@@ -12,8 +12,7 @@ library dependency.
 
 ## Milestones
 
-The milestone names below come from the self-compile plan, which is pending
-adoption into [ROADMAP.md](ROADMAP.md). As this document uses them:
+The milestones are defined in [ROADMAP.md](ROADMAP.md). As this document uses them:
 
 - **M0**: foundation closeout; includes removing the `+` operator sites from `src`.
 - **M1b** (the "namespace" milestone): `private`, module aliases and qualified names. Part A (aliases, `private`, qualified values and types) landed 2026-10-15; qualified pattern heads remain.

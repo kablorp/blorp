@@ -1,222 +1,589 @@
 # Blorp 2 roadmap
 
-Updated 2026-10-14. This is the single plan for aggregate composition, ownership,
-generics and recursion. It replaces MEMORY_PLAN, MANAGED_RECORDS_PLAN,
-GENERICS_PLAN and RECURSION_PLAN; their completed evidence remains in Git and
+This is the single plan for getting Blorp 2 to compile itself, and for the
+aggregate, ownership, generics and recursion contracts that path depends on. It
+replaces MEMORY_PLAN, MANAGED_RECORDS_PLAN, GENERICS_PLAN and RECURSION_PLAN;
+completed evidence stays in Git and
 [benchmarks/results](../benchmarks/results/). Read both [AGENTS.md](AGENTS.md)
 and the [parent AGENTS.md](../AGENTS.md).
 
 [README.md](README.md) and [grammar.ebnf](grammar.ebnf) describe implemented
 behavior. The [imports/prelude reference](IMPORTS_AND_PRELUDE_PLAN.md) describes
-that implemented subsystem. Examples and unchecked milestones here are planned
+that implemented subsystem. [LIBRARY_PARITY.md](LIBRARY_PARITY.md) is the
+authority for which library functions the compiler source may use while the
+host still builds it. Examples and unfinished milestones here are planned
 capabilities, not claims that the current compiler accepts them.
-[LIBRARY_PARITY.md](LIBRARY_PARITY.md) is the authority for which library functions the compiler source may use while the host still builds it.
 
-The immediate goal is correctness and useful composition, not memory
-optimization. Extra retains, copies and fresh allocations are acceptable.
-Unique-root COW, allocation reuse, retain elimination and consuming-ABI inference
-are deferred. Existing test cost guards remain; adjust them deliberately with
-evidence rather than distorting the design to avoid a host-compiler cost.
+Correctness and useful composition come before memory optimization. Extra
+retains, copies and fresh allocations are acceptable; unique-root COW,
+allocation reuse, retain elimination and consuming-ABI inference are deferred.
+Existing test cost guards remain; adjust them deliberately with evidence rather
+than distorting the design to avoid a host-compiler cost.
+
+## Definition of done
+
+The fixpoint the old compiler already uses, strengthened:
+
+1. The host builds `blorp_2/src` and `standard_library_temp` into compiler **A**.
+2. **A** compiles the same source into **B**; **B** compiles it into **C**.
+3. **B** and **C** emit byte-identical C. **B** passes the full e2e suite. For
+   every e2e fixture, **A** and **B** emit byte-identical C. A self-consistent
+   fixpoint alone can hide a deterministic miscompile; A == B on fixtures
+   localises host-versus-pilot drift.
+4. A, B and C are built at `-O2`: the first time emitted C runs optimised.
+
+Unit tests are outside this definition. They depend on the host `TestSuite`
+(59.5k lines, 1,554 tuples, 2,285 `==`, process and filesystem APIs) and need
+their own inventory and plan after M8.
+
+## Rules for every milestone
+
+- **Dual-compile.** Until the fixpoint the host keeps building A, so the source
+  stays host-compilable: only syntax the host already accepts enters `src`, and
+  every library function `src` imports exists in both the host library and
+  `standard_library_temp` with the same module, name and signature.
+  [LIBRARY_PARITY.md](LIBRARY_PARITY.md) is the authority.
+- **Fixture first.** Each increment starts with a small real-main e2e fixture
+  shaped like the source's own use, failing granular tests, runnable acceptance
+  criteria and `should_fail` fixtures with exact text, under a bounded handoff
+  per [HANDOFF_SPEC](../docs/HANDOFF_SPEC.md).
+- **One path, no shims.** Grammar, parser, checker, lowering, ownership,
+  verification and emission land together for one producer-to-consumer path;
+  the replaced representation goes in the same change. A construct the parser
+  reads before its milestone is rejected by the checker with an exact message.
+  No cache, registry, extra pipeline or test driver for a hypothetical need.
+- **One authority per fact.** Each milestone names its new facts, the phase
+  that establishes each, and the product that carries it.
+- **Identity proofs.** Existing fixtures stay byte-identical in C and
+  diagnostics unless the milestone changes them deliberately and says why.
+- **Library over builtins**, except representation and machine operations.
+- **Measure.** See [Cost and evidence rules](#cost-and-evidence-rules).
+- **Independent review.** A slice is accepted, with independent code and test
+  review, before a dependent slice relies on it. Parallel work needs disjoint
+  files and contracts; compiled validation and measurements stay serialized.
+- **The frontier.** One number across the path, reported by
+  `scripts/blorp2-fixpoint --frontier`: files of `src` that parse (0 to 34),
+  then the phase reached on `main.brp` (load, check, specialize, lower, own,
+  verify, emit, C compiles, B passes e2e, B == C).
 
 ## Status and order
 
-The validated feature milestone is checkpointed as `14fc4b9c9`; reconciliation
-onto the newer structural frontend, split checker and import policy is tracked
-in the [integration report](../benchmarks/results/blorp_2_milestone_integration_2026-10-13.md).
-The historical counts below describe their frozen feature-branch snapshots.
-They do not establish that the combined branch passes until integration is
-validated independently.
-
-Already delivered: scalar bindings and local var, function recursion,
-nongeneric unmanaged direct-self tail loops, bidirectional checking entrypoints
-and typed errors, ordered multiple generic parameters and nested applications,
-finite inline owning unions, managed Strings, Int-only fixed records, imports,
-Unicode calculator operations, and borrowed argv List[String] access. The working
-tree also implements mixed finite records, approved by two independent compiler
-reviewers. The accepted pre-generic integration snapshot passes 1,800 strict unit/runtime/grammar
-checks across 115 suites and 275 normal-main end-to-end cases, with no source
-drift. This includes 20 per-object aggregate runtime cases with five verified
-mutation oracles. See the
-[implementation report](../benchmarks/results/blorp_2_mixed_records_2026-10-13.md).
-
-Contextual generic-call inference/unification is accepted: one local work
-loop owns temporary variables, with nested calls and uniquely resolved UFCS
-context supported. Focused and frozen unit gates pass; matched costs and identical
-C output establish the bounded type-reuse repairs. Two independent compiler
-reviewers approve the final source and evidence; the combined live gate passes.
-See the [inference report](../benchmarks/results/blorp_2_contextual_inference_2026-10-13.md).
-Generic records and contextual record literals are implemented and approved by
-two independent compiler experts. The final production snapshot passes 1,856
-strict checks across 118 suites and 299 normal-main e2e cases, with no source
-drift. Independently reviewed quiet matched allocations/instructions pass both
-unchanged cost ceilings. This increment is accepted; see the
-[generic-record report](../benchmarks/results/blorp_2_generic_records_2026-10-13.md).
-Direct unary union payload annotations are accepted: ordinary type syntax now
-resolves through the shared annotation path, with all union declarations covered
-by the finite-cycle guard. Two expert reviews, mutation oracles, quiet matched
-costs and final integration pass: 1,917 sanitized checks across 120 suites and
-310 normal-main e2e cases. See the
-[direct-payload report](../benchmarks/results/blorp_2_direct_union_payloads_2026-10-13.md).
-Multiple union fields are accepted: ordered children and captures, complete
-concrete layouts and independent per-slot ownership/destruction checks pass.
-Two compiler experts approve the final source and evidence: 1,975 sanitized
-checks across 124 suites and 321 normal-main e2e cases, plus mutation oracles,
-runtime-helper checks and unchanged matched cost ceilings. See the
-[multiple-field report](../benchmarks/results/blorp_2_multiple_union_fields_2026-10-13.md).
-Review identified inherited repeated copying in use-vector updates and lowering
-definition accumulation. The use-vector preparation is now accepted: local
-updates replace per-read copies, with one possible initial terminal snapshot
-copy. Two independent experts approve 1,985 sanitized checks, 321 e2e cases and
-quiet matched costs with identical target C; see the
-[builder report](../benchmarks/results/blorp_2_ownership_builders_2026-10-13.md).
-Block-local lowering preparation is now accepted, including fresh main-rebase
-validation. Recursive expression-local copying remains documented debt. The
-earlier integration round stopped at its validated milestone; the next approved
-implementation sequence is described below.
-No whole-compiler linearity is claimed. General List construction, length and
-owned lookup are accepted after the final full gate and independent evidence
-reviews. The unary recursive union (recursive data step 1) is implemented with
-a boxed representation and iterative release; see the
-[unary recursion report](../benchmarks/results/blorp_2_recursive_unary_2026-10-15.md).
-Still absent: mutual/generic/branching recursive data and generic/managed tail
-loops.
-Locally owned match-prefix values are implemented for ordinary terminating
-matches, with independent per-arm verification. Matched cost checks, two expert
-reviews and combined integration pass; see the
-[owned-prefix report](../benchmarks/results/blorp_2_owned_match_prefix_2026-10-13.md).
-General non-tail joins remain restricted.
-The pilot cannot self-compile yet.
-
-The combined milestone through declaration inventory is validated for main:
-2,090 sanitized unit/runtime/grammar checks and 325 normal-main e2e cases pass,
-with independent component and integration reviews. Declaration IDs are issued
-once in assembly; ownership classification belongs to concrete specialization;
-known concrete nominal requirements reject during checking. The
-[authority repair report](../benchmarks/results/blorp_2_authority_fixes_2026-10-13.md)
-records the matched costs and remaining limits. Validated namespace publication
-now rejects incomplete scopes before checking and removes downstream visibility
-rechecks, with separately reviewed producer/provenance tests and mutation oracles;
-see the [namespace report](../benchmarks/results/blorp_2_namespace_publication_2026-10-14.md).
-
-| Order | Working increment | Dependency and verdict |
+| Milestone | Scope | Status |
 | --- | --- | --- |
-| 1 | [Mixed finite records and safe field projections](#first-increment-mixed-finite-records) | Accepted: independent reviews, per-object runtime oracles, matched costs and combined strict/native gates pass. |
-| 2 | [Generic records, direct full union payload types, then multiple payload fields](#finite-aggregate-frontend-increments) | All three increments, use-vector and block-lowering preparations accepted with independent reviews, strict/native gates, mutation oracles and matched costs. |
-| 3 | [General List[T] construction, length and owned lookup](#general-lists-and-functional-updates) | Accepted: two expert reviews, 2,209 strict checks, 331 e2e cases, mutation oracles and unchanged matched cost ceilings. |
-| 4 | [Functional record/List updates](#general-lists-and-functional-updates) | Start with fresh results and borrowed-input/owned-result contracts; old aliases stay unchanged. |
-| 5 | [Unary recursive union, then mutual/regular-generic and branching mixed data](#recursive-data) | Unary step implemented: boxed layout, iterative release proven at 100,000 nodes on a 512 KiB stack. Each later shape needs finite representation, acyclic values and bounded-stack destruction. |
-| 6 | [Other collections and broader control flow](#broader-control-flow-and-later-scope) | Set/Dict key semantics, typed joins/edges and managed loops enter through separate examples. |
+| [M0](#m0-foundation-closeout) | Re-cut, perf fixes, recursion-site loops, fixpoint script, parity table | Landed: checker re-cut, emit and name-interning fixes, parity table, parser statement loop, `scripts/blorp2-fixpoint`, `BLORP2_COMPILER` harness. Open: the per-item recursions in `check_functions` and `declare_types`. |
+| [M1a](#m1a-surface-syntax-parity) | Layout, `\|`/`raw` strings, pattern/opaque/range syntax | Checkpoints 1, 2a, 2b and 3 landed. 32 of 34 files parse; the other two need a `Char` type (`lex.brp`) and function types (`specialize.brp`, M7). |
+| [ML](#ml-list-construction) | `append`, `set`, `concat`, list literal | Done. |
+| [M1b](#m1b-names-and-the-foundation) | Namespace: private, aliases, qualified names, designated `Bool`/`Option`/`Result` | Part A done. Part B in progress. |
+| [M5](#m5-constants) | Module-level constants | Not started. |
+| [M2](#m2-the-join) | Blocks with parameters; non-tail match, `if`, `and`/`or`/`not`, `?=` | M2.1 in progress; M2.2 after M1b part B; M2.3 after M2.2 and M1b part B (designated `Result`). |
+| [M2b](#m2b-pattern-compilation) | Nested, or-, list and literal patterns | Not started. |
+| [M3](#m3-loops-and-tail-recursion) | Loops with managed carried values; `SelfTailLoop` retired | Not started. |
+| [M4](#m4-recursive-types) | Recursive types, release rule, opaque erasure | Step 1 done; step 2a in progress. |
+| [M6](#m6-library-and-shell) | Library and shell per the parity table | Not started. |
+| [M7](#m7-lambdas) | Lambdas at known callees; function types | Not started. |
+| [M8](#m8-the-fixpoint-gate) | Fixpoint gate | Not started. |
 
-Contextual inference is a separate frontend track, not a prerequisite for mixed
-records. Tail-loop follow-ups have their own dependencies below. A unary recursive
-proof may proceed once its payload/type and ownership prerequisites are green;
-it need not wait for every collection update API. Parallel work is appropriate
-only where contracts and owned files do not overlap; each dependent slice must
-be independently accepted before the next relies on it.
+Dependency order:
 
-Every increment starts with a small real-main fixture, failing granular tests,
-exact acceptance criteria and a bounded handoff under
-[HANDOFF_SPEC](../docs/HANDOFF_SPEC.md). Complete one producer-to-consumer path
-and remove its replaced representation in that slice. Do not introduce a cache,
-registry, extra pipeline or test driver for hypothetical future needs.
-The agreed excluded features and numeric-width limits remain in AGENTS.md.
+```
+M0   foundation closeout
+M1a  layout, `|`/`raw` strings, pattern/opaque/range syntax        [lex, parse]
+ML   List construction intrinsics                                  [all phases, runtime]
+M1b  namespace: private, aliases + qualified names, designated Bool/Option/Result
+M5   constants
+M2   the join: blocks with parameters                              [all phases]
+M2b  pattern compilation                                           [check, lower]
+M3   loops with managed carried values; SelfTailLoop retired       [all phases, runtime]
+M4   recursive types, release rule, opaque erasure
+M6   library and shell per the parity table
+M7   lambdas at known callees; no closure values
+M8   fixpoint gate
+```
 
-### Current implementation sequence
+Parallel pairs with disjoint files: M1a with the M0 fixpoint script and parity
+table; ML with M1a; M1b with M5; M4 with M3; M6's Blorp bodies with M4 once M3
+lands. M2.2 and M2.3 wait for M1b part B; M2b waits for M2; M3 reuses M2's join.
 
-The approved next round started at `e59346426`, incorporating main `4dcb0d20a`.
-Its historical baseline passed 2,090 sanitized callbacks in 137 suites and 325
-e2e cases. Namespace and block-lowering preparation are now rebased onto main
-`d411c7bb0`: fresh required-instruction gates pass 2,120 unit/runtime/grammar
-callbacks in 138 suites and 325 normal-main e2e cases. Incoming main changes and
-all reviewed source/test hashes are preserved; both preparations pass the
-unchanged matched cost ceiling. See the
-[rebase receipt](../benchmarks/results/blorp_2_main_rebase_2026-10-14.md).
-Each slice is independently reviewed and accepted before a dependent slice uses
-it. Namespace and lowering preparation have disjoint frontend/Core ownership;
-implementation and design may proceed in parallel, but compiled validation and
-measurements remain serialized. The coordinator owns integration and this plan.
+## Delivered foundation
 
-1. **Validated namespace publication.** Complete authority-repair part B:
-   `build_namespace` publishes either complete valid scope facts or a nonempty
-   typed failure. Expand implicit prelude exposures before validating visibility.
-   Remove the replaced checker uniqueness/direct-visibility authorities in the
-   same slice. Keep accepted signatures, receiver compatibility and expected-type
-   constructor selection in checking; distinct union owners may share a spelling.
-   Accepted with fresh current-main validation; see the
-   [namespace publication report](../benchmarks/results/blorp_2_namespace_publication_2026-10-14.md).
-   Module aliases, `private` and qualified values/types (M1b part A) are
-   namespace facts: alias rows scoped to the importing module, visibility on
-   declared rows consulted at import selection and qualified resolution; see
-   the [namespace aliases report](../benchmarks/results/blorp_2_namespace_aliases_2026-10-15.md).
-2. **Bounded lowering preparation.** Keep the growing block definition vector,
-   binding map and cursor in their local block owner. Lower each expression into
-   its own completed chunk and merge it once at the block boundary, preserving
-   exact evaluation order, ValueIds, binding versions, branch isolation and public
-   lowered IR. Keep expression traversal unchanged in this slice: its existing
-   wide/deep construction costs remain explicit follow-up work. The measured
-   expression-task prototypes increased work and source complexity and were
-   rejected. Prove unique block accumulation in generated C and measure statement
-   width separately from expression width/depth. No general IR rewrite or
-   speculative traversal framework is authorized.
-   Accepted with fresh current-main validation; see the
-   [block lowering report](../benchmarks/results/blorp_2_block_lowering_2026-10-14.md).
-3. **General List construction and access.** Start with the standard library's
-   `repeat[T](elem: T, n: Int) -> List[T]`, plus generic length and owned
-   `Option[T]` lookup. A list containing the same mixed record twice exercises
-   per-occurrence ownership; returning an element and then its String field
-   exercises survival after parent retirement. The intrinsic signatures and
-   accepted element facts need an explicit reviewed contract: this is broader
-   than the previous nongeneric String-only builtins. Nonpositive counts produce
-   empty lists. Add no list-literal syntax or update API to this first example.
-   Implemented with typed concrete slots, per-occurrence acquisition/destruction,
-   granular phase tests and 24 native runtime cases. The final required-instruction
-   gate passes 2,209 unit/runtime/grammar callbacks and 331 e2e cases. Final source
-   and evidence reviews approve; this increment is accepted. See the
-   [general List report](../benchmarks/results/blorp_2_general_lists_2026-10-14.md).
-4. **Fresh-result updates.** Add record update, then List append, replacement
-   and removal through separate fixtures. Borrow inputs, acquire each surviving
-   or replacement stored occurrence, allocate a new result and preserve every
-   old alias. Keep unique-root mutation, COW/reuse and consuming-ABI inference
-   deferred.
-   Record updates are implemented with complete typed field partitions and
-   existing ownership/runtime operations. The required gate passes 2,282
-   unit/runtime/grammar checks and 334 e2e cases. See the
-   [record update report](../benchmarks/results/blorp_2_record_updates_2026-10-14.md).
-   List `append`, `set` and `concat` are implemented as fresh-result intrinsics
-   with the same borrowed-input contract; see the
-   [list intrinsics report](../benchmarks/results/blorp_2_list_intrinsics_2026-10-15.md).
-   The list literal `[a, b]` / `[]` constructs one fresh root inline with n
-   stored occurrences under the same acquisition rule as variant payloads;
-   `[]` needs an expected List type. Removal remains a following increment.
-   Each generic library wrapper costs every compile about 340 allocations:
-   lexing ≈146, parsing ≈104 and checking ≈90. Checking only referenced
-   library declarations was measured and rejected, because loading must stay
-   complete for the prelude's `methods_only` imports; see the
-   [referenced library check report](../benchmarks/results/blorp_2_referenced_library_check_2026-10-15.md).
-5. **Recursive data.** Step 1, the unary Nat example with an iterative final
-   release, is implemented; then separately admit mutual, regular-generic and
-   branching mixed shapes. Reserve instance identities locally and publish only complete
-   layouts. Constructors accept completed children, so values remain finite
-   DAGs. Every newly admitted release graph must have bounded C-stack use;
-   mutually recursive release helpers alone do not meet that requirement.
+Accepted, each with independent reviews, mutation oracles and matched costs in
+its report. Later milestones build on these and do not reopen them.
 
-For each preparatory refactor, freeze a matched same-toolchain baseline and
-require identical existing target C and at most +3% allocations/minimum retired
-instructions per frozen input. Namespace part B targets a production reduction;
-lowering preparation stops for design review above +50 production lines or a
-wider algorithmic change. Feature increments may change emitted C and increase
-costs: set their numerical fixture limits before implementation, measure scaling
-on 16/32/64/128-size examples, and report new-feature work separately from the
-shared existing corpus. Until self-compilation works, these are owned-input CLI
-proxies, not self-compile evidence. Existing fixture ceilings stay unchanged
-unless a measured adjustment is reviewed explicitly.
+- **Scalars to recursion.** [Bindings](../benchmarks/results/blorp_2_bindings_2026-10-09.md),
+  [arm blocks](../benchmarks/results/blorp_2_arm_bindings_2026-10-09.md),
+  [managed Strings](../benchmarks/results/blorp_2_managed_strings_2026-10-09.md),
+  [tail-arm ownership](../benchmarks/results/blorp_2_tail_strings_2026-10-09.md),
+  [typed errors](../benchmarks/results/blorp_2_typed_checker_errors_2026-10-09.md),
+  [checking/synthesis](../benchmarks/results/blorp_2_synthesis_checking_2026-10-09.md),
+  [function parameters](../benchmarks/results/blorp_2_function_type_parameters_2026-10-09.md),
+  [union parameters](../benchmarks/results/blorp_2_union_type_parameters_2026-10-10.md),
+  [nested applications](../benchmarks/results/blorp_2_generic_nested_2026-10-10.md),
+  [managed union payloads](../benchmarks/results/blorp_2_managed_union_payloads_2026-10-11.md),
+  [fixed records](../benchmarks/results/blorp_2_fixed_records_2026-10-10.md),
+  [function recursion](../benchmarks/results/blorp_2_function_recursion_2026-10-10.md),
+  [tail loops](../benchmarks/results/blorp_2_tail_recursion_2026-10-10.md) (unmanaged,
+  nongeneric, direct-self; the billion-iteration run is in the
+  [argument report](../benchmarks/results/blorp_2_arguments_2026-10-12.md)),
+  [argv](../benchmarks/results/blorp_2_arguments_2026-10-12.md) and
+  [ownership reconciliation](../benchmarks/results/blorp_2_argv_reconciliation_2026-10-12.md).
+- **Finite aggregates.** [Mixed finite records and safe projections](../benchmarks/results/blorp_2_mixed_records_2026-10-13.md),
+  [generic records](../benchmarks/results/blorp_2_generic_records_2026-10-13.md),
+  [direct union payload types](../benchmarks/results/blorp_2_direct_union_payloads_2026-10-13.md),
+  [multiple union fields](../benchmarks/results/blorp_2_multiple_union_fields_2026-10-13.md),
+  [owned match-prefix values](../benchmarks/results/blorp_2_owned_match_prefix_2026-10-13.md)
+  and [record updates](../benchmarks/results/blorp_2_record_updates_2026-10-14.md).
+  A record update evaluates the base once, then the replacements in written
+  order, then reads the inherited fields in declaration order into one fresh
+  construction; old aliases never change. Checking publishes the exact
+  replacement/inherited partition, so lowering needs no ordinal table.
+- **Contextual inference.** [Report](../benchmarks/results/blorp_2_contextual_inference_2026-10-13.md).
+  One expression-local work loop owns temporary variables; caller-owned
+  parameters stay rigid; nothing tentative escapes into a published product.
+  Explicit call type arguments, let polymorphism, traits and bounds,
+  higher-kinded types and polymorphic function values remain deferred.
+- **Lists.** [General `List[T]`](../benchmarks/results/blorp_2_general_lists_2026-10-14.md):
+  `repeat`, `length` and owned `get` over every supported finite element type,
+  with typed concrete slots and per-occurrence ownership.
+- **Preparation and authority repairs.** [Use-vector builders](../benchmarks/results/blorp_2_ownership_builders_2026-10-13.md),
+  [block-local lowering](../benchmarks/results/blorp_2_block_lowering_2026-10-14.md)
+  (recursive expression-local copying remains documented debt),
+  [authority fixes](../benchmarks/results/blorp_2_authority_fixes_2026-10-13.md),
+  [namespace publication](../benchmarks/results/blorp_2_namespace_publication_2026-10-14.md),
+  [milestone integration](../benchmarks/results/blorp_2_milestone_integration_2026-10-13.md),
+  [main rebase](../benchmarks/results/blorp_2_main_rebase_2026-10-14.md) and
+  [performance fixes](../benchmarks/results/blorp_2_perf_fixes_2026-10-15.md)
+  (linear emission, indexed name lookup).
+- **Library cost.** Each generic library wrapper costs every compile about 340
+  allocations (lexing 146, parsing 104, checking 90). Checking only referenced
+  library declarations was measured and rejected, because loading must stay
+  complete for the prelude's `methods_only` imports; see the
+  [referenced library check report](../benchmarks/results/blorp_2_referenced_library_check_2026-10-15.md).
+- **Not claimed.** No whole-compiler linearity. The pilot cannot self-compile.
 
-Every affected phase gets granular typed-input/output tests. Insertion and raw
-verification have independent tests; runtime-helper tests observe individual
-objects and stored occurrences; mutations prove the protected failure is caught.
-Real-main e2e, sanitizers and balanced totals supplement those oracles. A worker
-reports an ambiguous boundary, unexpected cost or scope expansion before adding
-a mechanism. The next slice starts only after independent code and test review.
+## M0: foundation closeout
+
+**Goal.** A foundation the fixpoint can be measured against. **Scope.**
+
+- **Recursion-site loops.** `parse::consume_function_lines`,
+  `check/bodies::check_functions` and `check/declarations::declare_types` recurse
+  once per statement, function or union only because the host forbids `?=` in
+  loop bodies; the pilot dies at about 2K items per module. Each becomes
+  `while` + `match` + `break` (host-legal). Oracle: the pilot on a 4K-statement
+  input under `ulimit -s 512` exits 0.
+- **[scripts/blorp2-fixpoint](../scripts/blorp2-fixpoint)**: the three stages, a
+  SHA-256 per stage with the first differing line, A == B over fixtures, e2e
+  under B, `-O2`, and `--frontier`.
+- **Parity table:** [LIBRARY_PARITY.md](LIBRARY_PARITY.md), landed. Regenerate it
+  whenever `src` gains or loses a library dependency.
+- **Source corrections.** No `+` String operator in `src`; inventory
+  corrections: 61 lambdas, 64 constants, sibling imports already relative.
+
+**Decision (harness).** The e2e harness takes the compiler under test from a
+required `BLORP2_COMPILER` environment variable, set by
+`make -C blorp_2 test-e2e` ([Makefile](Makefile)). This is expected to be temporary: once blorp_2 is
+mature the test code will likely be rewritten (M8).
+
+**Exit proof.** The 4K-statement input compiles under `ulimit -s 512`; the
+fixpoint script reports frontier 0.
+
+**Status.** The checker re-cut by phase ([check/](src/check/)), the emit and
+name-interning fixes, the parity table, the parser's statement loop, the
+fixpoint script and the `BLORP2_COMPILER` harness have landed. Open: the
+per-item recursions in `check_functions` and `declare_types`.
+
+## M1a: surface syntax parity
+
+**Goal.** Lex and parse everything the source uses that needs no semantics.
+**Scope.** Continuation lines, trailing commas, multi-line headers, records,
+imports and calls, parenthesised grouping, `---` doc blocks, block depth beyond
+3, `else if`, a comment inside an open bracket, multi-line `|` and `raw` String
+literals (160 lines, the C runtime text), pattern syntax (or-, nested, list,
+String/Char literal, qualified) parsed into the AST and rejected by the checker
+until M2b with an exact message, `opaque type` / `into_opaque` / `from_opaque`,
+`a..b` ranges and `Char` literals as tokens. The language reserves every word
+GRAMMAR [§1.4](../docs/GRAMMAR.md#14-keywords) reserves, and indentation follows
+the host's levels stack: a deeper line opens a level whatever the step, a
+dedent must land on an open level, and a bracketed block closes at its base.
+
+**Decision.** `?=` is rejected in loop bodies and in lambda bodies, and the
+parser enforces it from its statement context. The host agrees for loops
+([GUIDE](../docs/GUIDE.md), `?=` is rejected inside loop bodies); blorp_2 is
+stricter for lambdas, which the host allows. The host divergence applies to
+lambdas only, and the source has no such use. Keeping loop exits at two
+variants (M3) and `?=` a function-body construct (M2.3) depend on it.
+
+```blorp
+import:
+	../utils/syntax: Span
+	int as IntOps
+
+---
+A span's width, in bytes.
+---
+private pure func width(
+	span: Span,
+) -> Int:
+	IntOps.subtract(
+		span.end,
+		span.start,
+	)
+```
+
+**Exit proof.** [test_source_tree.brp](test/unit/test_parse/test_source_tree.brp)
+enumerates `blorp_2/src/**/*.brp`, parses each and reports N/34 (a direct phase
+test; no new entry point). The frontier reaches 34 here. Conformance suites and
+the EBNF move together.
+
+**Status.** Checkpoints 1, 2a, 2b and 3 slices 1 to 7a landed (layout and
+literals, declaration forms, patterns, `if`/`else`, `and`/`or`/`not`, `match`,
+propagating binding, loops and loop controls, bracketed blocks, levels-stack
+indentation). Checkpoint 3 also covers lambdas, inline statement arms, method chains
+across lines and `for _`. 32 of 34 files parse; the remaining two need a `Char`
+type (`lex.brp`) and function types (`specialize.brp`, M7).
+
+## ML: List construction
+
+**Goal.** Build a list of n+1 distinct elements. **Scope.** `append` (268 uses
+in `src`), `set` (47), `concat` and the literal `[a, b]` / `[]` (276) are
+intrinsics by the library-over-builtins rule, with fresh-result semantics: borrow
+the inputs, acquire each surviving or replacement stored occurrence, allocate a
+new result, preserve every old alias. Unique-root reuse is deferred and measured
+at M8. The literal constructs one fresh root inline with n stored occurrences
+under the acquisition rule for variant payloads; `[]` needs an expected `List`
+type. List removal is outside the self-compile path until a fixture needs it.
+
+```blorp
+pure func append(values: List[E], value: E) -> List[E]:
+	builtin("list.append")
+```
+
+The List storage contract holds for every list operation:
+
+- Logical length and initialized owned slots are explicit, separate from capacity.
+  Publish a constructed root only after its admitted slots are initialized;
+  never read or destroy uninitialized spare capacity.
+- Replacement and growth account for each old element obligation exactly once and
+  each new stored occurrence independently, including duplicate pointers. Moved-
+  from slots no longer own elements.
+- Accepted operations carry their element type (`ListRepeat(E)`,
+  `ListLength(E)`, `ListGet(E, roles)`); Some/None roles are compile-time
+  constructor identities from the declared result union.
+- A disposable emitter-local inventory derives needed List element types in one
+  walk and owns no layouts or identities; C names project from semantic types,
+  with no per-value linear lookup. Avoid depth quadratics.
+- The feature budget for a List change is at most +5% allocations and minimum
+  retired instructions per frozen shared input, with +10% per input the hard
+  rejection ceiling. Runtime slot count must not grow helper C size: one root
+  allocation and exactly n applications of the element's duplication/drop.
+
+**Exit proof.** Fixtures for append/set/concat/literal with managed elements,
+ownership verified, C read, ceilings measured; see the
+[list intrinsics report](../benchmarks/results/blorp_2_list_intrinsics_2026-10-15.md).
+
+**Status.** Done (`append`, `set`, `concat`, literal).
+
+## M1b: names and the foundation
+
+**Goal.** The source's 34 namespaces resolve. **Scope.**
+
+- **Part A.** `private` is a `Visibility` fact on each namespace declaration row,
+  rejected at import selection with an exact message. Aliases and qualified names:
+  the parser mints a qualified-name form from the module's import block, and the
+  checker resolves it in expressions, types (`Builtins.RuntimeType[T]`),
+  constructors and patterns. See the
+  [namespace aliases report](../benchmarks/results/blorp_2_namespace_aliases_2026-10-15.md).
+- **Part B.** **Decision:** `Bool`, `Option` and `Result` are designated
+  foundation unions. One fact, established by the builtin check from `_base`,
+  names the unions and their variant ids. `if`, `and`/`or`/`not`, `?=` and `for`
+  consume it by identity. The representation is identical to any other union.
+  The per-operation `BooleanRoles`/`OptionalRoles` lists are deleted, so
+  `int.equals` returns the designated `Bool`.
+
+**Exit proof.** The tree resolves all 34 namespaces; `private` rejections pinned.
+
+**Status.** Part A done (aliases, `private`, qualified values and types; qualified
+pattern heads wait for M2b). Part B in progress.
+
+## M5: constants
+
+**Goal.** The 64 module-level constants in `src` compile: 44 scalar/String
+literals and 20 record literals of literals; two reference another constant
+(`COMPILER_SOURCE` via `into_opaque`, `INTERNAL_SPAN` across modules). **Scope.**
+The checker publishes `CheckedConstant` rows with a dependency DAG (a cycle is
+an error); lowering adds `ConstantReference`; `evaluate` is the identity phase
+that rejects any initializer that is not a closed literal term (literals, record
+literals of such, references to other constants, `into_opaque` of such). No
+interpreter.
+
+**Decision.** Constants are materialised at use in increment 1, as literals are
+today: no static data, no immortal storage class, no runtime change. They
+transition to static C data when CTFE lands: that increment introduces the
+immortal storage rule (every release helper honours it for a static managed
+record) and measures the per-use cost it removes.
+
+**Exit proof.** All 64 constants of `src` shapes compile; C read.
+
+**Status.** Not started.
+
+## M2: the join
+
+**Goal.** Give a bound match, a statement-position match, a void `if` and
+`a and b` somewhere to converge. Today a lowered function is a flat definition
+list plus one tail. **Scope.** The one real mechanism of the plan, pre-approved
+as "typed block arguments and explicit edge transfers". Only the selected branch
+executes; no blanket cleanup after a match. A lowered block is
+`{ parameters, definitions, exit }`, with the exit by context:
+
+```
+in a function body        ReturnExpression(value)
+in a non-tail match arm   Yield(values) -> the join block's parameters | ReturnExpression
+in a loop body (M3)       Break(values) | RecurWith(values)
+```
+
+Own transfers each yielded value's owner on the edge exactly as `ReturnTransfer`
+does for a return; verify checks every edge like `verify_return`; emit writes the
+join as assignments to the join's C locals. Precedent: SIL/MLIR/Cranelift block
+arguments; MIR `SwitchInt` with a join block.
+
+Checked side: one form, `Match(CheckedMatch[CheckedExpr])`, a tail match always
+being the body form. Desugarings happen in the checker, never the parser, which
+must not know `Bool`:
+
+```
+x = if ready: 1 else: 0        Match on Bool: True -> yield 1, False -> yield 0
+if ready: print("go")          Match on Bool: True -> yield void, False -> yield void
+a and b                        Match a: True -> yield b, False -> yield False
+not a                          Match a: True -> yield False, False -> yield True
+value ?= parse(text)           value = Match parse(text):
+                                   Ok(v)  -> yield v
+                                   Err(e) -> ReturnExpression(Err(e))      -- diverging arm
+```
+
+`?=` desugars only in function-body positions (it is rejected in loop and lambda
+bodies, see M1a). It is a value match with one diverging arm: no CPS nesting, no depth growth (the
+source's deepest chain is 13). All 668 uses are in `Result` functions, so `Err`
+propagation suffices. An `if` origin stays in the checker's error type for
+diagnostics, not in the tree. Local type annotations (an expected type) land
+here.
+
+Steps: **M2.1** the join mechanism across lower, own, verify and emit, with
+non-tail `match` (needs no `Bool`); **M2.2** `if` and `and`/`or`/`not` (needs the
+designated `Bool`); **M2.3** `?=` and local annotations (needs the designated
+`Result`; the early return must discharge every enclosing owner).
+
+**Exit proof.** Fixtures for each desugaring; a `?=` in a non-tail arm with two
+live managed locals; the existing fixtures byte-identical; a nesting stress
+fixture with recorded C depth.
+
+**Status.** M2.1 in progress. M2.2 after M1b part B (designated `Bool`). M2.3 after M2.2; it needs M1b part B's designated `Result`.
+
+## M2b: pattern compilation
+
+**Goal.** The source's pattern shapes check and lower: nested constructor (54),
+or- (51), list (34), String-literal (36), Char (14) and qualified (28).
+**Decision.** A decision-tree match compiler in the checker (Maranget), with
+column-wise exhaustiveness and list patterns as length and index tests. The
+source is not rewritten to flat patterns. M1a parses these forms; M2b replaces
+the checker's rejection.
+
+**Exit proof.** The source's pattern shapes as fixtures; exhaustiveness errors
+exact.
+
+**Status.** Not started.
+
+## M3: loops and tail recursion
+
+**Goal.** Loops with managed carried values, and the one loop mechanism for
+`@tail_recursive`. **Scope.** A loop is a statement with a carried-binding set and
+two exits:
+
+```
+CheckedStatement.Loop(carried: List[BindingId], body)   -- body exits: Break | RecurWith
+```
+
+The carried set is a checker fact: the outer `var` bindings reassigned in the body
+plus the iteration index. Lowering makes them header-block parameters; own carries
+one obligation per managed carried value on both edges. A `for` over a list is an
+index-carried loop over `values.get(index)`; `a..b` is the same with bounds;
+`while` has no index. `break` is always bare in the source; a non-tail `break` (70
+uses) reuses the join.
+
+```blorp
+var total = 0
+for value in values:
+	if stop(value): break
+	total = IntOps.add(total, value)
+```
+
+```
+Loop(carried = [index, total]):
+	Match values.get(index):
+		None -> Break([total])
+		Some(value) -> Match stop(value):
+			True  -> Break([total])
+			False -> RecurWith([IntOps.add(index, 1), IntOps.add(total, value)])
+```
+
+`?=` is rejected in loop bodies (see M1a), which keeps loop exits at two
+variants; lambda-based workarounds stay valid.
+
+**Managed carried values** (179 loops carry a `List`/`String`, 173 an
+`Option`/`Result`) are the larger half. Keep the external borrowed ABI; internal
+carried obligations are explicit. Entry acquires internal loop owners from
+borrowed parameters and never retires the caller's obligation. Each managed
+parameter occurrence carries its own obligation, including duplicate aliases.
+On the back edge: evaluate the next values, acquire or transfer next owners,
+retire the old obligations, rebind and jump; no pending cleanup follows the back
+edge. Base returns transfer the result and discharge remaining owners.
+`@tail_recursive` becomes a function whose body is one loop carrying its
+parameters, so `FunctionExecution`/`SelfTailLoop` are the replaced representation
+and go in the same change; a back edge outside a loop becomes unrepresentable by
+the exit types. Follow-ups, each separately accepted:
+
+1. **Same-instance generics.** Accept an annotated self edge only when
+   substitution preserves every enclosing rigid parameter in order; equal C
+   layouts are not equal concrete instances. Define managed-instantiation
+   rejection or support first, and keep growing-instantiation checking separate.
+2. **Managed values.** Start with one `String` carrier and a terminating match.
+3. **Recursive managed data.** Compose the transition with M4's unary data:
+   acquire the next projected child before retiring its parent, then add deep
+   traversal and destruction oracles.
+
+Test entry acquisition and caller survival, unchanged and fresh carriers,
+aliasing, duplicate and swap arguments, unused intermediates, projected children
+and every return or edge at each affected phase. Mutual tail calls and
+tail-modulo-constructor are separate future designs; traversal depth and
+measured release depth are separate acceptance criteria.
+
+**Exit proof.** A `List[String]` accumulator loop under ASan with exact allocator
+balance; nested loops; a range loop;
+malformed-IR negatives; `SelfTailLoop` gone.
+
+**Status.** Not started.
+
+## M4: recursive types
+
+**Goal.** `CheckedExpr`-shaped data: `TypeRef`, `InferenceType`,
+`PendingOperations` recurse through inline payloads with no pointer today. Runtime
+values stay finite DAGs: roots are constructed from completed children, with no
+recursive bindings, backpatching or lazy knot tying. **Scope.** Three steps:
+
+1. **Unary self-recursive unions.** The `Nat` example (`Zero`, `Next(Nat)`;
+   `walk(make())` exits 7): self-reference resolves to `UnionId`; the concrete
+   instance is reserved in a local builder before its children expand and
+   published complete. Every variant, leaves included, is boxed
+   (`BoxedRecursive`); forward C declarations and pointer fields give finite
+   storage; a verifier rule requires a layout to refer to itself only through a
+   boxed payload. Final release iterates: decrement the root, stop if shared,
+   otherwise save the active child, free the root once and continue.
+2. **Mutual and generic recursion** through records and `List` (`CheckedExpr`,
+   `PendingValue`, ...): separate examples for mutual references and regular
+   generic recursive instances; reserve canonical declaration/argument keys
+   before following children; reject type-changing recursion with an unbounded
+   instance graph; distinguish by-value size dependencies, stored pointer edges
+   and phantom arguments. Forward declarations in emit; the checker's
+   `RecursiveAggregateType` rejection becomes the admission rule. A useful
+   union-based list needs head and tail through multiple constructor fields or a
+   record payload.
+3. **Release graph.** **Decision:** recursive release helpers are accepted,
+   including mutual recursion within recursive layout groups; step 1's iterative
+   chain release stays. A worklist release is a recorded potential optimisation,
+   taken only if measured recursion depth or cost demands it. Admitting a shape
+   needs a measured release-depth table, not a bound proved in advance. Test
+   shared-tail diamonds, repeated slots, mixed inline owning children, all
+   variants and deep branching teardown.
+
+**Opaque types** are a checked `TypeRef.OpaqueType(id)`, legal only in the
+declaring module (a namespace-row fact). Specialize substitutes the underlying
+type after instance keys are formed, so the concrete `TypeRef` has no opaque
+variant.
+
+Isolate deep destruction from construction and traversal depth: in an approved
+runtime-helper test, build a long chain iteratively from completed children,
+retain a middle tail, release the prefix, then release the tail and check exact
+per-object frees. A deliberately recursive release must fail the constrained-
+stack case for step 1. Source construction of a long chain still uses call depth
+until M3 manages loop-carried values, so a build or walk overflow is not
+destructor evidence. Always-fresh updates preserve acyclicity; later COW would
+need a consumed root obligation, no conflicting live projection and independently
+secured replacement children, because RC == 1 alone cannot authorize mutating a
+borrowed input.
+
+**Exit proof.** A `CheckedExpr`-shaped fixture; a release-depth table for the
+admitted shapes at the source's deepest nesting under `ulimit -s 512`; step 1's
+100,000-node chain still passes. See the
+[unary recursion report](../benchmarks/results/blorp_2_recursive_unary_2026-10-15.md).
+
+**Status.** Step 1 done. Step 2a in progress. Step 3 follows step 2.
+
+## M6: library and shell
+
+**Goal.** `src` loads: the parity table drives it. **Scope.** Intrinsics
+(representation or machine): byte access `string.get -> Option[Char]` (the
+host's own signature), `Char` with `to_int`/`to_char`, `Int` ordering, `Float`
+ordering/`equals`/`is_nan`/`is_finite`/`copysign`, String from chars, and the
+shell's `read_file`, `write_file`, `print_error`, `getcwd`, `argv` and exit
+status, in `main.brp` only. Everything else the source uses is written in Blorp
+in `standard_library_temp`: `substring`, `starts_with`, `index_of`, `join`,
+`take`, `is_empty`, `any`, `sort_by`, `min`, `append_int`, the Option/Result
+helpers, `Path`. `concat`/`join` get a measured decision (the emitter joins
+thousands of fragments).
+
+```blorp
+pure func starts_with(text: String, prefix: String) -> Bool:
+	match IntOps.less_than(text.length(), prefix.length()):
+		True: False
+		False: chars_equal_at(text, prefix, 0)
+```
+
+**Open item: a `Char` type.** The pilot's `lex.brp` uses `Char` literals (about 52)
+and 13 `Char` patterns, and M1a stops there. Placement is pending the owner; proposed:
+M6, with the `Char` intrinsics above.
+
+**Exit proof.** No MISSING parity row; `src` loads (frontier at least load).
+
+**Status.** Not started.
+
+## M7: lambdas
+
+**Goal.** The 61 lambda literals in `src` compile. All are `pure`, all are
+arguments to a known callee (`map` 30, `and_then` 5, `any` 3, `sort_by` 3,
+`translated_list` 7, others 13); none is bound, stored or returned; none captures
+a `var`; captures include managed values. **Scope.** The model, not an
+optimisation: each lambda literal is a unique nominal record type of its
+captures; a callee with a function parameter is specialised per lambda type (one
+more component in specialize's instance key); the call inside the callee is a
+direct call to the lambda body with the capture record as receiver, captures
+passed borrowed. No function pointers, no closure values, no new runtime
+representation. Function types in signatures (`pure (T) -> U`) are the one new
+type form. The escape case waits for a fixture that needs it; none is expected.
+`?=` in a lambda body stays rejected (see M1a).
+
+```blorp
+offsets.map(pure func(value): IntOps.add(value, base))
+-- specialize: map instantiated for this lambda's capture type; a direct call inside
+```
+
+**Exit proof.** Fixtures for a capturing and a non-capturing lambda at a library
+combinator and at a user generic; ownership of borrowed managed captures
+verified; frontier reaches emit.
+
+**Status.** Not started.
+
+## M8: the fixpoint gate
+
+**Goal.** The definition of done. **Scope.** `scripts/blorp2-fixpoint` exits 0:
+B == C, A == B on every fixture, e2e under B, all at `-O2`. Measure the
+self-compile cost row (allocations and instructions per phase) under
+always-fresh `append`; if quadratic, unique-root reuse is the first post-fixpoint
+increment. **Decision (harness).** The e2e harness has no closure values: tests
+are dispatched by name. This keeps one lambda model (lambdas only at known
+callees, M7) and a simpler harness. The `BLORP2_COMPILER` harness is expected to
+be rewritten once blorp_2 is mature. The unit-test migration is a separate plan.
+
+**Exit proof.** The fixpoint script exits 0.
+
+**Status.** Not started.
 
 ## Identity and immutable facts
 
@@ -311,120 +678,18 @@ owned result may alias its argument and need not be fresh. Runtime consuming
 operations, if introduced later, must carry explicit contracts across callers
 and callees. Conservative acquisition and copy are correct defaults.
 
-## First increment: mixed finite records
+### Construction and projection
 
-Working fixture [mixed.brp](test/e2e/fixtures/record/mixed.brp):
-
-```blorp
-fixed record Entry { count: Int, ratio: Float, text: String }
-
-pure func make_entry() -> Entry:
-    { count = 7, ratio = 2.5, text = 42.to_string() }
-
-pure func escaped_text(value: Entry) -> String:
-    value.text
-
-func main() -> Int:
-    escaped_text(make_entry()).length()
-```
-
-Expected exit 2, empty stdout/stderr. The escaped String survives retirement of
-the temporary Entry. Companion fixtures must observe count and ratio, store one
-mortal String in two fields, and compose nested records with finite unions.
-
-Admit all currently supported finite concrete field types: Int, Float, String,
-Void, List[String], existing fixed records and instantiated finite unions.
-Void uses the existing canonical zero-ownership C carrier. Keep nongeneric
-fixed-record syntax; generic records, updates and recursive types come later.
-
-Before recursion support, reject self/mutual type references before recursively
-expanding child layouts. Cover unused/pass-through declarations and
-record -> instantiated union -> record cycles with exact typed diagnostics.
-Phantom-only recursive references may conservatively remain deferred; diagnose
-unsupported recursive types, not cyclic runtime values. Ordinary phantom
-String/record arguments must not introduce child obligations.
-
-### Complete source path
-
-The working-tree implementation carries these facts through the existing phases;
-validation and final integration status are tracked above.
-
-| Boundary | Published fact and responsibility |
-| --- | --- |
-| [Checked facts](src/check/model.brp), [declaration checking](src/check/declarations.brp), [constructor planning](src/check/constructors.brp) and [expression checking](src/check/expressions.brp) | Declaration-owned field identities and complete accepted field types; contextual literal checking (constructors) and projection checking (expressions). |
-| [Specialization](src/specialize/specialize.brp) | Concrete field types and InlineRecord/ManagedRecord representation derived from the complete shape. |
-| [Ownership insertion](src/own/own.brp) | Independent stored-slot obligations and explicit projection acquisitions. |
-| [Verification](src/verify/verify.brp) | Independent layout, receiver-lifetime and sequential transfer validation. |
-| [Emission](src/emit/emit.brp) | Typed storage, mixed dependency order and root/field destruction from verified facts. |
-
-Each accepted field retains its concrete type and identity:
-
-```text
-Entry: managed root
-    count -> IntType,    no child cleanup
-    ratio -> FloatType,  no child cleanup
-    text  -> StringType, owns one String obligation
-```
-
-[Lowering](src/lower/lower.brp) evaluates field initializers once in written order,
-separately from storage order. Mixed inline record/union dependencies use one typed
-C definition order. Existing Box[T] instantiated with Entry becomes an owning
-inline union and duplicates/drops Entry's root. Unused/pass-through layouts need
-coverage as well as constructed ones at each affected boundary.
-
-### Conservative construction and projection
-
-Acquire independently for each owning slot; direct last-use transfer is optional
-where already sound. This handles duplicate children without move heuristics:
-
-```text
-text = to_string(42)                           owns o0
-left_owner  = acquire(text, o0)
-right_owner = acquire(text, o0)
-pair = construct { left <- left_owner,
-                   right <- right_owner }     owns o3
-drop o0
-```
-
-Ordered per-slot acquisitions/consumptions replace the former single optional
-acquisition. StoredPayload is the common stored-slot contract for records and
-unions; Lists must reuse it when construction is admitted. A definition-position
-last-use test cannot authorize transferring one obligation twice. Sequential raw
-transfer verification uses a local owner vector and publishes once, so validating
-each field does not repeatedly copy the whole vector.
-
-Prefer immediate acquisition for managed projections:
-
-```text
-parent = make_entry()                          owns o0
-child = project(parent, Entry.text)            borrows parent
-o1 = acquire(child, projected-parent = parent)
-drop o0
-use child backed by o1                         parent is no longer needed
-return_owned child, o1
-```
-
-Subsequent uses must select the acquired owner as their backing lifetime. Test
-a call after parent drop, a nested projection after intermediate-parent drop,
-and returned/stored child escape. Unmanaged fields are copied while the parent
-is live. The independent verifier must also validate a managed receiver's live
-backing when the projected result is unmanaged: reading a numeric field through
-an acquired child after grandparent retirement is valid, but reading it after
-the child's acquired owner drops is invalid. Rebasing insertion's private source
-list alone does not establish this; verified operands must expose or independently
-resolve their current backing. Keeping a projected value borrowed instead is a later option requiring
-complete transitive ancestor liveness and independent verification.
-
-Initial red/green path, after creating the fixture:
-
-```sh
-make -C blorp_2 test-compiler
-blorp_2/build/compiler --library-root blorp_2/standard_library_temp \
-  blorp_2/test/e2e/fixtures/record/mixed.brp blorp_2/build/record-mixed.c
-```
-
-Pin the current non-Int declaration rejection, help and span before changing it;
-then require successful native exit 2 through the normal e2e harness.
+Acquire independently for each owning slot; a direct last-use transfer is
+optional where already sound, and a definition-position last-use test never
+authorizes transferring one obligation twice. StoredPayload is the common
+stored-slot contract for records, unions and Lists. Prefer immediate acquisition
+for a managed projection: acquire the child, backed by its parent, before the
+parent drops, and make later uses select the acquired owner. Unmanaged fields are
+copied while the parent is live. The independent verifier validates a managed
+receiver's live backing even when the projected result is unmanaged. Test a call
+after the parent drops, a nested projection after the intermediate parent drops,
+and returned or stored child escape.
 
 ## Typechecking and specialization
 
@@ -445,679 +710,6 @@ A checked generic body may contain its rigid parameters; concrete specialization
 must eliminate them. Checking currently stops at the first error; collecting
 independent failures needs an explicit recovery policy, not partial acceptance.
 
-### Finite aggregate frontend increments
-
-1. Generic records reuse ordered parameter identities and complete substitutions.
-   Test distinct instances, parameter positions, nominal separation and phantom
-   arguments independently of memory behavior.
-2. Completed: union payloads use ordinary TypeSyntax, admitting direct
-   record/String/Float/application payloads through shared annotation resolution.
-   Users no longer need a generic wrapper to express a concrete payload.
-3. Add multiple constructor fields separately, with ordered evaluation and the
-   same stored-slot obligations as records and Lists.
-
-Each syntax increment needs parser/ergonomics input, updated EBNF conformance and
-documenter review. Broadening accepted payloads must not bypass ownership checks.
-The pilot's fixed-union synonym already permits managed payloads; any stricter
-checked-fixed semantics is a separate language decision.
-
-### Contextual inference
-
-The checker uses private expression-local structural unification, accepted with
-the evidence tracked above. It solves argument constraints
-before declared expected results, keeping caller-owned parameters rigid.
-
-The first working example is:
-
-```blorp
-fixed union Choice[T]:
-    Empty
-    Value(T)
-
-pure func empty[T]() -> Choice[T]:
-    Empty
-
-pure func make_choice() -> Choice[Int]:
-    empty()
-```
-
-The declared result constrains the call's type argument without a default type.
-Private fresh call variables and an occurs check establish complete substitutions.
-Nested pending calls may use later sibling evidence. Known nominal heads and
-uniquely resolved UFCS contracts supply constructor hints; variant spelling and
-overload result types do not select owners. Sticky readiness distinguishes closed
-nested errors from descendants whose ambiguity must wait for enclosing evidence.
-Preserve child-first completion, source-order conflicts and diagnostic origins
-independently of union-find representatives. New bindings and match scrutinees
-synthesize without containing-function result context; discarded Void tails do
-not constrain their expressions.
-
-Test rigid versus solvable variables, independent calls, substitution chains,
-nominal mismatch, occurs failures, nested calls, expected-result/argument
-conflicts and unresolved phantom parameters. Typed errors retain stable facts
-and constraint origins without pointing into mutable inference state. Explicit
-call type arguments, implicit let polymorphism, traits/bounds, higher-kinded types
-and polymorphic function values remain deferred.
-
-## General Lists and functional updates
-
-List[T] storage and operations consume the complete concrete element layout;
-no String/numeric whitelist or universal Any carrier. Start with construction,
-length, owned Option[T] lookup and exhaustive release. Successful lookup copies
-an unmanaged element or gives an owning element an independent obligation;
-absent lookup owns no child. Preserve argv
-List[String] and normal entrypoint conventions.
-
-### First List contract and acceptance
-
-Start with `repeat`, generic `length` and owned `get`, without adding expression
-syntax or update APIs. The first real-main fixture uses pure helpers:
-
-```blorp
-import:
-    list: repeat, length, get
-    int: subtract, to_string
-    io: print
-
-fixed record Entry { number: Int, text: String }
-
-pure func make_entry(text: String, number: Int) -> Entry:
-    { number = number, text = text }
-
-pure func selected_entry() -> Option[Entry]:
-    values = repeat(make_entry("kept", 7), 2)
-    values.get(values.length().subtract(1))
-
-pure func number(value: Option[Entry]) -> Int:
-    match value:
-        Some(entry): entry.number
-        None: -1
-
-pure func text(value: Option[Entry]) -> String:
-    match value:
-        Some(entry): entry.text
-        None: "missing"
-
-func main() -> Void:
-    selected = selected_entry()
-    print(to_string(number(selected)))
-    print(text(selected))
-```
-
-Expected stdout is `7\nkept\n`, exit 0 and empty stderr. A separate fixture
-uses a String produced by `Int.to_string`, alongside literal-byte Strings.
-Both have allocated roots today; static literal bytes are copied into a root.
-Normal-main output alone cannot prove destruction. Phase tests prove parent
-retirement before escaped child use, while direct helper tests independently
-observe actual allocation/free.
-
-The sole phase-neutral runtime contract gains an element parameter. Accepted
-List operations carry E: `ListRepeat(E)`, `ListLength(E)` and
-`ListGet(E, roles)`. Checking extracts E from the resolved header and validates
-all parameter/result positions against that contract before publishing it.
-Valid concrete and generic wrappers, including structured E such as `List[T]`
-or `Pair[T,U]`, use ordinary declaration-owned parameters and substitution.
-Some/None roles are compile-time constructor identities from the declared
-result union, not callbacks or runtime arguments. Other runtime intrinsics
-retain their nongeneric restriction. Malformed headers retain their parsed
-operation for diagnostics rather than inventing an E.
-
-Source calls remain ordinary user-function wrappers; their checked builtin
-bodies carry the accepted runtime operation. Specialization prepares nested E
-and its nominal instances, substitutes it and translates result roles once.
-Remove String-only admissibility summaries and their threading in the same
-slice. Preserve simultaneous substitution, pure-Void rules, finite/increasing
-type-cycle checks and the entrypoint's exact `List[String]` restriction.
-Every currently supported finite concrete E is valid, including Void, numeric
-values, inline and owning unions, records, Strings and nested Lists. Independent
-raw-IR verification validates nested nominal membership even for unused or
-pass-through List values; root ownership cannot conceal a missing child layout.
-
-Runtime storage has concrete typed slots. Successful get returns presence
-separately from the copied/acquired E; zero, Void and empty values remain valid
-present payloads. Repeat clamps nonpositive counts before unsigned conversion,
-checks allocation size without negating INT_MIN, acquires each stored occurrence
-and publishes only initialized logical length. Nonfinal root release drops no
-children; final release drops each initialized occurrence exactly once.
-Construction's internal early length assignment followed by complete infallible
-initialization is observationally equivalent today: inspect publication order
-in C and mutate an advertised length exceeding initialized slots for the native
-failure oracle. Add no tracing hook to manufacture that observation.
-
-A disposable emitter-local inventory derives needed List element types from
-aggregate fields, signatures, all definitions/arms and runtime-operation E.
-It owns no layouts or identities. Current concrete types have unary List nesting
-over primitive or nominal instance identities, so depth plus typed terminal
-kind/identity is a complete key. Derive suffix keys in one walk, use existing
-stable host sorting from terminal identity through kind to depth, then dedup
-complete keys. Test equivalence with semantic type equality, including equal
-raw ordinals in different domains and phantom nominal instances. Project C names
-directly from semantic types/keys; no per-value linear inventory lookup, ABI
-string keys or preprocessor dedup. This temporary host sorting dependency does
-not establish bootstrap readiness. Emit root declarations before aggregate
-ownership helpers and complete typed List bodies after aggregate layouts.
-
-Before propagating the new carrier, inspect its generated host C and measure
-construction/access/destruction, including scalar variants carrying no E.
-The feature's working target is **at most 5%** additional allocations and
-minimum retired instructions on each frozen shared input; **10% per input** is
-the hard investigation/rejection ceiling. This is a feature budget, not a change
-to the preparations' 3% ceiling or existing e2e ceilings. No average may conceal
-an individual breach. Shared-input native behavior and ownership must agree;
-target C may legitimately change with the generalized helper ABI. Bootstrap
-identity checks apply where the compiler can perform them; the pilot still
-cannot self-compile.
-
-Measure runtime slot counts 16/32/64/128 separately from source call-site counts,
-distinct E counts and nested List depth. Runtime count must not grow helper C
-size: one root allocation and exactly n applications of E's stored-occurrence
-duplication/drop contract. Owning E acquires/releases each active child obligation;
-unmanaged E copies without child ownership operations.
-Avoid new depth quadratics when gathering suffixes or projecting child names.
-Record actual production/test line changes separately; forecast net production
-growth is 250–500 lines after removing obsolete admission work. Widening beyond
-that forecast calls for scope review, not compressed code or deleted tests.
-Granular contract, checking, preparation, lowering, ownership, verifier,
-emission and per-object runtime callbacks follow the phase matrix below, with
-genuine failing tests and specific mutation oracles before independent review.
-
-The Go slice lesson translates to these ARC invariants:
-
-- Logical length and initialized owned slots are explicit, separate from capacity.
-- Publish a constructed root only after its admitted slots are initialized.
-  Never read or destroy uninitialized spare capacity.
-- Removal/replacement/growth accounts for each old element obligation exactly
-  once and each new stored occurrence independently, including duplicate pointers.
-- Vacated/moved-from slots no longer own elements. ARC does not require copying
-  Go's GC-oriented zeroing rule; it requires correct initialized-slot boundaries
-  and no later access/drop of a retired obligation.
-
-### Fresh record updates preserve existing aliases
-
-#### Problem
-
-The pilot constructs and reads records, but cannot express a fresh update. Its
-lexer does not recognize `|` (`blorp_2/src/lex/lex.brp:446–509`); the parser only
-accepts literals after `{` (`parse.brp:765`, `1599–1608`). This program should
-print exactly `42\n7\n`, exit 0, and write no stderr:
-
-```blorp
-import:
-    list: repeat
-    int: to_string
-    io: print
-fixed record Entry { number: Int, text: String, values: List[Int] }
-pure func make_entry(number: Int) -> Entry:
-    { number = number, text = number.to_string(), values = repeat(number, 2) }
-pure func replace_text(value: Entry) -> Entry:
-    { value | text = 7.to_string() }
-func main() -> Void:
-    old = make_entry(42)
-    alias = old
-    fresh = replace_text(old)
-    print(alias.text)
-    print(fresh.text)
-```
-
-After implementation, run it through the normal e2e harness, not a C driver
-calling generated language symbols. Before implementation, root captures a
-behavioral red: a TestSuite callback expects this input to check successfully.
-The source-derived baseline failure is `unsupported character` at `|`, with
-help `use ASCII function declarations and numeric literals, parameter names,
-or calls; keep -> adjacent`. This spec has not executed that reproduction.
-
-A separate fixture uses the same imports, Entry and make_entry, with a reverse
-replacement order and actual IO (expected `base\ntext\nnumber\n7\n7\n`):
-
-```blorp
-func traced_base() -> Entry:
-    print("base")
-    make_entry(42)
-func traced_text() -> String:
-    print("text")
-    7.to_string()
-func traced_number() -> Int:
-    print("number")
-    7
-func main() -> Void:
-    fresh = { traced_base() | text = traced_text(), number = traced_number() }
-    print(fresh.number.to_string())
-    print(fresh.text)
-```
-
-#### Background and dependencies
-
-General List[T] is accepted in `85834e15f`. This is the next bounded design;
-production implementation starts after this plan is reviewed and committed. Root
-retains a source-matched native baseline, owns FRESH-host checks and serializes
-compiled validation. All current finite field classes are in scope.
-
-Parent `docs/GUIDE.md:1273–1279` and `docs/GRAMMAR.md:1128–1154` already specify
-base once, replacements in written order, then field writes. Pilot rules remain
-narrower: one-line braces, at least one replacement, no trailing comma, no field
-assignment, no recursive/empty record declarations, and only `fixed record`.
-Record updates preserve the base's nominal type and type arguments; replacement
-names never infer an owner. All currently supported finite field types work,
-including Void, numeric values, String, inline/owning unions, records and List[E].
-
-#### Proposed solution
-
-Use ordinary projections and complete construction, always fresh for managed
-records. No uniqueness test, COW/reuse branch, or new runtime operation.
-
-1. Parser publishes `RecordUpdateExpression(base, replacements)` with existing
-   `ParsedRecordField` rows in written order. The `|` is the named `Bar` symbol.
-   After `{`, a name followed by `=` selects the existing literal path; otherwise
-   parse one ordinary value, require `|`, then require nonempty replacement fields.
-   Existing empty-literal, postfix, whitespace/comment and brace-span rules stay.
-2. Checking elaborates the base first, using the ordinary expected result type
-   when available. Its nominal record head must be established before resolving
-   fields; ordinary inference may still solve generic arguments from replacements.
-   Keep the base pending until those constraints are solved; elaboration is not
-   an early freeze. Preserve its parsed `ValueExpression.span` explicitly. Resolve each
-   replacement once to its declaration-owned FieldId and instantiated expected
-   type. Validate duplicate ordinals before RHS elaboration. Build the disjoint
-   complement in one declaration-field pass, then freeze complete typed data.
-3. Specialization translates the base, replacements and inherited projection
-   types/FieldIds once to the same concrete record instance. Include their
-   children in all existing preparation and call/recursion traversals.
-4. Lower the base once; lower all replacement RHSs in written order; project
-   inherited fields in declaration order. Append the replacement values, then
-   the inherited reads, into one `RecordFieldValue` vector for the existing
-   `ConstructRecordValue`. Emission names each field, so storage order is
-   evaluation order. No field spelling or type lookup occurs here.
-5. Existing ownership insertion, independent verification and emission consume
-   those ordinary operations without a new update opcode or semantic authority.
-
-#### Code and fact ownership
-
-Checked construction is one expression node, `CheckedExpr { form, value_type,
-span }`, whose `CheckedForm` includes:
-
-```blorp
-fixed record CheckedRecordField { field: FieldId, value: CheckedExpr, span: Span }
-fixed union CheckedForm:
-    ConstructRecord(RecordId, List[CheckedRecordField])
-    UpdateRecord(RecordId, CheckedRecordUpdate)
-    -- other existing forms
-```
-
-The update product is:
-
-```blorp
-fixed record RetainedRecordField { field: FieldId, value_type: TypeRef }
-fixed record CheckedRecordUpdate {
-    base: CheckedExpr,
-    base_expression_span: Span,
-    replacements: List[CheckedRecordField],
-    inherited: List[RetainedRecordField]
-}
-```
-
-`replacements` contains only written/evaluated RHSs in source order; `inherited`
-contains only omitted fields in declaration order. These are disjoint rows,
-not parallel arrays. Construction verifies one exact partition of the base
-record's fields: owner, bounds, uniqueness and coverage. The inherited TypeRef
-is an occurrence projection type, analogous to a field read's `value_type`, not a
-second layout catalogue. The `UpdateRecord` node owns the update's result
-record type in its `value_type` and carries its declaration as the form's
-`RecordId`, as `ConstructRecord` does; an outer postfix is a separate node
-whose type may differ. The node's `span` is the update's own occurrence, carried
-through unchanged to the concrete `UpdateRecord` node (`ConcreteExpr`,
-`specialize.brp`). Copy the parser-owned complete
-base-expression span (`syntax.brp:196–201`) to `base_expression_span`, including
-the base's own postfixes, while publishing the checked update. No reconstruction,
-expression-ID domain, optional published
-type or insertion-policy flag is needed. These IDs live in one compilation.
-Only the existing checked-program producer publishes this product.
-
-The concrete counterpart, `UpdateRecord(RecordInstanceId, ConcreteRecordUpdate)`,
-substitutes `ConcreteExpr`, `ConcreteRecordField`,
-FieldInstanceId and concrete TypeRef and carries the unchanged
-`base_expression_span`. Its complete partition survives translation;
-phantom arguments remain part of nominal instance identity. Projected omitted
-fields and update-base errors use that full base-expression span because omitted
-fields have no written names. Existing child node spans remain unchanged.
-
-Current lowering (`lower_record_fields`, `lower.brp:228–255`) evaluates written
-fields; the construction arm then emits:
-
-```blorp
-Ok(define_value(current, ConstructRecordValue(owner, values), value_type, span))
-```
-
-The update consumer reuses this final operation; its algorithm is:
-
-```text
-base = lower_value(builder, bindings, update.base)       // exactly once
-fields = lowered replacements                          // written order
-for retained in update.inherited:                      // declaration order
-    child = define_value(current,
-        ReadRecordFieldValue(retained.field, base.value),
-        retained.value_type, update.base_expression_span)
-    fields.append({ retained.field, child.value })
-define_value(current, ConstructRecordValue(owner, fields), result_type, span)
-```
-
-Checking guarantees that `replacements` and `inherited` partition the record's
-declared fields, so lowering needs no ordinal table and no completeness check.
-Own, verify and emit identify each stored value by its FieldInstanceId; emission
-writes designated initializers, so the field vector's order is not a layout.
-Ownership insertion acquires stored children and numbers their owners in the
-field vector's order, so for an update that order is the replacements as
-written, then the inherited fields; behaviour does not depend on it
-(`record/update/managed_reorder.brp` covers two managed fields out of order).
-
-The sketch describes local construction, not a new public freeze API or helper
-framework. Carry the full existing FieldInstanceId in each field value; never
-manufacture it from an ordinal. Publication preserves all ValueIds/types,
-exact base/RHS/projection spans, and the function's existing allocator.
-Lowering a call base once produces its normal argument definitions and one call
-definition. A binding base reuses its existing ValueId (`lower_value`, `lower.brp:296–298`),
-without an extra alias definition; pin both cases independently.
-
-Current `own.brp:434–464` acquires a stored child obligation for **every** owning
-record field, then transfers it into `OwnedPayload`; `558–698` first acquires
-an independent temporary for a managed field projection. Changed RHS owners are
-also copied for storage and subsequently dropped at last use. Preserve this
-acquire-then-drop protocol: there is no `CopyStoredPayload` variant and no direct
-changed-owner transfer optimization in this slice. A retained managed child can
-outlive its base because its projection obligation is acquired before the base
-can retire; stored acquisition precedes constructing the fresh root.
-
-All-replaced updates may retire an otherwise unused base earlier, after its true
-last use. Do not force it live until construction when no dependency remains.
-For unmanaged inline numeric records there is no root/child RC. Managed records
-(including Void/unmanaged-union records) allocate exactly one fresh result root.
-`emit.brp:717–747` already implements that constructor with malloc/refcount 1;
-`754–806` emits ordinary field-designated construction/projection. It does not
-evaluate language RHSs in C initializers: their ValueIds are already defined.
-
-#### Scope and ownership
-
-Implementation owns `syntax`, `lex`, `parse`, `check/model`, `check/expressions`,
-`check/errors`, `check/render`, `check/recursion`, `specialize`, and `lower` in
-`blorp_2/src/`, plus matching tests and README/EBNF/conformance updates. Required
-closed-tree consumers include `check/model:448`, `check/recursion:68`,
-`specialize:1158,1569`; omitting an update child would hide calls or layouts.
-Existing own/verify/emit/runtime production is expected unchanged; a discovered
-required production change there stops for a separately reviewed correction.
-Raw ownership and native-helper tests may be delegated to a separate expert
-after the checked/concrete product is sealed. Root owns roadmap/report/Git,
-serialized compilation, measurements and final integration.
-
-No List update API, record spelling change, generic constraint solver, general
-expression-tree rewrite, CPS/SSA redesign, cache/index/registry, new layout
-catalogue, host change, consuming ABI, COW/reuse or production tracing.
-
-#### Risks, costs and stop rules
-
-Base evaluation must precede RHSs, even with all fields replaced. Distinguish
-immediate base-elaboration errors (unknown value, impurity, nonrecord head) from
-delayed freeze errors (unsettled generic arguments). Extend existing inference
-work actions and child-first freeze, rather than recursively invoking a second
-checker, prematurely freezing the base, or discarding inference slots. Preserve
-priority: immediate base errors; then all replacement name/duplicate errors in
-written order; then RHS/constraint errors and delayed ordinary freeze errors.
-Expected types cannot make
-an incompatible base a different nominal record. No source spelling survives
-into specialized/lowered update data.
-
-This **unit-only** accepted input proves that the base head can be known while its
-type argument is unsettled, with no outer hint on the update initializer:
-
-```blorp
-fixed record Box[T] { value: T }
-pure func seed[T]() -> Box[T]:
-    seed()
-pure func inferred() -> Int:
-    updated = { seed() | value = 1 }
-    updated.value
-func main() -> Int:
-    0
-```
-
-The typed update must be Box[Int], and its base's accepted call must instantiate
-seed with Int through the replacement constraint. The seed implementation is
-nonterminating; this is checking/phase-test input only, never an executed fixture.
-A sibling input replacing `value` with unknown `missing` must produce
-UnknownRecordField at `missing` before CannotInfer/UninferableTypeParameter.
-Keep seed's forwarding body so ordinary return-context inference is exercised.
-Normal-main fixtures above remain terminating.
-
-After one name resolution per replacement, new partition and lowering work is
-O(F+R), with F fields and R replacements. Current `resolve_record_field` calls
-linear `find_field` (`check/constructors`, `check/declarations`), so total existing lookup work is
-O(F×R); disclose that inherited mechanism. Use direct ordinal marks/slots for
-duplicate/complement/construction work, never a per-field replacement scan.
-Inherited expression-builder COW and aggregate emitter prefix copying remain
-debts; do not claim whole-compiler linearity. Measure fixed-R field width,
-R=F, and many independent update statements at 16/32/64/128; stop if the feature
-adds quadratic work beyond the equivalent explicit projection/construction path.
-Do not add an unmeasured lookup index to conceal that result.
-
-Root-approved feature policy: unchanged shared36 inputs target ≤+5%, hard +10%
-**each input** for allocations and minimum retired instructions, matched
-fresh-host/O0 runs. New fixtures initially propose 25k allocations/150M instructions for
-the small Entry case and 35k/180M for the traced case; confirm from retained
-first-smoke evidence before registration, keeping all old ceilings unchanged.
-Forecast +220–320 handwritten production lines and +450–800 tests; stop above
-+350 production for design review, or for widened files/model, unexplained cost,
-missing ownership proof or a host defect. The line threshold is never pressure
-to compress formatting, delete tests or weaken handling. Report physical counts.
-
-#### Testing and acceptance
-
-Start with the small valid-input TestSuite behavioral red, not missing-API
-compilation failure. Then phase callbacks test complete published values:
-
-| Boundary | Exact oracle and deliberate mutant |
-| --- | --- |
-| Lexer/parser/EBNF | Bar span; base and RHS syntax/order; update postfixes/nesting; reject missing base/bar/field/equals/brace, empty update, duplicate separator and multiline braces. Replace update parsing with literal path: valid callback fails. |
-| Checking | Base supplies owner without an outer annotation; known context supports a literal base; nonrecord base gets new UpdateRequiresRecord error at complete base_expression_span; UnknownRecordField and RecordFieldTypeMismatch retain messages/help/declaration notes; new DuplicateUpdateField reports second name plus PreviousField(first span). Tests pin exact typed kinds and rendered message/help/span/note. Pin seed replacement inference and UnknownRecordField before delayed CannotInfer. Cover wrong nominal owner, generic/phantom identity, contextual RHS, purity, Void fields, all finite child classes and hidden growing recursion in base/RHS. |
-| Specialization | Base/result/replacement/inherited fields all belong to the same actual concrete layout; Int/String instances differ when required; unused phantom arguments remain key identity. Calls reachable only inside base/RHS and nominal children appearing only under inherited List are prepared. Omit a child traversal: its precise instance/call oracle fails. |
-| Lowering | Call base evaluated once (one call plus its ordinary argument definitions); binding base reuses an existing ValueId with no new alias operation. All RHSs in written order, then inherited projections and one construction in declaration order; exact IDs/types/spans/field owners/exit. Full base postfix span and outer update postfix returning another type. All-replaced, same-field RHS, nested update, reverse written order, aliases and branch isolation. Reorder RHSs, duplicate the call base, or omit a projection: specific callback fails. |
-| Ownership + raw verification | Borrowed record parameter; numeric inline case; managed zero-child root; owning String/record/union/List children; duplicate pointer occurrences; retained child escapes after base retirement. Pin acquisitions, per-field OwnedPayload transfers and scheduled drops. From proven valid insertion output remove stored/projection acquisition, duplicate an owner transfer, or drop a base before a live projection; verifier rejects exact malformed-IR diagnostics. Keep all existing raw type/layout/borrow checks. |
-| Runtime helpers | Use only aggregate_runtime production fragments plus actual allocator/free wrappers. Compare old/fresh pointers only while the old alias/root is live, including equal replacements. If an all-replaced base retires before fresh allocation, compare distinct allocation occurrence IDs and exact frees; malloc may reuse the address (aggregate_runtime_test.h:36–46). Never inspect a freed base or force unnecessary liveness. Each repeated child slot owns separately; unchanged root/list aliases survive nonfinal drop; final destruction accounts for every occurrence, including active owning-union payloads. Actual mortal Strings, nested Lists and Void/unmanaged-union roots. No generated language-symbol calls. |
-| Real main | Entry prints `42\n7\n`. A second fixture declares number before text but writes `{ traced_base() | text = traced_text(), number = traced_number() }`; actual IO prints `base\ntext\nnumber\n7\n7\n`. Add surviving old child and returned updated-child cases. Exact stdout/exit/empty stderr and strict sanitizer evidence; stdout alone never proves destruction. |
-
-Commands are root-only from the assigned integration worktree, with a FRESH host:
-
-```sh
-scripts/compiler-build-status
-bin/blorp test --suite --timeout 180 blorp_2/test/unit/test_check/test_record_updates.brp
-# Expand to affected phase suites, then strict owning/runtime/grammar packet.
-BLORP_MEMORY_STATS=1 BLORP_LEAK_CHECK=strict bin/blorp test --suite --timeout 180 \
-  blorp_2/test/unit blorp_2/test/runtime blorp_2/test/test_grammar
-env BLORP_2_INSTRUCTION_CHECK=required make -C blorp_2 test
-git diff --check
-```
-
-Require passing named callbacks and behavior mutations/restoration, all existing
-e2e plus normal new mains, one compiler build per e2e run, ASan/UBSan and exact
-allocator balances, generated-C ordering/fresh-root proof, current cost ceilings,
-and two independent expert approvals. Shared frozen programs must emit identical
-target C; unrelated layout/ABI changes are not authorized. Inspect default-limit
-C compilation for moderate width/depth; report depth separately from byte size.
-Phase/runtime/source-width measurements have separate workloads. The pilot cannot
-selfcompile: the shared whole-CLI workload is explicitly a proxy excluding host
-bootstrap work and unsupported language features.
-
-#### Release strategy and handback
-
-Review and commit this bounded plan before production. Land one
-complete frontend→construction slice only after every gate; no partially accepted
-update representation or compatibility shim. Revert the slice if a main failure
-cannot be promptly isolated; preserve receipts. Hand back exact changed files,
-source/binary/host/input hashes, independent severity counts/verdicts, red/green
-and mutation receipts, C proof, raw measurements, separate production/test LOC,
-and remaining debts. Ask root before broadening or working around a defect.
-
-### List updates after record updates
-
-Add record update, append, replacement and removal through separate fixtures.
-Initially always allocate fresh results: copy unmanaged slots and acquire
-surviving owned slots, then retire old storage as normal liveness permits.
-Borrowed-input/owned-result functions suffice. Test empty/singleton/many elements,
-absent/boundary lookup, mixed nested elements, changed length/capacity, repeated
-children, replacement from an existing child, and surviving old aliases.
-
-Set/Dict may reuse these slot/destruction contracts, but key equality/hash
-semantics need a separate design. Storing a type does not automatically define
-its suitability as a key.
-
-## Recursive data
-
-Function recursion is already supported. Declared signatures precede bodies;
-concrete function requests reuse exact instance keys. The existing checking rule
-rejects recursive parameter-dependency cycles that increase type depth, including
-unused computations and unselected arms. Bare parameter cycles, permutations and
-concrete resets remain allowed. This conservative first-order termination rule
-can reject finite programs; richer type computation requires fresh review.
-Deduplicating equal keys alone cannot stop infinitely many different keys.
-
-### Unary recursive union
-
-The first planned data-recursion example is deliberately small:
-
-```blorp
-fixed union Nat:
-    Zero
-    Next(Nat)
-
-pure func make() -> Nat:
-    Next(Next(Zero))
-
-pure func walk(value: Nat) -> Int:
-    match value:
-        Zero: 7
-        Next(child): walk(child)
-
-func main() -> Int:
-    walk(make())
-```
-
-Expected exit 7. Resolve self-reference to UnionId; reserve the concrete instance
-in a local builder before expanding children; publish only complete immutable
-rows after resolution. Box every variant of this recursive union, including
-leaves, while preserving existing finite inline unions. Forward C declarations
-and pointer fields produce finite storage. Cross-union, generic-recursive and
-multi-field recursive shapes remain rejected until their increments.
-
-Status: implemented as `BoxedRecursive` in specialization, with checker
-admission, a verifier rule that a layout refers to itself only through a boxed
-payload, and emitted constructor/retain/iterative-release helpers. The
-[report](../benchmarks/results/blorp_2_recursive_unary_2026-10-15.md) records
-the 100,000-node release on a 512 KiB stack and its recursive-release mutation
-oracle. Source construction of such a chain still uses ordinary call depth
-because managed values remain outside `@tail_recursive` loops.
-
-Constructors take completed children, acquiring independent obligations as needed.
-Projections and escapes use the same parent/acquisition contracts as records.
-Carry owned match-prefix obligations into the selected terminating arm and
-transfer/discharge them there; no general join representation is needed. Keeping
-prefix owners until the selected arm returns is a correct first policy, without
-claiming earliest-death cleanup. Reuse the accepted per-arm prefix obligations;
-managed annotated tail-loop restrictions remain until their separate increment.
-
-Final release iterates: decrement root, stop if shared, otherwise save the active
-child, free root once and continue with the child. A leaf ends the walk. Root
-retention does not retain children again. Test every variant, nonfinal/final
-release, escaped child, shared tail, reassignment snapshots and deep destruction.
-This unary release needs no general worklist or function trampoline.
-
-Isolate deep destruction from construction/traversal call depth. In an approved
-runtime-helper test, build a long chain iteratively from completed children,
-retain a middle/shared tail, release the prefix, then release the tail and check
-exact per-object frees. Establish construction completion before the destructor
-mutation runs; a deliberately recursive release must fail the constrained-stack
-case. Keep the initial real-main unary example small. Deep source construction
-and traversal need the later managed tail-loop builder, so an earlier build/walk
-stack overflow must not be reported as destructor evidence.
-
-### Mutual, generic and branching shapes
-
-Add mutual references and regular generic recursive instances through separate
-examples. Reserve canonical declaration/argument keys before following children;
-reject type-changing recursion with an unbounded instance graph. Distinguish
-by-value size dependencies, stored pointer edges and phantom type arguments.
-List[Tree] already provides indirection; not every semantic type cycle requires
-boxing every participant. Do not merely relax child-before-parent ordinal checks.
-
-A useful union-based List needs both head and tail, through multiple constructor
-fields or a record payload. Compose arbitrary supported elements using the same
-slot contracts. Before admitting branching/mutual mixed shapes, prove bounded
-C stack across the entire release graph, including record -> List -> union ->
-record. Iterative helpers that recursively call one another are insufficient.
-Select any needed local worklist with its working example under AGENTS.md;
-no speculative destructor registry. Test shared-tail diamonds, repeated slots,
-mixed inline owning children, all variants and deep branching teardown.
-
-### Acyclic values and future COW
-
-Recursive type graphs may have cycles; runtime values must remain finite DAGs.
-Construct roots from completed children. No recursive value bindings,
-backpatching, lazy knot tying or shared mutable references are available.
-
-```blorp
-var value = make_zero()
-snapshot = value
-value = wrap(value)
-```
-
-This future example preserves the old root under the new one. Reassignment
-changes a binding, not snapshot. Raw verification rejects forward/self child
-value uses and invalid or reused obligations. No cycle detector/collector is
-required by the admitted value shapes.
-
-Always-fresh updates preserve that construction argument. Later unique-storage
-COW/reuse would require a consumed root obligation, no conflicting live projection,
-and independently secured replacement children before testing uniqueness.
-RC == 1 alone cannot authorize mutation of a borrowed input. The illustrative
-update `value = { value | child = Some(value) }` must produce a new root pointing
-to the old snapshot, never install the root into itself. Reuse is deferred.
-
-## Tail-recursion follow-ups
-
-Unmanaged nongeneric direct-self loops are implemented. The regular accumulator
-fixture checks exact output through one million iterations; the separate
-billion-iteration run is retained in the
-[argument report](../benchmarks/results/blorp_2_arguments_2026-10-12.md).
-Ordinary calls still use the C stack; recursion is not automatically constant-stack.
-
-1. **Same-instance generics.** Accept an annotated self edge only when substitution
-   preserves every enclosing rigid parameter in order. Equal C layouts are not
-   equal concrete instances. Define managed-instantiation rejection/support before
-   enabling the annotation and retain growing-instantiation checking separately.
-2. **Managed values.** Start with one String carrier and a terminating match after
-   prefix handling is supported. Keep the external borrowed ABI; internal carried
-   obligations are explicit. Entry acquires internal loop owners from borrowed
-   parameters; it must never retire the caller's obligation. Each managed parameter
-   occurrence carries its own obligation, including duplicate aliases. Evaluate
-   next arguments, acquire/transfer next owners,
-   retire old obligations, then rebind and jump. No pending cleanup follows the
-   backedge. Base returns transfer the result and discharge remaining owners.
-3. **Recursive managed data.** Compose the proven transition with unary recursive
-   data. Acquire the next projected child before retiring its parent, then add
-   deep traversal and destruction oracles.
-
-Test entry acquisition and caller survival, unchanged/fresh carriers, aliasing,
-duplicate/swap arguments, unused
-intermediates, projected children and every return/edge directly at each affected
-phase. Mutual tail-call guarantees and tail-modulo-constructor are separate future
-designs. Stack safety for traversal and stack safety for destruction are separate
-acceptance criteria.
-
-## Broader control flow and later scope
-
-Before non-tail matches, introduce typed block arguments and explicit edge
-transfers; before loops, define carried values and all exits. Use SSA as the
-working direction, without adding general phi/dominance machinery to straight-line
-bindings. Only the selected branch executes; no blanket cleanup after a match.
-Ordinary record syntax can reuse managed-root machinery with the same value
-semantics. Closures need capture/escape and final capture destruction tests when
-admitted. They do not justify adding closure infrastructure now.
-
 ## Phase-level test contract
 
 Use named Blorp TestSuite callbacks; no subprocess per phase assertion and no
@@ -1136,7 +728,7 @@ separate from verified products. Do not weaken production APIs for tests.
 | Ownership insertion | Per-slot multiplicity, repeated child values, borrowed acquisition, unused-root cleanup, returned/stored escape, RHS-before-old-drop, selected-path owner discharge. |
 | Independent raw verifier | Missing/double consume on one path, early owner drop, borrowed escape, wrong parent/field/type, use after transfer, leaked roots, sibling facts and invalid match coverage; inspect actual operations, not insertion decisions. |
 | C emission | Independently expected small typed operation sequences, correct helpers/operands, acquire-before-retire, active-field cleanup, no invented owners; inspect layout order and structural depth. |
-| Target runtime | Nonfinal release preserves children; final release destroys each occurrence/root once; repeated pointers and independent owners; mixed inline children; recursive shared tails and bounded destruction. |
+| Target runtime | Nonfinal release preserves children; final release destroys each occurrence/root once; repeated pointers and independent owners; mixed inline children; recursive shared tails and measured release depth. |
 | General collections | Initialized length distinct from capacity; empty/boundary/absent access; insert/replace/remove/grow cleanup, no stale owned tail slots, old snapshots unchanged. |
 | Real-main e2e | Mixed numeric/managed fields observed, temporary-parent escape, duplicate child fields, nested/generic elements, old aliases, recursive snapshots and deep destruction. |
 | Future COW/reuse only | Shared aliases preserved; unique update has consumed permission and no conflicting borrow; replacement acquisition precedes uniqueness; safe capacity/layout fallback. |
@@ -1163,7 +755,7 @@ Deliberately omit one child drop, target a different child, remove required
 acquisition, or free a root twice and require its protected test to fail. Where
 branching exists, defect only one arm. Collection tests must detect a forgotten
 removed child and a double-dropped shifted child. Later update tests must fail if
-an old alias changes; later recursion tests must detect recursive C teardown.
+an old alias changes; the unary-chain test must detect recursive C teardown.
 Restore exact sources before final gates. These are bounded oracle checks, not
 permission for a mutation framework.
 
@@ -1183,41 +775,50 @@ keep real-main fixtures unmodified. Missing aggregate destruction evidence is an
 implementation acceptance dependency to report, not permission for an implicit
 test driver or a claim that compiler leak checks prove target cleanup.
 
-## Validation and acceptance
-
-Each slice must provide red/green fixtures, granular positive/error/malformed-IR
-tests, complete immutable facts, independent ownership verification, generated-C
-inspection and runtime lifetime/destruction evidence for its admitted shapes.
-Compiler-expert code-reviewer and test-runner review both design and final change.
-Do not mark a milestone complete while required evidence is missing.
-
-### Complexity and compiler-cost tracking
+## Cost and evidence rules
 
 Allocations and retired instructions may increase as capabilities grow. Record
-both on frozen baseline/candidate inputs with the same toolchain, serially and
-separately from target lifetime evidence. Before changing a major carrier,
-freeze its input corpus and numerical fixture guards; explain any deliberate
-guard adjustment from measured behavior.
+both on frozen baseline and candidate inputs with the same toolchain, serially
+and separately from target lifetime evidence, with source, binary, flags, inputs,
+raw samples and output identity retained in one report and raw artifacts under
+ignored `build/`. Report production and test lines separately. Owned-input
+costs are proxies for self-compilation until M8 gives the self-compile cost row.
 
-For new traversals/builders, state their input-size dimensions and expected
-work. Exercise a small scaling series, such as 16/32/64/128 stored fields or
-concrete shapes, and inspect work/allocation/instruction growth. Investigate
-repeatable near-quadratic doubling and repeated whole-body/layout scans or
-copies; avoid introducing superlinear algorithms where a direct bounded
-traversal suffices. Existing linear instance-key scans are not a claim of total
-linear compilation. Report inherited scaling separately and add an index only
-when a measured query justifies its key, authority and lifetime.
+- **Preparatory refactors** freeze a matched same-toolchain baseline, emit
+  identical existing target C and stay within +3% allocations and minimum
+  retired instructions per frozen input. A lowering preparation stops for design
+  review above +50 production lines or a wider algorithmic change.
+- **Features** may change emitted C and increase costs: set numerical fixture
+  limits before implementation, report new-feature work separately from the
+  shared corpus, and take the +5% target and +10% per-input hard ceiling as the
+  default shared-input budget. No average conceals an individual breach.
+  Existing fixture ceilings stay unchanged unless a reviewed, measured
+  adjustment says otherwise. A line threshold is never pressure to compress
+  formatting, delete tests or weaken handling.
+- **Scaling.** For a new traversal or builder, state its input-size dimensions
+  and expected work and exercise a 16/32/64/128 series; investigate repeatable
+  near-quadratic doubling and repeated whole-body or layout scans. Where a
+  milestone adds accumulating nesting, add a moderately sized stress case,
+  compile it with the supported C toolchains at default limits and record the
+  emitted nesting depth. Report inherited scaling separately and add an index
+  only when a measured query justifies its key, authority and lifetime.
+- **Not required.** No feature requires fewer allocations, minimal retains, unique
+  reuse or a new optimization benchmark. Keep local uniquely owned builders and
+  one published row or slot per concrete fact.
 
-This tracking does not require allocation reduction, minimal ARC traffic or
-optimization passes as feature acceptance. Keep local uniquely owned builders
-and one published row/slot per concrete fact; measure rather than hiding the
-host compiler's physical storage costs.
+Every affected phase gets granular typed-input and typed-output tests; insertion
+and raw verification are tested independently; runtime-helper tests observe
+individual objects. A worker reports an ambiguous boundary, unexpected cost or
+scope expansion before adding a mechanism. Hand back exact supported shapes and
+contracts, red/green and mutation outcomes, C observations, gate verdicts and
+remaining limits. Stop and report host defects, unapproved mechanisms, missing
+destruction oracles and incomplete representation; never work around them with
+partial publication or unchecked emission.
 
 From the repository root, check host freshness and use focused suites first:
 
 ```sh
 scripts/compiler-build-status
-bin/blorp test --suite --timeout 180 blorp_2/test/unit/test_check/test_records.brp
 bin/blorp test --suite --timeout 180 blorp_2/test/unit/test_own/test_own.brp
 bin/blorp test --suite --timeout 180 blorp_2/test/unit/test_verify/test_verify.brp
 bin/blorp test --suite --sanitize --leak-check --timeout 180 blorp_2/test/unit
@@ -1225,22 +826,18 @@ make -C blorp_2 test
 git diff --check
 ```
 
-If not FRESH, run make then recheck before direct tests. Add owning frontend,
-grammar/runtime suites as appropriate. E2e builds the pilot once at O0, compiles
-unmodified fixture C at O0 and uses timeout 0. No persistent compiler cache.
+If the host is not FRESH, run `make` then recheck before direct tests. E2e builds
+the pilot once at O0, compiles unmodified fixture C at O0 and uses timeout 0; no
+persistent compiler cache.
 
-Keep source/binary/toolchain/input provenance and gates in one retained report,
-with raw artifacts under ignored build/. Existing test ceilings and repository
-measurement rules still apply to performance claims and compiler data-model
-refactors. Report production/test LOC separately; owned-input costs are proxies,
-not self-compilation. Old slice-specific thresholds/counts are historical evidence,
-not current budgets. No feature requires fewer allocations, minimal retains,
-unique reuse or a new optimization benchmark.
+## Deferred beyond the fixpoint
 
-Hand back exact supported shapes/contracts, red/green and mutation outcomes,
-C observations, gate verdicts and remaining limits. Stop and report host defects,
-unapproved mechanisms, missing destruction oracles and incomplete representation.
-Never work around them with partial publication or unchecked emission.
+Unique-root COW and allocation reuse (first candidate if M8 shows quadratic
+`append`), retain elimination, consuming-ABI inference, List removal, Set/Dict
+key semantics (storing a type does not make it a key), mutual tail calls,
+tail-modulo-constructor, closure escape and closure values, and the unit-test
+migration plan. When reuse is introduced, its enabled and always-fresh paths must
+agree on observable values and safe destruction.
 
 ## Established references and local choices
 
@@ -1271,32 +868,12 @@ Carry useful contracts forward, not broad mutable environments or string-keyed
 semantic rediscovery. Historical aggregate-child protection and builder-COW
 failures supply regression ideas, not claims about current bugs.
 
-## Retained evidence and history
+## Retained evidence
 
-Current plans live here; completed experiments, counts, historical budgets and
-host-compiler limitations live in their reports:
-
-- [Bindings](../benchmarks/results/blorp_2_bindings_2026-10-09.md),
-  [arm blocks](../benchmarks/results/blorp_2_arm_bindings_2026-10-09.md),
-  [managed Strings](../benchmarks/results/blorp_2_managed_strings_2026-10-09.md)
-  and [tail-arm ownership](../benchmarks/results/blorp_2_tail_strings_2026-10-09.md).
-- [Typed errors](../benchmarks/results/blorp_2_typed_checker_errors_2026-10-09.md),
-  [checking/synthesis](../benchmarks/results/blorp_2_synthesis_checking_2026-10-09.md),
-  [function parameters](../benchmarks/results/blorp_2_function_type_parameters_2026-10-09.md),
-  [union parameters](../benchmarks/results/blorp_2_union_type_parameters_2026-10-10.md),
-  [nested applications](../benchmarks/results/blorp_2_generic_nested_2026-10-10.md)
-  and [managed union payloads](../benchmarks/results/blorp_2_managed_union_payloads_2026-10-11.md).
-- [Fixed records](../benchmarks/results/blorp_2_fixed_records_2026-10-10.md),
-  [function recursion](../benchmarks/results/blorp_2_function_recursion_2026-10-10.md),
-  [tail loops](../benchmarks/results/blorp_2_tail_recursion_2026-10-10.md),
-  [argv](../benchmarks/results/blorp_2_arguments_2026-10-12.md)
-  and [ownership reconciliation](../benchmarks/results/blorp_2_argv_reconciliation_2026-10-12.md).
-- [Host temporary-projection repair](../benchmarks/results/compiler_nested_temporary_projection_2026-10-11.md).
-  Passing pilot checks do not imply an incomplete broader host gate passed.
-
-For the superseded wording and historical thresholds, use the Git snapshots of
-[memory](https://github.com/kablorp/blorp/blob/79deebd455856e5955d215ff2ec36f17860feb14/blorp_2/MEMORY_PLAN.md),
-[generics](https://github.com/kablorp/blorp/blob/79deebd455856e5955d215ff2ec36f17860feb14/blorp_2/GENERICS_PLAN.md),
-[recursion](https://github.com/kablorp/blorp/blob/79deebd455856e5955d215ff2ec36f17860feb14/blorp_2/RECURSION_PLAN.md)
-and the [older one-String-field proposal](https://github.com/kablorp/blorp/blob/79deebd455856e5955d215ff2ec36f17860feb14/blorp_2/MANAGED_RECORDS_PLAN.md).
-They are historical evidence; this consolidated roadmap supersedes their plans.
+Completed experiments, counts, historical budgets and host-compiler limitations
+live in the reports linked under [Delivered foundation](#delivered-foundation)
+and in the milestones above, plus the
+[host temporary-projection repair](../benchmarks/results/compiler_nested_temporary_projection_2026-10-11.md);
+passing pilot checks do not imply an incomplete broader host gate passed.
+Old slice-specific thresholds and counts are historical evidence, not current
+budgets.

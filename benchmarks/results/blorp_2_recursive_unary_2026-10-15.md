@@ -1,7 +1,7 @@
 # Unary recursive unions: boxed representation and iterative release
 
 The pilot now admits a union that names itself as one direct variant payload,
-the first shape of [roadmap item 5](../../blorp_2/ROADMAP.md#recursive-data):
+the first shape of [roadmap milestone M4](../../blorp_2/ROADMAP.md#m4-recursive-types):
 
 ```blorp
 fixed union Nat:

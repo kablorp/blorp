@@ -543,7 +543,7 @@ fixture has limits of 10,000 allocations and 100,000,000 instructions. Calls
 use the C stack; automatic tail-call optimization and constant-stack recursion are not
 part of this increment. Cyclic runtime data is forbidden. The first recursive
 data shape, a [unary recursive union](#unary-recursive-unions), is supported;
-the [recursive-data roadmap](ROADMAP.md#recursive-data) defines the remaining
+the [M4 recursive-types roadmap](ROADMAP.md#m4-recursive-types) defines the remaining
 shapes and their ownership requirements.
 An explicit `@tail_recursive` function has a checked direct-self loop guarantee:
 
@@ -585,7 +585,7 @@ ordinary stack behavior. The annotation does not bound heap use or prove
 termination. Unannotated C output is preserved. The
 [tail-recursion report](../benchmarks/results/blorp_2_tail_recursion_2026-10-10.md)
 records phase invariants, malformed-IR tests and the native stack-exhaustion
-mutation oracle. The [tail-loop roadmap](ROADMAP.md#tail-recursion-follow-ups)
+mutation oracle. The [tail-loop roadmap](ROADMAP.md#m3-loops-and-tail-recursion)
 retains the unfinished generic and managed loop requirements.
 
 The [numeric accumulator](test/e2e/fixtures/tail_recursion/accumulator.brp)
@@ -774,7 +774,7 @@ Whole-variable reassignment preserves old aliases. Empty record
 declarations, recursive records and field assignment remain unsupported.
 Recursive declaration references other than a union's direct self payload
 reject before layout expansion.
-The [roadmap](ROADMAP.md#first-increment-mixed-finite-records) tracks final
+The [roadmap](ROADMAP.md#delivered-foundation) tracks final
 integrated acceptance and later aggregate extensions.
 
 ## Fresh record updates
