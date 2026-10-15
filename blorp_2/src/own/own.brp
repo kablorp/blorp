@@ -1,0 +1,1051 @@
+import:
+	int as IntOps
+	list: set_index
+	../lower/lower:
+		LoweredExit(ReturnValue, RecurValues),
+		LoweredFunction,
+		LoweredMatch,
+		LoweredProgram,
+		LoweredTail(ExitValue, MatchValue),
+		MatchLabel,
+		ValueDefinition,
+		ValueId,
+		ValueOperation(
+			ParameterValue, VoidValue, IntegerValue, FloatValue, StringValue,
+			CallValue, ConstructValue, PayloadValue, ConstructRecordValue, ReadRecordFieldValue,
+		),
+		lowered_functions,
+		value_number,
+	option: is_some, to_result
+	../utils/source: COMPILER_SOURCE
+	../specialize/specialize:
+		ConcreteCall,
+		ConcreteRecord,
+		ConcreteUnion,
+		FieldInstanceId,
+		FunctionInstanceId,
+		FunctionSignature,
+		RecordInstanceId,
+		TypeRef,
+		UnionInstanceId,
+		ValueOwnership(
+			NoOwnership, ManagedStringLeaf, ManagedListRoot, ManagedRecordRoot,
+			InlineOwnedFields,
+		),
+		VariantInstanceId, VariantFieldInstanceId,
+		value_ownership,
+	../utils/syntax: Diagnostic, Entrypoint, FunctionExecution(OrdinaryCalls, SelfTailLoop), Span
+	../utils/text: concat
+
+
+-- This identity names an obligation in an unverified function body. Only the
+-- independent verifier establishes its membership, lifetime and uniqueness.
+opaque type OwnerId = Int
+
+
+pure func owner_id(ordinal: Int) -> OwnerId:
+	into_opaque OwnerId(ordinal)
+
+
+pure func owner_number(id: OwnerId) -> Int:
+	from_opaque OwnerId(id)
+
+
+fixed union BorrowSource:
+	ParameterBorrow(ValueId)
+	OwnerBorrow(OwnerId)
+	PayloadBorrow(ValueId)
+
+
+fixed record BorrowedValue {
+	value: ValueId,
+	source: BorrowSource
+}
+
+
+fixed union OwnedArgument:
+	UnmanagedArgument(ValueId)
+	BorrowedArgument(BorrowedValue)
+
+
+fixed union ResultOwnership:
+	UnmanagedResult
+	BorrowedResult(BorrowSource)
+	OwnedResult(OwnerId)
+
+
+fixed union StoredPayload:
+	UnmanagedPayload(ValueId)
+	OwnedPayload(ValueId, OwnerId)
+
+
+fixed record OwnedRecordField {
+	field: FieldInstanceId,
+	value: StoredPayload
+}
+
+
+fixed union OwnedValueOperation:
+	ConstructRecordDefinition(RecordInstanceId, List[OwnedRecordField])
+	ReadRecordFieldDefinition(FieldInstanceId, OwnedArgument)
+	ParameterDefinition(Int)
+	VoidDefinition
+	IntegerDefinition(Int)
+	FloatDefinition(Float)
+	StringDefinition(String)
+	CallDefinition(ConcreteCall, List[OwnedArgument])
+	ConstructDefinition(VariantInstanceId, List[StoredPayload])
+	PayloadDefinition(VariantFieldInstanceId, ValueId)
+
+
+fixed record OwnedDefinition {
+	id: ValueId,
+	value_type: TypeRef,
+	operation: OwnedValueOperation,
+	result: ResultOwnership,
+	span: Span
+}
+
+
+fixed union OwnershipOperation:
+	DefineValue(OwnedDefinition)
+	AcquireOwner(OwnerId, BorrowedValue, Span)
+	DropOwner(OwnerId, Span)
+
+
+fixed union ReturnTransfer:
+	UnmanagedReturn(ValueId)
+	OwnedReturn(ValueId, OwnerId)
+
+
+fixed union OwnedExit:
+	ReturnResult(ReturnTransfer)
+	RecurArguments(List[ValueId], Span)
+
+
+fixed record OwnedArm {
+	label: MatchLabel,
+	operations: List[OwnershipOperation],
+	exit: OwnedExit
+}
+
+
+fixed record OwnedMatch {
+	scrutinee: OwnedArgument,
+	owner: UnionInstanceId,
+	arms: List[OwnedArm]
+}
+
+
+fixed union OwnedTail:
+	ReturnTail(OwnedExit)
+	MatchTail(OwnedMatch)
+
+
+fixed record OwnedFunction {
+	execution: FunctionExecution,
+	signature: FunctionSignature,
+	operations: List[OwnershipOperation],
+	tail: OwnedTail
+}
+
+
+fixed record OwnershipProgram {
+	records: List[ConcreteRecord],
+	unions: List[ConcreteUnion],
+	functions: List[OwnedFunction],
+	entrypoint: Entrypoint[FunctionInstanceId]
+}
+
+
+private pure func internal_error(span: Span, message: String) -> Diagnostic:
+	{
+		span = span,
+		note = None,
+		message = "internal compiler error: ".concat(message),
+		help = "report this compiler error with the input program"
+	}
+
+
+-- Last-use positions belong to this block; ValueIds remain function-wide.
+-- The dense prefix is visible, but earlier sibling ordinals are not.
+private pure func use_slot(
+	value: ValueId,
+	position: Int,
+	prefix_count: Int,
+	first_value: Int,
+	slot_count: Int,
+	span: Span,
+) -> Result[Option[Int], Diagnostic]:
+	ordinal = value_number(value)
+
+	if IntOps.greater_than_or_equal(ordinal, 0) and IntOps.less_than(ordinal, prefix_count):
+		Ok(None)
+	else if IntOps.greater_than_or_equal(ordinal, first_value) and IntOps.less_than(
+		ordinal,
+		IntOps.add(first_value, position),
+	):
+		index = IntOps.subtract(ordinal, first_value)
+
+		if IntOps.greater_than_or_equal(index, 0) and IntOps.less_than(index, slot_count):
+			Ok(Some(index))
+		else:
+			Err(internal_error(span, "invalid value identity in ownership use analysis"))
+	else:
+		Err(internal_error(span, "invalid value identity in ownership use analysis"))
+
+
+private pure func use_operands(operation: ValueOperation) -> List[ValueId]:
+	match operation:
+		ConstructRecordValue(_, fields):
+			fields.map(pure func(field): field.value)
+		ReadRecordFieldValue(_, value):
+			[value]
+		CallValue(_, arguments):
+			arguments
+		ConstructValue(_, arguments):
+			arguments
+		PayloadValue(_, value):
+			[value]
+		ParameterValue(_):
+			[]
+		VoidValue:
+			[]
+		IntegerValue(_):
+			[]
+		FloatValue(_):
+			[]
+		StringValue(_):
+			[]
+
+
+pure func exit_last_uses(
+	definitions: List[ValueDefinition],
+	exit: LoweredExit,
+	prefix_count: Int,
+	first_value: Int,
+) -> Result[List[Option[Int]], Diagnostic]:
+	var uses = definitions.map(pure func(_: ValueDefinition) -> Option[Int]: None)
+	var position: Int = 0
+	var failure: Option[Diagnostic] = None
+
+	for definition in definitions:
+		if IntOps.not_equals(
+			value_number(definition.id),
+			IntOps.add(first_value, position),
+		):
+			failure = Some(
+				internal_error(
+					definition.span,
+					"nonconsecutive value identity in ownership use analysis",
+				),
+			)
+			break
+
+		-- Slot validation borrows only scalar bounds, so each write keeps the
+		-- same local vector owner rather than sharing it through Result[List].
+		for operand in use_operands(definition.operation):
+			match use_slot(
+				operand,
+				position,
+				prefix_count,
+				first_value,
+				uses.length(),
+				definition.span,
+			):
+				Ok(Some(index)):
+					uses = uses.set(index, Some(position))
+				Ok(None):
+					void
+				Err(error):
+					failure = Some(error)
+					break
+
+		if failure.is_some():
+			break
+
+		position = IntOps.add(position, 1)
+
+	ready ?= match failure:
+		Some(error):
+			Err(error)
+		None:
+			Ok(void)
+
+	operands = match exit:
+		ReturnValue(result):
+			[result]
+		RecurValues(arguments, _):
+			arguments
+
+	span_result: Result[Span, Diagnostic] = match exit:
+		RecurValues(_, span):
+			Ok(span)
+		ReturnValue(result):
+			ordinal = value_number(result)
+
+			if (
+				IntOps.greater_than_or_equal(ordinal, 0)
+				and IntOps.less_than(ordinal, prefix_count)
+			):
+				Ok({
+					source = COMPILER_SOURCE,
+					start = 0,
+					end = 0,
+				})
+			else:
+				definition ?= definitions
+					.get(IntOps.subtract(ordinal, first_value))
+					.to_result(
+						internal_error(
+							{
+								source = COMPILER_SOURCE,
+								start = 0,
+								end = 0
+							},
+							"invalid return value in ownership use analysis",
+						),
+					)
+				Ok(definition.span)
+
+	span ?= span_result
+	-- Start this builder inside the successful span scope. The outer snapshot
+	-- may cause one initial copy; subsequent writes keep the local vector owner.
+	var terminal_uses = uses
+	var invalid: Option[Diagnostic] = None
+
+	for operand in operands:
+		match use_slot(
+			operand,
+			position,
+			prefix_count,
+			first_value,
+			terminal_uses.length(),
+			span,
+		):
+			Ok(Some(index)):
+				terminal_uses = terminal_uses.set(index, Some(position))
+			Ok(None):
+				void
+			Err(error):
+				invalid = Some(error)
+				break
+
+	match invalid:
+		Some(error):
+			Err(error)
+		None:
+			Ok(terminal_uses)
+
+
+pure func block_last_uses(
+	definitions: List[ValueDefinition],
+	result: ValueId,
+	prefix_count: Int,
+	first_value: Int,
+) -> Result[List[Option[Int]], Diagnostic]:
+	exit_last_uses(definitions, ReturnValue(result), prefix_count, first_value)
+
+
+pure func last_uses(
+	definitions: List[ValueDefinition],
+	result: ValueId,
+) -> Result[List[Option[Int]], Diagnostic]:
+	block_last_uses(definitions, result, 0, 0)
+
+
+private fixed record ChildAcquisition {
+	owner: OwnerId,
+	borrow: BorrowedValue
+}
+
+
+private fixed union AcquisitionPlan:
+	StoredAcquisitions(List[ChildAcquisition])
+	ProjectedAcquisition(ChildAcquisition)
+
+
+private fixed record BuiltDefinition {
+	definition: OwnedDefinition,
+	next_owner: Int,
+	acquisitions: AcquisitionPlan
+}
+
+
+private pure func value_source(
+	value: ValueId,
+	sources: List[ResultOwnership],
+	prefix: List[ResultOwnership],
+	first_value: Int,
+	span: Span,
+) -> Result[ResultOwnership, Diagnostic]:
+	ordinal = value_number(value)
+
+	entry = if IntOps.less_than(ordinal, prefix.length()):
+		prefix.get(ordinal)
+	else:
+		sources.get(IntOps.subtract(ordinal, first_value))
+
+	entry.to_result(internal_error(span, "value used before definition in ownership insertion"))
+
+
+private pure func arguments(
+	value: ValueId,
+	sources: List[ResultOwnership],
+	prefix: List[ResultOwnership],
+	first_value: Int,
+	span: Span,
+) -> Result[OwnedArgument, Diagnostic]:
+	source ?= value_source(value, sources, prefix, first_value, span)
+	Ok(
+		match source:
+			UnmanagedResult:
+				UnmanagedArgument(value)
+			BorrowedResult(source):
+				BorrowedArgument({
+					value = value,
+					source = source,
+				})
+			OwnedResult(owner):
+				BorrowedArgument({
+					value = value,
+					source = OwnerBorrow(owner),
+				})
+	)
+
+
+private pure func build_definition(
+	definition: ValueDefinition,
+	sources: List[ResultOwnership],
+	prefix: List[ResultOwnership],
+	first_value: Int,
+	next_owner: Int,
+	unions: List[ConcreteUnion],
+	records: List[ConcreteRecord],
+) -> Result[BuiltDefinition, Diagnostic]:
+	plan ?= value_ownership(definition.value_type, unions, records)
+	var next = next_owner
+	var acquisitions: List[ChildAcquisition] = []
+
+	operation_result: Result[OwnedValueOperation, Diagnostic] = match definition.operation:
+		ConstructRecordValue(owner, fields):
+			var stored: List[OwnedRecordField] = []
+			var failure: Option[Diagnostic] = None
+
+			for field in fields:
+				match arguments(field.value, sources, prefix, first_value, definition.span):
+					Err(error):
+						failure = Some(error)
+						break
+					Ok(UnmanagedArgument(value)):
+						stored = stored.append({
+							field = field.field,
+							value = UnmanagedPayload(value),
+						})
+					Ok(BorrowedArgument(borrow)):
+						child_owner = owner_id(next)
+						next = IntOps.add(next, 1)
+						acquisitions = acquisitions.append({
+							owner = child_owner,
+							borrow = borrow,
+						})
+						stored = stored.append({
+							field = field.field,
+							value = OwnedPayload(field.value, child_owner),
+						})
+
+			match failure:
+				Some(error):
+					Err(error)
+				None:
+					Ok(ConstructRecordDefinition(owner, stored))
+		ReadRecordFieldValue(field, value):
+			arguments(
+				value,
+				sources,
+				prefix,
+				first_value,
+				definition.span,
+			).map(
+				pure func(parent): ReadRecordFieldDefinition(field, parent),
+			)
+		ParameterValue(index):
+			Ok(ParameterDefinition(index))
+		VoidValue:
+			Ok(VoidDefinition)
+		StringValue(bytes):
+			Ok(StringDefinition(bytes))
+		IntegerValue(value):
+			Ok(IntegerDefinition(value))
+		FloatValue(value):
+			Ok(FloatDefinition(value))
+		ConstructValue(id, values):
+			-- Each stored occurrence acquires independently, including Pair(x, x).
+			-- A unary last-use transfer cannot safely generalize to repeated values.
+			var stored: List[StoredPayload] = []
+			var failure: Option[Diagnostic] = None
+			for value in values:
+				match arguments(value, sources, prefix, first_value, definition.span):
+					Err(error):
+						failure = Some(error)
+						break
+					Ok(UnmanagedArgument(value)): stored = stored.append(UnmanagedPayload(value))
+					Ok(BorrowedArgument(borrow)):
+						child_owner = owner_id(next)
+						next = IntOps.add(next, 1)
+						acquisitions = acquisitions.append({ owner = child_owner, borrow = borrow })
+						stored = stored.append(OwnedPayload(value, child_owner))
+			match failure:
+				Some(error): Err(error)
+				None: Ok(ConstructDefinition(id, stored))
+		PayloadValue(variant, value):
+			Ok(PayloadDefinition(variant, value))
+		CallValue(call, written):
+			var converted: List[OwnedArgument] = []
+			var failure: Option[Diagnostic] = None
+
+			for value in written:
+				match arguments(value, sources, prefix, first_value, definition.span):
+					Err(error):
+						failure = Some(error)
+						break
+					Ok(argument):
+						converted = converted.append(argument)
+
+			match failure:
+				Some(error):
+					Err(error)
+				None:
+					Ok(CallDefinition(call, converted))
+
+	operation ?= operation_result
+
+	ownership_result: Result[ResultOwnership, Diagnostic] = match plan:
+		NoOwnership:
+			Ok(UnmanagedResult)
+		ManagedStringLeaf | ManagedListRoot | ManagedRecordRoot(_) | InlineOwnedFields(_):
+			match operation:
+				ParameterDefinition(_):
+					Ok(BorrowedResult(ParameterBorrow(definition.id)))
+				PayloadDefinition(_, source):
+					Ok(BorrowedResult(PayloadBorrow(source)))
+				ReadRecordFieldDefinition(_, argument):
+					parent = match argument:
+						UnmanagedArgument(value):
+							value
+						BorrowedArgument(borrow):
+							borrow.value
+
+					Ok(BorrowedResult(PayloadBorrow(parent)))
+				StringDefinition(_) | CallDefinition(_, _) | ConstructDefinition(_, _) | ConstructRecordDefinition(_, _):
+					Ok(OwnedResult(owner_id(next)))
+				_:
+					Err(internal_error(definition.span, "unsupported managed value operation"))
+
+	result ?= ownership_result
+
+	var updated_owner = match result:
+		OwnedResult(_):
+			IntOps.add(next, 1)
+		_:
+			next
+
+	acquisition_plan = match operation:
+		ReadRecordFieldDefinition(_, _):
+			match result:
+				BorrowedResult(source):
+					owner = owner_id(updated_owner)
+					updated_owner = IntOps.add(updated_owner, 1)
+					ProjectedAcquisition({
+						owner = owner,
+						borrow = {
+							value = definition.id,
+							source = source
+						},
+					})
+				_:
+					StoredAcquisitions(acquisitions)
+		_:
+			StoredAcquisitions(acquisitions)
+
+	Ok({
+		definition = {
+			id = definition.id,
+			value_type = definition.value_type,
+			operation = operation,
+			result = result,
+			span = definition.span
+		},
+		next_owner = updated_owner,
+		acquisitions = acquisition_plan,
+	})
+
+
+private fixed record ScheduledDrop {
+	owner: OwnerId,
+	span: Span
+}
+
+
+private pure func schedule_drop(
+	drops: List[List[ScheduledDrop]],
+	owner: OwnerId,
+	position: Int,
+	uses: List[Option[Int]],
+	definitions: List[ValueDefinition],
+	span: Span,
+) -> Result[List[List[ScheduledDrop]], Diagnostic]:
+	last_use ?= uses
+		.get(position)
+		.to_result(internal_error(span, "missing value-use row"))
+
+	last = match last_use:
+		Some(position):
+			position
+		None:
+			position
+
+	if IntOps.equals(last, definitions.length()):
+		-- The synthetic return use transfers this obligation.
+		Ok(drops)
+	else:
+		definition ?= definitions
+			.get(last)
+			.to_result(internal_error(span, "invalid last-use position"))
+		bucket ?= drops
+			.get(last)
+			.to_result(internal_error(span, "missing drop schedule row"))
+		drops
+			.set_index(
+				last,
+				bucket.append({
+					owner = owner,
+					span = definition.span,
+				}),
+			)
+			.to_result(internal_error(span, "invalid drop schedule position"))
+
+
+private fixed record InsertedBlock {
+	operations: List[OwnershipOperation],
+	exit: OwnedExit,
+	next_owner: Int
+}
+
+
+private pure func insert_block(
+	definitions: List[ValueDefinition],
+	exit: LoweredExit,
+	prefix: List[ResultOwnership],
+	first_value: Int,
+	initial_owner: Int,
+	unions: List[ConcreteUnion],
+	records: List[ConcreteRecord],
+) -> Result[InsertedBlock, Diagnostic]:
+	uses ?= exit_last_uses(definitions, exit, prefix.length(), first_value)
+	var drops = definitions.map(pure func(_: ValueDefinition) -> List[ScheduledDrop]: [])
+	var operations: List[OwnershipOperation] = []
+	var sources: List[ResultOwnership] = []
+	var next_owner = initial_owner
+	var position: Int = 0
+	var failure: Option[Diagnostic] = None
+
+	for definition in definitions:
+
+		match build_definition(
+			definition,
+			sources,
+			prefix,
+			first_value,
+			next_owner,
+			unions,
+			records,
+		):
+			Err(error):
+				failure = Some(error)
+				break
+			Ok(built):
+				match built.acquisitions:
+					StoredAcquisitions(acquired):
+						for acquisition in acquired:
+							operations = operations.append(
+								AcquireOwner(
+									acquisition.owner,
+									acquisition.borrow,
+									definition.span,
+								),
+							)
+					ProjectedAcquisition(_):
+						void
+
+				operations = operations.append(DefineValue(built.definition))
+
+				available = match built.acquisitions:
+					ProjectedAcquisition(acquired):
+						operations = operations.append(
+							AcquireOwner(
+								acquired.owner,
+								acquired.borrow,
+								definition.span,
+							),
+						)
+						OwnedResult(acquired.owner)
+					StoredAcquisitions(_):
+						built.definition.result
+
+				sources = sources.append(available)
+				next_owner = built.next_owner
+
+				match available:
+					OwnedResult(owner):
+						match schedule_drop(
+							drops,
+							owner,
+							position,
+							uses,
+							definitions,
+							definition.span,
+						):
+							Ok(updated):
+								drops = updated
+							Err(error):
+								failure = Some(error)
+								break
+					_:
+						void
+
+		match drops.get(position):
+			Some(bucket):
+				for dropped in bucket:
+					operations = operations.append(DropOwner(dropped.owner, dropped.span))
+			None:
+				failure = Some(internal_error(definition.span, "missing drop schedule row"))
+				break
+
+		position = IntOps.add(position, 1)
+
+	match failure:
+		Some(error):
+			Err(error)
+		None:
+			tail_result: Result[OwnedExit, Diagnostic] = match exit:
+				RecurValues(arguments, span):
+					Ok(RecurArguments(arguments, span))
+				ReturnValue(result):
+					span: Span = match definitions.get(
+						IntOps.subtract(
+							value_number(result),
+							first_value,
+						),
+					):
+						Some(definition):
+							definition.span
+						None:
+							{
+								source = COMPILER_SOURCE,
+								start = 0,
+								end = 0
+							}
+
+					source ?= value_source(result, sources, prefix, first_value, span)
+
+					tail = match source:
+						UnmanagedResult:
+							UnmanagedReturn(result)
+						OwnedResult(owner):
+							OwnedReturn(result, owner)
+						BorrowedResult(source):
+							owner = owner_id(next_owner)
+							operations = operations.append(
+								AcquireOwner(
+									owner,
+									{
+										value = result,
+										source = source
+									},
+									span,
+								),
+							)
+							next_owner = IntOps.add(next_owner, 1)
+							OwnedReturn(result, owner)
+
+					Ok(ReturnResult(tail))
+
+			tail ?= tail_result
+			Ok({
+				operations = operations,
+				exit = tail,
+				next_owner = next_owner,
+			})
+
+
+private pure func insert_match(
+	function: LoweredFunction,
+	matched: LoweredMatch,
+	unions: List[ConcreteUnion],
+	records: List[ConcreteRecord],
+) -> Result[OwnedFunction, Diagnostic]:
+	var operations: List[OwnershipOperation] = []
+	var sources: List[ResultOwnership] = []
+	var next_value = function.definitions.length()
+	var next_owner: Int = 0
+	var arms: List[OwnedArm] = []
+	var failure: Option[Diagnostic] = None
+
+	var prefix_owners: List[ScheduledDrop] = []
+
+	for definition in function.definitions:
+		match build_definition(definition, sources, [], 0, next_owner, unions, records):
+			Ok(built):
+				match built.acquisitions:
+					StoredAcquisitions(acquired):
+						for acquisition in acquired:
+							operations = operations.append(
+								AcquireOwner(
+									acquisition.owner,
+									acquisition.borrow,
+									definition.span,
+								),
+							)
+					ProjectedAcquisition(_):
+						void
+
+				operations = operations.append(DefineValue(built.definition))
+
+				available = match built.acquisitions:
+					ProjectedAcquisition(acquired):
+						operations = operations.append(
+							AcquireOwner(
+								acquired.owner,
+								acquired.borrow,
+								definition.span,
+							),
+						)
+						OwnedResult(acquired.owner)
+					StoredAcquisitions(_):
+						built.definition.result
+
+				sources = sources.append(available)
+				next_owner = built.next_owner
+
+				match available:
+					OwnedResult(owner):
+						prefix_owners = prefix_owners.append({
+							owner = owner,
+							span = definition.span,
+						})
+					_:
+						void
+			Err(error):
+				failure = Some(error)
+				break
+
+	valid_prefix ?= match failure:
+		Some(error):
+			Err(error)
+		None:
+			Ok(void)
+
+	scrutinee_definition ?= function.definitions
+		.get(value_number(matched.scrutinee))
+		.to_result(
+			internal_error(
+				{
+					source = COMPILER_SOURCE,
+					start = 0,
+					end = 0
+				},
+				"missing match scrutinee definition",
+			),
+		)
+	scrutinee ?= arguments(matched.scrutinee, sources, [], 0, scrutinee_definition.span)
+
+	for arm in matched.arms:
+		match insert_block(
+			arm.body.definitions,
+			arm.body.exit,
+			sources,
+			next_value,
+			next_owner,
+			unions,
+			records,
+		):
+			Ok(built):
+				var arm_operations = built.operations
+
+				returned = match built.exit:
+					ReturnResult(OwnedReturn(_, owner)):
+						Some(owner)
+					_:
+						None
+
+				-- Prefix obligations remain live until this selected arm exits.
+				-- Return acquisition has already run, before any ancestor cleanup.
+				for pending in prefix_owners:
+					transferred = match returned:
+						Some(owner):
+							IntOps.equals(owner_number(owner), owner_number(pending.owner))
+						None:
+							False
+
+					if not transferred:
+						arm_operations = arm_operations.append(
+							DropOwner(
+								pending.owner,
+								pending.span,
+							),
+						)
+
+				arms = arms.append({
+					label = arm.label,
+					operations = arm_operations,
+					exit = built.exit,
+				})
+				next_value = IntOps.add(next_value, arm.body.definitions.length())
+				next_owner = built.next_owner
+			Err(error):
+				failure = Some(error)
+				break
+
+	match failure:
+		Some(error):
+			Err(error)
+		None:
+			Ok({
+				execution = function.execution,
+				signature = function.signature,
+				operations = operations,
+				tail = MatchTail({
+					scrutinee = scrutinee,
+					owner = matched.owner,
+					arms = arms,
+				}),
+			})
+
+
+private pure func managed_loop(span: Span) -> Diagnostic:
+	{
+		span = span,
+		note = None,
+		message = "managed values in @tail_recursive functions are not supported yet",
+		help = "use an unmanaged helper, or remove @tail_recursive"
+	}
+
+
+private pure func admit_loop_values(
+	definitions: List[ValueDefinition],
+	unions: List[ConcreteUnion],
+	records: List[ConcreteRecord],
+) -> Result[Void, Diagnostic]:
+	var invalid: Option[Diagnostic] = None
+
+	for definition in definitions:
+		match value_ownership(definition.value_type, unions, records):
+			Err(error):
+				invalid = Some(error)
+				break
+			Ok(ManagedStringLeaf) | Ok(ManagedListRoot) | Ok(ManagedRecordRoot(_)) | Ok(InlineOwnedFields(_)):
+				invalid = Some(managed_loop(definition.span))
+				break
+			Ok(NoOwnership):
+				void
+
+	match invalid:
+		Some(error):
+			Err(error)
+		None:
+			Ok(void)
+
+
+private pure func admit_loop(
+	function: LoweredFunction,
+	unions: List[ConcreteUnion],
+	records: List[ConcreteRecord],
+) -> Result[Void, Diagnostic]:
+	match function.execution:
+		OrdinaryCalls:
+			Ok(void)
+		SelfTailLoop(annotation):
+			var invalid: Option[Diagnostic] = None
+
+			for value_type in function.signature.parameters.append(function.signature.return_type):
+				match value_ownership(value_type, unions, records):
+					Err(error):
+						invalid = Some(error)
+						break
+					Ok(ManagedStringLeaf) | Ok(ManagedListRoot) | Ok(ManagedRecordRoot(_)) | Ok(InlineOwnedFields(_)):
+						invalid = Some(managed_loop(annotation))
+						break
+					Ok(NoOwnership):
+						void
+
+			signature ?= match invalid:
+				Some(error):
+					Err(error)
+				None:
+					Ok(void)
+
+			prefix ?= admit_loop_values(function.definitions, unions, records)
+
+			match function.tail:
+				ExitValue(_):
+					Ok(void)
+				MatchValue(matched):
+					for arm in matched.arms:
+						match admit_loop_values(arm.body.definitions, unions, records):
+							Err(error):
+								invalid = Some(error)
+								break
+							Ok(_):
+								void
+
+					match invalid:
+						Some(error):
+							Err(error)
+						None:
+							Ok(void)
+
+
+pure func insert_function(
+	function: LoweredFunction,
+	unions: List[ConcreteUnion],
+	records: List[ConcreteRecord],
+) -> Result[OwnedFunction, Diagnostic]:
+	admitted ?= admit_loop(function, unions, records)
+
+	match function.tail:
+		ExitValue(exit):
+			built ?= insert_block(function.definitions, exit, [], 0, 0, unions, records)
+			Ok({
+				execution = function.execution,
+				signature = function.signature,
+				operations = built.operations,
+				tail = ReturnTail(built.exit),
+			})
+		MatchValue(matched):
+			insert_match(function, matched, unions, records)
+
+
+pure func own(program: LoweredProgram) -> Result[OwnershipProgram, Diagnostic]:
+	contents = lowered_functions(program)
+	var functions: List[OwnedFunction] = []
+	var failure: Option[Diagnostic] = None
+
+	for function in contents.functions:
+		match insert_function(function, contents.unions, contents.records):
+			Ok(owned):
+				functions = functions.append(owned)
+			Err(error):
+				failure = Some(error)
+				break
+
+	match failure:
+		Some(error):
+			Err(error)
+		None:
+			Ok({
+				records = contents.records,
+				unions = contents.unions,
+				functions = functions,
+				entrypoint = contents.entrypoint,
+			})

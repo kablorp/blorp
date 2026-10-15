@@ -1,0 +1,2213 @@
+import:
+	../namespace/builtins:
+		BooleanRoles,
+		OptionalRoles,
+		RuntimeOperation(
+			IntAdd, IntSubtract, IntMultiply, IntDivide, IntRemainder, IntToString, StringLength,
+			StringPrint, StringParseInt, StringParseFloat, ListRepeat, ListLength, ListGet, StringEquals,
+			IntEquals, FloatAdd, FloatSubtract, FloatMultiply, FloatDivide, FloatRemainder,
+			FloatToString,
+		),
+	./float_literal: c_float_literal
+	../runtime/float_runtime: float_parse_runtime, float_runtime, float_string_runtime
+	int as IntOps
+	list: join
+	../runtime/list_runtime:
+		ListElementKey, arguments_runtime, list_c_type, list_child_key, list_element_key,
+		list_key_depth, list_key_ordinal, list_key_rank, list_runtime, list_suffix, same_list_key
+	../lower/lower: MatchLabel(VariantLabel, DefaultLabel), ValueId, value_number
+	option: to_result
+	../own/own as Own:
+		OwnedArgument(UnmanagedArgument, BorrowedArgument),
+		OwnedArm,
+		OwnedDefinition,
+		OwnedExit(ReturnResult, RecurArguments),
+		OwnedFunction,
+		OwnedMatch,
+		OwnedTail(ReturnTail, MatchTail),
+		OwnedValueOperation(
+			ParameterDefinition, VoidDefinition, IntegerDefinition, FloatDefinition,
+			StringDefinition, CallDefinition, ConstructDefinition,
+			PayloadDefinition, ConstructRecordDefinition, ReadRecordFieldDefinition,
+		),
+		OwnerId,
+		OwnershipOperation(DefineValue, AcquireOwner, DropOwner),
+		OwnershipProgram,
+		ResultOwnership(UnmanagedResult, BorrowedResult, OwnedResult),
+		ReturnTransfer(UnmanagedReturn, OwnedReturn),
+		StoredPayload(UnmanagedPayload, OwnedPayload),
+		owner_number,
+	../utils/source: COMPILER_SOURCE
+	../specialize/specialize:
+		CallTarget(UserFunction, RuntimeFunction),
+		ConcreteRecord,
+		ConcreteUnion,
+		FieldInstanceId,
+		RecordInstanceId,
+		RecordRepresentation(InlineRecord, ManagedRecord),
+		TypeRef(VoidType, IntType, FloatType, StringType, ListType, UnionType, RecordType),
+		UnionInstanceId,
+		UnionRepresentation(InlineUnmanaged, InlineOwningPayload),
+		VariantInstanceId, variant_field_variant, variant_field_number,
+		field_number,
+		field_owner,
+		function_number,
+		record_number,
+		union_number,
+		variant_number,
+		variant_owner,
+		value_ownership, ValueOwnership(NoOwnership),
+	string as StringOps
+	../runtime/string_runtime:
+		string_equals_runtime,
+		string_parse_int_runtime,
+		string_print_runtime,
+		string_runtime,
+	../utils/syntax:
+		Diagnostic,
+		EntryResult(IntegerExitStatus, SuccessfulExit),
+		Entrypoint(NoArguments, WithArguments),
+		FunctionExecution(OrdinaryCalls, SelfTailLoop),
+		Span,
+		entry_function,
+	../utils/text: concat
+	../verify/verify: VerifiedProgram, verified_contents
+
+
+-- Checked-reference errors have no source occurrence; this marks that origin.
+private INTERNAL_SPAN: Span = {
+	source = COMPILER_SOURCE,
+	start = 0,
+	end = 0
+}
+
+
+private pure func c_parameter(index: Int) -> String:
+	"blorp_p_".append_int(index)
+
+
+private pure func internal_error() -> Diagnostic:
+	{
+		span = INTERNAL_SPAN,
+		note = None,
+		message = "internal compiler error: invalid checked union identity",
+		help = "report this compiler error with the input program"
+	}
+
+
+private pure func c_name(index: Int) -> String:
+	"blorp_f_".append_int(index)
+
+
+private pure func c_value(id: ValueId) -> String:
+	"blorp_vl_".append_int(value_number(id))
+
+
+private pure func c_owner(id: OwnerId) -> String:
+	"blorp_owner_".append_int(owner_number(id))
+
+
+private pure func c_callable(target: CallTarget) -> String:
+	match target:
+		UserFunction(id):
+			c_name(function_number(id))
+		RuntimeFunction(operation):
+			match operation:
+				StringPrint:
+					"blorp_string_print"
+				IntAdd:
+					"blorp_int_add"
+				IntSubtract:
+					"blorp_int_subtract"
+				IntMultiply:
+					"blorp_int_multiply"
+				IntDivide:
+					"blorp_int_divide"
+				IntRemainder:
+					"blorp_int_remainder"
+				IntToString:
+					"blorp_int_to_string"
+				FloatAdd:
+					"blorp_float_add"
+				FloatSubtract:
+					"blorp_float_subtract"
+				FloatMultiply:
+					"blorp_float_multiply"
+				FloatDivide:
+					"blorp_float_divide"
+				FloatRemainder:
+					"blorp_float_remainder"
+				FloatToString:
+					"blorp_float_to_string"
+				StringLength:
+					"blorp_string_length"
+				StringParseInt(_):
+					"blorp_string_parse_int"
+				StringParseFloat(_):
+					"blorp_string_parse_float"
+				ListRepeat(element):
+					"blorp_list_repeat_".concat(list_suffix(list_element_key(element)))
+				ListLength(element):
+					"blorp_list_length_".concat(list_suffix(list_element_key(element)))
+				ListGet(element, _):
+					"blorp_list_get_".concat(list_suffix(list_element_key(element)))
+				StringEquals(_):
+					"blorp_string_equals"
+				IntEquals(_):
+					"blorp_int_equals"
+
+
+private pure func append_integer(output: String, value: Int) -> String:
+	if IntOps.equals(value, IntOps.INT_MIN):
+		output.concat("INT64_MIN")
+	else if IntOps.less_than(value, 0):
+		output
+			.concat("(-INT64_C(")
+			.append_int(IntOps.subtract(0, value))
+			.concat("))")
+	else:
+		output
+			.concat("INT64_C(")
+			.append_int(value)
+			.concat(")")
+
+
+-- Function-local static data has fixed syntactic depth and no C string-token
+-- length limit or automatic array storage. Existing ValueIds distinguish the
+-- backing bytes; each evaluation still constructs an ordinary fresh String.
+private pure func c_literal_bytes(id: ValueId) -> String:
+	"blorp_bytes_".append_int(value_number(id))
+
+
+private pure func append_string_bytes(output: String, id: ValueId, bytes: String) -> String:
+	var projected = output
+		.concat("static const unsigned char ")
+		.concat(c_literal_bytes(id))
+		.concat("[]={")
+	var position = 0
+
+	for character in StringOps.chars(bytes):
+		if IntOps.greater_than(position, 0):
+			projected = projected.concat(",")
+
+		projected = projected.append_int(to_int(character))
+		position = IntOps.add(position, 1)
+
+	if IntOps.equals(position, 0):
+		-- ISO C forbids an empty initializer; logical length remains zero.
+		projected = projected.concat("0")
+
+	projected.concat("};")
+
+
+private pure func has_payload(declaration: ConcreteUnion) -> Bool:
+	declaration.variants.any(pure func(fields): not fields.is_empty())
+
+
+private pure func union_c_type(id: UnionInstanceId, declaration: ConcreteUnion) -> String:
+	prefix = if has_payload(declaration):
+		"struct blorp_u_"
+	else:
+		"enum blorp_u_"
+
+	prefix.append_int(union_number(id))
+
+
+private pure func record_c_type(id: RecordInstanceId) -> String:
+	"blorp_r_".append_int(record_number(id))
+
+
+private pure func c_field(id: FieldInstanceId) -> String:
+	"blorp_rf_"
+		.append_int(record_number(field_owner(id)))
+		.concat("_")
+		.append_int(field_number(id))
+
+
+private pure func append_record(
+	output: String,
+	layout: ConcreteRecord,
+	index: Int,
+	unions: List[ConcreteUnion],
+) -> Result[String, Diagnostic]:
+	var result = output
+		.concat("struct blorp_r_")
+		.append_int(index)
+		.concat("{")
+
+	match layout.representation:
+		ManagedRecord:
+			result = result.concat("_Atomic uint64_t references;")
+		InlineRecord:
+			void
+
+	var position = 0
+	var invalid: Option[Diagnostic] = None
+
+	for field in layout.fields:
+		match c_type(field, unions):
+			Ok(name):
+				result = result
+					.concat(name)
+					.concat(" blorp_rf_")
+					.append_int(index)
+					.concat("_")
+					.append_int(position)
+					.concat(";")
+			Err(error):
+				invalid = Some(error)
+				break
+
+		position = IntOps.add(position, 1)
+
+	match invalid:
+		Some(error):
+			Err(error)
+		None:
+			Ok(result.concat("};"))
+
+
+private pure func c_type(
+	type_ref: TypeRef,
+	unions: List[ConcreteUnion],
+) -> Result[String, Diagnostic]:
+	match type_ref:
+		RecordType(id):
+			Ok(record_c_type(id))
+		VoidType:
+			Ok("uint8_t")
+		IntType:
+			Ok("int64_t")
+		FloatType:
+			Ok("double")
+		StringType:
+			Ok("struct blorp_string*")
+		ListType(element):
+			Ok(list_c_type(list_element_key(element)))
+		UnionType(id):
+			declaration ?= unions
+				.get(union_number(id))
+				.to_result(internal_error())
+			Ok(union_c_type(id, declaration))
+
+
+private pure func c_variant(id: VariantInstanceId) -> String:
+	"blorp_v_"
+		.append_int(union_number(variant_owner(id)))
+		.concat("_")
+		.append_int(variant_number(id))
+
+
+private pure func c_parameters(
+	parameters: List[TypeRef],
+	unions: List[ConcreteUnion],
+) -> Result[String, Diagnostic]:
+	if IntOps.equals(parameters.length(), 0):
+		Ok("(void)")
+	else:
+		var output: String = "("
+		var index: Int = 0
+		var invalid: Option[Diagnostic] = None
+
+		for parameter in parameters:
+			match c_type(parameter, unions):
+				Err(error):
+					invalid = Some(error)
+					break
+				Ok(name):
+					if IntOps.greater_than(index, 0):
+						output = output.concat(",")
+
+					output = output
+						.concat(name)
+						.concat(" ")
+						.concat(c_parameter(index))
+
+			index = IntOps.add(index, 1)
+
+		match invalid:
+			Some(error):
+				Err(error)
+			None:
+				Ok(output.concat(")"))
+
+
+private pure func c_payload(id: VariantInstanceId) -> String:
+	"blorp_up_".append_int(variant_number(id))
+
+
+private pure func c_payload_field(variant: VariantInstanceId, position: Int) -> String:
+	c_payload(variant).concat(".blorp_uf_").append_int(position)
+
+
+private pure func append_union(
+	output: String,
+	declaration: ConcreteUnion,
+	index: Int,
+	unions: List[ConcreteUnion],
+) -> Result[String, Diagnostic]:
+	payload = has_payload(declaration)
+
+	prefix = if payload:
+		"enum blorp_tag_"
+	else:
+		"enum blorp_u_"
+
+	var result = output
+		.concat(prefix)
+		.append_int(index)
+		.concat("{")
+	var position: Int = 0
+
+	for shape in declaration.variants:
+		if IntOps.not_equals(position, 0):
+			result = result.concat(",")
+
+		result = result
+			.concat("blorp_v_")
+			.append_int(index)
+			.concat("_")
+			.append_int(position)
+		position = IntOps.add(position, 1)
+
+	result = result.concat("};")
+
+	if payload:
+		result = result
+			.concat("struct blorp_u_")
+			.append_int(index)
+			.concat("{enum blorp_tag_")
+			.append_int(index)
+			.concat(" tag;union{")
+		position = 0
+		var failure: Option[Diagnostic] = None
+
+		for fields in declaration.variants:
+			if not fields.is_empty():
+				result = result.concat("struct{")
+				var field_position = 0
+				for value_type in fields:
+					match c_type(value_type, unions):
+						Err(error):
+							failure = Some(error)
+							break
+						Ok(name):
+							result = result
+								.concat(name)
+								.concat(" blorp_uf_")
+								.append_int(field_position)
+								.concat(";")
+					field_position = IntOps.add(field_position, 1)
+				if failure.is_some():
+					break
+				result = result
+					.concat("} blorp_up_")
+					.append_int(position)
+					.concat(";")
+			position = IntOps.add(position, 1)
+
+		match failure:
+			Some(error):
+				Err(error)
+			None:
+				append_union_ownership(
+					result.concat("}payload;};"),
+					declaration,
+					index,
+					unions,
+				)
+	else:
+		Ok(result)
+
+
+private fixed union AggregateDefinition:
+	RecordDefinition(Int)
+	UnionDefinition(Int)
+
+
+private fixed union AggregateVisit:
+	UnvisitedAggregate
+	VisitingAggregate
+	EmittedAggregate
+
+
+private fixed union AggregateVisitStep:
+	PrepareAggregate(AggregateDefinition)
+	EmitAggregate(AggregateDefinition)
+
+
+private pure func push_aggregate_visit(
+	steps: List[AggregateVisitStep],
+	depth: Int,
+	step: AggregateVisitStep,
+) -> List[AggregateVisitStep]:
+	if IntOps.less_than(depth, steps.length()):
+		steps.set(depth, step)
+	else:
+		steps.append(step)
+
+
+private pure func append_aggregate_definitions(
+	records: List[ConcreteRecord],
+	unions: List[ConcreteUnion],
+	output: String,
+) -> Result[String, Diagnostic]:
+	-- State vectors and output remain local owners while dependencies are
+	-- visited. No recursive carrier retains their previous roots.
+	var record_visits = records.map(pure func(_): UnvisitedAggregate)
+	var union_visits = unions.map(pure func(_): UnvisitedAggregate)
+	var result = output
+	var pending: List[AggregateVisitStep] = []
+	var pending_count = 0
+	var position = unions.length()
+
+	while IntOps.greater_than(position, 0):
+		position = IntOps.subtract(position, 1)
+		pending = push_aggregate_visit(
+			pending,
+			pending_count,
+			PrepareAggregate(UnionDefinition(position)),
+		)
+		pending_count = IntOps.add(pending_count, 1)
+
+	position = records.length()
+
+	while IntOps.greater_than(position, 0):
+		position = IntOps.subtract(position, 1)
+		pending = push_aggregate_visit(
+			pending,
+			pending_count,
+			PrepareAggregate(RecordDefinition(position)),
+		)
+		pending_count = IntOps.add(pending_count, 1)
+
+	var invalid: Option[Diagnostic] = None
+
+	while IntOps.greater_than(pending_count, 0) and not invalid.is_some():
+		pending_count = IntOps.subtract(pending_count, 1)
+
+		match pending.get(pending_count):
+			None:
+				invalid = Some(internal_error())
+			Some(step):
+				match step:
+					PrepareAggregate(definition):
+						status = match definition:
+							RecordDefinition(index):
+								record_visits.get(index)
+							UnionDefinition(index):
+								union_visits.get(index)
+
+						match status:
+							None:
+								invalid = Some(internal_error())
+							Some(EmittedAggregate):
+								void
+							Some(VisitingAggregate):
+								invalid = Some(internal_error())
+							Some(UnvisitedAggregate):
+								pending = push_aggregate_visit(
+									pending,
+									pending_count,
+									EmitAggregate(definition),
+								)
+								pending_count = IntOps.add(pending_count, 1)
+
+								match definition:
+									RecordDefinition(index):
+										record_visits = record_visits.set(index, VisitingAggregate)
+
+										match records.get(index):
+											None:
+												invalid = Some(internal_error())
+											Some(layout):
+												var child = layout.fields.length()
+
+												while IntOps.greater_than(child, 0):
+													child = IntOps.subtract(child, 1)
+
+													match layout.fields.get(child):
+														Some(RecordType(id)):
+															pending = push_aggregate_visit(
+																pending,
+																pending_count,
+																PrepareAggregate(
+																	RecordDefinition(
+																		record_number(id),
+																	),
+																),
+															)
+															pending_count = IntOps.add(
+																pending_count,
+																1,
+															)
+														Some(UnionType(id)):
+															pending = push_aggregate_visit(
+																pending,
+																pending_count,
+																PrepareAggregate(
+																	UnionDefinition(
+																		union_number(id),
+																	),
+																),
+															)
+															pending_count = IntOps.add(
+																pending_count,
+																1,
+															)
+														Some(_):
+															void
+														None:
+															invalid = Some(internal_error())
+															break
+									UnionDefinition(index):
+										union_visits = union_visits.set(index, VisitingAggregate)
+
+										match unions.get(index):
+											None:
+												invalid = Some(internal_error())
+											Some(layout):
+												var child = layout.variants.length()
+
+												while IntOps.greater_than(child, 0):
+													child = IntOps.subtract(child, 1)
+
+													match layout.variants.get(child):
+														Some(fields):
+															var field_position = fields.length()
+															while IntOps.greater_than(field_position, 0):
+																field_position = IntOps.subtract(field_position, 1)
+																match fields.get(field_position):
+																	Some(RecordType(id)):
+																		pending = push_aggregate_visit(pending, pending_count, PrepareAggregate(RecordDefinition(record_number(id))))
+																		pending_count = IntOps.add(pending_count, 1)
+																	Some(UnionType(id)):
+																		pending = push_aggregate_visit(pending, pending_count, PrepareAggregate(UnionDefinition(union_number(id))))
+																		pending_count = IntOps.add(pending_count, 1)
+																	Some(_): void
+																	None:
+																		invalid = Some(internal_error())
+																		break
+														None:
+															invalid = Some(internal_error())
+															break
+					EmitAggregate(definition):
+						match definition:
+							RecordDefinition(index):
+								match records.get(index):
+									None:
+										invalid = Some(internal_error())
+									Some(layout):
+										match append_record(result, layout, index, unions):
+											Ok(updated):
+												result = updated
+												record_visits = record_visits.set(
+													index,
+													EmittedAggregate,
+												)
+											Err(error):
+												invalid = Some(error)
+							UnionDefinition(index):
+								match unions.get(index):
+									None:
+										invalid = Some(internal_error())
+									Some(layout):
+										match append_union(result, layout, index, unions):
+											Ok(updated):
+												result = updated
+												union_visits = union_visits.set(
+													index,
+													EmittedAggregate,
+												)
+											Err(error):
+												invalid = Some(error)
+
+	match invalid:
+		Some(error):
+			Err(error)
+		None:
+			Ok(result)
+
+
+private pure func append_record_prototypes(output: String, index: Int) -> String:
+	output
+		.concat("void blorp_record_dup_")
+		.append_int(index)
+		.concat("(blorp_r_")
+		.append_int(index)
+		.concat(");")
+		.concat("void blorp_record_drop_")
+		.append_int(index)
+		.concat("(blorp_r_")
+		.append_int(index)
+		.concat(");")
+
+
+private pure func append_record_ownership(
+	output: String,
+	layout: ConcreteRecord,
+	index: Int,
+	unions: List[ConcreteUnion],
+) -> Result[String, Diagnostic]:
+	prefix = output
+		.concat("void blorp_record_dup_")
+		.append_int(index)
+		.concat("(blorp_r_")
+		.append_int(index)
+		.concat(" value){")
+
+	match layout.representation:
+		InlineRecord:
+			Ok(
+				prefix
+					.concat("(void)value;}void blorp_record_drop_")
+					.append_int(index)
+					.concat("(blorp_r_")
+					.append_int(index)
+					.concat(" value){(void)value;}"),
+			)
+		ManagedRecord:
+			var result = prefix
+				.concat(
+					"(void)atomic_fetch_add_explicit(&value->references,UINT64_C(1),"
+						.concat("memory_order_relaxed);}"),
+				)
+				.concat("void blorp_record_drop_")
+				.append_int(index)
+				.concat("(blorp_r_")
+				.append_int(index)
+				.concat(
+					" value){if(atomic_fetch_sub_explicit(&value->references,UINT64_C(1),"
+						.concat("memory_order_acq_rel)!=UINT64_C(1))return;"),
+				)
+			var position = 0
+			var invalid: Option[Diagnostic] = None
+
+			for field in layout.fields:
+				match (
+					append_storage_operation(
+						result,
+						field,
+						DestroyValue,
+						"value->blorp_rf_"
+							.append_int(index)
+							.concat("_")
+							.append_int(position),
+						unions,
+					)
+				):
+					Ok(updated):
+						result = updated
+					Err(error):
+						invalid = Some(error)
+						break
+
+				position = IntOps.add(position, 1)
+
+			ready ?= match invalid:
+				Some(error):
+					Err(error)
+				None:
+					Ok(void)
+
+			result = result
+				.concat("free(value);}")
+				.concat("blorp_r_")
+				.append_int(index)
+				.concat(" blorp_record_make_")
+				.append_int(index)
+				.concat("(struct blorp_r_")
+				.append_int(index)
+				.concat(" fields){blorp_r_")
+				.append_int(index)
+				.concat(
+					" value=malloc(sizeof *value);if(!value)abort();atomic_init(&value->references,"
+						.concat("UINT64_C(1));"),
+				)
+			position = 0
+
+			for _ in layout.fields:
+				field = "blorp_rf_"
+					.append_int(index)
+					.concat("_")
+					.append_int(position)
+				result = result
+					.concat("value->")
+					.concat(field)
+					.concat("=fields.")
+					.concat(field)
+					.concat(";")
+				position = IntOps.add(position, 1)
+
+			Ok(result.concat("return value;}"))
+
+
+private pure func append_operation(
+	output: String,
+	id: ValueId,
+	operation: OwnedValueOperation,
+	unions: List[ConcreteUnion],
+	records: List[ConcreteRecord],
+) -> Result[String, Diagnostic]:
+	match operation:
+		ConstructRecordDefinition(owner, fields):
+			layout ?= records
+				.get(record_number(owner))
+				.to_result(internal_error())
+
+			var result = match layout.representation:
+				InlineRecord:
+					output.concat("((")
+				ManagedRecord:
+					output
+						.concat("blorp_record_make_")
+						.append_int(record_number(owner))
+						.concat("((")
+
+			result = result
+				.concat("struct blorp_r_")
+				.append_int(record_number(owner))
+				.concat("){")
+			var position = 0
+
+			for field in fields:
+				if IntOps.greater_than(position, 0):
+					result = result.concat(",")
+
+				stored = match field.value:
+					UnmanagedPayload(value):
+						value
+					OwnedPayload(value, _):
+						value
+
+				result = result
+					.concat(".")
+					.concat(c_field(field.field))
+					.concat("=")
+					.concat(c_value(stored))
+				position = IntOps.add(position, 1)
+
+			Ok(result.concat("})"))
+		ReadRecordFieldDefinition(field, argument):
+			layout ?= records
+				.get(record_number(field_owner(field)))
+				.to_result(internal_error())
+
+			value = match argument:
+				UnmanagedArgument(value):
+					value
+				BorrowedArgument(borrow):
+					borrow.value
+
+			selector = match layout.representation:
+				InlineRecord:
+					"."
+				ManagedRecord:
+					"->"
+
+			Ok(
+				output
+					.concat(c_value(value))
+					.concat(selector)
+					.concat(c_field(field)),
+			)
+		ParameterDefinition(index):
+			Ok(output.concat(c_parameter(index)))
+		VoidDefinition:
+			Ok(output.concat("((uint8_t)0)"))
+		IntegerDefinition(value):
+			Ok(append_integer(output, value))
+		FloatDefinition(value):
+			Ok(output.concat(c_float_literal(value)))
+		StringDefinition(bytes):
+			constructor = output
+				.concat("blorp_string_from_bytes((const char *)")
+				.concat(c_literal_bytes(id))
+			length = append_integer(
+				constructor.concat(","),
+				bytes.length(),
+			)
+			Ok(length.concat(")"))
+		CallDefinition(call, arguments):
+			var prefix = output
+				.concat(c_callable(call.target))
+				.concat("(")
+			var index: Int = 0
+
+			for argument in arguments:
+				if IntOps.greater_than(index, 0):
+					prefix = prefix.concat(",")
+
+				value = match argument:
+					UnmanagedArgument(id):
+						id
+					BorrowedArgument(borrow):
+						borrow.value
+
+				prefix = prefix.concat(c_value(value))
+				index = IntOps.add(index, 1)
+
+			Ok(prefix.concat(")"))
+		ConstructDefinition(id, fields):
+			declaration ?= unions
+				.get(union_number(variant_owner(id)))
+				.to_result(internal_error())
+
+			-- A union with no payload anywhere is a bare C enum, so a variant is its tag.
+			if has_payload(declaration):
+				tagged = output
+					.concat("((")
+					.concat(union_c_type(variant_owner(id), declaration))
+					.concat("){.tag=")
+					.concat(c_variant(id))
+				-- A variant without fields omits the payload initializer.
+				if fields.is_empty():
+					Ok(tagged.concat("})"))
+				else:
+					Ok(append_payload_initializer(tagged, id, fields).concat("})"))
+			else:
+				Ok(output.concat(c_variant(id)))
+		PayloadDefinition(field, id):
+			Ok(
+				output
+					.concat(c_value(id))
+					.concat(".payload.")
+					.concat(c_payload_field(
+						variant_field_variant(field),
+						variant_field_number(field),
+					)),
+			)
+
+
+private pure func append_payload_initializer(
+	output: String,
+	id: VariantInstanceId,
+	fields: List[StoredPayload],
+) -> String:
+	var result = output
+		.concat(",.payload.")
+		.concat(c_payload(id))
+		.concat("={")
+	var position = 0
+	for field in fields:
+		if IntOps.greater_than(position, 0):
+			result = result.concat(",")
+		stored = match field:
+			UnmanagedPayload(value): c_value(value)
+			OwnedPayload(_, owner): c_owner(owner)
+		result = result
+			.concat(".blorp_uf_")
+			.append_int(position)
+			.concat("=")
+			.concat(stored)
+		position = IntOps.add(position, 1)
+	result.concat("}")
+
+
+private pure func argument_value(argument: OwnedArgument) -> ValueId:
+	match argument:
+		UnmanagedArgument(id):
+			id
+		BorrowedArgument(borrow):
+			borrow.value
+
+
+private pure func append_optional_value(
+	output: String,
+	id: ValueId,
+	roles: OptionalRoles[VariantInstanceId],
+	condition: String,
+	payload: String,
+	unions: List[ConcreteUnion],
+) -> Result[String, Diagnostic]:
+	type_name ?= c_type(UnionType(variant_owner(roles.present)), unions)
+	name = c_value(id)
+	Ok(
+		output
+			.concat("const ")
+			.concat(type_name)
+			.concat(" ")
+			.concat(name)
+			.concat("=")
+			.concat(condition)
+			.concat("?((")
+			.concat(type_name)
+			.concat("){.tag=")
+			.concat(c_variant(roles.present))
+			.concat(",.payload.")
+			.concat(c_payload_field(roles.present, 0))
+			.concat("=")
+			.concat(payload)
+			.concat("}):((")
+			.concat(type_name)
+			.concat("){.tag=")
+			.concat(c_variant(roles.absent))
+			.concat("});(void)")
+			.concat(name)
+			.concat(";"),
+	)
+
+
+private pure func append_parse_number(
+	output: String,
+	id: ValueId,
+	roles: OptionalRoles[VariantInstanceId],
+	arguments: List[OwnedArgument],
+	unions: List[ConcreteUnion],
+	scalar_type: String,
+	runtime: String,
+) -> Result[String, Diagnostic]:
+	argument ?= arguments
+		.get(0)
+		.to_result(internal_error())
+	scratch = "blorp_runtime_".append_int(value_number(id))
+	prefix = output
+		.concat(scalar_type)
+		.concat(" ")
+		.concat(scratch)
+		.concat("=0;const uint8_t ")
+		.concat(scratch)
+		.concat("_some=")
+		.concat(runtime)
+		.concat("(")
+		.concat(c_value(argument_value(argument)))
+		.concat(",&")
+		.concat(scratch)
+		.concat(");")
+	append_optional_value(
+		prefix,
+		id,
+		roles,
+		scratch.concat("_some"),
+		scratch,
+		unions,
+	)
+
+
+private pure func append_list_get(
+	output: String,
+	id: ValueId,
+	roles: OptionalRoles[VariantInstanceId],
+	element: TypeRef,
+	arguments: List[OwnedArgument],
+	unions: List[ConcreteUnion],
+) -> Result[String, Diagnostic]:
+	values ?= arguments
+		.get(0)
+		.to_result(internal_error())
+	index ?= arguments
+		.get(1)
+		.to_result(internal_error())
+	scratch = "blorp_runtime_".append_int(value_number(id))
+	element_type ?= c_type(element, unions)
+	prefix = output
+		.concat(element_type).concat(" ").concat(scratch).concat("={0};const uint8_t ")
+		.concat(scratch).concat("_some=blorp_list_get_")
+		.concat(list_suffix(list_element_key(element))).concat("(")
+		.concat(c_value(argument_value(values))).concat(",")
+		.concat(c_value(argument_value(index))).concat(",&").concat(scratch).concat(");")
+	append_optional_value(
+		prefix,
+		id,
+		roles,
+		scratch.concat("_some"),
+		scratch,
+		unions,
+	)
+
+
+private pure func append_value(
+	output: String,
+	id: ValueId,
+	value_type: TypeRef,
+	operation: OwnedValueOperation,
+	unions: List[ConcreteUnion],
+	records: List[ConcreteRecord],
+) -> Result[String, Diagnostic]:
+	match operation:
+		CallDefinition(call, arguments):
+			match call.target:
+				RuntimeFunction(StringParseInt(roles)):
+					append_parse_number(
+						output,
+						id,
+						roles,
+						arguments,
+						unions,
+						"int64_t",
+						"blorp_string_parse_int",
+					)
+				RuntimeFunction(StringParseFloat(roles)):
+					append_parse_number(
+						output,
+						id,
+						roles,
+						arguments,
+						unions,
+						"double",
+						"blorp_string_parse_float",
+					)
+				RuntimeFunction(ListGet(element, roles)):
+					append_list_get(output, id, roles, element, arguments, unions)
+				RuntimeFunction(StringEquals(roles)):
+					append_equals(output, id, roles, arguments, unions, StringComparison)
+				RuntimeFunction(IntEquals(roles)):
+					append_equals(output, id, roles, arguments, unions, IntegerComparison)
+				_:
+					append_regular_value(output, id, value_type, operation, unions, records)
+		_:
+			append_regular_value(output, id, value_type, operation, unions, records)
+
+
+private fixed union EqualityComparison:
+	StringComparison
+	IntegerComparison
+
+
+private pure func append_equals(
+	output: String,
+	id: ValueId,
+	roles: BooleanRoles[VariantInstanceId],
+	arguments: List[OwnedArgument],
+	unions: List[ConcreteUnion],
+	comparison: EqualityComparison,
+) -> Result[String, Diagnostic]:
+	left ?= arguments
+		.get(0)
+		.to_result(internal_error())
+	right ?= arguments
+		.get(1)
+		.to_result(internal_error())
+	type_name ?= c_type(UnionType(variant_owner(roles.equal)), unions)
+	name = c_value(id)
+	left_value = c_value(argument_value(left))
+	right_value = c_value(argument_value(right))
+
+	condition = match comparison:
+		StringComparison:
+			"blorp_string_equals("
+				.concat(left_value)
+				.concat(",")
+				.concat(right_value)
+				.concat(")")
+		IntegerComparison:
+			"("
+				.concat(left_value)
+				.concat("==")
+				.concat(right_value)
+				.concat(")")
+
+	Ok(
+		output
+			.concat("const ")
+			.concat(type_name)
+			.concat(" ")
+			.concat(name)
+			.concat("=")
+			.concat(condition)
+			.concat("?")
+			.concat(c_variant(roles.equal))
+			.concat(":")
+			.concat(c_variant(roles.different))
+			.concat(";(void)")
+			.concat(name)
+			.concat(";"),
+	)
+
+
+private pure func append_regular_value(
+	output: String,
+	id: ValueId,
+	value_type: TypeRef,
+	operation: OwnedValueOperation,
+	unions: List[ConcreteUnion],
+	records: List[ConcreteRecord],
+) -> Result[String, Diagnostic]:
+	type_name ?= c_type(value_type, unions)
+	name = c_value(id)
+
+	prepared = match operation:
+		StringDefinition(bytes):
+			append_string_bytes(output, id, bytes)
+		_:
+			output
+
+	declaration = match value_type:
+		StringType | ListType(_):
+			type_name.concat(" const ")
+		_:
+			"const "
+				.concat(type_name)
+				.concat(" ")
+
+	value ?= append_operation(
+		prepared
+			.concat(declaration)
+			.concat(name)
+			.concat("="),
+		id,
+		operation,
+		unions,
+		records,
+	)
+	Ok(
+		value
+			.concat(";(void)")
+			.concat(name)
+			.concat(";"),
+	)
+
+
+private pure func append_owner_alias(
+	output: String,
+	owner: OwnerId,
+	value: ValueId,
+	value_type: TypeRef,
+	unions: List[ConcreteUnion],
+) -> Result[String, Diagnostic]:
+	name = c_owner(owner)
+	type_name ?= c_type(value_type, unions)
+
+	declaration = match value_type:
+		StringType | ListType(_):
+			type_name.concat(" const ")
+		_:
+			"const "
+				.concat(type_name)
+				.concat(" ")
+
+	Ok(
+		output
+			.concat(declaration)
+			.concat(name)
+			.concat("=")
+			.concat(c_value(value))
+			.concat(";(void)")
+			.concat(name)
+			.concat(";"),
+	)
+
+
+private pure func append_owned_definition(
+	output: String,
+	definition: OwnedDefinition,
+	unions: List[ConcreteUnion],
+	records: List[ConcreteRecord],
+) -> Result[String, Diagnostic]:
+	value ?= append_value(
+		output,
+		definition.id,
+		definition.value_type,
+		definition.operation,
+		unions,
+		records,
+	)
+
+	match definition.result:
+		UnmanagedResult | BorrowedResult(_):
+			Ok(value)
+		OwnedResult(owner):
+			append_owner_alias(value, owner, definition.id, definition.value_type, unions)
+
+
+-- Disposable owner-type projection of accepted IR; value types stay local.
+private pure func owner_types(function: OwnedFunction) -> Result[List[TypeRef], Diagnostic]:
+	var blocks = [function.operations]
+
+	match function.tail:
+		ReturnTail(_):
+			void
+		MatchTail(matched):
+			for arm in matched.arms:
+				blocks = blocks.append(arm.operations)
+
+	var values: List[TypeRef] = []
+	var owners: List[TypeRef] = []
+	var failure: Option[Diagnostic] = None
+
+	for operations in blocks:
+		for operation in operations:
+			match operation:
+				DefineValue(definition):
+					values = values.append(definition.value_type)
+
+					match definition.result:
+						OwnedResult(_):
+							owners = owners.append(definition.value_type)
+						_:
+							void
+				AcquireOwner(_, borrowed, _):
+					match values.get(value_number(borrowed.value)):
+						Some(value_type):
+							owners = owners.append(value_type)
+						None:
+							failure = Some(internal_error())
+							break
+				DropOwner(_, _):
+					void
+
+		if failure.is_some():
+			break
+
+	match failure:
+		Some(error):
+			Err(error)
+		None:
+			Ok(owners)
+
+
+private fixed union OwnershipAction:
+	DuplicateValue
+	DestroyValue
+
+
+private pure func append_storage_operation(
+	output: String,
+	value_type: TypeRef,
+	action: OwnershipAction,
+	expression: String,
+	unions: List[ConcreteUnion],
+) -> Result[String, Diagnostic]:
+	name_result: Result[Option[String], Diagnostic] = match value_type:
+		RecordType(id):
+			prefix = match action:
+				DuplicateValue:
+					"blorp_record_dup_"
+				DestroyValue:
+					"blorp_record_drop_"
+
+			Ok(Some(prefix.append_int(record_number(id))))
+		ListType(element):
+			prefix = match action:
+				DuplicateValue: "blorp_list_dup_"
+				DestroyValue: "blorp_list_drop_"
+			Ok(Some(prefix.concat(list_suffix(list_element_key(element)))))
+		StringType:
+			Ok(
+				Some(
+					match action:
+						DuplicateValue:
+							"blorp_string_retain"
+						DestroyValue:
+							"blorp_string_release"
+				),
+			)
+		UnionType(id):
+			layout ?= unions
+				.get(union_number(id))
+				.to_result(internal_error())
+			Ok(
+				match layout.representation:
+					InlineUnmanaged:
+						None
+					InlineOwningPayload:
+						prefix = match action:
+							DuplicateValue:
+								"blorp_union_dup_"
+							DestroyValue:
+								"blorp_union_drop_"
+
+						Some(prefix.append_int(union_number(id)))
+			)
+		_:
+			Ok(None)
+
+	name ?= name_result
+	Ok(
+		match name:
+			Some(name):
+				output
+					.concat(name)
+					.concat("(")
+					.concat(expression)
+					.concat(");")
+			None:
+				output
+	)
+
+
+private pure func append_union_action(
+	output: String,
+	layout: ConcreteUnion,
+	index: Int,
+	unions: List[ConcreteUnion],
+	action: OwnershipAction,
+) -> Result[String, Diagnostic]:
+	prefix = match action:
+		DuplicateValue:
+			"void blorp_union_dup_"
+		DestroyValue:
+			"void blorp_union_drop_"
+
+	var result = output
+		.concat(prefix)
+		.append_int(index)
+		.concat("(struct blorp_u_")
+		.append_int(index)
+		.concat(" value){switch(value.tag){")
+	var position = 0
+	var failure: Option[Diagnostic] = None
+
+	for fields in layout.variants:
+		result = result
+			.concat("case blorp_v_")
+			.append_int(index)
+			.concat("_")
+			.append_int(position)
+			.concat(":")
+		var field_position = 0
+		for value_type in fields:
+			path = "value.payload.blorp_up_"
+				.append_int(position)
+				.concat(".blorp_uf_")
+				.append_int(field_position)
+			match append_storage_operation(result, value_type, action, path, unions):
+				Ok(updated): result = updated
+				Err(error):
+					failure = Some(error)
+					break
+			field_position = IntOps.add(field_position, 1)
+		if failure.is_some():
+			break
+		result = result.concat("break;")
+		position = IntOps.add(position, 1)
+
+	match failure:
+		Some(error):
+			Err(error)
+		None:
+			Ok(result.concat("}}"))
+
+
+private pure func append_union_ownership(
+	output: String,
+	layout: ConcreteUnion,
+	index: Int,
+	unions: List[ConcreteUnion],
+) -> Result[String, Diagnostic]:
+	match layout.representation:
+		InlineUnmanaged:
+			Ok(output)
+		InlineOwningPayload:
+			duplicated ?= append_union_action(output, layout, index, unions, DuplicateValue)
+			append_union_action(duplicated, layout, index, unions, DestroyValue)
+
+
+private pure func append_ownership_operation(
+	output: String,
+	operation: OwnershipOperation,
+	unions: List[ConcreteUnion],
+	types: List[TypeRef],
+	records: List[ConcreteRecord],
+) -> Result[String, Diagnostic]:
+	match operation:
+		DefineValue(definition):
+			append_owned_definition(output, definition, unions, records)
+		AcquireOwner(owner, borrowed, _):
+			value_type ?= types
+				.get(owner_number(owner))
+				.to_result(internal_error())
+			retained ?= append_storage_operation(
+				output,
+				value_type,
+				DuplicateValue,
+				c_value(borrowed.value),
+				unions,
+			)
+			append_owner_alias(retained, owner, borrowed.value, value_type, unions)
+		DropOwner(owner, _):
+			value_type ?= types
+				.get(owner_number(owner))
+				.to_result(internal_error())
+			append_storage_operation(output, value_type, DestroyValue, c_owner(owner), unions)
+
+
+private pure func append_ownership_operations(
+	output: String,
+	operations: List[OwnershipOperation],
+	unions: List[ConcreteUnion],
+	types: List[TypeRef],
+	records: List[ConcreteRecord],
+) -> Result[String, Diagnostic]:
+	var result = output
+	var failure: Option[Diagnostic] = None
+
+	for operation in operations:
+		match append_ownership_operation(result, operation, unions, types, records):
+			Err(error):
+				failure = Some(error)
+				break
+			Ok(emitted):
+				result = emitted
+
+	match failure:
+		Some(error):
+			Err(error)
+		None:
+			Ok(result)
+
+
+private pure func append_arm(
+	output: String,
+	arm: OwnedArm,
+	final_default: Bool,
+	unions: List[ConcreteUnion],
+	types: List[TypeRef],
+	records: List[ConcreteRecord],
+) -> Result[String, Diagnostic]:
+	var result = match arm.label:
+		VariantLabel(id):
+			output
+				.concat("case ")
+				.concat(c_variant(id))
+				.concat(":")
+		DefaultLabel:
+			output.concat("default:")
+
+	if final_default:
+		result = result.concat("default:")
+
+	body ?= append_ownership_operations(
+		result.concat("{"),
+		arm.operations,
+		unions,
+		types,
+		records,
+	)
+	Ok(append_exit(body, arm.exit).concat("}"))
+
+
+private pure func append_match(
+	output: String,
+	matched: OwnedMatch,
+	unions: List[ConcreteUnion],
+	types: List[TypeRef],
+	records: List[ConcreteRecord],
+) -> Result[String, Diagnostic]:
+	declaration ?= unions
+		.get(union_number(matched.owner))
+		.to_result(internal_error())
+	var result = output
+		.concat("switch(")
+		.concat(c_value(argument_value(matched.scrutinee)))
+
+	if has_payload(declaration):
+		result = result.concat(".tag")
+
+	result = result.concat("){")
+	var has_default = False
+
+	for arm in matched.arms:
+		match arm.label:
+			DefaultLabel:
+				has_default = True
+			_:
+				void
+
+	var position: Int = 0
+	var failure: Option[Diagnostic] = None
+
+	for arm in matched.arms:
+		final_default = not has_default and IntOps.equals(
+			IntOps.add(position, 1),
+			matched.arms.length(),
+		)
+
+		match append_arm(result, arm, final_default, unions, types, records):
+			Err(error):
+				failure = Some(error)
+				break
+			Ok(emitted):
+				result = emitted
+
+		position = IntOps.add(position, 1)
+
+	match failure:
+		Some(error):
+			Err(error)
+		None:
+			Ok(result.concat("}"))
+
+
+private pure func append_signature(
+	output: String,
+	function: OwnedFunction,
+	index: Int,
+	unions: List[ConcreteUnion],
+) -> Result[String, Diagnostic]:
+	type_name ?= c_type(function.signature.return_type, unions)
+	parameters ?= c_parameters(function.signature.parameters, unions)
+	Ok(
+		output
+			.concat(type_name)
+			.concat(" ")
+			.concat(c_name(index))
+			.concat(parameters),
+	)
+
+
+private pure func append_return(output: String, result: ReturnTransfer) -> String:
+	value = match result:
+		UnmanagedReturn(id):
+			c_value(id)
+		OwnedReturn(_, owner):
+			c_owner(owner)
+
+	output
+		.concat("return ")
+		.concat(value)
+		.concat(";")
+
+
+private pure func append_exit(output: String, exit: OwnedExit) -> String:
+	match exit:
+		ReturnResult(result):
+			append_return(output, result)
+		RecurArguments(arguments, _):
+			var result = output
+			var position: Int = 0
+
+			-- Every operand is already an immutable value local. Replacing slots
+			-- from these captures preserves swaps and repeated arguments.
+			for argument in arguments:
+				result = result
+					.concat(c_parameter(position))
+					.concat("=")
+					.concat(c_value(argument))
+					.concat(";")
+				position = IntOps.add(position, 1)
+
+			result.concat("continue;")
+
+
+private pure func append_function(
+	output: String,
+	function: OwnedFunction,
+	index: Int,
+	unions: List[ConcreteUnion],
+	records: List[ConcreteRecord],
+) -> Result[String, Diagnostic]:
+	header ?= append_signature(output, function, index, unions)
+	types ?= owner_types(function)
+
+	opening = match function.execution:
+		OrdinaryCalls:
+			header.concat("{")
+		SelfTailLoop(_):
+			header.concat("{while (1){")
+
+	body ?= append_ownership_operations(opening, function.operations, unions, types, records)
+
+	emitted ?= match function.tail:
+		ReturnTail(exit):
+			Ok(append_exit(body, exit))
+		MatchTail(matched):
+			append_match(body, matched, unions, types, records)
+
+	closing = match function.execution:
+		OrdinaryCalls:
+			"}"
+		SelfTailLoop(_):
+			"}}"
+
+	Ok(emitted.concat(closing))
+
+
+private pure func is_string(type_ref: TypeRef) -> Bool:
+	match type_ref:
+		StringType:
+			True
+		ListType(element):
+			is_string(element)
+		_:
+			False
+
+
+private pure func operations_need_strings(operations: List[OwnershipOperation]) -> Bool:
+	var needed = False
+
+	for operation in operations:
+		match operation:
+			DefineValue(definition):
+				if is_string(definition.value_type):
+					needed = True
+			AcquireOwner(_, _, _) | DropOwner(_, _):
+				void
+
+	needed
+
+
+private fixed union RuntimeFeature:
+	IntegerAddition
+	IntegerArithmetic
+	StringOutput
+	IntegerParsing
+	StringEquality
+	FloatFormatting
+	FloatParsing
+
+
+private pure func runtime_matches(
+	actual: RuntimeOperation[VariantInstanceId, TypeRef],
+	expected: RuntimeFeature,
+) -> Bool:
+	match actual:
+		IntAdd:
+			match expected:
+				IntegerAddition:
+					True
+				_:
+					False
+		IntSubtract | IntMultiply | IntDivide | IntRemainder:
+			match expected:
+				IntegerArithmetic:
+					True
+				_:
+					False
+		StringPrint:
+			match expected:
+				StringOutput:
+					True
+				_:
+					False
+		StringParseInt(_):
+			match expected:
+				IntegerParsing:
+					True
+				_:
+					False
+		ListRepeat(_) | ListLength(_) | ListGet(_, _):
+			False
+		StringEquals(_):
+			match expected:
+				StringEquality:
+					True
+				_:
+					False
+		FloatToString:
+			match expected:
+				FloatFormatting:
+					True
+				_:
+					False
+		StringParseFloat(_):
+			match expected:
+				FloatParsing:
+					True
+				_:
+					False
+		IntEquals(_) | FloatAdd | FloatSubtract | FloatMultiply | FloatDivide | FloatRemainder | IntToString | StringLength:
+			False
+
+
+private pure func operations_need_runtime(
+	operations: List[OwnershipOperation],
+	expected: RuntimeFeature,
+) -> Bool:
+	var needed = False
+
+	for operation in operations:
+		match operation:
+			DefineValue(definition):
+				match definition.operation:
+					CallDefinition(call, _):
+						match call.target:
+							RuntimeFunction(actual):
+								needed = runtime_matches(actual, expected) or needed
+							_:
+								void
+					_:
+						void
+			_:
+				void
+
+	needed
+
+
+private pure func needs_runtime(program: OwnershipProgram, expected: RuntimeFeature) -> Bool:
+	var needed = False
+
+	for function in program.functions:
+		if operations_need_runtime(function.operations, expected):
+			needed = True
+
+		match function.tail:
+			ReturnTail(_):
+				void
+			MatchTail(matched):
+				for arm in matched.arms:
+					if operations_need_runtime(arm.operations, expected):
+						needed = True
+
+	needed
+
+
+-- Unsigned addition wraps. Both signed casts below receive representable values;
+-- the negative branch also stays within Int64 at UINT64_MAX - sum == INT64_MAX.
+private INTEGER_ADD_RUNTIME: String =
+	|static int64_t blorp_int_add(int64_t first,int64_t second){uint64_t sum=(uint64_t)first+(uint64_t)second;return sum<=INT64_MAX?(int64_t)sum:-INT64_C(1)-(int64_t)(UINT64_MAX-sum);}
+	|
+
+-- Convert wrapped unsigned bits using only representable signed casts. Division
+-- and remainder guard both zero and the sole overflowing signed quotient.
+private INTEGER_ARITHMETIC_RUNTIME: String =
+	|int64_t blorp_int_signed(uint64_t value){return value<=INT64_MAX?(int64_t)value:-INT64_C(1)-(int64_t)(UINT64_MAX-value);}
+	|int64_t blorp_int_subtract(int64_t first,int64_t second){return blorp_int_signed((uint64_t)first-(uint64_t)second);}
+	|int64_t blorp_int_multiply(int64_t first,int64_t second){return blorp_int_signed((uint64_t)first*(uint64_t)second);}
+	|int64_t blorp_int_divide(int64_t first,int64_t second){if(second==0)return 0;if(first==INT64_MIN&&second==-1)return INT64_MIN;return first/second;}
+	|int64_t blorp_int_remainder(int64_t first,int64_t second){if(second==0||(first==INT64_MIN&&second==-1))return 0;return first%second;}
+	|
+
+
+private pure func needs_string_runtime(program: OwnershipProgram) -> Bool:
+	var needed = False
+
+	for layout in program.records:
+		for field in layout.fields:
+			needed = is_string(field) or needed
+
+	for layout in program.unions:
+		for fields in layout.variants:
+			for value_type in fields:
+				needed = is_string(value_type) or needed
+
+
+	for function in program.functions:
+		if is_string(function.signature.return_type):
+			needed = True
+
+		for parameter in function.signature.parameters:
+			if is_string(parameter):
+				needed = True
+
+		if operations_need_strings(function.operations):
+			needed = True
+
+		match function.tail:
+			ReturnTail(_):
+				void
+			MatchTail(matched):
+				for arm in matched.arms:
+					if operations_need_strings(arm.operations):
+						needed = True
+
+	needed
+
+
+-- Typed Float facts, including generic union payload layouts, select the ABI
+-- guard. This follows the existing loaded-module policy; it is not reachability.
+private pure func is_float(value_type: TypeRef) -> Bool:
+	match value_type:
+		FloatType:
+			True
+		ListType(element):
+			is_float(element)
+		_:
+			False
+
+
+private pure func operations_need_floats(operations: List[OwnershipOperation]) -> Bool:
+	operations.any(pure func(operation):
+		match operation:
+			DefineValue(definition):
+				is_float(definition.value_type)
+			_:
+				False
+	)
+
+
+private pure func needs_float_runtime(program: OwnershipProgram) -> Bool:
+	var needed = False
+
+	for layout in program.records:
+		for field in layout.fields:
+			needed = is_float(field) or needed
+
+	for layout in program.unions:
+		for fields in layout.variants:
+			for value_type in fields:
+				needed = is_float(value_type) or needed
+
+
+	for function in program.functions:
+		needed = is_float(function.signature.return_type) or needed
+
+		for parameter in function.signature.parameters:
+			needed = is_float(parameter) or needed
+
+		needed = operations_need_floats(function.operations) or needed
+
+		match function.tail:
+			ReturnTail(_):
+				void
+			MatchTail(matched):
+				for arm in matched.arms:
+					needed = operations_need_floats(arm.operations) or needed
+
+	needed
+
+
+-- This inventory lives for one emission only. Its complete key is a projection
+-- of concrete TypeRefs, not an ownership or layout authority. Stable sorting
+-- and adjacent key equality avoid scanning existing helpers at each occurrence.
+private fixed record ListLayout {
+	element: TypeRef,
+	key: ListElementKey
+}
+
+
+private pure func strip_list_layer(value_type: TypeRef) -> TypeRef:
+	match value_type:
+		ListType(element): element
+		_: value_type
+
+
+private pure func element_list_layouts(element: TypeRef) -> List[ListLayout]:
+	var current = element
+	var key = list_element_key(element)
+	var remaining = list_key_depth(key)
+	var layouts: List[ListLayout] = []
+	layouts = layouts.append({ element = current, key = key })
+
+	while IntOps.greater_than(remaining, 0):
+		current = strip_list_layer(current)
+		key = list_child_key(key)
+		remaining = IntOps.subtract(remaining, 1)
+		layouts = layouts.append({ element = current, key = key })
+
+	layouts
+
+
+private pure func type_list_layouts(value_type: TypeRef) -> List[ListLayout]:
+	match value_type:
+		ListType(element): element_list_layouts(element)
+		_: []
+
+
+private pure func operation_list_layouts(operation: OwnershipOperation) -> List[ListLayout]:
+	match operation:
+		DefineValue(definition):
+			value_layouts = type_list_layouts(definition.value_type)
+			runtime_layouts: List[ListLayout] = match definition.operation:
+				CallDefinition(call, _):
+					match call.target:
+						RuntimeFunction(operation):
+							match operation:
+								ListRepeat(element): element_list_layouts(element)
+								ListLength(element): element_list_layouts(element)
+								ListGet(element, _): element_list_layouts(element)
+								_: []
+						_: []
+				_: []
+			value_layouts.concat(runtime_layouts)
+		_: []
+
+
+private pure func block_list_layouts(operations: List[OwnershipOperation]) -> List[ListLayout]:
+	var layouts: List[ListLayout] = []
+	for operation in operations:
+		chunk = operation_list_layouts(operation)
+		for layout in chunk:
+			layouts = layouts.append(layout)
+	layouts
+
+
+private pure func list_layouts(program: OwnershipProgram) -> List[ListLayout]:
+	var layouts: List[ListLayout] = []
+
+	for record_layout in program.records:
+		for value_type in record_layout.fields:
+			chunk = type_list_layouts(value_type)
+			for layout in chunk:
+				layouts = layouts.append(layout)
+
+	for declaration in program.unions:
+		for fields in declaration.variants:
+			for value_type in fields:
+				chunk = type_list_layouts(value_type)
+				for layout in chunk:
+					layouts = layouts.append(layout)
+
+	for function in program.functions:
+		for parameter in function.signature.parameters:
+			chunk = type_list_layouts(parameter)
+			for layout in chunk:
+				layouts = layouts.append(layout)
+		returned = type_list_layouts(function.signature.return_type)
+		for layout in returned:
+			layouts = layouts.append(layout)
+		prefix = block_list_layouts(function.operations)
+		for layout in prefix:
+			layouts = layouts.append(layout)
+		branches: List[ListLayout] = match function.tail:
+			ReturnTail(_): []
+			MatchTail(matched):
+				var arms: List[ListLayout] = []
+				for arm in matched.arms:
+					chunk = block_list_layouts(arm.operations)
+					for layout in chunk:
+						arms = arms.append(layout)
+				arms
+		for layout in branches:
+			layouts = layouts.append(layout)
+
+	ordered = layouts
+		.sort_by(pure func(layout): list_key_ordinal(layout.key))
+		.sort_by(pure func(layout): list_key_rank(layout.key))
+		.sort_by(pure func(layout): list_key_depth(layout.key))
+	var unique: List[ListLayout] = []
+	var previous: Option[ListElementKey] = None
+	for layout in ordered:
+		duplicate = match previous:
+			Some(key): same_list_key(key, layout.key)
+			None: False
+		if not duplicate:
+			unique = unique.append(layout)
+			previous = Some(layout.key)
+	unique
+
+
+private pure func append_list_prototypes(output: String, layouts: List[ListLayout]) -> String:
+	if layouts.is_empty():
+		output
+	else:
+		var fragments: List[String] = [output]
+		for layout in layouts:
+			suffix = list_suffix(layout.key)
+			type_name = list_c_type(layout.key)
+			fragment = "struct blorp_l_".concat(suffix).concat(";")
+				.concat("void blorp_list_dup_").concat(suffix).concat("(").concat(type_name).concat(");")
+				.concat("void blorp_list_drop_").concat(suffix).concat("(").concat(type_name).concat(");")
+			fragments = fragments.append(fragment)
+		fragments.join("")
+
+
+private pure func list_runtime_fragment(
+	layout: ListLayout,
+	unions: List[ConcreteUnion],
+	records: List[ConcreteRecord],
+) -> Result[String, Diagnostic]:
+	-- Nested helpers use the precomputed suffix key. Rewalking the TypeRef at
+	-- every suffix would make a single deeply nested List require quadratic work.
+	if IntOps.greater_than(list_key_depth(layout.key), 0):
+		child = list_child_key(layout.key)
+		suffix = list_suffix(child)
+		Ok(list_runtime(
+			layout.key,
+			list_c_type(child),
+			"blorp_list_dup_".concat(suffix).concat("(element);"),
+			"blorp_list_drop_".concat(suffix).concat("(element);"),
+		))
+	else:
+		type_name ?= c_type(layout.element, unions)
+		ownership ?= value_ownership(layout.element, unions, records)
+		acquire ?= match ownership:
+			NoOwnership: Ok("")
+			_: append_storage_operation("", layout.element, DuplicateValue, "element", unions)
+		destroy ?= match ownership:
+			NoOwnership: Ok("")
+			_: append_storage_operation("", layout.element, DestroyValue, "element", unions)
+		Ok(list_runtime(layout.key, type_name, acquire, destroy))
+
+
+private pure func append_list_runtime(
+	output: String,
+	layouts: List[ListLayout],
+	unions: List[ConcreteUnion],
+	records: List[ConcreteRecord],
+) -> Result[String, Diagnostic]:
+	if layouts.is_empty():
+		Ok(output)
+	else:
+		var fragments: List[String] = [output]
+		var failure: Option[Diagnostic] = None
+		for layout in layouts:
+			fragment = list_runtime_fragment(layout, unions, records)
+			match fragment:
+				Err(error):
+					failure = Some(error)
+					break
+				Ok(completed):
+					fragments = fragments.append(completed)
+		match failure:
+			Some(error): Err(error)
+			None: Ok(fragments.join(""))
+
+
+private pure func aggregate_runtime_contents(
+	checked: OwnershipProgram,
+	lists: List[ListLayout],
+) -> Result[String, Diagnostic]:
+	var output = append_list_prototypes("", lists)
+	var index: Int = 0
+
+	for layout in checked.records:
+		output = output
+			.concat("typedef struct blorp_r_")
+			.append_int(index)
+			.concat(
+				match layout.representation:
+					InlineRecord:
+						" "
+					ManagedRecord:
+						"* "
+			)
+			.concat("blorp_r_")
+			.append_int(index)
+			.concat(";")
+		index = IntOps.add(index, 1)
+
+	index = 0
+
+	for _ in checked.records:
+		output = append_record_prototypes(output, index)
+		index = IntOps.add(index, 1)
+
+	ordered ?= append_aggregate_definitions(checked.records, checked.unions, output)
+	output = ordered
+	index = 0
+	var failure: Option[Diagnostic] = None
+
+	for layout in checked.records:
+		match append_record_ownership(output, layout, index, checked.unions):
+			Ok(updated):
+				output = updated
+			Err(error):
+				failure = Some(error)
+				break
+
+		index = IntOps.add(index, 1)
+
+	ready ?= match failure:
+		Some(error):
+			Err(error)
+		None:
+			Ok(void)
+
+	completed ?= append_list_runtime(output, lists, checked.unions, checked.records)
+	arguments = match checked.entrypoint:
+		WithArguments(_, _): arguments_runtime()
+		NoArguments(_, _): ""
+	Ok(completed.concat(arguments))
+
+
+pure func aggregate_runtime(program: VerifiedProgram) -> Result[String, Diagnostic]:
+	checked = verified_contents(program)
+	aggregate_runtime_contents(checked, list_layouts(checked))
+
+
+pure func emit(program: VerifiedProgram) -> Result[String, Diagnostic]:
+	checked = verified_contents(program)
+	records = checked.records
+	lists = list_layouts(checked)
+
+	var output: String = if needs_string_runtime(checked):
+		string_runtime()
+	else:
+		"#include <stdint.h>\n"
+
+	if (
+		not lists.is_empty() or checked.records.any(pure func(layout):
+			match layout.representation:
+				ManagedRecord:
+					True
+				InlineRecord:
+					False
+		)
+	):
+		output = output.concat("#include <stdlib.h>\n#include <stdatomic.h>\n")
+
+	if needs_float_runtime(checked):
+		output = output.concat(float_runtime())
+
+	if needs_runtime(checked, FloatFormatting):
+		output = output.concat(float_string_runtime())
+
+	if needs_runtime(checked, FloatParsing):
+		output = output.concat(float_parse_runtime())
+
+	if needs_runtime(checked, IntegerAddition):
+		output = output.concat(INTEGER_ADD_RUNTIME)
+
+	if needs_runtime(checked, IntegerArithmetic):
+		output = output.concat(INTEGER_ARITHMETIC_RUNTIME)
+
+	if needs_runtime(checked, StringOutput):
+		output = output.concat(string_print_runtime())
+
+	if needs_runtime(checked, IntegerParsing):
+		output = output.concat(string_parse_int_runtime())
+
+	if needs_runtime(checked, StringEquality):
+		output = output.concat(string_equals_runtime())
+
+	aggregates ?= aggregate_runtime_contents(checked, lists)
+	output = output.concat(aggregates)
+	var index: Int = 0
+	var failure: Option[Diagnostic] = None
+
+	index = 0
+
+	for function in checked.functions:
+		match append_signature(output, function, index, checked.unions):
+			Err(error):
+				failure = Some(error)
+				break
+			Ok(signature):
+				output = signature.concat(";")
+
+		index = IntOps.add(index, 1)
+
+	if not failure.is_some():
+		index = 0
+
+		for function in checked.functions:
+			match append_function(output, function, index, checked.unions, records):
+				Err(error):
+					failure = Some(error)
+					break
+				Ok(function_code):
+					output = function_code
+
+			index = IntOps.add(index, 1)
+
+	match failure:
+		Some(error):
+			Err(error)
+		None:
+			name = c_name(function_number(entry_function(checked.entrypoint)))
+
+			wrapper = match checked.entrypoint:
+				NoArguments(_, IntegerExitStatus):
+					output
+						.concat("int main(void){return (int)")
+						.concat(name)
+						.concat("();}\n")
+				NoArguments(_, SuccessfulExit):
+					output
+						.concat("int main(void){(void)")
+						.concat(name)
+						.concat("();return 0;}\n")
+				WithArguments(_, result):
+					prefix = output.concat((
+							"int main(int argc,char **argv){struct blorp_l_0_s *const "
+							+ "blorp_arguments=blorp_list_from_argv(argc,argv);"
+						))
+
+					match result:
+						IntegerExitStatus:
+							prefix
+								.concat("const int64_t blorp_result=")
+								.concat(name)
+								.concat(
+									"(blorp_arguments);blorp_list_drop_0_s(blorp_arguments);return (int)blorp_result;}\n",
+								)
+						SuccessfulExit:
+							prefix
+								.concat("(void)")
+								.concat(name)
+								.concat(
+									"(blorp_arguments);blorp_list_drop_0_s(blorp_arguments);return 0;}\n",
+								)
+
+			Ok(wrapper)

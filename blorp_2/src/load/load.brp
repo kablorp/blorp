@@ -1,0 +1,399 @@
+import:
+	int as IntOps
+	../lex/lex: lex
+	../utils/names: NameId, NameTable, name_spelling
+	option: to_result
+	../parse/assemble:
+		ParsedAssembly, ParsedProgram, ParsedModuleRow, ModuleImport, append_module, assembly_names, begin_program, parsed_contents, seal_program
+	../parse/parse:
+		ParsedModule, ParsedImport, ImportOrigin(RelativeImport, LibraryImport), module_imports, module_names, parse_module
+	path as Path
+	../utils/source:
+		COMPILER_SOURCE, ModuleId, ModuleKind(UserModule, LibraryModule, FoundationTypesModule, FoundationPreludeModule), foundation_prelude_module_id, foundation_types_module_id, module_id, module_number, module_source, root_module_id, same_module
+	../utils/syntax: Diagnostic, Span
+	system: getcwd, read_file
+	../utils/text as Text
+
+
+private FOUNDATION_TYPES_PATH: String = "_base.brp"
+
+private FOUNDATION_PRELUDE_PATH: String = "prelude.brp"
+
+fixed record SourceFile {
+	path: String,
+	contents: String
+}
+
+
+-- Module source rows use the same order as the parser's module inventory.
+fixed record SourceInputs {
+	modules: List[SourceFile]
+}
+
+
+fixed record LoadedProgram {
+	sources: SourceInputs,
+	program: ParsedProgram
+}
+
+
+fixed record LoadFailure {
+	sources: SourceInputs,
+	diagnostic: Diagnostic
+}
+
+
+private pure func failure(modules: List[SourceFile], diagnostic: Diagnostic) -> LoadFailure:
+	{ sources = { modules = modules }, diagnostic = diagnostic }
+
+
+private pure func rejection(span: Span, message: String, help: String) -> Diagnostic:
+	{ span = span, note = None, message = message, help = help }
+
+
+private pure func internal_error(message: String) -> Diagnostic:
+	rejection(
+		{ source = COMPILER_SOURCE, start = 0, end = 0 },
+		message,
+		"report this compiler error with the input files",
+	)
+
+
+private fixed record LibraryContents {
+	root: String,
+	prefix: String,
+	types_path: String,
+	prelude_path: String
+}
+
+
+-- The configured library root is the only authority for module roles: the
+-- foundation inputs are its two designated files, and every other file under it
+-- is library code. Only library_layout builds one, so these paths always agree.
+opaque type LibraryLayout = LibraryContents
+
+
+-- The root is normalized here, like every path passed to module_role.
+pure func library_layout(root: String) -> LibraryLayout:
+	normalized = Path.normalize(root)
+	into_opaque LibraryLayout({
+		root = normalized,
+		prefix = Path.join(normalized, ""),
+		types_path = Path.join(normalized, FOUNDATION_TYPES_PATH),
+		prelude_path = Path.join(normalized, FOUNDATION_PRELUDE_PATH)
+	})
+
+
+-- Decides the role of a normalized path, whether it was queued by an import or
+-- named on the command line. The application root is the caller's concern: it
+-- is a user module wherever it lives, and only foundation roles are rejected.
+pure func module_role(layout: LibraryLayout, path: String) -> ModuleKind:
+	contents = from_opaque LibraryLayout(layout)
+	if Text.equals(path, contents.types_path):
+		FoundationTypesModule
+	else if Text.equals(path, contents.prelude_path):
+		FoundationPreludeModule
+	else if path.starts_with(contents.prefix):
+		LibraryModule
+	else:
+		UserModule
+
+
+private pure func join_parts(directory: String, parts: List[NameId], position: Int, names: NameTable) -> Result[String, Diagnostic]:
+	match parts.get(position):
+		None:
+			Ok(directory)
+		Some(part):
+			spelling ?= name_spelling(names, part).to_result(internal_error("import path references an invalid spelling identity"))
+			join_parts(Path.join(directory, spelling), parts, IntOps.add(position, 1), names)
+
+
+-- This projection belongs to source loading, where filesystem paths are needed.
+-- Semantic import resolution receives ModuleId targets instead of these strings.
+pure func import_path(
+	importer: String,
+	request: ParsedImport,
+	names: NameTable,
+	layout: LibraryLayout,
+) -> Result[String, Diagnostic]:
+	base = match request.path.origin:
+		LibraryImport:
+			from_opaque LibraryLayout(layout).root
+		RelativeImport(parents):
+			var directory = Path.dirname(importer)
+			var remaining = parents
+			while IntOps.greater_than(remaining, 0):
+				directory = Path.dirname(directory)
+				remaining = IntOps.subtract(remaining, 1)
+			directory
+	directory ?= join_parts(base, request.path.parts, 0, names)
+	-- Already normal: the importer and library root are normalized, relative parents
+	-- are resolved with dirname on that normal path, and the parser admits only
+	-- identifier parts ("interior dot segments are rejected" in
+	-- test_grammar/test_imports.brp), so normalizing again would only reallocate.
+	Ok(Text.concat(directory, ".brp"))
+
+
+-- The site is the import that discovered the file; designated inputs have none.
+-- The role is fixed when the module is queued and is its only role authority.
+private fixed record RequestedModule {
+	id: ModuleId,
+	path: String,
+	role: ModuleKind,
+	site: Option[Span]
+}
+
+
+private pure func designated(id: ModuleId, path: String, role: ModuleKind) -> RequestedModule:
+	{ id = id, path = path, role = role, site = None }
+
+
+-- A first-match scan: it keeps the first hit and reads the whole (short) queue.
+private pure func known_module(requests: List[RequestedModule], path: String) -> Option[RequestedModule]:
+	var known: Option[RequestedModule] = None
+	for request in requests:
+		if known.is_none() and Text.equals(request.path, path):
+			known = Some(request)
+	known
+
+
+private func read_module(path: String, id: ModuleId, site: Option[Span]) -> Result[String, Diagnostic]:
+	match read_file(path):
+		Ok(contents):
+			Ok(contents)
+		Err(error):
+			Err(rejection(
+				site.get_or({ source = module_source(id), start = 0, end = 0 }),
+				Text.concat("could not read module ", path).concat(": ").concat(error),
+				"check the import path and provide a readable .brp file under its source root",
+			))
+
+
+-- Everything loading threads through the queue. Each queued file yields exactly
+-- one row, so the row count is the next file's queue position.
+private fixed record LoadState {
+	layout: LibraryLayout,
+	root_path: String,
+	requests: List[RequestedModule],
+	assembly: ParsedAssembly,
+	modules: List[SourceFile]
+}
+
+
+-- The imports of one module resolved in written order. Every import yields
+-- exactly one target, so the target count is the next import's position.
+private fixed record ImportCursor {
+	layout: LibraryLayout,
+	importer: RequestedModule,
+	names: NameTable,
+	imports: List[ParsedImport],
+	requests: List[RequestedModule],
+	targets: List[ModuleId]
+}
+
+
+-- User modules receive the prelude implicitly, so it is reserved, and a module
+-- under the library root importing a user module would close a cycle through it.
+-- Nested matches, not a tuple, so the host checks that every role is covered.
+private pure func import_rejection(importer: ModuleKind, target: ModuleKind, span: Span) -> Option[Diagnostic]:
+	match target:
+		FoundationPreludeModule:
+			Some(rejection(span, "the prelude cannot be imported explicitly", "remove this import; user modules receive the prelude automatically"))
+		FoundationTypesModule | LibraryModule:
+			None
+		UserModule:
+			match importer:
+				UserModule:
+					None
+				FoundationTypesModule | FoundationPreludeModule | LibraryModule:
+					Some(rejection(span, "a library module cannot import a user module", "library modules may import only other library modules and _base"))
+
+
+-- A permitted import yields its request: the queued one, or a new request with
+-- its layout role. The root is queued first, as a user module wherever it lives.
+private pure func import_allowed(cursor: ImportCursor, known: Option[RequestedModule], path: String, span: Span) -> Result[RequestedModule, Diagnostic]:
+	role = match known:
+		Some(queued): queued.role
+		None: module_role(cursor.layout, path)
+	match import_rejection(cursor.importer.role, role, span):
+		Some(error):
+			Err(error)
+		None:
+			match known:
+				Some(queued):
+					Ok(queued)
+				None:
+					match module_id(cursor.requests.length()):
+						Some(id): Ok({ id = id, path = path, role = role, site = Some(span) })
+						None: Err(internal_error("module inventory is too large"))
+
+
+private pure func resolve_imports(cursor: ImportCursor) -> Result[ImportCursor, Diagnostic]:
+	match cursor.imports.get(cursor.targets.length()):
+		None:
+			Ok(cursor)
+		Some(request):
+			path ?= import_path(cursor.importer.path, request, cursor.names, cursor.layout)
+			known = known_module(cursor.requests, path)
+			target ?= import_allowed(cursor, known, path, request.span)
+			requests = match known:
+				Some(_): cursor.requests
+				None: cursor.requests.append(target)
+			resolve_imports({ cursor | requests = requests, targets = cursor.targets.append(target.id) })
+
+
+-- Parse one file, resolve its imports, and add it to the assembly.
+private pure func link_module(state: LoadState, current: RequestedModule, contents: String) -> Result[LoadState, Diagnostic]:
+	lexed ?= lex(module_source(current.id), contents)
+	parsed ?= parse_module(lexed, current.id, assembly_names(state.assembly))
+	resolved ?= resolve_imports({
+		layout = state.layout, importer = current, names = module_names(parsed),
+		imports = module_imports(parsed), requests = state.requests, targets = [],
+	})
+	assembly ?= append_module(state.assembly, parsed, resolved.targets, current.role)
+	Ok({ state | requests = resolved.requests, assembly = assembly })
+
+
+-- Readable bytes stay in the failure's sources even when parsing fails, so the
+-- diagnostic has a source to render against.
+private func load_module(state: LoadState, current: RequestedModule) -> Result[LoadState, LoadFailure]:
+	match read_module(current.path, current.id, current.site):
+		Err(error):
+			-- Missing designated inputs still have a path for source-aware diagnostics.
+			Err(failure(state.modules.append({ path = current.path, contents = "" }), error))
+		Ok(contents):
+			display_path = if same_module(current.id, root_module_id()):
+				state.root_path
+			else:
+				current.path
+			with_source = { state | modules = state.modules.append({ path = display_path, contents = contents }) }
+			match link_module(with_source, current, contents):
+				Err(error): Err(failure(with_source.modules, error))
+				Ok(linked): Ok(linked)
+
+
+-- Recursion depth is the module count, which follows the program's files. The host
+-- handles tens of thousands of frames (30,000 ran, 50,000 overflowed the stack).
+private func load_queue(state: LoadState) -> Result[LoadState, LoadFailure]:
+	match state.requests.get(state.modules.length()):
+		None:
+			Ok(state)
+		Some(current):
+			next ?= load_module(state, current)
+			load_queue(next)
+
+
+private IMPORT_CYCLE_HELP: String = "move the declarations both modules need into a third module that both import"
+
+
+-- A depth-first walk over resolved import targets. The path holds the modules
+-- being explored, outermost first; a module is explored once all its imports are.
+private fixed record ImportWalk {
+	rows: List[ParsedModuleRow],
+	path: List[ModuleId],
+	explored: List[ModuleId]
+}
+
+
+-- Why a walk stopped early. A sealed program has a row for every import target.
+private fixed union WalkStop:
+	ClosedCycle(List[ModuleId], Span)
+	MissingModuleRow
+
+
+-- An import of a module already on the path closes a cycle: the path from that
+-- module to the importer, then back to it. A module appears on the path at most once.
+private pure func walk_imports(walk: ImportWalk, imports: List[ModuleImport], position: Int) -> Result[ImportWalk, WalkStop]:
+	match imports.get(position):
+		None:
+			Ok(walk)
+		Some(request):
+			var cycle: List[ModuleId] = []
+			for module in walk.path:
+				if not cycle.is_empty() or same_module(module, request.target):
+					cycle = cycle.append(module)
+			next ?= if cycle.is_empty():
+				walk_module(walk, request.target)
+			else:
+				Err(ClosedCycle(cycle.append(request.target), request.span))
+			walk_imports(next, imports, IntOps.add(position, 1))
+
+
+-- Recursion depth is bounded by the program's import count, which follows its
+-- files like load_queue's; the host handles tens of thousands of frames. The
+-- explored scan makes the walk O(modules x imports), small at today's sizes.
+private pure func walk_module(walk: ImportWalk, module: ModuleId) -> Result[ImportWalk, WalkStop]:
+	var explored = False
+	for done in walk.explored:
+		if same_module(done, module):
+			explored = True
+			break
+	if explored:
+		Ok(walk)
+	else:
+		row ?= walk.rows.get(module_number(module)).to_result(MissingModuleRow)
+		entered ?= walk_imports({ walk | path = walk.path.append(module) }, row.imports, 0)
+		Ok({ entered | path = walk.path, explored = entered.explored.append(module) })
+
+
+-- Source rows follow module ordinals, so each module in a cycle has a display path.
+private pure func display_paths(sources: SourceInputs, cycle: List[ModuleId], paths: List[String]) -> Result[List[String], Diagnostic]:
+	match cycle.get(paths.length()):
+		None:
+			Ok(paths)
+		Some(module):
+			file ?= sources.modules.get(module_number(module)).to_result(internal_error("import cycle names a module without a source"))
+			display_paths(sources, cycle, paths.append(file.path))
+
+
+-- Import cycles are banned. Walking from each module in load order reports the
+-- first cycle deterministically, at the import that closes it.
+private pure func reject_import_cycles(sources: SourceInputs, program: ParsedProgram) -> Result[Void, Diagnostic]:
+	rows = parsed_contents(program).modules
+	var walk: Result[ImportWalk, WalkStop] = Ok({ rows = rows, path = [], explored = [] })
+	for row in rows:
+		walk = walk.and_then(pure func(state): walk_module(state, row.module))
+	match walk:
+		Ok(_):
+			Ok(void)
+		Err(MissingModuleRow):
+			Err(internal_error("import target has no module row"))
+		Err(ClosedCycle(cycle, closing)):
+			paths ?= display_paths(sources, cycle, [])
+			Err(rejection(closing, Text.concat("import cycle: ", paths.join(" -> ")), IMPORT_CYCLE_HELP))
+
+
+-- Every queued path has one identity, role, read, and parse in this invocation.
+func load_program(root_path: String, library_root: String) -> Result[LoadedProgram, LoadFailure]:
+	working_directory = getcwd()
+	layout = library_layout(Path.join(working_directory, library_root))
+	foundation = from_opaque LibraryLayout(layout)
+	root_file = Path.normalize(Path.join(working_directory, root_path))
+	-- Only the foundation inputs are barred from being the application root.
+	root_input ?= match module_role(layout, root_file):
+		FoundationTypesModule | FoundationPreludeModule:
+			Err(failure(
+				[{ path = root_path, contents = "" }],
+				rejection({ source = module_source(root_module_id()), start = 0, end = 0 }, "foundation modules cannot be application roots", "choose an application module; foundation inputs are supplied by --library-root"),
+			))
+		LibraryModule | UserModule:
+			Ok(void)
+	loaded ?= load_queue({
+		layout = layout,
+		root_path = root_path,
+		requests = [
+			designated(root_module_id(), root_file, UserModule),
+			designated(foundation_types_module_id(), foundation.types_path, FoundationTypesModule),
+			designated(foundation_prelude_module_id(), foundation.prelude_path, FoundationPreludeModule),
+		],
+		assembly = begin_program(),
+		modules = [],
+	})
+	sources: SourceInputs = { modules = loaded.modules }
+	match seal_program(loaded.assembly):
+		Err(error):
+			Err(failure(loaded.modules, error))
+		Ok(program):
+			match reject_import_cycles(sources, program):
+				Err(error): Err(failure(loaded.modules, error))
+				Ok(_): Ok({ sources = sources, program = program })

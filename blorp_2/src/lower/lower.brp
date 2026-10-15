@@ -1,0 +1,608 @@
+import:
+	../check/check_model: BindingId, BindingOrigin(ParameterBinding, BodyLocal, MatchCapture), binding_number
+	int as IntOps
+	list: set
+	option: to_result
+	../specialize/specialize:
+		ConcreteArm,
+		ConcreteBinding,
+		ConcreteBody(ConcreteValueBody, ConcreteMatchBody),
+		ConcreteCall,
+		ConcreteExit(ReturnExpression, RecurWith),
+		ConcreteExpr,
+		ConcreteForm(
+			LiteralVoid, LiteralInteger, LiteralFloat, LiteralString, ReadBinding, ConstructVariant,
+			ConstructRecord, UpdateRecord, InvokeFunction, ReadRecordField,
+		),
+		ConcreteFunction,
+		ConcreteMatch,
+		ConcretePattern(VariantCase, WildcardCase, BindingCase),
+		ConcreteRecord,
+		ConcreteRecordField,
+		ConcreteRecordUpdate,
+		ConcreteStatement(InitializeBinding, ReassignBinding, DiscardExpression),
+		ConcreteUnion, VariantFieldInstanceId, variant_field,
+		FieldInstanceId,
+		FunctionInstanceId,
+		FunctionSignature,
+		RecordInstanceId,
+		SpecializedProgram,
+		TypeRef(IntType, RecordType),
+		UnionInstanceId,
+		VariantInstanceId,
+		specialized_contents,
+	../utils/syntax: Diagnostic, Entrypoint, FunctionExecution, Span
+
+
+-- A value identity belongs to one lowered function, including its branches.
+opaque type ValueId = Int
+
+
+pure func value_number(id: ValueId) -> Int:
+	from_opaque ValueId(id)
+
+
+fixed record RecordFieldValue {
+	field: FieldInstanceId,
+	value: ValueId
+}
+
+
+fixed union ValueOperation:
+	ConstructRecordValue(RecordInstanceId, List[RecordFieldValue])
+	ReadRecordFieldValue(FieldInstanceId, ValueId)
+	ParameterValue(Int)
+	VoidValue
+	IntegerValue(Int)
+	FloatValue(Float)
+	StringValue(String)
+	CallValue(ConcreteCall, List[ValueId])
+	ConstructValue(VariantInstanceId, List[ValueId])
+	-- Selected member identity is retained for verification and C projection.
+	PayloadValue(VariantFieldInstanceId, ValueId)
+
+
+fixed record ValueDefinition {
+	id: ValueId,
+	value_type: TypeRef,
+	operation: ValueOperation,
+	span: Span
+}
+
+
+fixed record ValueBlock {
+	definitions: List[ValueDefinition],
+	exit: LoweredExit
+}
+
+
+fixed union MatchLabel:
+	VariantLabel(VariantInstanceId)
+	DefaultLabel
+
+
+fixed record LoweredArm {
+	label: MatchLabel,
+	body: ValueBlock
+}
+
+
+fixed record LoweredMatch {
+	scrutinee: ValueId,
+	owner: UnionInstanceId,
+	arms: List[LoweredArm]
+}
+
+
+fixed union LoweredExit:
+	ReturnValue(ValueId)
+	RecurValues(List[ValueId], Span)
+
+
+fixed union LoweredTail:
+	ExitValue(LoweredExit)
+	MatchValue(LoweredMatch)
+
+
+fixed record LoweredFunction {
+	execution: FunctionExecution,
+	signature: FunctionSignature,
+	definitions: List[ValueDefinition],
+	tail: LoweredTail
+}
+
+
+fixed record LoweredFunctions {
+	records: List[ConcreteRecord],
+	unions: List[ConcreteUnion],
+	functions: List[LoweredFunction],
+	entrypoint: Entrypoint[FunctionInstanceId]
+}
+
+
+-- Only lowering can publish ordered definitions with resolved value uses.
+opaque type LoweredProgram = LoweredFunctions
+
+
+pure func lowered_functions(program: LoweredProgram) -> LoweredFunctions:
+	from_opaque LoweredProgram(program)
+
+
+-- This builder is confined to one expression; read-only bindings are separate.
+-- Its inherited traversal still shares a growing vector, without a block prefix.
+private fixed record ExpressionBuilder {
+	next_value: Int,
+	definitions: List[ValueDefinition]
+}
+
+
+private fixed record BuiltValue {
+	builder: ExpressionBuilder,
+	value: ValueId
+}
+
+
+private pure func invalid_binding(span: Span) -> Diagnostic:
+	{
+		span = span,
+		note = None,
+		message = "internal compiler error: invalid checked binding identity",
+		help = "report this compiler error with the input program"
+	}
+
+
+private pure func define_value(
+	builder: ExpressionBuilder,
+	operation: ValueOperation,
+	value_type: TypeRef,
+	span: Span,
+) -> BuiltValue:
+	id = into_opaque ValueId(builder.next_value)
+	{
+		builder = { builder |
+			next_value = IntOps.add(builder.next_value, 1),
+			definitions = builder.definitions.append({
+				id = id,
+				operation = operation,
+				value_type = value_type,
+				span = span,
+			})
+		},
+		value = id
+	}
+
+
+private pure func read_binding(
+	bindings: List[Option[ValueId]],
+	id: BindingId,
+	span: Span,
+) -> Result[ValueId, Diagnostic]:
+	entry ?= bindings
+		.get(binding_number(id))
+		.to_result(invalid_binding(span))
+	entry.to_result(invalid_binding(span))
+
+
+private fixed record BuiltArguments {
+	builder: ExpressionBuilder,
+	values: List[ValueId]
+}
+
+
+private pure func lower_arguments(
+	builder: ExpressionBuilder,
+	bindings: List[Option[ValueId]],
+	arguments: List[ConcreteExpr],
+) -> Result[BuiltArguments, Diagnostic]:
+	var current = builder
+	var values: List[ValueId] = []
+	var failure: Option[Diagnostic] = None
+
+	for argument in arguments:
+		match lower_value(current, bindings, argument):
+			Err(error):
+				failure = Some(error)
+				break
+			Ok(built):
+				current = built.builder
+				values = values.append(built.value)
+
+	match failure:
+		Some(error):
+			Err(error)
+		None:
+			Ok({
+				builder = current,
+				values = values,
+			})
+
+
+private fixed record BuiltFields {
+	builder: ExpressionBuilder,
+	values: List[RecordFieldValue]
+}
+
+
+-- Written fields in written order. Emission names each field, so the order of
+-- a record's field values is evaluation order, not declaration order.
+private pure func lower_record_fields(
+	builder: ExpressionBuilder,
+	bindings: List[Option[ValueId]],
+	fields: List[ConcreteRecordField],
+) -> Result[BuiltFields, Diagnostic]:
+	var current = builder
+	var values: List[RecordFieldValue] = []
+	var failure: Option[Diagnostic] = None
+
+	for field in fields:
+		match lower_value(current, bindings, field.value):
+			Err(error):
+				failure = Some(error)
+				break
+			Ok(child):
+				current = child.builder
+				values = values.append({
+					field = field.field,
+					value = child.value,
+				})
+
+	match failure:
+		Some(error):
+			Err(error)
+		None:
+			Ok({
+				builder = current,
+				values = values,
+			})
+
+
+-- The base, then the replacements in written order, then reads of the
+-- inherited fields; the checker guarantees the two lists partition the fields.
+private pure func lower_record_update(
+	builder: ExpressionBuilder,
+	bindings: List[Option[ValueId]],
+	update: ConcreteRecordUpdate,
+	owner: RecordInstanceId,
+	value_type: TypeRef,
+	span: Span,
+) -> Result[BuiltValue, Diagnostic]:
+	base ?= lower_value(builder, bindings, update.base)
+	replaced ?= lower_record_fields(base.builder, bindings, update.replacements)
+	var current = replaced.builder
+	var fields = replaced.values
+
+	for field in update.inherited:
+		read = define_value(current, ReadRecordFieldValue(field.field, base.value), field.value_type, update.base_expression_span)
+		current = read.builder
+		fields = fields.append({ field = field.field, value = read.value })
+
+	Ok(define_value(current, ConstructRecordValue(owner, fields), value_type, span))
+
+
+private pure func lower_value(
+	builder: ExpressionBuilder,
+	bindings: List[Option[ValueId]],
+	value: ConcreteExpr,
+) -> Result[BuiltValue, Diagnostic]:
+	match value.form:
+		LiteralVoid:
+			Ok(define_value(builder, VoidValue, value.value_type, value.span))
+		LiteralInteger(integer):
+			Ok(define_value(builder, IntegerValue(integer), value.value_type, value.span))
+		LiteralFloat(number):
+			Ok(define_value(builder, FloatValue(number), value.value_type, value.span))
+		LiteralString(bytes):
+			Ok(define_value(builder, StringValue(bytes), value.value_type, value.span))
+		ReadBinding(id):
+			bound ?= read_binding(bindings, id, value.span)
+			Ok({ builder = builder, value = bound })
+		ConstructVariant(variant, values):
+			children ?= lower_arguments(builder, bindings, values)
+			Ok(define_value(children.builder, ConstructValue(variant, children.values), value.value_type, value.span))
+		ConstructRecord(owner, fields):
+			built ?= lower_record_fields(builder, bindings, fields)
+			Ok(define_value(built.builder, ConstructRecordValue(owner, built.values), value.value_type, value.span))
+		UpdateRecord(owner, update):
+			lower_record_update(builder, bindings, update, owner, value.value_type, value.span)
+		InvokeFunction(call, arguments):
+			children ?= lower_arguments(builder, bindings, arguments)
+			-- A call's definition is anchored at its callee, not at the whole occurrence.
+			Ok(define_value(children.builder, CallValue(call, children.values), value.value_type, call.span))
+		ReadRecordField(receiver, field):
+			read ?= lower_value(builder, bindings, receiver)
+			Ok(define_value(read.builder, ReadRecordFieldValue(field, read.value), value.value_type, value.span))
+
+
+private fixed record BuiltBlock {
+	next_value: Int,
+	definitions: List[ValueDefinition],
+	bindings: List[Option[ValueId]]
+}
+
+
+private fixed record BuiltExit {
+	next_value: Int,
+	definitions: List[ValueDefinition],
+	exit: LoweredExit
+}
+
+
+private fixed record BuiltMatch {
+	definitions: List[ValueDefinition],
+	matched: LoweredMatch
+}
+
+
+private fixed record BuiltTail {
+	definitions: List[ValueDefinition],
+	tail: LoweredTail
+}
+
+
+private fixed record BuiltArm {
+	arm: LoweredArm,
+	next_value: Int
+}
+
+
+private pure func binding_slot(bindings: List[Option[ValueId]], id: BindingId, span: Span) -> Result[Int, Diagnostic]:
+	position = binding_number(id)
+	match bindings.get(position):
+		Some(_): Ok(position)
+		None: Err(invalid_binding(span))
+
+
+private pure func exit_span(exit: ConcreteExit) -> Span:
+	match exit:
+		ReturnExpression(value):
+			value.span
+		RecurWith(_, span):
+			span
+
+
+private pure func lower_exit(
+	next_value: Int,
+	bindings: List[Option[ValueId]],
+	exit: ConcreteExit,
+) -> Result[BuiltExit, Diagnostic]:
+	match exit:
+		ReturnExpression(value):
+			result ?= lower_value({ next_value = next_value, definitions = [] }, bindings, value)
+			Ok({
+				next_value = result.builder.next_value,
+				definitions = result.builder.definitions,
+				exit = ReturnValue(result.value),
+			})
+		RecurWith(arguments, span):
+			var cursor = next_value
+			var definitions: List[ValueDefinition] = []
+			var values: List[ValueId] = []
+			var failure: Option[Diagnostic] = None
+			for argument in arguments:
+				match lower_value({ next_value = cursor, definitions = [] }, bindings, argument):
+					Err(error):
+						failure = Some(error)
+						break
+					Ok(result):
+						for definition in result.builder.definitions:
+							definitions = definitions.append(definition)
+						values = values.append(result.value)
+						cursor = result.builder.next_value
+			match failure:
+				Some(error): Err(error)
+				None: Ok({
+					next_value = cursor,
+					definitions = definitions,
+					exit = RecurValues(values, span),
+				})
+
+
+private pure func lower_statements(
+	next_value: Int,
+	bindings: List[Option[ValueId]],
+	statements: List[ConcreteStatement],
+) -> Result[BuiltBlock, Diagnostic]:
+	var cursor = next_value
+	var values = bindings
+	var definitions: List[ValueDefinition] = []
+	var failure: Option[Diagnostic] = None
+	for statement in statements:
+		value = match statement:
+			InitializeBinding(_, value): value
+			ReassignBinding(_, value): value
+			DiscardExpression(value): value
+		match lower_value({ next_value = cursor, definitions = [] }, values, value):
+			Err(error):
+				failure = Some(error)
+				break
+			Ok(result):
+				for definition in result.builder.definitions:
+					definitions = definitions.append(definition)
+				cursor = result.builder.next_value
+				assigned = match statement:
+					InitializeBinding(id, _): Some(id)
+					ReassignBinding(id, _): Some(id)
+					DiscardExpression(_): None
+				match assigned:
+					None:
+						void
+					Some(id):
+						match binding_slot(values, id, value.span):
+							Ok(position): values = values.set(position, Some(result.value))
+							Err(error):
+								failure = Some(error)
+								break
+	match failure:
+		Some(error): Err(error)
+		None: Ok({
+			next_value = cursor,
+			definitions = definitions,
+			bindings = values,
+		})
+
+
+private pure func lower_arm(
+	initial_value: Int,
+	outer: List[Option[ValueId]],
+	arm: ConcreteArm,
+	scrutinee: ValueId,
+	bindings: List[ConcreteBinding],
+	unions: List[ConcreteUnion],
+) -> Result[BuiltArm, Diagnostic]:
+	var next_value = initial_value
+	var values = outer
+	var definitions: List[ValueDefinition] = []
+	var failure: Option[Diagnostic] = None
+	label = match arm.pattern:
+		VariantCase(id, _): VariantLabel(id)
+		_: DefaultLabel
+	match arm.pattern:
+		BindingCase(id):
+			match binding_slot(values, id, exit_span(arm.body)):
+				Ok(position): values = values.set(position, Some(scrutinee))
+				Err(error): failure = Some(error)
+		VariantCase(variant, captures):
+			var position = 0
+			for capture in captures:
+				match capture:
+					None:
+						void
+					Some(id):
+						field_result = variant_field(variant, position, unions, exit_span(arm.body))
+						binding = bindings.get(binding_number(id))
+						match field_result:
+							Err(error):
+								failure = Some(error)
+								break
+							Ok(field):
+								match binding:
+									Some(binding):
+										value = into_opaque ValueId(next_value)
+										next_value = IntOps.add(next_value, 1)
+										definitions = definitions.append({
+											id = value,
+											operation = PayloadValue(field, scrutinee),
+											value_type = binding.value_type,
+											span = binding.span,
+										})
+										values = values.set(binding_number(id), Some(value))
+									None:
+										failure = Some(invalid_binding(exit_span(arm.body)))
+										break
+				position = IntOps.add(position, 1)
+		WildcardCase:
+			void
+	match failure:
+		Some(error): Err(error)
+		None:
+			prefix ?= lower_statements(next_value, values, arm.statements)
+			result ?= lower_exit(prefix.next_value, prefix.bindings, arm.body)
+			var completed_definitions = definitions
+			for definition in prefix.definitions:
+				completed_definitions = completed_definitions.append(definition)
+			for definition in result.definitions:
+				completed_definitions = completed_definitions.append(definition)
+			Ok({
+				arm = {
+					label = label,
+					body = { definitions = completed_definitions, exit = result.exit },
+				},
+				next_value = result.next_value,
+			})
+
+
+private pure func lower_match(
+	next_value: Int,
+	values: List[Option[ValueId]],
+	matched: ConcreteMatch,
+	bindings: List[ConcreteBinding],
+	unions: List[ConcreteUnion],
+) -> Result[BuiltMatch, Diagnostic]:
+	scrutinee ?= lower_value({ next_value = next_value, definitions = [] }, values, matched.scrutinee)
+	var cursor = scrutinee.builder.next_value
+	var arms: List[LoweredArm] = []
+	var failure: Option[Diagnostic] = None
+	for arm in matched.arms:
+		match lower_arm(cursor, values, arm, scrutinee.value, bindings, unions):
+			Err(error):
+				failure = Some(error)
+				break
+			Ok(lowered):
+				arms = arms.append(lowered.arm)
+				cursor = lowered.next_value
+	match failure:
+		Some(error): Err(error)
+		None: Ok({
+			definitions = scrutinee.builder.definitions,
+			matched = { scrutinee = scrutinee.value, owner = matched.owner, arms = arms },
+		})
+
+
+private pure func lower_function(
+	function: ConcreteFunction,
+	unions: List[ConcreteUnion],
+) -> Result[LoweredFunction, Diagnostic]:
+	var next_value = 0
+	var parameter_definitions: List[ValueDefinition] = []
+	var values = function.bindings.map(pure func(_: ConcreteBinding) -> Option[ValueId]: None)
+	var ordinal = 0
+	for binding in function.bindings:
+		match binding.origin:
+			ParameterBinding(index):
+				definition: ValueDefinition = {
+					id = into_opaque ValueId(next_value),
+					operation = ParameterValue(index),
+					value_type = binding.value_type,
+					span = binding.span,
+				}
+				next_value = IntOps.add(next_value, 1)
+				parameter_definitions = parameter_definitions.append(definition)
+				values = values.set(ordinal, Some(definition.id))
+			_:
+				void
+		ordinal = IntOps.add(ordinal, 1)
+	prefix ?= lower_statements(next_value, values, function.statements)
+	body_result: Result[BuiltTail, Diagnostic] = match function.body:
+		ConcreteValueBody(value):
+			result ?= lower_exit(prefix.next_value, prefix.bindings, value)
+			Ok({ definitions = result.definitions, tail = ExitValue(result.exit) })
+		ConcreteMatchBody(matched):
+			result ?= lower_match(prefix.next_value, prefix.bindings, matched, function.bindings, unions)
+			Ok({ definitions = result.definitions, tail = MatchValue(result.matched) })
+	body ?= body_result
+	var definitions = parameter_definitions
+	for definition in prefix.definitions:
+		definitions = definitions.append(definition)
+	for definition in body.definitions:
+		definitions = definitions.append(definition)
+	Ok({
+		execution = function.execution,
+		signature = function.signature,
+		definitions = definitions,
+		tail = body.tail,
+	})
+
+
+pure func lower(program: SpecializedProgram) -> Result[LoweredProgram, Diagnostic]:
+	checked = specialized_contents(program)
+	var functions: List[LoweredFunction] = []
+	var failure: Option[Diagnostic] = None
+
+	for function in checked.functions:
+		match lower_function(function, checked.unions):
+			Err(error):
+				failure = Some(error)
+				break
+			Ok(lowered):
+				functions = functions.append(lowered)
+
+	match failure:
+		Some(error):
+			Err(error)
+		None:
+			Ok(into_opaque LoweredProgram({
+						records = checked.records,
+						unions = checked.unions,
+						functions = functions,
+						entrypoint = checked.entrypoint
+					}))

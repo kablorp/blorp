@@ -1,0 +1,2006 @@
+import:
+	float as FloatOps
+	int as IntOps
+	../utils/names: NameId, NameTable, intern_name
+	option: to_result
+	../utils/source: ModuleId, module_source, same_source
+	string as StringOps: index_of
+	../utils/syntax:
+		BindingSyntax(ImmutableBinding, MutableBinding),
+		DECIMAL_DIGITS,
+		Diagnostic,
+		ExpressionBase(
+			VoidExpression, IntegerExpression, FloatExpression, StringExpression, NameExpression, DirectApplication,
+			RecordExpression, RecordUpdateExpression,
+		),
+		FieldPattern(FieldName, FieldWildcard),
+		FunctionHeader,
+		LexedProgram,
+		ParsedBinding,
+		ParsedBody(ParsedBuiltinBody, ParsedValueBody, ParsedMatchBody),
+		ParsedBuiltinType(IntegerBuiltin, FloatBuiltin, StringBuiltin, VoidBuiltin, ListBuiltin),
+		ParsedFunction,
+		ParsedMatchArm,
+		ParsedParameter,
+		ParsedPattern(PatternName, PatternWildcard, PatternConstructor),
+		ParsedRecord,
+		ParsedRecordField,
+		ParsedRuntimeOperation(
+			IntegerAddBuiltin, IntegerToStringBuiltin, StringLengthBuiltin, StringPrintBuiltin,
+			StringParseIntBuiltin, ListRepeatBuiltin, ListLengthBuiltin, ListGetBuiltin, StringEqualsBuiltin, IntegerEqualsBuiltin, IntegerSubtractBuiltin,
+			IntegerMultiplyBuiltin, IntegerDivideBuiltin, IntegerRemainderBuiltin,
+			FloatAddBuiltin, FloatSubtractBuiltin, FloatMultiplyBuiltin, FloatDivideBuiltin,
+			FloatRemainderBuiltin, FloatToStringBuiltin, StringParseFloatBuiltin,
+		),
+		ParsedStatement(BindingStatement, ExpressionStatement),
+		ParsedUnion,
+		ParsedVariant,
+		PostfixOperation(ReceiverInvocation, FieldAccess),
+		Purity(Pure, Impure),
+		Spacing(Adjacent, Spaced),
+		Span,
+		Symbol(
+			PureKeyword, FunctionKeyword, MatchKeyword, Wildcard, LeftParen, RightParen, Dot, Arrow,
+			Colon, Newline, Indent, Dedent, VarKeyword, VoidKeyword, Equals, LeftBracket, RightBracket,
+			LeftBrace, RightBrace, RecordUpdateBar, Comma, AtSign, Slash, Star,
+		),
+		Token,
+		TokenKind(IdentifierToken, SymbolToken, IntegerLiteral, FloatLiteral, QuotedString),
+		TypeSyntax(AtomicType, AppliedType),
+		UTF8_CONTINUATION_END,
+		UTF8_CONTINUATION_START,
+		ValueExpression,
+		WrittenName,
+		diagnostic,
+		source_bundle_error,
+	../utils/text as Text
+
+
+private fixed record ParserState {
+	input: LexedProgram,
+	position: Int,
+	names: NameTable
+}
+
+
+fixed union ImportOrigin:
+	RelativeImport(Int)
+	LibraryImport
+
+
+fixed record ModulePath {
+	origin: ImportOrigin,
+	parts: List[NameId]
+}
+
+
+fixed union ImportSelection:
+	NamedSelection(WrittenName)
+	ConstructorSelection(WrittenName, List[WrittenName])
+	MethodsOnlySelection(WrittenName, Span)
+
+
+fixed record ParsedImport {
+	path: ModulePath,
+	symbols: List[ImportSelection],
+	span: Span
+}
+
+
+-- `base_names` is the table this parse extended; `names` adds its spellings.
+fixed record ParsedModuleContents {
+	base_names: NameTable,
+	names: NameTable,
+	module: ModuleId,
+	imports: List[ParsedImport],
+	builtin_types: List[ParsedBuiltinType],
+	functions: List[ParsedFunction],
+	unions: List[ParsedUnion],
+	records: List[ParsedRecord],
+	end: Span
+}
+
+
+-- Only `parse_module` constructs a module's syntax; readers see its contents.
+opaque type ParsedModule = ParsedModuleContents
+
+
+pure func module_contents(parsed: ParsedModule) -> ParsedModuleContents:
+	from_opaque ParsedModule(parsed)
+
+
+pure func module_names(parsed: ParsedModule) -> NameTable:
+	from_opaque ParsedModule(parsed).names
+
+
+pure func module_imports(parsed: ParsedModule) -> List[ParsedImport]:
+	from_opaque ParsedModule(parsed).imports
+
+
+private IDENTIFIER_HELP: String = "use an ASCII identifier starting with a letter or underscore; 'func', 'pure', 'match', 'var', and lone '_' are reserved"
+
+private EXPRESSION_HELP: String = "use a literal, a parameter or variant name, or a call as the entire body"
+
+private DECIMAL_RADIX: Int = 10
+
+private STRING_ESCAPE_HELP: String = "use \\n, \\r, \\t, \\0, \\\\, \\\", \\', \\{, \\}, or a Unicode scalar escape such as \\u{E9}"
+
+private UNICODE_ESCAPE_HELP: String = "write \\u{H} with one to six hexadecimal digits for a scalar from 0 to 10FFFF, excluding D800 through DFFF"
+
+-- A digit's value is its position in HEX_DIGITS after lowering its case.
+private HEX_DIGITS: String = "0123456789abcdef"
+
+private MAX_UNICODE_HEX_DIGITS: Int = 6
+
+private HEX_RADIX: Int = 16
+
+private UNICODE_MAX: Int = 1114111
+
+private SURROGATE_START: Int = 55296
+
+private SURROGATE_END: Int = 57343
+
+
+private pure func current(state: ParserState) -> Option[Token]:
+	state.input.tokens.get(state.position)
+
+
+private pure func shifted(state: ParserState, count: Int) -> ParserState:
+	{ state | position = IntOps.add(state.position, count) }
+
+
+private pure func at_end(state: ParserState) -> Bool:
+	IntOps.greater_than_or_equal(state.position, state.input.tokens.length())
+
+
+private pure func parser_span(state: ParserState) -> Span:
+	match current(state):
+		Some(token):
+			token.span
+		None:
+			state.input.end
+
+
+private pure func expected(state: ParserState, message: String, help: String) -> Diagnostic:
+	diagnostic(parser_span(state), message, help)
+
+
+private pure func misplaced_annotation(state: ParserState) -> Diagnostic:
+	expected(state, "misplaced function annotation", "put @tail_recursive before the optional pure and func keywords at column 1")
+
+
+-- The symbol at the parser position, or None for any other token or the end.
+private pure func current_symbol(state: ParserState) -> Option[Symbol]:
+	match current(state):
+		Some(token):
+			match token.kind:
+				SymbolToken(symbol):
+					Some(symbol)
+				_:
+					None
+		None:
+			None
+
+
+-- Each symbol the parser tests at several sites has one predicate here.
+private pure func at_comma(state: ParserState) -> Bool:
+	match current_symbol(state):
+		Some(Comma):
+			True
+		_:
+			False
+
+
+private pure func at_left_paren(state: ParserState) -> Bool:
+	match current_symbol(state):
+		Some(LeftParen):
+			True
+		_:
+			False
+
+
+private pure func at_right_paren(state: ParserState) -> Bool:
+	match current_symbol(state):
+		Some(RightParen):
+			True
+		_:
+			False
+
+
+private pure func at_dot(state: ParserState) -> Bool:
+	match current_symbol(state):
+		Some(Dot):
+			True
+		_:
+			False
+
+
+private pure func at_dedent(state: ParserState) -> Bool:
+	match current_symbol(state):
+		Some(Dedent):
+			True
+		_:
+			False
+
+
+private pure func at_newline(state: ParserState) -> Bool:
+	match current_symbol(state):
+		Some(Newline):
+			True
+		_:
+			False
+
+
+private pure func at_slash(state: ParserState) -> Bool:
+	match current_symbol(state):
+		Some(Slash):
+			True
+		_:
+			False
+
+
+private pure func at_at_sign(state: ParserState) -> Bool:
+	match current_symbol(state):
+		Some(AtSign):
+			True
+		_:
+			False
+
+
+private pure func at_left_bracket(state: ParserState) -> Bool:
+	match current_symbol(state):
+		Some(LeftBracket):
+			True
+		_:
+			False
+
+
+private pure func at_right_bracket(state: ParserState) -> Bool:
+	match current_symbol(state):
+		Some(RightBracket):
+			True
+		_:
+			False
+
+
+private pure func at_wildcard(state: ParserState) -> Bool:
+	match current_symbol(state):
+		Some(Wildcard):
+			True
+		_:
+			False
+
+
+private pure func at_var(state: ParserState) -> Bool:
+	match current_symbol(state):
+		Some(VarKeyword):
+			True
+		_:
+			False
+
+
+private pure func at_pure(state: ParserState) -> Bool:
+	match current_symbol(state):
+		Some(PureKeyword):
+			True
+		_:
+			False
+
+
+private pure func at_func(state: ParserState) -> Bool:
+	match current_symbol(state):
+		Some(FunctionKeyword):
+			True
+		_:
+			False
+
+
+private pure func at_colon(state: ParserState) -> Bool:
+	match current_symbol(state):
+		Some(Colon):
+			True
+		_:
+			False
+
+
+private pure func at_indent(state: ParserState) -> Bool:
+	match current_symbol(state):
+		Some(Indent):
+			True
+		_:
+			False
+
+
+private pure func at_equals(state: ParserState) -> Bool:
+	match current_symbol(state):
+		Some(Equals):
+			True
+		_:
+			False
+
+
+private pure func at_right_brace(state: ParserState) -> Bool:
+	match current_symbol(state):
+		Some(RightBrace):
+			True
+		_:
+			False
+
+
+private pure func at_word(state: ParserState, word: String) -> Bool:
+	match current(state):
+		Some(token):
+			match token.kind:
+				IdentifierToken(spelling):
+					Text.equals(spelling, word)
+				_:
+					False
+		None:
+			False
+
+
+private pure func at_identifier(state: ParserState) -> Bool:
+	match current(state):
+		Some(token):
+			match token.kind:
+				IdentifierToken(_):
+					True
+				_:
+					False
+		None:
+			False
+
+
+private pure func at_spaced_token(state: ParserState) -> Bool:
+	match current(state):
+		Some(token):
+			match token.spacing:
+				Spaced:
+					True
+				Adjacent:
+					False
+		None:
+			False
+
+
+-- Consumes the token at `state` when the caller's match found it `present`.
+private pure func expect(state: ParserState, present: Bool, message: String, help: String) -> Result[ParserState, Diagnostic]:
+	if present:
+		Ok(shifted(state, 1))
+	else:
+		Err(unexpected(state, message, help))
+
+
+private pure func unexpected(state: ParserState, message: String, help: String) -> Diagnostic:
+	if at_at_sign(state):
+		misplaced_annotation(state)
+	else:
+		expected(state, message, help)
+
+
+-- Ends a line that opens no block, so the next line cannot be indented.
+private pure func consume_line_end(state: ParserState, message: String, help: String) -> Result[ParserState, Diagnostic]:
+	next ?= expect(state, at_newline(state), message, help)
+
+	if at_indent(next):
+		Err(expected(next, "unexpected indentation", "indent a line only to open the block of a header ending in ':'; otherwise align it with the line above"))
+	else:
+		Ok(next)
+
+
+-- Ends a line whose value or declaration is complete.
+private pure func end_value_line(state: ParserState) -> Result[ParserState, Diagnostic]:
+	consume_line_end(state, "expected a newline after the return expression", "put each declaration on a new line")
+
+
+private pure func consume_word(state: ParserState, word: String) -> Result[ParserState, Diagnostic]:
+	if at_word(state, word):
+		Ok(shifted(state, 1))
+	else:
+		Err(expected(state, Text.concat("expected '", word).concat("'"), "use the ordinary declaration syntax, such as type Int = builtin or builtin(\"int.add\")"))
+
+
+private fixed record ParsedName {
+	name: WrittenName,
+	next: ParserState
+}
+
+
+private pure func consume_name(state: ParserState, message: String) -> Result[ParsedName, Diagnostic]:
+	match current(state):
+		Some(token):
+			match token.kind:
+				IdentifierToken(spelling):
+					interned = intern_name(state.names, spelling)
+					Ok({
+						name = { id = interned.id, span = token.span },
+						next = { state | position = IntOps.add(state.position, 1), names = interned.names },
+					})
+				SymbolToken(AtSign):
+					Err(misplaced_annotation(state))
+				_:
+					Err(expected(state, message, IDENTIFIER_HELP))
+		None:
+			Err(expected(state, message, IDENTIFIER_HELP))
+
+
+private fixed record NameList {
+	names: List[WrittenName],
+	next: ParserState
+}
+
+
+-- The digits read so far and their negated value.
+private fixed record DigitScan {
+	position: Int,
+	value: Int
+}
+
+
+private pure func invalid_integer(span: Span) -> Diagnostic:
+	diagnostic(span, "invalid integer literal", "write decimal digits, optionally preceded by an adjacent '-'")
+
+
+-- Accumulates negatively against `limit`, checking before multiplication, so
+-- the minimum needs no overflowing positive magnitude.
+private pure func accumulate_digit(spelling: String, span: Span, limit: Int, scan: DigitScan) -> Result[DigitScan, Diagnostic]:
+	shifted_value = IntOps.multiply(scan.value, DECIMAL_RADIX)
+
+	match DECIMAL_DIGITS.index_of(spelling.substring(scan.position, 1)):
+		None:
+			Err(invalid_integer(span))
+		Some(digit):
+			if (
+				IntOps.less_than(scan.value, IntOps.divide(limit, DECIMAL_RADIX))
+				or IntOps.less_than(shifted_value, IntOps.add(limit, digit))
+			):
+				Err(diagnostic(span, "integer literal is outside the Int64 range", "use a value from -9223372036854775808 to 9223372036854775807"))
+			else:
+				Ok({ position = IntOps.add(scan.position, 1), value = IntOps.subtract(shifted_value, digit) })
+
+
+private pure func integer_value(spelling: String, span: Span) -> Result[Int, Diagnostic]:
+	negative: Bool = spelling.starts_with("-")
+	digit_start: Int = if negative:
+		1
+	else:
+		0
+
+	if IntOps.equals(digit_start, spelling.length()):
+		Err(invalid_integer(span))
+	else if IntOps.less_than(IntOps.add(digit_start, 1), spelling.length()) and Text.equals(spelling.substring(digit_start, 1), "0"):
+		Err(diagnostic(span, "integer literals cannot have leading zeros", "write 0 or -0, or remove the leading zeros"))
+	else:
+		limit: Int = if negative:
+			IntOps.INT_MIN
+		else:
+			IntOps.subtract(0, IntOps.INT_MAX)
+		-- One Result carries the digits to the end of the spelling or to the first error.
+		var scan: Result[DigitScan, Diagnostic] = Ok({ position = digit_start, value = 0 })
+
+		while True:
+			match scan:
+				Ok(digits):
+					if IntOps.equals(digits.position, spelling.length()):
+						break
+
+					scan = accumulate_digit(spelling, span, limit, digits)
+				Err(_):
+					break
+
+		digits ?= scan
+
+		if negative:
+			Ok(digits.value)
+		else:
+			Ok(IntOps.subtract(0, digits.value))
+
+
+private pure func float_value(spelling: String, span: Span) -> Result[Float, Diagnostic]:
+	start = if spelling.starts_with("-"):
+		1
+	else:
+		0
+
+	if Text.equals(spelling.substring(start, 1), "0") and DECIMAL_DIGITS.contains(spelling.substring(IntOps.add(start, 1), 1)):
+		Err(diagnostic(span, "Float literals cannot have leading zeros", "write 0.5 or remove the leading zeros from the integer part"))
+	else:
+		match StringOps.parse_float(spelling):
+			Some(value):
+				if FloatOps.is_finite(value):
+					Ok(value)
+				else:
+					Err(diagnostic(span, "Float literal is outside the finite Float64 range", "use a smaller magnitude or exponent; infinities are produced by arithmetic, not literals"))
+			None:
+				Err(diagnostic(span, "invalid decimal Float literal", "write a decimal Float such as 1.0, 0.5 or 1e2"))
+
+
+-- `start` and `end` are offsets within the quoted contents after the opening quote.
+private pure func string_error(span: Span, start: Int, end: Int, message: String, help: String) -> Diagnostic:
+	contents = IntOps.add(span.start, 1)
+	diagnostic({ span | start = IntOps.add(contents, start), end = IntOps.add(contents, end) }, message, help)
+
+
+-- The lexer has validated UTF-8; this only finds one scalar's byte extent for
+-- diagnostics, without decoding or validating its contents again.
+private pure func character_end(raw: String, start: Int) -> Int:
+	var end = IntOps.min(IntOps.add(start, 1), raw.length())
+
+	while IntOps.less_than(end, raw.length()) and is_continuation_byte(raw, end):
+		end = IntOps.add(end, 1)
+
+	end
+
+
+private pure func is_continuation_byte(raw: String, position: Int) -> Bool:
+	match StringOps.get(raw, position):
+		Some(character):
+			byte = to_int(character)
+			IntOps.greater_than_or_equal(byte, UTF8_CONTINUATION_START) and IntOps.less_than_or_equal(byte, UTF8_CONTINUATION_END)
+		None:
+			False
+
+
+private fixed record DecodedEscape {
+	bytes: String,
+	next: Int
+}
+
+
+-- The hexadecimal digits read so far: the scan stops at a non-digit or once
+-- it has read one digit more than an escape allows.
+private fixed record HexDigits {
+	end: Int,
+	scalar: Int
+}
+
+
+private pure func hex_digits(raw: String, start: Int, read: HexDigits) -> HexDigits:
+	byte = StringOps.lower(raw.substring(read.end, 1))
+
+	if byte.is_empty() or IntOps.greater_than(IntOps.subtract(read.end, start), MAX_UNICODE_HEX_DIGITS):
+		read
+	else:
+		match HEX_DIGITS.index_of(byte):
+			Some(digit):
+				hex_digits(raw, start, { end = IntOps.add(read.end, 1), scalar = IntOps.add(IntOps.multiply(read.scalar, HEX_RADIX), digit) })
+			None:
+				read
+
+
+-- `start` is the backslash of a \u{H} escape.
+private pure func unicode_escape(raw: String, start: Int, span: Span) -> Result[DecodedEscape, Diagnostic]:
+	opening = IntOps.add(start, 2)
+	opened = Text.equals(raw.substring(opening, 1), "{")
+	digits_start = IntOps.add(opening, 1)
+	digits = hex_digits(raw, digits_start, { end = digits_start, scalar = 0 })
+	count = IntOps.subtract(digits.end, digits_start)
+	surrogate = IntOps.greater_than_or_equal(digits.scalar, SURROGATE_START) and IntOps.less_than_or_equal(digits.scalar, SURROGATE_END)
+
+	if (
+		opened
+		and Text.equals(raw.substring(digits.end, 1), "}")
+		and IntOps.greater_than(count, 0)
+		and IntOps.less_than_or_equal(count, MAX_UNICODE_HEX_DIGITS)
+		and IntOps.less_than_or_equal(digits.scalar, UNICODE_MAX)
+		and not surrogate
+	):
+		Ok({ bytes = StringOps.from_char(to_char(digits.scalar)), next = IntOps.add(digits.end, 1) })
+	else:
+		error_end = if opened:
+			IntOps.min(digits.end, IntOps.add(digits_start, MAX_UNICODE_HEX_DIGITS))
+		else:
+			opening
+		Err(string_error(span, start, character_end(raw, error_end), "invalid Unicode escape", UNICODE_ESCAPE_HELP))
+
+
+private pure func fixed_escape(code: String) -> Option[String]:
+	match code:
+		"n":
+			Some("\n")
+		"r":
+			Some("\r")
+		"t":
+			Some("\t")
+		"0":
+			Some("\0")
+		"\\":
+			Some("\\")
+		"\"":
+			Some("\"")
+		"'":
+			Some("'")
+		"{":
+			Some("{")
+		"}":
+			Some("}")
+		_:
+			None
+
+
+-- `start` is the escape's backslash.
+private pure func decode_escape(raw: String, start: Int, span: Span) -> Result[DecodedEscape, Diagnostic]:
+	code = raw.substring(IntOps.add(start, 1), 1)
+
+	if Text.equals(code, "u"):
+		unicode_escape(raw, start, span)
+	else:
+		match fixed_escape(code):
+			Some(bytes):
+				Ok({ bytes = bytes, next = IntOps.add(start, 2) })
+			None:
+				Err(string_error(span, start, character_end(raw, IntOps.add(start, 1)), "unknown String escape", STRING_ESCAPE_HELP))
+
+
+-- Decoded text before `cursor`; raw bytes from `cursor` are not yet decoded.
+private fixed record StringScan {
+	decoded: String,
+	cursor: Int
+}
+
+
+-- Copies the raw run up to the next escape intact, then decodes that escape.
+-- UTF-8 source bytes are never reconstructed as characters or normalized.
+private pure func decode_next_escape(raw: String, span: Span, scan: StringScan) -> Result[StringScan, Diagnostic]:
+	var escape = scan.cursor
+
+	while (
+		IntOps.less_than(escape, raw.length())
+		and not Text.equals(raw.substring(escape, 1), "\\")
+		and not Text.equals(raw.substring(escape, 2), "$".concat("{"))
+	):
+		escape = IntOps.add(escape, 1)
+
+	run = raw.substring(scan.cursor, IntOps.subtract(escape, scan.cursor))
+
+	if IntOps.equals(escape, raw.length()):
+		Ok({ decoded = scan.decoded.concat(run), cursor = escape })
+	else if Text.equals(raw.substring(escape, 1), "$"):
+		Err(string_error(span, escape, IntOps.add(escape, 2), "String interpolation is not supported yet", "escape the opening brace as \\{ for literal $".concat("{ text")))
+	else:
+		decoded ?= decode_escape(raw, escape, span)
+		Ok({ decoded = scan.decoded.concat(run).concat(decoded.bytes), cursor = decoded.next })
+
+
+private pure func string_value(raw: String, span: Span) -> Result[String, Diagnostic]:
+	-- One Result carries the decoding to the end of the contents or to the first error.
+	var scan: Result[StringScan, Diagnostic] = Ok({ decoded = "", cursor = 0 })
+
+	while True:
+		match scan:
+			Ok(text):
+				if IntOps.equals(text.cursor, raw.length()):
+					break
+
+				scan = decode_next_escape(raw, span, text)
+			Err(_):
+				break
+
+	text ?= scan
+	Ok(text.decoded)
+
+
+private fixed record ParsedValue {
+	body: ValueExpression,
+	next: ParserState
+}
+
+
+-- An expression's base before its postfix operations.
+private fixed record ParsedBase {
+	base: ExpressionBase,
+	span: Span,
+	next: ParserState
+}
+
+
+private fixed record ParsedValues {
+	values: List[ValueExpression],
+	next: ParserState
+}
+
+
+private pure func consume_argument_list(state: ParserState, arguments: List[ValueExpression]) -> Result[ParsedValues, Diagnostic]:
+	value ?= consume_value(state)
+	gathered = arguments.append(value.body)
+
+	if at_comma(value.next):
+		consume_argument_list(shifted(value.next, 1), gathered)
+	else:
+		Ok({ values = gathered, next = value.next })
+
+
+-- `end` is where the closing parenthesis ends.
+private fixed record ParsedArguments {
+	arguments: List[ValueExpression],
+	end: Int,
+	next: ParserState
+}
+
+
+-- `state` is at the opening parenthesis.
+private pure func consume_call_arguments(state: ParserState) -> Result[ParsedArguments, Diagnostic]:
+	opened = shifted(state, 1)
+	listed ?= if at_right_paren(opened):
+		Ok({ values = [], next = opened })
+	else:
+		consume_argument_list(opened, [])
+	closed ?= expect(
+		listed.next,
+		at_right_paren(listed.next),
+		"expected ')' after the call arguments",
+		"separate complete expressions with commas, then close the call with ')'",
+	)
+	Ok({ arguments = listed.values, end = parser_span(listed.next).end, next = closed })
+
+
+private pure func reject_function_type_arguments(state: ParserState) -> Result[Void, Diagnostic]:
+	if at_left_bracket(state):
+		Err(expected(state, "explicit function type arguments are unsupported", "omit the brackets at calls; argument types determine the type parameters"))
+	else:
+		Ok(void)
+
+
+private pure func consume_name_or_call(start: ParserState) -> Result[ParsedBase, Diagnostic]:
+	name ?= consume_name(start, "expected a value name")
+	explicit_types ?= reject_function_type_arguments(name.next)
+
+	if at_left_paren(name.next):
+		call ?= consume_call_arguments(name.next)
+		Ok({ base = DirectApplication(name.name, call.arguments), span = { name.name.span | end = call.end }, next = call.next })
+	else:
+		Ok({ base = NameExpression(name.name), span = name.name.span, next = name.next })
+
+
+private pure func consume_base(start: ParserState, token: Token) -> Result[ParsedBase, Diagnostic]:
+	after = shifted(start, 1)
+
+	match token.kind:
+		SymbolToken(AtSign):
+			Err(misplaced_annotation(start))
+		SymbolToken(VoidKeyword):
+			Ok({ base = VoidExpression, span = token.span, next = after })
+		SymbolToken(Dot):
+			Err(diagnostic({ token.span | end = parser_span(after).end }, "Float literals need digits before the decimal point", "write 0.5; a source Float literal needs an integer part"))
+		SymbolToken(LeftBrace):
+			consume_braced_record(after, token.span)
+		FloatLiteral(spelling):
+			value ?= float_value(spelling, token.span)
+			Ok({ base = FloatExpression(value), span = token.span, next = after })
+		IntegerLiteral(spelling):
+			value ?= integer_value(spelling, token.span)
+			Ok({ base = IntegerExpression(value), span = token.span, next = after })
+		QuotedString(raw):
+			bytes ?= string_value(raw, token.span)
+			Ok({ base = StringExpression(bytes), span = token.span, next = after })
+		IdentifierToken(_):
+			consume_name_or_call(start)
+		_:
+			Err(expected(start, "expected a return expression", EXPRESSION_HELP))
+
+
+private fixed record ParsedPostfix {
+	operation: PostfixOperation,
+	end: Int,
+	next: ParserState
+}
+
+
+-- `state` follows the dot.
+private pure func consume_postfix(state: ParserState) -> Result[ParsedPostfix, Diagnostic]:
+	name ?= consume_name(state, "expected a field or function name after '.'")
+	explicit_types ?= reject_function_type_arguments(name.next)
+
+	if at_left_paren(name.next):
+		call ?= consume_call_arguments(name.next)
+		Ok({
+			operation = ReceiverInvocation({
+				span = { name.name.span | end = call.end },
+				callee = name.name,
+				arguments = call.arguments,
+			}),
+			end = call.end,
+			next = call.next,
+		})
+	else:
+		Ok({ operation = FieldAccess(name.name), end = name.name.span.end, next = name.next })
+
+
+private fixed record ParsedPostfixes {
+	applications: List[PostfixOperation],
+	end: Int,
+	next: ParserState
+}
+
+
+-- `end` is where the last postfix operation, or else the base, ends.
+private pure func consume_postfixes(state: ParserState, applications: List[PostfixOperation], end: Int) -> Result[ParsedPostfixes, Diagnostic]:
+	if not at_dot(state):
+		Ok({ applications = applications, end = end, next = state })
+	else:
+		postfix ?= consume_postfix(shifted(state, 1))
+		consume_postfixes(postfix.next, applications.append(postfix.operation), postfix.end)
+
+
+private pure func consume_value(start: ParserState) -> Result[ParsedValue, Diagnostic]:
+	scope ?= if at_word(start, "import") and at_colon(shifted(start, 1)):
+		Err(expected(start, "imports belong at module scope", "move import: and its selected functions before the module's declarations at column 1"))
+	else:
+		Ok(void)
+	match current(start):
+		None:
+			Err(expected(start, "expected a return expression", EXPRESSION_HELP))
+		Some(token):
+			base ?= consume_base(start, token)
+			postfixes ?= consume_postfixes(base.next, [], base.span.end)
+			Ok({
+				body = {
+					base = base.base,
+					base_span = base.span,
+					applications = postfixes.applications,
+					span = { token.span | end = postfixes.end }
+				},
+				next = postfixes.next,
+			})
+
+
+private fixed record ParsedType {
+	written: TypeSyntax,
+	next: ParserState
+}
+
+
+private fixed record ParsedTypes {
+	types: List[TypeSyntax],
+	next: ParserState
+}
+
+
+private pure func consume_type_arguments(state: ParserState, types: List[TypeSyntax]) -> Result[ParsedTypes, Diagnostic]:
+	argument ?= consume_type(state, "expected a type argument")
+	gathered = types.append(argument.written)
+
+	if at_comma(argument.next):
+		consume_type_arguments(shifted(argument.next, 1), gathered)
+	else:
+		Ok({ types = gathered, next = argument.next })
+
+
+private pure func consume_type(state: ParserState, message: String) -> Result[ParsedType, Diagnostic]:
+	name ?= consume_name(state, message)
+
+	if not at_left_bracket(name.next):
+		Ok({ written = AtomicType(name.name), next = name.next })
+	else:
+		arguments ?= consume_type_arguments(shifted(name.next, 1), [])
+		closed ?= expect(
+			arguments.next,
+			at_right_bracket(arguments.next),
+			"expected ']' after the type arguments",
+			"write comma-separated type arguments, such as Result[Box[Int], Int]",
+		)
+		span = { name.name.span | end = parser_span(arguments.next).end }
+		Ok({ written = AppliedType(name.name, arguments.types, span), next = closed })
+
+
+private fixed record ParameterResult {
+	parameter: ParsedParameter,
+	next: ParserState
+}
+
+
+private pure func consume_parameter(state: ParserState, message: String) -> Result[ParameterResult, Diagnostic]:
+	name ?= consume_name(state, message)
+	after_colon ?= expect(name.next, at_colon(name.next), "expected ':' after the parameter name", "write each parameter as name: Type")
+	type_name ?= consume_type(after_colon, "expected a parameter type")
+	Ok({ parameter = { name = name.name, type_name = type_name.written }, next = type_name.next })
+
+
+private fixed record ParsedParameters {
+	parameters: List[ParsedParameter],
+	next: ParserState
+}
+
+
+-- Parses `name: Type { , name: Type }` for function parameters and record fields.
+private pure func consume_parameter_list(
+	state: ParserState,
+	message: String,
+	parameters: List[ParsedParameter],
+) -> Result[ParsedParameters, Diagnostic]:
+	parameter ?= consume_parameter(state, message)
+	gathered = parameters.append(parameter.parameter)
+
+	if at_comma(parameter.next):
+		consume_parameter_list(shifted(parameter.next, 1), message, gathered)
+	else:
+		Ok({ parameters = gathered, next = parameter.next })
+
+
+private pure func consume_parameters(start: ParserState) -> Result[ParsedParameters, Diagnostic]:
+	listed ?= if at_right_paren(start):
+		Ok({ parameters = [], next = start })
+	else:
+		consume_parameter_list(start, "expected a parameter name or ')'", [])
+	closed ?= expect(listed.next, at_right_paren(listed.next), "expected ')' after the parameters", "separate explicitly typed parameters with commas, then close with ')'")
+	Ok({ listed | next = closed })
+
+
+private fixed record PatternResult {
+	pattern: ParsedPattern,
+	span: Span,
+	next: ParserState
+}
+
+
+private fixed record PatternFieldResult {
+	field: FieldPattern,
+	next: ParserState
+}
+
+
+private pure func consume_pattern_field(state: ParserState) -> Result[PatternFieldResult, Diagnostic]:
+	if at_wildcard(state):
+		Ok({ field = FieldWildcard(parser_span(state)), next = shifted(state, 1) })
+	else:
+		name ?= consume_name(state, "expected a field binding or '_'")
+		Ok({ field = FieldName(name.name), next = name.next })
+
+
+private pure func consume_pattern(state: ParserState) -> Result[PatternResult, Diagnostic]:
+	if at_wildcard(state):
+		Ok({ pattern = PatternWildcard(parser_span(state)), span = parser_span(state), next = shifted(state, 1) })
+	else:
+		name ?= consume_name(state, "expected a match pattern")
+
+		if not at_left_paren(name.next):
+			Ok({ pattern = PatternName(name.name), span = name.name.span, next = name.next })
+		else:
+			var current = shifted(name.next, 1)
+			var fields: List[FieldPattern] = []
+			var failure: Option[Diagnostic] = None
+
+			if not at_right_paren(current):
+				while True:
+					match consume_pattern_field(current):
+						Err(error):
+							failure = Some(error)
+							break
+						Ok(field):
+							fields = fields.append(field.field)
+							current = field.next
+
+					if not at_comma(current):
+						break
+					current = shifted(current, 1)
+
+			ready ?= match failure:
+				Some(error): Err(error)
+				None: Ok(void)
+			closed ?= expect(current, at_right_paren(current), "expected ')' after the constructor pattern", "write one name or '_' per field, such as Pair(left, _)")
+			span = { name.name.span | end = parser_span(current).end }
+			Ok({ pattern = PatternConstructor(name.name, fields, span), span = span, next = closed })
+
+
+private fixed record BodyResult {
+	body: ParsedBody,
+	next: ParserState
+}
+
+
+-- One code line of a statement block, after its Newline.
+private fixed union BlockLine:
+	StatementLine(ParsedStatement, ParserState)
+	FinalLine(ValueExpression, ParserState)
+
+
+private pure func at_binding(state: ParserState) -> Bool:
+	at_var(state) or (at_identifier(state) and at_equals(shifted(state, 1)))
+
+
+private pure func consume_binding(state: ParserState) -> Result[BlockLine, Diagnostic]:
+	mutability = if at_var(state):
+		MutableBinding
+	else:
+		ImmutableBinding
+	after_keyword = match mutability:
+		MutableBinding:
+			shifted(state, 1)
+		ImmutableBinding:
+			state
+	name ?= consume_name(after_keyword, "expected a binding name")
+	equals ?= expect(name.next, at_equals(name.next), "expected '=' after the binding name", "write name = expression or var name = expression")
+	initializer ?= if at_newline(equals):
+		Err(expected(equals, "expected a binding initializer", "put one expression after '=' on the same line"))
+	else:
+		consume_value(equals)
+	next ?= consume_line_end(initializer.next, "expected a newline after the binding", "put each statement on its own line")
+	binding = { name = name.name, mutability = mutability, initializer = initializer.body }
+	Ok(StatementLine(BindingStatement(binding), next))
+
+
+-- A value line ends its block when the block's Dedent follows it.
+private pure func consume_block_line(state: ParserState) -> Result[BlockLine, Diagnostic]:
+	if at_binding(state):
+		consume_binding(state)
+	else:
+		value ?= consume_value(state)
+		next ?= end_value_line(value.next)
+
+		if at_dedent(next):
+			Ok(FinalLine(value.body, shifted(next, 1)))
+		else:
+			Ok(StatementLine(ExpressionStatement(value.body), next))
+
+
+-- Only bindings can leave a block without its final value.
+private pure func require_final_line(state: ParserState, message: String, help: String) -> Result[Void, Diagnostic]:
+	if at_dedent(state):
+		Err(expected(state, message, help))
+	else:
+		Ok(void)
+
+
+private fixed record ArmBlock {
+	statements: List[ParsedStatement],
+	value: ValueExpression,
+	next: ParserState
+}
+
+
+private pure func consume_arm_lines(state: ParserState, statements: List[ParsedStatement]) -> Result[ArmBlock, Diagnostic]:
+	unfinished ?= require_final_line(state, "expected a final expression after the arm bindings", "finish the arm with a value expression on its own indented line")
+	line ?= consume_block_line(state)
+
+	match line:
+		StatementLine(statement, next):
+			consume_arm_lines(next, statements.append(statement))
+		FinalLine(value, next):
+			Ok({ statements = statements, value = value, next = next })
+
+
+private fixed record ArmResult {
+	arm: ParsedMatchArm,
+	next: ParserState
+}
+
+
+-- `colon` follows the pattern: an inline value or an indented block follows.
+private pure func consume_arm_result(colon: ParserState) -> Result[ArmBlock, Diagnostic]:
+	if at_newline(colon):
+		newline = shifted(colon, 1)
+		opened ?= expect(newline, at_indent(newline), "expected an indented match arm result", "put the arm's statements and final value one tab or four spaces deeper than its pattern")
+		consume_arm_lines(opened, [])
+	else:
+		value ?= consume_value(colon)
+		next ?= end_value_line(value.next)
+		Ok({ statements = [], value = value.body, next = next })
+
+
+private pure func consume_arm(state: ParserState) -> Result[ArmResult, Diagnostic]:
+	pattern ?= consume_pattern(state)
+	colon ?= expect(pattern.next, at_colon(pattern.next), "expected ':' after the match pattern", "write Pattern: expression, or put the arm body on the next indented line")
+	block ?= consume_arm_result(colon)
+	Ok({
+		arm = {
+			pattern = pattern.pattern,
+			statements = block.statements,
+			body = block.value,
+			span = { pattern.span | end = block.value.span.end }
+		},
+		next = block.next,
+	})
+
+
+-- `end` is where the last arm ends.
+private fixed record ParsedArms {
+	arms: List[ParsedMatchArm],
+	end: Int,
+	next: ParserState
+}
+
+
+private pure func consume_arms(state: ParserState, arms: List[ParsedMatchArm]) -> Result[ParsedArms, Diagnostic]:
+	arm ?= consume_arm(state)
+	gathered = arms.append(arm.arm)
+
+	if at_dedent(arm.next):
+		Ok({ arms = gathered, end = arm.arm.span.end, next = shifted(arm.next, 1) })
+	else:
+		consume_arms(arm.next, gathered)
+
+
+private pure func consume_match(start: ParserState) -> Result[BodyResult, Diagnostic]:
+	keyword = parser_span(start)
+	after_keyword = shifted(start, 1)
+	separated ?= if at_spaced_token(after_keyword):
+		Ok(void)
+	else:
+		Err(expected(after_keyword, "expected a space after 'match'", "put a space between 'match' and the matched expression"))
+	scrutinee ?= consume_value(after_keyword)
+	colon ?= expect(scrutinee.next, at_colon(scrutinee.next), "expected ':' after the match value", "write match value: and put each arm on the next line")
+	newline ?= expect(colon, at_newline(colon), "expected a newline after the match header", "put each pattern on its own indented line, with an inline or indented result")
+	opened ?= expect(newline, at_indent(newline), "expected an indented match arm", "indent each arm one tab or four spaces deeper than its match")
+	arms ?= consume_arms(opened, [])
+	Ok({
+		body = ParsedMatchBody({
+			scrutinee = scrutinee.body,
+			arms = arms.arms,
+			keyword_span = keyword,
+			span = { keyword | end = arms.end }
+		}),
+		next = arms.next,
+	})
+
+
+private pure func at_builtin_body(state: ParserState) -> Bool:
+	if at_word(state, "builtin") and at_left_paren(shifted(state, 1)):
+		match current(shifted(state, 2)):
+			Some(token):
+				match token.kind:
+					QuotedString(_):
+						True
+					_:
+						False
+			None:
+				False
+	else:
+		False
+
+
+private BUILTIN_LABEL_HELP: String = (
+	"use int.equals, int.add, int.subtract, int.multiply, int.divide, int.remainder, int."
+	+ "to_string, float.add, float.subtract, float.multiply, float.divide, float.remainder, float.to_string, string.length, string.print, string.parse_int, string.parse_float, string.equals, list.repeat, list.length or list.get"
+)
+
+
+private pure func primitive_operation(label: String) -> Option[ParsedRuntimeOperation]:
+	match label:
+		"string.print":
+			Some(StringPrintBuiltin)
+		"int.add":
+			Some(IntegerAddBuiltin)
+		"int.subtract":
+			Some(IntegerSubtractBuiltin)
+		"int.multiply":
+			Some(IntegerMultiplyBuiltin)
+		"int.divide":
+			Some(IntegerDivideBuiltin)
+		"int.remainder":
+			Some(IntegerRemainderBuiltin)
+		"int.to_string":
+			Some(IntegerToStringBuiltin)
+		"float.add":
+			Some(FloatAddBuiltin)
+		"float.subtract":
+			Some(FloatSubtractBuiltin)
+		"float.multiply":
+			Some(FloatMultiplyBuiltin)
+		"float.divide":
+			Some(FloatDivideBuiltin)
+		"float.remainder":
+			Some(FloatRemainderBuiltin)
+		"float.to_string":
+			Some(FloatToStringBuiltin)
+		"list.repeat":
+			Some(ListRepeatBuiltin)
+		"list.length":
+			Some(ListLengthBuiltin)
+		"string.length":
+			Some(StringLengthBuiltin)
+		_:
+			None
+
+
+private fixed union UnionBuiltinKind:
+	IntegerParseRoles
+	FloatParseRoles
+	ListGetRoles
+	StringEqualityRoles
+	IntegerEqualityRoles
+
+
+private pure func union_builtin_kind(label: String) -> Option[UnionBuiltinKind]:
+	match label:
+		"string.parse_int":
+			Some(IntegerParseRoles)
+		"string.parse_float":
+			Some(FloatParseRoles)
+		"list.get":
+			Some(ListGetRoles)
+		"int.equals":
+			Some(IntegerEqualityRoles)
+		"string.equals":
+			Some(StringEqualityRoles)
+		_:
+			None
+
+
+private fixed record BuiltinOperationResult {
+	operation: ParsedRuntimeOperation,
+	next: ParserState
+}
+
+
+-- `state` follows the quoted label.
+private pure func consume_builtin_roles(state: ParserState, kind: UnionBuiltinKind) -> Result[BuiltinOperationResult, Diagnostic]:
+	present_start ?= expect(state, at_comma(state), "expected constructor roles after the builtin label", "bind the two result constructors after the quoted label")
+	present ?= consume_name(present_start, "expected the first result constructor")
+	absent_start ?= expect(present.next, at_comma(present.next), "expected ',' between constructor roles", "separate the two result constructors with a comma")
+	absent ?= consume_name(absent_start, "expected the second result constructor")
+	operation = match kind:
+		FloatParseRoles:
+			StringParseFloatBuiltin(present.name, absent.name)
+		IntegerParseRoles:
+			StringParseIntBuiltin(present.name, absent.name)
+		ListGetRoles:
+			ListGetBuiltin(present.name, absent.name)
+		StringEqualityRoles:
+			StringEqualsBuiltin(present.name, absent.name)
+		IntegerEqualityRoles:
+			IntegerEqualsBuiltin(present.name, absent.name)
+	Ok({ operation = operation, next = absent.next })
+
+
+private pure func consume_builtin_operation(opened: ParserState, label: String) -> Result[BuiltinOperationResult, Diagnostic]:
+	match union_builtin_kind(label):
+		Some(kind):
+			consume_builtin_roles(shifted(opened, 1), kind)
+		None:
+			match primitive_operation(label):
+				Some(primitive):
+					Ok({ operation = primitive, next = shifted(opened, 1) })
+				None:
+					Err(expected(opened, "unknown builtin operation", BUILTIN_LABEL_HELP))
+
+
+private pure func consume_builtin_body(start: ParserState) -> Result[BodyResult, Diagnostic]:
+	after_builtin ?= consume_word(start, "builtin")
+	opened ?= expect(after_builtin, at_left_paren(after_builtin), "expected '(' after builtin", "write builtin(\"int.add\") or bind union constructors as builtin(\"string.parse_int\", Some, None)")
+	operation ?= match current(opened):
+		Some(label):
+			match label.kind:
+				QuotedString(spelling):
+					consume_builtin_operation(opened, spelling)
+				_:
+					Err(expected(opened, "expected a quoted builtin label", BUILTIN_LABEL_HELP))
+		None:
+			Err(expected(opened, "expected a builtin label", "use a quoted closed operation label"))
+	closed ?= expect(operation.next, at_right_paren(operation.next), "expected ')' after the builtin label", "give primitive builtins one quoted label, or bind both constructors of a union result")
+	Ok({ body = ParsedBuiltinBody(operation.operation, parser_span(opened)), next = closed })
+
+
+private fixed record StatementBlock {
+	statements: List[ParsedStatement],
+	body: ParsedBody,
+	next: ParserState
+}
+
+
+private pure func builtin_not_alone(state: ParserState) -> Diagnostic:
+	expected(state, "builtin must be the entire function body", "use builtin as the entire function body; put other work in an ordinary wrapper function")
+
+
+-- The function's final line is a value, a builtin body or a tail match; the
+-- block's Dedent must follow it.
+private pure func consume_function_lines(state: ParserState, statements: List[ParsedStatement]) -> Result[StatementBlock, Diagnostic]:
+	unfinished ?= require_final_line(state, "expected a final expression after the bindings", "finish the function with a value expression or tail match")
+
+	match current_symbol(state):
+		Some(MatchKeyword):
+			matched ?= consume_match(state)
+			closed ?= expect(matched.next, at_dedent(matched.next), "a match must end its function", "move the statements after the match before it, or indent further arms one level deeper than the match")
+			Ok({ statements = statements, body = matched.body, next = closed })
+		_:
+			if at_builtin_body(state):
+				consume_builtin_lines(state, statements)
+			else:
+				line ?= consume_block_line(state)
+
+				match line:
+					StatementLine(statement, next):
+						consume_function_lines(next, statements.append(statement))
+					FinalLine(value, next):
+						Ok({ statements = statements, body = ParsedValueBody(value), next = next })
+
+
+-- A builtin body is the function's only line.
+private pure func consume_builtin_lines(state: ParserState, statements: List[ParsedStatement]) -> Result[StatementBlock, Diagnostic]:
+	alone ?= if statements.is_empty():
+		Ok(void)
+	else:
+		Err(builtin_not_alone(state))
+	operation ?= consume_builtin_body(state)
+	after ?= end_value_line(operation.next)
+
+	if at_dedent(after):
+		Ok({ statements = statements, body = operation.body, next = shifted(after, 1) })
+	else:
+		Err(builtin_not_alone(state))
+
+
+-- A capital ASCII letter followed by ASCII letters and digits.
+private pure func valid_type_parameter_name(spelling: String) -> Bool:
+	continued = run_of(spelling, 1, "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789")
+	"ABCDEFGHIJKLMNOPQRSTUVWXYZ".contains(spelling.substring(0, 1)) and IntOps.equals(continued, spelling.length())
+
+
+private pure func run_of(text: String, start: Int, accepted: String) -> Int:
+	var end = start
+
+	while IntOps.less_than(end, text.length()) and accepted.contains(text.substring(end, 1)):
+		end = IntOps.add(end, 1)
+
+	end
+
+
+private pure func consume_type_parameter(state: ParserState) -> Result[ParsedName, Diagnostic]:
+	match current(state):
+		Some(token):
+			match token.kind:
+				IdentifierToken(spelling):
+					if valid_type_parameter_name(spelling):
+						consume_name(state, "expected a type parameter name")
+					else:
+						Err(diagnostic(token.span, "invalid type parameter name", "start with a capital ASCII letter and use only ASCII letters and digits, such as T or Element2"))
+				_:
+					Err(expected(state, "expected a type parameter name", "declare type parameters separated by commas, such as [A, B]"))
+		None:
+			Err(expected(state, "expected a type parameter name", "declare type parameters separated by commas, such as [A, B]"))
+
+
+private pure func consume_type_parameter_list(state: ParserState, parameters: List[WrittenName]) -> Result[NameList, Diagnostic]:
+	name ?= consume_type_parameter(state)
+	gathered = parameters.append(name.name)
+
+	if at_right_bracket(name.next):
+		Ok({ names = gathered, next = shifted(name.next, 1) })
+	else if at_comma(name.next):
+		consume_type_parameter_list(shifted(name.next, 1), gathered)
+	else:
+		Err(expected(name.next, "expected ',' or ']' after a type parameter", "separate type parameters with commas and close the list with ']'"))
+
+
+private pure func consume_type_parameters(state: ParserState) -> Result[NameList, Diagnostic]:
+	if at_left_bracket(state):
+		consume_type_parameter_list(shifted(state, 1), [])
+	else:
+		Ok({ names = [], next = state })
+
+
+private fixed record ParsedReturnAnnotation {
+	written: Option[TypeSyntax],
+	next: ParserState
+}
+
+
+private pure func consume_return_annotation(start: ParserState) -> Result[ParsedReturnAnnotation, Diagnostic]:
+	if at_colon(start):
+		Ok({ written = None, next = start })
+	else:
+		after_arrow ?= match current_symbol(start):
+			Some(Arrow):
+				Ok(shifted(start, 1))
+			_:
+				Err(unexpected(start, "expected '->' before the return type", "write main() -> Int with adjacent arrow characters, or main(): for Void"))
+		return_type ?= consume_type(after_arrow, "expected a return type")
+		Ok({ written = Some(return_type.written), next = return_type.next })
+
+
+private fixed record HeaderResult {
+	header: FunctionHeader,
+	next: ParserState
+}
+
+
+-- Ends at the function body's Indent.
+private pure func consume_header(start: ParserState) -> Result[HeaderResult, Diagnostic]:
+	purity = if at_pure(start):
+		Pure
+	else:
+		Impure
+	after_func ?= match purity:
+		Pure:
+			after_pure = shifted(start, 1)
+			expect(after_pure, at_func(after_pure), "expected 'func' after 'pure'", "write pure func name() -> Int:")
+		Impure:
+			expect(start, at_func(start), "expected a function declaration at column 1", "start with func main() -> Int:")
+	function ?= consume_name(after_func, "expected a function name")
+	type_parameters ?= consume_type_parameters(function.next)
+	after_open ?= expect(type_parameters.next, at_left_paren(type_parameters.next), "expected '(' after the function name", "write main() or helper(value: Int)")
+	parameters ?= consume_parameters(after_open)
+	return_type ?= consume_return_annotation(parameters.next)
+	after_header ?= expect(return_type.next, at_colon(return_type.next), "expected ':' after the function header", "end the header with ':' and put the return expression on the next line")
+	after_newline ?= expect(after_header, at_newline(after_header), "expected a newline after the function header", "put the return expression on the next line")
+	after_indent ?= expect(after_newline, at_indent(after_newline), "expected an indent of one tab or four spaces", "indent the body with exactly one tab or four spaces")
+	Ok({
+		header = {
+			purity = purity,
+			function_name = function.name,
+			type_parameters = type_parameters.names,
+			parameters = parameters.parameters,
+			return_type = return_type.written
+		},
+		next = after_indent,
+	})
+
+
+private fixed record ParsedAnnotation {
+	span: Option[Span],
+	next: ParserState
+}
+
+
+-- `@tail_recursive` precedes `pure` or `func` on its line or on the next one.
+private pure func consume_annotation_target(span: Span, after_name: ParserState) -> Result[ParsedAnnotation, Diagnostic]:
+	declaration = if at_newline(after_name):
+		shifted(after_name, 1)
+	else:
+		after_name
+
+	if at_left_paren(after_name):
+		Err(expected(after_name, "@tail_recursive takes no arguments", "write @tail_recursive before the optional pure and func keywords"))
+	else if at_at_sign(declaration):
+		Err(expected(declaration, "multiple function annotations are not supported", "write @tail_recursive only once before a function"))
+	else if at_end(declaration):
+		Err(diagnostic(span, "@tail_recursive has no function declaration", "put a function declaration immediately after @tail_recursive"))
+	else if at_pure(declaration) or at_func(declaration):
+		Ok({ span = Some(span), next = declaration })
+	else:
+		Err(expected(declaration, "@tail_recursive requires a function declaration", "put @tail_recursive before the optional pure and func keywords"))
+
+
+private pure func consume_annotation(start: ParserState) -> Result[ParsedAnnotation, Diagnostic]:
+	if not at_at_sign(start):
+		Ok({ span = None, next = start })
+	else:
+		after_at = shifted(start, 1)
+		name ?= current(after_at).to_result(expected(start, "expected a function annotation", "write @tail_recursive before a function declaration"))
+		known = match name.kind:
+			IdentifierToken(spelling):
+				Text.equals(spelling, "tail_recursive") and not at_spaced_token(after_at)
+			_:
+				False
+		span = { parser_span(start) | end = name.span.end }
+
+		if known:
+			consume_annotation_target(span, shifted(after_at, 1))
+		else:
+			Err(diagnostic(span, "unknown function annotation", "use @tail_recursive before a function declaration"))
+
+
+private fixed record FunctionResult {
+	function: ParsedFunction,
+	next: ParserState
+}
+
+
+private pure func consume_function(start: ParserState, module: ModuleId) -> Result[FunctionResult, Diagnostic]:
+	annotation ?= consume_annotation(start)
+	header ?= consume_header(annotation.next)
+	body ?= consume_function_lines(header.next, [])
+	Ok({
+		function = {
+			module = module,
+			tail_annotation = annotation.span,
+			purity = header.header.purity,
+			function_name = header.header.function_name,
+			type_parameters = header.header.type_parameters,
+			parameters = header.header.parameters,
+			return_type = header.header.return_type,
+			statements = body.statements,
+			body = body.body
+		},
+		next = body.next,
+	})
+
+
+private fixed record VariantResult {
+	variant: ParsedVariant,
+	next: ParserState
+}
+
+
+private pure func consume_variant(state: ParserState) -> Result[VariantResult, Diagnostic]:
+	name ?= consume_name(state, "expected a union variant name")
+
+	if at_left_paren(name.next):
+		var current = shifted(name.next, 1)
+		var fields: List[TypeSyntax] = []
+		var failure: Option[Diagnostic] = None
+
+		if at_right_paren(current):
+			failure = Some(expected(current, "expected a payload type", "write bare Variant for no fields, or Variant(String, Int) for fields"))
+		else:
+			while True:
+				match consume_type(current, "expected a payload type"):
+					Err(error):
+						failure = Some(error)
+						break
+					Ok(field):
+						fields = fields.append(field.written)
+						current = field.next
+
+				if not at_comma(current):
+					break
+				current = shifted(current, 1)
+
+		ready ?= match failure:
+			Some(error): Err(error)
+			None: Ok(void)
+		closed ?= expect(current, at_right_paren(current), "expected ')' after the variant fields", "write comma-separated field types, such as Pair(String, String)")
+		Ok({ variant = { name = name.name, fields = fields }, next = closed })
+	else:
+		Ok({ variant = { name = name.name, fields = [] }, next = name.next })
+
+
+private fixed record ParsedVariants {
+	variants: List[ParsedVariant],
+	next: ParserState
+}
+
+
+private pure func consume_variants(state: ParserState, variants: List[ParsedVariant]) -> Result[ParsedVariants, Diagnostic]:
+	variant ?= consume_variant(state)
+	next ?= consume_line_end(variant.next, "expected a newline after the variant name", "put each variant on its own indented line")
+	gathered = variants.append(variant.variant)
+
+	if at_dedent(next):
+		Ok({ variants = gathered, next = shifted(next, 1) })
+	else:
+		consume_variants(next, gathered)
+
+
+private fixed record UnionResult {
+	declaration: ParsedUnion,
+	next: ParserState
+}
+
+
+private pure func consume_union(start: ParserState, module: ModuleId) -> Result[UnionResult, Diagnostic]:
+	after_fixed = shifted(start, 1)
+	word ?= if at_word(after_fixed, "union"):
+		Ok(shifted(after_fixed, 1))
+	else:
+		Err(expected(after_fixed, "expected 'union' after 'fixed'", "write fixed union Choice: followed by indented variant names"))
+	name ?= consume_name(word, "expected a union type name")
+	type_parameters ?= consume_type_parameters(name.next)
+	colon ?= expect(type_parameters.next, at_colon(type_parameters.next), "expected ':' after the union type name", "write fixed union Choice: or fixed union Box[T]:")
+	newline ?= expect(colon, at_newline(colon), "expected a newline after the union header", "put each variant name on its own indented line")
+	opened ?= expect(newline, at_indent(newline), "expected an indented union variant", "declare at least one variant, indented with one tab or four spaces")
+	variants ?= consume_variants(opened, [])
+	Ok({
+		declaration = {
+			module = module,
+			type_name = name.name,
+			type_parameters = type_parameters.names,
+			variants = variants.variants
+		},
+		next = variants.next,
+	})
+
+
+private fixed record ParsedLiteralFields {
+	fields: List[ParsedRecordField],
+	next: ParserState
+}
+
+
+private pure func consume_literal_fields(state: ParserState, fields: List[ParsedRecordField]) -> Result[ParsedLiteralFields, Diagnostic]:
+	name ?= consume_name(state, "expected a record field name")
+	after_equals ?= expect(name.next, at_equals(name.next), "expected '=' after the record field name", "write field = expression")
+	value ?= consume_value(after_equals)
+	gathered = fields.append({ name = name.name, value = value.body })
+
+	if at_comma(value.next):
+		consume_literal_fields(shifted(value.next, 1), gathered)
+	else:
+		Ok({ fields = gathered, next = value.next })
+
+
+-- `start` follows the opening brace.
+private pure func consume_record_literal(start: ParserState, opening: Span) -> Result[ParsedBase, Diagnostic]:
+	listed ?= if at_right_brace(start):
+		Ok({ fields = [], next = start })
+	else:
+		consume_literal_fields(start, [])
+	closed ?= expect(listed.next, at_right_brace(listed.next), "expected '}' after the record fields", "keep record fields on one line, separated by commas")
+	Ok({ base = RecordExpression(listed.fields), span = { opening | end = parser_span(listed.next).end }, next = closed })
+
+
+private pure func consume_braced_record(start: ParserState, opening: Span) -> Result[ParsedBase, Diagnostic]:
+	literal = at_identifier(start) and at_equals(shifted(start, 1))
+	if at_right_brace(start) or literal:
+		consume_record_literal(start, opening)
+	else:
+		base ?= consume_value(start)
+		at_bar = match current_symbol(base.next):
+			Some(RecordUpdateBar): True
+			_: False
+		bar ?= expect(base.next, at_bar, "expected '|' after the record update base", "write { existing_record | field = expression }")
+		fields ?= consume_literal_fields(bar, [])
+		closed ?= expect(fields.next, at_right_brace(fields.next), "expected '}' after the record update fields", "keep replacement fields on one line, separated by commas")
+		Ok({ base = RecordUpdateExpression(base.body, fields.fields), span = { opening | end = parser_span(fields.next).end }, next = closed })
+
+
+private fixed record ParsedRecordResult {
+	declaration: ParsedRecord,
+	next: ParserState
+}
+
+
+private pure func consume_record(start: ParserState, module: ModuleId) -> Result[ParsedRecordResult, Diagnostic]:
+	name ?= consume_name(shifted(start, 2), "expected a record type name")
+	type_parameters ?= consume_type_parameters(name.next)
+	opened ?= match current_symbol(type_parameters.next):
+		Some(LeftBrace):
+			Ok(shifted(type_parameters.next, 1))
+		_:
+			Err(unexpected(type_parameters.next, "expected '{' after the record type name", "write fixed record Name { field: Int }"))
+	fields ?= consume_parameter_list(opened, "expected a record field name", [])
+	closed ?= expect(fields.next, at_right_brace(fields.next), "expected '}' after the record declaration", "keep nonempty record fields on one line, separated by commas")
+	Ok({ declaration = { module = module, type_name = name.name, type_parameters = type_parameters.names, fields = fields.parameters }, next = closed })
+
+
+private fixed record BuiltinTypeResult {
+	declaration: ParsedBuiltinType,
+	next: ParserState
+}
+
+
+private BUILTIN_TYPE_HELP: String = "declare type Int = builtin, type Float = builtin, type String = builtin, type Void = builtin or type List[T] = builtin"
+
+
+private pure func consume_list_parameter(state: ParserState) -> Result[ParserState, Diagnostic]:
+	opened ?= expect(state, at_left_bracket(state), "List requires one type parameter", "write type List[T] = builtin")
+	parameter ?= consume_name(opened, "expected the List type parameter")
+	expect(parameter.next, at_right_bracket(parameter.next), "List requires exactly one type parameter", "write type List[T] = builtin")
+
+
+-- `state` is at the declared type name.
+private pure func builtin_type(state: ParserState, name: WrittenName) -> Option[ParsedBuiltinType]:
+	if at_word(state, "Int"):
+		Some(IntegerBuiltin(name))
+	else if at_word(state, "Float"):
+		Some(FloatBuiltin(name))
+	else if at_word(state, "String"):
+		Some(StringBuiltin(name))
+	else if at_word(state, "Void"):
+		Some(VoidBuiltin(name))
+	else if at_word(state, "List"):
+		Some(ListBuiltin(name))
+	else:
+		None
+
+
+private pure func unknown_builtin_type(state: ParserState) -> Diagnostic:
+	expected(state, "unknown builtin type", BUILTIN_TYPE_HELP)
+
+
+private pure func consume_builtin_type(start: ParserState) -> Result[BuiltinTypeResult, Diagnostic]:
+	after_type ?= consume_word(start, "type")
+	name ?= if at_identifier(after_type):
+		consume_name(after_type, "expected a builtin type name")
+	else:
+		Err(unknown_builtin_type(after_type))
+	declaration ?= match builtin_type(after_type, name.name):
+		Some(declared):
+			Ok(declared)
+		None:
+			Err(unknown_builtin_type(after_type))
+	after_name ?= match declaration:
+		ListBuiltin(_):
+			consume_list_parameter(name.next)
+		_:
+			Ok(name.next)
+	equals ?= expect(after_name, at_equals(after_name), "expected '=' after the builtin type name", "write type Int = builtin, type Float = builtin, type String = builtin, type Void = builtin or type List[T] = builtin")
+	end ?= consume_word(equals, "builtin")
+	Ok({ declaration = declaration, next = end })
+
+
+private fixed record ParsedPath {
+	path: ModulePath,
+	span: Span,
+	next: ParserState
+}
+
+
+private pure func parent_prefix(state: ParserState) -> Bool:
+	at_dot(state) and at_dot(shifted(state, 1)) and at_slash(shifted(state, 2))
+
+
+private fixed record ParsedPathParts {
+	parts: List[NameId],
+	last: Span,
+	next: ParserState
+}
+
+
+private pure func consume_path_parts(state: ParserState, parts: List[NameId]) -> Result[ParsedPathParts, Diagnostic]:
+	interior ?= if at_dot(state):
+		Err(expected(state, "'.' and '..' may only begin an import path", "write ../shared/helper or ./shared/helper without interior dot segments"))
+	else:
+		Ok(void)
+	part ?= consume_name(state, "expected a module name in the import path")
+	gathered = parts.append(part.name.id)
+
+	if at_slash(part.next):
+		consume_path_parts(shifted(part.next, 1), gathered)
+	else:
+		Ok({ parts = gathered, last = part.name.span, next = part.next })
+
+
+-- Path bytes are contiguous: no token after the path's first is spaced.
+private pure func reject_spaced_path(state: ParserState, end: Int) -> Result[Void, Diagnostic]:
+	if IntOps.greater_than_or_equal(state.position, end):
+		Ok(void)
+	else if at_spaced_token(state):
+		Err(expected(state, "import paths cannot contain spaces", "write adjacent path characters, such as ./helper or ../shared/helper"))
+	else:
+		reject_spaced_path(shifted(state, 1), end)
+
+
+private pure func consume_module_path(start: ParserState) -> Result[ParsedPath, Diagnostic]:
+	var state = start
+	var origin: ImportOrigin = LibraryImport
+
+	if at_dot(state) and at_slash(shifted(state, 1)):
+		origin = RelativeImport(0)
+		state = shifted(state, 2)
+	else:
+		var parents: Int = 0
+
+		while parent_prefix(state):
+			parents = IntOps.add(parents, 1)
+			state = shifted(state, 3)
+
+		if IntOps.greater_than(parents, 0):
+			origin = RelativeImport(parents)
+
+	prefix ?= if at_slash(start):
+		Err(expected(start, "absolute import paths are not supported", "write int: add for the target library or ./helper: answer for a local module"))
+	else if IntOps.equals(state.position, start.position) and at_dot(start):
+		Err(expected(start, "expected './' or '../' before a relative import path", "write ./helper: answer or ../shared/helper: answer"))
+	else:
+		Ok(void)
+	parts ?= consume_path_parts(state, [])
+	contiguous ?= reject_spaced_path(shifted(start, 1), parts.next.position)
+	Ok({
+		path = { origin = origin, parts = parts.parts },
+		span = { parser_span(start) | end = parts.last.end },
+		next = parts.next
+	})
+
+
+private fixed record ImportSelectionResult {
+	selection: ImportSelection,
+	span: Span,
+	next: ParserState
+}
+
+
+-- `opened` follows the opening parenthesis of a constructor selection.
+private pure func consume_constructor_names(state: ParserState, names: List[WrittenName]) -> Result[NameList, Diagnostic]:
+	name ?= consume_name(state, "expected an imported constructor name")
+	gathered = names.append(name.name)
+	after_comma = shifted(name.next, 1)
+
+	if not at_comma(name.next):
+		Ok({ names = gathered, next = name.next })
+	else if at_right_paren(after_comma):
+		Err(expected(after_comma, "expected a constructor after ','", "omit the trailing comma in Option(Some, None)"))
+	else:
+		consume_constructor_names(after_comma, gathered)
+
+
+private ONLY_METHODS_HELP: String = "write Foo(First) to import the type and constructors, or Foo methods_only to import only methods"
+
+
+private pure func consume_constructor_selection(name: ParsedName) -> Result[ImportSelectionResult, Diagnostic]:
+	opened = shifted(name.next, 1)
+	selected ?= if at_right_paren(opened):
+		Ok({ names = [], next = opened })
+	else:
+		consume_constructor_names(opened, [])
+	closed ?= expect(selected.next, at_right_paren(selected.next), "expected ')' after selected constructors", "write Option(Some, None) or Option() on one line")
+
+	if at_word(closed, "methods_only"):
+		Err(expected(closed, "constructor selection cannot be combined with methods_only", ONLY_METHODS_HELP))
+	else:
+		Ok({
+			selection = ConstructorSelection(name.name, selected.names),
+			span = { name.name.span | end = parser_span(selected.next).end },
+			next = closed,
+		})
+
+
+private pure func consume_methods_only(name: ParsedName) -> Result[ImportSelectionResult, Diagnostic]:
+	modifier = parser_span(name.next)
+	after_modifier = shifted(name.next, 1)
+
+	if at_left_paren(after_modifier):
+		Err(expected(after_modifier, "methods_only cannot include constructor selection", ONLY_METHODS_HELP))
+	else if at_word(after_modifier, "methods_only"):
+		Err(expected(after_modifier, "methods_only must appear once after a type name", "write ops: Foo methods_only without constructors or another modifier"))
+	else:
+		Ok({ selection = MethodsOnlySelection(name.name, modifier), span = { name.name.span | end = modifier.end }, next = after_modifier })
+
+
+private pure func consume_import_symbol(state: ParserState) -> Result[ImportSelectionResult, Diagnostic]:
+	match current_symbol(state):
+		Some(Star):
+			Err(expected(state, "wildcard imports are not supported", "list the functions you need, such as ./helper: answer"))
+		_:
+			name ?= consume_name(state, "expected an imported function or type name")
+
+			if at_word(name.next, "as"):
+				Err(expected(name.next, "import aliases are not supported yet", "select the function by its declared name, such as ./helper: answer"))
+			else if at_left_paren(name.next):
+				consume_constructor_selection(name)
+			else if at_word(name.next, "methods_only"):
+				consume_methods_only(name)
+			else:
+				Ok({ selection = NamedSelection(name.name), span = name.name.span, next = name.next })
+
+
+private fixed record ImportSymbols {
+	symbols: List[ImportSelection],
+	last: Span,
+	next: ParserState
+}
+
+
+private pure func consume_import_symbols(state: ParserState, symbols: List[ImportSelection]) -> Result[ImportSymbols, Diagnostic]:
+	symbol ?= consume_import_symbol(state)
+	gathered = symbols.append(symbol.selection)
+
+	if at_comma(symbol.next):
+		consume_import_symbols(shifted(symbol.next, 1), gathered)
+	else:
+		Ok({ symbols = gathered, last = symbol.span, next = symbol.next })
+
+
+private fixed record ImportResult {
+	request: ParsedImport,
+	next: ParserState
+}
+
+
+private pure func consume_import_row(start: ParserState) -> Result[ImportResult, Diagnostic]:
+	path ?= consume_module_path(start)
+	selection ?= if at_word(path.next, "as"):
+		Err(expected(path.next, "import aliases are not supported yet", "select functions directly, such as ./helper: answer"))
+	else if at_dot(path.next):
+		Err(expected(path.next, "import paths omit file extensions", "write ./helper: answer instead of ./helper.brp: answer"))
+	else:
+		expect(path.next, at_colon(path.next), "expected ':' and selected function names after the import path", "write ./helper: answer; module aliases and whole-module imports are not supported yet")
+	symbols ?= consume_import_symbols(selection, [])
+	next ?= consume_line_end(symbols.next, "expected ',' between imported function names", "write ./helper: answer, other on one line")
+	Ok({
+		request = { path = path.path, symbols = symbols.symbols, span = { path.span | end = symbols.last.end } },
+		next = next,
+	})
+
+
+private fixed record ImportBlockResult {
+	imports: List[ParsedImport],
+	next: ParserState
+}
+
+
+private pure func consume_import_rows(state: ParserState, imports: List[ParsedImport]) -> Result[ImportBlockResult, Diagnostic]:
+	row ?= consume_import_row(state)
+	gathered = imports.append(row.request)
+
+	if at_dedent(row.next):
+		Ok({ imports = gathered, next = shifted(row.next, 1) })
+	else:
+		consume_import_rows(row.next, gathered)
+
+
+private pure func consume_import_block(start: ParserState) -> Result[ImportBlockResult, Diagnostic]:
+	keyword_end = shifted(start, 1)
+	colon ?= expect(keyword_end, at_colon(keyword_end), "expected ':' after 'import'", "write import: followed by indented relative imports")
+	newline ?= expect(colon, at_newline(colon), "expected a newline after 'import:'", "put each ./helper: answer import on its own indented line")
+	opened ?= expect(newline, at_indent(newline), "expected an indented import", "indent each ./helper: answer line with one tab or four spaces")
+	consume_import_rows(opened, [])
+
+
+-- One top-level item of a module.
+private fixed union Declaration:
+	ImportBlock(List[ParsedImport])
+	BuiltinTypeDeclaration(ParsedBuiltinType)
+	FunctionDeclaration(ParsedFunction)
+	UnionDeclaration(ParsedUnion)
+	RecordDeclaration(ParsedRecord)
+
+
+private fixed record DeclarationResult {
+	declaration: Declaration,
+	next: ParserState
+}
+
+
+-- `declared` says whether a non-import declaration precedes `state`.
+private pure func consume_declaration(state: ParserState, module: ModuleId, declared: Bool) -> Result[DeclarationResult, Diagnostic]:
+	if at_word(state, "import") and declared:
+		Err(expected(state, "imports must precede declarations", "move every import: block before the module's functions, fixed unions, and fixed records"))
+	else if at_word(state, "import"):
+		block ?= consume_import_block(state)
+		Ok({ declaration = ImportBlock(block.imports), next = block.next })
+	else if at_word(state, "type"):
+		parsed ?= consume_builtin_type(state)
+		next ?= end_value_line(parsed.next)
+		Ok({ declaration = BuiltinTypeDeclaration(parsed.declaration), next = next })
+	else if at_word(state, "private"):
+		Err(expected(state, "private declarations are not supported yet", "omit private; local module declarations are public by default"))
+	else if at_word(state, "fixed") and at_word(shifted(state, 1), "record"):
+		parsed ?= consume_record(state, module)
+		next ?= end_value_line(parsed.next)
+		Ok({ declaration = RecordDeclaration(parsed.declaration), next = next })
+	else if at_word(state, "fixed"):
+		parsed ?= consume_union(state, module)
+		Ok({ declaration = UnionDeclaration(parsed.declaration), next = parsed.next })
+	else:
+		parsed ?= consume_function(state, module)
+		Ok({ declaration = FunctionDeclaration(parsed.function), next = parsed.next })
+
+
+pure func parse_module(input: LexedProgram, module: ModuleId, names: NameTable) -> Result[ParsedModule, Diagnostic]:
+	var correct_source = same_source(input.end.source, module_source(module))
+
+	for token in input.tokens:
+		correct_source = correct_source and same_source(token.span.source, module_source(module))
+
+	origin ?= if correct_source:
+		Ok(void)
+	else:
+		Err(source_bundle_error("parsed module's source does not match its module identity"))
+	var imports: List[ParsedImport] = []
+	var builtin_types: List[ParsedBuiltinType] = []
+	var functions: List[ParsedFunction] = []
+	var unions: List[ParsedUnion] = []
+	var records: List[ParsedRecord] = []
+	-- One Result carries the parser to the end of the module or to the first error.
+	var scan: Result[ParserState, Diagnostic] = Ok({ input = input, position = 0, names = names })
+
+	while True:
+		match scan:
+			Ok(state):
+				if at_end(state):
+					break
+
+				declared = not (builtin_types.is_empty() and functions.is_empty() and unions.is_empty() and records.is_empty())
+				scan = match consume_declaration(state, module, declared):
+					Ok(parsed):
+						match parsed.declaration:
+							ImportBlock(rows):
+								for row in rows:
+									imports = imports.append(row)
+							BuiltinTypeDeclaration(declaration):
+								builtin_types = builtin_types.append(declaration)
+							FunctionDeclaration(function):
+								functions = functions.append(function)
+							UnionDeclaration(declaration):
+								unions = unions.append(declaration)
+							RecordDeclaration(declaration):
+								records = records.append(declaration)
+
+						Ok(parsed.next)
+					Err(error):
+						Err(error)
+			Err(_):
+				break
+
+	finished ?= scan
+	Ok(into_opaque ParsedModule({
+				base_names = names,
+				names = finished.names,
+				module = module,
+				imports = imports,
+				builtin_types = builtin_types,
+				functions = functions,
+				unions = unions,
+				records = records,
+				end = input.end
+			}))

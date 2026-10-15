@@ -1,0 +1,200 @@
+import:
+	../utils/declarations: DeclarationInventory, issue_inventory
+	int as IntOps
+	../utils/names: NameId, NameTable, program_names, same_name_table
+	option: to_result
+	./parse: ImportSelection, ParsedModule, ParsedModuleContents, module_contents
+	../utils/source: ModuleId, ModuleKind(FoundationTypesModule, FoundationPreludeModule, LibraryModule, UserModule), module_number
+	../utils/syntax: Diagnostic, ParsedBuiltinType, ParsedFunction, ParsedRecord, ParsedUnion, Span, source_bundle_error
+
+
+-- Program assembly: the loader appends each parsed module in inventory order,
+-- and sealing validates the complete bundle once for checking.
+
+
+fixed record ModuleImport {
+	target: ModuleId,
+	symbols: List[ImportSelection],
+	span: Span
+}
+
+
+fixed record FoundationModules {
+	types: ModuleId,
+	prelude: ModuleId
+}
+
+
+fixed record ParsedBuiltinDeclaration {
+	module: ModuleId,
+	declaration: ParsedBuiltinType
+}
+
+
+fixed record ParsedModuleRow {
+	module: ModuleId,
+	role: ModuleKind,
+	imports: List[ModuleImport],
+	end: Span
+}
+
+
+fixed record ParsedContents {
+	names: NameTable,
+	entrypoint: NameId,
+	foundation: FoundationModules,
+	builtin_types: List[ParsedBuiltinDeclaration],
+	modules: List[ParsedModuleRow],
+	declarations: DeclarationInventory,
+	end: Span
+}
+
+
+private fixed record ProgramBuilder {
+	names: NameTable,
+	entrypoint: NameId,
+	builtin_types: List[ParsedBuiltinDeclaration],
+	modules: List[ParsedModuleRow],
+	functions: List[ParsedFunction],
+	unions: List[ParsedUnion],
+	records: List[ParsedRecord]
+}
+
+
+opaque type ParsedAssembly = ProgramBuilder
+
+-- All module syntax shares one complete spelling authority per compilation.
+opaque type ParsedProgram = ParsedContents
+
+
+pure func parsed_contents(program: ParsedProgram) -> ParsedContents:
+	from_opaque ParsedProgram(program)
+
+
+pure func begin_program() -> ParsedAssembly:
+	seed = program_names()
+	into_opaque ParsedAssembly({
+			names = seed.names,
+			entrypoint = seed.main,
+			builtin_types = [],
+			modules = [],
+			functions = [],
+			unions = [],
+			records = []
+		})
+
+
+pure func assembly_names(assembly: ParsedAssembly) -> NameTable:
+	from_opaque ParsedAssembly(assembly).names
+
+
+-- Pairs each import request with its target, in order.
+private pure func linked_imports(
+	contents: ParsedModuleContents,
+	position: Int,
+	targets: List[ModuleId],
+	linked: List[ModuleImport],
+) -> Result[List[ModuleImport], Diagnostic]:
+	match contents.imports.get(position):
+		None:
+			if IntOps.equals(position, targets.length()):
+				Ok(linked)
+			else:
+				Err(source_bundle_error("source bundle does not supply exactly one target per import"))
+		Some(request):
+			match targets.get(position):
+				Some(target):
+					link = { target = target, symbols = request.symbols, span = request.span }
+					linked_imports(contents, IntOps.add(position, 1), targets, linked.append(link))
+				None:
+					Err(source_bundle_error("source bundle does not supply exactly one target per import"))
+
+
+pure func append_module(
+	assembly: ParsedAssembly,
+	parsed: ParsedModule,
+	targets: List[ModuleId],
+	role: ModuleKind,
+) -> Result[ParsedAssembly, Diagnostic]:
+	builder = from_opaque ParsedAssembly(assembly)
+	contents = module_contents(parsed)
+	authority ?= if not same_name_table(builder.names, contents.base_names):
+		Err(source_bundle_error("parsed module does not extend this source bundle's name authority"))
+	else if not IntOps.equals(module_number(contents.module), builder.modules.length()):
+		Err(source_bundle_error("parsed module does not have the next source bundle identity"))
+	else:
+		Ok(void)
+	imports ?= linked_imports(contents, 0, targets, [])
+	var builtin_types = builder.builtin_types
+
+	for declaration in contents.builtin_types:
+		builtin_types = builtin_types.append({ module = contents.module, declaration = declaration })
+
+	Ok(into_opaque ParsedAssembly({
+				names = contents.names,
+				entrypoint = builder.entrypoint,
+				builtin_types = builtin_types,
+				modules = builder.modules.append({ module = contents.module, role = role, imports = imports, end = contents.end }),
+				functions = builder.functions.concat(contents.functions),
+				unions = builder.unions.concat(contents.unions),
+				records = builder.records.concat(contents.records)
+			}))
+
+
+-- Exactly one row has each foundation role.
+private pure func foundation_module(
+	rows: List[ParsedModuleRow],
+	missing: String,
+	repeated: String,
+	root: ParsedModuleRow,
+) -> Result[ModuleId, Diagnostic]:
+	match rows:
+		[]:
+			Err({ source_bundle_error(missing) | span = root.end })
+		[row]:
+			Ok(row.module)
+		[_, duplicate, ..._]:
+			Err({ source_bundle_error(repeated) | span = duplicate.end })
+
+
+pure func seal_program(assembly: ParsedAssembly) -> Result[ParsedProgram, Diagnostic]:
+	builder = from_opaque ParsedAssembly(assembly)
+	root ?= builder.modules.get(0).to_result(source_bundle_error("source bundle has no root module"))
+	var complete: Bool = True
+
+	for module in builder.modules:
+		for request in module.imports:
+			complete = complete and IntOps.less_than(module_number(request.target), builder.modules.length())
+
+	targets ?= if complete:
+		Ok(void)
+	else:
+		Err(source_bundle_error("source bundle is missing an imported module"))
+	var types_rows: List[ParsedModuleRow] = []
+	var prelude_rows: List[ParsedModuleRow] = []
+
+	for row in builder.modules:
+		match row.role:
+			FoundationTypesModule:
+				types_rows = types_rows.append(row)
+			FoundationPreludeModule:
+				prelude_rows = prelude_rows.append(row)
+			LibraryModule | UserModule:
+				void
+
+	types ?= foundation_module(types_rows, "source bundle has no foundation types module", "source bundle has more than one foundation types module", root)
+	prelude ?= foundation_module(prelude_rows, "source bundle has no foundation prelude module", "source bundle has more than one foundation prelude module", root)
+	root_role ?= match root.role:
+		UserModule:
+			Ok(void)
+		_:
+			Err({ source_bundle_error("source bundle root must be a user module") | span = root.end })
+	Ok(into_opaque ParsedProgram({
+				names = builder.names,
+				entrypoint = builder.entrypoint,
+				foundation = { types = types, prelude = prelude },
+				builtin_types = builder.builtin_types,
+				modules = builder.modules,
+				declarations = issue_inventory(builder.functions, builder.records, builder.unions),
+				end = root.end
+			}))
