@@ -1,0 +1,195 @@
+import:
+	../../../src/lex/lex: lex
+	../../../src/parse/parse: ParsedModule, module_contents, parse_module
+	../../../src/utils/names: program_names
+	../../../src/utils/source: module_source, root_module_id
+	../../../src/utils/syntax:
+		Diagnostic,
+		ExpressionBase(LambdaExpression, NameExpression),
+		LambdaBinder(LambdaDiscard, LambdaName),
+		LambdaBody(BlockBody, InlineBody),
+		ParsedBody(ParsedValueBody),
+		ParsedFunction,
+		ParsedLambda,
+		ParsedStatement(BindingStatement),
+		PostfixOperation(ReceiverInvocation),
+		Purity(Impure, Pure),
+	test: TestSuite
+
+
+private HEADER: String = "func main() -> Int:\n"
+
+private BLOCK_HEADER_HELP: String = "a block header ends with `:` before its indented body, as in `if condition:` or `func name() -> Type:`"
+
+private KEYWORD_HELP: String = "a keyword is missing or misspelled: `in` follows a loop variable, `from` follows a select receive binding and `func` starts a function"
+
+
+private pure func parse_source(source: String) -> Result[ParsedModule, Diagnostic]:
+	tokens ?= lex(module_source(root_module_id()), source, program_names().names)
+	parse_module(tokens, root_module_id())
+
+
+private pure func main_function(source: String) -> Option[ParsedFunction]:
+	match parse_source(source):
+		Ok(parsed):
+			module_contents(parsed).functions.get(0)
+		Err(_):
+			None
+
+
+-- The lambda bound by the function's first statement.
+private pure func bound_lambda(source: String) -> Option[ParsedLambda]:
+	match main_function(source):
+		Some(function):
+			match function.statements:
+				[BindingStatement(binding)]:
+					match binding.initializer.base:
+						LambdaExpression(lambda):
+							Some(lambda)
+						_:
+							None
+				_:
+					None
+		None:
+			None
+
+
+private pure func accepts(source: String) -> Bool:
+	parse_source(source).is_ok()
+
+
+private pure func rejects(source: String, start: Int, end: Int, message: String, help: String) -> Bool:
+	match parse_source(source):
+		Err(diagnostic):
+			diagnostic.span.start == start and diagnostic.span.end == end and diagnostic.message == message and diagnostic.help == help
+		Ok(_):
+			False
+
+
+-- `pure func(x: Int) -> Int: x` keeps purity, the annotated parameter, the
+-- return type and an inline body; the span runs to the body's end.
+pure func test_inline_lambda_keeps_header_and_body() -> Bool:
+	match bound_lambda(HEADER + "\tf = pure func(x: Int) -> Int: x\n\t0\n"):
+		Some(lambda):
+			match (lambda.purity, lambda.parameters, lambda.body):
+				(Pure, [parameter], InlineBody(body)):
+					match (parameter.binder, body.base):
+						(LambdaName(name), NameExpression(_)):
+							(
+								name.span.start == 35 and parameter.annotation.is_some() and lambda.return_type.is_some()
+								and lambda.span.start == 25 and lambda.span.end == 52
+							)
+						_:
+							False
+				_:
+					False
+		None:
+			False
+
+
+-- Parameters may be bare names or `_`, with a trailing comma; `func` alone
+-- is impure.
+pure func test_lambda_parameters_may_be_bare_or_discarded() -> Bool:
+	match bound_lambda(HEADER + "\tf = func(_, y,): y\n\t0\n"):
+		Some(lambda):
+			match (lambda.purity, lambda.parameters):
+				(Impure, [first, second]):
+					match (first.binder, second.binder):
+						(LambdaDiscard(span), LambdaName(_)):
+							span.start == 30 and first.annotation.is_none() and lambda.return_type.is_none()
+						_:
+							False
+				_:
+					False
+		None:
+			False
+
+
+-- A block body inside a call is a bracketed block; the closing bracket
+-- follows the block on its own line.
+pure func test_block_lambda_inside_a_call() -> Bool:
+	source: String =
+		|func main() -> Int:
+		|	ys = xs.map(func(x):
+		|		y = x
+		|		y
+		|	)
+		|	0
+		|
+	match main_function(source):
+		Some(function):
+			match function.statements:
+				[BindingStatement(binding)]:
+					match binding.initializer.applications:
+						[ReceiverInvocation(call)]:
+							match call.arguments:
+								[argument]:
+									match argument.base:
+										LambdaExpression(lambda):
+											match lambda.body:
+												BlockBody(block):
+													block.statements.length() == 1 and block.value.is_some() and lambda.span.end == 53
+												_:
+													False
+										_:
+											False
+								_:
+									False
+						_:
+							False
+				_:
+					False
+		None:
+			False
+
+
+-- An inline lambda as an argument ends at the call's `)` or `,`.
+pure func test_inline_lambda_as_an_argument() -> Bool:
+	accepts(HEADER + "\tys = xs.map(func(x): x, 1)\n\t0\n") and accepts(HEADER + "\tys = xs.map(func(x): x.length())\n\t0\n")
+
+
+pure func test_lambda_header_errors_use_the_host_words() -> Bool:
+	(
+		rejects(HEADER + "\tf = pure x\n\t0\n", 30, 31, "expected `func` before lambda", KEYWORD_HELP)
+		and rejects(HEADER + "\tf = func x: 1\n\t0\n", 30, 31, "expected `(` after lambda `func`", "write the parameters or arguments inside parentheses")
+		and rejects(HEADER + "\tf = func(,): 1\n\t0\n", 30, 31, "expected lambda parameter", "write an identifier here; it starts with a letter or `_` and is not a reserved keyword")
+		and rejects(HEADER + "\tf = func(1): 1\n\t0\n", 30, 31, "expected lambda parameter", "write an identifier here; it starts with a letter or `_` and is not a reserved keyword")
+		and rejects(HEADER + "\tf = func(in): 1\n\t0\n", 30, 32, "`in` is a reserved keyword and cannot be used as a name", "choose another identifier such as `in_name`")
+		and rejects(HEADER + "\tf = func(x: 1\n\t0\n", 33, 34, "expected a parameter type", "use an ASCII identifier starting with a letter or underscore; keywords and lone '_' are reserved")
+		and rejects(HEADER + "\tf = func(x y): 1\n\t0\n", 32, 33, "expected `)` after lambda parameters", "close the parenthesis opened earlier with `)`")
+		and rejects(HEADER + "\tf = func(x) 1\n\t0\n", 33, 34, "expected `:` before lambda body", BLOCK_HEADER_HELP)
+		and rejects(HEADER + "\tf = func(x):\n\t0\n", 35, 36, "expected an indented block", "indent the lines of the block under its header")
+	)
+
+
+-- Host 4.9: a block inside brackets must end before the bracket closes.
+pure func test_closing_bracket_on_the_block_last_line_is_rejected() -> Bool:
+	help = "put the closing bracket on its own line, at or below the indentation of the line that opened the block"
+	(
+		rejects(HEADER + "\tys = xs.map(func(x):\n\t\tx)\n\t0\n", 45, 46, "a block inside brackets must end before the closing bracket", help)
+		and rejects(HEADER + "\tys = f(if True:\n\t\t1\n\telse:\n\t\t2)\n\t0\n", 51, 52, "a block inside brackets must end before the closing bracket", help)
+		and rejects(HEADER + "\tx = 1)\n\t0\n", 26, 27, "expected a newline after the binding", "put each statement on its own line")
+	)
+
+
+-- Host 5.3: a lambda body starts a new statement context.
+pure func test_lambda_body_starts_a_new_context() -> Bool:
+	(
+		accepts(HEADER + "\twhile True:\n\t\tf = func(x):\n\t\t\ty ?= find(x)\n\t\t\ty\n\t\tbreak\n\t0\n")
+		and rejects(HEADER + "\twhile True:\n\t\tf = func(x):\n\t\t\tbreak\n\t0\n", 51, 56, "`break` can only be used inside a loop", "move `break` into a `while` or `for` body, or remove it")
+		and accepts(HEADER + "\tf = func(x):\n\t\twhile True:\n\t\t\tbreak\n\t\tx\n\t0\n")
+	)
+
+
+tests: TestSuite = {
+	description = "Blorp 2 lambda syntax",
+	tests = [
+		("inline lambda keeps header and body", test_inline_lambda_keeps_header_and_body),
+		("lambda parameters may be bare or discarded", test_lambda_parameters_may_be_bare_or_discarded),
+		("block lambda inside a call", test_block_lambda_inside_a_call),
+		("inline lambda as an argument", test_inline_lambda_as_an_argument),
+		("lambda header errors use the host words", test_lambda_header_errors_use_the_host_words),
+		("closing bracket on the block last line is rejected", test_closing_bracket_on_the_block_last_line_is_rejected),
+		("lambda body starts a new context", test_lambda_body_starts_a_new_context),
+	]
+}
