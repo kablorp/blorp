@@ -5,17 +5,20 @@ and patterns, and the canonical Void tail.
 import:
 	./errors:
 		CheckError,
-		CheckerInvariant(InvalidCheckedUnion, InvalidResolvedParameter, UnsupportedPatternReachedResolution, LoopControlOutsideLoop),
-		ExpectedTypeSite(InferredBindingDeclaration, SourceAnnotation),
+		CheckerInvariant(InvalidCheckedUnion, InvalidResolvedParameter, UnsupportedPatternReachedResolution, LoopControlOutsideLoop, JoinWithoutArms),
+		ExpectedTypeSite(FirstArmValue, InferredBindingDeclaration, SourceAnnotation),
 		MatchError(
 			ArmWithoutValue, MatchRequiresUnion, NonExhaustiveMatch, PatternFieldCountMismatch, DuplicatePatternBinding,
 			UnknownConstructorPattern, UnreachableArm,
 		),
-		StatementError(DuplicateLocal, ImmutableAssignment, NonVoidStatement),
+		StatementError(DuplicateLocal, ImmutableAssignment, NonVoidMatchArm, NonVoidStatement),
 		checker_invariant,
 		match_error,
 		statement_error,
-		UnsupportedForm(LocalAnnotation, NestedPattern, OrPattern, ListPattern, StringPattern, CharPattern, QualifiedPattern, Propagation, WhileStatement, ForStatement),
+		UnsupportedForm(
+			LocalAnnotation, NestedPattern, OrPattern, ListPattern, StringPattern, CharPattern, QualifiedPattern, Propagation,
+			WhileStatement, ForStatement, JoinArmReassignment,
+		),
 		unsupported_form,
 	./callables: CallableBinding, ResolutionContext
 	./model:
@@ -27,8 +30,10 @@ import:
 		CheckedArm,
 		CheckedBody(CheckedMatchBody, CheckedValueBody),
 		CheckedExit(RecurWith, ReturnExpression),
+		CheckedJoin,
+		CheckedJoinArm,
 		CheckedExpr,
-		CheckedForm(InvokeFunction, LiteralVoid, ReadBinding),
+		CheckedForm(InvokeFunction, LiteralVoid, Match, ReadBinding),
 		CheckedFunction,
 		CheckedMatch,
 		CheckedPattern(BindingCase, VariantCase, WildcardCase),
@@ -53,6 +58,7 @@ import:
 	../utils/syntax:
 		BindingSyntax(ImmutableBinding, MutableBinding),
 		ParsedBinding,
+		ExpressionBase(MatchExpression),
 		ParsedMatch,
 		ParsedMatchArm,
 		ParsedParameter,
@@ -210,11 +216,10 @@ private pure func resolve_variant_pattern(
 
 
 -- What every arm of one match shares: the scrutinee's union type and
--- occurrence, the function's return obligation and the scope before the match.
+-- occurrence and the scope before the match.
 private fixed record MatchContext {
 	union_type: TypeRef,
 	occurrence: UnionOccurrence,
-	return_type: TypeUse,
 	scope: List[LocalBinding]
 }
 
@@ -350,14 +355,20 @@ private pure func pattern_form_rejection(pattern: ParsedPattern) -> Option[Check
 			Some(unsupported_form(span, CharPattern))
 
 
--- Every arm must be useful, and together the arms must cover every variant.
-private pure func resolve_match(
-	return_type: TypeUse,
+-- A match's typed scrutinee, its arms' shared context and every variant
+-- its arms must cover.
+private fixed record StartedMatch {
+	scrutinee: CheckedExpr,
+	match_context: MatchContext,
+	remaining: List[VariantId]
+}
+
+
+private pure func start_match(
 	scope: List[LocalBinding],
 	body: ParsedMatch,
-	bindings: List[BindingDefinition],
 	context: ResolutionContext,
-) -> Result[ResolvedMatch, CheckError]:
+) -> Result[StartedMatch, CheckError]:
 	supported ?= match unsupported_pattern_form(body.arms):
 		Some(error): Err(error)
 		None: Ok(void)
@@ -373,39 +384,93 @@ private pure func resolve_match(
 	for variant in declaration.variants:
 		remaining = remaining.append(variant.id)
 
-	match_context: MatchContext = {
-		union_type = scrutinee.value_type,
-		occurrence = occurrence,
-		return_type = return_type,
-		scope = scope
-	}
+	Ok({
+		scrutinee = scrutinee,
+		match_context = {
+			union_type = scrutinee.value_type,
+			occurrence = occurrence,
+			scope = scope
+		},
+		remaining = remaining,
+	})
+
+
+private pure func exhaustive(remaining: List[VariantId], body: ParsedMatch) -> Result[Void, CheckError]:
+	if remaining.is_empty():
+		Ok(void)
+	else:
+		Err(match_error(body.keyword_span, NonExhaustiveMatch(remaining)))
+
+
+-- One arm's pattern and statements, the variants still uncovered after it,
+-- and the function's bindings including the arm's.
+private fixed record ResolvedArmPrefix {
+	pattern: CheckedPattern,
+	remaining: List[VariantId],
+	block: ResolvedStatements
+}
+
+
+private pure func resolve_arm_prefix(
+	arm: ParsedMatchArm,
+	match_context: MatchContext,
+	remaining: List[VariantId],
+	bindings: List[BindingDefinition],
+	reassignment: ReassignmentScope,
+	context: ResolutionContext,
+) -> Result[ResolvedArmPrefix, CheckError]:
+	pattern ?= resolve_pattern(arm.pattern, match_context, bindings.length(), context)
+	uncovered ?= remaining_after(pattern.pattern, remaining, pattern_span(arm.pattern))
+	definitions = bindings.concat(pattern.bindings)
+	block ?= resolve_statements(
+		arm.block.statements,
+		{
+			bindings = definitions,
+			scope = pattern.scope,
+			statements = []
+		},
+		definitions.length(),
+		reassignment,
+		context,
+	)
+	Ok({ pattern = pattern.pattern, remaining = uncovered, block = block })
+
+
+-- Every arm must be useful, and together the arms must cover every variant.
+private pure func resolve_match(
+	return_type: TypeUse,
+	scope: List[LocalBinding],
+	body: ParsedMatch,
+	bindings: List[BindingDefinition],
+	context: ResolutionContext,
+) -> Result[ResolvedMatch, CheckError]:
+	started ?= start_match(scope, body, context)
 	resolved ?= resolve_arms(
 		body.arms,
-		match_context,
+		started.match_context,
+		return_type,
 		{
 			arms = [],
-			remaining = remaining,
+			remaining = started.remaining,
 			bindings = bindings
 		},
 		context,
 	)
-
-	if resolved.remaining.is_empty():
-		Ok({
-			body = {
-				scrutinee = scrutinee,
-				union_type = scrutinee.value_type,
-				arms = resolved.arms
-			},
-			bindings = resolved.bindings,
-		})
-	else:
-		Err(match_error(body.keyword_span, NonExhaustiveMatch(resolved.remaining)))
+	covered ?= exhaustive(resolved.remaining, body)
+	Ok({
+		body = {
+			scrutinee = started.scrutinee,
+			union_type = started.scrutinee.value_type,
+			arms = resolved.arms
+		},
+		bindings = resolved.bindings,
+	})
 
 
 private pure func resolve_arms(
 	written: List[ParsedMatchArm],
 	match_context: MatchContext,
+	return_type: TypeUse,
 	progress: ArmProgress,
 	context: ResolutionContext,
 ) -> Result[ArmProgress, CheckError]:
@@ -413,49 +478,239 @@ private pure func resolve_arms(
 		None:
 			Ok(progress)
 		Some(arm):
-			pattern ?= resolve_pattern(
-				arm.pattern,
-				match_context,
-				progress.bindings.length(),
-				context,
-			)
-			remaining ?= remaining_after(
-				pattern.pattern,
-				progress.remaining,
-				pattern_span(arm.pattern),
-			)
-
-			definitions = progress.bindings.concat(pattern.bindings)
-
-			prefix ?= resolve_statements(
-				arm.block.statements,
-				{
-					bindings = definitions,
-					scope = pattern.scope,
-					statements = []
-				},
-				definitions.length(),
-				context,
-			)
+			-- A tail arm has no continuation, so it may reassign any variable.
+			prefix ?= resolve_arm_prefix(arm, match_context, progress.remaining, progress.bindings, AnyMutableBinding, context)
 			-- A tail match's arm must produce the function's value.
 			body ?= arm.block.value.to_result(match_error(arm.span, ArmWithoutValue))
-			value ?= resolve_return_value(
-				prefix.scope,
-				body,
-				match_context.return_type,
+			value ?= resolve_value(prefix.block, body, return_expectation(return_type), context)
+			resolve_arms(
+				written,
+				match_context,
+				return_type,
+				{
+					arms = progress.arms.append({
+						pattern = prefix.pattern,
+						statements = prefix.block.statements,
+						body = ReturnExpression(value.value),
+					}),
+					remaining = prefix.remaining,
+					bindings = value.bindings
+				},
 				context,
 			)
-			resolve_arms(
+
+
+-- What a block's value, an initializer or an expression statement must
+-- produce. A bare match's arms take the expectation of the position it
+-- stands in: a known type checks every arm; a statement requires Void, and
+-- its arms may end with a statement; a Void function's tail discards each
+-- arm's value, as it does a plain tail value. Only a new binding, or the
+-- first arm of a match under one, has no expectation: there the first arm's
+-- type decides the later arms'.
+private fixed union ValueExpectation:
+	UntypedValue
+	CheckedAgainst(TypeRef, ExpectedTypeSite)
+	StatementValue
+	-- An arm of a statement match, or of a match nested as one's value.
+	StatementArm
+	-- A Void function's tail. The match there is Void; its arms keep their
+	-- values' own types only until normalize_void_body discards them, after
+	-- tail-recursion analysis has seen them at the tail. Like any tail arm,
+	-- each arm still needs a value.
+	VoidTail
+
+
+-- Which bindings a block may reassign. A join carries only its value to the
+-- code after it, so an arm of a bound or statement match may reassign only
+-- the bindings it declares, those at or after this ordinal.
+private fixed union ReassignmentScope:
+	AnyMutableBinding
+	JoinArmLocals(Int)
+
+
+-- A checked value with the function's bindings after it: a match's arms
+-- add their captures and locals.
+private fixed record ResolvedValue {
+	value: CheckedExpr,
+	bindings: List[BindingDefinition]
+}
+
+
+-- Arms resolved so far, the uncovered variants and what the next arm's
+-- value must produce.
+private fixed record JoinProgress {
+	arms: List[CheckedJoinArm],
+	remaining: List[VariantId],
+	bindings: List[BindingDefinition],
+	expectation: ValueExpectation
+}
+
+
+private pure func return_expectation(return_type: TypeUse) -> ValueExpectation:
+	-- Void tails have no expected value type: each expression is still fully
+	-- checked, then its value is discarded after tail-recursion analysis.
+	if same_type(return_type.value_type, VoidType):
+		VoidTail
+	else:
+		CheckedAgainst(return_type.value_type, SourceAnnotation(return_type.span))
+
+
+-- A bare match is the only expression resolved here rather than by the
+-- expression planner, which rejects a match nested inside another expression.
+private pure func bare_match(written: ValueExpression) -> Option[ParsedMatch]:
+	match written.base:
+		MatchExpression(matched):
+			if written.applications.is_empty():
+				Some(matched)
+			else:
+				None
+		_:
+			None
+
+
+-- A block's final value, an initializer or an expression statement, in the
+-- scope after `block`'s statements.
+private pure func resolve_value(
+	block: ResolvedStatements,
+	written: ValueExpression,
+	expectation: ValueExpectation,
+	context: ResolutionContext,
+) -> Result[ResolvedValue, CheckError]:
+	match bare_match(written):
+		Some(matched):
+			resolve_join(block, matched, expectation, context)
+		None:
+			value ?= match expectation:
+				UntypedValue | VoidTail:
+					synthesize_value(block.scope, written, None, context)
+				CheckedAgainst(expected, site):
+					check_value(block.scope, written, expected, site, context)
+				StatementValue:
+					statement_value(block.scope, written, ExpressionStatementValue, context)
+				StatementArm:
+					statement_value(block.scope, written, StatementMatchArmValue, context)
+			Ok({ value = value, bindings = block.bindings })
+
+
+-- Non-final expression statements, and a statement match's arm values, must
+-- have Void type.
+-- Where a value must be Void: each position names its own rejection.
+private fixed union VoidPosition:
+	ExpressionStatementValue
+	StatementMatchArmValue
+
+
+private pure func statement_value(
+	scope: List[LocalBinding],
+	written: ValueExpression,
+	position: VoidPosition,
+	context: ResolutionContext,
+) -> Result[CheckedExpr, CheckError]:
+	value ?= synthesize_value(scope, written, None, context)
+	if same_type(value.value_type, VoidType):
+		Ok(value)
+	else:
+		rejection = match position:
+			ExpressionStatementValue: NonVoidStatement(value.value_type)
+			StatementMatchArmValue: NonVoidMatchArm(value.value_type)
+		Err(statement_error(written.span, rejection))
+
+
+-- A bound or statement match. Its arms resolve as a tail match's do, except
+-- that each yields its value to the code after the match.
+private pure func resolve_join(
+	block: ResolvedStatements,
+	body: ParsedMatch,
+	expectation: ValueExpectation,
+	context: ResolutionContext,
+) -> Result[ResolvedValue, CheckError]:
+	started ?= start_match(block.scope, body, context)
+	-- A statement match's arms, and those of matches nested as their values,
+	-- are statement arms.
+	arm_expectation = match expectation:
+		StatementValue | StatementArm: StatementArm
+		UntypedValue | CheckedAgainst(_, _) | VoidTail: expectation
+	resolved ?= resolve_join_arms(
+		body.arms,
+		started.match_context,
+		{
+			arms = [],
+			remaining = started.remaining,
+			bindings = block.bindings,
+			expectation = arm_expectation
+		},
+		context,
+	)
+	covered ?= exhaustive(resolved.remaining, body)
+	decided: Result[TypeRef, CheckError] = match resolved.expectation:
+		CheckedAgainst(expected, _): Ok(expected)
+		StatementValue | StatementArm | VoidTail: Ok(VoidType)
+		-- Only a match without arms leaves its type undecided.
+		UntypedValue: Err(checker_invariant(body.keyword_span, JoinWithoutArms))
+	value_type ?= decided
+	Ok({
+		value = {
+			form = Match({
+				scrutinee = started.scrutinee,
+				union_type = started.scrutinee.value_type,
+				arms = resolved.arms
+			}),
+			value_type = value_type,
+			span = body.span,
+		},
+		bindings = resolved.bindings,
+	})
+
+
+private pure func resolve_join_arms(
+	written: List[ParsedMatchArm],
+	match_context: MatchContext,
+	progress: JoinProgress,
+	context: ResolutionContext,
+) -> Result[JoinProgress, CheckError]:
+	match written.get(progress.arms.length()):
+		None:
+			Ok(progress)
+		Some(arm):
+			prefix ?= resolve_arm_prefix(
+				arm,
+				match_context,
+				progress.remaining,
+				progress.bindings,
+				JoinArmLocals(progress.bindings.length()),
+				context,
+			)
+			resolved: Result[ResolvedValue, CheckError] = match arm.block.value:
+				Some(body):
+					resolve_value(prefix.block, body, progress.expectation, context)
+				None:
+					match progress.expectation:
+						-- An arm of a statement match may end with a statement.
+						StatementValue | StatementArm:
+							Ok({
+								value = { form = LiteralVoid, value_type = VoidType, span = arm.span },
+								bindings = prefix.block.bindings,
+							})
+						UntypedValue | CheckedAgainst(_, _) | VoidTail:
+							Err(match_error(arm.span, ArmWithoutValue))
+			value ?= resolved
+			expectation = match progress.expectation:
+				UntypedValue:
+					CheckedAgainst(value.value.value_type, FirstArmValue)
+				CheckedAgainst(_, _) | StatementValue | StatementArm | VoidTail:
+					progress.expectation
+			resolve_join_arms(
 				written,
 				match_context,
 				{
 					arms = progress.arms.append({
-						pattern = pattern.pattern,
-						statements = prefix.statements,
-						body = ReturnExpression(value),
+						pattern = prefix.pattern,
+						statements = prefix.block.statements,
+						value = value.value,
 					}),
-					remaining = remaining,
-					bindings = prefix.bindings
+					remaining = prefix.remaining,
+					bindings = value.bindings,
+					expectation = expectation,
 				},
 				context,
 			)
@@ -519,6 +774,7 @@ private pure func resolve_statements(
 	written: List[ParsedStatement],
 	block: ResolvedStatements,
 	block_start: Int,
+	reassignment: ReassignmentScope,
 	context: ResolutionContext,
 ) -> Result[ResolvedStatements, CheckError]:
 	match written.get(block.statements.length()):
@@ -528,8 +784,8 @@ private pure func resolve_statements(
 			unannotated ?= match binding.annotation:
 				Some(annotation): Err(unsupported_form(type_span(annotation), LocalAnnotation))
 				None: Ok(void)
-			next ?= resolve_assignment(binding, block, block_start, context)
-			resolve_statements(written, next, block_start, context)
+			next ?= resolve_assignment(binding, block, block_start, reassignment, context)
+			resolve_statements(written, next, block_start, reassignment, context)
 		Some(PropagatingBinding(propagation)):
 			Err(unsupported_form(propagation.span, Propagation))
 		Some(WhileLoop(loop)):
@@ -541,25 +797,24 @@ private pure func resolve_statements(
 		Some(Continue(span)):
 			Err(checker_invariant(span, LoopControlOutsideLoop))
 		Some(ExpressionStatement(expression)):
-			value ?= synthesize_value(block.scope, expression, None, context)
-
-			if same_type(value.value_type, VoidType):
-				resolve_statements(
-					written,
-					{ block |
-						statements = block.statements.append(DiscardExpression(value))
-					},
-					block_start,
-					context,
-				)
-			else:
-				Err(statement_error(expression.span, NonVoidStatement(value.value_type)))
+			resolved ?= resolve_value(block, expression, StatementValue, context)
+			resolve_statements(
+				written,
+				{ block |
+					bindings = resolved.bindings,
+					statements = block.statements.append(DiscardExpression(resolved.value))
+				},
+				block_start,
+				reassignment,
+				context,
+			)
 
 
 private pure func resolve_assignment(
 	written: ParsedBinding,
 	block: ResolvedStatements,
 	block_start: Int,
+	reassignment: ReassignmentScope,
 	context: ResolutionContext,
 ) -> Result[ResolvedStatements, CheckError]:
 	-- Only an explicit var may shadow; it may not redeclare this block's own local.
@@ -587,7 +842,14 @@ private pure func resolve_assignment(
 				ImmutableBinding:
 					match binding.definition.mutability:
 						Mutable:
-							Ok(Some(binding))
+							match reassignment:
+								AnyMutableBinding:
+									Ok(Some(binding))
+								JoinArmLocals(first):
+									if IntOps.less_than(binding_number(binding.id), first):
+										Err(unsupported_form(written.name.span, JoinArmReassignment))
+									else:
+										Ok(Some(binding))
 						Immutable:
 							Err(statement_error(written.name.span, ImmutableAssignment(site)))
 
@@ -596,20 +858,16 @@ private pure func resolve_assignment(
 	match reassign:
 		Some(binding):
 			site = InferredBindingDeclaration(binding_site(context.caller.function, binding))
-			value ?= check_value(
-				block.scope,
-				written.initializer,
-				binding.definition.value_type,
-				site,
-				context,
-			)
+			resolved ?= resolve_value(block, written.initializer, CheckedAgainst(binding.definition.value_type, site), context)
 			Ok(
 				{ block |
-					statements = block.statements.append(ReassignBinding(binding.id, value))
+					bindings = resolved.bindings,
+					statements = block.statements.append(ReassignBinding(binding.id, resolved.value))
 				},
 			)
 		None:
-			value ?= synthesize_value(block.scope, written.initializer, None, context)
+			resolved ?= resolve_value(block, written.initializer, UntypedValue, context)
+			value = resolved.value
 
 			mutability = match written.mutability:
 				MutableBinding:
@@ -623,9 +881,10 @@ private pure func resolve_assignment(
 				value_type = value.value_type,
 				span = written.name.span
 			}
-			id = binding_id(block.bindings.length())
+			-- A match's arm captures and locals precede this binding's ordinal.
+			id = binding_id(resolved.bindings.length())
 			Ok({
-				bindings = block.bindings.append(definition),
+				bindings = resolved.bindings.append(definition),
 				scope = [
 					{
 						name = written.name.id,
@@ -635,26 +894,6 @@ private pure func resolve_assignment(
 				].concat(block.scope),
 				statements = block.statements.append(InitializeBinding(id, value)),
 			})
-
-
--- Void tails have no expected value type: each expression is still fully checked,
--- then its value is discarded after tail-recursion analysis, before publication.
-private pure func resolve_return_value(
-	scope: List[LocalBinding],
-	written: ValueExpression,
-	return_type: TypeUse,
-	context: ResolutionContext,
-) -> Result[CheckedExpr, CheckError]:
-	if same_type(return_type.value_type, VoidType):
-		synthesize_value(scope, written, None, context)
-	else:
-		check_value(
-			scope,
-			written,
-			return_type.value_type,
-			SourceAnnotation(return_type.span),
-			context,
-		)
 
 
 private pure func resolve_body(
@@ -673,6 +912,7 @@ private pure func resolve_body(
 			statements = []
 		},
 		initial.length(),
+		AnyMutableBinding,
 		context,
 	)
 
@@ -702,11 +942,11 @@ private pure func resolve_body(
 				})),
 			})
 		ValueBody(body):
-			value ?= resolve_return_value(prefix.scope, body, signature.return_type, context)
+			value ?= resolve_value(prefix, body, return_expectation(signature.return_type), context)
 			Ok({
-				bindings = prefix.bindings,
+				bindings = value.bindings,
 				statements = prefix.statements,
-				body = CheckedValueBody(ReturnExpression(value)),
+				body = CheckedValueBody(ReturnExpression(value.value)),
 			})
 		MatchBody(body):
 			matched ?= resolve_match(
@@ -801,21 +1041,43 @@ private pure func normalize_void_exit(
 				exit = exit
 			}
 		ReturnExpression(value):
-			match value.form:
-				LiteralVoid:
-					{
-						statements = statements,
-						exit = exit
-					}
-				_:
-					{
-						statements = statements.append(DiscardExpression(value)),
-						exit = ReturnExpression({
-							form = LiteralVoid,
-							value_type = VoidType,
-							span = value.span,
-						})
-					}
+			discarded = discard_tail_value(statements, value)
+			{
+				statements = discarded.statements,
+				exit = ReturnExpression(discarded.value)
+			}
+
+
+-- A Void tail value after discarding: statements, then canonical void.
+private fixed record DiscardedTail {
+	statements: List[CheckedStatement],
+	value: CheckedExpr
+}
+
+
+-- A match at a Void tail was resolved with VoidTail, so it is Void and its
+-- arm values are tail values too: each is discarded the same way first.
+private pure func discard_tail_value(statements: List[CheckedStatement], value: CheckedExpr) -> DiscardedTail:
+	match value.form:
+		LiteralVoid:
+			{ statements = statements, value = value }
+		_:
+			{
+				statements = statements.append(DiscardExpression(discard_arm_values(value))),
+				value = { form = LiteralVoid, value_type = VoidType, span = value.span }
+			}
+
+
+private pure func discard_arm_values(value: CheckedExpr) -> CheckedExpr:
+	match value.form:
+		Match(join):
+			var arms: List[CheckedJoinArm] = []
+			for arm in join.arms:
+				discarded = discard_tail_value(arm.statements, arm.value)
+				arms = arms.append({ arm | statements = discarded.statements, value = discarded.value })
+			{ value | form = Match({ join | arms = arms }) }
+		_:
+			value
 
 
 -- A Void body's tails return canonical void after discarding their values.

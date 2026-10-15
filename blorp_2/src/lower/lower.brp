@@ -12,9 +12,11 @@ import:
 		ConcreteExpr,
 		ConcreteForm(
 			LiteralVoid, LiteralInteger, LiteralFloat, LiteralString, ReadBinding, ConstructVariant,
-			ConstructRecord, ConstructList, UpdateRecord, InvokeFunction, ReadRecordField,
+			ConstructRecord, ConstructList, Match, UpdateRecord, InvokeFunction, ReadRecordField,
 		),
 		ConcreteFunction,
+		ConcreteJoin,
+		ConcreteJoinArm,
 		ConcreteMatch,
 		ConcretePattern(VariantCase, WildcardCase, BindingCase),
 		ConcreteRecord,
@@ -42,6 +44,31 @@ pure func value_number(id: ValueId) -> Int:
 	from_opaque ValueId(id)
 
 
+-- The values an operation reads. A join reads, at its own position, every
+-- value its scrutinee and arms read from outside its arms.
+pure func value_reads(operation: ValueOperation) -> List[ValueId]:
+	match operation:
+		ConstructRecordValue(_, fields):
+			var values: List[ValueId] = []
+			for field in fields:
+				values = values.append(field.value)
+			values
+		ReadRecordFieldValue(_, value):
+			[value]
+		CallValue(_, arguments):
+			arguments
+		ConstructValue(_, arguments):
+			arguments
+		ConstructListValue(elements):
+			elements
+		PayloadValue(_, value):
+			[value]
+		JoinValue(join):
+			join.reads
+		ParameterValue(_) | VoidValue | IntegerValue(_) | FloatValue(_) | StringValue(_):
+			[]
+
+
 fixed record RecordFieldValue {
 	field: FieldInstanceId,
 	value: ValueId
@@ -61,6 +88,9 @@ fixed union ValueOperation:
 	ConstructListValue(List[ValueId])
 	-- Selected member identity is retained for verification and C projection.
 	PayloadValue(VariantFieldInstanceId, ValueId)
+	-- A bound or statement match. The definition is the join's single
+	-- parameter: each arm that continues yields one value of its type.
+	JoinValue(LoweredJoin)
 
 
 fixed record ValueDefinition {
@@ -100,6 +130,29 @@ fixed union LoweredExit:
 	RecurValues(List[ValueId], Span)
 
 
+-- A join arm yields `value` to the join. Only a tail arm returns or loops,
+-- so a yield cannot end a function and a backedge cannot leave a join arm.
+fixed record JoinArm {
+	label: MatchLabel,
+	definitions: List[ValueDefinition],
+	value: ValueId
+}
+
+
+-- Each block's values are one consecutive interval. A join's arms follow the
+-- whole block that defines it, in join and arm order, each arm's own interval
+-- followed by its joins' arms. `reads` are the values the scrutinee and arms
+-- read from outside the arms, published with the join, inner joins first,
+-- so use analysis never walks its arms. A value may repeat: a repeated read
+-- rewrites the same last-use slot, so no deduplication is needed.
+fixed record LoweredJoin {
+	scrutinee: ValueId,
+	owner: UnionInstanceId,
+	arms: List[JoinArm],
+	reads: List[ValueId]
+}
+
+
 fixed union LoweredTail:
 	ExitValue(LoweredExit)
 	MatchValue(LoweredMatch)
@@ -129,11 +182,31 @@ pure func lowered_functions(program: LoweredProgram) -> LoweredFunctions:
 	from_opaque LoweredProgram(program)
 
 
+-- A join whose arms are lowered once its block is complete, so they can be
+-- numbered after it. Its value `id` is defined in the block; its arms match
+-- on `scrutinee` and see `bindings`.
+private fixed record PendingJoin {
+	id: ValueId,
+	value_type: TypeRef,
+	span: Span,
+	scrutinee: ValueId,
+	join: ConcreteJoin,
+	bindings: List[Option[ValueId]]
+}
+
+
+-- A block's definitions while it is built: complete ones, and joins whose
+-- definitions complete_joins builds once their arms are lowered.
+private fixed union BlockEntry:
+	Defined(ValueDefinition)
+	AwaitingArms(PendingJoin)
+
+
 -- This builder is confined to one expression; read-only bindings are separate.
 -- Its inherited traversal still shares a growing vector, without a block prefix.
 private fixed record ExpressionBuilder {
 	next_value: Int,
-	definitions: List[ValueDefinition]
+	entries: List[BlockEntry]
 }
 
 
@@ -162,12 +235,12 @@ private pure func define_value(
 	{
 		builder = { builder |
 			next_value = IntOps.add(builder.next_value, 1),
-			definitions = builder.definitions.append({
+			entries = builder.entries.append(Defined({
 				id = id,
 				operation = operation,
 				value_type = value_type,
 				span = span,
-			})
+			}))
 		},
 		value = id
 	}
@@ -315,18 +388,36 @@ private pure func lower_value(
 		ReadRecordField(receiver, field):
 			read ?= lower_value(builder, bindings, receiver)
 			Ok(define_value(read.builder, ReadRecordFieldValue(field, read.value), value.value_type, value.span))
+		Match(join):
+			scrutinee ?= lower_value(builder, bindings, join.scrutinee)
+			id = into_opaque ValueId(scrutinee.builder.next_value)
+			pending: PendingJoin = {
+				id = id,
+				value_type = value.value_type,
+				span = value.span,
+				scrutinee = scrutinee.value,
+				join = join,
+				bindings = bindings,
+			}
+			Ok({
+				builder = {
+					next_value = IntOps.add(scrutinee.builder.next_value, 1),
+					entries = scrutinee.builder.entries.append(AwaitingArms(pending))
+				},
+				value = id,
+			})
 
 
 private fixed record BuiltBlock {
 	next_value: Int,
-	definitions: List[ValueDefinition],
+	entries: List[BlockEntry],
 	bindings: List[Option[ValueId]]
 }
 
 
 private fixed record BuiltExit {
 	next_value: Int,
-	definitions: List[ValueDefinition],
+	entries: List[BlockEntry],
 	exit: LoweredExit
 }
 
@@ -345,6 +436,15 @@ private fixed record BuiltTail {
 
 private fixed record BuiltArm {
 	arm: LoweredArm,
+	next_value: Int
+}
+
+
+-- A lowered join arm, the values it reads from outside its own interval and
+-- the next value after it and its joins.
+private fixed record BuiltJoinArm {
+	arm: JoinArm,
+	reads: List[ValueId],
 	next_value: Int
 }
 
@@ -371,32 +471,32 @@ private pure func lower_exit(
 ) -> Result[BuiltExit, Diagnostic]:
 	match exit:
 		ReturnExpression(value):
-			result ?= lower_value({ next_value = next_value, definitions = [] }, bindings, value)
+			result ?= lower_value({ next_value = next_value, entries = [] }, bindings, value)
 			Ok({
 				next_value = result.builder.next_value,
-				definitions = result.builder.definitions,
+				entries = result.builder.entries,
 				exit = ReturnValue(result.value),
 			})
 		RecurWith(arguments, span):
 			var cursor = next_value
-			var definitions: List[ValueDefinition] = []
+			var entries: List[BlockEntry] = []
 			var values: List[ValueId] = []
 			var failure: Option[Diagnostic] = None
 			for argument in arguments:
-				match lower_value({ next_value = cursor, definitions = [] }, bindings, argument):
+				match lower_value({ next_value = cursor, entries = [] }, bindings, argument):
 					Err(error):
 						failure = Some(error)
 						break
 					Ok(result):
-						for definition in result.builder.definitions:
-							definitions = definitions.append(definition)
+						for entry in result.builder.entries:
+							entries = entries.append(entry)
 						values = values.append(result.value)
 						cursor = result.builder.next_value
 			match failure:
 				Some(error): Err(error)
 				None: Ok({
 					next_value = cursor,
-					definitions = definitions,
+					entries = entries,
 					exit = RecurValues(values, span),
 				})
 
@@ -408,20 +508,20 @@ private pure func lower_statements(
 ) -> Result[BuiltBlock, Diagnostic]:
 	var cursor = next_value
 	var values = bindings
-	var definitions: List[ValueDefinition] = []
+	var entries: List[BlockEntry] = []
 	var failure: Option[Diagnostic] = None
 	for statement in statements:
 		value = match statement:
 			InitializeBinding(_, value): value
 			ReassignBinding(_, value): value
 			DiscardExpression(value): value
-		match lower_value({ next_value = cursor, definitions = [] }, values, value):
+		match lower_value({ next_value = cursor, entries = [] }, values, value):
 			Err(error):
 				failure = Some(error)
 				break
 			Ok(result):
-				for definition in result.builder.definitions:
-					definitions = definitions.append(definition)
+				for entry in result.builder.entries:
+					entries = entries.append(entry)
 				cursor = result.builder.next_value
 				assigned = match statement:
 					InitializeBinding(id, _): Some(id)
@@ -440,29 +540,36 @@ private pure func lower_statements(
 		Some(error): Err(error)
 		None: Ok({
 			next_value = cursor,
-			definitions = definitions,
+			entries = entries,
 			bindings = values,
 		})
 
 
-private pure func lower_arm(
+-- An arm's captures: the bound scrutinee, or one payload projection per
+-- named field. Tail arms and join arms bind them alike.
+private fixed record BoundCaptures {
+	next_value: Int,
+	definitions: List[ValueDefinition],
+	bindings: List[Option[ValueId]]
+}
+
+
+private pure func bind_captures(
 	initial_value: Int,
 	outer: List[Option[ValueId]],
-	arm: ConcreteArm,
+	pattern: ConcretePattern,
 	scrutinee: ValueId,
+	span: Span,
 	bindings: List[ConcreteBinding],
 	unions: List[ConcreteUnion],
-) -> Result[BuiltArm, Diagnostic]:
+) -> Result[BoundCaptures, Diagnostic]:
 	var next_value = initial_value
 	var values = outer
 	var definitions: List[ValueDefinition] = []
 	var failure: Option[Diagnostic] = None
-	label = match arm.pattern:
-		VariantCase(id, _): VariantLabel(id)
-		_: DefaultLabel
-	match arm.pattern:
+	match pattern:
 		BindingCase(id):
-			match binding_slot(values, id, exit_span(arm.body)):
+			match binding_slot(values, id, span):
 				Ok(position): values = values.set(position, Some(scrutinee))
 				Err(error): failure = Some(error)
 		VariantCase(variant, captures):
@@ -472,7 +579,7 @@ private pure func lower_arm(
 					None:
 						void
 					Some(id):
-						field_result = variant_field(variant, position, unions, exit_span(arm.body))
+						field_result = variant_field(variant, position, unions, span)
 						binding = bindings.get(binding_number(id))
 						match field_result:
 							Err(error):
@@ -491,43 +598,155 @@ private pure func lower_arm(
 										})
 										values = values.set(binding_number(id), Some(value))
 									None:
-										failure = Some(invalid_binding(exit_span(arm.body)))
+										failure = Some(invalid_binding(span))
 										break
 				position = IntOps.add(position, 1)
 		WildcardCase:
 			void
 	match failure:
 		Some(error): Err(error)
-		None:
-			prefix ?= lower_statements(next_value, values, arm.statements)
-			result ?= lower_exit(prefix.next_value, prefix.bindings, arm.body)
-			var completed_definitions = definitions
-			for definition in prefix.definitions:
-				completed_definitions = completed_definitions.append(definition)
-			for definition in result.definitions:
-				completed_definitions = completed_definitions.append(definition)
-			Ok({
-				arm = {
-					label = label,
-					body = { definitions = completed_definitions, exit = result.exit },
-				},
-				next_value = result.next_value,
-			})
+		None: Ok({ next_value = next_value, definitions = definitions, bindings = values })
 
 
-private pure func lower_match(
+private pure func arm_label(pattern: ConcretePattern) -> MatchLabel:
+	match pattern:
+		VariantCase(id, _): VariantLabel(id)
+		_: DefaultLabel
+
+
+-- One complete block: its definitions, with its joins' arms numbered after
+-- them from `next_value`.
+private fixed record CompletedBlock {
 	next_value: Int,
-	values: List[Option[ValueId]],
+	definitions: List[ValueDefinition]
+}
+
+
+-- Builds each join's definition once its block is complete: its arms are
+-- lowered after the block, in join and arm order.
+private pure func complete_joins(
+	entries: List[BlockEntry],
+	next_value: Int,
+	bindings: List[ConcreteBinding],
+	unions: List[ConcreteUnion],
+) -> Result[CompletedBlock, Diagnostic]:
+	var definitions: List[ValueDefinition] = []
+	var cursor = next_value
+	var failure: Option[Diagnostic] = None
+	for entry in entries:
+		match entry:
+			Defined(definition):
+				definitions = definitions.append(definition)
+			AwaitingArms(join):
+				var arms: List[JoinArm] = []
+				var reads = [join.scrutinee]
+				for arm in join.join.arms:
+					match lower_join_arm(cursor, join.bindings, arm, join.scrutinee, bindings, unions):
+						Err(error):
+							failure = Some(error)
+							break
+						Ok(lowered):
+							arms = arms.append(lowered.arm)
+							reads = reads.concat(lowered.reads)
+							cursor = lowered.next_value
+				if failure.is_some():
+					break
+				definitions = definitions.append({
+					id = join.id,
+					operation = JoinValue({ scrutinee = join.scrutinee, owner = join.join.owner, arms = arms, reads = reads }),
+					value_type = join.value_type,
+					span = join.span,
+				})
+	match failure:
+		Some(error): Err(error)
+		None: Ok({ next_value = cursor, definitions = definitions })
+
+
+-- An arm's block: its captures, statements and exit definitions, in order.
+private pure func arm_block(captures: BoundCaptures, prefix: BuiltBlock, last: List[BlockEntry]) -> List[BlockEntry]:
+	var entries: List[BlockEntry] = []
+	for definition in captures.definitions:
+		entries = entries.append(Defined(definition))
+	for entry in prefix.entries:
+		entries = entries.append(entry)
+	for entry in last:
+		entries = entries.append(entry)
+	entries
+
+
+private pure func lower_arm(
+	initial_value: Int,
+	outer: List[Option[ValueId]],
+	arm: ConcreteArm,
+	scrutinee: ValueId,
+	bindings: List[ConcreteBinding],
+	unions: List[ConcreteUnion],
+) -> Result[BuiltArm, Diagnostic]:
+	captures ?= bind_captures(initial_value, outer, arm.pattern, scrutinee, exit_span(arm.body), bindings, unions)
+	prefix ?= lower_statements(captures.next_value, captures.bindings, arm.statements)
+	result ?= lower_exit(prefix.next_value, prefix.bindings, arm.body)
+	completed ?= complete_joins(arm_block(captures, prefix, result.entries), result.next_value, bindings, unions)
+	Ok({
+		arm = {
+			label = arm_label(arm.pattern),
+			body = { definitions = completed.definitions, exit = result.exit },
+		},
+		next_value = completed.next_value,
+	})
+
+
+private pure func lower_join_arm(
+	initial_value: Int,
+	outer: List[Option[ValueId]],
+	arm: ConcreteJoinArm,
+	scrutinee: ValueId,
+	bindings: List[ConcreteBinding],
+	unions: List[ConcreteUnion],
+) -> Result[BuiltJoinArm, Diagnostic]:
+	captures ?= bind_captures(initial_value, outer, arm.pattern, scrutinee, arm.value.span, bindings, unions)
+	prefix ?= lower_statements(captures.next_value, captures.bindings, arm.statements)
+	result ?= lower_value({ next_value = prefix.next_value, entries = [] }, prefix.bindings, arm.value)
+	completed ?= complete_joins(arm_block(captures, prefix, result.builder.entries), result.builder.next_value, bindings, unions)
+	-- The arm's own values are [initial_value, after); its joins' reads
+	-- already exclude their arms' values.
+	after = IntOps.add(initial_value, completed.definitions.length())
+	var reads: List[ValueId] = []
+	for definition in completed.definitions:
+		for read in value_reads(definition.operation):
+			if outside_arm(read, initial_value, after):
+				reads = reads.append(read)
+	if outside_arm(result.value, initial_value, after):
+		reads = reads.append(result.value)
+	Ok({
+		arm = { label = arm_label(arm.pattern), definitions = completed.definitions, value = result.value },
+		reads = reads,
+		next_value = completed.next_value,
+	})
+
+
+private pure func outside_arm(value: ValueId, first: Int, after: Int) -> Bool:
+	ordinal = value_number(value)
+	IntOps.less_than(ordinal, first) or IntOps.greater_than_or_equal(ordinal, after)
+
+
+-- The tail match's scrutinee ends the function's block, whose joins' arms
+-- precede the tail arms.
+private pure func lower_match(
+	block: BuiltBlock,
 	matched: ConcreteMatch,
 	bindings: List[ConcreteBinding],
 	unions: List[ConcreteUnion],
 ) -> Result[BuiltMatch, Diagnostic]:
-	scrutinee ?= lower_value({ next_value = next_value, definitions = [] }, values, matched.scrutinee)
-	var cursor = scrutinee.builder.next_value
+	scrutinee ?= lower_value({ next_value = block.next_value, entries = [] }, block.bindings, matched.scrutinee)
+	var entries = block.entries
+	for entry in scrutinee.builder.entries:
+		entries = entries.append(entry)
+	completed ?= complete_joins(entries, scrutinee.builder.next_value, bindings, unions)
+	var cursor = completed.next_value
 	var arms: List[LoweredArm] = []
 	var failure: Option[Diagnostic] = None
 	for arm in matched.arms:
-		match lower_arm(cursor, values, arm, scrutinee.value, bindings, unions):
+		match lower_arm(cursor, block.bindings, arm, scrutinee.value, bindings, unions):
 			Err(error):
 				failure = Some(error)
 				break
@@ -537,7 +756,7 @@ private pure func lower_match(
 	match failure:
 		Some(error): Err(error)
 		None: Ok({
-			definitions = scrutinee.builder.definitions,
+			definitions = completed.definitions,
 			matched = { scrutinee = scrutinee.value, owner = matched.owner, arms = arms },
 		})
 
@@ -566,23 +785,28 @@ private pure func lower_function(
 				void
 		ordinal = IntOps.add(ordinal, 1)
 	prefix ?= lower_statements(next_value, values, function.statements)
+	var entries: List[BlockEntry] = []
+	for definition in parameter_definitions:
+		entries = entries.append(Defined(definition))
+	for entry in prefix.entries:
+		entries = entries.append(entry)
+	block: BuiltBlock = { prefix | entries = entries }
 	body_result: Result[BuiltTail, Diagnostic] = match function.body:
 		ConcreteValueBody(value):
 			result ?= lower_exit(prefix.next_value, prefix.bindings, value)
-			Ok({ definitions = result.definitions, tail = ExitValue(result.exit) })
+			var body_entries = block.entries
+			for entry in result.entries:
+				body_entries = body_entries.append(entry)
+			completed ?= complete_joins(body_entries, result.next_value, function.bindings, unions)
+			Ok({ definitions = completed.definitions, tail = ExitValue(result.exit) })
 		ConcreteMatchBody(matched):
-			result ?= lower_match(prefix.next_value, prefix.bindings, matched, function.bindings, unions)
+			result ?= lower_match(block, matched, function.bindings, unions)
 			Ok({ definitions = result.definitions, tail = MatchValue(result.matched) })
 	body ?= body_result
-	var definitions = parameter_definitions
-	for definition in prefix.definitions:
-		definitions = definitions.append(definition)
-	for definition in body.definitions:
-		definitions = definitions.append(definition)
 	Ok({
 		execution = function.execution,
 		signature = function.signature,
-		definitions = definitions,
+		definitions = body.definitions,
 		tail = body.tail,
 	})
 

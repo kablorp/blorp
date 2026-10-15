@@ -1,0 +1,178 @@
+-- Programs with joins and a compact rendering of their ownership operations,
+-- shared by the insertion, verification and emission suites.
+import:
+	../../src/lower/lower as Lower
+	../../src/own/own as Own
+	../../src/utils/syntax: Diagnostic
+	./managed_union_inputs: lowered
+
+
+-- `kept` is live across the join; one arm yields a fresh String, the other
+-- yields `kept`, which it must acquire again.
+PICK: String =
+	|fixed union Choice:
+	|	Yes
+	|	No
+	|pure func pick(choice: Choice) -> String:
+	|	kept = "kept"
+	|	label = match choice:
+	|		Yes: "fresh"
+	|		No: kept
+	|	label
+	|func main() -> Int:
+	|	unused = pick(Yes)
+	|	0
+	|
+
+
+-- An outer arm's `held` is live across the inner join, whose `No` arm
+-- yields it.
+NEST: String =
+	|fixed union Choice:
+	|	Yes
+	|	No
+	|pure func nest(choice: Choice) -> String:
+	|	kept = "kept"
+	|	outer = match choice:
+	|		Yes:
+	|			held = "held"
+	|			inner = match choice:
+	|				Yes: "a"
+	|				No: held
+	|			inner
+	|		No: kept
+	|	outer
+	|func main() -> Int:
+	|	unused = nest(Yes)
+	|	0
+	|
+
+
+-- The joined String is never read, so its owner drops after the join.
+MEASURE: String =
+	|fixed union Choice:
+	|	Yes
+	|	No
+	|pure func measure(choice: Choice) -> Int:
+	|	label = match choice:
+	|		Yes: "fresh"
+	|		No: "other"
+	|	0
+	|func main() -> Int:
+	|	measure(Yes)
+	|
+
+
+-- An Int join: its arms yield unmanaged values.
+COUNT: String =
+	|fixed union Choice:
+	|	Yes
+	|	No
+	|pure func count(choice: Choice) -> Int:
+	|	number = match choice:
+	|		Yes: 1
+	|		No: 2
+	|	number
+	|func main() -> Int:
+	|	count(Yes)
+	|
+
+
+pure func owned(source: String) -> Result[Own.OwnershipProgram, Diagnostic]:
+	program ?= lowered(source)
+	Own.own(program)
+
+
+-- The owned function that defines a join: the program's first such.
+pure func join_function(program: Own.OwnershipProgram) -> Option[Own.OwnedFunction]:
+	program.functions.find(pure func(function): function.operations.any(pure func(operation): is_join(operation)))
+
+
+pure func is_join(operation: Own.OwnershipOperation) -> Bool:
+	match operation:
+		Own.DefineValue(definition):
+			match definition.operation:
+				Own.JoinDefinition(_): True
+				_: False
+		_:
+			False
+
+
+private pure func transfer_text(transfer: Own.ReturnTransfer) -> String:
+	match transfer:
+		Own.UnmanagedReturn(value): "v" + Lower.value_number(value).to_string()
+		Own.OwnedReturn(value, owner): "v" + Lower.value_number(value).to_string() + "/o" + Own.owner_number(owner).to_string()
+
+
+-- One operation as text: `v1=o0` defines a value owning o0, `acquire o3(v1)`
+-- and `drop o0` change obligations, and a join lists its arms in braces.
+pure func operation_text(operation: Own.OwnershipOperation) -> String:
+	match operation:
+		Own.DefineValue(definition):
+			defined = "v" + Lower.value_number(definition.id).to_string() + match definition.result:
+				Own.OwnedResult(owner): "=o" + Own.owner_number(owner).to_string()
+				_: ""
+			match definition.operation:
+				Own.JoinDefinition(join):
+					defined + " {" + join.arms.map(pure func(arm): arm_text(arm)).join(" | ") + "}"
+				_:
+					defined
+		Own.AcquireOwner(owner, borrowed, _):
+			"acquire o" + Own.owner_number(owner).to_string() + "(v" + Lower.value_number(borrowed.value).to_string() + ")"
+		Own.DropOwner(owner, _):
+			"drop o" + Own.owner_number(owner).to_string()
+
+
+pure func operations_text(operations: List[Own.OwnershipOperation]) -> String:
+	operations.map(pure func(operation): operation_text(operation)).join(", ")
+
+
+pure func arm_text(arm: Own.OwnedJoinArm) -> String:
+	exit = "yield " + transfer_text(arm.transfer)
+	if arm.operations.is_empty():
+		exit
+	else:
+		operations_text(arm.operations) + "; " + exit
+
+
+pure func function_text(function: Own.OwnedFunction) -> String:
+	tail = match function.tail:
+		Own.ReturnTail(Own.ReturnResult(transfer)): "return " + transfer_text(transfer)
+		_: "other tail"
+	operations_text(function.operations) + "; " + tail
+
+
+-- Rewrites the arms of every join in these operations, outermost first.
+pure func map_join_arms(
+	operations: List[Own.OwnershipOperation],
+	rewrite: pure (List[Own.OwnedJoinArm]) -> List[Own.OwnedJoinArm],
+) -> List[Own.OwnershipOperation]:
+	operations.map(pure func(operation):
+		match operation:
+			Own.DefineValue(definition):
+				match definition.operation:
+					Own.JoinDefinition(join):
+						Own.DefineValue({ definition | operation = Own.JoinDefinition({ join | arms = rewrite(join.arms) }) })
+					_:
+						operation
+			_:
+				operation
+	)
+
+
+-- Replaces the join function's operations throughout the program.
+pure func with_operations(
+	program: Own.OwnershipProgram,
+	rewrite: pure (List[Own.OwnershipOperation]) -> List[Own.OwnershipOperation],
+) -> Own.OwnershipProgram:
+	{ program | functions = program.functions.map(pure func(function): rewritten(function, rewrite)) }
+
+
+private pure func rewritten(
+	function: Own.OwnedFunction,
+	rewrite: pure (List[Own.OwnershipOperation]) -> List[Own.OwnershipOperation],
+) -> Own.OwnedFunction:
+	if function.operations.any(pure func(operation): is_join(operation)):
+		{ function | operations = rewrite(function.operations) }
+	else:
+		function

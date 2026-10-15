@@ -26,12 +26,13 @@ import:
 		OwnedDefinition,
 		OwnedExit(ReturnResult, RecurArguments),
 		OwnedFunction,
+		OwnedJoin,
 		OwnedMatch,
 		OwnedTail(ReturnTail, MatchTail),
 		OwnedValueOperation(
 			ParameterDefinition, VoidDefinition, IntegerDefinition, FloatDefinition,
 			StringDefinition, CallDefinition, ConstructDefinition, ConstructListDefinition,
-			PayloadDefinition, ConstructRecordDefinition, ReadRecordFieldDefinition,
+			PayloadDefinition, ConstructRecordDefinition, ReadRecordFieldDefinition, JoinDefinition,
 		),
 		OwnerId,
 		OwnershipOperation(DefineValue, AcquireOwner, DropOwner),
@@ -231,10 +232,17 @@ private pure func union_c_type(id: UnionInstanceId, declaration: ConcreteUnion) 
 			prefix.append_int(union_number(id))
 
 
+-- Every value local is const except a join's, which its arms assign.
+private fixed union LocalAssignment:
+	InitializedLocal
+	JoinLocal
+
+
 -- A local holding a pointer is itself const, so const follows a pointer type.
 -- String, List and boxed union carriers spell their pointer in the C type.
 private pure func c_local_declaration(
 	value_type: TypeRef,
+	assignment: LocalAssignment,
 	unions: List[ConcreteUnion],
 ) -> Result[String, Diagnostic]:
 	type_name ?= c_type(value_type, unions)
@@ -254,10 +262,14 @@ private pure func c_local_declaration(
 		_:
 			Ok(False)
 	Ok(
-		if pointer_carrier:
-			type_name.concat(" const ")
-		else:
-			"const ".concat(type_name).concat(" ")
+		match assignment:
+			JoinLocal:
+				type_name.concat(" ")
+			InitializedLocal:
+				if pointer_carrier:
+					type_name.concat(" const ")
+				else:
+					"const ".concat(type_name).concat(" ")
 	)
 
 
@@ -918,9 +930,9 @@ private pure func append_operation(
 				operands = operands.append(operand)
 			value ?= c_union_value(id, operands, unions)
 			Ok(output.concat(value))
-		ConstructListDefinition(_):
-			-- append_value routes list construction to append_list_construction,
-			-- which writes statements; it never reaches this expression writer.
+		ConstructListDefinition(_) | JoinDefinition(_):
+			-- List construction and joins are written as statements, by
+			-- append_list_construction and append_join; never as expressions.
 			Err(internal_error())
 		PayloadDefinition(field, id):
 			declaration ?= unions
@@ -1009,7 +1021,7 @@ private pure func append_optional_value(
 	payload: String,
 	unions: List[ConcreteUnion],
 ) -> Result[String, Diagnostic]:
-	declaration ?= c_local_declaration(UnionType(variant_owner(option.some)), unions)
+	declaration ?= c_local_declaration(UnionType(variant_owner(option.some)), InitializedLocal, unions)
 	some ?= c_union_value(option.some, [payload], unions)
 	none ?= c_union_value(option.none, [], unions)
 	name = c_value(id)
@@ -1186,7 +1198,7 @@ private pure func append_equals(
 	right ?= arguments
 		.get(1)
 		.to_result(internal_error())
-	declaration ?= c_local_declaration(UnionType(variant_owner(boolean.true_variant)), unions)
+	declaration ?= c_local_declaration(UnionType(variant_owner(boolean.true_variant)), InitializedLocal, unions)
 	equal ?= c_union_value(boolean.true_variant, [], unions)
 	different ?= c_union_value(boolean.false_variant, [], unions)
 	name = c_value(id)
@@ -1231,7 +1243,7 @@ private pure func append_regular_value(
 	unions: List[ConcreteUnion],
 	records: List[ConcreteRecord],
 ) -> Result[String, Diagnostic]:
-	declaration ?= c_local_declaration(value_type, unions)
+	declaration ?= c_local_declaration(value_type, InitializedLocal, unions)
 	name = c_value(id)
 
 	prepared = match operation:
@@ -1266,7 +1278,7 @@ private pure func append_owner_alias(
 	unions: List[ConcreteUnion],
 ) -> Result[String, Diagnostic]:
 	name = c_owner(owner)
-	declaration ?= c_local_declaration(value_type, unions)
+	declaration ?= c_local_declaration(value_type, InitializedLocal, unions)
 
 	Ok(
 		output
@@ -1304,15 +1316,7 @@ private pure func append_owned_definition(
 
 -- Disposable owner-type projection of accepted IR; value types stay local.
 private pure func owner_types(function: OwnedFunction) -> Result[List[TypeRef], Diagnostic]:
-	var blocks = [function.operations]
-
-	match function.tail:
-		ReturnTail(_):
-			void
-		MatchTail(matched):
-			for arm in matched.arms:
-				blocks = blocks.append(arm.operations)
-
+	blocks = function_blocks(function)
 	var values: List[TypeRef] = []
 	var owners: List[TypeRef] = []
 	var failure: Option[Diagnostic] = None
@@ -1608,7 +1612,11 @@ private pure func append_ownership_operation(
 ) -> Result[String, Diagnostic]:
 	match operation:
 		DefineValue(definition):
-			append_owned_definition(output, definition, unions, records)
+			match definition.operation:
+				JoinDefinition(join):
+					append_join(output, definition, join, unions, types, records)
+				_:
+					append_owned_definition(output, definition, unions, records)
 		AcquireOwner(owner, borrowed, _):
 			value_type ?= types
 				.get(owner_number(owner))
@@ -1653,15 +1661,28 @@ private pure func append_ownership_operations(
 			Ok(fragments.join(""))
 
 
-private pure func append_arm(
+-- A switch on a match's scrutinee tag, up to its first case.
+private pure func append_switch(
 	output: String,
-	arm: OwnedArm,
-	final_default: Bool,
+	scrutinee: OwnedArgument,
+	owner: UnionInstanceId,
 	unions: List[ConcreteUnion],
-	types: List[TypeRef],
-	records: List[ConcreteRecord],
 ) -> Result[String, Diagnostic]:
-	var result = match arm.label:
+	declaration ?= unions
+		.get(union_number(owner))
+		.to_result(internal_error())
+	opening = output.concat("switch(").concat(c_value(argument_value(scrutinee)))
+
+	if has_payload(declaration):
+		Ok(opening.concat(union_member_selector(declaration)).concat("tag").concat("){"))
+	else:
+		Ok(opening.concat("){"))
+
+
+-- Without a written default the final arm is also `default`, so every path
+-- through the switch reaches an arm.
+private pure func append_case(output: String, label: MatchLabel, final_default: Bool) -> String:
+	var result = match label:
 		VariantLabel(id):
 			output
 				.concat("case ")
@@ -1673,14 +1694,58 @@ private pure func append_arm(
 	if final_default:
 		result = result.concat("default:")
 
-	body ?= append_ownership_operations(
-		result.concat("{"),
-		arm.operations,
-		unions,
-		types,
-		records,
-	)
-	Ok(append_exit(body, arm.exit).concat("}"))
+	result
+
+
+private pure func labels_have_default(labels: List[MatchLabel]) -> Bool:
+	var found = False
+	for label in labels:
+		match label:
+			DefaultLabel: found = True
+			_: void
+	found
+
+
+-- One case of a switch: its label, its operations and the statements that
+-- leave it.
+private fixed record SwitchCase {
+	label: MatchLabel,
+	operations: List[OwnershipOperation],
+	ending: String
+}
+
+
+-- A switch's cases after its opening, then its closing brace.
+private pure func append_cases(
+	opening: String,
+	cases: List[SwitchCase],
+	unions: List[ConcreteUnion],
+	types: List[TypeRef],
+	records: List[ConcreteRecord],
+) -> Result[String, Diagnostic]:
+	var fragments: List[String] = [opening]
+	var labels: List[MatchLabel] = []
+
+	for switch_case in cases:
+		labels = labels.append(switch_case.label)
+
+	has_default = labels_have_default(labels)
+	var position: Int = 0
+	var failure: Option[Diagnostic] = None
+
+	for switch_case in cases:
+		final_default = not has_default and IntOps.equals(IntOps.add(position, 1), cases.length())
+		match append_ownership_operations(append_case("", switch_case.label, final_default).concat("{"), switch_case.operations, unions, types, records):
+			Err(error):
+				failure = Some(error)
+				break
+			Ok(body):
+				fragments = fragments.append(body.concat(switch_case.ending).concat("}"))
+		position = IntOps.add(position, 1)
+
+	match failure:
+		Some(error): Err(error)
+		None: Ok(fragments.append("}").join(""))
 
 
 private pure func append_match(
@@ -1689,50 +1754,42 @@ private pure func append_match(
 	types: List[TypeRef],
 	records: List[ConcreteRecord],
 ) -> Result[String, Diagnostic]:
-	declaration ?= unions
-		.get(union_number(matched.owner))
-		.to_result(internal_error())
-	opening = "switch(".concat(c_value(argument_value(matched.scrutinee)))
-	var fragments: List[String] = [opening]
-
-	if has_payload(declaration):
-		fragments = fragments.append(union_member_selector(declaration).concat("tag"))
-
-	fragments = fragments.append("){")
-	var has_default = False
-
+	opening ?= append_switch("", matched.scrutinee, matched.owner, unions)
+	var cases: List[SwitchCase] = []
 	for arm in matched.arms:
-		match arm.label:
-			DefaultLabel:
-				has_default = True
-			_:
-				void
+		cases = cases.append({ label = arm.label, operations = arm.operations, ending = append_exit("", arm.exit) })
+	append_cases(opening, cases, unions, types, records)
 
-	var position: Int = 0
-	var failure: Option[Diagnostic] = None
 
-	for arm in matched.arms:
-		final_default = not has_default and IntOps.equals(
-			IntOps.add(position, 1),
-			matched.arms.length(),
-		)
-
-		match append_arm("", arm, final_default, unions, types, records):
-			Err(error):
-				failure = Some(error)
-				break
-			Ok(emitted):
-				fragments = fragments.append(emitted)
-
-		position = IntOps.add(position, 1)
-
-	fragments = fragments.append("}")
-
-	match failure:
-		Some(error):
-			Err(error)
-		None:
-			Ok(fragments.join(""))
+-- A join's local is declared before its switch and assigned by each arm,
+-- which then leaves the switch. A managed value moves in its owner, which
+-- the join's own owner takes over after the switch.
+private pure func append_join(
+	output: String,
+	definition: OwnedDefinition,
+	join: OwnedJoin,
+	unions: List[ConcreteUnion],
+	types: List[TypeRef],
+	records: List[ConcreteRecord],
+) -> Result[String, Diagnostic]:
+	name = c_value(definition.id)
+	declaration ?= c_local_declaration(definition.value_type, JoinLocal, unions)
+	opening ?= append_switch(output.concat(declaration).concat(name).concat(";"), join.scrutinee, join.owner, unions)
+	var cases: List[SwitchCase] = []
+	for arm in join.arms:
+		moved = match arm.transfer:
+			UnmanagedReturn(value): c_value(value)
+			OwnedReturn(_, owner): c_owner(owner)
+		cases = cases.append({ label = arm.label, operations = arm.operations, ending = name.concat("=").concat(moved).concat(";break;") })
+	switched ?= append_cases(opening, cases, unions, types, records)
+	-- Like every value local, the join's is marked used: a statement match's
+	-- Void local is assigned but never read.
+	joined = switched.concat("(void)").concat(name).concat(";")
+	match definition.result:
+		UnmanagedResult | BorrowedResult(_):
+			Ok(joined)
+		OwnedResult(owner):
+			append_owner_alias(joined, owner, definition.id, definition.value_type, unions)
 
 
 private pure func append_signature(
@@ -1933,16 +1990,9 @@ private pure func needs_runtime(program: OwnershipProgram, expected: RuntimeFeat
 	var needed = False
 
 	for function in program.functions:
-		if operations_need_runtime(function.operations, expected):
-			needed = True
-
-		match function.tail:
-			ReturnTail(_):
-				void
-			MatchTail(matched):
-				for arm in matched.arms:
-					if operations_need_runtime(arm.operations, expected):
-						needed = True
+		for block in function_blocks(function):
+			if operations_need_runtime(block, expected):
+				needed = True
 
 	needed
 
@@ -1985,16 +2035,9 @@ private pure func needs_string_runtime(program: OwnershipProgram) -> Bool:
 			if is_string(parameter):
 				needed = True
 
-		if operations_need_strings(function.operations):
-			needed = True
-
-		match function.tail:
-			ReturnTail(_):
-				void
-			MatchTail(matched):
-				for arm in matched.arms:
-					if operations_need_strings(arm.operations):
-						needed = True
+		for block in function_blocks(function):
+			if operations_need_strings(block):
+				needed = True
 
 	needed
 
@@ -2040,14 +2083,8 @@ private pure func needs_float_runtime(program: OwnershipProgram) -> Bool:
 		for parameter in function.signature.parameters:
 			needed = is_float(parameter) or needed
 
-		needed = operations_need_floats(function.operations) or needed
-
-		match function.tail:
-			ReturnTail(_):
-				void
-			MatchTail(matched):
-				for arm in matched.arms:
-					needed = operations_need_floats(arm.operations) or needed
+		for block in function_blocks(function):
+			needed = operations_need_floats(block) or needed
 
 	needed
 
@@ -2120,16 +2157,36 @@ private pure func block_list_layouts(operations: List[OwnershipOperation]) -> Li
 	layouts
 
 
--- A function's operations in order: its prefix, then each match arm. Both
--- List inventories below walk exactly these blocks.
+-- A function's blocks in the order their values and owners are numbered:
+-- its prefix, then each match arm, each block followed by its joins' arms.
+-- Owner types and every inventory below walk exactly these blocks.
 private pure func function_blocks(function: OwnedFunction) -> List[List[OwnershipOperation]]:
-	var blocks: List[List[OwnershipOperation]] = [function.operations]
+	var blocks = append_block([], function.operations)
 	match function.tail:
 		ReturnTail(_): void
 		MatchTail(matched):
 			for arm in matched.arms:
-				blocks = blocks.append(arm.operations)
+				blocks = append_block(blocks, arm.operations)
 	blocks
+
+
+private pure func append_block(
+	blocks: List[List[OwnershipOperation]],
+	operations: List[OwnershipOperation],
+) -> List[List[OwnershipOperation]]:
+	var collected = blocks.append(operations)
+	for operation in operations:
+		match operation:
+			DefineValue(definition):
+				match definition.operation:
+					JoinDefinition(join):
+						for arm in join.arms:
+							collected = append_block(collected, arm.operations)
+					_:
+						void
+			AcquireOwner(_, _, _) | DropOwner(_, _):
+				void
+	collected
 
 
 private pure func list_layouts(program: OwnershipProgram) -> List[ListLayout]:

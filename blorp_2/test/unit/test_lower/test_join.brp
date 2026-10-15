@@ -1,0 +1,190 @@
+import:
+	../../../src/lower/lower:
+		JoinArm,
+		LoweredExit(ReturnValue),
+		LoweredFunction,
+		LoweredJoin,
+		LoweredTail(ExitValue, MatchValue),
+		ValueDefinition,
+		ValueOperation(JoinValue, ParameterValue, PayloadValue, StringValue),
+		lowered_functions,
+		value_number,
+	../managed_union_inputs: lowered
+	test: TestSuite
+
+
+private SHAPE: String =
+	|fixed union Shape:
+	|	Circle(Int)
+	|	Square(Int)
+	|
+
+
+-- The first lowered function that defines a join, with that join.
+private fixed record FoundJoin {
+	function: LoweredFunction,
+	position: Int,
+	join: LoweredJoin
+}
+
+
+private pure func first_join(source: String) -> Option[FoundJoin]:
+	match lowered(source):
+		Err(_):
+			None
+		Ok(program):
+			var found: Option[FoundJoin] = None
+			for function in lowered_functions(program).functions:
+				var position = 0
+				for definition in function.definitions:
+					match definition.operation:
+						JoinValue(join):
+							if found.is_none():
+								found = Some({ function = function, position = position, join = join })
+						_:
+							void
+					position = position + 1
+			found
+
+
+private pure func ids(definitions: List[ValueDefinition]) -> List[Int]:
+	definitions.map(pure func(definition): value_number(definition.id))
+
+
+private pure func yields(arm: JoinArm) -> Int:
+	value_number(arm.value)
+
+
+private pure func projects(arm: JoinArm) -> Bool:
+	match arm.definitions:
+		[definition]:
+			match definition.operation:
+				PayloadValue(_, scrutinee):
+					value_number(scrutinee) == 0
+				_:
+					False
+		_:
+			False
+
+
+-- The join's own value keeps its place in the block, whose values stay one
+-- interval; each arm's values follow the whole block, in arm order.
+pure func test_bound_match_lowers_to_a_join_numbered_after_its_block() -> Bool:
+	source = SHAPE + "pure func width(shape: Shape) -> Int:\n\tw = match shape:\n\t\tCircle(r): r\n\t\tSquare(s): s\n\tw\nfunc main() -> Int:\n\twidth(Square(4))\n"
+	match first_join(source):
+		None:
+			False
+		Some(found):
+			returned = match found.function.tail:
+				ExitValue(ReturnValue(value)):
+					value_number(value)
+				_:
+					-1
+
+			match found.join.arms:
+				[first, second]:
+					(
+						ids(found.function.definitions) == [0, 1]
+						and found.position == 1
+						and value_number(found.join.scrutinee) == 0
+						and returned == 1
+						and ids(first.definitions) == [2]
+						and yields(first) == 2
+						and projects(first)
+						and ids(second.definitions) == [3]
+						and yields(second) == 3
+						and projects(second)
+					)
+				_:
+					False
+
+
+-- A join inside an arm numbers its own arms after that arm's interval, and
+-- the next arm of the outer join follows the nested join's arms.
+pure func test_nested_join_arms_follow_their_enclosing_arm() -> Bool:
+	source = SHAPE + "pure func width(shape: Shape) -> Int:\n\tw = match shape:\n\t\tCircle(r):\n\t\t\tinner = match shape:\n\t\t\t\tCircle(_): r\n\t\t\t\tSquare(s): s\n\t\t\tinner\n\t\tSquare(s): s\n\tw\nfunc main() -> Int:\n\twidth(Square(4))\n"
+	match first_join(source):
+		None:
+			False
+		Some(found):
+			match found.join.arms:
+				[first, second]:
+					nested = match first.definitions:
+						[_, inner]:
+							match inner.operation:
+								JoinValue(join):
+									match join.arms:
+										[left, right]:
+											(
+												value_number(inner.id) == 3
+												and yields(first) == 3
+												and ids(left.definitions) == []
+												and yields(left) == 2
+												and ids(right.definitions) == [4]
+												and yields(right) == 4
+											)
+										_:
+											False
+								_:
+									False
+						_:
+							False
+
+					ids(first.definitions) == [2, 3] and nested and ids(second.definitions) == [5]
+				_:
+					False
+
+
+-- A join in a tail match's prefix precedes the tail arms' values.
+pure func test_prefix_join_arms_precede_tail_arms() -> Bool:
+	source = SHAPE + "pure func width(shape: Shape) -> Int:\n\tw = match shape:\n\t\tCircle(r): r\n\t\tSquare(s): s\n\tmatch shape:\n\t\tCircle(_): w\n\t\tSquare(s): s\nfunc main() -> Int:\n\twidth(Square(4))\n"
+	match first_join(source):
+		None:
+			False
+		Some(found):
+			match found.function.tail:
+				MatchValue(matched):
+					match matched.arms:
+						[first, second]:
+							(
+								ids(found.function.definitions) == [0, 1]
+								and ids(first.body.definitions) == []
+								and ids(second.body.definitions) == [4]
+							)
+						_:
+							False
+				_:
+					False
+
+
+-- A statement match is a Void join whose value nothing reads.
+pure func test_statement_match_is_a_void_join() -> Bool:
+	source = "fixed union Choice:\n\tYes\n\tNo\npure func choose(choice: Choice) -> Int:\n\tmatch choice:\n\t\tYes:\n\t\t\tkept = \"yes\"\n\t\tNo: void\n\t0\nfunc main() -> Int:\n\tchoose(Yes)\n"
+	match first_join(source):
+		None:
+			False
+		Some(found):
+			match found.join.arms:
+				[first, second]:
+					stored = match first.definitions:
+						[text, unit]:
+							match text.operation:
+								StringValue(bytes): bytes == "yes" and yields(first) == value_number(unit.id)
+								_: False
+						_:
+							False
+
+					found.position == 1 and stored and second.definitions.length() == 1
+				_:
+					False
+
+
+tests: TestSuite = {
+	description = "Joins lowered from bound and statement matches",
+	tests = [
+		("bound match numbers its arms after the block", test_bound_match_lowers_to_a_join_numbered_after_its_block),
+		("nested join arms follow their enclosing arm", test_nested_join_arms_follow_their_enclosing_arm),
+		("prefix join arms precede tail arms", test_prefix_join_arms_precede_tail_arms),
+		("statement match is a Void join", test_statement_match_is_a_void_join),
+	]
+}

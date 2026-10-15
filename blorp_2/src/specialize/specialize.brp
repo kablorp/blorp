@@ -231,6 +231,7 @@ fixed union ConcreteForm:
 	ConstructVariant(VariantInstanceId, List[ConcreteExpr])
 	ConstructRecord(RecordInstanceId, List[ConcreteRecordField])
 	ConstructList(List[ConcreteExpr])
+	Match(ConcreteJoin)
 	UpdateRecord(RecordInstanceId, ConcreteRecordUpdate)
 	InvokeFunction(ConcreteCall, List[ConcreteExpr])
 	ReadRecordField(ConcreteExpr, FieldInstanceId)
@@ -275,6 +276,21 @@ fixed record ConcreteMatch {
 fixed union ConcreteExit:
 	ReturnExpression(ConcreteExpr)
 	RecurWith(List[ConcreteExpr], Span)
+
+
+-- An arm of a bound or statement match, yielding `value` to the join.
+fixed record ConcreteJoinArm {
+	pattern: ConcretePattern,
+	statements: List[ConcreteStatement],
+	value: ConcreteExpr
+}
+
+
+fixed record ConcreteJoin {
+	scrutinee: ConcreteExpr,
+	owner: UnionInstanceId,
+	arms: List[ConcreteJoinArm]
+}
 
 
 fixed union ConcreteBody:
@@ -1764,6 +1780,11 @@ private pure func append_value_types(
 		Checked.ConstructList(elements):
 			for element in elements:
 				types = append_value_types(types, element)
+		Checked.Match(join):
+			types = append_value_types(types, join.scrutinee)
+			for arm in join.arms:
+				types = types.concat(statement_types(arm.statements))
+				types = append_value_types(types, arm.value)
 		Checked.InvokeFunction(_, arguments):
 			for argument in arguments:
 				types = append_value_types(types, argument)
@@ -2232,6 +2253,10 @@ private pure func translate_expr(
 			value_type ?= concrete_type(value.value_type, substitution, unions, value.span, records)
 			values ?= translate_exprs(elements, substitution, keys, unions, records)
 			Ok({ form = ConstructList(values), value_type = value_type, span = value.span })
+		Checked.Match(join):
+			value_type ?= concrete_type(value.value_type, substitution, unions, value.span, records)
+			concrete ?= translate_join(join, substitution, keys, unions, records, value.span)
+			Ok({ form = Match(concrete), value_type = value_type, span = value.span })
 		Checked.LiteralVoid:
 			translate_leaf(LiteralVoid, value, substitution, unions, records)
 		Checked.LiteralString(text):
@@ -2318,6 +2343,47 @@ private pure func translate_pattern(
 		Checked.VariantCase(id, bindings):
 			variant ?= translate_variant(id, owner, unions, span)
 			Ok(VariantCase(variant, bindings))
+
+
+-- A non-tail match specializes exactly as the tail match does, arm by arm.
+private pure func translate_join(
+	join: Checked.CheckedJoin,
+	substitution: List[TypeSubstitution[TypeRef]],
+	keys: List[FunctionRequest],
+	unions: List[UnionInstance],
+	records: List[RecordInstance],
+	span: Span,
+) -> Result[ConcreteJoin, Diagnostic]:
+	scrutinee ?= translate_expr(join.scrutinee, substitution, keys, unions, records)
+	union_type ?= concrete_type(join.union_type, substitution, unions, span, records)
+	owner ?= concrete_union_owner(union_type, span)
+	var arms: List[ConcreteJoinArm] = []
+	var failure: Option[Diagnostic] = None
+	for arm in join.arms:
+		match translate_join_arm(arm, owner, substitution, keys, unions, records, span):
+			Err(error):
+				failure = Some(error)
+				break
+			Ok(translated):
+				arms = arms.append(translated)
+	match failure:
+		Some(error): Err(error)
+		None: Ok({ scrutinee = scrutinee, owner = owner, arms = arms })
+
+
+private pure func translate_join_arm(
+	arm: Checked.CheckedJoinArm,
+	owner: UnionInstanceId,
+	substitution: List[TypeSubstitution[TypeRef]],
+	keys: List[FunctionRequest],
+	unions: List[UnionInstance],
+	records: List[RecordInstance],
+	span: Span,
+) -> Result[ConcreteJoinArm, Diagnostic]:
+	pattern ?= translate_pattern(arm.pattern, owner, span, unions)
+	statements ?= translate_statements(arm.statements, substitution, keys, unions, records)
+	value ?= translate_expr(arm.value, substitution, keys, unions, records)
+	Ok({ pattern = pattern, statements = statements, value = value })
 
 
 private pure func translate_exit(

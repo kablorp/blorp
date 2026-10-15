@@ -14,12 +14,14 @@ import:
 		OwnedDefinition,
 		OwnedExit(ReturnResult, RecurArguments),
 		OwnedFunction,
+		OwnedJoin,
+		OwnedJoinArm,
 		OwnedMatch,
 		OwnedTail(ReturnTail, MatchTail),
 		OwnedValueOperation(
 			ParameterDefinition, VoidDefinition, IntegerDefinition, FloatDefinition,
 			StringDefinition, CallDefinition, ConstructDefinition, ConstructListDefinition,
-			PayloadDefinition, ConstructRecordDefinition, ReadRecordFieldDefinition,
+			PayloadDefinition, ConstructRecordDefinition, ReadRecordFieldDefinition, JoinDefinition,
 		),
 		OwnerId,
 		OwnershipOperation(DefineValue, AcquireOwner, DropOwner),
@@ -40,6 +42,7 @@ import:
 		RecordInstanceId,
 		RecordRepresentation(InlineRecord, ManagedRecord),
 		TypeRef(VoidType, IntType, FloatType, StringType, ListType, UnionType, RecordType),
+		UnionInstanceId,
 		UnionRepresentation(InlineUnmanaged, InlineOwningPayload, BoxedRecursive),
 		ValueOwnership(
 			NoOwnership, ManagedStringLeaf, ManagedListRoot, ManagedRecordRoot,
@@ -118,8 +121,29 @@ private fixed union OwnerState:
 	DischargedOwner
 
 
+-- One block enclosing the block being verified, as of the join or tail
+-- match that entered it: the function's prefix or an enclosing arm, with its
+-- consecutive values and owners. It is a shared view: a nested block flags
+-- the enclosing owners it discharges instead of changing it.
+private fixed record EnclosingScope {
+	first_value: Int,
+	values: List[KnownValue],
+	first_owner: Int,
+	owners: List[OwnerState]
+}
+
+
+-- Whether a block may discharge enclosing owners. A tail arm discharges the
+-- function prefix's on its way out; a join arm continues into its join, so
+-- every enclosing owner must stay live through it.
+private fixed union EnclosingDischarge:
+	MayDischargeEnclosing
+	KeepsEnclosing
+
+
 private fixed record VerificationFacts {
-	prefix_values: List[KnownValue],
+	enclosing: List[EnclosingScope],
+	enclosing_discharge: EnclosingDischarge,
 	first_value: Int,
 	values: List[KnownValue],
 	first_owner: Int,
@@ -127,9 +151,12 @@ private fixed record VerificationFacts {
 }
 
 
+-- `discharged` flags the enclosing owners discharged so far, those the block
+-- was entered with included, by owner number. A nested block shares its
+-- parent's flags until its first discharge copies them.
 private fixed record VerificationState {
 	facts: VerificationFacts,
-	prefix_owners: List[OwnerState],
+	discharged: List[Bool],
 	owners: List[OwnerState]
 }
 
@@ -151,73 +178,106 @@ private pure func value(
 			.concat(" is not defined before use"),
 	)
 	ordinal = value_number(id)
+	var entry: Option[KnownValue] = None
 
-	entry = if (
-		IntOps.greater_than_or_equal(ordinal, 0)
-		and IntOps.less_than(ordinal, state.prefix_values.length())
-	):
-		state.prefix_values.get(ordinal)
-	else if IntOps.greater_than_or_equal(ordinal, state.first_value):
-		state.values.get(IntOps.subtract(ordinal, state.first_value))
+	if IntOps.greater_than_or_equal(ordinal, state.first_value):
+		entry = state.values.get(IntOps.subtract(ordinal, state.first_value))
 	else:
-		None
+		for scope in state.enclosing:
+			if IntOps.greater_than_or_equal(ordinal, scope.first_value) and IntOps.less_than(ordinal, IntOps.add(scope.first_value, scope.values.length())):
+				entry = scope.values.get(IntOps.subtract(ordinal, scope.first_value))
+				break
 
 	entry.to_result(error)
 
 
+-- An owner's slot: an enclosing owner by ordinal, or a local one by index.
 private fixed union OwnerSlot:
-	PrefixSlot(Int)
+	EnclosingSlot(Int)
 	LocalSlot(Int)
 
 
+-- An enclosing owner's state when its block was entered.
+private pure func enclosing_owner(state: VerificationFacts, ordinal: Int) -> Option[OwnerState]:
+	var found: Option[OwnerState] = None
+	for scope in state.enclosing:
+		if IntOps.greater_than_or_equal(ordinal, scope.first_owner) and IntOps.less_than(ordinal, IntOps.add(scope.first_owner, scope.owners.length())):
+			found = scope.owners.get(IntOps.subtract(ordinal, scope.first_owner))
+			break
+	found
+
+
 private pure func owner_slot(
-	prefix_count: Int,
-	first_owner: Int,
+	state: VerificationFacts,
 	owner_count: Int,
 	id: OwnerId,
 	span: Span,
 ) -> Result[OwnerSlot, Diagnostic]:
 	ordinal = owner_number(id)
+	first_owner = state.first_owner
 
-	if IntOps.greater_than_or_equal(ordinal, 0) and IntOps.less_than(ordinal, prefix_count):
-		Ok(PrefixSlot(ordinal))
-	else if IntOps.greater_than_or_equal(ordinal, 0) and IntOps.less_than(ordinal, first_owner):
-		Err(
-			failure(
-				span,
-				"owner "
-					.append_int(ordinal)
-					.concat(" is not available in this match arm"),
-			),
-		)
-	else if IntOps.greater_than_or_equal(ordinal, first_owner) and IntOps.less_than(
-		ordinal,
-		IntOps.add(first_owner, owner_count),
-	):
-		Ok(LocalSlot(IntOps.subtract(ordinal, first_owner)))
-	else:
-		Err(
-			failure(
-				span,
-				"owner "
-					.append_int(ordinal)
-					.concat(" is not defined"),
-			),
-		)
+	match enclosing_owner(state, ordinal):
+		Some(_):
+			Ok(EnclosingSlot(ordinal))
+		None:
+			if IntOps.greater_than_or_equal(ordinal, 0) and IntOps.less_than(ordinal, first_owner):
+				Err(
+					failure(
+						span,
+						"owner "
+							.append_int(ordinal)
+							.concat(" is not available in this match arm"),
+					),
+				)
+			else if IntOps.greater_than_or_equal(ordinal, first_owner) and IntOps.less_than(
+				ordinal,
+				IntOps.add(first_owner, owner_count),
+			):
+				Ok(LocalSlot(IntOps.subtract(ordinal, first_owner)))
+			else:
+				Err(
+					failure(
+						span,
+						"owner "
+							.append_int(ordinal)
+							.concat(" is not defined"),
+					),
+				)
+
+
+private pure func discharged_already(discharged: List[Bool], ordinal: Int) -> Bool:
+	match discharged.get(ordinal):
+		Some(flag): flag
+		None: False
+
+
+-- Discharges enclosing owner `ordinal`, which only a block that may do so can.
+private pure func discharge(state: VerificationFacts, discharged: List[Bool], ordinal: Int, span: Span) -> Result[List[Bool], Diagnostic]:
+	match state.enclosing_discharge:
+		KeepsEnclosing:
+			Err(failure(span, "owner ".append_int(ordinal).concat(" is discharged before its join")))
+		MayDischargeEnclosing:
+			var flags = discharged
+			while IntOps.less_than(flags.length(), IntOps.add(ordinal, 1)):
+				flags = flags.append(False)
+			Ok(flags.set(ordinal, True))
 
 
 private pure func owner(
-	prefix_owners: List[OwnerState],
-	first_owner: Int,
+	state: VerificationFacts,
+	discharged: List[Bool],
 	owners: List[OwnerState],
 	id: OwnerId,
 	span: Span,
 ) -> Result[OwnerState, Diagnostic]:
-	slot ?= owner_slot(prefix_owners.length(), first_owner, owners.length(), id, span)
+	slot ?= owner_slot(state, owners.length(), id, span)
 
 	entry = match slot:
-		PrefixSlot(index):
-			prefix_owners.get(index)
+		EnclosingSlot(ordinal):
+			if discharged_already(discharged, ordinal):
+				Some(DischargedOwner)
+			else:
+				enclosing_owner(state, ordinal)
 		LocalSlot(index):
 			owners.get(index)
 
@@ -269,7 +329,7 @@ private pure func verify_borrow(
 	borrow: BorrowedValue,
 	state: VerificationFacts,
 	span: Span,
-	prefix_owners: List[OwnerState],
+	discharged: List[Bool],
 	owners: List[OwnerState],
 ) -> Result[Void, Diagnostic]:
 	borrowed ?= value(state, borrow.value, span)
@@ -294,7 +354,7 @@ private pure func verify_borrow(
 			else:
 				Err(failure(span, "parameter borrow does not refer to the borrowed parameter"))
 		OwnerBorrow(id):
-			entry ?= owner(prefix_owners, state.first_owner, owners, id, span)
+			entry ?= owner(state, discharged, owners, id, span)
 
 			match entry:
 				DischargedOwner:
@@ -335,7 +395,7 @@ private pure func verify_borrow(
 			)
 
 			if IntOps.equals(value_number(ancestor.value), value_number(parent)):
-				verify_borrow(ancestor, state, span, prefix_owners, owners)
+				verify_borrow(ancestor, state, span, discharged, owners)
 			else:
 				Err(failure(span, "payload borrow has the wrong parent value"))
 
@@ -429,7 +489,7 @@ private pure func verify_argument(
 	unions: List[ConcreteUnion],
 	span: Span,
 	records: List[ConcreteRecord],
-	prefix_owners: List[OwnerState],
+	discharged: List[Bool],
 	owners: List[OwnerState],
 ) -> Result[Void, Diagnostic]:
 	id = match argument:
@@ -458,7 +518,7 @@ private pure func verify_argument(
 							),
 						)
 			BorrowedArgument(borrow):
-				verify_borrow(borrow, state, span, prefix_owners, owners)
+				verify_borrow(borrow, state, span, discharged, owners)
 
 
 private pure func verify_arguments(
@@ -468,7 +528,7 @@ private pure func verify_arguments(
 	unions: List[ConcreteUnion],
 	span: Span,
 	records: List[ConcreteRecord],
-	prefix_owners: List[OwnerState],
+	discharged: List[Bool],
 	owners: List[OwnerState],
 ) -> Result[Void, Diagnostic]:
 	if IntOps.less_than(arguments.length(), parameters.length()):
@@ -492,7 +552,7 @@ private pure func verify_arguments(
 						unions,
 						span,
 						records,
-						prefix_owners,
+						discharged,
 						owners,
 					):
 						Err(error):
@@ -975,7 +1035,7 @@ private pure func operation_type(
 	unions: List[ConcreteUnion],
 	projection: ProjectionContext,
 	records: List[ConcreteRecord],
-	prefix_owners: List[OwnerState],
+	discharged: List[Bool],
 	owners: List[OwnerState],
 ) -> Result[TypeRef, Diagnostic]:
 	match definition.operation:
@@ -1062,7 +1122,7 @@ private pure func operation_type(
 				unions,
 				definition.span,
 				records,
-				prefix_owners,
+				discharged,
 				owners,
 			)
 			record_field_type(field, owner, layout, definition.span)
@@ -1105,7 +1165,7 @@ private pure func operation_type(
 				unions,
 				definition.span,
 				records,
-				prefix_owners,
+				discharged,
 				owners,
 			)
 
@@ -1151,6 +1211,18 @@ private pure func operation_type(
 			match error:
 				Some(error): Err(error)
 				None: Ok(definition.value_type)
+		JoinDefinition(join):
+			scrutinee ?= value(state, argument_value(join.scrutinee), definition.span)
+			belongs ?= if same_type(scrutinee.value_type, UnionType(join.owner)):
+				Ok(void)
+			else:
+				Err(failure(definition.span, "join scrutinee does not belong to its union"))
+			var labels: List[MatchLabel] = []
+			for arm in join.arms:
+				labels = labels.append(arm.label)
+			covered ?= verify_match_labels(join.owner, labels, unions, definition.span)
+			live ?= verify_match_argument(join.scrutinee, state, unions, records, definition.span, discharged, owners)
+			Ok(definition.value_type)
 		PayloadDefinition(field, source):
 			selected = variant_field_variant(field)
 			scrutinee ?= value(state, source, definition.span)
@@ -1182,7 +1254,7 @@ private pure func operation_type(
 							unions,
 							records,
 							definition.span,
-							prefix_owners,
+							discharged,
 							owners,
 						)
 						Ok(payload_type)
@@ -1198,7 +1270,7 @@ private pure func operation_type(
 -- Owner slots after every stored payload of one construction discharged its
 -- obligation into storage; variants, list literals and records share it.
 private fixed record DischargedOwners {
-	prefix_owners: List[OwnerState],
+	discharged: List[Bool],
 	owners: List[OwnerState]
 }
 
@@ -1206,32 +1278,37 @@ private fixed record DischargedOwners {
 private pure func discharge_payloads(
 	payloads: List[StoredPayload],
 	state: VerificationFacts,
-	prefix_owners: List[OwnerState],
+	discharged: List[Bool],
 	owners: List[OwnerState],
 	unions: List[ConcreteUnion],
 	records: List[ConcreteRecord],
 	span: Span,
 ) -> Result[DischargedOwners, Diagnostic]:
-	var prefix = prefix_owners
+	var enclosing = discharged
 	var local = owners
 	var failure_slot: Option[Diagnostic] = None
 	for payload in payloads:
-		match stored_payload_transfer(payload, state, prefix, local, unions, records, span):
+		match stored_payload_transfer(payload, state, enclosing, local, unions, records, span):
 			Err(error):
 				failure_slot = Some(error)
 				break
-			Ok(Some(PrefixSlot(index))): prefix = prefix.set(index, DischargedOwner)
+			Ok(Some(EnclosingSlot(ordinal))):
+				match discharge(state, enclosing, ordinal, span):
+					Ok(flags): enclosing = flags
+					Err(error):
+						failure_slot = Some(error)
+						break
 			Ok(Some(LocalSlot(index))): local = local.set(index, DischargedOwner)
 			Ok(None): void
 	match failure_slot:
 		Some(error): Err(error)
-		None: Ok({ prefix_owners = prefix, owners = local })
+		None: Ok({ discharged = enclosing, owners = local })
 
 
 private pure func stored_payload_transfer(
 	payload: StoredPayload,
 	state: VerificationFacts,
-	prefix_owners: List[OwnerState],
+	discharged: List[Bool],
 	owners: List[OwnerState],
 	unions: List[ConcreteUnion],
 	records: List[ConcreteRecord],
@@ -1260,7 +1337,7 @@ private pure func stored_payload_transfer(
 				_:
 					Ok(void)
 
-			entry ?= owner(prefix_owners, state.first_owner, owners, transferred, span)
+			entry ?= owner(state, discharged, owners, transferred, span)
 
 			match entry:
 				DischargedOwner:
@@ -1268,8 +1345,7 @@ private pure func stored_payload_transfer(
 				ActiveOwner(owned):
 					if IntOps.equals(value_number(value), value_number(owned)):
 						owner_slot(
-							prefix_owners.length(),
-							state.first_owner,
+							state,
 							owners.length(),
 							transferred,
 							span,
@@ -1354,7 +1430,7 @@ private pure func verify_definition_result(
 									"managed projection requires its parent borrow",
 								),
 							)
-				StringDefinition(_) | CallDefinition(_, _) | ConstructDefinition(_, _) | ConstructListDefinition(_) | ConstructRecordDefinition(_, _):
+				StringDefinition(_) | CallDefinition(_, _) | ConstructDefinition(_, _) | ConstructListDefinition(_) | ConstructRecordDefinition(_, _) | JoinDefinition(_):
 					match definition.result:
 						OwnedResult(owner):
 							Ok(Some(owner))
@@ -1372,12 +1448,12 @@ private pure func verify_match_argument(
 	unions: List[ConcreteUnion],
 	records: List[ConcreteRecord],
 	span: Span,
-	prefix_owners: List[OwnerState],
+	discharged: List[Bool],
 	owners: List[OwnerState],
 ) -> Result[Void, Diagnostic]:
 	match argument:
 		BorrowedArgument(borrow):
-			verify_borrow(borrow, state, span, prefix_owners, owners)
+			verify_borrow(borrow, state, span, discharged, owners)
 		UnmanagedArgument(id):
 			known ?= value(state, id, span)
 			plan ?= value_ownership(known.value_type, unions, records)
@@ -1414,7 +1490,7 @@ private pure func verify_definition_type(
 	unions: List[ConcreteUnion],
 	projection: ProjectionContext,
 	records: List[ConcreteRecord],
-	prefix_owners: List[OwnerState],
+	discharged: List[Bool],
 	owners: List[OwnerState],
 ) -> Result[Void, Diagnostic]:
 	if IntOps.not_equals(
@@ -1434,7 +1510,7 @@ private pure func verify_definition_type(
 			unions,
 			projection,
 			records,
-			prefix_owners,
+			discharged,
 			owners,
 		)
 
@@ -1447,11 +1523,11 @@ private pure func verify_definition_type(
 private pure func verified_drop(
 	id: OwnerId,
 	span: Span,
-	prefix_owners: List[OwnerState],
-	first_owner: Int,
+	state: VerificationFacts,
+	discharged: List[Bool],
 	owners: List[OwnerState],
 ) -> Result[OwnerSlot, Diagnostic]:
-	entry ?= owner(prefix_owners, first_owner, owners, id, span)
+	entry ?= owner(state, discharged, owners, id, span)
 
 	match entry:
 		DischargedOwner:
@@ -1464,12 +1540,28 @@ private pure func verified_drop(
 				),
 			)
 		ActiveOwner(_):
-			owner_slot(prefix_owners.length(), first_owner, owners.length(), id, span)
+			owner_slot(state, owners.length(), id, span)
+
+
+-- A join whose arms are verified after its block, as they are numbered:
+-- each arm starts from `start`, the block's state just before the join.
+private fixed record PendingJoin {
+	join: OwnedJoin,
+	value_type: TypeRef,
+	span: Span,
+	start: VerificationState
+}
+
+
+private fixed record VerifiedBlock {
+	state: VerificationState,
+	pending: List[PendingJoin]
+}
 
 
 -- Owner vectors belong to this traversal, not the per-definition facts carrier.
--- Each selected arm may make one initial copy of its prefix snapshot; subsequent
--- discharges consume the uniquely held local vectors.
+-- Enclosing owners are shared views: a block records the ones it discharges,
+-- and its local owner vector stays uniquely held.
 private pure func verify_operations(
 	operations: List[OwnershipOperation],
 	initial: VerificationState,
@@ -1478,15 +1570,27 @@ private pure func verify_operations(
 	unions: List[ConcreteUnion],
 	projection: ProjectionContext,
 	records: List[ConcreteRecord],
-) -> Result[VerificationState, Diagnostic]:
-	var prefix_owners = initial.prefix_owners
+) -> Result[VerifiedBlock, Diagnostic]:
+	var discharged = initial.discharged
 	var owners = initial.owners
 	var state = initial.facts
+	var pending: List[PendingJoin] = []
 	var invalid: Option[Diagnostic] = None
 
 	for operation in operations:
 		checked: Result[Void, Diagnostic] = match operation:
 			DefineValue(definition):
+				match definition.operation:
+					JoinDefinition(join):
+						pending = pending.append({
+							join = join,
+							value_type = definition.value_type,
+							span = definition.span,
+							start = { facts = state, discharged = discharged, owners = owners },
+						})
+					_:
+						void
+
 				match verify_definition_type(
 					definition,
 					state,
@@ -1495,7 +1599,7 @@ private pure func verify_operations(
 					unions,
 					projection,
 					records,
-					prefix_owners,
+					discharged,
 					owners,
 				):
 					Err(error):
@@ -1503,28 +1607,28 @@ private pure func verify_operations(
 					Ok(_):
 						stored: Result[Void, Diagnostic] = match definition.operation:
 							ConstructListDefinition(payloads):
-								match discharge_payloads(payloads, state, prefix_owners, owners, unions, records, definition.span):
+								match discharge_payloads(payloads, state, discharged, owners, unions, records, definition.span):
 									Err(error): Err(error)
-									Ok(discharged):
-										prefix_owners = discharged.prefix_owners
-										owners = discharged.owners
+									Ok(moved):
+										discharged = moved.discharged
+										owners = moved.owners
 										Ok(void)
 							ConstructDefinition(_, payloads):
-								match discharge_payloads(payloads, state, prefix_owners, owners, unions, records, definition.span):
+								match discharge_payloads(payloads, state, discharged, owners, unions, records, definition.span):
 									Err(error): Err(error)
-									Ok(discharged):
-										prefix_owners = discharged.prefix_owners
-										owners = discharged.owners
+									Ok(moved):
+										discharged = moved.discharged
+										owners = moved.owners
 										Ok(void)
 							ConstructRecordDefinition(_, fields):
 								var payloads: List[StoredPayload] = []
 								for field in fields:
 									payloads = payloads.append(field.value)
-								match discharge_payloads(payloads, state, prefix_owners, owners, unions, records, definition.span):
+								match discharge_payloads(payloads, state, discharged, owners, unions, records, definition.span):
 									Err(error): Err(error)
-									Ok(discharged):
-										prefix_owners = discharged.prefix_owners
-										owners = discharged.owners
+									Ok(moved):
+										discharged = moved.discharged
+										owners = moved.owners
 										Ok(void)
 							_:
 								Ok(void)
@@ -1579,7 +1683,7 @@ private pure func verify_operations(
 												}
 												Ok(void)
 			AcquireOwner(id, borrow, span):
-				match verify_borrow(borrow, state, span, prefix_owners, owners):
+				match verify_borrow(borrow, state, span, discharged, owners):
 					Err(error):
 						Err(error)
 					Ok(_):
@@ -1590,16 +1694,18 @@ private pure func verify_operations(
 								owners = owners.append(ActiveOwner(borrow.value))
 								Ok(void)
 			DropOwner(id, span):
-				match verified_drop(id, span, prefix_owners, state.first_owner, owners):
+				match verified_drop(id, span, state, discharged, owners):
 					Err(error):
 						Err(error)
-					Ok(slot):
-						match slot:
-							PrefixSlot(index):
-								prefix_owners = prefix_owners.set(index, DischargedOwner)
-							LocalSlot(index):
-								owners = owners.set(index, DischargedOwner)
-
+					Ok(EnclosingSlot(ordinal)):
+						match discharge(state, discharged, ordinal, span):
+							Err(error):
+								Err(error)
+							Ok(flags):
+								discharged = flags
+								Ok(void)
+					Ok(LocalSlot(index)):
+						owners = owners.set(index, DischargedOwner)
 						Ok(void)
 
 		match checked:
@@ -1614,16 +1720,26 @@ private pure func verify_operations(
 			Err(error)
 		None:
 			Ok({
-				facts = state,
-				prefix_owners = prefix_owners,
-				owners = owners,
+				state = {
+					facts = state,
+					discharged = discharged,
+					owners = owners,
+				},
+				pending = pending,
 			})
+
+
+-- The edge a block leaves by, which names an owner it leaves live.
+private fixed union ExitEdge:
+	ReturnEdge
+	YieldEdge
 
 
 private pure func complete_owners(
 	owners: List[OwnerState],
 	first_owner: Int,
 	excluded: Option[OwnerId],
+	edge: ExitEdge,
 	span: Span,
 ) -> Result[Void, Diagnostic]:
 	var position = first_owner
@@ -1653,9 +1769,41 @@ private pure func complete_owners(
 					span,
 					"owner "
 						.append_int(id)
-						.concat(" remains live at return"),
+						.concat(
+							match edge:
+								ReturnEdge: " remains live at return"
+								YieldEdge: " remains live at yield"
+						),
 				),
 			)
+		None:
+			Ok(void)
+
+
+-- Every enclosing owner, function prefix and enclosing arms alike, is
+-- discharged when the function returns from a nested block.
+private pure func complete_enclosing(
+	state: VerificationState,
+	excluded: Option[OwnerId],
+	span: Span,
+) -> Result[Void, Diagnostic]:
+	var failure_owner: Option[Int] = None
+	for scope in state.facts.enclosing:
+		var ordinal = scope.first_owner
+		for entry in scope.owners:
+			match entry:
+				ActiveOwner(_):
+					transferred = match excluded:
+						Some(id): IntOps.equals(owner_number(id), ordinal)
+						None: False
+					if failure_owner.is_none() and not transferred and not discharged_already(state.discharged, ordinal):
+						failure_owner = Some(ordinal)
+				DischargedOwner:
+					void
+			ordinal = IntOps.add(ordinal, 1)
+	match failure_owner:
+		Some(id):
+			Err(failure(span, "owner ".append_int(id).concat(" remains live at return")))
 		None:
 			Ok(void)
 
@@ -1696,8 +1844,8 @@ private pure func verify_return(
 						Err(failure(result.span, "managed return requires an owner transfer"))
 					Some(id):
 						entry ?= owner(
-							state.prefix_owners,
-							state.facts.first_owner,
+							state.facts,
+							state.discharged,
 							state.owners,
 							id,
 							result.span,
@@ -1725,8 +1873,8 @@ private pure func verify_return(
 									)
 
 		transferred ?= ownership_result
-		prefix ?= complete_owners(state.prefix_owners, 0, returned_owner, result.span)
-		complete_owners(state.owners, state.facts.first_owner, returned_owner, result.span)
+		prefix ?= complete_enclosing(state, returned_owner, result.span)
+		complete_owners(state.owners, state.facts.first_owner, returned_owner, ReturnEdge, result.span)
 
 
 private pure func verify_transfer(
@@ -1805,7 +1953,7 @@ private pure func verify_exit(
 				Some(error):
 					Err(error)
 				None:
-					complete_owners(state.owners, state.facts.first_owner, None, span)
+					complete_owners(state.owners, state.facts.first_owner, None, ReturnEdge, span)
 
 
 private pure func is_backedge(exit: OwnedExit) -> Bool:
@@ -1855,6 +2003,12 @@ private pure func verify_loop_operations(
 									)
 							RuntimeFunction(_):
 								void
+					JoinDefinition(join):
+						for arm in join.arms:
+							if invalid.is_none():
+								match verify_loop_operations(arm.operations, current, unions, records):
+									Err(error): invalid = Some(error)
+									Ok(_): void
 					_:
 						void
 			AcquireOwner(_, _, span):
@@ -1934,18 +2088,19 @@ private pure func verify_execution(
 -- OwnershipProgram is public raw data: its reconstructed arms do not retain
 -- checking's sealed proof of coverage and usefulness. Re-establish that proof
 -- here so emission can project the accepted labels without repairing them.
-private pure func verify_match_arms(
-	matched: OwnedMatch,
+private pure func verify_match_labels(
+	owner: UnionInstanceId,
+	labels: List[MatchLabel],
 	unions: List[ConcreteUnion],
 	span: Span,
 ) -> Result[Void, Diagnostic]:
-	nonempty ?= if IntOps.equals(matched.arms.length(), 0):
+	nonempty ?= if IntOps.equals(labels.length(), 0):
 		Err(failure(span, "match has no arms"))
 	else:
 		Ok(void)
 
 	declaration ?= unions
-		.get(union_number(matched.owner))
+		.get(union_number(owner))
 		.to_result(failure(span, "unknown match union"))
 	var seen: List[Bool] = []
 
@@ -1956,8 +2111,8 @@ private pure func verify_match_arms(
 	var has_default = False
 	var invalid: Option[Diagnostic] = None
 
-	for arm in matched.arms:
-		match arm.label:
+	for label in labels:
+		match label:
 			DefaultLabel:
 				if has_default:
 					invalid = Some(failure(span, "match default appears more than once"))
@@ -1968,7 +2123,7 @@ private pure func verify_match_arms(
 				else:
 					has_default = True
 			VariantLabel(id):
-				if IntOps.not_equals(union_number(variant_owner(id)), union_number(matched.owner)):
+				if IntOps.not_equals(union_number(variant_owner(id)), union_number(owner)):
 					invalid = Some(failure(span, "match variant belongs to another union"))
 					break
 				else:
@@ -2004,10 +2159,151 @@ private pure func verify_match_arms(
 				Ok(void)
 
 
+-- A nested block's starting state: the enclosing block's state `start`
+-- becomes one more enclosing scope, shared rather than copied, and its own
+-- values and owners begin at the given ordinals. Sibling ordinal gaps never
+-- become visible.
+private pure func enter(
+	start: VerificationState,
+	first_value: Int,
+	first_owner: Int,
+	enclosing_discharge: EnclosingDischarge,
+) -> VerificationState:
+	facts = start.facts
+	{
+		facts = { facts |
+			enclosing = facts.enclosing.append({
+				first_value = facts.first_value,
+				values = facts.values,
+				first_owner = facts.first_owner,
+				owners = start.owners
+			}),
+			enclosing_discharge = enclosing_discharge,
+			first_value = first_value,
+			values = [],
+			first_owner = first_owner
+		},
+		discharged = start.discharged,
+		owners = []
+	}
+
+
+-- The ordinals after a block and the joins nested in it.
+private fixed record BlockEnd {
+	next_value: Int,
+	next_owner: Int
+}
+
+
+private pure func block_end(state: VerificationState) -> BlockEnd:
+	{
+		next_value = IntOps.add(state.facts.first_value, state.facts.values.length()),
+		next_owner = IntOps.add(state.facts.first_owner, state.owners.length())
+	}
+
+
+-- A yield moves the joined value into the join's own definition. It may
+-- move only an owner made in its arm, and must have discharged the arm's
+-- other owners. Every enclosing owner is still live: a join arm cannot
+-- discharge one, so all edges into the join agree.
+private pure func verify_yield(
+	transfer: ReturnTransfer,
+	state: VerificationState,
+	join_type: TypeRef,
+	unions: List[ConcreteUnion],
+	records: List[ConcreteRecord],
+	span: Span,
+) -> Result[Void, Diagnostic]:
+	yielded = match transfer:
+		UnmanagedReturn(value): value
+		OwnedReturn(value, _): value
+	moved = match transfer:
+		UnmanagedReturn(_): None
+		OwnedReturn(_, owner): Some(owner)
+	known ?= value(state.facts, yielded, span)
+	matching ?= if same_type(known.value_type, join_type):
+		Ok(void)
+	else:
+		Err(failure(span, "yield type does not match its join"))
+	plan ?= value_ownership(join_type, unions, records)
+	transferred: Result[Void, Diagnostic] = match plan:
+		NoOwnership:
+			match moved:
+				None: Ok(void)
+				Some(_): Err(failure(span, "unmanaged yield cannot transfer an owner"))
+		ManagedStringLeaf | ManagedListRoot | ManagedRecordRoot(_) | InlineOwnedFields(_) | ManagedUnionRoot(_):
+			match moved:
+				None:
+					Err(failure(span, "managed yield requires an owner transfer"))
+				Some(id):
+					slot ?= owner_slot(state.facts, state.owners.length(), id, span)
+					match slot:
+						EnclosingSlot(_):
+							Err(failure(span, "yield must transfer an owner made in its arm, not owner ".append_int(owner_number(id))))
+						LocalSlot(_):
+							entry ?= owner(state.facts, state.discharged, state.owners, id, span)
+							match entry:
+								ActiveOwner(owned):
+									if IntOps.equals(value_number(owned), value_number(yielded)):
+										Ok(void)
+									else:
+										Err(failure(span, "yielded owner does not own the yielded value"))
+								DischargedOwner:
+									Err(failure(span, "yield refers to discharged owner ".append_int(owner_number(id))))
+	moved_owner ?= transferred
+	complete_owners(state.owners, state.facts.first_owner, moved, YieldEdge, span)
+
+
+-- Verifies every pending join's arms after their block, in the order their
+-- values and owners are numbered, and returns the ordinals after them.
+private pure func verify_joins(
+	pending: List[PendingJoin],
+	end: BlockEnd,
+	signature: FunctionSignature,
+	functions: List[OwnedFunction],
+	unions: List[ConcreteUnion],
+	records: List[ConcreteRecord],
+) -> Result[BlockEnd, Diagnostic]:
+	var cursor = end
+	var invalid: Option[Diagnostic] = None
+	for join in pending:
+		for arm in join.join.arms:
+			match verify_join_arm(arm, join, cursor, signature, functions, unions, records):
+				Err(error):
+					invalid = Some(error)
+					break
+				Ok(after):
+					cursor = after
+		if invalid.is_some():
+			break
+	match invalid:
+		Some(error): Err(error)
+		None: Ok(cursor)
+
+
+private pure func verify_join_arm(
+	arm: OwnedJoinArm,
+	join: PendingJoin,
+	cursor: BlockEnd,
+	signature: FunctionSignature,
+	functions: List[OwnedFunction],
+	unions: List[ConcreteUnion],
+	records: List[ConcreteRecord],
+) -> Result[BlockEnd, Diagnostic]:
+	start = enter(join.start, cursor.next_value, cursor.next_owner, KeepsEnclosing)
+	projection = match arm.label:
+		DefaultLabel: NoProjection
+		VariantLabel(id): PayloadProjection(join.join.scrutinee, id)
+	verified ?= verify_operations(arm.operations, start, signature, functions, unions, projection, records)
+	left ?= verify_yield(arm.transfer, verified.state, join.value_type, unions, records, join.span)
+	verify_joins(verified.pending, block_end(verified.state), signature, functions, unions, records)
+
+
 private pure func verify_match(
 	matched: OwnedMatch,
 	execution: FunctionExecution,
 	state: VerificationState,
+	end: BlockEnd,
 	signature: FunctionSignature,
 	functions: List[OwnedFunction],
 	unions: List[ConcreteUnion],
@@ -2026,33 +2322,26 @@ private pure func verify_match(
 	if not same_type(scrutinee.value_type, UnionType(matched.owner)):
 		Err(failure(scrutinee.span, "match scrutinee does not belong to its union"))
 	else:
-		valid_arms ?= verify_match_arms(matched, unions, scrutinee.span)
+		var labels: List[MatchLabel] = []
+		for arm in matched.arms:
+			labels = labels.append(arm.label)
+		valid_arms ?= verify_match_labels(matched.owner, labels, unions, scrutinee.span)
 		live ?= verify_match_argument(
 			matched.scrutinee,
 			state.facts,
 			unions,
 			records,
 			scrutinee.span,
-			state.prefix_owners,
+			state.discharged,
 			state.owners,
 		)
-		var next_value = IntOps.add(state.facts.first_value, state.facts.values.length())
-		var next_owner = IntOps.add(state.facts.first_owner, state.owners.length())
+		var cursor = end
 		var invalid: Option[Diagnostic] = None
 
 		-- Each selected arm receives an independent prefix snapshot and a disjoint
-		-- local owner interval. Sibling ordinal gaps never become visible.
+		-- local owner interval, after the previous arm and its joins.
 		for arm in matched.arms:
-			branch_start: VerificationState = {
-				facts = { state.facts |
-					prefix_values = state.facts.values,
-					first_value = next_value,
-					values = [],
-					first_owner = next_owner
-				},
-				prefix_owners = state.owners,
-				owners = []
-			}
+			branch_start = enter(state, cursor.next_value, cursor.next_owner, MayDischargeEnclosing)
 
 			projection = match arm.label:
 				DefaultLabel:
@@ -2073,19 +2362,17 @@ private pure func verify_match(
 					invalid = Some(error)
 					break
 				Ok(branch):
-					match verify_exit(arm.exit, branch, signature, execution, unions, records):
-						Ok(_):
-							next_value = IntOps.add(
-								branch.facts.first_value,
-								branch.facts.values.length(),
-							)
-							next_owner = IntOps.add(
-								branch.facts.first_owner,
-								branch.owners.length(),
-							)
+					match verify_exit(arm.exit, branch.state, signature, execution, unions, records):
 						Err(error):
 							invalid = Some(error)
 							break
+						Ok(_):
+							match verify_joins(branch.pending, block_end(branch.state), signature, functions, unions, records):
+								Ok(after):
+									cursor = after
+								Err(error):
+									invalid = Some(error)
+									break
 
 		match invalid:
 			Some(error):
@@ -2104,16 +2391,17 @@ private pure func verify_function(
 	execution ?= verify_execution(function, current, unions, records)
 	initial: VerificationState = {
 		facts = {
-			prefix_values = [],
+			enclosing = [],
+			enclosing_discharge = MayDischargeEnclosing,
 			first_value = 0,
 			values = [],
 			first_owner = 0,
 			parameters = []
 		},
-		prefix_owners = [],
+		discharged = [],
 		owners = []
 	}
-	state ?= verify_operations(
+	verified ?= verify_operations(
 		function.operations,
 		initial,
 		function.signature,
@@ -2122,6 +2410,7 @@ private pure func verify_function(
 		NoProjection,
 		records,
 	)
+	state = verified.state
 
 	valid_parameter ?= if IntOps.equals(
 		state.facts.parameters.length(),
@@ -2142,12 +2431,17 @@ private pure func verify_function(
 
 	match function.tail:
 		ReturnTail(result):
-			verify_exit(result, state, function.signature, function.execution, unions, records)
+			exit ?= verify_exit(result, state, function.signature, function.execution, unions, records)
+			joins ?= verify_joins(verified.pending, block_end(state), function.signature, functions, unions, records)
+			Ok(void)
 		MatchTail(matched):
+			-- The prefix's joins' arms precede the tail arms.
+			end ?= verify_joins(verified.pending, block_end(state), function.signature, functions, unions, records)
 			verify_match(
 				matched,
 				function.execution,
 				state,
+				end,
 				function.signature,
 				functions,
 				unions,

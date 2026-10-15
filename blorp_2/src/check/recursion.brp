@@ -7,7 +7,7 @@ import:
 		CheckError,
 		RecursionError(
 			GenericTailRecursionUnsupported, GrowingRecursiveInstantiation, NoSelfRecursion,
-			NonTailSelfCall,
+			NonTailSelfCall, TailCallInNestedMatch,
 		),
 		recursion_error,
 	./model:
@@ -19,7 +19,7 @@ import:
 		CheckedExpr,
 		CheckedForm(
 			ConstructRecord, ConstructVariant, ConstructList, InvokeFunction, LiteralFloat, LiteralInteger,
-			LiteralString, LiteralVoid, ReadBinding, ReadRecordField, UpdateRecord,
+			LiteralString, LiteralVoid, Match, ReadBinding, ReadRecordField, UpdateRecord,
 		),
 		CheckedFunction,
 		CheckedStatement(DiscardExpression, InitializeBinding, ReassignBinding),
@@ -74,6 +74,13 @@ private pure func self_call_in(value: CheckedExpr, current: FunctionId) -> Optio
 			first_self_call(fields, current)
 		ConstructList(elements):
 			first_self_call(elements, current)
+		Match(join):
+			-- A self call anywhere in a non-tail match is a non-tail call.
+			var found = self_call_in(join.scrutinee, current)
+			for arm in join.arms:
+				if found.is_none():
+					found = first_self_call(statement_values(arm.statements).append(arm.value), current)
+			found
 		ConstructRecord(_, fields):
 			var found: Option[Span] = None
 			for field in fields:
@@ -152,8 +159,30 @@ private pure func tail_exit(
 					valid ?= reject_self_calls(call.arguments, current)
 					Ok(RecurWith(call.arguments, call.span))
 				None:
-					valid ?= reject_self_calls([value], current)
+					valid ?= nested_tail(value, current)
 					Ok(exit)
+
+
+-- A tail value other than a direct self call. A match there passes the tail
+-- to each arm's value: a self call that is such a value needs a backedge out
+-- of a join, which does not exist yet; a self call anywhere else is an
+-- ordinary non-tail call.
+private pure func nested_tail(value: CheckedExpr, current: FunctionId) -> Result[Void, CheckError]:
+	match tail_call(value, current):
+		Some(call):
+			Err(recursion_error(call.span, TailCallInNestedMatch))
+		None:
+			match value.form:
+				Match(join):
+					var checked = reject_self_calls([join.scrutinee], current)
+					for arm in join.arms:
+						if checked.is_ok():
+							checked = reject_self_calls(statement_values(arm.statements), current)
+						if checked.is_ok():
+							checked = nested_tail(arm.value, current)
+					checked
+				_:
+					reject_self_calls([value], current)
 
 
 private pure func tail_arms(

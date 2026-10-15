@@ -1,0 +1,70 @@
+import:
+	../../../src/utils/names: program_names
+	../../../src/utils/source: module_source, root_module_id
+	../../../src/lex/lex: lex
+	../../../src/specialize/specialize as Concrete
+	../input: check, parse, setup_diagnostic
+	test: TestSuite
+
+
+-- One generic join, instantiated at Int and at String.
+private SOURCE: String =
+	|fixed union Box[T]:
+	|	Full(T)
+	|	Empty
+	|pure func open[T](value: Box[T], fallback: T) -> T:
+	|	opened = match value:
+	|		Full(payload): payload
+	|		Empty: fallback
+	|	opened
+	|func main() -> Int:
+	|	text = open(Full("seven"), "none")
+	|	open(Empty, 7)
+	|
+
+
+private pure func concrete_joins(source: String) -> List[Concrete.ConcreteJoin]:
+	tokens = lex(module_source(root_module_id()), source, program_names().names)
+	match tokens.and_then(pure func(lexed): parse(lexed)).and_then(pure func(parsed): check(parsed).map_err(setup_diagnostic)).and_then(pure func(checked): Concrete.specialize(checked)):
+		Err(_):
+			[]
+		Ok(program):
+			var joins: List[Concrete.ConcreteJoin] = []
+			for function in Concrete.specialized_contents(program).functions:
+				for statement in function.statements:
+					match statement:
+						Concrete.InitializeBinding(_, value):
+							match value.form:
+								Concrete.Match(join): joins = joins.append(join)
+								_: void
+						_:
+							void
+			joins
+
+
+private pure func yields(join: Concrete.ConcreteJoin, expected: Concrete.TypeRef) -> Bool:
+	join.arms.all(pure func(arm): Concrete.same_type(arm.value.value_type, expected))
+
+
+-- Each instance's join matches on its own concrete union, and its arms
+-- yield that instance's type.
+pure func test_generic_join_specializes_per_instance() -> Bool:
+	match concrete_joins(SOURCE):
+		[first, second]:
+			(
+				Concrete.union_number(first.owner) != Concrete.union_number(second.owner)
+				and (
+					yields(first, Concrete.StringType) and yields(second, Concrete.IntType)
+					or yields(first, Concrete.IntType) and yields(second, Concrete.StringType)
+				)
+			)
+		_:
+			False
+
+
+tests: TestSuite = {
+	description = "Specialization of joins",
+	tests = [
+		("generic join specializes per instance", test_generic_join_specializes_per_instance),
+	]
+}

@@ -1,0 +1,442 @@
+import:
+	../../../src/check/check: checked_functions
+	../../../src/check/model:
+		BindingOrigin(ParameterBinding, MatchCapture, BodyLocal),
+		CheckedBody(CheckedMatchBody),
+		CheckedExit(ReturnExpression),
+		CheckedForm(Match, LiteralVoid, ReadBinding),
+		CheckedFunction,
+		CheckedJoinArm,
+		CheckedPattern(VariantCase),
+		CheckedStatement(InitializeBinding, DiscardExpression),
+		TypeRef(IntType, VoidType),
+		binding_number,
+		same_type,
+	../input: checked_source
+	test: TestSuite
+
+
+private SHAPE: String =
+	|fixed union Shape:
+	|	Circle(Int)
+	|	Square(Int)
+	|
+
+private MAIN: String =
+	|func main() -> Int:
+	|	0
+	|
+
+
+private pure func function_named_first(source: String) -> Option[CheckedFunction]:
+	match checked_source(source):
+		Err(_):
+			None
+		Ok(program):
+			checked_functions(program).functions.get(0)
+
+
+-- The function's last line is its tail; a match before it is a join whose
+-- value initializes `w`. The arm captures precede `w` in binding order.
+pure func test_bound_match_is_a_join_with_value_arms() -> Bool:
+	source = SHAPE + "pure func width(shape: Shape) -> Int:\n\tw = match shape:\n\t\tCircle(r): r\n\t\tSquare(s): s\n\tw\n" + MAIN
+
+	match function_named_first(source):
+		None:
+			False
+		Some(function):
+			origins = function.bindings.map(pure func(binding):
+				match binding.origin:
+					ParameterBinding(_):
+						0
+					MatchCapture:
+						1
+					BodyLocal:
+						2
+			)
+
+			bound = match function.statements:
+				[InitializeBinding(id, value)]:
+					arms = match value.form:
+						Match(join):
+							match join.arms:
+								[first, second]:
+									captures(first, 1) and captures(second, 2)
+								_:
+									False
+						_:
+							False
+
+					binding_number(id) == 3 and same_type(value.value_type, IntType) and arms
+				_:
+					False
+
+			origins == [0, 1, 1, 2] and bound
+
+
+private pure func captures(arm: CheckedJoinArm, ordinal: Int) -> Bool:
+	read = match arm.value.form:
+		ReadBinding(id):
+			binding_number(id) == ordinal
+		_:
+			False
+
+	captured = match arm.pattern:
+		VariantCase(_, fields):
+			match fields.get(0):
+				Some(field):
+					match field:
+						Some(id):
+							fields.length() == 1 and binding_number(id) == ordinal
+						None:
+							False
+				None:
+					False
+		_:
+			False
+
+	read and captured
+
+
+-- A statement match is Void; an arm ending with a statement yields void.
+pure func test_statement_match_is_void_and_an_arm_may_omit_its_value() -> Bool:
+	source = SHAPE + "pure func ignore(shape: Shape) -> Int:\n\tmatch shape:\n\t\tCircle(r):\n\t\t\tkept = r\n\t\tSquare(_): void\n\t0\n" + MAIN
+
+	match function_named_first(source):
+		None:
+			False
+		Some(function):
+			match function.statements:
+				[DiscardExpression(value)]:
+					arms = match value.form:
+						Match(join):
+							match join.arms:
+								[first, second]:
+									(
+										first.statements.length() == 1
+										and is_void(first)
+										and second.statements.is_empty()
+										and is_void(second)
+									)
+								_:
+									False
+						_:
+							False
+
+					same_type(value.value_type, VoidType) and arms
+				_:
+					False
+
+
+private pure func is_void(arm: CheckedJoinArm) -> Bool:
+	match arm.value.form:
+		LiteralVoid:
+			same_type(arm.value.value_type, VoidType)
+		_:
+			False
+
+
+-- A bare match as an arm's value is a nested join, in a tail arm or a join arm.
+pure func test_a_bare_match_as_an_arm_value_is_a_nested_join() -> Bool:
+	source = SHAPE + "pure func pick(shape: Shape) -> Int:\n\tw = match shape:\n\t\tCircle(r): match shape:\n\t\t\tCircle(_): r\n\t\t\tSquare(s): s\n\t\tSquare(s): s\n\tw\n" + MAIN
+
+	match function_named_first(source):
+		None:
+			False
+		Some(function):
+			match function.statements:
+				[InitializeBinding(_, value)]:
+					match value.form:
+						Match(join):
+							match join.arms:
+								[first, _]:
+									match first.value.form:
+										Match(inner):
+											inner.arms.length() == 2
+										_:
+											False
+								_:
+									False
+						_:
+							False
+				_:
+					False
+
+
+private pure func rejected(
+	source: String,
+	start: Int,
+	end: Int,
+	message: String,
+	help: String,
+) -> Bool:
+	match checked_source(source):
+		Ok(_):
+			False
+		Err(error):
+			(
+				error.span.start == start
+				and error.span.end == end
+				and error.message == message
+				and error.help == help
+			)
+
+
+pure func test_later_arm_is_checked_against_the_first_arm_type() -> Bool:
+	prefix = SHAPE + "pure func width(shape: Shape) -> Int:\n\tw = match shape:\n\t\tCircle(r): r\n\t\tSquare(_): "
+	rejected(
+		prefix + "\"wide\"\n\tw\n" + MAIN,
+		prefix.length(),
+		prefix.length() + 6,
+		"expression does not match the expected type",
+		"the first arm's value decides this match's type, Int; give every arm a value of type Int",
+	)
+
+
+pure func test_statement_match_arm_value_must_be_void() -> Bool:
+	prefix = SHAPE + "pure func width(shape: Shape) -> Int:\n\tmatch shape:\n\t\tCircle(r): "
+	rejected(
+		prefix + "r\n\t\tSquare(_): void\n\t0\n" + MAIN,
+		prefix.length(),
+		prefix.length() + 1,
+		"a statement match's arm must be Void",
+		"bind the match's value with name = match ... to use it",
+	)
+
+
+pure func test_bound_match_arm_needs_a_value() -> Bool:
+	prefix = SHAPE + "pure func width(shape: Shape) -> Int:\n\tw = match shape:\n\t\t"
+	arm = "Circle(r):\n\t\t\tkept = r"
+	rejected(
+		prefix + arm + "\n\t\tSquare(s): s\n\tw\n" + MAIN,
+		prefix.length(),
+		prefix.length() + arm.length(),
+		"match arm has no final value",
+		"finish the arm with a value expression on its own indented line",
+	)
+
+
+pure func test_join_arm_cannot_reassign_an_outer_variable() -> Bool:
+	prefix = SHAPE + "pure func width(shape: Shape) -> Int:\n\tvar total = 0\n\tmatch shape:\n\t\tCircle(r):\n\t\t\t"
+	rejected(
+		prefix + "total = r\n\t\tSquare(_): void\n\ttotal\n" + MAIN,
+		prefix.length(),
+		prefix.length() + 5,
+		"reassigning a variable declared outside this match arm is not supported yet",
+		"bind the match's value with name = match ... instead; reassignment inside an arm arrives with joins that carry reassigned variables",
+	)
+
+
+pure func test_join_arm_may_reassign_its_own_variable() -> Bool:
+	source = SHAPE + "pure func width(shape: Shape) -> Int:\n\tw = match shape:\n\t\tCircle(r):\n\t\t\tvar total = 0\n\t\t\ttotal = r\n\t\t\ttotal\n\t\tSquare(s): s\n\tw\n" + MAIN
+	checked_source(source).is_ok()
+
+
+pure func test_tail_arm_may_still_reassign_an_outer_variable() -> Bool:
+	source = SHAPE + "pure func width(shape: Shape) -> Int:\n\tvar total = 0\n\tmatch shape:\n\t\tCircle(r):\n\t\t\ttotal = r\n\t\t\ttotal\n\t\tSquare(s): s\n" + MAIN
+	checked_source(source).is_ok()
+
+
+pure func test_match_inside_a_larger_expression_is_rejected_at_the_match() -> Bool:
+	prefix = SHAPE + "pure func identity(value: Int) -> Int:\n\tvalue\npure func width(shape: Shape) -> Int:\n\tidentity("
+	matched = "match shape:\n\t\tCircle(r): r\n\t\tSquare(s): s\n\t"
+	rejected(
+		prefix + matched + ")\n" + MAIN,
+		prefix.length(),
+		prefix.length() + matched.length() - 2,
+		"a `match` inside a larger expression is not supported yet",
+		"bind the match first with name = match ..., then use the name",
+	)
+
+
+private STEP: String =
+	|fixed union Step:
+	|	Stop
+	|	Once
+	|
+
+
+private TAIL_HELP: String = "make it an arm of the function's own match, or remove @tail_recursive; backedges from nested matches arrive with the loops milestone"
+
+
+-- A self call that is a nested match's arm value is in tail position, but
+-- no backedge leaves a join yet: a staged rejection, not a non-tail call.
+pure func test_tail_call_in_a_nested_match_is_staged() -> Bool:
+	prefix = STEP + "@tail_recursive\npure func walk(step: Step, value: Int) -> Int:\n\tmatch step:\n\t\tStop: value\n\t\tOnce: match step:\n\t\t\tStop: "
+	call = "walk(Stop, 7)"
+	rejected(
+		prefix + call + "\n\t\t\tOnce: value\n" + MAIN,
+		prefix.length(),
+		prefix.length() + call.length(),
+		"a recursive call at the tail of a nested match is not supported yet",
+		TAIL_HELP,
+	)
+
+
+pure func test_tail_call_two_matches_deep_is_staged() -> Bool:
+	prefix = STEP + "@tail_recursive\npure func walk(step: Step, value: Int) -> Int:\n\tmatch step:\n\t\tStop: value\n\t\tOnce: match step:\n\t\t\tStop: value\n\t\t\tOnce: match step:\n\t\t\t\tStop: "
+	call = "walk(Stop, 7)"
+	rejected(
+		prefix + call + "\n\t\t\t\tOnce: value\n" + MAIN,
+		prefix.length(),
+		prefix.length() + call.length(),
+		"a recursive call at the tail of a nested match is not supported yet",
+		TAIL_HELP,
+	)
+
+
+-- A Void function discards its tail values only after tail analysis, so the
+-- nested arm's self call is still seen at the tail.
+pure func test_void_tail_call_in_a_nested_match_is_staged() -> Bool:
+	prefix = STEP + "@tail_recursive\nfunc walk(step: Step) -> Void:\n\tmatch step:\n\t\tStop: void\n\t\tOnce: match step:\n\t\t\tStop: "
+	call = "walk(Stop)"
+	rejected(
+		prefix + call + "\n\t\t\tOnce: void\n" + MAIN,
+		prefix.length(),
+		prefix.length() + call.length(),
+		"a recursive call at the tail of a nested match is not supported yet",
+		TAIL_HELP,
+	)
+
+
+-- A self call in a nested arm's statements is not at the tail.
+pure func test_self_call_in_a_nested_arm_statement_is_not_a_tail_call() -> Bool:
+	prefix = STEP + "@tail_recursive\npure func walk(step: Step, value: Int) -> Int:\n\tmatch step:\n\t\tStop: value\n\t\tOnce: match step:\n\t\t\tStop:\n\t\t\t\tnext = "
+	call = "walk(Stop, 7)"
+	rejected(
+		prefix + call + "\n\t\t\t\tnext\n\t\t\tOnce: value\n" + MAIN,
+		prefix.length(),
+		prefix.length() + call.length(),
+		"recursive call is not in tail position",
+		"return this call directly, or remove @tail_recursive",
+	)
+
+
+-- A Void function's tail match whose arm value is a match: normalization
+-- discards each nested arm's value, here the Int `r`, after tail analysis.
+pure func test_void_tail_discards_each_nested_arm_value() -> Bool:
+	source = SHAPE + "func show(shape: Shape) -> Void:\n\tmatch shape:\n\t\tCircle(r): match shape:\n\t\t\tCircle(_): r\n\t\t\tSquare(_): void\n\t\tSquare(_): void\n" + MAIN
+	match function_named_first(source):
+		None:
+			False
+		Some(function):
+			match function.body:
+				CheckedMatchBody(matched):
+					match matched.arms.get(0):
+						Some(arm):
+							nested = match arm.statements:
+								[DiscardExpression(value)]:
+									match value.form:
+										Match(join): same_type(value.value_type, VoidType) and discards_int(join.arms)
+										_: False
+								_: False
+							nested and returns_void(arm.body)
+						None:
+							False
+				_:
+					False
+
+
+private pure func discards_int(arms: List[CheckedJoinArm]) -> Bool:
+	match arms.get(0):
+		Some(arm):
+			discarded = match arm.statements:
+				[DiscardExpression(value)]: same_type(value.value_type, IntType)
+				_: False
+			discarded and is_void(arm)
+		None:
+			False
+
+
+private pure func returns_void(exit: CheckedExit) -> Bool:
+	match exit:
+		ReturnExpression(value):
+			match value.form:
+				LiteralVoid: True
+				_: False
+		_:
+			False
+
+
+-- A statement match nested as a statement match's arm value: its own arms
+-- are statement arms too.
+pure func test_nested_statement_match_arm_value_must_be_void() -> Bool:
+	prefix = SHAPE + "pure func width(shape: Shape) -> Int:\n\tmatch shape:\n\t\tCircle(r): match shape:\n\t\t\tCircle(_): "
+	rejected(
+		prefix + "r\n\t\t\tSquare(_): void\n\t\tSquare(_): void\n\t0\n" + MAIN,
+		prefix.length(),
+		prefix.length() + 1,
+		"a statement match's arm must be Void",
+		"bind the match's value with name = match ... to use it",
+	)
+
+
+-- A self call in a nested match's scrutinee is evaluated before the match,
+-- so it is not at the tail.
+pure func test_self_call_in_a_nested_scrutinee_is_not_a_tail_call() -> Bool:
+	prefix = STEP + "pure func step_of(value: Int) -> Step:\n\tStop\n@tail_recursive\npure func walk(step: Step, value: Int) -> Int:\n\tmatch step:\n\t\tStop: value\n\t\tOnce: match step_of("
+	call = "walk(Stop, 1)"
+	source = prefix + call + "):\n\t\t\tStop: value\n\t\t\tOnce: value\n" + MAIN
+	rejected(
+		source,
+		prefix.length(),
+		prefix.length() + call.length(),
+		"recursive call is not in tail position",
+		"return this call directly, or remove @tail_recursive",
+	)
+
+
+-- The first arm's type comes from a nested match there; a later arm is
+-- checked against it.
+pure func test_first_arm_help_when_the_first_arm_is_a_nested_match() -> Bool:
+	prefix = SHAPE + "pure func width(shape: Shape) -> Int:\n\tw = match shape:\n\t\tCircle(r): match shape:\n\t\t\tCircle(_): r\n\t\t\tSquare(s): s\n\t\tSquare(_): "
+	rejected(
+		prefix + "\"two\"\n\tw\n" + MAIN,
+		prefix.length(),
+		prefix.length() + 5,
+		"expression does not match the expected type",
+		"the first arm's value decides this match's type, Int; give every arm a value of type Int",
+	)
+
+
+tests: TestSuite = {
+	description = "Bound and statement matches checked as joins",
+	tests = [
+		("tail call in a nested match is staged", test_tail_call_in_a_nested_match_is_staged),
+		("tail call two matches deep is staged", test_tail_call_two_matches_deep_is_staged),
+		("Void tail call in a nested match is staged", test_void_tail_call_in_a_nested_match_is_staged),
+		("self call in a nested arm statement is not a tail call", test_self_call_in_a_nested_arm_statement_is_not_a_tail_call),
+		("Void tail discards each nested arm value", test_void_tail_discards_each_nested_arm_value),
+		("nested statement match arm value must be Void", test_nested_statement_match_arm_value_must_be_void),
+		("self call in a nested scrutinee is not a tail call", test_self_call_in_a_nested_scrutinee_is_not_a_tail_call),
+		("first-arm help when the first arm is a nested match", test_first_arm_help_when_the_first_arm_is_a_nested_match),
+		("bound match is a join with value arms", test_bound_match_is_a_join_with_value_arms),
+		(
+			"statement match is Void and may omit an arm value",
+			test_statement_match_is_void_and_an_arm_may_omit_its_value,
+		),
+		(
+			"bare match arm value is a nested join",
+			test_a_bare_match_as_an_arm_value_is_a_nested_join,
+		),
+		(
+			"later arm checks against the first arm type",
+			test_later_arm_is_checked_against_the_first_arm_type,
+		),
+		("statement match arm value must be Void", test_statement_match_arm_value_must_be_void),
+		("bound match arm needs a value", test_bound_match_arm_needs_a_value),
+		(
+			"join arm cannot reassign an outer variable",
+			test_join_arm_cannot_reassign_an_outer_variable,
+		),
+		("join arm may reassign its own variable", test_join_arm_may_reassign_its_own_variable),
+		(
+			"tail arm may still reassign an outer variable",
+			test_tail_arm_may_still_reassign_an_outer_variable,
+		),
+		(
+			"match inside a larger expression is rejected",
+			test_match_inside_a_larger_expression_is_rejected_at_the_match,
+		),
+	]
+}

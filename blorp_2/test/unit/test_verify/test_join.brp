@@ -1,0 +1,309 @@
+import:
+	../../../src/lower/lower as Lower
+	../../../src/own/own as Own
+	../../../src/utils/source: COMPILER_SOURCE
+	../../../src/utils/syntax: Span
+	../../../src/verify/verify: verify
+	../join_inputs: COUNT, MEASURE, NEST, PICK, map_join_arms, owned, with_operations
+	test: TestSuite
+
+
+private SPAN: Span = {
+	source = COMPILER_SOURCE,
+	start = 0,
+	end = 0
+}
+
+
+private pure func accepted(source: String) -> Bool:
+	match owned(source):
+		Err(_): False
+		Ok(program): verify(program).is_ok()
+
+
+pure func test_inserted_joins_are_verified() -> Bool:
+	accepted(PICK) and accepted(NEST) and accepted(MEASURE)
+
+
+-- PICK's join function with its arms rewritten, verified as raw IR.
+private pure func rejects_pick_arms(
+	rewrite: pure (List[Own.OwnedJoinArm]) -> List[Own.OwnedJoinArm],
+	message: String,
+) -> Bool:
+	match owned(PICK):
+		Err(_):
+			False
+		Ok(program):
+			rejected(with_operations(program, pure func(operations): map_join_arms(operations, rewrite)), message)
+
+
+private pure func rejected(program: Own.OwnershipProgram, message: String) -> Bool:
+	match verify(program):
+		Ok(_): False
+		Err(error): error.message == "ownership verification failed: " + message
+
+
+private pure func transferred_value(transfer: Own.ReturnTransfer) -> Lower.ValueId:
+	match transfer:
+		Own.UnmanagedReturn(value): value
+		Own.OwnedReturn(value, _): value
+
+
+private pure func yielded(arm: Own.OwnedJoinArm) -> Lower.ValueId:
+	transferred_value(arm.transfer)
+
+
+-- Rewrites one arm, given the value it yields.
+private pure func rewrite_arm(
+	arms: List[Own.OwnedJoinArm],
+	selected: Int,
+	rewrite: pure (Own.OwnedJoinArm, Lower.ValueId) -> Own.OwnedJoinArm,
+) -> List[Own.OwnedJoinArm]:
+	arms.map_indexed(pure func(index, arm): rewrite_selected(arm, index == selected, rewrite))
+
+
+private pure func rewrite_selected(
+	arm: Own.OwnedJoinArm,
+	selected: Bool,
+	rewrite: pure (Own.OwnedJoinArm, Lower.ValueId) -> Own.OwnedJoinArm,
+) -> Own.OwnedJoinArm:
+	if selected:
+		rewrite(arm, yielded(arm))
+	else:
+		arm
+
+
+-- PICK's `No` arm yields `kept`, value 1, whose prefix owner is 0. Moving
+-- that owner instead of acquiring would leave the arms' edges disagreeing.
+pure func test_yield_of_a_prefix_owner_without_acquisition_is_rejected() -> Bool:
+	rejects_pick_arms(
+		pure func(arms): rewrite_arm(arms, 1, pure func(arm, kept): { arm | operations = [], transfer = Own.OwnedReturn(kept, Own.owner_id(0)) }),
+		"yield must transfer an owner made in its arm, not owner 0",
+	)
+
+
+pure func test_managed_yield_without_an_owner_is_rejected() -> Bool:
+	rejects_pick_arms(
+		pure func(arms): rewrite_arm(arms, 1, pure func(arm, kept): { arm | operations = [], transfer = Own.UnmanagedReturn(kept) }),
+		"managed yield requires an owner transfer",
+	)
+
+
+-- The `Yes` arm makes owner 2, then yields an acquired `kept` without
+-- dropping owner 2.
+pure func test_arm_owner_leaked_across_a_yield_is_rejected() -> Bool:
+	rejects_pick_arms(pure func(arms): leaked(arms), "owner 2 remains live at yield")
+
+
+private pure func leaked(arms: List[Own.OwnedJoinArm]) -> List[Own.OwnedJoinArm]:
+	match arms:
+		[fresh, reacquired]:
+			[{ fresh | operations = fresh.operations.concat(reacquired.operations), transfer = reacquired.transfer }, reacquired]
+		_:
+			arms
+
+
+-- Dropping the prefix owner in one arm only would leave the join's edges
+-- with different live prefixes.
+pure func test_prefix_owner_dropped_in_one_arm_is_rejected() -> Bool:
+	rejects_pick_arms(
+		pure func(arms): rewrite_arm(arms, 1, pure func(arm, _): { arm | operations = arm.operations.append(Own.DropOwner(Own.owner_id(0), SPAN)) }),
+		"owner 0 is discharged before its join",
+	)
+
+
+private pure func without_drop(operations: List[Own.OwnershipOperation], owner: Int) -> List[Own.OwnershipOperation]:
+	operations.filter(pure func(operation): not drops(operation, owner))
+
+
+private pure func drops(operation: Own.OwnershipOperation, owner: Int) -> Bool:
+	match operation:
+		Own.DropOwner(id, _): Own.owner_number(id) == owner
+		_: False
+
+
+-- MEASURE drops its unread join value; without that drop it stays live.
+pure func test_undischarged_join_value_is_rejected() -> Bool:
+	match owned(MEASURE):
+		Err(_): False
+		Ok(program): rejected(with_operations(program, pure func(operations): without_drop(operations, 0)), "owner 0 remains live at return")
+
+
+-- Rewrites every arm of COUNT's join, verified as raw IR.
+private pure func rejects_count_arms(
+	rewrite: pure (List[Own.OwnedJoinArm]) -> List[Own.OwnedJoinArm],
+	message: String,
+) -> Bool:
+	match owned(COUNT):
+		Err(_):
+			False
+		Ok(program):
+			rejected(with_operations(program, pure func(operations): map_join_arms(operations, rewrite)), message)
+
+
+-- PICK's join matches on `kept`, a String, instead of its Choice.
+pure func test_join_scrutinee_of_another_type_is_rejected() -> Bool:
+	match owned(PICK):
+		Err(_):
+			False
+		Ok(program):
+			rejected(with_operations(program, pure func(operations): operations.map(pure func(operation): string_scrutinee(operation))), "join scrutinee does not belong to its union")
+
+
+private pure func string_scrutinee(operation: Own.OwnershipOperation) -> Own.OwnershipOperation:
+	match operation:
+		Own.DefineValue(definition):
+			match definition.operation:
+				Own.JoinDefinition(join):
+					match join.arms.get(1):
+						Some(arm):
+							kept = yielded(arm)
+							Own.DefineValue({ definition | operation = Own.JoinDefinition({ join | scrutinee = Own.UnmanagedArgument(kept) }) })
+						None:
+							operation
+				_:
+					operation
+		_:
+			operation
+
+
+-- PICK's `Yes` arm yields the Choice scrutinee, value 0, into a String join.
+pure func test_yield_of_another_type_is_rejected() -> Bool:
+	match owned(PICK):
+		Err(_):
+			False
+		Ok(program):
+			rejected(with_operations(program, pure func(operations): operations.map(pure func(operation): choice_yield(operation))), "yield type does not match its join")
+
+
+private pure func choice_yield(operation: Own.OwnershipOperation) -> Own.OwnershipOperation:
+	match operation:
+		Own.DefineValue(definition):
+			match definition.operation:
+				Own.JoinDefinition(join):
+					scrutinee = match join.scrutinee:
+						Own.UnmanagedArgument(value): value
+						Own.BorrowedArgument(borrow): borrow.value
+					arms = rewrite_arm(join.arms, 0, pure func(arm, _): { arm | transfer = Own.UnmanagedReturn(scrutinee) })
+					Own.DefineValue({ definition | operation = Own.JoinDefinition({ join | arms = arms }) })
+				_:
+					operation
+		_:
+			operation
+
+
+pure func test_unmanaged_yield_moving_an_owner_is_rejected() -> Bool:
+	rejects_count_arms(
+		pure func(arms): rewrite_arm(arms, 0, pure func(arm, number): { arm | transfer = Own.OwnedReturn(number, Own.owner_id(0)) }),
+		"unmanaged yield cannot transfer an owner",
+	)
+
+
+-- The `Yes` arm's owner 2 owns "fresh", value 3, not `kept`.
+pure func test_yield_moving_another_values_owner_is_rejected() -> Bool:
+	match owned(PICK):
+		Err(_):
+			False
+		Ok(program):
+			match join_arms(program):
+				[_, reacquired]:
+					rejects_pick_arms(
+						pure func(arms): rewrite_arm(arms, 0, pure func(arm, _): { arm | transfer = Own.OwnedReturn(yielded(reacquired), Own.owner_id(2)) }),
+						"yielded owner does not own the yielded value",
+					)
+				_:
+					False
+
+
+private pure func join_arms(program: Own.OwnershipProgram) -> List[Own.OwnedJoinArm]:
+	var arms: List[Own.OwnedJoinArm] = []
+	for function in program.functions:
+		for operation in function.operations:
+			match operation:
+				Own.DefineValue(definition):
+					match definition.operation:
+						Own.JoinDefinition(join): arms = join.arms
+						_: void
+				_:
+					void
+	arms
+
+
+pure func test_yield_of_a_dropped_owner_is_rejected() -> Bool:
+	rejects_pick_arms(
+		pure func(arms): rewrite_arm(arms, 0, pure func(arm, _): { arm | operations = arm.operations.append(Own.DropOwner(Own.owner_id(2), SPAN)) }),
+		"yield refers to discharged owner 2",
+	)
+
+
+-- `Yes` stores `kept` in a fresh `Full`, acquiring an owner for the payload.
+private WRAP: String =
+	|fixed union Choice:
+	|	Yes
+	|	No
+	|fixed union Box:
+	|	Full(String)
+	|	Empty
+	|pure func empty() -> Box:
+	|	Empty
+	|pure func wrap(choice: Choice) -> Box:
+	|	kept = "kept"
+	|	var boxed = empty()
+	|	boxed = match choice:
+	|		Yes: Full(kept)
+	|		No: Empty
+	|	boxed
+	|func main() -> Int:
+	|	unused = wrap(Yes)
+	|	0
+	|
+
+
+-- Storing the prefix owner 0 itself would discharge it inside a join arm.
+private pure func stores_prefix_owner(operation: Own.OwnershipOperation) -> Own.OwnershipOperation:
+	match operation:
+		Own.DefineValue(definition):
+			match definition.operation:
+				Own.ConstructDefinition(variant, payloads):
+					stored = payloads.map(pure func(payload): prefix_payload(payload))
+					Own.DefineValue({ definition | operation = Own.ConstructDefinition(variant, stored) })
+				_:
+					operation
+		_:
+			operation
+
+
+private pure func prefix_payload(payload: Own.StoredPayload) -> Own.StoredPayload:
+	match payload:
+		Own.OwnedPayload(value, _): Own.OwnedPayload(value, Own.owner_id(0))
+		Own.UnmanagedPayload(_): payload
+
+
+pure func test_payload_storing_a_prefix_owner_in_a_join_arm_is_rejected() -> Bool:
+	match owned(WRAP):
+		Err(_):
+			False
+		Ok(program):
+			rejected(
+				with_operations(program, pure func(operations): map_join_arms(operations, pure func(arms): arms.map(pure func(arm): { arm | operations = arm.operations.map(pure func(operation): stores_prefix_owner(operation)) }))),
+				"owner 0 is discharged before its join",
+			)
+
+
+tests: TestSuite = {
+	description = "Verification of join edges",
+	tests = [
+		("inserted joins are verified", test_inserted_joins_are_verified),
+		("yield of a prefix owner without acquisition is rejected", test_yield_of_a_prefix_owner_without_acquisition_is_rejected),
+		("managed yield without an owner is rejected", test_managed_yield_without_an_owner_is_rejected),
+		("arm owner leaked across a yield is rejected", test_arm_owner_leaked_across_a_yield_is_rejected),
+		("prefix owner dropped in one arm is rejected", test_prefix_owner_dropped_in_one_arm_is_rejected),
+		("undischarged join value is rejected", test_undischarged_join_value_is_rejected),
+		("payload storing a prefix owner in a join arm is rejected", test_payload_storing_a_prefix_owner_in_a_join_arm_is_rejected),
+		("join scrutinee of another type is rejected", test_join_scrutinee_of_another_type_is_rejected),
+		("yield of another type is rejected", test_yield_of_another_type_is_rejected),
+		("unmanaged yield moving an owner is rejected", test_unmanaged_yield_moving_an_owner_is_rejected),
+		("yield moving another value's owner is rejected", test_yield_moving_another_values_owner_is_rejected),
+		("yield of a dropped owner is rejected", test_yield_of_a_dropped_owner_is_rejected),
+	]
+}

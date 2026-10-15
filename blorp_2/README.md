@@ -256,7 +256,36 @@ prefix owner or drops it after securing the result. Prefix roots and acquired
 projections remain alive through the selected arm; sibling arms share no local
 obligations. The [owned-prefix examples](test/e2e/test_owned_prefix.brp) cover
 aliases, reassignment, projected payloads and selected-arm effects.
-Nested/non-tail matches and joins are deferred.
+
+A match that is not the function's tail is a join: the function continues
+after it with the value its selected arm yields.
+[`join/bound_int.brp`](test/e2e/fixtures/join/bound_int.brp) binds one:
+
+```blorp
+pure func width(shape: Shape) -> Int:
+	w = match shape:
+		Circle(radius): radius.multiply(2)
+		Square(side): side
+	w.add(1)
+```
+
+The first arm's value decides a bound match's type (a reassigned `var`
+decides it instead), and every later arm is checked against it. A statement
+match is Void: each arm's value must be Void, and an arm may end with a
+statement instead. A match whose position expects a type, such as a tail
+arm's, checks every arm against it. At a Void function's tail, a nested
+match discards each arm's value, as a plain Void tail does. A bare match as
+an arm's value is a nested join; in a `@tail_recursive` function a self call
+there is rejected until the loops milestone. Until the
+join milestone's next step, an arm may reassign only variables it declares
+itself; a match nested inside a
+larger expression, such as a call argument, must be bound first. Each yielding
+arm moves its value into the join: a managed value moves an owner made in its
+arm, so a yielded prefix value is acquired again, and owners live before the
+join stay live through every arm and are dropped after it at their last use.
+In C the join is a local declared before the `switch` and assigned in each
+braced case; the [join examples](test/e2e/test_join.brp) include sixteen
+nested bound matches, whose C nests 33 braces deep.
 
 From the repository root:
 
@@ -961,8 +990,9 @@ parse and are rejected by checking until the lambdas milestone. A `match` anywhe
 or branch block, or followed by further lines) is likewise one expression
 ending at its last arm's dedent; the function's last match stays its tail
 body. Ranges parse and are rejected by checking
-until the loops milestone; `and`, `or`, `not`, `if` and non-tail `match`
-until the join milestone.
+until the loops milestone; `and`, `or`, `not` and `if` until the join
+milestone. A bound or statement match is a join; a match inside a larger
+expression is rejected until it is bound.
 A dotted type such as `Shared.Span[Int]` is a qualified type. A qualified
 name resolves through the import block's alias row to the target module's
 own public declarations: `IntOps.add(1, 2)` is a direct call to that
@@ -1128,7 +1158,7 @@ Lexical and layout rules:
   the mandatory final expression or function tail match. A non-final bare
   expression must return Void; bind or return other values. Bindings inside
   arguments and annotations are unsupported. An arm block may end with a
-  nested match, which checking rejects until the join milestone.
+  nested match, a join whose value the arm returns or yields.
 - Integer literals are decimal values from `-9223372036854775808` through
   `9223372036854775807`, with an optional adjacent minus. `-0` is accepted
   and has value zero. Leading zeros (`00`, `-01`), plus signs, separated minus
@@ -1302,8 +1332,10 @@ Semantic rules:
   transfers its owner. Borrowed managed parameters and locally owned prefixes
   are admitted before an ordinary terminating match. Each selected arm discharges
   prefix obligations after securing its result. Literal construction creates a
-  fresh ordinary String owner. COW, joins and managed annotated loops are deferred.
-- Union-only recursive layouts, generic self-reinstantiation, nested and non-tail matches (they parse; checking rejects them),
+  fresh ordinary String owner. A join's arms follow the same rules and move a
+  managed result into the join, which owns it afterwards. COW and managed
+  annotated loops are deferred.
+- Union-only recursive layouts, generic self-reinstantiation,
   guards, qualified/nested/literal patterns, constructor UFCS,
   and function
   values are outside this increment. `Bool` is an ordinary fixed union declared
@@ -1977,7 +2009,9 @@ identities and typed operations. Integer and
 union programs with optional Int fields need no target heap allocation or RC operations.
 Recursive direct arguments and postfix receiver calls remain single-line values.
 A structured body sum distinguishes that leaf from a match with ordered arms.
-Managed control-flow joins and general pass infrastructure remain future work.
+A join is one definition whose value its arms yield: its arms' values and
+owners follow those of its block, so every block keeps consecutive identities.
+General pass infrastructure remains future work.
 
 The target library's [`_base.brp`](standard_library_temp/_base.brp)
 owns the builtin Int, Float, String, Void and List identities, and the ordinary
