@@ -317,7 +317,12 @@ and keeps allocation parsing and caps. Empty or unknown settings reject before
 fixture compilation or output changes. These checks never reuse output from an
 earlier fixture compilation.
 
-Every host-compiled source module has a matching unit suite under `test/unit/`.
+Every host-compiled source module has a matching unit suite under `test/unit/test_<stage>/`,
+mirroring its folder under `src/`; the support modules that suites share stay in `test/unit/`.
+`src/` has one folder per stage (`lex`, `parse`, `load`, `namespace`, `check`, `specialize`,
+`lower`, `own`, `verify`, `emit`), `utils` for modules several stages share and `runtime` for the C
+fragments `emit` embeds. A folder imports only earlier folders, `main.brp` stays at the root, and
+imports of compiler modules are explicit relative paths; bare paths name the target library only.
 The designated target base/prelude are loaded from the explicit library root; they are not host modules.
 Integration
 and native execution suites live under `test/e2e/`; their input programs live
@@ -1489,9 +1494,9 @@ checks representation requirements; target programs cannot change locale or
 rounding in this subset. Float remains unmanaged in parameters, locals and
 ordinary union fields and fixed-record fields.
 
-The [calculator component tests](test/unit/test_option_contracts.brp),
-[input ownership tests](test/unit/test_option_ownership.brp),
-[Float projection tests](test/unit/test_float_literal.brp) and normal-main
+The [calculator component tests](test/unit/test_lower/test_option_contracts.brp),
+[input ownership tests](test/unit/test_verify/test_option_ownership.brp),
+[Float projection tests](test/unit/test_emit/test_float_literal.brp) and normal-main
 fixtures protect different boundaries independently.
 
 All nine calculator increments are complete. The
@@ -1526,8 +1531,8 @@ diagnostic rendering are pure. The pipeline publishes these complete results:
    Every expression records its consumed token span directly, without reconstructing
    locations from names or literal values.
    A shared interning builder assigns one opaque `NameId` per spelling across the module inventory. Program
-   assembly ([assemble.brp](src/assemble.brp)) seals the complete syntax and immutable name table in an opaque `ParsedProgram`.
-   Its [declaration inventory](src/declarations.brp) issues function, record,
+   assembly ([assemble.brp](src/parse/assemble.brp)) seals the complete syntax and immutable name table in an opaque `ParsedProgram`.
+   Its [declaration inventory](src/utils/declarations.brp) issues function, record,
    union and owner-qualified variant IDs once from the raw syntax. Consumers
    carry those IDs through accepted and checked rows; vector positions are
    traversal counters, not another identity producer.
@@ -1569,7 +1574,7 @@ diagnostic rendering are pure. The pipeline publishes these complete results:
    `CheckErrors` collection. The current checker stops at the first error, so
    that collection is a singleton. Failures contain closed semantic variants,
    types, owner-qualified identities, argument positions and source occurrences;
-   temporary builders do not escape. [check_render.brp](src/check_render.brp)
+   temporary builders do not escape. [check_render.brp](src/check/check_render.brp)
    keeps pure presentation outside the checker. Its `render_failure` produces
    every diagnostic using the failure's original parsed name authority.
    The CLI preserves the entire
@@ -1592,10 +1597,10 @@ diagnostic rendering are pure. The pipeline publishes these complete results:
    during freezing; a later fatal name error can precede that new requirement
    failure. Existing direct List and pure-result readiness checks retain their
    established priority.
-   [check.brp](src/check.brp) only composes these checks and seals their result;
-   [check_model.brp](src/check_model.brp) owns published semantic data,
-   [check_errors.brp](src/check_errors.brp) owns typed rejections, and
-   [check_values.brp](src/check_values.brp) privately owns expression inference.
+   [check.brp](src/check/check.brp) only composes these checks and seals their result;
+   [check_model.brp](src/check/check_model.brp) owns published semantic data,
+   [check_errors.brp](src/check/check_errors.brp) owns typed rejections, and
+   [check_values.brp](src/check/check_values.brp) privately owns expression inference.
    Accepted record fields and variants retain their declaration identities and
    written names alongside complete field annotations, so later checking does
    not rejoin parsed declarations to recover those facts.
@@ -1890,5 +1895,5 @@ it does not use trait-dispatched operators. Future traits and operator syntax ca
 select these same functions, keeping one implementation per operation. The current
 host library declares some concrete functions inside trait implementations; the
 future subset library will expose ordinary function declarations instead.
-`src/text.brp` supplies exact string equality using equal byte lengths and an exact
+`src/utils/text.brp` supplies exact string equality using equal byte lengths and an exact
 prefix check because the host library has no ordinary string-equality function.

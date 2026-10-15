@@ -388,11 +388,11 @@ path, or backend import repair is needed.
 | Prelude / library | Same defaults in root and user helper; stdlib acquires neither prelude nor base implicitly; Int/Float `add`, String/List `length`, and numeric `to_string` resolve by type; Option/Result/Bool remain ordinary unions. |
 | Ownership / backend | Imported managed Strings/unions and existing inline records retain checked, concrete, lowered, ownership and verifier contracts; generated C references the selected function; real fixtures remain sanitizer-clean. |
 
-The direct suites for [import syntax](test/unit/test_import_syntax.brp),
-[namespace identity](test/unit/test_type_import_namespace.brp),
-[call selection](test/unit/test_import_selectors.brp),
-[module loading](test/unit/test_module_input.brp), and
-[foundation contracts](test/unit/test_builtins.brp) exercise these boundaries.
+The direct suites for [import syntax](test/unit/test_parse/test_import_syntax.brp),
+[namespace identity](test/unit/test_check/test_type_import_namespace.brp),
+[call selection](test/unit/test_parse/test_import_selectors.brp),
+[module loading](test/unit/test_parse/test_module_input.brp), and
+[foundation contracts](test/unit/test_namespace/test_builtins.brp) exercise these boundaries.
 Grammar checks live under [test/test_grammar](test/test_grammar/), and native
 examples under [test/e2e/fixtures/import](test/e2e/fixtures/import/).
 The [validation report](../benchmarks/results/blorp_2_imports_prelude_2026-10-12.md)

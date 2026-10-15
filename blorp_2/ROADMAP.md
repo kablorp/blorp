@@ -333,11 +333,11 @@ validation and final integration status are tracked above.
 
 | Boundary | Published fact and responsibility |
 | --- | --- |
-| [Checked facts](src/check_model.brp), [declaration checking](src/check_types.brp) and [expression checking](src/check_values.brp) | Declaration-owned field identities and complete accepted field types; contextual literal and projection checking. |
-| [Specialization](src/specialize.brp) | Concrete field types and InlineRecord/ManagedRecord representation derived from the complete shape. |
-| [Ownership insertion](src/own.brp) | Independent stored-slot obligations and explicit projection acquisitions. |
-| [Verification](src/verify.brp) | Independent layout, receiver-lifetime and sequential transfer validation. |
-| [Emission](src/emit.brp) | Typed storage, mixed dependency order and root/field destruction from verified facts. |
+| [Checked facts](src/check/check_model.brp), [declaration checking](src/check/check_types.brp) and [expression checking](src/check/check_values.brp) | Declaration-owned field identities and complete accepted field types; contextual literal and projection checking. |
+| [Specialization](src/specialize/specialize.brp) | Concrete field types and InlineRecord/ManagedRecord representation derived from the complete shape. |
+| [Ownership insertion](src/own/own.brp) | Independent stored-slot obligations and explicit projection acquisitions. |
+| [Verification](src/verify/verify.brp) | Independent layout, receiver-lifetime and sequential transfer validation. |
+| [Emission](src/emit/emit.brp) | Typed storage, mixed dependency order and root/field destruction from verified facts. |
 
 Each accepted field retains its concrete type and identity:
 
@@ -348,7 +348,7 @@ Entry: managed root
     text  -> StringType, owns one String obligation
 ```
 
-[Lowering](src/lower.brp) evaluates field initializers once in written order,
+[Lowering](src/lower/lower.brp) evaluates field initializers once in written order,
 separately from storage order. Mixed inline record/union dependencies use one typed
 C definition order. Existing Box[T] instantiated with Entry becomes an owning
 inline union and duplicates/drops Entry's root. Unused/pass-through layouts need
@@ -619,7 +619,7 @@ The Go slice lesson translates to these ARC invariants:
 #### Problem
 
 The pilot constructs and reads records, but cannot express a fresh update. Its
-lexer does not recognize `|` (`blorp_2/src/lex.brp:446–509`); the parser only
+lexer does not recognize `|` (`blorp_2/src/lex/lex.brp:446–509`); the parser only
 accepts literals after `{` (`parse.brp:765`, `1599–1608`). This program should
 print exactly `42\n7\n`, exit 0, and write no stderr:
 
@@ -907,7 +907,7 @@ Commands are root-only from the assigned integration worktree, with a FRESH host
 
 ```sh
 scripts/compiler-build-status
-bin/blorp test --suite --timeout 180 blorp_2/test/unit/test_record_updates.brp
+bin/blorp test --suite --timeout 180 blorp_2/test/unit/test_check/test_record_updates.brp
 # Expand to affected phase suites, then strict owning/runtime/grammar packet.
 BLORP_MEMORY_STATS=1 BLORP_LEAK_CHECK=strict bin/blorp test --suite --timeout 180 \
   blorp_2/test/unit blorp_2/test/runtime blorp_2/test/test_grammar
@@ -1119,9 +1119,9 @@ When reuse is introduced, its enabled and always-fresh paths must agree on
 observable values and safe destruction. This future equivalence oracle is not a
 requirement to implement reuse now.
 
-Existing direct stage suites include [test_lower.brp](test/unit/test_lower.brp),
-[test_own.brp](test/unit/test_own.brp), [test_verify.brp](test/unit/test_verify.brp)
-and [test_emit.brp](test/unit/test_emit.brp). The
+Existing direct stage suites include [test_lower.brp](test/unit/test_lower/test_lower.brp),
+[test_own.brp](test/unit/test_own/test_own.brp), [test_verify.brp](test/unit/test_verify/test_verify.brp)
+and [test_emit.brp](test/unit/test_emit/test_emit.brp). The
 [String-runtime suite](test/runtime/test_string_runtime.brp) independently checks
 bytes/length, retain, nonfinal release, final free and independent lifetimes.
 These do not establish future aggregate runtime coverage.
@@ -1191,9 +1191,9 @@ From the repository root, check host freshness and use focused suites first:
 
 ```sh
 scripts/compiler-build-status
-bin/blorp test --suite --timeout 180 blorp_2/test/unit/test_records.brp
-bin/blorp test --suite --timeout 180 blorp_2/test/unit/test_own.brp
-bin/blorp test --suite --timeout 180 blorp_2/test/unit/test_verify.brp
+bin/blorp test --suite --timeout 180 blorp_2/test/unit/test_check/test_records.brp
+bin/blorp test --suite --timeout 180 blorp_2/test/unit/test_own/test_own.brp
+bin/blorp test --suite --timeout 180 blorp_2/test/unit/test_verify/test_verify.brp
 bin/blorp test --suite --sanitize --leak-check --timeout 180 blorp_2/test/unit
 make -C blorp_2 test
 git diff --check

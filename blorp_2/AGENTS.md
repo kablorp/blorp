@@ -94,7 +94,8 @@ a requirement, report the limitation instead of adding one.
 
 **Tests.** Compiler tests are Blorp `TestSuite`s, not a test `main` or Python.
 Every host-compiled source module has a unit suite under
-[test/unit/](test/unit/). Grammar cases live under
+[test/unit/](test/unit/), in the `test_<stage>/` folder that mirrors the module's
+folder under `src/`. Grammar cases live under
 [test/test_grammar/](test/test_grammar/) and change with the EBNF.
 Rejections check exact message, help and span. Embedded programs use aligned
 multiline strings with exact contents; keep quoted escapes where they make
