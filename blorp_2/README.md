@@ -1707,7 +1707,8 @@ Runtime declarations name only their operation, for example
 `Option[Int]`, and `int.equals` and `string.equals` return the designated
 `Bool`; checking accepts the exact result type, arity and purity once.
 Specialization translates the designated constructors to the result instance's
-constructor identities, and emission receives those directly.
+constructor identities, and emission receives those directly. The verifier
+sees instances, not declarations, and deliberately does not repeat that check.
 
 ## Float64 calculator
 
