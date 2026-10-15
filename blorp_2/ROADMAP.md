@@ -75,7 +75,7 @@ their own inventory and plan after M8.
 | [ML](#ml-list-construction) | `append`, `set`, `concat`, list literal | Done. |
 | [M1b](#m1b-names-and-the-foundation) | Namespace: private, aliases, qualified names, designated `Bool`/`Option`/`Result` | Part A done. Part B in progress. |
 | [M5](#m5-constants) | Module-level constants | Not started. |
-| [M2](#m2-the-join) | Blocks with parameters; non-tail match, `if`, `and`/`or`/`not`, `?=` | M2.1 in progress; M2.2 after M1b part B; M2.3 after M2.2 and M1b part B (designated `Result`). |
+| [M2](#m2-the-join) | Blocks with parameters; non-tail match, `if`, `and`/`or`/`not`, `?=` | M2.1 implemented; M2.2 after M1b part B; M2.3 after M2.2 and M1b part B (designated `Result`). |
 | [M2b](#m2b-pattern-compilation) | Nested, or-, list and literal patterns | Not started. |
 | [M3](#m3-loops-and-tail-recursion) | Loops with managed carried values; `SelfTailLoop` retired | Not started. |
 | [M4](#m4-recursive-types) | Recursive types, release rule, opaque erasure | Steps 1 and 2a done; 2b, 2c and opaque types remain. |
@@ -377,7 +377,27 @@ designated `Bool`); **M2.3** `?=` and local annotations (needs the designated
 live managed locals; the existing fixtures byte-identical; a nesting stress
 fixture with recorded C depth.
 
-**Status.** M2.1 in progress. M2.2 after M1b part B (designated `Bool`). M2.3 after M2.2; it needs M1b part B's designated `Result`.
+**Status.** M2.1 implemented: bound and statement `match`, nested joins and
+joins in tail arms, with byte-identical C for every existing fixture; see the
+[join report](../benchmarks/results/blorp_2_join_2026-10-16.md). It settled
+three details of the sketch above. A join is a single `JoinValue` definition
+that is its own parameter (Void for a statement match), so its arms carry a
+value each, not a parameter list. A join arm only yields its value: only a
+tail arm returns or loops, so a yield cannot end a function and a backedge
+cannot leave a join. An arm may not reassign a variable declared outside it
+yet; M2.1b, next, makes a join also carry each reassigned variable. The
+checked form is `Match(CheckedJoin)` with value arms; the tail match keeps
+`CheckedMatchBody`. A match at a Void function's tail discards each arm's
+value, as a plain Void tail does. A self call at the tail of a nested match
+is rejected until the loops milestone gives joins a backedge. M2.2 after M1b
+part B (designated `Bool`). M2.3 after M2.2; it needs M1b part B's
+designated `Result`, and adds a join arm's early return with `?=` as its
+producer: an arm exit union, the owners live at each join, drops of the
+whole scope stack except a transferred owner, the verifier's return rule
+for an arm and its rule that some arm continues to the join, `return` in an
+emitted case, fixtures with owners live in two enclosing scopes, and the
+negatives for an early return leaving an outer arm's owner live and for a
+join whose every arm returns.
 
 ## M2b: pattern compilation
 
