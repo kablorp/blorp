@@ -16,7 +16,7 @@ The milestone names below come from the self-compile plan, which is pending
 adoption into [ROADMAP.md](ROADMAP.md). As this document uses them:
 
 - **M0**: foundation closeout; includes removing the `+` operator sites from `src`.
-- **ML**: List construction intrinsics (`append`, `set`, the list literal).
+- **ML**: List construction intrinsics (`append`, `set`, `concat`, the list literal).
 - **M3**: loops with managed carried values (`for`, `while`, `break`).
 - **M5**: module-level constants with literal initializers, including in library modules.
 - **M6**: the library and shell increment this table drives; its exit is no MISSING row.
@@ -102,16 +102,16 @@ source unchanged.
 | int | to_string | `pure func to_string(val: Int) -> String` (`implements Stringable for Int`, int.brp:66) | 11 | check/render.brp:364, :372 | `int.to_string(value: Int) -> String` | exists |
 | io | print_error | `func print_error[T:Stringable](value: T) -> Void` (io.brp:31) | 4 | main.brp:137, :144, :153, :158 | MISSING | intrinsic (shell: stderr); twin narrowed to `io.print_error(value: String) -> Void` like the existing `print`; see note C |
 | list | any | `pure func any[T](self: List[T], pred: pure (T) -> Bool) -> Bool` (list.brp:572) | 4 | emit, verify (emit/emit.brp:204, verify/verify.brp:287) | MISSING | blorp; needs M7 (function-typed parameter) and M3 (loop) |
-| list | append | `pure func append[T](self: List[T], elem: T) -> List[T]` (list.brp:104) | 268 | 23 files (namespace/namespace.brp:41 uses, check/values.brp:48 uses) | MISSING | intrinsic (list construction; ML) |
-| list | concat | `pure func concat[T](a: List[T], b: List[T]) -> List[T]` (list.brp:534) | 22 | 7 files (parse/assemble.brp:138, specialize/specialize.brp:7 uses) | MISSING | blorp: loop over `append`; needs ML and M3; promotion candidate |
+| list | append | `pure func append[T](self: List[T], elem: T) -> List[T]` (list.brp:104) | 268 | 23 files (namespace/namespace.brp:41 uses, check/values.brp:48 uses) | `list.append[T](values: List[T], value: T) -> List[T]` | exists (intrinsic; ML part 1) |
+| list | concat | `pure func concat[T](a: List[T], b: List[T]) -> List[T]` (list.brp:534) | 22 | 7 files (parse/assemble.brp:138, specialize/specialize.brp:7 uses) | `list.concat[T](left: List[T], right: List[T]) -> List[T]` | exists (intrinsic; ML part 1) |
 | list | contains | `pure func contains[T:Equatable](self: List[T], elem: T) -> Bool` (list.brp:764) | 2 | verify/verify.brp:925, check/methods.brp:387 | MISSING | blorp, narrowed to `list.contains(values: List[Int], value: Int) -> Bool` (both sites are `List[Int]`); needs M3 (loop) |
 | list | get | `pure func get[T](self: List[T], index: Int) -> Option[T]` (list.brp:68) | 217 | 23 files (check/values.brp:51 uses, verify/verify.brp:32 uses) | `list.get[T](values: List[T], index: Int) -> Option[T]` | exists |
 | list | is_empty | `pure func is_empty[T](self: List[T]) -> Bool` (list.brp:289) | 34 | 13 files (check/values.brp:7 uses, emit/emit.brp:6 uses) | MISSING | blorp: `int.equals(length(values), 0)`; no milestone |
 | list | join | `pure func join(self: List[String], sep: String) -> String` (list.brp:1351) | 4 | emit, load, main (emit/emit.brp:1982, main.brp:123) | MISSING | blorp over `string.add`; needs M3 (loop); measured decision per the self-compile plan (emit joins thousands of fragments) |
 | list | length | `pure func length(self: List[T]) -> Int` (`implements HasLength for List[T]`, list.brp:225) | 175 | 22 files (verify/verify.brp:39 uses, check/values.brp:36 uses) | `list.length[T](values: List[T]) -> Int` | exists |
 | list | map | `pure func map[T, U](self: List[T], f: pure (T) -> U) -> List[U]` (list.brp:358) | 22 | 11 files (emit/emit.brp:457, own/own.brp:201) | MISSING | blorp; needs M7 and M3, over `append` |
-| list | set | `pure func set[T](self: List[T], index: Int, elem: T) -> List[T]` (list.brp:189) | 47 | 8 files (check/values.brp:17 uses, verify/verify.brp:12 uses) | MISSING | intrinsic (list update; ML) |
-| list | set_index | `pure func set_index[T](self: List[T], index: Int, elem: T) -> Option[List[T]]` (list.brp:111) | 1 | own/own.brp:619 | MISSING | blorp: bounds test over `length` then `set`; needs the `set` intrinsic (ML) |
+| list | set | `pure func set[T](self: List[T], index: Int, elem: T) -> List[T]` (list.brp:189) | 47 | 8 files (check/values.brp:17 uses, verify/verify.brp:12 uses) | `list.set[T](values: List[T], index: Int, value: T) -> List[T]` | exists (intrinsic; ML part 1) |
+| list | set_index | `pure func set_index[T](self: List[T], index: Int, elem: T) -> Option[List[T]]` (list.brp:111) | 1 | own/own.brp:619 | MISSING | blorp: bounds test over `length` then `set`; `set` exists since ML part 1 |
 | list | sort_by | `pure func sort_by[T, K:Orderable](self: List[T], key_fn: pure (T) -> K) -> List[T]` (list.brp:614) | 3 | emit/emit.brp:1955, :1956, :1957 | MISSING | blorp, narrowed to `list.sort_by[T](values: List[T], key: pure (T) -> Int) -> List[T]` (all three keys are `Int`); a stable sort; needs M7 and M3 |
 | list | take | `pure func take[T](self: List[T], n: Int) -> List[T]` (list.brp:786) | 1 | check/signatures.brp:259 | MISSING | blorp over `get`/`append`; needs M3 |
 | option | and_then | `pure func and_then[T, U](self: Option[T], f: pure (T) -> Option[U]) -> Option[U]` (option.brp:138) | 1 | check/methods.brp:181 | MISSING | blorp (match); needs M7 |
@@ -166,7 +166,7 @@ Proposed temp-library declarations (host parameter names kept where the host
 has a plain function; the host's trait-impl methods become plain functions
 under the same name, as the temp `int.brp` already does for `add`):
 
-ML (list construction):
+ML (list construction; `append`, `set` and `concat` landed in part 1):
 
 ```blorp
 -- list.brp
@@ -174,7 +174,9 @@ pure func append[T](values: List[T], value: T) -> List[T]:
 	builtin("list.append")
 pure func set[T](values: List[T], index: Int, value: T) -> List[T]:
 	builtin("list.set")
--- plus the list literal `[a, b]` as syntax over the same construction
+pure func concat[T](left: List[T], right: List[T]) -> List[T]:
+	builtin("list.concat")
+-- plus the list literal `[a, b]` as syntax over the same construction (part 2)
 ```
 
 M6 (representation and machine):
@@ -212,13 +214,14 @@ func write_file(path: String, content: String) -> Result[Void, String]:
 	builtin("system.write_file", Ok, Err)
 ```
 
-That is 17 intrinsic functions (2 in ML, 15 in M6) and one intrinsic type.
+That is 18 intrinsic functions (3 in ML, 15 in M6) and one intrinsic type.
 Everything else in the table is Blorp over these, `int.equals`/`add`/`subtract`,
-`list.get`/`length`, `string.length` and `match`. Five rows are derivable and
+`list.get`/`length`, `string.length` and `match`. Four rows are derivable and
 classified blorp, but are candidates for later promotion to intrinsics for
 codegen quality once measured: `int.greater_than`, `int.greater_than_or_equal`,
-`int.less_than_or_equal` (one `less_than` each), `float.greater_than_or_equal`
-(`less_than` plus `is_nan`), and `list.concat` (a loop over `append`).
+`int.less_than_or_equal` (one `less_than` each) and `float.greater_than_or_equal`
+(`less_than` plus `is_nan`). `list.concat` was promoted in ML part 1: a loop over
+`append` would copy the growing result once per element.
 
 ## 2. Rows where the host signature is awkward for the pilot
 
@@ -307,12 +310,12 @@ codegen quality once measured: `int.greater_than`, `int.greater_than_or_equal`,
 | measure | count |
 | --- | --- |
 | rows (host module, name, signature) | 69 |
-| exists | 14 |
+| exists | 17 |
 | rename | 0 |
-| blorp | 38 |
-| intrinsic | 17 |
-| MISSING twins (blorp + intrinsic) | 55 |
-| blorp rows that are promotion candidates | 5 |
+| blorp | 37 |
+| intrinsic | 18 |
+| MISSING twins (blorp + intrinsic) | 52 |
+| blorp rows that are promotion candidates | 4 |
 | narrowed twins among those | 3 (`list.contains`, `list.sort_by`, `io.print_error`) |
 | rows needing M7 | 8 |
 | rows needing M5 | 2 |

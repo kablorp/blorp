@@ -4,7 +4,8 @@ import:
 		OptionalRoles,
 		RuntimeOperation(
 			IntAdd, IntSubtract, IntMultiply, IntDivide, IntRemainder, IntToString, StringLength,
-			StringPrint, StringParseInt, StringParseFloat, ListRepeat, ListLength, ListGet, StringEquals,
+			StringPrint, StringParseInt, StringParseFloat, ListRepeat, ListLength, ListGet, ListAppend, ListSet,
+			ListConcat, StringEquals,
 			IntEquals, FloatAdd, FloatSubtract, FloatMultiply, FloatDivide, FloatRemainder,
 			FloatToString,
 		),
@@ -13,8 +14,10 @@ import:
 	int as IntOps
 	list: join
 	../runtime/list:
-		ListElementKey, arguments_runtime, list_c_type, list_child_key, list_element_key,
-		list_key_depth, list_key_ordinal, list_key_rank, list_runtime, list_suffix, same_list_key
+		ListElementKey, ListUpdate(AppendUpdate, SetUpdate, ConcatUpdate), arguments_runtime,
+		list_c_type, list_child_key, list_element_key, list_key_depth, list_key_ordinal,
+		list_key_rank, list_runtime, list_suffix, list_update_name, list_update_runtime,
+		same_list_key
 	../lower/lower: MatchLabel(VariantLabel, DefaultLabel), ValueId, value_number
 	option: to_result
 	../own/own as Own:
@@ -151,6 +154,12 @@ private pure func c_callable(target: CallTarget) -> String:
 					"blorp_list_length_".concat(list_suffix(list_element_key(element)))
 				ListGet(element, _):
 					"blorp_list_get_".concat(list_suffix(list_element_key(element)))
+				ListAppend(element):
+					list_update_name(AppendUpdate, list_element_key(element))
+				ListSet(element):
+					list_update_name(SetUpdate, list_element_key(element))
+				ListConcat(element):
+					list_update_name(ConcatUpdate, list_element_key(element))
 				StringEquals(_):
 					"blorp_string_equals"
 				IntEquals(_):
@@ -1674,7 +1683,7 @@ private pure func runtime_matches(
 					True
 				_:
 					False
-		ListRepeat(_) | ListLength(_) | ListGet(_, _):
+		ListRepeat(_) | ListLength(_) | ListGet(_, _) | ListAppend(_) | ListSet(_) | ListConcat(_):
 			False
 		StringEquals(_):
 			match expected:
@@ -1894,6 +1903,9 @@ private pure func operation_list_layouts(operation: OwnershipOperation) -> List[
 								ListRepeat(element): element_list_layouts(element)
 								ListLength(element): element_list_layouts(element)
 								ListGet(element, _): element_list_layouts(element)
+								ListAppend(element): element_list_layouts(element)
+								ListSet(element): element_list_layouts(element)
+								ListConcat(element): element_list_layouts(element)
 								_: []
 						_: []
 				_: []
@@ -1908,6 +1920,18 @@ private pure func block_list_layouts(operations: List[OwnershipOperation]) -> Li
 		for layout in chunk:
 			layouts = layouts.append(layout)
 	layouts
+
+
+-- A function's operations in order: its prefix, then each match arm. Both
+-- List inventories below walk exactly these blocks.
+private pure func function_blocks(function: OwnedFunction) -> List[List[OwnershipOperation]]:
+	var blocks: List[List[OwnershipOperation]] = [function.operations]
+	match function.tail:
+		ReturnTail(_): void
+		MatchTail(matched):
+			for arm in matched.arms:
+				blocks = blocks.append(arm.operations)
+	blocks
 
 
 private pure func list_layouts(program: OwnershipProgram) -> List[ListLayout]:
@@ -1934,20 +1958,10 @@ private pure func list_layouts(program: OwnershipProgram) -> List[ListLayout]:
 		returned = type_list_layouts(function.signature.return_type)
 		for layout in returned:
 			layouts = layouts.append(layout)
-		prefix = block_list_layouts(function.operations)
-		for layout in prefix:
-			layouts = layouts.append(layout)
-		branches: List[ListLayout] = match function.tail:
-			ReturnTail(_): []
-			MatchTail(matched):
-				var arms: List[ListLayout] = []
-				for arm in matched.arms:
-					chunk = block_list_layouts(arm.operations)
-					for layout in chunk:
-						arms = arms.append(layout)
-				arms
-		for layout in branches:
-			layouts = layouts.append(layout)
+		for block in function_blocks(function):
+			chunk = block_list_layouts(block)
+			for layout in chunk:
+				layouts = layouts.append(layout)
 
 	ordered = layouts
 		.sort_by(pure func(layout): list_key_ordinal(layout.key))
@@ -1965,6 +1979,79 @@ private pure func list_layouts(program: OwnershipProgram) -> List[ListLayout]:
 	unique
 
 
+-- An update helper is emitted only where its operation is called. The
+-- inventory is deduplicated by scanning its own entries: there are at most
+-- three per element layout, so the scan stays small for any call count.
+private fixed record ListUpdateHelper {
+	update: ListUpdate,
+	layout: ListLayout
+}
+
+
+private pure func same_list_update(left: ListUpdate, right: ListUpdate) -> Bool:
+	match left:
+		AppendUpdate:
+			match right:
+				AppendUpdate: True
+				_: False
+		SetUpdate:
+			match right:
+				SetUpdate: True
+				_: False
+		ConcatUpdate:
+			match right:
+				ConcatUpdate: True
+				_: False
+
+
+private pure func update_helper(update: ListUpdate, element: TypeRef) -> ListUpdateHelper:
+	{ update = update, layout = { element = element, key = list_element_key(element) } }
+
+
+private pure func operation_list_update(operation: OwnershipOperation) -> Option[ListUpdateHelper]:
+	match operation:
+		DefineValue(definition):
+			match definition.operation:
+				CallDefinition(call, _):
+					match call.target:
+						RuntimeFunction(operation):
+							match operation:
+								ListAppend(element): Some(update_helper(AppendUpdate, element))
+								ListSet(element): Some(update_helper(SetUpdate, element))
+								ListConcat(element): Some(update_helper(ConcatUpdate, element))
+								_: None
+						_: None
+				_: None
+		_: None
+
+
+private pure func add_block_list_updates(
+	helpers: List[ListUpdateHelper],
+	operations: List[OwnershipOperation],
+) -> List[ListUpdateHelper]:
+	var unique = helpers
+	for operation in operations:
+		match operation_list_update(operation):
+			None: void
+			Some(helper):
+				var known = False
+				for existing in unique:
+					if same_list_update(existing.update, helper.update) and same_list_key(existing.layout.key, helper.layout.key):
+						known = True
+						break
+				if not known:
+					unique = unique.append(helper)
+	unique
+
+
+private pure func list_update_helpers(program: OwnershipProgram) -> List[ListUpdateHelper]:
+	var helpers: List[ListUpdateHelper] = []
+	for function in program.functions:
+		for block in function_blocks(function):
+			helpers = add_block_list_updates(helpers, block)
+	helpers
+
+
 private pure func append_list_prototypes(output: String, layouts: List[ListLayout]) -> String:
 	if layouts.is_empty():
 		output
@@ -1980,22 +2067,30 @@ private pure func append_list_prototypes(output: String, layouts: List[ListLayou
 		fragments.join("")
 
 
-private pure func list_runtime_fragment(
+-- The element C type and the stored-occurrence fragments every helper of one
+-- List layout stores and destroys through.
+private fixed record ElementFragments {
+	type_name: String,
+	acquire: String,
+	destroy: String
+}
+
+
+private pure func element_fragments(
 	layout: ListLayout,
 	unions: List[ConcreteUnion],
 	records: List[ConcreteRecord],
-) -> Result[String, Diagnostic]:
+) -> Result[ElementFragments, Diagnostic]:
 	-- Nested helpers use the precomputed suffix key. Rewalking the TypeRef at
 	-- every suffix would make a single deeply nested List require quadratic work.
 	if IntOps.greater_than(list_key_depth(layout.key), 0):
 		child = list_child_key(layout.key)
 		suffix = list_suffix(child)
-		Ok(list_runtime(
-			layout.key,
-			list_c_type(child),
-			"blorp_list_dup_".concat(suffix).concat("(element);"),
-			"blorp_list_drop_".concat(suffix).concat("(element);"),
-		))
+		Ok({
+			type_name = list_c_type(child),
+			acquire = "blorp_list_dup_".concat(suffix).concat("(element);"),
+			destroy = "blorp_list_drop_".concat(suffix).concat("(element);"),
+		})
 	else:
 		type_name ?= c_type(layout.element, unions)
 		ownership ?= value_ownership(layout.element, unions, records)
@@ -2005,7 +2100,41 @@ private pure func list_runtime_fragment(
 		destroy ?= match ownership:
 			NoOwnership: Ok("")
 			_: append_storage_operation("", layout.element, DestroyValue, "element", unions)
-		Ok(list_runtime(layout.key, type_name, acquire, destroy))
+		Ok({ type_name = type_name, acquire = acquire, destroy = destroy })
+
+
+private pure func list_runtime_fragment(
+	layout: ListLayout,
+	unions: List[ConcreteUnion],
+	records: List[ConcreteRecord],
+) -> Result[String, Diagnostic]:
+	element ?= element_fragments(layout, unions, records)
+	Ok(list_runtime(layout.key, element.type_name, element.acquire, element.destroy))
+
+
+private pure func append_list_updates(
+	output: String,
+	helpers: List[ListUpdateHelper],
+	unions: List[ConcreteUnion],
+	records: List[ConcreteRecord],
+) -> Result[String, Diagnostic]:
+	if helpers.is_empty():
+		Ok(output)
+	else:
+		var fragments: List[String] = [output]
+		var failure: Option[Diagnostic] = None
+		-- At most three helpers share one layout, so recomputing its few
+		-- fragments costs less than keying them from the layout inventory.
+		for helper in helpers:
+			match element_fragments(helper.layout, unions, records):
+				Err(error):
+					failure = Some(error)
+					break
+				Ok(element):
+					fragments = fragments.append(list_update_runtime(helper.update, helper.layout.key, element.type_name, element.acquire))
+		match failure:
+			Some(error): Err(error)
+			None: Ok(fragments.join(""))
 
 
 private pure func append_list_runtime(
@@ -2040,6 +2169,7 @@ private pure func aggregate_runtime_contents(
 	-- Both `?=` therefore precede `fragments`; `ready ?=` follows the loops and costs one copy.
 	ordered ?= append_aggregate_definitions(checked.records, checked.unions)
 	completed ?= append_list_runtime("", lists, checked.unions, checked.records)
+	updates ?= append_list_updates("", list_update_helpers(checked), checked.unions, checked.records)
 	var fragments: List[String] = [append_list_prototypes("", lists)]
 	var index: Int = 0
 
@@ -2087,7 +2217,7 @@ private pure func aggregate_runtime_contents(
 	arguments = match checked.entrypoint:
 		WithArguments(_, _): arguments_runtime()
 		NoArguments(_, _): ""
-	fragments = fragments.concat([completed, arguments])
+	fragments = fragments.concat([completed, updates, arguments])
 	Ok(fragments.join(""))
 
 

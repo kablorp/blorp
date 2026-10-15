@@ -1059,7 +1059,7 @@ Semantic rules:
   unused bodies. An arbitrary `T` cannot return an Int literal or call a
   concrete Int/String runtime operation. Parameters cannot share a name with
   `Int`, `String`, or any declared union; separate declarations may reuse `T`.
-  `main` cannot declare type parameters. List repeat, length and get builtin wrappers may be generic; other closed builtin bodies remain nongeneric.
+  `main` cannot declare type parameters. List repeat, length, get, append, set and concat builtin wrappers may be generic; other closed builtin bodies remain nongeneric.
   Direct and UFCS calls solve private call variables structurally, processing
   argument constraints before a declared expected result. Later sibling evidence
   can solve an earlier pending call. Repeated occurrences, including structural
@@ -1208,7 +1208,7 @@ outside compilation inputs. Its active declarations provide the calculator's
 ordinary unions and concrete numeric, conversion and IO functions.
 Their explicit builtin bodies select closed compiler-known operations. Module functions
 may declare these builtin bodies with the exact concrete runtime signature,
-without statement prefixes or tail annotations. List repeat, length and get wrappers may also declare generic parameters; other builtin wrappers remain nongeneric. Unknown
+without statement prefixes or tail annotations. List repeat, length, get, append, set and concat wrappers may also declare generic parameters; other builtin wrappers remain nongeneric. Unknown
 labels and signature mismatches are errors. There is no arbitrary foreign
 symbol binding. The base types module owns `Int`, `Float`, `String`, `Void` and unary `List`.
 The [validation report](../benchmarks/results/blorp_2_int_add_2026-10-11.md) records
@@ -1358,7 +1358,7 @@ tests cover counted NUL bytes separately. Lists accept every supported finite el
 records, unions, and nested Lists. `main` continues to accept exactly
 `List[String]` for its argument parameter.
 
-The temporary `list` module provides three ordinary pure generic functions:
+The temporary `list` module provides six ordinary pure generic functions:
 
 ```blorp
 pure func repeat[T](element: T, count: Int) -> List[T]:
@@ -1367,6 +1367,12 @@ pure func length[T](values: List[T]) -> Int:
     builtin("list.length")
 pure func get[T](values: List[T], index: Int) -> Option[T]:
     builtin("list.get", Some, None)
+pure func append[T](values: List[T], value: T) -> List[T]:
+    builtin("list.append")
+pure func set[T](values: List[T], index: Int, value: T) -> List[T]:
+    builtin("list.set")
+pure func concat[T](left: List[T], right: List[T]) -> List[T]:
+    builtin("list.concat")
 ```
 
 `repeat` evaluates its element and count once. A nonpositive count produces an
@@ -1375,8 +1381,16 @@ stored value. `length` returns the initialized element count; `get` returns
 None for a negative or out-of-range index and an independently owned Some value
 otherwise. Zero, Void, an empty String and a nullary union case are valid Some
 payloads. Retaining a List root does not acquire its children again; its final
-release destroys each initialized slot exactly once. No List literal, indexed
-update, append or removal syntax is included in this increment.
+release destroys each initialized slot exactly once.
+
+`append`, `set` and `concat` borrow their inputs and return a fresh owned
+List; every old alias keeps its original elements. Each stored occurrence of
+the result, surviving or replacement, is acquired independently, so one
+managed value may appear in both the input and the result. `set` with a
+negative or out-of-range index returns an unchanged copy; `append` and
+`concat` always produce the longer List. The runtime helper for an update
+exists only where its operation is called. No List literal or removal syntax
+is included yet.
 
 For example, a managed record can escape after its containing List is retired:
 

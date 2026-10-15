@@ -1,0 +1,220 @@
+import:
+	../../../src/namespace/builtins as Builtins
+	../../../src/check/check: checked_functions
+	../../../src/check/errors as Errors
+	../../../src/check/model as Checked
+	../../../src/utils/source: module_source, root_module_id, same_source
+	../../../src/utils/syntax: ParsedRuntimeOperation(ListAppendBuiltin, ListSetBuiltin, ListConcatBuiltin)
+	../input: checked_source, check_failure
+	int as IntOps
+	test: TestSuite
+
+
+private MAIN: String =
+	|func main() -> Int:
+	|    0
+	|
+
+
+-- What the checker accepted for the first declared wrapper's builtin body.
+private fixed union AcceptedUpdate:
+	AcceptedAppend(Checked.TypeRef)
+	AcceptedSet(Checked.TypeRef)
+	AcceptedConcat(Checked.TypeRef)
+	NotAccepted
+
+
+private pure func accepted_update(source: String) -> AcceptedUpdate:
+	match checked_source(source + MAIN):
+		Err(_): NotAccepted
+		Ok(program):
+			match checked_functions(program).functions:
+				[wrapper, _]:
+					match wrapper.body:
+						Checked.CheckedValueBody(Checked.ReturnExpression(value)):
+							match value.form:
+								Checked.InvokeFunction(call, _):
+									match call.target:
+										Checked.RuntimeFunction(Builtins.ListAppend(element)): AcceptedAppend(element)
+										Checked.RuntimeFunction(Builtins.ListSet(element)): AcceptedSet(element)
+										Checked.RuntimeFunction(Builtins.ListConcat(element)): AcceptedConcat(element)
+										_: NotAccepted
+								_: NotAccepted
+						_: NotAccepted
+				_: NotAccepted
+
+
+pure func test_concrete_append_header_is_admitted_with_its_int_element() -> Bool:
+	source: String =
+		|pure func append_ints(values: List[Int], value: Int) -> List[Int]:
+		|    builtin("list.append")
+		|
+	match accepted_update(source):
+		AcceptedAppend(element): Checked.same_type(element, Checked.IntType)
+		_: False
+
+
+pure func test_concrete_set_header_is_admitted_with_its_int_element() -> Bool:
+	source: String =
+		|pure func set_ints(values: List[Int], index: Int, value: Int) -> List[Int]:
+		|    builtin("list.set")
+		|
+	match accepted_update(source):
+		AcceptedSet(element): Checked.same_type(element, Checked.IntType)
+		_: False
+
+
+pure func test_concrete_concat_header_is_admitted_with_its_string_element() -> Bool:
+	source: String =
+		|pure func concat_texts(left: List[String], right: List[String]) -> List[String]:
+		|    builtin("list.concat")
+		|
+	match accepted_update(source):
+		AcceptedConcat(element): Checked.same_type(element, Checked.StringType)
+		_: False
+
+
+-- A generic wrapper's body carries the same rigid E its return type names.
+private pure func generic_wrapper_keeps_one_element(source: String) -> Bool:
+	match checked_source(source + MAIN):
+		Err(_): False
+		Ok(program):
+			match checked_functions(program).functions:
+				[wrapper, _]:
+					returned = match wrapper.signature.return_type.value_type:
+						Checked.ListType(element): Some(element)
+						_: None
+					accepted = match accepted_update(source):
+						AcceptedAppend(element): Some(element)
+						AcceptedSet(element): Some(element)
+						AcceptedConcat(element): Some(element)
+						NotAccepted: None
+					match returned:
+						Some(expected):
+							match accepted:
+								Some(element):
+									IntOps.equals(wrapper.signature.type_parameters.length(), 1) and Checked.same_type(element, expected)
+								None: False
+						None: False
+				_: False
+
+
+pure func test_generic_append_wrapper_keeps_its_type_parameter_everywhere() -> Bool:
+	generic_wrapper_keeps_one_element(
+		|pure func append[T](values: List[T], value: T) -> List[T]:
+		|    builtin("list.append")
+		|
+	)
+
+
+pure func test_generic_set_wrapper_keeps_its_type_parameter_everywhere() -> Bool:
+	generic_wrapper_keeps_one_element(
+		|pure func set[T](values: List[T], index: Int, value: T) -> List[T]:
+		|    builtin("list.set")
+		|
+	)
+
+
+pure func test_generic_concat_wrapper_keeps_its_type_parameter_everywhere() -> Bool:
+	generic_wrapper_keeps_one_element(
+		|pure func concat[T](left: List[T], right: List[T]) -> List[T]:
+		|    builtin("list.concat")
+		|
+	)
+
+
+private pure func same_parsed_update(expected: ParsedRuntimeOperation, actual: ParsedRuntimeOperation) -> Bool:
+	match expected:
+		ListAppendBuiltin:
+			match actual:
+				ListAppendBuiltin: True
+				_: False
+		ListSetBuiltin:
+			match actual:
+				ListSetBuiltin: True
+				_: False
+		ListConcatBuiltin:
+			match actual:
+				ListConcatBuiltin: True
+				_: False
+		_: False
+
+
+private APPEND_HELP: String = "declare a pure function with List[E] and E parameters returning List[E]"
+
+private SET_HELP: String = "declare a pure function with List[E], Int and E parameters returning List[E]"
+
+private CONCAT_HELP: String = "declare a pure function with two List[E] parameters returning List[E]"
+
+
+-- The mismatch names the parsed operation, renders its help and spans the label.
+private pure func mismatch(prefix: String, label: String, expected: ParsedRuntimeOperation, help: String) -> Bool:
+	source = prefix + label + ")\n" + MAIN
+	rendered = match checked_source(source):
+		Err(error): error.message == "builtin declaration does not match its runtime contract" and error.help == help
+		Ok(_): False
+	match check_failure(source):
+		None: False
+		Some(error):
+			kind = match error.kind:
+				Errors.BuiltinRejection(Errors.BuiltinContractMismatch(actual)): same_parsed_update(expected, actual)
+				_: False
+			(
+				kind and same_source(error.span.source, module_source(root_module_id()))
+				and IntOps.equals(error.span.start, prefix.length())
+				and IntOps.equals(error.span.end, IntOps.add(prefix.length(), label.length()))
+				and rendered
+			)
+
+
+pure func test_append_rejects_a_missing_value_parameter_at_its_label() -> Bool:
+	mismatch("pure func append(values: List[Int]) -> List[Int]:\n    builtin(", "\"list.append\"", ListAppendBuiltin, APPEND_HELP)
+
+
+pure func test_append_rejects_a_non_list_first_parameter_at_its_label() -> Bool:
+	mismatch("pure func append(values: Int, value: Int) -> List[Int]:\n    builtin(", "\"list.append\"", ListAppendBuiltin, APPEND_HELP)
+
+
+pure func test_append_rejects_a_different_return_element_at_its_label() -> Bool:
+	mismatch("pure func append(values: List[Int], value: Int) -> List[String]:\n    builtin(", "\"list.append\"", ListAppendBuiltin, APPEND_HELP)
+
+
+pure func test_append_rejects_an_impure_header_at_its_label() -> Bool:
+	mismatch("func append(values: List[Int], value: Int) -> List[Int]:\n    builtin(", "\"list.append\"", ListAppendBuiltin, APPEND_HELP)
+
+
+pure func test_set_rejects_a_string_index_at_its_label() -> Bool:
+	mismatch("pure func set(values: List[Int], index: String, value: Int) -> List[Int]:\n    builtin(", "\"list.set\"", ListSetBuiltin, SET_HELP)
+
+
+pure func test_set_rejects_a_value_of_another_element_type_at_its_label() -> Bool:
+	mismatch("pure func set(values: List[Int], index: Int, value: String) -> List[Int]:\n    builtin(", "\"list.set\"", ListSetBuiltin, SET_HELP)
+
+
+pure func test_concat_rejects_sides_with_different_elements_at_its_label() -> Bool:
+	mismatch("pure func concat(left: List[Int], right: List[String]) -> List[Int]:\n    builtin(", "\"list.concat\"", ListConcatBuiltin, CONCAT_HELP)
+
+
+pure func test_concat_rejects_an_extra_parameter_at_its_label() -> Bool:
+	mismatch("pure func concat(left: List[Int], right: List[Int], extra: Int) -> List[Int]:\n    builtin(", "\"list.concat\"", ListConcatBuiltin, CONCAT_HELP)
+
+
+tests: TestSuite = {
+	description = "List update builtin signatures",
+	tests = [
+		("concrete append header carries Int E", test_concrete_append_header_is_admitted_with_its_int_element),
+		("concrete set header carries Int E", test_concrete_set_header_is_admitted_with_its_int_element),
+		("concrete concat header carries String E", test_concrete_concat_header_is_admitted_with_its_string_element),
+		("generic append keeps one rigid E", test_generic_append_wrapper_keeps_its_type_parameter_everywhere),
+		("generic set keeps one rigid E", test_generic_set_wrapper_keeps_its_type_parameter_everywhere),
+		("generic concat keeps one rigid E", test_generic_concat_wrapper_keeps_its_type_parameter_everywhere),
+		("append rejects a missing value parameter", test_append_rejects_a_missing_value_parameter_at_its_label),
+		("append rejects a non-List first parameter", test_append_rejects_a_non_list_first_parameter_at_its_label),
+		("append rejects a different return element", test_append_rejects_a_different_return_element_at_its_label),
+		("append rejects an impure header", test_append_rejects_an_impure_header_at_its_label),
+		("set rejects a String index", test_set_rejects_a_string_index_at_its_label),
+		("set rejects a value of another element type", test_set_rejects_a_value_of_another_element_type_at_its_label),
+		("concat rejects sides with different elements", test_concat_rejects_sides_with_different_elements_at_its_label),
+		("concat rejects an extra parameter", test_concat_rejects_an_extra_parameter_at_its_label),
+	]
+}

@@ -1,7 +1,8 @@
 import:
 	../../../src/runtime/list:
-		list_child_key, list_c_type, list_element_key, list_key_depth, list_runtime,
-		list_suffix, same_list_key
+		ListUpdate(AppendUpdate, SetUpdate, ConcatUpdate), list_child_key, list_c_type,
+		list_element_key, list_key_depth, list_runtime, list_suffix, list_update_name,
+		list_update_runtime, same_list_key
 	../../../src/specialize/specialize as Concrete
 	../../../src/utils/syntax: Diagnostic
 	../compilation: compile
@@ -237,6 +238,94 @@ pure func test_void_list_emits_root_helpers_without_string_runtime() -> Bool:
 		Ok(output): output.contains("struct blorp_l_0_v{") and not output.contains("struct blorp_string")
 
 
+private pure func string_update(update: ListUpdate) -> String:
+	list_update_runtime(update, list_element_key(Concrete.StringType), "struct blorp_string*", "blorp_string_retain(element);")
+
+
+pure func test_update_names_project_from_the_element_key() -> Bool:
+	(
+		list_update_name(AppendUpdate, list_element_key(Concrete.IntType)) == "blorp_list_append_0_i"
+		and list_update_name(SetUpdate, list_element_key(Concrete.StringType)) == "blorp_list_set_0_s"
+		and list_update_name(ConcatUpdate, list_element_key(Concrete.ListType(Concrete.IntType))) == "blorp_list_concat_1_i"
+	)
+
+
+pure func test_append_checks_growth_once_then_acquires_every_stored_occurrence() -> Bool:
+	fragment = string_update(AppendUpdate)
+	(
+		fragment.contains("struct blorp_l_0_s* blorp_list_append_0_s(const struct blorp_l_0_s *values,struct blorp_string* value){")
+		and fragment.contains("if(count>=(uint64_t)INT64_MAX||count>=(SIZE_MAX-sizeof(struct blorp_l_0_s))/sizeof(struct blorp_string*))abort();")
+		and IntOps.equals(fragment.split("=malloc(").length(), 2)
+		and fragment.contains("for(uint64_t index=0;index<count;index++){struct blorp_string* element=values->values[index];blorp_string_retain(element);result->values[index]=element;result->length++;}")
+		and fragment.contains("struct blorp_string* element=value;blorp_string_retain(element);result->values[count]=element;result->length++;return result;}")
+	)
+
+
+pure func test_set_copies_every_slot_and_replaces_only_the_matching_index() -> Bool:
+	fragment = string_update(SetUpdate)
+	(
+		fragment.contains("struct blorp_l_0_s* blorp_list_set_0_s(const struct blorp_l_0_s *values,int64_t index,struct blorp_string* value){")
+		and IntOps.equals(fragment.split("=malloc(").length(), 2)
+		and fragment.contains("for(uint64_t slot=0;slot<count;slot++){struct blorp_string* element=(index>=0&&(uint64_t)index==slot)?value:values->values[slot];blorp_string_retain(element);result->values[slot]=element;result->length++;}return result;}")
+		and not fragment.contains("return values")
+	)
+
+
+pure func test_concat_checks_combined_length_then_acquires_both_sides() -> Bool:
+	fragment = string_update(ConcatUpdate)
+	(
+		fragment.contains("struct blorp_l_0_s* blorp_list_concat_0_s(const struct blorp_l_0_s *left,const struct blorp_l_0_s *right){")
+		and fragment.contains("if(second>(uint64_t)INT64_MAX-first||first+second>(SIZE_MAX-sizeof(struct blorp_l_0_s))/sizeof(struct blorp_string*))abort();")
+		and IntOps.equals(fragment.split("=malloc(").length(), 2)
+		and fragment.contains("for(uint64_t index=0;index<first;index++){struct blorp_string* element=left->values[index];blorp_string_retain(element);result->values[index]=element;result->length++;}")
+		and fragment.contains("for(uint64_t index=0;index<second;index++){struct blorp_string* element=right->values[index];blorp_string_retain(element);result->values[first+index]=element;result->length++;}return result;}")
+	)
+
+
+pure func test_unmanaged_elements_are_copied_without_ownership_operations() -> Bool:
+	fragment = list_update_runtime(AppendUpdate, list_element_key(Concrete.IntType), "int64_t", "")
+	fragment.contains("{int64_t element=values->values[index];result->values[index]=element;result->length++;}int64_t element=value;result->values[count]=element;")
+
+
+pure func test_update_helpers_exist_only_where_their_operation_is_called() -> Bool:
+	source: String =
+		|pure func repeat[T](element: T, count: Int) -> List[T]:
+		|    builtin("list.repeat")
+		|pure func append[T](values: List[T], value: T) -> List[T]:
+		|    builtin("list.append")
+		|func main() -> Int:
+		|    values = repeat(1, 2)
+		|    longer = append(values, 3)
+		|    again = append(longer, 4)
+		|    outer = append(repeat(values, 1), longer)
+		|    0
+		|
+	match compile(source):
+		Err(_): False
+		Ok(output):
+			(
+				IntOps.equals(output.split(" blorp_list_append_0_i(").length(), 2)
+				and IntOps.equals(output.split(" blorp_list_append_1_i(").length(), 2)
+				and output.contains("struct blorp_l_0_i* element=values->values[index];blorp_list_dup_0_i(element);result->values[index]=element;")
+				and not output.contains("blorp_list_set_")
+				and not output.contains("blorp_list_concat_")
+			)
+
+
+pure func test_repeat_only_programs_omit_update_helpers() -> Bool:
+	source: String =
+		|pure func repeat[T](element: T, count: Int) -> List[T]:
+		|    builtin("list.repeat")
+		|func main() -> Int:
+		|    values = repeat(0, 2)
+		|    0
+		|
+	match compile(source):
+		Err(_): False
+		Ok(output):
+			not output.contains("blorp_list_append_") and not output.contains("blorp_list_set_") and not output.contains("blorp_list_concat_")
+
+
 tests: TestSuite = {
 	description = "Blorp 2 concrete List runtime and derived helper keys",
 	tests = [
@@ -255,5 +344,12 @@ tests: TestSuite = {
 		("emission deduplicates E and preserves nested helper suffixes", test_emission_deduplicates_repeated_elements_and_keeps_nested_suffixes),
 		("numeric nested Lists omit String runtime", test_numeric_list_emits_root_helpers_without_string_runtime),
 		("Void Lists omit String runtime", test_void_list_emits_root_helpers_without_string_runtime),
+		("update names project from the element key", test_update_names_project_from_the_element_key),
+		("append checks growth once and acquires each slot", test_append_checks_growth_once_then_acquires_every_stored_occurrence),
+		("set copies every slot and replaces one index", test_set_copies_every_slot_and_replaces_only_the_matching_index),
+		("concat checks combined length and acquires both sides", test_concat_checks_combined_length_then_acquires_both_sides),
+		("unmanaged elements copy without ownership operations", test_unmanaged_elements_are_copied_without_ownership_operations),
+		("update helpers exist only where called", test_update_helpers_exist_only_where_their_operation_is_called),
+		("repeat-only programs omit update helpers", test_repeat_only_programs_omit_update_helpers),
 	]
 }

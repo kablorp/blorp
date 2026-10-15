@@ -481,6 +481,162 @@ pure func test_escaped_string_acquisition_precedes_option_and_entry_retirement()
 				_: False
 
 
+private UPDATE_SOURCE: String =
+	|fixed record Entry { number: Int, text: String }
+	|pure func repeat[T](element: T, count: Int) -> List[T]:
+	|    builtin("list.repeat")
+	|pure func append[T](values: List[T], value: T) -> List[T]:
+	|    builtin("list.append")
+	|pure func set[T](values: List[T], index: Int, value: T) -> List[T]:
+	|    builtin("list.set")
+	|pure func concat[T](left: List[T], right: List[T]) -> List[T]:
+	|    builtin("list.concat")
+	|pure func text(value: Int) -> String:
+	|    builtin("int.to_string")
+	|pure func make_entry(value: Int) -> Entry:
+	|    { number = value, text = text(value) }
+	|func main() -> Int:
+	|    values = repeat(make_entry(42), 1)
+	|    longer = append(values, make_entry(7))
+	|    replaced = set(values, 0, make_entry(7))
+	|    joined = concat(values, longer)
+	|    0
+	|
+
+
+private pure func runtime_append_element(function: Lower.LoweredFunction) -> Option[Concrete.TypeRef]:
+	match function.definitions:
+		[_, _, result]:
+			match result.operation:
+				Lower.CallValue(call, _):
+					match call.target:
+						Concrete.RuntimeFunction(Builtins.ListAppend(element)): Some(element)
+						_: None
+				_: None
+		_: None
+
+
+private pure func runtime_set_element(function: Lower.LoweredFunction) -> Option[Concrete.TypeRef]:
+	match function.definitions:
+		[_, _, _, result]:
+			match result.operation:
+				Lower.CallValue(call, _):
+					match call.target:
+						Concrete.RuntimeFunction(Builtins.ListSet(element)): Some(element)
+						_: None
+				_: None
+		_: None
+
+
+private pure func runtime_concat_element(function: Lower.LoweredFunction) -> Option[Concrete.TypeRef]:
+	match function.definitions:
+		[_, _, result]:
+			match result.operation:
+				Lower.CallValue(call, _):
+					match call.target:
+						Concrete.RuntimeFunction(Builtins.ListConcat(element)): Some(element)
+						_: None
+				_: None
+		_: None
+
+
+-- A parameter is borrowed when managed and unmanaged otherwise; nothing is acquired.
+private pure func parameter_follows_its_layout(definition: Own.OwnedDefinition) -> Bool:
+	match definition.operation:
+		Own.ParameterDefinition(_):
+			match definition.result:
+				Own.BorrowedResult(Own.ParameterBorrow(source)):
+					IntOps.equals(Lower.value_number(source), Lower.value_number(definition.id))
+				Own.UnmanagedResult: Concrete.same_type(definition.value_type, Concrete.IntType)
+				_: False
+		_: False
+
+
+-- The update contract is repeat's: every parameter borrowed by the runtime
+-- call, exactly one owned root in the result, transferred by the return.
+private pure func update_wrapper_borrows_inputs_and_transfers_one_root(
+	owned: Own.OwnedFunction,
+	parameters: Int,
+) -> Bool:
+	var valid = IntOps.equals(owned.operations.length(), IntOps.add(parameters, 1))
+	var index = 0
+	for operation in owned.operations:
+		match operation:
+			Own.DefineValue(definition):
+				if IntOps.less_than(index, parameters):
+					valid = valid and parameter_follows_its_layout(definition)
+				else:
+					transferred = match definition.result:
+						Own.OwnedResult(owner):
+							match owned.tail:
+								Own.ReturnTail(Own.ReturnResult(Own.OwnedReturn(value, returned))):
+									(IntOps.equals(Lower.value_number(value), Lower.value_number(definition.id))
+									and IntOps.equals(Own.owner_number(owner), Own.owner_number(returned)))
+								_: False
+						_: False
+					valid = valid and transferred
+			_: valid = False
+		index = IntOps.add(index, 1)
+	valid
+
+
+private pure func update_wrapper_passes(
+	selected: pure (Lower.LoweredFunction) -> Option[Concrete.TypeRef],
+	parameters: Int,
+) -> Bool:
+	match concrete(UPDATE_SOURCE).and_then(Lower.lower):
+		Err(_): False
+		Ok(program):
+			facts = Lower.lowered_functions(program)
+			match facts.functions.filter(pure func(function): selected(function).is_some()):
+				[function]:
+					entry_element = match selected(function):
+						Some(Concrete.RecordType(_)): True
+						_: False
+					match Own.insert_function(function, facts.unions, facts.records):
+						Err(_): False
+						Ok(owned): entry_element and update_wrapper_borrows_inputs_and_transfers_one_root(owned, parameters)
+				_: False
+
+
+pure func test_runtime_append_borrows_list_and_entry_and_owns_one_root() -> Bool:
+	update_wrapper_passes(runtime_append_element, 2)
+
+
+pure func test_runtime_set_borrows_list_index_and_entry_and_owns_one_root() -> Bool:
+	update_wrapper_passes(runtime_set_element, 3)
+
+
+pure func test_runtime_concat_borrows_both_lists_and_owns_one_root() -> Bool:
+	update_wrapper_passes(runtime_concat_element, 2)
+
+
+pure func test_update_contracts_carry_the_same_structured_element_everywhere() -> Bool:
+	element = Concrete.ListType(Concrete.StringType)
+	append: Builtins.RuntimeOperation[Void, Concrete.TypeRef] = Builtins.ListAppend(element)
+	set: Builtins.RuntimeOperation[Void, Concrete.TypeRef] = Builtins.ListSet(element)
+	concat: Builtins.RuntimeOperation[Void, Concrete.TypeRef] = Builtins.ListConcat(element)
+	append_valid = match Builtins.runtime_contract(append).parameters:
+		[Builtins.ListRuntimeType(values), Builtins.ElementRuntimeType(value)]:
+			Concrete.same_type(values, element) and Concrete.same_type(value, element)
+		_: False
+	set_valid = match Builtins.runtime_contract(set).parameters:
+		[Builtins.ListRuntimeType(values), Builtins.PrimitiveRuntimeType(Builtins.BuiltinInt), Builtins.ElementRuntimeType(value)]:
+			Concrete.same_type(values, element) and Concrete.same_type(value, element)
+		_: False
+	concat_valid = match Builtins.runtime_contract(concat).parameters:
+		[Builtins.ListRuntimeType(left), Builtins.ListRuntimeType(right)]:
+			Concrete.same_type(left, element) and Concrete.same_type(right, element)
+		_: False
+	var results = True
+	for contract in [Builtins.runtime_contract(append), Builtins.runtime_contract(set), Builtins.runtime_contract(concat)]:
+		returned = match contract.return_type:
+			Builtins.ValueResult(Builtins.ListRuntimeType(result)): Concrete.same_type(result, element)
+			_: False
+		results = results and returned and contract.purity == Pure
+	append_valid and set_valid and concat_valid and results
+
+
 tests: TestSuite = {
 	description = "Generic List immutable phase facts",
 	tests = [
@@ -498,5 +654,9 @@ tests: TestSuite = {
 		("numeric and Void get results are unmanaged", test_runtime_get_numeric_and_void_results_have_no_ownership_obligation),
 		("owned get escapes after List retirement", test_owned_get_result_survives_list_retirement_before_return_transfer),
 		("String acquisition precedes parent retirement", test_escaped_string_acquisition_precedes_option_and_entry_retirement),
+		("runtime append borrows inputs and owns one root", test_runtime_append_borrows_list_and_entry_and_owns_one_root),
+		("runtime set borrows inputs and owns one root", test_runtime_set_borrows_list_index_and_entry_and_owns_one_root),
+		("runtime concat borrows both Lists and owns one root", test_runtime_concat_borrows_both_lists_and_owns_one_root),
+		("update contracts keep structured E", test_update_contracts_carry_the_same_structured_element_everywhere),
 	]
 }

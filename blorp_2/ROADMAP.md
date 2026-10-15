@@ -175,7 +175,12 @@ measurements remain serialized. The coordinator owns integration and this plan.
    existing ownership/runtime operations. The required gate passes 2,282
    unit/runtime/grammar checks and 334 e2e cases. See the
    [record update report](../benchmarks/results/blorp_2_record_updates_2026-10-14.md).
-   List append, replacement and removal remain separate following increments.
+   List `append`, `set` and `concat` are implemented as fresh-result intrinsics
+   with the same borrowed-input contract; see the
+   [list intrinsics report](../benchmarks/results/blorp_2_list_intrinsics_2026-10-15.md).
+   Removal and the List literal remain separate following increments.
+   Follow-up: check only referenced library declarations; every compile now
+   pays about 300 allocations per generic library wrapper (884 for the three).
 5. **Recursive data.** Begin with the existing unary Nat example and iterative
    final release; then separately admit mutual, regular-generic and branching
    mixed shapes. Reserve instance identities locally and publish only complete
