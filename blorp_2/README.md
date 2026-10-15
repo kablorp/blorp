@@ -910,9 +910,9 @@ names or `_`, each optionally annotated, and its body is one expression on
 the same line or an indented block (inside brackets, a bracketed block,
 which must end before the bracket closes: a `)` on the block's last line is
 an error, as in the host). A lambda body starts a new statement context, so
-`?=` inside one is allowed even within a loop and a loop control inside one
-needs a loop of its own. Lambdas parse and are rejected by checking until
-the lambdas milestone. A `match` anywhere but a function's tail (bound, nested in an arm
+a loop control inside one needs a loop of its own, and by owner decision
+`?=` is rejected anywhere inside one, where the host accepts it. Lambdas
+parse and are rejected by checking until the lambdas milestone. A `match` anywhere but a function's tail (bound, nested in an arm
 or branch block, or followed by further lines) is likewise one expression
 ending at its last arm's dedent; the function's last match stays its tail
 body. Ranges parse and are rejected by checking

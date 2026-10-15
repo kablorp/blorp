@@ -82,9 +82,12 @@ import:
 -- Where a statement stands, for the host's 5.3 rules: `break` and
 -- `continue` need a loop body; `?=` must be outside every loop; and none
 -- of them may sit in an `if` or `match` used as a value within a loop. A
--- function body starts a new context, and a loop body ends with its block.
+-- function or lambda body starts a new context, and a loop body ends with
+-- its block. By owner decision `?=` is also rejected in a lambda body,
+-- where the host accepts it.
 private fixed union StatementContext:
 	FunctionBody
+	InsideLambda
 	LoopBody
 	ValueInLoop
 
@@ -1442,8 +1445,9 @@ private KEYWORD_HELP: String = "a keyword is missing or misspelled: `in` follows
 
 -- `start` is at `pure` or `func` in value position: `[pure] func(params)
 -- [-> Type]:` then one expression on the same line or an indented block.
--- A lambda body starts a new statement context (host 5.3). The lambda takes
--- no postfix operations; an inline body absorbs them as its own.
+-- A lambda body starts a new statement context (host 5.3), in which `?=`
+-- is rejected (owner rule). The lambda takes no postfix operations; an
+-- inline body absorbs them as its own.
 private pure func consume_lambda(start: ParserState) -> Result[ParsedValue, Diagnostic]:
 	keyword = parser_span(start)
 	purity = if at_pure(start):
@@ -1460,7 +1464,7 @@ private pure func consume_lambda(start: ParserState) -> Result[ParsedValue, Diag
 	closed ?= expect(parameters.next, at_right_paren(parameters.next), "expected `)` after lambda parameters", "close the parenthesis opened earlier with `)`")
 	returns ?= consume_optional_return_type(closed)
 	colon ?= expect(returns.next, at_colon(returns.next), "expected `:` before lambda body", BLOCK_HEADER_HELP)
-	body ?= consume_lambda_body(with_context(colon, FunctionBody))
+	body ?= consume_lambda_body(with_context(colon, InsideLambda))
 	lambda = {
 		purity = purity,
 		parameters = parameters.binders,
@@ -2128,10 +2132,12 @@ private pure func consume_binding(state: ParserState) -> Result[LineForm, Diagno
 			False
 
 	if propagating:
-		outside_loops ?= match state.context:
+		placed ?= match state.context:
 			FunctionBody:
 				Ok(void)
-			_:
+			InsideLambda:
+				Err(expected(annotation.next, "`?=` cannot be used inside a lambda body", "match on the Result or Option inside the lambda, or bind the value before the lambda"))
+			LoopBody | ValueInLoop:
 				Err(expected(annotation.next, "`?=` cannot be used inside a loop body", "bind it before the loop, or use `match` inside the loop"))
 		value ?= consume_initializer(shifted(annotation.next, 1), Propagate, BINDING_LINE_MESSAGE, BINDING_LINE_HELP)
 		propagation = { name = name.name, annotation = annotation.written, value = value.body, span = { name.name.span | end = value.body.span.end } }
@@ -2232,7 +2238,7 @@ private pure func consume_loop_control(state: ParserState, control: LoopControl)
 	placed ?= match state.context:
 		LoopBody:
 			Ok(void)
-		FunctionBody:
+		FunctionBody | InsideLambda:
 			Err(expected(state, words.outside_loop, words.outside_loop_help))
 		ValueInLoop:
 			Err(expected(state, words.in_value, words.in_value_help))
