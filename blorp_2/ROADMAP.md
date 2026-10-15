@@ -333,7 +333,7 @@ validation and final integration status are tracked above.
 
 | Boundary | Published fact and responsibility |
 | --- | --- |
-| [Checked facts](src/check/model.brp), [declaration checking](src/check/types.brp) and [expression checking](src/check/values.brp) | Declaration-owned field identities and complete accepted field types; contextual literal and projection checking. |
+| [Checked facts](src/check/model.brp), [declaration checking](src/check/declarations.brp), [constructor planning](src/check/constructors.brp) and [expression checking](src/check/expressions.brp) | Declaration-owned field identities and complete accepted field types; contextual literal checking (constructors) and projection checking (expressions). |
 | [Specialization](src/specialize/specialize.brp) | Concrete field types and InlineRecord/ManagedRecord representation derived from the complete shape. |
 | [Ownership insertion](src/own/own.brp) | Independent stored-slot obligations and explicit projection acquisitions. |
 | [Verification](src/verify/verify.brp) | Independent layout, receiver-lifetime and sequential transfer validation. |
@@ -817,10 +817,10 @@ evaluate language RHSs in C initializers: their ValueIds are already defined.
 
 #### Scope and ownership
 
-Implementation owns `syntax`, `lex`, `parse`, `check_model`, `check_values`,
-`check_errors`, `check_render`, `check_recursion`, `specialize`, and `lower` in
+Implementation owns `syntax`, `lex`, `parse`, `check/model`, `check/expressions`,
+`check/errors`, `check/render`, `check/recursion`, `specialize`, and `lower` in
 `blorp_2/src/`, plus matching tests and README/EBNF/conformance updates. Required
-closed-tree consumers include `check_model:448`, `check_recursion:68`,
+closed-tree consumers include `check/model:448`, `check/recursion:68`,
 `specialize:1158,1569`; omitting an update child would hide calls or layouts.
 Existing own/verify/emit/runtime production is expected unchanged; a discovered
 required production change there stops for a separately reviewed correction.
@@ -869,7 +869,7 @@ Normal-main fixtures above remain terminating.
 
 After one name resolution per replacement, new partition and lowering work is
 O(F+R), with F fields and R replacements. Current `resolve_record_field` calls
-linear `find_field` (`check_values:110–121`), so total existing lookup work is
+linear `find_field` (`check/constructors`, `check/declarations`), so total existing lookup work is
 O(F×R); disclose that inherited mechanism. Use direct ordinal marks/slots for
 duplicate/complement/construction work, never a per-field replacement scan.
 Inherited expression-builder COW and aggregate emitter prefix copying remain

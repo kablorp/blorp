@@ -1597,10 +1597,19 @@ diagnostic rendering are pure. The pipeline publishes these complete results:
    during freezing; a later fatal name error can precede that new requirement
    failure. Existing direct List and pure-result readiness checks retain their
    established priority.
-   [check.brp](src/check/check.brp) only composes these checks and seals their result;
+   [check.brp](src/check/check.brp) only composes the phases and seals their result.
+   The phases follow the data: [declarations.brp](src/check/declarations.brp) checks types and
+   declarations, [signatures.brp](src/check/signatures.brp) accepts function headers and builtin bodies,
+   and [callables.brp](src/check/callables.brp) selects methods and proves call contracts. Bodies then
+   use [inference.brp](src/check/inference.brp), the body-local inference state,
+   [constructors.brp](src/check/constructors.brp), which plans record and variant construction (contextual
+   record-literal and update checking), and [expressions.brp](src/check/expressions.brp), which elaborates
+   and freezes one expression. [bodies.brp](src/check/bodies.brp) checks statements and matches and calls
+   `check_execution` while it resolves each body; [recursion.brp](src/check/recursion.brp) holds that analysis
+   and also checks the finished bodies for growing recursive instantiation.
    [model.brp](src/check/model.brp) owns published semantic data,
-   [errors.brp](src/check/errors.brp) owns typed rejections, and
-   [values.brp](src/check/values.brp) privately owns expression inference.
+   [errors.brp](src/check/errors.brp) owns typed rejections and
+   [namespace.brp](src/check/namespace.brp) adapts namespace failures to them.
    Accepted record fields and variants retain their declaration identities and
    written names alongside complete field annotations, so later checking does
    not rejoin parsed declarations to recover those facts.
