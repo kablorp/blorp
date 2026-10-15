@@ -201,7 +201,9 @@ func main() -> Int:
 ```
 
 An arm block contains zero or more binding or Void expression statements and a final expression,
-indented deeper than its pattern. Inline and block arms can coexist.
+indented deeper than its pattern. An inline arm holds one value, or one
+statement (`None: failure = Some(error)`), as in the host; a statement arm
+has no value, which a tail match rejects. Inline and block arms can coexist.
 Each arm has its own scope; sibling arms can declare the same name. An explicit
 `var` may shadow an enclosing binding, and its initializer sees the earlier
 binding. Ordinary `=` still reassigns the nearest mutable binding or rejects

@@ -1951,6 +1951,14 @@ private fixed union BlockLine:
 	FinalLine(ValueExpression, ParserState)
 
 
+-- What one code line holds before its line end is read: a statement
+-- (binding, propagation, loop or loop control), which has consumed its own
+-- line end, or a value still to be ended.
+private fixed union LineForm:
+	StatementForm(ParsedStatement, ParserState)
+	ValueForm(ParsedValue)
+
+
 -- A line that declares a binding: `var`, a name followed by '=', '?=' or
 -- ':', or a keyword followed by '=' or '?=' so that `in = 1` reports the
 -- reserved word rather than a missing expression. `else:` is a block
@@ -2030,7 +2038,7 @@ private BINDING_LINE_MESSAGE: String = "expected a newline after the binding"
 private BINDING_LINE_HELP: String = "put each statement on its own line"
 
 
-private pure func consume_binding(state: ParserState) -> Result[BlockLine, Diagnostic]:
+private pure func consume_binding(state: ParserState) -> Result[LineForm, Diagnostic]:
 	mutability = if at_var(state):
 		MutableBinding
 	else:
@@ -2058,12 +2066,12 @@ private pure func consume_binding(state: ParserState) -> Result[BlockLine, Diagn
 				Err(expected(annotation.next, "`?=` cannot be used inside a loop body", "bind it before the loop, or use `match` inside the loop"))
 		value ?= consume_initializer(shifted(annotation.next, 1), Propagate, BINDING_LINE_MESSAGE, BINDING_LINE_HELP)
 		propagation = { name = name.name, annotation = annotation.written, value = value.body, span = { name.name.span | end = value.body.span.end } }
-		Ok(StatementLine(PropagatingBinding(propagation), value.next))
+		Ok(StatementForm(PropagatingBinding(propagation), value.next))
 	else:
 		equals ?= expect(annotation.next, at_equals(annotation.next), "expected '=' after the binding name", "write name = expression or var name = expression; a propagating binding is name ?= expression")
 		initializer ?= consume_initializer(equals, Assign, BINDING_LINE_MESSAGE, BINDING_LINE_HELP)
 		binding = { name = name.name, annotation = annotation.written, mutability = mutability, initializer = initializer.body }
-		Ok(StatementLine(BindingStatement(binding), initializer.next))
+		Ok(StatementForm(BindingStatement(binding), initializer.next))
 
 
 private fixed record OptionalAnnotation {
@@ -2085,6 +2093,25 @@ private pure func consume_optional_annotation(state: ParserState, message: Strin
 -- `import:` line is tested first so that it teaches where imports go rather
 -- than reporting `import` as a reserved binding name.
 private pure func consume_block_line(state: ParserState) -> Result[BlockLine, Diagnostic]:
+	form ?= consume_line_form(state)
+
+	match form:
+		StatementForm(statement, next):
+			Ok(StatementLine(statement, next))
+		ValueForm(value):
+			next ?= end_value(value, VALUE_LINE_MESSAGE, VALUE_LINE_HELP)
+
+			if at_dedent(next):
+				Ok(FinalLine(value.body, shifted(next, 1)))
+			else:
+				Ok(StatementLine(ExpressionStatement(value.body), next))
+
+
+-- The statement or value a code line starts with. A line-leading `if` or
+-- `match` is a statement-position form read under the current context;
+-- any other value line is a value position, and the line's own context is
+-- restored after it.
+private pure func consume_line_form(state: ParserState) -> Result[LineForm, Diagnostic]:
 	if at_import(state) and at_colon(shifted(state, 1)):
 		Err(expected(state, IMPORT_IN_BODY_MESSAGE, IMPORT_IN_BODY_HELP))
 	else if at_binding(state):
@@ -2098,51 +2125,39 @@ private pure func consume_block_line(state: ParserState) -> Result[BlockLine, Di
 			Some(control):
 				consume_loop_control(state, control)
 			None:
-				consume_expression_line(state)
-
-
--- A line-leading `if` or `match` is a statement-position form read under
--- the current context; any other line is a value.
-private pure func consume_expression_line(state: ParserState) -> Result[BlockLine, Diagnostic]:
-	start = if at_if(state) or at_match(state):
-		state
-	else:
-		value_position(state)
-	value ?= consume_value(start)
-	ended ?= end_value(value, VALUE_LINE_MESSAGE, VALUE_LINE_HELP)
-	next = with_context(ended, state.context)
-
-	if at_dedent(next):
-		Ok(FinalLine(value.body, shifted(next, 1)))
-	else:
-		Ok(StatementLine(ExpressionStatement(value.body), next))
+				start = if at_if(state) or at_match(state):
+					state
+				else:
+					value_position(state)
+				value ?= consume_value(start)
+				Ok(ValueForm({ value | next = with_context(value.next, state.context) }))
 
 
 -- `state` is at `while`: the condition, then a body read as a loop body.
 -- The loop's context ends with its block.
-private pure func consume_while(state: ParserState) -> Result[BlockLine, Diagnostic]:
+private pure func consume_while(state: ParserState) -> Result[LineForm, Diagnostic]:
 	keyword = parser_span(state)
 	condition ?= consume_value(value_position(shifted(state, 1)))
 	body ?= consume_header_block(with_context(condition.next, LoopBody), "expected `:` after while condition")
 	loop = { condition = condition.body, body = body.block, span = { keyword | end = body.block.span.end } }
-	Ok(StatementLine(WhileLoop(loop), with_context(body.next, state.context)))
+	Ok(StatementForm(WhileLoop(loop), with_context(body.next, state.context)))
 
 
 -- `state` is at `for`: `for name in iterable:` and a loop body.
-private pure func consume_for(state: ParserState) -> Result[BlockLine, Diagnostic]:
+private pure func consume_for(state: ParserState) -> Result[LineForm, Diagnostic]:
 	keyword = parser_span(state)
 	binder ?= consume_name(shifted(state, 1), "expected a loop variable after `for`")
 	in_word ?= expect(binder.next, at_in(binder.next), "expected `in` after for loop variable", KEYWORD_HELP)
 	iterable ?= consume_value(value_position(in_word))
 	body ?= consume_header_block(with_context(iterable.next, LoopBody), "expected `:` after for loop iterable")
 	loop = { binder = binder.name, iterable = iterable.body, body = body.block, span = { keyword | end = body.block.span.end } }
-	Ok(StatementLine(ForLoop(loop), with_context(body.next, state.context)))
+	Ok(StatementForm(ForLoop(loop), with_context(body.next, state.context)))
 
 
 -- `state` is at `break` or `continue`: a statement of its own line, valid
 -- only in a loop body (host 5.3) and never in an `if` or `match` used as a
 -- value within the loop (owner rule).
-private pure func consume_loop_control(state: ParserState, control: LoopControl) -> Result[BlockLine, Diagnostic]:
+private pure func consume_loop_control(state: ParserState, control: LoopControl) -> Result[LineForm, Diagnostic]:
 	keyword = parser_span(state)
 	words = loop_control_words(control)
 	placed ?= match state.context:
@@ -2158,7 +2173,7 @@ private pure func consume_loop_control(state: ParserState, control: LoopControl)
 			Break(keyword)
 		ContinueControl:
 			Continue(keyword)
-	Ok(StatementLine(statement, next))
+	Ok(StatementForm(statement, next))
 
 
 private fixed record LoopControlWords {
@@ -2256,16 +2271,25 @@ private fixed record ArmResult {
 }
 
 
--- `colon` follows the pattern: an inline value or an indented block follows.
+-- `colon` follows the pattern: an indented block, or one inline line that
+-- is a value or a statement (host case_body: a match case is the one place
+-- a statement may share the line with its header). A statement arm's block
+-- holds that statement and no value.
 private pure func consume_arm_result(colon: ParserState) -> Result[BlockResult, Diagnostic]:
 	if at_newline(colon):
 		newline = shifted(colon, 1)
 		opened ?= expect(newline, at_indent(newline), "expected an indented match arm result", "put the arm's statements and final value on lines indented deeper than its pattern")
 		consume_block(opened)
 	else:
-		value ?= consume_value(colon)
-		next ?= end_value(value, VALUE_LINE_MESSAGE, VALUE_LINE_HELP)
-		Ok({ block = { statements = [], value = Some(value.body), span = value.body.span }, next = next })
+		form ?= consume_line_form(colon)
+
+		match form:
+			StatementForm(statement, next):
+				first = parser_span(colon)
+				Ok({ block = { statements = [statement], value = None, span = { first | end = statement_end(statement) } }, next = next })
+			ValueForm(value):
+				next ?= end_value(value, VALUE_LINE_MESSAGE, VALUE_LINE_HELP)
+				Ok({ block = { statements = [], value = Some(value.body), span = value.body.span }, next = next })
 
 
 private pure func consume_arm(state: ParserState) -> Result[ArmResult, Diagnostic]:

@@ -1,0 +1,121 @@
+import:
+	../../../src/lex/lex: lex
+	../../../src/parse/parse: ParsedModule, module_contents, parse_module
+	../../../src/utils/names: program_names
+	../../../src/utils/source: module_source, root_module_id
+	../../../src/utils/syntax:
+		Diagnostic,
+		ExpressionBase(IntegerExpression),
+		ParsedBody(ParsedMatchBody),
+		ParsedFunction,
+		ParsedMatchArm,
+		ParsedStatement(BindingStatement, PropagatingBinding),
+	test: TestSuite
+
+
+private HEADER: String = "func main() -> Int:\n"
+
+
+private pure func parse_source(source: String) -> Result[ParsedModule, Diagnostic]:
+	tokens ?= lex(module_source(root_module_id()), source, program_names().names)
+	parse_module(tokens, root_module_id())
+
+
+private pure func main_function(source: String) -> Option[ParsedFunction]:
+	match parse_source(source):
+		Ok(parsed):
+			module_contents(parsed).functions.get(0)
+		Err(_):
+			None
+
+
+-- The arms of a function whose body is a tail match.
+private pure func tail_arms(source: String) -> Option[List[ParsedMatchArm]]:
+	match main_function(source):
+		Some(function):
+			match function.body:
+				ParsedMatchBody(form):
+					Some(form.arms)
+				_:
+					None
+		None:
+			None
+
+
+private pure func accepts(source: String) -> Bool:
+	parse_source(source).is_ok()
+
+
+private pure func rejects(source: String, start: Int, end: Int, message: String, help: String) -> Bool:
+	match parse_source(source):
+		Err(diagnostic):
+			diagnostic.span.start == start and diagnostic.span.end == end and diagnostic.message == message and diagnostic.help == help
+		Ok(_):
+			False
+
+
+-- `None: failure = Some(error)`: an inline assignment arm holds one
+-- statement and no value; its block spans the statement.
+pure func test_inline_assignment_arm_has_a_statement_and_no_value() -> Bool:
+	match tail_arms(HEADER + "\tmatch 1:\n\t\t_: failure = 2\n\t\tA: 3\n"):
+		Some([first, second]):
+			match (first.block.statements, first.block.value, second.block.statements, second.block.value):
+				([BindingStatement(binding)], None, [], Some(value)):
+					match (binding.initializer.base, value.base):
+						(IntegerExpression(2), IntegerExpression(3)):
+							first.block.span.start == 35 and first.block.span.end == 46 and first.span.end == 46
+						_:
+							False
+				_:
+					False
+		_:
+			False
+
+
+-- Every statement kind may stand inline: `var`, `?=`, a loop control and a
+-- loop (whose block follows on the next lines).
+pure func test_every_statement_kind_may_stand_inline() -> Bool:
+	accepts(HEADER + "\twhile True:\n\t\tmatch 1:\n\t\t\t_: var z = 1\n\t\t\tB: break\n\t\t\tC: while True:\n\t\t\t\tbreak\n\t0\n")
+
+
+pure func test_statement_arm_kinds_are_recorded() -> Bool:
+	match tail_arms(HEADER + "\tmatch 1:\n\t\t_: x ?= find(1)\n\t\tA: var z = 1\n"):
+		Some([first, second]):
+			match (first.block.statements, second.block.statements):
+				([PropagatingBinding(_)], [BindingStatement(_)]):
+					True
+				_:
+					False
+		_:
+			False
+
+
+pure func test_loop_control_arm_needs_a_loop() -> Bool:
+	(
+		rejects(HEADER + "\tmatch 1:\n\t\t_: break\n", 35, 40, "`break` can only be used inside a loop", "move `break` into a `while` or `for` body, or remove it")
+		and accepts(HEADER + "\twhile True:\n\t\tmatch 1:\n\t\t\t_: break\n\t0\n")
+	)
+
+
+-- An inline value arm is a value position only for its own line: the next
+-- arm of a statement `match` in a loop is back in the loop body.
+pure func test_inline_value_arm_leaves_the_loop_context() -> Bool:
+	accepts(HEADER + "\tfor x in [1]:\n\t\tmatch x:\n\t\t\tOk(_): void\n\t\t\tErr(_):\n\t\t\t\tbreak\n\t0\n")
+
+
+-- A statement arm still ends its line like a statement.
+pure func test_statement_arm_keeps_its_line_end_errors() -> Bool:
+	rejects(HEADER + "\tmatch 1:\n\t\t_: y = 1 2\n", 41, 42, "expected a newline after the binding", "put each statement on its own line")
+
+
+tests: TestSuite = {
+	description = "Blorp 2 inline statement arms",
+	tests = [
+		("inline assignment arm has a statement and no value", test_inline_assignment_arm_has_a_statement_and_no_value),
+		("every statement kind may stand inline", test_every_statement_kind_may_stand_inline),
+		("statement arm kinds are recorded", test_statement_arm_kinds_are_recorded),
+		("loop control arm needs a loop", test_loop_control_arm_needs_a_loop),
+		("statement arm keeps its line end errors", test_statement_arm_keeps_its_line_end_errors),
+		("inline value arm leaves the loop context", test_inline_value_arm_leaves_the_loop_context),
+	]
+}
