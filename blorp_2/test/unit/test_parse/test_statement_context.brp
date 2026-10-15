@@ -1,0 +1,88 @@
+import:
+	../../../src/lex/lex: lex
+	../../../src/parse/parse: ParsedModule, parse_module
+	../../../src/utils/names: program_names
+	../../../src/utils/source: module_source, root_module_id
+	../../../src/utils/syntax: Diagnostic
+	test: TestSuite
+
+
+private HEADER: String = "func main() -> Int:\n"
+
+private LOOP_ONLY_HELP: String = "move `break` into a `while` or `for` body, or remove it"
+
+private VALUE_HELP: String = "write the `if` or `match` as a statement on its own line, or move `break` out of it"
+
+private NO_PROPAGATION_MESSAGE: String = "`?=` cannot be used inside a loop body"
+
+private NO_PROPAGATION_HELP: String = "bind it before the loop, or use `match` inside the loop"
+
+
+private pure func parse_source(source: String) -> Result[ParsedModule, Diagnostic]:
+	tokens ?= lex(module_source(root_module_id()), source, program_names().names)
+	parse_module(tokens, root_module_id())
+
+
+private pure func accepts(source: String) -> Bool:
+	parse_source(source).is_ok()
+
+
+private pure func rejects(source: String, start: Int, end: Int, message: String, help: String) -> Bool:
+	match parse_source(source):
+		Err(diagnostic):
+			diagnostic.span.start == start and diagnostic.span.end == end and diagnostic.message == message and diagnostic.help == help
+		Ok(_):
+			False
+
+
+-- Host 5.3: `break` and `continue` need an enclosing loop body; a function
+-- body starts a new context, and a loop's context ends with its body.
+pure func test_loop_controls_need_a_loop() -> Bool:
+	(
+		rejects(HEADER + "\tbreak\n\t0\n", 21, 26, "`break` can only be used inside a loop", LOOP_ONLY_HELP)
+		and rejects(HEADER + "\tcontinue\n\t0\n", 21, 29, "`continue` can only be used inside a loop", "move `continue` into a `while` or `for` body, or remove it")
+		and rejects(HEADER + "\twhile True:\n\t\tx = 1\n\tbreak\n\t0\n", 42, 47, "`break` can only be used inside a loop", LOOP_ONLY_HELP)
+		and rejects(HEADER + "\tif True:\n\t\tbreak\n\t0\n", 32, 37, "`break` can only be used inside a loop", LOOP_ONLY_HELP)
+	)
+
+
+-- Statement-position `if` and `match` inside a loop body keep its context.
+pure func test_loop_controls_inside_statement_blocks_are_accepted() -> Bool:
+	(
+		accepts(HEADER + "\twhile True:\n\t\tbreak\n\t0\n")
+		and accepts(HEADER + "\tfor x in [1]:\n\t\tif True:\n\t\t\tbreak\n\t\telse:\n\t\t\tcontinue\n\t0\n")
+		and accepts(HEADER + "\twhile True:\n\t\tmatch 1:\n\t\t\t_:\n\t\t\t\tbreak\n\t0\n")
+		and accepts(HEADER + "\twhile True:\n\t\tfor y in [1]:\n\t\t\tbreak\n\t\tcontinue\n\t0\n")
+	)
+
+
+-- Owner rule: an `if` or `match` used as a value within a loop is no place
+-- for a loop control; a loop nested inside it starts a loop context again.
+pure func test_loop_controls_inside_value_blocks_are_rejected() -> Bool:
+	(
+		rejects(HEADER + "\twhile True:\n\t\tx = if True:\n\t\t\tbreak\n\t\telse:\n\t\t\t1\n\t0\n", 51, 56, "`break` cannot be used inside an `if` or `match` used as a value", VALUE_HELP)
+		and rejects(HEADER + "\twhile True:\n\t\tx = match 1:\n\t\t\t_:\n\t\t\t\tcontinue\n\t0\n", 58, 66, "`continue` cannot be used inside an `if` or `match` used as a value", "write the `if` or `match` as a statement on its own line, or move `continue` out of it")
+		and accepts(HEADER + "\twhile True:\n\t\tx = if True:\n\t\t\twhile True:\n\t\t\t\tbreak\n\t\t\t1\n\t\telse:\n\t\t\t2\n\t0\n")
+	)
+
+
+-- Host 5.3: `?=` is invalid anywhere inside a loop body, however nested;
+-- it is fine before and after the loop.
+pure func test_propagation_is_rejected_inside_loops() -> Bool:
+	(
+		rejects(HEADER + "\twhile True:\n\t\tx ?= find(1)\n\t0\n", 37, 39, NO_PROPAGATION_MESSAGE, NO_PROPAGATION_HELP)
+		and rejects(HEADER + "\tfor a in [1]:\n\t\tif True:\n\t\t\tx ?= find(1)\n\t0\n", 51, 53, NO_PROPAGATION_MESSAGE, NO_PROPAGATION_HELP)
+		and rejects(HEADER + "\twhile True:\n\t\ty = if True:\n\t\t\tx ?= find(1)\n\t\t\t1\n\t\telse:\n\t\t\t2\n\t0\n", 53, 55, NO_PROPAGATION_MESSAGE, NO_PROPAGATION_HELP)
+		and accepts(HEADER + "\ta ?= find(1)\n\twhile True:\n\t\tbreak\n\tb ?= find(2)\n\tb\n")
+	)
+
+
+tests: TestSuite = {
+	description = "Blorp 2 statement context",
+	tests = [
+		("loop controls need a loop", test_loop_controls_need_a_loop),
+		("loop controls inside statement blocks are accepted", test_loop_controls_inside_statement_blocks_are_accepted),
+		("loop controls inside value blocks are rejected", test_loop_controls_inside_value_blocks_are_rejected),
+		("propagation is rejected inside loops", test_propagation_is_rejected_inside_loops),
+	]
+}

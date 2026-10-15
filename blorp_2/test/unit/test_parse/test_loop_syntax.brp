@@ -1,0 +1,120 @@
+import:
+	../../../src/lex/lex: lex
+	../../../src/parse/parse: ParsedModule, module_contents, parse_module
+	../../../src/utils/names: program_names
+	../../../src/utils/source: module_source, root_module_id
+	../../../src/utils/syntax:
+		Diagnostic,
+		ExpressionBase(IntegerExpression, ListExpression, NameExpression),
+		ParsedBody(ParsedValueBody),
+		ParsedFunction,
+		ParsedStatement(Break, Continue, ForLoop, WhileLoop),
+	test: TestSuite
+
+
+private HEADER: String = "func main() -> Int:\n"
+
+private BLOCK_HEADER_HELP: String = "a block header ends with `:` before its indented body, as in `if condition:` or `func name() -> Type:`"
+
+private STATEMENT_HELP: String = "write it on a line of its own; a loop or loop control has no value to bind, pass or return"
+
+
+private pure func parse_source(source: String) -> Result[ParsedModule, Diagnostic]:
+	tokens ?= lex(module_source(root_module_id()), source, program_names().names)
+	parse_module(tokens, root_module_id())
+
+
+private pure func main_function(source: String) -> Option[ParsedFunction]:
+	match parse_source(source):
+		Ok(parsed):
+			module_contents(parsed).functions.get(0)
+		Err(_):
+			None
+
+
+private pure func rejects(source: String, start: Int, end: Int, message: String, help: String) -> Bool:
+	match parse_source(source):
+		Err(diagnostic):
+			diagnostic.span.start == start and diagnostic.span.end == end and diagnostic.message == message and diagnostic.help == help
+		Ok(_):
+			False
+
+
+-- `while condition:` is a statement with a block and no value; it spans
+-- from the keyword to the end of its body.
+pure func test_while_keeps_condition_body_and_span() -> Bool:
+	match main_function(HEADER + "\twhile True:\n\t\tx = 1\n\t\tbreak\n\t0\n"):
+		Some(function):
+			match (function.statements, function.body):
+				([WhileLoop(loop)], ParsedValueBody(value)):
+					match (loop.condition.base, loop.body.statements, value.base):
+						(NameExpression(_), [_, Break(keyword)], IntegerExpression(0)):
+							(
+								loop.span.start == 21 and loop.span.end == 48 and loop.condition.span.start == 27
+								and loop.body.span.start == 35 and loop.body.value.is_none() and keyword.start == 43 and keyword.end == 48
+							)
+						_:
+							False
+				_:
+					False
+		None:
+			False
+
+
+pure func test_for_keeps_binder_iterable_body_and_span() -> Bool:
+	match main_function(HEADER + "\tfor item in [1, 2]:\n\t\tcontinue\n\t0\n"):
+		Some(function):
+			match function.statements:
+				[ForLoop(loop)]:
+					match (loop.iterable.base, loop.body.statements):
+						(ListExpression([_, _]), [Continue(keyword)]):
+							(
+								loop.binder.span.start == 25 and loop.binder.span.end == 29 and loop.iterable.span.start == 33
+								and loop.span.start == 21 and loop.span.end == 51 and keyword.start == 43
+							)
+						_:
+							False
+				_:
+					False
+		None:
+			False
+
+
+-- A loop is never a block's value: a function ending in one still needs
+-- its final expression.
+pure func test_loop_cannot_end_a_function() -> Bool:
+	rejects(HEADER + "\twhile True:\n\t\tbreak\n", 41, 41, "expected a final expression after the bindings", "finish the function with a value expression or tail match")
+
+
+pure func test_loop_headers_use_the_host_words() -> Bool:
+	(
+		rejects(HEADER + "\twhile True\n\t\tbreak\n\t0\n", 31, 32, "expected `:` after while condition", BLOCK_HEADER_HELP)
+		and rejects(HEADER + "\tfor x in [1]\n\t\tbreak\n\t0\n", 33, 34, "expected `:` after for loop iterable", BLOCK_HEADER_HELP)
+		and rejects(HEADER + "\tfor x [1]:\n\t\tbreak\n\t0\n", 27, 28, "expected `in` after for loop variable", "a keyword is missing or misspelled: `in` follows a loop variable, `from` follows a select receive binding and `func` starts a function")
+		and rejects(HEADER + "\tfor in [1]:\n\t\tbreak\n\t0\n", 25, 27, "`in` is a reserved keyword and cannot be used as a name", "choose another identifier such as `in_name`")
+		and rejects(HEADER + "\tfor x in :\n\t\tbreak\n\t0\n", 30, 31, "expected a return expression", "use a literal, a parameter or variant name, or a call as the entire body")
+		and rejects(HEADER + "\twhile True: break\n\t0\n", 33, 38, "expected newline before indented block", "start the next statement or item on its own line")
+	)
+
+
+-- Loops and loop controls are statements: none of them is a value.
+pure func test_loops_and_controls_have_no_value() -> Bool:
+	(
+		rejects(HEADER + "\tx = while True:\n\t\tbreak\n\t0\n", 25, 30, "`while` is a statement and has no value", STATEMENT_HELP)
+		and rejects(HEADER + "\tx = for a in [1]:\n\t\tbreak\n\t0\n", 25, 28, "`for` is a statement and has no value", STATEMENT_HELP)
+		and rejects(HEADER + "\twhile True:\n\t\tx = break\n\t0\n", 39, 44, "`break` is a statement and has no value", STATEMENT_HELP)
+		and rejects(HEADER + "\twhile True:\n\t\tprint(continue)\n\t0\n", 41, 49, "`continue` is a statement and has no value", STATEMENT_HELP)
+		and rejects(HEADER + "\twhile True:\n\t\tbreak 1\n\t0\n", 41, 42, "expected a newline after `break`", "put `break` on a line of its own")
+	)
+
+
+tests: TestSuite = {
+	description = "Blorp 2 loop syntax",
+	tests = [
+		("while keeps condition, body and span", test_while_keeps_condition_body_and_span),
+		("for keeps binder, iterable, body and span", test_for_keeps_binder_iterable_body_and_span),
+		("loop cannot end a function", test_loop_cannot_end_a_function),
+		("loop headers use the host words", test_loop_headers_use_the_host_words),
+		("loops and controls have no value", test_loops_and_controls_have_no_value),
+	]
+}

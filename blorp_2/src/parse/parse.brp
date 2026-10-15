@@ -42,7 +42,9 @@ import:
 			FloatRemainderBuiltin, FloatToStringBuiltin, StringParseFloatBuiltin,
 		),
 		ParsedPropagation,
-		ParsedStatement(BindingStatement, PropagatingBinding, ExpressionStatement),
+		ParsedWhile,
+		ParsedFor,
+		ParsedStatement(BindingStatement, PropagatingBinding, ExpressionStatement, WhileLoop, ForLoop, Break, Continue),
 		ParsedUnion,
 		ParsedVariant,
 		PostfixOperation(ReceiverInvocation, FieldAccess),
@@ -53,7 +55,7 @@ import:
 			PureKeyword, FunctionKeyword, MatchKeyword, Wildcard, LeftParen, RightParen, Dot, Arrow,
 			Colon, Newline, Indent, Dedent, VarKeyword, VoidKeyword, Equals, QuestionEquals, LeftBracket, RightBracket,
 			LeftBrace, RightBrace, Bar, Comma, AtSign, Slash, Star, DotDot, Ellipsis, AndKeyword, OrKeyword, NotKeyword,
-			IfKeyword, ElseKeyword,
+			IfKeyword, ElseKeyword, WhileKeyword, ForKeyword, InKeyword, BreakKeyword, ContinueKeyword,
 			ImportKeyword, TypeKeyword, PrivateKeyword, RecordKeyword, UnionKeyword, BuiltinKeyword, AsKeyword, OpaqueKeyword,
 			IntoOpaqueKeyword, FromOpaqueKeyword,
 		),
@@ -73,11 +75,39 @@ import:
 
 -- `aliases` are the module aliases its import block declared so far; a name
 -- followed by '.' is a qualified name only when it is one of them.
+-- Where a statement stands, for the host's 5.3 rules: `break` and
+-- `continue` need a loop body; `?=` must be outside every loop; and none
+-- of them may sit in an `if` or `match` used as a value within a loop. A
+-- function body starts a new context, and a loop body ends with its block.
+private fixed union StatementContext:
+	FunctionBody
+	LoopBody
+	ValueInLoop
+
+
 private fixed record ParserState {
 	input: LexedProgram,
 	position: Int,
-	aliases: List[NameId]
+	aliases: List[NameId],
+	context: StatementContext
 }
+
+
+private pure func with_context(state: ParserState, context: StatementContext) -> ParserState:
+	{ state | context = context }
+
+
+-- A value read inside a loop body is a value position: its blocks admit no
+-- loop control. Elsewhere the context is unchanged. A line-leading `if` or
+-- `match` is not a value position: its condition or scrutinee and its
+-- blocks are read under the loop body's own context (a block-ended value
+-- in the header fails at the header's `:` anyway).
+private pure func value_position(state: ParserState) -> ParserState:
+	match state.context:
+		LoopBody:
+			with_context(state, ValueInLoop)
+		_:
+			state
 
 
 fixed union ImportOrigin:
@@ -393,6 +423,54 @@ private pure func at_else(state: ParserState) -> Bool:
 			False
 
 
+private pure func at_while(state: ParserState) -> Bool:
+	match current_symbol(state):
+		Some(WhileKeyword):
+			True
+		_:
+			False
+
+
+private pure func at_for(state: ParserState) -> Bool:
+	match current_symbol(state):
+		Some(ForKeyword):
+			True
+		_:
+			False
+
+
+private pure func at_in(state: ParserState) -> Bool:
+	match current_symbol(state):
+		Some(InKeyword):
+			True
+		_:
+			False
+
+
+private pure func at_match(state: ParserState) -> Bool:
+	match current_symbol(state):
+		Some(MatchKeyword):
+			True
+		_:
+			False
+
+
+private fixed union LoopControl:
+	BreakControl
+	ContinueControl
+
+
+-- The loop control a line starts with, if any.
+private pure func at_loop_control(state: ParserState) -> Option[LoopControl]:
+	match current_symbol(state):
+		Some(BreakKeyword):
+			Some(BreakControl)
+		Some(ContinueKeyword):
+			Some(ContinueControl)
+		_:
+			None
+
+
 private pure func at_dot_dot(state: ParserState) -> Bool:
 	match current_symbol(state):
 		Some(DotDot):
@@ -614,6 +692,10 @@ private pure func reserved_name(span: Span, spelling: String) -> Diagnostic:
 		Text.concat(Text.concat("`", spelling), "` is a reserved keyword and cannot be used as a name"),
 		Text.concat(Text.concat("choose another identifier such as `", spelling), "_name`"),
 	)
+
+
+private pure func statement_as_value(state: ParserState, message: String) -> Diagnostic:
+	expected(state, message, "write it on a line of its own; a loop or loop control has no value to bind, pass or return")
 
 
 private fixed record ParsedName {
@@ -1060,6 +1142,14 @@ private pure func consume_base(start: ParserState, token: Token) -> Result[Parse
 			consume_opaque_conversion(start, Wrapping)
 		SymbolToken(FromOpaqueKeyword):
 			consume_opaque_conversion(start, Unwrapping)
+		SymbolToken(WhileKeyword):
+			Err(statement_as_value(start, "`while` is a statement and has no value"))
+		SymbolToken(ForKeyword):
+			Err(statement_as_value(start, "`for` is a statement and has no value"))
+		SymbolToken(BreakKeyword):
+			Err(statement_as_value(start, "`break` is a statement and has no value"))
+		SymbolToken(ContinueKeyword):
+			Err(statement_as_value(start, "`continue` is a statement and has no value"))
 		-- In any value position: a dangling `else` line, or `x = else`.
 		SymbolToken(ElseKeyword):
 			Err(expected(start, "`else` has no matching `if`", "write else on its own line at the indentation of its if, directly after the if branch; else is not a value"))
@@ -1728,17 +1818,17 @@ private pure func indented_value_words(operator: BindingOperator) -> IndentedVal
 -- the line end.
 private pure func consume_initializer(equals: ParserState, operator: BindingOperator, line_message: String, line_help: String) -> Result[ParsedValue, Diagnostic]:
 	if not at_newline(equals):
-		value ?= consume_value(equals)
+		value ?= consume_value(value_position(equals))
 		next ?= end_value(value, line_message, line_help)
-		Ok({ value | next = next })
+		Ok({ value | next = with_context(next, equals.context) })
 	else:
 		after_newline = shifted(equals, 1)
 		words = indented_value_words(operator)
 		opened ?= expect(after_newline, at_indent(after_newline), words.indented, words.help)
-		value ?= consume_value(opened)
+		value ?= consume_value(value_position(opened))
 		ended ?= end_value(value, words.one_expression, words.help)
 		closed ?= expect(ended, at_dedent(ended), words.one_expression, words.help)
-		Ok({ value | next = closed })
+		Ok({ value | next = with_context(closed, equals.context) })
 
 
 private BINDING_LINE_MESSAGE: String = "expected a newline after the binding"
@@ -1767,6 +1857,11 @@ private pure func consume_binding(state: ParserState) -> Result[BlockLine, Diagn
 			False
 
 	if propagating:
+		outside_loops ?= match state.context:
+			FunctionBody:
+				Ok(void)
+			_:
+				Err(expected(annotation.next, "`?=` cannot be used inside a loop body", "bind it before the loop, or use `match` inside the loop"))
 		value ?= consume_initializer(shifted(annotation.next, 1), Propagate, BINDING_LINE_MESSAGE, BINDING_LINE_HELP)
 		propagation = { name = name.name, annotation = annotation.written, value = value.body, span = { name.name.span | end = value.body.span.end } }
 		Ok(StatementLine(PropagatingBinding(propagation), value.next))
@@ -1800,14 +1895,109 @@ private pure func consume_block_line(state: ParserState) -> Result[BlockLine, Di
 		Err(expected(state, IMPORT_IN_BODY_MESSAGE, IMPORT_IN_BODY_HELP))
 	else if at_binding(state):
 		consume_binding(state)
+	else if at_while(state):
+		consume_while(state)
+	else if at_for(state):
+		consume_for(state)
 	else:
-		value ?= consume_value(state)
-		next ?= end_value(value, VALUE_LINE_MESSAGE, VALUE_LINE_HELP)
+		match at_loop_control(state):
+			Some(control):
+				consume_loop_control(state, control)
+			None:
+				consume_expression_line(state)
 
-		if at_dedent(next):
-			Ok(FinalLine(value.body, shifted(next, 1)))
-		else:
-			Ok(StatementLine(ExpressionStatement(value.body), next))
+
+-- A line-leading `if` or `match` is a statement-position form read under
+-- the current context; any other line is a value.
+private pure func consume_expression_line(state: ParserState) -> Result[BlockLine, Diagnostic]:
+	start = if at_if(state) or at_match(state):
+		state
+	else:
+		value_position(state)
+	value ?= consume_value(start)
+	ended ?= end_value(value, VALUE_LINE_MESSAGE, VALUE_LINE_HELP)
+	next = with_context(ended, state.context)
+
+	if at_dedent(next):
+		Ok(FinalLine(value.body, shifted(next, 1)))
+	else:
+		Ok(StatementLine(ExpressionStatement(value.body), next))
+
+
+-- `state` is at `while`: the condition, then a body read as a loop body.
+-- The loop's context ends with its block.
+private pure func consume_while(state: ParserState) -> Result[BlockLine, Diagnostic]:
+	keyword = parser_span(state)
+	condition ?= consume_value(value_position(shifted(state, 1)))
+	body ?= consume_header_block(with_context(condition.next, LoopBody), "expected `:` after while condition")
+	loop = { condition = condition.body, body = body.block, span = { keyword | end = body.block.span.end } }
+	Ok(StatementLine(WhileLoop(loop), with_context(body.next, state.context)))
+
+
+-- `state` is at `for`: `for name in iterable:` and a loop body.
+private pure func consume_for(state: ParserState) -> Result[BlockLine, Diagnostic]:
+	keyword = parser_span(state)
+	binder ?= consume_name(shifted(state, 1), "expected a loop variable after `for`")
+	in_word ?= expect(binder.next, at_in(binder.next), "expected `in` after for loop variable", "a keyword is missing or misspelled: `in` follows a loop variable, `from` follows a select receive binding and `func` starts a function")
+	iterable ?= consume_value(value_position(in_word))
+	body ?= consume_header_block(with_context(iterable.next, LoopBody), "expected `:` after for loop iterable")
+	loop = { binder = binder.name, iterable = iterable.body, body = body.block, span = { keyword | end = body.block.span.end } }
+	Ok(StatementLine(ForLoop(loop), with_context(body.next, state.context)))
+
+
+-- `state` is at `break` or `continue`: a statement of its own line, valid
+-- only in a loop body (host 5.3) and never in an `if` or `match` used as a
+-- value within the loop (owner rule).
+private pure func consume_loop_control(state: ParserState, control: LoopControl) -> Result[BlockLine, Diagnostic]:
+	keyword = parser_span(state)
+	words = loop_control_words(control)
+	placed ?= match state.context:
+		LoopBody:
+			Ok(void)
+		FunctionBody:
+			Err(expected(state, words.outside_loop, words.outside_loop_help))
+		ValueInLoop:
+			Err(expected(state, words.in_value, words.in_value_help))
+	next ?= consume_line_end(shifted(state, 1), words.line, words.line_help)
+	statement = match control:
+		BreakControl:
+			Break(keyword)
+		ContinueControl:
+			Continue(keyword)
+	Ok(StatementLine(statement, next))
+
+
+private fixed record LoopControlWords {
+	outside_loop: String,
+	outside_loop_help: String,
+	in_value: String,
+	in_value_help: String,
+	line: String,
+	line_help: String
+}
+
+
+-- The host's words for `break`, and the same for `continue`.
+private pure func loop_control_words(control: LoopControl) -> LoopControlWords:
+	match control:
+		ContinueControl:
+			{
+				outside_loop = "`continue` can only be used inside a loop",
+				outside_loop_help = "move `continue` into a `while` or `for` body, or remove it",
+				in_value = "`continue` cannot be used inside an `if` or `match` used as a value",
+				in_value_help = "write the `if` or `match` as a statement on its own line, or move `continue` out of it",
+				line = "expected a newline after `continue`",
+				line_help = "put `continue` on a line of its own"
+			}
+		BreakControl:
+			{
+				outside_loop = "`break` can only be used inside a loop",
+				outside_loop_help = "move `break` into a `while` or `for` body, or remove it",
+				in_value = "`break` cannot be used inside an `if` or `match` used as a value",
+				in_value_help = "write the `if` or `match` as a statement on its own line, or move `break` out of it",
+				line = "expected a newline after `break`",
+				line_help = "put `break` on a line of its own"
+			}
 
 
 private fixed record BlockResult {
@@ -1825,6 +2015,14 @@ private pure func statement_end(statement: ParsedStatement) -> Int:
 			propagation.value.span.end
 		ExpressionStatement(value):
 			value.span.end
+		WhileLoop(loop):
+			loop.span.end
+		ForLoop(loop):
+			loop.span.end
+		Break(span):
+			span.end
+		Continue(span):
+			span.end
 
 
 -- The lines of an indented block, after its Indent, in one loop: statement
@@ -2933,7 +3131,7 @@ pure func parse_module(input: LexedProgram, module: ModuleId) -> Result[ParsedMo
 	var opaques: List[ParsedOpaque] = []
 	var constants: List[ParsedConstant] = []
 	-- One Result carries the parser to the end of the module or to the first error.
-	var scan: Result[ParserState, Diagnostic] = Ok({ input = input, position = 0, aliases = [] })
+	var scan: Result[ParserState, Diagnostic] = Ok({ input = input, position = 0, aliases = [], context = FunctionBody })
 
 	while True:
 		match scan:

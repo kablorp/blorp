@@ -1053,7 +1053,15 @@ Lexical and layout rules:
   the same line, or stands alone on the next line indented one level, and may
   continue inside brackets. `name ?= expression` is a propagating binding:
   it parses like a binding (never with `var`), and checking rejects it until
-  the join milestone. Bindings and bare expression statements may interleave before
+  the join milestone. `while condition:` and `for name in iterable:` open a
+  loop body; they, `break` and `continue` are statements with no value, and a
+  loop control stands alone on its line (`break 1` is rejected here while the
+  host still accepts it, pending GRAMMAR D10).
+  As in the host, `break` and `continue` need an enclosing loop body and
+  `?=` may not appear anywhere inside one; by owner decision none of the
+  three may sit in an `if` or `match` used as a value within a loop. The
+  parser enforces those rules; checking rejects loops until the loops
+  milestone. Bindings and bare expression statements may interleave before
   the mandatory final expression or function tail match. A non-final bare
   expression must return Void; bind or return other values. Bindings inside
   arguments and annotations are unsupported. An arm block may end with a
