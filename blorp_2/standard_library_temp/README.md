@@ -13,7 +13,7 @@ The library root contains two designated foundation modules:
   modules receive its selections, and it cannot be imported explicitly.
 
 Library modules receive nothing implicitly. Each one imports what it uses,
-including base types, for example `_base: Int, Bool(True, False)` in `int.brp`.
+including base types, for example `_base: Int, Bool` in `int.brp`.
 They import only other library modules and `_base`, never user modules.
 
 For example, `42.add(1).to_string().length()` needs no imports. Direct calls
@@ -54,8 +54,9 @@ Bool, Option and Result are ordinary fixed unions owned by `_base.brp`; user
 modules receive their types and constructors through the prelude. Separate Bool,
 Option and Result operation modules are deferred until operations need them. The String adapter
 exposes strict counted-byte `parse_int`, `parse_float` and `equals` operations.
-Their builtin bodies explicitly bind the ordinary result constructors; names
-and declaration order have no hidden runtime meaning. Copied upstream source
+Their builtin bodies name only the operation; results refer to the
+foundation's designated Bool and Option, found by name in `_base.brp`, and
+layout follows the unions' declaration order. Copied upstream source
 is reference material outside this input library, with provenance beside each
 adapter. Traits and FFI remain inactive.
 

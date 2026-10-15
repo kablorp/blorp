@@ -1,29 +1,25 @@
 import:
-	../../../src/utils/names: program_names
-	../../../src/check/check: CheckedProgram, check_errors, checked_functions
+	../../../src/check/check: CheckedProgram, check, check_errors, checked_functions
 	../../../src/check/errors as Errors
 	../../../src/check/model as Check
 	../../../src/check/render: render_failure
 	../../../src/utils/ids as Declaration
-	../../../src/lex/lex: lex
 	../../../src/lower/lower as Lower
 	../../../src/own/own as Own
 	../../../src/namespace/builtins as Builtins
-	../../../src/utils/source: module_source, root_module_id
 	../../../src/specialize/specialize as Concrete
 	../../../src/utils/syntax: Diagnostic, Purity(Pure), ParsedRuntimeOperation(IntegerEqualsBuiltin)
-	../compilation: compile
-	../input: check, check_failure, parse, setup_diagnostic
+	../compilation: compile_modules
+	../input: setup_diagnostic, singleton_check_error
+	../module_input: TEST_BASE, parse_modules
 	option: get_or
 	test: TestSuite
 
 
+-- The test foundation declares Bool as True, then False.
 private SOURCE: String =
-	|fixed union Answer:
-	|    Different
-	|    Identical
-	|pure func compare(left: Int, right: Int) -> Answer:
-	|    builtin("int.equals", Identical, Different)
+	|pure func compare(left: Int, right: Int) -> Bool:
+	|    builtin("int.equals")
 	|func main() -> Int:
 	|    compared = compare(20, 22)
 	|    0
@@ -31,25 +27,25 @@ private SOURCE: String =
 
 
 private pure func checked(source: String) -> Result[CheckedProgram, Diagnostic]:
-	tokens ?= lex(module_source(root_module_id()), source, program_names().names)
-	parsed ?= parse(tokens)
+	parsed ?= parse_modules([{ source = source, targets = [] }])
 	check(parsed).map_err(setup_diagnostic)
 
 
-pure func test_checked_comparison_preserves_reversed_roles_and_int_parameters() -> Bool:
+pure func test_checked_comparison_returns_designated_bool_with_int_parameters() -> Bool:
 	match checked(SOURCE):
 		Err(_): False
 		Ok(program):
 			match checked_functions(program).functions:
 				[function, _]:
-					match function.body:
-						Check.CheckedValueBody(Check.ReturnExpression(value)):
+					match (function.signature.return_type.value_type, function.body):
+						(Check.UnionType(owner), Check.CheckedValueBody(Check.ReturnExpression(value))):
 							match value.form:
 								Check.InvokeFunction(call, [left, right]):
 									match call.target:
-										Check.RuntimeFunction(Builtins.IntEquals(roles)):
-											(Declaration.variant_number(roles.equal) == 1
-											and Declaration.variant_number(roles.different) == 0
+										Check.RuntimeFunction(Builtins.IntEquals(boolean)):
+											(Declaration.variant_number(boolean.true_variant) == 0
+											and Declaration.variant_number(boolean.false_variant) == 1
+											and Declaration.union_number(Declaration.variant_owner(boolean.true_variant)) == Declaration.union_number(owner)
 											and Check.same_type(left.value_type, Check.IntType)
 											and Check.same_type(right.value_type, Check.IntType))
 										_: False
@@ -58,7 +54,7 @@ pure func test_checked_comparison_preserves_reversed_roles_and_int_parameters() 
 				_: False
 
 
-pure func test_specialization_translates_roles_to_result_instance() -> Bool:
+pure func test_specialization_translates_bool_constructors_to_result_instance() -> Bool:
 	match checked(SOURCE).and_then(pure func(program): Concrete.specialize(program)):
 		Err(_): False
 		Ok(program):
@@ -69,11 +65,11 @@ pure func test_specialization_translates_roles_to_result_instance() -> Bool:
 							match (value.form, value.value_type):
 								(Concrete.InvokeFunction(call, [_, _]), Concrete.UnionType(owner)):
 									match call.target:
-										Concrete.RuntimeFunction(Builtins.IntEquals(roles)):
-											(Concrete.variant_number(roles.equal) == 1
-											and Concrete.variant_number(roles.different) == 0
-											and Concrete.union_number(Concrete.variant_owner(roles.equal)) == Concrete.union_number(owner)
-											and Concrete.union_number(Concrete.variant_owner(roles.different)) == Concrete.union_number(owner))
+										Concrete.RuntimeFunction(Builtins.IntEquals(boolean)):
+											(Concrete.variant_number(boolean.true_variant) == 0
+											and Concrete.variant_number(boolean.false_variant) == 1
+											and Concrete.union_number(Concrete.variant_owner(boolean.true_variant)) == Concrete.union_number(owner)
+											and Concrete.union_number(Concrete.variant_owner(boolean.false_variant)) == Concrete.union_number(owner))
 										_: False
 								_: False
 						_: False
@@ -102,111 +98,99 @@ pure func test_ownership_keeps_numeric_comparison_unmanaged() -> Bool:
 				_: False
 
 
+-- True is the designated union's first variant, so equality selects tag 0.
 pure func test_emission_uses_numeric_comparison_and_explicit_tags() -> Bool:
-	match compile(SOURCE):
+	match compile_modules([{ source = SOURCE, targets = [] }], TEST_BASE):
 		Err(_): False
 		Ok(output):
-			(output.contains("(blorp_vl_0==blorp_vl_1)?blorp_v_0_1:blorp_v_0_0")
+			(output.contains("(blorp_vl_0==blorp_vl_1)?blorp_v_0_0:blorp_v_0_1")
 			and not output.contains("blorp_string_equals")
 			and not output.contains("blorp_int_equals"))
 
 
-pure func test_runtime_contract_is_pure_binary_int_to_ordinary_union() -> Bool:
-	operation: Builtins.RuntimeOperation[Int, Concrete.TypeRef] = Builtins.IntEquals({ equal = 17, different = 29 })
+pure func test_runtime_contract_is_pure_binary_int_to_designated_bool() -> Bool:
+	operation: Builtins.RuntimeOperation[Int, Concrete.TypeRef] = Builtins.IntEquals({ true_variant = 17, false_variant = 29 })
 	contract = Builtins.runtime_contract(operation)
 	match (contract.purity, contract.parameters, contract.return_type):
-		(Pure, [Builtins.PrimitiveRuntimeType(Builtins.BuiltinInt), Builtins.PrimitiveRuntimeType(Builtins.BuiltinInt)], Builtins.BooleanResult(roles)):
-			roles.equal == 17 and roles.different == 29
+		(Pure, [Builtins.PrimitiveRuntimeType(Builtins.BuiltinInt), Builtins.PrimitiveRuntimeType(Builtins.BuiltinInt)], Builtins.BooleanResult(boolean)):
+			boolean.true_variant == 17 and boolean.false_variant == 29
 		_: False
 
 
-pure func test_checker_rejects_string_parameter_contract() -> Bool:
-	source: String =
-		|fixed union Answer:
-		|    Different
-		|    Identical
-		|pure func compare(left: String, right: Int) -> Answer:
-		|    builtin("int.equals", Identical, Different)
-		|func main() -> Int:
-		|    0
-		|
-	match check_failure(source):
-		None: False
-		Some(error):
-			match error.kind:
-				Errors.BuiltinRejection(Errors.BuiltinContractMismatch(IntegerEqualsBuiltin(_, _))):
-					match checked(source):
-						Ok(_): False
-						Err(diagnostic):
-							(error.span.start == source.index_of("\"int.equals\"").get_or(-1)
-							and error.span.end == error.span.start + "\"int.equals\"".length()
-							and diagnostic.message == "builtin declaration does not match its runtime contract"
-							and diagnostic.help == "declare a pure nongeneric function with two Int parameters returning a union of two empty variants"
-							and diagnostic.span.start == error.span.start
-							and diagnostic.span.end == error.span.end
-							and diagnostic.note.is_none())
-				_: False
-
-
-pure func test_checker_rejects_duplicate_roles_with_exact_diagnostic() -> Bool:
-	source: String =
-		|fixed union Answer:
-		|    Different
-		|    Identical
-		|pure func compare(left: Int, right: Int) -> Answer:
-		|    builtin("int.equals", Identical, Identical)
-		|func main() -> Int:
-		|    0
-		|
-	match lex(module_source(root_module_id()), source, program_names().names).and_then(pure func(tokens): parse(tokens)):
+private pure func rejects_contract(source: String) -> Bool:
+	match parse_modules([{ source = source, targets = [] }]):
 		Err(_): False
 		Ok(parsed):
 			match check(parsed):
 				Ok(_): False
 				Err(failure):
-					errors = check_errors(failure)
 					rendered = render_failure(failure)
-					match errors.first.kind:
-						Errors.BuiltinRejection(Errors.BuiltinRoleCoverage):
-							(errors.remaining.is_empty() and rendered.remaining.is_empty()
-							and rendered.first.message == "builtin constructors must cover the complete result union"
-							and rendered.first.help == "bind two distinct constructors and declare exactly those two variants"
-							and rendered.first.span.start == source.index_of("\"int.equals\"").get_or(-1)
-							and rendered.first.span.end == rendered.first.span.start + "\"int.equals\"".length()
-							and rendered.first.note.is_none())
-						_: False
+					label = source.index_of("\"int.equals\"").get_or(-1)
+					match singleton_check_error(check_errors(failure)):
+						Some(error):
+							match error.kind:
+								Errors.BuiltinRejection(Errors.BuiltinContractMismatch(IntegerEqualsBuiltin)):
+									(rendered.remaining.is_empty()
+									and rendered.first.message == "builtin declaration does not match its runtime contract"
+									and rendered.first.help == "declare a pure nongeneric function with two Int parameters returning Bool"
+									and rendered.first.span.start == label
+									and rendered.first.span.end == label + "\"int.equals\"".length()
+									and rendered.first.note.is_none())
+								_: False
+						None: False
 
 
-pure func test_parser_requires_explicit_comparison_roles() -> Bool:
+pure func test_checker_rejects_string_parameter_contract() -> Bool:
+	source: String =
+		|pure func compare(left: String, right: Int) -> Bool:
+		|    builtin("int.equals")
+		|func main() -> Int:
+		|    0
+		|
+	rejects_contract(source)
+
+
+-- Bool is an identity, not a shape: an equal-shaped union is still rejected.
+pure func test_checker_rejects_comparison_into_an_ordinary_union() -> Bool:
 	source: String =
 		|fixed union Answer:
-		|    Different
 		|    Identical
+		|    Different
 		|pure func compare(left: Int, right: Int) -> Answer:
 		|    builtin("int.equals")
+		|func main() -> Int:
+		|    0
+		|
+	rejects_contract(source)
+
+
+pure func test_parser_rejects_constructor_arguments_after_the_label() -> Bool:
+	source: String =
+		|pure func compare(left: Int, right: Int) -> Bool:
+		|    builtin("int.equals", True, False)
 		|func main() -> Int:
 		|    0
 		|
 	match checked(source):
 		Ok(_): False
 		Err(error):
-			(error.message == "expected constructor roles after the builtin label"
-			and error.help == "bind the two result constructors after the quoted label"
+			(error.message == "expected ')' after the builtin label"
+			and error.help == "give the builtin one quoted label; Bool and Option results use the foundation's unions"
 			and error.span.start == source.index_of("\"int.equals\"").get_or(-1) + "\"int.equals\"".length()
 			and error.span.end == error.span.start + 1
 			and error.note.is_none())
 
 
 tests: TestSuite = {
-	description = "Blorp 2 Int equality through ordinary Bool roles",
+	description = "Blorp 2 Int equality through the designated Bool",
 	tests = [
-		("checked reversed roles and numeric parameters", test_checked_comparison_preserves_reversed_roles_and_int_parameters),
-		("specialized result instance roles", test_specialization_translates_roles_to_result_instance),
+		("checked designated Bool and numeric parameters", test_checked_comparison_returns_designated_bool_with_int_parameters),
+		("specialized result instance constructors", test_specialization_translates_bool_constructors_to_result_instance),
 		("unmanaged numeric comparison", test_ownership_keeps_numeric_comparison_unmanaged),
 		("direct numeric C comparison", test_emission_uses_numeric_comparison_and_explicit_tags),
-		("pure numeric runtime contract", test_runtime_contract_is_pure_binary_int_to_ordinary_union),
+		("pure numeric runtime contract", test_runtime_contract_is_pure_binary_int_to_designated_bool),
 		("reject String parameter contract", test_checker_rejects_string_parameter_contract),
-		("reject duplicate result roles", test_checker_rejects_duplicate_roles_with_exact_diagnostic),
-		("parser requires explicit roles", test_parser_requires_explicit_comparison_roles),
+		("reject comparison into an ordinary union", test_checker_rejects_comparison_into_an_ordinary_union),
+		("parser rejects constructor arguments", test_parser_rejects_constructor_arguments_after_the_label),
 	]
 }

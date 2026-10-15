@@ -13,7 +13,7 @@ import:
 	../compilation: compile, compile_modules
 	float as FloatOps
 	../input: setup_diagnostic
-	../module_input: PRIMITIVE_BASE, STRING_OPERATIONS, parse_modules, parse_modules_with_base
+	../module_input: PRIMITIVE_BASE, STRING_OPERATIONS, TEST_BASE, parse_modules, parse_modules_with_base
 	test: TestSuite
 
 
@@ -159,22 +159,19 @@ pure func test_format_selects_fresh_string_runtime() -> Bool:
 			False
 
 
-pure func test_parse_float_uses_ordinary_reversed_constructor_roles() -> Bool:
+pure func test_parse_float_returns_the_designated_option() -> Bool:
 	source: String =
-		|fixed union Maybe[T]:
-		|    Empty
-		|    Full(T)
-		|pure func parse_number(text: String) -> Maybe[Float]:
-		|    builtin("string.parse_float", Full, Empty)
+		|pure func parse_number(text: String) -> Option[Float]:
+		|    builtin("string.parse_float")
 		|pure func consume(text: String) -> Int:
 		|    match parse_number(text):
-		|        Full(value): 0
-		|        Empty: 1
+		|        Some(value): 0
+		|        None: 1
 		|func main() -> Int:
 		|    consume("6.5")
 		|
 
-	match compile(source):
+	match compile_modules([{ source = source, targets = [] }], TEST_BASE):
 		Ok(output):
 			(
 				output.contains("double blorp_runtime_")
@@ -386,13 +383,10 @@ pure func test_arithmetic_only_source_selects_no_string_float_fragment() -> Bool
 			False
 
 
-pure func test_checked_parse_roles_use_float_payload_not_int() -> Bool:
+pure func test_checked_parse_option_uses_float_payload_not_int() -> Bool:
 	source: String =
-		|fixed union Maybe[T]:
-		|    Empty
-		|    Full(T)
-		|pure func parse_number(text: String) -> Maybe[Float]:
-		|    builtin("string.parse_float", Full, Empty)
+		|pure func parse_number(text: String) -> Option[Float]:
+		|    builtin("string.parse_float")
 		|func main() -> Int:
 		|    parsed = parse_number("1.25")
 		|    0
@@ -423,25 +417,25 @@ pure func test_checked_parse_roles_use_float_payload_not_int() -> Bool:
 							match value.form:
 								Concrete.InvokeFunction(call, [_]):
 									match call.target:
-										Concrete.RuntimeFunction(Builtins.StringParseFloat(roles)):
-											owner = Concrete.variant_owner(roles.present)
+										Concrete.RuntimeFunction(Builtins.StringParseFloat(option)):
+											owner = Concrete.variant_owner(option.some)
 
 											match contents.unions.get(Concrete.union_number(owner)):
 												Some(layout):
 													match (layout.variants, layout.representation):
-														([[], [Concrete.FloatType]], Concrete.InlineUnmanaged):
+														([[Concrete.FloatType], []], Concrete.InlineUnmanaged):
 															(
 																Concrete.variant_number(
-																	roles.present,
-																) == 1
-																and Concrete.variant_number(
-																	roles.absent,
+																	option.some,
 																) == 0
+																and Concrete.variant_number(
+																	option.none,
+																) == 1
 																and Concrete.union_number(
 																	owner,
 																) == Concrete.union_number(
 																	Concrete.variant_owner(
-																		roles.absent,
+																		option.none,
 																	),
 																)
 																and Concrete.same_type(
@@ -536,7 +530,6 @@ pure func test_duplicate_float_foundation_role_has_exact_occurrence() -> Bool:
 private fixed union RejectionKind:
 	MainType
 	RuntimeContract
-	RolePayload
 
 
 private pure func check_rejects(
@@ -571,8 +564,6 @@ private pure func check_rejects(
 						(Errors.SignatureRejection(Errors.MainReturnType(Check.FloatType)), MainType):
 							True
 						(Errors.BuiltinRejection(Errors.BuiltinContractMismatch(_)), RuntimeContract):
-							True
-						(Errors.BuiltinRejection(Errors.BuiltinRolePayload), RolePayload):
 							True
 						_:
 							False
@@ -634,7 +625,7 @@ pure func test_direct_float_union_payload_publishes_float_type() -> Bool:
 			match check(parsed):
 				Ok(program):
 					match checked_functions(program).unions:
-						[raw]:
+						[raw, _, _, _]:
 							match raw.variants:
 								[variant]:
 									match variant.fields:
@@ -682,24 +673,22 @@ pure func test_float_formatter_contract_rejects_int_parameter() -> Bool:
 
 pure func test_parse_float_checker_rejects_int_option_payload() -> Bool:
 	prefix: String =
-		|fixed union Maybe[T]:
-		|    Empty
-		|    Full(T)
-		|pure func parse_number(text: String) -> Maybe[Int]:
+		|pure func parse_number(text: String) -> Option[Int]:
 		|
 	tail: String =
 		|func main() -> Int:
 		|    0
 		|
-	body = "    builtin(\"string.parse_float\", "
+	body = "    builtin("
+	label = "\"string.parse_float\""
 	start = prefix.length() + body.length()
 	check_rejects(
-		prefix + body + "Full, Empty)\n" + tail,
-		RolePayload,
+		prefix + body + label + ")\n" + tail,
+		RuntimeContract,
 		start,
-		start + 4,
-		"builtin constructor has the wrong payload",
-		"bind the required payload constructor first and the empty constructor second",
+		start + label.length(),
+		"builtin declaration does not match its runtime contract",
+		"declare a pure nongeneric function with one String parameter returning Option[Float]",
 	)
 
 
@@ -742,8 +731,8 @@ tests: TestSuite = {
 			test_arithmetic_only_source_selects_no_string_float_fragment,
 		),
 		(
-			"parse roles use concrete Float payload",
-			test_checked_parse_roles_use_float_payload_not_int,
+			"parse Option uses concrete Float payload",
+			test_checked_parse_option_uses_float_payload_not_int,
 		),
 		("fraction reaches exact C bits", test_fraction_reaches_exact_c_bits),
 		("negative zero reaches signed C zero", test_negative_zero_reaches_signed_c_zero),
@@ -763,8 +752,8 @@ tests: TestSuite = {
 		("remainder uses closed Float contract", test_remainder_uses_closed_float_contract),
 		("format selects fresh String runtime", test_format_selects_fresh_string_runtime),
 		(
-			"parse Float uses reversed ordinary roles",
-			test_parse_float_uses_ordinary_reversed_constructor_roles,
+			"parse Float returns the designated Option",
+			test_parse_float_returns_the_designated_option,
 		),
 		(
 			"integer-only program has no Float runtime",

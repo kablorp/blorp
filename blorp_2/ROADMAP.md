@@ -266,8 +266,8 @@ The List storage contract holds for every list operation:
   each new stored occurrence independently, including duplicate pointers. Moved-
   from slots no longer own elements.
 - Accepted operations carry their element type (`ListRepeat(E)`,
-  `ListLength(E)`, `ListGet(E, roles)`); Some/None roles are compile-time
-  constructor identities from the declared result union.
+  `ListLength(E)`, `ListGet(E, option)`); `option` holds the designated
+  Option's Some/None constructor identities, translated per result instance.
 - A disposable emitter-local inventory derives needed List element types in one
   walk and owns no layouts or identities; C names project from semantic types,
   with no per-value linear lookup. Avoid depth quadratics.
@@ -302,7 +302,9 @@ ownership verified, C read, ceilings measured; see the
 **Exit proof.** The tree resolves all 34 namespaces; `private` rejections pinned.
 
 **Status.** Part A done (aliases, `private`, qualified values and types; qualified
-pattern heads wait for M2b). Part B in progress.
+pattern heads wait for M2b). Part B done: the foundation check publishes the
+designation and builtin contracts refer to it; the `if`, `and`/`or`/`not`, `?=`
+and `for` consumers arrive with M2.2, M2.3 and M3.
 
 ## M5: constants
 

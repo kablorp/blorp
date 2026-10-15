@@ -1530,7 +1530,7 @@ records phase tests, native output, ownership checks and matched costs.
 ## Calculator input and results
 
 `Option[T]`, `Result[Value, Error]` and `Bool` come from ordinary
-fixed unions in `standard_library_temp/_base.brp`; neither spelling receives
+fixed unions in `standard_library_temp/_base.brp`; none of them receives
 a compiler-specific representation. The prelude supplies their types and
 constructors to user modules; library modules import them from `_base`:
 
@@ -1564,7 +1564,7 @@ pure func repeat[T](element: T, count: Int) -> List[T]:
 pure func length[T](values: List[T]) -> Int:
     builtin("list.length")
 pure func get[T](values: List[T], index: Int) -> Option[T]:
-    builtin("list.get", Some, None)
+    builtin("list.get")
 pure func append[T](values: List[T], value: T) -> List[T]:
     builtin("list.append")
 pure func set[T](values: List[T], index: Int, value: T) -> List[T]:
@@ -1668,11 +1668,12 @@ and the first operand is validated before the second. Extra arguments are
 ignored. Empty, spaced, CR-containing and newline-containing arguments remain
 intact and fail strict numeric validation.
 
-Runtime declarations explicitly bind result roles, for example
-`builtin("string.parse_int", Some, None)`. Checking accepts the exact nominal
-union, constructor payloads, arity and purity once. Specialization translates
-declaration identities to concrete constructor identities. Emission receives
-those roles directly; constructor names and ordering carry no hidden semantics.
+Runtime declarations name only their operation, for example
+`builtin("string.parse_int")`. Its contract returns the foundation's designated
+`Option[Int]`, and `int.equals` and `string.equals` return the designated
+`Bool`; checking accepts the exact result type, arity and purity once.
+Specialization translates the designated constructors to the result instance's
+constructor identities, and emission receives those directly.
 
 ## Float64 calculator
 
@@ -1981,7 +1982,17 @@ Managed control-flow joins and general pass infrastructure remain future work.
 The target library's [`_base.brp`](standard_library_temp/_base.brp)
 owns the builtin Int, Float, String, Void and List identities, and the ordinary
 Bool, Option and Result unions. It is the only module that may declare builtin
-types, and any module may import it as `_base`. [`prelude.brp`](standard_library_temp/prelude.brp)
+types, and any module may import it as `_base`.
+
+The foundation check designates those three unions once, by name and only in
+`_base.brp`, and publishes their constructor identities for checking to read:
+`Bool` must declare exactly `True` and `False` without payloads, `Option[A]`
+exactly `Some(A)` and `None`, and `Result[Value, Error]` exactly `Ok(Value)`
+and `Err(Error)`, in any order. A missing or differently shaped union is a
+foundation error. The designation is an identity fact only: layout follows
+declaration order, as for any union, and a same-named union in another module is
+an ordinary declaration (a user module cannot declare one, because the prelude
+already exposes the designated type). [`prelude.brp`](standard_library_temp/prelude.brp)
 is the only implicit import: it supplies its written import scope to application
 roots and user helper modules, and cannot be imported explicitly. Library
 modules receive nothing implicitly; each imports what it uses, including base

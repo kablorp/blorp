@@ -188,22 +188,22 @@ M6 (representation and machine):
 type Char = builtin
 
 -- int.brp
-pure func less_than(a: Int, b: Int) -> Bool:              builtin("int.less_than", True, False)
+pure func less_than(a: Int, b: Int) -> Bool:              builtin("int.less_than")
 pure func to_char(value: Int) -> Char:                    builtin("int.to_char")
 
 -- char.brp (new module)
 pure func to_int(value: Char) -> Int:                     builtin("char.to_int")
 
 -- float.brp
-pure func equals(a: Float, b: Float) -> Bool:                   builtin("float.equals", True, False)
-pure func less_than(a: Float, b: Float) -> Bool:                builtin("float.less_than", True, False)
-pure func is_nan(x: Float) -> Bool:                             builtin("float.is_nan", True, False)
-pure func is_finite(x: Float) -> Bool:                          builtin("float.is_finite", True, False)
+pure func equals(a: Float, b: Float) -> Bool:                   builtin("float.equals")
+pure func less_than(a: Float, b: Float) -> Bool:                builtin("float.less_than")
+pure func is_nan(x: Float) -> Bool:                             builtin("float.is_nan")
+pure func is_finite(x: Float) -> Bool:                          builtin("float.is_finite")
 pure func copysign(x: Float, y: Float) -> Float:                builtin("float.copysign")
 
 -- string.brp
 pure func add(a: String, b: String) -> String:            builtin("string.add")
-pure func get(text: String, index: Int) -> Option[Char]:  builtin("string.get", Some, None)
+pure func get(text: String, index: Int) -> Option[Char]:  builtin("string.get")
 pure func from_char(c: Char) -> String:                   builtin("string.from_char")
 
 -- io.brp
@@ -211,10 +211,14 @@ func print_error(value: String) -> Void:                  builtin("string.print_
 
 -- system.brp (new module; `main.brp` and `load.brp` only)
 func getcwd() -> String:                                        builtin("system.getcwd")
-func read_file(path: String) -> Result[String, String]:         builtin("system.read_file", Ok, Err)
+func read_file(path: String) -> Result[String, String]:         builtin("system.read_file")
 func write_file(path: String, content: String) -> Result[Void, String]:
-	builtin("system.write_file", Ok, Err)
+	builtin("system.write_file")
 ```
+
+Builtins returning Bool, Option or Result name only their operation: their
+contracts return the foundation's designated unions, so no body binds
+constructors.
 
 That is 18 intrinsic functions (3 in ML, 15 in M6) and one intrinsic type.
 Everything else in the table is Blorp over these, `int.equals`/`add`/`subtract`,

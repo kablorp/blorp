@@ -1,6 +1,8 @@
 import:
     ../input: existing_name
-    ../../../src/utils/ids: inventory_unions
+    ../../../src/check/check: check, check_errors
+    ../../../src/check/render: render_failure
+    ../../../src/utils/ids: UnionRow, VariantId, inventory_unions, union_number, variant_number, variant_owner
     ../../../src/lex/lex: lex
     ../../../src/utils/names: NameTable, NameId, same_name, program_names
     ../../../src/parse/assemble:
@@ -12,8 +14,9 @@ import:
         seal_program,
     ../../../src/parse/parse: parse_module
     ../../../src/namespace/builtins:
-        BuiltinTypeErrorKind(MissingBuiltinType, DuplicateBuiltinType, BuiltinOutsideFoundation, FoundationImports, FoundationFunctions, FoundationTypeConflict),
+        BuiltinTypeErrorKind(MissingBuiltinType, DuplicateBuiltinType, BuiltinOutsideFoundation, FoundationImports, FoundationFunctions, FoundationTypeConflict, MissingDesignatedUnion, MalformedDesignatedUnion),
         BuiltinTypeRole(IntegerType, StringType, FloatType, VoidType, ListType),
+        DesignatedUnionRole(BoolUnion, OptionUnion, ResultUnion),
         check_builtin_types, render_builtin_type_error
     ../../../src/utils/source:
         ModuleId, ModuleKind(UserModule, FoundationTypesModule, FoundationPreludeModule),
@@ -21,6 +24,7 @@ import:
     ../../../src/utils/syntax: Diagnostic
     option: to_result, is_none
     ../../../src/utils/text: concat
+    ../module_input: parse_modules
     test: TestSuite
 
 
@@ -30,6 +34,34 @@ private TYPES: String =
     |type String = builtin
     |type Void = builtin
     |type List[T] = builtin
+    |
+
+
+private BOOL: String =
+    |fixed union Bool:
+    |    True
+    |    False
+    |
+private OPTION: String =
+    |fixed union Option[A]:
+    |    Some(A)
+    |    None
+    |
+private RESULT: String =
+    |fixed union Result[Value, Error]:
+    |    Ok(Value)
+    |    Err(Error)
+    |
+private UNIONS: String =
+    |fixed union Bool:
+    |    True
+    |    False
+    |fixed union Option[A]:
+    |    Some(A)
+    |    None
+    |fixed union Result[Value, Error]:
+    |    Ok(Value)
+    |    Err(Error)
     |
 
 
@@ -65,8 +97,16 @@ private pure func same_role(left: BuiltinTypeRole, right: BuiltinTypeRole) -> Bo
         _: False
 
 
+private pure func same_designated_role(left: DesignatedUnionRole, right: DesignatedUnionRole) -> Bool:
+    match (left, right):
+        (BoolUnion, BoolUnion) | (OptionUnion, OptionUnion) | (ResultUnion, ResultUnion): True
+        _: False
+
+
 private pure func same_error_kind(left: BuiltinTypeErrorKind, right: BuiltinTypeErrorKind) -> Bool:
     match (left, right):
+        (MissingDesignatedUnion(a), MissingDesignatedUnion(b)): same_designated_role(a, b)
+        (MalformedDesignatedUnion(a), MalformedDesignatedUnion(b)): same_designated_role(a, b)
         (MissingBuiltinType(a), MissingBuiltinType(b)): same_role(a, b)
         (DuplicateBuiltinType(a), DuplicateBuiltinType(b)): same_role(a, b)
         (FoundationTypeConflict(a), FoundationTypeConflict(b)): same_role(a, b)
@@ -95,12 +135,13 @@ private pure func rejected(base: String, kind: BuiltinTypeErrorKind, message: St
 
 
 pure func test_one_primitive_authority_uses_complete_program_names() -> Bool:
-    match program(TYPES, "func main() -> Int:\n    0\n", "", []):
+    match program(TYPES.concat(UNIONS), "func main() -> Int:\n    0\n", "", []):
         Err(_): False
         Ok(parsed):
             match check_builtin_types(parsed):
                 Err(_): False
-                Ok(initial):
+                Ok(foundation):
+                    initial = foundation.initial
                     names = parsed_contents(parsed).names
                     (
                         spelling_is(names, "Int", initial.special.integer)
@@ -120,12 +161,13 @@ pure func test_builtin_roles_are_distinct_in_reverse_declaration_order() -> Bool
         |type Float = builtin
         |type Int = builtin
         |
-    match program(reversed, "func main() -> Int:\n    0\n", "", []):
+    match program(reversed.concat(UNIONS), "func main() -> Int:\n    0\n", "", []):
         Err(_): False
         Ok(parsed):
             match check_builtin_types(parsed):
                 Err(_): False
-                Ok(initial):
+                Ok(foundation):
+                    initial = foundation.initial
                     names = parsed_contents(parsed).names
                     (
                         spelling_is(names, "Int", initial.special.integer)
@@ -209,23 +251,188 @@ pure func test_foundation_cannot_import_modules() -> Bool:
 
 
 pure func test_ordinary_base_unions_are_preserved() -> Bool:
-    unions: String =
-        |fixed union Bool:
-        |    True
-        |    False
-        |fixed union Option[A]:
-        |    Some(A)
-        |    None
-        |fixed union Result[Value, Error]:
-        |    Ok(Value)
-        |    Err(Error)
-        |
-    match program(TYPES.concat(unions), "func main() -> Int:\n    0\n", "", []):
+    match program(TYPES.concat(UNIONS), "func main() -> Int:\n    0\n", "", []):
         Err(_): False
         Ok(parsed):
             match check_builtin_types(parsed):
                 Err(_): False
                 Ok(_): inventory_unions(parsed_contents(parsed).declarations).length() == 3 and parsed_contents(parsed).builtin_types.length() == 5
+
+
+-- The foundation union of this spelling, found by its published name.
+private pure func foundation_union(parsed: ParsedProgram, spelling: String) -> Option[UnionRow]:
+    contents = parsed_contents(parsed)
+    var found: Option[UnionRow] = None
+    match existing_name(contents.names, spelling):
+        Some(name):
+            for row in inventory_unions(contents.declarations):
+                if same_name(row.type_name.id, name):
+                    found = Some(row)
+        None: void
+    found
+
+
+-- `variant` is the variant at `position` of the foundation union `spelling`.
+private pure func is_variant(parsed: ParsedProgram, variant: VariantId, spelling: String, position: Int) -> Bool:
+    match foundation_union(parsed, spelling):
+        Some(row): union_number(variant_owner(variant)) == union_number(row.id) and variant_number(variant) == position
+        None: False
+
+
+pure func test_designation_names_each_constructor_of_the_foundation_unions() -> Bool:
+    match program(TYPES.concat(UNIONS), "func main() -> Int:\n    0\n", "", []):
+        Err(_): False
+        Ok(parsed):
+            match check_builtin_types(parsed):
+                Err(_): False
+                Ok(foundation):
+                    unions = foundation.designated
+                    (
+                        is_variant(parsed, unions.boolean.true_variant, "Bool", 0) and is_variant(parsed, unions.boolean.false_variant, "Bool", 1)
+                        and is_variant(parsed, unions.option.some, "Option", 0) and is_variant(parsed, unions.option.none, "Option", 1)
+                        and is_variant(parsed, unions.result.ok, "Result", 0) and is_variant(parsed, unions.result.err, "Result", 1)
+                    )
+
+
+-- Constructors are designated by name; declaration order stays the layout.
+pure func test_designation_follows_names_not_declaration_order() -> Bool:
+    reversed: String =
+        |fixed union Result[Value, Error]:
+        |    Err(Error)
+        |    Ok(Value)
+        |fixed union Option[A]:
+        |    None
+        |    Some(A)
+        |fixed union Bool:
+        |    False
+        |    True
+        |
+    match program(TYPES.concat(reversed), "func main() -> Int:\n    0\n", "", []):
+        Err(_): False
+        Ok(parsed):
+            match check_builtin_types(parsed):
+                Err(_): False
+                Ok(foundation):
+                    unions = foundation.designated
+                    (
+                        is_variant(parsed, unions.boolean.true_variant, "Bool", 1) and is_variant(parsed, unions.boolean.false_variant, "Bool", 0)
+                        and is_variant(parsed, unions.option.some, "Option", 1) and is_variant(parsed, unions.option.none, "Option", 0)
+                        and is_variant(parsed, unions.result.ok, "Result", 1) and is_variant(parsed, unions.result.err, "Result", 0)
+                    )
+
+
+-- A same-named union outside the foundation is an ordinary declaration.
+pure func test_user_bool_is_not_the_designated_bool() -> Bool:
+    root = "fixed union Bool:\n    True\n    False\nfunc main() -> Int:\n    0\n"
+    match program(TYPES.concat(UNIONS), root, "", []):
+        Err(_): False
+        Ok(parsed):
+            match check_builtin_types(parsed):
+                Err(_): False
+                Ok(foundation):
+                    match (inventory_unions(parsed_contents(parsed).declarations).get(0), foundation_union(parsed, "Bool")):
+                        (Some(user), Some(_)):
+                            owner = variant_owner(foundation.designated.boolean.true_variant)
+                            union_number(user.id) == 0 and union_number(owner) != union_number(user.id) and is_variant(parsed, foundation.designated.boolean.true_variant, "Bool", 0)
+                        _: False
+
+
+-- A user module cannot redeclare Bool: the prelude already exposes the
+-- designated one, so the existing type-conflict rule rejects it.
+pure func test_user_module_cannot_redeclare_the_designated_bool() -> Bool:
+    root = "fixed union Bool:\n    Yes\n    No\nfunc main() -> Int:\n    0\n"
+    match parse_modules([{ source = root, targets = [] }]):
+        Err(_): False
+        Ok(parsed):
+            match check(parsed):
+                Ok(_): False
+                Err(failure):
+                    rendered = render_failure(failure).first
+                    (
+                        check_errors(failure).remaining.is_empty()
+                        and rendered.message == "imported type conflicts with another type"
+                        and rendered.help == "give the types distinct names or remove the duplicate import"
+                        and same_source(rendered.span.source, module_source(root_module_id()))
+                        and rendered.span.start == 12 and rendered.span.end == 16
+                    )
+
+
+private pure func designation_rejected(base: String, start: Int, end: Int, kind: BuiltinTypeErrorKind, message: String, help: String) -> Bool:
+    match program(base, "func main() -> Int:\n    0\n", "", []):
+        Err(_): False
+        Ok(parsed):
+            match check_builtin_types(parsed):
+                Ok(_): False
+                Err(error):
+                    rendered = render_builtin_type_error(error)
+                    (
+                        same_error_kind(error.kind, kind)
+                        and same_source(error.span.source, module_source(parsed_contents(parsed).foundation.types))
+                        and error.span.start == start and error.span.end == end
+                        and rendered.message == message and rendered.help == help and rendered.note.is_none()
+                    )
+
+
+private BOOL_SHAPE: String = "fixed union Bool with exactly the variants True and False"
+private OPTION_SHAPE: String = "fixed union Option[A] with exactly the variants Some(A) and None"
+private RESULT_SHAPE: String = "fixed union Result[Value, Error] with exactly the variants Ok(Value) and Err(Error)"
+
+
+pure func test_missing_bool_is_reported_at_the_foundation_end() -> Bool:
+    base = TYPES.concat(OPTION).concat(RESULT)
+    designation_rejected(base, base.length(), base.length(), MissingDesignatedUnion(BoolUnion), "missing Bool union declaration", "add ".concat(BOOL_SHAPE).concat(" to _base.brp"))
+
+
+pure func test_missing_option_is_reported_at_the_foundation_end() -> Bool:
+    base = TYPES.concat(BOOL).concat(RESULT)
+    designation_rejected(base, base.length(), base.length(), MissingDesignatedUnion(OptionUnion), "missing Option union declaration", "add ".concat(OPTION_SHAPE).concat(" to _base.brp"))
+
+
+pure func test_missing_result_is_reported_at_the_foundation_end() -> Bool:
+    base = TYPES.concat(BOOL).concat(OPTION)
+    designation_rejected(base, base.length(), base.length(), MissingDesignatedUnion(ResultUnion), "missing Result union declaration", "add ".concat(RESULT_SHAPE).concat(" to _base.brp"))
+
+
+-- `declaration` replaces the well-formed union of its role; the error names it.
+private pure func malformed(role: DesignatedUnionRole, declaration: String, spelling: String, shape: String) -> Bool:
+    base = match role:
+        BoolUnion: TYPES.concat(OPTION).concat(RESULT).concat(declaration)
+        OptionUnion: TYPES.concat(BOOL).concat(RESULT).concat(declaration)
+        ResultUnion: TYPES.concat(BOOL).concat(OPTION).concat(declaration)
+    start = base.length() - declaration.length() + "fixed union ".length()
+    designation_rejected(base, start, start + spelling.length(), MalformedDesignatedUnion(role),
+        "foundation union ".concat(spelling).concat(" does not have its designated shape"), "declare it as ".concat(shape))
+
+
+pure func test_bool_with_a_payload_is_malformed() -> Bool:
+    malformed(BoolUnion, "fixed union Bool:\n    True(Int)\n    False\n", "Bool", BOOL_SHAPE)
+
+pure func test_bool_with_a_third_variant_is_malformed() -> Bool:
+    malformed(BoolUnion, "fixed union Bool:\n    True\n    False\n    Unknown\n", "Bool", BOOL_SHAPE)
+
+pure func test_bool_with_other_constructor_names_is_malformed() -> Bool:
+    malformed(BoolUnion, "fixed union Bool:\n    Yes\n    No\n", "Bool", BOOL_SHAPE)
+
+pure func test_generic_bool_is_malformed() -> Bool:
+    malformed(BoolUnion, "fixed union Bool[A]:\n    True\n    False\n", "Bool", BOOL_SHAPE)
+
+pure func test_nongeneric_option_is_malformed() -> Bool:
+    malformed(OptionUnion, "fixed union Option:\n    Some(Int)\n    None\n", "Option", OPTION_SHAPE)
+
+pure func test_option_payload_must_be_its_parameter() -> Bool:
+    malformed(OptionUnion, "fixed union Option[A]:\n    Some(Int)\n    None\n", "Option", OPTION_SHAPE)
+
+pure func test_option_none_must_be_empty() -> Bool:
+    malformed(OptionUnion, "fixed union Option[A]:\n    Some(A)\n    None(A)\n", "Option", OPTION_SHAPE)
+
+pure func test_option_some_takes_exactly_one_payload() -> Bool:
+    malformed(OptionUnion, "fixed union Option[A]:\n    Some(A, A)\n    None\n", "Option", OPTION_SHAPE)
+
+pure func test_result_payloads_follow_parameter_order() -> Bool:
+    malformed(ResultUnion, "fixed union Result[Value, Error]:\n    Ok(Error)\n    Err(Value)\n", "Result", RESULT_SHAPE)
+
+pure func test_result_requires_two_parameters() -> Bool:
+    malformed(ResultUnion, "fixed union Result[Value]:\n    Ok(Value)\n    Err(Value)\n", "Result", RESULT_SHAPE)
 
 
 private pure func foundation_nominal_conflict_rejected(prefix: String, name: String, suffix: String, role: BuiltinTypeRole) -> Bool:
@@ -294,6 +501,23 @@ tests: TestSuite = {
         ("foundation functions rejected", test_foundation_cannot_declare_functions),
         ("foundation imports rejected", test_foundation_cannot_import_modules),
         ("ordinary base unions retained", test_ordinary_base_unions_are_preserved),
+        ("designation names each foundation constructor", test_designation_names_each_constructor_of_the_foundation_unions),
+        ("designation follows names not order", test_designation_follows_names_not_declaration_order),
+        ("user Bool is not designated", test_user_bool_is_not_the_designated_bool),
+        ("user module cannot redeclare Bool", test_user_module_cannot_redeclare_the_designated_bool),
+        ("missing Bool diagnostic", test_missing_bool_is_reported_at_the_foundation_end),
+        ("missing Option diagnostic", test_missing_option_is_reported_at_the_foundation_end),
+        ("missing Result diagnostic", test_missing_result_is_reported_at_the_foundation_end),
+        ("Bool payload rejected", test_bool_with_a_payload_is_malformed),
+        ("Bool third variant rejected", test_bool_with_a_third_variant_is_malformed),
+        ("Bool constructor names required", test_bool_with_other_constructor_names_is_malformed),
+        ("generic Bool rejected", test_generic_bool_is_malformed),
+        ("nongeneric Option rejected", test_nongeneric_option_is_malformed),
+        ("Option payload is its parameter", test_option_payload_must_be_its_parameter),
+        ("Option None is empty", test_option_none_must_be_empty),
+        ("Option Some has one payload", test_option_some_takes_exactly_one_payload),
+        ("Result payloads follow parameters", test_result_payloads_follow_parameter_order),
+        ("Result has two parameters", test_result_requires_two_parameters),
         ("foundation record cannot redeclare builtin", test_foundation_record_cannot_redeclare_builtin_type),
         ("foundation union cannot redeclare builtin", test_foundation_union_cannot_redeclare_builtin_type),
         ("foundation functions precede imports", test_foundation_functions_take_precedence_over_imports),

@@ -38,12 +38,12 @@ ordinary Bool, Option and Result types and constructors are implicit. User
 modules also receive the ordinary prelude's selected methods; library operation
 modules receive the base alone. Explicit and implicit exposures of the same
 function are idempotent; different applicable functions remain ambiguous.
-Closed runtime bodies can bind constructor roles, as in
-`builtin("string.parse_int", Some, None)`; semantic checking validates the
-ordinary union's exact result contract. Constructors of other imported types
-require explicit selection. Aliases, wildcards and function reexports remain unsupported.
-`builtin("int.equals", True, False)` binds the equal and different roles of an
-ordinary two-variant empty union and requires two Int parameters.
+Closed runtime bodies name one operation, as in `builtin("string.parse_int")`,
+which returns the foundation's designated `Option[Int]`; `builtin("int.equals")`
+requires two Int parameters and returns the designated `Bool`. The foundation
+check designates Bool, Option and Result once, by name in `_base.brp`.
+Constructors of other imported types require explicit selection. Wildcards
+and function reexports remain unsupported.
 Decimal Float tokens carry an optional minus, a decimal fraction or exponent,
 or both. Parsing checks canonical source spelling and finite binary64 range;
 `1.identity()` remains an Int receiver call. The restricted EBNF owns the exact

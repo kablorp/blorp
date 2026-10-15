@@ -188,12 +188,13 @@ fixed union Result[Value, Error]:
 ```
 
 Bool, Option, and Result remain ordinary nominal unions. They acquire no
-primitive representation or name-based runtime recognition. Builtin operations
-continue to receive explicit, checked constructor roles.
+primitive representation. The foundation check designates them once, by name
+and only in base, and publishes their constructor identities; builtin
+operations returning Bool or Option refer to that designation.
 
 Base declares no functions and imports nothing. Any module may import it as
 `_base`, selecting types and constructors like any other module, for example
-`_base: Int, Bool(True, False)` in `int.brp`. Library operation modules name
+`_base: Int, Bool` in `int.brp`. Library operation modules name
 base types and constructors only through such imports; this keeps every
 dependency written where it is used. Base type names share the module's type
 namespace with normal imports: a distinct module-level type declaration cannot

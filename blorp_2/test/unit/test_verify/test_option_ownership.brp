@@ -17,9 +17,8 @@ import:
 private fixed record Seed {
 	ids: InputIds,
 	parse_function: Lower.LoweredFunction,
-	integer_roles: Builtins.OptionalRoles[Concrete.VariantInstanceId],
-	other_roles: Builtins.OptionalRoles[Concrete.VariantInstanceId],
-	string_roles: Builtins.OptionalRoles[Concrete.VariantInstanceId],
+	integer_option: Builtins.DesignatedOption[Concrete.VariantInstanceId],
+	string_option: Builtins.DesignatedOption[Concrete.VariantInstanceId],
 	string_field: Concrete.VariantFieldInstanceId,
 	unions: List[Concrete.ConcreteUnion]
 }
@@ -34,13 +33,13 @@ private pure func seed_error() -> Diagnostic:
 	}
 
 
-private pure func parse_roles(function: Lower.LoweredFunction) -> Result[Builtins.OptionalRoles[Concrete.VariantInstanceId], Diagnostic]:
+private pure func parse_option(function: Lower.LoweredFunction) -> Result[Builtins.DesignatedOption[Concrete.VariantInstanceId], Diagnostic]:
 	match function.definitions:
 		[_, result]:
 			match result.operation:
 				Lower.CallValue(call, [_]):
 					match call.target:
-						Concrete.RuntimeFunction(Builtins.StringParseInt(roles)): Ok(roles)
+						Concrete.RuntimeFunction(Builtins.StringParseInt(option)): Ok(option)
 						_: Err(seed_error())
 				_: Err(seed_error())
 		_: Err(seed_error())
@@ -50,21 +49,12 @@ private pure func parse_roles(function: Lower.LoweredFunction) -> Result[Builtin
 -- input below independently declares its operations, owners and borrow edges.
 private pure func seed() -> Result[Seed, Diagnostic]:
 	source: String =
-		|fixed union Maybe[T]:
-		|    Missing
-		|    Present(T)
-		|fixed union Other[T]:
-		|    Absent
-		|    Found(T)
-		|pure func parse_number(text: String) -> Maybe[Int]:
-		|    builtin("string.parse_int", Present, Missing)
-		|pure func parse_other(text: String) -> Other[Int]:
-		|    builtin("string.parse_int", Found, Absent)
-		|pure func read_text(values: List[String], index: Int) -> Maybe[String]:
-		|    builtin("list.get", Present, Missing)
+		|pure func parse_number(text: String) -> Option[Int]:
+		|    builtin("string.parse_int")
+		|pure func read_text(values: List[String], index: Int) -> Option[String]:
+		|    builtin("list.get")
 		|func main(arguments: List[String]) -> Int:
 		|    parsed = parse_number("42")
-		|    other = parse_other("42")
 		|    read = read_text(arguments, 0)
 		|    0
 		|
@@ -75,32 +65,31 @@ private pure func seed() -> Result[Seed, Diagnostic]:
 	lowered ?= Lower.lower(concrete)
 	contents = Lower.lowered_functions(lowered)
 	match contents.functions:
-		[_, parser, other, reader]:
-			integer_roles ?= parse_roles(parser)
-			other_roles ?= parse_roles(other)
+		[_, parser, reader]:
+			integer_option ?= parse_option(parser)
 			match reader.definitions:
 				[_, _, result]:
 					match result.operation:
 						Lower.CallValue(call, [_, _]):
 							match call.target:
-								Concrete.RuntimeFunction(Builtins.ListGet(_, string_roles)):
-									string_field ?= Concrete.variant_field(string_roles.present, 0, contents.unions, span(0))
-									Ok({ ids = ids, parse_function = parser, integer_roles = integer_roles, other_roles = other_roles, string_roles = string_roles, string_field = string_field, unions = contents.unions })
+								Concrete.RuntimeFunction(Builtins.ListGet(_, string_option)):
+									string_field ?= Concrete.variant_field(string_option.some, 0, contents.unions, span(0))
+									Ok({ ids = ids, parse_function = parser, integer_option = integer_option, string_option = string_option, string_field = string_field, unions = contents.unions })
 								_: Err(seed_error())
 						_: Err(seed_error())
 				_: Err(seed_error())
 		_: Err(seed_error())
 
 
-private pure func result_type(roles: Builtins.OptionalRoles[Concrete.VariantInstanceId]) -> Concrete.TypeRef:
-	Concrete.UnionType(Concrete.variant_owner(roles.present))
+private pure func result_type(option: Builtins.DesignatedOption[Concrete.VariantInstanceId]) -> Concrete.TypeRef:
+	Concrete.UnionType(Concrete.variant_owner(option.some))
 
 
 pure func test_option_int_has_no_ownership() -> Bool:
 	match seed():
 		Err(_): False
 		Ok(seed):
-			match Concrete.value_ownership(result_type(seed.integer_roles), seed.unions, []):
+			match Concrete.value_ownership(result_type(seed.integer_option), seed.unions, []):
 				Ok(Concrete.NoOwnership): True
 				_: False
 
@@ -109,9 +98,9 @@ pure func test_option_string_has_inline_owned_fields() -> Bool:
 	match seed():
 		Err(_): False
 		Ok(seed):
-			match Concrete.value_ownership(result_type(seed.string_roles), seed.unions, []):
+			match Concrete.value_ownership(result_type(seed.string_option), seed.unions, []):
 				Ok(Concrete.InlineOwnedFields(owner)):
-					Concrete.union_number(owner) == Concrete.union_number(Concrete.variant_owner(seed.string_roles.present))
+					Concrete.union_number(owner) == Concrete.union_number(Concrete.variant_owner(seed.string_option.some))
 				_: False
 
 
@@ -152,7 +141,7 @@ pure func test_parse_owned_input_drops_after_final_borrow() -> Bool:
 		Ok(seed):
 			ids = seed.ids
 			input: Lower.ValueDefinition = { id = ids.first, value_type = Concrete.StringType, operation = Lower.StringValue("42"), span = span(10) }
-			lowered = function([input, runtime(ids.second, Builtins.StringParseInt(seed.integer_roles), [ids.first], result_type(seed.integer_roles), 30), integer(ids.third, 0, 50)], ids.third, [], Concrete.IntType)
+			lowered = function([input, runtime(ids.second, Builtins.StringParseInt(seed.integer_option), [ids.first], result_type(seed.integer_option), 30), integer(ids.third, 0, 50)], ids.third, [], Concrete.IntType)
 			match Own.insert_function(lowered, seed.unions, []):
 				Ok(function):
 					match function.operations:
@@ -170,10 +159,10 @@ pure func test_parse_owned_input_drops_after_final_borrow() -> Bool:
 private pure func read_function(seed: Seed, returned: Bool) -> Lower.LoweredFunction:
 	ids = seed.ids
 	list_type = Concrete.ListType(Concrete.StringType)
-	read = runtime(ids.third, Builtins.ListGet(Concrete.StringType, seed.string_roles), [ids.first, ids.second], result_type(seed.string_roles), 30)
+	read = runtime(ids.third, Builtins.ListGet(Concrete.StringType, seed.string_option), [ids.first, ids.second], result_type(seed.string_option), 30)
 	inputs = [parameter(ids.first, list_type), integer(ids.second, 0, 20), read]
 	if returned:
-		function(inputs, ids.third, [list_type], result_type(seed.string_roles))
+		function(inputs, ids.third, [list_type], result_type(seed.string_option))
 	else:
 		function(inputs.append(integer(ids.fourth, 0, 50)), ids.fourth, [list_type], Concrete.IntType)
 
@@ -210,17 +199,17 @@ pure func test_returned_list_get_transfers_fresh_owner() -> Bool:
 
 private pure func child_function(seed: Seed) -> Lower.LoweredFunction:
 	ids = seed.ids
-	roles = seed.string_roles
+	option = seed.string_option
 	{
 		execution = OrdinaryCalls,
-		signature = { parameters = [result_type(roles)], return_type = Concrete.StringType },
-		definitions = [parameter(ids.first, result_type(roles))],
+		signature = { parameters = [result_type(option)], return_type = Concrete.StringType },
+		definitions = [parameter(ids.first, result_type(option))],
 		tail = Lower.MatchValue({
 			scrutinee = ids.first,
-			owner = Concrete.variant_owner(roles.present),
+			owner = Concrete.variant_owner(option.some),
 			arms = [
-				{ label = Lower.VariantLabel(roles.absent), body = { definitions = [{ id = ids.second, value_type = Concrete.StringType, operation = Lower.StringValue("fallback"), span = span(20) }], exit = Lower.ReturnValue(ids.second) } },
-				{ label = Lower.VariantLabel(roles.present), body = { definitions = [{ id = ids.third, value_type = Concrete.StringType, operation = Lower.PayloadValue(seed.string_field, ids.first), span = span(30) }], exit = Lower.ReturnValue(ids.third) } },
+				{ label = Lower.VariantLabel(option.none), body = { definitions = [{ id = ids.second, value_type = Concrete.StringType, operation = Lower.StringValue("fallback"), span = span(20) }], exit = Lower.ReturnValue(ids.second) } },
+				{ label = Lower.VariantLabel(option.some), body = { definitions = [{ id = ids.third, value_type = Concrete.StringType, operation = Lower.PayloadValue(seed.string_field, ids.first), span = span(30) }], exit = Lower.ReturnValue(ids.third) } },
 			]
 		})
 	}
@@ -255,41 +244,41 @@ pure func test_owned_list_get_prefix_drops_in_each_arm() -> Bool:
 		Ok(seed):
 			ids = seed.ids
 			list_type = Concrete.ListType(Concrete.StringType)
-			roles = seed.integer_roles
+			option = seed.integer_option
 			owned: Lower.LoweredFunction = {
 				execution = OrdinaryCalls,
 				signature = {
-					parameters = [list_type, result_type(roles)],
+					parameters = [list_type, result_type(option)],
 					return_type = Concrete.IntType
 				},
 				definitions = [
 					parameter(ids.first, list_type),
-					{ parameter(ids.second, result_type(roles)) |
+					{ parameter(ids.second, result_type(option)) |
 						operation = Lower.ParameterValue(1)
 					},
 					integer(ids.third, 0, 20),
 					runtime(
 						ids.fourth,
-						Builtins.ListGet(Concrete.StringType, seed.string_roles),
+						Builtins.ListGet(Concrete.StringType, seed.string_option),
 						[ids.first, ids.third],
-						result_type(seed.string_roles),
+						result_type(seed.string_option),
 						30,
 					),
 					integer(ids.fifth, 0, 50),
 				],
 				tail = Lower.MatchValue({
 					scrutinee = ids.second,
-					owner = Concrete.variant_owner(roles.present),
+					owner = Concrete.variant_owner(option.some),
 					arms = [
 						{
-							label = Lower.VariantLabel(roles.absent),
+							label = Lower.VariantLabel(option.none),
 							body = {
 								definitions = [],
 								exit = Lower.ReturnValue(ids.fifth)
 							}
 						},
 						{
-							label = Lower.VariantLabel(roles.present),
+							label = Lower.VariantLabel(option.some),
 							body = {
 								definitions = [],
 								exit = Lower.ReturnValue(ids.fifth)
@@ -336,9 +325,9 @@ private pure func raw_program(seed: Seed, tested: Own.OwnedFunction) -> Own.Owne
 	{ records = [], unions = seed.unions, functions = [entry, tested], entrypoint = NoArguments(ids.entrypoint, IntegerExitStatus) }
 
 
-private pure func raw_parse(seed: Seed, roles: Builtins.OptionalRoles[Concrete.VariantInstanceId], value_type: Concrete.TypeRef, result: Own.ResultOwnership, argument: Own.OwnedArgument) -> Own.OwnershipProgram:
+private pure func raw_parse(seed: Seed, option: Builtins.DesignatedOption[Concrete.VariantInstanceId], value_type: Concrete.TypeRef, result: Own.ResultOwnership, argument: Own.OwnedArgument) -> Own.OwnershipProgram:
 	ids = seed.ids
-	call: Concrete.ConcreteCall = { target = Concrete.RuntimeFunction(Builtins.StringParseInt(roles)), span = span(30) }
+	call: Concrete.ConcreteCall = { target = Concrete.RuntimeFunction(Builtins.StringParseInt(option)), span = span(30) }
 	raw_program(seed, raw_function([
 		define(ids.first, Concrete.StringType, Own.ParameterDefinition(0), Own.BorrowedResult(Own.ParameterBorrow(ids.first)), 10),
 		define(ids.second, value_type, Own.CallDefinition(call, [argument]), result, 30),
@@ -351,7 +340,7 @@ private pure func parse_argument(seed: Seed) -> Own.OwnedArgument:
 
 
 private pure func valid_parse(seed: Seed) -> Own.OwnershipProgram:
-	raw_parse(seed, seed.integer_roles, result_type(seed.integer_roles), Own.UnmanagedResult, parse_argument(seed))
+	raw_parse(seed, seed.integer_option, result_type(seed.integer_option), Own.UnmanagedResult, parse_argument(seed))
 
 
 private pure func rejects(program: Own.OwnershipProgram, message: String, at: Int) -> Bool:
@@ -367,31 +356,32 @@ pure func test_raw_parse_borrow_and_unmanaged_result_are_valid() -> Bool:
 		Err(_): False
 
 
-pure func test_verifier_rejects_runtime_roles_from_different_owners() -> Bool:
+-- Option[Int] and Option[String] are distinct concrete instances.
+pure func test_verifier_rejects_option_constructors_from_different_instances() -> Bool:
 	match seed():
 		Err(_): False
 		Ok(seed):
-			roles = { present = seed.other_roles.present, absent = seed.integer_roles.absent }
-			rejects(raw_parse(seed, roles, result_type(roles), Own.UnmanagedResult, parse_argument(seed)), "runtime constructor roles do not cover one result union", 30)
+			option = { some = seed.integer_option.some, none = seed.string_option.none }
+			rejects(raw_parse(seed, option, result_type(option), Own.UnmanagedResult, parse_argument(seed)), "runtime Option constructors do not cover one result union", 30)
 
 
-pure func test_verifier_rejects_swapped_runtime_roles() -> Bool:
+pure func test_verifier_rejects_swapped_option_constructors() -> Bool:
 	match seed():
 		Err(_): False
 		Ok(seed):
-			roles = { present = seed.integer_roles.absent, absent = seed.integer_roles.present }
-			rejects(raw_parse(seed, roles, result_type(roles), Own.UnmanagedResult, parse_argument(seed)), "variant field count does not match its operation", 30)
+			option = { some = seed.integer_option.none, none = seed.integer_option.some }
+			rejects(raw_parse(seed, option, result_type(option), Own.UnmanagedResult, parse_argument(seed)), "variant field count does not match its operation", 30)
 
 
-pure func test_verifier_rejects_reused_runtime_role() -> Bool:
+pure func test_verifier_rejects_reused_option_constructor() -> Bool:
 	match seed():
 		Err(_): False
 		Ok(seed):
-			roles = { present = seed.integer_roles.present, absent = seed.integer_roles.present }
-			rejects(raw_parse(seed, roles, result_type(roles), Own.UnmanagedResult, parse_argument(seed)), "variant field count does not match its operation", 30)
+			option = { some = seed.integer_option.some, none = seed.integer_option.some }
+			rejects(raw_parse(seed, option, result_type(option), Own.UnmanagedResult, parse_argument(seed)), "variant field count does not match its operation", 30)
 
 
-pure func test_verifier_rejects_unknown_runtime_role_owner() -> Bool:
+pure func test_verifier_rejects_unknown_option_owner() -> Bool:
 	match seed():
 		Err(_): False
 		Ok(seed):
@@ -401,51 +391,51 @@ pure func test_verifier_rejects_unknown_runtime_role_owner() -> Bool:
 
 private pure func rejects_layout(seed: Seed, variants: List[List[Concrete.TypeRef]], message: String) -> Bool:
 	program = valid_parse(seed)
-	owner = Concrete.union_number(Concrete.variant_owner(seed.integer_roles.present))
+	owner = Concrete.union_number(Concrete.variant_owner(seed.integer_option.some))
 	match seed.unions.set_index(owner, { variants = variants, representation = Concrete.InlineUnmanaged }):
 		Some(unions): rejects({ program | unions = unions }, message, 30)
 		None: False
 
 
-pure func test_verifier_rejects_unknown_runtime_role_ordinal() -> Bool:
+pure func test_verifier_rejects_unknown_option_constructor_ordinal() -> Bool:
 	match seed():
-		Ok(seed): rejects_layout(seed, [[]], "unknown variant identity")
+		Ok(seed): rejects_layout(seed, [[Concrete.IntType]], "unknown variant identity")
 		Err(_): False
 
 
 pure func test_verifier_rejects_wrong_runtime_payload_type() -> Bool:
 	match seed():
-		Ok(seed): rejects_layout(seed, [[], [Concrete.VoidType]], "variant payload does not match its operation")
+		Ok(seed): rejects_layout(seed, [[Concrete.VoidType], []], "variant payload does not match its operation")
 		Err(_): False
 
 
 pure func test_verifier_rejects_uncovered_runtime_variant() -> Bool:
 	match seed():
-		Ok(seed): rejects_layout(seed, [[], [Concrete.IntType], []], "runtime constructor roles do not cover one result union")
+		Ok(seed): rejects_layout(seed, [[Concrete.IntType], [], []], "runtime Option constructors do not cover one result union")
 		Err(_): False
 
 
 pure func test_verifier_rejects_wrong_parse_result_type() -> Bool:
 	match seed():
-		Ok(seed): rejects(raw_parse(seed, seed.integer_roles, Concrete.IntType, Own.UnmanagedResult, parse_argument(seed)), "call result type does not match its contract", 30)
+		Ok(seed): rejects(raw_parse(seed, seed.integer_option, Concrete.IntType, Own.UnmanagedResult, parse_argument(seed)), "call result type does not match its contract", 30)
 		Err(_): False
 
 
 pure func test_verifier_rejects_owned_option_int_result() -> Bool:
 	match seed():
-		Ok(seed): rejects(raw_parse(seed, seed.integer_roles, result_type(seed.integer_roles), Own.OwnedResult(Own.owner_id(0)), parse_argument(seed)), "unmanaged value carries an ownership obligation", 30)
+		Ok(seed): rejects(raw_parse(seed, seed.integer_option, result_type(seed.integer_option), Own.OwnedResult(Own.owner_id(0)), parse_argument(seed)), "unmanaged value carries an ownership obligation", 30)
 		Err(_): False
 
 
 pure func test_verifier_rejects_borrowed_option_int_result() -> Bool:
 	match seed():
-		Ok(seed): rejects(raw_parse(seed, seed.integer_roles, result_type(seed.integer_roles), Own.BorrowedResult(Own.ParameterBorrow(seed.ids.first)), parse_argument(seed)), "unmanaged value carries an ownership obligation", 30)
+		Ok(seed): rejects(raw_parse(seed, seed.integer_option, result_type(seed.integer_option), Own.BorrowedResult(Own.ParameterBorrow(seed.ids.first)), parse_argument(seed)), "unmanaged value carries an ownership obligation", 30)
 		Err(_): False
 
 
 pure func test_verifier_rejects_unmanaged_parse_string_argument() -> Bool:
 	match seed():
-		Ok(seed): rejects(raw_parse(seed, seed.integer_roles, result_type(seed.integer_roles), Own.UnmanagedResult, Own.UnmanagedArgument(seed.ids.first)), "managed call argument requires an owner-dependent borrow", 30)
+		Ok(seed): rejects(raw_parse(seed, seed.integer_option, result_type(seed.integer_option), Own.UnmanagedResult, Own.UnmanagedArgument(seed.ids.first)), "managed call argument requires an owner-dependent borrow", 30)
 		Err(_): False
 
 
@@ -454,11 +444,11 @@ pure func test_verifier_rejects_parse_borrow_after_input_drop() -> Bool:
 		Err(_): False
 		Ok(seed):
 			ids = seed.ids
-			call: Concrete.ConcreteCall = { target = Concrete.RuntimeFunction(Builtins.StringParseInt(seed.integer_roles)), span = span(30) }
+			call: Concrete.ConcreteCall = { target = Concrete.RuntimeFunction(Builtins.StringParseInt(seed.integer_option)), span = span(30) }
 			tested = raw_function([
 				define(ids.first, Concrete.StringType, Own.StringDefinition("42"), Own.OwnedResult(Own.owner_id(0)), 10),
 				Own.DropOwner(Own.owner_id(0), span(20)),
-				define(ids.second, result_type(seed.integer_roles), Own.CallDefinition(call, [Own.BorrowedArgument({ value = ids.first, source = Own.OwnerBorrow(Own.owner_id(0)) })]), Own.UnmanagedResult, 30),
+				define(ids.second, result_type(seed.integer_option), Own.CallDefinition(call, [Own.BorrowedArgument({ value = ids.first, source = Own.OwnerBorrow(Own.owner_id(0)) })]), Own.UnmanagedResult, 30),
 				define(ids.third, Concrete.IntType, Own.IntegerDefinition(0), Own.UnmanagedResult, 50),
 			], Own.ReturnTail(Own.ReturnResult(Own.UnmanagedReturn(ids.third))), [], Concrete.IntType)
 			rejects(raw_program(seed, tested), "borrow refers to discharged owner 0", 30)
@@ -468,10 +458,10 @@ private pure func read_arguments(seed: Seed) -> List[Own.OwnedArgument]:
 	[Own.BorrowedArgument({ value = seed.ids.first, source = Own.ParameterBorrow(seed.ids.first) }), Own.UnmanagedArgument(seed.ids.second)]
 
 
-private pure func raw_read_call(seed: Seed, roles: Builtins.OptionalRoles[Concrete.VariantInstanceId], arguments: List[Own.OwnedArgument], value_type: Concrete.TypeRef, result: Own.ResultOwnership, drops: List[Own.OwnershipOperation]) -> Own.OwnershipProgram:
+private pure func raw_read_call(seed: Seed, option: Builtins.DesignatedOption[Concrete.VariantInstanceId], arguments: List[Own.OwnedArgument], value_type: Concrete.TypeRef, result: Own.ResultOwnership, drops: List[Own.OwnershipOperation]) -> Own.OwnershipProgram:
 	ids = seed.ids
 	list_type = Concrete.ListType(Concrete.StringType)
-	call: Concrete.ConcreteCall = { target = Concrete.RuntimeFunction(Builtins.ListGet(Concrete.StringType, roles)), span = span(30) }
+	call: Concrete.ConcreteCall = { target = Concrete.RuntimeFunction(Builtins.ListGet(Concrete.StringType, option)), span = span(30) }
 	operations = [
 		define(ids.first, list_type, Own.ParameterDefinition(0), Own.BorrowedResult(Own.ParameterBorrow(ids.first)), 10),
 		define(ids.second, Concrete.IntType, Own.IntegerDefinition(0), Own.UnmanagedResult, 20),
@@ -481,12 +471,12 @@ private pure func raw_read_call(seed: Seed, roles: Builtins.OptionalRoles[Concre
 
 
 private pure func raw_read(seed: Seed, result: Own.ResultOwnership, drops: List[Own.OwnershipOperation]) -> Own.OwnershipProgram:
-	raw_read_call(seed, seed.string_roles, read_arguments(seed), result_type(seed.string_roles), result, drops)
+	raw_read_call(seed, seed.string_option, read_arguments(seed), result_type(seed.string_option), result, drops)
 
 
 -- Keep the rest of a valid get program fixed while varying one call fact.
-private pure func changed_read(seed: Seed, roles: Builtins.OptionalRoles[Concrete.VariantInstanceId], arguments: List[Own.OwnedArgument], value_type: Concrete.TypeRef) -> Own.OwnershipProgram:
-	raw_read_call(seed, roles, arguments, value_type, Own.OwnedResult(Own.owner_id(0)), [Own.DropOwner(Own.owner_id(0), span(40))])
+private pure func changed_read(seed: Seed, option: Builtins.DesignatedOption[Concrete.VariantInstanceId], arguments: List[Own.OwnedArgument], value_type: Concrete.TypeRef) -> Own.OwnershipProgram:
+	raw_read_call(seed, option, arguments, value_type, Own.OwnedResult(Own.owner_id(0)), [Own.DropOwner(Own.owner_id(0), span(40))])
 
 
 pure func test_raw_read_fresh_result_and_single_drop_are_valid() -> Bool:
@@ -500,7 +490,7 @@ pure func test_verifier_rejects_wrong_list_get_list_argument() -> Bool:
 		Err(_): False
 		Ok(seed):
 			arguments = [Own.UnmanagedArgument(seed.ids.second), Own.UnmanagedArgument(seed.ids.second)]
-			rejects(changed_read(seed, seed.string_roles, arguments, result_type(seed.string_roles)), "call argument type does not match its contract", 30)
+			rejects(changed_read(seed, seed.string_option, arguments, result_type(seed.string_option)), "call argument type does not match its contract", 30)
 
 
 pure func test_verifier_rejects_wrong_list_get_index_argument() -> Bool:
@@ -508,7 +498,7 @@ pure func test_verifier_rejects_wrong_list_get_index_argument() -> Bool:
 		Err(_): False
 		Ok(seed):
 			argument: Own.OwnedArgument = Own.BorrowedArgument({ value = seed.ids.first, source = Own.ParameterBorrow(seed.ids.first) })
-			rejects(changed_read(seed, seed.string_roles, [argument, argument], result_type(seed.string_roles)), "call argument type does not match its contract", 30)
+			rejects(changed_read(seed, seed.string_option, [argument, argument], result_type(seed.string_option)), "call argument type does not match its contract", 30)
 
 
 pure func test_verifier_rejects_unmanaged_list_get_argument() -> Bool:
@@ -516,21 +506,21 @@ pure func test_verifier_rejects_unmanaged_list_get_argument() -> Bool:
 		Err(_): False
 		Ok(seed):
 			arguments = [Own.UnmanagedArgument(seed.ids.first), Own.UnmanagedArgument(seed.ids.second)]
-			rejects(changed_read(seed, seed.string_roles, arguments, result_type(seed.string_roles)), "managed call argument requires an owner-dependent borrow", 30)
+			rejects(changed_read(seed, seed.string_option, arguments, result_type(seed.string_option)), "managed call argument requires an owner-dependent borrow", 30)
 
 
 pure func test_verifier_rejects_wrong_list_get_result_type() -> Bool:
 	match seed():
 		Err(_): False
-		Ok(seed): rejects(changed_read(seed, seed.string_roles, read_arguments(seed), Concrete.IntType), "call result type does not match its contract", 30)
+		Ok(seed): rejects(changed_read(seed, seed.string_option, read_arguments(seed), Concrete.IntType), "call result type does not match its contract", 30)
 
 
-pure func test_verifier_rejects_swapped_list_get_roles() -> Bool:
+pure func test_verifier_rejects_swapped_list_get_constructors() -> Bool:
 	match seed():
 		Err(_): False
 		Ok(seed):
-			roles = { present = seed.string_roles.absent, absent = seed.string_roles.present }
-			rejects(changed_read(seed, roles, read_arguments(seed), result_type(seed.string_roles)), "variant field count does not match its operation", 30)
+			option = { some = seed.string_option.none, none = seed.string_option.some }
+			rejects(changed_read(seed, option, read_arguments(seed), result_type(seed.string_option)), "variant field count does not match its operation", 30)
 
 
 pure func test_list_get_last_uses_include_root_borrow_and_index() -> Bool:
@@ -571,7 +561,7 @@ pure func test_verifier_rejects_double_drop_of_list_get_result() -> Bool:
 
 private pure func raw_child(seed: Seed, acquire: Bool, transfer: Bool) -> Own.OwnershipProgram:
 	ids = seed.ids
-	roles = seed.string_roles
+	option = seed.string_option
 	borrow: Own.BorrowedValue = { value = ids.third, source = Own.PayloadBorrow(ids.first) }
 	no_acquisition: List[Own.OwnershipOperation] = []
 	acquisition = if acquire:
@@ -584,14 +574,14 @@ private pure func raw_child(seed: Seed, acquire: Bool, transfer: Bool) -> Own.Ow
 		Own.UnmanagedReturn(ids.third)
 	matched: Own.OwnedMatch = {
 		scrutinee = Own.BorrowedArgument({ value = ids.first, source = Own.ParameterBorrow(ids.first) }),
-		owner = Concrete.variant_owner(roles.present),
+		owner = Concrete.variant_owner(option.some),
 		arms = [
-			{ label = Lower.VariantLabel(roles.absent), operations = [define(ids.second, Concrete.StringType, Own.StringDefinition("fallback"), Own.OwnedResult(Own.owner_id(0)), 20)], exit = Own.ReturnResult(Own.OwnedReturn(ids.second, Own.owner_id(0))) },
-			{ label = Lower.VariantLabel(roles.present), operations = [define(ids.third, Concrete.StringType, Own.PayloadDefinition(seed.string_field, ids.first), Own.BorrowedResult(Own.PayloadBorrow(ids.first)), 30)] + acquisition, exit = Own.ReturnResult(returned) },
+			{ label = Lower.VariantLabel(option.none), operations = [define(ids.second, Concrete.StringType, Own.StringDefinition("fallback"), Own.OwnedResult(Own.owner_id(0)), 20)], exit = Own.ReturnResult(Own.OwnedReturn(ids.second, Own.owner_id(0))) },
+			{ label = Lower.VariantLabel(option.some), operations = [define(ids.third, Concrete.StringType, Own.PayloadDefinition(seed.string_field, ids.first), Own.BorrowedResult(Own.PayloadBorrow(ids.first)), 30)] + acquisition, exit = Own.ReturnResult(returned) },
 		]
 	}
-	parameter = define(ids.first, result_type(roles), Own.ParameterDefinition(0), Own.BorrowedResult(Own.ParameterBorrow(ids.first)), 10)
-	raw_program(seed, raw_function([parameter], Own.MatchTail(matched), [result_type(roles)], Concrete.StringType))
+	parameter = define(ids.first, result_type(option), Own.ParameterDefinition(0), Own.BorrowedResult(Own.ParameterBorrow(ids.first)), 10)
+	raw_program(seed, raw_function([parameter], Own.MatchTail(matched), [result_type(option)], Concrete.StringType))
 
 
 pure func test_raw_selected_child_acquisition_and_transfer_are_valid() -> Bool:
@@ -619,22 +609,22 @@ pure func test_verifier_accepts_dropped_list_get_before_unmanaged_match() -> Boo
 		Ok(seed):
 			ids = seed.ids
 			list_type = Concrete.ListType(Concrete.StringType)
-			roles = seed.integer_roles
+			option = seed.integer_option
 			call: Concrete.ConcreteCall = {
-				target = Concrete.RuntimeFunction(Builtins.ListGet(Concrete.StringType, seed.string_roles)),
+				target = Concrete.RuntimeFunction(Builtins.ListGet(Concrete.StringType, seed.string_option)),
 				span = span(30)
 			}
 			matched: Own.OwnedMatch = {
 				scrutinee = Own.UnmanagedArgument(ids.second),
-				owner = Concrete.variant_owner(roles.present),
+				owner = Concrete.variant_owner(option.some),
 				arms = [
 					{
-						label = Lower.VariantLabel(roles.absent),
+						label = Lower.VariantLabel(option.none),
 						operations = [],
 						exit = Own.ReturnResult(Own.UnmanagedReturn(ids.fifth))
 					},
 					{
-						label = Lower.VariantLabel(roles.present),
+						label = Lower.VariantLabel(option.some),
 						operations = [],
 						exit = Own.ReturnResult(Own.UnmanagedReturn(ids.fifth))
 					},
@@ -651,7 +641,7 @@ pure func test_verifier_accepts_dropped_list_get_before_unmanaged_match() -> Boo
 					),
 					define(
 						ids.second,
-						result_type(roles),
+						result_type(option),
 						Own.ParameterDefinition(1),
 						Own.UnmanagedResult,
 						15,
@@ -665,7 +655,7 @@ pure func test_verifier_accepts_dropped_list_get_before_unmanaged_match() -> Boo
 					),
 					define(
 						ids.fourth,
-						result_type(seed.string_roles),
+						result_type(seed.string_option),
 						Own.CallDefinition(
 							call,
 							[Own.BorrowedArgument({
@@ -689,7 +679,7 @@ pure func test_verifier_accepts_dropped_list_get_before_unmanaged_match() -> Boo
 					),
 				],
 				Own.MatchTail(matched),
-				[list_type, result_type(roles)],
+				[list_type, result_type(option)],
 				Concrete.IntType,
 			)
 			verify(raw_program(seed, owned)).is_ok()
@@ -708,13 +698,13 @@ tests: TestSuite = {
 		("returned child acquires selected arm borrow", test_returned_child_acquires_only_its_selected_arm_borrow),
 		("owned list get prefix drops in each arm", test_owned_list_get_prefix_drops_in_each_arm),
 		("raw parse borrow and unmanaged result valid", test_raw_parse_borrow_and_unmanaged_result_are_valid),
-		("runtime roles require one owner", test_verifier_rejects_runtime_roles_from_different_owners),
-		("runtime roles reject swapped roles", test_verifier_rejects_swapped_runtime_roles),
-		("runtime roles reject reused role", test_verifier_rejects_reused_runtime_role),
-		("runtime role owner must exist", test_verifier_rejects_unknown_runtime_role_owner),
-		("runtime role ordinal must exist", test_verifier_rejects_unknown_runtime_role_ordinal),
-		("runtime role payload must match", test_verifier_rejects_wrong_runtime_payload_type),
-		("runtime roles cover every variant", test_verifier_rejects_uncovered_runtime_variant),
+		("Option constructors require one instance", test_verifier_rejects_option_constructors_from_different_instances),
+		("Option constructors reject swapped constructors", test_verifier_rejects_swapped_option_constructors),
+		("Option constructors reject a reused constructor", test_verifier_rejects_reused_option_constructor),
+		("Option constructor owner must exist", test_verifier_rejects_unknown_option_owner),
+		("Option constructor ordinal must exist", test_verifier_rejects_unknown_option_constructor_ordinal),
+		("Option constructor payload must match", test_verifier_rejects_wrong_runtime_payload_type),
+		("Option constructors cover every variant", test_verifier_rejects_uncovered_runtime_variant),
 		("parse result type matches contract", test_verifier_rejects_wrong_parse_result_type),
 		("Option Int cannot carry owner", test_verifier_rejects_owned_option_int_result),
 		("Option Int cannot carry borrow", test_verifier_rejects_borrowed_option_int_result),
@@ -725,7 +715,7 @@ tests: TestSuite = {
 		("list get index argument matches contract", test_verifier_rejects_wrong_list_get_index_argument),
 		("list get root argument requires borrow", test_verifier_rejects_unmanaged_list_get_argument),
 		("list get result type matches contract", test_verifier_rejects_wrong_list_get_result_type),
-		("list get roles preserve payload meaning", test_verifier_rejects_swapped_list_get_roles),
+		("list get constructors preserve payload meaning", test_verifier_rejects_swapped_list_get_constructors),
 		("list get last uses include root and index", test_list_get_last_uses_include_root_borrow_and_index),
 		("list get cannot be unmanaged", test_verifier_rejects_unmanaged_list_get_result),
 		("list get cannot borrow fresh result", test_verifier_rejects_borrowed_list_get_result),
