@@ -1,0 +1,322 @@
+---
+Publishes one checked signature per function in declaration order and
+identifies the entrypoint.
+---
+import:
+	../namespace/builtins: RuntimeOperation
+	./builtins: validate_builtin_body
+	./errors:
+		CheckError,
+		CheckerInvariant(InvalidResolvedFunction),
+		SignatureError(
+			DuplicateParameter, GenericMain, MainHasParameters,
+			MainParameterType, MainReturnType, MissingMain, PureVoidReturn,
+		),
+		checker_invariant,
+		signature_error,
+	./model:
+		CheckedUnion,
+		FunctionSignature,
+		TypeParameterOwner(FunctionDeclaration),
+		TypeRef(IntType, ListType, StringType, VoidType),
+		TypeUse,
+		same_type,
+		type_parameter_id,
+	./types:
+		TypeScope,
+		declared_parameters,
+		local_type_parameters,
+		resolve_type,
+	../utils/declarations: FunctionId, VariantId, function_number, inventory_functions, inventory_records, inventory_unions
+	int as IntOps
+	../utils/names: same_name
+	../namespace/namespace: Namespace, local_function
+	option: to_result
+	../parse/assemble: ParsedContents
+	../utils/source: root_module_id
+	../utils/syntax:
+		EntryResult(IntegerExitStatus, SuccessfulExit),
+		Entrypoint(NoArguments, WithArguments),
+		ParsedBody(ParsedBuiltinBody, ParsedMatchBody, ParsedValueBody),
+		ParsedFunction,
+		ParsedMatch,
+		ParsedParameter,
+		Purity(Pure),
+		Span,
+		ValueExpression,
+		same_purity,
+		type_span,
+
+
+private fixed union FunctionRole:
+	EntryFunction
+	HelperFunction
+
+
+-- A function body after signature checking. A builtin body has been validated
+-- against its runtime contract; source bodies are checked with the others.
+fixed union AcceptedBody:
+	BuiltinBody(RuntimeOperation[VariantId, TypeRef], Span)
+	ValueBody(ValueExpression)
+	MatchBody(ParsedMatch)
+
+
+-- One function after signature checking: its declaration, its one published
+-- signature and its accepted body. Rows follow declaration order, so a
+-- FunctionId indexes them.
+fixed record AcceptedFunction {
+	id: FunctionId,
+	declaration: ParsedFunction,
+	signature: FunctionSignature,
+	body: AcceptedBody
+}
+
+
+fixed record CheckedSignatures {
+	functions: List[AcceptedFunction],
+	entrypoint: Entrypoint[FunctionId]
+}
+
+
+pure func validate_pure_result(
+	purity: Purity,
+	value_type: TypeRef,
+	span: Span,
+) -> Result[Void, CheckError]:
+	if same_purity(purity, Pure) and same_type(value_type, VoidType):
+		Err(signature_error(span, PureVoidReturn))
+	else:
+		Ok(void)
+
+
+pure func validate_signatures(
+	parsed: ParsedContents,
+	namespace: Namespace,
+	unions: List[CheckedUnion],
+) -> Result[CheckedSignatures, CheckError]:
+	entrypoint = local_function(namespace, root_module_id(), parsed.entrypoint)
+	functions ?= accept_functions(parsed, namespace, unions, entrypoint, [])
+	id ?= entrypoint.to_result(signature_error(parsed.end, MissingMain))
+	main ?= functions
+		.get(function_number(id))
+		.to_result(checker_invariant(parsed.end, InvalidResolvedFunction(id)))
+
+	result = if same_type(main.signature.return_type.value_type, VoidType):
+		SuccessfulExit
+	else:
+		IntegerExitStatus
+
+	accepted: Entrypoint[FunctionId] = match main.signature.parameters:
+		[]:
+			NoArguments(id, result)
+		_:
+			WithArguments(id, result)
+
+	Ok({
+		functions = functions,
+		entrypoint = accepted,
+	})
+
+
+private pure func accept_functions(
+	parsed: ParsedContents,
+	namespace: Namespace,
+	unions: List[CheckedUnion],
+	entrypoint: Option[FunctionId],
+	accepted: List[AcceptedFunction],
+) -> Result[List[AcceptedFunction], CheckError]:
+	match inventory_functions(parsed.declarations).get(accepted.length()):
+		None:
+			Ok(accepted)
+		Some(row):
+			function = row.declaration
+
+			id = row.id
+
+			role = match entrypoint:
+				Some(entry):
+					if IntOps.equals(function_number(id), function_number(entry)):
+						EntryFunction
+					else:
+						HelperFunction
+				None:
+					HelperFunction
+
+			scope: TypeScope = {
+				records = inventory_records(parsed.declarations),
+				unions = inventory_unions(parsed.declarations),
+				namespace = namespace,
+				module = function.module,
+				parameters = []
+			}
+			signature ?= resolve_signature(function, id, role, scope, unions)
+			accept_functions(
+				parsed,
+				namespace,
+				unions,
+				entrypoint,
+				accepted.append(signature),
+			)
+
+
+private pure func resolve_signature(
+	function: ParsedFunction,
+	id: FunctionId,
+	role: FunctionRole,
+	module_scope: TypeScope,
+	unions: List[CheckedUnion],
+) -> Result[AcceptedFunction, CheckError]:
+	generic_main ?= match role:
+		EntryFunction:
+			match function.type_parameters.get(0):
+				Some(name):
+					Err(
+						signature_error(
+							name.span,
+							GenericMain(type_parameter_id(FunctionDeclaration(id), 0)),
+						),
+					)
+				None:
+					Ok(void)
+		HelperFunction:
+			Ok(void)
+
+	scope ?= local_type_parameters(function.type_parameters, FunctionDeclaration(id), module_scope)
+
+	return_type ?= match function.return_type:
+		Some(written):
+			resolve_type(scope, written)
+		None:
+			Ok(VoidType)
+
+	return_span = match function.return_type:
+		Some(written):
+			type_span(written)
+		None:
+			function.function_name.span
+
+	pure_result ?= validate_pure_result(function.purity, return_type, return_span)
+
+	main_type ?= match role:
+		EntryFunction:
+			if same_type(return_type, IntType) or same_type(return_type, VoidType):
+				Ok(void)
+			else:
+				Err(signature_error(return_span, MainReturnType(return_type)))
+		HelperFunction:
+			Ok(void)
+
+	single_main_parameter ?= match role:
+		EntryFunction:
+			match function.parameters:
+				[_, second, ..._]:
+					Err(
+						signature_error(
+							second.name.span,
+							MainHasParameters(function.parameters.length()),
+						),
+					)
+				_:
+					Ok(void)
+		HelperFunction:
+			Ok(void)
+
+	parameters ?= resolve_parameters(function.parameters, role, scope, [])
+	signature: FunctionSignature = {
+		type_parameters = declared_parameters(scope),
+		purity = function.purity,
+		parameters = parameters,
+		return_type = {
+			value_type = return_type,
+			span = return_span
+		}
+	}
+	body ?= accept_body(function, signature, unions, scope.namespace)
+
+	Ok({
+		id = id,
+		declaration = function,
+		signature = signature,
+		body = body,
+	})
+
+
+-- Parameter names are distinct; main's only parameter is a List[String].
+private pure func resolve_parameters(
+	parameters: List[ParsedParameter],
+	role: FunctionRole,
+	scope: TypeScope,
+	resolved: List[TypeUse],
+) -> Result[List[TypeUse], CheckError]:
+	position = resolved.length()
+
+	match parameters.get(position):
+		None:
+			Ok(resolved)
+		Some(parameter):
+			var earlier: Option[ParsedParameter] = None
+
+			for previous in parameters.take(position):
+				if same_name(previous.name.id, parameter.name.id):
+					earlier = Some(previous)
+					break
+
+			unique ?= match earlier:
+				Some(first):
+					Err(
+						signature_error(
+							parameter.name.span,
+							DuplicateParameter(parameter.name.id, first.name.span),
+						),
+					)
+				None:
+					Ok(void)
+
+			value_type ?= resolve_type(scope, parameter.type_name)
+			span = type_span(parameter.type_name)
+
+			entry_type ?= match role:
+				EntryFunction:
+					if same_type(value_type, ListType(StringType)):
+						Ok(void)
+					else:
+						Err(signature_error(span, MainParameterType))
+				HelperFunction:
+					Ok(void)
+
+			resolve_parameters(
+				parameters,
+				role,
+				scope,
+				resolved.append({
+					value_type = value_type,
+					span = span,
+				}),
+			)
+
+
+-- A builtin body is accepted once its runtime contract is validated; source
+-- bodies are checked with every other body.
+private pure func accept_body(
+	function: ParsedFunction,
+	signature: FunctionSignature,
+	unions: List[CheckedUnion],
+	namespace: Namespace,
+) -> Result[AcceptedBody, CheckError]:
+	match function.body:
+		ParsedBuiltinBody(operation, span):
+			runtime ?= validate_builtin_body(
+				operation,
+				{
+					function = function,
+					signature = signature,
+					unions = unions,
+					namespace = namespace,
+					span = span
+				},
+			)
+			Ok(BuiltinBody(runtime, span))
+		ParsedValueBody(value):
+			Ok(ValueBody(value))
+		ParsedMatchBody(matched):
+			Ok(MatchBody(matched))

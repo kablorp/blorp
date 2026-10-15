@@ -1,0 +1,2603 @@
+---
+Expression-local elaboration and freeze. Only complete checked facts leave this
+module; temporary inference variables never become published TypeRefs.
+---
+import:
+	./calls: FunctionContract, function_contract
+	./methods: ResolutionContext, ResolvedReceiver(ReceiverCandidates, UniqueReceiver), ReceiverCandidate, classify_receiver, contains_variant, lookup_target, receiver_expectation, method_sites, select_receiver_contract
+	./signatures: validate_pure_result
+	./types: find_field, occurrence_fields, previous_declaration
+	./model:
+		BindingDefinition, BindingId, FieldId, CheckedForm(UpdateRecord, ConstructRecord, ConstructVariant, LiteralVoid, LiteralInteger, LiteralFloat, LiteralString, ReadBinding, InvokeFunction, ReadRecordField), CheckedRecord, CheckedField, CheckedRecordField, CheckedRecordUpdate, RetainedRecordField, CheckedExpr, CheckedCall, TypeParameterId, TypeRef(VoidType, IntType, FloatType, StringType, ListType, RecordType, AppliedRecordType, UnionType, AppliedUnionType, ParameterType), TypeUse, UnionOccurrence, CallTarget(UserFunction), same_type, same_parameter, same_variant, field_number, parameter_position
+	./errors:
+		CheckError, BindingSite, ArgumentMismatch, InfiniteInference, ExpectedTypeSite(SourceAnnotation),
+		CheckErrorKind(ConstructorRejection, RecordRejection),
+		CallError(ArgumentTypeMismatch, GenericArgumentConflict, UninferableTypeParameter, InfiniteTypeArgument, UnknownFunction, UncallableBinding),
+		ConstructorError(ConstructorNeedsExpectedType, VariantNotInExpectedType, PayloadFreeVariantCalled, ConstructorFieldCountMismatch),
+		RecordError(UpdateRequiresRecord, DuplicateUpdateField, RecordNeedsExpectedType, UnknownRecordField, DuplicateLiteralField, MissingRecordField, RecordFieldTypeMismatch, FieldRequiresRecord),
+		ValueError(UnknownValue, ExpressionTypeMismatch), MethodError(MethodReceiverNeedsType),
+		CheckerInvariant(InvalidCheckedUnion, InvalidRecordDeclaration, InvalidRecordField, GenericConstructorContract, InvalidInferenceVariable, InvalidInferenceWorklist, InvalidParameterDeclaration, MissingCallParameter, MissingGenericParameter, InvalidFunctionContract),
+		call_error, constructor_error, record_error, value_error, method_error, checker_invariant
+	../utils/declarations: FunctionId, RecordId, UnionId, VariantId, record_number, union_number, variant_number
+	int as IntOps
+	../utils/names: NameId, same_name
+	../utils/source: COMPILER_SOURCE
+	../namespace/namespace: variant_candidates
+	option: is_some, to_result
+	../utils/syntax: BindingSyntax, Span, ValueExpression, WrittenName, ParsedRecordField, PostfixOperation(ReceiverInvocation, FieldAccess), ReceiverApplication, ExpressionBase(VoidExpression, IntegerExpression, FloatExpression, StringExpression, NameExpression, DirectApplication, RecordExpression, RecordUpdateExpression), Purity, same_span
+
+
+private fixed union ResolvedPostfix:
+	InvokeReceiver(ReceiverApplication, ResolvedReceiver)
+	ReadField(WrittenName)
+
+
+private fixed union ResolvedApplication:
+	FunctionApplication(FunctionContract)
+	ConstructorApplication(WrittenName)
+
+
+fixed record LocalBinding {
+	name: NameId,
+	id: BindingId,
+	definition: BindingDefinition
+}
+
+
+pure func lookup_binding(scope: List[LocalBinding], name: NameId) -> Option[LocalBinding]:
+	var found: Option[LocalBinding] = None
+
+	for binding in scope:
+		if same_name(binding.name, name):
+			found = Some(binding)
+			break
+
+	found
+
+
+private fixed record ExpectedValue {
+	value_type: TypeRef,
+	site: ExpectedTypeSite
+}
+
+
+fixed record VariantContract {
+	variant: VariantId,
+	result_type: TypeRef,
+	fields: List[TypeUse]
+}
+
+
+private fixed record DeclaredVariantContract {
+	variant: VariantId,
+	fields: List[TypeUse],
+	parameters: List[TypeParameterId]
+}
+
+
+private pure func find_declared_variant(context: ResolutionContext, owner: UnionId, name: WrittenName) -> Result[Option[DeclaredVariantContract], CheckError]:
+	declaration ?= context.unions.get(union_number(owner)).to_result(checker_invariant(name.span, InvalidCheckedUnion(owner)))
+	var found: Option[DeclaredVariantContract] = None
+	for candidate in variant_candidates(context.namespace, context.module, name.id):
+		match declaration.variants.get(variant_number(candidate)):
+			Some(variant):
+				if same_variant(candidate, variant.id) and same_name(variant.name.id, name.id):
+					found = Some({ variant = variant.id, fields = variant.fields, parameters = declaration.type_parameters })
+					break
+			None: void
+	Ok(found)
+
+
+pure func find_variant(context: ResolutionContext, occurrence: UnionOccurrence, name: WrittenName) -> Result[Option[VariantContract], CheckError]:
+	found ?= find_declared_variant(context, occurrence.owner, name)
+	match found:
+		None: Ok(None)
+		Some(variant):
+			fields ?= occurrence_fields(variant.fields, occurrence)
+			value_type = if occurrence.arguments.is_empty():
+				UnionType(occurrence.owner)
+			else:
+				AppliedUnionType(occurrence.owner, occurrence.arguments)
+			Ok(Some({ variant = variant.variant, result_type = value_type, fields = fields }))
+
+
+private pure func resolve_record_field(
+	name: WrittenName,
+	owner: RecordId,
+	context: ResolutionContext,
+) -> Result[CheckedField, CheckError]:
+	declaration ?= context.records
+		.get(record_number(owner))
+		.to_result(checker_invariant(name.span, InvalidRecordDeclaration(owner)))
+	find_field(
+		declaration.fields,
+		name.id,
+	).to_result(record_error(name.span, UnknownRecordField(name.id, owner)))
+
+
+private fixed record PlannedRecordField {
+	field: FieldId,
+	written: ValueExpression,
+	expected: InferenceUse
+}
+
+
+-- Literal and update fields share one RHS/constraint engine; only their origins differ.
+private fixed union RecordOrigin:
+	LiteralRecord(RecordId)
+	UpdatedRecord(RecordId, PendingValue, Span, List[PendingRetainedField])
+
+
+private fixed record PendingRetainedField { field: FieldId, value_type: InferenceType }
+
+
+private fixed record PlannedRecordFields {
+	origin: RecordOrigin,
+	value_type: InferenceType,
+	fields: List[PlannedRecordField],
+	span: Span
+}
+
+
+private fixed record PendingRecordField {
+	field: FieldId,
+	expected: InferenceUse,
+	value: PendingValue
+}
+
+
+private fixed record RecordOccurrence {
+	owner: RecordId,
+	arguments: List[InferenceType]
+}
+
+
+private pure func record_occurrence(value: InferenceType) -> Option[RecordOccurrence]:
+	match inference_shape(value):
+		AcceptedType(RecordType(owner)): Some({ owner = owner, arguments = [] })
+		InferredRecord(owner, arguments): Some({ owner = owner, arguments = arguments })
+		_: None
+
+
+private pure func record_argument_hints(arguments: List[InferenceType]) -> List[Option[InferenceType]]:
+	arguments.map(pure func(value): Some(value))
+
+
+private fixed record ResolvedLiteralField {
+	field: CheckedField,
+	written: ParsedRecordField
+}
+
+
+private pure func plan_record_literal(
+	written: List[ParsedRecordField],
+	span: Span,
+	expectation: Option[InferenceType],
+	context: ResolutionContext,
+) -> Result[PlannedBase, CheckError]:
+	term ?= expectation.to_result(record_error(span, RecordNeedsExpectedType))
+	-- The supplied hint must establish the owner. A solved bare call variable
+	-- can constrain types, but cannot give a later literal its nominal shape.
+	occurrence ?= record_occurrence(term).to_result(record_error(span, RecordNeedsExpectedType))
+	owner = occurrence.owner
+	declaration ?= context.records
+		.get(record_number(owner))
+		.to_result(checker_invariant(span, InvalidRecordDeclaration(owner)))
+	var resolved: List[ResolvedLiteralField] = []
+	var previous: List[WrittenName] = []
+	var failure: Option[CheckError] = None
+
+	for field in written:
+		known_names = previous
+		result = resolve_record_field(
+			field.name,
+			owner,
+			context,
+		).and_then(pure func(declared: CheckedField) -> Result[ResolvedLiteralField, CheckError]:
+			match previous_declaration(known_names, field.name.id):
+				Some(first):
+					Err(
+						record_error(
+							field.name.span,
+							DuplicateLiteralField(field.name.id, first.span),
+						),
+					)
+				None:
+					Ok({
+						field = declared,
+						written = field,
+					})
+		)
+
+		match result:
+			Err(error):
+				failure = Some(error)
+				break
+			Ok(field):
+				resolved = resolved.append(field)
+				previous = previous.append(field.written.name)
+
+	names_ready ?= match failure:
+		Some(error):
+			Err(error)
+		None:
+			Ok(void)
+
+	for field in declaration.fields:
+		if not previous_declaration(previous, field.name.id).is_some():
+			failure = Some(
+				record_error(
+					span,
+					MissingRecordField(
+						field.id,
+						field.name.span,
+					),
+				),
+			)
+			break
+
+	complete ?= match failure:
+		Some(error):
+			Err(error)
+		None:
+			Ok(void)
+
+	accepted = declaration
+	if not IntOps.equals(accepted.type_parameters.length(), occurrence.arguments.length()):
+		Err(checker_invariant(span, InvalidRecordDeclaration(owner)))
+	else:
+		hints = record_argument_hints(occurrence.arguments)
+		var fields: List[PlannedRecordField] = []
+		var error: Option[CheckError] = None
+
+		for field in resolved:
+			result = plan_record_field(field, accepted, hints)
+			match result:
+				Ok(field): fields = fields.append(field)
+				Err(failure):
+					error = Some(failure)
+					break
+
+		ready ?= match error:
+			Some(error): Err(error)
+			None: Ok(void)
+		Ok(PlannedRecord({ origin = LiteralRecord(owner), value_type = term, fields = fields, span = span }))
+
+
+private pure func plan_record_update(base: PendingValue, written: List[ParsedRecordField], span: Span, expression_span: Span, context: ResolutionContext, slots: List[InferenceSlot]) -> Result[PlannedRecordFields, CheckError]:
+	head ?= inference_head(pending_type(base), slots, expression_span)
+	occurrence_result: Result[RecordOccurrence, CheckError] = match record_occurrence(head):
+		Some(value): Ok(value)
+		None:
+			actual ?= publish_inference_type(head, slots, DiagnosticInference, expression_span)
+			Err(record_error(expression_span, UpdateRequiresRecord(actual)))
+	occurrence ?= occurrence_result
+	declaration ?= context.records.get(record_number(occurrence.owner)).to_result(checker_invariant(span, InvalidRecordDeclaration(occurrence.owner)))
+	hints = record_argument_hints(occurrence.arguments)
+	var replaced: List[Option[Span]] = []
+	for _ in declaration.fields:
+		replaced = replaced.append(None)
+	var fields: List[PlannedRecordField] = []
+	var failure: Option[CheckError] = None
+	for written_field in written:
+		planned: Result[PlannedRecordField, CheckError] = match resolve_record_field(written_field.name, occurrence.owner, context):
+			Err(error): Err(error)
+			Ok(field):
+				match replaced.get(field_number(field.id)):
+					Some(Some(first)): Err(record_error(written_field.name.span, DuplicateUpdateField(written_field.name.id, first)))
+					Some(None): plan_record_field({ field = field, written = written_field }, declaration, hints)
+					None: Err(checker_invariant(span, InvalidRecordField(field.id)))
+		match planned:
+			Err(error):
+				failure = Some(error)
+				break
+			Ok(field):
+				fields = fields.append(field)
+				replaced = replaced.set(field_number(field.field), Some(written_field.name.span))
+	ready ?= match failure:
+		Some(error): Err(error)
+		None: Ok(void)
+	var inherited: List[PendingRetainedField] = []
+	for field in declaration.fields:
+		match replaced.get(field_number(field.id)):
+			Some(None):
+				annotation = field.value_type
+				match apply_type_hint(annotation.value_type, declaration.type_parameters, hints):
+					Some(value_type): inherited = inherited.append({ field = field.id, value_type = value_type })
+					None:
+						failure = Some(checker_invariant(annotation.span, InvalidRecordField(field.id)))
+						break
+			Some(Some(_)): void
+			None:
+				failure = Some(checker_invariant(span, InvalidRecordField(field.id)))
+				break
+	complete ?= match failure:
+		Some(error): Err(error)
+		None: Ok(void)
+	Ok({ origin = UpdatedRecord(occurrence.owner, base, expression_span, inherited), value_type = pending_type(base), fields = fields, span = span })
+
+
+private pure func plan_record_field(field: ResolvedLiteralField, accepted: CheckedRecord, hints: List[Option[InferenceType]]) -> Result[PlannedRecordField, CheckError]:
+	annotation = field.field.value_type
+	value_type ?= apply_type_hint(annotation.value_type, accepted.type_parameters, hints).to_result(checker_invariant(annotation.span, InvalidRecordField(field.field.id)))
+	Ok({ field = field.field.id, written = field.written.value, expected = { value_type = value_type, span = annotation.span } })
+
+
+private pure func validate_record_field(field: PendingRecordField, slots: List[InferenceSlot]) -> Result[Void, CheckError]:
+	expected ?= publish_inference_type(field.expected.value_type, slots, CompleteInference, field.expected.span)
+	actual ?= publish_inference_type(pending_type(field.value), slots, CompleteInference, field.value.span)
+	if same_type(expected, actual):
+		Ok(void)
+	else:
+		Err(record_error(field.value.span, RecordFieldTypeMismatch(field.field, { value_type = actual, span = field.value.span }, { value_type = expected, span = field.expected.span })))
+
+
+private pure func validate_record_fields(fields: List[PendingRecordField], slots: List[InferenceSlot]) -> Result[Void, CheckError]:
+	var failure: Option[CheckError] = None
+
+	for field in fields:
+		result = validate_record_field(field, slots)
+		match result:
+			Ok(_): void
+			Err(error):
+				failure = Some(error)
+				break
+
+	match failure:
+		Some(error): Err(error)
+		None: Ok(void)
+
+
+private pure func finish_pending_record(plan: PlannedRecordFields, fields: List[PendingRecordField], slots: List[InferenceSlot]) -> Result[PendingValue, CheckError]:
+	var readiness = match plan.origin:
+		LiteralRecord(_): ClosedInference
+		UpdatedRecord(_, base, _, _): base.readiness
+	for field in fields:
+		match field.value.readiness:
+			DeferredInference: readiness = DeferredInference
+			ClosedInference: void
+	complete ?= inference_complete(plan.value_type, slots, plan.span)
+	if not complete:
+		readiness = DeferredInference
+	valid ?= match readiness:
+		ClosedInference: validate_record_fields(fields, slots)
+		DeferredInference: Ok(void)
+	base = match plan.origin:
+		LiteralRecord(owner): PendingConstructRecord(owner, fields)
+		UpdatedRecord(owner, base, expression_span, inherited): PendingUpdateRecord(owner, base, expression_span, fields, inherited)
+	Ok({ span = plan.span, readiness = readiness, base = base, base_type = plan.value_type, base_span = plan.span, operations = NoPendingOperations })
+
+
+private pure func freeze_record_fields(fields: List[PendingRecordField], slots: List[InferenceSlot]) -> Result[List[CheckedRecordField], CheckError]:
+	var frozen: List[CheckedRecordField] = []
+	var failure: Option[CheckError] = None
+
+	-- All child errors precede ordinary field mismatches, including later children.
+	for field in fields:
+		match freeze_pending_value(field.value, slots):
+			Ok(value): frozen = frozen.append({ field = field.field, value = value, span = field.value.span })
+			Err(error):
+				failure = Some(error)
+				break
+	ready ?= match failure:
+		Some(error): Err(error)
+		None: Ok(void)
+	valid ?= validate_record_fields(fields, slots)
+	Ok(frozen)
+
+
+private fixed record ResolvedArguments {
+	values: List[CheckedExpr],
+	call: CheckedCall
+}
+
+
+private fixed record PendingCall {
+	contract: FunctionContract,
+	variable_start: Int
+}
+
+
+-- Only leaves are accepted before freezing: they have no children to infer.
+private fixed union PendingBase:
+	AcceptedVoid
+	AcceptedInteger(Int)
+	AcceptedFloat(Float)
+	AcceptedString(String)
+	AcceptedBinding(BindingId)
+	PendingDirectCall(PendingCall, List[PendingValue])
+	PendingConstructRecord(RecordId, List[PendingRecordField])
+	PendingUpdateRecord(RecordId, PendingValue, Span, List[PendingRecordField], List[PendingRetainedField])
+	PendingConstructVariant(PendingVariantContract, List[PendingValue])
+
+
+private fixed union PendingOperation:
+	AcceptedField(FieldId)
+	PendingInvocation(PendingCall, List[PendingValue])
+
+
+private fixed record PendingStep {
+	operation: PendingOperation,
+	value_type: InferenceType,
+	span: Span
+}
+
+
+-- Extension shares one immutable link, rather than copying an operation prefix.
+-- Freeze walks these links once and publishes the existing source-order vector.
+private fixed union PendingOperations:
+	NoPendingOperations
+	PendingOperationLink(PendingStep, PendingOperations)
+
+
+private fixed record PendingValue {
+	span: Span,
+	readiness: InferenceReadiness,
+	base: PendingBase,
+	base_type: InferenceType,
+	base_span: Span,
+	operations: PendingOperations
+}
+
+
+private pure func pending_type(value: PendingValue) -> InferenceType:
+	match value.operations:
+		PendingOperationLink(step, _): step.value_type
+		NoPendingOperations: value.base_type
+
+
+private pure func parameter_in_type(parameter: TypeParameterId, value_type: TypeRef) -> Bool:
+	match value_type:
+		ParameterType(actual):
+			same_parameter(parameter, actual)
+		ListType(element):
+			parameter_in_type(parameter, element)
+		AppliedRecordType(_, arguments):
+			var found = False
+
+			for argument in arguments:
+				if parameter_in_type(parameter, argument):
+					found = True
+					break
+
+			found
+		AppliedUnionType(_, arguments):
+			var found = False
+
+			for argument in arguments:
+				if parameter_in_type(parameter, argument):
+					found = True
+					break
+
+			found
+		_:
+			False
+
+
+private pure func inference_complete(value_type: InferenceType, slots: List[InferenceSlot], span: Span) -> Result[Bool, CheckError]:
+	value ?= inference_head(value_type, slots, span)
+
+	match value:
+		CallVariable(_): Ok(False)
+		AcceptedType(_): Ok(True)
+		InferredList(element): inference_complete(element, slots, span)
+		InferredRecord(_, arguments):
+			var complete = True
+			var failure: Option[CheckError] = None
+
+			for argument in arguments:
+				match inference_complete(argument, slots, span):
+					Err(error):
+						failure = Some(error)
+						break
+					Ok(value):
+						if not value:
+							complete = False
+							break
+
+			match failure:
+				Some(error): Err(error)
+				None: Ok(complete)
+		InferredUnion(_, arguments):
+			var complete = True
+			var failure: Option[CheckError] = None
+
+			for argument in arguments:
+				match inference_complete(argument, slots, span):
+					Err(error):
+						failure = Some(error)
+						break
+					Ok(value):
+						if not value:
+							complete = False
+							break
+
+			match failure:
+				Some(error): Err(error)
+				None: Ok(complete)
+
+
+private pure func call_inference_ready(call: PendingCall, slots: List[InferenceSlot]) -> Result[Bool, CheckError]:
+	var complete = True
+	var failure: Option[CheckError] = None
+
+	for parameter in call.contract.signature.type_parameters:
+		variable = CallVariable(into_opaque InferenceVariableId(IntOps.add(call.variable_start, parameter_position(parameter))))
+
+		match inference_complete(variable, slots, call.contract.span):
+			Err(error):
+				failure = Some(error)
+				break
+			Ok(ready):
+				if not ready:
+					complete = False
+
+					if not parameter_in_type(parameter, call.contract.signature.return_type.value_type):
+						failure = Some(call_error(call.contract.span, UninferableTypeParameter(parameter)))
+						break
+
+	match failure:
+		Some(error): Err(error)
+		None: Ok(complete)
+
+
+private pure func pending_arguments(values: List[PendingValue]) -> List[InferenceUse]:
+	var arguments: List[InferenceUse] = []
+
+	for value in values:
+		arguments = arguments.append({ value_type = pending_type(value), span = value.span })
+
+	arguments
+
+
+-- Traverse the written callee signature, never a complete substitution's
+-- ancestry. Replacements remain terminal under simultaneous substitution.
+private pure func admit_call_type(written: TypeRef, call: PendingCall, slots: List[InferenceSlot], span: Span) -> Result[TypeRef, CheckError]:
+	if call.contract.signature.type_parameters.is_empty():
+		Ok(written)
+	else:
+		match written:
+			ListType(element):
+				value ?= admit_call_type(element, call, slots, span)
+				Ok(ListType(value))
+			AppliedRecordType(owner, arguments):
+				var values: List[TypeRef] = []
+				var failure: Option[CheckError] = None
+
+				for argument in arguments:
+					match admit_call_type(argument, call, slots, span):
+						Ok(value): values = values.append(value)
+						Err(error):
+							failure = Some(error)
+							break
+
+				match failure:
+					Some(error): Err(error)
+					None: Ok(AppliedRecordType(owner, values))
+			AppliedUnionType(owner, arguments):
+				var values: List[TypeRef] = []
+				var failure: Option[CheckError] = None
+
+				for argument in arguments:
+					match admit_call_type(argument, call, slots, span):
+						Ok(value): values = values.append(value)
+						Err(error):
+							failure = Some(error)
+							break
+
+				match failure:
+					Some(error): Err(error)
+					None: Ok(AppliedUnionType(owner, values))
+			ParameterType(_):
+				publish_inference_type(inference_type(written, call.contract.signature.type_parameters, call.variable_start), slots, CompleteInference, span)
+			_: Ok(written)
+
+
+private pure func admit_call_parameters(call: PendingCall, slots: List[InferenceSlot]) -> Result[List[TypeUse], CheckError]:
+	if call.contract.signature.type_parameters.is_empty():
+		Ok(call.contract.signature.parameters)
+	else:
+		var parameters: List[TypeUse] = []
+		var failure: Option[CheckError] = None
+
+		for written in call.contract.signature.parameters:
+			match admit_call_type(written.value_type, call, slots, written.span):
+				Ok(value): parameters = parameters.append({ written | value_type = value })
+				Err(error):
+					failure = Some(error)
+					break
+
+		match failure:
+			Some(error): Err(error)
+			None: Ok(parameters)
+
+
+-- Called only after closed-child readiness and own-slot completion, or after
+-- child-first freeze and call publication. Rechecking completeness here
+-- would rescan every growing nested term without establishing another fact.
+private pure func validate_complete_arguments(contract: FunctionContract, parameters: List[TypeUse], return_type: TypeRef, actual: List[InferenceUse], slots: List[InferenceSlot]) -> Result[TypeRef, CheckError]:
+	pure_result ?= validate_pure_result(contract.signature.purity, return_type, contract.span)
+	var failure: Option[CheckError] = None
+	var position = 0
+
+	for value in actual:
+		match validate_complete_argument(contract, parameters, position, value, slots):
+			Err(error):
+				failure = Some(error)
+				break
+			Ok(_):
+				void
+
+		position = IntOps.add(position, 1)
+
+	match failure:
+		Some(error): Err(error)
+		None: Ok(return_type)
+
+
+private pure func validate_complete_argument(contract: FunctionContract, parameters: List[TypeUse], position: Int, actual: InferenceUse, slots: List[InferenceSlot]) -> Result[Void, CheckError]:
+	written ?= parameters.get(position).to_result(checker_invariant(contract.span, MissingCallParameter(position)))
+	expected = written.value_type
+	value ?= publish_inference_type(actual.value_type, slots, CompleteInference, actual.span)
+
+	if same_type(expected, value):
+		Ok(void)
+	else:
+		span = if IntOps.equals(contract.signature.parameters.length(), 1):
+			contract.span
+		else:
+			actual.span
+
+		Err(call_error(span, ArgumentTypeMismatch({
+			expected = expected,
+			actual = { value_type = value, span = actual.span },
+			argument_position = position,
+			expected_site = SourceAnnotation(written.span),
+		})))
+
+
+-- These hints choose a constructor's already established nominal head. They are
+-- advisory: only the expression's argument-first solver establishes call types.
+-- Hints preserve common shape, never establish an equality between fresh slots.
+-- Retain the first unresolved reference so diagnostic origins follow source order.
+private pure func merge_hint(first: InferenceType, next: InferenceType, slots: List[InferenceSlot], span: Span) -> Result[Option[InferenceType], CheckError]:
+	left ?= inference_head(first, slots, span)
+	right ?= inference_head(next, slots, span)
+
+	match inference_action(left, right):
+		SameInference: Ok(Some(first))
+		MergeInference(_, _): Ok(Some(first))
+		BindInference(_, known): Ok(Some(known))
+		ListEquality(left_element, right_element):
+			merged ?= merge_hint(left_element, right_element, slots, span)
+			match merged:
+				None: Ok(None)
+				Some(value):
+					match retained_hint(left, right):
+						Some(retained): Ok(Some(retained))
+						None: Ok(Some(substituted_list(value)))
+		RecordEquality(left_arguments, right_arguments):
+			owner_result: Result[RecordId, CheckError] = match left:
+				InferredRecord(owner, _): Ok(owner)
+				AcceptedType(AppliedRecordType(owner, _)): Ok(owner)
+				_: Err(checker_invariant(span, InvalidInferenceWorklist))
+			owner ?= owner_result
+			retained = retained_hint(left, right)
+			var values: List[InferenceType] = []
+			var position = 0
+			var complete = True
+			var failure: Option[CheckError] = None
+
+			for argument in left_arguments:
+				match merge_hint_child(argument, right_arguments, position, slots, span):
+					Err(error):
+						failure = Some(error)
+						break
+					Ok(None):
+						complete = False
+						break
+					Ok(Some(value)):
+						if retained.is_none():
+							values = values.append(value)
+
+				position = IntOps.add(position, 1)
+
+			match failure:
+				Some(error): Err(error)
+				None:
+					if complete:
+						match retained:
+							Some(value): Ok(Some(value))
+							None: Ok(Some(substituted_record(owner, values)))
+					else:
+						Ok(None)
+		UnionEquality(left_arguments, right_arguments):
+			owner_result: Result[UnionId, CheckError] = match left:
+				InferredUnion(owner, _): Ok(owner)
+				AcceptedType(AppliedUnionType(owner, _)): Ok(owner)
+				_: Err(checker_invariant(span, InvalidInferenceWorklist))
+			owner ?= owner_result
+			retained = retained_hint(left, right)
+			var values: List[InferenceType] = []
+			var position = 0
+			var complete = True
+			var failure: Option[CheckError] = None
+
+			for argument in left_arguments:
+				match merge_hint_child(argument, right_arguments, position, slots, span):
+					Err(error):
+						failure = Some(error)
+						break
+					Ok(None):
+						complete = False
+						break
+					Ok(Some(value)):
+						if retained.is_none():
+							values = values.append(value)
+
+				position = IntOps.add(position, 1)
+
+			match failure:
+				Some(error): Err(error)
+				None:
+					if complete:
+						match retained:
+							Some(value): Ok(Some(value))
+							None: Ok(Some(substituted_union(owner, values)))
+					else:
+						Ok(None)
+		InferenceMismatch: Ok(None)
+
+
+private pure func retained_hint(left: InferenceType, right: InferenceType) -> Option[InferenceType]:
+	match left:
+		AcceptedType(_): Some(left)
+		_:
+			match right:
+				AcceptedType(_): Some(right)
+				_: None
+
+
+private pure func merge_hint_child(first: InferenceType, next: List[InferenceType], position: Int, slots: List[InferenceSlot], span: Span) -> Result[Option[InferenceType], CheckError]:
+	value ?= next.get(position).to_result(checker_invariant(span, InvalidInferenceWorklist))
+	merge_hint(first, value, slots, span)
+
+
+private pure func hint_atom_matches(expected: TypeRef, known: InferenceType) -> Bool:
+	match known:
+		AcceptedType(actual): same_type(expected, actual)
+		CallVariable(_): True
+		_: False
+
+
+private fixed record PendingVariantContract {
+	variant: VariantId,
+	result_type: InferenceType,
+	fields: List[InferenceUse],
+	span: Span
+}
+
+
+private pure func pending_variant(
+	name: WrittenName,
+	expected: Option[InferenceType],
+	slots: List[InferenceSlot],
+	context: ResolutionContext,
+) -> Result[PendingVariantContract, CheckError]:
+	term ?= expected.to_result(constructor_error(name.span, ConstructorNeedsExpectedType(name.id)))
+	-- Select a constructor only from a structurally established nominal hint;
+	-- a sibling's solution of a bare call variable supplies no owner authority.
+	head = term
+	shape = inference_shape(head)
+	owner_result: Result[UnionId, CheckError] = match shape:
+		InferredUnion(owner, _): Ok(owner)
+		AcceptedType(UnionType(owner)): Ok(owner)
+		CallVariable(_): Err(constructor_error(name.span, ConstructorNeedsExpectedType(name.id)))
+		_:
+			snapshot ?= publish_inference_type(head, slots, DiagnosticInference, name.span)
+			Err(constructor_error(name.span, VariantNotInExpectedType(name.id, snapshot)))
+	owner ?= owner_result
+	declared ?= find_declared_variant(context, owner, name)
+	variant_result: Result[DeclaredVariantContract, CheckError] = match declared:
+		Some(variant): Ok(variant)
+		None:
+			snapshot ?= publish_inference_type(head, slots, DiagnosticInference, name.span)
+			Err(constructor_error(name.span, VariantNotInExpectedType(name.id, snapshot)))
+	variant ?= variant_result
+	arguments: List[InferenceType] = match shape:
+		InferredUnion(_, arguments): arguments
+		_: []
+	var hints: List[Option[InferenceType]] = []
+
+	for argument in arguments:
+		hints = hints.append(Some(argument))
+
+	var fields: List[InferenceUse] = []
+	var failure: Option[CheckError] = None
+	for annotation in variant.fields:
+		match apply_type_hint(annotation.value_type, variant.parameters, hints):
+			Some(value_type):
+				fields = fields.append({
+					value_type = value_type,
+					span = annotation.span,
+				})
+			None:
+				failure = Some(checker_invariant(name.span, GenericConstructorContract))
+				break
+	ready ?= match failure:
+		Some(error): Err(error)
+		None: Ok(void)
+	Ok({
+		variant = variant.variant,
+		result_type = head,
+		fields = fields,
+		span = name.span,
+	})
+
+
+private pure func plan_variant(
+	name: WrittenName,
+	arguments: List[ValueExpression],
+	called: Bool,
+	expected: Option[InferenceType],
+	slots: List[InferenceSlot],
+	context: ResolutionContext,
+) -> Result[PlannedBase, CheckError]:
+	contract ?= pending_variant(name, expected, slots, context)
+	if contract.fields.is_empty() and called:
+		Err(constructor_error(name.span, PayloadFreeVariantCalled(contract.variant)))
+	else if not IntOps.equals(contract.fields.length(), arguments.length()):
+		Err(constructor_error(
+			name.span,
+			ConstructorFieldCountMismatch(
+				contract.variant,
+				contract.fields.length(),
+				arguments.length(),
+			),
+		))
+	else:
+		Ok(PlannedVariant(contract, arguments))
+
+
+private pure func validate_variant_field(
+	contract: PendingVariantContract,
+	annotation: InferenceUse,
+	value: PendingValue,
+	position: Int,
+	slots: List[InferenceSlot],
+) -> Result[Void, CheckError]:
+	expected ?= publish_inference_type(annotation.value_type, slots, CompleteInference, annotation.span)
+	actual ?= publish_inference_type(pending_type(value), slots, CompleteInference, value.span)
+	if same_type(expected, actual):
+		Ok(void)
+	else:
+		Err(call_error(
+			contract.span,
+			ArgumentTypeMismatch({
+				expected = expected,
+				actual = { value_type = actual, span = value.span },
+				argument_position = position,
+				expected_site = SourceAnnotation(annotation.span),
+			}),
+		))
+
+
+private pure func validate_variant_fields(
+	contract: PendingVariantContract,
+	values: List[PendingValue],
+	slots: List[InferenceSlot],
+) -> Result[Void, CheckError]:
+	var position = 0
+	var failure: Option[CheckError] = None
+	for value in values:
+		result: Result[Void, CheckError] = match contract.fields.get(position):
+			Some(annotation): validate_variant_field(contract, annotation, value, position, slots)
+			None: Err(checker_invariant(contract.span, GenericConstructorContract))
+		match result:
+			Ok(_): void
+			Err(error):
+				failure = Some(error)
+				break
+		position = IntOps.add(position, 1)
+	match failure:
+		Some(error): Err(error)
+		None: Ok(void)
+
+
+private pure func finish_pending_variant(
+	contract: PendingVariantContract,
+	values: List[PendingValue],
+	span: Span,
+	slots: List[InferenceSlot],
+) -> Result[PendingValue, CheckError]:
+	var readiness = ClosedInference
+	for value in values:
+		match value.readiness:
+			DeferredInference: readiness = DeferredInference
+			ClosedInference: void
+	complete ?= inference_complete(contract.result_type, slots, span)
+	if not complete:
+		readiness = DeferredInference
+	valid ?= match readiness:
+		ClosedInference: validate_variant_fields(contract, values, slots)
+		DeferredInference: Ok(void)
+	Ok({
+		span = span,
+		readiness = readiness,
+		base = PendingConstructVariant(contract, values),
+		base_type = contract.result_type,
+		base_span = contract.span,
+		operations = NoPendingOperations,
+	})
+
+
+private fixed record HintEquality {
+	pattern: TypeRef,
+	known: InferenceType
+}
+
+
+private pure func push_hint_equality(work: List[HintEquality], depth: Int, equality: HintEquality) -> List[HintEquality]:
+	if IntOps.less_than(depth, work.length()):
+		work.set(depth, equality)
+	else:
+		work.append(equality)
+
+
+private pure func hint_child(patterns: List[TypeRef], known: List[InferenceType], position: Int, span: Span) -> Result[HintEquality, CheckError]:
+	pattern ?= patterns.get(position).to_result(checker_invariant(span, InvalidInferenceWorklist))
+	value ?= known.get(position).to_result(checker_invariant(span, InvalidInferenceWorklist))
+	Ok({ pattern = pattern, known = value })
+
+
+private pure func project_result_hint(contract: FunctionContract, known: InferenceType, slots: List[InferenceSlot]) -> Result[Option[List[Option[InferenceType]]], CheckError]:
+	var hints: List[Option[InferenceType]] = []
+
+	for parameter in contract.signature.type_parameters:
+		hints = hints.append(None)
+
+	var work: List[HintEquality] = [{ pattern = contract.signature.return_type.value_type, known = known }]
+	var depth = 1
+	var compatible = True
+	var failure: Option[CheckError] = None
+
+	while IntOps.greater_than(depth, 0) and compatible and failure.is_none():
+		depth = IntOps.subtract(depth, 1)
+
+		match work.get(depth):
+			None: failure = Some(checker_invariant(contract.span, InvalidInferenceWorklist))
+			Some(equality):
+				match inference_head(equality.known, slots, contract.span):
+					Err(error): failure = Some(error)
+					Ok(known):
+						match equality.pattern:
+							ParameterType(parameter):
+								position = parameter_position(parameter)
+
+								match contract.signature.type_parameters.get(position):
+									Some(declared):
+										if same_parameter(parameter, declared):
+											match hints.get(position):
+												Some(Some(previous)):
+													match merge_hint(previous, equality.known, slots, contract.span):
+														Err(error): failure = Some(error)
+														Ok(None): compatible = False
+														Ok(Some(merged)): hints = hints.set(position, Some(merged))
+												Some(None): hints = hints.set(position, Some(equality.known))
+												None: failure = Some(checker_invariant(contract.span, InvalidInferenceWorklist))
+										else:
+											compatible = hint_atom_matches(equality.pattern, known)
+									None: compatible = hint_atom_matches(equality.pattern, known)
+							ListType(element):
+								match inference_shape(known):
+									InferredList(known):
+										work = push_hint_equality(work, depth, { pattern = element, known = known })
+										depth = IntOps.add(depth, 1)
+									_: compatible = False
+							AppliedRecordType(owner, arguments):
+								match inference_shape(known):
+									InferredRecord(known_owner, known_arguments):
+										compatible = IntOps.equals(record_number(owner), record_number(known_owner)) and IntOps.equals(arguments.length(), known_arguments.length())
+
+										if compatible:
+											var position = arguments.length()
+
+											-- LIFO pushes reverse so repeated parameters keep their first occurrence.
+											while IntOps.greater_than(position, 0):
+												position = IntOps.subtract(position, 1)
+
+												match hint_child(arguments, known_arguments, position, contract.span):
+													Err(error):
+														failure = Some(error)
+														break
+													Ok(child):
+														work = push_hint_equality(work, depth, child)
+														depth = IntOps.add(depth, 1)
+									_: compatible = False
+							AppliedUnionType(owner, arguments):
+								match inference_shape(known):
+									InferredUnion(known_owner, known_arguments):
+										compatible = IntOps.equals(union_number(owner), union_number(known_owner)) and IntOps.equals(arguments.length(), known_arguments.length())
+
+										if compatible:
+											var position = arguments.length()
+
+											-- LIFO pushes reverse so repeated parameters keep their first occurrence.
+											while IntOps.greater_than(position, 0):
+												position = IntOps.subtract(position, 1)
+
+												match hint_child(arguments, known_arguments, position, contract.span):
+													Err(error):
+														failure = Some(error)
+														break
+													Ok(child):
+														work = push_hint_equality(work, depth, child)
+														depth = IntOps.add(depth, 1)
+									_: compatible = False
+							_: compatible = hint_atom_matches(equality.pattern, known)
+
+	match failure:
+		Some(error): Err(error)
+		None:
+			if compatible:
+				Ok(Some(hints))
+			else:
+				Ok(None)
+
+
+private pure func apply_type_hint(value_type: TypeRef, parameters: List[TypeParameterId], hints: List[Option[InferenceType]]) -> Option[InferenceType]:
+	if parameters.is_empty():
+		Some(AcceptedType(value_type))
+	else:
+		match value_type:
+			ParameterType(parameter):
+				match parameters.get(parameter_position(parameter)):
+					Some(declared):
+						if same_parameter(parameter, declared):
+							hints.get(parameter_position(parameter)).get_or(None)
+						else:
+							Some(inference_type(value_type, [], 0))
+					None: Some(inference_type(value_type, [], 0))
+			ListType(element):
+				apply_type_hint(element, parameters, hints).map(substituted_list)
+			AppliedRecordType(owner, arguments):
+				var values: List[InferenceType] = []
+				var complete = True
+
+				for argument in arguments:
+					match apply_type_hint(argument, parameters, hints):
+						Some(value): values = values.append(value)
+						None:
+							complete = False
+							break
+
+				if complete:
+					Some(substituted_record(owner, values))
+				else:
+					None
+			AppliedUnionType(owner, arguments):
+				var values: List[InferenceType] = []
+				var complete = True
+
+				for argument in arguments:
+					match apply_type_hint(argument, parameters, hints):
+						Some(value): values = values.append(value)
+						None:
+							complete = False
+							break
+
+				if complete:
+					Some(substituted_union(owner, values))
+				else:
+					None
+			_: Some(inference_type(value_type, [], 0))
+
+
+private pure func call_argument_hints(call: PendingCall, result_hint: Option[InferenceType], slots: List[InferenceSlot]) -> Result[List[Option[InferenceType]], CheckError]:
+	contract = call.contract
+	projection_result: Result[List[Option[InferenceType]], CheckError] = match result_hint:
+		None: Ok([])
+		Some(known): project_result_hint(contract, known, slots).map(pure func(value): value.get_or([]))
+	projection ?= projection_result
+	var candidates: List[Option[InferenceType]] = []
+
+	for parameter in contract.signature.type_parameters:
+		candidate = projection.get(parameter_position(parameter)).get_or(None).get_or(inference_type(ParameterType(parameter), contract.signature.type_parameters, call.variable_start))
+		candidates = candidates.append(Some(candidate))
+
+	var hints: List[Option[InferenceType]] = []
+
+	for parameter in contract.signature.parameters:
+		hints = hints.append(apply_type_hint(parameter.value_type, contract.signature.type_parameters, candidates))
+
+	Ok(hints)
+
+
+private fixed record PostfixHints {
+	base: Option[InferenceType],
+	results: List[Option[InferenceType]]
+}
+
+
+private pure func postfix_hints(postfixes: List[PendingPostfix], result_hint: Option[InferenceType], context: ResolutionContext, slots: List[InferenceSlot]) -> Result[PostfixHints, CheckError]:
+	var results: List[Option[InferenceType]] = []
+
+	for postfix in postfixes:
+		results = results.append(None)
+
+	var hint = result_hint
+	var position = postfixes.length()
+	var failure: Option[CheckError] = None
+
+	while IntOps.greater_than(position, 0):
+		position = IntOps.subtract(position, 1)
+		results = results.set(position, hint)
+
+		match postfixes.get(position):
+			Some(PendingReceiverInvocation(_, call)):
+				match call_argument_hints(call, hint, slots):
+					Ok(arguments): hint = arguments.get(0).get_or(None)
+					Err(error):
+						failure = Some(error)
+						break
+			Some(PendingOverloadInvocation(application, candidates)):
+				hint = receiver_expectation(ReceiverCandidates(candidates))
+					.map(pure func(value): inference_type(value, [], 0))
+			Some(PendingField(_)): hint = None
+			None:
+				failure = Some(checker_invariant({ source = COMPILER_SOURCE, start = 0, end = 0 }, InvalidInferenceWorklist))
+				break
+
+	match failure:
+		Some(error): Err(error)
+		None: Ok({ base = hint, results = results })
+
+
+private fixed union InferenceReadiness:
+	ClosedInference
+	DeferredInference
+
+
+private fixed union CallPlacement:
+	ReturnPlacement(Span, Span)
+	ReceiverPlacement(PendingValue, Span)
+
+
+private fixed union PlannedBase:
+	PlannedLeaf(PendingBase, TypeRef)
+	PlannedRecord(PlannedRecordFields)
+	PlannedUpdate(ValueExpression, List[ParsedRecordField], Option[InferenceType])
+	PlannedVariant(PendingVariantContract, List[ValueExpression])
+	PlannedCall(FunctionContract, List[ValueExpression], CallPlacement, Option[InferenceType])
+
+
+private fixed union PendingPostfix:
+	PendingField(WrittenName)
+	PendingReceiverInvocation(ReceiverApplication, PendingCall)
+	PendingOverloadInvocation(ReceiverApplication, List[ReceiverCandidate])
+
+
+private fixed record ExpressionPlan {
+	base: PlannedBase,
+	postfixes: List[PendingPostfix],
+	hints: List[Option[InferenceType]]
+}
+
+
+private fixed record OperandRange {
+	start: Int,
+	count: Int
+}
+
+
+private fixed union ExpressionWork:
+	EnterExpression(ValueExpression, Option[InferenceType])
+	ContinuePostfix(List[PendingPostfix], List[Option[InferenceType]], Int, Span, Span)
+	ScheduleCall(FunctionContract, List[ValueExpression], CallPlacement, Option[InferenceType])
+	StartCall(PendingCall, List[ValueExpression], CallPlacement, Option[InferenceType])
+	FinishVariant(PendingVariantContract, OperandRange, Span)
+	CheckVariant(PendingVariantContract, List[PendingValue], Span)
+	FinishCall(PendingCall, OperandRange, CallPlacement)
+	CheckCall(PendingCall, List[PendingValue], CallPlacement)
+	PlanRecordUpdate(List[ParsedRecordField], Span, Span)
+	ScheduleRecord(PlannedRecordFields)
+	FinishRecord(PlannedRecordFields, OperandRange)
+	CheckRecord(PlannedRecordFields, List[PendingRecordField])
+	SolveConstraint(InferenceEquality)
+	FinishRoot
+	FreezeRoot(PendingValue)
+
+
+private fixed union ResultInferenceState:
+	NoResultInference
+	SolvingResultInference
+	IncompatibleResultInference
+
+
+private pure func push_expression_work(work: List[Option[ExpressionWork]], depth: Int, action: ExpressionWork) -> List[Option[ExpressionWork]]:
+	if IntOps.less_than(depth, work.length()):
+		work.set(depth, Some(action))
+	else:
+		work.append(Some(action))
+
+
+private pure func push_operand(values: List[Option[PendingValue]], depth: Int, value: PendingValue) -> List[Option[PendingValue]]:
+	if IntOps.less_than(depth, values.length()):
+		values.set(depth, Some(value))
+	else:
+		values.append(Some(value))
+
+
+private pure func expression_operand(values: List[Option[PendingValue]], position: Int, span: Span) -> Result[PendingValue, CheckError]:
+	match values.get(position):
+		Some(Some(value)): Ok(value)
+		_: Err(checker_invariant(span, InvalidInferenceWorklist))
+
+
+private pure func call_operands(values: List[Option[PendingValue]], range: OperandRange, span: Span) -> Result[List[PendingValue], CheckError]:
+	var arguments: List[PendingValue] = []
+	var failure: Option[CheckError] = None
+
+	for position in range.start..IntOps.add(range.start, range.count):
+		match expression_operand(values, position, span):
+			Err(error):
+				failure = Some(error)
+				break
+			Ok(value):
+				arguments = arguments.append(value)
+
+	match failure:
+		Some(error): Err(error)
+		None: Ok(arguments)
+
+
+private pure func record_operands(values: List[Option[PendingValue]], range: OperandRange, literal: PlannedRecordFields) -> Result[List[PendingRecordField], CheckError]:
+	var fields: List[PendingRecordField] = []
+	var position = range.start
+	var failure: Option[CheckError] = None
+	for planned in literal.fields:
+		match expression_operand(values, position, literal.span):
+			Ok(value): fields = fields.append({ field = planned.field, expected = planned.expected, value = value })
+			Err(error):
+				failure = Some(error)
+				break
+		position = IntOps.add(position, 1)
+	match failure:
+		Some(error): Err(error)
+		None: Ok(fields)
+
+
+private pure func argument_work(call: PendingCall, arguments: List[ValueExpression], placement: CallPlacement, hints: List[Option[InferenceType]], position: Int) -> Result[ExpressionWork, CheckError]:
+	argument ?= arguments.get(position).to_result(checker_invariant(call.contract.span, MissingCallParameter(position)))
+	parameter_position = match placement:
+		ReceiverPlacement(_, _): IntOps.add(position, 1)
+		_: position
+	hint ?= hints.get(parameter_position).to_result(checker_invariant(call.contract.span, MissingCallParameter(parameter_position)))
+	Ok(EnterExpression(argument, hint))
+
+
+private pure func plan_base(purity: Purity, scope: List[LocalBinding], body: ValueExpression, expectation: Option[InferenceType], context: ResolutionContext, slots: List[InferenceSlot]) -> Result[PlannedBase, CheckError]:
+	match body.base:
+		RecordExpression(fields): plan_record_literal(fields, body.base_span, expectation, context)
+		RecordUpdateExpression(base, fields): Ok(PlannedUpdate(base, fields, expectation))
+		DirectApplication(name, arguments):
+			classified ?= classify_direct_call(name, arguments, scope, context)
+			match classified:
+				FunctionApplication(contract): Ok(PlannedCall(contract, arguments, ReturnPlacement(body.base_span, body.span), expectation))
+				ConstructorApplication(name): plan_variant(name, arguments, True, expectation, slots, context)
+		NameExpression(name):
+			match lookup_binding(scope, name.id):
+				Some(binding): Ok(PlannedLeaf(AcceptedBinding(binding.id), binding.definition.value_type))
+				None:
+					if contains_variant(context.namespace, context.module, name.id):
+						plan_variant(name, [], False, expectation, slots, context)
+					else:
+						Err(value_error(name.span, UnknownValue(name.id)))
+		VoidExpression: Ok(PlannedLeaf(AcceptedVoid, VoidType))
+		StringExpression(value): Ok(PlannedLeaf(AcceptedString(value), StringType))
+		IntegerExpression(value): Ok(PlannedLeaf(AcceptedInteger(value), IntType))
+		FloatExpression(value): Ok(PlannedLeaf(AcceptedFloat(value), FloatType))
+
+
+private pure func resolve_postfixes(purity: Purity, body: ValueExpression, context: ResolutionContext) -> Result[List[ResolvedPostfix], CheckError]:
+	var contracts: List[ResolvedPostfix] = []
+	var failure: Option[CheckError] = None
+
+	for postfix in body.applications:
+		match postfix:
+			FieldAccess(name): contracts = contracts.append(ReadField(name))
+			ReceiverInvocation(application):
+				match classify_receiver(application, context):
+					Err(error):
+						failure = Some(error)
+						break
+					Ok(receiver): contracts = contracts.append(InvokeReceiver(application, receiver))
+
+	match failure:
+		Some(error): Err(error)
+		None: Ok(contracts)
+
+
+private pure func plan_expression(purity: Purity, scope: List[LocalBinding], body: ValueExpression, hint: Option[InferenceType], context: ResolutionContext, slots: List[InferenceSlot], contracts: List[PendingPostfix]) -> Result[ExpressionPlan, CheckError]:
+	projected ?= postfix_hints(contracts, hint, context, slots)
+	base_expectation = projected.base
+	base_result = plan_base(purity, scope, body, base_expectation, context, slots)
+	contextual_base: Result[PlannedBase, CheckError] = match base_result:
+		Ok(base): Ok(base)
+		Err(error):
+			context_error = match error.kind:
+				ConstructorRejection(ConstructorNeedsExpectedType(_)):
+					match body.base:
+						NameExpression(name): same_span(error.span, name.span)
+						DirectApplication(name, _): same_span(error.span, name.span)
+						_: same_span(error.span, body.base_span)
+				RecordRejection(RecordNeedsExpectedType): same_span(error.span, body.base_span)
+				_: False
+
+			if context_error:
+				match contracts.get(0):
+					Some(PendingOverloadInvocation(application, candidates)):
+						sites = method_sites(candidates)
+						Err(method_error(application.callee.span, MethodReceiverNeedsType(application.callee.id, sites)))
+					_: Err(error)
+			else:
+				Err(error)
+	base ?= contextual_base
+	Ok({ base = base, postfixes = contracts, hints = projected.results })
+
+
+private pure func pending_receiver_contract(purity: Purity, current: PendingValue, application: ReceiverApplication, receiver: ResolvedReceiver, context: ResolutionContext, slots: List[InferenceSlot]) -> Result[FunctionContract, CheckError]:
+	match receiver:
+		UniqueReceiver(contract): Ok(contract.call)
+		ReceiverCandidates(_):
+			actual ?= publish_inference_type(pending_type(current), slots, CompleteInference, application.callee.span)
+			select_receiver_contract(application, receiver, { value_type = actual, span = current.base_span }, context).map(pure func(contract): contract.call)
+
+
+private pure func pending_field(name: WrittenName, current: PendingValue, slots: List[InferenceSlot], context: ResolutionContext) -> Result[PendingValue, CheckError]:
+	head ?= inference_head(pending_type(current), slots, name.span)
+	occurrence_result: Result[RecordOccurrence, CheckError] = match record_occurrence(head):
+		Some(value): Ok(value)
+		None:
+			actual ?= publish_inference_type(head, slots, DiagnosticInference, name.span)
+			Err(record_error(name.span, FieldRequiresRecord(actual)))
+	occurrence ?= occurrence_result
+	field ?= resolve_record_field(name, occurrence.owner, context)
+	accepted ?= context.records.get(record_number(occurrence.owner)).to_result(checker_invariant(name.span, InvalidRecordDeclaration(occurrence.owner)))
+	annotation = field.value_type
+	value_type ?= apply_type_hint(annotation.value_type, accepted.type_parameters, record_argument_hints(occurrence.arguments)).to_result(checker_invariant(name.span, InvalidRecordField(field.id)))
+	Ok({ current | operations = PendingOperationLink({ operation = AcceptedField(field.id), value_type = value_type, span = name.span }, current.operations) })
+
+
+private pure func placed_arguments(arguments: List[PendingValue], placement: CallPlacement, span: Span) -> List[InferenceUse]:
+	values = pending_arguments(arguments)
+
+	match placement:
+		ReceiverPlacement(receiver, _):
+			actual: InferenceUse = { value_type = pending_type(receiver), span = span }
+			[actual].concat(values)
+		_: values
+
+
+private pure func placed_readiness(arguments: List[PendingValue], placement: CallPlacement) -> InferenceReadiness:
+	var readiness = match placement:
+		ReceiverPlacement(receiver, _): receiver.readiness
+		_: ClosedInference
+
+	for argument in arguments:
+		match argument.readiness:
+			DeferredInference:
+				readiness = DeferredInference
+				break
+			ClosedInference: void
+
+	readiness
+
+
+private pure func finish_pending_call(call: PendingCall, arguments: List[PendingValue], placement: CallPlacement, slots: List[InferenceSlot]) -> Result[PendingValue, CheckError]:
+	children = placed_readiness(arguments, placement)
+	closed_result: Result[Option[TypeRef], CheckError] = match children:
+		DeferredInference: Ok(None)
+		ClosedInference:
+			complete ?= call_inference_ready(call, slots)
+
+			if complete:
+				parameters ?= admit_call_parameters(call, slots)
+				return_type ?= admit_call_type(call.contract.signature.return_type.value_type, call, slots, call.contract.span)
+				validate_complete_arguments(call.contract, parameters, return_type, placed_arguments(arguments, placement, call.contract.span), slots).map(pure func(value): Some(value))
+			else:
+				Ok(None)
+	accepted ?= closed_result
+	readiness = match accepted:
+		Some(_): ClosedInference
+		None: DeferredInference
+
+	-- Reuse the result already published for Closed-call validation. Deferred
+	-- descendants keep their original terms and child-first diagnostic ordering.
+	value_type = match accepted:
+		Some(value): AcceptedType(value)
+		None: inference_type(call.contract.signature.return_type.value_type, call.contract.signature.type_parameters, call.variable_start)
+
+	match placement:
+		ReturnPlacement(base_span, span):
+			Ok({ span = span, readiness = readiness, base = PendingDirectCall(call, arguments), base_type = value_type, base_span = base_span, operations = NoPendingOperations })
+		ReceiverPlacement(receiver, span):
+			Ok({ receiver | readiness = readiness, operations = PendingOperationLink({ operation = PendingInvocation(call, arguments), value_type = value_type, span = span }, receiver.operations) })
+
+
+private pure func record_argument_origin(equality: InferenceEquality, slots: List[InferenceSlot]) -> Result[Option[InferenceSlotUpdate], CheckError]:
+	match equality.origin:
+		ResultConstraint(_): Ok(None)
+		VariantConstraint(_, _): Ok(None)
+		RecordFieldConstraint(_, _, _): Ok(None)
+		ArgumentConstraint(_, _, actual, _):
+			match equality.parameter:
+				Some(_): Ok(None)
+				None:
+					match equality.expected:
+						CallVariable(id):
+							position = from_opaque InferenceVariableId(id)
+							slot ?= slots.get(position).to_result(checker_invariant(actual.span, InvalidInferenceVariable(position)))
+
+							match slot.first_argument:
+								Some(_): Ok(None)
+								None: Ok(Some({ position = position, slot = { slot | first_argument = Some({ value_type = equality.actual, span = actual.span }) } }))
+						_: Ok(None)
+
+
+private pure func elaborate_value(
+	purity: Purity,
+	scope: List[LocalBinding],
+	body: ValueExpression,
+	constructor_type: Option[TypeRef],
+	result_context: Option[CallResultContext],
+	context: ResolutionContext,
+) -> Result[CheckedExpr, CheckError]:
+	var slots: List[InferenceSlot] = []
+	var work: List[Option[ExpressionWork]] = [Some(FinishRoot), Some(EnterExpression(body, constructor_type.map(pure func(value): inference_type(value, [], 0))))]
+	var work_count = 2
+	var operands: List[Option[PendingValue]] = []
+	var operand_count = 0
+	var result_state = NoResultInference
+	var accepted: Option[CheckedExpr] = None
+	var failure: Option[CheckError] = None
+
+	while IntOps.greater_than(work_count, 0) and failure.is_none():
+		work_count = IntOps.subtract(work_count, 1)
+		next = work.get(work_count)
+		work = work.set(work_count, None)
+
+		match next:
+			Some(Some(action)):
+				match action:
+					EnterExpression(written, hint):
+						match resolve_postfixes(purity, written, context):
+							Err(error): failure = Some(error)
+							Ok(resolved):
+								var postfixes: List[PendingPostfix] = []
+
+								for postfix in resolved:
+									match postfix:
+										ReadField(name): postfixes = postfixes.append(PendingField(name))
+										InvokeReceiver(application, receiver):
+											match receiver:
+												ReceiverCandidates(candidates): postfixes = postfixes.append(PendingOverloadInvocation(application, candidates))
+												UniqueReceiver(contract):
+													call: PendingCall = { contract = contract.call, variable_start = slots.length() }
+
+													for parameter in contract.call.signature.type_parameters:
+														slots = slots.append({ parameter = parameter, call_span = contract.call.span, first_argument = None, state = UnboundVariable(0) })
+
+													postfixes = postfixes.append(PendingReceiverInvocation(application, call))
+
+								match plan_expression(purity, scope, written, hint, context, slots, postfixes):
+									Err(error): failure = Some(error)
+									Ok(plan):
+										work = push_expression_work(work, work_count, ContinuePostfix(plan.postfixes, plan.hints, 0, written.base_span, written.span))
+										work_count = IntOps.add(work_count, 1)
+
+										match plan.base:
+											PlannedLeaf(base, value_type):
+												value: PendingValue = { span = written.span, readiness = ClosedInference, base = base, base_type = inference_type(value_type, [], 0), base_span = written.base_span, operations = NoPendingOperations }
+												operands = push_operand(operands, operand_count, value)
+												operand_count = IntOps.add(operand_count, 1)
+											PlannedRecord(literal):
+												work = push_expression_work(work, work_count, ScheduleRecord(literal))
+												work_count = IntOps.add(work_count, 1)
+											PlannedUpdate(base, fields, hint):
+												work = push_expression_work(work, work_count, PlanRecordUpdate(fields, written.base_span, base.span))
+												work_count = IntOps.add(work_count, 1)
+												work = push_expression_work(work, work_count, EnterExpression(base, hint))
+												work_count = IntOps.add(work_count, 1)
+											PlannedVariant(contract, arguments):
+												range: OperandRange = { start = operand_count, count = arguments.length() }
+												work = push_expression_work(work, work_count, FinishVariant(contract, range, written.span))
+												work_count = IntOps.add(work_count, 1)
+												var position = arguments.length()
+												while IntOps.greater_than(position, 0):
+													position = IntOps.subtract(position, 1)
+													match arguments.get(position):
+														None: failure = Some(checker_invariant(contract.span, GenericConstructorContract))
+														Some(argument):
+															match contract.fields.get(position):
+																None: failure = Some(checker_invariant(contract.span, GenericConstructorContract))
+																Some(field):
+																	work = push_expression_work(work, work_count, EnterExpression(argument, Some(field.value_type)))
+																	work_count = IntOps.add(work_count, 1)
+											PlannedCall(contract, arguments, placement, hint):
+												work = push_expression_work(work, work_count, ScheduleCall(contract, arguments, placement, hint))
+												work_count = IntOps.add(work_count, 1)
+					PlanRecordUpdate(fields, span, expression_span):
+						position = IntOps.subtract(operand_count, 1)
+						match expression_operand(operands, position, expression_span):
+							Err(error): failure = Some(error)
+							Ok(base):
+								match plan_record_update(base, fields, span, expression_span, context, slots):
+									Err(error): failure = Some(error)
+									Ok(plan):
+										operands = operands.set(position, None)
+										operand_count = position
+										work = push_expression_work(work, work_count, ScheduleRecord(plan))
+										work_count = IntOps.add(work_count, 1)
+					ScheduleRecord(literal):
+						work = push_expression_work(work, work_count, FinishRecord(literal, { start = operand_count, count = literal.fields.length() }))
+						work_count = IntOps.add(work_count, 1)
+						var position = literal.fields.length()
+						while IntOps.greater_than(position, 0):
+							position = IntOps.subtract(position, 1)
+							match literal.fields.get(position):
+								Some(field):
+									work = push_expression_work(work, work_count, EnterExpression(field.written, Some(field.expected.value_type)))
+									work_count = IntOps.add(work_count, 1)
+								None: failure = Some(checker_invariant(literal.span, InvalidInferenceWorklist))
+					FinishRecord(literal, range):
+						match record_operands(operands, range, literal):
+							Err(error): failure = Some(error)
+							Ok(fields):
+								for operand_position in range.start..operand_count:
+									operands = operands.set(operand_position, None)
+								operand_count = range.start
+								work = push_expression_work(work, work_count, CheckRecord(literal, fields))
+								work_count = IntOps.add(work_count, 1)
+								var position = fields.length()
+								while IntOps.greater_than(position, 0):
+									position = IntOps.subtract(position, 1)
+									match fields.get(position):
+										Some(field):
+											-- Accepted subtrees contain no local variables. Ordinary mismatches
+											-- remain the field validator's responsibility after all children.
+											settled = match field.expected.value_type:
+												AcceptedType(_):
+													match pending_type(field.value):
+														AcceptedType(_): True
+														_: False
+												_: False
+											if not settled:
+												equality: InferenceEquality = { expected = field.expected.value_type, actual = pending_type(field.value), origin = RecordFieldConstraint(field.field, field.expected, field.value.span), relation = CollectArguments, parameter = None }
+												work = push_expression_work(work, work_count, SolveConstraint(equality))
+												work_count = IntOps.add(work_count, 1)
+										None: failure = Some(checker_invariant(literal.span, InvalidInferenceWorklist))
+					CheckRecord(literal, fields):
+						match finish_pending_record(literal, fields, slots):
+							Err(error): failure = Some(error)
+							Ok(value):
+								operands = push_operand(operands, operand_count, value)
+								operand_count = IntOps.add(operand_count, 1)
+					FinishVariant(contract, range, span):
+						match call_operands(operands, range, span):
+							Err(error): failure = Some(error)
+							Ok(values):
+								for position in range.start..operand_count:
+									operands = operands.set(position, None)
+								operand_count = range.start
+								work = push_expression_work(work, work_count, CheckVariant(contract, values, span))
+								work_count = IntOps.add(work_count, 1)
+								var position = values.length()
+								while IntOps.greater_than(position, 0):
+									position = IntOps.subtract(position, 1)
+									match contract.fields.get(position):
+										None: failure = Some(checker_invariant(span, GenericConstructorContract))
+										Some(expected):
+											match values.get(position):
+												None: failure = Some(checker_invariant(span, GenericConstructorContract))
+												Some(actual):
+													settled = match expected.value_type:
+														AcceptedType(_):
+															match pending_type(actual):
+																AcceptedType(_): True
+																_: False
+														_: False
+													if not settled:
+														equality: InferenceEquality = { expected = expected.value_type, actual = pending_type(actual), origin = VariantConstraint(contract, position), relation = CollectArguments, parameter = None }
+														work = push_expression_work(work, work_count, SolveConstraint(equality))
+														work_count = IntOps.add(work_count, 1)
+					CheckVariant(contract, values, span):
+						match finish_pending_variant(contract, values, span, slots):
+							Err(error): failure = Some(error)
+							Ok(value):
+								operands = push_operand(operands, operand_count, value)
+								operand_count = IntOps.add(operand_count, 1)
+					ScheduleCall(contract, arguments, placement, hint):
+						call: PendingCall = { contract = contract, variable_start = slots.length() }
+
+						for parameter in contract.signature.type_parameters:
+							slots = slots.append({ parameter = parameter, call_span = contract.span, first_argument = None, state = UnboundVariable(0) })
+
+						work = push_expression_work(work, work_count, StartCall(call, arguments, placement, hint))
+						work_count = IntOps.add(work_count, 1)
+					StartCall(call, arguments, placement, hint):
+						match call_argument_hints(call, hint, slots):
+							Err(error): failure = Some(error)
+							Ok(hints):
+								work = push_expression_work(work, work_count, FinishCall(call, { start = operand_count, count = arguments.length() }, placement))
+								work_count = IntOps.add(work_count, 1)
+								var position = arguments.length()
+
+								while IntOps.greater_than(position, 0):
+									position = IntOps.subtract(position, 1)
+
+									match argument_work(call, arguments, placement, hints, position):
+										Err(error):
+											failure = Some(error)
+											break
+										Ok(argument):
+											work = push_expression_work(work, work_count, argument)
+											work_count = IntOps.add(work_count, 1)
+					FinishCall(call, range, placement):
+						match call_operands(operands, range, call.contract.span):
+							Err(error): failure = Some(error)
+							Ok(arguments):
+								for position in range.start..operand_count:
+									operands = operands.set(position, None)
+
+								operand_count = range.start
+								work = push_expression_work(work, work_count, CheckCall(call, arguments, placement))
+								work_count = IntOps.add(work_count, 1)
+								actual = placed_arguments(arguments, placement, call.contract.span)
+								var position = actual.length()
+
+								while IntOps.greater_than(position, 0):
+									position = IntOps.subtract(position, 1)
+
+									match call_argument_constraint(call, actual, position):
+										Err(error):
+											failure = Some(error)
+											break
+										Ok(equality):
+											work = push_expression_work(work, work_count, SolveConstraint(equality))
+											work_count = IntOps.add(work_count, 1)
+					CheckCall(call, arguments, placement):
+						match finish_pending_call(call, arguments, placement, slots):
+							Err(error): failure = Some(error)
+							Ok(value):
+								operands = push_operand(operands, operand_count, value)
+								operand_count = IntOps.add(operand_count, 1)
+					ContinuePostfix(postfixes, hints, position, base_span, span):
+						operand_count = IntOps.subtract(operand_count, 1)
+						current_result = expression_operand(operands, operand_count, span)
+						operands = operands.set(operand_count, None)
+
+						match current_result:
+							Err(error): failure = Some(error)
+							Ok(current):
+								if IntOps.equals(position, postfixes.length()):
+									operands = push_operand(operands, operand_count, { current | span = span })
+									operand_count = IntOps.add(operand_count, 1)
+								else:
+									work = push_expression_work(work, work_count, ContinuePostfix(postfixes, hints, IntOps.add(position, 1), base_span, span))
+									work_count = IntOps.add(work_count, 1)
+
+									match postfixes.get(position):
+										Some(PendingField(name)):
+											match pending_field(name, current, slots, context):
+												Err(error): failure = Some(error)
+												Ok(value):
+													operands = push_operand(operands, operand_count, value)
+													operand_count = IntOps.add(operand_count, 1)
+										Some(PendingReceiverInvocation(application, call)):
+											work = push_expression_work(work, work_count, StartCall(call, application.arguments, ReceiverPlacement(current, { source = base_span.source, start = base_span.start, end = application.span.end }), hints.get(position).get_or(None)))
+											work_count = IntOps.add(work_count, 1)
+										Some(PendingOverloadInvocation(application, candidates)):
+											match pending_receiver_contract(purity, current, application, ReceiverCandidates(candidates), context, slots):
+												Err(error): failure = Some(error)
+												Ok(contract):
+													work = push_expression_work(work, work_count, ScheduleCall(contract, application.arguments, ReceiverPlacement(current, { source = base_span.source, start = base_span.start, end = application.span.end }), hints.get(position).get_or(None)))
+													work_count = IntOps.add(work_count, 1)
+										None: failure = Some(checker_invariant(span, InvalidInferenceWorklist))
+					SolveConstraint(equality):
+						var inspect = True
+
+						match equality.origin:
+							ResultConstraint(_):
+								match result_state:
+									IncompatibleResultInference: inspect = False
+									_: void
+							ArgumentConstraint(_, _, _, _): void
+							VariantConstraint(_, _): void
+							RecordFieldConstraint(_, _, _): void
+
+						if inspect:
+							match record_argument_origin(equality, slots):
+								Err(error): failure = Some(error)
+								Ok(Some(update)): slots = slots.set(update.position, update.slot)
+								Ok(None): void
+
+							if failure.is_none():
+								match inspect_inference_equality(equality, slots):
+									Err(error): failure = Some(error)
+									Ok(step):
+										match step:
+											IncompatibleResult: result_state = IncompatibleResultInference
+											CompleteEquality: void
+											UpdateInferenceSlots(updates):
+												for update in updates:
+													slots = slots.set(update.position, update.slot)
+											ExpandInferenceList(child):
+												work = push_expression_work(work, work_count, SolveConstraint(child))
+												work_count = IntOps.add(work_count, 1)
+											ExpandInferenceArguments(current, left, right):
+												var position = left.length()
+
+												while IntOps.greater_than(position, 0):
+													position = IntOps.subtract(position, 1)
+
+													match inference_child(current, left, right, position):
+														Err(error):
+															failure = Some(error)
+															break
+														Ok(child):
+															work = push_expression_work(work, work_count, SolveConstraint(child))
+															work_count = IntOps.add(work_count, 1)
+					FinishRoot:
+						operand_count = IntOps.subtract(operand_count, 1)
+						value_result = expression_operand(operands, operand_count, body.span)
+						operands = operands.set(operand_count, None)
+
+						match value_result:
+							Err(error): failure = Some(error)
+							Ok(value):
+								work = push_expression_work(work, work_count, FreezeRoot(value))
+								work_count = IntOps.add(work_count, 1)
+
+								match result_context:
+									Some(result):
+										if not slots.is_empty():
+											equality: InferenceEquality = { expected = pending_type(value), actual = inference_type(result.expected.value_type, [], 0), origin = ResultConstraint(result), relation = RequireEquality, parameter = None }
+											work = push_expression_work(work, work_count, SolveConstraint(equality))
+											work_count = IntOps.add(work_count, 1)
+											result_state = SolvingResultInference
+									None: void
+					FreezeRoot(value):
+						match freeze_pending_value(value, slots):
+							Err(error): failure = Some(error)
+							Ok(value): accepted = Some(value)
+			_: failure = Some(checker_invariant(body.span, InvalidInferenceWorklist))
+
+	match failure:
+		Some(error): Err(error)
+		None: accepted.to_result(checker_invariant(body.span, InvalidInferenceWorklist))
+
+
+private pure func freeze_pending_values(values: List[PendingValue], slots: List[InferenceSlot]) -> Result[List[CheckedExpr], CheckError]:
+	var frozen: List[CheckedExpr] = []
+	var failure: Option[CheckError] = None
+
+	for value in values:
+		match freeze_pending_value(value, slots):
+			Err(error):
+				failure = Some(error)
+				break
+			Ok(value):
+				frozen = frozen.append(value)
+
+	match failure:
+		Some(error): Err(error)
+		None: Ok(frozen)
+
+
+-- A receiver call's frozen receiver is its first argument. Seeding the list with
+-- it, rather than concatenating, saves one list allocation per UFCS call.
+private pure func freeze_pending_call(call: PendingCall, values: List[PendingValue], receiver: Option[CheckedExpr], slots: List[InferenceSlot]) -> Result[ResolvedArguments, CheckError]:
+	var actual = pending_arguments(values)
+	var arguments: List[CheckedExpr] = []
+	var failure: Option[CheckError] = None
+
+	match receiver:
+		Some(receiver):
+			receiver_use: InferenceUse = { value_type = AcceptedType(receiver.value_type), span = call.contract.span }
+			actual = [receiver_use].concat(actual)
+			arguments = [receiver]
+		None: void
+
+	for value in values:
+		match freeze_pending_value(value, slots):
+			Err(error):
+				failure = Some(error)
+				break
+			Ok(value):
+				arguments = arguments.append(value)
+
+	ready ?= match failure:
+		Some(error): Err(error)
+		None: Ok(void)
+	checked_call ?= publish_pending_call(call, slots)
+	parameters ?= admit_call_parameters(call, slots)
+	return_type ?= admit_call_type(call.contract.signature.return_type.value_type, call, slots, call.contract.span)
+	valid ?= validate_complete_arguments(call.contract, parameters, return_type, actual, slots)
+	Ok({ values = arguments, call = checked_call })
+
+
+private pure func freeze_retained_fields(fields: List[PendingRetainedField], slots: List[InferenceSlot], span: Span) -> Result[List[RetainedRecordField], CheckError]:
+	var frozen: List[RetainedRecordField] = []
+	var failure: Option[CheckError] = None
+	for field in fields:
+		match publish_inference_type(field.value_type, slots, CompleteInference, span):
+			Ok(value_type): frozen = frozen.append({ field = field.field, value_type = value_type })
+			Err(error):
+				failure = Some(error)
+				break
+	match failure:
+		Some(error): Err(error)
+		None: Ok(frozen)
+
+
+-- Steps fold over their frozen receiver in source order. The loop keeps the
+-- checker from recursing on chain length.
+private pure func freeze_pending_value(value: PendingValue, slots: List[InferenceSlot]) -> Result[CheckedExpr, CheckError]:
+	base_result: Result[CheckedForm, CheckError] = match value.base:
+		AcceptedVoid: Ok(LiteralVoid)
+		AcceptedInteger(integer): Ok(LiteralInteger(integer))
+		AcceptedFloat(number): Ok(LiteralFloat(number))
+		AcceptedString(text): Ok(LiteralString(text))
+		AcceptedBinding(id): Ok(ReadBinding(id))
+		PendingConstructRecord(owner, fields):
+			frozen ?= freeze_record_fields(fields, slots)
+			Ok(ConstructRecord(owner, frozen))
+		PendingUpdateRecord(owner, base, expression_span, fields, inherited):
+			base ?= freeze_pending_value(base, slots)
+			replacements ?= freeze_record_fields(fields, slots)
+			inherited ?= freeze_retained_fields(inherited, slots, expression_span)
+			update: CheckedRecordUpdate = { base = base, base_expression_span = expression_span, replacements = replacements, inherited = inherited }
+			Ok(UpdateRecord(owner, update))
+		PendingConstructVariant(contract, values):
+			frozen ?= freeze_pending_values(values, slots)
+			valid ?= validate_variant_fields(contract, values, slots)
+			Ok(ConstructVariant(contract.variant, frozen))
+		PendingDirectCall(call, arguments):
+			resolved ?= freeze_pending_call(call, arguments, None, slots)
+			Ok(InvokeFunction(resolved.call, resolved.values))
+	base ?= base_result
+	base_type ?= publish_inference_type(value.base_type, slots, CompleteInference, value.base_span)
+	var current: CheckedExpr = { form = base, value_type = base_type, span = value.base_span }
+	var failure: Option[CheckError] = None
+
+	var steps: List[PendingStep] = []
+	var cursor = value.operations
+	var complete = False
+
+	while not complete:
+		match cursor:
+			NoPendingOperations: complete = True
+			PendingOperationLink(step, previous):
+				steps = steps.append(step)
+				cursor = previous
+
+	var position = steps.length()
+
+	while IntOps.greater_than(position, 0):
+		position = IntOps.subtract(position, 1)
+
+		match steps.get(position):
+			None:
+				failure = Some(checker_invariant(value.span, InvalidInferenceWorklist))
+				break
+			Some(step):
+				match freeze_pending_step(step, current, slots):
+					Err(error):
+						failure = Some(error)
+						break
+					Ok(next):
+						current = next
+
+	ready ?= match failure:
+		Some(error): Err(error)
+		None: Ok(void)
+	Ok(current)
+
+
+private pure func freeze_pending_step(step: PendingStep, receiver: CheckedExpr, slots: List[InferenceSlot]) -> Result[CheckedExpr, CheckError]:
+	form_result: Result[CheckedForm, CheckError] = match step.operation:
+		AcceptedField(field): Ok(ReadRecordField(receiver, field))
+		PendingInvocation(call, values):
+			resolved ?= freeze_pending_call(call, values, Some(receiver), slots)
+			Ok(InvokeFunction(resolved.call, resolved.values))
+	form ?= form_result
+	value_type ?= publish_inference_type(step.value_type, slots, CompleteInference, step.span)
+	Ok({ form = form, value_type = value_type, span = step.span })
+
+
+-- These variables live only while one expression is elaborated. They are distinct
+-- from declaration-owned rigid parameters and never enter a checked TypeRef.
+private opaque type InferenceVariableId = Int
+
+
+private fixed union InferenceType:
+	AcceptedType(TypeRef)
+	CallVariable(InferenceVariableId)
+	InferredList(InferenceType)
+	InferredUnion(UnionId, List[InferenceType])
+	InferredRecord(RecordId, List[InferenceType])
+
+
+private fixed record InferenceUse {
+	value_type: InferenceType,
+	span: Span
+}
+
+
+private fixed union InferenceVariableState:
+	UnboundVariable(Int)
+	BoundVariable(InferenceType)
+	LinkedVariable(InferenceVariableId)
+
+
+private fixed record InferenceSlot {
+	parameter: TypeParameterId,
+	call_span: Span,
+	first_argument: Option[InferenceUse],
+	state: InferenceVariableState
+}
+
+
+private fixed record CallResultContext {
+	expected: ExpectedValue,
+	span: Span
+}
+
+
+private fixed union ConstraintOrigin:
+	ArgumentConstraint(PendingCall, Int, InferenceUse, TypeUse)
+	ResultConstraint(CallResultContext)
+	VariantConstraint(PendingVariantContract, Int)
+	RecordFieldConstraint(FieldId, InferenceUse, Span)
+
+
+private fixed union InferenceRelation:
+	CollectArguments
+	RequireEquality
+
+
+private fixed record InferenceParameterConstraint {
+	variable: InferenceVariableId,
+	actual: InferenceType
+}
+
+
+private fixed record InferenceEquality {
+	expected: InferenceType,
+	actual: InferenceType,
+	origin: ConstraintOrigin,
+	relation: InferenceRelation,
+	parameter: Option[InferenceParameterConstraint]
+}
+
+
+private fixed union InferencePublication:
+	CompleteInference
+	DiagnosticInference
+	OccursInference(InferenceVariableId, TypeParameterId)
+
+
+-- Complete accepted subtrees contain no expression-local variables. Retain them
+-- intact; shape consumers open only one level when a mixed comparison needs it.
+private pure func inference_type(
+	value_type: TypeRef,
+	parameters: List[TypeParameterId],
+	variable_start: Int,
+) -> InferenceType:
+	if parameters.is_empty():
+		AcceptedType(value_type)
+	else:
+		match value_type:
+			ListType(element):
+				match inference_type(element, parameters, variable_start):
+					AcceptedType(_): AcceptedType(value_type)
+					value: InferredList(value)
+			AppliedRecordType(owner, arguments):
+				var values: List[InferenceType] = []
+				var retained = True
+
+				for argument in arguments:
+					value = inference_type(argument, parameters, variable_start)
+					values = values.append(value)
+
+					match value:
+						AcceptedType(_): void
+						_: retained = False
+
+				if retained:
+					AcceptedType(value_type)
+				else:
+					InferredRecord(owner, values)
+			AppliedUnionType(owner, arguments):
+				var values: List[InferenceType] = []
+				var retained = True
+
+				for argument in arguments:
+					value = inference_type(argument, parameters, variable_start)
+					values = values.append(value)
+
+					match value:
+						AcceptedType(_): void
+						_: retained = False
+
+				if retained:
+					AcceptedType(value_type)
+				else:
+					InferredUnion(owner, values)
+			ParameterType(parameter):
+				match parameters.get(parameter_position(parameter)):
+					Some(declared):
+						if same_parameter(parameter, declared):
+							CallVariable(into_opaque InferenceVariableId(IntOps.add(variable_start, parameter_position(parameter))))
+						else:
+							AcceptedType(value_type)
+					None:
+						AcceptedType(value_type)
+			_:
+				AcceptedType(value_type)
+
+
+private pure func inference_shape(value: InferenceType) -> InferenceType:
+	match value:
+		AcceptedType(ListType(element)): InferredList(AcceptedType(element))
+		AcceptedType(AppliedRecordType(owner, arguments)):
+			var values: List[InferenceType] = []
+
+			for argument in arguments:
+				values = values.append(AcceptedType(argument))
+
+			InferredRecord(owner, values)
+		AcceptedType(AppliedUnionType(owner, arguments)):
+			var values: List[InferenceType] = []
+
+			for argument in arguments:
+				values = values.append(AcceptedType(argument))
+
+			InferredUnion(owner, values)
+		_: value
+
+
+-- Annotation substitution may change accepted children. Build that compound
+-- once rather than retaining its unsubstituted callee-owned annotation.
+private pure func substituted_list(element: InferenceType) -> InferenceType:
+	match element:
+		AcceptedType(value): AcceptedType(ListType(value))
+		_: InferredList(element)
+
+
+private pure func substituted_record(owner: RecordId, arguments: List[InferenceType]) -> InferenceType:
+	var values: List[TypeRef] = []
+	var complete = True
+
+	for argument in arguments:
+		match argument:
+			AcceptedType(value): values = values.append(value)
+			_:
+				complete = False
+				break
+
+	if complete:
+		AcceptedType(AppliedRecordType(owner, values))
+	else:
+		InferredRecord(owner, arguments)
+
+
+private pure func substituted_union(owner: UnionId, arguments: List[InferenceType]) -> InferenceType:
+	var values: List[TypeRef] = []
+	var complete = True
+
+	for argument in arguments:
+		match argument:
+			AcceptedType(value): values = values.append(value)
+			_:
+				complete = False
+				break
+
+	if complete:
+		AcceptedType(AppliedUnionType(owner, values))
+	else:
+		InferredUnion(owner, arguments)
+
+
+private pure func inference_head(
+	value_type: InferenceType,
+	slots: List[InferenceSlot],
+	span: Span,
+) -> Result[InferenceType, CheckError]:
+	var current = value_type
+	var complete = False
+	var failure: Option[CheckError] = None
+
+	while not complete:
+		match current:
+			CallVariable(id):
+				match slots.get(from_opaque InferenceVariableId(id)):
+					Some(slot):
+						match slot.state:
+							UnboundVariable(_):
+								complete = True
+							BoundVariable(value):
+								current = value
+							LinkedVariable(next):
+								current = CallVariable(next)
+					None:
+						failure = Some(checker_invariant(span, InvalidInferenceVariable(from_opaque InferenceVariableId(id))))
+						complete = True
+			_:
+				complete = True
+
+	match failure:
+		Some(error):
+			Err(error)
+		None:
+			Ok(current)
+
+
+private pure func push_inference_type(values: List[InferenceType], depth: Int, value: InferenceType) -> List[InferenceType]:
+	if IntOps.less_than(depth, values.length()):
+		values.set(depth, value)
+	else:
+		values.append(value)
+
+
+private pure func inference_occurs(
+	variable: InferenceVariableId,
+	value_type: InferenceType,
+	slots: List[InferenceSlot],
+	span: Span,
+) -> Result[Bool, CheckError]:
+	var pending = [value_type]
+	var pending_count = 1
+	var found = False
+	var failure: Option[CheckError] = None
+
+	while IntOps.greater_than(pending_count, 0) and not found:
+		pending_count = IntOps.subtract(pending_count, 1)
+
+		match pending.get(pending_count):
+			None:
+				failure = Some(checker_invariant(span, InvalidInferenceWorklist))
+				break
+			Some(value):
+				match inference_head(value, slots, span):
+					Err(error):
+						failure = Some(error)
+						break
+					Ok(value):
+						match value:
+							CallVariable(id):
+								found = IntOps.equals(from_opaque InferenceVariableId(id), from_opaque InferenceVariableId(variable))
+							InferredList(element):
+								pending = push_inference_type(pending, pending_count, element)
+								pending_count = IntOps.add(pending_count, 1)
+							InferredRecord(_, arguments):
+								for argument in arguments:
+									pending = push_inference_type(pending, pending_count, argument)
+									pending_count = IntOps.add(pending_count, 1)
+							InferredUnion(_, arguments):
+								for argument in arguments:
+									pending = push_inference_type(pending, pending_count, argument)
+									pending_count = IntOps.add(pending_count, 1)
+							AcceptedType(_):
+								void
+
+	match failure:
+		Some(error):
+			Err(error)
+		None:
+			Ok(found)
+
+
+private pure func publish_inference_type(
+	value_type: InferenceType,
+	slots: List[InferenceSlot],
+	publication: InferencePublication,
+	span: Span,
+) -> Result[TypeRef, CheckError]:
+	value ?= inference_head(value_type, slots, span)
+
+	match value:
+		AcceptedType(value):
+			Ok(value)
+		CallVariable(id):
+			requested = match value_type:
+				CallVariable(original): original
+				_: id
+			slot ?= slots.get(from_opaque InferenceVariableId(requested)).to_result(
+				checker_invariant(span, InvalidInferenceVariable(from_opaque InferenceVariableId(requested))),
+			)
+
+			match publication:
+				CompleteInference:
+					Err(call_error(slot.call_span, UninferableTypeParameter(slot.parameter)))
+				DiagnosticInference:
+					Ok(ParameterType(slot.parameter))
+				OccursInference(root, parameter):
+					if IntOps.equals(from_opaque InferenceVariableId(root), from_opaque InferenceVariableId(id)):
+						Ok(ParameterType(parameter))
+					else:
+						Ok(ParameterType(slot.parameter))
+		InferredList(element):
+			value ?= publish_inference_type(element, slots, publication, span)
+			Ok(ListType(value))
+		InferredRecord(owner, arguments):
+			var values: List[TypeRef] = []
+			var failure: Option[CheckError] = None
+
+			for argument in arguments:
+				match publish_inference_type(argument, slots, publication, span):
+					Err(error):
+						failure = Some(error)
+						break
+					Ok(value):
+						values = values.append(value)
+
+			match failure:
+				Some(error):
+					Err(error)
+				None:
+					Ok(AppliedRecordType(owner, values))
+		InferredUnion(owner, arguments):
+			var values: List[TypeRef] = []
+			var failure: Option[CheckError] = None
+
+			for argument in arguments:
+				match publish_inference_type(argument, slots, publication, span):
+					Err(error):
+						failure = Some(error)
+						break
+					Ok(value):
+						values = values.append(value)
+
+			match failure:
+				Some(error):
+					Err(error)
+				None:
+					Ok(AppliedUnionType(owner, values))
+
+
+private pure func inference_origin_span(origin: ConstraintOrigin) -> Span:
+	match origin:
+		ArgumentConstraint(_, _, actual, _):
+			actual.span
+		ResultConstraint(result):
+			result.span
+		VariantConstraint(contract, _): contract.span
+		RecordFieldConstraint(_, _, span): span
+
+
+private pure func inference_conflict(
+	equality: InferenceEquality,
+	slots: List[InferenceSlot],
+) -> Result[CheckError, CheckError]:
+	span = inference_origin_span(equality.origin)
+
+	match equality.origin:
+		ResultConstraint(_):
+			Err(checker_invariant(span, InvalidInferenceWorklist))
+		VariantConstraint(_, _): Err(checker_invariant(span, InvalidInferenceWorklist))
+		RecordFieldConstraint(_, _, _): Err(checker_invariant(span, InvalidInferenceWorklist))
+		ArgumentConstraint(call, position, occurrence, written):
+			contract = call.contract
+			constraint ?= equality.parameter.to_result(checker_invariant(span, InvalidInferenceWorklist))
+			id = constraint.variable
+			slot ?= slots.get(from_opaque InferenceVariableId(id)).to_result(
+				checker_invariant(span, InvalidInferenceVariable(from_opaque InferenceVariableId(id))),
+			)
+			previous ?= slot.first_argument.to_result(checker_invariant(span, InvalidInferenceWorklist))
+			expected ?= publish_inference_type(inference_type(written.value_type, contract.signature.type_parameters, call.variable_start), slots, DiagnosticInference, span)
+			first ?= publish_inference_type(previous.value_type, slots, DiagnosticInference, previous.span)
+			current ?= publish_inference_type(constraint.actual, slots, DiagnosticInference, span)
+			actual_type ?= publish_inference_type(occurrence.value_type, slots, DiagnosticInference, occurrence.span)
+			Ok(call_error(span, GenericArgumentConflict({
+				parameter = slot.parameter,
+				previous = { value_type = first, span = previous.span },
+				current = { value_type = current, span = span },
+				mismatch = {
+					expected = expected,
+					actual = { value_type = actual_type, span = occurrence.span },
+					argument_position = position,
+					expected_site = SourceAnnotation(written.span),
+				},
+			})))
+
+
+private fixed union InferenceAction:
+	SameInference
+	BindInference(InferenceVariableId, InferenceType)
+	MergeInference(InferenceVariableId, InferenceVariableId)
+	ListEquality(InferenceType, InferenceType)
+	UnionEquality(List[InferenceType], List[InferenceType])
+	RecordEquality(List[InferenceType], List[InferenceType])
+	InferenceMismatch
+
+
+private pure func inference_action(left: InferenceType, right: InferenceType) -> InferenceAction:
+	match left:
+		CallVariable(left_id):
+			match right:
+				CallVariable(right_id):
+					if IntOps.equals(from_opaque InferenceVariableId(left_id), from_opaque InferenceVariableId(right_id)):
+						SameInference
+					else:
+						MergeInference(left_id, right_id)
+				_:
+					BindInference(left_id, right)
+		_:
+			match right:
+				CallVariable(id): BindInference(id, left)
+				_:
+					match left:
+						AcceptedType(left_type):
+							match right:
+								AcceptedType(right_type):
+									if same_type(left_type, right_type):
+										SameInference
+									else:
+										InferenceMismatch
+								_: inference_shape_action(inference_shape(left), inference_shape(right))
+						_: inference_shape_action(inference_shape(left), inference_shape(right))
+
+
+private pure func inference_shape_action(left: InferenceType, right: InferenceType) -> InferenceAction:
+	match left:
+		InferredList(left):
+			match right:
+				InferredList(right): ListEquality(left, right)
+				_: InferenceMismatch
+		InferredRecord(left_owner, left_arguments):
+			match right:
+				InferredRecord(right_owner, right_arguments):
+					if IntOps.equals(record_number(left_owner), record_number(right_owner)) and IntOps.equals(left_arguments.length(), right_arguments.length()):
+						RecordEquality(left_arguments, right_arguments)
+					else:
+						InferenceMismatch
+				_: InferenceMismatch
+		InferredUnion(left_owner, left_arguments):
+			match right:
+				InferredUnion(right_owner, right_arguments):
+					if IntOps.equals(union_number(left_owner), union_number(right_owner)) and IntOps.equals(left_arguments.length(), right_arguments.length()):
+						UnionEquality(left_arguments, right_arguments)
+					else:
+						InferenceMismatch
+				_: InferenceMismatch
+		_: InferenceMismatch
+
+
+private pure func inference_rank(state: InferenceVariableState, span: Span) -> Result[Int, CheckError]:
+	match state:
+		UnboundVariable(rank): Ok(rank)
+		_: Err(checker_invariant(span, InvalidInferenceWorklist))
+
+
+private fixed record InferenceSlotUpdate {
+	position: Int,
+	slot: InferenceSlot
+}
+
+
+private fixed union InferenceStep:
+	IncompatibleResult
+	CompleteEquality
+	UpdateInferenceSlots(List[InferenceSlotUpdate])
+	ExpandInferenceList(InferenceEquality)
+	ExpandInferenceArguments(InferenceEquality, List[InferenceType], List[InferenceType])
+
+
+-- Borrow the slot vector and return only the validated changes. Its local owner
+-- applies them after this call, with no retained old vector root.
+private pure func inspect_inference_equality(
+	equality: InferenceEquality,
+	slots: List[InferenceSlot],
+) -> Result[InferenceStep, CheckError]:
+	span = inference_origin_span(equality.origin)
+	var origin = equality.parameter
+	var relation = equality.relation
+
+	match equality.expected:
+		CallVariable(id):
+			if origin.is_none():
+				origin = Some({ variable = id, actual = equality.actual })
+
+			relation = RequireEquality
+		_:
+			void
+
+	left ?= inference_head(equality.expected, slots, span)
+	right ?= inference_head(equality.actual, slots, span)
+	current = { equality | parameter = origin, relation = relation }
+
+	match inference_action(left, right):
+		SameInference:
+			Ok(CompleteEquality)
+		MergeInference(left_id, right_id):
+			left_position = from_opaque InferenceVariableId(left_id)
+			right_position = from_opaque InferenceVariableId(right_id)
+			left_slot ?= slots.get(left_position).to_result(checker_invariant(span, InvalidInferenceVariable(left_position)))
+			right_slot ?= slots.get(right_position).to_result(checker_invariant(span, InvalidInferenceVariable(right_position)))
+			left_rank ?= inference_rank(left_slot.state, span)
+			right_rank ?= inference_rank(right_slot.state, span)
+
+			-- Union by rank bounds chains without repeatedly rewriting old terms.
+			if IntOps.less_than(left_rank, right_rank):
+				Ok(UpdateInferenceSlots([{ position = left_position, slot = { left_slot | state = LinkedVariable(right_id) } }]))
+			else:
+				var updates: List[InferenceSlotUpdate] = [
+					{ position = right_position, slot = { right_slot | state = LinkedVariable(left_id) } },
+				]
+
+				if IntOps.equals(left_rank, right_rank):
+					updates = updates.append({ position = left_position, slot = { left_slot | state = UnboundVariable(IntOps.add(left_rank, 1)) } })
+
+				Ok(UpdateInferenceSlots(updates))
+		BindInference(id, value):
+			position = from_opaque InferenceVariableId(id)
+			slot ?= slots.get(position).to_result(checker_invariant(span, InvalidInferenceVariable(position)))
+			occurs ?= inference_occurs(id, value, slots, span)
+
+			if occurs:
+				error ?= inference_occurs_error(current, id, value, slots)
+				Err(error)
+			else:
+				Ok(UpdateInferenceSlots([{ position = position, slot = { slot | state = BoundVariable(value) } }]))
+		ListEquality(left, right):
+			Ok(ExpandInferenceList({ current | expected = left, actual = right }))
+		UnionEquality(left_arguments, right_arguments):
+			Ok(ExpandInferenceArguments(current, left_arguments, right_arguments))
+		RecordEquality(left_arguments, right_arguments):
+			Ok(ExpandInferenceArguments(current, left_arguments, right_arguments))
+		InferenceMismatch:
+			match relation:
+				RequireEquality:
+					match current.origin:
+						ResultConstraint(_):
+							-- The enclosing expression/field owns this mismatch diagnostic.
+							Ok(IncompatibleResult)
+						VariantConstraint(_, _): Ok(CompleteEquality)
+						RecordFieldConstraint(_, _, _): Ok(CompleteEquality)
+						ArgumentConstraint(_, _, _, _):
+							error ?= inference_conflict(current, slots)
+							Err(error)
+				CollectArguments:
+					Ok(CompleteEquality)
+
+
+private pure func inference_occurs_error(equality: InferenceEquality, root: InferenceVariableId, value: InferenceType, slots: List[InferenceSlot]) -> Result[CheckError, CheckError]:
+	span = inference_origin_span(equality.origin)
+	origin_id = match equality.parameter:
+		Some(parameter): parameter.variable
+		None: root
+	origin ?= slots.get(from_opaque InferenceVariableId(origin_id)).to_result(checker_invariant(span, InvalidInferenceVariable(from_opaque InferenceVariableId(origin_id))))
+	snapshot ?= publish_inference_type(value, slots, OccursInference(root, origin.parameter), span)
+	site_result: Result[ExpectedTypeSite, CheckError] = match equality.origin:
+		ArgumentConstraint(call, _, _, written): Ok(SourceAnnotation(written.span))
+		ResultConstraint(result): Ok(result.expected.site)
+		RecordFieldConstraint(_, expected, _): Ok(SourceAnnotation(expected.span))
+		VariantConstraint(contract, position):
+			field ?= contract.fields.get(position).to_result(checker_invariant(span, GenericConstructorContract))
+			Ok(SourceAnnotation(field.span))
+	site ?= site_result
+	Ok(call_error(span, InfiniteTypeArgument({ parameter = origin.parameter, call_span = origin.call_span, recursive_type = snapshot, expected_site = site })))
+
+
+private pure func inference_child(
+	equality: InferenceEquality,
+	left_arguments: List[InferenceType],
+	right_arguments: List[InferenceType],
+	position: Int,
+) -> Result[InferenceEquality, CheckError]:
+	span = inference_origin_span(equality.origin)
+	left ?= left_arguments.get(position).to_result(checker_invariant(span, InvalidInferenceWorklist))
+	right ?= right_arguments.get(position).to_result(checker_invariant(span, InvalidInferenceWorklist))
+	Ok({ equality | expected = left, actual = right })
+
+
+private pure func call_argument_constraint(
+	call: PendingCall,
+	actual: List[InferenceUse],
+	position: Int,
+) -> Result[InferenceEquality, CheckError]:
+	contract = call.contract
+	value ?= actual.get(position).to_result(checker_invariant(contract.span, MissingGenericParameter(position)))
+	written ?= contract.signature.parameters.get(position).to_result(checker_invariant(contract.span, MissingGenericParameter(position)))
+	Ok({ expected = inference_type(written.value_type, contract.signature.type_parameters, call.variable_start), actual = value.value_type, origin = ArgumentConstraint(call, position, value, written), relation = CollectArguments, parameter = None })
+
+
+-- Publish solved arguments only; pure-result and argument checks
+-- stay together in validate_complete_arguments after child-first freeze.
+private pure func publish_pending_call(
+	call: PendingCall,
+	slots: List[InferenceSlot],
+) -> Result[CheckedCall, CheckError]:
+	contract = call.contract
+	var types: List[TypeRef] = []
+	var failure: Option[CheckError] = None
+	for parameter in contract.signature.type_parameters:
+		match publish_inference_type(inference_type(ParameterType(parameter), contract.signature.type_parameters, call.variable_start), slots, CompleteInference, contract.span):
+			Err(error):
+				failure = Some(error)
+				break
+			Ok(value): types = types.append(value)
+	ready ?= match failure:
+		Some(error): Err(error)
+		None: Ok(void)
+	Ok({ target = UserFunction(contract.function, types), span = contract.span })
+
+
+pure func synthesize_value(scope: List[LocalBinding], body: ValueExpression, constructor_type: Option[TypeRef], context: ResolutionContext) -> Result[CheckedExpr, CheckError]:
+	elaborate_value(context.caller.purity, scope, body, constructor_type, None, context)
+
+
+pure func check_value(scope: List[LocalBinding], body: ValueExpression, expected: TypeRef, site: ExpectedTypeSite, context: ResolutionContext) -> Result[CheckedExpr, CheckError]:
+	obligation: ExpectedValue = { value_type = expected, site = site }
+	value ?= elaborate_value(context.caller.purity, scope, body, Some(expected), Some({ expected = obligation, span = body.span }), context)
+	if same_type(value.value_type, expected):
+		Ok(value)
+	else:
+		Err(value_error(body.span, ExpressionTypeMismatch({ expected = expected, actual = { value_type = value.value_type, span = body.span }, expected_site = site })))
+
+
+private pure func classify_direct_call(
+	name: WrittenName,
+	arguments: List[ValueExpression],
+	scope: List[LocalBinding],
+	context: ResolutionContext,
+) -> Result[ResolvedApplication, CheckError]:
+	callable ?= match lookup_binding(scope, name.id):
+		Some(binding):
+			Err(non_callable(binding, name.span, context.caller.function))
+		None:
+			Ok(void)
+
+	target = lookup_target(context, name)
+
+	match target:
+		Some(target):
+			contract ?= function_contract(
+				context.caller,
+				name,
+				arguments,
+				target,
+				context.signatures,
+			)
+			Ok(FunctionApplication(contract))
+		None:
+			if contains_variant(context.namespace, context.module, name.id):
+				Ok(ConstructorApplication(name))
+			else:
+				Err(call_error(name.span, UnknownFunction(name.id)))
+
+
+pure func binding_site(function: FunctionId, binding: LocalBinding) -> BindingSite:
+	{
+		function = function,
+		binding = binding.id,
+		name = binding.name,
+		span = binding.definition.span
+	}
+
+
+private pure func non_callable(
+	binding: LocalBinding,
+	span: Span,
+	function: FunctionId,
+) -> CheckError:
+	call_error(
+		span,
+		UncallableBinding(
+			binding_site(function, binding),
+			binding.definition.origin,
+			binding.definition.value_type,
+		),
+	)

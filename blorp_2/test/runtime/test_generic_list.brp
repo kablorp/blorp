@@ -1,0 +1,146 @@
+import:
+	../../src/specialize/specialize as Concrete
+	../../src/verify/verify: VerifiedProgram, verified_contents
+	test_record: RuntimeCase, runtime_passes
+	test: TestSuite
+
+
+-- Reachable calls populate every List family used by the C cases. The complete
+-- verified catalogue below establishes their concrete helper names before use.
+private RUNTIME_SOURCE: String =
+	|fixed record Entry { number: Int, text: String }
+	|fixed union Number:
+	|    Value(Int)
+	|    NoNumber
+	|fixed union Choice:
+	|    Pair(String, String)
+	|    Nested(Entry, List[Entry])
+	|    Empty
+	|fixed record Envelope { choices: List[Choice], entries: List[Entry] }
+	|fixed record Point { number: Int }
+	|pure func text(value: Int) -> String:
+	|    builtin("int.to_string")
+	|pure func repeat[T](value: T, count: Int) -> List[T]:
+	|    builtin("list.repeat")
+	|pure func make_entry() -> Entry:
+	|    { number = 7, text = text(42) }
+	|pure func make_number() -> Number:
+	|    Value(7)
+	|pure func make_choice() -> Choice:
+	|    Pair(text(7), text(42))
+	|pure func make_envelope(choices: List[Choice], entries: List[Entry]) -> Envelope:
+	|    { choices = choices, entries = entries }
+	|pure func make_point() -> Point:
+	|    { number = 0 }
+	|func main() -> Int:
+	|    ints = repeat(0, 2)
+	|    floats = repeat(0.0, 2)
+	|    units = repeat(void, 2)
+	|    texts = repeat(text(42), 2)
+	|    entries = repeat(make_entry(), 2)
+	|    numbers = repeat(make_number(), 2)
+	|    choices = repeat(make_choice(), 2)
+	|    nested = repeat(texts, 2)
+	|    outer = repeat(make_envelope(choices, entries), 2)
+	|    points = repeat(make_point(), 2)
+	|    0
+	|
+
+
+private pure func entry_layout(layout: Concrete.ConcreteRecord) -> Bool:
+	match layout.representation:
+		Concrete.ManagedRecord:
+			match layout.fields:
+				[Concrete.IntType, Concrete.StringType]: True
+				_: False
+		_: False
+
+
+private pure func envelope_layout(layout: Concrete.ConcreteRecord) -> Bool:
+	match layout.representation:
+		Concrete.ManagedRecord:
+			match layout.fields:
+				[Concrete.ListType(Concrete.UnionType(choice)), Concrete.ListType(Concrete.RecordType(entry))]:
+					Concrete.union_number(choice) == 1 and Concrete.record_number(entry) == 0
+				_: False
+		_: False
+
+
+private pure func number_layout(layout: Concrete.ConcreteUnion) -> Bool:
+	match layout.representation:
+		Concrete.InlineUnmanaged:
+			match layout.variants:
+				[[Concrete.IntType], []]: True
+				_: False
+		_: False
+
+
+private pure func point_layout(layout: Concrete.ConcreteRecord) -> Bool:
+	match layout.representation:
+		Concrete.InlineRecord:
+			match layout.fields:
+				[Concrete.IntType]: True
+				_: False
+		_: False
+
+
+private pure func choice_layout(layout: Concrete.ConcreteUnion) -> Bool:
+	match layout.representation:
+		Concrete.InlineOwningPayload:
+			match layout.variants:
+				[[Concrete.StringType, Concrete.StringType], [Concrete.RecordType(entry), Concrete.ListType(Concrete.RecordType(child))], []]:
+					Concrete.record_number(entry) == 0 and Concrete.record_number(child) == 0
+				_: False
+		_: False
+
+
+private pure func complete_runtime_catalog(program: VerifiedProgram) -> Bool:
+	contents = verified_contents(program)
+	match contents.records:
+		[entry, envelope, point]:
+			match contents.unions:
+				[number, choice]:
+					entry_layout(entry) and envelope_layout(envelope) and point_layout(point) and number_layout(number) and choice_layout(choice)
+				_: False
+		_: False
+
+
+private CASES: List[RuntimeCase] = [
+	{ description = "Int zero is present and absent lookup preserves out", name = "int_zero" },
+	{ description = "Float zero is present and copied exactly", name = "float_zero" },
+	{ description = "Void zero is present rather than an absence sentinel", name = "void_zero" },
+	{ description = "inline union zero retains its active tag and payload", name = "inline_union_zero" },
+	{ description = "inline record E is copied by value without child allocations", name = "inline_record_zero" },
+	{ description = "negative repeat owns an empty root without acquiring E", name = "negative_repeat" },
+	{ description = "zero repeat owns an empty root without acquiring E", name = "zero_repeat" },
+	{ description = "Int minimum repeat owns an empty root without acquiring E", name = "minimum_repeat" },
+	{ description = "negative length boundary and Int maximum lookup preserve out", name = "lookup_bounds" },
+	{ description = "literal bytes have an allocated String lifetime", name = "literal_string" },
+	{ description = "repeat acquires every equal mortal String occurrence", name = "mortal_repeat" },
+	{ description = "acquired mortal String survives its List", name = "mortal_get_escape" },
+	{ description = "List dup and nonfinal drop change only root references", name = "root_dup" },
+	{ description = "acquired Entry and text survive their List and record", name = "entry_escape" },
+	{ description = "acquired nested List survives its parent root", name = "nested_escape" },
+	{ description = "owning union List destroys each distinct active child", name = "union_distinct" },
+	{ description = "owning union List discharges equal child occurrences", name = "union_equal" },
+	{ description = "inactive union storage owns no child", name = "union_inactive" },
+	{ description = "acquired union preserves Entry and List children", name = "union_nested" },
+	{ description = "record List union tree destroys every initialized child", name = "mixed" },
+	{ description = "16 copies allocate one root and acquire 16 E obligations", name = "repeat_16" },
+	{ description = "32 copies allocate one root and acquire 32 E obligations", name = "repeat_32" },
+	{ description = "64 copies allocate one root and acquire 64 E obligations", name = "repeat_64" },
+	{ description = "128 copies allocate one root and acquire 128 E obligations", name = "repeat_128" },
+]
+
+
+private func test_generic_runtime() -> Bool:
+	runtime_passes(
+		RUNTIME_SOURCE, complete_runtime_catalog,
+		"blorp_2/test/runtime/fixtures/generic_list_test.c", CASES,
+	)
+
+
+tests: TestSuite = {
+	description = "Blorp 2 general List runtime",
+	tests = [("complete concrete List ownership matrix", test_generic_runtime)]
+}

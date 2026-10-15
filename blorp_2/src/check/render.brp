@@ -1,0 +1,1247 @@
+import:
+	../namespace/builtins: builtin_type_name, render_builtin_type_error, runtime_declaration_help
+	./check: CheckFailure, check_errors, failure_program
+	./errors as Errors
+	./model as Check
+	../utils/declarations:
+		VariantId,
+		inventory_functions,
+		inventory_records,
+		inventory_unions,
+		function_number,
+		record_number,
+		union_number,
+		variant_number,
+		variant_owner,
+	int as IntOps
+	../utils/names: NameId, NameTable, name_spelling
+	../namespace/namespace:
+		ImportProblem(
+			RepeatedModuleImport, MissingImportedFunction, RepeatedImportedFunction,
+			AmbiguousImportSelection, MissingImportedType, AmbiguousImportedType,
+			MethodTypeNotVisible, MissingImportedUnion, AmbiguousImportedUnion,
+			MissingImportedVariant, RepeatedImportedVariant, ImportedTypeConflict,
+		),
+	option: to_result
+	../parse/assemble: ParsedContents, ParsedProgram, parsed_contents
+	../utils/syntax:
+		CallNotation(DirectCall, ReceiverCall),
+		Diagnostic,
+		DiagnosticNote(
+			TypeDeclaration, RecordFieldDeclaration, PreviousField, PreviousDeclaration,
+			CompetingDeclarations,
+		),
+		Diagnostics,
+		ParsedBuiltinType(IntegerBuiltin, FloatBuiltin, StringBuiltin, VoidBuiltin, ListBuiltin),
+		Span,
+	../utils/text as Text
+
+
+pure func render_failure(failure: CheckFailure) -> Diagnostics:
+	render_check_errors(failure_program(failure), check_errors(failure))
+
+
+pure func render_check_errors(program: ParsedProgram, errors: Errors.CheckErrors) -> Diagnostics:
+	var remaining: List[Diagnostic] = []
+
+	for error in errors.remaining:
+		remaining = remaining.append(render_check_error(program, error))
+
+	{
+		first = render_check_error(program, errors.first),
+		remaining = remaining
+	}
+
+
+private pure func invariant_message(invariant: Errors.CheckerInvariant) -> String:
+	match invariant:
+		Errors.InvalidRecordDeclaration(_):
+			"invalid record declaration"
+		Errors.InvalidResolvedFunction(_):
+			"invalid resolved function identity"
+		Errors.InvalidUnionDeclaration(_):
+			"invalid union declaration"
+		Errors.InvalidResolvedUnion(_):
+			"invalid resolved union identity"
+		Errors.InvalidCheckedUnion(_):
+			"invalid checked union identity"
+		Errors.InvalidResolvedVariant(_):
+			"invalid resolved variant identity"
+		Errors.InvalidParameterDeclaration(_):
+			"invalid parameter declaration"
+		Errors.InvalidParameterName(_):
+			"invalid parameter name"
+		Errors.ParameterOwnerWithoutParameter(_):
+			"parameter owner has no parameter"
+		Errors.InvalidParsedName(_):
+			"invalid parsed name identity"
+		Errors.RuntimeContractMismatch:
+			"builtin operation disagrees with its runtime contract"
+		Errors.InvalidResolvedParameter(_):
+			"invalid resolved parameter"
+		Errors.GenericConstructorContract:
+			"generic constructor contract"
+		Errors.InvalidInferenceVariable(_):
+			"invalid inference variable"
+		Errors.InvalidInferenceWorklist:
+			"invalid inference worklist"
+		Errors.InvalidDeclarationVisit:
+			"invalid declaration visit"
+		Errors.InvalidRecordField(_):
+			"invalid record field"
+		Errors.VariantOccurrenceWithoutUnion(_):
+			"variant occurrence without union"
+		Errors.DirectCallInSimpleBase(_):
+			"direct call in simple base"
+		Errors.MissingCallParameter(_):
+			"missing call parameter"
+		Errors.ConstructorReceiver(_):
+			"constructor receiver"
+		Errors.MissingConstructorArgument(_):
+			"missing constructor argument"
+		Errors.InvalidFunctionContract:
+			"invalid function contract"
+		Errors.MissingGenericParameter(_):
+			"missing generic parameter"
+		Errors.RuntimeGenericContract:
+			"runtime generic contract"
+		Errors.InvalidCallName(_):
+			"invalid call name identity"
+
+
+private pure func rendered(span: Span, message: String, help: String) -> Diagnostic:
+	{
+		span = span,
+		note = None,
+		message = message,
+		help = help
+	}
+
+
+private pure func noted(
+	span: Span,
+	message: String,
+	help: String,
+	note: DiagnosticNote,
+) -> Diagnostic:
+	{ rendered(span, message, help) | note = Some(note) }
+
+
+private pure func render_fault(span: Span, invariant: Errors.CheckerInvariant) -> Diagnostic:
+	rendered(
+		span,
+		invariant_message(invariant),
+		"report this compiler error with the input program",
+	)
+
+
+private pure func parsed_spelling(
+	name: NameId,
+	names: NameTable,
+	span: Span,
+) -> Result[String, Diagnostic]:
+	name_spelling(names, name).to_result(render_fault(span, Errors.InvalidParsedName(name)))
+
+
+pure func pure_void_return(span: Span) -> Diagnostic:
+	rendered(span, "pure functions cannot return Void", "remove pure, or return a non-Void value")
+
+
+pure func render_check_error(program: ParsedProgram, error: Errors.CheckError) -> Diagnostic:
+	context = parsed_contents(program)
+
+	match error.kind:
+		Errors.ImportRejection(rejection):
+			render_import_error(error.span, rejection)
+		Errors.TypeDeclarationRejection(rejection):
+			render_type_declaration_error(error.span, rejection)
+		Errors.TypeTermRejection(rejection):
+			render_type_term_error(error.span, rejection)
+		Errors.SignatureRejection(rejection):
+			render_signature_error(error.span, rejection)
+		Errors.BuiltinRejection(rejection):
+			render_builtin_error(error.span, rejection)
+		Errors.CallRejection(rejection):
+			render_call_error(error.span, rejection, context)
+		Errors.MethodRejection(rejection):
+			render_method_error(error.span, rejection)
+		Errors.ConstructorRejection(rejection):
+			render_constructor_error(error.span, rejection, context)
+		Errors.RecordRejection(rejection):
+			render_record_error(error.span, rejection, context)
+		Errors.ValueRejection(rejection):
+			render_value_error(error.span, rejection, context)
+		Errors.StatementRejection(rejection):
+			render_statement_error(error.span, rejection)
+		Errors.MatchRejection(rejection):
+			render_match_error(error.span, rejection, context)
+		Errors.RecursionRejection(rejection):
+			render_recursion_error(error.span, rejection)
+		Errors.InternalInvariant(invariant):
+			render_fault(error.span, invariant)
+
+
+private pure func render_import_error(span: Span, rejection: Errors.ImportError) -> Diagnostic:
+	match rejection:
+		Errors.ImportRejected(problem):
+			render_import_problem(span, problem)
+		Errors.ImportedFunctionConflict(_, previous):
+			noted(
+				span,
+				"imported function conflicts with another function",
+				"give the functions distinct names or remove the duplicate import",
+				PreviousDeclaration(previous),
+			)
+		Errors.ImportedConstructorConflict(_, previous):
+			noted(
+				span,
+				"imported constructor conflicts with a function",
+				"give the constructor and function distinct names",
+				PreviousDeclaration(previous),
+			)
+		Errors.ImportedVariantConflict(_, previous):
+			noted(
+				span,
+				"imported function conflicts with a local variant",
+				"give the imported function and local variant distinct names",
+				PreviousDeclaration(previous),
+			)
+
+
+-- The namespace's import-selection problems, reported before checking.
+private pure func render_import_problem(span: Span, problem: ImportProblem) -> Diagnostic:
+	match problem:
+		RepeatedModuleImport(_, previous, _):
+			noted(
+				span,
+				"module imported more than once",
+				"combine the selected function names into one import",
+				PreviousDeclaration(previous),
+			)
+		MissingImportedFunction(_, _):
+			rendered(
+				span,
+				"unknown imported function",
+				"select a function declared directly in that module; imports are not reexported",
+			)
+		RepeatedImportedFunction(_, previous):
+			noted(
+				span,
+				"function selected more than once",
+				"list each selected function once",
+				PreviousDeclaration(previous),
+			)
+		AmbiguousImportSelection(_, _):
+			rendered(
+				span,
+				"import selection names both a type and a function",
+				"rename the function or select through a module with an unambiguous surface",
+			)
+		MissingImportedType(_, _):
+			rendered(
+				span,
+				"unknown imported type",
+				"select a type declared or ordinarily imported by that module",
+			)
+		AmbiguousImportedType(_, _):
+			rendered(
+				span,
+				"ambiguous imported type",
+				"give distinct type declarations distinct names",
+			)
+		MethodTypeNotVisible(_):
+			rendered(
+				span,
+				"method receiver type is not independently visible",
+				"import the exact type with an ordinary type selection before using methods_only",
+			)
+		MissingImportedUnion(_):
+			rendered(
+				span,
+				"unknown imported union",
+				"select a fixed union declared or ordinarily imported by that module",
+			)
+		AmbiguousImportedUnion(_):
+			rendered(
+				span,
+				"ambiguous imported union",
+				"give each type declared in the selected module a distinct name",
+			)
+		MissingImportedVariant(_):
+			rendered(
+				span,
+				"constructor does not belong to the selected union",
+				"select a constructor declared inside that union",
+			)
+		RepeatedImportedVariant(_, previous):
+			noted(
+				span,
+				"constructor selected more than once",
+				"list each selected constructor once",
+				PreviousDeclaration(previous),
+			)
+		ImportedTypeConflict(_, previous):
+			noted(
+				span,
+				"imported type conflicts with another type",
+				"give the types distinct names or remove the duplicate import",
+				PreviousDeclaration(previous),
+			)
+
+
+private pure func render_type_declaration_error(
+	span: Span,
+	rejection: Errors.TypeDeclarationError,
+) -> Diagnostic:
+	match rejection:
+		Errors.DuplicateRecordType(_, Errors.SourceTypeDeclaration(declaration)):
+			noted(
+				span,
+				"duplicate type name",
+				"give record and union types distinct names",
+				TypeDeclaration(declaration),
+			)
+		Errors.RecursiveAggregateType(_):
+			rendered(
+				span,
+				"recursive aggregate types are not supported yet",
+				"use finite record and union fields until recursive data is supported",
+			)
+		Errors.DuplicateRecordField(_, first):
+			noted(
+				span,
+				"duplicate record field name",
+				"give each field in a record a distinct name",
+				PreviousField(first),
+			)
+
+		Errors.DuplicateVariant(_, _):
+			rendered(span, "duplicate variant name", "give each variant in a union a distinct name")
+		Errors.VariantFunctionConflict(_, _, _):
+			rendered(
+				span,
+				"variant name conflicts with a function",
+				"give functions and union variants distinct names",
+			)
+		Errors.DuplicateUnion(_, _):
+			rendered(
+				span,
+				"duplicate union type name",
+				(
+					"give union types distinct names; foundational types are declared by the base "
+					+ "module"
+				),
+			)
+		Errors.DuplicateTypeParameter(_, _, _):
+			rendered(
+				span,
+				"duplicate type parameter name",
+				"choose a distinct name for each type parameter, such as A and B",
+			)
+		Errors.TypeParameterTypeNameConflict(_):
+			rendered(
+				span,
+				"type parameter conflicts with a type name",
+				"choose a distinct type parameter name, such as T",
+			)
+
+
+
+private pure func render_type_term_error(span: Span, rejection: Errors.TypeTermError) -> Diagnostic:
+	match rejection:
+		Errors.MissingRecordTypeArguments(_, count):
+			if IntOps.equals(count, 1):
+				rendered(
+					span,
+					"generic record requires one type argument",
+					"write a concrete or symbolic application, such as Box[Int] or Box[T]",
+				)
+			else:
+				rendered(
+					span,
+					"generic record requires type arguments",
+					"write "
+						.concat(IntOps.to_string(count))
+						.concat(" type arguments in declaration order"),
+				)
+		Errors.RecordTypeArgumentCountMismatch(_, expected, actual):
+			rendered(
+				span,
+				"record type argument count does not match its declaration",
+				"expected "
+					.concat(IntOps.to_string(expected))
+					.concat(" type arguments, got ")
+					.concat(IntOps.to_string(actual))
+					.concat("; supply types in declaration order"),
+			)
+		Errors.MissingUnionTypeArguments(_, count):
+			if IntOps.equals(count, 1):
+				rendered(
+					span,
+					"generic union requires one type argument",
+					"write a concrete or symbolic application, such as Box[Int] or Box[T]",
+				)
+			else:
+				rendered(
+					span,
+					"generic union requires type arguments",
+					"write "
+						.concat(IntOps.to_string(count))
+						.concat(" type arguments in declaration order"),
+				)
+		Errors.UnionTypeArgumentCountMismatch(_, expected, actual):
+			rendered(
+				span,
+				"union type argument count does not match its declaration",
+				"expected "
+					.concat(IntOps.to_string(expected))
+					.concat(" type arguments, got ")
+					.concat(IntOps.to_string(actual))
+					.concat("; supply types in declaration order"),
+			)
+		Errors.UnknownType(_):
+			rendered(
+				span,
+				"unknown type",
+				(
+					"declare or import this type; builtin types and declared type parameters are "
+					+ "also available"
+				),
+			)
+		Errors.NonApplicableType(_):
+			rendered(
+				span,
+				"type does not accept a type argument",
+				"apply a declared generic union or record, such as Box[Int]",
+			)
+		Errors.OrdinaryRecordApplied(_):
+			rendered(
+				span,
+				"ordinary record does not accept a type argument",
+				"remove the type argument from this record type",
+			)
+		Errors.OrdinaryUnionApplied(_):
+			rendered(
+				span,
+				"ordinary union does not accept a type argument",
+				"remove the type argument from this union type",
+			)
+		Errors.ListTypeArgumentCount:
+			rendered(
+				span,
+				"List requires one type argument",
+				"write List[String] for a list of Strings",
+			)
+
+
+
+private pure func render_signature_error(
+	span: Span,
+	rejection: Errors.SignatureError,
+) -> Diagnostic:
+	match rejection:
+		Errors.GenericMain(_):
+			rendered(
+				span,
+				"main cannot be generic",
+				"declare main() -> Int: without type parameters",
+			)
+		Errors.MainHasParameters(_):
+			rendered(
+				span,
+				"main accepts at most one parameter",
+				"declare main() -> Int: or main(arguments: List[String]) -> Int:",
+			)
+		Errors.MainParameterType:
+			rendered(
+				span,
+				"main parameter must have type List[String]",
+				"declare main() -> Int: or main(arguments: List[String]) -> Int:",
+			)
+		Errors.DuplicateParameter(_, _):
+			rendered(span, "duplicate parameter name", "give each parameter a distinct name")
+		Errors.MainReturnType(_):
+			rendered(
+				span,
+				"main must return Int or Void",
+				"return an Int exit status, or omit the return type for exit status 0",
+			)
+		Errors.PureVoidReturn:
+			pure_void_return(span)
+		Errors.DuplicateFunction(_, _):
+			rendered(span, "duplicate function name", "give every function a distinct name")
+		Errors.MissingMain:
+			rendered(
+				span,
+				"expected a main function",
+				"declare func main() -> Int: as the entrypoint",
+			)
+
+
+private pure func render_builtin_error(span: Span, rejection: Errors.BuiltinError) -> Diagnostic:
+	match rejection:
+		Errors.BuiltinTypesRejected(error):
+			render_builtin_type_error(error)
+		Errors.BuiltinContractMismatch(operation):
+			rendered(
+				span,
+				"builtin declaration does not match its runtime contract",
+				runtime_declaration_help(operation),
+			)
+		Errors.BuiltinResultUnion:
+			rendered(
+				span,
+				"builtin result must be an ordinary union",
+				(
+					"return an ordinary two-variant union and bind the constructors required by this "
+					+ "operation"
+				),
+			)
+		Errors.BuiltinRoleNotInResult(_, _):
+			rendered(
+				span,
+				"builtin constructor does not belong to its result type",
+				"import or declare this constructor in the annotated result union",
+			)
+		Errors.BuiltinRolePayload:
+			rendered(
+				span,
+				"builtin constructor has the wrong payload",
+				"bind the required payload constructor first and the empty constructor second",
+			)
+		Errors.BuiltinBooleanPayload:
+			rendered(
+				span,
+				"comparison constructors must be empty",
+				(
+					"declare two empty variants and bind the equal constructor first and the "
+					+ "different constructor second"
+				),
+			)
+		Errors.BuiltinRoleCoverage:
+			rendered(
+				span,
+				"builtin constructors must cover the complete result union",
+				"bind two distinct constructors and declare exactly those two variants",
+			)
+		Errors.BuiltinTailAnnotation:
+			rendered(
+				span,
+				"builtin bodies cannot have a tail-recursion annotation",
+				"remove @tail_recursive from the builtin declaration",
+			)
+
+
+private pure func render_call_error(
+	span: Span,
+	rejection: Errors.CallError,
+	context: ParsedContents,
+) -> Diagnostic:
+	match rejection:
+		Errors.ImpureCall(_, _):
+			rendered(
+				span,
+				"pure functions cannot call impure functions",
+				"mark the callee pure or remove pure from the caller",
+			)
+		Errors.UnknownFunction(_):
+			rendered(
+				span,
+				"unknown function",
+				(
+					"declare the function locally or import it by name; type selections enable "
+					+ "receiver calls only"
+				),
+			)
+		Errors.ArgumentTypeMismatch(mismatch):
+			type_diagnostic(
+				span,
+				"argument type does not match the parameter type",
+				mismatch.expected,
+				context,
+			)
+		Errors.GenericArgumentConflict(conflict):
+			type_diagnostic(
+				span,
+				"argument type does not match the parameter type",
+				conflict.mismatch.expected,
+				context,
+			)
+		Errors.UncallableBinding(_, origin, value_type):
+			match origin:
+				Check.ParameterBinding(_):
+					message = if Check.same_type(value_type, Check.IntType):
+						"Int parameters cannot be called"
+					else:
+						"parameters cannot be called"
+
+					rendered(
+						span,
+						message,
+						"use the parameter as a value, or rename it to call the function",
+					)
+				Check.MatchCapture:
+					rendered(
+						span,
+						"match bindings cannot be called",
+						"use the binding as a value, or rename it to call the function",
+					)
+				Check.BodyLocal:
+					rendered(
+						span,
+						"local bindings cannot be called",
+						"use the binding as a value, or rename it to call the function",
+					)
+		Errors.ArgumentCountMismatch(arity):
+			render_arity_mismatch(span, arity, context)
+		Errors.InfiniteTypeArgument(_):
+			rendered(span, "inferred type would contain itself", "pass a value with a finite type, or use a concrete helper")
+		Errors.UninferableTypeParameter(_):
+			rendered(
+				span,
+				"cannot infer the type parameter from the argument",
+				Text.concat(
+					"pass a value whose type determines the declared type parameter; use a concrete ",
+					"helper when no argument can determine it",
+				),
+			)
+
+
+-- Arity wording teaches by the callee's parameter count and call notation.
+private pure func render_arity_mismatch(
+	span: Span,
+	arity: Errors.ArityMismatch,
+	context: ParsedContents,
+) -> Diagnostic:
+	if IntOps.equals(arity.expected, 0):
+		match arity.notation:
+			DirectCall:
+				rendered(
+					span,
+					"function takes no arguments",
+					"remove the argument and call the function with ()",
+				)
+			ReceiverCall:
+				match name_spelling(context.names, arity.callee):
+					Some(name):
+						rendered(
+							span,
+							"function takes no arguments",
+							Text
+								.concat("call ", name)
+								.concat("() directly, or choose a function with one parameter"),
+						)
+					None:
+						render_fault(
+							span,
+							Errors.InvalidCallName(arity.callee),
+						)
+	else if IntOps.equals(arity.expected, 1):
+		rendered(
+			span,
+			"function requires one argument",
+			"pass one expression of the declared parameter type",
+		)
+	else:
+		rendered(
+			span,
+			"argument count does not match the function parameters",
+			Text.concat(
+				"pass one expression for each declared parameter; UFCS supplies the receiver ",
+				"first",
+			),
+		)
+
+
+private pure func render_method_error(span: Span, rejection: Errors.MethodError) -> Diagnostic:
+	match rejection:
+		Errors.AmbiguousMethod(_, _, sites):
+			method_diagnostic(
+				span,
+				sites,
+				"ambiguous method call",
+				(
+					"rename one method or call a uniquely imported function directly; receiver type "
+					+ "and argument count must identify one function"
+				),
+			)
+		Errors.NoApplicableMethod(_, _, sites):
+			method_diagnostic(
+				span,
+				sites,
+				"no method accepts this receiver type",
+				(
+					"use a value of a declared receiver type, or import a function accepting this "
+					+ "type"
+				),
+			)
+		Errors.MethodReceiverNeedsType(_, sites):
+			method_diagnostic(
+				span,
+				sites,
+				"method receiver needs an explicit type",
+				(
+					"bind the receiver through a typed helper, or call a uniquely imported function "
+					+ "directly"
+				),
+			)
+		Errors.MethodArgumentCounts(_, _, counts, sites):
+			var expected: List[String] = []
+
+			for count in counts:
+				expected = expected.append(IntOps.to_string(count))
+
+			method_diagnostic(
+				span,
+				sites,
+				"method argument count does not match any receiver-compatible function",
+				"pass one of these total argument counts, including the receiver: ".concat(
+					comma_separated(expected),
+				),
+			)
+		Errors.ConstructorUFCS(_):
+			rendered(
+				span,
+				"constructors do not support UFCS in this increment",
+				"write the constructor directly, such as Number(value)",
+			)
+
+
+private pure func render_constructor_error(
+	span: Span,
+	rejection: Errors.ConstructorError,
+	context: ParsedContents,
+) -> Diagnostic:
+	match rejection:
+		Errors.ConstructorNeedsExpectedType(_):
+			rendered(
+				span,
+				"constructor needs an expected union type",
+				"pass an already-typed union value or call a concrete helper returning the union",
+			)
+		Errors.PayloadFreeVariantCalled(_):
+			rendered(
+				span,
+				"payload-free variants cannot be called",
+				"use the bare variant name without parentheses",
+			)
+
+		Errors.ConstructorFieldCountMismatch(_, expected, actual):
+			rendered(
+				span,
+				"constructor field count does not match its declaration",
+				"expected "
+					.concat(IntOps.to_string(expected))
+					.concat(" fields, got ")
+					.concat(IntOps.to_string(actual))
+					.concat("; pass one expression per declared field"),
+			)
+		Errors.VariantNotInExpectedType(_, expected):
+			type_diagnostic(span, "variant does not belong to the expected type", expected, context)
+
+
+
+private pure func render_record_error(
+	span: Span,
+	rejection: Errors.RecordError,
+	context: ParsedContents,
+) -> Diagnostic:
+	match rejection:
+		Errors.RecordNeedsExpectedType:
+			rendered(
+				span,
+				"record literal needs an expected record type",
+				Text.concat(
+					"pass the literal to a concrete record parameter or return it from a helper ",
+					"declaring that record",
+				),
+			)
+		Errors.UnknownRecordField(name, owner):
+			result = parsed_spelling(
+				name,
+				context.names,
+				span,
+			).and_then(
+				pure func(field): type_spelling(
+					Check.RecordType(owner),
+					context,
+					span,
+				).map(pure func(record_name): rendered(
+						span,
+						"unknown field '"
+							.concat(field)
+							.concat("' in ")
+							.concat(record_name),
+						"use a field declared by the receiving record",
+					)),
+			)
+
+			match result:
+				Ok(diagnostic):
+					diagnostic
+				Err(diagnostic):
+					diagnostic
+		Errors.DuplicateLiteralField(_, first):
+			noted(
+				span,
+				"duplicate field in record literal",
+				"write each record field exactly once",
+				PreviousField(first),
+			)
+		Errors.DuplicateUpdateField(_, first):
+			noted(span, "duplicate field in record update", "write each replacement field exactly once", PreviousField(first))
+		Errors.MissingRecordField(_, declaration):
+			noted(
+				span,
+				"missing field in record literal",
+				"provide every declared record field exactly once",
+				RecordFieldDeclaration(declaration),
+			)
+		Errors.RecordFieldTypeMismatch(_, _, annotation):
+			match type_spelling(annotation.value_type, context, span):
+				Ok(expected):
+					{ rendered(
+						span,
+						"record field requires ".concat(expected),
+						"use an expression of type "
+							.concat(expected)
+							.concat(" here"),
+					) | note = Some(RecordFieldDeclaration(annotation.span)) }
+				Err(error):
+					error
+		Errors.FieldRequiresRecord(_):
+			rendered(
+				span,
+				"field access requires a record value",
+				"read a declared record field, or use parentheses for a UFCS function call",
+			)
+		Errors.UpdateRequiresRecord(_):
+			rendered(span, "record update requires a record value", "write { existing_record | field = expression } with a record base")
+
+
+private pure func render_value_error(
+	span: Span,
+	rejection: Errors.ValueError,
+	context: ParsedContents,
+) -> Diagnostic:
+	match rejection:
+		Errors.UnknownValue(_):
+			rendered(
+				span,
+				"unknown value",
+				"use this function's parameter name, a declared variant, or a call",
+			)
+		Errors.ExpressionTypeMismatch(mismatch):
+			type_diagnostic(
+				span,
+				"expression does not match the expected type",
+				mismatch.expected,
+				context,
+			)
+
+
+private pure func render_statement_error(
+	span: Span,
+	rejection: Errors.StatementError,
+) -> Diagnostic:
+	match rejection:
+		Errors.NonVoidStatement(_):
+			rendered(
+				span,
+				"expression statement must return Void",
+				"bind this value with name = expression, or make it the final expression",
+			)
+		Errors.DuplicateLocal(_):
+			rendered(
+				span,
+				"duplicate local binding",
+				Text.concat(
+					"give each body-local declaration a distinct name; ",
+					"omit var to reassign a mutable binding",
+				),
+			)
+		Errors.ImmutableAssignment(_):
+			rendered(
+				span,
+				"cannot assign to an immutable binding",
+				"declare the binding with var to allow reassignment",
+			)
+
+
+private pure func render_match_error(
+	span: Span,
+	rejection: Errors.MatchError,
+	context: ParsedContents,
+) -> Diagnostic:
+	match rejection:
+
+		Errors.PatternFieldCountMismatch(_, expected, actual):
+			rendered(
+				span,
+				"constructor pattern field count does not match its declaration",
+				"expected "
+					.concat(IntOps.to_string(expected))
+					.concat(" fields, got ")
+					.concat(IntOps.to_string(actual))
+					.concat("; write one name or '_' per declared field"),
+			)
+		Errors.DuplicatePatternBinding(_, previous):
+			{ rendered(
+				span,
+				"duplicate binding in constructor pattern",
+				"give each captured field a distinct name, or ignore it with '_'",
+			) |
+				note = Some(PreviousDeclaration(previous))
+			}
+		Errors.UnknownConstructorPattern(_, _):
+			rendered(
+				span,
+				"unknown constructor pattern",
+				"use an unshadowed variant of the matched union; rename a shadowing local binding",
+			)
+		Errors.UnreachableArm:
+			rendered(
+				span,
+				"match arm is unreachable",
+				"remove this arm; earlier arms already cover all values it could match",
+			)
+		Errors.MatchRequiresUnion(_):
+			rendered(
+				span,
+				"match requires a union value",
+				"match a typed union parameter or a call returning a declared union",
+			)
+
+		Errors.NonExhaustiveMatch(missing):
+			missing_coverage(missing, span, context)
+
+
+private pure func render_recursion_error(
+	span: Span,
+	rejection: Errors.RecursionError,
+) -> Diagnostic:
+	match rejection:
+		Errors.NonTailSelfCall(_):
+			rendered(
+				span,
+				"recursive call is not in tail position",
+				"return this call directly, or remove @tail_recursive",
+			)
+		Errors.NoSelfRecursion:
+			rendered(
+				span,
+				"@tail_recursive function has no direct self call",
+				"remove @tail_recursive; mutual recursion is not covered by this annotation",
+			)
+		Errors.GenericTailRecursionUnsupported:
+			rendered(
+				span,
+				"generic @tail_recursive functions are not supported yet",
+				"use a nongeneric helper, or remove @tail_recursive",
+			)
+		Errors.GrowingRecursiveInstantiation:
+			rendered(
+				span,
+				"recursive calls grow type arguments without bound",
+				Text.concat(
+					"pass recursive type arguments unchanged, permute them, or reset them to ",
+					"concrete types",
+				),
+			)
+
+
+private pure func method_diagnostic(
+	span: Span,
+	sites: List[Errors.MethodCandidateSite],
+	message: String,
+	help: String,
+) -> Diagnostic:
+	var locations: List[Span] = []
+
+	for site in sites:
+		locations = locations.append(site.declaration)
+
+		match site.import_site:
+			Some(import_site):
+				locations = locations.append(import_site)
+			None:
+				void
+
+	noted(span, message, help, CompetingDeclarations(locations))
+
+
+private pure func builtin_spelling(
+	value: Check.TypeRef,
+	context: ParsedContents,
+	span: Span,
+) -> Result[String, Diagnostic]:
+	var name: Option[NameId] = None
+
+	for declaration in context.builtin_types:
+		selected = match declaration.declaration:
+			IntegerBuiltin(_):
+				Check.same_type(value, Check.IntType)
+			FloatBuiltin(_):
+				Check.same_type(value, Check.FloatType)
+			StringBuiltin(_):
+				Check.same_type(value, Check.StringType)
+			VoidBuiltin(_):
+				Check.same_type(value, Check.VoidType)
+			ListBuiltin(_):
+				match value:
+					Check.ListType(_):
+						True
+					_:
+						False
+
+		if selected:
+			name = Some(builtin_type_name(declaration.declaration).id)
+			break
+
+	match name:
+		Some(name):
+			parsed_spelling(name, context.names, span)
+		None:
+			Err(
+				rendered(
+					span,
+					"missing builtin type declaration",
+					"report this compiler error with the input program",
+				),
+			)
+
+
+private pure func parameter_spelling(
+	id: Check.TypeParameterId,
+	context: ParsedContents,
+	span: Span,
+) -> Result[String, Diagnostic]:
+	parameters = match Check.parameter_owner(id):
+		Check.FunctionDeclaration(owner):
+			inventory_functions(context.declarations)
+				.get(function_number(owner))
+				.map(pure func(row): row.declaration.type_parameters)
+		Check.UnionDeclaration(owner):
+			inventory_unions(context.declarations)
+				.get(union_number(owner))
+				.map(pure func(declaration): declaration.type_parameters)
+
+		Check.RecordDeclaration(owner):
+			inventory_records(context.declarations)
+				.get(record_number(owner))
+				.map(pure func(row): row.declaration.type_parameters)
+
+	written ?= match parameters:
+		Some(parameters):
+			match parameters.get(Check.parameter_position(id)):
+				Some(written):
+					Ok(written)
+				None:
+					Err(render_fault(span, Errors.ParameterOwnerWithoutParameter(id)))
+		None:
+			Err(render_fault(span, Errors.InvalidParameterDeclaration(id)))
+
+	match name_spelling(context.names, written.id):
+		Some(spelling):
+			Ok(spelling)
+		None:
+			Err(render_fault(span, Errors.InvalidParameterName(id)))
+
+
+
+private pure func type_spelling(
+	value: Check.TypeRef,
+	context: ParsedContents,
+	span: Span,
+) -> Result[String, Diagnostic]:
+	match value:
+		Check.RecordType(id):
+			declaration ?= inventory_records(context.declarations)
+				.get(record_number(id))
+				.to_result(render_fault(span, Errors.InvalidRecordDeclaration(id)))
+			parsed_spelling(declaration.declaration.type_name.id, context.names, span)
+		Check.IntType | Check.FloatType | Check.VoidType | Check.StringType:
+			builtin_spelling(value, context, span)
+		Check.ListType(element):
+			name ?= builtin_spelling(value, context, span)
+			child ?= type_spelling(element, context, span)
+			Ok(
+				name
+					.concat("[")
+					.concat(child)
+					.concat("]"),
+			)
+		Check.ParameterType(id):
+			parameter_spelling(id, context, span)
+		Check.UnionType(id):
+			declaration ?= inventory_unions(context.declarations)
+				.get(union_number(id))
+				.to_result(render_fault(span, Errors.InvalidResolvedUnion(id)))
+			parsed_spelling(declaration.type_name.id, context.names, span)
+		Check.AppliedUnionType(id, arguments):
+			name ?= type_spelling(
+				Check.UnionType(id),
+				context,
+				span,
+			)
+			spelled ?= type_spellings(arguments, context, span, [])
+			Ok(
+				name
+					.concat("[")
+					.concat(comma_separated(spelled))
+					.concat("]"),
+			)
+		Check.AppliedRecordType(id, arguments):
+			name ?= type_spelling(
+				Check.RecordType(id),
+				context,
+				span,
+			)
+			var spelling = name.concat("[")
+			var failure: Option[Diagnostic] = None
+			var position: Int = 0
+
+			for argument in arguments:
+				match type_spelling(argument, context, span):
+					Ok(value):
+						if not IntOps.equals(position, 0):
+							spelling = spelling.concat(", ")
+
+						spelling = spelling.concat(value)
+					Err(error):
+						failure = Some(error)
+						break
+
+				position = IntOps.add(position, 1)
+
+			match failure:
+				Some(error):
+					Err(error)
+				None:
+					Ok(spelling.concat("]"))
+
+
+-- The parts in order, separated by commas.
+private pure func comma_separated(parts: List[String]) -> String:
+	match parts:
+		[]:
+			""
+		[first, ...rest]:
+			var text = first
+
+			for part in rest:
+				text = text
+					.concat(", ")
+					.concat(part)
+
+			text
+
+
+private pure func type_spellings(
+	values: List[Check.TypeRef],
+	context: ParsedContents,
+	span: Span,
+	spelled: List[String],
+) -> Result[List[String], Diagnostic]:
+	match values:
+		[]:
+			Ok(spelled)
+		[value, ...rest]:
+			spelling ?= type_spelling(value, context, span)
+			type_spellings(
+				rest,
+				context,
+				span,
+				spelled.append(spelling),
+			)
+
+
+private pure func missing_variant_name(
+	id: VariantId,
+	span: Span,
+	context: ParsedContents,
+) -> Result[String, Diagnostic]:
+	declaration ?= inventory_unions(context.declarations)
+		.get(union_number(variant_owner(id)))
+		.to_result(render_fault(span, Errors.InvalidResolvedUnion(variant_owner(id))))
+	variant ?= declaration.variants
+		.get(variant_number(id))
+		.to_result(render_fault(span, Errors.InvalidResolvedVariant(id)))
+	name ?= parsed_spelling(variant.declaration.name.id, context.names, span)
+
+	if variant.declaration.fields.is_empty():
+		Ok(name)
+	else:
+		var positions: List[String] = []
+
+		for field in variant.declaration.fields:
+			positions = positions.append("_")
+
+		Ok(name.concat("(").concat(comma_separated(positions)).concat(")"))
+
+
+private pure func variant_spellings(
+	remaining: List[VariantId],
+	context: ParsedContents,
+	span: Span,
+	spelled: List[String],
+) -> Result[List[String], Diagnostic]:
+	match remaining:
+		[]:
+			Ok(spelled)
+		[id, ...rest]:
+			name ?= missing_variant_name(id, span, context)
+			variant_spellings(
+				rest,
+				context,
+				span,
+				spelled.append(name),
+			)
+
+
+private pure func missing_coverage(
+	remaining: List[VariantId],
+	span: Span,
+	context: ParsedContents,
+) -> Diagnostic:
+	match variant_spellings(remaining, context, span, []):
+		Err(error):
+			error
+		Ok(names):
+			prefix = if IntOps.equals(remaining.length(), 1):
+				"add an arm for the missing variant: "
+			else:
+				"add arms for the missing variants: "
+
+			rendered(
+				span,
+				"non-exhaustive match",
+				Text.concat(prefix, comma_separated(names)),
+			)
+
+
+private pure func type_diagnostic(
+	span: Span,
+	message: String,
+	expected_type: Check.TypeRef,
+	context: ParsedContents,
+) -> Diagnostic:
+	match expected_type:
+		Check.ParameterType(_):
+			rendered(
+				span,
+				message,
+				"use a value already typed as this declaration's type parameter",
+			)
+		_:
+			match type_spelling(expected_type, context, span):
+				Err(error):
+					error
+				Ok(spelling):
+					rendered(
+						span,
+						message,
+						"use an expression of type "
+							.concat(spelling)
+							.concat(" here"),
+					)

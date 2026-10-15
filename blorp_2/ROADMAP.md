@@ -333,7 +333,7 @@ validation and final integration status are tracked above.
 
 | Boundary | Published fact and responsibility |
 | --- | --- |
-| [Checked facts](src/check/check_model.brp), [declaration checking](src/check/check_types.brp) and [expression checking](src/check/check_values.brp) | Declaration-owned field identities and complete accepted field types; contextual literal and projection checking. |
+| [Checked facts](src/check/model.brp), [declaration checking](src/check/types.brp) and [expression checking](src/check/values.brp) | Declaration-owned field identities and complete accepted field types; contextual literal and projection checking. |
 | [Specialization](src/specialize/specialize.brp) | Concrete field types and InlineRecord/ManagedRecord representation derived from the complete shape. |
 | [Ownership insertion](src/own/own.brp) | Independent stored-slot obligations and explicit projection acquisitions. |
 | [Verification](src/verify/verify.brp) | Independent layout, receiver-lifetime and sequential transfer validation. |
@@ -1122,7 +1122,7 @@ requirement to implement reuse now.
 Existing direct stage suites include [test_lower.brp](test/unit/test_lower/test_lower.brp),
 [test_own.brp](test/unit/test_own/test_own.brp), [test_verify.brp](test/unit/test_verify/test_verify.brp)
 and [test_emit.brp](test/unit/test_emit/test_emit.brp). The
-[String-runtime suite](test/runtime/test_string_runtime.brp) independently checks
+[String-runtime suite](test/runtime/test_string.brp) independently checks
 bytes/length, retain, nonfinal release, final free and independent lifetimes.
 These do not establish future aggregate runtime coverage.
 

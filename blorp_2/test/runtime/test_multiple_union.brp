@@ -1,0 +1,147 @@
+import:
+	../../src/specialize/specialize as Concrete
+	../../src/verify/verify: VerifiedProgram, verified_contents
+	test_record: RuntimeCase, runtime_passes
+	test: TestSuite
+
+
+private RUNTIME_SOURCE: String =
+	|fixed record Holder { text: String }
+	|fixed union Fields:
+	|    Pair(String, String)
+	|    Mixed(Int, Float, String, Void)
+	|    Nested(Holder, Option[String])
+	|    Repeated(Holder, Holder)
+	|    Empty
+	|    Unit(Void)
+	|fixed record Envelope { value: Fields }
+	|pure func text(value: Int) -> String:
+	|    builtin("int.to_string")
+	|pure func make_holder() -> Holder:
+	|    { text = text(7) }
+	|pure func make_pair() -> Fields:
+	|    Pair(text(7), text(42))
+	|pure func make_mixed() -> Fields:
+	|    Mixed(7, 2.5, text(42), void)
+	|pure func make_nested() -> Fields:
+	|    Nested(make_holder(), Some(text(42)))
+	|pure func make_repeated() -> Fields:
+	|    holder = make_holder()
+	|    Repeated(holder, holder)
+	|pure func make_empty() -> Fields:
+	|    Empty
+	|pure func make_unit() -> Fields:
+	|    Unit(void)
+	|pure func envelope(value: Fields) -> Envelope:
+	|    { value = value }
+	|func main() -> Int:
+	|    holder = make_holder()
+	|    pair = envelope(make_pair())
+	|    mixed = envelope(make_mixed())
+	|    nested = envelope(make_nested())
+	|    repeated = envelope(make_repeated())
+	|    empty = envelope(make_empty())
+	|    unit = envelope(make_unit())
+	|    0
+	|
+
+
+private pure func string_option(layout: Concrete.ConcreteUnion) -> Bool:
+	match (layout.representation, layout.variants):
+		(Concrete.InlineOwningPayload, [[Concrete.StringType], []]): True
+		_: False
+
+
+private pure func multiple_fields(layout: Concrete.ConcreteUnion) -> Bool:
+	match (layout.representation, layout.variants):
+		(Concrete.InlineOwningPayload, [
+			[Concrete.StringType, Concrete.StringType],
+			[Concrete.IntType, Concrete.FloatType, Concrete.StringType, Concrete.VoidType],
+			[Concrete.RecordType(nested), Concrete.UnionType(optional)],
+			[Concrete.RecordType(first), Concrete.RecordType(second)],
+			[],
+			[Concrete.VoidType]
+		]):
+			(
+				Concrete.record_number(nested) == 0
+				and Concrete.union_number(optional) == 0
+				and Concrete.record_number(first) == 0
+				and Concrete.record_number(second) == 0
+			)
+		_: False
+
+
+private pure func complete_runtime_catalog(program: VerifiedProgram) -> Bool:
+	contents = verified_contents(program)
+	match (contents.records, contents.unions):
+		([holder, envelope], [optional, fields]):
+			match (holder.representation, holder.fields, envelope.representation, envelope.fields):
+				(Concrete.ManagedRecord, [Concrete.StringType], Concrete.ManagedRecord, [Concrete.UnionType(owner)]):
+					Concrete.union_number(owner) == 1 and string_option(optional) and multiple_fields(fields)
+				_: False
+		_: False
+
+
+private CASES: List[RuntimeCase] = [
+	{
+		description = "two distinct fields each destroy their child once",
+		name = "distinct_cleanup"
+	},
+	{
+		description = "repeated String slots discharge two references and one allocation",
+		name = "repeated_pointer"
+	},
+	{
+		description = "acquired field zero survives its parent",
+		name = "first_escape"
+	},
+	{
+		description = "acquired distinct field one survives its parent",
+		name = "second_escape"
+	},
+	{
+		description = "nonfinal parent release preserves every active field",
+		name = "nonfinal_release"
+	},
+	{
+		description = "union duplication and release visit every owning field",
+		name = "union_dup"
+	},
+	{
+		description = "inactive variant ignores every payload storage slot",
+		name = "inactive"
+	},
+	{
+		description = "mixed scalar Float String and Void slots release only the child",
+		name = "mixed"
+	},
+	{
+		description = "nested record and owning union fields release independently",
+		name = "nested"
+	},
+	{
+		description = "repeated managed roots retain per-occurrence obligations",
+		name = "repeated_roots"
+	},
+	{
+		description = "unary Void variant frees no invented child",
+		name = "void_only"
+	},
+	{
+		description = "nullary variant frees no payload child",
+		name = "empty_only"
+	},
+]
+
+
+func test_runtime() -> Bool:
+	runtime_passes(
+		RUNTIME_SOURCE, complete_runtime_catalog,
+		"blorp_2/test/runtime/fixtures/multiple_union_test.c", CASES,
+	)
+
+
+tests: TestSuite = {
+	description = "Blorp 2 multiple union field runtime",
+	tests = [("complete multiple field catalog and runtime helpers", test_runtime)]
+}

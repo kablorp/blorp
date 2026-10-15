@@ -1,0 +1,733 @@
+---
+Checks function bodies: parameter scope, ordered statements, match arms
+and patterns, and the canonical Void tail.
+---
+import:
+	./errors:
+		CheckError,
+		CheckerInvariant(InvalidCheckedUnion, InvalidResolvedParameter),
+		ExpectedTypeSite(InferredBindingDeclaration, SourceAnnotation),
+		MatchError(
+			MatchRequiresUnion, NonExhaustiveMatch, PatternFieldCountMismatch, DuplicatePatternBinding,
+			UnknownConstructorPattern, UnreachableArm,
+		),
+		StatementError(DuplicateLocal, ImmutableAssignment, NonVoidStatement),
+		checker_invariant,
+		match_error,
+		statement_error,
+	./methods: CallableBinding, ResolutionContext
+	./model:
+		BindingDefinition,
+		BindingId,
+		BindingMutability(Immutable, Mutable),
+		BindingOrigin(BodyLocal, MatchCapture, ParameterBinding),
+		CallTarget(RuntimeFunction),
+		CheckedArm,
+		CheckedBody(CheckedMatchBody, CheckedValueBody),
+		CheckedExit(RecurWith, ReturnExpression),
+		CheckedExpr,
+		CheckedForm(InvokeFunction, LiteralVoid, ReadBinding),
+		CheckedFunction,
+		CheckedMatch,
+		CheckedPattern(BindingCase, VariantCase, WildcardCase),
+		CheckedStatement(DiscardExpression, InitializeBinding, ReassignBinding),
+		TypeRef(VoidType),
+		TypeUse,
+		UnionOccurrence,
+		binding_id,
+		binding_number,
+		same_type,
+		same_variant,
+		union_occurrence,
+	./recursion: check_execution
+	./signatures: AcceptedBody(BuiltinBody, MatchBody, ValueBody), AcceptedFunction
+	./types: CheckedDeclarations, previous_declaration
+	./values:
+		LocalBinding,
+		VariantContract,
+		binding_site,
+		check_value,
+		find_variant,
+		lookup_binding,
+		synthesize_value,
+	../utils/declarations: VariantId, union_number
+	int as IntOps
+	../namespace/namespace: Namespace
+	option: is_some, to_result
+	../utils/syntax:
+		BindingSyntax(ImmutableBinding, MutableBinding),
+		FieldPattern(FieldName, FieldWildcard),
+		ParsedBinding,
+		ParsedMatch,
+		ParsedMatchArm,
+		ParsedParameter,
+		ParsedPattern(PatternName, PatternWildcard, PatternConstructor),
+		ParsedStatement(BindingStatement, ExpressionStatement),
+		Span,
+		ValueExpression,
+		WrittenName,
+
+
+private fixed record ResolvedPattern {
+	pattern: CheckedPattern,
+	scope: List[LocalBinding],
+	bindings: List[BindingDefinition]
+}
+
+
+private pure func bound_pattern(
+	name: WrittenName,
+	type_ref: TypeRef,
+	ordinal: Int,
+	scope: List[LocalBinding],
+	pattern: CheckedPattern,
+) -> ResolvedPattern:
+	definition: BindingDefinition = {
+		origin = MatchCapture,
+		mutability = Immutable,
+		value_type = type_ref,
+		span = name.span
+	}
+
+	{
+		pattern = pattern,
+		scope = [
+			{
+				name = name.id,
+				id = binding_id(ordinal),
+				definition = definition
+			},
+		].concat(scope),
+		bindings = [definition]
+	}
+
+
+-- A pattern that binds nothing new.
+private pure func unbound(pattern: CheckedPattern, scope: List[LocalBinding]) -> ResolvedPattern:
+	{
+		pattern = pattern,
+		scope = scope,
+		bindings = []
+	}
+
+
+private pure func resolve_variant_pattern(
+	contract: VariantContract,
+	fields: List[FieldPattern],
+	span: Span,
+	ordinal: Int,
+	scope: List[LocalBinding],
+) -> Result[ResolvedPattern, CheckError]:
+	if not IntOps.equals(contract.fields.length(), fields.length()):
+		Err(match_error(span, PatternFieldCountMismatch(contract.variant, contract.fields.length(), fields.length())))
+	else:
+		var bindings: List[BindingDefinition] = []
+		var captures: List[Option[BindingId]] = []
+		var locals: List[LocalBinding] = []
+		var previous: List[WrittenName] = []
+		var position = 0
+		var failure: Option[CheckError] = None
+		for field in fields:
+			match contract.fields.get(position):
+				None: failure = Some(checker_invariant(span, GenericConstructorContract))
+				Some(annotation):
+					match field:
+						FieldWildcard(_): captures = captures.append(None)
+						FieldName(name):
+							match previous_declaration(previous, name.id):
+								Some(first):
+									failure = Some(match_error(name.span, DuplicatePatternBinding(name.id, first.span)))
+									break
+								None: void
+							id = binding_id(IntOps.add(ordinal, bindings.length()))
+							definition: BindingDefinition = {
+								origin = MatchCapture,
+								mutability = Immutable,
+								value_type = annotation.value_type,
+								span = name.span,
+							}
+							locals = locals.append({ name = name.id, id = id, definition = definition })
+							bindings = bindings.append(definition)
+							captures = captures.append(Some(id))
+							previous = previous.append(name)
+			if failure.is_some():
+				break
+			position = IntOps.add(position, 1)
+		match failure:
+			Some(error): Err(error)
+			None:
+				Ok({
+					pattern = VariantCase(contract.variant, captures),
+					scope = locals.concat(scope),
+					bindings = bindings,
+				})
+
+
+-- What every arm of one match shares: the scrutinee's union type and
+-- occurrence, the function's return obligation and the scope before the match.
+private fixed record MatchContext {
+	union_type: TypeRef,
+	occurrence: UnionOccurrence,
+	return_type: TypeUse,
+	scope: List[LocalBinding]
+}
+
+
+-- A bare name is a variant of the matched union unless a local binding shadows it.
+private pure func resolve_pattern(
+	pattern: ParsedPattern,
+	match_context: MatchContext,
+	ordinal: Int,
+	context: ResolutionContext,
+) -> Result[ResolvedPattern, CheckError]:
+	scope = match_context.scope
+
+	match pattern:
+		PatternWildcard(_):
+			Ok(unbound(WildcardCase, scope))
+		PatternName(name):
+			contract ?= pattern_variant(name, match_context, context)
+
+			match contract:
+				Some(contract):
+					resolve_variant_pattern(contract, [], name.span, ordinal, scope)
+				None:
+					capture = BindingCase(binding_id(ordinal))
+					Ok(bound_pattern(name, match_context.union_type, ordinal, scope, capture))
+		PatternConstructor(name, fields, span):
+			contract ?= pattern_variant(name, match_context, context)
+			unknown = UnknownConstructorPattern(name.id, match_context.union_type)
+			variant ?= contract.to_result(match_error(span, unknown))
+			resolve_variant_pattern(variant, fields, span, ordinal, scope)
+
+
+private pure func pattern_variant(
+	name: WrittenName,
+	match_context: MatchContext,
+	context: ResolutionContext,
+) -> Result[Option[VariantContract], CheckError]:
+	if lookup_binding(match_context.scope, name.id).is_some():
+		Ok(None)
+	else:
+		find_variant(context, match_context.occurrence, name)
+
+
+private pure func remaining_after(
+	pattern: CheckedPattern,
+	remaining: List[VariantId],
+	span: Span,
+) -> Result[List[VariantId], CheckError]:
+	var next: List[VariantId] = []
+	var useful = False
+
+	match pattern:
+		VariantCase(id, _):
+			for known in remaining:
+				if same_variant(id, known):
+					useful = True
+				else:
+					next = next.append(known)
+		WildcardCase:
+			useful = not IntOps.equals(remaining.length(), 0)
+		BindingCase(_):
+			useful = not IntOps.equals(remaining.length(), 0)
+
+	if useful:
+		Ok(next)
+	else:
+		Err(match_error(span, UnreachableArm))
+
+
+private fixed record ResolvedMatch {
+	body: CheckedMatch,
+	bindings: List[BindingDefinition]
+}
+
+
+-- Arms resolved so far, the variants they leave uncovered and the function's
+-- bindings including every earlier arm's.
+private fixed record ArmProgress {
+	arms: List[CheckedArm],
+	remaining: List[VariantId],
+	bindings: List[BindingDefinition]
+}
+
+
+-- Every arm must be useful, and together the arms must cover every variant.
+private pure func resolve_match(
+	return_type: TypeUse,
+	scope: List[LocalBinding],
+	body: ParsedMatch,
+	bindings: List[BindingDefinition],
+	context: ResolutionContext,
+) -> Result[ResolvedMatch, CheckError]:
+	scrutinee ?= synthesize_value(scope, body.scrutinee, None, context)
+	occurrence ?= union_occurrence(
+		scrutinee.value_type,
+	).to_result(match_error(body.scrutinee.span, MatchRequiresUnion(scrutinee.value_type)))
+	declaration ?= context.unions
+		.get(union_number(occurrence.owner))
+		.to_result(checker_invariant(body.keyword_span, InvalidCheckedUnion(occurrence.owner)))
+	var remaining: List[VariantId] = []
+
+	for variant in declaration.variants:
+		remaining = remaining.append(variant.id)
+
+	match_context: MatchContext = {
+		union_type = scrutinee.value_type,
+		occurrence = occurrence,
+		return_type = return_type,
+		scope = scope
+	}
+	resolved ?= resolve_arms(
+		body.arms,
+		match_context,
+		{
+			arms = [],
+			remaining = remaining,
+			bindings = bindings
+		},
+		context,
+	)
+
+	if resolved.remaining.is_empty():
+		Ok({
+			body = {
+				scrutinee = scrutinee,
+				union_type = scrutinee.value_type,
+				arms = resolved.arms
+			},
+			bindings = resolved.bindings,
+		})
+	else:
+		Err(match_error(body.keyword_span, NonExhaustiveMatch(resolved.remaining)))
+
+
+private pure func resolve_arms(
+	written: List[ParsedMatchArm],
+	match_context: MatchContext,
+	progress: ArmProgress,
+	context: ResolutionContext,
+) -> Result[ArmProgress, CheckError]:
+	match written.get(progress.arms.length()):
+		None:
+			Ok(progress)
+		Some(arm):
+			pattern ?= resolve_pattern(
+				arm.pattern,
+				match_context,
+				progress.bindings.length(),
+				context,
+			)
+			remaining ?= remaining_after(
+				pattern.pattern,
+				progress.remaining,
+				pattern_span(arm.pattern),
+			)
+
+			definitions = progress.bindings.concat(pattern.bindings)
+
+			prefix ?= resolve_statements(
+				arm.statements,
+				{
+					bindings = definitions,
+					scope = pattern.scope,
+					statements = []
+				},
+				definitions.length(),
+				context,
+			)
+			value ?= resolve_return_value(
+				prefix.scope,
+				arm.body,
+				match_context.return_type,
+				context,
+			)
+			resolve_arms(
+				written,
+				match_context,
+				{
+					arms = progress.arms.append({
+						pattern = pattern.pattern,
+						statements = prefix.statements,
+						body = ReturnExpression(value),
+					}),
+					remaining = remaining,
+					bindings = prefix.bindings
+				},
+				context,
+			)
+
+
+private pure func pattern_span(pattern: ParsedPattern) -> Span:
+	match pattern:
+		PatternName(name):
+			name.span
+		PatternWildcard(span):
+			span
+		PatternConstructor(_, _, span):
+			span
+
+
+-- The signature was resolved from these parameters, one type each.
+private pure func parameter_scope(
+	parameters: List[ParsedParameter],
+	types: List[TypeUse],
+	scope: List[LocalBinding],
+) -> Result[List[LocalBinding], CheckError]:
+	position = scope.length()
+
+	match parameters.get(position):
+		None:
+			Ok(scope)
+		Some(parameter):
+			value_type ?= types
+				.get(position)
+				.to_result(
+					checker_invariant(
+						parameter.name.span,
+						InvalidResolvedParameter(position),
+					),
+				)
+			parameter_scope(
+				parameters,
+				types,
+				scope.append({
+					name = parameter.name.id,
+					id = binding_id(position),
+					definition = {
+						origin = ParameterBinding(position),
+						mutability = Immutable,
+						value_type = value_type.value_type,
+						span = parameter.name.span
+					},
+				}),
+			)
+
+
+private fixed record ResolvedBody {
+	bindings: List[BindingDefinition],
+	statements: List[CheckedStatement],
+	body: CheckedBody
+}
+
+
+-- A block's checked statements, the scope after them and the function's
+-- bindings so far.
+private fixed record ResolvedStatements {
+	bindings: List[BindingDefinition],
+	scope: List[LocalBinding],
+	statements: List[CheckedStatement]
+}
+
+
+-- Function-owned ordinals at or after `block_start` belong to this block. Only
+-- an explicit var may shadow an outer binding or the arm capture.
+private pure func resolve_statements(
+	written: List[ParsedStatement],
+	block: ResolvedStatements,
+	block_start: Int,
+	context: ResolutionContext,
+) -> Result[ResolvedStatements, CheckError]:
+	match written.get(block.statements.length()):
+		None:
+			Ok(block)
+		Some(BindingStatement(binding)):
+			next ?= resolve_assignment(binding, block, block_start, context)
+			resolve_statements(written, next, block_start, context)
+		Some(ExpressionStatement(expression)):
+			value ?= synthesize_value(block.scope, expression, None, context)
+
+			if same_type(value.value_type, VoidType):
+				resolve_statements(
+					written,
+					{ block |
+						statements = block.statements.append(DiscardExpression(value))
+					},
+					block_start,
+					context,
+				)
+			else:
+				Err(statement_error(expression.span, NonVoidStatement(value.value_type)))
+
+
+private pure func resolve_assignment(
+	written: ParsedBinding,
+	block: ResolvedStatements,
+	block_start: Int,
+	context: ResolutionContext,
+) -> Result[ResolvedStatements, CheckError]:
+	-- Only an explicit var may shadow; it may not redeclare this block's own local.
+	decision: Result[Option[LocalBinding], CheckError] = match lookup_binding(
+		block.scope,
+		written.name.id,
+	):
+		None:
+			Ok(None)
+		Some(binding):
+			site = binding_site(context.caller.function, binding)
+
+			match written.mutability:
+				MutableBinding:
+					redeclared = match binding.definition.origin:
+						BodyLocal:
+							IntOps.greater_than_or_equal(binding_number(binding.id), block_start)
+						_:
+							False
+
+					if redeclared:
+						Err(statement_error(written.name.span, DuplicateLocal(site)))
+					else:
+						Ok(None)
+				ImmutableBinding:
+					match binding.definition.mutability:
+						Mutable:
+							Ok(Some(binding))
+						Immutable:
+							Err(statement_error(written.name.span, ImmutableAssignment(site)))
+
+	reassign ?= decision
+
+	match reassign:
+		Some(binding):
+			site = InferredBindingDeclaration(binding_site(context.caller.function, binding))
+			value ?= check_value(
+				block.scope,
+				written.initializer,
+				binding.definition.value_type,
+				site,
+				context,
+			)
+			Ok(
+				{ block |
+					statements = block.statements.append(ReassignBinding(binding.id, value))
+				},
+			)
+		None:
+			value ?= synthesize_value(block.scope, written.initializer, None, context)
+
+			mutability = match written.mutability:
+				MutableBinding:
+					Mutable
+				ImmutableBinding:
+					Immutable
+
+			definition: BindingDefinition = {
+				origin = BodyLocal,
+				mutability = mutability,
+				value_type = value.value_type,
+				span = written.name.span
+			}
+			id = binding_id(block.bindings.length())
+			Ok({
+				bindings = block.bindings.append(definition),
+				scope = [
+					{
+						name = written.name.id,
+						id = id,
+						definition = definition
+					},
+				].concat(block.scope),
+				statements = block.statements.append(InitializeBinding(id, value)),
+			})
+
+
+-- Void tails have no expected value type: each expression is still fully checked,
+-- then its value is discarded after tail-recursion analysis, before publication.
+private pure func resolve_return_value(
+	scope: List[LocalBinding],
+	written: ValueExpression,
+	return_type: TypeUse,
+	context: ResolutionContext,
+) -> Result[CheckedExpr, CheckError]:
+	if same_type(return_type.value_type, VoidType):
+		synthesize_value(scope, written, None, context)
+	else:
+		check_value(
+			scope,
+			written,
+			return_type.value_type,
+			SourceAnnotation(return_type.span),
+			context,
+		)
+
+
+private pure func resolve_body(
+	accepted: AcceptedFunction,
+	context: ResolutionContext,
+) -> Result[ResolvedBody, CheckError]:
+	signature = accepted.signature
+	initial ?= parameter_scope(accepted.declaration.parameters, signature.parameters, [])
+	prefix ?= resolve_statements(
+		accepted.declaration.statements,
+		{
+			bindings = initial.map(
+				pure func(binding: LocalBinding) -> BindingDefinition: binding.definition,
+			),
+			scope = initial,
+			statements = []
+		},
+		initial.length(),
+		context,
+	)
+
+	match accepted.body:
+		BuiltinBody(operation, span):
+			-- Read the scope's actual binding identities, as ordinary parameter uses do.
+			arguments = initial.map(pure func(binding: LocalBinding) -> CheckedExpr:
+				{
+					form = ReadBinding(binding.id),
+					value_type = binding.definition.value_type,
+					span = binding.definition.span
+				}
+			)
+			Ok({
+				bindings = prefix.bindings,
+				statements = prefix.statements,
+				body = CheckedValueBody(ReturnExpression({
+					form = InvokeFunction(
+						{
+							target = RuntimeFunction(operation),
+							span = span
+						},
+						arguments,
+					),
+					value_type = signature.return_type.value_type,
+					span = span,
+				})),
+			})
+		ValueBody(body):
+			value ?= resolve_return_value(prefix.scope, body, signature.return_type, context)
+			Ok({
+				bindings = prefix.bindings,
+				statements = prefix.statements,
+				body = CheckedValueBody(ReturnExpression(value)),
+			})
+		MatchBody(body):
+			matched ?= resolve_match(
+				signature.return_type,
+				prefix.scope,
+				body,
+				prefix.bindings,
+				context,
+			)
+			Ok({
+				bindings = matched.bindings,
+				statements = prefix.statements,
+				body = CheckedMatchBody(matched.body),
+			})
+
+
+-- Checks every function body in declaration order, including unreachable ones.
+pure func resolve_functions(
+	functions: List[AcceptedFunction],
+	declarations: CheckedDeclarations,
+	namespace: Namespace,
+	callables: List[CallableBinding],
+) -> Result[List[CheckedFunction], CheckError]:
+	check_functions(functions, declarations, namespace, callables, [])
+
+
+private pure func check_functions(
+	functions: List[AcceptedFunction],
+	declarations: CheckedDeclarations,
+	namespace: Namespace,
+	callables: List[CallableBinding],
+	checked: List[CheckedFunction],
+) -> Result[List[CheckedFunction], CheckError]:
+	match functions.get(checked.length()):
+		None:
+			Ok(checked)
+		Some(accepted):
+			id = accepted.id
+			context: ResolutionContext = {
+				caller = {
+					function = id,
+					purity = accepted.signature.purity
+				},
+				module = accepted.declaration.module,
+				namespace = namespace,
+				signatures = functions,
+				unions = declarations.unions,
+				records = declarations.records,
+				callables = callables,
+			}
+			signature = accepted.signature
+			body ?= resolve_body(accepted, context)
+			execution ?= check_execution(accepted.declaration, body.statements, body.body, id)
+
+			executed: ResolvedBody = { body | body = execution.body }
+
+			published = if same_type(signature.return_type.value_type, VoidType):
+				normalize_void_body(executed)
+			else:
+				executed
+
+			check_functions(
+				functions,
+				declarations,
+				namespace,
+				callables,
+				checked.append({
+					id = id,
+					execution = execution.execution,
+					signature = signature,
+					bindings = published.bindings,
+					statements = published.statements,
+					body = published.body,
+				}),
+			)
+
+
+private fixed record NormalizedVoidExit {
+	statements: List[CheckedStatement],
+	exit: CheckedExit
+}
+
+
+private pure func normalize_void_exit(
+	statements: List[CheckedStatement],
+	exit: CheckedExit,
+) -> NormalizedVoidExit:
+	match exit:
+		RecurWith(_, _):
+			{
+				statements = statements,
+				exit = exit
+			}
+		ReturnExpression(value):
+			match value.form:
+				LiteralVoid:
+					{
+						statements = statements,
+						exit = exit
+					}
+				_:
+					{
+						statements = statements.append(DiscardExpression(value)),
+						exit = ReturnExpression({
+							form = LiteralVoid,
+							value_type = VoidType,
+							span = value.span,
+						})
+					}
+
+
+-- A Void body's tails return canonical void after discarding their values.
+private pure func normalize_void_body(resolved: ResolvedBody) -> ResolvedBody:
+	match resolved.body:
+		CheckedValueBody(exit):
+			normalized = normalize_void_exit(resolved.statements, exit)
+			{ resolved |
+				statements = normalized.statements,
+				body = CheckedValueBody(normalized.exit)
+			}
+		CheckedMatchBody(matched):
+			arms = matched.arms.map(pure func(arm: CheckedArm) -> CheckedArm:
+				normalized = normalize_void_exit(arm.statements, arm.body)
+				{ arm |
+					statements = normalized.statements,
+					body = normalized.exit
+				}
+			)
+			{ resolved | body = CheckedMatchBody({ matched | arms = arms }) }

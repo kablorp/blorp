@@ -1574,7 +1574,7 @@ diagnostic rendering are pure. The pipeline publishes these complete results:
    `CheckErrors` collection. The current checker stops at the first error, so
    that collection is a singleton. Failures contain closed semantic variants,
    types, owner-qualified identities, argument positions and source occurrences;
-   temporary builders do not escape. [check_render.brp](src/check/check_render.brp)
+   temporary builders do not escape. [render.brp](src/check/render.brp)
    keeps pure presentation outside the checker. Its `render_failure` produces
    every diagnostic using the failure's original parsed name authority.
    The CLI preserves the entire
@@ -1598,9 +1598,9 @@ diagnostic rendering are pure. The pipeline publishes these complete results:
    failure. Existing direct List and pure-result readiness checks retain their
    established priority.
    [check.brp](src/check/check.brp) only composes these checks and seals their result;
-   [check_model.brp](src/check/check_model.brp) owns published semantic data,
-   [check_errors.brp](src/check/check_errors.brp) owns typed rejections, and
-   [check_values.brp](src/check/check_values.brp) privately owns expression inference.
+   [model.brp](src/check/model.brp) owns published semantic data,
+   [errors.brp](src/check/errors.brp) owns typed rejections, and
+   [values.brp](src/check/values.brp) privately owns expression inference.
    Accepted record fields and variants retain their declaration identities and
    written names alongside complete field annotations, so later checking does
    not rejoin parsed declarations to recover those facts.
