@@ -336,7 +336,7 @@ Seed tests with a nonempty origin table and previously minted RHS nodes, then
 include repeated/synthetic RHS locations and nested/shared-location wrappers.
 Those inputs must still produce distinct Void IDs and owner IDs, without
 revisiting or reevaluating the RHS. Keep all other pass state fields intact.
-The existing +100 production / +320 test ceilings and cost caps apply to this
+The existing +100 production / +380 test ceilings and cost caps apply to this
 API/context plumbing; stop for review if it cannot fit them.
 
 ## Ownership authorities and wrappers
@@ -375,8 +375,10 @@ commit precede implementation; this is no permission to run compiled work.
   evaluation-normalization module. No backend, runtime or C-layout change.
   At most one additional existing production owner if identity plumbing proves
   necessary; no new index/context, pass/module/IR constructor or ownership metadata.
-- At most **+320 net handwritten test lines** across existing evaluation/Core
+- At most **+380 net handwritten test lines** across existing evaluation/Core
   owners and the runtime-memory regression. Preserve all baseline coverage.
+  The extra allowance covers scoped wrapper fixtures, getter checks isolated to
+  their emitted function, and CorePassState setup for 27 existing API callers.
   Remove only this task's rejected-candidate C-layout assertions, which no
   longer describe the revised change. Do not compress formatting to meet caps.
 - Matched unchanged-workload source-to-C allocations **<= +0.1%**, retired
