@@ -198,9 +198,13 @@ Before broad `Define(ValueDefinition)` migration, a short-lived Blorp TestSuite
 compares ordinary-definition construction/traversal with the exact proposed
 wrapper/parameter shapes through the normal host test entrypoint. Inspect
 C for managed boxes/copies/releases. Measure N=16/32/64/128, setup excluded,
-snapshots retained: record allocation/instruction deltas and projected corpus cost.
-Review before proceeding; stop if +3% looks unattainable. No production alternative
-or waiver of full matched evidence: source estimates do not prove cheap storage.
+snapshots retained: the early screen records scalar allocation/backing/raw windows.
+A separate ordinary TestSuite may use existing public compiler APIs to emit the
+probe as a library for unmodified C inspection; it never executes that artifact.
+Isolated micro retired instructions remain unavailable and must not be claimed.
+This screen cannot approve migration or waive the final hard +3% per-input
+source-to-C/shared-input allocation and retired-instruction gates. Review measured
+storage before proceeding; source estimates do not prove cheap storage.
 
 Source-based preparation estimate: lower 100–150 added/+20–40 net, own
 180–250/+50–80, verify 110–160/+20–50, emit 70–100/+10–30, plus 40–90 added/
