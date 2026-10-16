@@ -1,32 +1,39 @@
 # M5 constants: fresh producer-to-consumer plan
 
-Proposal for root and independent compiler-expert review; no implementation is
-authorized by this document. Baseline is main
+Design reviewed by root and independent compiler experts. Its original baseline is main
 `e24ca0f251fa3a7b63990141c3352df8097848f8`, plus the accepted quality contracts.
 The old `blorp2/constants` tip `cc07e5f19` is a read-only design reference:
 its obsolete namespace and unfinished expression/lowering path will not land.
 
+M5a.1's scalar/String path is accepted on the keyword/UFCS base: focused,
+mutation and cost checks pass, as does the actual-main 2894-component/452-e2e gate.
+[The scalar report](../benchmarks/results/blorp_2_scalar_constants_2026-10-16.md)
+records the evidence and scoped limits. M5a.2 and M5b remain incomplete.
+
 ## Inventory and prerequisite
 
-A preliminary source-form census finds **99 annotated declaration candidates** across
+The initial source-form census at `e24ca0f25` found **99 annotated declaration candidates** across
 34 source modules: 40 Int, 31 String, 22 ErrorText records, three Utf8Form
 records, two Span records and one SourceId. Two String constants use pipe
-multiline literals. These supersede the roadmap's stale 64/89 estimates, but
-99 is presently a source-form census, not a parser-complete inventory.
+multiline literals. These superseded the roadmap's stale 64/89 estimates;
+the source census alone was not a parser-complete inventory.
+
+The prerequisite Blorp TestSuite probe subsequently ran before production edits
+on `972ad0b12c3f8c5dc8b667fc3f1811fd1fbbea41`. It read all 34 modules: 32 parsed
+and exposed 65 classified constants; the two rejected modules were reported
+explicitly. Source audits account for 34 candidates in lex and zero in specialize,
+reconciling the historical 99 without claiming those files parsed. Refresh this
+inventory after the remaining syntax and opaque support; it is not a current
+source total. Probe SHA
+`4de10f5807c7691db456324c5629247f1e5a03303a3924a7adeb4f1be11f0e36`;
+raw log SHA `a4f4446a8444592ebd99c46d309cf1ebfe11080eb400f1302d8c9bc617a6fb86`.
+The retained probe and audits are identified in the scalar handoff.
+
 The immutable base above identifies the inspected source. Optional raw local
 census/manifests remain under ignored `build/roadmap-constants/`; this plan
 does not depend on those files to resume work.
 
-The existing `test_parse/test_source_tree.brp` approach must be extended in a
-temporary Blorp TestSuite probe to enumerate `module_contents(...).constants`
-for every accepted module, retaining first diagnostics for rejected files.
-Do not report a complete total from the accepted subset alone. Source audit
-of the two known parser gaps finds 34 candidates in `lex/lex.brp` (22 ErrorText,
-three Utf8Form, nine Int), with Char syntax later in that file; and zero in
-`specialize/specialize.brp`, whose function-type parameter is at line 487.
-The proposed parser inventory remains an explicit prerequisite before coding.
-
-**M5a** implements the 96 nonopaque shapes and the entire reference-to-runtime
+**M5a** implements the nonopaque shapes (96 in the initial inventory) and the entire reference-to-runtime
 path. **M5b depends on M4's ordinary opaque semantics** for
 `COMPILER_SOURCE: SourceId = into_opaque SourceId(COMPILER_SOURCE_NUMBER)` and
 both `INTERNAL_SPAN` constants. The Span fields reference the opaque SourceId.
@@ -195,6 +202,22 @@ it is not a third feature slice or permission for broader constructor cleanup.
    +500 net production; hard +600 net / 750 added. Tests excluding fixtures are
    estimated +1,100; fixtures +180, reported separately with actual physical counts.
    Exceeding a hard cap requires root/expert rescoping, not compressed formatting.
+
+**Reviewed record-admission preparation.** Keep one helper in
+`check/constructors.brp`: `admit_record_fields(written, span, CheckedRecord)` returns
+the existing `ResolvedLiteralField` rows in written order. Move only the existing
+known-name, duplicate and missing-field checks; use the declaration's RecordId
+and FieldIds directly. Nominal hints, generic arity, child scheduling and updates
+stay with their current owners. No new module, carrier or solver is needed.
+Root and a separate compiler expert approved this boundary. Prep hard limits are
+96 added / +24 net production lines and 3% allocations/normal instructions per
+unchanged input and host-build proxy. These count inside the combined M5a limits.
+M5a.1 uses 351 added / +259 net, leaving 399 added / +341 net before prep.
+Exact ordering, error spans/notes, reversed FieldIds, all-child-before-mismatch,
+unchanged constant rejections and a direct malformed generic-arity control must
+pass; deliberate faults must prove those oracles. Prep gets its own reviewed
+commit before the record/reference feature. Actual costs and the remaining
+feature's line estimate are unverified; stop rather than compress code to fit.
 
 Freeze the host, base/candidate inputs and binaries before any measurements.
 On every unchanged accepted/rejected input, normal minimum-of-three serial

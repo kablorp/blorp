@@ -5,6 +5,8 @@ import:
 	./model as Check
 	../utils/ids:
 		VariantId,
+		constant_number,
+		inventory_constants,
 		inventory_functions,
 		inventory_records,
 		inventory_unions,
@@ -19,12 +21,12 @@ import:
 	../namespace/namespace:
 		builtin_head,
 		Conflict,
-		Entity(Function, Constructor, Type, Alias),
+		Entity(Function, Constant, Constructor, Type, Alias),
 		NamespaceProblem(NameConflict, SelectionFailure),
 		Origin(Declared, Imported, Implicit),
-		SelectionProblem(NotOffered, AlreadyFromPrelude, AlreadyImported, Ambiguous, BareConstructor, NotAConstructor, ReceiverNotVisible),
+		SelectionProblem(NotOffered, AlreadyFromPrelude, AlreadyImported, AmbiguousFunction, AmbiguousConstant, BareConstructor, NotAConstructor, ReceiverNotVisible),
 		TypeHead(UnionHead, RecordHead),
-		ValueBinding(FunctionName, ConstructorName, ModuleAliasName),
+		ValueBinding(FunctionName, ConstantName, ConstructorName, ModuleAliasName),
 		Unoffered(UnknownName, PrivateName, ImportedThere, ProvidedThere),
 		same_head,
 	option: to_result
@@ -62,6 +64,8 @@ private pure func invariant_message(invariant: Errors.CheckerInvariant) -> Strin
 	match invariant:
 		Errors.InvalidRecordDeclaration(_):
 			"invalid record declaration"
+		Errors.InvalidConstantDeclaration(_):
+			"invalid constant declaration"
 		Errors.InvalidResolvedFunction(_):
 			"invalid resolved function identity"
 		Errors.InvalidUnionDeclaration(_):
@@ -178,6 +182,8 @@ pure func render_check_error(program: ParsedProgram, error: Errors.CheckError) -
 			render_builtin_error(error.span, rejection)
 		Errors.CallRejection(rejection):
 			render_call_error(error.span, rejection, context)
+		Errors.ConstantRejection(rejection):
+			render_constant_error(error.span, rejection, context)
 		Errors.MethodRejection(rejection):
 			render_method_error(error.span, rejection, context)
 		Errors.ConstructorRejection(rejection):
@@ -198,6 +204,20 @@ pure func render_check_error(program: ParsedProgram, error: Errors.CheckError) -
 			render_fault(error.span, invariant)
 
 
+private pure func render_constant_error(span: Span, rejection: Errors.ConstantError, context: ParsedContents) -> Diagnostic:
+	match rejection:
+		Errors.NonClosedInitializer:
+			rendered(span, "constant initializer is not a closed value", "use an Int, Float, or String literal")
+		Errors.ConstantCalled(id):
+			spelling = inventory_constants(context.declarations).get(constant_number(id))
+				.to_result(render_fault(span, Errors.InvalidConstantDeclaration(id)))
+				.and_then(pure func(row): parsed_spelling(row.declaration.name.id, context.names, span))
+			match spelling:
+				Err(error): error
+				Ok(name): rendered(span, "constant '".concat(name).concat("' cannot be called"),
+					"read the constant without parentheses, such as ".concat(name))
+
+
 -- Each form names itself and the milestone that lands it.
 private pure func render_unsupported_form(span: Span, form: Errors.UnsupportedForm) -> Diagnostic:
 	match form:
@@ -207,8 +227,6 @@ private pure func render_unsupported_form(span: Span, form: Errors.UnsupportedFo
 			rendered(span, "into_opaque is not supported yet", "construct the underlying value directly; opaque types arrive with the recursive-types milestone")
 		Errors.FromOpaque:
 			rendered(span, "from_opaque is not supported yet", "read the underlying value directly; opaque types arrive with the recursive-types milestone")
-		Errors.ModuleConstant:
-			rendered(span, "module constants are not supported yet", "return the value from a function; constants arrive with the constants milestone")
 		Errors.LocalAnnotation:
 			rendered(span, "binding type annotations are not supported yet", "remove the annotation; the binding's type is inferred from its initializer until the join milestone")
 		Errors.RangeValue:
@@ -325,6 +343,7 @@ private pure func render_namespace_problem(span: Span, problem: NamespaceProblem
 private pure func entity_noun(entity: Entity) -> String:
 	match entity:
 		Function(_): "function"
+		Constant(_): "constant"
 		Constructor(_): "constructor"
 		Type(_): "type"
 		Alias(_): "module alias"
@@ -335,6 +354,10 @@ private pure func same_kind(left: Entity, right: Entity) -> Bool:
 		Function(_):
 			match right:
 				Function(_): True
+				_: False
+		Constant(_):
+			match right:
+				Constant(_): True
 				_: False
 		Constructor(_):
 			match right:
@@ -362,7 +385,7 @@ private pure func render_conflict(span: Span, conflict: Conflict, context: Parse
 			previous = entity_noun(conflict.previous.entity)
 			alias_previous = match conflict.previous.entity:
 				Alias(_): True
-				Function(_) | Constructor(_) | Type(_): False
+				Function(_) | Constant(_) | Constructor(_) | Type(_): False
 			message = match conflict.previous.origin:
 				Implicit:
 					name.concat(" is provided by the prelude")
@@ -378,7 +401,7 @@ private pure func render_conflict(span: Span, conflict: Conflict, context: Parse
 						incoming.concat(" name conflicts with a ").concat(previous)
 			alias_incoming = match conflict.incoming.entity:
 				Alias(_): True
-				Function(_) | Constructor(_) | Type(_): False
+				Function(_) | Constant(_) | Constructor(_) | Type(_): False
 			help = match conflict.incoming.origin:
 				Declared(_):
 					match conflict.previous.origin:
@@ -416,6 +439,10 @@ private pure func declaration_span(entity: Entity, context: ParsedContents) -> O
 			match inventory_functions(context.declarations).get(function_number(id)):
 				Some(row): found = Some(row.declaration.function_name.span)
 				None: void
+		Constant(id):
+			match inventory_constants(context.declarations).get(constant_number(id)):
+				Some(row): found = Some(row.declaration.name.span)
+				None: void
 		Constructor(id):
 			match inventory_unions(context.declarations).get(union_number(variant_owner(id))):
 				Some(row):
@@ -444,7 +471,7 @@ private pure func declaration_span(entity: Entity, context: ParsedContents) -> O
 private pure func methods_hint(entity: Entity, name: String, module: String) -> String:
 	match entity:
 		Type(_): ", or write ".concat(module).concat(": ").concat(name).concat(" methods_only to use the functions ").concat(module).concat(" declares on ").concat(name)
-		Function(_) | Constructor(_) | Alias(_): ""
+		Function(_) | Constant(_) | Constructor(_) | Alias(_): ""
 
 
 -- A selection that binds nothing, named by the target's written path.
@@ -475,7 +502,7 @@ private pure func render_selection(span: Span, path: ModulePath, selection: Impo
 									match type_spelling(Check.UnionType(variant_owner(id)), context, span):
 										Err(error): Err(error)
 										Ok(union_name): Ok("import the union from the module that declares it, selecting ".concat(union_name).concat("(").concat(name).concat(")"))
-								Function(_) | Type(_) | Alias(_):
+								Function(_) | Constant(_) | Type(_) | Alias(_):
 									Ok("import ".concat(name).concat(" from the module that declares it").concat(methods_hint(entity, name, module)))
 							match help:
 								Err(error): error
@@ -489,8 +516,10 @@ private pure func render_selection(span: Span, path: ModulePath, selection: Impo
 							rendered(span, name.concat(" is already in scope through the prelude"), "remove ".concat(name).concat(" from this selection").concat(methods_hint(entity, name, module)))
 						AlreadyImported(entity):
 							rendered(span, name.concat(" is already imported, and ").concat(module).concat(" does not declare it"), "remove ".concat(name).concat(" from this selection").concat(methods_hint(entity, name, module)))
-						Ambiguous:
-							rendered(span, "import selection names both a type and a function", "rename the type or the function in ".concat(module).concat("; a bare selection names one declaration"))
+						AmbiguousFunction:
+							ambiguous_selection(span, module, "function")
+						AmbiguousConstant:
+							ambiguous_selection(span, module, "constant")
 						BareConstructor(variant):
 							match type_spelling(Check.UnionType(variant_owner(variant)), context, span):
 								Err(error): error
@@ -500,6 +529,14 @@ private pure func render_selection(span: Span, path: ModulePath, selection: Impo
 							rendered(span, "constructor does not belong to the selected union", "select a constructor declared inside that union")
 						ReceiverNotVisible:
 							rendered(span, "method receiver type is not independently visible", "import the exact type with an ordinary type selection before using methods_only")
+
+
+private pure func ambiguous_selection(span: Span, module: String, kind: String) -> Diagnostic:
+	rendered(
+		span,
+		"import selection names both a type and a ".concat(kind),
+		"rename the type or the ".concat(kind).concat(" in ").concat(module).concat("; a bare selection names one declaration"),
+	)
 
 
 private pure func render_type_declaration_error(
@@ -1044,6 +1081,7 @@ private pure func render_binding_error(span: Span, rejection: Errors.BindingErro
 		Errors.ModuleBindingConflict(previous):
 			match previous:
 				FunctionName(name): binding_conflict(span, name.id, "function", "module", name.span, context)
+				ConstantName(name): binding_conflict(span, name.id, "constant", "module", name.span, context)
 				ConstructorName(name): binding_conflict(span, name.id, "constructor", "module", name.span, context)
 				ModuleAliasName(name): binding_conflict(span, name.id, "module alias", "module", name.span, context)
 		Errors.LocalBindingConflict(previous, origin):

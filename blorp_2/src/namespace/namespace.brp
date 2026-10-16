@@ -14,8 +14,8 @@ offer and the scopes being built stay private to this module.
 ---
 import:
 	../utils/ids:
-		FunctionId, FunctionRow, RecordId, UnionId, UnionRow, VariantId,
-		function_number, inventory_functions, next_nominal, record_number,
+		ConstantId, ConstantRow, FunctionId, FunctionRow, RecordId, UnionId, UnionRow, VariantId,
+		constant_number, function_number, inventory_constants, inventory_functions, next_nominal, record_number,
 		union_number, variant_number, variant_owner,
 		NominalRow(UnionDeclarationRow, RecordDeclarationRow),
 	int as IntOps
@@ -54,6 +54,7 @@ fixed record AliasedModule {
 -- What a written name denotes in a module.
 fixed union Entity:
 	Function(FunctionId)
+	Constant(ConstantId)
 	Constructor(VariantId)
 	Type(TypeHead)
 	Alias(AliasedModule)
@@ -77,6 +78,7 @@ fixed record NamedType {
 -- A value-space name already claimed in this module, with its original site.
 fixed union ValueBinding:
 	FunctionName(WrittenName)
+	ConstantName(WrittenName)
 	ConstructorName(WrittenName)
 	ModuleAliasName(WrittenName)
 
@@ -90,7 +92,7 @@ fixed record Entry {
 }
 
 
--- A module's two name spaces: values (functions and constructors) and types.
+-- A module's two name spaces: values (functions, constants, constructors) and types.
 -- A module alias claims its spelling in both.
 private fixed union Space:
 	Values
@@ -128,7 +130,8 @@ fixed union SelectionProblem:
 	NotOffered(Unoffered)
 	AlreadyFromPrelude(Entity)
 	AlreadyImported(Entity)
-	Ambiguous
+	AmbiguousFunction
+	AmbiguousConstant
 	BareConstructor(VariantId)
 	NotAConstructor(WrittenName)
 	ReceiverNotVisible
@@ -169,6 +172,7 @@ fixed union FunctionSource:
 -- What a name denotes in the value space.
 fixed union NamedValue:
 	NamedFunction(FunctionId, FunctionSource)
+	NamedConstant(ConstantId)
 	NamedConstructor(VariantId)
 	NamedAlias(AliasedModule)
 
@@ -176,6 +180,7 @@ fixed union NamedValue:
 -- What a module offers importers in the value space: never an alias.
 fixed union OfferedValue:
 	OfferedFunction(FunctionId)
+	OfferedConstant(ConstantId)
 	OfferedConstructor(VariantId)
 
 
@@ -219,6 +224,10 @@ private pure func same_entity(left: Entity, right: Entity) -> Bool:
 		Function(first):
 			match right:
 				Function(second): IntOps.equals(function_number(first), function_number(second))
+				_: False
+		Constant(first):
+			match right:
+				Constant(second): IntOps.equals(constant_number(first), constant_number(second))
 				_: False
 		Constructor(first):
 			match right:
@@ -284,7 +293,7 @@ private pure func first_problem(found: Option[NamespaceProblem], later: Namespac
 -- What `names` already holds in a space that `entity` named `name` claims.
 private pure func claimant(names: IntMaps.IntMap[Entry], name: NameId, entity: Entity) -> Option[Entry]:
 	match entity:
-		Function(_) | Constructor(_):
+		Function(_) | Constant(_) | Constructor(_):
 			holder(names, Values, name)
 		Type(_):
 			holder(names, Types, name)
@@ -295,8 +304,8 @@ private pure func claimant(names: IntMaps.IntMap[Entry], name: NameId, entity: E
 
 
 -- `names` with `incoming` in each space it claims. This is a scope's only
--- writer, so a value key never holds a type, a type key never holds a function
--- or constructor, and an alias, entered only by `import_row`, is always
+-- writer, so a value key never holds a type, a type key never holds a function,
+-- constant or constructor, and an alias, entered only by `import_row`, is always
 -- `Imported`. The arms that read those states (in `named_value`, `named_type`,
 -- `offered_value`, `offered_type`, `select_methods` and render) are
 -- unreachable. Typed per-space entries would remove them, but measured they
@@ -305,7 +314,7 @@ private pure func claimant(names: IntMaps.IntMap[Entry], name: NameId, entity: E
 private pure func claimed(names: IntMaps.IntMap[Entry], incoming: Entry) -> IntMaps.IntMap[Entry]:
 	name = incoming.name.id
 	match incoming.entity:
-		Function(_) | Constructor(_):
+		Function(_) | Constant(_) | Constructor(_):
 			IntMaps.set(names, space_key(Values, name), incoming)
 		Type(_):
 			IntMaps.set(names, space_key(Types, name), incoming)
@@ -340,7 +349,7 @@ private pure func offer(found: Option[Entry]) -> Result[Entity, Unoffered]:
 		Some(entry):
 			match entry.entity:
 				Alias(_): Err(UnknownName)
-				Function(_) | Constructor(_) | Type(_):
+				Function(_) | Constant(_) | Constructor(_) | Type(_):
 					match entry.origin:
 						Declared(Public): Ok(entry.entity)
 						Declared(Private(_)): Err(PrivateName)
@@ -385,12 +394,14 @@ private pure func written_before(nominal: NominalRow, function: Option[FunctionR
 -- Builtin types come first: the base owns them, so a union or record that
 -- reuses a builtin's name is the one reported. Assembly appends each kind's
 -- rows grouped by module in module order, so one cursor per kind reads each
--- row once; the module's next nominal declaration and next function are
+-- row once; its next nominal declaration, function and constant are
 -- taken in the order they are written.
 private pure func declared_entries(parsed: ParsedContents) -> List[List[Entry]]:
 	functions = inventory_functions(parsed.declarations)
+	constants = inventory_constants(parsed.declarations)
 	var builtins_seen = 0
 	var functions_seen = 0
+	var constants_seen = 0
 	var records_seen = 0
 	var unions_seen = 0
 	var declared: List[List[Entry]] = []
@@ -424,21 +435,40 @@ private pure func declared_entries(parsed: ParsedContents) -> List[List[Entry]]:
 						None
 				None:
 					None
-			match nominal:
-				Some(UnionDeclarationRow(union_row)):
-					entries = with_union(entries, union_row)
-					unions_seen = IntOps.add(unions_seen, 1)
-				Some(RecordDeclarationRow(record_row)):
-					declaration = record_row.declaration
-					entries = entries.append({ name = declaration.type_name, entity = Type(RecordHead(record_row.id)), origin = Declared(declaration.visibility) })
-					records_seen = IntOps.add(records_seen, 1)
+			constant: Option[ConstantRow] = match constants.get(constants_seen):
+				Some(candidate):
+					before_function = match function:
+						Some(next): IntOps.less_than(candidate.declaration.name.span.start, next.declaration.function_name.span.start)
+						None: True
+					before_nominal = match nominal:
+						Some(next): IntOps.less_than(candidate.declaration.name.span.start, nominal_start(next))
+						None: True
+					if same_module(candidate.declaration.module, row.module) and before_function and before_nominal:
+						Some(candidate)
+					else:
+						None
+				None: None
+			match constant:
+				Some(constant_row):
+					declaration = constant_row.declaration
+					entries = entries.append({ name = declaration.name, entity = Constant(constant_row.id), origin = Declared(declaration.visibility) })
+					constants_seen = IntOps.add(constants_seen, 1)
 				None:
-					match function:
-						Some(function_row):
-							entries = entries.append({ name = function_row.declaration.function_name, entity = Function(function_row.id), origin = Declared(function_row.declaration.visibility) })
-							functions_seen = IntOps.add(functions_seen, 1)
+					match nominal:
+						Some(UnionDeclarationRow(union_row)):
+							entries = with_union(entries, union_row)
+							unions_seen = IntOps.add(unions_seen, 1)
+						Some(RecordDeclarationRow(record_row)):
+							declaration = record_row.declaration
+							entries = entries.append({ name = declaration.type_name, entity = Type(RecordHead(record_row.id)), origin = Declared(declaration.visibility) })
+							records_seen = IntOps.add(records_seen, 1)
 						None:
-							reading = False
+							match function:
+								Some(function_row):
+									entries = entries.append({ name = function_row.declaration.function_name, entity = Function(function_row.id), origin = Declared(function_row.declaration.visibility) })
+									functions_seen = IntOps.add(functions_seen, 1)
+								None:
+									reading = False
 		declared = declared.append(entries)
 	declared
 
@@ -450,7 +480,7 @@ private pure func provided(prelude: ModuleScope) -> List[Entry]:
 	for entry in IntMaps.values(prelude.names):
 		match entry.entity:
 			Alias(_): void
-			Function(_) | Constructor(_) | Type(_):
+			Function(_) | Constant(_) | Constructor(_) | Type(_):
 				match entry.origin:
 					Imported: entries = entries.append({ entry | origin = Implicit })
 					Declared(_) | Implicit: void
@@ -549,7 +579,7 @@ private pure func more_specific(value_reason: SelectionProblem, type_reason: Sel
 				_: type_reason
 
 
--- A bare name selects the target's public function or public type of that
+-- A bare name selects the target's public value or public type of that
 -- name; both make it ambiguous, and a public constructor is named with its
 -- union.
 private pure func bare_selection(target: ModuleScope, name: NameId) -> Result[Entity, SelectionProblem]:
@@ -563,7 +593,12 @@ private pure func bare_selection(target: ModuleScope, name: NameId) -> Result[En
 	match value:
 		Ok(selected):
 			match selected_type:
-				Ok(_): Err(Ambiguous)
+				Ok(_):
+					match selected:
+						Function(_): Err(AmbiguousFunction)
+						Constant(_): Err(AmbiguousConstant)
+						Constructor(variant): Err(BareConstructor(variant))
+						Type(_) | Alias(_): Err(NotOffered(UnknownName))
 				Err(_): Ok(selected)
 		Err(value_reason):
 			match selected_type:
@@ -578,7 +613,7 @@ private pure func bind(built: BuiltScope, request: ModuleImport, name: WrittenNa
 	match entity:
 		Type(receiver):
 			{ entered | methods = entered.methods.append({ target = request.target, receiver = receiver, name = name }) }
-		Function(_) | Constructor(_) | Alias(_):
+		Function(_) | Constant(_) | Constructor(_) | Alias(_):
 			entered
 
 
@@ -686,6 +721,7 @@ pure func named_value(namespace: Namespace, module: ModuleId, name: NameId) -> O
 						Declared(_): DeclaredHere
 						Imported | Implicit: ImportedAt(entry.name.span)
 					Some(NamedFunction(id, source))
+				Constant(id): Some(NamedConstant(id))
 				Constructor(variant): Some(NamedConstructor(variant))
 				Alias(aliased): Some(NamedAlias(aliased))
 				Type(_): None
@@ -700,6 +736,7 @@ pure func value_binding(namespace: Namespace, module: ModuleId, name: NameId) ->
 		Some(entry):
 			match entry.entity:
 				Function(_): Some(FunctionName(entry.name))
+				Constant(_): Some(ConstantName(entry.name))
 				Constructor(_): Some(ConstructorName(entry.name))
 				Alias(_): Some(ModuleAliasName(entry.name))
 				Type(_): None
@@ -712,15 +749,16 @@ pure func named_type(namespace: Namespace, module: ModuleId, name: NameId) -> Op
 		Some(entry):
 			match entry.entity:
 				Type(head): Some({ head = head, origin = entry.origin })
-				Function(_) | Constructor(_) | Alias(_): None
+				Function(_) | Constant(_) | Constructor(_) | Alias(_): None
 		None:
 			None
 
 
--- The function or constructor `target` offers as `name`: `A.f` and `A.Some`.
+-- The function, constant or constructor `target` offers as `name`.
 pure func offered_value(namespace: Namespace, target: ModuleId, name: NameId) -> Result[OfferedValue, Unoffered]:
 	match offer(held_in(namespace, target, Values, name)):
 		Ok(Function(id)): Ok(OfferedFunction(id))
+		Ok(Constant(id)): Ok(OfferedConstant(id))
 		Ok(Constructor(variant)): Ok(OfferedConstructor(variant))
 		Ok(_): Err(UnknownName)
 		Err(reason): Err(reason)

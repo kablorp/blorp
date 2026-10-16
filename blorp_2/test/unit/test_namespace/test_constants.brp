@@ -1,0 +1,179 @@
+import:
+	../../../src/namespace/namespace:
+		Entity(Function, Constant), Namespace,
+		NamedValue(NamedConstant, NamedAlias), OfferedValue(OfferedConstant),
+		NamespaceProblem(NameConflict, SelectionFailure),
+		SelectionProblem(AmbiguousConstant, AmbiguousFunction, NotOffered),
+		Unoffered(PrivateName, ImportedThere), ValueBinding(ConstantName),
+		build_namespace, method_imports, named_value, offered_value, value_binding,
+	../../../src/parse/assemble: ParsedProgram, parsed_contents
+	../../../src/parse/parse: ImportSelection(NamedSelection), selection_name
+	../../../src/utils/ids: constant_number, function_number, inventory_constants
+	../../../src/utils/source: module_id, module_source, root_module_id, same_module, same_source
+	../../../src/utils/syntax: same_span
+	../module_input: ModuleInput, parse_modules
+	test: TestSuite
+
+
+private MAIN: String = "func main() -> Int:\n    0\n"
+
+
+private fixed record ScopedInput {
+	program: ParsedProgram,
+	namespace: Namespace
+}
+
+
+private pure func scoped(inputs: List[ModuleInput]) -> Option[ScopedInput]:
+	match parse_modules(inputs):
+		Err(_): None
+		Ok(program):
+			match build_namespace(program):
+				Err(_): None
+				Ok(namespace): Some({ program = program, namespace = namespace })
+
+
+private pure func problem(inputs: List[ModuleInput]) -> Option[NamespaceProblem]:
+	match parse_modules(inputs):
+		Err(_): None
+		Ok(program):
+			match build_namespace(program):
+				Err(rejection): Some(rejection)
+				Ok(_): None
+
+
+pure func test_selected_and_qualified_names_preserve_one_constant_identity() -> Bool:
+	root: String =
+		|import:
+		|    ./answer as Answers: ANSWER
+		|func main() -> Int:
+		|    0
+		|
+	match scoped([{ source = root, targets = [1] }, { source = "ANSWER: Int = 23\n", targets = [] }]):
+		None: False
+		Some(input):
+			contents = parsed_contents(input.program)
+			match (inventory_constants(contents.declarations), contents.modules):
+				([row], [module, _, _, _]):
+					match module.imports:
+						[request]:
+							match (request.module_alias, request.symbols):
+								(Some(module_alias), [NamedSelection(selected)]):
+									match (named_value(input.namespace, root_module_id(), row.declaration.name.id), named_value(input.namespace, root_module_id(), module_alias.id)):
+										(Some(NamedConstant(direct)), Some(NamedAlias(qualified))):
+											match (offered_value(input.namespace, qualified.target, row.declaration.name.id), value_binding(input.namespace, root_module_id(), selected.id)):
+												(Ok(OfferedConstant(offered)), Some(ConstantName(previous))):
+													(
+														constant_number(direct) == constant_number(row.id)
+														and constant_number(offered) == constant_number(row.id)
+														and same_span(previous.span, selected.span)
+														and same_source(previous.span.source, module_source(root_module_id()))
+														and method_imports(input.namespace, root_module_id()).all(pure func(method): not same_module(method.target, qualified.target))
+													)
+												_: False
+										_: False
+								_: False
+						_: False
+				_: False
+
+
+pure func test_constant_type_selection_is_a_precise_constant_ambiguity() -> Bool:
+	root = "import:\n    ./answer: Shared\n" + MAIN
+	leaf: String =
+		|fixed record Shared { value: Int }
+		|Shared: Int = 23
+		|
+	match problem([{ source = root, targets = [1] }, { source = leaf, targets = [] }]):
+		Some(SelectionFailure(_, selection, AmbiguousConstant)):
+			at = selection_name(selection).span
+			(
+				at.start == "import:\n    ./answer: ".length()
+				and at.end == "import:\n    ./answer: Shared".length()
+				and same_source(at.source, module_source(root_module_id()))
+			)
+		_: False
+
+
+pure func test_existing_function_type_ambiguity_stays_distinct() -> Bool:
+	root = "import:\n    ./answer: Shared\n" + MAIN
+	leaf: String =
+		|fixed record Shared { value: Int }
+		|pure func Shared() -> Int:
+		|    23
+		|
+	match problem([{ source = root, targets = [1] }, { source = leaf, targets = [] }]):
+		Some(SelectionFailure(_, _, AmbiguousFunction)): True
+		_: False
+
+
+pure func test_constant_before_function_preserves_conflict_order() -> Bool:
+	source = "ANSWER: Int = 23\nfunc ANSWER() -> Int:\n    17\n" + MAIN
+	match problem([{ source = source, targets = [] }]):
+		Some(NameConflict(conflict)):
+			match (conflict.previous.entity, conflict.incoming.entity):
+				(Constant(previous), Function(incoming)):
+					(
+						constant_number(previous) == 0 and function_number(incoming) == 0
+						and conflict.previous.name.span.start == 0
+						and conflict.incoming.name.span.start == "ANSWER: Int = 23\nfunc ".length()
+					)
+				_: False
+		_: False
+
+
+pure func test_function_before_constant_preserves_conflict_order() -> Bool:
+	source = "func ANSWER() -> Int:\n    17\nANSWER: Int = 23\n" + MAIN
+	match problem([{ source = source, targets = [] }]):
+		Some(NameConflict(conflict)):
+			match (conflict.previous.entity, conflict.incoming.entity):
+				(Function(previous), Constant(incoming)):
+					(
+						function_number(previous) == 0 and constant_number(incoming) == 0
+						and conflict.previous.name.span.start == "func ".length()
+						and conflict.incoming.name.span.start == "func ANSWER() -> Int:\n    17\n".length()
+					)
+				_: False
+		_: False
+
+
+pure func test_private_constant_is_not_offered() -> Bool:
+	root = "import:\n    ./answer as Answers\n" + MAIN
+	match (scoped([{ source = root, targets = [1] }, { source = "private ANSWER: Int = 23\n", targets = [] }]), module_id(1)):
+		(Some(input), Some(target)):
+			match inventory_constants(parsed_contents(input.program).declarations):
+				[row]:
+					match offered_value(input.namespace, target, row.declaration.name.id):
+						Err(PrivateName): True
+						_: False
+				_: False
+		_: False
+
+
+pure func test_imported_constant_is_not_reexported() -> Bool:
+	inputs = [
+		{ source = "import:\n    ./facade: ANSWER\n" + MAIN, targets = [1] },
+		{ source = "import:\n    ./answer: ANSWER\n", targets = [2] },
+		{ source = "ANSWER: Int = 23\n", targets = [] },
+	]
+	match problem(inputs):
+		Some(SelectionFailure(_, selection, NotOffered(ImportedThere(Constant(id))))):
+			(
+				constant_number(id) == 0
+				and selection_name(selection).span.start == "import:\n    ./facade: ".length()
+				and same_source(selection_name(selection).span.source, module_source(root_module_id()))
+			)
+		_: False
+
+
+tests: TestSuite = {
+	description = "Blorp 2 constant namespace authority",
+	tests = [
+		("selected and qualified constants retain identity and occurrence", test_selected_and_qualified_names_preserve_one_constant_identity),
+		("constant and type selection reports constant ambiguity", test_constant_type_selection_is_a_precise_constant_ambiguity),
+		("function and type ambiguity remains distinct", test_existing_function_type_ambiguity_stays_distinct),
+		("constant before function preserves conflict order", test_constant_before_function_preserves_conflict_order),
+		("function before constant preserves conflict order", test_function_before_constant_preserves_conflict_order),
+		("private constant is not offered", test_private_constant_is_not_offered),
+		("imported constant is not reexported", test_imported_constant_is_not_reexported),
+	]
+}

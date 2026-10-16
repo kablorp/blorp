@@ -1,0 +1,149 @@
+import:
+	../../../src/check/check: check, check_errors
+	../../../src/check/errors as Errors
+	../../../src/check/render: render_failure
+	../../../src/utils/ids: constant_number
+	../../../src/utils/source: module_source, root_module_id, same_source
+	../../../src/utils/syntax: same_span
+	../module_input: ModuleInput, parse_modules
+	test: TestSuite
+
+
+private MAIN: String = "func main() -> Int:\n    0\n"
+
+
+private pure func rejects(
+	inputs: List[ModuleInput], start: Int, length: Int,
+	kind: pure (Errors.CheckErrorKind) -> Bool, message: String, help: String,
+) -> Bool:
+	match parse_modules(inputs):
+		Err(_): False
+		Ok(parsed):
+			match check(parsed):
+				Ok(_): False
+				Err(failure):
+					error = check_errors(failure).first
+					rendered = render_failure(failure).first
+					(kind(error.kind) and error.span.start == start and error.span.end == start + length
+						and same_source(error.span.source, module_source(root_module_id()))
+						and same_span(rendered.span, error.span) and rendered.note.is_none()
+						and rendered.message == message and rendered.help == help
+						and check_errors(failure).remaining.is_empty() and render_failure(failure).remaining.is_empty())
+
+
+private pure func nonclosed(prefix: String, expression: String) -> Bool:
+	match_kind = pure func(kind: Errors.CheckErrorKind) -> Bool:
+		match kind:
+			Errors.ConstantRejection(Errors.NonClosedInitializer): True
+			_: False
+	rejects([{ source = prefix + expression + "\n" + MAIN, targets = [] }], prefix.length(), expression.length(),
+		match_kind,
+		"constant initializer is not a closed value", "use an Int, Float, or String literal")
+
+
+pure func test_call_is_rejected_without_resolving_the_callee() -> Bool:
+	nonclosed("BAD: Int = ", "missing()")
+
+
+pure func test_grouped_call_rejects_the_complete_written_expression() -> Bool:
+	nonclosed("BAD: Int = ", "(missing())")
+
+
+pure func test_reference_waits_for_the_dependency_increment() -> Bool:
+	nonclosed("ANSWER: Int = 23\nBAD: Int = ", "ANSWER")
+
+
+pure func test_record_waits_for_the_record_increment() -> Bool:
+	nonclosed("fixed record Cell { value: Int }\nBAD: Cell = ", "{ value = 23 }")
+
+
+pure func test_list_is_not_a_scalar_initializer() -> Bool:
+	nonclosed("BAD: List[Int] = ", "[23]")
+
+
+pure func test_postfix_is_not_a_closed_literal() -> Bool:
+	nonclosed("BAD: Int = ", "23.missing()")
+
+
+pure func test_unused_bad_annotation_is_checked_before_any_initializer() -> Bool:
+	prefix: String =
+		|BAD: Int = missing()
+		|UNUSED:
+	prefix_with_space = prefix + " "
+	match_kind = pure func(kind: Errors.CheckErrorKind) -> Bool:
+		match kind:
+			Errors.TypeTermRejection(Errors.UnknownType(_)): True
+			_: False
+	rejects([{ source = prefix_with_space + "Missing = 23\n" + MAIN, targets = [] }], prefix_with_space.length(), 7,
+		match_kind,
+		"unknown type", "declare or import this type; builtin types and declared type parameters are also available")
+
+
+pure func test_unused_wrong_scalar_keeps_the_annotation_error() -> Bool:
+	prefix = "UNUSED: Int = "
+	match_kind = pure func(kind: Errors.CheckErrorKind) -> Bool:
+		match kind:
+			Errors.ValueRejection(Errors.ExpressionTypeMismatch(mismatch)):
+				match mismatch.expected_site:
+					Errors.SourceAnnotation(_): True
+					_: False
+			_: False
+	rejects([{ source = prefix + "\"wrong\"\n" + MAIN, targets = [] }], prefix.length(), 7,
+		match_kind,
+		"expression does not match the expected type", "use an expression of type Int here")
+
+
+private pure func called(inputs: List[ModuleInput], prefix: String) -> Bool:
+	match_kind = pure func(kind: Errors.CheckErrorKind) -> Bool:
+		match kind:
+			Errors.ConstantRejection(Errors.ConstantCalled(id)): constant_number(id) == 0
+			_: False
+	rejects(inputs, prefix.length(), 6,
+		match_kind,
+		"constant 'ANSWER' cannot be called", "read the constant without parentheses, such as ANSWER")
+
+
+pure func test_constant_called_uses_declaration_identity() -> Bool:
+	prefix = "ANSWER: Int = 23\nfunc main() -> Int:\n    "
+	called([{ source = prefix + "ANSWER()\n", targets = [] }], prefix)
+
+
+pure func test_qualified_constant_called_highlights_the_member() -> Bool:
+	prefix: String =
+		|import:
+		|    ./answer as Config
+		|func main() -> Int:
+		|    Config.
+	called([
+		{ source = prefix + "ANSWER()\n", targets = [1] },
+		{ source = "ANSWER: Int = 23\n", targets = [] },
+	], prefix)
+
+
+pure func test_public_constant_cannot_expose_a_private_type() -> Bool:
+	prefix = "private fixed record Secret { value: Int }\nVALUE: "
+	match_kind = pure func(kind: Errors.CheckErrorKind) -> Bool:
+		match kind:
+			Errors.TypeTermRejection(Errors.PrivateTypeInPublicDeclaration(_, _)): True
+			_: False
+	rejects([{ source = prefix + "Secret = 23\n" + MAIN, targets = [] }], prefix.length(), 6,
+		match_kind,
+		"Secret is private but appears in public declaration VALUE", "make Secret public, or make VALUE private")
+
+
+tests: TestSuite = {
+	description = "Constant annotation and closed initializer diagnostics",
+	tests = [
+		("initializer calls are rejected without callee resolution", test_call_is_rejected_without_resolving_the_callee),
+		("grouped nonclosed initializer keeps its full span", test_grouped_call_rejects_the_complete_written_expression),
+		("initializer references remain outside the scalar increment", test_reference_waits_for_the_dependency_increment),
+		("record initializers remain outside the scalar increment", test_record_waits_for_the_record_increment),
+		("List is not a scalar initializer", test_list_is_not_a_scalar_initializer),
+		("postfix is not a closed literal", test_postfix_is_not_a_closed_literal),
+		("all annotations precede any initializer", test_unused_bad_annotation_is_checked_before_any_initializer),
+		("unused constants retain annotation mismatch", test_unused_wrong_scalar_keeps_the_annotation_error),
+		("direct constant call carries declaration identity", test_constant_called_uses_declaration_identity),
+		("qualified constant call highlights the member", test_qualified_constant_called_highlights_the_member),
+		("public constant respects private type access", test_public_constant_cannot_expose_a_private_type),
+	]
+}

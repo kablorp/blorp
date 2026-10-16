@@ -1,0 +1,76 @@
+import:
+	../../../src/check/constants: validate_constants
+	../../../src/check/errors as Errors
+	../../../src/check/model as Model
+	../../../src/namespace/namespace: build_namespace
+	../../../src/parse/assemble: parsed_contents
+	../../../src/utils/ids: constant_number, inventory_constants
+	../../../src/utils/syntax: same_span
+	../module_input: parse_modules
+	test: TestSuite
+
+
+pure func test_admission_publishes_complete_dense_rows_from_parser_literals() -> Bool:
+	source: String =
+		|MINIMUM: Int = -9223372036854775808
+		|MAXIMUM: Int = 9223372036854775807
+		|NUMBER: Float = 1.25
+		|TEXT: String = "hello λ"
+		|func main() -> Int:
+		|    0
+		|
+	match parse_modules([{ source = source, targets = [] }]):
+		Err(_): False
+		Ok(program):
+			parsed = parsed_contents(program)
+			match build_namespace(program):
+				Err(_): False
+				Ok(namespace):
+					match validate_constants(parsed, namespace):
+						Err(_): False
+						Ok(rows):
+							match (rows, inventory_constants(parsed.declarations)):
+								([minimum, maximum, number, text], [first, _, _, _]):
+									match (minimum.value, maximum.value, number.value, text.value):
+										(Model.IntegerConstant(low), Model.IntegerConstant(high), Model.FloatConstant(decimal), Model.StringConstant(bytes)):
+											(low == -9223372036854775808 and high == 9223372036854775807 and decimal == 1.25 and bytes == "hello λ"
+												and rows.map(pure func(row): constant_number(row.id)) == [0, 1, 2, 3]
+												and constant_number(first.id) == constant_number(minimum.id)
+												and Model.same_type(minimum.value_type.value_type, Model.IntType)
+												and Model.same_type(number.value_type.value_type, Model.FloatType)
+												and Model.same_type(text.value_type.value_type, Model.StringType))
+										_: False
+								_: False
+
+
+pure func test_private_annotation_is_allowed_to_reach_ordinary_value_checking() -> Bool:
+	source: String =
+		|private fixed record Secret { value: Int }
+		|private VALUE: Secret = 23
+		|func main() -> Int:
+		|    0
+		|
+	match parse_modules([{ source = source, targets = [] }]):
+		Err(_): False
+		Ok(program):
+			match build_namespace(program):
+				Err(_): False
+				Ok(namespace):
+					match validate_constants(parsed_contents(program), namespace):
+						Err(error):
+							match error.kind:
+								Errors.ValueRejection(Errors.ExpressionTypeMismatch(mismatch)):
+									match (mismatch.expected, mismatch.actual.value_type):
+										(Model.RecordType(_), Model.IntType): same_span(error.span, mismatch.actual.span)
+										_: False
+								_: False
+						Ok(_): False
+
+
+tests: TestSuite = {
+	description = "Closed constant phase admission",
+	tests = [
+		("parsed scalar values publish complete dense constant facts", test_admission_publishes_complete_dense_rows_from_parser_literals),
+		("private constant annotation retains private access", test_private_annotation_is_allowed_to_reach_ordinary_value_checking),
+	]
+}

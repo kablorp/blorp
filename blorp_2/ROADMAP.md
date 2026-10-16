@@ -71,17 +71,17 @@ their own inventory and plan after M8.
 
 Corrections, language rules and cleanups decided at the 2026-10-16 quality reset,
 including the namespace redesign, the `?=` placement rule, pattern and binding
-names, private types and UFCS clashes, are queued in
-[QUALITY_ROADMAP.md](QUALITY_ROADMAP.md). Most of them land before the next
-milestone work.
+names, private types and UFCS clashes, are complete and published; see
+[QUALITY_ROADMAP.md](QUALITY_ROADMAP.md). Deferred cost experiments remain
+separate from that completed correctness and maintenance queue.
 
 | Milestone | Scope | Status |
 | --- | --- | --- |
 | [M0](#m0-foundation-closeout) | Re-cut, perf fixes, parser statement loop, fixpoint script, parity table | Landed. M3 owns the recorded managed-value call limits. |
-| [M1a](#m1a-surface-syntax-parity) | Layout, `\|`/`raw` strings, pattern/opaque/range syntax | Checkpoints 1, 2a, 2b and 3 landed. The final quality frontier is 35/37; the other two need a `Char` type (`lex.brp`) and function types (`specialize.brp`, M7). |
+| [M1a](#m1a-surface-syntax-parity) | Layout, `\|`/`raw` strings, pattern/opaque/range syntax | Checkpoints 1, 2a, 2b and 3 landed. The current accepted frontier is 36/38; the other two need a `Char` type (`lex.brp`) and function types (`specialize.brp`, M7). |
 | [ML](#ml-list-construction) | `append`, `set`, `concat`, list literal | Done. |
 | [M1b](#m1b-names-and-the-foundation) | Namespace: private, aliases, qualified names, designated `Bool`/`Option`/`Result` | Parts A and B done; control-flow consumers follow in M2/M3. |
-| [M5](#m5-constants) | Module-level constants | Reviewed plan; parser inventory precedes implementation; opaque shapes follow M4. |
+| [M5](#m5-constants) | Module-level constants | Scalar/String path complete. Closed records/references follow the reviewed field-admission prep; opaque shapes follow M4. |
 | [M2](#m2-the-join) | Blocks with parameters; non-tail match, `if`, `and`/`or`/`not`, `?=` | M2.1 implemented; M2.2 after M1b part B; M2.3 after M2.2 and M1b part B (designated `Result`). |
 | [M2b](#m2b-pattern-compilation) | Nested, or-, list and literal patterns | Not started. |
 | [M3](#m3-loops-and-tail-recursion) | Loops with managed carried values; `SelfTailLoop` retired | Not started. |
@@ -341,9 +341,12 @@ and `for` consumers arrive with M2.2, M2.3 and M3.
 
 **Goal.** The source's module constants compile through one complete path.
 The [constants plan](CONSTANTS_PLAN.md) replaces the stale 64/89 estimates with
-a provisional 99-candidate source census at `e24ca0f25`. Parser inventory and
-explicit audits of the two unsupported source modules must verify it before
-implementation; the count is not pinned in a test.
+a historical 99-candidate census at `e24ca0f25`. A Blorp parser probe at `972ad0b12` read 34
+modules, parsed 32 and classified 65 constants; explicit audits accounted for
+the remaining 34 candidates in the rejected lexer and zero in specialization.
+This is not a current source total or a claim that those modules parsed. Refresh
+the inventory after their remaining syntax/opaque support; no count is pinned
+in a test.
 
 **Scope.** M5a.1 implements scalar/String declarations and body reads. M5a.2
 adds closed records, initializer references and cycle validation; any required
@@ -369,7 +372,11 @@ record) and measures the per-use cost it removes.
 the opaque-dependent forms after M4; generated C, granular identity/ownership
 tests and actual-entrypoint e2e cases prove the scoped materialization policy.
 
-**Status.** Design reviewed; authoritative inventory and implementation pending.
+**Status.** M5a.1 scalar/String facts, identity/ownership tests, six mutation
+oracles, matched costs and the actual-main 2894-component/452-e2e gate pass.
+The [scalar report](../benchmarks/results/blorp_2_scalar_constants_2026-10-16.md)
+records that bounded path. M5a.2's shared field-admission preparation is reviewed;
+closed records, initializer references/cycles and opaque forms remain.
 M5 is complete only after M5a and the M4-dependent M5b both pass their gates.
 
 ## M2: the join

@@ -1,0 +1,70 @@
+import:
+	../../../src/check/check: check, checked_functions, check_errors
+	../../../src/check/errors as Errors
+	../../../src/check/model as Model
+	../../../src/check/render: render_failure
+	../../../src/parse/assemble: parsed_contents
+	../../../src/utils/ids: constant_number, inventory_constants
+	../../../src/utils/source: module_source, root_module_id, same_source
+	../../../src/utils/syntax: same_span
+	../module_input: parse_modules
+	test: TestSuite
+
+
+pure func test_selected_and_qualified_body_reads_share_the_declaration_id() -> Bool:
+	root: String =
+		|import:
+		|    ./answer as Config: ANSWER
+		|func main() -> Int:
+		|    selected = ANSWER
+		|    Config.ANSWER
+		|
+	match parse_modules([{ source = root, targets = [1] }, { source = "ANSWER: Int = 23\n", targets = [] }]):
+		Err(_): False
+		Ok(parsed):
+			match (check(parsed), inventory_constants(parsed_contents(parsed).declarations)):
+				(Ok(program), [declaration]):
+					match checked_functions(program).functions:
+						[main]:
+							match (main.statements, main.body):
+								([Model.InitializeBinding(_, selected)], Model.CheckedValueBody(Model.ReturnExpression(qualified))):
+									match (selected.form, qualified.form):
+										(Model.ReadConstant(first), Model.ReadConstant(second)):
+											prefix = "import:\n    ./answer as Config: ANSWER\nfunc main() -> Int:\n    selected = ANSWER\n    "
+											(constant_number(first) == constant_number(declaration.id)
+												and constant_number(second) == constant_number(first)
+												and qualified.span.start == prefix.length() and qualified.span.end == prefix.length() + 13
+												and same_source(qualified.span.source, module_source(root_module_id())))
+										_: False
+								_: False
+						_: False
+				_: False
+
+
+pure func test_constant_does_not_enter_ufcs_candidates() -> Bool:
+	prefix = "ANSWER: Int = 23\nfunc main() -> Int:\n    0."
+	match parse_modules([{ source = prefix + "ANSWER()\n", targets = [] }]):
+		Err(_): False
+		Ok(parsed):
+			match check(parsed):
+				Ok(_): False
+				Err(failure):
+					error = check_errors(failure).first
+					rendered = render_failure(failure).first
+					match error.kind:
+						Errors.CallRejection(Errors.UnknownFunction(_)):
+							(error.span.start == prefix.length() and error.span.end == prefix.length() + 6
+								and same_source(error.span.source, module_source(root_module_id()))
+								and same_span(error.span, rendered.span) and rendered.note.is_none()
+								and rendered.message == "unknown function"
+								and rendered.help == "declare the function locally or import it by name; type selections enable receiver calls only")
+						_: False
+
+
+tests: TestSuite = {
+	description = "Constant expression import identity",
+	tests = [
+		("selected and qualified reads retain declaration identity", test_selected_and_qualified_body_reads_share_the_declaration_id),
+		("constant declarations do not become UFCS candidates", test_constant_does_not_enter_ufcs_candidates),
+	]
+}

@@ -1192,8 +1192,16 @@ Lexical and layout rules:
   all three parse, and checking rejects them until the recursive-types
   milestone. The conversion words are reserved: `into_opaque(7)` is a syntax error.
 - `LIMIT: Int = 7` declares a module constant; its value may stand alone on
-  the next line. The row parses, and checking rejects it until the constants
-  milestone.
+  the next line. This increment accepts explicitly typed, closed Int, Float
+  and String literal initializers, including pipe Strings. Every declaration
+  is checked, including unused constants; annotations are checked before
+  initializers. Imports and qualified reads resolve to the same constant
+  identity. Constants obey module privacy and cannot be shadowed by parameters
+  or local bindings. Each runtime read materializes an ordinary value at its
+  use site, with its own value identity and ownership when needed. Record
+  initializers, references to other constants in initializers, opaque
+  conversions and calls remain rejected; constants cannot be called or used
+  as UFCS methods.
 - Every token must be consumed. Malformed declarations and statements are errors.
 
 Semantic rules:

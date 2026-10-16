@@ -6,6 +6,7 @@ published TypeRefs.
 ---
 import:
 	./scope: LocalBinding, binding_site, binding_definition, local_binding_id, lookup_binding
+	./constants: constant_row
 	./callables:
 		FunctionContract,
 		function_contract,
@@ -15,7 +16,7 @@ import:
 		classify_receiver,
 		method_sites,
 	./model:
-		CheckedForm(UpdateRecord, ConstructRecord, ConstructVariant, ConstructList, LiteralVoid, LiteralInteger, LiteralFloat, LiteralString, ReadBinding, InvokeFunction, ReadRecordField),
+		CheckedForm(UpdateRecord, ConstructRecord, ConstructVariant, ConstructList, LiteralVoid, LiteralInteger, LiteralFloat, LiteralString, ReadBinding, ReadConstant, InvokeFunction, ReadRecordField),
 		CheckedRecordField,
 		CheckedRecordUpdate,
 		RetainedRecordField,
@@ -29,6 +30,7 @@ import:
 		ExpectedTypeSite,
 		CheckErrorKind(ConstructorRejection, RecordRejection),
 		CallError(UnknownFunction, UncallableBinding),
+		ConstantError(ConstantCalled), constant_error,
 		ConstructorError(ConstructorNeedsExpectedType),
 		RecordError(RecordNeedsExpectedType, FieldRequiresRecord),
 		ValueError(UnknownValue, ExpressionTypeMismatch),
@@ -45,7 +47,7 @@ import:
 		checker_invariant
 	./inference:
 		select_receiver_contract,
-		PendingBase(AcceptedBinding, AcceptedFloat, AcceptedInteger, AcceptedString, AcceptedVoid, PendingConstructRecord, PendingConstructVariant, PendingConstructList, PendingDirectCall, PendingUpdateRecord),
+		PendingBase(AcceptedBinding, AcceptedConstant, AcceptedFloat, AcceptedInteger, AcceptedString, AcceptedVoid, PendingConstructRecord, PendingConstructVariant, PendingConstructList, PendingDirectCall, PendingUpdateRecord),
 		ListElementSource(ExpectedElementType, FirstElementType),
 		PendingOperation(AcceptedField, PendingInvocation),
 		InferenceType(AcceptedType),
@@ -105,7 +107,7 @@ import:
 		validate_variant_fields
 	../utils/ids: FunctionId, record_number, variant_owner
 	./declarations: aliased_module
-	../namespace/namespace: NamedValue(NamedFunction, NamedConstructor, NamedAlias), OfferedValue(OfferedFunction, OfferedConstructor), named_value, offered_value
+	../namespace/namespace: NamedValue(NamedFunction, NamedConstant, NamedConstructor, NamedAlias), OfferedValue(OfferedFunction, OfferedConstant, OfferedConstructor), named_value, offered_value
 	int as IntOps
 	../utils/source: COMPILER_SOURCE
 	option: to_result
@@ -337,6 +339,9 @@ private pure func plan_base(purity: Purity, scope: List[LocalBinding], body: Val
 				Some(binding): Ok(PlannedLeaf(AcceptedBinding(local_binding_id(binding)), binding_definition(binding).value_type))
 				None:
 					match named_value(context.namespace, context.module, name.id):
+						Some(NamedConstant(id)):
+							constant_row(context.constants, id, name.span)
+								.map(pure func(row): PlannedLeaf(AcceptedConstant(id), row.value_type.value_type))
 						Some(NamedConstructor(_)): plan_variant(name, [], False, expectation, slots, context)
 						Some(NamedAlias(_)): Err(qualified_error(name.span, BareModuleAlias(name.id)))
 						_: Err(value_error(name.span, UnknownValue(name.id)))
@@ -374,6 +379,12 @@ private pure func plan_qualified(
 	aliased ?= aliased_module(context.namespace, context.module, qualified.module)
 	name = qualified.name
 	match offered_value(context.namespace, aliased.target, name.id):
+		Ok(OfferedConstant(id)):
+			if called:
+				Err(constant_error(name.span, ConstantCalled(id)))
+			else:
+				constant_row(context.constants, id, name.span)
+					.map(pure func(row): PlannedLeaf(AcceptedConstant(id), row.value_type.value_type))
 		Ok(OfferedConstructor(variant)):
 			plan_qualified_variant(variant_owner(variant), variant, name, arguments, called, expectation, context)
 		Ok(OfferedFunction(function)):
@@ -995,6 +1006,7 @@ private pure func freeze_pending_value(value: PendingValue, slots: List[Inferenc
 		AcceptedFloat(number): Ok(LiteralFloat(number))
 		AcceptedString(text): Ok(LiteralString(text))
 		AcceptedBinding(id): Ok(ReadBinding(id))
+		AcceptedConstant(id): Ok(ReadConstant(id))
 		PendingConstructRecord(owner, fields):
 			match freeze_record_fields(fields, slots):
 				Ok(frozen): Ok(ConstructRecord(owner, frozen))
@@ -1106,6 +1118,8 @@ private pure func classify_direct_call(
 			Ok(void)
 
 	match named_value(context.namespace, context.module, name.id):
+		Some(NamedConstant(id)):
+			Err(constant_error(name.span, ConstantCalled(id)))
 		Some(NamedFunction(target, _)):
 			match function_contract(
 				context.caller,
