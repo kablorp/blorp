@@ -5,10 +5,10 @@ import:
 	../../../src/check/check: check, check_errors, checked_functions
 	../../../src/check/errors as Errors
 	../../../src/check/render: render_failure
-	../../../src/utils/ids: function_number, union_number, record_number
+	../../../src/utils/ids: function_number, union_number, record_number, inventory_unions, variant_owner, variant_number
 	../../../src/utils/names: same_name
 	../../../src/utils/source: module_id, module_source, root_module_id, same_source
-	../../../src/utils/syntax: DiagnosticNote(RecordFieldDeclaration), same_span
+	../../../src/utils/syntax: DiagnosticNote(RecordFieldDeclaration, PreviousDeclaration), same_span
 	../module_input: ModuleInput, parse_modules
 	test: TestSuite
 
@@ -152,24 +152,24 @@ pure func test_unselected_ufcs_call_is_rejected() -> Bool:
 	)
 
 
-pure func test_imported_ufcs_ignores_local_value_shadowing() -> Bool:
+pure func test_imported_ufcs_accepts_a_parameter_receiver() -> Bool:
 	root: String =
 		|import:
 		|    ./helper: answer
-		|pure func invoke(answer: Int) -> Int:
-		|    answer.answer()
+		|pure func invoke(number: Int) -> Int:
+		|    number.answer()
 		|func main() -> Int:
 		|    invoke(42)
 		|
 	accepts([{source = root, targets = [1]}, {source = HELPER, targets = []}])
 
 
-pure func test_imported_direct_call_respects_local_value_shadowing() -> Bool:
+pure func test_imported_function_does_not_make_a_parameter_callable() -> Bool:
 	root: String =
 		|import:
 		|    ./helper: answer
-		|pure func invoke(answer: Int) -> Int:
-		|    answer(answer)
+		|pure func invoke(number: Int) -> Int:
+		|    number(number)
 		|func main() -> Int:
 		|    invoke(42)
 		|
@@ -336,13 +336,34 @@ pure func test_foreign_constructor_pattern_is_not_visible() -> Bool:
 		|    match make():
 		|        Ready(): 42
 		|
-	rejects([{source = root, targets = [1]}, {source = FOREIGN_CHOICE, targets = []}], pure func(error):
-		match error.kind:
-			Errors.MatchRejection(Errors.UnknownConstructorPattern(_, _)):
-				True
-			_:
-				False
-	)
+	match parse_modules([{source = root, targets = [1]}, {source = FOREIGN_CHOICE, targets = []}]):
+		Err(_): False
+		Ok(parsed):
+			match check(parsed):
+				Ok(_): False
+				Err(failure):
+					errors = check_errors(failure)
+					diagnostics = render_failure(failure)
+					match (errors.first.kind, module_id(1), existing_name(parsed_contents(parsed).names, "Choice")):
+						(Errors.MatchRejection(Errors.UnimportedConstructorPattern(id)), Some(helper), Some(choice)):
+							primary_start = "import:\n    ./helper: make\nfunc main() -> Int:\n    match make():\n        ".length()
+							primary = { source = module_source(root_module_id()), start = primary_start, end = primary_start + 5 }
+							previous_start = "fixed union Choice:\n    ".length()
+							previous = { source = module_source(helper), start = previous_start, end = previous_start + 5 }
+							owner_matches = match inventory_unions(parsed_contents(parsed).declarations).get(union_number(variant_owner(id))):
+								Some(declaration): same_name(declaration.type_name.id, choice) and variant_number(id) == 0
+								None: False
+							note_matches = match diagnostics.first.note:
+								Some(PreviousDeclaration(declaration)): same_span(declaration, previous)
+								_: False
+							(
+								errors.remaining.is_empty() and diagnostics.remaining.is_empty() and owner_matches
+								and same_span(errors.first.span, primary) and same_span(diagnostics.first.span, primary)
+								and diagnostics.first.message == "Ready is a constructor of Choice but is not imported"
+								and diagnostics.first.help == "import Ready with its union: Choice(Ready), from the module that declares Choice"
+								and note_matches
+							)
+						_: False
 
 
 pure func test_foreign_nominal_mismatch_keeps_annotation_source() -> Bool:
@@ -571,8 +592,8 @@ tests: TestSuite = {
 		("same named helpers have module identities", test_same_named_helpers_keep_distinct_module_identities),
 		("unselected direct call is rejected", test_unselected_direct_call_is_rejected),
 		("unselected UFCS call is rejected", test_unselected_ufcs_call_is_rejected),
-		("imported UFCS ignores local shadowing", test_imported_ufcs_ignores_local_value_shadowing),
-		("imported direct call respects local shadowing", test_imported_direct_call_respects_local_value_shadowing),
+		("imported UFCS accepts parameter receiver", test_imported_ufcs_accepts_a_parameter_receiver),
+		("imported function does not make parameter callable", test_imported_function_does_not_make_a_parameter_callable),
 		("dependency main is an ordinary generic helper", test_dependency_main_is_an_ordinary_generic_function),
 		("imported main cannot supply root entrypoint", test_imported_main_cannot_supply_the_root_entrypoint),
 		("same named union types remain module local", test_same_named_union_types_remain_module_local),

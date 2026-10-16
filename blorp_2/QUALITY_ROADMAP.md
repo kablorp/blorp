@@ -592,6 +592,15 @@ byte-identical on every e2e fixture at every rewrite commit.
 
 ## Pattern and binding names
 
+**Implementation checkpoint.** The reviewed implementation has completed its
+standalone acceptance at -29 production lines, rather than the historical +21
+estimate below. Constructor visibility and local binding creation each have
+one authority; `_` is the only whole-arm catch-all. The refreshed collision
+inventory is 110 source sites in 14 files. Tests and matched costs are in the
+[naming evidence](../benchmarks/results/blorp_2_quality_names_2026-10-16.md);
+the destination's full Makefile gate remains a publication requirement.
+The following problem examples and estimates describe the original baseline.
+
 Three decisions share one plan, because they share one cause: a bare name could
 mean either a binding or something already in scope.
 

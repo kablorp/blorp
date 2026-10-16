@@ -24,6 +24,7 @@ import:
 		Origin(Declared, Imported, Implicit),
 		SelectionProblem(NotOffered, AlreadyFromPrelude, AlreadyImported, Ambiguous, BareConstructor, NotAConstructor, ReceiverNotVisible),
 		TypeHead(UnionHead, RecordHead),
+		ValueBinding(FunctionName, ConstructorName, ModuleAliasName),
 		Unoffered(UnknownName, PrivateName, ImportedThere, ProvidedThere),
 		same_head,
 	option: to_result
@@ -185,6 +186,8 @@ pure func render_check_error(program: ParsedProgram, error: Errors.CheckError) -
 			render_record_error(error.span, rejection, context)
 		Errors.ValueRejection(rejection):
 			render_value_error(error.span, rejection, context)
+		Errors.BindingRejection(rejection):
+			render_binding_error(error.span, rejection, context)
 		Errors.StatementRejection(rejection):
 			render_statement_error(error.span, rejection)
 		Errors.MatchRejection(rejection):
@@ -291,23 +294,23 @@ private pure func render_qualified_error(span: Span, rejection: Errors.Qualified
 				Ok(alias_spelling):
 					match parsed_spelling(name, context.names, span):
 						Err(error): error
-						Ok(name_spelling):
+						Ok(selected_spelling):
 							match module_path_spelling(path, context, span):
 								Err(error): error
 								Ok(module):
 									match reason:
 										PrivateName:
-											rendered(span, name_spelling.concat(" is private to ").concat(module), "remove private or qualify a public declaration")
+											rendered(span, selected_spelling.concat(" is private to ").concat(module), "remove private or qualify a public declaration")
 										UnknownName | ImportedThere(_) | ProvidedThere(_):
-											rendered(span, "module ".concat(module).concat(" declares no public ").concat(name_spelling), alias_spelling.concat(" names module ").concat(module).concat("; qualify a public function, constructor or type it declares; imports are not reexported"))
+											rendered(span, "module ".concat(module).concat(" declares no public ").concat(selected_spelling), alias_spelling.concat(" names module ").concat(module).concat("; qualify a public function, constructor or type it declares; imports are not reexported"))
 		Errors.QualifiedFunctionNotCalled(aliased, name):
 			match parsed_spelling(aliased, context.names, span):
 				Err(error): error
 				Ok(alias_spelling):
 					match parsed_spelling(name, context.names, span):
 						Err(error): error
-						Ok(name_spelling):
-							rendered(span, alias_spelling.concat(".").concat(name_spelling).concat(" names a function"), "call it with arguments; a function is not a value")
+						Ok(selected_spelling):
+							rendered(span, alias_spelling.concat(".").concat(selected_spelling).concat(" names a function"), "call it with arguments; a function is not a value")
 
 
 -- Every namespace problem: a conflict in one table, a selection by its reason.
@@ -641,8 +644,6 @@ private pure func render_signature_error(
 				"main parameter must have type List[String]",
 				"declare main() -> Int: or main(arguments: List[String]) -> Int:",
 			)
-		Errors.DuplicateParameter(_, _):
-			rendered(span, "duplicate parameter name", "give each parameter a distinct name")
 		Errors.MainReturnType(_):
 			rendered(
 				span,
@@ -1014,6 +1015,29 @@ private pure func render_value_error(
 							)
 
 
+private pure func binding_conflict(span: Span, name: NameId, kind: String, location: String, previous: Span, context: ParsedContents) -> Diagnostic:
+	match parsed_spelling(name, context.names, span):
+		Err(error): error
+		Ok(spelling):
+			noted(span, "`".concat(spelling).concat("` is already a ").concat(kind).concat(" in this ").concat(location),
+				"choose a different name for this binding", PreviousDeclaration(previous),
+			)
+
+
+private pure func render_binding_error(span: Span, rejection: Errors.BindingError, context: ParsedContents) -> Diagnostic:
+	match rejection:
+		Errors.ModuleBindingConflict(previous):
+			match previous:
+				FunctionName(name): binding_conflict(span, name.id, "function", "module", name.span, context)
+				ConstructorName(name): binding_conflict(span, name.id, "constructor", "module", name.span, context)
+				ModuleAliasName(name): binding_conflict(span, name.id, "module alias", "module", name.span, context)
+		Errors.LocalBindingConflict(previous, origin):
+			kind = match origin:
+				Check.ParameterBinding(_): "parameter"
+				Check.BodyLocal | Check.MatchCapture: "local"
+			binding_conflict(span, previous.name, kind, "function", previous.span, context)
+
+
 private pure func render_statement_error(
 	span: Span,
 	rejection: Errors.StatementError,
@@ -1027,15 +1051,6 @@ private pure func render_statement_error(
 			)
 		Errors.NonVoidMatchArm(_):
 			rendered(span, "a statement match's arm must be Void", "bind the match's value with name = match ... to use it")
-		Errors.DuplicateLocal(_):
-			rendered(
-				span,
-				"duplicate local binding",
-				Text.concat(
-					"give each body-local declaration a distinct name; ",
-					"omit var to reassign a mutable binding",
-				),
-			)
 		Errors.ImmutableAssignment(_):
 			rendered(
 				span,
@@ -1061,19 +1076,31 @@ private pure func render_match_error(
 					.concat(IntOps.to_string(actual))
 					.concat("; write one name or '_' per declared field"),
 			)
-		Errors.DuplicatePatternBinding(_, previous):
-			{ rendered(
-				span,
-				"duplicate binding in constructor pattern",
-				"give each captured field a distinct name, or ignore it with '_'",
-			) |
-				note = Some(PreviousDeclaration(previous))
-			}
+		Errors.BarePatternName(_, _):
+			rendered(span, "a bare name in a match arm is a constructor; use `_` to match anything", "use a visible constructor of the matched union, or write `_` and use the match's scrutinee in the arm")
+		Errors.UnimportedConstructorPattern(id):
+			match inventory_unions(context.declarations).get(union_number(variant_owner(id))):
+				None: render_fault(span, Errors.InvalidResolvedUnion(variant_owner(id)))
+				Some(declaration):
+					match declaration.variants.get(variant_number(id)):
+						None: render_fault(span, Errors.InvalidResolvedVariant(id))
+						Some(variant):
+							match parsed_spelling(variant.declaration.name.id, context.names, span):
+								Err(error): error
+								Ok(name):
+									match parsed_spelling(declaration.type_name.id, context.names, span):
+										Err(error): error
+										Ok(owner):
+											noted(span,
+												name.concat(" is a constructor of ").concat(owner).concat(" but is not imported"),
+												"import ".concat(name).concat(" with its union: ").concat(owner).concat("(").concat(name).concat("), from the module that declares ").concat(owner),
+												PreviousDeclaration(variant.declaration.name.span),
+											)
 		Errors.UnknownConstructorPattern(_, _):
 			rendered(
 				span,
 				"unknown constructor pattern",
-				"use an unshadowed variant of the matched union; rename a shadowing local binding",
+				"use a constructor of the matched union that is declared or imported in this module",
 			)
 		Errors.ArmWithoutValue:
 			rendered(span, "match arm has no final value", "finish the arm with a value expression on its own indented line")
@@ -1159,7 +1186,7 @@ private pure func builtin_spelling(
 	context: ParsedContents,
 	span: Span,
 ) -> Result[String, Diagnostic]:
-	var name: Option[NameId] = None
+	var found_name: Option[NameId] = None
 
 	for declaration in context.builtin_types:
 		selected = match declaration.declaration:
@@ -1179,10 +1206,10 @@ private pure func builtin_spelling(
 						False
 
 		if selected:
-			name = Some(builtin_type_name(declaration.declaration).id)
+			found_name = Some(builtin_type_name(declaration.declaration).id)
 			break
 
-	match name:
+	match found_name:
 		Some(name):
 			parsed_spelling(name, context.names, span)
 		None:
@@ -1200,7 +1227,7 @@ private pure func parameter_spelling(
 	context: ParsedContents,
 	span: Span,
 ) -> Result[String, Diagnostic]:
-	parameters = match Check.parameter_owner(id):
+	found_parameters = match Check.parameter_owner(id):
 		Check.FunctionDeclaration(owner):
 			inventory_functions(context.declarations)
 				.get(function_number(owner))
@@ -1215,7 +1242,7 @@ private pure func parameter_spelling(
 				.get(record_number(owner))
 				.map(pure func(row): row.declaration.type_parameters)
 
-	written ?= match parameters:
+	written ?= match found_parameters:
 		Some(parameters):
 			match parameters.get(Check.parameter_position(id)):
 				Some(written):
@@ -1294,11 +1321,11 @@ private pure func type_spelling(
 
 					for argument in arguments:
 						match type_spelling(argument, context, span):
-							Ok(value):
+							Ok(argument_type):
 								if not IntOps.equals(position, 0):
 									spelling = spelling.concat(", ")
 
-								spelling = spelling.concat(value)
+								spelling = spelling.concat(argument_type)
 							Err(error):
 								failure = Some(error)
 								break

@@ -5,6 +5,7 @@ complete checked facts leave this module; temporary inference variables never be
 published TypeRefs.
 ---
 import:
+	./scope: LocalBinding, binding_site, binding_definition, local_binding_id, lookup_binding
 	./callables:
 		FunctionContract,
 		function_contract,
@@ -16,8 +17,6 @@ import:
 		method_sites,
 		select_receiver_contract
 	./model:
-		BindingDefinition,
-		BindingId,
 		CheckedForm(UpdateRecord, ConstructRecord, ConstructVariant, ConstructList, LiteralVoid, LiteralInteger, LiteralFloat, LiteralString, ReadBinding, InvokeFunction, ReadRecordField),
 		CheckedRecordField,
 		CheckedRecordUpdate,
@@ -29,7 +28,6 @@ import:
 		parameter_position
 	./errors:
 		CheckError,
-		BindingSite,
 		ExpectedTypeSite,
 		CheckErrorKind(ConstructorRejection, RecordRejection),
 		CallError(UnknownFunction, UncallableBinding),
@@ -110,7 +108,6 @@ import:
 	./declarations: aliased_module
 	../namespace/namespace: NamedValue(NamedFunction, NamedConstructor, NamedAlias), OfferedValue(OfferedFunction, OfferedConstructor), named_value, offered_value
 	int as IntOps
-	../utils/names: NameId, same_name
 	../utils/source: COMPILER_SOURCE
 	option: to_result
 	../utils/syntax:
@@ -138,24 +135,6 @@ private fixed union ResolvedPostfix:
 private fixed union ResolvedApplication:
 	FunctionApplication(FunctionContract)
 	ConstructorApplication(WrittenName)
-
-
-fixed record LocalBinding {
-	name: NameId,
-	id: BindingId,
-	definition: BindingDefinition
-}
-
-
-pure func lookup_binding(scope: List[LocalBinding], name: NameId) -> Option[LocalBinding]:
-	var found: Option[LocalBinding] = None
-
-	for binding in scope:
-		if same_name(binding.name, name):
-			found = Some(binding)
-			break
-
-	found
 
 
 private pure func freeze_record_fields(fields: List[PendingRecordField], slots: List[InferenceSlot]) -> Result[List[CheckedRecordField], CheckError]:
@@ -336,10 +315,10 @@ private pure func record_operands(values: List[Option[PendingValue]], range: Ope
 
 private pure func argument_work(call: PendingCall, arguments: List[ValueExpression], placement: CallPlacement, hints: List[Option[InferenceType]], position: Int) -> Result[ExpressionWork, CheckError]:
 	argument ?= arguments.get(position).to_result(checker_invariant(call.contract.span, MissingCallParameter(position)))
-	parameter_position = match placement:
+	argument_position = match placement:
 		ReceiverPlacement(_, _): IntOps.add(position, 1)
 		_: position
-	hint ?= hints.get(parameter_position).to_result(checker_invariant(call.contract.span, MissingCallParameter(parameter_position)))
+	hint ?= hints.get(argument_position).to_result(checker_invariant(call.contract.span, MissingCallParameter(argument_position)))
 	Ok(EnterExpression(argument, hint))
 
 
@@ -352,11 +331,11 @@ private pure func plan_base(purity: Purity, scope: List[LocalBinding], body: Val
 				Ok(classified):
 					match classified:
 						FunctionApplication(contract): Ok(PlannedCall(contract, arguments, ReturnPlacement(body.base_span, body.span), expectation))
-						ConstructorApplication(name): plan_variant(name, arguments, True, expectation, slots, context)
+						ConstructorApplication(constructor_name): plan_variant(constructor_name, arguments, True, expectation, slots, context)
 				Err(error): Err(error)
 		NameExpression(name):
 			match lookup_binding(scope, name.id):
-				Some(binding): Ok(PlannedLeaf(AcceptedBinding(binding.id), binding.definition.value_type))
+				Some(binding): Ok(PlannedLeaf(AcceptedBinding(local_binding_id(binding)), binding_definition(binding).value_type))
 				None:
 					match named_value(context.namespace, context.module, name.id):
 						Some(NamedConstructor(_)): plan_variant(name, [], False, expectation, slots, context)
@@ -601,10 +580,10 @@ private pure func elaborate_value(
 											PlannedRecord(literal):
 												work = push_expression_work(work, work_count, ScheduleRecord(literal))
 												work_count = IntOps.add(work_count, 1)
-											PlannedUpdate(base, fields, hint):
+											PlannedUpdate(base, fields, update_hint):
 												work = push_expression_work(work, work_count, PlanRecordUpdate(fields, written.base_span, base.span))
 												work_count = IntOps.add(work_count, 1)
-												work = push_expression_work(work, work_count, EnterExpression(base, hint))
+												work = push_expression_work(work, work_count, EnterExpression(base, update_hint))
 												work_count = IntOps.add(work_count, 1)
 											PlannedVariant(contract, arguments):
 												range: OperandRange = { start = operand_count, count = arguments.length() }
@@ -621,8 +600,8 @@ private pure func elaborate_value(
 																Some(field):
 																	work = push_expression_work(work, work_count, EnterExpression(argument, Some(field.value_type)))
 																	work_count = IntOps.add(work_count, 1)
-											PlannedCall(contract, arguments, placement, hint):
-												work = push_expression_work(work, work_count, ScheduleCall(contract, arguments, placement, hint))
+											PlannedCall(contract, arguments, placement, call_hint):
+												work = push_expression_work(work, work_count, ScheduleCall(contract, arguments, placement, call_hint))
 												work_count = IntOps.add(work_count, 1)
 											PlannedList(elements, source):
 												work = push_expression_work(work, work_count, ContinueList({ source = source, elements = elements, position = 0, start = operand_count, base_span = written.base_span, span = written.span }))
@@ -936,7 +915,7 @@ private pure func elaborate_value(
 					FreezeRoot(value):
 						match freeze_pending_value(value, slots):
 							Err(error): failure = Some(error)
-							Ok(value): accepted = Some(value)
+							Ok(frozen_value): accepted = Some(frozen_value)
 			_: failure = Some(checker_invariant(body.span, InvalidInferenceWorklist))
 
 	match failure:
@@ -953,8 +932,8 @@ private pure func freeze_pending_values(values: List[PendingValue], slots: List[
 			Err(error):
 				failure = Some(error)
 				break
-			Ok(value):
-				frozen = frozen.append(value)
+			Ok(frozen_value):
+				frozen = frozen.append(frozen_value)
 
 	match failure:
 		Some(error): Err(error)
@@ -969,10 +948,10 @@ private pure func freeze_pending_call(call: PendingCall, values: List[PendingVal
 	var failure: Option[CheckError] = None
 
 	match receiver:
-		Some(receiver):
-			receiver_use: InferenceUse = { value_type = AcceptedType(receiver.value_type), span = call.contract.span }
+		Some(frozen_receiver):
+			receiver_use: InferenceUse = { value_type = AcceptedType(frozen_receiver.value_type), span = call.contract.span }
 			actual = [receiver_use].concat(actual)
-			arguments = [receiver]
+			arguments = [frozen_receiver]
 		None: void
 
 	for value in values:
@@ -980,8 +959,8 @@ private pure func freeze_pending_call(call: PendingCall, values: List[PendingVal
 			Err(error):
 				failure = Some(error)
 				break
-			Ok(value):
-				arguments = arguments.append(value)
+			Ok(frozen_value):
+				arguments = arguments.append(frozen_value)
 
 	ready ?= match failure:
 		Some(error): Err(error)
@@ -1022,12 +1001,12 @@ private pure func freeze_pending_value(value: PendingValue, slots: List[Inferenc
 				Err(error): Err(error)
 		PendingUpdateRecord(owner, base, expression_span, fields, inherited):
 			match freeze_pending_value(base, slots):
-				Ok(base):
+				Ok(frozen_base):
 					match freeze_record_fields(fields, slots):
 						Ok(replacements):
 							match freeze_retained_fields(inherited, slots, expression_span):
-								Ok(inherited):
-									update: CheckedRecordUpdate = { base = base, base_expression_span = expression_span, replacements = replacements, inherited = inherited }
+								Ok(frozen_inherited):
+									update: CheckedRecordUpdate = { base = frozen_base, base_expression_span = expression_span, replacements = replacements, inherited = frozen_inherited }
 									Ok(UpdateRecord(owner, update))
 								Err(error): Err(error)
 						Err(error): Err(error)
@@ -1143,15 +1122,6 @@ private pure func classify_direct_call(
 			Err(call_error(name.span, UnknownFunction(name.id)))
 
 
-pure func binding_site(function: FunctionId, binding: LocalBinding) -> BindingSite:
-	{
-		function = function,
-		binding = binding.id,
-		name = binding.name,
-		span = binding.definition.span
-	}
-
-
 private pure func non_callable(
 	binding: LocalBinding,
 	span: Span,
@@ -1161,7 +1131,7 @@ private pure func non_callable(
 		span,
 		UncallableBinding(
 			binding_site(function, binding),
-			binding.definition.origin,
-			binding.definition.value_type,
+			binding_definition(binding).origin,
+			binding_definition(binding).value_type,
 		),
 	)

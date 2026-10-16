@@ -1,0 +1,183 @@
+import:
+	../../../src/check/errors as Errors
+	../../../src/check/model as Model
+	../../../src/check/scope: bind_local, binding_definition, binding_site, local_binding_id, lookup_binding
+	../../../src/namespace/namespace: Namespace, NamedValue(NamedFunction), ValueBinding(FunctionName, ConstructorName, ModuleAliasName), build_namespace, named_value
+	../../../src/parse/assemble: parsed_contents
+	../../../src/utils/ids: FunctionId, function_number
+	../../../src/utils/names: NameTable, same_name
+	../../../src/utils/source: module_source, root_module_id
+	../../../src/utils/syntax: Span, WrittenName, same_span
+	../input: existing_name
+	../module_input: parse_modules
+	test: TestSuite
+
+
+private fixed record Fixture {
+	namespace: Namespace,
+	names: NameTable,
+	function: FunctionId
+}
+
+
+private pure func fixture() -> Option[Fixture]:
+	root = "import:\n\t./ops as tools\nfixed union Signal:\n\tReady\npure func existing(candidate: Int) -> Int:\n\tcandidate\nfunc main() -> Int:\n\t0\n"
+	match parse_modules([
+		{ source = root, targets = [1] },
+		{ source = "pure func other() -> Int:\n\t0\n", targets = [] },
+	]):
+		Err(_): None
+		Ok(program):
+			match build_namespace(program):
+				Err(_): None
+				Ok(namespace):
+					names = parsed_contents(program).names
+					match existing_name(names, "main"):
+						None: None
+						Some(main):
+							match named_value(namespace, root_module_id(), main):
+								Some(NamedFunction(function, _)): Some({ namespace = namespace, names = names, function = function })
+								_: None
+
+
+private pure func span(start: Int) -> Span:
+	{ source = module_source(root_module_id()), start = start, end = start + 9 }
+
+
+private pure func written(setup: Fixture, spelling: String, start: Int) -> Option[WrittenName]:
+	existing_name(setup.names, spelling).map(pure func(name): { id = name, span = span(start) })
+
+
+private pure func definition(origin: Model.BindingOrigin, site: Span) -> Model.BindingDefinition:
+	{ origin = origin, mutability = Model.Immutable, value_type = Model.IntType, span = site }
+
+
+pure func test_constructor_preserves_the_complete_binding_definition() -> Bool:
+	match fixture():
+		None: False
+		Some(setup):
+			match written(setup, "candidate", 90):
+				None: False
+				Some(name):
+					match bind_local([], setup.namespace, root_module_id(), setup.function, name, Model.binding_id(7), definition(Model.MatchCapture, name.span)):
+						Err(_): False
+						Ok(binding):
+							accepted = binding_definition(binding)
+							site = binding_site(setup.function, binding)
+							origin_matches = match accepted.origin:
+								Model.MatchCapture: True
+								_: False
+							(
+								Model.binding_number(local_binding_id(binding)) == 7
+								and function_number(site.function) == function_number(setup.function)
+								and same_name(site.name, name.id) and same_span(site.span, name.span)
+								and same_span(accepted.span, name.span)
+								and Model.same_type(accepted.value_type, Model.IntType)
+								and accepted.mutability == Model.Immutable
+								and origin_matches
+								and lookup_binding([binding], name.id).is_some()
+							)
+
+
+private pure func module_conflict(spelling: String, matches: pure (Errors.BindingError) -> Bool) -> Bool:
+	match fixture():
+		None: False
+		Some(setup):
+			match written(setup, spelling, 110):
+				None: False
+				Some(name):
+					match bind_local([], setup.namespace, root_module_id(), setup.function, name, Model.binding_id(0), definition(Model.BodyLocal, name.span)):
+						Ok(_): False
+						Err(error):
+							kind_matches = match error.kind:
+								Errors.BindingRejection(conflict): matches(conflict)
+								_: False
+							same_span(error.span, name.span) and kind_matches
+
+
+pure func test_function_collision_carries_its_namespace_occurrence() -> Bool:
+	module_conflict("existing", pure func(error: Errors.BindingError) -> Bool:
+		match error:
+			Errors.ModuleBindingConflict(FunctionName(previous)): previous.span.start == "import:\n\t./ops as tools\nfixed union Signal:\n\tReady\npure func ".length()
+			_: False
+	)
+
+
+pure func test_constructor_collision_carries_its_namespace_occurrence() -> Bool:
+	module_conflict("Ready", pure func(error: Errors.BindingError) -> Bool:
+		match error:
+			Errors.ModuleBindingConflict(ConstructorName(previous)): previous.span.start == "import:\n\t./ops as tools\nfixed union Signal:\n\t".length()
+			_: False
+	)
+
+
+pure func test_alias_collision_carries_its_namespace_occurrence() -> Bool:
+	module_conflict("tools", pure func(error: Errors.BindingError) -> Bool:
+		match error:
+			Errors.ModuleBindingConflict(ModuleAliasName(previous)): previous.span.start == "import:\n\t./ops as ".length()
+			_: False
+	)
+
+
+private pure func local_conflict(origin: Model.BindingOrigin, matches: pure (Model.BindingOrigin) -> Bool) -> Bool:
+	match fixture():
+		None: False
+		Some(setup):
+			match written(setup, "candidate", 80):
+				None: False
+				Some(original):
+					match bind_local([], setup.namespace, root_module_id(), setup.function, original, Model.binding_id(4), definition(origin, original.span)):
+						Err(_): False
+						Ok(binding):
+							shadow = { original | span = span(140) }
+							match bind_local([binding], setup.namespace, root_module_id(), setup.function, shadow, Model.binding_id(5), definition(Model.BodyLocal, shadow.span)):
+								Ok(_): False
+								Err(error):
+									kind_matches = match error.kind:
+										Errors.BindingRejection(Errors.LocalBindingConflict(previous, previous_origin)):
+											(
+												same_name(previous.name, original.id)
+												and same_span(previous.span, original.span)
+												and function_number(previous.function) == function_number(setup.function)
+												and matches(previous_origin)
+											)
+										_: False
+									same_span(error.span, shadow.span) and kind_matches
+
+
+pure func test_parameter_conflict_preserves_the_original_binding_origin() -> Bool:
+	local_conflict(Model.ParameterBinding(2), pure func(origin: Model.BindingOrigin) -> Bool:
+		match origin:
+			Model.ParameterBinding(2): True
+			_: False
+	)
+
+
+pure func test_local_conflict_preserves_the_original_binding_origin() -> Bool:
+	local_conflict(Model.BodyLocal, pure func(origin: Model.BindingOrigin) -> Bool:
+		match origin:
+			Model.BodyLocal: True
+			_: False
+	)
+
+
+pure func test_capture_conflict_preserves_the_original_binding_origin() -> Bool:
+	local_conflict(Model.MatchCapture, pure func(origin: Model.BindingOrigin) -> Bool:
+		match origin:
+			Model.MatchCapture: True
+			_: False
+	)
+
+
+tests: TestSuite = {
+	description = "Accepted local binding construction",
+	tests = [
+		("constructor preserves complete binding definition", test_constructor_preserves_the_complete_binding_definition),
+		("function collision carries namespace occurrence", test_function_collision_carries_its_namespace_occurrence),
+		("constructor collision carries namespace occurrence", test_constructor_collision_carries_its_namespace_occurrence),
+		("alias collision carries namespace occurrence", test_alias_collision_carries_its_namespace_occurrence),
+		("parameter conflict preserves original origin", test_parameter_conflict_preserves_the_original_binding_origin),
+		("local conflict preserves original origin", test_local_conflict_preserves_the_original_binding_origin),
+		("capture conflict preserves original origin", test_capture_conflict_preserves_the_original_binding_origin),
+	]
+}

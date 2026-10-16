@@ -1,0 +1,513 @@
+import:
+	../../../src/check/check: check, check_errors
+	../../../src/check/errors as Errors: CheckErrorKind
+	../../../src/check/render: render_failure
+	../../../src/check/model: TypeRef(UnionType), BindingOrigin(ParameterBinding, BodyLocal, MatchCapture)
+	../../../src/namespace/namespace: ValueBinding(FunctionName, ConstructorName, ModuleAliasName)
+	../../../src/parse/assemble: ParsedProgram, parsed_contents
+	../../../src/utils/ids: inventory_unions, union_number, variant_owner, variant_number
+	../../../src/utils/names: NameId, same_name
+	../../../src/utils/source: module_id, module_source, root_module_id
+	../../../src/utils/syntax: Diagnostic, DiagnosticNote(PreviousDeclaration), Span, same_span
+	../input: existing_name
+	../module_input: parse_modules, parse_modules_with_prelude
+	test: TestSuite
+
+
+private MAIN: String = "func main() -> Int:\n\t0\n"
+private COLOR: String = "fixed union Color:\n\tRed\n\tGreen\n"
+private VALUE: String = "fixed union Value:\n\tEmpty\n\tNumber(Int)\n"
+private RENAME_HELP: String = "choose a different name for this binding"
+private BARE_MESSAGE: String = "a bare name in a match arm is a constructor; use `_` to match anything"
+private BARE_HELP: String = "use a visible constructor of the matched union, or write `_` and use the match's scrutinee in the arm"
+
+
+private pure func root_span(start: Int, length: Int) -> Span:
+	{ source = module_source(root_module_id()), start = start, end = start + length }
+
+
+private pure func same_note(actual: Option[DiagnosticNote], expected: Option[Span]) -> Bool:
+	match actual:
+		None: expected.is_none()
+		Some(PreviousDeclaration(previous)):
+			match expected:
+				Some(original): same_span(previous, original)
+				None: False
+		_: False
+
+
+private pure func has_name(program: ParsedProgram, actual: NameId, expected: String) -> Bool:
+	match existing_name(parsed_contents(program).names, expected):
+		Some(name): same_name(actual, name)
+		None: False
+
+
+private pure func binding_rejection(program: ParsedProgram, actual: CheckErrorKind, name: String, kind: String, previous: Span) -> Bool:
+	match actual:
+		Errors.BindingRejection(Errors.ModuleBindingConflict(binding)):
+			match binding:
+				FunctionName(written): kind == "function" and has_name(program, written.id, name) and same_span(written.span, previous)
+				ConstructorName(written): kind == "constructor" and has_name(program, written.id, name) and same_span(written.span, previous)
+				ModuleAliasName(written): kind == "module alias" and has_name(program, written.id, name) and same_span(written.span, previous)
+		Errors.BindingRejection(Errors.LocalBindingConflict(binding, origin)):
+			kind_matches = match origin:
+				ParameterBinding(_): kind == "parameter"
+				BodyLocal | MatchCapture: kind == "local"
+			kind_matches and has_name(program, binding.name, name) and same_span(binding.span, previous)
+		_: False
+
+
+private pure func bare_pattern_rejection(program: ParsedProgram, kind: CheckErrorKind, name: String) -> Bool:
+	match kind:
+		Errors.MatchRejection(Errors.BarePatternName(written, matched)):
+			matches_union = match matched:
+				UnionType(owner):
+					match inventory_unions(parsed_contents(program).declarations).get(union_number(owner)):
+						Some(declaration): has_name(program, declaration.type_name.id, "Color")
+						None: False
+				_: False
+			has_name(program, written, name) and matches_union
+		_: False
+
+
+private pure func unimported_pattern_rejection(program: ParsedProgram, kind: CheckErrorKind, name: String, previous: Span) -> Bool:
+	match kind:
+		Errors.MatchRejection(Errors.UnimportedConstructorPattern(id)):
+			match inventory_unions(parsed_contents(program).declarations).get(union_number(variant_owner(id))):
+				None: False
+				Some(declaration):
+					matches_variant = match declaration.variants.get(variant_number(id)):
+						Some(variant): has_name(program, variant.declaration.name.id, name) and same_span(variant.declaration.name.span, previous)
+						None: False
+					has_name(program, declaration.type_name.id, "Shape") and matches_variant
+		_: False
+
+
+-- The red run used the retained pre-variant form of these exact cases; typed
+-- identities are checked here as well as the complete rendered diagnostics.
+private pure func rejects(
+	parsed: Result[ParsedProgram, Diagnostic],
+	prefix: String,
+	name: String,
+	message: String,
+	help: String,
+	previous: Option[Span],
+	matches: pure (ParsedProgram, CheckErrorKind) -> Bool,
+) -> Bool:
+	match parsed:
+		Err(_): False
+		Ok(program):
+			match check(program):
+				Ok(_): False
+				Err(failure):
+					errors = check_errors(failure)
+					diagnostics = render_failure(failure)
+					expected = root_span(prefix.length(), name.length())
+					(
+						errors.remaining.is_empty()
+						and matches(program, errors.first.kind)
+						and diagnostics.remaining.is_empty()
+						and same_span(errors.first.span, expected)
+						and same_span(diagnostics.first.span, expected)
+						and diagnostics.first.message == message
+						and diagnostics.first.help == help
+						and same_note(diagnostics.first.note, previous)
+					)
+
+
+private pure func parsed(source: String) -> Result[ParsedProgram, Diagnostic]:
+	parse_modules([{ source = source, targets = [] }])
+
+
+private pure func collision(prefix: String, name: String, suffix: String, kind: String, previous: Span) -> Bool:
+	location = if kind == "parameter" or kind == "local":
+		"function"
+	else:
+		"module"
+	rejects(
+		parsed(prefix + name + suffix + MAIN), prefix, name,
+		"`" + name + "` is already a " + kind + " in this " + location,
+		RENAME_HELP, Some(previous),
+		pure func(program: ParsedProgram, actual: CheckErrorKind) -> Bool: binding_rejection(program, actual, name, kind, previous),
+	)
+
+
+pure func test_name_rejection_predicates_reject_an_unexpected_error_family() -> Bool:
+	match parsed(COLOR + MAIN):
+		Err(_): False
+		Ok(program):
+			match existing_name(parsed_contents(program).names, "Red"):
+				None: False
+				Some(name):
+					unexpected = Errors.ValueRejection(Errors.UnknownValue(name))
+					previous = root_span("fixed union Color:\n\t".length(), 3)
+					(
+						not binding_rejection(program, unexpected, "Red", "constructor", previous)
+						and not bare_pattern_rejection(program, unexpected, "Red")
+						and not unimported_pattern_rejection(program, unexpected, "Red", previous)
+					)
+
+
+pure func test_unknown_bare_name_cannot_become_a_catch_all() -> Bool:
+	prefix = COLOR + "pure func score(color: Color) -> Int:\n\tmatch color:\n\t\tRed: 1\n\t\t"
+	rejects(parsed(prefix + "Gren: 2\n" + MAIN), prefix, "Gren", BARE_MESSAGE, BARE_HELP, None,
+		pure func(program: ParsedProgram, kind: CheckErrorKind) -> Bool: bare_pattern_rejection(program, kind, "Gren"),
+	)
+
+
+pure func test_another_unions_bare_constructor_is_not_a_catch_all() -> Bool:
+	light = "fixed union Light:\n\tOn\n\tOff\n"
+	prefix = COLOR + light + "pure func score(color: Color) -> Int:\n\tmatch color:\n\t\tRed: 1\n\t\t"
+	rejects(parsed(prefix + "On: 2\n" + MAIN), prefix, "On", BARE_MESSAGE, BARE_HELP, None,
+		pure func(program: ParsedProgram, kind: CheckErrorKind) -> Bool: bare_pattern_rejection(program, kind, "On"),
+	)
+
+
+pure func test_parameter_cannot_hide_a_module_function() -> Bool:
+	declaration = "pure func "
+	prefix = declaration + "helper() -> Int:\n\t1\npure func use("
+	collision(prefix, "helper", ": Int) -> Int:\n\t0\n", "function", root_span(declaration.length(), 6))
+
+
+pure func test_immutable_local_cannot_hide_a_module_function() -> Bool:
+	declaration = "pure func "
+	prefix = declaration + "helper() -> Int:\n\t1\npure func use() -> Int:\n\t"
+	collision(prefix, "helper", " = 2\n\t0\n", "function", root_span(declaration.length(), 6))
+
+
+pure func test_mutable_local_cannot_hide_a_module_function() -> Bool:
+	declaration = "pure func "
+	prefix = declaration + "helper() -> Int:\n\t1\npure func use() -> Int:\n\tvar "
+	collision(prefix, "helper", " = 2\n\t0\n", "function", root_span(declaration.length(), 6))
+
+
+pure func test_field_capture_cannot_hide_a_module_function() -> Bool:
+	declaration = VALUE + "pure func "
+	prefix = declaration + "helper() -> Int:\n\t1\npure func use(value: Value) -> Int:\n\tmatch value:\n\t\tNumber("
+	collision(prefix, "helper", "): 2\n\t\tEmpty: 0\n", "function", root_span(declaration.length(), 6))
+
+
+pure func test_duplicate_parameters_use_the_original_parameter_note() -> Bool:
+	declaration = "pure func use("
+	prefix = declaration + "value: Int, "
+	collision(prefix, "value", ": Int) -> Int:\n\t0\n", "parameter", root_span(declaration.length(), 5))
+
+
+pure func test_unknown_parameter_annotation_precedes_duplicate_parameter() -> Bool:
+	prefix = "pure func use(value: Int, value: "
+	source = prefix + "Missing) -> Int:\n\t0\n" + MAIN
+	rejects(parsed(source), prefix, "Missing", "unknown type",
+		"declare or import this type; builtin types and declared type parameters are also available", None,
+		pure func(program: ParsedProgram, kind: CheckErrorKind) -> Bool:
+			match kind:
+				Errors.TypeTermRejection(Errors.UnknownType(name)): has_name(program, name, "Missing")
+				_: False
+	)
+
+
+pure func test_mutable_local_cannot_hide_a_parameter() -> Bool:
+	declaration = "pure func use("
+	prefix = declaration + "value: Int) -> Int:\n\tvar "
+	collision(prefix, "value", " = 2\n\t0\n", "parameter", root_span(declaration.length(), 5))
+
+
+pure func test_field_capture_cannot_hide_a_parameter() -> Bool:
+	declaration = VALUE + "pure func use("
+	prefix = declaration + "value: Value) -> Int:\n\tmatch value:\n\t\tNumber("
+	collision(prefix, "value", "): 2\n\t\tEmpty: 0\n", "parameter", root_span(declaration.length(), 5))
+
+
+pure func test_duplicate_mutable_declarations_use_the_original_local_note() -> Bool:
+	declaration = "func main() -> Int:\n\tvar "
+	prefix = declaration + "value = 1\n\tvar "
+	rejects(parsed(prefix + "value = 2\n\tvalue\n"), prefix, "value",
+		"`value` is already a local in this function", RENAME_HELP,
+		Some(root_span(declaration.length(), 5)),
+		pure func(program: ParsedProgram, kind: CheckErrorKind) -> Bool:
+			binding_rejection(program, kind, "value", "local", root_span(declaration.length(), 5))
+	)
+
+
+pure func test_mutable_local_cannot_hide_a_capture() -> Bool:
+	declaration = VALUE + "pure func use(value: Value) -> Int:\n\tmatch value:\n\t\tNumber("
+	prefix = declaration + "number):\n\t\t\tvar "
+	collision(prefix, "number", " = 2\n\t\t\t0\n\t\tEmpty: 0\n", "local", root_span(declaration.length(), 6))
+
+
+pure func test_field_capture_cannot_hide_an_enclosing_local() -> Bool:
+	declaration = VALUE + "pure func use(value: Value) -> Int:\n\t"
+	prefix = declaration + "number = 1\n\tmatch value:\n\t\tNumber("
+	collision(prefix, "number", "): 2\n\t\tEmpty: 0\n", "local", root_span(declaration.length(), 6))
+
+
+pure func test_repeated_fields_use_the_first_capture_note() -> Bool:
+	pair = "fixed union Pair:\n\tTogether(Int, Int)\n"
+	declaration = pair + "pure func use(pair: Pair) -> Int:\n\tmatch pair:\n\t\tTogether("
+	prefix = declaration + "value, "
+	collision(prefix, "value", "): 0\n", "local", root_span(declaration.length(), 5))
+
+
+pure func test_parameter_cannot_hide_a_constructor() -> Bool:
+	declaration = "fixed union Signal:\n\t"
+	prefix = declaration + "Ready\npure func use("
+	collision(prefix, "Ready", ": Int) -> Int:\n\t0\n", "constructor", root_span(declaration.length(), 5))
+
+
+pure func test_parameter_cannot_hide_an_imported_module_alias() -> Bool:
+	declaration = "import:\n\t./helper as "
+	prefix = declaration + "tools\npure func use("
+	rejects(
+		parse_modules([
+			{ source = prefix + "tools: Int) -> Int:\n\t0\n" + MAIN, targets = [1] },
+			{ source = "pure func helper() -> Int:\n\t1\n", targets = [] },
+		]),
+		prefix, "tools", "`tools` is already a module alias in this module", RENAME_HELP,
+		Some(root_span(declaration.length(), 5)),
+		pure func(program: ParsedProgram, kind: CheckErrorKind) -> Bool:
+			binding_rejection(program, kind, "tools", "module alias", root_span(declaration.length(), 5))
+	)
+
+
+private pure func with_answer_prelude(source: String, prelude: String) -> Result[ParsedProgram, Diagnostic]:
+	parse_modules_with_prelude([
+		{ source = source + MAIN, targets = [] },
+		{ source = "fixed union Answer:\n\tYes\npure func answer() -> Answer:\n\tYes\n", targets = [] },
+	], 1, { source = prelude, targets = [2, 1] })
+
+
+pure func test_parameter_cannot_hide_a_prelude_function() -> Bool:
+	declaration = "import:\n\t_base: Int\n\t./answers: Answer(Yes), "
+	prefix = "pure func use("
+	match module_id(3):
+		None: False
+		Some(prelude):
+			previous = { source = module_source(prelude), start = declaration.length(), end = declaration.length() + 6 }
+			rejects(
+				with_answer_prelude(prefix + "answer: Int) -> Int:\n\t0\n", declaration + "answer\n"),
+				prefix, "answer", "`answer` is already a function in this module", RENAME_HELP,
+				Some(previous),
+				pure func(program: ParsedProgram, actual: CheckErrorKind) -> Bool: binding_rejection(program, actual, "answer", "function", previous),
+			)
+
+
+pure func test_parameter_cannot_hide_a_prelude_constructor() -> Bool:
+	declaration = "import:\n\t_base: Int\n\t./answers: Answer("
+	prefix = "pure func use("
+	match module_id(3):
+		None: False
+		Some(prelude):
+			previous = { source = module_source(prelude), start = declaration.length(), end = declaration.length() + 3 }
+			rejects(
+				with_answer_prelude(prefix + "Yes: Int) -> Int:\n\t0\n", declaration + "Yes), answer\n"),
+				prefix, "Yes", "`Yes` is already a constructor in this module", RENAME_HELP,
+				Some(previous),
+				pure func(program: ParsedProgram, actual: CheckErrorKind) -> Bool: binding_rejection(program, actual, "Yes", "constructor", previous),
+			)
+
+
+pure func test_prelude_owned_alias_does_not_enter_the_user_scope() -> Bool:
+	source = "pure func use(tools: Int) -> Int:\n\ttools\n"
+	prelude = "import:\n\t_base: Int\n\t./answers as tools: Answer(Yes), answer\n"
+	match with_answer_prelude(source, prelude):
+		Err(_): False
+		Ok(program): check(program).is_ok()
+
+
+private pure func unimported_constructor(nested: Bool) -> Bool:
+	declaration = "fixed union Shape:\n\tCircle\n\t"
+	prefix = if nested:
+		"import:\n\t./shapes: Shape(Circle)\nfixed union Wrapper:\n\tHolds(Shape)\npure func use(value: Wrapper) -> Int:\n\tmatch value:\n\t\tHolds("
+	else:
+		"import:\n\t./shapes: Shape(Circle)\npure func use(value: Shape) -> Int:\n\tmatch value:\n\t\tCircle: 0\n\t\t"
+	suffix = if nested:
+		"): 4\n"
+	else:
+		": 4\n"
+	match module_id(1):
+		None: False
+		Some(provider):
+			previous = { source = module_source(provider), start = declaration.length(), end = declaration.length() + 6 }
+			rejects(
+				parse_modules([
+					{ source = prefix + "Square" + suffix + MAIN, targets = [1] },
+					{ source = declaration + "Square\n", targets = [] },
+				]),
+				prefix, "Square", "Square is a constructor of Shape but is not imported",
+				"import Square with its union: Shape(Square), from the module that declares Shape",
+				Some(previous),
+				pure func(program: ParsedProgram, actual: CheckErrorKind) -> Bool: unimported_pattern_rejection(program, actual, "Square", previous),
+			)
+
+
+pure func test_unimported_bare_constructor_has_import_help() -> Bool:
+	unimported_constructor(False)
+
+
+pure func test_unimported_nested_constructor_has_import_help() -> Bool:
+	unimported_constructor(True)
+
+
+pure func test_visible_nested_constructor_keeps_its_unsupported_boundary() -> Bool:
+	prefix = "fixed union Shape:\n\tCyan\nfixed union Wrapper:\n\tHolds(Shape)\npure func use(value: Wrapper) -> Int:\n\tmatch value:\n\t\tHolds("
+	source = prefix + "Cyan): 4\n" + MAIN
+	rejects(parsed(source), prefix, "Cyan", "nested patterns are not supported yet",
+		"bind the field to a name and match it in a second match; nested patterns arrive with the pattern-compilation milestone", None,
+		pure func(program: ParsedProgram, kind: CheckErrorKind) -> Bool:
+			match kind:
+				Errors.UnsupportedSyntax(Errors.NestedPattern): True
+				_: False
+	)
+
+
+private pure func accepted(source: String) -> Bool:
+	match parsed(source + MAIN):
+		Err(_): False
+		Ok(program): check(program).is_ok()
+
+
+pure func test_wildcard_remains_the_whole_arm_catch_all() -> Bool:
+	accepted(COLOR + "pure func score(color: Color) -> Int:\n\tmatch color:\n\t\tRed: 1\n\t\t_: 2\n")
+
+
+pure func test_field_captures_remain_legal() -> Bool:
+	accepted("pure func use(value: Option[Int]) -> Int:\n\tmatch value:\n\t\tSome(number): number\n\t\tNone: 0\n")
+
+
+pure func test_sibling_arms_have_independent_capture_scopes() -> Bool:
+	source: String =
+		|fixed union Choice:
+		|	Left(Int)
+		|	Right(Int)
+		|pure func use(choice: Choice) -> Int:
+		|	match choice:
+		|		Left(value): value
+		|		Right(value): value
+		|
+	accepted(source)
+
+
+pure func test_a_type_name_does_not_claim_the_value_namespace() -> Bool:
+	accepted("fixed record Holder { value: Int }\npure func use(Holder: Int) -> Int:\n\tHolder\n")
+
+
+pure func test_mutable_assignment_keeps_the_original_binding() -> Bool:
+	accepted("pure func use() -> Int:\n\tvar value = 1\n\tvalue = 2\n\tvalue\n")
+
+
+pure func test_new_declaration_checks_initializer_before_its_collision() -> Bool:
+	prefix = "func main() -> Int:\n\tvar value = 1\n\tvar value = "
+	source = prefix + "missing\n\tvalue\n"
+	rejects(parsed(source), prefix, "missing", "unknown value",
+		"use this function's parameter name, a declared variant, or a call", None,
+		pure func(program: ParsedProgram, kind: CheckErrorKind) -> Bool:
+			match kind:
+				Errors.ValueRejection(Errors.UnknownValue(name)): has_name(program, name, "missing")
+				_: False
+	)
+
+
+pure func test_immutable_assignment_classification_precedes_its_initializer() -> Bool:
+	prefix = "func main() -> Int:\n\tvalue = 1\n\t"
+	source = prefix + "value = missing\n\tvalue\n"
+	rejects(parsed(source), prefix, "value",
+		"cannot assign to an immutable binding", "declare the binding with var to allow reassignment", None,
+		pure func(program: ParsedProgram, kind: CheckErrorKind) -> Bool:
+			match kind:
+				Errors.StatementRejection(Errors.ImmutableAssignment(previous)):
+					has_name(program, previous.name, "value") and same_span(previous.span, root_span("func main() -> Int:\n\t".length(), 5))
+				_: False
+	)
+
+
+pure func test_join_assignment_classification_precedes_its_initializer() -> Bool:
+	prefix = "pure func use(value: Option[Int]) -> Int:\n\tvar total = 0\n\tmatch value:\n\t\tSome(number):\n\t\t\t"
+	source = prefix + "total = missing\n\t\tNone: void\n\ttotal\n" + MAIN
+	rejects(parsed(source), prefix, "total",
+		"reassigning a variable declared outside this match arm is not supported yet",
+		"bind the match's value with name = match ... instead; reassignment inside an arm arrives with joins that carry reassigned variables",
+		None,
+		pure func(program: ParsedProgram, kind: CheckErrorKind) -> Bool:
+			match kind:
+				Errors.UnsupportedSyntax(Errors.JoinArmReassignment): True
+				_: False
+	)
+
+
+pure func test_propagation_keeps_its_unsupported_boundary() -> Bool:
+	prefix = "pure func use(value: Option[Int]) -> Option[Int]:\n\t"
+	form = "value ?= value"
+	source = prefix + form + "\n\tSome(value)\n" + MAIN
+	rejects(parsed(source), prefix, form, "`?=` is not supported yet",
+		"match on the Option or Result and return its failing case; `?=` arrives with the join milestone", None,
+		pure func(program: ParsedProgram, kind: CheckErrorKind) -> Bool:
+			match kind:
+				Errors.UnsupportedSyntax(Errors.Propagation): True
+				_: False
+	)
+
+
+pure func test_for_binder_keeps_its_unsupported_boundary() -> Bool:
+	prefix = "pure func use(value: List[Int]) -> Int:\n\t"
+	form = "for value in value:\n\t\tvoid"
+	source = prefix + form + "\n\t0\n" + MAIN
+	rejects(parsed(source), prefix, form, "`for` is not supported yet",
+		"write a recursive function; loops arrive with the loops milestone", None,
+		pure func(program: ParsedProgram, kind: CheckErrorKind) -> Bool:
+			match kind:
+				Errors.UnsupportedSyntax(Errors.ForStatement): True
+				_: False
+	)
+
+
+pure func test_lambda_parameter_keeps_its_unsupported_boundary() -> Bool:
+	prefix = "pure func use(value: Int) -> Int:\n\tclosure = "
+	form = "func(value: Int) -> Int: value"
+	source = prefix + form + "\n\t0\n" + MAIN
+	rejects(parsed(source), prefix, form, "lambdas are not supported yet",
+		"declare a named function and call it; lambdas arrive with the lambdas milestone", None,
+		pure func(program: ParsedProgram, kind: CheckErrorKind) -> Bool:
+			match kind:
+				Errors.UnsupportedSyntax(Errors.LambdaValue): True
+				_: False
+	)
+
+
+tests: TestSuite = {
+	description = "Binding names and constructor-only match arms",
+	tests = [
+		("name predicates reject an unexpected error family", test_name_rejection_predicates_reject_an_unexpected_error_family),
+		("unknown bare name cannot become a catch-all", test_unknown_bare_name_cannot_become_a_catch_all),
+		("another union's bare constructor is not a catch-all", test_another_unions_bare_constructor_is_not_a_catch_all),
+		("parameter cannot hide a module function", test_parameter_cannot_hide_a_module_function),
+		("immutable local cannot hide a module function", test_immutable_local_cannot_hide_a_module_function),
+		("mutable local cannot hide a module function", test_mutable_local_cannot_hide_a_module_function),
+		("field capture cannot hide a module function", test_field_capture_cannot_hide_a_module_function),
+		("duplicate parameters retain the original note", test_duplicate_parameters_use_the_original_parameter_note),
+		("unknown parameter annotation precedes duplicate parameter", test_unknown_parameter_annotation_precedes_duplicate_parameter),
+		("mutable local cannot hide a parameter", test_mutable_local_cannot_hide_a_parameter),
+		("field capture cannot hide a parameter", test_field_capture_cannot_hide_a_parameter),
+		("duplicate mutable declarations retain the original note", test_duplicate_mutable_declarations_use_the_original_local_note),
+		("mutable local cannot hide a capture", test_mutable_local_cannot_hide_a_capture),
+		("field capture cannot hide an enclosing local", test_field_capture_cannot_hide_an_enclosing_local),
+		("repeated fields retain the first capture note", test_repeated_fields_use_the_first_capture_note),
+		("parameter cannot hide a constructor", test_parameter_cannot_hide_a_constructor),
+		("parameter cannot hide an imported module alias", test_parameter_cannot_hide_an_imported_module_alias),
+		("parameter cannot hide a prelude function", test_parameter_cannot_hide_a_prelude_function),
+		("parameter cannot hide a prelude constructor", test_parameter_cannot_hide_a_prelude_constructor),
+		("prelude-owned alias does not enter user scope", test_prelude_owned_alias_does_not_enter_the_user_scope),
+		("unimported bare constructor has import help", test_unimported_bare_constructor_has_import_help),
+		("unimported nested constructor has import help", test_unimported_nested_constructor_has_import_help),
+		("visible nested constructor keeps unsupported boundary", test_visible_nested_constructor_keeps_its_unsupported_boundary),
+		("wildcard remains the whole-arm catch-all", test_wildcard_remains_the_whole_arm_catch_all),
+		("field captures remain legal", test_field_captures_remain_legal),
+		("sibling arms have independent capture scopes", test_sibling_arms_have_independent_capture_scopes),
+		("type name does not claim the value namespace", test_a_type_name_does_not_claim_the_value_namespace),
+		("mutable assignment keeps the original binding", test_mutable_assignment_keeps_the_original_binding),
+		("new declaration checks initializer before collision", test_new_declaration_checks_initializer_before_its_collision),
+		("immutable assignment classification precedes initializer", test_immutable_assignment_classification_precedes_its_initializer),
+		("join assignment classification precedes initializer", test_join_assignment_classification_precedes_its_initializer),
+		("propagation keeps its unsupported boundary", test_propagation_keeps_its_unsupported_boundary),
+		("for binder keeps its unsupported boundary", test_for_binder_keeps_its_unsupported_boundary),
+		("lambda parameter keeps its unsupported boundary", test_lambda_parameter_keeps_its_unsupported_boundary),
+	]
+}

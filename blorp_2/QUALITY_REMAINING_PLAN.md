@@ -95,6 +95,16 @@ cost. Preserve these observations without describing them as a waived ceiling.
 
 ## Other rule deltas
 
+The naming implementation has completed independent source reviews and its
+standalone acceptance: 2,775 component checks, 439 e2e checks, zero leaks in
+878 strict runs, and identical C for 349 shared successful inputs. Production
+shrinks by 29 lines. Corpus allocations/instructions fall 0.387%/0.216%;
+canonical host-build proxies rise 0.331%/0.338%, below their +1% ceilings.
+The dynamic frontier is now 33/35: the new scope module parses; Char and
+function types remain the two gaps. The actual main destination also passes
+the literal full Makefile gate: 2,775 component checks and 439 e2e checks. See the
+[naming evidence](../benchmarks/results/blorp_2_quality_names_2026-10-16.md).
+
 Pattern/binding, private-type and UFCS delta plans have received independent
 review. Their implementations remain separate review and integration slices;
 approval of a plan is not approval of its resulting code or measurements.

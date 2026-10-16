@@ -1,14 +1,16 @@
 import:
-	../../../src/utils/names: program_names
+	../../../src/utils/names: program_names, same_name
 	../../../src/utils/ids as Declaration
 	../../../src/utils/source: module_source, root_module_id
 	../../../src/check/check: CheckedProgram, check_errors, checked_functions
 	../../../src/check/errors as Errors
 	../../../src/check/model as Check
 	../../../src/check/render: render_failure
+	../../../src/namespace/namespace: ValueBinding(FunctionName)
+	../../../src/parse/assemble: parsed_contents
 	../../../src/lex/lex: lex
-	../../../src/utils/syntax: Diagnostic, FunctionExecution(SelfTailLoop, OrdinaryCalls), same_span
-	../input: check, parse, setup_diagnostic
+	../../../src/utils/syntax: Diagnostic, DiagnosticNote(PreviousDeclaration), FunctionExecution(SelfTailLoop, OrdinaryCalls), same_span
+	../input: check, parse, setup_diagnostic, existing_name
 	../module_input: PRIMITIVE_BASE, INTEGER_OPERATIONS, parse_modules_with_base
 	test: TestSuite
 
@@ -196,12 +198,25 @@ pure func test_impure_self_tail_is_checked() -> Bool:
 	accepts(source + MAIN)
 
 
-pure func test_ufcs_target_ignores_parameter_shadow() -> Bool:
+pure func test_ufcs_tail_call_preserves_a_local_receiver_identity() -> Bool:
 	source: String =
-		|@tail_recursive func loop(loop: Int) -> Int:
-		|	loop.loop()
+		|@tail_recursive func loop(value: Int) -> Int:
+		|	receiver = value
+		|	receiver.loop()
 		|
-	accepts(source + MAIN)
+	match checked(source + MAIN):
+		Err(_): False
+		Ok(program):
+			match checked_functions(program).functions:
+				[function, _]:
+					match (function.execution, function.statements, function.body):
+						(SelfTailLoop(_), [Check.InitializeBinding(local, initializer)], Check.CheckedValueBody(Check.RecurWith([receiver], _))):
+							match (initializer.form, receiver.form):
+								(Check.ReadBinding(parameter), Check.ReadBinding(argument)):
+									Check.binding_number(parameter) == 0 and Check.binding_number(local) == 1 and Check.binding_number(argument) == Check.binding_number(local)
+								_: False
+						_: False
+				_: False
 
 
 pure func test_unannotated_recursion_stays_ordinary() -> Bool:
@@ -580,7 +595,7 @@ pure func test_ordinary_purity_error_precedes_annotation() -> Bool:
 							False
 
 
-pure func test_direct_parameter_shadow_is_not_recursion() -> Bool:
+pure func test_parameter_collision_precedes_tail_annotation() -> Bool:
 	source: String =
 		|@tail_recursive pure func loop(loop: Int) -> Int:
 		|	loop(loop)
@@ -596,11 +611,25 @@ pure func test_direct_parameter_shadow_is_not_recursion() -> Bool:
 				Ok(_):
 					False
 				Err(failure):
-					match check_errors(failure).first.kind:
-						Errors.CallRejection(Errors.UncallableBinding(_, _, _)):
-							True
-						_:
-							False
+					errors = check_errors(failure)
+					diagnostics = render_failure(failure)
+					match (errors.first.kind, existing_name(parsed_contents(parsed).names, "loop")):
+						(Errors.BindingRejection(Errors.ModuleBindingConflict(FunctionName(previous))), Some(expected)):
+							primary_start = "@tail_recursive pure func loop(".length()
+							primary = { source = module_source(root_module_id()), start = primary_start, end = primary_start + 4 }
+							declaration_start = "@tail_recursive pure func ".length()
+							declaration = { source = module_source(root_module_id()), start = declaration_start, end = declaration_start + 4 }
+							note_matches = match diagnostics.first.note:
+								Some(PreviousDeclaration(original)): same_span(original, declaration)
+								_: False
+							(
+								errors.remaining.is_empty() and diagnostics.remaining.is_empty()
+								and same_name(previous.id, expected) and same_span(previous.span, declaration)
+								and same_span(errors.first.span, primary) and same_span(diagnostics.first.span, primary)
+								and diagnostics.first.message == "`loop` is already a function in this module"
+								and diagnostics.first.help == "choose a different name for this binding" and note_matches
+							)
+						_: False
 
 
 pure func test_no_self_error_precedes_managed_admission() -> Bool:
@@ -636,14 +665,14 @@ tests: TestSuite = {
 			"ordinary purity error precedes annotation",
 			test_ordinary_purity_error_precedes_annotation,
 		),
-		("direct parameter shadow is not recursion", test_direct_parameter_shadow_is_not_recursion),
+		("parameter collision precedes tail annotation", test_parameter_collision_precedes_tail_annotation),
 		("no self error precedes managed admission", test_no_self_error_precedes_managed_admission),
 		("direct terminal is explicit", test_direct_terminal_is_explicit),
 		("ufcs terminal preserves receiver", test_ufcs_terminal_preserves_receiver),
 		("zero argument main is checked", test_zero_argument_main_is_checked),
 		("unused zero argument helper is checked", test_unused_zero_argument_helper_is_checked),
 		("impure self tail is checked", test_impure_self_tail_is_checked),
-		("ufcs target ignores parameter shadow", test_ufcs_target_ignores_parameter_shadow),
+		("ufcs tail call preserves local receiver identity", test_ufcs_tail_call_preserves_a_local_receiver_identity),
 		("unannotated recursion stays ordinary", test_unannotated_recursion_stays_ordinary),
 		("unused nongeneric no self rejects", test_unused_nongeneric_no_self_rejects),
 		("unused generic rejects", test_unused_generic_rejects),

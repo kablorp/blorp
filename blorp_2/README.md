@@ -145,15 +145,18 @@ func main() -> Int:
 It exits 42 with empty stdout and stderr. `Number(42)` constructs a value;
 `Number(number)` selects that constructor and binds its field. A field `_`
 discards the field, and a whole-pattern `_` matches any remaining value.
-An unshadowed bare variant pattern selects that variant; another bare name
-binds the complete matched value. Matches require exhaustive, useful arms.
+A whole-arm name must select a visible constructor of the matched union.
+`_` is the only whole-arm catch-all; an arm that needs the whole value reads
+the scrutinee binding. Matches require exhaustive, useful arms.
 The scrutinee runs once and only the first matching arm's result runs.
 The companion [`match/values.brp`](test/e2e/fixtures/match/values.brp) covers
-whole-value capture and field preservation; the separate
-[`match/shadow.brp`](test/e2e/fixtures/match/shadow.brp) covers shadowing. Small
+whole-value and field preservation; the separate
+[`match/shadow.brp`](test/e2e/fixtures/match/shadow.brp) preserves an outer
+parameter alongside a distinct field capture. Small
 source fixtures expose these behaviors through `main`; exact full-width
 values and evaluation order are checked directly at phase boundaries.
-Pattern captures are immutable.
+Pattern captures are immutable. The pilot enforces these name rules; the
+frozen host compiler keeps its existing shadowing and whole-arm capture behavior.
 
 The [bindings example](test/e2e/fixtures/binding/basic.brp) adds a prefix of local
 bindings before the final expression or tail match:
@@ -176,7 +179,7 @@ functions. Every initializer runs once in source order, including unused
 bindings. The [binding report](../benchmarks/results/blorp_2_bindings_2026-10-09.md) records phase validation;
 the [companion fixture](test/e2e/fixtures/binding/values.brp) instead returns
 the reassigned current value, 42. Separate small fixtures cover self-assignment,
-parameter shadowing and union values. Phase tests check exact full-width values
+parameter initialization and union values. Phase tests check exact full-width values
 and evaluation order.
 
 Bindings also compose with match arms. The
@@ -204,13 +207,13 @@ An arm block contains zero or more binding or Void expression statements and a f
 indented deeper than its pattern. An inline arm holds one value, or one
 statement (`None: failure = Some(error)`), as in the host; a statement arm
 has no value, which a tail match rejects. Inline and block arms can coexist.
-Each arm has its own scope; sibling arms can declare the same name. An explicit
-`var` may shadow an enclosing binding, and its initializer sees the earlier
-binding. Ordinary `=` still reassigns the nearest mutable binding or rejects
+Each arm has its own scope; sibling arms can declare the same fresh name. An
+explicit `var` cannot hide an enclosing binding; its initializer may read that
+binding to initialize a distinct local. Ordinary `=` still reassigns the nearest mutable binding or rejects
 assignment to an immutable one. Companion fixtures return the
 [updated value](test/e2e/fixtures/match/binding_current.brp), exercise the
 [other branch](test/e2e/fixtures/match/binding_empty.brp), and preserve an
-[outer value](test/e2e/fixtures/match/binding_outer.brp) across shadowing.
+[outer value](test/e2e/fixtures/match/binding_outer.brp) alongside arm-local mutation.
 
 The [mortal String example](test/e2e/fixtures/mortal_string/basic.brp) starts the
 managed path without literals, traits or general imports:
@@ -1220,16 +1223,20 @@ Semantic rules:
   `Number(expression)` supplies its one field; `Pair(left, right)` supplies two.
   Each complete field type is established by the receiving union instance.
   A name cannot refer to another function's parameter or denote a function value.
-  A local binding shadows a same-named constructor or direct call; its established type
-  is preserved, with no fallback to a constructor when that type is wrong.
+  A new parameter, local or field capture cannot reuse a visible function,
+  constructor or module alias, or an enclosing parameter, local or capture. The
+  prelude provides functions and constructors; its own aliases are not inherited.
+  Type-only names occupy the separate type namespace. A
+  binding's established type is preserved when it is read.
   Arguments use the caller's scope, even when the callee has a parameter with
   the same spelling.
 - `name = expression` declares an immutable binding when the name is absent,
   reassigns an existing mutable binding, and rejects an existing immutable
-  binding. `var` declares a fresh mutable binding and may shadow a parameter,
-  an arm capture, or a local from an enclosing block; redeclaring a local in
-  the same block is rejected. The initializer sees the earlier
-  scope, so `var value = value` can initialize from a parameter. New bindings
+  binding. `var` declares a fresh mutable binding under the same no-shadowing rule.
+  The initializer sees the earlier scope: write `var current = value` to
+  initialize a distinct mutable local from a parameter. New declarations check
+  their initializer before reporting a name collision; assignment to an existing
+  binding still reports immutable or unsupported reassignment before its RHS. New bindings
   infer their type from the initializer; reassignment checks the established
   type. Bare constructors need a receiving union type, supplied by a call,
   return or reassignment; a new local initializer does not guess that type.
@@ -1237,11 +1244,10 @@ Semantic rules:
   in an arm a constant scrutinee cannot select. Arm locals stay within their
   arm. Reassignment of an enclosing mutable binding affects only the selected
   arm's computation; matches remain in the function tail.
-- `receiver.function(arguments)` resolves its target from the file's declared functions,
-  independently of parameter shadowing. The receiver still uses the caller's scope.
-  A parameter named `identity` can therefore be read and passed to the declared
-  function with `identity.identity()`; the direct call `identity(identity)` tries
-  to call the parameter and is rejected. UFCS supplies the receiver first, followed
+- `receiver.function(arguments)` resolves its target from the file's declared
+  and imported receiver functions. The receiver uses the caller's scope: a
+  parameter `value` can be passed to `identity` with `value.identity()`. A
+  direct call on a parameter value, such as `value(value)`, is rejected. UFCS supplies the receiver first, followed
   by the explicitly written arguments. Every argument is evaluated left to right
   exactly once before the call.
 - Each argument must match its receiving type, as must the final expression
@@ -1259,10 +1265,12 @@ Semantic rules:
   the matched union. Void functions evaluate and discard the selected arm's
   result. All arms are checked, including ones a constant scrutinee
   cannot select.
-- An unshadowed constructor spelling in a bare pattern selects that variant
-  of the matched union. Other bare names, including a spelling shadowed by a
-  local binding, introduce fresh whole-value binders. Explicit constructor
-  patterns require an unshadowed constructor of the matched union. Its declared field
+- A bare pattern name must be a visible constructor of the matched union.
+  Constructors declared in another module must be imported with their union;
+  an unimported constructor receives import help, including in a field position.
+  Unknown bare names are errors, and `_` alone catches all remaining values.
+  Bind a computed scrutinee before the match when an arm needs the whole value.
+  Explicit constructor patterns also require a visible constructor of that union. Its declared field
   shape determines the required pattern arity. Field binders and wildcards
   cover the constructor's entire field domain. Arm bindings are immutable and
   scoped to that arm; sibling arms may reuse a spelling. Earlier arms determine
@@ -1840,8 +1848,8 @@ diagnostic rendering are pure. The pipeline publishes these complete results:
    source bytes; no rewritten source or comment metadata crosses the boundary.
 2. Parsing produces function and union declarations, payload and parameter
    annotations, written names, ordered statement syntax, expression syntax, and structured match bodies.
-   Match patterns preserve names and field syntax without deciding whether a
-   bare name denotes a constructor or binding. Each expression has a literal,
+   Match patterns preserve written names and field syntax. Checking resolves a
+   whole-arm name as a constructor and validates each named field capture. Each expression has a literal,
    name, or direct application base with ordered recursive arguments, followed by
    receiver applications with ordered explicit arguments. Direct and receiver
    syntax stay distinct because their target lookup differs.
@@ -2012,8 +2020,8 @@ diagnostic rendering are pure. The pipeline publishes these complete results:
 8. Emission consumes that verified program and produces C. Computed values use
    immutable C locals; scalar reassignment requires no runtime mutable cell.
    A match uses its evaluated scrutinee once and switches on its tag. Arm-local field
-   projections occur only in the selected branch; a whole-value binder reads
-   the saved value. Emission consumes resolved lowered labels and values without repeating
+   projections occur only in the selected branch; a wildcard arm may read an
+   existing binding for the whole scrutinee. Emission consumes resolved lowered labels and values without repeating
    resolution, arity, purity, or coverage checks. Its result can report an
    internal lowered-reference error instead of silently choosing a C layout;
    source-language acceptance is already complete. Retains/releases project the

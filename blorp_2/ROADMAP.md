@@ -62,7 +62,8 @@ their own inventory and plan after M8.
   review, before a dependent slice relies on it. Parallel work needs disjoint
   files and contracts; compiled validation and measurements stay serialized.
 - **The frontier.** One number across the path, reported by
-  `scripts/blorp2-fixpoint --frontier`: files of `src` that parse (0 to 34),
+  `scripts/blorp2-fixpoint --frontier`: files of `src` that parse (report the
+  discovered numerator and denominator, currently 33/35),
   then the phase reached on `main.brp` (load, check, specialize, lower, own,
   verify, emit, C compiles, B passes e2e, B == C).
 
@@ -77,7 +78,7 @@ milestone work.
 | Milestone | Scope | Status |
 | --- | --- | --- |
 | [M0](#m0-foundation-closeout) | Re-cut, perf fixes, parser statement loop, fixpoint script, parity table | Landed. Managed-value recursion limits remain recorded under M4. |
-| [M1a](#m1a-surface-syntax-parity) | Layout, `\|`/`raw` strings, pattern/opaque/range syntax | Checkpoints 1, 2a, 2b and 3 landed. 32 of 34 files parse; the other two need a `Char` type (`lex.brp`) and function types (`specialize.brp`, M7). |
+| [M1a](#m1a-surface-syntax-parity) | Layout, `\|`/`raw` strings, pattern/opaque/range syntax | Checkpoints 1, 2a, 2b and 3 landed. The naming acceptance frontier is 33/35; the other two need a `Char` type (`lex.brp`) and function types (`specialize.brp`, M7). |
 | [ML](#ml-list-construction) | `append`, `set`, `concat`, list literal | Done. |
 | [M1b](#m1b-names-and-the-foundation) | Namespace: private, aliases, qualified names, designated `Bool`/`Option`/`Result` | Parts A and B done; control-flow consumers follow in M2/M3. |
 | [M5](#m5-constants) | Module-level constants | Reviewed plan; parser inventory precedes implementation; opaque shapes follow M4. |
@@ -235,15 +236,15 @@ private pure func width(
 ```
 
 **Exit proof.** [test_source_tree.brp](test/unit/test_parse/test_source_tree.brp)
-enumerates `blorp_2/src/**/*.brp`, parses each and reports N/34 (a direct phase
-test; no new entry point). The frontier reaches 34 here. Conformance suites and
+enumerates `blorp_2/src/**/*.brp`, parses each and reports N/M (a direct phase
+test; no new entry point). All discovered files must parse. Conformance suites and
 the EBNF move together.
 
 **Status.** Checkpoints 1, 2a, 2b and 3 slices 1 to 7a landed (layout and
 literals, declaration forms, patterns, `if`/`else`, `and`/`or`/`not`, `match`,
 propagating binding, loops and loop controls, bracketed blocks, levels-stack
 indentation). Checkpoint 3 also covers lambdas, inline statement arms, method chains
-across lines and `for _`. 32 of 34 files parse; the remaining two need a `Char`
+across lines and `for _`. The naming acceptance parses 33/35 files; the remaining two need a `Char`
 type (`lex.brp`) and function types (`specialize.brp`, M7).
 
 ## ML: List construction

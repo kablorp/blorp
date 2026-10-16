@@ -1007,6 +1007,14 @@ immutable name, and a destructuring always declares its names. The placement
 rules for `break`, `continue` and `?=`, and the full rules for assignable
 places, are in [section 5](#5-static-syntactic-restrictions).
 
+Blorp 2 validates new parameters, locals and constructor-field captures through
+one binding authority. They cannot reuse a visible function, constructor or
+module alias, or an enclosing parameter, local or capture; type-only names are
+separate. New declarations check their initializer before reporting a name
+collision. Existing immutable or unsupported assignments are classified before
+their RHS, and parameter types resolve before body-scope name validation. The
+frozen existing compiler remains more permissive about shadowing.
+
 `while`, `for` and `for ... concurrently` are statements and have no value. A
 `for` where a value is required is ``for` is a statement and has no value``,
 with a hint to use `map` (`LP:6115-6134`).
@@ -1352,6 +1360,13 @@ spread_target  = name | "_" ;
   shadowing name or a name unrelated to the matched type binds a variable.
   A matching constructor from another module that is not imported bare requires
   an import or module qualification, rather than becoming a variable binding.
+- Blorp 2 rejects whole-arm bindings: a whole-arm bare name must be a visible
+  constructor of the matched union, and `_` alone is the catch-all. Unknown
+  names get constructor guidance. An unimported constructor gets import help,
+  including in a field position; a visible nested constructor retains the
+  staged unsupported-pattern rejection. Payload captures remain valid under
+  the no-shadowing rule above. Bind a computed scrutinee before the match when
+  an arm needs its whole value. Qualified patterns remain a later pilot increment.
 - Or-pattern alternatives cannot introduce variable bindings, including
   payload, tuple, list-element, and named list-spread bindings. This rule also
   applies to nested or-patterns and is checked during typechecking. Wildcards,

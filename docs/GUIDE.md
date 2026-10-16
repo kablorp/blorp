@@ -1918,9 +1918,16 @@ match key:
 Constructors from another module must be imported with their type for bare
 patterns, or qualified with the module alias. An unimported constructor of the
 value's union type produces an error instead of becoming a catch-all binding.
-A name unrelated to the value's type, or a local name that shadows a constructor,
-is a variable binding in a bare pattern. Rename the local binding to match that
-constructor instead.
+Use `_` as the catch-all and bind the scrutinee before matching when an arm
+needs the whole value. Blorp 2 enforces this rule: a whole-arm bare name must
+be a visible constructor, so a typo such as `Gren` cannot silently catch every
+remaining value. Constructor payloads can still bind names, as in `Some(value)`.
+Its parameters, locals and payload captures cannot hide visible functions,
+constructors, module aliases or enclosing bindings; type-only names are separate.
+Import a constructor with its union before using it in a pilot pattern;
+qualified patterns are a later increment. The frozen existing compiler also
+allows unrelated or shadowing whole-arm names to bind variables; see
+[GRAMMAR](GRAMMAR.md#39-patterns) for the compiler-specific rules.
 
 Or-pattern alternatives cannot introduce variable bindings, even when the
 payloads have the same type. Use `_` to ignore payload data, or split the

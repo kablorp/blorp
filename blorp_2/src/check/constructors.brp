@@ -21,6 +21,8 @@ import:
 		CheckError,
 		ExpectedTypeSite(SourceAnnotation),
 		CallError(ArgumentTypeMismatch),
+		MatchError(UnimportedConstructorPattern),
+		match_error,
 		ConstructorError(ConstructorNeedsExpectedType, VariantNotInExpectedType, PayloadFreeVariantCalled, ConstructorFieldCountMismatch),
 		RecordError(UpdateRequiresRecord, DuplicateUpdateField, RecordNeedsExpectedType, UnknownRecordField, DuplicateLiteralField, MissingRecordField, RecordFieldTypeMismatch),
 		ValueError(EmptyListNeedsElementType, ListElementTypeMismatch),
@@ -98,7 +100,18 @@ private pure func find_declared_variant(context: ResolutionContext, owner: Union
 pure func find_variant(context: ResolutionContext, occurrence: UnionOccurrence, name: WrittenName) -> Result[Option[VariantContract], CheckError]:
 	found ?= find_declared_variant(context, occurrence.owner, name)
 	match found:
-		None: Ok(None)
+		None:
+			match context.unions.get(union_number(occurrence.owner)):
+				None: Err(checker_invariant(name.span, InvalidCheckedUnion(occurrence.owner)))
+				Some(declaration):
+					var failure: Option[CheckError] = None
+					for variant in declaration.variants:
+						if same_name(variant.name.id, name.id):
+							failure = Some(match_error(name.span, UnimportedConstructorPattern(variant.id)))
+							break
+					match failure:
+						Some(error): Err(error)
+						None: Ok(None)
 		Some(variant):
 			match occurrence_fields(variant.fields, occurrence):
 				Ok(fields):
@@ -212,9 +225,9 @@ pure func plan_record_literal(
 			Err(error):
 				failure = Some(error)
 				break
-			Ok(field):
-				resolved = resolved.append(field)
-				previous = previous.append(field.written.name)
+			Ok(resolved_field):
+				resolved = resolved.append(resolved_field)
+				previous = previous.append(resolved_field.written.name)
 
 	names_ready ?= match failure:
 		Some(error):
@@ -247,17 +260,17 @@ pure func plan_record_literal(
 	else:
 		hints = record_argument_hints(occurrence.arguments)
 		var fields: List[PlannedRecordField] = []
-		var error: Option[CheckError] = None
+		var found_error: Option[CheckError] = None
 
 		for field in resolved:
 			result = plan_record_field(field, accepted, hints)
 			match result:
-				Ok(field): fields = fields.append(field)
-				Err(failure):
-					error = Some(failure)
+				Ok(planned_field): fields = fields.append(planned_field)
+				Err(field_error):
+					found_error = Some(field_error)
 					break
 
-		match error:
+		match found_error:
 			Some(error): Err(error)
 			None:
 				Ok(PlannedRecord({ origin = LiteralRecord(owner), value_type = term, fields = fields, span = span }))
