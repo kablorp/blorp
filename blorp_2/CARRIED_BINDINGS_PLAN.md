@@ -2,9 +2,10 @@
 
 Design reviewed by root and two independent compiler experts. Source baseline:
 main `e6785c22fb050572d703301eb1435f9cb8fcef4b` (2026-10-16), with the later
-argument lifts noted below. Preparation budgets are accepted; the physical probe
-and measurement-baseline review precede broad migration. No implementation,
-builds, tests or measurements have run. Feature budgets remain unapproved.
+argument lifts noted below. Preparation budgets are accepted. The early host
+storage screen is measured; whole-input cost and measurement-baseline review
+still precede broad migration. No production migration has run. Feature budgets
+remain unapproved.
 
 ## Problem and first input
 
@@ -206,6 +207,11 @@ This screen cannot approve migration or waive the final hard +3% per-input
 source-to-C/shared-input allocation and retired-instruction gates. Review measured
 storage before proceeding; source estimates do not prove cheap storage.
 
+The [early host storage screen](../benchmarks/results/blorp_2_carried_bindings_storage_2026-10-16.md)
+observed one extra allocation and 40 extra live bytes per wrapped definition.
+Its five allocation tests and separate C-inspection test pass. Whole-input costs
+and eventual pilot storage remain unverified; this is no migration approval.
+
 Source-based preparation estimate: lower 100–150 added/+20–40 net, own
 180–250/+50–80, verify 110–160/+20–50, emit 70–100/+10–30, plus 40–90 added/
 +0–20 net caller/analysis adjustments: **500–750 added/+100–220 net production**.
@@ -312,5 +318,5 @@ and request a smaller slice or explicitly reviewed budget. Consider a function
 value catalogue only with a demonstrated query that attached facts cannot serve.
 Hand back source/branch/diff, separate LOC, typed and mutation outcomes, complete
 C/diagnostic identity, provenance/raw paths and measured per-input verdicts.
-Open preparation decisions: physical probe and baseline epoch/cumulative metrics.
+Open preparation decisions: whole-input storage costs and baseline/cumulative metrics.
 After preparation, review feature transfer costs/fixture caps against its concrete diff.
