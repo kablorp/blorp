@@ -645,6 +645,8 @@ references may cross modules; only construction and projection are restricted
 to the declaring module, using namespace-owned declaration authority.
 Specialize substitutes the underlying type after instance keys are formed,
 so the concrete `TypeRef` has no opaque variant.
+The reviewed [ordinary opaque types plan](OPAQUE_TYPES_PLAN.md) separates semantic-key
+preparation from the witnessed nongeneric feature; implementation is unstarted.
 
 Isolate deep destruction from construction and traversal depth: in an approved
 runtime-helper test, build a long chain iteratively from completed children,
