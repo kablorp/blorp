@@ -580,11 +580,11 @@ byte-identical on every e2e fixture at every rewrite commit.
    - GRAMMAR §5.3 with both quotes;
    - the divergence row near GRAMMAR line 1932;
    - the README's statement contexts;
-   - ROADMAP M2.3 with the early-return work removed, with no hard-coded site
+   - ROADMAP M2.3 with join-arm early-return work removed, with no hard-coded site
      counts;
    - ROADMAP M0 reworded. It promised loops for `check_functions` and
      `declare_types`, which stay recursive. Record their overflow limits under
-     M4's managed-value tail calls: about 2,680 functions, about 1,890 types, and
+     M3's managed-value tail calls: about 2,680 functions, about 1,890 types, and
      `accept_functions` unmeasured, all at -O0;
    - the GUIDE: remove or rewrite its `?=`-in-block examples (lines 2085,
      2087–2088, 2236, 2279 and 2349), as Keith asked: "Get rid of it";
@@ -993,7 +993,7 @@ Each item below was measured but not fixed. Each needs its own reviewed plan.
   decided they stay recursive. The realistic overflow limits are `check_functions`
   at 2,697 functions and `declare_types` at 1,909 types at -O0;
   `accept_functions` is unmeasured. Blorp 2's own source has 1,038 functions and
-  504 types. M4's managed-value tail calls remove the limits.
+  504 types. M3's shared loops and managed-value tail calls remove the limits.
 
 ## Maintenance items
 
@@ -1036,8 +1036,10 @@ Decided changes to milestones:
 - **Char goes in M6.** It unblocks `lex.brp`'s Char literals in the frontier.
   Until then, compiler source compares bytes through named Int constants, as in
   `parse.brp`'s `BACKSLASH_BYTE`.
-- **M2.3 needs no `?=` early return**, as stated above.
-- **M0's open recursion items** become M4 debt, as stated above.
+- **M2.3 needs no join-arm `?=` early return**, as stated above. Function-top-level
+  propagation still needs a function return that discharges live owners.
+- **M0's open managed-call recursion items** become M3 debt, as stated above;
+  M4 owns recursive data storage and destruction.
 
 ## Decision log
 

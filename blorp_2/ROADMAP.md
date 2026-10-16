@@ -77,7 +77,7 @@ milestone work.
 
 | Milestone | Scope | Status |
 | --- | --- | --- |
-| [M0](#m0-foundation-closeout) | Re-cut, perf fixes, parser statement loop, fixpoint script, parity table | Landed. Managed-value recursion limits remain recorded under M4. |
+| [M0](#m0-foundation-closeout) | Re-cut, perf fixes, parser statement loop, fixpoint script, parity table | Landed. M3 owns the recorded managed-value call limits. |
 | [M1a](#m1a-surface-syntax-parity) | Layout, `\|`/`raw` strings, pattern/opaque/range syntax | Checkpoints 1, 2a, 2b and 3 landed. The naming acceptance frontier is 33/35; the other two need a `Char` type (`lex.brp`) and function types (`specialize.brp`, M7). |
 | [ML](#ml-list-construction) | `append`, `set`, `concat`, list literal | Done. |
 | [M1b](#m1b-names-and-the-foundation) | Namespace: private, aliases, qualified names, designated `Bool`/`Option`/`Result` | Parts A and B done; control-flow consumers follow in M2/M3. |
@@ -85,7 +85,7 @@ milestone work.
 | [M2](#m2-the-join) | Blocks with parameters; non-tail match, `if`, `and`/`or`/`not`, `?=` | M2.1 implemented; M2.2 after M1b part B; M2.3 after M2.2 and M1b part B (designated `Result`). |
 | [M2b](#m2b-pattern-compilation) | Nested, or-, list and literal patterns | Not started. |
 | [M3](#m3-loops-and-tail-recursion) | Loops with managed carried values; `SelfTailLoop` retired | Not started. |
-| [M4](#m4-recursive-types) | Recursive types, release rule, opaque erasure | Steps 1 and 2a done; 2b, 2c and opaque types remain. |
+| [M4](#m4-recursive-types) | Recursive types, release rule, opaque erasure | Steps 1 and 2a done; union-only step 2b has a reviewed plan; 2c and opaque types remain. |
 | [M6](#m6-library-and-shell) | Library and shell per the parity table | Not started. |
 | [M7](#m7-lambdas) | Lambdas at known callees; function types | Not started. |
 | [M8](#m8-the-fixpoint-gate) | Fixpoint gate | Not started. |
@@ -174,7 +174,7 @@ its report. Later milestones build on these and do not reopen them.
 - **Parser statement loop.** `parse::consume_function_lines` uses a loop
   rather than recursion per statement. Oracle: the pilot on a 4K-statement
   input under `ulimit -s 512` exits 0. The declaration and function walks
-  retain their direct recursive form; M4 records their managed-value tail-call
+  retain their direct recursive form; M3 owns their managed-value tail-call
   limits rather than promising separate loop rewrites here.
 - **[scripts/blorp2-fixpoint](../scripts/blorp2-fixpoint)**: the three stages, a
   SHA-256 per stage with the first differing line, A == B over fixtures, e2e
@@ -526,6 +526,11 @@ recursive bindings, backpatching or lazy knot tying. **Scope.** Three steps:
    `RecursiveAggregateType` rejection becomes the admission rule. A useful
    union-based list needs head and tail through multiple constructor fields or a
    record payload.
+   [The reviewed union-only step 2b plan](RECURSIVE_UNION_CYCLES_PLAN.md)
+   admits non-generic mutual cycles and multiple self payloads, with independent
+   storage verification and per-occurrence destruction tests. It preserves the
+   existing unary iterative release; generic cycles and opaque types follow
+   separately. Plan approval does not establish implementation or measured costs.
 3. **Release graph.** **Decision:** recursive release helpers are accepted,
    including mutual recursion within recursive layout groups; step 1's iterative
    chain release stays. A worklist release is a recorded potential optimisation,
@@ -545,7 +550,7 @@ recursive bindings, backpatching or lazy knot tying. **Scope.** Three steps:
 currently turns them into loops. Retained measurements at `-O0` overflow at
 2,697 functions and 1,909 types; `accept_functions` is unmeasured. These are
 historical measurements from the quality investigation, not renewed limits for
-every host or build. M4's managed-value tail calls remove this restriction;
+every host or build. M3's shared loops and managed-value tail calls remove this restriction;
 there is no separate loop rewrite promised by M0.
 
 **Opaque types** are a checked `TypeRef.OpaqueType(id)`. Public opaque type
