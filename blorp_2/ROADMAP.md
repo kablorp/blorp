@@ -80,7 +80,7 @@ milestone work.
 | [M1a](#m1a-surface-syntax-parity) | Layout, `\|`/`raw` strings, pattern/opaque/range syntax | Checkpoints 1, 2a, 2b and 3 landed. 32 of 34 files parse; the other two need a `Char` type (`lex.brp`) and function types (`specialize.brp`, M7). |
 | [ML](#ml-list-construction) | `append`, `set`, `concat`, list literal | Done. |
 | [M1b](#m1b-names-and-the-foundation) | Namespace: private, aliases, qualified names, designated `Bool`/`Option`/`Result` | Parts A and B done; control-flow consumers follow in M2/M3. |
-| [M5](#m5-constants) | Module-level constants | Not started. |
+| [M5](#m5-constants) | Module-level constants | Reviewed plan; parser inventory precedes implementation; opaque shapes follow M4. |
 | [M2](#m2-the-join) | Blocks with parameters; non-tail match, `if`, `and`/`or`/`not`, `?=` | M2.1 implemented; M2.2 after M1b part B; M2.3 after M2.2 and M1b part B (designated `Result`). |
 | [M2b](#m2b-pattern-compilation) | Nested, or-, list and literal patterns | Not started. |
 | [M3](#m3-loops-and-tail-recursion) | Loops with managed carried values; `SelfTailLoop` retired | Not started. |
@@ -313,14 +313,25 @@ and `for` consumers arrive with M2.2, M2.3 and M3.
 
 ## M5: constants
 
-**Goal.** The 64 module-level constants in `src` compile: 44 scalar/String
-literals and 20 record literals of literals; two reference another constant
-(`COMPILER_SOURCE` via `into_opaque`, `INTERNAL_SPAN` across modules). **Scope.**
-The checker publishes `CheckedConstant` rows with a dependency DAG (a cycle is
-an error); lowering adds `ConstantReference`; `evaluate` is the identity phase
-that rejects any initializer that is not a closed literal term (literals, record
-literals of such, references to other constants, `into_opaque` of such). No
-interpreter.
+**Goal.** The source's module constants compile through one complete path.
+The [constants plan](CONSTANTS_PLAN.md) replaces the stale 64/89 estimates with
+a provisional 99-candidate source census at `e24ca0f25`. Parser inventory and
+explicit audits of the two unsupported source modules must verify it before
+implementation; the count is not pinned in a test.
+
+**Scope.** M5a.1 implements scalar/String declarations and body reads. M5a.2
+adds closed records, initializer references and cycle validation; any required
+record-admission extraction is a separately reviewed, semantics-preserving
+preparation. The checker publishes complete typed constants and an acyclic
+closed-term graph, with one ConstantId from the declaration inventory. Record
+fields preserve written order and their FieldIds. Specialization projects each
+read into existing concrete literal/record expressions, and ordinary lowering
+materializes fresh values at that use. No identity `evaluate` phase, separate
+concrete constant table or new lower form is needed for these closed terms.
+
+M5b waits for M4's ordinary opaque semantics: `COMPILER_SOURCE` and both
+`INTERNAL_SPAN` initializers require SourceId wrapping or a wrapped field.
+They receive no constant-only opaque representation or synthetic caller ID.
 
 **Decision.** Constants are materialised at use in increment 1, as literals are
 today: no static data, no immortal storage class, no runtime change. They
@@ -328,9 +339,12 @@ transition to static C data when CTFE lands: that increment introduces the
 immortal storage rule (every release helper honours it for a static managed
 record) and measures the per-use cost it removes.
 
-**Exit proof.** All 64 constants of `src` shapes compile; C read.
+**Exit proof.** Every inventoried source-constant shape compiles, including
+the opaque-dependent forms after M4; generated C, granular identity/ownership
+tests and actual-entrypoint e2e cases prove the scoped materialization policy.
 
-**Status.** Not started.
+**Status.** Design reviewed; authoritative inventory and implementation pending.
+M5 is complete only after M5a and the M4-dependent M5b both pass their gates.
 
 ## M2: the join
 
@@ -533,10 +547,11 @@ historical measurements from the quality investigation, not renewed limits for
 every host or build. M4's managed-value tail calls remove this restriction;
 there is no separate loop rewrite promised by M0.
 
-**Opaque types** are a checked `TypeRef.OpaqueType(id)`, legal only in the
-declaring module (a namespace-row fact). Specialize substitutes the underlying
-type after instance keys are formed, so the concrete `TypeRef` has no opaque
-variant.
+**Opaque types** are a checked `TypeRef.OpaqueType(id)`. Public opaque type
+references may cross modules; only construction and projection are restricted
+to the declaring module, using namespace-owned declaration authority.
+Specialize substitutes the underlying type after instance keys are formed,
+so the concrete `TypeRef` has no opaque variant.
 
 Isolate deep destruction from construction and traversal depth: in an approved
 runtime-helper test, build a long chain iteratively from completed children,
