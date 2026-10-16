@@ -169,3 +169,53 @@ source optimization, new framework, disabled limit or further cap exception is
 authorized by this collection. Its purpose is a complete accept/defer/rescope
 decision, not acceptance despite red evidence. Publication still requires an
 explicit reviewed cost decision and the ordinary correctness/destination gates.
+
+### Complete collection and correctness-feature cost decision
+
+The finite collection completed all 4,524 compiler calls without an outcome,
+full-diagnostic, C-identity, counter, leak or provenance failure. It measured
+all 445 fixtures (349 accepted/96 rejected) and the three declared stress trees.
+The original limits still fail in eight places: corpus allocations +1.644796%
+and instructions +2.019801%; zero instructions +2.490860%; 32x1/32x16/128x8
+instructions +4.568961%/+2.409657%/+4.853801%; canonical host allocations
++2.028825% and instructions +1.883797%. These results do not pass the old gates.
+The isolated ground increment passes every declared G/U limit.
+
+Root and two independent compiler experts accept this explicit rescope: the
+new mandatory declaration-validation pass may cost **at most +5% allocations
+and normal instructions**, uniformly against B, for the declared unchanged inputs and
+host boundary. Check allocations separately for all 448 strict inputs, including
+rejections; check instructions for the declared 352 accepted/stress inputs,
+the accepted-corpus aggregates (instructions sum independent per-input minima),
+and the canonical host source-to-C proxy. Rejection instructions remain unmeasured and excluded.
+Retain zero's absolute 8,513, 32x1's absolute 31,000 and the +102 production-line
+limits in addition to this relative bound. All G/U limits stay unchanged.
+This is a post-observation correctness-feature allowance, not a refactor
+speedup, an automatic baseline replacement or a general waiver for later work.
+
+On the retained data, the worst allocation increase is +3.069360% on a rejected
+input; the worst accepted allocation/instruction increases are +2.807828% and
++2.706098%. The 128x8 stress's +4.853801% instruction increase has little margin;
+these observations establish no wider-scale bound. No adaptive remeasurement
+or source optimization is authorized by the decision.
+
+The additional work is explicit in `check/receiver_clashes.brp`: declaration
+name counts, introduction groups, selected-route scans, inherited membership
+proofs and unordered receiver-pair validation before bodies. One inference
+solver and borrowed namespace facts replace the old matching path. IntMap is
+already hashed and namespace entry lists are shared; substituting another map
+alone would not remove the scans or pair enumeration. Exact dynamic attribution
+of the 231-allocation zero increase is unknown. Current route selection rescans
+method suffixes; canonical candidate collection repeats edge scans and linear
+FunctionId deduplication; inherited membership is rescanned for each pair.
+A credible separate follow-up is to measure carrier/COW costs and have the
+existing visibility/signature producer expose canonical unique introductions
+once, with explicit inherited-proof provenance and preserved conflict order.
+Change only the measured owning boundary; another map alone is insufficient.
+No speculative index, cache, second matcher or counter-directed shortcut
+belongs in this change.
+
+Full correctness, mutation, destination Make/frontier and independent source
+reviews remain required before implementation publication. The raw collection
+and its original eight failures remain in the `quality-ufcs-integrated` worktree's ignored
+`blorp_2/build/ufcs-integrated/fresh-base-c4ec/complete-cost-preparation/`.

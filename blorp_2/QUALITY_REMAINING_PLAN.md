@@ -180,9 +180,14 @@ solver for receiver selection and overlap; no second matching algorithm or
 global pair cache. A scope checks unordered new/new and inherited/new pairs;
 it may skip inherited/inherited pairs only where provider validation proves
 that exact inherited set was already checked. Different import subsets must
-not conceal a clash. The roadmap's +102 production and +0.5% small/corpus
-instruction limits still apply, as does the 31,000-allocation 32-module stress
-ceiling. Additional workload and allocation ceilings are set in delta review.
+not conceal a clash. The initial delta retains the roadmap's +102 production
+and +0.5% small/corpus instruction limits and the 31,000-allocation 32-module
+stress ceiling. The later
+[complete-collection cost decision](UFCS_OVERLAP_PLAN.md#complete-collection-and-correctness-feature-cost-decision)
+explicitly replaces the failed relative G/B limits with a uniform +5% allowance
+for this new correctness pass, retaining absolute and isolated-ground limits.
+It records the original eight failures, exact measured domains and remaining
+correctness/publication gates; it does not establish implementation acceptance.
 
 The first bounded UFCS prototype passed 13 focused callbacks but added 276
 allocations (3.27%) and 1.09 million instructions (2.58%) on `return/zero`.
