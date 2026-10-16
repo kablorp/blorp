@@ -395,6 +395,11 @@ non-tail `match` (needs no `Bool`); **M2.2** `if` and `and`/`or`/`not` (needs th
 designated `Bool`); **M2.3** `?=` and local annotations (needs the designated
 `Result`; the early return must discharge every live function owner).
 
+The [compositional control plan](COMPOSITIONAL_CONTROL_PLAN.md) splits the
+work after logical operators into a mechanical module move, compositional
+match, then full `if`. It fixes binding identity, inference checkpoints and
+diagnostic order before implementation; these steps are not yet accepted.
+
 **Exit proof.** Fixtures for each desugaring; top-level `?=` success and failure
 with two live managed locals; parser rejections for propagation in join arms;
 the existing fixtures byte-identical; a nesting stress fixture with recorded C
