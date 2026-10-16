@@ -111,6 +111,31 @@ Parallel pairs with disjoint files: M1a with the M0 fixpoint script and parity
 table; ML with M1a; M1b with M5; M4 with M3; M6's Blorp bodies with M4 once M3
 lands. M2.2 and M2.3 wait for M1b part B; M2b waits for M2; M3 reuses M2's join.
 
+### Acceptance order for the parallel work
+
+Finish the quality queue, then accept M5a.1's scalar/String constants and the
+logical-operator slice of M2.2. The reviewed compositional-control preparation,
+match and full-if slices follow. M4.2b's source, granular tests and independent
+runtime depth probes may proceed alongside that work; accept its complete slice
+at the earliest slot where shared phase changes have been reviewed together.
+The early M6 Char preparation may overlap after its plan is accepted, while its
+constant support uses the accepted M5a.1 path. This changes execution order,
+not milestone scope or the definition of done.
+
+Standalone evidence proves the exact frozen source and boundary that produced
+it. After integrating onto an accepted base, review the source/API delta and
+rerun affected focused suites. Run the remaining full pilot/cost acceptance
+once against that immediately preceding accepted base, followed by the actual
+main destination gate. Preserve old unexecuted cost packets as preparation;
+never relabel old-base samples as current-stack measurements. This avoids
+duplicating broad acceptance while retaining independent integration evidence.
+
+Each new cost packet freezes the full fixture corpus on that accepted base;
+its count may differ from earlier packets. Enumerate intentional outcome or
+diagnostic changes separately, preserving unchanged inputs and full oracles.
+Existing ceilings remain in force. No new cache, runner, fallback, or host
+compiler rebuild follows from this sequencing decision.
+
 ## Delivered foundation
 
 Accepted, each with independent reviews, mutation oracles and matched costs in
