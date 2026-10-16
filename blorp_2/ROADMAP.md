@@ -384,8 +384,9 @@ and all 452 e2e cases pass. Ordinary opaque semantics remain a separate M4 task.
 
 **Bootstrap boundary.** Keep statement/binding/function-tail/arm-tail control,
 qualified flat matching, restricted if, outer-variable flow, local annotations
-and function-top-level propagation. Lift the 16 source argument matches rather
-than generalizing expression inference. The reviewed
+and function-top-level propagation. The
+[16 source argument matches are now lifted](../benchmarks/results/blorp_2_argument_controls_2026-10-16.md),
+removing their need for general expression inference. The reviewed
 [compositional plan](COMPOSITIONAL_CONTROL_PLAN.md) remains a broader language
 design; its workloop relocation and arbitrary-expression match/if are deferred.
 Omitted else is permitted in explicit statement roles, including inherited

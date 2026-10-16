@@ -9,8 +9,9 @@ removing a source dependency does not remove an already supported input feature.
 The planning baseline is `78bc406d6646eb7a1b61700b71d1faa9e9eaca09`.
 Quality-roadmap work is complete. The 28 construction-function migrations are
 complete; [their acceptance report](../benchmarks/results/blorp_2_construction_values_2026-10-16.md)
-records the preserved behavior, identities and bounded costs. Other source
-migrations below remain pending.
+records the preserved behavior, identities and bounded costs. The
+[16 argument-control lifts](../benchmarks/results/blorp_2_argument_controls_2026-10-16.md)
+are also complete. Other source migrations below remain pending.
 The record/reference-constant implementation stopped after its first failing
 test, before production edits. Other reviewed candidates and their evidence
 remain preserved; their existence does not make them bootstrap prerequisites.
