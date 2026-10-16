@@ -228,7 +228,7 @@ counter implementation, alternate entrypoint or validation framework is added.
 
 | Metric | Ceiling |
 | --- | --- |
-| Each frozen whole-compiler fixture/stress allocation count | No growth |
+| Each frozen whole-compiler fixture/stress allocation count | No growth, except the bounded reserved-name diagnostic case below |
 | Direct lex and lex-plus-parse allocation count | No growth; classifier probe/C must show no additional per-word allocation |
 | Matched min-of-3 instructions, corpus, each stress input and phase-workload process proxy | +0.5%; proxy is not isolated phase instructions |
 | Host compilation of compiler source, allocations and instructions | +5% |
@@ -236,6 +236,32 @@ counter implementation, alternate entrypoint or validation framework is added.
 | LexedProgram physical carrier on arm64 | At most one pointer, +8 bytes |
 | Additional source backing storage in normal loading | 0 copied bytes |
 | Live objects/bytes with the returned parsed product or diagnostic held, after every full-source owner has gone | No growth against the matched baseline, for success and rejection |
+
+### Reserved-name diagnostic allocation exception
+
+The first measured reserved-name rejection uses315 baseline allocations and316
+candidate allocations, with identical diagnostics, balanced releases and zero
+leaks. It **fails the original no-growth rule**. The longer control and the
+whole corpus have not been measured. Root and two compiler experts agree to
+an explicit diagnostic-only allowance of **at most baseline+1 allocation per
+rejected compilation** whose unchanged first diagnostic rejects a reserved
+keyword as a name. Accepted inputs and unrelated errors retain no-growth;
+all instruction, phase, carrier, source-storage, host and lifetime limits stay.
+
+The parser now takes one substring of the validated keyword span where it
+previously used static inverse spelling. Message/help assembly is unchanged.
+One callsite alone does not prove a per-compilation bound: discarded parser
+trials could construct other errors. Run the longer control first, then verify
+every declared reserved-name context and relevant corpus rejection against the
+same+1 bound and exact diagnostic/source/span. Stop on a larger increase or
+any other unwaived breach. Preserve the original failed result.
+
+A credible separate refinement is a typed parser rejection carrying the
+validated span until source-aware final rendering through existing SourceInputs,
+avoiding eager materialization of a spelling String. That requires its own
+design and measurements; it is not implemented, guaranteed free or permission
+to retain a source view in later products, restore an inverse table or add a
+cache. The current bounded exception authorizes no new mechanism.
 
 Read generated C and its ordinary Clang record-layout dump to verify physical
 carriers, mapping types through their actual installed names rather than
