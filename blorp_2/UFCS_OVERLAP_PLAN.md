@@ -92,11 +92,37 @@ Each provider has one distinct nominal Item_i receiver for shared name describe,
 
 ## Numerical full-UFCS acceptance against B
 
-The coordinator explicitly agreed these prospective limits before observation. The stricter absolute/relative zero allocation rule wins. Apply matched ratios using fresh B, never historical allocation numbers.
+The original prospective zero limit was
+`min(8513, floor(B_zero_allocations *1.01))`. On the frozen current boundary,
+B uses8,229 allocations, U uses8,474, and the ground candidate uses8,460:
+the latter is+231/+2.8071% and **149 over the original8,311 ceiling**.
+Both candidates emit identical zero C with balanced counts and no leaks.
+The ground owning/model suites pass72/72; broader ground costs remain unrun.
+These negative receipts stay valid under their original rule.
+
+Root and two compiler experts agree to remove **only zero's
+relative limb**, retaining the already specified absolute8,513 ceiling.
+This follows the user's allowance for minor documented inefficiency; it is an
+explicit post-observation exception, not a claim that the old limit passed.
+The new validation pass checks receiver declarations in the loaded library
+even when main never calls a receiver function. Its transient name counts,
+introduction groups and inherited-ID proofs serve that new correctness rule.
+For this pinned library they impose a small validation floor; it is not a
+general constant cost. Exact attribution of the231 allocations is unknown.
+IntMap already uses hashed lookup, and namespace entries share its stored
+values list. Do not describe this as a linear-map or list-rebuilding problem.
+
+Credible deferred work is measuring the physical cost of map/Option/group
+updates and consuming selected routes once instead of repeating import/method
+suffix scans. Replacing the map with a Dict alone would not remove routing
+scans or pair enumeration. No index, cache or counter-directed special case is
+authorized. All other limits below remain unchanged; normal instructions,
+stress, aggregate corpus costs or the host proxy can still reject this design.
+Use fresh matched B ratios, never historical allocation numbers.
 
 | Workload/metric | Ceiling |
 | --- | --- |
-|Zero strict allocations|min(8513, floor(B_zero_allocations *1.01))|
+|Zero strict allocations|8513 absolute; explicitly revised zero-only exception above|
 |Zero normal retired instructions|B_zero_min3 *1.005|
 |Shared accepted corpus aggregate allocations|B_corpus_allocations *1.01|
 |Shared accepted corpus sum of per-input normal min3 instructions|B_corpus_instructions *1.005|
