@@ -140,6 +140,35 @@ existing error ordering. Only the three inventoried source visibility
 promotions are allowed; these establish future-bootstrap consistency, not a
 claim that the pilot can check its entire source.
 
+**Private-type cost decision.** The integrated rule is +47 production lines.
+Its 349 shared successful inputs twice measure 4,609,098 to 4,669,137
+allocations (+1.302619%), exceeding the original +0.5% corpus ceiling. Every
+shared C output is identical, all strict runs are leak-free, and the four
+preflight normal instruction deltas are below +0.177%. Preserve both failed
+corpus receipts; they are not successful runs under the original limit.
+
+The coordinator and independent compiler-expert test runner agree to a narrow
+conditional rescope: **+1.5% aggregate corpus allocations for this rule only**.
+Corpus instructions stay at +0.5%; host-build allocations and instructions at
++1%; the four individual instruction limits at +1%. Return-zero's previously
+reviewed allocation ceiling remains +2% (observed +1.879%); the other three
+individual allocation limits stay +1%. No fixture budget changes. Pending
+normal-corpus, host-build and complete destination gates must still pass.
+
+Generated C and source identify allocations for `NamedType`, `PublicTypeUse`
+and eager `UnknownType`/`NonApplicableType` arguments on successful head lookup.
+This is site attribution, not a dynamic allocation-stack decomposition.
+`resolve_head` already returns `blorp_StackResult`; its Result does not allocate.
+Keep the direct typed authority rather than adding selectors, thunks, caches
+or repeated privacy checks to move the counter. After ordinary opaque erasure,
+the finite scalar TypeAccess/TypeTermError unions are candidates for existing
+unmanaged representation. NamedType additionally requires a separately reviewed
+extension of fixed-record inline eligibility to finite unmanaged union fields,
+with layout, ownership, generated-C and matched-cost tests. This is a credible
+representation follow-up, not proven savings or an automatic M8 outcome. The
+host remains frozen. Raw evidence is retained in the private integration
+worktree under ignored `build/quality-private-integrated/final/`.
+
 UFCS requires a reviewed cost-reduction plan before implementation. Reuse one
 solver for receiver selection and overlap; no second matching algorithm or
 global pair cache. A scope checks unordered new/new and inherited/new pairs;
