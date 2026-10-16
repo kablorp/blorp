@@ -2,22 +2,25 @@ import:
 	test: TestSuite
 	../test_lex/test_lex: trace
 	../../../src/lex/lex: lex
-	../../../src/utils/names: program_names
+	../../../src/utils/names: name_spelling, program_names
 	../../../src/utils/source: module_source, root_module_id
-	../../../src/utils/syntax: TokenKind(SymbolToken), keyword_spelling
+	../../../src/utils/syntax:
+		Keyword(FunctionKeyword, IfKeyword, WhereKeyword),
+		Symbol(Wildcard, Newline),
+		TokenKind(IdentifierToken, KeywordToken, SymbolToken)
 
 
--- Every word the host reserves is a symbol token; longer or prefixed
+-- Every word the host reserves is a keyword token; longer or prefixed
 -- spellings, and the words the host leaves as names, remain identifiers.
-pure func test_expression_words_are_symbols() -> Bool:
+pure func test_expression_words_are_keywords() -> Bool:
 	trace("if else and or not") == "if@0:2\nelse@3:7\nand@8:11\nor@12:14\nnot@15:18\nLF@18:18\nEOF@18:18"
 
 
-pure func test_loop_words_are_symbols() -> Bool:
+pure func test_loop_words_are_keywords() -> Bool:
 	trace("while for in break continue") == "while@0:5\nfor@6:9\nin@10:12\nbreak@13:18\ncontinue@19:27\nLF@27:27\nEOF@27:27"
 
 
-pure func test_declaration_words_are_symbols() -> Bool:
+pure func test_declaration_words_are_keywords() -> Bool:
 	(
 		trace("import type private record union") == "import@0:6\ntype@7:11\nprivate@12:19\nrecord@20:26\nunion@27:32\nLF@32:32\nEOF@32:32"
 		and trace("builtin as opaque into_opaque from_opaque") == "builtin@0:7\nas@8:10\nopaque@11:17\ninto_opaque@18:29\nfrom_opaque@30:41\nLF@41:41\nEOF@41:41"
@@ -25,7 +28,7 @@ pure func test_declaration_words_are_symbols() -> Bool:
 
 
 -- The host reserves these for forms this compiler does not read.
-pure func test_unread_form_words_are_symbols() -> Bool:
+pure func test_unread_form_words_are_keywords() -> Bool:
 	(
 		trace("alias debug detach foreign from implements") == "alias@0:5\ndebug@6:11\ndetach@12:18\nforeign@19:26\nfrom@27:31\nimplements@32:42\nLF@42:42\nEOF@42:42"
 		and trace("resource select trait try where") == "resource@0:8\nselect@9:15\ntrait@16:21\ntry@22:25\nwhere@26:31\nLF@31:31\nEOF@31:31"
@@ -40,42 +43,61 @@ pure func test_unreserved_words_remain_identifiers() -> Bool:
 	)
 
 
--- `keyword_spelling` is the inverse of the lexer's keyword table: every
--- reserved spelling lexes to the symbol that spells it back.
-pure func test_keyword_spellings_round_trip() -> Bool:
-	spellings = [
-		"func", "pure", "match", "var", "void", "if", "else", "and", "or", "not", "while", "for", "in", "break",
-		"continue", "import", "type", "private", "record", "union", "builtin", "as", "opaque", "into_opaque",
-		"from_opaque", "alias", "debug", "detach", "foreign", "from", "implements", "resource", "select", "trait",
-		"try", "where",
-	]
-	spellings.all(pure func(spelling): lexes_to_keyword(spelling))
-
-
-private pure func lexes_to_keyword(spelling: String) -> Bool:
-	match lex(module_source(root_module_id()), spelling, program_names().names):
-		Err(_):
-			False
+pure func test_implemented_and_reserved_only_words_have_distinct_keyword_roles() -> Bool:
+	match lex(module_source(root_module_id()), "func if where", program_names().names):
+		Err(_): False
 		Ok(program):
 			match program.tokens:
-				[first, _]:
-					match first.kind:
-						SymbolToken(symbol):
-							keyword_spelling(symbol) == Some(spelling)
-						_:
-							False
-				_:
-					False
+				[function, condition, reserved, newline]:
+					match (function.kind, condition.kind, reserved.kind, newline.kind):
+						(KeywordToken(FunctionKeyword), KeywordToken(IfKeyword), KeywordToken(WhereKeyword), SymbolToken(Newline)):
+							function.span.start == 0 and function.span.end == 4 and condition.span.start == 5 and reserved.span.start == 8
+						_: False
+				_: False
+
+
+pure func test_lone_underscore_is_a_symbol_and_longer_words_are_identifiers() -> Bool:
+	match lex(module_source(root_module_id()), "_ _if if_ in2", program_names().names):
+		Err(_): False
+		Ok(program):
+			match program.tokens:
+				[wildcard, prefixed, suffixed, numbered, newline]:
+					match [wildcard.kind, prefixed.kind, suffixed.kind, numbered.kind, newline.kind]:
+						[SymbolToken(Wildcard), IdentifierToken(first), IdentifierToken(second), IdentifierToken(third), SymbolToken(Newline)]:
+							name_spelling(program.names, first) == Some("_if") and name_spelling(program.names, second) == Some("if_") and name_spelling(program.names, third) == Some("in2")
+						_: False
+				_: False
+
+
+pure func test_contextual_words_keep_identifier_tokens() -> Bool:
+	match lex(module_source(root_module_id()), "fixed methods_only tail_recursive raw True", program_names().names):
+		Err(_): False
+		Ok(program):
+			match program.tokens:
+				[first, second, third, fourth, fifth, newline]:
+					match [first.kind, second.kind, third.kind, fourth.kind, fifth.kind, newline.kind]:
+						[IdentifierToken(fixed_name), IdentifierToken(methods_name), IdentifierToken(tail_name), IdentifierToken(raw_name), IdentifierToken(true_name), SymbolToken(Newline)]:
+							(
+								name_spelling(program.names, fixed_name) == Some("fixed")
+								and name_spelling(program.names, methods_name) == Some("methods_only")
+								and name_spelling(program.names, tail_name) == Some("tail_recursive")
+								and name_spelling(program.names, raw_name) == Some("raw")
+								and name_spelling(program.names, true_name) == Some("True")
+							)
+						_: False
+				_: False
 
 
 tests: TestSuite = {
 	description = "Blorp 2 reserved words",
 	tests = [
-		("expression words are symbols", test_expression_words_are_symbols),
-		("loop words are symbols", test_loop_words_are_symbols),
-		("declaration words are symbols", test_declaration_words_are_symbols),
-		("unread form words are symbols", test_unread_form_words_are_symbols),
+		("expression words are keywords", test_expression_words_are_keywords),
+		("loop words are keywords", test_loop_words_are_keywords),
+		("declaration words are keywords", test_declaration_words_are_keywords),
+		("unread form words are keywords", test_unread_form_words_are_keywords),
 		("unreserved words remain identifiers", test_unreserved_words_remain_identifiers),
-		("keyword spellings round-trip", test_keyword_spellings_round_trip),
+		("implemented and unparsed words keep distinct keyword roles", test_implemented_and_reserved_only_words_have_distinct_keyword_roles),
+		("wildcard is a symbol and longer words are identifiers", test_lone_underscore_is_a_symbol_and_longer_words_are_identifiers),
+		("contextual words keep identifier tokens", test_contextual_words_keep_identifier_tokens),
 	]
 }

@@ -1003,17 +1003,19 @@ records the independent reviews, exact diagnostics, unchanged accepted C,
 passing destination gates and matched costs. The
 [multiline cleanup](../benchmarks/results/blorp_2_multiline_tests_2026-10-16.md)
 is also complete: 209 literals in 37 files preserve their exact bytes and pass
-576 focused callbacks plus the full destination gate. Keyword authority remains
-a separate acceptance slice.
+576 focused callbacks plus the full destination gate. The
+[keyword authority report](../benchmarks/results/blorp_2_keyword_authority_2026-10-16.md)
+records the completed mapping refactor, granular/lifetime/mutation checks and
+matched costs; the actual destination passes 2,830 component and 445 e2e checks.
 
 1. **One message for 28 failures.** All 28 calls to the emitter's
    `internal_error()` report "invalid checked union identity", including a
    missing record layout and missing runtime arguments. Give each invariant its
    own error, carrying the relevant identity and occurrence span.
-2. **Keywords listed in three places:** the lexer's `keyword`,
-   `utils/syntax.keyword_spelling`, and a hand-kept 36-word test inventory
-   (`test_lex/test_keywords.brp`). Hand-kept counts in tests break the
-   no-pinning rule. Use one authoritative table, and keep lookup fast.
+2. **Keyword authority. Complete.** One lexer match produces typed keyword
+   tokens; parser diagnostics quote their validated source spans. The inverse
+   and round-trip inventory are gone. Production shrinks by 26 lines; accepted
+   allocations are unchanged and corpus instructions rise 0.246224%, below 0.5%.
 3. **Escaped one-line test programs. Complete.** Aligned multiline strings show
    syntax and indentation, with exact byte comparisons and terminal-LF/tab
    mutation oracles. Malformed whitespace and useful short byte fragments retain

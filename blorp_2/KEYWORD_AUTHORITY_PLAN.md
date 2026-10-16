@@ -1,8 +1,10 @@
 # One keyword authority: bounded maintenance plan
 
-Plan only; no production implementation or compiled evidence yet. Initially
-reviewed against `c2fa6230c`; implementation follows the accepted propagation
-parser and naming changes. Source anchors below describe that initial tree;
+Implementation and matched costs are validated; the
+[keyword report](../benchmarks/results/blorp_2_keyword_authority_2026-10-16.md)
+records the evidence and final destination gates. Initially reviewed against
+`c2fa6230c`, this plan follows the accepted propagation parser and naming
+changes. Source anchors below describe that initial tree;
 resolve the named declarations when line numbers move. The coordinator owns
 shared documentation, compiled slots and
 integration. Two independent plan reviews precede implementation.
@@ -241,12 +243,17 @@ counter implementation, alternate entrypoint or validation framework is added.
 
 The first measured reserved-name rejection uses315 baseline allocations and316
 candidate allocations, with identical diagnostics, balanced releases and zero
-leaks. It **fails the original no-growth rule**. The longer control and the
-whole corpus have not been measured. Root and two compiler experts agree to
+leaks. It **fails the original no-growth rule**. At that decision the longer
+control and whole corpus had not been measured. Root and two compiler experts agree to
 an explicit diagnostic-only allowance of **at most baseline+1 allocation per
 rejected compilation** whose unchanged first diagnostic rejects a reserved
 keyword as a name. Accepted inputs and unrelated errors retain no-growth;
 all instruction, phase, carrier, source-storage, host and lifetime limits stay.
+
+The subsequent complete gate validates all 13 declared reserved-name rejection
+cases at exactly baseline+1; the other 451 inputs have no growth. The report
+above records the longer control, all contexts and complete corpus separately
+from the original failed short result.
 
 The parser now takes one substring of the validated keyword span where it
 previously used static inverse spelling. Message/help assembly is unchanged.

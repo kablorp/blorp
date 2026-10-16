@@ -1,0 +1,126 @@
+import:
+	memory:
+		MemoryCounter(LiveManagedObjects, ManagedBytes, MemoryStatsActive, ManagedBytesAvailable),
+		read_memory_counter, reset_mem_stats
+	system: read_file
+	../../../src/lex/lex: lex
+	../../../src/parse/parse: ParsedModule, module_contents, parse_module
+	../../../src/utils/names: NameTable, program_names
+	../../../src/utils/source: COMPILER_SOURCE, module_source, root_module_id, same_source
+	../../../src/utils/syntax: Diagnostic, ExpressionBase(IntegerExpression), ParsedBody(ParsedValueBody), diagnostic
+	test: TestSuite
+
+
+private FIXTURE_ROOT: String = "blorp_2/test/unit/test_parse/fixtures/keyword_lifetime_"
+
+
+-- All scalar fields: reporting these endpoints must not retain a source owner.
+private fixed record RetainedFootprint {
+	objects: Int,
+	bytes: Int
+}
+
+
+-- The complete input is created here, not held by the observing caller.
+-- Only the actual parsed module or actual diagnostic leaves this scope.
+private func read_module(path: String, names: NameTable) -> Result[ParsedModule, Diagnostic]:
+	source ?= read_file(path).map_err(pure func(error): diagnostic(
+		{ source = COMPILER_SOURCE, start = 0, end = 0 },
+		"cannot read lifetime input: " + error, "restore the named test input",
+	))
+	tokens ?= lex(module_source(root_module_id()), source, names)
+	parse_module(tokens, root_module_id())
+
+
+private pure func valid_product(result: Result[ParsedModule, Diagnostic], rejection: Bool) -> Bool:
+	match result:
+		Ok(parsed):
+			if rejection:
+				False
+			else:
+				match module_contents(parsed).functions:
+					[function]:
+						match function.body:
+							ParsedValueBody(value):
+								match value.base:
+									IntegerExpression(0): True
+									_: False
+							_: False
+					_: False
+		Err(error):
+			(
+				rejection and same_source(error.span.source, module_source(root_module_id()))
+				and error.span.end - error.span.start == 5
+				and error.message == "`where` is a reserved keyword and cannot be used as a name"
+				and error.help == "choose another identifier such as `where_name`" and error.note.is_none()
+			)
+
+
+private func held_footprint(path: String, names: NameTable, rejection: Bool) -> Result[RetainedFootprint, String]:
+	result = read_module(path, names)
+	objects = read_memory_counter(LiveManagedObjects)
+	bytes = read_memory_counter(ManagedBytes)
+	-- This observation follows the reads, keeping the real product/error alive.
+	if valid_product(result, rejection):
+		Ok({ objects = objects, bytes = bytes })
+	else:
+		Err("lifetime input failed setup or produced an unexpected parse result: " + path)
+
+
+private func same_retained_footprint(short_path: String, long_path: String, rejection: Bool) -> Bool:
+	seed = program_names()
+	reset_mem_stats()
+	active_before = read_memory_counter(MemoryStatsActive)
+	available_before = read_memory_counter(ManagedBytesAvailable)
+	setup_objects = read_memory_counter(LiveManagedObjects)
+	setup_bytes = read_memory_counter(ManagedBytes)
+	var short_footprint: RetainedFootprint = { objects = 0, bytes = 0 }
+	var short_valid = False
+	match held_footprint(short_path, seed.names, rejection):
+		Ok(measured):
+			short_footprint = measured
+			short_valid = True
+		Err(error): print_error(error)
+	-- Both the parsed result and the observation's Result carrier have left scope.
+	short_dropped_objects = read_memory_counter(LiveManagedObjects)
+	short_dropped_bytes = read_memory_counter(ManagedBytes)
+	var long_footprint: RetainedFootprint = { objects = 0, bytes = 0 }
+	var long_valid = False
+	match held_footprint(long_path, seed.names, rejection):
+		Ok(measured):
+			long_footprint = measured
+			long_valid = True
+		Err(error): print_error(error)
+	long_dropped_objects = read_memory_counter(LiveManagedObjects)
+	long_dropped_bytes = read_memory_counter(ManagedBytes)
+	active_after = read_memory_counter(MemoryStatsActive)
+	available_after = read_memory_counter(ManagedBytesAvailable)
+	-- Report construction follows every endpoint. Only scalar footprints escape.
+	print("keyword lifetime " + short_path
+		+ ": objects=" + short_footprint.objects.to_string() + "/" + long_footprint.objects.to_string()
+		+ "; bytes=" + short_footprint.bytes.to_string() + "/" + long_footprint.bytes.to_string())
+	(
+		short_valid and long_valid and active_before == 1 and active_after == 1
+		and available_before == 1 and available_after == 1
+		and short_footprint.objects > setup_objects and short_footprint.bytes > setup_bytes
+		and short_footprint.objects == long_footprint.objects and short_footprint.bytes == long_footprint.bytes
+		and short_dropped_objects == setup_objects and long_dropped_objects == setup_objects
+		and short_dropped_bytes == setup_bytes and long_dropped_bytes == setup_bytes
+	)
+
+
+func test_parsed_module_does_not_retain_source_only_comments() -> Bool:
+	same_retained_footprint(FIXTURE_ROOT + "success_short.txt", FIXTURE_ROOT + "success_long.txt", False)
+
+
+func test_rejection_does_not_retain_source_only_comments() -> Bool:
+	same_retained_footprint(FIXTURE_ROOT + "rejection_short.txt", FIXTURE_ROOT + "rejection_long.txt", True)
+
+
+tests: TestSuite = {
+	description = "Blorp 2 keyword source lifetime",
+	tests = [
+		("parsed module drops dynamically read source", test_parsed_module_does_not_retain_source_only_comments),
+		("rejection drops dynamically read source", test_rejection_does_not_retain_source_only_comments),
+	]
+}

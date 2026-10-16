@@ -209,15 +209,18 @@ unchanged fixture C, zero leaks and all matched cost ceilings. The
 [multiline test cleanup](../benchmarks/results/blorp_2_multiline_tests_2026-10-16.md)
 converts 209 program literals in 37 files with identical bytes, assertions and
 spans; its focused suites pass 576 callbacks and the actual destination passes
-2,814 component/445 e2e checks. Keyword recognition and diagnostic spelling
-still need one authoritative mapping with measured lookup costs. Each gets its
-own small reviewed plan and explicit ceilings before code; none authorizes broader
-emitter, lexer or testing infrastructure.
+2,814 component/445 e2e checks. The
+[keyword authority report](../benchmarks/results/blorp_2_keyword_authority_2026-10-16.md)
+records the single typed mapping, 600 focused callbacks, physical/lifetime and
+mutation evidence, and passing matched costs. Across the 464 strict pilot
+inputs, its only allocation growth is the separately reviewed one-object
+reserved-name diagnostic allowance; accepted inputs and other errors have
+no growth. No broader lexer or test mechanism was added.
 
 The [keyword authority plan](KEYWORD_AUTHORITY_PLAN.md) defines the precise
 token split, classifier representation preflight, source-lifetime oracle and
-cost ceilings. Its source probe precedes implementation; plan approval alone
-does not establish that the proposed physical representation is cheap.
+cost ceilings. Its source probe and actual generated-C layout/lifetime gates
+establish the representation's bounded physical cost.
 The [emitter diagnostics plan](EMITTER_DIAGNOSTICS_PLAN.md) fixes the failure
 vocabulary and source-occurrence ownership without weakening VerifiedProgram.
 

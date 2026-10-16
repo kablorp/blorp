@@ -1846,6 +1846,12 @@ diagnostic rendering are pure. The pipeline publishes these complete results:
    It receives the name table so far, mints one opaque `NameId` per identifier
    spelling, and publishes the table it was given (`base_names`) and its
    extension (`names`); identifier tokens carry only the `NameId`.
+   Reserved words carry `KeywordToken(Keyword)`; punctuation and layout carry
+   `SymbolToken(Symbol)`, including the lone `_`. The lexer's forward match is
+   their sole spelling authority. `LexedProgram` shares the original input
+   String until parsing finishes so diagnostics can quote validated spans.
+   A standalone retained `LexedProgram` therefore retains that input; parsed
+   modules retain semantic names and literal values, not the full source.
    Integer tokens retain their complete raw spelling; indent and dedent tokens
    span the indentation prefix, and each token records whether a space precedes
    it. Trivia is skipped over the original
