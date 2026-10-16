@@ -1,0 +1,247 @@
+import:
+	../../../src/check/check: check, checked_functions, check_errors
+	../../../src/check/callables: ResolutionContext
+	../../../src/check/constructors: plan_record_literal
+	../../../src/check/declarations: validate_declarations
+	../../../src/check/errors as Errors
+	../../../src/check/inference: InferenceType(AcceptedType)
+	../../../src/check/model as Model
+	../../../src/check/render: render_failure, render_check_error
+	../../../src/namespace/namespace: build_namespace
+	../../../src/parse/assemble: ParsedProgram, parsed_contents
+	../../../src/utils/ids: RecordId, inventory_functions, record_number
+	../../../src/utils/names: NameId, NameTable, same_name
+	../../../src/utils/source: module_source, root_module_id
+	../../../src/utils/syntax:
+		DiagnosticNote(PreviousField, RecordFieldDeclaration), Span, ValueExpression, same_span,
+		ParsedBody(ParsedValueBody), ExpressionBase(RecordExpression)
+	../input: accepted_signatures, checked_source, existing_name
+	../module_input: parse_modules
+	test: TestSuite
+
+
+private PAIR: String =
+	|fixed record Pair { first: Int, second: Int }
+	|
+
+private MAKE: String =
+	|pure func make() -> Pair:
+	|
+
+private MAIN: String =
+	|func main() -> Int:
+	|    0
+	|
+
+
+private pure func at(prefix: String, marked: String) -> Span:
+	{ source = module_source(root_module_id()), start = prefix.length(), end = prefix.length() + marked.length() }
+
+
+private pure func same_note(actual: Option[DiagnosticNote], expected: Option[DiagnosticNote]) -> Bool:
+	match (actual, expected):
+		(None, None): True
+		(Some(PreviousField(left)), Some(PreviousField(right))): same_span(left, right)
+		(Some(RecordFieldDeclaration(left)), Some(RecordFieldDeclaration(right))): same_span(left, right)
+		_: False
+
+
+private pure func diagnostic_is(program: ParsedProgram, error: Errors.CheckError, span: Span, message: String, help: String, note: Option[DiagnosticNote]) -> Bool:
+	rendered = render_check_error(program, error)
+	(same_span(error.span, span) and same_span(rendered.span, span)
+		and rendered.message == message and rendered.help == help and same_note(rendered.note, note))
+
+
+private pure func named(names: NameTable, actual: NameId, spelling: String) -> Bool:
+	match existing_name(names, spelling):
+		Some(expected): same_name(actual, expected)
+		None: False
+
+
+private pure func rejects(source: String, span: Span, message: String, help: String, note: Option[DiagnosticNote], matches: pure (Errors.CheckErrorKind, NameTable) -> Bool) -> Bool:
+	match parse_modules([{ source = source, targets = [] }]):
+		Err(_): False
+		Ok(program):
+			match check(program):
+				Ok(_): False
+				Err(failure):
+					errors = check_errors(failure)
+					(matches(errors.first.kind, parsed_contents(program).names) and errors.remaining.is_empty()
+						and render_failure(failure).remaining.is_empty()
+						and diagnostic_is(program, errors.first, span, message, help, note))
+
+
+private pure func reversed_fields(prefix: String) -> Bool:
+	source = prefix + "{ second = 17, first = 23 }\n" + MAIN
+	match checked_source(source):
+		Err(_): False
+		Ok(program):
+			match checked_functions(program).functions:
+				[make, ..._]:
+					match make.body:
+						Model.CheckedValueBody(Model.ReturnExpression(value)):
+							match value.form:
+								Model.ConstructRecord(owner, [second, first]):
+									match (second.value.form, first.value.form):
+										(Model.LiteralInteger(right), Model.LiteralInteger(left)):
+											(record_number(owner) == 0 and record_number(Model.field_owner(second.field)) == 0
+												and record_number(Model.field_owner(first.field)) == 0
+												and Model.field_number(second.field) == 1 and Model.field_number(first.field) == 0
+												and right == 17 and left == 23
+												and Model.same_type(second.value.value_type, Model.IntType)
+												and Model.same_type(first.value.value_type, Model.IntType)
+												and same_span(second.span, at(prefix + "{ second = ", "17"))
+												and same_span(first.span, at(prefix + "{ second = 17, first = ", "23"))
+												and same_span(second.value.span, second.span) and same_span(first.value.span, first.span))
+										_: False
+								_: False
+						_: False
+				_: False
+
+
+pure func test_literal_fields_keep_written_order_and_nominal_ids() -> Bool:
+	reversed_fields(PAIR + MAKE + "    ")
+
+
+pure func test_generic_fields_keep_written_order_and_concrete_types() -> Bool:
+	prefix: String =
+		|fixed record Pair[T] { first: T, second: T }
+		|pure func make() -> Pair[Int]:
+		|
+	reversed_fields(prefix + "    ")
+
+
+pure func test_unknown_field_wins_before_later_duplicate_and_rhs() -> Bool:
+	prefix = PAIR + MAKE + "    { "
+	rejects(prefix + "third = missing, first = 0, first = 1 }\n" + MAIN,
+		at(prefix, "third"), "unknown field 'third' in Pair", "use a field declared by the receiving record", None, pure func(kind, names):
+			match kind:
+				Errors.RecordRejection(Errors.UnknownRecordField(name, owner)): named(names, name, "third") and record_number(owner) == 0
+				_: False
+	)
+
+
+pure func test_duplicate_field_wins_before_later_unknown_and_rhs() -> Bool:
+	first_prefix = PAIR + MAKE + "    { "
+	prefix = first_prefix + "first = 0, "
+	first_span = at(first_prefix, "first")
+	rejects(prefix + "first = missing, third = 1 }\n" + MAIN,
+		at(prefix, "first"), "duplicate field in record literal", "write each record field exactly once", Some(PreviousField(first_span)), pure func(kind, names):
+			match kind:
+				Errors.RecordRejection(Errors.DuplicateLiteralField(name, previous)): named(names, name, "first") and same_span(previous, first_span)
+				_: False
+	)
+
+
+private pure func missing_first(literal: String) -> Bool:
+	prefix = PAIR + MAKE + "    "
+	declaration_span = at("fixed record Pair { ", "first")
+	rejects(prefix + literal + "\n" + MAIN, at(prefix, literal),
+		"missing field in record literal", "provide every declared record field exactly once", Some(RecordFieldDeclaration(declaration_span)), pure func(kind, names):
+			match kind:
+				Errors.RecordRejection(Errors.MissingRecordField(field, declaration)):
+					(Model.field_number(field) == 0 and record_number(Model.field_owner(field)) == 0
+						and same_span(declaration, declaration_span))
+				_: False
+	)
+
+
+pure func test_first_missing_declaration_wins_before_rhs() -> Bool:
+	missing_first("{ second = missing }") and missing_first("{}")
+
+
+pure func test_later_child_error_wins_before_sibling_mismatch() -> Bool:
+	prefix = PAIR + MAKE + "    { first = \"bad\", second = "
+	rejects(prefix + "missing }\n" + MAIN, at(prefix, "missing"),
+		"unknown value", "use this function's parameter name, a declared variant, or a call", None, pure func(kind, names):
+			match kind:
+				Errors.ValueRejection(Errors.UnknownValue(name)): named(names, name, "missing")
+				_: False
+	)
+
+
+-- Only this direct planner input omits Pair's accepted type argument. The real
+-- declaration, signature, Caller and written fields still come from their owners.
+private pure func malformed_plans(program: ParsedProgram, context: ResolutionContext, body: ValueExpression, owner: RecordId) -> Bool:
+	hint = Some(AcceptedType(Model.RecordType(owner)))
+	declaration_span = at("fixed record Pair[T] { ", "first")
+	match body.base:
+		RecordExpression([second, first]):
+			complete = plan_record_literal([second, first], body.base_span, hint, context)
+			incomplete = plan_record_literal([second], body.base_span, hint, context)
+			match (complete, incomplete):
+				(Err(arity), Err(missing)):
+					match (arity.kind, missing.kind):
+						(Errors.InternalInvariant(Errors.InvalidRecordDeclaration(invalid_owner)), Errors.RecordRejection(Errors.MissingRecordField(field, declaration))):
+							(record_number(invalid_owner) == record_number(owner)
+								and Model.field_number(field) == 0 and record_number(Model.field_owner(field)) == record_number(owner)
+								and same_span(declaration, declaration_span)
+								and diagnostic_is(program, arity, body.base_span,
+									"invalid record declaration", "report this compiler error with the input program", None)
+								and diagnostic_is(program, missing, body.base_span,
+									"missing field in record literal", "provide every declared record field exactly once", Some(RecordFieldDeclaration(declaration_span))))
+						_: False
+				_: False
+		_: False
+
+
+pure func test_malformed_arity_is_checked_after_missing_fields() -> Bool:
+	source: String =
+		|fixed record Pair[T] { first: T, second: T }
+		|pure func make() -> Pair[Int]:
+		|    { second = 17, first = 23 }
+		|func main() -> Int:
+		|    0
+		|
+	match parse_modules([{ source = source, targets = [] }]):
+		Err(_): False
+		Ok(program):
+			parsed = parsed_contents(program)
+			match build_namespace(program):
+				Err(_): False
+				Ok(namespace):
+					match validate_declarations(parsed, namespace):
+						Err(_): False
+						Ok(declarations):
+							match accepted_signatures(program, namespace):
+								Err(_): False
+								Ok(signatures):
+									match (inventory_functions(parsed.declarations), declarations.records):
+										([make, ..._], [checked_record]):
+											match make.declaration.body:
+												ParsedValueBody(body):
+													context: ResolutionContext = {
+														caller = { function = make.id, purity = make.declaration.purity },
+														module = make.declaration.module, namespace = namespace,
+														signatures = signatures.functions, unions = declarations.unions,
+														records = declarations.records, constants = []
+													}
+													malformed_plans(program, context, body, checked_record.id)
+												_: False
+										_: False
+
+
+pure func test_record_constant_rejection_stays_outside_the_prep() -> Bool:
+	prefix = PAIR + "private VALUE: Pair = "
+	literal = "{ first = 23, second = 17 }"
+	rejects(prefix + literal + "\n" + MAIN, at(prefix, literal),
+		"constant initializer is not a closed value", "use an Int, Float, or String literal", None, pure func(kind, names):
+			match kind:
+				Errors.ConstantRejection(Errors.NonClosedInitializer): True
+				_: False
+	)
+
+
+tests: TestSuite = {
+	description = "Record field admission before extraction",
+	tests = [
+		("literal fields keep written order and nominal IDs", test_literal_fields_keep_written_order_and_nominal_ids),
+		("generic fields keep written order and concrete types", test_generic_fields_keep_written_order_and_concrete_types),
+		("unknown field precedes later duplicate and RHS errors", test_unknown_field_wins_before_later_duplicate_and_rhs),
+		("duplicate field precedes later unknown and RHS errors", test_duplicate_field_wins_before_later_unknown_and_rhs),
+		("first missing declaration precedes RHS errors", test_first_missing_declaration_wins_before_rhs),
+		("later child error precedes sibling mismatch", test_later_child_error_wins_before_sibling_mismatch),
+		("malformed generic arity follows structural admission", test_malformed_arity_is_checked_after_missing_fields),
+		("record constants remain outside this prep", test_record_constant_rejection_stays_outside_the_prep),
+	]
+}

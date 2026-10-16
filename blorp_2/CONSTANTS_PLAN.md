@@ -216,8 +216,14 @@ M5a.1 uses 351 added / +259 net, leaving 399 added / +341 net before prep.
 Exact ordering, error spans/notes, reversed FieldIds, all-child-before-mismatch,
 unchanged constant rejections and a direct malformed generic-arity control must
 pass; deliberate faults must prove those oracles. Prep gets its own reviewed
-commit before the record/reference feature. Actual costs and the remaining
-feature's line estimate are unverified; stop rather than compress code to fit.
+commit before the record/reference feature. Its implementation is 42 added /
+35 deleted / +7 net production lines, with 247 test lines. The 154 focused
+callbacks, five sensitive faults and 3,624 matched cost calls pass. Actual-main
+acceptance passes 2,902 component checks, 452 e2e cases and the unchanged 36/38
+frontier. The [admission report](../benchmarks/results/blorp_2_record_field_admission_2026-10-16.md)
+records these bounded results. Combined M5a now uses 393 added / +266 net,
+leaving 357 added / +334 net for records/references. That feature's estimate is
+still unverified; stop rather than compress code to fit.
 
 Freeze the host, base/candidate inputs and binaries before any measurements.
 On every unchanged accepted/rejected input, normal minimum-of-three serial

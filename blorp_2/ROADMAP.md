@@ -375,8 +375,12 @@ tests and actual-entrypoint e2e cases prove the scoped materialization policy.
 **Status.** M5a.1 scalar/String facts, identity/ownership tests, six mutation
 oracles, matched costs and the actual-main 2894-component/452-e2e gate pass.
 The [scalar report](../benchmarks/results/blorp_2_scalar_constants_2026-10-16.md)
-records that bounded path. M5a.2's shared field-admission preparation is reviewed;
-closed records, initializer references/cycles and opaque forms remain.
+records that bounded path. M5a.2's shared field-admission preparation passes
+focused, mutation and matched cost checks, plus actual-main 2902-component/
+452-e2e acceptance and the unchanged 36/38 frontier.
+The [admission report](../benchmarks/results/blorp_2_record_field_admission_2026-10-16.md)
+records its 42 added / +7 net production lines. Closed records, initializer
+references/cycles and opaque forms remain.
 M5 is complete only after M5a and the M4-dependent M5b both pass their gates.
 
 ## M2: the join

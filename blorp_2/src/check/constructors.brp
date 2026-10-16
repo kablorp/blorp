@@ -175,51 +175,41 @@ pure func record_argument_hints(arguments: List[InferenceType]) -> List[Option[I
 	arguments.map(pure func(value): Some(value))
 
 
-private fixed record ResolvedLiteralField {
+fixed record ResolvedLiteralField {
 	field: CheckedField,
 	written: ParsedRecordField
 }
 
 
-pure func plan_record_literal(
+-- Structural admission precedes child planning and preserves written order.
+-- Only missing-field selection follows the declaration's field order.
+pure func admit_record_fields(
 	written: List[ParsedRecordField],
 	span: Span,
-	expectation: Option[InferenceType],
-	context: ResolutionContext,
-) -> Result[PlannedBase, CheckError]:
-	term ?= expectation.to_result(record_error(span, RecordNeedsExpectedType))
-	-- The supplied hint must establish the owner. A solved bare call variable
-	-- can constrain types, but cannot give a later literal its nominal shape.
-	occurrence ?= record_occurrence(term).to_result(record_error(span, RecordNeedsExpectedType))
-	owner = occurrence.owner
-	declaration ?= context.records
-		.get(record_number(owner))
-		.to_result(checker_invariant(span, InvalidRecordDeclaration(owner)))
+	declaration: CheckedRecord,
+) -> Result[List[ResolvedLiteralField], CheckError]:
 	var resolved: List[ResolvedLiteralField] = []
 	var previous: List[WrittenName] = []
 	var failure: Option[CheckError] = None
 
 	for field in written:
-		known_names = previous
-		result = resolve_record_field(
-			field.name,
-			owner,
-			context,
-		).and_then(pure func(declared: CheckedField) -> Result[ResolvedLiteralField, CheckError]:
-			match previous_declaration(known_names, field.name.id):
-				Some(first):
-					Err(
-						record_error(
-							field.name.span,
-							DuplicateLiteralField(field.name.id, first.span),
-						),
-					)
-				None:
-					Ok({
-						field = declared,
-						written = field,
-					})
-		)
+		result: Result[ResolvedLiteralField, CheckError] = match find_field(declaration.fields, field.name.id):
+			None:
+				Err(record_error(field.name.span, UnknownRecordField(field.name.id, declaration.id)))
+			Some(declared):
+				match previous_declaration(previous, field.name.id):
+					Some(first):
+						Err(
+							record_error(
+								field.name.span,
+								DuplicateLiteralField(field.name.id, first.span),
+							),
+						)
+					None:
+						Ok({
+							field = declared,
+							written = field,
+						})
 
 		match result:
 			Err(error):
@@ -248,11 +238,28 @@ pure func plan_record_literal(
 			)
 			break
 
-	complete ?= match failure:
+	match failure:
 		Some(error):
 			Err(error)
 		None:
-			Ok(void)
+			Ok(resolved)
+
+
+pure func plan_record_literal(
+	written: List[ParsedRecordField],
+	span: Span,
+	expectation: Option[InferenceType],
+	context: ResolutionContext,
+) -> Result[PlannedBase, CheckError]:
+	term ?= expectation.to_result(record_error(span, RecordNeedsExpectedType))
+	-- The supplied hint must establish the owner. A solved bare call variable
+	-- can constrain types, but cannot give a later literal its nominal shape.
+	occurrence ?= record_occurrence(term).to_result(record_error(span, RecordNeedsExpectedType))
+	owner = occurrence.owner
+	declaration ?= context.records
+		.get(record_number(owner))
+		.to_result(checker_invariant(span, InvalidRecordDeclaration(owner)))
+	resolved ?= admit_record_fields(written, span, declaration)
 
 	accepted = declaration
 	if not IntOps.equals(accepted.type_parameters.length(), occurrence.arguments.length()):
