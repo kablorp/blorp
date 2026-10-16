@@ -159,6 +159,13 @@ strings while preserving asserted bytes and spans. Each gets its own small
 reviewed plan and explicit ceilings before code; none authorizes broader
 emitter, lexer or testing infrastructure.
 
+The [keyword authority plan](KEYWORD_AUTHORITY_PLAN.md) defines the precise
+token split, classifier representation preflight, source-lifetime oracle and
+cost ceilings. Its source probe precedes implementation; plan approval alone
+does not establish that the proposed physical representation is cheap.
+The [emitter diagnostics plan](EMITTER_DIAGNOSTICS_PLAN.md) fixes the failure
+vocabulary and source-occurrence ownership without weakening VerifiedProgram.
+
 Shared documentation includes the input-program rule references, removed GUIDE
 examples, roadmap join/recursion corrections and CF-031/032 reproductions.
 Document divergence from the frozen host explicitly.

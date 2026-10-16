@@ -327,12 +327,18 @@ func probe(label: String, value: Bool) -> Bool:
     value
 
 func main():
-    match True:
-        True: match False:
+    match not False:
+        True: match not True:
             True: not probe("never", False)
             False: not probe("selected", False)
         False: not probe("outer-skipped", True)
 ```
+
+Implementation preparation corrected these scrutinees from bare `True` and
+`False`: existing match checking requires an already-typed union expression.
+The logical forms supply the designated Bool type without extending bare
+constructor inference, while preserving the same selected effects and Void
+join normalization oracle.
 
 Prove the tests by deliberate temporary mutations: swapped canonical labels,
 RHS work moved before the join, skipped static RHS checking, bypassed Bool
@@ -345,7 +351,7 @@ functions or rewrite fixture C.
 Remove only the obsolete `not` and `and/or` unsupported cases. Keep the exact
 `if` rejection. All previously accepted fixtures must emit byte-identical C;
 any exception requires explicit explanation and review. Preserve all existing
-fixture cost limits and the 32/34 parser frontier.
+fixture cost limits and the measured parser frontier for the actual source tree.
 
 ## Scope, costs and acceptance
 

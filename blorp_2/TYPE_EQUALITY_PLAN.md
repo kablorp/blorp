@@ -57,9 +57,9 @@ The body change is **+10 physical production lines**, including normal arm
 formatting already used by namespace.same_head. Removing the now-unused
 same_head import makes the complete preparation **+9**. No helper, carrier,
 state, type, index or matcher is added. type_head remains unchanged for namespace
-consumers. The separate current UFCS prototype's +28 becomes **+37** when this
-preparation is integrated, below the
-new +20 preparation ceiling and original +102 whole-change ceiling.
+consumers. The preparation's +9 stays below its +20 ceiling. The separate
+current UFCS prototype's +28 becomes **+37** when this preparation is
+integrated, below the original +102 whole-change ceiling.
 
 The mapping is exactly the old TypeRef -> TypeHead -> same_head composition:
 four distinct primitive constructors, record identity and union identity.
