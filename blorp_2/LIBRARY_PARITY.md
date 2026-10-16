@@ -21,9 +21,9 @@ claim that current callers or missing twins have disappeared.
 | Char reads, literals and conversions | Replace with `string.byte_at(String, Int) -> Option[Int]` and `string.from_codepoint(Int) -> Option[String]`; both matching host/target interfaces are planned, not implemented. Full-width scalar validation precedes narrowing, and Some[String] has ordinary owning payload transfer/destruction. |
 | Parser alphabet classification | Private ASCII byte predicates replace all current String lower/index_of/contains callers, preserving empty-substring and malformed-token diagnostic behavior. Remove the historical rows only after resolved inventory confirms zero uses. |
 | List/Option/Result callbacks and function types | Conditional first-order migration. Do not implement historical HOF rows solely for bootstrap or remove them before the bounded pilots and full inventory pass. |
-| First-order numeric, String and List operations | Remain required. Slice/compare raw counted bytes. Establish actual frozen-host substring bounds; legacy C and current synthesized helpers differ. Measure join construction: host join uses capacity-aware append, not naive concat. |
-| `system.get_current_directory() -> Result[String, String]` | New fallible contract replaces source use of fixed-buffer `getcwd`. Owned nonempty absolute success, useful error and no fixed path-length limit. |
-| `system.read_file(String) -> Result[String, String]` | Exact counted bytes including NUL; reject NUL paths; close on every opened path; read/close failures are Err, with no printing. |
+| First-order numeric, String and List operations | Remain required over valid UTF-8. Planned `string.slice(String, Int, Int) -> Option[String]` uses half-open byte offsets and rejects out-of-range or misaligned endpoints. Byte comparisons create no String. Measure join construction: host join uses capacity-aware append, not naive concat. |
+| `system.get_current_directory() -> Result[String, String]` | New fallible contract replaces source use of fixed-buffer `getcwd`. Owned nonempty absolute UTF-8 path on success; invalid encoding returns Err. No fixed path-length limit. |
+| `system.read_file(String) -> Result[String, String]` | Preserve valid UTF-8 contents exactly, including CRLF and NUL; invalid encoding returns Err before String publication. Reject NUL paths; close on every opened path; read/close failures are Err, with no printing. |
 | `system.write_file(String, String) -> Result[Void, String]` | Exact create/truncate write; reject NUL paths; Ok only after successful write and close. Missing parents fail; partial output is allowed. |
 | `io.print_error(String) -> Void` | Write the counted message plus one LF to stderr only. The host's existing generic API supplies this String instance; the target twin is explicitly monomorphic, as in note C. |
 | `path.join`, `path.dirname`, `path.normalize` | Keep existing names and pure String signatures. ROADMAP pins empty children, all trailing separators, logical normalization and root behavior. No cosmetic synonyms or Path carrier. |
@@ -32,6 +32,13 @@ These seven OS/path functions plus the existing `main(args: List[String]) -> Int
 contract cover the shell/loader boundary. [ROADMAP](ROADMAP.md#seven-shell-and-path-functions)
 owns their complete behavioral and failure contracts, the unchanged CLI,
 relative-path acceptance and runtime ownership tests.
+
+The String contract is valid UTF-8 everywhere, retaining byte lengths and spans.
+Validate raw argv before invoking main; invalid encoding reports a fixed valid
+diagnostic and exits 1. Error messages themselves must satisfy the invariant.
+Current unchecked target argv/native constructors and legacy host byte APIs do
+not yet establish this guarantee. Admission and checked slicing require their
+own bounded implementation/tests; no public Bytes or ASCII type is introduced.
 
 The host normally uses an embedded library/runtime. Verify explicit
 `compile --std-dir DIRECTORY` selection for new ordinary wrappers; project CWD

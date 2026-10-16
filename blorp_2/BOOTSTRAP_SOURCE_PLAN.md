@@ -181,6 +181,11 @@ construction cost. Sorting is a separate pilot, not a mechanical rewrite.
 
 ## String and library boundary
 
+Every String must contain valid UTF-8, including paths and errors. Lengths and
+source spans remain byte-based; NUL is valid content. No ASCII refinement, Char
+or Bytes representation is needed for this increment. This is the required
+contract, not a claim that current native/legacy host boundaries enforce it.
+
 Use two explicit, matching public interfaces in the host and temporary library:
 
 ```blorp
@@ -189,15 +194,36 @@ pure func from_codepoint(value: Int) -> Option[String]
 ```
 
 `byte_at` returns an unsigned byte 0–255 or None outside the counted String.
+It observes encoding bytes: for "é", offsets 0 and 1 return 195 and 169.
+It never constructs a one-byte String or revalidates a trusted String.
 `from_codepoint` rejects negative values, D800–DFFF and values above 10FFFF
 **before narrowing**; every other scalar, including NUL and noncharacters,
 produces its exact UTF-8 bytes. Host wrappers may use Char internally. Target
 operations use existing String/Int/Option representations. An owning Some[String]
 must use the ordinary union transfer/destruction path, not a numeric adapter.
 
-Keep raw UTF-8 validation, exact error priority and half-open byte spans. Keep
-existing unsupported Char-input diagnostics. Replacing source Char values does
-not authorize ASCII-only text or reconstruction of raw byte slices as scalars.
+Preserve lexical diagnostic priority and half-open byte spans for valid UTF-8
+inputs, including unsupported Char-input diagnostics. Replacing source Char
+values does not authorize ASCII-only text or reconstruction of raw byte slices
+as scalars. Admission rejects malformed encoding before String publication and
+lexing; its offset and failure-priority rules belong to the admission brief.
+Malformed-file coverage belongs there; lexer tests continue covering invalid
+escapes and unsupported source characters within valid UTF-8.
+
+Exact String-producing slices use one planned matching interface:
+
+```blorp
+pure func slice(value: String, start: Int, end: Int) -> Option[String]
+```
+
+Offsets are half-open bytes. Require 0 <= start <= end <= length and both
+endpoints at scalar boundaries; otherwise return None. Preserve exact bytes,
+with no rounding, replacement or normalization. Given a valid String, endpoint
+checks suffice; do not rescan the result. An empty range inside a scalar fails.
+Migrate one-byte classification, including diagnostic location scanning, to
+byte_at. Do not silently redefine legacy host substring or add both public forms.
+Slice and ingress enforcement are separate bounded tasks, outside the two new
+operations' budgets.
 
 All current String lower/index_of/contains source calls serve parser ASCII
 alphabets. Two private digit-value helpers and the existing type-parameter
@@ -207,14 +233,49 @@ spelled "0" or "-0" currently gets the leading-zero diagnostic because an empty
 substring passes contains. Preserve that absent-byte result explicitly at that
 callsite, not in the digit helper. Preserve forged integer-token validation too.
 Remove library search/lower requirements only after the source patch and a fresh
-resolved call inventory; public String semantics do not change.
+resolved call inventory; classification migration preserves valid UTF-8 contents
+and their diagnostics.
 
-Byte-exact substring, starts_with, concatenation and large List[String].join
+Boundary-checked slicing, starts_with, concatenation and large List[String].join
 still need real library implementations. Host join uses a capacity-aware append
 operation; naive immutable concat can restore quadratic copying. Measure a direct
 Blorp candidate; if it fails the gate, review one concrete counted join operation
 over the existing List[String] representation. No general String builder or new
 managed buffer type follows automatically.
+
+Validate untrusted counted native buffers once, before constructing Strings.
+The existing internal from-bytes constructor must accept only already-valid
+UTF-8; literals, scalar encoding, numeric formatting, concatenation/join and
+aligned slicing establish validity by construction. Current argv admission and
+native runtime equality tests expose gaps: reject malformed argv before user
+main with a fixed valid-text diagnostic and status 1, clean up partial ownership,
+and move malformed-byte cases to native admission tests. Use valid multilingual
+Strings for byte/equality tests. Preserve coverage until its replacement passes.
+Legacy host decoding/slicing/IO loopholes are defects, not target contracts;
+minimal bootstrap twins do not authorize a whole host-library rewrite.
+
+The first enforcement slice touches only runtime/string, runtime/list and emit:
+one allocation-free counted-buffer UTF-8 predicate, the existing argv helper
+returning native NULL after ordinary partial-list destruction on invalid input,
+and a checked generated wrapper before user main. Native NULL never becomes a
+language value. Argument-taking Int and Void main share this check; no-argument
+main publishes no argv Strings and retains its existing behavior. Successful
+allocation counts remain unchanged. Ceilings are 120 added / +90 net production,
+500 test lines, 60 fixture lines and 45 documentation lines; added C is at most
+4 KiB for validation and 1 KiB for argv projection. Per-input feature costs target
++5%, cap +10%, and retain stricter fixture limits. Checked slicing and filesystem
+admission are separate slices. The planned String route totals at most 630 added /
++480 net production including host wrappers, two target operations and this slice;
+it excludes source Char migration and host ownership repair.
+
+Raw native helper tests prove malformed admission and partial destruction;
+emitter unit tests prove rejection precedes the language call, and existing
+real-main e2e tests prove valid argv behavior. List[String] cannot express
+malformed argv, so this does not prove malformed-argv execution through real main.
+The coordinator accepts that evidence limit; add no launcher mechanism to hide it.
+Require semantic red, restored mutations, two code reviews of the completed
+candidate including the coordinator, and a separate test-runner review. Design
+reviews do not substitute for candidate reviews.
 
 New library wrappers require a verified explicit host source-library selection.
 Native helper additions require a supporting host with the new runtime and

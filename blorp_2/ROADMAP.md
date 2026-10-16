@@ -678,9 +678,10 @@ dependency inventory after source migration, not the old callback/Char rows.
 remaining first-order numeric comparisons/classification; ordinary Option/Result
 helpers; byte-exact String operations; and the shell/path surface below. New
 `string.byte_at -> Option[Int]` and `string.from_codepoint -> Option[String]`
-avoid target Char/Bytes. They preserve arbitrary counted input bytes and validate
-scalar encoding before narrowing. See the source plan for exact contracts and
-the owning Some[String] transfer tests.
+avoid target Char/Bytes. Strings contain valid UTF-8; byte observation retains
+byte coordinates, and scalar encoding validates before narrowing. Planned
+`string.slice` checks half-open byte bounds and scalar boundaries. See the source
+plan for exact contracts and the owning Some[String] transfer tests.
 
 Write ordinary helpers in Blorp where the reduced subset and measured cost allow.
 Do not reconstruct raw substring bytes through scalar encoding. `starts_with`
@@ -733,7 +734,11 @@ as explicitly recorded in the parity table. No host trait enters target code.
   otherwise. Grow storage as required by the OS; no fixed buffer or empty failure
   sentinel. Query once before loader identities. Failure uses the real compiler
   SourceId and an empty source inventory, not a fabricated module/file row.
-- **Read:** preserve all counted bytes, including CRLF, NUL and invalid UTF-8.
+  Validate native encoding before String publication; invalid UTF-8 returns Err.
+- **Read:** preserve valid UTF-8 contents exactly, including CRLF, BOM and NUL.
+  Malformed UTF-8 returns Err before publishing contents as a String. Its exact
+  diagnostic and failure priority belong to the read brief. Preserve malformed-input
+  coverage at this admission boundary.
   Reject NUL in a path before opening. Missing/unreadable input, incomplete reads
   and close failure return Err; clean up every opened handle. This increment
   needs stable source files, not arbitrary streams or concurrent snapshots.
@@ -742,6 +747,9 @@ as explicitly recorded in the parity table. No host trait enters target code.
   partial output. Neither file operation prints. Preserve the primary failure
   while attempting cleanup; never report success after a short transfer/close
   failure. Interruption/retry policy needs explicit native tests.
+  All fallible OS operations, including current-directory lookup, return valid-text
+  errors. OS failures use fixed operation text and numeric OS codes rather than
+  unchecked locale-dependent native messages.
 - **Stderr:** attempt the complete counted message plus one additional LF,
   preserving internal newlines/NUL and writing nothing to stdout. Void reports
   no delivery status; stop on unrecoverable output error.
@@ -767,6 +775,11 @@ stdout/stderr on success; return 1 with stderr diagnostics for usage/loading/
 compilation/publication failures. Relative paths use process CWD. The existing
 relative output path passed to write_file needs no new shell context carrier.
 After loading, compilation and diagnostic rendering remain pure.
+Validate every native argument, including the executable name, before invoking
+argument-taking user main. No-argument main publishes no argv Strings and keeps
+its current behavior. Malformed UTF-8 produces a fixed ASCII stderr diagnostic and status 1,
+with all partially acquired argument ownership released. This admission contract
+still needs implementation; existing unchecked argv conversion is not sufficient.
 
 Ordinary Blorp implements paths; native bindings implement the four impure
 operations. The existing fixed-buffer getcwd cannot satisfy the new contract.
@@ -780,13 +793,18 @@ payload types once. Inputs are borrowed; successful/error Strings are owned.
 Specialization, ownership and independent verification consume those facts;
 do not recover a branch from error spelling or duplicate the signature solver.
 
-**Acceptance.** Pure path edge tables, byte-exact file/stderr tests, NUL paths,
+**Acceptance.** Pure path edge tables, byte-exact valid-UTF-8 file/stderr tests, NUL paths,
 missing/permission/incomplete/close errors, multiple-CWD relative invocations,
-prefix identity and source cleanup. Use granular phase tests and runtime helpers
+prefix identity and source cleanup. Raw-buffer tests reject overlong encodings,
+isolated continuations, truncation, surrogates and values above U+10FFFF before
+String publication. Preserve valid NUL, multibyte, scalar and ownership cases.
+Use granular phase tests and runtime helpers
 as well as real-main e2e. A deterministic failure-injection test needs its own
 reviewed test-local design; no new production failure framework. Every slice
-sets LOC/cost ceilings before code. Existing non-I/O fixtures retain C/diagnostic
-identity; M8 still proves real rebuilt-compiler output identity.
+sets LOC/cost ceilings before code. Source-only preparations retain shared-fixture
+C/diagnostic identity. Feature slices enumerate, review and measure intentional
+C changes, including new helper definitions in existing String programs. M8
+still proves real rebuilt-compiler output identity.
 
 **Exit proof.** No required MISSING parity row; real src reaches load/check.
 

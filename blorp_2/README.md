@@ -1512,6 +1512,12 @@ decomposed text is preserved without normalization. Source spans and diagnostic
 columns continue to count bytes; identifier and comment syntax retains its
 current ASCII restriction.
 
+Every String's required contract is valid UTF-8. Current native argv admission
+and legacy host byte APIs still have enforcement gaps; the
+[source plan](BOOTSTRAP_SOURCE_PLAN.md#string-and-library-boundary) tracks their
+removal. Planned checked slicing preserves scalar boundaries; byte access remains useful.
+An ASCII refinement type is deferred.
+
 The fixed escapes are `\n`, `\r`, `\t`, `\0`, `\\`, `\"`, `\'`, `\{` and
 `\}`. A Unicode escape `\u{X...}` has one to six hexadecimal digits and names a
 valid scalar from U+0000 through U+10FFFF, excluding U+D800 through U+DFFF.
