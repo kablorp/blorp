@@ -1000,8 +1000,11 @@ Each item below was measured but not fixed. Each needs its own reviewed plan.
 The original bug-hunt backlog follows. The emitter item is now complete:
 [its report](../benchmarks/results/blorp_2_emitter_diagnostics_2026-10-16.md)
 records the independent reviews, exact diagnostics, unchanged accepted C,
-passing destination gates and matched costs. Keyword and multiline work
-remain separate acceptance slices.
+passing destination gates and matched costs. The
+[multiline cleanup](../benchmarks/results/blorp_2_multiline_tests_2026-10-16.md)
+is also complete: 209 literals in 37 files preserve their exact bytes and pass
+576 focused callbacks plus the full destination gate. Keyword authority remains
+a separate acceptance slice.
 
 1. **One message for 28 failures.** All 28 calls to the emitter's
    `internal_error()` report "invalid checked union identity", including a
@@ -1011,9 +1014,10 @@ remain separate acceptance slices.
    `utils/syntax.keyword_spelling`, and a hand-kept 36-word test inventory
    (`test_lex/test_keywords.brp`). Hand-kept counts in tests break the
    no-pinning rule. Use one authoritative table, and keep lookup fast.
-3. **Escaped one-line test programs,** for example in `test_check/test_match.brp`.
-   Multiline strings would show syntax and indentation. Conversions must keep
-   exact bytes wherever a test asserts spans.
+3. **Escaped one-line test programs. Complete.** Aligned multiline strings show
+   syntax and indentation, with exact byte comparisons and terminal-LF/tab
+   mutation oracles. Malformed whitespace and useful short byte fragments retain
+   quoted escapes.
 
 ## Paused milestone branches
 

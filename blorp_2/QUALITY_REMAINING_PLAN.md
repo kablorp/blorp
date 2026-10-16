@@ -200,11 +200,13 @@ The emitter diagnostics item is complete: twelve precise failures carry the
 relevant identity and available occurrence, replacing the generic union error.
 The [emitter report](../benchmarks/results/blorp_2_emitter_diagnostics_2026-10-16.md)
 records the passing 2,814-component/445-e2e destination gate, 34/36 frontier,
-unchanged fixture C, zero leaks and all matched cost ceilings. Keyword
-recognition and diagnostic spelling still need one authoritative
-mapping with measured lookup costs. Escaped long test programs become multiline
-strings while preserving asserted bytes and spans. Each gets its own small
-reviewed plan and explicit ceilings before code; none authorizes broader
+unchanged fixture C, zero leaks and all matched cost ceilings. The
+[multiline test cleanup](../benchmarks/results/blorp_2_multiline_tests_2026-10-16.md)
+converts 209 program literals in 37 files with identical bytes, assertions and
+spans; its focused suites pass 576 callbacks and the actual destination passes
+2,814 component/445 e2e checks. Keyword recognition and diagnostic spelling
+still need one authoritative mapping with measured lookup costs. Each gets its
+own small reviewed plan and explicit ceilings before code; none authorizes broader
 emitter, lexer or testing infrastructure.
 
 The [keyword authority plan](KEYWORD_AUTHORITY_PLAN.md) defines the precise
