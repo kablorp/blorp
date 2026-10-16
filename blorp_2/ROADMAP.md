@@ -785,8 +785,8 @@ After loading, compilation and diagnostic rendering remain pure.
 Validate every native argument, including the executable name, before invoking
 argument-taking user main. No-argument main publishes no argv Strings and keeps
 its current behavior. Malformed UTF-8 produces a fixed ASCII stderr diagnostic and status 1,
-with all partially acquired argument ownership released. This admission contract
-still needs implementation; existing unchecked argv conversion is not sufficient.
+with all partially acquired argument ownership released. The native validator,
+ordinary prefix destruction and shared Int/Void wrapper enforce this boundary.
 
 Ordinary Blorp implements paths; native bindings implement the four impure
 operations. The existing fixed-buffer getcwd cannot satisfy the new contract.

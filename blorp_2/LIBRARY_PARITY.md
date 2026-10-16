@@ -34,11 +34,13 @@ owns their complete behavioral and failure contracts, the unchanged CLI,
 relative-path acceptance and runtime ownership tests.
 
 The String contract is valid UTF-8 everywhere, retaining byte lengths and spans.
-Validate raw argv before invoking main; invalid encoding reports a fixed valid
-diagnostic and exits 1. Error messages themselves must satisfy the invariant.
-Current unchecked target argv/native constructors and legacy host byte APIs do
-not yet establish this guarantee. Admission and checked slicing require their
-own bounded implementation/tests; no public Bytes or ASCII type is introduced.
+Target-generated programs validate argv before argument-taking main; malformed
+encoding reports a fixed ASCII diagnostic and exits 1 after prefix cleanup.
+The internal `blorp_string_from_bytes` constructor requires already-valid UTF-8.
+Filesystem admission, checked slicing and legacy host argv/byte APIs remain
+pending. Target emission does not repair the host-built pilot's own argv/file IO.
+Error messages must also satisfy the invariant. No public Bytes or ASCII type
+is introduced.
 
 The host normally uses an embedded library/runtime. Verify explicit
 `compile --std-dir DIRECTORY` selection for new ordinary wrappers; project CWD

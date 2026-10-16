@@ -247,11 +247,10 @@ managed buffer type follows automatically.
 Validate untrusted counted native buffers once, before constructing Strings.
 The existing internal from-bytes constructor must accept only already-valid
 UTF-8; literals, scalar encoding, numeric formatting, concatenation/join and
-aligned slicing establish validity by construction. Current argv admission and
-native runtime equality tests expose gaps: reject malformed argv before user
-main with a fixed valid-text diagnostic and status 1, clean up partial ownership,
-and move malformed-byte cases to native admission tests. Use valid multilingual
-Strings for byte/equality tests. Preserve coverage until its replacement passes.
+aligned slicing establish validity by construction. Native argv admission now
+rejects malformed input before user main with a fixed ASCII diagnostic and
+status 1, releasing partial ownership. Native admission tests cover malformed
+bytes; String byte/equality tests use valid multilingual contents.
 Legacy host decoding/slicing/IO loopholes are defects, not target contracts;
 minimal bootstrap twins do not authorize a whole host-library rewrite.
 

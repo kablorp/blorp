@@ -346,8 +346,8 @@ static void test_equals_nul(void) {
 }
 
 static void test_equals_bytes(void) {
-    static const char first[] = {(char)0xff, (char)0x80, 'x'};
-    static const char second[] = {(char)0xff, (char)0x81, 'x'};
+    static const char first[] = {(char)0xc3, (char)0xa9, 'x'};
+    static const char second[] = {(char)0xc3, (char)0xaa, 'x'};
     assert_equality(first, sizeof first, first, sizeof first, 1);
     assert_equality(first, sizeof first, second, sizeof second, 0);
 }

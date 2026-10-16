@@ -1512,8 +1512,9 @@ decomposed text is preserved without normalization. Source spans and diagnostic
 columns continue to count bytes; identifier and comment syntax retains its
 current ASCII restriction.
 
-Every String's required contract is valid UTF-8. Current native argv admission
-and legacy host byte APIs still have enforcement gaps; the
+Every String's required contract is valid UTF-8, including counted NUL. Native
+argv admission validates each argument before constructing its String. Legacy
+host byte APIs still have enforcement gaps; the
 [source plan](BOOTSTRAP_SOURCE_PLAN.md#string-and-library-boundary) tracks their
 removal. Planned checked slicing preserves scalar boundaries; byte access remains useful.
 An ASCII refinement type is deferred.
@@ -1596,6 +1597,17 @@ is rejected; pure main must return Int. The
 [main signature fixtures](test/e2e/test_main_signatures.brp) cover pure and
 impure Int entrypoints and explicit and omitted Void entrypoints, with and
 without arguments, through their ordinary native main functions.
+
+Argument-taking main rejects malformed UTF-8, including in the executable name,
+before calling language code. It releases the initialized argument prefix,
+exits 1, writes no stdout, and writes exactly this stderr:
+
+```text
+error: command-line argument is not valid UTF-8
+help: pass UTF-8 encoded arguments
+```
+
+No-argument main retains its existing behavior and publishes no argv Strings.
 
 Managed prefixes, including printing a literal before an ordinary terminating
 tail match, are supported. Managed temporaries in annotated tail loops retain
