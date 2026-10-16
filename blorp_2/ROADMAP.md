@@ -68,6 +68,12 @@ their own inventory and plan after M8.
 
 ## Status and order
 
+Corrections, language rules and cleanups decided at the 2026-10-16 quality reset,
+including the namespace redesign, the `?=` placement rule, pattern and binding
+names, private types and UFCS clashes, are queued in
+[QUALITY_ROADMAP.md](QUALITY_ROADMAP.md). Most of them land before the next
+milestone work.
+
 | Milestone | Scope | Status |
 | --- | --- | --- |
 | [M0](#m0-foundation-closeout) | Re-cut, perf fixes, recursion-site loops, fixpoint script, parity table | Landed: checker re-cut, emit and name-interning fixes, parity table, parser statement loop, `scripts/blorp2-fixpoint`, `BLORP2_COMPILER` harness. Open: the per-item recursions in `check_functions` and `declare_types`. |
