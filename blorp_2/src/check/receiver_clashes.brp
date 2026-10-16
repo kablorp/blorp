@@ -1,0 +1,219 @@
+---
+Reject overlapping receiver declarations before bodies are elaborated. Transient
+name-keyed groups use introduction-route upper bounds. Each unordered pair is
+checked once; only the exact inherited prelude subset reuses a proof.
+---
+import:
+	./callables: ReceiverCandidate, method_site, receiver_bindings
+	./errors: CheckError, CheckerInvariant(InvalidResolvedFunction), MethodError(OverlappingReceivers), checker_invariant, method_error
+	./inference: types_overlap
+	./model: type_head
+	./signatures: AcceptedFunction
+	../namespace/namespace: Namespace, MethodImport, declared_function, method_imports, module_entries, offered_function, same_head
+	../parse/assemble: ModuleImport, ParsedModuleRow
+	../parse/parse: ImportSelection(NamedSelection)
+	../utils/ids: FunctionId, function_number
+	../utils/int_map as IntMaps
+	../utils/names: name_number, same_name
+	../utils/source: ModuleKind(UserModule, FoundationPreludeModule), same_module
+	../utils/syntax: Span, WrittenName
+	int as IntOps
+
+
+private fixed record IntroducedName {
+	written: WrittenName,
+	candidate_bound: Int
+}
+
+
+private pure func count_introduction(names: IntMaps.IntMap[IntroducedName], written: WrittenName, inherited_count: Int) -> IntMaps.IntMap[IntroducedName]:
+	key = name_number(written.id)
+	match IntMaps.get(names, key):
+		None: IntMaps.set(names, key, { written = written, candidate_bound = IntOps.add(inherited_count, 1) })
+		Some(previous): IntMaps.set(names, key, { previous | candidate_bound = IntOps.add(previous.candidate_bound, 1) })
+
+
+private pure func name_counts(signatures: List[AcceptedFunction]) -> IntMaps.IntMap[Int]:
+	var counts: IntMaps.IntMap[Int] = IntMaps.int_map_with_capacity(signatures.length())
+	for accepted in signatures:
+		if not accepted.signature.parameters.is_empty():
+			key = name_number(accepted.declaration.function_name.id)
+			counts = IntMaps.set(counts, key, IntOps.add(IntMaps.get(counts, key).get_or(0), 1))
+	counts
+
+
+-- Explicit function selections and the written suffix of the namespace's method
+-- edges introduce candidates. The prelude prefix is already validated.
+private pure func selected_receiver(request: ModuleImport, accepted: AcceptedFunction, methods: List[MethodImport], first_method: Int) -> Bool:
+	var selected = False
+	for selection in request.symbols:
+		match selection:
+			NamedSelection(written):
+				if same_name(written.id, accepted.declaration.function_name.id):
+					selected = True
+			_: void
+	match accepted.signature.parameters.get(0):
+		None: void
+		Some(parameter):
+			match type_head(parameter.value_type):
+				None: void
+				Some(head):
+					for position in first_method..methods.length():
+						match methods.get(position):
+							Some(edge):
+								if same_module(edge.target, request.target) and same_head(edge.receiver, head):
+									selected = True
+							None: void
+	selected
+
+
+private pure func introduced_names(namespace: Namespace, signatures: List[AcceptedFunction], counts: IntMaps.IntMap[Int], row: ParsedModuleRow, first_method: Int, inherited: IntMaps.IntMap[List[FunctionId]]) -> Result[IntMaps.IntMap[IntroducedName], CheckError]:
+	var names: IntMaps.IntMap[IntroducedName] = IntMaps.empty_int_map()
+	none: List[FunctionId] = []
+	var failure: Option[CheckError] = None
+	for own_entry in module_entries(namespace, row.module):
+		match declared_function(own_entry):
+			None: void
+			Some(own_id):
+				match signatures.get(function_number(own_id)):
+					None: failure = Some(checker_invariant(row.end, InvalidResolvedFunction(own_id)))
+					Some(accepted):
+						key = name_number(accepted.declaration.function_name.id)
+						if not accepted.signature.parameters.is_empty() and IntOps.greater_than(IntMaps.get(counts, key).get_or(0), 1):
+							names = count_introduction(names, accepted.declaration.function_name, IntMaps.get(inherited, key).get_or(none).length())
+	methods = method_imports(namespace, row.module)
+	for request in row.imports:
+		for provider_entry in module_entries(namespace, request.target):
+			match offered_function(provider_entry):
+				None: void
+				Some(offered_id):
+					match signatures.get(function_number(offered_id)):
+						None: failure = Some(checker_invariant(request.span, InvalidResolvedFunction(offered_id)))
+						Some(accepted):
+							key = name_number(accepted.declaration.function_name.id)
+							if not accepted.signature.parameters.is_empty() and IntOps.greater_than(IntMaps.get(counts, key).get_or(0), 1):
+								provided_ids = IntMaps.get(inherited, key).get_or(none)
+								if not is_inherited(accepted.id, provided_ids) and selected_receiver(request, accepted, methods, first_method):
+									names = count_introduction(names, accepted.declaration.function_name, provided_ids.length())
+	match failure:
+		Some(invariant): Err(invariant)
+		None: Ok(names)
+
+
+private pure func is_inherited(id: FunctionId, inherited: List[FunctionId]) -> Bool:
+	var found = False
+	for supplied in inherited:
+		if IntOps.equals(function_number(id), function_number(supplied)):
+			found = True
+			break
+	found
+
+
+private pure func candidate_span(candidate: ReceiverCandidate) -> Span:
+	match candidate.import_site:
+		Some(selection): selection
+		None: candidate.function.declaration.function_name.span
+
+
+private pure func reject_pair(name: WrittenName, left: ReceiverCandidate, right: ReceiverCandidate, inherited: List[FunctionId]) -> Result[Void, CheckError]:
+	left_inherited = not inherited.is_empty() and is_inherited(left.function.id, inherited)
+	right_inherited = not inherited.is_empty() and is_inherited(right.function.id, inherited)
+	if left_inherited and right_inherited:
+		Ok(void)
+	else:
+		introduced = if right_inherited:
+			left
+		else:
+			right
+		other = if right_inherited:
+			right
+		else:
+			left
+		match introduced.function.signature.parameters.get(0):
+			None: Ok(void)
+			Some(introduced_parameter):
+				match other.function.signature.parameters.get(0):
+					None: Ok(void)
+					Some(other_parameter):
+						match types_overlap(other_parameter.value_type, other.function.signature.type_parameters, introduced_parameter.value_type, introduced.function.signature.type_parameters, candidate_span(introduced)):
+							Err(invariant): Err(invariant)
+							Ok(False): Ok(void)
+							Ok(True): Err(method_error(candidate_span(introduced), OverlappingReceivers(name.id, {
+								introduced = method_site(introduced), introduced_receiver = introduced_parameter.value_type,
+								other = method_site(other), other_receiver = other_parameter.value_type
+							})))
+
+
+private pure func reject_group(name: WrittenName, candidates: List[ReceiverCandidate], inherited: List[FunctionId]) -> Result[Void, CheckError]:
+	var failure: Option[CheckError] = None
+	var right_position = 0
+	for right_candidate in candidates:
+		var left_position = 0
+		for left_candidate in candidates:
+			if IntOps.equals(left_position, right_position):
+				break
+			match reject_pair(name, left_candidate, right_candidate, inherited):
+				Ok(_): void
+				Err(clash): failure = Some(clash)
+			if failure.is_some():
+				break
+			left_position = IntOps.add(left_position, 1)
+		if failure.is_some():
+			break
+		right_position = IntOps.add(right_position, 1)
+	match failure:
+		Some(clash): Err(clash)
+		None: Ok(void)
+
+
+pure func reject_receiver_clashes(namespace: Namespace, signatures: List[AcceptedFunction], modules: List[ParsedModuleRow]) -> Result[Void, CheckError]:
+	counts = name_counts(signatures)
+	unprovided: IntMaps.IntMap[List[FunctionId]] = IntMaps.empty_int_map()
+	var supplied = unprovided
+	var supplied_methods = 0
+	var failure: Option[CheckError] = None
+	for row in modules:
+		first_method = match row.role:
+			UserModule: supplied_methods
+			_: 0
+		inherited_names = match row.role:
+			UserModule: supplied
+			_: unprovided
+		match introduced_names(namespace, signatures, counts, row, first_method, inherited_names):
+			Err(invariant): failure = Some(invariant)
+			Ok(names):
+				for introduction in IntMaps.values(names):
+					publishes_prelude = match row.role:
+						FoundationPreludeModule: True
+						_: False
+					if not publishes_prelude and IntOps.equals(introduction.candidate_bound, 1):
+						continue
+					written = introduction.written
+					match receiver_bindings(namespace, signatures, row.module, written):
+						Err(invariant): failure = Some(invariant)
+						Ok(candidates):
+							none: List[FunctionId] = []
+							inherited = match row.role:
+								UserModule: IntMaps.get(supplied, name_number(written.id)).get_or(none)
+								_: none
+							match reject_group(written, candidates, inherited):
+								Err(clash): failure = Some(clash)
+								Ok(_): void
+							match row.role:
+								FoundationPreludeModule:
+									var provided_ids: List[FunctionId] = []
+									for candidate in candidates:
+										if candidate.import_site.is_some():
+											provided_ids = provided_ids.append(candidate.function.id)
+									supplied = IntMaps.set(supplied, name_number(written.id), provided_ids)
+								_: void
+					if failure.is_some():
+						break
+		match row.role:
+			FoundationPreludeModule: supplied_methods = method_imports(namespace, row.module).length()
+			_: void
+		if failure.is_some():
+			break
+	match failure:
+		Some(clash): Err(clash)
+		None: Ok(void)

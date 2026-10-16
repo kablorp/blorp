@@ -34,11 +34,11 @@ import:
 		Diagnostic,
 		DiagnosticNote(
 			TypeDeclaration, RecordFieldDeclaration, PreviousField, PreviousDeclaration,
-			CompetingDeclarations, Declaration,
+			CompetingDeclarations, Declaration, NoteLines,
 		),
 		Diagnostics,
 		ParsedBuiltinType(IntegerBuiltin, FloatBuiltin, StringBuiltin, VoidBuiltin, ListBuiltin),
-		Span,
+		Span, NoteLine, same_span,
 	../utils/text as Text
 
 
@@ -179,7 +179,7 @@ pure func render_check_error(program: ParsedProgram, error: Errors.CheckError) -
 		Errors.CallRejection(rejection):
 			render_call_error(error.span, rejection, context)
 		Errors.MethodRejection(rejection):
-			render_method_error(error.span, rejection)
+			render_method_error(error.span, rejection, context)
 		Errors.ConstructorRejection(rejection):
 			render_constructor_error(error.span, rejection, context)
 		Errors.RecordRejection(rejection):
@@ -807,8 +807,12 @@ private pure func render_arity_mismatch(
 		)
 
 
-private pure func render_method_error(span: Span, rejection: Errors.MethodError) -> Diagnostic:
+private pure func render_method_error(span: Span, rejection: Errors.MethodError, context: ParsedContents) -> Diagnostic:
 	match rejection:
+		Errors.OverlappingReceivers(name, overlap):
+			match render_receiver_overlap(span, name, overlap, context):
+				Ok(clash): clash
+				Err(invariant): invariant
 		Errors.AmbiguousMethod(_, _, sites):
 			method_diagnostic(
 				span,
@@ -1479,3 +1483,27 @@ private pure func type_diagnostic(
 							.concat(spelling)
 							.concat(" here"),
 					)
+
+
+private pure func overlap_notes(primary: Span, site: Errors.MethodCandidateSite, receiver: String) -> List[NoteLine]:
+	var lines: List[NoteLine] = []
+	if not same_span(site.declaration, primary):
+		lines = lines.append({ span = site.declaration, text = "receiver ".concat(receiver).concat(" is declared here") })
+	match site.import_site:
+		None: void
+		Some(selection):
+			if not same_span(selection, primary):
+				lines = lines.append({ span = selection, text = "receiver ".concat(receiver).concat(" is imported here") })
+	lines
+
+
+private pure func render_receiver_overlap(span: Span, name: NameId, overlap: Errors.ReceiverOverlap, context: ParsedContents) -> Result[Diagnostic, Diagnostic]:
+	spelling ?= parsed_spelling(name, context.names, span)
+	introduced ?= type_spelling(overlap.introduced_receiver, context, span)
+	other ?= type_spelling(overlap.other_receiver, context, span)
+	Ok(noted(
+		span,
+		"two functions named ".concat(spelling).concat(" can accept the same receiver"),
+		"rename one of them, or change a first parameter so that no value fits both receivers, ".concat(introduced).concat(" and ").concat(other),
+		NoteLines(overlap_notes(span, overlap.introduced, introduced).concat(overlap_notes(span, overlap.other, other))),
+	))

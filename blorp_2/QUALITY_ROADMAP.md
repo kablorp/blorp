@@ -64,9 +64,10 @@ noted in the decision log.
    - A *design-conformance* reviewer, usually the plan reviewer, checks that the
      approved design is implemented, that illegal states stay unrepresentable,
      and that line counts are honest.
-   - Then a separate *test-runner* gate builds `bin/blorp` with `make`, never by
-     copying it, and runs `make -C blorp_2 test`, the frontier and the leak check
-     at every commit.
+   - Then a separate *test-runner* verifies that the approved repository host is
+     FRESH without rebuilding or replacing the frozen compiler, and runs
+     `make -C blorp_2 test`, the frontier and the leak check for each code slice.
+     Documentation-only slices use their owning link/path and whitespace checks.
 4. **Honest costs.**
    - Production and test lines are reported separately.
    - Compressed formatting that hides growth is rejected.
@@ -107,6 +108,16 @@ execution order, refreshed propagation census and validation contract.
 Landing order: the namespace stack, then the `?=` rewrite and its rule, then the
 pattern and binding names, then private types, then UFCS. Each of the last
 three reads the namespace's new lookups.
+
+**Current completion.** The decided correctness and maintenance queue is
+complete: namespace, propagation placement, pattern/binding names, private
+types, receiver clashes, emitter diagnostics, keyword authority and multiline
+test cleanup. [Remaining quality work](QUALITY_REMAINING_PLAN.md) records the
+individual decisions and reports. The final
+[receiver checking report](../benchmarks/results/blorp_2_receiver_clashes_2026-10-16.md)
+records the passing 2,852-component/445-e2e destination gate and measured
+35/37 parser frontier. The deferred cost experiments and paused branch
+inventory below remain separate work, not unreported acceptance requirements.
 
 ## Namespace: one scope per module
 
@@ -805,6 +816,18 @@ the origin from the namespace. The variant that re-read declaration rows cost
 
 ## UFCS receiver clashes
 
+**Implementation checkpoint.** One inference engine now handles receiver
+selection and declaration overlap, with accepted function identities and exact
+inherited-prelude proof reuse. Production grows by 24 lines against the
+accepted keyword base; nine behavioral mutants fail and restored controls pass.
+All 808 matched current-base cost decisions and the actual destination gate
+pass. Corpus allocations/instructions rise 1.644796%/1.565441%, under the
+explicitly reviewed +5% correctness-pass allowance; the original tighter-limit
+failures remain recorded. See the
+[receiver checking report](../benchmarks/results/blorp_2_receiver_clashes_2026-10-16.md).
+The design/cost investigation below is the historical handoff, not the current
+implementation or an assertion that its original ceilings passed.
+
 ### Decision
 
 Keith's rule: "UFCS can have the same names because they are not ambiguous.
@@ -971,8 +994,10 @@ Each item below was measured but not fixed. Each needs its own reviewed plan.
   is a numbered graph with visited marks, +50 −24 lines, and it took a
   128-function layered library from 5.07 G to 0.58 G.
 - **Specialization's `find_instance` is quadratic** (`specialize.brp`), costing
-  1.9–7.7% with exponent 1.2–1.7. An IntMap keyed by declaration would make it
-  O(1).
+  1.9–7.7% with exponent 1.2–1.7 in the retained experiment. Bucketing by
+  declaration could narrow the search; instances still require equality of
+  their complete ordered argument keys. Declaration lookup alone does not
+  make that full query O(1); any index needs its own measured proposal.
 - **The loader is quadratic in module count.** 1,500 modules take 5 s, and flat
   programs cost 0.525, 1.793 and 6.791 G at 256, 512 and 1,024 modules. Samples
   at 2,048 modules point at string comparisons.

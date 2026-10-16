@@ -1,10 +1,12 @@
 import:
 	../../../src/check/model as Model
-	../../../src/check/check: check, check_errors
+	../../../src/check/check: check, check_errors, checked_functions
 	../../../src/check/errors as Errors
 	../../../src/check/render: render_failure
+	../../../src/parse/assemble: parsed_contents
+	../../../src/utils/ids: function_number, inventory_functions, union_number
 	../../../src/utils/source: module_id, module_source, root_module_id, same_source
-	../../../src/utils/syntax: DiagnosticNote(CompetingDeclarations), same_span
+	../../../src/utils/syntax: DiagnosticNote(CompetingDeclarations, NoteLines), Span, same_span
 	../module_input: ModuleInput, parse_modules
 	test: TestSuite
 	../../../src/utils/text: concat
@@ -54,6 +56,20 @@ private pure func two_methods(body: String, left: String, right: String) -> List
 	[{source = root, targets = [1, 2]}, {source = left, targets = []}, {source = right, targets = []}]
 
 
+private pure func root_span(prefix: String, name: String) -> Span:
+	{ source = module_source(root_module_id()), start = prefix.length(), end = prefix.length() + name.length() }
+
+
+-- These controlled three-module inputs declare main, left measure, right measure.
+private pure func overlapping_int_receivers(error: Errors.CheckError) -> Bool:
+	match error.kind:
+		Errors.MethodRejection(Errors.OverlappingReceivers(_, overlap)):
+			(function_number(overlap.introduced.function) == 2 and function_number(overlap.other.function) == 1
+				and Model.same_type(overlap.introduced_receiver, Model.IntType)
+				and Model.same_type(overlap.other_receiver, Model.IntType))
+		_: False
+
+
 private INT_METHOD: String =
 	|pure func measure(value: Int) -> Int:
 	|    value
@@ -77,19 +93,11 @@ pure func test_receiver_selection_ignores_import_order() -> Bool:
 	accepts(two_methods("42.measure()", FLOAT_METHOD, INT_METHOD))
 
 
-pure func test_same_receiver_and_arity_is_ambiguous() -> Bool:
-	rejects(two_methods("42.measure()", INT_METHOD, INT_METHOD), pure func(error):
-		match error.kind:
-			Errors.MethodRejection(Errors.AmbiguousMethod(_, Model.IntType, [left, right])):
-				(
-					not same_source(left.declaration.source, right.declaration.source)
-					and left.import_site.is_some() and right.import_site.is_some()
-				)
-			_: False
-	)
+pure func test_same_receiver_declarations_overlap() -> Bool:
+	rejects(two_methods("42.measure()", INT_METHOD, INT_METHOD), overlapping_int_receivers)
 
 
-pure func test_local_and_type_import_method_ambiguity_keeps_both_origins() -> Bool:
+pure func test_local_and_imported_receiver_clash_keeps_both_origins() -> Bool:
 	root: String =
 		|import:
 		|    ./ops: Int methods_only
@@ -105,39 +113,50 @@ pure func test_local_and_type_import_method_ambiguity_keeps_both_origins() -> Bo
 				Ok(_): False
 				Err(failure):
 					error = check_errors(failure).first
+					diagnostic = render_failure(failure).first
 					match error.kind:
-						Errors.MethodRejection(Errors.AmbiguousMethod(_, Model.IntType, [local, imported])):
-							match (local.import_site, imported.import_site, render_failure(failure).first.note):
-								(None, Some(import_site), Some(CompetingDeclarations([first, second, selection]))):
-									(
-										same_span(first, local.declaration)
-										and same_span(second, imported.declaration)
-										and same_span(selection, import_site)
-										and same_source(first.source, module_source(root_module_id()))
-										and not same_source(first.source, second.source)
-									)
+						Errors.MethodRejection(Errors.OverlappingReceivers(_, overlap)):
+							match (overlap.other.import_site, overlap.introduced.import_site, diagnostic.note):
+								(None, Some(import_site), Some(NoteLines([imported, local]))):
+									primary = root_span("import:\n    ./ops: ", "Int")
+									(function_number(overlap.introduced.function) == 2 and function_number(overlap.other.function) == 0
+										and Model.same_type(overlap.introduced_receiver, Model.IntType)
+										and Model.same_type(overlap.other_receiver, Model.IntType)
+										and same_span(imported.span, overlap.introduced.declaration)
+										and same_span(local.span, overlap.other.declaration)
+										and imported.text == "receiver Int is declared here" and local.text == imported.text
+										and same_source(local.span.source, module_source(root_module_id()))
+										and same_source(imported.span.source, module_source(module_id(1).get_or(root_module_id())))
+										and same_span(import_site, primary) and same_span(error.span, primary) and same_span(diagnostic.span, primary)
+										and diagnostic.message == "two functions named measure can accept the same receiver"
+										and diagnostic.help == "rename one of them, or change a first parameter so that no value fits both receivers, Int and Int")
 								_: False
 						_: False
 
 
-pure func test_ambiguity_renders_primary_and_all_candidate_sites() -> Bool:
+pure func test_receiver_clash_renders_primary_and_all_other_sites() -> Bool:
 	match parse_modules(two_methods("42.measure()", INT_METHOD, INT_METHOD)):
 		Err(_): False
 		Ok(parsed):
 			match check(parsed):
 				Ok(_): False
 				Err(failure):
+					error = check_errors(failure).first
 					diagnostic = render_failure(failure).first
 					match diagnostic.note:
-						Some(CompetingDeclarations([left, left_import, right, right_import])):
+						Some(NoteLines([right, left, left_import])):
+							primary_prefix = "import:\n    ./left: Int methods_only, Float methods_only, String methods_only\n    ./right: "
+							primary = root_span(primary_prefix, "Int")
+							declaration = "pure func ".length()
 							(
-								diagnostic.message == "ambiguous method call"
-								and diagnostic.help == "rename one method or call a uniquely imported function directly; receiver type and argument count must identify one function"
-								and same_span(diagnostic.span, {source = module_source(root_module_id()), start = 176, end = 183})
-								and same_span(left, {source = module_source(module_id(1).get_or(root_module_id())), start = 10, end = 17})
-								and same_span(right, {source = module_source(module_id(2).get_or(root_module_id())), start = 10, end = 17})
-								and same_span(left_import, {source = module_source(root_module_id()), start = 20, end = 23})
-								and same_span(right_import, {source = module_source(root_module_id()), start = 91, end = 94})
+								overlapping_int_receivers(error) and same_span(error.span, primary) and same_span(diagnostic.span, primary)
+								and diagnostic.message == "two functions named measure can accept the same receiver"
+								and diagnostic.help == "rename one of them, or change a first parameter so that no value fits both receivers, Int and Int"
+								and same_span(left.span, { source = module_source(module_id(1).get_or(root_module_id())), start = declaration, end = declaration + "measure".length() })
+								and same_span(right.span, { source = module_source(module_id(2).get_or(root_module_id())), start = declaration, end = declaration + "measure".length() })
+								and same_span(left_import.span, root_span("import:\n    ./left: ", "Int"))
+								and left.text == "receiver Int is declared here" and right.text == left.text
+								and left_import.text == "receiver Int is imported here"
 							)
 						_: False
 
@@ -180,15 +199,15 @@ pure func test_unique_receiver_preserves_wrong_arity_beside_other_type() -> Bool
 	)
 
 
-pure func test_arity_selects_among_receiver_matches() -> Bool:
+pure func test_different_arities_do_not_separate_receivers() -> Bool:
 	right: String =
 		|pure func measure(value: Int, other: Int) -> Int:
 		|    value
 		|
-	accepts(two_methods("42.measure(1)", INT_METHOD, right))
+	rejects(two_methods("42.measure(1)", INT_METHOD, right), overlapping_int_receivers)
 
 
-pure func test_multiple_receiver_matches_report_available_arities() -> Bool:
+pure func test_overlapping_declarations_precede_call_arity() -> Bool:
 	left: String =
 		|pure func measure(value: Int, other: Int) -> Int:
 		|    value
@@ -197,11 +216,7 @@ pure func test_multiple_receiver_matches_report_available_arities() -> Bool:
 		|pure func measure(value: Int, other: Int, third: Int) -> Int:
 		|    value
 		|
-	rejects(two_methods("42.measure()", left, right), pure func(error):
-		match error.kind:
-			Errors.MethodRejection(Errors.MethodArgumentCounts(_, 1, [2, 3], [_, _])): True
-			_: False
-	)
+	rejects(two_methods("42.measure()", left, right), overlapping_int_receivers)
 
 
 pure func test_later_arguments_do_not_rank_candidates() -> Bool:
@@ -213,11 +228,7 @@ pure func test_later_arguments_do_not_rank_candidates() -> Bool:
 		|pure func measure(value: Int, other: String) -> Int:
 		|    value
 		|
-	rejects(two_methods("42.measure(1)", left, right), pure func(error):
-		match error.kind:
-			Errors.MethodRejection(Errors.AmbiguousMethod(_, _, [_, _])): True
-			_: False
-	)
+	rejects(two_methods("42.measure(1)", left, right), overlapping_int_receivers)
 
 
 pure func test_purity_does_not_rank_candidates() -> Bool:
@@ -232,11 +243,7 @@ pure func test_purity_does_not_rank_candidates() -> Bool:
 		|func measure(value: Int) -> Int:
 		|    value
 		|
-	rejects([{source = root, targets = [1, 2]}, {source = INT_METHOD, targets = []}, {source = impure, targets = []}], pure func(error):
-		match error.kind:
-			Errors.MethodRejection(Errors.AmbiguousMethod(_, _, [_, _])): True
-			_: False
-	)
+	rejects([{source = root, targets = [1, 2]}, {source = INT_METHOD, targets = []}, {source = impure, targets = []}], overlapping_int_receivers)
 
 
 pure func test_expected_return_type_does_not_rank_candidates() -> Bool:
@@ -244,11 +251,7 @@ pure func test_expected_return_type_does_not_rank_candidates() -> Bool:
 		|pure func measure(value: Int) -> Float:
 		|    1.0
 		|
-	rejects(two_methods("42.measure()", INT_METHOD, right), pure func(error):
-		match error.kind:
-			Errors.MethodRejection(Errors.AmbiguousMethod(_, Model.IntType, [_, _])): True
-			_: False
-	)
+	rejects(two_methods("42.measure()", INT_METHOD, right), overlapping_int_receivers)
 
 
 pure func test_unique_selected_impure_method_rejects_pure_caller() -> Bool:
@@ -375,7 +378,7 @@ pure func test_applied_generic_receiver_matches_full_arguments() -> Bool:
 	accepts([{source = root, targets = [1, 2]}, {source = left, targets = []}, {source = right, targets = []}])
 
 
-pure func test_generic_receiver_is_not_less_specific() -> Bool:
+pure func test_generic_and_concrete_receiver_declarations_overlap() -> Bool:
 	root: String =
 		|import:
 		|    ./left: Option methods_only
@@ -393,11 +396,26 @@ pure func test_generic_receiver_is_not_less_specific() -> Bool:
 		|pure func measure(value: Option[Int]) -> Int:
 		|    1
 		|
-	rejects([{source = root, targets = [1, 2]}, {source = left, targets = []}, {source = right, targets = []}], pure func(error):
-		match error.kind:
-			Errors.MethodRejection(Errors.AmbiguousMethod(_, _, [_, _])): True
-			_: False
-	)
+	match parse_modules([{source = root, targets = [1, 2]}, {source = left, targets = []}, {source = right, targets = []}]):
+		Err(_): False
+		Ok(parsed):
+			-- Root make/main precede the two provider declarations in the inventory.
+			match (check(parsed), inventory_functions(parsed_contents(parsed).declarations)):
+				(Err(failure), [_, _, generic, concrete]):
+					match check_errors(failure).first.kind:
+						Errors.MethodRejection(Errors.OverlappingReceivers(_, overlap)):
+							match (overlap.introduced_receiver, overlap.other_receiver):
+								(Model.AppliedUnionType(concrete_owner, [Model.IntType]), Model.AppliedUnionType(generic_owner, [Model.ParameterType(parameter)])):
+									match Model.parameter_owner(parameter):
+										Model.FunctionDeclaration(owner):
+											(function_number(overlap.introduced.function) == function_number(concrete.id)
+												and function_number(overlap.other.function) == function_number(generic.id)
+												and union_number(concrete_owner) == union_number(generic_owner)
+												and function_number(owner) == function_number(generic.id) and Model.parameter_position(parameter) == 0)
+										_: False
+								_: False
+						_: False
+				_: False
 
 
 pure func test_unique_generic_callee_provides_concrete_constructor_context() -> Bool:
@@ -433,7 +451,7 @@ pure func test_concrete_list_receiver_selects_list_method() -> Bool:
 	accepts([{source = root, targets = [1, 2]}, {source = left, targets = []}, {source = right, targets = []}])
 
 
-pure func test_common_constructor_context_preserves_arity_selection() -> Bool:
+pure func test_overlapping_constructor_receivers_reject_before_body_context() -> Bool:
 	root: String =
 		|import:
 		|    ./left: Option methods_only
@@ -449,7 +467,16 @@ pure func test_common_constructor_context_preserves_arity_selection() -> Bool:
 		|pure func measure(value: Option[Int], other: Int) -> Int:
 		|    42
 		|
-	accepts([{source = root, targets = [1, 2]}, {source = left, targets = []}, {source = right, targets = []}])
+	rejects([{source = root, targets = [1, 2]}, {source = left, targets = []}, {source = right, targets = []}], pure func(error):
+		match error.kind:
+			Errors.MethodRejection(Errors.OverlappingReceivers(_, overlap)):
+				match overlap.introduced_receiver:
+					Model.AppliedUnionType(_, [Model.IntType]):
+						(function_number(overlap.introduced.function) == 2 and function_number(overlap.other.function) == 1
+							and Model.same_type(overlap.introduced_receiver, overlap.other_receiver))
+					_: False
+			_: False
+	)
 
 
 pure func test_unique_generic_union_receiver_instantiates_from_receiver() -> Bool:
@@ -499,22 +526,28 @@ pure func test_inapplicable_method_diagnostic_has_exact_help_and_call_span() -> 
 	)
 
 
-pure func test_method_arity_diagnostic_has_exact_counts_and_call_span() -> Bool:
+pure func test_unique_method_arity_diagnostic_has_exact_help_and_call_span() -> Bool:
 	left: String =
 		|pure func measure(value: Int, other: Int) -> Int:
 		|    value
 		|
-	right: String =
-		|pure func measure(value: Int, other: Int, third: Int) -> Int:
-		|    value
-		|
-	method_diagnostic_is(
-		two_methods("42.measure()", left, right),
-		"method argument count does not match any receiver-compatible function",
-		"pass one of these total argument counts, including the receiver: 2, 3",
-		176,
-		183,
-	)
+	match parse_modules(two_methods("42.measure()", left, FLOAT_METHOD)):
+		Err(_): False
+		Ok(parsed):
+			match check(parsed):
+				Ok(_): False
+				Err(failure):
+					error = check_errors(failure).first
+					diagnostic = render_failure(failure).first
+					prefix = "import:\n    ./left: Int methods_only, Float methods_only, String methods_only\n    ./right: Int methods_only, Float methods_only, String methods_only\nfunc main() -> Int:\n    42."
+					match error.kind:
+						Errors.CallRejection(Errors.ArgumentCountMismatch(mismatch)):
+							(mismatch.expected == 2 and mismatch.actual == 1
+								and same_span(error.span, root_span(prefix, "measure")) and same_span(error.span, diagnostic.span)
+								and diagnostic.note.is_none()
+								and diagnostic.message == "argument count does not match the function parameters"
+								and diagnostic.help == "pass one expression for each declared parameter; UFCS supplies the receiver first")
+						_: False
 
 
 pure func test_constructor_context_diagnostic_has_exact_help_and_call_span() -> Bool:
@@ -611,30 +644,98 @@ pure func test_record_with_competing_contexts_teaches_annotation() -> Bool:
 	)
 
 
+pure func test_rigid_actual_parameter_keeps_no_applicable_method() -> Bool:
+	prefix: String =
+		|import:
+		|    ./left: Int methods_only
+		|    ./right: Float methods_only
+		|pure func use[T](receiver: T) -> Int:
+		|    receiver.
+	source = prefix + "measure()\nfunc main() -> Int:\n    0\n"
+	match parse_modules([{ source = source, targets = [1, 2] }, { source = INT_METHOD, targets = [] }, { source = FLOAT_METHOD, targets = [] }]):
+		Err(_): False
+		Ok(parsed):
+			match (check(parsed), inventory_functions(parsed_contents(parsed).declarations).get(0)):
+				(Err(failure), Some(declaration)):
+					error = check_errors(failure).first
+					diagnostic = render_failure(failure).first
+					match (error.kind, diagnostic.note):
+						(Errors.MethodRejection(Errors.NoApplicableMethod(_, Model.ParameterType(parameter), [left, right])), Some(CompetingDeclarations([_, _, _, _]))):
+							match Model.parameter_owner(parameter):
+								Model.FunctionDeclaration(owner):
+									(function_number(owner) == function_number(declaration.id) and Model.parameter_position(parameter) == 0
+										and function_number(left.function) == 2 and function_number(right.function) == 3
+										and same_span(error.span, root_span(prefix, "measure")) and same_span(diagnostic.span, error.span)
+										and diagnostic.message == "no method accepts this receiver type"
+										and diagnostic.help == "use a value of a declared receiver type, or import a function accepting this type")
+								_: False
+						_: False
+				_: False
+
+
+pure func test_function_and_type_import_routes_keep_one_candidate_identity() -> Bool:
+	root: String =
+		|import:
+		|    ./ops: describe, Foo
+		|    ./other as OtherProvider
+		|func main() -> Int:
+		|    { value = 23 }.describe()
+		|
+	ops: String =
+		|fixed record Foo { value: Int }
+		|pure func describe(value: Foo) -> Int:
+		|    value.value
+		|
+	unrelated: String =
+		|fixed record Other { value: Int }
+		|pure func describe(value: Other) -> Int:
+		|    value.value
+		|
+	match parse_modules([{ source = root, targets = [1, 2] }, { source = ops, targets = [] }, { source = unrelated, targets = [] }]):
+		Err(_): False
+		Ok(parsed):
+			match (check(parsed), inventory_functions(parsed_contents(parsed).declarations).get(1)):
+				(Ok(program), Some(declaration)):
+					match checked_functions(program).functions.get(0):
+						None: False
+						Some(main):
+							match main.body:
+								Model.CheckedValueBody(Model.ReturnExpression(result)):
+									match result.form:
+										Model.InvokeFunction(call, [receiver]):
+											match (call.target, receiver.value_type):
+												(Model.UserFunction(target, []), Model.RecordType(_)):
+													function_number(target) == function_number(declaration.id)
+												_: False
+										_: False
+								_: False
+				_: False
+
+
 tests: TestSuite = {
 	description = "method resolution",
 	tests = [
 		("expected return type does not rank candidates", test_expected_return_type_does_not_rank_candidates),
-		("local and imported method ambiguity retains both origins", test_local_and_type_import_method_ambiguity_keeps_both_origins),
+		("local and imported receiver clash retains both origins", test_local_and_imported_receiver_clash_keeps_both_origins),
 		("bare constructor competing contexts teach annotation", test_bare_constructor_with_competing_contexts_teaches_annotation),
 		("record competing contexts teach annotation", test_record_with_competing_contexts_teaches_annotation),
 		("competing methods preserve nested constructor error", test_competing_outer_methods_preserve_nested_constructor_error),
 		("inapplicable diagnostic exact help and span", test_inapplicable_method_diagnostic_has_exact_help_and_call_span),
-		("arity diagnostic exact counts and span", test_method_arity_diagnostic_has_exact_counts_and_call_span),
+		("unique method arity has exact help and span", test_unique_method_arity_diagnostic_has_exact_help_and_call_span),
 		("constructor context diagnostic exact help and span", test_constructor_context_diagnostic_has_exact_help_and_call_span),
 		("unique generic receiver instantiates from receiver", test_unique_generic_union_receiver_instantiates_from_receiver),
 		("repeated generic receiver arguments must unify", test_repeated_generic_receiver_arguments_must_unify),
 		("concrete List receiver selects List method", test_concrete_list_receiver_selects_list_method),
-		("common constructor context retains arity selection", test_common_constructor_context_preserves_arity_selection),
+		("overlapping constructor receivers reject before body context", test_overlapping_constructor_receivers_reject_before_body_context),
 		("receiver type selects same named methods", test_receiver_type_selects_same_named_methods),
 		("receiver selection ignores import order", test_receiver_selection_ignores_import_order),
-		("same receiver and arity are ambiguous", test_same_receiver_and_arity_is_ambiguous),
-		("ambiguity renders every candidate site", test_ambiguity_renders_primary_and_all_candidate_sites),
+		("same receiver declarations overlap", test_same_receiver_declarations_overlap),
+		("receiver clash renders primary and every other site", test_receiver_clash_renders_primary_and_all_other_sites),
 		("multiple incompatible receivers have typed error", test_multiple_incompatible_receivers_have_typed_error),
 		("unique incompatible receiver preserves argument error", test_unique_incompatible_receiver_preserves_argument_error),
 		("wrong arity survives different receiver matching arity", test_unique_receiver_preserves_wrong_arity_beside_other_type),
-		("arity selects among receiver matches", test_arity_selects_among_receiver_matches),
-		("multiple receiver matches report available arities", test_multiple_receiver_matches_report_available_arities),
+		("different arities do not separate receivers", test_different_arities_do_not_separate_receivers),
+		("overlapping declarations precede call arity", test_overlapping_declarations_precede_call_arity),
 		("later arguments do not rank candidates", test_later_arguments_do_not_rank_candidates),
 		("purity does not rank candidates", test_purity_does_not_rank_candidates),
 		("unique impure method rejects pure caller", test_unique_selected_impure_method_rejects_pure_caller),
@@ -643,7 +744,9 @@ tests: TestSuite = {
 		("unique constructor receiver context is preserved", test_unique_constructor_receiver_context_is_preserved),
 		("competing constructor context teaches annotation", test_competing_constructor_receiver_context_teaches_annotation),
 		("applied receiver matches full arguments", test_applied_generic_receiver_matches_full_arguments),
-		("generic receiver does not lose specificity ranking", test_generic_receiver_is_not_less_specific),
+		("generic and concrete receiver declarations overlap", test_generic_and_concrete_receiver_declarations_overlap),
 		("unique generic callee provides constructor context", test_unique_generic_callee_provides_concrete_constructor_context),
+		("rigid caller parameter keeps no applicable method", test_rigid_actual_parameter_keeps_no_applicable_method),
+		("function and type import routes keep one candidate identity", test_function_and_type_import_routes_keep_one_candidate_identity),
 	]
 }

@@ -219,3 +219,21 @@ Full correctness, mutation, destination Make/frontier and independent source
 reviews remain required before implementation publication. The raw collection
 and its original eight failures remain in the `quality-ufcs-integrated` worktree's ignored
 `blorp_2/build/ufcs-integrated/fresh-base-c4ec/complete-cost-preparation/`.
+
+### Completed integration on the keyword base
+
+The independently reviewed composition preserves the standalone solver and
+receiver owners. Nine behavioral mutants are killed and restored controls pass.
+Fresh matched integration checks all 448 strict inputs and 352 timed inputs,
+with unchanged outcomes, full diagnostics and C, zero leaks, and all 808 cap
+decisions passing. Accepted-corpus allocations/instructions rise
+1.644796%/1.565441%; host proxies rise 2.007329%/1.990444%.
+These are marginal keyword-base costs, not relabeled standalone G/U samples.
+The original failed limits and their explicit allowance above remain intact.
+
+The actual main destination passes 2,852 component and 445 e2e checks. Its
+compiler C matches the paired candidate; the parser frontier is 35/37 modules.
+The [receiver checking report](../benchmarks/results/blorp_2_receiver_clashes_2026-10-16.md)
+records exact artifacts, limits, retained raw evidence and remaining small
+lookup costs. The current root packet is ignored `build/ufcs-keyword-integration/`;
+primary destination logs are ignored `blorp_2/build/ufcs-landing/`.

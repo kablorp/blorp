@@ -1,0 +1,263 @@
+import:
+	../../../src/check/check: check, check_errors, checked_functions
+	../../../src/check/errors: CheckErrorKind(MethodRejection), MethodError(OverlappingReceivers)
+	../../../src/check/model:
+		CallTarget(UserFunction), CheckedBody(CheckedValueBody), CheckedExit(ReturnExpression),
+		CheckedForm(InvokeFunction), TypeRef(AppliedUnionType, IntType, StringType, UnionType), same_type
+	../../../src/check/render: render_failure
+	../../../src/parse/assemble: ParsedProgram
+	../../../src/utils/ids: function_number, union_number
+	../../../src/utils/source: module_id, module_source, root_module_id
+	../../../src/utils/syntax: Diagnostic, DiagnosticNote(NoteLines), Span, same_span
+	../../../src/utils/text: concat
+	../module_input: parse_modules, parse_modules_with_prelude
+	test: TestSuite
+
+
+private ROOT: String =
+	|import:
+	|    ./types: Foo
+	|    ./left: Foo methods_only
+	|    ./right: Foo methods_only
+	|func main() -> Int:
+	|    0
+	|
+
+
+private LEFT: String =
+	|import:
+	|    ./types: Foo
+	|pure func describe(value: Foo) -> Int:
+	|    1
+	|
+
+
+private pure func rejects_unused_receiver(right_source: String) -> Bool:
+	match parse_modules([
+		{ source = ROOT, targets = [1, 2, 3] },
+		{ source = "fixed record Foo { value: Int }\n", targets = [] },
+		{ source = LEFT, targets = [1] },
+		{ source = right_source, targets = [1] },
+	]):
+		Err(_): False
+		Ok(parsed_program):
+			match check(parsed_program):
+				Ok(_): False
+				Err(check_failure):
+					clash = render_failure(check_failure).first
+					typed = match check_errors(check_failure).first.kind:
+						MethodRejection(OverlappingReceivers(_, overlap)):
+							(
+								function_number(overlap.introduced.function) == 2
+								and function_number(overlap.other.function) == 1
+								and same_type(overlap.introduced_receiver, overlap.other_receiver)
+							)
+						_: False
+					notes = match clash.note:
+						Some(NoteLines([right_declaration, left_declaration, left_selection])):
+							(
+								right_declaration.text == "receiver Foo is declared here"
+								and left_declaration.text == "receiver Foo is declared here"
+								and left_selection.text == "receiver Foo is imported here"
+								and same_span(right_declaration.span, { source = module_source(module_id(3).get_or(root_module_id())), start = 35, end = 43 })
+								and same_span(left_declaration.span, { source = module_source(module_id(2).get_or(root_module_id())), start = 35, end = 43 })
+								and same_span(left_selection.span, { source = module_source(root_module_id()), start = 37, end = 40 })
+							)
+						_: False
+					(
+						typed and notes
+						and clash.message == "two functions named describe can accept the same receiver"
+						and clash.help == "rename one of them, or change a first parameter so that no value fits both receivers, Foo and Foo"
+						and same_span(clash.span, { source = module_source(root_module_id()), start = 67, end = 70 })
+					)
+
+
+pure func test_unused_overlapping_receivers_are_rejected() -> Bool:
+	rejects_unused_receiver(LEFT)
+
+
+pure func test_different_arities_do_not_separate_unused_receivers() -> Bool:
+	right_source: String =
+		|import:
+		|    ./types: Foo
+		|pure func describe(value: Foo, extra: Int) -> Int:
+		|    2
+		|
+	rejects_unused_receiver(right_source)
+
+
+pure func test_private_local_receiver_still_clashes() -> Bool:
+	root_source: String =
+		|import:
+		|    ./provider: Foo
+		|private pure func describe(value: Foo) -> Int:
+		|    1
+		|func main() -> Int:
+		|    0
+		|
+	provider: String =
+		|fixed record Foo { value: Int }
+		|pure func describe(value: Foo) -> Int:
+		|    2
+		|
+	match parse_modules([{ source = root_source, targets = [1] }, { source = provider, targets = [] }]):
+		Err(_): False
+		Ok(parsed_program):
+			match check(parsed_program):
+				Ok(_): False
+				Err(check_failure):
+					match check_errors(check_failure).first.kind:
+						MethodRejection(OverlappingReceivers(_, _)): True
+						_: False
+
+
+pure func test_private_provider_receiver_is_not_imported() -> Bool:
+	root_source: String =
+		|import:
+		|    ./provider: Foo
+		|pure func describe(value: Foo) -> Int:
+		|    1
+		|func main() -> Int:
+		|    0
+		|
+	provider: String =
+		|fixed record Foo { value: Int }
+		|private pure func describe(value: Foo) -> Int:
+		|    2
+		|
+	match parse_modules([{ source = root_source, targets = [1] }, { source = provider, targets = [] }]):
+		Err(_): False
+		Ok(parsed_program): check(parsed_program).is_ok()
+
+
+private RECEIVER_LIBRARY: String =
+	|import:
+	|    ./types: Foo
+	|pure func describe(value: Foo) -> Foo:
+	|    value
+	|
+
+private RECEIVER_PRELUDE: String =
+	|import:
+	|    _base: Int
+	|    ./types: Foo
+	|    ./left: Foo methods_only
+	|
+
+
+-- Inputs are root0, Foo1, left2 and right3; the producer appends base4/prelude5.
+private pure func parse_receiver_prelude(root: String, provider: Int) -> Result[ParsedProgram, Diagnostic]:
+	parse_modules_with_prelude([
+		{ source = root, targets = [provider] },
+		{ source = "fixed union Foo:\n    Only\n", targets = [] },
+		{ source = RECEIVER_LIBRARY, targets = [1] },
+		{ source = RECEIVER_LIBRARY, targets = [1] },
+	], 1, { source = RECEIVER_PRELUDE, targets = [4, 1, 2] })
+
+
+pure func test_new_receiver_is_checked_against_the_inherited_prelude_subset() -> Bool:
+	root_prefix: String = "import:\n    ./right: "
+	root = root_prefix + "Foo methods_only\nfunc main() -> Int:\n    0\n"
+	declaration_prefix: String = "import:\n    ./types: Foo\npure func "
+	prelude_prefix: String = "import:\n    _base: Int\n    ./types: Foo\n    ./left: "
+	match parse_receiver_prelude(root, 3):
+		Err(_): False
+		Ok(parsed):
+			match check(parsed):
+				Ok(_): False
+				Err(failure):
+					error = check_errors(failure).first
+					clash = render_failure(failure).first
+					primary: Span = {
+						source = module_source(root_module_id()),
+						start = root_prefix.length(),
+						end = root_prefix.length() + "Foo".length()
+					}
+					typed = match error.kind:
+						MethodRejection(OverlappingReceivers(_, overlap)):
+							match (overlap.introduced_receiver, overlap.other_receiver):
+								(UnionType(introduced), UnionType(other)):
+									(
+										function_number(overlap.introduced.function) == 2
+										and function_number(overlap.other.function) == 1
+										and union_number(introduced) == 0 and union_number(other) == 0
+									)
+								_: False
+						_: False
+					full_notes = match clash.note:
+						Some(NoteLines([right_declaration, left_declaration, inherited_selection])):
+							(
+								right_declaration.text == "receiver Foo is declared here" and left_declaration.text == "receiver Foo is declared here"
+								and inherited_selection.text == "receiver Foo is imported here"
+								and same_span(right_declaration.span, { source = module_source(module_id(3).get_or(root_module_id())), start = declaration_prefix.length(), end = declaration_prefix.length() + "describe".length() })
+								and same_span(left_declaration.span, { source = module_source(module_id(2).get_or(root_module_id())), start = declaration_prefix.length(), end = declaration_prefix.length() + "describe".length() })
+								and same_span(inherited_selection.span, { source = module_source(module_id(5).get_or(root_module_id())), start = prelude_prefix.length(), end = prelude_prefix.length() + "Foo".length() })
+							)
+						_: False
+					(
+						typed and full_notes and check_errors(failure).remaining.is_empty()
+						and clash.message == "two functions named describe can accept the same receiver"
+						and clash.help == "rename one of them, or change a first parameter so that no value fits both receivers, Foo and Foo"
+						and same_span(error.span, primary) and same_span(clash.span, primary)
+					)
+
+
+pure func test_reimporting_the_inherited_receiver_keeps_one_function_identity() -> Bool:
+	root: String =
+		|import:
+		|    ./left: Foo methods_only
+		|func main() -> Int:
+		|    0
+		|
+	match parse_receiver_prelude(root, 2):
+		Err(_): False
+		Ok(parsed): check(parsed).is_ok()
+
+
+pure func test_unique_generic_receiver_keeps_its_concrete_constructor_hint() -> Bool:
+	root_source: String =
+		|import:
+		|    ./provider: Option methods_only
+		|func main() -> Int:
+		|    Some(42).measure("text")
+		|
+	provider: String =
+		|pure func measure[T](value: Option[Int], evidence: T) -> Int:
+		|    42
+		|
+	match parse_modules([{ source = root_source, targets = [1] }, { source = provider, targets = [] }]):
+		Err(_): False
+		Ok(parsed_program):
+			match check(parsed_program):
+				Err(_): False
+				Ok(checked_program):
+					match checked_functions(checked_program).functions.get(0):
+						None: False
+						Some(main_function):
+							match main_function.body:
+								CheckedValueBody(ReturnExpression(result)):
+									match result.form:
+										InvokeFunction(call, [receiver, _]):
+											match call.target:
+												UserFunction(_, [inferred_argument]):
+													match receiver.value_type:
+														AppliedUnionType(_, [element]):
+															same_type(inferred_argument, StringType) and same_type(element, IntType) and same_type(result.value_type, IntType)
+														_: False
+												_: False
+										_: False
+								_: False
+
+
+tests: TestSuite = {
+	description = "Blorp 2 declaration-time receiver clashes",
+	tests = [
+		("unused overlapping receivers are rejected", test_unused_overlapping_receivers_are_rejected),
+		("different arities do not separate unused receivers", test_different_arities_do_not_separate_unused_receivers),
+		("private local receiver still clashes", test_private_local_receiver_still_clashes),
+		("private provider receiver is not imported", test_private_provider_receiver_is_not_imported),
+		("new receiver checks the inherited prelude subset", test_new_receiver_is_checked_against_the_inherited_prelude_subset),
+		("reimported inherited receiver keeps one identity", test_reimporting_the_inherited_receiver_keeps_one_function_identity),
+		("unique generic receiver keeps its concrete constructor hint", test_unique_generic_receiver_keeps_its_concrete_constructor_hint),
+	]
+}

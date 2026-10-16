@@ -4,7 +4,9 @@ admission and the pending value tree. Only complete types leave through
 publish_inference_type; temporary inference variables never become published TypeRefs.
 ---
 import:
-	./callables: FunctionContract
+	./callables:
+		FunctionContract, ReceiverContract, ReceiverCandidate, ResolvedReceiver(UniqueReceiver, ReceiverCandidates),
+		ResolutionContext, method_sites, receiver_contract
 	./signatures: validate_pure_result
 	./model:
 		BindingId,
@@ -16,16 +18,19 @@ import:
 		CallTarget(UserFunction),
 		same_type,
 		same_parameter,
-		parameter_position
+		parameter_position,
+		type_head
 	./errors:
 		CheckError,
+		MethodError(AmbiguousMethod, NoApplicableMethod), method_error,
 		ExpectedTypeSite(SourceAnnotation),
 		CallError(ArgumentTypeMismatch, GenericArgumentConflict, UninferableTypeParameter, InfiniteTypeArgument),
 		CheckerInvariant(GenericConstructorContract, InvalidInferenceVariable, InvalidInferenceWorklist, MissingCallParameter, MissingGenericParameter),
 		call_error,
 		checker_invariant
 	../utils/ids: RecordId, UnionId, VariantId, record_number, union_number
-	../utils/syntax: Span
+	../utils/syntax: Span, WrittenName, ReceiverApplication
+	../namespace/namespace: same_head
 	int as IntOps
 	option: to_result
 
@@ -640,6 +645,7 @@ pure func record_argument_origin(equality: InferenceEquality, slots: List[Infere
 		VariantConstraint(_, _): Ok(None)
 		RecordFieldConstraint(_, _, _): Ok(None)
 		ListElementConstraint(_, _): Ok(None)
+		ReceiverOverlapConstraint(_): Ok(None)
 		ArgumentConstraint(_, _, actual, _):
 			match equality.parameter:
 				Some(_): Ok(None)
@@ -702,6 +708,7 @@ fixed union ConstraintOrigin:
 	VariantConstraint(PendingVariantContract, Int)
 	RecordFieldConstraint(FieldId, InferenceUse, Span)
 	ListElementConstraint(Int, Span)
+	ReceiverOverlapConstraint(Span)
 
 
 fixed union InferenceRelation:
@@ -1022,6 +1029,7 @@ private pure func inference_origin_span(origin: ConstraintOrigin) -> Span:
 		VariantConstraint(contract, _): contract.span
 		RecordFieldConstraint(_, _, span): span
 		ListElementConstraint(_, span): span
+		ReceiverOverlapConstraint(span): span
 
 
 private pure func inference_conflict(
@@ -1036,6 +1044,7 @@ private pure func inference_conflict(
 		VariantConstraint(_, _): Err(checker_invariant(span, InvalidInferenceWorklist))
 		RecordFieldConstraint(_, _, _): Err(checker_invariant(span, InvalidInferenceWorklist))
 		ListElementConstraint(_, _): Err(checker_invariant(span, InvalidInferenceWorklist))
+		ReceiverOverlapConstraint(_): Err(checker_invariant(span, InvalidInferenceWorklist))
 		ArgumentConstraint(call, position, occurrence, written):
 			generic_argument_conflict(call, position, occurrence, written, equality.parameter, slots)
 
@@ -1191,9 +1200,12 @@ pure func inspect_inference_equality(
 						Ok(occurs):
 
 							if occurs:
-								match inference_occurs_error(current, id, value, slots):
-									Ok(error): Err(error)
-									Err(error): Err(error)
+								match current.origin:
+									ReceiverOverlapConstraint(_): Ok(IncompatibleResult)
+									_:
+										match inference_occurs_error(current, id, value, slots):
+											Ok(occurs_error): Err(occurs_error)
+											Err(invariant): Err(invariant)
 							else:
 								Ok(UpdateInferenceSlots([{ position = position, slot = { slot | state = BoundVariable(value) } }]))
 						Err(error): Err(error)
@@ -1214,6 +1226,7 @@ pure func inspect_inference_equality(
 						VariantConstraint(_, _): Ok(CompleteEquality)
 						RecordFieldConstraint(_, _, _): Ok(CompleteEquality)
 						ListElementConstraint(_, _): Ok(CompleteEquality)
+						ReceiverOverlapConstraint(_): Ok(IncompatibleResult)
 						ArgumentConstraint(_, _, _, _):
 							match inference_conflict(current, slots):
 								Ok(error): Err(error)
@@ -1257,6 +1270,7 @@ private pure func inference_occurs_error(equality: InferenceEquality, root: Infe
 		ResultConstraint(result): Ok(result.expected.site)
 		RecordFieldConstraint(_, expected, _): Ok(SourceAnnotation(expected.span))
 		ListElementConstraint(_, element_span): Ok(SourceAnnotation(element_span))
+		ReceiverOverlapConstraint(_): Err(checker_invariant(span, InvalidInferenceWorklist))
 		VariantConstraint(contract, position):
 			match contract.fields.get(position).to_result(checker_invariant(span, GenericConstructorContract)):
 				Ok(field): Ok(SourceAnnotation(field.span))
@@ -1307,3 +1321,98 @@ pure func publish_pending_call(
 		Some(error): Err(error)
 		None: Ok(void)
 	Ok({ target = UserFunction(contract.function, types), span = contract.span })
+
+
+-- Different concrete constructors are the unifier's immediate mismatch rule.
+private pure func disjoint_heads(left: TypeRef, right: TypeRef) -> Bool:
+	match type_head(left):
+		None: False
+		Some(left_head):
+			match type_head(right):
+				None: False
+				Some(right_head): not same_head(left_head, right_head)
+
+
+private pure func solve_overlap(equality: InferenceEquality, slots: List[InferenceSlot]) -> Result[Option[List[InferenceSlot]], CheckError]:
+	step ?= inspect_inference_equality(equality, slots)
+	match step:
+		IncompatibleResult: Ok(None)
+		CompleteEquality: Ok(Some(slots))
+		UpdateInferenceSlots(updates):
+			var updated_slots = slots
+			for update in updates:
+				updated_slots = updated_slots.set(update.position, update.slot)
+			Ok(Some(updated_slots))
+		ExpandInferenceList(child): solve_overlap(child, slots)
+		ExpandInferenceArguments(parent, left_arguments, right_arguments):
+			solve_overlap_arguments(parent, left_arguments, right_arguments, 0, slots)
+
+
+private pure func solve_overlap_arguments(parent: InferenceEquality, left: List[InferenceType], right: List[InferenceType], position: Int, slots: List[InferenceSlot]) -> Result[Option[List[InferenceSlot]], CheckError]:
+	if IntOps.equals(position, left.length()):
+		Ok(Some(slots))
+	else:
+		match inference_child(parent, left, right, position):
+			Err(invariant): Err(invariant)
+			Ok(child):
+				match solve_overlap(child, slots):
+					Err(invariant): Err(invariant)
+					Ok(None): Ok(None)
+					Ok(Some(next_slots)):
+						solve_overlap_arguments(parent, left, right, IntOps.add(position, 1), next_slots)
+
+
+-- Both declarations' parameters are flexible in separate variable ranges.
+-- A call supplies [] for its actual receiver, keeping caller parameters rigid.
+pure func types_overlap(left: TypeRef, left_parameters: List[TypeParameterId], right: TypeRef, right_parameters: List[TypeParameterId], span: Span) -> Result[Bool, CheckError]:
+	-- With no flexible parameters the solver compares accepted types directly.
+	if left_parameters.is_empty() and right_parameters.is_empty():
+		Ok(same_type(left, right))
+	else if disjoint_heads(left, right):
+		Ok(False)
+	else:
+		var slots: List[InferenceSlot] = []
+		for declared_parameter in left_parameters.concat(right_parameters):
+			slots = slots.append({ parameter = declared_parameter, call_span = span, first_argument = None, state = UnboundVariable(0) })
+		equality: InferenceEquality = {
+			expected = inference_type(left, left_parameters, 0),
+			actual = inference_type(right, right_parameters, left_parameters.length()),
+			origin = ReceiverOverlapConstraint(span),
+			relation = RequireEquality,
+			parameter = None
+		}
+		match solve_overlap(equality, slots):
+			Err(invariant): Err(invariant)
+			Ok(unified): Ok(unified.is_some())
+
+
+-- Declaration validation guarantees at most one type-compatible receiver.
+private pure func choose_receiver(callee: WrittenName, candidates: List[ReceiverCandidate], actual: TypeUse) -> Result[ReceiverCandidate, CheckError]:
+	var compatible: List[ReceiverCandidate] = []
+	var failure: Option[CheckError] = None
+	for candidate in candidates:
+		match candidate.function.signature.parameters.get(0):
+			None: void
+			Some(receiver_parameter):
+				match types_overlap(receiver_parameter.value_type, candidate.function.signature.type_parameters, actual.value_type, [], actual.span):
+					Err(invariant): failure = Some(invariant)
+					Ok(False): void
+					Ok(True): compatible = compatible.append(candidate)
+		if failure.is_some():
+			break
+	match failure:
+		Some(invariant): Err(invariant)
+		None:
+			match compatible:
+				[]: Err(method_error(callee.span, NoApplicableMethod(callee.id, actual.value_type, method_sites(candidates))))
+				[selected]: Ok(selected)
+				_: Err(method_error(callee.span, AmbiguousMethod(callee.id, actual.value_type, method_sites(compatible))))
+
+
+pure func select_receiver_contract(application: ReceiverApplication, receiver: ResolvedReceiver, actual: TypeUse, context: ResolutionContext) -> Result[ReceiverContract, CheckError]:
+	match receiver:
+		UniqueReceiver(contract): Ok(contract)
+		ReceiverCandidates(candidates):
+			match choose_receiver(application.callee, candidates, actual):
+				Err(selection_error): Err(selection_error)
+				Ok(selected): receiver_contract(context.caller, application.callee, application.arguments, selected.function.id, context.signatures)

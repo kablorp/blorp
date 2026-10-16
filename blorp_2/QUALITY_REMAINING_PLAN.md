@@ -186,8 +186,12 @@ stress ceiling. The later
 [complete-collection cost decision](UFCS_OVERLAP_PLAN.md#complete-collection-and-correctness-feature-cost-decision)
 explicitly replaces the failed relative G/B limits with a uniform +5% allowance
 for this new correctness pass, retaining absolute and isolated-ground limits.
-It records the original eight failures, exact measured domains and remaining
-correctness/publication gates; it does not establish implementation acceptance.
+It records the original eight failures and exact measured domains. The
+[receiver checking report](../benchmarks/results/blorp_2_receiver_clashes_2026-10-16.md)
+now records nine killed semantic mutants, unchanged integrated C/diagnostics,
+all 808 current-base cost decisions passing, and the actual destination's
+2,852 component/445 e2e checks. The decided correctness and maintenance queue
+is complete; the explicitly deferred performance backlog stays deferred.
 
 The first bounded UFCS prototype passed 13 focused callbacks but added 276
 allocations (3.27%) and 1.09 million instructions (2.58%) on `return/zero`.

@@ -1,0 +1,166 @@
+import:
+	../../../src/check/inference: types_overlap
+	../../../src/check/model: TypeUse, TypeParameterId
+	../../../src/check/signatures: validate_signatures
+	../../../src/namespace/builtins: check_builtin_types
+	../../../src/namespace/namespace: build_namespace
+	../../../src/parse/assemble: parsed_contents
+	../../../src/utils/text: concat
+	../module_input: parse_modules
+	result: to_option
+	test: TestSuite
+
+
+private fixed record OverlapInputs {
+	left: TypeUse,
+	left_parameters: List[TypeParameterId],
+	right: TypeUse,
+	right_parameters: List[TypeParameterId]
+}
+
+
+-- Build accepted types through their ordinary producer, without checking bodies.
+private pure func receiver_inputs(left_declaration: String, right_declaration: String) -> Option[OverlapInputs]:
+	declarations: String =
+		|fixed union Pair[A, B]:
+		|    Both(A, B)
+		|fixed union Box[T]:
+		|    Pack(T)
+		|func main() -> Int:
+		|    0
+		|
+	parsed_program ?= parse_modules([{ source = declarations.concat(left_declaration).concat(right_declaration), targets = [] }]).to_option()
+	foundation ?= check_builtin_types(parsed_program).to_option()
+	namespace ?= build_namespace(parsed_program).to_option()
+	accepted ?= validate_signatures(parsed_contents(parsed_program), namespace, foundation.designated).to_option()
+	left_function ?= accepted.functions.get(1)
+	right_function ?= accepted.functions.get(2)
+	left_receiver ?= left_function.signature.parameters.get(0)
+	right_receiver ?= right_function.signature.parameters.get(0)
+	Some({ left = left_receiver, left_parameters = left_function.signature.type_parameters, right = right_receiver, right_parameters = right_function.signature.type_parameters })
+
+
+private pure func overlap_is(left: String, right: String, expected: Bool) -> Bool:
+	match receiver_inputs(left, right):
+		None: False
+		Some(inputs):
+			match types_overlap(inputs.left.value_type, inputs.left_parameters, inputs.right.value_type, inputs.right_parameters, inputs.left.span):
+				Ok(found): found == expected
+				Err(_): False
+
+
+pure func test_distinct_concrete_heads_do_not_overlap() -> Bool:
+	overlap_is("pure func first(value: Int) -> Int:\n    0\n", "pure func second(value: String) -> Int:\n    0\n", False)
+
+
+pure func test_equal_ground_primitive_receivers_overlap() -> Bool:
+	left: String =
+		|pure func first(value: Int) -> Int:
+		|    0
+		|
+	right: String =
+		|pure func second(value: Int) -> Int:
+		|    0
+		|
+	overlap_is(left, right, True)
+
+
+pure func test_equal_nested_ground_receivers_overlap() -> Bool:
+	left: String =
+		|pure func first(value: List[Box[Pair[Int, String]]]) -> Int:
+		|    0
+		|
+	right: String =
+		|pure func second(value: List[Box[Pair[Int, String]]]) -> Int:
+		|    0
+		|
+	overlap_is(left, right, True)
+
+
+pure func test_different_nested_ground_list_elements_do_not_overlap() -> Bool:
+	left: String =
+		|pure func first(value: List[List[Int]]) -> Int:
+		|    0
+		|
+	right: String =
+		|pure func second(value: List[List[String]]) -> Int:
+		|    0
+		|
+	overlap_is(left, right, False)
+
+
+pure func test_swapped_ground_arguments_do_not_overlap() -> Bool:
+	left: String =
+		|pure func first(value: Pair[Int, String]) -> Int:
+		|    0
+		|
+	right: String =
+		|pure func second(value: Pair[String, Int]) -> Int:
+		|    0
+		|
+	overlap_is(left, right, False)
+
+
+pure func test_distinct_ground_nominal_receivers_do_not_overlap() -> Bool:
+	left: String =
+		|pure func first(value: Box[Int]) -> Int:
+		|    0
+		|
+	right: String =
+		|pure func second(value: Pair[Int, Int]) -> Int:
+		|    0
+		|
+	overlap_is(left, right, False)
+
+
+pure func test_list_element_can_be_instantiated() -> Bool:
+	overlap_is("pure func first(value: List[Int]) -> Int:\n    0\n", "pure func second[T](value: List[T]) -> Int:\n    0\n", True)
+
+
+pure func test_repeated_parameter_preserves_both_constraints() -> Bool:
+	overlap_is("pure func first[T](value: Pair[T, T]) -> Int:\n    0\n", "pure func second(value: Pair[Int, String]) -> Int:\n    0\n", False)
+
+
+pure func test_repeated_parameter_can_match_consistently() -> Bool:
+	overlap_is("pure func first[T](value: Pair[T, T]) -> Int:\n    0\n", "pure func second(value: Pair[Int, Int]) -> Int:\n    0\n", True)
+
+
+pure func test_independent_parameters_have_distinct_variables() -> Bool:
+	overlap_is("pure func first[T](value: Pair[T, Int]) -> Int:\n    0\n", "pure func second[U](value: Pair[String, U]) -> Int:\n    0\n", True)
+
+
+pure func test_phantom_parameter_keeps_variable_positions() -> Bool:
+	overlap_is("pure func first[Unused, T](value: Pair[T, T]) -> Int:\n    0\n", "pure func second[U](value: Pair[U, Int]) -> Int:\n    0\n", True)
+
+
+pure func test_recursive_equations_have_no_finite_overlap() -> Bool:
+	overlap_is("pure func first[T](value: Pair[T, Box[T]]) -> Int:\n    0\n", "pure func second[U](value: Pair[Box[U], U]) -> Int:\n    0\n", False)
+
+
+pure func test_actual_caller_parameter_stays_rigid() -> Bool:
+	match receiver_inputs("pure func first(value: Int) -> Int:\n    0\n", "pure func second[T](value: T) -> Int:\n    0\n"):
+		None: False
+		Some(inputs):
+			match types_overlap(inputs.left.value_type, inputs.left_parameters, inputs.right.value_type, [], inputs.right.span):
+				Ok(False): True
+				_: False
+
+
+tests: TestSuite = {
+	description = "Blorp 2 shared receiver overlap unification",
+	tests = [
+		("distinct concrete heads do not overlap", test_distinct_concrete_heads_do_not_overlap),
+		("equal ground primitive receivers overlap", test_equal_ground_primitive_receivers_overlap),
+		("equal nested ground receivers overlap", test_equal_nested_ground_receivers_overlap),
+		("different nested ground list elements do not overlap", test_different_nested_ground_list_elements_do_not_overlap),
+		("swapped ground arguments do not overlap", test_swapped_ground_arguments_do_not_overlap),
+		("distinct ground nominal receivers do not overlap", test_distinct_ground_nominal_receivers_do_not_overlap),
+		("list element can be instantiated", test_list_element_can_be_instantiated),
+		("repeated parameter preserves both constraints", test_repeated_parameter_preserves_both_constraints),
+		("repeated parameter can match consistently", test_repeated_parameter_can_match_consistently),
+		("independent parameters have distinct variables", test_independent_parameters_have_distinct_variables),
+		("phantom parameter keeps variable positions", test_phantom_parameter_keeps_variable_positions),
+		("recursive equations have no finite overlap", test_recursive_equations_have_no_finite_overlap),
+		("actual caller parameter stays rigid", test_actual_caller_parameter_stays_rigid),
+	]
+}
