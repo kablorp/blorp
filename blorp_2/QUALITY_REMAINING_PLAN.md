@@ -172,7 +172,10 @@ representation follow-up, not proven savings or an automatic M8 outcome. The
 host remains frozen. Raw evidence is retained in the private integration
 worktree under ignored `build/quality-private-integrated/final/`.
 
-UFCS requires a reviewed cost-reduction plan before implementation. Reuse one
+The [UFCS delta plan](UFCS_OVERLAP_PLAN.md) defines the reviewed direct-equality
+preparation, ground solver case, complete reproducible stress inputs and
+prospective cost ceilings. Neither historical failed costs nor unidentified
+workloads establish acceptance on the current base. Reuse one
 solver for receiver selection and overlap; no second matching algorithm or
 global pair cache. A scope checks unordered new/new and inherited/new pairs;
 it may skip inherited/inherited pairs only where provider validation proves
