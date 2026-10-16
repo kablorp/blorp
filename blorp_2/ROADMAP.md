@@ -63,7 +63,7 @@ their own inventory and plan after M8.
   files and contracts; compiled validation and measurements stay serialized.
 - **The frontier.** One number across the path, reported by
   `scripts/blorp2-fixpoint --frontier`: files of `src` that parse (report the
-  discovered numerator and denominator, currently 33/35),
+  discovered numerator and denominator, 35/37 at the final quality gate),
   then the phase reached on `main.brp` (load, check, specialize, lower, own,
   verify, emit, C compiles, B passes e2e, B == C).
 
@@ -78,7 +78,7 @@ milestone work.
 | Milestone | Scope | Status |
 | --- | --- | --- |
 | [M0](#m0-foundation-closeout) | Re-cut, perf fixes, parser statement loop, fixpoint script, parity table | Landed. M3 owns the recorded managed-value call limits. |
-| [M1a](#m1a-surface-syntax-parity) | Layout, `\|`/`raw` strings, pattern/opaque/range syntax | Checkpoints 1, 2a, 2b and 3 landed. The naming acceptance frontier is 33/35; the other two need a `Char` type (`lex.brp`) and function types (`specialize.brp`, M7). |
+| [M1a](#m1a-surface-syntax-parity) | Layout, `\|`/`raw` strings, pattern/opaque/range syntax | Checkpoints 1, 2a, 2b and 3 landed. The final quality frontier is 35/37; the other two need a `Char` type (`lex.brp`) and function types (`specialize.brp`, M7). |
 | [ML](#ml-list-construction) | `append`, `set`, `concat`, list literal | Done. |
 | [M1b](#m1b-names-and-the-foundation) | Namespace: private, aliases, qualified names, designated `Bool`/`Option`/`Result` | Parts A and B done; control-flow consumers follow in M2/M3. |
 | [M5](#m5-constants) | Module-level constants | Reviewed plan; parser inventory precedes implementation; opaque shapes follow M4. |
@@ -631,9 +631,14 @@ pure func starts_with(text: String, prefix: String) -> Bool:
 		False: chars_equal_at(text, prefix, 0)
 ```
 
-**Open item: a `Char` type.** The pilot's `lex.brp` uses `Char` literals (about 52)
-and 13 `Char` patterns, and M1a stops there. Placement is pending the owner; proposed:
-M6, with the `Char` intrinsics above.
+**Early M6 slice: `Char`.** The reviewed [Char plan](CHAR_PLAN.md) defines
+Unicode scalar literals, one shared escape decoder, the required primitive
+identity and `char.to_int`. Its source audit found 72 literal expressions and
+14 literal patterns in `lex.brp`; these replace the older approximate counts.
+The value path may proceed early, with its closed-constant support using
+accepted M5a.1. M2b still owns Char patterns; later M6 work owns conversions,
+String byte access and library/shell integration. Plan approval establishes
+neither implementation nor a new measured frontier.
 
 **Exit proof.** No MISSING parity row; `src` loads (frontier at least load).
 
