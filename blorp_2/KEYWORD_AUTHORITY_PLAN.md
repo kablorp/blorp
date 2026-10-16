@@ -207,19 +207,42 @@ copy of the existing `src/parse/parse.brp` text, read outside the measured call;
 do not add a source generator. Use the existing Blorp memory counters and direct
 phase TestSuite, not another runner or native-symbol access.
 
+Reviewed measurement clarification: direct allocation windows run with the
+existing strict/leak tracking enabled. With both measurement variables unset,
+the runtime counters are inactive; merely removing `reset_mem_stats` does not
+enable them. Do not reset global counters inside the measured helper. Capture
+scalar endpoints around the lex or lex-plus-parse call, keeping setup and
+report construction outside that allocation window. One and two calls on the
+same frozen file check fixed-work call scaling, not a varying word-mix slope;
+the classifier probe and emitted C independently cover per-word allocation.
+
+The memory API has no isolated retired-instruction counter. For direct-phase
+instruction evidence, run a separate counter-free ordinary TestSuite workload
+with both measurement variables unset outside `/usr/bin/time`. Label this a
+**phase-workload process proxy**: it includes host/native compilation, startup,
+input I/O, assertions and reporting. It cannot establish isolated phase
+instructions or attribute a small difference to the lexer. Whole-pilot corpus
+and stress instruction limits remain independent acceptance requirements.
+Root and an independent compiler expert agree on this narrower claim; no
+counter implementation, alternate entrypoint or validation framework is added.
+
 | Metric | Ceiling |
 | --- | --- |
 | Each frozen whole-compiler fixture/stress allocation count | No growth |
-| Direct lex and lex-plus-parse allocation count | No growth; zero new per-word allocation slope |
-| Matched min-of-3 instructions, corpus and each phase/stress input | +0.5% |
+| Direct lex and lex-plus-parse allocation count | No growth; classifier probe/C must show no additional per-word allocation |
+| Matched min-of-3 instructions, corpus, each stress input and phase-workload process proxy | +0.5%; proxy is not isolated phase instructions |
 | Host compilation of compiler source, allocations and instructions | +5% |
 | Token and TokenKind physical carrier size | No growth |
 | LexedProgram physical carrier on arm64 | At most one pointer, +8 bytes |
 | Additional source backing storage in normal loading | 0 copied bytes |
 | Live objects/bytes with the returned parsed product or diagnostic held, after every full-source owner has gone | No growth against the matched baseline, for success and rejection |
 
-Read generated C and use host `memory.size_of` in a scratch measurement to
-verify physical carriers. Use existing `read_memory_counter` with active
+Read generated C and its ordinary Clang record-layout dump to verify physical
+carriers, mapping types through their actual installed names rather than
+assuming numeric C identities are stable. Host `memory.size_of` observations
+are supplementary and do not replace physical layout evidence. Compile the
+unmodified compiler C already needed for the corpus; no split-output capture
+or rewritten C is needed. Use existing `read_memory_counter` with active
 counters around direct helper scopes for allocation/release/live-byte evidence;
 construct reports after endpoint reads. Check both `MemoryStatsActive` and
 `ManagedBytesAvailable`; an inactive/unavailable value is not zero evidence.

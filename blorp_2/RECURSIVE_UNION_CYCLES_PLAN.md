@@ -10,6 +10,22 @@ reference/producer/consumer bytes read; the accepted source commit identifies
 the durable baseline independently of that packet.
 Abbreviated production anchors below are relative to `blorp_2/src/`.
 
+### Reviewed checker amendment
+
+The first executed red has fourteen callbacks: three new semantic failures and
+eleven passing controls. The baseline CLI also rejects both new real-main
+fixtures with the expected diagnostics and no output C. That evidence does not
+validate the first implementation, which has not been compiled.
+
+Source review of that implementation found that admitting only empty-argument
+backedges is insufficient: `Wrap[T] → Node → Wrap[Int] → Node` can close at
+Node without rejecting the deferred generic recursion. Conversely, entering
+`Node → Option[Node] → Node` through Option can encounter a nonempty backedge
+and reject a supported wrapper. These are source-derived counterexamples,
+not additional executed reproductions. Root and two compiler experts agree on
+the fixed-target policy below. This amendment must be committed before the
+checker revision; new paired ordering tests must demonstrate actual red first.
+
 ## Problem and first executable example
 
 `check/declarations.brp:1167–1168` rejects a repeated union instance on the
@@ -86,6 +102,7 @@ fresh current-source census or measured safety margin.
 | --- | --- | --- |
 | UnionId, VariantId, TypeParameterId | existing inventory/namespace + checked declaration admission | immutable checked program; never spellings or raw IDs across domains |
 | complete declared payload TypeUse | checker; generic-cycle validation runs first | all declarations, unused included; full written/application spans retained |
+| storage-walk completion | checker, local full-instance-key builders | shared across IndependentStorage roots; fresh and private to each GenericDeclarationRoot query, never translated between these questions |
 | concrete key (declaration, ordered complete/partial arguments) | existing specializer reservation builder | key reserved in InProgressLayout before children; numeric instance IDs still issued postorder at slot publication |
 | PendingUnionType/UnionSlot | same builder, one slot/key | local only; references resolved by existing completion; sealing rejects all placeholders |
 | union storage/ownership | specializer, ConcreteUnion.representation | frozen complete catalog; value_ownership projects ManagedUnionRoot or InlineOwnedFields |
@@ -101,26 +118,46 @@ while repeated equal keys produce one complete row.
 
 ## Smallest producer-to-consumer change
 
-**Checker.** Preserve validate_generic_cycles first (`declarations:972/1025`),
-all roots and completion ordering (`1033–1102`). Remove repeated-self rejection.
-For a repeated exact **non-generic** instance, close the traversal edge without
-adding a second finish frame; do not mark the active frame complete early.
-Repeated instances with nonempty arguments continue rejecting, including
-constant-argument generic cycles; only the empty-argument case is newly
-admitted. Current versus proposed branch:
+**Checker.** Preserve validate_generic_cycles first (`declarations:972/1025`):
+it rejects own-parameter reinstantiation/growth before this finite traversal.
+Keep the existing instance walker and root/field scheduling. Remove the
+repeated-self rejection and its now-unnecessary VisitVariantPayload bypass.
+One private policy distinguishes the question for the active root:
 
 ```blorp
--- Current declarations.brp:1167; the instance comes from checked annotations:
-if contains_instance_visit(visiting, instance):
-    Err(type_declaration_error(annotation.span, RecursiveAggregateType(annotation.value_type)))
-
--- Proposed, empty arguments identify an already-validated non-generic head:
-if contains_instance_visit(visiting, instance):
-    if instance.arguments.is_empty():
-        Ok({ visiting = visiting, pending = pending, pending_count = pending_count })
-    else:
-        Err(type_declaration_error(annotation.span, RecursiveAggregateType(annotation.value_type)))
+-- Proposed private local-query policy, not a published semantic authority.
+private fixed union StorageWalkPolicy:
+    IndependentStorage
+    GenericDeclarationRoot(UnionId)
 ```
+
+IndependentStorage admits **every exact active-instance backedge**, including
+an applied nonempty wrapper key. Close the edge without a second finish frame
+or early completion. A generic declaration root G instead asks whether its
+rigid-parameter body reaches G again. Reject a child entry to declaration G at
+**any arguments, before active/completed lookup**. The existing VisitUnionRoot
+seed is structurally exempt; no seed flag is needed. ParameterType is a leaf,
+so Option[T] itself stops at T, while a concrete Option[Node] query follows
+the substituted stored Node. This admits ordinary wrappers but rejects both
+Wrap[T]→Node→Wrap[Int] and Wrap[T]→Option[Node]→Node→Wrap[Int].
+
+Use two direct local completion builders with full ordered instance keys:
+the existing shared IndependentStorage builder and a fresh builder per fixed
+generic target. A completion row means its outgoing edges were expanded in
+**this query**, not that this node independently cannot reach every target.
+Accept the query only after its pending work drains. Never reuse independent
+or another generic target's completion facts. Select the active builder at
+the existing lookup/finish sites; do not thread growing tables through a shared
+record. The policy lasts from root activation through pending-stack exhaustion.
+List and record pointer cuts schedule fresh IndependentStorage roots rather
+than inheriting G. Traverse stored fields, never phantom key arguments alone.
+No new graph, traversal, SCC authority or ancestor-result cache is required.
+
+Preserve ApplicationSpan/PayloadSpan reporting and own-parameter validation
+priority. Selecting the first child reentry can change the rejected TypeRef
+from a later repeated wrapper to G; enumerate and review such typed diagnostic
+changes with exact source/span/help/note tests. Do not claim blanket first-error
+identity without checking competing errors and both declaration orders.
 
 **Specializer.** Current `prepare_union:1473–1498` boxes only an own direct
 PendingUnionType. Merely lifting checker rejection would seal an invalid
@@ -230,8 +267,9 @@ feature slice; a separately reviewed semantics-preserving emitter loop extractio
 is allowed only if needed and counted in the same caps. Preserve all existing
 unary/mixed tests. Existing reject_mutual and union_mutual_unused inputs become
 accepted unchanged (exit0, no reachable layouts); update their callers/names
-explicitly, never replace them with another rejection. Generic rejection bytes,
-first-error ordering and no-C failure contract remain; proposed help becomes
+explicitly, never replace them with another rejection. Generic rejection cases
+and the no-C failure contract remain; review the explicit first-reentry
+diagnostic changes described above. Proposed help becomes
 `use non-generic recursive declarations or a non-recursive generic wrapper; recursive generic declarations are not supported yet`.
 
 | Boundary | Required independent named oracles |
@@ -244,6 +282,16 @@ first-error ordering and no-C failure contract remain; proposed help becomes
 | raw verify | accepted indirect/multiple boxed layouts; independently malformed all-inline cycle, fake boxed/no-cycle, unknown IDs, wrong summary, reused/missing owner and missing/double/wrong drop; competing unknown-ID/by-value-cycle/record-summary errors take priority over missing boxed witness; full diagnostics |
 | emit | forward prototypes precede definitions; finite by-value ordering; correct pointer access; every active field dropped; indirect/multiple helpers recurse, unary loop remains; no parent freed before fields read |
 | runtime | production aggregate_runtime fragments through existing Blorp RuntimeCase/TestSuite; per-allocation ledger from aggregate_runtime_test.h for small cases; final/nonfinal, all variants, String+inline-owning child, diamond/shared tail, same child in two slots, retained tail; exact per-object frees without reading freed objects |
+
+Before revising the checker, add paired declaration-order tests for entry
+through Node and Option[Node]; direct and Option-mediated constant-argument
+generic recursion; a generic root reaching an unrelated non-generic cycle;
+List/record cuts; and phantom versus actual stored fields. Include distinct
+applied keys, fresh generic-query completion, unused declarations and a
+competing function-body error. Kill mutants that reuse shared completion for
+a generic query, inherit a target across a pointer cut, omit the child-target
+check, or reject every nonempty backedge. Preserve the initial fourteen
+callbacks and their recorded red rather than replacing their evidence.
 
 Use count-only wrappers for large depth runs, separately from small per-object
 oracles. Construct iteratively from completed children in the approved runtime
@@ -267,6 +315,9 @@ Initial physical estimates (not permission to compress):
 | Total | 300 | 109 | 191 |
 
 Goal<=200 net; hard<=260 net and<=420 added, including any preparation.
+The first source packet is +200/-84 (net116). The amended checker is estimated
+at a further +45–70/-30–45, giving +245–270 added/net116–156 overall;
+these are estimates, not measured acceptance or permission to raise a ceiling.
 Tests excluding fixture files estimate900–1200 added; Blorp/C fixtures300–450,
 reported separately, never shortened to hit a cap. No new source module expected.
 Old accepted inputs and canonical host proxy: target+5%, hard+10% allocations
@@ -285,6 +336,10 @@ by owning phase when possible, complete compile, generated size/nesting and
 default-Clang results. Expect linear local reached-query work, while existing
 instance lookups and overlapping root closures may add superlinear total work;
 attribute rather than assert a blanket linear bound. No cap/toolchain flag waiver.
+For G generic targets, report the sum of their reached instance closures and
+the O(GU) setup from fresh dense completion tables (U declarations). Existing
+active/completed key scans and structural comparisons remain real costs.
+Do not share facts across different query questions to conceal those costs.
 
 Release table: mutual and branching/skewed shapes at16/32/64/128, then
 1k/4k/16k/64k until the first failure, plain-O0 and ASan separately on default
