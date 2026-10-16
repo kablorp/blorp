@@ -14,6 +14,12 @@ authority for which library functions the compiler source may use while the
 host still builds it. Examples and unfinished milestones here are planned
 capabilities, not claims that the current compiler accepts them.
 
+[BOOTSTRAP_SOURCE_PLAN.md](BOOTSTRAP_SOURCE_PLAN.md) now owns the reviewed
+source-simplification direction. Source convenience alone does not justify a
+new compiler mechanism. Retain implemented language behavior and migrate the
+compiler source before removing a deferred feature from the prerequisite set.
+The M8 proof below is unchanged.
+
 Correctness and useful composition come before memory optimization. Extra
 retains, copies and fresh allocations are acceptable; unique-root COW,
 allocation reuse, retain elimination and consuming-ABI inference are deferred.
@@ -33,7 +39,7 @@ The fixpoint the old compiler already uses, strengthened:
 4. A, B and C are built at `-O2`: the first time emitted C runs optimised.
 
 Unit tests are outside this definition. They depend on the host `TestSuite`
-(59.5k lines, 1,554 tuples, 2,285 `==`, process and filesystem APIs) and need
+(historical inventory: 59.5k lines, 1,554 tuples, 2,285 `==`, process and filesystem APIs) and need
 their own inventory and plan after M8.
 
 ## Rules for every milestone
@@ -78,49 +84,48 @@ separate from that completed correctness and maintenance queue.
 | Milestone | Scope | Status |
 | --- | --- | --- |
 | [M0](#m0-foundation-closeout) | Re-cut, perf fixes, parser statement loop, fixpoint script, parity table | Landed. M3 owns the recorded managed-value call limits. |
-| [M1a](#m1a-surface-syntax-parity) | Layout, `\|`/`raw` strings, pattern/opaque/range syntax | Checkpoints 1, 2a, 2b and 3 landed. The current accepted frontier is 36/38; the other two need a `Char` type (`lex.brp`) and function types (`specialize.brp`, M7). |
+| [M1a](#m1a-surface-syntax-parity) | Layout and parsed source syntax | Accepted frontier 36/38. Char/function-type source migrations target the remaining two files; no new frontier is claimed. |
 | [ML](#ml-list-construction) | `append`, `set`, `concat`, list literal | Done. |
 | [M1b](#m1b-names-and-the-foundation) | Namespace: private, aliases, qualified names, designated `Bool`/`Option`/`Result` | Parts A and B done; control-flow consumers follow in M2/M3. |
-| [M5](#m5-constants) | Module-level constants | Scalar/String path complete. Closed records/references follow the reviewed field-admission prep; opaque shapes follow M4. |
-| [M2](#m2-the-join) | Blocks with parameters; non-tail match, `if`, `and`/`or`/`not`, `?=` | M2.1 implemented; M2.2 after M1b part B; M2.3 after M2.2 and M1b part B (designated `Result`). |
-| [M2b](#m2b-pattern-compilation) | Nested, or-, list and literal patterns | Not started. |
-| [M3](#m3-loops-and-tail-recursion) | Loops with managed carried values; `SelfTailLoop` retired | Not started. |
-| [M4](#m4-recursive-types) | Recursive types, release rule, opaque erasure | Steps 1 and 2a done; union-only step 2b has a reviewed plan; 2c and opaque types remain. |
-| [M6](#m6-library-and-shell) | Library and shell per the parity table | Not started. |
-| [M7](#m7-lambdas) | Lambdas at known callees; function types | Not started. |
+| [M5](#m5-constants) | Literal scalar/String constants | Implemented. Source construction functions replace the need for record/opaque constants and initializer dependencies. |
+| [M2](#m2-the-join) | Restricted control positions, outer-variable joins, Boolean operators, `?=` and annotations | M2.1 implemented; reviewed logical candidate preserved. General expression-control recut deferred. |
+| [M2b](#m2b-pattern-compilation) | Qualified flat heads and non-binding constructor groups | Not started. Nested/list/literal source-pattern migration has bounded decision gates. |
+| [M3](#m3-loops-and-tail-recursion) | Managed List/while loops, explicit exits and existing scalar TCO | Not started. Source flat recursion/ranges become loops; broader managed TCO deferred. |
+| [M4](#m4-recursive-types) | Existing unary/mixed recursive shapes plus ordinary opaque semantics | Steps 1/2a done. Opaque completion remains. No current source witness requires unlanded 2b/2c. |
+| [M6](#m6-library-and-shell) | First-order library parity, integer-facing String APIs and seven shell/path functions | Not started. Target Char/Bytes are not planned prerequisites after source migration. |
+| [M7](#m7-lambdas) | Broader language function types/lambdas | Source-removal pilots precede any retirement of this bootstrap dependency. |
 | [M8](#m8-the-fixpoint-gate) | Fixpoint gate | Not started. |
 
-Dependency order:
+Remaining dependency order (source migrations may overlap disjoint work):
 
 ```
-M0   foundation closeout
-M1a  layout, `|`/`raw` strings, pattern/opaque/range syntax        [lex, parse]
-ML   List construction intrinsics                                  [all phases, runtime]
-M1b  namespace: private, aliases + qualified names, designated Bool/Option/Result
-M5   constants
-M2   the join: blocks with parameters                              [all phases]
-M2b  pattern compilation                                           [check, lower]
-M3   loops with managed carried values; SelfTailLoop retired       [all phases, runtime]
-M4   recursive types, release rule, opaque erasure
-M6   library and shell per the parity table
-M7   lambdas at known callees; no closure values
-M8   fixpoint gate
+reviewed source plan + small constructor/control preparations
+host library/runtime prerequisites, then freeze the supporting host
+M6 String byte/scalar APIs + source Char/classification migration
+first-order source pilots + callback removal                     [M7 gate]
+M2 restricted control, outer-variable flow, propagation/annotations
+M3 managed List/while loops + source flat-walk/range migration
+M4 ordinary opaque semantics over retained recursive layouts
+M2b qualified flat groups + bounded source-pattern migration
+M6 remaining first-order library + shell/path integration
+M8 actual O2 A/B/C and fixture identity proof
 ```
 
-Parallel pairs with disjoint files: M1a with the M0 fixpoint script and parity
-table; ML with M1a; M1b with M5; M4 with M3; M6's Blorp bodies with M4 once M3
-lands. M2.2 and M2.3 wait for M1b part B; M2b waits for M2; M3 reuses M2's join.
+Host library work can overlap disjoint source preparations. Shared compiler
+builtin/check/specialize/emit owners have one writer at a time. M3 reuses M2's
+join and ownership edges; target library Blorp bodies depend on the retained
+control/loop subset. Every writing subthread has its own worktree/branch, with
+coordinator integration. Up to eight active subthreads, without forced parallelism.
 
 ### Acceptance order for the parallel work
 
-Finish the quality queue, then accept M5a.1's scalar/String constants and the
-logical-operator slice of M2.2. The reviewed compositional-control preparation,
-match and full-if slices follow. M4.2b's source, granular tests and independent
-runtime depth probes may proceed alongside that work; accept its complete slice
-at the earliest slot where shared phase changes have been reviewed together.
-The early M6 Char preparation may overlap after its plan is accepted, while its
-constant support uses the accepted M5a.1 path. This changes execution order,
-not milestone scope or the definition of done.
+Quality and M5a.1 are accepted. Preserve the logical candidate for current-base
+review. Hold record/reference constants, the general compositional workloop,
+primitive Char and union-only recursion candidates off the bootstrap path while
+their source requirements are removed or disproven. Keep their reviewed designs
+and evidence; neither delete them nor count them as accepted implementation.
+The source plan names pilot stop rules before the larger migrations. M4.2b/2c
+reopen only with a concrete retained stored-payload witness.
 
 Standalone evidence proves the exact frozen source and boundary that produced
 it. After integrating onto an accepted base, review the source/API delta and
@@ -133,8 +138,9 @@ duplicating broad acceptance while retaining independent integration evidence.
 Each new cost packet freezes the full fixture corpus on that accepted base;
 its count may differ from earlier packets. Enumerate intentional outcome or
 diagnostic changes separately, preserving unchanged inputs and full oracles.
-Existing ceilings remain in force. No new cache, runner, fallback, or host
-compiler rebuild follows from this sequencing decision.
+Existing ceilings remain in force. No new cache, runner or fallback follows.
+A separately reviewed native-library prerequisite may require one supporting
+host rebuild; freeze it before subsequent matched comparisons.
 
 ## Delivered foundation
 
@@ -269,8 +275,10 @@ the EBNF move together.
 literals, declaration forms, patterns, `if`/`else`, `and`/`or`/`not`, `match`,
 propagating binding, loops and loop controls, bracketed blocks, levels-stack
 indentation). Checkpoint 3 also covers lambdas, inline statement arms, method chains
-across lines and `for _`. The naming acceptance parses 33/35 files; the remaining two need a `Char`
-type (`lex.brp`) and function types (`specialize.brp`, M7).
+across lines and `for _`. That historical naming acceptance parsed 33/35 files;
+the current accepted frontier is 36/38. The remaining files contain Char
+(`lex.brp`) and function-type (`specialize.brp`) source dependencies. The source
+plan migrates those uses; the frontier alone does not require either feature.
 
 ## ML: List construction
 
@@ -339,38 +347,23 @@ and `for` consumers arrive with M2.2, M2.3 and M3.
 
 ## M5: constants
 
-**Goal.** The source's module constants compile through one complete path.
-The [constants plan](CONSTANTS_PLAN.md) replaces the stale 64/89 estimates with
-a historical 99-candidate census at `e24ca0f25`. A Blorp parser probe at `972ad0b12` read 34
-modules, parsed 32 and classified 65 constants; explicit audits accounted for
-the remaining 34 candidates in the rejected lexer and zero in specialization.
-This is not a current source total or a claim that those modules parsed. Refresh
-the inventory after their remaining syntax/opaque support; no count is pinned
-in a test.
+**Bootstrap goal.** Use the accepted literal Int/Float/String constant path.
+The current 99-global inventory has 71 such declarations; the other 27 records
+and one opaque marker become named construction functions under the source plan.
+This explicit bootstrap compromise removes initializer references, graph-cycle
+validation and opaque constant initialization from the prerequisite set.
 
-**Scope.** M5a.1 implements scalar/String declarations and body reads. M5a.2
-adds closed records, initializer references and cycle validation; any required
-record-admission extraction is a separately reviewed, semantics-preserving
-preparation. The checker publishes complete typed constants and an acyclic
-closed-term graph, with one ConstantId from the declaration inventory. Record
-fields preserve written order and their FieldIds. Specialization projects each
-read into existing concrete literal/record expressions, and ordinary lowering
-materializes fresh values at that use. No identity `evaluate` phase, separate
-concrete constant table or new lower form is needed for these closed terms.
+The [constants plan](CONSTANTS_PLAN.md) retains the reviewed M5a.2/M5b feature
+design for later language work. Do not implement it solely to bootstrap these
+28 source declarations. Ordinary opaque semantics still belong to M4.
 
-M5b waits for M4's ordinary opaque semantics: `COMPILER_SOURCE` and both
-`INTERNAL_SPAN` initializers require SourceId wrapping or a wrapped field.
-They receive no constant-only opaque representation or synthetic caller ID.
+**Decision.** Accepted constants materialise at use: no static data, immortal
+storage class or runtime change. Static data/CTFE remain future language work,
+not bootstrap prerequisites; their ownership policy needs its own reviewed slice.
 
-**Decision.** Constants are materialised at use in increment 1, as literals are
-today: no static data, no immortal storage class, no runtime change. They
-transition to static C data when CTFE lands: that increment introduces the
-immortal storage rule (every release helper honours it for a static managed
-record) and measures the per-use cost it removes.
-
-**Exit proof.** Every inventoried source-constant shape compiles, including
-the opaque-dependent forms after M4; generated C, granular identity/ownership
-tests and actual-entrypoint e2e cases prove the scoped materialization policy.
+**Bootstrap exit proof.** No own-source initializer needs more than the accepted
+literal path; constructor functions preserve identities and behavior. Generated
+C/diagnostics and granular ownership tests remain unchanged on shared fixtures.
 
 **Status.** M5a.1 scalar/String facts, identity/ownership tests, six mutation
 oracles, matched costs and the actual-main 2894-component/452-e2e gate pass.
@@ -380,10 +373,26 @@ focused, mutation and matched cost checks, plus actual-main 2902-component/
 452-e2e acceptance and the unchanged 36/38 frontier.
 The [admission report](../benchmarks/results/blorp_2_record_field_admission_2026-10-16.md)
 records its 42 added / +7 net production lines. Closed records, initializer
-references/cycles and opaque forms remain.
-M5 is complete only after M5a and the M4-dependent M5b both pass their gates.
+references/cycles and opaque constant forms are deferred language features.
+No M5a.2 production implementation had begun when this scope changed.
 
 ## M2: the join
+
+**Bootstrap boundary.** Keep statement/binding/function-tail/arm-tail control,
+qualified flat matching, restricted if, outer-variable flow, local annotations
+and function-top-level propagation. Lift the 16 source argument matches rather
+than generalizing expression inference. The reviewed
+[compositional plan](COMPOSITIONAL_CONTROL_PLAN.md) remains a broader language
+design; its workloop relocation and arbitrary-expression match/if are deferred.
+Omitted else is permitted in explicit statement roles, including inherited
+statement arms, and in the final control position of a function whose accepted
+signature returns Void, including an omitted return annotation. Every normally
+completing then-path must produce Void. Other value positions require else;
+general VoidTail discard does not relax this branch requirement.
+Updating an outer variable needs carried-binding edges on both branches,
+including the false edge; the current Void-only join is insufficient. The design sketches
+below still describe the shared join/ownership mechanisms, not permission to
+expand this restricted placement boundary.
 
 **Goal.** Give a bound match, a statement-position match, a void `if` and
 `a and b` somewhere to converge. Today a lowered function is a flat definition
@@ -431,10 +440,9 @@ non-tail `match` (needs no `Bool`); **M2.2** `if` and `and`/`or`/`not` (needs th
 designated `Bool`); **M2.3** `?=` and local annotations (needs the designated
 `Result`; the early return must discharge every live function owner).
 
-The [compositional control plan](COMPOSITIONAL_CONTROL_PLAN.md) splits the
-work after logical operators into a mechanical module move, compositional
-match, then full `if`. It fixes binding identity, inference checkpoints and
-diagnostic order before implementation; these steps are not yet accepted.
+The [compositional control plan](COMPOSITIONAL_CONTROL_PLAN.md) preserves the
+future general-expression design. Bootstrap instead uses the body owner's
+existing position, identity and inference checkpoints for restricted control.
 
 **Exit proof.** Fixtures for each desugaring; top-level `?=` success and failure
 with two live managed locals; parser rejections for propagation in join arms;
@@ -461,22 +469,38 @@ form for a join arm: nested propagation is a parser error.
 
 ## M2b: pattern compilation
 
-**Goal.** The source's pattern shapes check and lower: nested constructor (54),
-or- (51), list (34), String-literal (36), Char (14) and qualified (28).
-**Decision.** A decision-tree match compiler in the checker (Maranget), with
-column-wise exhaustiveness and list patterns as length and index tests. The
-source is not rewritten to flat patterns. M1a parses these forms; M2b replaces
-the checker's rejection.
+**Bootstrap scope.** Qualified flat constructor heads and non-binding constructor
+groups with wildcard payloads. Each group has complete accepted VariantIds,
+no captures, one body and exact coverage diagnostics. Current source has 106
+or-groups: 99 fit directly; seven factor a common outer constructor.
+Canonical duplicate/covered alternatives fail at the offending alternative's
+span. The group remains one body through lowering and ownership. Independent
+verification checks every label but grants no payload-projection permission.
+This feature is bounded to 650 gross added / +450 net production lines.
 
-**Exit proof.** The source's pattern shapes as fixtures; exhaustiveness errors
-exact.
+The source plan pilots successive matches for 236 nested-test arm headers,
+and length/get/equality replacements for list/String patterns. Do not duplicate
+substantial actions to force a ban: full source-growth and cost gates apply.
+General nested patterns, binder-unifying alternatives and list/literal pattern
+compilation remain deferred only after their source uses are actually removed.
+Keep parsed data and precise unsupported-input diagnostics.
+
+The broader language design remains a checker-owned Maranget decision tree,
+column-wise exhaustiveness and list length/index tests. It is not a bootstrap
+prerequisite merely because M1a can parse those forms.
+
+**Exit proof.** Group/qualified identity and coverage tests, one-body emission,
+ignored managed-payload cleanup, source migration and exact rejections for
+deferred cases. No general pattern-matrix implementation is implied.
 
 **Status.** Not started.
 
 ## M3: loops and tail recursion
 
-**Goal.** Loops with managed carried values, and the one loop mechanism for
-`@tail_recursive`. **Scope.** A loop is a statement with a carried-binding set and
+**Goal.** Managed List/while loops, with one explicit edge/ownership mechanism.
+Retain existing scalar `@tail_recursive` behavior; broader managed/generic tail-
+call optimization is not a bootstrap prerequisite. Rewrite the source's flat
+managed walks into loops. **Scope.** A loop is a statement with a carried-binding set and
 two exits:
 
 ```
@@ -485,10 +509,11 @@ CheckedStatement.Loop(carried: List[BindingId], body)   -- body exits: Break | R
 
 The carried set is a checker fact: the outer `var` bindings reassigned in the body
 plus the iteration index. Lowering makes them header-block parameters; own carries
-one obligation per managed carried value on both edges. A `for` over a list is an
-index-carried loop over `values.get(index)`; `a..b` is the same with bounds;
-`while` has no index. `break` is always bare in the source; a non-tail `break` (70
-uses) reuses the join.
+one obligation per managed carried value on every edge. A List `for` evaluates
+its source once and carries its iterator; `while` checks its condition at the
+header. Resolve break/continue to their actual enclosing loop, preserving List
+iteration advancement. The six source ranges become Int while loops preserving
+evaluated-once bounds and both directions; Range execution/types are deferred.
 
 ```blorp
 var total = 0
@@ -507,7 +532,8 @@ Loop(carried = [index, total]):
 ```
 
 `?=` is rejected in loop bodies (see M1a), which keeps loop exits at two
-variants; lambda-based workarounds stay valid.
+variants. Bootstrap uses named fallible helpers and an explicit Result match
+with an error accumulator/break; it does not introduce lambda workarounds.
 
 **Managed carried values** (179 loops carry a `List`/`String`, 173 an
 `Option`/`Result`) are the larger half. Keep the external borrowed ABI; internal
@@ -517,10 +543,11 @@ parameter occurrence carries its own obligation, including duplicate aliases.
 On the back edge: evaluate the next values, acquire or transfer next owners,
 retire the old obligations, rebind and jump; no pending cleanup follows the back
 edge. Base returns transfer the result and discharge remaining owners.
-`@tail_recursive` becomes a function whose body is one loop carrying its
-parameters, so `FunctionExecution`/`SelfTailLoop` are the replaced representation
-and go in the same change; a back edge outside a loop becomes unrepresentable by
-the exit types. Follow-ups, each separately accepted:
+Existing supported `@tail_recursive` functions become a body loop carrying their
+parameters, so `FunctionExecution`/`SelfTailLoop` are replaced in the same bounded
+representation change; preserve their current accepted/rejected cases. A back
+edge outside a loop becomes unrepresentable by the exit types. Broader language
+follow-ups are deferred, not prerequisites for the source loop migration:
 
 1. **Same-instance generics.** Accept an annotated self edge only when
    substitution preserves every enclosing rigid parameter in order; equal C
@@ -538,12 +565,23 @@ tail-modulo-constructor are separate future designs; traversal depth and
 measured release depth are separate acceptance criteria.
 
 **Exit proof.** A `List[String]` accumulator loop under ASan with exact allocator
-balance; nested loops; a range loop;
-malformed-IR negatives; `SelfTailLoop` gone.
+balance; nested loops and explicit exits; the source range/walk migrations;
+malformed-IR negatives; `SelfTailLoop` gone with existing scalar TCO preserved.
 
 **Status.** Not started.
 
 ## M4: recursive types
+
+**Bootstrap scope reset.** The frozen source inventory covers all 549 type
+headers and their substituted fields/aliases: 206 union instances, 112 stored
+union edges, five unary self families, no multi-instance union-only cycle and
+no multiple direct self slots. Root independently checked that graph; the host
+Bool leaf is accounted for separately. No current generic family requires
+own-parameter recursive reapplication. Thus unlanded 2b/2c leave the critical
+path; preserve their designs/candidates and rejections. Reopen only with an exact
+retained source/library witness. Ordinary opaque semantics and existing unary/
+mixed record/List recursion remain required. The broader recursive-language
+design below records future work, not additional bootstrap prerequisites.
 
 **Goal.** `CheckedExpr`-shaped data: `TypeRef`, `InferenceType`,
 `PendingOperations` recurse through inline payloads with no pointer today. Runtime
@@ -579,8 +617,10 @@ recursive bindings, backpatching or lazy knot tying. **Scope.** Three steps:
    needs a measured release-depth table, not a bound proved in advance. Step
    2a's table: a self-linked chain overflows at 75,003 levels on an 8 MiB stack
    and 4,786 on 512 KiB (`-O0`), an alternating record/List chain at 58,335 and
-   3,722, against fewer than about 200 levels in the trees the pilot builds
-   from its own source. The worklist design is kept on branch
+   3,722. The historical "below about 200" source comparison was an indentation/
+   bracket/UFCS scan, not measured live product destruction depth. Inventory the
+   actual post-migration products and release paths before claiming adequate
+   margins. The worklist design is kept on branch
    `blorp2/recursive-worklist-ref`; it is taken if data approaches that table
    or release must run on small thread stacks. Test
    shared-tail diamonds, repeated slots, mixed inline owning children, all
@@ -591,8 +631,9 @@ recursive bindings, backpatching or lazy knot tying. **Scope.** Three steps:
 currently turns them into loops. Retained measurements at `-O0` overflow at
 2,697 functions and 1,909 types; `accept_functions` is unmeasured. These are
 historical measurements from the quality investigation, not renewed limits for
-every host or build. M3's shared loops and managed-value tail calls remove this restriction;
-there is no separate loop rewrite promised by M0.
+every host or build. M3's source loop migration addresses these flat walks;
+broader managed tail-call optimization remains deferred. Tree traversal and
+destruction depth still need their separate measured evidence.
 
 **Opaque types** are a checked `TypeRef.OpaqueType(id)`. Public opaque type
 references may cross modules; only construction and projection are restricted
@@ -619,21 +660,31 @@ admitted shapes at the source's deepest nesting under `ulimit -s 512`; step 1's
 **Status.** Step 1 done. Step 2a done: non-generic recursion through record
 fields and `List` elements, released by recursive helpers; see the
 [recursive group report](../benchmarks/results/blorp_2_recursive_mixed_2026-10-15.md).
-Remaining: union-only cycles (2b), generic recursion through a declaration's
-own parameters (2c), and opaque types.
+Bootstrap remaining: ordinary opaque types and actual source-product depth
+acceptance. Union-only cycles (2b) and own-parameter recursion (2c) are deferred
+language extensions with no current bootstrap witness.
 
 ## M6: library and shell
 
-**Goal.** `src` loads: the parity table drives it. **Scope.** Intrinsics
-(representation or machine): byte access `string.get -> Option[Char]` (the
-host's own signature), `Char` with `to_int`/`to_char`, `Int` ordering, `Float`
-ordering/`equals`/`is_nan`/`is_finite`/`copysign`, String from chars, and the
-shell's `read_file`, `write_file`, `print_error`, `getcwd`, `argv` and exit
-status, in `main.brp` only. Everything else the source uses is written in Blorp
-in `standard_library_temp`: `substring`, `starts_with`, `index_of`, `join`,
-`take`, `is_empty`, `any`, `sort_by`, `min`, `append_int`, the Option/Result
-helpers, `Path`. `concat`/`join` get a measured decision (the emitter joins
-thousands of fragments).
+**Goal.** The real compiler source loads and checks against the real temporary
+library, with no remaining required parity row missing. Use the reduced resolved
+dependency inventory after source migration, not the old callback/Char rows.
+
+**Scope.** Existing Int/Float/String/List representation and machine operations;
+remaining first-order numeric comparisons/classification; ordinary Option/Result
+helpers; byte-exact String operations; and the shell/path surface below. New
+`string.byte_at -> Option[Int]` and `string.from_codepoint -> Option[String]`
+avoid target Char/Bytes. They preserve arbitrary counted input bytes and validate
+scalar encoding before narrowing. See the source plan for exact contracts and
+the owning Some[String] transfer tests.
+
+Write ordinary helpers in Blorp where the reduced subset and measured cost allow.
+Do not reconstruct raw substring bytes through scalar encoding. `starts_with`
+can compare counted bytes without per-position substring allocation. Remove
+Unicode case mapping or search from the prerequisite set only after the parser's
+actual ASCII-classification calls disappear. Large String concatenation/join
+needs its explicit scaling decision; a concrete counted join can be reviewed if
+the Blorp candidate restores quadratic copying. No generic builder follows.
 
 ```blorp
 pure func starts_with(text: String, prefix: String) -> Bool:
@@ -642,25 +693,113 @@ pure func starts_with(text: String, prefix: String) -> Bool:
 		False: chars_equal_at(text, prefix, 0)
 ```
 
-**Early M6 slice: `Char`.** The reviewed [Char plan](CHAR_PLAN.md) defines
-Unicode scalar literals, one shared escape decoder, the required primitive
-identity and `char.to_int`. Its source audit found 72 literal expressions and
-14 literal patterns in `lex.brp`; these replace the older approximate counts.
-The value path may proceed early, with its closed-constant support using
-accepted M5a.1. M2b still owns Char patterns; later M6 work owns conversions,
-String byte access and library/shell integration. Plan approval establishes
-neither implementation nor a new measured frontier.
+**Char status.** Preserve the reviewed [Char plan](CHAR_PLAN.md) and its held
+extraction candidate as future language work. It is not the active bootstrap
+route. The compiler's 72 ASCII literals, 14 Char patterns and Char API consumers
+are migrated explicitly; input UTF-8 support is retained.
 
-**Exit proof.** No MISSING parity row; `src` loads (frontier at least load).
+### Seven shell and path functions
+
+Paths and OS errors remain String for this macOS/Linux bootstrap increment.
+Opaque Path, filesystem canonicalization, process execution, directory scanning,
+environment APIs, durability and atomic output publication are outside it.
+
+```blorp
+-- system
+func get_current_directory() -> Result[String, String]
+func read_file(path: String) -> Result[String, String]
+func write_file(path: String, contents: String) -> Result[Void, String]
+
+-- io
+func print_error(message: String) -> Void
+
+-- path: retain existing public names, with these strengthened contracts
+pure func join(base: String, child: String) -> String
+pure func dirname(path: String) -> String
+pure func normalize(path: String) -> String
+```
+
+The last three implement the proposed join_paths/parent_directory/normalize_path
+semantics. Keeping the existing module names avoids parallel synonyms and a
+cosmetic cross-repository rename. The host's broader generic print_error still
+provides this String instantiation; the temporary twin is concretely String,
+as explicitly recorded in the parity table. No host trait enters target code.
+
+- **Current directory:** owned, nonempty absolute path on success; useful Err
+  otherwise. Grow storage as required by the OS; no fixed buffer or empty failure
+  sentinel. Query once before loader identities. Failure uses the real compiler
+  SourceId and an empty source inventory, not a fabricated module/file row.
+- **Read:** preserve all counted bytes, including CRLF, NUL and invalid UTF-8.
+  Reject NUL in a path before opening. Missing/unreadable input, incomplete reads
+  and close failure return Err; clean up every opened handle. This increment
+  needs stable source files, not arbitrary streams or concurrent snapshots.
+- **Write:** create/truncate, write all counted contents and close successfully
+  before Ok(void). Reject NUL paths; missing parents fail. A failure may leave
+  partial output. Neither file operation prints. Preserve the primary failure
+  while attempting cleanup; never report success after a short transfer/close
+  failure. Interruption/retry policy needs explicit native tests.
+- **Stderr:** attempt the complete counted message plus one additional LF,
+  preserving internal newlines/NUL and writing nothing to stdout. Void reports
+  no delivery status; stop on unrecoverable output error.
+- **Join:** an absolute child replaces base. Empty base returns child, including
+  join("", "") == "". Otherwise retain a trailing separator or add one;
+  join("/library", "") == "/library/". Do not normalize components/separators.
+- **Parent:** ignore all trailing separators, remove the final component and
+  its preceding separator run; preserve root. Empty/basename becomes ".";
+  dirname("/a///") == "/", dirname("a//b//") == "a", and
+  dirname("a/..") == "a". Do not resolve interior parent components.
+- **Normalize:** collapse repeated '/' and '.', cancel ordinary components
+  against following '..', preserve unresolved leading relative parents and stop
+  absolute parents at root. Empty becomes ".". No filesystem/symlink lookup.
+
+The loader continues using normalized absolute **logical** paths as module
+identity. The trailing-separator prefix distinguishes /library/module.brp from
+/library-extra/module.brp; preserve root-library and cycle/alias tests. Pure path
+helpers preserve Strings, including NUL; fallible OS boundaries reject NUL.
+
+Retain main(args: List[String]) -> Int, including executable name at index zero,
+and `compiler --library-root DIRECTORY INPUT.brp OUTPUT.c`. Return 0 with empty
+stdout/stderr on success; return 1 with stderr diagnostics for usage/loading/
+compilation/publication failures. Relative paths use process CWD. The existing
+relative output path passed to write_file needs no new shell context carrier.
+After loading, compilation and diagnostic rendering remain pure.
+
+Ordinary Blorp implements paths; native bindings implement the four impure
+operations. The existing fixed-buffer getcwd cannot satisfy the new contract.
+Add/validate a bounded supporting-host prerequisite for its native helper and
+ownership declaration. Verify explicit `--std-dir` source selection separately
+from the executable's embedded runtime; then freeze binary, library and toolchain
+for matched comparisons. Never claim a disk edit updates embedded helpers.
+
+Target Result contracts must carry designated constructor identities and exact
+payload types once. Inputs are borrowed; successful/error Strings are owned.
+Specialization, ownership and independent verification consume those facts;
+do not recover a branch from error spelling or duplicate the signature solver.
+
+**Acceptance.** Pure path edge tables, byte-exact file/stderr tests, NUL paths,
+missing/permission/incomplete/close errors, multiple-CWD relative invocations,
+prefix identity and source cleanup. Use granular phase tests and runtime helpers
+as well as real-main e2e. A deterministic failure-injection test needs its own
+reviewed test-local design; no new production failure framework. Every slice
+sets LOC/cost ceilings before code. Existing non-I/O fixtures retain C/diagnostic
+identity; M8 still proves real rebuilt-compiler output identity.
+
+**Exit proof.** No required MISSING parity row; real src reaches load/check.
 
 **Status.** Not started.
 
 ## M7: lambdas
 
-**Goal.** The 61 lambda literals in `src` compile. All are `pure`, all are
-arguments to a known callee (`map` 30, `and_then` 5, `any` 3, `sort_by` 3,
-`translated_list` 7, others 13); none is bound, stored or returned; none captures
-a `var`; captures include managed values. **Scope.** The model, not an
+**Bootstrap decision.** Migrate the current 53 pure lambda literals, 64
+higher-order calls and one function-typed helper parameter to first-order source
+under the bounded source plan. Retire this dependency only after sorting,
+translation/source-growth pilots and the complete resolved inventory pass.
+No stored/returned closure was found in the reviewed current source. Broader
+language function values remain future work; existing parser/rejection behavior
+is preserved.
+
+**Retained future design.** Lambdas at known callees, including managed captures.
+The model, not an
 optimisation: each lambda literal is a unique nominal record type of its
 captures; a callee with a function parameter is specialised per lambda type (one
 more component in specialize's instance key); the call inside the callee is a
@@ -675,11 +814,12 @@ offsets.map(pure func(value): IntOps.add(value, base))
 -- specialize: map instantiated for this lambda's capture type; a direct call inside
 ```
 
-**Exit proof.** Fixtures for a capturing and a non-capturing lambda at a library
+**Future language exit proof.** Fixtures for a capturing and a non-capturing lambda at a library
 combinator and at a user generic; ownership of borrowed managed captures
 verified; frontier reaches emit.
 
-**Status.** Not started.
+**Status.** Future language implementation not started; bootstrap dependency
+retirement remains conditional on the source migration and inventory.
 
 ## M8: the fixpoint gate
 
@@ -688,8 +828,8 @@ B == C, A == B on every fixture, e2e under B, all at `-O2`. Measure the
 self-compile cost row (allocations and instructions per phase) under
 always-fresh `append`; if quadratic, unique-root reuse is the first post-fixpoint
 increment. **Decision (harness).** The e2e harness has no closure values: tests
-are dispatched by name. This keeps one lambda model (lambdas only at known
-callees, M7) and a simpler harness. The `BLORP2_COMPILER` harness is expected to
+are dispatched by name. It does not add a lambda prerequisite to bootstrap.
+The `BLORP2_COMPILER` harness is expected to
 be rewritten once blorp_2 is mature. The unit-test migration is a separate plan.
 
 **Exit proof.** The fixpoint script exits 0.
@@ -897,7 +1037,11 @@ costs are proxies for self-compilation until M8 gives the self-compile cost row.
 
 - **Preparatory refactors** freeze a matched same-toolchain baseline, emit
   identical existing target C and stay within +3% allocations and minimum
-  retired instructions per frozen input. A lowering preparation stops for design
+  retired instructions per frozen input. Source migrations also stay within
+  +3% cumulatively against the frozen reset source baseline, including the
+  host source-to-C proxy. A required native-host transition is measured
+  separately and both sources are rebuilt under one frozen measurement epoch.
+  A lowering preparation stops for design
   review above +50 production lines or a wider algorithmic change.
 - **Features** may change emitted C and increase costs: set numerical fixture
   limits before implementation, report new-feature work separately from the
@@ -942,6 +1086,14 @@ the pilot once at O0, compiles unmodified fixture C at O0 and uses timeout 0; no
 persistent compiler cache.
 
 ## Deferred beyond the fixpoint
+
+Record/reference and opaque constants, general expression-child control,
+general nested/binder-unifying/list/literal patterns, Char/Bytes primitives,
+union-only and own-parameter recursive extensions, and lambdas/function values
+are outside the intended bootstrap subset. Their deferral is discharged only
+when the corresponding complete source-plus-library migration/inventory gate
+passes. Preserve reviewed future designs and held candidates. A retained stored
+payload witness can reopen the appropriate recursive-type prerequisite.
 
 Unique-root COW and allocation reuse (first candidate if M8 shows quadratic
 `append`), retain elimination, consuming-ABI inference, List removal, Set/Dict

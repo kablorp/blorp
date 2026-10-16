@@ -1,14 +1,44 @@
 # Library parity: what `blorp_2/src` needs from both libraries
 
-Until the fixpoint, the host compiler builds `blorp_2/src` against
-`standard_library/src/` while the pilot compiles programs against
+Until the fixpoint, the host compiler builds `blorp_2/src` against its selected
+host library while the pilot compiles programs against
 `blorp_2/standard_library_temp/`. The source may therefore use only library
 functions that exist in both, with the same module name, function name and
-signature. This table is the authority for that set. It drives the ML and M6
-increments; no row may be MISSING when M6 exits.
+signature, including the explicitly documented monomorphic instances below.
+This document owns that set. No required row may be MISSING when M6 exits.
 
-Taken at `ba57e368a` (2026-10-15). Regenerate it when `src` gains or loses a
-library dependency.
+**Scope update.** The table and counts below are a historical resolved snapshot
+at `ba57e368a` (2026-10-15), not the final interface inventory. The
+[source plan](BOOTSTRAP_SOURCE_PLAN.md) and [current roadmap](ROADMAP.md#m6-library-and-shell)
+replace the old Char/callback prerequisites. Regenerate the resolved inventory
+after each source dependency is actually removed; planned removals below do not
+claim that current callers or missing twins have disappeared.
+
+## Planned interface delta
+
+| Source migration / interface | Bootstrap requirement |
+| --- | --- |
+| Char reads, literals and conversions | Replace with `string.byte_at(String, Int) -> Option[Int]` and `string.from_codepoint(Int) -> Option[String]`; both matching host/target interfaces are planned, not implemented. Full-width scalar validation precedes narrowing, and Some[String] has ordinary owning payload transfer/destruction. |
+| Parser alphabet classification | Private ASCII byte predicates replace all current String lower/index_of/contains callers, preserving empty-substring and malformed-token diagnostic behavior. Remove the historical rows only after resolved inventory confirms zero uses. |
+| List/Option/Result callbacks and function types | Conditional first-order migration. Do not implement historical HOF rows solely for bootstrap or remove them before the bounded pilots and full inventory pass. |
+| First-order numeric, String and List operations | Remain required. Slice/compare raw counted bytes. Establish actual frozen-host substring bounds; legacy C and current synthesized helpers differ. Measure join construction: host join uses capacity-aware append, not naive concat. |
+| `system.get_current_directory() -> Result[String, String]` | New fallible contract replaces source use of fixed-buffer `getcwd`. Owned nonempty absolute success, useful error and no fixed path-length limit. |
+| `system.read_file(String) -> Result[String, String]` | Exact counted bytes including NUL; reject NUL paths; close on every opened path; read/close failures are Err, with no printing. |
+| `system.write_file(String, String) -> Result[Void, String]` | Exact create/truncate write; reject NUL paths; Ok only after successful write and close. Missing parents fail; partial output is allowed. |
+| `io.print_error(String) -> Void` | Write the counted message plus one LF to stderr only. The host's existing generic API supplies this String instance; the target twin is explicitly monomorphic, as in note C. |
+| `path.join`, `path.dirname`, `path.normalize` | Keep existing names and pure String signatures. ROADMAP pins empty children, all trailing separators, logical normalization and root behavior. No cosmetic synonyms or Path carrier. |
+
+These seven OS/path functions plus the existing `main(args: List[String]) -> Int`
+contract cover the shell/loader boundary. [ROADMAP](ROADMAP.md#seven-shell-and-path-functions)
+owns their complete behavioral and failure contracts, the unchanged CLI,
+relative-path acceptance and runtime ownership tests.
+
+The host normally uses an embedded library/runtime. Verify explicit
+`compile --std-dir DIRECTORY` selection for new ordinary wrappers; project CWD
+alone does not establish availability. That override cannot add embedded native
+helpers or ownership declarations. A native addition needs a separately validated
+supporting host, then a frozen matched measurement epoch. No hidden fallback or
+second library implementation is authorized.
 
 ## Milestones
 
@@ -18,11 +48,11 @@ The milestones are defined in [ROADMAP.md](ROADMAP.md). As this document uses th
 - **M1b** (the "namespace" milestone): `private`, module aliases and qualified names. Part A (aliases, `private`, qualified values and types) landed 2026-10-15; qualified pattern heads remain.
 - **ML** (the "list intrinsics" milestone): List construction intrinsics (`append`, `set`, `concat`, the list literal).
 - **M2** (the "join" milestone): non-tail matches, `if`, `and`/`or`/`not`, `?=`, local type annotations.
-- **M3** (the "loops" milestone): loops with managed carried values (`for`, `while`, `break`, `a..b`).
+- **M3** (the "loops" milestone): List/while loops with managed carried values and explicit exits. Six source ranges migrate to Int loops; range execution is not a planned prerequisite afterward.
 - **M4** (the "recursive-types" milestone): recursive types and opaque types.
 - **M5**: module-level constants with literal initializers, including in library modules.
 - **M6**: the library and shell increment this table drives; its exit is no MISSING row.
-- **M7**: lambdas at known callees; `pure (T) -> U` parameter types in signatures.
+- **M7**: future lambdas at known callees and function-typed parameters; conditionally retired from bootstrap after first-order source migration.
 
 ## Method
 

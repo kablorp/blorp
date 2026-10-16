@@ -1,5 +1,11 @@
 # M6a: Unicode Char values and their numeric projection
 
+**Bootstrap scope update.** This reviewed primitive-Char design and the held
+decoder preparation remain future work. The active [source plan](BOOTSTRAP_SOURCE_PLAN.md)
+uses String byte access and checked scalar encoding through Int-facing APIs,
+avoiding target Char and Bytes representations while preserving UTF-8. The
+budgets below do not transfer to that different implementation route.
+
 Reviewed plan; implementation and acceptance remain pending. Root and an
 independent compiler expert approved the design before implementation. No
 compiler, test, build, probe or measurement ran while preparing it. Read

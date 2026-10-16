@@ -1,5 +1,12 @@
 # M5 constants: fresh producer-to-consumer plan
 
+**Bootstrap scope update.** M5a.1 literal constants and the shared field-admission
+preparation are accepted. The [source plan](BOOTSTRAP_SOURCE_PLAN.md) instead
+migrates 27 record constants and one opaque constant to named construction
+functions. M5a.2/M5b below are retained future designs, not active bootstrap
+prerequisites. Their measurements and budgets do not establish acceptance of
+the source migration.
+
 Design reviewed by root and independent compiler experts. Its original baseline is main
 `e24ca0f251fa3a7b63990141c3352df8097848f8`, plus the accepted quality contracts.
 The old `blorp2/constants` tip `cc07e5f19` is a read-only design reference:

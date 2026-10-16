@@ -1,5 +1,11 @@
 # M2.2: compositional blocks and if
 
+**Bootstrap scope update.** This is the future general-expression design. The
+active [source plan](BOOTSTRAP_SOURCE_PLAN.md) lifts expression-child controls
+into preceding bindings and retains restricted body control, outer-variable
+joins and managed loops. General expression inference and workloop relocation
+below are deferred; the existing join/ownership contracts remain authoritative.
+
 This is the design for the steps after the separately reviewed
 [logical operators](BOOLEAN_CONTROL_PLAN.md). Plan approval is not acceptance
 of implementation or costs. Source anchors below describe that logical-operator

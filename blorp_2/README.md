@@ -13,6 +13,9 @@ Current language examples and limits are below; [grammar.ebnf](grammar.ebnf)
 owns the formal syntax. The [roadmap](ROADMAP.md) owns planned increments,
 immutable-fact and ownership contracts, and required validation. It consolidates
 the earlier memory, aggregate, generics and recursion plans.
+The [bootstrap source plan](BOOTSTRAP_SOURCE_PLAN.md) defines the smaller source
+subset and the bounded migrations toward it; it does not remove currently
+supported input features.
 
 Completed increment plans and handoffs are retained in Git; validation reports
 remain under [benchmarks/results](../benchmarks/results/). Historical research
