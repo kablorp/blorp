@@ -2886,6 +2886,13 @@ private func helper(x: Int) -> Int:
     x + 1
 ```
 
+**Blorp 2:** a public function's parameter and return types, public record fields
+and public union payloads cannot mention a private type, including nested type
+arguments such as `Option[List[Secret]]`. The error names the private type and
+public declaration and suggests making the type public or the declaration
+private. A private declaration or body-only use may still use the type. This
+additional pilot rule does not change the frozen host compiler.
+
 ---
 
 ## 9. Concurrency

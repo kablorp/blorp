@@ -152,8 +152,11 @@ conditional rescope: **+1.5% aggregate corpus allocations for this rule only**.
 Corpus instructions stay at +0.5%; host-build allocations and instructions at
 +1%; the four individual instruction limits at +1%. Return-zero's previously
 reviewed allocation ceiling remains +2% (observed +1.879%); the other three
-individual allocation limits stay +1%. No fixture budget changes. Pending
-normal-corpus, host-build and complete destination gates must still pass.
+individual allocation limits stay +1%. No fixture budget changes. The subsequent
+normal-corpus (+0.195876% instructions), host-build (+0.166588% allocations,
++0.238707% instructions) and literal destination unit/e2e gates all pass;
+the [private-type report](../benchmarks/results/blorp_2_quality_private_types_2026-10-16.md)
+records their exact boundaries and the measured 33/35 parsing frontier.
 
 Generated C and source identify allocations for `NamedType`, `PublicTypeUse`
 and eager `UnknownType`/`NonApplicableType` arguments on successful head lookup.

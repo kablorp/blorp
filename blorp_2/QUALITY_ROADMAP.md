@@ -738,6 +738,17 @@ plan review was in progress when work stopped. Finish it first.
 
 ## No private type in a public declaration
 
+**Implementation checkpoint.** The integrated rule uses one namespace-owned
+head/origin projection and one annotation-access check, at +47 production lines.
+Owning tests and mutations, shared C identity, zero leaks, normal-corpus and
+host-build costs pass. The original +0.5% allocation ceiling failed twice;
+the [recorded decision](QUALITY_REMAINING_PLAN.md#other-rule-deltas) conditionally
+permits +1.5% for corpus allocations only. The destination's full unit/e2e gate
+passes (2,799 component checks and 445 e2e checks); the measured frontier is
+33/35, with Char and reserved `pure` still unsupported. Exact evidence is in the
+[private-type report](../benchmarks/results/blorp_2_quality_private_types_2026-10-16.md).
+The estimates below describe the original handoff.
+
 ### Decision
 
 Keith answered "I think no" to whether `Option[Secret]` may appear in a public

@@ -745,6 +745,12 @@ Declarations are public unless marked `private`; there is no `export`.
 `private` does not apply to `import` or `foreign` blocks. The old parser also
 accepts annotations and `pure` written before `private` (`LP:10729-10763`).
 
+Blorp 2 additionally checks annotation visibility: public function parameter and
+return types, public record fields and public union payloads cannot contain a
+private type, even within nested type arguments. Private declarations and
+body-only uses are allowed. This is a checker rule, with no additional syntax;
+the frozen host compiler does not gain the rule.
+
 #### Functions
 
 ```ebnf

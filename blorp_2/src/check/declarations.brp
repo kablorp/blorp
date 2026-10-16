@@ -12,6 +12,7 @@ import:
 			DuplicateRecordField, DuplicateTypeParameter, TypeParameterTypeNameConflict, RecursiveAggregateType,
 		),
 		TypeTermError(
+			PrivateTypeInPublicDeclaration,
 			ListTypeArgumentCount, MissingUnionTypeArguments, NonApplicableType, MissingRecordTypeArguments, RecordTypeArgumentCountMismatch, OrdinaryRecordApplied,
 			OrdinaryUnionApplied, UnionTypeArgumentCountMismatch, UnknownType,
 		),
@@ -57,7 +58,7 @@ import:
 	../utils/names: NameId, same_name
 	../namespace/namespace:
 		AliasedModule, Namespace, NamedValue(NamedAlias), TypeHead(PrimitiveHead, ListHead, UnionHead, RecordHead),
-		named_type, named_value, offered_type,
+		Origin(Declared), named_type, named_value, offered_type,
 	option: to_result
 	../parse/assemble: ParsedContents, ParsedModuleRow
 	../utils/source: COMPILER_SOURCE, ModuleId, same_module
@@ -67,6 +68,7 @@ import:
 		Span,
 		TypeSyntax(AtomicType, AppliedType, QualifiedType),
 		WrittenName,
+		Visibility(Private, Public),
 		type_span,
 
 
@@ -88,8 +90,20 @@ fixed record TypeScope {
 	unions: List[UnionRow],
 	namespace: Namespace,
 	module: ModuleId,
+	access: TypeAccess,
 	parameters: List[LocalTypeParameter]
 }
+
+
+fixed union TypeAccess:
+	PrivateTypeUse
+	PublicTypeUse(NameId)
+
+
+pure func type_access(visibility: Visibility, declaration: NameId) -> TypeAccess:
+	match visibility:
+		Private(_): PrivateTypeUse
+		Public: PublicTypeUse(declaration)
 
 
 fixed record LocalTypeParameter {
@@ -206,6 +220,19 @@ private pure func resolve_atomic_head(
 				Err(error): Err(error)
 
 
+-- One unqualified lookup validates access before publishing the head.
+private pure func resolve_head(scope: TypeScope, name: WrittenName, missing: TypeTermError) -> Result[TypeHead, CheckError]:
+	match named_type(scope.namespace, scope.module, name.id):
+		None: Err(type_term_error(name.span, missing))
+		Some(found):
+			match scope.access:
+				PublicTypeUse(declaration):
+					match found.origin:
+						Declared(Private(_)): Err(type_term_error(name.span, PrivateTypeInPublicDeclaration(name.id, declaration)))
+						_: Ok(found.head)
+				PrivateTypeUse: Ok(found.head)
+
+
 private pure func resolve_atomic_type(
 	scope: TypeScope,
 	name: WrittenName,
@@ -214,11 +241,9 @@ private pure func resolve_atomic_type(
 		Some(parameter):
 			Ok(ParameterType(parameter.id))
 		None:
-			match named_type(scope.namespace, scope.module, name.id):
-				Some(head):
-					resolve_atomic_head(scope, head, name)
-				None:
-					Err(type_term_error(name.span, UnknownType(name.id)))
+			match resolve_head(scope, name, UnknownType(name.id)):
+				Ok(head): resolve_atomic_head(scope, head, name)
+				Err(error): Err(error)
 
 
 -- A head applied to written arguments; the head's own arity rules.
@@ -303,11 +328,9 @@ pure func resolve_type(scope: TypeScope, written: TypeSyntax) -> Result[TypeRef,
 		AtomicType(name):
 			resolve_atomic_type(scope, name)
 		AppliedType(name, arguments, span):
-			match named_type(scope.namespace, scope.module, name.id):
-				Some(head):
-					resolve_applied_head(scope, head, name, arguments, span)
-				None:
-					Err(type_term_error(name.span, NonApplicableType(name.id)))
+			match resolve_head(scope, name, NonApplicableType(name.id)):
+				Ok(head): resolve_applied_head(scope, head, name, arguments, span)
+				Err(error): Err(error)
 
 
 private pure func resolve_types(
@@ -415,11 +438,15 @@ private pure func declare_types(
 		None:
 			Ok(checked)
 		Some(declaration):
+			access = match declaration:
+				UnionDeclarationRow(row): type_access(row.visibility, row.type_name.id)
+				RecordDeclarationRow(row): type_access(row.declaration.visibility, row.declaration.type_name.id)
 			scope: TypeScope = {
 				records = inventory_records(parsed.declarations),
 				unions = inventory_unions(parsed.declarations),
 				namespace = namespace,
 				module = declared_module(declaration),
+				access = access,
 				parameters = []
 			}
 

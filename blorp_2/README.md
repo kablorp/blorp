@@ -1182,7 +1182,11 @@ Lexical and layout rules:
   Non-ASCII bytes outside quoted Strings and CRLF source line endings are rejected.
 - A declaration may start with `private` (GUIDE, Visibility): it stays
   visible within its module and is neither selectable by import nor
-  reachable through an alias from another module.
+  reachable through an alias from another module. A public function's parameter
+  or return type, public record field, or public union payload may not mention a
+  private type, including inside nested type arguments. Make the type public or
+  the enclosing declaration private. Private declarations and body-only uses
+  of private types remain valid.
 - `opaque type Name = Underlying` declares an opaque type, and
   `into_opaque Name(value)` / `from_opaque Name(value)` convert one value;
   all three parse, and checking rejects them until the recursive-types
