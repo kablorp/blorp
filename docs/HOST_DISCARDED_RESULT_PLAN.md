@@ -336,7 +336,7 @@ Seed tests with a nonempty origin table and previously minted RHS nodes, then
 include repeated/synthetic RHS locations and nested/shared-location wrappers.
 Those inputs must still produce distinct Void IDs and owner IDs, without
 revisiting or reevaluating the RHS. Keep all other pass state fields intact.
-The existing +100 production / +380 test ceilings and cost caps apply to this
+The existing +100 production / +400 test ceilings and cost caps apply to this
 API/context plumbing; stop for review if it cannot fit them.
 
 ## Ownership authorities and wrappers
@@ -344,7 +344,8 @@ API/context plumbing; stop for review if it cannot fit them.
 `plan_managed_let` and its binding-alias normalization own acquisition. Existing
 call contracts distinguish ReturnOwned, ReturnBorrowed and ReturnAliasOfArg.
 Existing normalizers handle borrowed leaves, local binding transfer, exact Dup
-effects and mixed branches. Existing Let balancing owns the disposal Drop.
+effects and mixed branches. The Drop-wrapper gap below is a separate prerequisite.
+Existing Let balancing owns the disposal Drop.
 Backend Let/Drop emission consumes that explicit policy; no emitter classifier
 or blanket type-based release is changed.
 
@@ -365,6 +366,32 @@ is preserved original owners plus balanced temporary obligations, not a blanket
 ban on release operations. Zero-live-payload and actual-execution requirements
 remain unchanged.
 
+## Separate prerequisite: mixed results inside Drop
+
+Independent review traced a gap in
+`perceus/results_and_loops.normalize_scoped_binding_alias_result`: unlike If,
+Let, BorrowLet and Seq, it does not descend through Drop. For a Drop wrapping
+a mixed borrowed/owned If, it acquires the whole result rather than just the
+borrowed arm. This is source-traced evidence; an executed failing test is still
+required before changing production.
+
+```text
+Drop(other, If(condition, borrowed, owned))
+    => Drop(other, If(condition, acquire(borrowed), owned))
+```
+
+Repair only that existing Perceus normalizer and its owning tests in a separate
+prerequisite slice: at most **+15 net production / +160 net test lines**. Preserve
+the Drop's variable, value type, release policy, result type and location; recurse
+only into its body. Add no classifier, IR form, pass or backend change. Test both
+mixed branch orders, nested Drops with distinct origins, wholly owned source
+identity, and ordinary managed-Let integration with the borrowed source used
+afterward. Use an explicit existing ReturnOwned call contract for the owned arm.
+The cumulative allocation/instruction ceilings below also cover this prerequisite.
+It needs its own failing/passing tests and independent reviews before the discard
+slice depends on it. The discard slice additionally covers Drop-wrapped mixed
+results in both non-final and wildcard positions.
+
 ## Accepted pilot ceilings and pending final plan review
 
 Root accepted these hard replacement ceilings for the internally reviewed
@@ -375,10 +402,11 @@ commit precede implementation; this is no permission to run compiled work.
   evaluation-normalization module. No backend, runtime or C-layout change.
   At most one additional existing production owner if identity plumbing proves
   necessary; no new index/context, pass/module/IR constructor or ownership metadata.
-- At most **+380 net handwritten test lines** across existing evaluation/Core
+- At most **+400 net handwritten test lines** across existing evaluation/Core
   owners and the runtime-memory regression. Preserve all baseline coverage.
   The extra allowance covers scoped wrapper fixtures, getter checks isolated to
-  their emitted function, and CorePassState setup for 27 existing API callers.
+  their emitted function, CorePassState setup for 27 existing API callers, and
+  the three existing emitter assertions whose C shape changes with lexical owners.
   Remove only this task's rejected-candidate C-layout assertions, which no
   longer describe the revised change. Do not compress formatting to meet caps.
 - Matched unchanged-workload source-to-C allocations **<= +0.1%**, retired
