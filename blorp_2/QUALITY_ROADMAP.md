@@ -997,7 +997,11 @@ Each item below was measured but not fixed. Each needs its own reviewed plan.
 
 ## Maintenance items
 
-These come from the bug hunt's third tier and have not been started.
+The original bug-hunt backlog follows. The emitter item is now complete:
+[its report](../benchmarks/results/blorp_2_emitter_diagnostics_2026-10-16.md)
+records the independent reviews, exact diagnostics, unchanged accepted C,
+passing destination gates and matched costs. Keyword and multiline work
+remain separate acceptance slices.
 
 1. **One message for 28 failures.** All 28 calls to the emitter's
    `internal_error()` report "invalid checked union identity", including a

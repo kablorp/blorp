@@ -1,0 +1,209 @@
+import:
+	../../../src/emit/diagnostics:
+		AggregateKind(RecordAggregate, UnionAggregate),
+		EmissionFailure(
+			MissingUnionLayout, MissingRecordLayout, MissingOwnerType, MissingValueType,
+			MissingRuntimeArgument, StatementOnlyValue, MissingAggregateWorkItem,
+			MissingAggregateVisit, CyclicByValueAggregate, MissingAggregateLayout,
+			MissingAggregateMember, MissingUnionPayloadField,
+		),
+		render,
+	../../../src/lower/lower: lowered_functions, value_number
+	../../../src/own/own: owner_id
+	../../../src/specialize/specialize: UnionInstanceId, TypeRef(UnionType), record_number, union_number
+	../../../src/utils/source: COMPILER_SOURCE, module_id, module_source
+	../../../src/utils/syntax: Span, same_span
+	../managed_union_inputs: lowered
+	../ownership_inputs: input_ids, record_ids, span
+	test: TestSuite
+
+
+private pure func reports(failure: EmissionFailure, expected: String, occurrence: Span) -> Bool:
+	diagnostic = render(occurrence, failure)
+	(
+		diagnostic.message == "internal compiler error: " + expected
+		and diagnostic.help == "report this compiler error with the input program"
+		and diagnostic.note.is_none()
+		and same_span(diagnostic.span, occurrence)
+	)
+
+
+private fixed record UnionIds {
+	first: UnionInstanceId,
+	second: UnionInstanceId
+}
+
+
+-- Reuse the ordinary producer; these tests never mint nominal identities.
+private pure func union_ids() -> Option[UnionIds]:
+	source: String =
+		|fixed union First:
+		|	One
+		|fixed union Second:
+		|	Two
+		|pure func first() -> First:
+		|	One
+		|pure func second() -> Second:
+		|	Two
+		|func main() -> Int:
+		|	kept_first = first()
+		|	kept_second = second()
+		|	0
+		|
+	match lowered(source):
+		Err(_): None
+		Ok(program):
+			match lowered_functions(program).functions:
+				[main, _, _]:
+					match main.definitions:
+						[first, second, _]:
+							match (first.value_type, second.value_type):
+								(UnionType(first_id), UnionType(second_id)): Some({ first = first_id, second = second_id })
+								_: None
+						_: None
+				_: None
+
+
+pure func test_identity_seeds_are_complete_before_renderer_assertions() -> Bool:
+	match (input_ids(), record_ids(), union_ids()):
+		(Ok(values), Ok(records), Some(unions)):
+			(
+				value_number(values.first) == 0 and value_number(values.fifth) == 4
+				and record_number(records.record_id) == 0 and record_number(records.other_record) == 1
+				and union_number(unions.first) == 0 and union_number(unions.second) == 1
+			)
+		_: False
+
+
+pure func test_missing_union_layout_reports_its_nominal_identity() -> Bool:
+	match union_ids():
+		None: False
+		Some(ids):
+			(
+				reports(MissingUnionLayout(ids.first), "missing emitted union layout #0", span(10))
+				and reports(MissingUnionLayout(ids.second), "missing emitted union layout #1", span(12))
+			)
+
+
+pure func test_missing_record_layout_reports_its_nominal_identity() -> Bool:
+	match record_ids():
+		Err(_): False
+		Ok(ids):
+			(
+				reports(MissingRecordLayout(ids.record_id), "missing emitted record layout #0", span(14))
+				and reports(MissingRecordLayout(ids.other_record), "missing emitted record layout #1", span(16))
+			)
+
+
+pure func test_missing_owner_type_reports_its_obligation_identity() -> Bool:
+	(
+		reports(MissingOwnerType(owner_id(0)), "missing emitted owner type #0", span(18))
+		and reports(MissingOwnerType(owner_id(4)), "missing emitted owner type #4", span(20))
+	)
+
+
+pure func test_missing_value_type_reports_its_value_identity() -> Bool:
+	match input_ids():
+		Err(_): False
+		Ok(ids):
+			(
+				reports(MissingValueType(ids.first), "missing emitted value type #0", span(22))
+				and reports(MissingValueType(ids.fifth), "missing emitted value type #4", span(24))
+			)
+
+
+pure func test_missing_runtime_argument_distinguishes_result_and_argument() -> Bool:
+	match input_ids():
+		Err(_): False
+		Ok(ids):
+			(
+				reports(MissingRuntimeArgument(ids.second, 0), "missing runtime argument #0 for value #1", span(26))
+				and reports(MissingRuntimeArgument(ids.fifth, 3), "missing runtime argument #3 for value #4", span(28))
+			)
+
+
+pure func test_statement_only_value_reports_its_value_identity() -> Bool:
+	match input_ids():
+		Err(_): False
+		Ok(ids):
+			(
+				reports(StatementOnlyValue(ids.first), "value #0 requires statement emission", span(30))
+				and reports(StatementOnlyValue(ids.fifth), "value #4 requires statement emission", span(32))
+			)
+
+
+pure func test_missing_aggregate_work_item_reports_its_index() -> Bool:
+	(
+		reports(MissingAggregateWorkItem(0), "missing aggregate work item #0", span(34))
+		and reports(MissingAggregateWorkItem(7), "missing aggregate work item #7", span(36))
+	)
+
+
+pure func test_missing_aggregate_visit_distinguishes_record_and_union_indices() -> Bool:
+	(
+		reports(MissingAggregateVisit(RecordAggregate, 2), "missing record aggregate visit #2", span(38))
+		and reports(MissingAggregateVisit(UnionAggregate, 5), "missing union aggregate visit #5", span(40))
+	)
+
+
+pure func test_by_value_cycle_distinguishes_record_and_union_indices() -> Bool:
+	(
+		reports(CyclicByValueAggregate(RecordAggregate, 3), "by-value dependency cycle at record aggregate #3", span(42))
+		and reports(CyclicByValueAggregate(UnionAggregate, 6), "by-value dependency cycle at union aggregate #6", span(44))
+	)
+
+
+pure func test_missing_aggregate_layout_distinguishes_record_and_union_indices() -> Bool:
+	(
+		reports(MissingAggregateLayout(RecordAggregate, 4), "missing record aggregate layout #4", span(46))
+		and reports(MissingAggregateLayout(UnionAggregate, 7), "missing union aggregate layout #7", span(48))
+	)
+
+
+pure func test_missing_aggregate_member_distinguishes_fields_and_variants() -> Bool:
+	(
+		reports(MissingAggregateMember(RecordAggregate, 2, 5), "missing field #5 of record aggregate #2", span(50))
+		and reports(MissingAggregateMember(UnionAggregate, 6, 9), "missing variant #9 of union aggregate #6", span(52))
+	)
+
+
+pure func test_missing_union_payload_field_preserves_all_three_ordinals() -> Bool:
+	(
+		reports(MissingUnionPayloadField(1, 3, 7), "missing field #7 of variant #3 of union aggregate #1", span(54))
+		and reports(MissingUnionPayloadField(2, 4, 8), "missing field #8 of variant #4 of union aggregate #2", span(56))
+	)
+
+
+pure func test_source_occurrence_is_preserved() -> Bool:
+	match module_id(4):
+		None: False
+		Some(module):
+			occurrence: Span = { source = module_source(module), start = 13, end = 29 }
+			reports(MissingAggregateWorkItem(3), "missing aggregate work item #3", occurrence)
+
+
+pure func test_compiler_origin_is_preserved_when_no_occurrence_exists() -> Bool:
+	occurrence: Span = { source = COMPILER_SOURCE, start = 0, end = 0 }
+	reports(MissingAggregateWorkItem(8), "missing aggregate work item #8", occurrence)
+
+
+tests: TestSuite = {
+	description = "Emitter invariant diagnostic facts",
+	tests = [
+		("identity seeds are complete before renderer assertions", test_identity_seeds_are_complete_before_renderer_assertions),
+		("missing union layout names its identity", test_missing_union_layout_reports_its_nominal_identity),
+		("missing record layout names its identity", test_missing_record_layout_reports_its_nominal_identity),
+		("missing owner type names its obligation", test_missing_owner_type_reports_its_obligation_identity),
+		("missing value type names its value", test_missing_value_type_reports_its_value_identity),
+		("runtime argument keeps result and argument distinct", test_missing_runtime_argument_distinguishes_result_and_argument),
+		("statement-only value names its value", test_statement_only_value_reports_its_value_identity),
+		("aggregate work item names its index", test_missing_aggregate_work_item_reports_its_index),
+		("aggregate visit keeps kind and index", test_missing_aggregate_visit_distinguishes_record_and_union_indices),
+		("by-value cycle keeps kind and index", test_by_value_cycle_distinguishes_record_and_union_indices),
+		("aggregate layout keeps kind and index", test_missing_aggregate_layout_distinguishes_record_and_union_indices),
+		("aggregate member keeps field and variant distinct", test_missing_aggregate_member_distinguishes_fields_and_variants),
+		("union payload field keeps all ordinals", test_missing_union_payload_field_preserves_all_three_ordinals),
+		("source occurrence is preserved", test_source_occurrence_is_preserved),
+		("compiler origin is preserved", test_compiler_origin_is_preserved_when_no_occurrence_exists),
+	]
+}

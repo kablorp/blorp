@@ -10,6 +10,14 @@ import:
 			FloatToString,
 		),
 	./float_literal: c_float_literal
+	./diagnostics:
+		AggregateKind(RecordAggregate, UnionAggregate),
+		EmissionFailure(
+			MissingUnionLayout, MissingRecordLayout, MissingOwnerType, MissingValueType,
+			MissingRuntimeArgument, StatementOnlyValue, MissingAggregateWorkItem,
+			MissingAggregateVisit, CyclicByValueAggregate, MissingAggregateLayout,
+			MissingAggregateMember, MissingUnionPayloadField,
+		), render,
 	../runtime/float: float_parse_runtime, float_runtime, float_string_runtime
 	int as IntOps
 	list: join
@@ -19,7 +27,6 @@ import:
 		list_key_rank, list_root_allocation, list_runtime, list_slot_store, list_suffix,
 		list_update_name, list_update_runtime, same_list_key
 	../lower/lower: MatchLabel(VariantLabel, DefaultLabel), ValueId, value_number
-	option: to_result
 	../own/own as Own:
 		OwnedArgument(UnmanagedArgument, BorrowedArgument),
 		OwnedArm,
@@ -78,7 +85,7 @@ import:
 	../verify/verify: VerifiedProgram, verified_contents
 
 
--- Checked-reference errors have no source occurrence; this marks that origin.
+-- Type and layout products have no source occurrence; this marks that origin.
 private INTERNAL_SPAN: Span = {
 	source = COMPILER_SOURCE,
 	start = 0,
@@ -88,15 +95,6 @@ private INTERNAL_SPAN: Span = {
 
 private pure func c_parameter(index: Int) -> String:
 	"blorp_p_".append_int(index)
-
-
-private pure func internal_error() -> Diagnostic:
-	{
-		span = INTERNAL_SPAN,
-		note = None,
-		message = "internal compiler error: invalid checked union identity",
-		help = "report this compiler error with the input program"
-	}
 
 
 private pure func c_name(index: Int) -> String:
@@ -244,15 +242,16 @@ private pure func c_local_declaration(
 	value_type: TypeRef,
 	assignment: LocalAssignment,
 	unions: List[ConcreteUnion],
+	span: Span,
 ) -> Result[String, Diagnostic]:
-	type_name ?= c_type(value_type, unions)
+	type_name ?= c_type(value_type, unions, span)
 	pointer_carrier ?= match value_type:
 		StringType | ListType(_):
 			Ok(True)
 		UnionType(id):
 			match unions.get(union_number(id)):
 				None:
-					Err(internal_error())
+					Err(render(span, MissingUnionLayout(id)))
 				Some(layout):
 					Ok(
 						match layout.representation:
@@ -305,7 +304,7 @@ private pure func append_record(
 	var invalid: Option[Diagnostic] = None
 
 	for field in layout.fields:
-		match c_type(field, unions):
+		match c_type(field, unions, INTERNAL_SPAN):
 			Ok(name):
 				result = result
 					.concat(name)
@@ -330,6 +329,7 @@ private pure func append_record(
 private pure func c_type(
 	type_ref: TypeRef,
 	unions: List[ConcreteUnion],
+	span: Span,
 ) -> Result[String, Diagnostic]:
 	match type_ref:
 		RecordType(id):
@@ -347,7 +347,7 @@ private pure func c_type(
 		UnionType(id):
 			match unions.get(union_number(id)):
 				Some(declaration): Ok(union_c_type(id, declaration))
-				None: Err(internal_error())
+				None: Err(render(span, MissingUnionLayout(id)))
 
 
 private pure func c_variant(id: VariantInstanceId) -> String:
@@ -369,7 +369,7 @@ private pure func c_parameters(
 		var invalid: Option[Diagnostic] = None
 
 		for parameter in parameters:
-			match c_type(parameter, unions):
+			match c_type(parameter, unions, INTERNAL_SPAN):
 				Err(error):
 					invalid = Some(error)
 					break
@@ -459,7 +459,7 @@ private pure func append_union(
 				result = result.concat("struct{")
 				var field_position = 0
 				for value_type in fields:
-					match c_type(value_type, unions):
+					match c_type(value_type, unions, INTERNAL_SPAN):
 						Err(error):
 							failure = Some(error)
 							break
@@ -583,7 +583,7 @@ private pure func append_aggregate_definitions(
 
 		match pending.get(pending_count):
 			None:
-				invalid = Some(internal_error())
+				invalid = Some(render(INTERNAL_SPAN, MissingAggregateWorkItem(pending_count)))
 			Some(step):
 				match step:
 					PrepareAggregate(definition):
@@ -595,11 +595,17 @@ private pure func append_aggregate_definitions(
 
 						match status:
 							None:
-								invalid = Some(internal_error())
+								missing = match definition:
+									RecordDefinition(index): MissingAggregateVisit(RecordAggregate, index)
+									UnionDefinition(index): MissingAggregateVisit(UnionAggregate, index)
+								invalid = Some(render(INTERNAL_SPAN, missing))
 							Some(EmittedAggregate):
 								void
 							Some(VisitingAggregate):
-								invalid = Some(internal_error())
+								cycle = match definition:
+									RecordDefinition(index): CyclicByValueAggregate(RecordAggregate, index)
+									UnionDefinition(index): CyclicByValueAggregate(UnionAggregate, index)
+								invalid = Some(render(INTERNAL_SPAN, cycle))
 							Some(UnvisitedAggregate):
 								pending = push_aggregate_visit(
 									pending,
@@ -614,7 +620,7 @@ private pure func append_aggregate_definitions(
 
 										match records.get(index):
 											None:
-												invalid = Some(internal_error())
+												invalid = Some(render(INTERNAL_SPAN, MissingAggregateLayout(RecordAggregate, index)))
 											Some(layout):
 												var child = layout.fields.length()
 
@@ -630,14 +636,14 @@ private pure func append_aggregate_definitions(
 																None:
 																	void
 														None:
-															invalid = Some(internal_error())
+															invalid = Some(render(INTERNAL_SPAN, MissingAggregateMember(RecordAggregate, index, child)))
 															break
 									UnionDefinition(index):
 										union_visits = union_visits.set(index, VisitingAggregate)
 
 										match unions.get(index):
 											None:
-												invalid = Some(internal_error())
+												invalid = Some(render(INTERNAL_SPAN, MissingAggregateLayout(UnionAggregate, index)))
 											Some(layout):
 												var child = layout.variants.length()
 
@@ -658,17 +664,17 @@ private pure func append_aggregate_definitions(
 																			None:
 																				void
 																	None:
-																		invalid = Some(internal_error())
+																		invalid = Some(render(INTERNAL_SPAN, MissingUnionPayloadField(index, child, field_position)))
 																		break
 														None:
-															invalid = Some(internal_error())
+															invalid = Some(render(INTERNAL_SPAN, MissingAggregateMember(UnionAggregate, index, child)))
 															break
 					EmitAggregate(definition):
 						match definition:
 							RecordDefinition(index):
 								match records.get(index):
 									None:
-										invalid = Some(internal_error())
+										invalid = Some(render(INTERNAL_SPAN, MissingAggregateLayout(RecordAggregate, index)))
 									Some(layout):
 										match append_record("", layout, index, unions):
 											Ok(record_definition):
@@ -682,7 +688,7 @@ private pure func append_aggregate_definitions(
 							UnionDefinition(index):
 								match unions.get(index):
 									None:
-										invalid = Some(internal_error())
+										invalid = Some(render(INTERNAL_SPAN, MissingAggregateLayout(UnionAggregate, index)))
 									Some(layout):
 										match append_union("", layout, index, unions):
 											Ok(union_definition):
@@ -766,6 +772,7 @@ private pure func append_record_ownership(
 							.concat("_")
 							.append_int(position),
 						unions,
+						INTERNAL_SPAN,
 					)
 				):
 					Ok(updated):
@@ -818,6 +825,7 @@ private pure func append_operation(
 	operation: OwnedValueOperation,
 	unions: List[ConcreteUnion],
 	records: List[ConcreteRecord],
+	span: Span,
 ) -> Result[String, Diagnostic]:
 	match operation:
 		ConstructRecordDefinition(owner, fields):
@@ -857,7 +865,7 @@ private pure func append_operation(
 						position = IntOps.add(position, 1)
 
 					Ok(result.concat("})"))
-				None: Err(internal_error())
+				None: Err(render(span, MissingRecordLayout(owner)))
 		ReadRecordFieldDefinition(field, argument):
 			match records.get(record_number(field_owner(field))):
 				Some(layout):
@@ -880,7 +888,7 @@ private pure func append_operation(
 							.concat(selector)
 							.concat(c_field(field)),
 					)
-				None: Err(internal_error())
+				None: Err(render(span, MissingRecordLayout(field_owner(field))))
 		ParameterDefinition(index):
 			Ok(output.concat(c_parameter(index)))
 		VoidDefinition:
@@ -925,13 +933,13 @@ private pure func append_operation(
 					UnmanagedPayload(value): c_value(value)
 					OwnedPayload(_, owner): c_owner(owner)
 				operands = operands.append(operand)
-			match c_union_value(variant_id, operands, unions):
+			match c_union_value(variant_id, operands, unions, span):
 				Ok(value): Ok(output.concat(value))
 				Err(error): Err(error)
 		ConstructListDefinition(_) | JoinDefinition(_):
 			-- List construction and joins are written as statements, by
 			-- append_list_construction and append_join; never as expressions.
-			Err(internal_error())
+			Err(render(span, StatementOnlyValue(id)))
 		PayloadDefinition(field, source_id):
 			match unions.get(union_number(variant_owner(variant_field_variant(field)))):
 				Some(declaration):
@@ -945,7 +953,7 @@ private pure func append_operation(
 								variant_field_number(field),
 							)),
 					)
-				None: Err(internal_error())
+				None: Err(render(span, MissingUnionLayout(variant_owner(variant_field_variant(field)))))
 
 
 -- The one C rendering of a union value, for source constructions and runtime
@@ -957,11 +965,12 @@ private pure func c_union_value(
 	variant: VariantInstanceId,
 	operands: List[String],
 	unions: List[ConcreteUnion],
+	span: Span,
 ) -> Result[String, Diagnostic]:
 	index = union_number(variant_owner(variant))
-	declaration ?= unions
-		.get(index)
-		.to_result(internal_error())
+	declaration ?= match unions.get(index):
+		Some(found): Ok(found)
+		None: Err(render(span, MissingUnionLayout(variant_owner(variant))))
 
 	if has_payload(declaration):
 		opening = match declaration.representation:
@@ -1018,10 +1027,11 @@ private pure func append_optional_value(
 	condition: String,
 	payload: String,
 	unions: List[ConcreteUnion],
+	span: Span,
 ) -> Result[String, Diagnostic]:
-	declaration ?= c_local_declaration(UnionType(variant_owner(option.some)), InitializedLocal, unions)
-	some ?= c_union_value(option.some, [payload], unions)
-	none ?= c_union_value(option.none, [], unions)
+	declaration ?= c_local_declaration(UnionType(variant_owner(option.some)), InitializedLocal, unions, span)
+	some ?= c_union_value(option.some, [payload], unions, span)
+	none ?= c_union_value(option.none, [], unions, span)
 	name = c_value(id)
 	Ok(
 		output
@@ -1047,10 +1057,11 @@ private pure func append_parse_number(
 	unions: List[ConcreteUnion],
 	scalar_type: String,
 	runtime: String,
+	span: Span,
 ) -> Result[String, Diagnostic]:
-	argument ?= arguments
-		.get(0)
-		.to_result(internal_error())
+	argument ?= match arguments.get(0):
+		Some(found): Ok(found)
+		None: Err(render(span, MissingRuntimeArgument(id, 0)))
 	scratch = "blorp_runtime_".append_int(value_number(id))
 	prefix = output
 		.concat(scalar_type)
@@ -1072,6 +1083,7 @@ private pure func append_parse_number(
 		scratch.concat("_some"),
 		scratch,
 		unions,
+		span,
 	)
 
 
@@ -1082,15 +1094,16 @@ private pure func append_list_get(
 	element: TypeRef,
 	arguments: List[OwnedArgument],
 	unions: List[ConcreteUnion],
+	span: Span,
 ) -> Result[String, Diagnostic]:
-	values ?= arguments
-		.get(0)
-		.to_result(internal_error())
-	index ?= arguments
-		.get(1)
-		.to_result(internal_error())
+	values ?= match arguments.get(0):
+		Some(found): Ok(found)
+		None: Err(render(span, MissingRuntimeArgument(id, 0)))
+	index ?= match arguments.get(1):
+		Some(found): Ok(found)
+		None: Err(render(span, MissingRuntimeArgument(id, 1)))
 	scratch = "blorp_runtime_".append_int(value_number(id))
-	element_type ?= c_type(element, unions)
+	element_type ?= c_type(element, unions, span)
 	prefix = output
 		.concat(element_type).concat(" ").concat(scratch).concat("={0};const uint8_t ")
 		.concat(scratch).concat("_some=blorp_list_get_")
@@ -1104,6 +1117,7 @@ private pure func append_list_get(
 		scratch.concat("_some"),
 		scratch,
 		unions,
+		span,
 	)
 
 
@@ -1114,6 +1128,7 @@ private pure func append_value(
 	operation: OwnedValueOperation,
 	unions: List[ConcreteUnion],
 	records: List[ConcreteRecord],
+	span: Span,
 ) -> Result[String, Diagnostic]:
 	match operation:
 		CallDefinition(call, arguments):
@@ -1127,6 +1142,7 @@ private pure func append_value(
 						unions,
 						"int64_t",
 						"blorp_string_parse_int",
+						span,
 					)
 				RuntimeFunction(StringParseFloat(option)):
 					append_parse_number(
@@ -1137,19 +1153,20 @@ private pure func append_value(
 						unions,
 						"double",
 						"blorp_string_parse_float",
+						span,
 					)
 				RuntimeFunction(ListGet(element, option)):
-					append_list_get(output, id, option, element, arguments, unions)
+					append_list_get(output, id, option, element, arguments, unions, span)
 				RuntimeFunction(StringEquals(boolean)):
-					append_equals(output, id, boolean, arguments, unions, StringComparison)
+					append_equals(output, id, boolean, arguments, unions, StringComparison, span)
 				RuntimeFunction(IntEquals(boolean)):
-					append_equals(output, id, boolean, arguments, unions, IntegerComparison)
+					append_equals(output, id, boolean, arguments, unions, IntegerComparison, span)
 				_:
-					append_regular_value(output, id, value_type, operation, unions, records)
+					append_regular_value(output, id, value_type, operation, unions, records, span)
 		ConstructListDefinition(payloads):
-			append_list_construction(output, id, value_type, payloads, unions)
+			append_list_construction(output, id, value_type, payloads, unions, span)
 		_:
-			append_regular_value(output, id, value_type, operation, unions, records)
+			append_regular_value(output, id, value_type, operation, unions, records, span)
 
 
 -- A literal is one fresh root of exactly n slots, written inline at its site
@@ -1161,8 +1178,9 @@ private pure func append_list_construction(
 	value_type: TypeRef,
 	payloads: List[StoredPayload],
 	unions: List[ConcreteUnion],
+	span: Span,
 ) -> Result[String, Diagnostic]:
-	type_name ?= c_type(value_type, unions)
+	type_name ?= c_type(value_type, unions, span)
 	name = c_value(id)
 	var result = output.concat(list_root_allocation(
 		type_name.concat(" const"), name, "".append_int(payloads.length()),
@@ -1189,16 +1207,17 @@ private pure func append_equals(
 	arguments: List[OwnedArgument],
 	unions: List[ConcreteUnion],
 	comparison: EqualityComparison,
+	span: Span,
 ) -> Result[String, Diagnostic]:
-	left ?= arguments
-		.get(0)
-		.to_result(internal_error())
-	right ?= arguments
-		.get(1)
-		.to_result(internal_error())
-	declaration ?= c_local_declaration(UnionType(variant_owner(boolean.true_variant)), InitializedLocal, unions)
-	equal ?= c_union_value(boolean.true_variant, [], unions)
-	different ?= c_union_value(boolean.false_variant, [], unions)
+	left ?= match arguments.get(0):
+		Some(found): Ok(found)
+		None: Err(render(span, MissingRuntimeArgument(id, 0)))
+	right ?= match arguments.get(1):
+		Some(found): Ok(found)
+		None: Err(render(span, MissingRuntimeArgument(id, 1)))
+	declaration ?= c_local_declaration(UnionType(variant_owner(boolean.true_variant)), InitializedLocal, unions, span)
+	equal ?= c_union_value(boolean.true_variant, [], unions, span)
+	different ?= c_union_value(boolean.false_variant, [], unions, span)
 	name = c_value(id)
 	left_value = c_value(argument_value(left))
 	right_value = c_value(argument_value(right))
@@ -1240,8 +1259,9 @@ private pure func append_regular_value(
 	operation: OwnedValueOperation,
 	unions: List[ConcreteUnion],
 	records: List[ConcreteRecord],
+	span: Span,
 ) -> Result[String, Diagnostic]:
-	declaration ?= c_local_declaration(value_type, InitializedLocal, unions)
+	declaration ?= c_local_declaration(value_type, InitializedLocal, unions, span)
 	name = c_value(id)
 
 	prepared = match operation:
@@ -1259,6 +1279,7 @@ private pure func append_regular_value(
 		operation,
 		unions,
 		records,
+		span,
 	)
 	Ok(
 		value
@@ -1274,9 +1295,10 @@ private pure func append_owner_alias(
 	value: ValueId,
 	value_type: TypeRef,
 	unions: List[ConcreteUnion],
+	span: Span,
 ) -> Result[String, Diagnostic]:
 	name = c_owner(owner)
-	declaration ?= c_local_declaration(value_type, InitializedLocal, unions)
+	declaration ?= c_local_declaration(value_type, InitializedLocal, unions, span)
 
 	Ok(
 		output
@@ -1303,13 +1325,14 @@ private pure func append_owned_definition(
 		definition.operation,
 		unions,
 		records,
+		definition.span,
 	)
 
 	match definition.result:
 		UnmanagedResult | BorrowedResult(_):
 			Ok(value)
 		OwnedResult(owner):
-			append_owner_alias(value, owner, definition.id, definition.value_type, unions)
+			append_owner_alias(value, owner, definition.id, definition.value_type, unions, definition.span)
 
 
 -- Disposable owner-type projection of accepted IR; value types stay local.
@@ -1330,12 +1353,12 @@ private pure func owner_types(function: OwnedFunction) -> Result[List[TypeRef], 
 							owners = owners.append(definition.value_type)
 						_:
 							void
-				AcquireOwner(_, borrowed, _):
+				AcquireOwner(_, borrowed, span):
 					match values.get(value_number(borrowed.value)):
 						Some(value_type):
 							owners = owners.append(value_type)
 						None:
-							failure = Some(internal_error())
+							failure = Some(render(span, MissingValueType(borrowed.value)))
 							break
 				DropOwner(_, _):
 					void
@@ -1361,6 +1384,7 @@ private pure func append_storage_operation(
 	action: OwnershipAction,
 	expression: String,
 	unions: List[ConcreteUnion],
+	span: Span,
 ) -> Result[String, Diagnostic]:
 	name_result: Result[Option[String], Diagnostic] = match value_type:
 		RecordType(id):
@@ -1402,7 +1426,7 @@ private pure func append_storage_operation(
 
 								Some(prefix.append_int(union_number(id)))
 					)
-				None: Err(internal_error())
+				None: Err(render(span, MissingUnionLayout(id)))
 		_:
 			Ok(None)
 
@@ -1455,7 +1479,7 @@ private pure func append_union_action(
 				.append_int(position)
 				.concat(".blorp_uf_")
 				.append_int(field_position)
-			match append_storage_operation(result, value_type, action, path, unions):
+			match append_storage_operation(result, value_type, action, path, unions, INTERNAL_SPAN):
 				Ok(updated): result = updated
 				Err(error):
 					failure = Some(error)
@@ -1566,7 +1590,7 @@ private pure func append_boxed_union_release(
 			if self_child:
 				result = result.concat("child=").concat(path).concat(";")
 			else:
-				match append_storage_operation(result, value_type, DestroyValue, path, unions):
+				match append_storage_operation(result, value_type, DestroyValue, path, unions, INTERNAL_SPAN):
 					Ok(updated): result = updated
 					Err(error):
 						failure = Some(error)
@@ -1616,7 +1640,7 @@ private pure func append_ownership_operation(
 					append_join(output, definition, matched_join, unions, types, records)
 				_:
 					append_owned_definition(output, definition, unions, records)
-		AcquireOwner(owner, borrowed, _):
+		AcquireOwner(owner, borrowed, span):
 			match types.get(owner_number(owner)):
 				Some(value_type):
 					match append_storage_operation(
@@ -1625,14 +1649,15 @@ private pure func append_ownership_operation(
 						DuplicateValue,
 						c_value(borrowed.value),
 						unions,
+						span,
 					):
-						Ok(retained): append_owner_alias(retained, owner, borrowed.value, value_type, unions)
+						Ok(retained): append_owner_alias(retained, owner, borrowed.value, value_type, unions, span)
 						Err(error): Err(error)
-				None: Err(internal_error())
-		DropOwner(owner, _):
+				None: Err(render(span, MissingOwnerType(owner)))
+		DropOwner(owner, span):
 			match types.get(owner_number(owner)):
-				Some(value_type): append_storage_operation(output, value_type, DestroyValue, c_owner(owner), unions)
-				None: Err(internal_error())
+				Some(value_type): append_storage_operation(output, value_type, DestroyValue, c_owner(owner), unions, span)
+				None: Err(render(span, MissingOwnerType(owner)))
 
 
 private pure func append_ownership_operations(
@@ -1666,10 +1691,11 @@ private pure func append_switch(
 	scrutinee: OwnedArgument,
 	owner: UnionInstanceId,
 	unions: List[ConcreteUnion],
+	span: Span,
 ) -> Result[String, Diagnostic]:
-	declaration ?= unions
-		.get(union_number(owner))
-		.to_result(internal_error())
+	declaration ?= match unions.get(union_number(owner)):
+		Some(found): Ok(found)
+		None: Err(render(span, MissingUnionLayout(owner)))
 	opening = output.concat("switch(").concat(c_value(argument_value(scrutinee)))
 
 	if has_payload(declaration):
@@ -1753,7 +1779,7 @@ private pure func append_match(
 	types: List[TypeRef],
 	records: List[ConcreteRecord],
 ) -> Result[String, Diagnostic]:
-	opening ?= append_switch("", matched.scrutinee, matched.owner, unions)
+	opening ?= append_switch("", matched.scrutinee, matched.owner, unions, INTERNAL_SPAN)
 	var cases: List[SwitchCase] = []
 	for arm in matched.arms:
 		cases = cases.append({ label = arm.label, operations = arm.operations, ending = append_exit("", arm.exit) })
@@ -1772,8 +1798,8 @@ private pure func append_join(
 	records: List[ConcreteRecord],
 ) -> Result[String, Diagnostic]:
 	name = c_value(definition.id)
-	declaration ?= c_local_declaration(definition.value_type, JoinLocal, unions)
-	opening ?= append_switch(output.concat(declaration).concat(name).concat(";"), matched_join.scrutinee, matched_join.owner, unions)
+	declaration ?= c_local_declaration(definition.value_type, JoinLocal, unions, definition.span)
+	opening ?= append_switch(output.concat(declaration).concat(name).concat(";"), matched_join.scrutinee, matched_join.owner, unions, definition.span)
 	var cases: List[SwitchCase] = []
 	for arm in matched_join.arms:
 		moved = match arm.transfer:
@@ -1788,7 +1814,7 @@ private pure func append_join(
 		UnmanagedResult | BorrowedResult(_):
 			Ok(joined)
 		OwnedResult(owner):
-			append_owner_alias(joined, owner, definition.id, definition.value_type, unions)
+			append_owner_alias(joined, owner, definition.id, definition.value_type, unions, definition.span)
 
 
 private pure func append_signature(
@@ -1797,7 +1823,7 @@ private pure func append_signature(
 	index: Int,
 	unions: List[ConcreteUnion],
 ) -> Result[String, Diagnostic]:
-	type_name ?= c_type(function.signature.return_type, unions)
+	type_name ?= c_type(function.signature.return_type, unions, INTERNAL_SPAN)
 	parameters ?= c_parameters(function.signature.parameters, unions)
 	Ok(
 		output
@@ -2185,18 +2211,18 @@ private pure func element_fragments(
 			destroy = "blorp_list_drop_".concat(suffix).concat("(element);"),
 		})
 	else:
-		match c_type(layout.element, unions):
+		match c_type(layout.element, unions, INTERNAL_SPAN):
 			Ok(type_name):
 				match value_ownership(layout.element, unions, records):
 					Ok(ownership):
 						acquire_result: Result[String, Diagnostic] = match ownership:
 							NoOwnership: Ok("")
-							_: append_storage_operation("", layout.element, DuplicateValue, "element", unions)
+							_: append_storage_operation("", layout.element, DuplicateValue, "element", unions, INTERNAL_SPAN)
 						match acquire_result:
 							Ok(acquire):
 								destroy_result: Result[String, Diagnostic] = match ownership:
 									NoOwnership: Ok("")
-									_: append_storage_operation("", layout.element, DestroyValue, "element", unions)
+									_: append_storage_operation("", layout.element, DestroyValue, "element", unions, INTERNAL_SPAN)
 								match destroy_result:
 									Ok(destroy): Ok({ type_name = type_name, acquire = acquire, destroy = destroy })
 									Err(error): Err(error)

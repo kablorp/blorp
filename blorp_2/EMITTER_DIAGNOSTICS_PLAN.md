@@ -1,5 +1,13 @@
 # Diagnose emitter invariants at their actual boundary
 
+**Implementation checkpoint.** The integrated rule is +85 production lines.
+Renderer/owning suites, current mutations, complete C/diagnostic identity,
+strict leaks and all cost ceilings pass. The actual-main full gate passes
+2,814 component and 445 e2e checks; the dynamic frontier is 34/36, with the
+same Char/function-type gaps. [Emitter evidence](../benchmarks/results/blorp_2_emitter_diagnostics_2026-10-16.md)
+records exact boundaries and the host-build proxy cost. The original design
+context follows.
+
 ## Problem
 
 The current emitter at c3b7e4294 has one private `internal_error()`
