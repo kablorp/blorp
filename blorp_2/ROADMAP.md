@@ -348,8 +348,8 @@ and `for` consumers arrive with M2.2, M2.3 and M3.
 ## M5: constants
 
 **Bootstrap goal.** Use the accepted literal Int/Float/String constant path.
-The current 99-global inventory has 71 such declarations; the other 27 records
-and one opaque marker become named construction functions under the source plan.
+The baseline 99-global inventory had 71 such declarations; the other 27 records
+and one opaque marker are now named construction functions under the source plan.
 This explicit bootstrap compromise removes initializer references, graph-cycle
 validation and opaque constant initialization from the prerequisite set.
 
@@ -375,6 +375,10 @@ The [admission report](../benchmarks/results/blorp_2_record_field_admission_2026
 records its 42 added / +7 net production lines. Closed records, initializer
 references/cycles and opaque constant forms are deferred language features.
 No M5a.2 production implementation had begun when this scope changed.
+The [construction migration](../benchmarks/results/blorp_2_construction_values_2026-10-16.md)
+now replaces all 28 aggregate/opaque globals in compiler source. Fresh host Core
+retains only 71 literal globals; shared fixture behavior and diagnostics match,
+and all 452 e2e cases pass. Ordinary opaque semantics remain a separate M4 task.
 
 ## M2: the join
 

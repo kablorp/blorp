@@ -7,7 +7,10 @@ owns the required host/target library interfaces. These are separate questions:
 removing a source dependency does not remove an already supported input feature.
 
 The planning baseline is `78bc406d6646eb7a1b61700b71d1faa9e9eaca09`.
-Quality-roadmap work is complete. No source migration below is complete yet.
+Quality-roadmap work is complete. The 28 construction-function migrations are
+complete; [their acceptance report](../benchmarks/results/blorp_2_construction_values_2026-10-16.md)
+records the preserved behavior, identities and bounded costs. Other source
+migrations below remain pending.
 The record/reference-constant implementation stopped after its first failing
 test, before production edits. Other reviewed candidates and their evidence
 remain preserved; their existence does not make them bootstrap prerequisites.
@@ -86,6 +89,11 @@ It is an inspection artifact, not a source acceptance run or a cost measurement.
 These counts replace the historical estimates for planning; they do not establish
 whole-source acceptance or the next parse frontier. Every migrated category gets
 a fresh resolved inventory before its bootstrap dependency is removed.
+
+After the construction migration, fresh host Core contains only the 71 literal
+globals (40 Int and 31 String). All 452 e2e cases pass; the source-tree frontier
+remains 36/38 at the existing Char/function-type stops. This discharges the
+record/opaque **constant** dependency, not ordinary opaque type support.
 
 ## Retained recursive types
 
