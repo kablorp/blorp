@@ -124,6 +124,11 @@ cannot expose a private type, using the accepted TypeScope access check.
    order. Prove that preparation semantics-preserving with paired written-order
    and error-priority tests before using it for constants. Do not
    construct a fake Caller.FunctionId or add another record field solver.
+   M5a.2 passes complete checked records explicitly to validate_constants;
+   initializer helpers receive headers, module and namespace without a Caller.
+   Finish every initializer's form/type checking before dependency validation.
+   Within each record, names/coverage precede children; retain the first ordinary
+   field mismatch while checking remaining children, whose errors take priority.
 4. **Checked publication:** one dense CheckedConstant table owns the accepted
    annotation and closed term; bodies contain CheckedForm.ReadConstant(ConstantId)
    with their own TypeRef and use span, like other checked expressions. A closed
@@ -131,6 +136,30 @@ cannot expose a private type, using the accepted TypeScope access check.
    ConstantId references; it cannot store calls or bindings. References are resolved
    once and carry their source occurrence for errors. Temporary header/type builder
    state is discarded when the complete table freezes. No optional accepted rows.
+   The M5a.2 forms and typed child row are:
+
+   ```blorp
+   fixed union ClosedConstant:
+       IntegerConstant(Int)
+       FloatConstant(Float)
+       StringConstant(String)
+       RecordConstant(RecordId, List[ClosedRecordField])
+       ReferenceConstant(ConstantId, Span)
+
+   fixed record ClosedRecordField {
+       field: FieldId,
+       value_type: TypeRef,
+       value: ClosedConstant
+   }
+   ```
+
+   CheckedConstant.value_type owns the root's accepted TypeRef; each child row
+   owns its accepted TypeRef. AppliedRecordType therefore retains every ordered
+   argument without a second arguments table. Assembly issues RecordId;
+   declaration checking accepts fields. RecordConstant retains the accepted
+   annotation's nominal RecordId; child FieldIds pass from CheckedRecord through
+   shared admission. ReferenceConstant retains its full written read span, including
+   grouping/qualification. Consumers do not recover these facts from syntax.
 5. **Dependency validation:** a local dense visit builder and explicit DFS frames
    validate ConstantId edges once, with stable source-order roots/children. Edges
    come from the closed reference terms; they are not reconstructed from text.
@@ -145,6 +174,10 @@ cannot expose a private type, using the accepted TypeScope access check.
    each use. There is no concrete constant identity/table or new lower value form.
    This is a deliberate roadmap delta from the unimplemented ConstantReference
    and placeholder identity `evaluate` phase; both would add indirection here.
+   Narrow private record_instance's CheckedExpr parameter to accepted TypeRef
+   and span, adapting its two ordinary construct/update callers. The constant
+   projector shares that lookup without a fake CheckedExpr, field retyping or
+   another layout collector; root-TypeRef preparation still reaches nested fields.
 7. **Ownership/verify/emit:** unchanged semantic forms. Existing literal and managed
    record ownership inserts dup/drop, independent verification checks it, and C
    emission projects it. Each String/managed record use has ordinary scoped lifetime.
@@ -185,6 +218,16 @@ Do not infer a constant from uppercase spelling. Tests distinguish equal NameIds
 in different modules from declaration ConstantIds, and same spelling with unrelated
 module ownership. `private` and shadowing tests use the accepted quality contracts.
 
+Wrong-reference tests pin actual.span to the full reference occurrence, including
+parentheses/qualification. ExpressionTypeMismatch keeps the receiving constant's
+expected annotation and SourceAnnotation span; its rendered note is None.
+RecordFieldTypeMismatch keeps the substituted expected type at the receiving
+field's original type-annotation span and renders RecordFieldDeclaration there.
+Missing-field notes instead use
+the receiving field NAME. Neither uses the referenced constant's declaration or
+an inferred literal span. Cycle errors retain the closing-read primary and
+reached declaration-NAME note specified above; these are different authorities.
+
 ## Bounded delivery and numerical acceptance
 
 Two full-path feature slices, each red→green and independently reviewed before
@@ -222,8 +265,14 @@ callbacks, five sensitive faults and 3,624 matched cost calls pass. Actual-main
 acceptance passes 2,902 component checks, 452 e2e cases and the unchanged 36/38
 frontier. The [admission report](../benchmarks/results/blorp_2_record_field_admission_2026-10-16.md)
 records these bounded results. Combined M5a now uses 393 added / +266 net,
-leaving 357 added / +334 net for records/references. That feature's estimate is
-still unverified; stop rather than compress code to fit.
+leaving 357 added / +334 net for records/references. The provisional feature
+estimate is 342 added / 54 deleted / +288 net, giving combined totals of
+735 added / +554 net and only 15 added lines of slack. This is not a guarantee.
+After closed checking, model and DFS, count physical additions against their
+232-line provisional subtotal and the 342-line overall estimate. Re-estimate
+clean projection/error completion against the remaining 357 added / +334 net;
+stop for root/expert rescoping if it cannot fit. This adds no per-owner hard cap;
+never reformat, compress or drop coverage to meet the unchanged combined limits.
 
 Freeze the host, base/candidate inputs and binaries before any measurements.
 On every unchanged accepted/rejected input, normal minimum-of-three serial
@@ -252,6 +301,16 @@ closed terms/types, graph cycles/forward imports, expression reads, specializati
 layout identity/spans, lower fresh ValueIds and owner obligations, independent
 malformed-IR negatives, and emission fragments. Check exact error kind, full Span
 including SourceId, message/help and note. No integration-only proof of phase facts.
+M5a.2 needs at least 26 embedded phase programs covering closed records, forward
+and imported references, identities, priorities, cycles and repeated managed uses.
+Use test_constant_records and test_constant_dependencies for the first checker
+red/green, then the existing downstream phase owners. Migrate the same-byte
+record/reference placeholder programs in test_constant_errors and the final
+record-rejection callback in test_record_admission into accepted typed-row tests.
+Retain call/list/postfix rejection coverage with the M5a.2 help above;
+test_constants' existing native nonclosed-call input/location/message/no-C checks
+stay, with only that help change. Enumerate other intentional acceptance/name-error
+changes before corpus comparison rather than silently shrinking its oracle set.
 
 E2e cases run real main, unchanged C, -O0/ASan/UBSan: Int/Float exact outcomes,
 String bytes including Unicode/multiline, scalar and managed records, imported and
