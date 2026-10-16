@@ -85,7 +85,10 @@ noted in the decision log.
 
 ## Status at a glance
 
-Main is `bd8b39775`. Line deltas are production lines in `blorp_2/src`.
+The handoff's implementation baseline is `bd8b39775`; roadmap publication
+`05ac9c9ce` changes documentation only. The table records that handoff, rather
+than a live `main` tip. Line deltas are production lines in `blorp_2/src`.
+The namespace completion checkpoint is recorded below.
 
 | Item | State | Branch / SHA | Next step | Lines |
 | --- | --- | --- | --- | --- |
@@ -265,9 +268,11 @@ because the prelude puts them in every user module's scope.
 
 ### The stack
 
-All six commits are on local branch `blorp2/namespace-scopes`, worktree
-`/Users/keithphilpott/CLionProjects/blorp2-namespace-scopes`, based on
-`bd8b39775`. Each passes `make -C blorp_2 test`: 2,701 to 2,746 unit, runtime and
+All six commits are on local branch `blorp2/namespace-scopes`, based on
+`bd8b39775`. The old worktree
+`/Users/keithphilpott/CLionProjects/blorp2-namespace-scopes` is detached at
+`c05f34418`, with unfinished work preserved; it is not the stack tip.
+The handoff recorded each commit passing `make -C blorp_2 test`: 2,701 to 2,746 unit, runtime and
 grammar tests, 427 to 428 e2e cases, frontier 32/34, and zero leaks under
 `BLORP_LEAK_CHECK=strict` on all 426 fixtures.
 
@@ -307,11 +312,14 @@ Measured on prototypes and confirmed by two reviewers:
 
 ### Namespace open items
 
-These are the last batch from the three verification reviews. Every commit is
-already approved; these are should-fixes, and none is a redesign. The worktree
-holds an uncommitted, partial start on item 3, in `assemble.brp` and
-`test_assemble.brp`. Inspect it before continuing, or discard it with
-`git restore`.
+The numbered list records the last batch from the three verification reviews.
+Their implementation and current acceptance state are recorded in the
+[completion checkpoint](#namespace-completion-checkpoint). Every commit is
+already approved; these are should-fixes, and none is a redesign. The handoff
+recorded a partial start on item 3 in `assemble.brp` and `test_assemble.brp`.
+Those unfinished changes remain preserved in the detached worktree. The
+completion was built from the integrated stack tip rather than applying that
+earlier patch.
 
 1. **C1 needs a test for the `scan.declared` fix.** In probe `c1/p07`, the
    target declares `func Foo` and only imports a type `Foo`. Selecting `Foo` must
@@ -334,13 +342,15 @@ holds an uncommitted, partial start on item 3, in `assemble.brp` and
 
    -- One module on the walk's stack and the next of its edges to follow.
    fixed record WalkFrame {
-       row: ParsedModuleRow,
+       module: ModuleId,
        next_edge: Int
    }
    ```
 
    Each row gets its edge list, prelude first. The stack becomes a list of
-   frames, and each loop level becomes a named step. Keep the depth and the
+   frames referring to the authoritative module rows; an inline scalar frame
+   avoids allocating a managed record at each transition. One visit-state
+   vector replaces the coupled `on_path` and `done` flags. Keep the depth and the
    cost. Lines should not grow if it can be avoided. The edge type lands in C4,
    where its consumer is.
 4. **C3's help.**
@@ -361,6 +371,39 @@ holds an uncommitted, partial start on item 3, in `assemble.brp` and
 
 Then each reviewer spot-checks only its own items, a fresh test-runner gates
 every commit, and the series is pushed to `main` and `blorp-2`.
+
+### Namespace completion checkpoint
+
+The six commits have been integrated locally on
+`codex/blorp-2-quality-followup`, preserving `blorp2/namespace-scopes` and the
+old worktree's unfinished changes. The completion replaces the sentinel and
+parallel traversal state with typed edges, one scalar frame stack and three
+visit states. Selection help is one fixed teaching rule. Constructor errors
+project the original declaration and union name through existing identities.
+
+The six open items have implementations and granular tests. Mutation checks
+reject the historical `scan.types` mistake, replacement/growth order changes,
+wrong closing spans and reversed dependency order. The 3,000-module tests
+exercise large cycles and chains; recursive experimental drivers also pass
+that size on the current host, so size alone is not a constant-stack oracle.
+The production walk is iterative, with an inline-frame C representation.
+
+Production changes are **−195 lines** against the handoff baseline, with
+tests/fixtures **−2,358**. C3 is now **−2**, meeting its original `<0` ceiling.
+The graph and constructor-diagnostic completion make C4 **−263**, exceeding
+its original `≤−280` ceiling. Keith accepted this documented variance when
+authorizing the completed namespace change to be committed, squash-merged to
+main and pushed. The revised C4 ceiling is `≤−263`; allocation and instruction
+ceilings are unchanged.
+
+Both independent source reviews approve the completed model. Fresh gates
+pass: 2,712 unit/runtime/grammar tests, 430 e2e cases, and strict zero leaks
+on all 429 fixture files. All 348 pre-existing successful C outputs are
+byte-identical; only the forwarding and alias-conflict diagnostics and the
+new declared-function/imported-type acceptance differ. The frontier remains
+32/34. Commands, measurements and exact comparison scope are recorded in the
+[namespace measurement report](../benchmarks/results/blorp_2_namespace_scopes_2026-10-15.md#completion-measurements).
+Nothing in this checkpoint claims the namespace work is published to main.
 
 ### Follow-ups recorded with the stack
 

@@ -14,16 +14,18 @@ import:
 		variant_number,
 		variant_owner,
 	int as IntOps
-	../parse/parse: ImportOrigin(RelativeImport, LibraryImport), ModulePath
+	../parse/parse: ImportOrigin(RelativeImport, LibraryImport), ImportSelection(NamedSelection, ConstructorSelection, MethodsOnlySelection), ModulePath, selection_name
 	../utils/names: NameId, NameTable, name_spelling
 	../namespace/namespace:
-		ImportProblem(
-			PrivateImportSelection, RepeatedModuleAlias, ModuleAliasNameConflict,
-			RepeatedModuleImport, MissingImportedFunction, RepeatedImportedFunction,
-			AmbiguousImportSelection, MissingImportedType, AmbiguousImportedType,
-			MethodTypeNotVisible, MissingImportedUnion, AmbiguousImportedUnion,
-			MissingImportedVariant, RepeatedImportedVariant, ImportedTypeConflict,
-		),
+		builtin_head,
+		Conflict,
+		Entity(Function, Constructor, Type, Alias),
+		NamespaceProblem(NameConflict, SelectionFailure),
+		Origin(Declared, Imported, Implicit),
+		SelectionProblem(NotOffered, AlreadyFromPrelude, AlreadyImported, Ambiguous, BareConstructor, NotAConstructor, ReceiverNotVisible),
+		TypeHead(UnionHead, RecordHead),
+		Unoffered(UnknownName, PrivateName, ImportedThere, ProvidedThere),
+		same_head,
 	option: to_result
 	../parse/assemble: ParsedContents, ParsedProgram, parsed_contents
 	../utils/syntax:
@@ -31,7 +33,7 @@ import:
 		Diagnostic,
 		DiagnosticNote(
 			TypeDeclaration, RecordFieldDeclaration, PreviousField, PreviousDeclaration,
-			CompetingDeclarations,
+			CompetingDeclarations, Declaration,
 		),
 		Diagnostics,
 		ParsedBuiltinType(IntegerBuiltin, FloatBuiltin, StringBuiltin, VoidBuiltin, ListBuiltin),
@@ -163,8 +165,8 @@ pure func render_check_error(program: ParsedProgram, error: Errors.CheckError) -
 			render_unsupported_form(error.span, form)
 		Errors.QualifiedRejection(rejection):
 			render_qualified_error(error.span, rejection, context)
-		Errors.ImportRejection(rejection):
-			render_import_error(error.span, rejection, context)
+		Errors.NamespaceRejection(problem):
+			render_namespace_problem(error.span, problem, context)
 		Errors.TypeDeclarationRejection(rejection):
 			render_type_declaration_error(error.span, rejection)
 		Errors.TypeTermRejection(rejection):
@@ -283,7 +285,7 @@ private pure func render_qualified_error(span: Span, rejection: Errors.Qualified
 				Err(error): error
 				Ok(spelling):
 					rendered(span, spelling.concat(" is a module alias"), "write ".concat(spelling).concat(".name to use a declaration of that module"))
-		Errors.UnknownQualifiedName(aliased, name, path):
+		Errors.QualifiedNotOffered(aliased, name, path, reason):
 			match parsed_spelling(aliased, context.names, span):
 				Err(error): error
 				Ok(alias_spelling):
@@ -293,19 +295,11 @@ private pure func render_qualified_error(span: Span, rejection: Errors.Qualified
 							match module_path_spelling(path, context, span):
 								Err(error): error
 								Ok(module):
-									rendered(
-										span,
-										"module ".concat(module).concat(" declares no public ").concat(name_spelling),
-										alias_spelling.concat(" names module ").concat(module).concat("; qualify a public function, constructor or type it declares; imports are not reexported"),
-									)
-		Errors.PrivateQualifiedName(name, path):
-			match parsed_spelling(name, context.names, span):
-				Err(error): error
-				Ok(name_spelling):
-					match module_path_spelling(path, context, span):
-						Err(error): error
-						Ok(module):
-							rendered(span, name_spelling.concat(" is private to ").concat(module), "remove private or qualify a public declaration")
+									match reason:
+										PrivateName:
+											rendered(span, name_spelling.concat(" is private to ").concat(module), "remove private or qualify a public declaration")
+										UnknownName | ImportedThere(_) | ProvidedThere(_):
+											rendered(span, "module ".concat(module).concat(" declares no public ").concat(name_spelling), alias_spelling.concat(" names module ").concat(module).concat("; qualify a public function, constructor or type it declares; imports are not reexported"))
 		Errors.QualifiedFunctionNotCalled(aliased, name):
 			match parsed_spelling(aliased, context.names, span):
 				Err(error): error
@@ -316,124 +310,193 @@ private pure func render_qualified_error(span: Span, rejection: Errors.Qualified
 							rendered(span, alias_spelling.concat(".").concat(name_spelling).concat(" names a function"), "call it with arguments; a function is not a value")
 
 
-private pure func render_import_error(span: Span, rejection: Errors.ImportError, context: ParsedContents) -> Diagnostic:
-	match rejection:
-		Errors.ImportRejected(problem):
-			render_import_problem(span, problem, context)
-		Errors.ImportedFunctionConflict(_, previous):
-			noted(
-				span,
-				"imported function conflicts with another function",
-				"give the functions distinct names or remove the duplicate import",
-				PreviousDeclaration(previous),
-			)
-		Errors.ImportedConstructorConflict(_, previous):
-			noted(
-				span,
-				"imported constructor conflicts with a function",
-				"give the constructor and function distinct names",
-				PreviousDeclaration(previous),
-			)
-		Errors.ImportedVariantConflict(_, previous):
-			noted(
-				span,
-				"imported function conflicts with a local variant",
-				"give the imported function and local variant distinct names",
-				PreviousDeclaration(previous),
-			)
-
-
--- The namespace's import-selection problems, reported before checking.
-private pure func render_import_problem(span: Span, problem: ImportProblem, context: ParsedContents) -> Diagnostic:
+-- Every namespace problem: a conflict in one table, a selection by its reason.
+private pure func render_namespace_problem(span: Span, problem: NamespaceProblem, context: ParsedContents) -> Diagnostic:
 	match problem:
-		PrivateImportSelection(name, path):
-			match parsed_spelling(name.id, context.names, span):
-				Err(error): error
-				Ok(name_spelling):
-					match module_path_spelling(path, context, span):
-						Err(error): error
-						Ok(module):
-							rendered(span, name_spelling.concat(" is private to ").concat(module), "remove private or import a public declaration")
-		RepeatedModuleAlias(_, previous):
-			noted(span, "module alias declared more than once", "give each aliased module a distinct alias", PreviousDeclaration(previous))
-		ModuleAliasNameConflict(_, previous):
-			noted(span, "module alias reuses a visible name", "choose an alias that is not a declared or imported name of this module", PreviousDeclaration(previous))
-		RepeatedModuleImport(_, previous, _):
-			noted(
-				span,
-				"module imported more than once",
-				"combine the alias and the selected names into one import, such as path as Alias: name",
-				PreviousDeclaration(previous),
-			)
-		MissingImportedFunction(_, _):
-			rendered(
-				span,
-				"unknown imported function",
-				"select a function declared directly in that module; imports are not reexported",
-			)
-		RepeatedImportedFunction(_, previous):
-			noted(
-				span,
-				"function selected more than once",
-				"list each selected function once",
-				PreviousDeclaration(previous),
-			)
-		AmbiguousImportSelection(_, _):
-			rendered(
-				span,
-				"import selection names both a type and a function",
-				"rename the function or select through a module with an unambiguous surface",
-			)
-		MissingImportedType(_, _):
-			rendered(
-				span,
-				"unknown imported type",
-				"select a type declared or ordinarily imported by that module",
-			)
-		AmbiguousImportedType(_, _):
-			rendered(
-				span,
-				"ambiguous imported type",
-				"give distinct type declarations distinct names",
-			)
-		MethodTypeNotVisible(_):
-			rendered(
-				span,
-				"method receiver type is not independently visible",
-				"import the exact type with an ordinary type selection before using methods_only",
-			)
-		MissingImportedUnion(_):
-			rendered(
-				span,
-				"unknown imported union",
-				"select a fixed union declared or ordinarily imported by that module",
-			)
-		AmbiguousImportedUnion(_):
-			rendered(
-				span,
-				"ambiguous imported union",
-				"give each type declared in the selected module a distinct name",
-			)
-		MissingImportedVariant(_):
-			rendered(
-				span,
-				"constructor does not belong to the selected union",
-				"select a constructor declared inside that union",
-			)
-		RepeatedImportedVariant(_, previous):
-			noted(
-				span,
-				"constructor selected more than once",
-				"list each selected constructor once",
-				PreviousDeclaration(previous),
-			)
-		ImportedTypeConflict(_, previous):
-			noted(
-				span,
-				"imported type conflicts with another type",
-				"give the types distinct names or remove the duplicate import",
-				PreviousDeclaration(previous),
-			)
+		NameConflict(conflict):
+			render_conflict(span, conflict, context)
+		SelectionFailure(path, selection, reason):
+			render_selection(span, path, selection, reason, context)
+
+
+private pure func entity_noun(entity: Entity) -> String:
+	match entity:
+		Function(_): "function"
+		Constructor(_): "constructor"
+		Type(_): "type"
+		Alias(_): "module alias"
+
+
+private pure func same_kind(left: Entity, right: Entity) -> Bool:
+	match left:
+		Function(_):
+			match right:
+				Function(_): True
+				_: False
+		Constructor(_):
+			match right:
+				Constructor(_): True
+				_: False
+		Type(_):
+			match right:
+				Type(_): True
+				_: False
+		Alias(_):
+			match right:
+				Alias(_): True
+				_: False
+
+
+-- One table for every name conflict. The message says what already holds the
+-- name; the help says how to change the incoming one. The note marks the
+-- earlier name: a declaration, an import, or the prelude's selection.
+private pure func render_conflict(span: Span, conflict: Conflict, context: ParsedContents) -> Diagnostic:
+	match parsed_spelling(conflict.incoming.name.id, context.names, span):
+		Err(error):
+			error
+		Ok(name):
+			incoming = entity_noun(conflict.incoming.entity)
+			previous = entity_noun(conflict.previous.entity)
+			alias_previous = match conflict.previous.entity:
+				Alias(_): True
+				Function(_) | Constructor(_) | Type(_): False
+			message = match conflict.previous.origin:
+				Implicit:
+					name.concat(" is provided by the prelude")
+				Imported:
+					if alias_previous:
+						name.concat(" is already a module alias")
+					else:
+						name.concat(" is already imported")
+				Declared(_):
+					if same_kind(conflict.incoming.entity, conflict.previous.entity):
+						"duplicate ".concat(incoming).concat(" name")
+					else:
+						incoming.concat(" name conflicts with a ").concat(previous)
+			alias_incoming = match conflict.incoming.entity:
+				Alias(_): True
+				Function(_) | Constructor(_) | Type(_): False
+			help = match conflict.incoming.origin:
+				Declared(_):
+					match conflict.previous.origin:
+						Implicit:
+							"give this ".concat(incoming).concat(" another name; the prelude's ").concat(previous).concat(" ").concat(name).concat(" is always in scope")
+						Imported:
+							if alias_previous:
+								"rename this ".concat(incoming).concat(", or choose another alias")
+							else:
+								"rename this ".concat(incoming).concat(", or remove ").concat(name).concat(" from the import")
+						Declared(_):
+							if same_kind(conflict.incoming.entity, conflict.previous.entity):
+								"give each ".concat(incoming).concat(" in a module a distinct name")
+							else:
+								"functions and constructors share one name space; give them distinct names"
+				Imported | Implicit:
+					if alias_incoming:
+						"choose another alias for this module"
+					else if alias_previous:
+						"choose another alias for that module, or omit ".concat(name).concat(" from this selection")
+					else:
+						match conflict.previous.origin:
+							Implicit: "omit ".concat(name).concat(" from this selection, or reach it through a module alias")
+							Imported | Declared(_): "select ".concat(name).concat(" from one module only, and reach the other through a module alias")
+			noted(span, message, help, PreviousDeclaration(conflict.previous.name.span))
+
+
+-- Where `entity` is declared, for a note: ids name their inventory rows, and a
+-- builtin type is the foundation's declaration of that head. Host `get` returns
+-- an Option even for an issued id, which always has its row, so `None` never runs.
+private pure func declaration_span(entity: Entity, context: ParsedContents) -> Option[Span]:
+	var found: Option[Span] = None
+	match entity:
+		Function(id):
+			match inventory_functions(context.declarations).get(function_number(id)):
+				Some(row): found = Some(row.declaration.function_name.span)
+				None: void
+		Constructor(id):
+			match inventory_unions(context.declarations).get(union_number(variant_owner(id))):
+				Some(row):
+					match row.variants.get(variant_number(id)):
+						Some(variant): found = Some(variant.declaration.name.span)
+						None: void
+				None: void
+		Type(UnionHead(id)):
+			match inventory_unions(context.declarations).get(union_number(id)):
+				Some(row): found = Some(row.type_name.span)
+				None: void
+		Type(RecordHead(id)):
+			match inventory_records(context.declarations).get(record_number(id)):
+				Some(row): found = Some(row.declaration.type_name.span)
+				None: void
+		Type(candidate):
+			for row in context.builtin_types:
+				if same_head(builtin_head(row.declaration), candidate):
+					found = Some(builtin_type_name(row.declaration).span)
+		Alias(_):
+			void
+	found
+
+
+-- The " or write P: N methods_only ..." clause a type selection may add.
+private pure func methods_hint(entity: Entity, name: String, module: String) -> String:
+	match entity:
+		Type(_): ", or write ".concat(module).concat(": ").concat(name).concat(" methods_only to use the functions ").concat(module).concat(" declares on ").concat(name)
+		Function(_) | Constructor(_) | Alias(_): ""
+
+
+-- A selection that binds nothing, named by the target's written path.
+private pure func render_selection(span: Span, path: ModulePath, selection: ImportSelection, problem: SelectionProblem, context: ParsedContents) -> Diagnostic:
+	match parsed_spelling(selection_name(selection).id, context.names, span):
+		Err(error):
+			error
+		Ok(name):
+			match module_path_spelling(path, context, span):
+				Err(error):
+					error
+				Ok(module):
+					match problem:
+						NotOffered(UnknownName):
+							match selection:
+								NamedSelection(_):
+									rendered(span, "module ".concat(module).concat(" declares no public function or type ").concat(name), "select a public function or type that ".concat(module).concat(" declares"))
+								ConstructorSelection(_, _):
+									rendered(span, "module ".concat(module).concat(" declares no public union ").concat(name), "select a fixed union that ".concat(module).concat(" declares"))
+								MethodsOnlySelection(_, _):
+									rendered(span, "module ".concat(module).concat(" has no type ").concat(name), "methods_only names a type that ".concat(module).concat(" declares or imports"))
+						NotOffered(PrivateName):
+							rendered(span, name.concat(" is private to ").concat(module), "remove private or import a public declaration")
+						NotOffered(ImportedThere(entity)):
+							message = name.concat(" is imported by ").concat(module).concat(", not declared there")
+							help = match entity:
+								Constructor(id):
+									match type_spelling(Check.UnionType(variant_owner(id)), context, span):
+										Err(error): Err(error)
+										Ok(union_name): Ok("import the union from the module that declares it, selecting ".concat(union_name).concat("(").concat(name).concat(")"))
+								Function(_) | Type(_) | Alias(_):
+									Ok("import ".concat(name).concat(" from the module that declares it").concat(methods_hint(entity, name, module)))
+							match help:
+								Err(error): error
+								Ok(text):
+									match declaration_span(entity, context):
+										Some(declared): noted(span, message, text, Declaration(declared))
+										None: rendered(span, message, text)
+						NotOffered(ProvidedThere(entity)):
+							rendered(span, module.concat(" receives ").concat(name).concat(" from the prelude and does not declare it"), name.concat(" is already in scope through the prelude; remove it from this selection").concat(methods_hint(entity, name, module)))
+						AlreadyFromPrelude(entity):
+							rendered(span, name.concat(" is already in scope through the prelude"), "remove ".concat(name).concat(" from this selection").concat(methods_hint(entity, name, module)))
+						AlreadyImported(entity):
+							rendered(span, name.concat(" is already imported, and ").concat(module).concat(" does not declare it"), "remove ".concat(name).concat(" from this selection").concat(methods_hint(entity, name, module)))
+						Ambiguous:
+							rendered(span, "import selection names both a type and a function", "rename the type or the function in ".concat(module).concat("; a bare selection names one declaration"))
+						BareConstructor(variant):
+							match type_spelling(Check.UnionType(variant_owner(variant)), context, span):
+								Err(error): error
+								Ok(union_name):
+									rendered(span, name.concat(" is a constructor of the union ").concat(union_name), "write ".concat(union_name).concat("(").concat(name).concat(") to select the union with this constructor"))
+						NotAConstructor(_):
+							rendered(span, "constructor does not belong to the selected union", "select a constructor declared inside that union")
+						ReceiverNotVisible:
+							rendered(span, "method receiver type is not independently visible", "import the exact type with an ordinary type selection before using methods_only")
 
 
 private pure func render_type_declaration_error(
@@ -441,13 +504,6 @@ private pure func render_type_declaration_error(
 	rejection: Errors.TypeDeclarationError,
 ) -> Diagnostic:
 	match rejection:
-		Errors.DuplicateRecordType(_, Errors.SourceTypeDeclaration(declaration)):
-			noted(
-				span,
-				"duplicate type name",
-				"give record and union types distinct names",
-				TypeDeclaration(declaration),
-			)
 		Errors.RecursiveAggregateType(_):
 			rendered(
 				span,
@@ -462,20 +518,6 @@ private pure func render_type_declaration_error(
 				PreviousField(first),
 			)
 
-		Errors.DuplicateVariant(_, _):
-			rendered(span, "duplicate variant name", "give each variant in a union a distinct name")
-		Errors.VariantFunctionConflict(_, _, _):
-			rendered(
-				span,
-				"variant name conflicts with a function",
-				"give functions and union variants distinct names",
-			)
-		Errors.DuplicateUnion(_, _):
-			rendered(
-				span,
-				"duplicate union type name",
-				"give union types distinct names; foundational types are declared by the base module",
-			)
 		Errors.DuplicateTypeParameter(_, _, _):
 			rendered(
 				span,
@@ -609,8 +651,6 @@ private pure func render_signature_error(
 			)
 		Errors.PureVoidReturn:
 			pure_void_return(span)
-		Errors.DuplicateFunction(_, _):
-			rendered(span, "duplicate function name", "give every function a distinct name")
 		Errors.MissingMain:
 			rendered(
 				span,

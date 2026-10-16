@@ -1,5 +1,6 @@
 import:
-	./harness: run_source_example, verify_rejected_command, with_directory
+	./cost: CostLimits
+	./harness: Example, native_case, run_source_example, verify_all, verify_rejected_command, with_directory
 	system: file_exists, getcwd, read_file, write_file
 	test: TestSuite
 
@@ -68,6 +69,57 @@ private func rejected_cycle(compiler: String, directory: String) -> Result[Void,
 		Ok(void)
 
 
+-- Generated programs of CHAIN_MODULES modules. Under this harness's strict
+-- leak check the namespace scopes commit measured the direct chain at 248 M
+-- instructions and 79,774 allocations and the flat program at 132 M and
+-- 27,515, where the program-wide namespace before it measured 528 M and 375 M.
+-- Allocation ceilings also reject the old program-wide namespace when CI
+-- disables instruction checks; the two workloads have independent oracles.
+private CHAIN_MODULES: Int = 64
+private DIRECT_CHAIN_LIMITS: CostLimits = { allocations = 83000, instructions = 300000000 }
+private FLAT_LIMITS: CostLimits = { allocations = 31000, instructions = 160000000 }
+
+
+private func written(directory: String, name: String, source: String) -> Bool:
+	match write_file(directory + "/" + name, source):
+		Ok(_): True
+		Err(_): False
+
+
+-- main calls m1, each module calls the next and selects Box from the last one,
+-- which declares it.
+private func write_direct_chain(directory: String) -> Bool:
+	last = CHAIN_MODULES.to_string()
+	var complete = written(directory, "main.brp", "import:\n    ./m1: f1\n    ./m" + last + ": Box(Pack)\nfunc main() -> Int:\n    match f1():\n        Pack(value): value\n")
+	for position in 1..CHAIN_MODULES:
+		next = (position + 1).to_string()
+		body = "pure func f" + position.to_string() + "() -> Box:\n    match f" + next + "():\n        Pack(value): Pack(value)\n"
+		imports = if next == last:
+			"import:\n    ./m" + last + ": f" + last + ", Box(Pack)\n"
+		else:
+			"import:\n    ./m" + next + ": f" + next + "\n    ./m" + last + ": Box(Pack)\n"
+		complete = complete and written(directory, "m" + position.to_string() + ".brp", imports + body)
+	complete and written(directory, "m" + last + ".brp", "fixed union Box:\n    Pack(Int)\npure func f" + last + "() -> Box:\n    Pack(0)\n")
+
+
+-- main selects one type from each module, each declaring its own.
+private func write_flat(directory: String) -> Bool:
+	var imports = "import:\n"
+	var complete = True
+	for position in 1..(CHAIN_MODULES + 1):
+		number = position.to_string()
+		imports = imports + "    ./m" + number + ": Type" + number + "\n"
+		complete = complete and written(directory, "m" + number + ".brp", "fixed union Type" + number + "[T]:\n    Make" + number + "(T)\n")
+	complete and written(directory, "main.brp", imports + "func main() -> Int:\n    0\n")
+
+
+private func chain_within_ceiling(compiler: String, directory: String, name: String, complete: Bool, limits: CostLimits) -> Result[Void, String]:
+	if complete:
+		verify_all(compiler, directory, { name = name, fixture = directory + "/main.brp", expected_c = None, first_case = native_case("native output", "", 0, ""), remaining_cases = [], limits = limits })
+	else:
+		Err("could not write the generated " + name + " program")
+
+
 pure func suite(compiler: String) -> TestSuite:
 	{
 		description = "Blorp 2 local modules",
@@ -78,7 +130,8 @@ pure func suite(compiler: String) -> TestSuite:
 			("dependency cycle is rejected at its closing import", func(): with_directory(func(directory: String): rejected_cycle(compiler, directory))),
 			("foreign nominal value through generic UFCS", func(): example(compiler, "managed", 2)),
 			("two independent method modules preserve type identity", func(): example(compiler, "method_modules", 42)),
-			("forwarded constructors retain their declaration", func(): example(compiler, "forwarding", 42)),
+			("methods_only reaches functions on a type imported elsewhere", func(): example(compiler, "forwarding", 42)),
+			("a module does not reexport an imported union", func(): with_directory(func(directory: String): rejected_example(compiler, directory, "forwarding/facade", ":2:12: error: Box is imported by ./ops, not declared there\nhelp: import Box from the module that declares it, or write ./ops: Box methods_only to use the functions ./ops declares on Box\n" + getcwd() + "/blorp_2/test/e2e/fixtures/import/forwarding/box.brp:1:13: note: declared here\n"))),
 			("helper module receives the default prelude", func(): example(compiler, "prelude_helper", 2)),
 			("explicit base import overlaps the prelude", func(): example(compiler, "explicit_base", 42)),
 			("same-named methods resolve by receiver type", func(): example(compiler, "receiver_types", 42)),
@@ -87,5 +140,7 @@ pure func suite(compiler: String) -> TestSuite:
 			("method-only selection needs exact visible type", func(): with_directory(func(directory: String): rejected_example(compiler, directory, "method_modules/missing_type", ":2:15: error: method receiver type is not independently visible\nhelp: import the exact type with an ordinary type selection before using methods_only\n"))),
 			("default prelude exposes receiver calls only", func(): with_directory(func(directory: String): rejected_example(compiler, directory, "prelude_helper/direct_rejected", ":2:5: error: unknown function\nhelp: declare the function locally or import it by name; type selections enable receiver calls only\n"))),
 			("cross-file field diagnostic preserves output", func(): with_directory(func(directory: String): rejected_field(compiler, directory))),
+			("direct module chain stays within its cost ceiling", func(): with_directory(func(directory: String): chain_within_ceiling(compiler, directory, "direct chain", write_direct_chain(directory), DIRECT_CHAIN_LIMITS))),
+			("flat modules stay within their cost ceiling", func(): with_directory(func(directory: String): chain_within_ceiling(compiler, directory, "flat modules", write_flat(directory), FLAT_LIMITS))),
 		]
 	}

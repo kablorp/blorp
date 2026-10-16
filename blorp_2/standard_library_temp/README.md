@@ -75,6 +75,7 @@ import:
 
 `Foo methods_only` requires the exact Foo type independently visible in the
 caller. It imports no type or constructors and cannot make bare function calls
-available. Type forwarding follows the original declaration; it does not
-forward another module's imported methods. The prelude is a compiler input and
+available. A module offers only the types it declares, so `int: Int` is
+rejected and `int: Int methods_only` uses `int`'s functions on Int; no module
+reexports another module's types or methods. The prelude is a compiler input and
 cannot be imported explicitly.

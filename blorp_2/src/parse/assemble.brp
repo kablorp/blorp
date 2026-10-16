@@ -3,9 +3,10 @@ import:
 	int as IntOps
 	../utils/names: NameId, NameTable, program_names, same_name_table
 	option: to_result
+	list: repeat
 	./parse: ImportSelection, ModulePath, ParsedModule, ParsedModuleContents, module_contents
-	../utils/source: ModuleId, ModuleKind(FoundationTypesModule, FoundationPreludeModule, LibraryModule, UserModule), module_number
-	../utils/syntax: Diagnostic, ParsedBuiltinType, ParsedConstant, ParsedFunction, ParsedOpaque, ParsedRecord, ParsedUnion, Span, WrittenName, source_bundle_error
+	../utils/source: ModuleId, ModuleKind(FoundationTypesModule, FoundationPreludeModule, LibraryModule, UserModule), module_number, same_module
+	../utils/syntax: Diagnostic, DiagnosticNote(PreviousDeclaration), ParsedBuiltinType, ParsedConstant, ParsedFunction, ParsedOpaque, ParsedRecord, ParsedUnion, Span, WrittenName, diagnostic, source_bundle_error
 
 
 -- Program assembly: the loader appends each parsed module in inventory order,
@@ -48,6 +49,9 @@ fixed record ParsedContents {
 	foundation: FoundationModules,
 	builtin_types: List[ParsedBuiltinDeclaration],
 	modules: List[ParsedModuleRow],
+	-- The rows of `modules` again, each once, after the modules it imports
+	-- and, for a user module, after the prelude it receives.
+	dependency_order: List[ParsedModuleRow],
 	declarations: DeclarationInventory,
 	-- Declaration forms read ahead of their semantics; checking rejects
 	-- them, so they have no identity in the inventory yet.
@@ -99,7 +103,11 @@ pure func assembly_names(assembly: ParsedAssembly) -> NameTable:
 	from_opaque ParsedAssembly(assembly).names
 
 
--- Pairs each import request with its target, in order.
+private REPEATED_IMPORT_HELP: String = "combine the alias and the selected names into one import, such as path as Alias: name"
+
+
+-- Pairs each import request with its target, in order. A module imports each
+-- module once (GUIDE, One Import Per Module): an alias and selections share a row.
 private pure func linked_imports(
 	contents: ParsedModuleContents,
 	position: Int,
@@ -115,8 +123,17 @@ private pure func linked_imports(
 		Some(request):
 			match targets.get(position):
 				Some(target):
-					link = { target = target, path = request.path, module_alias = request.module_alias, symbols = request.symbols, span = request.span }
-					linked_imports(contents, IntOps.add(position, 1), targets, linked.append(link))
+					var earlier: Option[Span] = None
+					for previous in linked:
+						if same_module(previous.target, target):
+							earlier = Some(previous.span)
+							break
+					match earlier:
+						Some(first):
+							Err({ diagnostic(request.span, "module imported more than once", REPEATED_IMPORT_HELP) | note = Some(PreviousDeclaration(first)) })
+						None:
+							link = { target = target, path = request.path, module_alias = request.module_alias, symbols = request.symbols, span = request.span }
+							linked_imports(contents, IntOps.add(position, 1), targets, linked.append(link))
 				None:
 					Err(source_bundle_error("source bundle does not supply exactly one target per import"))
 
@@ -160,29 +177,122 @@ private pure func foundation_module(
 	missing: String,
 	repeated: String,
 	root: ParsedModuleRow,
-) -> Result[ModuleId, Diagnostic]:
+) -> Result[ModuleId, SealFailure]:
 	match rows:
 		[]:
-			Err({ source_bundle_error(missing) | span = root.end })
+			Err(MalformedBundle({ source_bundle_error(missing) | span = root.end }))
 		[row]:
 			Ok(row.module)
 		[_, duplicate, ..._]:
-			Err({ source_bundle_error(repeated) | span = duplicate.end })
+			Err(MalformedBundle({ source_bundle_error(repeated) | span = duplicate.end }))
 
 
-pure func seal_program(assembly: ParsedAssembly) -> Result[ParsedProgram, Diagnostic]:
+-- Why a bundle cannot be sealed. The loader renders a cycle: it owns the
+-- modules' display paths.
+fixed union SealFailure:
+	MalformedBundle(Diagnostic)
+	ImportCycle(List[ModuleId], Span)
+
+
+-- Seal-only edges distinguish the implicit prelude from written imports.
+private fixed union ModuleEdge:
+	PreludeEdge(ModuleId)
+	ImportEdge(ModuleImport)
+
+
+private fixed record WalkFrame {
+	module: ModuleId,
+	next_edge: Int
+}
+
+
+private fixed union VisitState:
+	Unvisited
+	Active
+	Complete
+
+
+private fixed record ModuleWalk {
+	frames: List[WalkFrame],
+	visits: List[VisitState],
+	explored: List[ParsedModuleRow],
+	failure: Option[SealFailure]
+}
+
+
+-- The active suffix closed by this edge, followed by its target again.
+private pure func cycle_to(frames: List[WalkFrame], target: ModuleId) -> List[ModuleId]:
+	var cycle: List[ModuleId] = []
+	for frame in frames:
+		if not cycle.is_empty() or same_module(frame.module, target):
+			cycle = cycle.append(frame.module)
+	cycle.append(target)
+
+
+-- Advance one frame, following its edge or publishing its completed row.
+-- Every result updates this walk directly, so the host can consume its lists.
+private pure func walk_step(walk: ModuleWalk, top: WalkFrame, edges: List[ModuleEdge], row: ParsedModuleRow) -> ModuleWalk:
+	depth = IntOps.subtract(walk.frames.length(), 1)
+	match edges.get(top.next_edge):
+		None:
+			{ walk |
+				frames = walk.frames.take(depth),
+				visits = walk.visits.set(module_number(top.module), Complete),
+				explored = walk.explored.append(row)
+			}
+		Some(edge):
+			target = match edge:
+				PreludeEdge(module): module
+				ImportEdge(request): request.target
+			number = module_number(target)
+			advanced = walk.frames.set(depth, { top | next_edge = IntOps.add(top.next_edge, 1) })
+			match walk.visits.get_or(number, Unvisited):
+				Active:
+					closing = match edge:
+						PreludeEdge(_): row.end
+						ImportEdge(request): request.span
+					{ walk | frames = advanced, failure = Some(ImportCycle(cycle_to(advanced, target), closing)) }
+				Complete:
+					{ walk | frames = advanced }
+				Unvisited:
+					{ walk | frames = advanced.append({ module = target, next_edge = 0 }), visits = walk.visits.set(number, Active) }
+
+
+-- Build the transient edge inventory once, prelude first. DFS keeps load and
+-- written-import order, publishing each row after its dependencies. Only the
+-- resulting order survives sealing; indices follow the assembly's dense rows.
+private pure func ordered_rows(rows: List[ParsedModuleRow], prelude: ModuleId) -> Result[List[ParsedModuleRow], SealFailure]:
+	var edges_by_module: List[List[ModuleEdge]] = []
+	for row in rows:
+		var edges: List[ModuleEdge] = match row.role:
+			UserModule: [PreludeEdge(prelude)]
+			FoundationTypesModule | FoundationPreludeModule | LibraryModule: []
+		for request in row.imports:
+			edges = edges.append(ImportEdge(request))
+		edges_by_module = edges_by_module.append(edges)
+	var walk: ModuleWalk = { frames = [], visits = repeat(Unvisited, rows.length()), explored = [], failure = None }
+	for start in rows:
+		match walk.visits.get_or(module_number(start.module), Unvisited):
+			Unvisited:
+				walk = { walk | frames = [{ module = start.module, next_edge = 0 }], visits = walk.visits.set(module_number(start.module), Active) }
+			Active | Complete: void
+		while walk.failure.is_none():
+			match walk.frames.last():
+				Some(top):
+					match rows.get(module_number(top.module)):
+						Some(row): walk = walk_step(walk, top, edges_by_module.get_or(module_number(top.module), []), row)
+						None: walk = { walk | failure = Some(MalformedBundle(source_bundle_error("source bundle is missing an imported module"))) }
+				None: break
+		if walk.failure.is_some():
+			break
+	match walk.failure:
+		Some(stop): Err(stop)
+		None: Ok(walk.explored)
+
+
+pure func seal_program(assembly: ParsedAssembly) -> Result[ParsedProgram, SealFailure]:
 	builder = from_opaque ParsedAssembly(assembly)
-	root ?= builder.modules.get(0).to_result(source_bundle_error("source bundle has no root module"))
-	var complete: Bool = True
-
-	for module in builder.modules:
-		for request in module.imports:
-			complete = complete and IntOps.less_than(module_number(request.target), builder.modules.length())
-
-	targets ?= if complete:
-		Ok(void)
-	else:
-		Err(source_bundle_error("source bundle is missing an imported module"))
+	root ?= builder.modules.get(0).to_result(MalformedBundle(source_bundle_error("source bundle has no root module")))
 	var types_rows: List[ParsedModuleRow] = []
 	var prelude_rows: List[ParsedModuleRow] = []
 
@@ -201,15 +311,22 @@ pure func seal_program(assembly: ParsedAssembly) -> Result[ParsedProgram, Diagno
 		UserModule:
 			Ok(void)
 		_:
-			Err({ source_bundle_error("source bundle root must be a user module") | span = root.end })
-	Ok(into_opaque ParsedProgram({
-				names = builder.names,
-				entrypoint = builder.entrypoint,
-				foundation = { types = types, prelude = prelude },
-				builtin_types = builder.builtin_types,
-				modules = builder.modules,
-				declarations = issue_inventory(builder.functions, builder.records, builder.unions),
-				opaques = builder.opaques,
-				constants = builder.constants,
-				end = root.end
-			}))
+			Err(MalformedBundle({ source_bundle_error("source bundle root must be a user module") | span = root.end }))
+	-- Walking from each module in load order reports the first cycle
+	-- deterministically, at the import that closes it.
+	match ordered_rows(builder.modules, prelude):
+		Err(failure):
+			Err(failure)
+		Ok(ordered):
+			Ok(into_opaque ParsedProgram({
+						names = builder.names,
+						entrypoint = builder.entrypoint,
+						foundation = { types = types, prelude = prelude },
+						builtin_types = builder.builtin_types,
+						modules = builder.modules,
+						dependency_order = ordered,
+						declarations = issue_inventory(builder.functions, builder.records, builder.unions),
+						opaques = builder.opaques,
+						constants = builder.constants,
+						end = root.end
+					}))

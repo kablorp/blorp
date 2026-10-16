@@ -1,7 +1,9 @@
 # Type imports, method visibility, and the target prelude
 
-Status: implemented in `blorp_2`, including its target library and input fixtures.
-This document records the current semantic contract. The original implementation
+Status: superseded in part (2026-10-15). Modules no longer forward types, and
+each module now has one scope built in dependency order; see the README and
+[the namespace scopes report](../benchmarks/results/blorp_2_namespace_scopes_2026-10-15.md).
+The rest records the semantic contract as implemented. The original implementation
 sequence and cost ceilings remain in the [committed design](https://github.com/kablorp/blorp/blob/4b05ea3b431d9fbe4e906a0802bd41060b6f397f/blorp_2/IMPORTS_AND_PRELUDE_PLAN.md).
 See [README](README.md) for current usage and the
 [validation report](../benchmarks/results/blorp_2_imports_prelude_2026-10-12.md)
@@ -23,7 +25,7 @@ fixed record Foo { value: Int }
 -- foo_1.brp: an independent operation module
 import:
     ./foo: Foo
-    int: Int
+    int: Int methods_only
 
 pure func doubled(value: Foo) -> Foo:
     { value = value.value.add(value.value) }
@@ -101,15 +103,13 @@ from a different owner never satisfies the requirement.
 A type declared in the importing module itself is independently visible too;
 it does not need a self-import. Existing local UFCS keeps working.
 
-An ordinary type selector may follow a type binding already visible in its
-target module to the original declaration. Thus `int: Int` works because `int`
-imports Int from `_base`, and `foo_1: Foo` may explicitly import the
-Foo that `foo_1` imported. This is type forwarding by identity, not a new
-declaration or a `reexport` feature. Type forwarding must terminate and report
-missing/conflicting bindings. The loader bans import cycles, but the namespace
-still rejects a forwarding cycle with no declaration at its origin rather than
-inventing an identity. Importing a function continues to expose none of its signature
-types, sibling functions, or constructors as names.
+An ordinary type selector selects a type its target module declares; a module
+never reexports (decided 2026-10-15, superseding type forwarding). Thus
+`int: Int` is rejected, because `int` only imports Int from `_base`, and
+`foo_1: Foo` cannot import the Foo that `foo_1` imported; `int: Int
+methods_only` and `foo_1: Foo methods_only` use their functions instead.
+Importing a function continues to expose none of its signature types, sibling
+functions, or constructors as names.
 
 Method selection considers only functions declared in the selected module.
 Its imports and implicit prelude are not recursively forwarded. Empty method
@@ -119,8 +119,6 @@ paths retain their original identities. Overlapping exposures of the same
 identity are idempotent; different types with the same visible name conflict.
 Keep diagnostics for malformed or repeated explicit import rows separate from
 harmless overlap between explicit imports and the implicit scope.
-Constructor selections through a forwarded union resolve variants from the
-original UnionId, even if the forwarding module did not import their names.
 
 Receiver selection uses accepted first-parameter types. A fixed receiver head
 can be a builtin type or an existing nominal union/record identity. A selector
@@ -329,11 +327,9 @@ one import a module is expected to need for naming them.
 | Resolved call and contract | Body checker; existing complete call contract, then checked target/substitution. |
 | Runtime/layout/ownership facts | Existing specialization and later phases; no import-name interpretation. |
 
-Do not put accepted types into the parsed-only Namespace. Resolve forwarded
-type bindings with a finite monotone local builder/worklist, then seal the
-namespace before declaration payloads and signatures are checked. A cycle
-with no originating declaration must fail rather than invent an identity.
-Reject conflicting type identities before deriving method visibility.
+Do not put accepted types into the parsed-only Namespace. Seal the namespace
+before declaration payloads and signatures are checked, and reject conflicting
+type identities before deriving method visibility.
 
 After accepting signatures, derive only the selected receiver functions,
 separating direct visibility from UFCS visibility. Borrow signatures from
@@ -382,7 +378,7 @@ path, or backend import repair is needed.
 | --- | --- |
 | Parser / EBNF | Exact suffix; constructor syntax unchanged; mixed selections; malformed placement/combinations; empty/comment-only modules. Inspect typed selectors and exact error/help/spans. |
 | Loader / roles | One load/parse per normalized module path, including shared prelude/base; explicit prelude imports reject and explicit base imports reach the designated base; import cycles, including self-imports, reject at the closing import while diamonds load; library modules importing user modules reject; root/helper/library roles remain distinct; missing foundation files preserve output files. |
-| Namespace | Forwarded types retain original IDs; type/constructor overlap is idempotent; missing/conflicting types and ambiguous bare type/function selectors reject; method-only imports add no type/constructor binding; import order is irrelevant. |
+| Namespace | Imported types retain original IDs and are never reexported; type/constructor overlap is idempotent; missing/conflicting types and ambiguous bare type/function selectors reject; method-only imports add no type/constructor binding; import order is irrelevant. |
 | Accepted signatures / UFCS visibility | Local module functions only; no dependency/prelude method forwarding; zero-parameter functions excluded; exact and applied receiver matching; unconstrained T excluded from type selection. |
 | Call checking | Two operation modules compose; DirectCall/ReceiverCall obey explicit binding availability; named import upgrades the same function's availability without duplication; distinct applicable methods are ambiguous; wrong receiver/arity/purity rejects with typed errors. |
 | Contextual inference | Bare constructor plus unique method context; competing contexts require annotation; multi-step receiver chains, field access followed by UFCS, and contextual generic receivers preserve existing behavior. |
@@ -390,7 +386,7 @@ path, or backend import repair is needed.
 | Ownership / backend | Imported managed Strings/unions and existing inline records retain checked, concrete, lowered, ownership and verifier contracts; generated C references the selected function; real fixtures remain sanitizer-clean. |
 
 The direct suites for [import syntax](test/unit/test_parse/test_import_syntax.brp),
-[namespace identity](test/unit/test_check/test_type_import_namespace.brp),
+[module scopes](test/unit/test_namespace/test_namespace.brp),
 [call selection](test/unit/test_parse/test_import_selectors.brp),
 [module loading](test/unit/test_parse/test_module_input.brp), and
 [foundation contracts](test/unit/test_namespace/test_builtins.brp) exercise these boundaries.

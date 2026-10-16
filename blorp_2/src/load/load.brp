@@ -4,7 +4,7 @@ import:
 	../utils/names: NameId, NameTable, name_spelling
 	option: to_result
 	../parse/assemble:
-		ParsedAssembly, ParsedProgram, ParsedModuleRow, ModuleImport, append_module, assembly_names, begin_program, parsed_contents, seal_program
+		ParsedAssembly, ParsedProgram, SealFailure(MalformedBundle, ImportCycle), append_module, assembly_names, begin_program, seal_program
 	../parse/parse:
 		ParsedModule, ParsedImport, ImportOrigin(RelativeImport, LibraryImport), module_imports, module_names, parse_module
 	path as Path
@@ -286,56 +286,6 @@ private func load_queue(state: LoadState) -> Result[LoadState, LoadFailure]:
 private IMPORT_CYCLE_HELP: String = "move the declarations both modules need into a third module that both import"
 
 
--- A depth-first walk over resolved import targets. The path holds the modules
--- being explored, outermost first; a module is explored once all its imports are.
-private fixed record ImportWalk {
-	rows: List[ParsedModuleRow],
-	path: List[ModuleId],
-	explored: List[ModuleId]
-}
-
-
--- Why a walk stopped early. A sealed program has a row for every import target.
-private fixed union WalkStop:
-	ClosedCycle(List[ModuleId], Span)
-	MissingModuleRow
-
-
--- An import of a module already on the path closes a cycle: the path from that
--- module to the importer, then back to it. A module appears on the path at most once.
-private pure func walk_imports(walk: ImportWalk, imports: List[ModuleImport], position: Int) -> Result[ImportWalk, WalkStop]:
-	match imports.get(position):
-		None:
-			Ok(walk)
-		Some(request):
-			var cycle: List[ModuleId] = []
-			for module in walk.path:
-				if not cycle.is_empty() or same_module(module, request.target):
-					cycle = cycle.append(module)
-			next ?= if cycle.is_empty():
-				walk_module(walk, request.target)
-			else:
-				Err(ClosedCycle(cycle.append(request.target), request.span))
-			walk_imports(next, imports, IntOps.add(position, 1))
-
-
--- Recursion depth is bounded by the program's import count, which follows its
--- files like load_queue's; the host handles tens of thousands of frames. The
--- explored scan makes the walk O(modules x imports), small at today's sizes.
-private pure func walk_module(walk: ImportWalk, module: ModuleId) -> Result[ImportWalk, WalkStop]:
-	var explored = False
-	for done in walk.explored:
-		if same_module(done, module):
-			explored = True
-			break
-	if explored:
-		Ok(walk)
-	else:
-		row ?= walk.rows.get(module_number(module)).to_result(MissingModuleRow)
-		entered ?= walk_imports({ walk | path = walk.path.append(module) }, row.imports, 0)
-		Ok({ entered | path = walk.path, explored = entered.explored.append(module) })
-
-
 -- Source rows follow module ordinals, so each module in a cycle has a display path.
 private pure func display_paths(sources: SourceInputs, cycle: List[ModuleId], paths: List[String]) -> Result[List[String], Diagnostic]:
 	match cycle.get(paths.length()):
@@ -344,23 +294,6 @@ private pure func display_paths(sources: SourceInputs, cycle: List[ModuleId], pa
 		Some(module):
 			file ?= sources.modules.get(module_number(module)).to_result(internal_error("import cycle names a module without a source"))
 			display_paths(sources, cycle, paths.append(file.path))
-
-
--- Import cycles are banned. Walking from each module in load order reports the
--- first cycle deterministically, at the import that closes it.
-private pure func reject_import_cycles(sources: SourceInputs, program: ParsedProgram) -> Result[Void, Diagnostic]:
-	rows = parsed_contents(program).modules
-	var walk: Result[ImportWalk, WalkStop] = Ok({ rows = rows, path = [], explored = [] })
-	for row in rows:
-		walk = walk.and_then(pure func(state): walk_module(state, row.module))
-	match walk:
-		Ok(_):
-			Ok(void)
-		Err(MissingModuleRow):
-			Err(internal_error("import target has no module row"))
-		Err(ClosedCycle(cycle, closing)):
-			paths ?= display_paths(sources, cycle, [])
-			Err(rejection(closing, Text.concat("import cycle: ", paths.join(" -> ")), IMPORT_CYCLE_HELP))
 
 
 -- Every queued path has one identity, role, read, and parse in this invocation.
@@ -391,9 +324,12 @@ func load_program(root_path: String, library_root: String) -> Result[LoadedProgr
 	})
 	sources: SourceInputs = { modules = loaded.modules }
 	match seal_program(loaded.assembly):
-		Err(error):
-			Err(failure(loaded.modules, error))
 		Ok(program):
-			match reject_import_cycles(sources, program):
+			Ok({ sources = sources, program = program })
+		Err(MalformedBundle(error)):
+			Err(failure(loaded.modules, error))
+		-- Import cycles are banned; sealing reports the first at the import that closes it.
+		Err(ImportCycle(cycle, closing)):
+			match display_paths(sources, cycle, []):
 				Err(error): Err(failure(loaded.modules, error))
-				Ok(_): Ok({ sources = sources, program = program })
+				Ok(paths): Err(failure(loaded.modules, rejection(closing, Text.concat("import cycle: ", paths.join(" -> ")), IMPORT_CYCLE_HELP)))

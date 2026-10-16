@@ -1207,8 +1207,10 @@ Semantic rules:
   arm capture, a body-local binding, or the containing function's parameter. Otherwise
   it resolves to a variant in the expected union: the innermost call's parameter
   type, or the containing function's return type when there is no enclosing call.
-  Variants in different unions may share a spelling; expected type chooses the
-  owner. `First()` is invalid because a payload-free constructor is a value;
+  A variant name is unique in its module, across all of its unions and its
+  functions; a user module also cannot declare one the prelude supplies (`True`,
+  `False`, `Some`, `None`, `Ok`, `Err`). The expected type must be the variant's
+  union. `First()` is invalid because a payload-free constructor is a value;
   `Number(expression)` supplies its one field; `Pair(left, right)` supplies two.
   Each complete field type is established by the receiving union instance.
   A name cannot refer to another function's parameter or denote a function value.
@@ -1371,20 +1373,25 @@ pure func answer() -> Int:
 The executable exits 42. Each import row starts with `./`
 or leading `../` segments, omits `.brp`, and selects local functions or fixed
 unions. The selections follow the path on its line, or on an indented block
-of lines under a path ending in `:`; each line may end with a comma. `path as
+of lines under a path ending in `:`; each line may end with a comma. A row
+names each selection, and each listed constructor, once. Repeating a selection
+is a parser error; its help teaches one combined selection, such as
+`Shape(Circle, Square)`. `path as
 Alias` names the module, alone or before `:` and selections, for qualified
 access such as `Alias.name`; an alias is scoped to its module, cannot reuse a
 declared or imported name there, and each module is imported once (GUIDE,
 One Import Per Module), so an alias and selections of one module share a
-row. A bare selector selects a local function or a visible type; if both
-exist, the selection is ambiguous. `Option(Some, None)` selects a union and those
+row. A bare selector selects a local function or a type the module declares;
+if both exist, the selection is ambiguous. `Option(Some, None)` selects a union and those
 constructors, while `Option()` selects the union without constructors. Both
 forms also enable local receiver functions. `Foo methods_only` adds receiver
 functions and requires the exact type independently visible in the caller.
 Imports precede declarations. Bare paths select target-library modules when
-the required explicit library root is supplied. Record type imports and type
-forwarding are supported. Aliases, qualified names and `private` are supported;
-wildcards and explicit reexport syntax are deferred, and a qualified
+the required explicit library root is supplied. Record type imports are
+supported; a module offers only the types it declares, so an imported type is
+never selected through a module that only imports it. Aliases, qualified names
+and `private` are supported;
+wildcards and reexports are unsupported, and a qualified
 constructor in a pattern still waits for the pattern-compilation milestone.
 
 Each module owns its declarations; same-spelled declarations in different
@@ -1397,9 +1404,11 @@ ordinary function.
 
 Paths are normalized absolute logical paths for one invocation; symlink aliases
 are not canonicalized. A diamond loads a shared path once. Import cycles,
-including a module importing itself, are rejected after loading and before
-checking: a depth-first walk over resolved targets in load order reports the
-first cycle at the import that closes it, naming its modules by display path.
+including a module importing itself, are rejected when the program is sealed,
+before checking: a depth-first walk over resolved targets in load order reports
+the first cycle at the import that closes it, and the loader names its modules
+by display path. Assembly rejects a second import of one module as it is
+appended.
 Every loaded module is checked, including unused declarations. Diagnostics
 retain the source file for primary errors and secondary notes independently.
 
@@ -1839,16 +1848,23 @@ diagnostic rendering are pure. The pipeline publishes these complete results:
    union and owner-qualified variant IDs once from the raw syntax. Consumers
    carry those IDs through accepted and checked rows; vector positions are
    traversal counters, not another identity producer.
+   Sealing walks typed written-import and implicit-prelude edges with an
+   explicit stack of module IDs and edge cursors. One visit-state vector
+   distinguishes unvisited, active and complete modules. The transient edges
+   are discarded after publishing dependency order.
    Integer conversion accumulates negatively against derived range cutoffs,
    checking before multiplication so even the minimum is represented safely.
-3. A frozen namespace maps each module's visible function names to original
-   declaration IDs. Its builder returns a complete valid namespace or a nonempty
-   typed failure. Implicit prelude exposures are expanded and validated before
-   publication. After builtin foundation validation, checking reports import and
-   visible declaration clashes before signature annotation errors. Direct
-   function and type queries return at most one binding; constructors retain
-   owner-qualified candidates for type-directed selection. Checking consumes
-   these visibility facts without repeating uniqueness checks.
+3. A frozen namespace gives each module one scope, built in dependency order:
+   its declarations, its import rows' names and, for a user module, the
+   prelude's selections. In one module a spelling denotes at most one entity
+   per space; functions and constructors share the value space, types have
+   their own, and a module alias claims both. One rule enters every name, so
+   two unions of one module cannot share a constructor name, and one rule
+   decides what a module offers: only its own public declarations. Building
+   stops at the first module with a problem and reports that one problem,
+   before signature annotation errors. Checking asks the namespace what a name
+   means in a module and what a module offers, one query per space, without
+   repeating uniqueness checks.
    Selective imports do not reexport imported names, and an
    imported function retains its defining scope. Checking resolves nominal union and owned variant identities, then publishes
    one authoritative signature per function. A private resolution context borrows
@@ -1911,8 +1927,8 @@ diagnostic rendering are pure. The pipeline publishes these complete results:
    `check_execution` while it resolves each body; [recursion.brp](src/check/recursion.brp) holds that analysis
    and also checks the finished bodies for growing recursive instantiation.
    [model.brp](src/check/model.brp) owns published semantic data,
-   [errors.brp](src/check/errors.brp) owns typed rejections and
-   [namespace.brp](src/check/namespace.brp) adapts namespace failures to them.
+   [errors.brp](src/check/errors.brp) owns typed rejections, carrying a
+   namespace problem unchanged for rendering.
    Accepted record fields and variants retain their declaration identities and
    written names alongside complete field annotations, so later checking does
    not rejoin parsed declarations to recover those facts.
@@ -2058,13 +2074,12 @@ func main() -> Int:
     add(20, 22).to_string().length()
 ```
 
-`module: Type` imports the type and enables the selected module's locally
+`module: Type` imports a type the module declares and enables its locally
 declared receiver functions through UFCS. `Type methods_only` enables those
-functions when the exact type is independently visible; it imports no type or
-constructors. Named function imports enable both direct and receiver calls.
-Forwarded types retain their original declaration identity. Constructor
-selection through a forwarding module resolves the original union's variants.
-Imported and implicit methods are never forwarded by ordinary modules.
+functions for a type the module declares or only imports, when the exact type
+is independently visible; it imports no type or constructors. Named function
+imports enable both direct and receiver calls. Imported and implicit types and
+methods are never reexported by ordinary modules.
 
 The checker associates receiver functions after accepting signatures, using
 type identities and full applied arguments. It merges overlapping exposures of

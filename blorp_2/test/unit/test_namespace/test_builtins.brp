@@ -11,20 +11,19 @@ import:
         assembly_names,
         begin_program,
         parsed_contents,
-        seal_program,
     ../../../src/parse/parse: parse_module
     ../../../src/namespace/builtins:
-        BuiltinTypeErrorKind(MissingBuiltinType, DuplicateBuiltinType, BuiltinOutsideFoundation, FoundationImports, FoundationFunctions, FoundationTypeConflict, MissingDesignatedUnion, MalformedDesignatedUnion),
+        BuiltinTypeErrorKind(MissingBuiltinType, DuplicateBuiltinType, BuiltinOutsideFoundation, FoundationImports, FoundationFunctions, MissingDesignatedUnion, MalformedDesignatedUnion),
         BuiltinTypeRole(IntegerType, StringType, FloatType, VoidType, ListType),
         DesignatedUnionRole(BoolUnion, OptionUnion, ResultUnion),
         check_builtin_types, render_builtin_type_error
     ../../../src/utils/source:
         ModuleId, ModuleKind(UserModule, FoundationTypesModule, FoundationPreludeModule),
         foundation_prelude_module_id, foundation_types_module_id, module_id, module_source, root_module_id, same_source
-    ../../../src/utils/syntax: Diagnostic
+    ../../../src/utils/syntax: Diagnostic, DiagnosticNote(PreviousDeclaration)
     option: to_result, is_none
     ../../../src/utils/text: concat
-    ../module_input: parse_modules
+    ../module_input: parse_modules, sealed
     test: TestSuite
 
 
@@ -88,7 +87,7 @@ private pure func program(base: String, root: String, prelude: String, base_targ
     prelude_tokens ?= lex(module_source(prelude_id), prelude, assembly_names(base_assembly))
     prelude_parsed ?= parse_module(prelude_tokens, prelude_id)
     complete ?= append_module(base_assembly, prelude_parsed, [], FoundationPreludeModule)
-    seal_program(complete)
+    sealed(complete)
 
 
 private pure func same_role(left: BuiltinTypeRole, right: BuiltinTypeRole) -> Bool:
@@ -109,7 +108,6 @@ private pure func same_error_kind(left: BuiltinTypeErrorKind, right: BuiltinType
         (MalformedDesignatedUnion(a), MalformedDesignatedUnion(b)): same_designated_role(a, b)
         (MissingBuiltinType(a), MissingBuiltinType(b)): same_role(a, b)
         (DuplicateBuiltinType(a), DuplicateBuiltinType(b)): same_role(a, b)
-        (FoundationTypeConflict(a), FoundationTypeConflict(b)): same_role(a, b)
         (BuiltinOutsideFoundation, BuiltinOutsideFoundation) | (FoundationImports, FoundationImports) | (FoundationFunctions, FoundationFunctions): True
         _: False
 
@@ -350,8 +348,8 @@ pure func test_user_module_cannot_redeclare_the_designated_bool() -> Bool:
                     rendered = render_failure(failure).first
                     (
                         check_errors(failure).remaining.is_empty()
-                        and rendered.message == "imported type conflicts with another type"
-                        and rendered.help == "give the types distinct names or remove the duplicate import"
+                        and rendered.message == "Bool is provided by the prelude"
+                        and rendered.help == "give this type another name; the prelude's type Bool is always in scope"
                         and same_source(rendered.span.source, module_source(root_module_id()))
                         and rendered.span.start == 12 and rendered.span.end == 16
                     )
@@ -435,30 +433,38 @@ pure func test_result_requires_two_parameters() -> Bool:
     malformed(ResultUnion, "fixed union Result[Value]:\n    Ok(Value)\n    Err(Value)\n", "Result", RESULT_SHAPE)
 
 
-private pure func foundation_nominal_conflict_rejected(prefix: String, name: String, suffix: String, role: BuiltinTypeRole) -> Bool:
-    base = TYPES.concat(prefix).concat(name).concat(suffix)
+-- The base owns its builtin names, so the namespace reports a base union or
+-- record of the same name as a second declaration of that type.
+private pure func foundation_nominal_conflict_rejected(prefix: String, name: String, suffix: String) -> Bool:
+    base = TYPES.concat(UNIONS).concat(prefix).concat(name).concat(suffix)
     match program(base, "func main() -> Int:\n    0\n", "", []):
         Err(_): False
         Ok(parsed):
-            match check_builtin_types(parsed):
+            match check(parsed):
                 Ok(_): False
-                Err(error):
-                    rendered = render_builtin_type_error(error)
+                Err(failure):
+                    rendered = render_failure(failure).first
+                    start = TYPES.length() + UNIONS.length() + prefix.length()
+                    declared_at = match TYPES.index_of("type ".concat(name)):
+                        Some(at): at + "type ".length()
+                        None: -1
+                    noted = match rendered.note:
+                        Some(PreviousDeclaration(previous)): previous.start == declared_at
+                        _: False
                     (
-                        same_error_kind(error.kind, FoundationTypeConflict(role))
-                        and same_source(error.span.source, module_source(parsed_contents(parsed).foundation.types))
-                        and error.span.start == TYPES.length() + prefix.length()
-                        and error.span.end == TYPES.length() + prefix.length() + name.length()
-                        and rendered.message == "foundation type conflicts with a builtin declaration"
-                        and rendered.help == "remove or rename this fixed union or record; ".concat(name).concat(" is owned by its builtin declaration")
-                        and rendered.note.is_none()
+                        noted
+                        and same_source(rendered.span.source, module_source(parsed_contents(parsed).foundation.types))
+                        and rendered.span.start == start
+                        and rendered.span.end == start + name.length()
+                        and rendered.message == "duplicate type name"
+                        and rendered.help == "give each type in a module a distinct name"
                     )
 
 pure func test_foundation_record_cannot_redeclare_builtin_type() -> Bool:
-    foundation_nominal_conflict_rejected("fixed record ", "Float", " { value: Int }\n", FloatType)
+    foundation_nominal_conflict_rejected("fixed record ", "Float", " { value: Int }\n")
 
 pure func test_foundation_union_cannot_redeclare_builtin_type() -> Bool:
-    foundation_nominal_conflict_rejected("fixed union ", "Int", ":\n    Value\n", IntegerType)
+    foundation_nominal_conflict_rejected("fixed union ", "Int", ":\n    Value\n")
 
 
 private pure func first_error_kind(base: String, targets: List[Int], expected: BuiltinTypeErrorKind) -> Bool:

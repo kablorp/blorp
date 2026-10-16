@@ -12,8 +12,6 @@ import:
 		ResolvedReceiver(ReceiverCandidates, UniqueReceiver),
 		ReceiverCandidate,
 		classify_receiver,
-		contains_variant,
-		lookup_target,
 		receiver_expectation,
 		method_sites,
 		select_receiver_contract
@@ -44,7 +42,7 @@ import:
 		record_error,
 		value_error,
 		UnsupportedForm(IntoOpaque, FromOpaque, RangeValue, AndOrOperator, NotOperator, IfValue, MatchInExpression, LambdaValue),
-		QualifiedError(UnknownModuleAlias, BareModuleAlias, UnknownQualifiedName, PrivateQualifiedName, QualifiedFunctionNotCalled),
+		QualifiedError(BareModuleAlias, QualifiedNotOffered, QualifiedFunctionNotCalled),
 		qualified_error,
 		unsupported_form,
 		method_error,
@@ -109,11 +107,8 @@ import:
 		validate_record_fields,
 		validate_variant_fields
 	../utils/ids: FunctionId, record_number, variant_owner
-	../namespace/namespace:
-		QualifiedLookup(ExportedDeclaration, PrivateDeclaration, NoDeclaration),
-		module_alias,
-		qualified_function,
-		qualified_variant,
+	./declarations: aliased_module
+	../namespace/namespace: NamedValue(NamedFunction, NamedConstructor, NamedAlias), OfferedValue(OfferedFunction, OfferedConstructor), named_value, offered_value
 	int as IntOps
 	../utils/names: NameId, same_name
 	../utils/source: COMPILER_SOURCE
@@ -361,12 +356,10 @@ private pure func plan_base(purity: Purity, scope: List[LocalBinding], body: Val
 			match lookup_binding(scope, name.id):
 				Some(binding): Ok(PlannedLeaf(AcceptedBinding(binding.id), binding.definition.value_type))
 				None:
-					if contains_variant(context.namespace, context.module, name.id):
-						plan_variant(name, [], False, expectation, slots, context)
-					else if module_alias(context.namespace, context.module, name.id).is_some():
-						Err(qualified_error(name.span, BareModuleAlias(name.id)))
-					else:
-						Err(value_error(name.span, UnknownValue(name.id)))
+					match named_value(context.namespace, context.module, name.id):
+						Some(NamedConstructor(_)): plan_variant(name, [], False, expectation, slots, context)
+						Some(NamedAlias(_)): Err(qualified_error(name.span, BareModuleAlias(name.id)))
+						_: Err(value_error(name.span, UnknownValue(name.id)))
 		QualifiedName(qualified): plan_qualified(qualified, [], False, expectation, slots, context, body)
 		QualifiedApplication(qualified, arguments): plan_qualified(qualified, arguments, True, expectation, slots, context, body)
 		OpaqueWrap(_, _): Err(unsupported_form(body.base_span, IntoOpaque))
@@ -398,26 +391,19 @@ private pure func plan_qualified(
 	context: ResolutionContext,
 	body: ValueExpression,
 ) -> Result[PlannedBase, CheckError]:
-	row ?= module_alias(context.namespace, context.module, qualified.module.id)
-		.to_result(qualified_error(qualified.module.span, UnknownModuleAlias(qualified.module.id)))
+	aliased ?= aliased_module(context.namespace, context.module, qualified.module)
 	name = qualified.name
-	match qualified_variant(context.namespace, row.target, name.id):
-		ExportedDeclaration(variant):
+	match offered_value(context.namespace, aliased.target, name.id):
+		Ok(OfferedConstructor(variant)):
 			plan_qualified_variant(variant_owner(variant), variant, name, arguments, called, expectation, context)
-		PrivateDeclaration(_):
-			Err(qualified_error(name.span, PrivateQualifiedName(name.id, row.path)))
-		NoDeclaration:
-			match qualified_function(context.namespace, row.target, name.id):
-				ExportedDeclaration(function):
-					if called:
-						contract ?= function_contract(context.caller, name, arguments, function, context.signatures)
-						Ok(PlannedCall(contract, arguments, ReturnPlacement(body.base_span, body.span), expectation))
-					else:
-						Err(qualified_error(body.base_span, QualifiedFunctionNotCalled(qualified.module.id, name.id)))
-				PrivateDeclaration(_):
-					Err(qualified_error(name.span, PrivateQualifiedName(name.id, row.path)))
-				NoDeclaration:
-					Err(qualified_error(name.span, UnknownQualifiedName(qualified.module.id, name.id, row.path)))
+		Ok(OfferedFunction(function)):
+			if called:
+				contract ?= function_contract(context.caller, name, arguments, function, context.signatures)
+				Ok(PlannedCall(contract, arguments, ReturnPlacement(body.base_span, body.span), expectation))
+			else:
+				Err(qualified_error(body.base_span, QualifiedFunctionNotCalled(qualified.module.id, name.id)))
+		Err(reason):
+			Err(qualified_error(name.span, QualifiedNotOffered(qualified.module.id, name.id, aliased.path, reason)))
 
 
 private pure func resolve_postfixes(purity: Purity, body: ValueExpression, context: ResolutionContext) -> Result[List[ResolvedPostfix], CheckError]:
@@ -1115,10 +1101,8 @@ private pure func classify_direct_call(
 		None:
 			Ok(void)
 
-	target = lookup_target(context, name)
-
-	match target:
-		Some(target):
+	match named_value(context.namespace, context.module, name.id):
+		Some(NamedFunction(target, _)):
 			contract ?= function_contract(
 				context.caller,
 				name,
@@ -1127,11 +1111,10 @@ private pure func classify_direct_call(
 				context.signatures,
 			)
 			Ok(FunctionApplication(contract))
-		None:
-			if contains_variant(context.namespace, context.module, name.id):
-				Ok(ConstructorApplication(name))
-			else:
-				Err(call_error(name.span, UnknownFunction(name.id)))
+		Some(NamedConstructor(_)):
+			Ok(ConstructorApplication(name))
+		_:
+			Err(call_error(name.span, UnknownFunction(name.id)))
 
 
 pure func binding_site(function: FunctionId, binding: LocalBinding) -> BindingSite:

@@ -1,12 +1,12 @@
 import:
 	../../src/utils/names: program_names
 	../../src/lex/lex: lex
-	../../src/parse/assemble: ParsedAssembly, ParsedProgram, append_module, assembly_names, begin_program, seal_program
+	../../src/parse/assemble: ParsedAssembly, ParsedProgram, SealFailure(MalformedBundle, ImportCycle), append_module, assembly_names, begin_program, seal_program
 	../../src/parse/parse: parse_module
 	../../src/utils/source:
-		COMPILER_SOURCE, ModuleId, ModuleKind(FoundationTypesModule, FoundationPreludeModule, UserModule),
+		COMPILER_SOURCE, ModuleId, ModuleKind(FoundationTypesModule, FoundationPreludeModule, LibraryModule, UserModule),
 		module_id, module_source, root_module_id,
-	../../src/utils/syntax: Diagnostic, LexedProgram
+	../../src/utils/syntax: Diagnostic, LexedProgram, diagnostic
 	int as IntOps
 	option: to_result
 	result: and_then, map
@@ -79,21 +79,40 @@ private pure func append_input(assembly: ParsedAssembly, input: ModuleInput, pos
 	append_module(assembly, parsed, targets, role)
 
 
--- The prelude follows the base, so its one import names the base's ordinal.
-private pure func append_foundation(assembly: ParsedAssembly, position: Int, foundation: TestFoundation) -> Result[ParsedProgram, Diagnostic]:
-	types ?= append_input(assembly, { source = foundation.types, targets = [] }, position, FoundationTypesModule)
-	prelude_source = "import:\n    _base: " + foundation.prelude_selections + "\n"
-	prelude ?= append_input(types, { source = prelude_source, targets = [position] }, IntOps.add(position, 1), FoundationPreludeModule)
-	seal_program(prelude)
+-- The test prelude's source: one import of the base.
+pure func prelude_source(foundation: TestFoundation) -> String:
+	"import:\n    _base: " + foundation.prelude_selections + "\n"
+
+
+-- The base at `position`, then the prelude after it.
+private pure func append_foundation(assembly: ParsedAssembly, position: Int, types: String, prelude: ModuleInput) -> Result[ParsedProgram, Diagnostic]:
+	base ?= append_input(assembly, { source = types, targets = [] }, position, FoundationTypesModule)
+	complete ?= append_input(base, prelude, IntOps.add(position, 1), FoundationPreludeModule)
+	sealed(complete)
+
+
+-- Sealing as the loader does. A cycle is reported at its closing import; the
+-- loader's own text, with display paths, is tested in `test_load`.
+pure func sealed(assembly: ParsedAssembly) -> Result[ParsedProgram, Diagnostic]:
+	match seal_program(assembly):
+		Ok(program): Ok(program)
+		Err(MalformedBundle(error)): Err(error)
+		Err(ImportCycle(_, closing)): Err(diagnostic(closing, "import cycle among the test modules", "remove one import of the cycle"))
 
 
 -- Already resolved edges preserve user declaration ordinals. The test prelude
 -- adds no operation functions; production defaults have separate e2e tests.
-pure func parse_modules_with_base(inputs: List[ModuleInput], foundation: TestFoundation) -> Result[ParsedProgram, Diagnostic]:
+-- Inputs from position `first_library` on are library modules, which do not
+-- receive the prelude. An input's target is another input's position; only the
+-- prelude may also name the base, which follows the inputs, so a missing
+-- target never binds to the foundation.
+private pure func parse_in_roles(inputs: List[ModuleInput], types: String, prelude: ModuleInput, first_library: Int) -> Result[ParsedProgram, Diagnostic]:
 	var valid_targets = True
 	for input in inputs:
 		for ordinal in input.targets:
 			valid_targets = valid_targets and IntOps.greater_than_or_equal(ordinal, 0) and IntOps.less_than(ordinal, inputs.length())
+	for ordinal in prelude.targets:
+		valid_targets = valid_targets and IntOps.greater_than_or_equal(ordinal, 0) and IntOps.less_than_or_equal(ordinal, inputs.length())
 	targets ?= if valid_targets:
 		Ok(void)
 	else:
@@ -102,14 +121,36 @@ pure func parse_modules_with_base(inputs: List[ModuleInput], foundation: TestFou
 	var position: Int = 0
 	for input in inputs:
 		ordinal = position
-		assembly = assembly.and_then(pure func(builder): append_input(builder, input, ordinal, UserModule))
+		role = if IntOps.less_than(position, first_library):
+			UserModule
+		else:
+			LibraryModule
+		assembly = assembly.and_then(pure func(builder): append_input(builder, input, ordinal, role))
 		position = IntOps.add(position, 1)
 	complete ?= assembly
-	append_foundation(complete, position, foundation)
+	append_foundation(complete, position, types, prelude)
+
+
+-- The prelude of `foundation`: one import of the base, which follows the inputs.
+private pure func foundation_prelude(inputs: List[ModuleInput], foundation: TestFoundation) -> ModuleInput:
+	{ source = prelude_source(foundation), targets = [inputs.length()] }
+
+
+pure func parse_modules_with_base(inputs: List[ModuleInput], foundation: TestFoundation) -> Result[ParsedProgram, Diagnostic]:
+	parse_in_roles(inputs, foundation.types, foundation_prelude(inputs, foundation), inputs.length())
 
 
 pure func parse_modules(inputs: List[ModuleInput]) -> Result[ParsedProgram, Diagnostic]:
 	parse_modules_with_base(inputs, TEST_BASE)
+
+
+pure func parse_modules_with_libraries(inputs: List[ModuleInput], first_library: Int) -> Result[ParsedProgram, Diagnostic]:
+	parse_in_roles(inputs, TEST_BASE.types, foundation_prelude(inputs, TEST_BASE), first_library)
+
+
+-- The same, with a prelude of the test's own over the test base.
+pure func parse_modules_with_prelude(inputs: List[ModuleInput], first_library: Int, prelude: ModuleInput) -> Result[ParsedProgram, Diagnostic]:
+	parse_in_roles(inputs, TEST_BASE.types, prelude, first_library)
 
 
 -- Callers select these small source inputs explicitly, together with their edges.
@@ -138,4 +179,4 @@ pure func parse_root(input: LexedProgram) -> Result[ParsedProgram, Diagnostic]:
 	assembly = begin_program()
 	parsed ?= parse_module(input, root_module_id())
 	root ?= append_module(assembly, parsed, [], UserModule)
-	append_foundation(root, 1, PRIMITIVE_BASE)
+	append_foundation(root, 1, PRIMITIVE_BASE.types, { source = prelude_source(PRIMITIVE_BASE), targets = [1] })

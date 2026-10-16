@@ -1,938 +1,726 @@
+---
+The namespace: every module's scope, built once from the sealed parsed program
+before checking. In one module a spelling denotes at most one entity per space,
+and `enter` is the only place that rule is checked; `offer` is the only place
+it is decided what a module offers its importers. Modules are built in
+dependency order, so each import reads a finished scope. Building stops at the
+first module with a problem: every later module depends on it or would be
+reported after it, and checking reports one problem.
+
+The sections run in this order: the data, identity, the rule and the offer,
+building, selection, then the queries. Only `build_namespace`, the queries,
+the identity helpers and the types they exchange are public; the rule, the
+offer and the scopes being built stay private to this module.
+---
 import:
 	../utils/ids:
-		FunctionId, RecordId, UnionId, VariantId,
-		function_number, record_number,
+		FunctionId, FunctionRow, RecordId, UnionId, UnionRow, VariantId,
+		function_number, inventory_functions, next_nominal, record_number,
 		union_number, variant_number, variant_owner,
-		inventory_functions, inventory_records, inventory_unions,
-		NominalRow(UnionDeclarationRow, RecordDeclarationRow), next_nominal,
+		NominalRow(UnionDeclarationRow, RecordDeclarationRow),
 	int as IntOps
-	../utils/names: NameId, same_name
+	list: repeat
+	../utils/int_map as IntMaps
+	../utils/names: NameId, name_number
 	../parse/assemble: ModuleImport, ParsedContents, ParsedModuleRow, ParsedProgram, parsed_contents
-	../parse/parse: ImportSelection(NamedSelection, ConstructorSelection, MethodsOnlySelection), ModulePath
+	../parse/parse: ImportSelection(NamedSelection, ConstructorSelection, MethodsOnlySelection), ModulePath, selection_name
 	./builtins: PrimitiveType(BuiltinInt, BuiltinFloat, BuiltinString, BuiltinVoid), builtin_type_name
-	../utils/source: ModuleId, ModuleKind(UserModule), same_module
+	../utils/source: ModuleId, ModuleKind(UserModule, LibraryModule, FoundationTypesModule, FoundationPreludeModule), module_number, same_module
 	../utils/syntax:
 		ParsedBuiltinType(IntegerBuiltin, FloatBuiltin, StringBuiltin, VoidBuiltin, ListBuiltin),
 		Span, Visibility(Public, Private), WrittenName,
 
 
-fixed union FunctionOrigin:
-	LocalFunction
-	ImportedFunction(Span)
+
+-- Data: what a module's names denote, and why a name does not enter.
 
 
-fixed record FunctionCandidate {
-	function: FunctionId,
-	origin: FunctionOrigin
-}
+-- The head a type name denotes; accepted type arguments stay in checking.
+fixed union TypeHead:
+	PrimitiveHead(PrimitiveType)
+	ListHead
+	UnionHead(UnionId)
+	RecordHead(RecordId)
 
 
-fixed record ImportedFunctionBinding {
-	module: ModuleId,
-	name: WrittenName,
-	function: FunctionId
-}
-
-
--- A constructor name visible in a module, whether declared there or imported.
--- `visibility` is the declaring union's: constructors are exported with it.
-private fixed record VariantBinding {
-	module: ModuleId,
-	name: WrittenName,
-	variant: VariantId,
-	declaration_span: Span,
-	visibility: Visibility
-}
-
-
--- `path as Alias` in one module's import block: the alias is a module name,
--- scoped to the importing module, never a value or type.
-fixed record ModuleAlias {
-	module: ModuleId,
-	name: WrittenName,
+-- `path as Alias`: the module it names, and its path as written, which
+-- qualified-name diagnostics quote.
+fixed record AliasedModule {
 	target: ModuleId,
 	path: ModulePath
 }
 
 
--- What a qualified name finds among a module's own declarations.
-fixed union QualifiedLookup[A]:
-	ExportedDeclaration(A)
-	PrivateDeclaration(Span)
-	NoDeclaration
+-- What a written name denotes in a module.
+fixed union Entity:
+	Function(FunctionId)
+	Constructor(VariantId)
+	Type(TypeHead)
+	Alias(AliasedModule)
 
 
--- These heads reserve declaration identity; accepted parameter types remain
--- solely in the checker. List has no primitive scalar representation.
-fixed union TypeCandidate:
-	PrimitiveCandidate(PrimitiveType)
-	ListCandidate
-	UnionCandidate(UnionId)
-	RecordCandidate(RecordId)
+-- How a name entered its module: declared there, written in its import block
+-- (a selection or an alias), or supplied by the prelude.
+fixed union Origin:
+	Declared(Visibility)
+	Imported
+	Implicit
 
 
-fixed record MethodSelectionRequest {
-	module: ModuleId,
-	target: ModuleId,
+-- One name of a module. `name.span` is where diagnostics point: the
+-- declaration, the selection or alias, or the prelude's own selection.
+fixed record Entry {
 	name: WrittenName,
-	receiver: TypeCandidate
+	entity: Entity,
+	origin: Origin
 }
 
 
-fixed union ImportProblem:
-	RepeatedModuleImport(ModuleId, Span, Span)
-	MissingImportedFunction(ModuleId, WrittenName)
-	RepeatedImportedFunction(WrittenName, Span)
-	AmbiguousImportSelection(ModuleId, WrittenName)
-	MissingImportedType(ModuleId, WrittenName)
-	AmbiguousImportedType(ModuleId, WrittenName)
-	MethodTypeNotVisible(WrittenName)
-	MissingImportedUnion(WrittenName)
-	AmbiguousImportedUnion(WrittenName)
-	MissingImportedVariant(WrittenName)
-	RepeatedImportedVariant(WrittenName, Span)
-	ImportedTypeConflict(WrittenName, Span)
-	PrivateImportSelection(WrittenName, ModulePath)
-	RepeatedModuleAlias(WrittenName, Span)
-	ModuleAliasNameConflict(WrittenName, Span)
+-- A module's two name spaces: values (functions and constructors) and types.
+-- A module alias claims its spelling in both.
+private fixed union Space:
+	Values
+	Types
+
+
+-- A type selection, or `T methods_only`, imports the target's public receiver
+-- functions of `receiver`; checking resolves it after signatures.
+fixed record MethodImport {
+	target: ModuleId,
+	receiver: TypeHead,
+	name: WrittenName
+}
+
+
+-- One module's names, in the order they entered, keyed by `space_key`.
+private fixed record ModuleScope {
+	names: IntMaps.IntMap[Entry],
+	methods: List[MethodImport]
+}
+
+
+-- Why a module does not offer a name: none of that kind, a private
+-- declaration, or a name it imports or receives from the prelude.
+fixed union Unoffered:
+	UnknownName
+	PrivateName
+	ImportedThere(Entity)
+	ProvidedThere(Entity)
+
+
+-- Why a selection binds nothing. A name the target only imports may already be
+-- in the selecting module's scope, through the prelude or an earlier import.
+fixed union SelectionProblem:
+	NotOffered(Unoffered)
+	AlreadyFromPrelude(Entity)
+	AlreadyImported(Entity)
+	Ambiguous
+	BareConstructor(VariantId)
+	NotAConstructor(WrittenName)
+	ReceiverNotVisible
+
+
+-- `incoming` reached a space `previous` already holds for its spelling.
+fixed record Conflict {
+	incoming: Entry,
+	previous: Entry
+}
 
 
 fixed union NamespaceProblem:
-	ImportSelectionFailure(ImportProblem)
-	DuplicateFunctionName(WrittenName, Span)
-	DuplicateUnionName(WrittenName, Span)
-	DuplicateTypeName(WrittenName, Span)
-	DuplicateVariantName(WrittenName, Span)
-	VariantFunctionNameConflict(NameId, Span, Span)
-	ImportedConstructorNameConflict(WrittenName, Span)
-	ImportedFunctionNameConflict(WrittenName, Span)
-	ImportedVariantNameConflict(WrittenName, Span)
+	NameConflict(Conflict)
+	SelectionFailure(ModulePath, ImportSelection, SelectionProblem)
 
 
-fixed record NamespaceFailure {
-	first: NamespaceProblem,
-	remaining: List[NamespaceProblem]
+-- A module's scope as it is built, with its first problem in source order.
+-- Its fields are flat so that each update can reuse them in place.
+private fixed record BuiltScope {
+	names: IntMaps.IntMap[Entry],
+	methods: List[MethodImport],
+	problem: Option[NamespaceProblem]
 }
 
 
-private fixed record LocalFunctionBinding {
-	module: ModuleId,
-	name: WrittenName,
-	function: FunctionId,
-	visibility: Visibility
-}
+-- One scope per module, indexed by module number, for one compilation.
+opaque type Namespace = List[ModuleScope]
 
 
--- A type name visible in `module`: declared there (builtins belong to the
--- foundation types module) with its visibility, or forwarded by an import,
--- which never exports.
-private fixed union TypeOrigin:
-	DeclaredType(Visibility)
-	ImportedType
+-- Where a function a module names comes from: its own declaration, or the
+-- selection that imported it, whose span diagnostics cite.
+fixed union FunctionSource:
+	DeclaredHere
+	ImportedAt(Span)
 
 
-private fixed record TypeBinding {
-	module: ModuleId,
-	name: WrittenName,
-	target: TypeCandidate,
-	origin: TypeOrigin
-}
+-- What a name denotes in the value space.
+fixed union NamedValue:
+	NamedFunction(FunctionId, FunctionSource)
+	NamedConstructor(VariantId)
+	NamedAlias(AliasedModule)
 
 
-private fixed union TypeSelectionKind:
-	AnyTypeSelection
-	UnionTypeSelection
+-- What a module offers importers in the value space: never an alias.
+fixed union OfferedValue:
+	OfferedFunction(FunctionId)
+	OfferedConstructor(VariantId)
 
 
--- Transient written requests supply type scope before signatures exist. Keeping
--- their importing module explicit also distinguishes prelude selections from
--- declarations that merely happen to live in the prelude module.
-private fixed record TypeImportRequest {
-	module: ModuleId,
-	target: ModuleId,
-	name: WrittenName,
-	kind: TypeSelectionKind
-}
+-- Identity of type heads and entities.
 
 
-private fixed record NamespaceContents {
-	functions: List[LocalFunctionBinding],
-	imports: List[ImportedFunctionBinding],
-	constructors: List[VariantBinding],
-	types: List[TypeBinding],
-	variants: List[VariantBinding],
-	methods: List[MethodSelectionRequest],
-	aliases: List[ModuleAlias]
-}
-
-
--- Derived once from a sealed parsed program. No accepted signatures or types
--- enter this product; the checker interprets method requests after signatures.
-opaque type Namespace = NamespaceContents
-
-
-pure func same_type_candidate(left: TypeCandidate, right: TypeCandidate) -> Bool:
+pure func same_head(left: TypeHead, right: TypeHead) -> Bool:
 	match left:
-		PrimitiveCandidate(BuiltinInt):
+		PrimitiveHead(BuiltinInt):
 			match right:
-				PrimitiveCandidate(BuiltinInt): True
+				PrimitiveHead(BuiltinInt): True
 				_: False
-		PrimitiveCandidate(BuiltinFloat):
+		PrimitiveHead(BuiltinFloat):
 			match right:
-				PrimitiveCandidate(BuiltinFloat): True
+				PrimitiveHead(BuiltinFloat): True
 				_: False
-		PrimitiveCandidate(BuiltinString):
+		PrimitiveHead(BuiltinString):
 			match right:
-				PrimitiveCandidate(BuiltinString): True
+				PrimitiveHead(BuiltinString): True
 				_: False
-		PrimitiveCandidate(BuiltinVoid):
+		PrimitiveHead(BuiltinVoid):
 			match right:
-				PrimitiveCandidate(BuiltinVoid): True
+				PrimitiveHead(BuiltinVoid): True
 				_: False
-		ListCandidate:
+		ListHead:
 			match right:
-				ListCandidate: True
+				ListHead: True
 				_: False
-		UnionCandidate(first):
+		UnionHead(first):
 			match right:
-				UnionCandidate(second): same_union(first, second)
+				UnionHead(second): IntOps.equals(union_number(first), union_number(second))
 				_: False
-		RecordCandidate(first):
+		RecordHead(first):
 			match right:
-				RecordCandidate(second): IntOps.equals(record_number(first), record_number(second))
+				RecordHead(second): IntOps.equals(record_number(first), record_number(second))
 				_: False
 
 
-private pure func local_functions(bindings: List[LocalFunctionBinding], module: ModuleId, name: NameId) -> List[FunctionId]:
-	var candidates: List[FunctionId] = []
-	for binding in bindings:
-		if same_module(binding.module, module) and same_name(binding.name.id, name):
-			candidates = candidates.append(binding.function)
-	candidates
+private pure func same_entity(left: Entity, right: Entity) -> Bool:
+	match left:
+		Function(first):
+			match right:
+				Function(second): IntOps.equals(function_number(first), function_number(second))
+				_: False
+		Constructor(first):
+			match right:
+				Constructor(second):
+					IntOps.equals(union_number(variant_owner(first)), union_number(variant_owner(second))) and IntOps.equals(variant_number(first), variant_number(second))
+				_: False
+		Type(first):
+			match right:
+				Type(second): same_head(first, second)
+				_: False
+		Alias(first):
+			match right:
+				Alias(second): same_module(first.target, second.target)
+				_: False
 
 
-private pure func first_local_function(bindings: List[LocalFunctionBinding], module: ModuleId, name: NameId) -> Option[LocalFunctionBinding]:
-	var found: Option[LocalFunctionBinding] = None
-	for binding in bindings:
-		if same_module(binding.module, module) and same_name(binding.name.id, name):
-			found = Some(binding)
-			break
-	found
+-- The head a builtin type declaration of the base declares.
+pure func builtin_head(declaration: ParsedBuiltinType) -> TypeHead:
+	match declaration:
+		IntegerBuiltin(_): PrimitiveHead(BuiltinInt)
+		FloatBuiltin(_): PrimitiveHead(BuiltinFloat)
+		StringBuiltin(_): PrimitiveHead(BuiltinString)
+		VoidBuiltin(_): PrimitiveHead(BuiltinVoid)
+		ListBuiltin(_): ListHead
 
 
-pure func local_function(namespace: Namespace, module: ModuleId, name: NameId) -> Option[FunctionId]:
-	first_local_function(from_opaque Namespace(namespace).functions, module, name).map(pure func(binding): binding.function)
+-- The rule and the offer.
 
 
-private pure func same_function(left: FunctionId, right: FunctionId) -> Bool:
-	IntOps.equals(function_number(left), function_number(right))
+private pure func empty_scope() -> ModuleScope:
+	none: List[MethodImport] = []
+	{ names = IntMaps.empty_int_map(), methods = none }
 
 
-private pure func same_union(left: UnionId, right: UnionId) -> Bool:
-	IntOps.equals(union_number(left), union_number(right))
+-- A spelling's entry in each space has its own key: 2n for values and 2n + 1
+-- for types, where n is the spelling's `name_number`.
+private pure func space_key(space: Space, name: NameId) -> Int:
+	values_key = IntOps.multiply(name_number(name), 2)
+	match space:
+		Values: values_key
+		Types: IntOps.add(values_key, 1)
 
 
-private pure func same_variant(left: VariantId, right: VariantId) -> Bool:
-	same_union(variant_owner(left), variant_owner(right)) and IntOps.equals(variant_number(left), variant_number(right))
+-- The entry `names` holds for `name` in `space`; the rule leaves at most one.
+private pure func holder(names: IntMaps.IntMap[Entry], space: Space, name: NameId) -> Option[Entry]:
+	IntMaps.get(names, space_key(space, name))
 
 
-pure func function_candidate(namespace: Namespace, module: ModuleId, name: NameId) -> Option[FunctionCandidate]:
-	contents = from_opaque Namespace(namespace)
-	var found: Option[FunctionCandidate] = None
-	match first_local_function(contents.functions, module, name):
-		Some(binding): found = Some({ function = binding.function, origin = LocalFunction })
+-- A module reports its first problem in source order. Names do not enter in
+-- source order (`methods_only` selections follow every row), but every
+-- problem's span lies in the module's own source, so starts compare.
+private pure func first_problem(found: Option[NamespaceProblem], later: NamespaceProblem) -> Option[NamespaceProblem]:
+	match found:
+		Some(earlier):
+			if IntOps.less_than(namespace_problem_span(later).start, namespace_problem_span(earlier).start):
+				Some(later)
+			else:
+				found
 		None:
-			for binding in contents.imports:
-				if same_module(binding.module, module) and same_name(binding.name.id, name):
-					found = Some({ function = binding.function, origin = ImportedFunction(binding.name.span) })
-					break
-	found
+			Some(later)
 
 
-private pure func visible_types(bindings: List[TypeBinding], module: ModuleId, name: NameId) -> List[TypeCandidate]:
-	var candidates: List[TypeCandidate] = []
-	for binding in bindings:
-		if same_module(binding.module, module) and same_name(binding.name.id, name):
-			var present = False
-			for candidate in candidates:
-				present = present or same_type_candidate(candidate, binding.target)
-			if not present:
-				candidates = candidates.append(binding.target)
-	candidates
+-- What `names` already holds in a space that `entity` named `name` claims.
+private pure func claimant(names: IntMaps.IntMap[Entry], name: NameId, entity: Entity) -> Option[Entry]:
+	match entity:
+		Function(_) | Constructor(_):
+			holder(names, Values, name)
+		Type(_):
+			holder(names, Types, name)
+		Alias(_):
+			match holder(names, Values, name):
+				Some(held): Some(held)
+				None: holder(names, Types, name)
 
 
-pure func type_candidate(namespace: Namespace, module: ModuleId, name: NameId) -> Option[TypeCandidate]:
-	var found: Option[TypeCandidate] = None
-	for binding in from_opaque Namespace(namespace).types:
-		if same_module(binding.module, module) and same_name(binding.name.id, name):
-			found = Some(binding.target)
-			break
-	found
+-- `names` with `incoming` in each space it claims. This is a scope's only
+-- writer, so a value key never holds a type, a type key never holds a function
+-- or constructor, and an alias, entered only by `import_row`, is always
+-- `Imported`. The arms that read those states (in `named_value`, `named_type`,
+-- `offered_value`, `offered_type`, `select_methods` and render) are
+-- unreachable. Typed per-space entries would remove them, but measured they
+-- cost a second copy of `enter` per space, about 37 more lines, and about 80
+-- more allocations on a one-line program, so one `Entity` serves both spaces.
+private pure func claimed(names: IntMaps.IntMap[Entry], incoming: Entry) -> IntMaps.IntMap[Entry]:
+	name = incoming.name.id
+	match incoming.entity:
+		Function(_) | Constructor(_):
+			IntMaps.set(names, space_key(Values, name), incoming)
+		Type(_):
+			IntMaps.set(names, space_key(Types, name), incoming)
+		Alias(_):
+			IntMaps.set(IntMaps.set(names, space_key(Values, name), incoming), space_key(Types, name), incoming)
 
 
-pure func variant_candidates(namespace: Namespace, module: ModuleId, name: NameId) -> List[VariantId]:
-	contents = from_opaque Namespace(namespace)
-	var candidates: List[VariantId] = []
-	for binding in contents.variants:
-		if same_module(binding.module, module) and same_name(binding.name.id, name):
-			candidates = candidates.append(binding.variant)
-	for binding in contents.constructors:
-		if same_module(binding.module, module) and same_name(binding.name.id, name):
-			var present = False
-			for candidate in candidates:
-				present = present or same_variant(candidate, binding.variant)
-			if not present:
-				candidates = candidates.append(binding.variant)
-	candidates
-
-
-pure func imported_functions(namespace: Namespace) -> List[ImportedFunctionBinding]:
-	from_opaque Namespace(namespace).imports
-
-
-pure func module_alias(namespace: Namespace, module: ModuleId, name: NameId) -> Option[ModuleAlias]:
-	var found: Option[ModuleAlias] = None
-	for row in from_opaque Namespace(namespace).aliases:
-		if same_module(row.module, module) and same_name(row.name.id, name):
-			found = Some(row)
-			break
-	found
-
-
-private pure func exported[A](visibility: Visibility, declaration: A) -> QualifiedLookup[A]:
-	match visibility:
-		Public: ExportedDeclaration(declaration)
-		Private(span): PrivateDeclaration(span)
-
-
--- The functions a module declares itself; imports are not reexported.
-pure func qualified_function(namespace: Namespace, target: ModuleId, name: NameId) -> QualifiedLookup[FunctionId]:
-	match first_local_function(from_opaque Namespace(namespace).functions, target, name):
-		Some(binding): exported(binding.visibility, binding.function)
-		None: NoDeclaration
-
-
-pure func qualified_variant(namespace: Namespace, target: ModuleId, name: NameId) -> QualifiedLookup[VariantId]:
-	var found: QualifiedLookup[VariantId] = NoDeclaration
-	for binding in from_opaque Namespace(namespace).variants:
-		if same_module(binding.module, target) and same_name(binding.name.id, name):
-			found = exported(binding.visibility, binding.variant)
-			break
-	found
-
-
-pure func qualified_type(namespace: Namespace, target: ModuleId, name: NameId) -> QualifiedLookup[TypeCandidate]:
-	var found: QualifiedLookup[TypeCandidate] = NoDeclaration
-	for binding in from_opaque Namespace(namespace).types:
-		if same_module(binding.module, target) and same_name(binding.name.id, name):
-			match binding.origin:
-				DeclaredType(visibility):
-					found = exported(visibility, binding.target)
-					break
-				ImportedType: void
-	found
-
-
--- The public functions `module` declares itself: what an importer's method
--- selection may bind. Visibility is read here, not by the checker.
-pure func exported_functions(namespace: Namespace, module: ModuleId) -> List[FunctionId]:
-	var functions: List[FunctionId] = []
-	for binding in from_opaque Namespace(namespace).functions:
-		if same_module(binding.module, module):
-			match binding.visibility:
-				Public: functions = functions.append(binding.function)
-				Private(_): void
-	functions
-
-
--- The span of a private declaration `name` in `target`, if any.
-private pure func private_declaration(scan: ImportScan, target: ModuleId, name: NameId) -> Option[Span]:
-	var found: Option[Span] = None
-	match first_local_function(scan.functions, target, name):
-		Some(binding):
-			match binding.visibility:
-				Private(span): found = Some(span)
-				Public: void
+-- The scope rule. An import of an entity the module already sees (the
+-- prelude's, and an explicit import of it) enters once; a declaration always
+-- claims its spelling, so a second declaration of anything is a conflict.
+-- Every path returns `built` or a record update of it: the host updates a
+-- scope in place only then, and copies its map on every entry otherwise.
+private pure func enter(built: BuiltScope, incoming: Entry) -> BuiltScope:
+	match claimant(built.names, incoming.name.id, incoming.entity):
 		None:
-			for binding in scan.types:
-				if same_module(binding.module, target) and same_name(binding.name.id, name):
-					match binding.origin:
-						DeclaredType(Private(span)):
-							found = Some(span)
-							break
-						DeclaredType(Public) | ImportedType: void
-	found
+			{ built | names = claimed(built.names, incoming) }
+		Some(held):
+			arrives_again = match incoming.origin:
+				Declared(_): False
+				Imported | Implicit: same_entity(held.entity, incoming.entity)
+			if arrives_again:
+				built
+			else:
+				{ built | problem = first_problem(built.problem, NameConflict({ incoming = incoming, previous = held })) }
 
 
-pure func method_selection_requests(namespace: Namespace) -> List[MethodSelectionRequest]:
-	from_opaque Namespace(namespace).methods
+-- A module offers importers only its own public declarations (decided
+-- 2026-10-15: a module never reexports), to selections, qualified names and
+-- method imports alike. An alias is never offered.
+private pure func offer(found: Option[Entry]) -> Result[Entity, Unoffered]:
+	match found:
+		Some(entry):
+			match entry.entity:
+				Alias(_): Err(UnknownName)
+				Function(_) | Constructor(_) | Type(_):
+					match entry.origin:
+						Declared(Public): Ok(entry.entity)
+						Declared(Private(_)): Err(PrivateName)
+						Imported: Err(ImportedThere(entry.entity))
+						Implicit: Err(ProvidedThere(entry.entity))
+		None:
+			Err(UnknownName)
 
 
-pure func import_problem_span(problem: ImportProblem) -> Span:
+-- Building, in dependency order.
+
+
+-- `entries` with a union's type, then each constructor with the union's visibility.
+private pure func with_union(entries: List[Entry], row: UnionRow) -> List[Entry]:
+	var grown = entries.append({ name = row.type_name, entity = Type(UnionHead(row.id)), origin = Declared(row.visibility) })
+	for variant in row.variants:
+		grown = grown.append({ name = variant.declaration.name, entity = Constructor(variant.id), origin = Declared(row.visibility) })
+	grown
+
+
+private pure func nominal_module(row: NominalRow) -> ModuleId:
+	match row:
+		UnionDeclarationRow(union_row): union_row.module
+		RecordDeclarationRow(record_row): record_row.declaration.module
+
+
+private pure func nominal_start(row: NominalRow) -> Int:
+	match row:
+		UnionDeclarationRow(union_row): union_row.type_name.span.start
+		RecordDeclarationRow(record_row): record_row.declaration.type_name.span.start
+
+
+-- Whether a module's next nominal declaration is written before its next
+-- function, if it has one left.
+private pure func written_before(nominal: NominalRow, function: Option[FunctionRow]) -> Bool:
+	match function:
+		Some(next): IntOps.less_than(nominal_start(nominal), next.declaration.function_name.span.start)
+		None: True
+
+
+-- Each module's declared entries in source order, indexed by module number.
+-- Builtin types come first: the base owns them, so a union or record that
+-- reuses a builtin's name is the one reported. Assembly appends each kind's
+-- rows grouped by module in module order, so one cursor per kind reads each
+-- row once; the module's next nominal declaration and next function are
+-- taken in the order they are written.
+private pure func declared_entries(parsed: ParsedContents) -> List[List[Entry]]:
+	functions = inventory_functions(parsed.declarations)
+	var builtins_seen = 0
+	var functions_seen = 0
+	var records_seen = 0
+	var unions_seen = 0
+	var declared: List[List[Entry]] = []
+	for row in parsed.modules:
+		var entries: List[Entry] = []
+		var reading = True
+		while reading:
+			match parsed.builtin_types.get(builtins_seen):
+				Some(primitive):
+					reading = same_module(primitive.module, row.module)
+					if reading:
+						entries = entries.append({ name = builtin_type_name(primitive.declaration), entity = Type(builtin_head(primitive.declaration)), origin = Declared(Public) })
+						builtins_seen = IntOps.add(builtins_seen, 1)
+				None:
+					reading = False
+		reading = True
+		while reading:
+			function: Option[FunctionRow] = match functions.get(functions_seen):
+				Some(candidate):
+					if same_module(candidate.declaration.module, row.module):
+						Some(candidate)
+					else:
+						None
+				None:
+					None
+			nominal: Option[NominalRow] = match next_nominal(parsed.declarations, records_seen, unions_seen):
+				Some(candidate):
+					if same_module(nominal_module(candidate), row.module) and written_before(candidate, function):
+						Some(candidate)
+					else:
+						None
+				None:
+					None
+			match nominal:
+				Some(UnionDeclarationRow(union_row)):
+					entries = with_union(entries, union_row)
+					unions_seen = IntOps.add(unions_seen, 1)
+				Some(RecordDeclarationRow(record_row)):
+					declaration = record_row.declaration
+					entries = entries.append({ name = declaration.type_name, entity = Type(RecordHead(record_row.id)), origin = Declared(declaration.visibility) })
+					records_seen = IntOps.add(records_seen, 1)
+				None:
+					match function:
+						Some(function_row):
+							entries = entries.append({ name = function_row.declaration.function_name, entity = Function(function_row.id), origin = Declared(function_row.declaration.visibility) })
+							functions_seen = IntOps.add(functions_seen, 1)
+						None:
+							reading = False
+		declared = declared.append(entries)
+	declared
+
+
+-- The prelude's selections, as every user module receives them. Its aliases
+-- and declarations stay its own.
+private pure func provided(prelude: ModuleScope) -> List[Entry]:
+	var entries: List[Entry] = []
+	for entry in IntMaps.values(prelude.names):
+		match entry.entity:
+			Alias(_): void
+			Function(_) | Constructor(_) | Type(_):
+				match entry.origin:
+					Imported: entries = entries.append({ entry | origin = Implicit })
+					Declared(_) | Implicit: void
+	entries
+
+
+-- One module: the names it receives, then its import rows, its `methods_only`
+-- selections, and its declarations, so a conflict is reported at the later
+-- name, in this module. Each map is presized for the received and declared
+-- names and one name per import row; a long selection list grows it. `empty`
+-- is only the host `get` default: dependency order builds every target before
+-- the modules that import it, so it is never read.
+private pure func build_module(scopes: List[ModuleScope], empty: ModuleScope, row: ParsedModuleRow, declared: List[Entry], received: List[Entry], methods: List[MethodImport]) -> BuiltScope:
+	expected = IntOps.add(IntOps.add(received.length(), declared.length()), row.imports.length())
+	var built: BuiltScope = { names = IntMaps.int_map_with_capacity(expected), methods = methods, problem = None }
+	for entry in received:
+		built = enter(built, entry)
+	for request in row.imports:
+		built = import_row(built, scopes.get_or(module_number(request.target), empty), request)
+	for request in row.imports:
+		built = select_methods(built, scopes.get_or(module_number(request.target), empty), request)
+	for entry in declared:
+		built = enter(built, entry)
+	built
+
+
+-- Host `get` defaults are unreachable: every index is a sealed module number,
+-- and the prelude precedes every user module in dependency order.
+pure func build_namespace(program: ParsedProgram) -> Result[Namespace, NamespaceProblem]:
+	parsed = parsed_contents(program)
+	declared = declared_entries(parsed)
+	none: List[MethodImport] = []
+	nothing: List[Entry] = []
+	empty = empty_scope()
+	var scopes: List[ModuleScope] = repeat(empty, parsed.modules.length())
+	var prelude_entries = nothing
+	var prelude_methods = none
+	var failure: Option[NamespaceProblem] = None
+	for row in parsed.dependency_order:
+		number = module_number(row.module)
+		built = match row.role:
+			UserModule: build_module(scopes, empty, row, declared.get_or(number, nothing), prelude_entries, prelude_methods)
+			FoundationTypesModule | FoundationPreludeModule | LibraryModule: build_module(scopes, empty, row, declared.get_or(number, nothing), nothing, none)
+		failure = built.problem
+		scope: ModuleScope = { names = built.names, methods = built.methods }
+		scopes = scopes.set(number, scope)
+		if same_module(row.module, parsed.foundation.prelude):
+			prelude_entries = provided(scope)
+			prelude_methods = scope.methods
+		if failure.is_some():
+			break
+	match failure:
+		Some(problem): Err(problem)
+		None: Ok(into_opaque Namespace(scopes))
+
+
+-- Selection: how an import row enters names, its alias first and then each
+-- selection, resolved against what the target offers. `methods_only`
+-- selections are resolved after a module's rows, because a later row may
+-- import the type they name.
+
+
+-- A name the target only imports may already be in this module's scope.
+private pure func seen_here(built: BuiltScope, name: NameId, problem: SelectionProblem) -> SelectionProblem:
 	match problem:
-		RepeatedModuleImport(_, _, occurrence): occurrence
-		MissingImportedFunction(_, name): name.span
-		RepeatedImportedFunction(name, _): name.span
-		AmbiguousImportSelection(_, name): name.span
-		MissingImportedType(_, name): name.span
-		AmbiguousImportedType(_, name): name.span
-		MethodTypeNotVisible(name): name.span
-		MissingImportedUnion(name): name.span
-		AmbiguousImportedUnion(name): name.span
-		MissingImportedVariant(name): name.span
-		RepeatedImportedVariant(name, _): name.span
-		ImportedTypeConflict(name, _): name.span
-		PrivateImportSelection(name, _): name.span
-		RepeatedModuleAlias(name, _): name.span
-		ModuleAliasNameConflict(name, _): name.span
+		NotOffered(ImportedThere(entity)):
+			match claimant(built.names, name, entity):
+				Some(entry):
+					if same_entity(entry.entity, entity):
+						match entry.origin:
+							Implicit: AlreadyFromPrelude(entity)
+							Imported: AlreadyImported(entity)
+							Declared(_): problem
+					else:
+						problem
+				None:
+					problem
+		_:
+			problem
+
+
+private pure func fail(built: BuiltScope, request: ModuleImport, selection: ImportSelection, problem: SelectionProblem) -> BuiltScope:
+	failure = SelectionFailure(request.path, selection, seen_here(built, selection_name(selection).id, problem))
+	{ built | problem = first_problem(built.problem, failure) }
+
+
+-- With nothing selected, the more specific reason is reported: a private
+-- declaration, then any reason but a name the target does not have.
+private pure func more_specific(value_reason: SelectionProblem, type_reason: SelectionProblem) -> SelectionProblem:
+	match value_reason:
+		NotOffered(PrivateName):
+			value_reason
+		_:
+			match type_reason:
+				NotOffered(UnknownName): value_reason
+				_: type_reason
+
+
+-- A bare name selects the target's public function or public type of that
+-- name; both make it ambiguous, and a public constructor is named with its
+-- union.
+private pure func bare_selection(target: ModuleScope, name: NameId) -> Result[Entity, SelectionProblem]:
+	value: Result[Entity, SelectionProblem] = match offer(holder(target.names, Values, name)):
+		Ok(Constructor(variant)): Err(BareConstructor(variant))
+		Ok(selected): Ok(selected)
+		Err(reason): Err(NotOffered(reason))
+	named_type: Result[Entity, SelectionProblem] = match offer(holder(target.names, Types, name)):
+		Ok(selected): Ok(selected)
+		Err(reason): Err(NotOffered(reason))
+	match value:
+		Ok(selected):
+			match named_type:
+				Ok(_): Err(Ambiguous)
+				Err(_): Ok(selected)
+		Err(value_reason):
+			match named_type:
+				Ok(selected): Ok(selected)
+				Err(type_reason): Err(more_specific(value_reason, type_reason))
+
+
+-- A selected name enters this module; a selected type also imports the
+-- target's receiver functions of that type.
+private pure func bind(built: BuiltScope, request: ModuleImport, name: WrittenName, entity: Entity) -> BuiltScope:
+	entered = enter(built, { name = name, entity = entity, origin = Imported })
+	match entity:
+		Type(receiver):
+			{ entered | methods = entered.methods.append({ target = request.target, receiver = receiver, name = name }) }
+		Function(_) | Constructor(_) | Alias(_):
+			entered
+
+
+-- `Union(First, ...)` selects a public union of the target and the listed
+-- constructors, which the target declares with it. Kind comes before privacy:
+-- a private record behind `Secret(Hidden)` is unknown, as a public one is.
+private pure func select_union(built: BuiltScope, target: ModuleScope, request: ModuleImport, selection: ImportSelection, name: WrittenName, listed: List[WrittenName]) -> BuiltScope:
+	found = holder(target.names, Types, name.id)
+	match found:
+		Some(entry):
+			match entry.entity:
+				Type(UnionHead(owner)):
+					match offer(found):
+						Err(reason):
+							fail(built, request, selection, NotOffered(reason))
+						Ok(union_type):
+							var next = bind(built, request, name, union_type)
+							for constructor in listed:
+								next = match offer(holder(target.names, Values, constructor.id)):
+									Ok(Constructor(variant)):
+										if IntOps.equals(union_number(variant_owner(variant)), union_number(owner)):
+											enter(next, { name = constructor, entity = Constructor(variant), origin = Imported })
+										else:
+											fail(next, request, selection, NotAConstructor(constructor))
+									_:
+										fail(next, request, selection, NotAConstructor(constructor))
+							next
+				_:
+					fail(built, request, selection, NotOffered(UnknownName))
+		None:
+			fail(built, request, selection, NotOffered(UnknownName))
+
+
+-- One `path [as Alias]: selections` row; its target was built first.
+private pure func import_row(built: BuiltScope, target: ModuleScope, request: ModuleImport) -> BuiltScope:
+	var next = built
+	match request.module_alias:
+		Some(written):
+			next = enter(next, { name = written, entity = Alias({ target = request.target, path = request.path }), origin = Imported })
+		None:
+			void
+	for selection in request.symbols:
+		next = match selection:
+			NamedSelection(name):
+				match bare_selection(target, name.id):
+					Ok(entity): bind(next, request, name, entity)
+					Err(problem): fail(next, request, selection, problem)
+			ConstructorSelection(name, listed):
+				select_union(next, target, request, selection, name, listed)
+			MethodsOnlySelection(_, _):
+				next
+	next
+
+
+-- `T methods_only` enters no name. The target must hold the type, publicly or
+-- by import, and this module must already see that same type.
+private pure func select_methods(built: BuiltScope, target: ModuleScope, request: ModuleImport) -> BuiltScope:
+	var next = built
+	for selection in request.symbols:
+		match selection:
+			MethodsOnlySelection(name, _):
+				holding: Result[Entity, Unoffered] = match offer(holder(target.names, Types, name.id)):
+					Err(ImportedThere(entity)): Ok(entity)
+					Err(ProvidedThere(entity)): Ok(entity)
+					other: other
+				next = match holding:
+					Ok(Type(receiver)):
+						seen = match holder(next.names, Types, name.id):
+							Some(entry): same_entity(entry.entity, Type(receiver))
+							None: False
+						if seen:
+							{ next | methods = next.methods.append({ target = request.target, receiver = receiver, name = name }) }
+						else:
+							fail(next, request, selection, ReceiverNotVisible)
+					Ok(_):
+						fail(next, request, selection, NotOffered(UnknownName))
+					Err(reason):
+						fail(next, request, selection, NotOffered(reason))
+			NamedSelection(_) | ConstructorSelection(_, _):
+				void
+	next
+
+
+-- Queries: the checker reads the namespace only through these.
+
+
+-- What `module` holds for `name` in `space`. Host `get` returns an Option even
+-- for a sealed module number, which always has a scope.
+private pure func held_in(namespace: Namespace, module: ModuleId, space: Space, name: NameId) -> Option[Entry]:
+	scopes: List[ModuleScope] = from_opaque Namespace(namespace)
+	match scopes.get(module_number(module)):
+		Some(scope): holder(scope.names, space, name)
+		None: None
+
+
+-- What `name` denotes as a value in `module`. The scope rule leaves one entry,
+-- so no caller chooses.
+pure func named_value(namespace: Namespace, module: ModuleId, name: NameId) -> Option[NamedValue]:
+	match held_in(namespace, module, Values, name):
+		Some(entry):
+			match entry.entity:
+				Function(id):
+					source = match entry.origin:
+						Declared(_): DeclaredHere
+						Imported | Implicit: ImportedAt(entry.name.span)
+					Some(NamedFunction(id, source))
+				Constructor(variant): Some(NamedConstructor(variant))
+				Alias(aliased): Some(NamedAlias(aliased))
+				Type(_): None
+		None:
+			None
+
+
+-- The type `name` denotes in `module`; a module alias, which also claims the
+-- type space, denotes none.
+pure func named_type(namespace: Namespace, module: ModuleId, name: NameId) -> Option[TypeHead]:
+	match held_in(namespace, module, Types, name):
+		Some(entry):
+			match entry.entity:
+				Type(head): Some(head)
+				Function(_) | Constructor(_) | Alias(_): None
+		None:
+			None
+
+
+-- The function or constructor `target` offers as `name`: `A.f` and `A.Some`.
+pure func offered_value(namespace: Namespace, target: ModuleId, name: NameId) -> Result[OfferedValue, Unoffered]:
+	match offer(held_in(namespace, target, Values, name)):
+		Ok(Function(id)): Ok(OfferedFunction(id))
+		Ok(Constructor(variant)): Ok(OfferedConstructor(variant))
+		Ok(_): Err(UnknownName)
+		Err(reason): Err(reason)
+
+
+-- The type `target` offers as `name`: `A.T`.
+pure func offered_type(namespace: Namespace, target: ModuleId, name: NameId) -> Result[TypeHead, Unoffered]:
+	match offer(held_in(namespace, target, Types, name)):
+		Ok(Type(head)): Ok(head)
+		Ok(_): Err(UnknownName)
+		Err(reason): Err(reason)
+
+
+-- Host `get` returns an Option even for a sealed module number, which always
+-- has a scope.
+pure func method_imports(namespace: Namespace, module: ModuleId) -> List[MethodImport]:
+	scopes: List[ModuleScope] = from_opaque Namespace(namespace)
+	match scopes.get(module_number(module)):
+		Some(scope): scope.methods
+		None: []
 
 
 pure func namespace_problem_span(problem: NamespaceProblem) -> Span:
 	match problem:
-		ImportSelectionFailure(rejection): import_problem_span(rejection)
-		DuplicateFunctionName(name, _): name.span
-		DuplicateUnionName(name, _): name.span
-		DuplicateTypeName(name, _): name.span
-		DuplicateVariantName(name, _): name.span
-		ImportedConstructorNameConflict(name, _): name.span
-		ImportedFunctionNameConflict(name, _): name.span
-		ImportedVariantNameConflict(name, _): name.span
-		VariantFunctionNameConflict(_, variant, function):
-			if IntOps.less_than(variant.start, function.start):
-				function
-			else:
-				variant
-
-
--- Row scans over the namespace's binding tables. A row is the same fact when
--- its module and declaration identity agree; a conflict keeps the spelling.
--- Two type rows name the same thing in the same module scope.
-private pure func same_type_name(left: TypeBinding, right: TypeBinding) -> Bool:
-	same_module(left.module, right.module) and same_name(left.name.id, right.name.id)
-
-
-private pure func contains_type(bindings: List[TypeBinding], row: TypeBinding) -> Bool:
-	var present = False
-	for binding in bindings:
-		present = present or (same_type_name(binding, row) and same_type_candidate(binding.target, row.target))
-	present
-
-
-private pure func with_type(bindings: List[TypeBinding], row: TypeBinding) -> List[TypeBinding]:
-	if contains_type(bindings, row):
-		bindings
-	else:
-		bindings.append(row)
-
-
--- First-match scans read the whole list and keep the first hit: the language has
--- no early return, and recursing per element would add a position parameter.
-private pure func type_conflict(bindings: List[TypeBinding], row: TypeBinding) -> Option[Span]:
-	var conflict: Option[Span] = None
-	for binding in bindings:
-		if conflict.is_none() and same_type_name(binding, row) and not same_type_candidate(binding.target, row.target):
-			conflict = Some(binding.name.span)
-	conflict
-
-
-private pure func contains_variant(bindings: List[VariantBinding], row: VariantBinding) -> Bool:
-	var present = False
-	for binding in bindings:
-		present = present or (same_module(binding.module, row.module) and same_variant(binding.variant, row.variant))
-	present
-
-
-private pure func earlier_function_import(bindings: List[ImportedFunctionBinding], row: ImportedFunctionBinding) -> Option[Span]:
-	var earlier: Option[Span] = None
-	for binding in bindings:
-		if earlier.is_none() and same_module(binding.module, row.module) and same_function(binding.function, row.function):
-			earlier = Some(binding.name.span)
-	earlier
-
-
-private pure func local_types(parsed: ParsedContents) -> List[TypeBinding]:
-	var types: List[TypeBinding] = []
-	for declaration in parsed.builtin_types:
-		if same_module(declaration.module, parsed.foundation.types):
-			target: TypeCandidate = match declaration.declaration:
-				IntegerBuiltin(_): PrimitiveCandidate(BuiltinInt)
-				FloatBuiltin(_): PrimitiveCandidate(BuiltinFloat)
-				StringBuiltin(_): PrimitiveCandidate(BuiltinString)
-				VoidBuiltin(_): PrimitiveCandidate(BuiltinVoid)
-				ListBuiltin(_): ListCandidate
-			types = types.append({ module = declaration.module, name = builtin_type_name(declaration.declaration), target = target, origin = DeclaredType(Public) })
-	for declaration in inventory_unions(parsed.declarations):
-		types = types.append({ module = declaration.module, name = declaration.type_name, target = UnionCandidate(declaration.id), origin = DeclaredType(declaration.visibility) })
-	for row in inventory_records(parsed.declarations):
-		declaration = row.declaration
-		types = types.append({ module = declaration.module, name = declaration.type_name, target = RecordCandidate(row.id), origin = DeclaredType(declaration.visibility) })
-	types
-
-
-private pure func type_import_requests(
-	modules: List[ParsedModuleRow],
-	functions: List[LocalFunctionBinding],
-) -> List[TypeImportRequest]:
-	var requests: List[TypeImportRequest] = []
-	for module in modules:
-		for request in module.imports:
-			for selection in request.symbols:
-				match selection:
-					NamedSelection(name):
-						if local_functions(functions, request.target, name.id).is_empty():
-							requests = requests.append({ module = module.module, target = request.target, name = name, kind = AnyTypeSelection })
-					ConstructorSelection(name, _):
-						requests = requests.append({ module = module.module, target = request.target, name = name, kind = UnionTypeSelection })
-					MethodsOnlySelection(_, _): void
-	requests
-
-
-private pure func selected_head(kind: TypeSelectionKind, candidate: TypeCandidate) -> Bool:
-	match kind:
-		AnyTypeSelection: True
-		UnionTypeSelection:
-			match candidate:
-				UnionCandidate(_): True
-				_: False
-
-
--- Modules whose implicit scope includes the designated prelude's selections.
-private pure func user_modules(parsed: ParsedContents) -> List[ModuleId]:
-	var users: List[ModuleId] = []
-	for module in parsed.modules:
-		match module.role:
-			UserModule: users = users.append(module.module)
-			_: void
-	users
-
-
--- The finite set is (scope, name, original head). Each round only adds a new
--- member, so forwarding cycles converge and cannot manufacture an origin.
-private pure func complete_types(
-	parsed: ParsedContents,
-	requests: List[TypeImportRequest],
-	local: List[TypeBinding],
-) -> List[TypeBinding]:
-	users = user_modules(parsed)
-	var types = local
-	var changed = True
-	while changed:
-		before = types.length()
-		for request in requests:
-			for candidate in visible_types(types, request.target, request.name.id):
-				if selected_head(request.kind, candidate):
-					row: TypeBinding = { module = request.module, name = request.name, target = candidate, origin = ImportedType }
-					types = with_type(types, row)
-					if same_module(request.module, parsed.foundation.prelude):
-						for user in users:
-							types = with_type(types, { row | module = user })
-		changed = IntOps.greater_than(types.length(), before)
-	types
-
-
-private pure func implicit_types(
-	parsed: ParsedContents,
-	requests: List[TypeImportRequest],
-	types: List[TypeBinding],
-) -> List[TypeBinding]:
-	var implicit: List[TypeBinding] = []
-	for user in user_modules(parsed):
-		for request in requests:
-			if same_module(request.module, parsed.foundation.prelude):
-				for candidate in visible_types(types, request.target, request.name.id):
-					if selected_head(request.kind, candidate):
-						implicit = with_type(implicit, { module = user, name = request.name, target = candidate, origin = ImportedType })
-	implicit
-
-
-private pure func written_name(selection: ImportSelection) -> WrittenName:
-	match selection:
-		NamedSelection(name): name
-		ConstructorSelection(name, _): name
-		MethodsOnlySelection(name, _): name
-
-
-private pure func selected_type(
-	types: List[TypeBinding],
-	target: ModuleId,
-	selection: ImportSelection,
-) -> Result[TypeCandidate, ImportProblem]:
-	name = written_name(selection)
-	candidates = visible_types(types, target, name.id)
-	match selection:
-		ConstructorSelection(_, _):
-			match candidates:
-				[UnionCandidate(owner)]: Ok(UnionCandidate(owner))
-				[] | [PrimitiveCandidate(_)] | [ListCandidate] | [RecordCandidate(_)]: Err(MissingImportedUnion(name))
-				_: Err(AmbiguousImportedUnion(name))
-		NamedSelection(_):
-			match candidates:
-				[candidate]: Ok(candidate)
-				-- A bare name that is neither a function nor a type.
-				[]: Err(MissingImportedFunction(target, name))
-				_: Err(AmbiguousImportedType(target, name))
-		MethodsOnlySelection(_, _):
-			match candidates:
-				[candidate]: Ok(candidate)
-				[]: Err(MissingImportedType(target, name))
-				_: Err(AmbiguousImportedType(target, name))
-
-
--- The first three fields are read-only scope that selections resolve against; the
--- rest accumulate rows and problems in source order. bound_types is the importing
--- scopes' type view, used only to detect conflicting type names.
-private fixed record ImportScan {
-	functions: List[LocalFunctionBinding],
-	variants: List[VariantBinding],
-	types: List[TypeBinding],
-	imports: List[ImportedFunctionBinding],
-	constructors: List[VariantBinding],
-	methods: List[MethodSelectionRequest],
-	problems: List[ImportProblem],
-	bound_types: List[TypeBinding],
-	aliases: List[ModuleAlias]
-}
-
-
--- One written selection: the importing module, the module it selects from.
-private fixed record ImportSite {
-	module: ModuleId,
-	target: ModuleId,
-	path: ModulePath,
-	selection: ImportSelection
-}
-
-
--- A method-only selection adds no type name; it needs one already visible.
-private pure func import_receiver(scan: ImportScan, site: ImportSite, receiver: TypeCandidate) -> ImportScan:
-	name = written_name(site.selection)
-	row: TypeBinding = { module = site.module, name = name, target = receiver, origin = ImportedType }
-	request: MethodSelectionRequest = { module = site.module, target = site.target, name = name, receiver = receiver }
-	match site.selection:
-		MethodsOnlySelection(_, _):
-			if contains_type(scan.types, row):
-				{ scan | methods = scan.methods.append(request) }
-			else:
-				{ scan | problems = scan.problems.append(MethodTypeNotVisible(name)) }
-		NamedSelection(_) | ConstructorSelection(_, _):
-			problems = match type_conflict(scan.bound_types, row):
-				Some(first): scan.problems.append(ImportedTypeConflict(name, first))
-				None: scan.problems
-			{ scan | methods = scan.methods.append(request), problems = problems, bound_types = with_type(scan.bound_types, row) }
-
-
--- Find the union's variant the selection names and import it.
-private pure func import_variant(scan: ImportScan, site: ImportSite, owner: UnionId, written: WrittenName) -> ImportScan:
-	var found: Option[VariantBinding] = None
-	for variant in scan.variants:
-		if found.is_none() and same_name(variant.name.id, written.id) and same_union(variant_owner(variant.variant), owner):
-			found = Some({ variant | module = site.module, name = written })
-	match found:
-		None:
-			{ scan | problems = scan.problems.append(MissingImportedVariant(written)) }
-		Some(binding):
-			if contains_variant(scan.constructors, binding):
-				scan
-			else:
-				{ scan | constructors = scan.constructors.append(binding) }
-
-
--- Each selected constructor must belong to the union; naming one twice is reported too.
-private pure func import_variants(scan: ImportScan, site: ImportSite, receiver: TypeCandidate) -> ImportScan:
-	match site.selection:
-		ConstructorSelection(_, selected):
-			match receiver:
-				UnionCandidate(owner):
-					var next = scan
-					var seen: List[WrittenName] = []
-					for written in selected:
-						var earlier: Option[Span] = None
-						for first in seen:
-							if earlier.is_none() and same_name(first.id, written.id):
-								earlier = Some(first.span)
-						match earlier:
-							Some(span): next = { next | problems = next.problems.append(RepeatedImportedVariant(written, span)) }
-							None: void
-						seen = seen.append(written)
-						next = import_variant(next, site, owner, written)
-					next
-				PrimitiveCandidate(_) | ListCandidate | RecordCandidate(_):
-					scan
-		NamedSelection(_) | MethodsOnlySelection(_, _):
-			scan
-
-
--- A bare name selects a target-local function or a visible type; naming both is
--- ambiguous. A private declaration of the target is not selectable (GUIDE,
--- Visibility: "not visible to importers").
-private pure func import_selection(scan: ImportScan, site: ImportSite) -> ImportScan:
-	name = written_name(site.selection)
-	match private_declaration(scan, site.target, name.id):
-		Some(_): { scan | problems = scan.problems.append(PrivateImportSelection(name, site.path)) }
-		None: select_visible(scan, site, name)
-
-
-private pure func select_visible(scan: ImportScan, site: ImportSite, name: WrittenName) -> ImportScan:
-	functions: List[FunctionId] = match site.selection:
-		NamedSelection(_): local_functions(scan.functions, site.target, name.id)
-		_: []
-	if functions.is_empty():
-		match selected_type(scan.types, site.target, site.selection):
-			Err(problem): { scan | problems = scan.problems.append(problem) }
-			Ok(receiver):
-				bound = import_receiver(scan, site, receiver)
-				import_variants(bound, site, receiver)
-	else if visible_types(scan.types, site.target, name.id).is_empty():
-		var next = scan
-		for function in functions:
-			row: ImportedFunctionBinding = { module = site.module, name = name, function = function }
-			match earlier_function_import(next.imports, row):
-				Some(first): next = { next | problems = next.problems.append(RepeatedImportedFunction(name, first)) }
-				None: next = { next | imports = next.imports.append(row) }
-		next
-	else:
-		{ scan | problems = scan.problems.append(AmbiguousImportSelection(site.target, name)) }
-
-
--- Each module may be imported once (GUIDE, One Import Per Module): an alias
--- and selections of one module share a row. An alias is unique in its module.
-private pure func import_module(scan: ImportScan, row: ParsedModuleRow) -> ImportScan:
-	var next = scan
-	var previous: List[ModuleImport] = []
-	for request in row.imports:
-		var earlier: Option[Span] = None
-		for first in previous:
-			if earlier.is_none() and same_module(first.target, request.target):
-				earlier = Some(first.span)
-		match earlier:
-			Some(span): next = { next | problems = next.problems.append(RepeatedModuleImport(request.target, span, request.span)) }
-			None: void
-		previous = previous.append(request)
-		match request.module_alias:
-			None: void
-			Some(aliased):
-				var repeated: Option[Span] = None
-				for existing in next.aliases:
-					if repeated.is_none() and same_module(existing.module, row.module) and same_name(existing.name.id, aliased.id):
-						repeated = Some(existing.name.span)
-				match repeated:
-					Some(span): next = { next | problems = next.problems.append(RepeatedModuleAlias(aliased, span)) }
-					None: next = { next | aliases = next.aliases.append({ module = row.module, name = aliased, target = request.target, path = request.path }) }
-		for selection in request.symbols:
-			next = import_selection(next, { module = row.module, target = request.target, path = request.path, selection = selection })
-	next
-
-
--- Only the designated prelude supplies an implicit scope. Ordinary module
--- type forwarding deliberately never forwards imported functions or methods.
-private pure func complete_scope(scan: ImportScan, parsed: ParsedContents) -> NamespaceContents:
-	var imports = scan.imports
-	var constructors = scan.constructors
-	var methods = scan.methods
-	for user in user_modules(parsed):
-		for binding in scan.imports:
-			if same_module(binding.module, parsed.foundation.prelude):
-				row = { binding | module = user }
-				if earlier_function_import(imports, row).is_none():
-					imports = imports.append(row)
-		for binding in scan.constructors:
-			if same_module(binding.module, parsed.foundation.prelude):
-				row = { binding | module = user }
-				if not contains_variant(constructors, row):
-					constructors = constructors.append(row)
-		for request in scan.methods:
-			if same_module(request.module, parsed.foundation.prelude):
-				methods = methods.append({ request | module = user })
-	{
-			functions = scan.functions,
-			imports = imports,
-			constructors = constructors,
-			types = scan.types,
-			variants = scan.variants,
-			methods = methods,
-			aliases = scan.aliases
-		}
-
-
--- The private scope includes implicit exposures before validation. No opaque
--- Namespace exists until all declaration and visibility facts are accepted.
-pure func build_namespace(program: ParsedProgram) -> Result[Namespace, NamespaceFailure]:
-	parsed = parsed_contents(program)
-	var functions: List[LocalFunctionBinding] = []
-	for row in inventory_functions(parsed.declarations):
-		function = row.declaration
-		functions = functions.append({ module = function.module, name = function.function_name, function = row.id, visibility = function.visibility })
-	var variants: List[VariantBinding] = []
-	for declaration in inventory_unions(parsed.declarations):
-		for variant in declaration.variants:
-			variants = variants.append({
-				module = declaration.module, name = variant.declaration.name,
-				variant = variant.id, declaration_span = variant.declaration.name.span,
-				visibility = declaration.visibility
-			})
-	local = local_types(parsed)
-	requests = type_import_requests(parsed.modules, functions)
-	types = complete_types(parsed, requests, local)
-	implicit = implicit_types(parsed, requests, types)
-	var conflicts: List[ImportProblem] = []
-	for binding in local:
-		match type_conflict(implicit, binding):
-			Some(previous): conflicts = conflicts.append(ImportedTypeConflict(binding.name, previous))
-			None: void
-	var scan: ImportScan = {
-		functions = functions,
-		variants = variants,
-		types = types,
-		imports = [],
-		constructors = [],
-		methods = [],
-		problems = conflicts,
-		bound_types = implicit.concat(local),
-		aliases = []
-	}
-	for row in parsed.modules:
-		scan = import_module(scan, row)
-	scope = complete_scope(scan, parsed)
-	problems: List[NamespaceProblem] = scan.problems.map(pure func(problem): ImportSelectionFailure(problem))
-		.concat(import_scope_problems(scope))
-		.concat(local_declaration_problems(parsed, scope))
-	match problems:
-		[]: Ok(into_opaque Namespace(scope))
-		[first, ...remaining]: Err({ first = first, remaining = remaining })
-
-
-private pure func visible_function_span(scope: NamespaceContents, module: ModuleId, name: NameId) -> Option[Span]:
-	var found = first_local_function(scope.functions, module, name).map(pure func(binding): binding.name.span)
-	if found.is_none():
-		for binding in scope.imports:
-			if same_module(binding.module, module) and same_name(binding.name.id, name):
-				found = Some(binding.name.span)
-				break
-	found
-
-
--- The first visible identity wins; a later exposure of that same identity is
--- not a clash. Import ordering and local precedence match direct lookup.
-private pure func function_import_conflict(scope: NamespaceContents, incoming: ImportedFunctionBinding) -> Option[Span]:
-	var conflict: Option[Span] = None
-	match first_local_function(scope.functions, incoming.module, incoming.name.id):
-		Some(local):
-			if not same_function(local.function, incoming.function):
-				conflict = Some(local.name.span)
-		None:
-			for binding in scope.imports:
-				if same_module(binding.module, incoming.module) and same_name(binding.name.id, incoming.name.id):
-					if not same_function(binding.function, incoming.function):
-						conflict = Some(binding.name.span)
-					break
-	conflict
-
-
-private pure func visible_variant_span(scope: NamespaceContents, module: ModuleId, name: NameId) -> Option[Span]:
-	var found: Option[Span] = None
-	for binding in scope.variants:
-		if same_module(binding.module, module) and same_name(binding.name.id, name):
-			found = Some(binding.declaration_span)
-			break
-	if found.is_none():
-		for binding in scope.constructors:
-			if same_module(binding.module, module) and same_name(binding.name.id, name):
-				found = Some(binding.declaration_span)
-				break
-	found
-
-
--- An alias shares the module's namespace with declared and imported names
--- (GUIDE, Qualified Imports: "an alias cannot reuse a name that already means
--- something else"); the earlier of the two names is reported as previous.
-private pure func alias_name_conflict(scope: NamespaceContents, row: ModuleAlias) -> Option[Span]:
-	var conflict = visible_function_span(scope, row.module, row.name.id)
-	if conflict.is_none():
-		conflict = visible_variant_span(scope, row.module, row.name.id)
-	if conflict.is_none():
-		for binding in scope.types:
-			if conflict.is_none() and same_module(binding.module, row.module) and same_name(binding.name.id, row.name.id):
-				conflict = Some(binding.name.span)
-	conflict
-
-
-private pure func import_scope_problems(scope: NamespaceContents) -> List[NamespaceProblem]:
-	var problems: List[NamespaceProblem] = []
-	for row in scope.aliases:
-		match alias_name_conflict(scope, row):
-			Some(previous): problems = problems.append(ImportSelectionFailure(ModuleAliasNameConflict(row.name, previous)))
-			None: void
-	for binding in scope.constructors:
-		match visible_function_span(scope, binding.module, binding.name.id):
-			Some(previous): problems = problems.append(ImportedConstructorNameConflict(binding.name, previous))
-			None: void
-	for binding in scope.imports:
-		match function_import_conflict(scope, binding):
-			Some(previous): problems = problems.append(ImportedFunctionNameConflict(binding.name, previous))
-			None: void
-		match visible_variant_span(scope, binding.module, binding.name.id):
-			Some(previous): problems = problems.append(ImportedVariantNameConflict(binding.name, previous))
-			None: void
-	problems
-
-
-private pure func previous_type(types: List[TypeBinding], incoming: TypeBinding) -> Option[TypeBinding]:
-	var previous: Option[TypeBinding] = None
-	for binding in types:
-		if same_type_name(binding, incoming):
-			previous = Some(binding)
-			break
-	previous
-
-
--- Nominal order is the declaration authority's projection, not a new index.
--- Constructors are unique within one union; different owners may share names.
-private pure func local_declaration_problems(parsed: ParsedContents, scope: NamespaceContents) -> List[NamespaceProblem]:
-	var problems: List[NamespaceProblem] = []
-	var types: List[TypeBinding] = []
-	var records_seen = 0
-	var unions_seen = 0
-	while True:
-		match next_nominal(parsed.declarations, records_seen, unions_seen):
-			None: break
-			Some(declaration):
-				incoming: TypeBinding = match declaration:
-					UnionDeclarationRow(row): { module = row.module, name = row.type_name, target = UnionCandidate(row.id), origin = DeclaredType(row.visibility) }
-					RecordDeclarationRow(row): { module = row.declaration.module, name = row.declaration.type_name, target = RecordCandidate(row.id), origin = DeclaredType(row.declaration.visibility) }
-				match previous_type(types, incoming):
-					Some(previous):
-						problem = match incoming.target:
-							UnionCandidate(_):
-								match previous.target:
-									UnionCandidate(_): DuplicateUnionName(incoming.name, previous.name.span)
-									RecordCandidate(_) | PrimitiveCandidate(_) | ListCandidate: DuplicateTypeName(incoming.name, previous.name.span)
-							RecordCandidate(_) | PrimitiveCandidate(_) | ListCandidate: DuplicateTypeName(incoming.name, previous.name.span)
-						problems = problems.append(problem)
-					None: void
-				types = types.append(incoming)
-				match declaration:
-					RecordDeclarationRow(_): records_seen = IntOps.add(records_seen, 1)
-					UnionDeclarationRow(row):
-						unions_seen = IntOps.add(unions_seen, 1)
-						var variants: List[WrittenName] = []
-						for issued in row.variants:
-							variant = issued.declaration.name
-							var previous: Option[Span] = None
-							for written in variants:
-								if same_name(written.id, variant.id):
-									previous = Some(written.span)
-									break
-							match previous:
-								Some(first): problems = problems.append(DuplicateVariantName(variant, first))
-								None: void
-							match first_local_function(scope.functions, row.module, variant.id):
-								Some(function): problems = problems.append(VariantFunctionNameConflict(variant.id, variant.span, function.name.span))
-								None: void
-							variants = variants.append(variant)
-	var functions: List[LocalFunctionBinding] = []
-	for binding in scope.functions:
-		match first_local_function(functions, binding.module, binding.name.id):
-			Some(previous): problems = problems.append(DuplicateFunctionName(binding.name, previous.name.span))
-			None: void
-		functions = functions.append(binding)
-	problems
+		NameConflict(conflict):
+			conflict.incoming.name.span
+		SelectionFailure(_, _, NotAConstructor(constructor)):
+			constructor.span
+		SelectionFailure(_, selection, _):
+			selection_name(selection).span

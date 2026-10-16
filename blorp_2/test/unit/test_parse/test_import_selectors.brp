@@ -6,6 +6,7 @@ import:
         ImportSelection(NamedSelection, ConstructorSelection, MethodsOnlySelection),
         module_imports, module_names, parse_module
     ../../../src/utils/source: module_source, root_module_id, same_source
+    ../../../src/utils/syntax: DiagnosticNote(PreviousDeclaration)
     option: is_none, is_some
     result: and_then
     test: TestSuite
@@ -22,10 +23,78 @@ private pure func rejects(source: String, start: Int, end: Int, message: String,
             )
 
 
+-- A rejection at `start`..`end` whose note marks the first listing at `first`.
+private pure func rejects_repeat(source: String, start: Int, end: Int, message: String, help: String, first: Int) -> Bool:
+    origin = module_source(root_module_id())
+    match lex(origin, source, program_names().names).and_then(pure func(tokens): parse_module(tokens, root_module_id())):
+        Ok(_): False
+        Err(error):
+            noted = match error.note:
+                Some(PreviousDeclaration(span)):
+                    same_source(span.source, origin) and span.start == first and span.end == first + end - start
+                _: False
+            same_source(error.span.source, origin) and noted and error.span.start == start and error.span.end == end and error.message == message and error.help == help
+
+
+pure func test_a_name_selected_twice_is_rejected() -> Bool:
+    rejects_repeat("import:\n    ./ops: Foo, Foo methods_only\n", 24, 27, "name selected more than once", "list each selected name once; combine constructor selections, such as Shape(Circle, Square)", 19)
+
+
+pure func test_a_function_selected_twice_is_rejected() -> Bool:
+    rejects_repeat("import:\n    ./ops: answer, answer\n", 27, 33, "name selected more than once", "list each selected name once; combine constructor selections, such as Shape(Circle, Square)", 19)
+
+
+-- Lines of an indented selection block are one list.
+pure func test_a_name_repeated_across_block_lines_is_rejected() -> Bool:
+    rejects_repeat("import:\n    ./ops:\n        answer,\n        answer\n", 43, 49, "name selected more than once", "list each selected name once; combine constructor selections, such as Shape(Circle, Square)", 27)
+
+
+pure func test_overlapping_constructor_selections_teach_one_selection() -> Bool:
+    rejects_repeat("import:\n    ./ops: Shape(Circle), Shape(Square, Circle)\n", 34, 39, "name selected more than once", "list each selected name once; combine constructor selections, such as Shape(Circle, Square)", 19)
+
+
+pure func test_disjoint_constructor_selections_teach_one_selection() -> Bool:
+    rejects_repeat("import:\n    ./ops: Shape(Circle), Shape(Square)\n", 34, 39, "name selected more than once", "list each selected name once; combine constructor selections, such as Shape(Circle, Square)", 19)
+
+
+pure func test_empty_constructor_selections_teach_listing_once() -> Bool:
+    rejects_repeat("import:\n    ./ops: Shape(), Shape()\n", 28, 33, "name selected more than once", "list each selected name once; combine constructor selections, such as Shape(Circle, Square)", 19)
+
+
+pure func test_one_empty_constructor_selection_still_teaches_constructors() -> Bool:
+    help = "list each selected name once; combine constructor selections, such as Shape(Circle, Square)"
+    (
+        rejects_repeat("import:\n    ./ops: Shape(), Shape(Circle)\n", 28, 33, "name selected more than once", help, 19)
+        and rejects_repeat("import:\n    ./ops: Shape(Circle), Shape()\n", 34, 39, "name selected more than once", help, 19)
+    )
+
+
+pure func test_an_unclosed_constructor_list_is_rejected() -> Bool:
+    source = "import:\n    ./option: TestOption(TestSome\n"
+    rejects(source, source.length(), source.length(), "expected ')' after selected constructors", "write Option(Some, None) or Option(), then close the selection with ')'")
+
+
+pure func test_a_constructor_list_may_end_with_a_comma() -> Bool:
+    source = "import:\n    ./option: TestOption(TestSome,)\n"
+    match lex(module_source(root_module_id()), source, program_names().names).and_then(pure func(tokens): parse_module(tokens, root_module_id())):
+        Err(_): False
+        Ok(parsed):
+            match module_imports(parsed):
+                [request]:
+                    match request.symbols:
+                        [ConstructorSelection(_, [_])]: True
+                        _: False
+                _: False
+
+
+pure func test_a_constructor_selected_twice_is_rejected() -> Bool:
+    rejects_repeat("import:\n    ./ops: Shape(Circle, Circle)\n", 33, 39, "constructor selected more than once", "list each selected constructor once", 25)
+
+
 pure func test_mixed_selectors_retain_category_names_and_modifier_span() -> Bool:
     source: String =
         |import:
-        |    ./ops: Foo, Foo(First, methods_only), Foo(), Foo methods_only, methods_only
+        |    ./ops: Foo, Bar(First, methods_only), Baz(), Qux methods_only, methods_only
         |
     origin = module_source(root_module_id())
     match lex(origin, source, program_names().names).and_then(pure func(tokens): parse_module(tokens, root_module_id())):
@@ -43,18 +112,18 @@ pure func test_mixed_selectors_retain_category_names_and_modifier_span() -> Bool
                     constructors = match request.symbols.get(1):
                         Some(ConstructorSelection(name, [first, contextual])):
                             (
-                                name_spelling(names, name.id) == Some("Foo")
+                                name_spelling(names, name.id) == Some("Bar")
                                 and name_spelling(names, first.id) == Some("First")
                                 and name_spelling(names, contextual.id) == Some("methods_only")
                             )
                         _: False
                     empty = match request.symbols.get(2):
-                        Some(ConstructorSelection(name, [])): name_spelling(names, name.id) == Some("Foo")
+                        Some(ConstructorSelection(name, [])): name_spelling(names, name.id) == Some("Baz")
                         _: False
                     methods = match request.symbols.get(3):
                         Some(MethodsOnlySelection(name, modifier)):
                             (
-                                name_spelling(names, name.id) == Some("Foo")
+                                name_spelling(names, name.id) == Some("Qux")
                                 and modifier.start == 61 and modifier.end == 73 and same_source(modifier.source, origin)
                             )
                         _: False
@@ -101,17 +170,17 @@ private pure func retains_first_constructor(suffix: String) -> Bool:
                 _: False
 
 pure func test_constructor_then_name() -> Bool:
-    retains_first_constructor("Foo")
+    retains_first_constructor("Bar")
 
 pure func test_constructor_then_empty_selection() -> Bool:
-    retains_first_constructor("Foo()")
+    retains_first_constructor("Bar()")
 
 pure func test_constructor_then_methods_only() -> Bool:
-    retains_first_constructor("Foo methods_only")
+    retains_first_constructor("Bar methods_only")
 
 
 pure func test_mixed_selector_names_are_all_in_authority() -> Bool:
-    source = "import:\n    ./ops: Foo, Foo(First, methods_only), Foo(), Foo methods_only, methods_only\n"
+    source = "import:\n    ./ops: Foo, Bar(First, methods_only), Baz(), Qux methods_only, methods_only\n"
     match lex(module_source(root_module_id()), source, program_names().names).and_then(pure func(tokens): parse_module(tokens, root_module_id())):
         Err(_): False
         Ok(parsed):
@@ -157,6 +226,16 @@ pure func test_comment_only_module_is_valid_syntax() -> Bool:
 tests: TestSuite = {
     description = "Blorp 2 typed import selectors",
     tests = [
+        ("a name selected twice is rejected", test_a_name_selected_twice_is_rejected),
+        ("a function selected twice is rejected", test_a_function_selected_twice_is_rejected),
+        ("a name repeated across block lines is rejected", test_a_name_repeated_across_block_lines_is_rejected),
+        ("overlapping constructor selections teach one selection", test_overlapping_constructor_selections_teach_one_selection),
+        ("disjoint constructor selections teach one selection", test_disjoint_constructor_selections_teach_one_selection),
+        ("empty constructor selections teach listing once", test_empty_constructor_selections_teach_listing_once),
+        ("one empty constructor selection still teaches constructors", test_one_empty_constructor_selection_still_teaches_constructors),
+        ("a constructor selected twice is rejected", test_a_constructor_selected_twice_is_rejected),
+        ("an unclosed constructor list is rejected", test_an_unclosed_constructor_list_is_rejected),
+        ("a constructor list may end with a comma", test_a_constructor_list_may_end_with_a_comma),
         ("mixed selectors retain categories and modifier span", test_mixed_selectors_retain_category_names_and_modifier_span),
         ("constructor names share published authority", test_constructor_names_share_the_published_authority),
         ("constructor then named selection", test_constructor_then_name),

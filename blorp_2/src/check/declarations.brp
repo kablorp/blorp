@@ -16,7 +16,7 @@ import:
 			OrdinaryUnionApplied, UnionTypeArgumentCountMismatch, UnknownType,
 		),
 		UnsupportedForm(OpaqueTypeDeclaration, ModuleConstant),
-		QualifiedError(UnknownModuleAlias, UnknownQualifiedName, PrivateQualifiedName),
+		QualifiedError(UnknownModuleAlias, QualifiedNotOffered),
 		qualified_error,
 		checker_invariant,
 		type_declaration_error,
@@ -56,12 +56,8 @@ import:
 	int as IntOps
 	../utils/names: NameId, same_name
 	../namespace/namespace:
-		Namespace,
-		QualifiedLookup(ExportedDeclaration, PrivateDeclaration, NoDeclaration),
-		TypeCandidate(PrimitiveCandidate, ListCandidate, UnionCandidate, RecordCandidate),
-		module_alias,
-		qualified_type,
-		type_candidate,
+		AliasedModule, Namespace, NamedValue(NamedAlias), TypeHead(PrimitiveHead, ListHead, UnionHead, RecordHead),
+		named_type, named_value, offered_type,
 	option: to_result
 	../parse/assemble: ParsedContents, ParsedModuleRow
 	../utils/source: COMPILER_SOURCE, ModuleId, same_module
@@ -147,7 +143,7 @@ private pure func declare_type_parameters(
 						),
 					)
 				None:
-					if type_candidate(scope.namespace, scope.module, name.id).is_none():
+					if named_type(scope.namespace, scope.module, name.id).is_none():
 						Ok(void)
 					else:
 						Err(
@@ -183,23 +179,23 @@ private pure func record_arity(scope: TypeScope, owner: RecordId, span: Span) ->
 	Ok(declaration.declaration.type_parameters.length())
 
 
-private pure func resolve_atomic_candidate(
+private pure func resolve_atomic_head(
 	scope: TypeScope,
-	candidate: TypeCandidate,
+	head: TypeHead,
 	name: WrittenName,
 ) -> Result[TypeRef, CheckError]:
-	match candidate:
-		PrimitiveCandidate(primitive):
+	match head:
+		PrimitiveHead(primitive):
 			Ok(primitive_ref(primitive))
-		ListCandidate:
+		ListHead:
 			Err(type_term_error(name.span, ListTypeArgumentCount))
-		RecordCandidate(id):
+		RecordHead(id):
 			arity ?= record_arity(scope, id, name.span)
 			if IntOps.equals(arity, 0):
 				Ok(RecordType(id))
 			else:
 				Err(type_term_error(name.span, MissingRecordTypeArguments(id, arity)))
-		UnionCandidate(id):
+		UnionHead(id):
 			arity ?= union_arity(scope, id, name.span)
 
 			if IntOps.equals(arity, 0):
@@ -216,30 +212,30 @@ private pure func resolve_atomic_type(
 		Some(parameter):
 			Ok(ParameterType(parameter.id))
 		None:
-			match type_candidate(scope.namespace, scope.module, name.id):
-				Some(candidate):
-					resolve_atomic_candidate(scope, candidate, name)
+			match named_type(scope.namespace, scope.module, name.id):
+				Some(head):
+					resolve_atomic_head(scope, head, name)
 				None:
 					Err(type_term_error(name.span, UnknownType(name.id)))
 
 
--- A candidate applied to written arguments; the candidate's own arity rules.
-private pure func resolve_applied_candidate(
+-- A head applied to written arguments; the head's own arity rules.
+private pure func resolve_applied_head(
 	scope: TypeScope,
-	candidate: TypeCandidate,
+	head: TypeHead,
 	name: WrittenName,
 	arguments: List[TypeSyntax],
 	span: Span,
 ) -> Result[TypeRef, CheckError]:
-	match candidate:
-		ListCandidate:
+	match head:
+		ListHead:
 			match arguments:
 				[element]:
 					value ?= resolve_type(scope, element)
 					Ok(ListType(value))
 				_:
 					Err(type_term_error(span, ListTypeArgumentCount))
-		RecordCandidate(owner):
+		RecordHead(owner):
 			arity ?= record_arity(scope, owner, span)
 			applicable ?= if IntOps.equals(arity, 0):
 				Err(type_term_error(span, OrdinaryRecordApplied(owner)))
@@ -249,7 +245,7 @@ private pure func resolve_applied_candidate(
 				Err(type_term_error(span, RecordTypeArgumentCountMismatch(owner, arity, arguments.length())))
 			values ?= resolve_types(scope, arguments, [])
 			Ok(AppliedRecordType(owner, values))
-		UnionCandidate(owner):
+		UnionHead(owner):
 			arity ?= union_arity(scope, owner, span)
 
 			applicable ?= if IntOps.equals(arity, 0):
@@ -266,28 +262,32 @@ private pure func resolve_applied_candidate(
 
 			values ?= resolve_types(scope, arguments, [])
 			Ok(AppliedUnionType(owner, values))
-		PrimitiveCandidate(_):
+		PrimitiveHead(_):
 			Err(type_term_error(name.span, NonApplicableType(name.id)))
 
 
--- `Alias.Name[args]` resolves through the alias row to the target module's
--- own exported type; forwarded imports and private types are not exported.
+-- The module `written` names as a module alias in `module`.
+pure func aliased_module(namespace: Namespace, module: ModuleId, written: WrittenName) -> Result[AliasedModule, CheckError]:
+	match named_value(namespace, module, written.id):
+		Some(NamedAlias(aliased)): Ok(aliased)
+		_: Err(qualified_error(written.span, UnknownModuleAlias(written.id)))
+
+
+-- `Alias.Name[args]` names a type the aliased module offers.
 private pure func resolve_qualified_type(
 	scope: TypeScope,
 	qualified: ParsedQualified,
 	arguments: List[TypeSyntax],
 	span: Span,
 ) -> Result[TypeRef, CheckError]:
-	row ?= module_alias(scope.namespace, scope.module, qualified.module.id)
-		.to_result(qualified_error(qualified.module.span, UnknownModuleAlias(qualified.module.id)))
-	candidate ?= match qualified_type(scope.namespace, row.target, qualified.name.id):
-		ExportedDeclaration(candidate): Ok(candidate)
-		PrivateDeclaration(_): Err(qualified_error(qualified.name.span, PrivateQualifiedName(qualified.name.id, row.path)))
-		NoDeclaration: Err(qualified_error(qualified.name.span, UnknownQualifiedName(qualified.module.id, qualified.name.id, row.path)))
+	aliased ?= aliased_module(scope.namespace, scope.module, qualified.module)
+	head ?= match offered_type(scope.namespace, aliased.target, qualified.name.id):
+		Ok(head): Ok(head)
+		Err(reason): Err(qualified_error(qualified.name.span, QualifiedNotOffered(qualified.module.id, qualified.name.id, aliased.path, reason)))
 	if arguments.is_empty():
-		resolve_atomic_candidate(scope, candidate, qualified.name)
+		resolve_atomic_head(scope, head, qualified.name)
 	else:
-		resolve_applied_candidate(scope, candidate, qualified.name, arguments, span)
+		resolve_applied_head(scope, head, qualified.name, arguments, span)
 
 
 pure func resolve_type(scope: TypeScope, written: TypeSyntax) -> Result[TypeRef, CheckError]:
@@ -297,9 +297,9 @@ pure func resolve_type(scope: TypeScope, written: TypeSyntax) -> Result[TypeRef,
 		AtomicType(name):
 			resolve_atomic_type(scope, name)
 		AppliedType(name, arguments, span):
-			match type_candidate(scope.namespace, scope.module, name.id):
-				Some(candidate):
-					resolve_applied_candidate(scope, candidate, name, arguments, span)
+			match named_type(scope.namespace, scope.module, name.id):
+				Some(head):
+					resolve_applied_head(scope, head, name, arguments, span)
 				None:
 					Err(type_term_error(name.span, NonApplicableType(name.id)))
 

@@ -5,6 +5,7 @@ import:
 		append_module,
 		assembly_names,
 		begin_program,
+		SealFailure(MalformedBundle, ImportCycle),
 		parsed_contents,
 		seal_program,
 	../../../src/lex/lex: lex
@@ -21,7 +22,8 @@ import:
 		root_module_id,
 		same_module,
 		same_source,
-	../../../src/utils/syntax: Diagnostic
+	../../../src/utils/syntax: Diagnostic, DiagnosticNote(PreviousDeclaration), source_bundle_error
+	../module_input: sealed
 	test: TestSuite
 
 
@@ -49,15 +51,16 @@ private pure func append_root(source: String, targets: List[ModuleId]) -> Result
 
 pure func test_sealing_requires_root_and_complete_targets() -> Bool:
 	empty = match seal_program(begin_program()):
-		Err(error):
+		Err(MalformedBundle(error)):
 			error.message == "source bundle has no root module" and same_source(error.span.source, COMPILER_SOURCE)
-		Ok(_):
+		_:
 			False
+	-- The root imports module 3; the foundation follows at 1 and 2.
 	missing = match module_id(3):
 		Some(target):
 			match append_root("import:\n    ./helper: answer\n", [target]):
 				Ok(assembly):
-					match seal_program(assembly):
+					match assemble_roles(assembly, [FoundationTypesModule, FoundationPreludeModule], 1):
 						Err(error):
 							error.message == "source bundle is missing an imported module" and error.help == BUNDLE_HELP
 						Ok(_):
@@ -67,6 +70,197 @@ pure func test_sealing_requires_root_and_complete_targets() -> Bool:
 		None:
 			False
 	empty and missing
+
+
+pure func test_assembly_rejects_a_repeated_module_import() -> Bool:
+	source = "import:\n    ./one: a\n    ./one as One\n"
+	match module_id(1):
+		Some(target):
+			match append_root(source, [target, target]):
+				Err(error):
+					noted = match error.note:
+						Some(PreviousDeclaration(first)): first.start == 12
+						_: False
+					(
+						noted and error.message == "module imported more than once"
+						and error.help == "combine the alias and the selected names into one import, such as path as Alias: name"
+						and error.span.start == 25 and error.span.end == 37
+					)
+				Ok(_):
+					False
+		None:
+			False
+
+
+-- `helper` imports the root back: sealing reports the cycle at that import.
+pure func test_sealing_rejects_an_import_cycle() -> Bool:
+	match (module_id(1), module_id(2), module_id(3)):
+		(Some(helper), Some(types), Some(prelude)):
+			match append_root("import:\n    ./helper: answer\n", [helper]):
+				Ok(root):
+					match parse_at("import:\n    ./main: run\n", helper, assembly_names(root)):
+						Ok(parsed):
+							match append_module(root, parsed, [root_module_id()], UserModule):
+								Ok(assembly):
+									match foundation(assembly, types, prelude):
+										Ok(complete):
+											match seal_program(complete):
+												Err(ImportCycle([first, second, third], closing)):
+													same_module(first, root_module_id()) and same_module(second, helper) and same_module(third, root_module_id()) and same_source(closing.source, module_source(helper)) and closing.start == 12 and closing.end == 23
+												_: False
+										Err(_): False
+								Err(_): False
+						Err(_): False
+				Err(_): False
+		_:
+			False
+
+
+-- Each user module's first edge is its prelude, so a prelude that imports a
+-- user module closes a cycle at that import.
+pure func test_sealing_rejects_a_cycle_through_the_prelude() -> Bool:
+	match (module_id(1), module_id(2)):
+		(Some(types), Some(prelude)):
+			match append_root("func main() -> Int:\n    0\n", []):
+				Ok(root):
+					match parse_at("-- module\n", types, assembly_names(root)):
+						Ok(base):
+							match append_module(root, base, [], FoundationTypesModule):
+								Ok(typed):
+									match parse_at("import:\n    ./main: main\n", prelude, assembly_names(typed)):
+										Ok(parsed):
+											match append_module(typed, parsed, [root_module_id()], FoundationPreludeModule):
+												Ok(complete):
+													match seal_program(complete):
+														Err(ImportCycle([first, second, third], closing)):
+															same_module(first, root_module_id()) and same_module(second, prelude) and same_module(third, root_module_id()) and same_source(closing.source, module_source(prelude)) and closing.start == 12 and closing.end == 24
+														_: False
+												Err(_): False
+										Err(_): False
+								Err(_): False
+						Err(_): False
+				Err(_): False
+		_:
+			False
+
+
+-- Adds a parsed row while preserving the assembly's spelling authority.
+private pure func append_at(assembly: ParsedAssembly, source: String, module: ModuleId, targets: List[ModuleId], role: ModuleKind) -> Result[ParsedAssembly, Diagnostic]:
+	parsed ?= parse_at(source, module, assembly_names(assembly))
+	append_module(assembly, parsed, targets, role)
+
+
+private pure func implicit_cycle_assembly(types: ModuleId, prelude: ModuleId, user: ModuleId) -> Result[ParsedAssembly, Diagnostic]:
+	root ?= append_root("-- root\n", [])
+	typed ?= append_at(root, "-- types\n", types, [], FoundationTypesModule)
+	base ?= append_at(typed, "import:\n    ./user: main\n", prelude, [user], FoundationPreludeModule)
+	append_at(base, "-- user\n", user, [], UserModule)
+
+
+-- The prelude imports a second user module. That user's implicit prelude edge
+-- closes the cycle, so its end span, rather than a written import, is the site.
+pure func test_sealing_reports_an_implicit_edge_closing_a_cycle() -> Bool:
+	match (module_id(1), module_id(2), module_id(3)):
+		(Some(types), Some(prelude), Some(user)):
+			built = implicit_cycle_assembly(types, prelude, user)
+			match built:
+				Ok(assembly):
+					match seal_program(assembly):
+						Err(ImportCycle([first, second, third], closing)):
+							(
+								same_module(first, prelude) and same_module(second, user) and same_module(third, prelude)
+								and same_source(closing.source, module_source(user)) and closing.start == 8 and closing.end == 8
+							)
+						_: False
+				Err(_): False
+		_: False
+
+
+private pure func diamond_assembly(left: ModuleId, right: ModuleId, shared: ModuleId, types: ModuleId, prelude: ModuleId) -> Result[ParsedAssembly, Diagnostic]:
+	root ?= append_root("import:\n    ./left: left\n    ./right: right\n", [left, right])
+	first ?= append_at(root, "import:\n    ./shared: shared\n", left, [shared], LibraryModule)
+	second ?= append_at(first, "import:\n    ./shared: shared\n", right, [shared], LibraryModule)
+	modules ?= append_at(second, "-- shared\n", shared, [], LibraryModule)
+	foundation(modules, types, prelude)
+
+
+-- Shared dependencies are completed once, not mistaken for an active cycle.
+-- Imports precede their importers; root/load and source-import order are stable.
+pure func test_sealing_orders_a_diamond_once() -> Bool:
+	match (module_id(1), module_id(2), module_id(3)):
+		(Some(left), Some(right), Some(shared)):
+			match (module_id(4), module_id(5)):
+				(Some(types), Some(prelude)):
+					match diamond_assembly(left, right, shared, types, prelude):
+						Ok(assembly):
+							match seal_program(assembly):
+								Ok(program): parsed_contents(program).dependency_order.map(pure func(row): module_number(row.module)) == [5, 3, 1, 2, 0, 4]
+								Err(_): False
+						Err(_): False
+				_: False
+		_: False
+
+
+-- The old recursive seal overflowed the host stack around 2,350 modules.
+private STRESS_MODULES: Int = 3000
+
+
+-- A chain whose last row either ends, or imports the supplied closing target.
+private pure func stress_chain(closing: List[ModuleId]) -> Result[ParsedAssembly, Diagnostic]:
+	var assembly: Result[ParsedAssembly, Diagnostic] = Ok(begin_program())
+	for ordinal in 0..STRESS_MODULES:
+		match (assembly, module_id(ordinal), module_id(ordinal + 1)):
+			(Ok(built), Some(module), Some(next)):
+				targets = if ordinal + 1 == STRESS_MODULES:
+					closing
+				else:
+					[next]
+				source = if targets.is_empty():
+					"-- last\n"
+				else:
+					"import:\n    ./next: run\n"
+				role = if ordinal == 0:
+					UserModule
+				else:
+					LibraryModule
+				assembly = append_at(built, source, module, targets, role)
+			(Err(_), _, _): void
+			_: assembly = Err(source_bundle_error("invalid stress module identity"))
+	built ?= assembly
+	types ?= module_id(STRESS_MODULES).to_result(source_bundle_error("invalid stress types identity"))
+	prelude ?= module_id(STRESS_MODULES + 1).to_result(source_bundle_error("invalid stress prelude identity"))
+	foundation(built, types, prelude)
+
+
+pure func test_sealing_reports_a_cycle_through_thousands_of_modules() -> Bool:
+	match stress_chain([root_module_id()]):
+		Ok(assembly):
+			match seal_program(assembly):
+				Err(ImportCycle(cycle, closing)):
+					var ordered = cycle.length() == STRESS_MODULES + 1
+					for ordinal in 0..STRESS_MODULES:
+						ordered = ordered and cycle.get(ordinal).map(pure func(module): module_number(module)) == Some(ordinal)
+					(
+						ordered and cycle.last().map(pure func(module): module_number(module)) == Some(0)
+						and same_source(closing.source, module_source(module_id(STRESS_MODULES - 1).get_or(root_module_id())))
+						and closing.start == 12 and closing.end == 23
+					)
+				_: False
+		Err(_): False
+
+
+pure func test_sealing_orders_a_chain_through_thousands_of_modules() -> Bool:
+	match stress_chain([]):
+		Ok(assembly):
+			match seal_program(assembly):
+				Ok(program):
+					order = parsed_contents(program).dependency_order.map(pure func(row): module_number(row.module))
+					var expected = [STRESS_MODULES + 1]
+					for offset in 0..STRESS_MODULES:
+						expected = expected.append(STRESS_MODULES - offset - 1)
+					order == expected.append(STRESS_MODULES)
+				Err(_): False
+		Err(_): False
 
 
 pure func test_assembly_requires_one_target_per_import() -> Bool:
@@ -130,11 +324,19 @@ pure func test_assembly_rejects_wrong_module_identity() -> Bool:
 			False
 
 
+-- A comment-only base and prelude at `types` and `prelude`.
+private pure func foundation(assembly: ParsedAssembly, types: ModuleId, prelude: ModuleId) -> Result[ParsedAssembly, Diagnostic]:
+	base ?= parse_at("-- module\n", types, assembly_names(assembly))
+	typed ?= append_module(assembly, base, [], FoundationTypesModule)
+	scope ?= parse_at("-- module\n", prelude, assembly_names(typed))
+	append_module(typed, scope, [], FoundationPreludeModule)
+
+
 -- Appends one comment-only module per role, in inventory order, then seals.
 private pure func assemble_roles(assembly: ParsedAssembly, roles: List[ModuleKind], ordinal: Int) -> Result[ParsedProgram, Diagnostic]:
 	match roles:
 		[]:
-			seal_program(assembly)
+			sealed(assembly)
 		[role, ...remaining]:
 			id ?= module_id(ordinal).to_result({ span = { source = COMPILER_SOURCE, start = 0, end = 0 }, note = None, message = "test inventory too large", help = "test setup" })
 			parsed ?= parse_at("-- module\n", id, assembly_names(assembly))
@@ -247,6 +449,13 @@ tests: TestSuite = {
 	description = "Blorp 2 program assembly",
 	tests = [
 		("sealing requires root and complete targets", test_sealing_requires_root_and_complete_targets),
+		("assembly rejects a repeated module import", test_assembly_rejects_a_repeated_module_import),
+		("sealing rejects an import cycle", test_sealing_rejects_an_import_cycle),
+		("sealing rejects a cycle through the prelude", test_sealing_rejects_a_cycle_through_the_prelude),
+		("sealing reports an implicit edge closing a cycle", test_sealing_reports_an_implicit_edge_closing_a_cycle),
+		("sealing orders a diamond once", test_sealing_orders_a_diamond_once),
+		("sealing reports a cycle through thousands of modules", test_sealing_reports_a_cycle_through_thousands_of_modules),
+		("sealing orders a chain through thousands of modules", test_sealing_orders_a_chain_through_thousands_of_modules),
 		("assembly requires one target per import", test_assembly_requires_one_target_per_import),
 		("assembly links imports to targets in order", test_assembly_links_each_import_to_its_target_in_order),
 		("assembly rejects stale name authority", test_assembly_rejects_stale_name_authority),

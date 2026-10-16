@@ -43,21 +43,13 @@ import:
 		WrittenName,
 		same_purity,
 		ReceiverApplication
-	../utils/names: NameId, same_name
 	../namespace/namespace:
-		FunctionOrigin(LocalFunction, ImportedFunction),
-		Namespace,
-		function_candidate,
-		exported_functions,
-		imported_functions,
-		method_selection_requests,
-		same_type_candidate,
-		variant_candidates
-	../utils/source: ModuleId, same_module
+		FunctionSource(DeclaredHere, ImportedAt), Namespace, NamedValue(NamedFunction, NamedConstructor), OfferedValue(OfferedFunction), TypeHead,
+		method_imports, named_value, offered_value, same_head,
+	../utils/source: ModuleId
 	int as IntOps
-	option: to_result, is_some
+	option: to_result
 	list: contains
-	result: and_then
 
 
 -- The function whose body contains a call.
@@ -405,12 +397,6 @@ pure func contains_parameter(value_type: TypeRef) -> Bool:
 			False
 
 
-pure func contains_variant(namespace: Namespace, module: ModuleId, name: NameId) -> Bool:
-	variant_candidates(namespace, module, name)
-		.get(0)
-		.is_some()
-
-
 fixed record ResolutionContext {
 	caller: Caller,
 	module: ModuleId,
@@ -418,14 +404,14 @@ fixed record ResolutionContext {
 	signatures: List[AcceptedFunction],
 	unions: List[CheckedUnion],
 	records: List[CheckedRecord],
-	callables: List[CallableBinding],
 }
 
 
--- A receiver function UFCS may select, with its accepted declaration.
+-- A receiver function UFCS may select, with its accepted declaration and the
+-- selection that brought it into the caller's module (None for its own).
 fixed record ReceiverCandidate {
-	binding: CallableBinding,
-	function: AcceptedFunction
+	function: AcceptedFunction,
+	import_site: Option[Span]
 }
 
 
@@ -434,150 +420,64 @@ fixed union ResolvedReceiver:
 	ReceiverCandidates(List[ReceiverCandidate])
 
 
-fixed record CallableBinding {
-	module: ModuleId,
-	name: NameId,
-	function: FunctionId,
-	origin: FunctionOrigin
-}
+-- The head of `function`'s first parameter type, which UFCS dispatches on.
+private pure func receiver_head(function: AcceptedFunction) -> Option[TypeHead]:
+	match function.signature.parameters.get(0):
+		Some(parameter): type_head(parameter.value_type)
+		None: None
 
 
-private pure func callable_candidates(
-	bindings: List[CallableBinding],
-	module: ModuleId,
-	name: NameId,
-) -> List[CallableBinding]:
-	var candidates: List[CallableBinding] = []
-	for binding in bindings:
-		if same_module(binding.module, module) and same_name(binding.name, name):
-			candidates = candidates.append(binding)
-	candidates
-
-
-pure func lookup_target(
-	context: ResolutionContext,
-	name: WrittenName,
-) -> Option[FunctionId]:
-	function_candidate(context.namespace, context.module, name.id).map(pure func(candidate): candidate.function)
-
-
--- A named exposure promotes the identity's diagnostic origin, including a
--- direct assembly input that names its own declaration. Methods never do this.
-private pure func append_callable(
-	bindings: List[CallableBinding],
-	incoming: CallableBinding,
-) -> List[CallableBinding]:
-	var result = bindings
-	var position = 0
-	var found = False
-	for binding in bindings:
-		if same_module(binding.module, incoming.module) and IntOps.equals(function_number(binding.function), function_number(incoming.function)):
-			result = result.set(position, incoming)
-			found = True
-			break
-		position = IntOps.add(position, 1)
-	if found:
-		result
-	else:
-		result.append(incoming)
-
-
-private pure func append_method(
-	bindings: List[CallableBinding],
-	incoming: CallableBinding,
-) -> List[CallableBinding]:
+private pure func listed_function(candidates: List[ReceiverCandidate], id: FunctionId) -> Bool:
 	var present = False
-	for binding in bindings:
-		if same_module(binding.module, incoming.module) and IntOps.equals(function_number(binding.function), function_number(incoming.function)):
-			present = True
-			break
-	if present:
-		bindings
-	else:
-		bindings.append(incoming)
-
-
-pure func build_callables(
-	namespace: Namespace,
-	functions: List[AcceptedFunction],
-) -> List[CallableBinding]:
-	-- Derived once after accepted signatures. Bindings retain only declaration
-	-- identity, scope availability and provenance; signatures have one authority.
-	var bindings: List[CallableBinding] = []
-
-	for function in functions:
-		bindings = append_callable(
-			bindings,
-			{
-				module = function.declaration.module,
-				name = function.declaration.function_name.id,
-				function = function.id,
-				origin = LocalFunction
-			},
-		)
-
-	for binding in imported_functions(namespace):
-		bindings = append_callable(
-			bindings,
-			{
-				module = binding.module,
-				name = binding.name.id,
-				function = binding.function,
-				origin = ImportedFunction(binding.name.span)
-			},
-		)
-
-	-- A method selection binds the target's public functions only: the
-	-- namespace publishes that set, so visibility is never read here.
-	for request in method_selection_requests(namespace):
-		exported = exported_functions(namespace, request.target)
-		for function in functions:
-			if contains_function(exported, function.id):
-				receiver = function.signature.parameters
-					.get(0)
-					.and_then(pure func(parameter): type_head(parameter.value_type))
-
-				match receiver:
-					Some(head):
-						if same_type_candidate(head, request.receiver):
-							bindings = append_method(
-								bindings,
-								{
-									module = request.module,
-									name = function.declaration.function_name.id,
-									function = function.id,
-									origin = ImportedFunction(request.name.span)
-								},
-							)
-					None:
-						void
-
-	bindings
-
-
-private pure func contains_function(functions: List[FunctionId], id: FunctionId) -> Bool:
-	var present = False
-	for candidate in functions:
-		if IntOps.equals(function_number(candidate), function_number(id)):
+	for candidate in candidates:
+		if IntOps.equals(function_number(candidate.function.id), function_number(id)):
 			present = True
 			break
 	present
+
+
+-- The receiver functions `name` reaches in the caller's module: its own value of
+-- that name if it is a function, then, per method import in scope order, the
+-- target's offered function of that name on the imported receiver type. A
+-- function reached twice is listed once.
+private pure func receiver_bindings(context: ResolutionContext, name: WrittenName) -> Result[List[ReceiverCandidate], CheckError]:
+	var found: List[ReceiverCandidate] = []
+	var failure: Option[CheckError] = None
+	match named_value(context.namespace, context.module, name.id):
+		Some(NamedFunction(id, source)):
+			site = match source:
+				DeclaredHere: None
+				ImportedAt(span): Some(span)
+			match context.signatures.get(function_number(id)):
+				Some(function): found = found.append({ function = function, import_site = site })
+				None: failure = Some(checker_invariant(name.span, InvalidResolvedFunction(id)))
+		_: void
+	for imported in method_imports(context.namespace, context.module):
+		match offered_value(context.namespace, imported.target, name.id):
+			Ok(OfferedFunction(id)):
+				if not listed_function(found, id):
+					match context.signatures.get(function_number(id)):
+						Some(function):
+							match receiver_head(function):
+								Some(head):
+									if same_head(head, imported.receiver):
+										found = found.append({ function = function, import_site = Some(imported.name.span) })
+								None: void
+						None: failure = Some(checker_invariant(name.span, InvalidResolvedFunction(id)))
+			_: void
+	match failure:
+		Some(error): Err(error)
+		None: Ok(found)
 
 
 pure func method_sites(candidates: List[ReceiverCandidate]) -> List[MethodCandidateSite]:
 	var sites: List[MethodCandidateSite] = []
 
 	for candidate in candidates:
-		import_site = match candidate.binding.origin:
-			LocalFunction:
-				None
-			ImportedFunction(site):
-				Some(site)
-
 		sites = sites.append({
-			function = candidate.binding.function,
+			function = candidate.function.id,
 			declaration = candidate.function.declaration.function_name.span,
-			import_site = import_site,
+			import_site = candidate.import_site,
 		})
 
 	sites
@@ -589,48 +489,23 @@ pure func classify_receiver(
 ) -> Result[ResolvedReceiver, CheckError]:
 	name = application.callee
 
-	match callable_candidates(context.callables, context.module, name.id):
+	candidates ?= receiver_bindings(context, name)
+	match candidates:
 		[]:
-			if contains_variant(context.namespace, context.module, name.id):
-				Err(method_error(name.span, ConstructorUFCS(name.id)))
-			else:
-				Err(call_error(name.span, UnknownFunction(name.id)))
+			match named_value(context.namespace, context.module, name.id):
+				Some(NamedConstructor(_)): Err(method_error(name.span, ConstructorUFCS(name.id)))
+				_: Err(call_error(name.span, UnknownFunction(name.id)))
 		[candidate]:
 			contract ?= receiver_contract(
 				context.caller,
 				name,
 				application.arguments,
-				candidate.function,
+				candidate.function.id,
 				context.signatures,
 			)
 			Ok(UniqueReceiver(contract))
-		candidates:
-			resolved ?= receiver_candidates(candidates, context.signatures, name.span, [])
-			Ok(ReceiverCandidates(resolved))
-
-
-private pure func receiver_candidates(
-	bindings: List[CallableBinding],
-	signatures: List[AcceptedFunction],
-	span: Span,
-	resolved: List[ReceiverCandidate],
-) -> Result[List[ReceiverCandidate], CheckError]:
-	match bindings.get(resolved.length()):
-		None:
-			Ok(resolved)
-		Some(binding):
-			function ?= signatures
-				.get(function_number(binding.function))
-				.to_result(checker_invariant(span, InvalidResolvedFunction(binding.function)))
-			receiver_candidates(
-				bindings,
-				signatures,
-				span,
-				resolved.append({
-					binding = binding,
-					function = function,
-				}),
-			)
+		_:
+			Ok(ReceiverCandidates(candidates))
 
 
 -- A concrete first parameter can give a receiver constructor its type.
@@ -721,7 +596,7 @@ pure func select_receiver_contract(
 				context.caller,
 				application.callee,
 				application.arguments,
-				chosen.binding.function,
+				chosen.function.id,
 				context.signatures,
 			)
 
@@ -743,7 +618,7 @@ private pure func choose_receiver(
 
 		match signature.parameters.get(0):
 			Some(parameter):
-				if receiver_matches(candidate.binding.function, signature, parameter, actual):
+				if receiver_matches(candidate.function.id, signature, parameter, actual):
 					compatible = compatible.append(candidate)
 					count = signature.parameters.length()
 
