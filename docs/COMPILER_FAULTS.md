@@ -36,3 +36,48 @@ with `rg -n -F '<phrase>' blorp/src`, then cite its raising site.
 | CF-028 | A record bound at the top of a loop body and read in only one nested match arm leaks on the other paths: Blorp 2's `namespace/namespace.brp`, with a `SiteProbe { path, selection }` record bound at the top of `select_methods`' loop and read only in its `ReceiverNotVisible` arm (an 8-line change, in the namespace scopes report under `benchmarks/results/`), leaks 8 objects (448 bytes: 4 `List`, 4 `ModulePath`) on `blorp_2/test/e2e/fixtures/return/zero.brp` under `BLORP_LEAK_CHECK=strict`; expected: no leak. Single-file reductions do not leak yet. Raising site not yet located |
 | CF-029 | `from_opaque Wrap(w).get_or(0, row)`, with `opaque type Wrap = List[Row]`, is rejected with "Generic type parameter T inferred as Row and Wrap"; expected: it compiles, as binding `rows: List[Row] = from_opaque Wrap(w)` and then calling `rows.get_or(0, row)` does. Raising site not yet located |
 | CF-030 | Unwrapping a value of a generic opaque type miscompiles ownership. Minimal input: `fixed record Rows[V] { entries: List[V], slots: List[Int] }`, `opaque type Box[V] = Rows[V]`, `pure func make[V](value: V) -> Box[V]` returning `into_opaque Box[V]({ entries = [value], slots = [0] })`, and `pure func count[V](box: Box[V]) -> Int` binding `rows: Rows[V] = from_opaque Box[V](box)` and returning `rows.entries.length()`; `main` binds `box: Box[String] = make("three")` and returns `count(box) + count(box)`. Expected: exit status 2. Actual: SIGSEGV (status 139), because the unwrap releases the borrowed `box`. `from_opaque Box[V](box).entries.length()`, or passing the unwrapped value to a helper, leaks 3 objects under `--leak-check` instead. The monomorphic `opaque type Box = Rows` is correct. Blorp 2's `utils/int_map.brp` is a plain record because of it. Raising site not yet located |
+| CF-031 | `?=` inside a bound `match` exits only the arm, then execution continues after the match. Expected: return the failure from the enclosing function. Minimal input below; raising site not yet located. Blorp 2 rejects this placement. |
+| CF-032 | Reported in the earlier quality investigation: an `Ok`/`Err` match used directly as a `?=` initializer fails with "Incompatible error type for ?="; an explicitly typed Result temporary avoids it. The original failing input was not retained. A simple Bool/Int/String example passes on the frozen host, so the fault remains unverified pending reduction. `infer_question_bind_statement` infers without an expected type (`stage_06_typecheck/infer.brp:22504`); the reported message is raised at line 22548. This source observation alone does not prove the fault. |
+
+## Nested Result propagation
+
+CF-031 reproduction:
+
+```blorp
+pure func parse(n: Int) -> Result[Int, String]:
+    if n < 0:
+        Err("negative")
+    else:
+        Ok(n)
+
+func run(n: Int) -> Result[Int, String]:
+    chosen: Result[Int, String] = match n < 100:
+        True:
+            parsed ?= parse(n)
+            Ok(parsed)
+        False: Ok(0)
+    print("reached the line after the match")
+    chosen
+
+func main() -> Int:
+    match run(0 - 1):
+        Err(_): 0
+        Ok(_): 1
+```
+
+Expected: exit 0 without printing. Actual: exit 0 after printing the line.
+Use an explicit `match` and return its carrier from the function instead.
+
+CF-032 still needs a standalone failing input. On the frozen host, a
+`choose(ready: Bool) -> Result[Int, String]` function using
+`value ?= match ready: True: Ok(1) / False: Err("not ready")` and then
+`Ok(value)` compiles. Do not use it as a regression for the reported fault.
+The source rewrite retains the explicit-carrier idiom below; it provides the
+expected type directly, but is not evidence that the unannotated form fails:
+
+```blorp
+result: Result[Int, String] = match ready:
+    True: Ok(1)
+    False: Err("not ready")
+value ?= result
+```

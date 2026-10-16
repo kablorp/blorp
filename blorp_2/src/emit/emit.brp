@@ -345,10 +345,9 @@ private pure func c_type(
 		ListType(element):
 			Ok(list_c_type(list_element_key(element)))
 		UnionType(id):
-			declaration ?= unions
-				.get(union_number(id))
-				.to_result(internal_error())
-			Ok(union_c_type(id, declaration))
+			match unions.get(union_number(id)):
+				Some(declaration): Ok(union_c_type(id, declaration))
+				None: Err(internal_error())
 
 
 private pure func c_variant(id: VariantInstanceId) -> String:
@@ -777,42 +776,40 @@ private pure func append_record_ownership(
 
 				position = IntOps.add(position, 1)
 
-			ready ?= match invalid:
+			match invalid:
 				Some(error):
 					Err(error)
 				None:
-					Ok(void)
+					result = result
+						.concat("free(value);}")
+						.concat("blorp_r_")
+						.append_int(index)
+						.concat(" blorp_record_make_")
+						.append_int(index)
+						.concat("(struct blorp_r_")
+						.append_int(index)
+						.concat(" fields){blorp_r_")
+						.append_int(index)
+						.concat(
+							" value=malloc(sizeof *value);if(!value)abort();atomic_init(&value->references,"
+								.concat("UINT64_C(1));"),
+						)
+					position = 0
 
-			result = result
-				.concat("free(value);}")
-				.concat("blorp_r_")
-				.append_int(index)
-				.concat(" blorp_record_make_")
-				.append_int(index)
-				.concat("(struct blorp_r_")
-				.append_int(index)
-				.concat(" fields){blorp_r_")
-				.append_int(index)
-				.concat(
-					" value=malloc(sizeof *value);if(!value)abort();atomic_init(&value->references,"
-						.concat("UINT64_C(1));"),
-				)
-			position = 0
+					for _ in layout.fields:
+						field = "blorp_rf_"
+							.append_int(index)
+							.concat("_")
+							.append_int(position)
+						result = result
+							.concat("value->")
+							.concat(field)
+							.concat("=fields.")
+							.concat(field)
+							.concat(";")
+						position = IntOps.add(position, 1)
 
-			for _ in layout.fields:
-				field = "blorp_rf_"
-					.append_int(index)
-					.concat("_")
-					.append_int(position)
-				result = result
-					.concat("value->")
-					.concat(field)
-					.concat("=fields.")
-					.concat(field)
-					.concat(";")
-				position = IntOps.add(position, 1)
-
-			Ok(result.concat("return value;}"))
+					Ok(result.concat("return value;}"))
 
 
 private pure func append_operation(
@@ -824,66 +821,66 @@ private pure func append_operation(
 ) -> Result[String, Diagnostic]:
 	match operation:
 		ConstructRecordDefinition(owner, fields):
-			layout ?= records
-				.get(record_number(owner))
-				.to_result(internal_error())
+			match records.get(record_number(owner)):
+				Some(layout):
 
-			var result = match layout.representation:
-				InlineRecord:
-					output.concat("((")
-				ManagedRecord:
-					output
-						.concat("blorp_record_make_")
+					var result = match layout.representation:
+						InlineRecord:
+							output.concat("((")
+						ManagedRecord:
+							output
+								.concat("blorp_record_make_")
+								.append_int(record_number(owner))
+								.concat("((")
+
+					result = result
+						.concat("struct blorp_r_")
 						.append_int(record_number(owner))
-						.concat("((")
+						.concat("){")
+					var position = 0
 
-			result = result
-				.concat("struct blorp_r_")
-				.append_int(record_number(owner))
-				.concat("){")
-			var position = 0
+					for field in fields:
+						if IntOps.greater_than(position, 0):
+							result = result.concat(",")
 
-			for field in fields:
-				if IntOps.greater_than(position, 0):
-					result = result.concat(",")
+						stored = match field.value:
+							UnmanagedPayload(value):
+								value
+							OwnedPayload(value, _):
+								value
 
-				stored = match field.value:
-					UnmanagedPayload(value):
-						value
-					OwnedPayload(value, _):
-						value
+						result = result
+							.concat(".")
+							.concat(c_field(field.field))
+							.concat("=")
+							.concat(c_value(stored))
+						position = IntOps.add(position, 1)
 
-				result = result
-					.concat(".")
-					.concat(c_field(field.field))
-					.concat("=")
-					.concat(c_value(stored))
-				position = IntOps.add(position, 1)
-
-			Ok(result.concat("})"))
+					Ok(result.concat("})"))
+				None: Err(internal_error())
 		ReadRecordFieldDefinition(field, argument):
-			layout ?= records
-				.get(record_number(field_owner(field)))
-				.to_result(internal_error())
+			match records.get(record_number(field_owner(field))):
+				Some(layout):
 
-			value = match argument:
-				UnmanagedArgument(value):
-					value
-				BorrowedArgument(borrow):
-					borrow.value
+					value = match argument:
+						UnmanagedArgument(value):
+							value
+						BorrowedArgument(borrow):
+							borrow.value
 
-			selector = match layout.representation:
-				InlineRecord:
-					"."
-				ManagedRecord:
-					"->"
+					selector = match layout.representation:
+						InlineRecord:
+							"."
+						ManagedRecord:
+							"->"
 
-			Ok(
-				output
-					.concat(c_value(value))
-					.concat(selector)
-					.concat(c_field(field)),
-			)
+					Ok(
+						output
+							.concat(c_value(value))
+							.concat(selector)
+							.concat(c_field(field)),
+					)
+				None: Err(internal_error())
 		ParameterDefinition(index):
 			Ok(output.concat(c_parameter(index)))
 		VoidDefinition:
@@ -928,26 +925,27 @@ private pure func append_operation(
 					UnmanagedPayload(value): c_value(value)
 					OwnedPayload(_, owner): c_owner(owner)
 				operands = operands.append(operand)
-			value ?= c_union_value(id, operands, unions)
-			Ok(output.concat(value))
+			match c_union_value(id, operands, unions):
+				Ok(value): Ok(output.concat(value))
+				Err(error): Err(error)
 		ConstructListDefinition(_) | JoinDefinition(_):
 			-- List construction and joins are written as statements, by
 			-- append_list_construction and append_join; never as expressions.
 			Err(internal_error())
 		PayloadDefinition(field, id):
-			declaration ?= unions
-				.get(union_number(variant_owner(variant_field_variant(field))))
-				.to_result(internal_error())
-			Ok(
-				output
-					.concat(c_value(id))
-					.concat(union_member_selector(declaration))
-					.concat("payload.")
-					.concat(c_payload_field(
-						variant_field_variant(field),
-						variant_field_number(field),
-					)),
-			)
+			match unions.get(union_number(variant_owner(variant_field_variant(field)))):
+				Some(declaration):
+					Ok(
+						output
+							.concat(c_value(id))
+							.concat(union_member_selector(declaration))
+							.concat("payload.")
+							.concat(c_payload_field(
+								variant_field_variant(field),
+								variant_field_number(field),
+							)),
+					)
+				None: Err(internal_error())
 
 
 -- The one C rendering of a union value, for source constructions and runtime
@@ -1389,22 +1387,22 @@ private pure func append_storage_operation(
 				),
 			)
 		UnionType(id):
-			layout ?= unions
-				.get(union_number(id))
-				.to_result(internal_error())
-			Ok(
-				match layout.representation:
-					InlineUnmanaged:
-						None
-					InlineOwningPayload | BoxedRecursive:
-						prefix = match action:
-							DuplicateValue:
-								"blorp_union_dup_"
-							DestroyValue:
-								"blorp_union_drop_"
+			match unions.get(union_number(id)):
+				Some(layout):
+					Ok(
+						match layout.representation:
+							InlineUnmanaged:
+								None
+							InlineOwningPayload | BoxedRecursive:
+								prefix = match action:
+									DuplicateValue:
+										"blorp_union_dup_"
+									DestroyValue:
+										"blorp_union_drop_"
 
-						Some(prefix.append_int(union_number(id)))
-			)
+								Some(prefix.append_int(union_number(id)))
+					)
+				None: Err(internal_error())
 		_:
 			Ok(None)
 
@@ -1596,8 +1594,9 @@ private pure func append_union_ownership(
 		InlineUnmanaged:
 			Ok(output)
 		InlineOwningPayload:
-			duplicated ?= append_union_action(output, layout, index, unions, DuplicateValue)
-			append_union_action(duplicated, layout, index, unions, DestroyValue)
+			match append_union_action(output, layout, index, unions, DuplicateValue):
+				Ok(duplicated): append_union_action(duplicated, layout, index, unions, DestroyValue)
+				Err(error): Err(error)
 		BoxedRecursive:
 			constructed = append_boxed_union_constructor(output, index)
 			append_boxed_union_release(append_boxed_union_retain(constructed, index), layout, index, unions)
@@ -1618,22 +1617,22 @@ private pure func append_ownership_operation(
 				_:
 					append_owned_definition(output, definition, unions, records)
 		AcquireOwner(owner, borrowed, _):
-			value_type ?= types
-				.get(owner_number(owner))
-				.to_result(internal_error())
-			retained ?= append_storage_operation(
-				output,
-				value_type,
-				DuplicateValue,
-				c_value(borrowed.value),
-				unions,
-			)
-			append_owner_alias(retained, owner, borrowed.value, value_type, unions)
+			match types.get(owner_number(owner)):
+				Some(value_type):
+					match append_storage_operation(
+						output,
+						value_type,
+						DuplicateValue,
+						c_value(borrowed.value),
+						unions,
+					):
+						Ok(retained): append_owner_alias(retained, owner, borrowed.value, value_type, unions)
+						Err(error): Err(error)
+				None: Err(internal_error())
 		DropOwner(owner, _):
-			value_type ?= types
-				.get(owner_number(owner))
-				.to_result(internal_error())
-			append_storage_operation(output, value_type, DestroyValue, c_owner(owner), unions)
+			match types.get(owner_number(owner)):
+				Some(value_type): append_storage_operation(output, value_type, DestroyValue, c_owner(owner), unions)
+				None: Err(internal_error())
 
 
 private pure func append_ownership_operations(
@@ -2186,15 +2185,24 @@ private pure func element_fragments(
 			destroy = "blorp_list_drop_".concat(suffix).concat("(element);"),
 		})
 	else:
-		type_name ?= c_type(layout.element, unions)
-		ownership ?= value_ownership(layout.element, unions, records)
-		acquire ?= match ownership:
-			NoOwnership: Ok("")
-			_: append_storage_operation("", layout.element, DuplicateValue, "element", unions)
-		destroy ?= match ownership:
-			NoOwnership: Ok("")
-			_: append_storage_operation("", layout.element, DestroyValue, "element", unions)
-		Ok({ type_name = type_name, acquire = acquire, destroy = destroy })
+		match c_type(layout.element, unions):
+			Ok(type_name):
+				match value_ownership(layout.element, unions, records):
+					Ok(ownership):
+						acquire_result: Result[String, Diagnostic] = match ownership:
+							NoOwnership: Ok("")
+							_: append_storage_operation("", layout.element, DuplicateValue, "element", unions)
+						match acquire_result:
+							Ok(acquire):
+								destroy_result: Result[String, Diagnostic] = match ownership:
+									NoOwnership: Ok("")
+									_: append_storage_operation("", layout.element, DestroyValue, "element", unions)
+								match destroy_result:
+									Ok(destroy): Ok({ type_name = type_name, acquire = acquire, destroy = destroy })
+									Err(error): Err(error)
+							Err(error): Err(error)
+					Err(error): Err(error)
+			Err(error): Err(error)
 
 
 private pure func list_runtime_fragment(

@@ -2085,7 +2085,12 @@ Rules for `?=`:
 - `None` or `Err(error)` is returned from the enclosing carrier-returning function.
 - Success values are not auto-wrapped; write `Some(value)` or `Ok(value)` explicitly.
 - `?=` is rejected inside loop bodies, including `for ... concurrently(...)` bodies. Move the `?=` before the loop, use an explicit `match` in the loop, or use Option/Result combinators when failure should stay local to one iteration.
-- A lambda or `concurrent:` body starts fresh: `?=` inside a lambda is allowed even within a loop, because it returns from the lambda, and `break` and `continue` cannot cross a lambda or task boundary.
+- Keep propagation among a function body's own top-level statements. Inside a
+  block, match on the `Option` or `Result` explicitly, or move the operation
+  into a separate function. Blorp 2 enforces this placement: it rejects `?=`
+  inside `if`, `match`, loop and lambda bodies. The existing compiler's more
+  permissive behavior is documented in [GRAMMAR §5.3](GRAMMAR.md#53-break-continue-and-);
+  nested propagation can miscompile (see [CF-031](COMPILER_FAULTS.md#nested-result-propagation)).
 - Direct `?=` cannot unwrap a resource acquisition such as `open_read(path)`;
   use `with reader ?= open_read(path):` so cleanup ownership is installed.
 - There is no bare postfix `?` operator.
@@ -2233,8 +2238,9 @@ import:
 
 func load_in_chunks(path: String) -> Result[Int, IOError]:
     with reader ?= open_read(path):
-        parts ?= reader.chunks_with_size(4096).collect_result()
-        Ok(parts.length())
+        match reader.chunks_with_size(4096).collect_result():
+            Ok(parts): Ok(parts.length())
+            Err(error): Err(error)
 ```
 
 For line counts, prefer the reader helper when the lines themselves are not
@@ -2276,8 +2282,9 @@ import:
 func fetch_once(port_num: Int) -> Result[Int, TcpError]:
     remote ?= port(port_num)
     with stream ?= connect_loopback(IPv4, remote):
-        data ?= read_chunk(stream, 4096)
-        Ok(data.length())
+        match read_chunk(stream, 4096):
+            Ok(data): Ok(data.length())
+            Err(error): Err(error)
 ```
 
 For repeated reads, `chunks(stream, max_bytes)` creates a scoped
@@ -2346,10 +2353,12 @@ import:
 func serve_until_timeout() -> Result[Void, TcpError]:
     http_port ?= Tcp.port(8080)
     with listener ?= Tcp.listen_loopback(IPv4, http_port, 128):
-        ignored ?= Tcp.set_timeout(listener, 1000)
-        for conn in Tcp.connections_stop_on_error(listener) concurrently(limit: 128):
-            _ = Tcp.stream_local_port(conn)
-        Ok(void)
+        match Tcp.set_timeout(listener, 1000):
+            Err(error): Err(error)
+            Ok(_):
+                for conn in Tcp.connections_stop_on_error(listener) concurrently(limit: 128):
+                    _ = Tcp.stream_local_port(conn)
+                Ok(void)
 ```
 
 For HTTP servers, keep resource operations in the connection loop and factor

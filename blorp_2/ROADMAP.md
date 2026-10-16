@@ -76,10 +76,10 @@ milestone work.
 
 | Milestone | Scope | Status |
 | --- | --- | --- |
-| [M0](#m0-foundation-closeout) | Re-cut, perf fixes, recursion-site loops, fixpoint script, parity table | Landed: checker re-cut, emit and name-interning fixes, parity table, parser statement loop, `scripts/blorp2-fixpoint`, `BLORP2_COMPILER` harness. Open: the per-item recursions in `check_functions` and `declare_types`. |
+| [M0](#m0-foundation-closeout) | Re-cut, perf fixes, parser statement loop, fixpoint script, parity table | Landed. Managed-value recursion limits remain recorded under M4. |
 | [M1a](#m1a-surface-syntax-parity) | Layout, `\|`/`raw` strings, pattern/opaque/range syntax | Checkpoints 1, 2a, 2b and 3 landed. 32 of 34 files parse; the other two need a `Char` type (`lex.brp`) and function types (`specialize.brp`, M7). |
 | [ML](#ml-list-construction) | `append`, `set`, `concat`, list literal | Done. |
-| [M1b](#m1b-names-and-the-foundation) | Namespace: private, aliases, qualified names, designated `Bool`/`Option`/`Result` | Part A done. Part B in progress. |
+| [M1b](#m1b-names-and-the-foundation) | Namespace: private, aliases, qualified names, designated `Bool`/`Option`/`Result` | Parts A and B done; control-flow consumers follow in M2/M3. |
 | [M5](#m5-constants) | Module-level constants | Not started. |
 | [M2](#m2-the-join) | Blocks with parameters; non-tail match, `if`, `and`/`or`/`not`, `?=` | M2.1 implemented; M2.2 after M1b part B; M2.3 after M2.2 and M1b part B (designated `Result`). |
 | [M2b](#m2b-pattern-compilation) | Nested, or-, list and literal patterns | Not started. |
@@ -170,12 +170,11 @@ its report. Later milestones build on these and do not reopen them.
 
 **Goal.** A foundation the fixpoint can be measured against. **Scope.**
 
-- **Recursion-site loops.** `parse::consume_function_lines`,
-  `check/bodies::check_functions` and `check/declarations::declare_types` recurse
-  once per statement, function or union only because the host forbids `?=` in
-  loop bodies; the pilot dies at about 2K items per module. Each becomes
-  `while` + `match` + `break` (host-legal). Oracle: the pilot on a 4K-statement
-  input under `ulimit -s 512` exits 0.
+- **Parser statement loop.** `parse::consume_function_lines` uses a loop
+  rather than recursion per statement. Oracle: the pilot on a 4K-statement
+  input under `ulimit -s 512` exits 0. The declaration and function walks
+  retain their direct recursive form; M4 records their managed-value tail-call
+  limits rather than promising separate loop rewrites here.
 - **[scripts/blorp2-fixpoint](../scripts/blorp2-fixpoint)**: the three stages, a
   SHA-256 per stage with the first differing line, A == B over fixtures, e2e
   under B, `-O2`, and `--frontier`.
@@ -194,8 +193,7 @@ fixpoint script reports frontier 0.
 
 **Status.** The checker re-cut by phase ([check/](src/check/)), the emit and
 name-interning fixes, the parity table, the parser's statement loop, the
-fixpoint script and the `BLORP2_COMPILER` harness have landed. Open: the
-per-item recursions in `check_functions` and `declare_types`.
+fixpoint script and the `BLORP2_COMPILER` harness have landed.
 
 ## M1a: surface syntax parity
 
@@ -211,12 +209,13 @@ GRAMMAR [§1.4](../docs/GRAMMAR.md#14-keywords) reserves, and indentation follow
 the host's levels stack: a deeper line opens a level whatever the step, a
 dedent must land on an open level, and a bracketed block closes at its base.
 
-**Decision.** `?=` is rejected in loop bodies and in lambda bodies, and the
-parser enforces it from its statement context. The host agrees for loops
-([GUIDE](../docs/GUIDE.md), `?=` is rejected inside loop bodies); blorp_2 is
-stricter for lambdas, which the host allows. The host divergence applies to
-lambdas only, and the source has no such use. Keeping loop exits at two
-variants (M3) and `?=` a function-body construct (M2.3) depend on it.
+**Decision.** `?=` is allowed only among a function body's own top-level
+statements, and the parser enforces this from its statement context. Every
+`if`/`match` block, loop body and lambda body rejects it. The host agrees for
+loops ([GUIDE](../docs/GUIDE.md)); it remains more permissive in the other
+contexts. The compiler-source rewrite removes those nested uses while keeping
+the host unchanged. Keeping loop exits at two variants (M3) and propagation
+out of join arms (M2.3) depends on this rule.
 
 ```blorp
 import:
@@ -367,21 +366,24 @@ value ?= parse(text)           value = Match parse(text):
                                    Err(e) -> ReturnExpression(Err(e))      -- diverging arm
 ```
 
-`?=` desugars only in function-body positions (it is rejected in loop and lambda
-bodies, see M1a). It is a value match with one diverging arm: no CPS nesting, no depth growth (the
-source's deepest chain is 13). All 668 uses are in `Result` functions, so `Err`
-propagation suffices. An `if` origin stays in the checker's error type for
+`?=` desugars only among a function body's own top-level statements. It is
+rejected inside every `if` and `match` block, as well as loop and lambda bodies
+(see the [quality rule](QUALITY_ROADMAP.md#parser-contexts)). Its failure arm
+returns from the function and discharges the function's live owners; it never
+exits an enclosing join. There is no CPS nesting or depth growth. The compiler
+source uses `Result` propagation. An `if` origin stays in the checker's error type for
 diagnostics, not in the tree. Local type annotations (an expected type) land
 here.
 
 Steps: **M2.1** the join mechanism across lower, own, verify and emit, with
 non-tail `match` (needs no `Bool`); **M2.2** `if` and `and`/`or`/`not` (needs the
 designated `Bool`); **M2.3** `?=` and local annotations (needs the designated
-`Result`; the early return must discharge every enclosing owner).
+`Result`; the early return must discharge every live function owner).
 
-**Exit proof.** Fixtures for each desugaring; a `?=` in a non-tail arm with two
-live managed locals; the existing fixtures byte-identical; a nesting stress
-fixture with recorded C depth.
+**Exit proof.** Fixtures for each desugaring; top-level `?=` success and failure
+with two live managed locals; parser rejections for propagation in join arms;
+the existing fixtures byte-identical; a nesting stress fixture with recorded C
+depth.
 
 **Status.** M2.1 implemented: bound and statement `match`, nested joins and
 joins in tail arms, with byte-identical C for every existing fixture; see the
@@ -397,13 +399,9 @@ checked form is `Match(CheckedJoin)` with value arms; the tail match keeps
 value, as a plain Void tail does. A self call at the tail of a nested match
 is rejected until the loops milestone gives joins a backedge. M2.2 after M1b
 part B (designated `Bool`). M2.3 after M2.2; it needs M1b part B's
-designated `Result`, and adds a join arm's early return with `?=` as its
-producer: an arm exit union, the owners live at each join, drops of the
-whole scope stack except a transferred owner, the verifier's return rule
-for an arm and its rule that some arm continues to the join, `return` in an
-emitted case, fixtures with owners live in two enclosing scopes, and the
-negatives for an early return leaving an outer arm's owner live and for a
-join whose every arm returns.
+designated `Result`, and adds top-level propagation with the function return's
+ownership discharge and independent verification. It requires no early-return
+form for a join arm: nested propagation is a parser error.
 
 ## M2b: pattern compilation
 
@@ -526,6 +524,14 @@ recursive bindings, backpatching or lazy knot tying. **Scope.** Three steps:
    or release must run on small thread stacks. Test
    shared-tail diamonds, repeated slots, mixed inline owning children, all
    variants and deep branching teardown.
+
+**Managed-value tail calls.** The direct recursive walks in `check_functions`,
+`declare_types` and `accept_functions` carry managed values, so neither compiler
+currently turns them into loops. Retained measurements at `-O0` overflow at
+2,697 functions and 1,909 types; `accept_functions` is unmeasured. These are
+historical measurements from the quality investigation, not renewed limits for
+every host or build. M4's managed-value tail calls remove this restriction;
+there is no separate loop rewrite promised by M0.
 
 **Opaque types** are a checked `TypeRef.OpaqueType(id)`, legal only in the
 declaring module (a namespace-row fact). Specialize substitutes the underlying

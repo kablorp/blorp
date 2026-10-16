@@ -259,10 +259,9 @@ private pure func terminal_span(
 	if visible_outside(ordinal, outer):
 		Ok(INTERNAL_SPAN)
 	else:
-		definition ?= definitions
-			.get(IntOps.subtract(ordinal, first_value))
-			.to_result(internal_error(INTERNAL_SPAN, "invalid return value in ownership use analysis"))
-		Ok(definition.span)
+		match definitions.get(IntOps.subtract(ordinal, first_value)):
+			Some(definition): Ok(definition.span)
+			None: Err(internal_error(INTERNAL_SPAN, "invalid return value in ownership use analysis"))
 
 
 -- What a block's exit reads: one returned or yielded value, or a backedge's
@@ -736,14 +735,14 @@ private pure func drop_position(
 		DropInEachArm:
 			Ok(count)
 		DropAtLastUse(uses):
-			last_use ?= uses
-				.get(position)
-				.to_result(internal_error(span, "missing value-use row"))
-			Ok(
-				match last_use:
-					Some(last): last
-					None: position
-			)
+			match uses.get(position):
+				Some(last_use):
+					Ok(
+						match last_use:
+							Some(last): last
+							None: position
+					)
+				None: Err(internal_error(span, "missing value-use row"))
 
 
 -- A join's own value: its result is a fresh owner when managed, like a
@@ -954,9 +953,11 @@ private pure func insert_block(
 			Ok({ entries = inserted.entries, next_owner = inserted.next_owner, exit = RecurArguments(arguments, span) })
 		ReturnValue(result):
 			span = returned_span(definitions, result, first_value)
-			source ?= value_source(result, inserted.sources, enclosing, first_value, span)
-			leaving = leave_with(result, source, inserted.entries, inserted.next_owner, span)
-			Ok({ entries = leaving.entries, next_owner = leaving.next_owner, exit = ReturnResult(leaving.transfer) })
+			match value_source(result, inserted.sources, enclosing, first_value, span):
+				Ok(source):
+					leaving = leave_with(result, source, inserted.entries, inserted.next_owner, span)
+					Ok({ entries = leaving.entries, next_owner = leaving.next_owner, exit = ReturnResult(leaving.transfer) })
+				Err(error): Err(error)
 	left ?= exit_result
 	completed ?= complete_joins(
 		left.entries,
@@ -1224,31 +1225,31 @@ private pure func admit_loop(
 					Ok(NoOwnership):
 						void
 
-			signature ?= match invalid:
+			match invalid:
 				Some(error):
 					Err(error)
 				None:
-					Ok(void)
+					match admit_loop_values(function.definitions, unions, records):
+						Ok(prefix):
 
-			prefix ?= admit_loop_values(function.definitions, unions, records)
+							match function.tail:
+								ExitValue(_):
+									Ok(void)
+								MatchValue(matched):
+									for arm in matched.arms:
+										match admit_loop_values(arm.body.definitions, unions, records):
+											Err(error):
+												invalid = Some(error)
+												break
+											Ok(_):
+												void
 
-			match function.tail:
-				ExitValue(_):
-					Ok(void)
-				MatchValue(matched):
-					for arm in matched.arms:
-						match admit_loop_values(arm.body.definitions, unions, records):
-							Err(error):
-								invalid = Some(error)
-								break
-							Ok(_):
-								void
-
-					match invalid:
-						Some(error):
-							Err(error)
-						None:
-							Ok(void)
+									match invalid:
+										Some(error):
+											Err(error)
+										None:
+											Ok(void)
+						Err(error): Err(error)
 
 
 pure func insert_function(
@@ -1260,13 +1261,15 @@ pure func insert_function(
 
 	match function.tail:
 		ExitValue(exit):
-			built ?= insert_block(function.definitions, exit, [], 0, 0, unions, records)
-			Ok({
-				execution = function.execution,
-				signature = function.signature,
-				operations = built.operations,
-				tail = ReturnTail(built.exit),
-			})
+			match insert_block(function.definitions, exit, [], 0, 0, unions, records):
+				Ok(built):
+					Ok({
+						execution = function.execution,
+						signature = function.signature,
+						operations = built.operations,
+						tail = ReturnTail(built.exit),
+					})
+				Err(error): Err(error)
 		MatchValue(matched):
 			insert_match(function, matched, unions, records)
 

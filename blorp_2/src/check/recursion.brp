@@ -156,11 +156,13 @@ private pure func tail_exit(
 		ReturnExpression(value):
 			match tail_call(value, current):
 				Some(call):
-					valid ?= reject_self_calls(call.arguments, current)
-					Ok(RecurWith(call.arguments, call.span))
+					match reject_self_calls(call.arguments, current):
+						Ok(valid): Ok(RecurWith(call.arguments, call.span))
+						Err(error): Err(error)
 				None:
-					valid ?= nested_tail(value, current)
-					Ok(exit)
+					match nested_tail(value, current):
+						Ok(valid): Ok(exit)
+						Err(error): Err(error)
 
 
 -- A tail value other than a direct self call. A match there passes the tail
@@ -194,13 +196,17 @@ private pure func tail_arms(
 		None:
 			Ok(checked)
 		Some(arm):
-			prefix ?= reject_self_calls(statement_values(arm.statements), current)
-			exit ?= tail_exit(arm.body, current)
-			tail_arms(
-				arms,
-				current,
-				checked.append({ arm | body = exit }),
-			)
+			match reject_self_calls(statement_values(arm.statements), current):
+				Ok(prefix):
+					match tail_exit(arm.body, current):
+						Ok(exit):
+							tail_arms(
+								arms,
+								current,
+								checked.append({ arm | body = exit }),
+							)
+						Err(error): Err(error)
+				Err(error): Err(error)
 
 
 private pure func recurs(exit: CheckedExit) -> Bool:
@@ -243,31 +249,37 @@ pure func check_execution(
 				body = body,
 			})
 		Some(annotation):
-			nongeneric ?= if IntOps.equals(function.type_parameters.length(), 0):
-				Ok(void)
+			if IntOps.equals(function.type_parameters.length(), 0):
+				match reject_self_calls(statement_values(statements), current):
+					Ok(prefix):
+
+						tail_body: Result[CheckedBody, CheckError] = match body:
+							CheckedValueBody(value):
+								match tail_exit(value, current):
+									Ok(exit): Ok(CheckedValueBody(exit))
+									Err(error): Err(error)
+							CheckedMatchBody(matched):
+								match reject_self_calls([matched.scrutinee], current):
+									Ok(scrutinee):
+										match tail_arms(matched.arms, current, []):
+											Ok(arms): Ok(CheckedMatchBody({ matched | arms = arms }))
+											Err(error): Err(error)
+									Err(error): Err(error)
+
+						match tail_body:
+							Ok(loop_body):
+
+								if body_recurs(loop_body):
+									Ok({
+										execution = SelfTailLoop(annotation),
+										body = loop_body,
+									})
+								else:
+									Err(recursion_error(annotation, NoSelfRecursion))
+							Err(error): Err(error)
+					Err(error): Err(error)
 			else:
 				Err(recursion_error(annotation, GenericTailRecursionUnsupported))
-
-			prefix ?= reject_self_calls(statement_values(statements), current)
-
-			tail_body: Result[CheckedBody, CheckError] = match body:
-				CheckedValueBody(value):
-					exit ?= tail_exit(value, current)
-					Ok(CheckedValueBody(exit))
-				CheckedMatchBody(matched):
-					scrutinee ?= reject_self_calls([matched.scrutinee], current)
-					arms ?= tail_arms(matched.arms, current, [])
-					Ok(CheckedMatchBody({ matched | arms = arms }))
-
-			loop_body ?= tail_body
-
-			if body_recurs(loop_body):
-				Ok({
-					execution = SelfTailLoop(annotation),
-					body = loop_body,
-				})
-			else:
-				Err(recursion_error(annotation, NoSelfRecursion))
 
 
 private fixed union ParameterGrowth:

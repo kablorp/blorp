@@ -368,44 +368,53 @@ private pure func lower_value(
 		LiteralString(bytes):
 			Ok(define_value(builder, StringValue(bytes), value.value_type, value.span))
 		ReadBinding(id):
-			bound ?= read_binding(bindings, id, value.span)
-			Ok({ builder = builder, value = bound })
+			match read_binding(bindings, id, value.span):
+				Ok(bound): Ok({ builder = builder, value = bound })
+				Err(error): Err(error)
 		ConstructVariant(variant, values):
-			children ?= lower_arguments(builder, bindings, values)
-			Ok(define_value(children.builder, ConstructValue(variant, children.values), value.value_type, value.span))
+			match lower_arguments(builder, bindings, values):
+				Ok(children): Ok(define_value(children.builder, ConstructValue(variant, children.values), value.value_type, value.span))
+				Err(error): Err(error)
 		ConstructRecord(owner, fields):
-			built ?= lower_record_fields(builder, bindings, fields)
-			Ok(define_value(built.builder, ConstructRecordValue(owner, built.values), value.value_type, value.span))
+			match lower_record_fields(builder, bindings, fields):
+				Ok(built): Ok(define_value(built.builder, ConstructRecordValue(owner, built.values), value.value_type, value.span))
+				Err(error): Err(error)
 		ConstructList(elements):
-			children ?= lower_arguments(builder, bindings, elements)
-			Ok(define_value(children.builder, ConstructListValue(children.values), value.value_type, value.span))
+			match lower_arguments(builder, bindings, elements):
+				Ok(children): Ok(define_value(children.builder, ConstructListValue(children.values), value.value_type, value.span))
+				Err(error): Err(error)
 		UpdateRecord(owner, update):
 			lower_record_update(builder, bindings, update, owner, value.value_type, value.span)
 		InvokeFunction(call, arguments):
-			children ?= lower_arguments(builder, bindings, arguments)
-			-- A call's definition is anchored at its callee, not at the whole occurrence.
-			Ok(define_value(children.builder, CallValue(call, children.values), value.value_type, call.span))
+			match lower_arguments(builder, bindings, arguments):
+				Ok(children):
+					-- A call's definition is anchored at its callee, not at the whole occurrence.
+					Ok(define_value(children.builder, CallValue(call, children.values), value.value_type, call.span))
+				Err(error): Err(error)
 		ReadRecordField(receiver, field):
-			read ?= lower_value(builder, bindings, receiver)
-			Ok(define_value(read.builder, ReadRecordFieldValue(field, read.value), value.value_type, value.span))
+			match lower_value(builder, bindings, receiver):
+				Ok(read): Ok(define_value(read.builder, ReadRecordFieldValue(field, read.value), value.value_type, value.span))
+				Err(error): Err(error)
 		Match(join):
-			scrutinee ?= lower_value(builder, bindings, join.scrutinee)
-			id = into_opaque ValueId(scrutinee.builder.next_value)
-			pending: PendingJoin = {
-				id = id,
-				value_type = value.value_type,
-				span = value.span,
-				scrutinee = scrutinee.value,
-				join = join,
-				bindings = bindings,
-			}
-			Ok({
-				builder = {
-					next_value = IntOps.add(scrutinee.builder.next_value, 1),
-					entries = scrutinee.builder.entries.append(AwaitingArms(pending))
-				},
-				value = id,
-			})
+			match lower_value(builder, bindings, join.scrutinee):
+				Ok(scrutinee):
+					id = into_opaque ValueId(scrutinee.builder.next_value)
+					pending: PendingJoin = {
+						id = id,
+						value_type = value.value_type,
+						span = value.span,
+						scrutinee = scrutinee.value,
+						join = join,
+						bindings = bindings,
+					}
+					Ok({
+						builder = {
+							next_value = IntOps.add(scrutinee.builder.next_value, 1),
+							entries = scrutinee.builder.entries.append(AwaitingArms(pending))
+						},
+						value = id,
+					})
+				Err(error): Err(error)
 
 
 private fixed record BuiltBlock {
@@ -471,12 +480,14 @@ private pure func lower_exit(
 ) -> Result[BuiltExit, Diagnostic]:
 	match exit:
 		ReturnExpression(value):
-			result ?= lower_value({ next_value = next_value, entries = [] }, bindings, value)
-			Ok({
-				next_value = result.builder.next_value,
-				entries = result.builder.entries,
-				exit = ReturnValue(result.value),
-			})
+			match lower_value({ next_value = next_value, entries = [] }, bindings, value):
+				Ok(result):
+					Ok({
+						next_value = result.builder.next_value,
+						entries = result.builder.entries,
+						exit = ReturnValue(result.value),
+					})
+				Err(error): Err(error)
 		RecurWith(arguments, span):
 			var cursor = next_value
 			var entries: List[BlockEntry] = []
@@ -793,15 +804,19 @@ private pure func lower_function(
 	block: BuiltBlock = { prefix | entries = entries }
 	body_result: Result[BuiltTail, Diagnostic] = match function.body:
 		ConcreteValueBody(value):
-			result ?= lower_exit(prefix.next_value, prefix.bindings, value)
-			var body_entries = block.entries
-			for entry in result.entries:
-				body_entries = body_entries.append(entry)
-			completed ?= complete_joins(body_entries, result.next_value, function.bindings, unions)
-			Ok({ definitions = completed.definitions, tail = ExitValue(result.exit) })
+			match lower_exit(prefix.next_value, prefix.bindings, value):
+				Ok(result):
+					var body_entries = block.entries
+					for entry in result.entries:
+						body_entries = body_entries.append(entry)
+					match complete_joins(body_entries, result.next_value, function.bindings, unions):
+						Ok(completed): Ok({ definitions = completed.definitions, tail = ExitValue(result.exit) })
+						Err(error): Err(error)
+				Err(error): Err(error)
 		ConcreteMatchBody(matched):
-			result ?= lower_match(block, matched, function.bindings, unions)
-			Ok({ definitions = result.definitions, tail = MatchValue(result.matched) })
+			match lower_match(block, matched, function.bindings, unions):
+				Ok(result): Ok({ definitions = result.definitions, tail = MatchValue(result.matched) })
+				Err(error): Err(error)
 	body ?= body_result
 	Ok({
 		execution = function.execution,

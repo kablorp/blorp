@@ -90,6 +90,10 @@ The handoff's implementation baseline is `bd8b39775`; roadmap publication
 than a live `main` tip. Line deltas are production lines in `blorp_2/src`.
 The namespace completion checkpoint is recorded below.
 
+The namespace was subsequently squash-merged and pushed as `fb257c946`.
+[Remaining quality work](QUALITY_REMAINING_PLAN.md) records the current
+execution order, refreshed propagation census and validation contract.
+
 | Item | State | Branch / SHA | Next step | Lines |
 | --- | --- | --- | --- | --- |
 | Namespace redesign | Six commits built, reviewed twice and gated green; one batch of small fixes open | `blorp2/namespace-scopes` at `bbb3da2f9` | Fold the [open items](#namespace-open-items), spot-check, gate, land | −188 |
@@ -514,8 +518,9 @@ match kind:
 For an Option, the arms are `Some(value): ...` and `None: None`.
 
 **Form 2: a value `if`/`match` bound to a name.** Give the bound value a
-Result type, then use one top-level `?=`. The temporary must be annotated,
-because of host fault CF-032 below:
+Result type, then use one top-level `?=`. Annotate the temporary to provide
+its expected carrier directly. The earlier CF-032 failure report below still
+needs a retained standalone reproduction:
 
 ```blorp
 -- before
@@ -926,11 +931,14 @@ The `?=` docs commit adds two more:
 
   `run(0 - 1)` should return `Err(negative)` without printing. It prints the
   line first. Blorp 2 now rejects this program.
-- **CF-032: `v ?= match` with `Ok`/`Err` arms fails to type-check.** The error
-  is "Incompatible error type for ?=", raised at `infer.brp:22548`. The
-  initializer is inferred without an expected type (`infer_without_expected`,
-  `infer.brp:22504`). Annotating the temporary works around it, which is why
-  Form 2 of the `?=` rewrite annotates.
+- **CF-032: reported inference failure for `v ?= match`.** The earlier
+  investigation reported "Incompatible error type for ?=" with `Ok`/`Err`
+  arms, avoided by an annotated temporary, but did not retain the failing input.
+  A fresh simple Bool/Int/String example compiles on the frozen host. The
+  initializer is inferred without an expected type (`infer.brp:22504`) and
+  that message is raised at `infer.brp:22548`; these source facts do not prove
+  the reported fault. Keep it explicitly unverified pending reduction; see
+  [COMPILER_FAULTS](../docs/COMPILER_FAULTS.md#nested-result-propagation).
 
 ## Deferred cost work
 

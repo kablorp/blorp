@@ -1821,6 +1821,16 @@ Any other target is a syntax error. Owner decisions:
   within a loop. They must sit in statement-position constructs all the way to
   the loop body (for `break` and `continue`) or to the function body (for
   `?=`).
+- Blorp 2's input-program rule is stricter: **`?=` is valid only among a
+  function body's own top-level statements.** It is forbidden inside every
+  `if` or `match` block, including statement, tail and value positions, and
+  inside loop and lambda bodies, while conditions and for iterables.
+  The parser reports `` `?=` cannot be used inside an `if` or `match` block ``
+  with help ``match on the Result or Option in place, or move the block into
+  its own function and use `?=` at its top``. Loop and lambda contexts retain
+  their more specific diagnostics. This follows the owner's rulings:
+  "Did I not already mention that ?= cannot be used inside `if` and `match`
+  blocks?" and "loops, or while conditions."
 
 > **Current behaviour differs:** `break` and `continue` inside a
 > value-position `if` or `match` in a loop are accepted by the parser;
@@ -1929,7 +1939,8 @@ whether today's parsers follow them.
 | `..` | Non-associative; `a..b..c` is an error. `..#N` is unaffected. | [3.5](#35-expressions) | Differs: left-associative. |
 | `detach` | Statement only. | [3.4](#34-statements) | Differs: prefix operator. |
 | Interpolation holes | Any `Stringable` expression; no nested interpolated strings. | [5.5](#55-interpolation-hole-contents) | Differs: nesting accepted. |
-| `break`, `continue`, `?=` | Not inside a value-position `if` or `match` in a loop. | [5.3](#53-break-continue-and-) | Differs: accepted. |
+| `break`, `continue` | Not inside a value-position `if` or `match` in a loop. | [5.3](#53-break-continue-and-) | Existing compiler differs; Blorp 2 enforces the restriction. |
+| `?=` | Function body's own top-level statements only; never inside `if`, `match`, loop or lambda bodies. | [5.3](#53-break-continue-and-) | Blorp 2 enforces it; the frozen existing compiler remains more permissive, with loop-body restrictions and the CF-031 fault. |
 | Nesting limit | 128. | [5.4](#54-nesting-limit) | Differs: no limit. |
 | Destructuring | Flat only, with no element types. | [5.2](#52-assignable-places) | Rejected today, with generic messages. |
 | Subscript assignment | Any chain of subscripts on a name; valid only on tuples (literal index) and tensors (proven index); a typecheck rule. | [5.2](#52-assignable-places) | Differs: any postfix place parses; tuples are rejected. |

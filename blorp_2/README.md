@@ -1148,16 +1148,22 @@ Lexical and layout rules:
   one in a function or depth three in an arm block. Its initializer starts on
   the same line, or stands alone on the next line indented one level, and may
   continue inside brackets. `name ?= expression` is a propagating binding:
-  it parses like a binding (never with `var`), and checking rejects it until
-  the join milestone. `while condition:` and `for name in iterable:` (or
+  it parses only among a function body's own top-level statements, never with
+  `var`. It is rejected inside every `if` or `match` block, in statement and
+  value positions alike, including tail arms. Loop bodies, lambda bodies,
+  `while` conditions and `for` iterables also reject it.
+  Match on the Result or Option in place, or give the block its own function
+  and propagate at that function's top level. Checking still rejects valid
+  top-level propagation until the join milestone.
+  `while condition:` and `for name in iterable:` (or
   `for _ in iterable:`, discarding each element) open a loop body; they,
   `break` and `continue` are statements with no value, and a loop control
   stands alone on its line (`break 1` is rejected here while the
   host still accepts it, pending GRAMMAR D10).
-  As in the host, `break` and `continue` need an enclosing loop body and
-  `?=` may not appear anywhere inside one; by owner decision none of the
-  three may sit in an `if` or `match` used as a value within a loop. The
-  parser enforces those rules; checking rejects loops until the loops
+  As in the host, `break` and `continue` need an enclosing loop body; by owner
+  decision neither may sit in an `if` or `match` used as a value within a loop.
+  Propagation is also rejected throughout loop bodies. The parser enforces
+  those rules; checking rejects loops until the loops
   milestone. Bindings and bare expression statements may interleave before
   the mandatory final expression or function tail match. A non-final bare
   expression must return Void; bind or return other values. Bindings inside

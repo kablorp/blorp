@@ -144,8 +144,9 @@ private pure func names_a_field_constructor(
 		None:
 			Ok(False)
 		Some(occurrence):
-			found ?= unshadowed_variant(scope, occurrence, name, context)
-			Ok(found.is_some())
+			match unshadowed_variant(scope, occurrence, name, context):
+				Ok(found): Ok(found.is_some())
+				Err(error): Err(error)
 
 
 private pure func resolve_variant_pattern(
@@ -237,22 +238,27 @@ private pure func resolve_pattern(
 		PatternWildcard(_):
 			Ok(unbound(WildcardCase, scope))
 		PatternName(name):
-			contract ?= pattern_variant(name, match_context, context)
+			match pattern_variant(name, match_context, context):
+				Ok(contract):
 
-			match contract:
-				Some(contract):
-					resolve_variant_pattern(contract, [], name.span, ordinal, scope, context)
-				None:
-					capture = BindingCase(binding_id(ordinal))
-					Ok(bound_pattern(name, match_context.union_type, ordinal, scope, capture))
+					match contract:
+						Some(contract):
+							resolve_variant_pattern(contract, [], name.span, ordinal, scope, context)
+						None:
+							capture = BindingCase(binding_id(ordinal))
+							Ok(bound_pattern(name, match_context.union_type, ordinal, scope, capture))
+				Err(error): Err(error)
 		PatternConstructor(head, fields, span):
-			name ?= match head:
-				BareHead(name): Ok(name)
+			match head:
+				BareHead(name):
+					match pattern_variant(name, match_context, context):
+						Ok(contract):
+							unknown = UnknownConstructorPattern(name.id, match_context.union_type)
+							match contract.to_result(match_error(span, unknown)):
+								Ok(variant): resolve_variant_pattern(variant, fields, span, ordinal, scope, context)
+								Err(error): Err(error)
+						Err(error): Err(error)
 				QualifiedHead(_): Err(checker_invariant(span, UnsupportedPatternReachedResolution))
-			contract ?= pattern_variant(name, match_context, context)
-			unknown = UnknownConstructorPattern(name.id, match_context.union_type)
-			variant ?= contract.to_result(match_error(span, unknown))
-			resolve_variant_pattern(variant, fields, span, ordinal, scope, context)
 		PatternOr(_, span):
 			Err(checker_invariant(span, UnsupportedPatternReachedResolution))
 		PatternList(_, _, span):
@@ -479,25 +485,31 @@ private pure func resolve_arms(
 			Ok(progress)
 		Some(arm):
 			-- A tail arm has no continuation, so it may reassign any variable.
-			prefix ?= resolve_arm_prefix(arm, match_context, progress.remaining, progress.bindings, AnyMutableBinding, context)
-			-- A tail match's arm must produce the function's value.
-			body ?= arm.block.value.to_result(match_error(arm.span, ArmWithoutValue))
-			value ?= resolve_value(prefix.block, body, return_expectation(return_type), context)
-			resolve_arms(
-				written,
-				match_context,
-				return_type,
-				{
-					arms = progress.arms.append({
-						pattern = prefix.pattern,
-						statements = prefix.block.statements,
-						body = ReturnExpression(value.value),
-					}),
-					remaining = prefix.remaining,
-					bindings = value.bindings
-				},
-				context,
-			)
+			match resolve_arm_prefix(arm, match_context, progress.remaining, progress.bindings, AnyMutableBinding, context):
+				Ok(prefix):
+					-- A tail match's arm must produce the function's value.
+					match arm.block.value.to_result(match_error(arm.span, ArmWithoutValue)):
+						Ok(body):
+							match resolve_value(prefix.block, body, return_expectation(return_type), context):
+								Ok(value):
+									resolve_arms(
+										written,
+										match_context,
+										return_type,
+										{
+											arms = progress.arms.append({
+												pattern = prefix.pattern,
+												statements = prefix.block.statements,
+												body = ReturnExpression(value.value),
+											}),
+											remaining = prefix.remaining,
+											bindings = value.bindings
+										},
+										context,
+									)
+								Err(error): Err(error)
+						Err(error): Err(error)
+				Err(error): Err(error)
 
 
 -- What a block's value, an initializer or an expression statement must
@@ -580,7 +592,7 @@ private pure func resolve_value(
 		Some(matched):
 			resolve_join(block, matched, expectation, context)
 		None:
-			value ?= match expectation:
+			value_result: Result[CheckedExpr, CheckError] = match expectation:
 				UntypedValue | VoidTail:
 					synthesize_value(block.scope, written, None, context)
 				CheckedAgainst(expected, site):
@@ -589,7 +601,9 @@ private pure func resolve_value(
 					statement_value(block.scope, written, ExpressionStatementValue, context)
 				StatementArm:
 					statement_value(block.scope, written, StatementMatchArmValue, context)
-			Ok({ value = value, bindings = block.bindings })
+			match value_result:
+				Ok(value): Ok({ value = value, bindings = block.bindings })
+				Err(error): Err(error)
 
 
 -- Non-final expression statements, and a statement match's arm values, must
@@ -672,48 +686,52 @@ private pure func resolve_join_arms(
 		None:
 			Ok(progress)
 		Some(arm):
-			prefix ?= resolve_arm_prefix(
+			match resolve_arm_prefix(
 				arm,
 				match_context,
 				progress.remaining,
 				progress.bindings,
 				JoinArmLocals(progress.bindings.length()),
 				context,
-			)
-			resolved: Result[ResolvedValue, CheckError] = match arm.block.value:
-				Some(body):
-					resolve_value(prefix.block, body, progress.expectation, context)
-				None:
-					match progress.expectation:
-						-- An arm of a statement match may end with a statement.
-						StatementValue | StatementArm:
-							Ok({
-								value = { form = LiteralVoid, value_type = VoidType, span = arm.span },
-								bindings = prefix.block.bindings,
-							})
-						UntypedValue | CheckedAgainst(_, _) | VoidTail:
-							Err(match_error(arm.span, ArmWithoutValue))
-			value ?= resolved
-			expectation = match progress.expectation:
-				UntypedValue:
-					CheckedAgainst(value.value.value_type, FirstArmValue)
-				CheckedAgainst(_, _) | StatementValue | StatementArm | VoidTail:
-					progress.expectation
-			resolve_join_arms(
-				written,
-				match_context,
-				{
-					arms = progress.arms.append({
-						pattern = prefix.pattern,
-						statements = prefix.block.statements,
-						value = value.value,
-					}),
-					remaining = prefix.remaining,
-					bindings = value.bindings,
-					expectation = expectation,
-				},
-				context,
-			)
+			):
+				Ok(prefix):
+					resolved: Result[ResolvedValue, CheckError] = match arm.block.value:
+						Some(body):
+							resolve_value(prefix.block, body, progress.expectation, context)
+						None:
+							match progress.expectation:
+								-- An arm of a statement match may end with a statement.
+								StatementValue | StatementArm:
+									Ok({
+										value = { form = LiteralVoid, value_type = VoidType, span = arm.span },
+										bindings = prefix.block.bindings,
+									})
+								UntypedValue | CheckedAgainst(_, _) | VoidTail:
+									Err(match_error(arm.span, ArmWithoutValue))
+					match resolved:
+						Ok(value):
+							expectation = match progress.expectation:
+								UntypedValue:
+									CheckedAgainst(value.value.value_type, FirstArmValue)
+								CheckedAgainst(_, _) | StatementValue | StatementArm | VoidTail:
+									progress.expectation
+							resolve_join_arms(
+								written,
+								match_context,
+								{
+									arms = progress.arms.append({
+										pattern = prefix.pattern,
+										statements = prefix.block.statements,
+										value = value.value,
+									}),
+									remaining = prefix.remaining,
+									bindings = value.bindings,
+									expectation = expectation,
+								},
+								context,
+							)
+						Err(error): Err(error)
+				Err(error): Err(error)
 
 
 -- The signature was resolved from these parameters, one type each.
@@ -728,28 +746,29 @@ private pure func parameter_scope(
 		None:
 			Ok(scope)
 		Some(parameter):
-			value_type ?= types
-				.get(position)
-				.to_result(
-					checker_invariant(
-						parameter.name.span,
-						InvalidResolvedParameter(position),
-					),
-				)
-			parameter_scope(
-				parameters,
-				types,
-				scope.append({
-					name = parameter.name.id,
-					id = binding_id(position),
-					definition = {
-						origin = ParameterBinding(position),
-						mutability = Immutable,
-						value_type = value_type.value_type,
-						span = parameter.name.span
-					},
-				}),
-			)
+			match types.get(position):
+				Some(value_type):
+					parameter_scope(
+						parameters,
+						types,
+						scope.append({
+							name = parameter.name.id,
+							id = binding_id(position),
+							definition = {
+								origin = ParameterBinding(position),
+								mutability = Immutable,
+								value_type = value_type.value_type,
+								span = parameter.name.span
+							},
+						}),
+					)
+				None:
+					Err(
+						checker_invariant(
+							parameter.name.span,
+							InvalidResolvedParameter(position),
+						),
+					)
 
 
 private fixed record ResolvedBody {
@@ -781,11 +800,12 @@ private pure func resolve_statements(
 		None:
 			Ok(block)
 		Some(BindingStatement(binding)):
-			unannotated ?= match binding.annotation:
+			match binding.annotation:
 				Some(annotation): Err(unsupported_form(type_span(annotation), LocalAnnotation))
-				None: Ok(void)
-			next ?= resolve_assignment(binding, block, block_start, reassignment, context)
-			resolve_statements(written, next, block_start, reassignment, context)
+				None:
+					match resolve_assignment(binding, block, block_start, reassignment, context):
+						Ok(next): resolve_statements(written, next, block_start, reassignment, context)
+						Err(error): Err(error)
 		Some(PropagatingBinding(propagation)):
 			Err(unsupported_form(propagation.span, Propagation))
 		Some(WhileLoop(loop)):
@@ -797,17 +817,19 @@ private pure func resolve_statements(
 		Some(Continue(span)):
 			Err(checker_invariant(span, LoopControlOutsideLoop))
 		Some(ExpressionStatement(expression)):
-			resolved ?= resolve_value(block, expression, StatementValue, context)
-			resolve_statements(
-				written,
-				{ block |
-					bindings = resolved.bindings,
-					statements = block.statements.append(DiscardExpression(resolved.value))
-				},
-				block_start,
-				reassignment,
-				context,
-			)
+			match resolve_value(block, expression, StatementValue, context):
+				Ok(resolved):
+					resolve_statements(
+						written,
+						{ block |
+							bindings = resolved.bindings,
+							statements = block.statements.append(DiscardExpression(resolved.value))
+						},
+						block_start,
+						reassignment,
+						context,
+					)
+				Err(error): Err(error)
 
 
 private pure func resolve_assignment(
@@ -858,42 +880,46 @@ private pure func resolve_assignment(
 	match reassign:
 		Some(binding):
 			site = InferredBindingDeclaration(binding_site(context.caller.function, binding))
-			resolved ?= resolve_value(block, written.initializer, CheckedAgainst(binding.definition.value_type, site), context)
-			Ok(
-				{ block |
-					bindings = resolved.bindings,
-					statements = block.statements.append(ReassignBinding(binding.id, resolved.value))
-				},
-			)
+			match resolve_value(block, written.initializer, CheckedAgainst(binding.definition.value_type, site), context):
+				Ok(resolved):
+					Ok(
+						{ block |
+							bindings = resolved.bindings,
+							statements = block.statements.append(ReassignBinding(binding.id, resolved.value))
+						},
+					)
+				Err(error): Err(error)
 		None:
-			resolved ?= resolve_value(block, written.initializer, UntypedValue, context)
-			value = resolved.value
+			match resolve_value(block, written.initializer, UntypedValue, context):
+				Ok(resolved):
+					value = resolved.value
 
-			mutability = match written.mutability:
-				MutableBinding:
-					Mutable
-				ImmutableBinding:
-					Immutable
+					mutability = match written.mutability:
+						MutableBinding:
+							Mutable
+						ImmutableBinding:
+							Immutable
 
-			definition: BindingDefinition = {
-				origin = BodyLocal,
-				mutability = mutability,
-				value_type = value.value_type,
-				span = written.name.span
-			}
-			-- A match's arm captures and locals precede this binding's ordinal.
-			id = binding_id(resolved.bindings.length())
-			Ok({
-				bindings = resolved.bindings.append(definition),
-				scope = [
-					{
-						name = written.name.id,
-						id = id,
-						definition = definition
-					},
-				].concat(block.scope),
-				statements = block.statements.append(InitializeBinding(id, value)),
-			})
+					definition: BindingDefinition = {
+						origin = BodyLocal,
+						mutability = mutability,
+						value_type = value.value_type,
+						span = written.name.span
+					}
+					-- A match's arm captures and locals precede this binding's ordinal.
+					id = binding_id(resolved.bindings.length())
+					Ok({
+						bindings = resolved.bindings.append(definition),
+						scope = [
+							{
+								name = written.name.id,
+								id = id,
+								definition = definition
+							},
+						].concat(block.scope),
+						statements = block.statements.append(InitializeBinding(id, value)),
+					})
+				Err(error): Err(error)
 
 
 private pure func resolve_body(
@@ -942,25 +968,29 @@ private pure func resolve_body(
 				})),
 			})
 		ValueBody(body):
-			value ?= resolve_value(prefix, body, return_expectation(signature.return_type), context)
-			Ok({
-				bindings = value.bindings,
-				statements = prefix.statements,
-				body = CheckedValueBody(ReturnExpression(value.value)),
-			})
+			match resolve_value(prefix, body, return_expectation(signature.return_type), context):
+				Ok(value):
+					Ok({
+						bindings = value.bindings,
+						statements = prefix.statements,
+						body = CheckedValueBody(ReturnExpression(value.value)),
+					})
+				Err(error): Err(error)
 		MatchBody(body):
-			matched ?= resolve_match(
+			match resolve_match(
 				signature.return_type,
 				prefix.scope,
 				body,
 				prefix.bindings,
 				context,
-			)
-			Ok({
-				bindings = matched.bindings,
-				statements = prefix.statements,
-				body = CheckedMatchBody(matched.body),
-			})
+			):
+				Ok(matched):
+					Ok({
+						bindings = matched.bindings,
+						statements = prefix.statements,
+						body = CheckedMatchBody(matched.body),
+					})
+				Err(error): Err(error)
 
 
 -- Checks every function body in declaration order, including unreachable ones.
@@ -995,29 +1025,33 @@ private pure func check_functions(
 				records = declarations.records,
 			}
 			signature = accepted.signature
-			body ?= resolve_body(accepted, context)
-			execution ?= check_execution(accepted.declaration, body.statements, body.body, id)
+			match resolve_body(accepted, context):
+				Ok(body):
+					match check_execution(accepted.declaration, body.statements, body.body, id):
+						Ok(execution):
 
-			executed: ResolvedBody = { body | body = execution.body }
+							executed: ResolvedBody = { body | body = execution.body }
 
-			published = if same_type(signature.return_type.value_type, VoidType):
-				normalize_void_body(executed)
-			else:
-				executed
+							published = if same_type(signature.return_type.value_type, VoidType):
+								normalize_void_body(executed)
+							else:
+								executed
 
-			check_functions(
-				functions,
-				declarations,
-				namespace,
-				checked.append({
-					id = id,
-					execution = execution.execution,
-					signature = signature,
-					bindings = published.bindings,
-					statements = published.statements,
-					body = published.body,
-				}),
-			)
+							check_functions(
+								functions,
+								declarations,
+								namespace,
+								checked.append({
+									id = id,
+									execution = execution.execution,
+									signature = signature,
+									bindings = published.bindings,
+									statements = published.statements,
+									body = published.body,
+								}),
+							)
+						Err(error): Err(error)
+				Err(error): Err(error)
 
 
 private fixed record NormalizedVoidExit {

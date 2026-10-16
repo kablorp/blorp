@@ -448,16 +448,18 @@ pure func value_ownership(
 ) -> Result[ValueOwnership, Diagnostic]:
 	match type_ref:
 		RecordType(id):
-			layout ?= records.get(record_number(id)).to_result(
+			match records.get(record_number(id)).to_result(
 				ownership_error("invalid record identity in ownership representation"),
-			)
-			Ok(
-				match layout.representation:
-					InlineRecord:
-						NoOwnership
-					ManagedRecord:
-						ManagedRecordRoot(id)
-			)
+			):
+				Ok(layout):
+					Ok(
+						match layout.representation:
+							InlineRecord:
+								NoOwnership
+							ManagedRecord:
+								ManagedRecordRoot(id)
+					)
+				Err(error): Err(error)
 		VoidType | IntType | FloatType:
 			Ok(NoOwnership)
 		StringType:
@@ -604,8 +606,9 @@ private pure func concrete_type(
 	match value_type:
 		Checked.RecordType(id):
 			-- A non-generic record has no arguments to translate.
-			owner ?= lookup_record_instance(id, [], records, span)
-			Ok(RecordType(owner))
+			match lookup_record_instance(id, [], records, span):
+				Ok(owner): Ok(RecordType(owner))
+				Err(error): Err(error)
 		Checked.VoidType:
 			Ok(VoidType)
 		Checked.IntType:
@@ -615,35 +618,41 @@ private pure func concrete_type(
 		Checked.StringType:
 			Ok(StringType)
 		Checked.ListType(element):
-			concrete ?= concrete_type(element, substitution, unions, span, records)
-			Ok(ListType(concrete))
+			match concrete_type(element, substitution, unions, span, records):
+				Ok(concrete): Ok(ListType(concrete))
+				Err(error): Err(error)
 		Checked.AppliedRecordType(id, arguments):
-			owner ?= concrete_record(id, arguments, substitution, unions, span, records)
-			Ok(RecordType(owner))
+			match concrete_record(id, arguments, substitution, unions, span, records):
+				Ok(owner): Ok(RecordType(owner))
+				Err(error): Err(error)
 		Checked.AppliedUnionType(id, arguments):
-			arguments ?= translated_list(
+			match translated_list(
 				arguments,
 				pure func(
 					value: Checked.TypeRef,
 				): concrete_type(value, substitution, unions, span, records),
-			)
-			id ?= find_union_instance(
-				unions,
-				{
-					declaration = id,
-					arguments = arguments
-				},
-			).to_result(invalid(span, "unprepared generic union instance"))
-			Ok(UnionType(id))
+			):
+				Ok(arguments):
+					match find_union_instance(
+						unions,
+						{
+							declaration = id,
+							arguments = arguments
+						},
+					).to_result(invalid(span, "unprepared generic union instance")):
+						Ok(id): Ok(UnionType(id))
+						Err(error): Err(error)
+				Err(error): Err(error)
 		Checked.UnionType(id):
-			id ?= find_union_instance(
+			match find_union_instance(
 				unions,
 				{
 					declaration = id,
 					arguments = []
 				},
-			).to_result(invalid(span, "unprepared ordinary union instance"))
-			Ok(UnionType(id))
+			).to_result(invalid(span, "unprepared ordinary union instance")):
+				Ok(id): Ok(UnionType(id))
+				Err(error): Err(error)
 		Checked.ParameterType(id):
 			var replacement: Option[TypeRef] = None
 
@@ -1249,37 +1258,43 @@ private pure func settle_union(instance: PendingUnionInstance, span: Span) -> Re
 	if pending:
 		Ok(PendingUnion(instance))
 	else:
-		arguments ?= known_types(instance.key.arguments, span)
-		var variants: List[List[TypeRef]] = []
-		var failure: Option[Diagnostic] = None
+		match known_types(instance.key.arguments, span):
+			Ok(arguments):
+				var variants: List[List[TypeRef]] = []
+				var failure: Option[Diagnostic] = None
 
-		for fields in instance.variants:
-			match known_types(fields, span):
-				Ok(known): variants = variants.append(known)
-				Err(error):
-					failure = Some(error)
-					break
+				for fields in instance.variants:
+					match known_types(fields, span):
+						Ok(known): variants = variants.append(known)
+						Err(error):
+							failure = Some(error)
+							break
 
-		match failure:
-			Some(error):
-				Err(error)
-			None:
-				Ok(CompleteUnion({
-					key = { declaration = instance.key.declaration, arguments = arguments },
-					layout = { variants = variants, representation = instance.representation },
-				}))
+				match failure:
+					Some(error):
+						Err(error)
+					None:
+						Ok(CompleteUnion({
+							key = { declaration = instance.key.declaration, arguments = arguments },
+							layout = { variants = variants, representation = instance.representation },
+						}))
+			Err(error): Err(error)
 
 
 private pure func settle_record(instance: PendingRecordInstance, span: Span) -> Result[RecordSlot, Diagnostic]:
 	if any_pending(instance.key.arguments) or any_pending(instance.fields):
 		Ok(PendingRecord(instance))
 	else:
-		arguments ?= known_types(instance.key.arguments, span)
-		fields ?= known_types(instance.fields, span)
-		Ok(CompleteRecord({
-			key = { declaration = instance.key.declaration, arguments = arguments },
-			layout = { fields = fields, representation = instance.representation },
-		}))
+		match known_types(instance.key.arguments, span):
+			Ok(arguments):
+				match known_types(instance.fields, span):
+					Ok(fields):
+						Ok(CompleteRecord({
+							key = { declaration = instance.key.declaration, arguments = arguments },
+							layout = { fields = fields, representation = instance.representation },
+						}))
+					Err(error): Err(error)
+			Err(error): Err(error)
 
 
 -- Fills every reference to a completed layout that a child referred back
@@ -1499,14 +1514,18 @@ private pure func prepare_union(
 			Ok({ value_type = KnownType(UnionType(id)), unions = published, records = record_dependencies, in_progress = left.remaining })
 		ReferencedBack:
 			completed = CompletedUnion(key, id)
-			resolved_unions ?= resolve_union_slots(published, unions.length(), completed, span)
-			resolved_records ?= resolve_record_slots(record_dependencies, records.length(), completed, span)
-			Ok({
-				value_type = KnownType(UnionType(id)),
-				unions = resolved_unions,
-				records = resolved_records,
-				in_progress = left.remaining,
-			})
+			match resolve_union_slots(published, unions.length(), completed, span):
+				Ok(resolved_unions):
+					match resolve_record_slots(record_dependencies, records.length(), completed, span):
+						Ok(resolved_records):
+							Ok({
+								value_type = KnownType(UnionType(id)),
+								unions = resolved_unions,
+								records = resolved_records,
+								in_progress = left.remaining,
+							})
+						Err(error): Err(error)
+				Err(error): Err(error)
 
 
 -- Whether a prepared field keeps its record inline: a number, or a record
@@ -1608,14 +1627,18 @@ private pure func prepare_record(
 			Ok({ value_type = KnownType(RecordType(instance)), unions = dependencies, records = published, in_progress = left.remaining })
 		ReferencedBack:
 			completed = CompletedRecord(key, instance)
-			resolved_unions ?= resolve_union_slots(dependencies, unions.length(), completed, span)
-			resolved_records ?= resolve_record_slots(published, records.length(), completed, span)
-			Ok({
-				value_type = KnownType(RecordType(instance)),
-				unions = resolved_unions,
-				records = resolved_records,
-				in_progress = left.remaining,
-			})
+			match resolve_union_slots(dependencies, unions.length(), completed, span):
+				Ok(resolved_unions):
+					match resolve_record_slots(published, records.length(), completed, span):
+						Ok(resolved_records):
+							Ok({
+								value_type = KnownType(RecordType(instance)),
+								unions = resolved_unions,
+								records = resolved_records,
+								in_progress = left.remaining,
+							})
+						Err(error): Err(error)
+				Err(error): Err(error)
 
 
 private pure func prepare_arguments(
@@ -1690,18 +1713,21 @@ private pure func prepare_type(
 				None:
 					Err(invalid(span, "unresolved or foreign type parameter"))
 		Checked.ListType(element):
-			prepared ?= prepare_type(element, substitution, checked, unions, span, records, in_progress)
-			Ok({ prepared | value_type = partial_list(prepared.value_type) })
+			match prepare_type(element, substitution, checked, unions, span, records, in_progress):
+				Ok(prepared): Ok({ prepared | value_type = partial_list(prepared.value_type) })
+				Err(error): Err(error)
 		Checked.RecordType(id):
 			ensure_record({ declaration = id, arguments = [] }, checked, unions, span, records, in_progress)
 		Checked.UnionType(id):
 			ensure_union({ declaration = id, arguments = [] }, checked, unions, span, records, in_progress)
 		Checked.AppliedRecordType(id, arguments):
-			prepared ?= prepare_arguments(arguments, substitution, checked, unions, span, records, in_progress)
-			ensure_record({ declaration = id, arguments = prepared.arguments }, checked, prepared.unions, span, prepared.records, prepared.in_progress)
+			match prepare_arguments(arguments, substitution, checked, unions, span, records, in_progress):
+				Ok(prepared): ensure_record({ declaration = id, arguments = prepared.arguments }, checked, prepared.unions, span, prepared.records, prepared.in_progress)
+				Err(error): Err(error)
 		Checked.AppliedUnionType(id, arguments):
-			prepared ?= prepare_arguments(arguments, substitution, checked, unions, span, records, in_progress)
-			ensure_union({ declaration = id, arguments = prepared.arguments }, checked, prepared.unions, span, prepared.records, prepared.in_progress)
+			match prepare_arguments(arguments, substitution, checked, unions, span, records, in_progress):
+				Ok(prepared): ensure_union({ declaration = id, arguments = prepared.arguments }, checked, prepared.unions, span, prepared.records, prepared.in_progress)
+				Err(error): Err(error)
 
 
 -- Every slot is complete once no layout is in progress; sealing projects the
@@ -2088,20 +2114,25 @@ private pure func translate_call(
 					accepted: RuntimeOperation[VariantInstanceId, TypeRef] = Builtins.FloatToString
 					Ok(accepted)
 				ListRepeat(element):
-					concrete ?= concrete_type(element, substitution, unions, call.span, records)
-					Ok(Builtins.ListRepeat(concrete))
+					match concrete_type(element, substitution, unions, call.span, records):
+						Ok(concrete): Ok(Builtins.ListRepeat(concrete))
+						Err(error): Err(error)
 				ListLength(element):
-					concrete ?= concrete_type(element, substitution, unions, call.span, records)
-					Ok(Builtins.ListLength(concrete))
+					match concrete_type(element, substitution, unions, call.span, records):
+						Ok(concrete): Ok(Builtins.ListLength(concrete))
+						Err(error): Err(error)
 				ListAppend(element):
-					concrete ?= concrete_type(element, substitution, unions, call.span, records)
-					Ok(Builtins.ListAppend(concrete))
+					match concrete_type(element, substitution, unions, call.span, records):
+						Ok(concrete): Ok(Builtins.ListAppend(concrete))
+						Err(error): Err(error)
 				ListSet(element):
-					concrete ?= concrete_type(element, substitution, unions, call.span, records)
-					Ok(Builtins.ListSet(concrete))
+					match concrete_type(element, substitution, unions, call.span, records):
+						Ok(concrete): Ok(Builtins.ListSet(concrete))
+						Err(error): Err(error)
 				ListConcat(element):
-					concrete ?= concrete_type(element, substitution, unions, call.span, records)
-					Ok(Builtins.ListConcat(concrete))
+					match concrete_type(element, substitution, unions, call.span, records):
+						Ok(concrete): Ok(Builtins.ListConcat(concrete))
+						Err(error): Err(error)
 				StringLength:
 					accepted: RuntimeOperation[VariantInstanceId, TypeRef] = Builtins.StringLength
 					Ok(accepted)
@@ -2109,39 +2140,50 @@ private pure func translate_call(
 					accepted: RuntimeOperation[VariantInstanceId, TypeRef] = Builtins.StringPrint
 					Ok(accepted)
 				StringParseInt(option):
-					translated ?= translate_option(option, result_type, unions, call.span)
-					Ok(Builtins.StringParseInt(translated))
+					match translate_option(option, result_type, unions, call.span):
+						Ok(translated): Ok(Builtins.StringParseInt(translated))
+						Err(error): Err(error)
 				StringParseFloat(option):
-					translated ?= translate_option(option, result_type, unions, call.span)
-					Ok(Builtins.StringParseFloat(translated))
+					match translate_option(option, result_type, unions, call.span):
+						Ok(translated): Ok(Builtins.StringParseFloat(translated))
+						Err(error): Err(error)
 				ListGet(element, option):
-					concrete ?= concrete_type(element, substitution, unions, call.span, records)
-					translated ?= translate_option(option, result_type, unions, call.span)
-					Ok(Builtins.ListGet(concrete, translated))
+					match concrete_type(element, substitution, unions, call.span, records):
+						Ok(concrete):
+							match translate_option(option, result_type, unions, call.span):
+								Ok(translated): Ok(Builtins.ListGet(concrete, translated))
+								Err(error): Err(error)
+						Err(error): Err(error)
 				IntEquals(boolean):
-					translated ?= translate_boolean(boolean, result_type, unions, call.span)
-					Ok(Builtins.IntEquals(translated))
+					match translate_boolean(boolean, result_type, unions, call.span):
+						Ok(translated): Ok(Builtins.IntEquals(translated))
+						Err(error): Err(error)
 				StringEquals(boolean):
-					translated ?= translate_boolean(boolean, result_type, unions, call.span)
-					Ok(Builtins.StringEquals(translated))
+					match translate_boolean(boolean, result_type, unions, call.span):
+						Ok(translated): Ok(Builtins.StringEquals(translated))
+						Err(error): Err(error)
 
-			concrete ?= concrete_result
-			Ok(RuntimeFunction(concrete))
+			match concrete_result:
+				Ok(concrete): Ok(RuntimeFunction(concrete))
+				Err(error): Err(error)
 		Checked.UserFunction(declaration, arguments):
-			concrete ?= translated_list(
+			match translated_list(
 				arguments,
 				pure func(
 					value: Checked.TypeRef,
 				): concrete_type(value, substitution, unions, call.span, records),
-			)
-			id ?= find_instance(
-				keys,
-				{
-					declaration = declaration,
-					arguments = concrete
-				},
-			).to_result(invalid(call.span, "unexpanded function instance"))
-			Ok(UserFunction(id))
+			):
+				Ok(concrete):
+					match find_instance(
+						keys,
+						{
+							declaration = declaration,
+							arguments = concrete
+						},
+					).to_result(invalid(call.span, "unexpanded function instance")):
+						Ok(id): Ok(UserFunction(id))
+						Err(error): Err(error)
+				Err(error): Err(error)
 
 	target ?= target_result
 	Ok({
@@ -2214,59 +2256,96 @@ private pure func translate_expr(
 ) -> Result[ConcreteExpr, Diagnostic]:
 	match value.form:
 		Checked.ReadRecordField(receiver, field):
-			source ?= translate_expr(receiver, substitution, keys, unions, records)
-			-- The receiver's translated type already names its record instance.
-			owner ?= match source.value_type:
-				RecordType(owner): Ok(owner)
-				_: Err(invalid(value.span, "record operation has a non-record receiver"))
-			-- The prepared receiver row already owns this exact concrete field type.
-			value_type ?= concrete_record_field_type(field, owner, records, value.span)
-			translated_field = into_opaque FieldInstanceId({ owner = owner, position = Checked.field_number(field) })
-			Ok({ form = ReadRecordField(source, translated_field), value_type = value_type, span = value.span })
+			match translate_expr(receiver, substitution, keys, unions, records):
+				Ok(source):
+					-- The receiver's translated type already names its record instance.
+					match source.value_type:
+						RecordType(owner):
+							-- The prepared receiver row already owns this exact concrete field type.
+							match concrete_record_field_type(field, owner, records, value.span):
+								Ok(value_type):
+									translated_field = into_opaque FieldInstanceId({ owner = owner, position = Checked.field_number(field) })
+									Ok({ form = ReadRecordField(source, translated_field), value_type = value_type, span = value.span })
+								Err(error): Err(error)
+						_: Err(invalid(value.span, "record operation has a non-record receiver"))
+				Err(error): Err(error)
 		Checked.InvokeFunction(call, arguments):
-			value_type ?= concrete_type(value.value_type, substitution, unions, call.span, records)
-			concrete ?= translate_call(call, substitution, keys, unions, records, value_type)
-			values ?= translate_exprs(arguments, substitution, keys, unions, records)
-			Ok({ form = InvokeFunction(concrete, values), value_type = value_type, span = value.span })
+			match concrete_type(value.value_type, substitution, unions, call.span, records):
+				Ok(value_type):
+					match translate_call(call, substitution, keys, unions, records, value_type):
+						Ok(concrete):
+							match translate_exprs(arguments, substitution, keys, unions, records):
+								Ok(values): Ok({ form = InvokeFunction(concrete, values), value_type = value_type, span = value.span })
+								Err(error): Err(error)
+						Err(error): Err(error)
+				Err(error): Err(error)
 		Checked.UpdateRecord(declaration, update):
-			owner ?= record_instance(declaration, value, substitution, unions, records)
-			base ?= translate_expr(update.base, substitution, keys, unions, records)
-			replacements ?= translated_list(
-				update.replacements,
-				pure func(
-					field: Checked.CheckedRecordField,
-				): translate_record_field(field, owner, substitution, keys, unions, records),
-			)
-			inherited ?= translated_list(update.inherited, pure func(field: Checked.RetainedRecordField) -> Result[RetainedRecordField, Diagnostic]:
-				id ?= translate_field(field.field, owner, records, update.base_expression_span)
-				value_type ?= concrete_type(field.value_type, substitution, unions, update.base_expression_span, records)
-				Ok({ field = id, value_type = value_type })
-			)
-			form = UpdateRecord(owner, { base = base, base_expression_span = update.base_expression_span, replacements = replacements, inherited = inherited })
-			Ok({ form = form, value_type = RecordType(owner), span = value.span })
+			match record_instance(declaration, value, substitution, unions, records):
+				Ok(owner):
+					match translate_expr(update.base, substitution, keys, unions, records):
+						Ok(base):
+							match translated_list(
+								update.replacements,
+								pure func(
+									field: Checked.CheckedRecordField,
+								): translate_record_field(field, owner, substitution, keys, unions, records),
+							):
+								Ok(replacements):
+									inherited_result: Result[List[RetainedRecordField], Diagnostic] = translated_list(update.inherited, pure func(field: Checked.RetainedRecordField) -> Result[RetainedRecordField, Diagnostic]:
+										match translate_field(field.field, owner, records, update.base_expression_span):
+											Ok(id):
+												match concrete_type(field.value_type, substitution, unions, update.base_expression_span, records):
+													Ok(value_type): Ok({ field = id, value_type = value_type })
+													Err(error): Err(error)
+											Err(error): Err(error)
+									)
+									match inherited_result:
+										Ok(inherited):
+											form = UpdateRecord(owner, { base = base, base_expression_span = update.base_expression_span, replacements = replacements, inherited = inherited })
+											Ok({ form = form, value_type = RecordType(owner), span = value.span })
+										Err(error): Err(error)
+								Err(error): Err(error)
+						Err(error): Err(error)
+				Err(error): Err(error)
 		Checked.ConstructVariant(id, children):
-			value_type ?= concrete_type(value.value_type, substitution, unions, value.span, records)
-			owner ?= concrete_union_owner(value_type, value.span)
-			variant ?= translate_variant(id, owner, unions, value.span)
-			values ?= translate_exprs(children, substitution, keys, unions, records)
-			Ok({ form = ConstructVariant(variant, values), value_type = value_type, span = value.span })
+			match concrete_type(value.value_type, substitution, unions, value.span, records):
+				Ok(value_type):
+					match concrete_union_owner(value_type, value.span):
+						Ok(owner):
+							match translate_variant(id, owner, unions, value.span):
+								Ok(variant):
+									match translate_exprs(children, substitution, keys, unions, records):
+										Ok(values): Ok({ form = ConstructVariant(variant, values), value_type = value_type, span = value.span })
+										Err(error): Err(error)
+								Err(error): Err(error)
+						Err(error): Err(error)
+				Err(error): Err(error)
 		Checked.ConstructRecord(declaration, fields):
-			owner ?= record_instance(declaration, value, substitution, unions, records)
-			concrete ?= translated_list(
-				fields,
-				pure func(
-					field: Checked.CheckedRecordField,
-				): translate_record_field(field, owner, substitution, keys, unions, records),
-			)
-			Ok({ form = ConstructRecord(owner, concrete), value_type = RecordType(owner), span = value.span })
+			match record_instance(declaration, value, substitution, unions, records):
+				Ok(owner):
+					match translated_list(
+						fields,
+						pure func(
+							field: Checked.CheckedRecordField,
+						): translate_record_field(field, owner, substitution, keys, unions, records),
+					):
+						Ok(concrete): Ok({ form = ConstructRecord(owner, concrete), value_type = RecordType(owner), span = value.span })
+						Err(error): Err(error)
+				Err(error): Err(error)
 		Checked.ConstructList(elements):
-			value_type ?= concrete_type(value.value_type, substitution, unions, value.span, records)
-			values ?= translate_exprs(elements, substitution, keys, unions, records)
-			Ok({ form = ConstructList(values), value_type = value_type, span = value.span })
+			match concrete_type(value.value_type, substitution, unions, value.span, records):
+				Ok(value_type):
+					match translate_exprs(elements, substitution, keys, unions, records):
+						Ok(values): Ok({ form = ConstructList(values), value_type = value_type, span = value.span })
+						Err(error): Err(error)
+				Err(error): Err(error)
 		Checked.Match(join):
-			value_type ?= concrete_type(value.value_type, substitution, unions, value.span, records)
-			concrete ?= translate_join(join, substitution, keys, unions, records, value.span)
-			Ok({ form = Match(concrete), value_type = value_type, span = value.span })
+			match concrete_type(value.value_type, substitution, unions, value.span, records):
+				Ok(value_type):
+					match translate_join(join, substitution, keys, unions, records, value.span):
+						Ok(concrete): Ok({ form = Match(concrete), value_type = value_type, span = value.span })
+						Err(error): Err(error)
+				Err(error): Err(error)
 		Checked.LiteralVoid:
 			translate_leaf(LiteralVoid, value, substitution, unions, records)
 		Checked.LiteralString(text):
@@ -2328,14 +2407,17 @@ private pure func translate_statements(
 	) -> Result[ConcreteStatement, Diagnostic]:
 		match statement:
 			Checked.InitializeBinding(id, value):
-				value ?= translate_expr(value, substitution, keys, unions, records)
-				Ok(InitializeBinding(id, value))
+				match translate_expr(value, substitution, keys, unions, records):
+					Ok(value): Ok(InitializeBinding(id, value))
+					Err(error): Err(error)
 			Checked.DiscardExpression(value):
-				value ?= translate_expr(value, substitution, keys, unions, records)
-				Ok(DiscardExpression(value))
+				match translate_expr(value, substitution, keys, unions, records):
+					Ok(value): Ok(DiscardExpression(value))
+					Err(error): Err(error)
 			Checked.ReassignBinding(id, value):
-				value ?= translate_expr(value, substitution, keys, unions, records)
-				Ok(ReassignBinding(id, value))
+				match translate_expr(value, substitution, keys, unions, records):
+					Ok(value): Ok(ReassignBinding(id, value))
+					Err(error): Err(error)
 	)
 
 
@@ -2351,8 +2433,9 @@ private pure func translate_pattern(
 		Checked.BindingCase(id):
 			Ok(BindingCase(id))
 		Checked.VariantCase(id, bindings):
-			variant ?= translate_variant(id, owner, unions, span)
-			Ok(VariantCase(variant, bindings))
+			match translate_variant(id, owner, unions, span):
+				Ok(variant): Ok(VariantCase(variant, bindings))
+				Err(error): Err(error)
 
 
 -- A non-tail match specializes exactly as the tail match does, arm by arm.
@@ -2405,11 +2488,13 @@ private pure func translate_exit(
 ) -> Result[ConcreteExit, Diagnostic]:
 	match exit:
 		Checked.ReturnExpression(value):
-			concrete ?= translate_expr(value, substitution, keys, unions, records)
-			Ok(ReturnExpression(concrete))
+			match translate_expr(value, substitution, keys, unions, records):
+				Ok(concrete): Ok(ReturnExpression(concrete))
+				Err(error): Err(error)
 		Checked.RecurWith(arguments, span):
-			concrete ?= translate_exprs(arguments, substitution, keys, unions, records)
-			Ok(RecurWith(concrete, span))
+			match translate_exprs(arguments, substitution, keys, unions, records):
+				Ok(concrete): Ok(RecurWith(concrete, span))
+				Err(error): Err(error)
 
 
 private pure func translate_function(
@@ -2456,46 +2541,64 @@ private pure func translate_function(
 	bindings ?= translated_list(function.bindings, pure func(
 		binding: Checked.BindingDefinition,
 	) -> Result[ConcreteBinding, Diagnostic]:
-		value_type ?= concrete_type(binding.value_type, substitution, unions, binding.span, records)
-		Ok({
-			origin = binding.origin,
-			value_type = value_type,
-			span = binding.span,
-		})
+		match concrete_type(binding.value_type, substitution, unions, binding.span, records):
+			Ok(value_type):
+				Ok({
+					origin = binding.origin,
+					value_type = value_type,
+					span = binding.span,
+				})
+			Err(error): Err(error)
 	)
 	statements ?= translate_statements(function.statements, substitution, keys, unions, records)
 
 	body_result: Result[ConcreteBody, Diagnostic] = match function.body:
 		Checked.CheckedValueBody(value):
-			concrete ?= translate_exit(value, substitution, keys, unions, records)
-			Ok(ConcreteValueBody(concrete))
+			match translate_exit(value, substitution, keys, unions, records):
+				Ok(concrete): Ok(ConcreteValueBody(concrete))
+				Err(error): Err(error)
 		Checked.CheckedMatchBody(matched):
-			scrutinee ?= translate_expr(matched.scrutinee, substitution, keys, unions, records)
-			union_type ?= concrete_type(matched.union_type, substitution, unions, span, records)
-			owner ?= concrete_union_owner(union_type, span)
-			arms ?= translated_list(matched.arms, pure func(
-				arm: Checked.CheckedArm,
-			) -> Result[ConcreteArm, Diagnostic]:
-				pattern ?= translate_pattern(arm.pattern, owner, span, unions)
-				statements ?= translate_statements(
-					arm.statements,
-					substitution,
-					keys,
-					unions,
-					records,
-				)
-				body ?= translate_exit(arm.body, substitution, keys, unions, records)
-				Ok({
-					pattern = pattern,
-					statements = statements,
-					body = body,
-				})
-			)
-			Ok(ConcreteMatchBody({
-				scrutinee = scrutinee,
-				owner = owner,
-				arms = arms,
-			}))
+			match translate_expr(matched.scrutinee, substitution, keys, unions, records):
+				Ok(scrutinee):
+					match concrete_type(matched.union_type, substitution, unions, span, records):
+						Ok(union_type):
+							match concrete_union_owner(union_type, span):
+								Ok(owner):
+									arms_result: Result[List[ConcreteArm], Diagnostic] = translated_list(matched.arms, pure func(
+										arm: Checked.CheckedArm,
+									) -> Result[ConcreteArm, Diagnostic]:
+										match translate_pattern(arm.pattern, owner, span, unions):
+											Ok(pattern):
+												match translate_statements(
+													arm.statements,
+													substitution,
+													keys,
+													unions,
+													records,
+												):
+													Ok(statements):
+														match translate_exit(arm.body, substitution, keys, unions, records):
+															Ok(body):
+																Ok({
+																	pattern = pattern,
+																	statements = statements,
+																	body = body,
+																})
+															Err(error): Err(error)
+													Err(error): Err(error)
+											Err(error): Err(error)
+									)
+									match arms_result:
+										Ok(arms):
+											Ok(ConcreteMatchBody({
+												scrutinee = scrutinee,
+												owner = owner,
+												arms = arms,
+											}))
+										Err(error): Err(error)
+								Err(error): Err(error)
+						Err(error): Err(error)
+				Err(error): Err(error)
 
 	body ?= body_result
 	Ok({
@@ -2534,25 +2637,26 @@ pure func specialize(program: CheckedProgram) -> Result[SpecializedProgram, Diag
 	functions ?= translated_list(prepared.functions, pure func(
 		request: FunctionRequest,
 	) -> Result[ConcreteFunction, Diagnostic]:
-		function ?= checked.functions
-			.get(Declaration.function_number(request.key.declaration))
-			.to_result(
-				invalid(
-					{
-						source = COMPILER_SOURCE,
-						start = 0,
-						end = 0
-					},
-					"unknown function declaration",
-				),
-			)
-		translate_function(
-			function,
-			request,
-			prepared.functions,
-			prepared.unions,
-			prepared.records,
-		)
+		match checked.functions.get(Declaration.function_number(request.key.declaration)):
+			Some(function):
+				translate_function(
+					function,
+					request,
+					prepared.functions,
+					prepared.unions,
+					prepared.records,
+				)
+			None:
+				Err(
+					invalid(
+						{
+							source = COMPILER_SOURCE,
+							start = 0,
+							end = 0
+						},
+						"unknown function declaration",
+					),
+				)
 	)
 	entrypoint ?= find_instance(
 		prepared.functions,
