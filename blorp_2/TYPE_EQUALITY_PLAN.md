@@ -1,5 +1,14 @@
 # Direct accepted-type equality before ground overlap — review only
 
+**Implementation checkpoint.** The integrated +9-line preparation passes
+29 owning callbacks, the complete 445-input identity/leak matrix and all
+separately measured cost ceilings. Corpus allocations/instructions fall
+2.083%/0.462%. The destination's full gate passes 2,799 component checks and
+445 e2e checks; the measured parsing frontier remains 33/35. The
+[equality evidence](../benchmarks/results/blorp_2_type_equality_2026-10-16.md)
+records the accepted-source boundary and distinguishes earlier mutant runs.
+The design below preserves its original planning context.
+
 This reviewed plan starts from published main `648cf95f1`. Root
 requested this bounded preparatory plan after source inspection disproved the
 initial allocation assumption for the ground-overlap fast path.
