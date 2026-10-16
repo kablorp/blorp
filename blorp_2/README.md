@@ -1445,10 +1445,10 @@ beside their importer, including inside library modules. Missing roots and files
 produce diagnostics; there is no local-file or host-library fallback. Library
 modules use the ordinary module pipeline and preserve declaration identities.
 
-The [temporary library](standard_library_temp/README.md) retains upstream
-provenance; full [reference copies](reference/standard_library/README.md) live
-outside compilation inputs. Its active declarations provide the calculator's
-ordinary unions and concrete numeric, conversion and IO functions.
+The [temporary library](standard_library_temp/README.md) adapts modules from
+the [standard library](../standard_library/src/), with original source revisions
+and hashes retained in its adapter headers. Its active declarations provide
+the calculator's ordinary unions and concrete numeric, conversion and IO functions.
 Their explicit builtin bodies select closed compiler-known operations. Module functions
 may declare these builtin bodies with the exact concrete runtime signature,
 without statement prefixes or tail annotations. List repeat, length, get, append, set and concat wrappers may also declare generic parameters; other builtin wrappers remain nongeneric. Unknown

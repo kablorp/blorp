@@ -20,24 +20,25 @@ For example, `42.add(1).to_string().length()` needs no imports. Direct calls
 still require named imports such as `int: add`. IO remains explicit.
 The [imports design](../IMPORTS_AND_PRELUDE_PLAN.md) defines the full rules.
 
-`int.brp` records the revision and SHA256 of its
-[upstream reference](../reference/standard_library/int.brp). Concrete `add`, `subtract`, `multiply`,
-`divide`, `remainder`, `equals` and `to_string` are active, lifted from trait implementations
-where needed. The Float adapter exposes those same concrete names for Float64.
+`int.brp` records the upstream revision and SHA256 used for its adaptation of
+[`standard_library/src/int.brp`](../../standard_library/src/int.brp). Concrete
+`add`, `subtract`, `multiply`, `divide`, `remainder`, `equals` and `to_string` are
+active, lifted from trait implementations where needed. The Float adapter
+exposes those same concrete names for Float64.
 `Int` and `Float` are declared once in `_base.brp`. Other
 declarations are enabled only as their features enter the supported subset.
-Byte-for-byte upstream references live outside compilation inputs under
-[reference/standard_library](../reference/standard_library/README.md).
+The original modules are maintained in [standard_library/src](../../standard_library/src/).
 
 Pass `blorp_2/standard_library_temp` explicitly as the argument to `--library-root`. Bare `int: add` imports resolve here; relative
 imports still resolve beside their importer. There is no host-library fallback.
 
-`io.brp` retains the upstream `standard_library/src/io.brp` revision and SHA256
-beside a link to its reference copy. Its active `print(String) -> Void` is concrete and
-impure, mapped to the closed `string.print` operation. It borrows the String,
+`io.brp` retains the upstream revision and SHA256 used for its adaptation of
+[`standard_library/src/io.brp`](../../standard_library/src/io.brp). Its active
+`print(String) -> Void` is concrete and impure, mapped to the closed
+`string.print` operation. It borrows the String,
 writes every byte and appends LF. Program input arrives explicitly through
 `main(args: List[String])`, including the executable name at index 0.
-Other IO declarations remain in the reference copy. `Void` is declared once in `_base.brp`.
+Other IO declarations remain in the original module. `Void` is declared once in `_base.brp`.
 
 The List adapter follows `standard_library/src/list.brp`'s generic `repeat`,
 `length` and safe `get` APIs. List is declared once in `_base.brp` as a unary
@@ -56,14 +57,12 @@ Option and Result operation modules are deferred until operations need them. The
 exposes strict counted-byte `parse_int`, `parse_float` and `equals` operations.
 Their builtin bodies name only the operation; results refer to the
 foundation's designated Bool and Option, found by name in `_base.brp`, and
-layout follows the unions' declaration order. Copied upstream source
-is reference material outside this input library, with provenance beside each
-adapter. Traits and FFI remain inactive.
+layout follows the unions' declaration order. Each adapter records its upstream
+provenance. Traits and FFI remain inactive.
 
 The current [calculator](../README.md#calculator-input-and-results) and
 [Float contracts](../README.md#float64-calculator) define deliberate conversion and arithmetic
-adaptations. The copied host implementation is a reference, not an implicit
-source of semantics or runtime dependencies.
+adaptations. The host library provides reference implementations for these adaptations.
 
 A type selection also supplies only that module's local receiver functions:
 

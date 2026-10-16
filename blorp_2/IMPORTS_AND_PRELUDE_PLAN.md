@@ -403,5 +403,5 @@ TestSuite still use the existing compiler and its library until self-hosting.
 The import backport to the existing compiler is deferred. Traits, general
 overload resolution, function reexports, private items, qualified calls, module
 aliases, wildcards, prelude opt-out and general List expansion remain outside
-this contract. Preserve the source provenance under
-[reference/standard_library](reference/standard_library/).
+this contract. Preserve source provenance in the temporary library's adapter
+headers; the original modules live in [standard_library/src](../standard_library/src/).

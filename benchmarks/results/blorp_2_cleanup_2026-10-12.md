@@ -23,9 +23,10 @@ frozen and rebuilt hosts and remains a follow-up.
   Phantom type arguments remain part of complete nominal instance keys; this
   is not runtime-use pruning of generic arguments.
 - Active library modules contain only supported declarations. Exact upstream
-  references and revision/hash provenance live under
-  [reference/standard_library](../../blorp_2/reference/standard_library/README.md),
-  outside compiler inputs. Checked native primitives remain explicit; this
+  copies were retained separately at this point; those redundant copies have
+  since been removed. Revision/hash provenance remains in adapter headers, and
+  the original modules live in [standard_library/src](../../standard_library/src/).
+  Checked native primitives remain explicit; this
   change does not claim self-hosting or implement unsupported library features.
 - Host Stage 08 now preserves the accepted callable identity for qualified
   function values using the existing checked projections. It does not resolve
@@ -174,8 +175,9 @@ and first-discovery ordering, without weakening ownership or output assertions.
 | E2E suites/fixtures `.brp` | 7,010 | 7,010 | 0 |
 
 The separate host fix adds 11 production lines and 125 test/helper lines.
-The 3,688 lines of exact upstream reference source are preserved outside
-compiler inputs; moving them is not a claim that those lines were deleted.
+At this milestone, 3,688 lines of exact upstream reference source were moved
+outside compiler inputs rather than deleted. Those redundant copies have since
+been removed; the original standard-library modules remain.
 
 ## Separate nested-or follow-up
 
