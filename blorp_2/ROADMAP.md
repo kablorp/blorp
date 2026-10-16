@@ -462,7 +462,11 @@ that is its own parameter (Void for a statement match), so its arms carry a
 value each, not a parameter list. A join arm only yields its value: only a
 tail arm returns or loops, so a yield cannot end a function and a backedge
 cannot leave a join. An arm may not reassign a variable declared outside it
-yet; M2.1b, next, makes a join also carry each reassigned variable. The
+yet; M2.1b, next, makes a join also carry each reassigned variable. Its reviewed
+[carried-bindings plan](CARRIED_BINDINGS_PLAN.md) defines structured multi-output
+steps, first as a behavior-preserving preparation. Preparation budgets are
+accepted; a physical representation probe and measurement-baseline review
+precede broad migration. Carried-binding implementation has not started. The
 checked form is `Match(CheckedJoin)` with value arms; the tail match keeps
 `CheckedMatchBody`. A match at a Void function's tail discards each arm's
 value, as a plain Void tail does. A self call at the tail of a nested match
