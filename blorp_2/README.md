@@ -325,14 +325,18 @@ persistent compiler cache or input manifest. To test another executable, pass
 the variable: `make -C blorp_2 test-e2e BLORP2_COMPILER=path/to/pilot`
 (relative to the repository root).
 
-CI's macOS Blorp 2 lane waits for the existing compiler's build and restores
-that toolchain artifact. It runs unit, runtime, grammar and tooling suites,
-then `make -C blorp_2 test-compiler test-e2e`, which uses that host compiler
-to build the pilot once and tests every fixture. Hosted macOS runners may omit
-retired-instruction counters, so that CI step explicitly sets
+CI's Blorp 2 lanes run on Linux x64 and ARM64 with Clang, Linux x64 with GCC,
+and macOS with Clang. Each waits for the matching existing compiler's build
+and restores that toolchain artifact. It runs unit, runtime and grammar
+suites, then `make -C blorp_2 test-compiler test-e2e`, which uses that host compiler
+to build the pilot once and tests every fixture. Hosted runners do not guarantee
+the required retired-instruction counters, so that CI step explicitly sets
 `BLORP_2_INSTRUCTION_CHECK=disabled`. Allocation caps, strict leak reports and
-all native ASan/UBSan cases still run. A failing suite blocks packaging and
-uploads its test log.
+all native ASan/UBSan cases still run. Failures upload their test logs. Clang
+platform jobs package release binaries only after their test lanes pass.
+Clang and GCC builds have separate caches and artifacts. The macOS lane also
+runs the compiler-comparison tooling suite, whose command requires macOS
+`/usr/bin/time -l` and does not support Linux.
 
 [`test_end_to_end.brp`](test/e2e/test_end_to_end.brp) is the sole e2e test
 entrypoint; the other case modules provide groups to it and are not standalone
@@ -1781,6 +1785,13 @@ math or contraction, C startup locale and nearest/ties-even rounding. Generated 
 checks representation requirements; target programs cannot change locale or
 rounding in this subset. Float remains unmanaged in parameters, locals and
 ordinary union fields and fixed-record fields.
+
+Generated C disables contraction with GCC's `fp-contract=off` optimization
+pragma or Clang's standard `STDC FP_CONTRACT OFF` pragma. The policy remains
+active for generated functions so inlined arithmetic helpers still round each
+operation separately under ordinary `-O2`, in both default GNU C and strict
+C11 builds. The [native Float runtime tests](test/runtime/test_float.brp)
+check exact runtime results and strict warning acceptance.
 
 The [calculator component tests](test/unit/test_lower/test_option_contracts.brp),
 [input ownership tests](test/unit/test_verify/test_option_ownership.brp),

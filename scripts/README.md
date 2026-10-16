@@ -27,18 +27,23 @@ not required before landing.
 Changes under `blorp_2/` are validated with `make -C blorp_2 test`;
 `scripts/compiler-check` selects nothing for that tree.
 
-CI's macOS Blorp 2 lane restores the existing compiler's build artifact and
-runs unit, runtime, grammar and tooling suites, then e2e tests
+CI's Blorp 2 lanes run on Linux x64 and ARM64 with Clang, Linux x64 with GCC,
+and macOS with Clang. Each restores its existing compiler's build artifact and
+runs unit, runtime and grammar suites, then e2e tests
 (`make -C blorp_2 test-compiler test-e2e`), which build the pilot once using
 the restored compiler and run every fixture against it.
-Hosted macOS runners may omit `/usr/bin/time -l` retired-instruction counters,
+Hosted runners do not guarantee the required retired-instruction counters,
 so the CI step explicitly sets `BLORP_2_INSTRUCTION_CHECK=disabled`. It skips
 only instruction measurement and limits; allocation caps, strict leak parsing,
 native sanitizers and every fixture remain enabled. Local e2e defaults to
 `required`; missing counters still fail, and empty or unknown settings reject.
 E2e disables the suite timeout; the CI job retains its 45-minute limit. Failures
-upload the unit and e2e logs, and packaging waits for the matching platform's
-test lanes.
+upload the test logs, and Clang packaging waits for that platform's test lanes.
+The macOS lane also runs the compiler-comparison tooling suite: that tool
+requires macOS `/usr/bin/time -l` and does not support Linux.
+The shared workflow selects `BLORP_CC` through its `c_compiler` input (default
+`clang`). Compiler build caches and artifacts distinguish Clang from GCC;
+only the Clang jobs package release binaries.
 
 ## Focused compiler checks
 
@@ -457,8 +462,8 @@ The individual checks:
   needs host OpenSSL headers and libraries plus the `openssl` command, so no
   gate runs it.
 
-On main, CI builds the compiler once per platform with its final dev release
-metadata, runs the test gates in independent jobs, and the dev release workflow
-publishes those exact bytes. Explicit `v*` tags build independently, because the
-tagged version embedded in the executable differs. `docs/RELEASES.md` has the
-preview and release procedure.
+On main, CI builds the compiler once per platform and C compiler with its final
+dev release metadata and runs the test gates in independent jobs. The dev
+release workflow publishes the tested Clang builds. Explicit `v*` tags build
+independently, because the tagged version embedded in the executable differs.
+`docs/RELEASES.md` has the preview and release procedure.

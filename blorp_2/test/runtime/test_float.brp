@@ -1,0 +1,92 @@
+import:
+	../../src/runtime/float: float_runtime
+	fs: IOError, resource_path, temporary_directory
+	process: ProcessOutput, run
+	system: getenv, read_file, temp_dir, write_file
+	test: TestSuite
+
+
+private func run_isolated(
+	program: String,
+	arguments: List[String],
+) -> Result[ProcessOutput, String]:
+	run(
+		"/usr/bin/env",
+		["-u", "BLORP_LEAK_CHECK", "-u", "BLORP_MEMORY_STATS", program].concat(arguments),
+	)
+
+
+private func check_rounding(directory: String, flags: List[String]) -> Result[Bool, String]:
+	runtime_written ?= write_file(directory + "/float_runtime.c", float_runtime())
+	test_source ?= read_file("blorp_2/test/runtime/fixtures/float_test.c")
+	test_written ?= write_file(directory + "/float_runtime_test.c", test_source)
+	executable = directory + "/float_runtime_test"
+	compiled ?= run_isolated(
+		getenv("BLORP_CC").get_or("clang"),
+		flags.concat([
+			directory + "/float_runtime_test.c",
+			"-lm",
+			"-o",
+			executable,
+		]),
+	)
+
+	if (
+		compiled.exit_code() != 0
+		or compiled.stdout() != ""
+		or compiled.stderr() != ""
+	):
+		Err("Float runtime C unit build failed: " + compiled.stderr())
+	else:
+		-- Runtime arguments prevent folding the inputs. Each operation must round
+		-- separately even when the C compiler inlines the arithmetic helpers.
+		result ?= run_isolated(
+			executable,
+			["1.0000000000000002", "0.9999999999999998"],
+		)
+
+		if (
+			result.exit_code() == 0
+			and result.stdout() == "0x0p+0\n"
+			and result.stderr() == ""
+		):
+			Ok(True)
+		else:
+			Err(
+				"Float operations must round separately; stdout=" + result.stdout() + "; stderr=" + result.stderr(),
+			)
+
+
+private func check_runtime(flags: List[String]) -> Result[Bool, IOError]:
+	with directory ?= temporary_directory(temp_dir(), "blorp-2-float-runtime-"):
+		match check_rounding(directory.resource_path(), flags):
+			Err(error):
+				print_error(error)
+				Ok(False)
+			Ok(passed):
+				Ok(passed)
+
+
+private func test_rounding(flags: List[String]) -> Bool:
+	match check_runtime(flags):
+		Ok(passed):
+			passed
+		Err(error):
+			print_error(error.to_string())
+			False
+
+
+tests: TestSuite = {
+	description = "Blorp 2 Float runtime native rounding",
+	tests = [
+		("ordinary O2 rounds operations separately", func(): test_rounding(["-O2"])),
+		("strict C11 O2 accepts the runtime and rounds separately", func(): test_rounding([
+				"-std=c11",
+				"-O2",
+				"-Wall",
+				"-Wextra",
+				"-Werror",
+				"-pedantic",
+			])),
+	]
+}

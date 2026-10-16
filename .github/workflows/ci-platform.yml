@@ -7,6 +7,10 @@ on:
         description: GitHub-hosted runner label for this platform.
         required: true
         type: string
+      c_compiler:
+        description: Host C compiler executable, clang or gcc.
+        default: clang
+        type: string
       test_lanes:
         description: JSON array of independently budgeted test lane definitions.
         required: true
@@ -18,7 +22,7 @@ jobs:
     runs-on: ${{ inputs.runner }}
     timeout-minutes: 30
     env:
-      BLORP_CC: clang
+      BLORP_CC: ${{ inputs.c_compiler }}
     outputs:
       version: ${{ steps.release-meta.outputs.version }}
       source_sha: ${{ steps.release-meta.outputs.source_sha }}
@@ -28,6 +32,13 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v5
+
+      - name: Validate C compiler
+        run: |
+          case "$BLORP_CC" in
+            clang|gcc) ;;
+            *) echo "Unsupported C compiler: $BLORP_CC" >&2; exit 1 ;;
+          esac
 
       - name: Compute release candidate metadata
         id: release-meta
@@ -73,19 +84,19 @@ jobs:
 
       - name: Install dependencies
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y clang libssl-dev pkg-config
+        run: sudo apt-get update && sudo apt-get install -y "$BLORP_CC" libssl-dev pkg-config
 
       - name: Assert host C compiler
-        run: $BLORP_CC --version | head -1 | grep -qi clang
+        run: '"$BLORP_CC" --version | head -1 | tee /dev/stderr | grep -qi "$BLORP_CC"'
 
       - name: Cache compiler build
         uses: actions/cache@v5
         with:
           path: blorp/build/_build/blorp-cli
-          key: blorp-cli-v1-${{ steps.compiler-bootstrap.outputs.tag }}-${{ runner.os }}-${{ runner.arch }}-${{ steps.release-meta.outputs.version }}-${{ steps.release-meta.outputs.source_sha }}-${{ steps.release-meta.outputs.target }}-${{ hashFiles('blorp/src/**', 'standard_library/src/**/*.brp', 'blorp/build/bootstrap.env', 'blorp/tool/*.brp', 'scripts/blorp-compiler-bootstrap') }}
+          key: blorp-cli-v2-${{ inputs.c_compiler }}-${{ steps.compiler-bootstrap.outputs.tag }}-${{ runner.os }}-${{ runner.arch }}-${{ steps.release-meta.outputs.version }}-${{ steps.release-meta.outputs.source_sha }}-${{ steps.release-meta.outputs.target }}-${{ hashFiles('blorp/src/**', 'standard_library/src/**/*.brp', 'blorp/build/bootstrap.env', 'blorp/tool/*.brp', 'scripts/blorp-compiler-bootstrap') }}
           restore-keys: |
-            blorp-cli-v1-${{ steps.compiler-bootstrap.outputs.tag }}-${{ runner.os }}-${{ runner.arch }}-${{ steps.release-meta.outputs.version }}-${{ steps.release-meta.outputs.source_sha }}-${{ steps.release-meta.outputs.target }}-
-            blorp-cli-v1-${{ steps.compiler-bootstrap.outputs.tag }}-${{ runner.os }}-${{ runner.arch }}-
+            blorp-cli-v2-${{ inputs.c_compiler }}-${{ steps.compiler-bootstrap.outputs.tag }}-${{ runner.os }}-${{ runner.arch }}-${{ steps.release-meta.outputs.version }}-${{ steps.release-meta.outputs.source_sha }}-${{ steps.release-meta.outputs.target }}-
+            blorp-cli-v2-${{ inputs.c_compiler }}-${{ steps.compiler-bootstrap.outputs.tag }}-${{ runner.os }}-${{ runner.arch }}-
 
       - name: Generate C
         env:
@@ -148,7 +159,7 @@ jobs:
       - name: Upload build
         uses: actions/upload-artifact@v6
         with:
-          name: ci-toolchain-${{ steps.release-meta.outputs.target }}
+          name: ci-toolchain-${{ steps.release-meta.outputs.target }}-${{ inputs.c_compiler }}
           path: ${{ runner.temp }}/ci-toolchain.tar.gz
           compression-level: 0
 
@@ -158,7 +169,7 @@ jobs:
     runs-on: ${{ inputs.runner }}
     timeout-minutes: ${{ matrix.timeout_minutes }}
     env:
-      BLORP_CC: clang
+      BLORP_CC: ${{ inputs.c_compiler }}
     strategy:
       fail-fast: false
       matrix:
@@ -171,7 +182,7 @@ jobs:
       - name: Download build
         uses: actions/download-artifact@v7
         with:
-          name: ci-toolchain-${{ needs.build-toolchain.outputs.target }}
+          name: ci-toolchain-${{ needs.build-toolchain.outputs.target }}-${{ inputs.c_compiler }}
           path: ${{ runner.temp }}
 
       - name: Restore build
@@ -181,7 +192,7 @@ jobs:
 
       - name: Install dependencies
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y clang libssl-dev pkg-config
+        run: sudo apt-get update && sudo apt-get install -y "$BLORP_CC" libssl-dev pkg-config
 
       - name: Read bootstrap pin
         if: matrix.run_quality_checks || matrix.scope == 'blorp-2'
@@ -201,8 +212,8 @@ jobs:
         run: scripts/blorp-compiler-bootstrap --print-path
 
       - name: Assert host C compiler
-        if: matrix.run_quality_checks
-        run: $BLORP_CC --version | head -1 | grep -qi clang
+        if: matrix.run_quality_checks || matrix.scope == 'blorp-2'
+        run: '"$BLORP_CC" --version | head -1 | tee /dev/stderr | grep -qi "$BLORP_CC"'
 
       - name: Quality checks
         if: matrix.run_quality_checks
@@ -241,25 +252,33 @@ jobs:
           set -euo pipefail
           scripts/compiler-build-status
           bin/blorp test --suite --timeout 180 \
-            blorp_2/test/unit blorp_2/test/runtime blorp_2/test/test_grammar blorp_2/test/tooling \
+            blorp_2/test/unit blorp_2/test/runtime blorp_2/test/test_grammar \
             2>&1 | tee blorp_2_unit_output.txt
           make -C blorp_2 test-compiler test-e2e \
             2>&1 | tee blorp_2_e2e_output.txt
+
+      - name: Run Blorp 2 macOS tooling tests
+        if: matrix.scope == 'blorp-2' && runner.os == 'macOS'
+        run: |
+          set -o pipefail
+          bin/blorp test --suite --timeout 180 blorp_2/test/tooling \
+            2>&1 | tee blorp_2_tooling_output.txt
 
       - name: Upload test logs
         if: failure()
         uses: actions/upload-artifact@v6
         with:
-          name: test-output-${{ needs.build-toolchain.outputs.target }}-${{ matrix.scope }}
+          name: test-output-${{ needs.build-toolchain.outputs.target }}-${{ inputs.c_compiler }}-${{ matrix.scope }}
           path: |
             test_output.txt
             blorp_2_unit_output.txt
             blorp_2_e2e_output.txt
+            blorp_2_tooling_output.txt
 
   package-tested-toolchain:
     name: Package
     needs: [build-toolchain, test]
-    if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+    if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && inputs.c_compiler == 'clang' }}
     runs-on: ${{ inputs.runner }}
     timeout-minutes: 20
 
@@ -270,7 +289,7 @@ jobs:
       - name: Download tested build
         uses: actions/download-artifact@v7
         with:
-          name: ci-toolchain-${{ needs.build-toolchain.outputs.target }}
+          name: ci-toolchain-${{ needs.build-toolchain.outputs.target }}-${{ inputs.c_compiler }}
           path: ${{ runner.temp }}
 
       - name: Restore tested build
