@@ -143,3 +143,29 @@ Run only with an explicit exclusive compiled slot. Use existing ordinary CLI/lib
 Source/C predict removing992/16256 RecordHead materializations in the32x16/128x8 describe groups after both stages. Verify this; it is not already a measured saving. Group maps, repeated routing scans, dedup scans and pair enumeration remain. No general speedup or cost closure is promised.
 
 STOP and hand back on a repeatable cap breach, baseline absolute-cap breach, source/binary/input drift, missing positive counters, leak, C/outcome mismatch, changed error ordering, host fault or need for a new matcher/cache/selector/framework. Retain negative receipts; do not continue wider gates without root direction. Independent source/test review, full destination Makefile gate and dynamic frontier are still required before publication.
+
+### One bounded diagnostic collection after the ground preflight
+
+The later normal zero preflight fails the unchanged+0.5% instruction limit:
+three alternating pairs give minima33,772,012 for B and34,680,542 for ground
+(+2.690186%). The32x1 strict count is23,801, balanced with zero leaks and
+unchanged C, within31,000. No broader acceptance follows.
+
+Root and two compiler experts agree to one collection-only exception to the
+cost stop rule. Freeze the existing B/ground binaries, complete source/library,
+discovered fixture corpus, three pinned stress trees and canonical host-proxy
+commands before execution. Use the existing ordinary serial CLI recipes for
+strict counts and at least three alternating normal pairs per declared input.
+Measure that finite inventory once; keep the existing limits and record every
+numerical breach rather than stopping at its first cost ratio. Report aggregate
+and worst-input results and a cap-by-cap failure table. Previously observed
+failures remain failures, not replacement baselines or passed gates.
+
+Abort immediately on provenance drift, setup/I/O/host failure, invalid/missing
+counters, timeout/resource-limit errors, leaks or unexpected behavior,
+diagnostic or C changes. Enumerate intentional language changes separately;
+never silently omit workloads from the unchanged corpus. No adaptive rerun,
+source optimization, new framework, disabled limit or further cap exception is
+authorized by this collection. Its purpose is a complete accept/defer/rescope
+decision, not acceptance despite red evidence. Publication still requires an
+explicit reviewed cost decision and the ordinary correctness/destination gates.
