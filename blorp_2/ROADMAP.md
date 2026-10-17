@@ -20,6 +20,10 @@ new compiler mechanism. Retain implemented language behavior and migrate the
 compiler source before removing a deferred feature from the prerequisite set.
 The M8 proof below is unchanged.
 
+After M8 passes, [M9](#m9-post-self-compilation-architecture-audit) audits the
+complete compiler against actual self-compilation evidence before the next major
+feature expansion. This audit does not defer existing correctness work or gates.
+
 Correctness and useful composition come before memory optimization. Extra
 retains, copies and fresh allocations are acceptable; unique-root COW,
 allocation reuse, retain elimination and consuming-ABI inference are deferred.
@@ -101,6 +105,7 @@ passed the audited toolchain's default limits through depth 256.
 | [M6](#m6-library-and-shell) | First-order library parity, integer-facing String APIs and seven shell/path functions | String byte/scalar APIs implemented and validated; source migration, remaining library and shell/path work pending. Target Char/Bytes are not planned prerequisites after source migration. |
 | [M7](#m7-lambdas) | Broader language function types/lambdas | Source-removal pilots precede any retirement of this bootstrap dependency. |
 | [M8](#m8-the-fixpoint-gate) | Fixpoint gate | Not started. |
+| [M9](#m9-post-self-compilation-architecture-audit) | Complete architecture audit using the self-compiled compiler | Planned immediately after M8, before the next major feature expansion. |
 
 Remaining dependency order (source migrations may overlap disjoint work):
 
@@ -872,7 +877,8 @@ retirement remains conditional on the source migration and inventory.
 B == C, A == B on every fixture, e2e under B, all at `-O2`. Measure the
 self-compile cost row (allocations and instructions per phase) under
 always-fresh `append`; if quadratic, unique-root reuse is the first post-fixpoint
-increment. **Decision (harness).** The e2e harness has no closure values: tests
+optimization candidate for M9 to assess before implementation.
+**Decision (harness).** The e2e harness has no closure values: tests
 are dispatched by name. It does not add a lambda prerequisite to bootstrap.
 The `BLORP2_COMPILER` harness is expected to
 be rewritten once blorp_2 is mature. The unit-test migration is a separate plan.
@@ -880,6 +886,46 @@ be rewritten once blorp_2 is mature. The unit-test migration is a separate plan.
 **Exit proof.** The fixpoint script exits 0.
 
 **Status.** Not started.
+
+## M9: post-self-compilation architecture audit
+
+**Trigger.** Start immediately after the real M8 proof passes. M8 still defines
+self-compilation; M9 is the next required review, before major feature expansion.
+Earlier audits and passing fixtures inform this audit but do not replace it.
+
+**Scope.** Independent compiler experts and the coordinator review every phase,
+the temporary target library/runtime, shell, build path and validation tooling:
+
+- Map facts from producer through consumers: identity, owner, lifetime,
+  construction boundary and immutable publication. Check local builders, sealed
+  products, pure compilation after loading and semantic decisions through
+  resolved identities rather than recovering meaning from spellings.
+- Review checking, specialization, recursive instance publication and complete
+  runtime layouts, including distinctions between semantic and storage identity.
+- Audit ownership obligations, borrow dependencies, transfer ordering and
+  exhaustive destruction across calls, aggregates, joins and loop exits. Check
+  insertion and independent verification separately; test actual destruction
+  depth and retained memory, not only balanced counts.
+- Profile the real self-compile by phase. Inspect physical allocations, boxing,
+  COW, repeated scans and collection growth with representative scaling cases.
+  Investigate measured causes before choosing optimizations or new indexes.
+- Review generated C and runtime behavior, structural depth and toolchain
+  limits. Explain expected C changes; retain exact deterministic fixpoint checks.
+- Check UTF-8 admission, module/path identity and CLI I/O against the matching
+  host and target-library contracts, including failure cleanup.
+- Review organization, duplicated authorities, implicit behavior, temporary
+  bootstrap accommodations and test quality. Confirm inventories cover all
+  supported forms and mutation tests fail for their intended reasons.
+
+**Acceptance.** Publish a report pinned to compiler/source/library/toolchain
+identities, with phase contracts, measured self-compile and scaling evidence,
+reproducible findings, severity, coverage limits and bounded follow-ups. Obtain
+at least two independent reviews including the coordinator. Resolve correctness
+and ownership blockers before expansion; document minor inefficiencies with
+their cause, evidence and a credible route to improvement. The audit authorizes
+no speculative rewrite, new framework or automatic optimization.
+
+**Status.** Planned; begins after M8. No audit result is claimed yet.
 
 ## Identity and immutable facts
 
