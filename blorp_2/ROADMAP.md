@@ -113,6 +113,7 @@ Remaining dependency order (source migrations may overlap disjoint work):
 reviewed source plan + small constructor/control preparations
 host library/runtime prerequisites, then freeze the supporting host
 M6 String byte/scalar APIs + source Char/classification migration
+M6 native current-directory Result witness (may overlap M2/M3; bounded below)
 first-order source pilots + callback removal                     [M7 gate]
 M2 restricted control, outer-variable flow, propagation/annotations
 M3 managed List/while loops + source flat-walk/range migration
@@ -697,6 +698,13 @@ instructions stay within +5%. Implementation, cost and documentation reviews are
 complete.
 Source Char/classification migration, slicing, remaining library and shell/path
 work are separate; this does not complete M6.
+
+The standalone [target current-directory Result slice](TARGET_CURRENT_DIRECTORY_PLAN.md)
+may overlap M2/M3 after its plan, native test seam and shared-file writer slot
+are reviewed. Existing ordinary match and managed unions support this one native
+witness. Compiler loader migration and all broader M6 shell/library integration
+retain the dependency order above; this exception establishes no self-compilation
+or M6 completion.
 
 **Goal.** The real compiler source loads and checks against the real temporary
 library, with no remaining required parity row missing. Use the reduced resolved
