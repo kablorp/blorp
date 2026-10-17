@@ -81,6 +81,12 @@ names, private types and UFCS clashes, are complete and published; see
 [QUALITY_ROADMAP.md](QUALITY_ROADMAP.md). Deferred cost experiments remain
 separate from that completed correctness and maintenance queue.
 
+The [architecture audit](ARCHITECTURE_AUDIT_2026-10-16.md) supports the existing
+phase/ownership design. It prioritizes native UTF-8 file admission and replacing
+byte-classification substrings before claiming every String is valid UTF-8. Actual
+bootstrap-product destruction-depth acceptance remains open; native nested joins
+passed the audited toolchain's default limits through depth 256.
+
 | Milestone | Scope | Status |
 | --- | --- | --- |
 | [M0](#m0-foundation-closeout) | Re-cut, perf fixes, parser statement loop, fixpoint script, parity table | Landed. M3 owns the recorded managed-value call limits. |
