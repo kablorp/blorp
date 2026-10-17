@@ -1,0 +1,59 @@
+import:
+	../../src/specialize/specialize as Concrete
+	../../src/verify/verify: VerifiedProgram, verified_contents
+	./test_record: RuntimeCase, runtime_passes
+	test: TestSuite
+
+
+-- Current CheckedExpr shape, reduced to the three admitted storage paths:
+-- numeric leaf, inline union owning String/List, and inline union owning Expr.
+-- Actual host compiler products have separate tests under test/unit; this
+-- source establishes target helper layouts without claiming self-compilation.
+private RUNTIME_SOURCE: String =
+	|fixed record Expr { form: Form, span: Int }
+	|fixed union Form:
+	|    Leaf(Int)
+	|    Call(String, List[Expr])
+	|    Field(Expr, Int)
+	|pure func make(value: Int) -> Expr:
+	|    { form = Call("call", [{ form = Field({ form = Leaf(value), span = value }, 2), span = 3 }]), span = 4 }
+	|func main() -> Int:
+	|    unused = make(7)
+	|    0
+	|
+
+
+private pure func complete_catalog(program: VerifiedProgram) -> Bool:
+	contents = verified_contents(program)
+	match (contents.records, contents.unions):
+		([expr], [form]):
+			match (expr.representation, expr.fields, form.representation, form.variants):
+				(Concrete.ManagedRecord, [Concrete.UnionType(stored), Concrete.IntType], Concrete.InlineOwningPayload, [[Concrete.IntType], [Concrete.StringType, Concrete.ListType(Concrete.RecordType(element))], [Concrete.RecordType(inner), Concrete.IntType]]):
+					Concrete.union_number(stored) == 0 and Concrete.record_number(element) == 0 and Concrete.record_number(inner) == 0
+				_: False
+		_: False
+
+
+private CASES: List[RuntimeCase] = [
+	{ description = "numeric leaf frees only its root", name = "leaf" },
+	{ description = "Call frees its distinct String and every List slot", name = "call" },
+	{ description = "Field frees its child and both roots", name = "field" },
+	{ description = "nonfinal root release preserves every child", name = "nonfinal" },
+	{ description = "repeated List slots own separate occurrences", name = "repeated" },
+	{ description = "nested acquired child survives both parent roots", name = "acquired" },
+	{ description = "128-level mixed chain preserves a retained middle tail", name = "deep" },
+	{ description = "128 broad children release individually around an acquired element", name = "wide" },
+]
+
+
+func test_runtime() -> Bool:
+	runtime_passes(
+		RUNTIME_SOURCE, complete_catalog,
+		"blorp_2/test/runtime/fixtures/compiler_products_test.c", CASES,
+	)
+
+
+tests: TestSuite = {
+	description = "Compiler-shaped target product destruction",
+	tests = [("complete current layout and individual allocation lifetimes", test_runtime)]
+}

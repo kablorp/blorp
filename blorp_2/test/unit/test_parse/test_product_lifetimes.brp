@@ -1,0 +1,107 @@
+import:
+	../../../src/lex/lex: lex
+	../../../src/parse/parse: module_contents, parse_module
+	../../../src/utils/names: program_names
+	../../../src/utils/source: module_source, root_module_id
+	../../../src/utils/syntax:
+		ExpressionBase(DirectApplication, IntegerExpression),
+		ParsedBody(ParsedValueBody),
+		ParsedFunction,
+		TypeSyntax(AtomicType, AppliedType),
+		ValueExpression,
+	test: TestSuite
+
+
+-- Returning the projection retires the parsed module before the caller reads
+-- its recursive child. These are actual parser products, not a second AST.
+private pure func parsed_function(source: String) -> Option[ParsedFunction]:
+	match lex(module_source(root_module_id()), source, program_names().names):
+		Err(_): None
+		Ok(tokens):
+			match parse_module(tokens, root_module_id()):
+				Err(_): None
+				Ok(parsed): module_contents(parsed).functions.get(0)
+
+
+private pure func nested_call(depth: Int) -> String:
+	var expression = "7"
+	for _ in 0..depth:
+		expression = "keep(" + expression + ")"
+	"func main() -> Int:\n\t" + expression + "\n"
+
+
+private pure func call_depth(value: ValueExpression) -> Option[Int]:
+	var current = value
+	var depth = 0
+	var result: Option[Int] = None
+	while True:
+		if not current.applications.is_empty():
+			break
+		match current.base:
+			DirectApplication(_, [child]):
+				current = child
+				depth = depth + 1
+			IntegerExpression(7):
+				result = Some(depth)
+				break
+			_:
+				break
+	result
+
+
+private pure func call_product_survives(depth: Int) -> Bool:
+	match parsed_function(nested_call(depth)):
+		Some(function):
+			match function.body:
+				ParsedValueBody(value): call_depth(value) == Some(depth)
+				_: False
+		None: False
+
+
+private pure func nested_type(depth: Int) -> String:
+	var annotation = "Int"
+	for _ in 0..depth:
+		annotation = "List[" + annotation + "]"
+	"pure func keep(value: " + annotation + ") -> " + annotation + ":\n\tvalue\n"
+
+
+private pure func type_depth(value: TypeSyntax) -> Option[Int]:
+	var current = value
+	var depth = 0
+	var result: Option[Int] = None
+	while True:
+		match current:
+			AppliedType(_, [child], _):
+				current = child
+				depth = depth + 1
+			AtomicType(_):
+				result = Some(depth)
+				break
+			_:
+				break
+	result
+
+
+private pure func type_product_survives(depth: Int) -> Bool:
+	match parsed_function(nested_type(depth)):
+		Some(function):
+			match (function.parameters, function.return_type):
+				([parameter], Some(result)):
+					type_depth(parameter.type_name) == Some(depth) and type_depth(result) == Some(depth)
+				_: False
+		None: False
+
+
+tests: TestSuite = {
+	description = "Retained recursive parser products",
+	tests = [
+		("16 call children survive the parsed module", pure func(): call_product_survives(16)),
+		("32 call children survive the parsed module", pure func(): call_product_survives(32)),
+		("64 call children survive the parsed module", pure func(): call_product_survives(64)),
+		("128 call children survive the parsed module", pure func(): call_product_survives(128)),
+		("16 type children survive the parsed module", pure func(): type_product_survives(16)),
+		("32 type children survive the parsed module", pure func(): type_product_survives(32)),
+		("64 type children survive the parsed module", pure func(): type_product_survives(64)),
+		("128 type children survive the parsed module", pure func(): type_product_survives(128)),
+	]
+}
