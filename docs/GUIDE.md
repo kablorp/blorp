@@ -447,6 +447,30 @@ escaped: String = "line1\nline2\ttabbed"
 unicode: String = "Hello \u{1F600}"   -- Unicode escape (1-6 hex digits)
 ```
 
+Strings are valid UTF-8 text stored as counted bytes, including embedded NUL.
+Length and access indices count encoding bytes. Existing `get` represents one
+encoding byte as `Char`; it does not decode a scalar. Literal and escape syntax
+is unchanged by the integer-facing APIs below. Legacy host producers that can
+return malformed UTF-8 are implementation gaps outside these two APIs, not
+supported String semantics.
+
+`string.byte_at(value: String, index: Int) -> Option[Int]` returns an unsigned
+encoding byte from 0 to 255, including continuation bytes, or `None` for a
+negative or out-of-bounds index. It observes the valid String without decoding
+a scalar. `string.from_codepoint(value: Int) -> Option[String]` encodes a Unicode
+scalar as exact UTF-8, including NUL, unassigned values and noncharacters. It
+rejects negatives, U+D800-U+DFFF and values above U+10FFFF before narrowing.
+Both interfaces preserve String's UTF-8 invariant.
+
+```blorp
+import:
+    string: byte_at, from_codepoint
+
+byte_at("é", 1) == Some(169)
+from_codepoint(169) == Some("©")  -- Scalar U+00A9 has UTF-8 bytes [194, 169]
+from_codepoint(55296) == None     -- Surrogates are not Unicode scalars
+```
+
 Capacity-aware construction uses the normal `String` type. Capacity is a performance hint, not observable behavior.
 Use `+` for ordinary concatenation and `+=` when accumulating into a mutable string.
 

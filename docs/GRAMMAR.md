@@ -309,6 +309,15 @@ is required between statements today, these are accepted as two statements
 
 Every string literal is one token. There are seven kinds.
 
+String values are valid UTF-8 text stored as counted bytes, including NUL.
+Literal and escape syntax is unchanged by the integer-facing APIs:
+`string.byte_at(String, Int) -> Option[Int]` reads an unsigned encoding byte,
+including continuation bytes, without decoding a scalar.
+`string.from_codepoint(Int) -> Option[String]` encodes a Unicode scalar,
+rejecting negatives, U+D800-U+DFFF and values above U+10FFFF before narrowing.
+NUL, unassigned scalars and noncharacters are accepted. Both interfaces
+preserve String's UTF-8 invariant.
+
 **Plain string** `"..."`: a double quote, then any characters except `"`, `\`,
 a line feed, or a `${` hole opener, then a closing `"` (`STR:132-152`,
 `STR:179-276`). Escapes:

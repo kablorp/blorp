@@ -18,7 +18,7 @@ claim that current callers or missing twins have disappeared.
 
 | Source migration / interface | Bootstrap requirement |
 | --- | --- |
-| Char reads, literals and conversions | Replace with `string.byte_at(String, Int) -> Option[Int]` and `string.from_codepoint(Int) -> Option[String]`; both matching host/target interfaces are planned, not implemented. Full-width scalar validation precedes narrowing, and Some[String] has ordinary owning payload transfer/destruction. |
+| Char reads, literals and conversions | Replace with `string.byte_at(String, Int) -> Option[Int]` and `string.from_codepoint(Int) -> Option[String]`. The host wrappers are implemented and validated with explicit source-library selection; matching target operations and source migration remain pending. Full-width scalar validation precedes narrowing, and Some[String] has ordinary owning payload transfer/destruction. |
 | Parser alphabet classification | Private ASCII byte predicates replace all current String lower/index_of/contains callers, preserving empty-substring and malformed-token diagnostic behavior. Remove the historical rows only after resolved inventory confirms zero uses. |
 | List/Option/Result callbacks and function types | Conditional first-order migration. Do not implement historical HOF rows solely for bootstrap or remove them before the bounded pilots and full inventory pass. |
 | First-order numeric, String and List operations | Remain required over valid UTF-8. Planned `string.slice(String, Int, Int) -> Option[String]` uses half-open byte offsets and rejects out-of-range or misaligned endpoints. Byte comparisons create no String. Measure join construction: host join uses capacity-aware append, not naive concat. |

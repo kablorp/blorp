@@ -1,0 +1,377 @@
+import:
+	int: INT_MAX, INT_MIN
+	memory: get_mem_stats, refcount, reset_mem_stats, same_object
+	string: byte_at, from_char, from_codepoint
+	test: TestSuite
+
+
+-- The runtime's immortal counts exceed any ordinary heap ownership count.
+private IMMORTAL_REFCOUNT_FLOOR: Int = 1000000000000
+
+
+-- Impure inputs keep conversion and ownership checks at runtime.
+func runtime_int(value: Int) -> Int:
+	value
+
+
+func byte_equals(text: String, index: Int, expected: Int) -> Bool:
+	match byte_at(text, runtime_int(index)):
+		Some(value):
+			value == expected
+		None:
+			False
+
+
+func byte_is_absent(text: String, index: Int) -> Bool:
+	match byte_at(text, runtime_int(index)):
+		Some(_):
+			False
+		None:
+			True
+
+
+func encoding_bytes_equal(text: String, expected: List[Int]) -> Bool:
+	var index: Int = 0
+	var correct: Bool = text.length() == expected.length()
+
+	while index < expected.length():
+		correct = byte_equals(text, index, expected.get_or(index, -1)) and correct
+		index += 1
+
+	correct and byte_is_absent(text, expected.length())
+
+
+func test_byte_at_returns_continuation_byte() -> Bool:
+	byte_equals("é", 1, 169)
+
+
+func test_byte_at_reads_each_multilingual_encoding_byte() -> Bool:
+	encoding_bytes_equal("Aé世😀", [65, 195, 169, 228, 184, 150, 240, 159, 152, 128])
+
+
+func test_byte_at_reads_all_ascii_including_nul() -> Bool:
+	var text: String = ""
+	var index: Int = 0
+
+	-- Every ASCII scalar, including NUL, is one valid UTF-8 encoding byte.
+	while index < 128:
+		text += from_char(to_char(runtime_int(index)))
+		index += 1
+
+	var correct: Bool = text.length() == 128
+	index = 0
+
+	while index < 128:
+		correct = byte_equals(text, index, index) and correct
+		index += 1
+
+	correct and byte_is_absent(text, 128)
+
+
+func test_byte_at_empty_string_has_no_bytes() -> Bool:
+	byte_is_absent("", 0) and byte_is_absent("", -1)
+
+
+func test_byte_at_rejects_negative_indices() -> Bool:
+	byte_is_absent("abc", -1) and byte_is_absent("abc", INT_MIN)
+
+
+func test_byte_at_checks_first_last_and_end() -> Bool:
+	(
+		byte_equals("abc", 0, 97)
+		and byte_equals("abc", 2, 99)
+		and byte_is_absent("abc", 3)
+		and byte_is_absent("abc", 4)
+	)
+
+
+func test_byte_at_rejects_full_width_indices() -> Bool:
+	(
+		byte_is_absent("abc", 2147483648)
+		and byte_is_absent("abc", 4294967296)
+		and byte_is_absent("abc", INT_MAX)
+	)
+
+
+func test_byte_at_counts_past_embedded_nul() -> Bool:
+	text: String = "\0A\0B"
+	(
+		text.length() == 4
+		and byte_equals(text, 0, 0)
+		and byte_equals(text, 1, 65)
+		and byte_equals(text, 2, 0)
+		and byte_equals(text, 3, 66)
+		and byte_is_absent(text, 4)
+	)
+
+
+func test_byte_at_reads_valid_scalar_encoding_boundaries() -> Bool:
+	text: String = "\0\u{7F}\u{80}\u{7FF}\u{800}\u{D7FF}\u{E000}\u{FFFF}\u{10000}\u{10FFFF}"
+	encoding_bytes_equal(
+		text,
+		[
+			0, 127, 194, 128, 223, 191,
+			224, 160, 128, 237, 159, 191,
+			238, 128, 128, 239, 191, 191,
+			240, 144, 128, 128, 244, 143, 191, 191,
+		],
+	)
+
+
+func test_byte_at_borrows_heap_string_without_consuming_alias() -> Bool:
+	text: String = from_char(to_char(runtime_int(233))) + "\0A"
+	text_alias: String = text
+	first: Bool = byte_equals(text, 0, 195)
+	first and text_alias.length() == 4 and text_alias == "é\0A" and byte_equals(text_alias, 3, 65)
+
+
+-- Fixed expected bytes are inspected through the old get/Char projection,
+-- independently of byte_at and the scalar encoder under test.
+pure func has_bytes(text: String, expected: List[Int]) -> Bool:
+	var correct: Bool = text.length() == expected.length()
+	var index: Int = 0
+
+	while index < expected.length():
+		match text.get(index):
+			Some(character):
+				correct = to_int(character) == expected.get_or(index, -1) and correct
+			None:
+				correct = False
+		index += 1
+
+	correct
+
+
+func encodes_as(value: Int, expected: List[Int]) -> Bool:
+	match from_codepoint(runtime_int(value)):
+		Some(text):
+			has_bytes(text, expected)
+		None:
+			False
+
+
+func codepoint_is_absent(value: Int) -> Bool:
+	match from_codepoint(runtime_int(value)):
+		Some(_):
+			False
+		None:
+			True
+
+
+func test_from_codepoint_encodes_nul() -> Bool:
+	encodes_as(0, [0])
+
+
+func test_from_codepoint_encodes_ascii_boundaries() -> Bool:
+	encodes_as(65, [65]) and encodes_as(127, [127])
+
+
+func test_from_codepoint_encodes_two_byte_boundaries() -> Bool:
+	encodes_as(128, [194, 128]) and encodes_as(2047, [223, 191])
+
+
+func test_from_codepoint_encodes_before_surrogate_range() -> Bool:
+	encodes_as(2048, [224, 160, 128]) and encodes_as(55295, [237, 159, 191])
+
+
+func test_from_codepoint_rejects_surrogate_range() -> Bool:
+	codepoint_is_absent(55296) and codepoint_is_absent(56320) and codepoint_is_absent(57343)
+
+
+func test_from_codepoint_encodes_after_surrogate_range() -> Bool:
+	encodes_as(57344, [238, 128, 128]) and encodes_as(65535, [239, 191, 191])
+
+
+func test_from_codepoint_encodes_four_byte_boundaries() -> Bool:
+	encodes_as(65536, [240, 144, 128, 128]) and encodes_as(1114111, [244, 143, 191, 191])
+
+
+func test_from_codepoint_rejects_above_scalar_maximum() -> Bool:
+	codepoint_is_absent(1114112)
+
+
+func test_from_codepoint_accepts_noncharacters() -> Bool:
+	(
+		encodes_as(64976, [239, 183, 144])
+		and encodes_as(65534, [239, 191, 190])
+		and encodes_as(65535, [239, 191, 191])
+		and encodes_as(1114110, [244, 143, 191, 190])
+		and encodes_as(1114111, [244, 143, 191, 191])
+	)
+
+
+func test_from_codepoint_accepts_unassigned_scalar() -> Bool:
+	encodes_as(888, [205, 184])
+
+
+func test_from_codepoint_rejects_negative_values() -> Bool:
+	codepoint_is_absent(INT_MIN) and codepoint_is_absent(-1)
+
+
+func test_from_codepoint_rejects_full_width_values() -> Bool:
+	(
+		codepoint_is_absent(2147483648)
+		and codepoint_is_absent(4294967295)
+		and codepoint_is_absent(4294967296)
+		and codepoint_is_absent(INT_MAX)
+	)
+
+
+func test_from_codepoint_rejects_value_that_narrows_to_ascii() -> Bool:
+	codepoint_is_absent(4294967361)
+
+
+func test_from_codepoint_encodes_scalar_instead_of_copying_byte() -> Bool:
+	byte_equals("é", 1, 169) and encodes_as(169, [194, 169])
+
+
+func returned_codepoint(value: Int) -> Option[String]:
+	from_codepoint(runtime_int(value))
+
+
+func escaped_codepoint(value: Int) -> String:
+	match returned_codepoint(value):
+		Some(text):
+			text
+		None:
+			""
+
+
+func test_from_codepoint_returns_heap_payload_in_option() -> Bool:
+	match returned_codepoint(233):
+		Some(text):
+			has_bytes(text, [195, 169]) and refcount(text) < IMMORTAL_REFCOUNT_FLOOR
+		None:
+			False
+
+
+func test_from_codepoint_payload_escapes_option() -> Bool:
+	text: String = escaped_codepoint(128512)
+	has_bytes(text, [240, 159, 152, 128]) and refcount(text) < IMMORTAL_REFCOUNT_FLOOR
+
+
+func test_from_codepoint_option_alias_survives_replacement() -> Bool:
+	var result: Option[String] = returned_codepoint(233)
+	saved_result: Option[String] = result
+	result = returned_codepoint(128512)
+	var correct: Bool = False
+
+	match saved_result:
+		Some(text):
+			correct = has_bytes(text, [195, 169])
+		None:
+			void
+
+	match result:
+		Some(text):
+			correct and has_bytes(text, [240, 159, 152, 128])
+		None:
+			False
+
+
+func test_from_codepoint_payload_alias_survives_replacement() -> Bool:
+	var result: Option[String] = returned_codepoint(233)
+	saved_text: String = match result:
+		Some(text): text
+		None: ""
+	result = returned_codepoint(128512)
+	result = None
+	has_bytes(saved_text, [195, 169])
+
+
+func test_from_codepoint_ascii_payloads_use_shared_statics() -> Bool:
+	match returned_codepoint(65):
+		Some(first):
+			match returned_codepoint(65):
+				Some(second):
+					(
+						has_bytes(first, [65])
+						and same_object(first, second)
+						and refcount(first) >= IMMORTAL_REFCOUNT_FLOOR
+					)
+				None:
+					False
+		None:
+			False
+
+
+func discard_codepoint_results() -> Void:
+	from_codepoint(runtime_int(233))
+	from_codepoint(runtime_int(65))
+	from_codepoint(runtime_int(-1))
+	void
+
+
+func test_from_codepoint_discard_releases_heap_payload() -> Bool:
+	reset_mem_stats()
+	discard_codepoint_results()
+	stats = get_mem_stats()
+	(
+		stats.memory_stats_active == 1
+		and stats.total_allocations > 0
+		and stats.current_objects == 0
+		and stats.total_allocations == stats.total_releases
+	)
+
+
+func replace_codepoint_results(count: Int) -> Void:
+	var result: Option[String] = None
+	var index: Int = 0
+
+	while index < count:
+		result = returned_codepoint(233 + index)
+		result = returned_codepoint(65)
+		result = returned_codepoint(-1)
+		index += 1
+
+	void
+
+
+func test_from_codepoint_repeated_replacement_releases_payloads() -> Bool:
+	reset_mem_stats()
+	replace_codepoint_results(runtime_int(64))
+	stats = get_mem_stats()
+	(
+		stats.memory_stats_active == 1
+		and stats.total_allocations > 0
+		and stats.current_objects == 0
+		and stats.total_allocations == stats.total_releases
+	)
+
+
+tests: TestSuite = {
+	description = "Integer String APIs",
+	tests = [
+		("byte_at returns continuation byte", test_byte_at_returns_continuation_byte),
+		("byte_at each multilingual encoding byte", test_byte_at_reads_each_multilingual_encoding_byte),
+		("byte_at empty string", test_byte_at_empty_string_has_no_bytes),
+		("byte_at negative indices", test_byte_at_rejects_negative_indices),
+		("byte_at first last and end", test_byte_at_checks_first_last_and_end),
+		("byte_at full width indices", test_byte_at_rejects_full_width_indices),
+		("byte_at embedded NUL", test_byte_at_counts_past_embedded_nul),
+		("byte_at valid scalar encoding boundaries", test_byte_at_reads_valid_scalar_encoding_boundaries),
+		("byte_at all ASCII including NUL", test_byte_at_reads_all_ascii_including_nul),
+		("byte_at borrows aliased heap string", test_byte_at_borrows_heap_string_without_consuming_alias),
+		("from_codepoint NUL", test_from_codepoint_encodes_nul),
+		("from_codepoint ASCII boundaries", test_from_codepoint_encodes_ascii_boundaries),
+		("from_codepoint two byte boundaries", test_from_codepoint_encodes_two_byte_boundaries),
+		("from_codepoint before surrogates", test_from_codepoint_encodes_before_surrogate_range),
+		("from_codepoint rejects surrogates", test_from_codepoint_rejects_surrogate_range),
+		("from_codepoint after surrogates", test_from_codepoint_encodes_after_surrogate_range),
+		("from_codepoint four byte boundaries", test_from_codepoint_encodes_four_byte_boundaries),
+		("from_codepoint rejects maximum plus one", test_from_codepoint_rejects_above_scalar_maximum),
+		("from_codepoint noncharacters", test_from_codepoint_accepts_noncharacters),
+		("from_codepoint unassigned scalar", test_from_codepoint_accepts_unassigned_scalar),
+		("from_codepoint rejects negative values", test_from_codepoint_rejects_negative_values),
+		("from_codepoint rejects full width values", test_from_codepoint_rejects_full_width_values),
+		("from_codepoint rejects narrowing to ASCII", test_from_codepoint_rejects_value_that_narrows_to_ascii),
+		("from_codepoint encodes scalar instead of copying byte", test_from_codepoint_encodes_scalar_instead_of_copying_byte),
+		("from_codepoint returned heap payload", test_from_codepoint_returns_heap_payload_in_option),
+		("from_codepoint escaped heap payload", test_from_codepoint_payload_escapes_option),
+		("from_codepoint Option alias after replacement", test_from_codepoint_option_alias_survives_replacement),
+		("from_codepoint payload alias after replacement", test_from_codepoint_payload_alias_survives_replacement),
+		("from_codepoint ASCII static payload", test_from_codepoint_ascii_payloads_use_shared_statics),
+		("from_codepoint discard releases heap payload", test_from_codepoint_discard_releases_heap_payload),
+		("from_codepoint repeated replacement releases payloads", test_from_codepoint_repeated_replacement_releases_payloads),
+	]
+}
