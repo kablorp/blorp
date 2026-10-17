@@ -706,6 +706,9 @@ witness. Compiler loader migration and all broader M6 shell/library integration
 retain the dependency order above; this exception establishes no self-compilation
 or M6 completion.
 
+Planned [target file reading](TARGET_FILE_READ_PLAN.md) depends on acceptance of
+that Result boundary; implementation and acceptance are not yet granted.
+
 **Goal.** The real compiler source loads and checks against the real temporary
 library, with no remaining required parity row missing. Use the reduced resolved
 dependency inventory after source migration, not the old callback/Char rows.
@@ -1131,6 +1134,9 @@ and separately from target lifetime evidence, with source, binary, flags, inputs
 raw samples and output identity retained in one report and raw artifacts under
 ignored `build/`. Report production and test lines separately. Owned-input
 costs are proxies for self-compilation until M8 gives the self-compile cost row.
+
+Supporting-host compile-time leaks follow the
+[documented bootstrap limitation](HOST_BOOTSTRAP_LIMITATIONS.md).
 
 - **Preparatory refactors** freeze a matched same-toolchain baseline, emit
   identical existing target C and stay within +3% allocations and minimum

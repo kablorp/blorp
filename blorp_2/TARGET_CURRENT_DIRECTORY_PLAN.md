@@ -362,8 +362,10 @@ Cover every baseline registered e2e input, including rejections, both new
 fixtures, and the proxy; retain the frozen input list and byte hashes.
 Each new fixture has approved absolute caps of 205,000 allocations and
 600,000,000 normal instructions. Record raw strict counts separately from normal B/C,C/B,B/C
-samples; require balanced positive counters, zero leaks, exact status/diagnostic
-oracles and complete C review. New-only native calls have no fictional baseline.
+samples; pilot/compiler-fixture/native runs require strict zero leaks and balanced
+positive counters, exact status/diagnostic oracles and complete C review.
+Supporting-host compile-time leaks follow [the bootstrap decision](HOST_BOOTSTRAP_LIMITATIONS.md).
+New-only native calls have no fictional baseline.
 Report success/error native allocation counts and growth work independently.
 The host compiling B/C target sources is a proxy, not target self-compilation.
 Retain exact source/binary/library hashes and production/test LOC separately.
