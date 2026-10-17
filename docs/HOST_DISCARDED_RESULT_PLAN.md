@@ -381,12 +381,14 @@ Drop(other, If(condition, borrowed, owned))
 ```
 
 Repair only that existing Perceus normalizer and its owning tests in a separate
-prerequisite slice: at most **+15 net production / +160 net test lines**. Preserve
+prerequisite slice: at most **+15 net production / +165 net test lines**. Preserve
 the Drop's variable, value type, release policy, result type and location; recurse
 only into its body. Add no classifier, IR form, pass or backend change. Test both
 mixed branch orders, nested Drops with distinct origins, wholly owned source
 identity, and ordinary managed-Let integration with the borrowed source used
 afterward. Use an explicit existing ReturnOwned call contract for the owned arm.
+The test allowance includes the solved incoming contract and per-path last-use
+oracle; a zero static Drop count does not prove safety for a consumed parameter.
 The cumulative allocation/instruction ceilings below also cover this prerequisite.
 It needs its own failing/passing tests and independent reviews before the discard
 slice depends on it. The discard slice additionally covers Drop-wrapped mixed
