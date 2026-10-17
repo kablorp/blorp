@@ -69,8 +69,14 @@ their own inventory and plan after M8.
 - **Library over builtins**, except representation and machine operations.
 - **Measure.** See [Cost and evidence rules](#cost-and-evidence-rules).
 - **Independent review.** A slice is accepted, with independent code and test
-  review, before a dependent slice relies on it. Parallel work needs disjoint
-  files and contracts; compiled validation and measurements stay serialized.
+  review, before a dependent slice relies on it. Parallel work owns disjoint
+  files or explicitly assigned function regions under stable contracts; each
+  shared schema has one writer. After successful serial warmup of the exact
+  pinned host/runtime configuration, up to two focused correctness suites may
+  run in separate worktrees with separate artifacts. Cold or different cache
+  configurations, cache-mutating tests and shared builds remain serialized.
+  All measurements and e2e cost gates require an exclusive quiet window.
+  Stop and serialize focused runs if macOS execution stalls recur.
 - **The frontier.** One number across the path, reported by
   `scripts/blorp2-fixpoint --frontier`: files of `src` that parse (report the
   discovered numerator and denominator, 35/37 at the final quality gate),
@@ -124,10 +130,11 @@ M8 actual O2 A/B/C and fixture identity proof
 ```
 
 Host library work can overlap disjoint source preparations. Shared compiler
-builtin/check/specialize/emit owners have one writer at a time. M3 reuses M2's
+schemas and builtin wiring have one writer; disjoint helpers and explicitly
+assigned function regions can proceed on separate branches. M3 reuses M2's
 join and ownership edges; target library Blorp bodies depend on the retained
 control/loop subset. Every writing subthread has its own worktree/branch, with
-coordinator integration. Up to eight active subthreads, without forced parallelism.
+coordinator integration. Up to ten active subthreads, without forced parallelism.
 
 ### Acceptance order for the parallel work
 
