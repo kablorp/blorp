@@ -2079,6 +2079,10 @@ the same carrier type, and the success path must return `Some(...)` or
 `Ok(...)` explicitly.
 `read_file` returns Err for malformed UTF-8 and preserves valid contents exactly.
 `read_bytes` provides the separate binary-input API.
+`read_file` and `write_file` report OS failures as fixed operation text followed
+by `errno=` and the captured decimal code. Non-I/O short reads retain
+`read_file: short read` without a code. Both fail fast on short transfers and
+`EINTR`, attempt close once, and retain the primary error if cleanup also fails.
 
 `system.get_current_directory()` returns a nonempty absolute UTF-8 pathname in
 `Ok(directory)` or a text `Err(error)`. OS failures report fixed operation text

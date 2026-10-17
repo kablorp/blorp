@@ -2,18 +2,32 @@
 #include <assert.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 
-enum WriteFault { NO_FAILURE, SHORT_WRITE, CLOSE_FAILURE, WRITE_CLOSE_FAILURE, FDOPEN_FAILURE };
-enum { INPUT_PATH, INPUT_CONTENT, OUTPUT_RESULT, ERROR_TEXT, WATCH_COUNT };
+enum WriteFault { NO_FAILURE, SHORT_WRITE, CLOSE_FAILURE, WRITE_CLOSE_FAILURE, FDOPEN_FAILURE, OPEN_FAILURE };
+enum { INPUT_PATH, INPUT_CONTENT, OUTPUT_RESULT, ERROR_TEXT, PRIVATE_PATH, WATCH_COUNT };
 static enum WriteFault write_fault;
 static int observing_write, write_descriptor, close_attempts;
+static int transfer_attempts, strerror_calls;
+static int write_code = EIO, close_code = ENOSPC;
 static FILE* write_stream;
 static void* watched[WATCH_COUNT];
 static int frees[WATCH_COUNT];
+static const void* write_path_bytes;
+static void* observed_memcpy(void*, const void*, size_t);
+
+static char* observed_strerror(int code) {
+    if (observing_write && write_fault == OPEN_FAILURE) {
+        static char invalid_text[] = "\xff";
+        strerror_calls++;
+        return invalid_text;
+    }
+    return strerror(code);
+}
 
 static FILE* observed_fdopen(int descriptor, const char* mode) {
     if (observing_write) {
@@ -29,16 +43,21 @@ static FILE* observed_fdopen(int descriptor, const char* mode) {
 }
 
 static size_t observed_fwrite(const void* data, size_t width, size_t count, FILE* stream) {
+    if (observing_write && stream == write_stream) {
+        transfer_attempts++;
+        assert(transfer_attempts == 1);
+    }
     if (observing_write && stream == write_stream &&
         (write_fault == SHORT_WRITE || write_fault == WRITE_CLOSE_FAILURE)) {
         size_t written = fwrite(data, width, count ? count - 1 : 0, stream);
-        errno = EIO;
+        errno = write_code;
         return written;
     }
     return fwrite(data, width, count, stream);
 }
 
 static int observed_fclose(FILE* stream) {
+    if (observing_write) assert(write_stream != NULL && stream == write_stream);
     int observed = observing_write && stream == write_stream;
     if (observed) {
         close_attempts++;
@@ -46,7 +65,7 @@ static int observed_fclose(FILE* stream) {
     }
     int result = fclose(stream);
     if (observed && (write_fault == CLOSE_FAILURE || write_fault == WRITE_CLOSE_FAILURE)) {
-        errno = ENOSPC;
+        errno = close_code;
         return EOF;
     }
     return result;
@@ -60,6 +79,7 @@ static int observed_close(int descriptor) {
 static void observed_free(void* object) {
     for (int index = 0; index < WATCH_COUNT; index++) {
         if (object && object == watched[index]) {
+            if (index == INPUT_PATH) write_path_bytes = NULL;
             watched[index] = NULL; /* Clear before libc can reuse the address. */
             frees[index]++;
         }
@@ -74,12 +94,25 @@ static void observed_free(void* object) {
 #define fclose observed_fclose
 #define close observed_close
 #define free observed_free
+#define strerror observed_strerror
+#define memcpy observed_memcpy
 #include "runtime.c"
 #undef fdopen
 #undef fwrite
 #undef fclose
 #undef close
 #undef free
+#undef strerror
+#undef memcpy
+
+static void* observed_memcpy(void* destination, const void* source, size_t count) {
+    if (observing_write && source == write_path_bytes) {
+        assert(frees[INPUT_PATH] == 0 && frees[PRIVATE_PATH] == 0);
+        assert(watched[PRIVATE_PATH] == NULL);
+        watched[PRIVATE_PATH] = destination;
+    }
+    return memcpy(destination, source, count);
+}
 
 static const char LONG_TEXT[] = "prefix-\xc3\xa9\0\r\nsuffix";
 static const unsigned char LONG_BYTES[] = {
@@ -96,6 +129,15 @@ static const unsigned char INTERNAL_LINE[] = {'a', 10, 'b', 10, 10};
 static void assert_string(const blorp_String* value, const void* bytes, size_t count) {
     assert(value && value->len == (long)count);
     assert(!count || memcmp(value->data, bytes, count) == 0);
+}
+
+static void assert_file_error(const blorp_String* message, const char* prefix, int code) {
+    enum { ERROR_CAPACITY = sizeof("write_file: short write; errno=") + sizeof(int) * CHAR_BIT };
+    char expected[ERROR_CAPACITY];
+    int length = snprintf(expected, sizeof(expected), "%s%d", prefix, code);
+    assert(length > 0 && length < ERROR_CAPACITY);
+    assert_string(message, expected, (size_t)length);
+    assert(blorp_utf8_is_valid((const unsigned char*)message->data, message->len));
 }
 
 static void assert_stream(FILE* stream, const unsigned char* expected, size_t count) {
@@ -124,19 +166,27 @@ static void write_case(const char* file, const char* text, size_t length,
     blorp_String* path = blorp_string_create_len(file, (long)strlen(file));
     blorp_String* content = blorp_string_create_len(text, (long)length);
     watched[INPUT_PATH] = path;
+    write_path_bytes = path->data;
     watched[INPUT_CONTENT] = content;
     write_descriptor = -1;
     write_stream = NULL;
-    close_attempts = 0;
+    close_attempts = transfer_attempts = strerror_calls = 0;
     write_fault = fault;
     observing_write = 1;
     blorp_Result* result = blorp_write_file(path, content);
     observing_write = 0;
     /* Check the actual descriptor before any oracle can open/reuse its number. */
-    assert(write_descriptor >= 0);
-    errno = 0;
-    assert(fcntl(write_descriptor, F_GETFD) == -1 && errno == EBADF);
-    assert(close_attempts == 1);
+    if (fault == OPEN_FAILURE) {
+        assert(write_descriptor == -1 && close_attempts == 0);
+        assert(strerror_calls == 0);
+    } else {
+        assert(write_descriptor >= 0);
+        errno = 0;
+        assert(fcntl(write_descriptor, F_GETFD) == -1 && errno == EBADF);
+        assert(close_attempts == 1);
+    }
+    assert(transfer_attempts == (fault != OPEN_FAILURE && fault != FDOPEN_FAILURE && count > 0));
+    assert(frees[PRIVATE_PATH] == 1);
     assert(frees[INPUT_PATH] == 0 && frees[INPUT_CONTENT] == 0);
     assert_string(path, file, strlen(file));
     assert_string(content, expected, count);
@@ -149,15 +199,12 @@ static void write_case(const char* file, const char* text, size_t length,
         assert(result->tag == BLORP_TAG_ERR && result->release_mask == 1UL);
         blorp_String* error = result->data.Err.field0;
         watched[ERROR_TEXT] = error;
-        if (fault == FDOPEN_FAILURE) {
-            assert(error && error->len > 0);
-            assert(blorp_utf8_is_valid((const unsigned char*)error->data, error->len));
+        if (fault == OPEN_FAILURE || fault == FDOPEN_FAILURE) {
+            assert_file_error(error, "write_file: open failed; errno=", fault == OPEN_FAILURE ? ENOENT : EMFILE);
         } else if (fault == CLOSE_FAILURE) {
-            static const char message[] = "write_file: close failed";
-            assert_string(error, message, sizeof(message) - 1);
+            assert_file_error(error, "write_file: close failed; errno=", close_code);
         } else {
-            static const char message[] = "write_file: short write";
-            assert_string(error, message, sizeof(message) - 1);
+            assert_file_error(error, "write_file: short write; errno=", write_code);
         }
     }
     blorp_release(result);
@@ -229,6 +276,16 @@ int main(int argc, char** argv) {
         write_case(path, SHORT_TEXT, sizeof(SHORT_TEXT) - 1,
                    SHORT_BYTES, sizeof(SHORT_BYTES), NO_FAILURE);
         write_case(path, "", sizeof("") - 1, NULL, 0, NO_FAILURE);
+    } else if (strcmp(name, "write_open_errno_ascii") == 0) {
+        if (unlink(path) != 0) assert(errno == ENOENT);
+        size_t capacity = strlen(path) + sizeof("/child");
+        char* missing = malloc(capacity);
+        assert(missing);
+        int length = snprintf(missing, capacity, "%s/child", path);
+        assert(length > 0 && (size_t)length < capacity);
+        write_case(missing, SHORT_TEXT, sizeof(SHORT_TEXT) - 1,
+                   SHORT_BYTES, sizeof(SHORT_BYTES), OPEN_FAILURE);
+        free(missing);
     } else if (strcmp(name, "stderr_empty") == 0) {
         stderr_case("", sizeof("") - 1, EMPTY_LINE, sizeof(EMPTY_LINE));
     } else if (strcmp(name, "stderr_unicode") == 0) {
@@ -243,7 +300,13 @@ int main(int argc, char** argv) {
         else if (strcmp(name, "close_failure") == 0) fault = CLOSE_FAILURE;
         else if (strcmp(name, "write_close_failure") == 0) fault = WRITE_CLOSE_FAILURE;
         else if (strcmp(name, "fdopen_failure") == 0) fault = FDOPEN_FAILURE;
-        else abort();
+        else if (strcmp(name, "write_short_eintr") == 0) {
+            fault = SHORT_WRITE;
+            write_code = EINTR;
+        } else if (strcmp(name, "write_close_eintr") == 0) {
+            fault = CLOSE_FAILURE;
+            close_code = EINTR;
+        } else abort();
         write_case(path, SHORT_TEXT, sizeof(SHORT_TEXT) - 1,
                    SHORT_BYTES, sizeof(SHORT_BYTES), fault);
     }

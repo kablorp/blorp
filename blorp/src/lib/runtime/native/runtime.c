@@ -35098,6 +35098,13 @@ static blorp_Result* blorp_path_errno_result(const blorp_String* path, const cha
     return blorp_result_err_owned((void*)msg);
 }
 
+// Fixed ASCII prefixes and saved codes keep file errors valid UTF-8 across locales.
+static blorp_Result* blorp_file_errno_result(const char* prefix, int saved_errno) {
+    blorp_String* message = blorp_string_append_int(
+        blorp_string_create(prefix), saved_errno);
+    return blorp_result_err_owned(message);
+}
+
 blorp_Result* blorp_read_file(const blorp_String* path) {
     blorp_Result* path_err = NULL;
     char* cpath = blorp_os_cstring_or_null(path, "read_file", &path_err);
@@ -35114,32 +35121,41 @@ blorp_Result* blorp_read_file(const blorp_String* path) {
     free(cpath);
 
     if (fseek(f, 0, SEEK_END) != 0) {
+        int seek_errno = errno;
         fclose(f);
-        return blorp_result_err_cstr("read_file: non-seekable file");
+        return blorp_file_errno_result("read_file: seek end failed; errno=", seek_errno);
     }
     long len = ftell(f);
     if (len < 0) {
+        int tell_errno = errno;
         fclose(f);
-        return blorp_result_err_cstr("read_file: non-seekable file");
+        return blorp_file_errno_result("read_file: tell failed; errno=", tell_errno);
     }
     if (fseek(f, 0, SEEK_SET) != 0) {
+        int seek_errno = errno;
         fclose(f);
-        return blorp_result_err_cstr("read_file: seek failed");
+        return blorp_file_errno_result("read_file: seek start failed; errno=", seek_errno);
     }
 
     blorp_String* content = blorp_string_alloc_uninit(len, len);
     if (len > 0) {
         size_t n = fread(content->data, 1, (size_t)len, f);
         if (n != (size_t)len) {
+            int read_errno = errno;
+            bool io_failed = ferror(f) != 0;
             fclose(f);
             blorp_release(content);
+            if (io_failed) {
+                return blorp_file_errno_result("read_file: read failed; errno=", read_errno);
+            }
             return blorp_result_err_cstr("read_file: short read");
         }
     }
     content->data[len] = '\0';
     if (fclose(f) != 0) {
+        int close_errno = errno;
         blorp_release(content);
-        return blorp_result_err_cstr("read_file: close failed");
+        return blorp_file_errno_result("read_file: close failed; errno=", close_errno);
     }
 
     if (!blorp_utf8_is_valid((const unsigned char*)content->data, len)) {
@@ -35161,21 +35177,23 @@ blorp_Result* blorp_write_file(const blorp_String* path, const blorp_String* con
 
     FILE* f = blorp_runtime_fopen_cloexec(cpath, "wb");
     if (!f) {
-        blorp_Result* res = blorp_path_errno_result(path, cpath);
+        int open_errno = errno;
         free(cpath);
-        return res;
+        return blorp_file_errno_result("write_file: open failed; errno=", open_errno);
     }
     free(cpath);
 
     if (content && content->len > 0) {
         size_t n = fwrite(content->data, 1, (size_t)content->len, f);
         if (n != (size_t)content->len) {
+            int write_errno = errno;
             fclose(f);
-            return blorp_result_err_cstr("write_file: short write");
+            return blorp_file_errno_result("write_file: short write; errno=", write_errno);
         }
     }
     if (fclose(f) != 0) {
-        return blorp_result_err_cstr("write_file: close failed");
+        int close_errno = errno;
+        return blorp_file_errno_result("write_file: close failed; errno=", close_errno);
     }
 
     blorp_Result* res = blorp_result_ok(NULL);

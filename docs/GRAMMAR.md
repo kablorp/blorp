@@ -191,6 +191,10 @@ and comment text, only ASCII characters may appear; any other character is an
 unexpected character (`LEX:932-947`).
 `system.read_file` preserves valid UTF-8 bytes, including NUL, CRLF and BOM.
 Malformed file encoding returns Err before contents are published as a String.
+`system.read_file` and `system.write_file` report OS errors using fixed operation
+text and a numeric `errno=` code. Non-I/O short reads retain `read_file: short read`.
+Short transfers and `EINTR` fail without retry; close is attempted once and
+cleanup cannot replace an earlier operation failure.
 `system.get_current_directory` returns `Result[String, String]`, admitting only
 a nonempty absolute UTF-8 native pathname as `Ok`.
 
