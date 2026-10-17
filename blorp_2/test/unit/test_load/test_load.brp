@@ -6,14 +6,15 @@ import:
     ../../../src/parse/parse: ImportOrigin(RelativeImport, LibraryImport)
     ../../../src/utils/source:
         compiler_source, ModuleKind(UserModule, LibraryModule, FoundationTypesModule, FoundationPreludeModule),
-        SourceId, foundation_types_module_id, module_id, module_number, source_module, module_source, root_module_id, same_module, same_source
+        SourceId, foundation_types_module_id, module_id, module_source, root_module_id, same_module, same_source
     ../../../src/utils/syntax: Diagnostic
+    bytes: Bytes, bytes
     fs: IOError, message, resource_path, temporary_directory
     option: is_none, is_some
     ../../../src/utils/text: concat
-    string: starts_with
+    string: starts_with, to_bytes
     path as Path
-    system: mkdir, read_file, temp_dir, write_file
+    system: mkdir, read_file, temp_dir, write_bytes, write_file
     test: TestSuite
 
 
@@ -602,13 +603,19 @@ private func missing_foundation(directory: String, missing: String) -> Result[Bo
     else:
         write_module(lib, "_base.brp", TYPES)
     missing_path = Path.join(lib, missing)
+    expected_sources: List[SourceFile] = if missing == "_base.brp":
+        [{ path = root_path, contents = "func main() -> Int:\n    0\n" }]
+    else:
+        [{ path = root_path, contents = "func main() -> Int:\n    0\n" }, { path = present, contents = TYPES }]
     Ok(match load_program(root_path, lib):
         Ok(_): False
         Err(failure):
-            known_origin = match source_module(failure.diagnostic.span.source):
-                Some(id): failure.sources.modules.get(module_number(id)).is_some()
-                None: False
-            failure.diagnostic.message.starts_with("could not read module ".concat(missing_path)) and known_origin
+            (
+                failure.diagnostic.message.starts_with("could not read module ".concat(missing_path))
+                and same_source(failure.diagnostic.span.source, compiler_source())
+                and failure.diagnostic.span.start == 0 and failure.diagnostic.span.end == 0
+                and failure.sources.modules == expected_sources
+            )
     )
 
 
@@ -651,6 +658,31 @@ private func no_fallback(directory: String) -> Result[Bool, String]:
             (
                 failure.diagnostic.message.starts_with("could not read module ".concat(Path.join(lib, "absent.brp")))
                 and same_source(failure.diagnostic.span.source, module_source(root_module_id()))
+                and failure.diagnostic.span.start == 12 and failure.diagnostic.span.end == 26
+                and failure.sources.modules.length() == 3
+                and failure.sources.modules.get(0) == Some({ path = root_path, contents = root_source })
+                and not failure.sources.modules.any(func(file): file.path == Path.join(lib, "absent.brp"))
+            )
+    )
+
+
+private func invalid_utf8_documentation(directory: String) -> Result[Bool, String]:
+    lib ?= library(directory, "")
+    root_path = directory + "/main.brp"
+    source: Bytes = "---\n".to_bytes()
+        .append(bytes(1).set_index(0, 255))
+        .append("\n---\nfunc main() -> Int:\n    0\n".to_bytes())
+    written ?= write_bytes(root_path, source)
+    Ok(match load_program(root_path, lib):
+        Ok(_): False
+        Err(failure):
+            (
+                failure.sources.modules.is_empty()
+                and exact_error(
+                    failure.diagnostic, compiler_source(), 0, 0,
+                    "could not read module ".concat(root_path).concat(": read_file: invalid UTF-8; save the file as UTF-8, or use read_bytes for binary data"),
+                    "check the import path and provide a readable .brp file under its source root",
+                )
             )
     )
 
@@ -704,5 +736,6 @@ tests: TestSuite = {
         ("missing prelude has source path", func(): in_directory(func(dir): missing_foundation(dir, "prelude.brp"))),
         ("imported parse error retains bytes", func(): in_directory(imported_parse_error)),
         ("missing library module does not fall back", func(): in_directory(no_fallback)),
+        ("invalid UTF-8 documentation rejects before source publication", func(): in_directory(invalid_utf8_documentation)),
     ]
 }

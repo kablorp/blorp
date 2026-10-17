@@ -1,9 +1,10 @@
 -- Tests for read_file/read_bytes safety on non-seekable and edge-case files.
 import:
 	fs: IOError, resource_path, temporary_directory
-	process: ProcessCommand, ProcessExit(Exited), ProcessStream(NullStream), command, run_command
-	system: read_bytes, read_file, temp_dir, write_file
-	test: TestSuite
+	process:
+		ProcessCommand, ProcessExit(Exited), ProcessStream(NullStream), command, run, run_command
+	system: getcwd, getenv, read_bytes, read_file, temp_dir, write_file
+	test: TestSuite, run_suite_result
 	units: milliseconds
 
 
@@ -192,6 +193,77 @@ func test_read_empty_file() -> Bool:
 			False
 
 
+private func native_admission_case(executable: String, directory: String, name: String) -> Bool:
+	match run(
+		"/usr/bin/env",
+		["-u", "BLORP_LEAK_CHECK", "-u", "BLORP_MEMORY_STATS", executable, name, directory + "/input"],
+	):
+		Err(error):
+			print_error(error)
+			False
+		Ok(result):
+			passed = result.exit_code() == 0 and result.stdout() == "" and result.stderr() == ""
+			if not passed:
+				print_error("file admission " + name + ": " + result.exit_code().to_string() + " " + result.stderr())
+			passed
+
+
+private func native_admission_checks(directory: String) -> Result[Bool, String]:
+	executable = directory + "/read_file_admission"
+	compiled ?= run(
+		getenv("BLORP_CC").get_or("clang"),
+		[
+			"-std=gnu11", "-O0", "-DBLORP_MEMORY_DIAGNOSTICS=1",
+			"-fsanitize=address,undefined", "-fno-sanitize-recover=all", "-fno-omit-frame-pointer",
+			"-I" + getcwd() + "/blorp/src/lib/runtime/native",
+			"blorp/test/test_runtime/test_sys/fixtures/read_file_admission.c",
+			"-lm", "-lpthread", "-o", executable,
+		],
+	)
+	if compiled.exit_code() != 0:
+		Err("native file admission build failed: " + compiled.stderr())
+	else:
+		suite: TestSuite = {
+			description = "Native read_file UTF-8 admission",
+			tests = [
+				("missing-file Err exactly captures platform ENOENT", func(): native_admission_case(executable, directory, "open_errno")),
+				("malformed documentation is rejected before publication", func(): native_admission_case(executable, directory, "documentation")),
+				("isolated continuations and forbidden leads reject", func(): native_admission_case(executable, directory, "forbidden")),
+				("overlong encodings reject", func(): native_admission_case(executable, directory, "overlong")),
+				("surrogate encodings reject", func(): native_admission_case(executable, directory, "surrogate")),
+				("encodings above Unicode maximum reject", func(): native_admission_case(executable, directory, "above_max")),
+				("truncated multibyte encodings reject", func(): native_admission_case(executable, directory, "truncated")),
+				("bad continuation positions reject", func(): native_admission_case(executable, directory, "continuation")),
+				("counted NUL cannot hide invalid suffix", func(): native_admission_case(executable, directory, "after_nul")),
+				("empty contents keep the existing allocation budget", func(): native_admission_case(executable, directory, "empty")),
+				("valid counted contents and allocations are exact", func(): native_admission_case(executable, directory, "contents")),
+				("rejected contents free their unpublished staging object", func(): native_admission_case(executable, directory, "staging_free")),
+				("rejected contents close their file exactly once", func(): native_admission_case(executable, directory, "closed")),
+			]
+		}
+		result = run_suite_result(suite)
+		Ok(result[1] == 0)
+
+
+private func scoped_native_admission() -> Result[Bool, IOError]:
+	with directory ?= temporary_directory(temp_dir(), "blorp_read_file_admission_"):
+		match native_admission_checks(directory.resource_path()):
+			Ok(passed):
+				Ok(passed)
+			Err(error):
+				print_error(error)
+				Ok(False)
+
+
+func test_native_file_admission() -> Bool:
+	match scoped_native_admission():
+		Ok(passed):
+			passed
+		Err(error):
+			print_error(error.to_string())
+			False
+
+
 tests: TestSuite = {
 	description = "Read File Safety",
 	tests = [
@@ -203,5 +275,6 @@ tests: TestSuite = {
 		("read_bytes FIFO safety", test_read_bytes_fifo_returns_err),
 		("read normal file", test_read_normal_file),
 		("read empty file", test_read_empty_file),
+		("native UTF-8 admission and ownership", test_native_file_admission),
 	]
 }

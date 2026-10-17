@@ -4631,6 +4631,66 @@ static blorp_String* blorp_string_alloc_empty(long capacity) {
     return blorp_string_alloc_uninit(0, capacity);
 }
 
+/* RFC 3629 byte ranges; validate untrusted counted buffers before publication. */
+static bool blorp_utf8_is_valid(
+    const unsigned char* data,
+    long len
+) {
+    if (len < 0) return false;
+    long i = 0;
+    while (i < len) {
+        unsigned char byte = data[i];
+        if (byte <= 0x7f) {
+            i++;
+        } else if (byte >= 0xc2 && byte <= 0xdf) {
+            if (len - i < 2) return false;
+            if ((data[i + 1] & 0xc0) != 0x80) return false;
+            i += 2;
+        } else if (byte == 0xe0) {
+            if (len - i < 3) return false;
+            if (data[i + 1] < 0xa0 || data[i + 1] > 0xbf) return false;
+            if ((data[i + 2] & 0xc0) != 0x80) return false;
+            i += 3;
+        } else if (byte >= 0xe1 && byte <= 0xec) {
+            if (len - i < 3) return false;
+            if ((data[i + 1] & 0xc0) != 0x80) return false;
+            if ((data[i + 2] & 0xc0) != 0x80) return false;
+            i += 3;
+        } else if (byte == 0xed) {
+            if (len - i < 3) return false;
+            if (data[i + 1] < 0x80 || data[i + 1] > 0x9f) return false;
+            if ((data[i + 2] & 0xc0) != 0x80) return false;
+            i += 3;
+        } else if (byte >= 0xee && byte <= 0xef) {
+            if (len - i < 3) return false;
+            if ((data[i + 1] & 0xc0) != 0x80) return false;
+            if ((data[i + 2] & 0xc0) != 0x80) return false;
+            i += 3;
+        } else if (byte == 0xf0) {
+            if (len - i < 4) return false;
+            if (data[i + 1] < 0x90 || data[i + 1] > 0xbf) return false;
+            if ((data[i + 2] & 0xc0) != 0x80) return false;
+            if ((data[i + 3] & 0xc0) != 0x80) return false;
+            i += 4;
+        } else if (byte >= 0xf1 && byte <= 0xf3) {
+            if (len - i < 4) return false;
+            if ((data[i + 1] & 0xc0) != 0x80) return false;
+            if ((data[i + 2] & 0xc0) != 0x80) return false;
+            if ((data[i + 3] & 0xc0) != 0x80) return false;
+            i += 4;
+        } else if (byte == 0xf4) {
+            if (len - i < 4) return false;
+            if (data[i + 1] < 0x80 || data[i + 1] > 0x8f) return false;
+            if ((data[i + 2] & 0xc0) != 0x80) return false;
+            if ((data[i + 3] & 0xc0) != 0x80) return false;
+            i += 4;
+        } else {
+            return false;
+        }
+    }
+    return true;
+}
+
 // Create a mutable string from a dynamic buffer (NOT interned, NOT immortal).
 // Use this for runtime-built strings (to_string results, concatenation buffers, etc.)
 static blorp_String* blorp_string_from_buf(const char* buf, long len) {
@@ -16959,65 +17019,6 @@ static blorp_WebSocketVoidResult blorp_websocket_send_close_frame(
         payload);
 }
 
-static bool blorp_websocket_payload_is_valid_utf8(
-    const unsigned char* data,
-    long len
-) {
-    if (len < 0) return false;
-    long i = 0;
-    while (i < len) {
-        unsigned char byte = data[i];
-        if (byte <= 0x7f) {
-            i++;
-        } else if (byte >= 0xc2 && byte <= 0xdf) {
-            if (i + 1 >= len) return false;
-            if ((data[i + 1] & 0xc0) != 0x80) return false;
-            i += 2;
-        } else if (byte == 0xe0) {
-            if (i + 2 >= len) return false;
-            if (data[i + 1] < 0xa0 || data[i + 1] > 0xbf) return false;
-            if ((data[i + 2] & 0xc0) != 0x80) return false;
-            i += 3;
-        } else if (byte >= 0xe1 && byte <= 0xec) {
-            if (i + 2 >= len) return false;
-            if ((data[i + 1] & 0xc0) != 0x80) return false;
-            if ((data[i + 2] & 0xc0) != 0x80) return false;
-            i += 3;
-        } else if (byte == 0xed) {
-            if (i + 2 >= len) return false;
-            if (data[i + 1] < 0x80 || data[i + 1] > 0x9f) return false;
-            if ((data[i + 2] & 0xc0) != 0x80) return false;
-            i += 3;
-        } else if (byte >= 0xee && byte <= 0xef) {
-            if (i + 2 >= len) return false;
-            if ((data[i + 1] & 0xc0) != 0x80) return false;
-            if ((data[i + 2] & 0xc0) != 0x80) return false;
-            i += 3;
-        } else if (byte == 0xf0) {
-            if (i + 3 >= len) return false;
-            if (data[i + 1] < 0x90 || data[i + 1] > 0xbf) return false;
-            if ((data[i + 2] & 0xc0) != 0x80) return false;
-            if ((data[i + 3] & 0xc0) != 0x80) return false;
-            i += 4;
-        } else if (byte >= 0xf1 && byte <= 0xf3) {
-            if (i + 3 >= len) return false;
-            if ((data[i + 1] & 0xc0) != 0x80) return false;
-            if ((data[i + 2] & 0xc0) != 0x80) return false;
-            if ((data[i + 3] & 0xc0) != 0x80) return false;
-            i += 4;
-        } else if (byte == 0xf4) {
-            if (i + 3 >= len) return false;
-            if (data[i + 1] < 0x80 || data[i + 1] > 0x8f) return false;
-            if ((data[i + 2] & 0xc0) != 0x80) return false;
-            if ((data[i + 3] & 0xc0) != 0x80) return false;
-            i += 4;
-        } else {
-            return false;
-        }
-    }
-    return true;
-}
-
 static blorp_Bytes* blorp_websocket_copy_payload_bytes(
     const unsigned char* data,
     long len
@@ -17189,7 +17190,7 @@ blorp_websocket_decode_complete_server_frame(blorp_Bytes* frame) {
     const unsigned char* payload = frame->data + offset;
     switch (opcode) {
         case BLORP_WEBSOCKET_OPCODE_TEXT:
-            if (!blorp_websocket_payload_is_valid_utf8(
+            if (!blorp_utf8_is_valid(
                     payload,
                     payload_len)) {
                 return blorp_websocket_message_result_error(
@@ -17224,7 +17225,7 @@ blorp_websocket_decode_complete_server_frame(blorp_Bytes* frame) {
                     BLORP_WEBSOCKET_ERROR_PROTOCOL,
                     "invalid websocket close code");
             }
-            if (!blorp_websocket_payload_is_valid_utf8(
+            if (!blorp_utf8_is_valid(
                     payload + 2,
                     payload_len - 2)) {
                 return blorp_websocket_message_result_error(
@@ -35104,9 +35105,11 @@ blorp_Result* blorp_read_file(const blorp_String* path) {
 
     FILE* f = blorp_runtime_fopen_cloexec(cpath, "rb");
     if (!f) {
-        blorp_Result* res = blorp_path_errno_result(path, cpath);
+        int open_errno = errno;
         free(cpath);
-        return res;
+        blorp_String* message = blorp_string_append_int(
+            blorp_string_create("read_file: open failed; errno="), open_errno);
+        return blorp_result_err_owned(message);
     }
     free(cpath);
 
@@ -35137,6 +35140,13 @@ blorp_Result* blorp_read_file(const blorp_String* path) {
     if (fclose(f) != 0) {
         blorp_release(content);
         return blorp_result_err_cstr("read_file: close failed");
+    }
+
+    if (!blorp_utf8_is_valid((const unsigned char*)content->data, len)) {
+        blorp_release(content);
+        return blorp_result_err_cstr(
+            "read_file: invalid UTF-8; save the file as UTF-8, "
+            "or use read_bytes for binary data");
     }
 
     blorp_Result* res = blorp_result_ok((void*)content);

@@ -2077,6 +2077,8 @@ func main(args: List[String]) -> Int:
 failure value from the enclosing function. The enclosing function must return
 the same carrier type, and the success path must return `Some(...)` or
 `Ok(...)` explicitly.
+`read_file` returns Err for malformed UTF-8 and preserves valid contents exactly.
+`read_bytes` provides the separate binary-input API.
 
 ```blorp
 import:

@@ -189,6 +189,8 @@ return is not whitespace: it is reported as an unexpected character, so files
 with CRLF line endings are rejected (`LEX:920-947`). Outside string, character
 and comment text, only ASCII characters may appear; any other character is an
 unexpected character (`LEX:932-947`).
+`system.read_file` preserves valid UTF-8 bytes, including NUL, CRLF and BOM.
+Malformed file encoding returns Err before contents are published as a String.
 
 Columns are one-based. A tab advances the column to the next tab stop, and tab
 stops are every 4 columns: a tab at column `c` moves to column

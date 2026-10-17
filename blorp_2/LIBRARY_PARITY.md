@@ -37,8 +37,9 @@ The String contract is valid UTF-8 everywhere, retaining byte lengths and spans.
 Target-generated programs validate argv before argument-taking main; malformed
 encoding reports a fixed ASCII diagnostic and exits 1 after prefix cleanup.
 The internal `blorp_string_from_bytes` constructor requires already-valid UTF-8.
-Filesystem admission, checked slicing and legacy host argv/byte APIs remain
-pending. Target emission does not repair the host-built pilot's own argv/file IO.
+The [native file-admission pilot](BOOTSTRAP_SOURCE_PLAN.md#native-file-admission-pilot)
+covers host `read_file`. Target filesystem admission, checked slicing and legacy
+host argv/byte APIs remain pending.
 Error messages must also satisfy the invariant. No public Bytes or ASCII type
 is introduced.
 

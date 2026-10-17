@@ -749,9 +749,9 @@ as explicitly recorded in the parity table. No host trait enters target code.
   SourceId and an empty source inventory, not a fabricated module/file row.
   Validate native encoding before String publication; invalid UTF-8 returns Err.
 - **Read:** preserve valid UTF-8 contents exactly, including CRLF, BOM and NUL.
-  Malformed UTF-8 returns Err before publishing contents as a String. Its exact
-  diagnostic and failure priority belong to the read brief. Preserve malformed-input
-  coverage at this admission boundary.
+  Malformed UTF-8 returns Err before publishing contents as a String. The native
+  [file-admission pilot](BOOTSTRAP_SOURCE_PLAN.md#native-file-admission-pilot)
+  pins its diagnostic and priority. Preserve malformed-input coverage here.
   Reject NUL in a path before opening. Missing/unreadable input, incomplete reads
   and close failure return Err; clean up every opened handle. This increment
   needs stable source files, not arbitrary streams or concurrent snapshots.

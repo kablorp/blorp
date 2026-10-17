@@ -283,6 +283,59 @@ ownership contracts embedded. `--std-dir` supplies source, not native runtime.
 Validate that transition once, then freeze a single host/library/toolchain for
 each matched baseline/candidate comparison.
 
+### Native file-admission pilot
+
+Status: implemented and validated; native/broad/pilot gates passed.
+Frozen host cost input: `86777d833`, not the candidate source revision.
+
+`system.read_file(String) -> Result[String, String]` keeps its ABI. Preserve
+valid counted UTF-8 exactly: empty content, NUL, CRLF, BOM and noncharacters.
+Failed reads publish no row; preserve import sites or use compiler-source 0..0.
+The separate pre-read foundation-root-role placeholder remains deferred.
+Move the existing strict WebSocket predicate into the private native String
+section; reuse it for file admission and both original WebSocket callers.
+
+In `blorp_read_file`, after a complete read and successful close, insert:
+
+```c
+if (!blorp_utf8_is_valid((const unsigned char*)content->data, len)) {
+    blorp_release(content);
+    return blorp_result_err_cstr(
+        "read_file: invalid UTF-8; save the file as UTF-8, "
+        "or use read_bytes for binary data");
+}
+```
+
+Failure priority is path/open, existing seek/size/read checks, close, encoding.
+Preserve primary errors during cleanup. Only locale-derived open errors gain
+captured errno and fixed ASCII operation text, using existing String/decimal append.
+Other IO errors stay unchanged. No fixed buffer, byte repair or new representation.
+
+Blorp TestSuites own tests. An ordinary native C fixture directly includes the
+unchanged runtime, using existing Blorp compile/run and delegating observer
+patterns. Test strict UTF-8 classes/counting past NUL, exact valid contents,
+unchanged success allocations, rejected staging free, one close and fcntl-closed.
+The first semantic red calls existing public read_file, not a new private symbol.
+Use no new fault matrix or framework; existing IO/WebSocket suites remain gates.
+Prove three separate mutants: bypass admission, omit rejected-buffer release,
+omit close. Each intended named assertion fails; restore exact source and green.
+
+Atomically migrate the two discovery malformed-byte render/fixture tests to
+exact native-admission errors; preserve lexer coverage with valid UTF-8 inputs.
+Update library/public docs, parity and roadmap; adjacent String ingresses and
+target filesystem implementation remain separate.
+
+Ceilings: 110 added/+30 net production, +400 tests, +60 net documentation lines
+(53 for this pilot, 7 reserved for public contracts). No formatting compression.
+Supporting host O2 stage-2 self/small allocations: 289,944,211 / 1,758,813,
+unchanged; minimum retired instructions (3 samples): -0.08% / +0.22% (cap +0.5%).
+Common pin: `dev-0e1598ed616e`; Apple Clang 21.0.0 arm64.
+Both frozen C outputs match baseline; zero added success allocations.
+Host O2 fixpoint passed; all three host C outputs have SHA256:
+`7ee2f11069ec420ccf2f303b22a28d5e70747a939ec3ae2e6c0f1885ffe66641`.
+Raw C/JSON/pairs: `build/host-file-utf8/` in worktree `codex/host-utf8-file-admission`.
+Stop on a cap breach, source-epoch drift or need for another mechanism.
+
 ## Delivery order and parallel ownership
 
 1. **Scope and plan:** finish independent type/ownership and architecture review;
