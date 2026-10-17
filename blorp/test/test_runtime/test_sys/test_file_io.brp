@@ -1,7 +1,8 @@
 -- Test file I/O functions
 import:
 	bytes as B
-	system: read_bytes, read_file, remove_file, write_bytes, write_file
+	fs: IOError, resource_path, temporary_directory
+	system: file_exists, read_bytes, read_file, remove_file, temp_dir, write_bytes, write_file
 	test: TestSuite
 
 
@@ -15,6 +16,9 @@ tests: TestSuite = {
 		("read_bytes nonexistent returns Err", test_bytes_nonexistent),
 		("read_file rejects embedded NUL path", test_read_file_rejects_nul_path),
 		("write_file rejects embedded NUL path", test_write_file_rejects_nul_path),
+		("write_file counted overwrite and truncation", test_counted_overwrites),
+		("write_file missing parent has error content", test_missing_parent_error),
+		("write_file NUL path cannot create prefix file", test_nul_path_preserves_prefix),
 	]
 }
 
@@ -116,3 +120,62 @@ func test_write_file_rejects_nul_path() -> Bool:
 			msg.contains("embedded NUL")
 		Ok(_):
 			False
+
+
+private func scoped_output_case(check: (String) -> Bool) -> Result[Bool, IOError]:
+	with directory ?= temporary_directory(temp_dir(), "blorp_output_contract_"):
+		Ok(check(directory.resource_path()))
+
+
+private func output_case(check: (String) -> Bool) -> Bool:
+	match scoped_output_case(check):
+		Ok(passed): passed
+		Err(_): False
+
+
+private func write_exact_bytes(path: String, content: String, expected: List[Int]) -> Bool:
+	match write_file(path, content):
+		Err(_): False
+		Ok(_):
+			match read_bytes(path):
+				Err(_): False
+				Ok(actual):
+					var matches: Bool = B.length(actual) == expected.length()
+					var index: Int = 0
+					for value in expected:
+						matches = matches and check_byte(actual, index, value)
+						index += 1
+					matches
+
+
+func test_counted_overwrites() -> Bool:
+	output_case(func(directory: String):
+		path = directory + "/counted"
+		(
+			write_exact_bytes(
+				path, "prefix-é\0\r\nsuffix",
+				[112, 114, 101, 102, 105, 120, 45, 195, 169, 0, 13, 10, 115, 117, 102, 102, 105, 120],
+			)
+			and write_exact_bytes(path, "é\0\r\n", [195, 169, 0, 13, 10])
+			and write_exact_bytes(path, "", [])
+		)
+	)
+
+
+func test_missing_parent_error() -> Bool:
+	output_case(func(directory: String):
+		match write_file(directory + "/missing/output", "data"):
+			Err(message):
+				message.length() > 0 and B.decode_utf8(message.to_bytes()).is_some()
+			Ok(_): False
+	)
+
+
+func test_nul_path_preserves_prefix() -> Bool:
+	output_case(func(directory: String):
+		path = directory + "/prefix"
+		match write_file(path + "\0suffix", "data"):
+			Err(message):
+				message == "write_file: string contains embedded NUL" and not file_exists(path)
+			Ok(_): False
+	)

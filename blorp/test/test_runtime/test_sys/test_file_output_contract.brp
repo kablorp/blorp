@@ -1,0 +1,76 @@
+import:
+	fs: IOError, resource_path, temporary_directory
+	process: run
+	system: getcwd, getenv, temp_dir
+	test: TestSuite, run_suite_result
+
+
+private func native_output_case(executable: String, directory: String, name: String) -> Bool:
+	match run(
+		"/usr/bin/env",
+		["-u", "BLORP_LEAK_CHECK", "-u", "BLORP_MEMORY_STATS", executable, name, directory + "/output"],
+	):
+		Err(error):
+			print_error(error)
+			False
+		Ok(result):
+			passed = result.exit_code() == 0 and result.stdout() == "" and result.stderr() == ""
+			if not passed:
+				print_error("file output " + name + ": " + result.exit_code().to_string() + " " + result.stderr())
+			passed
+
+
+private func native_output_checks(directory: String) -> Result[Bool, String]:
+	executable = directory + "/file_output_contract"
+	compiled ?= run(
+		getenv("BLORP_CC").get_or("clang"),
+		[
+			"-std=gnu11", "-O0", "-DBLORP_MEMORY_DIAGNOSTICS=1",
+			"-fsanitize=address,undefined", "-fno-sanitize-recover=all", "-fno-omit-frame-pointer",
+			"-I" + getcwd() + "/blorp/src/lib/runtime/native",
+			"blorp/test/test_runtime/test_sys/fixtures/file_output_contract.c",
+			"-lm", "-lpthread", "-o", executable,
+		],
+	)
+	if compiled.exit_code() != 0:
+		Err("native file output build failed: " + compiled.stderr())
+	else:
+		suite: TestSuite = {
+			description = "Native file/output contract",
+			tests = [
+				("counted writes truncate exactly", func(): native_output_case(executable, directory, "counted_write")),
+				("short write closes descriptor and owns Err", func(): native_output_case(executable, directory, "short_write")),
+				("close failure returns owned Err", func(): native_output_case(executable, directory, "close_failure")),
+				("write error survives cleanup failure", func(): native_output_case(executable, directory, "write_close_failure")),
+				("fdopen failure closes actual descriptor", func(): native_output_case(executable, directory, "fdopen_failure")),
+				("empty stderr adds one LF", func(): native_output_case(executable, directory, "stderr_empty")),
+				("stderr preserves UTF-8", func(): native_output_case(executable, directory, "stderr_unicode")),
+				("stderr preserves internal and final LF", func(): native_output_case(executable, directory, "stderr_internal_lf")),
+				("stderr preserves counted NUL and CRLF", func(): native_output_case(executable, directory, "stderr_counted")),
+			]
+		}
+		result = run_suite_result(suite)
+		Ok(result[1] == 0)
+
+
+private func scoped_native_output() -> Result[Bool, IOError]:
+	with directory ?= temporary_directory(temp_dir(), "blorp_native_output_"):
+		match native_output_checks(directory.resource_path()):
+			Ok(passed): Ok(passed)
+			Err(error):
+				print_error(error)
+				Ok(False)
+
+
+func test_native_file_output() -> Bool:
+	match scoped_native_output():
+		Ok(passed): passed
+		Err(error):
+			print_error(error.to_string())
+			False
+
+
+tests: TestSuite = {
+	description = "File Output Contract",
+	tests = [("native write and stderr contracts", test_native_file_output)]
+}
