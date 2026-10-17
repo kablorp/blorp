@@ -352,9 +352,98 @@ static void test_equals_bytes(void) {
     assert_equality(first, sizeof first, second, sizeof second, 0);
 }
 
+static void assert_byte_at(const char *bytes, int64_t length, int64_t index,
+                           uint8_t status, int64_t expected) {
+    struct blorp_string *value = blorp_string_from_bytes(bytes, length);
+    const size_t allocations_before = allocation_count;
+    const size_t destructions_before = destruction_count;
+    const int64_t unchanged = -71;
+    int64_t result = unchanged;
+    assert(blorp_string_byte_at(value, index, &result) == status);
+    assert(result == (status ? expected : unchanged));
+    assert(atomic_load(&value->references) == 1);
+    assert(allocation_count == allocations_before);
+    assert(destruction_count == destructions_before);
+    assert_bytes(value, bytes, length);
+    blorp_string_release(value);
+    assert(destruction_count == destructions_before + 1);
+}
+
+static void test_byte_at_bounds(void) {
+    assert_byte_at("", 0, 0, 0, 0);
+    assert_byte_at("a", 1, -1, 0, 0);
+    assert_byte_at("a", 1, 1, 0, 0);
+    assert_byte_at("a", 1, INT64_MIN, 0, 0);
+    assert_byte_at("a", 1, INT64_MAX, 0, 0);
+    assert_byte_at("a", 1, INT64_C(4294967296), 0, 0);
+}
+
+static void test_byte_at_values(void) {
+    const char bytes[] = {(char)0xc3, (char)0xa9, '\0', 'z'};
+    assert_byte_at(bytes, sizeof bytes, 0, 1, 195);
+    assert_byte_at(bytes, sizeof bytes, 1, 1, 169);
+    assert_byte_at(bytes, sizeof bytes, 2, 1, 0);
+    assert_byte_at(bytes, sizeof bytes, 3, 1, 122);
+}
+
+static void test_from_codepoint_boundaries(void) {
+    const struct {
+        int64_t scalar;
+        unsigned char bytes[4];
+        int64_t length;
+    } cases[] = {
+        {0, {0}, 1}, {0x7f, {0x7f}, 1},
+        {0x80, {0xc2, 0x80}, 2}, {0x7ff, {0xdf, 0xbf}, 2},
+        {0x800, {0xe0, 0xa0, 0x80}, 3}, {0xd7ff, {0xed, 0x9f, 0xbf}, 3},
+        {0xe000, {0xee, 0x80, 0x80}, 3}, {0xfdd0, {0xef, 0xb7, 0x90}, 3},
+        {0xfffe, {0xef, 0xbf, 0xbe}, 3}, {0xffff, {0xef, 0xbf, 0xbf}, 3},
+        {0x10000, {0xf0, 0x90, 0x80, 0x80}, 4},
+        {0x1f600, {0xf0, 0x9f, 0x98, 0x80}, 4},
+        {0x10fffe, {0xf4, 0x8f, 0xbf, 0xbe}, 4},
+        {0x10ffff, {0xf4, 0x8f, 0xbf, 0xbf}, 4}
+    };
+    for (size_t index = 0; index < sizeof cases / sizeof cases[0]; index++) {
+        const size_t allocations_before = allocation_count;
+        const size_t destructions_before = destruction_count;
+        struct blorp_string *result = NULL;
+        assert(blorp_string_from_codepoint(cases[index].scalar, &result) == 1);
+        assert(result != NULL);
+        assert_bytes(result, (const char *)cases[index].bytes, cases[index].length);
+        assert(atomic_load(&result->references) == 1);
+        assert(allocation_count == allocations_before + 1);
+        assert(destruction_count == destructions_before);
+        blorp_string_release(result);
+        assert(destruction_count == destructions_before + 1);
+    }
+}
+
+static void test_from_codepoint_invalid(void) {
+    const int64_t cases[] = {INT64_MIN, -1, 0xd800, 0xdfff, 0x110000, INT64_C(4294967361), INT64_MAX};
+    struct blorp_string *sentinel = blorp_string_from_bytes("kept", 4);
+    const size_t allocations_before = allocation_count;
+    const size_t destructions_before = destruction_count;
+    for (size_t index = 0; index < sizeof cases / sizeof cases[0]; index++) {
+        struct blorp_string *result = sentinel;
+        assert(blorp_string_from_codepoint(cases[index], &result) == 0);
+        assert(result == sentinel);
+        assert(allocation_count == allocations_before);
+        assert(destruction_count == destructions_before);
+    }
+    assert_bytes(sentinel, "kept", 4);
+    blorp_string_release(sentinel);
+}
+
 int main(int argc, char **argv) {
     assert(argc == 2);
-    if (strcmp(argv[1], "equals_empty") == 0) {
+    if (strcmp(argv[1], "byte_at_bounds") == 0) {
+        test_byte_at_bounds();
+    } else if (strcmp(argv[1], "byte_at_values") == 0) {
+        test_byte_at_values();
+    } else if (strcmp(argv[1], "from_codepoint_boundaries") == 0) {
+        test_from_codepoint_boundaries();
+    } else if (strcmp(argv[1], "from_codepoint_invalid") == 0) {
+        test_from_codepoint_invalid();
+    } else if (strcmp(argv[1], "equals_empty") == 0) {
         assert_equality("", 0, "", 0, 1);
     } else if (strcmp(argv[1], "equals_same") == 0) {
         assert_equality("same", 4, "same", 4, 1);

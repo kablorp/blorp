@@ -1,0 +1,99 @@
+import:
+	../../../src/check/check: check
+	../../../src/lower/lower as Lower
+	../../../src/own/own as Own
+	../../../src/specialize/specialize as Concrete
+	../../../src/utils/syntax: entry_function
+	../../../src/utils/text: concat
+	../input: setup_diagnostic
+	../module_input: parse_modules
+	int as IntOps
+	test: TestSuite
+
+
+private pure func encoded_child_escapes(function: Own.OwnedFunction) -> Bool:
+	match (function.operations, function.tail):
+		([Own.DefineValue(_), Own.DefineValue(parent)], Own.MatchTail(matched)):
+			match parent.result:
+				Own.OwnedResult(parent_owner):
+					matched.arms.any(pure func(arm):
+						match (arm.operations, arm.exit):
+							([Own.DefineValue(payload), Own.AcquireOwner(child_owner, borrow, _), Own.DropOwner(dropped, _)], Own.ReturnResult(Own.OwnedReturn(returned, transferred))):
+								match (payload.operation, borrow.source):
+									(Own.PayloadDefinition(_, source), Own.PayloadBorrow(borrowed_parent)):
+										(
+											Concrete.same_type(payload.value_type, Concrete.StringType)
+											and IntOps.equals(Lower.value_number(source), Lower.value_number(parent.id))
+											and IntOps.equals(Lower.value_number(borrowed_parent), Lower.value_number(parent.id))
+											and IntOps.equals(Lower.value_number(borrow.value), Lower.value_number(payload.id))
+											and IntOps.equals(Lower.value_number(returned), Lower.value_number(payload.id))
+											and IntOps.equals(Own.owner_number(dropped), Own.owner_number(parent_owner))
+											and IntOps.equals(Own.owner_number(transferred), Own.owner_number(child_owner))
+										)
+									_:
+										False
+							_:
+								False
+					)
+				_:
+					False
+		_:
+			False
+
+
+func test_from_codepoint_owns_its_option_and_escaping_string() -> Bool:
+	source: String =
+		|pure func encode(value: Int) -> Option[String]:
+		|    builtin("string.from_codepoint")
+		|pure func text() -> String:
+		|    match encode(233):
+		|        Some(value): value
+		|        None: "failure"
+		|func main() -> Int:
+		|    unused = encode(128512)
+		|    unused_text = text()
+		|    0
+		|
+
+	match (
+		parse_modules([{ source = source, targets = [] }])
+			.and_then(pure func(parsed): check(parsed).map_err(setup_diagnostic))
+			.and_then(pure func(program): Concrete.specialize(program))
+			.and_then(pure func(program): Lower.lower(program))
+			.and_then(pure func(program): Own.own(program))
+	):
+		Err(error):
+			print_error(error.message)
+			print_error(error.help)
+			print_error(IntOps.to_string(error.span.start).concat("..").concat(IntOps.to_string(error.span.end)))
+			False
+		Ok(program):
+			match program.functions.get(Concrete.function_number(entry_function(program.entrypoint))):
+				Some(main):
+					match main.operations:
+						[Own.DefineValue(_), Own.DefineValue(encoded), Own.DropOwner(dropped, _), Own.DefineValue(_), Own.DropOwner(_, _), Own.DefineValue(_)]:
+							match (encoded.value_type, encoded.result):
+								(Concrete.UnionType(owner), Own.OwnedResult(obligation)):
+									match program.unions.get(Concrete.union_number(owner)):
+										Some(layout):
+											match (layout.variants, layout.representation):
+												([[Concrete.StringType], []], Concrete.InlineOwningPayload):
+													IntOps.equals(Own.owner_number(dropped), Own.owner_number(obligation)) and program.functions.any(encoded_child_escapes)
+												_:
+													False
+										None:
+											False
+								_:
+									False
+						_:
+							False
+				None:
+					False
+
+
+tests: TestSuite = {
+	description = "Blorp 2 String scalar encoding ownership",
+	tests = [
+		("from_codepoint owns Option[String] and its escaping child", test_from_codepoint_owns_its_option_and_escaping_string),
+	]
+}

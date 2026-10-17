@@ -1770,6 +1770,30 @@ Specialization translates the designated constructors to the result instance's
 constructor identities, and emission receives those directly. The verifier
 sees instances, not declarations, and deliberately does not repeat that check.
 
+## Integer-facing String operations
+
+The target `string` module provides two pure operations with ordinary foundation
+Option results:
+
+```blorp
+pure func byte_at(value: String, index: Int) -> Option[Int]:
+    builtin("string.byte_at")
+pure func from_codepoint(value: Int) -> Option[String]:
+    builtin("string.from_codepoint")
+```
+
+Indices and lengths count UTF-8 bytes. `byte_at("é", 1)` returns `Some(169)`;
+negative or out-of-bounds indices return None. Reading borrows the String and
+allocates nothing. A NUL byte returns `Some(0)`.
+
+`from_codepoint` accepts Unicode scalars, including NUL and noncharacters, and
+returns one fresh String. It rejects negative Int64 values, surrogates
+U+D800–U+DFFF and values above U+10FFFF before narrowing. Some owns the String:
+ordinary matching, copying and destruction preserve its lifetime. The
+[ownership fixture](test/e2e/fixtures/option_input/from_codepoint_ownership.brp)
+returns a String through a Some-pattern and separately discards an encoded result.
+Host interface publication and source Char migration remain separate work.
+
 ## Float64 calculator
 
 The designated foundation `_base.brp` owns `Float`, a binary64 unmanaged value. Decimal source

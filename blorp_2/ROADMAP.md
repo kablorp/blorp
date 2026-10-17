@@ -98,7 +98,7 @@ passed the audited toolchain's default limits through depth 256.
 | [M2b](#m2b-pattern-compilation) | Qualified flat heads and non-binding constructor groups | Not started. Nested/list/literal source-pattern migration has bounded decision gates. |
 | [M3](#m3-loops-and-tail-recursion) | Managed List/while loops, explicit exits and existing scalar TCO | Not started. Source flat recursion/ranges become loops; broader managed TCO deferred. |
 | [M4](#m4-recursive-types) | Existing unary/mixed recursive shapes plus ordinary opaque semantics | Steps 1/2a done. Opaque completion remains. No current source witness requires unlanded 2b/2c. |
-| [M6](#m6-library-and-shell) | First-order library parity, integer-facing String APIs and seven shell/path functions | Not started. Target Char/Bytes are not planned prerequisites after source migration. |
+| [M6](#m6-library-and-shell) | First-order library parity, integer-facing String APIs and seven shell/path functions | String byte/scalar APIs implemented and validated; source migration, remaining library and shell/path work pending. Target Char/Bytes are not planned prerequisites after source migration. |
 | [M7](#m7-lambdas) | Broader language function types/lambdas | Source-removal pilots precede any retirement of this bootstrap dependency. |
 | [M8](#m8-the-fixpoint-gate) | Fixpoint gate | Not started. |
 
@@ -683,13 +683,23 @@ language extensions with no current bootstrap witness.
 
 ## M6: library and shell
 
+**Status.** Reviewed acceptance of matching host/target `string.byte_at` and
+`string.from_codepoint` interfaces. Target phase/native ownership tests, six mutations,
+the full 456-case e2e gate and 3,640 matched cost calls pass hard ceilings.
+The [API report](../benchmarks/results/blorp_2_string_integer_apis_2026-10-16.md)
+retains all 105 allocation misses of the +5% target (maximum +5.62%); normal
+instructions stay within +5%. Implementation, cost and documentation reviews are
+complete.
+Source Char/classification migration, slicing, remaining library and shell/path
+work are separate; this does not complete M6.
+
 **Goal.** The real compiler source loads and checks against the real temporary
 library, with no remaining required parity row missing. Use the reduced resolved
 dependency inventory after source migration, not the old callback/Char rows.
 
 **Scope.** Existing Int/Float/String/List representation and machine operations;
 remaining first-order numeric comparisons/classification; ordinary Option/Result
-helpers; byte-exact String operations; and the shell/path surface below. New
+helpers; byte-exact String operations; and the shell/path surface below. Implemented
 `string.byte_at -> Option[Int]` and `string.from_codepoint -> Option[String]`
 avoid target Char/Bytes. Strings contain valid UTF-8; byte observation retains
 byte coordinates, and scalar encoding validates before narrowing. Planned
@@ -714,7 +724,7 @@ pure func starts_with(text: String, prefix: String) -> Bool:
 **Char status.** Preserve the reviewed [Char plan](CHAR_PLAN.md) and its held
 extraction candidate as future language work. It is not the active bootstrap
 route. The compiler's 72 ASCII literals, 14 Char patterns and Char API consumers
-are migrated explicitly; input UTF-8 support is retained.
+remain to be migrated explicitly; input UTF-8 support is retained.
 
 ### Seven shell and path functions
 

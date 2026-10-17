@@ -8,9 +8,12 @@ import:
 	../../../src/namespace/builtins as Builtins
 	../../../src/utils/source: module_source, root_module_id, same_source
 	../../../src/specialize/specialize as Concrete
-	../../../src/utils/syntax: Diagnostic, ParsedRuntimeOperation(StringParseIntBuiltin, ListGetBuiltin)
+	../../../src/utils/syntax: Diagnostic, ParsedRuntimeOperation(StringParseIntBuiltin, ListGetBuiltin, StringByteAtBuiltin, StringFromCodepointBuiltin), same_span
+	../../../src/utils/text: concat
 	../input: setup_diagnostic
 	../module_input: parse_modules
+	../string_integer_inputs: STRING_INTEGER_SOURCE, BYTE_LABEL_START, ENCODER_LABEL_START
+	int as IntOps
 	test: TestSuite
 
 
@@ -264,9 +267,173 @@ pure func test_pure_caller_can_invoke_list_get_wrapper() -> Bool:
 
 
 
+private BYTE_HELP: String = "declare a pure nongeneric function with String and Int parameters returning Option[Int]"
+private ENCODER_HELP: String = "declare a pure nongeneric function with one Int parameter returning Option[String]"
+
+
+private pure func rejects_string_api(header: String, label: String, operation: ParsedRuntimeOperation, help: String) -> Bool:
+	prefix = header.concat("\n    builtin(")
+	quoted = "\"".concat(label).concat("\"")
+	match rejected(prefix.concat(quoted).concat(")\n").concat(MAIN)):
+		None: False
+		Some(failure):
+			kind_matches = match (check_errors(failure).first.kind, operation):
+				(Errors.BuiltinRejection(Errors.BuiltinContractMismatch(StringByteAtBuiltin)), StringByteAtBuiltin) | (Errors.BuiltinRejection(Errors.BuiltinContractMismatch(StringFromCodepointBuiltin)), StringFromCodepointBuiltin): True
+				_: False
+			kind_matches and rendered_is(failure, prefix.length(), IntOps.add(prefix.length(), quoted.length()), "builtin declaration does not match its runtime contract", help)
+
+
+pure func test_string_integer_builtins_require_purity() -> Bool:
+	(
+		rejects_string_api("func read(value: String, index: Int) -> Option[Int]:", "string.byte_at", StringByteAtBuiltin, BYTE_HELP)
+		and rejects_string_api("func encode(value: Int) -> Option[String]:", "string.from_codepoint", StringFromCodepointBuiltin, ENCODER_HELP)
+	)
+
+pure func test_string_integer_builtins_require_exact_arity() -> Bool:
+	(
+		rejects_string_api("pure func read(value: String) -> Option[Int]:", "string.byte_at", StringByteAtBuiltin, BYTE_HELP)
+		and rejects_string_api("pure func encode() -> Option[String]:", "string.from_codepoint", StringFromCodepointBuiltin, ENCODER_HELP)
+		and rejects_string_api("pure func read(value: String, index: Int, extra: Int) -> Option[Int]:", "string.byte_at", StringByteAtBuiltin, BYTE_HELP)
+		and rejects_string_api("pure func encode(value: Int, extra: Int) -> Option[String]:", "string.from_codepoint", StringFromCodepointBuiltin, ENCODER_HELP)
+	)
+
+pure func test_string_integer_builtins_require_parameter_types() -> Bool:
+	(
+		rejects_string_api("pure func read(value: Int, index: Int) -> Option[Int]:", "string.byte_at", StringByteAtBuiltin, BYTE_HELP)
+		and rejects_string_api("pure func read(value: String, index: String) -> Option[Int]:", "string.byte_at", StringByteAtBuiltin, BYTE_HELP)
+		and rejects_string_api("pure func encode(value: String) -> Option[String]:", "string.from_codepoint", StringFromCodepointBuiltin, ENCODER_HELP)
+	)
+
+pure func test_string_integer_builtins_require_payload_types() -> Bool:
+	(
+		rejects_string_api("pure func read(value: String, index: Int) -> Option[Float]:", "string.byte_at", StringByteAtBuiltin, BYTE_HELP)
+		and rejects_string_api("pure func encode(value: Int) -> Option[Int]:", "string.from_codepoint", StringFromCodepointBuiltin, ENCODER_HELP)
+	)
+
+pure func test_string_integer_builtins_reject_generic_headers() -> Bool:
+	(
+		rejects_string_api("pure func read[T](value: String, index: Int) -> Option[Int]:", "string.byte_at", StringByteAtBuiltin, BYTE_HELP)
+		and rejects_string_api("pure func encode[T](value: Int) -> Option[String]:", "string.from_codepoint", StringFromCodepointBuiltin, ENCODER_HELP)
+	)
+
+pure func test_string_integer_builtins_reject_same_shaped_ordinary_unions() -> Bool:
+	declaration = "fixed union Maybe[T]:\n    Present(T)\n    Missing\n"
+	(
+		rejects_string_api(declaration.concat("pure func read(value: String, index: Int) -> Maybe[Int]:"), "string.byte_at", StringByteAtBuiltin, BYTE_HELP)
+		and rejects_string_api(declaration.concat("pure func encode(value: Int) -> Maybe[String]:"), "string.from_codepoint", StringFromCodepointBuiltin, ENCODER_HELP)
+	)
+
+
+pure func test_encoder_checked_result_carries_designated_string_option() -> Bool:
+	match checked(STRING_INTEGER_SOURCE):
+		Err(_): False
+		Ok(program):
+			match checked_functions(program).functions.get(1):
+				Some(function):
+					match (function.signature.return_type.value_type, function.body):
+						(Model.AppliedUnionType(owner, [Model.StringType]), Model.CheckedValueBody(Model.ReturnExpression(value))):
+							match value.form:
+								Model.InvokeFunction(call, [argument]):
+									match call.target:
+										Model.RuntimeFunction(Builtins.StringFromCodepoint(option)):
+											(
+												Model.same_type(argument.value_type, Model.IntType)
+												and IntOps.equals(union_number(variant_owner(option.some)), union_number(owner))
+												and IntOps.equals(union_number(variant_owner(option.none)), union_number(owner))
+												and IntOps.equals(variant_number(option.some), 0)
+												and IntOps.equals(variant_number(option.none), 1)
+											)
+										_: False
+								_: False
+						_: False
+				None: False
+
+
+private pure func concrete_option_matches(option: Builtins.DesignatedOption[Concrete.VariantInstanceId], value_type: Concrete.TypeRef) -> Bool:
+	match value_type:
+		Concrete.UnionType(owner):
+			(
+				IntOps.equals(Concrete.union_number(Concrete.variant_owner(option.some)), Concrete.union_number(owner))
+				and IntOps.equals(Concrete.union_number(Concrete.variant_owner(option.none)), Concrete.union_number(owner))
+				and IntOps.equals(Concrete.variant_number(option.some), 0)
+				and IntOps.equals(Concrete.variant_number(option.none), 1)
+			)
+		_: False
+
+
+pure func test_string_integer_specialization_preserves_constructors_and_layouts() -> Bool:
+	match checked(STRING_INTEGER_SOURCE).and_then(pure func(program): Concrete.specialize(program)):
+		Err(_): False
+		Ok(program):
+			contents = Concrete.specialized_contents(program)
+			match contents.functions:
+				[_, byte, encoder]:
+					match (byte.body, encoder.body):
+						(Concrete.ConcreteValueBody(Concrete.ReturnExpression(byte_value)), Concrete.ConcreteValueBody(Concrete.ReturnExpression(encoded))):
+							match (byte_value.form, encoded.form):
+								(Concrete.InvokeFunction(byte_call, [_, _]), Concrete.InvokeFunction(encoder_call, [_])):
+									match (byte_call.target, encoder_call.target):
+										(Concrete.RuntimeFunction(Builtins.StringByteAt(byte_option)), Concrete.RuntimeFunction(Builtins.StringFromCodepoint(string_option))):
+											match (contents.unions.get(Concrete.union_number(Concrete.variant_owner(byte_option.some))), contents.unions.get(Concrete.union_number(Concrete.variant_owner(string_option.some)))):
+												(Some(byte_layout), Some(string_layout)):
+													match (byte_layout.variants, byte_layout.representation, string_layout.variants, string_layout.representation):
+														([[Concrete.IntType], []], Concrete.InlineUnmanaged, [[Concrete.StringType], []], Concrete.InlineOwningPayload):
+															concrete_option_matches(byte_option, byte.signature.return_type) and concrete_option_matches(string_option, encoder.signature.return_type)
+														_: False
+												_: False
+										_: False
+								_: False
+						_: False
+				_: False
+
+
+pure func test_string_integer_lowering_preserves_operands_constructors_and_spans() -> Bool:
+	match checked(STRING_INTEGER_SOURCE).and_then(pure func(program): Concrete.specialize(program)).and_then(pure func(program): Lower.lower(program)):
+		Err(_): False
+		Ok(program):
+			match Lower.lowered_functions(program).functions:
+				[_, byte, encoder]:
+					match (byte.definitions, encoder.definitions, byte.tail, encoder.tail):
+						([text, index, byte_result], [scalar, encoded], Lower.ExitValue(Lower.ReturnValue(byte_return)), Lower.ExitValue(Lower.ReturnValue(encoder_return))):
+							match ((text.operation, index.operation, scalar.operation), byte_result.operation, encoded.operation):
+								((Lower.ParameterValue(0), Lower.ParameterValue(1), Lower.ParameterValue(0)), Lower.CallValue(byte_call, [text_arg, index_arg]), Lower.CallValue(encoder_call, [scalar_arg])):
+									match (byte_call.target, encoder_call.target):
+										(Concrete.RuntimeFunction(Builtins.StringByteAt(byte_option)), Concrete.RuntimeFunction(Builtins.StringFromCodepoint(string_option))):
+											(
+												IntOps.equals(Lower.value_number(text_arg), Lower.value_number(text.id))
+												and IntOps.equals(Lower.value_number(index_arg), Lower.value_number(index.id))
+												and IntOps.equals(Lower.value_number(scalar_arg), Lower.value_number(scalar.id))
+												and IntOps.equals(Lower.value_number(byte_return), Lower.value_number(byte_result.id))
+												and IntOps.equals(Lower.value_number(encoder_return), Lower.value_number(encoded.id))
+												and concrete_option_matches(byte_option, byte_result.value_type)
+												and concrete_option_matches(string_option, encoded.value_type)
+												and same_span(byte_call.span, byte_result.span)
+												and same_span(encoder_call.span, encoded.span)
+												and same_source(byte_call.span.source, module_source(root_module_id()))
+												and same_source(encoder_call.span.source, module_source(root_module_id()))
+												and IntOps.equals(byte_call.span.start, BYTE_LABEL_START)
+												and IntOps.equals(byte_call.span.end, IntOps.add(BYTE_LABEL_START, "\"string.byte_at\"".length()))
+												and IntOps.equals(encoder_call.span.start, ENCODER_LABEL_START)
+												and IntOps.equals(encoder_call.span.end, IntOps.add(ENCODER_LABEL_START, "\"string.from_codepoint\"".length()))
+											)
+										_: False
+								_: False
+						_: False
+				_: False
+
+
 tests: TestSuite = {
 	description = "Blorp 2 designated Option builtin contracts",
 	tests = [
+		("String integer builtins require purity", test_string_integer_builtins_require_purity),
+		("String integer builtins require exact arity", test_string_integer_builtins_require_exact_arity),
+		("String integer builtins require parameter types", test_string_integer_builtins_require_parameter_types),
+		("String integer builtins require payload types", test_string_integer_builtins_require_payload_types),
+		("String integer builtins reject generic headers", test_string_integer_builtins_reject_generic_headers),
+		("String integer builtins require the designated Option", test_string_integer_builtins_reject_same_shaped_ordinary_unions),
+		("checked encoder carries designated String Option", test_encoder_checked_result_carries_designated_string_option),
+		("String integer specialization preserves constructors and layouts", test_string_integer_specialization_preserves_constructors_and_layouts),
+		("String integer lowering preserves operands constructors and spans", test_string_integer_lowering_preserves_operands_constructors_and_spans),
 		("checked parse carries designated Option constructors", test_checked_parse_carries_the_designated_option_constructors),
 		("specialization translates Option constructors to concrete layout", test_specialization_translates_option_constructors_to_one_concrete_layout),
 		("lowering preserves input and Option constructors", test_lowering_preserves_borrow_input_and_option_constructors),
