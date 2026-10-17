@@ -1809,6 +1809,21 @@ Both Result branches own their String; matching, copying, discarding and
 existing union ownership rules. Loader migration and remaining M6 shell work
 remain pending.
 
+## File reading
+
+Import `system: read_file` for impure
+`read_file(path: String) -> Result[String, String]`; see the
+[complete program](test/e2e/fixtures/file_read/basic.brp).
+Success owns exact counted UTF-8 contents, preserving empty files, CRLF, BOM
+and embedded NUL. Stable regular files are supported; streams and concurrent
+snapshots are outside this contract. NUL paths reject before opening.
+IO failures return saved numeric errno text; short reads and malformed UTF-8
+return useful fixed text. The target advises saving malformed files as UTF-8;
+`read_bytes` is unavailable. Read errors take precedence over close errors,
+and close errors over encoding errors. Every opened stream receives one close
+attempt, including EINTR, without retry. Nothing is printed. Both Result branches own
+one fresh String under ordinary union ownership. Loader migration remains pending.
+
 ## Float64 calculator
 
 The designated foundation `_base.brp` owns `Float`, a binary64 unmanaged value. Decimal source

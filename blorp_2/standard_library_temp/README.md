@@ -83,3 +83,7 @@ available. A module offers only the types it declares, so `int: Int` is
 rejected and `int: Int methods_only` uses `int`'s functions on Int; no module
 reexports another module's types or methods. The prelude is a compiler input and
 cannot be imported explicitly.
+
+The system adapter also publishes impure `read_file(String) -> Result[String, String]`.
+Its counted UTF-8 contract and target-only encoding help are documented in
+[File reading](../README.md#file-reading); source loader migration remains pending.

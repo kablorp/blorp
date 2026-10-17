@@ -1,0 +1,128 @@
+import:
+	../../../src/lower/lower as Lower
+	../../../src/own/own as Own
+	../../../src/specialize/specialize as Concrete
+	../../../src/utils/source: same_source
+	../../../src/utils/syntax: entry_function
+	../file_read_inputs: FILE_READ_SOURCE, file_read_seed, file_read_seed_from_source
+	../module_input: TEST_BASE
+	test: TestSuite
+
+
+pure func test_native_result_returns_its_single_owner() -> Bool:
+	match file_read_seed(TEST_BASE):
+		Err(_): False
+		Ok(seed):
+			match Own.insert_function(seed.query, Lower.lowered_functions(seed.lowered).unions, []):
+				Err(_): False
+				Ok(function):
+					match (function.operations, function.tail):
+						([Own.DefineValue(_), Own.DefineValue(result)], Own.ReturnTail(Own.ReturnResult(Own.OwnedReturn(value, transferred)))):
+							match result.result:
+								Own.OwnedResult(owner):
+									Own.owner_number(owner) == Own.owner_number(transferred) and Lower.value_number(result.id) == Lower.value_number(value)
+								_: False
+						_: False
+
+
+pure func test_both_result_payloads_acquire_before_parent_drop() -> Bool:
+	match file_read_seed(TEST_BASE):
+		Err(_): False
+		Ok(seed):
+			match Own.own(seed.lowered).map(pure func(program): program.functions.get(Concrete.function_number(seed.escape))):
+				Ok(Some(escaped)):
+					match (escaped.operations, escaped.tail):
+						([Own.DefineValue(_), Own.DefineValue(parent)], Own.MatchTail(matched)):
+							match parent.result:
+								Own.OwnedResult(parent_owner):
+									matched.arms.length() == 2 and matched.arms.all(pure func(arm):
+										match (arm.operations, arm.exit):
+											([Own.DefineValue(child), Own.AcquireOwner(owner, borrow, _), Own.DropOwner(dropped, _)], Own.ReturnResult(Own.OwnedReturn(value, returned))):
+												match (child.result, borrow.source):
+													(Own.BorrowedResult(Own.PayloadBorrow(source)), Own.PayloadBorrow(borrowed)):
+														(
+															Lower.value_number(source) == Lower.value_number(parent.id)
+															and Lower.value_number(borrowed) == Lower.value_number(parent.id)
+															and Lower.value_number(borrow.value) == Lower.value_number(child.id)
+															and Lower.value_number(value) == Lower.value_number(child.id)
+															and Own.owner_number(dropped) == Own.owner_number(parent_owner)
+															and Own.owner_number(owner) == Own.owner_number(returned)
+														)
+													_: False
+											_: False
+									)
+								_: False
+						_: False
+				_: False
+
+
+private pure func owned_main(source: String) -> Option[Own.OwnedFunction]:
+	match file_read_seed_from_source(source, TEST_BASE).and_then(pure func(seed): Own.own(seed.lowered)):
+		Err(_): None
+		Ok(program): program.functions.get(Concrete.function_number(entry_function(program.entrypoint)))
+
+
+pure func test_unused_result_drops_its_owner_once() -> Bool:
+	match owned_main(FILE_READ_SOURCE):
+		Some(main):
+			match main.operations.get(1):
+				Some(Own.DefineValue(unused)):
+					match unused.result:
+						Own.OwnedResult(owner):
+							main.operations.filter(pure func(operation):
+								match operation:
+									Own.DropOwner(dropped, _): Own.owner_number(dropped) == Own.owner_number(owner)
+									_: False
+							).length() == 1
+						_: False
+				_: False
+		None: False
+
+
+pure func test_duplicate_results_acquire_distinct_stored_owners() -> Bool:
+	source = FILE_READ_SOURCE.replace("    escaped = escape(\"input\")\n", "    escaped = escape(\"input\")\n    copies = [unused, unused]\n")
+	match owned_main(source):
+		None: False
+		Some(main):
+			main.operations.any(pure func(operation):
+				match operation:
+					Own.DefineValue(definition):
+						match definition.operation:
+							Own.ConstructListDefinition([Own.OwnedPayload(first, first_owner), Own.OwnedPayload(second, second_owner)]):
+								(Lower.value_number(first) == Lower.value_number(second)
+									and Own.owner_number(first_owner) != Own.owner_number(second_owner))
+							_: False
+					_: False
+			)
+
+
+pure func test_path_operand_is_borrowed_without_acquire_or_drop() -> Bool:
+	match file_read_seed(TEST_BASE):
+		Err(_): False
+		Ok(seed):
+			match Own.insert_function(seed.query, Lower.lowered_functions(seed.lowered).unions, []):
+				Err(_): False
+				Ok(function):
+					match function.operations:
+						[Own.DefineValue(parameter), Own.DefineValue(result)]:
+							match (result.operation, result.result):
+								(Own.CallDefinition(call, [Own.BorrowedArgument(path)]), Own.OwnedResult(_)):
+									(
+										Lower.value_number(parameter.id) == Lower.value_number(path.value)
+										and same_source(call.span.source, result.span.source)
+										and call.span.start == result.span.start and call.span.end == result.span.end
+									)
+								_: False
+						_: False
+
+
+tests: TestSuite = {
+	description = "Blorp 2 native Result ownership",
+	tests = [
+		("path operand stays borrowed", test_path_operand_is_borrowed_without_acquire_or_drop),
+		("unused Result drops once", test_unused_result_drops_its_owner_once),
+		("duplicate Result slots have distinct owners", test_duplicate_results_acquire_distinct_stored_owners),
+		("native Result transfers its fresh owner", test_native_result_returns_its_single_owner),
+		("both payloads escape before parent destruction", test_both_result_payloads_acquire_before_parent_drop),
+	]
+}

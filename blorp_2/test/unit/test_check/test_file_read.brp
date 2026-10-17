@@ -1,0 +1,168 @@
+import:
+	../../../src/check/check: check, checked_functions
+	../../../src/check/model as Model
+	../../../src/namespace/builtins as Builtins
+	../../../src/check/render: render_failure
+	../../../src/utils/source: module_source, root_module_id, same_source
+	../../../src/utils/ids: VariantId, union_number, variant_number, variant_owner
+	../../../src/utils/syntax: Purity(Impure), same_purity
+	../../../src/utils/text: concat
+	../input: setup_diagnostic
+	../module_input: parse_modules
+	int as IntOps
+	test: TestSuite
+
+
+func test_read_file_checks_as_one_string_to_designated_result() -> Bool:
+	source: String =
+		|func query(path: String) -> Result[String, String]:
+		|    builtin("system.read_file")
+		|func main() -> Int:
+		|    0
+		|
+	match parse_modules([{ source = source, targets = [] }]).and_then(
+		pure func(parsed): check(parsed).map_err(setup_diagnostic),
+	):
+		Err(error):
+			print_error(error.message)
+			print_error(error.help)
+			print_error(IntOps.to_string(error.span.start).concat("..").concat(IntOps.to_string(error.span.end)))
+			False
+		Ok(program):
+			match checked_functions(program).functions.get(0):
+				Some(function):
+					match (function.signature.return_type.value_type, function.body):
+						(Model.AppliedUnionType(owner, [Model.StringType, Model.StringType]), Model.CheckedValueBody(Model.ReturnExpression(value))):
+							match value.form:
+								Model.InvokeFunction(call, [path]):
+									match call.target:
+										Model.RuntimeFunction(Builtins.ReadFile(designated)):
+											contract: Builtins.RuntimeContract[VariantId, Model.TypeRef] = Builtins.runtime_contract(Builtins.ReadFile(designated))
+											match (contract.parameters, contract.return_type):
+												([Builtins.PrimitiveRuntimeType(Builtins.BuiltinString)], Builtins.ResultResult(Builtins.PrimitiveRuntimeType(Builtins.BuiltinString), Builtins.PrimitiveRuntimeType(Builtins.BuiltinString), published)):
+													(
+														Model.same_type(path.value_type, Model.StringType)
+														and same_purity(contract.purity, Impure)
+														and union_number(owner) == union_number(variant_owner(designated.ok))
+														and union_number(owner) == union_number(variant_owner(designated.err))
+														and variant_number(published.ok) == variant_number(designated.ok)
+														and variant_number(published.err) == variant_number(designated.err)
+														and variant_number(designated.ok) == 0 and variant_number(designated.err) == 1
+													)
+												_: False
+										_: False
+								_: False
+						_: False
+				None: False
+
+
+private HELP: String = "declare an impure nongeneric function with one String parameter returning Result[String, String]"
+
+
+private BODY: String =
+	|    builtin("system.read_file")
+	|func main() -> Int:
+	|    0
+	|
+
+
+private pure func diagnostic_is(source: String, message: String, help: String, start: Int, end: Int) -> Bool:
+	match parse_modules([{ source = source, targets = [] }]):
+		Err(_): False
+		Ok(parsed):
+			match check(parsed):
+				Ok(_): False
+				Err(failure):
+					diagnostics = render_failure(failure)
+					error = diagnostics.first
+					(
+						diagnostics.remaining.is_empty() and error.note.is_none()
+						and error.message == message and error.help == help
+						and same_source(error.span.source, module_source(root_module_id()))
+						and error.span.start == start and error.span.end == end
+					)
+
+
+private pure func header_rejected(header: String) -> Bool:
+	label_start = header.length() + "\n    builtin(".length()
+	diagnostic_is(
+		header + "\n" + BODY,
+		"builtin declaration does not match its runtime contract", HELP,
+		label_start, label_start + "\"system.read_file\"".length(),
+	)
+
+
+pure func test_read_file_rejects_pure_header() -> Bool:
+	header_rejected("pure func query(path: String) -> Result[String, String]:")
+
+
+pure func test_read_file_rejects_generic_header() -> Bool:
+	header_rejected("func query[T](path: String) -> Result[String, String]:")
+
+
+pure func test_read_file_rejects_wrong_parameter() -> Bool:
+	header_rejected("func query(path: Int) -> Result[String, String]:")
+
+
+pure func test_read_file_rejects_wrong_success_payload() -> Bool:
+	header_rejected("func query(path: String) -> Result[Int, String]:")
+
+
+pure func test_read_file_rejects_wrong_error_payload() -> Bool:
+	header_rejected("func query(path: String) -> Result[String, Int]:")
+
+
+pure func test_read_file_rejects_ordinary_result() -> Bool:
+	header: String =
+		|fixed union Other[A, B]:
+		|    Yes(A)
+		|    No(B)
+		|func query(path: String) -> Other[String, String]:
+	header_rejected(header)
+
+
+pure func test_read_file_rejects_pure_caller() -> Bool:
+	source: String =
+		|func query(path: String) -> Result[String, String]:
+		|    builtin("system.read_file")
+		|pure func illegal(path: String) -> Result[String, String]:
+		|    query(path)
+		|func main() -> Int:
+		|    0
+		|
+	match source.index_of("    query(path)"):
+		None: False
+		Some(line):
+			start = line + "    ".length()
+			diagnostic_is(source, "pure functions cannot call impure functions",
+				"mark the callee pure or remove pure from the caller", start, start + "query".length())
+
+
+pure func test_read_file_rejects_tail_annotation() -> Bool:
+	source: String =
+		|@tail_recursive
+		|func query(path: String) -> Result[String, String]:
+		|    builtin("system.read_file")
+		|func main() -> Int:
+		|    0
+		|
+	diagnostic_is(source, "builtin bodies cannot have a tail-recursion annotation",
+		"remove @tail_recursive from the builtin declaration", 0, "@tail_recursive".length())
+
+
+tests: TestSuite = {
+	description = "Blorp 2 file-read contract",
+	tests = [
+		("zero parameters reject", pure func(): header_rejected("func query() -> Result[String, String]:")),
+		("two parameters reject", pure func(): header_rejected("func query(path: String, other: String) -> Result[String, String]:")),
+		("pure header rejects", test_read_file_rejects_pure_header),
+		("generic header rejects", test_read_file_rejects_generic_header),
+		("wrong parameter rejects", test_read_file_rejects_wrong_parameter),
+		("wrong success rejects", test_read_file_rejects_wrong_success_payload),
+		("wrong error rejects", test_read_file_rejects_wrong_error_payload),
+		("ordinary result rejects", test_read_file_rejects_ordinary_result),
+		("pure caller rejects", test_read_file_rejects_pure_caller),
+		("tail annotation rejects", test_read_file_rejects_tail_annotation),
+		("read_file checks as one String to designated Result", test_read_file_checks_as_one_string_to_designated_result),
+	]
+}

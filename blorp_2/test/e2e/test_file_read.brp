@@ -1,0 +1,67 @@
+import:
+	./harness: Example, NativeCase, argv_case, native_case, verify_all, with_directory
+	bytes: bytes, set_index
+	system: write_file, write_bytes
+	test: TestSuite
+
+
+private func run_file_examples(compiler: String, fixture: String) -> Bool:
+	with_directory(func(directory: String):
+		var prepared: Result[List[NativeCase], String] = Ok([])
+		for item in [("empty", ""), ("multibyte", "é😀"), ("CRLF", "a\r\nb"), ("BOM", "\u{FEFF}text"), ("NUL", "a\0b")]:
+			match prepared:
+				Err(_): void
+				Ok(previous_cases):
+					path = directory + "/" + item[0]
+					match write_file(path, item[1]):
+						Err(error): prepared = Err(error)
+						Ok(_): prepared = Ok(previous_cases.append(argv_case(item[0], [path], 0, item[1] + "\n")))
+		cases ?= prepared
+		invalid ?= write_bytes(directory + "/invalid", bytes(1).set_index(0, 255))
+		example: Example = {
+			name = fixture, fixture = fixture, expected_c = None,
+			first_case = native_case("missing argument", "", 2, "missing path\n"),
+			remaining_cases = cases.concat([
+				argv_case("malformed UTF-8", [directory + "/invalid"], 1, "read_file: invalid UTF-8; save the file as UTF-8\n"),
+				argv_case("missing file", [directory + "/missing"], 1, "read_file: open failed; errno=2\n"),
+			]),
+			limits = { allocations = 205000, instructions = 600000000 }
+		}
+		verify_all(compiler, directory, example)
+	)
+
+
+private func run_ownership(compiler: String) -> Bool:
+	with_directory(func(directory: String):
+		written ?= write_file(directory + "/input", "escaped\0contents")
+		example: Example = {
+			name = "file read ownership", fixture = "blorp_2/test/e2e/fixtures/file_read/ownership.brp", expected_c = None,
+			first_case = argv_case("ignored and escaped success", [directory + "/input"], 0, "escaped\0contents\n"),
+			remaining_cases = [argv_case("ignored and escaped error", [directory + "/missing"], 0, "read_file: open failed; errno=2\n")],
+			limits = { allocations = 205000, instructions = 600000000 }
+		}
+		verify_all(compiler, directory, example)
+	)
+
+
+private func run_nul_path(compiler: String) -> Bool:
+	with_directory(func(directory: String):
+		written ?= write_file(directory + "/input", "must not be opened")
+		example: Example = {
+			name = "file read NUL path", fixture = "blorp_2/test/e2e/fixtures/file_read/nul_path.brp", expected_c = None,
+			first_case = { native_case("NUL path", "", 1, "read_file: path contains embedded NUL; use a path without NUL\n") | cwd = Some(directory) },
+			remaining_cases = [], limits = { allocations = 205000, instructions = 600000000 }
+		}
+		verify_all(compiler, directory, example)
+	)
+
+
+pure func suite(compiler: String) -> TestSuite:
+	{
+		description = "Blorp 2 counted UTF-8 file reads",
+		tests = [
+			("exact file contents and useful errors reach real main", func(): run_file_examples(compiler, "blorp_2/test/e2e/fixtures/file_read/basic.brp")),
+			("ignored Result and escaped payload preserve ownership", func(): run_ownership(compiler)),
+			("internal NUL path rejects before opening its prefix", func(): run_nul_path(compiler)),
+		]
+	}

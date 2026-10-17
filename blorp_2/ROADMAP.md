@@ -709,8 +709,9 @@ failed. No pilot/native memory exception applies. Compiler loader migration and
 all broader M6 shell/library integration retain the dependency order above;
 this accepted bounded witness establishes no self-compilation or M6 completion.
 
-Planned [target file reading](TARGET_FILE_READ_PLAN.md) depends on acceptance of
-that Result boundary; implementation and acceptance are not yet granted.
+[Target file reading](TARGET_FILE_READ_PLAN.md) is implemented and validated with phase/native,
+mutation, full-suite and matched-cost gates; [evidence](../benchmarks/results/blorp_2_target_file_read_2026-10-17.md)
+retains failed host strict checks. Destination e2e passed; loader migration remains pending.
 
 **Goal.** The real compiler source loads and checks against the real temporary
 library, with no remaining required parity row missing. Use the reduced resolved
@@ -777,14 +778,18 @@ as explicitly recorded in the parity table. No host trait enters target code.
   sentinel. Query once before loader identities. Failure uses the real compiler
   SourceId and an empty source inventory, not a fabricated module/file row.
   Validate native encoding before String publication; invalid UTF-8 returns Err.
-- **Read:** preserve valid UTF-8 contents exactly, including CRLF, BOM and NUL.
+- **Read:** target adapter/native contract implemented; loader migration pending.
+  Preserve valid UTF-8 contents exactly, including CRLF, BOM and NUL.
+  Target encoding help omits the host read_bytes suggestion because that API
+  is unavailable; both reject malformed UTF-8 before String publication.
   Malformed UTF-8 returns Err before publishing contents as a String. The native
   [file-admission pilot](BOOTSTRAP_SOURCE_PLAN.md#native-file-admission-pilot)
   pins its diagnostic and priority. Preserve malformed-input coverage here.
   Reject NUL in a path before opening. Missing/unreadable input, incomplete reads
   and close failure return Err; clean up every opened handle. This increment
   needs stable source files, not arbitrary streams or concurrent snapshots.
-- **Write:** create/truncate, write all counted contents and close successfully
+- **Write:** [accepted plan](TARGET_WRITE_FILE_PLAN.md); implementation pending.
+  Create/truncate, write all counted contents and close successfully
   before Ok(void). Reject NUL paths; missing parents fail. A failure may leave
   partial output. Neither file operation prints. Preserve the primary failure
   while attempting cleanup; never report success after a short transfer/close
@@ -795,6 +800,8 @@ as explicitly recorded in the parity table. No host trait enters target code.
 - **Stderr:** attempt the complete counted message plus one additional LF,
   preserving internal newlines/NUL and writing nothing to stdout. Void reports
   no delivery status; stop on unrecoverable output error.
+  The accepted [target stderr plan](TARGET_STDERR_PLAN.md) is the next slice;
+  implementation remains pending.
 - **Join:** an absolute child replaces base. Empty base returns child, including
   join("", "") == "". Otherwise retain a trailing separator or add one;
   join("/library", "") == "/library/". Do not normalize components/separators.

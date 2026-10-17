@@ -61,3 +61,89 @@ SYSTEM_CURRENT_DIRECTORY_RUNTIME: String =
 		|}
 		|}
 		|
+
+-- One stable regular-file snapshot. Every normal return publishes one fresh
+-- counted UTF-8 String; private native storage never escapes this boundary.
+SYSTEM_READ_FILE_RUNTIME: String =
+	raw
+		|#include <errno.h>
+		|#include <limits.h>
+		|enum {
+		|BLORP_READ_FILE_OK=1,BLORP_READ_FILE_ERROR=0,
+		|BLORP_READ_FILE_ERROR_CAPACITY=sizeof("read_file: seek start failed; errno=")+sizeof(int)*CHAR_BIT
+		|};
+		|/* On supported LP64, positive ftell cannot reach the String size guard. */
+		|_Static_assert(LONG_MAX==INT64_MAX&&(uintmax_t)LONG_MAX<(uintmax_t)(SIZE_MAX-sizeof(struct blorp_string)-1),"read_file requires supported LP64 bounds");
+		|static uint8_t blorp_read_file_failure(struct blorp_string **result,const char *message){
+		|*result=blorp_string_from_bytes(message,(int64_t)strlen(message));
+		|return BLORP_READ_FILE_ERROR;
+		|}
+		|static uint8_t blorp_read_file_error(struct blorp_string **result,const char *prefix,int error){
+		|char message[BLORP_READ_FILE_ERROR_CAPACITY];
+		|const int length=snprintf(message,sizeof message,"%s%d",prefix,error);
+		|if(length<0||(size_t)length>=sizeof message){abort();}
+		|return blorp_read_file_failure(result,message);
+		|}
+		|uint8_t blorp_read_file(const struct blorp_string *path,struct blorp_string **result){
+		|const size_t path_length=(size_t)path->length;
+		|if(memchr(path->bytes,'\0',path_length)!=NULL){
+		|return blorp_read_file_failure(result,"read_file: path contains embedded NUL; use a path without NUL");
+		|}
+		|char *native_path=malloc(path_length+1);
+		|if(native_path==NULL){abort();}
+		|memcpy(native_path,path->bytes,path_length);
+		|native_path[path_length]='\0';
+		|FILE *stream=fopen(native_path,"rb");
+		|const int open_errno=errno;
+		|free(native_path);
+		|if(stream==NULL){return blorp_read_file_error(result,"read_file: open failed; errno=",open_errno);}
+		|if(fseek(stream,0,SEEK_END)!=0){
+		|const int saved_errno=errno;
+		|(void)fclose(stream);
+		|return blorp_read_file_error(result,"read_file: seek end failed; errno=",saved_errno);
+		|}
+		|const long measured_length=ftell(stream);
+		|if(measured_length<0){
+		|const int saved_errno=errno;
+		|(void)fclose(stream);
+		|return blorp_read_file_error(result,"read_file: tell failed; errno=",saved_errno);
+		|}
+		|const size_t allocation_limit=SIZE_MAX-sizeof(struct blorp_string)-1;
+		|if((uintmax_t)measured_length>(uintmax_t)INT64_MAX||(uintmax_t)measured_length>(uintmax_t)allocation_limit){
+		|(void)fclose(stream);
+		|return blorp_read_file_error(result,"read_file: size failed; errno=",EOVERFLOW);
+		|}
+		|if(fseek(stream,0,SEEK_SET)!=0){
+		|const int saved_errno=errno;
+		|(void)fclose(stream);
+		|return blorp_read_file_error(result,"read_file: seek start failed; errno=",saved_errno);
+		|}
+		|const size_t length=(size_t)measured_length;
+		|char *contents=NULL;
+		|if(length!=0){
+		|contents=malloc(length);
+		|if(contents==NULL){abort();}
+		|const size_t received=fread(contents,1,length,stream);
+		|if(received!=length){
+		|const int saved_errno=errno;
+		|const int read_failed=ferror(stream);
+		|(void)fclose(stream);
+		|free(contents);
+		|if(read_failed){return blorp_read_file_error(result,"read_file: read failed; errno=",saved_errno);}
+		|return blorp_read_file_failure(result,"read_file: short read");
+		|}
+		|}
+		|if(fclose(stream)!=0){
+		|const int saved_errno=errno;
+		|free(contents);
+		|return blorp_read_file_error(result,"read_file: close failed; errno=",saved_errno);
+		|}
+		|if(length!=0&&!blorp_utf8_is_valid(contents,length)){
+		|free(contents);
+		|return blorp_read_file_failure(result,"read_file: invalid UTF-8; save the file as UTF-8");
+		|}
+		|*result=blorp_string_from_bytes(length==0?"":contents,(int64_t)length);
+		|free(contents);
+		|return BLORP_READ_FILE_OK;
+		|}
+		|

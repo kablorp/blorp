@@ -1,0 +1,85 @@
+import:
+	../../src/check/check: CheckedProgram, check
+	../../src/lower/lower as Lower
+	../../src/namespace/builtins as Builtins
+	../../src/specialize/specialize as Concrete
+	../../src/utils/syntax: Diagnostic, entry_function
+	option: to_result
+	../../src/utils/source: compiler_source
+	./input: setup_diagnostic
+	./module_input: TestFoundation, parse_modules_with_base
+
+
+FILE_READ_SOURCE: String =
+	|func query(path: String) -> Result[String, String]:
+	|    builtin("system.read_file")
+	|func escape(path: String) -> String:
+	|    match query(path):
+	|        Ok(contents): contents
+	|        Err(error): error
+	|func main() -> Int:
+	|    unused = query("input")
+	|    escaped = escape("input")
+	|    0
+	|
+
+
+fixed record FileReadSeed {
+	lowered: Lower.LoweredProgram,
+	query: Lower.LoweredFunction,
+	escape: Concrete.FunctionInstanceId,
+	constructors: Builtins.DesignatedResult[Concrete.VariantInstanceId]
+}
+
+
+pure func checked_file_read(foundation: TestFoundation) -> Result[CheckedProgram, Diagnostic]:
+	parsed ?= parse_modules_with_base([{ source = FILE_READ_SOURCE, targets = [] }], foundation)
+	check(parsed).map_err(setup_diagnostic)
+
+
+pure func file_read_seed(foundation: TestFoundation) -> Result[FileReadSeed, Diagnostic]:
+	file_read_seed_from_source(FILE_READ_SOURCE, foundation)
+
+
+-- Both callers supply the same query/escape prefix; verifier alone adds a foreign union.
+pure func file_read_seed_from_source(source: String, foundation: TestFoundation) -> Result[FileReadSeed, Diagnostic]:
+	parsed ?= parse_modules_with_base([{ source = source, targets = [] }], foundation)
+	checked ?= check(parsed).map_err(setup_diagnostic)
+	concrete ?= Concrete.specialize(checked)
+	lowered ?= Lower.lower(concrete)
+	contents = Lower.lowered_functions(lowered)
+	main ?= contents.functions.get(Concrete.function_number(entry_function(contents.entrypoint))).to_result(invalid_seed())
+	match main.definitions.filter(pure func(definition): called_function(definition).is_ok()):
+		[query_call, escape_call, ...remaining]:
+			query_id ?= called_function(query_call)
+			escape_id ?= called_function(escape_call)
+			query ?= contents.functions.get(Concrete.function_number(query_id)).to_result(invalid_seed())
+			match query.definitions:
+				[_, result]:
+					match result.operation:
+						Lower.CallValue(call, [_]):
+							match call.target:
+								Concrete.RuntimeFunction(Builtins.ReadFile(constructors)):
+									Ok({ lowered = lowered, query = query, escape = escape_id, constructors = constructors })
+								_: Err(invalid_seed())
+						_: Err(invalid_seed())
+				_: Err(invalid_seed())
+		_: Err(invalid_seed())
+
+
+pure func called_function(definition: Lower.ValueDefinition) -> Result[Concrete.FunctionInstanceId, Diagnostic]:
+	match definition.operation:
+		Lower.CallValue(call, _):
+			match call.target:
+				Concrete.UserFunction(id): Ok(id)
+				_: Err(invalid_seed())
+		_: Err(invalid_seed())
+
+
+private pure func invalid_seed() -> Diagnostic:
+	{
+		span = { source = compiler_source(), start = 0, end = 0 },
+		note = None,
+		message = "invalid file-read test seed",
+		help = "keep the explicit query and main fixture"
+	}

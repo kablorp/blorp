@@ -6,7 +6,7 @@ import:
 		RuntimeOperation(
 			IntAdd, IntSubtract, IntMultiply, IntDivide, IntRemainder, IntToString, StringLength,
 			StringPrint, StringParseInt, StringParseFloat, ListRepeat, ListLength, ListGet, ListAppend, ListSet,
-			StringByteAt, StringFromCodepoint, GetCurrentDirectory,
+			StringByteAt, StringFromCodepoint, GetCurrentDirectory, ReadFile,
 			ListConcat, StringEquals,
 			IntEquals, FloatAdd, FloatSubtract, FloatMultiply, FloatDivide, FloatRemainder,
 			FloatToString,
@@ -21,7 +21,7 @@ import:
 			MissingAggregateMember, MissingUnionPayloadField,
 		), render,
 	../runtime/float: float_parse_runtime, float_runtime, float_string_runtime
-	../runtime/system: SYSTEM_CURRENT_DIRECTORY_RUNTIME
+	../runtime/system: SYSTEM_CURRENT_DIRECTORY_RUNTIME, SYSTEM_READ_FILE_RUNTIME
 	int as IntOps
 	list: join
 	../runtime/list:
@@ -155,6 +155,8 @@ private pure func c_callable(target: CallTarget) -> String:
 					"blorp_string_byte_at"
 				StringFromCodepoint(_):
 					"blorp_string_from_codepoint"
+				ReadFile(_):
+					"blorp_read_file"
 				GetCurrentDirectory(_):
 					"blorp_get_current_directory"
 				ListRepeat(element):
@@ -1156,6 +1158,29 @@ private pure func append_current_directory(
 		.concat(ok).concat(":").concat(error).concat(";(void)").concat(c_value(id)).concat(";"))
 
 
+private pure func append_read_file(
+	output: String,
+	id: ValueId,
+	result: DesignatedResult[VariantInstanceId],
+	arguments: List[OwnedArgument],
+	unions: List[ConcreteUnion],
+	span: Span,
+) -> Result[String, Diagnostic]:
+	path ?= match arguments.get(0):
+		Some(found): Ok(found)
+		None: Err(render(span, MissingRuntimeArgument(id, 0)))
+	declaration ?= c_local_declaration(UnionType(variant_owner(result.ok)), InitializedLocal, unions, span)
+	scratch = "blorp_runtime_".append_int(value_number(id))
+	ok ?= c_union_value(result.ok, [scratch], unions, span)
+	error ?= c_union_value(result.err, [scratch], unions, span)
+	-- The path is borrowed; either constructor takes the one fresh String.
+	Ok(output.concat("struct blorp_string *").concat(scratch).concat("=NULL;const uint8_t ")
+		.concat(scratch).concat("_ok=blorp_read_file(").concat(c_value(argument_value(path)))
+		.concat(",&").concat(scratch).concat(");")
+		.concat(declaration).concat(c_value(id)).concat("=").concat(scratch).concat("_ok?")
+		.concat(ok).concat(":").concat(error).concat(";(void)").concat(c_value(id)).concat(";"))
+
+
 private pure func append_list_get(
 	output: String,
 	id: ValueId,
@@ -1230,6 +1255,8 @@ private pure func append_value(
 					append_string_byte_at(output, id, option, arguments, unions, span)
 				RuntimeFunction(StringFromCodepoint(option)):
 					append_string_from_codepoint(output, id, option, arguments, unions, span)
+				RuntimeFunction(ReadFile(result)):
+					append_read_file(output, id, result, arguments, unions, span)
 				RuntimeFunction(GetCurrentDirectory(result)):
 					append_current_directory(output, id, result, unions, span)
 				RuntimeFunction(StringEquals(boolean)):
@@ -2003,6 +2030,7 @@ private pure func innermost_element(value_type: TypeRef) -> TypeRef:
 -- argument vector from the entrypoint, which already own those facts.
 private fixed record RuntimeRequirements {
 	current_directory: Bool,
+	file_read: Bool,
 	string_types: Bool,
 	float_types: Bool,
 	integer_addition: Bool,
@@ -2018,6 +2046,7 @@ private fixed record RuntimeRequirements {
 private pure func runtime_requirements(inventory: ProgramInventory) -> RuntimeRequirements:
 	var requirements: RuntimeRequirements = {
 		current_directory = False,
+		file_read = False,
 		string_types = False,
 		float_types = False,
 		integer_addition = False,
@@ -2037,6 +2066,7 @@ private pure func runtime_requirements(inventory: ProgramInventory) -> RuntimeRe
 
 	for operation in inventory.runtime_calls:
 		match operation:
+			ReadFile(_): requirements = { requirements | file_read = True }
 			GetCurrentDirectory(_): requirements = { requirements | current_directory = True }
 			IntAdd: requirements = { requirements | integer_addition = True }
 			IntSubtract | IntMultiply | IntDivide | IntRemainder:
@@ -2494,6 +2524,9 @@ pure func emit(program: VerifiedProgram) -> Result[String, Diagnostic]:
 
 	if requirements.string_output:
 		fragments = fragments.append(string_print_runtime())
+
+	if requirements.file_read:
+		fragments = fragments.append(SYSTEM_READ_FILE_RUNTIME)
 
 	if requirements.current_directory:
 		fragments = fragments.append(SYSTEM_CURRENT_DIRECTORY_RUNTIME)

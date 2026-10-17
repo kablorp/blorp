@@ -2,27 +2,23 @@
 
 ## Problem, authority, and dependencies
 
-PLAN ONLY at `72164f17a21d8e375efceb77503b92318e97340d`, branch
-`codex/target-file-read-plan`. Only this plan and one roadmap link are authorized.
-No implementation, compiled execution, measurement, commit, push, or epoch reset.
+Implemented and validated, including final destination unit/runtime/grammar and
+e2e gates. Root/peer review is complete. The [evidence report](../benchmarks/results/blorp_2_target_file_read_2026-10-17.md)
+records gates, matched costs and the separately failed supporting-host strict checks.
 [M6](ROADMAP.md#seven-shell-and-path-functions) needs
 `func read_file(path: String) -> Result[String, String]`; the target adapter and
-builtin are absent. This adds one shell API, not loader migration, write_file,
+builtin are implemented. This adds one shell API, not loader migration, write_file,
 path/stderr APIs, frontier progress, or self-compilation. Loading remains the
 effect boundary; the compiler pipeline after loading stays pure.
 
-Implementation depends on accepted CWD. Read-only reference: uncommitted
-`target-current-directory-plan/blorp`, HEAD `f41ee3fa8a059ce815e72b44a58d172033393e9d`.
-This worktree lacks it; all dependent examples are FUTURE code after acceptance.
-Freeze accepted CWD B, host pair, libraries and registry before costs under root's
-grant; this scratch reference provides no baseline authority.
-The host numeric-file-error slice is separately reviewed but awaits acceptance.
-Pin its accepted system.brp revision/hash in the temporary adapter's provenance.
+Accepted CWD and host numeric-file-error source/library baseline is
+`891f64c989a9c0b30002c3e98d8fce028de1ddb1`; temporary adapter provenance pins it.
+Frozen source/library, host/pilot pairs and corpus hashes are retained in the report.
 The known host leak follows [the bootstrap decision](HOST_BOOTSTRAP_LIMITATIONS.md).
 
 ## Witness and expected behavior
 
-Future `test/e2e/fixtures/file_read/basic.brp` uses the ordinary entrypoint:
+`test/e2e/fixtures/file_read/basic.brp` uses the ordinary entrypoint:
 
 ```blorp
 import:
@@ -237,4 +233,4 @@ These are owned-input/proxy costs, not self-compile evidence or M6 completion.
 
 Hand back hashes/LOC, red/green/mutants, commands/inputs/C, costs and limits.
 Root/peer review precedes code/commit; stop for ABI/budget drift, host defects, C/cost
-breach. Pins/cost grant remain open; approve diagnostics/EOF/overflow/close policy here.
+breach. Implementation, costs, destination validation and review are complete; remaining M6 work is separate.
