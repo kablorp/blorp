@@ -345,7 +345,8 @@ Stop on a cap breach, source-epoch drift or need for another mechanism.
 3. **First-order pilots:** fills, a coalesced type translator and stable layout
    ordering. Then migrate remaining callbacks in bounded module groups.
 4. **Library foundation:** host String wrappers/availability, two target String
-   operations, ASCII predicates and the four-consumer Char migration.
+   operations, ASCII predicates and the [five-file source byte migration](SOURCE_BYTE_MIGRATION_PLAN.md)
+   (four Char consumers plus main's byte-column classification).
 5. **Retained control/ownership:** accept reviewed logical operators, restricted
    if, outer-variable joins, top-level propagation/local annotations and managed
    List/while loops. Follow [M3's carried-owner protocol](ROADMAP.md#m3-loops-and-tail-recursion):
