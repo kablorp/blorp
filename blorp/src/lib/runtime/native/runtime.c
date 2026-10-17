@@ -39169,6 +39169,53 @@ blorp_String* blorp_getcwd(void) {
     return blorp_string_create("");
 }
 
+enum { BLORP_CURRENT_DIRECTORY_INITIAL_CAPACITY = 256 };
+
+static blorp_Result* blorp_current_directory_error(int error_code) {
+    blorp_String* message = blorp_string_append_int(
+        blorp_string_create("get_current_directory: failed; errno="), error_code);
+    return blorp_result_err_owned(message);
+}
+
+blorp_Result* blorp_get_current_directory(void) {
+    size_t capacity = BLORP_CURRENT_DIRECTORY_INITIAL_CAPACITY;
+    // Capacity includes the terminator, so a successful pathname fits long.
+    const size_t maximum_capacity = (size_t)LONG_MAX + 1;
+    char* buffer = (char*)blorp_malloc_checked(capacity);
+    for (;;) {
+        errno = 0;
+        if (getcwd(buffer, capacity) != NULL) {
+            size_t length = strlen(buffer);
+            if (length == 0 || buffer[0] != '/') {
+                free(buffer);
+                return blorp_result_err_cstr(
+                    "get_current_directory: native path must be nonempty and absolute");
+            }
+            if (!blorp_utf8_is_valid((const unsigned char*)buffer, (long)length)) {
+                free(buffer);
+                return blorp_result_err_cstr(
+                    "get_current_directory: invalid UTF-8; "
+                    "use a working directory with a UTF-8 path");
+            }
+            blorp_String* directory = blorp_string_create_len(buffer, (long)length);
+            free(buffer);
+            return blorp_result_ok_with_release_mask(directory, true);
+        }
+        int saved_errno = errno;
+        if (saved_errno != ERANGE) {
+            free(buffer);
+            return blorp_current_directory_error(saved_errno);
+        }
+        if (capacity == maximum_capacity) {
+            free(buffer);
+            return blorp_current_directory_error(EOVERFLOW);
+        }
+        capacity = capacity > maximum_capacity / 2
+            ? maximum_capacity : capacity * 2;
+        buffer = (char*)blorp_realloc_checked(buffer, capacity);
+    }
+}
+
 long blorp_mkdir(const blorp_String* path) {
     if (!path || path->len == 0) return 0;
     char* tmp = blorp_cstring_copy_if_valid(path);

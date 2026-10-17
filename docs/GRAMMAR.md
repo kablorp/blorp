@@ -191,6 +191,8 @@ and comment text, only ASCII characters may appear; any other character is an
 unexpected character (`LEX:932-947`).
 `system.read_file` preserves valid UTF-8 bytes, including NUL, CRLF and BOM.
 Malformed file encoding returns Err before contents are published as a String.
+`system.get_current_directory` returns `Result[String, String]`, admitting only
+a nonempty absolute UTF-8 native pathname as `Ok`.
 
 Columns are one-based. A tab advances the column to the next tab stop, and tab
 stops are every 4 columns: a tab at column `c` moves to column

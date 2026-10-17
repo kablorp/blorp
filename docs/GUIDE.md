@@ -2080,6 +2080,24 @@ the same carrier type, and the success path must return `Some(...)` or
 `read_file` returns Err for malformed UTF-8 and preserves valid contents exactly.
 `read_bytes` provides the separate binary-input API.
 
+`system.get_current_directory()` returns a nonempty absolute UTF-8 pathname in
+`Ok(directory)` or a text `Err(error)`. OS failures report fixed operation text
+and a numeric error code; malformed native encoding is rejected.
+
+```blorp
+import:
+    system: get_current_directory
+
+func main() -> Int:
+    match get_current_directory():
+        Ok(directory):
+            print(directory)
+            0
+        Err(error):
+            print_error(error)
+            1
+```
+
 ```blorp
 import:
     system: read_file

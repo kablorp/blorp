@@ -2649,6 +2649,7 @@ typedef void* (*blorp_ProcessOutputFactory)(
 );
 
 blorp_String* blorp_getcwd(void);
+blorp_Result* blorp_get_current_directory(void);
 long blorp_mkdir(const blorp_String* path);
 long blorp_remove_file(const blorp_String* path);
 long blorp_remove_dir(const blorp_String* path);

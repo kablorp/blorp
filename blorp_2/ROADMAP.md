@@ -818,11 +818,9 @@ with all partially acquired argument ownership released. The native validator,
 ordinary prefix destruction and shared Int/Void wrapper enforce this boundary.
 
 Ordinary Blorp implements paths; native bindings implement the four impure
-operations. The existing fixed-buffer getcwd cannot satisfy the new contract.
-Add/validate a bounded supporting-host prerequisite for its native helper and
-ownership declaration. Verify explicit `--std-dir` source selection separately
-from the executable's embedded runtime; then freeze binary, library and toolchain
-for matched comparisons. Never claim a disk edit updates embedded helpers.
+operations. The [host get_current_directory](HOST_CURRENT_DIRECTORY_PLAN.md) is validated.
+Target wiring and any source-refactor host epoch transition remain pending.
+A disk stdlib edit does not update an executable's embedded runtime.
 
 Target Result contracts must carry designated constructor identities and exact
 payload types once. Inputs are borrowed; successful/error Strings are owned.
