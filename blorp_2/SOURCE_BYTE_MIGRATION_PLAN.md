@@ -2,11 +2,19 @@
 
 ## Status, problem and dependencies
 
-Plan only; no implementation or compiled work is authorized by this document.
-Planning base: `545a6a07d32fb4c713442e441ddc8d93cd544756`. Root and independent
-compiler/HOF review agreed the five-file boundary and ceilings below. Root and
-an independent reviewer must review this document before its plan-only commit;
-production requires a later writing and compiled-lane grant.
+Implementation is frozen against accepted A
+`0cdba16a459c1a1f5792a70ea2071f98f453b96f`, with exact D production/test diff
+SHA256 `81cfcf7586761ff70204c805e1bc3f237bcbb1b3aaf83ee77537d2f9e0d83f96`.
+The fresh original cumulative screen **FAILED**: D=9959 exceeds its 9923 cap.
+Remaining fixed A/D cost, identity, inventory and correctness gates are pending
+under the [one-time landing policy](#one-time-landing-policy-after-the-failed-screen).
+That explicit policy change does not turn the original failure into a pass or
+authorize further execution or candidate publication.
+
+The original design and planning anchors below describe historical base
+`545a6a07d32fb4c713442e441ddc8d93cd544756`. Their initial five-file proposal
+and then-pending dependencies remain historical rationale; the actual frozen
+cohort and policy amendments below own current scope and acceptance.
 
 The [source plan's String boundary](BOOTSTRAP_SOURCE_PLAN.md#string-and-library-boundary)
 requires counted integer-byte access and checked scalar encoding. Compiler
@@ -39,11 +47,15 @@ adds admission nor removes checks because admission exists elsewhere.
 
 ## Scope and fact ownership
 
-Line anchors refer to the planning base. Only these five production files change:
-lex, parse, names and emit are the four Char consumers; main adds byte-column
-classification. The linked [delivery item 4](BOOTSTRAP_SOURCE_PLAN.md#delivery-order-and-parallel-ownership)
-gets only that boundary clarification. Neither this plan nor that wording change
-marks the migration complete or advances the recorded 36/38 source frontier.
+The table's line anchors describe the historical five-file planning boundary:
+lex, parse, names and emit were the four Char consumers; main adds byte-column
+classification. The actual reviewed migration also changes `src/utils/syntax.brp`
+only to remove the replaced `DECIMAL_DIGITS` constant: six production files.
+The separately bounded lazy repair changes `src/check/signatures.brp` and its
+owning test, as detailed in the actual-cohort amendment below. The linked
+[delivery item 4](BOOTSTRAP_SOURCE_PLAN.md#delivery-order-and-parallel-ownership)
+gets only that boundary clarification. The failed screen and pending gates do
+not establish migration acceptance or advance the recorded source frontier.
 
 | Owner | Exact boundary | Required preservation |
 | --- | --- | --- |
@@ -325,3 +337,197 @@ Stop for a host defect, admission/identity disagreement, changed diagnostic
 priority, ownership ambiguity, missing observer, required new mechanism or cap
 breach. Reduce and report the witness to root; do not fix an adjacent subsystem
 or silently widen the contract. Root and independent review precede any commit.
+
+## Actual deliverable after accepted file reads
+
+This amendment supersedes the historical candidate/cohort and identity wording
+above, without changing the original cost denominators or ceilings. Accepted
+base A is `0cdba16a459c1a1f5792a70ea2071f98f453b96f`, including CWD and
+`ReadFileBuiltin`. Its source tree is
+`30cb259e19bd3bde4e7ffda952059910fd78c5b9`; its complete temporary-library
+tree is `38530dc355893aca1207580a3dcd4ab810a55f17`. Actual candidate D is
+that base plus the previously reviewed six-file source migration and bounded
+lazy builtin-error construction repair. D keeps all accepted features and the
+complete base library; no stale-source overlay or subtraction is permitted.
+
+The preserved historical worktree is
+`/Users/keithphilpott/.codex/worktrees/bootstrap-lazy-errors/blorp`, branch
+`codex/bootstrap-lazy-errors`, HEAD
+`405a28f2d7f53e8289b2e1bc701f1ed55203f086`. Its twelve-file production/test
+patch SHA256 is
+`4afdbb7ffa98064f6073a8acdf269eb11e58af7fe04b76d2df7c512088ac571f`.
+The patch applied cleanly, without three-way merging, to A in
+`/Users/keithphilpott/.codex/worktrees/source-port-current/blorp`, branch
+`codex/source-port-current`. The refreshed production/test diff SHA256 is
+`81cfcf7586761ff70204c805e1bc3f237bcbb1b3aaf83ee77537d2f9e0d83f96`.
+These are source-inspection facts, not new passing tests or cost evidence.
+
+The sixth migration file, `src/utils/syntax.brp`, only removes the replaced
+`DECIMAL_DIGITS` constant. Migration production is +285/-209, net +76;
+four tests are +136/-2, net +134, within the original separate ceilings.
+The lazy repair changes only `src/check/signatures.brp` (+9/-8, net +1) and
+`test/unit/test_check/test_list_updates.brp` (+30/-4, net +26). Its separate
+ceilings remain 15 gross/+3 net production and 40 gross added test lines.
+Six existing List None arms construct the same typed mismatch only on rejection;
+the primitive fallback matches its explicitly typed Option before constructing
+the same invariant error. Keep the `to_result` import used elsewhere. Preserve
+`ReadFileBuiltin: Ok(Builtins.ReadFile(site.designated.result))` and the CWD
+arm unchanged. No new semantic spelling lookup, helper, framework or cache.
+
+The lazy semantic characterizations previously passed before and after the
+repair; they are not a functional red. Preserve their exact typed operation,
+source, span, message, help and absent-note assertions and prior mutation
+evidence. The genuine failing-before acceptance is the historical cost gate.
+
+### Frozen paths, identities and cost comparisons
+
+The authoritative historical primitives remain under
+`/Users/keithphilpott/.codex/worktrees/source-byte-migration-plan/blorp/build/source-byte-migration/cost-preparation/direct/`.
+Use `config.sh`, `strict.sh`, `normal.sh`, `new-fixtures.sh` and `host-proxy.sh`
+as the inspectable command/assertion authority. Do not execute their historical
+setup or overwrite their scripts, source snapshots, pilots or raw samples.
+Any necessary recipe delta is recorded separately for root and peer review;
+this amendment adds no controller.
+
+R0 and B retain their original source snapshots, pilot binaries and respective
+`cost-run/libraries/reset` and `cost-run/libraries/local` paths. The fixed CWD is
+the original `cost-run/input`; output remains the original `cost-run/same-output.c`.
+A/D use the same complete new frozen target-library path,
+`cost-run/libraries/actual-D-read-file`, under that historical packet root.
+Record that explicit library-path difference, complete membership and byte
+manifest. Source snapshots for A and D and new raw samples live under the new
+worktree's ignored `build/source-port-current/` directory. D is always the actual
+deliverable, including file reads, never the historical candidate C.
+
+The original 452 shared fixture bytes, four original API fixtures and immutable
+historical artifacts remain untouched. Only a future explicit compiled lease
+permits complete canonical source/library installation and writes to the owned
+shared output, outside measured intervals. Verify exact membership/bytes before
+and after installation; do not merge stale files into a complete snapshot.
+
+Migration-only correctness requires exact complete A/D fixture C, exit status,
+stdout and semantic diagnostic bytes. This explicitly supersedes the historical
+`strict.sh` B/C C comparison only in the new recorded recipe. Retain complete
+raw B/D and R0/D C deltas and review every difference against accepted CWD/file
+read and prior feature changes. Never normalize output; unexplained differences
+stop. Historical R0/B remain binding cost denominators, with both original
+integer tests `100 * D <= 103 * B` and `100 * D <= 103 * R0` on every applicable
+input and the host source-to-C proxy. Also require local A/D <=1.03. No reset,
+feature deduction, aggregate credit or widened allowance.
+
+The four original API fixtures retain B/D local and absolute caps. Add the five
+current feature fixtures (`current_directory/basic.brp`,
+`current_directory/ownership.brp`, `file_read/basic.brp`, `file_read/nul_path.brp`,
+`file_read/ownership.brp`, all under `test/e2e/fixtures/`) unchanged from A.
+Their installation at new canonical paths requires the future explicit lease;
+it must not overwrite any original fixture, and their complete bytes are pinned.
+These use A/D local +3% allocations and normal min3 instructions plus their
+existing 205000-allocation/600000000-instruction ceilings. They have no invented
+R0 baseline. Current full acceptance includes all existing feature/native cases.
+
+### First screen and stop rule
+
+One hypothesis: constructing builtin rejection data only on rejection reduces
+valid-signature work enough for the complete D deliverable to meet the original
+cap. After root and independent recipe review and an explicit serialized lease,
+build D with the frozen supporting host/stdlib and original canonical boundary;
+link normal/diagnostic pilots with the original O0 flags. First run the direct
+strict `c0004` binding/basic screen using R0/B/D, plus A for source-only identity.
+Use new raw directories and preserve every call; do not overwrite old samples.
+Require positive balanced counts, zero leaks and exact diagnostic checks.
+The historical R0 count is 9634, B is 10081; D must be at most 9923 allocations.
+Stop and report immediately if the screen fails, without another optimization.
+
+If it passes, execute the complete original shared/API allocation and normal
+min3 protocol, current A/D comparisons and frozen-host source-to-C proxies;
+retain every unfiltered sample and original absolute cap. Run granular owning
+suites and current full unit/runtime/grammar/e2e acceptance. All work remains
+serial on root's lease. The binding host-proxy allocation metric is exactly
+`direct/host-proxy.sh`: unset `BLORP_LEAK_CHECK`, set `BLORP_MEMORY_STATS=1`,
+require status 0 and exact `Generated <output>` plus LF, and extract the positive
+`total_allocations` from the unique schema1 `artifact_construction_complete`
+checkpoint. Preserve its local/cumulative integer ratios, frozen host/std epoch
+and flags. Do not substitute exit-time strict totals or the file-read feature's
+different proxy metric. Normal proxy instructions remain minimum-of-three.
+
+Separately, the old supporting host's known compile-time strict
+leak exception permits only documented FAILED status 99 with complete valid C;
+strict-host stdout is empty because its atexit path exits before flushing.
+Normal host status 0 requires exact `Generated <output>` plus LF. Pilot and native
+strict runs still require zero leaks. No compiled execution, commit or publication
+is authorized by this amendment; root assigns those steps separately.
+
+### One-time landing policy after the failed screen
+
+The original experiment above is **FAILED**, not accepted: fresh serial c0004
+allocations were R0=9634, B=10081, A=10081 and D=9959. D exceeds the original
+9923 cumulative cap by 36 (+3.373468964% over R0), despite reducing A/B by 122
+(-1.210197401%). All four strict runs were balanced and leak-free with identical
+complete C, status and semantic output. The [maintained result](../benchmarks/results/blorp_2_source_byte_lazy_screen_2026-10-17.md)
+preserves provenance, raw evidence and unresolved acceptance. No additional
+optimization followed the failure. The counts establish no particular host
+defect, and A=B on this input: CWD/read_file supply no cost deduction.
+
+Under the user's explicit authorization for roadmap changes with multiple
+expert agreement, the coordinator approved this one-time changed landing
+criterion after independent compiler-expert and stderr-expert recommendations.
+It supersedes only the historical R0/D and B/D percentage checks as landing
+requirements for the exact byte-migration plus lazy-error slice frozen below.
+Those historical denominators and the failed original result remain recorded;
+this is neither a passing original experiment nor a new supporting-host epoch.
+All other acceptance requirements remain binding.
+
+The purpose is to remove the reviewed compiler-source Char/classification
+dependencies through the accepted byte/scalar APIs without distorting the sound
+implementation to fit one observed count. The measured benefit is the c0004
+local allocation reduction only; no whole-corpus, instruction or proxy benefit
+is established. The explicit tradeoff is that historical cumulative growth
+over 3% no longer blocks this one precisely bounded slice. Broader bootstrap
+performance and actual full-source self-compilation remain open requirements.
+
+Freeze A at `0cdba16a459c1a1f5792a70ea2071f98f453b96f`, including its complete
+accepted temporary library. Freeze D at production/test diff SHA256
+`81cfcf7586761ff70204c805e1bc3f237bcbb1b3aaf83ee77537d2f9e0d83f96` over A.
+The earlier source/library manifests, physical paths, flags, actual source
+inventory, supporting host pair/std epoch and preserved observations do not
+change. Main `8ed7687dfa12d548fdb099d29a143092c1578bf2` adds only tests/docs
+relative to A; its compiler source and target-library trees still equal A's
+`30cb259e19bd3bde4e7ffda952059910fd78c5b9` and
+`38530dc355893aca1207580a3dcd4ab810a55f17`, respectively. Do not substitute
+later compiler/library changes or alter candidate bytes under this decision.
+
+For every unchanged A/D input separately, including all current feature inputs,
+and for the original frozen-host source-to-C proxy, require both exact tests:
+
+```text
+100 * D_allocations <= 103 * A_allocations
+100 * D_normal_min3_instructions <= 103 * A_normal_min3_instructions
+```
+
+Retain every existing absolute input/e2e ceiling. The original 452 shared files,
+four String API fixtures and five CWD/file-read fixtures retain their exact
+bytes and identities; no fictional R0 baseline is introduced for newer inputs.
+The proxy allocation metric remains the unique schema1
+`artifact_construction_complete total_allocations` checkpoint with
+`BLORP_MEMORY_STATS=1`, leak mode unset, status 0 and exact Generated stdout.
+Do not replace it with exit-time strict totals. Normal instructions still need
+three unfiltered alternating A/D samples under the same quiet frozen epoch.
+
+Reuse the four existing c0004 strict observations; never resample them under
+this decision. Other inputs/proxies remain unexecuted preparation until root
+approves their exact remaining command schedule and grants the exclusive lane.
+Retain all raw samples and commands, complete A/D fixture C and exact diagnostic
+identity, source inventory/semantic behavior, granular owner and full current
+unit/runtime/grammar/e2e acceptance. Positive balanced pilot/native strict counts
+and zero leaks remain mandatory; the separately documented old-host limitation
+does not relax them. Migration/lazy production and test ceilings remain separate
+and unchanged. A new failed gate or unexplained difference stops for root review;
+it never automatically widens this exception.
+
+This policy covers this frozen slice only. Do not roll A forward to D, reuse the
+exception for a later pilot, grant another waiver, change another threshold or
+subtract accepted feature costs. Genuine self-compilation and any future
+supporting-host transition require their own matched evidence and explicit
+policy; they cannot retroactively turn the original R0/D failure into a pass.
+Documentation review and publication authorize no source change, measurement,
+resampling or landing of D; root schedules the remaining acceptance separately.
