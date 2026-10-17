@@ -1,10 +1,12 @@
 # Discarded managed results acquire ordinary lexical owners
 
-Status: **design approved; the separate mixed-Drop Perceus prerequisite has
-passed correctness, mutation, O2 fixpoint and matched cost acceptance.** Its
+Status: **implemented and validated.** The separate mixed-Drop Perceus
+prerequisite passed correctness, mutation, O2 fixpoint and matched costs. Its
 [acceptance report](../benchmarks/results/compiler_drop_mixed_alias_2026-10-16.md)
-records +9 production / +164 tests. The original uniform non-Void discarded-result
-implementation remains parked and unlanded, pending fresh combined validation.
+records +9 production / +164 tests. The
+[discarded-result acceptance report](../benchmarks/results/compiler_discarded_result_2026-10-16.md)
+records +30 production / +448 tests, granular mutation proofs, sanitizer/leak
+and broad compiler gates, a fresh O2 fixpoint and cumulative matched costs.
 The rejected backend candidate remains parked for comparison and must not be
 integrated.
 
@@ -338,7 +340,7 @@ Seed tests with a nonempty origin table and previously minted RHS nodes, then
 include repeated/synthetic RHS locations and nested/shared-location wrappers.
 Those inputs must still produce distinct Void IDs and owner IDs, without
 revisiting or reevaluating the RHS. Keep all other pass state fields intact.
-The existing +100 production / +400 test ceilings and cost caps apply to this
+The existing +100 production / +450 test ceilings and cost caps apply to this
 API/context plumbing; stop for review if it cannot fit them.
 
 ## Ownership authorities and wrappers
@@ -397,32 +399,36 @@ It needs its own failing/passing tests and independent reviews before the discar
 slice depends on it. The discard slice additionally covers Drop-wrapped mixed
 results in both non-final and wildcard positions.
 
-## Accepted pilot ceilings and pending final plan review
+## Accepted pilot ceilings
 
-Root accepted these hard replacement ceilings for the internally reviewed
-rescope, subject to actual results. Final root/document review and the plan-only
-commit precede implementation; this is no permission to run compiled work.
+Root accepted these hard replacement ceilings before implementation. The
+reviewed plan commits precede the corresponding production and test changes;
+the acceptance report records the executed results and remaining evidence limits.
 
 - At most **+100 net handwritten production lines**, primarily the existing
   evaluation-normalization module. No backend, runtime or C-layout change.
   At most one additional existing production owner if identity plumbing proves
   necessary; no new index/context, pass/module/IR constructor or ownership metadata.
-- At most **+400 net handwritten test lines** across existing evaluation/Core
+- At most **+450 net handwritten test lines** across existing evaluation/Core
   owners and the runtime-memory regression. Preserve all baseline coverage.
   The extra allowance covers scoped wrapper fixtures, getter checks isolated to
   their emitted function, CorePassState setup for 27 existing API callers, and
   the three existing emitter assertions whose C shape changes with lexical owners.
   Remove only this task's rejected-candidate C-layout assertions, which no
   longer describe the revised change. Do not compress formatting to meet caps.
+  Up to 50 additional lines preserve Float/Float32 SIMD disposal coverage after
+  the audit's old nested-call spelling changes: two granular emitter callbacks
+  assert the named result's single release, while the audit checks direct kernel
+  dispatch and a named result binding. No new matcher or runtime mechanism.
 - Matched unchanged-workload source-to-C allocations **<= +0.1%**, retired
   instructions **<= +0.5%**. Investigate repeatable owning-phase increases;
   reject or rescope an over-budget result. Compiler data-model/context changes
   require those matched measurements before acceptance.
 
 Keep Blorp 2 source-constructor/argument lifting and String API wrapper work
-independent. This host fix remains based on cd061c77f; do not import unrelated
-working-tree changes from the primary checkout. No commits or integration are
-authorized by this proposal.
+independent. The discarded-result slice depends on the published mixed-Drop
+prerequisite; it imports no unrelated working-tree changes. Both slices retain
+the original cumulative workload baseline and cost ceilings.
 
 ## Required controls and acceptance
 

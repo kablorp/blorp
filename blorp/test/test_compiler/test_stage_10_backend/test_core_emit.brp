@@ -29132,19 +29132,34 @@ pure func test_emit_let_cleanup_tracks_owned_bytes() -> Bool:
 	)
 
 
-pure func test_emit_discard_assignment_borrows_then_drops_string() -> Bool:
+pure func test_emit_discard_assignment_hands_off_string_owner() -> Bool:
 	program: CoreProgram = {
 		decls = [FunctionDecl(let_discard_string_assignment_function())],
 		foreign_includes = [],
 		source_files = []
 	}
 	artifact: CArtifact = emit_source_spelled_c_artifact(program)
+	function_c = emitted_function_definition(
+		artifact.c_code,
+		"static long let_discard_string_assignment(void)",
+	)
+	retains = function_c.count("blorp_retain(")
+	drops = function_c.count("blorp_release(") + function_c.count("blorp_release_arc_only(")
 
 	(
-		artifact.c_code.contains("blorp_String* cwd = system__getcwd();")
-		and artifact.c_code.count("blorp_release_arc_only(cwd);") == 1
-		and not artifact.c_code.contains("blorp_CancelCleanupFrame __blorp_cleanup_cwd;")
-		and not artifact.c_code.contains("blorp_task_cleanup_push_with_task(&__blorp_cleanup_cwd")
+		function_c.count("system__getcwd()") == 1
+		and function_c.contains("blorp_String* cwd = system__getcwd();")
+		and function_c.contains("blorp_String* brp_vn_1 = cwd;")
+		and function_c.count("blorp_release(brp_vn_1);") == 1
+		and drops == retains + 1
+		and retains == 0
+		and not function_c.contains("blorp_release(cwd);")
+		and not function_c.contains("blorp_release_arc_only(cwd);")
+		and emitted_in_order(function_c, "cwd = system__getcwd();", "brp_vn_1 = cwd;")
+		and emitted_in_order(function_c, "brp_vn_1 = cwd;", "blorp_release(brp_vn_1);")
+		and emitted_in_order(function_c, "blorp_release(brp_vn_1);", "return 0;")
+		and not function_c.contains("blorp_CancelCleanupFrame")
+		and not function_c.contains("blorp_task_cleanup_push")
 	)
 
 
@@ -29155,13 +29170,59 @@ pure func test_emit_discard_assignment_releases_owned_string() -> Bool:
 		source_files = []
 	}
 	artifact: CArtifact = emit_source_spelled_c_artifact(program)
+	function_c = emitted_function_definition(
+		artifact.c_code,
+		"static long discard_owned_string_assignment(void)",
+	)
+	retains = function_c.count("blorp_retain(")
+	drops = function_c.count("blorp_release(") + function_c.count("blorp_release_arc_only(")
 
 	(
-		artifact.c_code.count("system__getcwd()") == 1
-		and artifact.c_code.count("blorp_release_arc_only(system__getcwd());") == 1
-		and not artifact.c_code.contains("blorp_CancelCleanupFrame")
-		and not artifact.c_code.contains("blorp_task_cleanup_push")
+		function_c.count("system__getcwd()") == 1
+		and function_c.contains("blorp_String* brp_vn_1 = system__getcwd();")
+		and function_c.count("blorp_release(brp_vn_1);") == 1
+		and drops == retains + 1
+		and retains == 0
+		and emitted_in_order(function_c, "brp_vn_1 = system__getcwd();", "blorp_release(brp_vn_1);")
+		and emitted_in_order(function_c, "blorp_release(brp_vn_1);", "return 0;")
+		and not function_c.contains("blorp_CancelCleanupFrame")
+		and not function_c.contains("blorp_task_cleanup_push")
 	)
+
+
+pure func discarded_simd_add_result_releases_once(kernel: String, element_type: CoreType) -> Bool:
+	vector_type = TensorType({ element_type = element_type, dims = [TensorStaticDim(64)] })
+	params = [{ tensor_param("left") | typ = vector_type }, { tensor_param("right") | typ = vector_type }]
+	producer = direct_builtin_call_function("discard_simd_add", kernel, params, vector_type, 373)
+	match producer.body:
+		Some(call):
+			fixture = { producer |
+				return_type = int_type(),
+				body = Some(SeqExpr(AssignExpr(named_var("_"), call, VoidType, synthetic_core_source_loc()), int_expr(0))),
+			}
+			program: CoreProgram = { decls = [FunctionDecl(fixture)], foreign_includes = [], source_files = [] }
+			signature = "static long discard_simd_add(blorp_Vector* left, blorp_Vector* right)"
+			function_c = emitted_function_definition(emit_source_spelled_c_artifact(program).c_code, signature)
+			binding = "blorp_Vector* brp_vn_1 = " + kernel + "(left, right);"
+			release = "blorp_release(brp_vn_1);"
+			(
+				function_c.count(kernel + "(") == 1
+				and function_c.count(binding) == 1
+				and function_c.count(release) == 1
+				and not function_c.contains("blorp_release_arc_only(brp_vn_1);")
+				and not function_c.contains("blorp_retain(brp_vn_1);")
+				and emitted_in_order(function_c, binding, release)
+				and emitted_in_order(function_c, release, "return 0;")
+			)
+		None: False
+
+
+pure func test_emit_discarded_simd_float_result_releases_once() -> Bool:
+	discarded_simd_add_result_releases_once("blorp_simd_vector_add_f64", float_type())
+
+
+pure func test_emit_discarded_simd_float32_result_releases_once() -> Bool:
+	discarded_simd_add_result_releases_once("blorp_simd_vector_add_f32", float32_type())
 
 
 pure func test_emit_discarded_scalar_expression_is_explicit() -> Bool:
@@ -29171,8 +29232,68 @@ pure func test_emit_discarded_scalar_expression_is_explicit() -> Bool:
 		source_files = []
 	}
 	artifact: CArtifact = emit_source_spelled_c_artifact(program)
+	function_c = emitted_function_definition(
+		artifact.c_code,
+		"static long discarded_scalar_expression(void)",
+	)
 
-	artifact.c_code.contains("(void)(1);")
+	(
+		function_c.count("long brp_vn_1 = 1;") == 1
+		and emitted_in_order(function_c, "brp_vn_1 = 1;", "return 0;")
+		and not function_c.contains("blorp_retain(")
+		and not function_c.contains("blorp_release(")
+		and not function_c.contains("blorp_release_arc_only(")
+	)
+
+
+pure func test_emit_discarded_runtime_getters_preserve_borrowed_results() -> Bool:
+	fixture: CoreFunction = tensor_borrowed_get_checked_set_function()
+	match fixture.body:
+		Some(CallExpr(_, _, [_, _, CastExpr(CallExpr(_, callee, args, typ, loc), result_type, result_loc)], _, _)):
+			var valid: Bool = True
+			for (name, arguments) in [
+				("blorp_checked_get", args),
+				("blorp_vector_get_or", args.append(LiteralExpr(StringLiteral("fallback"), string_type(), loc))),
+			]:
+				borrowed: CoreExpr = CastExpr(
+					CallExpr(direct_runtime_call_kind(name), callee, arguments, typ, loc),
+					result_type,
+					result_loc,
+				)
+				program: CoreProgram = {
+					decls = [FunctionDecl({ fixture |
+						return_type = int_type(),
+						body = Some(
+							SeqExpr(
+								borrowed,
+								SeqExpr(
+									AssignExpr(named_var("_"), borrowed, VoidType, loc),
+									int_expr(0),
+									),
+							),
+						),
+					})],
+					foreign_includes = [],
+					source_files = [],
+				}
+				artifact: CArtifact = emit_source_spelled_c_artifact(program)
+				function_c = emitted_function_definition(
+					artifact.c_code,
+					"static long copy_borrowed_string(blorp_Vector* target, blorp_Vector* source)",
+				)
+				retains = function_c.count("blorp_retain(")
+				drops = function_c.count("blorp_release(") + function_c.count("blorp_release_arc_only(")
+				valid = (
+					valid and function_c.count(name + "(") == 2
+					and retains == drops
+					and not function_c.contains("blorp_release(source);")
+					and not function_c.contains("blorp_release(target);")
+					and not function_c.contains("blorp_release_arc_only(source);")
+					and not function_c.contains("blorp_release_arc_only(target);")
+				)
+			valid
+		_:
+			False
 
 
 pure func test_emit_borrow_let_string_alias_has_no_cleanup() -> Bool:
@@ -32566,17 +32687,20 @@ tests: TestSuite = {
 		("emit drop release policies", test_emit_drop_release_policies),
 		("emit let cleanup tracks owned bytes", test_emit_let_cleanup_tracks_owned_bytes),
 		(
-			"emit discard assignment borrows then drops string",
-			test_emit_discard_assignment_borrows_then_drops_string,
+			"emit discard assignment hands off string owner",
+			test_emit_discard_assignment_hands_off_string_owner,
 		),
 		(
 			"emit discard assignment releases owned string",
 			test_emit_discard_assignment_releases_owned_string,
 		),
+		("discarded SIMD Float result releases once", test_emit_discarded_simd_float_result_releases_once),
+		("discarded SIMD Float32 result releases once", test_emit_discarded_simd_float32_result_releases_once),
 		(
 			"emit discarded scalar expression is explicit",
 			test_emit_discarded_scalar_expression_is_explicit,
 		),
+		("discarded runtime getters preserve borrowed results", test_emit_discarded_runtime_getters_preserve_borrowed_results),
 		(
 			"emit borrow let string alias has no cleanup",
 			test_emit_borrow_let_string_alias_has_no_cleanup,

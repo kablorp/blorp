@@ -8,9 +8,11 @@
 -- List elements use the same boundary before list allocation.
 -- Tensor scalar elements use the same boundary before tensor allocation;
 -- ranked row syntax is projected by the shared storage/shape issuer first.
+-- Discarded non-Void results also get ordinary owners, including literals;
+-- Perceus decides which acquisitions and releases their types require.
 import:
 	ir:
-		CoreBinderOrigin,
+		CoreBinderOrigin(PassTemporary),
 		CoreBoxedStorageValue,
 		CoreTensorBoxedLiteral,
 		CoreListConstruct,
@@ -20,25 +22,27 @@ import:
 		CoreDecl(FunctionDecl, GlobalDecl, ImplDecl),
 		CoreFunctionKind(ClosureBodyFunction),
 		CoreExpr(
-			BorrowLetExpr, BoxExpr, LambdaExpr, LetExpr, ListConstructExpr, LiteralExpr, ProductExpr,
+			AssignExpr, BorrowLetExpr, BoxExpr, LambdaExpr, LetExpr, ListConstructExpr, LiteralExpr, ProductExpr,
 			RecordReuseExpr, SeqExpr, StaticStringLiteralExpr, TensorBoxedLiteralExpr, TensorLiteralExpr, TensorPackedLiteralExpr, TupleExpr, UnionConstructExpr, VarExpr, VectorExpr, VoidExpr,
 		),
 		CoreFunction,
 		CoreMapState,
 		CoreProductBuild,
-		CoreProgram,
-		CoreType,
+		CoreType(VoidType),
 		CoreVar,
+		PassTempKind(PipelineTemp),
 		PRODUCT_FIELD_TEMP_ORIGIN,
 		PRODUCT_REUSE_SOURCE_TEMP_ORIGIN,
 		TENSOR_ELEMENT_TEMP_ORIGIN,
 		LIST_ELEMENT_TEMP_ORIGIN,
 		core_expr_source_loc,
 		core_expr_type,
+		core_node_id_resolve_origin,
 		core_var_equal,
 		product_build_values,
 		rewrite_product_build_values,
 	memory: same_object
+	pass_runner: CorePassState, core_mint_node_id, core_reserve_binder_ids
 	prepare: project_vector_literal_storage
 	traverse as CoreTraverse
 
@@ -53,6 +57,8 @@ private PRODUCT_REUSE_SOURCE_NAME_PREFIX: String = "$blorp$product_reuse_source$
 private TENSOR_ELEMENT_NAME_PREFIX: String = "$blorp$tensor_element$"
 
 private LIST_ELEMENT_NAME_PREFIX: String = "$blorp$list_element$"
+
+private DISCARDED_RESULT_NAME_PREFIX: String = "$blorp$discarded_result$"
 
 
 private record ProductValueBinding {
@@ -70,13 +76,8 @@ private record ProductFieldEvaluation {
 
 private record ProductEvaluationTraversal {
 	next_binder_id: Int,
+	mint_state: CorePassState,
 	local_variables: List[CoreVar]
-}
-
-
-record ProductEvaluationResult {
-	program: CoreProgram,
-	ids_used: Int
 }
 
 
@@ -384,6 +385,30 @@ private pure func normalize_reuse(
 		}
 
 
+private pure func discard_result(
+	state: ProductEvaluationTraversal,
+	value: CoreExpr,
+) -> CoreMapState[ProductEvaluationTraversal, CoreExpr]:
+	match core_expr_type(value):
+		VoidType:
+			{ state = state, value = value }
+		_:
+			variable: CoreVar = {
+				name = DISCARDED_RESULT_NAME_PREFIX + state.next_binder_id.to_string(),
+				id = state.next_binder_id,
+				def_id = None,
+				origin = PassTemporary(PipelineTemp, 0)
+			}
+			origin = core_node_id_resolve_origin(core_expr_source_loc(value), state.mint_state.minted_origins)
+			(minted, void_id) = core_mint_node_id(state.mint_state, origin)
+			{
+				state = { state | next_binder_id = state.next_binder_id - 1, mint_state = minted },
+				-- Keep the continuation outside this constant body: later ownership
+				-- queries must not rescan the rest of a long discarded-value spine.
+				value = LetExpr(variable, False, core_expr_type(value), value, VoidExpr(VoidType, void_id))
+			}
+
+
 private pure func normalize_expr(
 	state: ProductEvaluationTraversal,
 	expr: CoreExpr,
@@ -406,9 +431,10 @@ private pure func normalize_expr(
 
 			for item in spine.preceding_items:
 				mapped = normalize_expr(current, item)
-				current = mapped.state
-				preceding = preceding.append(mapped.value)
-				changed = changed or not same_object(mapped.value, item)
+				discarded = discard_result(mapped.state, mapped.value)
+				current = discarded.state
+				preceding = preceding.append(discarded.value)
+				changed = changed or not same_object(discarded.value, item)
 
 			final_item = normalize_expr(current, spine.final_item)
 			normalized: CoreExpr = if not changed and same_object(final_item.value, spine.final_item):
@@ -425,6 +451,13 @@ private pure func normalize_expr(
 		_:
 			mapped = CoreTraverse.map_core_expr_children_with_state(state, normalize_expr, expr)
 			match mapped.value:
+				AssignExpr(variable, rhs, _, _):
+					if variable.name == "_":
+						match core_expr_type(rhs):
+							VoidType: mapped
+							_: discard_result(mapped.state, rhs)
+					else:
+						mapped
 				ListConstructExpr(construct, typ, _):
 					list = normalize_list(mapped.state.next_binder_id, construct, typ, mapped.value)
 					{ state = { mapped.state | next_binder_id = list.state }, value = list.value }
@@ -460,9 +493,9 @@ private pure func normalize_expr(
 					mapped
 
 private pure func normalize_function(
-	next_binder_id: Int,
+	state: ProductEvaluationTraversal,
 	function: CoreFunction,
-) -> CoreMapState[Int, CoreFunction]:
+) -> CoreMapState[ProductEvaluationTraversal, CoreFunction]:
 	match function.body:
 		Some(body):
 			parameters: List[CoreVar] = function.params.map(func(param): param.name)
@@ -472,28 +505,26 @@ private pure func normalize_function(
 						name = capture.name, id = capture.id, def_id = None, origin = capture.origin
 					}))
 				_: []
-			mapped = normalize_expr({
-				next_binder_id = next_binder_id,
+			mapped = normalize_expr({ state |
 				local_variables = declared_local_variables(body, parameters.concat(closure_parameters))
 			}, body)
-			{ state = mapped.state.next_binder_id, value = { function | body = Some(mapped.value) } }
+			{ state = mapped.state, value = { function | body = Some(mapped.value) } }
 		None:
-			{ state = next_binder_id, value = function }
+			{ state = state, value = function }
 
 
 ---
-Normalize products at the ownership boundary. `next_binder_id` is the pass
-runner's shared descending frontier; the caller reserves `ids_used` before
-the next pass can mint a binder. Each build retains its checked ordinals.
+Normalize evaluation at the ownership boundary. Reserve the shared binder
+frontier in one batch and carry the node allocator advanced by discard bodies.
+Each product build retains its checked ordinals.
 ---
-pure func normalize_product_evaluation(
-	program: CoreProgram,
-	next_binder_id: Int,
-) -> ProductEvaluationResult:
-	var current: Int = next_binder_id
+pure func normalize_product_evaluation(state: CorePassState) -> CorePassState:
+	var current: ProductEvaluationTraversal = {
+		next_binder_id = state.next_binder_id, mint_state = state, local_variables = [],
+	}
 	var declarations: List[CoreDecl] = []
 
-	for decl in program.decls:
+	for decl in state.program.decls:
 		match decl:
 			FunctionDecl(function):
 				mapped = normalize_function(current, function)
@@ -503,8 +534,8 @@ pure func normalize_product_evaluation(
 				if product_evaluation_is_literal_global(global.init):
 					declarations = declarations.append(decl)
 				else:
-					mapped = normalize_expr({ next_binder_id = current, local_variables = declared_local_variables(global.init, []) }, global.init)
-					current = mapped.state.next_binder_id
+					mapped = normalize_expr({ current | local_variables = declared_local_variables(global.init, []) }, global.init)
+					current = mapped.state
 					declarations = declarations.append(GlobalDecl({ global | init = mapped.value }))
 			ImplDecl(implementation):
 				var methods: List[CoreFunction] = []
@@ -518,7 +549,7 @@ pure func normalize_product_evaluation(
 			_:
 				declarations = declarations.append(decl)
 
-	{
-		program = { program | decls = declarations },
-		ids_used = next_binder_id - current
-	}
+	core_reserve_binder_ids(
+		{ current.mint_state | program = { state.program | decls = declarations } },
+		state.next_binder_id - current.next_binder_id,
+	)

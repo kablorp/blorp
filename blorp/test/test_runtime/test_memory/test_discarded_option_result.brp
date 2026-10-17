@@ -1,0 +1,173 @@
+import:
+	float: to_float32
+	memory:
+		MemoryCounter(ManagedAllocations, ManagedReleases, LiveManagedObjects, MemoryStatsActive),
+		read_memory_counter, reset_mem_stats
+	string: from_char
+	test: TestSuite
+
+
+var PRODUCER_CALLS: Int = 0
+
+
+func runtime_int(value: Int) -> Int:
+	PRODUCER_CALLS += 1
+	value
+
+
+func make_option(value: Int) -> Option[String]:
+	if value < 0:
+		None
+	else:
+		Some(from_char(to_char(runtime_int(value))))
+
+
+func return_alias(value: Option[String]) -> Option[String]:
+	value
+
+
+func heap_discard(mode: Int) -> Bool:
+	match mode:
+		0:
+			Some(from_char(to_char(runtime_int(233))))
+			void
+		1:
+			make_option(233)
+			void
+		2:
+			_ = make_option(233)
+			void
+		3:
+			from_char(to_char(runtime_int(233)))
+			void
+		5:
+			left: Float[#64] = vector(1.0, 64)
+			right: Float[#64] = vector(2.0, 64)
+			_ = left + right
+		6:
+			left: Float32[#64] = vector(to_float32(1.0), 64)
+			right: Float32[#64] = vector(to_float32(2.0), 64)
+			_ = left + right
+		_:
+			runtime_int(7)
+			void
+	True
+
+
+func discarded_returned_alias() -> Bool:
+	value = make_option(233)
+	copy = value
+	return_alias(copy)
+	match value:
+		Some(payload): payload == "é"
+		None: False
+
+
+func named_and_consumed_control() -> Bool:
+	unused = make_option(233)
+	value = make_option(233)
+	unused_copy = return_alias(value)
+	match value:
+		Some(payload): payload == "é"
+		None: False
+
+
+func discarded_parameter_alias(value: Option[String]) -> Bool:
+	value
+	_ = value
+	_ = if PRODUCER_CALLS > 0:
+		value
+	else:
+		None
+	match value:
+		Some(payload): payload == "é"
+		None: False
+
+
+func parameter_control() -> Bool:
+	value = make_option(233)
+	values: String[#1] = {from_char(to_char(runtime_int(233)))}
+	values[0]
+	_ = values[0]
+	discarded_parameter_alias(value) and values[0] == "é"
+
+
+func mixed_discard(choose: Bool) -> Bool:
+	value = make_option(233)
+	if choose:
+		value
+	else:
+		make_option(233)
+	_ = if choose:
+		value
+	else:
+		make_option(233)
+	if choose:
+		make_option(233)
+	else:
+		value
+	_ = if choose:
+		make_option(233)
+	else:
+		value
+	match value:
+		Some(payload): payload == "é"
+		None: False
+
+
+func static_control() -> Bool:
+	make_option(65)
+	_ = make_option(65)
+	make_option(-1)
+	_ = make_option(-1)
+	True
+
+
+func bind_unused() -> Void:
+	unused = make_option(233)
+	void
+
+
+func void_tail() -> Void:
+	bind_unused()
+
+
+func void_control() -> Bool:
+	void_tail()
+	True
+
+
+func measure(workload: () -> Bool, expected_calls: Int, expect_heap: Bool) -> Bool:
+	PRODUCER_CALLS = 0
+	reset_mem_stats()
+	valid = workload()
+	active = read_memory_counter(MemoryStatsActive)
+	allocations = read_memory_counter(ManagedAllocations)
+	releases = read_memory_counter(ManagedReleases)
+	live = read_memory_counter(LiveManagedObjects)
+	allocated = if expect_heap:
+		allocations > 0
+	else:
+		allocations == 0
+	valid and PRODUCER_CALLS == expected_calls and active == 1 and allocated and releases == allocations and live == 0
+
+
+tests: TestSuite = {
+	description = "Discarded owned Option and String results",
+	tests = [
+		("inline Some executes once and releases payload", func(): measure(func(): heap_discard(0), 1, True)),
+		("ordinary Option call executes once and releases payload", func(): measure(func(): heap_discard(1), 1, True)),
+		("wildcard Option call executes once and releases payload", func(): measure(func(): heap_discard(2), 1, True)),
+		("direct String call executes once and releases payload", func(): measure(func(): heap_discard(3), 1, True)),
+		("discarded SIMD Float result releases heap objects", func(): measure(func(): heap_discard(5), 0, True)),
+		("discarded SIMD Float32 result releases heap objects", func(): measure(func(): heap_discard(6), 0, True)),
+		("discarded returned alias preserves other owners", func(): measure(discarded_returned_alias, 1, True)),
+		("named unused aliases and consumed return release payloads", func(): measure(named_and_consumed_control, 2, True)),
+		("ASCII and None discards have no heap payload", func(): measure(static_control, 2, False)),
+		("discarded parameter and tensor aliases keep owners", func(): measure(parameter_control, 2, True)),
+		("mixed If chooses borrowed then owned arms", func(): measure(func(): mixed_discard(True), 3, True)),
+		("mixed If chooses owned then borrowed arms", func(): measure(func(): mixed_discard(False), 3, True)),
+		("scalar discard executes once without ownership work", func(): measure(func(): heap_discard(4), 1, False)),
+		("Void tail releases unused binding", func(): measure(void_control, 1, True)),
+	]
+}
