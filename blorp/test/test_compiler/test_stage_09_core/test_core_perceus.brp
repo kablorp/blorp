@@ -206,7 +206,7 @@ import:
 		consumed_parameter_balancing_is_identity,
 		move_only_owner_alias,
 	../../../src/compiler/stage_09_core/perceus/results_and_loops:
-		call_ownership_normalization_reuses_source,
+		call_ownership_normalization_reuses_source, normalize_scoped_binding_alias_result,
 	../../../src/compiler/stage_09_core/perceus/uses:
 		borrowed_result_aliases_param,
 		count_uses,
@@ -10342,6 +10342,165 @@ pure func has_branch_local_owned_result_retain(expr: CoreExpr) -> Bool:
 			has_branch_local_owned_result_retain(body)
 		_:
 			False
+
+
+-- Direct result fixtures have ambient payload/choose parameters and an owned
+-- other local; the managed-Let fixture below constructs that complete scope.
+pure func test_drop_mixed_borrowed_then_owned_acquires_only_borrowed_arm() -> Bool:
+	typ = string_type()
+	env = perceus_env_for_managed_types(["String"])
+	borrowed = var_expr("payload", typ)
+	owned = call_expr("blorp_getcwd", [], typ)
+	condition = var_expr("choose", bool_type())
+	loc = pack_core_source_loc(0, 10, 1, 10, 20)
+	mixed = IfExpr(condition, borrowed, owned, typ, synthetic_core_source_loc())
+	input = DropExpr(named_var("other"), typ, ArcReleaseOnlyPolicy, mixed, typ, loc)
+	match normalize_scoped_binding_alias_result(env, [], input):
+		DropExpr(_, _, ArcReleaseOnlyPolicy, IfExpr(kept_condition, acquired, kept_owned, _, _), _, _):
+			match acquired:
+				BorrowLetExpr(temp, _, rhs, DupExpr(retained, _, ArcRetainPolicy, VarExpr(returned, _, _), _, _)):
+					(
+						contract_is(contract_for_call(env, BuiltinCall("blorp_getcwd"), 0, typ), [], ReturnOwned)
+						and same_object(kept_condition, condition) and same_object(kept_owned, owned)
+						and same_object(rhs, borrowed) and exact_core_var_equal(temp, retained)
+						and exact_core_var_equal(temp, returned)
+					)
+				_: False
+		_: False
+
+
+pure func test_drop_mixed_owned_then_borrowed_acquires_only_borrowed_arm() -> Bool:
+	typ = string_type()
+	env = perceus_env_for_managed_types(["String"])
+	borrowed = var_expr("payload", typ)
+	owned = call_expr("blorp_getcwd", [], typ)
+	condition = var_expr("choose", bool_type())
+	loc = pack_core_source_loc(0, 11, 1, 11, 20)
+	mixed = IfExpr(condition, owned, borrowed, typ, synthetic_core_source_loc())
+	input = DropExpr(named_var("other"), typ, ArcReleaseOnlyPolicy, mixed, typ, loc)
+	match normalize_scoped_binding_alias_result(env, [], input):
+		DropExpr(_, _, ArcReleaseOnlyPolicy, IfExpr(kept_condition, kept_owned, acquired, _, _), _, _):
+			match acquired:
+				BorrowLetExpr(temp, _, rhs, DupExpr(retained, _, ArcRetainPolicy, VarExpr(returned, _, _), _, _)):
+					(
+						contract_is(contract_for_call(env, BuiltinCall("blorp_getcwd"), 0, typ), [], ReturnOwned)
+						and same_object(kept_condition, condition) and same_object(kept_owned, owned)
+						and same_object(rhs, borrowed) and exact_core_var_equal(temp, retained)
+						and exact_core_var_equal(temp, returned)
+					)
+				_: False
+		_: False
+
+
+pure func test_nested_mixed_drops_preserve_metadata_and_acquisition_origin() -> Bool:
+	typ = string_type()
+	env = perceus_env_for_managed_types(["String", "List"])
+	outer = { named_var("outer") | id = 41 }
+	inner = { named_var("inner") | id = 42 }
+	outer_loc = pack_core_source_loc(0, 20, 1, 20, 20)
+	inner_loc = pack_core_source_loc(0, 21, 1, 21, 20)
+	borrow_loc = pack_core_source_loc(0, 22, 1, 22, 20)
+	borrowed = VarExpr(named_var("payload"), typ, borrow_loc)
+	owned = call_expr("blorp_getcwd", [], typ)
+	condition = var_expr("choose", bool_type())
+	mixed = IfExpr(condition, borrowed, owned, typ, borrow_loc)
+	input = DropExpr(outer, list_int_type(), ArcReleasePolicy,
+		DropExpr(inner, typ, ArcReleaseOnlyPolicy, mixed, typ, inner_loc), typ, outer_loc,
+	)
+	match normalize_scoped_binding_alias_result(env, [], input):
+		DropExpr(outer_var, outer_type, ArcReleasePolicy, inner_drop, outer_result, kept_outer_loc):
+			match inner_drop:
+				DropExpr(inner_var, inner_type, ArcReleaseOnlyPolicy, IfExpr(kept_condition, acquired, kept_owned, if_type, if_loc), inner_result, kept_inner_loc):
+					match acquired:
+						BorrowLetExpr(temp, _, rhs, DupExpr(retained, _, ArcRetainPolicy, VarExpr(returned, _, _), _, _)):
+							origins_valid = match (outer_var.origin, inner_var.origin, temp.origin):
+								(AuthoredBinder, AuthoredBinder, PerceusTemporary(PerceusOwnedResult, 0)): True
+								_: False
+							(
+								exact_core_var_equal(outer_var, outer) and exact_core_var_equal(inner_var, inner)
+								and core_type_equal(outer_type, list_int_type()) and core_type_equal(inner_type, typ)
+								and core_type_equal(outer_result, typ) and core_type_equal(inner_result, typ)
+								and core_type_equal(if_type, typ) and if_loc == borrow_loc
+								and kept_outer_loc == outer_loc and kept_inner_loc == inner_loc and origins_valid
+								and temp.id == perceus_temporary_binder_id(borrow_loc)
+								and same_object(rhs, borrowed) and same_object(kept_owned, owned)
+								and same_object(kept_condition, condition) and exact_core_var_equal(temp, retained)
+								and exact_core_var_equal(temp, returned)
+							)
+						_: False
+				_: False
+		_: False
+
+
+pure func test_wholly_owned_drop_results_keep_source_identity() -> Bool:
+	typ = string_type()
+	env = perceus_env_for_managed_types(["String"])
+	owned = call_expr("blorp_getcwd", [], typ)
+	loc = pack_core_source_loc(0, 30, 1, 30, 20)
+	owned_conditional = IfExpr(var_expr("choose", bool_type()), owned, call_expr("blorp_getcwd", [], typ), typ, loc)
+	var valid: Bool = contract_is(contract_for_call(env, BuiltinCall("blorp_getcwd"), 0, typ), [], ReturnOwned)
+	for result in [owned, owned_conditional]:
+		input = DropExpr(named_var("other"), typ, ArcReleaseOnlyPolicy, result, typ, loc)
+		valid = valid and same_object(normalize_scoped_binding_alias_result(env, [], input), input)
+	valid
+
+
+pure func test_managed_let_drop_mixed_result_preserves_later_payload_use() -> Bool:
+	typ = string_type()
+	loc = pack_core_source_loc(0, 40, 1, 40, 20)
+	payload = var_expr("payload", typ)
+	mixed = IfExpr(var_expr("choose", bool_type()), payload, call_expr("blorp_getcwd", [], typ), typ, loc)
+	body = LetExpr(named_var("other"), False, typ, call_expr("blorp_getcwd", [], typ),
+		LetExpr(named_var("selected"), False, typ,
+			DropExpr(named_var("other"), typ, ArcReleaseOnlyPolicy, mixed, typ, loc),
+			call_expr("blorp_codepoint_length", [payload], int_type()),
+		),
+	)
+	declaration = match function_decl("mixed_drop_owner", 1,
+		[core_param("payload", typ), core_param("choose", bool_type())], int_type(), body,
+	):
+		FunctionDecl(function): FunctionDecl({ function | is_pure = False })
+		other: other
+	program: CoreProgram = { decls = [declaration], foreign_includes = [], source_files = [] }
+	-- The solved contract consumes payload; the two branch Drops are mutually exclusive.
+	-- Its final Drop follows the later payload read, balancing the incoming unit.
+	facts = infer_ownership_contracts(resolve_global_value_refs(program))
+	contract_valid = inferred_contract_has_consumed_indices(facts.env, "mixed_drop_owner", 1, [0])
+	match function_body(insert_drops_program(program), "mixed_drop_owner"):
+		Some(rewritten):
+			scope_valid = match rewritten:
+				LetExpr(_, False, _, _, LetExpr(selected, False, _, rhs, tail)):
+					branch_balance = match rhs:
+						DupExpr(source, _, ArcRetainPolicy, DropExpr(_, _, _, IfExpr(_, borrowed_arm, owned_arm, _, _), _, _), _, _):
+							(
+								exact_core_var_equal(source, named_var("payload"))
+								and drop_count_for("payload", borrowed_arm) == 1
+								and drop_count_for("payload", owned_arm) == 1
+							)
+						_: False
+					read_before_final_drop = match tail:
+						LetExpr(result, False, _, DropExpr(selected_drop, _, _, read, _, _), DropExpr(final_drop, _, _, VarExpr(returned, _, _), _, _)):
+							match read:
+								CallExpr(BuiltinCall("blorp_codepoint_length"), _, [VarExpr(read_payload, _, _)], _, _):
+									(
+										exact_core_var_equal(read_payload, named_var("payload"))
+										and exact_core_var_equal(final_drop, read_payload)
+										and exact_core_var_equal(selected_drop, selected)
+										and exact_core_var_equal(returned, result)
+										and drop_count_for("payload", tail) == 1
+									)
+								_: False
+						_: False
+					branch_balance and read_before_final_drop
+				_: False
+			(
+				contract_valid
+				and has_branch_local_owned_result_retain(rewritten) and scope_valid
+				and dup_count_for("payload", rewritten) == 1
+				and drop_count_for("other", rewritten) == 1 and drop_count_for("selected", rewritten) == 1
+				and drop_count_for("payload", rewritten) == 3 and count_uses("payload", rewritten) == 2
+			)
+		None: False
 
 
 pure func test_same_call_mixed_conditional_retains_only_borrowed_branch() -> Bool:
@@ -21682,6 +21841,11 @@ pure func test_constructor_spelling_without_identity_does_not_expose_argument_re
 tests: TestSuite = {
 	description = "Blorp compiler Core Perceus",
 	tests = [
+		("Drop mixed borrowed then owned acquires only borrowed arm", test_drop_mixed_borrowed_then_owned_acquires_only_borrowed_arm),
+		("Drop mixed owned then borrowed acquires only borrowed arm", test_drop_mixed_owned_then_borrowed_acquires_only_borrowed_arm),
+		("nested mixed Drops preserve metadata and acquisition origin", test_nested_mixed_drops_preserve_metadata_and_acquisition_origin),
+		("wholly owned Drop results keep source identity", test_wholly_owned_drop_results_keep_source_identity),
+		("managed Let Drop mixed result preserves later payload use", test_managed_let_drop_mixed_result_preserves_later_payload_use),
 		("local owner balances nested consuming argument", test_local_owner_balances_nested_consuming_argument),
 		("one temporary projection match acquires child once", test_one_temporary_projection_match_acquires_child_once),
 		("two temporary projection match acquires child once", test_two_temporary_projection_match_acquires_child_once),

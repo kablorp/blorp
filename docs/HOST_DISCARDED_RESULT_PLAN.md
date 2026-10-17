@@ -1,8 +1,10 @@
 # Discarded managed results acquire ordinary lexical owners
 
-Status: **design approved by root and an independent compiler expert, including
-the uniform non-Void rule, existing identity APIs and numerical ceilings.**
-Implementation and compiled validation remain pending a separate TDD lane.
+Status: **design approved; the separate mixed-Drop Perceus prerequisite has
+passed correctness, mutation, O2 fixpoint and matched cost acceptance.** Its
+[acceptance report](../benchmarks/results/compiler_drop_mixed_alias_2026-10-16.md)
+records +9 production / +164 tests. The original uniform non-Void discarded-result
+implementation remains parked and unlanded, pending fresh combined validation.
 The rejected backend candidate remains parked for comparison and must not be
 integrated.
 
@@ -370,10 +372,11 @@ remain unchanged.
 
 Independent review traced a gap in
 `perceus/results_and_loops.normalize_scoped_binding_alias_result`: unlike If,
-Let, BorrowLet and Seq, it does not descend through Drop. For a Drop wrapping
-a mixed borrowed/owned If, it acquires the whole result rather than just the
-borrowed arm. This is source-traced evidence; an executed failing test is still
-required before changing production.
+Let, BorrowLet and Seq, it did not descend through Drop. For a Drop wrapping
+a mixed borrowed/owned If, it acquired the whole result rather than just the
+borrowed arm. The separate prerequisite now has executed failing/passing tests
+and accepted costs; see the report linked above. Its scoped repair preserves the
+design and boundaries below.
 
 ```text
 Drop(other, If(condition, borrowed, owned))
