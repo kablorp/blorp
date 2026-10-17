@@ -1794,6 +1794,21 @@ ordinary matching, copying and destruction preserve its lifetime. The
 returns a String through a Some-pattern and separately discards an encoded result.
 Host interface publication and source Char migration remain separate work.
 
+## Current directory
+
+Import `system: get_current_directory` to call the impure, zero-argument
+`get_current_directory() -> Result[String, String]`. Match its ordinary
+`Ok(path)` and `Err(error)` constructors; see the
+[complete program](test/e2e/fixtures/current_directory/basic.brp).
+Success owns a fresh, nonempty absolute pathname with exact validated UTF-8
+bytes. Native storage grows as needed. Empty, relative or malformed native
+paths return a useful valid-text error. OS errors include a saved numeric errno,
+and EINTR returns immediately. The operation prints nothing.
+Both Result branches own their String; matching, copying, discarding and
+[escaping a payload](test/e2e/fixtures/current_directory/ownership.brp) use the
+existing union ownership rules. Loader migration and remaining M6 shell work
+remain pending.
+
 ## Float64 calculator
 
 The designated foundation `_base.brp` owns `Float`, a binary64 unmanaged value. Decimal source

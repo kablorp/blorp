@@ -1,0 +1,166 @@
+import:
+	../../../src/check/check: check, checked_functions
+	../../../src/check/model as Model
+	../../../src/namespace/builtins as Builtins
+	../../../src/check/render: render_failure
+	../../../src/utils/ids: union_number, variant_owner
+	../../../src/utils/source: module_source, root_module_id, same_source
+	../../../src/utils/syntax: Purity(Impure), same_purity
+	../../../src/utils/text: concat
+	../module_input: parse_modules, TEST_BASE
+	../current_directory_inputs: checked_current_directory
+	int as IntOps
+	test: TestSuite
+
+
+private HELP: String = "declare an impure nongeneric function with no parameters returning Result[String, String]"
+
+
+func test_current_directory_checks_as_designated_result() -> Bool:
+	match checked_current_directory(TEST_BASE):
+		Err(error):
+			print_error(error.message)
+			print_error(error.help)
+			print_error(IntOps.to_string(error.span.start).concat("..").concat(IntOps.to_string(error.span.end)))
+			False
+		Ok(_):
+			True
+
+
+private BODY: String =
+	|    builtin("system.get_current_directory")
+	|func main() -> Int:
+	|    0
+	|
+
+
+pure func test_current_directory_contract_keeps_both_string_payloads() -> Bool:
+	match checked_current_directory(TEST_BASE):
+		Err(_): False
+		Ok(program):
+			match checked_functions(program).functions.get(0):
+				Some(function):
+					match function.body:
+						Model.CheckedValueBody(Model.ReturnExpression(value)):
+							match value.form:
+								Model.InvokeFunction(call, []):
+									match call.target:
+										Model.RuntimeFunction(operation):
+											contract = Builtins.runtime_contract(operation)
+											match (function.signature.return_type.value_type, contract.return_type):
+												(Model.AppliedUnionType(owner, [Model.StringType, Model.StringType]), Builtins.ResultResult(success, error, designated)):
+													match (success, error):
+														(Builtins.PrimitiveRuntimeType(Builtins.BuiltinString), Builtins.PrimitiveRuntimeType(Builtins.BuiltinString)):
+															(
+																same_purity(contract.purity, Impure)
+																and contract.parameters.is_empty()
+																and union_number(owner) == union_number(variant_owner(designated.ok))
+																and union_number(owner) == union_number(variant_owner(designated.err))
+															)
+														_: False
+												_: False
+										_: False
+								_: False
+						_: False
+				None: False
+
+
+private pure func diagnostic_is(source: String, message: String, help: String, start: Int, end: Int) -> Bool:
+	match parse_modules([{ source = source, targets = [] }]):
+		Err(_): False
+		Ok(parsed):
+			match check(parsed):
+				Ok(_): False
+				Err(failure):
+					diagnostics = render_failure(failure)
+					error = diagnostics.first
+					(
+						diagnostics.remaining.is_empty() and error.note.is_none()
+						and error.message == message and error.help == help
+						and same_source(error.span.source, module_source(root_module_id()))
+						and error.span.start == start and error.span.end == end
+					)
+
+
+private pure func header_rejected(header: String) -> Bool:
+	label_start = header.length() + "\n    builtin(".length()
+	diagnostic_is(
+		header + "\n" + BODY,
+		"builtin declaration does not match its runtime contract", HELP,
+		label_start, label_start + "\"system.get_current_directory\"".length(),
+	)
+
+
+pure func test_current_directory_rejects_pure_header() -> Bool:
+	header_rejected("pure func query() -> Result[String, String]:")
+
+
+pure func test_current_directory_rejects_generic_header() -> Bool:
+	header_rejected("func query[T]() -> Result[String, String]:")
+
+
+pure func test_current_directory_rejects_parameters() -> Bool:
+	header_rejected("func query(value: Int) -> Result[String, String]:")
+
+
+pure func test_current_directory_rejects_wrong_success_payload() -> Bool:
+	header_rejected("func query() -> Result[Int, String]:")
+
+
+pure func test_current_directory_rejects_wrong_error_payload() -> Bool:
+	header_rejected("func query() -> Result[String, Int]:")
+
+
+pure func test_current_directory_rejects_ordinary_result() -> Bool:
+	header: String =
+		|fixed union Other[A, B]:
+		|    Yes(A)
+		|    No(B)
+		|func query() -> Other[String, String]:
+	header_rejected(header)
+
+
+pure func test_current_directory_rejects_pure_caller() -> Bool:
+	source: String =
+		|func query() -> Result[String, String]:
+		|    builtin("system.get_current_directory")
+		|pure func illegal() -> Result[String, String]:
+		|    query()
+		|func main() -> Int:
+		|    0
+		|
+	match source.index_of("    query()"):
+		None: False
+		Some(line):
+			start = line + "    ".length()
+			diagnostic_is(source, "pure functions cannot call impure functions",
+				"mark the callee pure or remove pure from the caller", start, start + "query".length())
+
+
+pure func test_current_directory_rejects_tail_annotation() -> Bool:
+	source: String =
+		|@tail_recursive
+		|func query() -> Result[String, String]:
+		|    builtin("system.get_current_directory")
+		|func main() -> Int:
+		|    0
+		|
+	diagnostic_is(source, "builtin bodies cannot have a tail-recursion annotation",
+		"remove @tail_recursive from the builtin declaration", 0, "@tail_recursive".length())
+
+
+tests: TestSuite = {
+	description = "Blorp 2 current directory contract",
+	tests = [
+		("current directory checks as designated Result", test_current_directory_checks_as_designated_result),
+		("current directory carries both String result payloads", test_current_directory_contract_keeps_both_string_payloads),
+		("pure header rejects", test_current_directory_rejects_pure_header),
+		("generic header rejects", test_current_directory_rejects_generic_header),
+		("parameters reject", test_current_directory_rejects_parameters),
+		("wrong success payload rejects", test_current_directory_rejects_wrong_success_payload),
+		("wrong error payload rejects", test_current_directory_rejects_wrong_error_payload),
+		("ordinary result rejects", test_current_directory_rejects_ordinary_result),
+		("pure caller rejects", test_current_directory_rejects_pure_caller),
+		("tail annotation rejects", test_current_directory_rejects_tail_annotation),
+	]
+}

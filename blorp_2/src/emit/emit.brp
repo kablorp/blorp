@@ -2,10 +2,11 @@ import:
 	../namespace/builtins:
 		DesignatedBoolean,
 		DesignatedOption,
+		DesignatedResult,
 		RuntimeOperation(
 			IntAdd, IntSubtract, IntMultiply, IntDivide, IntRemainder, IntToString, StringLength,
 			StringPrint, StringParseInt, StringParseFloat, ListRepeat, ListLength, ListGet, ListAppend, ListSet,
-			StringByteAt, StringFromCodepoint,
+			StringByteAt, StringFromCodepoint, GetCurrentDirectory,
 			ListConcat, StringEquals,
 			IntEquals, FloatAdd, FloatSubtract, FloatMultiply, FloatDivide, FloatRemainder,
 			FloatToString,
@@ -20,6 +21,7 @@ import:
 			MissingAggregateMember, MissingUnionPayloadField,
 		), render,
 	../runtime/float: float_parse_runtime, float_runtime, float_string_runtime
+	../runtime/system: SYSTEM_CURRENT_DIRECTORY_RUNTIME
 	int as IntOps
 	list: join
 	../runtime/list:
@@ -153,6 +155,8 @@ private pure func c_callable(target: CallTarget) -> String:
 					"blorp_string_byte_at"
 				StringFromCodepoint(_):
 					"blorp_string_from_codepoint"
+				GetCurrentDirectory(_):
+					"blorp_get_current_directory"
 				ListRepeat(element):
 					"blorp_list_repeat_".concat(list_suffix(list_element_key(element)))
 				ListLength(element):
@@ -1134,6 +1138,24 @@ private pure func append_string_from_codepoint(
 	append_optional_value(prefix, id, option, scratch.concat("_some"), scratch, unions, span)
 
 
+private pure func append_current_directory(
+	output: String,
+	id: ValueId,
+	result: DesignatedResult[VariantInstanceId],
+	unions: List[ConcreteUnion],
+	span: Span,
+) -> Result[String, Diagnostic]:
+	declaration ?= c_local_declaration(UnionType(variant_owner(result.ok)), InitializedLocal, unions, span)
+	scratch = "blorp_runtime_".append_int(value_number(id))
+	ok ?= c_union_value(result.ok, [scratch], unions, span)
+	error ?= c_union_value(result.err, [scratch], unions, span)
+	-- Both branches take the one fresh String. Scratch has no separate obligation.
+	Ok(output.concat("struct blorp_string *").concat(scratch).concat("=NULL;const uint8_t ")
+		.concat(scratch).concat("_ok=blorp_get_current_directory(&").concat(scratch).concat(");")
+		.concat(declaration).concat(c_value(id)).concat("=").concat(scratch).concat("_ok?")
+		.concat(ok).concat(":").concat(error).concat(";(void)").concat(c_value(id)).concat(";"))
+
+
 private pure func append_list_get(
 	output: String,
 	id: ValueId,
@@ -1208,6 +1230,8 @@ private pure func append_value(
 					append_string_byte_at(output, id, option, arguments, unions, span)
 				RuntimeFunction(StringFromCodepoint(option)):
 					append_string_from_codepoint(output, id, option, arguments, unions, span)
+				RuntimeFunction(GetCurrentDirectory(result)):
+					append_current_directory(output, id, result, unions, span)
 				RuntimeFunction(StringEquals(boolean)):
 					append_equals(output, id, boolean, arguments, unions, StringComparison, span)
 				RuntimeFunction(IntEquals(boolean)):
@@ -1978,6 +2002,7 @@ private pure func innermost_element(value_type: TypeRef) -> TypeRef:
 -- selects its own helper. Allocation headers follow from the layouts and the
 -- argument vector from the entrypoint, which already own those facts.
 private fixed record RuntimeRequirements {
+	current_directory: Bool,
 	string_types: Bool,
 	float_types: Bool,
 	integer_addition: Bool,
@@ -1992,6 +2017,7 @@ private fixed record RuntimeRequirements {
 
 private pure func runtime_requirements(inventory: ProgramInventory) -> RuntimeRequirements:
 	var requirements: RuntimeRequirements = {
+		current_directory = False,
 		string_types = False,
 		float_types = False,
 		integer_addition = False,
@@ -2011,6 +2037,7 @@ private pure func runtime_requirements(inventory: ProgramInventory) -> RuntimeRe
 
 	for operation in inventory.runtime_calls:
 		match operation:
+			GetCurrentDirectory(_): requirements = { requirements | current_directory = True }
 			IntAdd: requirements = { requirements | integer_addition = True }
 			IntSubtract | IntMultiply | IntDivide | IntRemainder:
 				requirements = { requirements | integer_arithmetic = True }
@@ -2467,6 +2494,9 @@ pure func emit(program: VerifiedProgram) -> Result[String, Diagnostic]:
 
 	if requirements.string_output:
 		fragments = fragments.append(string_print_runtime())
+
+	if requirements.current_directory:
+		fragments = fragments.append(SYSTEM_CURRENT_DIRECTORY_RUNTIME)
 
 	if requirements.integer_parsing:
 		fragments = fragments.append(string_parse_int_runtime())

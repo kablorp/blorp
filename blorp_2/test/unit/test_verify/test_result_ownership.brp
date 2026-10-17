@@ -1,0 +1,194 @@
+import:
+	../../../src/lower/lower as Lower
+	../../../src/namespace/builtins as Builtins
+	../../../src/own/own as Own
+	../../../src/specialize/specialize as Concrete
+	../../../src/utils/syntax: Diagnostic, entry_function, FunctionExecution(OrdinaryCalls), Entrypoint(NoArguments), EntryResult(IntegerExitStatus)
+	../../../src/verify/verify: verify
+	../../../src/utils/source: same_source
+	../current_directory_inputs: CurrentDirectorySeed, current_directory_seed, current_directory_seed_from_source, called_function
+	../module_input: TEST_BASE
+	../ownership_inputs: InputIds, input_ids, span
+	test: TestSuite
+
+
+private pure func raw_result(
+	ids: InputIds,
+	constructors: Builtins.DesignatedResult[Concrete.VariantInstanceId],
+	ownership: Own.ResultOwnership,
+	drops: List[Own.OwnershipOperation],
+	unions: List[Concrete.ConcreteUnion],
+) -> Own.OwnershipProgram:
+	call: Concrete.ConcreteCall = {
+		target = Concrete.RuntimeFunction(Builtins.GetCurrentDirectory(constructors)),
+		span = span(30)
+	}
+	result: Own.OwnedDefinition = {
+		id = ids.first,
+		value_type = Concrete.UnionType(Concrete.variant_owner(constructors.ok)),
+		operation = Own.CallDefinition(call, []), result = ownership, span = span(30)
+	}
+	zero: Own.OwnedDefinition = {
+		id = ids.second, value_type = Concrete.IntType,
+		operation = Own.IntegerDefinition(0), result = Own.UnmanagedResult, span = span(50)
+	}
+	function: Own.OwnedFunction = {
+		execution = OrdinaryCalls,
+		signature = { parameters = [], return_type = Concrete.IntType },
+		operations = [Own.DefineValue(result)].concat(drops).append(Own.DefineValue(zero)),
+		tail = Own.ReturnTail(Own.ReturnResult(Own.UnmanagedReturn(ids.second)))
+	}
+	{ records = [], unions = unions, functions = [function], entrypoint = NoArguments(ids.entrypoint, IntegerExitStatus) }
+
+
+private pure func rejection_is(error: Diagnostic, message: String, at: Int) -> Bool:
+	(
+		error.message == "ownership verification failed: " + message
+		and error.help == "report this compiler error with the input program"
+		and same_source(error.span.source, span(at).source)
+		and error.span.start == at and error.span.end == at + 1
+		and error.note.is_none()
+	)
+
+
+private pure func rejects(program: Own.OwnershipProgram, message: String, at: Int) -> Bool:
+	match verify(program):
+		Ok(_): False
+		Err(error): rejection_is(error, message, at)
+
+
+private pure func valid_result(seed: CurrentDirectorySeed, ids: InputIds) -> Own.OwnershipProgram:
+	raw_result(ids, seed.constructors, Own.OwnedResult(Own.owner_id(0)), [Own.DropOwner(Own.owner_id(0), span(40))], Lower.lowered_functions(seed.lowered).unions)
+
+
+pure func test_raw_result_has_one_owner_and_drop() -> Bool:
+	match (current_directory_seed(TEST_BASE), input_ids()):
+		(Ok(seed), Ok(ids)): verify(valid_result(seed, ids)).is_ok()
+		_: False
+
+
+pure func test_verifier_rejects_wrong_error_payload() -> Bool:
+	match (current_directory_seed(TEST_BASE), input_ids()):
+		(Ok(seed), Ok(ids)):
+			program = valid_result(seed, ids)
+			wrong: List[Concrete.ConcreteUnion] = [{ variants = [[Concrete.StringType], [Concrete.IntType]], representation = Concrete.InlineOwningPayload }]
+			rejects({ program | unions = wrong }, "variant payload does not match its operation", 30)
+		_: False
+
+
+pure func test_verifier_rejects_duplicate_result_constructor() -> Bool:
+	match (current_directory_seed(TEST_BASE), input_ids()):
+		(Ok(seed), Ok(ids)):
+			program = raw_result(ids, { seed.constructors | err = seed.constructors.ok },
+				Own.OwnedResult(Own.owner_id(0)), [Own.DropOwner(Own.owner_id(0), span(40))],
+				Lower.lowered_functions(seed.lowered).unions)
+			rejects(program, "runtime Result constructors do not cover one result union", 30)
+		_: False
+
+
+pure func test_verifier_rejects_unmanaged_result() -> Bool:
+	match (current_directory_seed(TEST_BASE), input_ids()):
+		(Ok(seed), Ok(ids)):
+			rejects(raw_result(ids, seed.constructors, Own.UnmanagedResult, [], Lower.lowered_functions(seed.lowered).unions), "managed result requires an owner", 30)
+		_: False
+
+
+pure func test_verifier_rejects_missing_result_drop() -> Bool:
+	match (current_directory_seed(TEST_BASE), input_ids()):
+		(Ok(seed), Ok(ids)):
+			rejects(raw_result(ids, seed.constructors, Own.OwnedResult(Own.owner_id(0)), [], Lower.lowered_functions(seed.lowered).unions), "owner 0 remains live at return", 50)
+		_: False
+
+
+pure func test_verifier_rejects_missing_result_constructor() -> Bool:
+	match (current_directory_seed(TEST_BASE), input_ids()):
+		(Ok(seed), Ok(ids)):
+			program = valid_result(seed, ids)
+			missing: List[Concrete.ConcreteUnion] = [{ variants = [[Concrete.StringType]], representation = Concrete.InlineOwningPayload }]
+			rejects({ program | unions = missing }, "unknown variant identity", 30)
+		_: False
+
+
+pure func test_verifier_rejects_duplicate_result_drop() -> Bool:
+	match (current_directory_seed(TEST_BASE), input_ids()):
+		(Ok(seed), Ok(ids)):
+			drops = [Own.DropOwner(Own.owner_id(0), span(40)), Own.DropOwner(Own.owner_id(0), span(41))]
+			program = raw_result(ids, seed.constructors, Own.OwnedResult(Own.owner_id(0)), drops,
+				Lower.lowered_functions(seed.lowered).unions)
+			rejects(program, "owner 0 has already been discharged", 41)
+		_: False
+
+
+private pure func is_single_payload_constructor(definition: Lower.ValueDefinition) -> Bool:
+	match definition.operation:
+		Lower.ConstructValue(_, [_]): True
+		_: False
+
+
+func test_verifier_rejects_cross_owner_error_constructor() -> Bool:
+	source: String =
+		|fixed union Other:
+		|    Outside(String)
+		|func query() -> Result[String, String]:
+		|    builtin("system.get_current_directory")
+		|func escape() -> String:
+		|    match query():
+		|        Ok(path): path
+		|        Err(error): error
+		|pure func make_other() -> Other:
+		|    Outside("x")
+		|func main() -> Int:
+		|    unused = query()
+		|    escaped = escape()
+		|    other_value = make_other()
+		|    0
+		|
+	match (current_directory_seed_from_source(source, TEST_BASE), input_ids()):
+		(Err(error), _):
+			print_error("cross-owner fixture: " + error.message)
+			print_error(error.help)
+			False
+		(Ok(seed), Ok(ids)):
+			contents = Lower.lowered_functions(seed.lowered)
+			match contents.functions.get(Concrete.function_number(entry_function(contents.entrypoint))):
+				Some(main):
+					result_owner = Concrete.union_number(Concrete.variant_owner(seed.constructors.ok))
+					other_calls = main.definitions.filter(pure func(definition):
+						match definition.value_type:
+							Concrete.UnionType(owner): Concrete.union_number(owner) != result_owner
+							_: False
+					)
+					match other_calls:
+						[other_call]:
+							match called_function(other_call).map(pure func(id): contents.functions.get(Concrete.function_number(id))):
+								Ok(Some(maker)):
+									match maker.definitions.filter(is_single_payload_constructor):
+										[other_definition]:
+											match other_definition.operation:
+												Lower.ConstructValue(constructor, [_]):
+													program = raw_result(ids, { seed.constructors | err = constructor },
+														Own.OwnedResult(Own.owner_id(0)), [Own.DropOwner(Own.owner_id(0), span(40))], contents.unions)
+													match verify(program):
+														Err(error): rejection_is(error, "runtime Result constructors do not cover one result union", 30)
+														Ok(_): False
+												_: False
+										_: False
+								_: False
+						_: False
+				None: False
+		_: False
+
+
+tests: TestSuite = {
+	description = "Blorp 2 independent Result verification",
+	tests = [
+		("raw Result owner and drop are valid", test_raw_result_has_one_owner_and_drop),
+		("Result error payload must match", test_verifier_rejects_wrong_error_payload),
+		("missing Result constructor rejects", test_verifier_rejects_missing_result_constructor),
+		("duplicate Result drop rejects", test_verifier_rejects_duplicate_result_drop),
+		("Result constructors must be distinct", test_verifier_rejects_duplicate_result_constructor),
+		("Result must own its String", test_verifier_rejects_unmanaged_result),
+		("Result owner must be dropped", test_verifier_rejects_missing_result_drop),
+		("Result error constructor must share its owner", test_verifier_rejects_cross_owner_error_constructor),
+	]
+}

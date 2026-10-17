@@ -1,14 +1,17 @@
 # Target current-directory Result slice
 
-**Status: plan and ceilings approved.** Root and an independent compiler/runtime
-reviewer approved the plan and narrow native test seam with zero findings.
-Implementation and compiled execution remain ungranted; commits and execution
-require a separate coordinator grant.
+**Status: implemented and validated; integration review pending.** The target
+phase/native gates, six mutation oracles and 483-case cost corpus pass. The
+host source-to-C proxy meets its cost ceilings under the user's explicit
+host-only bootstrap leak exception; its strict memory observations remain
+failed. No pilot/native memory exception or source-cleanup cap waiver applies.
+Commits and integration still require a separate coordinator grant.
 
 ## Problem, pins, and scope
 
-Target programs cannot import `system.get_current_directory`: the temporary
-library has no `system.brp`, and the parser has no corresponding builtin tag.
+At the planning baseline, target programs could not import
+`system.get_current_directory`: the temporary library had no `system.brp`, and
+the parser had no corresponding builtin tag.
 Existing imports, ordinary match, String, and owning unions suffice for this
 single native Result witness. It may overlap M2/M3 after review; broader M6 and
 actual compiler loader migration retain their roadmap order. This neither
@@ -72,11 +75,11 @@ the exact stdout bytes of `/bin/pwd -P` in that same CWD (already one LF), statu
 and empty stderr; do not trim or normalize the oracle. No PWD/environment fallback.
 The fixture's Err arm specifies exit 1, error payload plus LF on stdout and
 empty stderr, but is not claimed as deterministic native-Err main coverage.
-Baseline rejection is expected,
-not observed: record the actual compiler status, message, help, span and output
-preservation before implementation; do not invent a red transcript now.
+The pre-implementation rejection and its exact diagnostic are retained in
+`build/target-current-directory/first-red-root/receipt.json`; the original
+first-red packet is unchanged.
 
-Current [builtins:102](src/namespace/builtins.brp) is:
+The planning-baseline [builtins](src/namespace/builtins.brp) contained:
 
 ```blorp
 fixed union RuntimeResult[Variant, Element]:
@@ -296,7 +299,7 @@ spaces/UTF-8 and parent components must reach ProcessCommand.cwd byte-for-byte,
 without resolution, trimming or normalization. Inventory all direct NativeCase
 record literals and mechanically add `cwd = None` where needed; preserve their
 other inputs and expectations. These owners and updates fit inside the same
-approved 850-gross/+820-net test ceiling, not an additional allowance.
+approved 1100-gross/+1080-net test ceiling, not an additional allowance.
 
 Native Err is deterministic only in direct helper tests; no native-Err language
 main coverage is claimed. Ordinary Err[String] phase/aggregate tests cover that
@@ -307,8 +310,8 @@ Prove separate compile-successful mutations: no ERANGE growth, errno read after
 free, UTF-8 bypass, missing staging free, swapped result tags, missing owner/drop;
 restore exactly and rerun the owning test green.
 
-Future serialized commands from this checkout's own FRESH host, after root's
-compiled-lane grant (none run now):
+The original planned validation commands were below. The execution record at
+the end documents the later explicit borrowed-host grant and actual pins:
 
 ```sh
 scripts/compiler-build-status
@@ -337,12 +340,27 @@ Root and the independent reviewer approved the limits below. The earlier
 250–450-test-line estimate omitted the full native matrix and granular
 malformed-IR coverage.
 
-| Physical scope | Estimate gross/net | Approved hard gross/net ceiling |
-| --- | --- | --- |
-| Production, including temp declaration | 200–260 / +180–240 | 300 / +280 |
-| Tests, including native C, excluding language fixtures | 650–800 / +620–770 | 850 / +820 |
-| Language fixtures | 2 files, 25–40 lines | 2 files, 50 added / +50 net |
-| Public docs, excluding this plan/roadmap | 20–35 / +20–35 | 40 / +40 |
+Checkpoint 1 stopped at 823 gross added / 2 deleted / +821 net test lines,
+exceeding the original +820 net ceiling. Following review, root approved one
+test-only extension for the estimated 180–230 necessary lines: missing negative
+cases, exact normal/reversed tag and payload oracles, independent help/span
+checks, and readable formatting. Existing tests and coverage are retained.
+This is no production, API, runner, or mechanism expansion. The original
+checkpoint and first-red receipts remain immutable; all other ceilings,
+including the source-cleanup 3% policy, and frozen epochs are unchanged.
+Another overrun requires a new explicit decision, not an automatic waiver.
+
+| Physical scope | Estimate gross/net | Approved hard gross/net ceiling | Actual gross/net |
+| --- | --- | --- | --- |
+| Production, including temp declaration | 200–260 / +180–240 | 300 / +280 | 158 / +142 |
+| Tests, including native C, excluding language fixtures | 1003–1053 / +1001–1051 | 1100 / +1080 | 1079 / +1073 |
+| Language fixtures | 2 files, 25–40 lines | 2 files, 50 added / +50 net | 2 files, 26 / +26 |
+| Public docs, excluding this plan/roadmap | 20–35 / +20–35 | 40 / +40 | 40 / +39 |
+
+The final test census is 1079 added / 6 deleted / +1073 net lines, within the
+accepted 1100-gross/+1080-net ceiling. The earlier estimate is not a different
+cap. Public documentation includes the concise benchmark report; this plan and
+the roadmap are counted separately. Original checkpoint receipts stay unchanged.
 
 Allowed production: `utils/syntax.brp`, `parse/parse.brp`,
 `namespace/builtins.brp`, `check/signatures.brp`, `specialize/specialize.brp`,
@@ -379,3 +397,55 @@ phase/native/main verdicts, raw C and measured costs. No commit/push until the
 coordinator grants the concrete step. Shared compiler files have one writer;
 coordinate M2/M3/host changes rather than altering their worktrees. If the ABI,
 test seam, bounds or budgets require broader mechanisms, stop for root.
+
+## Validation and cost record, 2026-10-17
+
+The [benchmark report](../benchmarks/results/blorp_2_target_current_directory_2026-10-17.md)
+records measured results. The measurement baseline is accepted main
+`72164f17a21d8e375efceb77503b92318e97340d`, compiler source tree
+`8a45f02fdf5c9d1bf5e8634426817c9df664568c`; the candidate is the unchanged
+feature source snapshot. Its exact B/C file hashes are in
+`build/target-current-directory/cost/snapshot-manifests.json`.
+
+Explicitly borrowed main host `e74cd095ab86d1d0035c6a9b319167bd17988fda061fb91dd9a2eb44ca9fdaf1`
+and pinned main standard library produced the B/C pilots. Actual host metadata
+remains `192bc8639d39-dirty`, CLI O0/runtime O2/diagnostics0; this is not an
+own-worktree FRESH claim. Pilots are O0 normal/diagnostic variants. The separate
+host proxy uses the fixed O2 pair pinned in `cost/proxy-pair.json`, with actual
+`59679bf6b9d0-dirty` / `self-59679bf6b9d0` metadata, not an e74 counterpart.
+
+Correctness evidence is 2604 unit / 229 runtime / 179 grammar reported checks
+(nested and repeated checks included), 458 e2e cases and 13 direct native cases
+under ASan/UBSan. Both new fixtures run their actual main in `/` and a temporary
+physical CWD with exact status/stdout/stderr. Six compile-successful mutations
+fail their intended oracles; each exact restoration is green. Native evidence
+in this packet is Darwin arm64, Apple Clang 21; Linux/GCC is not claimed here.
+
+The 483 logical cost cases comprise 481 shared output states and two new C-only
+states. All strict pilot counts balance with zero leaks; all stream/output
+oracles, raw C identities, +5% comparisons and stricter absolute ceilings pass.
+Shared allocations are unchanged; worst normal min3 growth is +0.552871%.
+The two new inputs measure 11785 / 12297 allocations and 48231276 / 49022765
+normal min3 instructions, below 205000 / 600000000. The first case's eight
+accepted observations were reused; the remaining corpus made 3848 calls.
+
+Host proxy TOTAL allocations are 23224178 -> 23328551 (+0.449415%); normal min3
+instructions are 20631844365 -> 20734800215 (+0.499014%). Both unchanged +5%
+ceilings pass. Per-variant normal/diagnostic C equals the retained producer C.
+This is host source-to-C evidence, not target self-compilation.
+
+Both host diagnostic observations still fail strict memory with exit 99:
+B reports 512964 leaked allocations / 34890725 bytes; C reports 515331 /
+35048857. The user explicitly accepts this known host-compiler bootstrap
+limitation only. Those observations are not relabeled zero-leak passes; TOTAL
+allocation counts include all allocations. The seven remaining proxy calls
+reuse the original B diagnostic, so no diagnostic or normal sample was rerun.
+Report-parser whitespace errors were corrected offline on the original raw
+reports; their stop history and every raw observation remain unchanged.
+
+Exact commands, all binary/source/std hashes, original failures and raw reports
+are retained under `build/target-current-directory/cost/`. The actual compiler
+source byte census is 943206 -> 949206 (+6000); temporary library source is
+4577 -> 4927 (+350). Historical snapshot totals have different inventories and
+are not source-growth measurements. The original source-byte R0 failure,
+hosts, epochs and cumulative/local 3% policy remain frozen and binding.

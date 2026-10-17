@@ -1,0 +1,82 @@
+import:
+	../../src/emit/emit: aggregate_runtime
+	../../src/own/own: own
+	../../src/runtime/string: string_runtime
+	../../src/runtime/system: SYSTEM_CURRENT_DIRECTORY_RUNTIME
+	../../src/verify/verify: verify
+	../unit/current_directory_inputs: current_directory_seed
+	../unit/module_input: TEST_BASE
+	fs: IOError, resource_path, temporary_directory
+	process: run
+	system: getenv, read_file, temp_dir, write_file
+	test: TestSuite, run_suite_result
+
+
+private func native_case(executable: String, name: String) -> Bool:
+	match run(executable, [name]):
+		Err(_): False
+		Ok(output):
+			if output.exit_code() == 0 and output.stdout() == "" and output.stderr() == "":
+				True
+			else:
+				print_error(output.stderr())
+				False
+
+
+private func native_checks(directory: String) -> Result[Bool, String]:
+	seed ?= current_directory_seed(TEST_BASE).map_err(pure func(error): error.message)
+	owned ?= own(seed.lowered).map_err(pure func(error): error.message)
+	verified ?= verify(owned).map_err(pure func(error): error.message)
+	aggregates ?= aggregate_runtime(verified).map_err(pure func(error): error.message)
+	written ?= write_file(directory + "/current_directory_runtime.c", string_runtime() + SYSTEM_CURRENT_DIRECTORY_RUNTIME + aggregates)
+	fixture ?= read_file("blorp_2/test/runtime/fixtures/current_directory_test.c")
+	test_written ?= write_file(directory + "/current_directory_test.c", fixture)
+	executable = directory + "/current_directory_test"
+	compiled ?= run(getenv("BLORP_CC").get_or("clang"), ["-std=c11", "-O0", "-Wall", "-Wextra", "-Werror", "-pedantic", "-fsanitize=address,undefined", "-fno-sanitize-recover=all", directory + "/current_directory_test.c", "-lm", "-o", executable])
+	if compiled.exit_code() != 0 or compiled.stdout() != "" or compiled.stderr() != "":
+		Err("current-directory native build failed: " + compiled.stderr())
+	else:
+		cases = [
+			("real OS success", "real"),
+			("ERANGE grows beyond 4096", "growth"),
+			("growth then failure frees staging", "growth_error"),
+			("EINTR returns without retry", "eintr"),
+			("cleanup preserves saved errno", "saved_errno"),
+			("root and UTF-8 whitespace stay exact", "utf8"),
+			("terminator excludes spare bytes", "after_terminator"),
+			("malformed UTF-8 precedes String publication", "malformed"),
+			("empty native success rejects", "empty"),
+			("relative native success rejects", "relative"),
+			("live calls have distinct fresh roots", "fresh"),
+			("Ok active slot releases its String", "owned_ok"),
+			("Err active slot releases its String", "owned_error"),
+		]
+		suite: TestSuite = {
+			description = "Target current-directory native ownership",
+			tests = cases.map(func(item): (item[0], func(): native_case(executable, item[1])))
+		}
+		result = run_suite_result(suite)
+		Ok(result[1] == 0)
+
+
+private func scoped_native_checks() -> Result[Bool, IOError]:
+	with directory ?= temporary_directory(temp_dir(), "blorp2_current_directory_"):
+		match native_checks(directory.resource_path()):
+			Ok(passed): Ok(passed)
+			Err(error):
+				print_error(error)
+				Ok(False)
+
+
+func test_current_directory_native_contract() -> Bool:
+	match scoped_native_checks():
+		Ok(passed): passed
+		Err(error):
+			print_error(error.to_string())
+			False
+
+
+tests: TestSuite = {
+	description = "Blorp 2 current-directory native runtime",
+	tests = [("native admission and both Result payloads", test_current_directory_native_contract)]
+}

@@ -20,6 +20,11 @@ For example, `42.add(1).to_string().length()` needs no imports. Direct calls
 still require named imports such as `int: add`. IO remains explicit.
 The [imports design](../IMPORTS_AND_PRELUDE_PLAN.md) defines the full rules.
 
+`system.brp` records its accepted upstream revision and source SHA256.
+Its explicit `get_current_directory()` import returns `Result[String, String]`:
+an owned nonempty absolute UTF-8 path or an owned valid-text error.
+Neither branch prints. The native helper uses the target String ABI.
+
 `int.brp` records the upstream revision and SHA256 used for its adaptation of
 [`standard_library/src/int.brp`](../../standard_library/src/int.brp). Concrete
 `add`, `subtract`, `multiply`, `divide`, `remainder`, `equals` and `to_string` are

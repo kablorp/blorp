@@ -102,7 +102,7 @@ passed the audited toolchain's default limits through depth 256.
 | [M2b](#m2b-pattern-compilation) | Qualified flat heads and non-binding constructor groups | Not started. Nested/list/literal source-pattern migration has bounded decision gates. |
 | [M3](#m3-loops-and-tail-recursion) | Managed List/while loops, explicit exits and existing scalar TCO | Not started. Source flat recursion/ranges become loops; broader managed TCO deferred. |
 | [M4](#m4-recursive-types) | Existing unary/mixed recursive shapes plus ordinary opaque semantics | Steps 1/2a done. Opaque completion remains. No current source witness requires unlanded 2b/2c. |
-| [M6](#m6-library-and-shell) | First-order library parity, integer-facing String APIs and seven shell/path functions | String byte/scalar APIs implemented and validated; source migration, remaining library and shell/path work pending. Target Char/Bytes are not planned prerequisites after source migration. |
+| [M6](#m6-library-and-shell) | First-order library parity, integer-facing String APIs and seven shell/path functions | String byte/scalar APIs and the bounded current-directory Result slice implemented and validated; source migration, remaining library and shell/path work pending. Target Char/Bytes are not planned prerequisites after source migration. |
 | [M7](#m7-lambdas) | Broader language function types/lambdas | Source-removal pilots precede any retirement of this bootstrap dependency. |
 | [M8](#m8-the-fixpoint-gate) | Fixpoint gate | Not started. |
 | [M9](#m9-post-self-compilation-architecture-audit) | Complete architecture audit using the self-compiled compiler | Planned immediately after M8, before the next major feature expansion. |
@@ -113,7 +113,7 @@ Remaining dependency order (source migrations may overlap disjoint work):
 reviewed source plan + small constructor/control preparations
 host library/runtime prerequisites, then freeze the supporting host
 M6 String byte/scalar APIs + source Char/classification migration
-M6 native current-directory Result witness (may overlap M2/M3; bounded below)
+M6 native current-directory Result witness (accepted slice; loader migration pending)
 first-order source pilots + callback removal                     [M7 gate]
 M2 restricted control, outer-variable flow, propagation/annotations
 M3 managed List/while loops + source flat-walk/range migration
@@ -700,11 +700,14 @@ Source Char/classification migration, slicing, remaining library and shell/path
 work are separate; this does not complete M6.
 
 The standalone [target current-directory Result slice](TARGET_CURRENT_DIRECTORY_PLAN.md)
-may overlap M2/M3 after its plan, native test seam and shared-file writer slot
-are reviewed. Existing ordinary match and managed unions support this one native
-witness. Compiler loader migration and all broader M6 shell/library integration
-retain the dependency order above; this exception establishes no self-compilation
-or M6 completion.
+is implemented and validated: ordinary owning Result, phase/native tests, six
+effective/restored mutations and all 483 logical cost cases meet their gates.
+The [cost report](../benchmarks/results/blorp_2_target_current_directory_2026-10-17.md)
+records host proxy allocation/instruction ceilings passing under the explicit
+host-only bootstrap leak exception; both host strict memory observations remain
+failed. No pilot/native memory exception applies. Compiler loader migration and
+all broader M6 shell/library integration retain the dependency order above;
+this accepted bounded witness establishes no self-compilation or M6 completion.
 
 Planned [target file reading](TARGET_FILE_READ_PLAN.md) depends on acceptance of
 that Result boundary; implementation and acceptance are not yet granted.

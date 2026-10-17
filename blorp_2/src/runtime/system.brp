@@ -1,0 +1,63 @@
+-- Private native staging becomes exactly one owned String on either branch.
+-- The caller wraps it in the already designated ordinary Result.
+SYSTEM_CURRENT_DIRECTORY_RUNTIME: String =
+	raw
+		|#include <errno.h>
+		|#include <limits.h>
+		|#include <unistd.h>
+		|enum {
+		|BLORP_CURRENT_DIRECTORY_ERROR=0,
+		|BLORP_CURRENT_DIRECTORY_OK=1,
+		|BLORP_CURRENT_DIRECTORY_INITIAL_CAPACITY=256,
+		|BLORP_CURRENT_DIRECTORY_ERROR_CAPACITY=sizeof("get_current_directory: failed; errno=")+sizeof(int)*CHAR_BIT
+		|};
+		|static uint8_t blorp_current_directory_failure(struct blorp_string **result,const char *message){
+		|*result=blorp_string_from_bytes(message,(int64_t)strlen(message));
+		|return BLORP_CURRENT_DIRECTORY_ERROR;
+		|}
+		|static uint8_t blorp_current_directory_error(struct blorp_string **result,int error){
+		|char message[BLORP_CURRENT_DIRECTORY_ERROR_CAPACITY];
+		|const int length=snprintf(message,sizeof message,"get_current_directory: failed; errno=%d",error);
+		|if(length<0||(size_t)length>=sizeof message){abort();}
+		|return blorp_current_directory_failure(result,message);
+		|}
+		|uint8_t blorp_get_current_directory(struct blorp_string **result){
+		|const size_t allocation_limit=SIZE_MAX-sizeof(struct blorp_string)-1;
+		|const size_t maximum_length=allocation_limit<(size_t)INT64_MAX?allocation_limit:(size_t)INT64_MAX;
+		|const size_t maximum_capacity=maximum_length+1;
+		|size_t capacity=BLORP_CURRENT_DIRECTORY_INITIAL_CAPACITY;
+		|char *buffer=malloc(capacity);
+		|if(buffer==NULL){abort();}
+		|for(;;){
+		|errno=0;
+		|if(getcwd(buffer,capacity)!=NULL){
+		|const size_t length=strlen(buffer);
+		|if(length==0||buffer[0]!='/'){
+		|free(buffer);
+		|return blorp_current_directory_failure(result,"get_current_directory: native path must be nonempty and absolute");
+		|}
+		|if(!blorp_utf8_is_valid(buffer,length)){
+		|free(buffer);
+		|return blorp_current_directory_failure(result,"get_current_directory: invalid UTF-8; use a working directory with a UTF-8 path");
+		|}
+		|*result=blorp_string_from_bytes(buffer,(int64_t)length);
+		|free(buffer);
+		|return BLORP_CURRENT_DIRECTORY_OK;
+		|}
+		|const int saved_errno=errno;
+		|if(saved_errno!=ERANGE){
+		|free(buffer);
+		|return blorp_current_directory_error(result,saved_errno);
+		|}
+		|if(capacity==maximum_capacity){
+		|free(buffer);
+		|return blorp_current_directory_error(result,EOVERFLOW);
+		|}
+		|const size_t grown_capacity=capacity>maximum_capacity/2?maximum_capacity:capacity*2;
+		|char *grown=realloc(buffer,grown_capacity);
+		|if(grown==NULL){abort();}
+		|buffer=grown;
+		|capacity=grown_capacity;
+		|}
+		|}
+		|
