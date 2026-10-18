@@ -93,7 +93,8 @@ separate. Never weaken the reader, ledger, sanitizer class or existing ceiling.
 ## Bounds, dependencies and handback
 
 Hard limits: production260 gross/+250 net; maintained tests500 gross/+480 net,
-including at most60 fixture lines. Forecast is about230 production/450 tests;
+including one direct-C runtime fixture of at most130 readable lines and no
+added language fixtures. Forecast is about230 production/450 tests;
 report actual physical additions/deletions, including mechanical expectation
 updates, without compressed formatting or removed coverage. Normal operations
 remain aliases. FEATURE costs target+5%, hard+10% per shared input and original
