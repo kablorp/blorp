@@ -2,7 +2,8 @@
 
 ## Status and boundary
 
-Remaining work is planning only. The written-fields port is accepted; its
+The owner stopped the remaining callback-removal migration on 2026-10-18.
+The estimates and held candidates below are historical. The written-fields port is accepted; its
 [report](../benchmarks/results/blorp_2_first_order_written_fields_2026-10-18.md)
 records current functional and fixed-baseline cost acceptance. This ledger
 grants no further implementation, compiled job, cost setup, new baseline or exception. The [source plan](BOOTSTRAP_SOURCE_PLAN.md#acceptance-and-cost-boundaries)

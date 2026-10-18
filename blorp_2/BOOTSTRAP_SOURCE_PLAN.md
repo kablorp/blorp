@@ -18,6 +18,10 @@ remain preserved; their existence does not make them bootstrap prerequisites.
 
 ## Decisions and constraints
 
+The owner stopped the remaining HOF-removal migration on 2026-10-18. Its callback
+replacement instructions below are historical; callback language support proceeds
+in separate increments, starting with pure function-type parsing.
+
 Keep typed declaration, binding, value, layout and ownership identities; complete
 immutable published facts; local builders; purity after loading; generic functions
 and data; ordinary nested value construction; opaque boundaries; recursive data

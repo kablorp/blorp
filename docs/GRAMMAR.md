@@ -1345,6 +1345,9 @@ dim_atom      = DIMNAME | "#" "_" | "#" INT | INT | "(" dim_expr ")" ;
   hold dimensions (``expected array dimensions``).
 - A parenthesized type list followed by `->` is a function type's
   parameters; without `->` it is a grouping (one type) or a tuple.
+- Blorp 2 parses the explicit `pure (...) -> type` form, including nested
+  callback parameters and returns. Its checker rejects function types until
+  callback checking is implemented; bare impure function types remain unsupported.
 - `(T)` is `T`. `(T,)` is ``a tuple type has two to four elements, and `(T,)`
   has one``. A function type's return type extends as far as a type can, so
   `(A) -> (B) -> C` returns `(B) -> C`.

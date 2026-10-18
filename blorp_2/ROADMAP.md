@@ -926,7 +926,11 @@ still proves real rebuilt-compiler output identity.
 
 ## M7: lambdas
 
-**Bootstrap decision.** Migrate the current 53 pure lambda literals, 64
+**Current direction, 2026-10-18.** The owner stopped the remaining callback-removal
+migration. Explicit pure callback types now parse; checking and callback execution
+remain separate future increments. The source-removal work below is retained history.
+
+**Historical bootstrap decision.** Migrate the current 53 pure lambda literals, 64
 higher-order calls and one function-typed helper parameter to first-order source
 under the bounded source plan. Retire this dependency only after sorting,
 translation/source-growth pilots and the complete resolved inventory pass.
@@ -972,8 +976,8 @@ offsets.map(pure func(value): IntOps.add(value, base))
 combinator and at a user generic; ownership of borrowed managed captures
 verified; frontier reaches emit.
 
-**Status.** Future language implementation not started; bootstrap dependency
-retirement remains conditional on the source migration and inventory.
+**Status.** Pure callback type parsing is implemented. Function-type checking,
+callable parameters and capture specialization remain unimplemented.
 
 ## M8: the fixpoint gate
 

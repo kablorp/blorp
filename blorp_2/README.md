@@ -999,7 +999,10 @@ which must end before the bracket closes: a `)` on the block's last line is
 an error, as in the host). A lambda body starts a new statement context, so
 a loop control inside one needs a loop of its own, and by owner decision
 `?=` is rejected anywhere inside one, where the host accepts it. Lambdas
-parse and are rejected by checking until the lambdas milestone. A `match` anywhere but a function's tail (bound, nested in an arm
+parse and are rejected by checking until the lambdas milestone. Explicit
+`pure (Int, String) -> Int` function types also parse, including zero parameters,
+trailing commas and nested callback types. Checking still rejects function types.
+A `match` anywhere but a function's tail (bound, nested in an arm
 or branch block, or followed by further lines) is likewise one expression
 ending at its last arm's dedent; the function's last match stays its tail
 body. Ranges parse and are rejected by checking

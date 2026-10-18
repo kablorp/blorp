@@ -70,7 +70,8 @@ import:
 		),
 		Token,
 		TokenKind(IdentifierToken, KeywordToken, SymbolToken, IntegerLiteral, FloatLiteral, QuotedString, PipeString, CharLiteral),
-		TypeSyntax(AtomicType, AppliedType, QualifiedType),
+		TypeSyntax(AtomicType, AppliedType, QualifiedType, PureFunctionType),
+		type_span,
 		UTF8_CONTINUATION_END,
 		UTF8_CONTINUATION_START,
 		ValueExpression,
@@ -1834,13 +1835,13 @@ private fixed record ParsedTypes {
 }
 
 
-private pure func consume_type_arguments(state: ParserState, types: List[TypeSyntax]) -> Result[ParsedTypes, Diagnostic]:
-	argument ?= consume_type(state, "expected a type argument")
+private pure func consume_types(state: ParserState, types: List[TypeSyntax], message: String) -> Result[ParsedTypes, Diagnostic]:
+	argument ?= consume_type(state, message)
 	gathered = types.append(argument.written)
 
 	match list_separator(argument.next):
 		ListContinues(next):
-			consume_type_arguments(next, gathered)
+			consume_types(next, gathered, message)
 		ListEnds(next):
 			Ok({ types = gathered, next = next })
 
@@ -1858,7 +1859,7 @@ private pure func consume_optional_type_arguments(state: ParserState, name_end: 
 	if not at_left_bracket(state):
 		Ok({ types = [], end = name_end, next = state })
 	else:
-		match consume_type_arguments(shifted(state, 1), []):
+		match consume_types(shifted(state, 1), [], "expected a type argument"):
 			Ok(arguments):
 				match expect(
 					arguments.next,
@@ -1871,9 +1872,39 @@ private pure func consume_optional_type_arguments(state: ParserState, name_end: 
 			Err(error): Err(error)
 
 
--- A type is `Name`, `Name[arguments]` or `Module.Name[arguments]`; a dot in
--- a type can only qualify, so no alias set is consulted here.
-private pure func consume_type(state: ParserState, message: String) -> Result[ParsedType, Diagnostic]:
+-- The return type recurses through consume_type, so callback returns associate
+-- to the right and keep their complete written span.
+private pure func consume_pure_function_type(state: ParserState) -> Result[ParsedType, Diagnostic]:
+	parenthesized ?= expect(
+		shifted(state, 1),
+		at_left_paren(shifted(state, 1)),
+		"expected '(' after 'pure' in a function type",
+		"write a callback type as pure (Int, String) -> Int",
+	)
+	opened = with_enclosure(parenthesized, Bracketed)
+	parameters ?= if at_right_paren(opened):
+		Ok({ types = [], next = opened })
+	else:
+		consume_types(opened, [], "expected a callback parameter type")
+	closed ?= expect(
+		parameters.next,
+		at_right_paren(parameters.next),
+		"expected ')' after the callback parameter types",
+		"write parameter types separated by commas, then ')' and '-> ReturnType'",
+	)
+	arrow ?= expect(
+		with_enclosure(closed, state.enclosure),
+		at_arrow(closed),
+		"expected '->' after the callback parameter types",
+		"write a callback type as pure (Int, String) -> Int",
+	)
+	returned ?= consume_type(arrow, "expected a callback return type after '->'")
+	span = { parser_span(state) | end = type_span(returned.written).end }
+	Ok({ written = PureFunctionType(parameters.types, returned.written, span), next = returned.next })
+
+
+-- A dot in a named type can only qualify, so no alias set is consulted here.
+private pure func consume_named_type(state: ParserState, message: String) -> Result[ParsedType, Diagnostic]:
 	name ?= consume_name(state, message)
 
 	if at_dot(name.next):
@@ -1893,6 +1924,13 @@ private pure func consume_type(state: ParserState, message: String) -> Result[Pa
 				span = { name.name.span | end = arguments.end }
 				Ok({ written = AppliedType(name.name, arguments.types, span), next = arguments.next })
 			Err(error): Err(error)
+
+
+private pure func consume_type(state: ParserState, message: String) -> Result[ParsedType, Diagnostic]:
+	if at_pure(state):
+		consume_pure_function_type(state)
+	else:
+		consume_named_type(state, message)
 
 
 private fixed record ParameterResult {

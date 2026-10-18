@@ -1645,6 +1645,9 @@ pure func double(x: Int) -> Int:
 result: Int = apply(double, 5)  -- OK: pure satisfies impure
 ```
 
+Blorp 2 currently parses explicit `pure (...) -> Type` annotations, including
+nested callback types. Checking and invoking callbacks are not implemented yet.
+
 ### Type Inference
 
 ```blorp

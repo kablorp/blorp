@@ -1,0 +1,187 @@
+import:
+	../../src/lex/lex: lex
+	../../src/parse/parse: ParsedModule, ParsedModuleContents, module_contents, module_names, parse_module
+	../../src/utils/names: NameTable, name_spelling, program_names
+	../../src/utils/source: module_source, root_module_id, same_source
+	../../src/utils/syntax:
+		Diagnostic, Span, WrittenName, type_span,
+		TypeSyntax(AtomicType, AppliedType, QualifiedType, PureFunctionType)
+	test: TestSuite
+
+
+private pure func parse_source(source: String) -> Result[ParsedModule, Diagnostic]:
+	tokens ?= lex(module_source(root_module_id()), source, program_names().names)
+	parse_module(tokens, root_module_id())
+
+
+private pure func located(span: Span, start: Int, end: Int) -> Bool:
+	same_source(span.source, module_source(root_module_id())) and span.start == start and span.end == end
+
+
+private pure func named(names: NameTable, name: WrittenName, spelling: String) -> Bool:
+	name_spelling(names, name.id) == Some(spelling)
+
+
+pure func test_generic_pure_callback_parameter_parses() -> Bool:
+	source: String =
+		|private pure func translated_list[T, U](
+		|	values: List[T],
+		|	translate: pure (T) -> Result[U, Diagnostic],
+		|) -> Result[List[U], Diagnostic]:
+		|	values
+		|
+	match parse_source(source):
+		Err(_): False
+		Ok(parsed):
+			names = module_names(parsed)
+			match module_contents(parsed).functions:
+				[function]:
+					match (function.parameters, function.return_type):
+						([values, translate], Some(AppliedType(result, [AppliedType(list, [AtomicType(u)], list_span), AtomicType(diagnostic)], result_span))):
+							match (values.type_name, translate.type_name):
+								(AppliedType(input_list, [AtomicType(t)], input_span), PureFunctionType([AtomicType(input)], AppliedType(output_result, [AtomicType(output), AtomicType(error)], output_span), callback_span)):
+									(
+										named(names, values.name, "values") and named(names, translate.name, "translate")
+										and named(names, input_list, "List") and named(names, t, "T") and named(names, input, "T")
+										and named(names, output_result, "Result") and named(names, output, "U") and named(names, error, "Diagnostic")
+										and named(names, result, "Result") and named(names, list, "List") and named(names, u, "U") and named(names, diagnostic, "Diagnostic")
+										and located(input_span, 50, 57) and located(callback_span, 71, 104) and located(output_span, 83, 104)
+										and located(list_span, 118, 125) and located(result_span, 111, 138)
+										and located(type_span(translate.type_name), 71, 104)
+									)
+								_: False
+						_: False
+				_: False
+
+
+pure func test_nullary_pure_callback_return_parses() -> Bool:
+	match parse_source("func make() -> pure () -> Int:\n\tzero\n"):
+		Err(_): False
+		Ok(parsed):
+			match module_contents(parsed).functions:
+				[function]:
+					match function.return_type:
+						Some(PureFunctionType([], AtomicType(result), span)):
+							named(module_names(parsed), result, "Int") and located(result.span, 26, 29) and located(span, 15, 29)
+						_: False
+				_: False
+
+
+-- The opaque module is retired before its recursive contents are observed.
+private pure func retained_contents(source: String) -> Option[ParsedModuleContents]:
+	match parse_source(source):
+		Ok(parsed): Some(module_contents(parsed))
+		Err(_): None
+
+
+pure func test_nested_pure_callback_types_parse() -> Bool:
+	match retained_contents("func apply(callback: pure (pure () -> Int) -> pure (String) -> Int) -> Int:\n\t0\n"):
+		Some(contents):
+			match contents.functions:
+				[function]:
+					match function.parameters:
+						[parameter]:
+							match parameter.type_name:
+								PureFunctionType([PureFunctionType([], AtomicType(first), parameter_span)], PureFunctionType([AtomicType(argument)], AtomicType(result), return_span), span):
+									(
+										named(contents.names, first, "Int") and named(contents.names, argument, "String") and named(contents.names, result, "Int")
+										and located(first.span, 38, 41) and located(argument.span, 52, 58) and located(result.span, 63, 66)
+										and located(parameter_span, 27, 41) and located(return_span, 46, 66) and located(span, 21, 66)
+										and located(type_span(parameter.type_name), 21, 66)
+									)
+								_: False
+						_: False
+				_: False
+		None: False
+
+
+pure func test_multiline_pure_callback_parameters_parse() -> Bool:
+	source: String =
+		|func apply(callback: pure (
+		|	Int,
+		|	Shared.Box[String],
+		|) -> Result[Int, String], other: Int) -> Int:
+		|	other
+		|
+	match parse_source(source):
+		Err(_): False
+		Ok(parsed):
+			names = module_names(parsed)
+			match module_contents(parsed).functions:
+				[function]:
+					match function.parameters:
+						[callback, other]:
+							match (callback.type_name, other.type_name):
+								(PureFunctionType([AtomicType(integer), QualifiedType(box, [AtomicType(string)], box_span)], AppliedType(result, [AtomicType(left), AtomicType(right)], result_span), span), AtomicType(other_type)):
+									(
+										named(names, integer, "Int") and named(names, box.module, "Shared") and named(names, box.name, "Box")
+										and named(names, string, "String") and named(names, result, "Result") and named(names, left, "Int") and named(names, right, "String")
+										and named(names, other.name, "other") and named(names, other_type, "Int")
+										and located(box_span, 35, 53) and located(result_span, 60, 79) and located(span, 21, 79)
+									)
+								_: False
+						_: False
+				_: False
+
+
+private IDENTIFIER_HELP: String = "use an ASCII identifier starting with a letter or underscore; keywords and lone '_' are reserved"
+
+private CALLBACK_HELP: String = "write a callback type as pure (Int, String) -> Int"
+
+private CLOSING_HELP: String = "write parameter types separated by commas, then ')' and '-> ReturnType'"
+
+
+private pure func rejects(prefix: String, marked: String, suffix: String, message: String, help: String) -> Bool:
+	match parse_source(prefix + marked + suffix):
+		Ok(_): False
+		Err(error):
+			(
+				error.message == message and error.help == help and error.note.is_none()
+				and located(error.span, prefix.length(), prefix.length() + marked.length())
+			)
+
+
+pure func test_missing_callback_opening_parenthesis() -> Bool:
+	rejects("func use(cb: pure ", "Int", ") -> Int) -> Int:\n\t0\n", "expected '(' after 'pure' in a function type", CALLBACK_HELP)
+
+
+pure func test_missing_callback_closing_parenthesis() -> Bool:
+	rejects("func use(cb: pure (Int", "]", " -> Int) -> Int:\n\t0\n", "expected ')' after the callback parameter types", CLOSING_HELP)
+
+
+pure func test_missing_callback_arrow() -> Bool:
+	rejects("func use(cb: pure (Int) ", "Int", ") -> Int:\n\t0\n", "expected '->' after the callback parameter types", CALLBACK_HELP)
+
+
+pure func test_missing_callback_return_type() -> Bool:
+	rejects("func use(cb: pure (Int) -> ", ")", " -> Int:\n\t0\n", "expected a callback return type after '->'", IDENTIFIER_HELP)
+
+
+pure func test_missing_callback_parameter_comma() -> Bool:
+	rejects("func use(cb: pure (Int ", "String", ") -> Int) -> Int:\n\t0\n", "expected ')' after the callback parameter types", CLOSING_HELP)
+
+
+pure func test_named_callback_parameters_are_rejected() -> Bool:
+	rejects("func use(cb: pure (value", ":", " Int) -> Int) -> Int:\n\t0\n", "expected ')' after the callback parameter types", CLOSING_HELP)
+
+
+pure func test_bare_impure_callback_type_is_rejected() -> Bool:
+	rejects("func use(cb: ", "(", "Int) -> Int) -> Int:\n\t0\n", "expected a parameter type", IDENTIFIER_HELP)
+
+
+tests: TestSuite = {
+	description = "Blorp 2 pure function type syntax",
+	tests = [
+		("generic pure callback parameter parses", test_generic_pure_callback_parameter_parses),
+		("nullary pure callback return parses", test_nullary_pure_callback_return_parses),
+		("nested pure callback types parse", test_nested_pure_callback_types_parse),
+		("multiline pure callback parameters parse", test_multiline_pure_callback_parameters_parse),
+		("missing callback opening parenthesis", test_missing_callback_opening_parenthesis),
+		("missing callback closing parenthesis", test_missing_callback_closing_parenthesis),
+		("missing callback arrow", test_missing_callback_arrow),
+		("missing callback return type", test_missing_callback_return_type),
+		("missing callback parameter comma", test_missing_callback_parameter_comma),
+		("named callback parameters are rejected", test_named_callback_parameters_are_rejected),
+		("bare impure callback type is rejected", test_bare_impure_callback_type_is_rejected),
+	]
+}
