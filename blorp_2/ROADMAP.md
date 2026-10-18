@@ -77,6 +77,9 @@ their own inventory and plan after M8.
   configurations, cache-mutating tests and shared builds remain serialized.
   All measurements and e2e cost gates require an exclusive quiet window.
   Stop and serialize focused runs if macOS execution stalls recur.
+  Before archiving a completed chat, copy still-needed ignored evidence outside
+  its managed worktrees and verify the copies. Chat archival may remove those
+  worktrees; their Git recovery snapshots omit ignored build files.
 - **The frontier.** One number across the path, reported by
   `scripts/blorp2-fixpoint --frontier`: files of `src` that parse (report the
   discovered numerator and denominator, 35/37 at the final quality gate),

@@ -14,7 +14,8 @@ both are below the independent +5% hard ceilings. The host proxy increases
 The host's known strict failure remains failed under the narrow
 [bootstrap limitation](../../blorp_2/HOST_BOOTSTRAP_LIMITATIONS.md).
 Root and independent compiler code/test reviews approve the original 29-path
-packet with zero findings. Destination integration remains a separate gate.
+packet with zero findings. Destination integration passed 33 focused checks,
+and `8a0417724` was verified on `origin/main`.
 
 ## Frozen inputs and tools
 
@@ -76,7 +77,7 @@ env -u BLORP_CC -u BLORP_LEAK_CHECK -u BLORP_MEMORY_STATS \
 
 Both emits and four links succeed. Every link retains 87 warnings; this is
 not a warning-free build. The full paired generated-compiler diff, 111,733
-lines, is retained without normalization. Whole-compiler B/C C identity is
+lines, was retained without normalization. Whole-compiler B/C C identity is
 not claimed: the source adds an operation, contract, fragment and enum cases.
 
 | Artifact | B SHA256 | C SHA256 |
@@ -151,7 +152,7 @@ This additional e2e run overlaps local compiled work from the legacy runtime
 gate: it is **functional integration evidence**, not a quiet cost measurement.
 No cost sample is repeated, no baseline moves, and the original 3,900 matched cost
 calls remain authoritative. Exact commands, logs, exits, hashes and before/after
-maps are retained under `blorp_2/build/finish-concat/post-ci-functional/`.
+maps were retained under `blorp_2/build/finish-concat/post-ci-functional/`.
 
 ## Costs and scope
 
@@ -169,7 +170,7 @@ not the source-byte checkpoint metric. Both strict host calls return **99**,
 empty stdout and complete C: B has 515,949 leaked objects / 35,090,966 bytes;
 C has 516,337 / 35,115,967. Both remain
 `FAILED_HOST_LEAK_LIMITATION`. Allocations are not reduced by leaked counts.
-The full ordered report, including the type table, is validated and retained;
+The full ordered report, including the type table, was validated before landing;
 17 static checks against accepted reports and malformed copies validate the
 bounded collector repair without extra host samples. Every strict/normal proxy
 C matches its own setup C exactly. This is owned-input compilation plus a host
@@ -193,20 +194,32 @@ not change.
 
 ## Retained artifacts
 
-In `finish-concat/blorp/blorp_2/build/finish-concat/`, `full/` holds complete
-correctness logs, the functional pilot and its maps. `cost-preparation/` holds
+**Retention correction after landing `8a0417724`.** Archiving the completed
+chat also archived its managed worktrees and removed their ignored build files.
+The source snapshots were restored, but the original 3,900-call raw packet and
+the supporting host binaries below were not recovered in the checked locations.
+The measurements and independent reviews above predate that loss; their summary
+remains recorded here, while the original raw paths are unavailable. The separate
+destination check remains in the primary checkout's `build/concat-destination/`
+(33 PASS events, exit 0, with all 830 input pins checked before archival).
+Remaining bootstrap evidence was copied with complete SHA256 maps to that
+checkout's `build/bootstrap-evidence/retained-2026-10-18/`. Future measurements
+must freeze available tools explicitly; these missing artifacts cannot be reused.
+
+In `finish-concat/blorp/blorp_2/build/finish-concat/`, `full/` held complete
+correctness logs, the functional pilot and its maps. `cost-preparation/` held
 the frozen invocation manifest, complete snapshots, script/case pins, commands,
 installers, validator checks, setup logs, production patch, generated-compiler
-diff and `verified-summary.json`; `cost/` holds all raw target/proxy calls,
+diff and `verified-summary.json`; `cost/` held all raw target/proxy calls,
 times, streams, statuses, C, TSVs and pilot artifacts. No measured input moved
-after freezing. Metadata-only setup errors before collection are preserved:
+after freezing. Metadata-only setup errors before collection were preserved:
 an initial nested-root calculation and relative oracle paths were corrected
 before any compiler sample; a docs-only main advance did not move B.
 
-The original worktree `b0da/blorp/blorp_2/build/string-concat/` retains every
+The original worktree `b0da/blorp/blorp_2/build/string-concat/` retained every
 semantic red, mutation/restoration, original source and normal-main delivery
 artifact. Its old absolute fixture observation (12,491 allocations / 71,039,732
 instructions) is historical and was not reused as a matched current result.
-Unlanded host/slice drafts remain in that original worktree and are excluded
-from this change. Static hygiene and artifact-scan records are kept alongside
+Unlanded host/slice drafts were left in that original worktree and were excluded
+from this change. Static hygiene and artifact-scan records were kept alongside
 the finishing packet, alongside the additional functional receipts above.
