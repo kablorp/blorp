@@ -1,0 +1,96 @@
+-- One emitted allocator authority. Accounting metadata exists only in mode1;
+-- normal mode preserves libc operations, pointer ABI and single evaluation.
+MEMORY_RUNTIME: String =
+	raw
+		|#include <stddef.h>
+		|#include <stdint.h>
+		|#include <stdio.h>
+		|#include <stdlib.h>
+		|#include <string.h>
+		|#include <stdatomic.h>
+		|#ifndef BLORP_MEMORY_DIAGNOSTICS
+		|#define BLORP_MEMORY_DIAGNOSTICS 0
+		|#endif
+		|#if BLORP_MEMORY_DIAGNOSTICS != 0 && BLORP_MEMORY_DIAGNOSTICS != 1
+		|#error BLORP_MEMORY_DIAGNOSTICS must be 0 or 1
+		|#endif
+		|#if BLORP_MEMORY_DIAGNOSTICS
+		|enum {BLORP_STRICT_LEAK_EXIT_STATUS=99};
+		|union blorp_memory_header {max_align_t alignment;size_t requested;};
+		|struct blorp_memory_counts {size_t allocations,releases,live,bytes;};
+		|static struct blorp_memory_counts blorp_memory_counts;
+		|static atomic_flag blorp_memory_lock=ATOMIC_FLAG_INIT;
+		|static int blorp_memory_strict;
+		|static void blorp_memory_fail(const char *message){fputs(message,stderr);abort();}
+		|static size_t blorp_memory_add(size_t left,size_t right){
+		|if(right>SIZE_MAX-left)blorp_memory_fail("error: target memory accounting overflow\n");
+		|return left+right;
+		|}
+		|static size_t blorp_memory_subtract(size_t left,size_t right){
+		|if(right>left)blorp_memory_fail("error: target memory accounting underflow\n");
+		|return left-right;
+		|}
+		|static void blorp_memory_enter(void){
+		|while(atomic_flag_test_and_set_explicit(&blorp_memory_lock,memory_order_acquire)){}
+		|}
+		|static void blorp_memory_leave(void){atomic_flag_clear_explicit(&blorp_memory_lock,memory_order_release);}
+		|void *blorp_memory_allocate(size_t requested){
+		|const size_t storage=blorp_memory_add(sizeof(union blorp_memory_header),requested);
+		|blorp_memory_enter();
+		|const size_t allocations=blorp_memory_add(blorp_memory_counts.allocations,1);
+		|const size_t live=blorp_memory_add(blorp_memory_counts.live,1);
+		|const size_t bytes=blorp_memory_add(blorp_memory_counts.bytes,requested);
+		|union blorp_memory_header *header=malloc(storage);
+		|if(header!=NULL){
+		|header->requested=requested;
+		|blorp_memory_counts=(struct blorp_memory_counts){allocations,blorp_memory_counts.releases,live,bytes};
+		|}
+		|blorp_memory_leave();
+		|return header==NULL?NULL:header+1;
+		|}
+		|void *blorp_memory_resize(void *allocation,size_t requested){
+		|if(requested==0)blorp_memory_fail("error: target memory resize requires a positive size\n");
+		|if(allocation==NULL)return blorp_memory_allocate(requested);
+		|const size_t storage=blorp_memory_add(sizeof(union blorp_memory_header),requested);
+		|union blorp_memory_header *header=(union blorp_memory_header *)allocation-1;
+		|blorp_memory_enter();
+		|const size_t bytes=blorp_memory_add(blorp_memory_subtract(blorp_memory_counts.bytes,header->requested),requested);
+		|union blorp_memory_header *grown=realloc(header,storage);
+		|if(grown!=NULL){grown->requested=requested;blorp_memory_counts.bytes=bytes;}
+		|blorp_memory_leave();
+		|return grown==NULL?NULL:grown+1;
+		|}
+		|void blorp_memory_release(void *allocation){
+		|if(allocation==NULL)return;
+		|union blorp_memory_header *header=(union blorp_memory_header *)allocation-1;
+		|blorp_memory_enter();
+		|const size_t requested=header->requested;
+		|const size_t releases=blorp_memory_add(blorp_memory_counts.releases,1);
+		|const size_t live=blorp_memory_subtract(blorp_memory_counts.live,1);
+		|const size_t bytes=blorp_memory_subtract(blorp_memory_counts.bytes,requested);
+		|blorp_memory_counts=(struct blorp_memory_counts){blorp_memory_counts.allocations,releases,live,bytes};
+		|free(header);
+		|blorp_memory_leave();
+		|}
+		|void blorp_memory_start(void){
+		|const char *mode=getenv("BLORP_LEAK_CHECK");
+		|if(mode==NULL||mode[0]=='\0'){blorp_memory_strict=0;return;}
+		|if(strcmp(mode,"strict")!=0){fputs("error: BLORP_LEAK_CHECK must be 'strict' or unset\n",stderr);exit(1);}
+		|blorp_memory_strict=1;
+		|}
+		|int blorp_memory_finish(int requested_exit_status){
+		|if(!blorp_memory_strict)return requested_exit_status;
+		|blorp_memory_enter();
+		|const struct blorp_memory_counts counts=blorp_memory_counts;
+		|blorp_memory_leave();
+		|fprintf(stderr,"blorp: leak check: %zu allocs, %zu releases, %zu leaked, %zu bytes\n",counts.allocations,counts.releases,counts.live,counts.bytes);
+		|return counts.allocations==counts.releases&&counts.live==0&&counts.bytes==0?requested_exit_status:BLORP_STRICT_LEAK_EXIT_STATUS;
+		|}
+		|#else
+		|#define blorp_memory_allocate malloc
+		|#define blorp_memory_resize realloc
+		|#define blorp_memory_release free
+		|#define blorp_memory_start() ((void)0)
+		|#define blorp_memory_finish(requested_exit_status) (requested_exit_status)
+		|#endif
+		|

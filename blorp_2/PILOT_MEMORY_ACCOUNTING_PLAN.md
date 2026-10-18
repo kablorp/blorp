@@ -2,8 +2,8 @@
 
 ## Problem and boundary
 
-Accepted baseline is `ab68426bedd9243208e8568b61abbc015347c0c9`.
-Self-built target compilers currently allocate through libc without producing
+Planning baseline was `ab68426bedd9243208e8568b61abbc015347c0c9`.
+At that baseline, self-built target compilers allocate through libc without producing
 `blorp: leak check: A allocs, R releases, L leaked, B bytes`; defining
 `BLORP_MEMORY_DIAGNOSTICS=1` alone cannot satisfy the existing strict reader.
 Host-built compiler accounting is a different runtime and object ABI.
@@ -109,3 +109,30 @@ Root coordinates all compiled jobs and final integration. Preserve source/tool
 pins, complete commands/status/streams/C and raw observations under ignored
 `build/pilot-memory-accounting/`. Stop on scope/cost breach, unexpected oracle or
 host defect; report it without a fallback, new mechanism, retry or waiver.
+
+## Implemented increment and evidence boundary
+
+The runtime/emission increment and owning tests are implemented. Production is
+132 physical additions/35 deletions/+97 net; tests 445 additions/71 deletions/+374 net,
+including the one 130-line direct-C fixture and no added language fixtures. All original caps bind.
+[Acceptance evidence](../benchmarks/results/blorp_2_pilot_memory_accounting_2026-10-18.md)
+records the first ordinary-main missing-report RED/GREEN, 20 native runtime cases,
+all five exit shapes, 3,359 worktree component callbacks and 478 e2e cases.
+Retained ordinary-main C executes the new target runtime with exact `3/3/0/0`.
+
+The reviewed FEATURE comparison fixed B at accepted `7b17de452` and C at B plus
+code/test patch `052e6fa5`, preserving accepted Path and product-lifetime tests.
+All 4,032 matched calls pass: 1,006 strict, 3,018 normal and 8 original host-proxy calls.
+All per-input allocation counts and normal instruction minima, plus the original
+schema 1 construction-checkpoint metrics, pass the +5% target, +10% hard ceiling
+and all tighter absolute caps. No roll of B or epoch change.
+
+The 1,006 strict compiler reports belong to host-generated pilot A's OLD host
+runtime, across feature variants B/C; they do not execute MEMORY_RUNTIME in that
+compiler. The e2e native harness unsets leak mode. New target-runtime execution
+evidence is the 20 native cases using direct C and ordinary-main probes, not strict
+accounting for every e2e target or a target-built compiler B. Mode 0 has libc-alias,
+no-getenv and single-evaluation proof, without a measured native overhead result.
+Mode 1 overhead and full target-built strict self-compilation remain M8 follow-up.
+Original SOURCE R0 criteria/failures/holds remain unchanged. Root owns destination
+validation, final reviews, commit and landing; no M8 completion is claimed.

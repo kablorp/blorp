@@ -1,0 +1,129 @@
+import:
+	../../src/runtime/list: arguments_runtime, list_element_key, list_runtime
+	../../src/runtime/memory: MEMORY_RUNTIME
+	../../src/runtime/string: string_runtime
+	../../src/specialize/specialize: TypeRef(StringType)
+	fs: IOError, resource_path, temporary_directory
+	process: ProcessExit(Exited, Signaled, TimedOut), command, run, run_command
+	system: getenv, read_file, temp_dir, write_file
+	test: TestSuite, run_suite_result
+
+
+private union ExpectedOutcome:
+	ExactExit(Int, String)
+	AccountingAbort(String)
+	AddressSanitizerFault
+
+
+private ABORT_SIGNAL: Int = 6 -- SIGABRT on the supported POSIX targets.
+private SANITIZER_EXIT_STATUS: Int = 77
+private BALANCED: String = "blorp: leak check: 1 allocs, 1 releases, 0 leaked, 0 bytes\n"
+private EMPTY: String = "blorp: leak check: 0 allocs, 0 releases, 0 leaked, 0 bytes\n"
+private OVERFLOW: String = "error: target memory accounting overflow\n"
+
+
+private pure func exit_label(exit: ProcessExit) -> String:
+	match exit:
+		Exited(status): "exit " + status.to_string()
+		Signaled(signal): "signal " + signal.to_string()
+		TimedOut: "timeout"
+
+
+private func native_case(executable: String, name: String, mode: Option[String], expected: ExpectedOutcome) -> Bool:
+	request = { command(executable, [name]) |
+		environment = [
+			{ name = "BLORP_LEAK_CHECK", value = mode },
+			{ name = "BLORP_MEMORY_STATS", value = None },
+			{ name = "ASAN_OPTIONS", value = Some("detect_leaks=0:abort_on_error=0:exitcode=77") },
+		]
+	}
+	match run_command(request):
+		Err(error):
+			print_error(error.to_string())
+			False
+		Ok(output):
+			stderr = output.stderr.to_string()
+			passed = output.stdout == "".to_bytes() and match (expected, output.exit):
+				(ExactExit(status, message), Exited(actual)): actual == status and stderr == message
+				(AccountingAbort(message), Signaled(signal)): signal == ABORT_SIGNAL and stderr == message
+				(AddressSanitizerFault, Exited(actual)):
+					actual == SANITIZER_EXIT_STATUS and (
+						stderr.contains("ERROR: AddressSanitizer: heap-use-after-free")
+						or stderr.contains("ERROR: AddressSanitizer: attempting double-free")
+					) and not stderr.contains("blorp: leak check:")
+				_: False
+			if not passed:
+				print_error(name + ": " + exit_label(output.exit) + "; stderr=" + stderr)
+			passed
+
+
+private func build_native(directory: String, mode: String) -> Result[String, String]:
+	executable = directory + "/memory_" + mode
+	compiled ?= run(getenv("BLORP_CC").get_or("clang"), [
+		"-std=c11", "-O0", "-Wall", "-Wextra", "-Werror", "-pedantic",
+		"-fsanitize=address,undefined", "-fno-sanitize-recover=all",
+		"-DBLORP_MEMORY_DIAGNOSTICS=" + mode, directory + "/memory_test.c", "-o", executable,
+	])
+	if compiled.exit_code() == 0 and compiled.stdout() == "" and compiled.stderr() == "":
+		Ok(executable)
+	else:
+		Err("memory native build failed: " + compiled.stderr())
+
+
+private func native_checks(directory: String) -> Result[Bool, String]:
+	lists = list_runtime(list_element_key(StringType), "struct blorp_string*", "blorp_string_retain(element);", "blorp_string_release(element);")
+	written ?= write_file(directory + "/memory_runtime.c", MEMORY_RUNTIME + string_runtime() + lists + arguments_runtime())
+	fixture ?= read_file("blorp_2/test/runtime/fixtures/memory_test.c")
+	copied ?= write_file(directory + "/memory_test.c", fixture)
+	normal ?= build_native(directory, "0")
+	diagnostic ?= build_native(directory, "1")
+	suite: TestSuite = {
+		description = "Target memory helper invariants",
+		tests = [
+			("mode0 preserves raw pointers, single evaluation and zero getenv", func(): native_case(normal, "normal", Some("invalid"), ExactExit(0, ""))),
+			("strict finish evaluates once and preserves requested status", func(): native_case(diagnostic, "finish_once", Some("strict"), ExactExit(17, EMPTY))),
+			("strict reports a live independent 17 byte root", func(): native_case(diagnostic, "leak", Some("strict"), ExactExit(99, "blorp: leak check: 1 allocs, 0 releases, 1 leaked, 17 bytes\n"))),
+			("release retires the observed backing occurrence", func(): native_case(diagnostic, "release", Some("strict"), ExactExit(0, BALANCED))),
+			("allocation preserves max_align_t alignment", func(): native_case(diagnostic, "alignment", Some("strict"), ExactExit(0, BALANCED))),
+			("double release fails with the expected sanitizer class", func(): native_case(diagnostic, "double_release", Some("strict"), AddressSanitizerFault)),
+			("successful resize preserves bytes and one lifetime", func(): native_case(diagnostic, "resize", Some("strict"), ExactExit(0, BALANCED))),
+			("failed resize preserves live bytes, counts and later release", func(): native_case(diagnostic, "failed_resize", Some("strict"), ExactExit(0, BALANCED))),
+			("failed allocation publishes no lifetime", func(): native_case(diagnostic, "failed_allocate", Some("strict"), ExactExit(0, EMPTY))),
+			("NULL resize starts one lifetime", func(): native_case(diagnostic, "null_resize", Some("strict"), ExactExit(0, BALANCED))),
+			("NULL release has no backing occurrence", func(): native_case(diagnostic, "null", Some("strict"), ExactExit(0, EMPTY))),
+			("checked arithmetic accepts exact SIZE_MAX boundaries", func(): native_case(diagnostic, "arithmetic", Some("strict"), ExactExit(0, EMPTY))),
+			("SIZE_MAX rejects before prefix addition wraps", func(): native_case(diagnostic, "size_overflow", Some("strict"), AccountingAbort(OVERFLOW))),
+			("allocation counter saturation rejects overflow", func(): native_case(diagnostic, "add_overflow", Some("strict"), AccountingAbort(OVERFLOW))),
+			("release live-count underflow rejects an invalid transition", func(): native_case(diagnostic, "subtract_underflow", Some("strict"), AccountingAbort("error: target memory accounting underflow\n"))),
+			("zero resize rejects its unsupported lifetime semantics", func(): native_case(diagnostic, "zero_resize", Some("strict"), AccountingAbort("error: target memory resize requires a positive size\n"))),
+			("invalid mode rejects before effects", func(): native_case(diagnostic, "effects", Some("invalid"), ExactExit(1, "error: BLORP_LEAK_CHECK must be 'strict' or unset\n"))),
+			("unset mode produces no invented balanced report", func(): native_case(diagnostic, "leak", None, ExactExit(0, ""))),
+			("empty mode produces no invented balanced report", func(): native_case(diagnostic, "leak", Some(""), ExactExit(0, ""))),
+			("invalid third argv destroys each initialized occurrence", func(): native_case(diagnostic, "partial_argv", Some("strict"), ExactExit(0, "blorp: leak check: 3 allocs, 3 releases, 0 leaked, 0 bytes\n"))),
+		]
+	}
+	result = run_suite_result(suite)
+	Ok(result[1] == 0)
+
+
+private func scoped_native_checks() -> Result[Bool, IOError]:
+	with directory ?= temporary_directory(temp_dir(), "blorp2_memory_helpers_"):
+		match native_checks(directory.resource_path()):
+			Ok(passed): Ok(passed)
+			Err(error):
+				print_error(error)
+				Ok(False)
+
+
+func test_native_memory_contract() -> Bool:
+	match scoped_native_checks():
+		Ok(passed): passed
+		Err(error):
+			print_error(error.to_string())
+			False
+
+
+tests: TestSuite = {
+	description = "Blorp 2 target allocator runtime",
+	tests = [("allocator transitions and lifecycle", test_native_memory_contract)]
+}

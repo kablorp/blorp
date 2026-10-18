@@ -1,0 +1,84 @@
+import:
+	../../src/emit/emit: emit
+	../../src/lower/lower: lower
+	../../src/own/own: own
+	../../src/specialize/specialize: specialize
+	../../src/utils/syntax: Diagnostic
+	../../src/verify/verify: verify
+	../unit/input: check, setup_diagnostic
+	../unit/module_input: PRIMITIVE_BASE, parse_modules_with_base
+	fs: IOError, resource_path, temporary_directory
+	process: run
+	system: getenv, temp_dir, write_file
+	test: TestSuite
+
+
+-- This is an ordinary language main, emitted unchanged through public phases.
+-- Its unused String still owns one root that must die before the exit report.
+private SOURCE: String =
+	|func main() -> Int:
+	|    unused = "root"
+	|    0
+	|
+
+
+private pure func program_c() -> Result[String, Diagnostic]:
+	parsed ?= parse_modules_with_base([{ source = SOURCE, targets = [] }], PRIMITIVE_BASE)
+	checked ?= check(parsed).map_err(setup_diagnostic)
+	specialized ?= specialize(checked)
+	lowered ?= lower(specialized)
+	owned ?= own(lowered)
+	verified ?= verify(owned)
+	emit(verified)
+
+
+private func strict_report(directory: String) -> Result[Bool, String]:
+	source ?= program_c().map_err(pure func(error): error.message + "; help: " + error.help)
+	written ?= write_file(directory + "/program.c", source)
+	executable = directory + "/program"
+	compiled ?= run(
+		getenv("BLORP_CC").get_or("clang"),
+		[
+			"-std=c11", "-O0", "-Wall", "-Wextra", "-Werror", "-pedantic",
+			"-fsanitize=address,undefined", "-fno-sanitize-recover=all",
+			"-DBLORP_MEMORY_DIAGNOSTICS=1", directory + "/program.c", "-o", executable,
+		],
+	)
+	if compiled.exit_code() != 0 or compiled.stdout() != "" or compiled.stderr() != "":
+		Err("memory accounting native build failed: " + compiled.stderr())
+	else:
+		output ?= run(
+			"/usr/bin/env",
+			["-u", "BLORP_MEMORY_STATS", "BLORP_LEAK_CHECK=strict", executable],
+		)
+		expected = "blorp: leak check: 1 allocs, 1 releases, 0 leaked, 0 bytes\n"
+		if output.exit_code() == 0 and output.stdout() == "" and output.stderr() == expected:
+			Ok(True)
+		else:
+			Err(
+				"ordinary main must report one retired String root; exit=" + output.exit_code().to_string()
+				+ "; stdout=" + output.stdout() + "; stderr=" + output.stderr(),
+			)
+
+
+private func scoped_strict_report() -> Result[Bool, IOError]:
+	with directory ?= temporary_directory(temp_dir(), "blorp2_memory_"):
+		match strict_report(directory.resource_path()):
+			Ok(passed): Ok(passed)
+			Err(error):
+				print_error(error)
+				Ok(False)
+
+
+func test_ordinary_main_reports_retired_string() -> Bool:
+	match scoped_strict_report():
+		Ok(passed): passed
+		Err(error):
+			print_error(error.to_string())
+			False
+
+
+tests: TestSuite = {
+	description = "Target strict memory accounting",
+	tests = [("ordinary main reports one retired String root", test_ordinary_main_reports_retired_string)]
+}

@@ -981,7 +981,11 @@ be rewritten once blorp_2 is mature. The unit-test migration is a separate plan.
 
 **Exit proof.** The fixpoint script exits 0.
 
-**Status.** Not started.
+**Status.** Not started. The [runtime accounting preparation](PILOT_MEMORY_ACCOUNTING_PLAN.md)
+has passed its bounded runtime and matched host-proxy gates
+([evidence](../benchmarks/results/blorp_2_pilot_memory_accounting_2026-10-18.md)).
+Those host-generated pilot counts do not establish target-built strict
+self-compilation or measured mode 0/mode 1 target allocator overhead; both remain M8 work.
 
 ## M9: post-self-compilation architecture audit
 
