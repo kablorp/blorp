@@ -40,7 +40,7 @@ The fixpoint the old compiler already uses, strengthened:
    every e2e fixture, **A** and **B** emit byte-identical C. A self-consistent
    fixpoint alone can hide a deterministic miscompile; A == B on fixtures
    localises host-versus-pilot drift.
-4. A, B and C are built at `-O2`: the first time emitted C runs optimised.
+4. A, B and C are built at `-O0`: the proof exercises unoptimised generated C.
 
 Unit tests are outside this definition. They depend on the host `TestSuite`
 (historical inventory: 59.5k lines, 1,554 tuples, 2,285 `==`, process and filesystem APIs) and need
@@ -129,7 +129,7 @@ M3 managed List/while loops + source flat-walk/range migration
 M4 ordinary opaque semantics over retained recursive layouts
 M2b qualified flat groups + bounded source-pattern migration
 M6 remaining first-order library + shell/path integration
-M8 actual O2 A/B/C and fixture identity proof
+M8 actual O0 A/B/C and fixture identity proof
 ```
 
 Host library work can overlap disjoint source preparations. Shared compiler
@@ -231,7 +231,7 @@ its report. Later milestones build on these and do not reopen them.
   limits rather than promising separate loop rewrites here.
 - **[scripts/blorp2-fixpoint](../scripts/blorp2-fixpoint)**: the three stages, a
   SHA-256 per stage with the first differing line, A == B over fixtures, e2e
-  under B, `-O2`, and `--frontier`.
+  under B, `-O0`, and `--frontier`.
 - **Parity table:** [LIBRARY_PARITY.md](LIBRARY_PARITY.md), landed. Regenerate it
   whenever `src` gains or loses a library dependency.
 - **Source corrections.** No `+` String operator in `src`; inventory
@@ -963,7 +963,7 @@ retirement remains conditional on the source migration and inventory.
 ## M8: the fixpoint gate
 
 **Goal.** The definition of done. **Scope.** `scripts/blorp2-fixpoint` exits 0:
-B == C, A == B on every fixture, e2e under B, all at `-O2`. Measure the
+B == C, A == B on every fixture, e2e under B, all at `-O0`. Measure the
 self-compile cost row (allocations and instructions per phase) under
 always-fresh `append`; if quadratic, unique-root reuse is the first post-fixpoint
 optimization candidate for M9 to assess before implementation.

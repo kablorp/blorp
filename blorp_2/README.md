@@ -2352,7 +2352,7 @@ Self-compilation has one measurement and one gate, both in
 
 ```bash
 scripts/blorp2-fixpoint --frontier   # files of src that parse, then the first failing stage; exits 0
-scripts/blorp2-fixpoint --prove      # A builds B, B builds C, all at -O2; B == C, A == B on every fixture, e2e under B
+scripts/blorp2-fixpoint --prove      # A builds B, B builds C, all at -O0; B == C, A == B on every fixture, e2e under B
 ```
 
 Both link every stage through this Makefile's `test-compiler` and

@@ -1,7 +1,7 @@
 BLORP_CC ?= clang
 # Paths are relative to the repository root, where every recipe runs. The e2e
 # suite tests BLORP2_COMPILER, which test-compiler links from BLORP2_COMPILER_C;
-# scripts/blorp2-fixpoint sets both per stage and links at -O2. A command-line
+# scripts/blorp2-fixpoint sets both per stage and links at -O0. A command-line
 # VAR=value overrides these; the environment does not (hence := and not ?=).
 BLORP2_COMPILER := blorp_2/build/compiler
 BLORP2_COMPILER_C := blorp_2/build/compiler.c

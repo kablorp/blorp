@@ -379,7 +379,7 @@ stage could not be built.
 
 `scripts/blorp2-fixpoint` is the same proof for the Blorp 2 pilot
 (`blorp_2/src`), strengthened per its self-compile plan: the host builds **A**,
-A builds **B**, B builds **C**, all linked at `-O2` through
+A builds **B**, B builds **C**, all linked at `-O0` through
 `make -C blorp_2 test-compiler` and `link-test-compiler` so the flags have one
 source. `--prove` requires B and C to emit byte-identical C for `blorp_2/src`
 (the first differing line is printed), A and B to agree on exit status, output
