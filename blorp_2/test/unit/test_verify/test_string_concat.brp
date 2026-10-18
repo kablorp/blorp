@@ -1,0 +1,143 @@
+import:
+	../../../src/namespace/builtins as Builtins
+	../../../src/own/own as Own
+	../../../src/specialize/specialize as Concrete
+	../../../src/utils/source: same_source
+	../../../src/utils/syntax: FunctionExecution(OrdinaryCalls), Entrypoint(NoArguments), EntryResult(IntegerExitStatus)
+	../../../src/verify/verify: verify
+	../ownership_inputs: InputIds, input_ids, span
+	test: TestSuite
+
+
+-- Raw ownership IR is independent of insertion; only opaque IDs use its seed.
+private pure func raw_concat(
+	ids: InputIds,
+	arguments: List[Own.OwnedArgument],
+	result: Own.ResultOwnership,
+	drops: List[Own.OwnershipOperation],
+) -> Own.OwnershipProgram:
+	parameter: Own.OwnedDefinition = {
+		id = ids.first, value_type = Concrete.StringType,
+		operation = Own.ParameterDefinition(0),
+		result = Own.BorrowedResult(Own.ParameterBorrow(ids.first)), span = span(10)
+	}
+	joined: Own.OwnedDefinition = {
+		id = ids.second, value_type = Concrete.StringType,
+		operation = Own.CallDefinition({ target = Concrete.RuntimeFunction(Builtins.StringConcat), span = span(30) }, arguments),
+		result = result, span = span(30)
+	}
+	zero: Own.OwnedDefinition = {
+		id = ids.third, value_type = Concrete.IntType,
+		operation = Own.IntegerDefinition(0), result = Own.UnmanagedResult, span = span(50)
+	}
+	worker: Own.OwnedFunction = {
+		execution = OrdinaryCalls, signature = { parameters = [Concrete.StringType], return_type = Concrete.IntType },
+		operations = [Own.DefineValue(parameter), Own.DefineValue(joined)].concat(drops).append(Own.DefineValue(zero)),
+		tail = Own.ReturnTail(Own.ReturnResult(Own.UnmanagedReturn(ids.third)))
+	}
+	main: Own.OwnedFunction = {
+		execution = OrdinaryCalls, signature = { parameters = [], return_type = Concrete.IntType },
+		operations = [Own.DefineValue({ zero | id = ids.first })],
+		tail = Own.ReturnTail(Own.ReturnResult(Own.UnmanagedReturn(ids.first)))
+	}
+	{ records = [], unions = [], functions = [main, worker], entrypoint = NoArguments(ids.entrypoint, IntegerExitStatus) }
+
+
+private pure func borrowed(ids: InputIds) -> Own.OwnedArgument:
+	Own.BorrowedArgument({ value = ids.first, source = Own.ParameterBorrow(ids.first) })
+
+
+private pure func rejects(program: Own.OwnershipProgram, message: String, at: Int) -> Bool:
+	match verify(program):
+		Ok(_): False
+		Err(error):
+			(
+				error.message == "ownership verification failed: " + message
+				and error.help == "report this compiler error with the input program"
+				and same_source(error.span.source, span(at).source)
+				and error.span.start == at and error.span.end == at + 1 and error.note.is_none()
+			)
+
+
+pure func test_raw_concat_has_one_fresh_owner_and_drop() -> Bool:
+	match input_ids():
+		Ok(ids):
+			verify(raw_concat(ids, [borrowed(ids), borrowed(ids)], Own.OwnedResult(Own.owner_id(0)),
+				[Own.DropOwner(Own.owner_id(0), span(40))],
+			)).is_ok()
+		Err(_): False
+
+
+pure func test_concat_rejects_unmanaged_result() -> Bool:
+	match input_ids():
+		Ok(ids):
+			rejects(raw_concat(ids, [borrowed(ids), borrowed(ids)], Own.UnmanagedResult, []),
+				"managed result requires an owner", 30)
+		Err(_): False
+
+
+pure func test_concat_rejects_missing_drop() -> Bool:
+	match input_ids():
+		Ok(ids):
+			rejects(raw_concat(ids, [borrowed(ids), borrowed(ids)], Own.OwnedResult(Own.owner_id(0)), []),
+				"owner 0 remains live at return", 50)
+		Err(_): False
+
+
+pure func test_concat_rejects_duplicate_drop() -> Bool:
+	match input_ids():
+		Ok(ids):
+			drops = [Own.DropOwner(Own.owner_id(0), span(40)), Own.DropOwner(Own.owner_id(0), span(41))]
+			rejects(raw_concat(ids, [borrowed(ids), borrowed(ids)], Own.OwnedResult(Own.owner_id(0)), drops),
+				"owner 0 has already been discharged", 41)
+		Err(_): False
+
+
+pure func test_concat_rejects_missing_operand() -> Bool:
+	match input_ids():
+		Ok(ids):
+			rejects(raw_concat(ids, [borrowed(ids)], Own.OwnedResult(Own.owner_id(0)),
+				[Own.DropOwner(Own.owner_id(0), span(40))]), "call is missing its argument", 30)
+		Err(_): False
+
+
+pure func test_concat_rejects_extra_operand() -> Bool:
+	match input_ids():
+		Ok(ids):
+			arguments = [borrowed(ids), borrowed(ids), borrowed(ids)]
+			rejects(raw_concat(ids, arguments, Own.OwnedResult(Own.owner_id(0)),
+				[Own.DropOwner(Own.owner_id(0), span(40))]), "call has an unexpected argument", 30)
+		Err(_): False
+
+
+pure func test_concat_rejects_unmanaged_argument() -> Bool:
+	match input_ids():
+		Ok(ids):
+			arguments = [Own.UnmanagedArgument(ids.first), borrowed(ids)]
+			rejects(raw_concat(ids, arguments, Own.OwnedResult(Own.owner_id(0)),
+				[Own.DropOwner(Own.owner_id(0), span(40))]), "managed call argument requires an owner-dependent borrow", 30)
+		Err(_): False
+
+
+pure func test_concat_rejects_wrong_parameter_borrow() -> Bool:
+	match input_ids():
+		Ok(ids):
+			arguments = [Own.BorrowedArgument({ value = ids.first, source = Own.ParameterBorrow(ids.second) }), borrowed(ids)]
+			rejects(raw_concat(ids, arguments, Own.OwnedResult(Own.owner_id(0)),
+				[Own.DropOwner(Own.owner_id(0), span(40))]), "parameter borrow does not refer to the borrowed parameter", 30)
+		Err(_): False
+
+
+tests: TestSuite = {
+	description = "Blorp 2 independent String concat verification",
+	tests = [
+		("valid fresh result drops once", test_raw_concat_has_one_fresh_owner_and_drop),
+		("unmanaged result rejects", test_concat_rejects_unmanaged_result),
+		("missing result drop rejects", test_concat_rejects_missing_drop),
+		("duplicate result drop rejects", test_concat_rejects_duplicate_drop),
+		("missing operand rejects", test_concat_rejects_missing_operand),
+		("extra operand rejects", test_concat_rejects_extra_operand),
+		("unmanaged managed argument rejects", test_concat_rejects_unmanaged_argument),
+		("wrong parameter borrow rejects", test_concat_rejects_wrong_parameter_borrow),
+	]
+}

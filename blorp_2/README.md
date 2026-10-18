@@ -1770,7 +1770,15 @@ Specialization translates the designated constructors to the result instance's
 constructor identities, and emission receives those directly. The verifier
 sees instances, not declarations, and deliberately does not repeat that check.
 
-## Integer-facing String operations
+## Counted String operations
+
+The target `string.add(left: String, right: String) -> String` is pure and
+returns one fresh concatenation. It borrows both operands, including when they
+alias, and preserves exact counted bytes, including NUL and UTF-8. Empty
+operands follow the same ownership contract. The native helper copies each
+operand once; this does not provide a growing-concat or List[String].join path.
+The [normal-main fixture](test/e2e/fixtures/string_operations/concat.brp)
+prints a doubled multilingual String with NUL and then its unchanged source.
 
 The target `string` module provides two pure operations with ordinary foundation
 Option results:

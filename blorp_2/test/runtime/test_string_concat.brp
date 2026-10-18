@@ -1,0 +1,70 @@
+import:
+	../../src/runtime/string: string_runtime
+	../../src/runtime/string_concat: STRING_CONCAT_RUNTIME
+	fs: IOError, resource_path, temporary_directory
+	process: run
+	system: getenv, read_file, temp_dir, write_file
+	test: TestSuite, run_suite_result
+
+
+private func native_case(executable: String, name: String) -> Bool:
+	match run("/usr/bin/env", ["-u", "BLORP_LEAK_CHECK", "-u", "BLORP_MEMORY_STATS", executable, name]):
+		Err(error):
+			print_error(error)
+			False
+		Ok(output):
+			if output.exit_code() == 0 and output.stdout() == "" and output.stderr() == "":
+				True
+			else:
+				print_error(name + ": " + output.stderr())
+				False
+
+
+private func native_checks(directory: String) -> Result[Bool, String]:
+	written ?= write_file(directory + "/string_concat_runtime.c", string_runtime() + STRING_CONCAT_RUNTIME)
+	fixture ?= read_file("blorp_2/test/runtime/fixtures/string_concat_test.c")
+	test_written ?= write_file(directory + "/string_concat_test.c", fixture)
+	executable = directory + "/string_concat_test"
+	compiled ?= run(getenv("BLORP_CC").get_or("clang"), ["-std=c11", "-O0", "-Wall", "-Wextra", "-Werror", "-pedantic", "-fsanitize=address,undefined", "-fno-sanitize-recover=all", directory + "/string_concat_test.c", "-o", executable])
+	if compiled.exit_code() != 0 or compiled.stdout() != "" or compiled.stderr() != "":
+		Err("String concat native build failed: " + compiled.stderr())
+	else:
+		cases = [
+			("empty operands create one fresh owner", "concat_empty"),
+			("empty left preserves exact right", "concat_left_empty"),
+			("empty right preserves exact left", "concat_right_empty"),
+			("ASCII concatenation survives input destruction", "concat_ascii"),
+			("concatenation preserves multilingual bytes", "concat_utf8"),
+			("concatenation preserves embedded NUL and following bytes", "concat_nul"),
+			("concatenation preserves distinct normalization forms", "concat_normalization"),
+			("aliasing operands borrow one source obligation", "concat_alias"),
+		]
+		suite: TestSuite = {
+			description = "Counted String concat lifetimes and bytes",
+			tests = cases.map(func(item): (item[0], func(): native_case(executable, item[1])))
+		}
+		result = run_suite_result(suite)
+		Ok(result[1] == 0)
+
+
+private func scoped_native_checks() -> Result[Bool, IOError]:
+	with directory ?= temporary_directory(temp_dir(), "blorp2_string_concat_"):
+		match native_checks(directory.resource_path()):
+			Ok(passed): Ok(passed)
+			Err(error):
+				print_error(error)
+				Ok(False)
+
+
+func test_string_concat_native_contract() -> Bool:
+	match scoped_native_checks():
+		Ok(passed): passed
+		Err(error):
+			print_error(error.to_string())
+			False
+
+
+tests: TestSuite = {
+	description = "Blorp 2 counted String concat native runtime",
+	tests = [("native concat contracts", test_string_concat_native_contract)]
+}

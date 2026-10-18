@@ -1,0 +1,76 @@
+import:
+	../../../src/lower/lower as Lower
+	../../../src/namespace/builtins as Builtins
+	../../../src/own/own as Own
+	../../../src/specialize/specialize as Concrete
+	../../../src/utils/syntax: Purity(Pure)
+	../ownership_inputs: InputIds, function, input_ids, integer, parameter, runtime
+	test: TestSuite
+
+
+pure func test_concat_contract_is_pure_two_strings_to_string() -> Bool:
+	operation: Builtins.RuntimeOperation[Concrete.VariantInstanceId, Concrete.TypeRef] = Builtins.StringConcat
+	contract = Builtins.runtime_contract(operation)
+	match (contract.purity, contract.parameters, contract.return_type):
+		(Pure, [Builtins.PrimitiveRuntimeType(Builtins.BuiltinString), Builtins.PrimitiveRuntimeType(Builtins.BuiltinString)], Builtins.ValueResult(Builtins.PrimitiveRuntimeType(Builtins.BuiltinString))): True
+		_: False
+
+
+pure func test_concat_borrows_aliased_inputs_and_transfers_its_fresh_owner() -> Bool:
+	match input_ids():
+		Err(_): False
+		Ok(ids):
+			definitions = [
+				parameter(ids.first, Concrete.StringType),
+				runtime(ids.second, Builtins.StringConcat, [ids.first, ids.first], Concrete.StringType, 30),
+			]
+			match Own.insert_function(function(definitions, ids.second, [Concrete.StringType], Concrete.StringType), [], []):
+				Ok(owned):
+					match (owned.operations, owned.tail):
+						([Own.DefineValue(_), Own.DefineValue(result)], Own.ReturnTail(Own.ReturnResult(Own.OwnedReturn(value, transferred)))):
+							match (result.operation, result.result):
+								(Own.CallDefinition(_, [Own.BorrowedArgument(left), Own.BorrowedArgument(right)]), Own.OwnedResult(owner)):
+									match (left.source, right.source):
+										(Own.ParameterBorrow(left_source), Own.ParameterBorrow(right_source)):
+											(
+												Lower.value_number(left.value) == Lower.value_number(ids.first)
+												and Lower.value_number(right.value) == Lower.value_number(ids.first)
+												and Lower.value_number(left_source) == Lower.value_number(ids.first)
+												and Lower.value_number(right_source) == Lower.value_number(ids.first)
+												and Lower.value_number(value) == Lower.value_number(ids.second)
+												and Own.owner_number(transferred) == Own.owner_number(owner)
+											)
+										_: False
+								_: False
+						_: False
+				Err(_): False
+
+
+pure func test_unused_concat_result_is_dropped_once() -> Bool:
+	match input_ids():
+		Err(_): False
+		Ok(ids):
+			definitions = [
+				parameter(ids.first, Concrete.StringType),
+				runtime(ids.second, Builtins.StringConcat, [ids.first, ids.first], Concrete.StringType, 30),
+				integer(ids.third, 0, 50),
+			]
+			match Own.insert_function(function(definitions, ids.third, [Concrete.StringType], Concrete.IntType), [], []):
+				Ok(owned):
+					match owned.operations:
+						[Own.DefineValue(_), Own.DefineValue(result), Own.DropOwner(dropped, at), Own.DefineValue(_)]:
+							match result.result:
+								Own.OwnedResult(owner): Own.owner_number(owner) == Own.owner_number(dropped) and at.start == 30
+								_: False
+						_: False
+				Err(_): False
+
+
+tests: TestSuite = {
+	description = "Blorp 2 String concat contract and ownership insertion",
+	tests = [
+		("contract is Pure String String to String", test_concat_contract_is_pure_two_strings_to_string),
+		("aliased inputs borrow and fresh result transfers", test_concat_borrows_aliased_inputs_and_transfers_its_fresh_owner),
+		("unused fresh result drops once", test_unused_concat_result_is_dropped_once),
+	]
+}
