@@ -889,9 +889,9 @@ language function values remain future work; existing parser/rejection behavior
 is preserved.
 
 The bounded [three-site type-argument translation](TYPE_ARGUMENT_TRANSLATION_PLAN.md)
-is being finished under its prospective fixed-current B/C +3% per-input and
-original-checkpoint-proxy contract. Historical R0 compliance remains UNVERIFIED;
-this retires neither the other eight callbacks nor the broader M7 dependency.
+is implemented and validated: [3,920 matched calls](../benchmarks/results/blorp_2_first_order_type_arguments_2026-10-18.md)
+pass the +3% per-input and original-checkpoint-proxy limits. Historical R0
+compliance remains UNVERIFIED; eight callbacks and the broader M7 dependency remain.
 
 **Retained future design.** Lambdas at known callees, including managed captures.
 The model, not an

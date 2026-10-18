@@ -2,10 +2,11 @@
 
 ## Status and dependencies
 
-Implementation finishing is authorized; compiled execution waits for root's
-exclusive-lane handover. The current finishing amendment below supersedes the
-old plan-only status and historical command assumptions. No current baseline,
-mutation, full-suite, output-identity or matched-cost pass is claimed.
+The three-site first-order migration is implemented and validated. The
+[current report](../benchmarks/results/blorp_2_first_order_type_arguments_2026-10-18.md)
+records the frozen accepted baseline, effective mutations, full functional gates
+and 3,920 successful matched calls. The amendments below retain the prospective
+contracts and historical evidence limits; eight callbacks and broader M7 remain.
 
 The original plan is retained at commit
 `9ae95d9fb8c475b38823e6e78729f19fd61ef5e8`. Its planning base was
