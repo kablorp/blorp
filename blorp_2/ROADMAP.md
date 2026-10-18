@@ -737,6 +737,10 @@ functional and matched FEATURE cost gates pass; [evidence](../benchmarks/results
 retains the failed supporting-host strict checks. Main/loader migration remains
 a separate gate. This does not complete M6.
 
+The [String integer-appending plan](APPEND_INT_PLAN.md) specifies one ordinary
+temporary-library wrapper over accepted formatting and concat; implementation
+remains pending.
+
 **Goal.** The real compiler source loads and checks against the real temporary
 library, with no remaining required parity row missing. Use the reduced resolved
 dependency inventory after source migration, not the old callback/Char rows.
