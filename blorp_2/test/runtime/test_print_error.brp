@@ -1,0 +1,68 @@
+import:
+	../../src/runtime/string: string_runtime, STRING_PRINT_ERROR_RUNTIME
+	fs: IOError, resource_path, temporary_directory
+	process: ProcessOutput, run
+	system: getenv, read_file, temp_dir, write_file
+	test: TestSuite, run_suite_result
+
+
+private func isolated(program: String, arguments: List[String]) -> Result[ProcessOutput, String]:
+	run("/usr/bin/env", ["-u", "BLORP_LEAK_CHECK", "-u", "BLORP_MEMORY_STATS", program].concat(arguments))
+
+
+private func native_case(executable: String, name: String, expected: String) -> Bool:
+	match isolated(executable, [name]):
+		Err(_): False
+		Ok(output):
+			if output.exit_code() == 0 and output.stdout() == "" and output.stderr() == expected:
+				True
+			else:
+				print_error("print_error native " + name + ": " + output.stderr())
+				False
+
+
+private func native_checks(directory: String) -> Result[Bool, String]:
+	written ?= write_file(directory + "/string_runtime.c", string_runtime())
+	helper_written ?= write_file(directory + "/print_error_runtime.c", STRING_PRINT_ERROR_RUNTIME)
+	fixture ?= read_file("blorp_2/test/runtime/fixtures/print_error_test.c")
+	test_written ?= write_file(directory + "/print_error_test.c", fixture)
+	executable = directory + "/print_error_test"
+	compiled ?= isolated(getenv("BLORP_CC").get_or("clang"), ["-std=c11", "-O0", "-Wall", "-Wextra", "-Werror", "-pedantic", "-fsanitize=address,undefined", "-fno-sanitize-recover=all", directory + "/print_error_test.c", "-o", executable])
+	if compiled.exit_code() != 0 or compiled.stdout() != "" or compiled.stderr() != "":
+		Err("print_error native build failed: " + compiled.stderr())
+	else:
+		suite: TestSuite = {
+			description = "Target stderr native ownership and requests",
+			tests = [
+				("counted NUL multibyte internal LF borrow", func(): native_case(executable, "bytes", "line1\n\0é😀\n")),
+				("empty requests zero bytes then LF", func(): native_case(executable, "empty", "\n")),
+				("short transfer stops without LF or retry", func(): native_case(executable, "short", "ab")),
+				("EINTR stops without LF or retry", func(): native_case(executable, "eintr", "")),
+				("LF failure attempts once", func(): native_case(executable, "newline_error", "abc")),
+			]
+		}
+		result = run_suite_result(suite)
+		Ok(result[1] == 0)
+
+
+private func scoped_native_checks() -> Result[Bool, IOError]:
+	with directory ?= temporary_directory(temp_dir(), "blorp2_print_error_"):
+		match native_checks(directory.resource_path()):
+			Ok(passed): Ok(passed)
+			Err(error):
+				print_error(error)
+				Ok(False)
+
+
+func test_native_contract() -> Bool:
+	match scoped_native_checks():
+		Ok(passed): passed
+		Err(error):
+			print_error(error.to_string())
+			False
+
+
+tests: TestSuite = {
+	description = "Blorp 2 stderr native runtime",
+	tests = [("native counted output and borrowed lifetime", test_native_contract)]
+}

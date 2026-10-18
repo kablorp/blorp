@@ -764,6 +764,9 @@ extraction candidate as future language work. It is not the active bootstrap
 route. The compiler's 72 ASCII literals, 14 Char patterns and Char API consumers
 remain to be migrated explicitly; input UTF-8 support is retained.
 
+Target `io.print_error(String) -> Void` now borrows counted bytes for stderr;
+short writes stop before LF without retry. Compiler-shell migration remains pending.
+
 ### Seven shell and path functions
 
 Paths and OS errors remain String for this macOS/Linux bootstrap increment.

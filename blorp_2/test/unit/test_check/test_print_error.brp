@@ -1,0 +1,134 @@
+import:
+	../../../src/check/check: check, checked_functions
+	../../../src/check/render: render_failure
+	../../../src/check/model as Model
+	../../../src/namespace/builtins as Builtins
+	../../../src/parse/assemble: parsed_contents
+	../../../src/utils/ids: inventory_functions
+	../../../src/utils/source: module_source, root_module_id, same_source
+	../../../src/utils/syntax: ParsedBody(ParsedBuiltinBody), ParsedRuntimeOperation(StringPrintErrorBuiltin), Purity(Impure), same_purity
+	../module_input: parse_modules
+	test: TestSuite
+
+
+func test_print_error_accepts_string_to_void() -> Bool:
+	source: String =
+		|func print_error(message: String) -> Void:
+		|    builtin("string.print_error")
+		|func main() -> Int:
+		|    print_error("text")
+		|    print_error("")
+		|    7
+		|
+	match parse_modules([{ source = source, targets = [] }]):
+		Err(error):
+			print_error(error.message + " | " + error.help + " | " + error.span.start.to_string() + ".." + error.span.end.to_string())
+			False
+		Ok(parsed):
+			match check(parsed):
+				Err(failure):
+					print_error(render_failure(failure).first.message)
+					False
+				Ok(program):
+					checked_functions(program).functions.any(pure func(function):
+						match function.statements:
+							[Model.DiscardExpression(value)]:
+								match value.form:
+									Model.InvokeFunction(call, arguments):
+										match call.target:
+											Model.RuntimeFunction(Builtins.StringPrintError):
+												contract: Builtins.RuntimeContract[Void, Model.TypeRef] = Builtins.runtime_contract(Builtins.StringPrintError)
+												match (contract.parameters, contract.return_type):
+													([Builtins.PrimitiveRuntimeType(Builtins.BuiltinString)], Builtins.ValueResult(Builtins.PrimitiveRuntimeType(Builtins.BuiltinVoid))):
+														same_purity(contract.purity, Impure) and arguments.length() == 1 and arguments.all(pure func(argument): Model.same_type(argument.value_type, Model.StringType)) and Model.same_type(value.value_type, Model.VoidType)
+													_: False
+											_: False
+									_: False
+							_: False
+					)
+
+
+private BODY: String =
+	|    builtin("string.print_error")
+	|func main() -> Int:
+	|    0
+	|
+
+
+private pure func diagnostic_is(source: String, message: String, help: String, start: Int, end: Int) -> Bool:
+	match parse_modules([{ source = source, targets = [] }]):
+		Err(_): False
+		Ok(parsed):
+			match check(parsed):
+				Ok(_): False
+				Err(failure):
+					diagnostics = render_failure(failure)
+					error = diagnostics.first
+					(
+						diagnostics.remaining.is_empty() and error.note.is_none()
+						and error.message == message and error.help == help
+						and same_source(error.span.source, module_source(root_module_id()))
+						and error.span.start == start and error.span.end == end
+					)
+
+
+private pure func header_rejected(header: String) -> Bool:
+	start = header.length() + "\n    builtin(".length()
+	diagnostic_is(header + "\n" + BODY,
+		"builtin declaration does not match its runtime contract",
+		"declare an impure function with one String parameter returning Void", start, start + "\"string.print_error\"".length())
+
+
+pure func test_label_publishes_variant_and_span() -> Bool:
+	header = "func print_error(message: String) -> Void:\n    builtin("
+	match parse_modules([{ source = header + "\"string.print_error\")\n", targets = [] }]):
+		Err(_): False
+		Ok(program):
+			match inventory_functions(parsed_contents(program).declarations).get(0):
+				Some(row):
+					match row.declaration.body:
+						ParsedBuiltinBody(StringPrintErrorBuiltin, span):
+							same_source(span.source, module_source(root_module_id())) and span.start == header.length() and span.end == header.length() + "\"string.print_error\"".length()
+						_: False
+				None: False
+
+
+pure func test_pure_void_rejects_at_return_type() -> Bool:
+	header = "pure func print_error(message: String) -> Void:"
+	diagnostic_is(header + "\n" + BODY, "pure functions cannot return Void",
+		"remove pure, or return a non-Void value", 42, 46)
+
+
+pure func test_pure_caller_rejects_effect() -> Bool:
+	source: String =
+		|func print_error(message: String) -> Void:
+		|    builtin("string.print_error")
+		|pure func main() -> Int:
+		|    print_error("text")
+		|    0
+		|
+	diagnostic_is(source, "pure functions cannot call impure functions",
+		"mark the callee pure or remove pure from the caller", 106, 117)
+
+
+pure func test_tail_annotation_rejects() -> Bool:
+	source = "@tail_recursive\nfunc print_error(message: String) -> Void:\n" + BODY
+	diagnostic_is(source, "builtin bodies cannot have a tail-recursion annotation",
+		"remove @tail_recursive from the builtin declaration", 0, 15)
+
+
+tests: TestSuite = {
+	description = "Blorp 2 print_error contract",
+	tests = [
+		("String to Void declaration and calls accepted", test_print_error_accepts_string_to_void),
+		("closed label publishes variant and span", test_label_publishes_variant_and_span),
+		("zero arguments reject", pure func(): header_rejected("func print_error() -> Void:")),
+		("two arguments reject", pure func(): header_rejected("func print_error(a: String, b: String) -> Void:")),
+		("wrong argument rejects", pure func(): header_rejected("func print_error(message: Int) -> Void:")),
+		("wrong result rejects", pure func(): header_rejected("func print_error(message: String) -> Int:")),
+		("generic declaration rejects", pure func(): header_rejected("func print_error[T](message: T) -> Void:")),
+		("pure Void rejected at earliest boundary", test_pure_void_rejects_at_return_type),
+		("pure caller rejects effect", test_pure_caller_rejects_effect),
+		("tail annotation rejects", test_tail_annotation_rejects),
+	]
+}

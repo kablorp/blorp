@@ -1,9 +1,10 @@
 import:
 	../../../src/lower/lower as Lower
 	../../../src/own/own as Own
-	../../../src/namespace/builtins as Builtins: RuntimeOperation(StringPrint, StringLength)
+	../../../src/namespace/builtins as Builtins: RuntimeOperation(StringPrint, StringPrintError, StringLength)
 	../../../src/specialize/specialize as Concrete
 	../../../src/utils/syntax: FunctionExecution(OrdinaryCalls), Entrypoint(NoArguments), EntryResult(IntegerExitStatus), entry_function
+	../../../src/utils/source: same_source
 	../../../src/verify/verify: verify
 	../ownership_inputs: InputIds, function, input_ids, integer, runtime, span
 	test: TestSuite
@@ -83,14 +84,14 @@ pure func test_unit_introduces_no_owner_or_drop() -> Bool:
 			False
 
 
-pure func test_print_is_a_last_use_of_its_borrowed_string() -> Bool:
+pure func test_print_is_a_last_use_of_its_borrowed_string(operation: Builtins.RuntimeOperation[Concrete.VariantInstanceId, Concrete.TypeRef]) -> Bool:
 	match input_ids():
 		Ok(ids):
 			match (
 				Own.last_uses(
 					[
 						text(ids.first),
-						runtime(ids.second, Builtins.StringPrint, [ids.first], Concrete.VoidType, 20),
+						runtime(ids.second, operation, [ids.first], Concrete.VoidType, 20),
 						integer(ids.third, 0, 30),
 					],
 					ids.third,
@@ -104,7 +105,7 @@ pure func test_print_is_a_last_use_of_its_borrowed_string() -> Bool:
 			False
 
 
-pure func test_print_borrows_and_drops_string_only_after_the_call() -> Bool:
+pure func test_print_borrows_and_drops_string_only_after_the_call(operation: Builtins.RuntimeOperation[Concrete.VariantInstanceId, Concrete.TypeRef]) -> Bool:
 	match input_ids():
 		Ok(ids):
 			match (
@@ -112,7 +113,7 @@ pure func test_print_borrows_and_drops_string_only_after_the_call() -> Bool:
 					function(
 						[
 							text(ids.first),
-							runtime(ids.second, Builtins.StringPrint, [ids.first], Concrete.VoidType, 20),
+							runtime(ids.second, operation, [ids.first], Concrete.VoidType, 20),
 							integer(ids.third, 0, 30),
 						],
 						ids.third,
@@ -150,7 +151,7 @@ pure func test_print_borrows_and_drops_string_only_after_the_call() -> Bool:
 			False
 
 
-pure func test_a_string_alias_stays_live_after_print() -> Bool:
+pure func test_a_string_alias_stays_live_after_print(operation: Builtins.RuntimeOperation[Concrete.VariantInstanceId, Concrete.TypeRef]) -> Bool:
 	match input_ids():
 		Ok(ids):
 			match (
@@ -158,7 +159,7 @@ pure func test_a_string_alias_stays_live_after_print() -> Bool:
 					function(
 						[
 							text(ids.first),
-							runtime(ids.second, Builtins.StringPrint, [ids.first], Concrete.VoidType, 20),
+							runtime(ids.second, operation, [ids.first], Concrete.VoidType, 20),
 							runtime(ids.third, Builtins.StringLength, [ids.first], Concrete.IntType, 30),
 						],
 						ids.third,
@@ -265,6 +266,7 @@ pure func test_verifier_rejects_a_borrowed_unit() -> Bool:
 
 
 private pure func rejects_print(
+	operation: Builtins.RuntimeOperation[Concrete.VariantInstanceId, Concrete.TypeRef],
 	argument_type: Concrete.TypeRef,
 	result_type: Concrete.TypeRef,
 	message: String,
@@ -289,7 +291,7 @@ private pure func rejects_print(
 						value_type = result_type,
 						operation = Own.CallDefinition(
 							{
-								target = Concrete.RuntimeFunction(Builtins.StringPrint),
+								target = Concrete.RuntimeFunction(operation),
 								span = span(30)
 							},
 							[Own.UnmanagedArgument(ids.first)],
@@ -315,13 +317,14 @@ private pure func rejects_print(
 
 pure func test_verifier_rejects_a_print_argument_with_the_wrong_type() -> Bool:
 	rejects_print(
+		Builtins.StringPrint,
 		Concrete.IntType,
 		Concrete.VoidType,
 		"call argument type does not match its contract",
 	)
 
 
-pure func test_verifier_rejects_a_print_result_with_the_wrong_type() -> Bool:
+pure func test_verifier_rejects_a_print_result_with_the_wrong_type(operation: Builtins.RuntimeOperation[Concrete.VariantInstanceId, Concrete.TypeRef]) -> Bool:
 	match input_ids():
 		Ok(ids):
 			owner = Own.owner_id(0)
@@ -343,7 +346,7 @@ pure func test_verifier_rejects_a_print_result_with_the_wrong_type() -> Bool:
 						value_type = Concrete.IntType,
 						operation = Own.CallDefinition(
 							{
-								target = Concrete.RuntimeFunction(Builtins.StringPrint),
+								target = Concrete.RuntimeFunction(operation),
 								span = span(30)
 							},
 							[Own.BorrowedArgument({
@@ -397,17 +400,158 @@ pure func test_verifier_accepts_an_unmanaged_unused_unit() -> Bool:
 			False
 
 
+-- Construct malformed ownership IR directly; insertion is not this oracle.
+private pure func raw_stderr(
+	ids: InputIds,
+	arguments: List[Own.OwnedArgument],
+	result_type: Concrete.TypeRef,
+	result: Own.ResultOwnership,
+	before: List[Own.OwnershipOperation],
+	after: List[Own.OwnershipOperation],
+) -> Own.OwnershipProgram:
+	input = program(ids, {
+		id = ids.first, value_type = Concrete.StringType,
+		operation = Own.StringDefinition("first"), result = Own.OwnedResult(Own.owner_id(0)), span = span(10)
+	})
+	functions = input.functions.map(pure func(function):
+		operations: List[Own.OwnershipOperation] = [
+			Own.DefineValue({ id = ids.first, value_type = Concrete.StringType,
+				operation = Own.StringDefinition("first"), result = Own.OwnedResult(Own.owner_id(0)), span = span(10) }),
+			Own.DefineValue({ id = ids.second, value_type = Concrete.StringType,
+				operation = Own.StringDefinition("second"), result = Own.OwnedResult(Own.owner_id(1)), span = span(20) }),
+		]
+		called = operations.concat(before).append(Own.DefineValue({
+			id = ids.third, value_type = result_type,
+			operation = Own.CallDefinition({ target = Concrete.RuntimeFunction(Builtins.StringPrintError), span = span(30) }, arguments),
+			result = result, span = span(30)
+		})).concat(after).append(Own.DefineValue({ id = ids.fourth, value_type = Concrete.IntType,
+			operation = Own.IntegerDefinition(0), result = Own.UnmanagedResult, span = span(50) }))
+		{ function | operations = called, tail = Own.ReturnTail(Own.ReturnResult(Own.UnmanagedReturn(ids.fourth))) }
+	)
+	{ input | functions = functions }
+
+
+private pure func rejects_stderr(program: Own.OwnershipProgram, message: String, at: Int) -> Bool:
+	match verify(program):
+		Ok(_): False
+		Err(error):
+			(
+				error.message == "ownership verification failed: " + message
+				and error.help == "report this compiler error with the input program"
+				and error.note.is_none() and same_source(error.span.source, span(at).source)
+				and error.span.start == at and error.span.end == at + 1
+			)
+
+
+pure func test_raw_stderr_borrow_and_unmanaged_result_are_valid() -> Bool:
+	match input_ids():
+		Err(_): False
+		Ok(ids):
+			borrow = Own.BorrowedArgument({ value = ids.first, source = Own.OwnerBorrow(Own.owner_id(0)) })
+			drops = [Own.DropOwner(Own.owner_id(0), span(40)), Own.DropOwner(Own.owner_id(1), span(41))]
+			verify(raw_stderr(ids, [borrow], Concrete.VoidType, Own.UnmanagedResult, [], drops)).is_ok()
+
+
+pure func test_stderr_rejects_missing_argument() -> Bool:
+	match input_ids():
+		Err(_): False
+		Ok(ids):
+			drops = [Own.DropOwner(Own.owner_id(0), span(40)), Own.DropOwner(Own.owner_id(1), span(41))]
+			rejects_stderr(raw_stderr(ids, [], Concrete.VoidType, Own.UnmanagedResult, [], drops),
+				"call is missing its argument", 30)
+
+
+pure func test_stderr_rejects_extra_argument() -> Bool:
+	match input_ids():
+		Err(_): False
+		Ok(ids):
+			borrow = Own.BorrowedArgument({ value = ids.first, source = Own.OwnerBorrow(Own.owner_id(0)) })
+			drops = [Own.DropOwner(Own.owner_id(0), span(40)), Own.DropOwner(Own.owner_id(1), span(41))]
+			rejects_stderr(raw_stderr(ids, [borrow, borrow], Concrete.VoidType, Own.UnmanagedResult, [], drops),
+				"call has an unexpected argument", 30)
+
+
+pure func test_stderr_rejects_owned_void() -> Bool:
+	match input_ids():
+		Err(_): False
+		Ok(ids):
+			borrow = Own.BorrowedArgument({ value = ids.first, source = Own.OwnerBorrow(Own.owner_id(0)) })
+			drops = [Own.DropOwner(Own.owner_id(0), span(40)), Own.DropOwner(Own.owner_id(1), span(41))]
+			rejects_stderr(raw_stderr(ids, [borrow], Concrete.VoidType, Own.OwnedResult(Own.owner_id(2)), [], drops),
+				"unmanaged value carries an ownership obligation", 30)
+
+
+pure func test_stderr_rejects_unknown_owner() -> Bool:
+	match input_ids():
+		Err(_): False
+		Ok(ids):
+			drops = [Own.DropOwner(Own.owner_id(0), span(40)), Own.DropOwner(Own.owner_id(1), span(41))]
+			rejects_stderr(raw_stderr(ids, [Own.BorrowedArgument({ value = ids.first, source = Own.OwnerBorrow(Own.owner_id(2)) })], Concrete.VoidType, Own.UnmanagedResult, [], drops),
+				"owner 2 is not defined", 30)
+
+
+pure func test_stderr_rejects_wrong_owner() -> Bool:
+	match input_ids():
+		Err(_): False
+		Ok(ids):
+			drops = [Own.DropOwner(Own.owner_id(0), span(40)), Own.DropOwner(Own.owner_id(1), span(41))]
+			rejects_stderr(raw_stderr(ids, [Own.BorrowedArgument({ value = ids.first, source = Own.OwnerBorrow(Own.owner_id(1)) })], Concrete.VoidType, Own.UnmanagedResult, [], drops),
+				"owner 1 does not own value 0", 30)
+
+
+pure func test_stderr_rejects_discharged_owner() -> Bool:
+	match input_ids():
+		Err(_): False
+		Ok(ids):
+			borrow = Own.BorrowedArgument({ value = ids.first, source = Own.OwnerBorrow(Own.owner_id(0)) })
+			rejects_stderr(raw_stderr(ids, [borrow], Concrete.VoidType, Own.UnmanagedResult, [Own.DropOwner(Own.owner_id(0), span(25))], []),
+				"borrow refers to discharged owner 0", 30)
+
+
+pure func test_stderr_rejects_missing_drop() -> Bool:
+	match input_ids():
+		Err(_): False
+		Ok(ids):
+			borrow = Own.BorrowedArgument({ value = ids.first, source = Own.OwnerBorrow(Own.owner_id(0)) })
+			rejects_stderr(raw_stderr(ids, [borrow], Concrete.VoidType, Own.UnmanagedResult, [], [Own.DropOwner(Own.owner_id(1), span(40))]),
+				"owner 0 remains live at return", 50)
+
+
+pure func test_stderr_rejects_duplicate_drop() -> Bool:
+	match input_ids():
+		Err(_): False
+		Ok(ids):
+			borrow = Own.BorrowedArgument({ value = ids.first, source = Own.OwnerBorrow(Own.owner_id(0)) })
+			rejects_stderr(raw_stderr(ids, [borrow], Concrete.VoidType, Own.UnmanagedResult, [], [Own.DropOwner(Own.owner_id(0), span(40)), Own.DropOwner(Own.owner_id(0), span(41))]),
+				"owner 0 has already been discharged", 41)
+
+
 tests: TestSuite = {
 	description = "Blorp 2 unit and print ownership boundaries",
 	tests = [
+		("raw stderr missing argument rejects", test_stderr_rejects_missing_argument),
+		("raw stderr extra argument rejects", test_stderr_rejects_extra_argument),
+		("raw stderr owned void rejects", test_stderr_rejects_owned_void),
+		("raw stderr unknown owner rejects", test_stderr_rejects_unknown_owner),
+		("raw stderr wrong owner rejects", test_stderr_rejects_wrong_owner),
+		("raw stderr discharged owner rejects", test_stderr_rejects_discharged_owner),
+		("raw stderr missing drop rejects", test_stderr_rejects_missing_drop),
+		("raw stderr duplicate drop rejects", test_stderr_rejects_duplicate_drop),
+
+		("raw stderr borrow with unmanaged Void accepts", test_raw_stderr_borrow_and_unmanaged_result_are_valid),
+		("stderr wrong argument type rejects", pure func(): rejects_print(Builtins.StringPrintError, Concrete.IntType, Concrete.VoidType, "call argument type does not match its contract")),
+		("stderr verifier rejects a print result with the wrong type", pure func(): test_verifier_rejects_a_print_result_with_the_wrong_type(Builtins.StringPrintError)),
+		("stderr a string alias stays live after print", pure func(): test_a_string_alias_stays_live_after_print(Builtins.StringPrintError)),
+		("stderr print borrows and drops string only after the call", pure func(): test_print_borrows_and_drops_string_only_after_the_call(Builtins.StringPrintError)),
+		("stderr print is a last use of its borrowed string", pure func(): test_print_is_a_last_use_of_its_borrowed_string(Builtins.StringPrintError)),
 		("unit has no operand use", test_unit_has_no_operand_use),
 		("unit creates no owner or drop", test_unit_introduces_no_owner_or_drop),
-		("print is String last use", test_print_is_a_last_use_of_its_borrowed_string),
+		("stdout String last use", pure func(): test_print_is_a_last_use_of_its_borrowed_string(Builtins.StringPrint)),
 		(
 			"print borrows until call then drops",
-			test_print_borrows_and_drops_string_only_after_the_call,
+			pure func(): test_print_borrows_and_drops_string_only_after_the_call(Builtins.StringPrint),
 		),
-		("String alias stays live after print", test_a_string_alias_stays_live_after_print),
+		("stdout alias stays live", pure func(): test_a_string_alias_stays_live_after_print(Builtins.StringPrint)),
 		("verifier rejects owned unit", test_verifier_rejects_an_owned_unit),
 		("verifier rejects borrowed unit", test_verifier_rejects_a_borrowed_unit),
 		(
@@ -416,7 +560,7 @@ tests: TestSuite = {
 		),
 		(
 			"verifier rejects malformed print result",
-			test_verifier_rejects_a_print_result_with_the_wrong_type,
+			pure func(): test_verifier_rejects_a_print_result_with_the_wrong_type(Builtins.StringPrint),
 		),
 		("verifier rejects wrongly typed unit", test_verifier_rejects_a_wrongly_typed_unit),
 		("verifier accepts unmanaged unused unit", test_verifier_accepts_an_unmanaged_unused_unit),

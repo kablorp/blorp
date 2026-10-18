@@ -1557,6 +1557,13 @@ func main() -> Int:
 ```
 
 Its stdout is exactly `Hello, World!\n`, stderr is empty and exit status is 0.
+Import `io: print_error` for impure `print_error(message: String) -> Void`.
+It borrows the String and requests its counted bytes once on stderr. A short
+transfer, including EINTR, returns without LF or retry; a full transfer attempts
+one LF. Empty input still attempts LF. Void conveys no delivery status or
+buffer-flush guarantee. The host currently attempts LF even after a short write;
+this target policy intentionally differs on that failure path.
+
 `print(value: String) -> Void` writes every String byte and adds LF. UTF-8 and
 embedded NUL are preserved. It borrows its argument; an owned temporary is
 released after its last use. Print is impure, so a pure caller receives a

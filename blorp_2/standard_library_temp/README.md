@@ -87,3 +87,8 @@ cannot be imported explicitly.
 The system adapter also publishes impure `read_file(String) -> Result[String, String]`.
 Its counted UTF-8 contract and target-only encoding help are documented in
 [File reading](../README.md#file-reading); source loader migration remains pending.
+
+`io.print_error(String) -> Void` concretely adapts the host Stringable API.
+It borrows its input, writes counted bytes to stderr once, and attempts LF only
+following a full transfer; short writes (including EINTR) stop without retry.
+The host attempts LF after short writes as well. Neither API reports delivery.
