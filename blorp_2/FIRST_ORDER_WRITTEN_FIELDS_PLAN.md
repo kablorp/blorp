@@ -1,5 +1,10 @@
 # First-order written record fields: first bounded proposal
 
+Completed. The [acceptance report](../benchmarks/results/blorp_2_first_order_written_fields_2026-10-18.md)
+records the implementation, current functional gates, fixed-B costs and oracle
+limits. The historical proposal and ceilings below remain for provenance; they
+grant no new work or renewed allowance.
+
 Proposal only, separate from the ledger documentation review. Root/peer review,
 a frozen exact composition and a test-only lane
 are required before writing or running anything. This document implements no

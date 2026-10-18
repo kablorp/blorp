@@ -2,19 +2,22 @@
 
 ## Status and boundary
 
-Planning only, for root and independent review before bounded writes. This
-ledger grants no implementation, commit, compiled job, cost setup, new baseline
-or exception. The [source plan](BOOTSTRAP_SOURCE_PLAN.md#acceptance-and-cost-boundaries)
+Remaining work is planning only. The written-fields port is accepted; its
+[report](../benchmarks/results/blorp_2_first_order_written_fields_2026-10-18.md)
+records current functional and fixed-baseline cost acceptance. This ledger
+grants no further implementation, compiled job, cost setup, new baseline or exception. The [source plan](BOOTSTRAP_SOURCE_PLAN.md#acceptance-and-cost-boundaries)
 still requires a complete estimate and cumulative ceiling before broad callback
 removal. Pilot allowances are not additive permission.
 
-This documentation branch starts at accepted
-`f1a27fcb2cfc1b951dd27e4ffa0e10e9e1e226b3`. Its source has the already landed
+The original planning snapshot starts at accepted
+`f1a27fcb2cfc1b951dd27e4ffa0e10e9e1e226b3`. That snapshot has the already landed
 type-argument and unary preparation ports. Sorter, six fills and scalar adapters
 remain separate held candidates. Opaque composition is a separately reviewed
 input, not transplanted into this branch. Its specialization still has eight
 `translated_list` calls, eight lambdas and one function-typed parameter; the
 existing first-order type-list operation is named `semantic_arguments` there.
+The accepted written-fields port removes two of those calls/lambdas; six
+`translated_list` callers and its function-typed parameter remain.
 
 Evidence is the source plan's historical 64-call/53-lambda inventory, the existing
 post-sorter/fills 51-call inventory, maintained reports/plans below, and root's
@@ -27,15 +30,16 @@ planning record, never a measurement freeze or fresh bootstrap acceptance claim.
 | Source state | HOF calls remaining | Executable lambdas remaining | Explanation |
 | --- | ---: | ---: | --- |
 | Historical source-plan census | 64 | 53 | Seven fills, twelve projections, twenty-four scalar/pipeline adapters, seven predicates, eleven translations, three sort passes |
-| Accepted source | 60 | 49 | Three type-argument callbacks and one unary ownership-use fill already removed |
-| Plus held sorter | 57 | 46 | Three sort callbacks removed |
-| Plus held six fills | 51 | 40 | Six constant-fill callbacks removed |
-| Plus held scalar adapters | 48 | 38 | Two lambdas and named `list_inference_type` callback removed |
-| Complete proposed callback migration | 0 | 0 | Remove the remaining eight translation calls and forty other calls; delete the function-typed helper after its final caller |
+| Before written fields | 60 | 49 | Three type-argument callbacks and one unary ownership-use fill already removed |
+| Accepted source | 58 | 47 | Two written-field callbacks removed by one typed domain loop |
+| Plus held sorter | 55 | 44 | Three sort callbacks removed |
+| Plus held six fills | 49 | 38 | Six constant-fill callbacks removed |
+| Plus held scalar adapters | 46 | 36 | Two lambdas and named `list_inference_type` callback removed |
+| Complete proposed callback migration | 0 | 0 | Remove the remaining six translation calls and forty other calls; delete the function-typed helper after its final caller |
 
-The final 48 calls contain 38 lambdas and ten named callback arguments. They
+The final 46 calls contain 36 lambdas and ten named callback arguments. They
 are fifteen scalar Option/Result adapters, six pipeline error adapters, seven
-predicates, twelve collection projections, and eight fallible translations.
+predicates, twelve collection projections, and six fallible translations.
 The original census found no stored/returned callable; that historical finding
 is not a claim about arbitrary future source. Nested `?=` simplification is a
 different migration and removes no additional callback call.
@@ -56,17 +60,18 @@ validation/cost limitations remain held.
 | Port | Production added/deleted/net | Tests added/deleted/net | State |
 | --- | ---: | ---: | --- |
 | Three type-argument translations | 28 / 18 / +10 | 44 / 0 / +44 | Landed; [report](../benchmarks/results/blorp_2_first_order_type_arguments_2026-10-18.md) |
+| Written record fields | 29 / 12 / +17 | 47 / 1 / +46 | Landed; [report](../benchmarks/results/blorp_2_first_order_written_fields_2026-10-18.md) |
 | Six remaining fill maps | 11 / 9 / +2 | 0 / 0 / 0 | Held, 154B/154C characterization; twelve mutations pending; [plan](FIRST_ORDER_FILLS_PLAN.md) |
 | Stable List ordering | 56 / 4 / +52 | 346 / 2 / +344 | Held, functional B41/C41 plus join/runtime green; mutation pairs pending; [plan](STABLE_LAYOUT_ORDER_PLAN.md) |
 | Three scalar adapters | 10 / 3 / +7 | 0 / 0 / 0 | Held, implementation and finite69B/69C plus three mutation pairs prepared; not run |
-| **Callback-port subtotal** | **105 / 34 / +71** | **390 / 2 / +388** | Does not claim resource acceptance or include a fictitious unary sub-hunk credit |
+| **Callback-port subtotal** | **134 / 46 / +88** | **437 / 3 / +434** | Does not claim resource acceptance or include a fictitious unary sub-hunk credit |
 
 The one already removed ownership-use fill is contained within the landed unary
 preparation, which is **432/265/+167 production and 969/522/+447 tests** in its
 [report](../benchmarks/results/blorp_2_unary_preparation_2026-10-18.md). It is not
 separately charged as another fill or assumed to explain that entire refactor.
-Including that whole preparation gives **537/299/+238 production** and
-**1,359/524/+835 tests** alongside the callback-port subtotal.
+Including that whole preparation gives **566/311/+255 production** and
+**1,406/525/+881 tests** alongside the callback-port subtotal.
 
 Other spent SOURCE migrations are the 28 construction functions
 (258/200/+58 production, 70/56/+14 tests) and sixteen argument-control lifts
@@ -74,8 +79,8 @@ Other spent SOURCE migrations are the 28 construction functions
 [construction](../benchmarks/results/blorp_2_construction_values_2026-10-16.md)
 and [argument-control](../benchmarks/results/blorp_2_argument_controls_2026-10-16.md)
 reports remain authoritative. Adding those separate source migrations produces
-the selected-ports context **905/631/+274 production** and
-**1,429/580/+849 tests**, before remaining work. This is not an assertion that
+the selected-ports context **934/643/+291 production** and
+**1,476/581/+895 tests**, before remaining work. This is not an assertion that
 those ports are the whole Git delta or resource cost from original R0: accepted
 language features and other changes also exist. No percentage gains are summed.
 
@@ -92,12 +97,14 @@ unimplemented M7 feature is counted as deleted production code.
 | Pipeline error matches | 6 | 45 | +20 | 60 |
 | Short-circuit predicates | 7 | 80 | +50 | 80 |
 | Typed projections/local builders | 12 | 180 | +100 | 180 |
-| Seven fallible domain loops | 8 | 420 | +260 | 400 |
-| **Remaining callbacks** | **48** | **905** | **+475** | **820** |
+| Six remaining fallible domain loops | 6 | 370 | +220 | 340 |
+| **Remaining callbacks** | **46** | **855** | **+435** | **760** |
 | Separate nested-propagation simplification | 0 | 45 | +25 | 80 |
-| **Combined future upper forecast** | **48** | **950** | **+500** | **900** |
+| **Combined future upper forecast** | **46** | **900** | **+460** | **840** |
 
-The 420/+260 fallible-loop upper is the independent opaque audit's estimate.
+The original independent opaque audit reserved 420/+260 and 400 test additions
+for seven domains. Removing the written-fields reservation (50/+40/60) leaves
+370/+220/340 for six domains; the actual 29/+17/47 is charged as spent above.
 The other upper bounds are planning forecasts from the existing classified
 sites, including reindentation of retained bodies in gross additions. They are
 not observed patches or validated economic decisions. No new language fixture
@@ -106,22 +113,27 @@ oracles. If actual coverage needs another fixture or a higher bound, review it
 before exceeding the chosen ceiling; do not delete tests or compress formatting.
 
 The resulting callback-specific upper, including spent callback ports, is
-**1,010 added / +546 net production** and **1,210 added / +1,208 net tests**.
-Including whole unary preparation is **1,442 added / +713 net production**.
+**989 added / +523 net production** and **1,197 added / +1,194 net tests**.
+Including whole unary preparation is **1,421 added / +690 net production**.
 Including construction/control source context and the separate propagation
-proposal is **1,855 added / +774 net production** and
-**2,329 added / +1,749 net tests**. These differently scoped totals must not be
+proposal is **1,834 added / +751 net production** and
+**2,316 added / +1,735 net tests**. These differently scoped totals must not be
 presented as the same number. The historical callback estimate +442–739 was an
 estimate, not an approved ceiling, and did not license these broader subtotals.
-The combined future 950/+500 forecast fits below the reviewed hard ceiling
+The combined future 900/+460 forecast fits below the remaining reviewed ceiling
 below; write permission is never inferred from that old range or pilot caps.
 
 ### Reviewed combined hard ceiling
 
-Root and the independent compiler reviewer approved one **future combined hard
-ceiling: 1,000 production added / +530 net / 930 test added**, inclusive of the
-nested-propagation work. The forecast 950/+500/900 fits inside it. Domain rows
-and future slice limits consume this ceiling; none adds to it.
+The original combined 1,000 production additions/+530 net/930 test additions
+ceiling is not renewed by landing written fields. Its actual 29/+17/47 consumes
+that allowance, leaving **971 production additions/+513 net/883 test additions**
+for the remaining callback/propagation work, including future composition.
+
+The original review approved one **combined hard ceiling: 1,000 production
+added / +530 net / 930 test added**, inclusive of nested propagation. Its
+original 950/+500/900 forecast fit inside it. Domain rows and later slice
+limits consume this same ceiling; none adds to it.
 
 Including spent callback ports, the hard ceiling's cumulative scope is
 **1,105 production added / +601 net / 1,320 test added**. Including whole unary
@@ -157,14 +169,13 @@ ports must be composed narrowly before a remaining-call count is claimed.
    `check/constructors:175`, `check/recursion:121`, `check/declarations:176`,
    `specialize:202,2834,2837`, `main:85`. Each local builder retains its domain
    order and original child action; only complete lists are published.
-5. Fallible translations: the seven domains below. End by deleting
+5. Fallible translations: the six remaining domains below. End by deleting
    `translated_list` and its function-typed `translate` parameter, never before
    its last caller. `semantic_arguments` is already first-order and is not
    reimplemented, re-counted, or given the spent type-argument allowance again.
 
-| Domain | Call anchors | Existing child authority | Share of 420/+260 upper |
+| Domain | Original opaque-audit call anchors | Existing child authority | Share of remaining 370/+220 upper |
 | --- | --- | --- | ---: |
-| Written literal fields/update replacements | 2409,2448 | `translate_record_field:2347`, field-ID lookup2357 then child2358 | 50 / +40 |
 | Inherited update fields | 2416 | Existing retained-field translation and span | 45 / +25 |
 | Statements | 2541 | Existing statement translator | 65 / +35 |
 | Signature parameters | 2652 | Each existing TypeUse's own span | 50 / +30 |
@@ -172,17 +183,17 @@ ports must be composed narrowly before a remaining-call count is claimed.
 | Tail arms | 2712 | Existing arm/pattern/body translation | 75 / +45 |
 | Function requests | 2784 | Existing request/instance lookup and function translation | 80 / +50 |
 
-That table apportions the one upper forecast; it does not add 50/+40 to 420/+260.
-Written fields are the smallest next domain: prior explicit shape forecast was
-42 added/8 deleted/+34 net. Its separate bounded proposal selects accepted main
-`6e6c3fb`, without the opaque-only argument; the exact composition and counts
-require review before writing. Reuse one private `translate_record_fields` for
-the two sites. Other loops stay in existing boundaries unless a helper earns
-its place through reuse or an existing domain/recursion contract. Pass the
+That table apportions one remaining upper forecast. Written fields are complete:
+one private `translate_record_fields` serves both sites at actual 29/12/+17
+production and 47/1/+46 tests, below the original 50/+40/60 reservation. It uses
+no opaque-only argument; future opaque composition must preserve its same
+field-ID-before-child authority and authored order. Other loops stay in existing
+boundaries unless a helper earns its place through reuse or an existing
+domain/recursion contract. Pass the
 actual required constants, substitutions, keys, layouts and opaque facts;
 introduce no argument-context bag, task enum or generic callback replacement.
 
-Current child authority:
+Opaque-audit child authority (before future composition):
 
 ```blorp
 id ?= translate_field(field.field, owner, records, field.span)
@@ -214,9 +225,9 @@ attempts, correct metadata without rerunning valid results, and stop on drift,
 unexpected failures, surviving witnesses or failed restoration. Root owns all
 compiled leases and two review assignments; no parallel compiled work.
 
-The smallest written-field proof needs the existing record literal/update
+The completed written-field proof used the existing record literal/update
 specialization owners plus a written-order case with two replacements and one
-inherited field. Broader domain groups need their own finite owner/oracle maps;
+inherited field. Remaining domains need their own finite owner/oracle maps;
 full component, ordinary-main and ownership/native gates remain integration
 requirements. Existing first-order type-argument evidence is historical evidence
 for that exact port, not acceptance of another span or argument domain.

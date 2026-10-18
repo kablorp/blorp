@@ -1,6 +1,7 @@
 import:
 	../../../src/specialize/specialize as Concrete
-	../../../src/utils/syntax: Diagnostic, entry_function
+	../../../src/utils/syntax: Diagnostic, entry_function, same_span
+	../../../src/utils/source: module_source, root_module_id, same_source
 	../input: checked_source
 	int as IntOps
 	test: TestSuite
@@ -229,9 +230,54 @@ pure func test_generic_calls_in_base_and_replacement_are_prepared() -> Bool:
 							base_call and rhs_call and IntOps.equals(program.functions.length(), 3)
 
 
+pure func test_written_replacements_keep_order_values_types_and_spans() -> Bool:
+	source: String =
+		|fixed record Triple { first: Int, middle: Int, last: Int }
+		|pure func change(value: Triple) -> Triple:
+		|    { value | last = 9223372036854775807, first = -9223372036854775808 }
+		|func main() -> Int:
+		|    changed = change({ first = 1, middle = 2, last = 3 })
+		|    changed.middle
+		|
+	maximum_literal = "9223372036854775807"
+	minimum_literal = "-9223372036854775808"
+	match specialized(source):
+		Err(_): False
+		Ok(program):
+			var updates = 0
+			var valid = True
+			for function in program.functions:
+				match returned_update(function):
+					None: void
+					Some(update):
+						updates = IntOps.add(updates, 1)
+						match (update.replacements, update.inherited, function.signature.return_type):
+							([last, first], [middle], Concrete.RecordType(owner)):
+								valid = valid and fields_belong_to(update, owner)
+								valid = valid and Concrete.same_type(update.base.value_type, Concrete.RecordType(owner))
+								valid = valid and Concrete.field_number(last.field) == 2 and Concrete.field_number(first.field) == 0 and Concrete.field_number(middle.field) == 1
+								valid = valid and Concrete.same_type(last.value.value_type, Concrete.IntType)
+								valid = valid and Concrete.same_type(first.value.value_type, Concrete.IntType)
+								valid = valid and Concrete.same_type(middle.value_type, Concrete.IntType)
+								valid = valid and Some(last.span.start) == source.index_of(maximum_literal)
+								valid = valid and last.span.end == last.span.start + maximum_literal.length()
+								valid = valid and Some(first.span.start) == source.index_of(minimum_literal)
+								valid = valid and first.span.end == first.span.start + minimum_literal.length()
+								valid = valid and same_span(last.span, last.value.span) and same_span(first.span, first.value.span)
+								valid = valid and same_source(last.span.source, module_source(root_module_id()))
+								valid = valid and same_source(first.span.source, module_source(root_module_id()))
+								match (last.value.form, first.value.form):
+									(Concrete.LiteralInteger(high), Concrete.LiteralInteger(low)):
+										valid = valid and high == 9223372036854775807 and low == -9223372036854775808
+									_: valid = False
+							_: valid = False
+			valid and updates == 1
+
+
 tests: TestSuite = {
 	description = "Record update specialization",
 	tests = [
+		("written replacements keep order, values, types and spans", test_written_replacements_keep_order_values_types_and_spans),
 		("generic updates use complete concrete instances", test_each_generic_update_uses_its_complete_concrete_instance),
 		("phantom arguments preserve distinct update owners", test_phantom_arguments_preserve_distinct_update_owners),
 		("inherited Lists keep prepared nominal children", test_inherited_nested_list_keeps_prepared_nominal_children),
