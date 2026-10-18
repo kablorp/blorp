@@ -752,8 +752,9 @@ helpers; byte-exact String operations; and the shell/path surface below. Impleme
 `string.byte_at -> Option[Int]` and `string.from_codepoint -> Option[String]`
 avoid target Char/Bytes. Strings contain valid UTF-8; byte observation retains
 byte coordinates, and scalar encoding validates before narrowing. Planned
-`string.slice` checks half-open byte bounds and scalar boundaries. See the source
-plan for exact contracts and the owning Some[String] transfer tests.
+[`string.slice`](STRING_SLICE_PLAN.md) checks half-open byte bounds and scalar
+boundaries. See the source plan for exact contracts and the owning Some[String]
+transfer tests.
 
 Write ordinary helpers in Blorp where the reduced subset and measured cost allow.
 Do not reconstruct raw substring bytes through scalar encoding. `starts_with`
