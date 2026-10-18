@@ -1,6 +1,6 @@
 import:
 	int as IntOps
-	list: set_index
+	list: repeat, set_index
 	../lower/lower:
 		JoinArm,
 		LoweredExit(ReturnValue, RecurValues),
@@ -8,17 +8,18 @@ import:
 		LoweredJoin,
 		LoweredMatch,
 		LoweredProgram,
+		LoweredStep(Define, Join),
 		LoweredTail(ExitValue, MatchValue),
 		MatchLabel,
 		ValueDefinition,
 		ValueId,
+		ValueParameter,
 		ValueOperation(
 			ParameterValue, VoidValue, IntegerValue, FloatValue, StringValue,
 			CallValue, ConstructValue, ConstructListValue, PayloadValue, ConstructRecordValue, ReadRecordFieldValue,
-			JoinValue,
 		),
 		lowered_functions,
-		value_reads,
+		block_value_count, step_reads, step_span, step_value_count, value_span,
 		value_number,
 	option: is_some, to_result
 	../utils/source: compiler_source
@@ -101,8 +102,6 @@ fixed union OwnedValueOperation:
 	ConstructDefinition(VariantInstanceId, List[StoredPayload])
 	ConstructListDefinition(List[StoredPayload])
 	PayloadDefinition(VariantFieldInstanceId, ValueId)
-	-- A bound or statement match; its definition is the joined value.
-	JoinDefinition(OwnedJoin)
 
 
 fixed record OwnedDefinition {
@@ -116,6 +115,7 @@ fixed record OwnedDefinition {
 
 fixed union OwnershipOperation:
 	DefineValue(OwnedDefinition)
+	ExecuteJoin(OwnedJoin)
 	AcquireOwner(OwnerId, BorrowedValue, Span)
 	DropOwner(OwnerId, Span)
 
@@ -131,13 +131,33 @@ fixed union ReturnTransfer:
 fixed record OwnedJoinArm {
 	label: MatchLabel,
 	operations: List[OwnershipOperation],
-	transfer: ReturnTransfer
+	transfer: ReturnTransfer,
+	carried: List[ReturnTransfer]
 }
+
+
+fixed union OwnedJoinParameter:
+	UnmanagedJoinParameter(ValueParameter)
+	ManagedJoinParameter(ValueParameter, OwnerId)
+
+
+pure func join_parameter(output: OwnedJoinParameter) -> ValueParameter:
+	match output:
+		UnmanagedJoinParameter(parameter): parameter
+		ManagedJoinParameter(parameter, _): parameter
+
+
+pure func join_ownership(output: OwnedJoinParameter) -> ResultOwnership:
+	match output:
+		UnmanagedJoinParameter(_): UnmanagedResult
+		ManagedJoinParameter(_, owner): OwnedResult(owner)
 
 
 -- A join's arms follow its block's values and owners, in arm order: each
 -- arm's own interval, then its joins' arms.
 fixed record OwnedJoin {
+	result: OwnedJoinParameter,
+	carried: List[OwnedJoinParameter],
 	scrutinee: OwnedArgument,
 	owner: UnionInstanceId,
 	arms: List[OwnedJoinArm]
@@ -227,7 +247,7 @@ private pure func visible_outside(ordinal: Int, outer: List[ValueInterval]) -> B
 -- Enclosing values are visible, but earlier sibling ordinals are not.
 private pure func use_slot(
 	value: ValueId,
-	position: Int,
+	introduced_count: Int,
 	outer: List[ValueInterval],
 	first_value: Int,
 	slot_count: Int,
@@ -237,7 +257,7 @@ private pure func use_slot(
 
 	if visible_outside(ordinal, outer):
 		Ok(None)
-	else if in_interval(ordinal, first_value, position):
+	else if in_interval(ordinal, first_value, introduced_count):
 		index = IntOps.subtract(ordinal, first_value)
 
 		if IntOps.greater_than_or_equal(index, 0) and IntOps.less_than(index, slot_count):
@@ -250,18 +270,15 @@ private pure func use_slot(
 
 -- The span a block's terminal use reports: its local operand's definition.
 private pure func terminal_span(
-	definitions: List[ValueDefinition],
+	steps: List[LoweredStep],
 	result: ValueId,
 	outer: List[ValueInterval],
-	first_value: Int,
 ) -> Result[Span, Diagnostic]:
-	ordinal = value_number(result)
-
-	if visible_outside(ordinal, outer):
+	if visible_outside(value_number(result), outer):
 		Ok(internal_span())
 	else:
-		match definitions.get(IntOps.subtract(ordinal, first_value)):
-			Some(definition): Ok(definition.span)
+		match value_span(steps, result):
+			Some(span): Ok(span)
 			None: Err(internal_error(internal_span(), "invalid return value in ownership use analysis"))
 
 
@@ -276,41 +293,51 @@ private fixed union BlockTerminal:
 -- reader; the terminal operands are read at the synthetic position after
 -- the last definition.
 private pure func block_uses(
-	definitions: List[ValueDefinition],
+	steps: List[LoweredStep],
 	terminal: BlockTerminal,
 	outer: List[ValueInterval],
 	first_value: Int,
+	span_result: Result[Span, Diagnostic],
 ) -> Result[List[Option[Int]], Diagnostic]:
-	var uses = definitions.map(pure func(_: ValueDefinition) -> Option[Int]: None)
-	var position: Int = 0
+	unused: Option[Int] = None
+	var uses = repeat(unused, block_value_count(steps))
+	var step_position: Int = 0
+	var introduced_count: Int = 0
 	var failure: Option[Diagnostic] = None
 
-	for definition in definitions:
-		if IntOps.not_equals(
-			value_number(definition.id),
-			IntOps.add(first_value, position),
-		):
-			failure = Some(
-				internal_error(
-					definition.span,
-					"nonconsecutive value identity in ownership use analysis",
-				),
-			)
+	for step in steps:
+		span = step_span(step)
+		first = match step:
+			Define(definition): definition.id
+			Join(join): join.result.id
+		if IntOps.not_equals(value_number(first), IntOps.add(first_value, introduced_count)):
+			failure = Some(internal_error(span, "nonconsecutive value identity in ownership use analysis"))
+		else:
+			match step:
+				Define(_): void
+				Join(join):
+					var ordinal = IntOps.add(IntOps.add(first_value, introduced_count), 1)
+					for parameter in join.carried:
+						if IntOps.not_equals(value_number(parameter.id), ordinal):
+							failure = Some(internal_error(parameter.span, "nonconsecutive value identity in ownership use analysis"))
+							break
+						ordinal = IntOps.add(ordinal, 1)
+		if failure.is_some():
 			break
 
 		-- Slot validation borrows only scalar bounds, so each write keeps the
 		-- same local vector owner rather than sharing it through Result[List].
-		for operand in value_reads(definition.operation):
+		for operand in step_reads(step):
 			match use_slot(
 				operand,
-				position,
+				introduced_count,
 				outer,
 				first_value,
 				uses.length(),
-				definition.span,
+				span,
 			):
 				Ok(Some(index)):
-					uses = uses.set(index, Some(position))
+					uses = uses.set(index, Some(step_position))
 				Ok(None):
 					void
 				Err(error):
@@ -320,7 +347,8 @@ private pure func block_uses(
 		if failure.is_some():
 			break
 
-		position = IntOps.add(position, 1)
+		introduced_count = IntOps.add(introduced_count, step_value_count(step))
+		step_position = IntOps.add(step_position, 1)
 
 	ready ?= match failure:
 		Some(error):
@@ -331,9 +359,8 @@ private pure func block_uses(
 	operands = match terminal:
 		TerminalValue(result): [result]
 		TerminalArguments(arguments, _): arguments
-	span ?= match terminal:
-		TerminalValue(result): terminal_span(definitions, result, outer, first_value)
-		TerminalArguments(_, span): Ok(span)
+	-- Resolve once at the caller, but keep operand errors ahead of a bad exit.
+	span ?= span_result
 
 	-- Start this builder inside the successful span scope. The outer snapshot
 	-- may cause one initial copy; subsequent writes keep the local vector owner.
@@ -343,14 +370,14 @@ private pure func block_uses(
 	for operand in operands:
 		match use_slot(
 			operand,
-			position,
+			introduced_count,
 			outer,
 			first_value,
 			terminal_uses.length(),
 			span,
 		):
 			Ok(Some(index)):
-				terminal_uses = terminal_uses.set(index, Some(position))
+				terminal_uses = terminal_uses.set(index, Some(step_position))
 			Ok(None):
 				void
 			Err(error):
@@ -365,41 +392,46 @@ private pure func block_uses(
 
 
 private pure func exit_uses(
-	definitions: List[ValueDefinition],
+	steps: List[LoweredStep],
 	exit: LoweredExit,
 	outer: List[ValueInterval],
 	first_value: Int,
+	span_result: Result[Span, Diagnostic],
 ) -> Result[List[Option[Int]], Diagnostic]:
 	terminal = match exit:
 		RecurValues(arguments, span): TerminalArguments(arguments, span)
 		ReturnValue(result): TerminalValue(result)
-	block_uses(definitions, terminal, outer, first_value)
+	block_uses(steps, terminal, outer, first_value, span_result)
 
 
 -- A block read after a dense prefix of `prefix_count` values.
 pure func exit_last_uses(
-	definitions: List[ValueDefinition],
+	steps: List[LoweredStep],
 	exit: LoweredExit,
 	prefix_count: Int,
 	first_value: Int,
 ) -> Result[List[Option[Int]], Diagnostic]:
-	exit_uses(definitions, exit, [{ first = 0, count = prefix_count }], first_value)
+	outer: List[ValueInterval] = [{ first = 0, count = prefix_count }]
+	span_result = match exit:
+		ReturnValue(result): terminal_span(steps, result, outer)
+		RecurValues(_, span): Ok(span)
+	exit_uses(steps, exit, outer, first_value, span_result)
 
 
 pure func block_last_uses(
-	definitions: List[ValueDefinition],
+	steps: List[LoweredStep],
 	result: ValueId,
 	prefix_count: Int,
 	first_value: Int,
 ) -> Result[List[Option[Int]], Diagnostic]:
-	exit_last_uses(definitions, ReturnValue(result), prefix_count, first_value)
+	exit_last_uses(steps, ReturnValue(result), prefix_count, first_value)
 
 
 pure func last_uses(
-	definitions: List[ValueDefinition],
+	steps: List[LoweredStep],
 	result: ValueId,
 ) -> Result[List[Option[Int]], Diagnostic]:
-	block_last_uses(definitions, result, 0, 0)
+	block_last_uses(steps, result, 0, 0)
 
 
 private fixed record ChildAcquisition {
@@ -585,9 +617,6 @@ private pure func build_definition(
 					Ok(ConstructListDefinition(payloads.stored))
 		PayloadValue(variant, value):
 			Ok(PayloadDefinition(variant, value))
-		JoinValue(_):
-			-- insert_definitions builds a join with its pending arms.
-			Err(internal_error(definition.span, "join reached single-definition ownership"))
 		CallValue(call, written):
 			var converted: List[OwnedArgument] = []
 			var failure: Option[Diagnostic] = None
@@ -697,14 +726,12 @@ private fixed union DropSchedule:
 	DropInEachArm
 
 
--- A join whose arms are inserted after its block, so that every block's
--- owners stay one consecutive interval, as its values do. `definition`
--- is the lowered join value; its arms see `enclosing`.
+-- A pending join sees the pre-output snapshot. Its arms follow the complete
+-- block's values and owners, keeping both introduction intervals consecutive.
 private fixed record PendingOwnedJoin {
-	definition: ValueDefinition,
 	join: LoweredJoin,
 	scrutinee: OwnedArgument,
-	result: ResultOwnership,
+	result: OwnedJoinParameter,
 	enclosing: List[EnclosingBlock]
 }
 
@@ -716,7 +743,7 @@ private fixed union InsertedEntry:
 	AwaitingArms(PendingOwnedJoin)
 
 
-private fixed record InsertedDefinitions {
+private fixed record InsertedSteps {
 	entries: List[InsertedEntry],
 	sources: List[ResultOwnership],
 	owners: List[ScheduledDrop],
@@ -727,34 +754,28 @@ private fixed record InsertedDefinitions {
 -- The position after which the block drops an owner made at `position`.
 private pure func drop_position(
 	schedule: DropSchedule,
-	position: Int,
+	value_slot: Int,
+	step_position: Int,
 	count: Int,
 	span: Span,
 ) -> Result[Int, Diagnostic]:
 	match schedule:
-		DropInEachArm:
-			Ok(count)
+		DropInEachArm: Ok(count)
 		DropAtLastUse(uses):
-			match uses.get(position):
-				Some(last_use):
-					last_position: Int = match last_use:
-						Some(last): last
-						None: position
-					Ok(last_position)
+			match uses.get(value_slot):
+				Some(Some(last)): Ok(last)
+				Some(None): Ok(step_position)
 				None: Err(internal_error(span, "missing value-use row"))
 
 
--- A join's own value: its result is a fresh owner when managed, like a
--- call's; its arms move their values into it.
 private fixed record BuiltJoin {
 	scrutinee: OwnedArgument,
-	result: ResultOwnership,
+	result: OwnedJoinParameter,
 	next_owner: Int
 }
 
 
 private pure func build_join(
-	definition: ValueDefinition,
 	join: LoweredJoin,
 	sources: List[ResultOwnership],
 	enclosing: List[EnclosingBlock],
@@ -763,50 +784,53 @@ private pure func build_join(
 	unions: List[ConcreteUnion],
 	records: List[ConcreteRecord],
 ) -> Result[BuiltJoin, Diagnostic]:
-	plan ?= value_ownership(definition.value_type, unions, records)
-	scrutinee ?= borrow_argument(join.scrutinee, sources, enclosing, first_value, definition.span)
-	built: BuiltJoin = match plan:
-		NoOwnership:
-			{ scrutinee = scrutinee, result = UnmanagedResult, next_owner = next_owner }
-		ManagedStringLeaf | ManagedListRoot | ManagedRecordRoot(_) | InlineOwnedFields(_) | ManagedUnionRoot(_):
-			{ scrutinee = scrutinee, result = OwnedResult(owner_id(next_owner)), next_owner = IntOps.add(next_owner, 1) }
-	Ok(built)
+	if not join.carried.is_empty():
+		Err(internal_error(join.result.span, "carried join outputs are not supported during unary preparation"))
+	else:
+		plan ?= value_ownership(join.result.value_type, unions, records)
+		scrutinee ?= borrow_argument(join.scrutinee, sources, enclosing, first_value, join.result.span)
+		match plan:
+			NoOwnership:
+				Ok({ scrutinee = scrutinee, result = UnmanagedJoinParameter(join.result), next_owner = next_owner })
+			_:
+				Ok({ scrutinee = scrutinee, result = ManagedJoinParameter(join.result, owner_id(next_owner)), next_owner = IntOps.add(next_owner, 1) })
 
 
-private pure func insert_definitions(
-	definitions: List[ValueDefinition],
+private pure func insert_steps(
+	steps: List[LoweredStep],
 	schedule: DropSchedule,
 	enclosing: List[EnclosingBlock],
 	first_value: Int,
 	initial_owner: Int,
 	unions: List[ConcreteUnion],
 	records: List[ConcreteRecord],
-) -> Result[InsertedDefinitions, Diagnostic]:
-	count = definitions.length()
-	var drops = definitions.map(pure func(_: ValueDefinition) -> List[ScheduledDrop]: [])
+) -> Result[InsertedSteps, Diagnostic]:
+	count = steps.length()
+	var drops = steps.map(pure func(_: LoweredStep) -> List[ScheduledDrop]: [])
 	var entries: List[InsertedEntry] = []
 	var sources: List[ResultOwnership] = []
 	var owners: List[ScheduledDrop] = []
 	var next_owner = initial_owner
-	var position: Int = 0
+	var step_position: Int = 0
 	var failure: Option[Diagnostic] = None
 
-	for definition in definitions:
-		available_result: Result[ResultOwnership, Diagnostic] = match definition.operation:
-			JoinValue(join):
-				match build_join(definition, join, sources, enclosing, first_value, next_owner, unions, records):
+	for step in steps:
+		value_slot = sources.length()
+		span = step_span(step)
+		available_result: Result[ResultOwnership, Diagnostic] = match step:
+			Join(join):
+				match build_join(join, sources, enclosing, first_value, next_owner, unions, records):
 					Err(error): Err(error)
 					Ok(built):
 						entries = entries.append(AwaitingArms({
-							definition = definition,
 							join = join,
 							scrutinee = built.scrutinee,
 							result = built.result,
 							enclosing = enclosing.append({ first_value = first_value, sources = sources }),
 						}))
 						next_owner = built.next_owner
-						Ok(built.result)
-			_:
+						Ok(join_ownership(built.result))
+			Define(definition):
 				match build_definition(definition, sources, enclosing, first_value, next_owner, unions, records):
 					Err(error): Err(error)
 					Ok(built):
@@ -816,12 +840,12 @@ private pure func insert_definitions(
 						match built.acquisitions:
 							StoredAcquisitions(acquired):
 								for acquisition in acquired:
-									entries = entries.append(Inserted(AcquireOwner(acquisition.owner, acquisition.borrow, definition.span)))
+									entries = entries.append(Inserted(AcquireOwner(acquisition.owner, acquisition.borrow, span)))
 								entries = entries.append(Inserted(DefineValue(built.definition)))
 								Ok(built.definition.result)
 							ProjectedAcquisition(acquired):
 								entries = entries.append(Inserted(DefineValue(built.definition)))
-								entries = entries.append(Inserted(AcquireOwner(acquired.owner, acquired.borrow, definition.span)))
+								entries = entries.append(Inserted(AcquireOwner(acquired.owner, acquired.borrow, span)))
 								Ok(OwnedResult(acquired.owner))
 
 		match available_result:
@@ -833,37 +857,37 @@ private pure func insert_definitions(
 
 				match available:
 					OwnedResult(owner):
-						match drop_position(schedule, position, count, definition.span):
+						match drop_position(schedule, value_slot, step_position, count, span):
 							Err(error):
 								failure = Some(error)
 								break
 							Ok(until):
-								owners = owners.append({ owner = owner, span = definition.span })
+								owners = owners.append({ owner = owner, span = span })
 								-- A use at the block's end transfers or keeps this obligation.
 								if IntOps.less_than(until, count):
 									match drops.get(until):
 										None:
-											failure = Some(internal_error(definition.span, "missing drop schedule row"))
+											failure = Some(internal_error(span, "missing drop schedule row"))
 											break
 										Some(bucket):
-											match definitions.get(until):
+											match steps.get(until):
 												None:
-													failure = Some(internal_error(definition.span, "invalid last-use position"))
+													failure = Some(internal_error(span, "invalid last-use position"))
 													break
 												Some(last):
-													drops = drops.set(until, bucket.append({ owner = owner, span = last.span }))
+													drops = drops.set(until, bucket.append({ owner = owner, span = step_span(last) }))
 					_:
 						void
 
-		match drops.get(position):
+		match drops.get(step_position):
 			Some(bucket):
 				for dropped in bucket:
 					entries = entries.append(Inserted(DropOwner(dropped.owner, dropped.span)))
 			None:
-				failure = Some(internal_error(definition.span, "missing drop schedule row"))
+				failure = Some(internal_error(span, "missing drop schedule row"))
 				break
 
-		position = IntOps.add(position, 1)
+		step_position = IntOps.add(step_position, 1)
 
 	match failure:
 		Some(error):
@@ -907,16 +931,6 @@ private pure func leave_with(
 			}
 
 
-private pure func returned_span(
-	definitions: List[ValueDefinition],
-	value: ValueId,
-	first_value: Int,
-) -> Span:
-	match definitions.get(IntOps.subtract(value_number(value), first_value)):
-		Some(definition): definition.span
-		None: internal_span()
-
-
 -- A block's entries through its exit, before its joins' arms.
 private fixed record BlockExitEntries {
 	entries: List[InsertedEntry],
@@ -936,7 +950,7 @@ private fixed record InsertedBlock {
 -- A function's block, or a tail match's arm. Its joins' arms follow its own
 -- values and owners.
 private pure func insert_block(
-	definitions: List[ValueDefinition],
+	steps: List[LoweredStep],
 	exit: LoweredExit,
 	enclosing: List[EnclosingBlock],
 	first_value: Int,
@@ -944,13 +958,17 @@ private pure func insert_block(
 	unions: List[ConcreteUnion],
 	records: List[ConcreteRecord],
 ) -> Result[InsertedBlock, Diagnostic]:
-	uses ?= exit_uses(definitions, exit, enclosing_intervals(enclosing), first_value)
-	inserted ?= insert_definitions(definitions, DropAtLastUse(uses), enclosing, first_value, initial_owner, unions, records)
+	outer = enclosing_intervals(enclosing)
+	span_result = match exit:
+		ReturnValue(result): terminal_span(steps, result, outer)
+		RecurValues(_, span): Ok(span)
+	uses ?= exit_uses(steps, exit, outer, first_value, span_result)
+	span ?= span_result
+	inserted ?= insert_steps(steps, DropAtLastUse(uses), enclosing, first_value, initial_owner, unions, records)
 	exit_result: Result[BlockExitEntries, Diagnostic] = match exit:
 		RecurValues(arguments, span):
 			Ok({ entries = inserted.entries, next_owner = inserted.next_owner, exit = RecurArguments(arguments, span) })
 		ReturnValue(result):
-			span = returned_span(definitions, result, first_value)
 			match value_source(result, inserted.sources, enclosing, first_value, span):
 				Ok(source):
 					leaving = leave_with(result, source, inserted.entries, inserted.next_owner, span)
@@ -959,7 +977,7 @@ private pure func insert_block(
 	left ?= exit_result
 	completed ?= complete_joins(
 		left.entries,
-		IntOps.add(first_value, definitions.length()),
+		IntOps.add(first_value, inserted.sources.length()),
 		left.next_owner,
 		unions,
 		records,
@@ -991,14 +1009,15 @@ private pure func insert_join_arm(
 	records: List[ConcreteRecord],
 ) -> Result[InsertedJoinArm, Diagnostic]:
 	result = arm.value
-	span = returned_span(arm.definitions, result, first_value)
 	outer = enclosing_intervals(enclosing)
-	uses ?= block_uses(arm.definitions, TerminalValue(result), outer, first_value)
-	inserted ?= insert_definitions(arm.definitions, DropAtLastUse(uses), enclosing, first_value, initial_owner, unions, records)
+	span_result = terminal_span(arm.steps, result, outer)
+	uses ?= block_uses(arm.steps, TerminalValue(result), outer, first_value, span_result)
+	span ?= span_result
+	inserted ?= insert_steps(arm.steps, DropAtLastUse(uses), enclosing, first_value, initial_owner, unions, records)
 	source ?= value_source(result, inserted.sources, enclosing, first_value, span)
 	moved = match source:
 		OwnedResult(owner):
-			if in_interval(value_number(result), first_value, arm.definitions.length()):
+			if in_interval(value_number(result), first_value, inserted.sources.length()):
 				source
 			else:
 				BorrowedResult(OwnerBorrow(owner))
@@ -1007,13 +1026,13 @@ private pure func insert_join_arm(
 	leaving = leave_with(result, moved, inserted.entries, inserted.next_owner, span)
 	completed ?= complete_joins(
 		leaving.entries,
-		IntOps.add(first_value, arm.definitions.length()),
+		IntOps.add(first_value, inserted.sources.length()),
 		leaving.next_owner,
 		unions,
 		records,
 	)
 	Ok({
-		arm = { label = arm.label, operations = completed.operations, transfer = leaving.transfer },
+		arm = { label = arm.label, operations = completed.operations, transfer = leaving.transfer, carried = [] },
 		next_owner = completed.next_owner,
 		next_value = completed.next_value,
 	})
@@ -1046,6 +1065,9 @@ private pure func complete_joins(
 			AwaitingArms(join):
 				var arms: List[OwnedJoinArm] = []
 				for arm in join.join.arms:
+					if not arm.carried.is_empty():
+						failure = Some(internal_error(join.join.result.span, "carried join transfers are not supported during unary preparation"))
+						break
 					match insert_join_arm(arm, join.enclosing, next_value, next_owner, unions, records):
 						Err(error):
 							failure = Some(error)
@@ -1056,12 +1078,12 @@ private pure func complete_joins(
 							next_owner = inserted.next_owner
 				if failure.is_some():
 					break
-				operations = operations.append(DefineValue({
-					id = join.definition.id,
-					value_type = join.definition.value_type,
-					operation = JoinDefinition({ scrutinee = join.scrutinee, owner = join.join.owner, arms = arms }),
+				operations = operations.append(ExecuteJoin({
 					result = join.result,
-					span = join.definition.span,
+					carried = [],
+					scrutinee = join.scrutinee,
+					owner = join.join.owner,
+					arms = arms,
 				}))
 	match failure:
 		Some(error): Err(error)
@@ -1074,13 +1096,12 @@ private pure func insert_match(
 	unions: List[ConcreteUnion],
 	records: List[ConcreteRecord],
 ) -> Result[OwnedFunction, Diagnostic]:
-	prefix ?= insert_definitions(function.definitions, DropInEachArm, [], 0, 0, unions, records)
+	prefix ?= insert_steps(function.steps, DropInEachArm, [], 0, 0, unions, records)
 	prefix_owners = prefix.owners
-	scrutinee_definition ?= function.definitions
-		.get(value_number(matched.scrutinee))
+	scrutinee_span ?= value_span(function.steps, matched.scrutinee)
 		.to_result(internal_error(internal_span(), "missing match scrutinee definition"))
-	scrutinee ?= borrow_argument(matched.scrutinee, prefix.sources, [], 0, scrutinee_definition.span)
-	joined ?= complete_joins(prefix.entries, function.definitions.length(), prefix.next_owner, unions, records)
+	scrutinee ?= borrow_argument(matched.scrutinee, prefix.sources, [], 0, scrutinee_span)
+	joined ?= complete_joins(prefix.entries, prefix.sources.length(), prefix.next_owner, unions, records)
 	enclosing: List[EnclosingBlock] = [{ first_value = 0, sources = prefix.sources }]
 	var next_value = joined.next_value
 	var next_owner = joined.next_owner
@@ -1089,7 +1110,7 @@ private pure func insert_match(
 
 	for arm in matched.arms:
 		match insert_block(
-			arm.body.definitions,
+			arm.body.steps,
 			arm.body.exit,
 			enclosing,
 			next_value,
@@ -1159,46 +1180,48 @@ private pure func managed_loop(span: Span) -> Diagnostic:
 	}
 
 
--- A self-tail loop admits only unmanaged values, including those in its
--- joins' arms.
+private pure func admit_unmanaged(
+	value_type: TypeRef,
+	span: Span,
+	unions: List[ConcreteUnion],
+	records: List[ConcreteRecord],
+) -> Result[Void, Diagnostic]:
+	plan ?= value_ownership(value_type, unions, records)
+	match plan:
+		NoOwnership: Ok(void)
+		_: Err(managed_loop(span))
+
+
+-- A self-tail loop admits only unmanaged current-source values.
 private pure func admit_loop_values(
-	definitions: List[ValueDefinition],
+	steps: List[LoweredStep],
 	unions: List[ConcreteUnion],
 	records: List[ConcreteRecord],
 ) -> Result[Void, Diagnostic]:
 	var invalid: Option[Diagnostic] = None
-
-	for definition in definitions:
-		match value_ownership(definition.value_type, unions, records):
+	for step in steps:
+		checked = match step:
+			Define(definition): admit_unmanaged(definition.value_type, definition.span, unions, records)
+			Join(join): admit_unmanaged(join.result.value_type, join.result.span, unions, records)
+		match checked:
 			Err(error):
 				invalid = Some(error)
 				break
-			Ok(ManagedStringLeaf) | Ok(ManagedListRoot) | Ok(ManagedRecordRoot(_)) | Ok(InlineOwnedFields(_)) | Ok(ManagedUnionRoot(_)):
-				invalid = Some(managed_loop(definition.span))
-				break
-			Ok(NoOwnership):
-				void
-
-		match definition.operation:
-			JoinValue(join):
+			Ok(_): void
+		match step:
+			Define(_): void
+			Join(join):
 				for arm in join.arms:
-					match admit_loop_values(arm.definitions, unions, records):
+					match admit_loop_values(arm.steps, unions, records):
 						Err(error):
 							invalid = Some(error)
 							break
-						Ok(_):
-							void
-			_:
-				void
-
+						Ok(_): void
 		if invalid.is_some():
 			break
-
 	match invalid:
-		Some(error):
-			Err(error)
-		None:
-			Ok(void)
+		Some(error): Err(error)
+		None: Ok(void)
 
 
 private pure func admit_loop(
@@ -1227,7 +1250,7 @@ private pure func admit_loop(
 				Some(error):
 					Err(error)
 				None:
-					match admit_loop_values(function.definitions, unions, records):
+					match admit_loop_values(function.steps, unions, records):
 						Ok(prefix):
 
 							match function.tail:
@@ -1235,7 +1258,7 @@ private pure func admit_loop(
 									Ok(void)
 								MatchValue(matched):
 									for arm in matched.arms:
-										match admit_loop_values(arm.body.definitions, unions, records):
+										match admit_loop_values(arm.body.steps, unions, records):
 											Err(error):
 												invalid = Some(error)
 												break
@@ -1259,7 +1282,7 @@ pure func insert_function(
 
 	match function.tail:
 		ExitValue(exit):
-			match insert_block(function.definitions, exit, [], 0, 0, unions, records):
+			match insert_block(function.steps, exit, [], 0, 0, unions, records):
 				Ok(built):
 					Ok({
 						execution = function.execution,

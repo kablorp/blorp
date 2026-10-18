@@ -95,48 +95,51 @@ private pure func raw_arm(
 	var returned_borrow: Option[Own.BorrowedValue] = None
 	var invalid = False
 
-	for definition in arm.body.definitions:
-		match definition.operation:
-			Lower.PayloadValue(variant, _):
-				if drop_before:
-					operations = operations.append(Own.DropOwner(Own.owner_id(1), at))
+	for step in arm.body.steps:
+		match step:
+			Lower.Define(definition):
+				match definition.operation:
+					Lower.PayloadValue(variant, _):
+						if drop_before:
+							operations = operations.append(Own.DropOwner(Own.owner_id(1), at))
 
-				result = match definition.value_type:
-					Concrete.StringType:
-						Own.BorrowedResult(Own.PayloadBorrow(scrutinee))
+						result = match definition.value_type:
+							Concrete.StringType:
+								Own.BorrowedResult(Own.PayloadBorrow(scrutinee))
+							_:
+								Own.UnmanagedResult
+
+						operations = operations.append(Own.DefineValue({
+							id = definition.id,
+							value_type = definition.value_type,
+							operation = Own.PayloadDefinition(variant, scrutinee),
+							result = result,
+							span = at,
+						}))
+
+						if drop_after:
+							operations = operations.append(Own.DropOwner(Own.owner_id(1), at))
+
+						match definition.value_type:
+							Concrete.StringType:
+								returned_borrow = Some({
+									value = definition.id,
+									source = Own.PayloadBorrow(scrutinee),
+								})
+							_:
+								void
+					Lower.StringValue(bytes):
+						operations = operations.append(Own.DefineValue({
+							id = definition.id,
+							value_type = Concrete.StringType,
+							operation = Own.StringDefinition(bytes),
+							result = Own.OwnedResult(owner),
+							span = at,
+						}))
 					_:
-						Own.UnmanagedResult
+						invalid = True
 
-				operations = operations.append(Own.DefineValue({
-					id = definition.id,
-					value_type = definition.value_type,
-					operation = Own.PayloadDefinition(variant, scrutinee),
-					result = result,
-					span = at,
-				}))
-
-				if drop_after:
-					operations = operations.append(Own.DropOwner(Own.owner_id(1), at))
-
-				match definition.value_type:
-					Concrete.StringType:
-						returned_borrow = Some({
-							value = definition.id,
-							source = Own.PayloadBorrow(scrutinee),
-						})
-					_:
-						void
-			Lower.StringValue(bytes):
-				operations = operations.append(Own.DefineValue({
-					id = definition.id,
-					value_type = Concrete.StringType,
-					operation = Own.StringDefinition(bytes),
-					result = Own.OwnedResult(owner),
-					span = at,
-				}))
-			_:
-				invalid = True
-
+			_: void
 	if invalid:
 		Err(seed_error())
 	else:
@@ -165,8 +168,8 @@ private pure func raw_match(
 	matched: Lower.LoweredMatch,
 	case: RawCase,
 ) -> Result[Own.OwnedFunction, Diagnostic]:
-	match (function.definitions, matched.arms):
-		([parent, projected], [number, text, empty]):
+	match (function.steps, matched.arms):
+		([Lower.Define(parent), Lower.Define(projected)], [number, text, empty]):
 			match projected.operation:
 				Lower.ReadRecordFieldValue(field, _):
 					first ?= raw_arm(number, projected.id, 0, case)

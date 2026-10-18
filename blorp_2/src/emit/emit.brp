@@ -38,15 +38,17 @@ import:
 		OwnedExit(ReturnResult, RecurArguments),
 		OwnedFunction,
 		OwnedJoin,
+		OwnedJoinParameter(UnmanagedJoinParameter, ManagedJoinParameter),
+		join_parameter,
 		OwnedMatch,
 		OwnedTail(ReturnTail, MatchTail),
 		OwnedValueOperation(
 			ParameterDefinition, VoidDefinition, IntegerDefinition, FloatDefinition,
 			StringDefinition, CallDefinition, ConstructDefinition, ConstructListDefinition,
-			PayloadDefinition, ConstructRecordDefinition, ReadRecordFieldDefinition, JoinDefinition,
+			PayloadDefinition, ConstructRecordDefinition, ReadRecordFieldDefinition,
 		),
 		OwnerId,
-		OwnershipOperation(DefineValue, AcquireOwner, DropOwner),
+		OwnershipOperation(DefineValue, ExecuteJoin, AcquireOwner, DropOwner),
 		OwnershipProgram,
 		ResultOwnership(UnmanagedResult, BorrowedResult, OwnedResult),
 		ReturnTransfer(UnmanagedReturn, OwnedReturn),
@@ -957,7 +959,7 @@ private pure func append_operation(
 			match c_union_value(variant_id, operands, unions, span):
 				Ok(value): Ok(output.concat(value))
 				Err(error): Err(error)
-		ConstructListDefinition(_) | JoinDefinition(_):
+		ConstructListDefinition(_):
 			-- List construction and joins are written as statements, by
 			-- append_list_construction and append_join; never as expressions.
 			Err(render(span, StatementOnlyValue(id)))
@@ -1494,6 +1496,13 @@ private pure func owner_types(function: OwnedFunction) -> Result[List[TypeRef], 
 							owners = owners.append(definition.value_type)
 						_:
 							void
+				ExecuteJoin(join):
+					parameter = join_parameter(join.result)
+					values = values.append(parameter.value_type)
+					match join.result:
+						UnmanagedJoinParameter(_): void
+						ManagedJoinParameter(_, _): owners = owners.append(parameter.value_type)
+
 				AcquireOwner(_, borrowed, span):
 					match values.get(value_number(borrowed.value)):
 						Some(value_type):
@@ -1771,11 +1780,9 @@ private pure func append_ownership_operation(
 ) -> Result[String, Diagnostic]:
 	match operation:
 		DefineValue(definition):
-			match definition.operation:
-				JoinDefinition(matched_join):
-					append_join(output, definition, matched_join, unions, types, records)
-				_:
-					append_owned_definition(output, definition, unions, records)
+			append_owned_definition(output, definition, unions, records)
+		ExecuteJoin(matched_join):
+			append_join(output, matched_join, unions, types, records)
 		AcquireOwner(owner, borrowed, span):
 			match types.get(owner_number(owner)):
 				Some(value_type):
@@ -1927,15 +1934,15 @@ private pure func append_match(
 -- the join's own owner takes over after the switch.
 private pure func append_join(
 	output: String,
-	definition: OwnedDefinition,
 	matched_join: OwnedJoin,
 	unions: List[ConcreteUnion],
 	types: List[TypeRef],
 	records: List[ConcreteRecord],
 ) -> Result[String, Diagnostic]:
-	name = c_value(definition.id)
-	declaration ?= c_local_declaration(definition.value_type, JoinLocal, unions, definition.span)
-	opening ?= append_switch(output.concat(declaration).concat(name).concat(";"), matched_join.scrutinee, matched_join.owner, unions, definition.span)
+	parameter = join_parameter(matched_join.result)
+	name = c_value(parameter.id)
+	declaration ?= c_local_declaration(parameter.value_type, JoinLocal, unions, parameter.span)
+	opening ?= append_switch(output.concat(declaration).concat(name).concat(";"), matched_join.scrutinee, matched_join.owner, unions, parameter.span)
 	var cases: List[SwitchCase] = []
 	for arm in matched_join.arms:
 		moved = match arm.transfer:
@@ -1946,11 +1953,11 @@ private pure func append_join(
 	-- Like every value local, the join's is marked used: a statement match's
 	-- Void local is assigned but never read.
 	joined = switched.concat("(void)").concat(name).concat(";")
-	match definition.result:
-		UnmanagedResult | BorrowedResult(_):
+	match matched_join.result:
+		UnmanagedJoinParameter(_):
 			Ok(joined)
-		OwnedResult(owner):
-			append_owner_alias(joined, owner, definition.id, definition.value_type, unions, definition.span)
+		ManagedJoinParameter(_, owner):
+			append_owner_alias(joined, owner, parameter.id, parameter.value_type, unions, parameter.span)
 
 
 private pure func append_signature(
@@ -2189,14 +2196,10 @@ private pure func append_block(
 	var collected = blocks.append(operations)
 	for operation in operations:
 		match operation:
-			DefineValue(definition):
-				match definition.operation:
-					JoinDefinition(matched_join):
-						for arm in matched_join.arms:
-							collected = append_block(collected, arm.operations)
-					_:
-						void
-			AcquireOwner(_, _, _) | DropOwner(_, _):
+			ExecuteJoin(join):
+				for arm in join.arms:
+					collected = append_block(collected, arm.operations)
+			DefineValue(_) | AcquireOwner(_, _, _) | DropOwner(_, _):
 				void
 	collected
 
@@ -2240,6 +2243,8 @@ private pure func program_inventory(program: OwnershipProgram) -> ProgramInvento
 									RuntimeFunction(runtime): runtime_calls = runtime_calls.append(runtime)
 									_: void
 							_: void
+					ExecuteJoin(join):
+						types = types.append(join_parameter(join.result).value_type)
 					AcquireOwner(_, _, _) | DropOwner(_, _):
 						void
 

@@ -1,4 +1,5 @@
 import:
+	../ownership_inputs: defined_value_at
 	../../../src/lower/lower as Lower
 	../../../src/own/own as Own
 	../../../src/utils/source: compiler_source
@@ -52,13 +53,16 @@ private pure func seed(source: String) -> Result[Seed, Diagnostic]:
 	facts = Lower.lowered_functions(program)
 	main ?= facts.functions.get(Concrete.function_number(entry_function(facts.entrypoint))).to_result(setup_error())
 	var selected: List[Concrete.FunctionInstanceId] = []
-	for definition in main.definitions:
-		match definition.operation:
-			Lower.CallValue(call, _):
-				match call.target:
-					Concrete.UserFunction(id):
-						match definition.value_type:
-							Concrete.RecordType(_): selected = selected.append(id)
+	for step in main.steps:
+		match step:
+			Lower.Define(definition):
+				match definition.operation:
+					Lower.CallValue(call, _):
+						match call.target:
+							Concrete.UserFunction(id):
+								match definition.value_type:
+									Concrete.RecordType(_): selected = selected.append(id)
+									_: void
 							_: void
 					_: void
 			_: void
@@ -182,8 +186,8 @@ pure func test_borrowed_base_acquires_projection_and_stored_obligation_separatel
 	match seed(ENTRY.concat(CLONE)):
 		Err(_): False
 		Ok(input):
-			match input.function.definitions:
-				[base, number, text, fresh]:
+			match input.function.steps:
+				[Lower.Define(base), Lower.Define(number), Lower.Define(text), Lower.Define(fresh)]:
 					match fresh.operation:
 						Lower.ConstructRecordValue(record_id, [number_field, text_field]):
 							match inserted(input):
@@ -231,8 +235,8 @@ pure func test_owned_base_retires_after_projection_acquisition_before_constructi
 	match seed(source):
 		Err(_): False
 		Ok(input):
-			match input.function.definitions:
-				[base, _, text, fresh]:
+			match input.function.steps:
+				[Lower.Define(base), Lower.Define(_), Lower.Define(text), Lower.Define(fresh)]:
 					match inserted(input):
 						Err(_): False
 						Ok(owned):
@@ -264,8 +268,8 @@ pure func test_all_replaced_owned_base_drops_before_independent_rhs() -> Bool:
 	match seed(source):
 		Err(_): False
 		Ok(input):
-			match input.function.definitions:
-				[base, number, text, fresh]:
+			match input.function.steps:
+				[Lower.Define(base), Lower.Define(number), Lower.Define(text), Lower.Define(fresh)]:
 					match inserted(input):
 						Err(_): False
 						Ok(owned):
@@ -297,8 +301,8 @@ pure func test_inline_numeric_copy_needs_no_ownership_operations() -> Bool:
 			match inserted(input):
 				Err(_): False
 				Ok(owned):
-					match input.function.definitions:
-						[base, left, right, fresh]:
+					match input.function.steps:
+						[Lower.Define(base), Lower.Define(left), Lower.Define(right), Lower.Define(fresh)]:
 							match owned.operations:
 								[Own.DefineValue(parameter), Own.DefineValue(replacement), Own.DefineValue(projected), Own.DefineValue(result)]:
 									unmanaged = [parameter, replacement, projected, result].all(pure func(definition): unmanaged_result(definition.result))
@@ -329,8 +333,8 @@ private ALIAS_SOURCE: String =
 -- inherited projection, construction, old-alias use. Only ordinary operations
 -- change; all five dense ValueIds and complete field/layout identities are real.
 private pure func alias_function(input: Seed) -> Result[Lower.LoweredFunction, Diagnostic]:
-	match input.function.definitions:
-		[base, old_number, number, text, fresh]:
+	match input.function.steps:
+		[Lower.Define(base), Lower.Define(old_number), Lower.Define(number), Lower.Define(text), Lower.Define(fresh)]:
 			match old_number.operation:
 				Lower.ReadRecordFieldValue(number_field, parent):
 					match text.operation:
@@ -345,7 +349,7 @@ private pure func alias_function(input: Seed) -> Result[Lower.LoweredFunction, D
 											{ field = second.field, value = projected.id },
 										]) }
 										old_alias = { fresh | value_type = Concrete.IntType, operation = Lower.ReadRecordFieldValue(number_field, base.id), span = old_number.span }
-										Ok({ input.function | definitions = [base, replacement, projected, constructed, old_alias], tail = Lower.ExitValue(Lower.ReturnValue(constructed.id)) })
+										Ok({ input.function | steps = [base, replacement, projected, constructed, old_alias].map(pure func(definition): Lower.Define(definition)), tail = Lower.ExitValue(Lower.ReturnValue(constructed.id)) })
 									else:
 										Err(setup_error())
 								_: Err(setup_error())
@@ -361,8 +365,8 @@ pure func test_old_alias_keeps_original_owner_live_past_fresh_construction() -> 
 			match alias_function(input):
 				Err(_): False
 				Ok(function):
-					match function.definitions:
-						[base, _, text, fresh, old_alias]:
+					match function.steps:
+						[Lower.Define(base), Lower.Define(_), Lower.Define(text), Lower.Define(fresh), Lower.Define(old_alias)]:
 							match Own.insert_function(function, input.program.unions, input.program.records):
 								Err(_): False
 								Ok(owned):
@@ -401,8 +405,8 @@ pure func test_replacement_and_inherited_projection_have_distinct_slot_obligatio
 	match seed(source):
 		Err(_): False
 		Ok(input):
-			match input.function.definitions:
-				[_, changed, inherited, fresh]:
+			match input.function.steps:
+				[Lower.Define(_), Lower.Define(changed), Lower.Define(inherited), Lower.Define(fresh)]:
 					match fresh.operation:
 						Lower.ConstructRecordValue(owner, [left, right]):
 							match inserted(input):
@@ -435,8 +439,8 @@ private pure func zero_child_root(source: String) -> Bool:
 	match seed(source):
 		Err(_): False
 		Ok(input):
-			match input.function.definitions:
-				[base, changed, fresh]:
+			match input.function.steps:
+				[Lower.Define(base), Lower.Define(changed), Lower.Define(fresh)]:
 					match fresh.operation:
 						Lower.ConstructRecordValue(owner, [field]):
 							match inserted(input):
@@ -490,15 +494,15 @@ pure func test_omitted_string_escapes_after_both_owned_record_roots_retire() -> 
 			match alias_function(input):
 				Err(_): False
 				Ok(function):
-					match function.definitions:
-						[base, number, text, fresh, final_value]:
+					match function.steps:
+						[Lower.Define(base), Lower.Define(number), Lower.Define(text), Lower.Define(fresh), Lower.Define(final_value)]:
 							match text.operation:
 								Lower.ReadRecordFieldValue(field, _):
 									escaped = { final_value | value_type = Concrete.StringType, operation = Lower.ReadRecordFieldValue(field, fresh.id) }
 									updated = {
 										function |
 										signature = { function.signature | return_type = Concrete.StringType },
-										definitions = [base, number, text, fresh, escaped],
+										steps = [base, number, text, fresh, escaped].map(pure func(definition): Lower.Define(definition)),
 										tail = Lower.ExitValue(Lower.ReturnValue(escaped.id))
 									}
 									match Own.insert_function(updated, input.program.unions, input.program.records):
@@ -534,8 +538,8 @@ pure func test_mixed_inherited_fields_each_get_temporary_and_stored_obligations(
 	match seed(source):
 		Err(_): False
 		Ok(input):
-			match input.function.definitions:
-				[_, _, text, entry, choice, values, fresh]:
+			match input.function.steps:
+				[Lower.Define(_), Lower.Define(_), Lower.Define(text), Lower.Define(entry), Lower.Define(choice), Lower.Define(values), Lower.Define(fresh)]:
 					match fresh.operation:
 						Lower.ConstructRecordValue(owner, [number_field, text_field, entry_field, choice_field, values_field]):
 							match inserted(input):
@@ -578,8 +582,8 @@ private fixed record RawClone {
 
 private pure func raw_clone() -> Result[RawClone, Diagnostic]:
 	input ?= seed(ENTRY.concat(CLONE))
-	match input.function.definitions:
-		[base, number, text, fresh]:
+	match input.function.steps:
+		[Lower.Define(base), Lower.Define(number), Lower.Define(text), Lower.Define(fresh)]:
 			match text.operation:
 				Lower.ReadRecordFieldValue(field, parent):
 					match fresh.operation:
@@ -614,7 +618,7 @@ private pure func raw_program(input: RawClone, function: Own.OwnedFunction) -> R
 	facts = input.seed.program
 	main_id = entry_function(facts.entrypoint)
 	main ?= facts.functions.get(Concrete.function_number(main_id)).to_result(setup_error())
-	first ?= main.definitions.get(0).to_result(setup_error())
+	first ?= defined_value_at(main.steps, 0, setup_error())
 	dummy: Own.OwnedFunction = {
 		execution = main.execution, signature = main.signature,
 		operations = [Own.DefineValue({ id = first.id, value_type = Concrete.IntType, operation = Own.IntegerDefinition(0), result = Own.UnmanagedResult, span = first.span })],

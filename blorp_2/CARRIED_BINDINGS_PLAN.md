@@ -1,29 +1,23 @@
 # Carried bindings at structured joins
 
-Design reviewed by root and two independent compiler experts. Source baseline:
-main `e6785c22fb050572d703301eb1435f9cb8fcef4b` (2026-10-16), with the later
-argument lifts noted below. Preparation budgets are accepted. The early host
-storage screen is measured; whole-input cost and measurement-baseline review
-still precede acceptance. The unary preparation has been ported from the retained
-dirty candidate at `04fee8a6fae7bc252ced6f7b3ba8c6916d76a1c9` onto accepted base
-`0cdba16a459c1a1f5792a70ea2071f98f453b96f`. Compiled validation and current cost
-evidence remain pending; historical candidate results do not validate this port.
-Feature budgets remain unapproved.
+The unary preparation is validated against accepted main
+`782824efbdedbebb2b0f3176d325e69edb42bcbd` after the byte, concat, stderr,
+first-order and write-file landings. Its fixed-epoch 3,944 cost calls pass the
+prospectively approved current-base hard +3% allocation/instruction gates,
+including the original SOURCE checkpoint. Functional evidence is 216 focused,
+3,276 component and 467 e2e passes. See the
+[current preparation report](../benchmarks/results/blorp_2_unary_preparation_2026-10-18.md)
+for exact roles, inputs, raw evidence and limitations. The carried-binding
+feature and its acceptance are separate.
 
-The finish checkout `finish-unary-ir/blorp`, branch `codex/finish-unary-ir`, starts
-at current main `e29a5396a147fc94b91a51f5285f2b0bd265429a`. Its inspectable
-`build/unary-ir/candidate-reviewed.patch` preserves the reviewed `8601/blorp`
-working diff without changing that checkout. The final acceptance baseline and
-fixture corpus must be refreshed after the preceding byte, concat, stderr and
-first-order landings, then frozen with source/library/binary/input hashes before
-matched measurement. New concat consumers must migrate mechanically to typed
-steps while preserving their exact identity, diagnostic and span oracles. The
-historical unary results and any byte-track policy exception do not transfer.
-
-Early characterization at this finishing base ran the nine named unary suites:
-96 callbacks passed after fixing one missed `ExecuteJoin` type-inventory arm in
-emission. The initial non-exhaustive-match compile failure is retained, not a
-passing test result. This is not final post-refresh correctness or cost evidence.
+Historical provenance: the design began at `e6785c22f` on 2026-10-16. The retained
+candidate `04fee8a6f` and ports at `0cdba16a4` and `e29a5396a` remain preserved.
+The earlier 96-callback characterization and its initial non-exhaustive-match
+failure are historical evidence, not validation of the current epoch. The fresh
+port preserves the reviewed production patch identity and mechanically migrates
+the later concat and write-file consumers. No prior feature exception transfers.
+Original R0 cumulative compliance remains UNVERIFIED under the separate,
+prospectively approved unary cost contract below.
 
 ## Problem and first input
 
@@ -276,16 +270,15 @@ including host source-to-C/shared pilot proxies, accepted as a hard stop.
 Before measuring, explicitly review the current capability baseline and roadmap
 cumulative metrics. Intentional UTF-8 C changes need their own reviewed identity
 epoch; they waive no old cost cap and authorize no backport or framework.
-Feature targets **+5%, hard +10% per shared input**; no average masks a breach.
-Proposed minimal scalar/String caps: **30,000 allocations/150,000,000 instructions**
-(current bound fixtures cap about 15–17k/78–98M); set stress caps from scaffolding.
-These feature numbers are not initially authorized. After preparation, review
-its complete producer/consumer diff and all costs separately. Feature production
-proposal: **450–750 added/+250–450 net**; unit/runtime/registration tests excluding
-fixtures **900–1,400 added/+650–1,100 net**; **6–8 fixtures/140–240 lines**.
-Proposed stop caps: production **900 added/+450 net**, tests
-**1,600 added/+1,300 net**, fixtures **10/300 lines**. All remain unapproved;
-**+350/+450 net** is only the earlier feature estimate. Keep existing cost caps.
+The historical feature **+5% target/+10% hard** proposal is superseded by its
+separate 2026-10-18 approval: hard **+3% allocations/normal min3 instructions**
+per unchanged input and original schema1 SOURCE checkpoint. Its first scalar
+and String limits are **30,000 allocations/150,000,000 instructions**; the
+separately approved 46-line managed nesting input starts at **60,000/300,000,000**.
+Feature stop caps are **900 added/+450 net production**, **1,600 added/+1,300
+net tests**, and **10 fixtures/300 lines**. Its earlier +350/+450 net estimate
+is historical. Full feature validation and acceptance remain separate from
+this unary preparation; no preparation allowance or result transfers.
 
 ## Prospective unary-preparation cost contract
 
@@ -338,8 +331,9 @@ Require exact local B/C fixture C, status/stdout/stderr and full diagnostic byte
 never normalize output. Keep and review host-generated compiler C separately,
 where this IR model change intentionally changes the compiler's generated code.
 Report physical counts and each input/proxy verdict with hashes, commands and raw
-samples. Final acceptance still requires root plus an independent expert; the
-later multi-output feature's policy and budgets remain unapproved.
+samples. Final acceptance still requires root plus an independent expert. The
+later multi-output feature has its separate approved policy and budgets above;
+this preparation's acceptance does not establish feature acceptance.
 
 ## Acceptance, dependencies and stop rules
 

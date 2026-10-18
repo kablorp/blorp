@@ -2178,8 +2178,14 @@ identities and typed operations. Integer and
 union programs with optional Int fields need no target heap allocation or RC operations.
 Recursive direct arguments and postfix receiver calls remain single-line values.
 A structured body sum distinguishes that leaf from a match with ordered arms.
-A join is one definition whose value its arms yield: its arms' values and
-owners follow those of its block, so every block keeps consecutive identities.
+A lowered block contains `Define` and `Join` steps. Ordinary definitions retain
+their value facts; a join publishes typed result/carried parameters separately
+from its arms' outgoing values. Current source lowering publishes one result and
+empty carried lists. Use rows count introduced values and record step positions;
+drop buckets count steps. Arms' values and owners follow their complete block,
+so every block keeps consecutive identities. Ownership publishes `ExecuteJoin`,
+and independent verification checks the unary result and rejects nonempty
+carriers before sealing the program.
 General pass infrastructure remains future work.
 
 The target library's [`_base.brp`](standard_library_temp/_base.brp)

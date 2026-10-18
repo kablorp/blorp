@@ -17,15 +17,17 @@ import:
 		OwnedFunction,
 		OwnedJoin,
 		OwnedJoinArm,
+		OwnedJoinParameter(UnmanagedJoinParameter, ManagedJoinParameter),
+		join_parameter, join_ownership,
 		OwnedMatch,
 		OwnedTail(ReturnTail, MatchTail),
 		OwnedValueOperation(
 			ParameterDefinition, VoidDefinition, IntegerDefinition, FloatDefinition,
 			StringDefinition, CallDefinition, ConstructDefinition, ConstructListDefinition,
-			PayloadDefinition, ConstructRecordDefinition, ReadRecordFieldDefinition, JoinDefinition,
+			PayloadDefinition, ConstructRecordDefinition, ReadRecordFieldDefinition,
 		),
 		OwnerId,
-		OwnershipOperation(DefineValue, AcquireOwner, DropOwner),
+		OwnershipOperation(DefineValue, ExecuteJoin, AcquireOwner, DropOwner),
 		OwnershipProgram,
 		ResultOwnership(UnmanagedResult, BorrowedResult, OwnedResult),
 		ReturnTransfer(UnmanagedReturn, OwnedReturn),
@@ -1245,22 +1247,7 @@ private pure func operation_type(
 						Some(error): Err(error)
 						None: Ok(definition.value_type)
 				_: Err(verification_error(definition.span, "list construction result must be a List"))
-		JoinDefinition(join):
-			match known_value(state, argument_value(join.scrutinee), definition.span):
-				Ok(scrutinee):
-					if same_type(scrutinee.value_type, UnionType(join.owner)):
-						var labels: List[MatchLabel] = []
-						for arm in join.arms:
-							labels = labels.append(arm.label)
-						match verify_match_labels(join.owner, labels, unions, definition.span):
-							Ok(covered):
-								match verify_match_argument(join.scrutinee, state, unions, records, definition.span, discharged, owners):
-									Ok(live): Ok(definition.value_type)
-									Err(error): Err(error)
-							Err(error): Err(error)
-					else:
-						Err(verification_error(definition.span, "join scrutinee does not belong to its union"))
-				Err(error): Err(error)
+
 		PayloadDefinition(field, source):
 			selected = variant_field_variant(field)
 			match known_value(state, source, definition.span):
@@ -1475,7 +1462,7 @@ private pure func verify_definition_result(
 									"managed projection requires its parent borrow",
 								),
 							)
-				StringDefinition(_) | CallDefinition(_, _) | ConstructDefinition(_, _) | ConstructListDefinition(_) | ConstructRecordDefinition(_, _) | JoinDefinition(_):
+				StringDefinition(_) | CallDefinition(_, _) | ConstructDefinition(_, _) | ConstructListDefinition(_) | ConstructRecordDefinition(_, _):
 					match definition.result:
 						OwnedResult(owner):
 							Ok(Some(owner))
@@ -1601,8 +1588,6 @@ private pure func verified_drop(
 -- each arm starts from `start`, the block's state just before the join.
 private fixed record PendingJoin {
 	join: OwnedJoin,
-	value_type: TypeRef,
-	span: Span,
 	start: VerificationState
 }
 
@@ -1611,6 +1596,88 @@ private fixed record VerifiedBlock {
 	state: VerificationState,
 	pending: List[PendingJoin]
 }
+
+
+private pure func verify_unary_join_header(
+	join: OwnedJoin,
+	state: VerificationFacts,
+	unions: List[ConcreteUnion],
+	records: List[ConcreteRecord],
+	discharged: List[Bool],
+	owners: List[OwnerState],
+) -> Result[Void, Diagnostic]:
+	parameter = join_parameter(join.result)
+	admitted ?= if join.carried.is_empty():
+		Ok(void)
+	else:
+		Err(verification_error(parameter.span, "carried join outputs are not supported during unary preparation"))
+	ordinal ?= if IntOps.equals(value_number(parameter.id), IntOps.add(state.first_value, state.values.length())):
+		Ok(void)
+	else:
+		Err(verification_error(parameter.span, "value identity is not the next function ordinal"))
+	membership ?= match parameter.value_type:
+		ListType(element): verify_type_membership(element, unions, records, parameter.span)
+		_: Ok(void)
+	match known_value(state, argument_value(join.scrutinee), parameter.span):
+		Ok(scrutinee):
+			if same_type(scrutinee.value_type, UnionType(join.owner)):
+				var labels: List[MatchLabel] = []
+				for arm in join.arms:
+					labels = labels.append(arm.label)
+				match verify_match_labels(join.owner, labels, unions, parameter.span):
+					Ok(covered):
+						match verify_match_argument(join.scrutinee, state, unions, records, parameter.span, discharged, owners):
+							Ok(live): Ok(void)
+							Err(error): Err(error)
+					Err(error): Err(error)
+			else:
+				Err(verification_error(parameter.span, "join scrutinee does not belong to its union"))
+		Err(error): Err(error)
+
+
+private pure func introduce_join_parameter(
+	output: OwnedJoinParameter,
+	initial: VerificationState,
+	unions: List[ConcreteUnion],
+	records: List[ConcreteRecord],
+) -> Result[VerificationState, Diagnostic]:
+	parameter = join_parameter(output)
+	state = initial.facts
+
+	plan ?= value_ownership(parameter.value_type, unions, records)
+	var owners = initial.owners
+	classification: Result[Void, Diagnostic] = match plan:
+		NoOwnership:
+			match output:
+				UnmanagedJoinParameter(_): Ok(void)
+				_: Err(verification_error(parameter.span, "unmanaged value carries an ownership obligation"))
+		_:
+			match output:
+				UnmanagedJoinParameter(_): Err(verification_error(parameter.span, "managed result requires an owner"))
+				ManagedJoinParameter(_, owner):
+					next ?= validate_next_owner(state.first_owner, owners, owner, parameter.span)
+					owners = owners.append(ActiveOwner(parameter.id))
+					Ok(void)
+	classified ?= classification
+	Ok({ initial |
+		facts = { state | values = state.values.append({
+			value_type = parameter.value_type,
+			span = parameter.span,
+			result = join_ownership(output),
+			projection_parent = None,
+		}) },
+		owners = owners,
+	})
+
+
+private pure func introduce_unary_join(
+	join: OwnedJoin,
+	start: VerificationState,
+	unions: List[ConcreteUnion],
+	records: List[ConcreteRecord],
+) -> Result[VerificationState, Diagnostic]:
+	header ?= verify_unary_join_header(join, start.facts, unions, records, start.discharged, start.owners)
+	introduce_join_parameter(join.result, start, unions, records)
 
 
 -- Owner vectors belong to this traversal, not the per-definition facts carrier.
@@ -1634,16 +1701,6 @@ private pure func verify_operations(
 	for operation in operations:
 		checked: Result[Void, Diagnostic] = match operation:
 			DefineValue(definition):
-				match definition.operation:
-					JoinDefinition(join):
-						pending = pending.append({
-							join = join,
-							value_type = definition.value_type,
-							span = definition.span,
-							start = { facts = state, discharged = discharged, owners = owners },
-						})
-					_:
-						void
 
 				match verify_definition_type(
 					definition,
@@ -1736,6 +1793,16 @@ private pure func verify_operations(
 													parameters = parameters
 												}
 												Ok(void)
+			ExecuteJoin(join):
+				start: VerificationState = { facts = state, discharged = discharged, owners = owners }
+				match introduce_unary_join(join, start, unions, records):
+					Err(error): Err(error)
+					Ok(introduced):
+						pending = pending.append({ join = join, start = start })
+						state = introduced.facts
+						owners = introduced.owners
+						Ok(void)
+
 			AcquireOwner(id, borrow, span):
 				match verify_borrow(borrow, state, span, discharged, owners):
 					Err(error):
@@ -2014,6 +2081,18 @@ private pure func is_backedge(exit: OwnedExit) -> Bool:
 			True
 
 
+private pure func verify_loop_type(
+	value_type: TypeRef,
+	span: Span,
+	unions: List[ConcreteUnion],
+	records: List[ConcreteRecord],
+) -> Result[Void, Diagnostic]:
+	plan ?= value_ownership(value_type, unions, records)
+	match plan:
+		NoOwnership: Ok(void)
+		_: Err(verification_error(span, "managed value appears in a self-tail loop"))
+
+
 -- This preflight deliberately inspects raw definitions, including values whose
 -- owners have already been dropped. The normal verifier still proves each type.
 private pure func verify_loop_operations(
@@ -2027,18 +2106,9 @@ private pure func verify_loop_operations(
 	for operation in operations:
 		match operation:
 			DefineValue(definition):
-				match value_ownership(definition.value_type, unions, records):
-					Err(error):
-						invalid = Some(error)
-					Ok(ManagedStringLeaf) | Ok(ManagedListRoot) | Ok(ManagedRecordRoot(_)) | Ok(InlineOwnedFields(_)) | Ok(ManagedUnionRoot(_)):
-						invalid = Some(
-							verification_error(
-								definition.span,
-								"managed value appears in a self-tail loop",
-							),
-						)
-					Ok(NoOwnership):
-						void
+				match verify_loop_type(definition.value_type, definition.span, unions, records):
+					Err(error): invalid = Some(error)
+					Ok(_): void
 
 				match definition.operation:
 					CallDefinition(call, _):
@@ -2053,14 +2123,20 @@ private pure func verify_loop_operations(
 									)
 							RuntimeFunction(_):
 								void
-					JoinDefinition(join):
-						for arm in join.arms:
-							if invalid.is_none():
-								match verify_loop_operations(arm.operations, current, unions, records):
-									Err(error): invalid = Some(error)
-									Ok(_): void
+
 					_:
 						void
+			ExecuteJoin(join):
+				parameter = join_parameter(join.result)
+				match verify_loop_type(parameter.value_type, parameter.span, unions, records):
+					Err(error): invalid = Some(error)
+					Ok(_): void
+				for arm in join.arms:
+					if invalid.is_none():
+						match verify_loop_operations(arm.operations, current, unions, records):
+							Err(error): invalid = Some(error)
+							Ok(_): void
+
 			AcquireOwner(_, _, span):
 				invalid = Some(verification_error(span, "owner operation appears in a self-tail loop"))
 			DropOwner(_, span):
@@ -2342,12 +2418,17 @@ private pure func verify_join_arm(
 	unions: List[ConcreteUnion],
 	records: List[ConcreteRecord],
 ) -> Result[BlockEnd, Diagnostic]:
+	result = join_parameter(join.join.result)
+	admitted ?= if arm.carried.is_empty():
+		Ok(void)
+	else:
+		Err(verification_error(result.span, "carried join transfers are not supported during unary preparation"))
 	start = enter(join.start, cursor.next_value, cursor.next_owner, KeepsEnclosing)
 	projection = match arm.label:
 		DefaultLabel: NoProjection
 		VariantLabel(id): PayloadProjection(join.join.scrutinee, id)
 	verified ?= verify_operations(arm.operations, start, signature, functions, unions, projection, records)
-	left ?= verify_yield(arm.transfer, verified.state, join.value_type, unions, records, join.span)
+	left ?= verify_yield(arm.transfer, verified.state, result.value_type, unions, records, result.span)
 	verify_joins(verified.pending, block_end(verified.state), signature, functions, unions, records)
 
 
@@ -2547,6 +2628,7 @@ private pure func verify_entry(
 				match operation:
 					DefineValue(definition):
 						definition.span
+					ExecuteJoin(join): join_parameter(join.result).span
 					AcquireOwner(_, _, occurrence):
 						occurrence
 					DropOwner(_, occurrence):

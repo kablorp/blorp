@@ -63,8 +63,6 @@ pure func value_reads(operation: ValueOperation) -> List[ValueId]:
 			elements
 		PayloadValue(_, value):
 			[value]
-		JoinValue(join):
-			join.reads
 		ParameterValue(_) | VoidValue | IntegerValue(_) | FloatValue(_) | StringValue(_):
 			[]
 
@@ -88,9 +86,6 @@ fixed union ValueOperation:
 	ConstructListValue(List[ValueId])
 	-- Selected member identity is retained for verification and C projection.
 	PayloadValue(VariantFieldInstanceId, ValueId)
-	-- A bound or statement match. The definition is the join's single
-	-- parameter: each arm that continues yields one value of its type.
-	JoinValue(LoweredJoin)
 
 
 fixed record ValueDefinition {
@@ -101,8 +96,20 @@ fixed record ValueDefinition {
 }
 
 
+fixed record ValueParameter {
+	id: ValueId,
+	value_type: TypeRef,
+	span: Span
+}
+
+
+fixed union LoweredStep:
+	Define(ValueDefinition)
+	Join(LoweredJoin)
+
+
 fixed record ValueBlock {
-	definitions: List[ValueDefinition],
+	steps: List[LoweredStep],
 	exit: LoweredExit
 }
 
@@ -134,8 +141,9 @@ fixed union LoweredExit:
 -- so a yield cannot end a function and a backedge cannot leave a join arm.
 fixed record JoinArm {
 	label: MatchLabel,
-	definitions: List[ValueDefinition],
-	value: ValueId
+	steps: List[LoweredStep],
+	value: ValueId,
+	carried: List[ValueId]
 }
 
 
@@ -146,6 +154,8 @@ fixed record JoinArm {
 -- so use analysis never walks its arms. A value may repeat: a repeated read
 -- rewrites the same last-use slot, so no deduplication is needed.
 fixed record LoweredJoin {
+	result: ValueParameter,
+	carried: List[ValueParameter],
 	scrutinee: ValueId,
 	owner: UnionInstanceId,
 	arms: List[JoinArm],
@@ -161,9 +171,54 @@ fixed union LoweredTail:
 fixed record LoweredFunction {
 	execution: FunctionExecution,
 	signature: FunctionSignature,
-	definitions: List[ValueDefinition],
+	steps: List[LoweredStep],
 	tail: LoweredTail
 }
+
+
+pure func step_reads(step: LoweredStep) -> List[ValueId]:
+	match step:
+		Define(definition): value_reads(definition.operation)
+		Join(join): join.reads
+
+
+pure func step_span(step: LoweredStep) -> Span:
+	match step:
+		Define(definition): definition.span
+		Join(join): join.result.span
+
+
+pure func step_value_count(step: LoweredStep) -> Int:
+	match step:
+		Define(_): 1
+		Join(join): IntOps.add(1, join.carried.length())
+
+
+pure func block_value_count(steps: List[LoweredStep]) -> Int:
+	var count = 0
+	for step in steps:
+		count = IntOps.add(count, step_value_count(step))
+	count
+
+
+-- Value ordinals index introductions, never execution steps. Resolve a local
+-- operand's span once at the block boundary, including every join output.
+pure func value_span(steps: List[LoweredStep], value: ValueId) -> Option[Span]:
+	var found: Option[Span] = None
+	for step in steps:
+		match step:
+			Define(definition):
+				if IntOps.equals(value_number(definition.id), value_number(value)):
+					found = Some(definition.span)
+			Join(join):
+				if IntOps.equals(value_number(join.result.id), value_number(value)):
+					found = Some(join.result.span)
+				for parameter in join.carried:
+					if IntOps.equals(value_number(parameter.id), value_number(value)):
+						found = Some(parameter.span)
+		if found.is_some():
+			break
+	found
 
 
 fixed record LoweredFunctions {
@@ -432,13 +487,13 @@ private fixed record BuiltExit {
 
 
 private fixed record BuiltMatch {
-	definitions: List[ValueDefinition],
+	steps: List[LoweredStep],
 	matched: LoweredMatch
 }
 
 
 private fixed record BuiltTail {
-	definitions: List[ValueDefinition],
+	steps: List[LoweredStep],
 	tail: LoweredTail
 }
 
@@ -625,7 +680,7 @@ private pure func arm_label(pattern: ConcretePattern) -> MatchLabel:
 -- them from `next_value`.
 private fixed record CompletedBlock {
 	next_value: Int,
-	definitions: List[ValueDefinition]
+	steps: List[LoweredStep]
 }
 
 
@@ -637,13 +692,13 @@ private pure func complete_joins(
 	bindings: List[ConcreteBinding],
 	unions: List[ConcreteUnion],
 ) -> Result[CompletedBlock, Diagnostic]:
-	var definitions: List[ValueDefinition] = []
+	var steps: List[LoweredStep] = []
 	var cursor = next_value
 	var failure: Option[Diagnostic] = None
 	for entry in entries:
 		match entry:
 			Defined(definition):
-				definitions = definitions.append(definition)
+				steps = steps.append(Define(definition))
 			AwaitingArms(join):
 				var arms: List[JoinArm] = []
 				var reads = [join.scrutinee]
@@ -658,15 +713,17 @@ private pure func complete_joins(
 							cursor = lowered.next_value
 				if failure.is_some():
 					break
-				definitions = definitions.append({
-					id = join.id,
-					operation = JoinValue({ scrutinee = join.scrutinee, owner = join.join.owner, arms = arms, reads = reads }),
-					value_type = join.value_type,
-					span = join.span,
-				})
+				steps = steps.append(Join({
+					result = { id = join.id, value_type = join.value_type, span = join.span },
+					carried = [],
+					scrutinee = join.scrutinee,
+					owner = join.join.owner,
+					arms = arms,
+					reads = reads,
+				}))
 	match failure:
 		Some(error): Err(error)
-		None: Ok({ next_value = cursor, definitions = definitions })
+		None: Ok({ next_value = cursor, steps = steps })
 
 
 -- An arm's block: its captures, statements and exit definitions, in order.
@@ -696,7 +753,7 @@ private pure func lower_arm(
 	Ok({
 		arm = {
 			label = arm_label(arm.pattern),
-			body = { definitions = completed.definitions, exit = result.exit },
+			body = { steps = completed.steps, exit = result.exit },
 		},
 		next_value = completed.next_value,
 	})
@@ -716,16 +773,16 @@ private pure func lower_join_arm(
 	completed ?= complete_joins(arm_block(captures, prefix, result.builder.entries), result.builder.next_value, bindings, unions)
 	-- The arm's own values are [initial_value, after); its joins' reads
 	-- already exclude their arms' values.
-	after = IntOps.add(initial_value, completed.definitions.length())
+	after = result.builder.next_value
 	var reads: List[ValueId] = []
-	for definition in completed.definitions:
-		for read in value_reads(definition.operation):
+	for step in completed.steps:
+		for read in step_reads(step):
 			if outside_arm(read, initial_value, after):
 				reads = reads.append(read)
 	if outside_arm(result.value, initial_value, after):
 		reads = reads.append(result.value)
 	Ok({
-		arm = { label = arm_label(arm.pattern), definitions = completed.definitions, value = result.value },
+		arm = { label = arm_label(arm.pattern), steps = completed.steps, value = result.value, carried = [] },
 		reads = reads,
 		next_value = completed.next_value,
 	})
@@ -763,7 +820,7 @@ private pure func lower_match(
 	match failure:
 		Some(error): Err(error)
 		None: Ok({
-			definitions = completed.definitions,
+			steps = completed.steps,
 			matched = { scrutinee = scrutinee.value, owner = matched.owner, arms = arms },
 		})
 
@@ -806,18 +863,18 @@ private pure func lower_function(
 					for entry in result.entries:
 						body_entries = body_entries.append(entry)
 					match complete_joins(body_entries, result.next_value, function.bindings, unions):
-						Ok(completed): Ok({ definitions = completed.definitions, tail = ExitValue(result.exit) })
+						Ok(completed): Ok({ steps = completed.steps, tail = ExitValue(result.exit) })
 						Err(error): Err(error)
 				Err(error): Err(error)
 		ConcreteMatchBody(matched):
 			match lower_match(block, matched, function.bindings, unions):
-				Ok(result): Ok({ definitions = result.definitions, tail = MatchValue(result.matched) })
+				Ok(result): Ok({ steps = result.steps, tail = MatchValue(result.matched) })
 				Err(error): Err(error)
 	body ?= body_result
 	Ok({
 		execution = function.execution,
 		signature = function.signature,
-		definitions = body.definitions,
+		steps = body.steps,
 		tail = body.tail,
 	})
 

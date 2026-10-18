@@ -488,12 +488,13 @@ cannot leave a join. An arm may not reassign a variable declared outside it
 yet; M2.1b, next, makes a join also carry each reassigned variable. Its reviewed
 [carried-bindings plan](CARRIED_BINDINGS_PLAN.md) defines structured multi-output
 steps, first as a behavior-preserving preparation. Preparation budgets are
-accepted and the early physical screen is measured. The unary preparation has
-been ported onto `0cdba16a4` and copied to a new finishing checkout from
-`e29a5396a`, including current-directory and file-read typed test seeds. The final
-base/corpus refresh follows the preceding source/library landings. Final compiled
-validation, reviews and the prospective fixed-B cost gates remain pending.
-Carried-binding feature acceptance and budgets remain unapproved. The
+accepted and the early physical screen is measured. The current unary port at
+accepted main `782824efb` includes the later concat/write-file typed consumers;
+its functional gates and 3,944 fixed-epoch cost calls pass. See the
+[preparation report](../benchmarks/results/blorp_2_unary_preparation_2026-10-18.md)
+for current evidence and the separate historical R0 limitation. The carried
+feature's approved budgets and
+implementation acceptance remain separate from the preparation. The
 checked form is `Match(CheckedJoin)` with value arms; the tail match keeps
 `CheckedMatchBody`. A match at a Void function's tail discards each arm's
 value, as a plain Void tail does. A self call at the tail of a nested match

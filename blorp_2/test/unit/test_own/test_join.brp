@@ -1,6 +1,9 @@
 import:
 	../../../src/lower/lower as Lower
 	../../../src/own/own as Own
+	../../../src/utils/source: compiler_source
+	../../../src/utils/syntax: Span, same_span
+	../managed_union_inputs: lowered
 	../join_inputs: MEASURE, NEST, PICK, function_text, join_function, owned
 	test: TestSuite
 
@@ -33,11 +36,65 @@ pure func test_unread_join_value_drops_after_the_join() -> Bool:
 	inserted_text(MEASURE) == "v0, v1=o0 {v3=o1; yield v3/o1 | v4=o2; yield v4/o2}, drop o0, v2; return v2"
 
 
+private ADMISSION_SPAN: Span = { source = compiler_source(), start = 20, end = 21 }
+
+
+private pure func insertion_rejected(
+	rewrite: pure (Lower.LoweredJoin) -> Lower.LoweredJoin,
+	message: String,
+) -> Bool:
+	match lowered(PICK):
+		Err(_): False
+		Ok(program):
+			contents = Lower.lowered_functions(program)
+			joined = contents.functions.find(pure func(function):
+				function.steps.any(pure func(step):
+					match step:
+						Lower.Join(_): True
+						_: False
+				)
+			)
+			match joined:
+				None: False
+				Some(function):
+					steps = function.steps.map(pure func(step):
+						match step:
+							Lower.Join(join): Lower.Join(rewrite({ join | result = { join.result | span = ADMISSION_SPAN } }))
+							_: step
+					)
+					match Own.insert_function({ function | steps = steps }, contents.unions, contents.records):
+						Ok(_): False
+						Err(error):
+							(
+								Own.insert_function(function, contents.unions, contents.records).is_ok()
+								and error.message == "internal compiler error: " + message
+								and error.help == "report this compiler error with the input program"
+								and error.note.is_none() and same_span(error.span, ADMISSION_SPAN)
+							)
+
+
+pure func test_raw_join_carried_outputs_are_rejected_before_publication() -> Bool:
+	rewrite = pure func(join: Lower.LoweredJoin) -> Lower.LoweredJoin:
+		match join.arms:
+			[first, _]: { join | carried = [{ join.result | id = first.value }] }
+			_: join
+	insertion_rejected(rewrite, "carried join outputs are not supported during unary preparation")
+
+
+pure func test_raw_join_carried_transfers_are_rejected_before_publication() -> Bool:
+	insertion_rejected(
+		pure func(join): { join | arms = join.arms.map(pure func(arm): { arm | carried = [arm.value] }) },
+		"carried join transfers are not supported during unary preparation",
+	)
+
+
 tests: TestSuite = {
 	description = "Ownership insertion for joins",
 	tests = [
 		("prefix owner read in an arm drops after the join", test_prefix_owner_read_in_an_arm_drops_after_the_join),
 		("nested join owners follow their enclosing arm", test_nested_join_owners_follow_their_enclosing_arm),
 		("unread join value drops after the join", test_unread_join_value_drops_after_the_join),
+		("raw join carried outputs are rejected before publication", test_raw_join_carried_outputs_are_rejected_before_publication),
+		("raw join carried transfers are rejected before publication", test_raw_join_carried_transfers_are_rejected_before_publication),
 	]
 }

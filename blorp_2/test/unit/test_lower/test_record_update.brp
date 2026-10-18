@@ -7,6 +7,7 @@ import:
 	../input: checked_source
 	int as IntOps
 	option: to_result
+	list: find
 	test: TestSuite
 
 
@@ -23,6 +24,17 @@ private pure func setup_error() -> Diagnostic:
 	{ span = { source = module_source(root_module_id()), start = 0, end = 0 }, note = None, message = "invalid record update lowering seed", help = "fix the test's normal main and returned record field" }
 
 
+private pure func ordinary_value(function: Lower.LoweredFunction, id: Lower.ValueId) -> Result[Lower.ValueDefinition, Diagnostic]:
+	found = function.steps.find(pure func(step):
+		match step:
+			Lower.Define(definition): Lower.value_number(definition.id) == Lower.value_number(id)
+			_: False
+	)
+	match found:
+		Some(Lower.Define(definition)): Ok(definition)
+		_: Err(setup_error())
+
+
 -- The real entrypoint's returned field identifies the callee under test.
 private pure func changed(source: String) -> Result[Lower.LoweredFunction, Diagnostic]:
 	checked ?= checked_source(source)
@@ -33,11 +45,11 @@ private pure func changed(source: String) -> Result[Lower.LoweredFunction, Diagn
 	result ?= match main.tail:
 		Lower.ExitValue(Lower.ReturnValue(value)): Ok(value)
 		_: Err(setup_error())
-	definition ?= main.definitions.get(Lower.value_number(result)).to_result(setup_error())
+	definition ?= ordinary_value(main, result)
 	parent ?= match definition.operation:
 		Lower.ReadRecordFieldValue(_, parent): Ok(parent)
 		_: Err(setup_error())
-	call ?= main.definitions.get(Lower.value_number(parent)).to_result(setup_error())
+	call ?= ordinary_value(main, parent)
 	match call.operation:
 		Lower.CallValue(call, _):
 			match call.target:
@@ -99,8 +111,8 @@ pure func test_base_call_and_rhs_order_precede_written_order_storage() -> Bool:
 	match changed(source):
 		Err(_): False
 		Ok(function):
-			match function.definitions:
-				[base, nine, second, seven, first, result]:
+			match function.steps:
+				[Lower.Define(base), Lower.Define(nine), Lower.Define(second), Lower.Define(seven), Lower.Define(first), Lower.Define(result)]:
 					base_once = match base.operation:
 						Lower.CallValue(_, []): True
 						_: False
@@ -136,8 +148,8 @@ pure func test_binding_alias_reuses_identity_and_inherited_projection() -> Bool:
 	match changed(source):
 		Err(_): False
 		Ok(function):
-			match function.definitions:
-				[parent, seven, replacement, projection, result]:
+			match function.steps:
+				[Lower.Define(parent), Lower.Define(seven), Lower.Define(replacement), Lower.Define(projection), Lower.Define(result)]:
 					parameter = match parent.operation:
 						Lower.ParameterValue(index): IntOps.equals(index, 0)
 						_: False
@@ -179,8 +191,8 @@ pure func test_postfix_base_is_evaluated_once_and_preserves_projection_span() ->
 	match changed(prefix.concat(base).concat(suffix)):
 		Err(_): False
 		Ok(function):
-			match function.definitions:
-				[call, selected, seven, replacement, inherited, result]:
+			match function.steps:
+				[Lower.Define(call), Lower.Define(selected), Lower.Define(seven), Lower.Define(replacement), Lower.Define(inherited), Lower.Define(result)]:
 					call_once = match call.operation:
 						Lower.CallValue(_, []): True
 						_: False
@@ -204,8 +216,8 @@ pure func test_nested_updates_use_the_completed_inner_record() -> Bool:
 	match changed(source):
 		Err(_): False
 		Ok(function):
-			match function.definitions:
-				[parent, seven, first, old_second, inner, nine, second, new_first, outer]:
+			match function.steps:
+				[Lower.Define(parent), Lower.Define(seven), Lower.Define(first), Lower.Define(old_second), Lower.Define(inner), Lower.Define(nine), Lower.Define(second), Lower.Define(new_first), Lower.Define(outer)]:
 					(literal(seven, 7) and argument_is(first, seven.id)
 					and projects(old_second, parent, 1, Concrete.IntType) and constructs(inner, 0, first.id, 1, old_second.id)
 					and literal(nine, 9) and argument_is(second, nine.id)
@@ -226,8 +238,8 @@ pure func test_replacing_a_field_with_itself_still_constructs_a_result() -> Bool
 	match changed(source):
 		Err(_): False
 		Ok(function):
-			match function.definitions:
-				[parent, replacement, inherited, result]:
+			match function.steps:
+				[Lower.Define(parent), Lower.Define(replacement), Lower.Define(inherited), Lower.Define(result)]:
 					(projects(replacement, parent, 0, Concrete.IntType) and projects(inherited, parent, 1, Concrete.IntType)
 					and constructs(result, 0, replacement.id, 1, inherited.id)
 					and not IntOps.equals(Lower.value_number(result.id), Lower.value_number(parent.id))
@@ -248,8 +260,8 @@ pure func test_storage_appends_written_replacements_then_inherited_fields() -> B
 	match changed(source):
 		Err(_): False
 		Ok(function):
-			match function.definitions:
-				[parent, nine, seven, second, result]:
+			match function.steps:
+				[Lower.Define(parent), Lower.Define(nine), Lower.Define(seven), Lower.Define(second), Lower.Define(result)]:
 					match result.operation:
 						Lower.ConstructRecordValue(_, [third_field, first_field, second_field]):
 							(literal(nine, 9) and literal(seven, 7) and projects(second, parent, 1, Concrete.IntType)
@@ -265,8 +277,8 @@ pure func test_storage_appends_written_replacements_then_inherited_fields() -> B
 
 
 private pure func update_arm(arm: Lower.LoweredArm, parent: Lower.ValueDefinition, start: Int, ordinal: Int, number: Int) -> Bool:
-	match arm.body.definitions:
-		[value, replacement, inherited, result]:
+	match arm.body.steps:
+		[Lower.Define(value), Lower.Define(replacement), Lower.Define(inherited), Lower.Define(result)]:
 			returned = match arm.body.exit:
 				Lower.ReturnValue(id): IntOps.equals(Lower.value_number(id), Lower.value_number(result.id))
 				_: False
@@ -296,8 +308,8 @@ pure func test_match_arms_keep_updates_local_and_value_ids_distinct() -> Bool:
 	match changed(source):
 		Err(_): False
 		Ok(function):
-			match function.definitions:
-				[flag, parent]:
+			match function.steps:
+				[Lower.Define(flag), Lower.Define(parent)]:
 					match function.tail:
 						Lower.MatchValue(matched):
 							match matched.arms:

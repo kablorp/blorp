@@ -2,7 +2,7 @@ import:
 	../../../src/lower/lower as Lower
 	../../../src/own/own as Own
 	../../../src/utils/source: compiler_source
-	../../../src/utils/syntax: Span
+	../../../src/utils/syntax: Span, same_span
 	../../../src/verify/verify: verify
 	../join_inputs: COUNT, MEASURE, NEST, PICK, map_join_arms, owned, with_operations
 	test: TestSuite
@@ -23,6 +23,204 @@ private pure func accepted(source: String) -> Bool:
 
 pure func test_inserted_joins_are_verified() -> Bool:
 	accepted(PICK) and accepted(NEST) and accepted(MEASURE)
+
+
+private RESULT_SPAN: Span = { SPAN | start = 20, end = 21 }
+
+
+private pure func rewrite_joins(
+	program: Own.OwnershipProgram,
+	rewrite: pure (Own.OwnedJoin) -> Own.OwnedJoin,
+) -> Own.OwnershipProgram:
+	with_operations(program, pure func(operations):
+		operations.map(pure func(operation):
+			match operation:
+				Own.ExecuteJoin(join): Own.ExecuteJoin(rewrite(join))
+				_: operation
+		)
+	)
+
+
+private pure func rejected_at(program: Own.OwnershipProgram, message: String, at: Span) -> Bool:
+	match verify(program):
+		Ok(_): False
+		Err(error):
+			(
+				error.message == "ownership verification failed: " + message
+				and error.help == "report this compiler error with the input program"
+				and error.note.is_none() and same_span(error.span, at)
+			)
+
+
+private pure func managed_parameter_rejected(source: String) -> Bool:
+	match owned(source):
+		Err(_): False
+		Ok(program):
+			changed = rewrite_joins(program, pure func(join):
+				parameter = { Own.join_parameter(join.result) | span = RESULT_SPAN }
+				{ join | result = Own.UnmanagedJoinParameter(parameter) }
+			)
+			verify(program).is_ok() and rejected_at(changed, "managed result requires an owner", RESULT_SPAN)
+
+
+pure func test_string_join_parameter_cannot_be_unmanaged() -> Bool:
+	source: String =
+		|fixed union Choice:
+		|	Yes
+		|	No
+		|pure func pick(choice: Choice) -> String:
+		|	label = match choice:
+		|		Yes: "fresh"
+		|		No: "other"
+		|	label
+		|func main() -> Int:
+		|	unused = pick(Yes)
+		|	0
+		|
+	managed_parameter_rejected(source)
+
+
+pure func test_list_join_parameter_cannot_be_unmanaged() -> Bool:
+	source: String =
+		|fixed union Choice:
+		|	Yes
+		|	No
+		|pure func pick(choice: Choice) -> List[String]:
+		|	label = match choice:
+		|		Yes: ["fresh"]
+		|		No: ["other"]
+		|	label
+		|func main() -> Int:
+		|	unused = pick(Yes)
+		|	0
+		|
+	managed_parameter_rejected(source)
+
+
+pure func test_managed_record_join_parameter_cannot_be_unmanaged() -> Bool:
+	source: String =
+		|fixed record TextBox { text: String }
+		|pure func box(text: String) -> TextBox:
+		|	{ text = text }
+		|
+		|fixed union Choice:
+		|	Yes
+		|	No
+		|pure func pick(choice: Choice) -> TextBox:
+		|	label = match choice:
+		|		Yes: box("fresh")
+		|		No: box("other")
+		|	label
+		|func main() -> Int:
+		|	unused = pick(Yes)
+		|	0
+		|
+	managed_parameter_rejected(source)
+
+
+pure func test_owning_union_join_parameter_cannot_be_unmanaged() -> Bool:
+	source: String =
+		|fixed union Parcel:
+		|	Packed(String)
+		|pure func pack(text: String) -> Parcel:
+		|	Packed(text)
+		|
+		|fixed union Choice:
+		|	Yes
+		|	No
+		|pure func pick(choice: Choice) -> Parcel:
+		|	label = match choice:
+		|		Yes: pack("fresh")
+		|		No: pack("other")
+		|	label
+		|func main() -> Int:
+		|	unused = pick(Yes)
+		|	0
+		|
+	managed_parameter_rejected(source)
+
+
+pure func test_primitive_join_parameter_cannot_be_managed() -> Bool:
+	match owned(COUNT):
+		Err(_): False
+		Ok(program):
+			changed = rewrite_joins(program, pure func(join):
+				parameter = { Own.join_parameter(join.result) | span = RESULT_SPAN }
+				{ join | result = Own.ManagedJoinParameter(parameter, Own.owner_id(0)) }
+			)
+			rejected_at(changed, "unmanaged value carries an ownership obligation", RESULT_SPAN)
+
+
+-- These raw mutations keep PICK's original unary producer as the accepted input.
+private pure func rejects_pick_join(
+	rewrite: pure (Own.OwnedJoin) -> Own.OwnedJoin,
+	message: String,
+) -> Bool:
+	match owned(PICK):
+		Err(_): False
+		Ok(program): rejected_at(rewrite_joins(program, rewrite), message, RESULT_SPAN)
+
+
+pure func test_join_result_cannot_repeat_a_prefix_value_identity() -> Bool:
+	rewrite = pure func(join: Own.OwnedJoin) -> Own.OwnedJoin:
+		match (join.result, join.arms):
+			(Own.ManagedJoinParameter(parameter, owner), [_, enclosing]):
+				{ join | result = Own.ManagedJoinParameter({ parameter | id = yielded(enclosing), span = RESULT_SPAN }, owner) }
+			_: join
+	rejects_pick_join(rewrite, "value identity is not the next function ordinal")
+
+
+pure func test_join_result_cannot_repeat_a_prefix_owner_identity() -> Bool:
+	rewrite = pure func(join: Own.OwnedJoin) -> Own.OwnedJoin:
+		parameter = { Own.join_parameter(join.result) | span = RESULT_SPAN }
+		{ join | result = Own.ManagedJoinParameter(parameter, Own.owner_id(0)) }
+	rejects_pick_join(rewrite, "owner 0 is defined more than once")
+
+
+pure func test_join_parameter_owner_must_be_the_next_ordinal() -> Bool:
+	rewrite = pure func(join: Own.OwnedJoin) -> Own.OwnedJoin:
+		parameter = { Own.join_parameter(join.result) | span = RESULT_SPAN }
+		{ join | result = Own.ManagedJoinParameter(parameter, Own.owner_id(2)) }
+	rejects_pick_join(rewrite, "owner identity is not the next function ordinal")
+
+
+pure func test_join_arm_cannot_read_a_new_output() -> Bool:
+	match owned(PICK):
+		Err(_): False
+		Ok(program):
+			changed = rewrite_joins(program, pure func(join):
+				value = Own.join_parameter(join.result).id
+				borrow: Own.BorrowedValue = { value = value, source = Own.OwnerBorrow(Own.owner_id(1)) }
+				arms = rewrite_arm(join.arms, 1, pure func(arm, _): { arm | operations = [Own.AcquireOwner(Own.owner_id(3), borrow, SPAN)] })
+				{ join | arms = arms }
+			)
+			rejected_at(changed, "value 2 is not defined before use", SPAN)
+
+
+pure func test_join_result_value_must_be_the_next_ordinal() -> Bool:
+	rewrite = pure func(join: Own.OwnedJoin) -> Own.OwnedJoin:
+		match (join.result, join.arms):
+			(Own.ManagedJoinParameter(parameter, owner), [fresh, _]):
+				{ join | result = Own.ManagedJoinParameter({ parameter | id = yielded(fresh), span = RESULT_SPAN }, owner) }
+			_: join
+	rejects_pick_join(rewrite, "value identity is not the next function ordinal")
+
+
+pure func test_raw_join_carried_outputs_are_rejected() -> Bool:
+	rewrite = pure func(join: Own.OwnedJoin) -> Own.OwnedJoin:
+		parameter = { Own.join_parameter(join.result) | span = RESULT_SPAN }
+		{ join | result = Own.ManagedJoinParameter(parameter, Own.owner_id(1)), carried = [join.result] }
+	rejects_pick_join(rewrite, "carried join outputs are not supported during unary preparation")
+
+
+pure func test_raw_join_carried_transfers_are_rejected() -> Bool:
+	rewrite = pure func(join: Own.OwnedJoin) -> Own.OwnedJoin:
+		parameter = { Own.join_parameter(join.result) | span = RESULT_SPAN }
+		{ join |
+			result = Own.ManagedJoinParameter(parameter, Own.owner_id(1)),
+			arms = join.arms.map(pure func(arm): { arm | carried = [arm.transfer] }),
+		}
+	rejects_pick_join(rewrite, "carried join transfers are not supported during unary preparation")
 
 
 -- PICK's join function with its arms rewritten, verified as raw IR.
@@ -152,19 +350,12 @@ pure func test_join_scrutinee_of_another_type_is_rejected() -> Bool:
 
 private pure func string_scrutinee(operation: Own.OwnershipOperation) -> Own.OwnershipOperation:
 	match operation:
-		Own.DefineValue(definition):
-			match definition.operation:
-				Own.JoinDefinition(join):
-					match join.arms.get(1):
-						Some(arm):
-							kept = yielded(arm)
-							Own.DefineValue({ definition | operation = Own.JoinDefinition({ join | scrutinee = Own.UnmanagedArgument(kept) }) })
-						None:
-							operation
-				_:
-					operation
-		_:
-			operation
+		Own.ExecuteJoin(join):
+			match join.arms.get(1):
+				Some(arm):
+					Own.ExecuteJoin({ join | scrutinee = Own.UnmanagedArgument(yielded(arm)) })
+				None: operation
+		_: operation
 
 
 -- PICK's `Yes` arm yields the Choice scrutinee, value 0, into a String join.
@@ -178,18 +369,13 @@ pure func test_yield_of_another_type_is_rejected() -> Bool:
 
 private pure func choice_yield(operation: Own.OwnershipOperation) -> Own.OwnershipOperation:
 	match operation:
-		Own.DefineValue(definition):
-			match definition.operation:
-				Own.JoinDefinition(join):
-					scrutinee = match join.scrutinee:
-						Own.UnmanagedArgument(value): value
-						Own.BorrowedArgument(borrow): borrow.value
-					arms = rewrite_arm(join.arms, 0, pure func(arm, _): { arm | transfer = Own.UnmanagedReturn(scrutinee) })
-					Own.DefineValue({ definition | operation = Own.JoinDefinition({ join | arms = arms }) })
-				_:
-					operation
-		_:
-			operation
+		Own.ExecuteJoin(join):
+			scrutinee = match join.scrutinee:
+				Own.UnmanagedArgument(value): value
+				Own.BorrowedArgument(borrow): borrow.value
+			arms = rewrite_arm(join.arms, 0, pure func(arm, _): { arm | transfer = Own.UnmanagedReturn(scrutinee) })
+			Own.ExecuteJoin({ join | arms = arms })
+		_: operation
 
 
 pure func test_unmanaged_yield_moving_an_owner_is_rejected() -> Bool:
@@ -220,10 +406,7 @@ private pure func join_arms(program: Own.OwnershipProgram) -> List[Own.OwnedJoin
 	for function in program.functions:
 		for operation in function.operations:
 			match operation:
-				Own.DefineValue(definition):
-					match definition.operation:
-						Own.JoinDefinition(join): arms = join.arms
-						_: void
+				Own.ExecuteJoin(join): arms = join.arms
 				_:
 					void
 	arms
@@ -294,6 +477,18 @@ tests: TestSuite = {
 	description = "Verification of join edges",
 	tests = [
 		("inserted joins are verified", test_inserted_joins_are_verified),
+		("String output cannot be unmanaged", test_string_join_parameter_cannot_be_unmanaged),
+		("List output cannot be unmanaged", test_list_join_parameter_cannot_be_unmanaged),
+		("managed record output cannot be unmanaged", test_managed_record_join_parameter_cannot_be_unmanaged),
+		("owning union output cannot be unmanaged", test_owning_union_join_parameter_cannot_be_unmanaged),
+		("primitive output cannot be managed", test_primitive_join_parameter_cannot_be_managed),
+		("join result cannot repeat a prefix value", test_join_result_cannot_repeat_a_prefix_value_identity),
+		("join result cannot repeat a prefix owner", test_join_result_cannot_repeat_a_prefix_owner_identity),
+		("join parameter owner must be next", test_join_parameter_owner_must_be_the_next_ordinal),
+		("join arm cannot read a new output", test_join_arm_cannot_read_a_new_output),
+		("join result value must be next", test_join_result_value_must_be_the_next_ordinal),
+		("raw join carried outputs are rejected", test_raw_join_carried_outputs_are_rejected),
+		("raw join carried transfers are rejected", test_raw_join_carried_transfers_are_rejected),
 		("yield of a prefix owner without acquisition is rejected", test_yield_of_a_prefix_owner_without_acquisition_is_rejected),
 		("managed yield without an owner is rejected", test_managed_yield_without_an_owner_is_rejected),
 		("arm owner leaked across a yield is rejected", test_arm_owner_leaked_across_a_yield_is_rejected),
