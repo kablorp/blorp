@@ -11,8 +11,88 @@ import:
 	list: find
 	../managed_union_inputs: BOX_INPUTS, BOX_SOURCE, lowered, lowered_modules
 	../module_input: INTEGER_OPERATIONS, ModuleInput, STRING_OPERATIONS
+	../../../src/load/load: load_program
+	../../../src/check/check: check
+	../input: setup_diagnostic
 	system: read_file
 	test: TestSuite
+
+
+private pure func helper_arm_acquires(arm: Own.OwnedArm, expected: Own.BorrowSource, construct: Bool) -> Bool:
+	acquisitions = arm.operations.filter(pure func(operation):
+		match operation:
+			Own.AcquireOwner(_, _, _): True
+			_: False
+	)
+	match (acquisitions, arm.exit):
+		([Own.AcquireOwner(child, borrow, _)], Own.ReturnResult(Own.OwnedReturn(returned, parent))):
+			source = match (expected, borrow.source):
+				(Own.ParameterBorrow(a), Own.ParameterBorrow(b)): same_value(a, b) and same_value(a, borrow.value)
+				(Own.PayloadBorrow(a), Own.PayloadBorrow(b)):
+					match arm.operations.get(0):
+						Some(Own.DefineValue(payload)):
+							match payload.operation:
+								Own.PayloadDefinition(_, parent_value): same_value(a, b) and same_value(a, parent_value) and same_value(payload.id, borrow.value)
+								_: False
+						_: False
+				_: False
+			definitions = match expected:
+				Own.PayloadBorrow(_): 1
+				_: 0
+			if construct:
+				match arm.operations.get(definitions + 1):
+					Some(Own.DefineValue(result)):
+						match (result.operation, result.result):
+							(Own.ConstructDefinition(_, [Own.OwnedPayload(value, transferred)]), Own.OwnedResult(owner)):
+								(
+									source and arm.operations.length() == definitions + 2
+									and same_value(value, borrow.value) and same_owner(child, transferred)
+									and same_value(returned, result.id) and same_owner(parent, owner)
+								)
+							_: False
+					_: False
+			else:
+				source and arm.operations.length() == definitions + 1 and same_value(returned, borrow.value) and same_owner(child, parent)
+		_: False
+
+
+func test_library_helpers_acquire_selected_values_and_leave_predicate_inputs_borrowed() -> Bool:
+	loaded = load_program("blorp_2/test/e2e/fixtures/generic/managed/option_result_helpers.brp", "blorp_2/standard_library").map_err(func(failure): failure.diagnostic.message)
+	owned = loaded.and_then(pure func(input): check(input.program).map_err(pure func(failure): setup_diagnostic(failure).message))
+		.and_then(pure func(input): Concrete.specialize(input).map_err(pure func(error): error.message))
+		.and_then(pure func(input): Lower.lower(input).map_err(pure func(error): error.message))
+		.and_then(pure func(input): Own.own(input).map_err(pure func(error): error.message))
+	match owned:
+		Err(error):
+			print_error(error)
+			False
+		Ok(program):
+			var selected = 0
+			var predicates = 0
+			var passed = True
+			for function in program.functions:
+				match (function.signature.parameters, function.signature.return_type, function.operations, function.tail):
+					([Concrete.UnionType(_), Concrete.StringType], _, [Own.DefineValue(optional), Own.DefineValue(default)], Own.MatchTail(matched)):
+						selected = selected + 1
+						construct = match function.signature.return_type:
+							Concrete.UnionType(_): True
+							_: False
+						arms = match matched.arms:
+							[some, none]: helper_arm_acquires(some, Own.PayloadBorrow(optional.id), construct) and helper_arm_acquires(none, Own.ParameterBorrow(default.id), construct)
+							_: False
+						passed = passed and parameter_scrutinee(matched.scrutinee, optional.id) and arms
+					([Concrete.UnionType(_)], Concrete.UnionType(_), [Own.DefineValue(parameter)], Own.MatchTail(matched)):
+						predicates = predicates + 1
+						passed = passed and parameter_scrutinee(matched.scrutinee, parameter.id) and matched.arms.length() == 2 and matched.arms.all(pure func(arm):
+							match (arm.operations, arm.exit):
+								([Own.DefineValue(value)], Own.ReturnResult(Own.UnmanagedReturn(returned))):
+									match (value.operation, value.result):
+										(Own.ConstructDefinition(_, []), Own.UnmanagedResult): same_value(value.id, returned)
+										_: False
+								_: False
+						)
+					_: void
+			passed and selected == 2 and predicates == 3
 
 
 private FRESH_SOURCE: String =
@@ -750,6 +830,7 @@ func test_unused_constructor_retires_original_and_parent_obligations() -> Bool:
 tests: TestSuite = {
 	description = "Blorp 2 managed union ownership insertion",
 	tests = [
+		("library helpers acquire selected values and keep predicates borrowed", test_library_helpers_acquire_selected_values_and_leave_predicate_inputs_borrowed),
 		(
 			"borrowed child acquisition transfers into the inline owner",
 			test_borrowed_child_acquisition_is_transferred_to_the_inline_owner,

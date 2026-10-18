@@ -765,9 +765,9 @@ temporary-library wrapper over accepted formatting and concat; implementation
 remains pending.
 
 The current [Option/Result catalog and addition plan](OPTION_RESULT_PLAN.md)
-records nine APIs at 212 compiler sites: five ordinary helpers first, pure
-callable semantics with managed captures, then four callback helpers and explicit
-source imports. The prelude stays unchanged. Implementation remains pending;
+records nine APIs at 212 compiler sites. The five ordinary helpers are
+implemented; pure callable semantics with managed captures, four callback helpers
+and explicit compiler-source imports remain pending. The prelude stays unchanged;
 the held [five-helper proposal](OPTION_RESULT_HELPERS_PLAN.md) is its predecessor.
 
 The [loader/shell integration draft](LOADER_SHELL_INTEGRATION_PLAN.md) maps actual

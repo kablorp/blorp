@@ -63,10 +63,14 @@ The base module provides the ordinary generic Result union with Ok/Err for
 pure calculator parsing and evaluation; it has no compiler-specific behavior.
 
 Bool, Option and Result are ordinary fixed unions owned by `_base.brp`; user
-modules receive their types and constructors through the prelude. Separate Bool,
-Option and Result operation modules are not implemented yet. The
-[resolved catalog and addition plan](../OPTION_RESULT_PLAN.md) covers the nine
-helpers used by the compiler, including four that require callable semantics. The String adapter
+modules receive their types and constructors through the prelude. A separate
+Bool operation module remains deferred. Option and Result operations use explicit
+named imports. `option.brp` provides
+`is_some`, `is_none`, eager `get_or` and eager `to_result`; `result.brp` provides
+`is_ok`. They are ordinary generic pure functions over the existing base unions;
+managed results remain independently owned. The prelude supplies no operations
+from these two modules. The [resolved catalog and addition plan](../OPTION_RESULT_PLAN.md)
+tracks four remaining helpers that require callable semantics. The String adapter
 exposes strict counted-byte `parse_int`, `parse_float` and `equals` operations.
 Their builtin bodies name only the operation; results refer to the
 foundation's designated Bool and Option, found by name in `_base.brp`, and

@@ -1,15 +1,70 @@
 import:
 	../../../src/utils/names: program_names
 	../../../src/check/model as Model
-	../../../src/utils/source: module_source, root_module_id
+	../../../src/utils/source: module_source, root_module_id, same_module
+	../../../src/utils/ids: inventory_functions, function_number
+	../../../src/load/load: load_program
+	../../../src/parse/assemble: parsed_contents
 	../../../src/check/check: CheckedProgram, check, checked_functions
 	../../../src/check/errors as Errors
 	../../../src/lex/lex: lex
-	../../../src/utils/syntax: Diagnostic
+	../../../src/utils/syntax: Diagnostic, entry_function, Purity(Pure), same_purity
 	../compilation: compile, compile_modules
 	../input: check_failure, parse, setup_diagnostic, check_modules_failure
 	../module_input: PRIMITIVE_BASE, INTEGER_OPERATIONS, STRING_OPERATIONS, ModuleInput
 	test: TestSuite
+
+
+func test_library_helpers_preserve_foundation_owners_and_function_rigidity() -> Bool:
+	match load_program("blorp_2/test/e2e/fixtures/generic/managed/option_result_helpers.brp", "blorp_2/standard_library"):
+		Err(_): False
+		Ok(loaded):
+			parsed = parsed_contents(loaded.program)
+			match (parsed.modules.get(0), check(loaded.program)):
+				(Some(root), Ok(checked)):
+					match (root.imports, checked_functions(checked).unions):
+						([_, _, optional, result], [boolean, option_owner, result_owner]):
+							ids = inventory_functions(parsed.declarations).filter(pure func(row):
+								same_module(row.declaration.module, optional.target) or same_module(row.declaration.module, result.target)
+							)
+							functions = checked_functions(checked).functions
+							match ids.map(pure func(row): functions.get(function_number(row.id))):
+								[Some(some), Some(none), Some(unwrap), Some(convert), Some(ok)]:
+									match (unwrap.signature.type_parameters, convert.signature.type_parameters, unwrap.signature.parameters, convert.signature.parameters):
+										([t], [value, error], [optional_value, default], [converted_value, failure]):
+											match (Model.parameter_owner(t), Model.parameter_owner(value), Model.parameter_owner(error)):
+												(Model.FunctionDeclaration(a), Model.FunctionDeclaration(b), Model.FunctionDeclaration(c)):
+													(
+														function_number(a) == function_number(unwrap.id)
+														and function_number(b) == function_number(convert.id) and function_number(c) == function_number(convert.id)
+														and not Model.same_parameter(value, error)
+														and Model.same_type(optional_value.value_type, Model.AppliedUnionType(option_owner.id, [Model.ParameterType(t)]))
+														and Model.same_type(default.value_type, Model.ParameterType(t))
+														and Model.same_type(unwrap.signature.return_type.value_type, Model.ParameterType(t))
+														and Model.same_type(converted_value.value_type, Model.AppliedUnionType(option_owner.id, [Model.ParameterType(value)]))
+														and Model.same_type(failure.value_type, Model.ParameterType(error))
+														and Model.same_type(convert.signature.return_type.value_type, Model.AppliedUnionType(result_owner.id, [Model.ParameterType(value), Model.ParameterType(error)]))
+														and [some, none, ok].all(pure func(f): Model.same_type(f.signature.return_type.value_type, Model.UnionType(boolean.id)))
+													and [some, none, unwrap, convert, ok].all(pure func(f): same_purity(f.signature.purity, Pure))
+														and functions.get(function_number(entry_function(checked_functions(checked).entrypoint))).map(pure func(main):
+															[unwrap, ok].all(pure func(target):
+																expected = if function_number(target.id) == function_number(unwrap.id):
+																	5
+																else:
+																	2
+																Model.function_calls(main).filter(pure func(call):
+																	match call.target:
+																		Model.UserFunction(id, _): function_number(id) == function_number(target.id)
+																		_: False
+																).length() == expected
+															)
+														).get_or(False)
+													)
+												_: False
+										_: False
+								_: False
+						_: False
+				_: False
 
 
 private IDENTITY: String =
@@ -512,6 +567,7 @@ pure func test_generic_runtime_module_rejects() -> Bool:
 tests: TestSuite = {
 	description = "Blorp 2 generic functions",
 	tests = [
+		("library helpers preserve foundation owners and function rigidity", test_library_helpers_preserve_foundation_owners_and_function_rigidity),
 		("ufcs payload constructor without context still rejects", test_ufcs_payload_constructor_without_context_still_rejects),
 		("direct payload constructor without context still rejects", test_direct_payload_constructor_without_context_still_rejects),
 		("ufcs nullary constructor without context still rejects", test_ufcs_nullary_constructor_without_context_still_rejects),

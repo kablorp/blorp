@@ -36,7 +36,9 @@ function imports enable direct calls and UFCS. `Option(Some, None)` selects a
 fixed union and explicit constructors, while `Option()` selects its type alone.
 `Foo methods_only` enables receiver functions for an independently visible,
 exact Foo type without importing that type or its constructors. The foundation's
-ordinary Bool, Option and Result types and constructors are implicit. User
+ordinary Bool, Option and Result types and constructors are implicit. Named
+`option: is_some, is_none, get_or, to_result` and `result: is_ok` imports use the
+same function-import syntax and enable both direct calls and UFCS. User
 modules also receive the ordinary prelude's selected methods; library operation
 modules receive the base alone. Explicit and implicit exposures of the same
 function are idempotent; different applicable functions remain ambiguous.

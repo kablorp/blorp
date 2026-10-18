@@ -36,7 +36,10 @@ owned result, and Void main exits 0. Pure functions follow the same return
 conventions, including concrete generic instances; calls to impure functions
 remain forbidden. Selective union imports
 preserve ordinary nominal type and constructor identities. Base already supplies
-Bool, Option, Result and their constructors in every module. Concrete
+Bool, Option, Result and their constructors in every module. Named `option`
+imports provide generic pure `is_some`, `is_none`, `get_or` and `to_result`;
+`result: is_ok` provides the Result predicate. Defaults and error arguments are
+evaluated eagerly; selected managed payloads remain independently owned. Concrete
 `string.parse_int` consumes complete ASCII
 decimal input within Int64 bounds. Concrete `list.get` returns an owned
 Option[String], retaining a successful child independently of its list, and

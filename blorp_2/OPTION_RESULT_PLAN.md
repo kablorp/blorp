@@ -5,13 +5,18 @@
 The target library is `blorp_2/standard_library/`, separate from the host
 `standard_library/src/`. Its `_base.brp` already owns Bool, Option, Result and
 their constructors. The operation modules `option.brp` and `result.brp` are
-absent. This change renames the directory and records the inventory and plan;
-it implements no helpers or callable semantics.
+implemented for the five ordinary helpers: Option `is_some`, `is_none`,
+`get_or`, `to_result` and Result `is_ok`. The four callback helpers still need
+callable semantics. The directory rename and resolved inventory are already on main.
 
 At base `1f3f407198efa55703ba8dea7a4be1c5239cfc89`, an actual self-compile
 stops loading `result: map_err` in `src/main.brp:10`. All 41 compiler source
 files parse. Pure function-type annotations parse, but checking rejects
-function types and lambdas. Pure functions may return Void.
+function types and lambdas. Pure functions may return Void. After the five
+ordinary helpers are added, the actual source probe reaches
+`src/check/check.brp:20:13`: `opaque types are not supported yet`, with no C
+produced. That existing independent language requirement remains outside this
+library slice.
 
 The owner abandoned the remaining HOF-removal migration. Preserve existing
 compiler callbacks and their phase boundaries. The older
@@ -96,6 +101,9 @@ separate trait dependency; self-hosting TestSuite remains deferred.
 ## Addition sequence
 
 ### 1. Add the five helpers that need no callbacks
+
+**Implemented.** Typed phase tests and the ordinary native witness cover this
+subset; the frozen acceptance epoch below owns its cost boundary.
 
 Add `option.is_some`, `is_none`, `get_or`, `to_result` and `result.is_ok` as
 ordinary generic Blorp functions with tail matches. Reconcile the held
@@ -208,6 +216,36 @@ reviewed ceilings; never fabricate a successful baseline for a new input.
 Keep old failures/held evidence historical. A repeatable breach stops the
 slice for diagnosis/rescoping; do not widen a gate or add counter-specific code.
 
-No helper implementation or SOURCE-removal campaign is authorized by this
-catalog/planning change. Obtain two independent reviews and test-runner
-acceptance for every future increment before integration.
+Implementation was authorized after this catalog landed. No remaining
+SOURCE-removal campaign is planned. Obtain two independent reviews and
+test-runner acceptance for every increment before integration.
+
+### Ordinary-helper implementation epoch
+
+Freeze B at `6eb6886c76a4e6cc0427defe690b6ebb288bb9b6` before setup. This
+slice adds only the five ordinary helpers and their tests; compiler source,
+foundation and prelude remain unchanged. Prospective physical bounds are
+50 added production lines, 300 added test lines and 60 lines for the fixture.
+Retain existing coverage when reconciling the held candidate.
+
+The new real-main witness uses the current generic suite limits: 150,000
+compile allocations and 600,000,000 strict diagnostic-mode instructions.
+Normal diagnostic-free minimum-of-three instructions must also stay within
+600,000,000. Its missing-module B rejection is retained; it has no successful
+B denominator. Compare `return/zero.brp`, `generic/managed/basic.brp`,
+`option_input/parse_int.brp` and `conversion/integer.brp` under the B and candidate
+library roots: byte-identical C, balanced strict counts, and independent +3%
+allocation/normal-minimum-of-three instruction ceilings, plus existing limits.
+
+The source-matched retained C (`ddb3454d…`) and diagnostic pilot (`7b2f277d…`)
+come from the rename acceptance packet. Link one normal `-O0` diagnostic-free
+pilot from those same C bytes for instruction samples. The 41 compiler source,
+nine B library, host/library and tool pins must remain stable. This measures
+target input compilation; it makes no target self-compilation cost claim.
+The [epoch packet](../build/bootstrap-evidence/option-result-ordinary-2026-10-18/)
+retains full identities, raw observations, effective faults and restoration.
+A repeatable breach stops the slice for diagnosis/rescoping.
+
+The [ordinary-helper acceptance report](../benchmarks/results/blorp_2_option_result_ordinary_2026-10-18.md)
+records passing matched costs, phase/native gates, effective restored faults
+and the actual source frontier.

@@ -11,7 +11,93 @@ import:
 	int as IntOps
 	../input: check_failure, parse, setup_diagnostic
 	../module_input: PRIMITIVE_BASE, STRING_OPERATIONS
+	../../../src/load/load: load_program
+	fs: temporary_directory, resource_path, message
+	system: temp_dir, write_file
 	test: TestSuite
+
+
+private pure func same_variant_fields(actual: List[List[Concrete.TypeRef]], expected: List[List[Concrete.TypeRef]]) -> Bool:
+	var matches = actual.length() == expected.length()
+	for (left, right) in actual.zip(expected):
+		matches = matches and left.length() == right.length()
+		for (a, b) in left.zip(right):
+			matches = matches and Concrete.same_type(a, b)
+	matches
+
+
+private func helper_instances() -> Result[Bool, String]:
+	with directory ?= temporary_directory(temp_dir(), "blorp-2-option-instances-") on error => message(error):
+		source: String =
+			|import:
+			|    option: get_or, to_result
+			|    result: is_ok
+			|func main() -> Int:
+			|    integer = get_or(Some(7), 0)
+			|    text = get_or(Some("text"), "default")
+			|    mixed = to_result(Some("mixed"), 0)
+			|    unit = to_result(Some(void), "unit-error")
+			|    unit_ok = is_ok(unit)
+			|    integer
+			|
+		path = directory.resource_path() + "/main.brp"
+		written ?= write_file(path, source)
+		loaded ?= load_program(path, "blorp_2/standard_library").map_err(func(failure): failure.diagnostic.message)
+		checked ?= check(loaded.program).map_err(pure func(failure): setup_diagnostic(failure).message)
+		concrete ?= Concrete.specialize(checked).map_err(pure func(error): error.message)
+		rows = Concrete.specialized_contents(concrete)
+		var integer = False
+		var text = False
+		var mixed = False
+		var unit = False
+		var unit_predicate = False
+		for function in rows.functions:
+			match (function.signature.parameters, function.signature.return_type):
+				([Concrete.UnionType(owner), Concrete.IntType], Concrete.IntType):
+					integer = rows.unions.get(Concrete.union_number(owner))
+						.map(pure func(row): same_variant_fields(row.variants, [[Concrete.IntType], []])).get_or(False)
+				([Concrete.UnionType(owner), Concrete.StringType], Concrete.StringType):
+					text = rows.unions.get(Concrete.union_number(owner))
+						.map(pure func(row): same_variant_fields(row.variants, [[Concrete.StringType], []])).get_or(False)
+				([Concrete.UnionType(option), _], Concrete.UnionType(result)):
+					match function.body:
+						Concrete.ConcreteMatchBody(matched):
+							owners = Concrete.union_number(matched.owner) == Concrete.union_number(option) and matched.arms.all(pure func(arm):
+								match (arm.pattern, arm.body):
+									(Concrete.VariantCase(pattern, _), Concrete.ReturnExpression(value)):
+										match value.form:
+											Concrete.ConstructVariant(constructor, [child]):
+												(
+													Concrete.union_number(Concrete.variant_owner(pattern)) == Concrete.union_number(option)
+													and Concrete.union_number(Concrete.variant_owner(constructor)) == Concrete.union_number(result)
+													and rows.unions.get(Concrete.union_number(result))
+														.and_then(pure func(row): row.variants.get(Concrete.variant_number(constructor)))
+														.map(pure func(fields): same_variant_fields([fields], [[child.value_type]])).get_or(False)
+												)
+											_: False
+									_: False
+							)
+							match rows.unions.get(Concrete.union_number(result)):
+								Some(row):
+									mixed = mixed or (owners and same_variant_fields(row.variants, [[Concrete.StringType], [Concrete.IntType]]))
+									unit = unit or (owners and same_variant_fields(row.variants, [[Concrete.VoidType], [Concrete.StringType]]))
+								None: void
+						_: void
+				([Concrete.UnionType(result)], Concrete.UnionType(boolean)):
+					unit_predicate = match (rows.unions.get(Concrete.union_number(result)), rows.unions.get(Concrete.union_number(boolean))):
+						(Some(input), Some(output)):
+							same_variant_fields(input.variants, [[Concrete.VoidType], [Concrete.StringType]]) and same_variant_fields(output.variants, [[], []])
+						_: False
+				_: void
+		Ok(integer and text and mixed and unit and unit_predicate)
+
+
+func test_library_helpers_specialize_payloads_and_constructor_owners() -> Bool:
+	match helper_instances():
+		Ok(passed): passed
+		Err(error):
+			print_error(error)
+			False
 
 
 private pure func checked(source: String) -> Result[CheckedProgram, Diagnostic]:
@@ -602,6 +688,7 @@ pure func test_box_instance_translates_constructor_pattern_and_binding_types() -
 tests: TestSuite = {
 	description = "Blorp 2 generic unions",
 	tests = [
+		("library helpers specialize payloads and constructor owners", test_library_helpers_specialize_payloads_and_constructor_owners),
 		(
 			"pattern payload uses the function owned rigid parameter",
 			test_pattern_payload_uses_the_function_owned_rigid_parameter,

@@ -11,6 +11,9 @@ type/method visibility and a shared base/prelude for the target
 Its syntax and layout are implemented in this pilot. The
 [Option/Result catalog and addition plan](OPTION_RESULT_PLAN.md) records current
 compiler demand and separates ordinary helpers from callable prerequisites.
+The target library provides generic pure Option `is_some`, `is_none`, `get_or`,
+`to_result` and Result `is_ok` through explicit named imports. Default/error
+arguments are eager, and returned managed payloads remain independently owned.
 
 Current language examples and limits are below; [grammar.ebnf](grammar.ebnf)
 owns the formal syntax. The [roadmap](ROADMAP.md) owns planned increments,

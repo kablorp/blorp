@@ -13,7 +13,9 @@ at `ba57e368a` (2026-10-15), not the final interface inventory. The
 govern the independent Char/source work. The owner stopped the remaining
 callback-removal migration. The current [Option/Result catalog](OPTION_RESULT_PLAN.md)
 supersedes those rows/counts: nine pure APIs at 212 resolved compiler sites,
-including four callback helpers. Their callable prerequisites remain required.
+including four callback helpers. The five ordinary helpers are implemented
+in the target library; the four callback helpers and callable prerequisites
+remain pending.
 The remaining table is historical evidence; refresh other interfaces at their
 own implementation boundary rather than treating planned removals as complete.
 
