@@ -161,3 +161,7 @@ as proxies and say what they omit.
 Code-reviewer and test-runner review apply to every change. A docs-only
 change needs link and path checks and `git diff --check`, not a compiled
 gate.
+
+Archiving a chat can also archive its managed worktrees. Git snapshots exclude
+ignored build evidence. Before archiving, preserve and verify every artifact
+still borrowed by another task in the main checkout's ignored evidence directory.

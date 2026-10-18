@@ -194,3 +194,23 @@ The frozen b677 input patch is retained separately from the final landing patch.
 Code/corpus/protocol bytes remain those measured;
 final report review, integration onto current main and publication are
 coordinator-owned.
+
+## Evidence availability after publication
+
+After publication as `7acd6df25`, archiving the completed chat also archived its
+managed worktrees and removed ignored build files. Managed restoration recovered
+the exact committed source at `0274df53fc6fa9a02a0e5915aff4c247c0199cb0`, but did
+not recover `cost-01/`, its 3,976-call raw dataset and pilot artifacts, or the
+functional-first outputs. The retention statements above describe collection
+time; those raw artifacts are now unavailable. The recorded observations and
+criteria remain historical results, not newly reproduced measurements.
+
+The committed report and the actual destination's 274 passing checks survive;
+their streams remain in the main checkout's `build/blorp2-carried-landing-01/`.
+The original 598-member input manifest was recovered from the separately retained
+unary evidence with its exact recorded SHA256
+`bea8dc2fc442fcbeff9c3935de3935cde2237588c08bb7de6920f3850b8a85c2`;
+all 598 existing inputs were verified again. This recovers input provenance,
+not the lost observations. Future validation must retain new results under an
+explicitly reviewed setup; no missing measurement is reconstructed or relabeled
+as historical evidence, and no cost ceiling or SOURCE policy changes here.
