@@ -9,8 +9,8 @@ still waits for reviewed probes and successful RED execution under a lease.
 
 The reviewed draft below is retained, including its original pending-review
 status, except for the root-suggested and peer-approved purely unsigned
-subtraction-mutant clarification. Its fresh ceilings and all SOURCE/cost-policy
-limits remain unchanged. [Blorp 2 rules](AGENTS.md), the
+subtraction-mutant clarification and the prospective test-only amendment below.
+All other ceilings and SOURCE/cost-policy limits remain unchanged. [Blorp 2 rules](AGENTS.md), the
 [source plan](BOOTSTRAP_SOURCE_PLAN.md) and [development rules](../AGENTS.md)
 govern this work.
 
@@ -223,9 +223,26 @@ they are not borrowed SOURCE pilot allowances:
 | Category | Forecast | Proposed gross / net hard ceiling |
 | --- | ---: | ---: |
 | Production, including ordinary wrappers and necessary helper naming | 35–60 added, +20–35 net | 75 / +45 |
-| Nonfixture tests across phase owners and e2e registration | 300–440 added | 500 / +500 |
+| Nonfixture tests across phase owners and e2e registration | Prospective 501 added / +498 net | 510 / +500 |
 | One ordinary language fixture | 30–42 lines | 1 file / 48 lines |
 | Public documentation, excluding this plan and final evidence report | 20–35 added | 45 / +45 |
+
+**Prospective test-only amendment, 2026-10-18; root and independent review approved.**
+Root reproduced the separate 20-line imported-global TestSuite crash once:
+CLI status 1, harness status 139, empty stderr and no callback report. Retained
+evidence is in ROOT `build/bootstrap-evidence/int-imported-global-probe-2026-10-18/`.
+The witness source has no target compiler, Result, Option or generic declarations.
+This remains an unresolved host defect, not a fixed bug or Int acceptance result.
+
+Replace only the original specialization registry's two inline lambdas with two
+ordinary named callbacks, each containing its exact existing `retains_bool_roles`
+call. Preserve descriptions, callback count, arguments, helper and all assertions.
+The readable wrappers add eight lines: current nonfixture tests 493 added / 3
+deleted / +490 net would become 501 / 3 / +498. The proposed gross ceiling rises
+from 500 to 510, leaving nine lines of readability margin; the +500 net ceiling
+stays unchanged. Production 75/+45, one fixture/48 lines and every cost ceiling
+stay unchanged. Root and independent review precede actual wrapper writes;
+no coverage deletion, formatting compression or host-fix claim follows.
 
 Count physical readable lines, including imports/comments/blanks; report
 production, tests and fixture changes separately. No formatting compression,
