@@ -181,16 +181,19 @@ overhead; they are derived schedule counts, NOT measured total allocations.
 | 64 | 768 | 957 | 6,432 | 5,664 |
 | 128 | 1,792 | 2,173 | 25,280 | 23,488 |
 
-Measure N=16/32/64/128 through public `emit(VerifiedProgram)`, preparing each
-normal parsed/checked/specialized/lowered/owned/verified product outside the
-interval. No private hook. Use N distinct Int-only records with parameterized
-makers: call all makers in ascending order, then construct their singleton
-Lists in descending order and sum their lengths in real main (result N).
-Check published concrete IDs and main's definition types so this really supplies
-N descending distinct depth-zero rows; do not assume source spelling establishes
-ordinal order. Include small odd-sized cases for unbalanced halves. These are
-host-compiled public emitter measurements, including inventory/dedupe/emission;
-host append behavior can differ from target fresh-copy behavior.
+Characterize constructed List widths N=16/32/64/128 through public
+`emit(VerifiedProgram)`, preparing each normal parsed/checked/specialized/lowered/
+owned/verified product first. Use D Int-only record types and parameterized
+makers: prepare their values ascending, then construct N singleton Lists in
+descending cycles. D=N for distinct constructions and D=N/2 for repeated ones.
+The generic length wrapper contributes D genuine List parameter definitions.
+Published ownership facts must observe N constructions and D parameters, giving
+actual raw requests M=N+D and D semantic distinct keys. No private hook, source
+spelling inference or parameter omission is permitted. Native main still returns
+N and checks the unchanged checksum. The analytic table above uses raw input N,
+not constructed width; do not substitute constructed N for M or apply its
+power-of-two formula to non-power-of-two M. Host-compiled public emission includes
+inventory/dedupe/output, and host append can differ from target fresh-copy behavior.
 
 Use one bounded native runtime-helper measurement callback in the existing
 `test/runtime/test_generic_list.brp`, under the [authorized direct-C runtime-helper
@@ -251,18 +254,21 @@ registry closing line, not coverage. Expected combined scope is therefore
 **340 gross added/+337 net tests**. Retain all existing 189 added test lines and
 their controls. Do not move validation into an uncounted driver or benchmark.
 
-The additional readable setup and oracles are necessary to prove the sorter
-consumes real phase inventories at raw sizes 16/32/64/128. Each size has a
-distinct-key case and an interleaved repeated-key case: eight granular callbacks.
-Published typed IDs and ownership definitions establish exactly N raw rows before
-public `emit`; each row comes from a singleton List containing a typed Record
-value returned by a maker. No forged product, private sorter hook or synthetic C
-is introduced. Check typed declaration order and one definition per key, then
-compile unchanged emitted C with the existing default-toolchain native harness
-and run the source program's normal main with exact exit/stdout oracles.
+The additional readable setup and oracles use constructed List widths
+16/32/64/128, each with distinct and repeated construction modes: eight granular
+callbacks. The first draft incorrectly called those widths raw sorter sizes;
+the prospective producer-witness correction below supersedes that claim before
+execution. Published typed IDs distinguish singleton List constructions containing
+Record values returned by makers from legitimate wrapper parameter definitions.
+The complete unmodified program reaches public `emit`, including both kinds.
+No forged product, private hook or synthetic C is introduced. Check typed
+declaration order and one definition per key, then compile unchanged emitted C
+with the existing default-toolchain harness and run normal main with exact
+exit/stdout oracles.
 
-Temporarily bypassing the sort call must fail the N-row ordering callbacks;
-bypassing adjacent dedupe must fail the repeated-key callbacks. Require successful
+Temporarily bypassing the sort call must fail all eight layout callbacks;
+bypassing adjacent dedupe must also fail all eight, since wrapper parameters add
+duplicate keys even in the distinct-construction family. Require successful
 test builds, named failures, exact restoration and green reruns. Equal-key-origin
 stability remains covered by the reviewed structural proof, with no false dynamic
 mutation claim. Existing depth/rank, nominal, ownership and native copy controls
@@ -273,6 +279,45 @@ SOURCE failure, grant a cost-policy exception, reset a denominator or authorize
 further acceptance costs. Any unary consumer port and subsequent source/metric
 epoch require separate review. Preserve historical R0/B/C inputs, roles, raw
 observations and verdicts unchanged; do not mix them with a later base.
+
+## Prospective wrapper-parameter witness correction
+
+Independent producer tracing found a pre-execution test-oracle/accounting bug in
+port draft `bd411353`: it accepted List definitions only as constructions, while
+the generic length wrapper has legitimate List parameters. Specialization retains
+those wrappers, ownership publishes `ParameterDefinition`, and production
+`program_inventory` includes every definition's type. This is not a compiler RED;
+no execution or passing result exists for the erroneous N-row observer.
+
+Retain the original draft and review finding. Correct only the test observer and
+labels: separately recognize singleton Record List constructions and Record List
+parameters, require the observed construction count N and parameter count D,
+and reject every other List operation. Do not recheck parameter indices, arity
+or general type validity already guaranteed by `VerifiedProgram`. Constructor
+ordinal/semantic identity checks and the native source/checksum remain unchanged.
+The observer does not filter or rebuild the program sent to public `emit`.
+
+| Constructed Lists N | Distinct-mode raw requests (D=N) | Repeated-mode raw requests (D=N/2) |
+| ---: | ---: | ---: |
+| 16 | 32 | 24 |
+| 32 | 64 | 48 |
+| 64 | 128 | 96 |
+| 128 | 256 | 192 |
+
+There are D semantic distinct keys in both families. Labels state constructed
+width and actual raw requests N+D; no exact raw 16/32/64/128 or parameter-free
+claim remains. This accounts for the existing producer and increases the actual
+stress relative to the mistaken description, rather than redesigning input to
+hide parameters. Dedupe-bypass sensitivity now requires all eight families to
+fail, not just the repeated-construction four. No tie-origin claim is added.
+
+The ported pre-execution test patch was 338 gross/+335 net. The readable proposed
+repair is 17 added/6 removed relative to that draft, +11 net. Those removed lines
+were already feature additions: the final physical test diff is 349 added/3
+removed, **+346 net**, not stacked gross allowances. The existing **360 gross/
++350 net** ceiling is unchanged. Production remains 56 added/4 removed, +52 net;
+fixtures remain 0. No numeric cost ceiling, user policy, source epoch or original
+SOURCE failure is changed, waived or reset by this prospective correction.
 
 ## TDD and runnable gates
 
