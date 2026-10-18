@@ -7,6 +7,11 @@ completed evidence stays in Git and
 [benchmarks/results](../benchmarks/results/). Read both [AGENTS.md](AGENTS.md)
 and the [parent AGENTS.md](../AGENTS.md).
 
+The [2026-10-18 execution handoff](SELF_COMPILATION_HANDOFF.md) gives the current
+remaining dependency order, acceptance steps and
+[subthread recovery register](SELF_COMPILATION_WORKSTREAMS.md). Its dated
+candidate statuses distinguish held implementations from work landed on main.
+
 [README.md](README.md) and [grammar.ebnf](grammar.ebnf) describe implemented
 behavior. The [imports/prelude reference](IMPORTS_AND_PRELUDE_PLAN.md) describes
 that implemented subsystem. [LIBRARY_PARITY.md](LIBRARY_PARITY.md) is the
