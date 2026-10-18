@@ -421,6 +421,16 @@ epoch: measure and report the transition cost separately, then rebuild both rese
 baseline and candidate with that same frozen host. Changing epochs cannot hide
 source-migration cost.
 
+For only the [three-site concrete type-argument translation slice](TYPE_ARGUMENT_TRANSLATION_PLAN.md#prospective-current-matched-cost-contract),
+the prospectively reviewed landing contract replaces the historical cumulative
+R0 hard gate with one fixed then-current accepted B versus exact C: each current
+input and the same original schema1 artifact_construction_complete checkpoint
+proxy must satisfy +3% allocations and normal min3 instructions. Freeze the full
+library, host/checkpoint and corpus before sampling; never roll B or refreeze
+after failure. Preserve historical criteria/results with original compliance
+UNVERIFIED unless actually measured. Absolute caps, LOC, strict zero leaks and
+exact C/diagnostics remain binding. This grants no other slice an exception.
+
 Report gross/net production, tests and fixtures separately. Reject compressed
 formatting, deleted coverage, new tables without a measured query, or semantic
 special cases intended only to move counters. A justified minor inefficiency

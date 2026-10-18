@@ -874,6 +874,11 @@ No stored/returned closure was found in the reviewed current source. Broader
 language function values remain future work; existing parser/rejection behavior
 is preserved.
 
+The bounded [three-site type-argument translation](TYPE_ARGUMENT_TRANSLATION_PLAN.md)
+is being finished under its prospective fixed-current B/C +3% per-input and
+original-checkpoint-proxy contract. Historical R0 compliance remains UNVERIFIED;
+this retires neither the other eight callbacks nor the broader M7 dependency.
+
 **Retained future design.** Lambdas at known callees, including managed captures.
 The model, not an
 optimisation: each lambda literal is a unique nominal record type of its
