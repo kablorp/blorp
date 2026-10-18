@@ -819,7 +819,9 @@ as explicitly recorded in the parity table. No host trait enters target code.
   Reject NUL in a path before opening. Missing/unreadable input, incomplete reads
   and close failure return Err; clean up every opened handle. This increment
   needs stable source files, not arbitrary streams or concurrent snapshots.
-- **Write:** [accepted plan](TARGET_WRITE_FILE_PLAN.md); implementation pending.
+- **Write:** implemented and validated; the [plan](TARGET_WRITE_FILE_PLAN.md)
+  and [acceptance report](../benchmarks/results/blorp_2_target_write_file_2026-10-18.md)
+  retain the contracts and evidence.
   Create/truncate, write all counted contents and close successfully
   before Ok(void). Reject NUL paths; missing parents fail. A failure may leave
   partial output. Neither file operation prints. Preserve the primary failure
@@ -831,8 +833,8 @@ as explicitly recorded in the parity table. No host trait enters target code.
 - **Stderr:** attempt the complete counted message plus one additional LF,
   preserving internal newlines/NUL and writing nothing to stdout. Void reports
   no delivery status; stop on unrecoverable output error.
-  The accepted [target stderr plan](TARGET_STDERR_PLAN.md) is the next slice;
-  implementation remains pending.
+  The [target stderr plan](TARGET_STDERR_PLAN.md) is implemented and validated;
+  migration of the compiler shell to this target API remains pending.
 - **Join:** an absolute child replaces base. Empty base returns child, including
   join("", "") == "". Otherwise retain a trailing separator or add one;
   join("/library", "") == "/library/". Do not normalize components/separators.
