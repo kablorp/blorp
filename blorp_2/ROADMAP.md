@@ -515,6 +515,11 @@ span. The group remains one body through lowering and ownership. Independent
 verification checks every label but grants no payload-projection permission.
 This feature is bounded to 650 gross added / +450 net production lines.
 
+The approved [six-site first-order source pilot](QUALIFIED_PATTERN_SOURCE_PLAN.md)
+depends on qualified-feature acceptance. Source implementation waits for actual
+accepted-base/region pins and a separate grant. Source cost setup remains held
+for the baseline policy decision.
+
 The source plan pilots successive matches for 236 nested-test arm headers,
 and length/get/equality replacements for list/String patterns. Do not duplicate
 substantial actions to force a ban: full source-growth and cost gates apply.
