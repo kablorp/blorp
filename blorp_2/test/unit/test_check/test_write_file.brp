@@ -1,0 +1,111 @@
+import:
+	../../../src/check/check: check, checked_functions
+	../../../src/check/model as Model
+	../../../src/namespace/builtins as Builtins
+	../../../src/check/render: render_failure
+	../../../src/utils/ids: VariantId, union_number, variant_owner
+	../../../src/utils/source: module_source, root_module_id, same_source
+	../../../src/utils/syntax: Purity(Impure), same_purity
+	../input: setup_diagnostic
+	../module_input: parse_modules
+	test: TestSuite
+
+
+private BODY: String =
+	|    builtin("system.write_file")
+	|func main() -> Int:
+	|    0
+	|
+
+
+private HELP: String = "declare an impure nongeneric function with two String parameters returning Result[Void, String]"
+
+
+func test_write_file_accepts_two_strings_and_mixed_result() -> Bool:
+	match parse_modules([{ source = "func query(path: String, contents: String) -> Result[Void, String]:\n" + BODY, targets = [] }]).and_then(
+		pure func(parsed): check(parsed).map_err(setup_diagnostic),
+	):
+		Ok(program):
+			match checked_functions(program).functions.get(0):
+				Some(function):
+					match (function.signature.return_type.value_type, function.body):
+						(Model.AppliedUnionType(owner, [Model.VoidType, Model.StringType]), Model.CheckedValueBody(Model.ReturnExpression(value))):
+							match value.form:
+								Model.InvokeFunction(call, [path, contents]):
+									match call.target:
+										Model.RuntimeFunction(Builtins.WriteFile(result)):
+											contract: Builtins.RuntimeContract[VariantId, Model.TypeRef] = Builtins.runtime_contract(Builtins.WriteFile(result))
+											match (contract.parameters, contract.return_type):
+												([Builtins.PrimitiveRuntimeType(Builtins.BuiltinString), Builtins.PrimitiveRuntimeType(Builtins.BuiltinString)], Builtins.ResultResult(Builtins.PrimitiveRuntimeType(Builtins.BuiltinVoid), Builtins.PrimitiveRuntimeType(Builtins.BuiltinString), _)):
+													(Model.same_type(path.value_type, Model.StringType)
+														and Model.same_type(contents.value_type, Model.StringType)
+														and same_purity(contract.purity, Impure)
+														and union_number(owner) == union_number(variant_owner(result.ok))
+														and union_number(owner) == union_number(variant_owner(result.err)))
+												_: False
+										_: False
+								_: False
+						_: False
+				None: False
+		Err(error):
+			print_error(error.message)
+			print_error(error.help)
+			False
+
+
+private pure func diagnostic_is(source: String, message: String, help: String, start: Int, end: Int) -> Bool:
+	match parse_modules([{ source = source, targets = [] }]):
+		Err(_): False
+		Ok(parsed):
+			match check(parsed):
+				Ok(_): False
+				Err(failure):
+					diagnostics = render_failure(failure)
+					error = diagnostics.first
+					(
+						diagnostics.remaining.is_empty() and error.note.is_none()
+						and error.message == message and error.help == help
+						and same_source(error.span.source, module_source(root_module_id()))
+						and error.span.start == start and error.span.end == end
+					)
+
+
+private pure func header_rejected(header: String) -> Bool:
+	label_start = header.length() + "\n    builtin(".length()
+	diagnostic_is(header + "\n" + BODY,
+		"builtin declaration does not match its runtime contract", HELP,
+		label_start, label_start + "\"system.write_file\"".length())
+
+
+pure func test_pure_caller_rejects() -> Bool:
+	prefix = "func query(path: String, contents: String) -> Result[Void, String]:\n    builtin(\"system.write_file\")\npure func illegal(path: String) -> Result[Void, String]:\n    "
+	source = prefix + "query(path, path)\nfunc main() -> Int:\n    0\n"
+	diagnostic_is(source, "pure functions cannot call impure functions",
+		"mark the callee pure or remove pure from the caller", prefix.length(), prefix.length() + "query".length())
+
+
+pure func test_tail_annotation_rejects() -> Bool:
+	source = "@tail_recursive\nfunc query(path: String, contents: String) -> Result[Void, String]:\n" + BODY
+	diagnostic_is(source, "builtin bodies cannot have a tail-recursion annotation",
+		"remove @tail_recursive from the builtin declaration", 0, "@tail_recursive".length())
+
+
+tests: TestSuite = {
+	description = "Blorp 2 file-write contract",
+	tests = [
+		("two Strings return the designated Void/String Result", test_write_file_accepts_two_strings_and_mixed_result),
+		("zero parameters reject", pure func(): header_rejected("func query() -> Result[Void, String]:")),
+		("one parameter rejects", pure func(): header_rejected("func query(path: String) -> Result[Void, String]:")),
+		("three parameters reject", pure func(): header_rejected("func query(path: String, text: String, extra: String) -> Result[Void, String]:")),
+		("wrong path rejects", pure func(): header_rejected("func query(path: Int, text: String) -> Result[Void, String]:")),
+		("wrong contents reject", pure func(): header_rejected("func query(path: String, text: Int) -> Result[Void, String]:")),
+		("wrong success rejects", pure func(): header_rejected("func query(path: String, text: String) -> Result[Int, String]:")),
+		("wrong error rejects", pure func(): header_rejected("func query(path: String, text: String) -> Result[Void, Int]:")),
+		("swapped payloads reject", pure func(): header_rejected("func query(path: String, text: String) -> Result[String, Void]:")),
+		("ordinary lookalike rejects", pure func(): header_rejected("fixed union Other[A, B]:\n    Yes(A)\n    No(B)\nfunc query(path: String, text: String) -> Other[Void, String]:")),
+		("pure header rejects", pure func(): header_rejected("pure func query(path: String, text: String) -> Result[Void, String]:")),
+		("generic header rejects", pure func(): header_rejected("func query[T](path: String, text: String) -> Result[Void, String]:")),
+		("pure caller rejects", test_pure_caller_rejects),
+		("tail annotation rejects", test_tail_annotation_rejects),
+	]
+}

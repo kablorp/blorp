@@ -147,3 +147,57 @@ SYSTEM_READ_FILE_RUNTIME: String =
 		|return BLORP_READ_FILE_OK;
 		|}
 		|
+
+
+-- Both inputs remain borrowed. Only failure publishes a fresh owned String;
+-- success has no child payload for the caller's ordinary Result[Void, String].
+SYSTEM_WRITE_FILE_RUNTIME: String =
+	raw
+		|#include <errno.h>
+		|#include <limits.h>
+		|enum {
+		|BLORP_WRITE_FILE_OK=1,BLORP_WRITE_FILE_ERROR=0,
+		|BLORP_WRITE_FILE_ERROR_CAPACITY=sizeof("write_file: close failed; errno=")+sizeof(int)*CHAR_BIT
+		|};
+		|/* Valid String lengths fit size_t with room for a private path terminator. */
+		|_Static_assert(LONG_MAX==INT64_MAX&&(uintmax_t)INT64_MAX<(uintmax_t)(SIZE_MAX-sizeof(struct blorp_string)-1),"write_file requires supported LP64 bounds");
+		|static uint8_t blorp_write_file_failure(struct blorp_string **error,const char *message){
+		|*error=blorp_string_from_bytes(message,(int64_t)strlen(message));
+		|return BLORP_WRITE_FILE_ERROR;
+		|}
+		|static uint8_t blorp_write_file_error(struct blorp_string **error,const char *prefix,int saved_errno){
+		|char message[BLORP_WRITE_FILE_ERROR_CAPACITY];
+		|const int length=snprintf(message,sizeof message,"%s%d",prefix,saved_errno);
+		|if(length<0||(size_t)length>=sizeof message){abort();}
+		|return blorp_write_file_failure(error,message);
+		|}
+		|uint8_t blorp_write_file(const struct blorp_string *path,const struct blorp_string *contents,struct blorp_string **error){
+		|*error=NULL;
+		|const size_t path_length=(size_t)path->length;
+		|if(memchr(path->bytes,'\0',path_length)!=NULL){
+		|return blorp_write_file_failure(error,"write_file: path contains embedded NUL; use a path without NUL");
+		|}
+		|char *native_path=malloc(path_length+1);
+		|if(native_path==NULL){abort();}
+		|memcpy(native_path,path->bytes,path_length);
+		|native_path[path_length]='\0';
+		|FILE *stream=fopen(native_path,"wb");
+		|const int open_errno=errno;
+		|free(native_path);
+		|if(stream==NULL){return blorp_write_file_error(error,"write_file: open failed; errno=",open_errno);}
+		|const size_t contents_length=(size_t)contents->length;
+		|if(contents_length!=0){
+		|const size_t written=fwrite(contents->bytes,1,contents_length,stream);
+		|if(written!=contents_length){
+		|const int write_errno=errno;
+		|(void)fclose(stream);
+		|return blorp_write_file_error(error,"write_file: short write; errno=",write_errno);
+		|}
+		|}
+		|if(fclose(stream)!=0){
+		|const int close_errno=errno;
+		|return blorp_write_file_error(error,"write_file: close failed; errno=",close_errno);
+		|}
+		|return BLORP_WRITE_FILE_OK;
+		|}
+		|

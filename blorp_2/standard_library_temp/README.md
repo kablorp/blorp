@@ -92,3 +92,7 @@ Its counted UTF-8 contract and target-only encoding help are documented in
 It borrows its input, writes counted bytes to stderr once, and attempts LF only
 following a full transfer; short writes (including EINTR) stop without retry.
 The host attempts LF after short writes as well. Neither API reports delivery.
+
+The system adapter publishes impure `write_file(String, String) -> Result[Void, String]`.
+Ok carries Void; Err owns a fresh String. See [File writing](../README.md#file-writing)
+for counted bytes, one-close error priority and target NUL-path teaching text.

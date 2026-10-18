@@ -1,0 +1,214 @@
+import:
+	../../../src/lower/lower as Lower
+	../../../src/namespace/builtins as Builtins
+	../../../src/own/own as Own
+	../../../src/specialize/specialize as Concrete
+	../../../src/utils/source: same_source
+	../../../src/utils/syntax: Diagnostic, FunctionExecution(OrdinaryCalls), Entrypoint(NoArguments), EntryResult(IntegerExitStatus)
+	../../../src/verify/verify: verify
+	../file_write_inputs: FileWriteSeed, file_write_seed
+	../module_input: TEST_BASE
+	../ownership_inputs: InputIds, input_ids, span
+	test: TestSuite
+
+
+private pure func with_write_inputs(callback: pure (FileWriteSeed, InputIds) -> Bool) -> Bool:
+	match (file_write_seed(TEST_BASE), input_ids()):
+		(Ok(seed), Ok(ids)): callback(seed, ids)
+		_: False
+
+
+private pure func arguments(ids: InputIds) -> List[Own.OwnedArgument]:
+	[
+		Own.BorrowedArgument({ value = ids.first, source = Own.OwnerBorrow(Own.owner_id(0)) }),
+		Own.BorrowedArgument({ value = ids.second, source = Own.OwnerBorrow(Own.owner_id(1)) }),
+	]
+
+
+private pure func call_result(seed: FileWriteSeed, ids: InputIds) -> Own.OwnedDefinition:
+	{
+		id = ids.third, value_type = Concrete.UnionType(Concrete.variant_owner(seed.constructors.ok)),
+		operation = Own.CallDefinition({ target = Concrete.RuntimeFunction(Builtins.WriteFile(seed.constructors)), span = span(30) }, arguments(ids)),
+		result = Own.OwnedResult(Own.owner_id(2)), span = span(30)
+	}
+
+
+private pure func drops() -> List[Own.OwnershipOperation]:
+	[Own.DropOwner(Own.owner_id(0), span(40)), Own.DropOwner(Own.owner_id(1), span(41)), Own.DropOwner(Own.owner_id(2), span(42))]
+
+
+-- Raw definitions, borrows and owner transfers are independent of insertion.
+private pure func raw_result(seed: FileWriteSeed, ids: InputIds, result: Own.OwnedDefinition, before: List[Own.OwnershipOperation], after: List[Own.OwnershipOperation]) -> Own.OwnershipProgram:
+	path: Own.OwnedDefinition = {
+		id = ids.first, value_type = Concrete.StringType, operation = Own.StringDefinition("path"),
+		result = Own.OwnedResult(Own.owner_id(0)), span = span(10)
+	}
+	contents = { path | id = ids.second, result = Own.OwnedResult(Own.owner_id(1)), span = span(20) }
+	zero: Own.OwnedDefinition = {
+		id = ids.fourth, value_type = Concrete.IntType, operation = Own.IntegerDefinition(0),
+		result = Own.UnmanagedResult, span = span(50)
+	}
+	function: Own.OwnedFunction = {
+		execution = OrdinaryCalls, signature = { parameters = [], return_type = Concrete.IntType },
+		operations = [Own.DefineValue(path), Own.DefineValue(contents)].concat(before).append(Own.DefineValue(result)).concat(after).append(Own.DefineValue(zero)),
+		tail = Own.ReturnTail(Own.ReturnResult(Own.UnmanagedReturn(ids.fourth)))
+	}
+	{ records = [], unions = Lower.lowered_functions(seed.lowered).unions, functions = [function], entrypoint = NoArguments(ids.entrypoint, IntegerExitStatus) }
+
+
+private pure func rejects(program: Own.OwnershipProgram, message: String, at: Int) -> Bool:
+	match verify(program):
+		Ok(_): False
+		Err(error):
+			(error.message == "ownership verification failed: " + message
+				and error.help == "report this compiler error with the input program"
+				and same_source(error.span.source, span(at).source)
+				and error.span.start == at and error.span.end == at + 1 and error.note.is_none())
+
+
+private pure func changed_arguments(seed: FileWriteSeed, ids: InputIds, supplied: List[Own.OwnedArgument]) -> Own.OwnedDefinition:
+	result = call_result(seed, ids)
+	{ result | operation = Own.CallDefinition({ target = Concrete.RuntimeFunction(Builtins.WriteFile(seed.constructors)), span = span(30) }, supplied) }
+
+
+private pure func wrong_layout(seed: FileWriteSeed, ids: InputIds, variants: List[List[Concrete.TypeRef]]) -> Bool:
+	program = raw_result(seed, ids, call_result(seed, ids), [], drops())
+	unions: List[Concrete.ConcreteUnion] = [{ variants = variants, representation = Concrete.InlineOwningPayload }]
+	rejects({ program | unions = unions }, "variant payload does not match its operation", 30)
+
+
+pure func test_raw_two_borrows_and_one_result_owner_verify() -> Bool:
+	with_write_inputs(pure func(seed, ids): verify(raw_result(seed, ids, call_result(seed, ids), [], drops())).is_ok())
+
+
+pure func test_same_string_can_supply_both_live_borrows() -> Bool:
+	with_write_inputs(pure func(seed, ids):
+		match arguments(ids):
+			[first, _]: verify(raw_result(seed, ids, changed_arguments(seed, ids, [first, first]), [], drops())).is_ok()
+			_: False
+	)
+
+
+private pure func wrong_argument_type(seed: FileWriteSeed, ids: InputIds, position: Int) -> Bool:
+	supplied = if position == 0:
+		[Own.UnmanagedArgument(ids.first), Own.BorrowedArgument({ value = ids.second, source = Own.OwnerBorrow(Own.owner_id(0)) })]
+	else:
+		[Own.BorrowedArgument({ value = ids.first, source = Own.OwnerBorrow(Own.owner_id(0)) }), Own.UnmanagedArgument(ids.second)]
+	result = { changed_arguments(seed, ids, supplied) | result = Own.OwnedResult(Own.owner_id(1)) }
+	cleanup = [Own.DropOwner(Own.owner_id(0), span(40)), Own.DropOwner(Own.owner_id(1), span(42))]
+	program = raw_result(seed, ids, result, [], cleanup)
+	match program.functions:
+		[function]:
+			match function.operations:
+				[Own.DefineValue(path), Own.DefineValue(contents), ...remaining]:
+					original = if position == 0:
+						path
+					else:
+						contents
+					wrong = { original | value_type = Concrete.IntType, operation = Own.IntegerDefinition(7), result = Own.UnmanagedResult }
+					prefix = if position == 0:
+						[Own.DefineValue(wrong), Own.DefineValue({ contents | result = Own.OwnedResult(Own.owner_id(0)) })]
+					else:
+						[Own.DefineValue(path), Own.DefineValue(wrong)]
+					rejects({ program | functions = [{ function | operations = prefix.concat(remaining) }] }, "call argument type does not match its contract", 30)
+				_: False
+		_: False
+
+
+pure func test_wrong_path_type_rejects() -> Bool:
+	with_write_inputs(pure func(seed, ids): wrong_argument_type(seed, ids, 0))
+
+
+pure func test_wrong_contents_type_rejects() -> Bool:
+	with_write_inputs(pure func(seed, ids): wrong_argument_type(seed, ids, 1))
+
+
+pure func test_swapped_constructor_roles_reject() -> Bool:
+	with_write_inputs(pure func(seed, ids):
+		result = call_result(seed, ids)
+		swapped = { seed.constructors | ok = seed.constructors.err, err = seed.constructors.ok }
+		changed = { result | operation = Own.CallDefinition({ target = Concrete.RuntimeFunction(Builtins.WriteFile(swapped)), span = span(30) }, arguments(ids)) }
+		rejects(raw_result(seed, ids, changed, [], drops()), "variant payload does not match its operation", 30)
+	)
+
+
+pure func test_wrong_borrow_owner_rejects() -> Bool:
+	with_write_inputs(pure func(seed, ids):
+		wrong = Own.BorrowedArgument({ value = ids.first, source = Own.OwnerBorrow(Own.owner_id(1)) })
+		rejects(raw_result(seed, ids, changed_arguments(seed, ids, [wrong, wrong]), [], drops()), "owner 1 does not own value 0", 30)
+	)
+
+
+pure func test_early_path_drop_rejects() -> Bool:
+	with_write_inputs(pure func(seed, ids):
+		rejects(raw_result(seed, ids, call_result(seed, ids), [Own.DropOwner(Own.owner_id(0), span(25))], drops()), "borrow refers to discharged owner 0", 30)
+	)
+
+
+pure func test_early_contents_drop_rejects() -> Bool:
+	with_write_inputs(pure func(seed, ids):
+		rejects(raw_result(seed, ids, call_result(seed, ids), [Own.DropOwner(Own.owner_id(1), span(25))], drops()), "borrow refers to discharged owner 1", 30)
+	)
+
+
+pure func test_wrong_return_type_rejects() -> Bool:
+	with_write_inputs(pure func(seed, ids):
+		result = { call_result(seed, ids) | value_type = Concrete.IntType, result = Own.UnmanagedResult }
+		rejects(raw_result(seed, ids, result, [], drops()), "call result type does not match its contract", 30)
+	)
+
+
+pure func test_result_must_own_even_with_void_success() -> Bool:
+	with_write_inputs(pure func(seed, ids):
+		result = { call_result(seed, ids) | result = Own.UnmanagedResult }
+		rejects(raw_result(seed, ids, result, [], drops()), "managed result requires an owner", 30)
+	)
+
+
+pure func test_missing_result_drop_rejects() -> Bool:
+	with_write_inputs(pure func(seed, ids):
+		rejects(raw_result(seed, ids, call_result(seed, ids), [], drops().take(2)), "owner 2 remains live at return", 50)
+	)
+
+
+pure func test_missing_string_drop_rejects() -> Bool:
+	with_write_inputs(pure func(seed, ids):
+		rejects(raw_result(seed, ids, call_result(seed, ids), [], [Own.DropOwner(Own.owner_id(1), span(41)), Own.DropOwner(Own.owner_id(2), span(42))]), "owner 0 remains live at return", 50)
+	)
+
+
+pure func test_double_result_drop_rejects() -> Bool:
+	with_write_inputs(pure func(seed, ids):
+		rejects(raw_result(seed, ids, call_result(seed, ids), [], drops().append(Own.DropOwner(Own.owner_id(2), span(45)))), "owner 2 has already been discharged", 45)
+	)
+
+
+pure func test_double_string_drop_rejects() -> Bool:
+	with_write_inputs(pure func(seed, ids):
+		rejects(raw_result(seed, ids, call_result(seed, ids), [], drops().append(Own.DropOwner(Own.owner_id(0), span(45)))), "owner 0 has already been discharged", 45)
+	)
+
+
+tests: TestSuite = {
+	description = "Blorp 2 independent file-write verification",
+	tests = [
+		("raw two-borrow Result is valid", test_raw_two_borrows_and_one_result_owner_verify),
+		("same value may be borrowed twice", test_same_string_can_supply_both_live_borrows),
+		("wrong Void success slot rejects", pure func(): with_write_inputs(pure func(seed, ids): wrong_layout(seed, ids, [[Concrete.IntType], [Concrete.StringType]]))),
+		("wrong String error slot rejects", pure func(): with_write_inputs(pure func(seed, ids): wrong_layout(seed, ids, [[Concrete.VoidType], [Concrete.ListType(Concrete.StringType)]]))),
+		("swapped Void/String roles reject", test_swapped_constructor_roles_reject),
+		("non-String path rejects", test_wrong_path_type_rejects),
+		("non-String contents reject", test_wrong_contents_type_rejects),
+		("missing contents rejects", pure func(): with_write_inputs(pure func(seed, ids): rejects(raw_result(seed, ids, changed_arguments(seed, ids, arguments(ids).take(1)), [], drops()), "call is missing its argument", 30))),
+		("extra argument rejects", pure func(): with_write_inputs(pure func(seed, ids): rejects(raw_result(seed, ids, changed_arguments(seed, ids, arguments(ids).concat(arguments(ids))), [], drops()), "call has an unexpected argument", 30))),
+		("wrong borrow owner rejects", test_wrong_borrow_owner_rejects),
+		("early path drop rejects", test_early_path_drop_rejects),
+		("early contents drop rejects", test_early_contents_drop_rejects),
+		("wrong return type rejects", test_wrong_return_type_rejects),
+		("mixed Result remains owning", test_result_must_own_even_with_void_success),
+		("missing Result drop rejects", test_missing_result_drop_rejects),
+		("missing String drop rejects", test_missing_string_drop_rejects),
+		("double Result drop rejects", test_double_result_drop_rejects),
+		("double String drop rejects", test_double_string_drop_rejects),
+	]
+}

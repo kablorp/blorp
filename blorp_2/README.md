@@ -1839,6 +1839,23 @@ and close errors over encoding errors. Every opened stream receives one close
 attempt, including EINTR, without retry. Nothing is printed. Both Result branches own
 one fresh String under ordinary union ownership. Loader migration remains pending.
 
+## File writing
+
+Import `system: write_file` for impure
+`write_file(path: String, contents: String) -> Result[Void, String]`.
+It creates or truncates a file and writes exact counted UTF-8 bytes, including
+BOM, CRLF and embedded NUL contents. Empty contents still create/truncate.
+Ok contains Void and follows successful write and close; Err owns one fresh
+String. Both inputs stay borrowed, including when they alias.
+NUL paths reject before opening, with `write_file: path contains embedded NUL;
+use a path without NUL`. The host uses `string contains embedded NUL` instead.
+Open, short-write and close errors report their saved numeric errno. Write
+errors take priority over close errors; every opened stream receives exactly
+one close attempt, including EINTR, without retry. Partial output is allowed;
+atomic replacement and durability are outside the contract. Nothing is printed.
+See the [complete program](test/e2e/fixtures/file_write/bytes.brp) and
+[acceptance plan](TARGET_WRITE_FILE_PLAN.md). Main/loader migration remains pending.
+
 ## Float64 calculator
 
 The designated foundation `_base.brp` owns `Float`, a binary64 unmanaged value. Decimal source

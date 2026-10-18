@@ -731,6 +731,12 @@ this accepted bounded witness establishes no self-compilation or M6 completion.
 mutation, full-suite and matched-cost gates; [evidence](../benchmarks/results/blorp_2_target_file_read_2026-10-17.md)
 retains failed host strict checks. Destination e2e passed; loader migration remains pending.
 
+The bounded [target file-writing slice](TARGET_WRITE_FILE_PLAN.md) implements
+ordinary `Result[Void, String]` with two borrowed Strings. Its phase/native, full
+functional and matched FEATURE cost gates pass; [evidence](../benchmarks/results/blorp_2_target_write_file_2026-10-18.md)
+retains the failed supporting-host strict checks. Main/loader migration remains
+a separate gate. This does not complete M6.
+
 **Goal.** The real compiler source loads and checks against the real temporary
 library, with no remaining required parity row missing. Use the reduced resolved
 dependency inventory after source migration, not the old callback/Char rows.

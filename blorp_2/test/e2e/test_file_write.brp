@@ -1,0 +1,85 @@
+import:
+	./harness: Example, argv_case, native_case, verify_all, with_directory
+	system: read_bytes, write_file
+	test: TestSuite
+
+
+private CONTENTS: String = "\u{FEFF}é😀\r\n\0tail"
+
+
+private func missing_error(path: String) -> Result[String, String]:
+	match write_file(path, ""):
+		Ok(_): Err("the missing-parent control unexpectedly opened a file")
+		Err(error): Ok(error + "\n")
+
+
+private func run_bytes(compiler: String) -> Bool:
+	with_directory(func(directory: String):
+		path = directory + "/bytes"
+		written ?= write_file(path, "a longer file which must be truncated")
+		missing = directory + "/absent/child"
+		error ?= missing_error(missing)
+		example: Example = {
+			name = "file write bytes", fixture = "blorp_2/test/e2e/fixtures/file_write/bytes.brp", expected_c = None,
+			first_case = argv_case("counted bytes truncate exactly", [path], 7, CONTENTS + "\n"),
+			remaining_cases = [{ argv_case("missing parent", [missing], 1, "") | stderr = error.to_bytes() }],
+			limits = { allocations = 205000, instructions = 600000000 }
+		}
+		verified ?= verify_all(compiler, directory, example)
+		stored ?= read_bytes(path)
+		if stored == CONTENTS.to_bytes():
+			Ok(void)
+		else:
+			Err("the independently read file bytes differ from the counted write witness")
+	)
+
+
+private func run_ownership(compiler: String) -> Bool:
+	with_directory(func(directory: String):
+		path = directory + "/empty"
+		written ?= write_file(path, "seed requiring truncation")
+		missing = directory + "/absent/child"
+		error ?= missing_error(missing)
+		example: Example = {
+			name = "file write ownership", fixture = "blorp_2/test/e2e/fixtures/file_write/ownership.brp", expected_c = None,
+			first_case = { argv_case("ignored aliases and escaping error", [path, missing], 0, "\n") | stderr = error.to_bytes() },
+			remaining_cases = [], limits = { allocations = 205000, instructions = 600000000 }
+		}
+		verified ?= verify_all(compiler, directory, example)
+		stored ?= read_bytes(path)
+		if stored == "".to_bytes():
+			Ok(void)
+		else:
+			Err("the independently read file was not truncated to empty")
+	)
+
+
+private func run_nul_path(compiler: String) -> Bool:
+	with_directory(func(directory: String):
+		path = directory + "/input"
+		written ?= write_file(path, "preserve the prefix file")
+		example: Example = {
+			name = "file write NUL path", fixture = "blorp_2/test/e2e/fixtures/file_write/nul_path.brp", expected_c = None,
+			first_case = { native_case("NUL rejects before opening prefix", "", 1, "") |
+				cwd = Some(directory), stderr = "write_file: path contains embedded NUL; use a path without NUL\n".to_bytes()
+			},
+			remaining_cases = [], limits = { allocations = 205000, instructions = 600000000 }
+		}
+		verified ?= verify_all(compiler, directory, example)
+		stored ?= read_bytes(path)
+		if stored == "preserve the prefix file".to_bytes():
+			Ok(void)
+		else:
+			Err("NUL-path rejection changed the existing prefix file")
+	)
+
+
+pure func suite(compiler: String) -> TestSuite:
+	{
+		description = "Blorp 2 counted file writes",
+		tests = [
+			("exact bytes and native-derived errors reach real main", func(): run_bytes(compiler)),
+			("empty and aliased Result ownership", func(): run_ownership(compiler)),
+			("NUL path preserves the prefix file", func(): run_nul_path(compiler)),
+		]
+	}

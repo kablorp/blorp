@@ -2,11 +2,19 @@
 
 ## Problem, dependencies, and scope
 
-PLAN ONLY at accepted main `74a3b3bdbca1772370af494dc17c26aef5d1a112`, branch `codex/target-write-plan`. Only this document is authorized: no implementation, compiled execution, measurements, commit or push. [M6](ROADMAP.md#seven-shell-and-path-functions) needs `func write_file(path: String, contents: String) -> Result[Void, String]` for eventual shell output; the target API/builtin is absent. Land and accept [read_file](TARGET_FILE_READ_PLAN.md), then [print_error](TARGET_STDERR_PLAN.md), then implement this slice on accepted main after root grant. Plans may coexist; shared compiler files have one writer. This plan base is not the future frozen measurement baseline.
+Implementation and validation are complete against accepted main `e906b8104f269ace2ca990693a5bae417f73b006`. Coordinator owns landing and destination validation. The fixed write-only patch is `447e022744f559b0a84fc4d2013d56a096a2a76608689f628cd3d4c83b83f929`. [Current evidence](../benchmarks/results/blorp_2_target_write_file_2026-10-18.md) records 189 focused, 3258 component and 467 functional e2e passes, Linux Clang/GCC native checks, effective mutation/restoration proofs and all 3932 matched FEATURE cost calls. Read-file, concat, stderr and the bounded first-order predecessor are accepted in this baseline. M6 and compiler main/loader migration remain open. The original plan-only base was `74a3b3bdbca1772370af494dc17c26aef5d1a112`; it was never the measurement baseline.
 
 Loading remains the effect boundary and the compiler pipeline afterward stays pure. No main/loader migration, read/path API change, host repair, atomic publication, durability, retry/fallback, general IO/FFI framework, carrier, registry or cache. The [known host leak](HOST_BOOTSTRAP_LIMITATIONS.md) remains failed strict status 99 and a host-only bootstrap exception; pilot/native strict zero, costs and original epochs remain unchanged.
 
-## Witness and actual before/after
+## Witness and original before/after
+
+The future-tense instructions and old source anchors below retain the original
+pre-implementation design. Current implementation anchors are
+`utils/syntax.brp:385`, `parse/parse.brp:2649`, `namespace/builtins.brp:151`,
+`check/signatures.brp:385`, `specialize/specialize.brp:2189`,
+`emit/emit.brp:1195,1297,2115,2583`, `runtime/system.brp:154` and
+`standard_library_temp/system.brp:13`. The report reconciles the original red
+and preliminary mutation evidence with the final accepted-stack gates.
 
 Future `test/e2e/fixtures/file_write/bytes.brp` exercises ordinary main, after both dependencies:
 
@@ -122,4 +130,4 @@ env -u BLORP_MEMORY_STATS BLORP_LEAK_CHECK=strict "$diagnostic_host" compile --n
 
 Require serial B/C,C/B,B/C normal samples/minimum-of-three instructions and separate strict allocation/release counts. Feature-local hard ceiling is +5% allocations and normal instructions for EACH shared input AND fixed host source-to-C proxy; preserve all R0/local+cumulative 3% source-refactor rules, frozen epochs and stricter fixture caps. Within-variant normal/diagnostic C must match; unchanged-input C/diagnostics stay exact across B/C; review intentional compiler-C changes without normalization. Pilot/native strict zero and positive balanced counts remain mandatory; retain host strict status 99/leaks and completed-output validity, subtract nothing. New-only calls have no invented baseline. Label costs as owned-input/fixed-host proxies, not self-compilation, and state omissions.
 
-Hand back branch/diff/hash, separate physical LOC, exact red/green/restored mutations, C and gate verdicts, raw commands/artifacts and every per-input cost verdict in one benchmark report. Root plus independent code-reviewer/test-runner review precede plan commit and future implementation/commit. Stop for an ordinary mixed-Result gap, unapproved mechanism, new host bug, contract ambiguity, ABI/budget drift, unexplained C or cost breach; report the smallest reproduction/direct options to root. Current open evidence is mixed-Result execution, exact future baseline/path pins and measured cap headroom; no new mechanism is proposed to resolve them.
+Hand back branch/diff/hash, separate physical LOC, exact red/green/restored mutations, C and gate verdicts, raw commands/artifacts and every per-input cost verdict in one benchmark report. Root plus independent code-reviewer/test-runner review precede plan commit and future implementation/commit. Stop for an ordinary mixed-Result gap, unapproved mechanism, new host bug, contract ambiguity, ABI/budget drift, unexplained C or cost breach; report the smallest reproduction/direct options to root. Those original evidence gaps are closed by the linked report. Every shared invocation and the fixed supporting-host proxy passes the unchanged +5% allocation and normal min3 instruction gates. This FEATURE proxy uses full exit TOTAL allocations with memory stats unset, not the SOURCE artifact-construction checkpoint. Both supporting-host strict calls remain FAILED status 99 under the documented host-only exception; target/native strict zero remains binding. Original source-refactor epochs and historical failures are preserved without subtraction or denominator changes.

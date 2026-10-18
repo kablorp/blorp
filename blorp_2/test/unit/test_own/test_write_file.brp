@@ -1,0 +1,132 @@
+import:
+	../../../src/lower/lower as Lower
+	../../../src/own/own as Own
+	../../../src/specialize/specialize as Concrete
+	../../../src/utils/syntax: entry_function
+	../file_write_inputs: FILE_WRITE_SOURCE, file_write_seed, file_write_seed_from_source
+	../module_input: TEST_BASE
+	test: TestSuite
+
+
+pure func test_two_parameters_remain_borrowed_and_result_transfers() -> Bool:
+	match file_write_seed(TEST_BASE):
+		Err(_): False
+		Ok(seed):
+			match Own.insert_function(seed.query, Lower.lowered_functions(seed.lowered).unions, []):
+				Err(_): False
+				Ok(function):
+					match (function.operations, function.tail):
+						([Own.DefineValue(path), Own.DefineValue(contents), Own.DefineValue(result)], Own.ReturnTail(Own.ReturnResult(Own.OwnedReturn(value, transferred)))):
+							match (result.operation, result.result):
+								(Own.CallDefinition(_, [Own.BorrowedArgument(first), Own.BorrowedArgument(second)]), Own.OwnedResult(owner)):
+									(Lower.value_number(first.value) == Lower.value_number(path.id)
+										and Lower.value_number(second.value) == Lower.value_number(contents.id)
+										and Lower.value_number(value) == Lower.value_number(result.id)
+											and Own.owner_number(owner) == Own.owner_number(transferred))
+								_: False
+						_: False
+
+
+private pure func escaped_function() -> Option[Own.OwnedFunction]:
+	match file_write_seed(TEST_BASE):
+		Err(_): None
+		Ok(seed):
+			match Own.own(seed.lowered):
+				Err(_): None
+				Ok(program): program.functions.get(Concrete.function_number(seed.escape))
+
+
+pure func test_same_string_is_borrowed_twice_without_acquisition() -> Bool:
+	match escaped_function():
+		Some(function):
+			match function.operations:
+				[Own.DefineValue(path), Own.DefineValue(result)]:
+					match result.operation:
+						Own.CallDefinition(_, [Own.BorrowedArgument(first), Own.BorrowedArgument(second)]):
+							match (first.source, second.source):
+								(Own.ParameterBorrow(first_source), Own.ParameterBorrow(second_source)):
+									(Lower.value_number(first.value) == Lower.value_number(path.id)
+										and Lower.value_number(second.value) == Lower.value_number(path.id)
+										and Lower.value_number(first_source) == Lower.value_number(path.id)
+										and Lower.value_number(second_source) == Lower.value_number(path.id))
+								_: False
+						_: False
+				_: False
+		None: False
+
+
+pure func test_void_projection_is_unmanaged_and_error_acquires_before_parent_drop() -> Bool:
+	match escaped_function():
+		Some(function):
+			match (function.operations, function.tail):
+				([_, Own.DefineValue(parent)], Own.MatchTail(matched)):
+					match (parent.result, matched.arms):
+						(Own.OwnedResult(parent_owner), [ok, error]):
+							match (ok.operations, error.operations, error.exit):
+								([Own.DefineValue(done), Own.DefineValue(_), Own.DropOwner(ok_drop, _)], [Own.DefineValue(child), Own.AcquireOwner(acquired, borrow, _), Own.DropOwner(err_drop, _)], Own.ReturnResult(Own.OwnedReturn(value, returned))):
+									match (done.value_type, done.result, child.result, borrow.source):
+										(Concrete.VoidType, Own.UnmanagedResult, Own.BorrowedResult(Own.PayloadBorrow(source)), Own.PayloadBorrow(borrowed)):
+											(Own.owner_number(ok_drop) == Own.owner_number(parent_owner)
+												and Own.owner_number(err_drop) == Own.owner_number(parent_owner)
+												and Lower.value_number(source) == Lower.value_number(parent.id)
+												and Lower.value_number(borrowed) == Lower.value_number(parent.id)
+												and Lower.value_number(borrow.value) == Lower.value_number(child.id)
+												and Lower.value_number(value) == Lower.value_number(child.id)
+												and Own.owner_number(acquired) == Own.owner_number(returned))
+										_: False
+								_: False
+						_: False
+				_: False
+		None: False
+
+
+pure func test_ignored_result_drops_once() -> Bool:
+	match file_write_seed(TEST_BASE).and_then(pure func(seed): Own.own(seed.lowered)):
+		Err(_): False
+		Ok(program):
+			match program.functions.get(Concrete.function_number(entry_function(program.entrypoint))):
+				Some(main):
+					match main.operations.get(2):
+						Some(Own.DefineValue(result)):
+							match result.result:
+								Own.OwnedResult(owner):
+									main.operations.filter(pure func(operation):
+										match operation:
+											Own.DropOwner(dropped, _): Own.owner_number(dropped) == Own.owner_number(owner)
+											_: False
+									).length() == 1
+								_: False
+						_: False
+				None: False
+
+
+pure func test_duplicate_result_slots_acquire_separately() -> Bool:
+	source = FILE_WRITE_SOURCE.replace("    escaped = escape(\"input\")\n", "    escaped = escape(\"input\")\n    copies = [unused, unused]\n")
+	match file_write_seed_from_source(source, TEST_BASE).and_then(pure func(seed): Own.own(seed.lowered)):
+		Err(_): False
+		Ok(program):
+			match program.functions.get(Concrete.function_number(entry_function(program.entrypoint))):
+				None: False
+				Some(main):
+					main.operations.any(pure func(operation):
+						match operation:
+							Own.DefineValue(definition):
+								match definition.operation:
+									Own.ConstructListDefinition([Own.OwnedPayload(first, first_owner), Own.OwnedPayload(second, second_owner)]):
+										(Lower.value_number(first) == Lower.value_number(second)
+											and Own.owner_number(first_owner) != Own.owner_number(second_owner))
+									_: False
+							_: False
+					)
+
+
+tests: TestSuite = {
+	description = "Blorp 2 file-write ownership",
+	tests = [
+		("two borrowed Strings return one owning Result", test_two_parameters_remain_borrowed_and_result_transfers),
+		("same String supplies two live borrows", test_same_string_is_borrowed_twice_without_acquisition),
+		("Void stays unmanaged and Err escapes before parent destruction", test_void_projection_is_unmanaged_and_error_acquires_before_parent_drop),
+		("ignored mixed Result drops once", test_ignored_result_drops_once),
+		("duplicate Result slots acquire distinct owners", test_duplicate_result_slots_acquire_separately),
+	]
+}
