@@ -132,8 +132,9 @@ replay other held source slices or use a retained B binary as changed-source C
 proof. Loop cleanup/native ownership gates remain proportionate integration
 work; target append copying supplies no performance claim.
 
-Original SOURCE R0 hold, local/cumulative 3%, exact C, zero leaks, all absolute
-limits and frozen producer/checkpoint metrics remain unchanged. No cost setup,
+The user-approved [SOURCE fixed-baseline contract](BOOTSTRAP_SOURCE_PLAN.md#source-cost-acceptance)
+owns the +3% comparison and historical R0 reporting. Exact C, zero leaks, all
+absolute limits and frozen producer/checkpoint metrics remain. No cost setup,
 sampling, baseline roll, source implementation, commit or landing follows from
 this proposal. Return the exact test diff, source composition/pins, baseline
 characterization, then bounded production diff and its independent evidence.

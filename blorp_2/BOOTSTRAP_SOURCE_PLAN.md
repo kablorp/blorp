@@ -413,45 +413,52 @@ The historical whole-callback estimate was +442–739 net, not an allowance. The
 maintained [remaining callback ledger](REMAINING_CALLBACK_LEDGER.md) records the
 prospective selected whole ceiling: 1,000 production added / +530 net / 930 test
 added, including nested propagation, with spent ports and cumulative scopes
-accounted separately. It grants no source writes or SOURCE cost waiver; original
-R0 and every cost hold remain binding. Do not stack small pilot allowances to
+accounted separately. It grants no source writes or cost acceptance; the SOURCE
+contract below governs each slice. Do not stack small pilot allowances to
 hide total growth. Full pattern migration similarly
 needs a revised estimate after the six-site pilot; the old +1,300–2,300 estimate
 included discarded no-else/or-duplication rules and is not an approved allowance.
 
-Source refactors target and cap +3% allocations and normal minimum-of-three
-instructions on every unchanged owned input and the frozen-host source-to-C
-proxy, both locally and cumulatively against the frozen reset source baseline.
-Use the immediately preceding accepted source for local comparisons, one physical input path,
-strict leak/count runs separately, and one current full acceptance after source
-integration. Preserve old measurements as historical rather than rerunning them
-against obsolete bases. Feature slices keep their owning reviewed ceilings;
-new library/runtime slices set numerical budgets before implementation.
+### SOURCE cost acceptance
+
+**User decision, 2026-10-18:** use the fixed-baseline policy for all remaining
+SOURCE slices, extending the already reviewed type-argument/unary contracts.
+Before new setup or sampling, root names one then-current accepted baseline B
+and the complete candidate C, with the exact dependency/composition boundary.
+Freeze the source, full library, corpus, physical paths, host and metric roles.
+Each unchanged owned input and the frozen-host source-to-C proxy must pass
+**+3% allocations and normal minimum-of-three retired instructions** against
+that fixed B. Keep all tighter absolute fixture limits, strict zero leaks,
+identity/diagnostic oracles, LOC ceilings and independent reviews.
+
+Never roll B or refreeze after a failure. Acceptance of one slice permits a
+separately named accepted baseline for the next slice; it does not accept a
+held dependency or reset another slice's failed measurement. Historical R0
+criteria and actual failures remain recorded with their original verdicts.
+Report cumulative source trends against the retained historical reference;
+the old cumulative R0 +3% comparison is no longer a landing gate for these
+remaining slices. In particular, retain the sorter observation 10,166 versus
+the historical 9,923 threshold from R0 9,634 as a historical failure, alongside
+its measured local 12-allocation reduction. A later pass does not relabel it.
+
+This dated decision supersedes older original-R0 landing-hold language in
+SOURCE slice plans. It changes neither FEATURE contracts nor unrelated failed
+epochs. Use one physical input path, separate strict leak/count from normal
+runs, and require current full acceptance after source integration. Preserve
+old observations rather than rerunning obsolete bases. New library/runtime
+slices still set their own numerical budgets before implementation.
 A necessary host/runtime transition starts one explicit matched measurement
 epoch: measure and report the transition cost separately, then rebuild both reset
 baseline and candidate with that same frozen host. Changing epochs cannot hide
 source-migration cost.
 
-For only the [three-site concrete type-argument translation slice](TYPE_ARGUMENT_TRANSLATION_PLAN.md#prospective-current-matched-cost-contract),
-the prospectively reviewed landing contract replaces the historical cumulative
-R0 hard gate with one fixed then-current accepted B versus exact C: each current
-input and the same original schema1 artifact_construction_complete checkpoint
-proxy must satisfy +3% allocations and normal min3 instructions. Freeze the full
-library, host/checkpoint and corpus before sampling; never roll B or refreeze
-after failure. Preserve historical criteria/results with original compliance
-UNVERIFIED unless actually measured. Absolute caps, LOC, strict zero leaks and
-exact C/diagnostics remain binding. This grants no other slice an exception.
-
-For only the [unary typed-step preparation](CARRIED_BINDINGS_PLAN.md#prospective-unary-preparation-cost-contract),
-a separately reviewed prospective contract replaces its historical cumulative
-R0 hard landing gate with one fixed accepted then-main B versus its complete C:
-each current input and the same original schema1 construction-checkpoint proxy
-must pass +3% allocations and normal min3 instructions. Freeze the full corpus,
-target library and host/metric roles first; never roll B or refreeze after failure.
-Preserve old criteria/results/failures; original compliance remains UNVERIFIED
-unless retained actual observations establish a result.
-All absolute, LOC, strict-zero and exact C/diagnostic gates remain. This contract
-grants no other slice or carried feature a waiver or implementation approval.
+The [three-site type-argument contract](TYPE_ARGUMENT_TRANSLATION_PLAN.md#prospective-current-matched-cost-contract)
+and [unary typed-step contract](CARRIED_BINDINGS_PLAN.md#prospective-unary-preparation-cost-contract)
+are the retained precedents. Their recorded results and original-compliance
+limits stay unchanged. Required SOURCE proxy allocations still use the unique
+schema1 `artifact_construction_complete.total_allocations` checkpoint; an exit
+TOTAL, different host library or FUNCTIONAL producer is not a silent substitute.
+An API/toolchain transition needs the separate matched epoch described above.
 
 Report gross/net production, tests and fixtures separately. Reject compressed
 formatting, deleted coverage, new tables without a measured query, or semantic

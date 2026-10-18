@@ -765,7 +765,8 @@ Implementation and the separate compiler-source import migration remain pending.
 
 The [loader/shell integration draft](LOADER_SHELL_INTEGRATION_PLAN.md) maps actual
 source callers and missing leaves, beginning with fallible CWD and explicit stderr.
-Source review and the original-R0 cost hold remain separate from library acceptance.
+Source review and [fixed-baseline SOURCE cost acceptance](BOOTSTRAP_SOURCE_PLAN.md#source-cost-acceptance)
+remain separate from library acceptance; historical R0 failures stay recorded.
 
 **Goal.** The real compiler source loads and checks against the real temporary
 library, with no remaining required parity row missing. Use the reduced resolved
@@ -929,7 +930,9 @@ language function values remain future work; existing parser/rejection behavior
 is preserved.
 
 The [remaining callback ledger](REMAINING_CALLBACK_LEDGER.md) owns the prospective
-whole ceiling and cumulative accounting; original SOURCE R0 and cost holds remain.
+whole ceiling and cumulative accounting. Remaining SOURCE slices follow the
+user-approved fixed-baseline cost policy; retain historical R0 failures and
+cumulative trends without automatic baseline changes after failure.
 
 The bounded [three-site type-argument translation](TYPE_ARGUMENT_TRANSLATION_PLAN.md)
 is implemented and validated: [3,920 matched calls](../benchmarks/results/blorp_2_first_order_type_arguments_2026-10-18.md)

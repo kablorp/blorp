@@ -127,8 +127,8 @@ Including spent callback ports, the hard ceiling's cumulative scope is
 **1,105 production added / +601 net / 1,320 test added**. Including whole unary
 preparation instead is **1,537 / +768 / 2,289**; including all selected source
 context is **1,905 / +804 / 2,359**. These are three accounting views of the
-same ceiling, not additional allowances. Original R0, local/cumulative 3%, exact
-output/C, zero leaks and existing cost holds remain unchanged. Approval of this
+same ceiling, not additional allowances. The [SOURCE fixed-baseline contract](BOOTSTRAP_SOURCE_PLAN.md#source-cost-acceptance),
+exact output/C, zero leaks and existing absolute caps govern acceptance. Approval of this
 ledger authorizes no source writes, sampling or landing.
 
 ## Owning sites and bounded order
@@ -226,13 +226,15 @@ break cleanup are unfinished. Target List append/set currently copy a new root;
 local ownership does not prove linear construction or a performance win. Do not
 distort a correct model to avoid an unmeasured host cost.
 
-Original SOURCE R0, its held failures, local/cumulative +3% allocation and normal
-minimum-of-three instruction rules, absolute caps and exact outputs stay binding.
-Do not roll/refreeze R0, borrow the narrow type-argument/unary exception, add
-resource percentages, replace schema1 construction-checkpoint metrics with an
+The user-approved fixed-baseline policy governs remaining SOURCE slices; retain
+historical R0 criteria/failures and report cumulative trends. Per-slice +3%
+allocations and normal min3, absolute caps and exact outputs stay binding.
+Do not roll/refreeze a slice after failure, add resource percentages,
+replace schema1 construction-checkpoint metrics with an
 exit TOTAL, or substitute functional c04/std91 for required frozen cost roles.
 No fresh cost packet or baseline is created by this ledger. The known sorter
-failure 10166>9923 against 9634 remains unresolved, not waived by source progress.
+failure 10166>9923 against 9634 retains its historical FAILED verdict; new
+acceptance requires a separately named fixed B and complete candidate.
 
 Keep semantic strings at interning/discovery, loading, diagnostics and emission
 boundaries. Namespace/type/layout decisions use their existing typed IDs. String

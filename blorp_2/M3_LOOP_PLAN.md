@@ -485,8 +485,8 @@ this ceiling, not extra allowances. Existing 66 new Own-test lines are already
 charged to its forecast. Report actual complete ADD/DEL/net as ports close.
 
 This changes only the test budget for the same scalar common-loop checkpoint.
-Production, source eligibility, fixtures, resource gates and the original SOURCE
-cost hold stay unchanged. Preserve every distinct resource oracle; use existing
+Production, source eligibility, fixtures and resource gates stay unchanged;
+SOURCE cost policy is a separate decision. Preserve every distinct resource oracle; use existing
 identity seeds and direct fixtures where useful, with no output-derived raw
 inputs, adapter framework, dual tail path, compressed formatting or deleted
 coverage. A separately reviewed plan amendment precedes further test writes.
@@ -559,11 +559,12 @@ Report actual production/test gross and net separately, including replacements.
 No offsets between slices, compressed formatting, deleted coverage or borrowed
 feature budget. Reassess before exceeding a ceiling or adding a mechanism.
 
-SOURCE preparation's proposed cost role is +3% allocations and normal min3
-retired instructions per input, with the existing original-checkpoint and
-source-proxy policy UNWAIVED. A current-B-only baseline proposal is conditional
-on the unanswered user policy question: do not freeze or sample until resolved.
-Identify the policy's actual checkpoints; do not invent an automatic R0 gate.
+SOURCE preparation follows the user-approved
+[fixed-baseline contract](BOOTSTRAP_SOURCE_PLAN.md#source-cost-acceptance): +3%
+allocations and normal min3 retired instructions per input and original
+construction-checkpoint proxy against one named accepted B. Root freezes exact
+roles before setup/samples; historical R0 failures remain recorded, with
+cumulative trends reported separately. No automatic roll after failure.
 Expected TCO and ordinary-tail-match C changes require explicit review, not
 blanket normalization.
 
