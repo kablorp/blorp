@@ -755,6 +755,10 @@ The [String integer-appending plan](APPEND_INT_PLAN.md) specifies one ordinary
 temporary-library wrapper over accepted formatting and concat; implementation
 remains pending.
 
+The [Option/Result helper plan](OPTION_RESULT_HELPERS_PLAN.md) specifies five
+ordinary functions selected by explicit imports, with the prelude unchanged.
+Implementation and the separate compiler-source import migration remain pending.
+
 **Goal.** The real compiler source loads and checks against the real temporary
 library, with no remaining required parity row missing. Use the reduced resolved
 dependency inventory after source migration, not the old callback/Char rows.
