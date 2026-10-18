@@ -476,16 +476,21 @@ depth.
 **Status.** M2.1 implemented: bound and statement `match`, nested joins and
 joins in tail arms, with byte-identical C for every existing fixture; see the
 [join report](../benchmarks/results/blorp_2_join_2026-10-16.md). It settled
-three details of the sketch above. A join is a single `JoinValue` definition
-that is its own parameter (Void for a statement match), so its arms carry a
-value each, not a parameter list. A join arm only yields its value: only a
+three details of the sketch above. The original `JoinValue` definition is replaced
+by `LoweredStep.Define/Join` and explicit typed parameters in the written unary
+preparation; current lowering publishes one result (Void for a statement match)
+and empty carriers. A join arm only yields its value: only a
 tail arm returns or loops, so a yield cannot end a function and a backedge
 cannot leave a join. An arm may not reassign a variable declared outside it
 yet; M2.1b, next, makes a join also carry each reassigned variable. Its reviewed
 [carried-bindings plan](CARRIED_BINDINGS_PLAN.md) defines structured multi-output
 steps, first as a behavior-preserving preparation. Preparation budgets are
-accepted; a physical representation probe and measurement-baseline review
-precede broad migration. Carried-binding implementation has not started. The
+accepted and the early physical screen is measured. The unary preparation has
+been ported onto `0cdba16a4` and copied to a new finishing checkout from
+`e29a5396a`, including current-directory and file-read typed test seeds. The final
+base/corpus refresh follows the preceding source/library landings. Final compiled
+validation, reviews and the prospective fixed-B cost gates remain pending.
+Carried-binding feature acceptance and budgets remain unapproved. The
 checked form is `Match(CheckedJoin)` with value arms; the tail match keeps
 `CheckedMatchBody`. A match at a Void function's tail discards each arm's
 value, as a plain Void tail does. A self call at the tail of a nested match
@@ -1185,6 +1190,16 @@ Supporting-host compile-time leaks follow the
 - **Not required.** No feature requires fewer allocations, minimal retains, unique
   reuse or a new optimization benchmark. Keep local uniquely owned builders and
   one published row or slot per concrete fact.
+
+For the unary typed-step preparation only, the
+[reviewed fixed-current contract](CARRIED_BINDINGS_PLAN.md#prospective-unary-preparation-cost-contract)
+was approved before current cost sampling. One fixed final accepted B and complete
+C must pass +3% allocations and normal min3 instructions per current input and the
+original construction-checkpoint proxy, with all absolute/LOC/strict-zero/identity
+gates unchanged. Historical
+cumulative criteria and actual outcomes remain preserved, with original compliance
+UNVERIFIED unless actually measured. This contract grants no automatic widening,
+later carried-feature waiver or implementation approval.
 
 Every affected phase gets granular typed-input and typed-output tests; insertion
 and raw verification are tested independently; runtime-helper tests observe

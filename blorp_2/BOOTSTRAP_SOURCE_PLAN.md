@@ -431,6 +431,17 @@ after failure. Preserve historical criteria/results with original compliance
 UNVERIFIED unless actually measured. Absolute caps, LOC, strict zero leaks and
 exact C/diagnostics remain binding. This grants no other slice an exception.
 
+For only the [unary typed-step preparation](CARRIED_BINDINGS_PLAN.md#prospective-unary-preparation-cost-contract),
+a separately reviewed prospective contract replaces its historical cumulative
+R0 hard landing gate with one fixed accepted then-main B versus its complete C:
+each current input and the same original schema1 construction-checkpoint proxy
+must pass +3% allocations and normal min3 instructions. Freeze the full corpus,
+target library and host/metric roles first; never roll B or refreeze after failure.
+Preserve old criteria/results/failures; original compliance remains UNVERIFIED
+unless retained actual observations establish a result.
+All absolute, LOC, strict-zero and exact C/diagnostic gates remain. This contract
+grants no other slice or carried feature a waiver or implementation approval.
+
 Report gross/net production, tests and fixtures separately. Reject compressed
 formatting, deleted coverage, new tables without a measured query, or semantic
 special cases intended only to move counters. A justified minor inefficiency

@@ -4,8 +4,26 @@ Design reviewed by root and two independent compiler experts. Source baseline:
 main `e6785c22fb050572d703301eb1435f9cb8fcef4b` (2026-10-16), with the later
 argument lifts noted below. Preparation budgets are accepted. The early host
 storage screen is measured; whole-input cost and measurement-baseline review
-still precede broad migration. No production migration has run. Feature budgets
-remain unapproved.
+still precede acceptance. The unary preparation has been ported from the retained
+dirty candidate at `04fee8a6fae7bc252ced6f7b3ba8c6916d76a1c9` onto accepted base
+`0cdba16a459c1a1f5792a70ea2071f98f453b96f`. Compiled validation and current cost
+evidence remain pending; historical candidate results do not validate this port.
+Feature budgets remain unapproved.
+
+The finish checkout `finish-unary-ir/blorp`, branch `codex/finish-unary-ir`, starts
+at current main `e29a5396a147fc94b91a51f5285f2b0bd265429a`. Its inspectable
+`build/unary-ir/candidate-reviewed.patch` preserves the reviewed `8601/blorp`
+working diff without changing that checkout. The final acceptance baseline and
+fixture corpus must be refreshed after the preceding byte, concat, stderr and
+first-order landings, then frozen with source/library/binary/input hashes before
+matched measurement. New concat consumers must migrate mechanically to typed
+steps while preserving their exact identity, diagnostic and span oracles. The
+historical unary results and any byte-track policy exception do not transfer.
+
+Early characterization at this finishing base ran the nine named unary suites:
+96 callbacks passed after fixing one missed `ExecuteJoin` type-inventory arm in
+emission. The initial non-exhaustive-match compile failure is retained, not a
+passing test result. This is not final post-refresh correctness or cost evidence.
 
 ## Problem and first input
 
@@ -92,6 +110,35 @@ return v3
 ```
 
 One step introduces v2/v3; `total` has one BindingId with immutable versions v1/v3.
+
+## Current unary preparation boundary
+
+The reviewed preparation publishes `LoweredStep`/`ValueParameter` and the reserved
+carried fields, while source lowering continues to publish one result and empty
+carriers. Direct use analysis accepts the four-value/three-step input independently
+of source acceptance. Ownership insertion, verification and emission remain unary.
+
+Before introducing the result owner, own and raw verify reject nonempty
+`join.carried` with `carried join outputs are not supported during unary preparation`.
+Before visiting an arm's operations, each rejects nonempty `arm.carried` with
+`carried join transfers are not supported during unary preparation`. Both errors
+use the result parameter's span and their existing phase prefix, help and no-note
+convention. Empty-carrier diagnostics retain their existing priority and spans.
+
+The parameter's ownership classification is checked independently from its supplied
+Managed/Unmanaged variant. Unary `leave_with`, numbering, snapshots and ARC remain
+unchanged. Multi-output ownership construction, batch retirement and multi-output
+C assignments belong to the later coherent feature, along with checker acceptance.
+
+Tests retain all unary oracles and add raw rejection cases for the four admission
+boundaries, managed/unmanaged result classification, duplicate/gapped value and
+owner identities, and an arm reading its new result. The direct four-value/three-step
+use test separates value slots from execution positions. Current-directory and
+file-read test seeds consume typed steps through the same mechanical migration.
+The preparation caps remain **800 added/+250 net production**, **1,400 added/+450
+net tests**, no source-fixture changes, and **+3%** per-input/shared-proxy allocations
+and minimum retired instructions. Current physical counts are reported with the
+review handback; no cap increase is included.
 
 ## Complete facts, owners and consumers
 
@@ -239,6 +286,60 @@ fixtures **900–1,400 added/+650–1,100 net**; **6–8 fixtures/140–240 line
 Proposed stop caps: production **900 added/+450 net**, tests
 **1,600 added/+1,300 net**, fixtures **10/300 lines**. All remain unapproved;
 **+350/+450 net** is only the earlier feature estimate. Keep existing cost caps.
+
+## Prospective unary-preparation cost contract
+
+Root and an independent compiler expert reviewed and approved this prospective
+contract before any current cost sample. It applies only to the unary typed-step
+preparation. This is a separate decision, not an inherited byte or type-argument-
+translation exception and not approval of the carried feature or implementation.
+
+This contract supersedes only the preparation's historical
+cumulative reset-to-candidate hard landing gate. Preserve the original criterion,
+historical measurements and any failure literally; original compliance remains
+UNVERIFIED unless actual retained observations establish a result. Do not claim
+the old gate passed, subtract intervening feature costs or retrofit reset inputs.
+
+Freeze B at the actual accepted main after byte, concat, stderr and first-order
+landings. C is that exact B plus the complete unary preparation and its mechanical
+consumer migrations, including the new concat tests. Keep one B for the entire
+slice and every repair. Freeze target-library bytes, host/metric roles, source,
+toolchain, flags, canonical paths and the complete current registered invocation
+corpus before sampling. Preserve input bytes, modes, arguments, expected output,
+status and diagnostics; a historical fixture count is not a current inventory.
+No rolling B, refreeze after failure or baseline movement between subparts.
+
+Every applicable current input and the whole frozen-host source-to-C checkpoint
+proxy must satisfy both exact tests, with no average or cross-metric offset:
+
+```text
+100 * C_allocations <= 103 * B_allocations
+100 * C_normal_min3_instructions <= 103 * B_normal_min3_instructions
+```
+
+Use serial alternating normal B/C samples, three per variant, and separate
+positive balanced strict-zero pilot allocation observations. Normal memory modes
+remain unset. Keep all absolute fixture limits, the preparation's 800 gross/
++250 net production and 1,400 gross/+450 net test caps, source-fixture identity,
+and native ownership acceptance unchanged. An observed breach stops and remains
+visible; this contract authorizes no automatic widening or compensating edit.
+
+Preserve the original host-proxy schema1
+`artifact_construction_complete total_allocations` checkpoint with
+`BLORP_MEMORY_STATS=1`, leak mode unset, status0 and exact Generated output.
+Do not replace that count with exit-time totals. Pin and verify the original
+normal/diagnostic checkpoint host pair and its explicit host standard library;
+the borrowed c04/root-stdlib functional TestSuite role is separately recorded and
+must not be substituted silently. Any metric/host-epoch transition needs its own
+matched review. Retain actual old-host strict failures under the narrow documented
+host exception; it does not relax pilot or native zero-leak obligations.
+
+Require exact local B/C fixture C, status/stdout/stderr and full diagnostic bytes;
+never normalize output. Keep and review host-generated compiler C separately,
+where this IR model change intentionally changes the compiler's generated code.
+Report physical counts and each input/proxy verdict with hashes, commands and raw
+samples. Final acceptance still requires root plus an independent expert; the
+later multi-output feature's policy and budgets remain unapproved.
 
 ## Acceptance, dependencies and stop rules
 
