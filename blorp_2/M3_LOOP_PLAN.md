@@ -2,25 +2,25 @@
 
 ## Status, dependencies and review boundary
 
-Plan approved by root and independent source_port review, 2026-10-18, including
-the architecture and prospective ceilings below. Commit this documentation
-separately. Implementation requires its own bounded dispatch; the first scalar
-dispatch records baseline characterizations before production edits. This
-approval authorizes no cost setup, baseline freeze or sampling while SOURCE
-policy and the accepted measurement baseline remain unresolved.
+Ordinary-tail convergence amendment approved by root and independent
+compiler-expert review, 2026-10-18. No production rewrite resumes until this
+amended plan is landed. The original approved plan is preserved in Git; all
+numerical ceilings below remain unchanged.
 
-This worktree starts at accepted unary commit
-`db8abb15af4250eba1ad4c6d3efc8171cf35adaf`. Implementation depends on M2 carried
-joins: the inspected staged binary patch in `bootstrap-carried-current` has
-SHA-256 `b67726f0943af21afbf4dfdb71462a241c315c5b15f9c5d25e9133a7e6622778`
-(`git diff --cached --binary | shasum -a 256`). This is a patch digest, not a
-commit. Source line anchors below refer to that M2 dependency snapshot; the
-db8 base does not contain it. Scalar implementation may proceed in a new owned
-worktree stacked only on this exact reviewed patch, explicitly labelled a
-prospective dependency. Preserve the patch and source provenance without
-claiming M2 accepted. Final gates and publication wait for reconciliation and
-review against the actual accepted M2 integration; refresh anchors/provenance
-there. Do not modify the active M2/unary worktrees, campaign inputs or pins.
+The preceding plan's approved ceilings and baseline-policy restrictions remain
+binding. Commit this documentation separately; implementation needs its own
+bounded dispatch. No cost setup, baseline freeze or sampling is authorized while
+SOURCE policy and the accepted measurement baseline remain unresolved.
+
+M2 carried joins are accepted at
+`7acd6df25c4fe62c726614e8e9ea970071c35f73`. The scalar WIP began at unary commit
+`db8abb15af4250eba1ad4c6d3efc8171cf35adaf` with historical prospective patch
+SHA-256 `b67726f0943af21afbf4dfdb71462a241c315c5b15f9c5d25e9133a7e6622778`.
+Its pinned source/test/library trees were verified identical to accepted M2;
+these anchors refer to those accepted bytes. Preserve that WIP/index and all
+campaign pins. Review composition against accepted M2 before final gates and
+publication, retaining accepted documentation; do not destructively rebase the
+old stack or implicitly roll the host, standard library or measurement epoch.
 
 Scalar preparation does not depend on the Boolean feature. Managed while
 reuses its accepted designated-Bool route (root review identifier `800b`), or
@@ -70,11 +70,48 @@ new standard-library function or grammar expansion is needed.
 
 ## Products and construction
 
-ConcreteFunctionBlock has statements and a Return or FunctionMatch terminal.
-Function arms end in a returned expression. LoopBlock has statements and an
-Exit or Match terminal; each match arm ends in LoopExit directly. M2 joins
-still yield. A backedge cannot occur in a function or join terminal, and loop
-arms cannot recursively contain another match terminal.
+Ordinary functions have statements and one result expression. Their tail
+matches use CheckedExpr.Match/CheckedJoin, ConcreteExpr.Match and existing
+LoweredJoin, followed by the single function result. Retire ordinary
+FunctionArm/FunctionMatch/FunctionTail products and walkers. LoopBlock alone
+retains Exit or Match terminals; its arms end in Break/Recur directly. M2 joins
+still yield, and loop arms cannot recursively contain another match terminal.
+
+Preserve the explicit source root-tail distinction through annotation analysis:
+annotated root matches become LoopMatch before ordinary normalization. Otherwise
+a valid direct self call would become a rejected nested join. Reuse
+resolve_join_arms with declared return_expectation: SourceAnnotation for a known
+result, VoidTail for Void. Keep Void discards after recursion analysis and before
+publishing the generic result. Ordinary tail joins have carried=[] by
+construction; retain ParsedMatch.span and every original arm/call span. No
+persistent provenance flag, generic framework or backend shape heuristic.
+
+For example, this ordinary tail match returns an owned prefix on one branch:
+
+```blorp
+pure func choose(flag: Bool) -> String:
+    held = 1.to_string()
+    match flag:
+        True: held
+        False: 2.to_string()
+```
+
+```text
+Before: Match flag
+    True  -> Return(held_owner)
+    False -> fresh = to_string(2); Drop(held_owner); Return(fresh_owner)
+After: P = Join flag, carried=[]
+    True  -> Acquire(held); Yield(new_owner)
+    False -> fresh = to_string(2); Yield(move fresh_owner)
+Drop(held_owner)
+Return(P)
+```
+
+These are schematic ownership operations. Returning the owned prefix adds a
+retain/release pair; a fresh arm-local result can still move through the existing
+empty-carried join fast path. Parent last-use cleanup can release an unused
+prefix earlier. Supported value/IO semantics remain fixed; ARC counts, C and
+compiler costs must be measured rather than called identical.
 
 Checked self-loop origin contains only annotation Span, ordered formal
 BindingIds and the checked loop body. check/bodies supplies the formal ids to
@@ -101,42 +138,20 @@ record_layouts = prepared.records.map(
 ```
 
 Concrete LoopValue supplies the primary result without a fabricated checker
-binding. TCO becomes Return(LoopValue(loop)); while discards its Void loop
+binding. TCO has LoopValue(loop) as its result; while discards its Void loop
 result and publishes its carried bindings. While admission permits String and
 NoOwnership header representations; other managed carriers stay rejected at
 the specialization boundary that has their concrete representation.
 
-The representative lowered products below replace the old execution/exit
-products. Keep lowered/owned functions flat; no FunctionBlock wrapper there.
-The earlier 87-line prototype had that wrapper. Removing its six-line block
-including spacing and adding one flat field produces this 82-line specimen.
-The comparable old declarations occupy 40 physical lines: this product hunk
-adds 42, before any algorithms. Concrete retains its function block boundary.
+The representative products use one ordinary result and closed loop terminals.
+Keep lowered/owned functions flat. This 63-line specimen replaces the historical
+87/82-line dual-tail prototype; it is not whole-change LOC evidence.
 
 ```blorp
 fixed union LoweredStep:
     Define(ValueDefinition)
     Join(LoweredJoin)
     Loop(LoweredLoop)
-
-
-fixed record FunctionArm {
-    label: MatchLabel,
-    steps: List[LoweredStep],
-    value: ValueId
-}
-
-
-fixed record FunctionMatch {
-    scrutinee: ValueId,
-    owner: UnionInstanceId,
-    arms: List[FunctionArm]
-}
-
-
-fixed union FunctionTail:
-    ReturnValue(ValueId)
-    MatchValue(FunctionMatch)
 
 
 fixed union LoopExit:
@@ -194,7 +209,7 @@ fixed record LoweredLoop {
 fixed record LoweredFunction {
     signature: FunctionSignature,
     steps: List[LoweredStep],
-    tail: FunctionTail
+    result: ValueId
 }
 ```
 
@@ -229,6 +244,14 @@ feature acquires even an owned source before dropping its old obligation;
 there is no loop-local move fast path. Duplicate destinations need duplicate
 obligations. A projected String child is acquired before retiring its source
 parent. No cleanup follows a backedge.
+
+Scalar preparation may exercise managed P only through raw phase tests over the
+common Loop and existing M2 output batch; source scalar eligibility and unmanaged
+H stay unchanged. Extract the narrow acquisition core: keep M2's local-result
+move fast path outside it, and acquire every loop P occurrence even when there
+is only one. Test two aliased outputs from a loop-local owned String that must
+retire on Break, a separate single-output case, and an independent PRE String
+reused after the loop. PRE aliases alone do not prove local retirement.
 
 The while condition executes at the header on every iteration, including the
 initial and final false check, preserving impure calls and their order. Its
@@ -276,8 +299,10 @@ return result;
 
 Outgoing immutable captures preserve simultaneous swaps/duplicates before
 assigning header/result storage. Zero-header infinite TCO needs no fabricated
-header or base edge. Review expected annotated-TCO C changes individually;
-ordinary non-loop fixture C remains exact. No LoopInput, return-destination
+header or base edge. Review expected annotated-TCO C changes individually.
+Programs affected by neither TCO nor ordinary-tail normalization retain exact C.
+Affected ordinary matches have enumerated expected C, ARC and value/owner-ID changes;
+ABI and values remain fixed. No blanket C normalization. No LoopInput, return-destination
 mode, numbering-preservation scheme or backend TCO-shape heuristic.
 
 A one-level LoopMatch uses the existing switch structure inside while. Recur
@@ -316,7 +341,7 @@ function lines; complete regions also include intervening spacing/comments.
 | [check/recursion](src/check/recursion.brp):149,212,220,239 | tail_exit 17, recurs 6, body_recurs 11, check_execution 44; rewrites, not savings | Header identities and checked loop conversion; retain all rejections |
 | [check/bodies](src/check/bodies.brp):959,996 | Publication and Void normalization rewritten | Supply formal identities; normalize both body kinds |
 | [specialize](src/specialize/specialize.brp):1858,2542,2561 | exit_types 11, translate_exit 17 rewritten; execution field/copy removed | Products, request/type walks, admission and loop translation |
-| [lower](src/lower/lower.brp):578,586,901 | exit_span 6 and lower_exit 38 rewritten; old products 40 replaced | New products 82; common loop completion/terminal lowering |
+| [lower](src/lower/lower.brp):578,586,901 | exit_span 6 and lower_exit 38 rewritten; old products 40 replaced | Draft products 63; common loop completion/terminal lowering |
 | [own](src/own/own.brp):1326 | Admission functions 101; complete region 108 relocated, no net-saving credit | Common loop insertion/transfers; adapt shared walkers |
 | [verify](src/verify/verify.brp):2037,2098 | verify_exit 59 rewritten; obsolete preflight functions 133, complete region 141 removed | Structural headers/edges, completeness and PRE protection |
 | [emit](src/emit/emit.brp):2033,2054,2222 | append_exit 19 and append_function 30 rewritten; opening/closing switches 10 become 2 | Common loop emission and existing inventory traversal |
@@ -327,8 +352,18 @@ lower/specialize observers and preserve their exact oracles before edits.
 Managed condition checking also consumes the existing Boolean expression
 validation path; check/check and check/callables are dependency-route anchors,
 not new scalar execution consumers. Reuse its existing mismatch kind/renderer.
-The prior +175 net estimate is withdrawn. The following are prospective stop
-ceilings chosen for review, not predictions justified by the old-region sums.
+The prior +175 net estimate is withdrawn. Seven duplicate function regions
+contain 286 body lines, about 300 including separators. Keep the thin known-result
+checker adapter and repurpose shared mechanics for LoopMatch; do not count all
+300 as free savings. Ordinary products and observers provide further retirement.
+
+Whole-change planning point after convergence: about 1,100 gross/+250 net
+production lines, unmeasured. Conservative uncertainty still reaches roughly
+1,240/+406. The next dispatch is only the bounded ordinary-normalization
+checkpoint: report actual retirement and reforecast before expanding remaining
+loop algorithms. Stop/rescope if the remaining trajectory cannot fit; no ceiling
+raise, compressed formatting, removed assertions or new abstraction to fit.
+The following hard ceilings remain unchanged.
 
 | Slice | Production physical additions/net growth | Test additions | Normal feature fixtures |
 | --- | --- | --- | --- |
@@ -344,7 +379,8 @@ retired instructions per input, with the existing original-checkpoint and
 source-proxy policy UNWAIVED. A current-B-only baseline proposal is conditional
 on the unanswered user policy question: do not freeze or sample until resolved.
 Identify the policy's actual checkpoints; do not invent an automatic R0 gate.
-Expected TCO C changes require explicit review, not blanket normalization.
+Expected TCO and ordinary-tail-match C changes require explicit review, not
+blanket normalization.
 
 Managed FEATURE has a separate prospective +5% target/+10% hard shared-input
 contract and new-fixture absolute ceilings fixed before implementation. These
@@ -358,7 +394,18 @@ proxies until self-compilation works; retain raw evidence under ignored build/.
 Scalar: phase tests for origin erasure/admission, fresh H/P/PRE visibility,
 differing arities, zero arguments, swaps, duplicate occurrences, repeated prefix
 execution and exact old semantic rejection message/help/span. Review all TCO
-fixture C changes; require ordinary non-loop C identity. No managed-TCO widening.
+fixture C changes; catalogue ordinary-tail changes and require exact C for
+unaffected programs. No managed-TCO widening.
+
+Ordinary convergence: pin declared-result first-error spans, Void discards,
+empty carriers despite outer-var reassignment, and exact generic/constructor
+instance IDs. The extra result-type inventory visit must not reorder unique
+instances. Forty-three unit files refer to retired tail products: port every
+semantic/negative oracle, replacing per-arm prefix-drop traces with exact branch
+acquisition and parent cleanup. Keep missing/double cleanup, wrong-owner,
+unavailable-sibling and borrowed-child negatives, plus the actual million/
+0/1/17 output checks. No duplicate stress fixture. Extra P/owner facts and ARC
+pairs may affect costs; unchanged SOURCE +3% and original-checkpoint rules apply.
 
 Managed: test entry acquisition/caller survival, unchanged/fresh carriers,
 captured aliases, repeated borrows, duplicate/swap transfers, unused locals,
