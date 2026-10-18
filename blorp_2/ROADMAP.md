@@ -507,6 +507,10 @@ designated `Result`, and adds top-level propagation with the function return's
 ownership discharge and independent verification. It requires no early-return
 form for a join arm: nested propagation is a parser error.
 
+The [restricted control plan](RESTRICTED_CONTROL_PLAN.md) defines the next
+`if` increment and the separate, design-only function-top-level propagation
+work, including their ownership, test and cost gates. Implementation is pending.
+
 ## M2b: pattern compilation
 
 **Bootstrap scope.** Qualified flat constructor heads and non-binding constructor
