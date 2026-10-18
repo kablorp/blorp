@@ -461,17 +461,35 @@ their old whole-change forecast does not authorize writes.
 | [verify](src/verify/verify.brp):1589,2037,2319 | Common structural/edge verification and captured PRE protection; retire duplicate origin preflight | 210-250 |
 | [emit](src/emit/emit.brp):1936,2054,2222 | Common loop operations, outgoing captures, one switch/loop exit and inventory traversal | 110-140 |
 
-Forecast additional production is 850-1,020 gross / +100-280 net. Test ports
-forecast 450-520 additions and independent new phase oracles 330-360: 780-880
-total, with no new scalar fixture. Including actual ordinary prep, the forecast
-is 885-1,055 production additions / +74-254 net and 1,467-1,567 test additions.
-The remaining original ledger is 1,115 gross / +376 net production and 913 test
-additions. Stop at cumulative 1,085 production additions / +274 net and 1,587
-test additions, including prep's 35/61 production and 687/480 test counts.
-These internal stops leave reserve inside the unchanged 1,150/+350/1,600 hard
-ceilings; they are not new allowances or a reset. Stop earlier if an owner
-forecast fails. Count actual rewritten/removal regions only: relocating Own's
-admission is not a net saving, and deleting old draft code earns no credit.
+The original production forecast was 850-1,020 additional gross / +100-280 net.
+Keep the cumulative internal production stop at 1,085 additions / +274 net,
+inside the unchanged original 1,150/+350 ceiling. Count actual rewritten/removal
+regions only: relocating Own's admission is not a net saving, and deleting old
+draft code earns no credit. Stop earlier if an owner forecast fails.
+
+**Prospective test-only rescope, 2026-10-18; root and independent review approved.** The old
+1,587 internal / 1,600 hard test-addition forecast did not cover the actual
+independent raw-IR ports. A representative explicit Join port adds 25/deletes24
+lines while preserving all 47 callbacks, 27 rejection oracles and the exact
+unknown-record diagnostic/span. The closure includes 25 inline old match-tail
+construction/update sites totaling 425 literal lines, plus named wrappers and
+pattern readers. Ordinary source cannot generate these malformed resource
+states; replacing them with successful producer output would weaken coverage.
+
+Replace both old scalar test ceilings with **one cumulative hard ceiling of
+2,400 physical additions / +900 net**. This includes every prep, port and new
+oracle: actual prep/TDD is 733 additions / 480 deletions, including the 46
+admission-test lines. Own/Verify's 900-1,150 and the other owners' 250-400
+addition forecasts give 1,883-2,283 cumulative additions; they are portions of
+this ceiling, not extra allowances. Existing 66 new Own-test lines are already
+charged to its forecast. Report actual complete ADD/DEL/net as ports close.
+
+This changes only the test budget for the same scalar common-loop checkpoint.
+Production, source eligibility, fixtures, resource gates and the original SOURCE
+cost hold stay unchanged. Preserve every distinct resource oracle; use existing
+identity seeds and direct fixtures where useful, with no output-derived raw
+inputs, adapter framework, dual tail path, compressed formatting or deleted
+coverage. A separately reviewed plan amendment precedes further test writes.
 
 The actual old-tail retirement closure is 59 unit/helper files, with 286 lines
 mentioning the affected products or fields: six Lower suites, fifteen Own,
@@ -527,13 +545,14 @@ The working ordinary prep and the reviewed runtime-loop rescope replace that
 unbuildable draft. Reforecast the deferred early-IR remainder before any of its
 writes; the runtime rescope does not establish that it fits.
 The checkpoint and every later common-loop change share one cumulative
-1,150-gross/+350-net production ledger and 1,600-gross test ledger. No cap reset,
+1,150-gross/+350-net production ledger and 2,400-gross/+900-net test ledger. No cap reset,
 offset, borrowed feature budget, compressed formatting or deleted coverage.
-The following hard ceilings remain unchanged.
+The production ceilings remain unchanged; the scalar test rescope above is the
+sole replacement for its earlier internal and hard test ceilings.
 
 | Slice | Production physical additions/net growth | Test additions | Normal feature fixtures |
 | --- | --- | --- | --- |
-| Scalar preparation | at most 1,150 gross / +350 net | at most 1,600 gross | Existing TCO behavior/rejections |
+| Scalar preparation | at most 1,150 gross / +350 net | at most 2,400 gross / +900 net | Existing TCO behavior/rejections |
 | Later managed String while | at most 750 gross / +600 net | at most 1,600 gross | at most 3, at most 120 total source lines |
 
 Report actual production/test gross and net separately, including replacements.
@@ -564,8 +583,9 @@ reject the exact managed source at Specialize, and the emitted scalar function
 must have distinct H/result storage and a shared return. A setup/type failure
 does not establish that RED. Add exact typed Lower/Own/Verify Loop assertions
 with their product change, without a permanent dual-shape predicate or a new
-test framework. The whole packet, including the 59-owner ports above, has at
-most 900 additional test lines under the cumulative 1,587 internal stop.
+test framework. The whole packet, including the 59-owner ports above, shares
+the cumulative 2,400-addition/+900-net scalar test ceiling; there is no separate
+additional-test allowance.
 
 Require phase tests for Lower origin erasure, single Specialize admission,
 unchanged preorder instance IDs, fresh H/P/PRE visibility, independent arities,
