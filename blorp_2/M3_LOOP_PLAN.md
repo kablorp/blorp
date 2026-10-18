@@ -2,13 +2,16 @@
 
 ## Status, dependencies and review boundary
 
-The next checkpoint is an independently working ordinary-tail preparation,
-reviewed by root and two independent compiler experts on 2026-10-18. Commit this
-amendment separately after review, before its bounded implementation dispatch.
+The ordinary-tail preparation has passed its focused 16-test emitter suite and
+43-suite, 787-test owner batch. Its remaining acceptance, SOURCE cost evidence
+and production landing are pending. Its actual ledger is recorded below.
+The next checkpoint is the smaller scalar runtime-loop rescope reviewed by root
+and an independent compiler expert on 2026-10-18. Commit this amendment separately
+after plan review; phase tests and implementation need their own dispatch.
 The broader common-loop checkout is currently unavailable after interruption;
 root and the primary session are checking recovery. Preserve any recovered
 source and ignored evidence. This checkpoint does not approve resuming that
-draft or establish that it fits the whole cap.
+draft or establish that the deferred early-IR convergence fits the whole cap.
 The original approved plan is preserved in Git; all numerical ceilings below
 remain unchanged.
 
@@ -33,7 +36,17 @@ requires review of a bounded port of that same route if it has not landed.
 Do not create a parallel Bool channel. The unresolved SOURCE baseline policy
 does not block this plan or static consumer inventory; cost gates stay pending.
 
-## Immediate checkpoint: ordinary tail matches
+## Ordinary-tail preparation and current acceptance
+
+Actual production is 35 additions / 61 deletions (net -26) in two files,
+including the three model-comment corrections. Tests are 687 additions /
+480 deletions in 41 files, with no fixture additions. The owning emitter suite
+passed 16/16 and the owner batch passed 787/787, both with empty stderr and status
+zero. The earlier 784-pass/3-fail batch is retained: three old ordinary C-shape
+oracles were then ported with 7 additions / 5 deletions and independently
+reviewed. The checker-first RED was the expected 22 passes / 2 ordinary-shape
+failures; annotated controls stayed green. These results do not substitute for
+the remaining oracle mutation, broad/runtime gates or matched cost acceptance.
 
 Change only [check/bodies](src/check/bodies.brp)'s root-match construction. Reuse
 `resolve_join_arms` with `return_expectation(signature.return_type)`, then publish
@@ -94,6 +107,22 @@ jobs and keeps the frozen host binary and standard library unchanged. Reforecast
 the complete common-loop work against the cumulative ledger before any later
 production writes; stop for scope, ceiling, ownership or host-compiler ambiguity.
 
+## Next checkpoint: one scalar runtime loop
+
+Keep the current checked annotation analysis and checked/concrete source-tail
+products. Specialize admits scalar TCO once from sealed representation facts;
+Lower consumes the existing concrete execution marker once and erases it while
+constructing the common runtime Loop. Defer checked/concrete product and early
+origin retirement. This smaller checkpoint proves the runtime dataflow without
+claiming full early-IR convergence or admitting source while.
+
+Published lower/owned functions have steps/operations and one result. There is
+one common runtime Loop, with no legacy tail fallback in Own, Verify or Emit.
+The original prefix executes inside every iteration after fresh H identities
+replace the original formal bindings. Reuse existing pending completion,
+last-use, acquisition, verification and switch mechanics; no generic CPS/SSA
+framework, parallel loop path or new phase is authorized.
+
 ## Problem and first executable
 
 The parser accepts while, but [checking](src/check/bodies.brp) at 765 rejects it;
@@ -106,9 +135,12 @@ help: write a recursive function; loops arrive with the loops milestone
 
 This is source-inspected, not a newly executed reproduction. Existing scalar
 TCO uses a function-wide execution flag and returns/backedges in one exit type.
-First replace that representation without broadening accepted source. Then
-admit flat while with String carriers and unmanaged carriers, using the same
-loop path. The smallest feature fixture uses actual target APIs:
+First replace its runtime representation without broadening accepted source.
+Later FEATURE first admits flat while with unmanaged headers and a real main
+checking zero/one iterations with Int output `1\n7\n`; the next stage admits
+String headers and managed temporaries on the same loop path. Both stages share
+the separate feature ceiling below. The smallest managed fixture uses actual
+target APIs:
 
 ```blorp
 import:
@@ -136,22 +168,24 @@ new standard-library function or grammar expansion is needed.
 
 ## Products and construction
 
-The common-loop destination gives ordinary functions statements and one result
-expression. Their tail matches use CheckedExpr.Match/CheckedJoin,
-ConcreteExpr.Match and existing LoweredJoin, followed by the single function
-result. Retire ordinary FunctionArm/FunctionMatch/FunctionTail products and
-walkers. LoopBlock alone
-retains Exit or Match terminals; its arms end in Break/Recur directly. M2 joins
-still yield, and loop arms cannot recursively contain another match terminal.
+Ordinary tail matches already use CheckedExpr.Match/CheckedJoin,
+ConcreteExpr.Match and LoweredJoin. The next checkpoint keeps CheckedBody,
+ConcreteBody and the existing execution marker upstream of Lower for annotated
+source-tail analysis. Retire lower/owned function-tail products and their
+consumer walkers. LoopBlock alone retains Exit or Match terminals; its arms end
+in Break/Recur directly. M2 joins still yield, and loop arms cannot recursively
+contain another match terminal. Own, Verify and Emit consume only this common
+runtime shape, not a legacy annotated-tail fallback.
 
 Preserve the explicit source root-tail distinction through annotation analysis:
-annotated root matches become LoopMatch before ordinary normalization. Otherwise
-a valid direct self call would become a rejected nested join. Reuse
+annotated root matches retain CheckedMatchBody through unchanged check_execution.
+Otherwise a valid direct self call would become a rejected nested join. Reuse
 resolve_join_arms with declared return_expectation: SourceAnnotation for a known
 result, VoidTail for Void. Keep Void discards after recursion analysis and before
 publishing the generic result. Ordinary tail joins have carried=[] by
 construction; retain ParsedMatch.span and every original arm/call span. No
-persistent provenance flag, generic framework or backend shape heuristic.
+persistent downstream provenance flag, generic framework or backend shape
+heuristic. Lower alone converts the accepted annotated root to its LoopMatch.
 
 For example, this ordinary tail match returns an owned prefix on one branch:
 
@@ -180,12 +214,19 @@ empty-carried join fast path. Parent last-use cleanup can release an unused
 prefix earlier. Supported value/IO semantics remain fixed; ARC counts, C and
 compiler costs must be measured rather than called identical.
 
-Checked self-loop origin contains only annotation Span, ordered formal
-BindingIds and the checked loop body. check/bodies supplies the formal ids to
-check/recursion; retain generic, non-tail, nested-tail and no-self-call rules.
-Specialization performs annotation admission once using sealed representation
-facts, then erases the origin. Managed TCO remains rejected, including managed
-intermediates and M2 join results/carriers, with exact existing diagnostics.
+The checked producer retains its existing annotation marker and accepted body;
+check/recursion keeps generic, non-tail, nested-tail and no-self-call rules.
+Specialize performs annotation admission once using sealed representation facts.
+The concrete marker then reaches Lower only to construct the common Loop and is
+erased there. Do not add checked/concrete loop schemas in this checkpoint.
+Managed TCO remains rejected, including managed intermediates and M2 join
+results/carriers, with exact existing message, help and span.
+
+Keep the existing preorder type inventory and request order: append_value_types
+fixes concrete instance IDs and C names. Admission instead preserves lowered
+evaluation order: ordinary expression children before their parent, and each
+join's result/carriers before its arm bodies. Do not reuse the preorder inventory
+as an eligibility traversal or reorder instances to avoid a new narrow walk.
 
 At specialize:2696, unions and records are already sealed instances. Move the
 existing final `.layout` projections from program publication to immediately
@@ -204,11 +245,15 @@ record_layouts = prepared.records.map(
 -- SpecializedProgram publishes these same layouts afterward.
 ```
 
-Concrete LoopValue supplies the primary result without a fabricated checker
-binding. TCO has LoopValue(loop) as its result; while discards its Void loop
-result and publishes its carried bindings. While admission permits String and
-NoOwnership header representations; other managed carriers stay rejected at
-the specialization boundary that has their concrete representation.
+Lower reserves the Loop's primary result without a fabricated checker binding;
+the unchanged concrete body is its source, not a new Concrete LoopValue schema.
+Early checked/concrete loop products and their origin erasure are deferred and
+need a new bounded forecast before writes. Later while uses the same runtime
+Loop, discards its Void primary result and publishes carried bindings. Its
+source admission permits String and NoOwnership header representations; other
+managed carriers remain rejected at the specialization boundary that owns their
+concrete representation. Raw managed-output tests confer no managed-TCO or
+managed-header source eligibility in this scalar checkpoint.
 
 The representative products use one ordinary result and closed loop terminals.
 Keep lowered/owned functions flat. This 63-line specimen replaces the historical
@@ -296,7 +341,11 @@ the prefix against ABI captures; after conversion that prefix is inside the
 loop and reads H. Extend existing pending-block completion and step walkers,
 with typed terminal adapters; no new pass or duplicated ownership analysis.
 
-For managed entry, acquire one internal H obligation for every incoming
+Capture the actual live PRE obligations, not only an ordinal limit. Every loop
+edge must preserve each captured obligation, including an edge in a LoopMatch
+arm after nested enter replaces its enclosing-discharge policy.
+
+For later managed entry, acquire one internal H obligation for every incoming
 occurrence, even repeated aliases. The first feature conservatively protects
 every live PRE owner throughout the loop, including owned initial inputs.
 Do not move those owners into H. Borrowed ABI inputs acquire internal H owners
@@ -306,15 +355,18 @@ PRE owners only after the loop completes; this is not a minimum-retain pilot.
 H and iteration locals share the existing loop-local owner interval. On every
 Recur/Break: evaluate and capture all outgoing occurrences; acquire each
 outgoing managed occurrence; retire old header and remaining local obligations;
-publish the whole destination transfer batch; continue/break. This first
-feature acquires even an owned source before dropping its old obligation;
+publish the whole destination transfer batch; continue/break. Every Loop,
+including a scalar raw managed-output test, acquires even an owned source before
+dropping its old obligation;
 there is no loop-local move fast path. Duplicate destinations need duplicate
 obligations. A projected String child is acquired before retiring its source
 parent. No cleanup follows a backedge.
 
 Scalar preparation may exercise managed P only through raw phase tests over the
 common Loop and existing M2 output batch; source scalar eligibility and unmanaged
-H stay unchanged. Extract the narrow acquisition core: keep M2's local-result
+H stay unchanged. This is no permission to admit managed TCO, source managed
+headers or managed H implementation in the scalar slice. Extract the narrow
+acquisition core: keep M2's local-result
 move fast path outside it, and acquire every loop P occurrence even when there
 is only one. Test two aliased outputs from a loop-local owned String that must
 retire on Break, a separate single-output case, and an independent PRE String
@@ -397,32 +449,68 @@ managed carriers remain later slices. Neither first slice completes M3.
 
 ## Inventory and prospective ceilings
 
-The nine direct production modules and the exact existing rewrite/removal
-regions are below. Anchors refer to the M2 patch. Counts include physical
-function lines; complete regions also include intervening spacing/comments.
+The next checkpoint touches five production owners. Checked/concrete product
+retirement, check/recursion conversion and utils/syntax retirement are deferred;
+their old whole-change forecast does not authorize writes.
 
-| Owner | Existing region and accounting | Addition/replacement |
+| Owner | Bounded change | Additional physical additions |
 | --- | --- | --- |
-| [utils/syntax](src/utils/syntax.brp):317 | FunctionExecution: 3 removed | None |
-| [check/model](src/check/model.brp):237,269,481 | Exit/flag products; call walker rewritten | Closed products/origin; retain call discovery |
-| [check/recursion](src/check/recursion.brp):149,212,220,239 | tail_exit 17, recurs 6, body_recurs 11, check_execution 44; rewrites, not savings | Header identities and checked loop conversion; retain all rejections |
-| [check/bodies](src/check/bodies.brp):959,996 | Publication and Void normalization rewritten | Supply formal identities; normalize both body kinds |
-| [specialize](src/specialize/specialize.brp):1858,2542,2561 | exit_types 11, translate_exit 17 rewritten; execution field/copy removed | Products, request/type walks, admission and loop translation |
-| [lower](src/lower/lower.brp):578,586,901 | exit_span 6 and lower_exit 38 rewritten; old products 40 replaced | Draft products 63; common loop completion/terminal lowering |
-| [own](src/own/own.brp):1326 | Admission functions 101; complete region 108 relocated, no net-saving credit | Common loop insertion/transfers; adapt shared walkers |
-| [verify](src/verify/verify.brp):2037,2098 | verify_exit 59 rewritten; obsolete preflight functions 133, complete region 141 removed | Structural headers/edges, completeness and PRE protection |
-| [emit](src/emit/emit.brp):2033,2054,2222 | append_exit 19 and append_function 30 rewritten; opening/closing switches 10 become 2 | Common loop emission and existing inventory traversal |
+| [specialize](src/specialize/specialize.brp):2542 | One scalar admission walk, sealed layout projections; preserve source products and instance order | 120-150 |
+| [lower](src/lower/lower.brp):747,926 | One pending Loop, fresh H/P intervals, original prefix/body conversion and shared step walkers | 210-250 |
+| [own](src/own/own.brp):1082,1326 | Common insertion/edge batches; relocate admission, with no move credit | 200-230 |
+| [verify](src/verify/verify.brp):1589,2037,2319 | Common structural/edge verification and captured PRE protection; retire duplicate origin preflight | 210-250 |
+| [emit](src/emit/emit.brp):1936,2054,2222 | Common loop operations, outgoing captures, one switch/loop exit and inventory traversal | 110-140 |
 
-There are 39 direct execution/backedge unit consumers (check 1, emit 7, own 5,
-verify 25, helper 1), not 39 total affected tests. Inventory additional
-lower/specialize observers and preserve their exact oracles before edits.
-Managed condition checking also consumes the existing Boolean expression
-validation path; check/check and check/callables are dependency-route anchors,
-not new scalar execution consumers. Reuse its existing mismatch kind/renderer.
-The prior +175 net estimate is withdrawn. Seven duplicate function regions
-contain 286 body lines, about 300 including separators. Keep the thin known-result
-checker adapter and repurpose shared mechanics for LoopMatch; do not count all
-300 as free savings. Ordinary products and observers provide further retirement.
+Forecast additional production is 850-1,020 gross / +100-280 net. Test ports
+forecast 450-520 additions and independent new phase oracles 330-360: 780-880
+total, with no new scalar fixture. Including actual ordinary prep, the forecast
+is 885-1,055 production additions / +74-254 net and 1,467-1,567 test additions.
+The remaining original ledger is 1,115 gross / +376 net production and 913 test
+additions. Stop at cumulative 1,085 production additions / +274 net and 1,587
+test additions, including prep's 35/61 production and 687/480 test counts.
+These internal stops leave reserve inside the unchanged 1,150/+350/1,600 hard
+ceilings; they are not new allowances or a reset. Stop earlier if an owner
+forecast fails. Count actual rewritten/removal regions only: relocating Own's
+admission is not a net saving, and deleting old draft code earns no credit.
+
+The actual old-tail retirement closure is 59 unit/helper files, with 286 lines
+mentioning the affected products or fields: six Lower suites, fifteen Own,
+twenty-seven Verify, eight Emit and three shared helpers. The smaller
+execution/backedge-keyword inventory of 24 files is insufficient. Preserve each
+semantic/fault oracle in this complete closure under [test/unit](test/unit/):
+
+- Helpers (3): `join_inputs.brp`, `managed_union_inputs.brp`,
+  `ownership_inputs.brp`.
+- `test_lower/` (6): `test_float_phases.brp`, `test_join.brp`,
+  `test_lower.brp`, `test_managed_union.brp`, `test_option_contracts.brp`,
+  `test_record_update.brp`.
+- `test_own/` (15): `test_constants.brp`, `test_current_directory.brp`,
+  `test_file_read.brp`, `test_generic_list_phases.brp`, `test_int_equals.brp`,
+  `test_join.brp`, `test_managed_union.brp`, `test_own.brp`,
+  `test_record_lower.brp`, `test_string_concat.brp`,
+  `test_string_from_codepoint.brp`, `test_string_literals_phases.brp`,
+  `test_tail_recursion.brp`, `test_tail_recursion_phases.brp`,
+  `test_write_file.brp`.
+- `test_verify/` (27): `test_arguments.brp`, `test_boolean_contracts.brp`,
+  `test_carried_join.brp`, `test_direct_union_payloads.brp`, `test_file_read.brp`,
+  `test_float_ownership.brp`, `test_list_membership.brp`,
+  `test_list_ownership.brp`, `test_managed_records.brp`, `test_managed_union.brp`,
+  `test_multiple_union_fields.brp`, `test_multiple_union_ownership.brp`,
+  `test_nested_payload.brp`, `test_option_ownership.brp`, `test_owned_prefix.brp`,
+  `test_owned_scrutinee.brp`, `test_record.brp`, `test_record_update_ownership.brp`,
+  `test_recursive_unions.brp`, `test_result_ownership.brp`,
+  `test_string_concat.brp`, `test_tail_recursion.brp`, `test_union.brp`,
+  `test_verify.brp`, `test_void_print_ownership.brp`, `test_void_returns.brp`,
+  `test_write_file.brp`.
+- `test_emit/` (8): `test_builtin_functions.brp`, `test_emit.brp`,
+  `test_function_recursion_ownership.brp`, `test_generic_ownership.brp`,
+  `test_list_phases.brp`, `test_managed_union.brp`, `test_recursive_unions.brp`,
+  `test_string_literals_ownership.brp`.
+
+Managed condition checking later reuses the existing Boolean validation route;
+check/check and check/callables are dependency anchors, not scalar consumers.
+Reuse the existing mismatch kind/renderer. All older net/duplicate-region
+estimates are superseded by this bounded forecast, not counted as free savings.
 
 The historically reviewed broad draft had 774 gross additions and 568 deletions
 across six production owners, before Own/Verify/Emit were ported. Its original
@@ -435,8 +523,9 @@ the last independent Own (190-240) and Verify (180-230) forecasts already
 consumed 370-470 before Emit. That draft is not an accepted working increment
 or a feasible whole forecast. The earlier roughly
 1,100/+250 planning point and 1,240/+406 uncertainty do not authorize more writes.
-Complete only the independently working checkpoint above, report actual
-retirement, and reforecast the whole remainder before resuming loop algorithms.
+The working ordinary prep and the reviewed runtime-loop rescope replace that
+unbuildable draft. Reforecast the deferred early-IR remainder before any of its
+writes; the runtime rescope does not establish that it fits.
 The checkpoint and every later common-loop change share one cumulative
 1,150-gross/+350-net production ledger and 1,600-gross test ledger. No cap reset,
 offset, borrowed feature budget, compressed formatting or deleted coverage.
@@ -468,23 +557,41 @@ proxies until self-compilation works; retain raw evidence under ignored build/.
 
 ## Acceptance and stop rules
 
-Scalar: phase tests for origin erasure/admission, fresh H/P/PRE visibility,
-differing arities, zero arguments, swaps, duplicate occurrences, repeated prefix
-execution and exact old semantic rejection message/help/span. Review all TCO
-fixture C changes; catalogue ordinary-tail changes and require exact C for
-unaffected programs. No managed-TCO widening.
+Scalar begins with an existing-style phase-test-first packet, separately
+reviewed before production writes. Use the current specialization/emission APIs
+for meaningful semantic RED before new IR constructors exist: admission must
+reject the exact managed source at Specialize, and the emitted scalar function
+must have distinct H/result storage and a shared return. A setup/type failure
+does not establish that RED. Add exact typed Lower/Own/Verify Loop assertions
+with their product change, without a permanent dual-shape predicate or a new
+test framework. The whole packet, including the 59-owner ports above, has at
+most 900 additional test lines under the cumulative 1,587 internal stop.
 
-The immediate checkpoint has the independent acceptance contract above. For
-later complete ordinary convergence, pin declared-result first-error spans,
-Void discards, empty carriers despite outer-var reassignment, and exact
-generic/constructor instance IDs. The extra result-type inventory visit must
-not reorder unique
-instances. Forty-three unit files refer to retired tail products: port every
-semantic/negative oracle, replacing per-arm prefix-drop traces with exact branch
-acquisition and parent cleanup. Keep missing/double cleanup, wrong-owner,
-unavailable-sibling and borrowed-child negatives, plus the actual million/
-0/1/17 output checks. No duplicate stress fixture. Extra P/owner facts and ARC
-pairs may affect costs; unchanged SOURCE +3% and original-checkpoint rules apply.
+Require phase tests for Lower origin erasure, single Specialize admission,
+unchanged preorder instance IDs, fresh H/P/PRE visibility, independent arities,
+zero H, swaps, duplicate occurrences and original-prefix execution on every
+iteration. Check exact old source rejection message/help/span and child-first
+first-error order. Source managed-TCO/header eligibility stays unchanged.
+
+Own tests check the complete acquire-all-occurrences, retire-H/locals, then
+publish-batch order; include one and two aliased loop-local String outputs and
+an unrelated PRE String read afterward. Independently constructed malformed
+Verify inputs must reject unavailable P/H, wrong edge arity/type, reused or
+missing outgoing obligations, live old locals and captured PRE discharge,
+including through a LoopMatch arm. No origin preflight or legacy tail fallback
+may hide an invalid common loop. Raw managed P acceptance is only a phase
+resource proof, not permission for source managed TCO or managed H.
+
+Port every semantic/negative oracle in the enumerated 59-owner closure. Keep
+missing/double cleanup, wrong-owner, unavailable-sibling and borrowed-child
+faults. Preserve annotated source diagnostics at their actual producer rather
+than adding a TCO-origin flag to the raw common runtime verifier. Keep ordinary
+declared-result first errors, final Void discards, empty carriers despite outer
+reassignment and exact generic/constructor instance order. Review all affected
+TCO C individually and require exact C for unaffected programs. Retain the
+actual million/0/1/17 output checks without a duplicate stress fixture. Extra
+P/owner facts and ARC pairs may affect costs; SOURCE +3% and the original R0
+hold still block cost acceptance and production landing.
 
 Managed: test entry acquisition/caller survival, unchanged/fresh carriers,
 captured aliases, repeated borrows, duplicate/swap transfers, unused locals,
