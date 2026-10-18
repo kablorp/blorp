@@ -458,12 +458,12 @@ whole-change forecast does not authorize writes.
 | --- | --- | --- |
 | [specialize](src/specialize/specialize.brp):2542 | One scalar admission walk, sealed layout projections; preserve source products and instance order | 233 observed; 240 maximum |
 | [lower](src/lower/lower.brp):747,926 | One pending Loop, fresh H/P intervals, original prefix/body conversion and shared step walkers | 210-250 |
-| [own](src/own/own.brp):1082,1326 | Common insertion/edge batches; relocate admission, with no move credit | 282 in uncompiled syntax-correction scratch; re-estimate before further additions |
+| [own](src/own/own.brp):1082,1326 | Common insertion/edge batches; relocate admission, with no move credit | 285 observed after host-typing correction; re-estimate before further additions |
 | [verify](src/verify/verify.brp):1589,2037,2319 | Common structural/edge verification and captured PRE protection; retire duplicate origin preflight | 210-250 |
 | [emit](src/emit/emit.brp):1936,2054,2222 | Common loop operations, outgoing captures, one switch/loop exit and inventory traversal | 162 observed; re-estimate before further additions |
 
 The original production forecast was 850-1,020 additional gross / +100-280 net.
-Keep the cumulative internal production stop at 1,085 additions / +274 net,
+Keep the cumulative internal production stop at 1,087 additions / +274 net,
 inside the unchanged original 1,150/+350 ceiling. Count actual rewritten/removal
 regions only: relocating Own's admission is not a net saving, and deleting old
 draft code earns no credit. Stop earlier if an owner forecast fails.
@@ -477,14 +477,33 @@ next H ordinal, actual PRE lookup, exact concrete type and `NoOwnership`, in tha
 order. Publish one row only on success. Preserve sequential transfer consumption,
 all acquisitions before retirement, and PRE protection before local-owner checks.
 
-The complete readable, uncompiled scratch correction has **1,084 production additions /
+That complete readable scratch correction had **1,084 production additions /
 834 deletions / +250 net**, including 35 additions in the Check preparation.
 Own is 282/335; Verify is 222/269; Emit remains 162/81. This refreshes Own's old
 200-230 and Emit's old 110-140 forecasts; it adds no mechanism or cumulative
-allowance. The unchanged internal stop leaves **one gross addition and 24 net**;
+allowance. That internal stop left **one gross addition and 24 net**;
 owner rows are not stackable allowances. Review the exact scratch patch before
 tracked writes and re-estimate before any further addition. All source eligibility,
 fixture, test and resource gates remain unchanged.
+
+**Host-typing correction, 2026-10-18.** Two subsequently diagnosed indentation
+errors were corrected without changing these counts. The next check reached
+host typechecking and stopped with 11 diagnostics before any test. Add the
+explicit carried `List[ValueParameter]` annotation and replace the nested
+retirement `?=` with a function-level Result binding, publishing its accepted
+entries. Preserve acquisition-before-retirement, empty-carrier behavior and
+first-error order. Retain the accepted integer-comparison calls while their
+unlocated diagnostic remains unproven.
+
+The complete correction is **1,087 production additions / 836 deletions /
++251 net**, with Own at 285/337. The physical diff adds three gross lines,
+not the one initially estimated: the annotation and changed publication line
+also count. Stop at the old 1,085 internal ceiling; this reviewed reforecast
+raises only that internal stop to **1,087/+274**, leaving no gross room and
+23 net. The original **1,150/+350 hard ceiling** remains unchanged. Tests stay
+3,209/2,686/+523. No additional mechanism, formatting compression, coverage
+removal, cost waiver or source eligibility change is authorized. Review this
+exact correction before another focused check; it has no semantic verdict yet.
 
 **Prospective test-only rescope, 2026-10-18; root and independent review approved.** The old
 1,587 internal / 1,600 hard test-addition forecast did not cover the actual
@@ -513,7 +532,7 @@ producer-derived accepted products cannot replace malformed-IR tests.
 
 Specialize's recovered 233 additions exceed its earlier 120-150 owner forecast.
 Its refreshed 240-addition maximum leaves seven lines for corrections within
-the unchanged whole-production 1,085/+274 internal and 1,150/+350 hard stops.
+the current whole-production 1,087/+274 internal and 1,150/+350 hard stops.
 Before syntax correction, static whole production was 997 additions /
 835 deletions (+162); the corrected forecast above supersedes that snapshot.
 Further production work needs a forecast within the remaining allowances. Report
