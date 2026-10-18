@@ -2,10 +2,15 @@
 
 ## Status, dependencies and review boundary
 
-Ordinary-tail convergence amendment approved by root and independent
-compiler-expert review, 2026-10-18. No production rewrite resumes until this
-amended plan is landed. The original approved plan is preserved in Git; all
-numerical ceilings below remain unchanged.
+The next checkpoint is an independently working ordinary-tail preparation,
+reviewed by root and two independent compiler experts on 2026-10-18. Commit this
+amendment separately after review, before its bounded implementation dispatch.
+The broader common-loop checkout is currently unavailable after interruption;
+root and the primary session are checking recovery. Preserve any recovered
+source and ignored evidence. This checkpoint does not approve resuming that
+draft or establish that it fits the whole cap.
+The original approved plan is preserved in Git; all numerical ceilings below
+remain unchanged.
 
 The preceding plan's approved ceilings and baseline-policy restrictions remain
 binding. Commit this documentation separately; implementation needs its own
@@ -27,6 +32,67 @@ reuses its accepted designated-Bool route (root review identifier `800b`), or
 requires review of a bounded port of that same route if it has not landed.
 Do not create a parallel Bool channel. The unresolved SOURCE baseline policy
 does not block this plan or static consumer inventory; cost gates stay pending.
+
+## Immediate checkpoint: ordinary tail matches
+
+Change only [check/bodies](src/check/bodies.brp)'s root-match construction. Reuse
+`resolve_join_arms` with `return_expectation(signature.return_type)`, then publish
+an unannotated root as `CheckedValueBody(ReturnExpression(value))`, where
+`value.form` is `Match(join)`, its type is the declared result, its span is
+`ParsedMatch.span`, and `join.carried=[]`. Only the function return continues, so
+outer-variable reassignment needs no continuation carrier. Preserve captures,
+arm statements, arm/call spans, declaration order and binding identities.
+
+For an annotated root, convert those accepted join arms to the existing
+`CheckedMatchBody` using one local List builder, before unchanged
+`check_execution` sees direct self calls. Keep scalar TCO admission, origin,
+rejections and runtime behavior. Void discards still happen after recursion
+analysis. Final unannotated Void publication has
+`DiscardExpression(Match(join))` in the statements, followed by
+`ReturnExpression(LiteralVoid)`; each arm's non-Void value is discarded once.
+Tests assert that final shape, original match span and empty carriers. Delete
+the replaced `ArmProgress` and `resolve_arms` in this slice; keep the
+`ValueExpectation` rationale. No new IR, flag, helper framework or
+early-return mechanism is needed. Existing specialize/lower/own/verify/emit
+already consume the ordinary value-join route and need no production port.
+
+The historically reviewed ordinary-only specimen forecasts 22 gross additions
+and 62 deletions in one production file (net -40), before the local builder and
+comment adjustment. Reconstruct actual code from accepted source only after
+plan and TDD review; a reconstruction is not evidence of the retained original.
+The checkpoint's hard production ceiling is 50 gross additions and a net
+reduction. Test/fixture additions forecast 400-650 gross, with a hard
+800-gross ceiling, inclusive of changed ordinary expected-output assertions and
+at most one 40-line ordinary managed-runtime fixture. These are debits within
+the unchanged cumulative scalar ceilings, not a new allowance or offsets for
+later work. Report production, tests and fixture lines separately.
+
+First add owning checker tests that fail on the old ordinary product shape:
+Int and Void results, captures, statements, exact match span, declared-result
+first errors and empty carriers despite reassignment. Keep annotated-root and
+negative diagnostic oracles. Update only affected ordinary observers, including
+exact generic/constructor instance order; retain all 43 legacy tail-owner test
+files and their semantic/negative coverage. Add independent Own/Verify assertions
+for a returned owned prefix, a fresh arm-local result and surviving old aliases;
+the ordinary managed fixture uses its real `main` and must leak zero objects.
+Preserve the existing million-iteration and 0/1/17 scalar-TCO controls.
+
+Record the expected affected C/ARC changes: joins introduce a shared result and
+yield assignments; returning a parent-owned prefix adds acquisition and parent
+cleanup, while a fresh arm-local keeps the existing empty-carried move. Parent
+last-use cleanup and value/owner numbering can change; values, ABI, spans and
+evaluation order must not. Review these changes explicitly and require exact C
+for unaffected programs. Prove a new oracle by a deliberate fault followed by
+restored green, then run the focused and full owning gates. No Python tests,
+alternate fixture main, emitted-output rewrite or new feature fixture budget.
+
+SOURCE +3%, the original R0/checkpoint policy and its unresolved hold are
+unchanged: no cost setup, baseline/corpus freeze, epoch change or sampling is
+authorized. The hold blocks cost acceptance and production landing, not the
+separately dispatched TDD/static implementation. The root leases all compiled
+jobs and keeps the frozen host binary and standard library unchanged. Reforecast
+the complete common-loop work against the cumulative ledger before any later
+production writes; stop for scope, ceiling, ownership or host-compiler ambiguity.
 
 ## Problem and first executable
 
@@ -70,10 +136,11 @@ new standard-library function or grammar expansion is needed.
 
 ## Products and construction
 
-Ordinary functions have statements and one result expression. Their tail
-matches use CheckedExpr.Match/CheckedJoin, ConcreteExpr.Match and existing
-LoweredJoin, followed by the single function result. Retire ordinary
-FunctionArm/FunctionMatch/FunctionTail products and walkers. LoopBlock alone
+The common-loop destination gives ordinary functions statements and one result
+expression. Their tail matches use CheckedExpr.Match/CheckedJoin,
+ConcreteExpr.Match and existing LoweredJoin, followed by the single function
+result. Retire ordinary FunctionArm/FunctionMatch/FunctionTail products and
+walkers. LoopBlock alone
 retains Exit or Match terminals; its arms end in Break/Recur directly. M2 joins
 still yield, and loop arms cannot recursively contain another match terminal.
 
@@ -357,12 +424,22 @@ contain 286 body lines, about 300 including separators. Keep the thin known-resu
 checker adapter and repurpose shared mechanics for LoopMatch; do not count all
 300 as free savings. Ordinary products and observers provide further retirement.
 
-Whole-change planning point after convergence: about 1,100 gross/+250 net
-production lines, unmeasured. Conservative uncertainty still reaches roughly
-1,240/+406. The next dispatch is only the bounded ordinary-normalization
-checkpoint: report actual retirement and reforecast before expanding remaining
-loop algorithms. Stop/rescope if the remaining trajectory cannot fit; no ceiling
-raise, compressed formatting, removed assertions or new abstraction to fit.
+The historically reviewed broad draft had 774 gross additions and 568 deletions
+across six production owners, before Own/Verify/Emit were ported. Its original
+checkout is currently unavailable after interruption; these historical counts
+and the last forecast below are not a current patch-identity claim. Root and
+the primary session are checking recovery; preserve any recovered source and
+ignored evidence without presenting reconstructed files as retained evidence.
+That draft left only 376 gross additions under the approved whole ceiling;
+the last independent Own (190-240) and Verify (180-230) forecasts already
+consumed 370-470 before Emit. That draft is not an accepted working increment
+or a feasible whole forecast. The earlier roughly
+1,100/+250 planning point and 1,240/+406 uncertainty do not authorize more writes.
+Complete only the independently working checkpoint above, report actual
+retirement, and reforecast the whole remainder before resuming loop algorithms.
+The checkpoint and every later common-loop change share one cumulative
+1,150-gross/+350-net production ledger and 1,600-gross test ledger. No cap reset,
+offset, borrowed feature budget, compressed formatting or deleted coverage.
 The following hard ceilings remain unchanged.
 
 | Slice | Production physical additions/net growth | Test additions | Normal feature fixtures |
@@ -397,9 +474,11 @@ execution and exact old semantic rejection message/help/span. Review all TCO
 fixture C changes; catalogue ordinary-tail changes and require exact C for
 unaffected programs. No managed-TCO widening.
 
-Ordinary convergence: pin declared-result first-error spans, Void discards,
-empty carriers despite outer-var reassignment, and exact generic/constructor
-instance IDs. The extra result-type inventory visit must not reorder unique
+The immediate checkpoint has the independent acceptance contract above. For
+later complete ordinary convergence, pin declared-result first-error spans,
+Void discards, empty carriers despite outer-var reassignment, and exact
+generic/constructor instance IDs. The extra result-type inventory visit must
+not reorder unique
 instances. Forty-three unit files refer to retired tail products: port every
 semantic/negative oracle, replacing per-arm prefix-drop traces with exact branch
 acquisition and parent cleanup. Keep missing/double cleanup, wrong-owner,
