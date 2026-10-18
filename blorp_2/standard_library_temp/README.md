@@ -96,3 +96,6 @@ The host attempts LF after short writes as well. Neither API reports delivery.
 The system adapter publishes impure `write_file(String, String) -> Result[Void, String]`.
 Ok carries Void; Err owns a fresh String. See [File writing](../README.md#file-writing)
 for counted bytes, one-close error priority and target NUL-path teaching text.
+
+`path: join` imports pure String joining: an absolute child replaces the base; an empty base returns the child.
+Otherwise retain/add `/` without normalization; see the [join contract](../ROADMAP.md#seven-shell-and-path-functions).
