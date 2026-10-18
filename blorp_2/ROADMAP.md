@@ -534,6 +534,11 @@ deferred cases. No general pattern-matrix implementation is implied.
 
 ## M3: loops and tail recursion
 
+The first two bounded slices and their review gates are specified in
+[M3_LOOP_PLAN.md](M3_LOOP_PLAN.md): scalar representation preparation, then
+managed String while. They precede the broader exit proof below; neither
+slice alone completes M3.
+
 **Goal.** Managed List/while loops, with one explicit edge/ownership mechanism.
 Retain existing scalar `@tail_recursive` behavior; broader managed/generic tail-
 call optimization is not a bootstrap prerequisite. Rewrite the source's flat
