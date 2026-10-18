@@ -1,0 +1,181 @@
+import:
+	../../../src/specialize/specialize as Concrete
+	../../../src/utils/syntax: Diagnostic, entry_function
+	../input: checked_source
+	../product_lifetime_inputs: call_source, applied_type_source
+	test: TestSuite
+
+
+private fixed record RetainedCalls {
+	expression: Concrete.ConcreteExpr,
+	target: Concrete.FunctionInstanceId,
+	signature: Concrete.FunctionSignature
+}
+
+
+private fixed record RetainedApplication {
+	expression: Concrete.ConcreteExpr,
+	signature: Concrete.FunctionSignature,
+	records: List[Concrete.ConcreteRecord],
+	unions: List[Concrete.ConcreteUnion]
+}
+
+
+-- The source has one field and one variant; zero names their declared slot.
+private FIRST_MEMBER_POSITION: Int = 0
+
+
+private pure func specialized_source(source: String) -> Result[Concrete.SpecializedProgram, Diagnostic]:
+	checked ?= checked_source(source)
+	Concrete.specialize(checked)
+
+
+private pure func main_value(
+	functions: List[Concrete.ConcreteFunction],
+	entry: Concrete.FunctionInstanceId,
+) -> Option[Concrete.ConcreteExpr]:
+	match functions.get(Concrete.function_number(entry)):
+		Some(function):
+			match function.body:
+				Concrete.ConcreteValueBody(Concrete.ReturnExpression(value)): Some(value)
+				_: None
+		None: None
+
+
+-- No program or function vector escapes either scoped producer.
+private pure func retained_calls(depth: Int) -> Option[RetainedCalls]:
+	match specialized_source(call_source(depth)):
+		Err(_): None
+		Ok(parent):
+			contents = Concrete.specialized_contents(parent)
+			match main_value(contents.functions, entry_function(contents.entrypoint)):
+				Some(expression):
+					match expression.form:
+						Concrete.InvokeFunction(call, [_]):
+							match call.target:
+								Concrete.UserFunction(target):
+									match contents.functions.get(Concrete.function_number(target)):
+										Some(callee):
+											Some({
+												expression = expression,
+												target = target,
+												signature = callee.signature
+											})
+										None: None
+								_: None
+						_: None
+				None: None
+
+
+private pure func retained_application(depth: Int) -> Option[RetainedApplication]:
+	match specialized_source(applied_type_source(depth)):
+		Err(_): None
+		Ok(parent):
+			contents = Concrete.specialized_contents(parent)
+			match main_value(contents.functions, entry_function(contents.entrypoint)):
+				Some(value):
+					match value.form:
+						Concrete.InvokeFunction(call, [expression]):
+							match call.target:
+								Concrete.UserFunction(target):
+									match contents.functions.get(Concrete.function_number(target)):
+										Some(callee):
+											Some({
+												expression = expression,
+												signature = callee.signature,
+												records = contents.records,
+												unions = contents.unions
+											})
+										None: None
+								_: None
+						_: None
+				None: None
+
+
+private pure func concrete_calls_survive(depth: Int) -> Bool:
+	match retained_calls(depth):
+		None: False
+		Some(product):
+			var current = product.expression
+			var calls = 0
+			var found: Option[Int] = None
+			while True:
+				if not Concrete.same_type(current.value_type, Concrete.IntType):
+					break
+				match current.form:
+					Concrete.InvokeFunction(call, [child]):
+						match call.target:
+							Concrete.UserFunction(target):
+								if Concrete.function_number(target) != Concrete.function_number(product.target):
+									break
+								current = child
+								calls = calls + 1
+							_: break
+					Concrete.LiteralInteger(7):
+						found = Some(calls)
+						break
+					_: break
+			match product.signature.parameters:
+				[parameter]:
+					(
+						found == Some(depth) and Concrete.same_type(parameter, Concrete.IntType)
+						and Concrete.same_type(product.signature.return_type, Concrete.IntType)
+					)
+				_: False
+
+
+private pure func concrete_applications_survive(depth: Int) -> Bool:
+	match retained_application(depth):
+		None: False
+		Some(product):
+			match product.signature.parameters:
+				[parameter]:
+					var current_type = parameter
+					var current = product.expression
+					var valid = Concrete.same_type(product.signature.return_type, Concrete.IntType)
+					for _ in 0..depth:
+						match (current_type, current.form):
+							(Concrete.RecordType(record_id), Concrete.ConstructRecord(actual, [field])):
+								valid = (
+									valid and Concrete.same_type(current.value_type, current_type)
+									and Concrete.record_number(actual) == Concrete.record_number(record_id)
+									and Concrete.record_number(Concrete.field_owner(field.field)) == Concrete.record_number(record_id)
+									and Concrete.field_number(field.field) == FIRST_MEMBER_POSITION
+								)
+								match (field.value.value_type, field.value.form):
+									(Concrete.UnionType(union_id), Concrete.ConstructVariant(variant, [child])):
+										match (product.records.get(Concrete.record_number(record_id)), product.unions.get(Concrete.union_number(union_id))):
+											(Some(record_layout), Some(union_layout)):
+												match (record_layout.fields, union_layout.variants):
+													([stored_union], [[next_type]]):
+														valid = (
+															valid and Concrete.same_type(stored_union, Concrete.UnionType(union_id))
+															and Concrete.union_number(Concrete.variant_owner(variant)) == Concrete.union_number(union_id)
+															and Concrete.variant_number(variant) == FIRST_MEMBER_POSITION
+														)
+														current_type = next_type
+														current = child
+													_: valid = False
+											_: valid = False
+									_: valid = False
+							_: valid = False
+					match current.form:
+						Concrete.LiteralInteger(7):
+							valid and Concrete.same_type(current_type, Concrete.IntType) and Concrete.same_type(current.value_type, Concrete.IntType)
+						_: False
+				_: False
+
+
+tests: TestSuite = {
+	description = "Retained specialized products",
+	tests = [
+		("16 concrete calls survive their program", pure func(): concrete_calls_survive(16)),
+		("32 concrete calls survive their program", pure func(): concrete_calls_survive(32)),
+		("64 concrete calls survive their program", pure func(): concrete_calls_survive(64)),
+		("128 concrete calls survive their program", pure func(): concrete_calls_survive(128)),
+		("16 mixed constructions survive their specialized program", pure func(): concrete_applications_survive(16)),
+		("32 mixed constructions survive their specialized program", pure func(): concrete_applications_survive(32)),
+		("64 mixed constructions survive their specialized program", pure func(): concrete_applications_survive(64)),
+		("128 mixed constructions survive their specialized program", pure func(): concrete_applications_survive(128)),
+	]
+}

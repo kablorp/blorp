@@ -1,5 +1,10 @@
 import:
-	../../../src/check/model: TypeRef(IntType, StringType, ListType), same_type
+	../../../src/check/model as Model: TypeRef(IntType, StringType, ListType), same_type
+	../../../src/check/check: checked_functions, record_declaration_id, union_declaration_id
+	../../../src/utils/ids as Declaration
+	../../../src/utils/syntax: Purity(Pure)
+	../input: checked_source
+	../product_lifetime_inputs: call_source, applied_type_source
 	test: TestSuite
 
 
@@ -60,9 +65,117 @@ private pure func broad_product_survives(width: Int) -> Bool:
 		None: False
 
 
+private fixed record RetainedCalls {
+	expression: Model.CheckedExpr,
+	target: Declaration.FunctionId,
+	signature: Model.FunctionSignature
+}
+
+
+private fixed record RetainedApplication {
+	value_type: TypeRef,
+	record_id: Declaration.RecordId,
+	union_id: Declaration.UnionId
+}
+
+
+-- The fixture declares keep then main. Only the projection and issued ID escape.
+private pure func retained_calls(depth: Int) -> Option[RetainedCalls]:
+	match checked_source(call_source(depth)):
+		Err(_): None
+		Ok(parent):
+			match checked_functions(parent).functions:
+				[keep, main]:
+					match main.body:
+						Model.CheckedValueBody(Model.ReturnExpression(expression)):
+							Some({
+								expression = expression,
+								target = keep.id,
+								signature = keep.signature
+							})
+						_: None
+				_: None
+
+
+-- Zero is a declaration position passed to its issuer, not a fabricated ID.
+private pure func retained_application(depth: Int) -> Option[RetainedApplication]:
+	match checked_source(applied_type_source(depth)):
+		Err(_): None
+		Ok(parent):
+			match (record_declaration_id(parent, 0), union_declaration_id(parent, 0), checked_functions(parent).functions):
+				(Some(record_id), Some(union_id), [consume, _]):
+					match consume.signature.parameters:
+						[parameter]:
+							Some({
+								value_type = parameter.value_type,
+								record_id = record_id,
+								union_id = union_id
+							})
+						_: None
+				_: None
+
+
+private pure func checked_calls_survive(depth: Int) -> Bool:
+	match retained_calls(depth):
+		None: False
+		Some(product):
+			match product.signature.parameters:
+				[parameter]:
+					var current = product.expression
+					var found: Option[Int] = None
+					var calls = 0
+					while True:
+						if not same_type(current.value_type, IntType):
+							break
+						match current.form:
+							Model.InvokeFunction(call, [child]):
+								match call.target:
+									Model.UserFunction(target, []):
+										if Declaration.function_number(target) != Declaration.function_number(product.target):
+											break
+										current = child
+										calls = calls + 1
+									_: break
+							Model.LiteralInteger(7):
+								found = Some(calls)
+								break
+							_: break
+					(
+						found == Some(depth) and product.signature.type_parameters.is_empty() and product.signature.purity == Pure
+						and same_type(parameter.value_type, IntType) and same_type(product.signature.return_type.value_type, IntType)
+					)
+				_: False
+
+
+private pure func checked_applications_survive(depth: Int) -> Bool:
+	match retained_application(depth):
+		None: False
+		Some(product):
+			var current = product.value_type
+			var valid = True
+			for _ in 0..depth:
+				match current:
+					Model.AppliedRecordType(record_id, [Model.AppliedUnionType(union_id, [child])]):
+						valid = (
+							valid and Declaration.record_number(record_id) == Declaration.record_number(product.record_id)
+							and Declaration.union_number(union_id) == Declaration.union_number(product.union_id)
+						)
+						current = child
+					_: valid = False
+			valid and same_type(current, IntType)
+
+
 tests: TestSuite = {
 	description = "Retained checked type products",
 	tests = [
+		("16 checked calls survive their program", pure func(): checked_calls_survive(16)),
+		("32 checked calls survive their program", pure func(): checked_calls_survive(32)),
+		("64 checked calls survive their program", pure func(): checked_calls_survive(64)),
+		("128 checked calls survive their program", pure func(): checked_calls_survive(128)),
+		("16 mixed applications survive their checked program", pure func(): checked_applications_survive(16)),
+		("32 mixed applications survive their checked program", pure func(): checked_applications_survive(32)),
+		("64 mixed applications survive their checked program", pure func(): checked_applications_survive(64)),
+		("128 mixed applications survive their checked program", pure func(): checked_applications_survive(128)),
 		("16 List types survive their parent", pure func(): nested_product_survives(16)),
 		("32 List types survive their parent", pure func(): nested_product_survives(32)),
 		("64 List types survive their parent", pure func(): nested_product_survives(64)),
