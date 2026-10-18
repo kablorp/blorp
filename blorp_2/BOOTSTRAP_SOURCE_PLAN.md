@@ -221,21 +221,23 @@ Offsets are half-open bytes. Require 0 <= start <= end <= length and both
 endpoints at scalar boundaries; otherwise return None. Preserve exact bytes,
 with no rounding, replacement or normalization. Given a valid String, endpoint
 checks suffice; do not rescan the result. An empty range inside a scalar fails.
-Migrate one-byte classification, including diagnostic location scanning, to
-byte_at. Do not silently redefine legacy host substring or add both public forms.
+Compiler-source one-byte classification, including diagnostic location scanning,
+now uses byte_at. Do not silently redefine legacy host substring or add both public forms.
 Slice and ingress enforcement are separate bounded tasks, outside the two new
 operations' budgets.
 
-All current String lower/index_of/contains source calls serve parser ASCII
-alphabets. Two private digit-value helpers and the existing type-parameter
+At the planning baseline, String lower/index_of/contains source calls served parser
+ASCII alphabets. Two private digit-value helpers and the existing type-parameter
 validator replace them; no shared classifier is needed. Preserve consumption of
-a seventh hexadecimal digit and malformed-unit extents. A fabricated Float token
-spelled "0" or "-0" currently gets the leading-zero diagnostic because an empty
-substring passes contains. Preserve that absent-byte result explicitly at that
-callsite, not in the digit helper. Preserve forged integer-token validation too.
-Remove library search/lower requirements only after the source patch and a fresh
-resolved call inventory; classification migration preserves valid UTF-8 contents
-and their diagnostics.
+a seventh hexadecimal digit and malformed-unit extents. At that baseline, a
+fabricated Float token spelled "0" or "-0" got the leading-zero diagnostic because
+an empty substring passed contains. The migration preserves that absent-byte
+result explicitly at that callsite, not in the digit helper. Preserve forged
+integer-token validation too.
+The source patch and fresh 39-module pre-DCE resolved inventory are now complete;
+the [migration report](../benchmarks/results/blorp_2_source_byte_lazy_screen_2026-10-17.md)
+records their acceptance and the preserved diagnostic behavior. Library search
+and lowercase operations are no longer compiler-source requirements.
 
 Boundary-checked slicing, starts_with, concatenation and large List[String].join
 still need real library implementations. Host join uses a capacity-aware append

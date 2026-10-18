@@ -708,8 +708,11 @@ The [API report](../benchmarks/results/blorp_2_string_integer_apis_2026-10-16.md
 retains all 105 allocation misses of the +5% target (maximum +5.62%); normal
 instructions stay within +5%. Implementation, cost and documentation reviews are
 complete.
-Source Char/classification migration, slicing, remaining library and shell/path
-work are separate; this does not complete M6.
+Source Char and ASCII classification migration is complete in `abd0aa1a0`:
+all 39 compiler modules reconcile to fresh pre-DCE facts, with 3,109 component
+checks and 461 e2e fixtures passing. The [migration report](../benchmarks/results/blorp_2_source_byte_lazy_screen_2026-10-17.md)
+preserves the failed historical cost screen and the separately reviewed fixed-A/D
+acceptance. Slicing, remaining library and shell/path work still leave M6 open.
 
 The standalone [target current-directory Result slice](TARGET_CURRENT_DIRECTORY_PLAN.md)
 is implemented and validated: ordinary owning Result, phase/native tests, six
