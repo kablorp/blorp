@@ -1,10 +1,12 @@
 # Replace three layout sort callbacks with one domain ordering
 
-**Status, 2026-10-18.** Design reviewed; implementation has not started. The
-coordinator and one independent compiler expert are the two required plan
-reviewers; both accepted the proof obligation and measurement boundary below.
-This docs-only slice publishes the plan. A reviewed plan commit and an explicit
-serialized execution window precede TDD, production edits or compiled calls.
+**Status, 2026-10-18.** The implementation candidate is uncommitted. Its original
+cumulative SOURCE allocation screen is FAILED: current C 10,166 versus R0 9,634,
+above the 9,923 cap. The user policy decision is pending; no waiver is assumed.
+The coordinator and one independent compiler expert are the two required plan
+reviewers. The initial plan preceded implementation; the prospective test-only
+amendment below must be published before its additional test writes. Compiled
+calls still require a separate serialized execution grant.
 
 ## Problem and baseline
 
@@ -211,10 +213,12 @@ target-execution claim requires evidence through its supported normal entrypoint
 
 - Production: only the new operation and call in `emit/emit.brp` around 2216-2226.
   No changes to ListLayout, key factories, runtime ABI or adjacent dedupe.
-- Unit characterization: existing `test_emit/test_list_phases.brp`, provisionally
+- Original unit-characterization envelope, retained historically: existing
+  `test_emit/test_list_phases.brp`, provisionally
   <=110 added lines; native scalar probe in existing `test/runtime/test_generic_list.brp`,
-  provisionally <=90. Combined hard test cap 200 added/+200 net; fixtures 0.
-  If honest readable tests cannot fit, rescope before editing; do not compress.
+  provisionally <=90. Its combined hard test cap was 200 added/+200 net; fixtures 0.
+  The active test ceiling is the reviewed prospective amendment below. Preserve
+  the historical 200 criterion and results; do not compress or delete coverage.
 - Hard production caps: 250 gross added/+100 net physical lines, including
   imports/comments. Example helper leaves room below that cap; count actual diff.
 - M2 owns nearby `function_blocks` (2143), `ProgramInventory`/`program_inventory`
@@ -231,6 +235,44 @@ target-execution claim requires evidence through its supported normal entrypoint
   source/target libraries, corpus, host binaries/stdlib and checkpoint roles
   before future execution. Start from a clean accepted branch/worktree; do not
   reuse a preserved mixed candidate.
+
+## Prospective test-only phase coverage amendment
+
+The coordinator and independent compiler/source peer approved this amendment
+before tracked phase-scaling test writes. It changes only the test ceiling to
+**360 gross added/+350 net physical lines**. Production remains **250 gross
+added/+100 net** and fixtures remain **0**. No production allowance, allocation
+win or other metric offsets test growth; all cost gates below remain binding.
+
+The original 200 added/+200 net criterion remains historical. The initial test
+patch met it at 189 added/1 removed, +188 net. The required public-emitter scaling
+draft adds 151/removes 2, +149 net: the removed lines are an expanded import and
+registry closing line, not coverage. Expected combined scope is therefore
+**340 gross added/+337 net tests**. Retain all existing 189 added test lines and
+their controls. Do not move validation into an uncounted driver or benchmark.
+
+The additional readable setup and oracles are necessary to prove the sorter
+consumes real phase inventories at raw sizes 16/32/64/128. Each size has a
+distinct-key case and an interleaved repeated-key case: eight granular callbacks.
+Published typed IDs and ownership definitions establish exactly N raw rows before
+public `emit`; each row comes from a singleton List containing a typed Record
+value returned by a maker. No forged product, private sorter hook or synthetic C
+is introduced. Check typed declaration order and one definition per key, then
+compile unchanged emitted C with the existing default-toolchain native harness
+and run the source program's normal main with exact exit/stdout oracles.
+
+Temporarily bypassing the sort call must fail the N-row ordering callbacks;
+bypassing adjacent dedupe must fail the repeated-key callbacks. Require successful
+test builds, named failures, exact restoration and green reruns. Equal-key-origin
+stability remains covered by the reviewed structural proof, with no false dynamic
+mutation claim. Existing depth/rank, nominal, ownership and native copy controls
+remain intact. No new native framework or exported compiler helper is authorized.
+
+This prospective test-only amendment does not change the original cumulative
+SOURCE failure, grant a cost-policy exception, reset a denominator or authorize
+further acceptance costs. Any unary consumer port and subsequent source/metric
+epoch require separate review. Preserve historical R0/B/C inputs, roles, raw
+observations and verdicts unchanged; do not mix them with a later base.
 
 ## TDD and runnable gates
 
