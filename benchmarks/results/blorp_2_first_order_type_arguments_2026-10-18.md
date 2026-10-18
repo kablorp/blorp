@@ -36,7 +36,8 @@ The frozen c04 host and root library ran the functional checks: baseline and
 candidate focused suites **93/93**, complete component suites **3,191/3,191**,
 and normal-entrypoint functional e2e **464/464**. Functional e2e instruction
 counters were explicitly disabled; the separate quiet comparison below owns
-instruction acceptance. Pilot/native strict memory gates remained enabled.
+instruction acceptance. Pilot strict-zero checks and native sanitizer/independent
+lifetime tests remained required and green.
 Reversing the argument builder failed the intended order/phantom callback;
 omitting arguments failed six intended specialization callbacks. Exact source
 restoration returned both suites green. Defensive first-error propagation is
