@@ -449,23 +449,42 @@ managed carriers remain later slices. Neither first slice completes M3.
 
 ## Inventory and prospective ceilings
 
-The next checkpoint touches five production owners. Checked/concrete product
-retirement, check/recursion conversion and utils/syntax retirement are deferred;
-their old whole-change forecast does not authorize writes.
+The next checkpoint touches five production owners plus the reviewed ordinary-tail
+preparation in Check's bodies/model modules. Checked/concrete product retirement,
+check/recursion conversion and utils/syntax retirement are deferred; their old
+whole-change forecast does not authorize writes.
 
 | Owner | Bounded change | Additional physical additions |
 | --- | --- | --- |
 | [specialize](src/specialize/specialize.brp):2542 | One scalar admission walk, sealed layout projections; preserve source products and instance order | 233 observed; 240 maximum |
 | [lower](src/lower/lower.brp):747,926 | One pending Loop, fresh H/P intervals, original prefix/body conversion and shared step walkers | 210-250 |
-| [own](src/own/own.brp):1082,1326 | Common insertion/edge batches; relocate admission, with no move credit | 200-230 |
+| [own](src/own/own.brp):1082,1326 | Common insertion/edge batches; relocate admission, with no move credit | 282 in uncompiled syntax-correction scratch; re-estimate before further additions |
 | [verify](src/verify/verify.brp):1589,2037,2319 | Common structural/edge verification and captured PRE protection; retire duplicate origin preflight | 210-250 |
-| [emit](src/emit/emit.brp):1936,2054,2222 | Common loop operations, outgoing captures, one switch/loop exit and inventory traversal | 110-140 |
+| [emit](src/emit/emit.brp):1936,2054,2222 | Common loop operations, outgoing captures, one switch/loop exit and inventory traversal | 162 observed; re-estimate before further additions |
 
 The original production forecast was 850-1,020 additional gross / +100-280 net.
 Keep the cumulative internal production stop at 1,085 additions / +274 net,
 inside the unchanged original 1,150/+350 ceiling. Count actual rewritten/removal
 regions only: relocating Own's admission is not a net saving, and deleting old
 draft code earns no credit. Stop earlier if an owner forecast fails.
+
+**Prospective syntax-compatibility correction, 2026-10-18.** The first focused
+host check stopped before any test: 17 diagnosed loop-body `?=` sites and inline-block
+syntax produced 31 setup diagnostics. This is no semantic RED. Use the existing
+explicit `match`/first-error/break pattern; do not change the host or language.
+One private Verify header builder may return existing `KnownValue` after checking
+next H ordinal, actual PRE lookup, exact concrete type and `NoOwnership`, in that
+order. Publish one row only on success. Preserve sequential transfer consumption,
+all acquisitions before retirement, and PRE protection before local-owner checks.
+
+The complete readable, uncompiled scratch correction has **1,084 production additions /
+834 deletions / +250 net**, including 35 additions in the Check preparation.
+Own is 282/335; Verify is 222/269; Emit remains 162/81. This refreshes Own's old
+200-230 and Emit's old 110-140 forecasts; it adds no mechanism or cumulative
+allowance. The unchanged internal stop leaves **one gross addition and 24 net**;
+owner rows are not stackable allowances. Review the exact scratch patch before
+tracked writes and re-estimate before any further addition. All source eligibility,
+fixture, test and resource gates remain unchanged.
 
 **Prospective test-only rescope, 2026-10-18; root and independent review approved.** The old
 1,587 internal / 1,600 hard test-addition forecast did not cover the actual
@@ -495,8 +514,9 @@ producer-derived accepted products cannot replace malformed-IR tests.
 Specialize's recovered 233 additions exceed its earlier 120-150 owner forecast.
 Its refreshed 240-addition maximum leaves seven lines for corrections within
 the unchanged whole-production 1,085/+274 internal and 1,150/+350 hard stops.
-The static whole production is 997 additions / 835 deletions (+162); any further
-production work needs a forecast within those remaining allowances. Report
+Before syntax correction, static whole production was 997 additions /
+835 deletions (+162); the corrected forecast above supersedes that snapshot.
+Further production work needs a forecast within the remaining allowances. Report
 complete production, test and fixture ADD/DEL/net separately as ports close.
 
 This replaces the cumulative test budget and refreshes Specialize's owner
