@@ -31,8 +31,9 @@ concrete `io.print(String) -> Void`. Print borrows its String, writes all bytes
 followed by LF, and is forbidden in pure callers. Every block retains an
 explicit final expression. Omitting a function's return annotation means Void;
 a Void function evaluates and discards its final expression, including any
-owned result, and Void main exits 0. Pure functions cannot return Void,
-including concrete generic instances. Selective union imports
+owned result, and Void main exits 0. Pure functions follow the same return
+conventions, including concrete generic instances; calls to impure functions
+remain forbidden. Selective union imports
 preserve ordinary nominal type and constructor identities. Base already supplies
 Bool, Option, Result and their constructors in every module. Concrete
 `string.parse_int` consumes complete ASCII

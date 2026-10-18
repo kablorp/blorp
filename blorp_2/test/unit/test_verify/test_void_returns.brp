@@ -8,7 +8,7 @@ import:
 	../../../src/lower/lower as Lower
 	../../../src/own/own as Own
 	../../../src/parse/assemble: parsed_contents
-	../../../src/utils/source: module_source, root_module_id, same_module, same_source
+	../../../src/utils/source: module_source, root_module_id, same_module
 	../../../src/specialize/specialize as Concrete
 	../../../src/utils/syntax as Syntax
 	../../../src/verify/verify: verify
@@ -42,25 +42,6 @@ private pure func lowered(source: String) -> Result[Lower.LoweredProgram, Syntax
 
 private pure func owned(source: String) -> Result[Own.OwnershipProgram, Syntax.Diagnostic]:
 	lowered(source).and_then(pure func(program): Own.own(program))
-
-
-private pure func rejects_pure_void(source: String, start: Int, end: Int) -> Bool:
-	typed = match check_failure(source):
-		Some(error):
-			match error.kind:
-				Errors.SignatureRejection(Errors.PureVoidReturn): True
-				_: False
-		None: False
-	match compile(source):
-		Err(errors):
-			(
-				typed and errors.remaining.is_empty()
-				and errors.first.message == "pure functions cannot return Void"
-				and errors.first.help == "remove pure, or return a non-Void value"
-				and errors.first.span.start == start
-				and errors.first.span.end == end
-			)
-		Ok(_): False
 
 
 pure func test_main_can_omit_its_void_annotation() -> Bool:
@@ -115,27 +96,27 @@ pure func test_void_match_discards_different_arm_types() -> Bool:
 	accepts(source)
 
 
-pure func test_pure_explicit_void_return_is_rejected() -> Bool:
+pure func test_pure_explicit_void_return_is_accepted() -> Bool:
 	source: String =
 		|pure func effect() -> Void:
 		|    void
 		|func main() -> Int:
 		|    0
 		|
-	rejects_pure_void(source, 22, 26)
+	accepts(source)
 
 
-pure func test_pure_omitted_return_is_rejected() -> Bool:
+pure func test_pure_omitted_return_is_accepted() -> Bool:
 	source: String =
 		|pure func effect():
 		|    7
 		|func main() -> Int:
 		|    0
 		|
-	rejects_pure_void(source, 10, 16)
+	accepts(source)
 
 
-pure func test_pure_generic_void_result_is_rejected_at_the_call() -> Bool:
+pure func test_pure_generic_void_result_has_a_concrete_void_signature() -> Bool:
 	source: String =
 		|pure func identity[T](value: T) -> T:
 		|    value
@@ -143,7 +124,20 @@ pure func test_pure_generic_void_result_is_rejected_at_the_call() -> Bool:
 		|    identity(void)
 		|    0
 		|
-	rejects_pure_void(source, 72, 80)
+	match checked(source).and_then(pure func(program): Concrete.specialize(program)):
+		Err(_): False
+		Ok(program):
+			match Concrete.specialized_contents(program).functions:
+				[_, identity]:
+					match (identity.signature.parameters, identity.body):
+						([parameter], Concrete.ConcreteValueBody(Concrete.ReturnExpression(result))):
+							(
+								Concrete.same_type(parameter, Concrete.VoidType)
+								and Concrete.same_type(identity.signature.return_type, Concrete.VoidType)
+								and Concrete.same_type(result.value_type, Concrete.VoidType)
+							)
+						_: False
+				_: False
 
 
 pure func test_void_tail_recursion_keeps_its_loop_contract() -> Bool:
@@ -217,11 +211,8 @@ pure func test_lowering_keeps_managed_tail_before_canonical_void() -> Bool:
 		Err(_): False
 
 
-pure func test_ownership_drops_managed_string_tail() -> Bool:
-	source: String =
-		|func main():
-		|    "owned"
-		|
+private pure func managed_string_tail_is_dropped(header: String) -> Bool:
+	source = header + "\n    \"owned\"\n"
 	match owned(source):
 		Ok(program):
 			match program.functions:
@@ -235,6 +226,14 @@ pure func test_ownership_drops_managed_string_tail() -> Bool:
 						_: False
 				_: False
 		Err(_): False
+
+
+pure func test_ownership_drops_managed_string_tail() -> Bool:
+	managed_string_tail_is_dropped("func main():")
+
+
+pure func test_ownership_drops_pure_void_managed_string_tail() -> Bool:
+	managed_string_tail_is_dropped("pure func main():")
 
 
 pure func test_verifier_rejects_successful_exit_for_int_signature() -> Bool:
@@ -293,20 +292,34 @@ pure func test_discarded_invalid_argument_is_still_a_typed_error() -> Bool:
 	typed and rejects(source, "argument type does not match the parameter type", "use an expression of type Int here", 62, 66)
 
 
-pure func test_pure_void_rejection_is_typed() -> Bool:
+pure func test_pure_void_signature_normalizes_a_discarded_integer_tail() -> Bool:
 	source: String =
 		|pure func main():
 		|    17
 		|
-	match check_failure(source):
-		Some(error):
-			match error.kind:
-				Errors.SignatureRejection(Errors.PureVoidReturn): True
+	match checked(source):
+		Err(_): False
+		Ok(program):
+			contents = checked_functions(program)
+			match (contents.entrypoint, contents.functions):
+				(Syntax.NoArguments(_, Syntax.SuccessfulExit), [function]):
+					match (function.statements, function.body):
+						([Check.DiscardExpression(discarded)], Check.CheckedValueBody(Check.ReturnExpression(result))):
+							match (discarded.form, result.form):
+								(Check.LiteralInteger(17), Check.LiteralVoid):
+									(
+										Syntax.same_purity(function.signature.purity, Syntax.Pure)
+										and Check.same_type(function.signature.return_type.value_type, Check.VoidType)
+										and Check.same_type(discarded.value_type, Check.IntType)
+										and Check.same_type(result.value_type, Check.VoidType)
+										and function.bindings.is_empty()
+									)
+								_: False
+						_: False
 				_: False
-		None: False
 
 
-pure func test_transitive_generic_pure_void_reports_the_instantiating_call() -> Bool:
+pure func test_transitive_generic_pure_void_is_accepted() -> Bool:
 	source: String =
 		|pure func identity[T](value: T) -> T:
 		|    value
@@ -316,13 +329,10 @@ pure func test_transitive_generic_pure_void_reports_the_instantiating_call() -> 
 		|func main() -> Int:
 		|    discard(void)
 		|
-	match checked(source).and_then(pure func(program): Concrete.specialize(program)):
-		Err(error):
-			error.message == "pure functions cannot return Void" and error.help == "remove pure, or return a non-Void value" and error.span.start == 140 and error.span.end == 147
-		Ok(_): False
+	accepts(source)
 
 
-pure func test_transitive_pure_void_ufcs_reports_the_concrete_receiver_call() -> Bool:
+pure func test_transitive_pure_void_ufcs_is_accepted() -> Bool:
 	source: String =
 		|pure func identity[T](value: T) -> T:
 		|    value
@@ -332,17 +342,10 @@ pure func test_transitive_pure_void_ufcs_reports_the_concrete_receiver_call() ->
 		|func main() -> Int:
 		|    void.discard()
 		|
-	match checked(source).and_then(pure func(program): Concrete.specialize(program)):
-		Err(error):
-			(
-				error.message == "pure functions cannot return Void"
-				and error.help == "remove pure, or return a non-Void value"
-				and error.span.start == 146 and error.span.end == 153
-			)
-		Ok(_): False
+	accepts(source)
 
 
-pure func test_transitive_pure_void_preserves_the_outer_concrete_call_site() -> Bool:
+pure func test_nested_transitive_pure_void_is_accepted() -> Bool:
 	source: String =
 		|pure func identity[T](value: T) -> T:
 		|    value
@@ -354,17 +357,10 @@ pure func test_transitive_pure_void_preserves_the_outer_concrete_call_site() -> 
 		|func main() -> Int:
 		|    forward(void)
 		|
-	match checked(source).and_then(pure func(program): Concrete.specialize(program)):
-		Err(error):
-			(
-				error.message == "pure functions cannot return Void"
-				and error.help == "remove pure, or return a non-Void value"
-				and error.span.start == 193 and error.span.end == 200
-			)
-		Ok(_): False
+	accepts(source)
 
 
-pure func test_nongeneric_wrapper_does_not_replace_the_instantiating_call_site() -> Bool:
+pure func test_nongeneric_wrapper_accepts_generic_pure_void() -> Bool:
 	source: String =
 		|pure func identity[T](value: T) -> T:
 		|    value
@@ -376,14 +372,7 @@ pure func test_nongeneric_wrapper_does_not_replace_the_instantiating_call_site()
 		|func main() -> Int:
 		|    wrapper()
 		|
-	match checked(source).and_then(pure func(program): Concrete.specialize(program)):
-		Err(error):
-			(
-				error.message == "pure functions cannot return Void"
-				and error.help == "remove pure, or return a non-Void value"
-				and error.span.start == 143 and error.span.end == 150
-			)
-		Ok(_): False
+	accepts(source)
 
 
 pure func test_hidden_symbolic_list_element_specializes_to_numeric_storage() -> Bool:
@@ -417,7 +406,7 @@ pure func test_hidden_symbolic_list_element_specializes_to_numeric_storage() -> 
 						_: False
 
 
-pure func test_mixed_symbolic_arguments_retain_request_chain_root_provenance() -> Bool:
+pure func test_mixed_symbolic_arguments_accept_a_pure_void_instance() -> Bool:
 	source: String =
 		|pure func identity[A, B](value: A, extra: B) -> A:
 		|    value
@@ -429,19 +418,7 @@ pure func test_mixed_symbolic_arguments_retain_request_chain_root_provenance() -
 		|func main() -> Int:
 		|    wrapper(1)
 		|
-	match checked(source):
-		Err(_): False
-		Ok(program):
-			match Concrete.specialize(program):
-				Err(error):
-					(
-						error.message == "pure functions cannot return Void"
-						and error.help == "remove pure, or return a non-Void value"
-						and same_source(error.span.source, module_source(root_module_id()))
-						and error.span.start == 232 and error.span.end == 239
-						and error.note.is_none()
-					)
-				Ok(_): False
+	accepts(source)
 
 
 pure func test_nullary_void_wrapper_discards_result_and_returns_zero() -> Bool:
@@ -561,12 +538,12 @@ pure func test_void_match_recursion_preserves_recur_and_normalizes_terminal_arm(
 		Err(_): False
 
 
-pure func test_pure_argv_main_cannot_omit_its_return_type() -> Bool:
+pure func test_pure_argv_main_can_omit_its_return_type() -> Bool:
 	source: String =
 		|pure func main(arguments: List[String]):
 		|    arguments
 		|
-	rejects_pure_void(source, 10, 14)
+	accepts(source)
 
 
 pure func test_argv_verifier_checks_the_result_convention() -> Bool:
@@ -611,20 +588,20 @@ pure func test_ownership_drops_the_discarded_list_result_but_not_borrowed_argv()
 		Err(_): False
 
 
-pure func test_pure_nullary_main_cannot_explicitly_return_void() -> Bool:
+pure func test_pure_nullary_main_can_explicitly_return_void() -> Bool:
 	source: String =
 		|pure func main() -> Void:
 		|    17
 		|
-	rejects_pure_void(source, 20, 24)
+	accepts(source)
 
 
-pure func test_pure_argv_main_cannot_explicitly_return_void() -> Bool:
+pure func test_pure_argv_main_can_explicitly_return_void() -> Bool:
 	source: String =
 		|pure func main(arguments: List[String]) -> Void:
 		|    arguments
 		|
-	rejects_pure_void(source, 43, 47)
+	accepts(source)
 
 
 tests: TestSuite = {
@@ -635,35 +612,36 @@ tests: TestSuite = {
 		("argv main omits Void annotation", test_argv_main_can_omit_its_void_annotation),
 		("Void helper discards managed tail", test_void_helper_discards_its_managed_tail),
 		("Void match discards heterogeneous arms", test_void_match_discards_different_arm_types),
-		("pure explicit Void rejected", test_pure_explicit_void_return_is_rejected),
-		("pure omitted return rejected", test_pure_omitted_return_is_rejected),
-		("pure generic Void rejected", test_pure_generic_void_result_is_rejected_at_the_call),
+		("pure explicit Void accepted", test_pure_explicit_void_return_is_accepted),
+		("pure omitted return accepted", test_pure_omitted_return_is_accepted),
+		("pure generic result specializes to Void", test_pure_generic_void_result_has_a_concrete_void_signature),
 		("Void tail recursion remains a loop", test_void_tail_recursion_keeps_its_loop_contract),
 		("pure Int main preserved", test_int_main_remains_supported),
 		("parser retains absent annotation", test_parser_preserves_an_absent_return_annotation),
 		("checker publishes discard and canonical Void", test_checker_publishes_discard_and_canonical_void_without_binding),
 		("lowering keeps discarded String definition", test_lowering_keeps_managed_tail_before_canonical_void),
 		("ownership drops discarded String", test_ownership_drops_managed_string_tail),
+		("pure Void ownership drops discarded String", test_ownership_drops_pure_void_managed_string_tail),
 		("verifier rejects success for Int", test_verifier_rejects_successful_exit_for_int_signature),
 		("verifier rejects Int status for Void", test_verifier_rejects_integer_exit_for_void_signature),
 		("discarded unknown name still checked", test_discarded_unknown_name_is_still_a_typed_error),
 		("discarded invalid argument still checked", test_discarded_invalid_argument_is_still_a_typed_error),
-		("pure Void error is typed", test_pure_void_rejection_is_typed),
-		("transitive pure Void reports concrete call", test_transitive_generic_pure_void_reports_the_instantiating_call),
-		("transitive pure Void UFCS reports concrete call", test_transitive_pure_void_ufcs_reports_the_concrete_receiver_call),
-		("transitive pure Void preserves outer call", test_transitive_pure_void_preserves_the_outer_concrete_call_site),
-		("nongeneric wrapper preserves actual instantiating call", test_nongeneric_wrapper_does_not_replace_the_instantiating_call_site),
+		("pure Void signature and normalized body", test_pure_void_signature_normalizes_a_discarded_integer_tail),
+		("transitive generic pure Void accepted", test_transitive_generic_pure_void_is_accepted),
+		("transitive generic pure Void UFCS accepted", test_transitive_pure_void_ufcs_is_accepted),
+		("nested transitive pure Void accepted", test_nested_transitive_pure_void_is_accepted),
+		("nongeneric wrapper accepts pure Void instance", test_nongeneric_wrapper_accepts_generic_pure_void),
 		("hidden symbolic List element becomes concrete numeric storage", test_hidden_symbolic_list_element_specializes_to_numeric_storage),
-		("mixed symbolic arguments retain request chain root", test_mixed_symbolic_arguments_retain_request_chain_root_provenance),
+		("mixed symbolic arguments accept pure Void instance", test_mixed_symbolic_arguments_accept_a_pure_void_instance),
 		("nullary Void wrapper returns zero", test_nullary_void_wrapper_discards_result_and_returns_zero),
 		("argv Void wrapper releases then returns zero", test_argv_void_wrapper_releases_arguments_before_returning_zero),
 		("ownership drops discarded managed union", test_ownership_drops_discarded_managed_union_result),
 		("Void match drops only in managed arm", test_void_match_cleanup_is_local_to_the_selected_arm),
 		("Void match preserves recur and terminal exit", test_void_match_recursion_preserves_recur_and_normalizes_terminal_arm),
-		("pure argv main needs non-Void result", test_pure_argv_main_cannot_omit_its_return_type),
+		("pure argv main omits Void annotation", test_pure_argv_main_can_omit_its_return_type),
 		("argv verifier checks result convention", test_argv_verifier_checks_the_result_convention),
 		("owned List tail dropped without dropping argv borrow", test_ownership_drops_the_discarded_list_result_but_not_borrowed_argv),
-		("pure nullary main rejects explicit Void", test_pure_nullary_main_cannot_explicitly_return_void),
-		("pure argv main rejects explicit Void", test_pure_argv_main_cannot_explicitly_return_void),
+		("pure nullary main accepts explicit Void", test_pure_nullary_main_can_explicitly_return_void),
+		("pure argv main accepts explicit Void", test_pure_argv_main_can_explicitly_return_void),
 	]
 }

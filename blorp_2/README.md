@@ -954,13 +954,8 @@ specialization expands them. Record-owned List[T] fields accept every supported 
 other Lists. Checking accepts generic List annotations without a String-only
 admission rule. Specialization prepares all nested nominal element layouts and
 publishes their complete concrete identities before lowering.
-Void remains a valid type argument; the separate rule forbidding pure functions
-from returning Void still applies. When generic forwarding exposes that rule
-only during specialization, diagnostics retain a call-site origin per
-instantiation chain. Concrete written type arguments establish their own origin;
-caller-dependent arguments carry the outer origin. Mixed fixed and symbolic
-arguments can therefore retain an outer location. Argument-specific provenance
-remains future work.
+Void is a valid type argument and return type for pure functions, including
+generic instances. Purity is checked at calls; specialization does not inspect it.
 
 ## Grammar for this increment
 
@@ -1594,8 +1589,9 @@ arms. Discarding does not suppress errors or side effects in that expression.
 
 `main` accepts either `Int` or `Void`. An Int result supplies the process exit
 status; a Void result always exits 0. Both forms accept no parameters or one
-`List[String]` parameter. A pure function cannot return Void, whether explicitly
-annotated, omitted, or established by generic instantiation.
+`List[String]` parameter. Pure functions follow the same Void return conventions,
+whether explicitly annotated, omitted, or established by generic instantiation.
+They still cannot call impure functions.
 
 ```blorp
 import:
@@ -1606,7 +1602,7 @@ func main():
 
 This has the same behavior as `func main() -> Void:`. A final `17` would also
 exit 0 after being evaluated and discarded. A `pure func main()` declaration
-is rejected; pure main must return Int. The
+also exits 0 and must obey the ordinary purity rules. The
 [main signature fixtures](test/e2e/test_main_signatures.brp) cover pure and
 impure Int entrypoints and explicit and omitted Void entrypoints, with and
 without arguments, through their ordinary native main functions.

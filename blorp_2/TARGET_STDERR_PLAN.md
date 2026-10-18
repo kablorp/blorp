@@ -69,7 +69,7 @@ Use Blorp TestSuites and small typed inputs/outputs. Extend existing void-print 
 
 | Boundary | Named acceptance cases |
 | --- | --- |
-| Parse/namespace/check | Exact label/span and accepted contract; 0/2 arguments, wrong argument/result, generic and tail annotation; pure Void wrapper retains earliest `pure functions cannot return Void` / `remove pure, or return a non-Void value`; pure Int caller rejects effect. Wrong runtime signatures retain `builtin declaration does not match its runtime contract` / `declare an impure function with one String parameter returning Void`; pin exact help/span/note for each, not only status |
+| Parse/namespace/check | Exact label/span and accepted contract; 0/2 arguments, wrong argument/result, generic and tail annotation. A pure builtin declaration rejects its runtime contract; both pure Int and pure Void callers reject impure effects. Wrong runtime signatures retain `builtin declaration does not match its runtime contract` / `declare an impure function with one String parameter returning Void`; pin exact help/span/note for each, not only status |
 | Specialize/lower/own | Operation/signature/span retained; discard is Void, one borrowed String, unmanaged result; literal, live alias, repeat call and selected-arm cleanup; no acquired Void owner |
 | Raw verifier, separately | Wrong arity/type/result ownership; unknown/discharged/wrong-owner borrow; missing/duplicate String drop. Assert the exact violated obligation/operation/span |
 | Emitter/publication | Only reached stderr emits its fragment; stdout-only, unused stderr declaration and no-output programs omit it; both operations select both fragments; inspect one call with no helper retain/drop |

@@ -94,9 +94,10 @@ Boolean operators and local annotations. These are largely independent; they
 can be reviewed in parallel and landed separately. Shared checker, specialization,
 lowering and emitter regions require an explicit integration owner.
 
-Two immediate corrections are known: restricted-if's four failing fixtures
-declared forbidden pure Void functions; a fixture-only correction is authored
-but unrun. Boolean exact-mode profiling expected the wrong metadata field;
+At this handoff, restricted-if had four pure Void fixture failures. The owner
+subsequently allowed pure Void functions; that fixture-only repair is historical.
+The held candidate still needs current-base validation. Boolean exact-mode
+profiling expected the wrong metadata field;
 the check correction is drafted, with the original observation preserved.
 Neither finding authorizes weakening assertions or restarting successful runs.
 
