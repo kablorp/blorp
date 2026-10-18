@@ -1,0 +1,273 @@
+import:
+	../../../src/lower/lower as Lower
+	../../../src/own/own as Own
+	../../../src/specialize/specialize as Concrete
+	../../../src/utils/syntax as Syntax
+	../../../src/verify/verify: verify
+	../ownership_inputs: InputIds, input_ids, span
+	test: TestSuite
+
+
+-- These are independently authored raw operations. The seed only supplies
+-- opaque identities and a concrete two-variant layout; insertion is not called.
+private pure func raw_carried_join(ids: InputIds) -> Result[Own.OwnershipProgram, Syntax.Diagnostic]:
+	constructor ?= match ids.union_value.operation:
+		Lower.ConstructValue(variant, []): Ok(variant)
+		_: Err({ span = span(0), note = None, message = "invalid raw join identity seed", help = "supply the payload-free union seed" })
+	main: Own.OwnedFunction = {
+		execution = Syntax.OrdinaryCalls,
+		signature = { parameters = [], return_type = Concrete.IntType },
+		operations = [Own.DefineValue({
+			id = ids.first, value_type = Concrete.IntType, operation = Own.IntegerDefinition(0),
+			result = Own.UnmanagedResult, span = span(0)
+		})],
+		tail = Own.ReturnTail(Own.ReturnResult(Own.UnmanagedReturn(ids.first)))
+	}
+	borrow: Own.BorrowedValue = { value = ids.second, source = Own.OwnerBorrow(Own.owner_id(0)) }
+	joined: Own.OwnedJoin = {
+		result = Own.ManagedJoinParameter({ id = ids.third, value_type = Concrete.StringType, span = span(20) }, Own.owner_id(1)),
+		carried = [Own.ManagedJoinParameter({ id = ids.fourth, value_type = Concrete.StringType, span = span(21) }, Own.owner_id(2))],
+		scrutinee = Own.UnmanagedArgument(ids.first),
+		owner = ids.union_id,
+		arms = [
+			{
+				label = Lower.VariantLabel(constructor),
+				operations = [
+					Own.AcquireOwner(Own.owner_id(3), borrow, span(30)),
+					Own.AcquireOwner(Own.owner_id(4), borrow, span(31)),
+				],
+				transfer = Own.OwnedReturn(ids.second, Own.owner_id(3)),
+				carried = [Own.OwnedReturn(ids.second, Own.owner_id(4))]
+			},
+			{
+				label = Lower.VariantLabel(ids.second_variant),
+				operations = [
+					Own.AcquireOwner(Own.owner_id(5), borrow, span(40)),
+					Own.AcquireOwner(Own.owner_id(6), borrow, span(41)),
+				],
+				transfer = Own.OwnedReturn(ids.second, Own.owner_id(5)),
+				carried = [Own.OwnedReturn(ids.second, Own.owner_id(6))]
+			},
+		]
+	}
+	function: Own.OwnedFunction = {
+		execution = Syntax.OrdinaryCalls,
+		signature = { parameters = [], return_type = Concrete.StringType },
+		operations = [
+			Own.DefineValue({
+				id = ids.first, value_type = Concrete.UnionType(ids.union_id),
+				operation = Own.ConstructDefinition(constructor, []), result = Own.UnmanagedResult, span = span(1)
+			}),
+			Own.DefineValue({
+				id = ids.second, value_type = Concrete.StringType, operation = Own.StringDefinition("prefix"),
+				result = Own.OwnedResult(Own.owner_id(0)), span = span(10)
+			}),
+			Own.ExecuteJoin(joined),
+			Own.DropOwner(Own.owner_id(0), span(50)),
+			Own.DropOwner(Own.owner_id(1), span(51)),
+		],
+		tail = Own.ReturnTail(Own.ReturnResult(Own.OwnedReturn(ids.fourth, Own.owner_id(2))))
+	}
+	Ok({
+		records = [], unions = ids.unions, functions = [main, function],
+		entrypoint = Syntax.NoArguments(ids.entrypoint, Syntax.IntegerExitStatus)
+	})
+
+
+private pure func with_join(
+	program: Own.OwnershipProgram,
+	rewrite: pure (Own.OwnedJoin) -> Own.OwnedJoin,
+) -> Own.OwnershipProgram:
+	functions = program.functions.map(pure func(function):
+		operations = function.operations.map(pure func(operation):
+			match operation:
+				Own.ExecuteJoin(join): Own.ExecuteJoin(rewrite(join))
+				_: operation
+		)
+		{ function | operations = operations }
+	)
+	{ program | functions = functions }
+
+
+private pure func rejected_at(program: Own.OwnershipProgram, message: String, at: Int) -> Bool:
+	match verify(program):
+		Ok(_): False
+		Err(error):
+			(
+				error.message == "ownership verification failed: " + message
+				and error.help == "report this compiler error with the input program"
+				and error.note.is_none() and Syntax.same_span(error.span, span(at))
+			)
+
+
+pure func test_raw_repeated_pointer_outputs_have_independent_transfers() -> Bool:
+	match input_ids().and_then(raw_carried_join):
+		Err(_): False
+		Ok(program): verify(program).is_ok()
+
+
+pure func test_raw_carrier_edge_arity_matches_the_parameter_signature() -> Bool:
+	match input_ids().and_then(raw_carried_join):
+		Err(_): False
+		Ok(program):
+			changed = with_join(program, pure func(join):
+				{ join | arms = join.arms.map(pure func(arm): { arm | carried = [] }) }
+			)
+			rejected_at(changed, "join arm carries the wrong number of values", 20)
+
+
+pure func test_raw_carrier_cannot_omit_its_managed_obligation() -> Bool:
+	match input_ids():
+		Err(_): False
+		Ok(ids):
+			match raw_carried_join(ids):
+				Err(_): False
+				Ok(program):
+					changed = with_join(program, pure func(join):
+						{ join | arms = join.arms.map(pure func(arm): { arm | carried = [Own.UnmanagedReturn(ids.second)] }) }
+					)
+					rejected_at(changed, "managed yield requires an owner transfer", 21)
+
+
+pure func test_raw_result_and_carrier_cannot_transfer_the_same_obligation() -> Bool:
+	match input_ids().and_then(raw_carried_join):
+		Err(_): False
+		Ok(program):
+			changed = with_join(program, pure func(join):
+				{ join | arms = join.arms.map(pure func(arm): { arm | carried = [arm.transfer] }) }
+			)
+			rejected_at(changed, "yield refers to discharged owner 3", 21)
+
+
+pure func test_raw_arm_cannot_acquire_a_continuation_output() -> Bool:
+	match input_ids().and_then(raw_carried_join):
+		Err(_): False
+		Ok(program):
+			changed = with_join(program, pure func(join):
+				arms = join.arms.map(pure func(arm):
+					operations = arm.operations.append(Own.AcquireOwner(
+						Own.owner_id(5), { value = Own.join_parameter(join.result).id, source = Own.OwnerBorrow(Own.owner_id(1)) }, span(32)
+					))
+					{ arm | operations = operations }
+				)
+				{ join | arms = arms }
+			)
+			rejected_at(changed, "value 2 is not defined before use", 32)
+
+
+pure func test_raw_carrier_cannot_have_an_extra_edge_argument() -> Bool:
+	match input_ids().and_then(raw_carried_join):
+		Err(_): False
+		Ok(program):
+			changed = with_join(program, pure func(join):
+				{ join | arms = join.arms.map(pure func(arm): { arm | carried = [arm.transfer, arm.transfer] }) }
+			)
+			rejected_at(changed, "join arm carries the wrong number of values", 20)
+
+
+pure func test_raw_carrier_type_error_uses_the_parameter_origin() -> Bool:
+	match input_ids().and_then(raw_carried_join):
+		Err(_): False
+		Ok(program):
+			changed = with_join(program, pure func(join):
+				wrong = match join.scrutinee:
+					Own.UnmanagedArgument(value): value
+					Own.BorrowedArgument(borrow): borrow.value
+				{ join | arms = join.arms.map(pure func(arm): { arm | carried = [Own.UnmanagedReturn(wrong)] }) }
+			)
+			rejected_at(changed, "yield type does not match its join", 21)
+
+
+pure func test_raw_managed_carrier_cannot_be_marked_unmanaged() -> Bool:
+	match input_ids().and_then(raw_carried_join):
+		Err(_): False
+		Ok(program):
+			changed = with_join(program, pure func(join):
+				carried = join.carried.map(pure func(output): Own.UnmanagedJoinParameter(Own.join_parameter(output)))
+				{ join | carried = carried }
+			)
+			rejected_at(changed, "managed result requires an owner", 21)
+
+
+pure func test_raw_carrier_cannot_reuse_the_result_owner() -> Bool:
+	match input_ids().and_then(raw_carried_join):
+		Err(_): False
+		Ok(program):
+			changed = with_join(program, pure func(join):
+				carried = join.carried.map(pure func(output): Own.ManagedJoinParameter(Own.join_parameter(output), Own.owner_id(1)))
+				{ join | carried = carried }
+			)
+			rejected_at(changed, "owner 1 is defined more than once", 21)
+
+
+pure func test_raw_carrier_cannot_transfer_an_enclosing_obligation() -> Bool:
+	match input_ids():
+		Err(_): False
+		Ok(ids):
+			match raw_carried_join(ids):
+				Err(_): False
+				Ok(program):
+					changed = with_join(program, pure func(join):
+						carried = [Own.OwnedReturn(ids.second, Own.owner_id(0))]
+						{ join | arms = join.arms.map(pure func(arm): { arm | carried = carried }) }
+					)
+					rejected_at(changed, "yield must transfer an owner made in its arm, not owner 0", 21)
+
+
+pure func test_one_arm_cannot_leave_an_extra_local_obligation_live() -> Bool:
+	match input_ids():
+		Err(_): False
+		Ok(ids):
+			match raw_carried_join(ids):
+				Err(_): False
+				Ok(program):
+					changed = with_join(program, pure func(join):
+						match join.arms:
+							[first, second]:
+								operations = first.operations.append(Own.AcquireOwner(
+									Own.owner_id(5), { value = ids.second, source = Own.OwnerBorrow(Own.owner_id(0)) }, span(32)
+								))
+								borrow: Own.BorrowedValue = { value = ids.second, source = Own.OwnerBorrow(Own.owner_id(0)) }
+								next_arm = {
+									second |
+									operations = [Own.AcquireOwner(Own.owner_id(6), borrow, span(40)), Own.AcquireOwner(Own.owner_id(7), borrow, span(41))],
+									transfer = Own.OwnedReturn(ids.second, Own.owner_id(6)),
+									carried = [Own.OwnedReturn(ids.second, Own.owner_id(7))]
+								}
+								{ join | arms = [{ first | operations = operations }, next_arm] }
+							_: join
+					)
+					rejected_at(changed, "owner 5 remains live at yield", 20)
+
+
+pure func test_one_arm_cannot_retire_its_enclosing_obligation() -> Bool:
+	match input_ids().and_then(raw_carried_join):
+		Err(_): False
+		Ok(program):
+			changed = with_join(program, pure func(join):
+				match join.arms:
+					[first, second]:
+						operations = first.operations.append(Own.DropOwner(Own.owner_id(0), span(32)))
+						{ join | arms = [{ first | operations = operations }, second] }
+					_: join
+			)
+			rejected_at(changed, "owner 0 is discharged before its join", 32)
+
+
+tests: TestSuite = {
+	description = "Independent raw carried-join edges",
+	tests = [
+		("one arm cannot leak a local owner", test_one_arm_cannot_leave_an_extra_local_obligation_live),
+		("one arm cannot retire its enclosing owner", test_one_arm_cannot_retire_its_enclosing_obligation),
+		("extra carrier edge argument rejects", test_raw_carrier_cannot_have_an_extra_edge_argument),
+		("carrier type mismatch reports its parameter origin", test_raw_carrier_type_error_uses_the_parameter_origin),
+		("managed carrier cannot be marked unmanaged", test_raw_managed_carrier_cannot_be_marked_unmanaged),
+		("carrier cannot reuse its result owner", test_raw_carrier_cannot_reuse_the_result_owner),
+		("carrier cannot transfer an enclosing obligation", test_raw_carrier_cannot_transfer_an_enclosing_obligation),
+		("repeated pointers have independent outgoing obligations", test_raw_repeated_pointer_outputs_have_independent_transfers),
+		("carrier edge arity matches its signature", test_raw_carrier_edge_arity_matches_the_parameter_signature),
+		("managed carrier requires an obligation", test_raw_carrier_cannot_omit_its_managed_obligation),
+		("result and carrier cannot transfer one obligation twice", test_raw_result_and_carrier_cannot_transfer_the_same_obligation),
+		("arm cannot acquire from the continuation result", test_raw_arm_cannot_acquire_a_continuation_output),
+	]
+}

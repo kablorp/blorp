@@ -9,6 +9,7 @@ import:
 		ValueOperation(ParameterValue, PayloadValue, StringValue),
 		lowered_functions,
 		value_number,
+	../../../src/specialize/specialize as Concrete
 	../managed_union_inputs: lowered
 	test: TestSuite
 
@@ -232,9 +233,148 @@ pure func test_statement_match_is_a_void_join() -> Bool:
 					False
 
 
+pure func test_statement_join_publishes_the_new_binding_version_and_unchanged_edge() -> Bool:
+	source: String =
+		|fixed union Choice:
+		|    Yes
+		|    No
+		|pure func choose(flag: Choice) -> Int:
+		|    var total = 1
+		|    match flag:
+		|        Yes: total = 7
+		|        No: void
+		|    total
+		|func main() -> Int:
+		|    choose(Yes)
+		|
+	match first_join(source):
+		None: False
+		Some(found):
+			match (found.join.carried, found.join.arms, found.function.tail):
+				([total], [changed, unchanged], ExitValue(ReturnValue(returned))):
+					(
+						found.function.steps.length() == 3
+						and ids(found.function.steps) == [0, 1, 2, 3]
+						and value_number(found.join.result.id) == 2
+						and Concrete.same_type(found.join.result.value_type, Concrete.VoidType)
+						and value_number(total.id) == 3
+						and Concrete.same_type(total.value_type, Concrete.IntType)
+						and value_number(returned) == 3
+						and found.join.reads.map(value_number) == [0, 1]
+						and ids(changed.steps) == [4, 5] and value_number(changed.value) == 5
+						and changed.carried.map(value_number) == [4]
+						and ids(unchanged.steps) == [6] and value_number(unchanged.value) == 6
+						and unchanged.carried.map(value_number) == [1]
+					)
+				_: False
+
+
+pure func test_same_type_carriers_keep_binding_order_despite_reversed_writes() -> Bool:
+	source: String =
+		|fixed union Choice:
+		|    Yes
+		|    No
+		|pure func choose(choice: Choice) -> Int:
+		|    var left = 11
+		|    var right = 22
+		|    match choice:
+		|        Yes:
+		|            right = 202
+		|            left = 101
+		|        No: void
+		|    left
+		|func main() -> Int:
+		|    choose(Yes)
+		|
+	match first_join(source):
+		None: False
+		Some(found):
+			match found.join.arms:
+				[changed, unchanged]:
+					(
+						ids(found.function.steps) == [0, 1, 2, 3, 4, 5]
+						and found.join.carried.map(pure func(parameter): value_number(parameter.id)) == [4, 5]
+						and changed.carried.map(value_number) == [7, 6]
+						and unchanged.carried.map(value_number) == [1, 2]
+						and found.join.reads.map(value_number) == [0, 1, 2]
+					)
+				_: False
+
+
+pure func test_assignment_target_overrides_its_rhs_join_updated_version() -> Bool:
+	source: String =
+		|fixed union Choice:
+		|    Yes
+		|    No
+		|pure func choose(choice: Choice) -> Int:
+		|    var total = 1
+		|    total = match choice:
+		|        Yes:
+		|            total = 7
+		|            9
+		|        No: 3
+		|    total
+		|func main() -> Int:
+		|    choose(Yes)
+		|
+	match first_join(source):
+		None: False
+		Some(found):
+			match (found.function.tail, found.join.arms):
+				(ExitValue(ReturnValue(returned)), [changed, unchanged]):
+					(
+						value_number(returned) == 2
+						and value_number(found.join.result.id) == 2
+						and found.join.carried.map(pure func(parameter): value_number(parameter.id)) == [3]
+						and value_number(changed.value) == 5 and changed.carried.map(value_number) == [4]
+						and value_number(unchanged.value) == 6 and unchanged.carried.map(value_number) == [1]
+					)
+				_: False
+
+
+pure func test_final_nested_join_updates_the_outer_arm_carrier() -> Bool:
+	source: String =
+		|fixed union Choice:
+		|    Yes
+		|    No
+		|pure func choose(outer: Choice, inner: Choice) -> Int:
+		|    var total = 1
+		|    match outer:
+		|        Yes: match inner:
+		|            Yes: total = 7
+		|            No: void
+		|        No: void
+		|    total
+		|func main() -> Int:
+		|    choose(Yes, Yes)
+		|
+	match first_join(source):
+		None: False
+		Some(found):
+			match (found.join.arms, found.function.tail):
+				([changed, unchanged], ExitValue(ReturnValue(returned))):
+					match changed.steps:
+						[Join(inner)]:
+							(
+								value_number(returned) == 4 and value_number(found.join.result.id) == 3
+								and found.join.carried.map(pure func(parameter): value_number(parameter.id)) == [4]
+								and ids(changed.steps) == [5, 6]
+								and changed.carried.map(value_number) == [6]
+								and unchanged.carried.map(value_number) == [2]
+								and inner.carried.map(pure func(parameter): value_number(parameter.id)) == [6]
+								and found.join.reads.map(value_number) == [0, 1, 2, 2]
+							)
+						_: False
+				_: False
+
+
 tests: TestSuite = {
 	description = "Joins lowered from bound and statement matches",
 	tests = [
+		("same-type carriers preserve binding order", test_same_type_carriers_keep_binding_order_despite_reversed_writes),
+		("assignment target overrides the RHS join map", test_assignment_target_overrides_its_rhs_join_updated_version),
+		("final nested join updates its outer carrier", test_final_nested_join_updates_the_outer_arm_carrier),
+		("statement join publishes versions and its unchanged edge", test_statement_join_publishes_the_new_binding_version_and_unchanged_edge),
 		("bound match numbers its arms after the block", test_bound_match_lowers_to_a_join_numbered_after_its_block),
 		("nested join arms follow their enclosing arm", test_nested_join_arms_follow_their_enclosing_arm),
 		("prefix join arms precede tail arms", test_prefix_join_arms_precede_tail_arms),

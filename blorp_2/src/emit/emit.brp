@@ -16,7 +16,7 @@ import:
 		AggregateKind(RecordAggregate, UnionAggregate),
 		EmissionFailure(
 			MissingUnionLayout, MissingRecordLayout, MissingOwnerType, MissingValueType,
-			MissingRuntimeArgument, StatementOnlyValue, MissingAggregateWorkItem,
+			MissingRuntimeArgument, MissingJoinTransfer, StatementOnlyValue, MissingAggregateWorkItem,
 			MissingAggregateVisit, CyclicByValueAggregate, MissingAggregateLayout,
 			MissingAggregateMember, MissingUnionPayloadField,
 		), render,
@@ -1497,11 +1497,12 @@ private pure func owner_types(function: OwnedFunction) -> Result[List[TypeRef], 
 						_:
 							void
 				ExecuteJoin(join):
-					parameter = join_parameter(join.result)
-					values = values.append(parameter.value_type)
-					match join.result:
-						UnmanagedJoinParameter(_): void
-						ManagedJoinParameter(_, _): owners = owners.append(parameter.value_type)
+					for output in [join.result].concat(join.carried):
+						parameter = join_parameter(output)
+						values = values.append(parameter.value_type)
+						match output:
+							UnmanagedJoinParameter(_): void
+							ManagedJoinParameter(_, _): owners = owners.append(parameter.value_type)
 
 				AcquireOwner(_, borrowed, span):
 					match values.get(value_number(borrowed.value)):
@@ -1941,23 +1942,62 @@ private pure func append_join(
 ) -> Result[String, Diagnostic]:
 	parameter = join_parameter(matched_join.result)
 	name = c_value(parameter.id)
-	declaration ?= c_local_declaration(parameter.value_type, JoinLocal, unions, parameter.span)
-	opening ?= append_switch(output.concat(declaration).concat(name).concat(";"), matched_join.scrutinee, matched_join.owner, unions, parameter.span)
+	parameters = [matched_join.result].concat(matched_join.carried)
+	var declarations = output
+	var failure: Option[Diagnostic] = None
+	for output_parameter in parameters:
+		fact = join_parameter(output_parameter)
+		match c_local_declaration(fact.value_type, JoinLocal, unions, fact.span):
+			Err(error):
+				failure = Some(error)
+				break
+			Ok(declaration): declarations = declarations.concat(declaration).concat(c_value(fact.id)).concat(";")
+	declared ?= match failure:
+		Some(error): Err(error)
+		None: Ok(void)
+	opening ?= append_switch(declarations, matched_join.scrutinee, matched_join.owner, unions, parameter.span)
 	var cases: List[SwitchCase] = []
 	for arm in matched_join.arms:
 		moved = match arm.transfer:
 			UnmanagedReturn(value): c_value(value)
 			OwnedReturn(_, owner): c_owner(owner)
-		cases = cases.append({ label = arm.label, operations = arm.operations, ending = name.concat("=").concat(moved).concat(";break;") })
+		var ending = name.concat("=").concat(moved).concat(";")
+		var position = 0
+		for output_parameter in matched_join.carried:
+			fact = join_parameter(output_parameter)
+			match arm.carried.get(position):
+				None: failure = Some(render(fact.span, MissingJoinTransfer(fact.id)))
+				Some(transfer):
+					value = match transfer:
+						UnmanagedReturn(id): c_value(id)
+						OwnedReturn(_, owner): c_owner(owner)
+					ending = ending.concat(c_value(fact.id)).concat("=").concat(value).concat(";")
+			if failure.is_some():
+				break
+			position = IntOps.add(position, 1)
+		if failure.is_some():
+			break
+		cases = cases.append({ label = arm.label, operations = arm.operations, ending = ending.concat("break;") })
+	transferred ?= match failure:
+		Some(error): Err(error)
+		None: Ok(void)
 	switched ?= append_cases(opening, cases, unions, types, records)
-	-- Like every value local, the join's is marked used: a statement match's
-	-- Void local is assigned but never read.
-	joined = switched.concat("(void)").concat(name).concat(";")
-	match matched_join.result:
-		UnmanagedJoinParameter(_):
-			Ok(joined)
-		ManagedJoinParameter(_, owner):
-			append_owner_alias(joined, owner, parameter.id, parameter.value_type, unions, parameter.span)
+	var joined = switched
+	for output_parameter in parameters:
+		fact = join_parameter(output_parameter)
+		-- Include Void and unused outputs, exactly as for ordinary value locals.
+		joined = joined.concat("(void)").concat(c_value(fact.id)).concat(";")
+		match output_parameter:
+			UnmanagedJoinParameter(_): void
+			ManagedJoinParameter(_, owner):
+				match append_owner_alias(joined, owner, fact.id, fact.value_type, unions, fact.span):
+					Ok(aliased): joined = aliased
+					Err(error): failure = Some(error)
+		if failure.is_some():
+			break
+	match failure:
+		Some(error): Err(error)
+		None: Ok(joined)
 
 
 private pure func append_signature(
@@ -2244,7 +2284,8 @@ private pure func program_inventory(program: OwnershipProgram) -> ProgramInvento
 									_: void
 							_: void
 					ExecuteJoin(join):
-						types = types.append(join_parameter(join.result).value_type)
+						for output in [join.result].concat(join.carried):
+							types = types.append(join_parameter(output).value_type)
 					AcquireOwner(_, _, _) | DropOwner(_, _):
 						void
 

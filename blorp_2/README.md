@@ -282,14 +282,17 @@ statement instead. A match whose position expects a type, such as a tail
 arm's, checks every arm against it. At a Void function's tail, a nested
 match discards each arm's value, as a plain Void tail does. A bare match as
 an arm's value is a nested join; in a `@tail_recursive` function a self call
-there is rejected until the loops milestone. Until the
-join milestone's next step, an arm may reassign only variables it declares
-itself; a match nested inside a
+there is rejected until the loops milestone. An arm may reassign a visible
+`var`; the code after the join sees the selected arm's final value, or the old
+value on an arm that leaves it unchanged. Older immutable aliases keep their
+values. A match nested inside a
 larger expression, such as a call argument, must be bound first. Each yielding
 arm moves its value into the join: a managed value moves an owner made in its
 arm, so a yielded prefix value is acquired again, and owners live before the
 join stay live through every arm and are dropped after it at their last use.
-In C the join is a local declared before the `switch` and assigned in each
+With carried variables, every managed outgoing occurrence acquires its own
+obligation before arm-local sources retire; enclosing owners stay live.
+In C the join's outputs are locals declared before the `switch` and assigned in each
 braced case; the [join examples](test/e2e/test_join.brp) include sixteen
 nested bound matches, whose C nests 33 braces deep.
 
@@ -2180,12 +2183,13 @@ Recursive direct arguments and postfix receiver calls remain single-line values.
 A structured body sum distinguishes that leaf from a match with ordered arms.
 A lowered block contains `Define` and `Join` steps. Ordinary definitions retain
 their value facts; a join publishes typed result/carried parameters separately
-from its arms' outgoing values. Current source lowering publishes one result and
-empty carried lists. Use rows count introduced values and record step positions;
+from its arms' outgoing values. The checker publishes ordered reassigned binding
+identities; lowering publishes the result and a fresh parameter per carrier.
+Use rows count introduced values and record step positions;
 drop buckets count steps. Arms' values and owners follow their complete block,
 so every block keeps consecutive identities. Ownership publishes `ExecuteJoin`,
-and independent verification checks the unary result and rejects nonempty
-carriers before sealing the program.
+and independent verification checks the complete signature and outgoing batch
+before sealing the program.
 General pass infrastructure remains future work.
 
 The target library's [`_base.brp`](standard_library_temp/_base.brp)

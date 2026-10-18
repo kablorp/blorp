@@ -97,6 +97,64 @@ static void test_independent_objects(void) {
     assert(destruction_count == 2);
 }
 
+static void test_edge_duplicate_outputs(void) {
+    struct blorp_string *source = blorp_int_to_string(INT64_C(17));
+    struct blorp_string *first = source;
+    struct blorp_string *second = source;
+    blorp_string_retain(first);
+    blorp_string_retain(second);
+    blorp_string_release(source);
+    assert(allocation_count == 1 && destruction_count == 0);
+    assert(atomic_load(&first->references) == 2);
+    assert(strcmp(first->bytes, "17") == 0);
+    blorp_string_release(first);
+    assert(destruction_count == 0);
+    assert(atomic_load(&second->references) == 1);
+    assert(strcmp(second->bytes, "17") == 0);
+    blorp_string_release(second);
+    assert(destruction_count == 1);
+}
+
+static void test_edge_swap_outputs(void) {
+    struct blorp_string *left = blorp_int_to_string(INT64_C(1));
+    struct blorp_string *right = blorp_int_to_string(INT64_C(777));
+    struct blorp_string *next_left = right;
+    struct blorp_string *next_right = left;
+    blorp_string_retain(next_left);
+    blorp_string_retain(next_right);
+    blorp_string_release(left);
+    blorp_string_release(right);
+    assert(allocation_count == 2 && destruction_count == 0);
+    assert(strcmp(next_left->bytes, "777") == 0);
+    assert(strcmp(next_right->bytes, "1") == 0);
+    assert(atomic_load(&next_left->references) == 1);
+    assert(atomic_load(&next_right->references) == 1);
+    blorp_string_release(next_left);
+    assert(destruction_count == 1);
+    assert(strcmp(next_right->bytes, "1") == 0);
+    blorp_string_release(next_right);
+    assert(destruction_count == 2);
+}
+
+static void test_edge_old_alias(void) {
+    struct blorp_string *original = blorp_int_to_string(INT64_C(1));
+    struct blorp_string *old_alias = original;
+    blorp_string_retain(old_alias);
+    struct blorp_string *replacement = blorp_int_to_string(INT64_C(777));
+    struct blorp_string *next = replacement;
+    blorp_string_retain(next);
+    blorp_string_release(replacement);
+    blorp_string_release(original);
+    assert(allocation_count == 2 && destruction_count == 0);
+    assert(strcmp(old_alias->bytes, "1") == 0);
+    assert(strcmp(next->bytes, "777") == 0);
+    blorp_string_release(old_alias);
+    assert(destruction_count == 1);
+    assert(strcmp(next->bytes, "777") == 0);
+    blorp_string_release(next);
+    assert(destruction_count == 2);
+}
+
 static void assert_bytes(const struct blorp_string *value, const char *expected, int64_t length) {
     assert(value->length == length);
     assert(blorp_string_length(value) == length);
@@ -487,6 +545,12 @@ int main(int argc, char **argv) {
         test_final_release();
     } else if (strcmp(argv[1], "independent_objects") == 0) {
         test_independent_objects();
+    } else if (strcmp(argv[1], "edge_duplicate_outputs") == 0) {
+        test_edge_duplicate_outputs();
+    } else if (strcmp(argv[1], "edge_swap_outputs") == 0) {
+        test_edge_swap_outputs();
+    } else if (strcmp(argv[1], "edge_old_alias") == 0) {
+        test_edge_old_alias();
     } else if (strcmp(argv[1], "bytes_empty") == 0) {
         test_bytes_empty();
     } else if (strcmp(argv[1], "bytes_ascii") == 0) {

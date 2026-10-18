@@ -3,7 +3,8 @@
 The separate [Blorp 2 pilot grammar](../blorp_2/grammar.ebnf) defines that
 compiler's restricted subset, including ordered binding and expression
 statements before a final expression or tail match, depth-three statement
-blocks inside match arms, builtin type declarations in the configured foundation,
+blocks inside match arms, including reassignment of visible outer `var` bindings
+through a bound or statement match, builtin type declarations in the configured foundation,
 and concrete runtime function declarations in ordinary modules. Its ordinary
 call syntax also accepts self and mutual recursion; checking separately rejects
 unbounded recursive type substitutions. Imports precede declarations. Relative

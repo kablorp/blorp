@@ -1,18 +1,19 @@
 import:
-	../../../src/check/check: checked_functions
+	../../../src/check/check: check, checked_functions
 	../../../src/check/model:
 		BindingOrigin(ParameterBinding, MatchCapture, BodyLocal),
-		CheckedBody(CheckedMatchBody),
+		CheckedBody(CheckedMatchBody, CheckedValueBody),
 		CheckedExit(ReturnExpression),
-		CheckedForm(Match, LiteralVoid, ReadBinding),
+		CheckedForm(Match, LiteralVoid, LiteralInteger, ReadBinding),
 		CheckedFunction,
 		CheckedJoinArm,
 		CheckedPattern(VariantCase),
-		CheckedStatement(InitializeBinding, DiscardExpression),
-		TypeRef(IntType, VoidType),
+		CheckedStatement(InitializeBinding, ReassignBinding, DiscardExpression),
+		TypeRef(IntType, StringType, VoidType),
 		binding_number,
 		same_type,
 	../input: checked_source
+	../module_input: INTEGER_OPERATIONS, TEST_BASE, parse_modules_with_base
 	test: TestSuite
 
 
@@ -34,6 +35,16 @@ private pure func function_named_first(source: String) -> Option[CheckedFunction
 			None
 		Ok(program):
 			checked_functions(program).functions.get(0)
+
+
+private pure func first_function_with_designated_bool(source: String) -> Option[CheckedFunction]:
+	parsed = parse_modules_with_base([{ source = source, targets = [] }], TEST_BASE)
+	match parsed:
+		Err(_): None
+		Ok(program):
+			match check(program):
+				Err(_): None
+				Ok(checked): checked_functions(checked).functions.get(0)
 
 
 -- The function's last line is its tail; a match before it is a join whose
@@ -153,6 +164,87 @@ private pure func is_void(arm: CheckedJoinArm) -> Bool:
 			False
 
 
+-- These acceptance oracles start red under the unary preparation's intentional
+-- outer-write rejection. The checker proves identities and types, not execution.
+pure func test_statement_join_reassigns_the_enclosing_binding() -> Bool:
+	source: String =
+		|pure func choose(flag: Bool) -> Int:
+		|    var total = 1
+		|    match flag:
+		|        True: total = 7
+		|        False: void
+		|    total
+		|func main() -> Int:
+		|    choose(True)
+		|
+	match first_function_with_designated_bool(source):
+		None: False
+		Some(function):
+			match (function.statements, function.body):
+				([InitializeBinding(total, initial), DiscardExpression(control)], CheckedValueBody(ReturnExpression(returned))):
+					match (initial.form, control.form, returned.form):
+						(LiteralInteger(1), Match(join), ReadBinding(result)):
+							match join.arms:
+								[changed, unchanged]:
+									match changed.statements:
+										[ReassignBinding(target, replacement)]:
+											match replacement.form:
+												LiteralInteger(7):
+													(
+														binding_number(total) == 1 and binding_number(target) == 1
+														and binding_number(result) == 1 and function.bindings.length() == 2
+														and same_type(control.value_type, VoidType)
+														and same_type(replacement.value_type, IntType)
+														and is_void(changed) and is_void(unchanged)
+														and unchanged.statements.is_empty() and join.carried.map(binding_number) == [1]
+													)
+												_: False
+										_: False
+								_: False
+						_: False
+				_: False
+
+
+pure func test_allocated_string_alias_survives_a_checked_join_reassignment() -> Bool:
+	source: String =
+		|fixed record TextPair { old: String, current: String }
+		|pure func choose_text(flag: Bool) -> TextPair:
+		|    var text = 1.to_string()
+		|    old = text
+		|    match flag:
+		|        True: text = 777.to_string()
+		|        False: void
+		|    { old = old, current = text }
+		|func main() -> Int:
+		|    unused = choose_text(True)
+		|    0
+		|
+	match first_function_with_designated_bool(source + INTEGER_OPERATIONS):
+		None: False
+		Some(function):
+			match function.statements:
+				[InitializeBinding(text, allocated), InitializeBinding(old, snapshot), DiscardExpression(control)]:
+					match (snapshot.form, control.form):
+						(ReadBinding(original), Match(join)):
+							match join.arms:
+								[changed, unchanged]:
+									match changed.statements:
+										[ReassignBinding(target, replacement)]:
+											(
+												binding_number(text) == 1 and binding_number(original) == 1
+												and binding_number(target) == 1 and binding_number(old) == 2
+												and function.bindings.length() == 3
+												and same_type(allocated.value_type, StringType)
+												and same_type(replacement.value_type, StringType)
+												and is_void(changed) and is_void(unchanged)
+												and unchanged.statements.is_empty() and join.carried.map(binding_number) == [1]
+											)
+										_: False
+								_: False
+						_: False
+				_: False
+
+
 -- A bare match as an arm's value is a nested join, in a tail arm or a join arm.
 pure func test_a_bare_match_as_an_arm_value_is_a_nested_join() -> Bool:
 	body: String =
@@ -243,15 +335,17 @@ pure func test_bound_match_arm_needs_a_value() -> Bool:
 	)
 
 
-pure func test_join_arm_cannot_reassign_an_outer_variable() -> Bool:
+pure func test_join_arm_reassignment_publishes_the_enclosing_binding() -> Bool:
 	prefix = SHAPE + "pure func width(shape: Shape) -> Int:\n\tvar total = 0\n\tmatch shape:\n\t\tCircle(r):\n\t\t\t"
-	rejected(
-		prefix + "total = r\n\t\tSquare(_): void\n\ttotal\n" + MAIN,
-		prefix.length(),
-		prefix.length() + 5,
-		"reassigning a variable declared outside this match arm is not supported yet",
-		"bind the match's value with name = match ... instead; reassignment inside an arm arrives with joins that carry reassigned variables",
-	)
+	match function_named_first(prefix + "total = r\n\t\tSquare(_): void\n\ttotal\n" + MAIN):
+		None: False
+		Some(function):
+			match function.statements:
+				[InitializeBinding(_, _), DiscardExpression(value)]:
+					match value.form:
+						Match(join): join.carried.map(binding_number) == [1]
+						_: False
+				_: False
 
 
 pure func test_join_arm_may_reassign_its_own_variable() -> Bool:
@@ -456,9 +550,40 @@ pure func test_first_arm_help_when_the_first_arm_is_a_nested_match() -> Bool:
 	)
 
 
+pure func test_carried_bindings_are_unique_ordered_and_exclude_arm_locals() -> Bool:
+	source: String =
+		|pure func choose(flag: Bool) -> Int:
+		|    var left = 11
+		|    var right = 22
+		|    match flag:
+		|        True:
+		|            var inside = 0
+		|            inside = 7
+		|            right = 202
+		|            left = 101
+		|            left = 303
+		|        False: right = 22
+		|    left
+		|func main() -> Int:
+		|    choose(True)
+		|
+	match first_function_with_designated_bool(source):
+		None: False
+		Some(function):
+			match function.statements:
+				[InitializeBinding(_, _), InitializeBinding(_, _), DiscardExpression(value)]:
+					match value.form:
+						Match(join): join.carried.map(binding_number) == [1, 2] and function.bindings.length() == 4
+						_: False
+				_: False
+
+
 tests: TestSuite = {
 	description = "Bound and statement matches checked as joins",
 	tests = [
+		("carriers are unique, ordered and exclude arm locals", test_carried_bindings_are_unique_ordered_and_exclude_arm_locals),
+		("statement join reassigns its enclosing binding", test_statement_join_reassigns_the_enclosing_binding),
+		("allocated String alias survives checked join reassignment", test_allocated_string_alias_survives_a_checked_join_reassignment),
 		("tail call in a nested match is staged", test_tail_call_in_a_nested_match_is_staged),
 		("tail call two matches deep is staged", test_tail_call_two_matches_deep_is_staged),
 		("Void tail call in a nested match is staged", test_void_tail_call_in_a_nested_match_is_staged),
@@ -483,8 +608,8 @@ tests: TestSuite = {
 		("statement match arm value must be Void", test_statement_match_arm_value_must_be_void),
 		("bound match arm needs a value", test_bound_match_arm_needs_a_value),
 		(
-			"join arm cannot reassign an outer variable",
-			test_join_arm_cannot_reassign_an_outer_variable,
+			"join arm publishes its reassigned enclosing binding",
+			test_join_arm_reassignment_publishes_the_enclosing_binding,
 		),
 		("join arm may reassign its own variable", test_join_arm_may_reassign_its_own_variable),
 		(

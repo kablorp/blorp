@@ -4,7 +4,10 @@ A comprehensive reference for the blorp programming language.
 
 The separate [Blorp 2 pilot](../blorp_2/README.md) implements a restricted
 subset. Its current examples include immutable bindings and local `var`
-reassignment in function bodies and match-arm blocks, plus straight-line
+reassignment in function bodies and match-arm blocks, including visible outer
+variables carried through a bound or statement match. The continuation sees
+the selected arm's final values; older immutable aliases keep theirs. It supports
+straight-line
 managed Strings through target-library `to_string` and `length` operations
 selected by an ordinary source-defined prelude. Self and mutual function recursion are supported with
 ordinary C stack usage; generic recursion must have finite concrete instances,

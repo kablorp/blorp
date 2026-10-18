@@ -1,10 +1,12 @@
 import:
 	../../../src/lower/lower as Lower
 	../../../src/own/own as Own
+	../../../src/specialize/specialize as Concrete
 	../../../src/utils/source: compiler_source
-	../../../src/utils/syntax: Span, same_span
+	../../../src/utils/syntax: FunctionExecution(OrdinaryCalls), Span, same_span
 	../managed_union_inputs: lowered
 	../join_inputs: MEASURE, NEST, PICK, function_text, join_function, owned
+	../ownership_inputs: input_ids, parameter, span
 	test: TestSuite
 
 
@@ -16,6 +18,184 @@ private pure func inserted_text(source: String) -> String:
 			match join_function(program):
 				Some(function): function_text(function)
 				None: "no join"
+
+
+private CARRIED_TEXT: String =
+	|fixed union Choice:
+	|    Yes
+	|    No
+	|pure func text(value: Int) -> String:
+	|    builtin("int.to_string")
+	|
+
+
+private pure func text_join(body: String) -> Option[Own.OwnedJoin]:
+	main: String =
+		|func main() -> Int:
+		|    unused = choose(Yes)
+		|    0
+		|
+	match owned(CARRIED_TEXT + body + main):
+		Err(_): None
+		Ok(program):
+			match join_function(program):
+				None: None
+				Some(function):
+					var found: Option[Own.OwnedJoin] = None
+					for operation in function.operations:
+						match operation:
+							Own.ExecuteJoin(join): found = Some(join)
+							_: void
+					found
+
+
+private REPEATED_LOCAL: String =
+	|pure func choose(choice: Choice) -> String:
+	|    var held = text(1)
+	|    unused = match choice:
+	|        Yes:
+	|            held = text(7)
+	|            held
+	|        No: held
+	|    held
+	|
+
+
+pure func test_two_occurrences_of_one_local_acquire_twice_before_one_retirement() -> Bool:
+	match text_join(REPEATED_LOCAL):
+		Some(join):
+			match join.arms:
+				[first, _]:
+					match first.operations:
+						[Own.DefineValue(_), Own.DefineValue(source), Own.AcquireOwner(left, left_borrow, _), Own.AcquireOwner(right, right_borrow, _), Own.DropOwner(retired, _)]:
+							match (source.result, left_borrow.source, right_borrow.source):
+								(Own.OwnedResult(old), Own.OwnerBorrow(left_source), Own.OwnerBorrow(right_source)):
+									match (first.transfer, first.carried):
+										(Own.OwnedReturn(value, moved), [Own.OwnedReturn(carried, carried_owner)]):
+											(
+												Own.owner_number(left_source) == Own.owner_number(old)
+												and Own.owner_number(right_source) == Own.owner_number(old)
+												and Own.owner_number(retired) == Own.owner_number(old)
+												and Own.owner_number(left) == Own.owner_number(moved)
+												and Own.owner_number(right) == Own.owner_number(carried_owner)
+												and Own.owner_number(left) != Own.owner_number(right)
+												and Lower.value_number(value) == Lower.value_number(source.id)
+												and Lower.value_number(carried) == Lower.value_number(source.id)
+												and Lower.value_number(left_borrow.value) == Lower.value_number(source.id)
+												and Lower.value_number(right_borrow.value) == Lower.value_number(source.id)
+											)
+										_: False
+								_: False
+						_: False
+				_: False
+		None: False
+
+
+pure func test_two_enclosing_occurrences_acquire_twice_without_retiring_the_prefix() -> Bool:
+	match text_join(REPEATED_LOCAL):
+		Some(join):
+			match join.arms:
+				[_, second]:
+					match (second.operations, second.transfer, second.carried):
+						([Own.AcquireOwner(left, first, _), Own.AcquireOwner(right, other, _)], Own.OwnedReturn(value, moved), [Own.OwnedReturn(carried, carried_owner)]):
+							match (first.source, other.source):
+								(Own.OwnerBorrow(initial), Own.OwnerBorrow(same_initial)):
+									(
+										Own.owner_number(initial) == 0 and Own.owner_number(same_initial) == 0
+										and Own.owner_number(left) == Own.owner_number(moved)
+										and Own.owner_number(right) == Own.owner_number(carried_owner)
+										and Own.owner_number(left) != Own.owner_number(right)
+										and Lower.value_number(value) == Lower.value_number(carried)
+										and Lower.value_number(first.value) == Lower.value_number(value)
+										and Lower.value_number(other.value) == Lower.value_number(carried)
+									)
+								_: False
+						_: False
+				_: False
+		None: False
+
+
+pure func test_repeated_parameter_borrows_acquire_distinct_outgoing_obligations() -> Bool:
+	source: String =
+		|pure func choose(choice: Choice, input: String) -> String:
+		|    var held = input
+		|    unused = match choice:
+		|        Yes:
+		|            held = input
+		|            held
+		|        No: held
+		|    held
+		|func main() -> Int:
+		|    unused = choose(Yes, text(7))
+		|    0
+		|
+	match owned(CARRIED_TEXT + source):
+		Err(_): False
+		Ok(program):
+			match join_function(program):
+				None: False
+				Some(function):
+					match (function.operations, function.tail):
+						([Own.DefineValue(_), Own.DefineValue(input), Own.ExecuteJoin(join), Own.DropOwner(unused, _)], Own.ReturnTail(Own.ReturnResult(Own.OwnedReturn(returned, transferred)))):
+							match ((input.operation, input.result), join.result, join.carried, join.arms):
+								((Own.ParameterDefinition(1), Own.BorrowedResult(Own.ParameterBorrow(parameter))), Own.ManagedJoinParameter(_, result_owner), [Own.ManagedJoinParameter(carrier, carrier_owner)], [_, _]):
+									(
+										Lower.value_number(parameter) == Lower.value_number(input.id)
+										and Own.owner_number(result_owner) != Own.owner_number(carrier_owner)
+										and Own.owner_number(unused) == Own.owner_number(result_owner)
+										and Lower.value_number(returned) == Lower.value_number(carrier.id)
+										and Own.owner_number(transferred) == Own.owner_number(carrier_owner)
+										and join.arms.all(pure func(arm):
+											match (arm.operations, arm.transfer, arm.carried):
+												([Own.AcquireOwner(left, first, _), Own.AcquireOwner(right, other, _)], Own.OwnedReturn(value, moved), [Own.OwnedReturn(carried, carried_owner)]):
+													match (first.source, other.source):
+														(Own.ParameterBorrow(first_parameter), Own.ParameterBorrow(other_parameter)):
+															(
+																Lower.value_number(first_parameter) == Lower.value_number(input.id)
+																and Lower.value_number(other_parameter) == Lower.value_number(input.id)
+																and Lower.value_number(first.value) == Lower.value_number(input.id)
+																and Lower.value_number(other.value) == Lower.value_number(input.id)
+																and Lower.value_number(value) == Lower.value_number(input.id)
+																and Lower.value_number(carried) == Lower.value_number(input.id)
+																and Own.owner_number(left) != Own.owner_number(right)
+																and Own.owner_number(left) == Own.owner_number(moved)
+																and Own.owner_number(right) == Own.owner_number(carried_owner)
+															)
+														_: False
+												_: False
+										)
+									)
+								_: False
+						_: False
+
+
+pure func test_void_and_local_string_carrier_acquire_before_one_retirement() -> Bool:
+	body: String =
+		|pure func choose(choice: Choice) -> String:
+		|    var held = text(1)
+		|    match choice:
+		|        Yes: held = text(7)
+		|        No: void
+		|    held
+		|
+	match text_join(body):
+		Some(join):
+			match (join.result, join.arms):
+				(Own.UnmanagedJoinParameter(_), [first, _]):
+					match (first.operations, first.carried):
+						([Own.DefineValue(_), Own.DefineValue(source), Own.DefineValue(_), Own.AcquireOwner(acquired, borrow, _), Own.DropOwner(retired, _)], [Own.OwnedReturn(value, moved)]):
+							match (source.result, borrow.source):
+								(Own.OwnedResult(old), Own.OwnerBorrow(borrowed)):
+									(
+										Own.owner_number(old) == Own.owner_number(borrowed)
+										and Own.owner_number(old) == Own.owner_number(retired)
+										and Own.owner_number(acquired) == Own.owner_number(moved)
+										and Lower.value_number(value) == Lower.value_number(source.id)
+									)
+								_: False
+						_: False
+				_: False
+		None: False
 
 
 -- A prefix owner read only inside the join is dropped after it by the
@@ -73,28 +253,210 @@ private pure func insertion_rejected(
 							)
 
 
-pure func test_raw_join_carried_outputs_are_rejected_before_publication() -> Bool:
+pure func test_raw_join_carried_outputs_require_consecutive_identities() -> Bool:
 	rewrite = pure func(join: Lower.LoweredJoin) -> Lower.LoweredJoin:
-		match join.arms:
-			[first, _]: { join | carried = [{ join.result | id = first.value }] }
-			_: join
-	insertion_rejected(rewrite, "carried join outputs are not supported during unary preparation")
+		{ join | carried = [join.result] }
+	insertion_rejected(rewrite, "nonconsecutive value identity in ownership use analysis")
 
 
-pure func test_raw_join_carried_transfers_are_rejected_before_publication() -> Bool:
+pure func test_raw_join_carried_transfers_require_the_parameter_arity() -> Bool:
 	insertion_rejected(
 		pure func(join): { join | arms = join.arms.map(pure func(arm): { arm | carried = [arm.value] }) },
-		"carried join transfers are not supported during unary preparation",
+		"join arm carries the wrong number of values",
 	)
+
+
+pure func test_invalid_carried_value_reports_the_carrier_origin() -> Bool:
+	match input_ids():
+		Err(_): False
+		Ok(ids):
+			-- The raw prefix summary contains only the scrutinee. Insertion must
+			-- independently reject this arm's read of a continuation parameter.
+			function: Lower.LoweredFunction = {
+				execution = OrdinaryCalls,
+				signature = { parameters = [Concrete.UnionType(ids.union_id)], return_type = Concrete.IntType },
+				steps = [
+					Lower.Define(parameter(ids.first, Concrete.UnionType(ids.union_id))),
+					Lower.Join({
+						result = { id = ids.second, value_type = Concrete.VoidType, span = span(10) },
+						carried = [{ id = ids.third, value_type = Concrete.IntType, span = span(21) }],
+						scrutinee = ids.first,
+						owner = ids.union_id,
+						arms = [{
+							label = Lower.DefaultLabel,
+							steps = [Lower.Define({
+								id = ids.fourth,
+								value_type = Concrete.VoidType,
+								operation = Lower.VoidValue,
+								span = span(40),
+							})],
+							value = ids.fourth,
+							carried = [ids.third],
+						}],
+						reads = [ids.first],
+					}),
+				],
+				tail = Lower.ExitValue(Lower.ReturnValue(ids.third)),
+			}
+			match Own.insert_function(function, ids.unions, []):
+				Ok(_): False
+				Err(error):
+					(
+						error.message == "internal compiler error: invalid value identity in ownership use analysis"
+						and error.help == "report this compiler error with the input program"
+						and error.note.is_none() and same_span(error.span, span(21))
+					)
+
+
+pure func test_distinct_local_outputs_are_both_acquired_before_either_retires() -> Bool:
+	body: String =
+		|pure func choose(choice: Choice) -> String:
+		|    var held = text(1)
+		|    unused = match choice:
+		|        Yes:
+		|            held = text(7)
+		|            text(8)
+		|        No: held
+		|    held
+		|
+	match text_join(body):
+		Some(join):
+			match join.arms:
+				[first, _]:
+					match first.operations:
+						[Own.DefineValue(_), Own.DefineValue(current), Own.DefineValue(_), Own.DefineValue(selected), Own.AcquireOwner(_, result_borrow, _), Own.AcquireOwner(_, carrier_borrow, _), Own.DropOwner(retired_current, _), Own.DropOwner(retired_selected, _)]:
+							match (current.result, selected.result):
+								(Own.OwnedResult(current_owner), Own.OwnedResult(selected_owner)):
+									(
+										Own.owner_number(retired_current) == Own.owner_number(current_owner)
+										and Own.owner_number(retired_selected) == Own.owner_number(selected_owner)
+										and Own.owner_number(current_owner) != Own.owner_number(selected_owner)
+										and Lower.value_number(result_borrow.value) == Lower.value_number(selected.id)
+										and Lower.value_number(carrier_borrow.value) == Lower.value_number(current.id)
+									)
+								_: False
+						_: False
+				_: False
+		None: False
+
+
+pure func test_batch_does_not_retire_an_already_dropped_temporary_again() -> Bool:
+	body: String =
+		|pure func choose(choice: Choice) -> String:
+		|    var held = text(1)
+		|    unused = match choice:
+		|        Yes:
+		|            temporary = text(44)
+		|            held = text(7)
+		|            held
+		|        No: held
+		|    held
+		|
+	match text_join(body):
+		Some(join):
+			match join.arms:
+				[first, _]:
+					match first.operations:
+						[Own.DefineValue(_), Own.DefineValue(temporary), Own.DropOwner(early, _), Own.DefineValue(_), Own.DefineValue(current), Own.AcquireOwner(_, first_borrow, _), Own.AcquireOwner(_, second_borrow, _), Own.DropOwner(terminal, _)]:
+							match (temporary.result, current.result):
+								(Own.OwnedResult(temporary_owner), Own.OwnedResult(current_owner)):
+									(
+										Own.owner_number(early) == Own.owner_number(temporary_owner)
+										and Own.owner_number(terminal) == Own.owner_number(current_owner)
+										and Own.owner_number(early) != Own.owner_number(terminal)
+										and Lower.value_number(first_borrow.value) == Lower.value_number(current.id)
+										and Lower.value_number(second_borrow.value) == Lower.value_number(current.id)
+									)
+								_: False
+						_: False
+				_: False
+		None: False
+
+
+pure func test_unused_managed_carrier_drops_after_the_complete_join() -> Bool:
+	body: String =
+		|pure func choose(choice: Choice) -> Int:
+		|    var held = text(1)
+		|    match choice:
+		|        Yes: held = text(7)
+		|        No: void
+		|    0
+		|func main() -> Int:
+		|    unused = choose(Yes)
+		|    0
+		|
+	match owned(CARRIED_TEXT + body):
+		Err(_): False
+		Ok(program):
+			match join_function(program):
+				Some(function):
+					match function.operations:
+						[Own.DefineValue(_), Own.DefineValue(_), Own.DefineValue(_), Own.ExecuteJoin(join), Own.DropOwner(prefix, _), Own.DropOwner(unused, _), Own.DefineValue(_)]:
+							match join.carried:
+								[Own.ManagedJoinParameter(_, output)]:
+									Own.owner_number(prefix) == 0 and Own.owner_number(unused) == Own.owner_number(output)
+								_: False
+						_: False
+				None: False
+
+
+pure func test_projected_carrier_acquires_before_its_parent_retires() -> Bool:
+	body: String =
+		|fixed record Holder { text: String }
+		|pure func hold(value: String) -> Holder:
+		|    { text = value }
+		|pure func choose(choice: Choice) -> String:
+		|    var held = text(1)
+		|    match choice:
+		|        Yes:
+		|            parent = hold(text(7))
+		|            held = parent.text
+		|        No: void
+		|    held
+		|
+	match text_join(body):
+		None: False
+		Some(join):
+			match join.arms:
+				[first, _]:
+					match first.operations:
+						[Own.DefineValue(_), Own.DefineValue(_), Own.DefineValue(parent), Own.DropOwner(_, _), Own.DefineValue(child), Own.AcquireOwner(child_owner, child_borrow, _), Own.DropOwner(retired_parent, _), Own.DefineValue(_), Own.AcquireOwner(outgoing, carrier_borrow, _), Own.DropOwner(retired_child, _)]:
+							match (parent.result, child.result, first.carried):
+								(Own.OwnedResult(parent_owner), Own.BorrowedResult(Own.PayloadBorrow(parent_value)), [Own.OwnedReturn(value, transferred)]):
+									match (carrier_borrow.source, child_borrow.source):
+										(Own.OwnerBorrow(source), Own.PayloadBorrow(projected_parent)):
+											(
+												Lower.value_number(parent_value) == Lower.value_number(parent.id)
+												and Lower.value_number(projected_parent) == Lower.value_number(parent.id)
+												and Own.owner_number(retired_parent) == Own.owner_number(parent_owner)
+												and Own.owner_number(retired_child) == Own.owner_number(child_owner)
+												and Own.owner_number(source) == Own.owner_number(child_owner)
+												and Own.owner_number(outgoing) == Own.owner_number(transferred)
+												and Lower.value_number(child_borrow.value) == Lower.value_number(child.id)
+												and Lower.value_number(value) == Lower.value_number(child.id)
+											)
+										_: False
+								_: False
+						_: False
+				_: False
 
 
 tests: TestSuite = {
 	description = "Ownership insertion for joins",
 	tests = [
+		("repeated parameter borrows acquire distinct outgoing obligations", test_repeated_parameter_borrows_acquire_distinct_outgoing_obligations),
+		("unused managed carrier drops after the complete join", test_unused_managed_carrier_drops_after_the_complete_join),
+		("projected carrier acquires before parent retirement", test_projected_carrier_acquires_before_its_parent_retires),
+		("distinct locals acquire before either retires", test_distinct_local_outputs_are_both_acquired_before_either_retires),
+		("batch skips its already-retired temporary", test_batch_does_not_retire_an_already_dropped_temporary_again),
+		("invalid carried value reports its carrier origin", test_invalid_carried_value_reports_the_carrier_origin),
+		("two local occurrences acquire twice before one retirement", test_two_occurrences_of_one_local_acquire_twice_before_one_retirement),
+		("two enclosing occurrences preserve their prefix owner", test_two_enclosing_occurrences_acquire_twice_without_retiring_the_prefix),
+		("Void plus String carrier acquires before local retirement", test_void_and_local_string_carrier_acquire_before_one_retirement),
 		("prefix owner read in an arm drops after the join", test_prefix_owner_read_in_an_arm_drops_after_the_join),
 		("nested join owners follow their enclosing arm", test_nested_join_owners_follow_their_enclosing_arm),
 		("unread join value drops after the join", test_unread_join_value_drops_after_the_join),
-		("raw join carried outputs are rejected before publication", test_raw_join_carried_outputs_are_rejected_before_publication),
-		("raw join carried transfers are rejected before publication", test_raw_join_carried_transfers_are_rejected_before_publication),
+		("raw join carried outputs require consecutive identities", test_raw_join_carried_outputs_require_consecutive_identities),
+		("raw join carried transfers require parameter arity", test_raw_join_carried_transfers_require_the_parameter_arity),
 	]
 }

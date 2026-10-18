@@ -241,9 +241,8 @@ pure func lowered_functions(program: LoweredProgram) -> LoweredFunctions:
 -- numbered after it. Its value `id` is defined in the block; its arms match
 -- on `scrutinee` and see `bindings`.
 private fixed record PendingJoin {
-	id: ValueId,
-	value_type: TypeRef,
-	span: Span,
+	result: ValueParameter,
+	carried: List[ValueParameter],
 	scrutinee: ValueId,
 	join: ConcreteJoin,
 	bindings: List[Option[ValueId]]
@@ -268,6 +267,15 @@ private fixed record ExpressionBuilder {
 private fixed record BuiltValue {
 	builder: ExpressionBuilder,
 	value: ValueId
+}
+
+
+-- Only block positions can change binding versions. Ordinary expression
+-- children keep BuiltValue and never publish a continuation binding map.
+private fixed record BuiltBlockValue {
+	builder: ExpressionBuilder,
+	value: ValueId,
+	bindings: List[Option[ValueId]]
 }
 
 
@@ -322,13 +330,14 @@ private pure func lower_arguments(
 	builder: ExpressionBuilder,
 	bindings: List[Option[ValueId]],
 	arguments: List[ConcreteExpr],
+	binding_facts: List[ConcreteBinding],
 ) -> Result[BuiltArguments, Diagnostic]:
 	var current = builder
 	var values: List[ValueId] = []
 	var failure: Option[Diagnostic] = None
 
 	for argument in arguments:
-		match lower_value(current, bindings, argument):
+		match lower_value(current, bindings, argument, binding_facts):
 			Err(error):
 				failure = Some(error)
 				break
@@ -358,13 +367,14 @@ private pure func lower_record_fields(
 	builder: ExpressionBuilder,
 	bindings: List[Option[ValueId]],
 	fields: List[ConcreteRecordField],
+	binding_facts: List[ConcreteBinding],
 ) -> Result[BuiltFields, Diagnostic]:
 	var current = builder
 	var values: List[RecordFieldValue] = []
 	var failure: Option[Diagnostic] = None
 
 	for field in fields:
-		match lower_value(current, bindings, field.value):
+		match lower_value(current, bindings, field.value, binding_facts):
 			Err(error):
 				failure = Some(error)
 				break
@@ -394,9 +404,10 @@ private pure func lower_record_update(
 	owner: RecordInstanceId,
 	value_type: TypeRef,
 	span: Span,
+	binding_facts: List[ConcreteBinding],
 ) -> Result[BuiltValue, Diagnostic]:
-	base ?= lower_value(builder, bindings, update.base)
-	replaced ?= lower_record_fields(base.builder, bindings, update.replacements)
+	base ?= lower_value(builder, bindings, update.base, binding_facts)
+	replaced ?= lower_record_fields(base.builder, bindings, update.replacements, binding_facts)
 	var current = replaced.builder
 	var fields = replaced.values
 
@@ -412,6 +423,7 @@ private pure func lower_value(
 	builder: ExpressionBuilder,
 	bindings: List[Option[ValueId]],
 	value: ConcreteExpr,
+	binding_facts: List[ConcreteBinding],
 ) -> Result[BuiltValue, Diagnostic]:
 	match value.form:
 		LiteralVoid:
@@ -427,49 +439,92 @@ private pure func lower_value(
 				Ok(bound): Ok({ builder = builder, value = bound })
 				Err(error): Err(error)
 		ConstructVariant(variant, values):
-			match lower_arguments(builder, bindings, values):
+			match lower_arguments(builder, bindings, values, binding_facts):
 				Ok(children): Ok(define_value(children.builder, ConstructValue(variant, children.values), value.value_type, value.span))
 				Err(error): Err(error)
 		ConstructRecord(owner, fields):
-			match lower_record_fields(builder, bindings, fields):
+			match lower_record_fields(builder, bindings, fields, binding_facts):
 				Ok(built): Ok(define_value(built.builder, ConstructRecordValue(owner, built.values), value.value_type, value.span))
 				Err(error): Err(error)
 		ConstructList(elements):
-			match lower_arguments(builder, bindings, elements):
+			match lower_arguments(builder, bindings, elements, binding_facts):
 				Ok(children): Ok(define_value(children.builder, ConstructListValue(children.values), value.value_type, value.span))
 				Err(error): Err(error)
 		UpdateRecord(owner, update):
-			lower_record_update(builder, bindings, update, owner, value.value_type, value.span)
+			lower_record_update(builder, bindings, update, owner, value.value_type, value.span, binding_facts)
 		InvokeFunction(call, arguments):
-			match lower_arguments(builder, bindings, arguments):
+			match lower_arguments(builder, bindings, arguments, binding_facts):
 				Ok(children):
 					-- A call's definition is anchored at its callee, not at the whole occurrence.
 					Ok(define_value(children.builder, CallValue(call, children.values), value.value_type, call.span))
 				Err(error): Err(error)
 		ReadRecordField(receiver, field):
-			match lower_value(builder, bindings, receiver):
+			match lower_value(builder, bindings, receiver, binding_facts):
 				Ok(read): Ok(define_value(read.builder, ReadRecordFieldValue(field, read.value), value.value_type, value.span))
 				Err(error): Err(error)
 		Match(join):
-			match lower_value(builder, bindings, join.scrutinee):
-				Ok(scrutinee):
-					id = into_opaque ValueId(scrutinee.builder.next_value)
-					pending: PendingJoin = {
-						id = id,
-						value_type = value.value_type,
-						span = value.span,
-						scrutinee = scrutinee.value,
-						join = join,
-						bindings = bindings,
-					}
-					Ok({
-						builder = {
-							next_value = IntOps.add(scrutinee.builder.next_value, 1),
-							entries = scrutinee.builder.entries.append(AwaitingArms(pending))
-						},
-						value = id,
-					})
+			match lower_join_value(builder, bindings, join, value.value_type, value.span, binding_facts):
+				Ok(result): Ok({ builder = result.builder, value = result.value })
 				Err(error): Err(error)
+
+
+private pure func lower_join_value(
+	builder: ExpressionBuilder,
+	bindings: List[Option[ValueId]],
+	join: ConcreteJoin,
+	value_type: TypeRef,
+	span: Span,
+	binding_facts: List[ConcreteBinding],
+) -> Result[BuiltBlockValue, Diagnostic]:
+	scrutinee ?= lower_value(builder, bindings, join.scrutinee, binding_facts)
+	id = into_opaque ValueId(scrutinee.builder.next_value)
+	var next_value = IntOps.add(scrutinee.builder.next_value, 1)
+	var carried: List[ValueParameter] = []
+	var values = bindings
+	var failure: Option[Diagnostic] = None
+	for binding in join.carried:
+		position = binding_number(binding)
+		match binding_facts.get(position):
+			None:
+				failure = Some(invalid_binding(span))
+				break
+			Some(fact):
+				parameter: ValueParameter = {
+					id = into_opaque ValueId(next_value),
+					value_type = fact.value_type,
+					span = fact.span,
+				}
+				carried = carried.append(parameter)
+				values = values.set(position, Some(parameter.id))
+				next_value = IntOps.add(next_value, 1)
+	ready ?= match failure:
+		Some(error): Err(error)
+		None: Ok(void)
+	pending: PendingJoin = {
+		result = { id = id, value_type = value_type, span = span },
+		carried = carried,
+		scrutinee = scrutinee.value,
+		join = join,
+		bindings = bindings,
+	}
+	Ok({
+		builder = { next_value = next_value, entries = scrutinee.builder.entries.append(AwaitingArms(pending)) },
+		value = id,
+		bindings = values,
+	})
+
+
+private pure func lower_block_value(
+	builder: ExpressionBuilder,
+	bindings: List[Option[ValueId]],
+	value: ConcreteExpr,
+	binding_facts: List[ConcreteBinding],
+) -> Result[BuiltBlockValue, Diagnostic]:
+	match value.form:
+		Match(join): lower_join_value(builder, bindings, join, value.value_type, value.span, binding_facts)
+		_:
+			lowered ?= lower_value(builder, bindings, value, binding_facts)
+			Ok({ builder = lowered.builder, value = lowered.value, bindings = bindings })
 
 
 private fixed record BuiltBlock {
@@ -532,10 +587,11 @@ private pure func lower_exit(
 	next_value: Int,
 	bindings: List[Option[ValueId]],
 	exit: ConcreteExit,
+	binding_facts: List[ConcreteBinding],
 ) -> Result[BuiltExit, Diagnostic]:
 	match exit:
 		ReturnExpression(value):
-			match lower_value({ next_value = next_value, entries = [] }, bindings, value):
+			match lower_block_value({ next_value = next_value, entries = [] }, bindings, value, binding_facts):
 				Ok(result):
 					Ok({
 						next_value = result.builder.next_value,
@@ -549,7 +605,7 @@ private pure func lower_exit(
 			var values: List[ValueId] = []
 			var failure: Option[Diagnostic] = None
 			for argument in arguments:
-				match lower_value({ next_value = cursor, entries = [] }, bindings, argument):
+				match lower_value({ next_value = cursor, entries = [] }, bindings, argument, binding_facts):
 					Err(error):
 						failure = Some(error)
 						break
@@ -571,6 +627,7 @@ private pure func lower_statements(
 	next_value: Int,
 	bindings: List[Option[ValueId]],
 	statements: List[ConcreteStatement],
+	binding_facts: List[ConcreteBinding],
 ) -> Result[BuiltBlock, Diagnostic]:
 	var cursor = next_value
 	var values = bindings
@@ -581,7 +638,7 @@ private pure func lower_statements(
 			InitializeBinding(_, value): value
 			ReassignBinding(_, value): value
 			DiscardExpression(value): value
-		match lower_value({ next_value = cursor, entries = [] }, values, value):
+		match lower_block_value({ next_value = cursor, entries = [] }, values, value, binding_facts):
 			Err(error):
 				failure = Some(error)
 				break
@@ -589,6 +646,7 @@ private pure func lower_statements(
 				for entry in result.builder.entries:
 					entries = entries.append(entry)
 				cursor = result.builder.next_value
+				values = result.bindings
 				assigned = match statement:
 					InitializeBinding(id, _): Some(id)
 					ReassignBinding(id, _): Some(id)
@@ -703,7 +761,7 @@ private pure func complete_joins(
 				var arms: List[JoinArm] = []
 				var reads = [join.scrutinee]
 				for arm in join.join.arms:
-					match lower_join_arm(cursor, join.bindings, arm, join.scrutinee, bindings, unions):
+					match lower_join_arm(cursor, join.bindings, arm, join.scrutinee, join.join.carried, bindings, unions):
 						Err(error):
 							failure = Some(error)
 							break
@@ -714,8 +772,8 @@ private pure func complete_joins(
 				if failure.is_some():
 					break
 				steps = steps.append(Join({
-					result = { id = join.id, value_type = join.value_type, span = join.span },
-					carried = [],
+					result = join.result,
+					carried = join.carried,
 					scrutinee = join.scrutinee,
 					owner = join.join.owner,
 					arms = arms,
@@ -747,8 +805,8 @@ private pure func lower_arm(
 	unions: List[ConcreteUnion],
 ) -> Result[BuiltArm, Diagnostic]:
 	captures ?= bind_captures(initial_value, outer, arm.pattern, scrutinee, exit_span(arm.body), bindings, unions)
-	prefix ?= lower_statements(captures.next_value, captures.bindings, arm.statements)
-	result ?= lower_exit(prefix.next_value, prefix.bindings, arm.body)
+	prefix ?= lower_statements(captures.next_value, captures.bindings, arm.statements, bindings)
+	result ?= lower_exit(prefix.next_value, prefix.bindings, arm.body, bindings)
 	completed ?= complete_joins(arm_block(captures, prefix, result.entries), result.next_value, bindings, unions)
 	Ok({
 		arm = {
@@ -764,12 +822,24 @@ private pure func lower_join_arm(
 	outer: List[Option[ValueId]],
 	arm: ConcreteJoinArm,
 	scrutinee: ValueId,
+	carried_bindings: List[BindingId],
 	bindings: List[ConcreteBinding],
 	unions: List[ConcreteUnion],
 ) -> Result[BuiltJoinArm, Diagnostic]:
 	captures ?= bind_captures(initial_value, outer, arm.pattern, scrutinee, arm.value.span, bindings, unions)
-	prefix ?= lower_statements(captures.next_value, captures.bindings, arm.statements)
-	result ?= lower_value({ next_value = prefix.next_value, entries = [] }, prefix.bindings, arm.value)
+	prefix ?= lower_statements(captures.next_value, captures.bindings, arm.statements, bindings)
+	result ?= lower_block_value({ next_value = prefix.next_value, entries = [] }, prefix.bindings, arm.value, bindings)
+	var carried: List[ValueId] = []
+	var failure: Option[Diagnostic] = None
+	for binding in carried_bindings:
+		match read_binding(result.bindings, binding, arm.value.span):
+			Ok(value): carried = carried.append(value)
+			Err(error):
+				failure = Some(error)
+				break
+	ready ?= match failure:
+		Some(error): Err(error)
+		None: Ok(void)
 	completed ?= complete_joins(arm_block(captures, prefix, result.builder.entries), result.builder.next_value, bindings, unions)
 	-- The arm's own values are [initial_value, after); its joins' reads
 	-- already exclude their arms' values.
@@ -781,8 +851,11 @@ private pure func lower_join_arm(
 				reads = reads.append(read)
 	if outside_arm(result.value, initial_value, after):
 		reads = reads.append(result.value)
+	for value in carried:
+		if outside_arm(value, initial_value, after):
+			reads = reads.append(value)
 	Ok({
-		arm = { label = arm_label(arm.pattern), steps = completed.steps, value = result.value, carried = [] },
+		arm = { label = arm_label(arm.pattern), steps = completed.steps, value = result.value, carried = carried },
 		reads = reads,
 		next_value = completed.next_value,
 	})
@@ -801,7 +874,7 @@ private pure func lower_match(
 	bindings: List[ConcreteBinding],
 	unions: List[ConcreteUnion],
 ) -> Result[BuiltMatch, Diagnostic]:
-	scrutinee ?= lower_value({ next_value = block.next_value, entries = [] }, block.bindings, matched.scrutinee)
+	scrutinee ?= lower_value({ next_value = block.next_value, entries = [] }, block.bindings, matched.scrutinee, bindings)
 	var entries = block.entries
 	for entry in scrutinee.builder.entries:
 		entries = entries.append(entry)
@@ -848,7 +921,7 @@ private pure func lower_function(
 			_:
 				void
 		ordinal = IntOps.add(ordinal, 1)
-	prefix ?= lower_statements(next_value, values, function.statements)
+	prefix ?= lower_statements(next_value, values, function.statements, function.bindings)
 	var entries: List[BlockEntry] = []
 	for definition in parameter_definitions:
 		entries = entries.append(Defined(definition))
@@ -857,7 +930,7 @@ private pure func lower_function(
 	block: BuiltBlock = { prefix | entries = entries }
 	body_result: Result[BuiltTail, Diagnostic] = match function.body:
 		ConcreteValueBody(value):
-			match lower_exit(prefix.next_value, prefix.bindings, value):
+			match lower_exit(prefix.next_value, prefix.bindings, value, function.bindings):
 				Ok(result):
 					var body_entries = block.entries
 					for entry in result.entries:

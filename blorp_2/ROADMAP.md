@@ -481,11 +481,12 @@ joins in tail arms, with byte-identical C for every existing fixture; see the
 [join report](../benchmarks/results/blorp_2_join_2026-10-16.md). It settled
 three details of the sketch above. The original `JoinValue` definition is replaced
 by `LoweredStep.Define/Join` and explicit typed parameters in the written unary
-preparation; current lowering publishes one result (Void for a statement match)
-and empty carriers. A join arm only yields its value: only a
+preparation. M2.1b now also publishes the reassigned enclosing bindings as
+ordered carried parameters, alongside the result (Void for a statement match).
+A join arm yields its value and those bindings: only a
 tail arm returns or loops, so a yield cannot end a function and a backedge
-cannot leave a join. An arm may not reassign a variable declared outside it
-yet; M2.1b, next, makes a join also carry each reassigned variable. Its reviewed
+cannot leave a join. The checker records each enclosing `var` reassigned by an
+arm; lowering publishes its selected immutable version after the join. The reviewed
 [carried-bindings plan](CARRIED_BINDINGS_PLAN.md) defines structured multi-output
 steps, first as a behavior-preserving preparation. Preparation budgets are
 accepted and the early physical screen is measured. The current unary port at
@@ -495,7 +496,9 @@ its functional gates and 3,944 fixed-epoch cost calls pass. See the
 for current evidence and the separate historical R0 limitation. The carried
 feature's approved budgets and
 implementation acceptance remain separate from the preparation. The
-checked form is `Match(CheckedJoin)` with value arms; the tail match keeps
+[carried-feature report](../benchmarks/results/blorp_2_carried_bindings_2026-10-18.md)
+records current functional validation and the 3,976-call frozen cost campaign.
+The checked form is `Match(CheckedJoin)` with value arms; the tail match keeps
 `CheckedMatchBody`. A match at a Void function's tail discards each arm's
 value, as a plain Void tail does. A self call at the tail of a nested match
 is rejected until the loops milestone gives joins a backedge. M2.2 after M1b

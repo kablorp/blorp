@@ -1,26 +1,27 @@
 import:
 	../../../src/lower/lower: MatchLabel(DefaultLabel, VariantLabel)
 	../../../src/own/own:
-		BorrowSource(ParameterBorrow),
+		BorrowSource(ParameterBorrow, OwnerBorrow),
 		OwnedArgument(UnmanagedArgument),
 		OwnedDefinition,
 		OwnedExit(ReturnResult, RecurArguments),
 		OwnedFunction,
+		OwnedJoinParameter(UnmanagedJoinParameter, ManagedJoinParameter),
 		OwnedTail(ReturnTail, MatchTail),
 		OwnedValueOperation(
 			ParameterDefinition, IntegerDefinition, CallDefinition,
-			ConstructDefinition,
+			ConstructDefinition, StringDefinition, VoidDefinition,
 		),
-		OwnershipOperation(DefineValue, AcquireOwner, DropOwner),
+		OwnershipOperation(DefineValue, ExecuteJoin, AcquireOwner, DropOwner),
 		OwnershipProgram,
 		ResultOwnership(UnmanagedResult, OwnedResult),
-		ReturnTransfer(UnmanagedReturn),
+		ReturnTransfer(UnmanagedReturn, OwnedReturn),
 		StoredPayload(UnmanagedPayload),
 		owner_id,
 	../../../src/namespace/builtins as Builtins: RuntimeOperation(IntToString)
 	../../../src/specialize/specialize:
 		CallTarget(UserFunction, RuntimeFunction),
-		TypeRef(IntType, StringType, UnionType),
+		TypeRef(IntType, StringType, UnionType, VoidType),
 	../../../src/utils/syntax: FunctionExecution(OrdinaryCalls, SelfTailLoop), same_span, Entrypoint(NoArguments), EntryResult(IntegerExitStatus), entry_function
 	../../../src/verify/verify: verify
 	../ownership_inputs: InputIds, input_ids, span
@@ -98,6 +99,7 @@ private pure func rejects(
 				same_span(error.span, span(at))
 				and error.message == "ownership verification failed: " + message
 				and error.help == "report this compiler error with the input program"
+				and error.note.is_none()
 			)
 
 
@@ -614,9 +616,44 @@ pure func test_managed_arm_value_already_dropped() -> Bool:
 			rejects(ids, function, 30, "managed value appears in a self-tail loop")
 
 
+pure func test_raw_managed_join_carrier_rejects_before_its_arm_operations() -> Bool:
+	match input_ids():
+		Err(_): False
+		Ok(ids):
+			original = loop(ids)
+			function = { original |
+				signature = { original.signature | parameters = [UnionType(ids.union_id), IntType] },
+				operations = [
+					DefineValue({ id = ids.first, value_type = UnionType(ids.union_id), operation = ParameterDefinition(0), result = UnmanagedResult, span = span(10) }),
+					DefineValue({ id = ids.second, value_type = IntType, operation = ParameterDefinition(1), result = UnmanagedResult, span = span(20) }),
+					ExecuteJoin({
+						result = UnmanagedJoinParameter({ id = ids.third, value_type = VoidType, span = span(30) }),
+						carried = [ManagedJoinParameter({ id = ids.fourth, value_type = StringType, span = span(31) }, owner_id(0))],
+						scrutinee = UnmanagedArgument(ids.first),
+						owner = ids.union_id,
+						arms = [{
+							label = DefaultLabel,
+							operations = [
+								DefineValue({ id = ids.fifth, value_type = StringType, operation = StringDefinition("arm"), result = OwnedResult(owner_id(1)), span = span(40) }),
+								DefineValue({ id = ids.sixth, value_type = VoidType, operation = VoidDefinition, result = UnmanagedResult, span = span(41) }),
+								AcquireOwner(owner_id(2), { value = ids.fifth, source = OwnerBorrow(owner_id(1)) }, span(42)),
+								DropOwner(owner_id(1), span(43)),
+							],
+							transfer = UnmanagedReturn(ids.sixth),
+							carried = [OwnedReturn(ids.fifth, owner_id(2))],
+						}],
+					}),
+					DropOwner(owner_id(0), span(50)),
+				],
+				tail = ReturnTail(RecurArguments([ids.first, ids.second], span(80))),
+			}
+			rejects(ids, function, 31, "managed value appears in a self-tail loop")
+
+
 tests: TestSuite = {
 	description = "Independent recursive backedge verification",
 	tests = [
+		("managed raw carrier rejects before its arm", test_raw_managed_join_carrier_rejects_before_its_arm_operations),
 		("valid permutation", test_valid_permutation),
 		("valid duplicate", test_valid_duplicate),
 		("zero argument entry loop", test_zero_argument_entry_loop),

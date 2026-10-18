@@ -10,6 +10,16 @@ including the original SOURCE checkpoint. Functional evidence is 216 focused,
 for exact roles, inputs, raw evidence and limitations. The carried-binding
 feature and its acceptance are separate.
 
+The current carried-feature candidate is `bootstrap-carried-current/blorp`,
+based on accepted unary main `db8abb15af4250eba1ad4c6d3efc8171cf35adaf`. It
+carries checked binding identities through specialization, lowering, ownership,
+verification and emission. Static review is complete; fresh functional and
+matched feature-cost validation now pass: 168 focused, 3,313 component and 476
+e2e checks, plus all 3,976 frozen cost calls. The hard +3% shared-input and
+original SOURCE checkpoint gates pass; see the
+[current feature report](../benchmarks/results/blorp_2_carried_bindings_2026-10-18.md).
+Final report review, integration and publication remain coordinator-owned.
+
 Historical provenance: the design began at `e6785c22f` on 2026-10-16. The retained
 candidate `04fee8a6f` and ports at `0cdba16a4` and `e29a5396a` remain preserved.
 The earlier 96-callback characterization and its initial non-exhaustive-match
@@ -36,11 +46,14 @@ pure func choose(flag: Bool) -> Int:
     total
 ```
 
-Expected: `choose(True)` is 7; `choose(False)` is 1. With a fresh pilot, reproduce
-the existing [rejection fixture](test/e2e/fixtures/unsupported/join_reassignment.brp) from the repository root:
+Expected: `choose(True)` is 7; `choose(False)` is 1. The original rejection's
+executable body is preserved in
+[carried_existing.brp](test/e2e/fixtures/join/carried_existing.brp). A unary
+preparation pilot rejects it; the feature pilot emits C whose ordinary `main`
+returns 1, with empty stdout and stderr. Compile it from the repository root:
 
 ```sh
-blorp_2/build/compiler --library-root blorp_2/standard_library_temp blorp_2/test/e2e/fixtures/unsupported/join_reassignment.brp blorp_2/build/join_reassignment.c
+blorp_2/build/compiler --library-root blorp_2/standard_library_temp blorp_2/test/e2e/fixtures/join/carried_existing.brp blorp_2/build/carried_existing.c
 ```
 
 The next managed input uses existing target APIs and a supported managed record:
@@ -280,6 +293,36 @@ net tests**, and **10 fixtures/300 lines**. Its earlier +350/+450 net estimate
 is historical. Full feature validation and acceptance remain separate from
 this unary preparation; no preparation allowance or result transfers.
 
+## Prospective M2 carried-feature approval
+
+Root and an independent compiler expert approved this bounded feature and its
+hard caps on 2026-10-18, before production feature changes. The separate
+`bootstrap-carried-bindings` worktree preserves the complete preparation stack;
+feature writing does not change unary preparation's frozen cost inputs or borrow
+its LOC allowance. M3 loops remain a separate contract and implementation.
+
+The feature must implement the complete checker-to-emitter path, including managed
+multi-output edges: acquire every managed outgoing occurrence before retiring
+terminal-live arm-local sources, preserve enclosing owners, and verify the whole
+batch independently. A scalar-only substitute does not satisfy acceptance.
+
+Every unchanged input and the **original schema1 host checkpoint proxy** must
+satisfy **+3% allocations and normal minimum-of-three retired instructions**.
+Preserve existing absolute caps, strict-zero pilot/native memory, exact shared C
+and full diagnostic identity. Enumerate the deliberate outer-reassignment
+rejection-to-acceptance changes separately; never ratio an old rejected call
+against its newly accepted compilation. No baseline movement, cap widening,
+coverage deletion, formatting compression or alternate fixture entrypoint follows.
+
+Root and an independent compiler expert prospectively approved replacing only
+the new 18-line `carried_nested.brp` with the exact 46-line managed String
+nesting input on 2026-10-18, before measuring it. Its initial hard ceilings are
+**60,000 allocations/300,000,000 normal instructions**; the first scalar/String
+limits remain **30,000/150,000,000**. Ten fixtures now occupy 217 physical lines.
+The prior 18-line epoch passed its functional runs; that evidence is retained
+separately and does not validate this replacement. Default-limit C compilation,
+native values, structural nesting and final cost acceptance remain pending.
+
 ## Prospective unary-preparation cost contract
 
 Root and an independent compiler expert reviewed and approved this prospective
@@ -375,7 +418,7 @@ Runnable lane for the coordinator/runner, from a fresh isolated writer checkout:
 
 ```sh
 scripts/compiler-build-status
-bin/blorp test --suite --timeout 180 blorp_2/test/unit/test_check/test_join.brp blorp_2/test/unit/test_specialize/test_join.brp blorp_2/test/unit/test_lower/test_join.brp blorp_2/test/unit/test_own/test_join.brp blorp_2/test/unit/test_verify/test_join.brp blorp_2/test/unit/test_emit/test_join.brp
+bin/blorp test --suite --timeout 180 blorp_2/test/unit/test_check/test_join.brp blorp_2/test/unit/test_specialize/test_join.brp blorp_2/test/unit/test_lower/test_join.brp blorp_2/test/unit/test_own/test_join.brp blorp_2/test/unit/test_verify/test_join.brp blorp_2/test/unit/test_verify/test_carried_join.brp blorp_2/test/unit/test_emit/test_join.brp
 bin/blorp test --suite --timeout 180 blorp_2/test/runtime/test_string.brp blorp_2/test/runtime/test_record.brp
 bin/blorp test --suite --sanitize --leak-check --timeout 180 blorp_2/test/unit
 make -C blorp_2 test

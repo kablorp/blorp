@@ -1598,7 +1598,7 @@ private fixed record VerifiedBlock {
 }
 
 
-private pure func verify_unary_join_header(
+private pure func verify_join_header(
 	join: OwnedJoin,
 	state: VerificationFacts,
 	unions: List[ConcreteUnion],
@@ -1607,10 +1607,6 @@ private pure func verify_unary_join_header(
 	owners: List[OwnerState],
 ) -> Result[Void, Diagnostic]:
 	parameter = join_parameter(join.result)
-	admitted ?= if join.carried.is_empty():
-		Ok(void)
-	else:
-		Err(verification_error(parameter.span, "carried join outputs are not supported during unary preparation"))
 	ordinal ?= if IntOps.equals(value_number(parameter.id), IntOps.add(state.first_value, state.values.length())):
 		Ok(void)
 	else:
@@ -1670,14 +1666,40 @@ private pure func introduce_join_parameter(
 	})
 
 
-private pure func introduce_unary_join(
+private pure func introduce_carried_parameter(
+	output: OwnedJoinParameter,
+	start: VerificationState,
+	unions: List[ConcreteUnion],
+	records: List[ConcreteRecord],
+) -> Result[VerificationState, Diagnostic]:
+	parameter = join_parameter(output)
+	ordinal ?= if IntOps.equals(value_number(parameter.id), IntOps.add(start.facts.first_value, start.facts.values.length())):
+		Ok(void)
+	else:
+		Err(verification_error(parameter.span, "value identity is not the next function ordinal"))
+	membership ?= verify_type_membership(parameter.value_type, unions, records, parameter.span)
+	introduce_join_parameter(output, start, unions, records)
+
+
+private pure func introduce_join(
 	join: OwnedJoin,
 	start: VerificationState,
 	unions: List[ConcreteUnion],
 	records: List[ConcreteRecord],
 ) -> Result[VerificationState, Diagnostic]:
-	header ?= verify_unary_join_header(join, start.facts, unions, records, start.discharged, start.owners)
-	introduce_join_parameter(join.result, start, unions, records)
+	header ?= verify_join_header(join, start.facts, unions, records, start.discharged, start.owners)
+	result ?= introduce_join_parameter(join.result, start, unions, records)
+	var state = result
+	var invalid: Option[Diagnostic] = None
+	for output in join.carried:
+		match introduce_carried_parameter(output, state, unions, records):
+			Ok(introduced): state = introduced
+			Err(error):
+				invalid = Some(error)
+				break
+	match invalid:
+		Some(error): Err(error)
+		None: Ok(state)
 
 
 -- Owner vectors belong to this traversal, not the per-definition facts carrier.
@@ -1795,7 +1817,7 @@ private pure func verify_operations(
 												Ok(void)
 			ExecuteJoin(join):
 				start: VerificationState = { facts = state, discharged = discharged, owners = owners }
-				match introduce_unary_join(join, start, unions, records):
+				match introduce_join(join, start, unions, records):
 					Err(error): Err(error)
 					Ok(introduced):
 						pending = pending.append({ join = join, start = start })
@@ -2131,6 +2153,13 @@ private pure func verify_loop_operations(
 				match verify_loop_type(parameter.value_type, parameter.span, unions, records):
 					Err(error): invalid = Some(error)
 					Ok(_): void
+				for output in join.carried:
+					if invalid.is_some():
+						break
+					carried = join_parameter(output)
+					match verify_loop_type(carried.value_type, carried.span, unions, records):
+						Err(error): invalid = Some(error)
+						Ok(_): void
 				for arm in join.arms:
 					if invalid.is_none():
 						match verify_loop_operations(arm.operations, current, unions, records):
@@ -2330,14 +2359,14 @@ private pure func block_end(state: VerificationState) -> BlockEnd:
 -- move only an owner made in its arm, and must have discharged the arm's
 -- other owners. Every enclosing owner is still live: a join arm cannot
 -- discharge one, so all edges into the join agree.
-private pure func verify_yield(
+private pure func consume_yield(
 	transfer: ReturnTransfer,
 	state: VerificationState,
 	join_type: TypeRef,
 	unions: List[ConcreteUnion],
 	records: List[ConcreteRecord],
 	span: Span,
-) -> Result[Void, Diagnostic]:
+) -> Result[VerificationState, Diagnostic]:
 	yielded = match transfer:
 		UnmanagedReturn(value): value
 		OwnedReturn(value, _): value
@@ -2350,10 +2379,10 @@ private pure func verify_yield(
 	else:
 		Err(verification_error(span, "yield type does not match its join"))
 	plan ?= value_ownership(join_type, unions, records)
-	transferred: Result[Void, Diagnostic] = match plan:
+	transferred: Result[Option[Int], Diagnostic] = match plan:
 		NoOwnership:
 			match moved:
-				None: Ok(void)
+				None: Ok(None)
 				Some(_): Err(verification_error(span, "unmanaged yield cannot transfer an owner"))
 		ManagedStringLeaf | ManagedListRoot | ManagedRecordRoot(_) | InlineOwnedFields(_) | ManagedUnionRoot(_):
 			match moved:
@@ -2365,21 +2394,67 @@ private pure func verify_yield(
 							match slot:
 								EnclosingSlot(_):
 									Err(verification_error(span, "yield must transfer an owner made in its arm, not owner ".append_int(owner_number(id))))
-								LocalSlot(_):
+								LocalSlot(position):
 									match known_owner(state.facts, state.discharged, state.owners, id, span):
 										Ok(entry):
 											match entry:
 												ActiveOwner(owned):
 													if IntOps.equals(value_number(owned), value_number(yielded)):
-														Ok(void)
+														Ok(Some(position))
 													else:
 														Err(verification_error(span, "yielded owner does not own the yielded value"))
 												DischargedOwner:
 													Err(verification_error(span, "yield refers to discharged owner ".append_int(owner_number(id))))
 										Err(error): Err(error)
 						Err(error): Err(error)
-	moved_owner ?= transferred
-	complete_owners(state.owners, state.facts.first_owner, moved, YieldEdge, span)
+	consumed ?= transferred
+	match consumed:
+		None: Ok(state)
+		Some(position): Ok({ state | owners = state.owners.set(position, DischargedOwner) })
+
+
+private pure func verify_yield(
+	transfer: ReturnTransfer,
+	state: VerificationState,
+	join_type: TypeRef,
+	unions: List[ConcreteUnion],
+	records: List[ConcreteRecord],
+	span: Span,
+) -> Result[Void, Diagnostic]:
+	consumed ?= consume_yield(transfer, state, join_type, unions, records, span)
+	complete_owners(consumed.owners, state.facts.first_owner, None, YieldEdge, span)
+
+
+private pure func verify_join_transfers(
+	arm: OwnedJoinArm,
+	join: OwnedJoin,
+	state: VerificationState,
+	unions: List[ConcreteUnion],
+	records: List[ConcreteRecord],
+) -> Result[Void, Diagnostic]:
+	result = join_parameter(join.result)
+	if join.carried.is_empty():
+		verify_yield(arm.transfer, state, result.value_type, unions, records, result.span)
+	else:
+		first ?= consume_yield(arm.transfer, state, result.value_type, unions, records, result.span)
+		var current = first
+		var position = 0
+		var invalid: Option[Diagnostic] = None
+		for output in join.carried:
+			parameter = join_parameter(output)
+			match arm.carried.get(position):
+				None: invalid = Some(verification_error(result.span, "join arm carries the wrong number of values"))
+				Some(transfer):
+					match consume_yield(transfer, current, parameter.value_type, unions, records, parameter.span):
+						Ok(consumed): current = consumed
+						Err(error): invalid = Some(error)
+			if invalid.is_some():
+				break
+			position = IntOps.add(position, 1)
+		ready ?= match invalid:
+			Some(error): Err(error)
+			None: Ok(void)
+		complete_owners(current.owners, state.facts.first_owner, None, YieldEdge, result.span)
 
 
 -- Verifies every pending join's arms after their block, in the order their
@@ -2419,16 +2494,16 @@ private pure func verify_join_arm(
 	records: List[ConcreteRecord],
 ) -> Result[BlockEnd, Diagnostic]:
 	result = join_parameter(join.join.result)
-	admitted ?= if arm.carried.is_empty():
+	admitted ?= if IntOps.equals(arm.carried.length(), join.join.carried.length()):
 		Ok(void)
 	else:
-		Err(verification_error(result.span, "carried join transfers are not supported during unary preparation"))
+		Err(verification_error(result.span, "join arm carries the wrong number of values"))
 	start = enter(join.start, cursor.next_value, cursor.next_owner, KeepsEnclosing)
 	projection = match arm.label:
 		DefaultLabel: NoProjection
 		VariantLabel(id): PayloadProjection(join.join.scrutinee, id)
 	verified ?= verify_operations(arm.operations, start, signature, functions, unions, projection, records)
-	left ?= verify_yield(arm.transfer, verified.state, result.value_type, unions, records, result.span)
+	left ?= verify_join_transfers(arm, join.join, verified.state, unions, records)
 	verify_joins(verified.pending, block_end(verified.state), signature, functions, unions, records)
 
 

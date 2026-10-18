@@ -17,7 +17,7 @@ import:
 		statement_error,
 		UnsupportedForm(
 			LocalAnnotation, NestedPattern, OrPattern, ListPattern, StringPattern, CharPattern, QualifiedPattern, Propagation,
-			WhileStatement, ForStatement, JoinArmReassignment,
+			WhileStatement, ForStatement,
 		),
 		unsupported_form,
 	./callables: ResolutionContext
@@ -55,6 +55,7 @@ import:
 	./scope: LocalBinding, bind_local, binding_site, binding_definition, local_binding_id, lookup_binding
 	../utils/ids: VariantId, union_number
 	int as IntOps
+	list: repeat, set
 	../namespace/namespace: Namespace
 	option: is_some, to_result
 	../utils/syntax:
@@ -357,7 +358,6 @@ private pure func resolve_arm_prefix(
 	match_context: MatchContext,
 	remaining: List[VariantId],
 	bindings: List[BindingDefinition],
-	reassignment: ReassignmentScope,
 	context: ResolutionContext,
 ) -> Result[ResolvedArmPrefix, CheckError]:
 	pattern ?= resolve_pattern(arm.pattern, match_context, bindings.length(), context)
@@ -368,9 +368,9 @@ private pure func resolve_arm_prefix(
 		{
 			bindings = definitions,
 			scope = pattern.scope,
-			statements = []
+			statements = [],
+			reassigned = []
 		},
-		reassignment,
 		context,
 	)
 	Ok({ pattern = pattern.pattern, remaining = uncovered, block = block })
@@ -419,7 +419,7 @@ private pure func resolve_arms(
 			Ok(progress)
 		Some(arm):
 			-- A tail arm has no continuation, so it may reassign any variable.
-			match resolve_arm_prefix(arm, match_context, progress.remaining, progress.bindings, AnyMutableBinding, context):
+			match resolve_arm_prefix(arm, match_context, progress.remaining, progress.bindings, context):
 				Ok(prefix):
 					-- A tail match's arm must produce the function's value.
 					match arm.block.value.to_result(match_error(arm.span, ArmWithoutValue)):
@@ -466,19 +466,12 @@ private fixed union ValueExpectation:
 	VoidTail
 
 
--- Which bindings a block may reassign. A join carries only its value to the
--- code after it, so an arm of a bound or statement match may reassign only
--- the bindings it declares, those at or after this ordinal.
-private fixed union ReassignmentScope:
-	AnyMutableBinding
-	JoinArmLocals(Int)
-
-
 -- A checked value with the function's bindings after it: a match's arms
 -- add their captures and locals.
 private fixed record ResolvedValue {
 	value: CheckedExpr,
-	bindings: List[BindingDefinition]
+	bindings: List[BindingDefinition],
+	reassigned: List[BindingId]
 }
 
 
@@ -488,7 +481,8 @@ private fixed record JoinProgress {
 	arms: List[CheckedJoinArm],
 	remaining: List[VariantId],
 	bindings: List[BindingDefinition],
-	expectation: ValueExpectation
+	expectation: ValueExpectation,
+	reassigned: List[BindingId]
 }
 
 
@@ -536,7 +530,7 @@ private pure func resolve_value(
 				StatementArm:
 					statement_value(block.scope, written, StatementMatchArmValue, context)
 			match value_result:
-				Ok(value): Ok({ value = value, bindings = block.bindings })
+				Ok(value): Ok({ value = value, bindings = block.bindings, reassigned = block.reassigned })
 				Err(error): Err(error)
 
 
@@ -585,7 +579,8 @@ private pure func resolve_join(
 			arms = [],
 			remaining = started.remaining,
 			bindings = block.bindings,
-			expectation = arm_expectation
+			expectation = arm_expectation,
+			reassigned = []
 		},
 		context,
 	)
@@ -596,17 +591,23 @@ private pure func resolve_join(
 		-- Only a match without arms leaves its type undecided.
 		UntypedValue: Err(checker_invariant(body.keyword_span, JoinWithoutArms))
 	value_type ?= decided
+	carried: List[BindingId] = if resolved.reassigned.is_empty():
+		[]
+	else:
+		carried_bindings(block, resolved.reassigned)
 	Ok({
 		value = {
 			form = Match({
 				scrutinee = started.scrutinee,
 				union_type = started.scrutinee.value_type,
-				arms = resolved.arms
+				arms = resolved.arms,
+				carried = carried
 			}),
 			value_type = value_type,
 			span = body.span,
 		},
 		bindings = resolved.bindings,
+		reassigned = block.reassigned.concat(carried),
 	})
 
 
@@ -625,7 +626,6 @@ private pure func resolve_join_arms(
 				match_context,
 				progress.remaining,
 				progress.bindings,
-				JoinArmLocals(progress.bindings.length()),
 				context,
 			):
 				Ok(prefix):
@@ -639,6 +639,7 @@ private pure func resolve_join_arms(
 									Ok({
 										value = { form = LiteralVoid, value_type = VoidType, span = arm.span },
 										bindings = prefix.block.bindings,
+										reassigned = prefix.block.reassigned,
 									})
 								UntypedValue | CheckedAgainst(_, _) | VoidTail:
 									Err(match_error(arm.span, ArmWithoutValue))
@@ -661,6 +662,7 @@ private pure func resolve_join_arms(
 									remaining = prefix.remaining,
 									bindings = value.bindings,
 									expectation = expectation,
+									reassigned = progress.reassigned.concat(value.reassigned),
 								},
 								context,
 							)
@@ -705,15 +707,47 @@ private fixed record ResolvedBody {
 private fixed record ResolvedStatements {
 	bindings: List[BindingDefinition],
 	scope: List[LocalBinding],
-	statements: List[CheckedStatement]
+	statements: List[CheckedStatement],
+	reassigned: List[BindingId]
 }
+
+
+private fixed union JoinBindingState:
+	OutsideJoinScope
+	UntouchedJoinBinding
+	ReassignedJoinBinding
+
+
+-- Scope membership and write occurrences are already checked facts. This local
+-- table filters arm locals and freezes each visible identity once, in ordinal
+-- order even though the lexical lookup scope has most recent bindings first.
+private pure func carried_bindings(entry: ResolvedStatements, written: List[BindingId]) -> List[BindingId]:
+	var states = repeat(OutsideJoinScope, entry.bindings.length())
+	for binding in entry.scope:
+		states = states.set(binding_number(local_binding_id(binding)), UntouchedJoinBinding)
+	for id in written:
+		position = binding_number(id)
+		match states.get(position):
+			Some(state):
+				match state:
+					UntouchedJoinBinding | ReassignedJoinBinding:
+						states = states.set(position, ReassignedJoinBinding)
+					OutsideJoinScope: void
+			None: void
+	var carried: List[BindingId] = []
+	var ordinal = 0
+	for state in states:
+		match state:
+			ReassignedJoinBinding: carried = carried.append(binding_id(ordinal))
+			OutsideJoinScope | UntouchedJoinBinding: void
+		ordinal = IntOps.add(ordinal, 1)
+	carried
 
 
 -- New bindings are validated once after their initializer is checked.
 private pure func resolve_statements(
 	written: List[ParsedStatement],
 	block: ResolvedStatements,
-	reassignment: ReassignmentScope,
 	context: ResolutionContext,
 ) -> Result[ResolvedStatements, CheckError]:
 	match written.get(block.statements.length()):
@@ -723,8 +757,8 @@ private pure func resolve_statements(
 			match binding.annotation:
 				Some(annotation): Err(unsupported_form(type_span(annotation), LocalAnnotation))
 				None:
-					match resolve_assignment(binding, block, reassignment, context):
-						Ok(next): resolve_statements(written, next, reassignment, context)
+					match resolve_assignment(binding, block, context):
+						Ok(next): resolve_statements(written, next, context)
 						Err(error): Err(error)
 		Some(PropagatingBinding(propagation)):
 			Err(unsupported_form(propagation.span, Propagation))
@@ -743,9 +777,9 @@ private pure func resolve_statements(
 						written,
 						{ block |
 							bindings = resolved.bindings,
-							statements = block.statements.append(DiscardExpression(resolved.value))
+							statements = block.statements.append(DiscardExpression(resolved.value)),
+							reassigned = resolved.reassigned
 						},
-						reassignment,
 						context,
 					)
 				Err(error): Err(error)
@@ -754,7 +788,6 @@ private pure func resolve_statements(
 private pure func resolve_assignment(
 	written: ParsedBinding,
 	block: ResolvedStatements,
-	reassignment: ReassignmentScope,
 	context: ResolutionContext,
 ) -> Result[ResolvedStatements, CheckError]:
 	-- Existing assignment errors precede the RHS; an explicit var is a new declaration.
@@ -766,13 +799,7 @@ private pure func resolve_assignment(
 				Some(binding):
 					match binding_definition(binding).mutability:
 						Mutable:
-							match reassignment:
-								AnyMutableBinding: Ok(Some(binding))
-								JoinArmLocals(first):
-									if IntOps.less_than(binding_number(local_binding_id(binding)), first):
-										Err(unsupported_form(written.name.span, JoinArmReassignment))
-									else:
-										Ok(Some(binding))
+							Ok(Some(binding))
 						Immutable:
 							Err(statement_error(written.name.span, ImmutableAssignment(binding_site(context.caller.function, binding))))
 
@@ -786,7 +813,8 @@ private pure func resolve_assignment(
 					Ok(
 						{ block |
 							bindings = resolved.bindings,
-							statements = block.statements.append(ReassignBinding(local_binding_id(binding), resolved.value))
+							statements = block.statements.append(ReassignBinding(local_binding_id(binding), resolved.value)),
+							reassigned = resolved.reassigned.append(local_binding_id(binding))
 						},
 					)
 				Err(error): Err(error)
@@ -816,6 +844,7 @@ private pure func resolve_assignment(
 								bindings = resolved.bindings.append(definition),
 								scope = [binding].concat(block.scope),
 								statements = block.statements.append(InitializeBinding(id, value)),
+								reassigned = resolved.reassigned,
 							})
 				Err(error): Err(error)
 
@@ -833,9 +862,9 @@ private pure func resolve_body(
 				pure func(binding: LocalBinding) -> BindingDefinition: binding_definition(binding),
 			),
 			scope = initial,
-			statements = []
+			statements = [],
+			reassigned = []
 		},
-		AnyMutableBinding,
 		context,
 	)
 

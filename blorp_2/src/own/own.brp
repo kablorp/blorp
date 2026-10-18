@@ -282,11 +282,12 @@ private pure func terminal_span(
 			None: Err(internal_error(internal_span(), "invalid return value in ownership use analysis"))
 
 
--- What a block's exit reads: one returned or yielded value, or a backedge's
--- arguments at their own span.
+-- A terminal reads one returned value, shared-span backedge arguments, or a
+-- join result and ordered carriers with their existing parameter origins.
 private fixed union BlockTerminal:
 	TerminalValue(ValueId)
 	TerminalArguments(List[ValueId], Span)
+	TerminalJoin(ValueId, List[ValueId], List[ValueParameter])
 
 
 -- Each definition's last use in this block, at the position of its last
@@ -359,6 +360,7 @@ private pure func block_uses(
 	operands = match terminal:
 		TerminalValue(result): [result]
 		TerminalArguments(arguments, _): arguments
+		TerminalJoin(result, _, _): [result]
 	-- Resolve once at the caller, but keep operand errors ahead of a bad exit.
 	span ?= span_result
 
@@ -383,6 +385,24 @@ private pure func block_uses(
 			Err(error):
 				invalid = Some(error)
 				break
+
+	match terminal:
+		TerminalValue(_) | TerminalArguments(_, _): void
+		TerminalJoin(_, arguments, parameters):
+			var position = 0
+			for parameter in parameters:
+				if invalid.is_some():
+					break
+				match arguments.get(position):
+					None: invalid = Some(internal_error(span, "join arm carries the wrong number of values"))
+					Some(operand):
+						match use_slot(operand, introduced_count, outer, first_value, terminal_uses.length(), parameter.span):
+							Ok(slot):
+								match slot:
+									Some(index): terminal_uses = terminal_uses.set(index, Some(step_position))
+									None: void
+							Err(error): invalid = Some(error)
+				position = IntOps.add(position, 1)
 
 	match invalid:
 		Some(error):
@@ -732,6 +752,7 @@ private fixed record PendingOwnedJoin {
 	join: LoweredJoin,
 	scrutinee: OwnedArgument,
 	result: OwnedJoinParameter,
+	carried: List[OwnedJoinParameter],
 	enclosing: List[EnclosingBlock]
 }
 
@@ -771,8 +792,21 @@ private pure func drop_position(
 private fixed record BuiltJoin {
 	scrutinee: OwnedArgument,
 	result: OwnedJoinParameter,
+	carried: List[OwnedJoinParameter],
 	next_owner: Int
 }
+
+
+private pure func owned_join_parameter(
+	parameter: ValueParameter,
+	next_owner: Int,
+	unions: List[ConcreteUnion],
+	records: List[ConcreteRecord],
+) -> Result[OwnedJoinParameter, Diagnostic]:
+	plan ?= value_ownership(parameter.value_type, unions, records)
+	match plan:
+		NoOwnership: Ok(UnmanagedJoinParameter(parameter))
+		_: Ok(ManagedJoinParameter(parameter, owner_id(next_owner)))
 
 
 private pure func build_join(
@@ -784,16 +818,26 @@ private pure func build_join(
 	unions: List[ConcreteUnion],
 	records: List[ConcreteRecord],
 ) -> Result[BuiltJoin, Diagnostic]:
-	if not join.carried.is_empty():
-		Err(internal_error(join.result.span, "carried join outputs are not supported during unary preparation"))
-	else:
-		plan ?= value_ownership(join.result.value_type, unions, records)
-		scrutinee ?= borrow_argument(join.scrutinee, sources, enclosing, first_value, join.result.span)
-		match plan:
-			NoOwnership:
-				Ok({ scrutinee = scrutinee, result = UnmanagedJoinParameter(join.result), next_owner = next_owner })
-			_:
-				Ok({ scrutinee = scrutinee, result = ManagedJoinParameter(join.result, owner_id(next_owner)), next_owner = IntOps.add(next_owner, 1) })
+	result ?= owned_join_parameter(join.result, next_owner, unions, records)
+	scrutinee ?= borrow_argument(join.scrutinee, sources, enclosing, first_value, join.result.span)
+	var cursor = match result:
+		UnmanagedJoinParameter(_): next_owner
+		ManagedJoinParameter(_, _): IntOps.add(next_owner, 1)
+	var carried: List[OwnedJoinParameter] = []
+	var failure: Option[Diagnostic] = None
+	for parameter in join.carried:
+		match owned_join_parameter(parameter, cursor, unions, records):
+			Err(error):
+				failure = Some(error)
+				break
+			Ok(output):
+				carried = carried.append(output)
+				match output:
+					UnmanagedJoinParameter(_): void
+					ManagedJoinParameter(_, _): cursor = IntOps.add(cursor, 1)
+	match failure:
+		Some(error): Err(error)
+		None: Ok({ scrutinee = scrutinee, result = result, carried = carried, next_owner = cursor })
 
 
 private pure func insert_steps(
@@ -817,6 +861,7 @@ private pure func insert_steps(
 	for step in steps:
 		value_slot = sources.length()
 		span = step_span(step)
+		var carried: List[OwnedJoinParameter] = []
 		available_result: Result[ResultOwnership, Diagnostic] = match step:
 			Join(join):
 				match build_join(join, sources, enclosing, first_value, next_owner, unions, records):
@@ -826,9 +871,11 @@ private pure func insert_steps(
 							join = join,
 							scrutinee = built.scrutinee,
 							result = built.result,
+							carried = built.carried,
 							enclosing = enclosing.append({ first_value = first_value, sources = sources }),
 						}))
 						next_owner = built.next_owner
+						carried = built.carried
 						Ok(join_ownership(built.result))
 			Define(definition):
 				match build_definition(definition, sources, enclosing, first_value, next_owner, unions, records):
@@ -878,6 +925,31 @@ private pure func insert_steps(
 													drops = drops.set(until, bucket.append({ owner = owner, span = step_span(last) }))
 					_:
 						void
+
+		-- Several outputs share one execution position, but each owns a value
+		-- slot and, when managed, an independently scheduled obligation.
+		for output in carried:
+			parameter = join_parameter(output)
+			slot = sources.length()
+			sources = sources.append(join_ownership(output))
+			match output:
+				UnmanagedJoinParameter(_): void
+				ManagedJoinParameter(_, owner):
+					owners = owners.append({ owner = owner, span = parameter.span })
+					match drop_position(schedule, slot, step_position, count, parameter.span):
+						Err(error): failure = Some(error)
+						Ok(until):
+							if IntOps.less_than(until, count):
+								match drops.get(until):
+									None: failure = Some(internal_error(parameter.span, "missing drop schedule row"))
+									Some(bucket):
+										match steps.get(until):
+											Some(last): drops = drops.set(until, bucket.append({ owner = owner, span = step_span(last) }))
+											None: failure = Some(internal_error(parameter.span, "invalid last-use position"))
+			if failure.is_some():
+				break
+		if failure.is_some():
+			break
 
 		match drops.get(step_position):
 			Some(bucket):
@@ -997,33 +1069,116 @@ private fixed record InsertedJoinArm {
 }
 
 
+private fixed record LeavingJoin {
+	entries: List[InsertedEntry],
+	transfer: ReturnTransfer,
+	carried: List[ReturnTransfer],
+	next_owner: Int
+}
+
+
+-- Multiple outgoing occurrences each acquire an independent obligation. Only
+-- after every acquisition may terminal-live arm-local sources retire. Sources
+-- already dropped by insert_steps, and all enclosing owners, remain untouched.
+private pure func leave_join(
+	arm: JoinArm,
+	parameters: List[ValueParameter],
+	inserted: InsertedSteps,
+	uses: List[Option[Int]],
+	enclosing: List[EnclosingBlock],
+	first_value: Int,
+	span: Span,
+) -> Result[LeavingJoin, Diagnostic]:
+	result_source ?= value_source(arm.value, inserted.sources, enclosing, first_value, span)
+	moved = match result_source:
+		OwnedResult(owner):
+			if arm.carried.is_empty() and in_interval(value_number(arm.value), first_value, inserted.sources.length()):
+				result_source
+			else:
+				BorrowedResult(OwnerBorrow(owner))
+		_: result_source
+	leaving = leave_with(arm.value, moved, inserted.entries, inserted.next_owner, span)
+	var entries = leaving.entries
+	var next_owner = leaving.next_owner
+	var carried: List[ReturnTransfer] = []
+	var position = 0
+	var failure: Option[Diagnostic] = None
+	for parameter in parameters:
+		match arm.carried.get(position):
+			None: failure = Some(internal_error(span, "join arm carries the wrong number of values"))
+			Some(value):
+				match value_source(value, inserted.sources, enclosing, first_value, parameter.span):
+					Err(error): failure = Some(error)
+					Ok(carrier_source):
+						borrowed = match carrier_source:
+							OwnedResult(owner): BorrowedResult(OwnerBorrow(owner))
+							_: carrier_source
+						left = leave_with(value, borrowed, entries, next_owner, parameter.span)
+						entries = left.entries
+						next_owner = left.next_owner
+						carried = carried.append(left.transfer)
+		if failure.is_some():
+			break
+		position = IntOps.add(position, 1)
+	ready ?= match failure:
+		Some(error): Err(error)
+		None: Ok(void)
+	if not arm.carried.is_empty():
+		var slot = 0
+		for source in inserted.sources:
+			match source:
+				OwnedResult(owner):
+					match uses.get(slot):
+						Some(last_use):
+							match last_use:
+								Some(last):
+									if IntOps.equals(last, arm.steps.length()):
+										entries = entries.append(Inserted(DropOwner(owner, span)))
+								None: void
+						None:
+							failure = Some(internal_error(span, "missing value-use row"))
+							break
+				_: void
+			slot = IntOps.add(slot, 1)
+	match failure:
+		Some(error): Err(error)
+		None:
+			Ok({
+				entries = entries,
+				transfer = leaving.transfer,
+				carried = carried,
+				next_owner = next_owner,
+			})
+
+
 -- A yield moves only an owner made in its arm, so every edge into the join
 -- leaves the same enclosing owners live; a yielded enclosing value is
 -- acquired again first.
 private pure func insert_join_arm(
 	arm: JoinArm,
+	parameters: List[ValueParameter],
+	result_span: Span,
 	enclosing: List[EnclosingBlock],
 	first_value: Int,
 	initial_owner: Int,
 	unions: List[ConcreteUnion],
 	records: List[ConcreteRecord],
 ) -> Result[InsertedJoinArm, Diagnostic]:
+	admitted ?= if IntOps.equals(arm.carried.length(), parameters.length()):
+		Ok(void)
+	else:
+		Err(internal_error(result_span, "join arm carries the wrong number of values"))
 	result = arm.value
 	outer = enclosing_intervals(enclosing)
 	span_result = terminal_span(arm.steps, result, outer)
-	uses ?= block_uses(arm.steps, TerminalValue(result), outer, first_value, span_result)
+	terminal = if arm.carried.is_empty():
+		TerminalValue(result)
+	else:
+		TerminalJoin(result, arm.carried, parameters)
+	uses ?= block_uses(arm.steps, terminal, outer, first_value, span_result)
 	span ?= span_result
 	inserted ?= insert_steps(arm.steps, DropAtLastUse(uses), enclosing, first_value, initial_owner, unions, records)
-	source ?= value_source(result, inserted.sources, enclosing, first_value, span)
-	moved = match source:
-		OwnedResult(owner):
-			if in_interval(value_number(result), first_value, inserted.sources.length()):
-				source
-			else:
-				BorrowedResult(OwnerBorrow(owner))
-		_:
-			source
-	leaving = leave_with(result, moved, inserted.entries, inserted.next_owner, span)
+	leaving ?= leave_join(arm, parameters, inserted, uses, enclosing, first_value, span)
 	completed ?= complete_joins(
 		leaving.entries,
 		IntOps.add(first_value, inserted.sources.length()),
@@ -1032,7 +1187,7 @@ private pure func insert_join_arm(
 		records,
 	)
 	Ok({
-		arm = { label = arm.label, operations = completed.operations, transfer = leaving.transfer, carried = [] },
+		arm = { label = arm.label, operations = completed.operations, transfer = leaving.transfer, carried = leaving.carried },
 		next_owner = completed.next_owner,
 		next_value = completed.next_value,
 	})
@@ -1065,10 +1220,7 @@ private pure func complete_joins(
 			AwaitingArms(join):
 				var arms: List[OwnedJoinArm] = []
 				for arm in join.join.arms:
-					if not arm.carried.is_empty():
-						failure = Some(internal_error(join.join.result.span, "carried join transfers are not supported during unary preparation"))
-						break
-					match insert_join_arm(arm, join.enclosing, next_value, next_owner, unions, records):
+					match insert_join_arm(arm, join.join.carried, join.join.result.span, join.enclosing, next_value, next_owner, unions, records):
 						Err(error):
 							failure = Some(error)
 							break
@@ -1080,7 +1232,7 @@ private pure func complete_joins(
 					break
 				operations = operations.append(ExecuteJoin({
 					result = join.result,
-					carried = [],
+					carried = join.carried,
 					scrutinee = join.scrutinee,
 					owner = join.join.owner,
 					arms = arms,
@@ -1211,6 +1363,14 @@ private pure func admit_loop_values(
 		match step:
 			Define(_): void
 			Join(join):
+				for parameter in join.carried:
+					match admit_unmanaged(parameter.value_type, parameter.span, unions, records):
+						Err(error):
+							invalid = Some(error)
+							break
+						Ok(_): void
+				if invalid.is_some():
+					break
 				for arm in join.arms:
 					match admit_loop_values(arm.steps, unions, records):
 						Err(error):

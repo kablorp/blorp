@@ -1,11 +1,11 @@
 import:
 	../../../src/lower/lower:
-		LoweredStep(Define),
+		LoweredStep(Define, Join),
 		LoweredExit(ReturnValue, RecurValues),
 		LoweredFunction,
 		LoweredTail(ExitValue, MatchValue),
 		MatchLabel(DefaultLabel),
-		ValueOperation(ParameterValue),
+		ValueOperation(ParameterValue, StringValue, VoidValue),
 		value_number,
 	../../../src/own/own:
 		OwnedExit(RecurArguments),
@@ -15,7 +15,7 @@ import:
 		exit_last_uses,
 		insert_function,
 	../../../src/namespace/builtins as Builtins: RuntimeOperation(IntToString)
-	../../../src/specialize/specialize: TypeRef(IntType, StringType, UnionType)
+	../../../src/specialize/specialize: TypeRef(IntType, StringType, UnionType, VoidType)
 	../../../src/utils/syntax: Diagnostic, FunctionExecution(SelfTailLoop), same_span
 	../ownership_inputs: InputIds, input_ids, integer, parameter, runtime, span
 	test: TestSuite
@@ -184,6 +184,7 @@ private pure func rejects_managed(function: LoweredFunction, ids: InputIds, star
 				same_span(error.span, span(start))
 				and error.message == "managed values in @tail_recursive functions are not supported yet"
 				and error.help == "use an unmanaged helper, or remove @tail_recursive"
+				and error.note.is_none()
 			)
 
 
@@ -282,9 +283,43 @@ pure func test_managed_arm_initializer_rejects_at_definition() -> Bool:
 			)
 
 
+pure func test_managed_join_carrier_rejects_at_its_own_origin_before_the_arm() -> Bool:
+	match input_ids():
+		Err(_): False
+		Ok(ids):
+			original = loop(ids)
+			union_type = UnionType(ids.union_id)
+			function = { original |
+				signature = { original.signature | parameters = [union_type, IntType] },
+				steps = [
+					Define(parameter(ids.first, union_type)),
+					Define({ parameter(ids.second, IntType) | operation = ParameterValue(1) }),
+					Join({
+						result = { id = ids.third, value_type = VoidType, span = span(30) },
+						carried = [{ id = ids.fourth, value_type = StringType, span = span(31) }],
+						scrutinee = ids.first,
+						owner = ids.union_id,
+						arms = [{
+							label = DefaultLabel,
+							steps = [
+								Define({ id = ids.fifth, value_type = StringType, operation = StringValue("arm"), span = span(40) }),
+								Define({ id = ids.sixth, value_type = VoidType, operation = VoidValue, span = span(41) }),
+							],
+							value = ids.sixth,
+							carried = [ids.fifth],
+						}],
+						reads = [ids.first],
+					}),
+				],
+				tail = ExitValue(RecurValues([ids.first, ids.second], span(80))),
+			}
+			rejects_managed(function, ids, 31)
+
+
 tests: TestSuite = {
 	description = "Unmanaged recursive backedge ownership",
 	tests = [
+		("managed carried output rejects at its origin before its arm", test_managed_join_carrier_rejects_at_its_own_origin_before_the_arm),
 		(
 			"permuted arguments have no owners or fictitious result",
 			test_permuted_arguments_remain_unmanaged,
