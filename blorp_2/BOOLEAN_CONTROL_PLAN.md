@@ -1,10 +1,11 @@
 # Boolean expressions through checked joins
 
-This is the next bounded M2.2 increment, designed against source commit
+The initial M2.2 design below was written against source commit
 `c3b7e4294825e2707e8d30d2e38edcad86a5c384`. It implements compositional `not`,
 then `and` and `or`, using the existing expression inference loop and checked
 join. Implementation waits for independent compiler review and approval of
-this plan. M2.2 remains incomplete: `if` stays explicitly unsupported.
+this plan. The accepted-M2 cost refresh at the end supersedes only the historical
+measurement baseline/roles; general `if` stays explicitly unsupported.
 
 ## Problem and first complete example
 
@@ -390,7 +391,8 @@ depth, and compile nesting stress with supported toolchains at default
 limits. Report inherited scaling separately; do not add flattening, an index
 or a new mechanism to evade a failure.
 
-Only after root grants the serialized compiled lane, run the frozen host
+The following initial frozen-host recipe is historical; the accepted-M2 refresh
+below owns current roles. Originally, only after a serialized lane grant, run the host
 against the exact new suite, followed by affected checker/inference and
 join phase suites:
 
@@ -425,3 +427,51 @@ CheckedExpr. Do not add a bare-only `if`, callback framework, inferred scope,
 second checker path, new pipeline, cache or IR to bypass that boundary. Stop
 on a host bug, ambiguous authority, ceiling breach, missing ownership oracle
 or need for an additional mechanism. No commits or pushes by the worker.
+
+
+## Prospective accepted-M2 cost refresh
+
+This bounded Boolean FEATURE refresh is prospective: no current cost setup,
+freeze or sample exists, and no failed epoch is retargeted. The initial c3b7 B,
+899e functional host and later unexecuted FULL-exit TOTAL proposal remain history;
+none supplies current acceptance. Root and independent review approve this
+maintained contract and the actual packet before any cost preparation or freeze.
+
+Freeze one actual then-accepted M2 B and complete Boolean C source and target
+library, with the complete current registered CLI states, fixture/generated
+inputs, output preconditions and preserved sentinels. Name B before sampling;
+never roll it to C, refreeze after failure or select a smaller changed corpus.
+Keep the original unsupported not/and-or program bytes as shared inputs despite
+their removed e2e registrations: only their enumerated typed diagnostic changes
+are intentional. Include all new Boolean cases separately, with no invented B.
+Do not copy historical503-state/3988-call totals into a new registry.
+
+For every shared input, keep the **+5% target / +10% hard rejection** limits for
+allocations and normal minimum-of-three positive retired instructions. Apply the
+same target/hard limits to the parent-owned compiler-source construction proxy.
+Report every target miss even below the hard ceiling; root reviews it explicitly.
+Keep all stricter absolute fixture caps, positive balanced strict-zero target
+reports, exact shared C/status/diagnostics/output-state oracles (except the two
+explicit diagnostic changes), and within-variant strict/normal identity. No
+aggregate average, offset, subtraction or unrelated improvement hides a breach.
+
+Retain the original producer/normal proxy SHA256
+`34ac1a913c79fc14130c77fe4339f24885a2fa65f1d25fc4b873b627e10e1f33`,
+diagnostic proxy `be31a5a3a070deef54707d8676a7c6157042484f40d0424dd5fb46835c09ff93`,
+and their explicit original host std tree `090ed68c5bd688cb8e2197c72bc572e4dc32e6d7`.
+Verify complete existing598 host-input pins and actual binary provenance before
+reuse. The diagnostic proxy observes exactly the original schema1
+`artifact_construction_complete.total_allocations`, with BLORP_MEMORY_STATS=1,
+BLORP_LEAK_CHECK unset, status0 and one exact checkpoint row. Normal proxy runs
+unset both memory modes and use B1,C1,C2,B2,B3,C3/min3 instructions. Preserve each
+variant's generated compiler C against its own once-generated setup C, and review
+intentional B/C compiler-source differences raw. This proxy is not self-compilation.
+
+The existing ROOT c04/explicit ROOT std91 role is FUNCTIONAL TestSuite/pilot
+production only, never a substitute for the original construction metric/host.
+No FULL-exit TOTAL, SOURCE3% substitution, inherited unary/HOF exception or old
+host-borrow exception is granted. Missing original provenance is STOP, not fallback.
+Accepted M2 carried facts remain the baseline; historical reassignment rejection
+wording above does not restore a removed restriction. All physical ceilings,
+semantic scope, scaling/default-depth, native/sanitizer, review and destination
+gates remain unchanged. Source migrations retain their separate cumulative rules.
