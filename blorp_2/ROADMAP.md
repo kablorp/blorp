@@ -778,8 +778,9 @@ Do not reconstruct raw substring bytes through scalar encoding. `starts_with`
 can compare counted bytes without per-position substring allocation. Remove
 Unicode case mapping or search from the prerequisite set only after the parser's
 actual ASCII-classification calls disappear. Large String concatenation/join
-needs its explicit scaling decision; a concrete counted join can be reviewed if
-the Blorp candidate restores quadratic copying. No generic builder follows.
+has a bounded [concrete List[String].join plan](LIST_STRING_JOIN_PLAN.md) for
+counted copying with one fresh result root. Implementation and acceptance remain
+pending; no generic builder or M6 completion follows.
 
 ```blorp
 pure func starts_with(text: String, prefix: String) -> Bool:
