@@ -469,5 +469,5 @@ traversal stack depth. Compare each retained shape/helper path with release
 margins under matching stack, toolchain and sanitizer profiles; the historical
 syntax-based "about 200" estimate cannot discharge this gate. Inadequate margins
 stop for review; boxing alone does not prove constant stack. Run focused owners, then the pilot Make gate and
-frontier. M8 still requires O2 A/B/C, B==C emitted C, A==B on all fixtures and the
+frontier. M8 still requires O0 A/B/C, B==C emitted C, A==B on all fixtures and the
 full e2e suite under B. Parser coverage alone is not self-compilation.
