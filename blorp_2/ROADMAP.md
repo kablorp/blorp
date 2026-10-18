@@ -759,6 +759,10 @@ The [Option/Result helper plan](OPTION_RESULT_HELPERS_PLAN.md) specifies five
 ordinary functions selected by explicit imports, with the prelude unchanged.
 Implementation and the separate compiler-source import migration remain pending.
 
+The [loader/shell integration draft](LOADER_SHELL_INTEGRATION_PLAN.md) maps actual
+source callers and missing leaves, beginning with fallible CWD and explicit stderr.
+Source review and the original-R0 cost hold remain separate from library acceptance.
+
 **Goal.** The real compiler source loads and checks against the real temporary
 library, with no remaining required parity row missing. Use the reduced resolved
 dependency inventory after source migration, not the old callback/Char rows.
