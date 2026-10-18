@@ -6,8 +6,11 @@ Implementation is frozen against accepted A
 `0cdba16a459c1a1f5792a70ea2071f98f453b96f`, with exact D production/test diff
 SHA256 `81cfcf7586761ff70204c805e1bc3f237bcbb1b3aaf83ee77537d2f9e0d83f96`.
 The fresh original cumulative screen **FAILED**: D=9959 exceeds its 9923 cap.
-Remaining fixed A/D cost, identity, inventory and correctness gates are pending
-under the [one-time landing policy](#one-time-landing-policy-after-the-failed-screen).
+The fixed A/D cost, identity and byte-membership pin gates subsequently **PASS** under
+the [one-time landing policy](#one-time-landing-policy-after-the-failed-screen);
+fresh pre-DCE dependency reconciliation, three lazy diagnostic sensitivity proofs
+and full current-stack correctness also pass. Independent final landing review
+remains pending.
 That explicit policy change does not turn the original failure into a pass or
 authorize further execution or candidate publication.
 
@@ -514,8 +517,8 @@ Do not replace it with exit-time strict totals. Normal instructions still need
 three unfiltered alternating A/D samples under the same quiet frozen epoch.
 
 Reuse the four existing c0004 strict observations; never resample them under
-this decision. Other inputs/proxies remain unexecuted preparation until root
-approves their exact remaining command schedule and grants the exclusive lane.
+this decision. At policy publication, other inputs/proxies remained unexecuted
+preparation pending root's exact schedule approval and exclusive-lane grant.
 Retain all raw samples and commands, complete A/D fixture C and exact diagnostic
 identity, source inventory/semantic behavior, granular owner and full current
 unit/runtime/grammar/e2e acceptance. Positive balanced pilot/native strict counts
@@ -531,3 +534,19 @@ supporting-host transition require their own matched evidence and explicit
 policy; they cannot retroactively turn the original R0/D failure into a pass.
 Documentation review and publication authorize no source change, measurement,
 resampling or landing of D; root schedules the remaining acceptance separately.
+
+The subsequently authorized fixed A/D schedule completed all 461 unchanged
+inputs and the original checkpoint proxy with 3,694 new measured calls, reusing
+the two A/D c0004 strict records. Every local/absolute cost, exact C/status/
+diagnostic and positive balanced zero-leak gate passed. End source/library,
+fixture, toolchain, host and pilot pins remained unchanged. The [maintained
+result](../benchmarks/results/blorp_2_source_byte_lazy_screen_2026-10-17.md#fixed-accepted-ad-cost-acceptance)
+records counters, commands and raw artifact locations. This fixed A/D PASS does
+not change the original historical R0/D **FAILED** result. Current-stack
+correctness subsequently passed 3,109 unit/runtime/grammar callbacks and the
+full 461-fixture e2e gate, with explicit pinned current host/std and one functional
+pilot. Fresh pre-DCE facts reconcile all 39 modules/1,089 source function headers;
+three isolated early-None mutants each fail only their intended callback and
+restore to 17/17 with exact D bytes. The maintained report records their actual
+epochs, receipts and source-subset limits. Independent final landing review
+remains required; genuine source self-compilation remains unproven.

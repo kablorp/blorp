@@ -4,10 +4,9 @@ import:
 	../utils/names: ContextualWords, NameId, NameTable, contextual_words, name_spelling, same_name
 	option: to_result
 	../utils/source: ModuleId, module_source, same_source
-	string as StringOps: index_of
+	string as StringOps
 	../utils/syntax:
 		BindingSyntax(ImmutableBinding, MutableBinding),
-		DECIMAL_DIGITS,
 		Diagnostic,
 		DiagnosticNote(PreviousDeclaration),
 		ExpressionBase(
@@ -201,24 +200,30 @@ private STRING_ESCAPE_HELP: String = "use \\n, \\r, \\t, \\0, \\\\, \\\", \\', \
 
 private UNICODE_ESCAPE_HELP: String = "write \\u{H} with one to six hexadecimal digits for a scalar from 0 to 10FFFF, excluding D800 through DFFF"
 
--- A digit's value is its position in HEX_DIGITS after lowering its case.
-private HEX_DIGITS: String = "0123456789abcdef"
-
 private MAX_UNICODE_HEX_DIGITS: Int = 6
 
 private HEX_RADIX: Int = 16
 
--- Source-format bytes the String decoder compares by code. Ints, not Char
--- literals: the pilot does not parse Char literals yet.
+-- ASCII codes used by literal decoding and type-parameter classification.
+private ZERO_BYTE: Int = 48
+private NINE_BYTE: Int = 57
+private MINUS_BYTE: Int = 45
+private UPPER_A_BYTE: Int = 65
+private UPPER_F_BYTE: Int = 70
+private UPPER_Z_BYTE: Int = 90
+private LOWER_A_BYTE: Int = 97
+private LOWER_F_BYTE: Int = 102
+private LOWER_Z_BYTE: Int = 122
+private LOWER_N_BYTE: Int = 110
+private LOWER_R_BYTE: Int = 114
+private LOWER_T_BYTE: Int = 116
+private LOWER_U_BYTE: Int = 117
 private BACKSLASH_BYTE: Int = 92
 private DOLLAR_BYTE: Int = 36
 private OPEN_BRACE_BYTE: Int = 123
-
-private UNICODE_MAX: Int = 1114111
-
-private SURROGATE_START: Int = 55296
-
-private SURROGATE_END: Int = 57343
+private CLOSE_BRACE_BYTE: Int = 125
+private DOUBLE_QUOTE_BYTE: Int = 34
+private SINGLE_QUOTE_BYTE: Int = 39
 
 
 private pure func current_token(state: ParserState) -> Option[Token]:
@@ -799,12 +804,31 @@ private pure func invalid_integer(span: Span) -> Diagnostic:
 	diagnostic(span, "invalid integer literal", "write decimal digits, optionally preceded by an adjacent '-'")
 
 
+private pure func decimal_digit(byte: Int) -> Option[Int]:
+	if IntOps.greater_than_or_equal(byte, ZERO_BYTE) and IntOps.less_than_or_equal(byte, NINE_BYTE):
+		Some(IntOps.subtract(byte, ZERO_BYTE))
+	else:
+		None
+
+
+private pure func hexadecimal_digit(byte: Int) -> Option[Int]:
+	if IntOps.greater_than_or_equal(byte, LOWER_A_BYTE) and IntOps.less_than_or_equal(byte, LOWER_F_BYTE):
+		Some(IntOps.add(DECIMAL_RADIX, IntOps.subtract(byte, LOWER_A_BYTE)))
+	else if IntOps.greater_than_or_equal(byte, UPPER_A_BYTE) and IntOps.less_than_or_equal(byte, UPPER_F_BYTE):
+		Some(IntOps.add(DECIMAL_RADIX, IntOps.subtract(byte, UPPER_A_BYTE)))
+	else:
+		decimal_digit(byte)
+
+
 -- Accumulates negatively against `limit`, checking before multiplication, so
 -- the minimum needs no overflowing positive magnitude.
 private pure func accumulate_digit(spelling: String, span: Span, limit: Int, scan: DigitScan) -> Result[DigitScan, Diagnostic]:
 	shifted_value = IntOps.multiply(scan.value, DECIMAL_RADIX)
 
-	match DECIMAL_DIGITS.index_of(spelling.substring(scan.position, 1)):
+	digit = match StringOps.byte_at(spelling, scan.position):
+		Some(byte): decimal_digit(byte)
+		None: None
+	match digit:
 		None:
 			Err(invalid_integer(span))
 		Some(digit):
@@ -818,7 +842,7 @@ private pure func accumulate_digit(spelling: String, span: Span, limit: Int, sca
 
 
 private pure func integer_value(spelling: String, span: Span) -> Result[Int, Diagnostic]:
-	negative: Bool = spelling.starts_with("-")
+	negative: Bool = byte_is(spelling, 0, MINUS_BYTE)
 	digit_start: Int = if negative:
 		1
 	else:
@@ -826,7 +850,7 @@ private pure func integer_value(spelling: String, span: Span) -> Result[Int, Dia
 
 	if IntOps.equals(digit_start, spelling.length()):
 		Err(invalid_integer(span))
-	else if IntOps.less_than(IntOps.add(digit_start, 1), spelling.length()) and Text.equals(spelling.substring(digit_start, 1), "0"):
+	else if IntOps.less_than(IntOps.add(digit_start, 1), spelling.length()) and byte_is(spelling, digit_start, ZERO_BYTE):
 		Err(diagnostic(span, "integer literals cannot have leading zeros", "write 0 or -0, or remove the leading zeros"))
 	else:
 		limit: Int = if negative:
@@ -857,12 +881,22 @@ private pure func integer_value(spelling: String, span: Span) -> Result[Int, Dia
 
 
 private pure func float_value(spelling: String, span: Span) -> Result[Float, Diagnostic]:
-	start = if spelling.starts_with("-"):
+	start = if byte_is(spelling, 0, MINUS_BYTE):
 		1
 	else:
 		0
 
-	if Text.equals(spelling.substring(start, 1), "0") and DECIMAL_DIGITS.contains(spelling.substring(IntOps.add(start, 1), 1)):
+	-- Only forged zero-only Float spellings treat an absent second byte as a digit.
+	leading_zero = if byte_is(spelling, start, ZERO_BYTE):
+		match StringOps.byte_at(spelling, IntOps.add(start, 1)):
+			Some(byte):
+				match decimal_digit(byte):
+					Some(_): True
+					None: False
+			None: True
+	else:
+		False
+	if leading_zero:
 		Err(diagnostic(span, "Float literals cannot have leading zeros", "write 0.5 or remove the leading zeros from the integer part"))
 	else:
 		match StringOps.parse_float(spelling):
@@ -893,9 +927,8 @@ private pure func character_end(raw: String, start: Int) -> Int:
 
 
 private pure func is_continuation_byte(raw: String, position: Int) -> Bool:
-	match StringOps.get(raw, position):
-		Some(character):
-			byte = to_int(character)
+	match StringOps.byte_at(raw, position):
+		Some(byte):
 			IntOps.greater_than_or_equal(byte, UTF8_CONTINUATION_START) and IntOps.less_than_or_equal(byte, UTF8_CONTINUATION_END)
 		None:
 			False
@@ -916,12 +949,13 @@ private fixed record HexDigits {
 
 
 private pure func hex_digits(raw: String, start: Int, read: HexDigits) -> HexDigits:
-	byte = StringOps.lower(raw.substring(read.end, 1))
-
-	if byte.is_empty() or IntOps.greater_than(IntOps.subtract(read.end, start), MAX_UNICODE_HEX_DIGITS):
+	digit = match StringOps.byte_at(raw, read.end):
+		Some(byte): hexadecimal_digit(byte)
+		None: None
+	if IntOps.greater_than(IntOps.subtract(read.end, start), MAX_UNICODE_HEX_DIGITS):
 		read
 	else:
-		match HEX_DIGITS.index_of(byte):
+		match digit:
 			Some(digit):
 				hex_digits(raw, start, { end = IntOps.add(read.end, 1), scalar = IntOps.add(IntOps.multiply(read.scalar, HEX_RADIX), digit) })
 			None:
@@ -931,61 +965,66 @@ private pure func hex_digits(raw: String, start: Int, read: HexDigits) -> HexDig
 -- `start` is the backslash of a \u{H} escape.
 private pure func unicode_escape(raw: String, start: Int, span: Span) -> Result[DecodedEscape, Diagnostic]:
 	opening = IntOps.add(start, 2)
-	opened = Text.equals(raw.substring(opening, 1), "{")
+	opened = byte_is(raw, opening, OPEN_BRACE_BYTE)
 	digits_start = IntOps.add(opening, 1)
 	digits = hex_digits(raw, digits_start, { end = digits_start, scalar = 0 })
 	count = IntOps.subtract(digits.end, digits_start)
-	surrogate = IntOps.greater_than_or_equal(digits.scalar, SURROGATE_START) and IntOps.less_than_or_equal(digits.scalar, SURROGATE_END)
-
-	if (
+	encoded = if (
 		opened
-		and Text.equals(raw.substring(digits.end, 1), "}")
+		and byte_is(raw, digits.end, CLOSE_BRACE_BYTE)
 		and IntOps.greater_than(count, 0)
 		and IntOps.less_than_or_equal(count, MAX_UNICODE_HEX_DIGITS)
-		and IntOps.less_than_or_equal(digits.scalar, UNICODE_MAX)
-		and not surrogate
 	):
-		Ok({ bytes = StringOps.from_char(to_char(digits.scalar)), next = IntOps.add(digits.end, 1) })
+		StringOps.from_codepoint(digits.scalar)
 	else:
-		error_end = if opened:
-			IntOps.min(digits.end, IntOps.add(digits_start, MAX_UNICODE_HEX_DIGITS))
-		else:
-			opening
-		Err(string_error(span, start, character_end(raw, error_end), "invalid Unicode escape", UNICODE_ESCAPE_HELP))
+		None
+	match encoded:
+		Some(bytes):
+			Ok({ bytes = bytes, next = IntOps.add(digits.end, 1) })
+		None:
+			error_end = if opened:
+				IntOps.min(digits.end, IntOps.add(digits_start, MAX_UNICODE_HEX_DIGITS))
+			else:
+				opening
+			Err(string_error(span, start, character_end(raw, error_end), "invalid Unicode escape", UNICODE_ESCAPE_HELP))
 
 
-private pure func fixed_escape(code: String) -> Option[String]:
-	match code:
-		"n":
-			Some("\n")
-		"r":
-			Some("\r")
-		"t":
-			Some("\t")
-		"0":
-			Some("\0")
-		"\\":
-			Some("\\")
-		"\"":
-			Some("\"")
-		"'":
-			Some("'")
-		"{":
-			Some("{")
-		"}":
-			Some("}")
-		_:
-			None
+private pure func fixed_escape(code: Int) -> Option[String]:
+	if IntOps.equals(code, LOWER_N_BYTE):
+		Some("\n")
+	else if IntOps.equals(code, LOWER_R_BYTE):
+		Some("\r")
+	else if IntOps.equals(code, LOWER_T_BYTE):
+		Some("\t")
+	else if IntOps.equals(code, ZERO_BYTE):
+		Some("\0")
+	else if IntOps.equals(code, BACKSLASH_BYTE):
+		Some("\\")
+	else if IntOps.equals(code, DOUBLE_QUOTE_BYTE):
+		Some("\"")
+	else if IntOps.equals(code, SINGLE_QUOTE_BYTE):
+		Some("'")
+	else if IntOps.equals(code, OPEN_BRACE_BYTE):
+		Some("{")
+	else if IntOps.equals(code, CLOSE_BRACE_BYTE):
+		Some("}")
+	else:
+		None
 
 
 -- `start` is the escape's backslash.
 private pure func decode_escape(raw: String, start: Int, span: Span) -> Result[DecodedEscape, Diagnostic]:
-	code = raw.substring(IntOps.add(start, 1), 1)
-
-	if Text.equals(code, "u"):
+	code = StringOps.byte_at(raw, IntOps.add(start, 1))
+	is_unicode = match code:
+		Some(byte): IntOps.equals(byte, LOWER_U_BYTE)
+		None: False
+	if is_unicode:
 		unicode_escape(raw, start, span)
 	else:
-		match fixed_escape(code):
+		escaped = match code:
+			Some(byte): fixed_escape(byte)
+			None: None
+		match escaped:
 			Some(bytes):
 				Ok({ bytes = bytes, next = IntOps.add(start, 2) })
 			None:
@@ -995,9 +1034,9 @@ private pure func decode_escape(raw: String, start: Int, span: Span) -> Result[D
 -- Bytes are compared by code: a one-byte substring would allocate a String.
 -- False past the end of `raw`.
 private pure func byte_is(raw: String, position: Int, expected: Int) -> Bool:
-	match StringOps.get(raw, position):
-		Some(character):
-			IntOps.equals(to_int(character), expected)
+	match StringOps.byte_at(raw, position):
+		Some(byte):
+			IntOps.equals(byte, expected)
 		None:
 			False
 
@@ -2739,17 +2778,18 @@ private pure func consume_builtin_lines(state: ParserState, statements: List[Par
 
 -- A capital ASCII letter followed by ASCII letters and digits.
 private pure func valid_type_parameter_name(spelling: String) -> Bool:
-	continued = run_of(spelling, 1, "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789")
-	"ABCDEFGHIJKLMNOPQRSTUVWXYZ".contains(spelling.substring(0, 1)) and IntOps.equals(continued, spelling.length())
-
-
-private pure func run_of(text: String, start: Int, accepted: String) -> Int:
-	var end = start
-
-	while IntOps.less_than(end, text.length()) and accepted.contains(text.substring(end, 1)):
-		end = IntOps.add(end, 1)
-
-	end
+	var valid = IntOps.greater_than(spelling.length(), 0)
+	var position = 0
+	while valid and IntOps.less_than(position, spelling.length()):
+		valid = match StringOps.byte_at(spelling, position):
+			Some(byte):
+				upper = IntOps.greater_than_or_equal(byte, UPPER_A_BYTE) and IntOps.less_than_or_equal(byte, UPPER_Z_BYTE)
+				lower = IntOps.greater_than_or_equal(byte, LOWER_A_BYTE) and IntOps.less_than_or_equal(byte, LOWER_Z_BYTE)
+				digit = IntOps.greater_than_or_equal(byte, ZERO_BYTE) and IntOps.less_than_or_equal(byte, NINE_BYTE)
+				upper or (IntOps.greater_than(position, 0) and (lower or digit))
+			None: False
+		position = IntOps.add(position, 1)
+	valid
 
 
 private pure func consume_type_parameter(state: ParserState) -> Result[ParsedName, Diagnostic]:
