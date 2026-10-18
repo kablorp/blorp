@@ -411,7 +411,7 @@ BLORP2_COMPILER=blorp_2/build/roadmap-union-cycles/compiler \
 
 First real-main input will be `test/e2e/fixtures/recursive/union_cycles/mutual.brp`.
 Its baseline CLI is the frozen baseline pilot followed by
-`--library-root blorp_2/standard_library_temp INPUT.brp OUTPUT.c`; require the
+`--library-root blorp_2/standard_library INPUT.brp OUTPUT.c`; require the
 specific closing-Left failure/no C before changes and exact exit7 after native
 compilation. Each suite runs callbacks and checks typed products; a parser or
 host setup error is never an expected failing assertion. Final literal Make

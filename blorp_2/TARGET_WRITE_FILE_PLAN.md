@@ -13,7 +13,7 @@ pre-implementation design. Current implementation anchors are
 `utils/syntax.brp:385`, `parse/parse.brp:2649`, `namespace/builtins.brp:151`,
 `check/signatures.brp:385`, `specialize/specialize.brp:2189`,
 `emit/emit.brp:1195,1297,2115,2583`, `runtime/system.brp:154` and
-`standard_library_temp/system.brp:13`. The report reconciles the original red
+`standard_library/system.brp:13`. The report reconciles the original red
 and preliminary mutation evidence with the final accepted-stack gates.
 
 Future `test/e2e/fixtures/file_write/bytes.brp` exercises ordinary main, after both dependencies:
@@ -43,7 +43,7 @@ func main(arguments: List[String]) -> Int:
 
 Future reproduction: `"$compiler_B" --library-root "$library_B" blorp_2/test/e2e/fixtures/file_write/bytes.brp "$scratch/bytes.c"`. Record actual missing-write_file diagnostic/help/span, status and untouched output before implementation; no red run is claimed. Compile unchanged generated C once at O0 and run its real main with explicit temporary paths. Success exits 7, stdout is exactly BOM/UTF-8/CRLF/NUL/tail plus print's LF, stderr empty. Preseed a longer file and check exact stored Bytes independently through host read_bytes; this catches a compensating write/read bug. Missing-parent input exits 1 with exact Err plus LF on stderr and empty stdout; get its platform numeric OS code from the host's same failing operation, never assume a universal decimal errno.
 
-Current `standard_library_temp/system.brp:4–8` imports `_base: String, Result` and declares get_current_directory. Preserve read_file's future addition; add Void and the new declaration. Host `standard_library/src/system.brp:47` uses parameter `content`; the target's `contents` is the same positional String interface, not a new semantic distinction:
+Current `standard_library/system.brp:4–8` imports `_base: String, Result` and declares get_current_directory. Preserve read_file's future addition; add Void and the new declaration. Host `standard_library/src/system.brp:47` uses parameter `content`; the target's `contents` is the same positional String interface, not a new semantic distinction:
 
 ```blorp
 -- Before: _base: String, Result

@@ -1,6 +1,15 @@
 # Demand-loaded Option/Result helpers — read-only proposal
 
-## Problem and current evidence
+**Superseded planning snapshot, 2026-10-18.** The current
+[resolved catalog and addition plan](OPTION_RESULT_PLAN.md) owns the complete
+nine-API demand and implementation sequence. This predecessor covers only the
+five ordinary helpers. Preserve its held candidate and evidence; its old base,
+source anchors, missing-host-path observations and numeric budgets (including
+the +5% proposal) are historical, not current acceptance authority. Reconcile
+any reused code against current main and freeze prospective costs before
+implementation. The remaining callback-removal migration was abandoned.
+
+## Historical problem and evidence
 
 Accepted tracked-plan base: `7acd6df25c4fe62c726614e8e9ea970071c35f73` (M2 landed); the historical draft reference `fb5fe691dc722918e8f29fa5b17d8fe9b45e5341` is explicitly reconciled to this base. Cost B remains unfrozen: root must name it before any feature setup or first sample. Plan-worktree creation does not freeze cost B. Parent/pilot AGENTS and `docs/HANDOFF_SPEC.md` were read; current host import/UFCS rules were checked in GUIDE540–635, GRAMMAR31–39 and the host prelude. A separately reviewed tracked plan precedes implementation; no compiled job follows from this document. The separate append prototype383947, B5b and its failed epoch remain untouched; this proposal does not roll that baseline.
 
@@ -18,7 +27,7 @@ Unqualified `src/` anchors are under `blorp_2/`. This is a bounded manual map, n
 
 ## Proposed solution and exact code
 
-One library writer owns only new `standard_library_temp/option.brp` and `result.brp`, tests and bounded docs. **Prelude is unchanged.** `_base` keeps Bool/Option/Result and constructor identities; operation modules import those exact types, without an implicit prelude. Option imports `_base.Result` directly, not result operations. New operation-module exports are functions, not replacement type declarations/reexports. No builtin/designation change follows.
+One library writer owns only new `standard_library/option.brp` and `result.brp`, tests and bounded docs. **Prelude is unchanged.** `_base` keeps Bool/Option/Result and constructor identities; operation modules import those exact types, without an implicit prelude. Option imports `_base.Result` directly, not result operations. New operation-module exports are functions, not replacement type declarations/reexports. No builtin/designation change follows.
 
 Proposed `option.brp` (currently absent):
 
@@ -59,7 +68,7 @@ pure func is_ok[T, E](self: Result[T, E]) -> Bool:
         Err(_): False
 ```
 
-Current `standard_library_temp/prelude.brp:3–8` remains literally unchanged. A consumer requests only operations it needs; this exact header works with host modules and the proposed temporary modules:
+Current `standard_library/prelude.brp:3–8` remains literally unchanged. A consumer requests only operations it needs; this exact header works with host modules and the proposed temporary modules:
 
 ```blorp
 import:

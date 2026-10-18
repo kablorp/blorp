@@ -31,7 +31,7 @@ pure func join(self: List[String], sep: String) -> String:
     result
 ```
 This quotation omits only blank lines; the private append is builtin("list.string_append").
-Target standard_library_temp/list.brp:1–18 has only repeat/length/get/append/set/concat.
+Target standard_library/list.brp:1–18 has only repeat/length/get/append/set/concat.
 Compiler-shaped witnesses include emit/emit.brp fragment joins (for example :2462/2486/2550/2676),
 main:126 (diagnostic lines), load:341 (import-cycle paths). These are source-inspected
 List[String] reductions, not a fresh resolved-callee census or self-compilation proof.
@@ -205,7 +205,7 @@ grant precedes TDD/compiler jobs. Final code commit needs code-reviewer and test
 approval, maintained benchmark report, all raw/failed evidence and accepted-stack gates.
 
 ## Current change sites and acceptance commands
-Current `standard_library_temp/list.brp:2–3` imports only `Int, List, Option`;
+Current `standard_library/list.brp:2–3` imports only `Int, List, Option`;
 add `String` and the concrete wrapper shown above. Current `RuntimeType` at
 `src/namespace/builtins.brp:99–102` is:
 ```blorp

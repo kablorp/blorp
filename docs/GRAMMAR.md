@@ -9,7 +9,8 @@ and concrete runtime function declarations in ordinary modules. Its ordinary
 call syntax also accepts self and mutual recursion; checking separately rejects
 unbounded recursive type substitutions. Imports precede declarations. Relative
 paths use explicit `./` or leading `../` without a `.brp` suffix; bare paths
-resolve under the required target-library root. Each normalized source path is
+resolve under the required target-library root (`blorp_2/standard_library` in
+this checkout). Each normalized source path is
 loaded and parsed once, including the designated `_base.brp` and ordinary
 `prelude.brp`; the prelude is the only implicit import, and only user modules
 receive it. Import cycles, including self-imports, are rejected, and modules

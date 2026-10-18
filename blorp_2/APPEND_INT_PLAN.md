@@ -6,7 +6,7 @@ Plan-only base: `89fdc1bb9ac49553443e67deda5956764f6c697e`. Implementation is pe
 
 The compiler calls `string.append_int(String, Int) -> String`, but the temporary library has no twin. Manual source scanning finds **114 textual occurrences on 109 matching lines**. The earlier `e906b8104` census was 113/108; the landed write_file emitter adds one occurrence. Neither count is a resolved inventory.
 
-Add only this ordinary function in `standard_library_temp/string.brp`, composing accepted `int.to_string` and `string.add`. No compiler production changes, host changes, source migration, new builtin, builder, control mechanism, opaque completion, managed-loop work or path work follows. Coordinator owns integration and serialized compiled slots. Root and independent compiler/ownership expert review this plan patch before its separate commit; implementation follows that commit and explicit slot release.
+Add only this ordinary function in `standard_library/string.brp`, composing accepted `int.to_string` and `string.add`. No compiler production changes, host changes, source migration, new builtin, builder, control mechanism, opaque completion, managed-loop work or path work follows. Coordinator owns integration and serialized compiled slots. Root and independent compiler/ownership expert review this plan patch before its separate commit; implementation follows that commit and explicit slot release.
 
 ## Current dependency map
 
@@ -26,7 +26,7 @@ Target current-directory/read/write/stderr interfaces now exist; loader still us
 
 ## Exact change and ownership
 
-Before: `standard_library_temp/string.brp:5–6` imports only _base; its final declaration at 26–27 is from_codepoint. After, add the import selection and function:
+Before: `standard_library/string.brp:5–6` imports only _base; its final declaration at 26–27 is from_codepoint. After, add the import selection and function:
 
 ```blorp
 import:

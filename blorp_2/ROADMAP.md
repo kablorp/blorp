@@ -39,7 +39,7 @@ than distorting the design to avoid a host-compiler cost.
 
 The fixpoint the old compiler already uses, strengthened:
 
-1. The host builds `blorp_2/src` and `standard_library_temp` into compiler **A**.
+1. The host builds `blorp_2/src` and `standard_library` into compiler **A**.
 2. **A** compiles the same source into **B**; **B** compiles it into **C**.
 3. **B** and **C** emit byte-identical C. **B** passes the full e2e suite. For
    every e2e fixture, **A** and **B** emit byte-identical C. A self-consistent
@@ -56,7 +56,7 @@ their own inventory and plan after M8.
 - **Dual-compile.** Until the fixpoint the host keeps building A, so the source
   stays host-compilable: only syntax the host already accepts enters `src`, and
   every library function `src` imports exists in both the host library and
-  `standard_library_temp` with the same module, name and signature.
+  `standard_library` with the same module, name and signature.
   [LIBRARY_PARITY.md](LIBRARY_PARITY.md) is the authority.
 - **Fixture first.** Each increment starts with a small real-main e2e fixture
   shaped like the source's own use, failing granular tests, runnable acceptance
@@ -108,7 +108,7 @@ passed the audited toolchain's default limits through depth 256.
 | Milestone | Scope | Status |
 | --- | --- | --- |
 | [M0](#m0-foundation-closeout) | Re-cut, perf fixes, parser statement loop, fixpoint script, parity table | Landed. M3 owns the recorded managed-value call limits. |
-| [M1a](#m1a-surface-syntax-parity) | Layout and parsed source syntax | Accepted frontier 36/38. Char/function-type source migrations target the remaining two files; no new frontier is claimed. |
+| [M1a](#m1a-surface-syntax-parity) | Layout and parsed source syntax | Current frontier: all 41 compiler files parse, including explicit pure callback types. Checking remains separate. |
 | [ML](#ml-list-construction) | `append`, `set`, `concat`, list literal | Done. |
 | [M1b](#m1b-names-and-the-foundation) | Namespace: private, aliases, qualified names, designated `Bool`/`Option`/`Result` | Parts A and B done; control-flow consumers follow in M2/M3. |
 | [M5](#m5-constants) | Literal scalar/String constants | Implemented. Source construction functions replace the need for record/opaque constants and initializer dependencies. |
@@ -117,7 +117,7 @@ passed the audited toolchain's default limits through depth 256.
 | [M3](#m3-loops-and-tail-recursion) | Managed List/while loops, explicit exits and existing scalar TCO | Not started. Source flat recursion/ranges become loops; broader managed TCO deferred. |
 | [M4](#m4-recursive-types) | Existing unary/mixed recursive shapes plus ordinary opaque semantics | Steps 1/2a done. Opaque completion remains. No current source witness requires unlanded 2b/2c. |
 | [M6](#m6-library-and-shell) | First-order library parity, integer-facing String APIs and seven shell/path functions | String byte/scalar APIs and the bounded current-directory Result slice implemented and validated; source migration, remaining library and shell/path work pending. Target Char/Bytes are not planned prerequisites after source migration. |
-| [M7](#m7-lambdas) | Broader language function types/lambdas | Source-removal pilots precede any retirement of this bootstrap dependency. |
+| [M7](#m7-lambdas) | Pure function types/lambdas | Parsing implemented; callable checking and execution remain required. Remaining callback removal was abandoned. |
 | [M8](#m8-the-fixpoint-gate) | Fixpoint gate | Not started. |
 | [M9](#m9-post-self-compilation-architecture-audit) | Complete architecture audit using the self-compiled compiler | Planned immediately after M8, before the next major feature expansion. |
 
@@ -128,7 +128,7 @@ reviewed source plan + small constructor/control preparations
 host library/runtime prerequisites, then freeze the supporting host
 M6 String byte/scalar APIs + source Char/classification migration
 M6 native current-directory Result witness (accepted slice; loader migration pending)
-first-order source pilots + callback removal                     [M7 gate]
+M7 pure callable checking/execution, including managed captures
 M2 restricted control, outer-variable flow, propagation/annotations
 M3 managed List/while loops + source flat-walk/range migration
 M4 ordinary opaque semantics over retained recursive layouts
@@ -764,9 +764,11 @@ The [String integer-appending plan](APPEND_INT_PLAN.md) specifies one ordinary
 temporary-library wrapper over accepted formatting and concat; implementation
 remains pending.
 
-The [Option/Result helper plan](OPTION_RESULT_HELPERS_PLAN.md) specifies five
-ordinary functions selected by explicit imports, with the prelude unchanged.
-Implementation and the separate compiler-source import migration remain pending.
+The current [Option/Result catalog and addition plan](OPTION_RESULT_PLAN.md)
+records nine APIs at 212 compiler sites: five ordinary helpers first, pure
+callable semantics with managed captures, then four callback helpers and explicit
+source imports. The prelude stays unchanged. Implementation remains pending;
+the held [five-helper proposal](OPTION_RESULT_HELPERS_PLAN.md) is its predecessor.
 
 The [loader/shell integration draft](LOADER_SHELL_INTEGRATION_PLAN.md) maps actual
 source callers and missing leaves, beginning with fallible CWD and explicit stderr.
@@ -775,7 +777,7 @@ remain separate from library acceptance; historical R0 failures stay recorded.
 
 **Goal.** The real compiler source loads and checks against the real temporary
 library, with no remaining required parity row missing. Use the reduced resolved
-dependency inventory after source migration, not the old callback/Char rows.
+dependency inventory, including retained callbacks, not the historical parity counts.
 
 **Scope.** Existing Int/Float/String/List representation and machine operations;
 remaining first-order numeric comparisons/classification; ordinary Option/Result
@@ -928,7 +930,9 @@ still proves real rebuilt-compiler output identity.
 
 **Current direction, 2026-10-18.** The owner stopped the remaining callback-removal
 migration. Explicit pure callback types now parse; checking and callback execution
-remain separate future increments. The source-removal work below is retained history.
+remain separate future increments. The [Option/Result plan](OPTION_RESULT_PLAN.md)
+records current helper demand and the required named/capturing callable witnesses.
+The source-removal work below is retained history.
 
 **Historical bootstrap decision.** Migrate the current 53 pure lambda literals, 64
 higher-order calls and one function-typed helper parameter to first-order source

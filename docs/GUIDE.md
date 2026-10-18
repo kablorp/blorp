@@ -16,7 +16,8 @@ explicit `./` or leading `../` paths; callees retain their defining module's
 scope, and only a root-local main supplies the entrypoint. It accepts either
 no arguments or one `List[String]` argument, with an `Int` or `Void` result;
 argument index 0 is the
-executable name. The required `--library-root` supplies the foundation types
+executable name. Pass `blorp_2/standard_library` as the required `--library-root`;
+it supplies the foundation types
 and constructors, an ordinary prelude, and bare target-library imports. User
 helper modules receive the same defaults; library operation modules receive
 only the base. Type selections enable the selected module's receiver functions

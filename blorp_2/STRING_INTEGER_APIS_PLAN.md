@@ -16,7 +16,7 @@ The approved design below originated at `98f3472feaaf5183ef0fd5fdf3a24cda3fea5f9
 [ROADMAP M6](ROADMAP.md#m6-library-and-shell) and
 [LIBRARY_PARITY](LIBRARY_PARITY.md#planned-interface-delta) require two matching
 host/target interfaces before source Char migration. The temporary String library
-previously ended at [length](standard_library_temp/string.brp):17:
+previously ended at [length](standard_library/string.brp):17:
 
 ```blorp
 pure func length(value: String) -> Int:

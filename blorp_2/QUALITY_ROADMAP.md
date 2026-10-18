@@ -497,7 +497,7 @@ At the plan's base, the rule rejects 374 sites in 19 files of `blorp_2/src`:
 | others | the rest |
 
 The preparatory refactors brought that to 349 sites plus 10 lambda-body sites.
-`standard_library_temp` has none. The 78 in `blorp_2/test` are compiled by the
+`standard_library` has none. The 78 in `blorp_2/test` are compiled by the
 host, so they are out of scope. With the rule alone the frontier falls from
 32/34 to 15/34; with the rewrite it stays at 32/34.
 
@@ -700,7 +700,7 @@ signature acceptance. That trade keeps one site.
 | Where | Sites |
 | --- | --- |
 | `blorp_2/src`, 13 files | 107: a function shadowed 48, a parameter 21, a local 38, a constructor 0 |
-| `standard_library_temp` | 0 |
+| `standard_library` | 0 |
 | Fixtures | 15 of 425 change |
 | Unit programs | 26 tests in 13 files |
 | Whole-arm bare names | 3 of 3,590 arms in `src`, all used (+2 lines); 4 of 853 fixtures, all testing capture; 2 of 414 unit programs |
@@ -808,7 +808,7 @@ already rejected by `PrivateQualifiedName`, with no second error.
 
 Five sites in two files of `blorp_2/src` need it. Making three types public
 fixes them, for 0 net lines: `InferenceVariableId`,
-`InferenceParameterConstraint` and `RecordOrigin`. `standard_library_temp` and
+`InferenceParameterConstraint` and `RecordOrigin`. `standard_library` and
 all fixtures are unaffected. The rule itself costs **+66** production lines,
 +0.05% instructions and +0.22% allocations, measured for the variant that reads
 the origin from the namespace. The variant that re-read declaration rows cost

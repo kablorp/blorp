@@ -193,7 +193,7 @@ Char rather than weakening those later oracles.
 
 | Existing producer / oracle | Required migration |
 | --- | --- |
-| `standard_library_temp/{_base,prelude}.brp` | Add declaration and prelude selection. Explicit char module adds no implicit import. |
+| `standard_library/{_base,prelude}.brp` | Add declaration and prelude selection. Explicit char module adds no implicit import. |
 | `test/unit/module_input.brp:26–53` | FOUNDATION_TYPES plus PRIMITIVE_BASE/TEST_BASE selections; all helper consumers inherit it. |
 | `unit/test_namespace/test_builtins.brp:30,155` | TYPES/reversed complete bases, distinct-name assertions, Char role comparator; keep old missing-role/shape/duplicate precedence and add Char-only omission/duplicate/foreign/private cases. Missing designated-union tests keep their original error after complete-base update. |
 | `unit/test_main/test_option_input_phases.brp:19` | Add Char to complete REVERSED_OPTION_TYPES; reversed Option identity/layout oracle unchanged. |

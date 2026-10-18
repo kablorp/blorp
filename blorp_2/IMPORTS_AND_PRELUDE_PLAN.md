@@ -149,7 +149,7 @@ distinct outcomes.
 ## Target library structure and defaults
 
 ```text
-blorp_2/standard_library_temp/
+blorp_2/standard_library/
     README.md
     _base.brp
     prelude.brp
@@ -247,7 +247,7 @@ The shell receives an explicit library root; there is no host-library or
 working-directory fallback. The compiler command is:
 
 ```sh
-blorp_2/build/compiler --library-root blorp_2/standard_library_temp \
+blorp_2/build/compiler --library-root blorp_2/standard_library \
   blorp_2/test/e2e/fixtures/import/method_modules/main.brp \
   blorp_2/build/method_modules.c
 ```

@@ -28,7 +28,7 @@ StringPrint:
     { purity = Impure, parameters = [PrimitiveRuntimeType(BuiltinString)], return_type = ValueResult(PrimitiveRuntimeType(BuiltinVoid)) }
 ```
 
-Afterward share that unchanged contract arm as `StringPrint | StringPrintError:`. The concrete temporary signature matches the existing host String instantiation (`standard_library/src/io.brp:31`); unsupported traits are not imported. Current `standard_library_temp/io.brp:8` and its addition are:
+Afterward share that unchanged contract arm as `StringPrint | StringPrintError:`. The concrete temporary signature matches the existing host String instantiation (`standard_library/src/io.brp:31`); unsupported traits are not imported. Current `standard_library/io.brp:8` and its addition are:
 
 ```blorp
 -- Before (retained):

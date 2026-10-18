@@ -1,5 +1,12 @@
 # Self-compilation handoff — 2026-10-18
 
+**Current direction update, 2026-10-18.** Remaining callback removal was
+abandoned. All 41 compiler files now parse; pure function types parse, while
+callable checking/execution remains pending. Pure Void returns are accepted.
+The [Option/Result catalog and plan](OPTION_RESULT_PLAN.md) owns the nine required
+helpers and their callable prerequisites. The original starting commit and held
+work below remain historical handoff evidence, not a current-main claim.
+
 ## Problem and verified starting point
 
 Blorp 2 does **not** compile itself yet. Several substantial implementations
@@ -29,7 +36,7 @@ write-file and stderr operations; pure target path joining; retained-product
 tests; strict target allocator accounting; and the `-O0` fixpoint driver.
 Plans for additional capabilities are not those capabilities.
 
-**Not established:** complete source parsing/checking, a linked target-built
+**Not established:** complete source checking, a linked target-built
 compiler, target-built compiler leak freedom, actual compiler-product destruction
 depth, or the A/B/C proof. The historical parse frontier is not a current count.
 
@@ -41,8 +48,9 @@ opaques, required recursive data, UTF-8 Strings, local mutation, explicit
 ownership, and pure compilation after loading. Do not weaken these to make a
 fixture pass.
 
-Migrate compiler source away from executable callbacks/function types, Char
-operations, parser classification substrings, managed flat recursive walks,
+Retain executable callbacks/function types and implement their required semantics.
+Migrate compiler source away from Char operations, parser classification
+substrings, managed flat recursive walks,
 range execution, and general nested/list/literal patterns where the reviewed
 source pilots remain clear. Preserve the remaining dependency until its real
 callers are gone. Already-supported input features need not be removed.
@@ -65,7 +73,8 @@ verified ?= verify(owned).map_err(singleton_diagnostic)
 emit(verified).map_err(singleton_diagnostic)
 ```
 
-The callbacks above are migration targets; the phase boundaries remain.
+The callbacks above remain in the compiler; the Option/Result plan adds their
+required library support. Preserve the phase boundaries.
 Builders are local and published products complete and immutable. Namespace
 identity, semantic type identity, runtime layout identity, value identity and
 ownership obligations have distinct authorities. No downstream reconstruction
@@ -164,14 +173,14 @@ Reuse existing aggregate layout and ownership. Opaque wrappers do not imply
 allocation-free physical storage. [OPAQUE_TYPES_PLAN.md](OPAQUE_TYPES_PLAN.md)
 owns the design. This work can proceed beside steps 2–3 with shared-file review.
 
-### 5. Finish first-order, byte and source-pattern migrations
+### 5. Finish independent byte, loop and source-pattern migrations
 
-Compose the retained byte/classification, sorting, fill and scalar-adapter
-candidates narrowly. Continue the ordered remaining callback domains in
-[REMAINING_CALLBACK_LEDGER.md](REMAINING_CALLBACK_LEDGER.md). Delete the
-function-typed translation helper only after its last caller disappears.
-Preserve evaluation once, collection order, first-error ordering, spans and
-complete publication. No callback registry or generic dispatcher replaces it.
+Compose retained byte/classification candidates narrowly.
+Preserve the held sorting/fill/scalar-adapter callback-removal candidates and
+[remaining callback ledger](REMAINING_CALLBACK_LEDGER.md) as evidence; do not
+resume that migration. Preserve evaluation once, collection order, first-error
+ordering, spans and complete publication. Callable support follows the
+[Option/Result plan](OPTION_RESULT_PLAN.md), with early architecture review.
 
 After managed loops land, migrate flat recursive builders and all source ranges
 to ordinary loops. Preserve bound evaluation once, direction, exclusive ends and
@@ -180,10 +189,10 @@ alternatives, then source-pattern simplification under
 [QUALIFIED_PATTERN_SOURCE_PLAN.md](QUALIFIED_PATTERN_SOURCE_PLAN.md). Do not
 replace a clear pattern with unbounded boilerplate merely to claim removal.
 
-Exit: a fresh resolved inventory shows no retained callbacks/function-typed
-source dependencies or Char/classification dependencies, and every claimed
-pattern/range removal has zero real remaining callers. Update the parse frontier
-using actual results. Historical textual counts are not acceptance evidence.
+Exit: a fresh resolved inventory establishes each claimed Char/classification,
+pattern or range removal has zero real remaining callers. Callbacks remain
+required and are tracked separately. Report actual checking/frontier results;
+historical textual counts are not acceptance evidence.
 
 ### 6. Complete target library parity and the actual shell/loader
 

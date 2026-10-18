@@ -95,7 +95,7 @@ Target production inventory is exactly:
 
 | File under `blorp_2/` | Responsibility |
 | --- | --- |
-| `standard_library_temp/string.brp` | Nongeneric pure declaration using `builtin("string.slice")` |
+| `standard_library/string.brp` | Nongeneric pure declaration using `builtin("string.slice")` |
 | `src/utils/syntax.brp` | Closed `StringSliceBuiltin` variant |
 | `src/parse/parse.brp` | Label decoding and supported-label help |
 | `src/namespace/builtins.brp` | `StringSlice(DesignatedOption[Variant])`, sole runtime contract, declaration help and exhaustive observers |
@@ -209,7 +209,7 @@ proof that 150 lines suffice. Stop before a breach; do not expand generic owners
 
 Public documentation owners are `docs/GUIDE.md`, `docs/GRAMMAR.md`,
 `blorp_2/grammar.ebnf`, `blorp_2/LIBRARY_PARITY.md`, `blorp_2/ROADMAP.md`,
-`blorp_2/README.md` and `blorp_2/standard_library_temp/README.md`. Keep their API,
+`blorp_2/README.md` and `blorp_2/standard_library/README.md`. Keep their API,
 byte-boundary and ownership statements coherent within the combined allowance.
 This plan and one later benchmark evidence report are counted separately.
 
@@ -289,7 +289,7 @@ Read its recipes; never execute its historical setup or overwrite its artifacts.
 The owned packet root is
 `/Users/keithphilpott/.codex/worktrees/string-slice-plan/blorp/build/string-slice/cost-db8-01/`.
 Its fixed CWD is `canonical/`; host input is `canonical/blorp_2/src/main.brp`,
-target library is `canonical/blorp_2/standard_library_temp/`, and output is
+target library is `canonical/blorp_2/standard_library/`, and output is
 `canonical/same-output.c`, all relative to that packet root. Freeze each corpus
 input's full canonical path. B/C install outside measurement at those SAME
 paths. SOURCE host calls explicitly use the frozen host std path above. Each

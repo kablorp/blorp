@@ -49,7 +49,7 @@ helper. Whole-source bootstrap remains incomplete after this leaf.
 Read-only reproduction at this source boundary:
 
 ```sh
-rg -n 'pure func (equals|less_than|greater_than)' blorp_2/standard_library_temp/int.brp
+rg -n 'pure func (equals|less_than|greater_than)' blorp_2/standard_library/int.brp
 rg -n 'IntegerEqualsBuiltin|IntEquals\(' blorp_2/src
 ```
 
@@ -77,7 +77,7 @@ Follow the actual `IntegerEqualsBuiltin` producer/consumer route:
 | `check/signatures.brp:352–388` | Construct `IntLessThan(site.designated.boolean)` once; existing validation owns arity, purity, nongeneric header and exact designated result identity |
 | `specialize/specialize.brp:2209` | Translate existing designated constructors once with `translate_boolean`, then publish `Builtins.IntLessThan(translated)` |
 | `emit/emit.brp:185,1305,1341–1395,2176` | Handle the operation, emit signed `<` over Int locals, and select the actual true/false constructors; mark no runtime helper requirement |
-| `standard_library_temp/int.brp` | Add the two ordinary declarations shown above; retain the original upstream provenance and note the target's ordinary greater-than implementation |
+| `standard_library/int.brp` | Add the two ordinary declarations shown above; retain the original upstream provenance and note the target's ordinary greater-than implementation |
 
 The lower/own/verify pipeline already consumes the sole runtime contract and
 `BooleanResult`. Int arguments and Bool result are unmanaged. Add no operation-

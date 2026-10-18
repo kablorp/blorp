@@ -53,7 +53,7 @@ preparation pilot rejects it; the feature pilot emits C whose ordinary `main`
 returns 1, with empty stdout and stderr. Compile it from the repository root:
 
 ```sh
-blorp_2/build/compiler --library-root blorp_2/standard_library_temp blorp_2/test/e2e/fixtures/join/carried_existing.brp blorp_2/build/carried_existing.c
+blorp_2/build/compiler --library-root blorp_2/standard_library blorp_2/test/e2e/fixtures/join/carried_existing.brp blorp_2/build/carried_existing.c
 ```
 
 The next managed input uses existing target APIs and a supported managed record:

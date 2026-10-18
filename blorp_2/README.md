@@ -6,8 +6,11 @@ native execution. The existing compiler builds this compiler until it can
 build itself.
 
 The [imports and prelude reference](IMPORTS_AND_PRELUDE_PLAN.md) defines explicit
-type/method visibility and a shared base/prelude for the temporary target
-library. Its syntax and layout are implemented in this pilot.
+type/method visibility and a shared base/prelude for the target
+[standard library](standard_library/README.md) at `blorp_2/standard_library`.
+Its syntax and layout are implemented in this pilot. The
+[Option/Result catalog and addition plan](OPTION_RESULT_PLAN.md) records current
+compiler demand and separates ordinary helpers from callable prerequisites.
 
 Current language examples and limits are below; [grammar.ebnf](grammar.ebnf)
 owns the formal syntax. The [roadmap](ROADMAP.md) owns planned increments,
@@ -641,7 +644,7 @@ For a longer stress run, compile the same fixture and run its normal entrypoint
 with a nonnegative iteration argument:
 
 ```sh
-blorp_2/build/compiler --library-root blorp_2/standard_library_temp \
+blorp_2/build/compiler --library-root blorp_2/standard_library \
   blorp_2/test/e2e/fixtures/tail_recursion/accumulator.brp \
   blorp_2/build/tail-accumulator.c
 clang -std=c11 -Wall -Wextra -Werror -pedantic -O0 \
@@ -1465,7 +1468,7 @@ unsupported.
 Supply the target library explicitly:
 
 ```sh
-blorp_2/build/compiler --library-root blorp_2/standard_library_temp \
+blorp_2/build/compiler --library-root blorp_2/standard_library \
   blorp_2/test/e2e/fixtures/int/add.brp \
   blorp_2/build/add.c
 ```
@@ -1475,7 +1478,7 @@ beside their importer, including inside library modules. Missing roots and files
 produce diagnostics; there is no local-file or host-library fallback. Library
 modules use the ordinary module pipeline and preserve declaration identities.
 
-The [temporary library](standard_library_temp/README.md) adapts modules from
+The [temporary library](standard_library/README.md) adapts modules from
 the [standard library](../standard_library/src/), with original source revisions
 and hashes retained in its adapter headers. Its active declarations provide
 the calculator's ordinary unions and concrete numeric, conversion and IO functions.
@@ -1633,7 +1636,7 @@ records phase tests, native output, ownership checks and matched costs.
 ## Calculator input and results
 
 `Option[T]`, `Result[Value, Error]` and `Bool` come from ordinary
-fixed unions in `standard_library_temp/_base.brp`; none of them receives
+fixed unions in `standard_library/_base.brp`; none of them receives
 a compiler-specific representation. The prelude supplies their types and
 constructors to user modules; library modules import them from `_base`:
 
@@ -1914,7 +1917,7 @@ Build and run it from the repository root:
 
 ```sh
 make -C blorp_2 test-compiler
-blorp_2/build/compiler --library-root blorp_2/standard_library_temp \
+blorp_2/build/compiler --library-root blorp_2/standard_library \
   blorp_2/test/e2e/fixtures/calculator/float.brp \
   blorp_2/build/calculator.c
 clang -std=c11 -Wall -Wextra -Werror -pedantic -O0 \
@@ -1953,7 +1956,7 @@ The command reads the root program, the configured foundation and ordinary
 prelude, and their dependencies once per normalized path, then writes C:
 
 ```sh
-bin/blorp run --no-format blorp_2/src/main.brp -- --library-root blorp_2/standard_library_temp input.brp output.c
+bin/blorp run --no-format blorp_2/src/main.brp -- --library-root blorp_2/standard_library input.brp output.c
 ```
 
 The impure command shell owns file I/O and printing. Compilation and
@@ -2191,7 +2194,7 @@ and independent verification checks the complete signature and outgoing batch
 before sealing the program.
 General pass infrastructure remains future work.
 
-The target library's [`_base.brp`](standard_library_temp/_base.brp)
+The target library's [`_base.brp`](standard_library/_base.brp)
 owns the builtin Int, Float, String, Void and List identities, and the ordinary
 Bool, Option and Result unions. It is the only module that may declare builtin
 types, and any module may import it as `_base`.
@@ -2204,7 +2207,7 @@ and `Err(Error)`, in any order. A missing or differently shaped union is a
 foundation error. The designation is an identity fact only: layout follows
 declaration order, as for any union, and a same-named union in another module is
 an ordinary declaration (a user module cannot declare one, because the prelude
-already exposes the designated type). [`prelude.brp`](standard_library_temp/prelude.brp)
+already exposes the designated type). [`prelude.brp`](standard_library/prelude.brp)
 is the only implicit import: it supplies its written import scope to application
 roots and user helper modules, and cannot be imported explicitly. Library
 modules receive nothing implicitly; each imports what it uses, including base
@@ -2322,7 +2325,7 @@ the latter skips the pilot build. Supplied executables' source correspondence
 and optimization settings are unverified unless provided by their version
 output.
 
-Pilot samples receive `standard_library_temp` as an explicit library root,
+Pilot samples receive `standard_library` as an explicit library root,
 recorded with its source snapshot.
 
 `summary.tsv` reports minimum elapsed seconds and retired instructions across

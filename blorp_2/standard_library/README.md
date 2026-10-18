@@ -1,7 +1,11 @@
-# Temporary input library
+# Blorp 2 standard library
 
 These modules are compiled by Blorp 2 for input programs. They are separate
-from the host library that builds the pilot compiler.
+from the host library at `standard_library/src/` that builds the pilot compiler.
+
+The directory was renamed from `standard_library_temp` on 2026-10-18. Dated
+benchmark reports and retained raw evidence keep the historical path to preserve
+measurement provenance; current commands use `blorp_2/standard_library`.
 
 The library root contains two designated foundation modules:
 
@@ -34,7 +38,7 @@ exposes those same concrete names for Float64.
 declarations are enabled only as their features enter the supported subset.
 The original modules are maintained in [standard_library/src](../../standard_library/src/).
 
-Pass `blorp_2/standard_library_temp` explicitly as the argument to `--library-root`. Bare `int: add` imports resolve here; relative
+Pass `blorp_2/standard_library` explicitly as the argument to `--library-root`. Bare `int: add` imports resolve here; relative
 imports still resolve beside their importer. There is no host-library fallback.
 
 `io.brp` retains the upstream revision and SHA256 used for its adaptation of
@@ -60,7 +64,9 @@ pure calculator parsing and evaluation; it has no compiler-specific behavior.
 
 Bool, Option and Result are ordinary fixed unions owned by `_base.brp`; user
 modules receive their types and constructors through the prelude. Separate Bool,
-Option and Result operation modules are deferred until operations need them. The String adapter
+Option and Result operation modules are not implemented yet. The
+[resolved catalog and addition plan](../OPTION_RESULT_PLAN.md) covers the nine
+helpers used by the compiler, including four that require callable semantics. The String adapter
 exposes strict counted-byte `parse_int`, `parse_float` and `equals` operations.
 Their builtin bodies name only the operation; results refer to the
 foundation's designated Bool and Option, found by name in `_base.brp`, and

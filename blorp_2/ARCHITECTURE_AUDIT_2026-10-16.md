@@ -152,7 +152,7 @@ audit_root=$(mktemp -d)
 printf '%s\n' '---' > "$audit_root/invalid.brp"
 printf '\377\n' >> "$audit_root/invalid.brp"
 printf '%s\n' '---' 'func main() -> Int:' '    0' >> "$audit_root/invalid.brp"
-blorp_2/build/compiler --library-root blorp_2/standard_library_temp \
+blorp_2/build/compiler --library-root blorp_2/standard_library \
     "$audit_root/invalid.brp" "$audit_root/invalid.c"
 clang -std=c11 -Wall -Wextra -Werror -pedantic -O0 \
     "$audit_root/invalid.c" -o "$audit_root/invalid"
@@ -182,7 +182,7 @@ BEGIN {
  print "\tvalue_1\n\nfunc main(arguments: List[String]) -> Int:"
  print "\tdeep(arguments.length().equals(1))"
 }' > "$audit_root/deep.brp"
-blorp_2/build/compiler --library-root blorp_2/standard_library_temp \
+blorp_2/build/compiler --library-root blorp_2/standard_library \
     "$audit_root/deep.brp" "$audit_root/deep.c"
 clang -std=c11 -Wall -Wextra -Werror -pedantic -O0 \
     "$audit_root/deep.c" -o "$audit_root/deep"

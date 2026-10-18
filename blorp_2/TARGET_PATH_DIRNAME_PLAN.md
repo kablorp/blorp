@@ -18,7 +18,7 @@ Interior separators/parents, valid UTF-8 spelling and counted NUL remain lexical
 The host body/oracle in `standard_library/src/path.brp:80` and
 `blorp/test/test_runtime/test_sys/test_path.brp:26-100` already implement this.
 
-The accepted target module `standard_library_temp/path.brp` contains only join
+The accepted target module `standard_library/path.brp` contains only join
 and its private separator predicate; retain those exact bytes. Its SHA256 is
 `f720e2c42660528340dac3c783b13a851a1c5c039b422ea40bcf52167facca81`.
 [Loader source integration](LOADER_SHELL_INTEGRATION_PLAN.md) owns later callers;
@@ -26,7 +26,7 @@ normalize remains a separate component-stack slice. This increment changes neith
 
 ## Scope and caps before production code
 
-Only add dirname/imports/bounded module docs to `standard_library_temp/path.brp`
+Only add dirname/imports/bounded module docs to `standard_library/path.brp`
 when its prerequisites are accepted. No compiler/runtime/native change, Char,
 Bytes, take_left copy, path builtin, proof type, failure primitive or new controller.
 No host/source migration and no Option get_or dependency. The literal None arm
@@ -158,7 +158,7 @@ approves its generation/link separately. The narrow actual-main witnesses use
 its ordinary CLI, retaining C unmodified:
 
 ```sh
-"$dirname_pilot" --library-root blorp_2/standard_library_temp \
+"$dirname_pilot" --library-root blorp_2/standard_library \
   blorp_2/test/e2e/fixtures/path_dirname/edges.brp build/target-dirname/edges.c
 clang -std=c11 -Wall -Wextra -Werror -pedantic -O0 -fsanitize=address,undefined \
   -fno-sanitize-recover=all build/target-dirname/edges.c -lm -o build/target-dirname/edges

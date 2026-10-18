@@ -2,7 +2,7 @@
 
 Until the fixpoint, the host compiler builds `blorp_2/src` against its selected
 host library while the pilot compiles programs against
-`blorp_2/standard_library_temp/`. The source may therefore use only library
+`blorp_2/standard_library/`. The source may therefore use only library
 functions that exist in both, with the same module name, function name and
 signature, including the explicitly documented monomorphic instances below.
 This document owns that set. No required row may be MISSING when M6 exits.
@@ -10,9 +10,12 @@ This document owns that set. No required row may be MISSING when M6 exits.
 **Scope update.** The table and counts below are a historical resolved snapshot
 at `ba57e368a` (2026-10-15), not the final interface inventory. The
 [source plan](BOOTSTRAP_SOURCE_PLAN.md) and [current roadmap](ROADMAP.md#m6-library-and-shell)
-replace the old Char/callback prerequisites. Regenerate the resolved inventory
-after each source dependency is actually removed; planned removals below do not
-claim that current callers or missing twins have disappeared.
+govern the independent Char/source work. The owner stopped the remaining
+callback-removal migration. The current [Option/Result catalog](OPTION_RESULT_PLAN.md)
+supersedes those rows/counts: nine pure APIs at 212 resolved compiler sites,
+including four callback helpers. Their callable prerequisites remain required.
+The remaining table is historical evidence; refresh other interfaces at their
+own implementation boundary rather than treating planned removals as complete.
 
 ## Planned interface delta
 
@@ -20,7 +23,7 @@ claim that current callers or missing twins have disappeared.
 | --- | --- |
 | Char reads, literals and conversions | Replace with `string.byte_at(String, Int) -> Option[Int]` and `string.from_codepoint(Int) -> Option[String]`. Both matching host and target interfaces are implemented; host wrappers are validated with explicit source-library selection. Target phase/native/main and matched-cost evidence is in the [API acceptance report](../benchmarks/results/blorp_2_string_integer_apis_2026-10-16.md). Source Char/classification migration remains pending. Full-width scalar validation precedes narrowing, and Some[String] has ordinary owning payload transfer/destruction. |
 | Parser alphabet classification | Private ASCII byte predicates replace all current String lower/index_of/contains callers, preserving empty-substring and malformed-token diagnostic behavior. Remove the historical rows only after resolved inventory confirms zero uses. |
-| List/Option/Result callbacks and function types | Conditional first-order migration. Do not implement historical HOF rows solely for bootstrap or remove them before the bounded pilots and full inventory pass. |
+| List/Option/Result callbacks and function types | Retain compiler callbacks. The [Option/Result plan](OPTION_RESULT_PLAN.md) owns its resolved nine-API subset and callable prerequisites; List demand remains a separate inventory. No remaining HOF-removal campaign is planned. |
 | First-order numeric, String and List operations | Remain required over valid UTF-8. Planned `string.slice(String, Int, Int) -> Option[String]` uses half-open byte offsets and rejects out-of-range or misaligned endpoints. Byte comparisons create no String. Measure join construction: host join uses capacity-aware append, not naive concat. |
 | `system.get_current_directory() -> Result[String, String]` | Target adapter and native Result contract are implemented. Both branches own a fresh String; success is an exact nonempty absolute UTF-8 path, and invalid encoding returns Err. Storage grows as needed. Compiler-source migration from fixed-buffer `getcwd` remains pending. |
 | `system.read_file(String) -> Result[String, String]` | Target adapter and native Result contract implemented. Exact counted UTF-8 preserves empty/CRLF/BOM/NUL contents; NUL paths reject before open. IO errors use saved numeric errno; one close attempt follows every open. Both branches own a fresh String. Invalid UTF-8 advises saving as UTF-8; the host also suggests read_bytes, unavailable in the target. Loader migration remains pending. |
@@ -62,7 +65,7 @@ The milestones are defined in [ROADMAP.md](ROADMAP.md). As this document uses th
 - **M4** (the "recursive-types" milestone): recursive types and opaque types.
 - **M5**: module-level constants with literal initializers, including in library modules.
 - **M6**: the library and shell increment this table drives; its exit is no MISSING row.
-- **M7**: future lambdas at known callees and function-typed parameters; conditionally retired from bootstrap after first-order source migration.
+- **M7**: pure lambdas at known callees and function-typed parameters, including managed immutable captures; parsing is implemented, semantic execution remains required.
 
 ## Method
 
@@ -83,7 +86,7 @@ Every row comes from the host compiler's own resolution, not from names:
    and Char literals removed, so `"a + b"` and `'+'` do not count.
 3. Every host signature below was read from `standard_library/src/<module>.brp` at
    the line given; every twin was read from the 124 lines of
-   `blorp_2/standard_library_temp/`.
+   `blorp_2/standard_library/`.
 4. Import blocks were listed with
    `grep -rn -A40 '^import:' blorp_2/src` and checked against the rows: every
    host module imported by name (`int`, `float`, `string`, `list`, `option`,
@@ -187,7 +190,7 @@ source unchanged.
 
 Types reached through the host prelude: `Int`, `Float`, `String`, `Void`,
 `List`, `Bool(True, False)`, `Option(Some, None)` and `Result(Ok, Err)` exist in
-`standard_library_temp/_base.brp` under the same names. `Char` (51 Char literals
+`standard_library/_base.brp` under the same names. `Char` (51 Char literals
 in `src`, the `string.get`, `chars`, `from_char`, `to_int` and `to_char` rows) is
 MISSING from `_base` and is an intrinsic type. `main(args: List[String]) -> Int`
 (argv and exit status) is the same contract in both.
@@ -275,7 +278,7 @@ codegen quality once measured: `int.greater_than`, `int.greater_than_or_equal`,
   lex/lex.brp:196; `to_char(digits.scalar)`, parse/parse.brp:588) with no import:
   the host resolves them as builtin conversion methods. The pilot has no implicit
   bare functions: direct calls need named imports
-  (`standard_library_temp/README.md`). So `src` must call them through an
+  (`standard_library/README.md`). So `src` must call them through an
   import, and the host must accept that form for a method it declares inside a
   trait implementation. It does: this probe compiled under
   `bin/blorp run --no-format` (the same form `src` already uses for

@@ -86,7 +86,7 @@ Keep var bindings and every subsequent update/consumer unchanged.
   authority; Unvisited→Visiting→Emitted prevents missing/duplicate definitions.
 
 Host `standard_library/src/list.brp:1276` and target
-`standard_library_temp/list.brp:5` agree: repeat(element, count), **element first**.
+`standard_library/list.brp:5` agree: repeat(element, count), **element first**.
 The target runtime/list.brp:140–168 normalizes nonpositive counts to zero, allocates
 one owned list root and acquires each managed child occurrence. Actual source
 counts here come from lengths and are nonnegative. Zero input stays zero output;

@@ -34,7 +34,7 @@ nor subtracts accepted feature costs from its failed result.
 
 ## Witness and authoritative facts
 
-Proposed `standard_library_temp/system.brp`:
+Proposed `standard_library/system.brp`:
 
 ```blorp
 import:
@@ -327,7 +327,7 @@ git diff --check
 ```
 
 The fixture's exact compiler invocation is
-`blorp_2/build/compiler --library-root blorp_2/standard_library_temp blorp_2/test/e2e/fixtures/current_directory/basic.brp build/target-cwd/basic.c`.
+`blorp_2/build/compiler --library-root blorp_2/standard_library blorp_2/test/e2e/fixtures/current_directory/basic.brp build/target-cwd/basic.c`.
 The existing harness compiles each fixture once and links its unmodified C at
 O0, then invokes actual main. No manual duplicate compile is needed for review.
 Preserve complete raw generated C; this feature intentionally adds its helper,
