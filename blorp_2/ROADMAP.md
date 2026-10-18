@@ -899,6 +899,9 @@ is implemented and validated: [3,920 matched calls](../benchmarks/results/blorp_
 pass the +3% per-input and original-checkpoint-proxy limits. Historical R0
 compliance remains UNVERIFIED; eight callbacks and the broader M7 dependency remain.
 
+The [stable layout ordering pilot](STABLE_LAYOUT_ORDER_PLAN.md) has a reviewed
+design; implementation and measurements have not started.
+
 **Retained future design.** Lambdas at known callees, including managed captures.
 The model, not an
 optimisation: each lambda literal is a unique nominal record type of its
