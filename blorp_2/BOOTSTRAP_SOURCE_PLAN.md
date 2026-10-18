@@ -168,7 +168,11 @@ Preserve the next arm's fallback, loop ownership and non-shadowing names. Never
 duplicate a substantial action merely to remove syntax. Six representative sites
 must prove the migration before the other nested tests are changed.
 
-For higher-order code, seven constant fills use existing `repeat`. Eleven
+For higher-order code, the historical seven constant fills use existing `repeat`.
+Accepted unary preparation already migrated the value-counted ownership-use fill;
+the [fill plan](FIRST_ORDER_FILLS_PLAN.md) maps the six remaining sites. Its
+implementation and unwaived SOURCE cost acceptance remain pending. The historical
+64-call census above is unchanged; this is not a fresh full inventory. Eleven
 `translated_list` calls coalesce into eight typed domain traversals, retaining
 the existing child translator and first-error order. Do not replace callbacks
 with a task enum or dispatch framework.
@@ -344,8 +348,9 @@ Stop on a cap breach, source-epoch drift or need for another mechanism.
    update ROADMAP and parity requirements. Commit the reviewed plan first.
 2. **Small source preparation:** construction functions and argument lifting as
    separate green refactors. No record/reference constant implementation.
-3. **First-order pilots:** fills, a coalesced type translator and stable layout
-   ordering. Then migrate remaining callbacks in bounded module groups.
+3. **First-order pilots:** [remaining fills](FIRST_ORDER_FILLS_PLAN.md), a coalesced
+   type translator and stable layout ordering. Then migrate remaining callbacks
+   in bounded module groups.
 4. **Library foundation:** host String wrappers/availability, two target String
    operations, ASCII predicates and the [five-file source byte migration](SOURCE_BYTE_MIGRATION_PLAN.md)
    (four Char consumers plus main's byte-column classification).
@@ -397,7 +402,7 @@ before implementation):
 | 28 construction functions and uses | 300 | +80 |
 | 16 argument-control lifts | 250 | +60 |
 | Six representative nested tests | 160 | +40 |
-| Seven fill maps | 40 | +14 |
+| Fill maps (seven historical; six remain) | 40 | +14 |
 | Three type translations coalesced | 100 | +48 |
 | Stable layout ordering decision | 250 | +100 |
 

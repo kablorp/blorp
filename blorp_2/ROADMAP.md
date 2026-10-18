@@ -928,6 +928,11 @@ compliance remains UNVERIFIED; eight callbacks and the broader M7 dependency rem
 The [stable layout ordering pilot](STABLE_LAYOUT_ORDER_PLAN.md) has a reviewed
 design; implementation and measurements have not started.
 
+The [constant-fill plan](FIRST_ORDER_FILLS_PLAN.md) maps six remaining source maps
+to existing `repeat`; unary preparation already migrated the seventh historical
+site. Implementation and the unwaived SOURCE cumulative acceptance remain pending;
+the historical overall callback census is not refreshed by this bounded mapping.
+
 **Retained future design.** Lambdas at known callees, including managed captures.
 The model, not an
 optimisation: each lambda literal is a unique nominal record type of its
