@@ -409,9 +409,13 @@ before implementation):
 The retained non-binding pattern-group feature has a separate ceiling of 650
 gross added / +450 net production lines, not the six-site source pilot's budget.
 
-Whole callback removal is estimated at +442–739 net; it needs a complete reviewed
-patch estimate and cumulative ceiling before broad implementation. Do not stack
-small pilot allowances to hide total growth. Full pattern migration similarly
+The historical whole-callback estimate was +442–739 net, not an allowance. The
+maintained [remaining callback ledger](REMAINING_CALLBACK_LEDGER.md) records the
+prospective selected whole ceiling: 1,000 production added / +530 net / 930 test
+added, including nested propagation, with spent ports and cumulative scopes
+accounted separately. It grants no source writes or SOURCE cost waiver; original
+R0 and every cost hold remain binding. Do not stack small pilot allowances to
+hide total growth. Full pattern migration similarly
 needs a revised estimate after the six-site pilot; the old +1,300–2,300 estimate
 included discarded no-else/or-duplication rules and is not an approved allowance.
 

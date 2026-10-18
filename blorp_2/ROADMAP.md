@@ -928,6 +928,9 @@ No stored/returned closure was found in the reviewed current source. Broader
 language function values remain future work; existing parser/rejection behavior
 is preserved.
 
+The [remaining callback ledger](REMAINING_CALLBACK_LEDGER.md) owns the prospective
+whole ceiling and cumulative accounting; original SOURCE R0 and cost holds remain.
+
 The bounded [three-site type-argument translation](TYPE_ARGUMENT_TRANSLATION_PLAN.md)
 is implemented and validated: [3,920 matched calls](../benchmarks/results/blorp_2_first_order_type_arguments_2026-10-18.md)
 pass the +3% per-input and original-checkpoint-proxy limits. Historical R0
