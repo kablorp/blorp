@@ -2,6 +2,8 @@
 
 ## Status and problem
 
+Historical A/old-base handoff follows; the revised B checkpoint below governs B.
+
 Proposed implementation handoff, based on main
 `d82bdf85c4c7375024a1b1a7f2a86aa5e3815b62`. Plan only: no implementation,
 compiled job, baseline freeze or sampling is authorized here. Root reviews this
@@ -25,9 +27,10 @@ neither their validation nor landing permission; preserve every cumulative
 ledger debit. Do not duplicate predecessors or recover the unavailable broad
 loop draft.
 
-Two independently green slices follow: **A, restricted if**, then **B, top-level
-Result propagation**. B does not widen joins to early returns. Preserve the
-ordinary-tail, scalar TCO and ownership-negative controls throughout.
+A's prerequisite prose above is historical. Current B below is independent of A,
+Boolean admission and held ordinary-tail/M3 work; local annotations/body_types
+are already accepted. B does not widen joins to early returns. Preserve all
+then-accepted scalar-tail and ownership controls.
 
 ## A: if through existing joins
 
@@ -135,7 +138,65 @@ errors still precede annotation analysis. Prefix if statements beneath an
 otherwise supported root match keep existing scalar checks. Supporting root-if
 TCO is a later reviewed rule, not part of A.
 
-## B: one function-prefix propagation step
+## B: frontend Result propagation checkpoint (2026-10-19)
+
+This revised B supersedes the historical flat-edge model below. Plan only: root
+and independent review, a separate plan commit and explicit tests-first dispatch
+precede implementation. Fixed accepted baseline is
+`2aaedc28967f16d9d640256f264e731cf9922d48`; no held feature overlay is a prerequisite.
+
+The user explicitly said: "A 128-statement ?= chain is unrealistic." Accordingly,
+only B's artificial 128-chain/flat-C-depth requirement is waived. Test realistic
+1/2/5/9/16 chains and record emitted C depth at default toolchain limits, without
+new C flags/runtime behavior. This changes no resource, placement or TCO ceiling.
+
+Check the designated Result owner and compatible error type using foundation IDs
+and the accepted function return TypeUse, once. For source Result[V,E] and return
+Result[R,E], a written binder annotation V supplies complete Result[V,E] context
+through existing body_types; otherwise synthesize the RHS normally. Never use R
+as V, invent inference holes or add a solver. Underconstrained constructors teach
+a binding annotation/typed intermediate. Preserve exact first-error diagnostics.
+
+Consume each source statement once with a suffix index and existing scope/body
+resolvers; do not copy suffix arrays or duplicate the remaining body. At each
+`name ?= source`, construct one ordinary checked Result-valued join:
+
+```text
+Ok(name)  => the remaining function computation, yielding Result[R,E]
+Err(error) => construct the returned Result[R,E]'s Err(error)
+```
+
+The function returns the outer join value normally. Err is a yield, not a return
+inside CheckedJoinArm. Success/error captures use real issued BindingIds and
+canonical VariantIds in their own existing arm scopes. Error is private; name is
+visible only in the Ok continuation. Specialization selects source constructors
+with Result[V,E]'s instance and constructs Err with Result[R,E]'s instance.
+Existing join transfer acquires managed payload/results before parent cleanup;
+existing Own/Verify handle sibling scope, ancestor lifetime and complete function
+return. No new Checked/Concrete statement, Lower/Own/Verify/Emit product, general
+continuation framework, text synthesis, fake names or runtime operation.
+
+Keep Result-only function-top-level placement: nested if/match, loop and lambda
+propagation remain rejected. Option and annotated-TCO combinations stay rejected;
+check ordinary body errors before the explicit annotated-placement diagnostic.
+No if/Boolean/ordinary-tail predecessor or general early-return join is required.
+
+First checkpoint: one managed Result witness and exact semantic checker REDs,
+then minimum frontend desugaring, short generated-C/native review and the realistic
+chain screen. Forecast 160–250 gross production additions/+110–180 net, within
+unchanged hard 430/+330; tests <=1,000 gross including one <=40-line fixture.
+Prospective fixture limits: 45,000 strict compiler allocations, 200M strict and
+normal-min3 instructions, strict balanced-zero target memory and real-main proof.
+Before implementation, B selects its first prospective fixed accepted FEATURE
+baseline above: +3% allocations and normal-min3 instructions independently per
+unchanged shared input, plus all old absolutes. Supporting-host cost rules are
+unchanged; no measured HOST pass or retrospective baseline roll is claimed.
+The separate [SOURCE fixed-baseline policy](BOOTSTRAP_SOURCE_PLAN.md#string-and-library-boundary)
+and all failed histories remain unchanged; that dated decision grants no FEATURE
+exemption. No scalar SOURCE ledger transfer or reset funds this checkpoint.
+No setup, sampling or compiled call is granted by this plan amendment.
+
+### Historical B scope and flat-edge alternative (not selected)
 
 First scope is the designated Result, at function top level only. Preserve the
 parser's existing rejection of nested propagation in if/match, loop and lambda
@@ -206,7 +267,7 @@ managed objects. The successful continuation keeps both owned prefixes live at
 propagation; failure must clean them without running their prints. Reusing
 original proves caller-owned input survives.
 
-### Minimal typed model for review
+### Historical flat-edge typed model (not an implementation requirement)
 
 Current CheckedStatement has InitializeBinding, ReassignBinding and
 DiscardExpression. Add one fixed function-prefix operation, schematically:
@@ -274,10 +335,11 @@ after ordinary checking. Do not guess that its failure means Loop Break. Root
 must approve the exact diagnostic/placement rule and owned edge product before
 B's implementation.
 
-## Shared regions and integration ownership
+## Historical shared regions and integration ownership
 
-Anchors below name this pinned base; integrate by symbols after predecessors
-land, never by replacing old whole files.
+These anchors describe the original A/flat-edge handoff. Current B has no new
+downstream model or held-predecessor dependency; preserve current accepted code
+and integrate its frontend edits by symbols, not old whole-file replacement.
 
 | Region | Existing writer/conflict | Coordination rule |
 | --- | --- | --- |
@@ -311,7 +373,8 @@ Every diagnostic callback pins kind, full message/help and exact source span.
 | B | direct Own output order and independently malformed Verify IR for missing/double cleanup, wrong owner, borrowed child and sibling visibility | Drop the result parent before acquisition; the isolated verifier negative fails for its exact reason |
 | B | two live owned prefixes, successful continuation, failure exit, caller alias survives; existing parser rejections | Omit one failure-path drop; real-main leak control fails |
 
-Keep ordinary-prep checker/ARC/C controls and the million/0/1/17 scalar fixtures.
+Keep all then-accepted checker/ARC/C and scalar-tail controls. Held prep/common-loop
+oracles are not B prerequisites or inherited validation.
 After root grants a lane and pins host/std inputs, the narrow command is:
 
 ```bash
@@ -327,7 +390,8 @@ new propagation suite is test_check/test_propagation.brp. Finish with normal
 `make -C blorp_2 test` only after root supplies/verifies the intended repository
 host in that checkout. Its e2e target builds the compiler once and supplies it
 explicitly. Review affected C; require exact C for unaffected inputs. Record
-16/32/64/128 flat-control scaling and default-toolchain C depth. Never raise a
+A's 16/32/64/128 flat-control scaling and default-toolchain C depth; revised B uses
+its user-approved 1/2/5/9/16 screen instead. Never raise a
 compiler nesting limit to hide a failed structural gate. None of these jobs is
 authorized by this plan alone. Update the README's supported subset and examples
 with implementation; the grammar already parses these forms and gains no new
@@ -344,12 +408,11 @@ compressed formatting, coverage removal or reset after a preparatory landing.
 | Slice | Unmeasured production forecast | Proposed production stop | Tests/fixtures stop |
 | --- | --- | --- | --- |
 | A, after Boolean/annotation composition | 130–210 gross, +90–160 net | 210 gross and +160 net | 700 gross tests including at most 3 new fixture files/60 new source lines |
-| B, separate model approval first | 270–430 gross, +190–330 net | 430 gross and +330 net | 1,000 gross tests including one managed fixture/40 source lines |
+| B, revised frontend checkpoint | 160–250 gross, +110–180 net | 430 gross and +330 net | 1,000 gross tests including one managed fixture/40 source lines |
 
-The maxima are not additive permission. Reforecast after A; if remaining ledger
-cannot cover B, rescope before B's implementation. B's larger estimate explicitly
-includes four phase products, contextual typing and independent root-discharge
-verification; the earlier rough 130–230 allowance was incomplete.
+The maxima are not additive permission. Current B uses the checkpoint above,
+not A's historical predecessor/ledger route or the unselected four-product model.
+Keep scalar SOURCE accounting separate; no transfer, reset or hidden debit.
 
 Propose at most +3% allocations and normal min3 retired instructions per unchanged
 shared owned input for the composed candidate, against one approved reference,
@@ -373,7 +436,8 @@ balance. Verify the target's strict report and leak-fault oracle on the composed
 candidate. Source shape/LOC, compiler costs and target runtime
 are distinct acceptance evidence; none substitutes for another. These proposed
 numbers authorize no cost setup or sampling and waive no original R0 gate.
-B needs separate absolute new-fixture ceilings before any implementation.
+B's prospective 45,000 allocations/200M strict and normal-min3 fixture ceilings
+are specified in its revised checkpoint; no existing limit is changed.
 
 ## Subsequent common-loop forecast and handback
 
