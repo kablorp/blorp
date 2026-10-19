@@ -1,6 +1,39 @@
 # M3: common loops, then managed String while
 
-## Status, dependencies and review boundary
+## Current scalar checkpoint — 2026-10-19
+
+Ordinary-tail preparation remains unmerged: production is 35 additions / 61
+deletions (-26), tests are 799 / 507 (+292) in 43 files, and no fixture is added.
+Current components pass 3,536 checks. Native behavior and all 402 instruction
+checks pass, but direct-chain and nested-String-List allocation ceilings fail;
+matched SOURCE acceptance and effective restored faults remain pending.
+
+The corrected runtime reference `8499b0ea` has been recovered. Its five-owner
+production forecast is 1,052 additions / 775 deletions (+277), before current
+API ports. Including ordinary preparation gives 1,087 / 836 (+251), leaving
+63 gross additions under the unchanged 1,150 / +350 production ceiling.
+This is a conditional forecast, not typechecked or runnable acceptance.
+
+Two independent reviews verified the exact current test composition: 3,336
+additions / 2,706 deletions (+630), preserving all 128 mapped callbacks and
+the 59-file retirement closure. Ordinary preparation is charged once;
+36 rewritten ordinary lines are excluded from the residual debit. The old
+3,300 gross ceiling is still exceeded by 36 after that exclusion.
+
+Prospectively replace only that cumulative test ceiling with **3,500 physical
+additions / +1,100 net**. This leaves 164 gross additions for current API ports.
+Retain every existing oracle; do not compress formatting, delete coverage or
+add a helper framework to fit. Production, fixture and resource limits stay
+unchanged. The count authority is retained under
+`build/bootstrap-evidence/m3-residual-count-2026-10-19/`.
+
+The [fixed-baseline SOURCE decision](BOOTSTRAP_SOURCE_PLAN.md#source-cost-acceptance)
+supersedes historical unresolved-hold language below. Ordinary preparation has
+fixed B `ea881c84`; name the next accepted B prospectively before runtime setup.
+Do not roll a failed baseline. Commit this reviewed amendment before runtime
+production or test ports; implementation still needs its bounded dispatch.
+
+## Historical planning status and dependencies
 
 The ordinary-tail preparation has passed its focused 16-test emitter suite and
 43-suite, 787-test owner batch. Its remaining acceptance, SOURCE cost evidence
@@ -36,7 +69,7 @@ requires review of a bounded port of that same route if it has not landed.
 Do not create a parallel Bool channel. The unresolved SOURCE baseline policy
 does not block this plan or static consumer inventory; cost gates stay pending.
 
-## Ordinary-tail preparation and current acceptance
+## Historical ordinary-tail preparation acceptance
 
 Actual production is 35 additions / 61 deletions (net -26) in two files,
 including the three model-comment corrections. Tests are 687 additions /
@@ -600,14 +633,14 @@ The working ordinary prep and the reviewed runtime-loop rescope replace that
 unbuildable draft. Reforecast the deferred early-IR remainder before any of its
 writes; the runtime rescope does not establish that it fits.
 The checkpoint and every later common-loop change share one cumulative
-1,150-gross/+350-net production ledger and 3,300-gross/+1,100-net test ledger. No cap reset,
+1,150-gross/+350-net production ledger and 3,500-gross/+1,100-net test ledger. No cap reset,
 offset, borrowed feature budget, compressed formatting or deleted coverage.
-The production ceilings remain unchanged; the scalar test rescope above is the
-sole replacement for its earlier internal and hard test ceilings.
+The production ceilings remain unchanged; the current scalar checkpoint above
+supersedes the historical test rescope and its earlier test ceilings.
 
 | Slice | Production physical additions/net growth | Test additions | Normal feature fixtures |
 | --- | --- | --- | --- |
-| Scalar preparation | at most 1,150 gross / +350 net | at most 3,300 gross / +1,100 net | Existing TCO behavior/rejections |
+| Scalar preparation | at most 1,150 gross / +350 net | at most 3,500 gross / +1,100 net | Existing TCO behavior/rejections |
 | Later managed String while | at most 750 gross / +600 net | at most 1,600 gross | at most 3, at most 120 total source lines |
 
 Report actual production/test gross and net separately, including replacements.
@@ -640,7 +673,7 @@ must have distinct H/result storage and a shared return. A setup/type failure
 does not establish that RED. Add exact typed Lower/Own/Verify Loop assertions
 with their product change, without a permanent dual-shape predicate or a new
 test framework. The whole packet, including the 59-owner ports above, shares
-the cumulative 3,300-addition/+1,100-net scalar test ceiling; there is no separate
+the cumulative 3,500-addition/+1,100-net scalar test ceiling; there is no separate
 additional-test allowance.
 
 Require phase tests for Lower origin erasure, single Specialize admission,
