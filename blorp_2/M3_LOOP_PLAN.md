@@ -1,37 +1,81 @@
 # M3: common loops, then managed String while
 
-## Current scalar checkpoint — 2026-10-19
+## Current scalar checkpoint — atomic convergence, 2026-10-19
 
-Ordinary-tail preparation remains unmerged: production is 35 additions / 61
-deletions (-26), tests are 799 / 507 (+292) in 43 files, and no fixture is added.
-Current components pass 3,536 checks. Native behavior and all 402 instruction
-checks pass, but direct-chain and nested-String-List allocation ceilings fail;
-matched SOURCE acceptance and effective restored faults remain pending.
+The landing unit is ordinary-root normalization plus the five-owner scalar runtime-loop
+convergence, evaluated as one SOURCE refactor against the **same original accepted B**,
+`ea881c84d0df9df04a6ec5c4406a3b69cf406735`. It replaces the earlier sequence requiring ordinary
+preparation to land before runtime convergence. Root must freeze the complete combined C and
+exact role/dependency boundary before any combined setup or sampling. This is neither a baseline
+roll nor acceptance of the standalone preparation. No setup is authorized by this planning
+amendment.
 
-The corrected runtime reference `8499b0ea` has been recovered. Its five-owner
-production forecast is 1,052 additions / 775 deletions (+277), before current
-API ports. Including ordinary preparation gives 1,087 / 836 (+251), leaving
-63 gross additions under the unchanged 1,150 / +350 production ceiling.
-This is a conditional forecast, not typechecked or runnable acceptance.
+Ordinary preparation remains unmerged and unaccepted. Its production debit is 35 additions / 61
+deletions (-26), tests 799 / 507 (+292) in 43 files, with no new fixture. Its direct 65-file
+control measured 80,472 -> 84,943 allocations (+4,471, +5.556%), **FAIL** against +3%. The
+attributed increase is +2,294 load-through-Own, +768 Verify and +1,409 Emit; emitter-only
+removal cannot close this gap. Native behavior and all 402 instruction checks passed, but the
+direct-chain and nested-String-List absolute allocation limits failed. Preserve all failed raw
+receipts and the original 14 unrun diagnostic calls as UNRUN; this amendment does not resume
+them, infer their outcomes or relabel any failure.
 
-Two independent reviews verified the exact current test composition: 3,336
-additions / 2,706 deletions (+630), preserving all 128 mapped callbacks and
-the 59-file retirement closure. Ordinary preparation is charged once;
-36 rewritten ordinary lines are excluded from the residual debit. The old
-3,300 gross ceiling is still exceeded by 36 after that exclusion.
+The ordinary producer uses the existing general Join route. The final scalar checkpoint then
+retires the legacy Lower/Own/Verify/Emit tail products in favor of one runtime Loop. These are
+one coherent producer-to-consumer convergence; the fact that ordinary preparation can run
+separately does not establish its independent acceptance. No general-join optimization,
+string-only optimization, legacy fallback or alternate runtime path is authorized here.
+Checked/concrete annotation products remain; Specialize admits unmanaged scalar TCO once, and
+Lower erases the marker into the common runtime Loop. Source while and managed TCO/header
+eligibility remain deferred.
 
-Prospectively replace only that cumulative test ceiling with **3,500 physical
-additions / +1,100 net**. This leaves 164 gross additions for current API ports.
-Retain every existing oracle; do not compress formatting, delete coverage or
-add a helper framework to fit. Production, fixture and resource limits stay
-unchanged. The count authority is retained under
-`build/bootstrap-evidence/m3-residual-count-2026-10-19/`.
+The current source ledger is **1,114 additions / 830 deletions (+284)**. The reviewed
+five-result-port test ledger gives **3,362 / 2,747 (+615)**; close its exact postimages and
+owning suite before treating that preview as executed acceptance. Ordinary's 35/61 and 799/507
+are included once, not new allowances. Retain the earlier 1,087/+274 assessment-stop history and
+current compatibility reassessment; these counts do not authorize further production edits. At
+this snapshot, the first-green Specialize suite is 36 PASS / 1 FAIL; Lower/Verify/Emit calls
+remain unrun. No complete functional pass is claimed.
 
-The [fixed-baseline SOURCE decision](BOOTSTRAP_SOURCE_PLAN.md#source-cost-acceptance)
-supersedes historical unresolved-hold language below. Ordinary preparation has
-fixed B `ea881c84`; name the next accepted B prospectively before runtime setup.
-Do not roll a failed baseline. Commit this reviewed amendment before runtime
-production or test ports; implementation still needs its bounded dispatch.
+The cumulative hard ceilings stay **1,150 gross / +350 net production** and **3,500 gross /
++1,100 net tests**. At the stated ledgers this leaves 36 gross / 66 net production and 138 gross
+/ 485 net test room. No offsets between production/test/fixture budgets, borrowed FEATURE
+budget, compressed formatting, helper framework or deleted coverage are permitted. Retain the
+earlier 3,336/2,706 composition, 36-line ordinary overlap exclusion and superseded 3,300 test
+ceiling as historical count evidence under
+`build/bootstrap-evidence/m3-residual-count-2026-10-19/`. All subsequent edits require a fresh
+complete physical ledger before writes.
+
+Preserve and port every original **82-case ordinary obligation**, all **128 mapped scalar
+callbacks**, and the **59-file legacy retirement closure**. Expected product/C changes require
+explicit oracle ports, never dropped tests or permanent dual-shape predicates. Keep
+declared-result first errors, exact message/help/span/note and child-first priority, final Void
+discards, captures, empty carriers despite outer reassignment, exact instance order, independent
+Own insertion/Verify malformed-resource cases, and all prior effective mutation and restoration
+obligations. Retain the actual million/0/1/17 scalar-TCO native checks, ordinary managed
+cleanup/alias cases, real mains, strict zero leaks, sanitizers and every existing
+allocation/instruction limit. Original failed setup/link/diagnostic attempts remain evidence,
+not semantic passes.
+
+The [fixed-baseline SOURCE decision](BOOTSTRAP_SOURCE_PLAN.md#source-cost-acceptance) applies
+independently to **each unchanged owned input** and the **original construction-checkpoint
+source-to-C proxy**: +3% allocations and normal min3 retired instructions against original B.
+All tighter absolute gates remain. Acceptance compares actual measured whole C with the same B
+independently per input and metric. Runtime retirement's real contribution naturally belongs to
+that measured whole candidate. Never subtract the old prep's 4,471 increase, relabel its failed
+result, average inputs/metrics, or compare phase fragments to whole-candidate thresholds. Keep
+attribution/history separately reported. Preserve exact unaffected C and
+diagnostics/status/C-or-noC; review all intended ordinary/TCO C differences without
+normalization. If the combined checkpoint fails, stop and reassess: do not roll B, increase
+limits, publish prep alone or substitute another role.
+
+Fixed-EA B/C cost evidence and later accepted-main functional composition are separate. Freeze
+the combined fixed-EA C with its complete library/corpus, physical paths, host/std/artifact
+roles and expected-C review before sampling. Current-main composition must preserve all
+then-accepted behavior, including qualified flat heads, annotations, opaque types, named
+callables, pure Void and scalar constants, and pass its own complete component/native gates. A
+combined pass is not yet established; current partial gates or old standalone receipts cannot
+stand in for either boundary. Root integrates only after exact functional, mutation, cost and
+independent code-reviewer/test-runner closure.
 
 ## Historical planning status and dependencies
 
