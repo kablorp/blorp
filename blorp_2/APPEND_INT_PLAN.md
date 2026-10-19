@@ -2,13 +2,16 @@
 
 ## Problem and boundary
 
-Plan-only base: `89fdc1bb9ac49553443e67deda5956764f6c697e`. Implementation is pending. This is delivery 8 of [BOOTSTRAP_SOURCE_PLAN](BOOTSTRAP_SOURCE_PLAN.md) and bounded [M6](ROADMAP.md#m6-library-and-shell) library parity, not self-compilation acceptance.
+Original FEATURE evidence retains fixed B
+`eb7b9fe1bd5dec40a8a2dd8acfae27fd02b53e6e`; current Numeric composition uses unchanged `a656f5ce1`.
+This is delivery 8 of [BOOTSTRAP_SOURCE_PLAN](BOOTSTRAP_SOURCE_PLAN.md) and bounded
+[M6](ROADMAP.md#m6-library-and-shell) parity; the final native gate passed 1,135/0. Self-compilation acceptance remains separate.
 
 The compiler calls `string.append_int(String, Int) -> String`, but the temporary library has no twin. Manual source scanning finds **114 textual occurrences on 109 matching lines**. The earlier `e906b8104` census was 113/108; the landed write_file emitter adds one occurrence. Neither count is a resolved inventory.
 
 Add only this ordinary function in `standard_library/string.brp`, composing accepted `int.to_string` and `string.add`. No compiler production changes, host changes, source migration, new builtin, builder, control mechanism, opaque completion, managed-loop work or path work follows. Coordinator owns integration and serialized compiled slots. Root and independent compiler/ownership expert review this plan patch before its separate commit; implementation follows that commit and explicit slot release.
 
-## Current dependency map
+## Baseline dependency map
 
 All source anchors below are under `blorp_2/src/`; these are observed gaps, not implementation scope.
 
@@ -58,7 +61,8 @@ func main() -> Int:
     23
 ```
 
-Normal main must exit 23 with stdout bytes `c3 a9 00 2d 34 32 0a` and empty stderr. Capture the missing-method semantic red, including exact diagnostic message/help/span, before adding production; it is currently unexecuted evidence.
+Normal main exits 23 with stdout bytes `c3 a9 00 2d 34 32 0a` and empty stderr.
+The missing-method RED, restored GREEN and source-fault controls are retained.
 
 Second compact fixture, `append_int_edges.brp`, prints `prefix.append_int(-9223372036854775808)`, the retained `prefix = "é\0"`, `"".append_int(0)` and `"x".append_int(9223372036854775807)`, then binds an unused `prefix.append_int(-1)` result and exits 0. Normal source-literal emission already allocates a fresh String root; no extra concat/alias step is needed. Exact stdout is `é\0-9223372036854775808\né\0\n0\nx9223372036854775807\n`; stderr is empty. This covers extrema, empty prefix, zero, alias preservation and unused cleanup through real main.
 
@@ -89,6 +93,14 @@ Subsequent implementation budgets: production **12 gross/+12 net**, permanent te
 
 First fixture: **30,000 allocations/150M instructions**. Compact edge fixture: **40,000/200M**. Published concat observations of 12,390/40,553,537 motivate these prospective caps; they are not append_int measurements or recovered raw evidence. No post-failure increase.
 
-Freeze one accepted then-main B, exact candidate, full target library, corpus and coordinator's existing c04 supporting host with explicit ROOT host-library selection before samples. This is a **FEATURE proxy using full exit-time TOTAL allocations**, not the SOURCE construction checkpoint. Every unchanged input and proxy must satisfy **+5% allocations and normal min3 retired instructions**; strict target zero leaks. Preserve the host-only strict-leak limitation explicitly. This grants no waiver of original source-refactor **+3%** contracts or historical failures.
+The 12 fixed-B FEATURE target controls now permit **+6% allocations**;
+normal min3 instructions retain **+5%**, with strict target zero leaks. The 96 target
+samples are complete: maxima are +5.5652% allocations and +2.2461% instructions.
+Current Numeric composition approves exactly 45 allocation fields (+600–700) and syntax instructions at 68.8M.
+All other caps and both new-fixture bounds stay fixed; the old 17-field +700 approval is not stacked.
+The HOST6852/a362 proxy keeps its +5% contract and report-only FULL EXIT TOTAL accounting:
+25,631,262 allocations/role with 571,067 leaks/39,186,366 bytes; no strict-zero/schema1 claim.
+All 968 identity calls (484 pairs) and eight host samples are complete. Original FAIL receipts
+and SOURCE +3% contracts remain unchanged; components are 3,601/0 and native acceptance is 1,135/0 with all 408 cost checks passing.
 
 Stop for any cap breach, semantic mismatch, unexplained C change or new mechanism. Never roll B, refreeze after failure or silently expand scope. M8 remains the unchanged eventual real-source fixpoint proof.

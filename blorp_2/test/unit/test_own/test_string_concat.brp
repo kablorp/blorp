@@ -1,4 +1,8 @@
 import:
+	../../../src/check/check: check
+	../input: setup_diagnostic
+	../module_input: parse_modules
+	../string_concat_inputs: APPEND_INT_CALLER, APPEND_INT_METHOD
 	../../../src/lower/lower as Lower
 	../../../src/namespace/builtins as Builtins
 	../../../src/own/own as Own
@@ -66,9 +70,44 @@ pure func test_unused_concat_result_is_dropped_once() -> Bool:
 				Err(_): False
 
 
+pure func test_append_int_releases_formatted_digits_and_transfers_fresh_result() -> Bool:
+	match parse_modules([
+		{ source = APPEND_INT_CALLER, targets = [1] },
+		{ source = APPEND_INT_METHOD, targets = [] },
+	])
+		.and_then(pure func(parsed): check(parsed).map_err(setup_diagnostic))
+		.and_then(Concrete.specialize).and_then(Lower.lower).and_then(Own.own):
+		Err(_): False
+		Ok(program):
+			match program.functions:
+				[_, wrapper, _, _]:
+					match (wrapper.operations, wrapper.tail):
+						([Own.DefineValue(prefix), Own.DefineValue(number),
+							Own.DefineValue(digits), Own.DefineValue(result), Own.DropOwner(dropped, _)],
+							Own.ReturnTail(Own.ReturnResult(Own.OwnedReturn(returned, transferred)))):
+							match (digits.operation, digits.result, result.operation, result.result):
+								(Own.CallDefinition(_, [Own.UnmanagedArgument(argument)]), Own.OwnedResult(digits_owner),
+									Own.CallDefinition(_, [Own.BorrowedArgument(left), Own.BorrowedArgument(right)]), Own.OwnedResult(result_owner)):
+									match (left.source, right.source):
+										(Own.ParameterBorrow(borrowed_prefix), Own.OwnerBorrow(borrowed_digits)):
+											(Lower.value_number(argument) == Lower.value_number(number.id)
+												and Lower.value_number(left.value) == Lower.value_number(prefix.id)
+												and Lower.value_number(borrowed_prefix) == Lower.value_number(prefix.id)
+												and Lower.value_number(right.value) == Lower.value_number(digits.id)
+												and Own.owner_number(borrowed_digits) == Own.owner_number(digits_owner)
+												and Own.owner_number(dropped) == Own.owner_number(digits_owner)
+												and Own.owner_number(transferred) == Own.owner_number(result_owner)
+												and Lower.value_number(returned) == Lower.value_number(result.id))
+										_: False
+								_: False
+						_: False
+				_: False
+
+
 tests: TestSuite = {
 	description = "Blorp 2 String concat contract and ownership insertion",
 	tests = [
+		("append_int releases digits and transfers fresh result", test_append_int_releases_formatted_digits_and_transfers_fresh_result),
 		("contract is Pure String String to String", test_concat_contract_is_pure_two_strings_to_string),
 		("aliased inputs borrow and fresh result transfers", test_concat_borrows_aliased_inputs_and_transfers_its_fresh_owner),
 		("unused fresh result drops once", test_unused_concat_result_is_dropped_once),

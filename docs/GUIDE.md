@@ -26,6 +26,8 @@ module provides concrete wrapping `add`. Closed builtin bodies
 require their exact runtime signature. Quoted String literals accept valid UTF-8
 and Unicode scalar escapes; String length and source locations count bytes.
 Literal construction, copies and returns use ordinary managed ownership.
+Its [ordinary `append_int` wrapper](../blorp_2/README.md#counted-string-operations)
+appends signed Int64 digits while preserving counted UTF-8 and NUL bytes.
 The pilot also supports the single-value `Void` type and `void` literal,
 ordered binding and Void expression statements, and explicitly imported
 concrete `io.print(String) -> Void`. Print borrows its String, writes all bytes

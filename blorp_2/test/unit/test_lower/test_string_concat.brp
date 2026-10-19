@@ -6,7 +6,7 @@ import:
 	../../../src/utils/source: module_source, root_module_id, same_source
 	../input: setup_diagnostic
 	../module_input: parse_modules
-	../string_concat_inputs: CONCAT_SOURCE
+	../string_concat_inputs: CONCAT_SOURCE, APPEND_INT_CALLER, APPEND_INT_METHOD
 	test: TestSuite
 
 
@@ -40,7 +40,55 @@ pure func test_concat_lowering_preserves_operands_span_and_result() -> Bool:
 				_: False
 
 
+pure func test_append_int_formats_then_concatenates_in_argument_order() -> Bool:
+	match parse_modules([
+		{ source = APPEND_INT_CALLER, targets = [1] },
+		{ source = APPEND_INT_METHOD, targets = [] },
+	])
+		.and_then(pure func(parsed): check(parsed).map_err(setup_diagnostic))
+		.and_then(Concrete.specialize).and_then(Lower.lower):
+		Err(_): False
+		Ok(program):
+			match Lower.lowered_functions(program).functions:
+				[_, wrapper, format, concat]:
+					match (wrapper.steps, wrapper.tail):
+						([
+							Lower.Define(prefix), Lower.Define(number),
+							Lower.Define(digits), Lower.Define(result)
+						], Lower.ExitValue(Lower.ReturnValue(returned))):
+							match (prefix.operation, number.operation, digits.operation, result.operation):
+								(Lower.ParameterValue(0), Lower.ParameterValue(1),
+									Lower.CallValue(format_call, [format_argument]),
+									Lower.CallValue(concat_call, [left, right])):
+									match (format_call, concat_call, format.steps, concat.steps):
+										(Concrete.UserFunction(format_id), Concrete.UserFunction(concat_id),
+											[Lower.Define(_), Lower.Define(conversion)],
+											[Lower.Define(_), Lower.Define(_), Lower.Define(addition)]):
+											match (conversion.operation, addition.operation):
+												(Lower.CallValue(convert, [_]), Lower.CallValue(add, [_, _])):
+													match (convert, add):
+														(Concrete.RuntimeFunction(Builtins.IntToString), Concrete.RuntimeFunction(Builtins.StringConcat)):
+															(Concrete.function_number(format_id) == 2 and Concrete.function_number(concat_id) == 3
+																and Concrete.same_type(prefix.value_type, Concrete.StringType)
+																and Concrete.same_type(number.value_type, Concrete.IntType)
+																and Concrete.same_type(digits.value_type, Concrete.StringType)
+																and Concrete.same_type(result.value_type, Concrete.StringType)
+																and Lower.value_number(format_argument) == Lower.value_number(number.id)
+																and Lower.value_number(left) == Lower.value_number(prefix.id)
+																and Lower.value_number(right) == Lower.value_number(digits.id)
+																and Lower.value_number(returned) == Lower.value_number(result.id))
+														_: False
+												_: False
+										_: False
+								_: False
+						_: False
+				_: False
+
+
 tests: TestSuite = {
 	description = "Blorp 2 String concat lowering",
-	tests = [("ordered operands and source occurrence survive lowering", test_concat_lowering_preserves_operands_span_and_result)]
+	tests = [
+		("ordered operands and source occurrence survive lowering", test_concat_lowering_preserves_operands_span_and_result),
+		("append_int formats then concatenates in argument order", test_append_int_formats_then_concatenates_in_argument_order),
+	]
 }

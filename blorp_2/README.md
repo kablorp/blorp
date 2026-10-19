@@ -1856,6 +1856,10 @@ sees instances, not declarations, and deliberately does not repeat that check.
 
 ## Counted String operations
 
+`string.append_int(self: String, value: Int) -> String` appends signed Int64 decimal digits.
+The ordinary pure wrapper preserves UTF-8/NUL prefix bytes and earlier aliases.
+The [append plan](APPEND_INT_PLAN.md) records fixtures, ownership and resource bounds.
+
 The target `string.add(left: String, right: String) -> String` is pure and
 returns one fresh concatenation. It borrows both operands, including when they
 alias, and preserves exact counted bytes, including NUL and UTF-8. Empty

@@ -17,6 +17,8 @@ receive it. Import cycles, including self-imports, are rejected, and modules
 under the library root cannot import user modules. Concrete
 functions may use a sole closed builtin body, including `builtin("int.add")`,
 with an exact runtime signature.
+The ordinary [pilot `append_int` API](../blorp_2/README.md#counted-string-operations)
+uses the existing function-call and UFCS grammar.
 Imports preserve declaration identities; only the root module's local `main`
 is the entrypoint. It takes either no parameters or one List[String] parameter
 and returns Int or Void. Omitting a function's return annotation means Void.
