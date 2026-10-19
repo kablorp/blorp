@@ -9,6 +9,11 @@ Signed Int update: all 14 called Int APIs and both constants are now declared;
 37 called names are present and 28 absent. The source-demand snapshot below is
 unchanged; the [numeric report](../benchmarks/results/blorp_2_int_comparisons_2026-10-19.md) records validation.
 
+An [isolated library integration probe](../benchmarks/results/blorp_2_library_namespace_frontier_2026-10-19.md)
+has passed namespace and signature checking on the actual compiler source. Its
+next failure is the overlapping String receiver on `utils/text.equals`; the
+pending cohort is not merged and does not change the accepted API counts below.
+
 The compiler's 41 source modules use **65 resolved library functions at 2,408
 distinct call sites**. The target library declares 30 of those names; **35 names
 and two Int constants are absent**. Two missing names need source migrations to
