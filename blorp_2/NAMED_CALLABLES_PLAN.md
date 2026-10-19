@@ -40,6 +40,13 @@ branches, or substituted for ordinary data type parameters. Lambdas retain
 their current rejection throughout this increment. No function-pointer ABI,
 closure runtime, synthesized source, registry or new checking framework follows.
 
+Existing data-receiver UFCS for declared helpers remains supported, such as
+`present.get_or(default)`. Invoke a callable parameter directly as `f(value)`.
+This increment rejects both `value.f()` when f is a callable parameter and
+`f.use(value)` when f would be a static receiver. Pin exact diagnostics/help
+that teach the corresponding direct call; do not report a visible callback as
+an unknown function or expand receiver handling silently.
+
 ## Fact ownership
 
 | Fact | Producer and owner | Consumer |
@@ -194,12 +201,40 @@ owner; it must not add a runner or replace a fixture main.
 
 ## Prospective scope and costs
 
-The concrete point forecast is 725 production additions/+560 net, and 450–550
-test additions. Hard ceilings, fixed before edits: **900 production additions /
-+700 net**, **650 test additions / +600 net**. Report test/production growth
-separately and count moves honestly. At 800 additions/+620 net, stop to assess
-the remaining work rather than compressing code or deleting coverage. No
-preparatory refactor is presently justified.
+The original point forecast was 725 production additions/+560 net and 450–550
+test additions, with prospective hard limits of 900 production additions/+700
+net and 650 test additions/+600 net. That estimate did not cover the complete
+review-ready path. It is retained as failed estimation evidence, not described
+as a completed feature within allowance.
+
+Before specialization began, implementation stopped at the
+[checker checkpoint](../build/bootstrap-evidence/named-callables-2026-10-18/worker/checker-checkpoint01/):
+**657 production additions / 129 deletions / +528 net**, below the original
+hard limits. Only the two checker callbacks passed; no whole-compiler cost or
+native acceptance follows from this partial product. The independent remaining
+point estimate is 330 additions/103 deletions/+227 net, covering ordered keys,
+preparation/forwarding/provenance, ten translator consumers, erasure and tail
+restrictions. Necessary admission and diagnostic fixes also remain.
+
+The prospective revision before further compiler edits keeps the same named
+semantics and mechanisms. Its forecast is **1,000–1,050 production additions /
++800–830 net**; revised hard limits are **1,100 additions / +850 net**, with an
+assessment stop at **1,000 additions or +780 net**. Reaching that stop requires
+a remaining-work/count review, not automatic continuation toward the hard limit.
+The **650 test additions / +600 net** limits and the initial-M7 cumulative
+allocation/instruction ceilings below remain unchanged. No baseline roll,
+stacked allowance, compressed formatting or coverage deletion supplies room.
+Report production and test growth separately; count moves honestly.
+
+Keep ordinary type substitutions and resolved callable choices as narrow
+translator inputs. A proposed FunctionSubstitution carrier did not reduce the
+actual physical diff and is not introduced to chase the ceiling. Publish
+callable parameter TypeUses once at scope construction, borrowing them during
+invocation rather than rebuilding annotations. A named callback candidate whose
+own signature has callable parameters is rejected: it would nest a callable
+child and could bind an ordinary generic parameter to a callable type. Preserve
+first-child error/short-circuit behavior in callable hint/readiness traversal.
+No preparatory framework or broader inference refactor is authorized.
 
 Freeze a matching current normal/diagnostic host pair, host library, source
 inputs, tools/flags and explicit commands. Copy B and C source into pinned,
