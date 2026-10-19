@@ -147,3 +147,8 @@ Exact B/artifact pins, test postimages, current controls/corpus and actual physi
 counts require review before any setup/sampling lease. No compiled calls follow
 plan publication automatically; final code-reviewer/test-runner reviews precede
 root-only current-main integration, full destination gates and publication.
+
+Cost-stop exception: after review, root may grant remaining planned finite correctness/cost calls once.
+Keep B, semantics, thresholds/caps and original samples/FAILs; no retries, resampling or merge.
+Relative/absolute budget misses stay FAIL; the unchanged native umbrella may finish/report all fixed fields.
+All non-budget failures still stop immediately; data serves only a bounded proposal, never budget acceptance.
