@@ -137,6 +137,10 @@ this slice alone does not clear the current self-compilation frontier.
 
 ### 2. Support the pure callable forms the census actually uses
 
+[NAMED_CALLABLES_PLAN.md](NAMED_CALLABLES_PLAN.md) owns the first increment:
+named pure references, forwarding and direct-call specialization. Lambdas and
+immutable captures follow under a separately reviewed increment.
+
 Parsing is complete; semantic function types, function values, invocation and
 lambda execution are not. Start with a small end-to-end generic `apply`
 witness using a named pure function, then one using an immutable managed
