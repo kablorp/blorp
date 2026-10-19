@@ -1,216 +1,134 @@
-# List[Int] membership through one borrowed runtime scan
+# Supplied-equality List membership in ordinary Blorp
 
-## Status and problem
+## Decision and scope
 
-Root and independent architecture review approve this bounded plan before
-publication. Implementation requires a separate explicit root authorization;
-compiled work requires an explicit lane. Accepted B is
-`5b5985ffc385c89541dee2d997c2d3c0ad53f65b`; C is exactly B plus this feature.
-The current host builds A and all 41 source modules parse, but A's actual source
-probe first rejects `list: contains` at `src/verify/verify.brp:8:8`.
-The two current calls are `levels.contains(level)` at `lex/lex.brp:1156`, with
-`levels: List[Int]`, and `seen.contains(field_number(field.field))` at
-`verify/verify.brp:1080`, with `seen: List[Int]`. This is a source-inspected
-census, not a new resolved-call dump. Correct the stale third site and M3
-prerequisite in LIBRARY_PARITY's contains row; preserve unrelated historical rows.
+This revision replaces the native builtin design at root's/user's direction.
+The earlier published plan remains in Git history; it is not implementation or
+performance evidence. Root and an independent peer review/publish this revision
+before a separate implementation grant. No compiled job follows plan approval.
+Fixed B remains accepted `5b5985ffc385c89541dee2d997c2d3c0ad53f65b`;
+its 41 compiler sources and target library equal the docs-only plan base.
 
-Provide the concrete target-only signature `contains(List[Int], Int) -> Bool`.
-No host library, generic equality/traits, lambdas, source loops, HOF removal,
-compiler-source call migration or other missing List helper enters this slice.
-Lower/Own/Verify production stays unchanged; tests may inspect their contracts.
-Existing prelude `list: List methods_only` already offers receiver methods;
-explicit imports offer direct calls. No prelude change is expected.
-The unrelated numeric, M3 and lambda candidates remain held and unmodified.
+Current main parses all 41 sources; A's source probe rejects `list: contains`
+at verify/verify.brp:8:8. There are two current calls, levels:List[Int] at
+lex/lex.brp:1156 and seen:List[Int] at verify/verify.brp:1080. Retain both calls.
+Add permanent useful generic supplied-equality contains_with and a concrete Int
+compatibility adapter contains. The temporary restriction is the Int adapter
+and the indexed recursive implementation, not the generic supplied-equality API.
+A unary predicate API is any; it would require captured needles at these calls.
+Named binary equality avoids captures. Lambdas, traits and source loops stay out.
 
-## Current code and direct change
+Production changes only standard_library/list.brp. Keep every old API and add
+Bool(True, False) to its existing _base import plus `int as IntOps`.
+The prelude already offers List methods; no prelude or host library change.
+No compiler, builtin tag/contract, RuntimeType/Operation, runtime C, Lower/Own/
+Verify/Emit, generic inference or callback-tail admission changes are permitted.
 
-`standard_library/list.brp:2-3` currently imports:
+## Exact ordinary implementation
+
 ```blorp
-import:
-    _base: Int, List, Option(Some, None)
+pure func contains_with[A](values: List[A], needle: A, equals: pure (A, A) -> Bool) -> Bool:
+    contains_from(values, needle, equals, 0)
+
+private pure func contains_from[A](values: List[A], needle: A, equals: pure (A, A) -> Bool, index: Int) -> Bool:
+    match get(values, index):
+        None: False
+        Some(element):
+            match equals(element, needle):
+                True: True
+                False: contains_from(values, needle, equals, IntOps.add(index, 1))
+
+pure func contains(values: List[Int], needle: Int) -> Bool:
+    contains_with(values, needle, IntOps.equals)
 ```
-Add Bool to that selection and one ordinary declaration, keeping every old API:
-```blorp
-pure func contains(values: List[Int], value: Int) -> Bool:
-    builtin("list.contains")
-```
-This is nongeneric and pure. String/Float/Void/opaque elements are not silently
-coerced to Int. An opaque wrapping Int remains distinct at Check; callers must
-explicitly unwrap before constructing an accepted List[Int].
 
-`namespace/builtins.brp:99-102` currently has:
-```blorp
-fixed union RuntimeType[Element]:
-    PrimitiveRuntimeType(PrimitiveType)
-    ElementRuntimeType(Element)
-    ListRuntimeType(Element)
-```
-Add the precise nullary `IntegerListRuntimeType` alternative, not fake Element
-metadata. Add `ListContainsInt(DesignatedBoolean[Variant])` to RuntimeOperation.
-Its sole runtime_contract arm is Pure, with parameters
-`[IntegerListRuntimeType, PrimitiveRuntimeType(BuiltinInt)]` and
-`BooleanResult(boolean)`. Existing Check and concrete runtime_type_ref map the
-new alternative to `ListType(IntType)`. All generic consumers then share this
-contract, including borrowing and independent verification.
+Style may wrap signatures normally; physical budgets include that formatting.
+Arguments evaluate once in written order. Each existing element is compared at
+most once, in order; empty returns False, first True stops, exhausting returns
+False. get validates the index before increment: index starts0 and the final
+increment is at most length, hence at most INT64_MAX. The callback receives
+borrowed values under existing contracts; get/Some/payloads incur ordinary ARC.
+Use no slice/take/drop, unsupported if/while, fake callback or hidden builtin.
 
-At `check/signatures.brp:337-390`, accepted_operation already constructs
-`IntegerEqualsBuiltin: Ok(Builtins.IntEquals(boolean))`; add the analogous
-ListContainsBuiltin arm with the actual site.designated.boolean. Default
-nongeneric header validation at 422-425 must apply; do not place the new tag in
-the generic List-tag exemption. Existing contract equality rejects wrong arity,
-purity, generics, element types and foreign Bool identity at the builtin label.
-Help: `declare a pure nongeneric function with List[Int] and Int parameters returning Bool`.
+This is ordinary recursion: O(n) work and linear C stack at -O0. No bounded-stack,
+zero-allocation, zero-ARC or 65k-list guarantee is claimed. Test a modest64-element
+repeat and document this implementation limit. Annotation is not a fix: current
+Check rejects generic/callable @tail_recursive headers, and Own rejects managed
+source-tail state. Source-loop/callback-tail/capture work remains separate.
 
-At `specialize/specialize.brp:2315-2322`, IntEquals translates its actual
-constructors with translate_boolean. Add the same direct ListContainsInt arm;
-retain both real VariantInstanceIds. No hard-coded union/variant ordinals or
-spelling tests, no new semantic key or concrete layout.
+## Bounds, tests first and gates
 
-At `emit/emit.brp:1342-1395`, append_equals already evaluates a binary condition
-and selects c_union_value(boolean.true_variant/false_variant). Rename only this
-internal concept to BooleanTest/append_boolean_test, retaining the existing
-String/Int condition bytes, and add IntegerListContainsTest with condition
-`blorp_list_contains_int(list_local, needle_local)`. No new comparison framework.
+Forecast production28 ADD/1 DEL/+27 in one target module, hard40 ADD/+40 net.
+Tests hard500 ADD/+500 net; one real-main fixture <=60 physical lines;
+API docs <=45 ADD, this plan <=140 physical lines, final report <=80 lines.
+Preserve all old assertions and readable formatting; stop before any bound.
+Update target README, parity's stale third-site/M3 dependency, scoped README and
+narrow GUIDE/GRAMMAR API references; no new language syntax or general cleanup.
 
-`runtime/list.brp:151` already emits the typed scalar list struct from its key:
-`struct blorp_l_0_i{atomic_size_t references;int64_t length;int64_t values[];};`
-The nullary list_contains_int_runtime() fragment derives its local Int key with
-list_element_key(IntType), then list_c_type(key), whose spelling projection uses
-list_suffix(key). It accepts no caller-supplied layout. The following C illustrates that current key,
-not a hardcoded spelling in the generator. Emit the fragment once only when the
-operation occurs, after complete typed list structs and before function bodies:
-```c
-static int blorp_list_contains_int(const struct blorp_l_0_i *values, int64_t value) {
-    for (int64_t index = 0; index < values->length; index++) {
-        if (values->values[index] == value) return 1;
-    }
-    return 0;
-}
-```
-The predicate's C 0/1 is converted to the designated Bool by emission; it is
-never used as a language tag. The bounded index cannot overflow: the last
-increment is at most INT64_MAX. Empty lists never dereference a slot. The scan
-has constant stack, no allocation, mutation, ARC operation or element callback.
-Selection reads the existing ProgramInventory.runtime_calls; do not infer
-membership demand from a type, path, helper name or generic element placeholder.
-Keep aggregate_runtime and emit consistent; no helper on unchanged programs.
+Root observed the exact private visitor/public forwarding shape GREEN on
+unchanged A892c24a1: normal CLI compile, unmodified C11-O0 link and real main all
+exited0 with empty stdout/stderr; all144 precompile pins matched.
+Evidence: `build/bootstrap-evidence/list-contains-2026-10-19/source-prototype01/`.
+This is correctness evidence, not a measurement.
+Do not repeat that prototype. Before adding library helpers, compile the new
+real-main fixture on B: exact missing-export message/help/source span, exit1,
+empty stdout and no C. Only after observed API RED may library code be written.
 
-## Ownership, production and documentation budgets
+Use existing test_check/test_generics and e2e/test_lists owners/public helpers.
+Test actual API calls with named/imported predicates and exact wrong arity,
+input/result/purity diagnostics (kind/help/span), retaining all old assertions.
+Normal-main positives cover generic Int/String/managed values and supplied
+asymmetric equality. Full existing ownership/verification/sanitizer gates protect
+unchanged compiler algorithms; do not add malformed ownership IR, a callback-
+count visitor, six-phase scaffolding or mirror helper implementation structure.
+Add a focused phase assertion only for a necessary new fact. This pure API's
+runtime call count is not claimed observable through output or a typed-tree count.
 
-| Production owner | Forecast ADD | DEL | Net |
-| --- | ---: | ---: | ---: |
-| utils/syntax.brp | 2 | 1 | 1 |
-| parse/parse.brp | 5 | 2 | 3 |
-| namespace/builtins.brp | 22 | 3 | 19 |
-| check/signatures.brp | 7 | 3 | 4 |
-| specialize/specialize.brp | 10 | 3 | 7 |
-| runtime/list.brp | 16 | 0 | 16 |
-| emit/emit.brp | 58 | 10 | 48 |
-| standard_library/list.brp | 4 | 1 | 3 |
-| Total point forecast | 124 | 23 | 101 |
+One normal fixture contains Int signed extrema/wide values, String UTF8/NUL,
+managed record equality using a named callback, supplied custom equality,
+empty/miss/first+last hits, aliases, a one-print eager needle and64-element repeat.
+Freeze exact exit0/stdout/stderr before RED. New-only compile caps remain45000
+allocations/200M diagnostic instructions AND200M normal min3. No successful B
+is invented. Original caps/strict0/C11-O0/ASan/UBSan/required counters remain.
+Prove two meaningful library oracles with separately restored source faults:
+return True for exhausted/missing input, and reverse equals(element,needle).
+An asymmetric supplied comparator must distinguish the latter from the correct
+argument order; empty/miss output must distinguish the former. Freeze minimal
+patches and required named semantic FAILs before leases. Setup/resource failure
+is not a kill. Restore exact bytes/modes/pins and semantic index before
+classification, then same-owner GREEN. No compiler-drop mutation/private hook.
 
-Production expectation 110-150 ADD/+90-120 net; reassess before crossing
-150 ADD or +120 net, hard 180 ADD/+150 net. Tests hard 650 ADD/+600 net,
-excluding one real-main fixture of at most 60 physical lines. Forecast 520 test
-ADD and 45 fixture lines; stop before writing beyond any bound, not afterward.
-API docs hard 45 ADD, this plan forecast at most 220 physical lines, final
-measurement report hard 80 physical lines, all counted separately. Preserve
-readable formatting and existing coverage; no deletion/formatting budget tricks.
-Docs: target library README, LIBRARY_PARITY, scoped README/grammar.ebnf builtin
-label/help and narrow GUIDE/GRAMMAR API cross-references. No general stale-doc cleanup.
-Parser/ergonomics review precedes the one new closed builtin label; generic
-language syntax is unchanged. Root publishes the reviewed plan before code.
+After focused GREEN, run whole components/runtime/grammar and full native once
+with unchanged real mains and harness. Reuse exact source-matched A for native;
+compiler source is unchanged, so no fresh host generation or relink is required.
+Read ordinary CLI fixture C for direct calls, forwarding and ARC. Run one actual
+source frontier; the next missing helper is not self-compilation/fixpoint proof.
 
-## Tests first and finite correctness acceptance
+## Fixed costs and output identity
 
-Start with the actual ordinary real-main fixture importing list.contains,
-expecting exact missing-export diagnostic/help/source span, exit1 and no C on B.
-A baseline-compatible parser/check TestSuite must also demonstrate the new
-closed label's rejection before implementation, not missing enum/import setup.
-After implementation, retain the exact unknown-label/help oracle for misspelling
-and exact builtin contract message/help/label span for wrong list, second
-argument, result, foreign Bool, opaque element, purity, generic header and arity.
-Check actual designated IDs and accepted signature; Specialize checks translated
-IDs and exact List[Int]/Int types. Swap the designated foundation Bool order
-in a phase input to prove that emission selects identities rather than C tags.
+C is only the complete B target library plus these helpers, tests and docs.
+Reuse verified A892c24a1 with source41/library12, retained generated C, toolchain,
+flags/modes and ROOT974/STD91 provenance checked before/after. ROOT974 remains
+immutable FRESH; no host rebuild/install or gratuitous HOST cost campaign.
+The original supporting HOST+3% ceiling is preserved, but source/C/binary bytes
+are unchanged and this slice claims no new host performance measurement.
 
-Use existing owners: test_parse/test_parse, test_check/test_signatures,
-test_specialize/test_specialize, test_own/test_generic_list_phases,
-test_verify/test_boolean_contracts, test_emit/test_list_phases,
-test_runtime/test_list, runtime/test_generic_list, e2e/test_lists. Reuse their
-public phase helpers and normal RuntimeCase mechanism; no parallel harness.
-Own must borrow the actual managed List, keep Int/Bool unmanaged, preserve
-aliases and drop a fresh list once at last use. Verify independently rejects
-a raw dead-owner borrow without consulting Own's schedule. Emit tests require
-one selected helper after its struct, real argument order/occurrence identities,
-actual Bool variants, and omission when unused. Read the emitted native C.
-
-One <=60-line `fixtures/list/contains_int.brp` real main covers empty, first/last
-hit, miss, duplicates, signed MIN/MAX and 32-bit narrowing guards, an alias, an eagerly
-evaluated needle with one observable print, and repeat(7,65536) hit/miss.
-Prewrite exact exit0/stdout bytes/empty stderr; prospective new fixture caps
-45000 compiler allocations and 200M diagnostic instructions AND normal min3.
-Existing caps never change. RuntimeCase observes allocation-counter endpoints
-around the scan itself (zero new allocations/releases), preserved contents and
-edge results; this approved helper test is separate from normal-main execution.
-
-Require effective separately restored faults: hit test inverted (native exact
-output FAIL), mapped true/false constructor choice swapped (phase/native FAIL),
-and removed owner liveness/drop protection caught by the chosen typed ownership
-oracle. Freeze exact minimal patches/required named failures before their leases;
-setup/type/resource failure is not a semantic kill. Restore bytes and modes,
-semantic index and all input pins, then run the same owner GREEN after each.
-No generated C rewriting, fixture-main replacement or new runtime instrumentation.
-
-Focused commands use absolute ROOT/bin/blorp test --suite --timeout180 with
-explicit ROOT/standard_library/src and the existing owning paths. Then run the
-whole unit/runtime/grammar gate, generate C once with ROOT/bin/blorp, link O0
-normal0 and diagnostic1 from that same unmodified C, and run the full e2e umbrella
-with explicit BLORP2_COMPILER and required instructions/strict0/C11/ASan/UBSan.
-Reuse a verified exact producer only when its source matches; this feature
-changes compiler source, so an old A is B evidence, never C validation.
-Run the actual source frontier once after GREEN; a later missing helper is not
-self-compile/fixpoint acceptance. Root leases finite literal commands separately.
-
-## Frozen resource and identity boundary
-
-Before implementation freeze B's 41 source modules, complete target library,
-all 498 current e2e fixture .brp files, support inputs and every existing cap.
-Freeze C's exact source/library scope and physical active paths before samples.
-Supporting normal/diagnostic producers, clang, flags and explicit std directory
-must match across B/C. ROOT974/STD91 is functional only, immutable and FRESH;
-no install/rebuild of it. Root names matched B/C target pairs after source freeze.
-
-Eight unchanged relative-cost controls: return/zero.brp; list/zero.brp;
+Freeze the eight unchanged target controls: return/zero.brp; list/zero.brp;
 list/literal_int.brp; list/literal_empty.brp; list/append_int.brp;
-list/set_int.brp; list/concat_int.brp; list/entries.brp (under e2e/fixtures).
-For EACH: +5% target, +10% hard independently for full EXIT TOTAL compiler
-allocations and normal minimum of three retired-instruction samples, plus every
-tighter old absolute. Report every 5% miss; stop at the first 10%/absolute breach.
-Eight samples per control: B1,C1,B2,C2,B3,C3 normal, then strict diagnostic B/C;
-positive counters, balanced strict0 and within-role/B-C target C identity required.
-The new-only fixture has diagnostic plus three original normal samples against
-its absolute caps; no fabricated successful B denominator.
+list/set_int.brp; list/concat_int.brp; list/entries.brp, under e2e/fixtures.
+Each independently retains +5% allocation/normal-min3 targets, +10% hard ceilings
+and all tighter old absolutes. Eight original samples per control: normal
+B1,C1,B2,C2,B3,C3, then diagnostic B/C (64 total); positive counters, full EXIT
+TOTAL, strict balanced0, within-role and B/C exact target C identity. Report each
+5% miss, stop at first10%/absolute or semantic/accounting/provenance failure.
+New fixture: one diagnostic plus three normal samples against its absolute caps.
+Switch complete libraries only in one owned active physical path with the same
+source/output/CWD/argv. No successful new-input B, resampling or baseline roll.
 
-For all 498 unchanged file inputs require exact CLI status/stdout/stderr/C and
-output-presence identity (including rejection/no-C cases) with one normal B/C
-pair per file. Same physical source/library/output path and CWD via owned
-payloads, complete B/C libraries, explicit flags; never compare different paths,
-normalize C or adapt B. Separate API RED/new input and actual-source frontier
-have intentional transitions and do not enter this identity corpus. This is
-996 identity calls, 64 control samples and four C-only samples; no claim that
-all 498 inputs received relative samples. No SOURCE campaign or M7 baseline roll.
-
-The supporting HOST proxy separately retains original normal34ac1a91 /
-diagnosticbe31a5a3 / STD090ed68c and complete598 provenance, verified before
-reuse. Eight original matched serial calls: diagnostic B/C and normal
-B1,C1,C2,B2,B3,C3. Schema1 artifact_construction_complete.total_allocations and
-normal min3 each have independent +3% hard limits; not full EXIT TOTAL and not
-ROOT974 substitution. Target full EXIT TOTAL remains a distinct metric role.
-Freeze literal argv/CWD/pins/expected output states before each finite lease.
-
-Stop on semantic, setup, identity, accounting, provenance, scope or hard-cost
-failure; retain original logs/samples, restore active C payloads/faults and return
-the lane. No resample, baseline roll, cap change, hidden repair or new mechanism.
-Two independent code/test-runner reviews and full current-source gates precede
-root-only integration/push. This plan authorizes neither lambda nor loop work.
+All498 unchanged current file inputs get one normal B/C identity pair (996 calls):
+exact status/stdout/stderr/C/output-presence, including rejected/no-C states.
+No claim of relative sampling all498. Existing finite command protocols own
+execution; freeze literal commands/inputs/states and review before each lease.
+Retain every old failure and native-plan draft. Stop for scope, stack, semantic,
+setup, identity, provenance or hard-cost breach, restore C/faults and RETURN.
+Two final independent code/test-runner reviews precede root-only integration.
