@@ -16,7 +16,7 @@ import:
 		match_error,
 		statement_error,
 		UnsupportedForm(
-			LocalAnnotation, NestedPattern, OrPattern, ListPattern, StringPattern, CharPattern, QualifiedPattern, Propagation,
+			NestedPattern, OrPattern, ListPattern, StringPattern, CharPattern, QualifiedPattern, Propagation,
 			WhileStatement, ForStatement,
 		),
 		unsupported_form,
@@ -51,7 +51,7 @@ import:
 		union_occurrence,
 	./recursion: check_execution
 	./signatures: AcceptedBody(BuiltinBody, MatchBody, ValueBody), AcceptedFunction
-	./declarations: CheckedDeclarations
+	./declarations: CheckedDeclarations, resolve_type
 	./constructors: VariantContract, find_variant
 	./expressions: check_value, synthesize_value
 	./scope: ScopedValue(DataLocal, CallableLocal), LocalBinding, bind_callable, callable_binding_id, bind_local, binding_site, binding_definition, local_binding_id, lookup_binding
@@ -778,12 +778,9 @@ private pure func resolve_statements(
 		None:
 			Ok(block)
 		Some(BindingStatement(binding)):
-			match binding.annotation:
-				Some(annotation): Err(unsupported_form(type_span(annotation), LocalAnnotation))
-				None:
-					match resolve_assignment(binding, block, context):
-						Ok(next): resolve_statements(written, next, context)
-						Err(error): Err(error)
+			match resolve_assignment(binding, block, context):
+				Ok(next): resolve_statements(written, next, context)
+				Err(error): Err(error)
 		Some(PropagatingBinding(propagation)):
 			Err(unsupported_form(propagation.span, Propagation))
 		Some(WhileLoop(loop)):
@@ -809,24 +806,44 @@ private pure func resolve_statements(
 				Err(error): Err(error)
 
 
+-- Resolve a declaration's annotation before its initializer. Propagation stays
+-- at this function's top level, as required by the compiler's source subset.
+private pure func resolve_initializer(
+	written: ParsedBinding,
+	block: ResolvedStatements,
+	context: ResolutionContext,
+) -> Result[ResolvedValue, CheckError]:
+	expectation ?= match written.annotation:
+		None: Ok(UntypedValue)
+		Some(annotation):
+			match resolve_type(context.body_types, annotation):
+				Ok(value_type): Ok(CheckedAgainst(value_type, SourceAnnotation(type_span(annotation))))
+				Err(error): Err(error)
+	resolve_value(block, written.initializer, expectation, context)
+
+
 private pure func resolve_assignment(
 	written: ParsedBinding,
 	block: ResolvedStatements,
 	context: ResolutionContext,
 ) -> Result[ResolvedStatements, CheckError]:
-	-- Existing assignment errors precede the RHS; an explicit var is a new declaration.
-	decision: Result[Option[LocalBinding], CheckError] = match written.mutability:
-		MutableBinding: Ok(None)
-		ImmutableBinding:
-			match lookup_binding(block.scope, written.name.id):
-				None: Ok(None)
-				Some(CallableLocal(binding)): Err(statement_error(written.name.span, CallableAssignment(callable_binding_id(binding))))
-				Some(DataLocal(binding)):
-					match binding_definition(binding).mutability:
-						Mutable:
-							Ok(Some(binding))
-						Immutable:
-							Err(statement_error(written.name.span, ImmutableAssignment(binding_site(context.caller.function, binding))))
+	-- An annotation or explicit var declares a binding. Plain assignment keeps
+	-- its existing error priority before checking the RHS.
+	decision: Result[Option[LocalBinding], CheckError] = match written.annotation:
+		Some(_): Ok(None)
+		None:
+			match written.mutability:
+				MutableBinding: Ok(None)
+				ImmutableBinding:
+					match lookup_binding(block.scope, written.name.id):
+						None: Ok(None)
+						Some(CallableLocal(binding)): Err(statement_error(written.name.span, CallableAssignment(callable_binding_id(binding))))
+						Some(DataLocal(binding)):
+							match binding_definition(binding).mutability:
+								Mutable:
+									Ok(Some(binding))
+								Immutable:
+									Err(statement_error(written.name.span, ImmutableAssignment(binding_site(context.caller.function, binding))))
 
 	reassign ?= decision
 
@@ -844,7 +861,7 @@ private pure func resolve_assignment(
 					)
 				Err(error): Err(error)
 		None:
-			match resolve_value(block, written.initializer, UntypedValue, context):
+			match resolve_initializer(written, block, context):
 				Ok(resolved):
 					value = resolved.value
 
@@ -993,8 +1010,9 @@ private pure func check_functions(
 					function = id,
 					purity = accepted.signature.purity
 				},
-				module = accepted.declaration.module,
-				namespace = namespace,
+				module = accepted.body_types.module,
+				namespace = accepted.body_types.namespace,
+				body_types = accepted.body_types,
 				signatures = functions,
 				unions = declarations.unions,
 				records = declarations.records,

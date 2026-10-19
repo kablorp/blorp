@@ -1,0 +1,534 @@
+import:
+	../../../src/check/check: CheckedProgram, check, checked_functions, check_errors
+	../../../src/check/errors as Errors
+	../../../src/check/model as Model
+	../../../src/check/render: render_failure
+	../../../src/namespace/namespace: Unoffered(PrivateName)
+	../../../src/parse/assemble: ParsedProgram
+	../../../src/utils/ids as Declaration
+	../../../src/utils/source: module_source, root_module_id
+	../../../src/utils/syntax: Diagnostic, DiagnosticNote(PreviousDeclaration), Span, same_span
+	../input: setup_diagnostic
+	../module_input: ModuleInput, TEST_BASE, parse_modules_with_base
+	test: TestSuite
+
+
+private MAIN: String = "func main() -> Int:\n    0\n"
+
+
+private pure func parsed(source: String) -> Result[ParsedProgram, Diagnostic]:
+	parse_modules_with_base([{ source = source, targets = [] }], TEST_BASE)
+
+
+private pure func checked(source: String) -> Result[CheckedProgram, Diagnostic]:
+	program ?= parsed(source)
+	check(program).map_err(setup_diagnostic)
+
+
+private pure func function(source: String, index: Int) -> Option[Model.CheckedFunction]:
+	match checked(source + MAIN):
+		Err(_): None
+		Ok(program): checked_functions(program).functions.get(index)
+
+
+private pure func span(start: Int, end: Int) -> Span:
+	{ source = module_source(root_module_id()), start = start, end = end }
+
+
+private pure func reads(value: Model.CheckedExpr, ordinal: Int) -> Bool:
+	match value.form:
+		Model.ReadBinding(id): Model.binding_number(id) == ordinal
+		_: False
+
+
+private pure func rejects(
+	program: Result[ParsedProgram, Diagnostic],
+	start: Int,
+	end: Int,
+	expected: pure (Errors.CheckErrorKind) -> Bool,
+	message: String,
+	help: String,
+	previous: Option[Span],
+) -> Bool:
+	match program:
+		Err(_): False
+		Ok(input):
+			match check(input):
+				Ok(_): False
+				Err(failure):
+					errors = check_errors(failure)
+					diagnostics = render_failure(failure)
+					error = diagnostics.first
+					note = match (error.note, previous):
+						(None, None): True
+						(Some(PreviousDeclaration(actual)), Some(written)): same_span(actual, written)
+						_: False
+					(errors.remaining.is_empty() and diagnostics.remaining.is_empty()
+						and expected(errors.first.kind)
+						and same_span(errors.first.span, span(start, end))
+						and same_span(error.span, errors.first.span)
+						and error.message == message and error.help == help and note)
+
+
+private pure func mismatch(
+	kind: Errors.CheckErrorKind,
+	expected: Model.TypeRef,
+	actual: Model.TypeRef,
+	annotation: Span,
+	initializer: Span,
+) -> Bool:
+	match kind:
+		Errors.ValueRejection(Errors.ExpressionTypeMismatch(value)):
+			match value.expected_site:
+				Errors.SourceAnnotation(written):
+					(Model.same_type(value.expected, expected)
+						and Model.same_type(value.actual.value_type, actual)
+						and same_span(written, annotation) and same_span(value.actual.span, initializer))
+				_: False
+		_: False
+
+
+pure func test_annotation_publishes_complete_binding_facts() -> Bool:
+	prefix = "pure func identity(input: Int) -> Int:\n    "
+	source = prefix + "answer: Int = input\n    answer\n"
+	match function(source, 0):
+		None: False
+		Some(selected):
+			match (selected.bindings, selected.statements, selected.body):
+				([_, local], [Model.InitializeBinding(id, value)], Model.CheckedValueBody(Model.ReturnExpression(result))):
+					match (local.origin, local.mutability):
+						(Model.BodyLocal, Model.Immutable):
+							(Model.same_type(local.value_type, Model.IntType)
+								and same_span(local.span, span(prefix.length(), prefix.length() + 6))
+								and Model.binding_number(id) == 1 and reads(value, 0) and reads(result, 1))
+						_: False
+				_: False
+
+
+pure func test_mutable_annotation_preserves_reassignment_and_old_alias() -> Bool:
+	source: String =
+		|pure func preserve(input: Int) -> Int:
+		|    var current: Int = input
+		|    old = current
+		|    current = 42
+		|    old
+		|
+	match function(source, 0):
+		None: False
+		Some(selected):
+			match (selected.bindings, selected.statements, selected.body):
+				([_, current, _], [Model.InitializeBinding(first, original), Model.InitializeBinding(old, prior_read), Model.ReassignBinding(next, replacement)], Model.CheckedValueBody(Model.ReturnExpression(result))):
+					match current.mutability:
+						Model.Mutable:
+							(Model.same_type(current.value_type, Model.IntType)
+								and Model.binding_number(first) == 1 and Model.binding_number(next) == 1
+								and Model.binding_number(old) == 2 and reads(original, 0) and reads(prior_read, 1)
+								and reads(result, 2) and Model.same_type(replacement.value_type, Model.IntType))
+						_: False
+				_: False
+
+
+pure func test_generic_annotation_reuses_signature_parameter_identity() -> Bool:
+	source: String =
+		|pure func preserve[T](value: T) -> T:
+		|    answer: T = value
+		|    answer
+		|
+	match function(source, 0):
+		None: False
+		Some(selected):
+			match (selected.signature.type_parameters, selected.bindings, selected.statements):
+				([parameter], [_, local], [Model.InitializeBinding(id, value)]):
+					match local.value_type:
+						Model.ParameterType(actual):
+							match Model.parameter_owner(actual):
+								Model.FunctionDeclaration(owner):
+									(Model.same_parameter(actual, parameter) and Model.parameter_position(actual) == 0
+										and Declaration.function_number(owner) == Declaration.function_number(selected.id)
+										and Model.binding_number(id) == 1 and reads(value, 0))
+								_: False
+						_: False
+				_: False
+
+
+pure func test_annotation_infers_zero_argument_generic_initializer() -> Bool:
+	source: String =
+		|pure func empty[T]() -> List[T]:
+		|    []
+		|pure func choose() -> List[Int]:
+		|    values: List[Int] = empty()
+		|    values
+		|
+	match function(source, 1):
+		None: False
+		Some(selected):
+			match (selected.bindings, selected.statements):
+				([local], [Model.InitializeBinding(_, value)]):
+					match value.form:
+						Model.InvokeFunction(_, []):
+							(Model.same_type(local.value_type, Model.ListType(Model.IntType))
+								and Model.same_type(value.value_type, local.value_type))
+						_: False
+				_: False
+
+
+pure func test_annotation_supplies_empty_list_context() -> Bool:
+	source: String =
+		|pure func preserve() -> Int:
+		|    values: List[Int] = []
+		|    0
+		|
+	match function(source, 0):
+		None: False
+		Some(selected):
+			match (selected.bindings, selected.statements):
+				([local], [Model.InitializeBinding(id, value)]):
+					match value.form:
+						Model.ConstructList([]):
+							(Model.binding_number(id) == 0
+								and Model.same_type(local.value_type, Model.ListType(Model.IntType))
+								and Model.same_type(value.value_type, local.value_type))
+						_: False
+				_: False
+
+
+pure func test_annotation_supplies_nullary_constructor_context() -> Bool:
+	source: String =
+		|pure func empty() -> Option[Int]:
+		|    value: Option[Int] = None
+		|    value
+		|
+	match function(source, 0):
+		None: False
+		Some(selected):
+			match (selected.bindings, selected.statements):
+				([local], [Model.InitializeBinding(_, value)]):
+					match value.form:
+						Model.ConstructVariant(_, []):
+							(Model.same_type(local.value_type, selected.signature.return_type.value_type)
+								and Model.same_type(value.value_type, local.value_type))
+						_: False
+				_: False
+
+
+pure func test_public_body_can_annotate_private_implementation_type() -> Bool:
+	source: String =
+		|private fixed record Secret { value: Int }
+		|pure func reveal() -> Int:
+		|    item: Secret = { value = 7 }
+		|    item.value
+		|
+	match function(source, 0):
+		None: False
+		Some(selected):
+			match selected.bindings:
+				[local]:
+					match local.value_type:
+						Model.RecordType(id): Declaration.record_number(id) == 0
+						_: False
+				_: False
+
+
+pure func test_qualified_annotation_preserves_imported_nominal_identity() -> Bool:
+	root: String =
+		|import:
+		|    ./boxes as B
+		|pure func preserve(value: B.Box[Int]) -> B.Box[Int]:
+		|    item: B.Box[Int] = value
+		|    item
+		|
+	inputs: List[ModuleInput] = [
+		{ source = root + MAIN, targets = [1] },
+		{ source = "fixed record Box[T] { value: T }\n", targets = [] },
+	]
+	match parse_modules_with_base(inputs, TEST_BASE):
+		Err(_): False
+		Ok(program):
+			match check(program):
+				Err(_): False
+				Ok(accepted):
+					match checked_functions(accepted).functions.get(0):
+						None: False
+						Some(selected):
+							match selected.bindings:
+								[parameter, local]: Model.same_type(parameter.value_type, local.value_type)
+								_: False
+
+
+pure func test_private_import_annotation_keeps_exact_rejection() -> Bool:
+	prefix = "import:\n    ./boxes as B\nfunc main() -> Int:\n    item: B."
+	inputs: List[ModuleInput] = [
+		{ source = prefix + "Secret = missing\n    0\n", targets = [1] },
+		{ source = "private fixed record Secret { value: Int }\n", targets = [] },
+	]
+	rejects(parse_modules_with_base(inputs, TEST_BASE), prefix.length(), prefix.length() + 6,
+		(pure func(kind):
+			match kind:
+				Errors.QualifiedRejection(Errors.QualifiedNotOffered(_, _, _, PrivateName)): True
+				_: False
+		),
+		"Secret is private to ./boxes", "remove private or qualify a public declaration", None)
+
+
+pure func test_mismatch_keeps_initializer_and_annotation_spans() -> Bool:
+	declaration = "func main() -> Int:\n    answer: "
+	prefix = declaration + "Int = "
+	marked = "\"wrong\""
+	rejects(parsed(prefix + marked + "\n    0\n"), prefix.length(), prefix.length() + marked.length(),
+		(pure func(kind): mismatch(kind, Model.IntType, Model.StringType,
+			span(declaration.length(), declaration.length() + 3), span(prefix.length(), prefix.length() + marked.length()))
+		),
+		"expression does not match the expected type", "use an expression of type Int here", None)
+
+
+pure func test_same_shape_nominal_types_remain_distinct() -> Bool:
+	prefix = "fixed record First { value: Int }\nfixed record Second { value: Int }\npure func wrong(value: Second) -> Int:\n    item: First = "
+	rejects(parsed(prefix + "value\n    0\n" + MAIN), prefix.length(), prefix.length() + 5,
+		(pure func(kind):
+			match kind:
+				Errors.ValueRejection(Errors.ExpressionTypeMismatch(value)):
+					match (value.expected, value.actual.value_type, value.expected_site):
+						(Model.RecordType(first), Model.RecordType(second), Errors.SourceAnnotation(annotation)):
+							(Declaration.record_number(first) == 0 and Declaration.record_number(second) == 1
+								and annotation.start == prefix.length() - 8 and annotation.end == prefix.length() - 3
+								and same_span(value.actual.span, span(prefix.length(), prefix.length() + 5)))
+						_: False
+				_: False
+		),
+		"expression does not match the expected type", "use an expression of type First here", None)
+
+
+pure func test_unknown_annotation_precedes_invalid_initializer() -> Bool:
+	prefix = "func main() -> Int:\n    answer: "
+	rejects(parsed(prefix + "Missing = missing\n    0\n"), prefix.length(), prefix.length() + 7,
+		(pure func(kind):
+			match kind:
+				Errors.TypeTermRejection(Errors.UnknownType(_)): True
+				_: False
+		),
+		"unknown type", "declare or import this type; builtin types and declared type parameters are also available", None)
+
+
+pure func test_annotated_self_initializer_stays_unavailable() -> Bool:
+	prefix = "func main() -> Int:\n    answer: Int = "
+	rejects(parsed(prefix + "answer\n    0\n"), prefix.length(), prefix.length() + 6,
+		(pure func(kind):
+			match kind:
+				Errors.ValueRejection(Errors.UnknownValue(_)): True
+				_: False
+		),
+		"unknown value", "use this function's parameter name, a declared variant, or a call", None)
+
+
+pure func test_annotation_declares_instead_of_retyping_mutable_binding() -> Bool:
+	initial = "func main() -> Int:\n    var "
+	prefix = initial + "current = 7\n    "
+	rejects(parsed(prefix + "current: String = \"fresh\"\n    0\n"), prefix.length(), prefix.length() + 7,
+		(pure func(kind):
+			match kind:
+				Errors.BindingRejection(Errors.LocalBindingConflict(previous, Model.BodyLocal)):
+					Model.binding_number(previous.binding) == 0
+				_: False
+		),
+		"`current` is already a local in this function", "choose a different name for this binding",
+		Some(span(initial.length(), initial.length() + 7)))
+
+
+pure func test_annotated_declaration_checks_initializer_before_collision() -> Bool:
+	prefix = "func main() -> Int:\n    var current = 7\n    current: Int = "
+	rejects(parsed(prefix + "missing\n    0\n"), prefix.length(), prefix.length() + 7,
+		(pure func(kind):
+			match kind:
+				Errors.ValueRejection(Errors.UnknownValue(_)): True
+				_: False
+		),
+		"unknown value", "use this function's parameter name, a declared variant, or a call", None)
+
+
+pure func test_annotated_immutable_binding_keeps_assignment_priority() -> Bool:
+	prefix = "func main() -> Int:\n    answer: Int = 7\n    "
+	rejects(parsed(prefix + "answer = missing\n    0\n"), prefix.length(), prefix.length() + 6,
+		(pure func(kind):
+			match kind:
+				Errors.StatementRejection(Errors.ImmutableAssignment(previous)): Model.binding_number(previous.binding) == 0
+				_: False
+		),
+		"cannot assign to an immutable binding", "declare the binding with var to allow reassignment", None)
+
+
+pure func test_reassignment_keeps_established_binding_provenance() -> Bool:
+	prefix = "func main() -> Int:\n    var current: Int = 7\n    current = "
+	rejects(parsed(prefix + "\"wrong\"\n    0\n"), prefix.length(), prefix.length() + 7,
+		(pure func(kind):
+			match kind:
+				Errors.ValueRejection(Errors.ExpressionTypeMismatch(value)):
+					match value.expected_site:
+						Errors.InferredBindingDeclaration(previous):
+							(Model.binding_number(previous.binding) == 0 and Model.same_type(value.expected, Model.IntType)
+								and Model.same_type(value.actual.value_type, Model.StringType)
+								and same_span(value.actual.span, span(prefix.length(), prefix.length() + 7)))
+						_: False
+				_: False
+		),
+		"expression does not match the expected type", "use an expression of type Int here", None)
+
+
+pure func test_annotation_cannot_shadow_parameter() -> Bool:
+	initial = "pure func wrong("
+	prefix = initial + "value: Int) -> Int:\n    "
+	rejects(parsed(prefix + "value: Int = value\n    value\n" + MAIN), prefix.length(), prefix.length() + 5,
+		(pure func(kind):
+			match kind:
+				Errors.BindingRejection(Errors.LocalBindingConflict(previous, Model.ParameterBinding(0))): Model.binding_number(previous.binding) == 0
+				_: False
+		),
+		"`value` is already a parameter in this function", "choose a different name for this binding",
+		Some(span(initial.length(), initial.length() + 5)))
+
+
+pure func test_annotation_cannot_shadow_module_function() -> Bool:
+	initial = "pure func "
+	prefix = initial + "named() -> Int:\n    7\nfunc main() -> Int:\n    "
+	rejects(parsed(prefix + "named: Int = 7\n    0\n"), prefix.length(), prefix.length() + 5,
+		(pure func(kind):
+			match kind:
+				Errors.BindingRejection(Errors.ModuleBindingConflict(_)): True
+				_: False
+		),
+		"`named` is already a function in this module", "choose a different name for this binding",
+		Some(span(initial.length(), initial.length() + 5)))
+
+
+pure func test_annotated_match_preserves_m2_carried_binding() -> Bool:
+	source: String =
+		|pure func choose(flag: Bool) -> Int:
+		|    var current = 1
+		|    old = current
+		|    answer: Int = match flag:
+		|        True:
+		|            current = 7
+		|            current
+		|        False: current
+		|    old
+		|
+	match function(source, 0):
+		None: False
+		Some(selected):
+			match (selected.statements, selected.body):
+				([Model.InitializeBinding(current, _), Model.InitializeBinding(old, prior_read), Model.InitializeBinding(answer, value)], Model.CheckedValueBody(Model.ReturnExpression(result))):
+					match value.form:
+						Model.Match(join):
+							match (join.carried, join.arms):
+								([carried], [first, second]):
+									match first.statements:
+										[Model.ReassignBinding(reassigned, _)]:
+											(Model.binding_number(current) == 1 and Model.binding_number(carried) == 1
+												and Model.binding_number(reassigned) == 1 and Model.binding_number(old) == 2
+												and Model.binding_number(answer) == 3 and reads(prior_read, 1) and reads(result, 2)
+												and reads(join.scrutinee, 0) and reads(first.value, 1) and reads(second.value, 1)
+												and second.statements.is_empty() and Model.same_type(value.value_type, Model.IntType))
+										_: False
+								_: False
+						_: False
+				_: False
+
+
+pure func test_annotation_preserves_opaque_construction_identity() -> Bool:
+	source: String =
+		|opaque type Token = Int
+		|pure func preserve() -> Token:
+		|    item: Token = into_opaque Token(7)
+		|    item
+		|
+	match function(source, 0):
+		None: False
+		Some(selected):
+			match (selected.bindings, selected.statements, selected.body):
+				([local], [Model.InitializeBinding(id, value)], Model.CheckedValueBody(Model.ReturnExpression(result))):
+					match (local.value_type, value.form):
+						(Model.OpaqueType(owner), Model.ConstructOpaque(constructed, child)):
+							match child.form:
+								Model.LiteralInteger(7):
+									(Declaration.opaque_number(owner) == 0 and Declaration.opaque_number(constructed) == 0
+										and Model.same_type(value.value_type, local.value_type)
+										and Model.same_type(local.value_type, selected.signature.return_type.value_type)
+										and Model.same_type(child.value_type, Model.IntType)
+										and Model.binding_number(id) == 0 and reads(result, 0))
+								_: False
+						_: False
+				_: False
+
+
+pure func test_annotation_preserves_scalar_constant_value_and_use_span() -> Bool:
+	prefix = "private SEVEN: Int = 7\npure func preserve() -> Int:\n    answer: Int = "
+	match function(prefix + "SEVEN\n    answer\n", 0):
+		None: False
+		Some(selected):
+			match (selected.bindings, selected.statements, selected.body):
+				([local], [Model.InitializeBinding(id, value)], Model.CheckedValueBody(Model.ReturnExpression(result))):
+					match value.form:
+						Model.LiteralInteger(7):
+							(Model.same_type(local.value_type, Model.IntType)
+								and Model.same_type(value.value_type, Model.IntType)
+								and same_span(value.span, span(prefix.length(), prefix.length() + 5))
+								and Model.binding_number(id) == 0 and reads(result, 0))
+						_: False
+				_: False
+
+
+pure func test_local_callable_annotation_rejects_full_type_before_children_and_rhs() -> Bool:
+	prefix = "func main() -> Int:\n    callback: "
+	annotation = "pure (Missing) -> Absent"
+	rejects(parsed(prefix + annotation + " = missing\n    0\n"), prefix.length(), prefix.length() + annotation.length(),
+		(pure func(kind):
+			match kind:
+				Errors.UnsupportedSyntax(Errors.FunctionType): True
+				_: False
+		),
+		"callable types are only supported as function parameters",
+		"write pure function types only on function parameters; use ordinary data types inside them", None)
+
+
+pure func test_callable_parameter_assignment_precedes_invalid_rhs() -> Bool:
+	prefix = "pure func apply(callback: pure (Int) -> Int) -> Int:\n    "
+	rejects(parsed(prefix + "callback = missing\n    0\n" + MAIN), prefix.length(), prefix.length() + 8,
+		(pure func(kind):
+			match kind:
+				Errors.StatementRejection(Errors.CallableAssignment(parameter)):
+					(Model.callable_position(parameter) == 0
+						and Declaration.function_number(Model.callable_owner(parameter)) == 0)
+				_: False
+		),
+		"cannot assign to a callable parameter",
+		"invoke this parameter, or forward it unchanged; callable parameters are immutable", None)
+
+
+tests: TestSuite = {
+	description = "Local annotation checking and complete binding facts",
+	tests = [
+		("annotation publishes complete binding facts", test_annotation_publishes_complete_binding_facts),
+		("mutable annotation preserves reassignment and old alias", test_mutable_annotation_preserves_reassignment_and_old_alias),
+		("generic annotation reuses signature parameter identity", test_generic_annotation_reuses_signature_parameter_identity),
+		("annotation infers a zero-argument generic initializer", test_annotation_infers_zero_argument_generic_initializer),
+		("annotation supplies empty List initializer context", test_annotation_supplies_empty_list_context),
+		("annotation supplies nullary constructor context", test_annotation_supplies_nullary_constructor_context),
+		("public body annotates private implementation type", test_public_body_can_annotate_private_implementation_type),
+		("qualified annotation preserves imported nominal identity", test_qualified_annotation_preserves_imported_nominal_identity),
+		("private import annotation keeps exact rejection", test_private_import_annotation_keeps_exact_rejection),
+		("mismatch retains initializer and annotation spans", test_mismatch_keeps_initializer_and_annotation_spans),
+		("same-shape nominal types remain distinct", test_same_shape_nominal_types_remain_distinct),
+		("unknown annotation precedes invalid initializer", test_unknown_annotation_precedes_invalid_initializer),
+		("annotated self-initializer remains unavailable", test_annotated_self_initializer_stays_unavailable),
+		("annotation declares rather than retyping mutable binding", test_annotation_declares_instead_of_retyping_mutable_binding),
+		("annotated declaration checks initializer before collision", test_annotated_declaration_checks_initializer_before_collision),
+		("annotated immutable binding retains assignment priority", test_annotated_immutable_binding_keeps_assignment_priority),
+		("reassignment retains established binding provenance", test_reassignment_keeps_established_binding_provenance),
+		("annotation cannot shadow parameter", test_annotation_cannot_shadow_parameter),
+		("annotation cannot shadow module function", test_annotation_cannot_shadow_module_function),
+		("annotated match preserves M2 carried binding", test_annotated_match_preserves_m2_carried_binding),
+		("annotation preserves opaque construction identity", test_annotation_preserves_opaque_construction_identity),
+		("annotation preserves scalar constant value and use span", test_annotation_preserves_scalar_constant_value_and_use_span),
+		("local callable annotation rejects full type before children and RHS", test_local_callable_annotation_rejects_full_type_before_children_and_rhs),
+		("callable parameter assignment precedes invalid RHS", test_callable_parameter_assignment_precedes_invalid_rhs),
+	]
+}

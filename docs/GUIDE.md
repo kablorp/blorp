@@ -233,6 +233,11 @@ func variable_examples() -> Int:
     0
 ```
 
+The [Blorp 2 pilot](../blorp_2/README.md) also accepts local scalar, nominal and
+generic annotations. They supply the initializer's expected type and declare a
+new binding under its no-shadowing rule; plain `=` retains its existing
+reassignment behavior. A public function body may use a private local type.
+
 Assignment (`=`), compound assignment (`+=`), `?=` and bindings are statements,
 not expressions: write them on a line of their own, or as a match case body.
 They cannot appear inside a condition, a list, a call argument or an operand,

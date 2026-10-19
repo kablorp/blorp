@@ -1,15 +1,18 @@
 # Local binding annotations
 
-Status: root and independent compiler plan review APPROVE0. Production edits
-follow the scheduled owning-suite RED; compiled lane grants stay separate. Base:
-origin/main
-`a9ea383cff354be0d3bd24639d9f614ffeb017ce`, isolated branch
-`codex/local-binding-annotations`. No compiled jobs or cost setup have run.
+Status: EA3552 components, C/links and1098 native callbacks pass (495 cases).
+All404 native budget rows pass; failed runs and the fixture correction are kept.
+Fixed-e706 cost B/C is separate; all64 samples and547 oracle pairs pass.
+Independent code and test-runner reviews approve this implementation and evidence.
+Functional base `ea881c84d0df9df04a6ec5c4406a3b69cf406735`;
+branch `codex/local-annotations-functional-ea`.
+Historical author base `a9ea383cff354be0d3bd24639d9f614ffeb017ce` and staged candidate
+`d3637a17f10b` remain separate, with original results and worktree preserved.
 
 ## Problem and shortest reproduction
 
 The existing parser stores the annotation in ParsedBinding; no syntax change is
-needed. Checking currently rejects it at check/bodies.brp:757-758:
+needed. At the e706 baseline, checking rejects it at check/bodies.brp:781-782:
 
 ```blorp
 match binding.annotation:
@@ -24,9 +27,9 @@ func main() -> Int:
     identity(7)
 ```
 
-Source inspection predicts `binding type annotations are not supported yet` at
-the written Int; this is not an executed RED. Desired native result: status7,
-empty stdout/stderr. The first feedback is a granular TestSuite under
+The preserved baseline reports0 PASS/22 named FAIL, exit1 and empty stderr;
+there was no setup failure or retry. The maintained scalar annotation fixture
+passes native status7 with empty streams. The owning granular TestSuite is under
 test/unit/test_check/test_local_annotations.brp, using the existing parser/check
 helpers and existing exact diagnostic conventions.
 
@@ -63,21 +66,22 @@ or per-body inventory reconstruction. Choose it for this slice. Its extra
 retained references/record copy and whole-checker cost must be measured later;
 this is a simpler data path, not an asserted representation-cost win.
 
-New-declaration checking currently resolves UntypedValue at bodies.brp:826:
+New-declaration checking currently resolves UntypedValue at bodies.brp:850:
 
 ```blorp
 match resolve_value(block, written.initializer, UntypedValue, context):
 ```
 
-The proposed expectation at that same boundary is:
+A private initializer helper resolves the expectation at that boundary:
 
 ```blorp
 expectation ?= match written.annotation:
     None: Ok(UntypedValue)
     Some(annotation):
-        value_type ?= resolve_type(context.body_types, annotation)
-        Ok(CheckedAgainst(value_type, SourceAnnotation(type_span(annotation))))
-match resolve_value(block, written.initializer, expectation, context):
+        match resolve_type(context.body_types, annotation):
+            Ok(value_type): Ok(CheckedAgainst(value_type, SourceAnnotation(type_span(annotation))))
+            Err(error): Err(error)
+resolve_value(block, written.initializer, expectation, context)
 ```
 
 Keep the original pre-binding scope, resolved binding/reassignment facts,
@@ -138,8 +142,12 @@ exact restore and restored GREEN. A setup failure is not a killed oracle.
 
 Forecast about50-70 added/10-20 removed production lines in signatures,
 callables, bodies, errors and render; hard limits100 gross/+75 net production.
-Tests forecast450-600 added, hard650 gross/+650 net; at most2 ordinary fixtures,
-50 source lines total. Documentation: this plan<=180 lines, other edits<=70 added.
+The complete-test forecast prospectively increases from560 to600 added before
+the two post-RED preservation callbacks are written. Hard650 gross/+650 net
+remains unchanged; at most2 ordinary fixtures,50 source lines total.
+The plan's documentation ceiling prospectively increases from180 to220 physical
+lines on2026-10-19; its reviewed preparation was179 lines. Other active docs
+remain<=70 added; a retained benchmark report has a separate<=100-line ceiling.
 Report production/test/fixture counts separately; no compressed formatting,
 deleted assertions, new carrier type or unrelated cleanup to fit a ceiling.
 
@@ -155,9 +163,58 @@ baseline, metric, proxy, corpus or epoch: root and independent review must agree
 those explicitly before any preparation/freeze/sample. Do not substitute FULL
 TOTAL or SOURCE3%, borrow another exception, roll B or shrink the corpus.
 
+On2026-10-19 root+independent review prospectively select the existing F4
+six controls: pure/calls, ufcs/chain_64, generic/named/{identity,ordered,managed},
+and return/zero, plus the original schema1 HOST proxy. FEATURE5% target/10% hard
+and independent HOST3% apply per selected input. The16 early samples are reused;
+the40 shared and8 C-only calls pass; the two new fixtures have no B denominator.
+Oracle closure is496 file-backed+51 retained CLI states (32 generated/150 files,
+16 preserved-output,3 usage):547 pairs; old annotation B rejects1/C compiles0,
+with C realmain7. Native keeps all absolute caps; unit strings are not CLI requests.
+
 Root owns lane leases and integration. Preserve all raw logs, complete diffs,
 source/toolchain pins and failures under ignored build/. Request independent
 compiler-expert code review and test-runner evidence before any implementation
 commit, then complete root's final destination gates and landing. Stop for an
 unresolved boundary, unavailable provenance, host defect, cap breach or a
 need for another mechanism. Preserve this worktree; do not archive it.
+
+## Current-port review boundary, 2026-10-19
+
+The preserved22-case RED snapshot retains all20 original callbacks plus opaque
+construction and scalar-constant cases. All22 failed in the single baseline run;
+its raw source, outcomes and exact closing pins remain unchanged. After that
+RED, the reviewed49-added/28-removed/+21 production and one observer port were
+applied. The24-case suite then passed, as did both exact fault/restored-GREEN pairs.
+
+The suite adds the two callbacks requested by independent review. A local
+pure-function-type annotation must reject the complete FunctionType span, exact
+message/help and no note before resolving unknown child types or its invalid RHS.
+Plain assignment to an existing callable parameter must retain CallableAssignment,
+its exact diagnostic/span and no note before checking an invalid RHS. This brings
+the owning suite to24 callbacks; it does not add callable local-variable support.
+Retain current callable assignment, opaque/constant fields and signature rules.
+Historical +48/-27 production and20-case/mutation passes are not current-base proof.
+
+The original planning base was not a frozen FEATURE B; its historical cost B/C/
+proxy binding was unselected. Root now prospectively selects fixed accepted B
+`e706b393d51038ba49af720999d308fd95ce4ea9` for this annotation slice. C must be
+that base plus the complete annotation-only production, tests, fixtures and docs;
+its compiler/library bytes are materialized. No historical denominator is relabeled.
+
+ROOT std91 and the source-matched F3 producer have functional roles. They do not
+replace the independently authoritative host-construction proxy. Root names
+supporting normal producer6852 and diagnostic producera362; full binary/input
+provenance and matching STD91 must be verified before any freeze. The proxy's
+allocation metric is the unique schema1
+`artifact_construction_complete.total_allocations` checkpoint. Normal retired
+instructions use positive paired minimum-of-three samples. The independent
+host-construction gate is prospectively+3% HARD under the parent data-model rule,
+in addition to FEATURE+5% target/+10% hard and every tighter absolute fixture cap.
+
+All64 selected samples and547 oracle pairs pass; source/library/image pins close.
+EA3552 components and1098 native callbacks pass across495 cases and404 budget rows.
+Earlier failures stay preserved. F4/F5 composition is separate from cost C.
+Independent code and test-runner reviews approve this implementation and evidence.
+No additional execution or publication is granted by these completed gates.
+Report: benchmarks/results/blorp_2_local_annotations_2026-10-19.md.

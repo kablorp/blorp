@@ -1042,6 +1042,11 @@ collision. Existing immutable or unsupported assignments are classified before
 their RHS, and parameter types resolve before body-scope name validation. The
 frozen existing compiler remains more permissive about shadowing.
 
+In Blorp 2, an annotated occurrence declares a new binding rather than retyping
+an existing variable. Its type is resolved in the function's defining scope
+before the initializer, then supplies the expected initializer type. The function's
+generic parameter identities and implementation-private type access are retained.
+
 `while`, `for` and `for ... concurrently` are statements and have no value. A
 `for` where a value is required is ``for` is a statement and has no value``,
 with a hint to use `map` (`LP:6115-6134`).

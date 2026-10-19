@@ -1196,8 +1196,7 @@ Lexical and layout rules:
   A nullary constructor pattern may be written `Empty` or `Empty()`. `Number()`
   is valid syntax but fails semantic arity checking for a one-field constructor.
 - A binding line is `name = expression` or `var name = expression`, optionally
-  annotated as `name: Type = expression` (the annotation parses, and checking
-  rejects it until the join milestone), at depth
+  annotated as `name: Type = expression` or `var name: Type = expression`, at depth
   one in a function or depth three in an arm block. Its initializer starts on
   the same line, or stands alone on the next line indented one level, and may
   continue inside brackets. `name ?= expression` is a propagating binding:
@@ -1303,13 +1302,18 @@ Semantic rules:
 - `name = expression` declares an immutable binding when the name is absent,
   reassigns an existing mutable binding, and rejects an existing immutable
   binding. `var` declares a fresh mutable binding under the same no-shadowing rule.
+  An annotated occurrence also declares a new binding; it does not retype or
+  reassign an existing variable. Its annotation is resolved in the function's
+  defining type scope before its initializer and supplies that initializer's
+  expected type, including generic calls, empty Lists and bare constructors.
+  Body annotations may use implementation-private types, even in public functions.
   The initializer sees the earlier scope: write `var current = value` to
   initialize a distinct mutable local from a parameter. New declarations check
   their initializer before reporting a name collision; assignment to an existing
   binding still reports immutable or unsupported reassignment before its RHS. New bindings
-  infer their type from the initializer; reassignment checks the established
+  without annotations infer their type from the initializer; reassignment checks the established
   type. Bare constructors need a receiving union type, supplied by a call,
-  return or reassignment; a new local initializer does not guess that type.
+  return, reassignment or local annotation; an unannotated initializer does not guess that type.
   All initializers are checked for purity and call cycles, even when unused or
   in an arm a constant scrutinee cannot select. Arm locals stay within their
   arm. Reassignment of an enclosing mutable binding affects only the selected
@@ -1764,13 +1768,13 @@ decides it, and a later element of another type is rejected at that element
 Once E is known, every later element is checked with E as its expected
 type, so `[[1, 2], [], [3]]` gives the inner `[]` the type `List[Int]`.
 `[]` takes its element type from an expected List type. The routes that
-supply one are: a function's non-Void return value; a `var` reassignment; a
+supply one are: an annotated binding; a function's non-Void return value; a `var` reassignment; a
 call argument whose parameter is a List, including a generic `List[T]` such
 as `append([], 7)`, which then infers `T`; a record literal or update field;
 a variant payload field; and a later element of a list literal whose E is
 already decided. Without such a context `[]` is rejected (`cannot infer the
-element type of an empty list literal`): a binding initializer supplies no
-expected type until annotations arrive, `[[], [3]]` has nothing deciding E
+element type of an empty list literal`): an unannotated binding initializer supplies no
+expected type, `[[], [3]]` has nothing deciding E
 before the empty element, and a UFCS receiver such as `[].get(0)` is accepted
 with E = `T` and then reports `cannot infer the type parameter from the
 argument`. No
