@@ -6,8 +6,10 @@ The target library is `blorp_2/standard_library/`, separate from the host
 `standard_library/src/`. Its `_base.brp` already owns Bool, Option, Result and
 their constructors. The operation modules `option.brp` and `result.brp` are
 implemented for the five ordinary helpers: Option `is_some`, `is_none`,
-`get_or`, `to_result` and Result `is_ok`. The four callback helpers still need
-callable semantics. The directory rename and resolved inventory are already on main.
+`get_or`, `to_result` and Result `is_ok`. Accepted named references and forwarding
+permit a named-only four-helper library increment. The current
+[accounting](STANDARD_LIBRARY_GAPS.md) counts Option.map(5), Result.map(14), map_err(6), and_then(4).
+Some compiler consumers still need M7 lambdas/captures and explicit operation imports.
 
 At base `1f3f407198efa55703ba8dea7a4be1c5239cfc89`, an actual self-compile
 stops loading `result: map_err` in `src/main.brp:10`. All 41 compiler source
@@ -16,14 +18,15 @@ function types and lambdas. Pure functions may return Void. After the five
 ordinary helpers are added, the actual source probe reaches
 `src/check/check.brp:20:13`: `opaque types are not supported yet`, with no C
 produced. That existing independent language requirement remains outside this
-library slice.
+library slice. These are historical probe results, not a current-main frontier
+observation; no current frontier is claimed without an actual current probe.
 
 The owner abandoned the remaining HOF-removal migration. Preserve existing
 compiler callbacks and their phase boundaries. The older
 [five-helper proposal](OPTION_RESULT_HELPERS_PLAN.md) and held candidate are
 historical predecessors, not the complete current demand or current cost authority.
 
-## Resolved compiler inventory
+## Historical resolved compiler inventory
 
 The census covers all 41 modules under `src/`, excluding host tests/tooling and
 text embedded in test fixtures. One host Core dump after lowering resolved
@@ -132,8 +135,8 @@ borrowed inputs. Returned managed payloads/defaults/errors remain independently
 owned after the input and unused arguments retire. Cover Int, String and Void.
 
 Exit: named imports and UFCS work with the existing `_base` identities, exact
-branch results and ownership. Main's `map_err` import is still unavailable;
-this slice alone does not clear the current self-compilation frontier.
+branch results and ownership. At that checkpoint main's `map_err` import remained
+unavailable; this slice did not establish self-compilation or a current frontier.
 
 ### 2. Support the pure callable forms the census actually uses
 
@@ -154,19 +157,22 @@ and emission. Preserve rejection of mutable captures and impure callees in a
 pure callback slot. Purity is semantic information; it needs no late pure-Void
 restriction. Do not stop at noncapturing callbacks or bypass unsupported bodies.
 
-Exit: the representative named and capturing callback programs typecheck and
-execute through their ordinary native main functions, with typed phase facts,
-correct capture ownership and existing memory/resource checks.
+Named exit: accepted pure types, named references, forwarding and direct calls
+permit step3's bounded named-only library increment now. Full callable exit still
+requires representative named and capturing programs through their ordinary native
+mains, typed phase facts, correct capture ownership and existing resource checks.
+The library increment does not satisfy the full lambda/capture compiler census.
 
-### 3. Add the four callback helpers
+### 3. Add the four callback helpers as a named-only increment
 
-Add `option.map`, `result.map`, `map_err` and `and_then` with the exact selected
-pure host signatures. Bodies are ordinary matches. Option.map calls its
+Accepted named-callable semantics permit `option.map`, `result.map`, `map_err`
+and `and_then` now, with the exact selected pure host signatures. Lambda/capture
+completion remains separate. Bodies are ordinary matches. Option.map calls its
 callback only for Some; Result.map/and_then only for Ok; Result.map_err only
 for Err. The bypass variant/payload propagates unchanged. The selected branch
 contains one invocation; no invocation occurs in the bypass branch.
 
-For example, after callable semantics are accepted:
+For example, use the accepted named-callable path in an ordinary definition:
 
 ```blorp
 import:
@@ -258,3 +264,102 @@ A repeatable breach stops the slice for diagnosis/rescoping.
 The [ordinary-helper acceptance report](../benchmarks/results/blorp_2_option_result_ordinary_2026-10-18.md)
 records passing matched costs, phase/native gates, effective restored faults
 and the actual source frontier.
+
+## Named-only callback-helper implementation epoch
+
+Production is limited to `standard_library/option.brp` and `result.brp` using
+existing `_base` identities, ordinary matches and pure direct callback calls.
+No compiler, builtin, runtime, solver, prelude, source migration or HOF removal
+change is included. Stop for root if nested constructor/callback needs new machinery.
+
+### Prospective bounds and tests
+
+Hard added/net ceilings: production40/+40 across2 modules; nonfixture500/+500;
+one native fixture <=100 physical lines; API docs <=80 additions; this amendment
+<=120 physical lines; later report <=100. Forecast production20-28 additions.
+Count replacements/mechanical ports; no compression, deleted coverage, deletion
+credit against additions or borrowed predecessor room. Prefer existing phase helpers.
+Owners relative to blorp_2/test/: unit/test_check/test_generics.brp;
+unit/test_specialize/test_generic_unions.brp; unit/test_own/test_managed_union.brp;
+unit/test_emit/test_generic_ownership.brp; e2e/test_generics.brp.
+Reuse load/compilation/module_input/native helpers. Extend current5-helper
+inventory/ownership observers to distinguish9 by declaration/union identity;
+retain every original5 assertion. API docs: standard_library/README.md, LIBRARY_PARITY.md,
+README.md, ROADMAP.md, ../docs/GUIDE.md and ../docs/GRAMMAR.md parity links/status; same80 ADD.
+Check4 Pure signatures/rigid owners/exact callback input-result types, T!=U/E!=F,
+and same-shaped foreign unions; diagnostics pin kind/help/span. Cover named/imported
+callbacks, forwarding, eager data evaluation/order, impure callback/wrong argument-result-error rejection, Void,
+and existing body_types scope. Do not weaken established diagnostics for convenience.
+For each actual checked helper's canonical VariantIds/CallableParameterId, count
+nested callback invocations: selected1, bypass0. A concrete T=E=String bypass-call
+negative witness must fail that oracle. Specialize proves direct target/type choices,
+erased static argument and dense runtime slots; no spelling-based semantic lookup.
+Own/Verify prove input borrowing, immediate payload provenance, selected callback
+result transfer once, bypass independent returned owner and return/unused cleanup.
+Verify independently rejects omitted acquisition and duplicate child transfer.
+New fixture: blorp_2/test/e2e/fixtures/generic/managed/option_result_callbacks.brp;
+all8 branches, Int/String/Void, UTF8/NUL, aliases, result survival after callee locals.
+Real main exit0/exact prewritten bytes/stderr0; unchanged ASan/UBSan/strict0 harness.
+Freeze fixture/oracle bytes before RED; retain exact B missing-export diagnostic,
+status/no-C, not old missing-module evidence. Native output cannot prove call count.
+Two temporary faults: duplicate selected callback through an unused well-typed
+local in actual Option.map; omit actual BorrowedResult return acquisition in Own.
+Pin exact named semantic failures before leases. Restore exact bytes AND modes
+unconditionally before classification, verify pins/index, then restored GREEN.
+Setup/type failure is not an effective fault; retain typed bypass/Verify negatives.
+
+### Frozen costs and four mandatory unchanged shared controls
+
+Root names/approves accepted B/complete C before implementation/setup; 1d02a6700
+is context, not selected/frozen B. Freeze full sources/library/corpus/physical
+paths, producer/tool/std identities and output states. No roll after failure.
+Controls: blorp_2/test/e2e/fixtures/return/zero.brp plus these3 tiny data-only
+programs at inputs/shared/{name}, unchanged B/C; these are not extra native fixtures.
+option-min.brp:
+```blorp
+import:
+    option: get_or
+func main() -> Int:
+    get_or(Some(7), 0)
+```
+result-min.brp:
+```blorp
+import:
+    result: is_ok
+func main() -> Int:
+    value: Result[Int, String] = Ok(7)
+    match is_ok(value):
+        True: 1
+        False: 0
+```
+named-forward-min.brp:
+```blorp
+pure func identity[T](value: T) -> T:
+    value
+pure func apply[T, U](value: T, callback: pure (T) -> U) -> U:
+    callback(value)
+pure func forward[T, U](value: T, callback: pure (T) -> U) -> U:
+    apply(value, callback)
+func main() -> Int:
+    forward(7, identity)
+```
+No larger substitute, dropped control or cherry-picking after a breach.
+Each control AND frozen HOST proxy independently require C<=1.03B allocations
+and normal min3 instructions; all old absolutes/strict0 remain binding.
+Shared C/status/diagnostics/output states stay byte-exact; normal/strict agree per role.
+HOST retains original normal34ac1a91/diagnosticbe31a5a3 and STD090ed68c roles/pins;
+unique schema1 artifact_construction_complete.total_allocations, not exit TOTAL
+or ROOT974 substitution. Complete original598 provenance must close before reuse.
+Reuse source-matched A for B/C; verify C/normal0/diagnostic1 pins; no ABI/closures/M7 reset.
+New C-only caps:150000 allocations/600M strict diagnostic instructions/600M normal
+min3; positive balanced strict0/unmodified C. No successful B denominator.
+Finite leases:1 API RED;1 focused GREEN;4 fault/restored focused calls;1 component,
+1 full native,1 actual frontier call, all through existing commands/harness.
+Exact reuse avoids setup; otherwise separately lease1 C generation/2 O0 links
+(normal0/diagnostic1). Cost:36 target calls (4x8 controls+4 C-only), plus8 original
+HOST calls (diag B/C+normal B1,C1,C2,B2,B3,C3); no other samples.
+Literal argv/CWD/pins/output absence/failure sets need review before START.
+Stop first unexpected setup/semantic/pin/identity/strict/cost/LOC result; preserve
+raws, restore faults, RETURN lane; no retry/repair/refreeze/waiver or next job.
+Root+peer approve/publish this amendment before implementation; two final
+independent reviews plus test-runner acceptance precede root integration.
