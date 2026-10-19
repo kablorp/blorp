@@ -221,10 +221,55 @@ semantics and mechanisms. Its forecast is **1,000–1,050 production additions /
 +800–830 net**; revised hard limits are **1,100 additions / +850 net**, with an
 assessment stop at **1,000 additions or +780 net**. Reaching that stop requires
 a remaining-work/count review, not automatic continuation toward the hard limit.
-The **650 test additions / +600 net** limits and the initial-M7 cumulative
-allocation/instruction ceilings below remain unchanged. No baseline roll,
-stacked allowance, compressed formatting or coverage deletion supplies room.
-Report production and test growth separately; count moves honestly.
+The initial-M7 cumulative allocation/instruction ceilings below remain
+unchanged. No baseline roll, stacked allowance, compressed formatting or
+coverage deletion supplies room. Report production and test growth separately;
+count moves honestly.
+
+### Complete test coverage revision
+
+The original **650 test additions / +600 net** limits underestimated the
+required phase and rejection coverage. Before this prospective test revision,
+canonical tests are **252 additions / 54 deletions / +198 net**, below both
+original limits. The initial held 149-line draft and 789-addition forecast also
+omitted required oracles; they are failed estimates, not accepted complete work.
+
+The [sealed test proposal](../build/bootstrap-evidence/named-callables-2026-10-18/worker/test-proposal/SEALED_V2/MANIFEST.json)
+combines all existing changes and remaining drafts against the same HEAD,
+including formerly untracked files. Its complete actual count is
+**1,225 additions / 62 deletions / +1,163 net**, separately from production. It covers:
+
+- Callable scope publication, exact identities/spans/conflicts, first-incomplete
+  readiness and dense multiple data bindings with the next local ordinal.
+- Exact declared/parameter target diagnostics, wrong callable arity/input/result,
+  rigid invocation, fresh self references, finite permutations and growth edges.
+- Ordered choices/reuse, simultaneous different input/output substitutions and
+  actual forwarded data operands, erased runtime slots and selected direct calls.
+- Lowered calls, ownership acquisition/transfer/drop, an independent malformed
+  public OwnershipProgram rejection, and the existing direct managed String ABI.
+- Real-main noncommuting callbacks, imports, binary/zero arity, Void, managed
+  aliases, UTF-8/NUL bytes, eager defaults and ordinary data-receiver composition.
+  The fixture-local `map_get` function adds no library API.
+
+The prospective test-only hard limits are **1,350 additions / +1,280 net**.
+Reassess remaining work at **1,300 additions or +1,225 net** before continuing.
+Necessary correctness-test growth follows the parent development rules; no
+assertion, fixture or inherited coverage is removed or compressed for room.
+The language subset, production limits/assessment point, and both fixed
+initial-M7 cumulative cost ceilings remain unchanged.
+
+These are complete drafted bytes, not a full test-pass claim. The separate
+frozen precursor native run passes both new fixtures through the existing
+strict/sanitized harness; final current-source gates and effective restored
+key, forwarding, purity and growth mutations remain required. Private
+RequestSource dependency wiring has two static reviews, not a malformed
+CheckedProgram oracle. The callable merge_hint branch has static inspection
+because accepted contracts exclude callable returns/nested callable data; no
+malformed contract, visibility hook or parallel entrypoint is added to test it.
+
+This amendment authorizes necessary test coverage only. The current source-to-C
+proxy still fails both 3% ceilings; functional tests cannot approve integration
+or establish later lambda cost headroom.
 
 Keep ordinary type substitutions and resolved callable choices as narrow
 translator inputs. A proposed FunctionSubstitution carrier did not reduce the
