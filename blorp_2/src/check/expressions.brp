@@ -16,32 +16,32 @@ import:
 		classify_receiver,
 		method_sites,
 	./model:
-		CheckedForm(UpdateRecord, ConstructRecord, ConstructVariant, ConstructList, LiteralVoid, LiteralInteger, LiteralFloat, LiteralString, ReadBinding, ReadConstant, InvokeFunction, ReadRecordField),
+		CheckedForm(UpdateRecord, ConstructRecord, ConstructVariant, ConstructList, ConstructOpaque, ProjectOpaque, LiteralVoid, LiteralInteger, LiteralFloat, LiteralString, ReadBinding, ReadConstant, InvokeFunction, ReadRecordField),
 		CheckedRecordField,
 		CheckedRecordUpdate,
 		RetainedRecordField,
 		CheckedExpr,
 		CheckedCall, CallableChoice(NamedCallable, ForwardedCallable), CallableArgument,
 		CallIdentity(DeclaredTarget, ParameterTarget), callable_parameter,
-		TypeRef(ParameterType, PureCallableType, VoidType, IntType, FloatType, StringType),
+		TypeRef(ParameterType, PureCallableType, VoidType, IntType, FloatType, StringType, OpaqueType),
 		has_callable_parameters,
 		same_type,
 		parameter_position
 	./errors:
 		CheckError, RecursionError(AnnotatedSelfCallback, GenericTailRecursionUnsupported), recursion_error,
-		ExpectedTypeSite,
+		ExpectedTypeSite(OpaqueConstruction, OpaqueProjection),
 		CheckErrorKind(ConstructorRejection, RecordRejection),
 		CallError(CallableReceiverSyntax, CallableCandidateHasCallableParameters, ImpureCallback, CallableValueRequired, CallableValueEscapes, UnknownFunction, UncallableBinding),
 		ConstantError(ConstantCalled), constant_error,
 		ConstructorError(ConstructorNeedsExpectedType),
 		RecordError(RecordNeedsExpectedType, FieldRequiresRecord),
-		ValueError(UnknownValue, ExpressionTypeMismatch),
+		ValueError(UnknownValue, ExpressionTypeMismatch, UnknownOpaqueType, NonOpaqueConversionType, ForeignOpaqueConstruction, ForeignOpaqueProjection),
 		MethodError(MethodReceiverNeedsType),
-		CheckerInvariant(InvalidRecordDeclaration, InvalidRecordField, GenericConstructorContract, InvalidInferenceWorklist, MissingCallParameter),
+		CheckerInvariant(InvalidOpaqueDeclaration, InvalidRecordDeclaration, InvalidRecordField, GenericConstructorContract, InvalidInferenceWorklist, MissingCallParameter),
 		call_error,
 		record_error,
 		value_error,
-		UnsupportedForm(IntoOpaque, FromOpaque, RangeValue, AndOrOperator, NotOperator, IfValue, MatchInExpression, LambdaValue),
+		UnsupportedForm(RangeValue, AndOrOperator, NotOperator, IfValue, MatchInExpression, LambdaValue),
 		QualifiedError(BareModuleAlias, QualifiedNotOffered, QualifiedFunctionNotCalled),
 		qualified_error,
 		unsupported_form,
@@ -49,11 +49,11 @@ import:
 		checker_invariant
 	./inference:
 		select_receiver_contract,
-		PendingBase(PendingNamedCallable, PendingForwardedCallable, AcceptedBinding, AcceptedConstant, AcceptedFloat, AcceptedInteger, AcceptedString, AcceptedVoid, PendingConstructRecord, PendingConstructVariant, PendingConstructList, PendingDirectCall, PendingUpdateRecord),
+		PendingBase(PendingNamedCallable, PendingForwardedCallable, AcceptedBinding, AcceptedConstant, AcceptedFloat, AcceptedInteger, AcceptedString, AcceptedVoid, PendingConstructRecord, PendingConstructVariant, PendingConstructList, PendingConstructOpaque, PendingProjectOpaque, PendingDirectCall, PendingUpdateRecord),
 		ListElementSource(ExpectedElementType, FirstElementType),
 		PendingOperation(AcceptedField, PendingInvocation),
 		InferenceType(AcceptedType),
-		ConstraintOrigin(ArgumentConstraint, RecordFieldConstraint, ResultConstraint, VariantConstraint, ListElementConstraint, ReceiverOverlapConstraint),
+		ConstraintOrigin(ArgumentConstraint, RecordFieldConstraint, ResultConstraint, OpaqueOperandConstraint, VariantConstraint, ListElementConstraint, ReceiverOverlapConstraint),
 		CallResultContext,
 		InferenceReadiness(ClosedInference, DeferredInference),
 		InferenceRelation(CollectArguments, RequireEquality),
@@ -89,7 +89,7 @@ import:
 		validate_complete_arguments
 	./constructors:
 		CallPlacement(ReceiverPlacement, ReturnPlacement),
-		PlannedBase(PlannedCall, PlannedLeaf, PlannedRecord, PlannedUpdate, PlannedVariant, PlannedList),
+		PlannedBase(PlannedCall, PlannedLeaf, PlannedRecord, PlannedUpdate, PlannedVariant, PlannedList, PlannedConstructOpaque, PlannedProjectOpaque),
 		finish_pending_list,
 		list_element_type,
 		plan_list_literal,
@@ -107,11 +107,11 @@ import:
 		resolve_record_field,
 		validate_record_fields,
 		validate_variant_fields
-	../utils/ids: FunctionId, function_number, record_number, variant_owner
+	../utils/ids: FunctionId, OpaqueId, OpaqueRow, opaque_number, function_number, record_number, variant_owner
 	./declarations: aliased_module
-	../namespace/namespace: NamedValue(NamedFunction, NamedConstant, NamedConstructor, NamedAlias), OfferedValue(OfferedFunction, OfferedConstant, OfferedConstructor), named_value, offered_value
+	../namespace/namespace: NamedValue(NamedFunction, NamedConstant, NamedConstructor, NamedAlias), OfferedValue(OfferedFunction, OfferedConstant, OfferedConstructor), TypeHead(OpaqueHead), named_type, named_value, offered_value
 	int as IntOps
-	../utils/source: compiler_source
+	../utils/source: compiler_source, same_module
 	option: to_result
 	../utils/syntax:
 		ParsedQualified,
@@ -226,6 +226,8 @@ private fixed record OperandRange {
 private fixed union ExpressionWork:
 	EnterExpression(ValueExpression, Option[InferenceType])
 	EnterCallable(ValueExpression)
+	FinishConstructOpaque(OpaqueId, TypeRef, Span)
+	FinishProjectOpaque(OpaqueId, TypeRef, Span)
 	ContinuePostfix(List[PendingPostfix], List[Option[InferenceType]], Int, Span, Span)
 	ScheduleCall(FunctionContract, List[ValueExpression], CallPlacement, Option[InferenceType])
 	StartCall(PendingCall, List[ValueExpression], CallPlacement, Option[InferenceType])
@@ -329,6 +331,15 @@ private pure func argument_work(call: PendingCall, arguments: List[ValueExpressi
 		_: Ok(EnterExpression(argument, hint))
 
 
+private pure func conversion_declaration(name: WrittenName, context: ResolutionContext) -> Result[OpaqueRow, CheckError]:
+	match named_type(context.namespace, context.module, name.id):
+		None: Err(value_error(name.span, UnknownOpaqueType(name.id)))
+		Some(named):
+			match named.head:
+				OpaqueHead(id): context.opaque_declarations.get(opaque_number(id)).to_result(checker_invariant(name.span, InvalidOpaqueDeclaration(id)))
+				_: Err(value_error(name.span, NonOpaqueConversionType(name.id)))
+
+
 private pure func plan_base(purity: Purity, scope: List[ScopedValue], body: ValueExpression, expectation: Option[InferenceType], context: ResolutionContext, slots: List[InferenceSlot]) -> Result[PlannedBase, CheckError]:
 	match body.base:
 		RecordExpression(fields): plan_record_literal(fields, body.base_span, expectation, context)
@@ -355,8 +366,26 @@ private pure func plan_base(purity: Purity, scope: List[ScopedValue], body: Valu
 						_: Err(value_error(name.span, UnknownValue(name.id)))
 		QualifiedName(qualified): plan_qualified(qualified, [], False, expectation, slots, context, body)
 		QualifiedApplication(qualified, arguments): plan_qualified(qualified, arguments, True, expectation, slots, context, body)
-		OpaqueWrap(_, _): Err(unsupported_form(body.base_span, IntoOpaque))
-		OpaqueUnwrap(_, _): Err(unsupported_form(body.base_span, FromOpaque))
+		OpaqueWrap(name, operand):
+			match conversion_declaration(name, context):
+				Err(error): Err(error)
+				Ok(declaration):
+					if not same_module(declaration.declaration.module, context.module):
+						Err(value_error(name.span, ForeignOpaqueConstruction(declaration.id)))
+					else:
+						match context.opaques.get(opaque_number(declaration.id)):
+							None: Err(checker_invariant(name.span, InvalidOpaqueDeclaration(declaration.id)))
+							Some(accepted): Ok(PlannedConstructOpaque(declaration.id, accepted.underlying_type.value_type, operand))
+		OpaqueUnwrap(name, operand):
+			match conversion_declaration(name, context):
+				Err(error): Err(error)
+				Ok(declaration):
+					if not same_module(declaration.declaration.module, context.module):
+						Err(value_error(name.span, ForeignOpaqueProjection(declaration.id)))
+					else:
+						match context.opaques.get(opaque_number(declaration.id)):
+							None: Err(checker_invariant(name.span, InvalidOpaqueDeclaration(declaration.id)))
+							Some(accepted): Ok(PlannedProjectOpaque(declaration.id, accepted.underlying_type.value_type, operand))
 		ListExpression(elements): plan_list_literal(elements, expectation, body.base_span)
 		RangeExpression(_, _): Err(unsupported_form(body.base_span, RangeValue))
 		LogicalExpression(_, _, _): Err(unsupported_form(body.base_span, AndOrOperator))
@@ -626,6 +655,16 @@ private pure func elaborate_value(
 												value: PendingValue = { span = written.span, readiness = ClosedInference, base = base, base_type = inference_type(value_type, [], 0), base_span = written.base_span, operations = NoPendingOperations }
 												operands = push_operand(operands, operand_count, value)
 												operand_count = IntOps.add(operand_count, 1)
+											PlannedConstructOpaque(id, underlying, operand):
+												work = push_expression_work(work, work_count, FinishConstructOpaque(id, underlying, written.base_span))
+												work_count = IntOps.add(work_count, 1)
+												work = push_expression_work(work, work_count, EnterExpression(operand, Some(AcceptedType(underlying))))
+												work_count = IntOps.add(work_count, 1)
+											PlannedProjectOpaque(id, underlying, operand):
+												work = push_expression_work(work, work_count, FinishProjectOpaque(id, underlying, written.base_span))
+												work_count = IntOps.add(work_count, 1)
+												work = push_expression_work(work, work_count, EnterExpression(operand, Some(AcceptedType(OpaqueType(id)))))
+												work_count = IntOps.add(work_count, 1)
 											PlannedRecord(literal):
 												work = push_expression_work(work, work_count, ScheduleRecord(literal))
 												work_count = IntOps.add(work_count, 1)
@@ -655,6 +694,60 @@ private pure func elaborate_value(
 											PlannedList(elements, source):
 												work = push_expression_work(work, work_count, ContinueList({ source = source, elements = elements, position = 0, start = operand_count, base_span = written.base_span, span = written.span }))
 												work_count = IntOps.add(work_count, 1)
+					FinishConstructOpaque(id, underlying, span):
+						position = IntOps.subtract(operand_count, 1)
+						match expression_operand(operands, position, span):
+							Err(error): failure = Some(error)
+							Ok(operand):
+								value: PendingValue = {
+									span = span,
+									readiness = DeferredInference,
+									base = PendingConstructOpaque(id, underlying, operand),
+									base_type = AcceptedType(OpaqueType(id)),
+									base_span = span,
+									operations = NoPendingOperations,
+								}
+								operands = operands.set(position, Some(value))
+								match operand.readiness:
+									ClosedInference: void
+									DeferredInference:
+										expected: ExpectedValue = { value_type = underlying, site = OpaqueConstruction(id) }
+										equality: InferenceEquality = {
+											expected = pending_type(operand),
+											actual = AcceptedType(expected.value_type),
+											origin = OpaqueOperandConstraint(expected, operand.span),
+											relation = RequireEquality,
+											parameter = None
+										}
+										work = push_expression_work(work, work_count, SolveConstraint(equality))
+										work_count = IntOps.add(work_count, 1)
+					FinishProjectOpaque(id, underlying, span):
+						position = IntOps.subtract(operand_count, 1)
+						match expression_operand(operands, position, span):
+							Err(error): failure = Some(error)
+							Ok(operand):
+								value: PendingValue = {
+									span = span,
+									readiness = DeferredInference,
+									base = PendingProjectOpaque(id, operand),
+									base_type = AcceptedType(underlying),
+									base_span = span,
+									operations = NoPendingOperations,
+								}
+								operands = operands.set(position, Some(value))
+								match operand.readiness:
+									ClosedInference: void
+									DeferredInference:
+										expected: ExpectedValue = { value_type = OpaqueType(id), site = OpaqueProjection(id) }
+										equality: InferenceEquality = {
+											expected = pending_type(operand),
+											actual = AcceptedType(expected.value_type),
+											origin = OpaqueOperandConstraint(expected, operand.span),
+											relation = RequireEquality,
+											parameter = None
+										}
+										work = push_expression_work(work, work_count, SolveConstraint(equality))
+										work_count = IntOps.add(work_count, 1)
 					PlanRecordUpdate(fields, span, expression_span):
 						position = IntOps.subtract(operand_count, 1)
 						match expression_operand(operands, position, expression_span):
@@ -906,6 +999,7 @@ private pure func elaborate_value(
 									IncompatibleResultInference: inspect = False
 									_: void
 							ArgumentConstraint(_, _, _, _): void
+							OpaqueOperandConstraint(_, _): void
 							VariantConstraint(_, _): void
 							RecordFieldConstraint(_, _, _): void
 							ListElementConstraint(_, _): void
@@ -1071,6 +1165,14 @@ private pure func freeze_retained_fields(fields: List[PendingRetainedField], slo
 		None: Ok(frozen)
 
 
+private pure func freeze_opaque_operand(operand: PendingValue, expected: TypeRef, site: ExpectedTypeSite, slots: List[InferenceSlot]) -> Result[CheckedExpr, CheckError]:
+	value ?= freeze_pending_value(operand, slots)
+	if same_type(value.value_type, expected):
+		Ok(value)
+	else:
+		Err(value_error(operand.span, ExpressionTypeMismatch({ expected = expected, actual = { value_type = value.value_type, span = operand.span }, expected_site = site })))
+
+
 -- Steps fold over their frozen receiver in source order. The loop keeps the
 -- checker from recursing on chain length.
 private pure func freeze_pending_value(value: PendingValue, slots: List[InferenceSlot]) -> Result[CheckedExpr, CheckError]:
@@ -1082,6 +1184,14 @@ private pure func freeze_pending_value(value: PendingValue, slots: List[Inferenc
 		AcceptedString(text): Ok(LiteralString(text))
 		AcceptedBinding(id): Ok(ReadBinding(id))
 		AcceptedConstant(id): Ok(ReadConstant(id))
+		PendingConstructOpaque(id, underlying, operand):
+			match freeze_opaque_operand(operand, underlying, OpaqueConstruction(id), slots):
+				Ok(value): Ok(ConstructOpaque(id, value))
+				Err(error): Err(error)
+		PendingProjectOpaque(id, operand):
+			match freeze_opaque_operand(operand, OpaqueType(id), OpaqueProjection(id), slots):
+				Ok(value): Ok(ProjectOpaque(id, value))
+				Err(error): Err(error)
 		PendingConstructRecord(owner, fields):
 			match freeze_record_fields(fields, slots):
 				Ok(frozen): Ok(ConstructRecord(owner, frozen))

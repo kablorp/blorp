@@ -1,9 +1,15 @@
 # Self-compilation handoff — 2026-10-18
 
 **Current direction update, 2026-10-18.** Remaining callback removal was
-abandoned. All 41 compiler files now parse; pure function types parse, while
-callable checking/execution remains pending. Pure Void returns are accepted.
-The [Option/Result catalog and plan](OPTION_RESULT_PLAN.md) owns the nine required
+abandoned. All 41 compiler files now parse. Named pure callbacks, forwarding and
+direct-call specialization are implemented; lambdas and captures remain pending.
+Pure Void returns are accepted. Ordinary opaque types are implemented with
+nominal checking followed by representation erasure; see the
+[validation report](../benchmarks/results/blorp_2_opaque_types_2026-10-18.md).
+The current ordinary self-compile probe stops at `src/own/own.brp:3:16`:
+`module list declares no public function or type set_index`, with no C produced.
+This namespace frontier does not establish complete source checking.
+The [Option/Result catalog and plan](OPTION_RESULT_PLAN.md) owns the required
 helpers and their callable prerequisites. The original starting commit and held
 work below remain historical handoff evidence, not a current-main claim.
 
@@ -119,8 +125,8 @@ green candidates remain marked unmerged until destination acceptance finishes.
 Complete [RESTRICTED_CONTROL_PLAN.md](RESTRICTED_CONTROL_PLAN.md): canonical Bool
 operators, statement/binding/function-tail/arm-tail `if`, top-level `?=`, and
 local annotations. Preserve omitted-else rules by syntactic role, exact
-diagnostic/help/span and real cleanup on propagation. Pure functions returning
-Void remain rejected under the existing signature rule.
+diagnostic/help/span and real cleanup on propagation. Pure functions may return
+Void under the current signature rule.
 
 Reassigned outer bindings through joins are already landed at `7acd6df25`.
 Reuse that path under [CARRIED_BINDINGS_PLAN.md](CARRIED_BINDINGS_PLAN.md),
@@ -161,17 +167,18 @@ memory checks. Exercise million-step tail recursion with exact results and
 
 ### 4. Accept ordinary nominal opaque types
 
-The opaque candidate already passes a full standalone functional run; preserve
-and integrate it rather than reimplementing it. Accept its semantic-key
-preparation separately from the opaque feature. Keep nominal declaration and
-application identities through checking and instance-key construction; project
-representation at the accepted specialization authority.
+Implemented under [OPAQUE_TYPES_PLAN.md](OPAQUE_TYPES_PLAN.md). Nominal identity
+and defining-module construction/projection permissions belong to Check.
+Specialize erases accepted opaque types and conversions to the existing
+representation; equal representations may share generic runtime keys. Ordinary
+declaration IDs and ordered resolved callback choices remain distinct. Lower,
+Own, Verify, Emit and runtime production are unchanged.
 
-Test explicit construction/projection, distinct equal-representation types,
-generic substitution, visibility, managed underlying values and destruction.
-Reuse existing aggregate layout and ownership. Opaque wrappers do not imply
-allocation-free physical storage. [OPAQUE_TYPES_PLAN.md](OPAQUE_TYPES_PLAN.md)
-owns the design. This work can proceed beside steps 2–3 with shared-file review.
+The [current validation report](../benchmarks/results/blorp_2_opaque_types_2026-10-18.md)
+owns current-base tests, costs, corpus comparison and restored fault probes.
+The recovered old P+F candidate is historical evidence; its SemanticRef/key
+preparation is withdrawn and must not be resumed. Actual compiler-product
+destruction-depth acceptance remains open separately from opaque semantics.
 
 ### 5. Finish independent byte, loop and source-pattern migrations
 

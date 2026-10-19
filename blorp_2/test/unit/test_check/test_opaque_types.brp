@@ -1,0 +1,784 @@
+-- Source cases assert the published checked IDs, error kinds and diagnostics.
+import:
+	../../../src/check/check: CheckFailure, check, check_errors, checked_functions, failure_program
+	../../../src/check/errors as Errors
+	../../../src/check/inference as Inference
+	../../../src/check/model as Model
+	../../../src/check/render: render_failure
+	../../../src/parse/assemble: parsed_contents
+	../../../src/utils/ids: FunctionId, OpaqueId, function_number, inventory_functions, inventory_opaques, inventory_records, opaque_number, record_number
+	../../../src/utils/names: name_spelling
+	../../../src/utils/source: module_source, root_module_id, same_source
+	../../../src/utils/syntax: ExpressionBase(DirectApplication, OpaqueWrap, OpaqueUnwrap), ParsedBody(ParsedValueBody), ValueExpression, same_span, type_span
+	../module_input: ModuleInput, PRIMITIVE_BASE, parse_modules_with_base
+	test: TestSuite
+
+
+private ID_MODULE: String =
+	|opaque type Id = Int
+	|pure func make(value: Int) -> Id:
+	|    into_opaque Id(value)
+	|pure func number(value: Id) -> Int:
+	|    from_opaque Id(value)
+	|
+
+
+private MAIN: String =
+	|func main() -> Int:
+	|    0
+	|
+
+
+private pure func accepts(inputs: List[ModuleInput]) -> Bool:
+	match parse_modules_with_base(inputs, PRIMITIVE_BASE):
+		Ok(program): check(program).is_ok()
+		Err(_): False
+
+
+private pure func rejection(
+	inputs: List[ModuleInput],
+	prefix: String,
+	length: Int,
+	message: String,
+	help: String,
+) -> Option[CheckFailure]:
+	match parse_modules_with_base(inputs, PRIMITIVE_BASE):
+		Err(_): None
+		Ok(program):
+			match check(program):
+				Ok(_): None
+				Err(failure):
+					typed = check_errors(failure)
+					rendered = render_failure(failure)
+					if (
+						typed.remaining.is_empty() and rendered.remaining.is_empty()
+						and same_source(typed.first.span.source, module_source(root_module_id()))
+						and typed.first.span.start == prefix.length()
+						and typed.first.span.end == prefix.length() + length
+						and same_source(rendered.first.span.source, typed.first.span.source)
+						and rendered.first.span.start == typed.first.span.start
+						and rendered.first.span.end == typed.first.span.end
+						and rendered.first.message == message and rendered.first.help == help
+						and rendered.first.note.is_none()
+					):
+						Some(failure)
+					else:
+						None
+
+
+private pure func names_issued_opaque(failure: CheckFailure, id: OpaqueId) -> Bool:
+	match inventory_opaques(parsed_contents(failure_program(failure)).declarations):
+		[row]: opaque_number(id) == opaque_number(row.id)
+		_: False
+
+
+private pure func nested_identity_calls(function: Model.CheckedFunction, target: FunctionId, value_type: Model.TypeRef, written: ValueExpression) -> Bool:
+	match (written.base, Model.function_calls(function)):
+		(DirectApplication(outer_name, [inner_input]), [first, second]):
+			match (inner_input.base, first.target, second.target):
+				(DirectApplication(inner_name, [_]), Model.UserFunction(first_id, [first_type], []), Model.UserFunction(second_id, [second_type], [])):
+					(
+						function_number(first_id) == function_number(target)
+						and function_number(second_id) == function_number(target)
+						and Model.same_type(first_type, value_type) and Model.same_type(second_type, value_type)
+						and same_span(first.span, inner_name.span) and same_span(second.span, outer_name.span)
+					)
+				_: False
+		_: False
+
+
+pure func test_explicit_conversions_accept_nested_generic_calls() -> Bool:
+	source: String =
+		|opaque type Id = Int
+		|pure func identity[T](value: T) -> T:
+		|    value
+		|pure func make(value: Int) -> Id:
+		|    into_opaque Id(identity(identity(value)))
+		|pure func number(value: Id) -> Int:
+		|    from_opaque Id(identity(identity(value)))
+		|func main() -> Int:
+		|    number(make(7))
+		|
+	match parse_modules_with_base([{ source = source, targets = [] }], PRIMITIVE_BASE):
+		Err(_): False
+		Ok(program):
+			match check(program):
+				Err(_): False
+				Ok(checked):
+					inventory = parsed_contents(program).declarations
+					match (inventory_opaques(inventory), inventory_functions(inventory), checked_functions(checked).functions):
+						([declaration], [identity_source, make_source, number_source, _], [_, make, number, _]):
+							match (make_source.declaration.body, number_source.declaration.body, make.body, number.body):
+								(ParsedValueBody(written_make), ParsedValueBody(written_number), Model.CheckedValueBody(Model.ReturnExpression(made)), Model.CheckedValueBody(Model.ReturnExpression(projected))):
+									match (written_make.base, written_number.base, made.form, projected.form):
+										(OpaqueWrap(_, wrap_input), OpaqueUnwrap(_, unwrap_input), Model.ConstructOpaque(make_id, wrapped), Model.ProjectOpaque(number_id, unwrapped)):
+											(
+												opaque_number(make_id) == opaque_number(declaration.id)
+												and opaque_number(number_id) == opaque_number(declaration.id)
+												and Model.same_type(made.value_type, Model.OpaqueType(declaration.id))
+												and Model.same_type(wrapped.value_type, Model.IntType)
+												and Model.same_type(projected.value_type, Model.IntType)
+												and Model.same_type(unwrapped.value_type, Model.OpaqueType(declaration.id))
+												and same_span(made.span, written_make.base_span)
+												and same_span(projected.span, written_number.base_span)
+												and same_span(wrapped.span, wrap_input.span)
+												and same_span(unwrapped.span, unwrap_input.span)
+												and nested_identity_calls(make, identity_source.id, Model.IntType, wrap_input)
+												and nested_identity_calls(number, identity_source.id, Model.OpaqueType(declaration.id), unwrap_input)
+											)
+										_: False
+								_: False
+						_: False
+
+
+pure func test_public_opaque_reference_crosses_module_boundary() -> Bool:
+	main: String =
+		|import:
+		|    ./id: Id, make, number
+		|pure func read(value: Id) -> Int:
+		|    number(value)
+		|func main() -> Int:
+		|    read(make(7))
+		|
+	accepts([{ source = main, targets = [1] }, { source = ID_MODULE, targets = [] }])
+
+
+pure func test_conversion_expectation_closes_zero_argument_generic_result() -> Bool:
+	source: String =
+		|opaque type Rows = List[Int]
+		|pure func empty[T]() -> List[T]:
+		|    []
+		|pure func make() -> Rows:
+		|    into_opaque Rows(empty())
+		|func main() -> Int:
+		|    0
+		|
+	match parse_modules_with_base([{ source = source, targets = [] }], PRIMITIVE_BASE):
+		Err(_): False
+		Ok(program):
+			match check(program):
+				Err(_): False
+				Ok(checked):
+					match (inventory_opaques(parsed_contents(program).declarations), checked_functions(checked).functions):
+						([declaration], [empty, make, _]):
+							match make.body:
+								Model.CheckedValueBody(Model.ReturnExpression(value)):
+									match value.form:
+										Model.ConstructOpaque(id, operand):
+											match operand.form:
+												Model.InvokeFunction(call, []):
+													match call.target:
+														Model.UserFunction(target, [argument], []):
+															(
+																opaque_number(id) == opaque_number(declaration.id)
+																and function_number(target) == function_number(empty.id)
+																and Model.same_type(argument, Model.IntType)
+																and Model.same_type(operand.value_type, Model.ListType(Model.IntType))
+															)
+														_: False
+												_: False
+										_: False
+								_: False
+						_: False
+
+
+pure func test_unused_underlying_rows_keep_nominal_ids_and_annotations() -> Bool:
+	source: String =
+		|private fixed record Representation { value: Int }
+		|opaque type Id = Representation
+		|opaque type Alias = Id
+		|func main() -> Int:
+		|    0
+		|
+	match parse_modules_with_base([{ source = source, targets = [] }], PRIMITIVE_BASE):
+		Err(_): False
+		Ok(program):
+			match check(program):
+				Err(_): False
+				Ok(checked):
+					contents = checked_functions(checked)
+					match (inventory_opaques(parsed_contents(program).declarations), contents.opaques, contents.records):
+						([first, second], [checked_first, checked_second], [representation]):
+							(
+								opaque_number(checked_first.id) == opaque_number(first.id)
+								and opaque_number(checked_second.id) == opaque_number(second.id)
+								and Model.same_type(checked_first.underlying_type.value_type, Model.RecordType(representation.id))
+								and Model.same_type(checked_second.underlying_type.value_type, Model.OpaqueType(first.id))
+								and same_span(checked_first.underlying_type.span, type_span(first.declaration.underlying))
+								and same_span(checked_second.underlying_type.span, type_span(second.declaration.underlying))
+							)
+						_: False
+
+
+-- The source case pins diagnostic priority. The direct solver case below
+-- checks constraint independence; a first error can mask later binding facts.
+pure func test_later_generic_child_error_precedes_earlier_conversion_mismatch() -> Bool:
+	source: String =
+		|opaque type Id = Int
+		|opaque type Rows = List[Int]
+		|pure func empty[T]() -> List[T]:
+		|    []
+		|pure func text(value: List[Int]) -> String:
+		|    "bad"
+		|pure func identity[T](value: T) -> T:
+		|    value
+		|pure func consume(first: Id, second: Rows) -> Int:
+		|    0
+		|func main() -> Int:
+		|    consume(into_opaque Id(text(empty())), into_opaque Rows(identity(
+	match rejection(
+		[{ source = source + "unknown)))\n", targets = [] }], source, 7,
+		"unknown value", "use this function's parameter name, a declared variant, or a call",
+	):
+		Some(failure):
+			match check_errors(failure).first.kind:
+				Errors.ValueRejection(Errors.UnknownValue(name)):
+					name_spelling(parsed_contents(failure_program(failure)).names, name) == Some("unknown")
+				_: False
+		None: False
+
+
+pure func test_operand_mismatch_keeps_later_generic_constraint_independent() -> Bool:
+	source: String =
+		|opaque type Id = Int
+		|pure func identity[T](value: T) -> T:
+		|    value
+		|func main() -> Int:
+		|    0
+		|
+	match parse_modules_with_base([{ source = source, targets = [] }], PRIMITIVE_BASE):
+		Err(_): False
+		Ok(program):
+			match (inventory_opaques(parsed_contents(program).declarations), inventory_functions(parsed_contents(program).declarations)):
+				([opaque_row], [function, _]):
+					match function.declaration.type_parameters:
+						[written]:
+							parameter = Model.type_parameter_id(Model.FunctionDeclaration(function.id), 0)
+							slots: List[Inference.InferenceSlot] = [{ parameter = parameter, call_span = written.span, first_argument = None, state = Inference.UnboundVariable(0) }]
+							expected: Inference.ExpectedValue = { value_type = Model.IntType, site = Errors.OpaqueConstruction(opaque_row.id) }
+							origin = Inference.OpaqueOperandConstraint(expected, opaque_row.declaration.type_name.span)
+							mismatch: Inference.InferenceEquality = { expected = Inference.AcceptedType(Model.StringType), actual = Inference.AcceptedType(Model.IntType), origin = origin, relation = Inference.RequireEquality, parameter = None }
+							match Inference.inspect_inference_equality(mismatch, slots):
+								Ok(Inference.CompleteEquality):
+									variable = Inference.inference_type(Model.ParameterType(parameter), [parameter], 0)
+									later = { mismatch | expected = variable }
+									match Inference.inspect_inference_equality(later, slots):
+										Ok(Inference.UpdateInferenceSlots([update])):
+											match update.slot.state:
+												Inference.BoundVariable(Inference.AcceptedType(actual)):
+													update.position == 0 and Model.same_parameter(update.slot.parameter, parameter) and Model.same_type(actual, Model.IntType)
+												_: False
+										_: False
+								_: False
+						_: False
+				_: False
+
+
+pure func test_foreign_construction_rejects_before_invalid_operand() -> Bool:
+	conversion: String =
+		|import:
+		|    ./id: Id
+		|func main() -> Int:
+		|    into_opaque
+	prefix = conversion + " "
+	match rejection(
+		[{ source = prefix + "Id(unknown)\n", targets = [1] }, { source = ID_MODULE, targets = [] }],
+		prefix, 2,
+		"opaque values can be constructed only in their declaring module",
+		"call a public constructor from the declaring module",
+	):
+		Some(failure):
+			match check_errors(failure).first.kind:
+				Errors.ValueRejection(Errors.ForeignOpaqueConstruction(id)): names_issued_opaque(failure, id)
+				_: False
+		None: False
+
+
+pure func test_foreign_projection_rejects_before_invalid_operand() -> Bool:
+	conversion: String =
+		|import:
+		|    ./id: Id
+		|func main() -> Int:
+		|    from_opaque
+	prefix = conversion + " "
+	match rejection(
+		[{ source = prefix + "Id(unknown)\n", targets = [1] }, { source = ID_MODULE, targets = [] }],
+		prefix, 2,
+		"opaque values can be projected only in their declaring module",
+		"call a public accessor from the declaring module",
+	):
+		Some(failure):
+			match check_errors(failure).first.kind:
+				Errors.ValueRejection(Errors.ForeignOpaqueProjection(id)): names_issued_opaque(failure, id)
+				_: False
+		None: False
+
+
+pure func test_missing_conversion_type_has_exact_diagnostic() -> Bool:
+	conversion: String =
+		|func main() -> Int:
+		|    into_opaque
+	prefix = conversion + " "
+	match rejection(
+		[{ source = prefix + "Missing(7)\n", targets = [] }], prefix, 7,
+		"unknown opaque type", "import or declare an opaque type before converting it",
+	):
+		Some(failure):
+			match check_errors(failure).first.kind:
+				Errors.ValueRejection(Errors.UnknownOpaqueType(name)):
+					name_spelling(parsed_contents(failure_program(failure)).names, name) == Some("Missing")
+				_: False
+		None: False
+
+
+pure func test_nonopaque_conversion_head_has_exact_diagnostic() -> Bool:
+	conversion: String =
+		|func main() -> Int:
+		|    into_opaque
+	prefix = conversion + " "
+	match rejection(
+		[{ source = prefix + "Int(7)\n", targets = [] }], prefix, 3,
+		"type is not opaque", "use into_opaque or from_opaque only with a declared opaque type",
+	):
+		Some(failure):
+			match check_errors(failure).first.kind:
+				Errors.ValueRejection(Errors.NonOpaqueConversionType(name)):
+					name_spelling(parsed_contents(failure_program(failure)).names, name) == Some("Int")
+				_: False
+		None: False
+
+
+pure func test_construction_mismatch_uses_complete_operand_span() -> Bool:
+	body: String =
+		|func main() -> Int:
+		|    unused = into_opaque Id(
+	prefix = ID_MODULE + body
+	match rejection(
+		[{ source = prefix + "\"bad\")\n    0\n", targets = [] }], prefix, 5,
+		"opaque construction value has the wrong type", "pass the declared underlying type to into_opaque",
+	):
+		Some(failure):
+			match check_errors(failure).first.kind:
+				Errors.ValueRejection(Errors.ExpressionTypeMismatch(mismatch)):
+					match mismatch.expected_site:
+						Errors.OpaqueConstruction(id):
+							(
+								names_issued_opaque(failure, id)
+								and Model.same_type(mismatch.expected, Model.IntType)
+								and Model.same_type(mismatch.actual.value_type, Model.StringType)
+								and same_span(mismatch.actual.span, check_errors(failure).first.span)
+							)
+						_: False
+				_: False
+		None: False
+
+
+pure func test_projection_mismatch_uses_complete_operand_span() -> Bool:
+	body: String =
+		|func main() -> Int:
+		|    from_opaque Id(
+	prefix = ID_MODULE + body
+	match rejection(
+		[{ source = prefix + "7)\n", targets = [] }], prefix, 1,
+		"opaque projection value has the wrong type", "pass a value of the named opaque type to from_opaque",
+	):
+		Some(failure):
+			match check_errors(failure).first.kind:
+				Errors.ValueRejection(Errors.ExpressionTypeMismatch(mismatch)):
+					match mismatch.expected_site:
+						Errors.OpaqueProjection(id):
+							(
+								names_issued_opaque(failure, id)
+								and Model.same_type(mismatch.expected, Model.OpaqueType(id))
+								and Model.same_type(mismatch.actual.value_type, Model.IntType)
+								and same_span(mismatch.actual.span, check_errors(failure).first.span)
+							)
+						_: False
+				_: False
+		None: False
+
+
+pure func test_invalid_construction_operand_precedes_outer_argument_mismatch() -> Bool:
+	prefix: String =
+		|opaque type Id = Int
+		|pure func accept(value: Int) -> Int:
+		|    value
+		|pure func bad() -> Int:
+		|    accept(into_opaque Id(
+	ending: String =
+		|))
+		|func main() -> Int:
+		|    0
+		|
+	match rejection(
+		[{ source = prefix + "\"wrong\"" + ending, targets = [] }], prefix, 7,
+		"opaque construction value has the wrong type", "pass the declared underlying type to into_opaque",
+	):
+		Some(failure):
+			match check_errors(failure).first.kind:
+				Errors.ValueRejection(Errors.ExpressionTypeMismatch(mismatch)):
+					match mismatch.expected_site:
+						Errors.OpaqueConstruction(id):
+							(
+								names_issued_opaque(failure, id)
+								and Model.same_type(mismatch.expected, Model.IntType)
+								and Model.same_type(mismatch.actual.value_type, Model.StringType)
+								and same_span(mismatch.actual.span, check_errors(failure).first.span)
+							)
+						_: False
+				_: False
+		None: False
+
+
+pure func test_invalid_projection_operand_precedes_outer_argument_mismatch() -> Bool:
+	prefix: String =
+		|opaque type Id = Int
+		|pure func accept(value: String) -> Int:
+		|    0
+		|pure func bad() -> Int:
+		|    accept(from_opaque Id(
+	ending: String =
+		|))
+		|func main() -> Int:
+		|    0
+		|
+	match rejection(
+		[{ source = prefix + "1" + ending, targets = [] }], prefix, 1,
+		"opaque projection value has the wrong type", "pass a value of the named opaque type to from_opaque",
+	):
+		Some(failure):
+			match check_errors(failure).first.kind:
+				Errors.ValueRejection(Errors.ExpressionTypeMismatch(mismatch)):
+					match mismatch.expected_site:
+						Errors.OpaqueProjection(id):
+							(
+								names_issued_opaque(failure, id)
+								and Model.same_type(mismatch.expected, Model.OpaqueType(id))
+								and Model.same_type(mismatch.actual.value_type, Model.IntType)
+								and same_span(mismatch.actual.span, check_errors(failure).first.span)
+							)
+						_: False
+				_: False
+		None: False
+
+
+pure func test_equal_underlying_types_remain_nominal_in_the_defining_module() -> Bool:
+	declarations: String =
+		|opaque type First = Int
+		|opaque type Second = Int
+		|pure func accept(value: First) -> Int:
+		|    from_opaque First(value)
+		|
+	body: String =
+		|func main() -> Int:
+		|
+	call_prefix = declarations + body + "    "
+	prefix = call_prefix + "accept("
+	operand = "into_opaque Second(7)"
+	annotation: String =
+		|opaque type First = Int
+		|opaque type Second = Int
+		|pure func accept(value:
+	annotation_prefix = annotation + " "
+	match parse_modules_with_base([{ source = prefix + operand + ")\n", targets = [] }], PRIMITIVE_BASE):
+		Err(_): False
+		Ok(program):
+			match check(program):
+				Ok(_): False
+				Err(failure):
+					errors = check_errors(failure)
+					diagnostics = render_failure(failure)
+					match errors.first.kind:
+						Errors.CallRejection(Errors.ArgumentTypeMismatch(mismatch)):
+							nominal_types = match (inventory_opaques(parsed_contents(program).declarations), mismatch.expected, mismatch.actual.value_type):
+								([first, second], Model.OpaqueType(expected), Model.OpaqueType(actual)):
+									opaque_number(expected) == opaque_number(first.id) and opaque_number(actual) == opaque_number(second.id)
+								_: False
+							match mismatch.expected_site:
+								Errors.SourceAnnotation(annotation):
+									(
+										errors.remaining.is_empty() and diagnostics.remaining.is_empty()
+										and nominal_types
+										and mismatch.argument_position == 0
+										and not Model.same_type(mismatch.expected, mismatch.actual.value_type)
+										and same_source(errors.first.span.source, module_source(root_module_id()))
+										and errors.first.span.start == call_prefix.length()
+										and errors.first.span.end == call_prefix.length() + "accept".length()
+										and same_source(mismatch.actual.span.source, errors.first.span.source)
+										and mismatch.actual.span.start == prefix.length()
+										and mismatch.actual.span.end == prefix.length() + operand.length()
+										and same_source(annotation.source, errors.first.span.source)
+										and annotation.start == annotation_prefix.length()
+										and annotation.end == annotation.start + "First".length()
+										and same_source(diagnostics.first.span.source, errors.first.span.source)
+										and diagnostics.first.span.start == errors.first.span.start
+										and diagnostics.first.span.end == errors.first.span.end
+										and diagnostics.first.message == "argument type does not match the parameter type"
+										and diagnostics.first.help == "use an expression of type First here"
+										and diagnostics.first.note.is_none()
+									)
+								_: False
+						_: False
+
+
+pure func test_generic_growth_inside_construction_is_observed() -> Bool:
+	header: String =
+		|pure func grow[T](value: T) -> Id:
+		|
+	prefix = ID_MODULE + header + "    into_opaque Id(number("
+	match rejection([{ source = prefix + "grow([value])))\n" + MAIN, targets = [] }], prefix, "grow".length(),
+		"recursive calls grow type arguments without bound", "pass recursive type arguments unchanged, permute them, or reset them to concrete types"):
+		Some(failure):
+			match check_errors(failure).first.kind:
+				Errors.RecursionRejection(Errors.GrowingRecursiveInstantiation): True
+				_: False
+		None: False
+
+
+pure func test_generic_growth_inside_projection_is_observed() -> Bool:
+	header: String =
+		|pure func grow[T](value: T) -> Int:
+		|
+	prefix = ID_MODULE + header + "    from_opaque Id(make("
+	match rejection([{ source = prefix + "grow([value])))\n" + MAIN, targets = [] }], prefix, "grow".length(),
+		"recursive calls grow type arguments without bound", "pass recursive type arguments unchanged, permute them, or reset them to concrete types"):
+		Some(failure):
+			match check_errors(failure).first.kind:
+				Errors.RecursionRejection(Errors.GrowingRecursiveInstantiation): True
+				_: False
+		None: False
+
+
+pure func test_construction_around_self_call_is_not_tail_recursion() -> Bool:
+	header: String =
+		|@tail_recursive pure func grow(value: Int) -> Id:
+		|
+	prefix = ID_MODULE + header + "    into_opaque Id(number("
+	match rejection([{ source = prefix + "grow(value)))\n" + MAIN, targets = [] }], prefix, "grow(value)".length(),
+		"recursive call is not in tail position", "return this call directly, or remove @tail_recursive"):
+		Some(failure):
+			match (check_errors(failure).first.kind, inventory_functions(parsed_contents(failure_program(failure)).declarations)):
+				(Errors.RecursionRejection(Errors.NonTailSelfCall(id)), [_, _, grow, _]): function_number(id) == function_number(grow.id)
+				_: False
+		None: False
+
+
+pure func test_projection_around_self_call_is_not_tail_recursion() -> Bool:
+	header: String =
+		|@tail_recursive pure func grow(value: Int) -> Int:
+		|
+	prefix = ID_MODULE + header + "    from_opaque Id(make("
+	match rejection([{ source = prefix + "grow(value)))\n" + MAIN, targets = [] }], prefix, "grow(value)".length(),
+		"recursive call is not in tail position", "return this call directly, or remove @tail_recursive"):
+		Some(failure):
+			match (check_errors(failure).first.kind, inventory_functions(parsed_contents(failure_program(failure)).declarations)):
+				(Errors.RecursionRejection(Errors.NonTailSelfCall(id)), [_, _, grow, _]): function_number(id) == function_number(grow.id)
+				_: False
+		None: False
+
+
+pure func test_private_opaque_cannot_appear_in_public_signature() -> Bool:
+	prefix_body: String =
+		|private opaque type Secret = Int
+		|pure func reveal(value:
+	prefix = prefix_body + " "
+	suffix: String =
+		|Secret) -> Int:
+		|    0
+		|
+	match rejection(
+		[{ source = prefix + suffix + MAIN, targets = [] }], prefix, 6,
+		"Secret is private but appears in public declaration reveal",
+		"make Secret public, or make reveal private",
+	):
+		Some(failure):
+			match check_errors(failure).first.kind:
+				Errors.TypeTermRejection(Errors.PrivateTypeInPublicDeclaration(secret, declaration)):
+					names = parsed_contents(failure_program(failure)).names
+					(
+						name_spelling(names, secret) == Some("Secret")
+						and name_spelling(names, declaration) == Some("reveal")
+					)
+				_: False
+		None: False
+
+
+pure func test_opaque_type_cannot_be_applied() -> Bool:
+	header: String =
+		|pure func accept(value:
+	prefix = ID_MODULE + header + " "
+	suffix: String =
+		|Id[Int]) -> Int:
+		|    0
+		|
+	match rejection(
+		[{ source = prefix + suffix + MAIN, targets = [] }], prefix, 2,
+		"type does not accept a type argument",
+		"apply a declared generic union or record, such as Box[Int]",
+	):
+		Some(failure):
+			match check_errors(failure).first.kind:
+				Errors.TypeTermRejection(Errors.NonApplicableType(name)):
+					name_spelling(parsed_contents(failure_program(failure)).names, name) == Some("Id")
+				_: False
+		None: False
+
+
+pure func test_opaque_receiver_does_not_inherit_int_method() -> Bool:
+	body: String =
+		|pure func increment(value: Int) -> Int:
+		|    value
+		|func main() -> Int:
+		|    make(7).
+	prefix = ID_MODULE + body
+	suffix: String =
+		|increment()
+		|
+	match rejection(
+		[{ source = prefix + suffix, targets = [] }], prefix, 9,
+		"argument type does not match the parameter type", "use an expression of type Int here",
+	):
+		Some(failure):
+			match check_errors(failure).first.kind:
+				Errors.CallRejection(Errors.ArgumentTypeMismatch(mismatch)):
+					match mismatch.actual.value_type:
+						Model.OpaqueType(id):
+							(
+								names_issued_opaque(failure, id)
+								and Model.same_type(mismatch.expected, Model.IntType)
+								and mismatch.argument_position == 0
+								and same_span(mismatch.actual.span, check_errors(failure).first.span)
+							)
+						_: False
+				_: False
+		None: False
+
+
+pure func test_opaque_receiver_does_not_expose_underlying_field() -> Bool:
+	prefix: String =
+		|fixed record Representation { value: Int }
+		|opaque type Box = Representation
+		|pure func read(value: Box) -> Int:
+		|    value.
+	suffix: String =
+		|value
+		|
+	match rejection(
+		[{ source = prefix + suffix + MAIN, targets = [] }], prefix, 5,
+		"field access requires a record value",
+		"read a declared record field, or use parentheses for a UFCS function call",
+	):
+		Some(failure):
+			match check_errors(failure).first.kind:
+				Errors.RecordRejection(Errors.FieldRequiresRecord(Model.OpaqueType(id))):
+					names_issued_opaque(failure, id)
+				_: False
+		None: False
+
+
+private AGGREGATE_ARGUMENTS: String =
+	|opaque type A = Int
+	|opaque type B = Int
+	|fixed record Box[T] { value: T }
+	|pure func list_b() -> List[B]:
+	|    [into_opaque B(7)]
+	|pure func box_b() -> Box[B]:
+	|    { value = into_opaque B(7) }
+	|pure func take_list(value: List[A]) -> Int:
+	|    0
+	|pure func take_box(value: Box[A]) -> Int:
+	|    0
+	|func main() -> Int:
+	|
+
+
+private pure func rejects_nominal_aggregate(callee: String, argument: String, expected: String) -> Bool:
+	prefix = AGGREGATE_ARGUMENTS + "    "
+	argument_start = prefix.length() + callee.length() + 1
+	source = prefix + callee + "(" + argument + ")\n"
+	match rejection(
+		[{ source = source, targets = [] }], prefix, callee.length(),
+		"argument type does not match the parameter type", "use an expression of type " + expected + " here",
+	):
+		None: False
+		Some(failure):
+			match check_errors(failure).first.kind:
+				Errors.CallRejection(Errors.ArgumentTypeMismatch(mismatch)):
+					inventory = parsed_contents(failure_program(failure)).declarations
+					nominal_types = match (inventory_opaques(inventory), inventory_records(inventory)):
+						([first, second], [box]):
+							match (mismatch.expected, mismatch.actual.value_type):
+								(Model.ListType(Model.OpaqueType(expected)), Model.ListType(Model.OpaqueType(actual))):
+									opaque_number(expected) == opaque_number(first.id) and opaque_number(actual) == opaque_number(second.id)
+								(Model.AppliedRecordType(expected_box, [Model.OpaqueType(expected)]), Model.AppliedRecordType(actual_box, [Model.OpaqueType(actual)])):
+									(
+										record_number(expected_box) == record_number(box.id)
+										and record_number(actual_box) == record_number(box.id)
+										and opaque_number(expected) == opaque_number(first.id)
+										and opaque_number(actual) == opaque_number(second.id)
+									)
+								_: False
+						_: False
+					(
+						nominal_types
+						and mismatch.actual.span.start == argument_start
+						and mismatch.actual.span.end == argument_start + argument.length()
+						and same_source(mismatch.actual.span.source, module_source(root_module_id()))
+					)
+				_: False
+
+
+pure func test_list_elements_keep_opaque_identity() -> Bool:
+	rejects_nominal_aggregate("take_list", "list_b()", "List[A]")
+
+
+pure func test_box_arguments_keep_opaque_identity() -> Bool:
+	rejects_nominal_aggregate("take_box", "box_b()", "Box[A]")
+
+
+pure func test_opaque_only_root_reports_missing_main_at_eof() -> Bool:
+	source: String =
+		|opaque type Name = Int
+		|
+	match rejection(
+		[{ source = source, targets = [] }], source, 0,
+		"expected a main function", "declare func main() -> Int: as the entrypoint",
+	):
+		None: False
+		Some(failure):
+			match check_errors(failure).first.kind:
+				Errors.SignatureRejection(Errors.MissingMain): True
+				_: False
+
+
+tests: TestSuite = {
+	description = "Blorp 2 ordinary opaque access and conversions",
+	tests = [
+		("opaque-only root reports MissingMain at exact EOF", test_opaque_only_root_reports_missing_main_at_eof),
+		("List elements keep checked opaque identity", test_list_elements_keep_opaque_identity),
+		("Box arguments keep checked opaque identity", test_box_arguments_keep_opaque_identity),
+		("private opaque cannot appear in public signature", test_private_opaque_cannot_appear_in_public_signature),
+		("opaque type cannot be applied", test_opaque_type_cannot_be_applied),
+		("opaque receiver does not inherit Int method", test_opaque_receiver_does_not_inherit_int_method),
+		("opaque receiver does not expose underlying field", test_opaque_receiver_does_not_expose_underlying_field),
+		("generic growth inside construction is observed", test_generic_growth_inside_construction_is_observed),
+		("generic growth inside projection is observed", test_generic_growth_inside_projection_is_observed),
+		("construction around self call is not tail recursion", test_construction_around_self_call_is_not_tail_recursion),
+		("projection around self call is not tail recursion", test_projection_around_self_call_is_not_tail_recursion),
+		("nested generic calls in explicit conversions", test_explicit_conversions_accept_nested_generic_calls),
+		("public opaque references cross modules", test_public_opaque_reference_crosses_module_boundary),
+		("conversion expectation closes zero-argument generic result", test_conversion_expectation_closes_zero_argument_generic_result),
+		("unused underlying rows preserve IDs and full annotations", test_unused_underlying_rows_keep_nominal_ids_and_annotations),
+		("later generic child error precedes earlier conversion mismatch", test_later_generic_child_error_precedes_earlier_conversion_mismatch),
+		("operand mismatch keeps later generic constraint independent", test_operand_mismatch_keeps_later_generic_constraint_independent),
+		("foreign construction precedes invalid operand", test_foreign_construction_rejects_before_invalid_operand),
+		("foreign projection precedes invalid operand", test_foreign_projection_rejects_before_invalid_operand),
+		("unknown opaque conversion type", test_missing_conversion_type_has_exact_diagnostic),
+		("nonopaque conversion head", test_nonopaque_conversion_head_has_exact_diagnostic),
+		("construction mismatch operand span", test_construction_mismatch_uses_complete_operand_span),
+		("projection mismatch operand span", test_projection_mismatch_uses_complete_operand_span),
+		("invalid construction operand precedes outer argument mismatch", test_invalid_construction_operand_precedes_outer_argument_mismatch),
+		("invalid projection operand precedes outer argument mismatch", test_invalid_projection_operand_precedes_outer_argument_mismatch),
+		("equal underlying types stay nominal in defining module", test_equal_underlying_types_remain_nominal_in_the_defining_module),
+	]
+}

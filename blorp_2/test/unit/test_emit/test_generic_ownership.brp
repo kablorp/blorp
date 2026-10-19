@@ -1,12 +1,13 @@
 import:
 	../../../src/utils/names: program_names
+	../../../src/check/model as Checked
 	../../../src/utils/source: module_source, root_module_id
 	../../../src/emit/emit: emit
 	../../../src/lex/lex: lex
 	../../../src/lower/lower as Lower
 	../../../src/own/own as Own
 	../../../src/specialize/specialize as Concrete
-	../../../src/utils/syntax: Diagnostic, FunctionExecution(OrdinaryCalls)
+	../../../src/utils/syntax: Diagnostic, FunctionExecution(OrdinaryCalls), same_span
 	../../../src/verify/verify: verify
 	../input: check, parse, setup_diagnostic
 	test: TestSuite
@@ -22,11 +23,15 @@ private SOURCE: String =
 	|
 
 
-private pure func lowered(source: String) -> Result[Lower.LoweredProgram, Diagnostic]:
+private pure func specialized(source: String) -> Result[Concrete.SpecializedProgram, Diagnostic]:
 	tokens ?= lex(module_source(root_module_id()), source, program_names().names)
 	parsed ?= parse(tokens)
 	checked ?= check(parsed).map_err(setup_diagnostic)
-	concrete ?= Concrete.specialize(checked)
+	Concrete.specialize(checked)
+
+
+private pure func lowered(source: String) -> Result[Lower.LoweredProgram, Diagnostic]:
+	concrete ?= specialized(source)
 	Lower.lower(concrete)
 
 
@@ -355,9 +360,241 @@ pure func test_emitter_projects_distinct_int_and_string_instance_signatures() ->
 			False
 
 
+private OPAQUE_SOURCE: String =
+	|opaque type Text = String
+	|opaque type Texts = List[Text]
+	|pure func wrap(value: String) -> Text:
+	|    into_opaque Text(value)
+	|pure func project(value: Text) -> String:
+	|    from_opaque Text(value)
+	|pure func wrap_list(value: List[Text]) -> Texts:
+	|    into_opaque Texts(value)
+	|pure func project_list(value: Texts) -> List[Text]:
+	|    from_opaque Texts(value)
+	|func main() -> Int:
+	|    unused_text = project(wrap("owned"))
+	|    unused_texts = project_list(wrap_list([]))
+	|    0
+	|
+
+
+private pure func projected_signature(
+	signature: Concrete.FunctionSignature,
+	expected: Concrete.TypeRef,
+) -> Bool:
+	match signature.parameters:
+		[parameter]:
+			Concrete.same_type(parameter, expected) and Concrete.same_type(signature.return_type, expected)
+		_: False
+
+
+private pure func concrete_parameter_return(
+	function: Concrete.ConcreteFunction,
+	expected: Concrete.TypeRef,
+) -> Bool:
+	match (function.bindings, function.statements, function.body):
+		([parameter], [], Concrete.ConcreteValueBody(Concrete.ReturnExpression(value))):
+			match (parameter.origin, value.form):
+				(Checked.ParameterBinding(0), Concrete.ReadBinding(id)):
+					(
+						projected_signature(function.signature, expected) and Checked.binding_number(id) == 0
+						and Concrete.same_type(parameter.value_type, expected) and Concrete.same_type(value.value_type, expected)
+					)
+				_: False
+		_: False
+
+
+pure func test_opaque_conversions_specialize_to_parameter_reads() -> Bool:
+	match specialized(OPAQUE_SOURCE):
+		Err(_): False
+		Ok(program):
+			contents = Concrete.specialized_contents(program)
+			match contents.functions:
+				[_, wrap, project, wrap_list, project_list]:
+					(
+						contents.records.is_empty() and contents.unions.is_empty()
+						and concrete_parameter_return(wrap, Concrete.StringType) and concrete_parameter_return(project, Concrete.StringType)
+						and concrete_parameter_return(wrap_list, Concrete.ListType(Concrete.StringType))
+						and concrete_parameter_return(project_list, Concrete.ListType(Concrete.StringType))
+					)
+				_: False
+
+
+private pure func lowered_parameter_return(
+	function: Lower.LoweredFunction,
+	expected: Concrete.TypeRef,
+) -> Bool:
+	projected_signature(function.signature, expected) and parameter_return(function, expected)
+
+
+pure func test_opaque_conversions_lower_without_wrapper_definitions() -> Bool:
+	match lowered(OPAQUE_SOURCE):
+		Err(_): False
+		Ok(program):
+			match Lower.lowered_functions(program).functions:
+				[main, wrap, project, wrap_list, project_list]:
+					match main.steps:
+						[
+							Lower.Define(_),
+							Lower.Define(_),
+							Lower.Define(_),
+							Lower.Define(_),
+							Lower.Define(_),
+							Lower.Define(_),
+							Lower.Define(_)
+						]:
+							(
+								lowered_parameter_return(wrap, Concrete.StringType) and lowered_parameter_return(project, Concrete.StringType)
+								and lowered_parameter_return(wrap_list, Concrete.ListType(Concrete.StringType))
+								and lowered_parameter_return(project_list, Concrete.ListType(Concrete.StringType))
+							)
+						_: False
+				_: False
+
+
+private pure func acquired_parameter_return(
+	function: Own.OwnedFunction,
+	expected: Concrete.TypeRef,
+) -> Bool:
+	match function.operations:
+		[Own.DefineValue(parameter), Own.AcquireOwner(owner, borrow, _)]:
+			match (parameter.operation, parameter.result, borrow.source):
+				(Own.ParameterDefinition(0), Own.BorrowedResult(Own.ParameterBorrow(source)), Own.ParameterBorrow(dependency)):
+					(
+						projected_signature(function.signature, expected) and Concrete.same_type(parameter.value_type, expected)
+						and borrowed_result(parameter.result) and parameter_borrow(borrow)
+						and Lower.value_number(parameter.id) == 0
+						and Lower.value_number(source) == 0 and Lower.value_number(dependency) == 0
+						and Own.owner_number(owner) == 0 and transfers(function.tail, 0)
+					)
+				_: False
+		_: False
+
+
+private pure func call_borrows_owner(
+	value: Own.OwnedDefinition,
+	target: Int,
+	argument: Int,
+	source_owner: Int,
+	result_owner: Int,
+) -> Bool:
+	match (value.operation, value.result):
+		(Own.CallDefinition(call, [Own.BorrowedArgument(borrow)]), Own.OwnedResult(result)):
+			match (call.target, borrow.source):
+				(Concrete.UserFunction(id), Own.OwnerBorrow(source)):
+					(
+						Concrete.function_number(id) == target and Lower.value_number(borrow.value) == argument
+						and Own.owner_number(source) == source_owner and Own.owner_number(result) == result_owner
+					)
+				_: False
+		_: False
+
+
+pure func test_opaque_string_and_list_ownership_has_exact_acquisition_and_drop_order() -> Bool:
+	match owned(OPAQUE_SOURCE):
+		Err(_): False
+		Ok(program):
+			match program.functions:
+				[main, wrap, project, wrap_list, project_list]:
+					match (main.operations, main.tail):
+						([
+							Own.DefineValue(text),
+							Own.DefineValue(wrapped),
+							Own.DropOwner(original_text, _),
+							Own.DefineValue(projected),
+							Own.DropOwner(wrapped_text, _),
+							Own.DropOwner(projected_text, _),
+							Own.DefineValue(list),
+							Own.DefineValue(wrapped_list),
+							Own.DropOwner(original_list, _),
+							Own.DefineValue(projected_list),
+							Own.DropOwner(wrapped_root, _),
+							Own.DropOwner(projected_root, _),
+							Own.DefineValue(_)
+						], Own.ReturnTail(Own.ReturnResult(Own.UnmanagedReturn(returned)))):
+							match (text.operation, list.operation, list.result):
+								(Own.StringDefinition("owned"), Own.ConstructListDefinition([]), Own.OwnedResult(list_owner)):
+									(
+										acquired_parameter_return(wrap, Concrete.StringType) and acquired_parameter_return(project, Concrete.StringType)
+										and acquired_parameter_return(wrap_list, Concrete.ListType(Concrete.StringType))
+										and acquired_parameter_return(project_list, Concrete.ListType(Concrete.StringType))
+										and Concrete.same_type(text.value_type, Concrete.StringType)
+										and Concrete.same_type(list.value_type, Concrete.ListType(Concrete.StringType))
+										and owns_result(text.result) and Own.owner_number(list_owner) == 3
+										and call_borrows_owner(wrapped, 1, 0, 0, 1) and call_borrows_owner(projected, 2, 1, 1, 2)
+										and call_borrows_owner(wrapped_list, 3, 3, 3, 4) and call_borrows_owner(projected_list, 4, 4, 4, 5)
+										and Own.owner_number(original_text) == 0
+										and Own.owner_number(wrapped_text) == 1 and Own.owner_number(projected_text) == 2
+										and Own.owner_number(original_list) == 3
+										and Own.owner_number(wrapped_root) == 4 and Own.owner_number(projected_root) == 5
+										and Lower.value_number(returned) == 6
+									)
+								_: False
+						_: False
+				_: False
+
+
+pure func test_independent_verifier_accepts_erased_opaque_string_and_list_paths() -> Bool:
+	match owned(OPAQUE_SOURCE):
+		Ok(program): verify(program).is_ok()
+		Err(_): False
+
+
+pure func test_erased_opaque_values_emit_only_ordinary_string_and_list_helpers() -> Bool:
+	match owned(OPAQUE_SOURCE):
+		Err(_): False
+		Ok(program):
+			match verify(program):
+				Err(_): False
+				Ok(verified):
+					match emit(verified):
+						Ok(c):
+							(
+								c.contains("struct blorp_string* blorp_f_1(struct blorp_string* blorp_p_0)")
+								and c.contains("struct blorp_string* blorp_f_2(struct blorp_string* blorp_p_0)")
+								and c.contains("struct blorp_l_0_s* blorp_f_3(struct blorp_l_0_s* blorp_p_0)")
+								and c.contains("struct blorp_l_0_s* blorp_f_4(struct blorp_l_0_s* blorp_p_0)")
+								and c.contains("blorp_string_retain(blorp_vl_0);") and c.contains("blorp_string_release(blorp_owner_0);")
+								and c.contains("blorp_list_dup_0_s(blorp_vl_0);") and c.contains("blorp_list_drop_0_s(blorp_owner_3);")
+								and not c.contains("struct blorp_r_") and not c.contains("struct blorp_u_")
+							)
+						Err(_): False
+
+
+-- Corrupt only the acquisition in an actual checked/lowered opaque function.
+-- The public ownership product keeps the original target IDs, spans and tail.
+pure func test_opaque_parameter_return_requires_its_acquisition() -> Bool:
+	match owned(OPAQUE_SOURCE):
+		Err(_): False
+		Ok(program):
+			match program.functions:
+				[main, wrap, project, wrap_list, project_list]:
+					match wrap.operations:
+						[Own.DefineValue(parameter), Own.AcquireOwner(_, _, _)]:
+							broken = { wrap | operations = [Own.DefineValue(parameter)] }
+							corrupted = { program | functions = [main, broken, project, wrap_list, project_list] }
+							match verify(corrupted):
+								Ok(_): False
+								Err(error):
+									(
+										same_span(error.span, parameter.span)
+										and error.message == "ownership verification failed: owner 0 is not defined"
+										and error.help == "report this compiler error with the input program"
+										and error.note.is_none()
+									)
+						_: False
+				_: False
+
+
 tests: TestSuite = {
 	description = "Blorp 2 generic concrete ownership boundaries",
 	tests = [
+		("opaque borrowed return requires its exact owner acquisition", test_opaque_parameter_return_requires_its_acquisition),
+		("opaque conversions specialize to parameter reads", test_opaque_conversions_specialize_to_parameter_reads),
+		("opaque conversions lower without wrapper definitions", test_opaque_conversions_lower_without_wrapper_definitions),
+		("opaque String/List ownership acquisition and drop order", test_opaque_string_and_list_ownership_has_exact_acquisition_and_drop_order),
+		("verifier accepts erased opaque String/List paths", test_independent_verifier_accepts_erased_opaque_string_and_list_paths),
+		("opaque values emit ordinary String/List helpers", test_erased_opaque_values_emit_only_ordinary_string_and_list_helpers),
 		(
 			"Int and String lower with independent values",
 			test_int_and_string_instances_lower_with_independent_values,

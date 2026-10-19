@@ -1,7 +1,7 @@
 import:
 	int as IntOps
 	./source: ModuleId, module_number, same_module
-	./syntax: ParsedConstant, ParsedFunction, ParsedRecord, ParsedUnion, ParsedVariant, Visibility, WrittenName
+	./syntax: ParsedConstant, ParsedFunction, ParsedOpaque, ParsedRecord, ParsedUnion, ParsedVariant, Visibility, WrittenName
 
 
 -- Declaration identities are dense ordinals in one sealed parsed program.
@@ -11,6 +11,8 @@ opaque type FunctionId = Int
 opaque type UnionId = Int
 
 opaque type RecordId = Int
+
+opaque type OpaqueId = Int
 
 opaque type ConstantId = Int
 
@@ -36,6 +38,10 @@ private pure func record_id(position: Int) -> RecordId:
 	into_opaque RecordId(position)
 
 
+private pure func opaque_id(position: Int) -> OpaqueId:
+	into_opaque OpaqueId(position)
+
+
 private pure func constant_id(position: Int) -> ConstantId:
 	into_opaque ConstantId(position)
 
@@ -54,6 +60,10 @@ pure func union_number(id: UnionId) -> Int:
 
 pure func record_number(id: RecordId) -> Int:
 	from_opaque RecordId(id)
+
+
+pure func opaque_number(id: OpaqueId) -> Int:
+	from_opaque OpaqueId(id)
 
 
 pure func constant_number(id: ConstantId) -> Int:
@@ -77,6 +87,12 @@ fixed record FunctionRow {
 fixed record RecordRow {
 	id: RecordId,
 	declaration: ParsedRecord
+}
+
+
+fixed record OpaqueRow {
+	id: OpaqueId,
+	declaration: ParsedOpaque
 }
 
 
@@ -107,6 +123,7 @@ private fixed record DeclarationRows {
 	functions: List[FunctionRow],
 	records: List[RecordRow],
 	unions: List[UnionRow],
+	opaques: List[OpaqueRow],
 	constants: List[ConstantRow]
 }
 
@@ -120,11 +137,13 @@ pure func issue_inventory(
 	functions: List[ParsedFunction],
 	records: List[ParsedRecord],
 	unions: List[ParsedUnion],
+	opaques: List[ParsedOpaque],
 	constants: List[ParsedConstant],
 ) -> DeclarationInventory:
 	var function_rows: List[FunctionRow] = []
 	var record_rows: List[RecordRow] = []
 	var union_rows: List[UnionRow] = []
+	var opaque_rows: List[OpaqueRow] = []
 	var constant_rows: List[ConstantRow] = []
 	for declaration in functions:
 		function_rows = function_rows.append({ id = function_id(function_rows.length()), declaration = declaration })
@@ -143,12 +162,15 @@ pure func issue_inventory(
 			type_parameters = declaration.type_parameters,
 			variants = variants,
 		})
+	for declaration in opaques:
+		opaque_rows = opaque_rows.append({ id = opaque_id(opaque_rows.length()), declaration = declaration })
 	for declaration in constants:
 		constant_rows = constant_rows.append({ id = constant_id(constant_rows.length()), declaration = declaration })
 	into_opaque DeclarationInventory({
 		functions = function_rows,
 		records = record_rows,
 		unions = union_rows,
+		opaques = opaque_rows,
 		constants = constant_rows,
 	})
 
@@ -165,6 +187,10 @@ pure func inventory_unions(inventory: DeclarationInventory) -> List[UnionRow]:
 	from_opaque DeclarationInventory(inventory).unions
 
 
+pure func inventory_opaques(inventory: DeclarationInventory) -> List[OpaqueRow]:
+	from_opaque DeclarationInventory(inventory).opaques
+
+
 pure func inventory_constants(inventory: DeclarationInventory) -> List[ConstantRow]:
 	from_opaque DeclarationInventory(inventory).constants
 
@@ -172,25 +198,57 @@ pure func inventory_constants(inventory: DeclarationInventory) -> List[ConstantR
 fixed union NominalRow:
 	UnionDeclarationRow(UnionRow)
 	RecordDeclarationRow(RecordRow)
+	OpaqueDeclarationRow(OpaqueRow)
 
 
--- Source-order projection without a second declaration-order table. The two
--- counters are traversal positions, never identities. Read at most two rows.
-pure func next_nominal(inventory: DeclarationInventory, records_seen: Int, unions_seen: Int) -> Option[NominalRow]:
+private pure func declaration_precedes(first_module: ModuleId, first_start: Int, second_module: ModuleId, second_start: Int) -> Bool:
+	if same_module(first_module, second_module):
+		IntOps.less_than(first_start, second_start)
+	else:
+		IntOps.less_than(module_number(first_module), module_number(second_module))
+
+
+-- Source-order projection without a second declaration-order table. The three
+-- counters are traversal positions, never identities. Read at most three rows.
+pure func next_nominal(inventory: DeclarationInventory, records_seen: Int, unions_seen: Int, opaques_seen: Int) -> Option[NominalRow]:
 	rows = from_opaque DeclarationInventory(inventory)
 	match rows.records.get(records_seen):
 		None:
-			rows.unions.get(unions_seen).map(pure func(row): UnionDeclarationRow(row))
+			match rows.unions.get(unions_seen):
+				None:
+					match rows.opaques.get(opaques_seen):
+						None: None
+						Some(row): Some(OpaqueDeclarationRow(row))
+				Some(union_row):
+					match rows.opaques.get(opaques_seen):
+						None: Some(UnionDeclarationRow(union_row))
+						Some(opaque_row):
+							if declaration_precedes(union_row.module, union_row.type_name.span.start, opaque_row.declaration.module, opaque_row.declaration.type_name.span.start):
+								Some(UnionDeclarationRow(union_row))
+							else:
+								Some(OpaqueDeclarationRow(opaque_row))
 		Some(record_row):
 			match rows.unions.get(unions_seen):
 				None:
-					Some(RecordDeclarationRow(record_row))
+					match rows.opaques.get(opaques_seen):
+						None: Some(RecordDeclarationRow(record_row))
+						Some(opaque_row):
+							if declaration_precedes(record_row.declaration.module, record_row.declaration.type_name.span.start, opaque_row.declaration.module, opaque_row.declaration.type_name.span.start):
+								Some(RecordDeclarationRow(record_row))
+							else:
+								Some(OpaqueDeclarationRow(opaque_row))
 				Some(union_row):
-					record_first = if same_module(record_row.declaration.module, union_row.module):
-						IntOps.less_than(record_row.declaration.type_name.span.start, union_row.type_name.span.start)
-					else:
-						IntOps.less_than(module_number(record_row.declaration.module), module_number(union_row.module))
-					if record_first:
-						Some(RecordDeclarationRow(record_row))
-					else:
-						Some(UnionDeclarationRow(union_row))
+					record_first = declaration_precedes(record_row.declaration.module, record_row.declaration.type_name.span.start, union_row.module, union_row.type_name.span.start)
+					match rows.opaques.get(opaques_seen):
+						None:
+							if record_first:
+								Some(RecordDeclarationRow(record_row))
+							else:
+								Some(UnionDeclarationRow(union_row))
+						Some(opaque_row):
+							if record_first and declaration_precedes(record_row.declaration.module, record_row.declaration.type_name.span.start, opaque_row.declaration.module, opaque_row.declaration.type_name.span.start):
+								Some(RecordDeclarationRow(record_row))
+							else if declaration_precedes(union_row.module, union_row.type_name.span.start, opaque_row.declaration.module, opaque_row.declaration.type_name.span.start):
+								Some(UnionDeclarationRow(union_row))
+							else:
+								Some(OpaqueDeclarationRow(opaque_row))

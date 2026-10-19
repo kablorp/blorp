@@ -1532,7 +1532,10 @@ constructor/accessor functions when other modules need controlled access.
 The type after either keyword may include type arguments, as in
 `into_opaque Box[Int](value)`. The parentheses contain one value expression.
 The compiler erases the conversion after typechecking, so the representation keeps
-the same layout and optimizations as the target type.
+the same layout and optimizations as the target type. Two opaque types wrapping
+`Int` still cannot be substituted for one another, including inside `List` or a
+generic record; sharing a runtime representation never makes their source types
+interchangeable.
 
 ### Generics
 

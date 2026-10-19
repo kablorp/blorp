@@ -1,17 +1,22 @@
 import:
 	../../../src/utils/ids:
-		NominalRow(RecordDeclarationRow, UnionDeclarationRow),
+		DeclarationInventory,
+		NominalRow(RecordDeclarationRow, UnionDeclarationRow, OpaqueDeclarationRow),
 		function_number,
 		inventory_functions,
+		inventory_opaques,
 		inventory_records,
 		inventory_unions,
 		issue_inventory,
 		next_nominal,
+		opaque_number,
 		record_number,
 		union_number,
 		variant_number,
 		variant_owner,
-	../../../src/utils/source: module_number
+	../../../src/utils/names: program_names, same_name
+	../../../src/utils/source: module_number, module_source, root_module_id, foundation_prelude_module_id, same_module
+	../../../src/utils/syntax: ParsedOpaque, ParsedUnion, Span, TypeSyntax(AtomicType), Visibility(Public, Private)
 	../declaration_inputs: sample_inventory
 	test: TestSuite
 
@@ -59,8 +64,8 @@ pure func test_inventory_is_dense_in_each_domain_across_modules() -> Bool:
 
 
 pure func test_empty_inventory_has_no_rows_or_nominal_successor() -> Bool:
-	inventory = issue_inventory([], [], [], [])
-	inventory_functions(inventory).is_empty() and inventory_records(inventory).is_empty() and inventory_unions(inventory).is_empty() and next_nominal(inventory, 0, 0).is_none()
+	inventory = issue_inventory([], [], [], [], [])
+	inventory_functions(inventory).is_empty() and inventory_records(inventory).is_empty() and inventory_unions(inventory).is_empty() and inventory_opaques(inventory).is_empty() and next_nominal(inventory, 0, 0, 0).is_none()
 
 
 pure func test_nominal_projection_preserves_module_and_source_order() -> Bool:
@@ -69,15 +74,122 @@ pure func test_nominal_projection_preserves_module_and_source_order() -> Bool:
 	var unions_seen = 0
 	var sequence: List[String] = []
 	for _ in 0..9:
-		match next_nominal(inventory, records_seen, unions_seen):
+		match next_nominal(inventory, records_seen, unions_seen, 0):
 			Some(RecordDeclarationRow(row)):
 				sequence = sequence.append("record" + record_number(row.id).to_string())
 				records_seen = records_seen + 1
 			Some(UnionDeclarationRow(row)):
 				sequence = sequence.append("union" + union_number(row.id).to_string())
 				unions_seen = unions_seen + 1
+			Some(OpaqueDeclarationRow(_)): sequence = sequence.append("unexpected opaque")
 			None: sequence = sequence.append("missing")
-	sequence == ["record0", "union0", "record1", "union1", "union2", "record2", "union3", "record3", "union4"] and next_nominal(inventory, records_seen, unions_seen).is_none()
+	sequence == ["record0", "union0", "record1", "union1", "union2", "record2", "union3", "record3", "union4"] and next_nominal(inventory, records_seen, unions_seen, 0).is_none()
+
+
+-- Repeated names deliberately cannot identify declarations. Starts are sorted
+-- within each module, but the second module restarts before the first ends.
+private pure func opaque_inventory() -> DeclarationInventory:
+	base = sample_inventory()
+	var opaques: List[ParsedOpaque] = []
+	for start in [0, 20, 60, 80, 20, 60, 100]:
+		module = if opaques.length() < 4:
+			root_module_id()
+		else:
+			foundation_prelude_module_id()
+		span: Span = { source = module_source(module), start = start, end = start + 1 }
+		name = { id = program_names().main, span = span }
+		visibility = if opaques.length() == 1:
+			Private(span)
+		else:
+			Public
+		opaques = opaques.append({ module = module, visibility = visibility, type_name = name, underlying = AtomicType(name) })
+	issue_inventory(
+		inventory_functions(base).map(pure func(row): row.declaration),
+		inventory_records(base).map(pure func(row): row.declaration),
+		[], opaques, [],
+	)
+
+
+pure func test_opaque_ids_are_dense_and_retain_module_visibility_and_syntax() -> Bool:
+	match inventory_opaques(opaque_inventory()):
+		[first, second, third, fourth, fifth, sixth, seventh]:
+			match (first.declaration.visibility, second.declaration.visibility, fifth.declaration.underlying):
+				(Public, Private(private_span), AtomicType(underlying)):
+					(
+						[opaque_number(first.id), opaque_number(second.id), opaque_number(third.id), opaque_number(fourth.id), opaque_number(fifth.id), opaque_number(sixth.id), opaque_number(seventh.id)] == [0, 1, 2, 3, 4, 5, 6]
+						and same_module(first.declaration.module, root_module_id())
+						and same_module(fifth.declaration.module, foundation_prelude_module_id())
+						and same_name(first.declaration.type_name.id, fifth.declaration.type_name.id)
+						and private_span.start == 20 and private_span.end == 21
+						and fifth.declaration.type_name.span.start == 20 and fifth.declaration.type_name.span.end == 21
+						and same_name(underlying.id, fifth.declaration.type_name.id)
+					)
+				_: False
+		_: False
+
+
+pure func test_opaque_nominal_projection_preserves_module_and_source_order() -> Bool:
+	opaques = inventory_opaques(opaque_inventory()).map(pure func(row): row.declaration)
+	base = sample_inventory()
+	-- Union syntax is reconstructed only in this direct producer fixture.
+	var unions: List[ParsedUnion] = []
+	for row in inventory_unions(base):
+		unions = unions.append({ module = row.module, visibility = row.visibility, type_name = row.type_name, type_parameters = row.type_parameters, variants = row.variants.map(pure func(variant): variant.declaration) })
+	inventory = issue_inventory([], inventory_records(base).map(pure func(row): row.declaration), unions, opaques, [])
+	var records_seen = 0
+	var unions_seen = 0
+	var opaques_seen = 0
+	var sequence: List[String] = []
+	for _ in 0..16:
+		match next_nominal(inventory, records_seen, unions_seen, opaques_seen):
+			Some(RecordDeclarationRow(row)):
+				sequence = sequence.append("record" + record_number(row.id).to_string())
+				records_seen = records_seen + 1
+			Some(UnionDeclarationRow(row)):
+				sequence = sequence.append("union" + union_number(row.id).to_string())
+				unions_seen = unions_seen + 1
+			Some(OpaqueDeclarationRow(row)):
+				sequence = sequence.append("opaque" + opaque_number(row.id).to_string())
+				opaques_seen = opaques_seen + 1
+			None: sequence = sequence.append("missing")
+	(
+		sequence == ["opaque0", "record0", "opaque1", "union0", "record1", "opaque2", "union1", "opaque3", "union2", "record2", "opaque4", "union3", "record3", "opaque5", "union4", "opaque6"]
+		and records_seen == 4 and unions_seen == 5 and opaques_seen == 7
+		and next_nominal(inventory, records_seen, unions_seen, opaques_seen).is_none()
+	)
+
+
+pure func test_opaque_only_nominal_stream_exhausts_without_other_domains() -> Bool:
+	opaques = inventory_opaques(opaque_inventory()).map(pure func(row): row.declaration)
+	inventory = issue_inventory([], [], [], opaques, [])
+	var correct = True
+	for position in 0..7:
+		match next_nominal(inventory, 0, 0, position):
+			Some(OpaqueDeclarationRow(row)): correct = correct and opaque_number(row.id) == position
+			_: correct = False
+	correct and next_nominal(inventory, 0, 0, 7).is_none()
+
+
+pure func test_opaque_projection_merges_with_records_after_unions_exhausted() -> Bool:
+	inventory = opaque_inventory()
+	var records_seen = 0
+	var opaques_seen = 0
+	var sequence: List[String] = []
+	for _ in 0..11:
+		match next_nominal(inventory, records_seen, 0, opaques_seen):
+			Some(RecordDeclarationRow(row)):
+				sequence = sequence.append("record" + record_number(row.id).to_string())
+				records_seen = records_seen + 1
+			Some(OpaqueDeclarationRow(row)):
+				sequence = sequence.append("opaque" + opaque_number(row.id).to_string())
+				opaques_seen = opaques_seen + 1
+			Some(UnionDeclarationRow(_)): sequence = sequence.append("unexpected union")
+			None: sequence = sequence.append("missing")
+	(
+		sequence == ["opaque0", "record0", "opaque1", "record1", "opaque2", "opaque3", "record2", "opaque4", "record3", "opaque5", "opaque6"]
+		and records_seen == 4 and opaques_seen == 7
+		and next_nominal(inventory, records_seen, 0, opaques_seen).is_none()
+	)
 
 
 tests: TestSuite = {
@@ -88,5 +200,9 @@ tests: TestSuite = {
 		("inventory is dense across modules and domains", test_inventory_is_dense_in_each_domain_across_modules),
 		("empty inventory has no rows or successor", test_empty_inventory_has_no_rows_or_nominal_successor),
 		("nominal projection preserves module and source order", test_nominal_projection_preserves_module_and_source_order),
+		("opaque IDs retain module, visibility and syntax", test_opaque_ids_are_dense_and_retain_module_visibility_and_syntax),
+		("opaque nominal projection preserves module and source order", test_opaque_nominal_projection_preserves_module_and_source_order),
+		("opaque-only nominal stream exhausts", test_opaque_only_nominal_stream_exhausts_without_other_domains),
+		("opaque projection merges remaining records", test_opaque_projection_merges_with_records_after_unions_exhausted),
 	]
 }

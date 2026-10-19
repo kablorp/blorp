@@ -28,7 +28,7 @@ import:
 		CheckerInvariant(GenericConstructorContract, InvalidInferenceVariable, InvalidInferenceWorklist, MissingCallParameter, MissingGenericParameter),
 		call_error,
 		checker_invariant
-	../utils/ids: ConstantId, FunctionId, RecordId, UnionId, VariantId, record_number, union_number
+	../utils/ids: ConstantId, FunctionId, OpaqueId, RecordId, UnionId, VariantId, record_number, union_number
 	../utils/syntax: Span, WrittenName, ReceiverApplication
 	../namespace/namespace: same_head
 	int as IntOps
@@ -72,6 +72,8 @@ fixed union PendingBase:
 	PendingUpdateRecord(RecordId, PendingValue, Span, List[PendingRecordField], List[PendingRetainedField])
 	PendingConstructVariant(PendingVariantContract, List[PendingValue])
 	PendingConstructList(ListElementSource, List[PendingValue])
+	PendingConstructOpaque(OpaqueId, TypeRef, PendingValue)
+	PendingProjectOpaque(OpaqueId, PendingValue)
 
 
 -- Where a list literal's element type comes from: the expected List's element
@@ -711,6 +713,8 @@ pure func call_argument_hints(call: PendingCall, result_hint: Option[InferenceTy
 	Ok(hints)
 
 
+-- Closed permits eager parent validation: child and own checks are complete.
+-- A known result type alone is insufficient; otherwise retain child-first freezing.
 fixed union InferenceReadiness:
 	ClosedInference
 	DeferredInference
@@ -719,6 +723,7 @@ fixed union InferenceReadiness:
 pure func record_argument_origin(equality: InferenceEquality, slots: List[InferenceSlot]) -> Result[Option[InferenceSlotUpdate], CheckError]:
 	match equality.origin:
 		ResultConstraint(_): Ok(None)
+		OpaqueOperandConstraint(_, _): Ok(None)
 		VariantConstraint(_, _): Ok(None)
 		RecordFieldConstraint(_, _, _): Ok(None)
 		ListElementConstraint(_, _): Ok(None)
@@ -783,6 +788,7 @@ fixed record CallResultContext {
 fixed union ConstraintOrigin:
 	ArgumentConstraint(PendingCall, Int, InferenceUse, TypeUse)
 	ResultConstraint(CallResultContext)
+	OpaqueOperandConstraint(ExpectedValue, Span)
 	VariantConstraint(PendingVariantContract, Int)
 	RecordFieldConstraint(FieldId, InferenceUse, Span)
 	ListElementConstraint(Int, Span)
@@ -1142,6 +1148,7 @@ private pure func inference_origin_span(origin: ConstraintOrigin) -> Span:
 			actual.span
 		ResultConstraint(result):
 			result.span
+		OpaqueOperandConstraint(_, span): span
 		VariantConstraint(contract, _): contract.span
 		RecordFieldConstraint(_, _, span): span
 		ListElementConstraint(_, span): span
@@ -1157,6 +1164,7 @@ private pure func inference_conflict(
 	match equality.origin:
 		ResultConstraint(_):
 			Err(checker_invariant(span, InvalidInferenceWorklist))
+		OpaqueOperandConstraint(_, _): Err(checker_invariant(span, InvalidInferenceWorklist))
 		VariantConstraint(_, _): Err(checker_invariant(span, InvalidInferenceWorklist))
 		RecordFieldConstraint(_, _, _): Err(checker_invariant(span, InvalidInferenceWorklist))
 		ListElementConstraint(_, _): Err(checker_invariant(span, InvalidInferenceWorklist))
@@ -1350,6 +1358,8 @@ pure func inspect_inference_equality(
 						ResultConstraint(_):
 							-- The enclosing expression/field owns this mismatch diagnostic.
 							Ok(IncompatibleResult)
+						-- Operand freezing owns this mismatch; sibling constraints keep solving.
+						OpaqueOperandConstraint(_, _): Ok(CompleteEquality)
 						VariantConstraint(_, _): Ok(CompleteEquality)
 						RecordFieldConstraint(_, _, _): Ok(CompleteEquality)
 						ListElementConstraint(_, _): Ok(CompleteEquality)
@@ -1395,6 +1405,7 @@ private pure func inference_occurs_error(equality: InferenceEquality, root: Infe
 	site_result: Result[ExpectedTypeSite, CheckError] = match equality.origin:
 		ArgumentConstraint(call, _, _, written): Ok(SourceAnnotation(written.span))
 		ResultConstraint(result): Ok(result.expected.site)
+		OpaqueOperandConstraint(expected, _): Ok(expected.site)
 		RecordFieldConstraint(_, expected, _): Ok(SourceAnnotation(expected.span))
 		ListElementConstraint(_, element_span): Ok(SourceAnnotation(element_span))
 		ReceiverOverlapConstraint(_): Err(checker_invariant(span, InvalidInferenceWorklist))

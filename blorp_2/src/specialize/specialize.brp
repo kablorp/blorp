@@ -559,6 +559,7 @@ private pure func translate_field(
 
 -- The prepared instance of a record declaration at these checked type arguments.
 private pure func concrete_record(
+	opaques: List[Checked.CheckedOpaque],
 	declaration: Declaration.RecordId,
 	arguments: List[Checked.TypeRef],
 	substitution: List[TypeSubstitution[TypeRef]],
@@ -566,7 +567,7 @@ private pure func concrete_record(
 	span: Span,
 	records: List[RecordInstance],
 ) -> Result[RecordInstanceId, Diagnostic]:
-	concrete ?= concrete_types(arguments, substitution, unions, span, records)
+	concrete ?= concrete_types(opaques, arguments, substitution, unions, span, records)
 	lookup_record_instance(declaration, concrete, records, span)
 
 
@@ -583,6 +584,7 @@ private pure func lookup_record_instance(
 -- A record construction's instance: the declaration its form names, at the type
 -- arguments of its checked type, which checking derived from that declaration.
 private pure func record_instance(
+	opaques: List[Checked.CheckedOpaque],
 	declaration: Declaration.RecordId,
 	value: Checked.CheckedExpr,
 	substitution: List[TypeSubstitution[TypeRef]],
@@ -593,12 +595,13 @@ private pure func record_instance(
 		Checked.RecordType(_):
 			lookup_record_instance(declaration, [], records, value.span)
 		Checked.AppliedRecordType(_, arguments):
-			concrete_record(declaration, arguments, substitution, unions, value.span, records)
+			concrete_record(opaques, declaration, arguments, substitution, unions, value.span, records)
 		_:
 			Err(invalid(value.span, "record construction has a non-record type"))
 
 
 private pure func concrete_types(
+	opaques: List[Checked.CheckedOpaque],
 	arguments: List[Checked.TypeRef],
 	substitution: List[TypeSubstitution[TypeRef]],
 	unions: List[UnionInstance],
@@ -609,7 +612,7 @@ private pure func concrete_types(
 	var failure: Option[Diagnostic] = None
 
 	for argument in arguments:
-		match concrete_type(argument, substitution, unions, span, records):
+		match concrete_type(opaques, argument, substitution, unions, span, records):
 			Ok(value):
 				concrete = concrete.append(value)
 			Err(error):
@@ -624,6 +627,7 @@ private pure func concrete_types(
 
 
 private pure func concrete_type(
+	opaques: List[Checked.CheckedOpaque],
 	value_type: Checked.TypeRef,
 	substitution: List[TypeSubstitution[TypeRef]],
 	unions: List[UnionInstance],
@@ -631,6 +635,10 @@ private pure func concrete_type(
 	records: List[RecordInstance],
 ) -> Result[TypeRef, Diagnostic]:
 	match value_type:
+		Checked.OpaqueType(id):
+			match opaques.get(Declaration.opaque_number(id)):
+				Some(declaration): concrete_type(opaques, declaration.underlying_type.value_type, [], unions, span, records)
+				None: Err(invalid(span, "unknown opaque declaration"))
 		Checked.PureCallableType(_, _):
 			Err(invalid(span, "callable type reached a data layout"))
 		Checked.RecordType(id):
@@ -647,15 +655,15 @@ private pure func concrete_type(
 		Checked.StringType:
 			Ok(StringType)
 		Checked.ListType(element):
-			match concrete_type(element, substitution, unions, span, records):
+			match concrete_type(opaques, element, substitution, unions, span, records):
 				Ok(concrete): Ok(ListType(concrete))
 				Err(error): Err(error)
 		Checked.AppliedRecordType(id, arguments):
-			match concrete_record(id, arguments, substitution, unions, span, records):
+			match concrete_record(opaques, id, arguments, substitution, unions, span, records):
 				Ok(owner): Ok(RecordType(owner))
 				Err(error): Err(error)
 		Checked.AppliedUnionType(id, arguments):
-			match concrete_types(arguments, substitution, unions, span, records):
+			match concrete_types(opaques, arguments, substitution, unions, span, records):
 				Ok(concrete_arguments):
 					match find_union_instance(
 						unions,
@@ -1744,6 +1752,10 @@ private pure func prepare_type(
 	in_progress: List[InProgressLayout],
 ) -> Result[PreparedType, Diagnostic]:
 	match value:
+		Checked.OpaqueType(id):
+			match checked.opaques.get(Declaration.opaque_number(id)):
+				Some(declaration): prepare_type(declaration.underlying_type.value_type, [], checked, unions, span, records, in_progress)
+				None: Err(invalid(span, "unknown opaque declaration"))
 		Checked.PureCallableType(_, _):
 			Err(invalid(span, "callable type reached a data layout"))
 		Checked.VoidType:
@@ -1859,6 +1871,10 @@ private pure func append_value_types(
 		Checked.ConstructRecord(_, fields):
 			for field in fields:
 				types = append_value_types(types, field.value)
+		Checked.ConstructOpaque(_, child):
+			types = append_value_types(types, child)
+		Checked.ProjectOpaque(_, child):
+			types = append_value_types(types, child)
 		Checked.ConstructList(elements):
 			for element in elements:
 				types = append_value_types(types, element)
@@ -2182,6 +2198,7 @@ private pure func translate_boolean(
 
 
 private pure func translate_call(
+	opaques: List[Checked.CheckedOpaque],
 	call: Checked.CheckedCall,
 	substitution: List[TypeSubstitution[TypeRef]],
 	callables: List[KnownCallable],
@@ -2230,23 +2247,23 @@ private pure func translate_call(
 					accepted: RuntimeOperation[VariantInstanceId, TypeRef] = Builtins.FloatToString
 					Ok(accepted)
 				ListRepeat(element):
-					match concrete_type(element, substitution, unions, call.span, records):
+					match concrete_type(opaques, element, substitution, unions, call.span, records):
 						Ok(concrete): Ok(Builtins.ListRepeat(concrete))
 						Err(error): Err(error)
 				ListLength(element):
-					match concrete_type(element, substitution, unions, call.span, records):
+					match concrete_type(opaques, element, substitution, unions, call.span, records):
 						Ok(concrete): Ok(Builtins.ListLength(concrete))
 						Err(error): Err(error)
 				ListAppend(element):
-					match concrete_type(element, substitution, unions, call.span, records):
+					match concrete_type(opaques, element, substitution, unions, call.span, records):
 						Ok(concrete): Ok(Builtins.ListAppend(concrete))
 						Err(error): Err(error)
 				ListSet(element):
-					match concrete_type(element, substitution, unions, call.span, records):
+					match concrete_type(opaques, element, substitution, unions, call.span, records):
 						Ok(concrete): Ok(Builtins.ListSet(concrete))
 						Err(error): Err(error)
 				ListConcat(element):
-					match concrete_type(element, substitution, unions, call.span, records):
+					match concrete_type(opaques, element, substitution, unions, call.span, records):
 						Ok(concrete): Ok(Builtins.ListConcat(concrete))
 						Err(error): Err(error)
 				StringLength:
@@ -2290,7 +2307,7 @@ private pure func translate_call(
 						Ok(translated): Ok(Builtins.StringFromCodepoint(translated))
 						Err(error): Err(error)
 				ListGet(element, option):
-					match concrete_type(element, substitution, unions, call.span, records):
+					match concrete_type(opaques, element, substitution, unions, call.span, records):
 						Ok(concrete):
 							match translate_option(option, result_type, unions, call.span):
 								Ok(translated): Ok(Builtins.ListGet(concrete, translated))
@@ -2318,7 +2335,7 @@ private pure func translate_call(
 						callables = []
 					}).to_result(invalid(call.span, "unexpanded callable target")).map(pure func(id): UserFunction(id))
 		Checked.UserFunction(declaration, arguments, written_choices):
-			match concrete_types(arguments, substitution, unions, call.span, records):
+			match concrete_types(opaques, arguments, substitution, unions, call.span, records):
 				Err(error): Err(error)
 				Ok(concrete):
 					var choices: List[KnownCallable] = []
@@ -2329,7 +2346,7 @@ private pure func translate_call(
 								callable_choice(callables, parameter, written.span)
 									.map(pure func(choice): { choice | parameter = written.parameter })
 							Checked.NamedCallable(id, arguments):
-								concrete_types(arguments, substitution, unions, written.span, records).map(pure func(values): {
+								concrete_types(opaques, arguments, substitution, unions, written.span, records).map(pure func(values): {
 									parameter = written.parameter,
 									declaration = id,
 									arguments = values
@@ -2396,6 +2413,7 @@ private pure func translate_variant(
 
 -- A written record field of a literal or an update, with its field instance.
 private pure func translate_record_field(
+	opaques: List[Checked.CheckedOpaque],
 	field: Checked.CheckedRecordField,
 	owner: RecordInstanceId,
 	constants: List[Checked.CheckedConstant],
@@ -2406,11 +2424,12 @@ private pure func translate_record_field(
 	records: List[RecordInstance],
 ) -> Result[ConcreteRecordField, Diagnostic]:
 	id ?= translate_field(field.field, owner, records, field.span)
-	child ?= translate_expr(field.value, constants, substitution, callables, keys, unions, records)
+	child ?= translate_expr(opaques, field.value, constants, substitution, callables, keys, unions, records)
 	Ok({ field = id, value = child, span = field.span })
 
 
 private pure func translate_record_fields(
+	opaques: List[Checked.CheckedOpaque],
 	fields: List[Checked.CheckedRecordField],
 	owner: RecordInstanceId,
 	constants: List[Checked.CheckedConstant],
@@ -2424,7 +2443,7 @@ private pure func translate_record_fields(
 	var failure: Option[Diagnostic] = None
 
 	for field in fields:
-		match translate_record_field(field, owner, constants, substitution, callables, keys, unions, records):
+		match translate_record_field(opaques, field, owner, constants, substitution, callables, keys, unions, records):
 			Ok(concrete):
 				translated = translated.append(concrete)
 			Err(error):
@@ -2441,6 +2460,7 @@ private pure func translate_record_fields(
 -- A node's type and identity translate before its children, except a field read,
 -- whose instance needs its receiver's concrete record.
 private pure func translate_expr(
+	opaques: List[Checked.CheckedOpaque],
 	value: Checked.CheckedExpr,
 	constants: List[Checked.CheckedConstant],
 	substitution: List[TypeSubstitution[TypeRef]],
@@ -2450,8 +2470,16 @@ private pure func translate_expr(
 	records: List[RecordInstance],
 ) -> Result[ConcreteExpr, Diagnostic]:
 	match value.form:
+		Checked.ConstructOpaque(_, child):
+			match translate_expr(opaques, child, constants, substitution, callables, keys, unions, records):
+				Ok(translated): Ok({ translated | span = value.span })
+				Err(error): Err(error)
+		Checked.ProjectOpaque(_, child):
+			match translate_expr(opaques, child, constants, substitution, callables, keys, unions, records):
+				Ok(translated): Ok({ translated | span = value.span })
+				Err(error): Err(error)
 		Checked.ReadRecordField(receiver, field):
-			match translate_expr(receiver, constants, substitution, callables, keys, unions, records):
+			match translate_expr(opaques, receiver, constants, substitution, callables, keys, unions, records):
 				Ok(source):
 					-- The receiver's translated type already names its record instance.
 					match source.value_type:
@@ -2465,26 +2493,26 @@ private pure func translate_expr(
 						_: Err(invalid(value.span, "record operation has a non-record receiver"))
 				Err(error): Err(error)
 		Checked.InvokeFunction(call, arguments):
-			match concrete_type(value.value_type, substitution, unions, call.span, records):
+			match concrete_type(opaques, value.value_type, substitution, unions, call.span, records):
 				Ok(value_type):
-					match translate_call(call, substitution, callables, keys, unions, records, value_type):
+					match translate_call(opaques, call, substitution, callables, keys, unions, records, value_type):
 						Ok(concrete):
-							match translate_exprs(arguments, constants, substitution, callables, keys, unions, records):
+							match translate_exprs(opaques, arguments, constants, substitution, callables, keys, unions, records):
 								Ok(values): Ok({ form = InvokeFunction(concrete, values), value_type = value_type, span = value.span })
 								Err(error): Err(error)
 						Err(error): Err(error)
 				Err(error): Err(error)
 		Checked.UpdateRecord(declaration, update):
-			match record_instance(declaration, value, substitution, unions, records):
+			match record_instance(opaques, declaration, value, substitution, unions, records):
 				Ok(owner):
-					match translate_expr(update.base, constants, substitution, callables, keys, unions, records):
+					match translate_expr(opaques, update.base, constants, substitution, callables, keys, unions, records):
 						Ok(base):
-							match translate_record_fields(update.replacements, owner, constants, substitution, callables, keys, unions, records):
+							match translate_record_fields(opaques, update.replacements, owner, constants, substitution, callables, keys, unions, records):
 								Ok(replacements):
 									inherited_result: Result[List[RetainedRecordField], Diagnostic] = translated_list(update.inherited, pure func(field: Checked.RetainedRecordField) -> Result[RetainedRecordField, Diagnostic]:
 										match translate_field(field.field, owner, records, update.base_expression_span):
 											Ok(id):
-												match concrete_type(field.value_type, substitution, unions, update.base_expression_span, records):
+												match concrete_type(opaques, field.value_type, substitution, unions, update.base_expression_span, records):
 													Ok(value_type): Ok({ field = id, value_type = value_type })
 													Err(error): Err(error)
 											Err(error): Err(error)
@@ -2498,49 +2526,49 @@ private pure func translate_expr(
 						Err(error): Err(error)
 				Err(error): Err(error)
 		Checked.ConstructVariant(id, children):
-			match concrete_type(value.value_type, substitution, unions, value.span, records):
+			match concrete_type(opaques, value.value_type, substitution, unions, value.span, records):
 				Ok(value_type):
 					match concrete_union_owner(value_type, value.span):
 						Ok(owner):
 							match translate_variant(id, owner, unions, value.span):
 								Ok(variant):
-									match translate_exprs(children, constants, substitution, callables, keys, unions, records):
+									match translate_exprs(opaques, children, constants, substitution, callables, keys, unions, records):
 										Ok(values): Ok({ form = ConstructVariant(variant, values), value_type = value_type, span = value.span })
 										Err(error): Err(error)
 								Err(error): Err(error)
 						Err(error): Err(error)
 				Err(error): Err(error)
 		Checked.ConstructRecord(declaration, fields):
-			match record_instance(declaration, value, substitution, unions, records):
+			match record_instance(opaques, declaration, value, substitution, unions, records):
 				Ok(owner):
-					match translate_record_fields(fields, owner, constants, substitution, callables, keys, unions, records):
+					match translate_record_fields(opaques, fields, owner, constants, substitution, callables, keys, unions, records):
 						Ok(concrete): Ok({ form = ConstructRecord(owner, concrete), value_type = RecordType(owner), span = value.span })
 						Err(error): Err(error)
 				Err(error): Err(error)
 		Checked.ConstructList(elements):
-			match concrete_type(value.value_type, substitution, unions, value.span, records):
+			match concrete_type(opaques, value.value_type, substitution, unions, value.span, records):
 				Ok(value_type):
-					match translate_exprs(elements, constants, substitution, callables, keys, unions, records):
+					match translate_exprs(opaques, elements, constants, substitution, callables, keys, unions, records):
 						Ok(values): Ok({ form = ConstructList(values), value_type = value_type, span = value.span })
 						Err(error): Err(error)
 				Err(error): Err(error)
 		Checked.Match(join):
-			match concrete_type(value.value_type, substitution, unions, value.span, records):
+			match concrete_type(opaques, value.value_type, substitution, unions, value.span, records):
 				Ok(value_type):
-					match translate_join(join, constants, substitution, callables, keys, unions, records, value.span):
+					match translate_join(opaques, join, constants, substitution, callables, keys, unions, records, value.span):
 						Ok(concrete): Ok({ form = Match(concrete), value_type = value_type, span = value.span })
 						Err(error): Err(error)
 				Err(error): Err(error)
 		Checked.LiteralVoid:
-			translate_leaf(LiteralVoid, value, substitution, unions, records)
+			translate_leaf(opaques, LiteralVoid, value, substitution, unions, records)
 		Checked.LiteralString(text):
-			translate_leaf(LiteralString(text), value, substitution, unions, records)
+			translate_leaf(opaques, LiteralString(text), value, substitution, unions, records)
 		Checked.LiteralInteger(integer):
-			translate_leaf(LiteralInteger(integer), value, substitution, unions, records)
+			translate_leaf(opaques, LiteralInteger(integer), value, substitution, unions, records)
 		Checked.LiteralFloat(number):
-			translate_leaf(LiteralFloat(number), value, substitution, unions, records)
+			translate_leaf(opaques, LiteralFloat(number), value, substitution, unions, records)
 		Checked.ReadBinding(id):
-			translate_leaf(ReadBinding(id), value, substitution, unions, records)
+			translate_leaf(opaques, ReadBinding(id), value, substitution, unions, records)
 		Checked.ReadConstant(id):
 			match constants.get(Declaration.constant_number(id)):
 				None: Err(invalid(value.span, "unknown constant declaration"))
@@ -2549,22 +2577,24 @@ private pure func translate_expr(
 						Checked.IntegerConstant(integer): LiteralInteger(integer)
 						Checked.FloatConstant(number): LiteralFloat(number)
 						Checked.StringConstant(text): LiteralString(text)
-					translate_leaf(form, value, substitution, unions, records)
+					translate_leaf(opaques, form, value, substitution, unions, records)
 
 
 -- A leaf keeps its checked form; only its type is made concrete.
 private pure func translate_leaf(
+	opaques: List[Checked.CheckedOpaque],
 	form: ConcreteForm,
 	value: Checked.CheckedExpr,
 	substitution: List[TypeSubstitution[TypeRef]],
 	unions: List[UnionInstance],
 	records: List[RecordInstance],
 ) -> Result[ConcreteExpr, Diagnostic]:
-	value_type ?= concrete_type(value.value_type, substitution, unions, value.span, records)
+	value_type ?= concrete_type(opaques, value.value_type, substitution, unions, value.span, records)
 	Ok({ form = form, value_type = value_type, span = value.span })
 
 
 private pure func translate_exprs(
+	opaques: List[Checked.CheckedOpaque],
 	values: List[Checked.CheckedExpr],
 	constants: List[Checked.CheckedConstant],
 	substitution: List[TypeSubstitution[TypeRef]],
@@ -2577,7 +2607,7 @@ private pure func translate_exprs(
 	var failure: Option[Diagnostic] = None
 
 	for value in values:
-		match translate_expr(value, constants, substitution, callables, keys, unions, records):
+		match translate_expr(opaques, value, constants, substitution, callables, keys, unions, records):
 			Ok(concrete):
 				translated = translated.append(concrete)
 			Err(error):
@@ -2592,6 +2622,7 @@ private pure func translate_exprs(
 
 
 private pure func translate_statements(
+	opaques: List[Checked.CheckedOpaque],
 	statements: List[Checked.CheckedStatement],
 	constants: List[Checked.CheckedConstant],
 	substitution: List[TypeSubstitution[TypeRef]],
@@ -2605,15 +2636,15 @@ private pure func translate_statements(
 	) -> Result[ConcreteStatement, Diagnostic]:
 		match statement:
 			Checked.InitializeBinding(id, value):
-				match translate_expr(value, constants, substitution, callables, keys, unions, records):
+				match translate_expr(opaques, value, constants, substitution, callables, keys, unions, records):
 					Ok(translated_value): Ok(InitializeBinding(id, translated_value))
 					Err(error): Err(error)
 			Checked.DiscardExpression(value):
-				match translate_expr(value, constants, substitution, callables, keys, unions, records):
+				match translate_expr(opaques, value, constants, substitution, callables, keys, unions, records):
 					Ok(translated_value): Ok(DiscardExpression(translated_value))
 					Err(error): Err(error)
 			Checked.ReassignBinding(id, value):
-				match translate_expr(value, constants, substitution, callables, keys, unions, records):
+				match translate_expr(opaques, value, constants, substitution, callables, keys, unions, records):
 					Ok(translated_value): Ok(ReassignBinding(id, translated_value))
 					Err(error): Err(error)
 	)
@@ -2636,6 +2667,7 @@ private pure func translate_pattern(
 
 -- A non-tail match specializes exactly as the tail match does, arm by arm.
 private pure func translate_join(
+	opaques: List[Checked.CheckedOpaque],
 	join: Checked.CheckedJoin,
 	constants: List[Checked.CheckedConstant],
 	substitution: List[TypeSubstitution[TypeRef]],
@@ -2645,13 +2677,13 @@ private pure func translate_join(
 	records: List[RecordInstance],
 	span: Span,
 ) -> Result[ConcreteJoin, Diagnostic]:
-	scrutinee ?= translate_expr(join.scrutinee, constants, substitution, callables, keys, unions, records)
-	union_type ?= concrete_type(join.union_type, substitution, unions, span, records)
+	scrutinee ?= translate_expr(opaques, join.scrutinee, constants, substitution, callables, keys, unions, records)
+	union_type ?= concrete_type(opaques, join.union_type, substitution, unions, span, records)
 	owner ?= concrete_union_owner(union_type, span)
 	var arms: List[ConcreteJoinArm] = []
 	var failure: Option[Diagnostic] = None
 	for arm in join.arms:
-		match translate_join_arm(arm, owner, constants, substitution, callables, keys, unions, records, span):
+		match translate_join_arm(opaques, arm, owner, constants, substitution, callables, keys, unions, records, span):
 			Err(error):
 				failure = Some(error)
 				break
@@ -2663,6 +2695,7 @@ private pure func translate_join(
 
 
 private pure func translate_join_arm(
+	opaques: List[Checked.CheckedOpaque],
 	arm: Checked.CheckedJoinArm,
 	owner: UnionInstanceId,
 	constants: List[Checked.CheckedConstant],
@@ -2674,12 +2707,13 @@ private pure func translate_join_arm(
 	span: Span,
 ) -> Result[ConcreteJoinArm, Diagnostic]:
 	pattern ?= translate_pattern(arm.pattern, owner, span, unions)
-	statements ?= translate_statements(arm.statements, constants, substitution, callables, keys, unions, records)
-	value ?= translate_expr(arm.value, constants, substitution, callables, keys, unions, records)
+	statements ?= translate_statements(opaques, arm.statements, constants, substitution, callables, keys, unions, records)
+	value ?= translate_expr(opaques, arm.value, constants, substitution, callables, keys, unions, records)
 	Ok({ pattern = pattern, statements = statements, value = value })
 
 
 private pure func translate_exit(
+	opaques: List[Checked.CheckedOpaque],
 	exit: Checked.CheckedExit,
 	constants: List[Checked.CheckedConstant],
 	substitution: List[TypeSubstitution[TypeRef]],
@@ -2690,16 +2724,17 @@ private pure func translate_exit(
 ) -> Result[ConcreteExit, Diagnostic]:
 	match exit:
 		Checked.ReturnExpression(value):
-			match translate_expr(value, constants, substitution, callables, keys, unions, records):
+			match translate_expr(opaques, value, constants, substitution, callables, keys, unions, records):
 				Ok(concrete): Ok(ReturnExpression(concrete))
 				Err(error): Err(error)
 		Checked.RecurWith(arguments, span):
-			match translate_exprs(arguments, constants, substitution, callables, keys, unions, records):
+			match translate_exprs(opaques, arguments, constants, substitution, callables, keys, unions, records):
 				Ok(concrete): Ok(RecurWith(concrete, span))
 				Err(error): Err(error)
 
 
 private pure func translate_function(
+	opaques: List[Checked.CheckedOpaque],
 	function: Checked.CheckedFunction,
 	key: InstanceKey,
 	constants: List[Checked.CheckedConstant],
@@ -2719,6 +2754,7 @@ private pure func translate_function(
 		pure func(
 			value: Checked.TypeUse,
 		) -> Result[TypeRef, Diagnostic]: concrete_type(
+			opaques,
 			value.value_type,
 			substitution,
 			unions,
@@ -2728,6 +2764,7 @@ private pure func translate_function(
 	)
 
 	return_type ?= concrete_type(
+		opaques,
 		function.signature.return_type.value_type,
 		substitution,
 		unions,
@@ -2738,7 +2775,7 @@ private pure func translate_function(
 	bindings ?= translated_list(function.bindings, pure func(
 		binding: Checked.BindingDefinition,
 	) -> Result[ConcreteBinding, Diagnostic]:
-		match concrete_type(binding.value_type, substitution, unions, binding.span, records):
+		match concrete_type(opaques, binding.value_type, substitution, unions, binding.span, records):
 			Ok(value_type):
 				Ok({
 					origin = binding.origin,
@@ -2747,17 +2784,17 @@ private pure func translate_function(
 				})
 			Err(error): Err(error)
 	)
-	statements ?= translate_statements(function.statements, constants, substitution, key.callables, keys, unions, records)
+	statements ?= translate_statements(opaques, function.statements, constants, substitution, key.callables, keys, unions, records)
 
 	body_result: Result[ConcreteBody, Diagnostic] = match function.body:
 		Checked.CheckedValueBody(value):
-			match translate_exit(value, constants, substitution, key.callables, keys, unions, records):
+			match translate_exit(opaques, value, constants, substitution, key.callables, keys, unions, records):
 				Ok(concrete): Ok(ConcreteValueBody(concrete))
 				Err(error): Err(error)
 		Checked.CheckedMatchBody(matched):
-			match translate_expr(matched.scrutinee, constants, substitution, key.callables, keys, unions, records):
+			match translate_expr(opaques, matched.scrutinee, constants, substitution, key.callables, keys, unions, records):
 				Ok(scrutinee):
-					match concrete_type(matched.union_type, substitution, unions, span, records):
+					match concrete_type(opaques, matched.union_type, substitution, unions, span, records):
 						Ok(union_type):
 							match concrete_union_owner(union_type, span):
 								Ok(owner):
@@ -2767,6 +2804,7 @@ private pure func translate_function(
 										match translate_pattern(arm.pattern, owner, span, unions):
 											Ok(pattern):
 												match translate_statements(
+													opaques,
 													arm.statements,
 													constants,
 													substitution,
@@ -2776,7 +2814,7 @@ private pure func translate_function(
 													records,
 												):
 													Ok(arm_statements):
-														match translate_exit(arm.body, constants, substitution, key.callables, keys, unions, records):
+														match translate_exit(opaques, arm.body, constants, substitution, key.callables, keys, unions, records):
 															Ok(body):
 																Ok({
 																	pattern = pattern,
@@ -2840,6 +2878,7 @@ pure func specialize(program: CheckedProgram) -> Result[SpecializedProgram, Diag
 		match checked.functions.get(Declaration.function_number(request.key.declaration)):
 			Some(function):
 				translate_function(
+					checked.opaques,
 					function,
 					request.key,
 					checked.constants,

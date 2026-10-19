@@ -115,9 +115,9 @@ passed the audited toolchain's default limits through depth 256.
 | [M2](#m2-the-join) | Restricted control positions, outer-variable joins, Boolean operators, `?=` and annotations | M2.1 implemented; reviewed logical candidate preserved. General expression-control recut deferred. |
 | [M2b](#m2b-pattern-compilation) | Qualified flat heads and non-binding constructor groups | Not started. Nested/list/literal source-pattern migration has bounded decision gates. |
 | [M3](#m3-loops-and-tail-recursion) | Managed List/while loops, explicit exits and existing scalar TCO | Not started. Source flat recursion/ranges become loops; broader managed TCO deferred. |
-| [M4](#m4-recursive-types) | Existing unary/mixed recursive shapes plus ordinary opaque semantics | Steps 1/2a done. Opaque completion remains. No current source witness requires unlanded 2b/2c. |
+| [M4](#m4-recursive-types) | Existing unary/mixed recursive shapes plus ordinary opaque semantics | Steps 1/2a and ordinary opaque semantics implemented. Actual source-product depth acceptance remains. No current source witness requires unlanded 2b/2c. |
 | [M6](#m6-library-and-shell) | First-order library parity, integer-facing String APIs and seven shell/path functions | String byte/scalar APIs and the bounded current-directory Result slice implemented and validated; source migration, remaining library and shell/path work pending. Target Char/Bytes are not planned prerequisites after source migration. |
-| [M7](#m7-lambdas) | Pure function types/lambdas | Parsing implemented; callable checking and execution remain required. Remaining callback removal was abandoned. |
+| [M7](#m7-lambdas) | Pure function types/lambdas | Named pure callbacks, forwarding and direct-call specialization implemented. Lambdas and captures remain required. Remaining callback removal was abandoned. |
 | [M8](#m8-the-fixpoint-gate) | Fixpoint gate | Not started. |
 | [M9](#m9-post-self-compilation-architecture-audit) | Complete architecture audit using the self-compiled compiler | Planned immediately after M8, before the next major feature expansion. |
 
@@ -128,10 +128,10 @@ reviewed source plan + small constructor/control preparations
 host library/runtime prerequisites, then freeze the supporting host
 M6 String byte/scalar APIs + source Char/classification migration
 M6 native current-directory Result witness (accepted slice; loader migration pending)
-M7 pure callable checking/execution, including managed captures
+M7 lambdas and immutable captures, building on accepted named callbacks
 M2 restricted control, outer-variable flow, propagation/annotations
 M3 managed List/while loops + source flat-walk/range migration
-M4 ordinary opaque semantics over retained recursive layouts
+M4 actual source-product destruction-depth acceptance
 M2b qualified flat groups + bounded source-pattern migration
 M6 remaining first-order library + shell/path integration
 M8 actual O0 A/B/C and fixture identity proof
@@ -697,10 +697,15 @@ destruction depth still need their separate measured evidence.
 **Opaque types** are a checked `TypeRef.OpaqueType(id)`. Public opaque type
 references may cross modules; only construction and projection are restricted
 to the declaring module, using namespace-owned declaration authority.
-Specialize substitutes the underlying type after instance keys are formed,
-so the concrete `TypeRef` has no opaque variant.
-The reviewed [ordinary opaque types plan](OPAQUE_TYPES_PLAN.md) separates semantic-key
-preparation from the witnessed nongeneric feature; implementation is unstarted.
+Specialize projects the accepted underlying type before forming runtime keys,
+so equal representations may share instances and the concrete `TypeRef` has no
+opaque variant. Ordinary declaration identities and resolved callback choices
+remain authoritative. The [ordinary opaque types plan](OPAQUE_TYPES_PLAN.md)
+is implemented without SemanticRef/key preparation or backend/runtime changes;
+the [validation report](../benchmarks/results/blorp_2_opaque_types_2026-10-18.md)
+records current-base acceptance and its limits. The actual source probe now
+stops at the missing public `list.set_index` export in `own/own.brp:3:16`, before
+complete source checking.
 
 Isolate deep destruction from construction and traversal depth: in an approved
 runtime-helper test, build a long chain iteratively from completed children,
@@ -721,8 +726,8 @@ admitted shapes at the source's deepest nesting under `ulimit -s 512`; step 1's
 **Status.** Step 1 done. Step 2a done: non-generic recursion through record
 fields and `List` elements, released by recursive helpers; see the
 [recursive group report](../benchmarks/results/blorp_2_recursive_mixed_2026-10-15.md).
-Bootstrap remaining: ordinary opaque types and actual source-product depth
-acceptance. Union-only cycles (2b) and own-parameter recursion (2c) are deferred
+Ordinary opaque semantics are implemented. Bootstrap remaining: actual
+source-product depth acceptance. Union-only cycles (2b) and own-parameter recursion (2c) are deferred
 language extensions with no current bootstrap witness.
 
 ## M6: library and shell
@@ -980,8 +985,9 @@ offsets.map(pure func(value): IntOps.add(value, base))
 combinator and at a user generic; ownership of borrowed managed captures
 verified; frontier reaches emit.
 
-**Status.** Pure callback type parsing is implemented. Function-type checking,
-callable parameters and capture specialization remain unimplemented.
+**Status.** Pure callback types, named references, callable parameter forwarding
+and direct-call specialization are implemented. Lambdas and immutable capture
+specialization remain unimplemented.
 
 ## M8: the fixpoint gate
 

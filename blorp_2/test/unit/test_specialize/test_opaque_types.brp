@@ -1,0 +1,133 @@
+import:
+	../../../src/specialize/specialize:
+		ConcreteBody(ConcreteValueBody), ConcreteExit(ReturnExpression),
+		ConcreteForm(InvokeFunction, LiteralInteger),
+		ConcreteStatement(InitializeBinding), CallTarget(UserFunction),
+		TypeRef(IntType, RecordType), record_number, function_number, specialize, specialized_contents
+	../input: checked_source
+	test: TestSuite
+
+
+pure func test_int_conversions_erase_to_existing_data_types() -> Bool:
+	source: String =
+		|opaque type Id = Int
+		|pure func make(value: Int) -> Id:
+		|    into_opaque Id(value)
+		|pure func number(value: Id) -> Int:
+		|    from_opaque Id(value)
+		|func main() -> Int:
+		|    number(make(7))
+		|
+	match checked_source(source).and_then(specialize):
+		Err(_): False
+		Ok(program):
+			contents = specialized_contents(program)
+			match contents.functions:
+				[main, number, make]:
+					match (main.signature.return_type, (number.signature.parameters, number.signature.return_type), (make.signature.parameters, make.signature.return_type)):
+						(IntType, ([IntType], IntType), ([IntType], IntType)): True
+						_: False
+				_: False
+
+
+pure func test_equal_opaque_representations_reuse_generic_instance() -> Bool:
+	source: String =
+		|opaque type A = Int
+		|opaque type B = Int
+		|pure func identity[T](value: T) -> T:
+		|    value
+		|func main() -> Int:
+		|    first = identity(into_opaque A(7))
+		|    second = identity(into_opaque B(9))
+		|    identity(11)
+		|
+	match checked_source(source).and_then(specialize):
+		Err(_): False
+		Ok(program):
+			match specialized_contents(program).functions:
+				[main, identity]:
+					match (main.statements, main.body, identity.signature.parameters, identity.signature.return_type):
+						([InitializeBinding(_, first), InitializeBinding(_, second)], ConcreteValueBody(ReturnExpression(last)), [IntType], IntType):
+							match (first.form, second.form, last.form):
+								(InvokeFunction(a, [left]), InvokeFunction(b, [right]), InvokeFunction(c, [raw])):
+									match ((a.target, b.target, c.target), (left.form, right.form, raw.form)):
+										((UserFunction(x), UserFunction(y), UserFunction(z)), (LiteralInteger(7), LiteralInteger(9), LiteralInteger(11))):
+											function_number(x) == 1 and function_number(y) == 1 and function_number(z) == 1
+										_: False
+								_: False
+						_: False
+				_: False
+
+
+pure func test_box_arguments_share_the_erased_layout_and_function() -> Bool:
+	source: String =
+		|opaque type A = Int
+		|opaque type B = Int
+		|fixed record Box[T] { value: T }
+		|pure func box[T](value: T) -> Box[T]:
+		|    { value = value }
+		|pure func identity[T](value: T) -> T:
+		|    value
+		|func main() -> Int:
+		|    first = identity(box(into_opaque A(7)))
+		|    second = identity(box(into_opaque B(9)))
+		|    third = identity(box(11))
+		|    0
+		|
+	match checked_source(source).and_then(specialize):
+		Err(_): False
+		Ok(program):
+			contents = specialized_contents(program)
+			match (contents.records, contents.functions):
+				([box], [_, constructor, identity]):
+					match (box.fields, constructor.signature.parameters, identity.signature.parameters, identity.signature.return_type):
+						([IntType], [IntType], [RecordType(parameter)], RecordType(returned)):
+							record_number(parameter) == 0 and record_number(returned) == 0
+						_: False
+				_: False
+
+
+pure func test_erasure_preserves_named_callback_target_choices() -> Bool:
+	source: String =
+		|opaque type A = Int
+		|opaque type B = Int
+		|pure func first(value: A) -> Int:
+		|    from_opaque A(value)
+		|pure func second(value: B) -> Int:
+		|    from_opaque B(value)
+		|pure func apply[T](value: T, callback: pure (T) -> Int) -> Int:
+		|    callback(value)
+		|func main() -> Int:
+		|    earlier = apply(into_opaque A(7), first)
+		|    apply(into_opaque B(9), second)
+		|
+	match checked_source(source).and_then(specialize):
+		Err(_): False
+		Ok(program):
+			match specialized_contents(program).functions:
+				[main, _, first_apply, _, second_apply]:
+					match (main.statements, main.body, first_apply.body, second_apply.body):
+						([InitializeBinding(_, earlier)], ConcreteValueBody(ReturnExpression(later)), ConcreteValueBody(ReturnExpression(first)), ConcreteValueBody(ReturnExpression(second))):
+							match (earlier.form, later.form, first.form, second.form):
+								(InvokeFunction(a, [_]), InvokeFunction(b, [_]), InvokeFunction(c, [_]), InvokeFunction(d, [_])):
+									match (a.target, b.target, c.target, d.target):
+										(UserFunction(x), UserFunction(y), UserFunction(z), UserFunction(w)):
+											(
+												function_number(x) == 2 and function_number(y) == 4
+												and function_number(z) == 1 and function_number(w) == 3
+											)
+										_: False
+								_: False
+						_: False
+				_: False
+
+
+tests: TestSuite = {
+	description = "Opaque representation erasure",
+	tests = [
+		("Box A B and Int reuse one erased layout and function", test_box_arguments_share_the_erased_layout_and_function),
+		("distinct named callback choices survive erased type arguments", test_erasure_preserves_named_callback_target_choices),
+		("Int conversions erase to ordinary data signatures", test_int_conversions_erase_to_existing_data_types),
+		("A B and raw Int share a generic runtime instance", test_equal_opaque_representations_reuse_generic_instance),
+	]
+}

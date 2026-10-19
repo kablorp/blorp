@@ -11,7 +11,7 @@ import:
 		ConcreteFunction,
 		ConcreteStatement(InitializeBinding, ReassignBinding),
 		ConcreteExpr,
-		ConcreteForm(ConstructVariant, InvokeFunction, LiteralInteger),
+		ConcreteForm(ConstructRecord, ConstructVariant, InvokeFunction, LiteralInteger),
 		RecordRepresentation(InlineRecord, ManagedRecord),
 		SpecializedContents,
 		TypeRef(VoidType, IntType, FloatType, StringType, ListType, RecordType, UnionType),
@@ -895,9 +895,106 @@ pure func test_payload_free_variant_is_a_construct_with_no_arguments() -> Bool:
 			False
 
 
+private OPAQUE_RECORD_CALLS: String =
+	|opaque type Id = Int
+	|fixed record First { value: Int }
+	|fixed record Later { value: Float }
+	|pure func pick(value: First) -> Int:
+	|    value.value
+	|pure func later() -> Later:
+	|    { value = 1.25 }
+	|pure func make(value: Int) -> Id:
+	|    into_opaque Id(value)
+	|
+
+
+private pure func record_call_targets(contents: SpecializedContents, first: ConcreteExpr, later: ConcreteExpr) -> Bool:
+	match (contents.records, target(first), target(later), first.form):
+		([first_record, later_record], Some(first_target), Some(later_target), InvokeFunction(_, [argument])):
+			match (first_record.fields, later_record.fields, argument.form):
+				([IntType], [FloatType], ConstructRecord(actual, [field])):
+					match (contents.functions.get(first_target), contents.functions.get(later_target), field.value.form):
+						(Some(pick), Some(produce_later), LiteralInteger(7)):
+							match (pick.signature.parameters, pick.signature.return_type, produce_later.signature.return_type):
+								([RecordType(first_owner)], IntType, RecordType(later_owner)):
+									(
+										first_record.representation == InlineRecord and later_record.representation == InlineRecord
+										and record_number(actual) == 0 and record_number(first_owner) == 0 and record_number(later_owner) == 1
+									)
+								_: False
+						_: False
+				_: False
+		_: False
+
+
+pure func test_construction_visits_child_types_before_later_layout() -> Bool:
+	body: String =
+		|func main() -> Int:
+		|    first = into_opaque Id(pick({ value = 7 }))
+		|    second = later()
+		|    from_opaque Id(first)
+		|
+	source = OPAQUE_RECORD_CALLS + body
+	match program(source):
+		Err(_): False
+		Ok(contents):
+			match contents.functions.get(function_number(entry_function(contents.entrypoint))):
+				None: False
+				Some(main):
+					match (main.statements, source.index_of("into_opaque Id(pick({ value = 7 }))"), source.index_of("pick({")):
+						([InitializeBinding(_, first), InitializeBinding(_, later)], Some(start), Some(callee)):
+							match first.form:
+								InvokeFunction(call, [_]):
+									(
+										record_call_targets(contents, first, later)
+										and first.span.start == start and first.span.end == start + "into_opaque Id(pick({ value = 7 }))".length()
+										and same_source(first.span.source, module_source(root_module_id()))
+										and same_source(call.span.source, first.span.source) and call.span.start == callee and call.span.end == callee + "pick".length()
+									)
+								_: False
+						_: False
+
+
+pure func test_projection_visits_child_types_before_later_layout() -> Bool:
+	body: String =
+		|func main() -> Int:
+		|    first = from_opaque Id(make(pick({ value = 7 })))
+		|    second = later()
+		|    first
+		|
+	source = OPAQUE_RECORD_CALLS + body
+	match program(source):
+		Err(_): False
+		Ok(contents):
+			match contents.functions.get(function_number(entry_function(contents.entrypoint))):
+				None: False
+				Some(main):
+					match (main.statements, source.index_of("from_opaque Id(make(pick({ value = 7 })))"), source.index_of("make(pick({"), source.index_of("pick({")):
+						([InitializeBinding(_, first), InitializeBinding(_, later)], Some(start), Some(callee), Some(inner_callee)):
+							match (first.form, target(first)):
+								(InvokeFunction(call, [inner]), Some(make_target)):
+									match (contents.functions.get(make_target), inner.form):
+										(Some(make), InvokeFunction(inner_call, [_])):
+											match (make.signature.parameters, make.signature.return_type):
+												([IntType], IntType):
+													(
+														record_call_targets(contents, inner, later) and same_type(first.value_type, IntType)
+														and first.span.start == start and first.span.end == start + "from_opaque Id(make(pick({ value = 7 })))".length()
+														and same_source(first.span.source, module_source(root_module_id()))
+														and same_source(call.span.source, first.span.source) and call.span.start == callee and call.span.end == callee + "make".length()
+														and same_source(inner_call.span.source, first.span.source) and inner_call.span.start == inner_callee and inner_call.span.end == inner_callee + "pick".length()
+													)
+												_: False
+										_: False
+								_: False
+						_: False
+
+
 tests: TestSuite = {
 	description = "Blorp 2 specialization",
 	tests = [
+		("construction visits child types before later layout", test_construction_visits_child_types_before_later_layout),
+		("projection visits child types before later layout", test_projection_visits_child_types_before_later_layout),
 		("numeric and Void ownership", test_numeric_and_void_types_have_no_ownership),
 		("String ownership authority", test_string_ownership_is_a_managed_leaf),
 		("String List ownership authority", test_string_list_ownership_is_a_managed_root),

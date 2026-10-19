@@ -1,0 +1,172 @@
+import:
+	../../../src/check/check: check, check_errors
+	../../../src/check/errors as Errors
+	../../../src/check/render: render_failure
+	../../../src/parse/assemble: parsed_contents
+	../../../src/utils/ids: inventory_opaques, opaque_number
+	../../../src/utils/source: module_source, root_module_id, same_source
+	../../../src/utils/syntax: same_span
+	../module_input: PRIMITIVE_BASE, parse_modules_with_base
+	test: TestSuite
+
+
+private MAIN: String =
+	|func main() -> Int:
+	|    0
+	|
+
+private OPAQUE_PREFIX: String = "opaque type A = "
+
+
+private pure func rejects_cycle(prefix: String, closing: String, suffix: String, root_position: Int) -> Bool:
+	source = prefix + closing + suffix + MAIN
+	match parse_modules_with_base([{ source = source, targets = [] }], PRIMITIVE_BASE):
+		Err(_): False
+		Ok(program):
+			match (inventory_opaques(parsed_contents(program).declarations).get(root_position), check(program)):
+				(Some(expected), Err(failure)):
+					typed = check_errors(failure)
+					rendered = render_failure(failure)
+					match typed.first.kind:
+						Errors.TypeDeclarationRejection(Errors.RecursiveOpaqueRepresentation(id)):
+							(
+								opaque_number(id) == opaque_number(expected.id)
+								and typed.remaining.is_empty() and rendered.remaining.is_empty()
+								and same_source(typed.first.span.source, module_source(root_module_id()))
+								and typed.first.span.start == prefix.length()
+								and typed.first.span.end == prefix.length() + closing.length()
+								and same_span(rendered.first.span, typed.first.span)
+								and rendered.first.message == "recursive opaque representations are not supported yet"
+								and rendered.first.help == "wrap an independently recursive aggregate instead of referring back to the opaque type"
+								and rendered.first.note.is_none()
+							)
+						_: False
+				_: False
+
+
+pure func test_unused_direct_opaque_cycle_rejects() -> Bool:
+	rejects_cycle(OPAQUE_PREFIX, "A", "\n", 0)
+
+
+pure func test_unused_mutual_opaque_cycle_rejects_at_closing_use() -> Bool:
+	before: String =
+		|opaque type A = B
+		|
+	rejects_cycle(before + "opaque type B = ", "A", "\n", 0)
+
+
+pure func test_unused_list_cycle_keeps_complete_annotation() -> Bool:
+	rejects_cycle(OPAQUE_PREFIX, "List[A]", "\n", 0)
+
+
+pure func test_record_phantom_argument_is_a_representation_demand() -> Bool:
+	before: String =
+		|fixed record Phantom[T] { value: Int }
+		|
+	rejects_cycle(before + OPAQUE_PREFIX, "Phantom[A]", "\n", 0)
+
+
+pure func test_union_phantom_argument_is_a_representation_demand() -> Bool:
+	before: String =
+		|fixed union Phantom[T]:
+		|    Mark
+		|
+	rejects_cycle(before + OPAQUE_PREFIX, "Phantom[A]", "\n", 0)
+
+
+pure func test_unused_union_payload_cycle_rejects_at_field() -> Bool:
+	before: String =
+		|opaque type A = Choice
+		|fixed union Choice:
+		|
+	rejects_cycle(before + "    Mark(", "A", ")\n", 0)
+
+
+pure func test_each_fixed_target_gets_fresh_aggregate_visits() -> Bool:
+	after: String =
+		| }
+		|opaque type A = Link
+		|opaque type B = Link
+		|
+	rejects_cycle("fixed record Link { next: ", "B", after, 1)
+
+
+pure func test_reversed_fixed_targets_select_first_opaque_root() -> Bool:
+	after: String =
+		| }
+		|opaque type B = Link
+		|opaque type A = Link
+		|
+	rejects_cycle("fixed record Link { next: ", "B", after, 0)
+
+
+pure func test_record_visits_keep_complete_argument_keys() -> Bool:
+	before: String =
+		|fixed record Cell[T] { value: T }
+		|opaque type A = Link
+		|
+	rejects_cycle(before + "fixed record Link { first: Cell[Int], later: ", "Cell[A]", " }\n", 0)
+
+
+pure func test_union_visits_keep_complete_argument_keys() -> Bool:
+	before: String =
+		|fixed union Cell[T]:
+		|    Value(T)
+		|opaque type A = Link
+		|
+	rejects_cycle(before + "fixed record Link { first: Cell[Int], later: ", "Cell[A]", " }\n", 0)
+
+
+pure func test_field_order_selects_first_complete_closing_annotation() -> Bool:
+	before: String =
+		|opaque type A = Link
+		|
+	rejects_cycle(before + "fixed record Link { first: ", "List[A]", ", later: A }\n", 0)
+
+
+pure func test_first_invalid_root_is_selected_before_later_root() -> Bool:
+	after: String =
+		|
+		|opaque type B = B
+		|
+	rejects_cycle(OPAQUE_PREFIX, "A", after, 0)
+
+
+pure func test_reversed_invalid_roots_select_new_first_root() -> Bool:
+	after: String =
+		|
+		|opaque type A = A
+		|
+	rejects_cycle("opaque type B = ", "B", after, 0)
+
+
+pure func test_unused_wrappers_over_independent_recursive_record_accept() -> Bool:
+	declarations: String =
+		|fixed record Node { next: Node }
+		|opaque type First = Node
+		|opaque type Second = Node
+		|
+	match parse_modules_with_base([{ source = declarations + MAIN, targets = [] }], PRIMITIVE_BASE):
+		Ok(program): check(program).is_ok()
+		Err(_): False
+
+
+tests: TestSuite = {
+	description = "Blorp 2 fixed-target opaque representation cycles",
+	tests = [
+		("unused direct opaque cycle", test_unused_direct_opaque_cycle_rejects),
+		("unused mutual opaque cycle closes at written use", test_unused_mutual_opaque_cycle_rejects_at_closing_use),
+		("List cycle keeps complete annotation", test_unused_list_cycle_keeps_complete_annotation),
+		("record phantom argument is demanded", test_record_phantom_argument_is_a_representation_demand),
+		("union phantom argument is demanded", test_union_phantom_argument_is_a_representation_demand),
+		("ordinary union payload closes opaque cycle", test_unused_union_payload_cycle_rejects_at_field),
+		("each fixed target gets fresh visits", test_each_fixed_target_gets_fresh_aggregate_visits),
+		("reversed fixed targets select first opaque root", test_reversed_fixed_targets_select_first_opaque_root),
+		("record visits keep complete argument keys", test_record_visits_keep_complete_argument_keys),
+		("union visits keep complete argument keys", test_union_visits_keep_complete_argument_keys),
+		("first field keeps complete closing annotation", test_field_order_selects_first_complete_closing_annotation),
+		("first invalid root wins", test_first_invalid_root_is_selected_before_later_root),
+		("reversed invalid roots change selected root", test_reversed_invalid_roots_select_new_first_root),
+		("independent recursive record wrappers accept", test_unused_wrappers_over_independent_recursive_record_accept),
+	]
+}

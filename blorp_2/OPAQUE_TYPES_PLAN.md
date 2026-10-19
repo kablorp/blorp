@@ -2,11 +2,26 @@
 
 ## Status and scope
 
-Current proposal, before implementation, on accepted main
-`dcd8beb0af83f156ad0c482b2fd3235ba72bb8dc`. Root, architecture and test reviewers
-agree with the user's 2026-10-18 correction: opaque identity matters during
-checking; equal representations may share specialized instances afterward.
-Publish this reviewed revision separately before production edits.
+Implemented against accepted baseline
+`dcd8beb0af83f156ad0c482b2fd3235ba72bb8dc`, after publishing this revised plan
+separately at `2a7fcf65e26171fee366b6be33d9dd0010513e32`. Opaque identity matters
+during checking; equal representations may share specialized instances afterward.
+The [validation report](../benchmarks/results/blorp_2_opaque_types_2026-10-18.md)
+records 3,513 component and 1,091 native gate passes, six effective restored
+fault probes, exhaustive old-corpus identity and all prospective cost gates.
+
+Actual production is 561 ADD / 170 DEL / +391 net; test owners are separately
+1,751 ADD / 44 DEL / +1,707 net, plus 236 fixture lines. At the test
+assessment point, root and test review approved continuation through 1,850 added
+lines for the remaining required oracles; the 1,900 hard limit stayed unchanged.
+The original forecasts and acceptance contracts below are retained as prospective
+history, including the preimplementation source example and RED witness.
+
+The current ordinary source probe exits 1 without C at `src/own/own.brp:3:16`:
+`module list declares no public function or type set_index`. This namespace
+failure precedes complete source checking; it does not prove that every source
+opaque declaration has passed. Target library/source API alignment and M8 remain
+separate work.
 
 The earlier P+F candidate is recovered from Git snapshot
 `2ae6555e8960adef4ad8a27ddd0403ca29d6edfd`, parent `fec864e1`. Its 40 paths
@@ -27,7 +42,8 @@ function declarations must not be structurally merged.
 
 Admit nongeneric ordinary opaques over already supported representations,
 including scalar/Void, String, List, fixed records and independently recursive
-aggregates. The current 41-module source contains 36 opaque declarations.
+aggregates. The baseline 41-module source contains 36 opaque declarations;
+the implementation adds the compiler's own OpaqueId declaration.
 No generic opaques, opaque constants, inherited representation methods, new
 recursive families, runtime wrappers/ABI, lambda/capture support, source-body
 migration, caches, registries, new pipeline or benchmark framework is included.

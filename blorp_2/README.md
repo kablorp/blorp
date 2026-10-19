@@ -1226,10 +1226,18 @@ Lexical and layout rules:
   private type, including inside nested type arguments. Make the type public or
   the enclosing declaration private. Private declarations and body-only uses
   of private types remain valid.
-- `opaque type Name = Underlying` declares an opaque type, and
-  `into_opaque Name(value)` / `from_opaque Name(value)` convert one value;
-  all three parse, and checking rejects them until the recursive-types
-  milestone. The conversion words are reserved: `into_opaque(7)` is a syntax error.
+- `opaque type Name = Underlying` declares a distinct, nongeneric type.
+  `into_opaque Name(value)` wraps its underlying value and
+  `from_opaque Name(value)` projects it, only inside the declaring module.
+  Export ordinary constructor/accessor functions for other modules, as in the
+  [two-file Int example](test/e2e/fixtures/opaque/int/main.brp). Two opaque types
+  remain distinct during checking even when they wrap the same type, including
+  inside Lists and generic records. Conversions evaluate their operand once;
+  afterward they use the underlying layout and ownership operations without a
+  runtime wrapper. Opaque types do not inherit representation fields or methods.
+  Public opaques may hide private representations. Cyclic opaque representations
+  are rejected; wrapping an independently recursive aggregate remains valid.
+  The conversion words are reserved: `into_opaque(7)` is a syntax error.
 - `LIMIT: Int = 7` declares a module constant; its value may stand alone on
   the next line. This increment accepts explicitly typed, closed Int, Float
   and String literal initializers, including pipe Strings. Every declaration

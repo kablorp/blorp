@@ -6,17 +6,17 @@ import:
 	./errors:
 		CheckError,
 		CheckerInvariant(
-			InvalidParameterDeclaration, InvalidUnionDeclaration, InvalidRecordDeclaration, InvalidDeclarationVisit,
+			InvalidParameterDeclaration, InvalidUnionDeclaration, InvalidRecordDeclaration, InvalidOpaqueDeclaration, InvalidDeclarationVisit,
 		),
 		TypeDeclarationError(
-			DuplicateRecordField, DuplicateTypeParameter, TypeParameterTypeNameConflict, RecursiveAggregateType,
+			DuplicateRecordField, DuplicateTypeParameter, TypeParameterTypeNameConflict, RecursiveAggregateType, RecursiveOpaqueRepresentation,
 		),
 		TypeTermError(
 			PrivateTypeInPublicDeclaration,
 			ListTypeArgumentCount, MissingUnionTypeArguments, NonApplicableType, MissingRecordTypeArguments, RecordTypeArgumentCountMismatch, OrdinaryRecordApplied,
 			OrdinaryUnionApplied, UnionTypeArgumentCountMismatch, UnknownType,
 		),
-		UnsupportedForm(OpaqueTypeDeclaration, FunctionType),
+		UnsupportedForm(FunctionType),
 		QualifiedError(UnknownModuleAlias, QualifiedNotOffered),
 		qualified_error,
 		checker_invariant,
@@ -26,12 +26,13 @@ import:
 	./model:
 		CheckedField,
 		CheckedRecord,
+		CheckedOpaque,
 		CheckedUnion,
 		CheckedVariant,
 		TypeParameterId,
 		TypeParameterOwner(UnionDeclaration, RecordDeclaration),
 		TypeRef(PureCallableType,
-			AppliedUnionType, AppliedRecordType, VoidType, FloatType, IntType, ListType, ParameterType, RecordType, StringType, UnionType,
+			AppliedUnionType, AppliedRecordType, VoidType, FloatType, IntType, ListType, OpaqueType, ParameterType, RecordType, StringType, UnionType,
 		),
 		TypeUse,
 		UnionOccurrence,
@@ -41,27 +42,29 @@ import:
 		primitive_ref,
 		same_owner,
 		same_types,
+		same_type,
 		type_parameter_id,
 	../utils/ids:
 		RecordRow,
 		UnionRow,
-		NominalRow(UnionDeclarationRow, RecordDeclarationRow),
+		NominalRow(UnionDeclarationRow, RecordDeclarationRow, OpaqueDeclarationRow),
 		inventory_functions,
 		inventory_records,
 		inventory_unions,
 		next_nominal,
 		RecordId,
+		opaque_number,
 		UnionId,
 		record_number,
 		union_number,
 	int as IntOps
 	../utils/names: NameId, same_name
 	../namespace/namespace:
-		AliasedModule, Namespace, NamedValue(NamedAlias), TypeHead(PrimitiveHead, ListHead, UnionHead, RecordHead),
+		AliasedModule, Namespace, NamedValue(NamedAlias), TypeHead(PrimitiveHead, ListHead, UnionHead, RecordHead, OpaqueHead),
 		Origin(Declared), named_type, named_value, offered_type,
 	option: to_result
-	../parse/assemble: ParsedContents, ParsedModuleRow
-	../utils/source: compiler_source, ModuleId, same_module
+	../parse/assemble: ParsedContents
+	../utils/source: compiler_source, ModuleId
 	../utils/syntax:
 		ParsedQualified,
 		ParsedRecord,
@@ -201,6 +204,8 @@ private pure func resolve_atomic_head(
 			Ok(primitive_ref(primitive))
 		ListHead:
 			Err(type_term_error(name.span, ListTypeArgumentCount))
+		OpaqueHead(id):
+			Ok(OpaqueType(id))
 		RecordHead(id):
 			match record_arity(scope, id, name.span):
 				Ok(arity):
@@ -293,7 +298,7 @@ private pure func resolve_applied_head(
 							),
 						)
 				Err(error): Err(error)
-		PrimitiveHead(_):
+		PrimitiveHead(_) | OpaqueHead(_):
 			Err(type_term_error(name.span, NonApplicableType(name.id)))
 
 
@@ -356,7 +361,8 @@ private pure func resolve_types(
 
 fixed record CheckedDeclarations {
 	unions: List[CheckedUnion],
-	records: List[CheckedRecord]
+	records: List[CheckedRecord],
+	opaques: List[CheckedOpaque]
 }
 
 
@@ -368,48 +374,10 @@ private pure func declared_module(declaration: NominalRow) -> ModuleId:
 			parsed_union.module
 		RecordDeclarationRow(parsed_record):
 			parsed_record.declaration.module
+		OpaqueDeclarationRow(parsed_opaque):
+			parsed_opaque.declaration.module
 
 
-
-
--- The first opaque declaration, in source order: modules in load order, position
--- within a module. It runs before the namespace is built, which would
--- otherwise read these rows and report a misleading unknown imported name.
-pure func reject_unsupported_declarations(parsed: ParsedContents) -> Result[Void, CheckError]:
-	var failure: Option[CheckError] = None
-
-	for module in parsed.modules:
-		if failure.is_none():
-			failure = module_unsupported_form(parsed, module)
-
-	match failure:
-		Some(error):
-			Err(error)
-		None:
-			Ok(void)
-
-
--- The earliest unsupported form of one module, by span start.
-private pure func module_unsupported_form(parsed: ParsedContents, module: ParsedModuleRow) -> Option[CheckError]:
-	var earliest: Option[CheckError] = None
-
-	for declaration in parsed.opaques:
-		if same_module(declaration.module, module.module):
-			earliest = earlier(earliest, unsupported_form(declaration.type_name.span, OpaqueTypeDeclaration))
-
-	earliest
-
-
--- Both errors lie in one module's source, so span starts order them.
-private pure func earlier(current: Option[CheckError], candidate: CheckError) -> Option[CheckError]:
-	match current:
-		None:
-			Some(candidate)
-		Some(existing):
-			if IntOps.less_than(candidate.span.start, existing.span.start):
-				Some(candidate)
-			else:
-				current
 
 
 pure func validate_declarations(
@@ -421,7 +389,8 @@ pure func validate_declarations(
 		namespace,
 		{
 			unions = [],
-			records = []
+			records = [],
+			opaques = []
 		},
 	)
 
@@ -431,13 +400,14 @@ private pure func declare_types(
 	namespace: Namespace,
 	checked: CheckedDeclarations,
 ) -> Result[CheckedDeclarations, CheckError]:
-	match next_nominal(parsed.declarations, checked.records.length(), checked.unions.length()):
+	match next_nominal(parsed.declarations, checked.records.length(), checked.unions.length(), checked.opaques.length()):
 		None:
 			Ok(checked)
 		Some(declaration):
 			access = match declaration:
 				UnionDeclarationRow(row): type_access(row.visibility, row.type_name.id)
 				RecordDeclarationRow(row): type_access(row.declaration.visibility, row.declaration.type_name.id)
+				OpaqueDeclarationRow(_): PrivateTypeUse
 			scope: TypeScope = {
 				records = inventory_records(parsed.declarations),
 				unions = inventory_unions(parsed.declarations),
@@ -477,6 +447,19 @@ private pure func declare_types(
 										fields = fields,
 									}) })
 								Err(error): Err(error)
+						Err(error): Err(error)
+
+				OpaqueDeclarationRow(parsed_opaque):
+					match resolve_type(scope, parsed_opaque.declaration.underlying):
+						Ok(underlying):
+							accepted: CheckedOpaque = {
+								id = parsed_opaque.id,
+								underlying_type = {
+									value_type = underlying,
+									span = type_span(parsed_opaque.declaration.underlying)
+								}
+							}
+							Ok({ checked | opaques = checked.opaques.append(accepted) })
 						Err(error): Err(error)
 
 			match declared:
@@ -914,7 +897,7 @@ private pure func generic_reinstantiation_edge(
 					closing = Some(annotation)
 				else:
 					match annotation.value_type:
-						VoidType | IntType | FloatType | StringType | ParameterType(_):
+						VoidType | IntType | FloatType | StringType | OpaqueType(_) | ParameterType(_):
 							void
 						PureCallableType(parameters, result):
 							for child in parameters.append(result):
@@ -1122,7 +1105,7 @@ pure func validate_finite_declarations(
 								pending_count = IntOps.add(pending_count, 1)
 						VisitDeclaredType(annotation):
 							match annotation.value_type:
-								VoidType | IntType | FloatType | StringType | ParameterType(_):
+								VoidType | IntType | FloatType | StringType | OpaqueType(_) | ParameterType(_):
 									void
 								RecordType(_):
 									void
@@ -1155,7 +1138,127 @@ pure func validate_finite_declarations(
 		Some(error):
 			Err(error)
 		None:
-			Ok(void)
+			validate_opaque_representations(declarations)
+
+
+-- Fixed-target reachability is fresh for every opaque. Mark a type only when
+-- expanding it: all its children are then pending, so an aggregate revisit
+-- needs no second expansion. Check target reentry before that shortcut.
+private pure func validate_opaque_representation(
+	root: CheckedOpaque,
+	declarations: CheckedDeclarations,
+) -> Result[Void, CheckError]:
+	var pending = [root.underlying_type]
+	var depth = 1
+	var visited: List[TypeRef] = []
+	var failure: Option[CheckError] = None
+	while IntOps.greater_than(depth, 0) and failure.is_none():
+		depth = IntOps.subtract(depth, 1)
+		match pending.get(depth):
+			None: failure = Some(checker_invariant(root.underlying_type.span, InvalidDeclarationVisit))
+			Some(annotation):
+				reentry = match annotation.value_type:
+					OpaqueType(id): IntOps.equals(opaque_number(id), opaque_number(root.id))
+					_: False
+				if reentry:
+					failure = Some(type_declaration_error(annotation.span, RecursiveOpaqueRepresentation(root.id)))
+				else:
+					var seen = False
+					for previous in visited:
+						if same_type(previous, annotation.value_type):
+							seen = True
+							break
+					if not seen:
+						visited = visited.append(annotation.value_type)
+						children: Result[List[TypeUse], CheckError] = match annotation.value_type:
+							ListType(element): Ok([{ annotation | value_type = element }])
+							OpaqueType(id):
+								match declarations.opaques.get(opaque_number(id)):
+									Some(declaration): Ok([declaration.underlying_type])
+									None: Err(checker_invariant(annotation.span, InvalidOpaqueDeclaration(id)))
+							RecordType(id): opaque_record_children(id, [], annotation.span, declarations.records)
+							AppliedRecordType(id, arguments): opaque_record_children(id, arguments, annotation.span, declarations.records)
+							UnionType(id): opaque_union_children(id, [], annotation.span, declarations.unions)
+							AppliedUnionType(id, arguments): opaque_union_children(id, arguments, annotation.span, declarations.unions)
+							_: Ok([])
+						match children:
+							Err(error): failure = Some(error)
+							Ok(ordered):
+								var position = ordered.length()
+								while IntOps.greater_than(position, 0):
+									position = IntOps.subtract(position, 1)
+									match ordered.get(position):
+										Some(child):
+											pending = push_type_use(pending, depth, child)
+											depth = IntOps.add(depth, 1)
+										None: failure = Some(checker_invariant(annotation.span, InvalidDeclarationVisit))
+	match failure:
+		Some(error): Err(error)
+		None: Ok(void)
+
+
+private pure func validate_opaque_representations(declarations: CheckedDeclarations) -> Result[Void, CheckError]:
+	var failure: Option[CheckError] = None
+	for declaration in declarations.opaques:
+		match validate_opaque_representation(declaration, declarations):
+			Ok(_): void
+			Err(error):
+				failure = Some(error)
+				break
+	match failure:
+		Some(error): Err(error)
+		None: Ok(void)
+
+
+-- Argument demands precede stored fields, including phantom arguments. Each
+-- child keeps its complete written annotation; no child-provenance tree exists.
+private pure func opaque_record_children(
+	id: RecordId,
+	arguments: List[TypeRef],
+	span: Span,
+	records: List[CheckedRecord],
+) -> Result[List[TypeUse], CheckError]:
+	declaration ?= records.get(record_number(id)).to_result(checker_invariant(span, InvalidRecordDeclaration(id)))
+	var children: List[TypeUse] = []
+	for argument in arguments:
+		children = children.append({ value_type = argument, span = span })
+	substitution: Substitution = { owner = RecordDeclaration(id), values = arguments }
+	var failure: Option[CheckError] = None
+	for field in declaration.fields:
+		match substitute_type(field.value_type.value_type, substitution, field.value_type.span):
+			Ok(value): children = children.append({ field.value_type | value_type = value })
+			Err(error):
+				failure = Some(error)
+				break
+	match failure:
+		Some(error): Err(error)
+		None: Ok(children)
+
+
+private pure func opaque_union_children(
+	id: UnionId,
+	arguments: List[TypeRef],
+	span: Span,
+	unions: List[CheckedUnion],
+) -> Result[List[TypeUse], CheckError]:
+	declaration ?= unions.get(union_number(id)).to_result(checker_invariant(span, InvalidUnionDeclaration(id)))
+	var children: List[TypeUse] = []
+	for argument in arguments:
+		children = children.append({ value_type = argument, span = span })
+	substitution: Substitution = { owner = UnionDeclaration(id), values = arguments }
+	var failure: Option[CheckError] = None
+	for variant in declaration.variants:
+		for field in variant.fields:
+			match substitute_type(field.value_type, substitution, field.span):
+				Ok(value): children = children.append({ field | value_type = value })
+				Err(error):
+					failure = Some(error)
+					break
+		if failure.is_some():
+			break
+	match failure:
+		Some(error): Err(error)
+		None: Ok(children)
 
 
 private fixed record ExpandedInstance {
