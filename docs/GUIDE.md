@@ -52,6 +52,8 @@ stdout, stderr and exit status. Their parsing and evaluation are pure and return
 ordinary Result values; only the output boundary prints. List[String] is the
 first supported concrete List instantiation; list construction and mutation
 remain deferred. The pilot no longer exposes read_line.
+Flat [qualified constructor patterns](../blorp_2/README.md#local-modules)
+resolve public heads through a local module alias and permit payload captures.
 Float64 literals and concrete arithmetic/formatting preserve typed numeric
 values through the pilot pipeline. Strict `string.parse_float` returns ordinary
 Option[Float]; source literals require finite values, while arithmetic may

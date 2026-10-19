@@ -1,0 +1,320 @@
+import:
+	../../../src/check/check: CheckedProgram, check, checked_functions
+	../../../src/check/model as Checked
+	../../../src/utils/source: module_source, root_module_id, same_source
+	../../../src/utils/syntax: Diagnostic
+	../input: setup_diagnostic
+	../module_input: parse_modules
+	result: map_err
+	test: TestSuite
+
+
+private SHAPES: String =
+	|fixed union Shape:
+	|    Empty
+	|    Number(Int)
+	|fixed union Other:
+	|    Outside
+	|fixed union Maybe[T]:
+	|    Present(T)
+	|    Missing
+	|private fixed union Hidden:
+	|    Secret
+	|pure func answer() -> Int:
+	|    42
+	|
+
+private IMPORT: String = "import:\n    ./shapes as H\n"
+
+private MAIN: String = "func main() -> Int:\n    match H.Number(42):\n"
+
+
+private pure func checked(source: String) -> Result[CheckedProgram, Diagnostic]:
+	parsed ?= parse_modules([{ source = source, targets = [1] }, { source = SHAPES, targets = [] }])
+	check(parsed).map_err(setup_diagnostic)
+
+
+private pure func matched(source: String) -> Option[Checked.CheckedFunction]:
+	match checked(source):
+		Err(_): None
+		Ok(program):
+			var found: Option[Checked.CheckedFunction] = None
+			for function in checked_functions(program).functions:
+				match function.body:
+					Checked.CheckedMatchBody(_): found = Some(function)
+					_: void
+			found
+
+
+private pure func capture_has_field_facts(function: Checked.CheckedFunction, id: Checked.BindingId, source: String) -> Bool:
+	match (function.bindings.get(Checked.binding_number(id)), source.index_of("item")):
+		(Some(binding), Some(start)):
+			match binding.origin:
+				Checked.MatchCapture:
+					(
+						Checked.same_type(binding.value_type, Checked.IntType)
+						and same_source(binding.span.source, module_source(root_module_id()))
+						and binding.span.start == start and binding.span.end == start + 4
+					)
+				_: False
+		_: False
+
+
+private pure func single_capture(captures: List[Option[Checked.BindingId]]) -> Option[Checked.BindingId]:
+	if captures.length() == 1:
+		captures.get(0).and_then(pure func(capture): capture)
+	else:
+		None
+
+
+-- Diagnostic assertions include the source authority as well as byte extent.
+private pure func rejects(prefix: String, rejected: String, suffix: String, message: String, help: String) -> Bool:
+	match checked(prefix + rejected + suffix):
+		Ok(_): False
+		Err(error):
+			(
+				same_source(error.span.source, module_source(root_module_id()))
+				and error.span.start == prefix.length()
+				and error.span.end == prefix.length() + rejected.length()
+				and error.message == message
+				and error.help == help
+			)
+
+
+pure func test_qualified_and_selected_patterns_retain_the_constructor_id() -> Bool:
+	source: String =
+		|import:
+		|    ./shapes as H: Shape(Empty)
+		|func main() -> Int:
+		|    match H.Number(42):
+		|        H.Number(item): item
+		|        Empty: 0
+		|
+	match matched(source):
+		None: False
+		Some(function):
+			match function.body:
+				Checked.CheckedMatchBody(body):
+					match (body.scrutinee.form, body.arms):
+						(Checked.ConstructVariant(constructed, [_]), [first, second]):
+							match (first.pattern, second.pattern):
+								(Checked.VariantCase(number, captures), Checked.VariantCase(_, [])):
+									match single_capture(captures):
+										Some(capture):
+											match first.body:
+												Checked.ReturnExpression(value):
+													match value.form:
+														Checked.ReadBinding(read):
+															(
+																Checked.same_variant(constructed, number)
+																and Checked.binding_number(capture) == 0
+																and Checked.binding_number(read) == 0
+																and capture_has_field_facts(function, capture, source)
+															)
+														_: False
+												_: False
+										None: False
+								_: False
+						_: False
+				_: False
+
+
+pure func test_qualified_nullary_parentheses_and_wildcard_fields_are_accepted() -> Bool:
+	checked(IMPORT + MAIN + "        H.Empty(): 0\n        H.Number(_): 42\n").is_ok()
+
+
+-- The wildcard keeps a wrong retained variant useful and exhaustive, so this
+-- callback observes identity directly rather than relying on a coverage error.
+pure func test_qualified_pattern_publishes_the_selected_variant_identity() -> Bool:
+	match matched(IMPORT + MAIN + "        H.Number(_): 42\n        _: 0\n"):
+		None: False
+		Some(function):
+			match function.body:
+				Checked.CheckedMatchBody(body):
+					match (body.scrutinee.form, body.arms):
+						(Checked.ConstructVariant(expected, [_]), [first, _]):
+							match first.pattern:
+								Checked.VariantCase(actual, captures):
+									Checked.same_variant(expected, actual) and captures.length() == 1
+								_: False
+						_: False
+				_: False
+
+
+pure func test_generic_qualified_capture_uses_the_scrutinee_argument() -> Bool:
+	source: String =
+		|import:
+		|    ./shapes as H
+		|pure func unwrap(value: H.Maybe[Int]) -> Int:
+		|    match value:
+		|        H.Present(item): item
+		|        H.Missing: 0
+		|func main() -> Int:
+		|    unwrap(H.Present(42))
+		|
+	match matched(source):
+		None: False
+		Some(function):
+			match function.body:
+				Checked.CheckedMatchBody(body):
+					match body.arms:
+						[first, _]:
+							match first.pattern:
+								Checked.VariantCase(_, captures):
+									match single_capture(captures):
+										Some(id):
+											Checked.binding_number(id) == 1 and capture_has_field_facts(function, id, source)
+										None: False
+								_: False
+						_: False
+				_: False
+
+
+pure func test_qualified_payload_capture_can_be_aliased() -> Bool:
+	arms: String =
+		|        H.Number(item):
+		|            copy = item
+		|            copy
+		|        H.Empty: 0
+		|
+	checked(IMPORT + MAIN + arms).is_ok()
+
+
+pure func test_missing_qualified_payload_has_exact_arity_diagnostic() -> Bool:
+	rejects(IMPORT + MAIN + "        ", "H.Number()", ": 1\n        _: 0\n",
+		"constructor pattern field count does not match its declaration",
+		"expected 1 fields, got 0; write one name or '_' per declared field")
+
+
+pure func test_extra_qualified_payload_has_exact_arity_diagnostic() -> Bool:
+	rejects(IMPORT + MAIN + "        ", "H.Empty(_)", ": 1\n        _: 0\n",
+		"constructor pattern field count does not match its declaration",
+		"expected 0 fields, got 1; write one name or '_' per declared field")
+
+
+pure func test_qualified_wrong_union_does_not_match_equal_local_variant_ordinal() -> Bool:
+	rejects(IMPORT + MAIN + "        ", "H.Outside", ": 1\n        _: 0\n",
+		"unknown constructor pattern",
+		"use a constructor of the matched union that is declared or imported in this module")
+
+
+pure func test_qualified_private_constructor_is_rejected_at_the_member() -> Bool:
+	rejects(IMPORT + MAIN + "        H.", "Secret", ": 1\n        _: 0\n",
+		"Secret is private to ./shapes", "remove private or qualify a public declaration")
+
+
+pure func test_qualified_unknown_constructor_is_rejected_at_the_member() -> Bool:
+	rejects(IMPORT + MAIN + "        H.", "Absent", ": 1\n        _: 0\n",
+		"module ./shapes declares no public Absent",
+		"H names module ./shapes; qualify a public function, constructor or type it declares; imports are not reexported")
+
+
+pure func test_qualified_function_is_not_a_constructor() -> Bool:
+	rejects(IMPORT + MAIN + "        ", "H.answer", ": 1\n        _: 0\n",
+		"unknown constructor pattern",
+		"use a constructor of the matched union that is declared or imported in this module")
+
+
+pure func test_unknown_pattern_alias_is_rejected_at_the_alias() -> Bool:
+	rejects(IMPORT + MAIN + "        ", "Missing", ".Empty: 1\n        _: 0\n",
+		"unknown module alias Missing", "add path as Missing to the import block")
+
+
+pure func test_selected_and_qualified_patterns_share_coverage() -> Bool:
+	prefix: String =
+		|import:
+		|    ./shapes as H: Shape(Empty)
+		|func main() -> Int:
+		|    match H.Number(42):
+		|        H.Empty: 0
+		|
+	rejects(prefix + "        ", "Empty", ": 1\n        H.Number(_): 42\n",
+		"match arm is unreachable", "remove this arm; earlier arms already cover all values it could match")
+
+
+pure func test_bare_unknown_name_remains_a_constructor_error() -> Bool:
+	rejects(IMPORT + MAIN + "        ", "anything", ": 1\n        _: 0\n",
+		"a bare name in a match arm is a constructor; use `_` to match anything",
+		"use a visible constructor of the matched union, or write `_` and use the match's scrutinee in the arm")
+
+
+pure func test_qualified_patterns_report_missing_coverage() -> Bool:
+	rejects(IMPORT + "func main() -> Int:\n    ", "match", " H.Number(42):\n        H.Number(_): 42\n",
+		"non-exhaustive match", "add an arm for the missing variant: Empty")
+
+
+pure func test_qualified_heads_keep_scrutinee_type_errors_first() -> Bool:
+	rejects(IMPORT + "func main() -> Int:\n    match ", "0", ":\n        Missing.Empty: 0\n        _: 1\n",
+		"match requires a union value", "match a typed union parameter or a call returning a declared union")
+
+
+pure func test_qualified_and_bare_heads_share_nested_field_admission() -> Bool:
+	rejects(IMPORT + MAIN + "        H.Number(", "Missing.Empty", "): 42\n        H.Empty: 0\n",
+		"nested patterns are not supported yet",
+		"bind the field to a name and match it in a second match; nested patterns arrive with the pattern-compilation milestone")
+
+
+pure func test_private_qualified_heads_fail_visibility_before_arity() -> Bool:
+	rejects(IMPORT + MAIN + "        H.", "Secret", "(_): 1\n        _: 0\n",
+		"Secret is private to ./shapes", "remove private or qualify a public declaration")
+
+
+pure func test_qualifying_an_imported_constructor_does_not_reexport_it() -> Bool:
+	source: String =
+		|import:
+		|    ./forward as F
+		|    ./shapes as H
+		|func main() -> Int:
+		|    match H.Number(42):
+		|        F.Empty: 0
+		|        _: 42
+		|
+	prefix = "import:\n    ./forward as F\n    ./shapes as H\nfunc main() -> Int:\n    match H.Number(42):\n        F."
+	forward_source: String =
+		|import:
+		|    ./shapes: Shape(Empty)
+		|
+	inputs = [
+		{ source = source, targets = [1, 2] },
+		{ source = forward_source, targets = [2] },
+		{ source = SHAPES, targets = [] },
+	]
+	match parse_modules(inputs):
+		Err(_): False
+		Ok(parsed):
+			match check(parsed):
+				Ok(_): False
+				Err(failure):
+					error = setup_diagnostic(failure)
+					(
+						same_source(error.span.source, module_source(root_module_id()))
+						and error.span.start == prefix.length() and error.span.end == prefix.length() + 5
+						and error.message == "module ./forward declares no public Empty"
+						and error.help == "F names module ./forward; qualify a public function, constructor or type it declares; imports are not reexported"
+					)
+
+
+tests: TestSuite = {
+	description = "Qualified flat constructor patterns",
+	tests = [
+		("qualified and selected patterns retain constructor identity", test_qualified_and_selected_patterns_retain_the_constructor_id),
+		("qualified nullary parentheses and wildcard fields", test_qualified_nullary_parentheses_and_wildcard_fields_are_accepted),
+		("qualified pattern publishes selected variant identity", test_qualified_pattern_publishes_the_selected_variant_identity),
+		("generic capture uses the scrutinee argument", test_generic_qualified_capture_uses_the_scrutinee_argument),
+		("qualified payload capture can be aliased", test_qualified_payload_capture_can_be_aliased),
+		("missing qualified payload has exact arity diagnostic", test_missing_qualified_payload_has_exact_arity_diagnostic),
+		("extra qualified payload has exact arity diagnostic", test_extra_qualified_payload_has_exact_arity_diagnostic),
+		("wrong union rejects an equal local ordinal", test_qualified_wrong_union_does_not_match_equal_local_variant_ordinal),
+		("private constructor diagnostic spans the member", test_qualified_private_constructor_is_rejected_at_the_member),
+		("unknown constructor diagnostic spans the member", test_qualified_unknown_constructor_is_rejected_at_the_member),
+		("qualified function is not a constructor", test_qualified_function_is_not_a_constructor),
+		("unknown pattern alias diagnostic spans the alias", test_unknown_pattern_alias_is_rejected_at_the_alias),
+		("selected and qualified patterns share coverage", test_selected_and_qualified_patterns_share_coverage),
+		("bare unknown name stays a constructor error", test_bare_unknown_name_remains_a_constructor_error),
+		("qualified patterns report missing coverage", test_qualified_patterns_report_missing_coverage),
+		("qualified heads keep scrutinee errors first", test_qualified_heads_keep_scrutinee_type_errors_first),
+		("qualified and bare heads share nested field admission", test_qualified_and_bare_heads_share_nested_field_admission),
+		("private qualified heads fail visibility before arity", test_private_qualified_heads_fail_visibility_before_arity),
+		("imported constructors are not reexported", test_qualifying_an_imported_constructor_does_not_reexport_it),
+	]
+}

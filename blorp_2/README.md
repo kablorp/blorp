@@ -1191,8 +1191,8 @@ Lexical and layout rules:
   rest last); a String or Char literal is a literal pattern; `Alias.Variant`
   qualifies a constructor by a module alias. Checking accepts a binder or `_`
   per field and rejects a nested field pattern, an or-pattern, a list pattern
-  or a literal pattern until the pattern-compilation milestone, and a qualified
-  head until the namespace milestone.
+  or a literal pattern until the pattern-compilation milestone. A qualified
+  flat head selects a public constructor through the importing module's alias.
   A nullary constructor pattern may be written `Empty` or `Empty()`. `Number()`
   is valid syntax but fails semantic arity checking for a one-field constructor.
 - A binding line is `name = expression` or `var name = expression`, optionally
@@ -1430,7 +1430,7 @@ Semantic rules:
   managed result into the join, which owns it afterwards. COW and managed
   annotated loops are deferred.
 - Union-only recursive layouts, generic self-reinstantiation,
-  guards, qualified/nested/literal patterns, constructor UFCS,
+  guards, nested/literal patterns, constructor UFCS,
   and function
   values are outside this increment. `Bool` is an ordinary fixed union declared
   once in the base module, alongside Option and Result. Local functions and
@@ -1479,8 +1479,8 @@ the required explicit library root is supplied. Record type imports are
 supported; a module offers only the types it declares, so an imported type is
 never selected through a module that only imports it. Aliases, qualified names
 and `private` are supported;
-wildcards and reexports are unsupported, and a qualified
-constructor in a pattern still waits for the pattern-compilation milestone.
+wildcards and reexports are unsupported. Flat qualified constructor patterns
+use the same constructor identity, field arity and coverage as bare heads.
 
 Each module owns its declarations; same-spelled declarations in different
 modules have distinct identities. Imported functions resolve their annotations

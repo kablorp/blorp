@@ -1405,7 +1405,8 @@ spread_target  = name | "_" ;
   including in a field position; a visible nested constructor retains the
   staged unsupported-pattern rejection. Payload captures remain valid under
   the no-shadowing rule above. Bind a computed scrutinee before the match when
-  an arm needs its whole value. Qualified patterns remain a later pilot increment.
+  an arm needs its whole value. Flat `Alias.Constructor(...)` patterns resolve
+  public constructors through a module alias and permit payload captures.
 - Or-pattern alternatives cannot introduce variable bindings, including
   payload, tuple, list-element, and named list-spread bindings. This rule also
   applies to nested or-patterns and is checked during typechecking. Wildcards,

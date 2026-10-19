@@ -5,7 +5,7 @@ publishes.
 ---
 import:
 	./callables: FunctionContract, ResolutionContext
-	./declarations: find_field, occurrence_fields, previous_declaration
+	./declarations: aliased_module, find_field, occurrence_fields, previous_declaration
 	./model:
 		FieldId,
 		CheckedRecord,
@@ -22,7 +22,9 @@ import:
 		ExpectedTypeSite(SourceAnnotation),
 		CallError(ArgumentTypeMismatch),
 		MatchError(UnimportedConstructorPattern),
+		QualifiedError(QualifiedNotOffered),
 		match_error,
+		qualified_error,
 		ConstructorError(ConstructorNeedsExpectedType, VariantNotInExpectedType, PayloadFreeVariantCalled, ConstructorFieldCountMismatch),
 		RecordError(UpdateRequiresRecord, DuplicateUpdateField, RecordNeedsExpectedType, UnknownRecordField, DuplicateLiteralField, MissingRecordField, RecordFieldTypeMismatch),
 		ValueError(EmptyListNeedsElementType, ListElementTypeMismatch),
@@ -55,8 +57,8 @@ import:
 		publish_inference_type
 	../utils/ids: OpaqueId, RecordId, UnionId, VariantId, record_number, union_number, variant_number
 	../utils/names: same_name
-	../namespace/namespace: NamedValue(NamedConstructor), named_value
-	../utils/syntax: Span, ValueExpression, WrittenName, ParsedRecordField
+	../namespace/namespace: NamedValue(NamedConstructor), OfferedValue(OfferedConstructor), named_value, offered_value
+	../utils/syntax: Span, ValueExpression, WrittenName, ParsedRecordField, ParsedQualified
 	int as IntOps
 	option: is_some, to_result
 
@@ -113,14 +115,36 @@ pure func find_variant(context: ResolutionContext, occurrence: UnionOccurrence, 
 						Some(error): Err(error)
 						None: Ok(None)
 		Some(variant):
-			match occurrence_fields(variant.fields, occurrence):
-				Ok(fields):
-					value_type = if occurrence.arguments.is_empty():
-						UnionType(occurrence.owner)
-					else:
-						AppliedUnionType(occurrence.owner, occurrence.arguments)
-					Ok(Some({ variant = variant.variant, result_type = value_type, fields = fields }))
+			match instantiate_pattern_variant(variant, occurrence):
+				Ok(contract): Ok(Some(contract))
 				Err(error): Err(error)
+
+
+-- Qualification selects an exported declaration, then the same membership
+-- authority as a bare head checks it against the scrutinee's union.
+pure func find_qualified_variant(context: ResolutionContext, occurrence: UnionOccurrence, qualified: ParsedQualified) -> Result[Option[VariantContract], CheckError]:
+	aliased ?= aliased_module(context.namespace, context.module, qualified.module)
+	declared ?= match offered_value(context.namespace, aliased.target, qualified.name.id):
+		Ok(OfferedConstructor(variant)):
+			declared_variant_contract(context, occurrence.owner, variant, qualified.name.span)
+		Ok(_): Ok(None)
+		Err(reason):
+			Err(qualified_error(qualified.name.span, QualifiedNotOffered(qualified.module.id, qualified.name.id, aliased.path, reason)))
+	match declared:
+		None: Ok(None)
+		Some(variant):
+			match instantiate_pattern_variant(variant, occurrence):
+				Ok(contract): Ok(Some(contract))
+				Err(error): Err(error)
+
+
+private pure func instantiate_pattern_variant(variant: DeclaredVariantContract, occurrence: UnionOccurrence) -> Result[VariantContract, CheckError]:
+	fields ?= occurrence_fields(variant.fields, occurrence)
+	value_type = if occurrence.arguments.is_empty():
+		UnionType(occurrence.owner)
+	else:
+		AppliedUnionType(occurrence.owner, occurrence.arguments)
+	Ok({ variant = variant.variant, result_type = value_type, fields = fields })
 
 
 pure func resolve_record_field(

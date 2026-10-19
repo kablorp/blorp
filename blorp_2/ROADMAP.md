@@ -381,7 +381,7 @@ host interface. The cleaner names are [deferred to a coordinated change](LIBRARY
 **Exit proof.** The tree resolves all 34 namespaces; `private` rejections pinned.
 
 **Status.** Part A done (aliases, `private`, qualified values and types; qualified
-pattern heads wait for M2b). Part B done: the foundation check publishes the
+flat pattern heads use the same constructor identities under M2b). Part B done: the foundation check publishes the
 designation and builtin contracts refer to it; the `if`, `and`/`or`/`not`, `?=`
 and `for` consumers arrive with M2.2, M2.3 and M3.
 
@@ -540,6 +540,20 @@ span. The group remains one body through lowering and ownership. Independent
 verification checks every label but grants no payload-projection permission.
 This feature is bounded to 650 gross added / +450 net production lines.
 
+The qualified-head-only port passed current-composition acceptance; see its
+[report](../benchmarks/results/blorp_2_qualified_patterns_2026-10-19.md).
+Its fixed accepted B is `ea881c84d0df9df04a6ec5c4406a3b69cf406735`.
+The implementation is 42 ADD / 19 DEL / +23 production; the earlier
+41 ADD / 20 DEL / +21 forecast remains historical evidence.
+Hard limits are 100 gross / +85 net production, 400 nonfixture test,
+100 fixture and 30 active documentation additions. The new native fixture
+keeps 140,000 allocations / 500,000,000 instructions and its ordinary main.
+Each unchanged owned input and the original schema1 host-construction proxy
+keeps independent +3% allocation and normal min3 instruction ceilings.
+Historical focused passes do not establish current acceptance. Qualified heads
+reuse exported constructor identities and existing flat-field checking;
+constructor groups and broader source-pattern rewrites remain separate.
+
 The approved [six-site first-order source pilot](QUALIFIED_PATTERN_SOURCE_PLAN.md)
 depends on qualified-feature acceptance. Source implementation waits for actual
 accepted-base/region pins and a separate grant. Source cost setup remains held
@@ -560,7 +574,8 @@ prerequisite merely because M1a can parse those forms.
 ignored managed-payload cleanup, source migration and exact rejections for
 deferred cases. No general pattern-matrix implementation is implied.
 
-**Status.** Not started.
+**Status.** Qualified flat heads passed current-composition acceptance.
+Groups and broader source-pattern rewrites remain separate.
 
 ## M3: loops and tail recursion
 
