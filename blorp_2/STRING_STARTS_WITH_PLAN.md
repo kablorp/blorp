@@ -98,7 +98,8 @@ and real main. No C rewrite, alternate entrypoint, new harness or shared framewo
 ## Bounds, review and holds
 
 Hard physical limits: production 45 gross/+45 net; tests 180 gross/+180 net with
-registry; two fixtures/70 combined lines; public API/temporary notes 15 lines.
+registry; two fixtures/70 combined lines; README API/temporary notes plus
+GUIDE/GRAMMAR pilot API crossrefs share 15 lines; no grammar production change.
 Previews: tests 148+2 registry, including 50 fixture lines; API notes seven lines.
 Each C-only fixture has proposed 150000 allocations/600000000 normal min3 limits,
 no successful absent-feature B denominator. Stop before any bound is breached.
