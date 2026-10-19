@@ -1370,7 +1370,7 @@ Semantic rules:
   unused bodies. An arbitrary `T` cannot return an Int literal or call a
   concrete Int/String runtime operation. Parameters cannot share a name with
   `Int`, `String`, or any declared union; separate declarations may reuse `T`.
-  `main` cannot declare type parameters. List repeat, length, get, append, set_or_keep and concat builtin wrappers may be generic; other closed builtin bodies remain nongeneric.
+  `main` cannot declare type parameters. List repeat, length, get, append, set and concat builtin wrappers may be generic; other closed builtin bodies remain nongeneric.
   Direct and UFCS calls solve private call variables structurally, processing
   argument constraints before a declared expected result. Later sibling evidence
   can solve an earlier pending call. Repeated occurrences, including structural
@@ -1535,7 +1535,7 @@ and hashes retained in its adapter headers. Its active declarations provide
 the calculator's ordinary unions and concrete numeric, conversion and IO functions.
 Their explicit builtin bodies select closed compiler-known operations. Module functions
 may declare these builtin bodies with the exact concrete runtime signature,
-without statement prefixes or tail annotations. List repeat, length, get, append, set_or_keep and concat wrappers may also declare generic parameters; other builtin wrappers remain nongeneric. Unknown
+without statement prefixes or tail annotations. List repeat, length, get, append, set and concat wrappers may also declare generic parameters; other builtin wrappers remain nongeneric. Unknown
 labels and signature mismatches are errors. There is no arbitrary foreign
 symbol binding. The base types module owns `Int`, `Float`, `String`, `Void` and unary `List`.
 The [validation report](../benchmarks/results/blorp_2_int_add_2026-10-11.md) records
@@ -1724,13 +1724,13 @@ pure func get[T](values: List[T], index: Int) -> Option[T]:
     builtin("list.get")
 pure func append[T](values: List[T], value: T) -> List[T]:
     builtin("list.append")
-pure func set_or_keep[T](values: List[T], index: Int, value: T) -> List[T]:
+pure func set[T](values: List[T], index: Int, value: T) -> List[T]:
     builtin("list.set")
 pure func concat[T](left: List[T], right: List[T]) -> List[T]:
     builtin("list.concat")
-pure func set[T](values: List[T], index: Int, value: T) -> Option[List[T]]:
+pure func set_index[T](values: List[T], index: Int, value: T) -> Option[List[T]]:
     match get(values, index):
-        Some(_): Some(set_or_keep(values, index, value))
+        Some(_): Some(set(values, index, value))
         None: None
 ```
 
@@ -1742,18 +1742,19 @@ otherwise. Zero, Void, an empty String and a nullary union case are valid Some
 payloads. Retaining a List root does not acquire its children again; its final
 release destroys each initialized slot exactly once.
 
-`append`, `set_or_keep` and `concat` borrow their inputs and return a fresh owned
+`append`, `set` and `concat` borrow their inputs and return a fresh owned
 List; every old alias keeps its original elements. Each stored occurrence of
 the result, surviving or replacement, is acquired independently, so one
-managed value may appear in both the input and the result. `set_or_keep` with a
+managed value may appear in both the input and the result. `set` with a
 negative or out-of-range index returns an unchanged value; `append` and
 `concat` always produce the longer List. The runtime helper for an update
 exists only where its operation is called.
 
-Checked `set` returns `Some(updated)` for a valid index and `None` otherwise.
+Checked `set_index` returns `Some(updated)` for a valid index and `None` otherwise.
 Both update APIs evaluate their replacement argument eagerly, including invalid
-indices. These target names intentionally differ from the host library's
-`set_index` and `set`; the host library is unchanged.
+indices. These names match the host library so the same compiler source can
+be compiled by both compilers. The later coordinated rename is tracked in
+[library parity](LIBRARY_PARITY.md#deferred-list-update-naming).
 
 A list literal `[a, b]` constructs one fresh root of exactly n slots inline
 at its site, storing each element once; `[x, x]` acquires `x` twice, as a

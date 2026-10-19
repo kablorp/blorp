@@ -1,5 +1,10 @@
 # Target List update names — validation, 2026-10-18
 
+**Historical API names:** the target-only rename below was subsequently reversed
+to preserve the shared host/target bootstrap interface. The checked implementation
+and approved limits remain. See the [restoration report](blorp_2_list_bootstrap_names_2026-10-18.md)
+and [deferred coordinated rename](../../blorp_2/LIBRARY_PARITY.md#deferred-list-update-naming).
+
 The requested target-only API
 is implemented: `set(List[T], Int, T) -> Option[List[T]]` returns Some(updated)
 or None; `set_or_keep(List[T], Int, T) -> List[T]` returns the updated value or

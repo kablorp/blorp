@@ -19,13 +19,19 @@ remain pending.
 The remaining table is historical evidence; refresh other interfaces at their
 own implementation boundary rather than treating planned removals as complete.
 
-**Target List naming.** The target library intentionally uses
-`set(List[T], Int, T) -> Option[List[T]]` for checked replacement and
-`set_or_keep(List[T], Int, T) -> List[T]` for replacement that keeps the original
-value on an invalid index. These correspond to host `set_index` and `set`,
-respectively. The host library and compiler-source calls remain unchanged in
-this target-only API change. Source/interface alignment is still required for
-self-compilation; the existing missing `list.set_index` import remains a frontier.
+### Deferred List update naming
+
+Both libraries currently expose `set(List[T], Int, T) -> List[T]` for replacement
+that keeps the original value on an invalid index, and
+`set_index(List[T], Int, T) -> Option[List[T]]` for checked replacement. Matching
+interfaces are required because the same compiler source must build against
+both libraries. The checked target implementation is an ordinary get/match wrapper.
+
+**Later change:** rename checked `set_index` to `set`, and no-op-on-invalid
+`set` to `set_or_keep`. Change both libraries and all compiler callers, tests and
+docs together. A target-only rename breaks self-compilation; a source-only rename
+breaks the host build. This coordinated rename is deferred, not implemented here.
+See the [restoration report](../benchmarks/results/blorp_2_list_bootstrap_names_2026-10-18.md).
 
 ## Planned interface delta
 
@@ -165,8 +171,8 @@ source unchanged.
 | list | join | `pure func join(self: List[String], sep: String) -> String` (list.brp:1351) | 13 | emit, load, main, parse (emit/emit.brp:702, :1524, :1661, :1748, :1875, :2322, :2392, :2416, :2477, :2585, load/load.brp:363, main.brp:123, parse/parse.brp:1034) | MISSING | blorp over `string.add`; needs M3 (loop); measured decision per the self-compile plan (emit joins thousands of fragments) |
 | list | length | `pure func length(self: List[T]) -> Int` (`implements HasLength for List[T]`, list.brp:225) | 175 | 22 files (verify/verify.brp:39 uses, check/values.brp:36 uses) | `list.length[T](values: List[T]) -> Int` | exists |
 | list | map | `pure func map[T, U](self: List[T], f: pure (T) -> U) -> List[U]` (list.brp:358) | 22 | 11 files (emit/emit.brp:457, own/own.brp:201) | MISSING | blorp; needs M7 and M3, over `append` |
-| list | set | `pure func set[T](self: List[T], index: Int, elem: T) -> List[T]` (list.brp:189) | 47 | 8 files (check/values.brp:17 uses, verify/verify.brp:12 uses) | `list.set_or_keep[T](values: List[T], index: Int, value: T) -> List[T]` | target name differs; source alignment pending |
-| list | set_index | `pure func set_index[T](self: List[T], index: Int, elem: T) -> Option[List[T]]` (list.brp:111) | 1 | own/own.brp:619 | `list.set[T](values: List[T], index: Int, value: T) -> Option[List[T]]` | target name differs; source alignment pending |
+| list | set | `pure func set[T](self: List[T], index: Int, elem: T) -> List[T]` (list.brp:189) | 47 | 8 files (check/values.brp:17 uses, verify/verify.brp:12 uses) | `list.set[T](values: List[T], index: Int, value: T) -> List[T]` | exists; host-compatible name |
+| list | set_index | `pure func set_index[T](self: List[T], index: Int, elem: T) -> Option[List[T]]` (list.brp:111) | 1 | own/own.brp:619 | `list.set_index[T](values: List[T], index: Int, value: T) -> Option[List[T]]` | exists; ordinary get/match wrapper |
 | list | sort_by | `pure func sort_by[T, K:Orderable](self: List[T], key_fn: pure (T) -> K) -> List[T]` (list.brp:614) | 3 | emit/emit.brp:1955, :1956, :1957 | MISSING | blorp, narrowed to `list.sort_by[T](values: List[T], key: pure (T) -> Int) -> List[T]` (all three keys are `Int`); a stable sort; needs M7 and M3 |
 | list | take | `pure func take[T](self: List[T], n: Int) -> List[T]` (list.brp:786) | 2 | check/signatures.brp:259, lex/lex.brp (levels) | MISSING | blorp over `get`/`append`; needs M3 |
 | option | and_then | `pure func and_then[T, U](self: Option[T], f: pure (T) -> Option[U]) -> Option[U]` (option.brp:138) | 1 | check/methods.brp:181 | MISSING | blorp (match); needs M7 |
@@ -222,13 +228,13 @@ has a plain function; the host's trait-impl methods become plain functions
 under the same name, as the temp `int.brp` already does for `add`):
 
 ML (list construction; `append`, the no-op-on-invalid update and `concat` landed
-in part 1, the literal in part 2; the update is now named `set_or_keep`):
+in part 1, the literal in part 2; the update retains the host name `set`):
 
 ```blorp
 -- list.brp
 pure func append[T](values: List[T], value: T) -> List[T]:
 	builtin("list.append")
-pure func set_or_keep[T](values: List[T], index: Int, value: T) -> List[T]:
+pure func set[T](values: List[T], index: Int, value: T) -> List[T]:
 	builtin("list.set")
 pure func concat[T](left: List[T], right: List[T]) -> List[T]:
 	builtin("list.concat")
@@ -359,10 +365,10 @@ codegen quality once measured: `int.greater_than`, `int.greater_than_or_equal`,
   `result.map_err`, `result.and_then` need a `pure (T) -> U` parameter type in a
   temp-library signature. Either M7's function-type-in-signature lands before
   M6 exits or the M6 exit criterion is "no MISSING row except the eight M7
-  rows". Host `list.set_index` now has target semantics under `list.set`, while
-  the host's no-op-on-invalid `list.set` is target `list.set_or_keep`; source
-  alignment remains pending. Historical `string.chars`/`lower` callers remain
-  under the separate source-migration plan.
+  rows". `list.set_index` and `list.set` now have matching host and target
+  signatures; the cleaner naming is deferred to a coordinated change above.
+  Historical `string.chars`/`lower` callers remain under the separate
+  source-migration plan.
 - **`+` on String** has ten sites, not one (see the operator table); the M0
   source correction covers all ten.
 

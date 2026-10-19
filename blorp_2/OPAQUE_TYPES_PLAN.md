@@ -17,8 +17,12 @@ lines for the remaining required oracles; the 1,900 hard limit stayed unchanged.
 The original forecasts and acceptance contracts below are retained as prospective
 history, including the preimplementation source example and RED witness.
 
-The current ordinary source probe exits 1 without C at `src/own/own.brp:3:16`:
-`module list declares no public function or type set_index`. This namespace
+At opaque acceptance, the ordinary source probe exited 1 without C at
+`src/own/own.brp:3:16`: `module list declares no public function or type set_index`.
+After restoring host-compatible List names, the current probe stops at missing
+`list.contains` in `verify/verify.brp:8:8`; see the
+[restoration report](../benchmarks/results/blorp_2_list_bootstrap_names_2026-10-18.md).
+This namespace
 failure precedes complete source checking; it does not prove that every source
 opaque declaration has passed. Target library/source API alignment and M8 remain
 separate work.

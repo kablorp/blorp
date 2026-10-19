@@ -6,8 +6,11 @@ direct-call specialization are implemented; lambdas and captures remain pending.
 Pure Void returns are accepted. Ordinary opaque types are implemented with
 nominal checking followed by representation erasure; see the
 [validation report](../benchmarks/results/blorp_2_opaque_types_2026-10-18.md).
-The current ordinary self-compile probe stops at `src/own/own.brp:3:16`:
-`module list declares no public function or type set_index`, with no C produced.
+The target List update names now match the host: `set` returns List and
+`set_index` returns Option[List]. The cleaner names are
+[deferred to a coordinated change](LIBRARY_PARITY.md#deferred-list-update-naming).
+The current ordinary self-compile probe stops at `src/verify/verify.brp:8:8`:
+`module list declares no public function or type contains`, with no C produced.
 This namespace frontier does not establish complete source checking.
 The [Option/Result catalog and plan](OPTION_RESULT_PLAN.md) owns the required
 helpers and their callable prerequisites. The original starting commit and held
