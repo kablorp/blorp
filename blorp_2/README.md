@@ -2162,7 +2162,10 @@ diagnostic rendering are pure. The pipeline publishes these complete results:
    distinct function-owned `ValueId`s. A local builder maps each `BindingId` to
    its current value. An alias uses the same value; reassignment updates that
    map after evaluating the right-hand side. Every computed value retains its
-   type and source span. Match-arm computations remain in their branches.
+   type and source span. A call definition chooses its callee span once;
+   lowered and owned call operations carry the concrete target and arguments,
+   while their enclosing definition owns the diagnostic anchor.
+   Match-arm computations remain in their branches.
    Every arm starts with the enclosing binding map, lowers each named capture
    at its declared field ordinal and then its statement sequence, and publishes
    a branch-local value block. Sibling arms
