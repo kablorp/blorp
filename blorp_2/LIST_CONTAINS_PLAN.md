@@ -132,3 +132,8 @@ execution; freeze literal commands/inputs/states and review before each lease.
 Retain every old failure and native-plan draft. Stop for scope, stack, semantic,
 setup, identity, provenance or hard-cost breach, restore C/faults and RETURN.
 Two final independent code/test-runner reviews precede root-only integration.
+
+Cost-stop exception: after review, root may grant remaining planned finite correctness/cost calls once.
+Keep B, semantics, thresholds/caps and original samples/FAILs; no retries, resampling or merge.
+Relative/absolute budget misses stay FAIL; the unchanged native umbrella may finish/report all fixed fields.
+All non-budget failures still stop immediately; data serves only a bounded proposal, never budget acceptance.

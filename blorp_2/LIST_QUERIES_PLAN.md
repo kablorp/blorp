@@ -93,3 +93,8 @@ provenance failure or10%/absolute miss; retain5% misses, no cap edits or retries
 Read generated C/selected managed returns; independent code+test-runner reviews
 precede root integration. New main composition requires explicit source/provenance
 validation, not a B roll. No commit, push or compiled call follows plan approval.
+
+Cost-stop exception: after review, root may grant remaining planned finite correctness/cost calls once.
+Keep B, semantics, thresholds/caps and original samples/FAILs; no retries, resampling or merge.
+Relative/absolute budget misses stay FAIL; the unchanged native umbrella may finish/report all fixed fields.
+All non-budget failures still stop immediately; data serves only a bounded proposal, never budget acceptance.

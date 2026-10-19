@@ -126,3 +126,8 @@ and helper additions semantically; do not replace another worker's List file.
 Every current-main composition requires review without rolling the fixed cost B.
 No source/body migration, framework, build/install, commit or push is authorized.
 Two independent final code/test-runner reviews precede root integration.
+
+Cost-stop exception: after review, root may grant remaining planned finite correctness/cost calls once.
+Keep B, semantics, thresholds/caps and original samples/FAILs; no retries, resampling or merge.
+Relative/absolute budget misses stay FAIL; the unchanged native umbrella may finish/report all fixed fields.
+All non-budget failures still stop immediately; data serves only a bounded proposal, never budget acceptance.
