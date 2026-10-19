@@ -2053,10 +2053,11 @@ diagnostic rendering are pure. The pipeline publishes these complete results:
    imported function retains its defining scope. Checking resolves nominal union and owned variant identities, then publishes
    one authoritative signature per function. A private resolution context borrows
    accepted declarations, signatures and namespace facts. Target resolution returns a complete
-   call and signature after one lookup. Call boundaries prove complete arity once,
-   check purity afterward, and publish transient contracts with every ordered
-   parameter type and the result type. Checking infers one consistent substitution
-   across all argument positions before validating every edge; they are erased to checked calls only after validation. Published function
+   call and signature after one lookup. Call boundaries compare parameter and argument
+   counts once, including the UFCS receiver, then check purity. Transient contracts
+   retain the resolved target, accepted signature and callee span. Checking infers one
+   consistent substitution across all argument positions before validating every edge;
+   contracts become checked calls only after validation. Published function
    signatures remain the sole signature authority. Constructor operations are
    distinct from function calls and use the owning variant's declared field shape.
    Local reads carry a function-owned `BindingId`, distinguishing the parameter,

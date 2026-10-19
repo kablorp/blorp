@@ -18,7 +18,7 @@ import:
 		CheckedConstant,
 		CheckedOpaque,
 		FunctionSignature,
-		TypeUse, TypeRef,
+		TypeRef,
 		CheckedRecord,
 		CheckedUnion,
 		type_head
@@ -48,28 +48,12 @@ fixed record Caller {
 }
 
 
--- One explicit argument and the parameter it must satisfy.
-fixed record ArgumentSlot {
-	parameter: TypeUse,
-	argument: ValueExpression
-}
-
-
--- A resolved call before its arguments are checked: the callee, its one
--- published signature and each explicit argument paired with its parameter.
--- Pairing every argument is the arity proof; purity is proved with it.
+-- A resolved call whose complete arity and purity have been validated.
+-- The accepted signature owns its ordered parameter types and result type.
 fixed record FunctionContract {
 	target: CallIdentity,
 	signature: FunctionSignature,
-	arguments: List[ArgumentSlot],
 	span: Span
-}
-
-
--- A UFCS call's contract: the parameter its receiver satisfies, then the call.
-fixed record ReceiverContract {
-	receiver: TypeUse,
-	call: FunctionContract
 }
 
 
@@ -81,13 +65,11 @@ pure func function_contract(
 	signatures: List[AcceptedFunction],
 ) -> Result[FunctionContract, CheckError]:
 	signature ?= callee_signature(name, callee, signatures)
-	arity = arity_mismatch(name, DirectCall, arguments.length(), DeclaredTarget(callee), signature)
-	slots ?= paired_arguments(signature.parameters, arguments, []).to_result(arity)
+	arity ?= validate_arity(name, DirectCall, arguments.length(), DeclaredTarget(callee), signature)
 	pure_call ?= validate_purity(caller, name, callee, signature)
 	Ok({
 		target = DeclaredTarget(callee),
 		signature = signature,
-		arguments = slots,
 		span = name.span,
 	})
 
@@ -98,35 +80,21 @@ pure func receiver_contract(
 	arguments: List[ValueExpression],
 	callee: FunctionId,
 	signatures: List[AcceptedFunction],
-) -> Result[ReceiverContract, CheckError]:
+) -> Result[FunctionContract, CheckError]:
 	signature ?= callee_signature(name, callee, signatures)
-	arity = arity_mismatch(
+	arity ?= validate_arity(
 		name,
 		ReceiverCall,
 		IntOps.add(arguments.length(), 1),
 		DeclaredTarget(callee),
 		signature,
 	)
-
-	match signature.parameters:
-		[]:
-			Err(arity)
-		[receiver, ...parameters]:
-			match paired_arguments(parameters, arguments, []).to_result(arity):
-				Ok(slots):
-					match validate_purity(caller, name, callee, signature):
-						Ok(pure_call):
-							Ok({
-								receiver = receiver,
-								call = {
-									target = DeclaredTarget(callee),
-									signature = signature,
-									arguments = slots,
-									span = name.span
-								},
-							})
-						Err(error): Err(error)
-				Err(error): Err(error)
+	pure_call ?= validate_purity(caller, name, callee, signature)
+	Ok({
+		target = DeclaredTarget(callee),
+		signature = signature,
+		span = name.span,
+	})
 
 
 private pure func callee_signature(
@@ -140,20 +108,24 @@ private pure func callee_signature(
 	Ok(accepted.signature)
 
 
-private pure func arity_mismatch(
+private pure func validate_arity(
 	name: WrittenName,
 	notation: CallNotation,
-	arity: Int,
+	actual: Int,
 	callee: CallIdentity,
 	signature: FunctionSignature,
-) -> CheckError:
-	call_error(name.span, ArgumentCountMismatch({
+) -> Result[Void, CheckError]:
+	expected = signature.parameters.length()
+	if IntOps.equals(expected, actual):
+		Ok(void)
+	else:
+		Err(call_error(name.span, ArgumentCountMismatch({
 			callee = name.id,
-			expected = signature.parameters.length(),
-			actual = arity,
+			expected = expected,
+			actual = actual,
 			notation = notation,
 			target = callee,
-		}))
+		})))
 
 
 private pure func validate_purity(
@@ -166,33 +138,6 @@ private pure func validate_purity(
 		Err(call_error(name.span, ImpureCall(caller.function, callee)))
 	else:
 		Ok(void)
-
-
--- Pairs explicit arguments with parameters in order; None when the counts differ.
-private pure func paired_arguments(
-	parameters: List[TypeUse],
-	arguments: List[ValueExpression],
-	slots: List[ArgumentSlot],
-) -> Option[List[ArgumentSlot]]:
-	match parameters:
-		[]:
-			if arguments.is_empty():
-				Some(slots)
-			else:
-				None
-		[parameter, ...rest]:
-			match arguments:
-				[]:
-					None
-				[argument, ...others]:
-					paired_arguments(
-						rest,
-						others,
-						slots.append({
-							parameter = parameter,
-							argument = argument,
-						}),
-					)
 
 
 fixed record ResolutionContext {
@@ -217,7 +162,7 @@ fixed record ReceiverCandidate {
 
 
 fixed union ResolvedReceiver:
-	UniqueReceiver(ReceiverContract)
+	UniqueReceiver(FunctionContract)
 	ReceiverCandidates(List[ReceiverCandidate])
 
 
@@ -326,12 +271,9 @@ pure func callable_contract(
 		return_type = callable_return_type(binding)
 	}
 	target = ParameterTarget(callable_binding_id(binding))
-	slots ?= paired_arguments(signature.parameters, arguments, []).to_result(
-		arity_mismatch(name, DirectCall, arguments.length(), target, signature),
-	)
+	arity ?= validate_arity(name, DirectCall, arguments.length(), target, signature)
 	Ok({
 		target = target,
 		signature = signature,
-		arguments = slots,
 		span = name.span
 	})
