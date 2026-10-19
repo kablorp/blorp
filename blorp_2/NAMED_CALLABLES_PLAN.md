@@ -267,9 +267,10 @@ CheckedProgram oracle. The callable merge_hint branch has static inspection
 because accepted contracts exclude callable returns/nested callable data; no
 malformed contract, visibility hook or parallel entrypoint is added to test it.
 
-This amendment authorizes necessary test coverage only. The current source-to-C
-proxy still fails both 3% ceilings; functional tests cannot approve integration
-or establish later lambda cost headroom.
+This amendment authorized necessary test coverage only. At that revision the
+source-to-C proxy failed both original 3% ceilings; those failures remain
+historical evidence. Functional tests cannot approve integration or establish
+later lambda cost headroom.
 
 Keep ordinary type substitutions and resolved callable choices as narrow
 translator inputs. A proposed FunctionSubstitution carrier did not reduce the
@@ -295,9 +296,23 @@ source-to-C compile and ordinary minimum-of-three retired instructions separatel
 The source label is constructed dynamically by the current phase implementation;
 add no instrumentation or historical-schema substitute.
 
-Require independently **C <= 103% of B** for construction allocations and normal
-min3 instructions against one initial M7 B. Later lambda increments retain that
-same cumulative comparison; no stacking 3% allowances or automatic baseline roll.
+The prospective shared callable-M7 limit is independently **C <= 108% of B**
+for construction allocations and normal min3 instructions against the same
+initial M7 B. It covers the complete named and later lambda/capture stages
+cumulatively; it is not a separate allowance for either stage. No baseline
+roll or stacking is allowed. At **C >= 106% of B** for either metric, stop
+further feature implementation for a remaining-work and cost review before
+continuing, even below the hard limit.
+
+This replaces the original 3% limit prospectively; retained observations remain
+RED against that original contract and must not be relabeled as passes. The
+8% envelope is uncertain: named checkpoint04 measured about +3.09%, and the
+preliminary lambda increment is of comparable estimated implementation size.
+Cost is not proportional to source lines. No lambda cost has been measured,
+so neither feasibility nor lambda headroom is established. Final named evidence
+and a separately frozen lambda architecture, LOC budget and cost plan remain
+required. This resource revision changes no target fixture limit, existing LOC
+budget, language scope or implementation authorization.
 Label this host source-to-C measurement as a proxy until self-compilation works.
 For the same source variant, normal/diagnostic emitted C must agree; old and new
 compiler source need not emit identical C. Unchanged noncallable target fixtures
@@ -356,10 +371,14 @@ measurement pair, source, body objects and tools remain unchanged.
 
 Initial B construction allocations are **24,404,055**. Its three original
 normal instruction samples are 44,989,182,994; 44,942,552,001; and
-44,935,473,655, giving **44,935,473,655 min3 instructions**. Integer candidate
-ceilings are **25,136,176 construction allocations** and
-**46,283,537,864 normal min3 instructions**, each independently cumulative
-against this initial B. Diagnostic and all three normal runs emit identical C:
+44,935,473,655, giving **44,935,473,655 min3 instructions**. The
+original 3% ceilings were **25,136,176 construction allocations** and
+**46,283,537,864 normal min3 instructions**. The prospective 8% hard ceilings
+are **26,356,379 construction allocations** and **48,530,311,547 normal min3
+instructions**, each independently cumulative against this same initial B.
+The 6% assessment thresholds are **25,868,299 allocations** or
+**47,631,602,075 normal min3 instructions**; reaching either triggers the review
+above. Diagnostic and all three original normal runs emit identical C:
 `10bfbd0a3046d428076bb9584f0b57001ad38cd7ac0a8cef436145381b186cfa`
 (6,690,847 bytes). All 1,536 final pins remain stable.
 

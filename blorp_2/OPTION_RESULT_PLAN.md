@@ -213,8 +213,13 @@ Before implementation, freeze that slice's current-main B, candidate scope,
 production/test LOC limits, tool/library/input identities and cost procedure.
 Compiler data-model changes require matched construction allocations and normal
 minimum-of-three retired instructions, with independent prospective ceilings
-no looser than +3%, plus existing fixture limits. Label host source-to-C
-measurements as proxies until self-compilation works. Ordinary library helpers
+no looser than +3%, plus existing fixture limits. The sole exception is the
+shared named/lambda callable-M7 increment: its [bounded resource decision](NAMED_CALLABLES_PLAN.md#prospective-scope-and-costs)
+uses +8% cumulative hard limits and a +6% reassessment against the unchanged
+initial M7 B, not a fresh allowance per stage. It changes no fixture limit or
+LOC budget and authorizes no lambda implementation before its separate frozen
+architecture and cost plan. All other slices retain the +3% rule. Label host
+source-to-C measurements as proxies until self-compilation works. Ordinary library helpers
 need shared-control and API-using fixture cost evidence with prospectively
 reviewed ceilings; never fabricate a successful baseline for a new input.
 Keep old failures/held evidence historical. A repeatable breach stops the
