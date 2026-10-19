@@ -642,9 +642,98 @@ pure func test_no_self_error_precedes_managed_admission() -> Bool:
 	rejects_annotation(source, False)
 
 
+private pure func rejects_callable_tail(
+	prefix: String,
+	marked: String,
+	suffix: String,
+	message: String,
+	help: String,
+	matches: pure (Errors.CheckErrorKind) -> Bool,
+) -> Bool:
+	match lex(module_source(root_module_id()), prefix + marked + suffix, program_names().names).and_then(pure func(tokens): parse(tokens)):
+		Err(_): False
+		Ok(parsed):
+			match check(parsed):
+				Ok(_): False
+				Err(failure):
+					errors = check_errors(failure)
+					diagnostic = render_failure(failure).first
+					(
+						errors.remaining.is_empty() and matches(errors.first.kind)
+						and errors.first.span.start == prefix.length() and errors.first.span.end == prefix.length() + marked.length()
+						and same_span(diagnostic.span, errors.first.span) and diagnostic.note.is_none()
+						and diagnostic.message == message and diagnostic.help == help
+					)
+
+
+private CALLABLE_TAIL: String =
+	| pure func invoke(f: pure (Int) -> Int, value: Int) -> Int:
+	|    missing()
+	|
+private BUILTIN_CALLABLE_TAIL: String =
+	| pure func invoke(f: pure (Int) -> Int) -> Int:
+	|    builtin("int.add")
+	|
+private ANNOTATED_REFERENCE: String =
+	|pure func ignore(f: pure (Int) -> Int) -> Int:
+	|    0
+	|@tail_recursive pure func loop(value: Int) -> Int:
+	|
+
+
+pure func test_callable_tail_annotation_rejects_before_body_lookup() -> Bool:
+	rejects_callable_tail("", "@tail_recursive", CALLABLE_TAIL + MAIN, "tail recursion with callable parameters is not supported yet", "remove @tail_recursive; callable parameters on recursive backedges are not supported yet", pure func(kind):
+		match kind:
+			Errors.RecursionRejection(Errors.CallableTailRecursionUnsupported): True
+			_: False
+	)
+
+
+pure func test_annotated_function_rejects_its_own_callback_reference() -> Bool:
+	prefix = ANNOTATED_REFERENCE + "    ignore("
+	rejects_callable_tail(prefix, "loop", ")\n" + MAIN, "tail-recursive function cannot reference itself as a callback", "pass a different callback or remove @tail_recursive", pure func(kind):
+		match kind:
+			Errors.RecursionRejection(Errors.AnnotatedSelfCallback): True
+			_: False
+	)
+
+
+pure func test_generic_tail_precedence_survives_callable_parameters() -> Bool:
+	source: String =
+		|@tail_recursive pure func invoke[T](f: pure (T) -> T, value: T) -> T:
+		|    missing()
+		|
+	rejects_annotation(source + MAIN, True)
+
+
+pure func test_builtin_tail_precedence_survives_callable_parameters() -> Bool:
+	rejects_callable_tail("", "@tail_recursive", BUILTIN_CALLABLE_TAIL + MAIN, "builtin bodies cannot have a tail-recursion annotation", "remove @tail_recursive from the builtin declaration", pure func(kind):
+		match kind:
+			Errors.BuiltinRejection(Errors.BuiltinTailAnnotation): True
+			_: False
+	)
+
+
+pure func test_another_function_can_reference_an_annotated_declaration() -> Bool:
+	source: String =
+		|@tail_recursive pure func loop(value: Int) -> Int:
+		|    loop(value)
+		|pure func ignore(f: pure (Int) -> Int) -> Int:
+		|    0
+		|func main() -> Int:
+		|    ignore(loop)
+		|
+	accepts(source)
+
+
 tests: TestSuite = {
 	description = "Checked self-tail contexts",
 	tests = [
+		("callable tail contract precedes unknown body", test_callable_tail_annotation_rejects_before_body_lookup),
+		("annotated declaration cannot select itself as callback", test_annotated_function_rejects_its_own_callback_reference),
+		("generic tail restriction retains priority", test_generic_tail_precedence_survives_callable_parameters),
+		("builtin tail restriction retains priority", test_builtin_tail_precedence_survives_callable_parameters),
+		("other function may select annotated declaration", test_another_function_can_reference_an_annotated_declaration),
 		(
 			"nested direct self call in an initializer reports the inner call",
 			test_nested_direct_self_call_in_initializer_reports_the_inner_call,

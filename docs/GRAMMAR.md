@@ -1349,8 +1349,12 @@ dim_atom      = DIMNAME | "#" "_" | "#" INT | INT | "(" dim_expr ")" ;
 - A parenthesized type list followed by `->` is a function type's
   parameters; without `->` it is a grouping (one type) or a tuple.
 - Blorp 2 parses the explicit `pure (...) -> type` form, including nested
-  callback parameters and returns. Its checker rejects function types until
-  callback checking is implemented; bare impure function types remain unsupported.
+  callback parameters and returns. Its checker accepts only pure callable
+  function parameters whose parameter and result types are ordinary data.
+  Arguments are pure named references or unchanged callable parameters, invoked
+  with direct-call syntax. Nested callable types, callable storage/returns,
+  and lambdas remain unsupported by checking. Bare impure function types remain
+  outside its grammar.
 - `(T)` is `T`. `(T,)` is ``a tuple type has two to four elements, and `(T,)`
   has one``. A function type's return type extends as far as a type can, so
   `(A) -> (B) -> C` returns `(B) -> C`.

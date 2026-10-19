@@ -1,0 +1,397 @@
+import:
+	../../../src/check/model: CallIdentity(DeclaredTarget, ParameterTarget), TypeRef(IntType, StringType, ParameterType, PureCallableType), BindingOrigin(ParameterBinding), callable_position
+	../../../src/check/check: check_errors
+	../../../src/check/errors as Errors
+	../../../src/check/render: render_check_error
+	../../../src/utils/syntax: DiagnosticNote(PreviousDeclaration), same_span
+	../../../src/utils/source: module_source, root_module_id, same_source
+	../input: check, singleton_check_error
+	../module_input: parse_modules
+	test: TestSuite
+
+
+private PREFIX: String =
+	|import:
+	|    ./helper as H: imported
+	|fixed union Token:
+	|    Payload(Int)
+	|NUMBER: Int = 1
+	|pure func identity(value: Int) -> Int:
+	|    value
+	|pure func use(f: pure (Int) -> Int, value: Int) -> Int:
+	|    f(value)
+	|pure func data(value: Int) -> Int:
+	|    value
+	|func main() -> Int:
+	|
+private HELPER: String =
+	|pure func imported(value: Int) -> Int:
+	|    value
+	|private pure func hidden(value: Int) -> Int:
+	|    value
+	|pure func text(value: Int) -> String:
+	|    "text"
+	|pure func wrong_input(value: String) -> Int:
+	|    0
+	|pure func binary(first: Int, second: Int) -> Int:
+	|    first
+	|func impure(value: Int) -> Int:
+	|    value
+	|
+private SLOT_HELP: String = "pass a pure named function or forward a callable parameter unchanged"
+private DATA_HELP: String = "call this function or pass it directly to a pure callable parameter"
+private RECEIVER_HELP: String = "invoke the callback as f(value), or forward it in a declared helper's argument list"
+
+
+private pure func rejects(before: String, marked: String, after: String, message: String, help: String, matches: pure (Errors.CheckErrorKind) -> Bool) -> Bool:
+	rejects_source([1], PREFIX + "    " + before, marked, after, message, help, matches)
+
+
+private pure func rejects_source(
+	targets: List[Int],
+	prefix: String,
+	marked: String,
+	after: String,
+	message: String,
+	help: String,
+	matches: pure (Errors.CheckErrorKind) -> Bool,
+) -> Bool:
+	match parse_modules([{ source = prefix + marked + after, targets = targets }, { source = HELPER, targets = [] }]):
+		Err(_): False
+		Ok(program):
+			match check(program):
+				Ok(_): False
+				Err(failure):
+					match singleton_check_error(check_errors(failure)):
+						None: False
+						Some(error):
+							diagnostic = render_check_error(program, error)
+							note_matches = match (error.kind, diagnostic.note):
+								(Errors.BindingRejection(Errors.LocalBindingConflict(previous, _)), Some(PreviousDeclaration(span))): same_span(previous.span, span)
+								(Errors.BindingRejection(Errors.LocalBindingConflict(_, _)), _): False
+								(_, None): True
+								_: False
+							(
+								matches(error.kind) and same_source(error.span.source, module_source(root_module_id()))
+								and error.span.start == prefix.length() and error.span.end == prefix.length() + marked.length()
+								and same_source(diagnostic.span.source, error.span.source)
+								and diagnostic.span.start == error.span.start and diagnostic.span.end == error.span.end
+								and diagnostic.message == message and diagnostic.help == help and note_matches
+							)
+
+
+private pure func required(kind: Errors.CheckErrorKind) -> Bool:
+	match kind:
+		Errors.CallRejection(Errors.CallableValueRequired): True
+		_: False
+
+
+private pure func receiver(kind: Errors.CheckErrorKind) -> Bool:
+	match kind:
+		Errors.CallRejection(Errors.CallableReceiverSyntax(DeclaredTarget(_))): True
+		_: False
+
+
+private pure func escapes(kind: Errors.CheckErrorKind) -> Bool:
+	match kind:
+		Errors.CallRejection(Errors.CallableValueEscapes(DeclaredTarget(_))): True
+		_: False
+
+
+private pure func qualified(kind: Errors.CheckErrorKind) -> Bool:
+	match kind:
+		Errors.QualifiedRejection(Errors.QualifiedFunctionNotCalled(_, _)): True
+		_: False
+
+
+private CALLBACK_SCOPE: String =
+	|pure func consume(value: Int) -> Int:
+	|    value
+	|pure func invoke(f: pure (Int) -> Int) -> Int:
+	|
+private END: String =
+	|
+	|func main() -> Int:
+	|    0
+	|
+
+private RIGID_SCOPE: String =
+	|pure func invoke[T](f: pure (T) -> T) -> T:
+	|
+private SHADOW_SCOPE: String =
+	|pure func invoke(f: pure (Int) -> Int, value: Int) -> Int:
+	|    f(value)
+	|pure func shadow(f: Int) -> Int:
+	|
+private LEAKED_SCOPE: String =
+	|pure func invoke(f: pure (Int) -> Int) -> Int:
+	|    f(17)
+	|func main() -> Int:
+	|
+private DUPLICATE_TAIL: String =
+	|: pure (Int) -> Int) -> Int:
+	|    0
+	|
+private LOCAL_TAIL: String =
+	|
+	|    0
+	|
+private LIST_STORAGE_TAIL: String =
+	|]) -> Int:
+	|    0
+	|
+
+
+
+private CYCLIC_INFERENCE: String =
+	|pure func wrap[T](value: T) -> List[T]:
+	|    [value]
+	|pure func ignore[T, U](f: pure (T) -> U, g: pure (U) -> T) -> Int:
+	|    0
+	|func main() -> Int:
+	|
+
+
+private UNDERCONSTRAINED_CALLBACK: String =
+	|pure func identity[T](value: T) -> T:
+	|    value
+	|pure func ignore[T](f: pure (T) -> T) -> Int:
+	|    0
+	|func main() -> Int:
+	|
+
+
+private pure func parameter_receiver(kind: Errors.CheckErrorKind) -> Bool:
+	match kind:
+		Errors.CallRejection(Errors.CallableReceiverSyntax(ParameterTarget(_))): True
+		_: False
+
+
+private pure func parameter_escapes(kind: Errors.CheckErrorKind) -> Bool:
+	match kind:
+		Errors.CallRejection(Errors.CallableValueEscapes(ParameterTarget(_))): True
+		_: False
+
+
+tests: TestSuite = {
+	description = "Named callable admission diagnostics",
+	tests = [
+		("named callback rejects type parameters with no concrete evidence", pure func():
+			rejects_source([], UNDERCONSTRAINED_CALLBACK + "    ignore(", "identity", ")\n", "cannot infer the type parameter from the argument", "pass a value whose type determines the declared type parameter; use a concrete helper when no argument can determine it", pure func(kind):
+				match kind:
+					Errors.CallRejection(Errors.UninferableTypeParameter(_)): True
+					_: False
+			)
+		),
+		("named callback input type must match the accepted callable", pure func():
+			rejects("use(", "H.wrong_input", ", 17)\n", "argument type does not match the parameter type", "use an expression of type pure (Int) -> Int here", pure func(kind):
+				match kind:
+					Errors.CallRejection(Errors.ArgumentTypeMismatch(mismatch)):
+						match (mismatch.expected, mismatch.actual.value_type):
+							(PureCallableType([IntType], IntType), PureCallableType([StringType], IntType)): True
+							_: False
+					_: False
+			)
+		),
+		("named callback's written arity must match the accepted callable", pure func():
+			rejects("use(", "H.binary", ", 17)\n", "argument type does not match the parameter type", "use an expression of type pure (Int) -> Int here", pure func(kind):
+				match kind:
+					Errors.CallRejection(Errors.ArgumentTypeMismatch(mismatch)):
+						match (mismatch.expected, mismatch.actual.value_type):
+							(PureCallableType([IntType], IntType), PureCallableType([IntType, IntType], IntType)): True
+							_: False
+					_: False
+			)
+		),
+		("callable child constraints still reject an infinite ordinary type", pure func():
+			rejects_source([], CYCLIC_INFERENCE + "    ignore(wrap, ", "wrap", ")\n", "inferred type would contain itself", "pass a value with a finite type, or use a concrete helper", pure func(kind):
+				match kind:
+					Errors.CallRejection(Errors.InfiniteTypeArgument(_)): True
+					_: False
+			)
+		),
+		("named callback result type must match the accepted callable", pure func():
+			rejects("use(", "H.text", ", 17)\n", "argument type does not match the parameter type", "use an expression of type pure (Int) -> Int here", pure func(kind):
+				match kind:
+					Errors.CallRejection(Errors.ArgumentTypeMismatch(mismatch)):
+						match (mismatch.expected, mismatch.actual.value_type):
+							(PureCallableType([IntType], IntType), PureCallableType([IntType], StringType)): True
+							_: False
+					_: False
+			)
+		),
+		("lexical data parameter does not become a callable reference", pure func():
+			rejects_source([], SHADOW_SCOPE + "    invoke(", "f", ", 17)" + END, "Int parameters cannot be called", "use the parameter as a value, or rename it to call the function", pure func(kind):
+				match kind:
+					Errors.CallRejection(Errors.UncallableBinding(_, ParameterBinding(0), IntType)): True
+					_: False
+			)
+		),
+		("data parameter blocks a later callable with the same name", pure func():
+			rejects_source([], "pure func collide(f: Int, ", "f", DUPLICATE_TAIL + END, "`f` is already a parameter in this function", "choose a different name for this binding", pure func(kind):
+				match kind:
+					Errors.BindingRejection(Errors.LocalBindingConflict(previous, ParameterBinding(0))):
+						previous.span.start == "pure func collide(".length() and previous.span.end == "pure func collide(f".length()
+					_: False
+			)
+		),
+		("callable parameter blocks another callable with the same name", pure func():
+			rejects_source([], "pure func collide(f: pure (Int) -> Int, ", "f", DUPLICATE_TAIL + END, "binding conflicts with a callable parameter", "choose a different binding name in this function", pure func(kind):
+				match kind:
+					Errors.BindingRejection(Errors.CallableBindingConflict(previous, span)):
+						callable_position(previous) == 0 and span.start == "pure func collide(".length() and span.end == "pure func collide(f".length()
+					_: False
+			)
+		),
+		("callable parameters do not leak into another function's scope", pure func():
+			rejects_source([], LEAKED_SCOPE + "    invoke(", "f", ")\n", "unknown value", "use this function's parameter name, a declared variant, or a call", pure func(kind):
+				match kind:
+					Errors.ValueRejection(Errors.UnknownValue(_)): True
+					_: False
+			)
+		),
+		("lambda values remain outside named callback admission", pure func():
+			rejects("use(", "pure func(value): value", ", 17)\n", "lambdas are not supported yet", "declare a named function and call it; lambdas arrive with the lambdas milestone", pure func(kind):
+				match kind:
+					Errors.UnsupportedSyntax(Errors.LambdaValue): True
+					_: False
+			)
+		),
+		("signature-compatible impure named callback is rejected", pure func():
+			rejects(
+				"use(", "H.impure", ", 17)\n",
+				"pure callback requires a pure function",
+				"pass a pure named function; impure functions cannot satisfy a pure callable parameter",
+				pure func(kind):
+					match kind:
+						Errors.CallRejection(Errors.ImpureCallback(_)): True
+						_: False
+			)
+		),
+		("impure named reference rejects before callable compatibility", pure func():
+			rejects("use(", "main", ", 17)\n", "pure callback requires a pure function", "pass a pure named function; impure functions cannot satisfy a pure callable parameter", pure func(kind):
+				match kind:
+					Errors.CallRejection(Errors.ImpureCallback(_)): True
+					_: False
+			)
+		),
+		("written arity precedes unknown callback child", pure func():
+			rejects("", "use", "(missing)\n", "argument count does not match the function parameters", "pass one expression for each declared parameter; UFCS supplies the receiver first", pure func(kind):
+				match kind:
+					Errors.CallRejection(Errors.ArgumentCountMismatch(arity)): arity.expected == 2 and arity.actual == 1
+					_: False
+			)
+		),
+		("callable invocation arity retains ParameterTarget", pure func():
+			rejects_source([], CALLBACK_SCOPE + "    ", "f", "()" + END, "function requires one argument", "pass one expression of the declared parameter type", pure func(kind):
+				match kind:
+					Errors.CallRejection(Errors.ArgumentCountMismatch(arity)):
+						match arity.target:
+							ParameterTarget(_): arity.expected == 1 and arity.actual == 0
+							_: False
+					_: False
+			)
+		),
+		("callable invocation checks its accepted input type", pure func():
+			rejects_source([], CALLBACK_SCOPE + "    ", "f", "(\"wrong\")" + END, "argument type does not match the parameter type", "use an expression of type Int here", pure func(kind):
+				match kind:
+					Errors.CallRejection(Errors.ArgumentTypeMismatch(mismatch)):
+						match (mismatch.expected, mismatch.actual.value_type):
+							(IntType, StringType):
+								(
+									same_source(mismatch.actual.span.source, module_source(root_module_id()))
+									and mismatch.actual.span.start == (CALLBACK_SCOPE + "    f(").length()
+									and mismatch.actual.span.end == (CALLBACK_SCOPE + "    f(\"wrong\"").length()
+								)
+							_: False
+					_: False
+			)
+		),
+		("generic callable input stays rigid inside its declaration", pure func():
+			rejects_source([], RIGID_SCOPE + "    ", "f", "(0)" + END, "argument type does not match the parameter type", "use a value already typed as this declaration's type parameter", pure func(kind):
+				match kind:
+					Errors.CallRejection(Errors.ArgumentTypeMismatch(mismatch)):
+						match (mismatch.expected, mismatch.actual.value_type):
+							(ParameterType(_), IntType):
+								(
+									same_source(mismatch.actual.span.source, module_source(root_module_id()))
+									and mismatch.actual.span.start == (RIGID_SCOPE + "    f(").length()
+									and mismatch.actual.span.end == (RIGID_SCOPE + "    f(0").length()
+								)
+							_: False
+					_: False
+			)
+		),
+		("callable parameter as receiver retains ParameterTarget", pure func():
+			rejects_source([], CALLBACK_SCOPE + "    ", "f", ".consume(17)" + END, "callbacks require direct-call syntax", RECEIVER_HELP, parameter_receiver)
+		),
+		("callable receiver invocation retains ParameterTarget", pure func():
+			rejects_source([], CALLBACK_SCOPE + "    17.", "f", "()" + END, "callbacks require direct-call syntax", RECEIVER_HELP, parameter_receiver)
+		),
+		("callable parameter storage retains ParameterTarget", pure func():
+			rejects_source([], CALLBACK_SCOPE + "    saved = ", "f", LOCAL_TAIL + END, "function references are not data values", DATA_HELP, parameter_escapes)
+		),
+		("callable parameter in data argument retains ParameterTarget", pure func():
+			rejects_source([], CALLBACK_SCOPE + "    consume(", "f", ")" + END, "function references are not data values", DATA_HELP, parameter_escapes)
+		),
+		("qualified callback respects private visibility", pure func():
+			rejects("use(H.", "hidden", ", 17)\n", "hidden is private to ./helper", "remove private or qualify a public declaration", pure func(kind):
+				match kind:
+					Errors.QualifiedRejection(Errors.QualifiedNotOffered(_, _, _, _)): True
+					_: False
+			)
+		),
+		("callable storage rejects before resolving nested names", pure func():
+			rejects_source([], "pure func store(value: List[", "pure (Missing) -> Int", LIST_STORAGE_TAIL + END, "callable types are only supported as function parameters", "write pure function types only on function parameters; use ordinary data types inside them", pure func(kind):
+				match kind:
+					Errors.UnsupportedSyntax(Errors.FunctionType): True
+					_: False
+			)
+		),
+		("constant is known but is not a callback", pure func():
+			rejects("use(", "NUMBER", ", 17)\n", "callback argument must name a function", SLOT_HELP, required)
+		),
+		("constructor is known but is not a callback", pure func():
+			rejects("use(", "Payload", ", 17)\n", "callback argument must name a function", SLOT_HELP, required)
+		),
+		("bare module alias retains its qualified teaching error", pure func():
+			rejects("use(", "H", ", 17)\n", "H is a module alias", "write H.name to use a declaration of that module", pure func(kind):
+				match kind:
+					Errors.QualifiedRejection(Errors.BareModuleAlias(_)): True
+					_: False
+			)
+		),
+		("missing callback remains unknown", pure func():
+			rejects("use(", "missing", ", 17)\n", "unknown value", "use this function's parameter name, a declared variant, or a call", pure func(kind):
+				match kind:
+					Errors.ValueRejection(Errors.UnknownValue(_)): True
+					_: False
+			)
+		),
+		("named static receiver teaches direct calls", pure func():
+			rejects("", "identity", ".use(17)\n", "callbacks require direct-call syntax", RECEIVER_HELP, receiver)
+		),
+		("imported static receiver teaches direct calls", pure func():
+			rejects("", "imported", ".use(17)\n", "callbacks require direct-call syntax", RECEIVER_HELP, receiver)
+		),
+		("bare named reference cannot be stored", pure func():
+			rejects("saved = ", "identity", "\n    0\n", "function references are not data values", DATA_HELP, escapes)
+		),
+		("bare named reference cannot satisfy a data parameter", pure func():
+			rejects("data(", "identity", ")\n", "function references are not data values", DATA_HELP, escapes)
+		),
+		("qualified named reference cannot be stored", pure func():
+			rejects("saved = ", "H.imported", "\n    0\n", "H.imported names a function", DATA_HELP, qualified)
+		),
+		("qualified named reference cannot satisfy a data parameter", pure func():
+			rejects("data(", "H.imported", ")\n", "H.imported names a function", DATA_HELP, qualified)
+		),
+		("bare and qualified named references satisfy callable slots", pure func():
+			["identity", "H.imported"].all(pure func(name):
+				match parse_modules([{ source = PREFIX + "    use(" + name + ", 17)\n", targets = [1] }, { source = HELPER, targets = [] }]):
+					Ok(program): check(program).is_ok()
+					Err(_): False
+			)
+		),
+	]
+}

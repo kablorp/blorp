@@ -4,14 +4,14 @@ and patterns, and the canonical Void tail.
 ---
 import:
 	./errors:
-		CheckError,
+		CheckError, RecursionError(CallableTailRecursionUnsupported, GenericTailRecursionUnsupported), recursion_error,
 		CheckerInvariant(InvalidCheckedUnion, InvalidResolvedParameter, UnsupportedPatternReachedResolution, LoopControlOutsideLoop, JoinWithoutArms),
 		ExpectedTypeSite(FirstArmValue, InferredBindingDeclaration, SourceAnnotation),
 		MatchError(
 			ArmWithoutValue, MatchRequiresUnion, NonExhaustiveMatch, PatternFieldCountMismatch, BarePatternName,
 			UnknownConstructorPattern, UnreachableArm,
 		),
-		StatementError(ImmutableAssignment, NonVoidMatchArm, NonVoidStatement),
+		StatementError(CallableAssignment, ImmutableAssignment, NonVoidMatchArm, NonVoidStatement),
 		checker_invariant,
 		match_error,
 		statement_error,
@@ -39,11 +39,13 @@ import:
 		CheckedMatch,
 		CheckedPattern(VariantCase, WildcardCase),
 		CheckedStatement(DiscardExpression, InitializeBinding, ReassignBinding),
-		TypeRef(VoidType),
+		TypeRef(PureCallableType, VoidType),
 		TypeUse,
 		UnionOccurrence,
+		callable_parameter,
 		binding_id,
 		binding_number,
+		has_callable_parameters,
 		same_type,
 		same_variant,
 		union_occurrence,
@@ -52,7 +54,7 @@ import:
 	./declarations: CheckedDeclarations
 	./constructors: VariantContract, find_variant
 	./expressions: check_value, synthesize_value
-	./scope: LocalBinding, bind_local, binding_site, binding_definition, local_binding_id, lookup_binding
+	./scope: ScopedValue(DataLocal, CallableLocal), LocalBinding, bind_callable, callable_binding_id, bind_local, binding_site, binding_definition, local_binding_id, lookup_binding
 	../utils/ids: VariantId, union_number
 	int as IntOps
 	list: repeat, set
@@ -77,13 +79,13 @@ import:
 
 private fixed record ResolvedPattern {
 	pattern: CheckedPattern,
-	scope: List[LocalBinding],
+	scope: List[ScopedValue],
 	bindings: List[BindingDefinition]
 }
 
 
 -- A pattern that binds nothing new.
-private pure func unbound(pattern: CheckedPattern, scope: List[LocalBinding]) -> ResolvedPattern:
+private pure func unbound(pattern: CheckedPattern, scope: List[ScopedValue]) -> ResolvedPattern:
 	{
 		pattern = pattern,
 		scope = scope,
@@ -112,7 +114,7 @@ private pure func resolve_variant_pattern(
 	fields: List[ParsedPattern],
 	span: Span,
 	ordinal: Int,
-	scope: List[LocalBinding],
+	scope: List[ScopedValue],
 	context: ResolutionContext,
 ) -> Result[ResolvedPattern, CheckError]:
 	if not IntOps.equals(contract.fields.length(), fields.length()):
@@ -176,7 +178,7 @@ private pure func resolve_variant_pattern(
 private fixed record MatchContext {
 	union_type: TypeRef,
 	occurrence: UnionOccurrence,
-	scope: List[LocalBinding]
+	scope: List[ScopedValue]
 }
 
 
@@ -307,7 +309,7 @@ private fixed record StartedMatch {
 
 
 private pure func start_match(
-	scope: List[LocalBinding],
+	scope: List[ScopedValue],
 	body: ParsedMatch,
 	context: ResolutionContext,
 ) -> Result[StartedMatch, CheckError]:
@@ -379,7 +381,7 @@ private pure func resolve_arm_prefix(
 -- Every arm must be useful, and together the arms must cover every variant.
 private pure func resolve_match(
 	return_type: TypeUse,
-	scope: List[LocalBinding],
+	scope: List[ScopedValue],
 	body: ParsedMatch,
 	bindings: List[BindingDefinition],
 	context: ResolutionContext,
@@ -543,7 +545,7 @@ private fixed union VoidPosition:
 
 
 private pure func statement_value(
-	scope: List[LocalBinding],
+	scope: List[ScopedValue],
 	written: ValueExpression,
 	position: VoidPosition,
 	context: ResolutionContext,
@@ -674,25 +676,45 @@ private pure func resolve_join_arms(
 private pure func parameter_scope(
 	parameters: List[ParsedParameter],
 	types: List[TypeUse],
-	scope: List[LocalBinding],
+	scope: List[ScopedValue],
 	context: ResolutionContext,
-) -> Result[List[LocalBinding], CheckError]:
-	position = scope.length()
-	match parameters.get(position):
-		None: Ok(scope)
-		Some(parameter):
-			match types.get(position):
-				Some(value_type):
-					definition: BindingDefinition = {
-						origin = ParameterBinding(position),
-						mutability = Immutable,
-						value_type = value_type.value_type,
-						span = parameter.name.span
-					}
-					match bind_local(scope, context.namespace, context.module, context.caller.function, parameter.name, binding_id(position), definition):
-						Ok(binding): parameter_scope(parameters, types, scope.append(binding), context)
-						Err(error): Err(error)
-				None: Err(checker_invariant(parameter.name.span, InvalidResolvedParameter(position)))
+) -> Result[List[ScopedValue], CheckError]:
+	var resolved = scope
+	var data_ordinal = 0
+	var position = 0
+	var failure: Option[CheckError] = None
+	for parameter in parameters:
+		match types.get(position):
+			None: failure = Some(checker_invariant(parameter.name.span, InvalidResolvedParameter(position)))
+			Some(value_type):
+				binding_result = match value_type.value_type:
+					PureCallableType(parameters, result):
+						bind_callable(
+							resolved, context.namespace, context.module, context.caller.function,
+							parameter.name, callable_parameter(context.caller.function, position),
+							parameters, result, value_type.span,
+						)
+					_:
+						definition: BindingDefinition = {
+							origin = ParameterBinding(data_ordinal),
+							mutability = Immutable,
+							value_type = value_type.value_type,
+							span = parameter.name.span
+						}
+						data_ordinal = IntOps.add(data_ordinal, 1)
+						bind_local(
+							resolved, context.namespace, context.module, context.caller.function,
+							parameter.name, binding_id(IntOps.subtract(data_ordinal, 1)), definition,
+						)
+				match binding_result:
+					Ok(binding): resolved = resolved.append(binding)
+					Err(error): failure = Some(error)
+		if failure.is_some():
+			break
+		position = IntOps.add(position, 1)
+	match failure:
+		Some(error): Err(error)
+		None: Ok(resolved)
 
 
 private fixed record ResolvedBody {
@@ -706,7 +728,7 @@ private fixed record ResolvedBody {
 -- bindings so far.
 private fixed record ResolvedStatements {
 	bindings: List[BindingDefinition],
-	scope: List[LocalBinding],
+	scope: List[ScopedValue],
 	statements: List[CheckedStatement],
 	reassigned: List[BindingId]
 }
@@ -724,7 +746,9 @@ private fixed union JoinBindingState:
 private pure func carried_bindings(entry: ResolvedStatements, written: List[BindingId]) -> List[BindingId]:
 	var states = repeat(OutsideJoinScope, entry.bindings.length())
 	for binding in entry.scope:
-		states = states.set(binding_number(local_binding_id(binding)), UntouchedJoinBinding)
+		match binding:
+			DataLocal(data): states = states.set(binding_number(local_binding_id(data)), UntouchedJoinBinding)
+			CallableLocal(_): void
 	for id in written:
 		position = binding_number(id)
 		match states.get(position):
@@ -796,7 +820,8 @@ private pure func resolve_assignment(
 		ImmutableBinding:
 			match lookup_binding(block.scope, written.name.id):
 				None: Ok(None)
-				Some(binding):
+				Some(CallableLocal(binding)): Err(statement_error(written.name.span, CallableAssignment(callable_binding_id(binding))))
+				Some(DataLocal(binding)):
 					match binding_definition(binding).mutability:
 						Mutable:
 							Ok(Some(binding))
@@ -854,13 +879,29 @@ private pure func resolve_body(
 	context: ResolutionContext,
 ) -> Result[ResolvedBody, CheckError]:
 	signature = accepted.signature
+	tail_decision: Result[Void, CheckError] = match accepted.declaration.tail_annotation:
+		None: Ok(void)
+		Some(annotation):
+			if has_callable_parameters(signature):
+				if signature.type_parameters.is_empty():
+					Err(recursion_error(annotation, CallableTailRecursionUnsupported))
+				else:
+					Err(recursion_error(annotation, GenericTailRecursionUnsupported))
+			else:
+				Ok(void)
+	tail_contract ?= tail_decision
 	initial ?= parameter_scope(accepted.declaration.parameters, signature.parameters, [], context)
+	var parameter_bindings: List[BindingDefinition] = []
+	for binding in initial:
+		match binding:
+			DataLocal(data):
+				definition = binding_definition(data)
+				parameter_bindings = parameter_bindings.append(definition)
+			CallableLocal(_): void
 	prefix ?= resolve_statements(
 		accepted.declaration.statements,
 		{
-			bindings = initial.map(
-				pure func(binding: LocalBinding) -> BindingDefinition: binding_definition(binding),
-			),
+			bindings = parameter_bindings,
 			scope = initial,
 			statements = [],
 			reassigned = []
@@ -871,13 +912,17 @@ private pure func resolve_body(
 	match accepted.body:
 		BuiltinBody(operation, span):
 			-- Read the scope's actual binding identities, as ordinary parameter uses do.
-			arguments = initial.map(pure func(binding: LocalBinding) -> CheckedExpr:
-				{
-					form = ReadBinding(local_binding_id(binding)),
-					value_type = binding_definition(binding).value_type,
-					span = binding_definition(binding).span
-				}
-			)
+			var arguments: List[CheckedExpr] = []
+			for binding in initial:
+				match binding:
+					DataLocal(data):
+						definition = binding_definition(data)
+						arguments = arguments.append({
+							form = ReadBinding(local_binding_id(data)),
+							value_type = definition.value_type,
+							span = definition.span
+						})
+					CallableLocal(_): void
 			Ok({
 				bindings = prefix.bindings,
 				statements = prefix.statements,

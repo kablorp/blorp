@@ -44,7 +44,7 @@ private pure func body_value(function: Model.CheckedFunction) -> Option[Model.Ch
 
 private pure func one_type_argument(call: Model.CheckedCall, expected: Model.TypeRef) -> Bool:
 	match call.target:
-		Model.UserFunction(_, [actual]):
+		Model.UserFunction(_, [actual], []):
 			Model.same_type(actual, expected)
 		_:
 			False
@@ -601,7 +601,7 @@ private pure func repeated_result_substitutions(value: Model.CheckedExpr) -> Boo
 	match value.form:
 		Model.InvokeFunction(call, [repeated, _, _]):
 			outer = match call.target:
-				Model.UserFunction(owner, [Model.IntType, Model.IntType]): Declaration.function_number(owner) == 3
+				Model.UserFunction(owner, [Model.IntType, Model.IntType], []): Declaration.function_number(owner) == 3
 				_: False
 			outer and repeated_argument_substitution(repeated)
 		_: False
@@ -611,7 +611,7 @@ private pure func repeated_argument_substitution(value: Model.CheckedExpr) -> Bo
 	match value.form:
 		Model.InvokeFunction(call, [payload]):
 			match (call.target, payload.form, value.value_type):
-				(Model.UserFunction(owner, [argument]), Model.ConstructVariant(variant, [child]), Model.AppliedUnionType(pair, [first, second])):
+				(Model.UserFunction(owner, [argument], []), Model.ConstructVariant(variant, [child]), Model.AppliedUnionType(pair, [first, second])):
 					match payload.value_type:
 						Model.AppliedUnionType(choice, [Model.IntType]):
 							(
@@ -901,9 +901,112 @@ pure func test_pure_void_result_reports_the_ordinary_list_argument_mismatch() ->
 				_: False
 	)
 
+private NAMED_FORWARDING: String =
+	|pure func first[T](value: T) -> T:
+	|    value
+	|pure func second(value: Int) -> Int:
+	|    2
+	|pure func compose[T](value: T, f: pure (T) -> T, g: pure (T) -> T) -> T:
+	|    f(g(value))
+	|pure func forward[T](f: pure (T) -> T, value: T, g: pure (T) -> T) -> T:
+	|    compose(value, f, g)
+	|func main() -> Int:
+	|    same_choices = forward(first, 17, first)
+	|    changed_second = forward(first, 17, second)
+	|    swapped_choices = forward(second, 17, first)
+	|    forward(first, 17, second)
+	|
+
+
+pure func test_callable_positions_do_not_allocate_data_bindings() -> Bool:
+	match checked(NAMED_FORWARDING):
+		Err(_): False
+		Ok(program):
+			match API.checked_functions(program).functions:
+				[_, _, _, forward, _]:
+					match (forward.signature.type_parameters, forward.bindings):
+						([parameter], [binding]):
+							match binding.origin:
+								Model.ParameterBinding(0): Model.same_type(binding.value_type, Model.ParameterType(parameter))
+								_: False
+						_: False
+				_: False
+
+
+pure func test_forwarded_choices_keep_written_positions_and_rigid_owner() -> Bool:
+	match checked(NAMED_FORWARDING):
+		Err(_): False
+		Ok(program):
+			match API.checked_functions(program).functions:
+				[_, _, compose, forward, _]:
+					match (forward.signature.type_parameters, body_value(forward)):
+						([parameter], Some(value)):
+							match value.form:
+								Model.InvokeFunction(call, [argument]):
+									match (call.target, argument.form):
+										(Model.UserFunction(owner, [Model.ParameterType(actual)], [left, right]), Model.ReadBinding(binding)):
+											match (left.choice, right.choice):
+												(Model.ForwardedCallable(first), Model.ForwardedCallable(second)):
+													(
+														Declaration.function_number(owner) == Declaration.function_number(compose.id)
+														and Model.same_parameter(actual, parameter) and Model.binding_number(binding) == 0
+														and Model.same_callable_parameter(left.parameter, Model.callable_parameter(compose.id, 1))
+														and Model.same_callable_parameter(right.parameter, Model.callable_parameter(compose.id, 2))
+														and Model.same_callable_parameter(first, Model.callable_parameter(forward.id, 0))
+														and Model.same_callable_parameter(second, Model.callable_parameter(forward.id, 2))
+													)
+												_: False
+										_: False
+								_: False
+						_: False
+				_: False
+
+
+private CROSS_TYPES: String =
+	|pure func convert(value: Int) -> String:
+	|    "é\0"
+	|pure func apply[T, U](f: pure (T) -> U, value: T, g: pure (T) -> U, fallback: U) -> U:
+	|    saved = f(value)
+	|    saved
+	|pure func forward[T, U](f: pure (T) -> U, value: T, g: pure (T) -> U, fallback: U) -> U:
+	|    apply(f, value, g, fallback)
+	|func main() -> Int:
+	|    saved = forward(convert, 17, convert, "fallback")
+	|    0
+	|
+
+
+pure func test_interleaved_data_and_locals_keep_dense_ids() -> Bool:
+	match checked(CROSS_TYPES):
+		Err(_): False
+		Ok(program):
+			match API.checked_functions(program).functions:
+				[_, apply, _, _]:
+					match (apply.signature.type_parameters, apply.bindings, apply.statements):
+						([input, output], [first, second, local], [Model.InitializeBinding(saved, value)]):
+							match (first.origin, second.origin, local.origin, value.form):
+								(Model.ParameterBinding(0), Model.ParameterBinding(1), Model.BodyLocal, Model.InvokeFunction(call, [argument])):
+									match (call.target, argument.form):
+										(Model.CallableParameter(parameter), Model.ReadBinding(actual)):
+											(
+												Model.binding_number(saved) == 2 and Model.binding_number(actual) == 0
+												and Model.same_type(first.value_type, Model.ParameterType(input))
+												and Model.same_type(second.value_type, Model.ParameterType(output))
+												and Model.same_type(local.value_type, Model.ParameterType(output))
+												and Model.same_callable_parameter(parameter, Model.callable_parameter(apply.id, 0))
+											)
+										_: False
+								_: False
+						_: False
+				_: False
+
+
 tests: TestSuite = {
 	description = "Contextual generic-call inference",
 	tests = [
+		("interleaved data bindings and first local remain dense", test_interleaved_data_and_locals_keep_dense_ids),
+		("callable positions allocate no data binding", test_callable_positions_do_not_allocate_data_bindings),
+		("forwarded choices retain written positions and rigid owner", test_forwarded_choices_keep_written_positions_and_rigid_owner),
 		("substituted List parameter reports ordinary mismatch", test_substituted_list_parameter_reports_an_ordinary_mismatch),
 		("pure Void result reports ordinary List mismatch", test_pure_void_result_reports_the_ordinary_list_argument_mismatch),
 		("deferred List result permits later unknown", test_deferred_list_result_allows_a_later_unknown_child),

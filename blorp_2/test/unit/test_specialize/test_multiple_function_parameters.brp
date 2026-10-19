@@ -84,7 +84,7 @@ private pure func arguments(value: Model.CheckedExpr) -> Option[List[Model.TypeR
 	match value.form:
 		Model.InvokeFunction(call, _):
 			match call.target:
-				Model.UserFunction(_, arguments):
+				Model.UserFunction(_, arguments, []):
 					Some(arguments)
 				_:
 					None
@@ -290,7 +290,7 @@ pure func test_expected_result_completes_a_later_parameter() -> Bool:
 							match value.form:
 								Model.InvokeFunction(call, [_]):
 									match call.target:
-										Model.UserFunction(owner, [Model.IntType, Model.IntType]): Declaration.function_number(owner) == 0
+										Model.UserFunction(owner, [Model.IntType, Model.IntType], []): Declaration.function_number(owner) == 0
 										_: False
 								_: False
 						_: False
@@ -702,7 +702,7 @@ pure func test_ordered_calls_and_instances_preserve_int_string_permutation() -> 
 							match (arguments(first), second.form):
 								(Some([Model.IntType, Model.StringType]), Model.InvokeFunction(call, _)):
 									match call.target:
-										Model.UserFunction(_, [Model.StringType, Model.IntType]):
+										Model.UserFunction(_, [Model.StringType, Model.IntType], []):
 											match Concrete.specialize(program):
 												Ok(concrete):
 													match Concrete.specialized_contents(
@@ -778,9 +778,148 @@ pure func test_duplicate_renderer_uses_typed_error_without_rechecking() -> Bool:
 			False
 
 
+private NAMED_FORWARDING: String =
+	|pure func first[T](value: T) -> T:
+	|    value
+	|pure func second(value: Int) -> Int:
+	|    2
+	|pure func compose[T](value: T, f: pure (T) -> T, g: pure (T) -> T) -> T:
+	|    f(g(value))
+	|pure func forward[T](f: pure (T) -> T, value: T, g: pure (T) -> T) -> T:
+	|    compose(value, f, g)
+	|func main() -> Int:
+	|    same_choices = forward(first, 17, first)
+	|    changed_second = forward(first, 17, second)
+	|    swapped_choices = forward(second, 17, first)
+	|    forward(first, 17, second)
+	|
+
+
+private pure func selected_pair(
+	functions: List[Concrete.ConcreteFunction],
+	id: Concrete.FunctionInstanceId,
+) -> Option[List[Int]]:
+	forward ?= functions.get(Concrete.function_number(id))
+	target ?= match (forward.signature.parameters, forward.bindings, forward.body):
+		([Concrete.IntType], [binding], Concrete.ConcreteValueBody(Concrete.ReturnExpression(value))):
+			match (binding.origin, value.form):
+				(Model.ParameterBinding(0), Concrete.InvokeFunction(call, [argument])):
+					match (call.target, argument.form):
+						(Concrete.UserFunction(target), Concrete.ReadBinding(binding)):
+							if Model.binding_number(binding) == 0:
+								Some(target)
+							else:
+								None
+						_: None
+				_: None
+		_: None
+	compose ?= functions.get(Concrete.function_number(target))
+	match (compose.signature.parameters, compose.bindings, compose.body):
+		([Concrete.IntType], [_], Concrete.ConcreteValueBody(Concrete.ReturnExpression(result))):
+			match result.form:
+				Concrete.InvokeFunction(outer, [inner]):
+					match (outer.target, inner.form):
+						(Concrete.UserFunction(first), Concrete.InvokeFunction(second, [argument])):
+							match (second.target, argument.form):
+								(Concrete.UserFunction(last), Concrete.ReadBinding(binding)):
+									if Model.binding_number(binding) == 0:
+										Some([Concrete.function_number(first), Concrete.function_number(last)])
+									else:
+										None
+								_: None
+						_: None
+				_: None
+		_: None
+
+
+pure func test_named_keys_preserve_both_ordered_choices_and_reuse() -> Bool:
+	match specialized(NAMED_FORWARDING):
+		Err(_): False
+		Ok(program):
+			functions = Concrete.specialized_contents(program).functions
+			match functions:
+				[main, ..._]:
+					match (main.statements, main.body):
+						([Concrete.InitializeBinding(_, same_choices), Concrete.InitializeBinding(_, changed_second), Concrete.InitializeBinding(_, swapped_choices)], Concrete.ConcreteValueBody(Concrete.ReturnExpression(repeated))):
+							match (
+								same_choices.form, changed_second.form,
+								swapped_choices.form, repeated.form,
+							):
+								(
+									Concrete.InvokeFunction(same_call, [_]), Concrete.InvokeFunction(changed_call, [_]),
+									Concrete.InvokeFunction(swapped_call, [_]), Concrete.InvokeFunction(repeated_call, [_]),
+								):
+									match (same_call.target, changed_call.target, swapped_call.target, repeated_call.target):
+										(Concrete.UserFunction(same_id), Concrete.UserFunction(changed_id), Concrete.UserFunction(swapped_id), Concrete.UserFunction(repeated_id)):
+											match (selected_pair(functions, same_id), selected_pair(functions, changed_id), selected_pair(functions, swapped_id)):
+												(Some([first, same]), Some([outer, inner]), Some([swapped, last])):
+													(
+														first == same and first == outer and first == last and inner == swapped and first != inner
+														and Concrete.function_number(same_id) != Concrete.function_number(changed_id)
+														and Concrete.function_number(changed_id) != Concrete.function_number(swapped_id)
+														and Concrete.function_number(changed_id) == Concrete.function_number(repeated_id)
+														and functions.length() == 9
+													)
+												_: False
+										_: False
+								_: False
+						_: False
+				_: False
+
+
+private CROSS_TYPES: String =
+	|pure func convert(value: Int) -> String:
+	|    "é\0"
+	|pure func apply[T, U](f: pure (T) -> U, value: T, g: pure (T) -> U, fallback: U) -> U:
+	|    saved = f(value)
+	|    saved
+	|pure func forward[T, U](f: pure (T) -> U, value: T, g: pure (T) -> U, fallback: U) -> U:
+	|    apply(f, value, g, fallback)
+	|func main() -> Int:
+	|    saved = forward(convert, 17, convert, "fallback")
+	|    0
+	|
+
+
+pure func test_cross_type_forwarding_substitutes_input_and_output() -> Bool:
+	match specialized(CROSS_TYPES):
+		Err(_): False
+		Ok(program):
+			match Concrete.specialized_contents(program).functions:
+				[_, callback, forward, apply]:
+					forward_targets_apply = match (forward.signature.parameters, forward.signature.return_type, forward.body):
+						([Concrete.IntType, Concrete.StringType], Concrete.StringType, Concrete.ConcreteValueBody(Concrete.ReturnExpression(value))):
+							match value.form:
+								Concrete.InvokeFunction(call, [first, second]):
+									match (call.target, first.form, second.form):
+										(Concrete.UserFunction(target), Concrete.ReadBinding(input), Concrete.ReadBinding(output)):
+											Concrete.function_number(target) == 3 and Model.binding_number(input) == 0 and Model.binding_number(output) == 1
+										_: False
+								_: False
+						_: False
+					match (apply.signature.parameters, apply.signature.return_type, apply.bindings, apply.statements):
+						([Concrete.IntType, Concrete.StringType], Concrete.StringType, [_, _, local], [Concrete.InitializeBinding(saved, value)]):
+							match value.form:
+								Concrete.InvokeFunction(call, [argument]):
+									match (call.target, argument.form, callback.signature.parameters):
+										(Concrete.UserFunction(target), Concrete.ReadBinding(binding), [Concrete.IntType]):
+											(
+												forward_targets_apply and Concrete.function_number(target) == 1
+												and Concrete.same_type(callback.signature.return_type, Concrete.StringType)
+												and Concrete.same_type(local.value_type, Concrete.StringType)
+												and Model.binding_number(saved) == 2 and Model.binding_number(binding) == 0
+											)
+										_: False
+								_: False
+						_: False
+				_: False
+
+
 tests: TestSuite = {
 	description = "Multiple function type parameters",
 	tests = [
+		("cross-type forwarding substitutes input and output independently", test_cross_type_forwarding_substitutes_input_and_output),
+		("named keys retain ordered choices and reuse", test_named_keys_preserve_both_ordered_choices_and_reuse),
 		("binding without context keeps later parameter uninferred", test_binding_without_context_keeps_a_later_parameter_uninferred),
 		(
 			"two parameters accept independent int and string arguments",

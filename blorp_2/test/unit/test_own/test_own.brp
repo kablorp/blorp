@@ -11,7 +11,7 @@ import:
 		lowered_functions,
 		block_value_count,
 		value_number,
-	../../../src/own/own:
+	../../../src/own/own as Own:
 		BorrowSource(ParameterBorrow, OwnerBorrow),
 		OwnedArgument(BorrowedArgument),
 		OwnedExit(ReturnResult),
@@ -29,10 +29,11 @@ import:
 	../../../src/specialize/specialize:
 		CallTarget(UserFunction),
 		TypeRef(IntType, StringType, UnionType, VoidType),
+		function_number,
 		ValueOwnership(NoOwnership, ManagedStringLeaf),
 		value_ownership,
 	../ownership_inputs: InputIds, function, input_ids, integer, parameter, runtime, span
-	../managed_union_inputs: lowered
+	../managed_union_inputs: lowered, NAMED_CALLBACK_SOURCE
 	test: TestSuite
 
 
@@ -1279,9 +1280,96 @@ pure func test_match_arms_drop_unused_owners_and_transfer_distinct_owners() -> B
 					False
 
 
+pure func test_named_callback_return_acquires_its_borrowed_string() -> Bool:
+	match lowered(NAMED_CALLBACK_SOURCE).and_then(Own.own):
+		Err(_): False
+		Ok(program):
+			match program.functions:
+				[_, identity, apply]:
+					match apply.operations:
+						[_, Own.DefineValue(invocation)]:
+							selected = match invocation.operation:
+								Own.CallDefinition(call, [_]):
+									match call.target:
+										UserFunction(id): function_number(id) == 1
+										_: False
+								_: False
+							match (identity.operations, identity.tail):
+								([Own.DefineValue(parameter), Own.AcquireOwner(owner, borrow, _)], Own.ReturnTail(Own.ReturnResult(Own.OwnedReturn(value, returned)))):
+									match (parameter.operation, parameter.result, borrow.source):
+										(Own.ParameterDefinition(0), Own.BorrowedResult(Own.ParameterBorrow(source)), Own.ParameterBorrow(acquired)):
+											(
+												selected and value_number(value) == value_number(parameter.id)
+												and value_number(source) == value_number(acquired) and value_number(borrow.value) == value_number(parameter.id)
+												and Own.owner_number(owner) == Own.owner_number(returned)
+											)
+										_: False
+								_: False
+						_: False
+				_: False
+
+
+pure func test_named_callback_invocation_transfers_the_owned_call_result() -> Bool:
+	match lowered(NAMED_CALLBACK_SOURCE).and_then(Own.own):
+		Err(_): False
+		Ok(program):
+			match program.functions:
+				[main, _, apply]:
+					match main.operations:
+						[_, Own.DefineValue(invocation), ..._]:
+							selected = match invocation.operation:
+								Own.CallDefinition(call, [_]):
+									match call.target:
+										UserFunction(id): function_number(id) == 2
+										_: False
+								_: False
+							match (apply.operations, apply.tail):
+								([Own.DefineValue(parameter), Own.DefineValue(result)], Own.ReturnTail(Own.ReturnResult(Own.OwnedReturn(value, returned)))):
+									match (result.operation, result.result):
+										(Own.CallDefinition(call, [Own.BorrowedArgument(borrow)]), Own.OwnedResult(owner)):
+											match (call.target, borrow.source):
+												(UserFunction(callback), Own.ParameterBorrow(source)):
+													(
+														selected and function_number(callback) == 1
+														and value_number(source) == value_number(parameter.id) and value_number(value) == value_number(result.id)
+														and Own.owner_number(owner) == Own.owner_number(returned)
+													)
+												_: False
+										_: False
+								_: False
+						_: False
+				_: False
+
+
+pure func test_unused_named_callback_result_is_dropped_once() -> Bool:
+	match lowered(NAMED_CALLBACK_SOURCE).and_then(Own.own):
+		Err(_): False
+		Ok(program):
+			match program.functions:
+				[main, _, _]:
+					match main.operations:
+						[_, Own.DefineValue(result), ..._]:
+							match (result.operation, result.result):
+								(Own.CallDefinition(call, [_]), Own.OwnedResult(owner)):
+									match call.target:
+										UserFunction(id):
+											function_number(id) == 2 and main.operations.filter(pure func(operation):
+												match operation:
+													Own.DropOwner(dropped, _): Own.owner_number(dropped) == Own.owner_number(owner)
+													_: False
+											).length() == 1
+										_: False
+								_: False
+						_: False
+				_: False
+
+
 tests: TestSuite = {
 	description = "Blorp 2 ownership insertion",
 	tests = [
+		("unused named owned result is dropped exactly once", test_unused_named_callback_result_is_dropped_once),
+		("named callback String return acquires borrowed parameter", test_named_callback_return_acquires_its_borrowed_string),
+		("named invocation returns its owned direct-call result", test_named_callback_invocation_transfers_the_owned_call_result),
 		(
 			"repeated call uses preserve prefix and offset",
 			test_last_use_records_repeated_call_operands_with_a_prefix_and_offset,

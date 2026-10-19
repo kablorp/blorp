@@ -1650,8 +1650,13 @@ pure func double(x: Int) -> Int:
 result: Int = apply(double, 5)  -- OK: pure satisfies impure
 ```
 
-Blorp 2 currently parses explicit `pure (...) -> Type` annotations, including
-nested callback types. Checking and invoking callbacks are not implemented yet.
+Blorp 2 accepts explicit `pure (...) -> Type` parameters with ordinary data
+parameter and result types. Pass a pure named function or forward an existing
+callable parameter, then invoke it directly as `callback(value)`. Generic named
+references infer fresh type arguments; callable slots become ordinary direct
+calls during specialization. Lambdas, nested callable types, callable storage
+and callable return values remain unsupported there. See the
+[Blorp 2 subset](../blorp_2/README.md) for its scope and recursion restrictions.
 
 ### Type Inference
 

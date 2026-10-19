@@ -1,7 +1,7 @@
 import:
 	../../../src/check/errors as Errors
 	../../../src/check/model as Model
-	../../../src/check/scope: bind_local, binding_definition, binding_site, local_binding_id, lookup_binding
+	../../../src/check/scope as Scope: ScopedValue(DataLocal), bind_local, binding_definition, binding_site, local_binding_id, lookup_binding
 	../../../src/namespace/namespace: Namespace, NamedValue(NamedFunction), ValueBinding(FunctionName, ConstructorName, ModuleAliasName), build_namespace, named_value
 	../../../src/parse/assemble: parsed_contents
 	../../../src/utils/ids: FunctionId, function_number
@@ -61,7 +61,7 @@ pure func test_constructor_preserves_the_complete_binding_definition() -> Bool:
 				Some(name):
 					match bind_local([], setup.namespace, root_module_id(), setup.function, name, Model.binding_id(7), definition(Model.MatchCapture, name.span)):
 						Err(_): False
-						Ok(binding):
+						Ok(DataLocal(binding)):
 							accepted = binding_definition(binding)
 							site = binding_site(setup.function, binding)
 							origin_matches = match accepted.origin:
@@ -75,8 +75,10 @@ pure func test_constructor_preserves_the_complete_binding_definition() -> Bool:
 								and Model.same_type(accepted.value_type, Model.IntType)
 								and accepted.mutability == Model.Immutable
 								and origin_matches
-								and lookup_binding([binding], name.id).is_some()
+								and lookup_binding([DataLocal(binding)], name.id).is_some()
 							)
+						Ok(_):
+							False
 
 
 private pure func module_conflict(spelling: String, matches: pure (Errors.BindingError) -> Bool) -> Bool:
@@ -169,9 +171,54 @@ pure func test_capture_conflict_preserves_the_original_binding_origin() -> Bool:
 	)
 
 
+pure func test_callable_scope_preserves_its_contract_and_rejects_data_shadowing() -> Bool:
+	match fixture():
+		None: False
+		Some(setup):
+			match written(setup, "candidate", 90):
+				None: False
+				Some(name):
+					id = Model.callable_parameter(setup.function, 2)
+					match Scope.bind_callable([], setup.namespace, root_module_id(), setup.function,
+						name, id, [Model.StringType, Model.IntType], Model.VoidType, span(70)):
+						Ok(Scope.CallableLocal(binding)):
+							contract_matches = match Scope.callable_parameters(binding):
+								[first, second]:
+									(
+										Model.same_type(first.value_type, Model.StringType)
+										and Model.same_type(second.value_type, Model.IntType)
+										and same_span(first.span, span(70)) and same_span(second.span, span(70))
+									)
+								_: False
+							shadow = { name | span = span(140) }
+							conflict_matches = match bind_local([Scope.CallableLocal(binding)], setup.namespace,
+								root_module_id(), setup.function, shadow, Model.binding_id(0),
+								definition(Model.BodyLocal, shadow.span)):
+								Err(error):
+									match error.kind:
+										Errors.BindingRejection(Errors.CallableBindingConflict(previous, previous_span)):
+											(
+												Model.same_callable_parameter(previous, id) and same_span(previous_span, name.span)
+												and same_span(error.span, shadow.span)
+											)
+										_: False
+								_: False
+							(
+								contract_matches and conflict_matches
+								and Model.same_callable_parameter(Scope.callable_binding_id(binding), id)
+								and same_name(Scope.callable_binding_name(binding).id, name.id)
+								and same_span(Scope.callable_binding_name(binding).span, name.span)
+								and Model.same_type(Scope.callable_return_type(binding).value_type, Model.VoidType)
+								and same_span(Scope.callable_return_type(binding).span, span(70))
+								and lookup_binding([Scope.CallableLocal(binding)], name.id).is_some()
+							)
+						_: False
+
+
 tests: TestSuite = {
 	description = "Accepted local binding construction",
 	tests = [
+		("callable scope retains contract and data conflict identity", test_callable_scope_preserves_its_contract_and_rejects_data_shadowing),
 		("constructor preserves complete binding definition", test_constructor_preserves_the_complete_binding_definition),
 		("function collision carries namespace occurrence", test_function_collision_carries_its_namespace_occurrence),
 		("constructor collision carries namespace occurrence", test_constructor_collision_carries_its_namespace_occurrence),

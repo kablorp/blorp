@@ -5,10 +5,10 @@ complete checked facts leave this module; temporary inference variables never be
 published TypeRefs.
 ---
 import:
-	./scope: LocalBinding, binding_site, binding_definition, local_binding_id, lookup_binding
+	./scope: ScopedValue(DataLocal, CallableLocal), LocalBinding, callable_binding_id, callable_binding_name, callable_parameters, callable_return_type, binding_site, binding_definition, local_binding_id, lookup_binding
 	./constants: constant_row
 	./callables:
-		FunctionContract,
+		FunctionContract, callable_contract,
 		function_contract,
 		ResolutionContext,
 		ResolvedReceiver(ReceiverCandidates, UniqueReceiver),
@@ -21,15 +21,17 @@ import:
 		CheckedRecordUpdate,
 		RetainedRecordField,
 		CheckedExpr,
-		CheckedCall,
-		TypeRef(VoidType, IntType, FloatType, StringType),
+		CheckedCall, CallableChoice(NamedCallable, ForwardedCallable), CallableArgument,
+		CallIdentity(DeclaredTarget, ParameterTarget), callable_parameter,
+		TypeRef(ParameterType, PureCallableType, VoidType, IntType, FloatType, StringType),
+		has_callable_parameters,
 		same_type,
 		parameter_position
 	./errors:
-		CheckError,
+		CheckError, RecursionError(AnnotatedSelfCallback, GenericTailRecursionUnsupported), recursion_error,
 		ExpectedTypeSite,
 		CheckErrorKind(ConstructorRejection, RecordRejection),
-		CallError(UnknownFunction, UncallableBinding),
+		CallError(CallableReceiverSyntax, CallableCandidateHasCallableParameters, ImpureCallback, CallableValueRequired, CallableValueEscapes, UnknownFunction, UncallableBinding),
 		ConstantError(ConstantCalled), constant_error,
 		ConstructorError(ConstructorNeedsExpectedType),
 		RecordError(RecordNeedsExpectedType, FieldRequiresRecord),
@@ -47,7 +49,7 @@ import:
 		checker_invariant
 	./inference:
 		select_receiver_contract,
-		PendingBase(AcceptedBinding, AcceptedConstant, AcceptedFloat, AcceptedInteger, AcceptedString, AcceptedVoid, PendingConstructRecord, PendingConstructVariant, PendingConstructList, PendingDirectCall, PendingUpdateRecord),
+		PendingBase(PendingNamedCallable, PendingForwardedCallable, AcceptedBinding, AcceptedConstant, AcceptedFloat, AcceptedInteger, AcceptedString, AcceptedVoid, PendingConstructRecord, PendingConstructVariant, PendingConstructList, PendingDirectCall, PendingUpdateRecord),
 		ListElementSource(ExpectedElementType, FirstElementType),
 		PendingOperation(AcceptedField, PendingInvocation),
 		InferenceType(AcceptedType),
@@ -105,7 +107,7 @@ import:
 		resolve_record_field,
 		validate_record_fields,
 		validate_variant_fields
-	../utils/ids: FunctionId, record_number, variant_owner
+	../utils/ids: FunctionId, function_number, record_number, variant_owner
 	./declarations: aliased_module
 	../namespace/namespace: NamedValue(NamedFunction, NamedConstant, NamedConstructor, NamedAlias), OfferedValue(OfferedFunction, OfferedConstant, OfferedConstructor), named_value, offered_value
 	int as IntOps
@@ -124,7 +126,7 @@ import:
 			QualifiedName, QualifiedApplication, OpaqueWrap, OpaqueUnwrap, ListExpression, RangeExpression, RecordExpression,
 			RecordUpdateExpression, LogicalExpression, NotExpression, IfExpression, MatchExpression, LambdaExpression,
 		),
-		Purity,
+		Purity(Pure), same_purity,
 		same_span
 
 
@@ -223,6 +225,7 @@ private fixed record OperandRange {
 
 private fixed union ExpressionWork:
 	EnterExpression(ValueExpression, Option[InferenceType])
+	EnterCallable(ValueExpression)
 	ContinuePostfix(List[PendingPostfix], List[Option[InferenceType]], Int, Span, Span)
 	ScheduleCall(FunctionContract, List[ValueExpression], CallPlacement, Option[InferenceType])
 	StartCall(PendingCall, List[ValueExpression], CallPlacement, Option[InferenceType])
@@ -320,10 +323,13 @@ private pure func argument_work(call: PendingCall, arguments: List[ValueExpressi
 		ReceiverPlacement(_, _): IntOps.add(position, 1)
 		_: position
 	hint ?= hints.get(argument_position).to_result(checker_invariant(call.contract.span, MissingCallParameter(argument_position)))
-	Ok(EnterExpression(argument, hint))
+	written ?= call.contract.signature.parameters.get(argument_position).to_result(checker_invariant(call.contract.span, MissingCallParameter(argument_position)))
+	match written.value_type:
+		PureCallableType(_, _): Ok(EnterCallable(argument))
+		_: Ok(EnterExpression(argument, hint))
 
 
-private pure func plan_base(purity: Purity, scope: List[LocalBinding], body: ValueExpression, expectation: Option[InferenceType], context: ResolutionContext, slots: List[InferenceSlot]) -> Result[PlannedBase, CheckError]:
+private pure func plan_base(purity: Purity, scope: List[ScopedValue], body: ValueExpression, expectation: Option[InferenceType], context: ResolutionContext, slots: List[InferenceSlot]) -> Result[PlannedBase, CheckError]:
 	match body.base:
 		RecordExpression(fields): plan_record_literal(fields, body.base_span, expectation, context)
 		RecordUpdateExpression(base, fields): Ok(PlannedUpdate(base, fields, expectation))
@@ -336,9 +342,11 @@ private pure func plan_base(purity: Purity, scope: List[LocalBinding], body: Val
 				Err(error): Err(error)
 		NameExpression(name):
 			match lookup_binding(scope, name.id):
-				Some(binding): Ok(PlannedLeaf(AcceptedBinding(local_binding_id(binding)), binding_definition(binding).value_type))
+				Some(DataLocal(binding)): Ok(PlannedLeaf(AcceptedBinding(local_binding_id(binding)), binding_definition(binding).value_type))
+				Some(CallableLocal(binding)): Err(call_error(name.span, CallableValueEscapes(ParameterTarget(callable_binding_id(binding)))))
 				None:
 					match named_value(context.namespace, context.module, name.id):
+						Some(NamedFunction(id, _)): Err(call_error(name.span, CallableValueEscapes(DeclaredTarget(id))))
 						Some(NamedConstant(id)):
 							constant_row(context.constants, id, name.span)
 								.map(pure func(row): PlannedLeaf(AcceptedConstant(id), row.value_type.value_type))
@@ -398,7 +406,22 @@ private pure func plan_qualified(
 			Err(qualified_error(name.span, QualifiedNotOffered(qualified.module.id, name.id, aliased.path, reason)))
 
 
-private pure func resolve_postfixes(purity: Purity, body: ValueExpression, context: ResolutionContext) -> Result[List[ResolvedPostfix], CheckError]:
+private pure func resolve_postfixes(purity: Purity, scope: List[ScopedValue], body: ValueExpression, context: ResolutionContext) -> Result[List[ResolvedPostfix], CheckError]:
+	receiver_decision: Result[Void, CheckError] = if body.applications.is_empty():
+		Ok(void)
+	else:
+		match body.base:
+			NameExpression(name):
+				match lookup_binding(scope, name.id):
+					Some(CallableLocal(binding)):
+						Err(call_error(name.span, CallableReceiverSyntax(ParameterTarget(callable_binding_id(binding)))))
+					Some(DataLocal(_)): Ok(void)
+					None:
+						match named_value(context.namespace, context.module, name.id):
+							Some(NamedFunction(id, _)): Err(call_error(name.span, CallableReceiverSyntax(DeclaredTarget(id))))
+							_: Ok(void)
+			_: Ok(void)
+	data_receiver ?= receiver_decision
 	var contracts: List[ResolvedPostfix] = []
 	var failure: Option[CheckError] = None
 
@@ -406,6 +429,11 @@ private pure func resolve_postfixes(purity: Purity, body: ValueExpression, conte
 		match postfix:
 			FieldAccess(name): contracts = contracts.append(ReadField(name))
 			ReceiverInvocation(application):
+				match lookup_binding(scope, application.callee.id):
+					Some(CallableLocal(binding)):
+						failure = Some(call_error(application.callee.span, CallableReceiverSyntax(ParameterTarget(callable_binding_id(binding)))))
+						break
+					_: void
 				match classify_receiver(application, context):
 					Err(error):
 						failure = Some(error)
@@ -417,7 +445,7 @@ private pure func resolve_postfixes(purity: Purity, body: ValueExpression, conte
 		None: Ok(contracts)
 
 
-private pure func plan_expression(purity: Purity, scope: List[LocalBinding], body: ValueExpression, hint: Option[InferenceType], context: ResolutionContext, slots: List[InferenceSlot], contracts: List[PendingPostfix]) -> Result[ExpressionPlan, CheckError]:
+private pure func plan_expression(purity: Purity, scope: List[ScopedValue], body: ValueExpression, hint: Option[InferenceType], context: ResolutionContext, slots: List[InferenceSlot], contracts: List[PendingPostfix]) -> Result[ExpressionPlan, CheckError]:
 	projected ?= postfix_hints(contracts, hint, context, slots)
 	base_expectation = projected.base
 	base_result = plan_base(purity, scope, body, base_expectation, context, slots)
@@ -533,7 +561,7 @@ private pure func finish_pending_call(call: PendingCall, arguments: List[Pending
 
 private pure func elaborate_value(
 	purity: Purity,
-	scope: List[LocalBinding],
+	scope: List[ScopedValue],
 	body: ValueExpression,
 	constructor_type: Option[TypeRef],
 	result_context: Option[CallResultContext],
@@ -556,8 +584,19 @@ private pure func elaborate_value(
 		match next:
 			Some(Some(action)):
 				match action:
+					EnterCallable(written):
+						match resolve_callable_operand(written, scope, context, slots.length()):
+							Err(error): failure = Some(error)
+							Ok(value):
+								match value.base:
+									PendingNamedCallable(_, signature, _):
+										for parameter in signature.type_parameters:
+											slots = slots.append({ parameter = parameter, call_span = written.span, first_argument = None, state = UnboundVariable(0) })
+									_: void
+								operands = push_operand(operands, operand_count, value)
+								operand_count = IntOps.add(operand_count, 1)
 					EnterExpression(written, hint):
-						match resolve_postfixes(purity, written, context):
+						match resolve_postfixes(purity, scope, written, context):
 							Err(error): failure = Some(error)
 							Ok(resolved):
 								var postfixes: List[PendingPostfix] = []
@@ -956,6 +995,11 @@ private pure func freeze_pending_values(values: List[PendingValue], slots: List[
 private pure func freeze_pending_call(call: PendingCall, values: List[PendingValue], receiver: Option[CheckedExpr], slots: List[InferenceSlot]) -> Result[ResolvedArguments, CheckError]:
 	var actual = pending_arguments(values)
 	var arguments: List[CheckedExpr] = []
+	var callable_arguments: List[CallableArgument] = []
+	var written_position = if receiver.is_some():
+		1
+	else:
+		0
 	var failure: Option[CheckError] = None
 
 	match receiver:
@@ -966,17 +1010,47 @@ private pure func freeze_pending_call(call: PendingCall, values: List[PendingVal
 		None: void
 
 	for value in values:
-		match freeze_pending_value(value, slots):
-			Err(error):
-				failure = Some(error)
-				break
-			Ok(frozen_value):
-				arguments = arguments.append(frozen_value)
+		match value.base:
+			PendingNamedCallable(id, signature, start):
+				var types: List[TypeRef] = []
+				for parameter in signature.type_parameters:
+					match publish_inference_type(
+						inference_type(ParameterType(parameter), signature.type_parameters, start),
+						slots, CompleteInference, value.span,
+					):
+						Ok(accepted): types = types.append(accepted)
+						Err(error):
+							failure = Some(error)
+							break
+				match call.contract.target:
+					DeclaredTarget(owner):
+						callable_arguments = callable_arguments.append({
+							parameter = callable_parameter(owner, written_position),
+							choice = NamedCallable(id, types),
+							span = value.span
+						})
+					_: failure = Some(checker_invariant(value.span, InvalidInferenceWorklist))
+			PendingForwardedCallable(id):
+				match call.contract.target:
+					DeclaredTarget(owner):
+						callable_arguments = callable_arguments.append({
+							parameter = callable_parameter(owner, written_position),
+							choice = ForwardedCallable(id),
+							span = value.span
+						})
+					_: failure = Some(checker_invariant(value.span, InvalidInferenceWorklist))
+			_:
+				match freeze_pending_value(value, slots):
+					Err(error): failure = Some(error)
+					Ok(frozen_value): arguments = arguments.append(frozen_value)
+		if failure.is_some():
+			break
+		written_position = IntOps.add(written_position, 1)
 
 	ready ?= match failure:
 		Some(error): Err(error)
 		None: Ok(void)
-	checked_call ?= publish_pending_call(call, slots)
+	checked_call ?= publish_pending_call(call, callable_arguments, slots)
 	parameters ?= admit_call_parameters(call, slots)
 	return_type ?= admit_call_type(call.contract.signature.return_type.value_type, call, slots, call.contract.span)
 	valid ?= validate_complete_arguments(call.contract, parameters, return_type, actual, slots)
@@ -1001,6 +1075,7 @@ private pure func freeze_retained_fields(fields: List[PendingRetainedField], slo
 -- checker from recursing on chain length.
 private pure func freeze_pending_value(value: PendingValue, slots: List[InferenceSlot]) -> Result[CheckedExpr, CheckError]:
 	base_result: Result[CheckedForm, CheckError] = match value.base:
+		PendingNamedCallable(_, _, _) | PendingForwardedCallable(_): Err(call_error(value.span, CallableValueRequired))
 		AcceptedVoid: Ok(LiteralVoid)
 		AcceptedInteger(integer): Ok(LiteralInteger(integer))
 		AcceptedFloat(number): Ok(LiteralFloat(number))
@@ -1092,11 +1167,11 @@ private pure func freeze_pending_step(step: PendingStep, receiver: CheckedExpr, 
 	Ok({ form = form, value_type = value_type, span = step.span })
 
 
-pure func synthesize_value(scope: List[LocalBinding], body: ValueExpression, constructor_type: Option[TypeRef], context: ResolutionContext) -> Result[CheckedExpr, CheckError]:
+pure func synthesize_value(scope: List[ScopedValue], body: ValueExpression, constructor_type: Option[TypeRef], context: ResolutionContext) -> Result[CheckedExpr, CheckError]:
 	elaborate_value(context.caller.purity, scope, body, constructor_type, None, context)
 
 
-pure func check_value(scope: List[LocalBinding], body: ValueExpression, expected: TypeRef, site: ExpectedTypeSite, context: ResolutionContext) -> Result[CheckedExpr, CheckError]:
+pure func check_value(scope: List[ScopedValue], body: ValueExpression, expected: TypeRef, site: ExpectedTypeSite, context: ResolutionContext) -> Result[CheckedExpr, CheckError]:
 	obligation: ExpectedValue = { value_type = expected, site = site }
 	value ?= elaborate_value(context.caller.purity, scope, body, Some(expected), Some({ expected = obligation, span = body.span }), context)
 	if same_type(value.value_type, expected):
@@ -1108,32 +1183,34 @@ pure func check_value(scope: List[LocalBinding], body: ValueExpression, expected
 private pure func classify_direct_call(
 	name: WrittenName,
 	arguments: List[ValueExpression],
-	scope: List[LocalBinding],
+	scope: List[ScopedValue],
 	context: ResolutionContext,
 ) -> Result[ResolvedApplication, CheckError]:
-	callable ?= match lookup_binding(scope, name.id):
-		Some(binding):
+	match lookup_binding(scope, name.id):
+		Some(DataLocal(binding)):
 			Err(non_callable(binding, name.span, context.caller.function))
+		Some(CallableLocal(binding)):
+			callable_contract(name, arguments, binding)
+				.map(pure func(contract): FunctionApplication(contract))
 		None:
-			Ok(void)
 
-	match named_value(context.namespace, context.module, name.id):
-		Some(NamedConstant(id)):
-			Err(constant_error(name.span, ConstantCalled(id)))
-		Some(NamedFunction(target, _)):
-			match function_contract(
-				context.caller,
-				name,
-				arguments,
-				target,
-				context.signatures,
-			):
-				Ok(contract): Ok(FunctionApplication(contract))
-				Err(error): Err(error)
-		Some(NamedConstructor(_)):
-			Ok(ConstructorApplication(name))
-		_:
-			Err(call_error(name.span, UnknownFunction(name.id)))
+			match named_value(context.namespace, context.module, name.id):
+				Some(NamedConstant(id)):
+					Err(constant_error(name.span, ConstantCalled(id)))
+				Some(NamedFunction(target, _)):
+					match function_contract(
+						context.caller,
+						name,
+						arguments,
+						target,
+						context.signatures,
+					):
+						Ok(contract): Ok(FunctionApplication(contract))
+						Err(error): Err(error)
+				Some(NamedConstructor(_)):
+					Ok(ConstructorApplication(name))
+				_:
+					Err(call_error(name.span, UnknownFunction(name.id)))
 
 
 private pure func non_callable(
@@ -1149,3 +1226,83 @@ private pure func non_callable(
 			binding_definition(binding).value_type,
 		),
 	)
+
+
+private pure func named_callable_operand(
+	id: FunctionId,
+	written: ValueExpression,
+	context: ResolutionContext,
+	start: Int,
+) -> Result[PendingValue, CheckError]:
+	span = written.base_span
+	accepted ?= context.signatures.get(function_number(id)).to_result(checker_invariant(span, InvalidInferenceWorklist))
+	if not same_purity(accepted.signature.purity, Pure):
+		Err(call_error(span, ImpureCallback(id)))
+	else if has_callable_parameters(accepted.signature):
+		Err(call_error(span, CallableCandidateHasCallableParameters(id)))
+	else if IntOps.equals(function_number(id), function_number(context.caller.function)) and accepted.declaration.tail_annotation.is_some():
+		if accepted.signature.type_parameters.is_empty():
+			Err(recursion_error(span, AnnotatedSelfCallback))
+		else:
+			Err(recursion_error(span, GenericTailRecursionUnsupported))
+	else:
+		Ok({
+			span = written.span,
+			readiness = DeferredInference,
+			base = PendingNamedCallable(id, accepted.signature, start),
+			base_type = inference_type(
+				PureCallableType(
+					accepted.signature.parameters.map(pure func(value): value.value_type),
+					accepted.signature.return_type.value_type,
+				),
+				accepted.signature.type_parameters, start,
+			),
+			base_span = written.base_span,
+			operations = NoPendingOperations
+		})
+
+
+private pure func resolve_callable_operand(
+	written: ValueExpression,
+	scope: List[ScopedValue],
+	context: ResolutionContext,
+	start: Int,
+) -> Result[PendingValue, CheckError]:
+	if not written.applications.is_empty():
+		Err(call_error(written.span, CallableValueRequired))
+	else:
+		match written.base:
+			NameExpression(name):
+				match lookup_binding(scope, name.id):
+					Some(CallableLocal(binding)):
+						Ok({
+							span = written.span,
+							readiness = DeferredInference,
+							base = PendingForwardedCallable(callable_binding_id(binding)),
+							base_type = inference_type(
+								PureCallableType(
+									callable_parameters(binding).map(pure func(value): value.value_type),
+									callable_return_type(binding).value_type,
+								),
+								[], 0,
+							),
+							base_span = written.base_span,
+							operations = NoPendingOperations
+						})
+					Some(DataLocal(binding)): Err(non_callable(binding, name.span, context.caller.function))
+					None:
+						match named_value(context.namespace, context.module, name.id):
+							Some(NamedFunction(id, _)): named_callable_operand(id, written, context, start)
+							Some(NamedAlias(_)): Err(qualified_error(name.span, BareModuleAlias(name.id)))
+							Some(_): Err(call_error(name.span, CallableValueRequired))
+							None: Err(value_error(name.span, UnknownValue(name.id)))
+			QualifiedName(qualified):
+				match aliased_module(context.namespace, context.module, qualified.module):
+					Err(error): Err(error)
+					Ok(aliased):
+						match offered_value(context.namespace, aliased.target, qualified.name.id):
+							Ok(OfferedFunction(id)): named_callable_operand(id, written, context, start)
+							Ok(_): Err(call_error(written.span, CallableValueRequired))
+							Err(reason): Err(qualified_error(qualified.name.span, QualifiedNotOffered(qualified.module.id, qualified.name.id, aliased.path, reason)))
+			LambdaExpression(_): Err(unsupported_form(written.base_span, LambdaValue))
+			_: Err(call_error(written.span, CallableValueRequired))

@@ -1002,7 +1002,36 @@ a loop control inside one needs a loop of its own, and by owner decision
 `?=` is rejected anywhere inside one, where the host accepts it. Lambdas
 parse and are rejected by checking until the lambdas milestone. Explicit
 `pure (Int, String) -> Int` function types also parse, including zero parameters,
-trailing commas and nested callback types. Checking still rejects function types.
+trailing commas and nested callback types. Checking accepts pure callable types
+only as function parameters, with ordinary data parameter and result types:
+
+```blorp
+pure func identity[T](value: T) -> T:
+    value
+
+pure func apply[T, U](value: T, callback: pure (T) -> U) -> U:
+    callback(value)
+
+func main() -> Int:
+    apply(17, identity)
+```
+
+A callback argument is a pure function declared in the current module, an
+imported or module-qualified pure function reference, or unchanged forwarding of
+a callable parameter. Generic references
+infer fresh type arguments at each use; enclosing generic parameters stay rigid
+when invoking or forwarding a callable parameter. Zero and multiple parameters
+and Void results are supported. Specialization selects ordinary direct calls;
+callable parameters occupy no runtime data slots. Data arguments retain written
+evaluation order and existing data-receiver UFCS works for declared helpers.
+Invoke a callable parameter with `callback(value)`; `value.callback()` and
+`callback.use(value)` are rejected. Callables cannot be stored, returned,
+placed in aggregates, selected at runtime or used as ordinary type arguments;
+nested callable types and lambdas are still rejected by checking. Named
+references participate in the generic cycle-growth check even when their callee
+ignores them. Functions with callable parameters cannot use `@tail_recursive`,
+and an annotated function cannot pass itself as a callback.
+
 A `match` anywhere but a function's tail (bound, nested in an arm
 or branch block, or followed by further lines) is likewise one expression
 ending at its last arm's dedent; the function's last match stays its tail

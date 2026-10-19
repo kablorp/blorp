@@ -404,9 +404,17 @@ fixed record ConcreteBinding {
 }
 
 
-private fixed record InstanceKey {
+private fixed record KnownCallable {
+	parameter: Checked.CallableParameterId,
 	declaration: Declaration.FunctionId,
 	arguments: List[TypeRef]
+}
+
+
+private fixed record InstanceKey {
+	declaration: Declaration.FunctionId,
+	arguments: List[TypeRef],
+	callables: List[KnownCallable]
 }
 
 
@@ -623,6 +631,8 @@ private pure func concrete_type(
 	records: List[RecordInstance],
 ) -> Result[TypeRef, Diagnostic]:
 	match value_type:
+		Checked.PureCallableType(_, _):
+			Err(invalid(span, "callable type reached a data layout"))
 		Checked.RecordType(id):
 			-- A non-generic record has no arguments to translate.
 			match lookup_record_instance(id, [], records, span):
@@ -713,13 +723,44 @@ private pure func find_instance(
 		if IntOps.equals(
 			Declaration.function_number(known.key.declaration),
 			Declaration.function_number(key.declaration),
-		) and same_arguments(known.key.arguments, key.arguments):
+		) and same_arguments(known.key.arguments, key.arguments) and same_callables(known.key.callables, key.callables):
 			found = Some(into_opaque FunctionInstanceId(position))
 			break
 
 		position = IntOps.add(position, 1)
 
 	found
+
+
+private pure func same_callables(left: List[KnownCallable], right: List[KnownCallable]) -> Bool:
+	var matches = IntOps.equals(left.length(), right.length())
+	var position = 0
+	for value in left:
+		match right.get(position):
+			Some(other):
+				matches = (
+					matches and Checked.same_callable_parameter(value.parameter, other.parameter)
+					and IntOps.equals(Declaration.function_number(value.declaration), Declaration.function_number(other.declaration))
+					and same_arguments(value.arguments, other.arguments)
+				)
+			None: matches = False
+		if not matches:
+			break
+		position = IntOps.add(position, 1)
+	matches
+
+
+private pure func callable_choice(
+	choices: List[KnownCallable],
+	parameter: Checked.CallableParameterId,
+	span: Span,
+) -> Result[KnownCallable, Diagnostic]:
+	var found: Option[KnownCallable] = None
+	for choice in choices:
+		if Checked.same_callable_parameter(choice.parameter, parameter):
+			found = Some(choice)
+			break
+	found.to_result(invalid(span, "missing concrete callable parameter choice"))
 
 
 private pure func parameter_substitution[T](
@@ -919,6 +960,8 @@ private fixed record SealedInstances {
 
 private pure func contains_parameter(value: Checked.TypeRef) -> Bool:
 	match value:
+		Checked.PureCallableType(parameters, result):
+			parameters.any(contains_parameter) or contains_parameter(result)
 		Checked.ListType(element):
 			contains_parameter(element)
 		Checked.ParameterType(_):
@@ -1701,6 +1744,8 @@ private pure func prepare_type(
 	in_progress: List[InProgressLayout],
 ) -> Result[PreparedType, Diagnostic]:
 	match value:
+		Checked.PureCallableType(_, _):
+			Err(invalid(span, "callable type reached a data layout"))
 		Checked.VoidType:
 			Ok({ value_type = KnownType(VoidType), unions = unions, records = records, in_progress = in_progress })
 		Checked.IntType:
@@ -1866,7 +1911,13 @@ private pure func exit_types(exit: Checked.CheckedExit) -> List[Checked.TypeUse]
 
 
 private pure func function_types(function: Checked.CheckedFunction) -> List[Checked.TypeUse]:
-	var types: List[Checked.TypeUse] = function.signature.parameters
+	var types: List[Checked.TypeUse] = []
+	for parameter in function.signature.parameters:
+		match parameter.value_type:
+			Checked.PureCallableType(parameters, result):
+				for child in parameters.append(result):
+					types = types.append({ value_type = child, span = parameter.span })
+			_: types = types.append(parameter)
 
 	types = types
 		.append(function.signature.return_type)
@@ -1884,6 +1935,17 @@ private pure func function_types(function: Checked.CheckedFunction) -> List[Chec
 					.concat(exit_types(arm.body))
 
 			types
+
+
+private pure func request_instance(
+	prepared: PreparedInstances,
+	key: InstanceKey,
+	source: RequestSource,
+) -> PreparedInstances:
+	if find_instance(prepared.functions, key).is_some():
+		prepared
+	else:
+		{ prepared | functions = prepared.functions.append({ key = key, source = source }) }
 
 
 private pure func prepare_function(
@@ -1924,9 +1986,17 @@ private pure func prepare_function(
 	if not failure.is_some():
 		for call in Checked.function_calls(function):
 			match call.target:
-				Checked.RuntimeFunction(_):
-					void
-				Checked.UserFunction(declaration, arguments):
+				Checked.RuntimeFunction(_): void
+				Checked.CallableParameter(parameter):
+					match callable_choice(request.key.callables, parameter, call.span):
+						Err(error): failure = Some(error)
+						Ok(choice):
+							prepared = request_instance(prepared, {
+								declaration = choice.declaration,
+								arguments = choice.arguments,
+								callables = []
+							}, request.source)
+				Checked.UserFunction(declaration, arguments, callables):
 					var concrete: List[TypeRef] = []
 					var depends_on_caller = False
 
@@ -1962,27 +2032,49 @@ private pure func prepare_function(
 					if failure.is_some():
 						break
 
-					key: InstanceKey = {
-						declaration = declaration,
-						arguments = concrete
-					}
-
-					if not find_instance(prepared.functions, key).is_some():
-						-- Preserve the root of a caller-dependent request chain.
-						-- This records one chain origin, not each argument's origin.
-						-- A call with already concrete arguments is its own origin,
-						-- even when a nongeneric wrapper led us to this body.
-						source = if depends_on_caller:
-							match request.source:
-								EntrypointRoot: ConcreteRequest(call.span)
-								ConcreteRequest(span): ConcreteRequest(span)
-						else:
-							ConcreteRequest(call.span)
-
-						prepared = { prepared | functions = prepared.functions.append({
-								key = key,
-								source = source,
-							}) }
+					var choices: List[KnownCallable] = []
+					for callable in callables:
+						var choice_depends_on_caller = False
+						choice_result: Result[KnownCallable, Diagnostic] = match callable.choice:
+							Checked.ForwardedCallable(parameter):
+								-- A forwarded selection depends on the current caller's key.
+								choice_depends_on_caller = True
+								callable_choice(request.key.callables, parameter, callable.span)
+									.map(pure func(choice): { choice | parameter = callable.parameter })
+							Checked.NamedCallable(id, arguments):
+								choice_depends_on_caller = has_type_parameters and arguments.any(contains_parameter)
+								match prepare_arguments(
+									arguments, substitution, checked, prepared.unions,
+									request_span(choice_depends_on_caller, request.source, callable.span), prepared.records, [],
+								):
+									Err(error): Err(error)
+									Ok(types):
+										prepared = { prepared | unions = types.unions, records = types.records }
+										known_types(types.arguments, callable.span).map(pure func(values): {
+											parameter = callable.parameter,
+											declaration = id,
+											arguments = values
+										})
+						depends_on_caller = depends_on_caller or choice_depends_on_caller
+						match choice_result:
+							Err(error):
+								failure = Some(error)
+								break
+							Ok(choice):
+								choices = choices.append(choice)
+								prepared = request_instance(prepared, {
+									declaration = choice.declaration,
+									arguments = choice.arguments,
+									callables = []
+								}, ConcreteRequest(request_span(choice_depends_on_caller, request.source, callable.span)))
+					if not failure.is_some():
+						prepared = request_instance(prepared, {
+							declaration = declaration,
+							arguments = concrete,
+							callables = choices
+						}, ConcreteRequest(request_span(depends_on_caller, request.source, call.span)))
+			if failure.is_some():
+				break
 
 	match failure:
 		Some(error):
@@ -2092,6 +2184,7 @@ private pure func translate_boolean(
 private pure func translate_call(
 	call: Checked.CheckedCall,
 	substitution: List[TypeSubstitution[TypeRef]],
+	callables: List[KnownCallable],
 	keys: List[FunctionRequest],
 	unions: List[UnionInstance],
 	records: List[RecordInstance],
@@ -2215,19 +2308,45 @@ private pure func translate_call(
 			match concrete_result:
 				Ok(concrete): Ok(RuntimeFunction(concrete))
 				Err(error): Err(error)
-		Checked.UserFunction(declaration, arguments):
-			match concrete_types(arguments, substitution, unions, call.span, records):
-				Ok(concrete):
-					match find_instance(
-						keys,
-						{
-							declaration = declaration,
-							arguments = concrete
-						},
-					).to_result(invalid(call.span, "unexpanded function instance")):
-						Ok(id): Ok(UserFunction(id))
-						Err(error): Err(error)
+		Checked.CallableParameter(parameter):
+			match callable_choice(callables, parameter, call.span):
 				Err(error): Err(error)
+				Ok(choice):
+					find_instance(keys, {
+						declaration = choice.declaration,
+						arguments = choice.arguments,
+						callables = []
+					}).to_result(invalid(call.span, "unexpanded callable target")).map(pure func(id): UserFunction(id))
+		Checked.UserFunction(declaration, arguments, written_choices):
+			match concrete_types(arguments, substitution, unions, call.span, records):
+				Err(error): Err(error)
+				Ok(concrete):
+					var choices: List[KnownCallable] = []
+					var failure: Option[Diagnostic] = None
+					for written in written_choices:
+						choice_result: Result[KnownCallable, Diagnostic] = match written.choice:
+							Checked.ForwardedCallable(parameter):
+								callable_choice(callables, parameter, written.span)
+									.map(pure func(choice): { choice | parameter = written.parameter })
+							Checked.NamedCallable(id, arguments):
+								concrete_types(arguments, substitution, unions, written.span, records).map(pure func(values): {
+									parameter = written.parameter,
+									declaration = id,
+									arguments = values
+								})
+						match choice_result:
+							Ok(choice): choices = choices.append(choice)
+							Err(error):
+								failure = Some(error)
+								break
+					match failure:
+						Some(error): Err(error)
+						None:
+							find_instance(keys, {
+								declaration = declaration,
+								arguments = concrete,
+								callables = choices
+							}).to_result(invalid(call.span, "unexpanded function instance")).map(pure func(id): UserFunction(id))
 
 	target ?= target_result
 	Ok({
@@ -2281,12 +2400,13 @@ private pure func translate_record_field(
 	owner: RecordInstanceId,
 	constants: List[Checked.CheckedConstant],
 	substitution: List[TypeSubstitution[TypeRef]],
+	callables: List[KnownCallable],
 	keys: List[FunctionRequest],
 	unions: List[UnionInstance],
 	records: List[RecordInstance],
 ) -> Result[ConcreteRecordField, Diagnostic]:
 	id ?= translate_field(field.field, owner, records, field.span)
-	child ?= translate_expr(field.value, constants, substitution, keys, unions, records)
+	child ?= translate_expr(field.value, constants, substitution, callables, keys, unions, records)
 	Ok({ field = id, value = child, span = field.span })
 
 
@@ -2295,6 +2415,7 @@ private pure func translate_record_fields(
 	owner: RecordInstanceId,
 	constants: List[Checked.CheckedConstant],
 	substitution: List[TypeSubstitution[TypeRef]],
+	callables: List[KnownCallable],
 	keys: List[FunctionRequest],
 	unions: List[UnionInstance],
 	records: List[RecordInstance],
@@ -2303,7 +2424,7 @@ private pure func translate_record_fields(
 	var failure: Option[Diagnostic] = None
 
 	for field in fields:
-		match translate_record_field(field, owner, constants, substitution, keys, unions, records):
+		match translate_record_field(field, owner, constants, substitution, callables, keys, unions, records):
 			Ok(concrete):
 				translated = translated.append(concrete)
 			Err(error):
@@ -2323,13 +2444,14 @@ private pure func translate_expr(
 	value: Checked.CheckedExpr,
 	constants: List[Checked.CheckedConstant],
 	substitution: List[TypeSubstitution[TypeRef]],
+	callables: List[KnownCallable],
 	keys: List[FunctionRequest],
 	unions: List[UnionInstance],
 	records: List[RecordInstance],
 ) -> Result[ConcreteExpr, Diagnostic]:
 	match value.form:
 		Checked.ReadRecordField(receiver, field):
-			match translate_expr(receiver, constants, substitution, keys, unions, records):
+			match translate_expr(receiver, constants, substitution, callables, keys, unions, records):
 				Ok(source):
 					-- The receiver's translated type already names its record instance.
 					match source.value_type:
@@ -2345,9 +2467,9 @@ private pure func translate_expr(
 		Checked.InvokeFunction(call, arguments):
 			match concrete_type(value.value_type, substitution, unions, call.span, records):
 				Ok(value_type):
-					match translate_call(call, substitution, keys, unions, records, value_type):
+					match translate_call(call, substitution, callables, keys, unions, records, value_type):
 						Ok(concrete):
-							match translate_exprs(arguments, constants, substitution, keys, unions, records):
+							match translate_exprs(arguments, constants, substitution, callables, keys, unions, records):
 								Ok(values): Ok({ form = InvokeFunction(concrete, values), value_type = value_type, span = value.span })
 								Err(error): Err(error)
 						Err(error): Err(error)
@@ -2355,9 +2477,9 @@ private pure func translate_expr(
 		Checked.UpdateRecord(declaration, update):
 			match record_instance(declaration, value, substitution, unions, records):
 				Ok(owner):
-					match translate_expr(update.base, constants, substitution, keys, unions, records):
+					match translate_expr(update.base, constants, substitution, callables, keys, unions, records):
 						Ok(base):
-							match translate_record_fields(update.replacements, owner, constants, substitution, keys, unions, records):
+							match translate_record_fields(update.replacements, owner, constants, substitution, callables, keys, unions, records):
 								Ok(replacements):
 									inherited_result: Result[List[RetainedRecordField], Diagnostic] = translated_list(update.inherited, pure func(field: Checked.RetainedRecordField) -> Result[RetainedRecordField, Diagnostic]:
 										match translate_field(field.field, owner, records, update.base_expression_span):
@@ -2382,7 +2504,7 @@ private pure func translate_expr(
 						Ok(owner):
 							match translate_variant(id, owner, unions, value.span):
 								Ok(variant):
-									match translate_exprs(children, constants, substitution, keys, unions, records):
+									match translate_exprs(children, constants, substitution, callables, keys, unions, records):
 										Ok(values): Ok({ form = ConstructVariant(variant, values), value_type = value_type, span = value.span })
 										Err(error): Err(error)
 								Err(error): Err(error)
@@ -2391,21 +2513,21 @@ private pure func translate_expr(
 		Checked.ConstructRecord(declaration, fields):
 			match record_instance(declaration, value, substitution, unions, records):
 				Ok(owner):
-					match translate_record_fields(fields, owner, constants, substitution, keys, unions, records):
+					match translate_record_fields(fields, owner, constants, substitution, callables, keys, unions, records):
 						Ok(concrete): Ok({ form = ConstructRecord(owner, concrete), value_type = RecordType(owner), span = value.span })
 						Err(error): Err(error)
 				Err(error): Err(error)
 		Checked.ConstructList(elements):
 			match concrete_type(value.value_type, substitution, unions, value.span, records):
 				Ok(value_type):
-					match translate_exprs(elements, constants, substitution, keys, unions, records):
+					match translate_exprs(elements, constants, substitution, callables, keys, unions, records):
 						Ok(values): Ok({ form = ConstructList(values), value_type = value_type, span = value.span })
 						Err(error): Err(error)
 				Err(error): Err(error)
 		Checked.Match(join):
 			match concrete_type(value.value_type, substitution, unions, value.span, records):
 				Ok(value_type):
-					match translate_join(join, constants, substitution, keys, unions, records, value.span):
+					match translate_join(join, constants, substitution, callables, keys, unions, records, value.span):
 						Ok(concrete): Ok({ form = Match(concrete), value_type = value_type, span = value.span })
 						Err(error): Err(error)
 				Err(error): Err(error)
@@ -2446,6 +2568,7 @@ private pure func translate_exprs(
 	values: List[Checked.CheckedExpr],
 	constants: List[Checked.CheckedConstant],
 	substitution: List[TypeSubstitution[TypeRef]],
+	callables: List[KnownCallable],
 	keys: List[FunctionRequest],
 	unions: List[UnionInstance],
 	records: List[RecordInstance],
@@ -2454,7 +2577,7 @@ private pure func translate_exprs(
 	var failure: Option[Diagnostic] = None
 
 	for value in values:
-		match translate_expr(value, constants, substitution, keys, unions, records):
+		match translate_expr(value, constants, substitution, callables, keys, unions, records):
 			Ok(concrete):
 				translated = translated.append(concrete)
 			Err(error):
@@ -2472,6 +2595,7 @@ private pure func translate_statements(
 	statements: List[Checked.CheckedStatement],
 	constants: List[Checked.CheckedConstant],
 	substitution: List[TypeSubstitution[TypeRef]],
+	callables: List[KnownCallable],
 	keys: List[FunctionRequest],
 	unions: List[UnionInstance],
 	records: List[RecordInstance],
@@ -2481,15 +2605,15 @@ private pure func translate_statements(
 	) -> Result[ConcreteStatement, Diagnostic]:
 		match statement:
 			Checked.InitializeBinding(id, value):
-				match translate_expr(value, constants, substitution, keys, unions, records):
+				match translate_expr(value, constants, substitution, callables, keys, unions, records):
 					Ok(translated_value): Ok(InitializeBinding(id, translated_value))
 					Err(error): Err(error)
 			Checked.DiscardExpression(value):
-				match translate_expr(value, constants, substitution, keys, unions, records):
+				match translate_expr(value, constants, substitution, callables, keys, unions, records):
 					Ok(translated_value): Ok(DiscardExpression(translated_value))
 					Err(error): Err(error)
 			Checked.ReassignBinding(id, value):
-				match translate_expr(value, constants, substitution, keys, unions, records):
+				match translate_expr(value, constants, substitution, callables, keys, unions, records):
 					Ok(translated_value): Ok(ReassignBinding(id, translated_value))
 					Err(error): Err(error)
 	)
@@ -2515,18 +2639,19 @@ private pure func translate_join(
 	join: Checked.CheckedJoin,
 	constants: List[Checked.CheckedConstant],
 	substitution: List[TypeSubstitution[TypeRef]],
+	callables: List[KnownCallable],
 	keys: List[FunctionRequest],
 	unions: List[UnionInstance],
 	records: List[RecordInstance],
 	span: Span,
 ) -> Result[ConcreteJoin, Diagnostic]:
-	scrutinee ?= translate_expr(join.scrutinee, constants, substitution, keys, unions, records)
+	scrutinee ?= translate_expr(join.scrutinee, constants, substitution, callables, keys, unions, records)
 	union_type ?= concrete_type(join.union_type, substitution, unions, span, records)
 	owner ?= concrete_union_owner(union_type, span)
 	var arms: List[ConcreteJoinArm] = []
 	var failure: Option[Diagnostic] = None
 	for arm in join.arms:
-		match translate_join_arm(arm, owner, constants, substitution, keys, unions, records, span):
+		match translate_join_arm(arm, owner, constants, substitution, callables, keys, unions, records, span):
 			Err(error):
 				failure = Some(error)
 				break
@@ -2542,14 +2667,15 @@ private pure func translate_join_arm(
 	owner: UnionInstanceId,
 	constants: List[Checked.CheckedConstant],
 	substitution: List[TypeSubstitution[TypeRef]],
+	callables: List[KnownCallable],
 	keys: List[FunctionRequest],
 	unions: List[UnionInstance],
 	records: List[RecordInstance],
 	span: Span,
 ) -> Result[ConcreteJoinArm, Diagnostic]:
 	pattern ?= translate_pattern(arm.pattern, owner, span, unions)
-	statements ?= translate_statements(arm.statements, constants, substitution, keys, unions, records)
-	value ?= translate_expr(arm.value, constants, substitution, keys, unions, records)
+	statements ?= translate_statements(arm.statements, constants, substitution, callables, keys, unions, records)
+	value ?= translate_expr(arm.value, constants, substitution, callables, keys, unions, records)
 	Ok({ pattern = pattern, statements = statements, value = value })
 
 
@@ -2557,17 +2683,18 @@ private pure func translate_exit(
 	exit: Checked.CheckedExit,
 	constants: List[Checked.CheckedConstant],
 	substitution: List[TypeSubstitution[TypeRef]],
+	callables: List[KnownCallable],
 	keys: List[FunctionRequest],
 	unions: List[UnionInstance],
 	records: List[RecordInstance],
 ) -> Result[ConcreteExit, Diagnostic]:
 	match exit:
 		Checked.ReturnExpression(value):
-			match translate_expr(value, constants, substitution, keys, unions, records):
+			match translate_expr(value, constants, substitution, callables, keys, unions, records):
 				Ok(concrete): Ok(ReturnExpression(concrete))
 				Err(error): Err(error)
 		Checked.RecurWith(arguments, span):
-			match translate_exprs(arguments, constants, substitution, keys, unions, records):
+			match translate_exprs(arguments, constants, substitution, callables, keys, unions, records):
 				Ok(concrete): Ok(RecurWith(concrete, span))
 				Err(error): Err(error)
 
@@ -2584,7 +2711,11 @@ private pure func translate_function(
 	substitution ?= instance_substitution(function.signature, key, span)
 
 	parameters ?= translated_list(
-		function.signature.parameters,
+		function.signature.parameters.filter(pure func(parameter):
+			match parameter.value_type:
+				Checked.PureCallableType(_, _): False
+				_: True
+		),
 		pure func(
 			value: Checked.TypeUse,
 		) -> Result[TypeRef, Diagnostic]: concrete_type(
@@ -2616,15 +2747,15 @@ private pure func translate_function(
 				})
 			Err(error): Err(error)
 	)
-	statements ?= translate_statements(function.statements, constants, substitution, keys, unions, records)
+	statements ?= translate_statements(function.statements, constants, substitution, key.callables, keys, unions, records)
 
 	body_result: Result[ConcreteBody, Diagnostic] = match function.body:
 		Checked.CheckedValueBody(value):
-			match translate_exit(value, constants, substitution, keys, unions, records):
+			match translate_exit(value, constants, substitution, key.callables, keys, unions, records):
 				Ok(concrete): Ok(ConcreteValueBody(concrete))
 				Err(error): Err(error)
 		Checked.CheckedMatchBody(matched):
-			match translate_expr(matched.scrutinee, constants, substitution, keys, unions, records):
+			match translate_expr(matched.scrutinee, constants, substitution, key.callables, keys, unions, records):
 				Ok(scrutinee):
 					match concrete_type(matched.union_type, substitution, unions, span, records):
 						Ok(union_type):
@@ -2639,12 +2770,13 @@ private pure func translate_function(
 													arm.statements,
 													constants,
 													substitution,
+													key.callables,
 													keys,
 													unions,
 													records,
 												):
 													Ok(arm_statements):
-														match translate_exit(arm.body, constants, substitution, keys, unions, records):
+														match translate_exit(arm.body, constants, substitution, key.callables, keys, unions, records):
 															Ok(body):
 																Ok({
 																	pattern = pattern,
@@ -2689,7 +2821,8 @@ pure func specialize(program: CheckedProgram) -> Result[SpecializedProgram, Diag
 			{
 				key = {
 					declaration = entry_function(checked.entrypoint),
-					arguments = []
+					arguments = [],
+					callables = []
 				},
 				source = EntrypointRoot
 			},
@@ -2730,7 +2863,8 @@ pure func specialize(program: CheckedProgram) -> Result[SpecializedProgram, Diag
 		prepared.functions,
 		{
 			declaration = entry_function(checked.entrypoint),
-			arguments = []
+			arguments = [],
+			callables = []
 		},
 	).to_result(
 		invalid(

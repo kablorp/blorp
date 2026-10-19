@@ -1,11 +1,11 @@
 import:
-	./errors: BindingSite, CheckError, BindingError(ModuleBindingConflict, LocalBindingConflict), binding_error
-	./model: BindingDefinition, BindingId
+	./errors: BindingSite, CheckError, BindingError(ModuleBindingConflict, LocalBindingConflict, CallableBindingConflict), binding_error
+	./model: BindingDefinition, BindingId, CallableParameterId, TypeRef, TypeUse
 	../namespace/namespace: Namespace, value_binding
 	../utils/ids: FunctionId
 	../utils/names: NameId, same_name
 	../utils/source: ModuleId
-	../utils/syntax: WrittenName
+	../utils/syntax: Span, WrittenName
 
 
 -- Only bind_local publishes a binding; later readers receive accepted facts.
@@ -19,11 +19,19 @@ private fixed record ScopedBinding {
 }
 
 
-pure func lookup_binding(scope: List[LocalBinding], name: NameId) -> Option[LocalBinding]:
-	var found: Option[LocalBinding] = None
+fixed union ScopedValue:
+	DataLocal(LocalBinding)
+	CallableLocal(CallableBinding)
+
+
+pure func lookup_binding(scope: List[ScopedValue], name: NameId) -> Option[ScopedValue]:
+	var found: Option[ScopedValue] = None
 
 	for binding in scope:
-		if same_name(from_opaque LocalBinding(binding).name, name):
+		binding_name = match binding:
+			DataLocal(data): from_opaque LocalBinding(data).name
+			CallableLocal(callable): callable_binding_name(callable).id
+		if same_name(binding_name, name):
 			found = Some(binding)
 			break
 
@@ -49,12 +57,81 @@ pure func binding_site(function: FunctionId, binding: LocalBinding) -> BindingSi
 
 
 pure func bind_local(
-	scope: List[LocalBinding], namespace: Namespace, module: ModuleId,
+	scope: List[ScopedValue], namespace: Namespace, module: ModuleId,
 	function: FunctionId, name: WrittenName, id: BindingId, definition: BindingDefinition,
-) -> Result[LocalBinding, CheckError]:
+) -> Result[ScopedValue, CheckError]:
 	match value_binding(namespace, module, name.id):
 		Some(previous): Err(binding_error(name.span, ModuleBindingConflict(previous)))
 		None:
 			match lookup_binding(scope, name.id):
-				Some(previous): Err(binding_error(name.span, LocalBindingConflict(binding_site(function, previous), binding_definition(previous).origin)))
-				None: Ok(into_opaque LocalBinding({ name = name.id, id = id, definition = definition }))
+				Some(DataLocal(previous)):
+					Err(binding_error(name.span, LocalBindingConflict(
+						binding_site(function, previous), binding_definition(previous).origin,
+					)))
+				Some(CallableLocal(previous)):
+					Err(binding_error(name.span, CallableBindingConflict(
+						callable_binding_id(previous), callable_binding_name(previous).span,
+					)))
+				None:
+					Ok(DataLocal(into_opaque LocalBinding({
+						name = name.id,
+						id = id,
+						definition = definition
+					})))
+
+
+pure func bind_callable(
+	scope: List[ScopedValue],
+	namespace: Namespace,
+	module: ModuleId,
+	function: FunctionId,
+	name: WrittenName,
+	id: CallableParameterId,
+	parameters: List[TypeRef],
+	result: TypeRef,
+	annotation: Span,
+) -> Result[ScopedValue, CheckError]:
+	match value_binding(namespace, module, name.id):
+		Some(previous): Err(binding_error(name.span, ModuleBindingConflict(previous)))
+		None:
+			match lookup_binding(scope, name.id):
+				Some(DataLocal(previous)):
+					Err(binding_error(name.span, LocalBindingConflict(
+						binding_site(function, previous), binding_definition(previous).origin,
+					)))
+				Some(CallableLocal(previous)):
+					Err(binding_error(name.span, CallableBindingConflict(
+						callable_binding_id(previous), callable_binding_name(previous).span,
+					)))
+				None:
+					Ok(CallableLocal(into_opaque CallableBinding({
+						name = name,
+						id = id,
+						parameters = parameters.map(pure func(value): { value_type = value, span = annotation }),
+						return_type = { value_type = result, span = annotation }
+					})))
+
+
+private fixed record ScopedCallable {
+	name: WrittenName,
+	id: CallableParameterId,
+	parameters: List[TypeUse],
+	return_type: TypeUse
+}
+opaque type CallableBinding = ScopedCallable
+
+
+pure func callable_binding_id(binding: CallableBinding) -> CallableParameterId:
+	from_opaque CallableBinding(binding).id
+
+
+pure func callable_binding_name(binding: CallableBinding) -> WrittenName:
+	from_opaque CallableBinding(binding).name
+
+
+pure func callable_parameters(binding: CallableBinding) -> List[TypeUse]:
+	from_opaque CallableBinding(binding).parameters
+
+
+pure func callable_return_type(binding: CallableBinding) -> TypeUse:
+	from_opaque CallableBinding(binding).return_type

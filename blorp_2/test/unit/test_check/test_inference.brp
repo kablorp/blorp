@@ -1,13 +1,14 @@
 import:
 	../../../src/utils/names: program_names
 	../../../src/utils/ids as Declaration
-	../../../src/utils/source: module_source, root_module_id
+	../../../src/utils/source: module_source, root_module_id, same_source
 	../../../src/check/check: check, checked_functions
 	../../../src/check/errors as Errors
 	../../../src/check/model as Checker
+	../../../src/check/inference as Inference
 	../../../src/lex/lex: lex
 	../../../src/utils/text: concat
-	../input: check_failure, parse, check_modules_failure
+	../input: check_failure, parse, check_modules_failure, checked_source
 	int as IntOps
 	../module_input: PRIMITIVE_BASE, INTEGER_OPERATIONS
 	test: TestSuite
@@ -92,7 +93,7 @@ private pure func inferred_arguments(source: String) -> Option[List[Checker.Type
 									match value.form:
 										Checker.InvokeFunction(call, _):
 											match call.target:
-												Checker.UserFunction(id, arguments):
+												Checker.UserFunction(id, arguments, []):
 													if IntOps.equals(
 														Declaration.function_number(id),
 														0,
@@ -322,9 +323,49 @@ pure func test_missing_slot_still_precedes_an_ordinary_mismatch() -> Bool:
 			False
 
 
+pure func test_callable_readiness_stops_at_the_first_incomplete_child() -> Bool:
+	source: String =
+		|pure func identity[T](value: T) -> T:
+		|    value
+		|func main() -> Int:
+		|    0
+		|
+	match checked_source(source):
+		Err(_): False
+		Ok(program):
+			match checked_functions(program).functions:
+				[generic, _]:
+					match generic.signature.type_parameters:
+						[parameter]:
+							site = generic.signature.return_type.span
+							unbound = Inference.inference_type(Checker.ParameterType(parameter), [parameter], 0)
+							invalid = Inference.inference_type(Checker.ParameterType(parameter), [parameter], 1)
+							slots = [{ parameter = parameter, call_span = site, first_argument = None,
+								state = Inference.UnboundVariable(0) }]
+							first_incomplete = match Inference.inference_complete(Inference.InferredCallable([unbound], invalid), slots, site):
+								Ok(False): True
+								_: False
+							first_error = match Inference.inference_complete(
+								Inference.InferredCallable([Inference.AcceptedType(Checker.IntType)], invalid), slots, site,
+							):
+								Err(error):
+									match error.kind:
+										Errors.InternalInvariant(Errors.InvalidInferenceVariable(1)):
+											(
+												same_source(error.span.source, site.source)
+												and error.span.start == site.start and error.span.end == site.end
+											)
+										_: False
+								_: False
+							first_incomplete and first_error
+						_: False
+				_: False
+
+
 tests: TestSuite = {
 	description = "Inference collection contracts",
 	tests = [
+		("callable readiness preserves first incomplete child and error order", test_callable_readiness_stops_at_the_first_incomplete_child),
 		(
 			"sixteen structural constraints infer one complete argument",
 			test_sixteen_structural_constraints_infer_one_complete_argument,

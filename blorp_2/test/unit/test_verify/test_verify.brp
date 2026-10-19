@@ -1,6 +1,6 @@
 import:
 	../../../src/lower/lower: MatchLabel(DefaultLabel, VariantLabel), ValueId, ValueOperation(ConstructValue)
-	../../../src/own/own:
+	../../../src/own/own as Own:
 		BorrowSource(ParameterBorrow, OwnerBorrow),
 		OwnedArgument(UnmanagedArgument, BorrowedArgument),
 		OwnedArm,
@@ -22,10 +22,12 @@ import:
 	../../../src/specialize/specialize:
 		CallTarget(RuntimeFunction, UserFunction),
 		TypeRef(IntType, StringType, UnionType),
+		function_number,
 		UnionRepresentation(InlineUnmanaged),
 		specialize,
 	../../../src/utils/syntax: FunctionExecution(OrdinaryCalls), same_span, Entrypoint(NoArguments), EntryResult(IntegerExitStatus), entry_function
 	../../../src/verify/verify: verify
+	../managed_union_inputs: lowered, NAMED_CALLBACK_SOURCE
 	../ownership_inputs: InputIds, function, input_ids, parameter, span
 	test: TestSuite
 
@@ -2045,9 +2047,47 @@ pure func test_verifier_rejects_missing_acquisition_in_insertion_output() -> Boo
 						_: False
 
 
+pure func test_named_managed_callback_product_verifies() -> Bool:
+	lowered(NAMED_CALLBACK_SOURCE).and_then(Own.own).and_then(verify).is_ok()
+
+
+pure func test_named_callback_verifier_requires_the_return_acquisition() -> Bool:
+	match lowered(NAMED_CALLBACK_SOURCE).and_then(Own.own):
+		Err(_): False
+		Ok(program):
+			match program.functions:
+				[main, identity, apply]:
+					match (main.operations, apply.operations, identity.operations):
+						([_, Own.DefineValue(main_call), ..._], [_, Own.DefineValue(callback)], [definition, Own.AcquireOwner(owner, _, _) ]):
+							selected = match (main_call.operation, callback.operation):
+								(Own.CallDefinition(main_target, [_]), Own.CallDefinition(callback_target, [_])):
+									match (main_target.target, callback_target.target):
+										(UserFunction(apply_id), UserFunction(identity_id)): function_number(apply_id) == 2 and function_number(identity_id) == 1
+										_: False
+								_: False
+							match (definition, identity.tail):
+								(Own.DefineValue(parameter), Own.ReturnTail(Own.ReturnResult(Own.OwnedReturn(_, returned)))):
+									-- Preserve issued IDs/transfer/spans; remove only the selected target's acquisition.
+									corrupt = { program | functions = [main, { identity | operations = [definition] }, apply] }
+									match verify(corrupt):
+										Err(error):
+											(
+												selected and Own.owner_number(owner) == 0 and Own.owner_number(returned) == 0
+												and error.message == "ownership verification failed: owner 0 is not defined"
+												and error.help == "report this compiler error with the input program"
+												and same_span(error.span, parameter.span) and error.note.is_none()
+											)
+										Ok(_): False
+								_: False
+						_: False
+				_: False
+
+
 tests: TestSuite = {
 	description = "Blorp 2 independent ownership verification",
 	tests = [
+		("named managed callback ownership product verifies", test_named_managed_callback_product_verifies),
+		("named callback acquisition fault is independently rejected", test_named_callback_verifier_requires_the_return_acquisition),
 		("corrupted insertion output requires acquisition", test_verifier_rejects_missing_acquisition_in_insertion_output),
 		(
 			"sibling value after current definition",
