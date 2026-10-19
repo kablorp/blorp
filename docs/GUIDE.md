@@ -469,6 +469,8 @@ unicode: String = "Hello \u{1F600}"   -- Unicode escape (1-6 hex digits)
 ```
 
 Strings are valid UTF-8 text stored as counted bytes, including embedded NUL.
+`string.equals(left, right)` compares the complete counted contents, like `==`;
+it is an ordinary pure function, also available through an explicit import and UFCS.
 Length and access indices count encoding bytes. Existing `get` represents one
 encoding byte as `Char`; it does not decode a scalar. Literal and escape syntax
 is unchanged by the integer-facing APIs below. Legacy host producers that can

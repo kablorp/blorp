@@ -325,6 +325,8 @@ is required between statements today, these are accepted as two statements
 Every string literal is one token. There are seven kinds.
 
 String values are valid UTF-8 text stored as counted bytes, including NUL.
+The ordinary `string.equals(String, String) -> Bool` API uses existing function-call
+and UFCS syntax; it compares counted contents, including bytes after NUL, like `==`.
 Literal and escape syntax is unchanged by the integer-facing APIs:
 `string.byte_at(String, Int) -> Option[Int]` reads an unsigned encoding byte,
 including continuation bytes, without decoding a scalar.
