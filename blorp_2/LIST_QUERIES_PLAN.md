@@ -86,7 +86,7 @@ needed for unchanged compiler/data model; existing independent HOST3% stays fixe
 
 ## Bounds and stop
 
-Production forecast13ADD/1DEL/+12; hard30ADD/+30, list only. Nonfixture tests hard250,
+Production forecast13ADD/1DEL/+12; hard30ADD/+30, list only. Nonfixture tests hard280,
 one fixture hard60lines, API docs hard30ADD (README/GUIDE/GRAMMAR, no syntax change).
 This plan hard100lines. Stop before forecast/cap breach, semantic/accounting/
 provenance failure or10%/absolute miss; retain5% misses, no cap edits or retries.
