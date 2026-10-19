@@ -2082,6 +2082,9 @@ diagnostic rendering are pure. The pipeline publishes these complete results:
    after target resolution. A user call carries its checked substitution in its
    target variant; a runtime call cannot carry one. Rigid type parameters have
    explicit function-, union- or record-declaration owners.
+   Scalar constant reads become ordinary checked literals at their existing lookup,
+   retaining each read's occurrence span. Constant identities and accepted rows remain
+   checker-local; the successful program carries neither references nor a constant table.
    Checking returns either the complete `CheckedProgram` or an opaque
    `CheckFailure` retaining the original parsed program and a nonempty
    `CheckErrors` collection. The current checker stops at the first error, so

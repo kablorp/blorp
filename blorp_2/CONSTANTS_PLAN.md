@@ -7,6 +7,12 @@ functions. M5a.2/M5b below are retained future designs, not active bootstrap
 prerequisites. Their measurements and budgets do not establish acceptance of
 the source migration.
 
+The current scalar path projects each accepted Int, Float or String read to an
+ordinary checked literal during checking, preserving its occurrence span.
+Declaration IDs and accepted constant rows remain checker-local; the successful
+program and specialization do not retain them. The aggregate/reference design
+below remains deferred and does not describe current scalar publication.
+
 Design reviewed by root and independent compiler experts. Its original baseline is main
 `e24ca0f251fa3a7b63990141c3352df8097848f8`, plus the accepted quality contracts.
 The old `blorp2/constants` tip `cc07e5f19` is a read-only design reference:
@@ -245,8 +251,9 @@ it is not a third feature slice or permission for broader constructor cleanup.
 1. **M5a.1:** scalar/String declarations, inventory/namespace/annotation authority,
    body reads, specialization projection, ordinary lower/ownership path, exact
    nonclosed errors. Goal +280 net production; hard +360 net / 440 added.
-   Body ReadConstant is needed here; do not publish unused initializer-reference
-   variants, dependency rows or DFS scaffolding until M5a.2 needs them.
+   Original M5a.1 used ReadConstant; the current scalar boundary publishes literals
+   during checking. Do not publish unused initializer-reference variants,
+   dependency rows or DFS scaffolding until M5a.2 needs them.
 2. **M5a.2:** semantics-preserving record admission preparation, closed records,
    forward/imported dependencies and cycle verification. Combined M5a goal
    +500 net production; hard +600 net / 750 added. Tests excluding fixtures are

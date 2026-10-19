@@ -1,10 +1,10 @@
 import:
 	../../../src/check/check: checked_functions
 	../../../src/check/model:
-		CheckedBody(CheckedValueBody), CheckedExit(ReturnExpression), CheckedExpr,
-		CheckedForm(ReadConstant), ClosedConstant(IntegerConstant, FloatConstant, StringConstant),
+		CheckedBody(CheckedValueBody), CheckedExit(ReturnExpression), CheckedStatement(InitializeBinding),
+		CheckedForm(LiteralInteger, LiteralFloat, LiteralString),
 		TypeRef(IntType, FloatType, StringType),
-	../../../src/utils/ids: ConstantId, constant_number
+	../../../src/utils/source: module_source, root_module_id, same_source
 	../input: checked_source
 	test: TestSuite
 
@@ -29,7 +29,7 @@ private FLOAT: String =
 
 
 private STRING: String =
-	|MESSAGE: String = "hello λ"
+	|MESSAGE: String = "hello λ\0"
 	|
 	|pure func message() -> String:
 	|    MESSAGE
@@ -39,23 +39,18 @@ private STRING: String =
 	|
 
 
-private pure func reads(value: CheckedExpr, id: ConstantId) -> Bool:
-	match value.form:
-		ReadConstant(actual): constant_number(actual) == constant_number(id)
-		_: False
-
-
 pure func test_integer_constant_read_has_its_annotated_type() -> Bool:
 	match checked_source(INTEGER):
 		Err(_): False
 		Ok(program):
-			facts = checked_functions(program)
-			match (facts.functions, facts.constants):
-				([main], [constant]):
+			match checked_functions(program).functions:
+				[main]:
 					match main.body:
 						CheckedValueBody(ReturnExpression(value)):
-							match (value.value_type, constant.value):
-								(IntType, IntegerConstant(23)): reads(value, constant.id)
+							match (value.value_type, value.form):
+								(IntType, LiteralInteger(23)):
+									(Some(value.span.start) == INTEGER.index_of("ANSWER\n") and value.span.end == value.span.start + 6
+										and same_source(value.span.source, module_source(root_module_id())))
 								_: False
 						_: False
 				_: False
@@ -65,13 +60,14 @@ pure func test_float_constant_read_has_its_annotated_type() -> Bool:
 	match checked_source(FLOAT):
 		Err(_): False
 		Ok(program):
-			facts = checked_functions(program)
-			match (facts.functions, facts.constants):
-				([answer, _], [constant]):
+			match checked_functions(program).functions:
+				[answer, _]:
 					match answer.body:
 						CheckedValueBody(ReturnExpression(value)):
-							match (value.value_type, constant.value):
-								(FloatType, FloatConstant(number)): number == 1.25 and reads(value, constant.id)
+							match (value.value_type, value.form):
+								(FloatType, LiteralFloat(number)):
+									(number == 1.25 and Some(value.span.start) == FLOAT.index_of("ANSWER\n") and value.span.end == value.span.start + 6
+										and same_source(value.span.source, module_source(root_module_id())))
 								_: False
 						_: False
 				_: False
@@ -81,13 +77,14 @@ pure func test_string_constant_read_has_its_annotated_type() -> Bool:
 	match checked_source(STRING):
 		Err(_): False
 		Ok(program):
-			facts = checked_functions(program)
-			match (facts.functions, facts.constants):
-				([message, _], [constant]):
+			match checked_functions(program).functions:
+				[message, _]:
 					match message.body:
 						CheckedValueBody(ReturnExpression(value)):
-							match (value.value_type, constant.value):
-								(StringType, StringConstant(text)): text == "hello λ" and reads(value, constant.id)
+							match (value.value_type, value.form):
+								(StringType, LiteralString(text)):
+									(text == "hello λ\0" and Some(value.span.start) == STRING.index_of("MESSAGE\n") and value.span.end == value.span.start + 7
+										and same_source(value.span.source, module_source(root_module_id())))
 								_: False
 						_: False
 				_: False
@@ -109,15 +106,42 @@ pure func test_raw_string_constant_preserves_c_fragment_bytes() -> Bool:
 	match checked_source(source):
 		Err(_): False
 		Ok(program):
-			facts = checked_functions(program)
-			match (facts.functions, facts.constants):
-				([fragment, _], [constant]):
+			match checked_functions(program).functions:
+				[fragment, _]:
 					match fragment.body:
 						CheckedValueBody(ReturnExpression(value)):
-							match (value.value_type, constant.value):
-								(StringType, StringConstant(text)):
+							match (value.value_type, value.form):
+								(StringType, LiteralString(text)):
 									-- Quoted expected bytes distinguish literal backslash-n from an LF.
-									text == "const char *message=\"a\\nb\";" and reads(value, constant.id)
+									(text == "const char *message=\"a\\nb\";" and Some(value.span.start) == source.index_of("RUNTIME\n")
+										and value.span.end == value.span.start + 7 and same_source(value.span.source, module_source(root_module_id())))
+								_: False
+						_: False
+				_: False
+
+
+pure func test_grouped_integer_endpoints_keep_inner_name_spans() -> Bool:
+	source: String =
+		|LOW: Int = -9223372036854775808
+		|HIGH: Int = 9223372036854775807
+		|func main() -> Int:
+		|    low = (LOW)
+		|    (HIGH)
+		|
+	match checked_source(source):
+		Err(_): False
+		Ok(program):
+			match checked_functions(program).functions:
+				[main]:
+					match (main.statements, main.body):
+						([InitializeBinding(_, low)], CheckedValueBody(ReturnExpression(high))):
+							match (low.value_type, low.form, high.value_type, high.form):
+								(IntType, LiteralInteger(minimum), IntType, LiteralInteger(maximum)):
+									-- Grouped leaves keep the inner base span; parentheses do not become the occurrence.
+									(minimum == -9223372036854775808 and maximum == 9223372036854775807
+										and Some(low.span.start) == source.index_of("LOW)") and low.span.end == low.span.start + 3
+										and Some(high.span.start) == source.index_of("HIGH)") and high.span.end == high.span.start + 4
+										and same_source(low.span.source, module_source(root_module_id())) and same_source(high.span.source, low.span.source))
 								_: False
 						_: False
 				_: False
@@ -130,5 +154,6 @@ tests: TestSuite = {
 		("Float constant read keeps annotated type", test_float_constant_read_has_its_annotated_type),
 		("String constant read keeps annotated type", test_string_constant_read_has_its_annotated_type),
 		("raw String constant preserves C fragment bytes", test_raw_string_constant_preserves_c_fragment_bytes),
+		("grouped Int endpoints keep inner name spans", test_grouped_integer_endpoints_keep_inner_name_spans),
 	]
 }
