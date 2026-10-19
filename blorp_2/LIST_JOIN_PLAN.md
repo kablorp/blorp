@@ -85,7 +85,7 @@ changes. These controls are not the13 compiler source calls' selfcompile proof.
 
 ## Bounds, stop and integration
 
-Prospective hard: production40ADD/+40, tests290ADD, one fixture60lines, API docs25ADD,
+Prospective hard: production40ADD/+40, tests295ADD, one fixture60lines, API docs25ADD,
 plan100lines. Stop on first10%/absolute breach, semantic/accounting/provenance/
 identity failure or prospective LOC overflow. Retain5%misses; no cap edits,
 resampling, B roll, benchmark omission or acceptance from identical C alone.
