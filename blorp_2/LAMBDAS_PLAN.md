@@ -218,11 +218,29 @@ Creation is not execution, and no new dependency graph framework is proposed.
 
 | Slice | Production ADD / net stop | Nonfixture tests ADD / net stop |
 | --- | ---: | ---: |
-| 1: noncapture inline + bounded blocks, full direct path | 700 / +550 | 700 / +700 |
+| 1: noncapture inline + bounded blocks, full direct path | 900 / +700 | 700 / +700 |
 | 2: immutable envs, forwarding, nesting and ordinal map | 825 / +650 | 950 / +950 |
 | Combined | 1,525 / +1,200 | 1,650 / +1,650 |
 
 These are hard implementation stops for the separately reviewed slices.
+The noncapturing production allowance was revised after an early checkpoint of
+401 additions / 97 deletions. Two code audits found necessary body identities
+and global row threading, with no large duplicate architecture. Required caller
+inference scheduling and completion were underestimated: complete scope is about
+806 additions / +610 net, with a plausible 760–865 range. Reassess at 765 gross
+or 595 net before further production; these are 85% of the revised phase stops.
+Phase maxima are not reserved or additive allowances: combined 1,525 / +1,200
+remains independently binding. At the 806 / +610 point, 719 / +590 remains.
+Captures forecast 565–745 / +430–580, so upper gross exceeds that remainder by
+26; complete fit is unproven. Before capture implementation, reforecast its
+complete path against the actual accepted noncapturing ledger, using the same
+physical-diff accounting boundary and accounting true overlap once. Stop if
+either the capture phase cap or remaining combined gross/net cannot fit. No
+automatic transfer, cap increase, scope reduction, coverage cut, compression or
+new solver is allowed. Mandatory test ports add 39 lines and remove 27 across
+six owners, preserving 19 callbacks; complete tests forecast 670, below 700.
+Original M7 B, 8% hard / 6% reassessment, fixture/API/report caps and all other
+acceptance obligations remain fixed. LOC feasibility does not imply cost acceptance.
 At 85% of either gross/net slice stop, review actual remaining work before more
 implementation. Owner forecast remains model/scope/errors/render180–240,
 expressions/inference420–520, bodies/publication180–240, recursion40–70,
