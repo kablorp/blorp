@@ -113,7 +113,7 @@ passed the audited toolchain's default limits through depth 256.
 | [M1b](#m1b-names-and-the-foundation) | Namespace: private, aliases, qualified names, designated `Bool`/`Option`/`Result` | Parts A and B done; control-flow consumers follow in M2/M3. |
 | [M5](#m5-constants) | Literal scalar/String constants | Implemented. Source construction functions replace the need for record/opaque constants and initializer dependencies. |
 | [M2](#m2-the-join) | Restricted control positions, outer-variable joins, Boolean operators, `?=` and annotations | M2.1 implemented; reviewed logical candidate preserved. General expression-control recut deferred. |
-| [M2b](#m2b-pattern-compilation) | Qualified flat heads and non-binding constructor groups | Not started. Nested/list/literal source-pattern migration has bounded decision gates. |
+| [M2b](#m2b-pattern-compilation) | Qualified flat heads and non-binding constructor groups | Qualified flat heads implemented; non-binding groups and source-pattern migration remain pending. |
 | [M3](#m3-loops-and-tail-recursion) | Managed List/while loops, explicit exits and existing scalar TCO | Not started. Source flat recursion/ranges become loops; broader managed TCO deferred. |
 | [M4](#m4-recursive-types) | Existing unary/mixed recursive shapes plus ordinary opaque semantics | Steps 1/2a and ordinary opaque semantics implemented. Actual source-product depth acceptance remains. No current source witness requires unlanded 2b/2c. |
 | [M6](#m6-library-and-shell) | First-order library parity, integer-facing String APIs and seven shell/path functions | String byte/scalar APIs and the bounded current-directory Result slice implemented and validated; source migration, remaining library and shell/path work pending. Target Char/Bytes are not planned prerequisites after source migration. |
@@ -1282,10 +1282,14 @@ Supporting-host compile-time leaks follow the
 
 - **Preparatory refactors** freeze a matched same-toolchain baseline, emit
   identical existing target C and stay within +3% allocations and minimum
-  retired instructions per frozen input. Source migrations also stay within
-  +3% cumulatively against the frozen reset source baseline, including the
-  host source-to-C proxy. A required native-host transition is measured
-  separately and both sources are rebuilt under one frozen measurement epoch.
+  retired instructions per frozen input. Remaining SOURCE migrations follow the
+  [dated fixed-baseline policy](BOOTSTRAP_SOURCE_PLAN.md#source-cost-acceptance):
+  root names accepted B and complete C before setup; each owned input and the
+  original construction-checkpoint proxy must independently pass +3% allocations
+  and normal min3 instructions. Historical R0 failures and cumulative trends
+  remain recorded; no baseline rolls after failure. A required native-host
+  transition is measured separately and both sources are rebuilt under one
+  frozen measurement epoch.
   A lowering preparation stops for design
   review above +50 production lines or a wider algorithmic change.
 - **Features** may change emitted C and increase costs: set numerical fixture
