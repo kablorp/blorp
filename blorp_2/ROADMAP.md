@@ -945,10 +945,11 @@ still proves real rebuilt-compiler output identity.
 
 ## M7: lambdas
 
-**Current direction, 2026-10-18.** The owner stopped the remaining callback-removal
-migration. Explicit pure callback types now parse; checking and callback execution
-remain separate future increments. The [Option/Result plan](OPTION_RESULT_PLAN.md)
-records current helper demand and the required named/capturing callable witnesses.
+**Current direction, 2026-10-19.** The owner stopped the remaining callback-removal
+migration. Pure callback types, named references, forwarding and direct-call
+specialization are implemented. The [lambda plan](LAMBDAS_PLAN.md) owns the
+noncapturing and immutable-capture increments; the [Option/Result plan](OPTION_RESULT_PLAN.md)
+records helper demand and the required callable witnesses.
 The source-removal work below is retained history.
 
 **Historical bootstrap decision.** Migrate the current 53 pure lambda literals, 64
@@ -999,7 +1000,7 @@ verified; frontier reaches emit.
 
 **Status.** Pure callback types, named references, callable parameter forwarding
 and direct-call specialization are implemented. Lambdas and immutable capture
-specialization remain unimplemented.
+specialization remain unimplemented, under [their bounded plan](LAMBDAS_PLAN.md).
 
 ## M8: the fixpoint gate
 

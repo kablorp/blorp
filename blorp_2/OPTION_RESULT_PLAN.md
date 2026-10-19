@@ -141,10 +141,10 @@ this slice alone does not clear the current self-compilation frontier.
 named pure references, forwarding and direct-call specialization. Lambdas and
 immutable captures follow under a separately reviewed increment.
 
-Parsing is complete; semantic function types, function values, invocation and
-lambda execution are not. Start with a small end-to-end generic `apply`
-witness using a named pure function, then one using an immutable managed
-capture. Validate the M7 representation and cost plan before implementation.
+Pure function types, named references, forwarding and direct-call specialization
+are implemented. [LAMBDAS_PLAN.md](LAMBDAS_PLAN.md) owns the separately reviewed
+noncapturing and immutable-capture increments, starting with ordinary generic
+`apply` witnesses. Its shared M7 baseline and cost limits remain unchanged.
 Known-callee specialization is the bounded starting hypothesis; prove that it
 handles these named references and lambdas before designing a general closure ABI.
 
