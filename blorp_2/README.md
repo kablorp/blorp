@@ -1820,6 +1820,11 @@ records the entrypoint contract, ownership checks, native tests and matched cost
 `int` exposes concrete `add`, `subtract`, `multiply`, `divide`, `remainder`
 and `to_string`, plus `equals(Int, Int) -> Bool`. Equality uses the complete
 signed 64-bit values and ordinary explicitly bound Bool constructors.
+`less_than` uses signed64 ordering; `greater_than`, `less_than_or_equal`,
+`greater_than_or_equal`, `not_equals`, `min` and `max` are ordinary pure functions
+over that primitive or equality. Equal operands satisfy both inclusive relations.
+`INT_MIN` and `INT_MAX` are ordinary imported scalar constants with values
+`-9223372036854775808` and `9223372036854775807`; comparisons never subtract.
 The first three arithmetic operations wrap at Int64 bounds. Division and remainder
 return zero for a zero divisor; minimum Int divided by -1 wraps to minimum,
 with zero remainder. These operations avoid signed C overflow.
@@ -1843,7 +1848,7 @@ intact and fail strict numeric validation.
 
 Runtime declarations name only their operation, for example
 `builtin("string.parse_int")`. Its contract returns the foundation's designated
-`Option[Int]`, and `int.equals` and `string.equals` return the designated
+`Option[Int]`, and `int.equals`, `int.less_than` and `string.equals` return the designated
 `Bool`; checking accepts the exact result type, arity and purity once.
 Specialization translates the designated constructors to the result instance's
 constructor identities, and emission receives those directly. The verifier

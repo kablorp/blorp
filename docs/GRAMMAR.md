@@ -44,7 +44,8 @@ modules receive the base alone. Explicit and implicit exposures of the same
 function are idempotent; different applicable functions remain ambiguous.
 Closed runtime bodies name one operation, as in `builtin("string.parse_int")`,
 which returns the foundation's designated `Option[Int]`; `builtin("int.equals")`
-requires two Int parameters and returns the designated `Bool`. The foundation
+and `builtin("int.less_than")` require pure nongeneric two-Int declarations
+returning the designated `Bool`. Ordering uses signed64 values. The foundation
 check designates Bool, Option and Result once, by name in `_base.brp`.
 Constructors of other imported types require explicit selection. Wildcards
 and function reexports remain unsupported.

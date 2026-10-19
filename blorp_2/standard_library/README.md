@@ -17,11 +17,14 @@ The library root contains two designated foundation modules:
   modules receive its selections, and it cannot be imported explicitly.
 
 Library modules receive nothing implicitly. Each one imports what it uses,
-including base types, for example `_base: Int, Bool` in `int.brp`.
+including base types, for example `_base: Int, Bool(True, False)` in `int.brp`.
 They import only other library modules and `_base`, never user modules.
 
 For example, `42.add(1).to_string().length()` needs no imports. Direct calls
 still require named imports such as `int: add`. IO remains explicit.
+Int ordering uses one signed64 `less_than` builtin; the other relations,
+`not_equals`, `min` and `max` are ordinary pure functions. Imported `INT_MIN`
+and `INT_MAX` are closed scalar literals, with no runtime global storage.
 The [imports design](../IMPORTS_AND_PRELUDE_PLAN.md) defines the full rules.
 
 `system.brp` records its accepted upstream revision and source SHA256.

@@ -1,3 +1,5 @@
+Current authority: the [approved status and bounded resource limits](#current-approved-status-and-bounded-resource-limits) below supersede the historical draft status, scope and ceilings where explicitly stated. The original reviewed text is retained; its pending-review statements do not reopen completed work.
+
 Publication provenance: root and the independent qualified compiler reviewer
 approved draft `1af2fc88bddfe872c92fb1ebea04d8c6e2ba82c51e68aefd0ffd46edfb09835b`
 with zero findings. Implementation worktree base is accepted
@@ -281,3 +283,89 @@ work. Never transplant whole old functions. Root owns integration, review
 assignments, lane and final gates.
 Return exact branch/diff/LOC, RED/GREEN/mutation receipts, C review, cost verdicts
 and limitations. No production commit/push until validation and both reviews.
+
+## Current approved status and bounded resource limits
+
+The human approved this exact bounded update on 2026-10-19 after two independent reviews. The retained [approval data](../build/bootstrap-evidence/int-ordering-approved-budget-2026-10-19-01/APPROVED_PROPOSAL.json) has SHA256 `50e270dbe3e3c97eabd106f1f59f2360126771768b33464601ad9f061c45ba45`; its [authorization clarification](../build/bootstrap-evidence/int-ordering-approved-budget-2026-10-19-01/PROPOSAL_CLARIFIED.md) has SHA256 `e0f074f0ade180d54a4e9624cf27346fdd5a75796dcc3e9c4ec2a5776f6937db`. Approval authorizes the listed cap and plan edits and required final validation without another permission question. Root still schedules the serial compiled lane.
+
+Implementation is complete: one closed signed64 `IntLessThan` primitive uses the designated Bool; greater-than, both inclusive relations, inequality, minimum and maximum are ordinary functions; both Int bounds are scalar literals. The original fixed-e706 correctness protocol completed all 19 calls. Its original cost failures and raw evidence remain unchanged. The accepted-main `cd823cc4c9583b3dadbf8142073a01895a90bb18` composition has passed 3,598 unit/runtime/grammar callbacks and generated one C file with normal and diagnostic O0 links. Final current-composition native call 5 ran once after both independent APPROVE0 reviews and root START: exit 0, empty stderr, 633 named native callbacks and all four direct real-main checks passed; all 406 positive required cost counters stayed within the approved limits.
+
+The completed gate used the existing maintained entrypoint and fresh source-matched compiler artifacts. All 1,131 printed callbacks passed, covering 47 owners, 497 outer callbacks and 402 nested native suites. The [final report](../benchmarks/results/blorp_2_int_comparisons_2026-10-19.md) binds both receipts, source and binary hashes, the original cost evidence and the acceptance limits. No source pilot, baseline roll, new paired cost sample, replay of the original 19-call protocol or test exclusion occurred. Root owns final publication review and integration; current-main SOURCE frontier and +3% proxy acceptance are not established by the retained original FEATURE measurements.
+
+### Exact original-control exception
+
+The fixed B remains `e706b393d51038ba49af720999d308fd95ce4ea9`. Only the nine original unchanged inputs and their frozen measurement roles receive these finite ceilings. Allocation ceilings are `min(floor(1.40 * B), B + 4200)`; normal-min3 instruction ceilings are `min(floor(1.15 * B), B + 5600000)`. These are count limits for this feature, not global percentage allowances or a new baseline.
+
+| Original input | Approved allocation ceiling | Approved normal-min3 instruction ceiling |
+| --- | ---: | ---: |
+| `call/one.brp` | 14,877 | 43,985,285 |
+| `ufcs/chain_64.brp` | 25,562 | 59,049,209 |
+| `generic/named/managed.brp` | 28,421 | 62,273,135 |
+| `option_input/parse_int.brp` | 16,419 | 46,517,780 |
+| `file_read/ownership.brp` | 20,923 | 53,387,091 |
+| `file_write/ownership.brp` | 26,692 | 62,039,187 |
+| `calculator/integer.brp` | 47,872 | 87,791,982 |
+| `constant/integer.brp` | 14,604 | 43,654,165 |
+| `int/equals.brp` | 24,515 | 56,771,586 |
+
+All nine original +5% review-target misses in both measures remain reported; the eight allocation and six instruction +10% hard failures remain historical FAILs. Approval permits a separate acceptance decision under these explicit amended ceilings; no old receipt becomes green. The HOST construction proxy retains its existing +5% review/+10% hard limits and schema1 allocation definition. SOURCE +3%, all independent feature/source limits, the original corpus and producer/metric roles remain unchanged.
+
+### Exact native cap changes
+
+Only these 45 allocation fields change. Each new value is the frozen maximum over that definition’s affected roots plus 100, rounded up to a multiple of 100, leaving 100–199 allocations above the frozen maximum. Independent definitions stay independent even when their values match.
+
+| Definition | Old allocations | Approved allocations |
+| --- | ---: | ---: |
+| `test_imports.brp::DIRECT_CHAIN_LIMITS` | 83,000 | 84,600 |
+| `test_imports.brp::FLAT_LIMITS` | 31,000 | 34,100 |
+| `test_join.brp::limits(...) for bound_int` | 16,677 | 20,000 |
+| `test_join.brp::limits(...) for bound_managed` | 15,550 | 19,300 |
+| `test_join.brp::limits(...) for deep` | 30,133 | 31,100 |
+| `test_join.brp::limits(...) for nested` | 19,876 | 22,600 |
+| `test_join.brp::limits(...) for statement` | 15,652 | 19,400 |
+| `test_join.brp::limits(...) for tail_arm` | 16,555 | 20,200 |
+| `test_join.brp::limits(...) for void_tail` | 15,573 | 19,500 |
+| `test_lists.brp::APPEND_ENTRY_LIMITS` | 21,800 | 25,700 |
+| `test_lists.brp::APPEND_INT_LIMITS` | 21,300 | 24,000 |
+| `test_lists.brp::APPEND_POINT_LIMITS` | 24,400 | 28,000 |
+| `test_lists.brp::CHECKED_SET_LIMITS` | 45,000 | 47,000 |
+| `test_lists.brp::CONCAT_ENTRY_LIMITS` | 23,700 | 27,200 |
+| `test_lists.brp::CONCAT_INT_LIMITS` | 21,600 | 25,600 |
+| `test_lists.brp::CONCAT_POINT_LIMITS` | 25,100 | 28,700 |
+| `test_lists.brp::ENTRY_LIMITS` | 21,500 | 24,300 |
+| `test_lists.brp::LITERAL_CALL_LIMITS` | 19,300 | 22,700 |
+| `test_lists.brp::LITERAL_EMPTY_LIMITS` | 17,000 | 20,700 |
+| `test_lists.brp::LITERAL_ENTRY_LIMITS` | 20,400 | 23,700 |
+| `test_lists.brp::LITERAL_INT_LIMITS` | 16,800 | 20,600 |
+| `test_lists.brp::LITERAL_NESTED_LIMITS` | 19,700 | 22,900 |
+| `test_lists.brp::LITERAL_POINT_LIMITS` | 17,000 | 20,900 |
+| `test_lists.brp::MORTAL_LIMITS` | 19,000 | 22,000 |
+| `test_lists.brp::NESTED_LIMITS` | 19,000 | 23,100 |
+| `test_lists.brp::PRESENCE_LIMITS` | 15,500 | 18,900 |
+| `test_lists.brp::SET_ENTRY_LIMITS` | 23,400 | 27,100 |
+| `test_lists.brp::SET_INT_LIMITS` | 23,100 | 26,900 |
+| `test_lists.brp::SET_POINT_LIMITS` | 23,800 | 27,600 |
+| `test_namespace.brp::LIMITS` | 19,000 | 22,300 |
+| `test_record_updates.brp::REORDER_LIMITS` | 24,000 | 25,800 |
+| `test_recursive_groups.brp::BRANCHES_LIMITS` | 19,900 | 22,900 |
+| `test_recursive_groups.brp::GROUP_LIMITS` | 20,500 | 23,600 |
+| `test_recursive_groups.brp::KINDS_LIMITS` | 20,600 | 23,500 |
+| `test_recursive_groups.brp::LINKED_LIMITS` | 17,700 | 21,100 |
+| `test_recursive_groups.brp::LINKS_LIMITS` | 19,400 | 22,400 |
+| `test_recursive_groups.brp::TREE_LIMITS` | 26,600 | 28,700 |
+| `test_recursive_unions.brp::DEEP_LIMITS` | 17,500 | 21,300 |
+| `test_recursive_unions.brp::DEPTH_LIMITS` | 14,300 | 18,300 |
+| `test_recursive_unions.brp::SHARED_LIMITS` | 16,600 | 20,200 |
+| `test_recursive_unions.brp::TRAIL_LIMITS` | 16,500 | 20,400 |
+| `test_string_literals.brp::UNREACHED_ESCAPES_LIMITS` | 14,700 | 17,600 |
+| `test_string_literals.brp::UNREACHED_LONG_LIMITS` | 11,600 | 14,900 |
+| `test_syntax.brp::LIMITS` | 13,000 | 16,800 |
+| `test_ufcs.brp::test_chain_64_native_and_cost: inline limits` | 24,000 | 25,600 |
+
+The sole instruction-field change is `test/e2e/test_syntax.brp::LIMITS.instructions`: 65,000,000 → 66,500,000. All other instruction fields are unchanged. The same syntax constant covers its five selected roots. The namespace allocation constant also covers three already passing roots; DEPTH_LIMITS covers two roots and PRESENCE_LIMITS three. The retained approval data enumerates every affected and passing root.
+
+The seven join allocation arguments change only at their listed call sites. The shared `limits` factory and its ten passing call sites remain unchanged. The numeric fixture keeps 45,000 allocations and 150,000,000 instructions. New annotation and qualified-pattern fixture limits, HOST/SOURCE limits, and every other native limit remain unchanged.
+
+The reviewed feature LOC ceilings remain 110 gross/+80 net production, 650 gross/+640 net nonfixture tests, one fixture/48 lines and 45 added public-documentation lines excluding this plan and the final evidence report. The feature remains 79 added/23 deleted production lines; the 46 cap-literal replacements add and delete 46 test lines without changing test logic or net LOC. Preserve readable formatting and all assertions.
+
+The compiler’s 41 source files, target library, harness, callbacks and fixture behavior are unchanged by this budget update. Reuse the already generated `9ab6dde0…` C and `02ecee8f…` normal / `ef9365be…` diagnostic binaries with their exact recorded hashes and modes. Preserve the original 1,026-input freeze, commands and first-four receipt; bind the approved test/doc hashes in a new overlay before final native execution. Any actual remaining cap failure stays FAIL and returns to root without an automatic increase or retry.

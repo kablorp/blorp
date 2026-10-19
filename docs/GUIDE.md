@@ -46,7 +46,11 @@ Option[String], retaining a successful child independently of its list, and
 `list.length` counts arguments including the executable name. String
 and Int equality return the library's ordinary Bool union. Concrete integer arithmetic
 supports wrapping add/subtract/multiply and safe divide/remainder. The
-[calculator fixtures](../blorp_2/test/e2e/fixtures/calculator/) exercise these
+pilot also provides signed Int `less_than`, `greater_than`, both inclusive
+relations, `not_equals`, `min`, `max` and imported scalar `INT_MIN`/`INT_MAX`.
+Ordering compares complete signed64 values without subtraction. The
+[calculator fixtures](../blorp_2/test/e2e/fixtures/calculator/) and
+[ordering fixture](../blorp_2/test/e2e/fixtures/int/comparisons.brp) exercise these
 through normal main entrypoints with explicit process arguments and exact
 stdout, stderr and exit status. Their parsing and evaluation are pure and return
 ordinary Result values; only the output boundary prints. List[String] is the

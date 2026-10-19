@@ -1,0 +1,97 @@
+import:
+	../../../src/check/check: check, check_errors, checked_functions
+	../../../src/check/errors as Errors
+	../../../src/check/model as Model
+	../../../src/check/render: render_failure
+	../../../src/namespace/builtins as Builtins
+	../../../src/utils/ids as Declaration
+	../../../src/utils/syntax: ParsedRuntimeOperation(IntegerLessThanBuiltin)
+	../int_comparison_inputs: checked_comparison
+	../module_input: TEST_BASE, parse_modules
+	test: TestSuite
+
+
+private pure func rejects_header(header: String) -> Bool:
+	source = header + "\n    builtin(\"int.less_than\")\nfunc main() -> Int:\n    0\n"
+	start = header.length() + "\n    builtin(".length()
+	match parse_modules([{ source = source, targets = [] }]):
+		Err(_): False
+		Ok(parsed):
+			match check(parsed):
+				Ok(_): False
+				Err(failure):
+					errors = check_errors(failure)
+					diagnostic = render_failure(failure)
+					match errors.first.kind:
+						Errors.BuiltinRejection(Errors.BuiltinContractMismatch(IntegerLessThanBuiltin)):
+							(errors.remaining.is_empty() and diagnostic.remaining.is_empty()
+								and diagnostic.first.message == "builtin declaration does not match its runtime contract"
+								and diagnostic.first.help == "declare a pure nongeneric function with two Int parameters returning Bool"
+								and errors.first.span.start == start and errors.first.span.end == start + 15
+								and diagnostic.first.span.start == start and diagnostic.first.span.end == start + 15
+								and diagnostic.first.note.is_none())
+						_: False
+
+
+pure func test_renamed_comparison_uses_the_designated_bool_owner() -> Bool:
+	match checked_comparison(TEST_BASE):
+		Err(_): False
+		Ok(program):
+			match checked_functions(program).functions:
+				[function, _]:
+					match (function.signature.return_type.value_type, function.body):
+						(Model.UnionType(owner), Model.CheckedValueBody(Model.ReturnExpression(value))):
+							match value.form:
+								Model.InvokeFunction(call, [left, right]):
+									match call.target:
+										Model.RuntimeFunction(Builtins.IntLessThan(boolean)):
+											(Declaration.union_number(Declaration.variant_owner(boolean.true_variant)) == Declaration.union_number(owner)
+												and Declaration.variant_number(boolean.true_variant) == 0
+												and Declaration.variant_number(boolean.false_variant) == 1
+												and Model.same_type(left.value_type, Model.IntType) and Model.same_type(right.value_type, Model.IntType))
+										_: False
+								_: False
+						_: False
+				_: False
+
+
+pure func test_missing_selected_API_reports_its_exact_name_span() -> Bool:
+	source: String =
+		|import:
+		|    int: less_than, greater_than
+		|func main() -> Int:
+		|    0
+		|
+	library: String =
+		|pure func equals(a: Int, b: Int) -> Bool:
+		|    builtin("int.equals")
+		|
+	match parse_modules([{ source = source, targets = [1] }, { source = library, targets = [] }]):
+		Err(_): False
+		Ok(parsed):
+			match check(parsed):
+				Ok(_): False
+				Err(failure):
+					errors = check_errors(failure)
+					diagnostic = render_failure(failure)
+					(errors.first.span.start == 17 and errors.first.span.end == 26
+						and diagnostic.first.span.start == 17 and diagnostic.first.span.end == 26
+						and diagnostic.first.message == "module int declares no public function or type less_than"
+						and diagnostic.first.help == "select a public function or type that int declares")
+
+
+tests: TestSuite = {
+	description = "Signed Int comparison declaration contracts",
+	tests = [
+		("renamed declaration returns designated Bool", test_renamed_comparison_uses_the_designated_bool_owner),
+		("missing API diagnostic retains selection end", test_missing_selected_API_reports_its_exact_name_span),
+		("reject String in first parameter", pure func(): rejects_header("pure func compare(left: String, right: Int) -> Bool:")),
+		("reject String in second parameter", pure func(): rejects_header("pure func compare(left: Int, right: String) -> Bool:")),
+		("reject missing second parameter", pure func(): rejects_header("pure func compare(left: Int) -> Bool:")),
+		("reject extra third parameter", pure func(): rejects_header("pure func compare(left: Int, right: Int, extra: Int) -> Bool:")),
+		("reject impure declaration", pure func(): rejects_header("func compare(left: Int, right: Int) -> Bool:")),
+		("reject generic declaration", pure func(): rejects_header("pure func compare[T](left: Int, right: Int) -> Bool:")),
+		("reject Int return", pure func(): rejects_header("pure func compare(left: Int, right: Int) -> Int:")),
+		("reject ordinary Bool-shaped union", pure func(): rejects_header("fixed union Answer:\n    Yes\n    No\npure func compare(left: Int, right: Int) -> Answer:")),
+	]
+}

@@ -858,6 +858,11 @@ There were two gaps against this rule:
 | any `List` | length, get, append, set, set_index, concat |
 | a bare `T` | all 15 distinct names above |
 
+This table is a historical inventory, not the current reserved-name count.
+The configured [prelude](standard_library/prelude.brp) and selected target
+[Int](standard_library/int.brp), [String](standard_library/string.brp) and
+[List](standard_library/list.brp) module exports define the current names.
+
 Importing `Foo` from the module that declares it also brings in that module's
 receiver functions. A local `describe(Foo)` beside the module's `describe(Foo)`
 therefore clashes.

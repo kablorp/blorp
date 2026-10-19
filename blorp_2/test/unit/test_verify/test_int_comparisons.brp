@@ -1,0 +1,123 @@
+import:
+	../../../src/lower/lower as Lower
+	../../../src/namespace/builtins as Builtins
+	../../../src/own/own as Own
+	../../../src/specialize/specialize as Concrete
+	../../../src/utils/source: same_source, module_source, root_module_id
+	../../../src/utils/syntax: Diagnostic
+	../../../src/verify/verify: verify
+	../int_comparison_inputs: lowered_comparison
+	../module_input: TEST_BASE
+	../ownership_inputs: span
+	test: TestSuite
+
+
+private pure func definition(id: Lower.ValueId, value_type: Concrete.TypeRef, operation: Own.OwnedValueOperation) -> Own.OwnershipOperation:
+	Own.DefineValue({ id = id, value_type = value_type, operation = operation, result = Own.UnmanagedResult, span = span(30) })
+
+
+-- Lowering supplies real identities/layouts; no ownership inserter repairs this IR.
+private pure func raw_comparison() -> Result[Own.OwnershipProgram, Diagnostic]:
+	lowered ?= lowered_comparison(TEST_BASE)
+	contents = Lower.lowered_functions(lowered)
+	match contents.functions:
+		[entry, query]:
+			match query.steps:
+				[Lower.Define(left), Lower.Define(right), Lower.Define(result)]:
+					match result.operation:
+						Lower.CallValue(call, _):
+							main: Own.OwnedFunction = {
+								execution = entry.execution, signature = entry.signature,
+								operations = [definition(left.id, Concrete.IntType, Own.IntegerDefinition(0))],
+								tail = Own.ReturnTail(Own.ReturnResult(Own.UnmanagedReturn(left.id)))
+							}
+							comparison: Own.OwnedFunction = {
+								execution = query.execution, signature = query.signature,
+								operations = [
+									definition(left.id, Concrete.IntType, Own.ParameterDefinition(0)),
+									definition(right.id, Concrete.IntType, Own.ParameterDefinition(1)),
+									definition(result.id, result.value_type, Own.CallDefinition(call, [Own.UnmanagedArgument(left.id), Own.UnmanagedArgument(right.id)])),
+								],
+								tail = Own.ReturnTail(Own.ReturnResult(Own.UnmanagedReturn(result.id)))
+							}
+							Ok({ records = [], unions = contents.unions, functions = [main, comparison], entrypoint = contents.entrypoint })
+						_: Err({ message = "test comparison call missing", help = "fix the test input", span = span(0), note = None })
+				_: Err({ message = "test comparison steps missing", help = "fix the test input", span = span(0), note = None })
+		_: Err({ message = "test comparison function missing", help = "fix the test input", span = span(0), note = None })
+
+
+private pure func rejects(program: Own.OwnershipProgram, message: String) -> Bool:
+	match verify(program):
+		Ok(_): False
+		Err(error):
+			(error.message == "ownership verification failed: " + message
+				and error.help == "report this compiler error with the input program"
+				and same_source(error.span.source, module_source(root_module_id()))
+				and error.span.start == 30 and error.span.end == 31 and error.note.is_none())
+
+
+pure func test_duplicate_constructor_is_rejected_independently() -> Bool:
+	match raw_comparison():
+		Err(_): False
+		Ok(program):
+			match program.functions:
+				[entry, query]:
+					match query.operations:
+						[left, right, Own.DefineValue(result)]:
+							match result.operation:
+								Own.CallDefinition(call, arguments):
+									match call:
+										Concrete.RuntimeFunction(Builtins.IntLessThan(boolean)):
+											changed = Concrete.RuntimeFunction(Builtins.IntLessThan({ boolean | false_variant = boolean.true_variant }))
+											invalid = { query | operations = [left, right, Own.DefineValue({ result | operation = Own.CallDefinition(changed, arguments) })] }
+											rejects({ program | functions = [entry, invalid] }, "runtime Bool constructors do not cover one result union")
+										_: False
+								_: False
+						_: False
+				_: False
+
+
+pure func test_missing_runtime_argument_is_rejected() -> Bool:
+	match raw_comparison():
+		Err(_): False
+		Ok(program):
+			match program.functions:
+				[entry, query]:
+					match query.operations:
+						[left, right, Own.DefineValue(result)]:
+							match result.operation:
+								Own.CallDefinition(call, _):
+									invalid = { query | operations = [left, right, Own.DefineValue({ result | operation = Own.CallDefinition(call, []) })] }
+									rejects({ program | functions = [entry, invalid] }, "call is missing its argument")
+								_: False
+						_: False
+				_: False
+
+
+pure func test_wrong_numeric_argument_is_rejected() -> Bool:
+	match raw_comparison():
+		Err(_): False
+		Ok(program):
+			match program.functions:
+				[entry, query]:
+					match query.operations:
+						[left, Own.DefineValue(right), result]:
+							invalid = {
+								query |
+									signature = { query.signature | parameters = [Concrete.IntType, Concrete.FloatType] },
+									operations = [left, Own.DefineValue({ right | value_type = Concrete.FloatType }), result]
+							}
+							rejects({ program | functions = [entry, invalid] }, "call argument type does not match its contract")
+						_: False
+				_: False
+
+
+tests: TestSuite = {
+	description = "Signed Int comparison independent verification",
+	tests = [
+		("raw unmanaged comparison verifies without insertion", pure func(): raw_comparison().and_then(verify).is_ok()),
+		("duplicate designated constructor is rejected", test_duplicate_constructor_is_rejected_independently),
+		("missing numeric argument is rejected", test_missing_runtime_argument_is_rejected),
+		("Float operand is rejected by the runtime contract", test_wrong_numeric_argument_is_rejected),
+	]
+}

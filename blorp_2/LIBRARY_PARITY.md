@@ -20,8 +20,9 @@ supersedes those rows/counts: nine pure APIs at 212 resolved compiler sites,
 including four callback helpers. The five ordinary helpers are implemented
 in the target library; the four callback helpers and callable prerequisites
 remain pending.
-The remaining table is historical evidence; refresh other interfaces at their
-own implementation boundary rather than treating planned removals as complete.
+Int target-status rows now reflect signed ordering and scalar constants; source
+counts remain historical. The target also supplies ordinary `max(Int, Int) -> Int`.
+Refresh other interfaces at their own implementation boundary.
 
 ### Deferred List update naming
 
@@ -149,18 +150,18 @@ source unchanged.
 | float | less_than | `pure func less_than(a: Float, b: Float) -> Bool` (`implements Orderable for Float`, float.brp:659) | 2 | emit/float_literal.brp:16, :43 | MISSING | intrinsic (Float ordering) |
 | float | multiply | `pure func multiply(a: Float, b: Float) -> Float` (`implements Multipliable for Float`, float.brp:630) | 2 | emit/float_literal.brp:44, :56 | `float.multiply(first: Float, second: Float) -> Float` | exists |
 | float | subtract | `pure func subtract(a: Float, b: Float) -> Float` (`implements Subtractable for Float`, float.brp:625) | 2 | emit/float_literal.brp:52, :63 | `float.subtract(first: Float, second: Float) -> Float` | exists |
-| int | INT_MAX | `INT_MAX: Int = 9223372036854775807` (int.brp:205) | 2 | parse/parse.brp:477, utils/source.brp:44 | MISSING | blorp constant; needs M5 (constants in library modules) |
-| int | INT_MIN | `INT_MIN: Int = -9223372036854775807 - 1` (int.brp:207) | 2 | parse/parse.brp:475, emit/emit.brp:161 | MISSING | blorp constant; needs M5; see note B on the literal |
+| int | INT_MAX | `INT_MAX: Int = 9223372036854775807` (int.brp:205) | 2 | parse/parse.brp:477, utils/source.brp:44 | `int.INT_MAX: Int = 9223372036854775807` | ordinary closed scalar literal |
+| int | INT_MIN | `INT_MIN: Int = -9223372036854775807 - 1` (int.brp:207) | 2 | parse/parse.brp:475, emit/emit.brp:161 | `int.INT_MIN: Int = -9223372036854775808` | ordinary closed scalar literal; see note B |
 | int | add | `pure func add(a: Int, b: Int) -> Int` (`implements Addable for Int`, int.brp:99) | 202 | 23 files (check/values.brp:49 uses, lex/lex.brp:23 uses) | `int.add(a: Int, b: Int) -> Int` | exists |
 | int | divide | `pure func divide(a: Int, b: Int) -> Int` (`implements Divisible for Int`, int.brp:114) | 2 | lex/lex.brp:559, parse/parse.brp:454 | `int.divide(a: Int, b: Int) -> Int` | exists |
 | int | equals | `pure func equals(a: Int, b: Int) -> Bool` (`implements Equatable for Int`, int.brp:130) | 131 | 23 files (verify/verify.brp:27 uses, check/values.brp:16 uses) | `int.equals(a: Int, b: Int) -> Bool` | exists |
-| int | greater_than | `pure func greater_than(a: Int, b: Int) -> Bool` (`implements Orderable for Int`, int.brp:141) | 54 | 9 files (emit/emit.brp:190, check/values.brp:14 uses) | MISSING | blorp: `less_than(b, a)`; promotion candidate |
-| int | greater_than_or_equal | `pure func greater_than_or_equal(a: Int, b: Int) -> Bool` (`implements Orderable for Int`, int.brp:147) | 18 | 7 files (own/own.brp:182, verify/verify.brp:6 uses) | MISSING | blorp: `not less_than(a, b)`; promotion candidate |
-| int | less_than | `pure func less_than(a: Int, b: Int) -> Bool` (`implements Orderable for Int`, int.brp:138) | 40 | 14 files (emit/emit.brp:163, verify/verify.brp:10 uses) | MISSING | intrinsic (Int ordering) |
-| int | less_than_or_equal | `pure func less_than_or_equal(a: Int, b: Int) -> Bool` (`implements Orderable for Int`, int.brp:144) | 7 | lex, parse, source (lex/lex.brp:180, utils/source.brp:45) | MISSING | blorp: `not less_than(b, a)`; promotion candidate |
-| int | min | `pure func min(a: Int, b: Int) -> Int` (`implements Bounded for Int`, int.brp:82) | 4 | lex, parse (lex/lex.brp:583, parse/parse.brp:527) | MISSING | blorp: `match less_than(a, b)`; needs the `less_than` intrinsic only |
+| int | greater_than | `pure func greater_than(a: Int, b: Int) -> Bool` (`implements Orderable for Int`, int.brp:141) | 54 | 9 files (emit/emit.brp:190, check/values.brp:14 uses) | `int.greater_than(a: Int, b: Int) -> Bool` | ordinary `less_than(b, a)` |
+| int | greater_than_or_equal | `pure func greater_than_or_equal(a: Int, b: Int) -> Bool` (`implements Orderable for Int`, int.brp:147) | 18 | 7 files (own/own.brp:182, verify/verify.brp:6 uses) | `int.greater_than_or_equal(a: Int, b: Int) -> Bool` | ordinary Bool match over `less_than(a, b)` |
+| int | less_than | `pure func less_than(a: Int, b: Int) -> Bool` (`implements Orderable for Int`, int.brp:138) | 40 | 14 files (emit/emit.brp:163, verify/verify.brp:10 uses) | `int.less_than(a: Int, b: Int) -> Bool` | signed64 intrinsic |
+| int | less_than_or_equal | `pure func less_than_or_equal(a: Int, b: Int) -> Bool` (`implements Orderable for Int`, int.brp:144) | 7 | lex, parse, source (lex/lex.brp:180, utils/source.brp:45) | `int.less_than_or_equal(a: Int, b: Int) -> Bool` | ordinary Bool match over `less_than(b, a)` |
+| int | min | `pure func min(a: Int, b: Int) -> Int` (`implements Bounded for Int`, int.brp:82) | 4 | lex, parse (lex/lex.brp:583, parse/parse.brp:527) | `int.min(a: Int, b: Int) -> Int` | ordinary Bool match over `less_than(a, b)` |
 | int | multiply | `pure func multiply(a: Int, b: Int) -> Int` (`implements Multipliable for Int`, int.brp:109) | 3 | lex, parse (lex/lex.brp:291, parse/parse.brp:447) | `int.multiply(a: Int, b: Int) -> Int` | exists |
-| int | not_equals | `pure func not_equals(a: Int, b: Int) -> Bool` (`implements Equatable for Int`, int.brp:133) | 7 | emit, own, verify (emit/emit.brp:363, verify/verify.brp:254) | MISSING | blorp: `match equals(a, b)`; no milestone |
+| int | not_equals | `pure func not_equals(a: Int, b: Int) -> Bool` (`implements Equatable for Int`, int.brp:133) | 7 | emit, own, verify (emit/emit.brp:363, verify/verify.brp:254) | `int.not_equals(a: Int, b: Int) -> Bool` | ordinary Bool match over `equals(a, b)` |
 | int | remainder | `pure func remainder(a: Int, b: Int) -> Int` (`implements Modulable for Int`, int.brp:119) | 1 | lex/lex.brp:554 | `int.remainder(a: Int, b: Int) -> Int` | exists |
 | int | subtract | `pure func subtract(a: Int, b: Int) -> Int` (`implements Subtractable for Int`, int.brp:104) | 65 | 11 files (check/values.brp:17 uses, verify/verify.brp:9 uses) | `int.subtract(a: Int, b: Int) -> Int` | exists |
 | int | to_char | `pure func to_char(val: Int) -> Char` (`implements ToChar for Int`, int.brp:174) | 1 | parse/parse.brp:588 | MISSING | intrinsic (code point to Char); see note A on the call form |
@@ -251,8 +252,7 @@ M6 (representation and machine):
 -- _base.brp
 type Char = builtin
 
--- int.brp
-pure func less_than(a: Int, b: Int) -> Bool:              builtin("int.less_than")
+-- int.brp (signed ordering now exists; Char conversion remains planned)
 pure func to_char(value: Int) -> Char:                    builtin("int.to_char")
 
 -- char.brp (new module)
@@ -284,7 +284,7 @@ Builtins returning Bool, Option or Result name only their operation: their
 contracts return the foundation's designated unions, so no body binds
 constructors.
 
-That is 18 intrinsic functions (3 in ML, 15 in M6) and one intrinsic type.
+The original plan listed 18 intrinsic functions (3 in ML, 15 in M6) and one intrinsic type; signed Int ordering now exists.
 Everything else in the table is Blorp over these, `int.equals`/`add`/`subtract`,
 `list.get`/`length`, `string.length` and `match`. Four rows are derivable and
 classified blorp, but are candidates for later promotion to intrinsics for
@@ -321,15 +321,10 @@ codegen quality once measured: `int.greater_than`, `int.greater_than_or_equal`,
   Recommendation: `src` switches the 17 sites to
   `CharOps.to_int(c)` with `char as CharOps` and `IntOps.to_char(n)`; the temp
   gains `char.brp` with `to_int` and `int.to_char`.
-- **B. `INT_MIN`.** The host initializer is the expression
-  `-9223372036854775807 - 1`, because the host lexer does not read the
-  most-negative literal. M5 admits literal initializers only, so the temp
-  `int.brp` needs the literal `-9223372036854775808`, which the pilot's lexer and
-  checker must accept (the pilot already lexes `-` as part of a number token,
-  lex/lex.brp:494). Both `src` uses compare against it (parse/parse.brp:475,
-  emit/emit.brp:161). If the literal is rejected, the fallback is host-shaped:
-  `src` computes it as `IntOps.subtract(IntOps.subtract(0, IntOps.INT_MAX), 1)`,
-  which removes the `INT_MIN` row.
+- **B. `INT_MIN`.** The host spells its initializer as arithmetic, while the
+  target declares the supported literal `-9223372036854775808`. Ordinary selected
+  and qualified constant reads publish checked literals; no runtime global or
+  source-call rewrite is needed.
 - **C. `io.print_error[T: Stringable]`.** The host is generic over `Stringable`;
   all four `src` sites pass a `String`. The temp twin is the concrete
   `print_error(value: String) -> Void`, exactly as the temp already narrowed
