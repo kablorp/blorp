@@ -109,7 +109,7 @@ passed the audited toolchain's default limits through depth 256.
 | --- | --- | --- |
 | [M0](#m0-foundation-closeout) | Re-cut, perf fixes, parser statement loop, fixpoint script, parity table | Landed. M3 owns the recorded managed-value call limits. |
 | [M1a](#m1a-surface-syntax-parity) | Layout and parsed source syntax | Current frontier: all 41 compiler files parse, including explicit pure callback types. Checking remains separate. |
-| [ML](#ml-list-construction) | `append`, `set`, `concat`, list literal | Done. |
+| [ML](#ml-list-construction) | `append`, `set_or_keep`, `concat`, list literal | Done. Checked `set` is an ordinary target-library wrapper. |
 | [M1b](#m1b-names-and-the-foundation) | Namespace: private, aliases, qualified names, designated `Bool`/`Option`/`Result` | Parts A and B done; control-flow consumers follow in M2/M3. |
 | [M5](#m5-constants) | Literal scalar/String constants | Implemented. Source construction functions replace the need for record/opaque constants and initializer dependencies. |
 | [M2](#m2-the-join) | Restricted control positions, outer-variable joins, Boolean operators, `?=` and annotations | M2.1 implemented; reviewed logical candidate preserved. General expression-control recut deferred. |
@@ -310,7 +310,8 @@ plan migrates those uses; the frontier alone does not require either feature.
 ## ML: List construction
 
 **Goal.** Build a list of n+1 distinct elements. **Scope.** `append` (268 uses
-in `src`), `set` (47), `concat` and the literal `[a, b]` / `[]` (276) are
+in the historical `src` inventory), the no-op-on-invalid update (47 host `set`
+uses; now target `set_or_keep`), `concat` and the literal `[a, b]` / `[]` (276) are
 intrinsics by the library-over-builtins rule, with fresh-result semantics: borrow
 the inputs, acquire each surviving or replacement stored occurrence, allocate a
 new result, preserve every old alias. Unique-root reuse is deferred and measured
@@ -342,11 +343,22 @@ The List storage contract holds for every list operation:
   rejection ceiling. Runtime slot count must not grow helper C size: one root
   allocation and exactly n applications of the element's duplication/drop.
 
+For the target-only checked `set`/`set_or_keep` increment, the user approved a
+bounded allocation exception on 2026-10-18: +15% against fixed baseline
+`bc6168b483a6680628a2d915ff18f22bd314ab69` for its eight frozen controls only.
+The +5% assessment targets and +10% instruction hard limit remain unchanged;
+missed targets and original failures remain reported. Six existing native
+allocation constants increase by 1,500; all other allocation limits and all
+instruction limits stay unchanged. This grants no future List allowance; see
+the [validation report](../benchmarks/results/blorp_2_list_set_names_2026-10-18.md).
+
 **Exit proof.** Fixtures for append/set/concat/literal with managed elements,
 ownership verified, C read, ceilings measured; see the
 [list intrinsics report](../benchmarks/results/blorp_2_list_intrinsics_2026-10-15.md).
 
-**Status.** Done (`append`, `set`, `concat`, literal).
+**Status.** Done (`append`, `set_or_keep`, `concat`, literal). Target `set`
+returns `Option[List[T]]` through an ordinary `get`/match wrapper; host names and
+compiler-source alignment remain separate under [library parity](LIBRARY_PARITY.md).
 
 ## M1b: names and the foundation
 

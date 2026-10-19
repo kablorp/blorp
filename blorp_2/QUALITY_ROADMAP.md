@@ -855,8 +855,8 @@ There were two gaps against this rule:
 | `Int` | equals, add, to_string, subtract, multiply, divide, remainder |
 | `Float` | add, subtract, multiply, divide, remainder, to_string |
 | `String` | equals, length, parse_int, parse_float |
-| any `List` | length, get, append, set, concat |
-| a bare `T` | all 14 distinct names above |
+| any `List` | length, get, append, set, set_or_keep, concat |
+| a bare `T` | all 15 distinct names above |
 
 Importing `Foo` from the module that declares it also brings in that module's
 receiver functions. A local `describe(Foo)` beside the module's `describe(Foo)`

@@ -49,16 +49,27 @@ writes every byte and appends LF. Program input arrives explicitly through
 `main(args: List[String])`, including the executable name at index 0.
 Other IO declarations remain in the original module. `Void` is declared once in `_base.brp`.
 
-The List adapter follows `standard_library/src/list.brp`'s generic `repeat`,
-`length`, safe `get`, `append`, `set` and `concat` APIs. List is declared once
+The List adapter provides generic `repeat`, `length`, safe `get`, `append`,
+`set`, `set_or_keep` and `concat` APIs. List is declared once
 in `_base.brp` as a unary builtin. Every supported finite type can be an element,
 including records, unions, Void and nested Lists. A successful get returns an
 independently owned element inside ordinary Option; invalid indexes return None.
 A nonpositive repeat count creates an empty List. Each repeated occurrence
 owns its own stored obligation; final root release destroys each initialized
 slot once.
-List literals are supported. `append`, `set` and `concat` return owned Lists
-with value semantics: an update does not change an earlier alias.
+List literals are supported. `set(values, index, value)` returns
+`Option[List[T]]`: `Some(updated)` for a valid index, or `None` for a negative
+or out-of-bounds index. `set_or_keep(values, index, value)` returns `List[T]`:
+the updated value for a valid index, or the original value unchanged otherwise.
+Replacement arguments are evaluated eagerly in both APIs, including invalid
+indices. Updates have value semantics: an update does not change an earlier
+alias, and returned managed values remain independently owned. `append` and
+`concat` also return owned Lists.
+
+These two names intentionally differ from the unchanged host library:
+host `set_index` corresponds to target `set`, and host `set` corresponds to
+target `set_or_keep`. The internal `list.set` builtin still implements the
+no-op-on-invalid update; the target's checked `set` is an ordinary function.
 The base module provides the ordinary generic Result union with Ok/Err for
 pure calculator parsing and evaluation; it has no compiler-specific behavior.
 
