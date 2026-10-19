@@ -24,9 +24,9 @@ callback; larger ranges split count in half using Int.divide(count,2). Process
 left before right. any returns immediately after a True left half; map/filter
 concat left and right results. Filter preserves input order. Every nonempty
 private subrange remains within the original List, with no overflowing index.
-The reviewed source preview is75 lines/six functions. Add a short source comment
-beside it explaining unconditional copies and the temporary complexity tradeoff;
-charge those lines normally against the110ADD ceiling.
+The reviewed source preview is84 lines/six functions, including a source comment
+explaining unconditional copies and the temporary complexity tradeoff. Its lines
+are charged normally against the110ADD ceiling.
 No reusable traversal, callback carrier or alternate compiler execution path.
 
 ```blorp
@@ -118,7 +118,7 @@ Freeze literal commands/pins/oracles and finite leases with root before START.
 
 ## Physical forecast and stops
 
-Production preview78ADD/1DEL/+77, target list only; assess95ADD/+95, hard110/+110.
+Production preview87ADD/1DEL/+86, target list only; assess95ADD/+95, hard110/+110.
 Nonfixture tests forecast200-240ADD, assess250, hard300; one fixture hard80lines.
 API docs hard45ADD, this plan hard140lines, eventual measurement report hard80.
 Do not compress formatting or delete coverage to fit. Merge overlapping imports
