@@ -33,7 +33,8 @@ Neither branch prints. The native helper uses the target String ABI.
 [`standard_library/src/int.brp`](../../standard_library/src/int.brp). Concrete
 `add`, `subtract`, `multiply`, `divide`, `remainder`, `equals` and `to_string` are
 active, lifted from trait implementations where needed. The Float adapter
-exposes those same concrete names for Float64.
+exposes concrete `add`, `subtract`, `multiply`, `divide`, `remainder` and
+`to_string` for Float64; `equals` remains pending.
 `Int` and `Float` are declared once in `_base.brp`. Other
 declarations are enabled only as their features enter the supported subset.
 The original modules are maintained in [standard_library/src](../../standard_library/src/).

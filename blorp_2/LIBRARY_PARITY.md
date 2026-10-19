@@ -9,6 +9,10 @@ This document owns that set. No required row may be MISSING when M6 exits.
 
 **Scope update.** The table and counts below are a historical resolved snapshot
 at `ba57e368a` (2026-10-15), not the final interface inventory. The
+[current full accounting](STANDARD_LIBRARY_GAPS.md) records 65 called APIs,
+35 absent names, two missing constants and parallel implementation ownership
+at accepted main `1d02a6700` (2026-10-19). It supersedes the historical counts.
+The
 [source plan](BOOTSTRAP_SOURCE_PLAN.md) and [current roadmap](ROADMAP.md#m6-library-and-shell)
 govern the independent Char/source work. The owner stopped the remaining
 callback-removal migration. The current [Option/Result catalog](OPTION_RESULT_PLAN.md)

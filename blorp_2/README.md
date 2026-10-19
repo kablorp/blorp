@@ -1545,7 +1545,9 @@ symbol binding. The base types module owns `Int`, `Float`, `String`, `Void` and 
 The [validation report](../benchmarks/results/blorp_2_int_add_2026-10-11.md) records
 strict tests, native fixtures, matched costs and the existing compiler's
 different trait-based `add` import surface.
-[LIBRARY_PARITY.md](LIBRARY_PARITY.md) lists every host-library function the compiler source uses and its temp-library twin.
+[The current library accounting](STANDARD_LIBRARY_GAPS.md) lists the compiler's
+library dependencies, missing APIs and parallel ownership. [LIBRARY_PARITY.md](LIBRARY_PARITY.md)
+retains the historical inventory and coordinated API contracts.
 
 ## Quoted UTF-8 String literals
 
