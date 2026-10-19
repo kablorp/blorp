@@ -1,10 +1,13 @@
 # Stable Int-key List.sort_by: architecture preview
 
-Status: reviewed implementation contract; source and measurements remain pending.
-Publish this plan before separate tests-first implementation permission and every
-finite compiled START. No source/cost execution follows from publication. B is
-`a656f5ce1de963c8e9c162460e181d696b39c1d5`, including accepted Numeric Int.
-This preview contains no Float compiler/library, held List, M3 or M7 hunks.
+Status: candidate API and sanitizer/native fixture checks passed; implementation
+remains held and unmerged. The first shared-input instruction checkpoint rose
+46.750012804%, exceeding its unchanged 10% hard ceiling; strict allocation calls
+remain unrun. See the [measured result](../benchmarks/results/blorp_2_list_sort_by_2026-10-19.md).
+Fixed B remains `a656f5ce1de963c8e9c162460e181d696b39c1d5`, including accepted Numeric Int.
+No Float compiler/library, other held List, M3 or M7 hunks are included.
+The contract below retains the original architecture and acceptance obligations;
+this status update grants no further implementation or compiled calls.
 
 ## Exact required contract
 
@@ -110,9 +113,10 @@ assess130); nonfixture tests300ADD (forecast180–240); fixture80physical lines;
 API docs35ADD; canonical plan160lines; final evidence report80physical lines.
 Publication approves these bounds only; code and each finite call still need
 separate permission. No formatting compression/deleted coverage.
-New fixture uses existing generic150k allocations/600M diagnostic instructions
-and600M normal min3 unless a smaller bound is frozen prospectively with evidence.
-All existing absolute caps stay unchanged. Full component/native gates remain.
+Only the new sorting fixture uses dedicated `SORT_LIMITS`: 160,000 allocations,
+600M diagnostic instructions and 600M normal min3. The original 150,000 allocation
+gate failed at 157,753; retain it as FAIL. All preexisting fixture and shared generic
+caps stay unchanged. Full component/native gates remain.
 
 First unchanged return/zero eight costs before expensive work. Then seven List
 controls zero/literal_int/literal_empty/append_int/set_int/concat_int/entries, each
@@ -125,11 +129,11 @@ states remain; freeze new export/source-frontier transitions individually.
 The known HOF/List declaration-cost failures are relevant warnings, not a reset
 or evidence sorting fits. Stop on first hard/absolute/nonbudget failure, retain
 all targets/FAILs, no retry, cap revision, baseline roll or budget offsets.
-Root must select/pin actual source-matched producer roles before any calls;
-this draft materializes no active payload, cost freeze or new binary.
+Retained Numeric producer roles and the fixed-B measurements are recorded in the
+report. No new producer, baseline, cost ceiling or continued sampling is approved.
 
 Integration merges only this list import/record/helper/API diff and docs with
 then-accepted List work. Every composition is reviewed without rolling B.
 No source migration, compiler model, trait/closure ABI, FFI, runtime primitive
-or benchmark framework is in scope. Implementation/calls remain pending after
-this planning-only publication.
+or benchmark framework is in scope. Candidate implementation remains held;
+all remaining calls and feature acceptance are ungranted.
