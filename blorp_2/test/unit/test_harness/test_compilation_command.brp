@@ -1,0 +1,124 @@
+import:
+	../../e2e/cost: InstructionCheck(RequiredInstructions, DisabledInstructions)
+	../../e2e/harness: compilation_command, compilation_output
+	process:
+		ProcessCommand, ProcessCaptureLimit(DefaultCaptureLimit),
+		ProcessResult, ProcessExit(Exited, Signaled, TimedOut), ProcessError(SpawnFailed, ProgramNotFound),
+		ProcessGroup(NewProcessGroup), ProcessStdin(NullStdin), ProcessStream(CaptureStream)
+	test: TestSuite
+
+
+private pure func request(instruction_check: InstructionCheck) -> ProcessCommand:
+	compilation_command("/pilot dir/é compiler", "/output dir/é", "fixture dir/é.brp", instruction_check)
+
+
+pure func test_required_measurement_times_compiler_directly() -> Bool:
+	actual = request(RequiredInstructions)
+	actual.program == "/usr/bin/time" and actual.args == [
+		"-l", "-o", "/output dir/é/instructions.txt", "/pilot dir/é compiler",
+		"--library-root", "blorp_2/standard_library", "fixture dir/é.brp", "/output dir/é/program.c",
+	]
+
+
+pure func test_disabled_measurement_runs_same_compiler_arguments() -> Bool:
+	actual = request(DisabledInstructions)
+	actual.program == "/pilot dir/é compiler" and actual.args == [
+		"--library-root", "blorp_2/standard_library", "fixture dir/é.brp", "/output dir/é/program.c",
+	]
+
+
+private pure func has_strict_environment(actual: ProcessCommand) -> Bool:
+	match actual.environment:
+		[leaks, statistics]:
+			(
+				leaks.name == "BLORP_LEAK_CHECK" and leaks.value == Some("strict")
+				and statistics.name == "BLORP_MEMORY_STATS" and statistics.value.is_none()
+			)
+		_:
+			False
+
+
+pure func test_both_modes_set_strict_child_environment() -> Bool:
+	(
+		has_strict_environment(request(RequiredInstructions))
+		and has_strict_environment(request(DisabledInstructions))
+	)
+
+
+pure func test_both_modes_inherit_cwd_with_no_child_deadline() -> Bool:
+	required = request(RequiredInstructions)
+	disabled = request(DisabledInstructions)
+	(
+		required.cwd.is_none() and required.timeout.is_none()
+		and disabled.cwd.is_none() and disabled.timeout.is_none()
+	)
+
+
+private pure func has_file_compiler_policy(actual: ProcessCommand) -> Bool:
+	match (actual.stdin, actual.stdout, actual.stderr, (actual.capture_limit, actual.process_group)):
+		(NullStdin, CaptureStream, CaptureStream, (DefaultCaptureLimit, NewProcessGroup)): True
+		_: False
+
+
+pure func test_both_modes_use_null_stdin_and_standard_capture() -> Bool:
+	(
+		has_file_compiler_policy(request(RequiredInstructions))
+		and has_file_compiler_policy(request(DisabledInstructions))
+	)
+
+
+private pure func output(exit: ProcessExit, stdout: String, stderr: String) -> ProcessResult:
+	{ exit = exit, stdout = stdout.to_bytes(), stderr = stderr.to_bytes() }
+
+
+private pure func rejects(result: Result[ProcessResult, ProcessError], expected: String) -> Bool:
+	match compilation_output(result):
+		Err(error): error == expected
+		Ok(_): False
+
+
+pure func test_success_preserves_accounting_bytes() -> Bool:
+	match compilation_output(Ok(output(Exited(0), "", "accounting\n"))):
+		Ok(actual): actual.stderr == "accounting\n".to_bytes() and actual.stdout == "".to_bytes()
+		Err(_): False
+
+
+pure func test_nonzero_exit_precedes_unexpected_stdout() -> Bool:
+	rejects(Ok(output(Exited(7), "noise", "detail")), "compiler exited with status 7: detail")
+
+
+pure func test_signal_preserves_its_number_and_stderr() -> Bool:
+	rejects(Ok(output(Signaled(6), "", "abort")), "compiler terminated by signal 6: abort")
+
+
+pure func test_timeout_is_a_distinct_failure() -> Bool:
+	rejects(Ok(output(TimedOut, "", "detail")), "compiler timed out: detail")
+
+
+pure func test_success_cannot_hide_stdout_bytes() -> Bool:
+	rejects(Ok(output(Exited(0), "\0é", "")), "the compiler must have empty stdout on success")
+
+
+pure func test_process_errors_keep_their_exact_diagnostic() -> Bool:
+	(
+		rejects(Err(SpawnFailed("detail")), "process spawn failed: detail")
+		and rejects(Err(ProgramNotFound("/missing compiler")), "program not found: /missing compiler")
+	)
+
+
+tests: TestSuite = {
+	description = "Blorp 2 compiler measurement command",
+	tests = [
+		("required measurement times compiler directly", test_required_measurement_times_compiler_directly),
+		("disabled measurement runs same compiler arguments", test_disabled_measurement_runs_same_compiler_arguments),
+		("both modes set strict child environment", test_both_modes_set_strict_child_environment),
+		("both modes inherit cwd with no child deadline", test_both_modes_inherit_cwd_with_no_child_deadline),
+		("both modes use null stdin and standard capture", test_both_modes_use_null_stdin_and_standard_capture),
+		("success preserves accounting bytes", test_success_preserves_accounting_bytes),
+		("nonzero exit precedes unexpected stdout", test_nonzero_exit_precedes_unexpected_stdout),
+		("signal preserves its number and stderr", test_signal_preserves_its_number_and_stderr),
+		("timeout is a distinct failure", test_timeout_is_a_distinct_failure),
+		("success cannot hide stdout bytes", test_success_cannot_hide_stdout_bytes),
+		("process errors keep their exact diagnostic", test_process_errors_keep_their_exact_diagnostic),
+	]
+}

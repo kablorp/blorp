@@ -6,6 +6,7 @@ import:
 	fs: IOError, resource_path, temporary_directory
 	process:
 		ProcessCommand,
+		ProcessError,
 		ProcessExit(Exited, Signaled, TimedOut),
 		ProcessOutput,
 		ProcessResult,
@@ -136,6 +137,53 @@ func remove_existing_file(path: String) -> Result[Void, String]:
 		Err("could not remove previous measurement output: " + path)
 
 
+pure func compilation_command(
+	compiler: String,
+	directory: String,
+	fixture: String,
+	instruction_check: InstructionCheck,
+) -> ProcessCommand:
+	arguments = [
+		"--library-root",
+		"blorp_2/standard_library",
+		fixture,
+		directory + "/program.c",
+	]
+	request = match instruction_check:
+		RequiredInstructions:
+			command(
+				"/usr/bin/time",
+				["-l", "-o", directory + "/instructions.txt", compiler].concat(arguments),
+			)
+		DisabledInstructions:
+			command(compiler, arguments)
+	{ request |
+		environment = [
+			{ name = "BLORP_LEAK_CHECK", value = Some("strict") },
+			{ name = "BLORP_MEMORY_STATS", value = None },
+		]
+	}
+
+
+pure func compilation_output(result: Result[ProcessResult, ProcessError]) -> Result[ProcessResult, String]:
+	match result:
+		Err(error):
+			Err(error.to_string())
+		Ok(actual):
+			match actual.exit:
+				Exited(0):
+					if actual.stdout == "".to_bytes():
+						Ok(actual)
+					else:
+						Err("the compiler must have empty stdout on success")
+				Exited(code):
+					Err("compiler exited with status " + code.to_string() + ": " + actual.stderr.to_string())
+				Signaled(signal):
+					Err("compiler terminated by signal " + signal.to_string() + ": " + actual.stderr.to_string())
+				TimedOut:
+					Err("compiler timed out: " + actual.stderr.to_string())
+
+
 func measure_compilation_cost(
 	compiler: String,
 	directory: String,
@@ -144,45 +192,29 @@ func measure_compilation_cost(
 	-- Validate explicit policy before touching fixture outputs or invoking its compiler.
 	instruction_check ?= parse_instruction_check(getenv("BLORP_2_INSTRUCTION_CHECK"))
 	removed_c ?= remove_existing_file(directory + "/program.c")
-	arguments = [
-		"BLORP_LEAK_CHECK=strict",
-		compiler,
-		"--library-root",
-		"blorp_2/standard_library",
-		example.fixture,
-		directory + "/program.c",
-	]
-	-- Both modes compile exactly once with the same compiler arguments and leak mode.
-	compilation: Result[ProcessOutput, String] = match instruction_check:
-		RequiredInstructions:
-			removed_report ?= remove_existing_file(directory + "/instructions.txt")
-			run_successfully(
-				"/usr/bin/time",
-				["-l", "-o", directory + "/instructions.txt", "/usr/bin/env"].concat(arguments),
-			)
-		DisabledInstructions:
-			run_successfully("/usr/bin/env", arguments)
-	compiled ?= compilation
+	request = compilation_command(compiler, directory, example.fixture, instruction_check)
+	-- The environment is installed before time starts the compiler process.
+	removed_report ?= match instruction_check:
+		RequiredInstructions: remove_existing_file(directory + "/instructions.txt")
+		DisabledInstructions: Ok(void)
+	compiled ?= compilation_output(run_command(request))
 
-	if compiled.stdout() != "":
-		Err("the compiler must have empty stdout on success")
-	else:
-		verified ?= verify_generated_c(directory + "/program.c", example.expected_c)
-		allocations ?= parse_allocations(compiled.stderr())
-		instruction_result: Result[Option[Int], String] = match instruction_check:
-			RequiredInstructions:
-				report ?= read_file(directory + "/instructions.txt")
-				count ?= parse_instructions(report)
-				Ok(Some(count))
-			DisabledInstructions:
-				Ok(None)
-		instructions ?= instruction_result
-		cost: CompilationCost = {
-			allocations = allocations,
-			instructions = instructions,
-		}
-		print(example.name + " compiler: " + format_cost(cost, example.limits))
-		Ok(cost)
+	verified ?= verify_generated_c(directory + "/program.c", example.expected_c)
+	allocations ?= parse_allocations(compiled.stderr.to_string())
+	instruction_result: Result[Option[Int], String] = match instruction_check:
+		RequiredInstructions:
+			report ?= read_file(directory + "/instructions.txt")
+			count ?= parse_instructions(report)
+			Ok(Some(count))
+		DisabledInstructions:
+			Ok(None)
+	instructions ?= instruction_result
+	cost: CompilationCost = {
+		allocations = allocations,
+		instructions = instructions,
+	}
+	print(example.name + " compiler: " + format_cost(cost, example.limits))
+	Ok(cost)
 
 
 func verify_native_result(directory: String, expected_exit: Int) -> Result[Void, String]:

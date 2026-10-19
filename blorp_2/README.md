@@ -456,6 +456,17 @@ for that same run. Instruction counts include allocation bookkeeping and reporti
 ceilings, and are not directly comparable to the historical minimum of three
 uninstrumented `-O2` runs in the binding increment record.
 
+The process request sets strict leak diagnostics and removes memory statistics
+before starting the timer. The timer invokes the compiler directly, so a
+preparatory environment launcher is outside the retired-instruction boundary.
+The earlier harness timed that launcher too; retained measurements identify
+their epoch, and earlier failed gates remain failures. Numerical limits stay
+unchanged. Both instruction modes use the same compiler arguments and environment.
+These file-only compiler requests use null stdin and no child deadline. This
+intentionally replaces legacy `process.run`'s inherited stdin and implicit
+30-second or `BLORP_PROCESS_TIMEOUT_MS` deadline. The enclosing TestSuite timeout
+is separate; output capture retains its existing default limit and environment override.
+
 The default instruction check requires macOS `/usr/bin/time -l` and its
 retired-instruction counter. Missing or malformed required measurements fail
 the test. CI explicitly selects `BLORP_2_INSTRUCTION_CHECK=disabled` because hosted
