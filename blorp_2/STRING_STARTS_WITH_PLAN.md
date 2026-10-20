@@ -1,5 +1,36 @@
 # Ordinary target String.starts_with
 
+Current integration status: the reviewed Starts body, tests and API are ported
+with List callback helpers onto Option + Join main `09bdd5fb9db85df3d488ac02264845231770b943`.
+Components and the final native gate passed under reviewed measured margins. The standalone
+results below remain historical evidence, not a result for this composition.
+See the [evidence report](../benchmarks/results/blorp_2_string_starts_with_2026-10-20.md).
+
+## Current composition (2026-10-20)
+
+All 48 Starts allocation definitions overlap fields already changed by published
+Join. The initial port retained main values and replayed no old Starts tokens.
+The measured follow-up changes only 80 failing fields after Root and peer review.
+Join and Option bodies and predicates remain; no allowances are summed or stacked.
+The composition gate exposed combined growth against the initial limits;
+standalone resource approval does not grant combined-cost acceptance.
+
+The body is byte-identical to the reviewed Starts candidate. Feature tests add
+150 lines, including the two fixtures' 50 lines. The API notes preserve the Join
+contracts and clarify the existing README's reference to the separate ordinary
+List join wrapper. API scope is 13 added / 2 deleted, within 15 gross lines.
+The actual vector had 512 outer callbacks, 667 passing semantic children and one
+umbrella: 1,180 markers / 421 positive cost rows; components passed all 3,661.
+The first gate failed 85 allocation rows and 13 overlapping instruction rows.
+The next run failed one instruction field by 40,558; four reviewed margins are applied.
+Both failed receipts remain unchanged; final native passed all 1,180 markers / 421 rows.
+
+## Historical proposal and execution stages
+
+The following preview, original thresholds and continuation instructions are
+retained history. Their UNRUN and HELD labels describe those earlier stages;
+the current results and approved limits are recorded in the final section.
+
 Status: canonical source/test-first preview, UNRUN; root and independent
 API/ergonomics, code/data and test review precede plan publication. Implement
 only after publication and observed REDs; compiled work needs an exclusive START.
@@ -134,3 +165,103 @@ B12 and output state BEFORE each classification. Stage only the same3 pinned
 fixtures; restore original13 files/6 directories before RETURN or first STOP.
 No cost waiver is requested before collecting remaining instruction/control data.
 C-only/native/mutant/full-gate/API work stays HELD. Plan publication is not START.
+
+## Allocation exception requiring explicit approval (2026-10-20)
+
+This appendix takes effect only after Root, independent peer and human approval.
+All historical plan text, baselines, raw FAILs and producer epochs above remain.
+Current-main composition at468b used source-matched0fae/9b22 and host498/STD91:
+components3646PASS; two untimed C capturesPASS; full-native exit1 with57 existing
+allocation failures,665 semantic-childPASS,419 positive cost rows and no
+instruction-ceiling miss. The observed four-command statuses remain0/0/0/1.
+
+For exactly the four original fixed-a656 allocation controls, the proposed hard
+exception requires ALL of C<=the absolute final cap below, C-B<=2800 and
+100*C<=120*B. B remains its original observed allocation count. The2800 bound
+rounds max observed delta2668 plus100 to the next100; it is independent per input,
+never a pooled allowance. No previous ceiling increase is added to these caps.
+
+| Original control | Fixed B | Observed C | Absolute final cap | Headroom |
+| --- | ---: | ---: | ---: | ---: |
+| return/zero | 14534 | 17200 | 17334 | 134 |
+| mortal_string/alias | 15882 | 18549 | 18682 | 133 |
+| string_literal/unicode | 14981 | 17647 | 17781 | 134 |
+| string_operations/concat | 18074 | 20742 | 20874 | 132 |
+
+These allocation5% target misses and original10% hardFAILs remain recorded.
+All four original normal-min3 instruction5% target misses,10% hardPASSes and
+old absolute limits remain unchanged. This introduces no instruction exception;
+Root review of target misses still follows the original rule.
+
+For current-main native allocation ceilings, change only the48 reviewed literal
+definitions covering57 failed rows and4 passing shared users. Each final literal
+is ceil_to100(max observed allocation among ALL users+100):100..199 allocations
+above that definition's measured maximum. This is a final replacement, not an
+increment to stack with an earlier allowance. All419 instruction ceilings,
+358 other allocation rows and both new Starts150000/600000000 limits remain.
+The reviewed unapplied patch and definition/user math must stay with the evidence;
+no new lookup, harness rule, runtime mechanism or moving rebaseline is introduced.
+
+Arithmetic against existing observations is not a rerun or a green normal gate.
+Separate finite approval is required for any validation after applying caps.
+Strict-native accounting remains HELD: propose2 diagnostics1 strict sanitizer
+links of the two retained current C files and21 existing real-main cases with
+BLORP_LEAK_CHECK=strict, exact stdout/status and one positive balanced zero-leak
+report per case. The normal diagnostics0 native links do not satisfy this hold.
+No merge before the required reviews, human resource approval and remaining gates.
+
+The same explicit resource approval must include a narrow test gross-addition
+exception180->200 for this Starts composition only:150 existing testADD plus48
+allocation-literal replacementADD =198ADD/48DEL, net+150. The+180 net test ceiling,
+production45gross/+45net, two fixtures/70 combined lines and shared15-line API
+ceiling stay unchanged. The200 ceiling is final, not a stackable+20 allowance.
+
+## Current validated status (2026-10-20)
+
+This section records the reviewed standalone Starts worktree at 468b, before
+the published Join composition above. Its PASS results do not validate the new
+09bdd composition or amend any governing current-main limit.
+
+The current composition at `468b98b863eba89dab762d197c3cd91b0cdf8fe1` passed
+all 3,646 component callbacks. Its first full-native run retained exit 1 and
+57 allocation-ceiling failures, with 665 semantic children passing and all
+419 cost rows present. Receipt `39aca20d` remains FAIL; it was not rewritten.
+
+After explicit human approval, 48 allocation literals were changed exactly.
+They cover 57 failing rows and four passing shared users; 358 other allocation
+rows and all 419 instruction ceilings remain unchanged. The four original
+fixed-a656 allocation exceptions above and test gross-addition ceiling 200
+were approved together; the test net ceiling remains 180. The old four
+allocation hard failures and all original 5% target misses remain recorded.
+The maximum original increases were 18.343195% allocations and 8.140718%
+normal-minimum-of-three instructions; no instruction threshold was amended.
+
+The final maintained full-native call passed with exit 0 and empty stderr:
+49 groups, 510 outer callbacks, 665 native semantic children and one umbrella,
+exactly 1,176 PASS and zero FAIL. All 419 positive cost rows met the exact
+approved allocation and unchanged instruction ceilings. Receipt
+`b9377c756af1793d89b155dc256ba927d539e9c199d0b61454ca6f5a079e6466`
+records that executed gate and its passing source, library, test, tool,
+environment, cap and logical-Git closure. The final gate is complete.
+
+Separate strict-native accounting also passed: two diagnostics-enabled
+sanitizer links and all 21 existing real-main cases. Each of the 20 argv cases
+reported six allocations and six releases; the counted-NUL/lifetime case
+reported 21 and 21. Every report had zero leaked objects and bytes, with exact
+stdout and exit status and no other stderr. Receipt
+`2666171c17a5a37d2c52ee7c1e87770dfbcf3da4382bb91a430336337880f6bf`
+closes only that fixture-accounting hold. Three source-valid faults were killed
+by their named existing witnesses and followed by three fresh restored greens.
+
+Production remains 17 added / 1 deleted; tests are 198 added / 48 deleted,
+net +150, including the two fixtures' 50 lines. Shared API documentation is
+12 added / 1 deleted, within 15 lines. This plan and the benchmark evidence
+report are separate design/evidence documentation. Coverage and all other
+limits are unchanged.
+
+Native stack use remains linear in the matching prefix. The unchanged 4,096-byte
+witnesses provide bounded coverage, not a constant-stack or TCO guarantee.
+Compiler measurements and whole-native-process counters do not establish the
+helper's runtime cost or allocation rate. Source consumers remain queued.
+Final documentation and independent code/test review precede Root commit,
+merge and publication. Frozen packets and historical raw results stay intact.

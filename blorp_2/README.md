@@ -1755,6 +1755,16 @@ pure func set_index[T](values: List[T], index: Int, value: T) -> Option[List[T]]
         None: None
 ```
 
+The target List module also provides ordinary generic callback helpers:
+`any[T](List[T], pure (T) -> Bool) -> Bool`,
+`map[T, U](List[T], pure (T) -> U) -> List[U]`, and
+`filter[T](List[T], pure (T) -> Bool) -> List[T]`.
+Pass pure named functions or forward callable parameters. `any` stops at the
+first True result; `map` and `filter` preserve input order. Empty inputs return
+False or an empty List. The temporary balanced implementation uses logarithmic
+C stack and copies O(n log n) List slots for map/filter; it has no COW fast path.
+See the [List callback plan](LIST_CALLBACK_PLAN.md) for its limits and evidence.
+
 `repeat` evaluates its element and count once. A nonpositive count produces an
 empty List, including the minimum Int value. Each repeated occurrence owns its
 stored value. `length` returns the initialized element count; `get` returns
@@ -1871,6 +1881,10 @@ sees instances, not declarations, and deliberately does not repeat that check.
 
 ## Counted String operations
 
+`string.starts_with(value: String, prefix: String) -> Bool` compares counted bytes.
+Empty prefix is True; UTF-8/NUL spelling is exact. The temporary implementation
+uses native stack linear in the matching prefix; no constant-stack claim is made.
+
 `string.append_int(self: String, value: Int) -> String` appends signed Int64 decimal digits.
 The ordinary pure wrapper preserves UTF-8/NUL prefix bytes and earlier aliases.
 The [edge fixture](test/e2e/fixtures/string_operations/append_int_edges.brp)
@@ -1880,7 +1894,7 @@ The target `string.add(left: String, right: String) -> String` is pure and
 returns one fresh concatenation. It borrows both operands, including when they
 alias, and preserves exact counted bytes, including NUL and UTF-8. Empty
 operands follow the same ownership contract. The native helper copies each
-operand once; this does not provide a growing-concat or List[String].join path.
+operand once; the ordinary List join wrapper is documented separately.
 The [normal-main fixture](test/e2e/fixtures/string_operations/concat.brp)
 prints a doubled multilingual String with NUL and then its unchanged source.
 

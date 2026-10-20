@@ -1,8 +1,8 @@
 # Ordinary generic List callback helpers
 
-Status: reviewed implementation contract; code and measurements are pending.
-Root and independent architecture review approved this boundary. Publication
-precedes a separate tests-first implementation grant and every compiled lease.
+Status: combined components 3,661/native 1,180/421 cost rows passed; earlier FAILs retained.
+The historical plan below preserves its original authority and finite execution rules.
+Combined-tip validation is in the retained report; Root owns final publication.
 Fixed accepted B:1d02a670027ee05c2e18e0d19cbd22ac64ad23e4, selected by root.
 Later documentation-only publications do not roll this B or add a held candidate.
 Contains' +33.108888% allocation/+11.843529% instruction hard FAIL stays unchanged.
@@ -131,3 +131,10 @@ Cost-stop exception: after review, root may grant remaining planned finite corre
 Keep B, semantics, thresholds/caps and original samples/FAILs; no retries, resampling or merge.
 Relative/absolute budget misses stay FAIL; the unchanged native umbrella may finish/report all fixed fields.
 All non-budget failures still stop immediately; data serves only a bounded proposal, never budget acceptance.
+
+Human approved standalone resource-proposal04 on 2026-10-20 (manifest
+`824b854abd95e136dba10018dd3798bc13b944f950322f9d74e6d28c70224627`): eight comparison
+exceptions, 64 allocation/seven instruction fields and 317 nonfixture ADD for that slice.
+The initial projection retained Join caps; the measured follow-up changes 80 failing fields.
+General 300 ADD and 5%/10%, fixed B, raw samples and all historical FAILs remain.
+Both failed runs remain; reviewed measured margins passed the final combined native gate.

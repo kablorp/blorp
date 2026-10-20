@@ -28,6 +28,8 @@ and Unicode scalar escapes; String length and source locations count bytes.
 Literal construction, copies and returns use ordinary managed ownership.
 Its [ordinary `append_int` wrapper](../blorp_2/README.md#counted-string-operations)
 appends signed Int64 digits while preserving counted UTF-8 and NUL bytes.
+Its [ordinary prefix helper](../blorp_2/README.md#counted-string-operations)
+compares exact counted bytes with temporary native stack linear in the prefix.
 The pilot also supports the single-value `Void` type and `void` literal,
 ordered binding and Void expression statements, and explicitly imported
 concrete `io.print(String) -> Void`. Print borrows its String, writes all bytes
@@ -1682,6 +1684,9 @@ references infer fresh type arguments; callable slots become ordinary direct
 calls during specialization. Lambdas, nested callable types, callable storage
 and callable return values remain unsupported there. See the
 [Blorp 2 subset](../blorp_2/README.md) for its scope and recursion restrictions.
+
+Blorp 2's [generic List callbacks](../blorp_2/README.md#calculator-input-and-results)
+use these named/forwarded parameters for `any`, `map` and stable `filter`.
 
 ### Type Inference
 

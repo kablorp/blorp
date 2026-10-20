@@ -1,0 +1,246 @@
+import:
+	../../../src/load/load: load_program
+	../../../src/parse/assemble: parsed_contents
+	../../../src/check/check: check, checked_functions, check_errors
+	../../../src/check/model as Model
+	../../../src/check/errors as Errors
+	../../../src/utils/ids: inventory_functions, inventory_unions, function_number, union_number, variant_owner, variant_number, VariantId
+	../../../src/utils/names: name_spelling, foundation_words, same_name
+	../../../src/utils/source: same_module, same_source, module_source, root_module_id
+	../../../src/utils/syntax: Purity(Pure), same_purity
+	../input: setup_diagnostic, singleton_check_error
+	fs: temporary_directory, resource_path, message
+	system: temp_dir, write_file
+	test: TestSuite
+
+
+private func with_helpers(assertions: pure (Model.CheckedFunction, Model.CheckedFunction, Model.CheckedFunction, Model.CheckedFunction, Model.CheckedUnion) -> Bool) -> Bool:
+	match load_program("blorp_2/test/e2e/fixtures/generic/managed/list_callbacks.brp", "blorp_2/standard_library"):
+		Err(_): False
+		Ok(loaded):
+			parsed = parsed_contents(loaded.program)
+			match (parsed.modules.filter(pure func(row): same_module(row.module, root_module_id())), check(loaded.program)):
+				([root], Ok(program)):
+					rows = checked_functions(program)
+					list_imports = root.imports.filter(pure func(request): request.path.parts.map(pure func(part): name_spelling(parsed.names, part)) == [Some("list")])
+					booleans = inventory_unions(parsed.declarations).filter(pure func(row):
+						same_module(row.module, parsed.foundation.types) and same_name(row.type_name.id, foundation_words(parsed.names).bool_word)
+					)
+					match (list_imports, booleans):
+						([list_import], [boolean]):
+							-- Literal API names select issued IDs only within this loaded List module.
+							helpers = ["any", "any_range", "map", "filter"].map(pure func(name):
+								declarations = inventory_functions(parsed.declarations).filter(pure func(row):
+									same_module(row.declaration.module, list_import.target) and name_spelling(parsed.names, row.declaration.function_name.id) == Some(name)
+								)
+								match declarations:
+									[declaration]: rows.functions.get(function_number(declaration.id))
+									_: None
+							)
+							match (helpers, rows.unions.get(union_number(boolean.id))):
+								([Some(any), Some(range), Some(mapped), Some(filtered)], Some(owner)):
+									assertions(any, range, mapped, filtered, owner)
+								_: False
+						_: False
+				_: False
+
+
+private pure func owns_rigids(function: Model.CheckedFunction) -> Bool:
+	same_purity(function.signature.purity, Pure) and function.signature.type_parameters.all(pure func(parameter):
+		match Model.parameter_owner(parameter):
+			Model.FunctionDeclaration(owner): function_number(owner) == function_number(function.id)
+			_: False
+	)
+
+
+func test_public_signatures_preserve_independent_function_owned_types() -> Bool:
+	with_helpers(pure func(any, range, mapped, filtered, boolean):
+		match (any.signature.type_parameters, mapped.signature.type_parameters, filtered.signature.type_parameters):
+			([t], [input, output], [element]):
+				match (any.signature.parameters, mapped.signature.parameters, filtered.signature.parameters):
+					([values, predicate], [source, callback], [candidates, keep]):
+						(
+							[any, range, mapped, filtered].all(owns_rigids)
+							and not Model.same_parameter(input, output) and not Model.same_parameter(t, element)
+							and Model.same_type(values.value_type, Model.ListType(Model.ParameterType(t)))
+							and Model.same_type(predicate.value_type, Model.PureCallableType([Model.ParameterType(t)], Model.UnionType(boolean.id)))
+							and Model.same_type(any.signature.return_type.value_type, Model.UnionType(boolean.id))
+							and Model.same_type(source.value_type, Model.ListType(Model.ParameterType(input)))
+							and Model.same_type(callback.value_type, Model.PureCallableType([Model.ParameterType(input)], Model.ParameterType(output)))
+							and Model.same_type(mapped.signature.return_type.value_type, Model.ListType(Model.ParameterType(output)))
+							and Model.same_type(candidates.value_type, Model.ListType(Model.ParameterType(element)))
+							and Model.same_type(keep.value_type, Model.PureCallableType([Model.ParameterType(element)], Model.UnionType(boolean.id)))
+							and Model.same_type(filtered.signature.return_type.value_type, Model.ListType(Model.ParameterType(element)))
+						)
+					_: False
+			_: False
+	)
+
+
+private pure func same_variant(left: VariantId, right: VariantId) -> Bool:
+	variant_number(left) == variant_number(right) and Model.same_type(Model.UnionType(variant_owner(left)), Model.UnionType(variant_owner(right)))
+
+
+private pure func forwarded_choice(call: Model.CheckedCall, caller: Model.CheckedFunction, target: Model.CheckedFunction) -> Bool:
+	match call.target:
+		Model.UserFunction(callee, [Model.ParameterType(element)], [argument]):
+			match (caller.signature.type_parameters, argument.choice):
+				([parameter], Model.ForwardedCallable(forwarded)):
+					(
+						function_number(callee) == function_number(target.id) and Model.same_parameter(parameter, element)
+						and Model.same_callable_parameter(forwarded, Model.callable_parameter(caller.id, 1))
+					)
+				_: False
+		_: False
+
+
+private pure func short_circuit_selection(selected: Model.CheckedJoin, range: Model.CheckedFunction, boolean: Model.CheckedUnion) -> Bool:
+	match (selected.scrutinee.form, selected.arms, boolean.variants):
+		(Model.InvokeFunction(left, _), [yes, no], [truth, falsehood]):
+			match (yes.pattern, yes.value.form, no.pattern, no.value.form):
+				(Model.VariantCase(first, []), Model.ConstructVariant(returned, []), Model.VariantCase(second, []), Model.InvokeFunction(right, _)):
+					(
+						yes.statements.is_empty() and no.statements.is_empty()
+						and same_variant(first, truth.id) and same_variant(returned, truth.id)
+						and same_variant(second, falsehood.id)
+						and forwarded_choice(left, range, range) and forwarded_choice(right, range, range)
+					)
+				_: False
+		_: False
+
+
+func test_any_true_left_branch_returns_without_the_right_call() -> Bool:
+	with_helpers(pure func(any, range, mapped, filtered, boolean):
+		forwarded = match Model.function_calls(any):
+			[_, call]: forwarded_choice(call, any, range)
+			_: False
+		match range.body:
+			Model.CheckedMatchBody(empty_test):
+				match empty_test.arms:
+					[_, nonempty]:
+						match nonempty.body:
+							Model.ReturnExpression(value):
+								match value.form:
+									Model.Match(singleton):
+										match singleton.arms:
+											[_, split]:
+												match split.value.form:
+													Model.Match(selected): forwarded and short_circuit_selection(selected, range, boolean)
+													_: False
+											_: False
+									_: False
+							_: False
+					_: False
+			_: False
+	)
+
+
+private NEGATIVE_MAIN: String =
+	|import:
+	|    list: any
+	|pure func predicate(value: Int) -> Bool:
+	|    True
+	|pure func string_predicate(value: String) -> Bool:
+	|    True
+	|pure func integer(value: Int) -> Int:
+	|    value
+	|pure func binary(first: Int, second: Int) -> Bool:
+	|    True
+	|func impure(value: Int) -> Bool:
+	|    True
+	|func main() -> Int:
+	|
+private END: String =
+	|
+	|    0
+	|
+
+
+private func rejects(prefix: String, marked: String, suffix: String, help: String, kind_matches: pure (Errors.CheckErrorKind) -> Bool) -> Result[Bool, String]:
+	with directory ?= temporary_directory(temp_dir(), "blorp-2-list-callback-negative-") on error => message(error):
+		path = directory.resource_path() + "/main.brp"
+		written ?= write_file(path, prefix + marked + suffix + END)
+		loaded ?= load_program(path, "blorp_2/standard_library").map_err(func(failure): failure.diagnostic.message)
+		match check(loaded.program):
+			Ok(_): Ok(False)
+			Err(failure):
+				diagnostic = setup_diagnostic(failure)
+				match singleton_check_error(check_errors(failure)):
+					None: Ok(False)
+					Some(error):
+						message = match error.kind:
+							Errors.CallRejection(Errors.ImpureCallback(_)): "pure callback requires a pure function"
+							_: "argument type does not match the parameter type"
+						Ok(
+							kind_matches(error.kind) and diagnostic.message == message and diagnostic.help == help and diagnostic.note.is_none()
+							and same_source(error.span.source, module_source(root_module_id()))
+							and error.span.start == prefix.length() and error.span.end == prefix.length() + marked.length()
+							and same_source(diagnostic.span.source, error.span.source)
+							and diagnostic.span.start == error.span.start and diagnostic.span.end == error.span.end
+						)
+
+
+func test_wrong_list_is_rejected_at_the_argument() -> Bool:
+	rejects(NEGATIVE_MAIN + "    any(", "\"bad\"", ", predicate)", "use an expression of type List[Int] here", pure func(kind):
+		match kind:
+			Errors.CallRejection(Errors.ArgumentTypeMismatch(mismatch)):
+				mismatch.argument_position == 0 and Model.same_type(mismatch.expected, Model.ListType(Model.IntType)) and Model.same_type(mismatch.actual.value_type, Model.StringType)
+			_: False
+	).get_or(False)
+
+
+func test_callback_input_conflicts_with_the_list_element() -> Bool:
+	rejects(NEGATIVE_MAIN + "    any([1], ", "string_predicate", ")", "use an expression of type pure (Int) -> Bool here", pure func(kind):
+		match kind:
+			Errors.CallRejection(Errors.GenericArgumentConflict(conflict)):
+				match (conflict.mismatch.expected, conflict.mismatch.actual.value_type):
+					(Model.PureCallableType([Model.IntType], expected), Model.PureCallableType([Model.StringType], actual)):
+						conflict.mismatch.argument_position == 1 and Model.same_type(expected, actual) and Model.same_type(conflict.previous.value_type, Model.IntType) and Model.same_type(conflict.current.value_type, Model.StringType)
+					_: False
+			_: False
+	).get_or(False)
+
+
+func test_predicate_result_must_be_bool() -> Bool:
+	rejects(NEGATIVE_MAIN + "    any([1], ", "integer", ")", "use an expression of type pure (Int) -> Bool here", pure func(kind):
+		match kind:
+			Errors.CallRejection(Errors.ArgumentTypeMismatch(mismatch)):
+				match (mismatch.expected, mismatch.actual.value_type):
+					(Model.PureCallableType([Model.IntType], Model.UnionType(_)), Model.PureCallableType([Model.IntType], Model.IntType)): mismatch.argument_position == 1
+					_: False
+			_: False
+	).get_or(False)
+
+
+func test_callback_written_arity_must_match() -> Bool:
+	rejects(NEGATIVE_MAIN + "    any([1], ", "binary", ")", "use an expression of type pure (Int) -> Bool here", pure func(kind):
+		match kind:
+			Errors.CallRejection(Errors.ArgumentTypeMismatch(mismatch)):
+				match (mismatch.expected, mismatch.actual.value_type):
+					(Model.PureCallableType([Model.IntType], expected), Model.PureCallableType([Model.IntType, Model.IntType], actual)):
+						mismatch.argument_position == 1 and Model.same_type(expected, actual)
+					_: False
+			_: False
+	).get_or(False)
+
+
+func test_compatible_impure_callback_is_rejected() -> Bool:
+	rejects(NEGATIVE_MAIN + "    any([1], ", "impure", ")", "pass a pure named function; impure functions cannot satisfy a pure callable parameter", pure func(kind):
+		match kind:
+			Errors.CallRejection(Errors.ImpureCallback(_)): True
+			_: False
+	).get_or(False)
+
+
+tests: TestSuite = {
+	description = "Blorp 2 loaded List callback contracts",
+	tests = [
+		("List callback signatures preserve independent function-owned types", test_public_signatures_preserve_independent_function_owned_types),
+		("List any True left arm excludes the right recursive call", test_any_true_left_branch_returns_without_the_right_call),
+		("List any rejects a non-List argument", test_wrong_list_is_rejected_at_the_argument),
+		("List any callback input agrees with the List element", test_callback_input_conflicts_with_the_list_element),
+		("List any predicate returns Bool", test_predicate_result_must_be_bool),
+		("List any callback has one written parameter", test_callback_written_arity_must_match),
+		("List any rejects a signature-compatible impure callback", test_compatible_impure_callback_is_rejected),
+	]
+}

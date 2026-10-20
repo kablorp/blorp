@@ -19,6 +19,8 @@ functions may use a sole closed builtin body, including `builtin("int.add")`,
 with an exact runtime signature.
 The ordinary [pilot `append_int` API](../blorp_2/README.md#counted-string-operations)
 uses the existing function-call and UFCS grammar.
+The [pilot prefix helper](../blorp_2/README.md#counted-string-operations) also
+uses existing calls and UFCS; its implementation has a temporary linear stack bound.
 Imports preserve declaration identities; only the root module's local `main`
 is the entrypoint. It takes either no parameters or one List[String] parameter
 and returns Int or Void. Omitting a function's return annotation means Void.
@@ -1374,6 +1376,8 @@ dim_atom      = DIMNAME | "#" "_" | "#" INT | INT | "(" dim_expr ")" ;
   The pilot's [List membership APIs](../blorp_2/standard_library/README.md#list-membership)
   use this ordinary callable syntax, with a temporary Int adapter and linear O0
   stack in the current implementation; they add no grammar production.
+- Blorp 2's [List callback helpers](../blorp_2/LIST_CALLBACK_PLAN.md) use the
+  same pure callable parameter syntax; they introduce no additional grammar.
 - `(T)` is `T`. `(T,)` is ``a tuple type has two to four elements, and `(T,)`
   has one``. A function type's return type extends as far as a type can, so
   `(A) -> (B) -> C` returns `(B) -> C`.

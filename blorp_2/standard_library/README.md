@@ -61,6 +61,15 @@ independently owned element inside ordinary Option; invalid indexes return None.
 A nonpositive repeat count creates an empty List. Each repeated occurrence
 owns its own stored obligation; final root release destroys each initialized
 slot once.
+
+Generic `any`, `map` and `filter` accept pure named callbacks, including unchanged
+forwarded callback parameters. `map` permits distinct input/result types;
+`filter` keeps input order, and `any` skips later elements after its first True.
+These ordinary source helpers use balanced recursion: logarithmic C stack,
+with O(n log n) copied List slots for map/filter as a temporary bootstrap cost.
+See [the callback plan](../LIST_CALLBACK_PLAN.md); no constant-stack or COW claim
+is implied.
+
 List literals are supported. `set_index(values, index, value)` returns
 `Option[List[T]]`: `Some(updated)` for a valid index, or `None` for a negative
 or out-of-bounds index. `set(values, index, value)` returns `List[T]`:
@@ -129,6 +138,9 @@ Their builtin bodies name only the operation; results refer to the
 foundation's designated Bool and Option, found by name in `_base.brp`, and
 layout follows the unions' declaration order. Each adapter records its upstream
 provenance. Traits and FFI remain inactive.
+
+`string.starts_with` is an ordinary pure counted-byte prefix helper; see the
+[contract and temporary stack bound](../README.md#counted-string-operations).
 
 The current [calculator](../README.md#calculator-input-and-results) and
 [Float contracts](../README.md#float64-calculator) define deliberate conversion and arithmetic
