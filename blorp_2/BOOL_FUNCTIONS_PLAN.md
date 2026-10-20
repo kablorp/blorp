@@ -1,13 +1,43 @@
 # Ordinary Boolean functions
 
-Implement the user's six call forms in Blorp 2: `True.not()` / `not(True)`,
+Implement the user's six call forms in both compilers: `True.not()` / `not(True)`,
 `flag.and(other)` / `and(flag, other)`, and `flag.or(other)` / `or(flag, other)`.
 The separate Boolean operator implementation is paused. These are ordinary,
 eager function calls; use explicit `match` when the right side must be skipped.
 
+## Bootstrap order
+
+The legacy host must build source migrated to these calls too. Its active
+discovery builder, maintained tree parser and stage03 parser need scoped callable
+names. Stage03 also serves formatting, AST output and test discovery. Existing
+legacy name tables already issue keyword IDs; use those authorities, without
+new token kinds or broad keyword unreservation.
+
+Default `make` uses the immutable bootstrap with the checkout's host library.
+That bootstrap rejects keyword function declarations. Land three green slices:
+
+1. A: legacy parser capability with the unchanged host library. Accept the three
+   callable names in declarations/imports/UFCS/qualified calls, plus direct
+   `and(...)`/`or(...)`. Keep unqualified `not(...)` as unary syntax for this
+   preparatory slice, so current sources still work without a prelude function.
+   Test ordinary `not` calls through UFCS/qualification and actual callee identity;
+   do not claim the final six forms are complete yet.
+2. B: successful main CI automatically publishes immutable dev snapshots. Verify
+   the actual released source/capability and all three platform asset digests,
+   then rotate the bootstrap pin. Run default make and the maintained bootstrap,
+   release-toolchain and package gates; no local override or old-library fallback.
+3. C: add ordinary host `bool.brp` functions/prelude selections and switch legacy
+   `not` followed by `(` to a function call together. The verified A bootstrap can
+   parse those headers. Existing legacy unparenthesized operators remain available
+   to host current compiler sources; Blorp 2 rejects those operator forms.
+
+Blorp 2's parser/helpers may land independently: its target library is not the
+host library read by `make`. Each slice still needs two reviews and its own green
+gates. Do not migrate compiler source operators wholesale in these slices.
+
 ## Smallest complete path
 
-Add three ordinary pure functions in `standard_library/bool.brp`, importing
+Add three ordinary pure functions in `blorp_2/standard_library/bool.brp`, importing
 `_base: Bool(True, False)`. Implement their truth tables entirely with `match`:
 
 ```blorp
@@ -24,8 +54,10 @@ prelude: existing named function imports provide direct calls and UFCS. Its
 own declarations deliberately are not exported; preserve that namespace rule.
 Document the temporary bootstrap convenience of implicit availability; moving
 these selections later does not require another compiler representation.
+Add the same match bodies to the host's existing `standard_library/src/bool.brp`
+in C and expose the names through its prelude; keep existing trait methods intact.
 
-The lexer keeps `AndKeyword`, `OrKeyword`, and `NotKeyword`. Append their
+In Blorp 2 the lexer keeps `AndKeyword`, `OrKeyword`, and `NotKeyword`. Append their
 spellings after existing seeded names, retaining issued IDs in the existing
 `ContextualWords`. A narrow parser helper maps those three token variants to
 their canonical IDs. Do not recover names from source spelling or numeric IDs.
@@ -38,7 +70,7 @@ spacing rule as other calls: both `not(True)` and `not (True)` work. Use that
 same prefix-not distinction in range operand parsing. Postfix keyword selectors
 require call parentheses; qualified function references may follow the existing
 qualified-name path. Bare unqualified keyword references remain out of scope.
-Prefix `not value` and infix `left and right` / `left or right` are invalid.
+In Blorp 2, prefix `not value` and infix `left and right` / `left or right` are invalid.
 Use the existing rejection path, with diagnostics teaching ordinary calls;
 remove promises that these operators will arrive at a later milestone.
 Keep the negative cases and update their exact expected message/help.
@@ -48,24 +80,32 @@ compiler-source migration belongs in this change.
 
 ## Evidence and bounds before implementation
 
-Compiler/library forecast: 123–168 added and about 103–148 net lines. Hard
-bounds are 200 added /175 net production; reassess at 170 added or 149 net.
-Allow 550 added test lines, a 45-line fixture, 35 API documentation lines and
-100 plan lines. Keep readable, granular coverage; stop to reforecast rather
-than compressing tests or removing assertions to fit.
+Combined production forecast: 238–363 added lines, with no new IR or runtime.
+Blorp 2 retains 200 added /175 net; reassess at 170 added or 149 net.
+Legacy A allows 180 added /150 net, C allows 50 added /40 net; final combined
+production stays within 430 added /365 net. B is the verified manifest change.
+Allow 550 added Blorp 2 test lines plus a 45-line fixture; legacy A allows 600
+test/80 fixture lines and C allows 250 test/50 fixture lines. API docs stay within
+50 added lines and this expanded plan within 150. These are ceilings, not goals;
+reuse ordinary-call tests. Stop to reforecast rather than compress or drop coverage.
 
 Before code, freeze the exact accepted main containing the pending Contains
 addition as B, with its complete compiler source, target library, functional
-host/STD and cost producer provenance. Name the commit and physical paths in
+host/STD and cost producer provenance for each slice. Name commits and paths in
 the evidence before any measurements. This is a new ordinary-call feature;
 do not replace or reinterpret the paused operator feature's original receipts.
 Preserve all existing absolute fixture limits. For shared target controls,
 retain a 5% allocation/instruction target and 10% hard ceiling per metric.
-For the matched compiler-construction proxy require allocations and normal
-retired instructions each at most B+3%; label it a proxy, not self-compilation.
+For construction proxies and legacy self-compilation require allocations and
+normal retired instructions each at most B+3%; label only construction as a proxy.
 Measure serially, same physical inputs and toolchain, positive min-of-three
 normal instructions and the unique schema1 construction allocation checkpoint
-for that proxy. Keep failures, raw samples and output identity evidence.
+for a construction proxy. Measure legacy self-compilation at its actual boundary
+with its retained measurement tool. Keep failures, raw samples and output identity
+evidence; do not mix host or library roles between phases.
+Keep the original accepted B source and ceilings through the pin transition.
+The final legacy comparison must use one verified A-capable producer for both
+B and C, pinned before sampling; never compare pre-pin and post-pin timings.
 
 ## Validation and landing
 
@@ -85,10 +125,17 @@ ASan/UBSan, strict balanced accounting and exact streams/status; inspect C.
 Run relevant parser/name/namespace/check suites, current component/native gates,
 shared accepted/rejected output comparisons, matched costs and a frontier probe.
 Record actual commands, inputs and totals rather than old suite counts.
+Legacy fixtures belong to their legacy owners; never run Blorp 2's e2e suite
+through the legacy compiler. Use discovery fixtures, `scripts/test compiler-new`,
+`scripts/test compiler-blorp compiler-new-parity`, and the changed
+compiler checks selected by `scripts/compiler-check --changed --plan`.
+For C, test formatting twice: old `not (a and b)` intentionally becomes an
+ordinary call and should print as `not(a and b)` consistently. Preserve plain
+`not foo()` as legacy unary syntax; test AST/callee identity, not truth output
+alone. Add a formatter code change only if a real roundtrip failure requires it.
 
 Parser/ergonomics/data-authority input approved this design before code.
 Publish this plan first; implementation needs independent code-reviewer and
 test-runner approval before commit. Update the owning Blorp 2 grammar/README,
-library README and scoped GUIDE/GRAMMAR notes with the feature; do not promise
-this new callable-keyword syntax in the legacy compiler. Root integrates the
+library READMEs and GUIDE/GRAMMAR notes with each supported stage. Root integrates the
 bounded feature, verifies destination gates, then pushes main to origin.
