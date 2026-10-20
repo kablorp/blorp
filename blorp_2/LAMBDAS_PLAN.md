@@ -331,6 +331,18 @@ For each metric require C <= min(original absolute 8% ceiling, floor(Bsup*108/10
 reassess at original 6% threshold or floor(Bsup*106/100)+1, where Bsup is new B.
 No subtraction, offsets, automatic B resampling, reset or stacked credit.
 
+### Prospective C-only instruction characterization
+
+STOP5's 26,525,323 allocations remain HARD FAIL; no acceptance or waiver.
+After two reviews, publish this amendment and obtain a new finite serial START.
+Run only frozen commands06/07/08: C normal1/2/3, once each, in that order.
+Keep f798 source, producers, old STD91, parent environment and physical paths exact.
+No setup compilation, new B, diagnostic, resampling, repair or source change.
+Preserve each raw run before clearing shared outputs; require C exact to STOP5.
+Record three positive instruction values/min3. Budget misses remain FAIL;
+other failures STOP immediately. Restore frozen C41 and return the lane.
+Allocation HARD FAIL binds regardless of instructions; no numerical waiver.
+
 Per-slice acceptance: semantic RED, owner GREEN, source41 parse, generated C,
 effective faults/restoration, full component/native gates with strict zero and
 sanitizers, cumulative costs/LOC inside stops, two final independent reviews.
