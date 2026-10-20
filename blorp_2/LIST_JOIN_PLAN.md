@@ -87,14 +87,14 @@ The original eight return/zero calls are complete and must never repeat.
 Attribution measured Load+1782/Check+2606 allocations; all five later phases were
 unchanged. These are diagnostic intervals, not instruction or acceptance proof.
 Completed24 control and3 fixture normal samples stay credited; all failures bind.
-The first native umbrella timed out at180s. After two reviews and a finite grant,
-one unchanged-cap fullnative --timeout0 (maintained Makefile policy) may finish
-validation:29 calls total. Reuse strict39931/129642982; no cost/strict resampling.
-Every original5%/10%/absolute miss remains FAIL. Only numerical-limit failures
-may be collected; semantic/status/leak/counter/C/provenance faults STOP unused calls.
-Retain all raw outputs and map every native limit field/shared user/max excess.
-No B roll, cap change, acceptance or merge follows characterization. Planned
-faults/restorations and current-main composition remain separate.
-Root semantically composes List import/function hunks; no whole-file replacement.
-Two independent reviews/full gates and resource acceptance precede root commit.
-No source write, compiler call, commit or implementation dispatch is authorized here.
+The original native180s timeout and corrected441PASS/57FAIL remain retained.
+Current27b+Join599e7703 is a distinct composition, not a baseline replacement.
+After two reviews/publication/START, only16 current-C samples (four controls,
+three normal+one strict each) use original02ec/ef936 paths/env and credited old B.
+One current whole-native --timeout0 is also permitted:17 characterization calls.
+All original5%/10%/absolute misses stay FAIL; no benchmark or B replay.
+Only numerical misses may continue in these17; other20 functional/fault calls
+must match exact oracles. Any nonbudget failure STOPs unused calls.
+Map actual current limits/shared users/max; never add old allowances twice.
+No cap/B/HOST/acceptance/merge waiver. Root semantically composes List hunks;
+two independent final reviews/full gates/resource acceptance precede commit.
