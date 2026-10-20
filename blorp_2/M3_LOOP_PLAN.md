@@ -86,7 +86,9 @@ True ordinary body operations/Joins followed by Recur. Nested statement-if joins
 still yield and have no loop exit. This does not cover an early break/continue
 inside a body join; that and later managed carriers need their own reviewed design
 and fresh forecast. Keep canonical Bool and accepted integer comparison identity
-contracts; no Boolean-operator or generic If expansion is granted by this witness.
+contracts. Statement-position if, inside or outside a loop, normalizes through
+the same ordinary Void CheckedJoin; value/argument if remains unsupported. No
+Boolean-operator, separate If backend or other conditional expansion is granted.
 
 The prospective FEATURE ceilings remain **750 gross production / +600 net** and
 **1600 gross tests**, with the existing at-most3/120-total-line fixture bounds.
@@ -107,7 +109,8 @@ Acceptance is bounded and must be independently reviewed before execution:
    acceptance and same-shaped/non-Bool rejection; ordered H identities excluding
    locals; NoOwnership from sealed layouts; initial/condition/body evaluation
    order; zero and final-False edges; Void P/carried arity; header snapshots; PRE
-   non-discharge and ordinary body-Join cleanup. Conditions with an observable
+   non-discharge and ordinary body-Join cleanup. Include a standalone statement-if
+   control outside loops, with an absent else yielding Void. Conditions with an observable
    ordinary IO marker must be evaluated n+1 times; check exact output order.
    Positive native and phase oracles must observe borrowed SourceFile/contents PRE
    surviving iterations and the final exit, plus a mortal String iteration-local
