@@ -796,12 +796,29 @@ PY
 
 expect_test_closed_stdout_failure() {
     local name="$1"
-    shift
+    local stdin_mode="$2"
+    shift 2
     local stderr_file code output
     stderr_file=$(mktemp "$TMPDIR_CLI/stderr.XXXXXX") || exit 1
 
     TOTAL=$((TOTAL + 1))
-    "$@" 1>&- 2> "$stderr_file"
+    # Rust/uutils env reopens closed standard descriptors. Configure the
+    # environment first, then close the intended descriptors at the CLI exec.
+    case "$stdin_mode" in
+        open)
+            "${BLORP_DIRECT_TEST_ENV[@]}" bash -c 'exec "$@" 1>&-' bash "$@" \
+                2> "$stderr_file"
+            ;;
+        closed)
+            "${BLORP_DIRECT_TEST_ENV[@]}" bash -c 'exec "$@" 0<&- 1>&-' bash "$@" \
+                2> "$stderr_file"
+            ;;
+        *)
+            rm -f "$stderr_file"
+            record_fail "$name" "unknown stdin mode: $stdin_mode; use open or closed"
+            return 1
+            ;;
+    esac
     code=$?
     output=$(cat "$stderr_file")
     rm -f "$stderr_file"
@@ -809,7 +826,10 @@ expect_test_closed_stdout_failure() {
     if [ "$code" -ne 1 ]; then
         record_fail "$name" "expected exit 1, got $code
 $output"
-    elif echo "$output" | grep -qF "cannot forward captured test output"; then
+    elif ! echo "$output" | grep -Fxq "candidate-stderr-marker"; then
+        record_fail "$name" "missing candidate stderr marker
+$output"
+    elif echo "$output" | grep -Fxq "Error: cannot forward captured test output"; then
         record_pass "$name"
     else
         record_fail "$name" "missing output forwarding diagnostic
@@ -2394,11 +2414,11 @@ $RUN_OUTPUT"
 		"${BLORP_DIRECT_TEST_ENV[@]}" BLORP_PROCESS_MAX_OUTPUT_BYTES=4 \
 		"$BLORP_BIN" test --suite --timeout 5 "$binary_output_test"
 	expect_test_closed_stdout_failure "eligible suite reports output forwarding failure" \
-		"${BLORP_DIRECT_TEST_ENV[@]}" \
+		open \
 		"$BLORP_BIN" test --suite --timeout 5 "$binary_output_test"
 	expect_test_closed_stdout_failure "eligible suite reports output forwarding failure with closed stdin" \
-		"${BLORP_DIRECT_TEST_ENV[@]}" \
-		"$BLORP_BIN" test --suite --timeout 5 "$binary_output_test" 0<&-
+		closed \
+		"$BLORP_BIN" test --suite --timeout 5 "$binary_output_test"
 	expect_output_contains "eligible suite closes stdin" 0 "[PASS] observes closed stdin" \
 		"${BLORP_DIRECT_TEST_ENV[@]}" \
 		"$BLORP_BIN" test --suite --timeout 5 "$stdin_test"

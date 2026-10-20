@@ -1,0 +1,227 @@
+name: Native closed stdio diagnostic
+
+on:
+  push:
+    branches: [codex/linux-product-forwarding-diagnostic]
+
+permissions:
+  contents: read
+
+jobs:
+  native-stdio:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      BLORP_CC: clang
+      BLORP_CLI_C_OPTIMIZATION: -O2
+      BLORP_CLI_C_SPLIT_JOBS: 2
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install host dependencies
+        run: sudo apt-get update && sudo apt-get install -y clang libssl-dev pkg-config
+      - name: Build the product role and observe both launch boundaries
+        shell: bash
+        run: |
+          set -euo pipefail
+          artifact=build/native-stdio
+          mkdir -p "$artifact"
+          cpu_list=$(python3 -c 'import os; print(",".join(map(str, sorted(os.sched_getaffinity(0))[:2])))')
+          taskset -pc "$cpu_list" $$
+          export BLORP_BUILD_COMMIT="$GITHUB_SHA"
+          export BLORP_BUILD_DIRTY=false
+          cat > "$artifact/observe_stdio.c" <<'C'
+          #define _GNU_SOURCE
+          #include <errno.h>
+          #include <fcntl.h>
+          #include <stdio.h>
+          #include <stdlib.h>
+          #include <sys/syscall.h>
+          #include <unistd.h>
+          
+          static void observe(const char* phase, int descriptor) {
+              int saved = errno;
+              char path[64], target[256], message[512];
+              snprintf(path, sizeof(path), "/proc/self/fd/%d", descriptor);
+              ssize_t size = readlink(path, target, sizeof(target) - 1);
+              if (size < 0) size = 0;
+              target[size] = 0;
+              int count = snprintf(message, sizeof(message),
+                  "STDIO phase=%s fd=%d flags=%d target=%s\n",
+                  phase, descriptor, fcntl(descriptor, F_GETFL), target);
+              syscall(SYS_write, STDERR_FILENO, message, (size_t)count);
+              errno = saved;
+          }
+          
+          __attribute__((constructor)) static void observe_initial_stdio(void) {
+              int saved = errno;
+              unsetenv("LD_PRELOAD");
+              observe("startup", STDIN_FILENO);
+              observe("startup", STDOUT_FILENO);
+              errno = saved;
+          }
+          C
+          cat > "$artifact/binary_output_test.brp" <<'BRP'
+          import:
+          	bytes: bytes
+          	test: TestSuite
+          
+          func test_writes_binary_streams() -> Bool:
+          	output = bytes(3)
+          		.set_index(0, 0)
+          		.set_index(1, 65)
+          		.set_index(2, 255)
+          	puts(output)
+          	print_error("candidate-stderr-marker")
+          	True
+          
+          tests: TestSuite = {
+          	description = "CLI binary output test",
+          	tests = [("writes binary streams", test_writes_binary_streams)]
+          }
+          BRP
+          make > "$artifact/build.log" 2>&1
+          make build-blorp-cli-diagnostic > "$artifact/diagnostic-build.log" 2>&1
+          scripts/compiler-build-status > "$artifact/build-status.log"
+          bin/blorp --version > "$artifact/version.log"
+          {
+              cat /etc/os-release
+              ldd --version
+              clang --version
+              env --version
+              readlink -f /usr/bin/env
+          } > "$artifact/host.log"
+          sha256sum bin/blorp blorp/build/_build/blorp-cli/blorp-diagnostic \
+              blorp/src/lib/runtime/native/runtime.c \
+              blorp/build/_build/blorp-cli/runtime_sources.c \
+              blorp/build/_build/blorp-cli/runtime-*.o > "$artifact/identities.log"
+          clang -shared -fPIC "$artifact/observe_stdio.c" -o "$artifact/observe_stdio.so"
+          fixture_directory=$(mktemp -d /tmp/blorp_cli.XXXXXX)
+          cp "$artifact/binary_output_test.brp" "$fixture_directory/binary_output_test.brp"
+          for phase in baseline passive after-env; do
+              for mode in normal diagnostic; do
+                  if [ "$phase" = passive ] && [ "$mode" = diagnostic ]; then continue; fi
+                  binary=bin/blorp
+                  if [ "$mode" = diagnostic ]; then binary=blorp/build/_build/blorp-cli/blorp-diagnostic; fi
+                  for stdin_state in open closed; do
+                      label="$phase-$mode-$stdin_state"
+                      command=(env -u BLORP_TEST_TIMEOUT -u BLORP_LEAK_CHECK -u BLORP_GATE_RESULT -u BLORP_TEST_TIMINGS)
+                      target=("$binary" test --suite --timeout 5 "$fixture_directory/binary_output_test.brp")
+                      if [ "$phase" = passive ]; then command+=("LD_PRELOAD=$PWD/$artifact/observe_stdio.so"); fi
+                      status=0
+                      if [ "$phase" = after-env ]; then
+                          if [ "$stdin_state" = closed ]; then
+                              "${command[@]}" bash -c 'exec "$@" 0<&- 1>&-' bash "${target[@]}" 2> "$artifact/$label.stderr" || status=$?
+                          else
+                              "${command[@]}" bash -c 'exec "$@" 1>&-' bash "${target[@]}" 2> "$artifact/$label.stderr" || status=$?
+                          fi
+                      elif [ "$stdin_state" = closed ]; then
+                          "${command[@]}" "${target[@]}" 0<&- 1>&- 2> "$artifact/$label.stderr" || status=$?
+                      else
+                          "${command[@]}" "${target[@]}" 1>&- 2> "$artifact/$label.stderr" || status=$?
+                      fi
+                      printf '%s\n' "$status" > "$artifact/$label.status"
+                  done
+              done
+          done
+          python3 - <<'PY'
+          from pathlib import Path
+          import os
+          import re
+          import shlex
+          import sys
+          
+          artifact = Path("build/native-stdio")
+          def notice(title, body):
+              escaped = body.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+              print(f"::notice title={title}::{escaped}")
+          
+          for name in ("version.log", "host.log", "identities.log", "build-status.log"):
+              notice(name, (artifact / name).read_text())
+          host_lines = (artifact / "host.log").read_text().splitlines()
+          host_fields = {}
+          for line in host_lines:
+              if line.startswith(("ID=", "VERSION_ID=")):
+                  key, value = line.split("=", 1)
+                  decoded = shlex.split(value)
+                  host_fields[key] = decoded[0] if len(decoded) == 1 else ""
+          env_versions = [line for line in host_lines if re.fullmatch(r"env \(uutils coreutils\) \S+", line)]
+          eligible = (
+              host_fields.get("ID") == "ubuntu"
+              and host_fields.get("VERSION_ID") == "26.04"
+              and len(env_versions) == 1
+          )
+          notice("reproduction-cohort", f"eligible={eligible}; requires Ubuntu 26.04 and uutils env")
+          failed = not eligible
+          marker = "candidate-stderr-marker"
+          forwarding_error = "Error: cannot forward captured test output"
+          for phase in ("baseline", "passive", "after-env"):
+              for mode in ("normal", "diagnostic"):
+                  if phase == "passive" and mode == "diagnostic":
+                      continue
+                  for stdin_state in ("open", "closed"):
+                      label = f"{phase}-{mode}-{stdin_state}"
+                      status = int((artifact / f"{label}.status").read_text())
+                      stderr = (artifact / f"{label}.stderr").read_text()
+                      lines = stderr.splitlines()
+                      valid = marker in lines
+                      if phase == "after-env":
+                          valid = valid and status == 1 and forwarding_error in lines
+                      else:
+                          valid = valid and status == 0 and forwarding_error not in stderr
+                      if phase == "passive":
+                          stdout_facts = [
+                              match for line in lines
+                              if (match := re.fullmatch(r"STDIO phase=startup fd=1 flags=(-?\d+) target=(.*)", line))
+                          ]
+                          valid = valid and len(stdout_facts) == 1
+                          if len(stdout_facts) == 1:
+                              flags = int(stdout_facts[0][1])
+                              valid = (
+                                  valid
+                                  and stdout_facts[0][2] == "/dev/null"
+                                  and flags >= 0
+                                  and (flags & os.O_ACCMODE) == os.O_RDWR
+                              )
+                      notice(label, f"status={status}; valid={valid}\n{stderr}")
+                      if not valid:
+                          failed = True
+          sys.exit(1 if failed else 0)
+          PY
+          status=0
+          BLORP_DIAGNOSTIC_BIN="$PWD/blorp/build/_build/blorp-cli/blorp-diagnostic" \
+              scripts/test --no-build --serial --log-dir "$artifact/maintained-cli" cli \
+              > "$artifact/maintained-cli.log" 2>&1 || status=$?
+          printf '%s\n' "$status" > "$artifact/maintained-cli.status"
+          python3 - <<'PY'
+          from pathlib import Path
+          import sys
+          
+          artifact = Path("build/native-stdio")
+          status = int((artifact / "maintained-cli.status").read_text())
+          owner_log = artifact / "maintained-cli" / "cli.log"
+          lines = owner_log.read_text().splitlines() if owner_log.is_file() else []
+          summaries = [line for line in lines if line.startswith("BLORP_GATE_RESULT")]
+          # This disposable diagnostic pins the reviewed 155-test CLI cohort.
+          expected = "BLORP_GATE_RESULT gate=cli status=PASS passed=155 failed=0 tests=155"
+          passed = (
+              status == 0
+              and summaries == [expected]
+              and bool(lines)
+              and lines[-1] == expected
+          )
+          body = f"status={status}; valid={passed}\n" + "\n".join(summaries)
+          escaped = body.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+          print(f"::notice title=maintained-cli::{escaped}")
+          sys.exit(0 if passed else 1)
+          PY
+      - name: Preserve diagnostic receipts
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: native-stdio-diagnostic
+          path: build/native-stdio/
+
+
+
+
+
