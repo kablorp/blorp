@@ -86,15 +86,15 @@ resampling, B roll, benchmark omission or acceptance from identical C alone.
 The original eight return/zero calls are complete and must never repeat.
 Attribution measured Load+1782/Check+2606 allocations; all five later phases were
 unchanged. These are diagnostic intervals, not instruction or acceptance proof.
-After two reviews and separate finite root grants, characterize only the unrun
-three controls24 calls, the new fixture's three normal calls, and one maintained
-unchanged-cap full-native umbrella:28 calls maximum. Reuse its valid strict39931
-allocations/129642982 instructions and emitted C; do not recompile strict.
+Completed24 control and3 fixture normal samples stay credited; all failures bind.
+The first native umbrella timed out at180s. After two reviews and a finite grant,
+one unchanged-cap fullnative --timeout0 (maintained Makefile policy) may finish
+validation:29 calls total. Reuse strict39931/129642982; no cost/strict resampling.
 Every original5%/10%/absolute miss remains FAIL. Only numerical-limit failures
 may be collected; semantic/status/leak/counter/C/provenance faults STOP unused calls.
 Retain all raw outputs and map every native limit field/shared user/max excess.
-No resampling, B roll, cap change, acceptance or merge follows characterization.
-Three planned faults/restorations and current-main composition remain separate.
+No B roll, cap change, acceptance or merge follows characterization. Planned
+faults/restorations and current-main composition remain separate.
 Root semantically composes List import/function hunks; no whole-file replacement.
 Two independent reviews/full gates and resource acceptance precede root commit.
 No source write, compiler call, commit or implementation dispatch is authorized here.
