@@ -362,5 +362,10 @@ samples because the consumed compiler-source/HOSTSTD boundary is unchanged.
 Literal argv/CWD/pins/output absence/failure sets need review before START.
 Stop first unexpected setup/semantic/pin/identity/strict/cost/LOC result; preserve
 raws, restore faults, RETURN lane; no retry/repair/refreeze/waiver or next job.
+Characterization-only exception: retain the option-min allocation FAIL and all
+limits. After two reviews, publication and a separate finite grant, consume only
+the 26 original unrun target calls once; never replay the 10 completed calls.
+Record numeric breaches as FAIL; any nonnumeric failure stops immediately.
+Restore complete C12/output state before classification; no merge/cost waiver.
 Root+peer approve/publish this amendment before implementation; two final
 independent reviews plus test-runner acceptance precede root integration.
