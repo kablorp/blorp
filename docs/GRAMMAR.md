@@ -251,7 +251,7 @@ var         void        where       while       with
 
 Keywords fall into two classes.
 
-**Reserved keywords** may never be written where a name is declared: a
+**Reserved keywords** cannot normally be written where a name is declared: a
 binding, parameter, pattern variable, field, function, type or declaration
 name. Writing one there is a syntax error that names the keyword, for example
 ``error: `alias` is a reserved keyword and cannot be used as a name``, with the
@@ -780,7 +780,7 @@ the frozen host compiler does not gain the rule.
 #### Functions
 
 ```ebnf
-function_decl   = { annotation } [ "pure" ] "func" name [ type_params ] params
+function_decl   = { annotation } [ "pure" ] "func" ( name | "and" | "or" | "not" ) [ type_params ] params
                   [ "->" type ] [ where_clause ] ":" function_body ;
 
 annotation      = "@" annotation_name [ NEWLINE ] ;
@@ -936,7 +936,7 @@ import_item        = module_path [ "as" name ] [ ":" import_symbols ] ;
 import_symbols     = import_symbol_line
                    | NEWLINE INDENT seq(import_symbol_line) [ NEWLINE ] DEDENT ;
 import_symbol_line = import_symbol { "," import_symbol } [ "," ] ;
-import_symbol      = name [ "(" name { "," name } [ "," ] ")" ] [ "as" name ] ;
+import_symbol      = ( name | "and" | "or" | "not" ) [ "(" name { "," name } [ "," ] ")" ] [ "as" name ] ;
 
 module_path        = [ "." "/" | { ".." "/" } ] name { "/" name } ;
 ```
@@ -1085,7 +1085,7 @@ postfix_op     = "." field_name
                | NEWLINE "." field_name             (* leading dot, 4.2 *)
                | "(" [ expr_list ] ")"
                | "[" expr_list "]" ;
-field_name     = name ;
+field_name     = name | "and" | "or" | "not" ;    (* keyword members require a following call *)
 expr_list      = expression { "," expression } [ "," ] ;
 ```
 
@@ -1143,7 +1143,7 @@ Assignment and `?=` are statements, not operators
 ### 3.6 Primary expressions
 
 ```ebnf
-primary = IDENT
+primary = IDENT | ( "and" | "or" ) "(" [ expr_list ] ")"
         | INT | FLOAT | CHAR
         | STRING | ISTRING | RAW_STRING | PIPE_STRING | IPIPE_STRING | RAW_PIPE_STRING
         | "True" | "False" | "void"

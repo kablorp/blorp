@@ -38,10 +38,10 @@ import:
 		Boundary(AtBoundary, PastBoundary), stop_at, expression_boundary, expression_start_reason
 	layout_quirks: BlockAnchor(PastExpressionAnchor), ExpressionAnchor, anchored_at
 	tree_type_parser: parse_type
-	token_cursor: is_soft_keyword
+	token_cursor: is_soft_keyword, is_callable_keyword
 	parse_state:
 		ParseState, rejected_trial, diagnostic_count, current_kind, current_token, current_span, current_literal, current_interpolation, current_builtin_marker_text, advanced, peek_kind,
-		consume_referenced_name, consume_name, NameRole(ExpressionName), finished_name_use, finished_expression, finished_subscript_place, finished_hole, report_at_current, report_and_recover, report_diagnostic, report_unreachable_input, expect_token, entered_hole, left_hole, nested
+		consume_referenced_name, consume_name, NameRole(ExpressionName, CallableName), finished_name_use, finished_expression, finished_subscript_place, finished_hole, report_at_current, report_and_recover, report_diagnostic, report_unreachable_input, expect_token, entered_hole, left_hole, nested
 
 
 union ExpressionParse:
@@ -531,7 +531,10 @@ private pure func member_step(state: ParseState, receiver: ExpressionValue) -> (
 	if member_entry.current_kind() == NewlineToken:
 		(state, AbandonedPostfix(UnsupportedShape(member_entry.stop_at(MemberNameOnNextLine))))
 	else:
-		(after_name, name) = member_entry.consume_referenced_name(NameInFieldName)
+		(after_name, name) = if member_entry.current_kind().is_callable_keyword() and member_entry.peek_kind(1) == LeftParenSymbol:
+			member_entry.consume_name(CallableName, NameInFieldName)
+		else:
+			member_entry.consume_referenced_name(NameInFieldName)
 		if after_name.diagnostic_count() != member_entry.diagnostic_count():
 			(after_name, AbandonedPostfix(RejectedShape))
 		else:
@@ -868,19 +871,26 @@ private pure func parse_atom(state: ParseState, anchor: ExpressionAnchor, loop_c
 		EndOfFileToken | RightParenSymbol | RightBracketSymbol:
 			(state.report_at_current(ExpectedExpressionDiagnostic), RejectedValue)
 		_:
-			match expression_start_reason(state):
-				Some(reason):
-					(state, UnsupportedValue(state.stop_at(reason)))
-				None:
-					-- Every kind the arms above read has no reason; the others are named in full.
-					report_unreachable_input("an atom token the parser reads has an arm")
-					(state, UnsupportedValue(state.stop_at(MalformedTokenPayload)))
+			if state.current_kind().is_callable_keyword() and state.peek_kind(1) == LeftParenSymbol:
+				state.parse_name_atom(span)
+			else:
+				match expression_start_reason(state):
+					Some(reason):
+						(state, UnsupportedValue(state.stop_at(reason)))
+					None:
+						-- Every kind the arms above read has no reason; the others are named in full.
+						report_unreachable_input("an atom token the parser reads has an arm")
+						(state, UnsupportedValue(state.stop_at(MalformedTokenPayload)))
 
 
--- Only the frozen primary-name arms call this role: `from` is a name here,
--- while it remains reserved in binder, field and member name positions.
+-- Callable keywords reach this reader only before call parentheses. Other
+-- primary names, including `from`, retain their existing expression role.
 private pure func parse_name_atom(state: ParseState, span: Span) -> (ParseState, ValueParse):
-	(advanced, name) = state.consume_name(ExpressionName, NameInStatementName)
+	role = if state.current_kind().is_callable_keyword():
+		CallableName
+	else:
+		ExpressionName
+	(advanced, name) = state.consume_name(role, NameInStatementName)
 	(used, use) = advanced.finished_name_use(name)
 	used.finished_value(span, NameReference(use))
 

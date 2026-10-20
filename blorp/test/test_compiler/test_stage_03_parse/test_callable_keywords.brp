@@ -1,0 +1,249 @@
+import:
+	../../../src/compiler/stage_02_lex/name_table: name_ids_equal
+	../../../src/compiler/stage_03_parse/language_parser: parse_compiler_source
+	../../../src/compiler/stage_03_parse/parsed_ast:
+		ParsedDecl(FunctionParsedDecl, ImportBlockParsedDecl), ParsedProgram, ParsedIdentifier,
+		ParsedExpr(ParsedBoolLiteralExpr, ParsedCallExpr, ParsedFieldAccessExpr, ParsedNameExpr, ParsedUnaryExpr),
+		ParsedUnaryOp(ParsedNotOp), parsed_program_ok
+	../../../src/lib/source: source_file
+	../../../src/compiler_new/stage_01_discovery/pipeline: load_module
+	../../../src/compiler_new/stage_01_discovery/lex/lexer: lex_module
+	../../../src/compiler_new/stage_01_discovery/tables/builder: empty_discovery_builder
+	../../../src/compiler_new/stage_01_discovery/tables/frontend_tables: FreezeOutcome(FrozenTables), freeze
+	../../../src/compiler_new/stage_01_discovery/tables/ids: module_id_at_row, name_id_index
+	../../../src/compiler_new/stage_01_discovery/tables/row_kinds:
+		ModuleReach(RootModule), NodeKind(CallNode, FieldAccessNode), Visibility(PublicVisibility), Purity(PureFunction)
+	../../../src/compiler_new/stage_01_discovery/sources/source_provider: ModulePlacement(InUserCode)
+	../../../src/compiler_new/stage_01_discovery/parse/parse_state:
+		new_parse_state, current_span, diagnostics, diagnostic_count, spellings
+	../../../src/compiler_new/stage_01_discovery/parse/layout_quirks: anchored_at
+	../../../src/compiler_new/stage_01_discovery/parse/tree_expression_parser:
+		parse_expression_to_boundary, ExpressionParse(ParsedExpression)
+	../../../src/compiler_new/stage_01_discovery/parse/tree_function_header_parser:
+		parse_function_head, FunctionHeadParse(ParsedFunctionHead)
+	../../../src/compiler_new/stage_01_discovery/syntax/expressions:
+		ExpressionKind(Call, NameReference, FieldAccess)
+	../../../src/compiler_new/stage_01_discovery/syntax/ids: SpellingId
+	../../../src/compiler_new/stage_01_discovery/syntax/spellings: find_spelling
+	test: TestSuite
+
+
+private METHOD_SOURCE: String =
+	|pure func not(value: Bool) -> Bool: value
+	|func main() -> Bool: True.not()
+	|
+
+
+pure func test_keyword_method_keeps_its_declared_function_identity() -> Bool:
+	program = parse_compiler_source(source_file("callable_keywords.brp", "callable_keywords", METHOD_SOURCE))
+	if not parsed_program_ok(program):
+		False
+	else:
+		match program.decls.get(0):
+			Some(FunctionParsedDecl(helper)):
+				match program.decls.get(1):
+					Some(FunctionParsedDecl(main)):
+						match main.body:
+							Some(ParsedCallExpr(callee, arguments, _)):
+								match callee:
+									ParsedFieldAccessExpr(receiver, member, _):
+										match receiver:
+											ParsedBoolLiteralExpr(True, _):
+												(helper.name.text == "not" and member.text == "not"
+													and name_ids_equal(helper.name.name, member.name)
+													and arguments.is_empty())
+											_: False
+									_: False
+							_: False
+					_: False
+			_: False
+
+
+pure func test_stage_a_keeps_unqualified_not_as_unary_syntax() -> Bool:
+	source: String =
+		|func main() -> Bool: not(True)
+		|
+	program = parse_compiler_source(source_file("unary_not.brp", "unary_not", source))
+	match program.decls.get(0):
+		Some(FunctionParsedDecl(main)):
+			match main.body:
+				Some(ParsedUnaryExpr(ParsedNotOp, operand, _)):
+					match operand:
+						ParsedBoolLiteralExpr(True, _): parsed_program_ok(program)
+						_: False
+				_: False
+		_: False
+
+
+pure func test_direct_and_or_keep_the_declared_name_identity() -> Bool:
+	var correct = True
+	for word in ["and", "or"]:
+		source = "pure func " + word + "(left: Bool, right: Bool) -> Bool: left\nfunc main() -> Bool: " + word + "(True, False)\n"
+		program = parse_compiler_source(source_file("direct.brp", "direct", source))
+		correct = correct and parsed_program_ok(program)
+		match program.decls.get(0):
+			Some(FunctionParsedDecl(helper)):
+				match program.decls.get(1):
+					Some(FunctionParsedDecl(main)):
+						match main.body:
+							Some(ParsedCallExpr(callee, arguments, _)):
+								match callee:
+									ParsedNameExpr(name):
+										correct = correct and name_ids_equal(helper.name.name, name.name) and arguments.length() == 2
+									_: correct = False
+							_: correct = False
+					_: correct = False
+			_: correct = False
+	correct
+
+
+private pure func import_matches_call(
+	program: ParsedProgram,
+	module: ParsedIdentifier,
+	member: ParsedIdentifier,
+) -> Bool:
+	match program.decls.get(0):
+		Some(ImportBlockParsedDecl(items, _)):
+			match items.get(0):
+				Some(item):
+					match item.module_alias:
+						Some(alias_name):
+							match item.symbols:
+								Some(symbols):
+									match symbols.get(0):
+										Some(selected):
+											(name_ids_equal(alias_name.name, module.name)
+												and name_ids_equal(selected.name.name, member.name)
+												and symbols.length() == 3)
+										None: False
+								None: False
+						None: False
+				None: False
+		_: False
+
+
+pure func test_qualified_keyword_call_is_an_ordinary_member_call() -> Bool:
+	source: String =
+		|import:
+		|    ./ops as Ops: not, and, or
+		|func main() -> Bool: Ops.not(True)
+		|
+	program = parse_compiler_source(source_file("qualified.brp", "qualified", source))
+	match program.decls.get(1):
+		Some(FunctionParsedDecl(main)):
+			match main.body:
+				Some(ParsedCallExpr(callee, arguments, _)):
+					match callee:
+						ParsedFieldAccessExpr(target, member, _):
+							match target:
+								ParsedNameExpr(module):
+									(parsed_program_ok(program) and import_matches_call(program, module, member)
+										and member.text == "not" and arguments.length() == 1)
+								_: False
+						_: False
+				_: False
+		_: False
+
+
+pure func test_callable_keywords_remain_reserved_for_data_names() -> Bool:
+	var correct = True
+	for (source, word, start) in [
+		("func sample(and: Bool): True\n", "and", 12),
+		("func main():\n\tvar or = True\n", "or", 18),
+		("record Item { not: Bool }\n", "not", 14),
+		("import:\n\t./ops as and\n", "and", 18),
+		("pure func if(value: Bool): True\n", "if", 10),
+		("record or { value: Bool }\n", "or", 7),
+	]:
+		program = parse_compiler_source(source_file("reserved.brp", "reserved", source))
+		match program.diagnostics.get(0):
+			Some(error):
+				expected = "`" + word + "` is a reserved keyword and cannot be used as a name; choose another identifier such as `" + word + "_name`"
+				correct = (correct and error.message == expected and error.help.is_none()
+					and error.span.start_offset == start and error.span.end_offset == start + word.length())
+			None: correct = False
+	correct
+
+
+pure func test_keyword_field_selector_without_a_call_stays_rejected() -> Bool:
+	program = parse_compiler_source(source_file("field.brp", "field", "func main(value: Bool): value.not\n"))
+	match program.diagnostics.get(0):
+		Some(error): error.message == "expected field name" and error.help.is_none()
+		None: False
+
+
+pure func test_active_discovery_uses_the_header_id_for_the_call_member() -> Bool:
+	builder = load_module(empty_discovery_builder(), {
+		path = "callable_keywords.brp", trusted_directory = ".", placement = InUserCode,
+	}, RootModule, METHOD_SOURCE)
+	match builder.definitions.get(0):
+		Some(helper):
+			var calls = 0
+			var members = 0
+			var matching = True
+			for node in builder.nodes:
+				if node.kind == CallNode:
+					calls += 1
+				if node.kind == FieldAccessNode:
+					members += 1
+					matching = matching and node.payload == helper.name.name_id_index()
+			match builder.freeze():
+				FrozenTables(_): builder.diagnostics.is_empty() and matching and calls == 1 and members == 1
+				_: False
+		None: False
+
+
+pure func test_tree_header_uses_its_issued_keyword_spelling() -> Bool:
+	text = "func not(value: Bool): value\n"
+	match new_parse_state(lex_module(module_id_at_row(0), text)):
+		Err(_): False
+		Ok(entry):
+			(parsed, result) = parse_function_head(entry, PublicVisibility, None, [], PureFunction, entry.current_span())
+			match result:
+				ParsedFunctionHead(head):
+					match parsed.spellings().find_spelling("not", 0, 3):
+						Some(issued): parsed.diagnostic_count() == 0 and head.header.signature.name.spelling == issued
+						None: False
+				_: False
+
+
+pure func test_tree_call_names_use_their_issued_keyword_spellings() -> Bool:
+	var correct = True
+	for (text, word) in [("and(True, False)", "and"), ("or(False, True)", "or"), ("Ops.not(True)", "not")]:
+		match new_parse_state(lex_module(module_id_at_row(0), text)):
+			Err(_): correct = False
+			Ok(entry):
+				(parsed, result) = parse_expression_to_boundary(entry, anchored_at(entry.current_span()))
+				match result:
+					ParsedExpression(expression):
+						match expression.kind:
+							Call(callee, _):
+								name = match callee.kind:
+									NameReference(use): Some(use.name)
+									FieldAccess(_, use): Some(use.name)
+									_: None
+								match name:
+									Some(actual):
+										match parsed.spellings().find_spelling(word, 0, word.length()):
+											Some(issued): correct = correct and parsed.diagnostic_count() == 0 and actual.spelling == issued
+											None: correct = False
+									None: correct = False
+							_: correct = False
+					_: correct = False
+	correct
+
+
+tests: TestSuite = {
+	description = "Legacy callable keyword identities",
+	tests = [
+		("keyword method keeps its declared function identity", test_keyword_method_keeps_its_declared_function_identity),
+		("stage A keeps unqualified not as unary syntax", test_stage_a_keeps_unqualified_not_as_unary_syntax),
+		("direct and/or keep declared function identities", test_direct_and_or_keep_the_declared_name_identity),
+		("qualified keyword calls use ordinary member calls", test_qualified_keyword_call_is_an_ordinary_member_call),
+		("callable keywords stay reserved for data names", test_callable_keywords_remain_reserved_for_data_names),
+		("keyword field selector needs call parentheses", test_keyword_field_selector_without_a_call_stays_rejected),
+		("active discovery reuses the header NameId", test_active_discovery_uses_the_header_id_for_the_call_member),
+		("tree header reuses its issued keyword spelling", test_tree_header_uses_its_issued_keyword_spelling),
+		("tree calls reuse their issued keyword spellings", test_tree_call_names_use_their_issued_keyword_spellings),
+	]
+}

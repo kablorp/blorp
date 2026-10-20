@@ -1483,6 +1483,34 @@ private pure func keyword_is_reserved_name(keyword: Keyword) -> Bool:
 	soft_keyword_identifier_text(keyword).is_none()
 
 
+private pure func callable_keyword_at(state: ParserInput, index: Int) -> Bool:
+	current_tag(state, index) == KeywordTag and (
+		current_keyword(state, index) == AndKeyword
+		or current_keyword(state, index) == OrKeyword
+		or current_keyword(state, index) == NotKeyword
+	)
+
+
+-- These spellings already belong to SYNTHESIZED_NAME_TABLE. Other name
+-- positions retain their original reserved-keyword diagnostics.
+private pure func parse_callable_name_expected(
+	state: ParserInput,
+	index: Int,
+	diagnostics: List[ParseDiagnostic],
+	expected: String,
+) -> ParseIdentifierStep:
+	if callable_keyword_at(state, index):
+		{
+			index = advance_parser(state, index),
+			diagnostics = diagnostics,
+			value = synthesized_identifier(
+				state, keyword_text(current_keyword(state, index)), current_location(state, index),
+			)
+		}
+	else:
+		parse_identifier_expected(state, index, diagnostics, expected)
+
+
 ---
 The single diagnostic text for a reserved keyword written where a name belongs.
 It names the keyword and suggests a replacement identifier.
@@ -7736,7 +7764,14 @@ private pure func parse_primary_expr(
 				ConcurrentKeyword:
 					parse_concurrent_block_expr(state, index, diagnostics)
 				_:
-					parse_primary_expr_missing(state, index, diagnostics, span)
+					if callable_keyword_at(state, index) and next_is_symbol(state, index, LeftParenSymbol):
+						name = parse_callable_name_expected(state, index, diagnostics, "function name")
+						{
+							index = name.index, diagnostics = name.diagnostics,
+							value = ParsedNameExpr(name.value)
+						}
+					else:
+						parse_primary_expr_missing(state, index, diagnostics, span)
 		SymbolTag:
 			match current_symbol(state, index):
 				LeftParenSymbol:
@@ -7885,12 +7920,10 @@ private pure func parse_postfix_expr(
 
 			if current_is_symbol(state, st, DotSymbol):
 				st = advance_parser(state, st)
-				field_step: ParseIdentifierStep = parse_identifier_expected(
-					state,
-					st,
-					st_diag,
-					"field name",
-				)
+				field_step: ParseIdentifierStep = if next_is_symbol(state, st, LeftParenSymbol):
+					parse_callable_name_expected(state, st, st_diag, "field name")
+				else:
+					parse_identifier_expected(state, st, st_diag, "field name")
 				st = field_step.index
 				st_diag = field_step.diagnostics
 				expr = ParsedFieldAccessExpr(
@@ -8477,12 +8510,10 @@ private pure func parse_function_decl_value(
 	func_span: SourceLocation = current_location(state, index)
 	var st: Int = advance_parser(state, index)
 	var st_diag: List[ParseDiagnostic] = diagnostics
-	name_step: ParseIdentifierStep = parse_declared_name_expected(
-		state,
-		st,
-		st_diag,
-		EXPECTED_FUNCTION_NAME,
-	)
+	name_step: ParseIdentifierStep = if callable_keyword_at(state, st):
+		parse_callable_name_expected(state, st, st_diag, EXPECTED_FUNCTION_NAME)
+	else:
+		parse_declared_name_expected(state, st, st_diag, EXPECTED_FUNCTION_NAME)
 	st = name_step.index
 	st_diag = name_step.diagnostics
 	type_params_step: ParseTypeParamListStep = parse_type_params_opt(state, st, st_diag)
@@ -8639,7 +8670,7 @@ private pure func parse_import_symbol(
 	index: Int,
 	diagnostics: List[ParseDiagnostic],
 ) -> ParseImportSymbolStep:
-	name_step: ParseIdentifierStep = parse_identifier_expected(
+	name_step: ParseIdentifierStep = parse_callable_name_expected(
 		state,
 		index,
 		diagnostics,
