@@ -2396,6 +2396,9 @@ $RUN_OUTPUT"
 	expect_test_closed_stdout_failure "eligible suite reports output forwarding failure" \
 		"${BLORP_DIRECT_TEST_ENV[@]}" \
 		"$BLORP_BIN" test --suite --timeout 5 "$binary_output_test"
+	expect_test_closed_stdout_failure "eligible suite reports output forwarding failure with closed stdin" \
+		"${BLORP_DIRECT_TEST_ENV[@]}" \
+		"$BLORP_BIN" test --suite --timeout 5 "$binary_output_test" 0<&-
 	expect_output_contains "eligible suite closes stdin" 0 "[PASS] observes closed stdin" \
 		"${BLORP_DIRECT_TEST_ENV[@]}" \
 		"$BLORP_BIN" test --suite --timeout 5 "$stdin_test"

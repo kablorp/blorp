@@ -3458,17 +3458,51 @@ static int blorp_runtime_accept_cloexec(
     return client_fd;
 }
 
+// Internal pipes must not reopen standard descriptors that the caller closed.
+// Without atomic duplication, callers hold __process_spawn_mutex until both
+// replacement descriptors have close-on-exec set.
+static int blorp_runtime_move_pipe_above_stdio(int fds[2]) {
+    for (int i = 0; i < 2; i++) {
+        if (fds[i] > STDERR_FILENO) continue;
+#ifdef F_DUPFD_CLOEXEC
+        int replacement = fcntl(fds[i], F_DUPFD_CLOEXEC, STDERR_FILENO + 1);
+#else
+        int replacement = fcntl(fds[i], F_DUPFD, STDERR_FILENO + 1);
+        if (replacement >= 0 && blorp_runtime_set_cloexec(replacement) != 0) {
+            int saved_errno = errno;
+            close(replacement);
+            replacement = -1;
+            errno = saved_errno;
+        }
+#endif
+        if (replacement < 0) {
+            int saved_errno = errno;
+            close(fds[0]);
+            close(fds[1]);
+            fds[0] = -1;
+            fds[1] = -1;
+            errno = saved_errno;
+            return -1;
+        }
+        close(fds[i]);
+        fds[i] = replacement;
+    }
+    return 0;
+}
+
 static int blorp_runtime_pipe_cloexec(int fds[2]) {
     if (!fds) {
         errno = EINVAL;
         return -1;
     }
-#if defined(__linux__) && defined(O_CLOEXEC)
-    if (pipe2(fds, O_CLOEXEC) == 0) return 0;
-    if (errno != ENOSYS && errno != EINVAL) return -1;
-#endif
     fds[0] = -1;
     fds[1] = -1;
+#if defined(__linux__) && defined(O_CLOEXEC) && defined(F_DUPFD_CLOEXEC)
+    if (pipe2(fds, O_CLOEXEC) == 0) {
+        return blorp_runtime_move_pipe_above_stdio(fds);
+    }
+    if (errno != ENOSYS && errno != EINVAL) return -1;
+#endif
     int lock_status = pthread_mutex_lock(&__process_spawn_mutex);
     if (lock_status != 0) {
         errno = lock_status;
@@ -3489,8 +3523,11 @@ static int blorp_runtime_pipe_cloexec(int fds[2]) {
         errno = saved_errno;
         return -1;
     }
+    int status = blorp_runtime_move_pipe_above_stdio(fds);
+    int saved_errno = errno;
     pthread_mutex_unlock(&__process_spawn_mutex);
-    return 0;
+    errno = saved_errno;
+    return status;
 }
 
 static int blorp_runtime_pipe_cloexec_nonblock(int fds[2]) {
@@ -40603,33 +40640,7 @@ static bool __process_make_pipe(
             return false;
         }
     }
-    for (int i = 0; i < 2; i++) {
-        if (pipe_fds[i] > STDERR_FILENO) continue;
-#ifdef F_DUPFD_CLOEXEC
-        int replacement = fcntl(pipe_fds[i], F_DUPFD_CLOEXEC, 3);
-#else
-        int replacement = fcntl(pipe_fds[i], F_DUPFD, 3);
-        if (
-            replacement >= 0 &&
-            blorp_runtime_set_cloexec(replacement) != 0
-        ) {
-            int saved_errno = errno;
-            close(replacement);
-            replacement = -1;
-            errno = saved_errno;
-        }
-#endif
-        if (replacement < 0) {
-            int saved_errno = errno;
-            __process_close_fd(&pipe_fds[0]);
-            __process_close_fd(&pipe_fds[1]);
-            errno = saved_errno;
-            return false;
-        }
-        close(pipe_fds[i]);
-        pipe_fds[i] = replacement;
-    }
-    return true;
+    return blorp_runtime_move_pipe_above_stdio(pipe_fds) == 0;
 }
 
 static void* __process_error_result(
