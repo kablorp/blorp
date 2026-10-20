@@ -108,3 +108,29 @@ Code and test-runner review precede any later implementation commit. Dirname sta
 held behind accepted prerequisites. Normalize stays held: growing List.append
 endpoint metadata is O(k^2), a valid negative design, not permission to implement.
 No Path engine, source shim/migration, SOURCE gate waiver or old campaign restart.
+
+## Remaining-cost characterization: one bounded continuation
+
+Retained evidence is3 RED and26 initial GREEN calls, then2 strict cost calls.
+Return/zero allocations14534->17200 (+18.34%) FAIL the original +10% hard ceiling;
+status0, balanced/zero leaks and identical C do not waive that failure. No normal
+instruction sample ran. The receipt's false instruction_target_miss is unobserved,
+not an instruction PASS. Preserve both strict calls/raws/C and all old identities.
+
+After Root+peer review and publication of this amendment, a separate exclusive
+START may select ONLY original COMMANDS.json objects[2:] (indices3..32), once:
+6 return/zero normal samples and8 samples for each other original control. Never
+repeat indices1..2. Original a656 B/source41,02ecee8f/ef9365be producers,complete12
+B/C libraries, literal argv/CWD/env/input/output/report paths and ceilings remain.
+Only this30-call characterization may continue after valid allocation/instruction
+values breach the unchanged5% targets,10% hard limits or old absolutes. Record
+all such failures; this is no cost PASS, acceptance, waiver or permission to widen
+caps. The original return/zero allocation hardFAIL remains binding regardless
+of later numbers; no aggregate win offsets it. No retry, repair or resampling.
+
+All nonnumerical STOPs still bind: status/stream/C identity, invalid/missing/zero
+counter, leak/balance, pin/ownership/scope/LOC or restoration failure. Restore full
+B12 and output state BEFORE each classification. Stage only the same3 pinned
+fixtures; restore original13 files/6 directories before RETURN or first STOP.
+No cost waiver is requested before collecting remaining instruction/control data.
+C-only/native/mutant/full-gate/API work stays HELD. Plan publication is not START.
