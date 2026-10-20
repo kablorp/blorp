@@ -5,7 +5,7 @@ small program, defines the grammar it needs, and tests that program through
 native execution. The existing compiler builds this compiler until it can
 build itself.
 
-The [imports and prelude reference](IMPORTS_AND_PRELUDE_PLAN.md) defines explicit
+The [module and prelude sections](#local-modules) define explicit
 type/method visibility and a shared base/prelude for the target
 [standard library](standard_library/README.md) at `blorp_2/standard_library`.
 Its syntax and layout are implemented in this pilot. The
@@ -1513,7 +1513,7 @@ retain the source file for primary errors and secondary notes independently.
 
 The [module validation report](../benchmarks/results/blorp_2_modules_2026-10-11.md)
 retains the independent reviews and measurements; the
-[imports reference](IMPORTS_AND_PRELUDE_PLAN.md) defines the current visibility rules.
+[module reference](#local-modules) defines the current visibility rules.
 
 ## Temporary target library and Int addition
 
@@ -1869,7 +1869,8 @@ sees instances, not declarations, and deliberately does not repeat that check.
 
 `string.append_int(self: String, value: Int) -> String` appends signed Int64 decimal digits.
 The ordinary pure wrapper preserves UTF-8/NUL prefix bytes and earlier aliases.
-The [append plan](APPEND_INT_PLAN.md) records fixtures, ownership and resource bounds.
+The [edge fixture](test/e2e/fixtures/string_operations/append_int_edges.brp)
+checks signed extrema, counted bytes and aliases; its owning suite retains the resource limits.
 
 The target `string.add(left: String, right: String) -> String` is pure and
 returns one fresh concatenation. It borrows both operands, including when they
@@ -1946,7 +1947,7 @@ errors take priority over close errors; every opened stream receives exactly
 one close attempt, including EINTR, without retry. Partial output is allowed;
 atomic replacement and durability are outside the contract. Nothing is printed.
 See the [complete program](test/e2e/fixtures/file_write/bytes.brp) and
-[acceptance plan](TARGET_WRITE_FILE_PLAN.md). Main/loader migration remains pending.
+[acceptance report](../benchmarks/results/blorp_2_target_write_file_2026-10-18.md). Main/loader migration remains pending.
 
 ## Float64 calculator
 
@@ -2332,8 +2333,8 @@ the same function, distinguishes direct/UFCS availability in scope-owned typed
 bindings, and reports competing applicable declarations without ranking by
 import order. An unconstrained generic receiver is available through an
 explicit named function import; it is not associated with every type.
-[The imports design](IMPORTS_AND_PRELUDE_PLAN.md) specifies rejection behavior
-and the tested namespace/checker boundary.
+The module rules above specify rejection behavior at the tested namespace/checker
+boundary.
 
 Closed builtin bodies remain ordinary module declarations. Parsing translates
 quoted runtime keys to typed operations; checking validates their purity,
@@ -2496,5 +2497,5 @@ it does not use trait-dispatched operators. Future traits and operator syntax ca
 select these same functions, keeping one implementation per operation. The current
 host library declares some concrete functions inside trait implementations; the
 future subset library will expose ordinary function declarations instead.
-`src/utils/text.brp` supplies exact string equality using equal byte lengths and an exact
-prefix check because the host library has no ordinary string-equality function.
+Exact String equality uses the ordinary `string.equals` API in both libraries;
+`src/utils/text.brp` retains only its concatenation bridge.

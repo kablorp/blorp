@@ -5,7 +5,7 @@ Frozen B is accepted main `af92d13708736bde34c164858d7323875fb216aa`.
 Measured code/tests/library patch is `fc65fe65c1fe1f928fc6b2680128865759b8f4e21f8e6391ee5beffe352fc58b`.
 Final maintained status/report edits are separate from those measured bytes.
 Main advanced only through plans to `ca458fad441175dd471253b4ec89553364aac900`; B never rolled.
-The [owning plan](../../blorp_2/TARGET_PATH_JOIN_PLAN.md) and [seven-path contract](../../blorp_2/ROADMAP.md#seven-shell-and-path-functions) retain scope and ceilings.
+The [owning plan](https://github.com/kablorp/blorp/blob/b1dd8fda7d5f6c3451f6dd492c54cd8d876fdd2b/blorp_2/TARGET_PATH_JOIN_PLAN.md) and [seven-path contract](../../blorp_2/ROADMAP.md#seven-shell-and-path-functions) retain scope and ceilings.
 
 ## Behavior and ownership
 

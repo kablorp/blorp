@@ -1,7 +1,7 @@
 # Unread checker purity argument — 2026-10-19
 
 Status: **accept** after independent code-reviewer and test-runner approval. The independently reviewed
-[plan](../../blorp_2/PHASE_BOUNDARY_CLEANUPS_PLAN.md) was committed before
+[plan](https://github.com/kablorp/blorp/blob/b1dd8fda7d5f6c3451f6dd492c54cd8d876fdd2b/blorp_2/PHASE_BOUNDARY_CLEANUPS_PLAN.md) was committed before
 implementation as `e89eb0cd4`. Fixed B is the immediate accepted F3 main,
 `e706b393d51038ba49af720999d308fd95ce4ea9`; this is not a cumulative F2 comparison.
 

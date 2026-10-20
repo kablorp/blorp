@@ -109,6 +109,6 @@ The separate current focus receipt is in
 `written-fields-current-focused-2026-10-18/`.
 Root and an independent compiler reviewer approved source semantics, generated
 C, characterization limits, producer roles and all individual cost bounds.
-The [historical plan](../../blorp_2/FIRST_ORDER_WRITTEN_FIELDS_PLAN.md) retains
+The [historical plan](https://github.com/kablorp/blorp/blob/b1dd8fda7d5f6c3451f6dd492c54cd8d876fdd2b/blorp_2/FIRST_ORDER_WRITTEN_FIELDS_PLAN.md) retains
 the prospective design and ceilings; the
-[callback ledger](../../blorp_2/REMAINING_CALLBACK_LEDGER.md) charges actual spend.
+[callback ledger](https://github.com/kablorp/blorp/blob/b1dd8fda7d5f6c3451f6dd492c54cd8d876fdd2b/blorp_2/REMAINING_CALLBACK_LEDGER.md) charges actual spend.

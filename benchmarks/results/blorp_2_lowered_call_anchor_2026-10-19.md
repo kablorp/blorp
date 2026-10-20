@@ -1,7 +1,7 @@
 # Lowered call anchor boundary — 2026-10-19
 
 Status: **accepted for landing**. The separately reviewed
-[plan](../../blorp_2/PHASE_BOUNDARY_CLEANUPS_PLAN.md) is commit `e89eb0cd4`.
+[plan](https://github.com/kablorp/blorp/blob/b1dd8fda7d5f6c3451f6dd492c54cd8d876fdd2b/blorp_2/PHASE_BOUNDARY_CLEANUPS_PLAN.md) is commit `e89eb0cd4`.
 Fixed B is main `eb7b9fe1bd5dec40a8a2dd8acfae27fd02b53e6e`.
 
 ## Change and scope

@@ -2,7 +2,7 @@
 
 Plan base: accepted `eca1f723cab0ef87c498b81f124edf51546765fc`, 2026-10-19.
 This plan owns the two remaining callable increments after
-[named callbacks](NAMED_CALLABLES_PLAN.md). Root coordinates implementation,
+[named callbacks](README.md). Root coordinates implementation,
 serial compiled leases, two reviews per slice and publication. Commit this plan
 before production changes; plan acceptance does not establish feature readiness.
 The original drafts and independent review remain under the ignored
@@ -31,8 +31,8 @@ Current anchors under `blorp_2/src/`:
 
 Since e706, eca1 removes redundant expression purity parameters. Preserve one
 active purity authority in ResolutionContext.caller; do not reintroduce them.
-[NAMED_CALLABLES_PLAN.md](NAMED_CALLABLES_PLAN.md) owns named semantics and shared
-resource authority; [OPTION_RESULT_PLAN.md](OPTION_RESULT_PLAN.md) owns the
+[README.md](README.md) describes accepted named semantics; this plan retains the
+shared M7 resource authority. [OPTION_RESULT_PLAN.md](OPTION_RESULT_PLAN.md) owns the
 required callback helper APIs. Neither helper activation nor source migration
 belongs to these language increments.
 

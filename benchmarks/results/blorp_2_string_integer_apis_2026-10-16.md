@@ -11,7 +11,7 @@ into ordinary owning Some. Source Char/classification migration remains pending.
 inputs miss the +5% allocation target**, maximum **+5.6215%**; none breach +10%.
 All normal instruction comparisons meet +5%, maximum **+4.1858%**. Implementation,
 cost and documentation reviews are complete. The
-[approved plan](../../blorp_2/STRING_INTEGER_APIS_PLAN.md) owns scope and ceilings.
+[approved plan](https://github.com/kablorp/blorp/blob/b1dd8fda7d5f6c3451f6dd492c54cd8d876fdd2b/blorp_2/STRING_INTEGER_APIS_PLAN.md) owns scope and ceilings.
 
 ## Frozen versions and measurement boundary
 

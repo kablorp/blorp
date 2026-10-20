@@ -4,7 +4,7 @@
 and returns one fresh counted UTF-8 String. Aliasing and embedded NUL are valid;
 the helper copies each operand once. This supplies the concrete operation
 needed by `utils/text.concat`. Checked slicing and growing-buffer join remain
-separate work. The [phase matrix](../../blorp_2/STRING_CONCAT_PHASE_MATRIX.md)
+separate work. The [phase matrix](https://github.com/kablorp/blorp/blob/b1dd8fda7d5f6c3451f6dd492c54cd8d876fdd2b/blorp_2/STRING_CONCAT_PHASE_MATRIX.md)
 owns the approved scope and ceilings.
 
 All correctness and matched cost gates pass. Maximum shared-input increases

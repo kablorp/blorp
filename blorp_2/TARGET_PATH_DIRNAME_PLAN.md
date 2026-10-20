@@ -101,7 +101,7 @@ Consume separately accepted checked [String Slice](STRING_SLICE_PLAN.md) and the
 full current target library; current functional evidence alone is not acceptance.
 Ordinary scalar while/break support still rejects at this base and follows
 [M3](M3_LOOP_PLAN.md). The proposed signed guard uses the existing owner's
-[greater_than leaf](INT_COMPARISON_PLAN.md), absent at this source anchor; consume
+[greater_than leaf](../benchmarks/results/blorp_2_int_comparisons_2026-10-19.md), absent at this source anchor; consume
 its separately accepted implementation, without arithmetic approximation or an
 Int feature port here. No managed String loop carrier, Boolean operator feature,
 get_or, panic or extra helper is required. Stop on missing prerequisite rather

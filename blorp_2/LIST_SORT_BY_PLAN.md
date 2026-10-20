@@ -56,7 +56,7 @@ cursor, mutable capture, anonymous callback, fake type or synthesized source.
 `sort_range` halves a source interval, sorts left then right, and merges exactly
 the interval count. Public sort_by reuses empty/singleton values directly.
 All recursion forwards unchanged T/key, satisfying the named finite-instance
-policy (NAMED_CALLABLES_PLAN:150–173). No tail annotation is used or promised.
+policy documented in README.md. No tail annotation is used or promised.
 
 Source interval invariant: 0<=start, 0<=count, start+count<=length. Positive split
 counts are strictly smaller and partition the interval; start+left_count stays

@@ -5,7 +5,7 @@ permissions during checking, then erase to their accepted underlying types in
 Specialize. Equal representations can share generic instances and layouts.
 Resolved ordinary declaration IDs and ordered named callback choices remain
 unchanged. Lower, Own, Verify, Emit and the runtime have no production changes.
-The separately published [plan](../../blorp_2/OPAQUE_TYPES_PLAN.md), commit
+The separately published [plan](https://github.com/kablorp/blorp/blob/b1dd8fda7d5f6c3451f6dd492c54cd8d876fdd2b/blorp_2/OPAQUE_TYPES_PLAN.md), commit
 `2a7fcf65e26171fee366b6be33d9dd0010513e32`, withdrew the earlier SemanticRef/key
 preparation proposal before implementation. No new erasure pass, context carrier,
 wrapper allocation, ABI, registry or cache was introduced.

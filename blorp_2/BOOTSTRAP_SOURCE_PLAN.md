@@ -356,7 +356,7 @@ Stop on a cap breach, source-epoch drift or need for another mechanism.
    type translator and stable layout ordering. Then migrate remaining callbacks
    in bounded module groups.
 4. **Library foundation:** host String wrappers/availability, two target String
-   operations, ASCII predicates and the [five-file source byte migration](SOURCE_BYTE_MIGRATION_PLAN.md)
+   operations, ASCII predicates and the [five-file source byte migration](../benchmarks/results/blorp_2_source_byte_lazy_screen_2026-10-17.md)
    (four Char consumers plus main's byte-column classification).
 5. **Retained control/ownership:** accept reviewed logical operators, restricted
    if, outer-variable joins, top-level propagation/local annotations and managed
@@ -413,12 +413,10 @@ before implementation):
 The retained non-binding pattern-group feature has a separate ceiling of 650
 gross added / +450 net production lines, not the six-site source pilot's budget.
 
-The historical whole-callback estimate was +442–739 net, not an allowance. The
-maintained [remaining callback ledger](REMAINING_CALLBACK_LEDGER.md) records the
-prospective selected whole ceiling: 1,000 production added / +530 net / 930 test
-added, including nested propagation, with spent ports and cumulative scopes
-accounted separately. It grants no source writes or cost acceptance; the SOURCE
-contract below governs each slice. Do not stack small pilot allowances to
+The abandoned whole-callback migration estimated +442–739 net and proposed
+1,000 production added / +530 net / 930 test added, including nested propagation.
+Those historical figures grant no current source writes or cost acceptance;
+the SOURCE contract below governs each slice. Do not stack small pilot allowances to
 hide total growth. Full pattern migration similarly
 needs a revised estimate after the six-site pilot; the old +1,300–2,300 estimate
 included discarded no-else/or-duplication rules and is not an approved allowance.
@@ -456,8 +454,8 @@ epoch: measure and report the transition cost separately, then rebuild both rese
 baseline and candidate with that same frozen host. Changing epochs cannot hide
 source-migration cost.
 
-The [three-site type-argument contract](TYPE_ARGUMENT_TRANSLATION_PLAN.md#prospective-current-matched-cost-contract)
-and [unary typed-step contract](CARRIED_BINDINGS_PLAN.md#prospective-unary-preparation-cost-contract)
+The [three-site type-argument contract](../benchmarks/results/blorp_2_first_order_type_arguments_2026-10-18.md)
+and [unary typed-step contract](../benchmarks/results/blorp_2_carried_bindings_2026-10-18.md)
 are the retained precedents. Their recorded results and original-compliance
 limits stay unchanged. Required SOURCE proxy allocations still use the unique
 schema1 `artifact_construction_complete.total_allocations` checkpoint; an exit

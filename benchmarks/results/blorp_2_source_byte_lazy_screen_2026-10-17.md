@@ -10,7 +10,7 @@ owner/unit/runtime/grammar/e2e correctness, fresh source reconciliation and
 three lazy diagnostic sensitivity proofs also pass. Independent final landing
 review remains pending; genuine source self-compilation is not established.
 
-The [owning plan](../../blorp_2/SOURCE_BYTE_MIGRATION_PLAN.md#one-time-landing-policy-after-the-failed-screen)
+The [owning plan](https://github.com/kablorp/blorp/blob/b1dd8fda7d5f6c3451f6dd492c54cd8d876fdd2b/blorp_2/SOURCE_BYTE_MIGRATION_PLAN.md#one-time-landing-policy-after-the-failed-screen)
 retains the original source freeze and defines the exact exception. Only this
 frozen byte-migration/lazy-error slice may instead land through fixed accepted
 A/D comparisons, each capped at 3% allocations and normal minimum-of-three

@@ -89,7 +89,7 @@ successful input, with both memory variables unset **outside** `/usr/bin/time`.
 All 451 allowance-zero inputs have identical allocation counts. Exactly the
 13 predeclared reserved-name diagnostic cases add one allocation. The original
 315→316 short rejection **fails the old no-growth limit**; the separately
-reviewed [diagnostic allowance](../../blorp_2/KEYWORD_AUTHORITY_PLAN.md#reserved-name-diagnostic-allocation-exception)
+reviewed [diagnostic allowance](https://github.com/kablorp/blorp/blob/b1dd8fda7d5f6c3451f6dd492c54cd8d876fdd2b/blorp_2/KEYWORD_AUTHORITY_PLAN.md#reserved-name-diagnostic-allocation-exception)
 permits at most baseline+1 for that first diagnostic only. Longer, EOF, binding,
 UTF-8 and multi-module contexts all satisfy the bound. Other errors and accepted
 programs retain no-growth. No e2e fixture budget changes.

@@ -7,7 +7,7 @@ The measured code, tests, fixtures and target library are fixed by write-only pa
 `447e022744f559b0a84fc4d2013d56a096a2a76608689f628cd3d4c83b83f929`.
 Final maintained status/report edits are separate from those measured bytes.
 The final branch is `codex/bootstrap-write-file-final`; accepted HOF changes are
-in its base, rather than duplicated in this feature. The [owning plan](../../blorp_2/TARGET_WRITE_FILE_PLAN.md)
+in its base, rather than duplicated in this feature. The [owning plan](https://github.com/kablorp/blorp/blob/b1dd8fda7d5f6c3451f6dd492c54cd8d876fdd2b/blorp_2/TARGET_WRITE_FILE_PLAN.md)
 retains the contract, ceilings and original design provenance. M6 and compiler
 main/loader migration remain open.
 

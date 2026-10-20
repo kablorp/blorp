@@ -6,10 +6,10 @@ into preceding bindings and retains restricted body control, outer-variable
 joins and managed loops. General expression inference and workloop relocation
 below are deferred; the existing join/ownership contracts remain authoritative.
 
-This is the design for the steps after the separately reviewed
-[logical operators](BOOLEAN_CONTROL_PLAN.md). Plan approval is not acceptance
-of implementation or costs. Source anchors below describe that logical-operator
-candidate; resolve the named declarations after integration rather than relying
+The logical-operator candidate used for the historical anchors below is paused;
+[ordinary Boolean functions](BOOL_FUNCTIONS_PLAN.md) are the active direction.
+This general-expression design grants no implementation or cost acceptance.
+Resolve named declarations against the accepted source rather than relying
 on scratch files or old line numbers. The accepted quality APIs, including
 naming and private-type rules, remain prerequisites. Constants and recursive
 data work stay separate.
@@ -208,7 +208,7 @@ values = choose_first(
 )
 ```
 
-Here choose_first[T](first: T, second: T) returns first; the later actual argument,
+Here `choose_first[T](first: T, second: T)` returns first; the later actual argument,
 not an invented expected type, solves the pending match arms.
 
 A root function-tail if publishes CheckedMatchBody with canonical Bool patterns,

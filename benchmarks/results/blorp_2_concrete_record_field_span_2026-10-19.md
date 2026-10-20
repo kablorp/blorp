@@ -1,7 +1,7 @@
 # Unread concrete record field span — 2026-10-19
 
 Status: **accept** following independent code and test-runner review. The independently reviewed
-[plan](../../blorp_2/PHASE_BOUNDARY_CLEANUPS_PLAN.md) was committed before
+[plan](https://github.com/kablorp/blorp/blob/b1dd8fda7d5f6c3451f6dd492c54cd8d876fdd2b/blorp_2/PHASE_BOUNDARY_CLEANUPS_PLAN.md) was committed before
 implementation as `e89eb0cd4`. Fixed B is accepted F4 main,
 `eca1f723cab0ef87c498b81f124edf51546765fc`; this is an incremental comparison.
 

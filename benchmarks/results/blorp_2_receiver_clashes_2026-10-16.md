@@ -65,7 +65,7 @@ All **808 cap decisions pass** under the explicitly reviewed +5% correctness-pas
 allowance and retained absolute limits. Worst strict allocation growth is
 3.069360%; worst timed growth is the 128x8 stress above. The original eight
 tighter-limit failures remain failures in the
-[cost decision](../../blorp_2/UFCS_OVERLAP_PLAN.md#complete-collection-and-correctness-feature-cost-decision).
+[cost decision](https://github.com/kablorp/blorp/blob/b1dd8fda7d5f6c3451f6dd492c54cd8d876fdd2b/blorp_2/UFCS_OVERLAP_PLAN.md#complete-collection-and-correctness-feature-cost-decision).
 These are marginal costs against the keyword base. Different-source host
 proxies are not self-compilation or directly comparable across report roots.
 

@@ -1,7 +1,7 @@
 # Unused call contracts — 2026-10-18
 
 Status: **accepted for landing** after user reassessment. The code and primary
-cost metrics meet the [published plan](../../blorp_2/UNUSED_CALL_CONTRACTS_PLAN.md).
+cost metrics meet the [published plan](https://github.com/kablorp/blorp/blob/b1dd8fda7d5f6c3451f6dd492c54cd8d876fdd2b/blorp_2/UNUSED_CALL_CONTRACTS_PLAN.md).
 The user accepted the two measured small-input RSS increases and clarified that
 simplification should improve the overall direction; every individual metric
 need not decline. No layout tuning or compensating cleanup was attempted.

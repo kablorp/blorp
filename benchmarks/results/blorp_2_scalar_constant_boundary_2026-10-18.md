@@ -2,7 +2,7 @@
 
 Status: **accepted for landing**. Independent code/resource reviews and all
 functional gates pass. The separately reviewed
-[plan](../../blorp_2/SCALAR_CONSTANT_BOUNDARY_PLAN.md) is commit `7a78a9c9d`;
+[plan](https://github.com/kablorp/blorp/blob/b1dd8fda7d5f6c3451f6dd492c54cd8d876fdd2b/blorp_2/SCALAR_CONSTANT_BOUNDARY_PLAN.md) is commit `7a78a9c9d`;
 fixed B is `355d050a8fcab68508c48ec3d596ad922c9d8280`.
 
 ## Change and scope

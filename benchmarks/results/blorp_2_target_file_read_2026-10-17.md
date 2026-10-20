@@ -4,7 +4,7 @@ The bounded `system.read_file(String) -> Result[String, String]` implementation
 passes correctness, mutation, matched-cost and final destination gates, with
 root and independent compiler-expert review complete. This does not
 establish compiler self-compilation, loader migration, bootstrap or M6 completion.
-The [owning plan](../../blorp_2/TARGET_FILE_READ_PLAN.md) defines the contract.
+The [owning plan](https://github.com/kablorp/blorp/blob/b1dd8fda7d5f6c3451f6dd492c54cd8d876fdd2b/blorp_2/TARGET_FILE_READ_PLAN.md) defines the contract.
 
 ## Identity and ownership boundary
 

@@ -11,7 +11,7 @@ Current functional validation passes under the human-approved finite resource
 amendment. Original measurements and failed original thresholds remain recorded
 with their original verdicts. This is a FEATURE acceptance packet; it establishes
 neither target self-compilation nor current-main SOURCE frontier/+3% acceptance.
-The [canonical plan](../../blorp_2/INT_COMPARISON_PLAN.md#current-approved-status-and-bounded-resource-limits)
+The [canonical plan](https://github.com/kablorp/blorp/blob/b1dd8fda7d5f6c3451f6dd492c54cd8d876fdd2b/blorp_2/INT_COMPARISON_PLAN.md#current-approved-status-and-bounded-resource-limits)
 owns the exact cap tables and scope.
 
 ## Current composition and functional evidence

@@ -84,4 +84,4 @@ required ignored evidence has an independent retained copy.
 
 Root and an independent compiler reviewer inspected the code, effective
 mutations, producer roles and each measured limit. Historical plans and numerical
-ceilings remain in `blorp_2/TYPE_ARGUMENT_TRANSLATION_PLAN.md`.
+ceilings remain in [historical type-argument plan](https://github.com/kablorp/blorp/blob/b1dd8fda7d5f6c3451f6dd492c54cd8d876fdd2b/blorp_2/TYPE_ARGUMENT_TRANSLATION_PLAN.md).

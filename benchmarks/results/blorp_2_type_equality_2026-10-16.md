@@ -7,7 +7,7 @@ forms remain distinct even when the applied argument list is empty. No new
 matcher, cache, carrier or normalization is introduced.
 
 This is the separately validated preparation from
-[TYPE_EQUALITY_PLAN.md](../../blorp_2/TYPE_EQUALITY_PLAN.md), not implementation
+[TYPE_EQUALITY_PLAN.md](https://github.com/kablorp/blorp/blob/b1dd8fda7d5f6c3451f6dd492c54cd8d876fdd2b/blorp_2/TYPE_EQUALITY_PLAN.md), not implementation
 or acceptance of UFCS clash checking. Production changes are 23 added/14 removed
 lines, **+9 net** (ceiling +20); tests add six lines. Root and an independent
 compiler expert reviewed the integrated source with zero findings, and an
@@ -52,7 +52,7 @@ All **445** fixture inputs have exactly matching outcomes and diagnostics:
 C. Every one of the 890 strict runs reports positive, balanced allocation and
 release counts with zero leaked objects or bytes. All 349 accepted inputs
 reduce allocations; none grows. The complete provider trees from
-[UFCS_OVERLAP_PLAN.md](../../blorp_2/UFCS_OVERLAP_PLAN.md), including all provider
+[UFCS_OVERLAP_PLAN.md](https://github.com/kablorp/blorp/blob/b1dd8fda7d5f6c3451f6dd492c54cd8d876fdd2b/blorp_2/UFCS_OVERLAP_PLAN.md), including all provider
 bytes, are independently hash-verified before stress measurements.
 
 | Boundary | Baseline allocations | Candidate allocations | Normal min3 instruction change |

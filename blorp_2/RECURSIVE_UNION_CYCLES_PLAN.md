@@ -365,12 +365,10 @@ roots only take completed children; each new parent is newer than every stored
 child, so runtime sharing forms a finite DAG. Runtime mutation does not become
 safe merely because RC==1. No deep source-stack claim follows from boxed data.
 
-Reviewed wording-only corrections when this plan lands:
-ROADMAP M4's managed-call paragraph should assign removal of historical call-stack
-limits/shared-loop representation to **M3**, not data layout/destruction. QUALITY_ROADMAP:1035
-should say M2.3 needs no **join-arm** early-return form for ?=; permitted
-function-top-level propagation still needs a genuine function return plus cleanup.
-Neither clarification authorizes M3/M2.3 implementation here.
+The roadmap assigns managed call-stack limits and shared-loop representation to
+**M3**, separately from data layout/destruction. Function-top-level propagation
+needs genuine function return and cleanup, without a general join-arm early-return
+form. Neither clarification authorizes M3 or propagation implementation here.
 
 After reviewed plan commit: focused owning suites via frozen host, runtime
 TestSuite, one pilot build then real-main e2e atO0+sanitizers, full corpus/costs,

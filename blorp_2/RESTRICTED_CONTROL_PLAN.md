@@ -22,7 +22,7 @@ Current [expression checking](src/check/expressions.brp):356 rejects IfExpressio
 are source-inspected outcomes, not executed reproductions. The reviewed local
 annotation and Boolean implementations are separate dependencies: neither
 body-checking route is present in this pinned main. Compose their reviewed
-changes and the [ordinary-tail preparation](M3_LOOP_PLAN.md#immediate-checkpoint-ordinary-tail-matches)
+changes and the [ordinary-tail preparation](M3_LOOP_PLAN.md#historical-ordinary-tail-preparation-acceptance)
 before implementation. A later authorized implementation may compose these
 reviewed predecessor patches in this isolated branch before their individual
 landings. Root integrates predecessors first. The composed candidate inherits
@@ -440,7 +440,7 @@ new fixture files/60 source lines fit inside A's 700 gross test additions; the
 same absolute cost ceilings cover the existing rejection-to-success input. Target
 runtime independently requires strict zero leaks and balanced managed
 allocation/release counts from the actual emitted target memory runtime. Compose
-the reviewed [memory-accounting predecessor](PILOT_MEMORY_ACCOUNTING_PLAN.md)
+the reviewed [memory-accounting predecessor](../benchmarks/results/blorp_2_pilot_memory_accounting_2026-10-18.md)
 for native proof when needed; its validation/acceptance is not inherited.
 Supporting-host totals or a diagnostic build flag alone cannot establish target
 balance. Verify the target's strict report and leak-fault oracle on the composed

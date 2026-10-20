@@ -25,7 +25,7 @@ allocation/instruction gate passed independently.
 
 Acceptance uses the exact integer tests `100*C <= 103*B`, rather than rounded
 percentages or averages. The feature's
-[own approved policy](../../blorp_2/CARRIED_BINDINGS_PLAN.md#prospective-m2-carried-feature-approval)
+[own approved policy](https://github.com/kablorp/blorp/blob/b1dd8fda7d5f6c3451f6dd492c54cd8d876fdd2b/blorp_2/CARRIED_BINDINGS_PLAN.md#prospective-m2-carried-feature-approval)
 supersedes its historical +5%/+10% proposal. No library FEATURE TOTAL exception
 or unary-preparation allowance transfers to this feature.
 

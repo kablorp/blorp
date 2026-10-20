@@ -20,7 +20,7 @@ compiler user modules. No additional constructor import is required by this slic
 
 Only src/load/load.brp and its existing test_load owner change. Existing host and
 target system modules already expose get_current_directory() -> Result[String, String].
-The [host API contract](HOST_CURRENT_DIRECTORY_PLAN.md) is a dependency already
+The [host API contract](ROADMAP.md#seven-shell-and-path-functions) is a dependency already
 provided; the held host31 String.slice wrapper is unrelated to this CWD edit.
 Ambient Path/library and source-language prerequisites still govern self-compilation.
 

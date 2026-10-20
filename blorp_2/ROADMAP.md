@@ -7,13 +7,12 @@ completed evidence stays in Git and
 [benchmarks/results](../benchmarks/results/). Read both [AGENTS.md](AGENTS.md)
 and the [parent AGENTS.md](../AGENTS.md).
 
-The [2026-10-18 execution handoff](SELF_COMPILATION_HANDOFF.md) gives the current
-remaining dependency order, acceptance steps and
-[subthread recovery register](SELF_COMPILATION_WORKSTREAMS.md). Its dated
-candidate statuses distinguish held implementations from work landed on main.
+The milestone status below distinguishes implemented capabilities from pending
+contracts. Dated candidate handoffs and local worktree registers are recoverable
+from Git; they are not current source or acceptance authorities.
 
 [README.md](README.md) and [grammar.ebnf](grammar.ebnf) describe implemented
-behavior. The [imports/prelude reference](IMPORTS_AND_PRELUDE_PLAN.md) describes
+behavior. The [imports/prelude reference](README.md#local-modules) describes
 that implemented subsystem. [LIBRARY_PARITY.md](LIBRARY_PARITY.md) is the
 authority for which library functions the compiler source may use while the
 host still builds it. Examples and unfinished milestones here are planned
@@ -95,15 +94,15 @@ their own inventory and plan after M8.
 
 Corrections, language rules and cleanups decided at the 2026-10-16 quality reset,
 including the namespace redesign, the `?=` placement rule, pattern and binding
-names, private types and UFCS clashes, are complete and published; see
-[QUALITY_ROADMAP.md](QUALITY_ROADMAP.md). Deferred cost experiments remain
-separate from that completed correctness and maintenance queue.
+names, private types and UFCS clashes, are complete and published. Their reports
+remain under [benchmarks/results](../benchmarks/results/). Deferred scaling work
+below stays separate from that completed correctness and maintenance queue.
 
-The [architecture audit](ARCHITECTURE_AUDIT_2026-10-16.md) supports the existing
-phase/ownership design. It prioritizes native UTF-8 file admission and replacing
-byte-classification substrings before claiming every String is valid UTF-8. Actual
-bootstrap-product destruction-depth acceptance remains open; native nested joins
-passed the audited toolchain's default limits through depth 256.
+The [phase and ownership contracts](#identity-and-immutable-facts) remain the
+architecture authority. Actual bootstrap-product destruction-depth acceptance
+remains open. The historical Apple Clang21 audit compiled nested joins through
+depth256 (513 lexical braces) with default limits; that is bounded native success,
+not a portable nesting threshold or a product-destruction proof.
 
 | Milestone | Scope | Status |
 | --- | --- | --- |
@@ -112,7 +111,7 @@ passed the audited toolchain's default limits through depth 256.
 | [ML](#ml-list-construction) | `append`, `set`, `concat`, list literal | Done. Checked `set_index` is an ordinary target-library wrapper. |
 | [M1b](#m1b-names-and-the-foundation) | Namespace: private, aliases, qualified names, designated `Bool`/`Option`/`Result` | Parts A and B done; control-flow consumers follow in M2/M3. |
 | [M5](#m5-constants) | Literal scalar/String constants | Implemented. Source construction functions replace the need for record/opaque constants and initializer dependencies. |
-| [M2](#m2-the-join) | Restricted control positions, outer-variable joins, Boolean operators, `?=` and annotations | M2.1 implemented; reviewed logical candidate preserved. General expression-control recut deferred. |
+| [M2](#m2-the-join) | Restricted control positions, outer-variable joins, ordinary Boolean calls, `?=` and annotations | Joins, Result propagation and annotations implemented; Boolean calls/source migration and restricted `if` remain pending. General expression-control recut deferred. |
 | [M2b](#m2b-pattern-compilation) | Qualified flat heads and non-binding constructor groups | Qualified flat heads implemented; non-binding groups and source-pattern migration remain pending. |
 | [M3](#m3-loops-and-tail-recursion) | Managed List/while loops, explicit exits and existing scalar TCO | Not started. Source flat recursion/ranges become loops; broader managed TCO deferred. |
 | [M4](#m4-recursive-types) | Existing unary/mixed recursive shapes plus ordinary opaque semantics | Steps 1/2a and ordinary opaque semantics implemented. Actual source-product depth acceptance remains. No current source witness requires unlanded 2b/2c. |
@@ -459,7 +458,10 @@ arguments; MIR `SwitchInt` with a join block.
 
 Checked side: one form, `Match(CheckedMatch[CheckedExpr])`, a tail match always
 being the body form. Desugarings happen in the checker, never the parser, which
-must not know `Bool`:
+must not know `Bool`. The operator rows below are historical and superseded by
+[ordinary Boolean calls](BOOL_FUNCTIONS_PLAN.md); the separate
+[`.not()` source migration](BOOLEAN_SOURCE_PLAN.md) remains pending, with no
+further legacy parser, host-library or bootstrap-pin work.
 
 ```
 x = if ready: 1 else: 0        Match on Bool: True -> yield 1, False -> yield 0
@@ -473,15 +475,16 @@ value ?= parse(text)           value = Match parse(text):
 
 `?=` desugars only among a function body's own top-level statements. It is
 rejected inside every `if` and `match` block, as well as loop and lambda bodies
-(see the [quality rule](QUALITY_ROADMAP.md#parser-contexts)). Its failure arm
+(see the [current propagation contract](RESTRICTED_CONTROL_PLAN.md)). Its failure arm
 returns from the function and discharges the function's live owners; it never
-exits an enclosing join. There is no CPS nesting or depth growth. The compiler
-source uses `Result` propagation. An `if` origin stays in the checker's error type for
-diagnostics, not in the tree. Local type annotations (an expected type) land
-here.
+exits an intermediate value join. The accepted Result-only implementation
+resolves the remaining function prefix inside an ordinary successful match arm;
+it records nesting for realistic1/2/5/9/16 chains. The earlier flat sketch above
+is historical, not the current representation. Local type annotations and Result
+propagation are implemented; restricted `if` remains separately pending.
 
 Steps: **M2.1** the join mechanism across lower, own, verify and emit, with
-non-tail `match` (needs no `Bool`); **M2.2** `if` and `and`/`or`/`not` (needs the
+non-tail `match` (needs no `Bool`); **M2.2** restricted `if` (needs the
 designated `Bool`); **M2.3** `?=` and local annotations (needs the designated
 `Result`; the early return must discharge every live function owner).
 
@@ -505,7 +508,7 @@ A join arm yields its value and those bindings: only a
 tail arm returns or loops, so a yield cannot end a function and a backedge
 cannot leave a join. The checker records each enclosing `var` reassigned by an
 arm; lowering publishes its selected immutable version after the join. The reviewed
-[carried-bindings plan](CARRIED_BINDINGS_PLAN.md) defines structured multi-output
+[carried-bindings report](../benchmarks/results/blorp_2_carried_bindings_2026-10-18.md) defines structured multi-output
 steps, first as a behavior-preserving preparation. Preparation budgets are
 accepted and the early physical screen is measured. The current unary port at
 accepted main `782824efb` includes the later concat/write-file typed consumers;
@@ -519,15 +522,15 @@ records current functional validation and the 3,976-call frozen cost campaign.
 The checked form is `Match(CheckedJoin)` with value arms; the tail match keeps
 `CheckedMatchBody`. A match at a Void function's tail discards each arm's
 value, as a plain Void tail does. A self call at the tail of a nested match
-is rejected until the loops milestone gives joins a backedge. M2.2 after M1b
-part B (designated `Bool`). M2.3 after M2.2; it needs M1b part B's
-designated `Result`, and adds top-level propagation with the function return's
+is rejected until the loops milestone gives joins a backedge. Restricted `if`
+uses M1b part B's designated `Bool`; implemented Result propagation uses the
+designated `Result` independently of restricted `if`, with the function return's
 ownership discharge and independent verification. It requires no early-return
 form for a join arm: nested propagation is a parser error.
 
-The [restricted control plan](RESTRICTED_CONTROL_PLAN.md) defines the next
-`if` increment and the separate, design-only function-top-level propagation
-work, including their ownership, test and cost gates. Implementation is pending.
+The [restricted control plan](RESTRICTED_CONTROL_PLAN.md) retains the pending
+`if` contract and records accepted Result propagation with its ownership, test
+and cost evidence; ordinary Boolean calls follow their separate active plan.
 
 ## M2b: pattern compilation
 
@@ -728,7 +731,7 @@ to the declaring module, using namespace-owned declaration authority.
 Specialize projects the accepted underlying type before forming runtime keys,
 so equal representations may share instances and the concrete `TypeRef` has no
 opaque variant. Ordinary declaration identities and resolved callback choices
-remain authoritative. The [ordinary opaque types plan](OPAQUE_TYPES_PLAN.md)
+remain authoritative. The [ordinary opaque types plan](../benchmarks/results/blorp_2_opaque_types_2026-10-18.md)
 is implemented without SemanticRef/key preparation or backend/runtime changes;
 the [validation report](../benchmarks/results/blorp_2_opaque_types_2026-10-18.md)
 records current-base acceptance and its limits. After restoring host-compatible
@@ -773,7 +776,7 @@ checks and 461 e2e fixtures passing. The [migration report](../benchmarks/result
 preserves the failed historical cost screen and the separately reviewed fixed-A/D
 acceptance. Slicing, remaining library and shell/path work still leave M6 open.
 
-The standalone [target current-directory Result slice](TARGET_CURRENT_DIRECTORY_PLAN.md)
+The standalone [target current-directory Result slice](../benchmarks/results/blorp_2_target_current_directory_2026-10-17.md)
 is implemented and validated: ordinary owning Result, phase/native tests, six
 effective/restored mutations and all 483 logical cost cases meet their gates.
 The [cost report](../benchmarks/results/blorp_2_target_current_directory_2026-10-17.md)
@@ -783,25 +786,25 @@ failed. No pilot/native memory exception applies. Compiler loader migration and
 all broader M6 shell/library integration retain the dependency order above;
 this accepted bounded witness establishes no self-compilation or M6 completion.
 
-[Target file reading](TARGET_FILE_READ_PLAN.md) is implemented and validated with phase/native,
+[Target file reading](../benchmarks/results/blorp_2_target_file_read_2026-10-17.md) is implemented and validated with phase/native,
 mutation, full-suite and matched-cost gates; [evidence](../benchmarks/results/blorp_2_target_file_read_2026-10-17.md)
 retains failed host strict checks. Destination e2e passed; loader migration remains pending.
 
-The bounded [target file-writing slice](TARGET_WRITE_FILE_PLAN.md) implements
+The bounded [target file-writing slice](../benchmarks/results/blorp_2_target_write_file_2026-10-18.md) implements
 ordinary `Result[Void, String]` with two borrowed Strings. Its phase/native, full
 functional and matched FEATURE cost gates pass; [evidence](../benchmarks/results/blorp_2_target_write_file_2026-10-18.md)
 retains the failed supporting-host strict checks. Main/loader migration remains
 a separate gate. This does not complete M6.
 
-The [String integer-appending plan](APPEND_INT_PLAN.md) specifies one ordinary
-temporary-library wrapper over accepted formatting and concat; implementation
-remains pending.
+The ordinary [String integer-appending wrapper](README.md#counted-string-operations)
+is implemented over accepted formatting and concat. Its fixtures preserve signed
+extrema, UTF-8/NUL bytes and aliases; self-compilation remains a separate gate.
 
 The current [Option/Result catalog and addition plan](OPTION_RESULT_PLAN.md)
 records nine APIs at 212 compiler sites. The five ordinary helpers are
 implemented; pure callable semantics with managed captures, four callback helpers
-and explicit compiler-source imports remain pending. The prelude stays unchanged;
-the held [five-helper proposal](OPTION_RESULT_HELPERS_PLAN.md) is its predecessor.
+and explicit compiler-source imports remain pending. The prelude stays unchanged.
+The superseded five-helper proposal is recoverable from Git.
 
 The [loader/shell integration draft](LOADER_SHELL_INTEGRATION_PLAN.md) maps actual
 source callers and missing leaves, beginning with fallible CWD and explicit stderr.
@@ -827,9 +830,9 @@ Do not reconstruct raw substring bytes through scalar encoding. `starts_with`
 can compare counted bytes without per-position substring allocation. Remove
 Unicode case mapping or search from the prerequisite set only after the parser's
 actual ASCII-classification calls disappear. Large String concatenation/join
-has a bounded [concrete List[String].join plan](LIST_STRING_JOIN_PLAN.md) for
-counted copying with one fresh result root. Implementation and acceptance remain
-pending; no generic builder or M6 completion follows.
+has a bounded [ordinary List[String].join plan](LIST_JOIN_PLAN.md), whose
+copying and stack costs are explicit. Implementation acceptance remains pending;
+no native join primitive, generic builder or M6 completion follows.
 
 ```blorp
 pure func starts_with(text: String, prefix: String) -> Bool:
@@ -888,9 +891,9 @@ as explicitly recorded in the parity table. No host trait enters target code.
   Reject NUL in a path before opening. Missing/unreadable input, incomplete reads
   and close failure return Err; clean up every opened handle. This increment
   needs stable source files, not arbitrary streams or concurrent snapshots.
-- **Write:** implemented and validated; the [plan](TARGET_WRITE_FILE_PLAN.md)
-  and [acceptance report](../benchmarks/results/blorp_2_target_write_file_2026-10-18.md)
-  retain the contracts and evidence.
+- **Write:** implemented and validated; the
+  [acceptance report](../benchmarks/results/blorp_2_target_write_file_2026-10-18.md)
+  retains the contracts and evidence.
   Create/truncate, write all counted contents and close successfully
   before Ok(void). Reject NUL paths; missing parents fail. A failure may leave
   partial output. Neither file operation prints. Preserve the primary failure
@@ -902,7 +905,7 @@ as explicitly recorded in the parity table. No host trait enters target code.
 - **Stderr:** attempt the complete counted message plus one additional LF,
   preserving internal newlines/NUL and writing nothing to stdout. Void reports
   no delivery status; stop on unrecoverable output error.
-  The [target stderr plan](TARGET_STDERR_PLAN.md) is implemented and validated;
+  The [target stderr implementation](../benchmarks/results/blorp_2_print_error_2026-10-18.md) is validated;
   migration of the compiler shell to this target API remains pending.
 - **Join:** an absolute child replaces base. Empty base returns child, including
   join("", "") == "". Otherwise retain a trailing separator or add one;
@@ -933,7 +936,7 @@ with all partially acquired argument ownership released. The native validator,
 ordinary prefix destruction and shared Int/Void wrapper enforce this boundary.
 
 Ordinary Blorp implements paths; native bindings implement the four impure
-operations. The [host get_current_directory](HOST_CURRENT_DIRECTORY_PLAN.md) is validated.
+operations. The host `get_current_directory` API is implemented and validated.
 Target wiring and any source-refactor host epoch transition remain pending.
 A disk stdlib edit does not update an executable's embedded runtime.
 
@@ -976,12 +979,12 @@ No stored/returned closure was found in the reviewed current source. Broader
 language function values remain future work; existing parser/rejection behavior
 is preserved.
 
-The [remaining callback ledger](REMAINING_CALLBACK_LEDGER.md) owns the prospective
-whole ceiling and cumulative accounting. Remaining SOURCE slices follow the
-user-approved fixed-baseline cost policy; retain historical R0 failures and
-cumulative trends without automatic baseline changes after failure.
+The abandoned callback-removal estimates grant no implementation allowance.
+Remaining SOURCE slices follow the [user-approved fixed-baseline cost policy](BOOTSTRAP_SOURCE_PLAN.md#source-cost-acceptance);
+retain historical R0 failures and cumulative trends without automatic baseline
+changes after failure.
 
-The bounded [three-site type-argument translation](TYPE_ARGUMENT_TRANSLATION_PLAN.md)
+The bounded [three-site type-argument translation](../benchmarks/results/blorp_2_first_order_type_arguments_2026-10-18.md)
 is implemented and validated: [3,920 matched calls](../benchmarks/results/blorp_2_first_order_type_arguments_2026-10-18.md)
 pass the +3% per-input and original-checkpoint-proxy limits. Historical R0
 compliance remains UNVERIFIED; eight callbacks and the broader M7 dependency remain.
@@ -1032,7 +1035,7 @@ be rewritten once blorp_2 is mature. The unit-test migration is a separate plan.
 
 **Exit proof.** The fixpoint script exits 0.
 
-**Status.** Not started. The [runtime accounting preparation](PILOT_MEMORY_ACCOUNTING_PLAN.md)
+**Status.** Not started. The [runtime accounting preparation](../benchmarks/results/blorp_2_pilot_memory_accounting_2026-10-18.md)
 has passed its bounded runtime and matched host-proxy gates
 ([evidence](../benchmarks/results/blorp_2_pilot_memory_accounting_2026-10-18.md)).
 Those host-generated pilot counts do not establish target-built strict
@@ -1311,7 +1314,7 @@ Supporting-host compile-time leaks follow the
   one published row or slot per concrete fact.
 
 For the unary typed-step preparation only, the
-[reviewed fixed-current contract](CARRIED_BINDINGS_PLAN.md#prospective-unary-preparation-cost-contract)
+[reviewed fixed-current contract](../benchmarks/results/blorp_2_carried_bindings_2026-10-18.md)
 was approved before current cost sampling. One fixed final accepted B and complete
 C must pass +3% allocations and normal min3 instructions per current input and the
 original construction-checkpoint proxy, with all absolute/LOC/strict-zero/identity
@@ -1363,6 +1366,14 @@ agree on observable values and safe destruction.
 
 `utils/int_map.brp` is a stopgap Int-keyed map for compiler tables; once Blorp
 has a dict implementation it is deleted and its users move to it.
+
+Historical measurements also identify repeated generic-recursion reachability,
+linear specialization-instance lookup inside repeated requests, module-path
+comparisons and growing String construction as scaling candidates. Retain
+complete instance keys and diagnostic order; any graph/index/builder change needs
+its own current matched measurement and reviewed scope. Old timings and source
+counts do not describe current main. Flat managed recursion and actual product
+destruction margins remain explicit M3/M4/M8 obligations, not cleanup work.
 
 ## Established references and local choices
 

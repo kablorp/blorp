@@ -22,9 +22,9 @@ library slice. These are historical probe results, not a current-main frontier
 observation; no current frontier is claimed without an actual current probe.
 
 The owner abandoned the remaining HOF-removal migration. Preserve existing
-compiler callbacks and their phase boundaries. The older
-[five-helper proposal](OPTION_RESULT_HELPERS_PLAN.md) and held candidate are
-historical predecessors, not the complete current demand or current cost authority.
+compiler callbacks and their phase boundaries. The older five-helper proposal
+and held candidate are historical predecessors recoverable from Git, not the
+complete current demand or current cost authority.
 
 ## Historical resolved compiler inventory
 
@@ -140,8 +140,8 @@ unavailable; this slice did not establish self-compilation or a current frontier
 
 ### 2. Support the pure callable forms the census actually uses
 
-[NAMED_CALLABLES_PLAN.md](NAMED_CALLABLES_PLAN.md) owns the first increment:
-named pure references, forwarding and direct-call specialization. Lambdas and
+The [named callback report](../benchmarks/results/blorp_2_named_callbacks_2026-10-18.md)
+records accepted named references, forwarding and direct-call specialization. Lambdas and
 immutable captures follow under a separately reviewed increment.
 
 Pure function types, named references, forwarding and direct-call specialization
@@ -220,7 +220,7 @@ production/test LOC limits, tool/library/input identities and cost procedure.
 Compiler data-model changes require matched construction allocations and normal
 minimum-of-three retired instructions, with independent prospective ceilings
 no looser than +3%, plus existing fixture limits. The sole exception is the
-shared named/lambda callable-M7 increment: its [bounded resource decision](NAMED_CALLABLES_PLAN.md#prospective-scope-and-costs)
+shared named/lambda callable-M7 increment: its [bounded resource decision](LAMBDAS_PLAN.md#atomic-slices-proposed-stops-and-evidence)
 uses +8% cumulative hard limits and a +6% reassessment against the unchanged
 initial M7 B, not a fresh allowance per stage. It changes no fixture limit or
 LOC budget and authorizes no lambda implementation before its separate frozen

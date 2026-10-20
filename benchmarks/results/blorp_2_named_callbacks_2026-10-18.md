@@ -8,7 +8,7 @@ semantic callable IDs; ordered declaration/type choices belong to specialization
 keys. Runtime data bindings stay dense, static arguments disappear, and managed
 returns use the existing Lower/Own/Verify/Emit path and ABI. Imports/qualification,
 generic substitutions and reference provenance remain explicit. The bounded
-scope follows [NAMED_CALLABLES_PLAN.md](../../blorp_2/NAMED_CALLABLES_PLAN.md).
+scope follows [NAMED_CALLABLES_PLAN.md](https://github.com/kablorp/blorp/blob/b1dd8fda7d5f6c3451f6dd492c54cd8d876fdd2b/blorp_2/NAMED_CALLABLES_PLAN.md).
 
 This increment excludes lambdas, captures, function storage/returns/aggregate
 payloads and runtime callable values. Callback candidates themselves take only

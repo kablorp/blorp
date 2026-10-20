@@ -25,7 +25,7 @@ still require named imports such as `int: add`. IO remains explicit.
 Int ordering uses one signed64 `less_than` builtin; the other relations,
 `not_equals`, `min` and `max` are ordinary pure functions. Imported `INT_MIN`
 and `INT_MAX` are closed scalar literals, with no runtime global storage.
-The [imports design](../IMPORTS_AND_PRELUDE_PLAN.md) defines the full rules.
+The [imports design](../README.md#local-modules) defines the full rules.
 
 `system.brp` records its accepted upstream revision and source SHA256.
 Its explicit `get_current_directory()` import returns `Result[String, String]`:

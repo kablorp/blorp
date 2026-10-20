@@ -5,7 +5,7 @@ counted byte once on stderr, and attempts one LF after a full transfer. A short
 transfer, including EINTR, stops without LF or retry. Void conveys no delivery
 status. The host still attempts LF after a short write; that narrow difference
 is intentional. Compiler-shell migration remains pending. The
-[accepted design](../../blorp_2/TARGET_STDERR_PLAN.md) supplies the scope and caps;
+[accepted design](https://github.com/kablorp/blorp/blob/b1dd8fda7d5f6c3451f6dd492c54cd8d876fdd2b/blorp_2/TARGET_STDERR_PLAN.md) supplies the scope and caps;
 its original planning-only restriction was superseded by explicit implementation
 and final-validation grants.
 

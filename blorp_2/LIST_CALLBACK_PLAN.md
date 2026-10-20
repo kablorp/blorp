@@ -9,9 +9,9 @@ Contains' +33.108888% allocation/+11.843529% instruction hard FAIL stays unchang
 
 ## API and accepted prerequisites
 
-Add only target List.any[T](List[T], pure(T)->Bool)->Bool,
-map[T,U](List[T], pure(T)->U)->List[U], and
-filter[T](List[T], pure(T)->Bool)->List[T]. Fresh resolved demand is12/20/1 sites.
+Add only target `List.any[T](List[T], pure(T)->Bool)->Bool`,
+`map[T,U](List[T], pure(T)->U)->List[U]`, and
+`filter[T](List[T], pure(T)->Bool)->List[T]`. Fresh resolved demand is12/20/1 sites.
 These are generic APIs, not concrete adapters. Their definitions use accepted
 named/forwarded callbacks, get/length/concat and Int add/subtract/divide. No
 lambda/capture machinery, source loop, tail annotation, M3 path, compiler model,
