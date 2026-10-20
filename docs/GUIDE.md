@@ -2184,6 +2184,12 @@ Rules for `?=`:
   use `with reader ?= open_read(path):` so cleanup ownership is installed.
 - There is no bare postfix `?` operator.
 
+The [Blorp 2 pilot](../blorp_2/README.md) currently accepts only canonical
+`Result` propagation at the function's top level, outside `@tail_recursive`
+functions. Its source and returned `Result` may have different success types
+but must share the same error type. A `value: Type ?= expression` annotation
+supplies the success type when ordinary RHS inference needs context.
+
 ### `with` Resource Scopes
 
 `with name = acquire():` and `with name ?= acquire():` create scoped resources

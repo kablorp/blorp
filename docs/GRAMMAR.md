@@ -1885,6 +1885,9 @@ Any other target is a syntax error. Owner decisions:
   function body's own top-level statements.** It is forbidden inside every
   `if` or `match` block, including statement, tail and value positions, and
   inside loop and lambda bodies, while conditions and for iterables.
+  Its current checker accepts canonical `Result` propagation with matching
+  error types; source and enclosing return success types may differ. `Option`
+  propagation and propagation in `@tail_recursive` functions remain unsupported.
   The parser reports `` `?=` cannot be used inside an `if` or `match` block ``
   with help ``match on the Result or Option in place, or move the block into
   its own function and use `?=` at its top``. Loop and lambda contexts retain

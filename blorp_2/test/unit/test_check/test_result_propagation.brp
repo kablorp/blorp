@@ -1,0 +1,493 @@
+import:
+	../../../src/check/check: check, checked_functions, check_errors
+	../../../src/check/model as Model
+	../../../src/check/errors as Errors
+	../../../src/check/render: render_failure
+	../../../src/namespace/builtins as Builtins
+	../../../src/utils/source: module_source, root_module_id
+	../../../src/utils/syntax: Span, DiagnosticNote(PreviousDeclaration), same_span
+	../../../src/utils/ids: VariantId, variant_owner, union_number
+	../input: setup_diagnostic
+	../module_input: TEST_BASE, parse_modules_with_base
+	test: TestSuite
+
+
+private SOURCE: String =
+	|pure func produce(value: String) -> Result[String, String]:
+	|    Ok(value)
+	|pure func advance(value: String) -> Result[Int, String]:
+	|    captured: String ?= produce(value)
+	|    retained = captured
+	|    Ok(7)
+	|func main() -> Int:
+	|    0
+	|
+
+
+pure func test_annotated_result_prefix_accepts_a_different_success_type() -> Bool:
+	parse_modules_with_base([{ source = SOURCE, targets = [] }], TEST_BASE)
+		.and_then(pure func(parsed): check(parsed).map_err(setup_diagnostic))
+		.is_ok()
+
+
+private pure func checked(source: String) -> Option[Model.CheckedFunctions]:
+	match parse_modules_with_base([{ source = source, targets = [] }], TEST_BASE):
+		Err(_): None
+		Ok(parsed):
+			match check(parsed):
+				Err(_): None
+				Ok(program): Some(checked_functions(program))
+
+
+private pure func returned(function: Model.CheckedFunction) -> Option[Model.CheckedExpr]:
+	match function.body:
+		Model.CheckedValueBody(Model.ReturnExpression(value)): Some(value)
+		_: None
+
+
+private pure func constructor_id(function: Model.CheckedFunction) -> Option[VariantId]:
+	match returned(function):
+		Some(value):
+			match value.form:
+				Model.ConstructVariant(id, [_]): Some(id)
+				_: None
+		None: None
+
+
+private pure func success_value(arm: Model.CheckedJoinArm, capture: Model.BindingId, expected_ok: VariantId, result_type: Model.TypeRef) -> Bool:
+	match arm.statements.get(0):
+		None: False
+		Some(statement):
+			match statement:
+				Model.InitializeBinding(retained_id, retained):
+					match retained.form:
+						Model.ReadBinding(read):
+							match arm.value.form:
+								Model.ConstructVariant(actual_ok, fields):
+									match fields.get(0):
+										Some(number):
+											(Model.same_variant(actual_ok, expected_ok)
+												and Model.same_type(number.value_type, Model.IntType)
+												and Model.same_type(arm.value.value_type, result_type)
+												and Model.binding_number(read) == Model.binding_number(capture)
+												and Model.binding_number(retained_id) != Model.binding_number(capture)
+												and arm.statements.length() == 1 and fields.length() == 1)
+										None: False
+								_: False
+						_: False
+				_: False
+
+
+private pure func failure_value(arm: Model.CheckedJoinArm, capture: Model.BindingId, expected_err: VariantId, result_type: Model.TypeRef) -> Bool:
+	match arm.value.form:
+		Model.ConstructVariant(actual_err, fields):
+			match fields.get(0):
+				None: False
+				Some(error):
+					match error.form:
+						Model.ReadBinding(read):
+							(Model.same_variant(actual_err, expected_err)
+								and Model.same_type(error.value_type, Model.StringType)
+								and Model.same_type(arm.value.value_type, result_type)
+								and Model.binding_number(read) == Model.binding_number(capture)
+								and arm.statements.is_empty() and fields.length() == 1)
+						_: False
+		_: False
+
+
+private pure func one_capture(fields: List[Option[Model.BindingId]]) -> Option[Model.BindingId]:
+	match fields.get(0):
+		Some(field):
+			if fields.length() == 1:
+				field
+			else:
+				None
+		None: None
+
+
+private pure func string_capture(function: Model.CheckedFunction, id: Model.BindingId) -> Bool:
+	match function.bindings.get(Model.binding_number(id)):
+		None: False
+		Some(definition):
+			match definition.origin:
+				Model.MatchCapture: Model.same_type(definition.value_type, Model.StringType)
+				_: False
+
+
+private pure func joined_arms(function: Model.CheckedFunction, join: Model.CheckedJoin, private_id: Model.BindingId, expected_ok: VariantId, expected_err: VariantId) -> Bool:
+	match join.arms.get(0):
+		None: False
+		Some(success):
+			match join.arms.get(1):
+				None: False
+				Some(failure):
+					match success.pattern:
+						Model.VariantCase(actual_ok, success_fields):
+							match failure.pattern:
+								Model.VariantCase(actual_err, error_fields):
+									match one_capture(success_fields):
+										None: False
+										Some(value_id):
+											match one_capture(error_fields):
+												None: False
+												Some(error_id):
+													(Model.same_variant(actual_ok, expected_ok) and Model.same_variant(actual_err, expected_err)
+														and not Model.same_variant(actual_ok, actual_err)
+														and string_capture(function, value_id) and string_capture(function, error_id)
+														and Model.binding_number(error_id) != Model.binding_number(value_id)
+														and Model.binding_number(private_id) != Model.binding_number(value_id)
+														and Model.binding_number(private_id) != Model.binding_number(error_id)
+														and success_value(success, value_id, expected_ok, function.signature.return_type.value_type)
+														and failure_value(failure, error_id, expected_err, function.signature.return_type.value_type)
+														and join.carried.is_empty() and join.arms.length() == 2)
+								_: False
+						_: False
+
+
+private pure func private_rhs(function: Model.CheckedFunction, source_type: Model.TypeRef, expected_ok: VariantId, expected_err: VariantId) -> Bool:
+	match function.statements.get(0):
+		None: False
+		Some(statement):
+			match statement:
+				Model.InitializeBinding(private_id, rhs):
+					match function.bindings.get(Model.binding_number(private_id)):
+						None: False
+						Some(definition):
+							match definition.origin:
+								Model.BodyLocal:
+									match definition.mutability:
+										Model.Immutable:
+											match returned(function):
+												None: False
+												Some(value):
+													match value.form:
+														Model.Match(join):
+															match join.scrutinee.form:
+																Model.ReadBinding(read):
+																	(Model.binding_number(read) == Model.binding_number(private_id)
+																		and Model.same_type(definition.value_type, source_type)
+																		and Model.same_type(rhs.value_type, source_type)
+																		and Model.same_type(join.union_type, source_type)
+																		and Model.same_type(join.scrutinee.value_type, source_type)
+																		and Model.same_type(value.value_type, function.signature.return_type.value_type)
+																		and not Model.same_type(value.value_type, source_type)
+																		and function.statements.length() == 1
+																		and joined_arms(function, join, private_id, expected_ok, expected_err))
+																_: False
+														_: False
+										_: False
+								_: False
+				_: False
+
+
+pure func test_join_keeps_source_and_return_payloads_and_issued_variant_identities() -> Bool:
+	source: String =
+		|pure func produce(value: String) -> Result[String, String]:
+		|    Ok(value)
+		|pure func reject(value: String) -> Result[Int, String]:
+		|    Err(value)
+		|pure func advance(value: String) -> Result[Int, String]:
+		|    captured: String ?= produce(value)
+		|    retained = captured
+		|    Ok(7)
+		|func main() -> Int:
+		|    0
+		|
+	match checked(source):
+		None: False
+		Some(program):
+			match (program.functions.get(0), program.functions.get(1), program.functions.get(2)):
+				(Some(produce), Some(reject), Some(advance)):
+					match (constructor_id(produce), constructor_id(reject)):
+						(Some(ok_id), Some(err_id)):
+							(Model.same_type(advance.signature.return_type.value_type, reject.signature.return_type.value_type)
+								and private_rhs(advance, produce.signature.return_type.value_type, ok_id, err_id))
+						_: False
+				_: False
+
+
+pure func test_annotation_context_resolves_a_constructor_before_the_continuation() -> Bool:
+	source: String =
+		|pure func advance() -> Result[Int, String]:
+		|    captured: String ?= Ok("payload")
+		|    Ok(7)
+		|func main() -> Int:
+		|    0
+		|
+	checked(source).is_some()
+
+
+pure func test_generic_source_retains_the_enclosing_rigid_type() -> Bool:
+	source: String =
+		|pure func advance[T](value: Result[T, String]) -> Result[T, String]:
+		|    captured: T ?= value
+		|    Ok(captured)
+		|func main() -> Int:
+		|    0
+		|
+	checked(source).is_some()
+
+
+pure func test_void_success_payload_can_feed_a_different_return_type() -> Bool:
+	source: String =
+		|pure func advance(value: Result[Void, String]) -> Result[Int, String]:
+		|    captured: Void ?= value
+		|    Ok(7)
+		|func main() -> Int:
+		|    0
+		|
+	checked(source).is_some()
+
+
+pure func test_mutable_prefix_and_tail_match_remain_in_the_success_continuation() -> Bool:
+	source: String =
+		|pure func advance(value: Result[Bool, String]) -> Result[Int, String]:
+		|    var total = 1
+		|    flag ?= value
+		|    total = 7
+		|    match flag:
+		|        True: Ok(total)
+		|        False: Ok(2)
+		|func main() -> Int:
+		|    0
+		|
+	checked(source).is_some()
+
+
+private MAIN: String = "func main() -> Int:\n    0\n"
+private RESULT_HEADER: String = "pure func advance(value: Result[Int, String]) -> Result[Int, String]:\n"
+private RETURN_HELP: String = "return Result[Value, Error] from this function, or match on the value explicitly"
+private VALUE_HELP: String = "use a Result value here, or match on the value explicitly"
+
+
+private pure func rejects(source: String, before: String, occurrence: String, expected: pure (Errors.CheckErrorKind, Builtins.DesignatedUnions) -> Bool, message: String, help: String) -> Bool:
+	match parse_modules_with_base([{ source = source, targets = [] }], TEST_BASE):
+		Err(_): False
+		Ok(parsed):
+			match Builtins.check_builtin_types(parsed):
+				Err(_): False
+				Ok(foundation):
+					match check(parsed):
+						Ok(_): False
+						Err(failure):
+							errors = check_errors(failure)
+							diagnostics = render_failure(failure)
+							actual = diagnostics.first
+							note = match errors.first.kind:
+								Errors.BindingRejection(Errors.LocalBindingConflict(previous, _)):
+									match actual.note:
+										Some(PreviousDeclaration(written)): same_span(written, previous.span)
+										_: False
+								_: actual.note.is_none()
+							match source.index_of(before + occurrence):
+								None: False
+								Some(start):
+									span: Span = { source = module_source(root_module_id()), start = start + before.length(), end = start + before.length() + occurrence.length() }
+									(expected(errors.first.kind, foundation.designated)
+										and errors.remaining.is_empty() and diagnostics.remaining.is_empty()
+										and same_span(errors.first.span, span) and same_span(actual.span, span)
+										and actual.message == message and actual.help == help and note)
+
+
+pure func test_non_result_return_rejects_before_the_unknown_rhs() -> Bool:
+	source: String =
+		|pure func advance() -> Int:
+		|    captured ?= absent
+		|    7
+		|
+	expected: pure (Errors.CheckErrorKind, Builtins.DesignatedUnions) -> Bool = pure func(kind, foundation):
+		match kind:
+			Errors.StatementRejection(Errors.PropagationNeedsResultReturn(actual)): Model.same_type(actual, Model.IntType)
+			_: False
+	rejects(source + MAIN, "", "captured ?= absent", expected, "`?=` requires a Result-returning function", RETURN_HELP)
+
+
+pure func test_option_rhs_is_not_a_designated_result() -> Bool:
+	source: String =
+		|pure func advance(value: Option[Int]) -> Result[Int, String]:
+		|    captured ?= value
+		|    Ok(captured)
+		|
+	expected: pure (Errors.CheckErrorKind, Builtins.DesignatedUnions) -> Bool = pure func(kind, foundation):
+		match kind:
+			Errors.StatementRejection(Errors.PropagationNeedsResultValue(actual)):
+				Model.same_type(actual, Model.AppliedUnionType(variant_owner(foundation.option.some), [Model.IntType]))
+			_: False
+	rejects(source + MAIN, "captured ?= ", "value", expected, "`?=` requires a Result value", VALUE_HELP)
+
+
+pure func test_integer_rhs_requires_a_result() -> Bool:
+	source = RESULT_HEADER + "    captured ?= 7\n    Ok(captured)\n" + MAIN
+	expected: pure (Errors.CheckErrorKind, Builtins.DesignatedUnions) -> Bool = pure func(kind, foundation):
+		match kind:
+			Errors.StatementRejection(Errors.PropagationNeedsResultValue(actual)): Model.same_type(actual, Model.IntType)
+			_: False
+	rejects(source, "captured ?= ", "7", expected, "`?=` requires a Result value", VALUE_HELP)
+
+
+pure func test_error_payload_must_match_the_enclosing_result() -> Bool:
+	source: String =
+		|pure func advance(input: Result[Int, Int]) -> Result[String, String]:
+		|    captured ?= input
+		|    Ok("done")
+		|
+	expected: pure (Errors.CheckErrorKind, Builtins.DesignatedUnions) -> Bool = pure func(kind, foundation):
+		match kind:
+			Errors.ValueRejection(Errors.ExpressionTypeMismatch(mismatch)):
+				owner = variant_owner(foundation.result.ok)
+				(Model.same_type(mismatch.expected, Model.AppliedUnionType(owner, [Model.IntType, Model.StringType]))
+					and Model.same_type(mismatch.actual.value_type, Model.AppliedUnionType(owner, [Model.IntType, Model.IntType])))
+			_: False
+	rejects(source + MAIN, "captured ?= ", "input", expected, "expression does not match the expected type", "use an expression of type Result[Int, String] here")
+
+
+pure func test_success_annotation_is_checked_before_the_rhs_name() -> Bool:
+	source = RESULT_HEADER + "    captured: Missing ?= absent\n    Ok(7)\n" + MAIN
+	expected: pure (Errors.CheckErrorKind, Builtins.DesignatedUnions) -> Bool = pure func(kind, foundation):
+		match kind:
+			Errors.TypeTermRejection(Errors.UnknownType(_)): True
+			_: False
+	rejects(source, "captured: ", "Missing", expected, "unknown type", "declare or import this type; builtin types and declared type parameters are also available")
+
+
+pure func test_underconstrained_constructor_keeps_its_original_error() -> Bool:
+	source = RESULT_HEADER + "    captured ?= Ok(7)\n    Ok(captured)\n" + MAIN
+	expected: pure (Errors.CheckErrorKind, Builtins.DesignatedUnions) -> Bool = pure func(kind, foundation):
+		match kind:
+			Errors.ConstructorRejection(Errors.ConstructorNeedsExpectedType(_)): True
+			_: False
+	rejects(source, "captured ?= ", "Ok", expected, "constructor needs an expected union type", "pass an already-typed union value or call a concrete helper returning the union")
+
+
+pure func test_rhs_does_not_see_its_own_success_binder() -> Bool:
+	source = RESULT_HEADER + "    captured ?= captured\n    Ok(captured)\n" + MAIN
+	expected: pure (Errors.CheckErrorKind, Builtins.DesignatedUnions) -> Bool = pure func(kind, foundation):
+		match kind:
+			Errors.ValueRejection(Errors.UnknownValue(_)): True
+			_: False
+	rejects(source, "captured ?= ", "captured", expected, "unknown value", "use this function's parameter name, a declared variant, or a call")
+
+
+pure func test_tail_annotation_is_rejected_after_ordinary_body_errors() -> Bool:
+	source = "@tail_recursive\n" + RESULT_HEADER + "    captured ?= value\n    absent\n" + MAIN
+	expected: pure (Errors.CheckErrorKind, Builtins.DesignatedUnions) -> Bool = pure func(kind, foundation):
+		match kind:
+			Errors.ValueRejection(Errors.UnknownValue(_)): True
+			_: False
+	rejects(source, "", "absent", expected, "unknown value", "use this function's parameter name, a declared variant, or a call")
+
+
+pure func test_valid_propagation_rejects_annotated_tco() -> Bool:
+	source = "@tail_recursive\n" + RESULT_HEADER + "    captured ?= value\n    Ok(captured)\n" + MAIN
+	expected: pure (Errors.CheckErrorKind, Builtins.DesignatedUnions) -> Bool = pure func(kind, foundation):
+		match kind:
+			Errors.RecursionRejection(Errors.PropagationTailRecursionUnsupported): True
+			_: False
+	rejects(source, "", "captured ?= value", expected, "`?=` is not supported in @tail_recursive functions", "remove @tail_recursive, or match on the Result explicitly")
+
+
+pure func test_generic_tail_annotation_keeps_its_existing_priority() -> Bool:
+	source: String =
+		|@tail_recursive
+		|pure func advance[T](value: Result[T, String]) -> Result[T, String]:
+		|    captured ?= value
+		|    Ok(captured)
+		|
+	expected: pure (Errors.CheckErrorKind, Builtins.DesignatedUnions) -> Bool = pure func(kind, foundation):
+		match kind:
+			Errors.RecursionRejection(Errors.GenericTailRecursionUnsupported): True
+			_: False
+	rejects(source + MAIN, "", "@tail_recursive", expected, "generic @tail_recursive functions are not supported yet", "use a nongeneric helper, or remove @tail_recursive")
+
+
+pure func test_annotated_success_mismatch_keeps_both_result_types() -> Bool:
+	source = RESULT_HEADER + "    captured: String ?= value\n    Ok(7)\n" + MAIN
+	expected: pure (Errors.CheckErrorKind, Builtins.DesignatedUnions) -> Bool = pure func(kind, foundation):
+		match kind:
+			Errors.ValueRejection(Errors.ExpressionTypeMismatch(mismatch)):
+				owner = variant_owner(foundation.result.ok)
+				(Model.same_type(mismatch.expected, Model.AppliedUnionType(owner, [Model.StringType, Model.StringType]))
+					and Model.same_type(mismatch.actual.value_type, Model.AppliedUnionType(owner, [Model.IntType, Model.StringType])))
+			_: False
+	rejects(source, "captured: String ?= ", "value", expected, "expression does not match the expected type", "use an expression of type Result[String, String] here")
+
+
+pure func test_same_shaped_union_does_not_gain_result_propagation() -> Bool:
+	source: String =
+		|fixed union Other[A, B]:
+		|    Pass(A)
+		|    Stop(B)
+		|pure func advance(value: Other[Int, String]) -> Result[Int, String]:
+		|    captured ?= value
+		|    Ok(captured)
+		|
+	expected: pure (Errors.CheckErrorKind, Builtins.DesignatedUnions) -> Bool = pure func(kind, foundation):
+		match kind:
+			Errors.StatementRejection(Errors.PropagationNeedsResultValue(actual)):
+				match actual:
+					Model.AppliedUnionType(owner, arguments):
+						(union_number(owner) != union_number(variant_owner(foundation.result.ok))
+							and Model.same_types(arguments, [Model.IntType, Model.StringType]))
+					_: False
+			_: False
+	rejects(source + MAIN, "captured ?= ", "value", expected, "`?=` requires a Result value", VALUE_HELP)
+
+
+pure func test_unknown_rhs_precedes_a_duplicate_success_binder() -> Bool:
+	source = RESULT_HEADER + "    captured = 1\n    captured ?= absent\n    Ok(captured)\n" + MAIN
+	expected: pure (Errors.CheckErrorKind, Builtins.DesignatedUnions) -> Bool = pure func(kind, foundation):
+		match kind:
+			Errors.ValueRejection(Errors.UnknownValue(_)): True
+			_: False
+	rejects(source, "captured ?= ", "absent", expected, "unknown value", "use this function's parameter name, a declared variant, or a call")
+
+
+pure func test_a_typed_rhs_still_rejects_the_duplicate_binder() -> Bool:
+	source = RESULT_HEADER + "    captured = 1\n    captured ?= value\n    Ok(captured)\n" + MAIN
+	expected: pure (Errors.CheckErrorKind, Builtins.DesignatedUnions) -> Bool = pure func(kind, foundation):
+		match kind:
+			Errors.BindingRejection(Errors.LocalBindingConflict(previous, Model.BodyLocal)):
+				previous.span.start == RESULT_HEADER.length() + "    ".length()
+			_: False
+	rejects(source, "    captured = 1\n    ", "captured", expected, "`captured` is already a local in this function", "choose a different name for this binding")
+
+
+pure func test_nested_unrelated_constructor_preserves_its_own_diagnostic() -> Bool:
+	header: String =
+		|pure func independent[T](unused: T) -> Result[Int, String]:
+		|    Ok(7)
+		|
+	source = header + RESULT_HEADER + "    captured ?= independent(Ok(7))\n    Ok(captured)\n" + MAIN
+	expected: pure (Errors.CheckErrorKind, Builtins.DesignatedUnions) -> Bool = pure func(kind, foundation):
+		match kind:
+			Errors.ConstructorRejection(Errors.ConstructorNeedsExpectedType(_)): True
+			_: False
+	rejects(source, "captured ?= independent(", "Ok", expected, "constructor needs an expected union type", "pass an already-typed union value or call a concrete helper returning the union")
+
+
+tests: TestSuite = {
+	description = "Blorp 2 function-prefix Result propagation",
+	tests = [
+		("annotated Result prefix accepts a different success type", test_annotated_result_prefix_accepts_a_different_success_type),
+		("join keeps source and return payloads and issued variant identities", test_join_keeps_source_and_return_payloads_and_issued_variant_identities),
+		("annotation resolves a constructor before the continuation", test_annotation_context_resolves_a_constructor_before_the_continuation),
+		("generic source retains its enclosing rigid type", test_generic_source_retains_the_enclosing_rigid_type),
+		("Void success can feed a different return type", test_void_success_payload_can_feed_a_different_return_type),
+		("mutable prefix and tail match stay in the success continuation", test_mutable_prefix_and_tail_match_remain_in_the_success_continuation),
+		("Option RHS rejects with the designated Option identity", test_option_rhs_is_not_a_designated_result),
+		("non-Result return precedes unknown RHS", test_non_result_return_rejects_before_the_unknown_rhs),
+		("integer RHS requires a Result", test_integer_rhs_requires_a_result),
+		("error payload matches enclosing Result", test_error_payload_must_match_the_enclosing_result),
+		("success annotation precedes the RHS name", test_success_annotation_is_checked_before_the_rhs_name),
+		("underconstrained constructor keeps its original error", test_underconstrained_constructor_keeps_its_original_error),
+		("RHS cannot see its own success binder", test_rhs_does_not_see_its_own_success_binder),
+		("ordinary body error precedes tail annotation rejection", test_tail_annotation_is_rejected_after_ordinary_body_errors),
+		("valid propagation rejects annotated TCO", test_valid_propagation_rejects_annotated_tco),
+		("generic tail annotation retains existing priority", test_generic_tail_annotation_keeps_its_existing_priority),
+		("success annotation preserves both Result types", test_annotated_success_mismatch_keeps_both_result_types),
+		("same-shaped union is not designated Result", test_same_shaped_union_does_not_gain_result_propagation),
+		("unknown RHS precedes duplicate success binder", test_unknown_rhs_precedes_a_duplicate_success_binder),
+		("typed RHS still rejects duplicate binder", test_a_typed_rhs_still_rejects_the_duplicate_binder),
+		("nested unrelated constructor keeps its diagnostic", test_nested_unrelated_constructor_preserves_its_own_diagnostic),
+	]
+}

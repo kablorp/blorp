@@ -1204,9 +1204,16 @@ Lexical and layout rules:
   `var`. It is rejected inside every `if` or `match` block, in statement and
   value positions alike, including tail arms. Loop bodies, lambda bodies,
   `while` conditions and `for` iterables also reject it.
-  Match on the Result or Option in place, or give the block its own function
-  and propagate at that function's top level. Checking still rejects valid
-  top-level propagation until the join milestone.
+  Checking accepts a canonical `Result[Value, Error]` in a function returning
+  `Result[Return, Error]`; the success types may differ, and the error types
+  must match. It binds the `Ok` payload once and returns an `Err` before
+  evaluating later statements. A binding annotation names the success type:
+  `value: String ?= expression` supplies `Result[String, Error]` context.
+  Otherwise the RHS must infer a complete type through ordinary inference;
+  bind a typed Result first when a constructor needs more context. `Option`
+  propagation and `?=` in `@tail_recursive` functions remain unsupported.
+  Match on the Result or Option in place, or give a nested block its own
+  function and propagate at that function's top level.
   `while condition:` and `for name in iterable:` (or
   `for _ in iterable:`, discarding each element) open a loop body; they,
   `break` and `continue` are statements with no value, and a loop control

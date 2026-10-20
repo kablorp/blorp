@@ -1,0 +1,179 @@
+import:
+	../../../src/check/check: CheckedProgram, check, checked_functions
+	../../../src/check/model as Checked
+	../../../src/lower/lower as Lower
+	../../../src/specialize/specialize as Concrete
+	../../../src/utils/syntax: entry_function
+	../input: setup_diagnostic
+	../module_input: TEST_BASE, parse_modules_with_base
+	test: TestSuite
+
+
+private pure func accepted(source: String) -> Option[CheckedProgram]:
+	parse_modules_with_base([{ source = source, targets = [] }], TEST_BASE)
+		.and_then(pure func(parsed): check(parsed).map_err(setup_diagnostic)).to_option()
+
+
+private pure func definition(step: Lower.LoweredStep) -> Option[Lower.ValueDefinition]:
+	match step:
+		Lower.Define(value): Some(value)
+		_: None
+
+
+private pure func joining(step: Lower.LoweredStep) -> Option[Lower.LoweredJoin]:
+	match step:
+		Lower.Join(value): Some(value)
+		_: None
+
+
+private pure func entry_callee(contents: Lower.LoweredFunctions) -> Option[Lower.LoweredFunction]:
+	main ?= contents.functions.get(Concrete.function_number(entry_function(contents.entrypoint)))
+	step ?= main.steps.get(1)
+	value ?= definition(step)
+	match value.operation:
+		Lower.CallValue(target, arguments):
+			match target:
+				Concrete.UserFunction(id):
+					if main.steps.length() == 3 and arguments.length() == 1:
+						contents.functions.get(Concrete.function_number(id))
+					else:
+						None
+				_: None
+		_: None
+
+
+private pure func returned(function: Lower.LoweredFunction) -> Option[Lower.ValueId]:
+	match function.tail:
+		Lower.ExitValue(exit):
+			match exit:
+				Lower.ReturnValue(id): Some(id)
+				_: None
+		_: None
+
+
+private pure func rhs_once(contents: Lower.LoweredFunctions, function: Lower.LoweredFunction) -> Option[Bool]:
+	parameter ?= function.steps.get(0).and_then(definition)
+	rhs ?= function.steps.get(1).and_then(definition)
+	join ?= function.steps.get(2).and_then(joining)
+	result ?= returned(function)
+	match rhs.operation:
+		Lower.CallValue(target, arguments):
+			match target:
+				Concrete.UserFunction(id):
+					produce ?= contents.functions.get(Concrete.function_number(id))
+					argument ?= arguments.get(0)
+					match parameter.operation:
+						Lower.ParameterValue(0):
+							match rhs.value_type:
+								Concrete.UnionType(owner):
+									Some(function.steps.length() == 3 and arguments.length() == 1
+										and Lower.value_number(argument) == Lower.value_number(parameter.id)
+										and Lower.value_number(join.scrutinee) == Lower.value_number(rhs.id)
+										and Lower.value_number(result) == Lower.value_number(join.result.id)
+										and Concrete.union_number(join.owner) == Concrete.union_number(owner)
+										and Concrete.same_type(rhs.value_type, produce.signature.return_type)
+										and Concrete.same_type(join.result.value_type, function.signature.return_type)
+										and join.arms.length() == 2 and join.carried.is_empty())
+								_: None
+						_: None
+				_: None
+		_: None
+
+
+pure func test_rhs_call_is_evaluated_once_and_its_value_is_the_join_scrutinee() -> Bool:
+	source: String =
+		|pure func produce(value: String) -> Result[String, String]:
+		|    Ok(value)
+		|pure func advance(value: String) -> Result[Int, String]:
+		|    captured ?= produce(value)
+		|    Ok(7)
+		|func main() -> Int:
+		|    unused = advance("payload")
+		|    0
+		|
+	match accepted(source):
+		None: False
+		Some(checked):
+			match Concrete.specialize(checked).and_then(Lower.lower):
+				Err(_): False
+				Ok(program):
+					contents = Lower.lowered_functions(program)
+					match entry_callee(contents):
+						Some(function): rhs_once(contents, function).get_or(False)
+						None: False
+
+
+private pure func checked_carrier(function: Checked.CheckedFunction) -> Bool:
+	match function.statements.get(0):
+		Some(first):
+			match first:
+				Checked.InitializeBinding(total, _):
+					match function.statements.get(1):
+						Some(second):
+							match second:
+								Checked.InitializeBinding(private_id, rhs):
+									match rhs.form:
+										Checked.Match(join):
+											match join.carried.get(0):
+												Some(id):
+													(join.carried.length() == 1
+														and Checked.binding_number(id) == Checked.binding_number(total)
+														and Checked.binding_number(id) != Checked.binding_number(private_id))
+												None: False
+										_: False
+								_: False
+						None: False
+				_: False
+		None: False
+
+
+private pure func lowered_carrier(function: Lower.LoweredFunction) -> Option[Bool]:
+	rhs ?= function.steps.get(2).and_then(joining)
+	carried ?= rhs.carried.get(0)
+	result ?= function.steps.get(3).and_then(joining)
+	success ?= result.arms.get(0)
+	value ?= success.steps.get(1).and_then(definition)
+	match value.operation:
+		Lower.ConstructValue(_, arguments):
+			read ?= arguments.get(0)
+			Some(rhs.carried.length() == 1 and arguments.length() == 1
+				and Lower.value_number(read) == Lower.value_number(carried.id)
+				and Lower.value_number(result.scrutinee) == Lower.value_number(rhs.result.id))
+		_: None
+
+
+pure func test_rhs_join_carrier_is_the_continuation_read() -> Bool:
+	source: String =
+		|pure func advance(flag: Bool) -> Result[Int, String]:
+		|    var total = 1
+		|    captured: Int ?= match flag:
+		|        True:
+		|            total = 7
+		|            Ok(0)
+		|        False: Ok(0)
+		|    Ok(total)
+		|func main() -> Int:
+		|    unused = advance(True)
+		|    0
+		|
+	match accepted(source):
+		None: False
+		Some(checked):
+			match checked_functions(checked).functions.get(0):
+				None: False
+				Some(function):
+					match Concrete.specialize(checked).and_then(Lower.lower):
+						Err(_): False
+						Ok(program):
+							match entry_callee(Lower.lowered_functions(program)):
+								Some(advance): checked_carrier(function) and lowered_carrier(advance).get_or(False)
+								None: False
+
+
+tests: TestSuite = {
+	description = "Blorp 2 Result propagation lowering",
+	tests = [
+		("one RHS call defines the exact join scrutinee", test_rhs_call_is_evaluated_once_and_its_value_is_the_join_scrutinee),
+		("RHS join carrier is the continuation read", test_rhs_join_carrier_is_the_continuation_read),
+	]
+}

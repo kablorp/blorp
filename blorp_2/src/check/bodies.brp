@@ -4,14 +4,22 @@ and patterns, and the canonical Void tail.
 ---
 import:
 	./errors:
-		CheckError, RecursionError(CallableTailRecursionUnsupported, GenericTailRecursionUnsupported), recursion_error,
+		CheckError,
+		RecursionError(
+			CallableTailRecursionUnsupported, GenericTailRecursionUnsupported, PropagationTailRecursionUnsupported,
+		),
+		recursion_error,
+		ValueError(ExpressionTypeMismatch), value_error,
 		CheckerInvariant(InvalidCheckedUnion, InvalidResolvedParameter, UnsupportedPatternReachedResolution, LoopControlOutsideLoop, JoinWithoutArms),
 		ExpectedTypeSite(FirstArmValue, InferredBindingDeclaration, SourceAnnotation),
 		MatchError(
 			ArmWithoutValue, MatchRequiresUnion, NonExhaustiveMatch, PatternFieldCountMismatch, BarePatternName,
 			UnknownConstructorPattern, UnreachableArm,
 		),
-		StatementError(CallableAssignment, ImmutableAssignment, NonVoidMatchArm, NonVoidStatement),
+		StatementError(
+			CallableAssignment, ImmutableAssignment, NonVoidMatchArm, NonVoidStatement,
+			PropagationNeedsResultReturn, PropagationNeedsResultValue,
+		),
 		checker_invariant,
 		match_error,
 		statement_error,
@@ -34,12 +42,13 @@ import:
 		CheckedJoin,
 		CheckedJoinArm,
 		CheckedExpr,
-		CheckedForm(InvokeFunction, LiteralVoid, Match, ReadBinding),
+		CheckedForm(InvokeFunction, LiteralVoid, Match, ReadBinding, ConstructVariant),
 		CheckedFunction,
 		CheckedMatch,
 		CheckedPattern(VariantCase, WildcardCase),
 		CheckedStatement(DiscardExpression, InitializeBinding, ReassignBinding),
-		TypeRef(PureCallableType, VoidType),
+		TypeRef(PureCallableType, VoidType, AppliedUnionType),
+		FunctionSignature,
 		TypeUse,
 		UnionOccurrence,
 		callable_parameter,
@@ -55,14 +64,15 @@ import:
 	./constructors: VariantContract, find_qualified_variant, find_variant
 	./expressions: check_value, synthesize_value
 	./scope: ScopedValue(DataLocal, CallableLocal), LocalBinding, bind_callable, callable_binding_id, bind_local, binding_site, binding_definition, local_binding_id, lookup_binding
-	../utils/ids: OpaqueRow, VariantId, union_number
+	../utils/ids: OpaqueRow, VariantId, union_number, variant_owner
+	../namespace/builtins: DesignatedResult, RuntimeOperation
 	int as IntOps
 	list: repeat, set
 	../namespace/namespace: Namespace
 	option: is_some, to_result
 	../utils/syntax:
 		BindingSyntax(ImmutableBinding, MutableBinding),
-		ParsedBinding,
+		ParsedBinding, ParsedPropagation,
 		ExpressionBase(MatchExpression),
 		ParsedMatch,
 		ParsedMatchArm,
@@ -777,34 +787,33 @@ private pure func resolve_statements(
 	context: ResolutionContext,
 ) -> Result[ResolvedStatements, CheckError]:
 	match written.get(block.statements.length()):
-		None:
-			Ok(block)
-		Some(BindingStatement(binding)):
-			match resolve_assignment(binding, block, context):
+		None: Ok(block)
+		Some(statement):
+			match resolve_statement(statement, block, context):
 				Ok(next): resolve_statements(written, next, context)
 				Err(error): Err(error)
-		Some(PropagatingBinding(propagation)):
-			Err(unsupported_form(propagation.span, Propagation))
-		Some(WhileLoop(loop)):
-			Err(unsupported_form(loop.span, WhileStatement))
-		Some(ForLoop(loop)):
-			Err(unsupported_form(loop.span, ForStatement))
-		Some(Break(span)):
-			Err(checker_invariant(span, LoopControlOutsideLoop))
-		Some(Continue(span)):
-			Err(checker_invariant(span, LoopControlOutsideLoop))
-		Some(ExpressionStatement(expression)):
+
+
+private pure func resolve_statement(
+	statement: ParsedStatement,
+	block: ResolvedStatements,
+	context: ResolutionContext,
+) -> Result[ResolvedStatements, CheckError]:
+	match statement:
+		BindingStatement(binding): resolve_assignment(binding, block, context)
+		PropagatingBinding(propagation): Err(unsupported_form(propagation.span, Propagation))
+		WhileLoop(loop): Err(unsupported_form(loop.span, WhileStatement))
+		ForLoop(loop): Err(unsupported_form(loop.span, ForStatement))
+		Break(span): Err(checker_invariant(span, LoopControlOutsideLoop))
+		Continue(span): Err(checker_invariant(span, LoopControlOutsideLoop))
+		ExpressionStatement(expression):
 			match resolve_value(block, expression, StatementValue, context):
 				Ok(resolved):
-					resolve_statements(
-						written,
-						{ block |
-							bindings = resolved.bindings,
-							statements = block.statements.append(DiscardExpression(resolved.value)),
-							reassigned = resolved.reassigned
-						},
-						context,
-					)
+					Ok({ block |
+						bindings = resolved.bindings,
+						statements = block.statements.append(DiscardExpression(resolved.value)),
+						reassigned = resolved.reassigned
+					})
 				Err(error): Err(error)
 
 
@@ -895,6 +904,7 @@ private pure func resolve_assignment(
 
 private pure func resolve_body(
 	accepted: AcceptedFunction,
+	result: DesignatedResult[VariantId],
 	context: ResolutionContext,
 ) -> Result[ResolvedBody, CheckError]:
 	signature = accepted.signature
@@ -917,45 +927,66 @@ private pure func resolve_body(
 				definition = binding_definition(data)
 				parameter_bindings = parameter_bindings.append(definition)
 			CallableLocal(_): void
-	prefix ?= resolve_statements(
-		accepted.declaration.statements,
-		{
-			bindings = parameter_bindings,
-			scope = initial,
-			statements = [],
-			reassigned = []
-		},
-		context,
-	)
+	block: ResolvedStatements = {
+		bindings = parameter_bindings,
+		scope = initial,
+		statements = [],
+		reassigned = []
+	}
+	resolve_function_prefix(accepted, 0, block, initial, result, context)
+
+
+-- Ordinary functions keep their existing tail-body form. Only a propagation
+-- statement switches to a Result-valued suffix inside its successful arm.
+private pure func resolve_function_prefix(
+	accepted: AcceptedFunction,
+	position: Int,
+	block: ResolvedStatements,
+	initial: List[ScopedValue],
+	result: DesignatedResult[VariantId],
+	context: ResolutionContext,
+) -> Result[ResolvedBody, CheckError]:
+	match accepted.declaration.statements.get(position):
+		None: finish_body(accepted, block, initial, context)
+		Some(statement):
+			match statement:
+				PropagatingBinding(written):
+					match resolve_propagation(accepted, position, block, initial, written, result, context):
+						Err(error): Err(error)
+						Ok(value):
+							match accepted.declaration.tail_annotation:
+								Some(annotation):
+									if accepted.signature.type_parameters.is_empty():
+										Err(recursion_error(written.span, PropagationTailRecursionUnsupported))
+									else:
+										Err(recursion_error(annotation, GenericTailRecursionUnsupported))
+								None:
+									Ok({
+										bindings = value.bindings,
+										statements = value.statements,
+										body = CheckedValueBody(ReturnExpression(value.value))
+									})
+				_:
+					match resolve_statement(statement, block, context):
+						Ok(next):
+							resolve_function_prefix(accepted, IntOps.add(position, 1), next, initial, result, context)
+						Err(error): Err(error)
+
+
+private pure func finish_body(
+	accepted: AcceptedFunction,
+	prefix: ResolvedStatements,
+	initial: List[ScopedValue],
+	context: ResolutionContext,
+) -> Result[ResolvedBody, CheckError]:
+	signature = accepted.signature
 
 	match accepted.body:
 		BuiltinBody(operation, span):
-			-- Read the scope's actual binding identities, as ordinary parameter uses do.
-			var arguments: List[CheckedExpr] = []
-			for binding in initial:
-				match binding:
-					DataLocal(data):
-						definition = binding_definition(data)
-						arguments = arguments.append({
-							form = ReadBinding(local_binding_id(data)),
-							value_type = definition.value_type,
-							span = definition.span
-						})
-					CallableLocal(_): void
 			Ok({
 				bindings = prefix.bindings,
 				statements = prefix.statements,
-				body = CheckedValueBody(ReturnExpression({
-					form = InvokeFunction(
-						{
-							target = RuntimeFunction(operation),
-							span = span
-						},
-						arguments,
-					),
-					value_type = signature.return_type.value_type,
-					span = span,
-				})),
+				body = CheckedValueBody(ReturnExpression(builtin_value(signature, initial, operation, span))),
 			})
 		ValueBody(body):
 			match resolve_value(prefix, body, return_expectation(signature.return_type), context):
@@ -983,6 +1014,229 @@ private pure func resolve_body(
 				Err(error): Err(error)
 
 
+private pure func builtin_value(
+	signature: FunctionSignature,
+	initial: List[ScopedValue],
+	operation: RuntimeOperation[VariantId, TypeRef],
+	span: Span,
+) -> CheckedExpr:
+	var arguments: List[CheckedExpr] = []
+	for binding in initial:
+		match binding:
+			DataLocal(data):
+				definition = binding_definition(data)
+				arguments = arguments.append({
+					form = ReadBinding(local_binding_id(data)),
+					value_type = definition.value_type,
+					span = definition.span
+				})
+			CallableLocal(_): void
+	{
+		form = InvokeFunction({ target = RuntimeFunction(operation), span = span }, arguments),
+		value_type = signature.return_type.value_type,
+		span = span
+	}
+
+
+-- A Result-valued function suffix. It becomes the ordinary value of an Ok arm.
+private fixed record ResolvedFunctionValue {
+	bindings: List[BindingDefinition],
+	statements: List[CheckedStatement],
+	value: CheckedExpr
+}
+
+
+private pure func resolve_result_prefix(
+	accepted: AcceptedFunction,
+	position: Int,
+	block: ResolvedStatements,
+	initial: List[ScopedValue],
+	result: DesignatedResult[VariantId],
+	context: ResolutionContext,
+) -> Result[ResolvedFunctionValue, CheckError]:
+	match accepted.declaration.statements.get(position):
+		Some(statement):
+			match statement:
+				PropagatingBinding(written):
+					resolve_propagation(accepted, position, block, initial, written, result, context)
+				_:
+					match resolve_statement(statement, block, context):
+						Ok(next):
+							resolve_result_prefix(accepted, IntOps.add(position, 1), next, initial, result, context)
+						Err(error): Err(error)
+		None:
+			value: Result[ResolvedValue, CheckError] = match accepted.body:
+				ValueBody(body):
+					resolve_value(block, body, return_expectation(accepted.signature.return_type), context)
+				MatchBody(body):
+					resolve_join(block, body, return_expectation(accepted.signature.return_type), context)
+				BuiltinBody(operation, span):
+					Ok({
+						value = builtin_value(accepted.signature, initial, operation, span),
+						bindings = block.bindings,
+						reassigned = block.reassigned
+					})
+			match value:
+				Ok(resolved):
+					Ok({
+						bindings = resolved.bindings,
+						statements = block.statements,
+						value = resolved.value
+					})
+				Err(error): Err(error)
+
+
+-- Canonical Result's checked parameter order is Value, Error.
+private fixed record ResultPayloads {
+	value: TypeRef,
+	error: TypeRef
+}
+
+
+private pure func result_payloads(
+	value: TypeRef,
+	result: DesignatedResult[VariantId],
+) -> Option[ResultPayloads]:
+	match union_occurrence(value):
+		Some(occurrence):
+			if IntOps.equals(union_number(occurrence.owner), union_number(variant_owner(result.ok))):
+				match occurrence.arguments.get(0):
+					Some(success_type):
+						match occurrence.arguments.get(1):
+							Some(error): Some({ value = success_type, error = error })
+							None: None
+					None: None
+			else:
+				None
+		None: None
+
+
+private pure func propagation_source(
+	written: ParsedPropagation,
+	block: ResolvedStatements,
+	error_type: TypeRef,
+	result: DesignatedResult[VariantId],
+	context: ResolutionContext,
+) -> Result[ResolvedValue, CheckError]:
+	expectation: ValueExpectation ?= match written.annotation:
+		None: Ok(UntypedValue)
+		Some(annotation):
+			match resolve_type(context.body_types, annotation):
+				Ok(value):
+					Ok(CheckedAgainst(
+						AppliedUnionType(variant_owner(result.ok), [value, error_type]),
+						SourceAnnotation(type_span(annotation)),
+					))
+				Err(error): Err(error)
+	resolve_value(block, written.value, expectation, context)
+
+
+private pure func resolve_propagation(
+	accepted: AcceptedFunction,
+	position: Int,
+	block: ResolvedStatements,
+	initial: List[ScopedValue],
+	written: ParsedPropagation,
+	result: DesignatedResult[VariantId],
+	context: ResolutionContext,
+) -> Result[ResolvedFunctionValue, CheckError]:
+	returned = accepted.signature.return_type
+	error_type: TypeRef ?= match result_payloads(returned.value_type, result):
+		Some(payloads): Ok(payloads.error)
+		_: Err(statement_error(written.span, PropagationNeedsResultReturn(returned.value_type)))
+	source ?= propagation_source(written, block, error_type, result, context)
+	success_type: TypeRef ?= match result_payloads(source.value.value_type, result):
+		Some(payloads):
+			if same_type(payloads.error, error_type):
+				Ok(payloads.value)
+			else:
+				Err(value_error(written.value.span, ExpressionTypeMismatch({
+					expected = AppliedUnionType(variant_owner(result.ok), [payloads.value, error_type]),
+					actual = { value_type = source.value.value_type, span = source.value.span },
+					expected_site = SourceAnnotation(returned.span)
+				})))
+		_: Err(statement_error(written.value.span, PropagationNeedsResultValue(source.value.value_type)))
+	-- Keep RHS evaluation as a statement: its match may publish new versions
+	-- of mutable prefix bindings before the success continuation reads them.
+	source_id = binding_id(source.bindings.length())
+	source_definition: BindingDefinition = {
+		origin = BodyLocal,
+		mutability = Immutable,
+		value_type = source.value.value_type,
+		span = written.value.span
+	}
+	bindings = source.bindings.append(source_definition)
+	success = binding_id(bindings.length())
+	definition: BindingDefinition = {
+		origin = MatchCapture,
+		mutability = Immutable,
+		value_type = success_type,
+		span = written.name.span
+	}
+	binding ?= bind_local(
+		block.scope, context.namespace, context.module, context.caller.function,
+		written.name, success, definition,
+	)
+	continuation ?= resolve_result_prefix(
+		accepted,
+		IntOps.add(position, 1),
+		{
+			bindings = bindings.append(definition),
+			scope = [binding].concat(block.scope),
+			statements = [],
+			reassigned = []
+		},
+		initial, result, context,
+	)
+	failure = binding_id(continuation.bindings.length())
+	error_definition: BindingDefinition = {
+		origin = MatchCapture,
+		mutability = Immutable,
+		value_type = error_type,
+		span = written.value.span
+	}
+	error_value: CheckedExpr = {
+		form = ReadBinding(failure),
+		value_type = error_type,
+		span = written.value.span
+	}
+	-- The selected source Err and constructed return Err share a declaration,
+	-- but their enclosing Result instantiations can differ after specialization.
+	Ok({
+		bindings = continuation.bindings.append(error_definition),
+		statements = block.statements.append(InitializeBinding(source_id, source.value)),
+		value = {
+			form = Match({
+				scrutinee = {
+					form = ReadBinding(source_id),
+					value_type = source.value.value_type,
+					span = written.value.span
+				},
+				union_type = source.value.value_type,
+				carried = [],
+				arms = [
+					{
+						pattern = VariantCase(result.ok, [Some(success)]),
+						statements = continuation.statements,
+						value = continuation.value
+					},
+					{
+						pattern = VariantCase(result.err, [Some(failure)]),
+						statements = [],
+						value = {
+							form = ConstructVariant(result.err, [error_value]),
+							value_type = returned.value_type,
+							span = written.span
+						}
+					},
+				]
+			}),
+			value_type = returned.value_type,
+			span = written.span,
+		},
+	})
+
+
 -- Checks every function body in declaration order, including unreachable ones.
 pure func resolve_functions(
 	functions: List[AcceptedFunction],
@@ -990,8 +1244,9 @@ pure func resolve_functions(
 	opaque_declarations: List[OpaqueRow],
 	namespace: Namespace,
 	constants: List[CheckedConstant],
+	result: DesignatedResult[VariantId],
 ) -> Result[List[CheckedFunction], CheckError]:
-	check_functions(functions, declarations, opaque_declarations, namespace, constants, [])
+	check_functions(functions, declarations, opaque_declarations, namespace, constants, result, [])
 
 
 private pure func check_functions(
@@ -1000,6 +1255,7 @@ private pure func check_functions(
 	opaque_declarations: List[OpaqueRow],
 	namespace: Namespace,
 	constants: List[CheckedConstant],
+	result: DesignatedResult[VariantId],
 	checked: List[CheckedFunction],
 ) -> Result[List[CheckedFunction], CheckError]:
 	match functions.get(checked.length()):
@@ -1023,7 +1279,7 @@ private pure func check_functions(
 				constants = constants,
 			}
 			signature = accepted.signature
-			match resolve_body(accepted, context):
+			match resolve_body(accepted, result, context):
 				Ok(body):
 					match check_execution(accepted.declaration, body.statements, body.body, id):
 						Ok(execution):
@@ -1041,6 +1297,7 @@ private pure func check_functions(
 								opaque_declarations,
 								namespace,
 								constants,
+								result,
 								checked.append({
 									id = id,
 									execution = execution.execution,

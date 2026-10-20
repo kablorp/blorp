@@ -1,0 +1,93 @@
+import:
+	./harness: native_case, run_output_example, verify_all, with_directory
+	system: write_file
+	test: TestSuite
+
+
+pure func chain_source(count: Int) -> String:
+	header: String =
+		|import:
+		|    int as IntOps
+		|    io: print
+		|pure func next(value: Int) -> Result[Int, String]:
+		|    Ok(IntOps.add(value, 1))
+		|pure func walk() -> Result[Int, String]:
+		|
+	var source = header
+	var previous = "0"
+	for position in 1..(count + 1):
+		name = "step" + position.to_string()
+		source = source + "    " + name + " ?= next(" + previous + ")\n"
+		previous = name
+	tail: String =
+		|func main() -> Int:
+		|    match walk():
+		|        Ok(number): print(IntOps.to_string(number))
+		|        Err(error): print(error)
+		|    0
+		|
+	source + "    Ok(" + previous + ")\n" + tail
+
+
+private func run_generated(compiler: String, source: String, name: String, expected: String) -> Bool:
+	with_directory(func(directory: String):
+		input = directory + "/main.brp"
+		written ?= write_file(input, source).map_err(pure func(error): error.to_string())
+		verify_all(compiler, directory, {
+			name = name,
+			fixture = input,
+			expected_c = None,
+			first_case = native_case("real main", "", 0, expected),
+			remaining_cases = [],
+			limits = { allocations = 45000, instructions = 200000000 }
+		})
+	)
+
+
+private func run_chain(compiler: String, count: Int) -> Bool:
+	run_generated(compiler, chain_source(count), "Result prefix chain of " + count.to_string(), count.to_string() + "\n")
+
+
+RHS_CARRIERS: String =
+	|import:
+	|    int as IntOps
+	|    io: print
+	|pure func advance(flag: Bool) -> Result[Int, String]:
+	|    var total = 1
+	|    captured: Int ?= match flag:
+	|        True:
+	|            total = 7
+	|            Ok(0)
+	|        False: Ok(0)
+	|    Ok(total)
+	|func main() -> Int:
+	|    match advance(True):
+	|        Ok(number): print(IntOps.to_string(number))
+	|        Err(error): print(error)
+	|    match advance(False):
+	|        Ok(number): print(IntOps.to_string(number))
+	|        Err(error): print(error)
+	|    0
+	|
+
+
+pure func suite(compiler: String) -> TestSuite:
+	{
+		description = "Blorp 2 function-prefix Result propagation",
+		tests = [
+			("managed prefix and aliases survive Ok and Err paths", func():
+				run_output_example(
+					compiler,
+					"blorp_2/test/e2e/fixtures/result_propagation/managed.brp",
+					"rhs\nprefix:42é\0\n5\n42é\0\nrhs\n42é\0\n42é\0\n",
+					{ allocations = 45000, instructions = 200000000 },
+				)
+			),
+			("one propagation preserves the native result", func(): run_chain(compiler, 1)),
+			("two propagations preserve the native result", func(): run_chain(compiler, 2)),
+			("five propagations preserve the native result", func(): run_chain(compiler, 5)),
+			("nine propagations preserve the native result", func(): run_chain(compiler, 9)),
+			("sixteen propagations preserve the native result", func(): run_chain(compiler, 16)),
+			("RHS match updates reach the success continuation", func(): run_generated(compiler, RHS_CARRIERS, "RHS match carriers", "7\n1\n")),
+		]
+	}

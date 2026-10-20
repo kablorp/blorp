@@ -2,7 +2,10 @@
 
 ## Status and problem
 
-Historical A/old-base handoff follows; the revised B checkpoint below governs B.
+B's Result-only function-prefix propagation is implemented and validated through
+existing joins; see the [final evidence](../benchmarks/results/blorp_2_result_propagation_2026-10-19.md).
+A remains deferred. The A/old-base handoff below is historical; the revised B
+checkpoint governs B.
 
 Proposed implementation handoff, based on main
 `d82bdf85c4c7375024a1b1a7f2a86aa5e3815b62`. Plan only: no implementation,
@@ -140,9 +143,13 @@ TCO is a later reviewed rule, not part of A.
 
 ## B: frontend Result propagation checkpoint (2026-10-19)
 
-This revised B supersedes the historical flat-edge model below. Plan only: root
-and independent review, a separate plan commit and explicit tests-first dispatch
-precede implementation. Fixed accepted baseline is
+This revised B supersedes the historical flat-edge model below. The reviewed
+plan was committed before the genuine checker RED and frontend implementation.
+The completed candidate uses 345 production additions/66 deletions (+279 net)
+and 1,021 test additions/8 deletions, including the 29-line managed fixture.
+The [evidence report](../benchmarks/results/blorp_2_result_propagation_2026-10-19.md)
+records phase tests, two effective oracle faults, full gates, costs and C depth.
+Fixed accepted baseline is
 `2aaedc28967f16d9d640256f264e731cf9922d48`; no held feature overlay is a prerequisite.
 
 The user explicitly said: "A 128-statement ?= chain is unrealistic." Accordingly,
@@ -158,7 +165,10 @@ as V, invent inference holes or add a solver. Underconstrained constructors teac
 a binding annotation/typed intermediate. Preserve exact first-error diagnostics.
 
 Consume each source statement once with a suffix index and existing scope/body
-resolvers; do not copy suffix arrays or duplicate the remaining body. At each
+resolvers; do not copy suffix arrays or duplicate the remaining body. Normalize
+each RHS through a fresh immutable private BodyLocal initializer before joining.
+Its real binding ID stays outside the named scope; ordinary statement lowering
+then preserves any mutable versions carried by an RHS match. At each
 `name ?= source`, construct one ordinary checked Result-valued join:
 
 ```text
@@ -183,8 +193,9 @@ No if/Boolean/ordinary-tail predecessor or general early-return join is required
 
 First checkpoint: one managed Result witness and exact semantic checker REDs,
 then minimum frontend desugaring, short generated-C/native review and the realistic
-chain screen. Forecast 160–250 gross production additions/+110–180 net, within
-unchanged hard 430/+330; tests <=1,025 gross including one <=40-line fixture.
+chain screen. The initial 160–250 gross/+110–180 net production forecast was
+exceeded; actual 345/+279 remains within unchanged hard 430/+330. Tests use
+1,021/1,025 gross additions, including one 29/40-line fixture.
 Prospective fixture limits: 45,000 strict compiler allocations, 200M strict and
 normal-min3 instructions, strict balanced-zero target memory and real-main proof.
 Before implementation, B selects its first prospective fixed accepted FEATURE

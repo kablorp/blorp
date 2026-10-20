@@ -1,0 +1,217 @@
+import:
+	../../../src/check/check: check
+	../../../src/check/model: BindingId, binding_number
+	../../../src/specialize/specialize as Concrete
+	../../../src/utils/syntax: entry_function
+	../module_input: TestFoundation, TEST_BASE, parse_modules_with_base
+	test: TestSuite
+
+
+private SOURCE: String =
+	|pure func produce(value: String) -> Result[String, String]:
+	|    Ok(value)
+	|pure func reject(value: String) -> Result[Int, String]:
+	|    Err(value)
+	|pure func advance(value: String) -> Result[Int, String]:
+	|    captured ?= produce(value)
+	|    Ok(7)
+	|func main() -> Int:
+	|    failed = reject("error")
+	|    actual = advance("success")
+	|    0
+	|
+
+
+private pure func returned(function: Concrete.ConcreteFunction) -> Option[Concrete.ConcreteExpr]:
+	match function.body:
+		Concrete.ConcreteValueBody(Concrete.ReturnExpression(value)): Some(value)
+		_: None
+
+
+private pure func called(contents: Concrete.SpecializedContents, value: Concrete.ConcreteExpr) -> Option[Concrete.ConcreteFunction]:
+	match value.form:
+		Concrete.InvokeFunction(call, _):
+			match call.target:
+				Concrete.UserFunction(id): contents.functions.get(Concrete.function_number(id))
+				_: None
+		_: None
+
+
+private pure func same_variant(left: Concrete.VariantInstanceId, right: Concrete.VariantInstanceId) -> Bool:
+	(Concrete.union_number(Concrete.variant_owner(left)) == Concrete.union_number(Concrete.variant_owner(right))
+		and Concrete.variant_number(left) == Concrete.variant_number(right)
+	)
+
+
+private pure func variant_field_is(contents: Concrete.SpecializedContents, variant: Concrete.VariantInstanceId, expected: Concrete.TypeRef) -> Bool:
+	match contents.unions.get(Concrete.union_number(Concrete.variant_owner(variant))):
+		None: False
+		Some(layout):
+			match layout.variants.get(Concrete.variant_number(variant)):
+				None: False
+				Some(fields):
+					match fields.get(0):
+						Some(field): fields.length() == 1 and Concrete.same_type(field, expected)
+						None: False
+
+
+private pure func field_identities(contents: Concrete.SpecializedContents, source_err: Concrete.VariantInstanceId, returned_err: Concrete.VariantInstanceId, payload: Concrete.ConcreteExpr) -> Bool:
+	match Concrete.variant_field(source_err, 0, contents.unions, payload.span):
+		Err(_): False
+		Ok(source_field):
+			match Concrete.variant_field(returned_err, 0, contents.unions, payload.span):
+				Err(_): False
+				Ok(returned_field):
+					(same_variant(Concrete.variant_field_variant(source_field), source_err)
+						and same_variant(Concrete.variant_field_variant(returned_field), returned_err)
+						and Concrete.variant_field_number(source_field) == 0
+						and Concrete.variant_field_number(returned_field) == 0)
+
+
+private pure func one_capture(fields: List[Option[BindingId]]) -> Bool:
+	match fields.get(0):
+		Some(field): fields.length() == 1 and field.is_some()
+		None: False
+
+
+private pure func arm_roles(contents: Concrete.SpecializedContents, join: Concrete.ConcreteJoin, result: Concrete.ConcreteExpr, source_owner: Concrete.UnionInstanceId, returned_owner: Concrete.UnionInstanceId, expected_ok: Concrete.VariantInstanceId, expected_err: Concrete.VariantInstanceId) -> Bool:
+	match join.arms:
+		[success, failure]:
+			match success.pattern:
+				Concrete.VariantCase(source_ok, success_fields):
+					match failure.pattern:
+						Concrete.VariantCase(source_err, failure_fields):
+							match success.value.form:
+								Concrete.ConstructVariant(returned_ok, success_values):
+									match failure.value.form:
+										Concrete.ConstructVariant(returned_err, failure_values):
+											match failure_values.get(0):
+												Some(payload):
+													(same_variant(source_ok, expected_ok) and same_variant(returned_err, expected_err)
+														and Concrete.union_number(Concrete.variant_owner(source_err)) == Concrete.union_number(source_owner)
+														and Concrete.union_number(Concrete.variant_owner(returned_ok)) == Concrete.union_number(returned_owner)
+														and Concrete.variant_number(source_err) == Concrete.variant_number(returned_err)
+														and Concrete.variant_number(source_ok) == Concrete.variant_number(returned_ok)
+														and success_values.length() == 1 and failure_values.length() == 1
+														and one_capture(success_fields) and one_capture(failure_fields)
+														and variant_field_is(contents, source_ok, Concrete.StringType)
+														and variant_field_is(contents, source_err, Concrete.StringType)
+														and variant_field_is(contents, returned_ok, Concrete.IntType)
+														and variant_field_is(contents, returned_err, Concrete.StringType)
+														and field_identities(contents, source_err, returned_err, payload)
+														and Concrete.same_type(payload.value_type, Concrete.StringType)
+														and Concrete.same_type(failure.value.value_type, result.value_type)
+														and Concrete.same_type(success.value.value_type, result.value_type))
+												None: False
+										_: False
+								_: False
+						_: False
+				_: False
+		_: False
+
+
+private pure func constructor_id(function: Concrete.ConcreteFunction) -> Option[Concrete.VariantInstanceId]:
+	match returned(function):
+		None: None
+		Some(value):
+			match value.form:
+				Concrete.ConstructVariant(id, fields):
+					if fields.length() == 1:
+						Some(id)
+					else:
+						None
+				_: None
+
+
+private pure func result_roles(contents: Concrete.SpecializedContents, advance: Concrete.ConcreteFunction, reject: Concrete.ConcreteFunction, produce: Concrete.ConcreteFunction, join: Concrete.ConcreteJoin, result: Concrete.ConcreteExpr) -> Bool:
+	match (constructor_id(produce), constructor_id(reject)):
+		(Some(expected_ok), Some(expected_err)):
+			match (produce.signature.return_type, advance.signature.return_type, result.value_type):
+				(Concrete.UnionType(source_owner), Concrete.UnionType(returned_owner), Concrete.UnionType(value_owner)):
+					(Concrete.union_number(source_owner) != Concrete.union_number(returned_owner)
+						and Concrete.union_number(returned_owner) == Concrete.union_number(value_owner)
+						and Concrete.union_number(join.owner) == Concrete.union_number(source_owner)
+						and Concrete.same_type(join.scrutinee.value_type, produce.signature.return_type)
+						and arm_roles(contents, join, result, source_owner, returned_owner, expected_ok, expected_err))
+				_: False
+		_: False
+
+
+private pure func distinct_instances(contents: Concrete.SpecializedContents, advance: Concrete.ConcreteFunction, reject: Concrete.ConcreteFunction) -> Bool:
+	match returned(advance):
+		None: False
+		Some(result):
+			match result.form:
+				Concrete.Match(join):
+					match advance.statements.get(0):
+						None: False
+						Some(statement):
+							match statement:
+								Concrete.InitializeBinding(private_id, rhs):
+									match join.scrutinee.form:
+										Concrete.ReadBinding(read):
+											match called(contents, rhs):
+												Some(produce):
+													(binding_number(private_id) == binding_number(read)
+														and advance.statements.length() == 1
+														and Concrete.same_type(rhs.value_type, produce.signature.return_type)
+														and result_roles(contents, advance, reject, produce, join, result))
+												None: False
+										_: False
+								_: False
+				_: False
+
+
+private pure func selected_calls(contents: Concrete.SpecializedContents, main: Concrete.ConcreteFunction) -> Bool:
+	match main.statements.get(0):
+		None: False
+		Some(first):
+			match first:
+				Concrete.InitializeBinding(_, failed):
+					match main.statements.get(1):
+						None: False
+						Some(second):
+							match second:
+								Concrete.InitializeBinding(_, actual):
+									match called(contents, actual):
+										None: False
+										Some(advance):
+											match called(contents, failed):
+												Some(reject): main.statements.length() == 2 and distinct_instances(contents, advance, reject)
+												None: False
+								_: False
+				_: False
+
+
+private pure func propagation_instances(foundation: TestFoundation) -> Bool:
+	match parse_modules_with_base([{ source = SOURCE, targets = [] }], foundation):
+		Err(_): False
+		Ok(parsed):
+			match check(parsed):
+				Err(_): False
+				Ok(checked):
+					match Concrete.specialize(checked):
+						Err(_): False
+						Ok(program):
+							contents = Concrete.specialized_contents(program)
+							match contents.functions.get(Concrete.function_number(entry_function(contents.entrypoint))):
+								Some(main): selected_calls(contents, main)
+								None: False
+
+
+pure func test_propagation_selects_the_source_instance_and_constructs_the_return_instance() -> Bool:
+	propagation_instances(TEST_BASE)
+
+
+pure func test_reversed_foundation_order_retains_both_instance_roles() -> Bool:
+	foundation = { TEST_BASE | types = TEST_BASE.types.replace("    Ok(Value)\n    Err(Error)", "    Err(Error)\n    Ok(Value)") }
+	foundation.types != TEST_BASE.types and propagation_instances(foundation)
+
+
+tests: TestSuite = {
+	description = "Blorp 2 Result propagation specialization",
+	tests = [
+		("source and returned Result instances retain distinct field identities", test_propagation_selects_the_source_instance_and_constructs_the_return_instance),
+		("reversed foundation order retains both Result instance roles", test_reversed_foundation_order_retains_both_instance_roles),
+	]
+}
