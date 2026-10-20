@@ -1,5 +1,57 @@
 # M3: common loops, then managed String while
 
+## Prospective finite characterization after cost failure
+
+Retain C0: flat functions with steps and one result, ordinary-root Join normalization,
+and the sole common runtime Loop. Canonical production is 1,114/830 (+284), tests
+3,415/2,778 (+637); original 877 guards plus nine reviewed test overrides and the index
+match. The exact 72-root closure passed 1,318/0 and focused two suites 39/0. These do
+not close native, fault, identity, cost or later accepted-main composition gates.
+
+Close the append_join exception: C1 preserved exact C but Emit allocations rose
+8,756 -> 8,757. It is rejected; restore exact C0 and preserve C1 raw/source roles.
+The return-only architectural draft is also rejected: its initial 1,363/766 (+597)
+exceeds unchanged 1,150/+350, with duplicated Lower/Verify branch orchestration.
+A subsequent unapplied static language correction reached 1,414/761 (+653); both
+remain rejected evidence. No further fit rewrite, optimization, return-model rescope,
+source while, managed header/TCO, fallback or alternate runtime path is authorized.
+
+C0 direct65 remains 80,472 -> 85,335 (+6.043096%), FAIL against both SOURCE +3%
+(max integer 82,886) and absolute 83,000. Standalone ordinary 80,472 -> 84,943 also
+remains FAIL. Original construction-proxy allocations 25,643,358 -> 26,154,673 and
+normal min3 instructions 47,825,215,431 -> 48,746,248,158 pass only their own +3%
+comparisons. Reuse completed samples; do not rerun them to seek a different result.
+
+After two independent reviews, root may separately grant the remaining
+already planned finite functional/native/cost calls **once for characterization**.
+The data-only inventory is retained under
+`build/bootstrap-evidence/m3-current-implementation-2026-10-19/next-closure01/characterization-proposal01/`:
+88 owned-input cost calls, 14 remaining diagnostic-control calls and 992 identity
+calls, plus two unchanged functional/native entrypoints. Reuse frozen C0 target
+artifacts after provenance checks; no fresh setup is needed solely to resample.
+Existing one-at-a-time faults need exact separate leases and byte-restored gates;
+unprepared scalar fault recipes remain blockers, not additional implicit calls.
+Freeze/review literal commands, source/library/corpus/host/tool/environment/output
+bindings and observable non-budget stop boundaries before each serial lease.
+
+This narrowly supersedes stop-on-budget-failure only for those fixed once-only calls,
+as in the List.contains characterization exception. Relative/absolute budget misses
+remain FAIL; the unchanged native umbrella may finish its fixed fields when failures
+are budget-only. Stop immediately on any observable non-budget, semantic, setup,
+identity, metric-parser, accounting/leak, provenance, pin or unknown failure and
+return the lane. No retries, extra samples, baseline/epoch/input/limit changes,
+production/test edits, acceptance, implementation publication or merge are granted.
+Preserve every raw result and UNRUN field. Report per-input whole allocation/normal
+min3, tighter absolutes, exact identities, native outputs, faults and physical ledgers.
+Only the user may later decide an explicit concrete budget change after a complete
+measured proposal; this exception makes no waiver or acceptance claim.
+
+Full future while requires a separately reviewed recursive LoopBlock arm/statement
+extension for nested conditional nearest-loop breaks, preserving PRE and the same
+Break/Recur edges and propagating breaks through every emitted switch. A String-only
+slice does not cover the full source carrier census. This characterization adds none
+of that implementation and grants no parallel If route.
+
 ## Current scalar checkpoint — atomic convergence, 2026-10-19
 
 The landing unit is ordinary-root normalization plus the five-owner scalar runtime-loop
