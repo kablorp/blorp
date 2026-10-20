@@ -3481,6 +3481,10 @@ import:
 	net/tcp as TCP
 ```
 
+The [Blorp 2 List membership APIs](../blorp_2/standard_library/README.md#list-membership)
+provide pure supplied equality through `contains_with` and a temporary Int `contains`
+adapter. Their current indexed recursion does O(n) work with linear C stack at O0.
+
 The maintained module inventory is
 [`standard_library/README.md`](../standard_library/README.md). Public
 declarations and doctests in each `.brp` module are the API source of truth.

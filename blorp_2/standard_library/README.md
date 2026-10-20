@@ -70,7 +70,19 @@ indices. Updates have value semantics: an update does not change an earlier
 alias, and returned managed values remain independently owned. `append` and
 `concat` also return owned Lists.
 
-These names match the unchanged host library because the same compiler source
+### List membership
+
+`contains_with[A](values: List[A], needle: A, equals: pure (A, A) -> Bool) -> Bool`
+uses supplied equality in element/needle order and stops at the first match.
+`contains(values: List[Int], needle: Int) -> Bool` uses `int.equals`.
+Both functions are pure and borrow their inputs; managed aliases remain valid.
+The Int-only adapter is temporary: replace it with general `contains[T: Equatable]`
+when the target supports equality traits. The supplied-equality API stays generic.
+Indexed `get` and ordinary recursion do O(n) work, with linear C stack at O0 and
+ordinary temporary ARC costs. No bounded-stack or zero-allocation claim is made.
+Lambda captures, equality traits and source-loop work remain separate.
+
+The List update names match the unchanged host library because the same compiler source
 must build against both libraries. The internal `list.set` builtin implements the
 no-op-on-invalid update; checked `set_index` is an ordinary function. The desired
 later rename to checked `set` and no-op `set_or_keep` must update both libraries

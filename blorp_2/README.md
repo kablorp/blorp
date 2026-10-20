@@ -801,6 +801,10 @@ still use ordinary C call depth, and managed values remain outside
 [increment report](../benchmarks/results/blorp_2_recursive_unary_2026-10-15.md).
 
 
+Ordinary [List membership](standard_library/README.md#list-membership) accepts a
+supplied pure equality callback, with a temporary concrete Int adapter.
+Its indexed recursion does O(n) work and uses linear C stack at O0.
+
 ## Recursive data through records and Lists
 
 Every recursive shape the pilot's own source declares is now admitted: a

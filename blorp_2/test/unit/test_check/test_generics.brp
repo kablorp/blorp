@@ -1,17 +1,20 @@
 import:
-	../../../src/utils/names: program_names
+	../../../src/utils/names: program_names, name_spelling
 	../../../src/check/model as Model
-	../../../src/utils/source: module_source, root_module_id, same_module
+	../../../src/utils/source: module_source, root_module_id, same_module, same_source
 	../../../src/utils/ids: inventory_functions, function_number
 	../../../src/load/load: load_program
 	../../../src/parse/assemble: parsed_contents
-	../../../src/check/check: CheckedProgram, check, checked_functions
+	../../../src/check/check: CheckedProgram, check, checked_functions, check_errors
+	../../../src/check/render: render_check_error
 	../../../src/check/errors as Errors
 	../../../src/lex/lex: lex
 	../../../src/utils/syntax: Diagnostic, entry_function, Purity(Pure), same_purity
 	../compilation: compile, compile_modules
-	../input: check_failure, parse, setup_diagnostic, check_modules_failure
+	../input: check_failure, parse, setup_diagnostic, check_modules_failure, singleton_check_error
 	../module_input: PRIMITIVE_BASE, INTEGER_OPERATIONS, STRING_OPERATIONS, ModuleInput
+	../../e2e/harness: with_directory
+	system: write_file
 	test: TestSuite
 
 
@@ -564,9 +567,253 @@ pure func test_generic_runtime_module_rejects() -> Bool:
 		Ok(_): False
 
 
+func test_contains_library_preserves_its_rigid_parameter_and_designated_bool() -> Bool:
+	match load_program("blorp_2/test/e2e/fixtures/list/contains_int.brp", "blorp_2/standard_library"):
+		Err(_): False
+		Ok(loaded):
+			parsed = parsed_contents(loaded.program)
+			match (parsed.modules.get(0), check(loaded.program)):
+				(Some(root), Ok(checked)):
+					match (root.imports, checked_functions(checked).unions):
+						([list_import, ..._], [boolean, ..._]):
+							-- Select the two public API declarations in the actual imported module.
+							rows = inventory_functions(parsed.declarations).filter(pure func(row):
+								name = name_spelling(parsed.names, row.declaration.function_name.id)
+								(
+									same_module(row.declaration.module, list_import.target)
+										and (name == Some("contains_with") or name == Some("contains"))
+								)
+							)
+							functions = checked_functions(checked).functions
+							match rows.map(pure func(row): functions.get(function_number(row.id))):
+								[Some(generic), Some(adapter)]:
+									match (
+										generic.signature.type_parameters, generic.signature.parameters,
+										adapter.signature.type_parameters, adapter.signature.parameters,
+									):
+										([parameter], [values, needle, equality], [], [integers, integer]):
+											match Model.parameter_owner(parameter):
+												Model.FunctionDeclaration(owner):
+													bool_type = Model.UnionType(boolean.id)
+													(
+														function_number(owner) == function_number(generic.id)
+														and same_purity(generic.signature.purity, Pure)
+														and same_purity(adapter.signature.purity, Pure)
+														and Model.same_type(values.value_type, Model.ListType(Model.ParameterType(parameter)))
+														and Model.same_type(needle.value_type, Model.ParameterType(parameter))
+														and Model.same_type(equality.value_type, Model.PureCallableType([
+															Model.ParameterType(parameter), Model.ParameterType(parameter),
+														], bool_type))
+														and Model.same_type(generic.signature.return_type.value_type, bool_type)
+														and Model.same_type(adapter.signature.return_type.value_type, bool_type)
+														and Model.same_type(integers.value_type, Model.ListType(Model.IntType))
+														and Model.same_type(integer.value_type, Model.IntType)
+													)
+												_: False
+										_: False
+								_: False
+						_: False
+				_: False
+
+
+func test_contains_with_keeps_named_and_forwarded_callback_identities() -> Bool:
+	source: String =
+		|import:
+		|    list: contains_with
+		|    string as StringOps
+		|pure func same_text(left: String, right: String) -> Bool:
+		|    StringOps.equals(left, right)
+		|pure func forward[A](values: List[A], needle: A, equals: pure (A, A) -> Bool) -> Bool:
+		|    contains_with(values, needle, equals)
+		|func main() -> Int:
+		|    found = forward(["kept"], "kept", same_text)
+		|    0
+		|
+	with_directory(func(directory: String):
+		path = directory + "/main.brp"
+		written ?= write_file(path, source)
+		loaded ?= load_program(path, "blorp_2/standard_library").map_err(pure func(failure): failure.diagnostic.message)
+		checked ?= check(loaded.program).map_err(pure func(_): "valid forwarded membership was rejected")
+		parsed = parsed_contents(loaded.program)
+		functions = checked_functions(checked).functions
+		root_functions = inventory_functions(parsed.declarations)
+			.filter(pure func(row): same_module(row.declaration.module, root_module_id()))
+		valid = match root_functions.map(pure func(row): functions.get(function_number(row.id))):
+			[Some(same_text), Some(forward), Some(main)]:
+				match (forward.signature.type_parameters, Model.function_calls(forward), Model.function_calls(main)):
+					([parameter], [forwarded], [named]):
+						match (forwarded.target, named.target):
+							(
+								Model.UserFunction(target, [Model.ParameterType(argument)], [forwarded_choice]),
+								Model.UserFunction(called_forward, [Model.StringType], [named_choice]),
+							):
+								match (forwarded_choice.choice, named_choice.choice):
+									(Model.ForwardedCallable(original), Model.NamedCallable(chosen, [])):
+										(
+											Model.same_parameter(parameter, argument)
+											and function_number(called_forward) == function_number(forward.id)
+											and function_number(chosen) == function_number(same_text.id)
+											and Model.same_callable_parameter(original, Model.callable_parameter(forward.id, 2))
+											and Model.same_callable_parameter(forwarded_choice.parameter, Model.callable_parameter(target, 2))
+											and Model.same_callable_parameter(named_choice.parameter, Model.callable_parameter(forward.id, 2))
+										)
+									_: False
+							_: False
+					_: False
+			_: False
+		if valid:
+			Ok(void)
+		else:
+			Err("membership did not preserve the actual named/forwarded choices")
+	)
+
+
+private CONTAINS_CALL_SCOPE: String =
+	|import:
+	|    list: contains, contains_with
+	|pure func same(left: Int, right: Int) -> Bool:
+	|    True
+	|pure func wrong_input(left: String, right: String) -> Bool:
+	|    True
+	|pure func wrong_result(left: Int, right: Int) -> String:
+	|    "wrong"
+	|func side_effect(left: Int, right: Int) -> Bool:
+	|    True
+	|func main() -> Int:
+	|
+
+
+private func rejects_contains_call(
+	before: String,
+	marked: String,
+	after: String,
+	message: String,
+	help: String,
+	matches: pure (Errors.CheckErrorKind) -> Bool,
+) -> Bool:
+	prefix = CONTAINS_CALL_SCOPE + "    " + before
+	source = prefix + marked + after + "\n    0\n"
+	with_directory(func(directory: String):
+		path = directory + "/main.brp"
+		match write_file(path, source):
+			Err(error): Err(error)
+			Ok(_):
+				match load_program(path, "blorp_2/standard_library"):
+					Err(failure): Err(failure.diagnostic.message)
+					Ok(loaded):
+						match check(loaded.program):
+							Ok(_): Err("invalid membership call was accepted")
+							Err(failure):
+								match singleton_check_error(check_errors(failure)):
+									None: Err("membership call did not have one diagnostic")
+									Some(error):
+										diagnostic = render_check_error(loaded.program, error)
+										if (
+										matches(error.kind)
+										and same_source(error.span.source, module_source(root_module_id()))
+										and error.span.start == prefix.length() and error.span.end == prefix.length() + marked.length()
+										and same_source(diagnostic.span.source, error.span.source)
+										and diagnostic.span.start == error.span.start and diagnostic.span.end == error.span.end
+											and diagnostic.message == message and diagnostic.help == help
+											and diagnostic.note.is_none()
+										):
+											Ok(void)
+										else:
+											Err("membership diagnostic mismatch: " + diagnostic.message + " / " + diagnostic.help)
+	)
+
+
+func test_contains_int_adapter_rejects_a_string_needle() -> Bool:
+	rejects_contains_call("contains([1], ", "\"wrong\"", ")",
+		"argument type does not match the parameter type", "use an expression of type Int here",
+		pure func(kind):
+			match kind:
+				Errors.CallRejection(Errors.ArgumentTypeMismatch(mismatch)):
+					(
+						mismatch.argument_position == 1
+						and Model.same_type(mismatch.expected, Model.IntType)
+						and Model.same_type(mismatch.actual.value_type, Model.StringType)
+					)
+				_: False
+	)
+
+
+func test_contains_with_requires_three_arguments() -> Bool:
+	rejects_contains_call("", "contains_with", "([1], 1)",
+		"argument count does not match the function parameters",
+		"pass one expression for each declared parameter; UFCS supplies the receiver first",
+		pure func(kind):
+			match kind:
+				Errors.CallRejection(Errors.ArgumentCountMismatch(arity)): arity.expected == 3 and arity.actual == 2
+				_: False
+	)
+
+
+func test_contains_with_rejects_a_comparator_for_another_element_type() -> Bool:
+	rejects_contains_call("contains_with([1], 1, ", "wrong_input", ")",
+		"argument type does not match the parameter type", "use an expression of type pure (Int, Int) -> Bool here",
+		pure func(kind):
+			match kind:
+				Errors.CallRejection(Errors.GenericArgumentConflict(conflict)):
+					match (
+						Model.parameter_owner(conflict.parameter),
+						conflict.mismatch.expected,
+						conflict.mismatch.actual.value_type,
+					):
+						(
+							Model.FunctionDeclaration(_),
+							Model.PureCallableType([Model.IntType, Model.IntType], Model.UnionType(expected_bool)),
+							Model.PureCallableType([Model.StringType, Model.StringType], Model.UnionType(actual_bool)),
+						):
+							(
+								Model.parameter_position(conflict.parameter) == 0
+								and Model.same_type(conflict.previous.value_type, Model.IntType)
+								and Model.same_type(conflict.current.value_type, Model.StringType)
+								and conflict.mismatch.argument_position == 2
+								and Model.same_type(Model.UnionType(expected_bool), Model.UnionType(actual_bool))
+							)
+						_: False
+				_: False
+	)
+
+
+func test_contains_with_requires_a_boolean_comparator_result() -> Bool:
+	rejects_contains_call("contains_with([1], 1, ", "wrong_result", ")",
+		"argument type does not match the parameter type", "use an expression of type pure (Int, Int) -> Bool here",
+		pure func(kind):
+			match kind:
+				Errors.CallRejection(Errors.ArgumentTypeMismatch(mismatch)):
+					match (mismatch.expected, mismatch.actual.value_type):
+						(
+							Model.PureCallableType([Model.IntType, Model.IntType], Model.UnionType(_)),
+							Model.PureCallableType([Model.IntType, Model.IntType], Model.StringType),
+						): mismatch.argument_position == 2
+						_: False
+				_: False
+	)
+
+
+func test_contains_with_rejects_an_impure_comparator() -> Bool:
+	rejects_contains_call("contains_with([1], 1, ", "side_effect", ")",
+		"pure callback requires a pure function",
+		"pass a pure named function; impure functions cannot satisfy a pure callable parameter",
+		pure func(kind):
+			match kind:
+				Errors.CallRejection(Errors.ImpureCallback(_)): True
+				_: False
+	)
+
+
 tests: TestSuite = {
 	description = "Blorp 2 generic functions",
 	tests = [
+		("actual membership APIs retain their own rigid and designated Bool", test_contains_library_preserves_its_rigid_parameter_and_designated_bool),
+		("actual membership API preserves named and forwarded callback identities", test_contains_with_keeps_named_and_forwarded_callback_identities),
+		("Int membership adapter requires an Int needle", test_contains_int_adapter_rejects_a_string_needle),
+		("membership callback has the written three-argument contract", test_contains_with_requires_three_arguments),
+		("membership comparator input matches the actual element", test_contains_with_rejects_a_comparator_for_another_element_type),
+		("membership comparator returns Bool", test_contains_with_requires_a_boolean_comparator_result),
+		("membership comparator must be pure", test_contains_with_rejects_an_impure_comparator),
 		("library helpers preserve foundation owners and function rigidity", test_library_helpers_preserve_foundation_owners_and_function_rigidity),
 		("ufcs payload constructor without context still rejects", test_ufcs_payload_constructor_without_context_still_rejects),
 		("direct payload constructor without context still rejects", test_direct_payload_constructor_without_context_still_rejects),

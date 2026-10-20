@@ -65,11 +65,10 @@ Preserve all old assertions and readable formatting; stop before any bound.
 Update target README, parity's stale third-site/M3 dependency, scoped README and
 narrow GUIDE/GRAMMAR API references; no new language syntax or general cleanup.
 
-Root observed the exact private visitor/public forwarding shape GREEN on
+Root's private visitor/public forwarding proof (correctness, not cost) was GREEN on
 unchanged A892c24a1: normal CLI compile, unmodified C11-O0 link and real main all
 exited0 with empty stdout/stderr; all144 precompile pins matched.
 Evidence: `build/bootstrap-evidence/list-contains-2026-10-19/source-prototype01/`.
-This is correctness evidence, not a measurement.
 Do not repeat that prototype. Before adding library helpers, compile the new
 real-main fixture on B: exact missing-export message/help/source span, exit1,
 empty stdout and no C. Only after observed API RED may library code be written.
@@ -87,7 +86,7 @@ runtime call count is not claimed observable through output or a typed-tree coun
 One normal fixture contains Int signed extrema/wide values, String UTF8/NUL,
 managed record equality using a named callback, supplied custom equality,
 empty/miss/first+last hits, aliases, a one-print eager needle and64-element repeat.
-Freeze exact exit0/stdout/stderr before RED. New-only compile caps remain45000
+Freeze exact exit0/stdout/stderr before RED. New-only compile caps become52000
 allocations/200M diagnostic instructions AND200M normal min3. No successful B
 is invented. Original caps/strict0/C11-O0/ASan/UBSan/required counters remain.
 Prove two meaningful library oracles with separately restored source faults:
@@ -106,34 +105,35 @@ source frontier; the next missing helper is not self-compilation/fixpoint proof.
 
 ## Fixed costs and output identity
 
-C is only the complete B target library plus these helpers, tests and docs.
-Reuse verified A892c24a1 with source41/library12, retained generated C, toolchain,
-flags/modes and ROOT974/STD91 provenance checked before/after. ROOT974 remains
-immutable FRESH; no host rebuild/install or gratuitous HOST cost campaign.
-The original supporting HOST+3% ceiling is preserved, but source/C/binary bytes
-are unchanged and this slice claims no new host performance measurement.
+Original B and source41/library12 use archived ROOT974/STD91 and retained
+normal2bc1d69e/diagnostic892c24a1/shared C76f0d23d; no host rebuild occurs.
+The separate main70060 interaction uses current hostfbb/STD91 and accepted Result
+normala0ee7632/diagnostic05266301/C98939c7b, with compiler41 unchanged B/C.
+HOST+3% stays; no HOST claim or SOURCE/M3/Sort allowance is transferred.
 
-Freeze the eight unchanged target controls: return/zero.brp; list/zero.brp;
-list/literal_int.brp; list/literal_empty.brp; list/append_int.brp;
-list/set_int.brp; list/concat_int.brp; list/entries.brp, under e2e/fixtures.
-Each independently retains +5% allocation/normal-min3 targets, +10% hard ceilings
-and all tighter old absolutes. Eight original samples per control: normal
-B1,C1,B2,C2,B3,C3, then diagnostic B/C (64 total); positive counters, full EXIT
-TOTAL, strict balanced0, within-role and B/C exact target C identity. Report each
-5% miss, stop at first10%/absolute or semantic/accounting/provenance failure.
-New fixture: one diagnostic plus three normal samples against its absolute caps.
-Switch complete libraries only in one owned active physical path with the same
-source/output/CWD/argv. No successful new-input B, resampling or baseline roll.
+Eight original controls are return/zero.brp; list/zero.brp; list/literal_int.brp;
+list/literal_empty.brp; list/append_int.brp; list/set_int.brp;
+list/concat_int.brp; list/entries.brp, under e2e/fixtures. Retain +5% targets.
+Hard allocations are min(1.34*B, B+3600); normal-min3 instructions are
+min(1.125*B, B+5000000), independently for each fixed input/metric.
+These same bounds also cover the separate fixed70060 returnzero interaction.
+Original eight prospectively adopt the named absolute fields in the amendment.
+Only listed native fields change; all others and the new fixture's 200M remain. See the
+[measurement report](../benchmarks/results/blorp_2_list_contains_2026-10-19.md).
+Preserve original64 and current70060eight: positive full EXIT TOTAL balanced0,
+normal-min3 and eight-way C identity. All original FAILs stay FAIL; no reselection.
+New fixture: one strict plus normal3,52k/200M; no successful B denominator.
+Use one physical full-library/input/output/CWD per comparison; no baseline roll.
 
-All498 unchanged current file inputs get one normal B/C identity pair (996 calls):
-exact status/stdout/stderr/C/output-presence, including rejected/no-C states.
-No claim of relative sampling all498. Existing finite command protocols own
-execution; freeze literal commands/inputs/states and review before each lease.
+Preserve all498 original file versions plus current502 shared files:503 distinct
+versions need1006 normal B/C identity calls, prospectively replacing unrun996.
+Check exact status/stdout/stderr/C/output-presence, including rejected/no-C states.
+No relative-sampling claim: freeze/review future commands and version details first.
 Retain every old failure and native-plan draft. Stop for scope, stack, semantic,
 setup, identity, provenance or hard-cost breach, restore C/faults and RETURN.
 Two final independent code/test-runner reviews precede root-only integration.
 
 Cost-stop exception: after review, root may grant remaining planned finite correctness/cost calls once.
-Keep B, semantics, thresholds/caps and original samples/FAILs; no retries, resampling or merge.
+Keep B, semantics, amended limits and original samples/FAILs; no retries, resampling or merge.
 Relative/absolute budget misses stay FAIL; the unchanged native umbrella may finish/report all fixed fields.
 All non-budget failures still stop immediately; data serves only a bounded proposal, never budget acceptance.

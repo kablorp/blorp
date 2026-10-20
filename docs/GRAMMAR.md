@@ -1365,6 +1365,9 @@ dim_atom      = DIMNAME | "#" "_" | "#" INT | INT | "(" dim_expr ")" ;
   with direct-call syntax. Nested callable types, callable storage/returns,
   and lambdas remain unsupported by checking. Bare impure function types remain
   outside its grammar.
+  The pilot's [List membership APIs](../blorp_2/standard_library/README.md#list-membership)
+  use this ordinary callable syntax, with a temporary Int adapter and linear O0
+  stack in the current implementation; they add no grammar production.
 - `(T)` is `T`. `(T,)` is ``a tuple type has two to four elements, and `(T,)`
   has one``. A function type's return type extends as far as a type can, so
   `(A) -> (B) -> C` returns `(B) -> C`.
