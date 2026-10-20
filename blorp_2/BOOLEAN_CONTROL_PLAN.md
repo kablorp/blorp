@@ -1,5 +1,9 @@
 # Boolean expressions through checked joins
 
+Paused at the user's request. Ordinary eager Boolean function calls are the
+current direction; see [their plan](BOOL_FUNCTIONS_PLAN.md). The historical
+operator design and its evidence below remain separate and unaccepted.
+
 The initial M2.2 design below was written against source commit
 `c3b7e4294825e2707e8d30d2e38edcad86a5c384`. It implements compositional `not`,
 then `and` and `or`, using the existing expression inference loop and checked
