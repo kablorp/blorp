@@ -184,7 +184,7 @@ No if/Boolean/ordinary-tail predecessor or general early-return join is required
 First checkpoint: one managed Result witness and exact semantic checker REDs,
 then minimum frontend desugaring, short generated-C/native review and the realistic
 chain screen. Forecast 160–250 gross production additions/+110–180 net, within
-unchanged hard 430/+330; tests <=1,000 gross including one <=40-line fixture.
+unchanged hard 430/+330; tests <=1,025 gross including one <=40-line fixture.
 Prospective fixture limits: 45,000 strict compiler allocations, 200M strict and
 normal-min3 instructions, strict balanced-zero target memory and real-main proof.
 Before implementation, B selects its first prospective fixed accepted FEATURE
@@ -408,7 +408,7 @@ compressed formatting, coverage removal or reset after a preparatory landing.
 | Slice | Unmeasured production forecast | Proposed production stop | Tests/fixtures stop |
 | --- | --- | --- | --- |
 | A, after Boolean/annotation composition | 130–210 gross, +90–160 net | 210 gross and +160 net | 700 gross tests including at most 3 new fixture files/60 new source lines |
-| B, revised frontend checkpoint | 160–250 gross, +110–180 net | 430 gross and +330 net | 1,000 gross tests including one managed fixture/40 source lines |
+| B, revised frontend checkpoint | 160–250 gross, +110–180 net | 430 gross and +330 net | 1,025 gross tests including one managed fixture/40 source lines |
 
 The maxima are not additive permission. Current B uses the checkpoint above,
 not A's historical predecessor/ledger route or the unselected four-product model.
