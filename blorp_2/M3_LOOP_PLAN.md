@@ -46,11 +46,108 @@ min3, tighter absolutes, exact identities, native outputs, faults and physical l
 Only the user may later decide an explicit concrete budget change after a complete
 measured proposal; this exception makes no waiver or acceptance claim.
 
-Full future while requires a separately reviewed recursive LoopBlock arm/statement
-extension for nested conditional nearest-loop breaks, preserving PRE and the same
+Full future while with nested conditional nearest-loop breaks requires a separately
+reviewed recursive LoopBlock arm/statement extension, preserving PRE and the same
 Break/Recur edges and propagating breaks through every emitted switch. A String-only
 slice does not cover the full source carrier census. This characterization adds none
 of that implementation and grants no parallel If route.
+
+## Prospective first source while: render_file_location only — design review
+
+This checkpoint is design-only. It changes no implementation/acceptance authority:
+ROOT and a second independent reviewer must approve the bounded plan and ROOT must
+publish it before a separate implementation grant. Original C0 SOURCE seven failed
+criteria and the two native allocation failures remain FAIL; current composition,
+original fault/identity and matched resource gates retain their own source roles.
+The accepted Option feature and its separate approved limits are not new M3 budget.
+
+The witness is the unmodified `src/main.brp` `render_file_location`, currently at46:
+exactly three Int headers **line, column, cursor**, and one Void loop result P.
+SourceFile/file.contents and span are immutable borrowed PRE, never H. The
+iteration-local byte_at Option[Int] and its byte capture are InlineUnmanaged:
+Spec's sealed representation/value_ownership establishes NoOwnership, not a
+String-containing-header requirement. Scope is this no-break/no-continue witness,
+including its existing statement if, not managed String headers or the complete
+511-source-loop inventory. Existing unrelated nested-pattern/bootstrap debt is not
+claimed fixed or moved by this checkpoint.
+H eligibility is naturally sealed `value_ownership == NoOwnership`: no Int syntax,
+function-name or exactly-three whitelist. Three Int H is witness coverage only;
+no unmeasured Float or String-family behavior/resource claim follows.
+
+| Owner | Produced fact / consumed contract |
+| --- | --- |
+| Check | Resolve condition with the existing DesignatedBoolean identities, not spelling/ordinal guesses; normalize the necessary statement if through ordinary CheckedJoin. Publish ordered reassigned enclosing binding IDs once, excluding arm/iteration locals. Preserve normal binding, purity, diagnostic and first-error rules. |
+| Spec | Translate ordered identities/types and admit H exactly when sealed value_ownership is NoOwnership. The witness has three Int H; borrowed PRE and Option[Int] locals do not become H. |
+| Lower | Evaluate initial H once; evaluate condition inside each iteration after H snapshots. False exits Break with Void P plus current carried values. True executes ordinary yield-only body Joins then Recur with updated ordered carried values. |
+| Own / Verify / Emit | Reuse the existing common Loop transfer/cleanup, PRE retention, output arity/type, header snapshot and switch-exit contracts. No second loop backend, phase, framework, cache or recursive LoopBlock is introduced. |
+
+One flat LoopMatch on the designated condition is sufficient here: False Break,
+True ordinary body operations/Joins followed by Recur. Nested statement-if joins
+still yield and have no loop exit. This does not cover an early break/continue
+inside a body join; that and later managed carriers need their own reviewed design
+and fresh forecast. Keep canonical Bool and accepted integer comparison identity
+contracts; no Boolean-operator or generic If expansion is granted by this witness.
+
+The prospective FEATURE ceilings remain **750 gross production / +600 net** and
+**1600 gross tests**, with the existing at-most3/120-total-line fixture bounds.
+Early forecast for this checkpoint only is450–650 production / +350–520 net and
+900–1300 tests; report handwritten production, test and fixture ledgers separately.
+No coverage deletion, formatting compression, budget offset or borrowing from C0.
+Stop before writes if a complete phase/observer forecast exceeds any bound.
+
+Acceptance is bounded and must be independently reviewed before execution:
+
+1. Freeze small ordinary real-main fixtures mirroring these three counters and
+   byte_at/LF/statement-if body, with exact0/1/several-iteration outputs. Include
+   LF boundaries, consecutive LF, counted UTF8/NUL and span-at-end cases, preserving
+   the actual byte-based column behavior. Record the current unsupported-while
+   diagnostic as RED with exact message/help/span before implementation; no old
+   diagnostic outcome is asserted here as newly executed.
+2. Add named Check/Spec/Lower/Own/Verify/Emit TestSuite controls for designated Bool
+   acceptance and same-shaped/non-Bool rejection; ordered H identities excluding
+   locals; NoOwnership from sealed layouts; initial/condition/body evaluation
+   order; zero and final-False edges; Void P/carried arity; header snapshots; PRE
+   non-discharge and ordinary body-Join cleanup. Conditions with an observable
+   ordinary IO marker must be evaluated n+1 times; check exact output order.
+   Positive native and phase oracles must observe borrowed SourceFile/contents PRE
+   surviving iterations and the final exit, plus a mortal String iteration-local
+   (never H) released on backedge/exit. Fit its allocation/print marker into the
+   same IO-condition/body fixture, at most3 fixtures/120 lines; no String carrier.
+   Check must reject these source forms before ordinary Join normalization, with
+   exact message/help/span assertions below (including inside statement-if arms):
+
+   | Negative | Exact message | Exact help | Exact source span |
+   | --- | --- | --- | --- |
+   | Early break | `break in a source while is not supported yet` | `use the loop condition to exit; early break arrives in a later increment` | break keyword |
+   | Explicit continue | `continue in a source while is not supported yet` | `let the body reach its backedge; explicit continue arrives in a later increment` | continue keyword |
+   | Nested loop | `nested source loops are not supported yet` | `keep this loop body flat; nested loops arrive in a later increment` | complete inner loop statement |
+3. Prove the native multi-iteration oracle by one reviewed source-valid edge fault
+   that makes the True arm Break after its first body instead of Recur, using typed
+   Void/carried outputs. It terminates and must produce the exact wrong value/count
+   through the fixture's real main, then restore exact source bytes/modes and GREEN.
+   This is a design for a future exact recipe, not a verified mutant or blanket
+   fault lease. No generated-C rewrite, alternate main or instrumentation path.
+4. Run the existing source parser inventory and require41/41, then the normal
+   candidate compiler entrypoint on unchanged src/main.brp with its explicit current
+   target library. Retain the exact first diagnostic/span or emitted C. Credit an
+   actual-source frontier only if evidence reaches/advances past this witness;
+   earlier unsupported constructs are a reported blocker, not a pass or permission
+   to carve/rewrite compiler source. This does not claim self-compilation or511-loop
+   coverage. Existing component/native/TCO0/1/17/million and ownership gates remain.
+5. Freeze one matched accepted-current baseline/candidate and named shared FEATURE
+   controls before setup/sampling, with identical tools, paths, environment and
+   library/corpus roles. Retain whole allocations, strict positive balanced zero
+   leaks, normal min3 instructions, tighter existing absolutes and C/behavior review.
+   FEATURE has **+5% target / +10% hard**; old ceilings are unchanged. Original C0
+   SOURCE **+3%** is a separate failed-role decision, never rolled into FEATURE.
+   No measurement, sample count or setup is authorized by this planning paragraph.
+
+Stop for unknown/nonbudget/provenance/oracle failure, malformed/missing counters,
+unreviewed diagnostic/span or C/ABI/IO-order differences, required managed H,
+recursive/early-exit scope growth, an exceeded physical ceiling or a hard resource
+miss. Preserve raw outcomes and blocked fields; no retry, cap change, baseline
+roll, optimization detour or acceptance is implied. A later independent resource
+proposal cannot silently convert old failures to PASS.
 
 ## Current scalar checkpoint — atomic convergence, 2026-10-19
 
