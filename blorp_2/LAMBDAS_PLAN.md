@@ -162,6 +162,13 @@ partial Result/Option contexts require an explicit annotation. Block resolver
 therefore needs no inference-slot API, guessed nominal head or pending join IR.
 Recursion analysis precedes canonical Void discard as in existing body checking.
 
+A written return annotation has two consumers: constrain the original caller
+result term, and pass the written type as the lambda body's expected type. A
+bare record literal needs that nominal hint during planning; a solved bare
+call variable does not establish it. Retain the written type in the existing
+LambdaAdmission.result rather than recovering record identity from slots or
+adding another hint carrier.
+
 ## Immutable capture and erasure contract
 
 Resolve outer data by ScopedBindingId, deduplicate first-use identities, and
@@ -248,7 +255,7 @@ Specialize320–420, Lower20–35; Own/Verify/Emit production zero expected.
 All mechanical constructor/observer ports count. No compression/deleted coverage.
 Fixtures are separate: at most three/150 physical lines combined, not charged
 again to nonfixture tests. Active API/reference docs <=100 additions, retained
-final evidence <=120 physical lines, plan <=320 physical lines, counted separately.
+final evidence <=120 physical lines, plan <=350 physical lines, counted separately.
 Later source renames/import/helper integration needs a separate frozen slice.
 
 Minimal ordinary-main witness, with normal library imports:
@@ -295,6 +302,34 @@ proxy/host/STD/tool roles before samples. Normal/diagnostic C agree per variant;
 unaffected noncallable fixture C stays exact. No invented B success for new inputs.
 Measure the first complete managed-capture checkpoint before extended coverage.
 Harness-boundary changes are separate epochs, never retroactive passes.
+
+### Prospective supplemental old-B/current-C cost comparison
+
+Review and publish this amendment, then obtain an explicit finite cost grant.
+This independent new-path matched comparison leaves original B and raw samples
+untouched: 24,404,055 allocations; 44,935,473,655 normal-min3 instructions.
+It gives no retroactive old-role pass or changed-STD-path equivalence credit.
+Use original normal6852e1c6/diagnostica362b0df and the same pinned timer/tool roles.
+Freeze all B/C source41 bytes/modes, libraries, physical paths, argv/environment,
+tools and output/report endpoints before calls; source compatibility stays exact.
+ROOT means the persistent /Users/keithphilpott/CLionProjects/blorp checkout.
+Choose only ROOT's preserved-host01/standard_library archive, exact91 bytes/modes,
+under build/bootstrap-evidence/host-string-equality-2026-10-19/; no links/fallback.
+Never overwrite current ROOTSTD; ROOTfbb/currentSTD remains a separate functional role.
+Use new ROOT/build/bootstrap-evidence/lambda-supplemental-cost01/ as the endpoint:
+active/blorp_2/src/main.brp is the SAME physical source argument for both variants;
+active/compiler.c is the SAME physical output pathname on every call.
+Copy immutable B41, then frozen current C41 serially into that isolated active tree;
+verify exact members/hashes/modes each time; never modify either frozen payload.
+Per variant run one diagnostic and three positive normal instruction samples,
+quiet and serial in ROOT's exclusive compiled lane; retain normal-min3.
+Before each next call preserve raw C/stdout/stderr/time/report and exact command
+under a fresh variant/run directory; require diagnostic/normal C exact per variant.
+Read exactly one schema1 artifact_construction_complete cumulative total_allocations;
+never use end-process totals. Finally restore and verify frozen current C41 there.
+For each metric require C <= min(original absolute 8% ceiling, floor(Bsup*108/100));
+reassess at original 6% threshold or floor(Bsup*106/100)+1, where Bsup is new B.
+No subtraction, offsets, automatic B resampling, reset or stacked credit.
 
 Per-slice acceptance: semantic RED, owner GREEN, source41 parse, generated C,
 effective faults/restoration, full component/native gates with strict zero and
