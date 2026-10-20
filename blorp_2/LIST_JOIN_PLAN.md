@@ -89,6 +89,10 @@ Prospective hard: production40ADD/+40, tests295ADD, one fixture60lines, API docs
 plan100lines. Stop on first10%/absolute breach, semantic/accounting/provenance/
 identity failure or prospective LOC overflow. Retain5%misses; no cap edits,
 resampling, B roll, benchmark omission or acceptance from identical C alone.
+After a budget-only stop, two reviews and a separate finite root grant may run
+only return/zero's unrun strict calls7–8 once; retain every budget breach as FAIL.
+No repeats, other controls, source changes or acceptance; nonbudget failures STOP.
+Phase attribution needs its own reviewed packet and separate finite grant.
 Prior Query +22.15% allocation failure is preserved; join may incur declaration
 checking overhead too, so its first cost result is a real stop, not assumed headroom.
 Root semantically composes List import/function hunks; no whole-file replacement.
