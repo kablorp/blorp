@@ -1,6 +1,7 @@
 # Ordinary target List[String].join
 
-Status: reviewed implementation contract; implementation and measurements pending.
+Status: source23ADD/1DEL, eight phase callbacks and64-byte native main pass.
+Return/zero fails +13.023436% instructions/+30.230796% allocations; held.
 Fixed B: a656f5ce1de963c8e9c162460e181d696b39c1d5 (accepted Numeric main).
 Query/Contains/HOF candidates and all their failed samples remain separate.
 
@@ -24,10 +25,8 @@ String accumulator or a growing fragment list to disguise quadratic copying.
 
 ## Smallest ordinary implementation
 
-SOURCE_PREVIEW.patch is23ADD/1DEL/+22: merge base String/Bool constructors,
-IntOps/StringOps aliases, one private join_range and public join. No other API,
-compiler/runtime/host/prelude edit, M3/M7/callback dependency or new builtin.
-Preview is generated from exact B, not any held List checkout.
+Only list.brp changes: public join and private join_range; no compiler/runtime/
+host/prelude/M3/M7/callback machinery or new builtin. Source remains23ADD/1DEL.
 
 Public join calls join_range(values,0,length(values),separator). Match Bool from
 less_than(count,1): empty returns "". Otherwise match equals(count,1): get the
@@ -55,22 +54,17 @@ First baseline ordinary CLI must reject import join at2:11, bytes18..22:
 `select a public function or type that list declares`; exit1/stdout0/no C.
 No setup failure earns RED; no fabricated successful B for this new API.
 
-Nonfixture forecast220ADD: Check actual loaded public signature/purity/private
-range authority60; concrete ordinary calls/finite recursion20; separate Own and
-Verify exact leaf acquire/intermediate release/temporary-parent escape70; typed
-bad List[Int]/Int separator diagnostics (exact typed facts/source/span/help/note)
-30; native registration7; imports/layout contingency33. No copied library body,
-new runner or fixture alternate main. Use existing temporary-module phase helpers.
+Nonfixture tests293ADD retain actual public/private FunctionIds, concrete
+ordinary calls, exact negative kind/help/span/no-note, and independent Own/Verify
+leaf acquisition, intermediate retirement and escaped-result identity. No copied
+library body, new runner or fixture alternate main.
 After GREEN, independently mutate singleton payload->empty, right start->start,
 and omit separator. Each must fail real-main exact output, restore bytes/modes
 before classification and pass restored control; no setup-error kill credit.
 
-Commands follow existing owners: ROOT/bin/blorp test --std-dir ROOT/standard_library/src
---timeout180 blorp_2/test/unit/test_check/test_list_join.brp; changed Spec/Own
-owners next. A source-matched accepted Numeric normal/diagnostic pair must be
-named and pinned before RED/setup; old query2bc/892 are not Numeric producers.
-One ordinary CLI emits C, C11/O0/ASan+UBSan links unmodified C, real main checks
-all64 bytes. Then first unchanged return/zero eight costs before expensive gates.
+Retained actual Numeric02ec/ef936/commonC9ab roles own the native/cost epoch;
+old Query2bc/892 are not substitutes. Native C11/O0/ASan+UBSan uses unmodified C
+and real main. Existing native64B and phase8GREEN remain credited, not replayed.
 
 Freeze unchanged controls return/zero, string_operations/concat,
 generic/managed/basic, list/empty_string from exact B. Use same physical full12
@@ -89,12 +83,18 @@ Prospective hard: production40ADD/+40, tests295ADD, one fixture60lines, API docs
 plan100lines. Stop on first10%/absolute breach, semantic/accounting/provenance/
 identity failure or prospective LOC overflow. Retain5%misses; no cap edits,
 resampling, B roll, benchmark omission or acceptance from identical C alone.
-After a budget-only stop, two reviews and a separate finite root grant may run
-only return/zero's unrun strict calls7–8 once; retain every budget breach as FAIL.
-No repeats, other controls, source changes or acceptance; nonbudget failures STOP.
-Phase attribution needs its own reviewed packet and separate finite grant.
-Prior Query +22.15% allocation failure is preserved; join may incur declaration
-checking overhead too, so its first cost result is a real stop, not assumed headroom.
+The original eight return/zero calls are complete and must never repeat.
+Attribution measured Load+1782/Check+2606 allocations; all five later phases were
+unchanged. These are diagnostic intervals, not instruction or acceptance proof.
+After two reviews and separate finite root grants, characterize only the unrun
+three controls24 calls, the new fixture's three normal calls, and one maintained
+unchanged-cap full-native umbrella:28 calls maximum. Reuse its valid strict39931
+allocations/129642982 instructions and emitted C; do not recompile strict.
+Every original5%/10%/absolute miss remains FAIL. Only numerical-limit failures
+may be collected; semantic/status/leak/counter/C/provenance faults STOP unused calls.
+Retain all raw outputs and map every native limit field/shared user/max excess.
+No resampling, B roll, cap change, acceptance or merge follows characterization.
+Three planned faults/restorations and current-main composition remain separate.
 Root semantically composes List import/function hunks; no whole-file replacement.
 Two independent reviews/full gates and resource acceptance precede root commit.
 No source write, compiler call, commit or implementation dispatch is authorized here.
