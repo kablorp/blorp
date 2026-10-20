@@ -13,8 +13,12 @@ names. Stage03 also serves formatting, AST output and test discovery. Existing
 legacy name tables already issue keyword IDs; use those authorities, without
 new token kinds or broad keyword unreservation.
 
+Current status (2026-10-19): A is published; bootstrap B and legacy C are paused.
+Active work is explicit Blorp2 functions and the separate source migration using
+`.not()`. The host parser, library and pin stay fixed.
+
 Default `make` uses the immutable bootstrap with the checkout's host library.
-That bootstrap rejects keyword function declarations. Land three green slices:
+The original staged bootstrap sequence below is retained as deferred work:
 
 1. A: legacy parser capability with the unchanged host library. Accept the three
    callable names in declarations/imports/UFCS/qualified calls, plus direct
@@ -49,13 +53,16 @@ pure func not(value: Bool) -> Bool:
 
 `and(left, right)` returns `right` for True and False otherwise; `or(left,
 right)` returns True for True and `right` otherwise. Both arguments have
-already been evaluated by the caller. Select `bool: not, and, or` in the
-prelude: existing named function imports provide direct calls and UFCS. Its
-own declarations deliberately are not exported; preserve that namespace rule.
-Document the temporary bootstrap convenience of implicit availability; moving
-these selections later does not require another compiler representation.
-Add the same match bodies to the host's existing `standard_library/src/bool.brp`
-in C and expose the names through its prelude; keep existing trait methods intact.
+already been evaluated by the caller. Select `bool: not, and, or` explicitly
+in callers: existing named imports provide direct calls and UFCS. Keep these
+functions out of the target prelude. User modules receive that prelude, so
+implicit function selections would conflict with a temporary compiler helper
+module declaring the same spellings with different function identities. Preserve
+ordinary namespace admission and the rule that imports are not reexports.
+The separate [source migration](BOOLEAN_SOURCE_PLAN.md) uses explicit helpers
+and `.not()` while the legacy host keeps its current library and parser.
+If legacy C resumes later, add the same bodies to host `standard_library/src/bool.brp`
+and expose them through its prelude, retaining existing trait methods.
 
 In Blorp 2 the lexer keeps `AndKeyword`, `OrKeyword`, and `NotKeyword`. Append their
 spellings after existing seeded names, retaining issued IDs in the existing
