@@ -344,20 +344,21 @@ func main() -> Int:
     forward(7, identity)
 ```
 No larger substitute, dropped control or cherry-picking after a breach.
-Each control AND frozen HOST proxy independently require C<=1.03B allocations
-and normal min3 instructions; all old absolutes/strict0 remain binding.
+Each target control independently requires C<=1.03B allocations and normal min3
+instructions; all old absolutes/strict0 remain binding.
 Shared C/status/diagnostics/output states stay byte-exact; normal/strict agree per role.
-HOST retains original normal34ac1a91/diagnosticbe31a5a3 and STD090ed68c roles/pins;
-unique schema1 artifact_construction_complete.total_allocations, not exit TOTAL
-or ROOT974 substitution. Complete original598 provenance must close before reuse.
+This target-library-only slice leaves all41 compiler sources and HOSTSTD91
+byte-identical. Retain original34ac/be31, STD090ed68c and verified598 provenance;
+record the unchanged consumed boundary instead of eight duplicate HOST samples.
+Historical HOST metrics are context only, not measured acceptance of this slice.
 Reuse source-matched A for B/C; verify C/normal0/diagnostic1 pins; no ABI/closures/M7 reset.
 New C-only caps:150000 allocations/600M strict diagnostic instructions/600M normal
 min3; positive balanced strict0/unmodified C. No successful B denominator.
 Finite leases:1 API RED;1 focused GREEN;4 fault/restored focused calls;1 component,
 1 full native,1 actual frontier call, all through existing commands/harness.
 Exact reuse avoids setup; otherwise separately lease1 C generation/2 O0 links
-(normal0/diagnostic1). Cost:36 target calls (4x8 controls+4 C-only), plus8 original
-HOST calls (diag B/C+normal B1,C1,C2,B2,B3,C3); no other samples.
+(normal0/diagnostic1). Cost:36 target calls (4x8 controls+4 C-only); no HOST
+samples because the consumed compiler-source/HOSTSTD boundary is unchanged.
 Literal argv/CWD/pins/output absence/failure sets need review before START.
 Stop first unexpected setup/semantic/pin/identity/strict/cost/LOC result; preserve
 raws, restore faults, RETURN lane; no retry/repair/refreeze/waiver or next job.
