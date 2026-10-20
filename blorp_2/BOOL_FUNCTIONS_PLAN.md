@@ -38,8 +38,11 @@ spacing rule as other calls: both `not(True)` and `not (True)` work. Use that
 same prefix-not distinction in range operand parsing. Postfix keyword selectors
 require call parentheses; qualified function references may follow the existing
 qualified-name path. Bare unqualified keyword references remain out of scope.
-Prefix `not value` and infix `left and right` / `left or right` retain their
-existing unsupported-operator path. No Boolean IR, join construction, traits,
+Prefix `not value` and infix `left and right` / `left or right` are invalid.
+Use the existing rejection path, with diagnostics teaching ordinary calls;
+remove promises that these operators will arrive at a later milestone.
+Keep the negative cases and update their exact expected message/help.
+No Boolean IR, join construction, traits,
 backend/runtime mechanism, namespace exception, `if`, `while`, or wholesale
 compiler-source migration belongs in this change.
 
