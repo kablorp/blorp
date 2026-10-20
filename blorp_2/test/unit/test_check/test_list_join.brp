@@ -1,0 +1,117 @@
+import:
+	../../../src/load/load: load_program
+	../../../src/parse/assemble: parsed_contents
+	../../../src/check/check: check, checked_functions, check_errors
+	../../../src/check/model as Model
+	../../../src/check/errors as Errors
+	../../../src/specialize/specialize as Concrete
+	../../../src/utils/ids: inventory_functions, function_number
+	../../../src/utils/names: name_spelling
+	../../../src/utils/source: same_module, same_source, module_source, root_module_id
+	../../../src/utils/syntax: Purity(Pure), Visibility(Public, Private), same_purity
+	../input: setup_diagnostic, singleton_check_error
+	fs: temporary_directory, resource_path, message
+	system: temp_dir, write_file
+	test: TestSuite
+
+
+private JOIN_MAIN: String =
+	|import:
+	|    list: join
+	|func main() -> Int:
+	|
+
+
+func test_join_has_one_public_concrete_signature_and_private_range() -> Bool:
+	match load_program("blorp_2/test/e2e/fixtures/generic/managed/list_join.brp", "blorp_2/standard_library"):
+		Err(_): False
+		Ok(loaded):
+			parsed = parsed_contents(loaded.program)
+			match (parsed.modules.get(0), check(loaded.program)):
+				(Some(root), Ok(program)):
+					rows = checked_functions(program)
+					match root.imports:
+						[list_import, _, _, _]:
+							functions = inventory_functions(parsed.declarations).filter(pure func(row): same_module(row.declaration.module, list_import.target))
+							join_functions = functions.filter(pure func(row): name_spelling(parsed.names, row.declaration.function_name.id) == Some("join"))
+							range_functions = functions.filter(pure func(row): name_spelling(parsed.names, row.declaration.function_name.id) == Some("join_range"))
+							match (join_functions, range_functions):
+								([join], [range]):
+									match (join.declaration.visibility, range.declaration.visibility, rows.functions.get(function_number(join.id)), rows.functions.get(function_number(range.id))):
+										(Public, Private(_), Some(public), Some(private_range)):
+											matches = [public, private_range].all(pure func(row): row.signature.type_parameters.is_empty() and same_purity(row.signature.purity, Pure) and Model.same_type(row.signature.return_type.value_type, Model.StringType))
+											match (public.signature.parameters, private_range.signature.parameters):
+												([values, separator], [input, start, count, between]):
+													(
+														matches and Model.same_type(values.value_type, Model.ListType(Model.StringType)) and Model.same_type(input.value_type, values.value_type)
+														and [separator, between].all(pure func(value): Model.same_type(value.value_type, Model.StringType))
+														and [start, count].all(pure func(value): Model.same_type(value.value_type, Model.IntType))
+													)
+												_: False
+										_: False
+								_: False
+						_: False
+				_: False
+
+
+func test_join_specializes_one_ordinary_range_body() -> Bool:
+	loaded = load_program("blorp_2/test/e2e/fixtures/generic/managed/list_join.brp", "blorp_2/standard_library").map_err(func(failure): failure.diagnostic.message)
+	concrete = loaded.and_then(pure func(input): check(input.program).map_err(pure func(failure): setup_diagnostic(failure).message))
+		.and_then(pure func(input): Concrete.specialize(input).map_err(pure func(error): error.message))
+	match concrete:
+		Err(_): False
+		Ok(program):
+			ranges = Concrete.specialized_contents(program).functions.filter(pure func(row):
+				match row.signature.parameters:
+					[Concrete.ListType(Concrete.StringType), Concrete.IntType, Concrete.IntType, Concrete.StringType]: True
+					_: False
+			)
+			match ranges:
+				[range]:
+					match range.body:
+						Concrete.ConcreteMatchBody(matched): matched.arms.length() == 2 and Concrete.same_type(range.signature.return_type, Concrete.StringType)
+						_: False
+				_: False
+
+
+private func rejects_argument(prefix: String, marked: String, suffix: String, position: Int, expected: Model.TypeRef, actual: Model.TypeRef, help: String) -> Result[Bool, String]:
+	with directory ?= temporary_directory(temp_dir(), "blorp-2-list-join-negative-") on error => message(error):
+		path = directory.resource_path() + "/main.brp"
+		written ?= write_file(path, JOIN_MAIN + prefix + marked + suffix)
+		loaded ?= load_program(path, "blorp_2/standard_library").map_err(func(failure): failure.diagnostic.message)
+		match check(loaded.program):
+			Ok(_): Ok(False)
+			Err(failure):
+				diagnostic = setup_diagnostic(failure)
+				match singleton_check_error(check_errors(failure)):
+					Some(error):
+						match error.kind:
+							Errors.CallRejection(Errors.ArgumentTypeMismatch(mismatch)):
+								Ok(
+									mismatch.argument_position == position and Model.same_type(mismatch.expected, expected) and Model.same_type(mismatch.actual.value_type, actual)
+									and same_source(error.span.source, module_source(root_module_id())) and same_source(error.span.source, mismatch.actual.span.source)
+									and error.span.start == JOIN_MAIN.length() + prefix.length() and error.span.end == error.span.start + marked.length()
+									and mismatch.actual.span.start == error.span.start and mismatch.actual.span.end == error.span.end
+									and diagnostic.message == "argument type does not match the parameter type" and diagnostic.help == help and diagnostic.note.is_none()
+								)
+							_: Ok(False)
+					None: Ok(False)
+
+
+func test_join_rejects_integer_elements() -> Bool:
+	rejects_argument("    numbers = [1]\n    result = join(", "numbers", ", \"/\")\n    0\n", 0, Model.ListType(Model.StringType), Model.ListType(Model.IntType), "use an expression of type List[String] here").get_or(False)
+
+
+func test_join_rejects_integer_separator() -> Bool:
+	rejects_argument("    result = join([\"x\"], ", "1", ")\n    0\n", 1, Model.StringType, Model.IntType, "use an expression of type String here").get_or(False)
+
+
+tests: TestSuite = {
+	description = "Blorp 2 target List String join checking",
+	tests = [
+		("List join publishes a pure String signature and private range", test_join_has_one_public_concrete_signature_and_private_range),
+		("List join specializes one ordinary range match", test_join_specializes_one_ordinary_range_body),
+		("List join rejects integer elements at the actual List", test_join_rejects_integer_elements),
+		("List join rejects an integer separator at the actual argument", test_join_rejects_integer_separator),
+	]
+}

@@ -44,7 +44,9 @@ ordinary Bool, Option and Result types and constructors are implicit. Named
 and enable both direct calls and UFCS. Their ordinary named-callback definitions
 use the accepted `pure (T) -> U` parameter syntax; this adds no grammar form.
 See the [pilot API contracts](../blorp_2/standard_library/README.md).
-Lambdas/captures and compiler consumer imports remain separate work. User
+Lambdas/captures and compiler consumer imports remain separate work. The target
+`list: join` function uses this syntax for `join(List[String], String) -> String`;
+it adds no grammar form. User
 modules also receive the ordinary prelude's selected methods; library operation
 modules receive the base alone. Explicit and implicit exposures of the same
 function are idempotent; different applicable functions remain ambiguous.

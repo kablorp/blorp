@@ -2967,6 +2967,11 @@ a: List[Int] = [1, 2] + [3, 4]   -- No trait import needed
 - **Non-prelude types** — `Heap`, `SortedMap`, `JsonValue`, etc. need an import to enable UFCS
 - **Bare-name function calls** — `map(items, f)` style requires explicit `list: map`; `items.map(f)` does not
 
+The Blorp 2 target library also accepts `list: join` and
+`["a", "", "c"].join("::")`, producing `"a::::c"`. This pure String-list
+operation preserves UTF-8/NUL content and leaves input aliases usable; an empty
+List produces empty String. See the [target library](../blorp_2/standard_library/README.md).
+
 ### Visibility
 
 All top-level declarations are **public by default**. Use `private` to hide internal helpers:

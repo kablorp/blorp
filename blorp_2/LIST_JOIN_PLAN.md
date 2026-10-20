@@ -1,9 +1,9 @@
 # Ordinary target List[String].join
 
-Status: source23ADD/1DEL, eight phase callbacks and64-byte native main pass.
-Return/zero fails +13.023436% instructions/+30.230796% allocations; held.
+Status: source 22 ADD/1 DEL; components 3652 and native 1155 all PASS.
+Original/current FAILs remain; the resource amendment was approved on 2026-10-20.
 Fixed B: a656f5ce1de963c8e9c162460e181d696b39c1d5 (accepted Numeric main).
-Query/Contains/HOF candidates and all their failed samples remain separate.
+Original isolated measurements and current combined-library proof stay distinct.
 
 ## Public contract and existing authorities
 
@@ -26,7 +26,7 @@ String accumulator or a growing fragment list to disguise quadratic copying.
 ## Smallest ordinary implementation
 
 Only list.brp changes: public join and private join_range; no compiler/runtime/
-host/prelude/M3/M7/callback machinery or new builtin. Source remains23ADD/1DEL.
+host/prelude/M3/M7/callback machinery or new builtin. Original 23/1 is current 22/1.
 
 Public join calls join_range(values,0,length(values),separator). Match Bool from
 less_than(count,1): empty returns "". Otherwise match equals(count,1): get the
@@ -62,39 +62,39 @@ After GREEN, independently mutate singleton payload->empty, right start->start,
 and omit separator. Each must fail real-main exact output, restore bytes/modes
 before classification and pass restored control; no setup-error kill credit.
 
-Retained actual Numeric02ec/ef936/commonC9ab roles own the native/cost epoch;
-old Query2bc/892 are not substitutes. Native C11/O0/ASan+UBSan uses unmodified C
-and real main. Existing native64B and phase8GREEN remain credited, not replayed.
+Fixed cost roles are Numeric02ec/ef936/commonC9ab; Query2bc/892 never substitute.
+Current native uses CWD9b22+host498/STD91, unmodified C11/O0/ASan+UBSan/real main.
+All credited 64-byte native/phase8/fault GREEN and historical FAILs remain.
 
-Freeze unchanged controls return/zero, string_operations/concat,
-generic/managed/basic, list/empty_string from exact B. Use same physical full12
-library/input/output/CWD, normal B1,C1,B2,C2,B3,C3 then strict B,C per input.
-Each allocation/normalmin3 independently retains5% target/10%hard plus old tighter
-absolute caps; require positive counters, strict balancedzero and exact all8 C.
-No compiler data-model change or HOST rebuild/campaign; independent HOST3% stays
-fixed. New fixture only C strict+3normal under existing generic150k/600M.
-Full components/native REQUIREDinstructions/strictzero/sanitizers/oldcaps plus
-full unchanged corpus/state identity remain; explicitly name new export/frontier
-changes. These controls are not the13 compiler source calls' selfcompile proof.
+Four unchanged controls are return/zero, string_operations/concat,
+generic/managed/basic and list/empty_string. Fixed B and same physical paths,
+02ec/ef936 producers/env, positive counters, strictzero and exact C stay fixed.
+Original 5% targets/10% hard limits and every historical FAIL remain recorded.
+The human approved these current-composition hard caps on 2026-10-20:
+allocations min(floor(1.58*B), B+8400); normalmin3 min(floor(1.25*B), B+11000000).
+These cover Contains/AppendInt/Join together; they do not attribute 57% to Join.
+Empty String control-only absolutes become 27300 allocations/91M instructions;
+all other control absolutes and C-only fixture 150k/600M remain unchanged.
+Only 49 native allocation fields change to the frozen values derived once as
+max(currentcap,round_up(maximum_shared_observed+100,100)); 62 users are bound.
+Native instruction caps and all unlisted fields stay unchanged; never stack
+old allowances. Exact integers/headroom and evidence are in the [report](../benchmarks/results/blorp_2_list_join_2026-10-20.md).
+No compiler model/HOST rebuild; independent HOST/SOURCE/otherFEATURE caps stay.
 
 ## Bounds, stop and integration
 
-Prospective hard: production40ADD/+40, tests295ADD, one fixture60lines, API docs25ADD,
-plan100lines. Stop on first10%/absolute breach, semantic/accounting/provenance/
-identity failure or prospective LOC overflow. Retain5%misses; no cap edits,
-resampling, B roll, benchmark omission or acceptance from identical C alone.
-The original eight return/zero calls are complete and must never repeat.
-Attribution measured Load+1782/Check+2606 allocations; all five later phases were
-unchanged. These are diagnostic intervals, not instruction or acceptance proof.
-Completed24 control and3 fixture normal samples stay credited; all failures bind.
-The original native180s timeout and corrected441PASS/57FAIL remain retained.
-Current27b+Join599e7703 completed16 C-only samples and one native; failures bind.
-Credited old B and original02ec/ef936 paths/env stay fixed; no sample replay.
-After two reviews/publication/START, permit one final --timeout0 native only
-on Join plus accepteda5e5 Option/Result; it is not a new cost baseline.
-Only numerical misses may continue; retain every original/current5%/10% and
-absolute FAIL. Other20 functional/fault calls stay credited with strict oracles.
-Any nonbudget failure STOPs; no additional cost/fixture/HOST/build calls.
-Map actual current limits/shared users/max; never add old allowances twice.
-No cap/B/HOST/acceptance/merge waiver. Root semantically composes List hunks;
-two independent final reviews/full gates/resource acceptance precede commit.
+Prospective hard: production 40 ADD/+40, tests 345 ADD, fixture 60 lines, API docs 25 ADD.
+Feature tests remain 293 ADD; 49 numeric replacements give 342 ADD/49 DEL total.
+There are no extra callbacks, compressed formatting or lost predicates; plan 100 lines.
+Original 32 shared and 4 fixture samples, 20 functional/fault calls and current 16
+samples stay credited. No old B/sample replay, resampling or baseline roll.
+Old native timeout/441 PASS 57 FAIL and current 448 PASS 60 FAIL remain retained.
+Final accepted Option+Join native 449 PASS 60 FAIL/418 rows is allocation-only FAIL.
+Final approved-cap whole-native --timeout0 passed all 1155 markers/418 cost rows,
+509 outer/645 semantic-child/one umbrella, with strictzero and required counters.
+Components passed 3652; identity passed 505 pairs/1010 calls; all guards closed;
+explicitly bind new export/frontier differences. No selfcompile proof is claimed.
+Stop on every semantic/status/strict/counter/C/provenance or unapproved cost failure.
+No additional measurements/builds/cap edits follow implicitly from this amendment.
+Root composes List hunks; two final independent reviews and GREEN final gates
+are required before commit. All original/current FAIL evidence stays immutable.

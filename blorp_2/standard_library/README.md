@@ -70,6 +70,13 @@ indices. Updates have value semantics: an update does not change an earlier
 alias, and returned managed values remain independently owned. `append` and
 `concat` also return owned Lists.
 
+`list: join` imports pure `join(List[String], String) -> String`, also usable
+through UFCS. It preserves element order and counted UTF-8/NUL bytes; empty
+input returns empty String and separators appear only between elements. The
+result owns its content independently of temporary inputs and surviving aliases.
+This temporary balanced implementation copies O(n + bytes * log(n + 1)) work
+and uses O(log(n + 1)) stack, pending a separately reviewed linear String builder.
+
 ### List membership
 
 `contains_with[A](values: List[A], needle: A, equals: pure (A, A) -> Bool) -> Bool`

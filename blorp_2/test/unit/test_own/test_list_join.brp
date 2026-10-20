@@ -1,0 +1,169 @@
+import:
+	../../../src/load/load: load_program
+	../../../src/check/check: check
+	../../../src/specialize/specialize as Concrete
+	../../../src/lower/lower as Lower
+	../../../src/own/own as Own
+	../../../src/verify/verify: verify
+	../../../src/utils/syntax: same_span
+	../input: setup_diagnostic
+	int as IntOps
+	test: TestSuite
+
+
+private func join_program() -> Result[Own.OwnershipProgram, String]:
+	loaded ?= load_program("blorp_2/test/e2e/fixtures/generic/managed/list_join.brp", "blorp_2/standard_library").map_err(func(failure): failure.diagnostic.message)
+	checked ?= check(loaded.program).map_err(pure func(failure): setup_diagnostic(failure).message)
+	concrete ?= Concrete.specialize(checked).map_err(pure func(error): error.message)
+	lowered ?= Lower.lower(concrete).map_err(pure func(error): error.message)
+	Own.own(lowered).map_err(pure func(error): error.message)
+
+
+private pure func nested_joins(operations: List[Own.OwnershipOperation]) -> List[Own.OwnedJoin]:
+	var joins: List[Own.OwnedJoin] = []
+	for operation in operations:
+		match operation:
+			Own.ExecuteJoin(join):
+				joins = joins.append(join)
+				for arm in join.arms:
+					joins = joins.concat(nested_joins(arm.operations))
+			_: void
+	joins
+
+
+func test_join_leaf_acquires_before_optional_parent_release() -> Bool:
+	match join_program():
+		Err(_): False
+		Ok(program):
+			var leaves = 0
+			var valid = True
+			for function in program.functions:
+				match function.tail:
+					Own.MatchTail(matched):
+						for root_arm in matched.arms:
+							for join in nested_joins(root_arm.operations):
+								for arm in join.arms:
+									match arm.operations:
+										[Own.DefineValue(optional), Own.ExecuteJoin(leaf), Own.DropOwner(parent, _)]:
+											match (optional.result, leaf.arms, leaf.scrutinee):
+												(Own.OwnedResult(container), [some, none], Own.BorrowedArgument(scrutinee)):
+													match (some.operations, some.transfer):
+														([Own.DefineValue(payload), Own.AcquireOwner(child, borrow, _)], Own.OwnedReturn(value, transferred)):
+															match (payload.operation, borrow.source, scrutinee.source):
+																(Own.PayloadDefinition(_, source), Own.PayloadBorrow(origin), Own.OwnerBorrow(owner)):
+																	leaves = leaves + 1
+																	valid = (
+																		valid and Lower.value_number(source) == Lower.value_number(optional.id) and Lower.value_number(origin) == Lower.value_number(source)
+																		and Lower.value_number(scrutinee.value) == Lower.value_number(source) and Lower.value_number(payload.id) == Lower.value_number(borrow.value)
+																		and Lower.value_number(value) == Lower.value_number(payload.id) and Own.owner_number(child) == Own.owner_number(transferred)
+																		and Own.owner_number(container) == Own.owner_number(parent) and Own.owner_number(owner) == Own.owner_number(parent)
+																	)
+																_: valid = False
+														_: valid = False
+													match (none.operations, none.transfer):
+														([Own.DefineValue(empty)], Own.OwnedReturn(value, owner)):
+															match (empty.operation, empty.result):
+																(Own.StringDefinition(""), Own.OwnedResult(output)): valid = valid and Lower.value_number(empty.id) == Lower.value_number(value) and Own.owner_number(output) == Own.owner_number(owner)
+																_: valid = False
+														_: valid = False
+												_: valid = False
+										_: void
+					_: void
+			valid and leaves == 1
+
+
+func test_join_retires_intermediate_strings_after_their_consuming_calls() -> Bool:
+	match join_program():
+		Err(_): False
+		Ok(program):
+			var branches = 0
+			var valid = True
+			for function in program.functions:
+				match function.tail:
+					Own.MatchTail(matched):
+						for root_arm in matched.arms:
+							for join in nested_joins(root_arm.operations):
+								for arm in join.arms:
+									managed = arm.operations.filter(pure func(operation):
+										match operation:
+											Own.DefineValue(value): Concrete.same_type(value.value_type, Concrete.StringType)
+											Own.DropOwner(_, _): True
+											_: False
+									)
+									match (managed, arm.transfer):
+										([Own.DefineValue(left), Own.DefineValue(right), Own.DefineValue(prefix), Own.DropOwner(a, _), Own.DefineValue(result), Own.DropOwner(b, _), Own.DropOwner(c, _)], Own.OwnedReturn(value, transferred)):
+											branches = branches + 1
+											match (left.result, right.result, prefix.result, result.result):
+												(Own.OwnedResult(l), Own.OwnedResult(r), Own.OwnedResult(p), Own.OwnedResult(output)):
+													match (left.operation, right.operation, prefix.operation, result.operation):
+														(Own.CallDefinition(Concrete.UserFunction(recur_left), [_, _, _, _]), Own.CallDefinition(Concrete.UserFunction(recur_right), [_, _, _, _]), Own.CallDefinition(Concrete.UserFunction(add_left), [Own.BorrowedArgument(left_read), _]), Own.CallDefinition(Concrete.UserFunction(add_right), [Own.BorrowedArgument(prefix_read), Own.BorrowedArgument(right_read)])):
+															match (left_read.source, right_read.source, prefix_read.source):
+																(Own.OwnerBorrow(left_owner), Own.OwnerBorrow(right_owner), Own.OwnerBorrow(prefix_owner)):
+																	valid = (
+																		valid and Own.owner_number(l) == Own.owner_number(a) and Own.owner_number(r) == Own.owner_number(b) and Own.owner_number(p) == Own.owner_number(c)
+																		and Own.owner_number(output) == Own.owner_number(transferred) and Lower.value_number(value) == Lower.value_number(result.id)
+																		and Concrete.function_number(recur_left) == Concrete.function_number(recur_right) and Concrete.function_number(add_left) == Concrete.function_number(add_right)
+																		and Own.owner_number(left_owner) == Own.owner_number(l) and Lower.value_number(left_read.value) == Lower.value_number(left.id)
+																		and Own.owner_number(right_owner) == Own.owner_number(r) and Lower.value_number(right_read.value) == Lower.value_number(right.id)
+																		and Own.owner_number(prefix_owner) == Own.owner_number(p) and Lower.value_number(prefix_read.value) == Lower.value_number(prefix.id)
+																	)
+																_: valid = False
+														_: valid = False
+												_: valid = False
+										_: void
+					_: void
+			valid and branches == 1
+
+
+func test_join_result_outlives_its_temporary_list_and_separator() -> Bool:
+	match join_program():
+		Err(_): False
+		Ok(program):
+			program.functions.any(pure func(function):
+				match (function.signature.parameters, function.operations.reverse(), function.tail):
+					([], [Own.DropOwner(separator, _), Own.DropOwner(list, _), Own.DefineValue(result), ..._], Own.ReturnTail(Own.ReturnResult(Own.OwnedReturn(returned, transferred)))):
+						match (result.operation, result.result):
+							(Own.CallDefinition(Concrete.UserFunction(_), [Own.BorrowedArgument(values), Own.BorrowedArgument(between)]), Own.OwnedResult(owner)):
+								match (values.source, between.source):
+									(Own.OwnerBorrow(parent), Own.OwnerBorrow(delimiter)):
+										Own.owner_number(list) == Own.owner_number(parent) and Own.owner_number(separator) == Own.owner_number(delimiter) and Own.owner_number(owner) == Own.owner_number(transferred) and Lower.value_number(result.id) == Lower.value_number(returned)
+									_: False
+							_: False
+					_: False
+			)
+
+
+func test_verifier_rejects_retiring_the_public_join_result_before_return() -> Bool:
+	match join_program():
+		Err(_): False
+		Ok(program):
+			match verify(program):
+				Err(_): False
+				Ok(_):
+					program.functions.any(pure func(function):
+						match (function.signature.parameters, function.operations.reverse(), function.tail):
+							([Concrete.ListType(Concrete.StringType), Concrete.StringType], [Own.DefineValue(result), ..._], Own.ReturnTail(Own.ReturnResult(Own.OwnedReturn(_, owner)))):
+								fault = {function | operations = function.operations.append(Own.DropOwner(owner, result.span))}
+								functions = program.functions.map(pure func(row):
+									match row.signature.parameters:
+										[Concrete.ListType(Concrete.StringType), Concrete.StringType]: fault
+										_: row
+								)
+								broken = {program | functions = functions}
+								match verify(broken):
+									Err(error):
+										error.message == "ownership verification failed: return refers to discharged owner " + IntOps.to_string(Own.owner_number(owner)) and same_span(error.span, result.span) and error.help == "report this compiler error with the input program" and error.note.is_none()
+									Ok(_): False
+							_: False
+					)
+
+
+tests: TestSuite = {
+	description = "Blorp 2 target List String join ownership",
+	tests = [
+		("List join leaf acquires before dropping its Option parent", test_join_leaf_acquires_before_optional_parent_release),
+		("List join retires intermediate Strings after their consuming calls", test_join_retires_intermediate_strings_after_their_consuming_calls),
+		("List join result outlives temporary List and separator", test_join_result_outlives_its_temporary_list_and_separator),
+		("independent verifier rejects retiring the public join result before return", test_verifier_rejects_retiring_the_public_join_result_before_return),
+	]
+}
