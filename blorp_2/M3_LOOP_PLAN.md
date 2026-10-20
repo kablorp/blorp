@@ -22,8 +22,10 @@ them, infer their outcomes or relabel any failure.
 The ordinary producer uses the existing general Join route. The final scalar checkpoint then
 retires the legacy Lower/Own/Verify/Emit tail products in favor of one runtime Loop. These are
 one coherent producer-to-consumer convergence; the fact that ordinary preparation can run
-separately does not establish its independent acceptance. No general-join optimization,
-string-only optimization, legacy fallback or alternate runtime path is authorized here.
+separately does not establish its independent acceptance. General-join optimization remains
+forbidden unless the prospective append_join exception below receives independent review
+and explicit root approval. No string-only optimization, legacy fallback or alternate
+runtime path is authorized here.
 Checked/concrete annotation products remain; Specialize admits unmanaged scalar TCO once, and
 Lower erases the marker into the common runtime Loop. Source while and managed TCO/header
 eligibility remain deferred.
@@ -76,6 +78,54 @@ callables, pure Void and scalar constants, and pass its own complete component/n
 combined pass is not yet established; current partial gates or old standalone receipts cannot
 stand in for either boundary. Root integrates only after exact functional, mutation, cost and
 independent code-reviewer/test-runner closure.
+
+## Prospective append_join fragment assembly exception — UNAPPLIED
+
+This amendment proposes one independently reviewed SOURCE pilot in Emit.append_join.
+It grants no implementation or compiled run until root approves this amendment and
+an exact bounded dispatch. This is the sole proposed exception to the general-join
+optimization prohibition: local List[String] fragments, using the existing append_cases
+and append_ownership_operations precedent, with unchanged IR/API/validation and exact C.
+No other emitter path, join optimization, new helper/model or second optimization is
+included. Commit the reviewed plan separately before a later implementation slice.
+
+Measured current-C0 direct65 whole TARGET allocations remain80,472 ->85,335 (+6.043096%),
+failing both83,000 and SOURCE+3%. Prior ordinary-only80,472 ->84,943 (+5.556%) remains
+FAIL. The matched public-phase diagnostic observed Emit7,145 ->8,756 (+1,611), Own+1,021,
+Verify+1,024, Lower+641, Specialize+506 and Check+60. Those are host TestSuite intervals,
+not an EXIT_TOTAL partition, instructions or acceptance. Source proof remains the same
+original accepted B ea881c84d0df9df04a6ec5c4406a3b69cf406735 with all original limits.
+
+The exact initial preview changes only append_join:13 physical additions/11 deletions
+(+2). Complete production becomes1,127/841/+286 under1,150/+350, leaving23gross/64net;
+no allowance is reset or borrowed. Current tests3,415/2,778/+637 and fixtures remain
+unchanged. No compressed formatting or removed coverage funds this pilot. Every later
+revision requires a fresh complete physical ledger before writes.
+
+Keep declaration order, union-layout check, all carried arity/origin checks, arm order,
+operation emission and managed aliases at their current first-error positions. The
+whole join result assembles once from fragments; each SwitchCase ending is assembled
+once at its existing String publication boundary. append_cases' existing internal join
+remains unchanged. No repeated collapse occurs while collecting pieces. List buffers
+are local to one join or arm; no retained compiler-data lifetime changes are claimed.
+
+First reuse current-C0 raw public-phase observation once; run only candidate C1's same
+seven-phase driver under archived974/originalSTD91 with the same source-active/input/
+library/output/CWD paths, exact C18e and all other phases unchanged. Stop on any counter,
+identity, error-priority or pin failure, or Emit>=8,756. A lower Emit count is only a pilot
+signal. Require exact old/new C for direct65 and existing managed, carried, Void and
+nested join controls, plus owning emitter/ownership/negative diagnostics and restored
+fault controls. No C normalization, expected-text update, alternate main or extra fixture.
+
+After a measured pilot signal, root must separately authorize matched whole C1 setup and
+strict direct65 remeasurement against unchanged B. Report actual allocation A and
+remaining max(0,A-82,886) SOURCE deficit plus max(0,A-83,000) absolute deficit before
+considering other work. Do not subtract phase savings to declare whole-process gates
+passed. Recovering only the added1,611 Emit allocations cannot close today's2,449 SOURCE
+deficit. Further optimization/rescope requires a separate reviewed decision; this pilot
+is not assumed to solve it. Normal min3, original construction proxy, all11 unchanged
+owned inputs/absolute caps,992 identity calls (496 pairs), native/strict/sanitizer/fault closure and
+later accepted-main composition remain required. No baseline/cap roll or prep-only landing.
 
 ## Historical planning status and dependencies
 
