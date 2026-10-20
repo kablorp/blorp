@@ -1,8 +1,12 @@
 # Propagate the loader's current-directory failure
 
-Status: bounded source plan; no CWD source migration, execution or cost acceptance
-is claimed. Root publishes the reviewed plan before separately granting code and
-compiled work. This slice changes no host/system primitive or target library API.
+Status: implemented and validated. Focused regressions, three effective
+fault/restored pairs, the 48-call acceptance campaign and fixed-B SOURCE costs pass.
+See the [acceptance report](../benchmarks/results/blorp_2_current_directory_2026-10-20.md).
+No host/system primitive or target library API changed.
+
+The remainder is the historical frozen plan; its planning identities and
+unapplied-preview wording describe the pre-implementation proposal.
 
 ## Source identity, ownership and scope
 
