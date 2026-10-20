@@ -225,33 +225,33 @@ Creation is not execution, and no new dependency graph framework is proposed.
 
 | Slice | Production ADD / net stop | Nonfixture tests ADD / net stop |
 | --- | ---: | ---: |
-| 1: noncapture inline + bounded blocks, full direct path | 900 / +700 | 700 / +700 |
+| 1: noncapture inline + bounded blocks, full direct path | 1,000 / +750 | 1,100 / +1,050 |
 | 2: immutable envs, forwarding, nesting and ordinal map | 825 / +650 | 950 / +950 |
 | Combined | 1,525 / +1,200 | 1,650 / +1,650 |
 
 These are hard implementation stops for the separately reviewed slices.
-The noncapturing production allowance was revised after an early checkpoint of
-401 additions / 97 deletions. Two code audits found necessary body identities
-and global row threading, with no large duplicate architecture. Required caller
-inference scheduling and completion were underestimated: complete scope is about
-806 additions / +610 net, with a plausible 760–865 range. Reassess at 765 gross
-or 595 net before further production; these are 85% of the revised phase stops.
-Phase maxima are not reserved or additive allowances: combined 1,525 / +1,200
-remains independently binding. At the 806 / +610 point, 719 / +590 remains.
-Captures forecast 565–745 / +430–580, so upper gross exceeds that remainder by
-26; complete fit is unproven. Before capture implementation, reforecast its
-complete path against the actual accepted noncapturing ledger, using the same
-physical-diff accounting boundary and accounting true overlap once. Stop if
-either the capture phase cap or remaining combined gross/net cannot fit. No
-automatic transfer, cap increase, scope reduction, coverage cut, compression or
-new solver is allowed. Mandatory test ports add 39 lines and remove 27 across
-six owners, preserving 19 callbacks; complete tests forecast 670, below 700.
+The noncapture checkpoint is 884 additions / 250 deletions / +634 net.
+Necessary current-model adaptation forecasts another 40–94 additions / +20–64:
+complete production 924–978 / +654–698 does not fit the former 900 gross stop.
+Reassess at 850 gross or 637.5 net; the gross point is crossed. Review the
+complete remaining path before any write; this amendment grants no implementation.
+Combined 1,525 / +1,200 remains independently binding, not an additive reserve.
+At forecast upper 978 / +698, 547 / +502 remains. Capture forecast 565–745 /
++430–580 does not fit that gross remainder; capture implementation is ungranted.
+Reforecast captures against actual accepted noncapture, accounting overlap once.
+No automatic transfer, coverage cut, compression or new solver is allowed.
+Retain coverage03 tests: 934 additions / 68 deletions / +866 net. Integration
+regressions/ports forecast 106–132 additions, with no deletion credit: complete
+nonfixture tests 1,040–1,066 / +972–998. Approved on 2026-10-20, the revised
+1,100 / +1,050 supersedes the earlier 934 / +866 test-only approval. Both phases
+have 52 net lines above upper forecast; reforecast the complete path before writing.
+All 24 invariants, 17 missing-witness contracts and integration regressions remain.
 Original M7 B, 8% hard / 6% reassessment, fixture/API/report caps and all other
 acceptance obligations remain fixed. LOC feasibility does not imply cost acceptance.
 At 85% of either gross/net slice stop, review actual remaining work before more
-implementation. Owner forecast remains model/scope/errors/render180–240,
-expressions/inference420–520, bodies/publication180–240, recursion40–70,
-Specialize320–420, Lower20–35; Own/Verify/Emit production zero expected.
+implementation. The complete remaining-work forecast is context4–10,
+condition/if/while18–38, Result12–26, walkers2–6, Specialize4–14 additions;
+Lower/Own/Verify/Emit production zero. These are forecasts, not measured changes.
 All mechanical constructor/observer ports count. No compression/deleted coverage.
 Fixtures are separate: at most three/150 physical lines combined, not charged
 again to nonfixture tests. Active API/reference docs <=100 additions, retained
