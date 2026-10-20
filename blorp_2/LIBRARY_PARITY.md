@@ -17,9 +17,12 @@ The
 govern the independent Char/source work. The owner stopped the remaining
 callback-removal migration. The current [Option/Result catalog](OPTION_RESULT_PLAN.md)
 supersedes those rows/counts: nine pure APIs at 212 resolved compiler sites,
-including four callback helpers. The five ordinary helpers are implemented
-in the target library; the four callback helpers and callable prerequisites
-remain pending.
+including four callback helpers. All nine library definitions are implemented;
+`option.map`, `result.map`, `map_err` and `and_then` accept pure named callbacks
+and forwarding. [Their API contracts](standard_library/README.md) preserve the
+base union identities and bypass ownership. M7 lambdas/captures and explicit
+compiler-source operation imports remain pending; library definitions alone do
+not complete the compiler consumers or M6.
 Int target-status rows now reflect signed ordering and scalar constants; source
 counts remain historical. The target also supplies ordinary `max(Int, Int) -> Int`.
 Refresh other interfaces at their own implementation boundary.

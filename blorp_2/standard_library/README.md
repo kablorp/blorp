@@ -94,11 +94,29 @@ Bool, Option and Result are ordinary fixed unions owned by `_base.brp`; user
 modules receive their types and constructors through the prelude. A separate
 Bool operation module remains deferred. Option and Result operations use explicit
 named imports. `option.brp` provides
-`is_some`, `is_none`, eager `get_or` and eager `to_result`; `result.brp` provides
-`is_ok`. They are ordinary generic pure functions over the existing base unions;
-managed results remain independently owned. The prelude supplies no operations
-from these two modules. The [resolved catalog and addition plan](../OPTION_RESULT_PLAN.md)
-tracks four remaining helpers that require callable semantics. The String adapter
+`is_some`, `is_none`, eager `get_or`, eager `to_result` and `map`; `result.brp`
+provides `is_ok`, `map`, `map_err` and `and_then`. These are ordinary generic pure
+functions over the existing base unions. The prelude supplies no operations
+from these two modules. Import them by name or through a module alias.
+
+The four callback signatures keep their type parameters independent:
+
+```blorp
+pure func map[T, U](self: Option[T], callback: pure (T) -> U) -> Option[U]
+pure func map[T, U, E](self: Result[T, E], callback: pure (T) -> U) -> Result[U, E]
+pure func map_err[T, E, F](self: Result[T, E], callback: pure (E) -> F) -> Result[T, F]
+pure func and_then[T, U, E](self: Result[T, E], callback: pure (T) -> Result[U, E]) -> Result[U, E]
+```
+
+Pass a pure named function or forward a callable parameter. Option.map invokes
+it once for Some; Result.map and and_then once for Ok; map_err once for Err.
+The other branch preserves its variant and payload without invoking the callback.
+Data arguments evaluate eagerly. Inputs are borrowed and returned managed values
+remain independently owned, including bypass payloads. Void payloads are supported.
+Lambdas/captures and explicit compiler-source operation imports remain separate
+work in the [catalog and addition plan](../OPTION_RESULT_PLAN.md).
+
+The String adapter
 exposes strict counted-byte `parse_int`, `parse_float` and `equals` operations.
 Their builtin bodies name only the operation; results refer to the
 foundation's designated Bool and Option, found by name in `_base.brp`, and

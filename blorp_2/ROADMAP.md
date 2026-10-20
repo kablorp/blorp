@@ -801,9 +801,10 @@ is implemented over accepted formatting and concat. Its fixtures preserve signed
 extrema, UTF-8/NUL bytes and aliases; self-compilation remains a separate gate.
 
 The current [Option/Result catalog and addition plan](OPTION_RESULT_PLAN.md)
-records nine APIs at 212 compiler sites. The five ordinary helpers are
-implemented; pure callable semantics with managed captures, four callback helpers
-and explicit compiler-source imports remain pending. The prelude stays unchanged.
+retains the historical nine-API inventory. All nine library definitions are
+implemented, including four [named-callback helpers](standard_library/README.md).
+M7 lambdas/captures and explicit compiler-source operation imports remain pending.
+This library increment does not close those consumers. The prelude stays unchanged.
 The superseded five-helper proposal is recoverable from Git.
 
 The [loader/shell integration draft](LOADER_SHELL_INTEGRATION_PLAN.md) maps actual

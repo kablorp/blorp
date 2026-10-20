@@ -2,6 +2,16 @@
 
 ## Status and scope
 
+The four ordinary target-library helpers are implemented and validated. Focused
+98/components 3,644/native 1,153 checks, two semantic faults/restorations and all
+36 original target-cost calls are complete. On 2026-10-20 the human approved the
+three bounded exceptions below. Retained measurements pass that approved contract;
+the three original 3% FAILs remain unchanged in the record. Historical finite
+leases below are provenance, not authority to repeat samples.
+See the [validation and resource report](../benchmarks/results/blorp_2_option_result_callbacks_2026-10-20.md).
+The remainder retains the original catalog/plan and historical frontier evidence;
+no compiler-source migration, M7 completion or self-compilation is claimed.
+
 The target library is `blorp_2/standard_library/`, separate from the host
 `standard_library/src/`. Its `_base.brp` already owns Bool, Option, Result and
 their constructors. The operation modules `option.brp` and `result.brp` are
@@ -345,7 +355,20 @@ func main() -> Int:
 ```
 No larger substitute, dropped control or cherry-picking after a breach.
 Each target control independently requires C<=1.03B allocations and normal min3
-instructions; all old absolutes/strict0 remain binding.
+instructions, except only the following criteria approved by the human on
+2026-10-20. B is the retained original control observation; use the smaller bound:
+
+| Original control/metric | Approved relative bound | Approved additive bound |
+| --- | --- | --- |
+| option-min allocations | C<=1.06B | C<=B+850 |
+| result-min allocations | C<=1.225B | C<=B+3000 |
+| result-min normal min3 instructions | C<=1.10B | C<=B+4200000 |
+
+Integer ceilings are floor(min(bounds)). Every old absolute/strict0 and every
+other control/metric retains its original limit. Original 3% FAILs remain in the
+record. Approved integer ceilings are 15120/16111/45785307 respectively; retained
+measurements are 15078/16038/45555094. No new samples or current native-cap changes
+are authorized. Every other 3% criterion and every old absolute stays binding.
 Shared C/status/diagnostics/output states stay byte-exact; normal/strict agree per role.
 This target-library-only slice leaves all41 compiler sources and HOSTSTD91
 byte-identical. Retain original34ac/be31, STD090ed68c and verified598 provenance;

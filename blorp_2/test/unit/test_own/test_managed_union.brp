@@ -14,7 +14,8 @@ import:
 	../../../src/load/load: load_program
 	../../../src/check/check: check
 	../input: setup_diagnostic
-	system: read_file
+	system: read_file, temp_dir, write_file
+	fs: temporary_directory, resource_path, message
 	test: TestSuite
 
 
@@ -93,6 +94,85 @@ func test_library_helpers_acquire_selected_values_and_leave_predicate_inputs_bor
 						)
 					_: void
 			passed and selected == 2 and predicates == 3
+
+
+private pure func callback_arm_transfers(arm: Own.OwnedArm, input: Lower.ValueId) -> Bool:
+	match (arm.operations, arm.exit):
+		([Own.DefineValue(payload), Own.DefineValue(call), Own.AcquireOwner(acquired, borrow, _), Own.DefineValue(result), Own.DropOwner(dropped, _)], Own.ReturnResult(Own.OwnedReturn(returned, parent))):
+			match (
+				(payload.operation, payload.result, call.operation),
+				(call.result, result.operation, result.result)
+			):
+				(
+					(Own.PayloadDefinition(_, source), Own.BorrowedResult(Own.PayloadBorrow(immediate)), Own.CallDefinition(Concrete.UserFunction(_), [Own.BorrowedArgument(argument)])),
+					(Own.OwnedResult(child), Own.ConstructDefinition(_, [Own.OwnedPayload(value, transferred)]), Own.OwnedResult(owner))
+				):
+					match (argument.source, borrow.source):
+						(Own.PayloadBorrow(borrowed_parent), Own.OwnerBorrow(backing)):
+							(
+								same_value(source, input) and same_value(immediate, input) and same_value(borrowed_parent, input)
+								and same_value(argument.value, payload.id) and same_value(value, call.id)
+								and same_value(borrow.value, call.id) and same_owner(backing, child) and same_owner(dropped, child)
+								and same_owner(acquired, transferred) and not same_owner(child, acquired)
+								and not same_owner(child, owner) and not same_owner(acquired, owner)
+								and same_value(returned, result.id) and same_owner(parent, owner)
+							)
+						_: False
+				_: False
+		_: False
+
+
+private func library_callback_ownership() -> Result[Bool, String]:
+	with directory ?= temporary_directory(temp_dir(), "blorp-2-callback-ownership-") on error => message(error):
+		source: String =
+			|import:
+			|    result as Results
+			|pure func identity[T](value: T) -> T:
+			|    value
+			|func main() -> Int:
+			|    argument: Result[String, String] = Err("bypass")
+			|    unused = Results.map(argument, identity)
+			|    0
+			|
+		path = directory.resource_path() + "/main.brp"
+		written ?= write_file(path, source)
+		loaded ?= load_program(path, "blorp_2/standard_library").map_err(func(failure): failure.diagnostic.message)
+		checked ?= check(loaded.program).map_err(pure func(failure): setup_diagnostic(failure).message)
+		concrete ?= Concrete.specialize(checked).map_err(pure func(error): error.message)
+		lowered ?= Lower.lower(concrete).map_err(pure func(error): error.message)
+		program ?= Own.own(lowered).map_err(pure func(error): error.message)
+		main ?= program.functions.get(Concrete.function_number(entry_function(program.entrypoint))).to_result("missing main")
+		calls = main.operations.filter(pure func(operation):
+			match operation:
+				Own.DefineValue(value):
+					match value.operation:
+						Own.CallDefinition(Concrete.UserFunction(_), _): True
+						_: False
+				_: False
+		)
+		match calls:
+			[Own.DefineValue(call)]:
+				match call.operation:
+					Own.CallDefinition(Concrete.UserFunction(target), _):
+						function ?= program.functions.get(Concrete.function_number(target)).to_result("missing map instance")
+						match (function.signature.parameters, function.signature.return_type, function.operations, function.tail):
+							([Concrete.UnionType(input)], Concrete.UnionType(output), [Own.DefineValue(parameter)], Own.MatchTail(matched)):
+								match (parameter.operation, parameter.result, matched.arms):
+									(Own.ParameterDefinition(0), Own.BorrowedResult(Own.ParameterBorrow(borrowed)), [selected, bypassed]):
+										Ok(
+											Concrete.union_number(input) == Concrete.union_number(output) and Concrete.union_number(matched.owner) == Concrete.union_number(input)
+											and same_value(parameter.id, borrowed) and parameter_scrutinee(matched.scrutinee, parameter.id)
+											and callback_arm_transfers(selected, parameter.id)
+											and helper_arm_acquires(bypassed, Own.PayloadBorrow(parameter.id), True)
+										)
+									_: Ok(False)
+							_: Ok(False)
+					_: Ok(False)
+			_: Ok(False)
+
+
+func test_library_callback_borrows_input_and_transfers_selected_or_bypassed_owners() -> Bool:
+	library_callback_ownership().get_or(False)
 
 
 private FRESH_SOURCE: String =
@@ -830,6 +910,7 @@ func test_unused_constructor_retires_original_and_parent_obligations() -> Bool:
 tests: TestSuite = {
 	description = "Blorp 2 managed union ownership insertion",
 	tests = [
+		("library callback borrows input and transfers selected or bypassed owners", test_library_callback_borrows_input_and_transfers_selected_or_bypassed_owners),
 		("library helpers acquire selected values and keep predicates borrowed", test_library_helpers_acquire_selected_values_and_leave_predicate_inputs_borrowed),
 		(
 			"borrowed child acquisition transfers into the inline owner",

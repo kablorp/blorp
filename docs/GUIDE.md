@@ -39,9 +39,13 @@ conventions, including concrete generic instances; calls to impure functions
 remain forbidden. Selective union imports
 preserve ordinary nominal type and constructor identities. Base already supplies
 Bool, Option, Result and their constructors in every module. Named `option`
-imports provide generic pure `is_some`, `is_none`, `get_or` and `to_result`;
-`result: is_ok` provides the Result predicate. Defaults and error arguments are
-evaluated eagerly; selected managed payloads remain independently owned. Concrete
+imports provide generic pure `is_some`, `is_none`, `get_or`, `to_result` and `map`;
+Result imports provide `is_ok`, `map`, `map_err` and `and_then`. The four callback
+helpers accept pure named functions and forwarding, invoke once only for their
+selected variant, and preserve the other payload. Defaults and error arguments
+are eager; returned managed values remain independently owned. See the pilot's
+[API contracts](../blorp_2/standard_library/README.md). Lambdas/captures and compiler
+consumer imports remain separate work. Concrete
 `string.parse_int` consumes complete ASCII
 decimal input within Int64 bounds. Concrete `list.get` returns an owned
 Option[String], retaining a successful child independently of its list, and

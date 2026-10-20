@@ -6,7 +6,7 @@ import:
 	../../../src/check/errors as Errors
 	../../../src/lex/lex: lex
 	../../../src/specialize/specialize as Concrete
-	../../../src/utils/syntax: Diagnostic
+	../../../src/utils/syntax: Diagnostic, entry_function
 	../compilation: compile, compile_modules
 	int as IntOps
 	../input: check_failure, parse, setup_diagnostic
@@ -98,6 +98,131 @@ func test_library_helpers_specialize_payloads_and_constructor_owners() -> Bool:
 		Err(error):
 			print_error(error)
 			False
+
+
+private pure func callback_map_contract(
+	function: Concrete.ConcreteFunction,
+	callback: Concrete.FunctionInstanceId,
+	bypassed: Concrete.VariantInstanceId,
+) -> Bool:
+	match (function.signature.parameters, function.body):
+		([Concrete.UnionType(owner)], Concrete.ConcreteMatchBody(matched)):
+			parameters = function.bindings.filter(pure func(binding):
+				match binding.origin:
+					Model.ParameterBinding(_): True
+					_: False
+			)
+			parameter_positions_match = parameters.all(pure func(binding):
+				match binding.origin:
+					Model.ParameterBinding(position): position == 0
+					_: False
+			)
+			var passed = (
+				parameters.length() == 1 and function.statements.is_empty()
+				and parameter_positions_match
+				and Concrete.union_number(Concrete.variant_owner(bypassed)) == Concrete.union_number(owner)
+				and Concrete.union_number(matched.owner) == Concrete.union_number(owner)
+				and Concrete.same_type(function.signature.return_type, Concrete.UnionType(owner))
+			)
+			var selected = 0
+			var skipped = 0
+			for arm in matched.arms:
+				passed = passed and arm.statements.is_empty()
+				match (arm.pattern, arm.body):
+					(Concrete.VariantCase(tag, captures), Concrete.ReturnExpression(value)):
+						passed = passed and Concrete.union_number(Concrete.variant_owner(tag)) == Concrete.union_number(owner)
+						match (value.form, single_capture(captures)):
+							(Concrete.ConstructVariant(returned, [payload]), Some(binding)):
+								passed = passed and (
+									Concrete.union_number(Concrete.variant_owner(returned)) == Concrete.union_number(owner)
+									and Concrete.variant_number(returned) == Concrete.variant_number(tag)
+								)
+								if Concrete.variant_number(tag) == Concrete.variant_number(bypassed):
+									skipped = skipped + 1
+									valid_payload = match payload.form:
+										Concrete.ReadBinding(read): Model.binding_number(read) == Model.binding_number(binding)
+										_: False
+									passed = passed and valid_payload
+								else:
+									selected = selected + 1
+									valid_call = match payload.form:
+										Concrete.InvokeFunction(call, [argument]):
+											match (call.target, argument.form):
+												(Concrete.UserFunction(target), Concrete.ReadBinding(read)):
+													Concrete.function_number(target) == Concrete.function_number(callback) and Model.binding_number(read) == Model.binding_number(binding)
+												_: False
+										_: False
+									passed = passed and valid_call
+							_: passed = False
+					_: passed = False
+			passed and selected == 1 and skipped == 1
+		_: False
+
+
+private pure func injected_bypass_is_rejected(function: Concrete.ConcreteFunction, callback: Concrete.FunctionInstanceId, bypass: Concrete.VariantInstanceId) -> Bool:
+	match function.body:
+		Concrete.ConcreteMatchBody(matched):
+			match matched.arms:
+				[selected, skipped]:
+					match (selected.body, skipped.pattern, skipped.body):
+						(Concrete.ReturnExpression(value), Concrete.VariantCase(_, captures), Concrete.ReturnExpression(returned)):
+							match (value.form, single_capture(captures)):
+								(Concrete.ConstructVariant(_, [call]), Some(binding)):
+									match call.form:
+										Concrete.InvokeFunction(invoked, [_]):
+											argument = { call | form = Concrete.ReadBinding(binding) }
+											injected = { call | form = Concrete.InvokeFunction(invoked, [argument]) }
+											broken = { skipped | body = Concrete.ReturnExpression({ returned | form = Concrete.ConstructVariant(bypass, [injected]) }) }
+											not callback_map_contract({ function | body = Concrete.ConcreteMatchBody({ matched | arms = [selected, broken] }) }, callback, bypass)
+										_: False
+								_: False
+						_: False
+				_: False
+		_: False
+
+
+private func callback_instance(negative: Bool) -> Result[Bool, String]:
+	with directory ?= temporary_directory(temp_dir(), "blorp-2-callback-instance-") on error => message(error):
+		source: String =
+			|import:
+			|    result as Results
+			|pure func identity[T](value: T) -> T:
+			|    value
+			|func main() -> Int:
+			|    argument: Result[String, String] = Err("error")
+			|    probe = identity("probe")
+			|    mapped = Results.map(argument, identity)
+			|    0
+			|
+		path = directory.resource_path() + "/main.brp"
+		written ?= write_file(path, source)
+		loaded ?= load_program(path, "blorp_2/standard_library").map_err(func(failure): failure.diagnostic.message)
+		checked ?= check(loaded.program).map_err(pure func(failure): setup_diagnostic(failure).message)
+		concrete ?= Concrete.specialize(checked).map_err(pure func(error): error.message)
+		rows = Concrete.specialized_contents(concrete)
+		main ?= rows.functions.get(Concrete.function_number(entry_function(rows.entrypoint))).to_result("missing main")
+		match main.statements:
+			[Concrete.InitializeBinding(_, input), Concrete.InitializeBinding(_, probe), Concrete.InitializeBinding(_, mapped)]:
+				match (input.form, probe.form, mapped.form):
+					(Concrete.ConstructVariant(bypass, [_]), Concrete.InvokeFunction(probed, [_]), Concrete.InvokeFunction(called, [_])):
+						match (probed.target, called.target):
+							(Concrete.UserFunction(target), Concrete.UserFunction(helper)):
+								function ?= rows.functions.get(Concrete.function_number(helper)).to_result("missing library instance")
+								layout = rows.unions.get(Concrete.union_number(Concrete.variant_owner(bypass)))
+									.map(pure func(row): same_variant_fields(row.variants, [[Concrete.StringType], [Concrete.StringType]])).get_or(False)
+								valid = layout and callback_map_contract(function, target, bypass)
+								Ok(valid and (not negative or injected_bypass_is_rejected(function, target, bypass)))
+							_: Ok(False)
+					_: Ok(False)
+			_: Ok(False)
+
+
+func test_library_map_erases_the_callback_and_keeps_direct_identity() -> Bool:
+	callback_instance(False).get_or(False)
+
+
+func test_library_map_count_rejects_a_typed_bypass_invocation() -> Bool:
+	callback_instance(True).get_or(False)
 
 
 private pure func checked(source: String) -> Result[CheckedProgram, Diagnostic]:
@@ -689,6 +814,8 @@ tests: TestSuite = {
 	description = "Blorp 2 generic unions",
 	tests = [
 		("library helpers specialize payloads and constructor owners", test_library_helpers_specialize_payloads_and_constructor_owners),
+		("library map erases callback and preserves direct identity", test_library_map_erases_the_callback_and_keeps_direct_identity),
+		("library map call count rejects typed bypass invocation", test_library_map_count_rejects_a_typed_bypass_invocation),
 		(
 			"pattern payload uses the function owned rigid parameter",
 			test_pattern_payload_uses_the_function_owned_rigid_parameter,

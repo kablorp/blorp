@@ -2,20 +2,107 @@ import:
 	../../../src/utils/names: program_names, name_spelling
 	../../../src/check/model as Model
 	../../../src/utils/source: module_source, root_module_id, same_module, same_source
-	../../../src/utils/ids: inventory_functions, function_number
+	../../../src/utils/ids: inventory_functions, function_number, VariantId
 	../../../src/load/load: load_program
 	../../../src/parse/assemble: parsed_contents
 	../../../src/check/check: CheckedProgram, check, checked_functions, check_errors
-	../../../src/check/render: render_check_error
 	../../../src/check/errors as Errors
+	../../../src/check/render: render_check_error
 	../../../src/lex/lex: lex
-	../../../src/utils/syntax: Diagnostic, entry_function, Purity(Pure), same_purity
+	../../../src/utils/syntax: Diagnostic, entry_function, Purity(Pure), same_purity, same_span
 	../compilation: compile, compile_modules
 	../input: check_failure, parse, setup_diagnostic, check_modules_failure, singleton_check_error
 	../module_input: PRIMITIVE_BASE, INTEGER_OPERATIONS, STRING_OPERATIONS, ModuleInput
 	../../e2e/harness: with_directory
-	system: write_file
+	fs: temporary_directory, resource_path, message
+	system: temp_dir, write_file
 	test: TestSuite
+
+
+private pure func callback_contract(
+	function: Model.CheckedFunction,
+	input: Model.TypeRef,
+	argument: Model.TypeRef,
+	result: Model.TypeRef,
+	returned: Model.TypeRef,
+	selected: VariantId,
+	bypassed: VariantId,
+) -> Bool:
+	signature = match function.signature.parameters:
+		[value, callback]:
+			(
+				Model.same_type(value.value_type, input)
+				and Model.same_type(callback.value_type, Model.PureCallableType([argument], result))
+				and Model.same_type(function.signature.return_type.value_type, returned)
+			)
+		_: False
+	rigid = function.signature.type_parameters.all(pure func(parameter):
+		match Model.parameter_owner(parameter):
+			Model.FunctionDeclaration(owner): function_number(owner) == function_number(function.id)
+			_: False
+	)
+	match function.body:
+		Model.CheckedMatchBody(matched):
+			var selected_count = 0
+			var bypass_count = 0
+			var passed = signature and rigid and function.statements.is_empty()
+			for arm in matched.arms:
+				calls = Model.function_calls({ function | statements = arm.statements, body = Model.CheckedValueBody(arm.body) })
+				match arm.pattern:
+					Model.VariantCase(variant, _):
+						if Model.same_variant(variant, selected):
+							selected_count = selected_count + 1
+							valid_call = match calls:
+								[call]:
+									match call.target:
+										Model.CallableParameter(parameter): Model.same_callable_parameter(parameter, Model.callable_parameter(function.id, 1))
+										_: False
+								_: False
+							passed = passed and valid_call
+						else:
+							bypass_count = bypass_count + 1
+							passed = passed and Model.same_variant(variant, bypassed) and calls.is_empty()
+					_: passed = False
+			passed and selected_count == 1 and bypass_count == 1 and Model.function_calls(function).length() == 1
+		_: False
+
+
+private pure func callback_helpers(
+	optional: Model.CheckedFunction,
+	mapped: Model.CheckedFunction,
+	errors: Model.CheckedFunction,
+	chained: Model.CheckedFunction,
+	option_owner: Model.CheckedUnion,
+	result_owner: Model.CheckedUnion,
+) -> Bool:
+	match (
+		(optional.signature.type_parameters, mapped.signature.type_parameters, errors.signature.type_parameters),
+		(chained.signature.type_parameters, option_owner.variants, result_owner.variants)
+	):
+		(([a, b], [c, d, e], [f, g, h]), ([i, j, k], [some, none], [ok, error])):
+			(
+				not Model.same_parameter(a, b) and not Model.same_parameter(c, d) and not Model.same_parameter(d, e) and not Model.same_parameter(c, e)
+				and not Model.same_parameter(f, g) and not Model.same_parameter(g, h) and not Model.same_parameter(f, h)
+				and not Model.same_parameter(i, j) and not Model.same_parameter(j, k) and not Model.same_parameter(i, k)
+				and callback_contract(optional,
+					Model.AppliedUnionType(option_owner.id, [Model.ParameterType(a)]), Model.ParameterType(a), Model.ParameterType(b),
+					Model.AppliedUnionType(option_owner.id, [Model.ParameterType(b)]), some.id, none.id,
+				)
+				and callback_contract(mapped,
+					Model.AppliedUnionType(result_owner.id, [Model.ParameterType(c), Model.ParameterType(e)]), Model.ParameterType(c), Model.ParameterType(d),
+					Model.AppliedUnionType(result_owner.id, [Model.ParameterType(d), Model.ParameterType(e)]), ok.id, error.id,
+				)
+				and callback_contract(errors,
+					Model.AppliedUnionType(result_owner.id, [Model.ParameterType(f), Model.ParameterType(g)]), Model.ParameterType(g), Model.ParameterType(h),
+					Model.AppliedUnionType(result_owner.id, [Model.ParameterType(f), Model.ParameterType(h)]), error.id, ok.id,
+				)
+				and callback_contract(chained,
+					Model.AppliedUnionType(result_owner.id, [Model.ParameterType(i), Model.ParameterType(k)]), Model.ParameterType(i),
+					Model.AppliedUnionType(result_owner.id, [Model.ParameterType(j), Model.ParameterType(k)]),
+					Model.AppliedUnionType(result_owner.id, [Model.ParameterType(j), Model.ParameterType(k)]), ok.id, error.id,
+				)
+			)
+		_: False
 
 
 func test_library_helpers_preserve_foundation_owners_and_function_rigidity() -> Bool:
@@ -32,7 +119,7 @@ func test_library_helpers_preserve_foundation_owners_and_function_rigidity() -> 
 							)
 							functions = checked_functions(checked).functions
 							match ids.map(pure func(row): functions.get(function_number(row.id))):
-								[Some(some), Some(none), Some(unwrap), Some(convert), Some(ok)]:
+								[Some(some), Some(none), Some(unwrap), Some(convert), Some(optional_map), Some(ok), Some(result_map), Some(error_map), Some(chained)]:
 									match (unwrap.signature.type_parameters, convert.signature.type_parameters, unwrap.signature.parameters, convert.signature.parameters):
 										([t], [value, error], [optional_value, default], [converted_value, failure]):
 											match (Model.parameter_owner(t), Model.parameter_owner(value), Model.parameter_owner(error)):
@@ -48,7 +135,8 @@ func test_library_helpers_preserve_foundation_owners_and_function_rigidity() -> 
 														and Model.same_type(failure.value_type, Model.ParameterType(error))
 														and Model.same_type(convert.signature.return_type.value_type, Model.AppliedUnionType(result_owner.id, [Model.ParameterType(value), Model.ParameterType(error)]))
 														and [some, none, ok].all(pure func(f): Model.same_type(f.signature.return_type.value_type, Model.UnionType(boolean.id)))
-													and [some, none, unwrap, convert, ok].all(pure func(f): same_purity(f.signature.purity, Pure))
+														and [some, none, unwrap, convert, optional_map, ok, result_map, error_map, chained].all(pure func(f): same_purity(f.signature.purity, Pure))
+														and callback_helpers(optional_map, result_map, error_map, chained, option_owner, result_owner)
 														and functions.get(function_number(entry_function(checked_functions(checked).entrypoint))).map(pure func(main):
 															[unwrap, ok].all(pure func(target):
 																expected = if function_number(target.id) == function_number(unwrap.id):
@@ -68,6 +156,91 @@ func test_library_helpers_preserve_foundation_owners_and_function_rigidity() -> 
 								_: False
 						_: False
 				_: False
+
+
+private CALLBACK_ERRORS: String =
+	|import:
+	|    option: map
+	|    result as Results
+	|pure func wrong_input(value: String) -> Int:
+	|    0
+	|pure func wrong_error(value: Int) -> Result[Int, Int]:
+	|    Err(0)
+	|func impure(value: Int) -> Int:
+	|    value
+	|pure func identity(value: Int) -> Int:
+	|    value
+	|fixed union Foreign:
+	|    ForeignSome(Int)
+	|    ForeignNone
+	|func main() -> Int:
+	|    optional: Option[Int] = Some(7)
+	|    result: Result[Int, String] = Ok(7)
+	|    unrelated: Foreign = ForeignSome(7)
+	|    unused =
+
+
+private func rejects_library_callback(before: String, marked: String, after: String, message_text: String, help: String, accepts: pure (Errors.CheckErrorKind) -> Bool) -> Result[Bool, String]:
+	with directory ?= temporary_directory(temp_dir(), "blorp-2-callback-diagnostic-") on error => message(error):
+		prefix = CALLBACK_ERRORS + " " + before
+		path = directory.resource_path() + "/main.brp"
+		written ?= write_file(path, prefix + marked + after + "\n    0\n")
+		loaded ?= load_program(path, "blorp_2/standard_library").map_err(func(failure): failure.diagnostic.message)
+		match check(loaded.program):
+			Ok(_): Ok(False)
+			Err(failure):
+				match singleton_check_error(check_errors(failure)):
+					None: Ok(False)
+					Some(error):
+						diagnostic = render_check_error(loaded.program, error)
+						Ok(
+							accepts(error.kind) and same_source(error.span.source, module_source(root_module_id()))
+							and error.span.start == prefix.length() and error.span.end == prefix.length() + marked.length()
+							and same_span(diagnostic.span, error.span) and diagnostic.note.is_none()
+							and diagnostic.message == message_text and diagnostic.help == help
+						)
+
+
+func test_library_callback_rejects_impurity() -> Bool:
+	rejects_library_callback("map(optional, ", "impure", ")", "pure callback requires a pure function", "pass a pure named function; impure functions cannot satisfy a pure callable parameter", pure func(kind):
+		match kind:
+			Errors.CallRejection(Errors.ImpureCallback(_)): True
+			_: False
+	).get_or(False)
+
+
+func test_library_callback_rejects_wrong_input() -> Bool:
+	rejects_library_callback("map(optional, ", "wrong_input", ")", "argument type does not match the parameter type", "use an expression of type pure (Int) -> U here", pure func(kind):
+		match kind:
+			Errors.CallRejection(Errors.GenericArgumentConflict(conflict)):
+				match (conflict.mismatch.expected, conflict.mismatch.actual.value_type):
+					(Model.PureCallableType([Model.IntType], Model.ParameterType(_)), Model.PureCallableType([Model.StringType], Model.IntType)): True
+					_: False
+			_: False
+	).get_or(False)
+
+
+func test_library_chain_rejects_wrong_result_error() -> Bool:
+	rejects_library_callback("Results.and_then(result, ", "wrong_error", ")", "argument type does not match the parameter type", "use an expression of type pure (Int) -> Result[Int, String] here", pure func(kind):
+		match kind:
+			Errors.CallRejection(Errors.GenericArgumentConflict(conflict)):
+				match (conflict.mismatch.expected, conflict.mismatch.actual.value_type):
+					(Model.PureCallableType([Model.IntType], Model.AppliedUnionType(owner, [Model.IntType, Model.StringType])), Model.PureCallableType([Model.IntType], Model.AppliedUnionType(other, [Model.IntType, Model.IntType]))):
+						Model.same_type(Model.UnionType(owner), Model.UnionType(other))
+					_: False
+			_: False
+	).get_or(False)
+
+
+func test_library_map_rejects_a_same_shaped_foreign_union() -> Bool:
+	rejects_library_callback("map(", "unrelated", ", identity)", "argument type does not match the parameter type", "use an expression of type Option[Int] here", pure func(kind):
+		match kind:
+			Errors.CallRejection(Errors.ArgumentTypeMismatch(mismatch)):
+				match (mismatch.expected, mismatch.actual.value_type):
+					(Model.AppliedUnionType(_, [Model.IntType]), Model.UnionType(_)): not Model.same_type(mismatch.expected, mismatch.actual.value_type)
+					_: False
+			_: False
+	).get_or(False)
 
 
 private IDENTITY: String =
@@ -814,6 +987,10 @@ tests: TestSuite = {
 		("membership comparator input matches the actual element", test_contains_with_rejects_a_comparator_for_another_element_type),
 		("membership comparator returns Bool", test_contains_with_requires_a_boolean_comparator_result),
 		("membership comparator must be pure", test_contains_with_rejects_an_impure_comparator),
+		("library callback rejects impurity with exact diagnostic", test_library_callback_rejects_impurity),
+		("library callback rejects wrong input with exact diagnostic", test_library_callback_rejects_wrong_input),
+		("library chain rejects wrong Result error with exact diagnostic", test_library_chain_rejects_wrong_result_error),
+		("library map rejects same shaped foreign union", test_library_map_rejects_a_same_shaped_foreign_union),
 		("library helpers preserve foundation owners and function rigidity", test_library_helpers_preserve_foundation_owners_and_function_rigidity),
 		("ufcs payload constructor without context still rejects", test_ufcs_payload_constructor_without_context_still_rejects),
 		("direct payload constructor without context still rejects", test_direct_payload_constructor_without_context_still_rejects),

@@ -1,6 +1,8 @@
 import:
 	../../../src/utils/names: program_names
 	../../../src/check/model as Checked
+	../../../src/check/check as CheckStage
+	../../../src/load/load: load_program
 	../../../src/utils/source: module_source, root_module_id
 	../../../src/emit/emit: emit
 	../../../src/lex/lex: lex
@@ -586,9 +588,59 @@ pure func test_opaque_parameter_return_requires_its_acquisition() -> Bool:
 				_: False
 
 
+private func owned_library_callbacks() -> Result[Own.OwnershipProgram, Diagnostic]:
+	loaded ?= load_program("blorp_2/test/e2e/fixtures/generic/managed/option_result_callbacks.brp", "blorp_2/standard_library").map_err(func(failure): failure.diagnostic)
+	checked ?= CheckStage.check(loaded.program).map_err(setup_diagnostic)
+	concrete ?= Concrete.specialize(checked)
+	lowered ?= Lower.lower(concrete)
+	Own.own(lowered)
+
+
+private func callback_return_ownership(remove_acquisition: Bool) -> Bool:
+	match owned_library_callbacks():
+		Err(_): False
+		Ok(program):
+			var found = 0
+			var passed = verify(program).is_ok()
+			for (index, function) in program.functions.enumerate():
+				match (function.signature.parameters, function.signature.return_type, function.operations, function.tail):
+					([Concrete.StringType], Concrete.StringType, [Own.DefineValue(parameter), Own.AcquireOwner(owner, borrow, _)], Own.ReturnTail(Own.ReturnResult(Own.OwnedReturn(value, transferred)))):
+						found = found + 1
+						passed = passed and (
+							borrowed_result(parameter.result) and Lower.value_number(value) == Lower.value_number(parameter.id)
+							and Own.owner_number(owner) == Own.owner_number(transferred)
+							and Lower.value_number(borrow.value) == Lower.value_number(parameter.id)
+							and parameter_borrow(borrow)
+						)
+						if remove_acquisition:
+							broken = { function | operations = [Own.DefineValue(parameter)] }
+							corrupted = { program | functions = program.functions.set(index, broken) }
+							rejected = match verify(corrupted):
+								Err(error):
+									(
+										error.message == "ownership verification failed: owner " + Own.owner_number(owner).to_string() + " is not defined"
+										and error.help == "report this compiler error with the input program"
+										and error.note.is_none() and same_span(error.span, parameter.span)
+									)
+								Ok(_): False
+							passed = passed and rejected
+					_: void
+			passed and found == 1
+
+
+func test_callback_library_return_acquires_an_independent_owner() -> Bool:
+	callback_return_ownership(False)
+
+
+func test_verifier_rejects_callback_library_return_without_acquisition() -> Bool:
+	callback_return_ownership(True)
+
+
 tests: TestSuite = {
 	description = "Blorp 2 generic concrete ownership boundaries",
 	tests = [
+		("callback library returns an independently acquired String owner", test_callback_library_return_acquires_an_independent_owner),
+		("verifier rejects actual callback return without acquisition", test_verifier_rejects_callback_library_return_without_acquisition),
 		("opaque borrowed return requires its exact owner acquisition", test_opaque_parameter_return_requires_its_acquisition),
 		("opaque conversions specialize to parameter reads", test_opaque_conversions_specialize_to_parameter_reads),
 		("opaque conversions lower without wrapper definitions", test_opaque_conversions_lower_without_wrapper_definitions),
