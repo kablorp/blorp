@@ -17,17 +17,13 @@ import:
 		SpecializedContents,
 		TypeRef(VoidType, IntType, FloatType, StringType, ListType, RecordType, UnionType),
 		UnionRepresentation(InlineUnmanaged, InlineOwningPayload, BoxedRecursive),
-		ValueOwnership(
-			NoOwnership, ManagedStringLeaf, ManagedListRoot, ManagedRecordRoot,
-			InlineOwnedFields,
-		),
 		function_number,
 		record_number,
 		same_type,
 		specialize,
 		specialized_contents,
 		union_number,
-		value_ownership,
+		value_needs_ownership,
 		admit_scalar_loop,
 	../../../src/utils/syntax: Diagnostic, Entrypoint(NoArguments), FunctionExecution(SelfTailLoop), Span, diagnostic, entry_function, same_span
 	option: to_result
@@ -419,7 +415,7 @@ pure func test_match_scrutinee_assignments_and_results_discover_generic_instance
 
 
 private pure func ownership_rejection(
-	result: Result[ValueOwnership, Diagnostic],
+	result: Result[Bool, Diagnostic],
 	message: String,
 ) -> Bool:
 	match result:
@@ -440,8 +436,8 @@ pure func test_numeric_and_void_types_have_no_ownership() -> Bool:
 	var valid = True
 
 	for value_type in [IntType, FloatType, VoidType]:
-		match value_ownership(value_type, [], []):
-			Ok(NoOwnership):
+		match value_needs_ownership(value_type, [], []):
+			Ok(False):
 				void
 			_:
 				valid = False
@@ -450,16 +446,16 @@ pure func test_numeric_and_void_types_have_no_ownership() -> Bool:
 
 
 pure func test_string_ownership_is_a_managed_leaf() -> Bool:
-	match value_ownership(StringType, [], []):
-		Ok(ManagedStringLeaf):
+	match value_needs_ownership(StringType, [], []):
+		Ok(True):
 			True
 		_:
 			False
 
 
 pure func test_string_list_ownership_is_a_managed_root() -> Bool:
-	match value_ownership(ListType(StringType), [], []):
-		Ok(ManagedListRoot):
+	match value_needs_ownership(ListType(StringType), [], []):
+		Ok(True):
 			True
 		_:
 			False
@@ -468,16 +464,16 @@ pure func test_string_list_ownership_is_a_managed_root() -> Bool:
 pure func test_all_supported_list_elements_have_one_managed_root() -> Bool:
 	values = [IntType, FloatType, VoidType, StringType, ListType(StringType)]
 	values.all(pure func(element):
-		match value_ownership(ListType(element), [], []):
-			Ok(ManagedListRoot): True
+		match value_needs_ownership(ListType(element), [], []):
+			Ok(True): True
 			_: False
 	)
 
 
-private pure func return_plan(contents: SpecializedContents) -> Result[ValueOwnership, Diagnostic]:
+private pure func return_needs_ownership(contents: SpecializedContents) -> Result[Bool, Diagnostic]:
 	match contents.functions:
 		[_, helper]:
-			value_ownership(helper.signature.return_type, contents.unions, contents.records)
+			value_needs_ownership(helper.signature.return_type, contents.unions, contents.records)
 		_:
 			Err({
 				span = {
@@ -526,8 +522,8 @@ pure func test_nested_numeric_records_remain_inline() -> Bool:
 							record_number(child) == 0
 						_:
 							False
-					unmanaged_parent = match return_plan(contents):
-						Ok(NoOwnership):
+					unmanaged_parent = match return_needs_ownership(contents):
+						Ok(False):
 							True
 						_:
 							False
@@ -556,9 +552,15 @@ pure func test_string_record_has_one_root_and_complete_repeated_fields() -> Bool
 							True
 						_:
 							False
-					managed_root = match return_plan(contents):
-						Ok(ManagedRecordRoot(id)):
-							record_number(id) == 0
+					managed_root = match return_needs_ownership(contents):
+						Ok(True):
+							match contents.functions:
+								[_, helper]:
+									match helper.signature.return_type:
+										RecordType(id):
+											record_number(id) == 0
+										_: False
+								_: False
 						_:
 							False
 					complete_fields and managed_root
@@ -579,9 +581,15 @@ pure func test_void_record_has_a_root_without_owned_children() -> Bool:
 
 	match program(source):
 		Ok(contents):
-			match return_plan(contents):
-				Ok(ManagedRecordRoot(id)):
-					record_number(id) == 0
+			match return_needs_ownership(contents):
+				Ok(True):
+					match contents.functions:
+						[_, helper]:
+							match helper.signature.return_type:
+								RecordType(id):
+									record_number(id) == 0
+								_: False
+						_: False
 				_:
 					False
 		Err(_):
@@ -607,16 +615,22 @@ pure func test_unmanaged_union_field_still_requires_a_record_root() -> Bool:
 				[layout]:
 					unmanaged_child = match layout.fields:
 						[UnionType(child)]:
-							match value_ownership(UnionType(child), contents.unions, contents.records):
-								Ok(NoOwnership):
+							match value_needs_ownership(UnionType(child), contents.unions, contents.records):
+								Ok(False):
 									True
 								_:
 									False
 						_:
 							False
-					managed_parent = match return_plan(contents):
-						Ok(ManagedRecordRoot(id)):
-							record_number(id) == 0
+					managed_parent = match return_needs_ownership(contents):
+						Ok(True):
+							match contents.functions:
+								[_, helper]:
+									match helper.signature.return_type:
+										RecordType(id):
+											record_number(id) == 0
+										_: False
+								_: False
 						_:
 							False
 					unmanaged_child and managed_parent
@@ -637,8 +651,8 @@ pure func test_phantom_string_argument_creates_no_child_obligation() -> Bool:
 
 	match program(source):
 		Ok(contents):
-			match return_plan(contents):
-				Ok(NoOwnership):
+			match return_needs_ownership(contents):
+				Ok(False):
 					True
 				_:
 					False
@@ -672,9 +686,15 @@ pure func test_inline_union_keeps_each_repeated_owned_field() -> Bool:
 							True
 						InlineUnmanaged | BoxedRecursive:
 							False
-					owning_fields = match return_plan(contents):
-						Ok(InlineOwnedFields(id)):
-							union_number(id) == 0
+					owning_fields = match return_needs_ownership(contents):
+						Ok(True):
+							match contents.functions:
+								[_, helper]:
+									match helper.signature.return_type:
+										UnionType(id):
+											union_number(id) == 0
+										_: False
+								_: False
 						_:
 							False
 					complete_fields and owning_representation and owning_fields
@@ -696,7 +716,7 @@ pure func test_record_ownership_query_rejects_missing_layout() -> Bool:
 	match fixture(source):
 		Ok([_, helper]):
 			ownership_rejection(
-				value_ownership(helper.signature.return_type, [], []),
+				value_needs_ownership(helper.signature.return_type, [], []),
 				"invalid record identity in ownership representation",
 			)
 		_:
@@ -718,7 +738,7 @@ pure func test_union_ownership_query_rejects_missing_layout() -> Bool:
 	match fixture(source):
 		Ok([_, helper]):
 			ownership_rejection(
-				value_ownership(helper.signature.return_type, [], []),
+				value_needs_ownership(helper.signature.return_type, [], []),
 				"invalid union identity in ownership representation",
 			)
 		_:

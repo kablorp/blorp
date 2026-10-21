@@ -129,19 +129,6 @@ fixed union TypeRef:
 	UnionType(UnionInstanceId)
 
 
--- Storage ownership belongs to this compilation's concrete layouts, before
--- insertion chooses any owners or borrows. Stored slots remain in the complete
--- layouts; this classification does not replace their order or multiplicity.
-fixed union ValueOwnership:
-	NoOwnership
-	ManagedStringLeaf
-	ManagedCallableEnvironment
-	ManagedListRoot
-	ManagedRecordRoot(RecordInstanceId)
-	InlineOwnedFields(UnionInstanceId)
-	ManagedUnionRoot(UnionInstanceId)
-
-
 -- A union naming itself as a payload has no finite inline storage, so every
 -- value of it is a counted heap node and the self payload is a pointer edge.
 fixed union UnionRepresentation:
@@ -550,45 +537,34 @@ private pure func ownership_error(message: String) -> Diagnostic:
 
 -- Project the published storage fact, without rediscovering managed children.
 -- Raw ownership verification additionally checks supplied layout consistency.
-pure func value_ownership(
+pure func value_needs_ownership(
 	type_ref: TypeRef,
 	unions: List[ConcreteUnion],
 	records: List[ConcreteRecord],
-) -> Result[ValueOwnership, Diagnostic]:
+) -> Result[Bool, Diagnostic]:
 	match type_ref:
-		RecordType(id):
-			match records.get(record_number(id)).to_result(
-				ownership_error("invalid record identity in ownership representation"),
-			):
-				Ok(layout):
-					ownership: ValueOwnership = match layout.representation:
-						InlineRecord:
-							NoOwnership
-						ManagedRecord:
-							ManagedRecordRoot(id)
-					Ok(ownership)
-				Err(error): Err(error)
 		VoidType | IntType | FloatType:
-			Ok(NoOwnership)
-		CallableType(_, _):
-			Ok(ManagedCallableEnvironment)
-		StringType:
-			Ok(ManagedStringLeaf)
-		ListType(_):
-			Ok(ManagedListRoot)
+			Ok(False)
+		StringType | ListType(_) | CallableType(_, _):
+			Ok(True)
+		RecordType(id):
+			match records.get(record_number(id)):
+				None:
+					Err(ownership_error("invalid record identity in ownership representation"))
+				Some(declaration):
+					needs_owner: Bool = match declaration.representation:
+						InlineRecord: False
+						ManagedRecord: True
+					Ok(needs_owner)
 		UnionType(id):
 			match unions.get(union_number(id)):
-				Some(layout):
-					ownership: ValueOwnership = match layout.representation:
-						InlineUnmanaged:
-							NoOwnership
-						InlineOwningPayload:
-							InlineOwnedFields(id)
-						BoxedRecursive:
-							ManagedUnionRoot(id)
-					Ok(ownership)
 				None:
 					Err(ownership_error("invalid union identity in ownership representation"))
+				Some(declaration):
+					needs_owner: Bool = match declaration.representation:
+						InlineUnmanaged: False
+						InlineOwningPayload | BoxedRecursive: True
+					Ok(needs_owner)
 
 
 private pure func translated_list[T, U](
@@ -3775,10 +3751,10 @@ private pure func admit_scalar_type(
 	unions: List[ConcreteUnion],
 	records: List[ConcreteRecord],
 ) -> Result[Void, Diagnostic]:
-	plan ?= value_ownership(value_type, unions, records)
-	match plan:
-		NoOwnership: Ok(void)
-		_: Err(diagnostic(span, "managed values in @tail_recursive functions are not supported yet", "use an unmanaged helper, or remove @tail_recursive"))
+	needs_owner ?= value_needs_ownership(value_type, unions, records)
+	match needs_owner:
+		False: Ok(void)
+		True: Err(diagnostic(span, "managed values in @tail_recursive functions are not supported yet", "use an unmanaged helper, or remove @tail_recursive"))
 
 
 private pure func admit_scalar_binding(

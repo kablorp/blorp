@@ -51,10 +51,6 @@ import:
 		TypeRef(VoidType, IntType, FloatType, StringType, ListType, CallableType, UnionType, RecordType),
 		UnionInstanceId,
 		UnionRepresentation(InlineUnmanaged, InlineOwningPayload, BoxedRecursive),
-		ValueOwnership(
-			NoOwnership, ManagedStringLeaf, ManagedCallableEnvironment, ManagedListRoot, ManagedRecordRoot,
-			InlineOwnedFields, ManagedUnionRoot,
-		),
 		VariantFieldInstanceId, VariantInstanceId, variant_field_variant, variant_field_number,
 		field_number,
 		field_owner,
@@ -64,7 +60,7 @@ import:
 		runtime_type_ref,
 		same_type,
 		union_number,
-		value_ownership,
+		value_needs_ownership,
 		variant_number,
 		variant_owner,
 	../utils/syntax:
@@ -115,7 +111,7 @@ private pure func verify_type_membership(
 				Some(error): Err(error)
 				None: Ok(void)
 		_:
-			match value_ownership(value_type, unions, records):
+			match value_needs_ownership(value_type, unions, records):
 				Ok(_): Ok(void)
 				Err(error): Err({ error | span = span })
 
@@ -569,13 +565,13 @@ private pure func verify_argument(
 	else:
 		match argument:
 			UnmanagedArgument(_):
-				match value_ownership(expected, unions, records):
-					Ok(plan):
+				match value_needs_ownership(expected, unions, records):
+					Ok(needs_owner):
 
-						match plan:
-							NoOwnership:
+						match needs_owner:
+							False:
 								Ok(void)
-							ManagedStringLeaf | ManagedCallableEnvironment | ManagedListRoot | ManagedRecordRoot(_) | InlineOwnedFields(_) | ManagedUnionRoot(_):
+							True:
 								Err(
 									verification_error(
 										span,
@@ -1393,20 +1389,20 @@ private pure func stored_payload_transfer(
 			id
 
 	known ?= known_value(state, id, span)
-	plan ?= value_ownership(known.value_type, unions, records)
+	needs_owner ?= value_needs_ownership(known.value_type, unions, records)
 
 	match payload:
 		UnmanagedPayload(_):
-			match plan:
-				NoOwnership:
+			match needs_owner:
+				False:
 					Ok(None)
-				_:
+				True:
 					Err(verification_error(span, "managed payload requires an owner transfer"))
 		OwnedPayload(value, transferred):
-			match plan:
-				NoOwnership:
+			match needs_owner:
+				False:
 					Err(verification_error(span, "unmanaged payload cannot transfer an owner"))
-				_:
+				True:
 					match known_owner(state, discharged, owners, transferred, span):
 						Ok(entry):
 
@@ -1433,16 +1429,16 @@ private pure func verify_definition_result(
 	unions: List[ConcreteUnion],
 	records: List[ConcreteRecord],
 ) -> Result[Option[OwnerId], Diagnostic]:
-	plan ?= value_ownership(definition.value_type, unions, records)
+	needs_owner ?= value_needs_ownership(definition.value_type, unions, records)
 
-	ownership_result: Result[Option[OwnerId], Diagnostic] = match plan:
-		NoOwnership:
+	ownership_result: Result[Option[OwnerId], Diagnostic] = match needs_owner:
+		False:
 			match definition.result:
 				UnmanagedResult:
 					Ok(None)
 				_:
 					Err(verification_error(definition.span, "unmanaged value carries an ownership obligation"))
-		ManagedStringLeaf | ManagedCallableEnvironment | ManagedListRoot | ManagedRecordRoot(_) | InlineOwnedFields(_) | ManagedUnionRoot(_):
+		True:
 			match definition.operation:
 				ParameterDefinition(_):
 					match definition.result:
@@ -1548,13 +1544,13 @@ private pure func verify_match_argument(
 		UnmanagedArgument(id):
 			match known_value(state, id, span):
 				Ok(known):
-					match value_ownership(known.value_type, unions, records):
-						Ok(plan):
+					match value_needs_ownership(known.value_type, unions, records):
+						Ok(needs_owner):
 
-							match plan:
-								NoOwnership:
+							match needs_owner:
+								False:
 									Ok(void)
-								_:
+								True:
 									Err(verification_error(span, "managed match scrutinee requires an owner-dependent borrow"))
 						Err(error): Err(error)
 				Err(error): Err(error)
@@ -1841,14 +1837,14 @@ private pure func introduce_join_parameter(
 	parameter = join_parameter(output)
 	state = initial.facts
 
-	plan ?= value_ownership(parameter.value_type, unions, records)
+	needs_owner ?= value_needs_ownership(parameter.value_type, unions, records)
 	var owners = initial.owners
-	classification: Result[Void, Diagnostic] = match plan:
-		NoOwnership:
+	classification: Result[Void, Diagnostic] = match needs_owner:
+		False:
 			match output:
 				UnmanagedJoinParameter(_): Ok(void)
 				_: Err(verification_error(parameter.span, "unmanaged value carries an ownership obligation"))
-		_:
+		True:
 			match output:
 				UnmanagedJoinParameter(_): Err(verification_error(parameter.span, "managed result requires an owner"))
 				ManagedJoinParameter(_, owner):
@@ -2179,17 +2175,17 @@ private pure func verify_return(
 	if same_type(result.value_type, return_type).not():
 		Err(verification_error(result.span, "return type does not match its contract"))
 	else:
-		match value_ownership(return_type, unions, records):
-			Ok(plan):
+		match value_needs_ownership(return_type, unions, records):
+			Ok(needs_owner):
 
-				ownership_result: Result[Void, Diagnostic] = match plan:
-					NoOwnership:
+				ownership_result: Result[Void, Diagnostic] = match needs_owner:
+					False:
 						match returned_owner:
 							None:
 								Ok(void)
 							Some(_):
 								Err(verification_error(result.span, "unmanaged return cannot transfer an owner"))
-					ManagedStringLeaf | ManagedCallableEnvironment | ManagedListRoot | ManagedRecordRoot(_) | InlineOwnedFields(_) | ManagedUnionRoot(_):
+					True:
 						match returned_owner:
 							None:
 								Err(verification_error(result.span, "managed return requires an owner transfer"))
@@ -2314,13 +2310,13 @@ private pure func consume_yield(
 		Ok(void)
 	else:
 		Err(verification_error(span, "yield type does not match its join"))
-	plan ?= value_ownership(join_type, unions, records)
-	transferred: Result[Option[Int], Diagnostic] = match plan:
-		NoOwnership:
+	needs_owner ?= value_needs_ownership(join_type, unions, records)
+	transferred: Result[Option[Int], Diagnostic] = match needs_owner:
+		False:
 			match moved:
 				None: Ok(None)
 				Some(_): Err(verification_error(span, "unmanaged yield cannot transfer an owner"))
-		ManagedStringLeaf | ManagedCallableEnvironment | ManagedListRoot | ManagedRecordRoot(_) | InlineOwnedFields(_) | ManagedUnionRoot(_):
+		True:
 			match moved:
 				None:
 					Err(verification_error(span, "managed yield requires an owner transfer"))

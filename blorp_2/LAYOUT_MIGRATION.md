@@ -1,11 +1,12 @@
 # Simplifying layout and ownership representation in place
 
-Status: simplified roadmap, 2026-10-21; documentation only. This supersedes the
-uniform heap-catalogue proposal in commit `7237afb9a`. The source inspection
-baseline is `2ebbebf83c08b45cdf0c807453f89e12fb4b4ac9`; freeze accepted main after
-CI/bootstrap repair and the bounded test migration before implementation.
-Recheck the named symbols then. No production changes or new cost results are
-claimed here.
+Status: M1 implemented and qualified, 2026-10-21; see the
+[binary ownership report](../benchmarks/results/blorp_2_binary_ownership_2026-10-21.md).
+This simplified roadmap supersedes the uniform heap-catalogue proposal in
+commit `7237afb9a`. Design examples below retain their inspection snapshot
+`2ebbebf83c08b45cdf0c807453f89e12fb4b4ac9`; M1's matched measurements freeze source
+`cdfa1bc6009da61415f26b9f812f1dfbf23a6ebc`. Bootstrap repair and bounded test
+integration are qualified separately. Later experiments remain optional.
 
 ## Outcome and merge rule
 
@@ -67,8 +68,9 @@ part of this roadmap.
 | E1: physical-slot experiment | Complete record construction, raw verification and real emission path | Retained-data/code/work win; otherwise reject | A concrete deletion hypothesis after M1/M2 |
 | E2: further adoption | A separately bounded union/List path, only if E1 earned adoption | Its own benefit against accepted parent | Accepted E1; no automatic commitment |
 
-M1 is the next implementation candidate. M2 is a bounded source audit followed
-by a concrete diff, not permission for a general query framework. E1/E2 are
+M1 is complete: 32 fewer production lines, 1.016% fewer allocations and
+nonregressing instructions. M2 is an optional bounded source audit followed by
+a concrete diff, not permission for a general query framework. E1/E2 are
 unmerged experiments, not foundations that may land while awaiting later savings.
 Each implementation brief follows [HANDOFF_SPEC](../docs/HANDOFF_SPEC.md), stays
 under its prose limit and references this design rather than duplicating it.
