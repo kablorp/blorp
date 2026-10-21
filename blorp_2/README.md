@@ -367,7 +367,8 @@ roots, then Blorp 2 runs the explicit `TARGET_COMPONENT_SOURCES` in the Makefile
 The selection currently covers text, Boolean calls, constant/declaration IDs,
 IntMap, names, source identities and syntax publication, plus Lexer token traces,
 float boundaries, keyword roles, source origins, character literals, continuation,
-doc fences and ranges. Each selected suite uses its ordinary
+doc fences, ranges, lexical trivia and runtime-text round trips. Each selected
+suite uses its ordinary
 `tests: TestSuite` entry; generated C and executables mirror its source path
 under `blorp_2/build/self-hosted-tests/`.
 

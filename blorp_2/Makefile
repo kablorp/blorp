@@ -28,7 +28,9 @@ TARGET_COMPONENT_SOURCES := \
 	blorp_2/test/unit/test_lex/test_keywords.brp \
 	blorp_2/test/unit/test_lex/test_lex.brp \
 	blorp_2/test/unit/test_lex/test_provenance.brp \
-	blorp_2/test/unit/test_lex/test_ranges.brp
+	blorp_2/test/unit/test_lex/test_ranges.brp \
+	blorp_2/test/unit/test_lex/test_runtime_text.brp \
+	blorp_2/test/unit/test_lex/test_trivia.brp
 
 .PHONY: compiler generate-compiler link-compiler example test test-components test-target-components test-compiler link-test-compiler test-e2e host-check
 
