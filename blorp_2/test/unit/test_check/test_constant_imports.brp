@@ -2,6 +2,9 @@ import:
 	../../../src/check/check: check, checked_functions, check_errors
 	../../../src/check/errors as Errors
 	../../../src/check/model as Model
+	../../../src/namespace/namespace: build_namespace
+	../constant_inputs: admitted_constants
+	../../../src/utils/ids: function_number
 	../../../src/check/render: render_failure
 	../../../src/utils/source: module_source, root_module_id, same_source
 	../../../src/utils/syntax: same_span
@@ -60,10 +63,112 @@ pure func test_constant_does_not_enter_ufcs_candidates() -> Bool:
 						_: False
 
 
+pure func test_direct_and_qualified_callable_constant_calls_share_the_stored_path() -> Bool:
+	root: String =
+		|import:
+		|    ./config as Config: CALLBACK
+		|func main() -> Int:
+		|    first = CALLBACK(3)
+		|    Config.CALLBACK(first)
+		|
+	helper = "pure func identity[T](value: T) -> T:\n    value\nCALLBACK: pure (Int) -> Int = identity\n"
+	match parse_modules([{ source = root, targets = [1] }, { source = helper, targets = [] }]):
+		Err(_): False
+		Ok(parsed):
+			match check(parsed):
+				Err(_): False
+				Ok(program):
+					match checked_functions(program).functions:
+						[main, identity]:
+							match (main.statements, main.body):
+								([Model.InitializeBinding(_, first)], Model.CheckedValueBody(Model.ReturnExpression(second))):
+									match (first.form, second.form):
+										(Model.InvokeFunction(direct), Model.InvokeFunction(qualified)):
+											match (direct.target, qualified.target):
+												(Model.ValueCall(left), Model.ValueCall(right)):
+													match (left.form, right.form):
+														(Model.MakeCallable(Model.NamedCallable(first_code, [first_type])), Model.MakeCallable(Model.NamedCallable(second_code, [second_type]))):
+															(function_number(first_code) == function_number(identity.id) and function_number(second_code) == function_number(identity.id)
+																and Model.same_type(first_type, Model.IntType) and Model.same_type(second_type, Model.IntType)
+																and direct.operands.length() == 1 and qualified.operands.length() == 1
+																and Some(left.span.start) == root.index_of("CALLBACK(3)") and left.span.end == left.span.start + 8
+																and Some(right.span.start) == root.index_of("Config.CALLBACK(first)") and right.span.end == right.span.start + 15
+																and same_source(left.span.source, module_source(root_module_id())) and same_source(right.span.source, left.span.source))
+														_: False
+												_: False
+										_: False
+								_: False
+						_: False
+
+
+pure func test_imported_aggregate_rebases_only_its_root_span() -> Bool:
+	root = "import:\n    ./config as Config\nfunc main() -> Int:\n    saved = Config.VALUE\n    0\n"
+	helper = "fixed record Box { text: String }\nVALUE: Box = { text = \"imported\" }\n"
+	match parse_modules([{ source = root, targets = [1] }, { source = helper, targets = [] }]):
+		Err(_): False
+		Ok(parsed):
+			match build_namespace(parsed):
+				Err(_): False
+				Ok(namespace):
+					match (admitted_constants(parsed, namespace), check(parsed)):
+						(Ok([row]), Ok(program)):
+							match checked_functions(program).functions:
+								[main]:
+									match (row.value.form, main.statements):
+										(Model.ConstructRecord(owner, [original]), [Model.InitializeBinding(_, read)]):
+											match read.form:
+												Model.ConstructRecord(_, [field]):
+													match field.value.form:
+														Model.LiteralString("imported"):
+															(Model.same_type(read.value_type, Model.RecordType(owner))
+																and same_source(row.annotation.source, row.value.span.source) and not same_source(row.annotation.source, module_source(root_module_id()))
+																and same_span(original.value.span, field.value.span) and same_source(field.value.span.source, row.annotation.source)
+																and same_source(read.span.source, module_source(root_module_id()))
+																and Some(read.span.start) == root.index_of("Config.VALUE") and read.span.end == read.span.start + 12)
+														_: False
+												_: False
+										_: False
+								_: False
+						_: False
+
+
+pure func test_imported_callable_argument_error_keeps_read_and_declaration_sources() -> Bool:
+	prefix = "import:\n    ./config as Config\nfunc main() -> Int:\n    Config."
+	root = prefix + "CALLBACK(\"bad\")\n"
+	helper = "pure func identity[T](value: T) -> T:\n    value\nCALLBACK: pure (Int) -> Int = identity\n"
+	match parse_modules([{ source = root, targets = [1] }, { source = helper, targets = [] }]):
+		Err(_): False
+		Ok(parsed):
+			match check(parsed):
+				Ok(_): False
+				Err(failure):
+					error = check_errors(failure).first
+					rendered = render_failure(failure).first
+					match error.kind:
+						Errors.CallRejection(Errors.ArgumentTypeMismatch(mismatch)):
+							match mismatch.expected_site:
+								Errors.SourceAnnotation(annotation):
+									(mismatch.argument_position == 0
+										and Model.same_type(mismatch.expected, Model.IntType) and Model.same_type(mismatch.actual.value_type, Model.StringType)
+										and error.span.start == prefix.length() and error.span.end == prefix.length() + 8
+										and mismatch.actual.span.start == prefix.length() + 9 and mismatch.actual.span.end == prefix.length() + 14
+										and same_source(error.span.source, module_source(root_module_id())) and same_source(mismatch.actual.span.source, error.span.source)
+										and not same_source(annotation.source, error.span.source)
+										and Some(annotation.start) == helper.index_of("pure (Int) -> Int") and annotation.end == annotation.start + 17
+										and same_span(rendered.span, error.span) and rendered.note.is_none()
+										and rendered.message == "argument type does not match the parameter type" and rendered.help == "use an expression of type Int here"
+										and check_errors(failure).remaining.is_empty() and render_failure(failure).remaining.is_empty())
+								_: False
+						_: False
+
+
 tests: TestSuite = {
 	description = "Constant expression import values",
 	tests = [
 		("selected and qualified reads keep values and occurrence spans", test_selected_and_qualified_body_reads_keep_values_and_occurrence_spans),
 		("constant declarations do not become UFCS candidates", test_constant_does_not_enter_ufcs_candidates),
+		("direct and qualified callable constants use accepted stored callees", test_direct_and_qualified_callable_constant_calls_share_the_stored_path),
+		("cross-module aggregate reads rebase only the materialized root", test_imported_aggregate_rebases_only_its_root_span),
+		("imported callback mismatch keeps read and annotation sources", test_imported_callable_argument_error_keeps_read_and_declaration_sources),
 	]
 }

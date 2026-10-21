@@ -1477,17 +1477,29 @@ Lexical and layout rules:
   Public opaques may hide private representations. Cyclic opaque representations
   are rejected; wrapping an independently recursive aggregate remains valid.
   The conversion words are reserved: `into_opaque(7)` is a syntax error.
-- `LIMIT: Int = 7` declares a module constant; its value may stand alone on
-  the next line. This increment accepts explicitly typed, closed Int, Float
-  and String literal initializers, including pipe Strings. Every declaration
-  is checked, including unused constants; annotations are checked before
-  initializers. Imports and qualified reads resolve to the same constant
-  identity. Constants obey module privacy and cannot be shadowed by parameters
-  or local bindings. Each runtime read materializes an ordinary value at its
-  use site, with its own value identity and ownership when needed. Record
-  initializers, references to other constants in initializers, opaque
-  conversions and calls remain rejected; constants cannot be called or used
-  as UFCS methods.
+- `LIMIT: Int = 7` declares an explicitly annotated module constant; its
+  initializer may stand alone on the next line. Closed initializers admit
+  scalar/Void literals, constructors, records, Lists, tuples and named function
+  references. An annotation supplies ordinary context, including an empty List's
+  element type and a generic named function's concrete callable signature.
+  Calls, references to other constants, lambdas, postfix operations, record
+  updates, opaque conversions and control expressions are not closed initializers.
+  Name a callback as a function instead of writing a lambda in a constant.
+  Creating an impure function value does not invoke it; ordinary callable purity
+  checking still governs its annotation and later invocation.
+  Every declaration is checked, including unused constants. Checking resolves all
+  constant annotations, then function signatures and entrypoint diagnostics,
+  then constant initializers, then function bodies. Constants obey module privacy
+  and cannot be shadowed by parameters or local bindings. Imported and qualified
+  reads resolve to the same declaration identity. Each runtime read materializes
+  an ordinary value with fresh value/ownership identities; there is no runtime
+  global initialization or retained global object. The materialized root carries
+  the read's span; aggregate children retain their initializer's source spans.
+  Callable constants support ordinary direct and qualified calls; scalar constants
+  cannot be called, and constants do not enter UFCS method selection.
+  Test-suite mode still requires the pure `tests()` factory; aggregate constant
+  support does not change test registration or the runner API.
+
 - Every token must be consumed. Malformed declarations and statements are errors.
 
 Semantic rules:

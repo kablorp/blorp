@@ -1,7 +1,7 @@
 import:
 	../../../src/check/check: check, checked_functions, check_errors
 	../../../src/check/callables: ResolutionContext, SourceLoopScope(OutsideSourceLoop)
-	../../../src/check/constructors: plan_record_literal
+	../../../src/check/constructors: plan_record_literal, construction_context
 	../../../src/check/declarations: validate_declarations
 	../../../src/check/errors as Errors
 	../../../src/check/inference: InferenceType(AcceptedType)
@@ -16,6 +16,7 @@ import:
 	../../../src/utils/syntax:
 		DiagnosticNote(PreviousField, RecordFieldDeclaration), Span, ValueExpression, same_span,
 		ParsedBody(ParsedValueBody), ExpressionBase(RecordExpression)
+	../constant_inputs: admitted_constants
 	../input: accepted_signatures, checked_source, existing_name
 	../module_input: parse_modules
 	test: TestSuite
@@ -168,8 +169,8 @@ private pure func malformed_plans(program: ParsedProgram, context: ResolutionCon
 	declaration_span = at("fixed record Pair[T] { ", "first")
 	match body.base:
 		RecordExpression([second, first]):
-			complete = plan_record_literal([second, first], body.base_span, hint, context)
-			incomplete = plan_record_literal([second], body.base_span, hint, context)
+			complete = plan_record_literal([second, first], body.base_span, hint, construction_context(context))
+			incomplete = plan_record_literal([second], body.base_span, hint, construction_context(context))
 			match (complete, incomplete):
 				(Err(arity), Err(missing)):
 					match (arity.kind, missing.kind):
@@ -232,15 +233,28 @@ pure func test_malformed_arity_is_checked_after_missing_fields() -> Bool:
 										_: False
 
 
-pure func test_record_constant_rejection_stays_outside_the_prep() -> Bool:
+pure func test_record_constant_uses_the_same_field_admission() -> Bool:
 	prefix = PAIR + "private VALUE: Pair = "
 	literal = "{ first = 23, second = 17 }"
-	rejects(prefix + literal + "\n" + MAIN, at(prefix, literal),
-		"constant initializer is not a closed value", "use an Int, Float, or String literal", None, pure func(kind, names):
-			match kind:
-				Errors.ConstantRejection(Errors.NonClosedInitializer): True
-				_: False
-	)
+	match parse_modules([{ source = prefix + literal + "\n" + MAIN, targets = [] }]):
+		Err(_): False
+		Ok(program):
+			match build_namespace(program):
+				Err(_): False
+				Ok(namespace):
+					match admitted_constants(program, namespace):
+						Ok([row]):
+							match row.value.form:
+								Model.ConstructRecord(owner, [first, second]):
+									match (first.value.form, second.value.form):
+										(Model.LiteralInteger(23), Model.LiteralInteger(17)):
+											(Model.same_type(row.value.value_type, Model.RecordType(owner))
+												and record_number(Model.field_owner(first.field)) == record_number(owner) and Model.field_number(first.field) == 0
+												and record_number(Model.field_owner(second.field)) == record_number(owner) and Model.field_number(second.field) == 1
+												and same_span(row.value.span, at(prefix, literal)))
+										_: False
+								_: False
+						_: False
 
 
 tests: TestSuite = {
@@ -253,6 +267,6 @@ tests: TestSuite = {
 		("first missing declaration precedes RHS errors", test_first_missing_declaration_wins_before_rhs),
 		("later child error precedes sibling mismatch", test_later_child_error_wins_before_sibling_mismatch),
 		("malformed generic arity follows structural admission", test_malformed_arity_is_checked_after_missing_fields),
-		("record constants remain outside this prep", test_record_constant_rejection_stays_outside_the_prep),
+		("record constants use the same field admission", test_record_constant_uses_the_same_field_admission),
 	]
 }

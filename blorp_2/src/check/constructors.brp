@@ -9,11 +9,11 @@ import:
 	./declarations: aliased_module, find_field, occurrence_fields, previous_declaration
 	./model:
 		FieldId,
-		CheckedRecord,
+		CheckedRecord, CheckedUnion,
 		CheckedField,
 		TypeParameterId,
 		TypeRef(RecordType, UnionType, AppliedUnionType),
-		TypeUse,
+		TypeUse, CheckedExpr,
 		UnionOccurrence,
 		same_type,
 		same_variant,
@@ -57,11 +57,25 @@ import:
 		pending_type,
 		publish_inference_type
 	../utils/ids: OpaqueId, RecordId, UnionId, VariantId, record_number, union_number, variant_number
+	../utils/source: ModuleId
 	../utils/names: same_name
-	../namespace/namespace: NamedValue(NamedConstructor), OfferedValue(OfferedConstructor), named_value, offered_value
+	../namespace/namespace: Namespace, NamedValue(NamedConstructor), OfferedValue(OfferedConstructor), named_value, offered_value
 	../utils/syntax: Span, ValueExpression, WrittenName, ParsedRecordField, ParsedQualified
 	int as IntOps
 	option: is_some, to_result
+
+
+-- Construction reads declarations and module visibility, never a body owner.
+fixed record ConstructionContext {
+	module: ModuleId,
+	namespace: Namespace,
+	records: List[CheckedRecord],
+	unions: List[CheckedUnion]
+}
+
+
+pure func construction_context(context: ResolutionContext) -> ConstructionContext:
+	{ module = context.module, namespace = context.namespace, records = context.records, unions = context.unions }
 
 
 fixed record VariantContract {
@@ -80,7 +94,7 @@ private fixed record DeclaredVariantContract {
 
 -- The one reader of a variant's declaration: its fields and the union's
 -- parameters, for a variant identity the caller has already established.
-private pure func declared_variant_contract(context: ResolutionContext, owner: UnionId, variant: VariantId, span: Span) -> Result[Option[DeclaredVariantContract], CheckError]:
+private pure func declared_variant_contract(context: ConstructionContext, owner: UnionId, variant: VariantId, span: Span) -> Result[Option[DeclaredVariantContract], CheckError]:
 	declaration ?= context.unions.get(union_number(owner)).to_result(checker_invariant(span, InvalidCheckedUnion(owner)))
 	found: Option[DeclaredVariantContract] = match declaration.variants.get(variant_number(variant)):
 		Some(declared):
@@ -94,13 +108,13 @@ private pure func declared_variant_contract(context: ResolutionContext, owner: U
 
 -- A bare constructor is the one the caller's module sees under its name, and
 -- it must belong to `owner`; an unimported constructor of the union is not found.
-private pure func find_declared_variant(context: ResolutionContext, owner: UnionId, name: WrittenName) -> Result[Option[DeclaredVariantContract], CheckError]:
+private pure func find_declared_variant(context: ConstructionContext, owner: UnionId, name: WrittenName) -> Result[Option[DeclaredVariantContract], CheckError]:
 	match named_value(context.namespace, context.module, name.id):
 		Some(NamedConstructor(variant)): declared_variant_contract(context, owner, variant, name.span)
 		_: Ok(None)
 
 
-pure func find_variant(context: ResolutionContext, occurrence: UnionOccurrence, name: WrittenName) -> Result[Option[VariantContract], CheckError]:
+pure func find_variant(context: ConstructionContext, occurrence: UnionOccurrence, name: WrittenName) -> Result[Option[VariantContract], CheckError]:
 	found ?= find_declared_variant(context, occurrence.owner, name)
 	match found:
 		None:
@@ -123,7 +137,7 @@ pure func find_variant(context: ResolutionContext, occurrence: UnionOccurrence, 
 
 -- Qualification selects an exported declaration, then the same membership
 -- authority as a bare head checks it against the scrutinee's union.
-pure func find_qualified_variant(context: ResolutionContext, occurrence: UnionOccurrence, qualified: ParsedQualified) -> Result[Option[VariantContract], CheckError]:
+pure func find_qualified_variant(context: ConstructionContext, occurrence: UnionOccurrence, qualified: ParsedQualified) -> Result[Option[VariantContract], CheckError]:
 	aliased ?= aliased_module(context.namespace, context.module, qualified.module)
 	declared ?= match offered_value(context.namespace, aliased.target, qualified.name.id):
 		Ok(OfferedConstructor(variant)):
@@ -151,7 +165,7 @@ private pure func instantiate_pattern_variant(variant: DeclaredVariantContract, 
 pure func resolve_record_field(
 	name: WrittenName,
 	owner: RecordId,
-	context: ResolutionContext,
+	context: ConstructionContext,
 ) -> Result[CheckedField, CheckError]:
 	declaration ?= context.records
 		.get(record_number(owner))
@@ -274,7 +288,7 @@ pure func plan_record_literal(
 	written: List[ParsedRecordField],
 	span: Span,
 	expectation: Option[InferenceType],
-	context: ResolutionContext,
+	context: ConstructionContext,
 ) -> Result[PlannedBase, CheckError]:
 	term ?= expectation.to_result(record_error(span, RecordNeedsExpectedType))
 	-- The supplied hint must establish the owner. A solved bare call variable
@@ -308,7 +322,7 @@ pure func plan_record_literal(
 				Ok(PlannedRecord({ origin = LiteralRecord(owner), value_type = term, fields = fields, span = span }))
 
 
-pure func plan_record_update(base: PendingValue, written: List[ParsedRecordField], span: Span, expression_span: Span, context: ResolutionContext, slots: List[InferenceSlot]) -> Result[PlannedRecordFields, CheckError]:
+pure func plan_record_update(base: PendingValue, written: List[ParsedRecordField], span: Span, expression_span: Span, context: ConstructionContext, slots: List[InferenceSlot]) -> Result[PlannedRecordFields, CheckError]:
 	head ?= inference_head(pending_type(base), slots, expression_span)
 	occurrence_result: Result[RecordOccurrence, CheckError] = match record_occurrence(head):
 		Some(value): Ok(value)
@@ -417,7 +431,7 @@ private pure func pending_variant(
 	name: WrittenName,
 	expected: Option[InferenceType],
 	slots: List[InferenceSlot],
-	context: ResolutionContext,
+	context: ConstructionContext,
 ) -> Result[PendingVariantContract, CheckError]:
 	term ?= expected.to_result(constructor_error(name.span, ConstructorNeedsExpectedType(name.id)))
 	-- Select a constructor only from a structurally established nominal hint;
@@ -491,7 +505,7 @@ private pure func pending_qualified_variant(
 	variant: VariantId,
 	name: WrittenName,
 	expected: Option[InferenceType],
-	context: ResolutionContext,
+	context: ConstructionContext,
 ) -> Result[PendingVariantContract, CheckError]:
 	contract ?= declared_variant_contract(context, owner, variant, name.span)
 	declared ?= contract.to_result(checker_invariant(name.span, InvalidCheckedUnion(owner)))
@@ -523,7 +537,7 @@ pure func plan_qualified_variant(
 	arguments: List[ValueExpression],
 	called: Bool,
 	expected: Option[InferenceType],
-	context: ResolutionContext,
+	context: ConstructionContext,
 ) -> Result[PlannedBase, CheckError]:
 	contract ?= pending_qualified_variant(owner, variant, name, expected, context)
 	if and(contract.fields.is_empty(), called):
@@ -540,7 +554,7 @@ pure func plan_variant(
 	called: Bool,
 	expected: Option[InferenceType],
 	slots: List[InferenceSlot],
-	context: ResolutionContext,
+	context: ConstructionContext,
 ) -> Result[PlannedBase, CheckError]:
 	contract ?= pending_variant(name, expected, slots, context)
 	if and(contract.fields.is_empty(), called):
@@ -743,3 +757,4 @@ fixed union PlannedBase:
 	PlannedTuple(List[ValueExpression], List[Option[InferenceType]])
 	PlannedList(List[ValueExpression], ListElementSource)
 	PlannedCall(FunctionContract, List[ValueExpression], CallPlacement, Option[InferenceType])
+	PlannedStoredCall(CheckedExpr, FunctionContract, List[ValueExpression], CallPlacement, Option[InferenceType])

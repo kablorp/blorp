@@ -1,29 +1,26 @@
 ---
-Accepts every constant annotation before checking closed scalar initializers.
+Accepts every constant annotation before signatures and closed construction templates.
 The temporary headers disappear when the dense complete rows are published.
 ---
 import:
 	./declarations: TypeScope, resolve_type, type_access
 	./errors:
-		CheckError, ConstantError(NonClosedInitializer), constant_error,
+		CheckError,
 		CheckerInvariant(InvalidConstantDeclaration), checker_invariant,
-		ExpectedTypeSite(SourceAnnotation), ValueError(ExpressionTypeMismatch), value_error,
 	./model:
-		CheckedConstant, ClosedConstant(IntegerConstant, FloatConstant, StringConstant),
-		TypeRef(IntType, FloatType, StringType), TypeUse, same_type
+		CheckedConstant, CheckedRecord, CheckedUnion,
+		TypeUse
 	../namespace/namespace: Namespace
 	../parse/assemble: ParsedContents
-	../utils/ids: ConstantId, ConstantRow, constant_number, inventory_constants, inventory_records, inventory_unions
-	../utils/syntax: ExpressionBase(IntegerExpression, FloatExpression, StringExpression), Span, type_span
+	result: map
+	../utils/ids: constant_number, inventory_constants, inventory_records, inventory_unions
+	../utils/syntax: type_span
+	./constructors: ConstructionContext
+	./signatures: AcceptedFunction
+	./expressions: check_constant_initializer
 
 
-private fixed record TypedConstantValue {
-	value: ClosedConstant,
-	value_type: TypeRef
-}
-
-
-private pure func headers(parsed: ParsedContents, namespace: Namespace) -> Result[List[TypeUse], CheckError]:
+pure func constant_annotations(parsed: ParsedContents, namespace: Namespace) -> Result[List[TypeUse], CheckError]:
 	var accepted: List[TypeUse] = []
 	var failure: Option[CheckError] = None
 	for row in inventory_constants(parsed.declarations):
@@ -46,34 +43,19 @@ private pure func headers(parsed: ParsedContents, namespace: Namespace) -> Resul
 		None: Ok(accepted)
 
 
-private pure func accept(row: ConstantRow, annotation: TypeUse) -> Result[CheckedConstant, CheckError]:
-	body = row.declaration.value
-	closed_result: Result[TypedConstantValue, CheckError] = if body.applications.is_empty():
-		match body.base:
-			IntegerExpression(value): Ok({ value = IntegerConstant(value), value_type = IntType })
-			FloatExpression(value): Ok({ value = FloatConstant(value), value_type = FloatType })
-			StringExpression(value): Ok({ value = StringConstant(value), value_type = StringType })
-			_: Err(constant_error(body.span, NonClosedInitializer))
-	else:
-		Err(constant_error(body.span, NonClosedInitializer))
-	closed ?= closed_result
-	if same_type(annotation.value_type, closed.value_type):
-		Ok({ id = row.id, value_type = annotation, value = closed.value })
-	else:
-		Err(value_error(body.span, ExpressionTypeMismatch({
-			expected = annotation.value_type,
-			actual = { value_type = closed.value_type, span = body.span },
-			expected_site = SourceAnnotation(annotation.span),
-		})))
-
-
-pure func validate_constants(parsed: ParsedContents, namespace: Namespace) -> Result[List[CheckedConstant], CheckError]:
-	annotations ?= headers(parsed, namespace)
+pure func validate_constants(
+	parsed: ParsedContents, namespace: Namespace, annotations: List[TypeUse],
+	records: List[CheckedRecord], unions: List[CheckedUnion], signatures: List[AcceptedFunction],
+) -> Result[List[CheckedConstant], CheckError]:
 	var accepted: List[CheckedConstant] = []
 	var failure: Option[CheckError] = None
 	for row in inventory_constants(parsed.declarations):
 		result = match annotations.get(constant_number(row.id)):
-			Some(annotation): accept(row, annotation)
+			Some(annotation):
+				context: ConstructionContext = { module = row.declaration.module, namespace = namespace, records = records, unions = unions }
+				check_constant_initializer(row.declaration.value, annotation, context, signatures).map(pure func(value) -> CheckedConstant: {
+					id = row.id, annotation = annotation.span, value = value
+				})
 			None: Err(checker_invariant(row.declaration.name.span, InvalidConstantDeclaration(row.id)))
 		match result:
 			Ok(constant): accepted = accepted.append(constant)
@@ -83,9 +65,3 @@ pure func validate_constants(parsed: ParsedContents, namespace: Namespace) -> Re
 	match failure:
 		Some(error): Err(error)
 		None: Ok(accepted)
-
-
-pure func constant_row(constants: List[CheckedConstant], id: ConstantId, span: Span) -> Result[CheckedConstant, CheckError]:
-	match constants.get(constant_number(id)):
-		Some(row): Ok(row)
-		None: Err(checker_invariant(span, InvalidConstantDeclaration(id)))

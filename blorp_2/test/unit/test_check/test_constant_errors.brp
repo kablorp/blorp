@@ -1,10 +1,15 @@
 import:
 	../../../src/check/check: check, check_errors
+	../../../src/check/model as Model
+	../../../src/namespace/namespace: build_namespace
+	../constant_inputs: admitted_constants
 	../../../src/check/errors as Errors
 	../../../src/check/render: render_failure
-	../../../src/utils/ids: constant_number
+	../../../src/parse/assemble: parsed_contents
+	../../../src/utils/ids: constant_number, function_number, inventory_constants
 	../../../src/utils/source: module_source, root_module_id, same_source
-	../../../src/utils/syntax: same_span
+	../../../src/utils/names: same_name
+	../../../src/utils/syntax: same_span, CallNotation(DirectCall)
 	../module_input: ModuleInput, parse_modules
 	test: TestSuite
 
@@ -31,15 +36,18 @@ private pure func rejects(
 						and check_errors(failure).remaining.is_empty() and render_failure(failure).remaining.is_empty())
 
 
-private pure func nonclosed(prefix: String, expression: String) -> Bool:
+private pure func nonclosed_child(prefix: String, expression: String, suffix: String) -> Bool:
 	match_kind = pure func(kind: Errors.CheckErrorKind) -> Bool:
 		match kind:
 			Errors.ConstantRejection(Errors.NonClosedInitializer): True
 			_: False
-	rejects([{ source = prefix + expression + "\n" + MAIN, targets = [] }], prefix.length(), expression.length(),
+	rejects([{ source = prefix + expression + suffix + "\n" + MAIN, targets = [] }], prefix.length(), expression.length(),
 		match_kind,
-		"constant initializer is not a closed value", "use an Int, Float, or String literal")
+		"constant initializer is not a closed value", "use literals, constructor data, or named function references; calls, constant references and lambdas are not allowed")
 
+
+private pure func nonclosed(prefix: String, expression: String) -> Bool:
+	nonclosed_child(prefix, expression, "")
 
 pure func test_call_is_rejected_without_resolving_the_callee() -> Bool:
 	nonclosed("BAD: Int = ", "missing()")
@@ -53,12 +61,40 @@ pure func test_reference_waits_for_the_dependency_increment() -> Bool:
 	nonclosed("ANSWER: Int = 23\nBAD: Int = ", "ANSWER")
 
 
-pure func test_record_waits_for_the_record_increment() -> Bool:
-	nonclosed("fixed record Cell { value: Int }\nBAD: Cell = ", "{ value = 23 }")
+pure func test_record_initializer_publishes_a_checked_constructor() -> Bool:
+	match parse_modules([{ source = "fixed record Cell { value: Int }\nBAD: Cell = { value = 23 }\n" + MAIN, targets = [] }]):
+		Err(_): False
+		Ok(parsed):
+			match build_namespace(parsed):
+				Err(_): False
+				Ok(namespace):
+					match admitted_constants(parsed, namespace):
+						Ok([row]):
+							match row.value.form:
+								Model.ConstructRecord(owner, [field]):
+									match field.value.form:
+										Model.LiteralInteger(23): Model.same_type(row.value.value_type, Model.RecordType(owner))
+										_: False
+								_: False
+						_: False
 
 
-pure func test_list_is_not_a_scalar_initializer() -> Bool:
-	nonclosed("BAD: List[Int] = ", "[23]")
+pure func test_list_initializer_publishes_a_checked_constructor() -> Bool:
+	match parse_modules([{ source = "BAD: List[Int] = [23]\n" + MAIN, targets = [] }]):
+		Err(_): False
+		Ok(parsed):
+			match build_namespace(parsed):
+				Err(_): False
+				Ok(namespace):
+					match admitted_constants(parsed, namespace):
+						Ok([row]):
+							match row.value.form:
+								Model.ConstructList([element]):
+									match element.form:
+										Model.LiteralInteger(23): Model.same_type(row.value.value_type, Model.ListType(Model.IntType))
+										_: False
+								_: False
+						_: False
 
 
 pure func test_postfix_is_not_a_closed_literal() -> Bool:
@@ -131,19 +167,122 @@ pure func test_public_constant_cannot_expose_a_private_type() -> Bool:
 		"Secret is private but appears in public declaration VALUE", "make Secret public, or make VALUE private")
 
 
+pure func test_lambda_initializer_is_rejected_before_body_admission() -> Bool:
+	nonclosed("BAD: pure (Int) -> Int = ", "pure func(value: Int) -> Int: value")
+
+
+pure func test_record_update_initializer_is_not_closed() -> Bool:
+	nonclosed("fixed record Cell { value: Int }\nBAD: Cell = ", "{ missing | value = 23 }")
+
+
+pure func test_opaque_conversion_initializer_is_not_closed() -> Bool:
+	nonclosed("opaque type Secret = Int\nBAD: Secret = ", "into_opaque Secret(23)")
+
+
+pure func test_control_initializer_is_not_closed() -> Bool:
+	nonclosed("BAD: Int =\n    ", "if True:\n        1\n    else:\n        2")
+
+
+pure func test_missing_main_precedes_a_bad_initializer() -> Bool:
+	source = "BAD: Int = missing()\n"
+	kind = pure func(error: Errors.CheckErrorKind) -> Bool:
+		match error:
+			Errors.SignatureRejection(Errors.MissingMain): True
+			_: False
+	rejects([{ source = source, targets = [] }], source.length(), 0, kind,
+		"expected a main function", "declare func main() -> Int: as the entrypoint")
+
+
+pure func test_impure_named_initializer_cannot_satisfy_a_pure_annotation() -> Bool:
+	prefix = "func impure(value: Int) -> Int:\n    value\nBAD: pure (Int) -> Int = "
+	kind = pure func(error: Errors.CheckErrorKind) -> Bool:
+		match error:
+			Errors.CallRejection(Errors.ImpureCallback(id)): function_number(id) == 0
+			_: False
+	rejects([{ source = prefix + "impure\n" + MAIN, targets = [] }], prefix.length(), 6, kind,
+		"pure callback requires a pure function", "pass a pure named function; impure functions cannot satisfy a pure callable parameter")
+
+
+pure func test_declared_impure_constant_view_blocks_a_pure_caller() -> Bool:
+	prefix = "pure func identity(value: Int) -> Int:\n    value\nCALLBACK: (Int) -> Int = identity\npure func use() -> Int:\n    "
+	kind = pure func(error: Errors.CheckErrorKind) -> Bool:
+		match error:
+			Errors.CallRejection(Errors.ImpureCallableCall(Model.DeclaredBody(id))): function_number(id) == 1
+			_: False
+	rejects([{ source = prefix + "CALLBACK(7)\n" + MAIN, targets = [] }], prefix.length(), 8, kind,
+		"pure functions cannot call an impure callable", "use a pure callable type, or remove pure from the calling function")
+
+
+pure func test_nested_list_call_rejects_only_the_child_expression() -> Bool:
+	nonclosed_child("BAD: List[Int] = [", "missing()", "]")
+
+
+pure func test_nested_record_list_lambda_rejects_before_annotation_and_body_admission() -> Bool:
+	nonclosed_child("fixed record Box { callbacks: List[pure (Int) -> Int] }\nBAD: Box = { callbacks = [",
+		"pure func(value: Missing) -> Missing: absent", "] }")
+
+
+private pure func callable_arity(inputs: List[ModuleInput], prefix: String) -> Bool:
+	match parse_modules(inputs):
+		Err(_): False
+		Ok(parsed):
+			match inventory_constants(parsed_contents(parsed).declarations):
+				[row]:
+					match check(parsed):
+						Ok(_): False
+						Err(failure):
+							error = check_errors(failure).first
+							rendered = render_failure(failure).first
+							match error.kind:
+								Errors.CallRejection(Errors.ArgumentCountMismatch(arity)):
+									match arity.target:
+										Model.ConstantTarget(target):
+											(constant_number(target) == constant_number(row.id) and same_name(arity.callee, row.declaration.name.id)
+												and arity.expected == 1 and arity.actual == 0 and arity.notation == DirectCall
+												and error.span.start == prefix.length() and error.span.end == prefix.length() + 8
+												and same_source(error.span.source, module_source(root_module_id())) and same_span(rendered.span, error.span)
+												and rendered.message == "function requires one argument" and rendered.help == "pass one expression of the declared parameter type"
+												and rendered.note.is_none() and check_errors(failure).remaining.is_empty() and render_failure(failure).remaining.is_empty())
+										_: False
+								_: False
+				_: False
+
+
+pure func test_direct_callable_constant_arity_uses_its_published_constant_identity() -> Bool:
+	prefix = "pure func identity(value: Int) -> Int:\n    value\nCALLBACK: pure (Int) -> Int = identity\nfunc main() -> Int:\n    "
+	callable_arity([{ source = prefix + "CALLBACK()\n", targets = [] }], prefix)
+
+
+pure func test_qualified_callable_constant_arity_uses_its_published_constant_identity() -> Bool:
+	prefix = "import:\n    ./config as Config\nfunc main() -> Int:\n    Config."
+	helper = "pure func identity(value: Int) -> Int:\n    value\nCALLBACK: pure (Int) -> Int = identity\n"
+	callable_arity([{ source = prefix + "CALLBACK()\n", targets = [1] }, { source = helper, targets = [] }], prefix)
+
+
 tests: TestSuite = {
 	description = "Constant annotation and closed initializer diagnostics",
 	tests = [
 		("initializer calls are rejected without callee resolution", test_call_is_rejected_without_resolving_the_callee),
 		("grouped nonclosed initializer keeps its full span", test_grouped_call_rejects_the_complete_written_expression),
-		("initializer references remain outside the scalar increment", test_reference_waits_for_the_dependency_increment),
-		("record initializers remain outside the scalar increment", test_record_waits_for_the_record_increment),
-		("List is not a scalar initializer", test_list_is_not_a_scalar_initializer),
+		("initializer references remain outside the closed subset", test_reference_waits_for_the_dependency_increment),
+		("record initializer publishes its exact checked constructor", test_record_initializer_publishes_a_checked_constructor),
+		("List initializer publishes its exact checked constructor", test_list_initializer_publishes_a_checked_constructor),
 		("postfix is not a closed literal", test_postfix_is_not_a_closed_literal),
 		("all annotations precede any initializer", test_unused_bad_annotation_is_checked_before_any_initializer),
 		("unused constants retain annotation mismatch", test_unused_wrong_scalar_keeps_the_annotation_error),
 		("direct constant call carries declaration identity", test_constant_called_uses_declaration_identity),
 		("qualified constant call highlights the member", test_qualified_constant_called_highlights_the_member),
 		("public constant respects private type access", test_public_constant_cannot_expose_a_private_type),
+		("lambda initializer rejects before body admission", test_lambda_initializer_is_rejected_before_body_admission),
+		("record update initializer remains nonclosed", test_record_update_initializer_is_not_closed),
+		("opaque conversion initializer remains nonclosed", test_opaque_conversion_initializer_is_not_closed),
+		("control initializer remains nonclosed", test_control_initializer_is_not_closed),
+		("entrypoint diagnostics precede initializers", test_missing_main_precedes_a_bad_initializer),
+		("impure named initializer cannot satisfy pure annotation", test_impure_named_initializer_cannot_satisfy_a_pure_annotation),
+		("declared impure constant view blocks pure invocation", test_declared_impure_constant_view_blocks_a_pure_caller),
+		("nested List call keeps exact rejected child span", test_nested_list_call_rejects_only_the_child_expression),
+		("nested record List lambda rejects before body admission", test_nested_record_list_lambda_rejects_before_annotation_and_body_admission),
+		("direct callable arity pins published constant identity", test_direct_callable_constant_arity_uses_its_published_constant_identity),
+		("qualified callable arity pins published constant identity", test_qualified_callable_constant_arity_uses_its_published_constant_identity),
 	]
 }
