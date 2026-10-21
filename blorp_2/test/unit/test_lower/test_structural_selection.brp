@@ -1,0 +1,260 @@
+import:
+	../../../src/check/model as Model
+	../../../src/lower/lower as Lower
+	../../../src/specialize/specialize as Concrete
+	../managed_union_inputs: lowered, lowered_tail_join
+	test: TestSuite
+
+
+private NESTED_UNIONS: String =
+	|fixed union Inner:
+	|    Inner(String)
+	|fixed union Outer:
+	|    Outer(Inner)
+	|pure func chosen(value: Outer) -> String:
+	|    match value:
+	|        Outer(Inner(item)): item
+	|func main() -> Int:
+	|    unused = chosen(Outer(Inner("kept")))
+	|    0
+	|
+
+
+private EXACT_LIST: String =
+	|pure func chosen(values: List[String]) -> String:
+	|    match values:
+	|        [item]: item
+	|        _: "fallback"
+	|func main() -> Int:
+	|    unused = chosen(["kept"])
+	|    0
+	|
+
+
+private SUFFIX_LIST: String =
+	|pure func chosen(values: List[String]) -> List[String]:
+	|    match values:
+	|        [_, ...remaining]: remaining
+	|        _: []
+	|func main() -> Int:
+	|    unused = chosen(["head", "kept"])
+	|    0
+	|
+
+
+private pure func selected(source: String) -> Option[Lower.LoweredJoin]:
+	match lowered(source):
+		Err(_): None
+		Ok(program):
+			var found: Option[Lower.LoweredJoin] = None
+			for function in Lower.lowered_functions(program).functions:
+				match lowered_tail_join(function):
+					Some(join): found = Some(join)
+					None: void
+			found
+
+
+pure func test_nested_union_routes_materialize_each_immediate_parent_in_order() -> Bool:
+	match selected(NESTED_UNIONS):
+		None: False
+		Some(join):
+			join.selection.nodes.any(pure func(node):
+				match node:
+					Lower.EnterArm(edge):
+						match (edge.definitions, edge.arguments):
+							([Lower.BorrowUnionField(outer, outer_field, root), Lower.BorrowUnionField(inner, inner_field, parent)], [argument]):
+								(
+									Lower.value_number(root) == Lower.value_number(join.selection.scrutinee)
+									and Lower.value_number(parent) == Lower.value_number(outer.id)
+									and Lower.value_number(argument) == Lower.value_number(inner.id)
+									and Concrete.union_number(Concrete.variant_owner(Concrete.variant_field_variant(outer_field))) != Concrete.union_number(Concrete.variant_owner(Concrete.variant_field_variant(inner_field)))
+									and Concrete.same_type(inner.value_type, Concrete.StringType)
+								)
+							_: False
+					_: False
+			)
+
+
+pure func test_exact_list_length_stays_exact_before_index_projection() -> Bool:
+	match selected(EXACT_LIST):
+		None: False
+		Some(join):
+			join.selection.nodes.any(pure func(node):
+				match node:
+					Lower.TestListLength(place, Model.ExactLength(1), yes, no):
+						match (place.route, join.selection.nodes.get(Model.decision_node_number(yes)), join.selection.nodes.get(Model.decision_node_number(no))):
+							(Concrete.MatchRoot, Some(Lower.EnterArm(selected)), Some(Lower.EnterArm(fallback))):
+								match (selected.definitions, selected.arguments):
+									([Lower.BorrowListElement(parameter, 0, parent)], [argument]):
+										(
+											Model.match_arm_number(selected.arm) == 0
+											and Model.match_arm_number(fallback.arm) == 1
+											and fallback.definitions.is_empty()
+											and Concrete.same_type(parameter.value_type, Concrete.StringType)
+											and Lower.value_number(parent) == Lower.value_number(join.selection.scrutinee)
+											and Lower.value_number(argument) == Lower.value_number(parameter.id)
+										)
+									_: False
+							_: False
+					_: False
+			)
+
+
+pure func test_rest_capture_uses_minimum_length_and_one_suffix_definition() -> Bool:
+	match selected(SUFFIX_LIST):
+		None: False
+		Some(join):
+			join.selection.nodes.any(pure func(node):
+				match node:
+					Lower.TestListLength(_, Model.MinimumLength(1), yes, no):
+						match (join.selection.nodes.get(Model.decision_node_number(yes)), join.selection.nodes.get(Model.decision_node_number(no))):
+							(Some(Lower.EnterArm(selected)), Some(Lower.EnterArm(fallback))):
+								match (selected.definitions, selected.arguments):
+									([Lower.CopyListSuffix(parameter, parent, 1)], [argument]):
+										(
+											Model.match_arm_number(selected.arm) == 0
+											and Model.match_arm_number(fallback.arm) == 1
+											and fallback.definitions.is_empty()
+											and Concrete.same_type(parameter.value_type, Concrete.ListType(Concrete.StringType))
+											and Lower.value_number(parent) == Lower.value_number(join.selection.scrutinee)
+											and Lower.value_number(argument) == Lower.value_number(parameter.id)
+										)
+									_: False
+							_: False
+					_: False
+			)
+
+
+pure func test_string_test_inside_list_keeps_its_typed_route_and_exact_bytes() -> Bool:
+	source = "pure func chosen(values: List[String]) -> String:\n    match values:\n        [\"é\\0x\", item]: item\n        _: \"fallback\"\nfunc main() -> Int:\n    unused = chosen([\"é\\0x\", \"kept\"])\n    0\n"
+	match selected(source):
+		None: False
+		Some(join):
+			literal = join.selection.nodes.any(pure func(node):
+				match node:
+					Lower.TestStringBytes(place, bytes, _, _):
+						match place.route:
+							Concrete.ListElement(parent, 0):
+								match parent.route:
+									Concrete.MatchRoot: bytes == "é\0x" and Concrete.same_type(place.value_type, Concrete.StringType)
+									_: False
+							_: False
+					_: False
+			)
+			captured = join.selection.nodes.any(pure func(node):
+				match node:
+					Lower.EnterArm(edge):
+						match edge.definitions:
+							[Lower.BorrowListElement(_, 1, _)]: True
+							_: False
+					_: False
+			)
+			literal and captured
+
+
+pure func test_unused_rest_wildcard_materializes_no_selection_values() -> Bool:
+	source: String =
+		|pure func chosen(values: List[String]) -> Int:
+		|    match values:
+		|        [_, ..._]: 7
+		|        _: 0
+		|func main() -> Int:
+		|    chosen(["unused"])
+		|
+	match selected(source):
+		None: False
+		Some(join):
+			join.selection.nodes.all(pure func(node):
+				match node:
+					Lower.EnterArm(edge): edge.definitions.is_empty() and edge.arguments.is_empty()
+					_: True
+			)
+
+
+pure func test_edge_values_precede_all_canonical_inputs_and_bodies() -> Bool:
+	match selected(SUFFIX_LIST):
+		None: False
+		Some(join):
+			var edge_values: List[Int] = []
+			for node in join.selection.nodes:
+				match node:
+					Lower.EnterArm(edge):
+						for definition in edge.definitions:
+							match definition:
+								Lower.BorrowUnionField(parameter, _, _):
+									edge_values = edge_values.append(Lower.value_number(parameter.id))
+								Lower.BorrowListElement(parameter, _, _):
+									edge_values = edge_values.append(Lower.value_number(parameter.id))
+								Lower.CopyListSuffix(parameter, _, _):
+									edge_values = edge_values.append(Lower.value_number(parameter.id))
+					_: void
+			var valid = not edge_values.is_empty()
+			for arm in join.arms:
+				for input in arm.inputs:
+					valid = valid and edge_values.all(pure func(value): value < Lower.value_number(input.id))
+				for step in arm.steps:
+					match step:
+						Lower.Define(definition): valid = valid and edge_values.all(pure func(value): value < Lower.value_number(definition.id))
+						_: void
+			valid
+
+
+pure func test_shared_input_accepts_a_borrowed_list_or_a_constructed_suffix() -> Bool:
+	source: String =
+		|fixed union Input:
+		|    Whole(List[String])
+		|    Trim(List[String])
+		|pure func chosen(value: Input) -> List[String]:
+		|    match value:
+		|        Whole(items) | Trim([_, ...items]): items
+		|        Trim([]): []
+		|func main() -> Int:
+		|    unused = chosen(Trim(["head", "kept"]))
+		|    0
+		|
+	match selected(source):
+		None: False
+		Some(join):
+			borrowed = join.selection.nodes.any(pure func(node):
+				match node:
+					Lower.EnterArm(edge):
+						match (edge.definitions, edge.arguments):
+							([Lower.BorrowUnionField(parameter, _, _)], [argument]):
+								Model.match_arm_number(edge.arm) == 0 and Lower.value_number(parameter.id) == Lower.value_number(argument) and Concrete.same_type(parameter.value_type, Concrete.ListType(Concrete.StringType))
+							_: False
+					_: False
+			)
+			copied = join.selection.nodes.any(pure func(node):
+				match node:
+					Lower.EnterArm(edge):
+						match (edge.definitions, edge.arguments):
+							([Lower.BorrowUnionField(parent, _, _), Lower.CopyListSuffix(suffix, list, 1)], [argument]):
+								Model.match_arm_number(edge.arm) == 0 and Lower.value_number(parent.id) == Lower.value_number(list) and Lower.value_number(suffix.id) == Lower.value_number(argument)
+							_: False
+					_: False
+			)
+			match join.arms:
+				[shared, _]:
+					match (shared.inputs, shared.exit):
+						([input], Lower.Yield(outputs)):
+							(
+								borrowed and copied and shared.steps.is_empty()
+								and Lower.value_number(outputs.value) == Lower.value_number(input.id)
+								and outputs.carried.is_empty()
+							)
+						_: False
+				_: False
+
+
+tests: TestSuite = {
+	description = "Structural pattern lowering",
+	tests = [
+		("one input receives borrowed List or constructed suffix", test_shared_input_accepts_a_borrowed_list_or_a_constructed_suffix),
+		("nested Union routes preserve immediate parent order", test_nested_union_routes_materialize_each_immediate_parent_in_order),
+		("exact length dominates borrowed index", test_exact_list_length_stays_exact_before_index_projection),
+		("rest capture uses minimum length and copied suffix", test_rest_capture_uses_minimum_length_and_one_suffix_definition),
+		("List String test preserves route and exact bytes", test_string_test_inside_list_keeps_its_typed_route_and_exact_bytes),
+		("rest wildcard creates no selection values", test_unused_rest_wildcard_materializes_no_selection_values),
+		("all edges precede canonical inputs and bodies", test_edge_values_precede_all_canonical_inputs_and_bodies),
+	]
+}

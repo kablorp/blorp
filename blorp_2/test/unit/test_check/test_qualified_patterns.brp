@@ -1,7 +1,9 @@
 import:
+	../selection_inputs: checked_arm_variant, concrete_arm_variant
 	../../../src/check/check: CheckedProgram, check, checked_functions
 	../../../src/check/model as Checked
 	../../../src/utils/source: module_source, root_module_id, same_source
+	../../../src/utils/ids: VariantId
 	../../../src/utils/syntax: Diagnostic
 	../input: setup_diagnostic
 	../module_input: parse_modules
@@ -34,14 +36,23 @@ private pure func checked(source: String) -> Result[CheckedProgram, Diagnostic]:
 	check(parsed).map_err(setup_diagnostic)
 
 
+private pure func root_join(function: Checked.CheckedFunction) -> Option[Checked.CheckedJoin]:
+	match function.body:
+		Checked.CheckedValueBody(Checked.ReturnExpression(value)):
+			match value.form:
+				Checked.Match(join): Some(join)
+				_: None
+		_: None
+
+
 private pure func matched(source: String) -> Option[Checked.CheckedFunction]:
 	match checked(source):
 		Err(_): None
 		Ok(program):
 			var found: Option[Checked.CheckedFunction] = None
 			for function in checked_functions(program).functions:
-				match function.body:
-					Checked.CheckedMatchBody(_): found = Some(function)
+				match root_join(function):
+					Some(_): found = Some(function)
 					_: void
 			found
 
@@ -60,9 +71,9 @@ private pure func capture_has_field_facts(function: Checked.CheckedFunction, id:
 		_: False
 
 
-private pure func single_capture(captures: List[Option[Checked.BindingId]]) -> Option[Checked.BindingId]:
+private pure func single_capture(captures: List[Checked.BindingId]) -> Option[Checked.BindingId]:
 	if captures.length() == 1:
-		captures.get(0).and_then(pure func(capture): capture)
+		captures.get(0)
 	else:
 		None
 
@@ -93,25 +104,23 @@ pure func test_qualified_and_selected_patterns_retain_the_constructor_id() -> Bo
 	match matched(source):
 		None: False
 		Some(function):
-			match function.body:
-				Checked.CheckedMatchBody(body):
+			match root_join(function):
+				Some(body):
 					match (body.scrutinee.form, body.arms):
 						(Checked.ConstructVariant(constructed, [_]), [first, second]):
-							match (first.pattern, second.pattern):
-								(Checked.VariantCase(number, captures), Checked.VariantCase(_, [])):
+							match (checked_arm_variant(body.selection, first.id), first.inputs, second.inputs):
+								(Some(number), captures, []):
 									match single_capture(captures):
 										Some(capture):
-											match first.body:
-												Checked.ReturnExpression(value):
-													match value.form:
-														Checked.ReadBinding(read):
-															(
-																Checked.same_variant(constructed, number)
-																and Checked.binding_number(capture) == 0
-																and Checked.binding_number(read) == 0
-																and capture_has_field_facts(function, capture, source)
-															)
-														_: False
+											value = first.value
+											match value.form:
+												Checked.ReadBinding(read):
+													(
+														Checked.same_variant(constructed, number)
+														and Checked.binding_number(capture) == 0
+														and Checked.binding_number(read) == 0
+														and capture_has_field_facts(function, capture, source)
+													)
 												_: False
 										None: False
 								_: False
@@ -129,13 +138,13 @@ pure func test_qualified_pattern_publishes_the_selected_variant_identity() -> Bo
 	match matched(IMPORT + MAIN + "        H.Number(_): 42\n        _: 0\n"):
 		None: False
 		Some(function):
-			match function.body:
-				Checked.CheckedMatchBody(body):
+			match root_join(function):
+				Some(body):
 					match (body.scrutinee.form, body.arms):
 						(Checked.ConstructVariant(expected, [_]), [first, _]):
-							match first.pattern:
-								Checked.VariantCase(actual, captures):
-									Checked.same_variant(expected, actual) and captures.length() == 1
+							match checked_arm_variant(body.selection, first.id):
+								Some(actual):
+									Checked.same_variant(expected, actual) and first.inputs.is_empty()
 								_: False
 						_: False
 				_: False
@@ -155,17 +164,13 @@ pure func test_generic_qualified_capture_uses_the_scrutinee_argument() -> Bool:
 	match matched(source):
 		None: False
 		Some(function):
-			match function.body:
-				Checked.CheckedMatchBody(body):
+			match root_join(function):
+				Some(body):
 					match body.arms:
 						[first, _]:
-							match first.pattern:
-								Checked.VariantCase(_, captures):
-									match single_capture(captures):
-										Some(id):
-											Checked.binding_number(id) == 1 and capture_has_field_facts(function, id, source)
-										None: False
-								_: False
+							match single_capture(first.inputs):
+								Some(id): Checked.binding_number(id) == 1 and capture_has_field_facts(function, id, source)
+								None: False
 						_: False
 				_: False
 
@@ -245,13 +250,82 @@ pure func test_qualified_patterns_report_missing_coverage() -> Bool:
 
 pure func test_qualified_heads_keep_scrutinee_type_errors_first() -> Bool:
 	rejects(IMPORT + "func main() -> Int:\n    match ", "0", ":\n        Missing.Empty: 0\n        _: 1\n",
-		"match requires a union value", "match a typed union parameter or a call returning a declared union")
+		"match requires a union, List or String value", "match a union, List or String value; use if for a Boolean condition")
+
+
+private pure func nested_capture_has_constructor_facts(function: Checked.CheckedFunction, join: Checked.CheckedJoin, outer: VariantId, inner: VariantId, field_type: Checked.TypeRef, source: String) -> Bool:
+	var retained = False
+	for node in join.selection.nodes:
+		match node:
+			Checked.EnterArm(arm, [Checked.BorrowPlace(place)]):
+				match place.route:
+					Checked.UnionField(parent, nested, 0):
+						match parent.route:
+							Checked.UnionField(root, enclosing, 0):
+								match root.route:
+									Checked.MatchRoot:
+										retained = (
+											Checked.match_arm_number(arm) == 0
+											and Checked.same_variant(inner, nested)
+											and Checked.same_variant(outer, enclosing)
+											and Checked.same_type(parent.value_type, field_type)
+											and Checked.same_type(place.value_type, Checked.IntType)
+											and Checked.same_type(root.value_type, join.scrutinee.value_type)
+										)
+									_: void
+							_: void
+					_: void
+			_: void
+	match join.arms:
+		[first, second, third]:
+			match (first.inputs, first.value.form):
+				([capture], Checked.ReadBinding(read)):
+					(
+						retained and Checked.binding_number(capture) == Checked.binding_number(read)
+						and capture_has_field_facts(function, capture, source)
+						and second.inputs.is_empty() and third.inputs.is_empty()
+					)
+				_: False
+		_: False
 
 
 pure func test_qualified_and_bare_heads_share_nested_field_admission() -> Bool:
+	source: String =
+		|import:
+		|    ./shapes as H: Shape(Empty)
+		|func main() -> Int:
+		|    value: H.Maybe[H.Shape] = H.Present(H.Number(42))
+		|    match value:
+		|        H.Present(H.Number(item)): item
+		|        H.Present(Empty): 0
+		|        H.Missing: 0
+		|
+	match matched(source):
+		None: False
+		Some(function):
+			match root_join(function):
+				None: False
+				Some(join):
+					match (function.statements, join.scrutinee.form):
+						([Checked.InitializeBinding(binding, value)], Checked.ReadBinding(read)):
+							match value.form:
+								Checked.ConstructVariant(outer, [field]):
+									match field.form:
+										Checked.ConstructVariant(inner, [_]):
+											(
+												Checked.binding_number(binding) == Checked.binding_number(read)
+												and Checked.same_type(value.value_type, join.scrutinee.value_type)
+												and nested_capture_has_constructor_facts(function, join, outer, inner, field.value_type, source)
+											)
+										_: False
+								_: False
+						_: False
+
+
+pure func test_nested_qualified_head_keeps_the_field_type_error() -> Bool:
 	rejects(IMPORT + MAIN + "        H.Number(", "Missing.Empty", "): 42\n        H.Empty: 0\n",
-		"nested patterns are not supported yet",
-		"bind the field to a name and match it in a second match; nested patterns arrive with the pattern-compilation milestone")
+		"pattern does not match the value's type",
+		"use a constructor of that union, a List pattern for a List, or a String literal for a String")
 
 
 pure func test_private_qualified_heads_fail_visibility_before_arity() -> Bool:
@@ -295,7 +369,7 @@ pure func test_qualifying_an_imported_constructor_does_not_reexport_it() -> Bool
 
 
 tests: TestSuite = {
-	description = "Qualified flat constructor patterns",
+	description = "Qualified constructor patterns",
 	tests = [
 		("qualified and selected patterns retain constructor identity", test_qualified_and_selected_patterns_retain_the_constructor_id),
 		("qualified nullary parentheses and wildcard fields", test_qualified_nullary_parentheses_and_wildcard_fields_are_accepted),
@@ -314,6 +388,7 @@ tests: TestSuite = {
 		("qualified patterns report missing coverage", test_qualified_patterns_report_missing_coverage),
 		("qualified heads keep scrutinee errors first", test_qualified_heads_keep_scrutinee_type_errors_first),
 		("qualified and bare heads share nested field admission", test_qualified_and_bare_heads_share_nested_field_admission),
+		("nested qualified head keeps field type error", test_nested_qualified_head_keeps_the_field_type_error),
 		("private qualified heads fail visibility before arity", test_private_qualified_heads_fail_visibility_before_arity),
 		("imported constructors are not reexported", test_qualifying_an_imported_constructor_does_not_reexport_it),
 	]

@@ -1,0 +1,265 @@
+import:
+	../../../src/check/check: CheckedProgram, check, checked_functions
+	../../../src/check/model as Checked
+	../../../src/utils/syntax: Diagnostic
+	../../../src/utils/source: module_source, root_module_id, same_source
+	../module_input: TEST_BASE, parse_modules_with_base
+	../input: setup_diagnostic, checked_tail_join
+	result: map_err
+	test: TestSuite
+
+
+private MAIN: String = "func main() -> Int:\n    0\n"
+
+
+private pure func program(source: String) -> Result[CheckedProgram, Diagnostic]:
+	parsed ?= parse_modules_with_base([{ source = source, targets = [] }], TEST_BASE)
+	check(parsed).map_err(setup_diagnostic)
+
+
+private pure func joined(source: String) -> Option[Checked.CheckedJoin]:
+	match program(source):
+		Err(_): None
+		Ok(accepted): checked_functions(accepted).functions.get(0).and_then(pure func(function): checked_tail_join(function.body))
+
+
+private pure func rejects(source: String, start: Int, length: Int, message: String, help: String) -> Bool:
+	match program(source):
+		Ok(_): False
+		Err(error):
+			(
+				same_source(error.span.source, module_source(root_module_id()))
+				and error.span.start == start and error.span.end == start + length
+				and error.message == message and error.help == help and error.note.is_none()
+			)
+
+
+pure func test_nested_missing_witness_identifies_the_inner_constructor() -> Bool:
+	prefix = "pure func chosen(value: Option[Option[Int]]) -> Int:\n    "
+	body = "match value:\n        Some(Some(item)): item\n        None: 0\n"
+	rejects(prefix + body + MAIN, prefix.length(), 5, "non-exhaustive match", "add an arm for the missing pattern: Some(None)")
+
+
+pure func test_nested_covered_constructor_has_its_exact_later_span() -> Bool:
+	prefix = "pure func chosen(value: Option[Option[Int]]) -> Int:\n    match value:\n        Some(_): 0\n        "
+	written = "Some(Some(item))"
+	rejects(prefix + written + ": item\n        None: 0\n" + MAIN, prefix.length(), written.length(), "match arm is unreachable", "remove this arm; earlier arms already cover all values it could match")
+
+
+pure func test_nested_or_coverage_precedes_renamed_binding_mismatch() -> Bool:
+	prefix = "pure func chosen(value: Option[Option[Int]]) -> Int:\n    match value:\n        Some(Some(item) | "
+	written = "Some(other)"
+	rejects(prefix + written + "): item\n        _: 0\n" + MAIN, prefix.length(), written.length(), "match arm is unreachable", "remove this arm; earlier arms already cover all values it could match")
+
+
+pure func test_duplicate_alternative_precedes_a_later_unknown_constructor() -> Bool:
+	declarations = "fixed union Choice:\n    Left(Int, Int)\n    Right(Int, Int)\n"
+	prefix = declarations + "pure func chosen(value: Choice) -> Int:\n    match value:\n        Left(_, _) | "
+	written = "Left(_, _)"
+	rejects(prefix + written + " | Missing(): 0\n        Right(_, _): 1\n" + MAIN, prefix.length(), written.length(), "match arm is unreachable", "remove this arm; earlier arms already cover all values it could match")
+
+
+pure func test_nested_binder_type_mismatch_precedes_a_later_unknown_constructor() -> Bool:
+	declarations = "fixed union Value:\n    Number(Int)\n    Text(String)\nfixed union Wrapped:\n    Wrapped(Value)\n"
+	prefix = declarations + "pure func chosen(value: Wrapped) -> Int:\n    match value:\n        Wrapped(Number(item) | Text("
+	rejects(prefix + "item) | Missing()): item\n" + MAIN, prefix.length(), 4, "or-pattern binding has different types", "bind each name to the same type in every alternative, or use separate match arms")
+
+
+pure func test_nested_binder_type_mismatch_precedes_a_later_duplicate_binding() -> Bool:
+	declarations = "fixed union Value:\n    Number(Int)\n    Text(String)\n    Pair(Int, Int)\nfixed union Wrapped:\n    Wrapped(Value)\n"
+	prefix = declarations + "pure func chosen(value: Wrapped) -> Int:\n    match value:\n        Wrapped(Number(item) | Text("
+	rejects(prefix + "item) | Pair(item, item)): item\n" + MAIN, prefix.length(), 4, "or-pattern binding has different types", "bind each name to the same type in every alternative, or use separate match arms")
+
+
+pure func test_nested_binder_type_mismatch_precedes_a_later_field_resolution_failure() -> Bool:
+	declarations = "fixed union Value:\n    Number(Int)\n    Text(String)\nfixed union Wrapped:\n    Wrapped(Value, Option[Int])\n"
+	prefix = declarations + "pure func chosen(value: Wrapped) -> Int:\n    match value:\n        Wrapped(Number(item) | Text("
+	rejects(prefix + "item), Missing()): item\n" + MAIN, prefix.length(), 4, "or-pattern binding has different types", "bind each name to the same type in every alternative, or use separate match arms")
+
+
+pure func test_partial_or_product_remains_useful_in_its_other_combinations() -> Bool:
+	source: String =
+		|fixed union Color:
+		|    A
+		|    B
+		|fixed union Pair:
+		|    Pair(Color, Color)
+		|pure func chosen(value: Pair) -> Int:
+		|    match value:
+		|        Pair(A, A): 1
+		|        Pair(A | B, A | B): 2
+		|func main() -> Int:
+		|    0
+		|
+	program(source).is_ok()
+
+
+pure func test_list_missing_witness_requires_nonempty_lengths() -> Bool:
+	prefix = "pure func chosen(values: List[Int]) -> Int:\n    "
+	rejects(prefix + "match values:\n        []: 0\n" + MAIN, prefix.length(), 5, "non-exhaustive match", "add an arm for the missing pattern: [_, ..._]")
+
+
+pure func test_list_missing_singleton_witness_keeps_nested_none() -> Bool:
+	prefix = "pure func chosen(values: List[Option[Int]]) -> Int:\n    "
+	body: String =
+		|match values:
+		|        []: 0
+		|        [Some(_)]: 1
+		|        [_, _, ..._]: 2
+		|
+	rejects(
+		prefix + body + MAIN,
+		prefix.length(),
+		5,
+		"non-exhaustive match",
+		"add an arm for the missing pattern: [None]",
+	)
+
+
+pure func test_exact_singleton_keeps_longer_lengths_available() -> Bool:
+	source: String =
+		|pure func chosen(values: List[Int]) -> Int:
+		|    match values:
+		|        []: 0
+		|        [item]: item
+		|        _: 2
+		|func main() -> Int:
+		|    0
+		|
+	match joined(source):
+		None: False
+		Some(join):
+			var empty = False
+			var singleton = False
+			var captured = False
+			for node in join.selection.nodes:
+				match node:
+					Checked.TestListLength(_, Checked.ExactLength(0), _, _): empty = True
+					Checked.TestListLength(_, Checked.ExactLength(1), _, _): singleton = True
+					Checked.EnterArm(_, [Checked.BorrowPlace(place)]):
+						match place.route:
+							Checked.ListElement(_, 0): captured = Checked.same_type(place.value_type, Checked.IntType)
+							_: void
+					_: void
+			empty and singleton and captured and join.arms.length() == 3
+
+
+pure func test_minimum_length_guard_precedes_suffix_argument() -> Bool:
+	source: String =
+		|pure func chosen(values: List[String]) -> List[String]:
+		|    match values:
+		|        [first, ...remaining]: remaining
+		|        []: []
+		|func main() -> Int:
+		|    0
+		|
+	match joined(source):
+		None: False
+		Some(join):
+			var guarded = False
+			var copied = False
+			for node in join.selection.nodes:
+				match node:
+					Checked.TestListLength(_, Checked.MinimumLength(1), _, _): guarded = True
+					Checked.EnterArm(_, [Checked.BorrowPlace(_), Checked.CopyListSuffix(parent, 1)]):
+						copied = Checked.same_type(parent.value_type, Checked.ListType(Checked.StringType))
+					_: void
+			guarded and copied and join.arms.length() == 2
+
+
+pure func test_string_tests_keep_decoded_utf8_and_embedded_nul_bytes() -> Bool:
+	source = "pure func chosen(text: String) -> Int:\n    match text:\n        \"é\\0x\": 1\n        _: 0\n" + MAIN
+	match joined(source):
+		None: False
+		Some(join):
+			var exact = False
+			for node in join.selection.nodes:
+				match node:
+					Checked.TestStringBytes(place, bytes, _, _): exact = bytes == "é\0x" and bytes.length() == 4 and Checked.same_type(place.value_type, Checked.StringType)
+					_: void
+			exact
+
+
+pure func test_string_literals_need_a_catchall_for_other_bytes() -> Bool:
+	prefix = "pure func chosen(text: String) -> Int:\n    "
+	rejects(prefix + "match text:\n        \"known\": 1\n" + MAIN, prefix.length(), 5, "non-exhaustive match", "add an arm for the missing pattern: _")
+
+
+pure func test_nested_or_binders_require_exact_instantiated_types() -> Bool:
+	declarations = "fixed union Value:\n    Number(Int)\n    Text(String)\nfixed union Wrapped:\n    Wrapped(Value)\n"
+	prefix = declarations + "pure func chosen(value: Wrapped) -> Int:\n    match value:\n        Wrapped(Number(item) | Text("
+	rejects(prefix + "item)): item\n" + MAIN, prefix.length(), 4, "or-pattern binding has different types", "bind each name to the same type in every alternative, or use separate match arms")
+
+
+pure func test_borrowed_list_and_copied_suffix_share_one_typed_input() -> Bool:
+	source: String =
+		|fixed union Values:
+		|    Whole(List[String])
+		|    Tail(List[String])
+		|pure func chosen(value: Values) -> List[String]:
+		|    match value:
+		|        Whole(items) | Tail([_, ...items]): items
+		|        Tail([]): []
+		|func main() -> Int:
+		|    0
+		|
+	match joined(source):
+		None: False
+		Some(join):
+			var borrowed = False
+			var suffix = False
+			for node in join.selection.nodes:
+				match node:
+					Checked.EnterArm(arm, [Checked.BorrowPlace(place)]):
+						borrowed = Checked.match_arm_number(arm) == 0 and Checked.same_type(place.value_type, Checked.ListType(Checked.StringType))
+					Checked.EnterArm(arm, [Checked.CopyListSuffix(place, 1)]):
+						suffix = Checked.match_arm_number(arm) == 0 and Checked.same_type(place.value_type, Checked.ListType(Checked.StringType))
+					_: void
+			match join.arms:
+				[shared, _]: borrowed and suffix and shared.inputs.length() == 1
+				_: False
+
+
+pure func test_nested_selection_keeps_one_body_per_source_arm_under_depth() -> Bool:
+	depth = 24
+	var value_type = "Int"
+	var pattern = "item"
+	var remaining = depth
+	while remaining > 0:
+		value_type = "Option[" + value_type + "]"
+		pattern = "Some(" + pattern + ")"
+		remaining = remaining - 1
+	source = "pure func chosen(value: " + value_type + ") -> Int:\n    match value:\n        " + pattern + ": item\n        _: 0\n" + MAIN
+	match joined(source):
+		None: False
+		Some(join):
+			var tests = 0
+			for node in join.selection.nodes:
+				match node:
+					Checked.TestVariant(_, _, _, _): tests = tests + 1
+					_: void
+			tests == depth and join.arms.length() == 2
+
+
+tests: TestSuite = {
+	description = "Typed structural matrix selection",
+	tests = [
+		("nested missing witness names inner constructor", test_nested_missing_witness_identifies_the_inner_constructor),
+		("covered nested constructor has later span", test_nested_covered_constructor_has_its_exact_later_span),
+		("nested coverage precedes binder mismatch", test_nested_or_coverage_precedes_renamed_binding_mismatch),
+		("duplicate alternative precedes later unknown constructor", test_duplicate_alternative_precedes_a_later_unknown_constructor),
+		("nested type mismatch precedes later unknown constructor", test_nested_binder_type_mismatch_precedes_a_later_unknown_constructor),
+		("nested type mismatch precedes later duplicate binding", test_nested_binder_type_mismatch_precedes_a_later_duplicate_binding),
+		("nested type mismatch precedes later field failure", test_nested_binder_type_mismatch_precedes_a_later_field_resolution_failure),
+		("partially covered Or products remain useful", test_partial_or_product_remains_useful_in_its_other_combinations),
+		("List missing witness includes nonempty lengths", test_list_missing_witness_requires_nonempty_lengths),
+		("List missing singleton witness keeps nested None", test_list_missing_singleton_witness_keeps_nested_none),
+		("exact singleton keeps longer lengths", test_exact_singleton_keeps_longer_lengths_available),
+		("minimum length guards copied suffix", test_minimum_length_guard_precedes_suffix_argument),
+		("String test keeps UTF8 and NUL bytes", test_string_tests_keep_decoded_utf8_and_embedded_nul_bytes),
+		("String literals require catchall", test_string_literals_need_a_catchall_for_other_bytes),
+		("nested binders use exact semantic types", test_nested_or_binders_require_exact_instantiated_types),
+		("borrowed List and copied suffix share input", test_borrowed_list_and_copied_suffix_share_one_typed_input),
+		("nested depth preserves common source bodies", test_nested_selection_keeps_one_body_per_source_arm_under_depth),
+	]
+}

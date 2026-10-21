@@ -1,0 +1,200 @@
+import:
+	../../../src/lower/lower as Lower
+	../../../src/own/own as Own
+	../../../src/specialize/specialize as Concrete
+	../../../src/utils/syntax: Diagnostic
+	../input: checked_source
+	test: TestSuite
+
+
+private APPLY: String =
+	|pure func apply[A, B](callback: pure (A) -> B, value: A) -> B:
+	|    callback(value)
+	|
+
+
+private CAPTURE: String =
+	|func main() -> Int:
+	|    text = "shared"
+	|    unused = apply(pure func(_: Int) -> String: text, 0)
+	|    0
+	|
+
+
+private pure func owned(source: String) -> Result[Own.OwnershipProgram, Diagnostic]:
+	checked ?= checked_source(source)
+	concrete ?= Concrete.specialize(checked)
+	lowered ?= Lower.lower(concrete)
+	Own.own(lowered)
+
+
+private pure func same_value(left: Lower.ValueId, right: Lower.ValueId) -> Bool:
+	Lower.value_number(left) == Lower.value_number(right)
+
+
+private pure func same_owner(left: Own.OwnerId, right: Own.OwnerId) -> Bool:
+	Own.owner_number(left) == Own.owner_number(right)
+
+
+private pure func projected_fields(function: Own.OwnedFunction) -> List[Int]:
+	function.operations.filter_map(pure func(operation):
+		match operation:
+			Own.DefineValue(definition):
+				match definition.operation:
+					Own.ReadRecordFieldDefinition(field, _): Some(Concrete.field_number(field))
+					_: None
+			_: None
+	)
+
+
+pure func test_captured_string_projection_acquires_its_return_owner() -> Bool:
+	match owned(APPLY + CAPTURE):
+		Err(_): False
+		Ok(program):
+			program.functions.any(pure func(function):
+				match (function.operations, function.result):
+					([Own.DefineValue(environment), Own.DefineValue(_), Own.DefineValue(field), Own.AcquireOwner(owner, borrow, _)], Own.OwnedReturn(result, transferred)):
+						match (field.operation, field.result, borrow.source):
+							(Own.ReadRecordFieldDefinition(_, Own.BorrowedArgument(parent)), Own.BorrowedResult(Own.PayloadBorrow(source)), Own.PayloadBorrow(acquired_source)):
+								match parent.source:
+									Own.ParameterBorrow(parameter):
+										(
+											same_value(parent.value, environment.id)
+											and same_value(parameter, environment.id)
+											and same_value(source, environment.id)
+											and same_value(acquired_source, environment.id)
+											and same_value(borrow.value, field.id)
+											and same_value(result, field.id)
+											and same_owner(owner, transferred)
+											and Concrete.same_type(field.value_type, Concrete.StringType)
+										)
+									_: False
+							_: False
+					_: False
+			)
+
+
+pure func test_caller_drops_environment_and_unused_result_once_after_the_call() -> Bool:
+	match owned(APPLY + CAPTURE):
+		Err(_): False
+		Ok(program):
+			match program.functions:
+				[main, ..._]:
+					match main.operations:
+						[Own.DefineValue(_), Own.AcquireOwner(_, _, _), Own.DefineValue(environment), Own.DropOwner(_, _), Own.DefineValue(_), Own.DefineValue(call), Own.DropOwner(dropped_env, _), Own.DropOwner(dropped_result, _), Own.DefineValue(_)]:
+							match (environment.result, call.result, call.operation):
+								(Own.OwnedResult(env_owner), Own.OwnedResult(result_owner), Own.CallDefinition(_, [Own.BorrowedArgument(argument), Own.UnmanagedArgument(_)])):
+									match argument.source:
+										Own.OwnerBorrow(borrowed):
+											(
+												same_value(argument.value, environment.id)
+												and same_owner(borrowed, env_owner)
+												and same_owner(dropped_env, env_owner)
+												and same_owner(dropped_result, result_owner)
+												and not same_owner(env_owner, result_owner)
+											)
+										_: False
+								_: False
+						_: False
+				_: False
+
+
+pure func test_alias_captures_acquire_each_field_and_repeated_reads_reuse_the_field() -> Bool:
+	source: String =
+		|func main() -> Int:
+		|    first = "shared"
+		|    second = first
+		|    unused = apply(pure func(_: Int) -> String:
+		|        saved = first
+		|        repeated = first
+		|        second
+		|    , 0)
+		|    0
+		|
+	match owned(APPLY + source):
+		Err(_): False
+		Ok(program):
+			match program.functions:
+				[main, lambda, _]:
+					match main.operations:
+						[Own.DefineValue(text), Own.AcquireOwner(left, left_borrow, _), Own.AcquireOwner(right, right_borrow, _), Own.DefineValue(environment), ..._]:
+							match environment.operation:
+								Own.ConstructRecordDefinition(_, [first_slot, second_slot]):
+									match (first_slot.value, second_slot.value, text.result):
+										(Own.OwnedPayload(first_value, first_owner), Own.OwnedPayload(second_value, second_owner), Own.OwnedResult(original)):
+											(
+												same_value(first_value, text.id) and same_value(second_value, text.id)
+												and same_value(left_borrow.value, text.id) and same_value(right_borrow.value, text.id)
+												and same_owner(first_owner, left) and same_owner(second_owner, right)
+												and not same_owner(left, right)
+												and borrows_owner(left_borrow.source, original) and borrows_owner(right_borrow.source, original)
+												and Concrete.field_number(first_slot.field) == 0 and Concrete.field_number(second_slot.field) == 1
+												and projected_fields(lambda) == [0, 0, 1]
+											)
+										_: False
+								_: False
+						_: False
+				_: False
+
+
+private pure func borrows_owner(source: Own.BorrowSource, owner: Own.OwnerId) -> Bool:
+	match source:
+		Own.OwnerBorrow(borrowed): same_owner(borrowed, owner)
+		_: False
+
+
+pure func test_unused_callback_still_releases_its_nonempty_environment() -> Bool:
+	source: String =
+		|pure func ignore(callback: pure (Int) -> String, value: Int) -> Int:
+		|    value
+		|func main() -> Int:
+		|    text = "unused capture"
+		|    ignored = ignore(pure func(_: Int) -> String: text, 7)
+		|    0
+		|
+	match owned(source):
+		Err(_): False
+		Ok(program):
+			match program.functions:
+				[main, ..._]:
+					match main.operations:
+						[Own.DefineValue(_), Own.AcquireOwner(_, _, _), Own.DefineValue(environment), Own.DropOwner(_, _), Own.DefineValue(_), Own.DefineValue(call), Own.DropOwner(dropped, _), Own.DefineValue(_)]:
+							match (environment.operation, environment.result, call.result):
+								(Own.ConstructRecordDefinition(_, [_]), Own.OwnedResult(owner), Own.UnmanagedResult):
+									same_owner(owner, dropped)
+								_: False
+						_: False
+				_: False
+
+
+pure func test_forwarding_transfers_the_owned_call_result_without_reacquiring() -> Bool:
+	match owned(APPLY + CAPTURE):
+		Err(_): False
+		Ok(program):
+			program.functions.any(pure func(function):
+				match (function.operations, function.result):
+					([Own.DefineValue(environment), Own.DefineValue(_), Own.DefineValue(call)], Own.OwnedReturn(result, returned)):
+						match (call.operation, call.result):
+							(Own.CallDefinition(_, [Own.BorrowedArgument(argument), Own.UnmanagedArgument(_)]), Own.OwnedResult(owner)):
+								match argument.source:
+									Own.ParameterBorrow(parameter):
+										(
+											same_value(parameter, environment.id) and same_value(argument.value, environment.id)
+											and same_value(result, call.id) and same_owner(owner, returned)
+										)
+									_: False
+							_: False
+					_: False
+			)
+
+
+tests: TestSuite = {
+	description = "Immutable capture ownership uses ordinary managed record lifetimes",
+	tests = [
+		("captured String projection acquires its return owner", test_captured_string_projection_acquires_its_return_owner),
+		("caller drops environment and unused result once", test_caller_drops_environment_and_unused_result_once_after_the_call),
+		("aliases own separate fields and repeated reads reuse fields", test_alias_captures_acquire_each_field_and_repeated_reads_reuse_the_field),
+		("unused callback releases nonempty environment", test_unused_callback_still_releases_its_nonempty_environment),
+		("forwarding transfers owned call result", test_forwarding_transfers_the_owned_call_result_without_reacquiring),
+	]
+}

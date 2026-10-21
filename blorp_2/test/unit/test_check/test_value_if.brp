@@ -1,0 +1,407 @@
+import:
+	../../../src/check/check: CheckedProgram, check, checked_functions, check_errors
+	../../../src/check/render: render_failure
+	../../../src/check/errors as Errors
+	../../../src/utils/source: module_source, root_module_id
+	../../../src/utils/syntax: same_span
+	../../../src/lex/lex: lex
+	../../../src/parse/parse: parse_module
+	../../../src/utils/names: program_names
+	system: read_file
+	io: print
+	../../../src/check/model as Model
+	../module_input: TEST_BASE, INTEGER_OPERATIONS, parse_modules_with_base, parse_modules_with_libraries
+	test: TestSuite
+
+
+private pure func checked(source: String) -> Option[CheckedProgram]:
+	parsed ?= parse_modules_with_base([{ source = source, targets = [] }], TEST_BASE).to_option()
+	check(parsed).to_option()
+
+
+pure func test_annotated_initializer_is_an_int_join() -> Bool:
+	source: String =
+		|func main() -> Int:
+		|    flag: Bool = True
+		|    selected: Int = if flag:
+		|        41
+		|    else:
+		|        0
+		|    add(selected, 1)
+		|
+	match checked(source + INTEGER_OPERATIONS):
+		None: False
+		Some(program):
+			match checked_functions(program).functions.get(0):
+				None: False
+				Some(function):
+					match function.statements:
+						[Model.InitializeBinding(_, _), Model.InitializeBinding(_, value)]:
+							match value.form:
+								Model.Match(join):
+									match join.arms:
+										[first, second]:
+											match (first.value.form, second.value.form):
+												(Model.LiteralInteger(41), Model.LiteralInteger(0)):
+													Model.same_type(value.value_type, Model.IntType) and join.carried.is_empty()
+												_: False
+										_: False
+								_: False
+						_: False
+
+
+pure func test_return_if_uses_the_expected_nominal_constructor_type() -> Bool:
+	source: String =
+		|fixed union Choice:
+		|    First
+		|    Second
+		|pure func choose(flag: Bool) -> Choice:
+		|    if flag:
+		|        First
+		|    else:
+		|        Second
+		|func main() -> Int:
+		|    0
+		|
+	checked(source).is_some()
+
+
+pure func test_synthesized_initializer_takes_the_then_type() -> Bool:
+	source: String =
+		|func main() -> Int:
+		|    selected = if True:
+		|        41
+		|    else:
+		|        0
+		|    add(selected, 1)
+		|
+	checked(source + INTEGER_OPERATIONS).is_some()
+
+
+pure func test_absent_else_accepts_inferred_and_annotated_void_bindings() -> Bool:
+	source: String =
+		|func main() -> Int:
+		|    inferred = if True:
+		|        void
+		|    annotated: Void = if False:
+		|        void
+		|    statement_only: Void = if True:
+		|        local = 1
+		|    0
+		|
+	checked(source).is_some()
+
+
+pure func test_absent_else_preserves_a_final_statement_match() -> Bool:
+	source: String =
+		|func main() -> Int:
+		|    flag: Bool = True
+		|    ignored: Void = if flag:
+		|        match flag:
+		|            True:
+		|                local = 1
+		|            False: void
+		|    0
+		|
+	checked(source).is_some()
+
+
+pure func test_generic_record_branches_receive_the_return_type() -> Bool:
+	source: String =
+		|fixed record Box[T] { value: T }
+		|pure func choose[T](flag: Bool, left: T, right: T) -> Box[T]:
+		|    if flag:
+		|        { value = left }
+		|    else:
+		|        { value = right }
+		|func main() -> Int:
+		|    result = choose(True, 41, 0)
+		|    result.value
+		|
+	checked(source).is_some()
+
+
+pure func test_opaque_results_keep_their_nominal_identity() -> Bool:
+	source: String =
+		|opaque type Token = String
+		|pure func choose(flag: Bool) -> Token:
+		|    if flag:
+		|        into_opaque Token("chosen")
+		|    else:
+		|        into_opaque Token("other")
+		|func main() -> Int:
+		|    token = choose(True)
+		|    0
+		|
+	checked(source).is_some()
+
+
+private pure func void_tail_facts() -> Option[Bool]:
+	source: String =
+		|func ignore(flag: Bool) -> Void:
+		|    if flag:
+		|        1
+		|    else:
+		|        "ignored"
+		|func main() -> Int:
+		|    ignore(True)
+		|    0
+		|
+	accepted ?= checked(source)
+	function ?= checked_functions(accepted).functions.get(0)
+	match function.statements:
+		[Model.DiscardExpression(value)]:
+			match value.form:
+				Model.Match(join):
+					match join.arms:
+						[first, second]:
+							Some(Model.same_type(value.value_type, Model.VoidType)
+								and Model.same_type(first.value.value_type, Model.VoidType)
+								and Model.same_type(second.value.value_type, Model.VoidType)
+								and first.statements.length() == 1 and second.statements.length() == 1)
+						_: None
+				_: None
+		_: None
+
+
+pure func test_void_tail_discards_heterogeneous_branch_values_once() -> Bool:
+	void_tail_facts().get_or(False)
+
+
+private pure func rejects(source: String, prefix: String, marked: String, message: String, help: String) -> Bool:
+	match parse_modules_with_base([{ source = source, targets = [] }], TEST_BASE):
+		Err(_): False
+		Ok(parsed):
+			match check(parsed):
+				Ok(_): False
+				Err(failure):
+					diagnostics = render_failure(failure)
+					errors = check_errors(failure)
+					diagnostic = diagnostics.first
+					(errors.remaining.is_empty() and diagnostics.remaining.is_empty()
+						and diagnostic.message == message and diagnostic.help == help
+						and same_span(diagnostic.span, { source = module_source(root_module_id()), start = prefix.length(), end = prefix.length() + marked.length() })
+						and diagnostic.note.is_none())
+
+
+pure func test_nonboolean_condition_rejects_before_branch_errors() -> Bool:
+	prefix = "func main() -> Int:\n    selected: Int = if "
+	tail: String =
+		|1:
+		|        missing
+		|    else:
+		|        also_missing
+		|    selected
+		|
+	rejects(prefix + tail, prefix, "1", "condition must have the designated Bool type", "use a Bool value as the condition")
+
+
+pure func test_annotated_branches_reject_a_mismatched_else_value() -> Bool:
+	prefix: String =
+		|func main() -> Int:
+		|    selected: Int = if True:
+		|        41
+		|    else:
+		|
+	before = prefix + "        "
+	tail = "\"wrong\"\n    selected\n"
+	rejects(before + tail, before, "\"wrong\"", "expression does not match the expected type", "use an expression of type Int here")
+
+
+pure func test_synthesized_branches_reject_a_mismatched_else_value() -> Bool:
+	prefix: String =
+		|func main() -> Int:
+		|    selected = if True:
+		|        41
+		|    else:
+		|
+	before = prefix + "        "
+	tail = "\"wrong\"\n    selected\n"
+	rejects(before + tail, before, "\"wrong\"", "expression does not match the expected type", "the then branch decides this if's type, Int; give every branch a value of type Int")
+
+
+pure func test_nonvoid_then_without_else_has_the_whole_if_span() -> Bool:
+	prefix = "func main() -> Int:\n    selected = "
+	branch: String =
+		|if True:
+		|        41
+	tail = "\n    selected\n"
+	rejects(prefix + branch + tail, prefix, branch,
+		"if without else must return Void", "add an else branch to produce a value, or finish the then block with a Void expression")
+
+
+pure func test_void_without_else_rejects_an_int_receiver() -> Bool:
+	prefix = "func main() -> Int:\n    selected: Int = "
+	branch: String =
+		|if True:
+		|        void
+	tail = "\n    selected\n"
+	rejects(prefix + branch + tail, prefix, branch, "expression does not match the expected type", "use an expression of type Int here")
+
+
+pure func test_value_branch_requires_a_final_value() -> Bool:
+	prefix = "func main() -> Int:\n    selected: Int = if True:\n        "
+	branch = "local = 1"
+	tail: String =
+		|
+		|    else:
+		|        0
+		|    selected
+		|
+	rejects(prefix + branch + tail, prefix, branch, "if branch has no final value", "finish the branch with a value expression on its own indented line")
+
+pure func test_else_cannot_read_a_then_local() -> Bool:
+	prefix: String =
+		|func main() -> Int:
+		|    selected: Int = if True:
+		|        local = 1
+		|        local
+		|    else:
+		|
+	before = prefix + "        "
+	rejects(before + "local\n    selected\n", before, "local", "unknown value", "use this function's parameter name, a declared variant, or a call")
+
+
+pure func test_else_if_inherits_the_first_branch_type() -> Bool:
+	source: String =
+		|func main() -> Int:
+		|    selected = if False:
+		|        1
+		|    else if True:
+		|        2
+		|    else:
+		|        3
+		|    selected
+		|
+	checked(source).is_some()
+
+
+pure func test_unannotated_initializer_does_not_inherit_the_return_type() -> Bool:
+	header: String =
+		|fixed union Choice:
+		|    First
+		|    Second
+		|pure func choose() -> Choice:
+		|    selected = if True:
+		|
+	prefix = header + "        "
+	tail: String =
+		|First
+		|    else:
+		|        Second
+		|    selected
+		|func main() -> Int:
+		|    0
+		|
+	rejects(prefix + tail, prefix, "First", "constructor needs an expected union type", "pass an already-typed union value or call a concrete helper returning the union")
+
+
+pure func test_void_without_else_is_not_a_boolean_condition() -> Bool:
+	prefix = "func main() -> Int:\n    selected: Int = if "
+	condition: String =
+		|if True:
+		|        void
+	tail: String =
+		|
+		|    :
+		|        1
+		|    else:
+		|        0
+		|    selected
+		|
+	rejects(prefix + condition + tail, prefix, condition, "condition must have the designated Bool type", "use a Bool value as the condition")
+
+
+pure func test_value_if_preserves_the_nested_tail_call_rejection() -> Bool:
+	prefix: String =
+		|@tail_recursive
+		|pure func choose(flag: Bool) -> Int:
+		|    if flag:
+		|
+	before = prefix + "        "
+	tail: String =
+		|choose(False)
+		|    else:
+		|        0
+		|func main() -> Int:
+		|    choose(True)
+		|
+	rejects(before + tail, before, "choose(False)",
+		"a recursive call at the tail of a nested match is not supported yet",
+		"make it an arm of the function's own match, or remove @tail_recursive; backedges from nested matches arrive with the loops milestone")
+
+
+pure func test_another_modules_bool_spelling_does_not_make_it_the_condition_type() -> Bool:
+	prefix: String =
+		|import:
+		|    ./fake as Fake
+		|func main() -> Int:
+		|    flag: Fake.Bool = Fake.True
+		|
+	before = prefix + "    selected: Int = if "
+	tail: String =
+		|flag:
+		|        1
+		|    else:
+		|        0
+		|    selected
+		|
+	fake: String =
+		|fixed union Bool:
+		|    True
+		|    False
+		|
+	match parse_modules_with_libraries([{ source = before + tail, targets = [1] }, { source = fake, targets = [] }], 1):
+		Err(_): False
+		Ok(parsed):
+			match check(parsed):
+				Ok(_): False
+				Err(failure):
+					errors = render_failure(failure)
+					diagnostic = errors.first
+					(errors.remaining.is_empty() and diagnostic.message == "condition must have the designated Bool type"
+						and diagnostic.help == "use a Bool value as the condition"
+						and same_span(diagnostic.span, { source = module_source(root_module_id()), start = before.length(), end = before.length() + 4 }))
+
+func test_changed_production_sources_parse_with_target_grammar() -> Bool:
+	var accepted = True
+	for path in ["blorp_2/src/check/bodies.brp", "blorp_2/src/check/errors.brp", "blorp_2/src/check/render.brp", "blorp_2/src/specialize/specialize.brp"]:
+		match read_file(path):
+			Err(error):
+				print(path + ": " + error)
+				accepted = False
+			Ok(source):
+				match lex(module_source(root_module_id()), source, program_names().names).and_then(pure func(tokens): parse_module(tokens, root_module_id())):
+					Ok(_): void
+					Err(error):
+						print(path + ": " + error.message + " at " + error.span.start.to_string())
+						accepted = False
+	accepted
+
+
+tests: TestSuite = {
+	description = "Blorp 2 value if checking",
+	tests = [
+		("changed compiler sources obey target grammar", test_changed_production_sources_parse_with_target_grammar),
+		("annotated initializer is an Int join", test_annotated_initializer_is_an_int_join),
+		("return if receives expected nominal constructor type", test_return_if_uses_the_expected_nominal_constructor_type),
+		("synthesized initializer takes then type", test_synthesized_initializer_takes_the_then_type),
+		("absent else permits inferred and annotated Void", test_absent_else_accepts_inferred_and_annotated_void_bindings),
+		("absent else preserves final statement match", test_absent_else_preserves_a_final_statement_match),
+		("generic records receive return type", test_generic_record_branches_receive_the_return_type),
+		("opaque results preserve nominal identity", test_opaque_results_keep_their_nominal_identity),
+		("Void tail discards heterogeneous values once", test_void_tail_discards_heterogeneous_branch_values_once),
+		("condition error wins before branch errors", test_nonboolean_condition_rejects_before_branch_errors),
+		("annotated else type mismatch", test_annotated_branches_reject_a_mismatched_else_value),
+		("synthesized else type mismatch", test_synthesized_branches_reject_a_mismatched_else_value),
+		("nonVoid absent else has whole if span", test_nonvoid_then_without_else_has_the_whole_if_span),
+		("Void absent else rejects Int receiver", test_void_without_else_rejects_an_int_receiver),
+		("value branch needs final expression", test_value_branch_requires_a_final_value),
+		("else cannot read then local", test_else_cannot_read_a_then_local),
+		("else if inherits synthesized type", test_else_if_inherits_the_first_branch_type),
+		("unannotated initializer keeps synthesis", test_unannotated_initializer_does_not_inherit_the_return_type),
+		("Void absent else is not a condition", test_void_without_else_is_not_a_boolean_condition),
+		("tail call in join retains staged rejection", test_value_if_preserves_the_nested_tail_call_rejection),
+		("foreign Bool spelling is not designated identity", test_another_modules_bool_spelling_does_not_make_it_the_condition_type),
+	]
+}

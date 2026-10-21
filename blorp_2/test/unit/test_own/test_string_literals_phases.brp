@@ -148,8 +148,8 @@ pure func test_lowered_literal_is_a_single_value_definition() -> Bool:
 		Ok(program):
 			match Lower.lowered_functions(program).functions:
 				[_, function]:
-					match (function.steps, function.tail):
-						([Lower.Define(value)], Lower.ExitValue(Lower.ReturnValue(returned))):
+					match (function.steps, function.result):
+						([Lower.Define(value)], returned):
 							match value.operation:
 								Lower.StringValue(bytes):
 									(
@@ -223,7 +223,7 @@ pure func test_copy_survives_literal_reassignment_with_exact_drops() -> Bool:
 					False
 
 
-pure func test_managed_literal_prefix_drops_in_each_arm() -> Bool:
+pure func test_managed_literal_prefix_drops_once_before_join() -> Bool:
 	source: String =
 		|fixed union Flag:
 		|    Off
@@ -238,10 +238,28 @@ pure func test_managed_literal_prefix_drops_in_each_arm() -> Bool:
 		|
 
 	match compile(source):
-		Err(_):
-			False
-		Ok(c):
-			c.count("blorp_string_release(blorp_owner_0);") == 2
+		Err(_): False
+		Ok(_):
+			match checked(source).and_then(Concrete.specialize).and_then(Lower.lower).and_then(Own.own):
+				Err(_): False
+				Ok(program):
+					program.functions.any(pure func(function):
+						match (function.operations, function.result):
+							([Own.DefineValue(parameter), Own.DefineValue(literal), Own.DropOwner(dropped, _), Own.ExecuteJoin(join)], Own.UnmanagedReturn(returned)):
+								match (literal.operation, literal.result, join.selection.scrutinee):
+									(Own.StringDefinition("text"), Own.OwnedResult(owner), Own.UnmanagedArgument(scrutinee)):
+										match join.result:
+											Own.UnmanagedJoinParameter(result):
+												(
+													Own.owner_number(dropped) == Own.owner_number(owner)
+													and Lower.value_number(scrutinee) == Lower.value_number(parameter.id)
+													and Lower.value_number(returned) == Lower.value_number(result.id)
+													and join.arms.length() == 2
+												)
+											_: False
+									_: False
+							_: False
+					)
 
 
 pure func test_managed_literal_stays_rejected_in_tail_loop() -> Bool:
@@ -291,8 +309,8 @@ tests: TestSuite = {
 			test_copy_survives_literal_reassignment_with_exact_drops,
 		),
 		(
-			"managed literal prefix drops in each arm",
-			test_managed_literal_prefix_drops_in_each_arm,
+			"managed literal prefix drops once before join",
+			test_managed_literal_prefix_drops_once_before_join,
 		),
 		(
 			"managed literal stays rejected in tail loop",

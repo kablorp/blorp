@@ -1,6 +1,12 @@
 import:
+	../../../src/lex/lex: lex
+	../../../src/parse/parse: parse_module
+	../../../src/utils/names: program_names
+	../../../src/utils/source: module_source, root_module_id
+	system: read_file
+	string: count
 	../../../src/runtime/list:
-		ListUpdate(AppendUpdate, SetUpdate, ConcatUpdate), list_child_key, list_c_type,
+		ListUpdate(AppendUpdate, SetUpdate, ConcatUpdate, SuffixUpdate), list_child_key, list_c_type,
 		list_element_key, list_key_depth, list_root_allocation, list_runtime, list_slot_store,
 		list_suffix, list_update_name, list_update_runtime, same_list_key
 	../../../src/specialize/specialize as Concrete
@@ -414,9 +420,71 @@ pure func test_empty_literal_allocates_an_empty_root() -> Bool:
 			output.contains("struct blorp_l_0_i* const blorp_vl_0=blorp_memory_allocate(sizeof *blorp_vl_0+(size_t)0*sizeof *blorp_vl_0->values);if(!blorp_vl_0)abort();atomic_init(&blorp_vl_0->references,1);blorp_vl_0->length=0;(void)blorp_vl_0;")
 
 
+
+pure func test_suffix_copies_only_surviving_owned_occurrences() -> Bool:
+	fragment = list_update_runtime(SuffixUpdate, list_element_key(Concrete.StringType),
+		"struct blorp_string*", "blorp_string_retain(element);")
+	(
+		fragment.contains("const uint64_t count=(uint64_t)(values->length-start);")
+		and fragment.contains("element=values->values[(uint64_t)start+index];blorp_string_retain(element);result->values[index]=element;result->length++;")
+		and fragment.contains("blorp_memory_allocate(sizeof *result+(size_t)count*sizeof *result->values)")
+		and not fragment.contains("blorp_list_drop_")
+	)
+
+
+pure func test_suffix_helper_is_deduplicated_for_repeated_rest_captures() -> Bool:
+	source: String =
+		|pure func rest(values: List[String]) -> List[String]:
+		|    match values:
+		|        []: []
+		|        [_, ...remaining]: remaining
+		|pure func another(values: List[String]) -> List[String]:
+		|    match values:
+		|        []: []
+		|        [_, ...remaining]: remaining
+		|func main() -> Int:
+		|    first = rest(["a", "b"])
+		|    second = another(["c", "d"])
+		|    0
+		|
+	match compile(source):
+		Err(_): False
+		Ok(output):
+			(
+				output.count("blorp_list_suffix_0_s(const struct blorp_l_0_s *values,int64_t start)") == 1
+				and output.count("=blorp_list_suffix_0_s(") == 2
+			)
+
+
+pure func test_wildcard_rest_omits_suffix_construction_and_helper() -> Bool:
+	source: String =
+		|pure func first(values: List[String]) -> String:
+		|    match values:
+		|        []: "empty"
+		|        [item, ..._]: item
+		|func main() -> Int:
+		|    unused = first(["a", "b"])
+		|    0
+		|
+	match compile(source):
+		Err(_): False
+		Ok(output): not output.contains("blorp_list_suffix_")
+
+
+func test_changed_list_runtime_source_uses_target_grammar() -> Bool:
+	match read_file("blorp_2/src/runtime/list.brp"):
+		Err(_): False
+		Ok(source):
+			lex(module_source(root_module_id()), source, program_names().names)
+				.and_then(pure func(tokens): parse_module(tokens, root_module_id())).is_ok()
+
 tests: TestSuite = {
 	description = "Blorp 2 concrete List runtime and derived helper keys",
 	tests = [
+		("List runtime source uses target grammar", test_changed_list_runtime_source_uses_target_grammar),
+		("suffix copies surviving owned occurrences into a fresh root", test_suffix_copies_only_surviving_owned_occurrences),
+		("repeated rest captures share exactly one suffix helper", test_suffix_helper_is_deduplicated_for_repeated_rest_captures),
+		("wildcard rest omits suffix construction and helper", test_wildcard_rest_omits_suffix_construction_and_helper),
 		("argument main selects shared runtime", test_argument_main_selects_the_shared_list_runtime_fragment),
 		("nullary main omits list runtime", test_nullary_main_omits_list_runtime),
 		("reachable union payload selects runtime without argv", test_reachable_union_payload_selects_list_runtime_without_argv),

@@ -1,0 +1,219 @@
+import:
+	../../../src/check/model as Checked
+	../../../src/specialize/specialize as Concrete
+	../../../src/utils/syntax: FunctionExecution(SelfTailLoop), entry_function, same_span
+	../source_while_inputs as Input
+	test: TestSuite
+
+
+LIST_ITERATION: String =
+	|func main() -> Int:
+	|    var total: Int = 0
+	|    for item in ["a", "b"]:
+	|        unused = item
+	|        total = 7
+	|    total
+	|
+
+
+RANGE_ITERATION: String =
+	|func main() -> Int:
+	|    var total: Int = 0
+	|    for item in 1..4:
+	|        total = item
+	|    total
+	|
+
+
+STRING_HEADER: String =
+	|func main() -> Int:
+	|    var text: String = "old"
+	|    while False:
+	|        text = "new"
+	|    retained = text
+	|    0
+	|
+
+
+LIST_HEADER: String =
+	|func main() -> Int:
+	|    var values: List[String] = ["old"]
+	|    while False:
+	|        values = ["new"]
+	|    retained = values
+	|    0
+	|
+
+
+RECORD_HEADER: String =
+	|fixed record State {
+	|    values: List[String]
+	|}
+	|func main() -> Int:
+	|    var state: State = { values = ["old"] }
+	|    while False:
+	|        state = { state | values = ["new"] }
+	|    retained = state
+	|    0
+	|
+
+
+private pure func source_for(function: Concrete.ConcreteFunction) -> Option[Concrete.ConcreteFor]:
+	var found: Option[Concrete.ConcreteFor] = None
+	for statement in function.statements:
+		match statement:
+			Concrete.RunFor(loop): found = Some(loop)
+			_: void
+	found
+
+
+private pure func list_layout_facts() -> Option[Bool]:
+	accepted ?= Input.concrete(LIST_ITERATION).to_option()
+	contents = Concrete.specialized_contents(accepted)
+	function ?= contents.functions.get(Concrete.function_number(entry_function(contents.entrypoint)))
+	loop ?= source_for(function)
+	item ?= loop.item
+	binding ?= function.bindings.get(Checked.binding_number(item))
+	carried ?= loop.carried.get(0)
+	match loop.iteration:
+		Concrete.ListIteration(iterable, element, option):
+			owner = Concrete.variant_owner(option.some)
+			layout ?= contents.unions.get(Concrete.union_number(owner))
+			some_fields ?= layout.variants.get(Concrete.variant_number(option.some))
+			none_fields ?= layout.variants.get(Concrete.variant_number(option.none))
+			payload ?= some_fields.get(0)
+			Some(Concrete.same_type(element, Concrete.StringType)
+				and Concrete.same_type(iterable.value_type, Concrete.ListType(element))
+				and Concrete.same_type(binding.value_type, element)
+				and Concrete.same_type(payload, element) and some_fields.length() == 1 and none_fields.is_empty()
+				and Concrete.union_number(owner) == Concrete.union_number(Concrete.variant_owner(option.none))
+				and Concrete.variant_number(option.some) != Concrete.variant_number(option.none)
+				and Checked.binding_number(item) == 1 and Checked.binding_number(carried) == 0
+				and loop.carried.length() == 1 and loop.body.length() == 2)
+		_: None
+
+
+pure func test_list_iteration_requests_concrete_option_element_layout() -> Bool:
+	list_layout_facts().get_or(False)
+
+
+private pure func range_layout_facts() -> Option[Bool]:
+	accepted ?= Input.concrete(RANGE_ITERATION).to_option()
+	contents = Concrete.specialized_contents(accepted)
+	function ?= contents.functions.get(Concrete.function_number(entry_function(contents.entrypoint)))
+	loop ?= source_for(function)
+	item ?= loop.item
+	binding ?= function.bindings.get(Checked.binding_number(item))
+	match loop.iteration:
+		Concrete.AscendingIntRange(start, end, boolean):
+			owner = Concrete.variant_owner(boolean.true_variant)
+			layout ?= contents.unions.get(Concrete.union_number(owner))
+			true_fields ?= layout.variants.get(Concrete.variant_number(boolean.true_variant))
+			false_fields ?= layout.variants.get(Concrete.variant_number(boolean.false_variant))
+			bounds = match (start.form, end.form):
+				(Concrete.LiteralInteger(1), Concrete.LiteralInteger(4)): True
+				_: False
+			Some(bounds and Concrete.same_type(start.value_type, Concrete.IntType)
+				and Concrete.same_type(end.value_type, Concrete.IntType)
+				and Concrete.same_type(binding.value_type, Concrete.IntType)
+				and true_fields.is_empty() and false_fields.is_empty()
+				and Concrete.union_number(owner) == Concrete.union_number(Concrete.variant_owner(boolean.false_variant))
+				and Concrete.variant_number(boolean.true_variant) != Concrete.variant_number(boolean.false_variant))
+		_: None
+
+
+pure func test_range_iteration_requests_designated_bool_layout() -> Bool:
+	range_layout_facts().get_or(False)
+
+
+private pure func list_cursor_scalar_rejection() -> Option[Bool]:
+	source: String =
+		|func main() -> Int:
+		|    values = [1]
+		|    for item in values:
+		|        unused = item
+		|    0
+		|
+	accepted ?= Input.concrete(source).to_option()
+	contents = Concrete.specialized_contents(accepted)
+	function ?= contents.functions.get(Concrete.function_number(entry_function(contents.entrypoint)))
+	loop ?= source_for(function)
+	match loop.iteration:
+		Concrete.ListIteration(iterable, _, _):
+			-- Isolate scalar admission of the cursor alias: the defining List
+			-- initializer is deliberately absent from this raw phase input.
+			-- This does not claim Check can publish the forged tail function.
+			raw = { function |
+				execution = SelfTailLoop(iterable.span),
+				statements = [Concrete.RunFor(loop)],
+			}
+			match Concrete.admit_scalar_loop(raw, contents.unions, contents.records):
+				Ok(_): Some(False)
+				Err(error):
+					alias_read = match iterable.form:
+						Concrete.ReadBinding(_): True
+						_: False
+					Some(alias_read and same_span(error.span, iterable.span)
+						and error.message == "managed values in @tail_recursive functions are not supported yet"
+						and error.help == "use an unmanaged helper, or remove @tail_recursive"
+						and error.note.is_none())
+		_: None
+
+
+pure func test_scalar_tco_rejects_managed_list_cursor_alias() -> Bool:
+	list_cursor_scalar_rejection().get_or(False)
+
+
+private fixed union ExpectedHeader:
+	StringHeader
+	ListHeader
+	RecordHeader
+
+
+private pure func header_facts(source: String, expected: ExpectedHeader) -> Option[Bool]:
+	accepted ?= Input.concrete(source).to_option()
+	contents = Concrete.specialized_contents(accepted)
+	function ?= contents.functions.get(Concrete.function_number(entry_function(contents.entrypoint)))
+	var loop: Option[Concrete.ConcreteWhile] = None
+	for statement in function.statements:
+		match statement:
+			Concrete.RunWhile(found): loop = Some(found)
+			_: void
+	found ?= loop
+	id ?= found.carried.get(0)
+	binding ?= function.bindings.get(Checked.binding_number(id))
+	plan ?= Concrete.value_ownership(binding.value_type, contents.unions, contents.records).to_option()
+	layout = match (expected, plan):
+		(StringHeader, Concrete.ManagedStringLeaf): Concrete.same_type(binding.value_type, Concrete.StringType)
+		(ListHeader, Concrete.ManagedListRoot): Concrete.same_type(binding.value_type, Concrete.ListType(Concrete.StringType))
+		(RecordHeader, Concrete.ManagedRecordRoot(id)):
+			match contents.records.get(Concrete.record_number(id)):
+				Some(layout): layout.fields.length() == 1 and layout.fields.all(pure func(field): Concrete.same_type(field, Concrete.ListType(Concrete.StringType)))
+				None: False
+		_: False
+	Some(layout and found.carried.length() == 1 and found.body.length() == 1 and Checked.binding_number(id) == 0)
+
+
+pure func test_string_header_retains_sealed_ownership_layout() -> Bool:
+	header_facts(STRING_HEADER, StringHeader).get_or(False)
+
+
+pure func test_list_header_retains_sealed_ownership_layout() -> Bool:
+	header_facts(LIST_HEADER, ListHeader).get_or(False)
+
+
+pure func test_record_header_retains_sealed_ownership_layout() -> Bool:
+	header_facts(RECORD_HEADER, RecordHeader).get_or(False)
+
+
+tests: TestSuite = {
+	description = "Blorp 2 source for specialization",
+	tests = [
+		("List iteration requests Option element layout", test_list_iteration_requests_concrete_option_element_layout),
+		("range iteration requests Bool layout", test_range_iteration_requests_designated_bool_layout),
+		("scalar TCO rejects List cursor alias", test_scalar_tco_rejects_managed_list_cursor_alias),
+		("String H retains sealed ownership layout", test_string_header_retains_sealed_ownership_layout),
+		("List H retains sealed ownership layout", test_list_header_retains_sealed_ownership_layout),
+		("record H retains sealed ownership layout", test_record_header_retains_sealed_ownership_layout),
+	]
+}

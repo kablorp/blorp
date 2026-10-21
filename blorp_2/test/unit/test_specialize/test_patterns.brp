@@ -1,0 +1,130 @@
+import:
+	../../../src/check/check: check
+	../../../src/check/model as Checked
+	../../../src/specialize/specialize as Concrete
+	../../../src/utils/syntax: Diagnostic
+	../input: setup_diagnostic
+	../module_input: TEST_BASE, parse_modules_with_base
+	../managed_union_inputs: concrete_tail_join
+	result: map_err
+	test: TestSuite
+
+
+private pure func specialized(source: String) -> Result[Concrete.SpecializedContents, Diagnostic]:
+	parsed ?= parse_modules_with_base([{ source = source, targets = [] }], TEST_BASE)
+	checked ?= check(parsed).map_err(setup_diagnostic)
+	program ?= Concrete.specialize(checked)
+	Ok(Concrete.specialized_contents(program))
+
+
+private pure func nested_list(place: Concrete.ConcretePatternPlace) -> Bool:
+	match place.route:
+		Concrete.UnionField(option_place, some_field):
+			match option_place.route:
+				Concrete.UnionField(root, wrapped_field):
+					match root.route:
+						Concrete.MatchRoot:
+								(
+							Concrete.same_type(place.value_type, Concrete.ListType(Concrete.StringType))
+							and Concrete.variant_field_number(some_field) == 0 and Concrete.variant_field_number(wrapped_field) == 0
+							and Concrete.union_number(Concrete.variant_owner(Concrete.variant_field_variant(some_field))) != Concrete.union_number(Concrete.variant_owner(Concrete.variant_field_variant(wrapped_field)))
+								)
+						_: False
+				_: False
+		_: False
+
+
+pure func test_generic_nested_suffix_keeps_concrete_field_and_element_types() -> Bool:
+	source: String =
+		|fixed union Wrapped[T]:
+		|    Wrapped(Option[List[T]])
+		|pure func chosen[T](value: Wrapped[T]) -> List[T]:
+		|    match value:
+		|        Wrapped(Some([first, ...remaining])): remaining
+		|        _: []
+		|func main() -> Int:
+		|    answer = chosen(Wrapped(Some(["skip", "keep"])))
+		|    0
+		|
+	match specialized(source):
+		Err(_): False
+		Ok(contents):
+			match contents.functions.get(1):
+				None: False
+				Some(function):
+					match concrete_tail_join(function.body):
+						None: False
+						Some(join):
+							var captured = False
+							var guarded = False
+							for node in join.selection.nodes:
+								match node:
+									Concrete.EnterArm(arm, [Concrete.BorrowPlace(first), Concrete.CopyListSuffix(parent, 1)]):
+										match first.route:
+											Concrete.ListElement(first_parent, 0):
+												captured = Checked.match_arm_number(arm) == 0 and nested_list(parent) and nested_list(first_parent) and Concrete.same_type(first.value_type, Concrete.StringType)
+											_: void
+									Concrete.TestListLength(parent, Checked.MinimumLength(1), _, _): guarded = nested_list(parent)
+									_: void
+							match join.arms:
+								[shared, _]:
+									match (shared.inputs, shared.value.form):
+										([_, remaining], Concrete.ReadBinding(read)):
+											captured and guarded and Checked.binding_number(remaining) == Checked.binding_number(read) and Concrete.same_type(function.signature.return_type, Concrete.ListType(Concrete.StringType))
+										_: False
+								_: False
+
+
+pure func test_zero_skip_suffix_is_an_argument_without_a_test_place() -> Bool:
+	source: String =
+		|pure func chosen(values: List[String]) -> List[String]:
+		|    match values:
+		|        [...items]: items
+		|func main() -> Int:
+		|    answer = chosen(["retained"])
+		|    0
+		|
+	match specialized(source):
+		Err(_): False
+		Ok(contents):
+			match contents.functions.get(1):
+				None: False
+				Some(function):
+					match concrete_tail_join(function.body):
+						Some(join):
+							match (join.arms, join.selection.nodes):
+								([arm], [Concrete.EnterArm(_, [Concrete.CopyListSuffix(parent, 0)])]):
+									match parent.route:
+										Concrete.MatchRoot: arm.inputs.length() == 1 and Concrete.same_type(parent.value_type, Concrete.ListType(Concrete.StringType))
+										_: False
+								_: False
+						_: False
+
+
+pure func test_concrete_string_tests_preserve_decoded_bytes() -> Bool:
+	source = "pure func chosen(text: String) -> Int:\n    match text:\n        \"é\\0x\": 42\n        _: 0\nfunc main() -> Int:\n    chosen(\"é\\0x\")\n"
+	match specialized(source):
+		Err(_): False
+		Ok(contents):
+			match contents.functions.get(1):
+				None: False
+				Some(function):
+					match concrete_tail_join(function.body):
+						None: False
+						Some(join):
+							var exact = False
+							for node in join.selection.nodes:
+								match node:
+									Concrete.TestStringBytes(place, bytes, _, _): exact = bytes == "é\0x" and bytes.length() == 4 and Concrete.same_type(place.value_type, Concrete.StringType)
+									_: void
+							exact and join.arms.length() == 2
+
+
+tests: TestSuite = {
+	description = "Concrete structural pattern selection",
+	tests = [
+		("generic nested suffix retains field and element types", test_generic_nested_suffix_keeps_concrete_field_and_element_types),
+		("zero skip suffix remains an argument", test_zero_skip_suffix_is_an_argument_without_a_test_place),
+		("concrete String test preserves decoded bytes", test_concrete_string_tests_preserve_decoded_bytes),
+	]
+}

@@ -2,11 +2,23 @@
 
 A comprehensive reference for the blorp programming language.
 
+The Blorp 2 pilot uses explicit `bool: not, and, or` imports for eager calls and UFCS: `not(value)`, `and(left, right)` and `or(left, right)`.
+Its prefix/infix Boolean forms are invalid; use an explicit `match` to skip an argument.
+
 The separate [Blorp 2 pilot](../blorp_2/README.md) implements a restricted
 subset. Its current examples include immutable bindings and local `var`
 reassignment in function bodies and match-arm blocks, including visible outer
 variables carried through a bound or statement match. The continuation sees
 the selected arm's final values; older immutable aliases keep theirs. It supports
+nested `while` statements with designated Bool conditions and `for` over Lists
+or ascending, end-exclusive Int ranges. The iterable or bounds evaluate once
+in written order; empty Lists and equal or reversed ranges run no body.
+`break` and `continue` target the nearest loop through statement `if` and `match`;
+`continue` advances a `for` cursor. Inner-loop updates reach enclosing mutable
+bindings; each iteration starts fresh locals and an immutable item binding.
+Managed carried Strings, Lists, records and unions retain ordinary value
+semantics, including older aliases and borrowed outer values. Managed annotated
+tail-recursive functions remain outside this pilot increment. It supports
 straight-line
 managed Strings through target-library `to_string` and `length` operations
 selected by an ordinary source-defined prelude. Self and mutual function recursion are supported with
@@ -361,7 +373,7 @@ CTFE support.
 ### Control Flow
 
 ```blorp
--- If/else (expression — both branches required when used as a value)
+-- If/else (both branches required for a non-Void result)
 result: String = if x > 0:
     "positive"
 else:
@@ -423,6 +435,13 @@ match value:
     Some(x): x
     None: 0
 ```
+
+Without `else`, an `if` has type `Void` and its then block must also return
+`Void`. A block ending with a statement supplies `void`. This also permits a
+`Void` binding such as `ignored: Void = if flag: ...`; it cannot initialize
+an `Int` or another non-Void result. With `else`, both branches receive the
+expected result type; without an expected type, the then branch establishes
+their type.
 
 Notes on loops — `while` and `for` are statements. They have no value, and values
 produced inside the loop body are discarded after evaluation, so a loop cannot be
@@ -493,6 +512,11 @@ a scalar. `string.from_codepoint(value: Int) -> Option[String]` encodes a Unicod
 scalar as exact UTF-8, including NUL, unassigned values and noncharacters. It
 rejects negatives, U+D800-U+DFFF and values above U+10FFFF before narrowing.
 Both interfaces preserve String's UTF-8 invariant.
+
+`string.slice(value: String, start: Int, end: Int) -> Option[String]` selects
+half-open byte bounds at UTF-8 scalar boundaries. Invalid bounds return None.
+Some owns a fresh independent String, including empty and whole ranges; counted
+NUL bytes are preserved. For example, `slice("é", 0, 1)` returns None.
 
 ```blorp
 import:
@@ -3501,6 +3525,16 @@ import:
 The [Blorp 2 List membership APIs](../blorp_2/standard_library/README.md#list-membership)
 provide pure supplied equality through `contains_with` and a temporary Int `contains`
 adapter. Their current indexed recursion does O(n) work with linear C stack at O0.
+
+The [Blorp 2 List queries and copies](../blorp_2/standard_library/README.md#list-queries-and-copies)
+provide eager `get_or`, `is_empty`, `last`, clamped `take`/`drop`, checked
+`remove`, `reverse`, first-match `find` and empty-True `all`. Copies preserve
+aliases; take/drop/remove preserve retained order, while reverse reverses it.
+Find/all accept pure named, lambda or forwarded predicates
+and stop at their first decisive result. Temporary copying uses O(n log n)
+copied slots and O(log(n + 1)) stack. The owning API catalog records the
+concrete restrictions; integrated self-compilation and resource acceptance
+remain separate.
 
 The maintained module inventory is
 [`standard_library/README.md`](../standard_library/README.md). Public

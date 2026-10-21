@@ -32,7 +32,20 @@ Correctness and useful composition come before memory optimization. Extra
 retains, copies and fresh allocations are acceptable; unique-root COW,
 allocation reuse, retain elimination and consuming-ABI inference are deferred.
 Existing test cost guards remain; adjust them deliberately with evidence rather
-than distorting the design to avoid a host-compiler cost.
+than distorting the design to avoid a host-compiler cost. During integration,
+ordinary allocation-cap overruns are deferred cost debt and do not block
+self-compilation progress unless egregious. Preserve measured failures and
+instruction history; prioritize functional correctness, ownership, leak and
+sanitizer checks, exact diagnostics and the actual source frontier. Unexpected
+runaway growth or leaks require investigation. This records no resource PASS
+and changes no existing ceiling.
+
+For the initial self-built bootstrap switch, the user approved the recorded
+compiler cost overruns described in the [self-compilation acceptance
+report](../benchmarks/results/blorp_2_self_compiled_bootstrap_2026-10-20.md).
+That exception preserves every limit and resource FAIL and remains conditional
+on actual identity, behavior, ownership, sanitizer and platform qualification.
+It does not mark the complete M8 resource gate green.
 
 ## Definition of done
 
@@ -107,17 +120,17 @@ not a portable nesting threshold or a product-destruction proof.
 | Milestone | Scope | Status |
 | --- | --- | --- |
 | [M0](#m0-foundation-closeout) | Re-cut, perf fixes, parser statement loop, fixpoint script, parity table | Landed. M3 owns the recorded managed-value call limits. |
-| [M1a](#m1a-surface-syntax-parity) | Layout and parsed source syntax | Current frontier: all 41 compiler files parse, including explicit pure callback types. Checking remains separate. |
+| [M1a](#m1a-surface-syntax-parity) | Layout and parsed source syntax | Pure lambda and callback syntax is implemented; current source-frontier evidence remains separate. |
 | [ML](#ml-list-construction) | `append`, `set`, `concat`, list literal | Done. Checked `set_index` is an ordinary target-library wrapper. |
 | [M1b](#m1b-names-and-the-foundation) | Namespace: private, aliases, qualified names, designated `Bool`/`Option`/`Result` | Parts A and B done; control-flow consumers follow in M2/M3. |
 | [M5](#m5-constants) | Literal scalar/String constants | Implemented. Source construction functions replace the need for record/opaque constants and initializer dependencies. |
-| [M2](#m2-the-join) | Restricted control positions, outer-variable joins, ordinary Boolean calls, `?=` and annotations | Joins, Result propagation and annotations implemented; Boolean calls/source migration and restricted `if` remain pending. General expression-control recut deferred. |
-| [M2b](#m2b-pattern-compilation) | Qualified flat heads and non-binding constructor groups | Qualified flat heads implemented; non-binding groups and source-pattern migration remain pending. |
-| [M3](#m3-loops-and-tail-recursion) | Managed List/while loops, explicit exits and existing scalar TCO | Not started. Source flat recursion/ranges become loops; broader managed TCO deferred. |
+| [M2](#m2-the-join) | Restricted control positions, outer-variable joins, ordinary Boolean calls, `?=` and annotations | Joins, Result propagation, annotations, ordinary Boolean calls and restricted value/statement `if` implemented in integration; acceptance pending. General operand controls remain deferred. |
+| [M2b](#m2b-pattern-compilation) | Structural constructor, Or, List and String patterns | Implemented in integration with one body per arm and exact coverage diagnostics; acceptance pending. Char patterns remain deferred. |
+| [M3](#m3-loops-and-tail-recursion) | Managed List/while loops, explicit exits and existing scalar TCO | Common source while/for, managed headers and lexical exits implemented in integration; acceptance pending. Managed/generic annotated TCO remains deferred. |
 | [M4](#m4-recursive-types) | Existing unary/mixed recursive shapes plus ordinary opaque semantics | Steps 1/2a and ordinary opaque semantics implemented. Actual source-product depth acceptance remains. No current source witness requires unlanded 2b/2c. |
-| [M6](#m6-library-and-shell) | First-order library parity, integer-facing String APIs and seven shell/path functions | String byte/scalar APIs and the bounded current-directory Result slice implemented and validated; source migration, remaining library and shell/path work pending. Target Char/Bytes are not planned prerequisites after source migration. |
-| [M7](#m7-lambdas) | Pure function types/lambdas | Named pure callbacks, forwarding and direct-call specialization implemented. Lambdas and captures remain required. Remaining callback removal was abandoned. |
-| [M8](#m8-the-fixpoint-gate) | Fixpoint gate | Not started. |
+| [M6](#m6-library-and-shell) | First-order library parity, integer-facing String APIs and seven shell/path functions | String byte/scalar APIs, checked Slice, concrete library helpers and shell/path integration implemented in the combined candidate; final composition and acceptance pending. Target Char/Bytes remain outside the bootstrap prerequisite set. |
+| [M7](#m7-lambdas) | Pure function types/lambdas | Pure lambdas, immutable captures, forwarding and direct-call specialization implemented in integration; acceptance pending. Callback-removal history remains retained. |
+| [M8](#m8-the-fixpoint-gate) | Fixpoint gate | Own-source self-compilation, identical compiler C and all 556 A/B fixture comparisons pass. All 559 e2e functional callbacks pass with the approved initial cost-debt policy; resource FAILs remain recorded and platform qualification is pending. |
 | [M9](#m9-post-self-compilation-architecture-audit) | Complete architecture audit using the self-compiled compiler | Planned immediately after M8, before the next major feature expansion. |
 
 Remaining dependency order (source migrations may overlap disjoint work):
@@ -421,6 +434,11 @@ and all 452 e2e cases pass. Ordinary opaque semantics remain a separate M4 task.
 
 ## M2: the join
 
+**Integration status.** Restricted value/statement `if`, ordinary Boolean calls,
+outer-variable flow and top-level Result propagation are implemented. The README
+and grammar describe current placement rules. The design history below does not
+establish integrated functional or resource acceptance.
+
 **Bootstrap boundary.** Keep statement/binding/function-tail/arm-tail control,
 qualified flat matching, restricted if, outer-variable flow, local annotations
 and function-top-level propagation. The
@@ -428,13 +446,9 @@ and function-top-level propagation. The
 removing their need for general expression inference. The reviewed
 [compositional plan](COMPOSITIONAL_CONTROL_PLAN.md) remains a broader language
 design; its workloop relocation and arbitrary-expression match/if are deferred.
-Omitted else is permitted in explicit statement roles, including inherited
-statement arms, and in the final control position of a function whose accepted
-signature returns Void, including an omitted return annotation. Every normally
-completing then-path must produce Void. Other value positions require else;
-general VoidTail discard does not relax this branch requirement.
-Updating an outer variable needs carried-binding edges on both branches,
-including the false edge; the current Void-only join is insufficient. The design sketches
+An omitted else yields Void, including in a binding; its then block must be
+Void or statement-only. A non-Void result requires else. Updating an outer
+variable uses carried-binding edges on both branches, including the false edge. The design sketches
 below still describe the shared join/ownership mechanisms, not permission to
 expand this restricted placement boundary.
 
@@ -460,7 +474,8 @@ Checked side: one form, `Match(CheckedMatch[CheckedExpr])`, a tail match always
 being the body form. Desugarings happen in the checker, never the parser, which
 must not know `Bool`. The operator rows below are historical and superseded by
 [ordinary Boolean calls](BOOL_FUNCTIONS_PLAN.md); the separate
-[`.not()` source migration](BOOLEAN_SOURCE_PLAN.md) remains pending, with no
+[`.not()` source migration](BOOLEAN_SOURCE_PLAN.md) is implemented in the
+combined source, with no
 further legacy parser, host-library or bootstrap-pin work.
 
 ```
@@ -481,7 +496,8 @@ exits an intermediate value join. The accepted Result-only implementation
 resolves the remaining function prefix inside an ordinary successful match arm;
 it records nesting for realistic1/2/5/9/16 chains. The earlier flat sketch above
 is historical, not the current representation. Local type annotations and Result
-propagation are implemented; restricted `if` remains separately pending.
+propagation and restricted `if` are implemented in integration; acceptance
+remains separate.
 
 Steps: **M2.1** the join mechanism across lower, own, verify and emit, with
 non-tail `match` (needs no `Bool`); **M2.2** restricted `if` (needs the
@@ -504,9 +520,9 @@ three details of the sketch above. The original `JoinValue` definition is replac
 by `LoweredStep.Define/Join` and explicit typed parameters in the written unary
 preparation. M2.1b now also publishes the reassigned enclosing bindings as
 ordered carried parameters, alongside the result (Void for a statement match).
-A join arm yields its value and those bindings: only a
-tail arm returns or loops, so a yield cannot end a function and a backedge
-cannot leave a join. The checker records each enclosing `var` reassigned by an
+A yielding join arm publishes its value and continuation outputs. An abrupt
+arm instead transfers to its resolved enclosing loop through `TransferLoop`;
+it publishes no join outputs. The checker records each enclosing `var` reassigned by an
 arm; lowering publishes its selected immutable version after the join. The reviewed
 [carried-bindings report](../benchmarks/results/blorp_2_carried_bindings_2026-10-18.md) defines structured multi-output
 steps, first as a behavior-preserving preparation. Preparation budgets are
@@ -522,19 +538,27 @@ records current functional validation and the 3,976-call frozen cost campaign.
 The checked form is `Match(CheckedJoin)` with value arms; the tail match keeps
 `CheckedMatchBody`. A match at a Void function's tail discards each arm's
 value, as a plain Void tail does. A self call at the tail of a nested match
-is rejected until the loops milestone gives joins a backedge. Restricted `if`
+remains unsupported by annotated tail-call admission. Restricted `if`
 uses M1b part B's designated `Bool`; implemented Result propagation uses the
 designated `Result` independently of restricted `if`, with the function return's
 ownership discharge and independent verification. It requires no early-return
 form for a join arm: nested propagation is a parser error.
 
-The [restricted control plan](RESTRICTED_CONTROL_PLAN.md) retains the pending
-`if` contract and records accepted Result propagation with its ownership, test
+The [restricted control plan](RESTRICTED_CONTROL_PLAN.md) retains the implemented candidate
+`if` contract and its pending acceptance, and records accepted Result propagation with its ownership, test
 and cost evidence; ordinary Boolean calls follow their separate active plan.
 
 ## M2b: pattern compilation
 
-**Bootstrap scope.** Qualified flat constructor heads and non-binding constructor
+**Integration status.** Recursive constructor, binder-unifying Or, List and
+String patterns are implemented through a checker-owned typed pattern matrix
+and selection graph. Alternatives enter one canonical arm body; List suffix
+captures own their copied roots and String tests compare complete decoded bytes.
+The README and grammar define current syntax, name rules and exact coverage.
+Char patterns remain unsupported. Focused evidence does not close current
+integration, self-compilation or resource acceptance.
+
+**Historical bootstrap scope and source-removal proposal.** Qualified flat constructor heads and non-binding constructor
 groups with wildcard payloads. Each group has complete accepted VariantIds,
 no captures, one body and exact coverage diagnostics. Current source has 106
 or-groups: 99 fit directly; seven factor a common outer constructor.
@@ -577,8 +601,9 @@ prerequisite merely because M1a can parse those forms.
 ignored managed-payload cleanup, source migration and exact rejections for
 deferred cases. No general pattern-matrix implementation is implied.
 
-**Status.** Qualified flat heads passed current-composition acceptance.
-Groups and broader source-pattern rewrites remain separate.
+**Status.** Structural matching is implemented in the combined candidate;
+current integration and resource acceptance remain pending. The qualified-head
+report and source-removal forecasts above retain their original boundaries.
 
 ## M3: loops and tail recursion
 
@@ -597,13 +622,12 @@ two exits:
 CheckedStatement.Loop(carried: List[BindingId], body)   -- body exits: Break | RecurWith
 ```
 
-The carried set is a checker fact: the outer `var` bindings reassigned in the body
-plus the iteration index. Lowering makes them header-block parameters; own carries
-one obligation per managed carried value on every edge. A List `for` evaluates
-its source once and carries its iterator; `while` checks its condition at the
-header. Resolve break/continue to their actual enclosing loop, preserving List
-iteration advancement. The six source ranges become Int while loops preserving
-evaluated-once bounds and both directions; Range execution/types are deferred.
+The checker publishes enclosing mutable bindings reassigned in the body,
+excluding iteration locals. Lower adds a private for cursor. List iterables and
+ascending, end-exclusive Int range bounds evaluate once before iteration.
+While conditions run at the header. Break/continue resolve to the nearest loop;
+continue advances a for cursor. General Range values and descending iteration
+remain deferred. The earlier six-range source census is historical inventory.
 
 ```blorp
 var total = 0
@@ -633,9 +657,10 @@ parameter occurrence carries its own obligation, including duplicate aliases.
 On the back edge: evaluate the next values, acquire or transfer next owners,
 retire the old obligations, rebind and jump; no pending cleanup follows the back
 edge. Base returns transfer the result and discharge remaining owners.
-Existing supported `@tail_recursive` functions become a body loop carrying their
-parameters, so `FunctionExecution`/`SelfTailLoop` are replaced in the same bounded
-representation change; preserve their current accepted/rejected cases. A back
+Supported scalar annotated functions lower to the same runtime Loop. Checked
+and concrete `FunctionExecution`/`SelfTailLoop` facts remain for annotation
+admission; Lower removes that distinction from runtime control, preserving
+current accepted/rejected cases. A back
 edge outside a loop becomes unrepresentable by the exit types. Broader language
 follow-ups are deferred, not prerequisites for the source loop migration:
 
@@ -656,9 +681,12 @@ measured release depth are separate acceptance criteria.
 
 **Exit proof.** A `List[String]` accumulator loop under ASan with exact allocator
 balance; nested loops and explicit exits; the source range/walk migrations;
-malformed-IR negatives; `SelfTailLoop` gone with existing scalar TCO preserved.
+malformed-IR negatives; one runtime Loop with existing scalar TCO preserved and checked/concrete
+annotation facts retained.
 
-**Status.** Not started.
+**Status.** Common source while/for, managed headers and lexical loop transfers
+are implemented in integration; acceptance remains pending. Managed and generic
+annotated tail recursion remain deferred.
 
 ## M4: recursive types
 
@@ -803,7 +831,8 @@ extrema, UTF-8/NUL bytes and aliases; self-compilation remains a separate gate.
 The current [Option/Result catalog and addition plan](OPTION_RESULT_PLAN.md)
 retains the historical nine-API inventory. All nine library definitions are
 implemented, including four [named-callback helpers](standard_library/README.md).
-M7 lambdas/captures and explicit compiler-source operation imports remain pending.
+Lambdas/captures and explicit compiler-source operation imports are implemented
+in the combined candidate; source-frontier and resource acceptance remain pending.
 This library increment does not close those consumers. The prelude stays unchanged.
 The superseded five-helper proposal is recoverable from Git.
 
@@ -882,7 +911,8 @@ as explicitly recorded in the parity table. No host trait enters target code.
   sentinel. Query once before loader identities. Failure uses the real compiler
   SourceId and an empty source inventory, not a fabricated module/file row.
   Validate native encoding before String publication; invalid UTF-8 returns Err.
-- **Read:** target adapter/native contract implemented; loader migration pending.
+- **Read:** target adapter/native contract and integrated loader use implemented;
+  full compiler acceptance pending.
   Preserve valid UTF-8 contents exactly, including CRLF, BOM and NUL.
   Target encoding help omits the host read_bytes suggestion because that API
   is unavailable; both reject malformed UTF-8 before String publication.
@@ -907,7 +937,8 @@ as explicitly recorded in the parity table. No host trait enters target code.
   preserving internal newlines/NUL and writing nothing to stdout. Void reports
   no delivery status; stop on unrecoverable output error.
   The [target stderr implementation](../benchmarks/results/blorp_2_print_error_2026-10-18.md) is validated;
-  migration of the compiler shell to this target API remains pending.
+  the integrated compiler shell uses this target API; whole-compiler acceptance
+  remains pending.
 - **Join:** an absolute child replaces base. Empty base returns child, including
   join("", "") == "". Otherwise retain a trailing separator or add one;
   join("/library", "") == "/library/". Do not normalize components/separators.
@@ -938,7 +969,8 @@ ordinary prefix destruction and shared Int/Void wrapper enforce this boundary.
 
 Ordinary Blorp implements paths; native bindings implement the four impure
 operations. The host `get_current_directory` API is implemented and validated.
-Target wiring and any source-refactor host epoch transition remain pending.
+Target wiring and source shell/path integration are implemented in the combined
+candidate; current composition, host provenance and fixpoint acceptance remain separate.
 A disk stdlib edit does not update an executable's embedded runtime.
 
 Target Result contracts must carry designated constructor identities and exact
@@ -965,9 +997,10 @@ still proves real rebuilt-compiler output identity.
 
 ## M7: lambdas
 
-**Current direction, 2026-10-19.** The owner stopped the remaining callback-removal
-migration. Pure callback types, named references, forwarding and direct-call
-specialization are implemented. The [lambda plan](LAMBDAS_PLAN.md) owns the
+**Integration status.** Pure callback types, named references, forwarding, pure
+lambdas and immutable data captures are implemented. Mutable/callable captures,
+callable storage/returns and runtime-selected callbacks remain unsupported.
+The owner stopped the remaining callback-removal migration on 2026-10-19. The [lambda plan](LAMBDAS_PLAN.md) owns the
 noncapturing and immutable-capture increments; the [Option/Result plan](OPTION_RESULT_PLAN.md)
 records helper demand and the required callable witnesses.
 The source-removal work below is retained history.
@@ -998,7 +1031,7 @@ to existing `repeat`; unary preparation already migrated the seventh historical
 site. Implementation and the unwaived SOURCE cumulative acceptance remain pending;
 the historical overall callback census is not refreshed by this bounded mapping.
 
-**Retained future design.** Lambdas at known callees, including managed captures.
+**Retained design sketch.** Lambdas at known callees, including managed captures.
 The model, not an
 optimisation: each lambda literal is a unique nominal record type of its
 captures; a callee with a function parameter is specialised per lambda type (one
@@ -1014,13 +1047,14 @@ offsets.map(pure func(value): IntOps.add(value, base))
 -- specialize: map instantiated for this lambda's capture type; a direct call inside
 ```
 
-**Future language exit proof.** Fixtures for a capturing and a non-capturing lambda at a library
+**Required language exit proof.** Fixtures for a capturing and a non-capturing lambda at a library
 combinator and at a user generic; ownership of borrowed managed captures
 verified; frontier reaches emit.
 
 **Status.** Pure callback types, named references, callable parameter forwarding
-and direct-call specialization are implemented. Lambdas and immutable capture
-specialization remain unimplemented, under [their bounded plan](LAMBDAS_PLAN.md).
+and direct-call specialization, lambdas and immutable capture specialization
+are implemented in the combined candidate. Integrated correctness, resource and
+self-compilation acceptance remain pending under [their bounded plan](LAMBDAS_PLAN.md).
 
 ## M8: the fixpoint gate
 
@@ -1036,11 +1070,27 @@ be rewritten once blorp_2 is mature. The unit-test migration is a separate plan.
 
 **Exit proof.** The fixpoint script exits 0.
 
-**Status.** Not started. The [runtime accounting preparation](../benchmarks/results/blorp_2_pilot_memory_accounting_2026-10-18.md)
+**Status.** In progress. The compiler accepts all 43 of its own source modules,
+emits C that links without warnings, and the resulting compiler emits
+byte-identical C from the same source and library. The [self-compilation
+report](../benchmarks/results/blorp_2_self_compiled_bootstrap_2026-10-20.md)
+records the exact inputs and matched `-O0` execution cost. Host-backed component
+validation passes 4,174 checks. All 556 maintained fixture files agree under A/B;
+the self-built compiler passes all 559 e2e functional callbacks under the explicit
+initial-bootstrap cost-debt policy. Whole-source `-O0` ASan/UBSan compilation reproduces the same C and balances
+27,373,418 allocations/releases with no tracked leaks after replacing flat
+declaration recursion with an ordinary source loop. The final native run also
+passes from a fresh working directory. Seed publication and the default builder
+switch remain pending. Platform qualification and
+the remaining cost obligations above are still pending; this checkpoint does
+not mark the complete M8 resource gate green.
+
+The [runtime accounting preparation](../benchmarks/results/blorp_2_pilot_memory_accounting_2026-10-18.md)
 has passed its bounded runtime and matched host-proxy gates
 ([evidence](../benchmarks/results/blorp_2_pilot_memory_accounting_2026-10-18.md)).
-Those host-generated pilot counts do not establish target-built strict
-self-compilation or measured mode 0/mode 1 target allocator overhead; both remain M8 work.
+Those historical pilot counts do not by themselves establish target-built strict
+self-compilation; the current proof is recorded above. Matched mode 0/mode 1
+target allocator overhead remains M8 work.
 
 ## M9: post-self-compilation architecture audit
 

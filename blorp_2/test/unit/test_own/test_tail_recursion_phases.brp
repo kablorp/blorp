@@ -6,9 +6,131 @@ import:
 	../../../src/own/own as Own
 	../../../src/specialize/specialize as Concrete
 	../../../src/utils/syntax: Diagnostic, FunctionExecution(SelfTailLoop)
+	../../../src/namespace/builtins as Runtime
+	../ownership_inputs: InputIds, input_ids, runtime, span
 	../compilation: compile
 	../input: check, parse, setup_diagnostic
 	test: TestSuite
+
+
+-- Raw runtime loops exercise resources independently of scalar source admission.
+private pure func string_loop(ids: InputIds, duplicate: Bool) -> Lower.LoweredFunction:
+	read = if duplicate:
+		ids.fourth
+	else:
+		ids.third
+	local = if duplicate:
+		ids.fifth
+	else:
+		ids.fourth
+	carried: List[Lower.ValueParameter] = if duplicate:
+		[{ id = ids.third, value_type = Concrete.StringType, span = span(21) }]
+	else:
+		[]
+	carried_values: List[Lower.ValueId] = if duplicate:
+		[local]
+	else:
+		[]
+	{
+		signature = { parameters = [], return_type = Concrete.IntType },
+		steps = [
+			Lower.Define({ id = ids.first, value_type = Concrete.StringType, operation = Lower.StringValue("PRE"), span = span(10) }),
+			Lower.Loop({
+				headers = [], result = { id = ids.second, value_type = Concrete.StringType, span = span(20) },
+				carried = carried, reads = [],
+				body = {
+					steps = [Lower.Define({ id = local, value_type = Concrete.StringType, operation = Lower.StringValue("local"), span = span(30) })],
+					tail = Lower.ExitLoop(Lower.Break({ value = local, carried = carried_values, span = span(40) }))
+				}
+			}),
+			Lower.Define(runtime(read, Runtime.StringLength, [ids.first], Concrete.IntType, 50)),
+		],
+		result = read
+	}
+
+
+private pure func kept_pre_owner(
+	pre: Own.OwnedDefinition,
+	read: Own.OwnedDefinition,
+	retired: Own.OwnerId,
+) -> Bool:
+	match (pre.result, read.operation):
+		(Own.OwnedResult(owner), Own.CallDefinition(call, [Own.BorrowedArgument(borrow)])):
+			match (call, borrow.source):
+				(Concrete.RuntimeFunction(Runtime.StringLength), Own.OwnerBorrow(source)):
+					(
+						Own.owner_number(owner) == 0
+						and Own.owner_number(source) == 0
+						and Own.owner_number(retired) == 0
+						and Lower.value_number(borrow.value) == Lower.value_number(pre.id)
+					)
+				_: False
+		_: False
+
+
+private pure func acquired_before_retirement(duplicate: Bool) -> Bool:
+	expected_local_owner: Int = if duplicate:
+		3
+	else:
+		2
+	match input_ids():
+		Err(_): False
+		Ok(ids):
+			match Own.insert_function(string_loop(ids, duplicate), [], []):
+				Err(_): False
+				Ok(function):
+					pre_is_kept = match function.operations:
+						[Own.DefineValue(pre), Own.ExecuteLoop(_), Own.DropOwner(_, _), Own.DefineValue(read), Own.DropOwner(retired, _)]:
+							not duplicate and kept_pre_owner(pre, read, retired)
+						[Own.DefineValue(pre), Own.ExecuteLoop(_), Own.DropOwner(_, _), Own.DropOwner(_, _), Own.DefineValue(read), Own.DropOwner(retired, _)]:
+							duplicate and kept_pre_owner(pre, read, retired)
+						_: False
+					var valid = False
+					for operation in function.operations:
+						match operation:
+							Own.ExecuteLoop(loop):
+								match (loop.body.operations, loop.body.tail):
+									([Own.DefineValue(local), Own.AcquireOwner(first, borrow, _), ...rest], Own.ExitLoop(Own.Break(outputs))):
+										match (local.result, borrow.source, outputs.value):
+											(Own.OwnedResult(old), Own.OwnerBorrow(source), Own.OwnedReturn(value, transferred)):
+												valid = (
+													Own.owner_number(old) == expected_local_owner
+													and Own.owner_number(old) == Own.owner_number(source)
+													and Own.owner_number(first) == Own.owner_number(transferred)
+												)
+												valid = valid and Own.owner_number(first) == Own.owner_number(old) + 1
+												valid = valid and Lower.value_number(value) == Lower.value_number(local.id) and Own.owner_number(first) != Own.owner_number(old)
+												match (rest, outputs.carried):
+													([Own.DropOwner(retired, _)], []): valid = valid and not duplicate and Own.owner_number(retired) == Own.owner_number(old)
+													([Own.AcquireOwner(second, again, _), Own.DropOwner(retired, _)], [Own.OwnedReturn(other, moved)]):
+														valid = (
+															valid
+															and duplicate
+															and Own.owner_number(second) == Own.owner_number(moved)
+															and Own.owner_number(second) == Own.owner_number(first) + 1
+														)
+														valid = (
+															valid
+															and Own.owner_number(retired) == Own.owner_number(old)
+															and Lower.value_number(other) == Lower.value_number(local.id)
+															and Lower.value_number(again.value) == Lower.value_number(local.id)
+														)
+														match again.source:
+															Own.OwnerBorrow(source): valid = valid and Own.owner_number(source) == Own.owner_number(old)
+															_: valid = False
+													_: valid = False
+											_: valid = False
+									_: valid = False
+							_: void
+					valid and pre_is_kept
+
+
+pure func test_single_loop_output_acquires_before_local_retirement() -> Bool:
+	acquired_before_retirement(False)
+
+
+pure func test_duplicate_loop_outputs_acquire_before_local_retirement() -> Bool:
+	acquired_before_retirement(True)
 
 
 private STEP: String =
@@ -99,68 +221,37 @@ pure func test_specialization_preserves_backedge_and_arguments() -> Bool:
 
 private pure func ordered_values(terminal: String) -> Bool:
 	match concrete(source(terminal)).and_then(pure func(program): Lower.lower(program)):
-		Err(_):
-			False
+		Err(_): False
 		Ok(program):
-			match Lower.lowered_functions(program).functions:
-				[_, function, _]:
-					match function.steps:
-						[Lower.Define(step), Lower.Define(left), Lower.Define(right), Lower.Define(prefix)]:
-							match (
-								step.operation,
-								left.operation,
-								right.operation,
-								(prefix.operation, function.tail),
-							):
-								(Lower.ParameterValue(0), Lower.ParameterValue(1), Lower.ParameterValue(2), (Lower.CallValue(_, [original]), Lower.MatchValue(matched))):
-									match matched.arms:
-										[base, recur]:
-											match (
-												base.body.exit,
-												recur.body.exit,
-												recur.body.steps,
-											):
-												(Lower.ReturnValue(returned), Lower.RecurValues([next_step, next_left, next_right], _), [Lower.Define(variant), Lower.Define(first), Lower.Define(second)]):
-													match (
-														variant.operation,
-														first.operation,
-														second.operation,
-													):
-														(Lower.ConstructValue(_, []), Lower.CallValue(_, [current]), Lower.CallValue(_, [saved])):
-															(
-																Lower.value_number(original) == 1
-																and Lower.value_number(
-																	returned,
-																) == 3
-																and base.body.steps.length() == 0
-																and Lower.value_number(current) == 3
-																and Lower.value_number(saved) == 1
-																and Lower.value_number(
-																	next_step,
-																) == 4
-																and Lower.value_number(
-																	next_left,
-																) == 5
-																and Lower.value_number(
-																	next_right,
-																) == 6
-																and Lower.value_number(
-																	second.id,
-																) == 6
-															)
-														_:
-															False
-												_:
-													False
-										_:
-											False
-								_:
-									False
-						_:
-							False
-				_:
-					False
-
+			match Lower.lowered_functions(program).functions.map(pure func(function): function.steps):
+				[_, [Lower.Define(step), Lower.Define(left), Lower.Define(right), Lower.Loop(loop)], _]:
+					match (loop.body.steps, loop.body.tail):
+						([Lower.Define(prefix)], Lower.MatchLoop(matched)):
+							match ((step.operation, left.operation, right.operation), prefix.operation, matched.arms):
+								((Lower.ParameterValue(0), Lower.ParameterValue(1), Lower.ParameterValue(2)), Lower.CallValue(_, [original]), [base, recur]):
+									match (base.body.tail, recur.body.tail, recur.body.steps):
+										(Lower.ExitLoop(Lower.Break(outputs)), Lower.ExitLoop(Lower.Recur([next_step, next_left, next_right], _)), [Lower.Define(variant), Lower.Define(first), Lower.Define(second)]):
+											match (variant.operation, first.operation, second.operation):
+												(Lower.ConstructValue(_, []), Lower.CallValue(_, [current]), Lower.CallValue(_, [saved])):
+													(
+														loop.headers.map(pure func(header): Lower.value_number(header.initial)) == [0, 1, 2]
+														and loop.headers.map(pure func(header): Lower.value_number(header.parameter.id)) == [4, 5, 6]
+														and Lower.value_number(loop.result.id) == 3
+														and Lower.value_number(original) == 5
+														and Lower.value_number(outputs.value) == 7
+														and base.body.steps.is_empty()
+														and Lower.value_number(current) == 7
+														and Lower.value_number(saved) == 5
+														and Lower.value_number(next_step) == 8
+														and Lower.value_number(next_left) == 9
+														and Lower.value_number(next_right) == 10
+														and Lower.value_number(second.id) == 10
+													)
+												_: False
+										_: False
+								_: False
+						_: False
+				_: False
 
 pure func test_direct_arguments_lower_once_in_order() -> Bool:
 	ordered_values("walk(Stop, identity(current), identity(saved))")
@@ -184,14 +275,14 @@ pure func test_ufcs_receiver_chain_lowers_before_explicit_arguments() -> Bool:
 		Err(_):
 			False
 		Ok(program):
-			match Lower.lowered_functions(program).functions:
-				[_, function, _, _]:
-					match function.tail:
-						Lower.MatchValue(matched):
+			match Lower.lowered_functions(program).functions.map(pure func(function): function.steps):
+				[_, [_, _, _, Lower.Loop(loop)], _, _]:
+					match loop.body.tail:
+						Lower.MatchLoop(matched):
 							match matched.arms:
 								[_, recur]:
-									match (recur.body.steps, recur.body.exit):
-										([Lower.Define(variant), Lower.Define(receiver), Lower.Define(left), Lower.Define(right)], Lower.RecurValues([next_step, next_left, next_right], _)):
+									match (recur.body.steps, recur.body.tail):
+										([Lower.Define(variant), Lower.Define(receiver), Lower.Define(left), Lower.Define(right)], Lower.ExitLoop(Lower.Recur([next_step, next_left, next_right], _))):
 											match (
 												variant.operation,
 												receiver.operation,
@@ -217,22 +308,22 @@ pure func test_ufcs_receiver_chain_lowers_before_explicit_arguments() -> Bool:
 																) == 2
 																and Lower.value_number(
 																	receiver_argument,
-																) == 4
+																) == 8
 																and Lower.value_number(
 																	left_argument,
-																) == 3
+																) == 7
 																and Lower.value_number(
 																	right_argument,
-																) == 1
-																and Lower.value_number(
-																	next_step,
 																) == 5
 																and Lower.value_number(
+																	next_step,
+																) == 9
+																and Lower.value_number(
 																	next_left,
-																) == 6
+																) == 10
 																and Lower.value_number(
 																	next_right,
-																) == 7
+																) == 11
 															)
 														_:
 															False
@@ -254,12 +345,18 @@ pure func test_prefix_and_snapshots_are_inside_loop() -> Bool:
 			False
 		Ok(output):
 			(
-				output.contains("{while (1){const enum blorp_u_0 blorp_vl_0=blorp_p_0;")
-				and output.contains("const int64_t blorp_vl_3=blorp_f_2(blorp_vl_1);")
+				output.contains("goto blorp_loop_3_header;blorp_loop_3_header:{const enum blorp_u_0 blorp_vl_4=blorp_h_4;(void)blorp_vl_4;")
+				and output.contains("const int64_t blorp_vl_7=blorp_f_2(blorp_vl_5);")
+				and output.contains("int64_t blorp_vl_3;enum blorp_u_0 blorp_h_4=blorp_vl_0;")
+				and output.contains("}goto blorp_loop_3_break;blorp_loop_3_break:;(void)blorp_vl_3;return blorp_vl_3;}")
 				and output.contains(
-					"blorp_p_0=blorp_vl_4;blorp_p_1=blorp_vl_5;blorp_p_2=blorp_vl_6;continue;",
+					"const enum blorp_u_0 blorp_loop_3_transfer_0=blorp_vl_8;"
+					+ "const int64_t blorp_loop_3_transfer_1=blorp_vl_9;"
+					+ "const int64_t blorp_loop_3_transfer_2=blorp_vl_10;"
+					+ "blorp_h_4=blorp_loop_3_transfer_0;blorp_h_5=blorp_loop_3_transfer_1;"
+					+ "blorp_h_6=blorp_loop_3_transfer_2;goto blorp_loop_3_header;",
 				)
-				and not output.contains("=blorp_f_1(blorp_vl_4")
+				and not output.contains("=blorp_f_1(blorp_vl_8")
 			)
 
 
@@ -274,7 +371,9 @@ pure func test_zero_argument_main_emits_valid_loop() -> Bool:
 			False
 		Ok(output):
 			(
-				output.contains("int64_t blorp_f_0(void){while (1){continue;}}")
+				output.contains("int64_t blorp_f_0(void){int64_t blorp_vl_0;goto blorp_loop_0_header;"
+					+ "blorp_loop_0_header:{goto blorp_loop_0_header;}goto blorp_loop_0_break;"
+					+ "blorp_loop_0_break:;(void)blorp_vl_0;return blorp_vl_0;}")
 				and output.contains("int main(void){blorp_memory_start();return blorp_memory_finish((int)blorp_f_0());}")
 			)
 
@@ -284,7 +383,12 @@ private pure func compiles_loop(source: String) -> Bool:
 		Err(_):
 			False
 		Ok(output):
-			output.contains("while (1)") and output.contains("continue;")
+			(
+				output.count("blorp_loop_2_header:{") == 1
+				and output.count("goto blorp_loop_2_header;") == 2
+				and output.count("blorp_loop_2_break:;") == 1
+				and output.count("blorp_f_1(") == 3
+			)
 
 
 pure func test_phantom_string_argument_is_unmanaged() -> Bool:
@@ -312,9 +416,9 @@ pure func test_phantom_string_argument_is_unmanaged() -> Bool:
 		Ok(program):
 			match program.functions:
 				[_, function]:
-					match function.execution:
-						SelfTailLoop(_):
-							function.operations.length() == 2 and compiles_loop(source)
+					match function.operations:
+						[Own.DefineValue(_), Own.DefineValue(_), Own.ExecuteLoop(_)]:
+							compiles_loop(source)
 						_:
 							False
 				_:
@@ -324,6 +428,8 @@ pure func test_phantom_string_argument_is_unmanaged() -> Bool:
 tests: TestSuite = {
 	description = "Self-tail phase contracts and C projection",
 	tests = [
+		("single Loop output acquires before retiring its local", test_single_loop_output_acquires_before_local_retirement),
+		("duplicate Loop outputs acquire before retiring their local", test_duplicate_loop_outputs_acquire_before_local_retirement),
 		(
 			"UFCS receiver helper precedes explicit arguments exactly once",
 			test_ufcs_receiver_chain_lowers_before_explicit_arguments,

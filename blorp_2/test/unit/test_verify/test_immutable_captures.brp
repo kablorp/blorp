@@ -1,0 +1,129 @@
+import:
+	../../../src/lower/lower as Lower
+	../../../src/own/own as Own
+	../../../src/specialize/specialize as Concrete
+	../../../src/utils/syntax: Diagnostic, Span, same_span
+	../../../src/verify/verify: verify
+	../input: checked_source
+	test: TestSuite
+
+
+private SOURCE: String =
+	|pure func apply[A, B](callback: pure (A) -> B, value: A) -> B:
+	|    callback(value)
+	|func main() -> Int:
+	|    text = "shared"
+	|    unused = apply(pure func(_: Int) -> String: text, 0)
+	|    0
+	|
+
+
+private pure func owned(source: String) -> Result[Own.OwnershipProgram, Diagnostic]:
+	checked ?= checked_source(source)
+	concrete ?= Concrete.specialize(checked)
+	lowered ?= Lower.lower(concrete)
+	Own.own(lowered)
+
+
+private pure func rejects(
+	program: Own.OwnershipProgram,
+	message: String,
+	span: Span,
+) -> Bool:
+	match verify(program):
+		Err(error):
+			(
+				error.message == "ownership verification failed: " + message
+				and error.help == "report this compiler error with the input program"
+				and same_span(error.span, span)
+				and error.note.is_none()
+			)
+		Ok(_): False
+
+
+pure func test_scalar_environment_keeps_managed_storage_and_verifies() -> Bool:
+	source: String =
+		|pure func apply(callback: pure (Int) -> Int, value: Int) -> Int:
+		|    callback(value)
+		|func main() -> Int:
+		|    amount = 42
+		|    apply(pure func(_: Int) -> Int: amount, 0)
+		|
+	match owned(source):
+		Err(_): False
+		Ok(program):
+			(
+				program.records.any(pure func(layout):
+					match (layout.fields, layout.representation):
+						([Concrete.IntType], Concrete.ManagedRecord): True
+						_: False
+				)
+				and verify(program).is_ok()
+			)
+
+
+pure func test_missing_captured_return_acquisition_rejects_at_the_projection() -> Bool:
+	match owned(SOURCE):
+		Err(_): False
+		Ok(program):
+			match program.functions:
+				[main, lambda, apply]:
+					match (lambda.operations, lambda.result):
+						([parameter, item, Own.DefineValue(projected), Own.AcquireOwner(acquired, borrow, _)], Own.OwnedReturn(returned, transferred)):
+							-- Remove the actual acquisition while preserving its issued
+							-- value and owner references on the original return edge.
+							broken = { lambda | operations = [parameter, item, Own.DefineValue(projected)] }
+							(
+								Lower.value_number(borrow.value) == Lower.value_number(projected.id)
+								and Lower.value_number(returned) == Lower.value_number(projected.id)
+								and Own.owner_number(acquired) == Own.owner_number(transferred)
+								and rejects(
+									{ program | functions = [main, broken, apply] },
+									"owner ".append_int(Own.owner_number(acquired)) + " is not defined",
+									projected.span,
+								)
+								and verify(program).is_ok()
+							)
+						_: False
+				_: False
+
+
+pure func test_duplicate_environment_discharge_rejects_at_the_original_drop_span() -> Bool:
+	match owned(SOURCE):
+		Err(_): False
+		Ok(program):
+			match program.functions:
+				[main, lambda, apply]:
+					match main.operations:
+						[text, acquisition, Own.DefineValue(environment), original_drop, argument, call, Own.DropOwner(dropped, at), result_drop, zero]:
+							match environment.result:
+								Own.OwnedResult(owner):
+									-- Duplicate the actual environment discharge immediately,
+									-- before any other obligation can obscure the invariant.
+									broken = { main | operations = [
+										text, acquisition, Own.DefineValue(environment), original_drop,
+										argument, call, Own.DropOwner(dropped, at), Own.DropOwner(dropped, at),
+										result_drop, zero,
+									] }
+									(
+										Own.owner_number(owner) == Own.owner_number(dropped)
+										and rejects(
+											{ program | functions = [broken, lambda, apply] },
+											"owner ".append_int(Own.owner_number(dropped)) + " has already been discharged",
+											at,
+										)
+										and verify(program).is_ok()
+									)
+								_: False
+						_: False
+				_: False
+
+
+tests: TestSuite = {
+	description = "Independent verification rejects malformed capture environment ownership",
+	tests = [
+		("scalar environment keeps managed storage and verifies", test_scalar_environment_keeps_managed_storage_and_verifies),
+		("missing captured return acquisition rejects at projection", test_missing_captured_return_acquisition_rejects_at_the_projection),
+		("duplicate environment drop rejects at original span", test_duplicate_environment_discharge_rejects_at_the_original_drop_span),
+	]
+}

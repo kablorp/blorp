@@ -1,4 +1,6 @@
 import:
+	../../../src/check/model as Model
+	./selection_inputs as Selection
 	../../../src/utils/names: program_names
 	../../../src/check/check: check
 	../../../src/lex/lex: lex
@@ -9,12 +11,12 @@ import:
 	../../../src/utils/syntax:
 		Diagnostic,
 		Entrypoint(NoArguments), EntryResult(IntegerExitStatus),
-		FunctionExecution(OrdinaryCalls),
 		Span,
 		entry_function,
 	../../../src/verify/verify: verify
 	../input: parse, setup_diagnostic
 	../ownership_inputs: InputIds, input_ids, span
+	../managed_union_inputs: lowered_tail_join
 	test: TestSuite
 
 
@@ -32,6 +34,21 @@ private fixed record LayoutIds {
 	unions: List[Concrete.ConcreteUnion],
 	records: List[Concrete.ConcreteRecord]
 }
+
+
+private pure func seed_field(join: Lower.LoweredJoin, arm: Int) -> Result[Concrete.VariantFieldInstanceId, Diagnostic]:
+	var found: Option[Concrete.VariantFieldInstanceId] = None
+	for node in join.selection.nodes:
+		match node:
+			Lower.EnterArm(edge):
+				if Model.match_arm_number(edge.arm) == arm:
+					match edge.definitions:
+						[Lower.BorrowUnionField(_, field, _)]: found = Some(field)
+						_: void
+			_: void
+	match found:
+		Some(field): Ok(field)
+		None: Err({ span = span(0), note = None, message = "missing projection identity seed", help = "fix seed" })
 
 
 -- The seed mints opaque identities through lowering. All tested ownership
@@ -79,52 +96,24 @@ private pure func layout_ids() -> Result[LayoutIds, Diagnostic]:
 	match program.functions:
 		[_, first, other, pair, other_box]:
 			match (
-				first.tail,
-				other.tail,
+				lowered_tail_join(first),
+				lowered_tail_join(other),
 				pair.signature.return_type,
 				other_box.signature.return_type,
 			):
-				(Lower.MatchValue(matched), Lower.MatchValue(another), Concrete.RecordType(record_id), Concrete.UnionType(another_inner)):
-					match (matched.arms, another.arms):
-						([left, right], [other, _]):
-							match (
-								left.label,
-								right.label,
-								other.label,
-								first.signature.return_type,
-							):
-								(Lower.VariantLabel(first), Lower.VariantLabel(second), Lower.VariantLabel(other), Concrete.UnionType(inner)):
-									first_field ?= Concrete.variant_field(first, 0, program.unions, span(0))
-									second_field ?= Concrete.variant_field(second, 0, program.unions, span(0))
-									other_field ?= Concrete.variant_field(other, 0, program.unions, span(0))
-									Ok({
-										inner = inner,
-										another_inner = another_inner,
-										outer = matched.owner,
-										first = first,
-										first_field = first_field,
-										second = second,
-										second_field = second_field,
-										other = other,
-										other_field = other_field,
-										record_id = record_id,
-										unions = program.unions,
-										records = program.records,
-									})
-								_:
-									Err({
-										span = span(0),
-										note = None,
-										message = "missing variant seed",
-										help = "fix seed",
-									})
-						_:
-							Err({
-								span = span(0),
-								note = None,
-								message = "missing arm seed",
-								help = "fix seed",
-							})
+				(Some(matched), Some(another), Concrete.RecordType(record_id), Concrete.UnionType(another_inner)):
+					first_field ?= seed_field(matched, 0)
+					second_field ?= seed_field(matched, 1)
+					other_field ?= seed_field(another, 0)
+					match first.signature.return_type:
+						Concrete.UnionType(inner):
+							first_variant = Concrete.variant_field_variant(first_field)
+							Ok({ inner = inner, another_inner = another_inner,
+								outer = Concrete.variant_owner(first_variant), first = first_variant, first_field = first_field,
+								second = Concrete.variant_field_variant(second_field), second_field = second_field,
+								other = Concrete.variant_field_variant(other_field), other_field = other_field,
+								record_id = record_id, records = program.records, unions = program.unions })
+						_: Err({ span = span(0), note = None, message = "missing variant seed", help = "fix seed" })
 				_:
 					Err({
 						span = span(0),
@@ -143,7 +132,6 @@ private pure func layout_ids() -> Result[LayoutIds, Diagnostic]:
 
 private pure func main_function(ids: InputIds) -> Owned.OwnedFunction:
 	{
-		execution = OrdinaryCalls,
 		signature = {
 			parameters = [],
 			return_type = Concrete.IntType
@@ -155,7 +143,7 @@ private pure func main_function(ids: InputIds) -> Owned.OwnedFunction:
 				result = Owned.UnmanagedResult,
 				span = span(0),
 			})],
-		tail = Owned.ReturnTail(Owned.ReturnResult(Owned.UnmanagedReturn(ids.first)))
+		result = Owned.UnmanagedReturn(ids.first)
 	}
 
 
@@ -167,7 +155,6 @@ private pure func projection_program(ids: InputIds, layout: LayoutIds) -> Owned.
 		functions = [
 			main_function(ids),
 			{
-				execution = OrdinaryCalls,
 				signature = {
 					parameters = [
 						Concrete.UnionType(layout.outer),
@@ -187,35 +174,20 @@ private pure func projection_program(ids: InputIds, layout: LayoutIds) -> Owned.
 						value_type = Concrete.UnionType(layout.outer),
 						result = Owned.UnmanagedResult,
 						span = span(11),
-					})],
-				tail = Owned.MatchTail({
-					scrutinee = Owned.UnmanagedArgument(ids.first),
-					owner = layout.outer,
+					}), Owned.ExecuteJoin({
+					result = Owned.UnmanagedJoinParameter({ id = ids.third, value_type = Concrete.UnionType(layout.inner), span = span(40) }),
+					carried = [],
+					selection = { scrutinee = Owned.UnmanagedArgument(ids.first), entry = Model.decision_node_id(2), nodes = [
+						Owned.EnterArm({ arm = Model.match_arm_id(0), operations = [Owned.DefineValue({ id = ids.fourth, operation = Owned.PayloadDefinition(layout.first_field, ids.first), value_type = Concrete.UnionType(layout.inner), result = Owned.UnmanagedResult, span = span(20) })], transfers = [Owned.UnmanagedReturn(ids.fourth)] }),
+						Owned.EnterArm({ arm = Model.match_arm_id(1), operations = [Owned.DefineValue({ id = ids.fifth, operation = Owned.PayloadDefinition(layout.second_field, ids.first), value_type = Concrete.UnionType(layout.inner), result = Owned.UnmanagedResult, span = span(30) })], transfers = [Owned.UnmanagedReturn(ids.fifth)] }),
+						Owned.TestVariant({ value_type = Concrete.UnionType(layout.outer), route = Concrete.MatchRoot }, layout.first, Model.decision_node_id(0), Model.decision_node_id(1)),
+					] },
 					arms = [
-						{
-							label = Lower.VariantLabel(layout.first),
-							operations = [Owned.DefineValue({
-									id = ids.third,
-									operation = Owned.PayloadDefinition(layout.first_field, ids.first),
-									value_type = Concrete.UnionType(layout.inner),
-									result = Owned.UnmanagedResult,
-									span = span(20),
-								})],
-							exit = Owned.ReturnResult(Owned.UnmanagedReturn(ids.third))
-						},
-						{
-							label = Lower.VariantLabel(layout.second),
-							operations = [Owned.DefineValue({
-									id = ids.fourth,
-									operation = Owned.PayloadDefinition(layout.second_field, ids.first),
-									value_type = Concrete.UnionType(layout.inner),
-									result = Owned.UnmanagedResult,
-									span = span(30),
-								})],
-							exit = Owned.ReturnResult(Owned.UnmanagedReturn(ids.fourth))
-						},
+						{ id = Model.match_arm_id(0), inputs = [Owned.UnmanagedJoinParameter({ id = ids.sixth, value_type = Concrete.UnionType(layout.inner), span = span(20) })], operations = [], exit = Owned.Yield({ transfer = Owned.UnmanagedReturn(ids.sixth), carried = [] }) },
+						{ id = Model.match_arm_id(1), inputs = [Owned.UnmanagedJoinParameter({ id = ids.seventh, value_type = Concrete.UnionType(layout.inner), span = span(30) })], operations = [], exit = Owned.Yield({ transfer = Owned.UnmanagedReturn(ids.seventh), carried = [] }) },
 					],
-				})
+				})],
+				result = Owned.UnmanagedReturn(ids.third),
 			},
 		]
 	}
@@ -240,40 +212,31 @@ private pure func replace_projection(
 	operation: Owned.OwnedValueOperation,
 	value_type: Concrete.TypeRef,
 ) -> Owned.OwnershipProgram:
-	match input.functions:
-		[main, function]:
-			match function.tail:
-				Owned.MatchTail(matched):
-					match matched.arms:
-						[first, second]:
-							match first.operations:
-								[Owned.DefineValue(definition)]:
-									{ input | functions = [
-											main,
-											{ function | tail = Owned.MatchTail(
-													{ matched |
-														arms = [
-															{ first |
-																operations = [
-																	Owned.DefineValue({ definition |
-																			operation = operation,
-																			value_type = value_type
-																		}),
-																]
-															},
-															second,
-														]
-													},
-												) },
-										] }
-								_:
-									input
-						_:
-							input
-				_:
-					input
-		_:
-			input
+	functions = input.functions.map(pure func(function):
+		operations = function.operations.map(pure func(step):
+			match step:
+				Owned.ExecuteJoin(join):
+					selection = join.selection
+					nodes = selection.nodes.map(pure func(node):
+						match node:
+							Owned.EnterArm(edge):
+								if Model.match_arm_number(edge.arm) == 0:
+									operations = edge.operations.map(pure func(item):
+										match item:
+											Owned.DefineValue(definition): Owned.DefineValue({ definition | operation = operation, value_type = value_type })
+											_: item
+									)
+									Owned.EnterArm({ edge | operations = operations })
+								else:
+									node
+							_: node
+					)
+					Owned.ExecuteJoin({ join | selection = { selection | nodes = nodes } })
+				_: step
+		)
+		{ function | operations = operations }
+	)
+	{ input | functions = functions }
 
 
 pure func test_accepts_precise_unmanaged_projection() -> Bool:
@@ -307,12 +270,17 @@ private pure func rejects_projection(
 				value_type,
 			)
 
-			message = if wrong_type:
+			message = if second_source:
+				"selection edge contains an operation outside its local projections"
+			else if wrong_type:
 				"definition type does not match its operation"
 			else:
 				"payload projection does not belong to this match arm"
-
-			rejects(input, message, span(20))
+			at = if second_source:
+				span(10)
+			else:
+				span(20)
+			rejects(input, message, at)
 		_:
 			False
 
@@ -507,7 +475,6 @@ pure func test_constructor_rejects_equal_shaped_nominal_child() -> Bool:
 	match (input_ids(), layout_ids()):
 		(Ok(ids), Ok(layout)):
 			function: Owned.OwnedFunction = {
-				execution = OrdinaryCalls,
 				signature = {
 					parameters = [Concrete.UnionType(layout.another_inner)],
 					return_type = Concrete.UnionType(layout.outer)
@@ -528,7 +495,7 @@ pure func test_constructor_rejects_equal_shaped_nominal_child() -> Bool:
 						result = Owned.UnmanagedResult,
 						span = span(20),
 					})],
-				tail = Owned.ReturnTail(Owned.ReturnResult(Owned.UnmanagedReturn(ids.second)))
+				result = Owned.UnmanagedReturn(ids.second)
 			}
 			rejects(
 				{ projection_program(ids, layout) | functions = [main_function(ids), function] },

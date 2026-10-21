@@ -1,11 +1,13 @@
 import:
+	../../../src/check/model as Model
+	./selection_inputs as Selection
 	../../../src/lower/lower as Lower
 	../../../src/own/own as Own
 	../../../src/utils/source: same_source
 	../../../src/specialize/specialize as Concrete
-	../../../src/utils/syntax: Diagnostic, EntryResult(IntegerExitStatus), Entrypoint(NoArguments), FunctionExecution(OrdinaryCalls), Span
+	../../../src/utils/syntax: Diagnostic, EntryResult(IntegerExitStatus), Entrypoint(NoArguments), Span
 	../../../src/verify/verify: verify
-	../managed_union_inputs: lowered
+	../managed_union_inputs: lowered, lowered_tail_join
 	../ownership_inputs: InputIds, input_ids, span
 	test: TestSuite
 
@@ -32,11 +34,25 @@ private pure func seed_error() -> Diagnostic:
 	{ span = span(0), note = None, message = "invalid multiple field identity seed", help = "fix test setup" }
 
 
-private pure func variant(arm: Lower.LoweredArm) -> Result[Concrete.VariantInstanceId, Diagnostic]:
-	match arm.label:
-		Lower.VariantLabel(id): Ok(id)
-		_: Err(seed_error())
-
+private pure func variant(selection: Lower.LoweredSelection, arm: Lower.JoinArm) -> Result[Concrete.VariantInstanceId, Diagnostic]:
+	var found: Option[Concrete.VariantInstanceId] = None
+	for node in selection.nodes:
+		match node:
+			Lower.EnterArm(edge):
+				if Model.match_arm_number(edge.arm) == Model.match_arm_number(arm.id):
+					match edge.definitions:
+						[Lower.BorrowUnionField(_, field, _)]: found = Some(Concrete.variant_field_variant(field))
+						_: void
+			Lower.TestVariant(_, variant, yes, _):
+				match selection.nodes.get(Model.decision_node_number(yes)):
+					Some(Lower.EnterArm(edge)):
+						if Model.match_arm_number(edge.arm) == Model.match_arm_number(arm.id):
+							found = Some(variant)
+					_: void
+			Lower.TestListLength(_, _, _, _) | Lower.TestStringBytes(_, _, _, _): void
+	match found:
+		Some(variant): Ok(variant)
+		None: Err(seed_error())
 
 -- Only opaque identities come from lowering. The verified layouts, operations,
 -- storage transfers, projection borrows and owner obligations below are authored
@@ -50,19 +66,19 @@ private pure func layout_ids() -> Result[LayoutIds, Diagnostic]:
 		|    Empty
 		|pure func text(value: Slots[String, String]) -> String:
 		|    match value:
+		|        Empty: ""
 		|        Pair(left, _): left
 		|        Other(left, _): left
-		|        Empty: ""
 		|pure func mixed(value: Slots[Int, Void]) -> Int:
 		|    match value:
+		|        Empty: 0
 		|        Pair(left, _): left
 		|        Other(left, _): left
-		|        Empty: 0
 		|pure func marks(value: Slots[Marker[Int], Marker[String]]) -> Marker[Int]:
 		|    match value:
+		|        Empty: { value = 0 }
 		|        Pair(left, _): left
 		|        Other(left, _): left
-		|        Empty: { value = 0 }
 		|func main() -> Int:
 		|    unused_text = text(Pair("a", "b"))
 		|    unused_mixed = mixed(Pair(7, void))
@@ -73,15 +89,15 @@ private pure func layout_ids() -> Result[LayoutIds, Diagnostic]:
 	program = Lower.lowered_functions(seed)
 	match program.functions:
 		[_, text, mixed, marks]:
-			match (text.tail, mixed.tail, marks.tail):
-				(Lower.MatchValue(text), Lower.MatchValue(mixed), Lower.MatchValue(marks)):
+			match (lowered_tail_join(text), lowered_tail_join(mixed), lowered_tail_join(marks)):
+				(Some(text), Some(mixed), Some(marks)):
 					match (text.arms, mixed.arms, marks.arms):
-						([pair, sibling, empty], [mixed, _, _], [phantom, _, _]):
-							pair ?= variant(pair)
-							sibling ?= variant(sibling)
-							empty ?= variant(empty)
-							mixed ?= variant(mixed)
-							phantom ?= variant(phantom)
+						([empty, pair, sibling], [_, mixed_arm, _], [_, phantom, _]):
+							pair ?= variant(text.selection, pair)
+							sibling ?= variant(text.selection, sibling)
+							empty ?= variant(text.selection, empty)
+							mixed ?= variant(mixed.selection, mixed_arm)
+							phantom ?= variant(marks.selection, phantom)
 							first ?= Concrete.variant_field(pair, 0, program.unions, span(0))
 							second ?= Concrete.variant_field(pair, 1, program.unions, span(0))
 							sibling_field ?= Concrete.variant_field(sibling, 0, program.unions, span(0))
@@ -137,7 +153,7 @@ private pure func acquire(owner: Int, value: Lower.ValueId, source: Own.BorrowSo
 
 
 private pure func helper(parameters: List[Concrete.TypeRef], return_type: Concrete.TypeRef, operations: List[Own.OwnershipOperation], returned: Own.ReturnTransfer) -> Own.OwnedFunction:
-	{ execution = OrdinaryCalls, signature = { parameters = parameters, return_type = return_type }, operations = operations, tail = Own.ReturnTail(Own.ReturnResult(returned)) }
+	{ signature = { parameters = parameters, return_type = return_type }, operations = operations, result = returned }
 
 
 private pure func program(ids: InputIds, layout: LayoutIds, body: Own.OwnedFunction) -> Own.OwnershipProgram:
@@ -267,24 +283,36 @@ private pure func complete_projection(
 	managed = match value_type:
 		Concrete.StringType: True
 		_: False
+	projected_id = if managed:
+		ids.third
+	else:
+		ids.fourth
+	input_id = if managed:
+		ids.fourth
+	else:
+		ids.fifth
 	result = if managed:
 		Own.BorrowedResult(Own.PayloadBorrow(ids.first))
 	else:
 		Own.UnmanagedResult
-	projected_id = if managed:
-		ids.second
-	else:
-		ids.third
-	returned = if managed:
-		Own.OwnedReturn(ids.second, Own.owner_id(0))
-	else:
-		Own.UnmanagedReturn(projected_id)
 	acquisitions: List[Own.OwnershipOperation] = if managed:
-		[acquire(0, ids.second, Own.PayloadBorrow(ids.first), 21)]
+		[acquire(1, projected_id, Own.PayloadBorrow(ids.first), 21)]
 	else:
 		[]
+	edge_transfer = if managed:
+		Own.OwnedReturn(projected_id, Own.owner_id(1))
+	else:
+		Own.UnmanagedReturn(projected_id)
+	input: Own.OwnedJoinParameter = if managed:
+		Own.ManagedJoinParameter({ id = input_id, value_type = value_type, span = span(20) }, Own.owner_id(2))
+	else:
+		Own.UnmanagedJoinParameter({ id = input_id, value_type = value_type, span = span(20) })
+	returned = if managed:
+		Own.OwnedReturn(input_id, Own.owner_id(2))
+	else:
+		Own.UnmanagedReturn(input_id)
 	fallback: List[Own.OwnershipOperation] = if managed:
-		[definition(ids.third, value_type, Own.StringDefinition("fallback"), Own.OwnedResult(Own.owner_id(1)), 30)]
+		[definition(ids.fifth, value_type, Own.StringDefinition("fallback"), Own.OwnedResult(Own.owner_id(3)), 30)]
 	else:
 		[]
 	parameters = if managed:
@@ -292,7 +320,7 @@ private pure func complete_projection(
 	else:
 		[Concrete.UnionType(owner), value_type]
 	fallback_return = if managed:
-		Own.OwnedReturn(ids.third, Own.owner_id(1))
+		Own.OwnedReturn(ids.fifth, Own.owner_id(3))
 	else:
 		Own.UnmanagedReturn(ids.second)
 	scrutinee = if managed:
@@ -303,45 +331,53 @@ private pure func complete_projection(
 		[parameter(ids.first, Concrete.UnionType(owner), 0, 10)]
 	else:
 		[parameter(ids.first, Concrete.UnionType(owner), 0, 10), parameter(ids.second, value_type, 1, 11)]
+	join_result: Own.OwnedJoinParameter = if managed:
+		Own.ManagedJoinParameter({ id = ids.second, value_type = value_type, span = span(40) }, Own.owner_id(0))
+	else:
+		Own.UnmanagedJoinParameter({ id = ids.third, value_type = value_type, span = span(40) })
+	function_result = if managed:
+		Own.OwnedReturn(ids.second, Own.owner_id(0))
+	else:
+		Own.UnmanagedReturn(ids.third)
+	selection = Selection.branches(scrutinee, selected)
 	body: Own.OwnedFunction = {
-		execution = OrdinaryCalls,
 		signature = { parameters = parameters, return_type = value_type },
-		operations = prefix,
-		tail = Own.MatchTail({
-			scrutinee = scrutinee,
-			owner = owner,
+		operations = prefix.append(Own.ExecuteJoin({
+			result = join_result, carried = [],
+			selection = { selection | nodes = selection.nodes.set(0, Own.EnterArm({
+				arm = Model.match_arm_id(0),
+				operations = [definition(projected_id, value_type, Own.PayloadDefinition(field, ids.first), result, 20)] + acquisitions,
+				transfers = [edge_transfer],
+			})) },
 			arms = [
-				{
-					label = Lower.VariantLabel(selected),
-					operations = [definition(projected_id, value_type, Own.PayloadDefinition(field, ids.first), result, 20)] + acquisitions,
-					exit = Own.ReturnResult(returned)
-				},
-				{
-					label = Lower.DefaultLabel,
-					operations = fallback,
-					exit = Own.ReturnResult(fallback_return)
-				},
+				{ id = Model.match_arm_id(0), inputs = [input], operations = [], exit = Own.Yield({ transfer = returned, carried = [] }) },
+				{ id = Model.match_arm_id(1), inputs = [], operations = fallback, exit = Own.Yield({ transfer = fallback_return, carried = [] }) },
 			]
-		})
+		})),
+		result = function_result,
 	}
 	program(ids, layout, body)
-
 
 private pure func replace_projection(input: Own.OwnershipProgram, operation: Own.OwnedValueOperation, value_type: Concrete.TypeRef) -> Option[Own.OwnershipProgram]:
 	match input.functions:
 		[main, body]:
-			match body.tail:
-				Own.MatchTail(matched):
-					match matched.arms:
-						[first, second]:
-							match first.operations:
-								[Own.DefineValue(original), ...rest]:
-									Some({ input | functions = [main, { body | tail = Own.MatchTail({ matched | arms = [{ first | operations = [Own.DefineValue({ original | operation = operation, value_type = value_type })] + rest }, second] }) }] })
-								_: None
-						_: None
-				_: None
+			var prefix: List[Own.OwnershipOperation] = []
+			var changed: Option[Own.OwnedFunction] = None
+			for current in body.operations:
+				match current:
+					Own.ExecuteJoin(matched):
+						match matched.selection.nodes.get(0):
+							Some(Own.EnterArm(edge)):
+								match edge.operations:
+									[Own.DefineValue(original), ...rest]:
+										changed_edge = Own.EnterArm({ edge | operations = [Own.DefineValue({ original | operation = operation, value_type = value_type })] + rest })
+										selection = { matched.selection | nodes = matched.selection.nodes.set(0, changed_edge) }
+										changed = Some({ body | operations = prefix.append(Own.ExecuteJoin({ matched | selection = selection })) })
+									_: void
+							_: void
+					_: prefix = prefix.append(current)
+			changed.map(pure func(function): { input | functions = [main, function] })
 		_: None
-
 
 private pure func replacement_rejected(
 	input: Own.OwnershipProgram,
@@ -415,31 +451,68 @@ private fixed union ParentCase:
 
 private pure func acquired_parent_projection(ids: InputIds, layout: LayoutIds, case: ParentCase) -> Own.OwnershipProgram:
 	owner = Concrete.variant_owner(layout.pair)
-	projected = definition(ids.second, Concrete.StringType, Own.PayloadDefinition(layout.second, ids.first), Own.BorrowedResult(Own.PayloadBorrow(ids.first)), 20)
-	acquired = acquire(1, ids.second, Own.PayloadBorrow(ids.first), 21)
-	dropped = Own.DropOwner(Own.owner_id(0), span(22))
+	projected = definition(ids.third, Concrete.StringType, Own.PayloadDefinition(layout.second, ids.first), Own.BorrowedResult(Own.PayloadBorrow(ids.first)), 20)
+	acquired = acquire(2, ids.third, Own.PayloadBorrow(ids.first), 21)
+	dropped = Own.DropOwner(Own.owner_id(1), span(22))
+	-- An accepted edge preserves its parent owner until the canonical body.
+	-- Both malformed orderings now fail the stronger edge snapshot boundary.
 	operations = match case:
-		AcquiredBeforeDrop: [projected, acquired, dropped]
+		AcquiredBeforeDrop: [projected, acquired]
 		DroppedBeforeProjection: [dropped, projected, acquired]
 		DroppedBeforeAcquisition: [projected, dropped, acquired]
+	selection = Selection.branches(Own.BorrowedArgument({ value = ids.first, source = Own.OwnerBorrow(Own.owner_id(1)) }), layout.pair)
 	program(ids, layout, {
-		execution = OrdinaryCalls,
 		signature = { parameters = [Concrete.UnionType(owner)], return_type = Concrete.StringType },
-		operations = [parameter(ids.first, Concrete.UnionType(owner), 0, 10), acquire(0, ids.first, Own.ParameterBorrow(ids.first), 11)],
-		tail = Own.MatchTail({
-			scrutinee = Own.BorrowedArgument({ value = ids.first, source = Own.OwnerBorrow(Own.owner_id(0)) }),
-			owner = owner,
-			arms = [
-				{ label = Lower.VariantLabel(layout.pair), operations = operations, exit = Own.ReturnResult(Own.OwnedReturn(ids.second, Own.owner_id(1))) },
-				{
-					label = Lower.DefaultLabel,
-					operations = [definition(ids.third, Concrete.StringType, Own.StringDefinition("fallback"), Own.OwnedResult(Own.owner_id(2)), 30), Own.DropOwner(Own.owner_id(0), span(31))],
-					exit = Own.ReturnResult(Own.OwnedReturn(ids.third, Own.owner_id(2)))
-				},
-			]
-		})
+		operations = [parameter(ids.first, Concrete.UnionType(owner), 0, 10), Own.ExecuteLoop({
+			entry_acquisitions = [],
+			headers = [],
+			result = Own.ManagedJoinParameter({ id = ids.second, value_type = Concrete.StringType, span = span(40) }, Own.owner_id(0)),
+			carried = [],
+			body = {
+				operations = [acquire(1, ids.first, Own.ParameterBorrow(ids.first), 11)],
+				tail = Own.MatchLoop({
+					selection = {
+						selection | nodes = selection.nodes.set(0, Own.EnterArm({
+							arm = Model.match_arm_id(0),
+							operations = operations,
+							transfers = [Own.OwnedReturn(ids.third, Own.owner_id(2))]
+						}))
+					},
+					arms = [
+						{
+							id = Model.match_arm_id(0),
+							inputs = [Own.ManagedJoinParameter({
+								id = ids.fourth,
+								value_type = Concrete.StringType,
+								span = span(20)
+							}, Own.owner_id(3))],
+							body = {
+								operations = [acquire(4, ids.fourth, Own.OwnerBorrow(Own.owner_id(3)), 20), Own.DropOwner(Own.owner_id(3), span(20)), dropped],
+								tail = Own.ExitLoop(Own.Break({
+									value = Own.OwnedReturn(ids.fourth, Own.owner_id(4)),
+									carried = [],
+									span = span(20)
+								}))
+							}
+						},
+						{
+							id = Model.match_arm_id(1),
+							inputs = [],
+							body = {
+								operations = [definition(ids.fifth, Concrete.StringType, Own.StringDefinition("fallback"), Own.OwnedResult(Own.owner_id(5)), 30), acquire(6, ids.fifth, Own.OwnerBorrow(Own.owner_id(5)), 30), Own.DropOwner(Own.owner_id(5), span(31)), Own.DropOwner(Own.owner_id(1), span(31))],
+								tail = Own.ExitLoop(Own.Break({
+									value = Own.OwnedReturn(ids.fifth, Own.owner_id(6)),
+									carried = [],
+									span = span(30)
+								}))
+							}
+						},
+					]
+				}),
+			},
+		})],
+		result = Own.OwnedReturn(ids.second, Own.owner_id(0)),
 	})
-
 
 pure func test_acquired_second_child_survives_parent_drop() -> Bool:
 	run(pure func(ids, layout): verify(acquired_parent_projection(ids, layout, AcquiredBeforeDrop)).is_ok())
@@ -449,7 +522,7 @@ pure func test_second_slot_rejects_dead_parent_projection() -> Bool:
 	run(pure func(ids, layout):
 		(
 			verify(acquired_parent_projection(ids, layout, AcquiredBeforeDrop)).is_ok()
-			and rejects(acquired_parent_projection(ids, layout, DroppedBeforeProjection), "borrow refers to discharged owner 0", 20)
+			and rejects(acquired_parent_projection(ids, layout, DroppedBeforeProjection), "selection edge contains an operation outside its local projections", 10)
 		)
 	)
 
@@ -458,7 +531,7 @@ pure func test_second_slot_rejects_acquisition_after_parent_drop() -> Bool:
 	run(pure func(ids, layout):
 		(
 			verify(acquired_parent_projection(ids, layout, AcquiredBeforeDrop)).is_ok()
-			and rejects(acquired_parent_projection(ids, layout, DroppedBeforeAcquisition), "borrow refers to discharged owner 0", 21)
+			and rejects(acquired_parent_projection(ids, layout, DroppedBeforeAcquisition), "selection edge contains an operation outside its local projections", 10)
 		)
 	)
 

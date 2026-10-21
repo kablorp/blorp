@@ -1,4 +1,6 @@
 import:
+	../../../src/check/model as Model
+	./selection_inputs as Selection
 	../../../src/utils/names: program_names
 	../../../src/lex/lex: lex
 	../../../src/lower/lower as Lower
@@ -9,13 +11,13 @@ import:
 		Diagnostic,
 		Entrypoint(NoArguments), EntryResult(IntegerExitStatus),
 		FunctionExecution(OrdinaryCalls, SelfTailLoop),
-		Span,
+		Span, same_span,
 		entry_function,
 	../../../src/utils/text: concat
 	../../../src/verify/verify: verify
 	../input: check, parse, setup_diagnostic
 	int as IntOps
-	../managed_union_inputs: lowered, lowered_modules
+	../managed_union_inputs: lowered, lowered_modules, lowered_tail_join
 	../module_input: INTEGER_OPERATIONS, STRING_OPERATIONS
 	../ownership_inputs: InputIds, input_ids, span
 	system: read_file
@@ -49,15 +51,19 @@ private pure func seed_error() -> Diagnostic:
 	}
 
 
-private pure func seed_variant(
-	arm: Lower.LoweredArm,
-) -> Result[Concrete.VariantInstanceId, Diagnostic]:
-	match arm.label:
-		Lower.VariantLabel(id):
-			Ok(id)
-		_:
-			Err(seed_error())
-
+private pure func seed_variant(selection: Lower.LoweredSelection, arm: Lower.JoinArm) -> Result[Concrete.VariantInstanceId, Diagnostic]:
+	var found: Option[Concrete.VariantInstanceId] = None
+	for node in selection.nodes:
+		match node:
+			Lower.EnterArm(edge):
+				if Model.match_arm_number(edge.arm) == Model.match_arm_number(arm.id):
+					match edge.definitions:
+						[Lower.BorrowUnionField(_, field, _)]: found = Some(Concrete.variant_field_variant(field))
+						_: void
+			_: void
+	match found:
+		Some(variant): Ok(variant)
+		None: Err(seed_error())
 
 -- Lowering supplies opaque identities only. These tests independently declare
 -- every layout, operation, ownership obligation and borrow edge they verify.
@@ -101,37 +107,37 @@ private pure func layout_ids() -> Result[LayoutIds, Diagnostic]:
 
 	match program.functions:
 		[_, box, choice, other, outer]:
-			match (box.tail, choice.tail, other.tail, outer.tail):
-				(Lower.MatchValue(box), Lower.MatchValue(choice), Lower.MatchValue(other), Lower.MatchValue(outer)):
+			match (lowered_tail_join(box), lowered_tail_join(choice), lowered_tail_join(other), lowered_tail_join(outer)):
+				(Some(box), Some(choice), Some(other), Some(outer)):
 					match (box.arms, choice.arms, other.arms, outer.arms):
 						([boxed], [left, right], [othered], [wrapped]):
-							boxed ?= seed_variant(boxed)
+							boxed ?= seed_variant(box.selection, boxed)
 							boxed_field ?= Concrete.variant_field(boxed, 0, program.unions, span(0))
-							left ?= seed_variant(left)
+							left ?= seed_variant(choice.selection, left)
 							left_field ?= Concrete.variant_field(left, 0, program.unions, span(0))
-							right ?= seed_variant(right)
+							right ?= seed_variant(choice.selection, right)
 							right_field ?= Concrete.variant_field(right, 0, program.unions, span(0))
-							othered ?= seed_variant(othered)
+							othered ?= seed_variant(other.selection, othered)
 							othered_field ?= Concrete.variant_field(othered, 0, program.unions, span(0))
-							wrapped ?= seed_variant(wrapped)
+							wrapped ?= seed_variant(outer.selection, wrapped)
 							wrapped_field ?= Concrete.variant_field(wrapped, 0, program.unions, span(0))
 
 							-- Raw catalog rows below use this explicit producer-issued order.
 							if (
 								IntOps.equals(
-									Concrete.union_number(box.owner),
+									Concrete.union_number(Concrete.variant_owner(boxed)),
 									0,
 								)
 								and IntOps.equals(
-									Concrete.union_number(choice.owner),
+									Concrete.union_number(Concrete.variant_owner(left)),
 									1,
 								)
 								and IntOps.equals(
-									Concrete.union_number(other.owner),
+									Concrete.union_number(Concrete.variant_owner(othered)),
 									2,
 								)
 								and IntOps.equals(
-									Concrete.union_number(outer.owner),
+									Concrete.union_number(Concrete.variant_owner(wrapped)),
 									3,
 								)
 								and IntOps.equals(
@@ -156,18 +162,18 @@ private pure func layout_ids() -> Result[LayoutIds, Diagnostic]:
 								)
 							):
 								Ok({
-									box = box.owner,
+									box = Concrete.variant_owner(boxed),
 									boxed = boxed,
 									boxed_field = boxed_field,
-									choice = choice.owner,
+									choice = Concrete.variant_owner(left),
 									left = left,
 									left_field = left_field,
 									right = right,
 									right_field = right_field,
-									other = other.owner,
+									other = Concrete.variant_owner(othered),
 									othered = othered,
 									othered_field = othered_field,
-									outer = outer.owner,
+									outer = Concrete.variant_owner(wrapped),
 									wrapped = wrapped,
 									wrapped_field = wrapped_field,
 								})
@@ -292,13 +298,12 @@ private pure func function(
 	returned: Owned.ReturnTransfer,
 ) -> Owned.OwnedFunction:
 	{
-		execution = OrdinaryCalls,
 		signature = {
 			parameters = parameters,
 			return_type = return_type
 		},
 		operations = operations,
-		tail = Owned.ReturnTail(Owned.ReturnResult(returned))
+		result = returned
 	}
 
 
@@ -759,57 +764,69 @@ private pure func projection_program(
 	first_operations: List[Owned.OwnershipOperation],
 	returned: Owned.ReturnTransfer,
 	prefix: List[Owned.OwnershipOperation],
+	result_owner: Int,
 ) -> Owned.OwnershipProgram:
-	program(
-		ids,
-		layout,
-		{
-			execution = OrdinaryCalls,
-			signature = {
-				parameters = [Concrete.UnionType(layout.choice), Concrete.UnionType(layout.choice)],
-				return_type = Concrete.StringType
-			},
-			operations = [parameter(
-					ids.first,
-					0,
-					Concrete.UnionType(layout.choice),
-					10,
-				), parameter(
-					ids.second,
-					1,
-					Concrete.UnionType(layout.choice),
-					11,
-				)].concat(prefix),
-			tail = Owned.MatchTail({
-				scrutinee = Owned.BorrowedArgument({ value = ids.first, source = Owned.ParameterBorrow(ids.first) }),
-				owner = layout.choice,
+	selection = Selection.branches(Owned.BorrowedArgument({ value = ids.first, source = Owned.ParameterBorrow(ids.first) }), layout.left)
+	nodes = selection.nodes
+		.set(0, Owned.EnterArm({ arm = Model.match_arm_id(0), operations = first_operations, transfers = [returned] }))
+		.set(1, Owned.EnterArm({
+			arm = Model.match_arm_id(1),
+			operations = [
+				projected(ids.fifth, layout.right_field, ids.first, Owned.PayloadBorrow(ids.first), 30),
+				acquire(result_owner + 2, ids.fifth, Owned.PayloadBorrow(ids.first), 31),
+			],
+			transfers = [Owned.OwnedReturn(ids.fifth, Owned.owner_id(result_owner + 2))],
+		}))
+	program(ids, layout, {
+		signature = { parameters = [Concrete.UnionType(layout.choice), Concrete.UnionType(layout.choice)], return_type = Concrete.StringType },
+		operations = [
+			parameter(ids.first, 0, Concrete.UnionType(layout.choice), 10),
+			parameter(ids.second, 1, Concrete.UnionType(layout.choice), 11),
+		].concat(prefix).append(Owned.ExecuteLoop({
+			entry_acquisitions = [],
+			headers = [],
+			result = Owned.ManagedJoinParameter({ id = ids.third, value_type = Concrete.StringType, span = span(20) }, Owned.owner_id(result_owner)),
+			carried = [],
+			body = { operations = [], tail = Owned.MatchLoop({
+				selection = { selection | nodes = nodes },
 				arms = [
 					{
-						label = Lower.VariantLabel(layout.left),
-						operations = first_operations,
-						exit = Owned.ReturnResult(returned)
+						id = Model.match_arm_id(0),
+						inputs = [Owned.ManagedJoinParameter({
+							id = ids.sixth,
+							value_type = Concrete.StringType,
+							span = span(20)
+						}, Owned.owner_id(result_owner + 3))],
+						body = {
+							operations = [acquire(result_owner + 4, ids.sixth, Owned.OwnerBorrow(Owned.owner_id(result_owner + 3)), 20), Owned.DropOwner(Owned.owner_id(result_owner + 3), span(20))],
+							tail = Owned.ExitLoop(Owned.Break({
+								value = Owned.OwnedReturn(ids.sixth, Owned.owner_id(result_owner + 4)),
+								carried = [],
+								span = span(20)
+							}))
+						}
 					},
 					{
-						label = Lower.VariantLabel(layout.right),
-						operations = [projected(
-								ids.fourth,
-								layout.right_field,
-								ids.first,
-								Owned.PayloadBorrow(ids.first),
-								30,
-							), acquire(
-								1,
-								ids.fourth,
-								Owned.PayloadBorrow(ids.first),
-								31,
-							)],
-						exit = Owned.ReturnResult(Owned.OwnedReturn(ids.fourth, Owned.owner_id(1)))
+						id = Model.match_arm_id(1),
+						inputs = [Owned.ManagedJoinParameter({
+							id = ids.seventh,
+							value_type = Concrete.StringType,
+							span = span(30)
+						}, Owned.owner_id(result_owner + 5))],
+						body = {
+							operations = [acquire(result_owner + 6, ids.seventh, Owned.OwnerBorrow(Owned.owner_id(result_owner + 5)), 30), Owned.DropOwner(Owned.owner_id(result_owner + 5), span(30))],
+							tail = Owned.ExitLoop(Owned.Break({
+								value = Owned.OwnedReturn(ids.seventh, Owned.owner_id(result_owner + 6)),
+								carried = [],
+								span = span(30)
+							}))
+						}
 					},
 				],
-			})
-		},
-	)
-
+			}) },
+		})),
+		result = Owned.OwnedReturn(ids.third, Owned.owner_id(result_owner)),
+	})
 
 private pure func projection(
 	ids: InputIds,
@@ -821,17 +838,18 @@ private pure func projection(
 	projection_program(
 		ids,
 		layout,
-		[projected(ids.third, field, parent, source, 20), acquire(
-				0,
-				ids.third,
+		[projected(ids.fourth, field, parent, source, 20), acquire(
+				1,
+				ids.fourth,
 				Owned.PayloadBorrow(ids.first),
 				21,
 			)],
 		Owned.OwnedReturn(
-			ids.third,
-			Owned.owner_id(0),
+			ids.fourth,
+			Owned.owner_id(1),
 		),
 		[],
+		0,
 	)
 
 
@@ -851,59 +869,30 @@ pure func test_selected_payload_returns_independent_owner() -> Bool:
 
 pure func test_selected_nested_aggregate_returns_independent_owner() -> Bool:
 	run(pure func(ids, layout):
-		verify(
-			program(
-				ids,
-				layout,
-				{
-					execution = OrdinaryCalls,
-					signature = {
-						parameters = [Concrete.UnionType(layout.outer)],
-						return_type = Concrete.UnionType(layout.box)
-					},
-					operations = [parameter(
-							ids.first,
-							0,
-							Concrete.UnionType(layout.outer),
-							10,
-						)],
-					tail = Owned.MatchTail({
-						scrutinee = Owned.BorrowedArgument({ value = ids.first, source = Owned.ParameterBorrow(ids.first) }),
-						owner = layout.outer,
-						arms = [
-							{
-								label = Lower.VariantLabel(layout.wrapped),
-								operations = [Owned.DefineValue({
-										id = ids.second,
-										value_type = Concrete.UnionType(layout.box),
-										operation = Owned.PayloadDefinition(
-											layout.wrapped_field,
-											ids.first,
-										),
-										result = Owned.BorrowedResult(
-											Owned.PayloadBorrow(ids.first),
-										),
-										span = span(20),
-									}), acquire(
-										0,
-										ids.second,
-										Owned.PayloadBorrow(ids.first),
-										21,
-									)],
-								exit = Owned.ReturnResult(
-									Owned.OwnedReturn(
-										ids.second,
-										Owned.owner_id(0),
-									),
-								)
-							},
-						],
-					})
-				},
-			),
-		).is_ok()
+		selection = Selection.direct(Owned.BorrowedArgument({ value = ids.first, source = Owned.ParameterBorrow(ids.first) }))
+		verify(program(ids, layout, {
+			signature = { parameters = [Concrete.UnionType(layout.outer)], return_type = Concrete.UnionType(layout.box) },
+			operations = [parameter(ids.first, 0, Concrete.UnionType(layout.outer), 10), Owned.ExecuteLoop({
+				entry_acquisitions = [],
+				headers = [],
+				result = Owned.ManagedJoinParameter({ id = ids.second, value_type = Concrete.UnionType(layout.box), span = span(20) }, Owned.owner_id(0)),
+				carried = [],
+				body = { operations = [], tail = Owned.MatchLoop({
+					selection = { selection | nodes = [Owned.EnterArm({
+						arm = Model.match_arm_id(0),
+						operations = [Owned.DefineValue({ id = ids.third, value_type = Concrete.UnionType(layout.box), operation = Owned.PayloadDefinition(layout.wrapped_field, ids.first), result = Owned.BorrowedResult(Owned.PayloadBorrow(ids.first)), span = span(20) }), acquire(1, ids.third, Owned.PayloadBorrow(ids.first), 21)],
+						transfers = [Owned.OwnedReturn(ids.third, Owned.owner_id(1))],
+					})] },
+					arms = [{
+						id = Model.match_arm_id(0),
+						inputs = [Owned.ManagedJoinParameter({ id = ids.fourth, value_type = Concrete.UnionType(layout.box), span = span(20) }, Owned.owner_id(2))],
+						body = { operations = [acquire(3, ids.fourth, Owned.OwnerBorrow(Owned.owner_id(2)), 20), Owned.DropOwner(Owned.owner_id(2), span(20))], tail = Owned.ExitLoop(Owned.Break({ value = Owned.OwnedReturn(ids.fourth, Owned.owner_id(3)), carried = [], span = span(20) })) },
+					}],
+				}) },
+			})],
+			result = Owned.OwnedReturn(ids.second, Owned.owner_id(0)),
+		})).is_ok()
 	)
-
 
 pure func test_projection_rejects_wrong_immediate_parent() -> Bool:
 	run(pure func(ids, layout):
@@ -963,8 +952,8 @@ pure func test_projection_rejects_another_same_typed_scrutinee() -> Bool:
 				ids.second,
 				Owned.PayloadBorrow(ids.second),
 			),
-			"payload projection does not belong to this match arm",
-			span(20),
+			"selection edge contains an operation outside its local projections",
+			span(10),
 		)
 	)
 
@@ -976,10 +965,10 @@ pure func test_projection_rejects_forward_source() -> Bool:
 				ids,
 				layout,
 				layout.left_field,
-				ids.fourth,
-				Owned.PayloadBorrow(ids.fourth),
+				ids.fifth,
+				Owned.PayloadBorrow(ids.fifth),
 			),
-			"value 3 is not defined before use",
+			"value 4 is not defined before use",
 			span(20),
 		)
 	)
@@ -993,7 +982,7 @@ pure func test_projection_rejects_self_parent_edge() -> Bool:
 				layout,
 				layout.left_field,
 				ids.first,
-				Owned.PayloadBorrow(ids.third),
+				Owned.PayloadBorrow(ids.fourth),
 			),
 			"payload borrow has the wrong parent value",
 			span(20),
@@ -1009,7 +998,7 @@ pure func test_projection_requires_parent_borrow_kind() -> Bool:
 				layout,
 				layout.left_field,
 				ids.first,
-				Owned.ParameterBorrow(ids.third),
+				Owned.ParameterBorrow(ids.fourth),
 			),
 			"managed projection requires its parent borrow",
 			span(20),
@@ -1024,22 +1013,23 @@ pure func test_acquisition_rejects_wrong_payload_ancestry() -> Bool:
 				ids,
 				layout,
 				[projected(
-						ids.third,
+						ids.fourth,
 						layout.left_field,
 						ids.first,
 						Owned.PayloadBorrow(ids.first),
 						20,
 					), acquire(
-						0,
-						ids.third,
+						1,
+						ids.fourth,
 						Owned.PayloadBorrow(ids.second),
 						21,
 					)],
 				Owned.OwnedReturn(
-					ids.third,
-					Owned.owner_id(0),
+					ids.fourth,
+					Owned.owner_id(1),
 				),
 				[],
+				0,
 			),
 			"payload borrow has the wrong parent value",
 			span(21),
@@ -1054,24 +1044,25 @@ pure func test_acquisition_rejects_inactive_owner() -> Bool:
 				ids,
 				layout,
 				[projected(
-						ids.third,
+						ids.fourth,
 						layout.left_field,
 						ids.first,
 						Owned.PayloadBorrow(ids.first),
 						20,
 					), acquire(
-						0,
-						ids.third,
-						Owned.OwnerBorrow(Owned.owner_id(0)),
+						1,
+						ids.fourth,
+						Owned.OwnerBorrow(Owned.owner_id(1)),
 						21,
 					)],
 				Owned.OwnedReturn(
-					ids.third,
-					Owned.owner_id(0),
+					ids.fourth,
+					Owned.owner_id(1),
 				),
 				[],
+				0,
 			),
-			"owner 0 is not defined",
+			"owner 1 is not defined",
 			span(21),
 		)
 	)
@@ -1084,29 +1075,30 @@ pure func test_acquisition_rejects_active_owner_of_parent() -> Bool:
 				ids,
 				layout,
 				[projected(
-						ids.third,
+						ids.fourth,
 						layout.left_field,
 						ids.first,
 						Owned.PayloadBorrow(ids.first),
 						20,
 					), acquire(
-						0,
+						1,
 						ids.first,
 						Owned.ParameterBorrow(ids.first),
 						21,
 					), acquire(
-						1,
-						ids.third,
-						Owned.OwnerBorrow(Owned.owner_id(0)),
+						2,
+						ids.fourth,
+						Owned.OwnerBorrow(Owned.owner_id(1)),
 						22,
 					)],
 				Owned.OwnedReturn(
-					ids.third,
-					Owned.owner_id(1),
+					ids.fourth,
+					Owned.owner_id(2),
 				),
 				[],
+				0,
 			),
-			"owner 0 does not own value 2",
+			"owner 1 does not own value 3",
 			span(22),
 		)
 	)
@@ -1119,17 +1111,18 @@ pure func test_returned_payload_requires_acquisition() -> Bool:
 				ids,
 				layout,
 				[projected(
-						ids.third,
+						ids.fourth,
 						layout.left_field,
 						ids.first,
 						Owned.PayloadBorrow(ids.first),
 						20,
 					)],
-				Owned.UnmanagedReturn(ids.third),
+				Owned.UnmanagedReturn(ids.fourth),
 				[],
+				0,
 			),
-			"managed return requires an owner transfer",
-			span(20),
+			"managed yield requires an owner transfer",
+			span(10),
 		)
 	)
 
@@ -1141,20 +1134,21 @@ pure func test_returned_payload_cannot_name_unacquired_owner() -> Bool:
 				ids,
 				layout,
 				[projected(
-						ids.third,
+						ids.fourth,
 						layout.left_field,
 						ids.first,
 						Owned.PayloadBorrow(ids.first),
 						20,
 					)],
 				Owned.OwnedReturn(
-					ids.third,
-					Owned.owner_id(0),
+					ids.fourth,
+					Owned.owner_id(1),
 				),
 				[],
+				0,
 			),
-			"owner 0 is not defined",
-			span(20),
+			"owner 1 is not defined",
+			span(10),
 		)
 	)
 
@@ -1166,30 +1160,31 @@ pure func test_payload_owner_leak_is_rejected() -> Bool:
 				ids,
 				layout,
 				[projected(
-						ids.third,
+						ids.fourth,
 						layout.left_field,
 						ids.first,
 						Owned.PayloadBorrow(ids.first),
 						20,
 					), acquire(
-						0,
-						ids.third,
+						1,
+						ids.fourth,
 						Owned.PayloadBorrow(ids.first),
 						21,
 					), acquire(
-						1,
-						ids.third,
+						2,
+						ids.fourth,
 						Owned.PayloadBorrow(ids.first),
 						22,
 					)],
 				Owned.OwnedReturn(
-					ids.third,
-					Owned.owner_id(1),
+					ids.fourth,
+					Owned.owner_id(2),
 				),
 				[],
+				0,
 			),
-			"owner 0 remains live at return",
-			span(20),
+			"owner 1 remains live at yield",
+			span(10),
 		)
 	)
 
@@ -1201,30 +1196,31 @@ pure func test_payload_owner_double_drop_is_rejected() -> Bool:
 				ids,
 				layout,
 				[projected(
-						ids.third,
+						ids.fourth,
 						layout.left_field,
 						ids.first,
 						Owned.PayloadBorrow(ids.first),
 						20,
 					), acquire(
-						0,
-						ids.third,
+						1,
+						ids.fourth,
 						Owned.PayloadBorrow(ids.first),
 						21,
 					), Owned.DropOwner(
-						Owned.owner_id(0),
+						Owned.owner_id(1),
 						span(22),
 					), Owned.DropOwner(
-						Owned.owner_id(0),
+						Owned.owner_id(1),
 						span(23),
 					)],
 				Owned.OwnedReturn(
-					ids.third,
-					Owned.owner_id(0),
+					ids.fourth,
+					Owned.owner_id(1),
 				),
 				[],
+				0,
 			),
-			"owner 0 has already been discharged",
+			"owner 1 has already been discharged",
 			span(23),
 		)
 	)
@@ -1250,68 +1246,28 @@ private pure func prefix_projection_program(
 	else:
 		prefix
 
-	input = projection_program(
+	projection_program(
 		ids,
 		layout,
 		[projected(
-				ids.third,
+				ids.fourth,
 				layout.left_field,
 				ids.first,
 				Owned.PayloadBorrow(ids.first),
 				20,
 			), acquire(
-				1,
-				ids.third,
+				2,
+				ids.fourth,
 				Owned.PayloadBorrow(ids.first),
 				21,
 			)],
 		Owned.OwnedReturn(
-			ids.third,
-			Owned.owner_id(1),
+			ids.fourth,
+			Owned.owner_id(2),
 		),
 		operations,
+		1,
 	)
-
-	match input.functions:
-		[main, helper]:
-			match helper.tail:
-				Owned.MatchTail(matched):
-					match matched.arms:
-						[first, second]:
-							match second.operations:
-								[child, Owned.AcquireOwner(_, borrow, at)]:
-									{ input | functions = [
-											main,
-											{ helper | tail = Owned.MatchTail(
-													{ matched | arms = [
-															first,
-															{ second |
-																operations = [
-																	child,
-																	Owned.AcquireOwner(
-																		Owned.owner_id(2),
-																		borrow,
-																		at,
-																	),
-																],
-																exit = Owned.ReturnResult(
-																	Owned.OwnedReturn(
-																		ids.fourth,
-																		Owned.owner_id(2),
-																	),
-																)
-															},
-														] },
-												) },
-										] }
-								_:
-									input
-						_:
-							input
-				_:
-					input
-		_:
-			input
 
 
 pure func test_live_prefix_acquisition_must_be_discharged() -> Bool:
@@ -1342,26 +1298,25 @@ pure func test_discharged_scrutinee_rejects_tag_read() -> Bool:
 						parameters = [],
 						return_type = Concrete.IntType
 					},
-					operations = helper.operations.append(
-						Owned.DropOwner(
-							Owned.owner_id(0),
-							span(21),
-						),
-					),
-					tail = Owned.MatchTail({
-						scrutinee = Owned.BorrowedArgument({
-							value = ids.second,
-							source = Owned.OwnerBorrow(Owned.owner_id(0)),
-						}),
-						owner = layout.choice,
-						arms = [
-							{
-								label = Lower.DefaultLabel,
+					operations = helper.operations + [
+						Owned.DropOwner(Owned.owner_id(0), span(21)),
+						Owned.ExecuteLoop({
+							entry_acquisitions = [],
+							headers = [],
+							result = Owned.UnmanagedJoinParameter({ id = ids.third, value_type = Concrete.IntType, span = span(20) }),
+							carried = [],
+							body = {
 								operations = [],
-								exit = Owned.ReturnResult(Owned.UnmanagedReturn(ids.first))
-							},
-						],
-					})
+								tail = Owned.MatchLoop({
+									selection = Selection.direct(Owned.BorrowedArgument({ value = ids.second, source = Owned.OwnerBorrow(Owned.owner_id(0)) })),
+									arms = [{ id = Model.match_arm_id(0), inputs = [], body = { operations = [],
+										tail = Owned.ExitLoop(Owned.Break({ value = Owned.UnmanagedReturn(ids.first), carried = [], span = span(20) })) } }],
+								})
+							}
+						}),
+					],
+					result = Owned.UnmanagedReturn(ids.third)
+
 				}
 				rejects(
 					{ input | functions = [main, bad] },
@@ -1536,64 +1491,48 @@ pure func test_unused_empty_layout_is_rejected() -> Bool:
 	)
 
 
+-- These fixture-bound regressions exercise Specialize admission, not Verify.
+private pure func rejects_inline_admission(
+	function: Concrete.ConcreteFunction,
+	unions: List[Concrete.ConcreteUnion],
+	at: Int,
+) -> Bool:
+	match Concrete.admit_scalar_loop(function, unions, []):
+		Ok(_): False
+		Err(error):
+			(
+				same_span(error.span, span(at))
+				and error.message == "managed values in @tail_recursive functions are not supported yet"
+				and error.help == "use an unmanaged helper, or remove @tail_recursive"
+				and error.note.is_none()
+			)
+
+
 pure func test_inline_owning_signature_is_rejected_in_a_self_tail_loop() -> Bool:
 	run(pure func(ids, layout):
-		input = variant_program(
-			ids,
-			layout,
-			None,
-			Owned.OwnedResult(Owned.owner_id(0)),
-		)
-
-		match input.functions:
-			[main, helper]:
-				rejects(
-					{ input | functions = [
-							main,
-							{ helper |
-								execution = SelfTailLoop(span(90)),
-								tail = Owned.ReturnTail(Owned.RecurArguments([], span(80)))
-							},
-						] },
-					"managed signature in a self-tail loop",
-					span(90),
-				)
-			_:
-				False
+		input = variant_program(ids, layout, None, Owned.OwnedResult(Owned.owner_id(0)))
+		rejects_inline_admission({
+			execution = SelfTailLoop(span(90)),
+			signature = { parameters = [], return_type = Concrete.UnionType(layout.choice) },
+			bindings = [], statements = [],
+			body = Concrete.ConcreteValueBody(Concrete.RecurWith([], span(80)))
+		}, input.unions, 90)
 	)
 
 
 pure func test_inline_owning_intermediate_is_rejected_even_after_drop() -> Bool:
 	run(pure func(ids, layout):
-		input = variant_program(
-			ids,
-			layout,
-			None,
-			Owned.OwnedResult(Owned.owner_id(0)),
-		)
-
-		match input.functions:
-			[main, helper]:
-				rejects(
-					{ input | functions = [
-							main,
-							{ helper |
-								execution = SelfTailLoop(span(90)),
-								signature = { helper.signature | return_type = Concrete.IntType },
-								operations = helper.operations.append(
-									Owned.DropOwner(
-										Owned.owner_id(0),
-										span(40),
-									),
-								),
-								tail = Owned.ReturnTail(Owned.RecurArguments([], span(80)))
-							},
-						] },
-					"managed value appears in a self-tail loop",
-					span(20),
-				)
-			_:
-				False
+		input = variant_program(ids, layout, None, Owned.OwnedResult(Owned.owner_id(0)))
+		rejects_inline_admission({
+			execution = SelfTailLoop(span(90)),
+			signature = { parameters = [], return_type = Concrete.IntType },
+			bindings = [],
+			statements = [Concrete.DiscardExpression({
+				form = Concrete.ConstructVariant(layout.left, []),
+				value_type = Concrete.UnionType(layout.choice), span = span(20)
+			})],
+			body = Concrete.ConcreteValueBody(Concrete.RecurWith([], span(80)))
+		}, input.unions, 20)
 	)
 
 

@@ -1,0 +1,124 @@
+import:
+	../../../src/check/model: match_arm_number
+	../../../src/lower/lower as Lower
+	../../../src/own/own as Own
+	../../../src/specialize/specialize as Concrete
+	../../../src/utils/syntax: entry_function
+	../string_slice_inputs: slice_seed
+	test: TestSuite
+
+
+pure func test_slice_borrows_source_and_transfers_its_option() -> Bool:
+	match slice_seed():
+		Err(_): False
+		Ok(seed):
+			contents = Lower.lowered_functions(seed.lowered)
+			match Own.insert_function(seed.query, contents.unions, contents.records):
+				Err(_): False
+				Ok(owned):
+					match (owned.operations, owned.result):
+						([Own.DefineValue(source), Own.DefineValue(start), Own.DefineValue(end), Own.DefineValue(result)], Own.OwnedReturn(returned, transferred)):
+							match ((source.result, start.result, end.result), (result.operation, result.result)):
+								((Own.BorrowedResult(Own.ParameterBorrow(parameter)), Own.UnmanagedResult, Own.UnmanagedResult), (Own.CallDefinition(_, [Own.BorrowedArgument(borrow), Own.UnmanagedArgument(first), Own.UnmanagedArgument(last)]), Own.OwnedResult(owner))):
+									match borrow.source:
+										Own.ParameterBorrow(borrowed):
+											(
+												Lower.value_number(parameter) == Lower.value_number(source.id)
+												and Lower.value_number(borrowed) == Lower.value_number(source.id)
+												and Lower.value_number(borrow.value) == Lower.value_number(source.id)
+												and Lower.value_number(first) == Lower.value_number(start.id)
+												and Lower.value_number(last) == Lower.value_number(end.id)
+												and Lower.value_number(returned) == Lower.value_number(result.id)
+												and Own.owner_number(transferred) == Own.owner_number(owner)
+												and Concrete.same_type(result.value_type, Concrete.UnionType(Concrete.variant_owner(seed.option.some)))
+											)
+										_: False
+								_: False
+						_: False
+
+
+pure func test_ignored_slice_option_retires_once() -> Bool:
+	match slice_seed().and_then(pure func(seed): Own.own(seed.lowered)):
+		Err(_): False
+		Ok(program):
+			match program.functions.get(Concrete.function_number(entry_function(program.entrypoint))):
+				None: False
+				Some(main):
+					main.operations.any(pure func(operation):
+						match operation:
+							Own.DefineValue(result):
+								match (result.value_type, result.result):
+									(Concrete.UnionType(_), Own.OwnedResult(owner)):
+										main.operations.filter(pure func(operation):
+											match operation:
+												Own.DropOwner(dropped, _): Own.owner_number(dropped) == Own.owner_number(owner)
+												_: False
+										).length() == 1
+									_: False
+							_: False
+					)
+
+
+pure func test_slice_child_acquires_before_parent_retires() -> Bool:
+	match slice_seed():
+		Err(_): False
+		Ok(seed):
+			contents = Lower.lowered_functions(seed.lowered)
+			match Own.insert_function(seed.escape, contents.unions, contents.records):
+				Err(_): False
+				Ok(owned):
+					match (owned.operations, owned.result):
+						([_, _, _, Own.DefineValue(parent), Own.ExecuteJoin(matched), Own.DropOwner(dropped, _)], Own.OwnedReturn(joined, output_owner)):
+							match (parent.result, matched.result):
+								(Own.OwnedResult(parent_owner), Own.ManagedJoinParameter(result, result_owner)):
+									(
+										Own.owner_number(dropped) == Own.owner_number(parent_owner)
+										and Lower.value_number(joined) == Lower.value_number(result.id)
+										and Own.owner_number(output_owner) == Own.owner_number(result_owner)
+										and matched.arms.any(pure func(arm):
+											match (arm.inputs, arm.operations, arm.exit):
+												([Own.ManagedJoinParameter(input, canonical)], [], Own.Yield(outputs)):
+													matched.selection.nodes.any(pure func(node):
+														match node:
+															Own.EnterArm(edge):
+																match (edge.operations, edge.transfers, outputs.transfer):
+																	([Own.DefineValue(child), Own.AcquireOwner(owner, borrow, _)], [Own.OwnedReturn(selected, moved)], Own.OwnedReturn(returned, transferred)):
+																		match (child.operation, child.result, borrow.source):
+																			(Own.PayloadDefinition(field, source), Own.BorrowedResult(Own.PayloadBorrow(borrowed_parent)), Own.PayloadBorrow(acquired_parent)):
+																				(
+																					match_arm_number(edge.arm) == match_arm_number(arm.id)
+																					and Concrete.same_type(child.value_type, Concrete.StringType)
+																					and Concrete.variant_number(Concrete.variant_field_variant(field)) == Concrete.variant_number(seed.option.some)
+																					and Concrete.union_number(Concrete.variant_owner(Concrete.variant_field_variant(field))) == Concrete.union_number(Concrete.variant_owner(seed.option.some))
+																					and Concrete.variant_field_number(field) == 0
+																					and Lower.value_number(source) == Lower.value_number(parent.id)
+																					and Lower.value_number(borrowed_parent) == Lower.value_number(parent.id)
+																					and Lower.value_number(acquired_parent) == Lower.value_number(parent.id)
+																					and Lower.value_number(borrow.value) == Lower.value_number(child.id)
+																					and Lower.value_number(selected) == Lower.value_number(child.id)
+																					and Own.owner_number(moved) == Own.owner_number(owner)
+																					and Own.owner_number(owner) != Own.owner_number(canonical)
+																					and Lower.value_number(input.id) != Lower.value_number(child.id)
+																					and Lower.value_number(returned) == Lower.value_number(input.id)
+																					and Own.owner_number(transferred) == Own.owner_number(canonical)
+																					and outputs.carried.is_empty()
+																				)
+																			_: False
+																	_: False
+															_: False
+													)
+												_: False
+										)
+									)
+								_: False
+						_: False
+
+
+tests: TestSuite = {
+	description = "Blorp 2 checked String slice ownership insertion",
+	tests = [
+		("source borrows, bounds are unmanaged and Option transfers", test_slice_borrows_source_and_transfers_its_option),
+		("ignored Option retires once", test_ignored_slice_option_retires_once),
+		("selected String acquires before its Option retires", test_slice_child_acquires_before_parent_retires),
+	]
+}

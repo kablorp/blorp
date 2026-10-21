@@ -18,11 +18,14 @@ govern the independent Char/source work. The owner stopped the remaining
 callback-removal migration. The current [Option/Result catalog](OPTION_RESULT_PLAN.md)
 supersedes those rows/counts: nine pure APIs at 212 resolved compiler sites,
 including four callback helpers. All nine library definitions are implemented;
-`option.map`, `result.map`, `map_err` and `and_then` accept pure named callbacks
-and forwarding. [Their API contracts](standard_library/README.md) preserve the
-base union identities and bypass ownership. M7 lambdas/captures and explicit
-compiler-source operation imports remain pending; library definitions alone do
-not complete the compiler consumers or M6.
+`option.map`, `result.map`, `map_err` and `and_then` accept pure named callbacks,
+pure lambdas with immutable data captures and forwarding. [Their API contracts](standard_library/README.md) preserve the
+base union identities and bypass ownership. Lambdas/captures and explicit
+compiler-source operation imports are implemented in the combined candidate;
+source-frontier, fixpoint and resource acceptance remain separate. The current
+[API catalog](standard_library/README.md) describes checked String.slice, concrete
+List helpers and logical Path functions; the historical MISSING rows below are
+not a current interface inventory.
 Int target-status rows now reflect signed ordering and scalar constants; source
 counts remain historical. The target also supplies ordinary `max(Int, Int) -> Int`.
 Refresh other interfaces at their own implementation boundary.
@@ -45,14 +48,14 @@ See the [restoration report](../benchmarks/results/blorp_2_list_bootstrap_names_
 
 | Source migration / interface | Bootstrap requirement |
 | --- | --- |
-| Char reads, literals and conversions | Replace with `string.byte_at(String, Int) -> Option[Int]` and `string.from_codepoint(Int) -> Option[String]`. Both matching host and target interfaces are implemented; host wrappers are validated with explicit source-library selection. Target phase/native/main and matched-cost evidence is in the [API acceptance report](../benchmarks/results/blorp_2_string_integer_apis_2026-10-16.md). Source Char/classification migration remains pending. Full-width scalar validation precedes narrowing, and Some[String] has ordinary owning payload transfer/destruction. |
+| Char reads, literals and conversions | Replace with `string.byte_at(String, Int) -> Option[Int]` and `string.from_codepoint(Int) -> Option[String]`. Both matching host and target interfaces are implemented; host wrappers are validated with explicit source-library selection. Target phase/native/main and matched-cost evidence is in the [API acceptance report](../benchmarks/results/blorp_2_string_integer_apis_2026-10-16.md). Source Char/classification migration is implemented in the combined candidate; whole-compiler acceptance remains pending. Full-width scalar validation precedes narrowing, and Some[String] has ordinary owning payload transfer/destruction. |
 | Parser alphabet classification | Private ASCII byte predicates replace all current String lower/index_of/contains callers, preserving empty-substring and malformed-token diagnostic behavior. Remove the historical rows only after resolved inventory confirms zero uses. |
 | List/Option/Result callbacks and function types | Retain compiler callbacks. The [Option/Result plan](OPTION_RESULT_PLAN.md) owns its resolved nine-API subset and callable prerequisites; List demand remains a separate inventory. No remaining HOF-removal campaign is planned. |
-| First-order numeric, String and List operations | Remain required over valid UTF-8. Planned `string.slice(String, Int, Int) -> Option[String]` uses half-open byte offsets and rejects out-of-range or misaligned endpoints. Byte comparisons create no String. Measure join construction: host join uses capacity-aware append, not naive concat. |
-| `system.get_current_directory() -> Result[String, String]` | Target adapter and native Result contract are implemented. Both branches own a fresh String; success is an exact nonempty absolute UTF-8 path, and invalid encoding returns Err. Storage grows as needed. Compiler-source migration from fixed-buffer `getcwd` remains pending. |
-| `system.read_file(String) -> Result[String, String]` | Target adapter and native Result contract implemented. Exact counted UTF-8 preserves empty/CRLF/BOM/NUL contents; NUL paths reject before open. IO errors use saved numeric errno; one close attempt follows every open. Both branches own a fresh String. Invalid UTF-8 advises saving as UTF-8; the host also suggests read_bytes, unavailable in the target. Loader migration remains pending. |
-| `system.write_file(String, String) -> Result[Void, String]` | Target contract: exact create/truncate counted write; reject NUL paths before open; Ok stores Void only after successful write and one close. Err owns fresh saved-errno text; write errors precede close errors. Partial output is allowed. Target NUL-path teaching text says `path contains embedded NUL; use a path without NUL`, while host says `string contains embedded NUL`. Main migration remains pending. |
-| `io.print_error(String) -> Void` | Target concrete adapter and counted stderr helper implemented. Borrow String, return unmanaged Void; one message request, then LF only after a full transfer. Short/EINTR writes stop without LF or retry; host instead attempts LF after a short write. Shell migration remains pending; see note C. |
+| First-order numeric, String and List operations | Remain required over valid UTF-8. Implemented `string.slice(String, Int, Int) -> Option[String]` uses half-open byte offsets and rejects out-of-range or misaligned endpoints. Byte comparisons create no String. Measure join construction: host join uses capacity-aware append, not naive concat. |
+| `system.get_current_directory() -> Result[String, String]` | Target adapter and native Result contract are implemented. Both branches own a fresh String; success is an exact nonempty absolute UTF-8 path, and invalid encoding returns Err. Storage grows as needed. The integrated loader uses this runtime API before module identity normalization; whole-compiler acceptance remains pending. |
+| `system.read_file(String) -> Result[String, String]` | Target adapter and native Result contract implemented. Exact counted UTF-8 preserves empty/CRLF/BOM/NUL contents; NUL paths reject before open. IO errors use saved numeric errno; one close attempt follows every open. Both branches own a fresh String. Invalid UTF-8 advises saving as UTF-8; the host also suggests read_bytes, unavailable in the target. The integrated loader uses this target interface; whole-compiler acceptance remains pending. |
+| `system.write_file(String, String) -> Result[Void, String]` | Target contract: exact create/truncate counted write; reject NUL paths before open; Ok stores Void only after successful write and one close. Err owns fresh saved-errno text; write errors precede close errors. Partial output is allowed. Target NUL-path teaching text says `path contains embedded NUL; use a path without NUL`, while host says `string contains embedded NUL`. The integrated compiler shell uses this target interface; whole-compiler acceptance remains pending. |
+| `io.print_error(String) -> Void` | Target concrete adapter and counted stderr helper implemented. Borrow String, return unmanaged Void; one message request, then LF only after a full transfer. Short/EINTR writes stop without LF or retry; host instead attempts LF after a short write. The integrated compiler shell uses this API; see note C for the retained host difference. |
 | `path.join`, `path.dirname`, `path.normalize` | Keep existing names and pure String signatures. ROADMAP pins empty children, all trailing separators, logical normalization and root behavior. No cosmetic synonyms or Path carrier. |
 
 These seven OS/path functions plus the existing `main(args: List[String]) -> Int`
@@ -65,8 +68,9 @@ Target-generated programs validate argv before argument-taking main; malformed
 encoding reports a fixed ASCII diagnostic and exits 1 after prefix cleanup.
 The internal `blorp_string_from_bytes` constructor requires already-valid UTF-8.
 The [native file-admission pilot](BOOTSTRAP_SOURCE_PLAN.md#native-file-admission-pilot)
-covers host `read_file`. Target filesystem admission, checked slicing and legacy
-host argv/byte APIs remain pending.
+covers host `read_file`. Target filesystem admission and checked slicing are
+implemented in integration; whole-compiler acceptance and legacy host argv/byte
+API migration remain pending.
 Error messages must also satisfy the invariant. No public Bytes or ASCII type
 is introduced.
 
@@ -89,7 +93,7 @@ The milestones are defined in [ROADMAP.md](ROADMAP.md). As this document uses th
 - **M4** (the "recursive-types" milestone): recursive types and opaque types.
 - **M5**: module-level constants with literal initializers, including in library modules.
 - **M6**: the library and shell increment this table drives; its exit is no MISSING row.
-- **M7**: pure lambdas at known callees and function-typed parameters, including managed immutable captures; parsing is implemented, semantic execution remains required.
+- **M7**: pure lambdas at known callees and function-typed parameters, including managed immutable captures; implemented in the combined candidate, with integrated acceptance pending.
 
 ## Method
 

@@ -2,8 +2,19 @@
 
 A new compiler written in Blorp that emits C. Each increment starts with a
 small program, defines the grammar it needs, and tests that program through
-native execution. The existing compiler builds this compiler until it can
-build itself.
+native execution. It can compile itself. The repository build still uses the
+legacy compiler until a qualified Blorp 2 seed is published and pinned; unit
+and runtime suites continue using the legacy TestSuite host.
+
+The combined integration implements pure lambdas with immutable captures,
+structural patterns, value conditionals and managed source loops. The target
+library includes the temporary concrete helpers described below. Focused
+functional results are supplemented by an actual self-compilation: all 43
+compiler source modules emit C, that C links, and the resulting compiler emits
+byte-identical C from the same source and library. The [self-compilation
+report](../benchmarks/results/blorp_2_self_compiled_bootstrap_2026-10-20.md)
+records the proof and matched build costs. Full fixture parity, native-suite
+and resource acceptance remain separate; measured cost failures stay recorded.
 
 The [module and prelude sections](#local-modules) define explicit
 type/method visibility and a shared base/prelude for the target
@@ -14,10 +25,10 @@ compiler demand and separates ordinary helpers from callable prerequisites.
 The target library provides generic pure Option `is_some`, `is_none`, `get_or`,
 `to_result`, `map` and Result `is_ok`, `map`, `map_err`, `and_then` through explicit
 imports. Default/error arguments are eager. The four callback helpers accept pure
-named functions and forwarding, invoke once only in the selected branch, and
+named functions, lambdas and forwarding, invoke once only in the selected branch, and
 preserve the other variant/payload. Returned managed values remain independently
 owned. See the [API contracts](standard_library/README.md); compiler-source imports
-and M7 lambdas/captures remain separate work.
+remain separately tracked from callable admission and capture conversion.
 
 Current language examples and limits are below; [grammar.ebnf](grammar.ebnf)
 owns the formal syntax. The [roadmap](ROADMAP.md) owns planned increments,
@@ -159,9 +170,21 @@ It exits 42 with empty stdout and stderr. `Number(42)` constructs a value;
 `Number(number)` selects that constructor and binds its field. A field `_`
 discards the field, and a whole-pattern `_` matches any remaining value.
 A whole-arm name must select a visible constructor of the matched union.
-`_` is the only whole-arm catch-all; an arm that needs the whole value reads
+`_` is the whole-arm wildcard; a bare name never binds the whole value; an arm that needs the whole value reads
 the scrutinee binding. Matches require exhaustive, useful arms.
 The scrutinee runs once and only the first matching arm's result runs.
+
+Patterns compose recursively: `Some(Some(value))`, constructor alternatives
+such as `Left(item, _) | Right(_, item)`, exact Lists such as `[first, second]`,
+and prefix Lists such as `[first, ...remaining]`. Alternatives must bind the
+same names at identical semantic types, even when their field positions differ.
+A successful alternative enters one shared arm body. A captured List suffix
+owns a fresh ordinary root and its retained elements; `..._` constructs no suffix.
+String patterns compare the complete decoded UTF8 byte sequence, including NUL;
+`"é\0x"` differs from `"é"` and `"é\0y"`. All patterns retain exhaustive,
+useful, first-match semantics. [Structural pattern fixtures](test/e2e/fixtures/pattern/)
+exercise nested fallthrough, aliases, suffixes and binary output through `main`.
+
 The companion [`match/values.brp`](test/e2e/fixtures/match/values.brp) covers
 whole-value and field preservation; the separate
 [`match/shadow.brp`](test/e2e/fixtures/match/shadow.brp) preserves an outer
@@ -194,6 +217,22 @@ the [companion fixture](test/e2e/fixtures/binding/values.brp) instead returns
 the reassigned current value, 42. Separate small fixtures cover self-assignment,
 parameter initialization and union values. Phase tests check exact full-width values
 and evaluation order.
+
+An `if` can be a function's returned value, a binding initializer, a condition,
+or an arm's final value. Its condition has the designated `Bool` type and runs
+once; only the selected branch runs. With an expected result type, both branches
+receive that type. Otherwise the then branch determines the result type and
+the else branch must match it. Branch-local bindings remain local; assignments
+to enclosing variables continue through the ordinary join's carried bindings.
+
+The [value-if fixture](test/e2e/fixtures/value_if/answer.brp) initializes an
+`Int` with `if flag: 41 else: 0` and returns 42. Without `else`, an `if` yields
+`Void`: its then block must be Void or end with a statement. Inferred and
+annotated Void bindings are permitted. A Void function's final if with both
+branches discards each selected result, as a final match does. Controls nested
+in call arguments, record fields or list elements remain unsupported; bind the
+control's result first. Boolean keyword operators and nested `?=` remain
+unsupported.
 
 Bindings also compose with match arms. The
 [arm-binding example](test/e2e/fixtures/match/binding_original.brp) returns 7:
@@ -292,7 +331,7 @@ statement instead. A match whose position expects a type, such as a tail
 arm's, checks every arm against it. At a Void function's tail, a nested
 match discards each arm's value, as a plain Void tail does. A bare match as
 an arm's value is a nested join; in a `@tail_recursive` function a self call
-there is rejected until the loops milestone. An arm may reassign a visible
+there remains unsupported by annotated tail-call admission. An arm may reassign a visible
 `var`; the code after the join sees the selected arm's final value, or the old
 value on an arm that leaves it unchanged. Older immutable aliases keep their
 values. A match nested inside a
@@ -302,9 +341,9 @@ arm, so a yielded prefix value is acquired again, and owners live before the
 join stay live through every arm and are dropped after it at their last use.
 With carried variables, every managed outgoing occurrence acquires its own
 obligation before arm-local sources retire; enclosing owners stay live.
-In C the join's outputs are locals declared before the `switch` and assigned in each
-braced case; the [join examples](test/e2e/test_join.brp) include sixteen
-nested bound matches, whose C nests 33 braces deep.
+In C the join's outputs are locals declared before selection and assigned in each
+shared arm body. The [join examples](test/e2e/test_join.brp) include sixteen
+nested bound matches.
 
 From the repository root:
 
@@ -373,6 +412,18 @@ skips `/usr/bin/time` and instruction limits, records instructions as unmeasured
 and keeps allocation parsing and caps. Empty or unknown settings reject before
 fixture compilation or output changes. These checks never reuse output from an
 earlier fixture compilation.
+
+`BLORP_2_RESOURCE_POLICY` defaults to `enforce-limits`; an unset value or that
+exact spelling preserves every resource-limit error. Initial bootstrap
+qualification may explicitly select `record-initial-bootstrap-debt`. Each
+exceeded cost decision then prints a `BLORP2_RESOURCE_RESULT status=FAIL` record
+with its policy, both counters and limits, and the original error. An explicitly
+disabled instruction counter is recorded as `unmeasured` with its limit retained.
+Only this cost decision permits the behavioral callback to continue; compiler,
+counter, native, sanitizer, strict-accounting and independent file-state errors
+still fail. Empty or unknown policy values fail even when costs are within limits.
+Passing behavioral callbacks under this initial policy retain resource FAIL debt;
+they do not establish resource or full M8 acceptance. Ordinary runs stay strict.
 
 Every host-compiled source module has a matching unit suite under `test/unit/test_<stage>/`,
 mirroring its folder under `src/`; the support modules that suites share stay in `test/unit/`.
@@ -560,13 +611,13 @@ A nullary variant is bare `Empty`. `Unit(Void)` is unary and is constructed as
 `Unit(void)`; it remains distinct from an empty variant. `Variant()` is invalid,
 and `Variant(Int, String)` declares two ordered fields. `Variant(Pair[Int, String])` names one payload and is valid. Lists accept any supported finite element type.
 
-Constructors evaluate each field expression once in written order. Patterns
-write one distinct binder or `_` for each position, such as `Pair(left, _)`.
+Constructors evaluate each field expression once in written order. Patterns write one recursive pattern for each position, such as `Pair(left, _)`;
+all captured names within one alternative are distinct.
 Each managed stored occurrence acquires an independent obligation, including
 `Pair(text, text)`; an escaped managed child remains live after its parent retires.
 Nonempty variants use inline C field structs, while nullary variants have no
-payload member. Lists, nested patterns and recursive aggregate types other than
-a direct self-reference retain their existing restrictions.
+payload member. Recursive aggregate types other than a direct self-reference
+retain their existing restrictions.
 
 The [managed payload example](test/e2e/fixtures/generic/managed/basic.brp) runs
 `unbox(box(42.to_string())).length()` and exits 2. Its tail match borrows the
@@ -649,7 +700,7 @@ termination. Unannotated C output is preserved. The
 [tail-recursion report](../benchmarks/results/blorp_2_tail_recursion_2026-10-10.md)
 records phase invariants, malformed-IR tests and the native stack-exhaustion
 mutation oracle. The [tail-loop roadmap](ROADMAP.md#m3-loops-and-tail-recursion)
-retains the unfinished generic and managed loop requirements.
+retains the deferred generic and managed annotated tail-recursion requirements.
 
 The [numeric accumulator](test/e2e/fixtures/tail_recursion/accumulator.brp)
 decrements an Int while adding one to a second Int. The regular suite checks
@@ -1018,8 +1069,8 @@ the same line or an indented block (inside brackets, a bracketed block,
 which must end before the bracket closes: a `)` on the block's last line is
 an error, as in the host). A lambda body starts a new statement context, so
 a loop control inside one needs a loop of its own, and by owner decision
-`?=` is rejected anywhere inside one, where the host accepts it. Lambdas
-parse and are rejected by checking until the lambdas milestone. Explicit
+`?=` is rejected anywhere inside one, where the host accepts it. Written
+`pure func` lambdas are accepted as arguments to pure callable parameters. Explicit
 `pure (Int, String) -> Int` function types also parse, including zero parameters,
 trailing commas and nested callback types. Checking accepts pure callable types
 only as function parameters, with ordinary data parameter and result types:
@@ -1036,28 +1087,67 @@ func main() -> Int:
 ```
 
 A callback argument is a pure function declared in the current module, an
-imported or module-qualified pure function reference, or unchanged forwarding of
-a callable parameter. Generic references
+imported or module-qualified pure function reference, a `pure func` lambda, or
+unchanged forwarding of a callable parameter. Generic references
 infer fresh type arguments at each use; enclosing generic parameters stay rigid
 when invoking or forwarding a callable parameter. Zero and multiple parameters
-and Void results are supported. Specialization selects ordinary direct calls;
-callable parameters occupy no runtime data slots. Data arguments retain written
-evaluation order and existing data-receiver UFCS works for declared helpers.
+and Void results are supported. Lambda input types must be complete from their
+annotations, the expected callable type or ordinary arguments; a later ordinary
+argument may solve an earlier callback's input. Inline bodies infer their result.
+A block body needs a written return annotation or a complete expected result.
+A written nominal result annotation supplies the context for record literals.
+
+Lambdas capture immutable outer data by value, including Strings, Lists and
+records. Repeated reads of one binding share one capture; two alias bindings
+remain separate captures. Nested lambdas may read their parent's or a further
+ancestor's immutable data. Mutable outer bindings and enclosing callable
+parameters cannot be captured. Copy a mutable value into an immutable binding
+to capture its current value. A lambda may mutate its own local variables.
+
+```blorp
+import:
+    int as IntOps
+
+pure func apply[T, U](callback: pure (T) -> U, value: T) -> U:
+    callback(value)
+
+pure func offset(value: Int, amount: Int) -> Int:
+    apply(pure func(item: Int) -> Int: IntOps.add(item, amount), value)
+```
+
+`offset(40, 2)` returns 42. Each lambda has its own purity and loop scope: a
+pure lambda inside an impure function still cannot call an impure function,
+and a loop inside it does not inherit its enclosing function's loop context.
+
+Specialization selects ordinary direct calls. Named and noncapturing callbacks
+occupy no runtime data slots; a capturing callback passes one ordinary managed
+environment at its written argument position. Forwarding preserves that same
+environment. Data arguments retain written evaluation order and existing
+data-receiver UFCS works for declared helpers.
 Invoke a callable parameter with `callback(value)`; `value.callback()` and
 `callback.use(value)` are rejected. Callables cannot be stored, returned,
 placed in aggregates, selected at runtime or used as ordinary type arguments;
-nested callable types and lambdas are still rejected by checking. Named
-references participate in the generic cycle-growth check even when their callee
+nested callable types remain rejected by checking. Named references and lambda
+bodies participate in the generic cycle-growth check even when their callee
 ignores them. Functions with callable parameters cannot use `@tail_recursive`,
 and an annotated function cannot pass itself as a callback.
 
 A `match` anywhere but a function's tail (bound, nested in an arm
 or branch block, or followed by further lines) is likewise one expression
 ending at its last arm's dedent; the function's last match stays its tail
-body. Ranges parse and are rejected by checking
-until the loops milestone; `and`, `or`, `not` and `if` until the join
-milestone. A bound or statement match is a join; a match inside a larger
-expression is rejected until it is bound.
+body. Value `if` is supported as a whole initializer, function tail, condition,
+or branch value. An absent `else` produces only Void; statement branches must
+also produce Void. Conditions require the designated Bool type. Bind an `if`
+or `match` before using it inside a larger expression. Ascending, end-exclusive
+Int ranges are supported as `for` iterables; general Range values remain unsupported.
+Prefix `not value` and infix `and`/`or` are invalid; diagnostics teach ordinary calls.
+A bound or statement match is a join.
+
+Select pure Bool functions with `bool: not, and, or`: `not(value)` / `value.not()`,
+`and(left, right)` / `left.and(right)` and `or(left, right)` / `left.or(right)`.
+Calls evaluate every argument once, left to right; use `match` to skip an RHS.
+`not (value)` is also a call. These three keywords may name functions, imported
+selections and called members; bindings, types and fields retain their reserved-name rules.
 A dotted type such as `Shared.Span[Int]` is a qualified type. A qualified
 name resolves through the import block's alias row to the target module's
 own public declarations: `IntOps.add(1, 2)` is a direct call to that
@@ -1197,10 +1287,11 @@ Lexical and layout rules:
   patterns nest; alternatives separated by `|` form an or-pattern; `[]`,
   `[a, b]` and `[first, ...rest]` are list patterns (no trailing comma, the
   rest last); a String or Char literal is a literal pattern; `Alias.Variant`
-  qualifies a constructor by a module alias. Checking accepts a binder or `_`
-  per field and rejects a nested field pattern, an or-pattern, a list pattern
-  or a literal pattern until the pattern-compilation milestone. A qualified
-  flat head selects a public constructor through the importing module's alias.
+  qualifies a constructor by a module alias. Checking accepts nested
+  constructor, alternative, List and String patterns; Char remains unsupported.
+  Alternatives bind the same names at identical semantic types. Lists without
+  rest require exact lengths; a rest accepts any remaining suffix. A qualified
+  head selects a public constructor through the importing module's alias.
   A nullary constructor pattern may be written `Empty` or `Empty()`. `Number()`
   is valid syntax but fails semantic arity checking for a one-field constructor.
 - A binding line is `name = expression` or `var name = expression`, optionally
@@ -1230,8 +1321,18 @@ Lexical and layout rules:
   As in the host, `break` and `continue` need an enclosing loop body; by owner
   decision neither may sit in an `if` or `match` used as a value within a loop.
   Propagation is also rejected throughout loop bodies. The parser enforces
-  those rules; checking rejects loops until the loops
-  milestone. Bindings and bare expression statements may interleave before
+  those rules. Checking accepts nested `while` statements with designated Bool
+  conditions and `for` over Lists or ascending, end-exclusive Int ranges such as
+  `start..end`. The iterable or both bounds evaluate once before iteration, in
+  written order. Empty Lists and equal or reversed ranges run no body. Each
+  iteration binds a fresh immutable item (or discards it with `_`) and creates
+  fresh body locals. `break` exits the nearest loop; `continue` advances that
+  loop to its next iteration, including through statement `if` and `match`.
+  Inner writes to enclosing mutable bindings reach the outer continuation.
+  Carried values use their ordinary sealed ownership layouts, including Strings,
+  Lists, managed records and unions; older aliases and borrowed outer values
+  retain their values. Managed `@tail_recursive` functions remain unsupported.
+  Bindings and bare expression statements may interleave before
   the mandatory final expression or function tail match. A non-final bare
   expression must return Void; bind or return other values. Bindings inside
   arguments and annotations are unsupported. An arm block may end with a
@@ -1346,12 +1447,12 @@ Semantic rules:
   mismatches highlight the disagreeing argument occurrence;
   constructor lookup errors highlight the variant name. Return mismatches highlight
   the complete expression, excluding indentation and trailing spaces.
-- A match scrutinee must synthesize a declared union type from a binding or
-  function result. `match Empty:` and `match Number(42):` lack a receiving type;
+- A match scrutinee must synthesize a declared union, List or String type.
+  `match Empty:` and `match Number(42):` lack a receiving type;
   no type is guessed from patterns or the containing function's return type.
   Integer scrutinees are outside this increment. Each arm of a non-Void function
   must match that function's declared result type, which may differ from
-  the matched union. Void functions evaluate and discard the selected arm's
+  the matched value. Void functions evaluate and discard the selected arm's
   result. All arms are checked, including ones a constant scrutinee
   cannot select.
 - A bare pattern name must be a visible constructor of the matched union.
@@ -1360,10 +1461,15 @@ Semantic rules:
   Unknown bare names are errors, and `_` alone catches all remaining values.
   Bind a computed scrutinee before the match when an arm needs the whole value.
   Explicit constructor patterns also require a visible constructor of that union. Its declared field
-  shape determines the required pattern arity. Field binders and wildcards
-  cover the constructor's entire field domain. Arm bindings are immutable and
-  scoped to that arm; sibling arms may reuse a spelling. Earlier arms determine
-  usefulness, and the remaining variants determine exhaustiveness.
+  shape determines the required pattern arity. A field may contain a nested
+  pattern, binder or wildcard; a visible constructor of that field's union is
+  a constructor pattern even when written without parentheses. Arm bindings
+  are immutable and scoped to that arm; sibling arms may reuse a spelling.
+  Earlier arms determine usefulness. The same ordered pattern matrix checks
+  exhaustiveness and builds selection, preserving exact List lengths and
+  minimum lengths for rest patterns. An uncovered String domain requires a
+  catchall. Every alternative binds the same names at the same semantic types,
+  regardless of their constructor field positions.
 - A pure caller may call only declared pure callees. Every function body is
   checked, including unreachable helpers, so a pure call chain cannot hide an
   impure edge. Calls inside arguments obey the containing function's purity.
@@ -1445,7 +1551,7 @@ Semantic rules:
   managed result into the join, which owns it afterwards. COW and managed
   annotated loops are deferred.
 - Union-only recursive layouts, generic self-reinstantiation,
-  guards, nested/literal patterns, constructor UFCS,
+  guards, Char patterns, constructor UFCS,
   and function
   values are outside this increment. `Bool` is an ordinary fixed union declared
   once in the base module, alongside Option and Result. Local functions and
@@ -1494,7 +1600,7 @@ the required explicit library root is supplied. Record type imports are
 supported; a module offers only the types it declares, so an imported type is
 never selected through a module that only imports it. Aliases, qualified names
 and `private` are supported;
-wildcards and reexports are unsupported. Flat qualified constructor patterns
+wildcards and reexports are unsupported. Qualified constructor patterns
 use the same constructor identity, field arity and coverage as bare heads.
 
 Each module owns its declarations; same-spelled declarations in different
@@ -1881,6 +1987,14 @@ sees instances, not declarations, and deliberately does not repeat that check.
 
 ## Counted String operations
 
+`string.slice(value: String, start: Int, end: Int) -> Option[String]` takes
+half-open UTF-8 byte offsets. It returns None unless
+`0 <= start <= end <= value.length()` and both endpoints are scalar boundaries.
+Valid empty and full slices return Some with an independently owned String;
+NUL bytes are preserved and the input and its aliases remain valid. For example,
+`slice("éx", 0, 2)` yields `Some("é")`, while `slice("éx", 1, 2)` yields None.
+This is the checked target replacement for source substring operations.
+
 `string.starts_with(value: String, prefix: String) -> Bool` compares counted bytes.
 Empty prefix is True; UTF-8/NUL spelling is exact. The temporary implementation
 uses native stack linear in the matching prefix; no constant-stack claim is made.
@@ -1918,7 +2032,13 @@ U+D800–U+DFFF and values above U+10FFFF before narrowing. Some owns the String
 ordinary matching, copying and destruction preserve its lifetime. The
 [ownership fixture](test/e2e/fixtures/option_input/from_codepoint_ownership.brp)
 returns a String through a Some-pattern and separately discards an encoded result.
-Host interface publication and source Char migration remain separate work.
+Compiler source uses the byte/scalar interface; a public target Char type
+remains outside this bootstrap increment.
+
+The temporary [List helpers](standard_library/README.md#list-queries-and-copies)
+and [logical path helpers](standard_library/README.md#logical-paths) use ordinary
+Blorp bodies over these counted-byte operations. Their concrete restrictions and
+copying costs remain explicit.
 
 ## Current directory
 
@@ -1932,8 +2052,9 @@ paths return a useful valid-text error. OS errors include a saved numeric errno,
 and EINTR returns immediately. The operation prints nothing.
 Both Result branches own their String; matching, copying, discarding and
 [escaping a payload](test/e2e/fixtures/current_directory/ownership.brp) use the
-existing union ownership rules. Loader migration and remaining M6 shell work
-remain pending.
+existing union ownership rules. The integrated loader obtains this runtime path
+explicitly before normalizing module identities; full M6 and self-compilation
+acceptance remain pending.
 
 ## File reading
 
@@ -1948,7 +2069,8 @@ return useful fixed text. The target advises saving malformed files as UTF-8;
 `read_bytes` is unavailable. Read errors take precedence over close errors,
 and close errors over encoding errors. Every opened stream receives one close
 attempt, including EINTR, without retry. Nothing is printed. Both Result branches own
-one fresh String under ordinary union ownership. Loader migration remains pending.
+one fresh String under ordinary union ownership. The integrated loader uses
+this interface; full compiler acceptance remains pending.
 
 ## File writing
 
@@ -1965,7 +2087,8 @@ errors take priority over close errors; every opened stream receives exactly
 one close attempt, including EINTR, without retry. Partial output is allowed;
 atomic replacement and durability are outside the contract. Nothing is printed.
 See the [complete program](test/e2e/fixtures/file_write/bytes.brp) and
-[acceptance report](../benchmarks/results/blorp_2_target_write_file_2026-10-18.md). Main/loader migration remains pending.
+[acceptance report](../benchmarks/results/blorp_2_target_write_file_2026-10-18.md). The
+integrated compiler shell uses this interface; full compiler acceptance remains pending.
 
 ## Float64 calculator
 
@@ -1987,7 +2110,8 @@ func main() -> Int:
 ```
 
 This prints `13\n`. The concrete Float module provides the same five arithmetic
-function names as Int, plus `to_string`. Named function imports permit direct
+function names as Int, plus `to_string`, `copysign`, `equals`, `less_than`,
+`is_nan`, `is_finite`, `abs` and `greater_than_or_equal`. Named function imports permit direct
 calls and UFCS; type imports expose the module's associated functions through
 UFCS. Receiver types distinguish Int and Float methods. Importing both Int and
 Float `to_string` for direct calls is an error; neither declaration takes
@@ -2084,8 +2208,8 @@ diagnostic rendering are pure. The pipeline publishes these complete results:
    source bytes; no rewritten source or comment metadata crosses the boundary.
 2. Parsing produces function and union declarations, payload and parameter
    annotations, written names, ordered statement syntax, expression syntax, and structured match bodies.
-   Match patterns preserve written names and field syntax. Checking resolves a
-   whole-arm name as a constructor and validates each named field capture. Each expression has a literal,
+   Match patterns preserve written names and recursive field syntax. Checking
+   resolves constructors and validates each named capture. Each expression has a literal,
    name, or direct application base with ordered recursive arguments, followed by
    receiver applications with ordered explicit arguments. Direct and receiver
    syntax stay distinct because their target lookup differs.
@@ -2199,8 +2323,11 @@ diagnostic rendering are pure. The pipeline publishes these complete results:
    function, union and variant identities have separate instance domains.
    Parsed variant annotations and constructor patterns retain ordered field
    vectors. Each checked variant publishes one `List[TypeUse]`; each checked
-   pattern retains every position as an optional `BindingId`, with `None` for a
-   wildcard. A zero-field vector remains distinct from a wildcard position.
+   selection retains typed routes through union fields and List elements,
+   exact or minimum List length tests, exact String byte tests, and edges to
+   canonical arm inputs. Each arm body is published once. An edge either borrows
+   its typed place or constructs a fresh List suffix; specialization preserves
+   that distinction and translates union field routes to nominal field instances.
    Concrete union layouts publish one `List[TypeRef]` per variant; inline child
    layouts precede their parents. Construction carries the concrete variant
    owner and positional child values. Standalone projections retain a validated
@@ -2223,9 +2350,10 @@ diagnostic rendering are pure. The pipeline publishes these complete results:
    lowered and owned call operations carry the concrete target and arguments,
    while their enclosing definition owns the diagnostic anchor.
    Match-arm computations remain in their branches.
-   Every arm starts with the enclosing binding map, lowers each named capture
-   at its declared field ordinal and then its statement sequence, and publishes
-   a branch-local value block. Sibling arms
+   Successful selection edges project typed places or construct List suffixes,
+   then transfer their values into canonical arm inputs. Every shared arm starts
+   with those inputs and the enclosing binding map, lowers its statement sequence,
+   and publishes a branch-local value block. Sibling arms
    share only the function's value allocator, preserving distinct identities.
 6. Concrete specialization owns storage and child-ownership representation.
    Its read-only ownership query classifies a concrete value as having no
@@ -2248,8 +2376,10 @@ diagnostic rendering are pure. The pipeline publishes these complete results:
 7. Independent verification checks the actual operations against representation
    and call contracts, rejecting dead/wrong owners, invalid borrows and
    undisposed obligations. Raw ownership IR does not preserve checking's sealed
-   match proof, so verification independently requires nonempty, exhaustive,
-   useful arms with valid unique variants and at most one final default.
+   match proof, so verification independently checks the acyclic decision graph,
+   reachable nodes and arms, nominal variant and List-length guards, and dense
+   canonical arm identities with correctly typed input transfers. Nested tests
+   and projections require the guards for every ancestor place.
    It also enforces the accepted entry argument/result conventions, rejects
    invalid prefix/arm owner identities and checks each arm's prefix and local
    owner discharge/transfer independently. Payload reads validate the actual
@@ -2262,9 +2392,10 @@ diagnostic rendering are pure. The pipeline publishes these complete results:
    they do not perform source-language acceptance again.
 8. Emission consumes that verified program and produces C. Computed values use
    immutable C locals; scalar reassignment requires no runtime mutable cell.
-   A match uses its evaluated scrutinee once and switches on its tag. Arm-local field
-   projections occur only in the selected branch; a wildcard arm may read an
-   existing binding for the whole scrutinee. Emission consumes resolved lowered labels and values without repeating
+   A match uses its evaluated scrutinee once. Structural tests jump through
+   selection nodes; successful edges project fields and transfer inputs before
+   entering one shared body per source arm. A wildcard arm may read an existing
+   binding for the whole scrutinee. Emission consumes resolved lowered labels and values without repeating
    resolution, arity, purity, or coverage checks. Its result can report an
    internal lowered-reference error instead of silently choosing a C layout;
    source-language acceptance is already complete. Retains/releases project the

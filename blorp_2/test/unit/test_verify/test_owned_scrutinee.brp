@@ -1,11 +1,14 @@
 import:
+	../../../src/check/model as Model
+	./selection_inputs as Selection
 	../../../src/lower/lower as Lower
 	../../../src/own/own as Own
 	../../../src/utils/source: compiler_source
 	../../../src/specialize/specialize as Concrete
 	../../../src/utils/syntax: Diagnostic, Span
 	../../../src/verify/verify: verify
-	../managed_union_inputs: lowered
+	../managed_union_inputs: lowered, lowered_tail_join
+	../ownership_inputs: InputIds, input_ids
 	test: TestSuite
 
 
@@ -63,185 +66,185 @@ private pure func seed_error() -> Diagnostic:
 
 
 private pure func raw_arm(
-	arm: Lower.LoweredArm,
-	scrutinee: Lower.ValueId,
+	arm: Lower.JoinArm,
 	position: Int,
 	case: RawCase,
-) -> Result[Own.OwnedArm, Diagnostic]:
+) -> Result[Own.OwnedLoopArm, Diagnostic]:
 	at = span(20 + position * 10)
-	owner = Own.owner_id(position + 2)
-
-	drop_before = match case:
-		DroppedNumber:
-			position == 0
-		DroppedText:
-			position == 1
-		DroppedVoid:
-			position == 2
-		_:
-			False
-
-	drop_after = match case:
-		NumberCopiedBeforeDrop:
-			position == 0
-		VoidCopiedBeforeDrop:
-			position == 2
-		AcquireAfterDrop:
-			position == 1
-		_:
-			False
-
-	var operations: List[Own.OwnershipOperation] = []
-	var returned_borrow: Option[Own.BorrowedValue] = None
+	owner = Own.owner_id(position * 2 + 4)
+	acquired = Own.owner_id(position * 2 + 5)
+	var inputs: List[Own.OwnedJoinParameter] = []
+	for input in arm.inputs:
+		classified = match input.value_type:
+			Concrete.StringType: Own.ManagedJoinParameter(input, owner)
+			_: Own.UnmanagedJoinParameter(input)
+		inputs = inputs.append(classified)
+	var operations: List[Own.OwnershipOperation] = [Own.DropOwner(Own.owner_id(2), at)]
 	var invalid = False
-
-	for step in arm.body.steps:
+	for step in arm.steps:
 		match step:
 			Lower.Define(definition):
 				match definition.operation:
-					Lower.PayloadValue(variant, _):
-						if drop_before:
-							operations = operations.append(Own.DropOwner(Own.owner_id(1), at))
-
-						result = match definition.value_type:
-							Concrete.StringType:
-								Own.BorrowedResult(Own.PayloadBorrow(scrutinee))
-							_:
-								Own.UnmanagedResult
-
-						operations = operations.append(Own.DefineValue({
-							id = definition.id,
-							value_type = definition.value_type,
-							operation = Own.PayloadDefinition(variant, scrutinee),
-							result = result,
-							span = at,
-						}))
-
-						if drop_after:
-							operations = operations.append(Own.DropOwner(Own.owner_id(1), at))
-
-						match definition.value_type:
-							Concrete.StringType:
-								returned_borrow = Some({
-									value = definition.id,
-									source = Own.PayloadBorrow(scrutinee),
-								})
-							_:
-								void
 					Lower.StringValue(bytes):
 						operations = operations.append(Own.DefineValue({
-							id = definition.id,
-							value_type = Concrete.StringType,
-							operation = Own.StringDefinition(bytes),
-							result = Own.OwnedResult(owner),
-							span = at,
+							id = definition.id, value_type = Concrete.StringType,
+							operation = Own.StringDefinition(bytes), result = Own.OwnedResult(owner), span = at
 						}))
-					_:
-						invalid = True
-
-			_: void
+					_: invalid = True
+			_: invalid = True
 	if invalid:
 		Err(seed_error())
 	else:
-		match arm.body.exit:
-			Lower.ReturnValue(returned):
-				match returned_borrow:
-					Some(borrow):
-						operations = operations.append(Own.AcquireOwner(owner, borrow, at))
-					None:
-						void
-
-				if not (drop_before or drop_after):
-					operations = operations.append(Own.DropOwner(Own.owner_id(1), at))
-
-				Ok({
-					label = arm.label,
+		match arm.exit:
+			Lower.TransferLoop(_, _): Err(seed_error())
+			Lower.Yield(outputs):
+				operations = operations.concat([
+					Own.AcquireOwner(acquired, { value = outputs.value, source = Own.OwnerBorrow(owner) }, at),
+					Own.DropOwner(owner, at),
+				])
+				Ok({ id = arm.id, inputs = inputs, body = {
 					operations = operations,
-					exit = Own.ReturnResult(Own.OwnedReturn(returned, owner)),
-				})
-			_:
-				Err(seed_error())
+					tail = Own.ExitLoop(Own.Break({ value = Own.OwnedReturn(outputs.value, acquired), carried = [], span = at }))
+				} })
+
+
+private pure func raw_selection(
+	selection: Lower.LoweredSelection,
+	argument: Own.OwnedArgument,
+	root: Lower.ValueId,
+	case: RawCase,
+) -> Result[Own.OwnedSelection, Diagnostic]:
+	var nodes: List[Own.OwnedDecisionNode] = []
+	var invalid: Option[Diagnostic] = None
+	for node in selection.nodes:
+		match node:
+			Lower.TestVariant(place, variant, yes, no): nodes = nodes.append(Own.TestVariant(place, variant, yes, no))
+			Lower.TestListLength(_, _, _, _) | Lower.TestStringBytes(_, _, _, _): invalid = Some(seed_error())
+			Lower.EnterArm(edge):
+				position = Model.match_arm_number(edge.arm)
+				at = span(20 + position * 10)
+				drop_before = match case:
+					DroppedNumber: position == 0
+					DroppedText: position == 1
+					DroppedVoid: position == 2
+					_: False
+				var operations: List[Own.OwnershipOperation] = []
+				if drop_before:
+					operations = operations.append(Own.DropOwner(Own.owner_id(2), at))
+				for definition in edge.definitions:
+					match definition:
+						Lower.BorrowUnionField(value, field, _):
+							result = match value.value_type:
+								Concrete.StringType: Own.BorrowedResult(Own.PayloadBorrow(root))
+								_: Own.UnmanagedResult
+							operations = operations.append(Own.DefineValue({ id = value.id, value_type = value.value_type, operation = Own.PayloadDefinition(field, root), result = result, span = at }))
+							match value.value_type:
+								Concrete.StringType:
+									match case:
+										AcquireAfterDrop: operations = operations.append(Own.DropOwner(Own.owner_id(2), at))
+										_: void
+									operations = operations.append(Own.AcquireOwner(Own.owner_id(3), { value = value.id, source = Own.PayloadBorrow(root) }, at))
+								_: void
+						Lower.BorrowListElement(_, _, _) | Lower.CopyListSuffix(_, _, _): invalid = Some(seed_error())
+				transfers = edge.arguments.map(pure func(value):
+					if position == 1:
+						Own.OwnedReturn(value, Own.owner_id(3))
+					else:
+						Own.UnmanagedReturn(value)
+				)
+				nodes = nodes.append(Own.EnterArm({ arm = edge.arm, operations = operations, transfers = transfers }))
+	match invalid:
+		Some(error): Err(error)
+		None: Ok({ scrutinee = argument, entry = selection.entry, nodes = nodes })
 
 
 private pure func raw_match(
 	function: Lower.LoweredFunction,
-	matched: Lower.LoweredMatch,
+	matched: Lower.LoweredJoin,
+	values: InputIds,
 	case: RawCase,
 ) -> Result[Own.OwnedFunction, Diagnostic]:
 	match (function.steps, matched.arms):
-		([Lower.Define(parent), Lower.Define(projected)], [number, text, empty]):
+		([Lower.Define(parent), Lower.Define(projected), Lower.Join(_)], [number, text, empty]):
 			match projected.operation:
 				Lower.ReadRecordFieldValue(field, _):
-					first ?= raw_arm(number, projected.id, 0, case)
-					second ?= raw_arm(text, projected.id, 1, case)
-					third ?= raw_arm(empty, projected.id, 2, case)
+					first ?= raw_arm(number, 0, case)
+					second ?= raw_arm(text, 1, case)
+					third ?= raw_arm(empty, 2, case)
 					var prefix: List[Own.OwnershipOperation] = [
-						Own.DefineValue({
-							id = parent.id,
-							value_type = parent.value_type,
-							operation = Own.ParameterDefinition(0),
-							result = Own.BorrowedResult(Own.ParameterBorrow(parent.id)),
-							span = span(10),
-						}),
 						Own.AcquireOwner(
-							Own.owner_id(0),
+							Own.owner_id(1),
 							{
-								value = parent.id,
-								source = Own.ParameterBorrow(parent.id)
+								value = values.first,
+								source = Own.ParameterBorrow(values.first)
 							},
 							span(10),
 						),
 						Own.DefineValue({
-							id = projected.id,
+							id = values.third,
 							value_type = projected.value_type,
 							operation = Own.ReadRecordFieldDefinition(
 								field,
 								Own.BorrowedArgument({
-									value = parent.id,
-									source = Own.OwnerBorrow(Own.owner_id(0)),
+									value = values.first,
+									source = Own.OwnerBorrow(Own.owner_id(1)),
 								}),
 							),
-							result = Own.BorrowedResult(Own.PayloadBorrow(parent.id)),
+							result = Own.BorrowedResult(Own.PayloadBorrow(values.first)),
 							span = span(11),
 						}),
 						Own.AcquireOwner(
-							Own.owner_id(1),
+							Own.owner_id(2),
 							{
-								value = projected.id,
-								source = Own.PayloadBorrow(parent.id)
+								value = values.third,
+								source = Own.PayloadBorrow(values.first)
 							},
 							span(11),
 						),
 						Own.DropOwner(
-							Own.owner_id(0),
+							Own.owner_id(1),
 							span(11),
 						),
 					]
 
 					match case:
 						DroppedTag:
-							prefix = prefix.append(Own.DropOwner(Own.owner_id(1), span(11)))
+							prefix = prefix.append(Own.DropOwner(Own.owner_id(2), span(11)))
 						_:
 							void
 
 					argument = match case:
 						UnmanagedTag:
-							Own.UnmanagedArgument(projected.id)
+							Own.UnmanagedArgument(values.third)
 						_:
 							Own.BorrowedArgument({
-								value = projected.id,
-								source = Own.OwnerBorrow(Own.owner_id(1)),
+								value = values.third,
+								source = Own.OwnerBorrow(Own.owner_id(2)),
 							})
 
+					selection ?= raw_selection(matched.selection, argument, values.third, case)
 					Ok({
-						execution = function.execution,
 						signature = function.signature,
-						operations = prefix,
-						tail = Own.MatchTail({
-							scrutinee = argument,
-							owner = matched.owner,
-							arms = [first, second, third],
-						}),
+						operations = [Own.DefineValue({
+								id = values.first,
+								value_type = parent.value_type,
+								operation = Own.ParameterDefinition(0),
+								result = Own.BorrowedResult(Own.ParameterBorrow(values.first)),
+								span = span(10),
+							}), Own.ExecuteLoop({
+								entry_acquisitions = [],
+								headers = [],
+								result = Own.ManagedJoinParameter({ id = values.second, value_type = Concrete.StringType, span = span(50) }, Own.owner_id(0)),
+								carried = [],
+								body = {
+									operations = prefix,
+									tail = Own.MatchLoop({
+										selection = selection,
+										arms = [first, second, third],
+									}),
+								},
+							})],
+						result = Own.OwnedReturn(values.second, Own.owner_id(0)),
 					})
 				_:
 					Err(seed_error())
@@ -252,25 +255,27 @@ private pure func raw_match(
 private pure func raw_function(
 	function: Lower.LoweredFunction,
 	seed: Lower.LoweredFunctions,
+	values: InputIds,
 	case: RawCase,
 ) -> Result[Own.OwnedFunction, Diagnostic]:
-	match function.tail:
-		Lower.MatchValue(matched):
-			raw_match(function, matched, case)
+	match lowered_tail_join(function):
+		Some(matched):
+			raw_match(function, matched, values, case)
 		_:
 			Own.insert_function(function, seed.unions, seed.records)
 
 
--- Prefix o0 is deliberately retired before the match. The only permitted
--- backing for every payload read and escaped String is the acquired o1.
+-- Loop-local o1 is retired before the match. The acquired o2 is the
+-- backing for every payload read and escaped String; P owns o0 outside.
 private pure func raw_program(case: RawCase) -> Result[Own.OwnershipProgram, Diagnostic]:
+	ids ?= input_ids()
 	lowered ?= lowered(SOURCE)
 	seed = Lower.lowered_functions(lowered)
 	var functions: List[Own.OwnedFunction] = []
 	var invalid: Option[Diagnostic] = None
 
 	for function in seed.functions:
-		match raw_function(function, seed, case):
+		match raw_function(function, seed, ids, case):
 			Ok(function):
 				functions = functions.append(function)
 			Err(error):
@@ -313,19 +318,19 @@ pure func test_acquired_scrutinee_survives_retired_ancestor() -> Bool:
 
 
 pure func test_int_payload_checks_actual_scrutinee_lifetime() -> Bool:
-	rejects(DroppedNumber, "borrow refers to discharged owner 1", 20)
+	rejects(DroppedNumber, "selection edge contains an operation outside its local projections", 11)
 
 
 pure func test_string_payload_checks_actual_scrutinee_lifetime() -> Bool:
-	rejects(DroppedText, "borrow refers to discharged owner 1", 30)
+	rejects(DroppedText, "selection edge contains an operation outside its local projections", 11)
 
 
 pure func test_void_payload_checks_actual_scrutinee_lifetime() -> Bool:
-	rejects(DroppedVoid, "borrow refers to discharged owner 1", 40)
+	rejects(DroppedVoid, "selection edge contains an operation outside its local projections", 11)
 
 
 pure func test_tag_read_checks_actual_scrutinee_lifetime() -> Bool:
-	rejects(DroppedTag, "borrow refers to discharged owner 1", 11)
+	rejects(DroppedTag, "borrow refers to discharged owner 2", 11)
 
 
 pure func test_managed_scrutinee_requires_explicit_borrow() -> Bool:
@@ -345,7 +350,7 @@ pure func test_copied_void_payload_survives_scrutinee_drop() -> Bool:
 
 
 pure func test_returned_child_must_acquire_before_scrutinee_drop() -> Bool:
-	rejects(AcquireAfterDrop, "borrow refers to discharged owner 1", 30)
+	rejects(AcquireAfterDrop, "selection edge contains an operation outside its local projections", 11)
 
 
 tests: TestSuite = {

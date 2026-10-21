@@ -3,6 +3,8 @@ Recursion analyses over checked bodies: guaranteed self tail calls, and the
 rejection of recursive calls that grow type arguments without bound.
 ---
 import:
+	result: is_ok
+	../utils/boolean: not
 	./errors:
 		CheckError,
 		RecursionError(
@@ -14,25 +16,26 @@ import:
 		CallTarget(RuntimeFunction, UserFunction, CallableParameter),
 		CheckedArm,
 		CheckedBody(CheckedMatchBody, CheckedValueBody),
-		CheckedCall, CallableChoice(NamedCallable, ForwardedCallable),
+		CheckedCall, CallableChoice(NamedCallable, ForwardedCallable, LambdaCallable),
 		CheckedExit(RecurWith, ReturnExpression),
 		CheckedExpr,
 		CheckedForm(
 			ConstructOpaque, ProjectOpaque,
 			ConstructRecord, ConstructVariant, ConstructList, InvokeFunction, LiteralFloat, LiteralInteger,
-			LiteralString, LiteralVoid, Match, ReadBinding, ReadRecordField, UpdateRecord,
+			LiteralString, LiteralVoid, Match, ReadBinding, ReadCapture, ReadRecordField, UpdateRecord,
 		),
-		CheckedFunction,
-		CheckedStatement(DiscardExpression, InitializeBinding, ReassignBinding),
+		CheckedFunction, CheckedLambda,
+		CheckedStatement(DiscardExpression, InitializeBinding, ReassignBinding, RunWhile, RunFor, BreakSourceLoop, ContinueSourceLoop),
+		CheckedIteration(ListIteration, AscendingIntRange),
 		TypeParameterId,
 		TypeParameterOwner(FunctionDeclaration),
 		TypeRef(PureCallableType, AppliedUnionType, AppliedRecordType, ListType, ParameterType),
-		function_calls,
+		function_calls, lambda_calls,
 		same_parameter,
 		type_parameter_id,
 	../utils/ids: FunctionId, function_number
 	int as IntOps
-	option: is_some
+	option: is_some, is_none
 	../utils/syntax: FunctionExecution(OrdinaryCalls, SelfTailLoop), ParsedFunction, Span
 
 
@@ -102,7 +105,7 @@ private pure func self_call_in(value: CheckedExpr, current: FunctionId) -> Optio
 			found
 		ReadRecordField(receiver, _):
 			self_call_in(receiver, current)
-		LiteralVoid | LiteralInteger(_) | LiteralFloat(_) | LiteralString(_) | ReadBinding(_):
+		LiteralVoid | LiteralInteger(_) | LiteralFloat(_) | LiteralString(_) | ReadBinding(_) | ReadCapture(_):
 			None
 
 
@@ -118,15 +121,24 @@ private pure func reject_self_calls(
 
 
 private pure func statement_values(statements: List[CheckedStatement]) -> List[CheckedExpr]:
-	statements.map(pure func(statement: CheckedStatement) -> CheckedExpr:
+	var values: List[CheckedExpr] = []
+	for statement in statements:
 		match statement:
 			InitializeBinding(_, value):
-				value
-			DiscardExpression(value):
-				value
+				values = values.append(value)
 			ReassignBinding(_, value):
-				value
-	)
+				values = values.append(value)
+			DiscardExpression(value):
+				values = values.append(value)
+			RunWhile(loop):
+				values = values.append(loop.condition).concat(statement_values(loop.body))
+			BreakSourceLoop(_) | ContinueSourceLoop(_): void
+			RunFor(loop):
+				match loop.iteration:
+					ListIteration(iterable, _, _): values = values.append(iterable)
+					AscendingIntRange(start, end, _): values = values.append(start).append(end)
+				values = values.concat(statement_values(loop.body))
+	values
 
 
 -- A returned value that is a direct self call; its receiver, if written as one,
@@ -227,10 +239,12 @@ private pure func body_recurs(body: CheckedBody) -> Bool:
 		CheckedValueBody(exit):
 			recurs(exit)
 		CheckedMatchBody(matched):
-			var found = False
+			var found: Bool = False
 
 			for arm in matched.arms:
-				found = found or recurs(arm.body)
+				found = match found:
+					True: True
+					False: recurs(arm.body)
 
 			found
 
@@ -338,7 +352,7 @@ private pure func contains_parameter_id(
 	parameters: List[TypeParameterId],
 	requested: TypeParameterId,
 ) -> Bool:
-	var found = False
+	var found: Bool = False
 
 	for parameter in parameters:
 		if same_parameter(parameter, requested):
@@ -357,15 +371,16 @@ private pure func parameter_reaches(
 	var reached = [start]
 	var frontier = [start]
 
-	while not frontier.is_empty():
+	while frontier.is_empty().not():
 		var next: List[TypeParameterId] = []
 
 		for current in frontier:
 			for dependency in dependencies:
-				if (
-					same_parameter(dependency.source, current)
-					and not contains_parameter_id(reached, dependency.target)
-				):
+				unreached_dependency = match same_parameter(dependency.source, current):
+					True: contains_parameter_id(reached, dependency.target).not()
+					False: False
+
+				if unreached_dependency:
 					reached = reached.append(dependency.target)
 					next = next.append(dependency.target)
 
@@ -375,7 +390,7 @@ private pure func parameter_reaches(
 
 
 pure func validate_recursive_instantiation(
-	functions: List[CheckedFunction],
+	functions: List[CheckedFunction], lambdas: List[CheckedLambda],
 ) -> Result[Void, CheckError]:
 	-- These transient edges relate declaration-owned parameter identities, using
 	-- each checked call's simultaneous substitution. They are discarded before
@@ -388,35 +403,10 @@ pure func validate_recursive_instantiation(
 	var dependencies: List[ParameterDependency] = []
 
 	for function in functions:
-		for call in function_calls(function):
-			match call.target:
-				UserFunction(declaration, arguments, callables):
-					var position = 0
-
-					for argument in arguments:
-						target = type_parameter_id(FunctionDeclaration(declaration), position)
-						dependencies = append_dependencies(
-							dependencies,
-							argument,
-							target,
-							PreservedParameter,
-							call.span,
-						)
-						position = IntOps.add(position, 1)
-					for callable in callables:
-						match callable.choice:
-							NamedCallable(id, types):
-								var position = 0
-								for value in types:
-									dependencies = append_dependencies(
-										dependencies, value, type_parameter_id(FunctionDeclaration(id), position),
-										PreservedParameter, callable.span,
-									)
-									position = IntOps.add(position, 1)
-							ForwardedCallable(_): void
-
-				RuntimeFunction(_) | CallableParameter(_):
-					void
+		dependencies = append_call_dependencies(dependencies, function_calls(function))
+	-- Potential calls include ignored and nested lambdas, independently of runtime selection.
+	for lambda in lambdas:
+		dependencies = append_call_dependencies(dependencies, lambda_calls(lambda))
 
 	var growing: Option[ParameterDependency] = None
 
@@ -434,3 +424,41 @@ pure func validate_recursive_instantiation(
 			Err(recursion_error(dependency.span, GrowingRecursiveInstantiation))
 		None:
 			Ok(void)
+
+
+private pure func append_call_dependencies(
+	previous: List[ParameterDependency], calls: List[CheckedCall],
+) -> List[ParameterDependency]:
+	var dependencies = previous
+	for call in calls:
+		match call.target:
+			UserFunction(declaration, arguments, callables):
+				var position = 0
+
+				for argument in arguments:
+					target = type_parameter_id(FunctionDeclaration(declaration), position)
+					dependencies = append_dependencies(
+						dependencies,
+						argument,
+						target,
+						PreservedParameter,
+						call.span,
+					)
+					position = IntOps.add(position, 1)
+				for callable in callables:
+					match callable.choice:
+						NamedCallable(id, types):
+							var named_position = 0
+							for value in types:
+								dependencies = append_dependencies(
+									dependencies, value, type_parameter_id(FunctionDeclaration(id), named_position),
+									PreservedParameter, callable.span,
+								)
+								named_position = IntOps.add(named_position, 1)
+						ForwardedCallable(_): void
+						LambdaCallable(_, _): void
+
+			RuntimeFunction(_) | CallableParameter(_):
+				void
+
+	dependencies

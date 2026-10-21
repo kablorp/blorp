@@ -1,0 +1,209 @@
+import:
+	../../../src/check/check: CheckedProgram, check, checked_functions
+	../../../src/check/model as Checked
+	../../../src/utils/ids: variant_number
+	../../../src/utils/source: module_source, root_module_id, same_source
+	../../../src/utils/names: program_names
+	../../../src/lex/lex: lex
+	../../../src/parse/parse: parse_module
+	../../../src/utils/syntax: Diagnostic, DiagnosticNote(PreviousDeclaration)
+	../input: setup_diagnostic, checked_tail_join
+	../module_input: TEST_BASE, parse_modules_with_base
+	result: map_err
+	system: read_file
+	int as IntOps
+	test: TestSuite
+
+
+private SIDE: String =
+	|fixed union Side:
+	|    Left(String, String)
+	|    Right(String, String)
+	|
+
+private MAIN: String = "func main() -> Int:\n    0\n"
+private PREFIX: String = "pure func chosen(value: Side) -> String:\n    match value:\n        "
+
+
+private pure func program(source: String) -> Result[CheckedProgram, Diagnostic]:
+	parsed ?= parse_modules_with_base([{ source = source, targets = [] }], TEST_BASE)
+	check(parsed).map_err(setup_diagnostic)
+
+
+private pure func first_join(source: String) -> Option[Checked.CheckedJoin]:
+	match program(source):
+		Err(_): None
+		Ok(checked): checked_functions(checked).functions.get(0).and_then(pure func(function): checked_tail_join(function.body))
+
+
+private pure func route(argument: Checked.CheckedPatternArgument, variant: Int, ordinal: Int) -> Bool:
+	match argument:
+		Checked.BorrowPlace(place): place_route(place, variant, ordinal)
+		Checked.CopyListSuffix(_, _): False
+
+
+private pure func place_route(place: Checked.CheckedPatternPlace, variant: Int, ordinal: Int) -> Bool:
+	match place.route:
+		Checked.UnionField(parent, id, position):
+			match parent.route:
+				Checked.MatchRoot:
+					variant_number(id) == variant and position == ordinal and Checked.same_type(place.value_type, Checked.StringType)
+				_: False
+		_: False
+
+
+pure func test_alternatives_enter_one_body_with_canonical_inputs() -> Bool:
+	source = SIDE + PREFIX + "Left(first, second) | Right(second, first): first\n" + MAIN
+	match first_join(source):
+		Some(join):
+			match (join.arms, join.selection.nodes):
+				([arm], [Checked.EnterArm(right, [right_first, right_second]), Checked.EnterArm(left, [left_first, left_second]), Checked.TestVariant(root, tested, yes, no)]):
+					match (arm.inputs, arm.value.form, root.route):
+						([first, second], Checked.ReadBinding(read), Checked.MatchRoot):
+							(
+								Checked.match_arm_number(arm.id) == 0 and Checked.match_arm_number(right) == 0 and Checked.match_arm_number(left) == 0
+								and Checked.binding_number(first) == 1 and Checked.binding_number(second) == 2 and Checked.binding_number(read) == 1
+								and route(right_first, 1, 1) and route(right_second, 1, 0) and route(left_first, 0, 0) and route(left_second, 0, 1)
+								and variant_number(tested) == 0 and Checked.decision_node_number(yes) == 1 and Checked.decision_node_number(no) == 0
+								and Checked.decision_node_number(join.selection.entry) == 2
+							)
+						_: False
+				_: False
+		None: False
+
+
+pure func test_same_field_layout_still_enters_one_body() -> Bool:
+	source = SIDE + PREFIX + "Left(item, _) | Right(item, _): item\n" + MAIN
+	match first_join(source):
+		Some(join):
+			match (join.arms, join.selection.nodes):
+				([arm], [Checked.EnterArm(_, [right]), Checked.EnterArm(_, [left]), Checked.TestVariant(_, _, _, _)]):
+					arm.inputs.length() == 1 and route(left, 0, 0) and route(right, 1, 0)
+				_: False
+		None: False
+
+
+pure func test_wildcard_selection_has_no_projection_or_test() -> Bool:
+	match first_join(SIDE + PREFIX + "_: \"ok\"\n" + MAIN):
+		Some(join):
+			match (join.arms, join.selection.nodes):
+				([arm], [Checked.EnterArm(id, [])]):
+					arm.inputs.is_empty() and Checked.match_arm_number(id) == Checked.match_arm_number(arm.id) and Checked.decision_node_number(join.selection.entry) == 0
+				_: False
+		None: False
+
+
+pure func test_single_variant_selection_proves_projection_without_test() -> Bool:
+	source: String =
+		|fixed union Box:
+		|    Box(String)
+		|pure func chosen(value: Box) -> String:
+		|    match value:
+		|        Box(item): item
+		|func main() -> Int:
+		|    0
+		|
+	match first_join(source):
+		Some(join):
+			match (join.arms, join.selection.nodes):
+				([arm], [Checked.EnterArm(_, [place])]): arm.inputs.length() == 1 and route(place, 0, 0)
+				_: False
+		None: False
+
+
+private pure func rejects(source: String, start: Int, length: Int, message: String, help: String) -> Bool:
+	match program(source):
+		Ok(_): False
+		Err(error):
+			(
+				same_source(error.span.source, module_source(root_module_id()))
+				and error.span.start == start and error.span.end == start + length
+				and error.message == message and error.help == help
+			)
+
+
+pure func test_different_binder_names_reject_the_later_alternative() -> Bool:
+	prefix = SIDE + PREFIX + "Left(item, _) | "
+	written = "Right(_, other)"
+	rejects(prefix + written + ": item\n" + MAIN, prefix.length(), written.length(), "or-pattern alternatives bind different names", "bind the same names in every alternative, or use '_' for fields the arm does not need")
+
+
+pure func test_missing_binder_rejects_the_later_alternative() -> Bool:
+	prefix = SIDE + PREFIX + "Left(item, _) | "
+	written = "Right(_, _)"
+	rejects(prefix + written + ": item\n" + MAIN, prefix.length(), written.length(), "or-pattern alternatives bind different names", "bind the same names in every alternative, or use '_' for fields the arm does not need")
+
+
+pure func test_different_binder_types_reject_the_later_name() -> Bool:
+	declaration = "fixed union Side:\n    Left(String, Int)\n    Right(String, Int)\n"
+	prefix = declaration + PREFIX + "Left(item, _) | Right(_, "
+	rejects(prefix + "item): item\n" + MAIN, prefix.length(), 4, "or-pattern binding has different types", "bind each name to the same type in every alternative, or use separate match arms")
+
+
+pure func test_duplicate_binder_keeps_the_existing_binding_conflict() -> Bool:
+	prefix = SIDE + PREFIX + "Left(item, "
+	source = prefix + "item) | Right(item, _): item\n" + MAIN
+	match program(source):
+		Ok(_): False
+		Err(error):
+			exact = rejects(source, prefix.length(), 4, "`item` is already a local in this function", "choose a different name for this binding")
+			match error.note:
+				Some(PreviousDeclaration(previous)): exact and previous.start == prefix.length() - 6 and previous.end == prefix.length() - 2
+				_: False
+
+
+pure func test_duplicate_alternative_rejects_the_later_constructor() -> Bool:
+	prefix = SIDE + PREFIX + "Left(_, _) | "
+	written = "Left(_, _)"
+	rejects(prefix + written + ": \"left\"\n        Right(_, _): \"right\"\n" + MAIN, prefix.length(), written.length(), "match arm is unreachable", "remove this arm; earlier arms already cover all values it could match")
+
+
+pure func test_covered_alternative_precedes_binder_mismatch() -> Bool:
+	prefix = SIDE + PREFIX + "Left(item, _) | "
+	written = "Left(_, other)"
+	rejects(prefix + written + ": item\n        Right(_, _): \"right\"\n" + MAIN, prefix.length(), written.length(), "match arm is unreachable", "remove this arm; earlier arms already cover all values it could match")
+
+
+private func report_source_parse_failure(path: String, error: Diagnostic) -> Void:
+	print_error(path + ": " + error.message)
+	print_error("  help: " + error.help)
+	print_error("  span: " + IntOps.to_string(error.span.start) + ".." + IntOps.to_string(error.span.end))
+
+
+func test_changed_check_production_parses_with_target_parser() -> Bool:
+	var passed = True
+	for path in ["blorp_2/src/check/model.brp", "blorp_2/src/check/patterns.brp", "blorp_2/src/check/bodies.brp", "blorp_2/src/check/errors.brp", "blorp_2/src/check/render.brp"]:
+		match read_file(path):
+			Err(_):
+				print_error(path + ": unable to read source")
+				passed = False
+			Ok(source):
+				match lex(module_source(root_module_id()), source, program_names().names):
+					Err(error):
+						report_source_parse_failure(path, error)
+						passed = False
+					Ok(tokens):
+						match parse_module(tokens, root_module_id()):
+							Err(error):
+								report_source_parse_failure(path, error)
+								passed = False
+							Ok(_): void
+	passed
+
+
+tests: TestSuite = {
+	description = "Checked shared pattern selection",
+	tests = [
+		("alternatives canonicalize names and share one body", test_alternatives_enter_one_body_with_canonical_inputs),
+		("same binder layout shares one body", test_same_field_layout_still_enters_one_body),
+		("wildcard has no tests or projections", test_wildcard_selection_has_no_projection_or_test),
+		("single variant directly enters a projected body", test_single_variant_selection_proves_projection_without_test),
+		("different binder names reject later alternative", test_different_binder_names_reject_the_later_alternative),
+		("missing binder rejects later alternative", test_missing_binder_rejects_the_later_alternative),
+		("different binder types reject later name", test_different_binder_types_reject_the_later_name),
+		("duplicate binder retains conflict diagnostic", test_duplicate_binder_keeps_the_existing_binding_conflict),
+		("duplicate alternative retains coverage diagnostic", test_duplicate_alternative_rejects_the_later_constructor),
+		("covered alternative precedes binder comparison", test_covered_alternative_precedes_binder_mismatch),
+		("changed Check production parses in target", test_changed_check_production_parses_with_target_parser),
+	]
+}

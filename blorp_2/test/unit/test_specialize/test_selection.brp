@@ -1,0 +1,126 @@
+import:
+	../../../src/check/check: check
+	../../../src/check/model as Checked
+	../../../src/specialize/specialize as Concrete
+	../../../src/utils/syntax: Diagnostic
+	../../../src/utils/source: module_source, root_module_id
+	../../../src/utils/names: program_names
+	../../../src/lex/lex: lex
+	../../../src/parse/parse: parse_module
+	../input: setup_diagnostic
+	../module_input: TEST_BASE, parse_modules_with_base
+	../managed_union_inputs: concrete_tail_join
+	result: map_err
+	system: read_file
+	test: TestSuite
+
+
+private pure func specialized(source: String) -> Result[Concrete.SpecializedContents, Diagnostic]:
+	parsed ?= parse_modules_with_base([{ source = source, targets = [] }], TEST_BASE)
+	checked ?= check(parsed).map_err(setup_diagnostic)
+	concrete ?= Concrete.specialize(checked)
+	Ok(Concrete.specialized_contents(concrete))
+
+
+private pure func field(argument: Concrete.ConcretePatternArgument, variant: Int, ordinal: Int) -> Bool:
+	match argument:
+		Concrete.BorrowPlace(place): field_place(place, variant, ordinal)
+		Concrete.CopyListSuffix(_, _): False
+
+
+private pure func field_place(place: Concrete.ConcretePatternPlace, variant: Int, ordinal: Int) -> Bool:
+	match place.route:
+		Concrete.UnionField(parent, id):
+			match parent.route:
+				Concrete.MatchRoot:
+					Concrete.variant_number(Concrete.variant_field_variant(id)) == variant and Concrete.variant_field_number(id) == ordinal and Concrete.same_type(place.value_type, Concrete.StringType)
+				_: False
+		_: False
+
+
+pure func test_generic_alternatives_publish_instantiated_field_identities() -> Bool:
+	source: String =
+		|fixed union Side[T]:
+		|    Left(T, T)
+		|    Right(T, T)
+		|pure func chosen[T](value: Side[T]) -> T:
+		|    match value:
+		|        Left(item, _) | Right(_, item): item
+		|func main() -> Int:
+		|    answer = chosen(Left("chosen", "unused"))
+		|    0
+		|
+	match specialized(source):
+		Err(_): False
+		Ok(contents):
+			match contents.functions.get(1):
+				None: False
+				Some(function):
+					match concrete_tail_join(function.body):
+						None: False
+						Some(join):
+							match (join.arms, join.selection.nodes, function.bindings):
+								([arm], [Concrete.EnterArm(right, [right_place]), Concrete.EnterArm(left, [left_place]), Concrete.TestVariant(root, tag, yes, no)], [_, input]):
+									match (arm.inputs, arm.value.form, root.route):
+										([binding], Concrete.ReadBinding(read), Concrete.MatchRoot):
+											(
+												field(right_place, 1, 1) and field(left_place, 0, 0)
+												and Checked.match_arm_number(left) == Checked.match_arm_number(arm.id) and Checked.match_arm_number(right) == Checked.match_arm_number(arm.id)
+												and Checked.binding_number(binding) == Checked.binding_number(read) and Checked.binding_number(binding) == 1
+												and Concrete.same_type(input.value_type, Concrete.StringType) and Concrete.same_type(function.signature.return_type, Concrete.StringType)
+												and Concrete.variant_number(tag) == 0 and Checked.decision_node_number(yes) == 1 and Checked.decision_node_number(no) == 0
+												and Checked.decision_node_number(join.selection.entry) == 2
+											)
+										_: False
+								_: False
+
+
+pure func test_terminal_match_uses_the_same_selection_product() -> Bool:
+	source: String =
+		|fixed union Side:
+		|    Left(Int, Int)
+		|    Right(Int, Int)
+		|    Again
+		|@tail_recursive
+		|pure func chosen(value: Side) -> Int:
+		|    match value:
+		|        Left(item, _) | Right(_, item): item
+		|        Again: chosen(Left(42, 0))
+		|func main() -> Int:
+		|    chosen(Left(42, 0))
+		|
+	match specialized(source):
+		Err(_): False
+		Ok(contents):
+			match contents.functions.get(1):
+				None: False
+				Some(function):
+					match function.body:
+						Concrete.ConcreteMatchBody(matched):
+							match (matched.arms, matched.selection.nodes):
+								([arm, recurrent], [Concrete.EnterArm(again, []), Concrete.EnterArm(right, [_]), Concrete.TestVariant(_, _, _, _), Concrete.EnterArm(left, [_]), Concrete.TestVariant(_, _, _, _)]):
+									match recurrent.body:
+										Concrete.RecurWith([_], _):
+											arm.inputs.length() == 1 and Checked.match_arm_number(left) == Checked.match_arm_number(arm.id) and Checked.match_arm_number(right) == Checked.match_arm_number(arm.id) and Checked.match_arm_number(again) == Checked.match_arm_number(recurrent.id)
+										_: False
+								_: False
+						_: False
+
+
+func test_changed_specialize_production_parses_with_target_parser() -> Bool:
+	match read_file("blorp_2/src/specialize/specialize.brp"):
+		Err(_): False
+		Ok(source):
+			match lex(module_source(root_module_id()), source, program_names().names):
+				Err(_): False
+				Ok(tokens): parse_module(tokens, root_module_id()).is_ok()
+
+
+tests: TestSuite = {
+	description = "Concrete shared pattern selection",
+	tests = [
+		("generic alternatives retain concrete field identities", test_generic_alternatives_publish_instantiated_field_identities),
+		("terminal match shares selector and canonical input product", test_terminal_match_uses_the_same_selection_product),
+		("changed Specialize production parses in target", test_changed_specialize_production_parses_with_target_parser),
+	]
+}

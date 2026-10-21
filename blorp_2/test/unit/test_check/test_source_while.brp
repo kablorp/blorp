@@ -1,0 +1,396 @@
+import:
+	../../../src/check/check: CheckFailure, check, check_errors, checked_functions
+	../../../src/check/errors as Errors
+	../../../src/check/model as Model
+	../../../src/check/render: render_failure
+	../../../src/namespace/builtins: check_builtin_types
+	../../../src/utils/ids: function_number, variant_owner
+	../../../src/utils/source: module_source, root_module_id
+	../../../src/utils/syntax: entry_function, same_span
+	../module_input: TEST_BASE, parse_modules_with_base
+	../source_while_inputs as Input
+	test: TestSuite
+
+
+pure func test_zero_iteration_source_while_is_checked() -> Bool:
+	Input.checked(Input.ZERO_ITERATIONS).is_ok()
+
+
+private pure func source_loop(function: Model.CheckedFunction) -> Option[Model.CheckedWhile]:
+	var result: Option[Model.CheckedWhile] = None
+	for statement in function.statements:
+		match statement:
+			Model.RunWhile(loop): result = Some(loop)
+			_: void
+	result
+
+
+private pure func initialization(function: Model.CheckedFunction, position: Int) -> Option[Model.BindingId]:
+	statement ?= function.statements.get(position)
+	match statement:
+		Model.InitializeBinding(id, _): Some(id)
+		_: None
+
+
+private pure func while_retains_actual_designated_bool_ids_facts() -> Option[Bool]:
+	parsed ?= parse_modules_with_base([{ source = Input.ZERO_ITERATIONS, targets = [] }], TEST_BASE).to_option()
+	foundation ?= check_builtin_types(parsed).to_option()
+	accepted ?= check(parsed).to_option()
+	contents = checked_functions(accepted)
+	function ?= contents.functions.get(function_number(entry_function(contents.entrypoint)))
+	loop ?= source_loop(function)
+	initial ?= initialization(function, 0)
+	carried ?= loop.carried.get(0)
+	match loop.condition.form:
+		Model.ConstructVariant(id, fields):
+			Some(Model.same_variant(id, foundation.designated.boolean.false_variant)
+				and Model.same_variant(loop.boolean.true_variant, foundation.designated.boolean.true_variant)
+				and Model.same_variant(loop.boolean.false_variant, foundation.designated.boolean.false_variant)
+				and Model.same_type(loop.condition.value_type, Model.UnionType(variant_owner(id)))
+				and fields.is_empty() and loop.carried.length() == 1
+				and Model.binding_number(initial) == Model.binding_number(carried)
+				and function.statements.length() == 2 and loop.body.length() == 1)
+		_: None
+
+
+pure func test_while_retains_actual_designated_bool_ids() -> Bool:
+	while_retains_actual_designated_bool_ids_facts().get_or(False)
+
+
+private pure func carried_order_excludes_iteration_local_bindings_facts() -> Option[Bool]:
+	accepted ?= Input.checked(Input.HEADER_SWAP).to_option()
+	contents = checked_functions(accepted)
+	function ?= contents.functions.get(function_number(entry_function(contents.entrypoint)))
+	loop ?= source_loop(function)
+	first ?= initialization(function, 0)
+	second ?= initialization(function, 1)
+	again ?= initialization(function, 2)
+	first_h ?= loop.carried.get(0)
+	second_h ?= loop.carried.get(1)
+	again_h ?= loop.carried.get(2)
+	Some(loop.carried.length() == 3 and function.bindings.length() == 4
+		and Model.binding_number(first_h) == Model.binding_number(first)
+		and Model.binding_number(second_h) == Model.binding_number(second)
+		and Model.binding_number(again_h) == Model.binding_number(again)
+		and loop.body.length() == 4)
+
+
+pure func test_carried_order_excludes_iteration_local_bindings() -> Bool:
+	carried_order_excludes_iteration_local_bindings_facts().get_or(False)
+
+
+private pure func statement_if_outside_loop_is_a_void_join_with_absent_else_facts() -> Option[Bool]:
+	accepted ?= Input.checked(Input.STATEMENT_IF).to_option()
+	contents = checked_functions(accepted)
+	function ?= contents.functions.get(function_number(entry_function(contents.entrypoint)))
+	statement ?= function.statements.get(1)
+	match statement:
+		Model.DiscardExpression(value):
+			match value.form:
+				Model.Match(join):
+					match join.arms.get(0):
+						None: None
+						Some(then_arm):
+							match join.arms.get(1):
+								None: None
+								Some(else_arm):
+									Some(Model.same_type(value.value_type, Model.VoidType)
+										and join.carried.length() == 1 and join.arms.length() == 2
+										and then_arm.statements.length() == 1 and else_arm.statements.is_empty()
+										and Model.same_type(then_arm.value.value_type, Model.VoidType)
+										and Model.same_type(else_arm.value.value_type, Model.VoidType))
+				_: None
+		_: None
+
+
+pure func test_statement_if_outside_loop_is_a_void_join_with_absent_else() -> Bool:
+	statement_if_outside_loop_is_a_void_join_with_absent_else_facts().get_or(False)
+
+
+private pure func condition_match_write_is_an_enclosing_carrier_facts() -> Option[Bool]:
+	accepted ?= Input.checked(Input.CONDITION_WRITES).to_option()
+	contents = checked_functions(accepted)
+	function ?= contents.functions.get(function_number(entry_function(contents.entrypoint)))
+	loop ?= source_loop(function)
+	initial ?= initialization(function, 0)
+	carried ?= loop.carried.get(0)
+	match loop.condition.form:
+		Model.Match(join):
+			Some(loop.carried.length() == 1 and join.carried.length() == 1
+				and Model.binding_number(initial) == Model.binding_number(carried)
+				and join.arms.length() == 2)
+		_: None
+
+
+pure func test_condition_match_write_is_an_enclosing_carrier() -> Bool:
+	condition_match_write_is_an_enclosing_carrier_facts().get_or(False)
+
+
+private pure func rejects(source: String, marked: String, prefix: String, message: String, help: String, matches: pure (Errors.CheckErrorKind) -> Bool) -> Bool:
+	match parse_modules_with_base([{ source = source, targets = [] }], TEST_BASE):
+		Err(_): False
+		Ok(parsed):
+			match check(parsed):
+				Ok(_): False
+				Err(failure):
+					errors = render_failure(failure)
+					diagnostic = errors.first
+					-- check_errors retains the owned kind; rendering alone cannot
+					-- establish that the expected checking boundary rejected it.
+					owned = check_error_matches(failure, matches)
+					(owned and errors.remaining.is_empty()
+						and same_span(diagnostic.span, { source = module_source(root_module_id()), start = prefix.length(), end = prefix.length() + marked.length() })
+						and diagnostic.message == message and diagnostic.help == help
+						and diagnostic.note.is_none())
+
+
+private pure func check_error_matches(failure: CheckFailure, matches: pure (Errors.CheckErrorKind) -> Bool) -> Bool:
+	errors = check_errors(failure)
+	errors.remaining.is_empty() and matches(errors.first.kind)
+
+
+private pure func break_facts() -> Option[Bool]:
+	prefix = "func main() -> Int:\n    while True:\n        "
+	accepted ?= Input.checked(prefix + "break\n    0\n").to_option()
+	function ?= checked_functions(accepted).functions.get(0)
+	loop ?= source_loop(function)
+	statement ?= loop.body.get(0)
+	match statement:
+		Model.BreakSourceLoop(span):
+			Some(loop.body.length() == 1 and same_span(span, {
+				source = module_source(root_module_id()), start = prefix.length(), end = prefix.length() + "break".length(),
+			}))
+		_: None
+
+
+pure func test_break_publishes_typed_control_with_exact_span() -> Bool:
+	break_facts().get_or(False)
+
+
+private pure func continue_if_facts() -> Option[Bool]:
+	prefix = "func main() -> Int:\n    while True:\n        if True:\n            "
+	accepted ?= Input.checked(prefix + "continue\n    0\n").to_option()
+	function ?= checked_functions(accepted).functions.get(0)
+	loop ?= source_loop(function)
+	statement ?= loop.body.get(0)
+	match statement:
+		Model.DiscardExpression(value):
+			match value.form:
+				Model.Match(join):
+					arm ?= join.arms.get(0)
+					control ?= arm.statements.get(0)
+					match control:
+						Model.ContinueSourceLoop(span):
+							Some(arm.statements.length() == 1 and same_span(span, {
+								source = module_source(root_module_id()), start = prefix.length(), end = prefix.length() + "continue".length(),
+							}))
+						_: None
+				_: None
+		_: None
+
+
+pure func test_continue_inside_if_preserves_loop_scope() -> Bool:
+	continue_if_facts().get_or(False)
+
+
+pure func test_nested_loop_has_complete_inner_statement_span() -> Bool:
+	header: String =
+		|func main() -> Int:
+		|    while True:
+		|
+	prefix = header + "        "
+	inner: String =
+		|while False:
+		|            void
+	tail: String =
+		|
+		|    0
+		|
+	match Input.checked(prefix + inner + tail):
+		Err(_): False
+		Ok(accepted):
+			match checked_functions(accepted).functions.get(0):
+				None: False
+				Some(function):
+					match source_loop(function):
+						None: False
+						Some(outer):
+							match outer.body.get(0):
+								Some(Model.RunWhile(nested)):
+									same_span(nested.span, { source = module_source(root_module_id()), start = prefix.length(), end = prefix.length() + inner.length() })
+								_: False
+
+
+pure func test_int_condition_is_rejected_at_condition() -> Bool:
+	header: String =
+		|func main() -> Int:
+		|
+	prefix = header + "    while "
+	tail: String =
+		|1:
+		|        void
+		|    0
+		|
+	rejects(prefix + tail, "1", prefix,
+		"condition must have the designated Bool type", "use a Bool value as the condition", pure func(kind):
+			match kind:
+				Errors.StatementRejection(Errors.NonBooleanCondition(actual)): Model.same_type(actual, Model.IntType)
+				_: False
+	)
+
+
+pure func test_same_shape_union_is_not_designated_bool() -> Bool:
+	header: String =
+		|fixed union Decision:
+		|    Yes
+		|    No
+		|func main() -> Int:
+		|    decision: Decision = Yes
+		|
+	prefix = header + "    while "
+	tail: String =
+		|decision:
+		|        void
+		|    0
+		|
+	rejects(prefix + tail, "decision", prefix,
+		"condition must have the designated Bool type", "use a Bool value as the condition", pure func(kind):
+			match kind:
+				Errors.StatementRejection(Errors.NonBooleanCondition(_)): True
+				_: False
+	)
+
+
+pure func test_statement_if_support_also_accepts_value_if() -> Bool:
+	header: String =
+		|func main() -> Int:
+		|
+	prefix = header + "    value = "
+	value: String =
+		|if True:
+		|        1
+		|    else:
+		|        2
+	tail: String =
+		|
+		|    value
+		|
+	Input.checked(prefix + value + tail).is_ok()
+
+
+private pure func rejects_int_condition_leaf(prefix: String, tail: String) -> Bool:
+	rejects(prefix + tail, "1", prefix,
+		"condition must have the designated Bool type", "use a Bool value as the condition", pure func(kind):
+			match kind:
+				Errors.StatementRejection(Errors.NonBooleanCondition(actual)): Model.same_type(actual, Model.IntType)
+				_: False
+	)
+
+
+pure func test_condition_match_rejects_first_int_arm() -> Bool:
+	header: String =
+		|func main() -> Int:
+		|    flag: Bool = False
+		|    while match flag:
+		|        True:
+		|
+	prefix = header + "            "
+	tail: String =
+		|1
+		|        False:
+		|            False
+		|    :
+		|        void
+		|    0
+		|
+	rejects_int_condition_leaf(prefix, tail)
+
+
+pure func test_condition_match_rejects_nonfirst_int_arm() -> Bool:
+	header: String =
+		|func main() -> Int:
+		|    flag: Bool = False
+		|    while match flag:
+		|        True:
+		|            True
+		|        False:
+		|
+	prefix = header + "            "
+	tail: String =
+		|1
+		|    :
+		|        void
+		|    0
+		|
+	rejects_int_condition_leaf(prefix, tail)
+
+
+pure func test_condition_match_rejects_nested_int_arm() -> Bool:
+	header: String =
+		|func main() -> Int:
+		|    flag: Bool = False
+		|    while match flag:
+		|        True:
+		|            match flag:
+		|                True:
+		|                    True
+		|                False:
+		|
+	prefix = header + "                    "
+	tail: String =
+		|1
+		|        False:
+		|            False
+		|    :
+		|        void
+		|    0
+		|
+	rejects_int_condition_leaf(prefix, tail)
+
+
+pure func test_condition_match_requires_each_arm_value() -> Bool:
+	header: String =
+		|func main() -> Int:
+		|    flag: Bool = False
+		|    while match flag:
+		|
+	prefix = header + "        "
+	arm: String =
+		|True:
+		|            missing = 1
+	tail: String =
+		|
+		|        False:
+		|            False
+		|    :
+		|        void
+		|    0
+		|
+	rejects(prefix + arm + tail, arm, prefix,
+		"match arm has no final value", "finish the arm with a value expression on its own indented line", pure func(kind):
+			match kind:
+				Errors.MatchRejection(Errors.ArmWithoutValue): True
+				_: False
+	)
+
+
+tests: TestSuite = {
+	description = "Blorp 2 first source while checking",
+	tests = [
+		("zero-iteration source while is checked", test_zero_iteration_source_while_is_checked),
+		("while retains actual designated Bool identities", test_while_retains_actual_designated_bool_ids),
+		("carried order excludes iteration locals", test_carried_order_excludes_iteration_local_bindings),
+		("standalone statement if is a Void join with absent else", test_statement_if_outside_loop_is_a_void_join_with_absent_else),
+		("condition match writes are enclosing carriers", test_condition_match_write_is_an_enclosing_carrier),
+		("break publishes typed control with exact span", test_break_publishes_typed_control_with_exact_span),
+		("continue inside if preserves loop scope", test_continue_inside_if_preserves_loop_scope),
+		("nested loop has complete inner statement span", test_nested_loop_has_complete_inner_statement_span),
+		("Int condition is rejected at condition", test_int_condition_is_rejected_at_condition),
+		("same shape union is not designated Bool", test_same_shape_union_is_not_designated_bool),
+		("statement if and value if share joins", test_statement_if_support_also_accepts_value_if),
+		("condition match rejects its first Int arm", test_condition_match_rejects_first_int_arm),
+		("condition match rejects its nonfirst Int arm", test_condition_match_rejects_nonfirst_int_arm),
+		("condition match rejects a nested Int arm", test_condition_match_rejects_nested_int_arm),
+		("condition match requires every arm value", test_condition_match_requires_each_arm_value),
+	]
+}

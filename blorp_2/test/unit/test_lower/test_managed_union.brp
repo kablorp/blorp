@@ -4,7 +4,8 @@ import:
 	../../../src/namespace/builtins as Builtins: RuntimeOperation(StringLength)
 	../../../src/specialize/specialize as Concrete
 	int as IntOps
-	../managed_union_inputs: lowered_modules
+	./selection_inputs: selected_field
+	../managed_union_inputs: lowered_modules, lowered_tail_join
 	../module_input: INTEGER_OPERATIONS, STRING_OPERATIONS
 	system: read_file
 	test: TestSuite
@@ -52,35 +53,31 @@ private func fixture(
 
 
 private pure func projection_matches(
-	arm: Lower.LoweredArm,
+	matched: Lower.LoweredJoin,
+	arm: Lower.JoinArm,
 	parent: Lower.ValueId,
 	value_type: Concrete.TypeRef,
 ) -> Bool:
-	match (arm.label, arm.body.steps, arm.body.exit):
-		(Lower.VariantLabel(selected), [Lower.Define(payload)], Lower.ReturnValue(returned)):
-			match payload.operation:
-				Lower.PayloadValue(field, source):
-					(
-						same_variant(selected, Concrete.variant_field_variant(field))
-						and Concrete.variant_field_number(field) == 0
-						and same_value(source, parent)
-						and same_value(returned, payload.id)
-						and Concrete.same_type(payload.value_type, value_type)
-					)
-				_:
-					False
-		_:
-			False
+	match (selected_field(matched.selection, arm.id), arm.inputs, arm.steps, arm.exit):
+		(Some(projected), [input], [], Lower.Yield(outputs)):
+			(
+				Concrete.variant_field_number(projected.field) == 0
+				and same_value(projected.parent, parent)
+				and same_value(outputs.value, input.id)
+				and Concrete.same_type(input.value_type, value_type)
+				and Concrete.same_type(projected.parameter.value_type, value_type)
+			)
+		_: False
 
 
 private pure func string_projection(function: Lower.LoweredFunction) -> Bool:
-	match (function.steps, function.tail):
-		([Lower.Define(parameter)], Lower.MatchValue(matched)):
+	match (function.steps, lowered_tail_join(function)):
+		([Lower.Define(parameter), Lower.Join(_)], Some(matched)):
 			match matched.arms:
 				[arm]:
 					(
-						same_value(parameter.id, matched.scrutinee)
-						and projection_matches(arm, parameter.id, Concrete.StringType)
+						same_value(parameter.id, matched.selection.scrutinee)
+						and projection_matches(matched, arm, parameter.id, Concrete.StringType)
 					)
 				_:
 					False
@@ -96,8 +93,8 @@ func test_string_projection_keeps_the_selected_variant_source_and_type() -> Bool
 
 
 private pure func string_construction(function: Lower.LoweredFunction) -> Bool:
-	match (function.steps, function.signature.return_type, function.tail):
-		([Lower.Define(parameter), Lower.Define(constructed)], Concrete.UnionType(owner), Lower.ExitValue(Lower.ReturnValue(returned))):
+	match (function.steps, function.signature.return_type, function.result):
+		([Lower.Define(parameter), Lower.Define(constructed)], Concrete.UnionType(owner), returned):
 			match constructed.operation:
 				Lower.ConstructValue(selected, [source]):
 					(
@@ -137,8 +134,8 @@ private pure func reads(definition: Lower.ValueDefinition, expected: Lower.Value
 private pure func is_string_length(program: Lower.LoweredFunctions, id: Concrete.FunctionInstanceId) -> Bool:
 	match program.functions.get(Concrete.function_number(id)):
 		Some(function):
-			match (function.signature.parameters, function.steps, function.tail):
-				([Concrete.StringType], [Lower.Define(parameter), Lower.Define(result)], Lower.ExitValue(Lower.ReturnValue(returned))):
+			match (function.signature.parameters, function.steps, function.result):
+				([Concrete.StringType], [Lower.Define(parameter), Lower.Define(result)], returned):
 					match result.operation:
 						Lower.CallValue(call, [argument]):
 							match call:
@@ -171,11 +168,8 @@ private pure func length_reads(program: Lower.LoweredFunctions, definition: Lowe
 
 
 private pure func returns(function: Lower.LoweredFunction, expected: Lower.ValueId) -> Bool:
-	match function.tail:
-		Lower.ExitValue(Lower.ReturnValue(value)):
-			same_value(value, expected)
-		_:
-			False
+	value = function.result
+	same_value(value, expected)
 
 
 private pure func saved_reads_original(program: Lower.LoweredFunctions) -> Bool:
@@ -224,34 +218,24 @@ func test_current_extraction_reads_the_replacement_value_after_rebinding() -> Bo
 
 
 private pure func two_arm_projection(function: Lower.LoweredFunction) -> Bool:
-	match (function.steps, function.tail):
-		([Lower.Define(parameter)], Lower.MatchValue(matched)):
-			match matched.arms:
-				[first, second]:
-					match (first.body.steps, second.body.steps):
-						([Lower.Define(left)], [Lower.Define(right)]):
+	match (function.steps, lowered_tail_join(function)):
+		([Lower.Define(parameter), Lower.Join(_)], Some(matched)):
+			match (matched.arms.get(0), matched.arms.get(1)):
+				(Some(first), Some(second)):
+					match (selected_field(matched.selection, first.id), selected_field(matched.selection, second.id), first.inputs, second.inputs):
+						(Some(left_edge), Some(right_edge), [left], [right]):
 							(
-								projection_matches(first, parameter.id, Concrete.StringType)
-								and projection_matches(second, parameter.id, Concrete.StringType)
-								and IntOps.equals(
-									Lower.value_number(parameter.id),
-									0,
-								)
-								and IntOps.equals(
-									Lower.value_number(left.id),
-									1,
-								)
-								and IntOps.equals(
-									Lower.value_number(right.id),
-									2,
-								)
+								projection_matches(matched, first, parameter.id, Concrete.StringType)
+								and projection_matches(matched, second, parameter.id, Concrete.StringType)
+								and IntOps.equals(Lower.value_number(parameter.id), 0)
+								and IntOps.equals(Lower.value_number(right_edge.parameter.id), 2)
+								and IntOps.equals(Lower.value_number(left_edge.parameter.id), 3)
+								and IntOps.equals(Lower.value_number(left.id), 4)
+								and IntOps.equals(Lower.value_number(right.id), 5)
 							)
-						_:
-							False
-				_:
-					False
-		_:
-			False
+						_: False
+				_: False
+		_: False
 
 
 func test_sibling_string_projections_keep_distinct_global_value_ids() -> Bool:
@@ -262,21 +246,24 @@ func test_sibling_string_projections_keep_distinct_global_value_ids() -> Bool:
 
 
 private pure func nested_projection(function: Lower.LoweredFunction) -> Bool:
-	match (function.signature.return_type, function.steps, function.tail):
-		(Concrete.UnionType(child), [Lower.Define(parameter)], Lower.MatchValue(matched)):
+	match (function.signature.return_type, function.steps, lowered_tail_join(function)):
+		(Concrete.UnionType(child), [Lower.Define(parameter), Lower.Join(_)], Some(matched)):
 			match matched.arms:
 				[arm]:
-					(
-						projection_matches(arm, parameter.id, function.signature.return_type)
-						and IntOps.equals(
-							Concrete.union_number(child),
-							0,
-						)
-						and IntOps.equals(
-							Concrete.union_number(matched.owner),
-							1,
-						)
-					)
+					match selected_field(matched.selection, arm.id):
+						Some(projected):
+							(
+								projection_matches(matched, arm, parameter.id, function.signature.return_type)
+								and IntOps.equals(
+									Concrete.union_number(child),
+									0,
+								)
+								and IntOps.equals(
+									Concrete.union_number(Concrete.variant_owner(Concrete.variant_field_variant(projected.field))),
+									1,
+								)
+							)
+						None: False
 				_:
 					False
 		_:

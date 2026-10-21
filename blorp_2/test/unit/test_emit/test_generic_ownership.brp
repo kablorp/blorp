@@ -9,7 +9,7 @@ import:
 	../../../src/lower/lower as Lower
 	../../../src/own/own as Own
 	../../../src/specialize/specialize as Concrete
-	../../../src/utils/syntax: Diagnostic, FunctionExecution(OrdinaryCalls), same_span
+	../../../src/utils/syntax: Diagnostic, same_span
 	../../../src/verify/verify: verify
 	../input: check, parse, setup_diagnostic
 	test: TestSuite
@@ -50,16 +50,13 @@ private pure func parameter_return(
 		[Lower.Define(parameter)]:
 			match parameter.operation:
 				Lower.ParameterValue(_):
-					match function.tail:
-						Lower.ExitValue(Lower.ReturnValue(result)):
-							(
-								Lower.value_number(parameter.id) == 0
-								and Lower.value_number(result) == 0
-								and Concrete.same_type(parameter.value_type, expected)
-								and Concrete.same_type(function.signature.return_type, expected)
-							)
-						_:
-							False
+					result = function.result
+					(
+						Lower.value_number(parameter.id) == 0
+						and Lower.value_number(result) == 0
+						and Concrete.same_type(parameter.value_type, expected)
+						and Concrete.same_type(function.signature.return_type, expected)
+					)
 				_:
 					False
 		_:
@@ -90,8 +87,8 @@ pure func test_int_instance_returns_without_ownership() -> Bool:
 						[Own.DefineValue(parameter)]:
 							match parameter.result:
 								Own.UnmanagedResult:
-									match integer.tail:
-										Own.ReturnTail(Own.ReturnResult(Own.UnmanagedReturn(value))):
+									match integer.result:
+										Own.UnmanagedReturn(value):
 											Lower.value_number(value) == 0
 										_:
 											False
@@ -129,9 +126,9 @@ private pure func owns_result(result: Own.ResultOwnership) -> Bool:
 			False
 
 
-private pure func transfers(tail: Own.OwnedTail, expected_value: Int) -> Bool:
-	match tail:
-		Own.ReturnTail(Own.ReturnResult(Own.OwnedReturn(value, owner))):
+private pure func transfers(transfer: Own.ReturnTransfer, expected_value: Int) -> Bool:
+	match transfer:
+		Own.OwnedReturn(value, owner):
 			Lower.value_number(value) == expected_value and Own.owner_number(owner) == 0
 		_:
 			False
@@ -149,7 +146,7 @@ pure func test_string_instance_acquires_exact_borrowed_parameter_return() -> Boo
 								and parameter_borrow(borrow)
 								and Lower.value_number(parameter.id) == 0
 								and Own.owner_number(owner) == 0
-								and transfers(string.tail, 0)
+								and transfers(string.result, 0)
 							)
 						_:
 							False
@@ -185,7 +182,7 @@ pure func test_string_forwarding_borrows_call_argument_and_transfers_call_owner(
 												and parameter_borrow(borrow)
 												and Lower.value_number(call.id) == 1
 												and owns_result(call.result)
-												and transfers(forward.tail, 1)
+												and transfers(forward.result, 1)
 											)
 										_:
 											False
@@ -248,7 +245,7 @@ private pure func raw_return(kind: RawReturn) -> Result[Own.OwnershipProgram, Di
 								BorrowedReturn | MissingAcquisition:
 									[definition]
 
-							tail = match kind:
+							result = match kind:
 								BorrowedReturn:
 									Own.UnmanagedReturn(parameter.id)
 								AcquiredReturn | MissingAcquisition:
@@ -263,7 +260,6 @@ private pure func raw_return(kind: RawReturn) -> Result[Own.OwnershipProgram, Di
 								entrypoint = contents.entrypoint,
 								functions = [
 									{
-										execution = OrdinaryCalls,
 										signature = main.signature,
 										operations = [Own.DefineValue({
 												id = seed.id,
@@ -272,15 +268,12 @@ private pure func raw_return(kind: RawReturn) -> Result[Own.OwnershipProgram, Di
 												result = Own.UnmanagedResult,
 												span = seed.span,
 											})],
-										tail = Own.ReturnTail(
-											Own.ReturnResult(Own.UnmanagedReturn(seed.id)),
-										)
+										result = Own.UnmanagedReturn(seed.id)
 									},
 									{
-										execution = OrdinaryCalls,
 										signature = string.signature,
 										operations = operations,
-										tail = Own.ReturnTail(Own.ReturnResult(tail))
+										result = result
 									},
 								],
 							})
@@ -467,7 +460,7 @@ private pure func acquired_parameter_return(
 						and borrowed_result(parameter.result) and parameter_borrow(borrow)
 						and Lower.value_number(parameter.id) == 0
 						and Lower.value_number(source) == 0 and Lower.value_number(dependency) == 0
-						and Own.owner_number(owner) == 0 and transfers(function.tail, 0)
+						and Own.owner_number(owner) == 0 and transfers(function.result, 0)
 					)
 				_: False
 		_: False
@@ -498,7 +491,7 @@ pure func test_opaque_string_and_list_ownership_has_exact_acquisition_and_drop_o
 		Ok(program):
 			match program.functions:
 				[main, wrap, project, wrap_list, project_list]:
-					match (main.operations, main.tail):
+					match (main.operations, main.result):
 						([
 							Own.DefineValue(text),
 							Own.DefineValue(wrapped),
@@ -513,7 +506,7 @@ pure func test_opaque_string_and_list_ownership_has_exact_acquisition_and_drop_o
 							Own.DropOwner(wrapped_root, _),
 							Own.DropOwner(projected_root, _),
 							Own.DefineValue(_)
-						], Own.ReturnTail(Own.ReturnResult(Own.UnmanagedReturn(returned)))):
+						], Own.UnmanagedReturn(returned)):
 							match (text.operation, list.operation, list.result):
 								(Own.StringDefinition("owned"), Own.ConstructListDefinition([]), Own.OwnedResult(list_owner)):
 									(
@@ -603,8 +596,8 @@ private func callback_return_ownership(remove_acquisition: Bool) -> Bool:
 			var found = 0
 			var passed = verify(program).is_ok()
 			for (index, function) in program.functions.enumerate():
-				match (function.signature.parameters, function.signature.return_type, function.operations, function.tail):
-					([Concrete.StringType], Concrete.StringType, [Own.DefineValue(parameter), Own.AcquireOwner(owner, borrow, _)], Own.ReturnTail(Own.ReturnResult(Own.OwnedReturn(value, transferred)))):
+				match (function.signature.parameters, function.signature.return_type, function.operations, function.result):
+					([Concrete.StringType], Concrete.StringType, [Own.DefineValue(parameter), Own.AcquireOwner(owner, borrow, _)], Own.OwnedReturn(value, transferred)):
 						found = found + 1
 						passed = passed and (
 							borrowed_result(parameter.result) and Lower.value_number(value) == Lower.value_number(parameter.id)

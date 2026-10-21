@@ -3,6 +3,7 @@ Checks union and record declarations and resolves written type terms
 against the frozen namespace, including declared type parameters.
 ---
 import:
+	../utils/boolean: not, and, or
 	./errors:
 		CheckError,
 		CheckerInvariant(
@@ -62,7 +63,7 @@ import:
 	../namespace/namespace:
 		AliasedModule, Namespace, NamedValue(NamedAlias), TypeHead(PrimitiveHead, ListHead, UnionHead, RecordHead, OpaqueHead),
 		Origin(Declared), named_type, named_value, offered_type,
-	option: to_result
+	option: to_result, is_none, is_some
 	../parse/assemble: ParsedContents
 	../utils/source: compiler_source, ModuleId
 	../utils/syntax:
@@ -317,7 +318,7 @@ private pure func resolve_qualified_type(
 	span: Span,
 ) -> Result[TypeRef, CheckError]:
 	aliased ?= aliased_module(scope.namespace, scope.module, qualified.module)
-	head ?= match offered_type(scope.namespace, aliased.target, qualified.name.id):
+	head: TypeHead ?= match offered_type(scope.namespace, aliased.target, qualified.name.id):
 		Ok(head): Ok(head)
 		Err(reason): Err(qualified_error(qualified.name.span, QualifiedNotOffered(qualified.module.id, qualified.name.id, aliased.path, reason)))
 	if arguments.is_empty():
@@ -656,11 +657,13 @@ private fixed record UnionInstanceVisit {
 
 
 private pure func same_instance_visit(left: UnionInstanceVisit, right: UnionInstanceVisit) -> Bool:
-	IntOps.equals(union_number(left.declaration), union_number(right.declaration)) and same_types(left.arguments, right.arguments)
+	match IntOps.equals(union_number(left.declaration), union_number(right.declaration)):
+		True: same_types(left.arguments, right.arguments)
+		False: False
 
 
 private pure func contains_instance_visit(visits: List[UnionInstanceVisit], visit: UnionInstanceVisit) -> Bool:
-	var found = False
+	var found: Bool = False
 
 	for known in visits:
 		if same_instance_visit(known, visit):
@@ -684,7 +687,7 @@ private pure func no_completed_instances(count: Int) -> List[List[List[TypeRef]]
 
 
 private pure func completed_instance(completed: List[List[List[TypeRef]]], instance: UnionInstanceVisit) -> Bool:
-	var found = False
+	var found: Bool = False
 
 	match completed.get(union_number(instance.declaration)):
 		Some(instances):
@@ -739,7 +742,9 @@ private pure func push_type_use(steps: List[TypeUse], depth: Int, step: TypeUse)
 private pure func contains_parameter(value_type: TypeRef) -> Bool:
 	match value_type:
 		PureCallableType(parameters, result):
-			parameters.any(contains_parameter) or contains_parameter(result)
+			match parameters.any(contains_parameter):
+				True: True
+				False: contains_parameter(result)
 		ParameterType(_):
 			True
 		ListType(element):
@@ -826,11 +831,11 @@ private pure func generic_roots(declarations: CheckedDeclarations) -> List[Gener
 	var roots: List[GenericCycleRoot] = []
 
 	for declaration in declarations.unions:
-		if not declaration.type_parameters.is_empty():
+		if declaration.type_parameters.is_empty().not():
 			roots = roots.append(GenericUnionRoot(declaration.id))
 
 	for declaration in declarations.records:
-		if not declaration.type_parameters.is_empty():
+		if declaration.type_parameters.is_empty().not():
 			roots = roots.append(GenericRecordRoot(declaration.id))
 
 	roots
@@ -843,12 +848,16 @@ private pure func reinstantiates_root(value_type: TypeRef, root: GenericCycleRoo
 		GenericUnionRoot(id):
 			match value_type:
 				AppliedUnionType(other, arguments):
-					IntOps.equals(union_number(other), union_number(id)) and arguments.any(contains_parameter)
+					match IntOps.equals(union_number(other), union_number(id)):
+						True: arguments.any(contains_parameter)
+						False: False
 				_: False
 		GenericRecordRoot(id):
 			match value_type:
 				AppliedRecordType(other, arguments):
-					IntOps.equals(record_number(other), record_number(id)) and arguments.any(contains_parameter)
+					match IntOps.equals(record_number(other), record_number(id)):
+						True: arguments.any(contains_parameter)
+						False: False
 				_: False
 
 
@@ -886,7 +895,7 @@ private pure func generic_reinstantiation_edge(
 				pending = push_type_use(pending, pending_count, field)
 				pending_count = IntOps.add(pending_count, 1)
 
-	while IntOps.greater_than(pending_count, 0) and not failure.is_some() and not closing.is_some():
+	while and(and(IntOps.greater_than(pending_count, 0), failure.is_some().not()), closing.is_some().not()):
 		pending_count = IntOps.subtract(pending_count, 1)
 
 		match pending.get(pending_count):
@@ -986,7 +995,7 @@ private pure func validate_generic_cycles(declarations: CheckedDeclarations) -> 
 -- a node has at most one child and its release can walk a chain. The second
 -- written self payload of one variant is the rejected edge.
 private pure func repeated_self_payload(owner: UnionId, fields: List[TypeUse]) -> Option[TypeUse]:
-	var seen = False
+	var seen: Bool = False
 	var repeated: Option[TypeUse] = None
 
 	for field in fields:
@@ -1042,7 +1051,7 @@ pure func validate_finite_declarations(
 
 	var next_root = 0
 
-	while (IntOps.less_than(next_root, roots.length()) or IntOps.greater_than(pending_count, 0)) and not failure.is_some():
+	while and((or(IntOps.less_than(next_root, roots.length()), IntOps.greater_than(pending_count, 0))), failure.is_some().not()):
 		if IntOps.equals(pending_count, 0):
 			match roots.get(next_root):
 				None:
@@ -1053,7 +1062,7 @@ pure func validate_finite_declarations(
 
 			next_root = IntOps.add(next_root, 1)
 
-		while IntOps.greater_than(pending_count, 0) and not failure.is_some():
+		while and(IntOps.greater_than(pending_count, 0), failure.is_some().not()):
 			pending_count = IntOps.subtract(pending_count, 1)
 
 			match pending.get(pending_count):
@@ -1100,7 +1109,7 @@ pure func validate_finite_declarations(
 								UnionType(id): IntOps.equals(union_number(id), union_number(owner))
 								_: False
 
-							if not admitted:
+							if admitted.not():
 								pending = push_declaration_visit(pending, pending_count, VisitDeclaredType(annotation))
 								pending_count = IntOps.add(pending_count, 1)
 						VisitDeclaredType(annotation):
@@ -1152,7 +1161,7 @@ private pure func validate_opaque_representation(
 	var depth = 1
 	var visited: List[TypeRef] = []
 	var failure: Option[CheckError] = None
-	while IntOps.greater_than(depth, 0) and failure.is_none():
+	while and(IntOps.greater_than(depth, 0), failure.is_none()):
 		depth = IntOps.subtract(depth, 1)
 		match pending.get(depth):
 			None: failure = Some(checker_invariant(root.underlying_type.span, InvalidDeclarationVisit))
@@ -1163,12 +1172,12 @@ private pure func validate_opaque_representation(
 				if reentry:
 					failure = Some(type_declaration_error(annotation.span, RecursiveOpaqueRepresentation(root.id)))
 				else:
-					var seen = False
+					var seen: Bool = False
 					for previous in visited:
 						if same_type(previous, annotation.value_type):
 							seen = True
 							break
-					if not seen:
+					if seen.not():
 						visited = visited.append(annotation.value_type)
 						children: Result[List[TypeUse], CheckError] = match annotation.value_type:
 							ListType(element): Ok([{ annotation | value_type = element }])

@@ -18,6 +18,11 @@ The library root contains two designated foundation modules:
 
 Library modules receive nothing implicitly. Each one imports what it uses,
 including base types, for example `_base: Int, Bool(True, False)` in `int.brp`.
+
+`bool.brp` defines pure, ordinary `not`, `and` and `or`; select them explicitly
+with `bool: not, and, or` for direct calls and UFCS. Both binary arguments are eager;
+use an explicit `match` to skip evaluation. The prelude leaves these names available
+for user helper declarations and selections of their own ordinary functions.
 They import only other library modules and `_base`, never user modules.
 
 For example, `42.add(1).to_string().length()` needs no imports. Direct calls
@@ -37,7 +42,8 @@ Neither branch prints. The native helper uses the target String ABI.
 `add`, `subtract`, `multiply`, `divide`, `remainder`, `equals` and `to_string` are
 active, lifted from trait implementations where needed. The Float adapter
 exposes concrete `add`, `subtract`, `multiply`, `divide`, `remainder` and
-`to_string` for Float64; `equals` remains pending.
+`to_string` for Float64, plus concrete `copysign`, `equals`, `less_than`,
+`is_nan`, `is_finite`, `abs` and `greater_than_or_equal`.
 `Int` and `Float` are declared once in `_base.brp`. Other
 declarations are enabled only as their features enter the supported subset.
 The original modules are maintained in [standard_library/src](../../standard_library/src/).
@@ -62,8 +68,8 @@ A nonpositive repeat count creates an empty List. Each repeated occurrence
 owns its own stored obligation; final root release destroys each initialized
 slot once.
 
-Generic `any`, `map` and `filter` accept pure named callbacks, including unchanged
-forwarded callback parameters. `map` permits distinct input/result types;
+Generic `any`, `map` and `filter` accept pure named functions, pure lambdas
+(including immutable data captures) and unchanged forwarded callback parameters. `map` permits distinct input/result types;
 `filter` keeps input order, and `any` skips later elements after its first True.
 These ordinary source helpers use balanced recursion: logarithmic C stack,
 with O(n log n) copied List slots for map/filter as a temporary bootstrap cost.
@@ -86,6 +92,32 @@ result owns its content independently of temporary inputs and surviving aliases.
 This temporary balanced implementation copies O(n + bytes * log(n + 1)) work
 and uses O(log(n + 1)) stack, pending a separately reviewed linear String builder.
 
+### List queries and copies
+
+The combined library also supplies these ordinary pure helpers:
+
+| Function | Contract |
+| --- | --- |
+| `get_or[T](values, index, default) -> T` | Return the indexed value or the eagerly evaluated default. |
+| `is_empty[T](values) -> Bool` | Test whether the length is zero. |
+| `last[T](values) -> Option[T]` | Return the last element, or None for an empty List. |
+| `take[T](values, count) -> List[T]` | Keep a prefix, clamping count to `0..length`. |
+| `drop[T](values, count) -> List[T]` | Remove a prefix with the same clamping. |
+| `remove[T](values, index) -> Option[List[T]]` | Remove exactly one valid element; invalid indexes return None. |
+| `reverse[T](values) -> List[T]` | Reverse element order. |
+| `find[T](values, predicate: pure (T) -> Bool) -> Option[T]` | Return the first match in input order and skip later elements. |
+| `all[T](values, predicate: pure (T) -> Bool) -> Bool` | Stop at the first False; empty input returns True. |
+| `sort_by[T](values, key: pure (T) -> Int) -> List[T]` | Stable ascending Int-key order; equal keys retain input order. |
+
+Inputs are borrowed; returned managed values retain independent ownership and
+older aliases remain valid. Predicate/key callbacks may capture immutable data.
+The sort key may run more than once per element; generic `K: Orderable` remains
+future work. Take/drop/remove/reverse temporarily copy O(n log n) List slots
+with O(log(n + 1)) stack. Find/all visit at most n elements in input order,
+with logarithmic stack and short-circuiting. Sort uses a temporary merge
+implementation. No COW or constant-stack claim follows from availability.
+Integrated correctness, self-compilation and resource acceptance remain separate.
+
 ### List membership
 
 `contains_with[A](values: List[A], needle: A, equals: pure (A, A) -> Bool) -> Bool`
@@ -96,7 +128,7 @@ The Int-only adapter is temporary: replace it with general `contains[T: Equatabl
 when the target supports equality traits. The supplied-equality API stays generic.
 Indexed `get` and ordinary recursion do O(n) work, with linear C stack at O0 and
 ordinary temporary ARC costs. No bounded-stack or zero-allocation claim is made.
-Lambda captures, equality traits and source-loop work remain separate.
+Equality traits and optimization of these temporary helpers remain separate.
 
 The List update names match the unchanged host library because the same compiler source
 must build against both libraries. The internal `list.set` builtin implements the
@@ -107,9 +139,8 @@ The base module provides the ordinary generic Result union with Ok/Err for
 pure calculator parsing and evaluation; it has no compiler-specific behavior.
 
 Bool, Option and Result are ordinary fixed unions owned by `_base.brp`; user
-modules receive their types and constructors through the prelude. A separate
-Bool operation module remains deferred. Option and Result operations use explicit
-named imports. `option.brp` provides
+modules receive their types and constructors through the prelude. Bool, Option
+and Result operations use explicit named imports. `option.brp` provides
 `is_some`, `is_none`, eager `get_or`, eager `to_result` and `map`; `result.brp`
 provides `is_ok`, `map`, `map_err` and `and_then`. These are ordinary generic pure
 functions over the existing base unions. The prelude supplies no operations
@@ -124,13 +155,16 @@ pure func map_err[T, E, F](self: Result[T, E], callback: pure (E) -> F) -> Resul
 pure func and_then[T, U, E](self: Result[T, E], callback: pure (T) -> Result[U, E]) -> Result[U, E]
 ```
 
-Pass a pure named function or forward a callable parameter. Option.map invokes
+Pass a pure named function, a pure lambda with immutable data captures, or
+forward a callable parameter. Option.map invokes
 it once for Some; Result.map and and_then once for Ok; map_err once for Err.
 The other branch preserves its variant and payload without invoking the callback.
 Data arguments evaluate eagerly. Inputs are borrowed and returned managed values
 remain independently owned, including bypass payloads. Void payloads are supported.
-Lambdas/captures and explicit compiler-source operation imports remain separate
-work in the [catalog and addition plan](../OPTION_RESULT_PLAN.md).
+Lambdas/captures and explicit compiler-source operation imports are implemented
+in the combined compiler. The [catalog and addition plan](../OPTION_RESULT_PLAN.md)
+retains the historical inventory; integrated self-compilation and resource
+acceptance remain separate.
 
 The String adapter
 exposes strict counted-byte `parse_int`, `parse_float` and `equals` operations.
@@ -139,8 +173,12 @@ foundation's designated Bool and Option, found by name in `_base.brp`, and
 layout follows the unions' declaration order. Each adapter records its upstream
 provenance. Traits and FFI remain inactive.
 
-`string.starts_with` is an ordinary pure counted-byte prefix helper; see the
-[contract and temporary stack bound](../README.md#counted-string-operations).
+`string.starts_with` is an ordinary pure counted-byte prefix helper.
+`string.slice(String, Int, Int) -> Option[String]` uses half-open UTF-8 byte
+offsets: invalid bounds or an endpoint inside a scalar return None. A valid
+empty or full slice returns Some with an independently owned String, preserving
+NUL bytes and source aliases. See the
+[String contracts](../README.md#counted-string-operations).
 
 The current [calculator](../README.md#calculator-input-and-results) and
 [Float contracts](../README.md#float64-calculator) define deliberate conversion and arithmetic
@@ -163,7 +201,8 @@ cannot be imported explicitly.
 
 The system adapter also publishes impure `read_file(String) -> Result[String, String]`.
 Its counted UTF-8 contract and target-only encoding help are documented in
-[File reading](../README.md#file-reading); source loader migration remains pending.
+[File reading](../README.md#file-reading). The integrated source loader uses
+this target interface; whole-compiler self-compilation remains unproved.
 
 `io.print_error(String) -> Void` concretely adapts the host Stringable API.
 It borrows its input, writes counted bytes to stderr once, and attempts LF only
@@ -174,5 +213,26 @@ The system adapter publishes impure `write_file(String, String) -> Result[Void, 
 Ok carries Void; Err owns a fresh String. See [File writing](../README.md#file-writing)
 for counted bytes, one-close error priority and target NUL-path teaching text.
 
-`path: join` imports pure String joining: an absolute child replaces the base; an empty base returns the child.
-Otherwise retain/add `/` without normalization; see the [join contract](../ROADMAP.md#seven-shell-and-path-functions).
+### Logical paths
+
+`path` supplies pure String functions `join`, `dirname` and `normalize`.
+Only ASCII `/` separates components; these functions do no filesystem access,
+symlink resolution, Unicode normalization or case folding.
+
+`join(base, child)` returns an absolute child unchanged, or the child when the
+base is empty. Otherwise it retains or adds `/`, including for an empty child,
+without normalizing either input.
+
+`dirname(path)` ignores trailing separators, removes the last component and its
+separator run, and preserves interior spelling. Root remains `/`; an empty path
+or a basename without a parent yields `.`.
+
+`normalize(path)` removes empty and `.` components and resolves `..` against a
+preceding ordinary component. Leading relative parents survive; absolute paths
+cannot move above root. Empty relative output becomes `.`, root becomes `/`, and
+trailing separators disappear. Other component bytes, including UTF-8 and NUL,
+are preserved. OS operations independently reject NUL paths.
+
+The byte scan/materialization is linear, but temporary List append/take and
+balanced String joining still copy data; no linear total-cost or COW claim is
+made. See the [shell/path boundary](../ROADMAP.md#seven-shell-and-path-functions).

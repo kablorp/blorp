@@ -1,32 +1,16 @@
 import:
-	../../../src/lower/lower:
-		LoweredStep(Define, Join),
-		LoweredExit(ReturnValue, RecurValues),
-		LoweredFunction,
-		LoweredTail(ExitValue, MatchValue),
-		MatchLabel(DefaultLabel),
-		ValueOperation(ParameterValue, StringValue, VoidValue),
-		value_number,
-	../../../src/own/own:
-		OwnedExit(RecurArguments),
-		OwnedTail(ReturnTail),
-		OwnershipOperation(DefineValue),
-		ResultOwnership(UnmanagedResult),
-		exit_last_uses,
-		insert_function,
-	../../../src/namespace/builtins as Builtins: RuntimeOperation(IntToString)
-	../../../src/specialize/specialize: TypeRef(IntType, StringType, UnionType, VoidType)
+	../../../src/check/model: decision_node_id, match_arm_id
+	../../../src/lower/lower as Lower
+	../../../src/own/own as Own
+	../../../src/specialize/specialize as Concrete
+	../../../src/namespace/builtins as Builtins
+	../../../src/utils/names: program_names
+	../../../src/utils/source: module_source, root_module_id
+	../../../src/lex/lex: lex
 	../../../src/utils/syntax: Diagnostic, FunctionExecution(SelfTailLoop), same_span
-	../ownership_inputs: InputIds, input_ids, integer, parameter, runtime, span
+	../input: check, parse, setup_diagnostic
+	../ownership_inputs: InputIds, input_ids, integer, parameter, span
 	test: TestSuite
-
-
-private pure func unmanaged(result: ResultOwnership) -> Bool:
-	match result:
-		UnmanagedResult:
-			True
-		_:
-			False
 
 
 private pure func uses_equal(
@@ -34,151 +18,127 @@ private pure func uses_equal(
 	expected: List[Option[Int]],
 ) -> Bool:
 	match result:
-		Ok(uses):
-			uses == expected
-		Err(_):
-			False
+		Ok(uses): uses == expected
+		Err(_): False
 
 
-private pure func loop(ids: InputIds) -> LoweredFunction:
+private pure func loop(ids: InputIds) -> Lower.LoweredFunction:
 	{
-		execution = SelfTailLoop(span(90)),
-		signature = {
-			parameters = [IntType, IntType],
-			return_type = IntType
-		},
+		signature = { parameters = [Concrete.IntType, Concrete.IntType], return_type = Concrete.IntType },
 		steps = [
-			parameter(ids.first, IntType),
-			{ parameter(ids.second, IntType) | operation = ParameterValue(1) },
-		].map(pure func(definition): Define(definition)),
-		tail = ExitValue(
-			RecurValues(
-				[ids.second, ids.first],
-				span(80),
-			),
-		)
+			Lower.Define(parameter(ids.first, Concrete.IntType)),
+			Lower.Define({ parameter(ids.second, Concrete.IntType) | operation = Lower.ParameterValue(1) }),
+			Lower.Loop({
+				headers = [
+					{ parameter = { id = ids.fourth, value_type = Concrete.IntType, span = span(10) }, initial = ids.first },
+					{ parameter = { id = ids.fifth, value_type = Concrete.IntType, span = span(20) }, initial = ids.second },
+				],
+				result = { id = ids.third, value_type = Concrete.IntType, span = span(90) },
+				carried = [],
+				reads = [ids.first, ids.second],
+				body = { steps = [], tail = Lower.ExitLoop(Lower.Recur([ids.fifth, ids.fourth], span(80))) },
+			}),
+		],
+		result = ids.third,
 	}
 
 
 pure func test_permuted_arguments_remain_unmanaged() -> Bool:
 	match input_ids():
-		Err(_):
-			False
+		Err(_): False
 		Ok(ids):
-			match insert_function(loop(ids), ids.unions, []):
-				Err(_):
-					False
+			match Own.insert_function(loop(ids), ids.unions, []):
+				Err(_): False
 				Ok(owned):
-					match owned.operations:
-						[DefineValue(first), DefineValue(second)]:
-							match owned.tail:
-								ReturnTail(RecurArguments([left, right], occurrence)):
+					match (owned.operations, owned.result):
+						([Own.DefineValue(first), Own.DefineValue(second), Own.ExecuteLoop(loop)], Own.UnmanagedReturn(result)):
+							match (first.result, second.result, loop.body.operations, loop.body.tail):
+								(Own.UnmanagedResult, Own.UnmanagedResult, [], Own.ExitLoop(Own.Recur([Own.UnmanagedReturn(left), Own.UnmanagedReturn(right)], occurrence))):
 									(
-										unmanaged(first.result)
-										and unmanaged(second.result)
-										and value_number(left) == 1
-										and value_number(right) == 0
+										Lower.value_number(left) == 4
+										and Lower.value_number(right) == 3
+										and Lower.value_number(result) == 2
 										and same_span(occurrence, span(80))
 									)
-								_:
-									False
-						_:
-							False
+								_: False
+						_: False
 
 
 pure func test_duplicate_operands_have_terminal_use() -> Bool:
 	match input_ids():
-		Err(_):
-			False
+		Err(_): False
 		Ok(ids):
-			steps = loop(ids).steps.append(Define(integer(ids.third, 7, 30)))
 			uses_equal(
-				exit_last_uses(
-					steps,
-					RecurValues(
-						[ids.first, ids.first],
-						span(80),
-					),
-					0,
-					0,
-				),
+				Own.exit_last_uses([Lower.Define(integer(ids.first, 1, 10)), Lower.Define(integer(ids.second, 2, 20)), Lower.Define(integer(ids.third, 7, 30))], Lower.Recur([ids.first, ids.first], span(80)), 0, 0),
 				[Some(3), None, None],
 			)
 
 
 pure func test_permutation_operands_have_terminal_uses() -> Bool:
 	match input_ids():
-		Err(_):
-			False
+		Err(_): False
 		Ok(ids):
-			steps = loop(ids).steps.append(Define(integer(ids.third, 7, 30)))
 			uses_equal(
-				exit_last_uses(
-					steps,
-					RecurValues(
-						[ids.second, ids.first],
-						span(80),
-					),
-					0,
-					0,
-				),
+				Own.exit_last_uses([Lower.Define(integer(ids.first, 1, 10)), Lower.Define(integer(ids.second, 2, 20)), Lower.Define(integer(ids.third, 7, 30))], Lower.Recur([ids.second, ids.first], span(80)), 0, 0),
 				[Some(3), Some(3), None],
 			)
 
 
 pure func test_arm_capture_has_terminal_use() -> Bool:
 	match input_ids():
-		Err(_):
-			False
+		Err(_): False
 		Ok(ids):
 			uses_equal(
-				exit_last_uses(
-					[integer(ids.third, 7, 30)].map(pure func(definition): Define(definition)),
-					RecurValues(
-						[ids.first, ids.third],
-						span(80),
-					),
-					2,
-					2,
-				),
+				Own.exit_last_uses([Lower.Define(integer(ids.third, 7, 30))], Lower.Recur([ids.first, ids.third], span(80)), 2, 2),
 				[Some(1)],
 			)
 
 
 pure func test_zero_argument_backedge_has_no_result() -> Bool:
-	function: LoweredFunction = {
+	match input_ids():
+		Err(_): False
+		Ok(ids):
+			function: Lower.LoweredFunction = {
+				signature = { parameters = [], return_type = Concrete.IntType },
+				steps = [Lower.Loop({
+					headers = [],
+					result = { id = ids.first, value_type = Concrete.IntType, span = span(90) },
+					carried = [], reads = [],
+					body = { steps = [], tail = Lower.ExitLoop(Lower.Recur([], span(80))) },
+				})],
+				result = ids.first,
+			}
+			match Own.insert_function(function, [], []):
+				Err(_): False
+				Ok(owned):
+					match owned.operations:
+						[Own.ExecuteLoop(loop)]:
+							match loop.body.tail:
+								Own.ExitLoop(Own.Recur([], occurrence)):
+									loop.body.operations.is_empty() and same_span(occurrence, span(80)) and uses_equal(Own.exit_last_uses([], Lower.Recur([], span(80)), 0, 0), [])
+								_: False
+						_: False
+
+
+-- These facts belong to Specialize's sole source-eligibility boundary. They
+-- establish eligibility only; Check still owns whether source recursion is valid.
+private pure func scalar_function() -> Concrete.ConcreteFunction:
+	{
 		execution = SelfTailLoop(span(90)),
-		signature = {
-			parameters = [],
-			return_type = IntType
-		},
-		steps = [],
-		tail = ExitValue(RecurValues([], span(80)))
+		signature = { parameters = [Concrete.IntType, Concrete.IntType], return_type = Concrete.IntType },
+		bindings = [], statements = [],
+		body = Concrete.ConcreteValueBody(Concrete.RecurWith([], span(80))),
 	}
 
-	match insert_function(function, [], []):
-		Err(_):
-			False
-		Ok(owned):
-			match owned.tail:
-				ReturnTail(RecurArguments([], occurrence)):
-					owned.operations.length() == 0 and same_span(occurrence, span(80)) and uses_equal(
-						exit_last_uses(
-							[],
-							RecurValues([], span(80)),
-							0,
-							0,
-						),
-						[],
-					)
-				_:
-					False
 
-
-private pure func rejects_managed(function: LoweredFunction, ids: InputIds, start: Int) -> Bool:
-	match insert_function(function, ids.unions, []):
-		Ok(_):
-			False
+private pure func rejects_managed(
+	function: Concrete.ConcreteFunction,
+	unions: List[Concrete.ConcreteUnion],
+	records: List[Concrete.ConcreteRecord],
+	start: Int,
+) -> Bool:
+	match Concrete.admit_scalar_loop(function, unions, records):
+		Ok(_): False
 		Err(error):
 			(
 				same_span(error.span, span(start))
@@ -190,130 +150,89 @@ private pure func rejects_managed(function: LoweredFunction, ids: InputIds, star
 
 pure func test_managed_signature_rejects_at_annotation() -> Bool:
 	match input_ids():
-		Err(_):
-			False
+		Err(_): False
 		Ok(ids):
-			original = loop(ids)
-			rejects_managed(
-				{ original |
-					signature = { original.signature | parameters = [StringType, IntType] }
-				},
-				ids,
-				90,
-			)
+			original = scalar_function()
+			rejects_managed({ original | signature = { original.signature | parameters = [Concrete.StringType, Concrete.IntType] } }, ids.unions, [], 90)
 
 
 pure func test_managed_result_rejects_at_annotation() -> Bool:
 	match input_ids():
-		Err(_):
-			False
+		Err(_): False
 		Ok(ids):
-			original = loop(ids)
-			rejects_managed(
-				{ original | signature = { original.signature | return_type = StringType } },
-				ids,
-				90,
-			)
+			original = scalar_function()
+			rejects_managed({ original | signature = { original.signature | return_type = Concrete.StringType } }, ids.unions, [], 90)
+
+
+private pure func managed_initializer() -> Concrete.ConcreteExpr:
+	{
+		form = Concrete.InvokeFunction({ target = Concrete.RuntimeFunction(Builtins.IntToString), span = span(30) }, [{ form = Concrete.LiteralInteger(7), value_type = Concrete.IntType, span = span(29) }]),
+		value_type = Concrete.StringType,
+		span = span(30),
+	}
 
 
 pure func test_unused_managed_initializer_rejects_at_definition() -> Bool:
 	match input_ids():
-		Err(_):
-			False
+		Err(_): False
 		Ok(ids):
-			original = loop(ids)
-			rejects_managed(
-				{ original |
-					steps = original.steps.append(
-						Define(runtime(
-							ids.third,
-							Builtins.IntToString,
-							[ids.first],
-							StringType,
-							30,
-						)),
-					)
-				},
-				ids,
-				30,
-			)
+			rejects_managed({ scalar_function() | statements = [Concrete.DiscardExpression(managed_initializer())] }, ids.unions, [], 30)
 
 
 pure func test_managed_arm_initializer_rejects_at_definition() -> Bool:
 	match input_ids():
-		Err(_):
-			False
+		Err(_): False
 		Ok(ids):
-			original = loop(ids)
-			union_type = UnionType(ids.union_id)
-			rejects_managed(
-				{ original |
-					signature = { original.signature | parameters = [union_type, IntType] },
-					steps = [
-						parameter(ids.first, union_type),
-						{ parameter(ids.second, IntType) | operation = ParameterValue(1) },
-					].map(pure func(definition): Define(definition)),
-					tail = MatchValue({
-						scrutinee = ids.first,
-						owner = ids.union_id,
-						arms = [
-							{
-								label = DefaultLabel,
-								body = {
-									steps = [
-										runtime(
-											ids.third,
-											Builtins.IntToString,
-											[ids.second],
-											StringType,
-											30,
-										),
-									].map(pure func(definition): Define(definition)),
-									exit = RecurValues(
-										[ids.first, ids.second],
-										span(80),
-									)
-								}
-							},
-						],
-					})
-				},
-				ids,
-				30,
-			)
+			rejects_managed({ scalar_function() | body = Concrete.ConcreteMatchBody({
+				scrutinee = { form = Concrete.ConstructVariant(ids.second_variant, []), value_type = Concrete.UnionType(ids.union_id), span = span(20) },
+				selection = { nodes = [Concrete.EnterArm(match_arm_id(0), [])], entry = decision_node_id(0) },
+				arms = [{ id = match_arm_id(0), inputs = [], statements = [Concrete.DiscardExpression(managed_initializer())], body = Concrete.RecurWith([], span(80)) }],
+			}) }, ids.unions, [], 30)
+
+
+private pure func carrier_seed() -> Result[Concrete.SpecializedProgram, Diagnostic]:
+	source: String =
+		|fixed union Flag:
+		|    Off
+		|    On
+		|pure func choose(flag: Flag) -> Int:
+		|    var current = 0
+		|    match flag:
+		|        Off: current = 7
+		|        On: void
+		|    current
+		|func main() -> Int:
+		|    choose(Off)
+		|
+	tokens ?= lex(module_source(root_module_id()), source, program_names().names)
+	parsed ?= parse(tokens)
+	checked ?= check(parsed).map_err(setup_diagnostic)
+	Concrete.specialize(checked)
 
 
 pure func test_managed_join_carrier_rejects_at_its_own_origin_before_the_arm() -> Bool:
-	match input_ids():
+	match carrier_seed():
 		Err(_): False
-		Ok(ids):
-			original = loop(ids)
-			union_type = UnionType(ids.union_id)
-			function = { original |
-				signature = { original.signature | parameters = [union_type, IntType] },
-				steps = [
-					Define(parameter(ids.first, union_type)),
-					Define({ parameter(ids.second, IntType) | operation = ParameterValue(1) }),
-					Join({
-						result = { id = ids.third, value_type = VoidType, span = span(30) },
-						carried = [{ id = ids.fourth, value_type = StringType, span = span(31) }],
-						scrutinee = ids.first,
-						owner = ids.union_id,
-						arms = [{
-							label = DefaultLabel,
-							steps = [
-								Define({ id = ids.fifth, value_type = StringType, operation = StringValue("arm"), span = span(40) }),
-								Define({ id = ids.sixth, value_type = VoidType, operation = VoidValue, span = span(41) }),
-							],
-							value = ids.sixth,
-							carried = [ids.fifth],
-						}],
-						reads = [ids.first],
-					}),
-				],
-				tail = ExitValue(RecurValues([ids.first, ids.second], span(80))),
-			}
-			rejects_managed(function, ids, 31)
+		Ok(program):
+			contents = Concrete.specialized_contents(program)
+			match contents.functions:
+				[_, function]:
+					match (function.bindings, function.statements):
+						([parameter, carrier], [initialized, Concrete.DiscardExpression(value)]):
+							match value.form:
+								Concrete.Match(join):
+									match join.arms:
+										[first, second]:
+											changed = { first | statements = [Concrete.DiscardExpression({ form = Concrete.LiteralString("arm"), value_type = Concrete.StringType, span = span(40) })] }
+											rejects_managed({ function |
+												execution = SelfTailLoop(span(90)),
+												bindings = [parameter, { carrier | value_type = Concrete.StringType, span = span(31) }],
+												statements = [initialized, Concrete.DiscardExpression({ value | form = Concrete.Match({ join | arms = [changed, second] }) })],
+											}, contents.unions, contents.records, 31)
+										_: False
+								_: False
+						_: False
+				_: False
 
 
 tests: TestSuite = {

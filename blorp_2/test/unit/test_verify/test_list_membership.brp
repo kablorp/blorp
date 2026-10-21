@@ -1,4 +1,6 @@
 import:
+	../../../src/check/model as Model
+	./selection_inputs as Selection
 	../../../src/namespace/builtins as Builtins
 	../../../src/lower/lower as Lower
 	../../../src/own/own as Own
@@ -13,6 +15,7 @@ import:
 	../module_input: PRIMITIVE_BASE, parse_modules_with_base
 	option: to_result
 	../ownership_inputs: defined_value_at, span
+	../managed_union_inputs: lowered_tail_join
 	test: TestSuite
 
 
@@ -50,8 +53,8 @@ private pure func membership_ids() -> Result[MembershipIds, Diagnostic]:
 		|    On
 		|pure func consume(value: Flag) -> Int:
 		|    match value:
-		|        Off: 0
 		|        On: 0
+		|        Off: 0
 		|pure func make() -> Item:
 		|    { value = 0 }
 		|func main() -> Int:
@@ -79,29 +82,19 @@ private pure func membership_ids() -> Result[MembershipIds, Diagnostic]:
 				_: Err(seed_error("consume is not a user function call"))
 		_: Err(seed_error("second value is not a call"))
 	consume ?= program.functions.get(Concrete.function_number(consume_id)).to_result(seed_error("consume row is missing"))
-	matched ?= match consume.tail:
-		Lower.MatchValue(matched): Ok(matched)
-		_: Err(seed_error("consume has no match tail"))
+	matched ?= lowered_tail_join(consume).to_result(seed_error("consume has no value join"))
 	match first.value_type:
 		Concrete.UnionType(union_id):
 			match third.value_type:
 				Concrete.RecordType(record_id):
-					match matched.arms:
-						[first_arm, second_arm]:
-							match first_arm.label:
-								Lower.VariantLabel(first_variant):
-									match second_arm.label:
-										Lower.VariantLabel(second_variant):
-											Ok({
-												first = first.id, second = second.id, third = third.id,
-												fourth = fourth.id, fifth = fifth.id,
-												entrypoint = entrypoint, record_id = record_id, union_id = union_id,
-												first_variant = first_variant, second_variant = second_variant,
-												records = program.records, unions = program.unions
-											})
-										_: Err(seed_error("consume arms do not carry variant identities"))
-								_: Err(seed_error("consume arms do not carry variant identities"))
-						_: Err(seed_error("union/record values or two match arms are missing"))
+					match (first.operation, matched.selection.nodes.last()):
+						(Lower.ConstructValue(first_variant, []), Some(Lower.TestVariant(_, second_variant, _, _))):
+							Ok({ first = first.id, second = second.id, third = third.id,
+								fourth = fourth.id, fifth = fifth.id, entrypoint = entrypoint,
+								record_id = record_id, union_id = union_id,
+								first_variant = first_variant, second_variant = second_variant,
+								records = program.records, unions = program.unions })
+						_: Err(seed_error("union constructor or structural test is missing"))
 				_: Err(seed_error("union/record values or two match arms are missing"))
 		_: Err(seed_error("union/record values or two match arms are missing"))
 
@@ -116,10 +109,9 @@ private pure func integer(id: Lower.ValueId, at: Int) -> Own.OwnershipOperation:
 
 private pure func integer_function(id: Lower.ValueId) -> Own.OwnedFunction:
 	{
-		execution = OrdinaryCalls,
 		signature = { parameters = [], return_type = Concrete.IntType },
 		operations = [integer(id, 0)],
-		tail = Own.ReturnTail(Own.ReturnResult(Own.UnmanagedReturn(id)))
+		result = Own.UnmanagedReturn(id)
 	}
 
 
@@ -133,10 +125,9 @@ private pure func list_parameter(ids: MembershipIds, element: Concrete.TypeRef) 
 
 private pure func parameter_function(ids: MembershipIds, element: Concrete.TypeRef) -> Own.OwnedFunction:
 	{
-		execution = OrdinaryCalls,
 		signature = { parameters = [Concrete.ListType(element)], return_type = Concrete.IntType },
 		operations = [list_parameter(ids, element), integer(ids.second, 40)],
-		tail = Own.ReturnTail(Own.ReturnResult(Own.UnmanagedReturn(ids.second)))
+		result = Own.UnmanagedReturn(ids.second)
 	}
 
 
@@ -332,20 +323,24 @@ pure func test_match_arm_definition_requires_record_membership() -> Bool:
 		Err(_): False
 		Ok(ids):
 			tested: Own.OwnedFunction = {
-				execution = OrdinaryCalls,
 				signature = { parameters = [], return_type = Concrete.IntType },
-				operations = [Own.DefineValue({
-					id = ids.first, value_type = Concrete.UnionType(ids.union_id),
-					operation = Own.ConstructDefinition(ids.first_variant, []), result = Own.UnmanagedResult, span = span(10)
-				})],
-				tail = Own.MatchTail({
-					scrutinee = Own.UnmanagedArgument(ids.first), owner = ids.union_id,
-					arms = [{
-						label = Lower.DefaultLabel,
-						operations = [malformed_local(ids.second, Concrete.RecordType(ids.record_id)), integer(ids.third, 40)],
-						exit = Own.ReturnResult(Own.UnmanagedReturn(ids.third))
-					}]
-				})
+				operations = [
+					Own.DefineValue({
+						id = ids.first, value_type = Concrete.UnionType(ids.union_id),
+						operation = Own.ConstructDefinition(ids.first_variant, []), result = Own.UnmanagedResult, span = span(10)
+					}),
+					Own.ExecuteJoin({
+						result = Own.UnmanagedJoinParameter({ id = ids.second, value_type = Concrete.IntType, span = span(20) }),
+						carried = [],
+						selection = Selection.direct(Own.UnmanagedArgument(ids.first)),
+						arms = [{
+							id = Model.match_arm_id(0), inputs = [],
+							operations = [malformed_local(ids.third, Concrete.RecordType(ids.record_id)), integer(ids.fourth, 40)],
+							exit = Own.Yield({ transfer = Own.UnmanagedReturn(ids.fourth), carried = [] })
+							}]
+					})
+				],
+				result = Own.UnmanagedReturn(ids.second)
 			}
 			rejects(program(ids, tested, [], ids.unions), "internal compiler error: invalid record identity in ownership representation", span(17))
 
@@ -358,7 +353,7 @@ private pure func length_function(ids: MembershipIds, element: Concrete.TypeRef)
 			operation = Own.CallDefinition(Concrete.RuntimeFunction(Builtins.ListLength(element)), [Own.BorrowedArgument({ value = ids.first, source = Own.ParameterBorrow(ids.first) })]),
 			result = Own.UnmanagedResult, span = span(30)
 		}), integer(ids.third, 40)],
-		tail = Own.ReturnTail(Own.ReturnResult(Own.UnmanagedReturn(ids.third)))
+		result = Own.UnmanagedReturn(ids.third)
 	}
 
 
@@ -382,14 +377,13 @@ pure func test_valid_length_contract_remains_valid() -> Bool:
 
 private pure func repeat_function(ids: MembershipIds, element: Concrete.TypeRef) -> Own.OwnedFunction:
 	{
-		execution = OrdinaryCalls,
 		signature = { parameters = [], return_type = Concrete.IntType },
 		operations = [integer(ids.first, 0), integer(ids.second, 1), Own.DefineValue({
 			id = ids.third, value_type = Concrete.ListType(Concrete.IntType),
 			operation = Own.CallDefinition(Concrete.RuntimeFunction(Builtins.ListRepeat(element)), [Own.UnmanagedArgument(ids.first), Own.UnmanagedArgument(ids.second)]),
 			result = Own.OwnedResult(Own.owner_id(0)), span = span(30)
 		}), Own.DropOwner(Own.owner_id(0), span(31)), integer(ids.fourth, 40)],
-		tail = Own.ReturnTail(Own.ReturnResult(Own.UnmanagedReturn(ids.fourth)))
+		result = Own.UnmanagedReturn(ids.fourth)
 	}
 
 
@@ -419,7 +413,7 @@ private pure func update_function(
 			operation = Own.CallDefinition(Concrete.RuntimeFunction(operation), arguments),
 			result = Own.OwnedResult(Own.owner_id(0)), span = span(30)
 		}), Own.DropOwner(Own.owner_id(0), span(31)), integer(ids.fourth, 40)],
-		tail = Own.ReturnTail(Own.ReturnResult(Own.UnmanagedReturn(ids.fourth)))
+		result = Own.UnmanagedReturn(ids.fourth)
 	}
 
 
@@ -494,14 +488,13 @@ pure func test_valid_concat_contract_keeps_single_drop() -> Bool:
 -- A literal of two Int values typed as List[element]; the owned root is dropped once.
 private pure func literal_function(ids: MembershipIds, element: Concrete.TypeRef, payloads: List[Own.StoredPayload]) -> Own.OwnedFunction:
 	{
-		execution = OrdinaryCalls,
 		signature = { parameters = [], return_type = Concrete.IntType },
 		operations = [integer(ids.first, 0), integer(ids.second, 1), Own.DefineValue({
 			id = ids.third, value_type = Concrete.ListType(element),
 			operation = Own.ConstructListDefinition(payloads),
 			result = Own.OwnedResult(Own.owner_id(0)), span = span(30)
 		}), Own.DropOwner(Own.owner_id(0), span(31)), integer(ids.fourth, 40)],
-		tail = Own.ReturnTail(Own.ReturnResult(Own.UnmanagedReturn(ids.fourth)))
+		result = Own.UnmanagedReturn(ids.fourth)
 	}
 
 
@@ -562,7 +555,7 @@ private pure func get_function(ids: MembershipIds, element: Concrete.TypeRef, op
 			),
 			result = Own.UnmanagedResult, span = span(30)
 		}), integer(ids.fourth, 40)],
-		tail = Own.ReturnTail(Own.ReturnResult(Own.UnmanagedReturn(ids.fourth)))
+		result = Own.UnmanagedReturn(ids.fourth)
 	}
 
 

@@ -17,7 +17,7 @@ import:
 	../../../src/verify/verify: verify
 	../input: setup_diagnostic
 	list: set_index
-	../module_input: parse_modules
+	../module_input: FOUNDATION_TYPES, TEST_BASE, parse_modules, parse_modules_with_base
 	../ownership_inputs: InputIds, input_ids, span
 	test: TestSuite
 
@@ -91,8 +91,8 @@ pure func test_comparison_borrows_both_inputs_without_acquisition() -> Bool:
 					match Own.insert_function(function, contents.unions, []):
 						Err(_): False
 						Ok(function):
-							match (function.operations, function.tail):
-								([Own.DefineValue(left), Own.DefineValue(right), Own.DefineValue(result)], Own.ReturnTail(Own.ReturnResult(Own.UnmanagedReturn(returned)))):
+							match (function.operations, function.result):
+								([Own.DefineValue(left), Own.DefineValue(right), Own.DefineValue(result)], Own.UnmanagedReturn(returned)):
 									match (left.result, right.result, result.operation, result.result):
 										(Own.BorrowedResult(Own.ParameterBorrow(left_source)), Own.BorrowedResult(Own.ParameterBorrow(right_source)), Own.CallDefinition(_, [Own.BorrowedArgument(left_argument), Own.BorrowedArgument(right_argument)]), Own.UnmanagedResult):
 											match (left_argument.source, right_argument.source):
@@ -197,14 +197,12 @@ private pure func definition(id: Lower.ValueId, value_type: Concrete.TypeRef, op
 private pure func raw(seed: Seed, boolean: Builtins.DesignatedBoolean[Concrete.VariantInstanceId]) -> Own.OwnershipProgram:
 	ids = seed.ids
 	entry: Own.OwnedFunction = {
-		execution = OrdinaryCalls,
 		signature = { parameters = [], return_type = Concrete.IntType },
 		operations = [definition(ids.first, Concrete.IntType, Own.IntegerDefinition(0), Own.UnmanagedResult, 1)],
-		tail = Own.ReturnTail(Own.ReturnResult(Own.UnmanagedReturn(ids.first)))
+		result = Own.UnmanagedReturn(ids.first)
 	}
 	call: Concrete.CallTarget = Concrete.RuntimeFunction(Builtins.StringEquals(boolean))
 	comparison: Own.OwnedFunction = {
-		execution = OrdinaryCalls,
 		signature = { parameters = [Concrete.StringType, Concrete.StringType], return_type = Concrete.IntType },
 		operations = [
 			definition(ids.first, Concrete.StringType, Own.ParameterDefinition(0), Own.BorrowedResult(Own.ParameterBorrow(ids.first)), 10),
@@ -212,7 +210,7 @@ private pure func raw(seed: Seed, boolean: Builtins.DesignatedBoolean[Concrete.V
 			definition(ids.third, Concrete.UnionType(Concrete.variant_owner(boolean.true_variant)), Own.CallDefinition(call, [Own.BorrowedArgument({ value = ids.first, source = Own.ParameterBorrow(ids.first) }), Own.BorrowedArgument({ value = ids.second, source = Own.ParameterBorrow(ids.second) })]), Own.UnmanagedResult, 30),
 			definition(ids.fourth, Concrete.IntType, Own.IntegerDefinition(0), Own.UnmanagedResult, 50),
 		],
-		tail = Own.ReturnTail(Own.ReturnResult(Own.UnmanagedReturn(ids.fourth)))
+		result = Own.UnmanagedReturn(ids.fourth)
 	}
 	{ records = [], unions = seed.unions, functions = [entry, comparison], entrypoint = NoArguments(ids.entrypoint, IntegerExitStatus) }
 
@@ -282,9 +280,294 @@ pure func test_verifier_rejects_duplicate_comparison_constructor() -> Bool:
 		Err(_): False
 
 
+-- Ordinary constructor expressions provide independent issued identities;
+-- neither observer assumes the foundation's variant order.
+private FLOAT_PREDICATES: String =
+	|pure func equal(first: Float, second: Float) -> Bool:
+	|    builtin("float.equals")
+	|pure func less(first: Float, second: Float) -> Bool:
+	|    builtin("float.less_than")
+	|pure func nan(value: Float) -> Bool:
+	|    builtin("float.is_nan")
+	|pure func finite(value: Float) -> Bool:
+	|    builtin("float.is_finite")
+	|pure func truth() -> Bool:
+	|    True
+	|pure func falsehood() -> Bool:
+	|    False
+	|func main() -> Int:
+	|    equal_result = equal(1.0, 2.0)
+	|    less_result = less(1.0, 2.0)
+	|    nan_result = nan(1.0)
+	|    finite_result = finite(1.0)
+	|    true_result = truth()
+	|    false_result = falsehood()
+	|    0
+	|
+
+
+private pure func checked_float_predicates(types: String) -> Result[CheckedProgram, Diagnostic]:
+	parsed ?= parse_modules_with_base([{ source = FLOAT_PREDICATES, targets = [] }], { TEST_BASE | types = types })
+	check(parsed).map_err(setup_diagnostic)
+
+
+private pure func checked_float_identity(function: Model.CheckedFunction, truth: Model.CheckedExpr, falsehood: Model.CheckedExpr, arity: Int) -> Bool:
+	match (truth.form, falsehood.form, function.body):
+		(Model.ConstructVariant(true_id, []), Model.ConstructVariant(false_id, []), Model.CheckedValueBody(Model.ReturnExpression(value))):
+			match value.form:
+				Model.InvokeFunction(call, arguments):
+					match call.target:
+						Model.RuntimeFunction(operation):
+							match Builtins.runtime_contract(operation).return_type:
+								Builtins.BooleanResult(boolean):
+									(
+										Model.same_variant(boolean.true_variant, true_id)
+										and Model.same_variant(boolean.false_variant, false_id)
+										and Model.same_type(function.signature.return_type.value_type, truth.value_type)
+										and Model.same_type(value.value_type, truth.value_type)
+										and arguments.length() == arity
+										and arguments.all(pure func(argument): Model.same_type(argument.value_type, Model.FloatType))
+									)
+								_: False
+						_: False
+				_: False
+		_: False
+
+
+private pure func checked_float_identities(types: String) -> Bool:
+	match checked_float_predicates(types):
+		Err(_): False
+		Ok(program):
+			match checked_functions(program).functions:
+				[equal, less, nan, finite, truth, falsehood, _]:
+					match (truth.body, falsehood.body):
+						(Model.CheckedValueBody(Model.ReturnExpression(true_value)), Model.CheckedValueBody(Model.ReturnExpression(false_value))):
+							(
+								checked_float_identity(equal, true_value, false_value, 2)
+								and checked_float_identity(less, true_value, false_value, 2)
+								and checked_float_identity(nan, true_value, false_value, 1)
+								and checked_float_identity(finite, true_value, false_value, 1)
+							)
+						_: False
+				_: False
+
+
+private pure func same_concrete_variant(first: Concrete.VariantInstanceId, second: Concrete.VariantInstanceId) -> Bool:
+	(
+		Concrete.union_number(Concrete.variant_owner(first)) == Concrete.union_number(Concrete.variant_owner(second))
+		and Concrete.variant_number(first) == Concrete.variant_number(second)
+	)
+
+
+private pure func specialized_float_identity(function: Concrete.ConcreteFunction, truth: Concrete.ConcreteExpr, falsehood: Concrete.ConcreteExpr, arity: Int) -> Bool:
+	match (truth.form, falsehood.form, function.body):
+		(Concrete.ConstructVariant(true_id, []), Concrete.ConstructVariant(false_id, []), Concrete.ConcreteValueBody(Concrete.ReturnExpression(value))):
+			match value.form:
+				Concrete.InvokeFunction(call, arguments):
+					match call.target:
+						Concrete.RuntimeFunction(operation):
+							match Builtins.runtime_contract(operation).return_type:
+								Builtins.BooleanResult(boolean):
+									(
+										same_concrete_variant(boolean.true_variant, true_id)
+										and same_concrete_variant(boolean.false_variant, false_id)
+										and Concrete.same_type(function.signature.return_type, truth.value_type)
+										and Concrete.same_type(value.value_type, truth.value_type)
+										and arguments.length() == arity
+										and arguments.all(pure func(argument): Concrete.same_type(argument.value_type, Concrete.FloatType))
+									)
+								_: False
+						_: False
+				_: False
+		_: False
+
+
+private pure func specialized_float_identities(types: String) -> Bool:
+	match checked_float_predicates(types).and_then(pure func(program): Concrete.specialize(program)):
+		Err(_): False
+		Ok(program):
+			contents = Concrete.specialized_contents(program)
+			match (contents.functions, contents.unions):
+				([_, equal, less, nan, finite, truth, falsehood], [layout]):
+					match (truth.body, falsehood.body, layout.variants, layout.representation):
+						(Concrete.ConcreteValueBody(Concrete.ReturnExpression(true_value)), Concrete.ConcreteValueBody(Concrete.ReturnExpression(false_value)), [[], []], Concrete.InlineUnmanaged):
+							(
+								specialized_float_identity(equal, true_value, false_value, 2)
+								and specialized_float_identity(less, true_value, false_value, 2)
+								and specialized_float_identity(nan, true_value, false_value, 1)
+								and specialized_float_identity(finite, true_value, false_value, 1)
+							)
+						_: False
+				_: False
+
+
+pure func test_checked_float_predicates_preserve_constructor_identities() -> Bool:
+	checked_float_identities(FOUNDATION_TYPES)
+
+
+pure func test_checked_float_predicates_preserve_reversed_constructor_identities() -> Bool:
+	checked_float_identities(FOUNDATION_TYPES.replace("    True\n    False", "    False\n    True"))
+
+
+pure func test_specialized_float_predicates_preserve_constructor_identities() -> Bool:
+	specialized_float_identities(FOUNDATION_TYPES)
+
+
+pure func test_specialized_float_predicates_preserve_reversed_constructor_identities() -> Bool:
+	specialized_float_identities(FOUNDATION_TYPES.replace("    True\n    False", "    False\n    True"))
+
+
+pure func test_checker_rejects_float_predicate_into_an_ordinary_union() -> Bool:
+	declaration: String =
+		|fixed union Answer:
+		|    Identical
+		|    Different
+		|pure func compare(left: Float, right: Float) -> Answer:
+		|    builtin("float.equals")
+		|
+	start = declaration.length() - "\"float.equals\")\n".length()
+	match parse_modules([{ source = declaration + MAIN, targets = [] }]):
+		Err(_): False
+		Ok(parsed):
+			match check(parsed):
+				Ok(_): False
+				Err(failure):
+					kind_matches = match check_errors(failure).first.kind:
+						Errors.BuiltinRejection(Errors.BuiltinContractMismatch(_)): True
+						_: False
+					rendered = render_failure(failure)
+					kind_matches and check_errors(failure).remaining.is_empty() and rendered.remaining.is_empty() and same_source(rendered.first.span.source, module_source(root_module_id())) and rendered.first.span.start == start and rendered.first.span.end == start + "\"float.equals\"".length() and rendered.first.message == "builtin declaration does not match its runtime contract" and rendered.first.help == "declare a pure nongeneric function with two Float parameters returning Bool" and rendered.first.note.is_none()
+
+
+-- This raw product borrows only issued IDs and union layouts from the existing
+-- seed. No Own insertion or repair supplies the verification oracle.
+private pure func raw_float(
+	seed: Seed,
+	operation: Builtins.RuntimeOperation[Concrete.VariantInstanceId, Concrete.TypeRef],
+	arguments: List[Own.OwnedArgument],
+	result_type: Concrete.TypeRef,
+) -> Own.OwnershipProgram:
+	program = raw(seed, seed.boolean)
+	ids = seed.ids
+	function: Own.OwnedFunction = {
+		signature = { parameters = [], return_type = Concrete.IntType },
+		operations = [
+			definition(ids.first, Concrete.FloatType, Own.FloatDefinition(1.0), Own.UnmanagedResult, 10),
+			definition(ids.second, Concrete.FloatType, Own.FloatDefinition(2.0), Own.UnmanagedResult, 20),
+			definition(ids.third, Concrete.IntType, Own.IntegerDefinition(0), Own.UnmanagedResult, 25),
+			definition(ids.fourth, result_type, Own.CallDefinition(Concrete.RuntimeFunction(operation), arguments), Own.UnmanagedResult, 30),
+		],
+		result = Own.UnmanagedReturn(ids.third)
+	}
+	{ program | functions = [function] }
+
+
+pure func test_raw_float_binary_predicate_is_valid() -> Bool:
+	match seed():
+		Ok(seed):
+			program = raw_float(
+				seed,
+				Builtins.FloatLessThan(seed.boolean),
+				[Own.UnmanagedArgument(seed.ids.first), Own.UnmanagedArgument(seed.ids.second)],
+				Concrete.UnionType(Concrete.variant_owner(seed.boolean.true_variant)),
+			)
+			verify(program).is_ok()
+		Err(_): False
+
+
+pure func test_raw_float_unary_classifier_is_valid() -> Bool:
+	match seed():
+		Ok(seed):
+			program = raw_float(
+				seed,
+				Builtins.FloatIsFinite(seed.boolean),
+				[Own.UnmanagedArgument(seed.ids.first)],
+				Concrete.UnionType(Concrete.variant_owner(seed.boolean.true_variant)),
+			)
+			verify(program).is_ok()
+		Err(_): False
+
+
+pure func test_verifier_rejects_float_binary_missing_argument() -> Bool:
+	match seed():
+		Ok(seed):
+			program = raw_float(
+				seed,
+				Builtins.FloatEquals(seed.boolean),
+				[Own.UnmanagedArgument(seed.ids.first)],
+				Concrete.UnionType(Concrete.variant_owner(seed.boolean.true_variant)),
+			)
+			rejects(program, "call is missing its argument")
+		Err(_): False
+
+
+pure func test_verifier_rejects_float_classifier_extra_argument() -> Bool:
+	match seed():
+		Ok(seed):
+			program = raw_float(
+				seed,
+				Builtins.FloatIsFinite(seed.boolean),
+				[Own.UnmanagedArgument(seed.ids.first), Own.UnmanagedArgument(seed.ids.second)],
+				Concrete.UnionType(Concrete.variant_owner(seed.boolean.true_variant)),
+			)
+			rejects(program, "call has an unexpected argument")
+		Err(_): False
+
+
+pure func test_verifier_rejects_float_predicate_int_argument() -> Bool:
+	match seed():
+		Ok(seed):
+			program = raw_float(
+				seed,
+				Builtins.FloatEquals(seed.boolean),
+				[Own.UnmanagedArgument(seed.ids.first), Own.UnmanagedArgument(seed.ids.third)],
+				Concrete.UnionType(Concrete.variant_owner(seed.boolean.true_variant)),
+			)
+			rejects(program, "call argument type does not match its contract")
+		Err(_): False
+
+
+pure func test_verifier_rejects_float_classifier_int_result() -> Bool:
+	match seed():
+		Ok(seed):
+			program = raw_float(
+				seed,
+				Builtins.FloatIsNaN(seed.boolean),
+				[Own.UnmanagedArgument(seed.ids.first)],
+				Concrete.IntType,
+			)
+			rejects(program, "call result type does not match its contract")
+		Err(_): False
+
+
+pure func test_verifier_rejects_float_classifier_mixed_union_constructors() -> Bool:
+	match seed():
+		Ok(seed):
+			program = raw_float(
+				seed,
+				Builtins.FloatIsFinite({ true_variant = seed.boolean.true_variant, false_variant = seed.other }),
+				[Own.UnmanagedArgument(seed.ids.first)],
+				Concrete.UnionType(Concrete.variant_owner(seed.boolean.true_variant)),
+			)
+			rejects(program, "runtime Bool constructors do not cover one result union")
+		Err(_): False
+
+
 tests: TestSuite = {
 	description = "Independent designated Bool comparison contracts",
 	tests = [
+		("checker rejects Float predicate into an ordinary union", test_checker_rejects_float_predicate_into_an_ordinary_union),
+		("checked Float predicates preserve constructor identities", test_checked_float_predicates_preserve_constructor_identities),
+		("checked Float predicates preserve reversed constructor identities", test_checked_float_predicates_preserve_reversed_constructor_identities),
+		("specialized Float predicates preserve constructor identities", test_specialized_float_predicates_preserve_constructor_identities),
+		("specialized Float predicates preserve reversed constructor identities", test_specialized_float_predicates_preserve_reversed_constructor_identities),
+		("raw Float binary predicate valid", test_raw_float_binary_predicate_is_valid),
+		("raw Float unary classifier valid", test_raw_float_unary_classifier_is_valid),
+		("verifier rejects Float missing binary argument", test_verifier_rejects_float_binary_missing_argument),
+		("verifier rejects Float extra classifier argument", test_verifier_rejects_float_classifier_extra_argument),
+		("verifier rejects Float Int argument", test_verifier_rejects_float_predicate_int_argument),
+		("verifier rejects Float Int result", test_verifier_rejects_float_classifier_int_result),
+		("verifier rejects Float mixed union constructors", test_verifier_rejects_float_classifier_mixed_union_constructors),
 		("checked comparison returns the designated Bool", test_checked_comparison_returns_the_designated_bool),
 		("specialized comparison has empty unmanaged constructors", test_specialized_comparison_has_two_empty_unmanaged_constructors),
 		("comparison borrows both inputs without acquisition", test_comparison_borrows_both_inputs_without_acquisition),

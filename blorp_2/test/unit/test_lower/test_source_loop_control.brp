@@ -1,0 +1,447 @@
+import:
+	../../../src/lower/lower as Lower
+	../../../src/namespace/builtins as Builtins
+	../../../src/specialize/specialize as Concrete
+	../../../src/utils/syntax: entry_function
+	../source_while_inputs as Input
+	test: TestSuite
+
+
+ALL_BREAK: String =
+	|func poison(message: String) -> Void:
+	|    builtin("string.print")
+	|func main() -> Int:
+	|    flag: Bool = True
+	|    while flag:
+	|        match flag:
+	|            True: break
+	|            False: break
+	|        poison("unreachable")
+	|    0
+	|
+
+
+ALL_CONTINUE: String =
+	|func poison(message: String) -> Void:
+	|    builtin("string.print")
+	|func main() -> Int:
+	|    flag: Bool = True
+	|    while flag:
+	|        match flag:
+	|            True: continue
+	|            False: continue
+	|        poison("unreachable")
+	|    0
+	|
+
+
+MIXED_TERMINAL: String =
+	|func poison(message: String) -> Void:
+	|    builtin("string.print")
+	|func main() -> Int:
+	|    flag: Bool = True
+	|    while flag:
+	|        match flag:
+	|            True: break
+	|            False: continue
+	|        poison("unreachable")
+	|    0
+	|
+
+
+MIXED_JOIN: String =
+	|func main() -> Int:
+	|    var value: Int = 0
+	|    var flag: Bool = True
+	|    while flag:
+	|        if flag:
+	|            break
+	|        value = 7
+	|        flag = False
+	|    value
+	|
+
+
+NESTED_ABRUPT_JOIN: String =
+	|func main() -> Int:
+	|    var value: Int = 0
+	|    var flag: Bool = True
+	|    while flag:
+	|        if flag:
+	|            match flag:
+	|                True: break
+	|                False: continue
+	|        else:
+	|            value = 7
+	|        flag = False
+	|    value
+	|
+
+
+NESTED_LOOP: String =
+	|func main() -> Int:
+	|    var value: Int = 0
+	|    var flag: Bool = True
+	|    while flag:
+	|        while True:
+	|            break
+	|        value = 7
+	|        flag = False
+	|    value
+	|
+
+
+LIST_ITERATION: String =
+	|func main() -> Int:
+	|    var total: Int = 0
+	|    for item in ["a", "b"]:
+	|        total = 7
+	|    total
+	|
+
+
+RANGE_ITERATION: String =
+	|func main() -> Int:
+	|    var total: Int = 0
+	|    for item in 1..4:
+	|        total = item
+	|    total
+	|
+
+
+private pure func entry(source: String) -> Option[Lower.LoweredFunction]:
+	program ?= Input.lowered(source).to_option()
+	contents = Lower.lowered_functions(program)
+	contents.functions.get(Concrete.function_number(entry_function(contents.entrypoint)))
+
+
+private pure func first_loop(steps: List[Lower.LoweredStep]) -> Option[Lower.LoweredLoop]:
+	var result: Option[Lower.LoweredLoop] = None
+	for step in steps:
+		match step:
+			Lower.Loop(loop):
+				result = Some(loop)
+				break
+			_: void
+	result
+
+
+private pure func first_join(steps: List[Lower.LoweredStep]) -> Option[Lower.LoweredJoin]:
+	var result: Option[Lower.LoweredJoin] = None
+	for step in steps:
+		match step:
+			Lower.Join(join):
+				result = Some(join)
+				break
+			_: void
+	result
+
+
+private pure func true_arm(loop: Lower.LoweredLoop) -> Option[Lower.LoopArm]:
+	match loop.body.tail:
+		Lower.ExitLoop(_): None
+		Lower.MatchLoop(branch): branch.arms.get(0)
+
+
+private pure func terminal_facts(source: String, breaks: Int, recurs: Int) -> Option[Bool]:
+	function ?= entry(source)
+	loop ?= first_loop(function.steps)
+	selected ?= true_arm(loop)
+	match selected.body.tail:
+		Lower.ExitLoop(_): None
+		Lower.MatchLoop(branch):
+			var break_count = 0
+			var recur_count = 0
+			var no_continuation = selected.body.steps.is_empty()
+			for arm in branch.arms:
+				no_continuation = no_continuation and arm.body.steps.is_empty()
+				match arm.body.tail:
+					Lower.ExitLoop(Lower.Break(_)): break_count = break_count + 1
+					Lower.ExitLoop(Lower.Recur(_, _)): recur_count = recur_count + 1
+					Lower.MatchLoop(_): no_continuation = False
+			Some(no_continuation and branch.arms.length() == 2 and break_count == breaks and recur_count == recurs)
+
+
+pure func test_all_break_selection_has_no_join_output_or_unreachable_effect() -> Bool:
+	terminal_facts(ALL_BREAK, 2, 0).get_or(False)
+
+
+pure func test_all_continue_selection_has_no_join_output_or_unreachable_effect() -> Bool:
+	terminal_facts(ALL_CONTINUE, 0, 2).get_or(False)
+
+
+pure func test_mixed_break_continue_selection_is_terminal() -> Bool:
+	terminal_facts(MIXED_TERMINAL, 1, 1).get_or(False)
+
+
+private pure func mixed_join_facts() -> Option[Bool]:
+	function ?= entry(MIXED_JOIN)
+	loop ?= first_loop(function.steps)
+	selected ?= true_arm(loop)
+	join ?= first_join(selected.body.steps)
+	abrupt ?= join.arms.get(0)
+	normal ?= join.arms.get(1)
+	match (abrupt.exit, normal.exit, selected.body.tail):
+		(Lower.TransferLoop(target, Lower.ExitLoop(Lower.Break(outputs))), Lower.Yield(yielded), Lower.ExitLoop(Lower.Recur(values, _))):
+			Some(Lower.value_number(Lower.loop_target_value(target)) == Lower.value_number(loop.result.id)
+				and Concrete.same_type(join.result.value_type, Concrete.VoidType)
+				and outputs.carried.length() == 2 and values.length() == 2
+				and yielded.carried.length() == join.carried.length()
+				and selected.body.steps.length() == 3)
+		_: None
+
+
+pure func test_mixed_yield_and_break_publishes_only_the_yielding_continuation() -> Bool:
+	mixed_join_facts().get_or(False)
+
+
+private pure func nested_abrupt_facts() -> Option[Bool]:
+	function ?= entry(NESTED_ABRUPT_JOIN)
+	loop ?= first_loop(function.steps)
+	selected ?= true_arm(loop)
+	join ?= first_join(selected.body.steps)
+	abrupt ?= join.arms.get(0)
+	normal ?= join.arms.get(1)
+	match (abrupt.exit, normal.exit):
+		(Lower.TransferLoop(target, Lower.MatchLoop(branch)), Lower.Yield(outputs)):
+			first ?= branch.arms.get(0)
+			second ?= branch.arms.get(1)
+			match (first.body.tail, second.body.tail):
+				(Lower.ExitLoop(Lower.Break(_)), Lower.ExitLoop(Lower.Recur(_, _))):
+					Some(Lower.value_number(Lower.loop_target_value(target)) == Lower.value_number(loop.result.id)
+						and abrupt.steps.is_empty() and first.body.steps.is_empty() and second.body.steps.is_empty()
+						and branch.arms.length() == 2 and outputs.carried.length() == 1 and join.carried.length() == 1)
+				_: None
+		_: None
+
+
+pure func test_all_abrupt_nested_match_reuses_recursive_tail_inside_yielding_join() -> Bool:
+	nested_abrupt_facts().get_or(False)
+
+
+private pure func nested_loop_facts() -> Option[Bool]:
+	function ?= entry(NESTED_LOOP)
+	outer ?= first_loop(function.steps)
+	body ?= true_arm(outer)
+	inner ?= first_loop(body.body.steps)
+	suffix ?= body.body.steps.get(1)
+	inner_body ?= true_arm(inner)
+	match (suffix, inner_body.body.tail, body.body.tail):
+		(Lower.Define(value), Lower.ExitLoop(Lower.Break(_)), Lower.ExitLoop(Lower.Recur(_, _))):
+			match value.operation:
+				Lower.IntegerValue(7): Some(Lower.value_number(inner.result.id) != Lower.value_number(outer.result.id) and body.body.steps.length() == 3)
+				_: None
+		_: None
+
+
+pure func test_nested_loop_break_preserves_parent_continuation() -> Bool:
+	nested_loop_facts().get_or(False)
+
+
+-- These flat projections inspect the named for fixture's parent interval and
+-- private cursor/selection/arm intervals; they do not reconstruct lowering.
+private pure func flat_values(steps: List[Lower.LoweredStep]) -> List[Lower.ValueId]:
+	var values: List[Lower.ValueId] = []
+	for step in steps:
+		match step:
+			Lower.Define(value): values = values.append(value.id)
+			Lower.Join(join): values = values.append(join.result.id).concat(join.carried.map(pure func(value): value.id))
+			Lower.Loop(loop): values = values.append(loop.result.id).concat(loop.carried.map(pure func(value): value.id))
+	values
+
+
+private pure func selection_values(selection: Lower.LoweredSelection) -> List[Lower.ValueId]:
+	var values: List[Lower.ValueId] = []
+	for node in selection.nodes:
+		match node:
+			Lower.TestVariant(_, _, _, _) | Lower.TestListLength(_, _, _, _) | Lower.TestStringBytes(_, _, _, _): void
+			Lower.EnterArm(edge):
+				for definition in edge.definitions:
+					match definition:
+						Lower.BorrowUnionField(parameter, _, _): values = values.append(parameter.id)
+						Lower.BorrowListElement(parameter, _, _): values = values.append(parameter.id)
+						Lower.CopyListSuffix(parameter, _, _): values = values.append(parameter.id)
+	values
+
+
+private pure func dense(values: List[Lower.ValueId]) -> Bool:
+	var expected = 0
+	var complete = not values.is_empty()
+	for value in values:
+		complete = complete and Lower.value_number(value) == expected
+		expected = expected + 1
+	complete
+
+
+private pure func integer_is(steps: List[Lower.LoweredStep], id: Lower.ValueId, expected: Int) -> Bool:
+	var matches = False
+	for step in steps:
+		match step:
+			Lower.Define(definition):
+				match definition.operation:
+					Lower.IntegerValue(value):
+						if Lower.value_number(definition.id) == Lower.value_number(id):
+							matches = value == expected
+					_: void
+			_: void
+	matches
+
+
+private pure func defines_list(steps: List[Lower.LoweredStep], id: Lower.ValueId) -> Bool:
+	var matches = False
+	for step in steps:
+		match step:
+			Lower.Define(definition):
+				match definition.operation:
+					Lower.ConstructListValue(_):
+						matches = matches or Lower.value_number(definition.id) == Lower.value_number(id)
+					_: void
+			_: void
+	matches
+
+
+private pure func for_facts(source: String, is_list: Bool) -> Option[Bool]:
+	function ?= entry(source)
+	loop ?= first_loop(function.steps)
+	cursor ?= loop.headers.get(0)
+	carried ?= loop.headers.get(1)
+	condition ?= loop.body.steps.get(1)
+	match (condition, loop.body.tail):
+		(Lower.Define(condition), Lower.MatchLoop(branch)):
+			body ?= branch.arms.get(0)
+			ending ?= branch.arms.get(1)
+			one ?= body.body.steps.get(0)
+			next ?= body.body.steps.get(1)
+			match (one, next, body.body.tail, ending.body.tail):
+				(Lower.Define(one), Lower.Define(next), Lower.ExitLoop(Lower.Recur(values, _)), Lower.ExitLoop(Lower.Break(outputs))):
+					advanced ?= values.get(0)
+					unchanged ?= outputs.carried.get(0)
+					var condition_valid = False
+					match condition.operation:
+						Lower.CallValue(Concrete.RuntimeFunction(Builtins.ListGet(element, _)), [iterable, index]):
+							condition_valid = (is_list and Concrete.same_type(element, Concrete.StringType)
+								and Lower.value_number(index) == Lower.value_number(cursor.parameter.id)
+								and defines_list(function.steps, iterable) and integer_is(function.steps, cursor.initial, 0))
+						Lower.CallValue(Concrete.RuntimeFunction(Builtins.IntLessThan(_)), [index, end]):
+							condition_valid = (not is_list and Lower.value_number(index) == Lower.value_number(cursor.parameter.id)
+								and integer_is(function.steps, cursor.initial, 1) and integer_is(function.steps, end, 4))
+						_: void
+					item_valid = if is_list:
+						match body.inputs:
+							[item]: Concrete.same_type(item.value_type, Concrete.StringType) and selection_values(branch.selection).length() == 1
+							_: False
+					else:
+						match values.get(1):
+							Some(item): body.inputs.is_empty() and Lower.value_number(item) == Lower.value_number(cursor.parameter.id)
+							None: False
+					increment = match next.operation:
+						Lower.CallValue(Concrete.RuntimeFunction(Builtins.IntAdd), [index, step]):
+							Lower.value_number(index) == Lower.value_number(cursor.parameter.id) and Lower.value_number(step) == Lower.value_number(one.id)
+						_: False
+					prefix = flat_values(function.steps).concat(loop.headers.map(pure func(header): header.parameter.id))
+					selected = flat_values(loop.body.steps).concat(selection_values(branch.selection)).concat(body.inputs.map(pure func(input): input.id))
+					all = prefix.concat(selected).concat(flat_values(body.body.steps))
+					Some(condition_valid and item_valid and increment and dense(all) and integer_is(body.body.steps, one.id, 1)
+						and loop.headers.length() == 2 and loop.carried.length() == 1
+						and Concrete.same_type(cursor.parameter.value_type, Concrete.IntType)
+						and Concrete.same_type(carried.parameter.value_type, Concrete.IntType)
+						and Lower.value_number(advanced) == Lower.value_number(next.id)
+						and Lower.value_number(unchanged) == Lower.value_number(carried.parameter.id))
+				_: None
+		_: None
+
+
+pure func test_list_iteration_has_typed_item_cursor_and_dense_private_ids() -> Bool:
+	for_facts(LIST_ITERATION, True).get_or(False)
+
+
+pure func test_range_iteration_aliases_int_item_to_cursor_and_has_dense_ids() -> Bool:
+	for_facts(RANGE_ITERATION, False).get_or(False)
+
+
+private pure func false_write_facts() -> Option[Bool]:
+	function ?= entry(Input.CONDITION_WRITES)
+	loop ?= first_loop(function.steps)
+	condition ?= first_join(loop.body.steps)
+	output ?= condition.carried.get(0)
+	match loop.body.tail:
+		Lower.MatchLoop(branch):
+			arm ?= branch.arms.get(1)
+			match arm.body.tail:
+				Lower.ExitLoop(Lower.Break(outputs)):
+					actual ?= outputs.carried.get(0)
+					Some(Lower.value_number(actual) == Lower.value_number(output.id) and outputs.carried.length() == 1)
+				_: None
+		_: None
+
+
+pure func test_natural_false_edge_keeps_condition_join_write() -> Bool:
+	false_write_facts().get_or(False)
+
+
+private pure func structural_continue_facts() -> Option[Bool]:
+	source: String =
+		|func main() -> Int:
+		|    var total: Int = 0
+		|    while True:
+		|        for item in ["skip"]:
+		|            match item:
+		|                "skip": continue
+		|                _: total = 7
+		|            total = 8
+		|        break
+		|    total
+		|
+	function ?= entry(source)
+	outer ?= first_loop(function.steps)
+	outer_body ?= true_arm(outer)
+	inner ?= first_loop(outer_body.body.steps)
+	present ?= true_arm(inner)
+	join ?= first_join(present.body.steps)
+	abrupt ?= join.arms.get(0)
+	normal ?= join.arms.get(1)
+	cursor ?= inner.headers.get(0)
+	carried ?= inner.headers.get(1)
+	one ?= present.body.steps.get(0)
+	next ?= present.body.steps.get(1)
+	match (abrupt.exit, normal.exit, one, next):
+		(Lower.TransferLoop(target, Lower.ExitLoop(Lower.Recur([advanced, kept], _))), Lower.Yield(_), Lower.Define(one), Lower.Define(next)):
+			match (one.operation, next.operation):
+				(Lower.IntegerValue(1), Lower.CallValue(Concrete.RuntimeFunction(Builtins.IntAdd), [index, step])):
+					Some(
+						Lower.value_number(Lower.loop_target_value(target)) == Lower.value_number(inner.result.id)
+							and Lower.value_number(inner.result.id) != Lower.value_number(outer.result.id)
+							and Lower.value_number(advanced) == Lower.value_number(next.id)
+							and Lower.value_number(kept) == Lower.value_number(carried.parameter.id)
+							and Lower.value_number(index) == Lower.value_number(cursor.parameter.id)
+							and Lower.value_number(step) == Lower.value_number(one.id)
+							and inner.headers.length() == 2 and abrupt.steps.is_empty()
+							and join.selection.nodes.any(pure func(node):
+								match node:
+									Lower.TestStringBytes(_, "skip", _, _): True
+									_: False
+							)
+					)
+				_: None
+		_: None
+
+
+pure func test_string_selector_continue_targets_the_nearest_list_loop() -> Bool:
+	structural_continue_facts().get_or(False)
+
+
+tests: TestSuite = {
+	description = "Blorp 2 source loop control lowering",
+	tests = [
+		("String selector Continue targets the nearest List loop", test_string_selector_continue_targets_the_nearest_list_loop),
+		("all Break has no Join P or unreachable effect", test_all_break_selection_has_no_join_output_or_unreachable_effect),
+		("all Continue has no Join P or unreachable effect", test_all_continue_selection_has_no_join_output_or_unreachable_effect),
+		("mixed Break Continue is terminal", test_mixed_break_continue_selection_is_terminal),
+		("mixed Yield and Break publishes continuation", test_mixed_yield_and_break_publishes_only_the_yielding_continuation),
+		("nested abrupt Match uses recursive tail inside yielding Join", test_all_abrupt_nested_match_reuses_recursive_tail_inside_yielding_join),
+		("nested loop break preserves parent continuation", test_nested_loop_break_preserves_parent_continuation),
+		("List for has item cursor and dense private ids", test_list_iteration_has_typed_item_cursor_and_dense_private_ids),
+		("range for aliases item to cursor with dense ids", test_range_iteration_aliases_int_item_to_cursor_and_has_dense_ids),
+		("natural False edge keeps condition write", test_natural_false_edge_keeps_condition_join_write),
+	]
+}

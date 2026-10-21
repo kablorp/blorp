@@ -1,0 +1,71 @@
+import:
+	../../../src/check/check: check, checked_functions
+	../../../src/check/model as Model
+	../../../src/check/render: render_failure
+	../../../src/namespace/builtins as Builtins
+	../../../src/utils/ids: union_number, variant_owner
+	../../../src/utils/source: module_source, root_module_id, same_source
+	../input: setup_diagnostic
+	../module_input: parse_modules
+	../string_slice_inputs: SLICE_SOURCE
+	test: TestSuite
+
+
+pure func test_slice_publishes_ordered_types_and_designated_option() -> Bool:
+	match parse_modules([{ source = SLICE_SOURCE, targets = [] }]).and_then(pure func(parsed): check(parsed).map_err(setup_diagnostic)):
+		Err(_): False
+		Ok(program):
+			match checked_functions(program).functions.get(0):
+				Some(function):
+					match function.body:
+						Model.CheckedValueBody(Model.ReturnExpression(value)):
+							match (value.value_type, value.form):
+								(Model.AppliedUnionType(owner, [Model.StringType]), Model.InvokeFunction(call, [text, start, end])):
+									match call.target:
+										Model.RuntimeFunction(Builtins.StringSlice(option)):
+											(
+												Model.same_type(text.value_type, Model.StringType)
+												and Model.same_type(start.value_type, Model.IntType) and Model.same_type(end.value_type, Model.IntType)
+												and union_number(variant_owner(option.some)) == union_number(owner)
+												and union_number(variant_owner(option.none)) == union_number(owner)
+											)
+										_: False
+								_: False
+						_: False
+				None: False
+
+
+private pure func header_rejected(header: String) -> Bool:
+	source = header + "\n    builtin(\"string.slice\")\nfunc main() -> Int:\n    0\n"
+	start = header.length() + "\n    builtin(".length()
+	match parse_modules([{ source = source, targets = [] }]):
+		Err(_): False
+		Ok(parsed):
+			match check(parsed):
+				Ok(_): False
+				Err(failure):
+					diagnostics = render_failure(failure)
+					error = diagnostics.first
+					(
+						diagnostics.remaining.is_empty() and error.note.is_none()
+						and error.message == "builtin declaration does not match its runtime contract"
+						and error.help == "declare a pure nongeneric function with String, Int and Int parameters returning Option[String]"
+						and same_source(error.span.source, module_source(root_module_id()))
+						and error.span.start == start and error.span.end == start + "\"string.slice\"".length()
+					)
+
+
+tests: TestSuite = {
+	description = "Blorp 2 checked slice contract",
+	tests = [
+		("slice publishes its ordered types and Option identities", test_slice_publishes_ordered_types_and_designated_option),
+		("impure slice rejects", pure func(): header_rejected("func slice_text(value: String, start: Int, end: Int) -> Option[String]:")),
+		("generic slice rejects", pure func(): header_rejected("pure func slice_text[T](value: String, start: Int, end: Int) -> Option[String]:")),
+		("missing bound rejects", pure func(): header_rejected("pure func slice_text(value: String, start: Int) -> Option[String]:")),
+		("extra bound rejects", pure func(): header_rejected("pure func slice_text(value: String, start: Int, end: Int, extra: Int) -> Option[String]:")),
+		("wrong input type rejects", pure func(): header_rejected("pure func slice_text(value: Int, start: Int, end: Int) -> Option[String]:")),
+		("wrong start type rejects", pure func(): header_rejected("pure func slice_text(value: String, start: String, end: Int) -> Option[String]:")),
+		("wrong end type rejects", pure func(): header_rejected("pure func slice_text(value: String, start: Int, end: String) -> Option[String]:")),
+		("wrong Option payload rejects", pure func(): header_rejected("pure func slice_text(value: String, start: Int, end: Int) -> Option[Int]:")),
+	]
+}

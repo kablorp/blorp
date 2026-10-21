@@ -5,6 +5,7 @@ import:
 	../../../src/utils/syntax: Diagnostic, entry_function
 	../../../src/utils/text: concat
 	../input: checked_source
+	../managed_union_inputs: lowered_tail_join
 	int as IntOps
 	option: to_result
 	list: find
@@ -42,9 +43,7 @@ private pure func changed(source: String) -> Result[Lower.LoweredFunction, Diagn
 	program ?= Lower.lower(specialized)
 	facts = Lower.lowered_functions(program)
 	main ?= facts.functions.get(Concrete.function_number(entry_function(facts.entrypoint))).to_result(setup_error())
-	result ?= match main.tail:
-		Lower.ExitValue(Lower.ReturnValue(value)): Ok(value)
-		_: Err(setup_error())
+	result = main.result
 	definition ?= ordinary_value(main, result)
 	parent ?= match definition.operation:
 		Lower.ReadRecordFieldValue(_, parent): Ok(parent)
@@ -71,9 +70,8 @@ private pure func argument_is(definition: Lower.ValueDefinition, operand: Lower.
 
 
 private pure func returned(function: Lower.LoweredFunction, value: Lower.ValueId) -> Bool:
-	match function.tail:
-		Lower.ExitValue(Lower.ReturnValue(result)): IntOps.equals(Lower.value_number(result), Lower.value_number(value))
-		_: False
+	result = function.result
+	IntOps.equals(Lower.value_number(result), Lower.value_number(value))
 
 
 private pure func projects(definition: Lower.ValueDefinition, parent: Lower.ValueDefinition, ordinal: Int, expected: Concrete.TypeRef) -> Bool:
@@ -276,12 +274,10 @@ pure func test_storage_appends_written_replacements_then_inherited_fields() -> B
 				_: False
 
 
-private pure func update_arm(arm: Lower.LoweredArm, parent: Lower.ValueDefinition, start: Int, ordinal: Int, number: Int) -> Bool:
-	match arm.body.steps:
-		[Lower.Define(value), Lower.Define(replacement), Lower.Define(inherited), Lower.Define(result)]:
-			returned = match arm.body.exit:
-				Lower.ReturnValue(id): IntOps.equals(Lower.value_number(id), Lower.value_number(result.id))
-				_: False
+private pure func update_arm(arm: Lower.JoinArm, parent: Lower.ValueDefinition, start: Int, ordinal: Int, number: Int) -> Bool:
+	match (arm.steps, arm.exit):
+		([Lower.Define(value), Lower.Define(replacement), Lower.Define(inherited), Lower.Define(result)], Lower.Yield(outputs)):
+			returned = IntOps.equals(Lower.value_number(outputs.value), Lower.value_number(result.id))
 			stored = constructs(result, ordinal, replacement.id, IntOps.subtract(1, ordinal), inherited.id)
 			(returned and stored and literal(value, number) and argument_is(replacement, value.id)
 			and projects(inherited, parent, IntOps.subtract(1, ordinal), Concrete.IntType)
@@ -309,13 +305,13 @@ pure func test_match_arms_keep_updates_local_and_value_ids_distinct() -> Bool:
 		Err(_): False
 		Ok(function):
 			match function.steps:
-				[Lower.Define(flag), Lower.Define(parent)]:
-					match function.tail:
-						Lower.MatchValue(matched):
+				[Lower.Define(flag), Lower.Define(parent), Lower.Join(_)]:
+					match lowered_tail_join(function):
+						Some(matched):
 							match matched.arms:
 								[first, second]:
-									(IntOps.equals(Lower.value_number(matched.scrutinee), Lower.value_number(flag.id))
-									and update_arm(first, parent, 2, 0, 7) and update_arm(second, parent, 6, 1, 9))
+									(IntOps.equals(Lower.value_number(matched.selection.scrutinee), Lower.value_number(flag.id))
+									and update_arm(first, parent, 3, 0, 7) and update_arm(second, parent, 7, 1, 9))
 								_: False
 						_: False
 				_: False

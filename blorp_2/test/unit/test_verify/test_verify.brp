@@ -1,17 +1,20 @@
 import:
-	../../../src/lower/lower: MatchLabel(DefaultLabel, VariantLabel), ValueId, ValueOperation(ConstructValue)
+	../../../src/check/model as Model
+	./selection_inputs as Selection
+	../../../src/lower/lower: ValueId, ValueOperation(ConstructValue)
 	../../../src/own/own as Own:
 		BorrowSource(ParameterBorrow, OwnerBorrow),
 		OwnedArgument(UnmanagedArgument, BorrowedArgument),
-		OwnedArm,
-		OwnedExit(ReturnResult),
+		OwnedLoopArm,
 		OwnedFunction,
-		OwnedTail(ReturnTail, MatchTail),
+		OwnedLoopTail(MatchLoop),
+		OwnedLoopExit(Break),
+		OwnedJoinParameter(UnmanagedJoinParameter, ManagedJoinParameter),
 		OwnedValueOperation(
 			ParameterDefinition, IntegerDefinition, CallDefinition,
 			ConstructDefinition,
 		),
-		OwnershipOperation(DefineValue, AcquireOwner, DropOwner),
+		OwnershipOperation(DefineValue, ExecuteLoop, AcquireOwner, DropOwner),
 		OwnershipProgram,
 		ResultOwnership(UnmanagedResult, BorrowedResult, OwnedResult),
 		ReturnTransfer(UnmanagedReturn, OwnedReturn),
@@ -25,9 +28,9 @@ import:
 		function_number,
 		UnionRepresentation(InlineUnmanaged),
 		specialize,
-	../../../src/utils/syntax: FunctionExecution(OrdinaryCalls), same_span, Entrypoint(NoArguments), EntryResult(IntegerExitStatus), entry_function
+	../../../src/utils/syntax: same_span, Entrypoint(NoArguments), EntryResult(IntegerExitStatus), entry_function
 	../../../src/verify/verify: verify
-	../managed_union_inputs: lowered, NAMED_CALLBACK_SOURCE
+	../managed_union_inputs: lowered, NAMED_CALLBACK_SOURCE, NONCAPTURING_CALLBACK_SOURCE
 	../ownership_inputs: InputIds, function, input_ids, parameter, span
 	test: TestSuite
 
@@ -79,13 +82,12 @@ private pure func program(ids: InputIds, operations: List[OwnershipOperation]) -
 		entrypoint = NoArguments(ids.entrypoint, IntegerExitStatus),
 		functions = [
 			{
-				execution = OrdinaryCalls,
 				signature = {
 					parameters = [],
 					return_type = IntType
 				},
 				operations = operations,
-				tail = ReturnTail(ReturnResult(UnmanagedReturn(ids.third)))
+				result = UnmanagedReturn(ids.third)
 			},
 		]
 	}
@@ -104,207 +106,115 @@ private pure func rejects(input: OwnershipProgram, message: String, at: Int) -> 
 			False
 
 
-private pure func match_program(ids: InputIds, labels: List[MatchLabel]) -> OwnershipProgram:
-	var arms: List[OwnedArm] = []
-
-	for label in labels:
-		arms = arms.append({
-			label = label,
-			operations = [],
-			exit = ReturnResult(UnmanagedReturn(ids.second)),
-		})
-
+private pure func match_program(
+	ids: InputIds,
+	selection: Own.OwnedSelection,
+	identities: List[Model.MatchArmId],
+) -> OwnershipProgram:
+	arms = identities.map(pure func(identity) -> Own.OwnedLoopArm: {
+		id = identity, inputs = [], body = { operations = [],
+			tail = Own.ExitLoop(Break({ value = UnmanagedReturn(ids.second), carried = [], span = span(20) })) }
+	})
 	{
-		records = [],
-		unions = ids.unions,
+		records = [], unions = ids.unions,
 		entrypoint = NoArguments(ids.entrypoint, IntegerExitStatus),
-		functions = [
-			{
-				execution = OrdinaryCalls,
-				signature = {
-					parameters = [],
-					return_type = IntType
-				},
-				operations = [DefineValue({
-						id = ids.first,
-						value_type = UnionType(ids.union_id),
-						operation = ConstructDefinition(ids.second_variant, []),
-						result = UnmanagedResult,
-						span = span(10),
-					}), integer(ids.second, 7, 20)],
-				tail = MatchTail({
-					scrutinee = UnmanagedArgument(ids.first),
-					owner = ids.union_id,
-					arms = arms,
-				})
-			},
-		]
+		functions = [{ signature = { parameters = [], return_type = IntType },
+			operations = [DefineValue({ id = ids.first, value_type = UnionType(ids.union_id), operation = ConstructDefinition(ids.second_variant, []), result = UnmanagedResult, span = span(10) }), integer(ids.second, 7, 20), ExecuteLoop({
+				entry_acquisitions = [],
+				headers = [], result = UnmanagedJoinParameter({ id = ids.third, value_type = IntType, span = span(90) }), carried = [],
+				body = { operations = [], tail = MatchLoop({ selection = selection, arms = arms }) }
+			})], result = UnmanagedReturn(ids.third)
+		}]
 	}
 
 
-pure func test_rejects_a_match_without_arms() -> Bool:
+pure func test_rejects_a_match_without_an_entry_node() -> Bool:
 	match input_ids():
-		Err(_):
-			False
+		Err(_): False
+		Ok(ids): rejects(match_program(ids, { scrutinee = UnmanagedArgument(ids.first), nodes = [], entry = Model.decision_node_id(0) }, []), "selection entry is not a node", 10)
+
+
+pure func test_rejects_a_match_missing_its_fallback_edge() -> Bool:
+	match input_ids():
+		Err(_): False
 		Ok(ids):
-			rejects(
-				match_program(ids, []),
-				"match has no arms",
-				10,
+			original = Selection.branches(UnmanagedArgument(ids.first), ids.second_variant)
+			nodes = original.nodes.map(pure func(node):
+				match node:
+					Own.TestVariant(place, variant, yes, _): Own.TestVariant(place, variant, yes, Model.decision_node_id(99))
+					_: node
 			)
+			selection = { original | nodes = nodes }
+			rejects(match_program(ids, selection, [Model.match_arm_id(0), Model.match_arm_id(1)]), "selection successor is not an earlier node", 10)
 
 
-pure func test_rejects_a_match_missing_a_variant() -> Bool:
+pure func test_rejects_an_unreachable_match_decision() -> Bool:
 	match input_ids():
-		Err(_):
-			False
+		Err(_): False
 		Ok(ids):
-			rejects(
-				match_program(ids, [VariantLabel(ids.second_variant)]),
-				"match does not cover every variant",
-				10,
+			original = Selection.branches(UnmanagedArgument(ids.first), ids.second_variant)
+			rejects(match_program(ids, { original | entry = Model.decision_node_id(0) }, [Model.match_arm_id(0), Model.match_arm_id(1)]), "selection contains an unreachable node", 10)
+
+
+pure func test_rejects_a_repeated_canonical_match_arm() -> Bool:
+	match input_ids():
+		Err(_): False
+		Ok(ids): rejects(match_program(ids, Selection.direct(UnmanagedArgument(ids.first)), [Model.match_arm_id(0), Model.match_arm_id(0)]), "selection arm identity appears more than once", 10)
+
+
+pure func test_rejects_a_match_with_a_forward_successor() -> Bool:
+	match input_ids():
+		Err(_): False
+		Ok(ids):
+			original = Selection.branches(UnmanagedArgument(ids.first), ids.second_variant)
+			nodes = original.nodes.map(pure func(node):
+				match node:
+					Own.TestVariant(place, variant, _, no): Own.TestVariant(place, variant, Model.decision_node_id(2), no)
+					_: node
 			)
+			selection = { original | nodes = nodes }
+			rejects(match_program(ids, selection, [Model.match_arm_id(0), Model.match_arm_id(1)]), "selection successor is not an earlier node", 10)
 
 
-pure func test_rejects_a_repeated_match_variant() -> Bool:
+pure func test_rejects_a_canonical_arm_without_an_incoming_edge() -> Bool:
 	match input_ids():
-		Err(_):
-			False
-		Ok(ids):
-			rejects(
-				match_program(
-					ids,
-					[VariantLabel(ids.second_variant), VariantLabel(ids.second_variant)],
-				),
-				"match variant appears more than once",
-				10,
-			)
-
-
-pure func test_rejects_a_repeated_match_default() -> Bool:
-	match input_ids():
-		Err(_):
-			False
-		Ok(ids):
-			rejects(
-				match_program(
-					ids,
-					[DefaultLabel, DefaultLabel],
-				),
-				"match default appears more than once",
-				10,
-			)
-
-
-pure func test_rejects_a_match_default_before_a_variant() -> Bool:
-	match input_ids():
-		Err(_):
-			False
-		Ok(ids):
-			rejects(
-				match_program(
-					ids,
-					[DefaultLabel, VariantLabel(ids.second_variant)],
-				),
-				"match default must be the final arm",
-				10,
-			)
-
-
-pure func test_rejects_a_match_default_after_complete_coverage() -> Bool:
-	match input_ids():
-		Err(_):
-			False
-		Ok(ids):
-			match ids.union_value.operation:
-				ConstructValue(first, []):
-					rejects(
-						match_program(
-							ids,
-							[VariantLabel(first), VariantLabel(ids.second_variant), DefaultLabel],
-						),
-						"match default covers no remaining variants",
-						10,
-					)
-				_:
-					False
+		Err(_): False
+		Ok(ids): rejects(match_program(ids, Selection.branches(UnmanagedArgument(ids.first), ids.second_variant), [Model.match_arm_id(0), Model.match_arm_id(1), Model.match_arm_id(2)]), "selection arm has no incoming edge", 10)
 
 
 pure func test_accepts_a_match_with_all_variants() -> Bool:
 	match input_ids():
-		Err(_):
-			False
+		Err(_): False
 		Ok(ids):
 			match ids.union_value.operation:
-				ConstructValue(first, []):
-					match (
-						verify(
-							match_program(
-								ids,
-								[VariantLabel(first), VariantLabel(ids.second_variant)],
-							),
-						)
-					):
-						Ok(_):
-							True
-						Err(_):
-							False
-				_:
-					False
+				ConstructValue(first, []): verify(match_program(ids, Selection.branches(UnmanagedArgument(ids.first), first), [Model.match_arm_id(0), Model.match_arm_id(1)])).is_ok()
+				_: False
 
 
 pure func test_accepts_a_match_with_variants_in_reverse_order() -> Bool:
 	match input_ids():
-		Err(_):
-			False
-		Ok(ids):
-			match ids.union_value.operation:
-				ConstructValue(first, []):
-					match (
-						verify(
-							match_program(
-								ids,
-								[VariantLabel(ids.second_variant), VariantLabel(first)],
-							),
-						)
-					):
-						Ok(_):
-							True
-						Err(_):
-							False
-				_:
-					False
+		Err(_): False
+		Ok(ids): verify(match_program(ids, Selection.branches(UnmanagedArgument(ids.first), ids.second_variant), [Model.match_arm_id(0), Model.match_arm_id(1)])).is_ok()
 
 
 pure func test_accepts_a_partial_match_with_a_final_default() -> Bool:
 	match input_ids():
-		Err(_):
-			False
-		Ok(ids):
-			match (
-				verify(
-					match_program(
-						ids,
-						[VariantLabel(ids.second_variant), DefaultLabel],
-					),
-				)
-			):
-				Ok(_):
-					True
-				Err(_):
-					False
+		Err(_): False
+		Ok(ids): verify(match_program(ids, Selection.branches(UnmanagedArgument(ids.first), ids.second_variant), [Model.match_arm_id(0), Model.match_arm_id(1)])).is_ok()
 
 
 pure func test_accepts_a_default_only_match() -> Bool:
 	match input_ids():
-		Err(_):
-			False
+		Err(_): False
+		Ok(ids): verify(match_program(ids, Selection.direct(UnmanagedArgument(ids.first)), [Model.match_arm_id(0)])).is_ok()
+
+
+pure func test_rejects_a_non_dense_terminal_arm_identity() -> Bool:
+	match input_ids():
+		Err(_): False
 		Ok(ids):
-			match verify(match_program(ids, [DefaultLabel])):
-				Ok(_):
-					True
-				Err(_):
-					False
+			selection: Own.OwnedSelection = { scrutinee = UnmanagedArgument(ids.first), nodes = [Own.EnterArm({ arm = Model.match_arm_id(9), operations = [], transfers = [] })], entry = Model.decision_node_id(0) }
+			rejects(match_program(ids, selection, [Model.match_arm_id(9)]), "selection arm identity is not its source ordinal", 10)
 
 
 pure func test_accepts_exact_borrow_and_cleanup() -> Bool:
@@ -679,7 +589,6 @@ pure func test_borrowed_parameter_return_requires_an_acquisition() -> Bool:
 			False
 		Ok(ids):
 			borrowed: OwnedFunction = {
-				execution = OrdinaryCalls,
 				signature = {
 					parameters = [StringType],
 					return_type = StringType
@@ -691,7 +600,7 @@ pure func test_borrowed_parameter_return_requires_an_acquisition() -> Bool:
 						result = BorrowedResult(ParameterBorrow(ids.first)),
 						span = span(10),
 					})],
-				tail = ReturnTail(ReturnResult(UnmanagedReturn(ids.first)))
+				result = UnmanagedReturn(ids.first)
 			}
 			rejects(
 				{
@@ -711,7 +620,6 @@ pure func test_rejects_returning_a_dropped_owner() -> Bool:
 			False
 		Ok(ids):
 			returned: OwnedFunction = {
-				execution = OrdinaryCalls,
 				signature = {
 					parameters = [],
 					return_type = StringType
@@ -721,7 +629,7 @@ pure func test_rejects_returning_a_dropped_owner() -> Bool:
 					string(ids),
 					DropOwner(owner_id(0), span(25)),
 				],
-				tail = ReturnTail(ReturnResult(OwnedReturn(ids.second, owner_id(0))))
+				result = OwnedReturn(ids.second, owner_id(0))
 			}
 			rejects(
 				{
@@ -818,7 +726,6 @@ pure func test_sibling_arm_values_are_not_visible() -> Bool:
 			False
 		Ok(ids):
 			callee: OwnedFunction = {
-				execution = OrdinaryCalls,
 				signature = {
 					parameters = [IntType],
 					return_type = IntType
@@ -830,13 +737,12 @@ pure func test_sibling_arm_values_are_not_visible() -> Bool:
 						result = UnmanagedResult,
 						span = span(10),
 					})],
-				tail = ReturnTail(ReturnResult(UnmanagedReturn(ids.first)))
+				result = UnmanagedReturn(ids.first)
 			}
 
 			match ids.union_value.operation:
 				ConstructValue(variant, []):
 					main: OwnedFunction = {
-						execution = OrdinaryCalls,
 						signature = {
 							parameters = [],
 							return_type = IntType
@@ -847,34 +753,35 @@ pure func test_sibling_arm_values_are_not_visible() -> Bool:
 								operation = ConstructDefinition(variant, []),
 								result = UnmanagedResult,
 								span = span(10),
-							})],
-						tail = MatchTail({
-							scrutinee = UnmanagedArgument(ids.first),
-							owner = ids.union_id,
-							arms = [
-								{
-									label = VariantLabel(variant),
-									operations = [integer(ids.second, 7, 20)],
-									exit = ReturnResult(UnmanagedReturn(ids.second))
-								},
-								{
-									label = DefaultLabel,
-									operations = [
-										DefineValue({
-											id = ids.third,
-											value_type = IntType,
-											operation = CallDefinition(
-												UserFunction(ids.entrypoint),
-												[UnmanagedArgument(ids.second)],
-											),
-											result = UnmanagedResult,
-											span = span(30),
-										}),
+							})].append(ExecuteLoop({
+							entry_acquisitions = [],
+							headers = [],
+							result = UnmanagedJoinParameter({ id = ids.second, value_type = IntType, span = span(90) }),
+							carried = [],
+							body = {
+								operations = [],
+								tail = MatchLoop({
+									selection = Selection.branches(UnmanagedArgument(ids.first), variant),
+									arms = [
+										{ id = Model.match_arm_id(0), inputs = [], body = { operations = [integer(ids.third, 7, 20)], tail = Own.ExitLoop(Break({ value = UnmanagedReturn(ids.third), carried = [], span = span(20) })) } },
+										{ id = Model.match_arm_id(1), inputs = [], body = { operations = [
+												DefineValue({
+													id = ids.fourth,
+													value_type = IntType,
+													operation = CallDefinition(
+														UserFunction(ids.entrypoint),
+														[UnmanagedArgument(ids.third)],
+													),
+													result = UnmanagedResult,
+													span = span(30),
+												}),
+											], tail = Own.ExitLoop(Break({ value = UnmanagedReturn(ids.fourth), carried = [], span = span(30) })) } },
 									],
-									exit = ReturnResult(UnmanagedReturn(ids.third))
-								},
-							],
-						})
+
+								}),
+							},
+						})),
+						result = UnmanagedReturn(ids.second)
 					}
 					rejects(
 						{
@@ -883,7 +790,7 @@ pure func test_sibling_arm_values_are_not_visible() -> Bool:
 							entrypoint = NoArguments(ids.second_function, IntegerExitStatus),
 							functions = [callee, main]
 						},
-						"value 1 is not defined before use",
+						"value 2 is not defined before use",
 						30,
 					)
 				_:
@@ -898,7 +805,6 @@ pure func test_discharged_managed_prefix_allows_unmanaged_match() -> Bool:
 			match ids.union_value.operation:
 				ConstructValue(variant, []):
 					main: OwnedFunction = {
-						execution = OrdinaryCalls,
 						signature = {
 							parameters = [],
 							return_type = IntType
@@ -915,18 +821,23 @@ pure func test_discharged_managed_prefix_allows_unmanaged_match() -> Bool:
 								result = UnmanagedResult,
 								span = span(40),
 							}),
-						],
-						tail = MatchTail({
-							scrutinee = UnmanagedArgument(ids.fourth),
-							owner = ids.union_id,
-							arms = [
-								{
-									label = DefaultLabel,
-									operations = [integer(ids.fifth, 0, 50)],
-									exit = ReturnResult(UnmanagedReturn(ids.fifth))
-								},
-							],
-						})
+						].append(ExecuteLoop({
+							entry_acquisitions = [],
+							headers = [],
+							result = UnmanagedJoinParameter({ id = ids.fifth, value_type = IntType, span = span(90) }),
+							carried = [],
+							body = {
+								operations = [],
+								tail = MatchLoop({
+									selection = Selection.direct(UnmanagedArgument(ids.fourth)),
+									arms = [
+										{ id = Model.match_arm_id(0), inputs = [], body = { operations = [integer(ids.sixth, 0, 50)], tail = Own.ExitLoop(Break({ value = UnmanagedReturn(ids.sixth), carried = [], span = span(50) })) } },
+									],
+
+								}),
+							},
+						})),
+						result = UnmanagedReturn(ids.fifth)
 					}
 					verify({
 						records = [],
@@ -938,7 +849,7 @@ pure func test_discharged_managed_prefix_allows_unmanaged_match() -> Bool:
 					False
 
 
-pure func test_match_label_requires_its_variant_declaration() -> Bool:
+pure func test_match_test_requires_its_variant_declaration() -> Bool:
 	match input_ids():
 		Err(_):
 			False
@@ -946,7 +857,6 @@ pure func test_match_label_requires_its_variant_declaration() -> Bool:
 			match ids.union_value.operation:
 				ConstructValue(variant, []):
 					main: OwnedFunction = {
-						execution = OrdinaryCalls,
 						signature = {
 							parameters = [],
 							return_type = IntType
@@ -957,18 +867,23 @@ pure func test_match_label_requires_its_variant_declaration() -> Bool:
 								operation = ConstructDefinition(variant, []),
 								result = UnmanagedResult,
 								span = span(10),
-							})],
-						tail = MatchTail({
-							scrutinee = UnmanagedArgument(ids.first),
-							owner = ids.union_id,
-							arms = [
-								{
-									label = VariantLabel(ids.second_variant),
-									operations = [integer(ids.second, 0, 20)],
-									exit = ReturnResult(UnmanagedReturn(ids.second))
-								},
-							],
-						})
+							})].append(ExecuteLoop({
+							entry_acquisitions = [],
+							headers = [],
+							result = UnmanagedJoinParameter({ id = ids.second, value_type = IntType, span = span(90) }),
+							carried = [],
+							body = {
+								operations = [],
+								tail = MatchLoop({
+									selection = Selection.branches(UnmanagedArgument(ids.first), ids.second_variant),
+									arms = [
+										{ id = Model.match_arm_id(0), inputs = [], body = { operations = [integer(ids.third, 0, 20)], tail = Own.ExitLoop(Break({ value = UnmanagedReturn(ids.third), carried = [], span = span(20) })) } },
+									],
+
+								}),
+							},
+						})),
+						result = UnmanagedReturn(ids.second)
 					}
 					rejects(
 						{
@@ -995,13 +910,12 @@ pure func test_rejects_a_string_returning_entrypoint() -> Bool:
 			False
 		Ok(ids):
 			entry: OwnedFunction = {
-				execution = OrdinaryCalls,
 				signature = {
 					parameters = [],
 					return_type = StringType
 				},
 				operations = [integer(ids.first, 7, 10), string(ids)],
-				tail = ReturnTail(ReturnResult(OwnedReturn(ids.second, owner_id(0))))
+				result = OwnedReturn(ids.second, owner_id(0))
 			}
 			rejects(
 				{
@@ -1021,7 +935,6 @@ pure func test_rejects_an_entrypoint_with_a_parameter() -> Bool:
 			False
 		Ok(ids):
 			entry: OwnedFunction = {
-				execution = OrdinaryCalls,
 				signature = {
 					parameters = [IntType],
 					return_type = IntType
@@ -1033,7 +946,7 @@ pure func test_rejects_an_entrypoint_with_a_parameter() -> Bool:
 						result = UnmanagedResult,
 						span = span(10),
 					})],
-				tail = ReturnTail(ReturnResult(UnmanagedReturn(ids.first)))
+				result = UnmanagedReturn(ids.first)
 			}
 			rejects(
 				{
@@ -1053,13 +966,12 @@ pure func test_rejects_returning_another_values_owner() -> Bool:
 			False
 		Ok(ids):
 			entry: OwnedFunction = {
-				execution = OrdinaryCalls,
 				signature = {
 					parameters = [],
 					return_type = IntType
 				},
 				operations = [integer(ids.first, 0, 1)],
-				tail = ReturnTail(ReturnResult(UnmanagedReturn(ids.first)))
+				result = UnmanagedReturn(ids.first)
 			}
 			other_string = DefineValue({
 				id = ids.third,
@@ -1072,7 +984,6 @@ pure func test_rejects_returning_another_values_owner() -> Bool:
 				span = span(30),
 			})
 			helper: OwnedFunction = {
-				execution = OrdinaryCalls,
 				signature = {
 					parameters = [],
 					return_type = StringType
@@ -1083,7 +994,7 @@ pure func test_rejects_returning_another_values_owner() -> Bool:
 					other_string,
 					DropOwner(owner_id(0), span(40)),
 				],
-				tail = ReturnTail(ReturnResult(OwnedReturn(ids.second, owner_id(1))))
+				result = OwnedReturn(ids.second, owner_id(1))
 			}
 			rejects(
 				{
@@ -1105,16 +1016,14 @@ pure func test_rejects_an_empty_managed_match() -> Bool:
 			match ids.union_value.operation:
 				ConstructValue(variant, []):
 					entry: OwnedFunction = {
-						execution = OrdinaryCalls,
 						signature = {
 							parameters = [],
 							return_type = IntType
 						},
 						operations = [integer(ids.first, 0, 1)],
-						tail = ReturnTail(ReturnResult(UnmanagedReturn(ids.first)))
+						result = UnmanagedReturn(ids.first)
 					}
 					helper: OwnedFunction = {
-						execution = OrdinaryCalls,
 						signature = {
 							parameters = [],
 							return_type = StringType
@@ -1125,12 +1034,21 @@ pure func test_rejects_an_empty_managed_match() -> Bool:
 								operation = ConstructDefinition(variant, []),
 								result = UnmanagedResult,
 								span = span(10),
-							})],
-						tail = MatchTail({
-							owner = ids.union_id,
-							scrutinee = UnmanagedArgument(ids.first),
-							arms = [],
-						})
+							})].append(ExecuteLoop({
+							entry_acquisitions = [],
+							headers = [],
+							result = ManagedJoinParameter({ id = ids.second, value_type = StringType, span = span(90) }, owner_id(0)),
+							carried = [],
+							body = {
+								operations = [],
+								tail = MatchLoop({
+									selection = { scrutinee = UnmanagedArgument(ids.first), nodes = [], entry = Model.decision_node_id(0) },
+									arms = [],
+
+								}),
+							},
+						})),
+						result = OwnedReturn(ids.second, owner_id(0))
 					}
 
 					match (
@@ -1143,7 +1061,7 @@ pure func test_rejects_an_empty_managed_match() -> Bool:
 					):
 						Err(error):
 							(
-								error.message == "ownership verification failed: match has no arms"
+								error.message == "ownership verification failed: selection entry is not a node"
 								and error.help == "report this compiler error with the input program"
 								and same_span(error.span, span(10))
 							)
@@ -1159,16 +1077,14 @@ pure func test_acquired_owner_can_transfer_after_original_owner_is_dropped() -> 
 			False
 		Ok(ids):
 			entry: OwnedFunction = {
-				execution = OrdinaryCalls,
 				signature = {
 					parameters = [],
 					return_type = IntType
 				},
 				operations = [integer(ids.first, 0, 1)],
-				tail = ReturnTail(ReturnResult(UnmanagedReturn(ids.first)))
+				result = UnmanagedReturn(ids.first)
 			}
 			helper: OwnedFunction = {
-				execution = OrdinaryCalls,
 				signature = {
 					parameters = [],
 					return_type = StringType
@@ -1186,7 +1102,7 @@ pure func test_acquired_owner_can_transfer_after_original_owner_is_dropped() -> 
 					),
 					DropOwner(owner_id(0), span(40)),
 				],
-				tail = ReturnTail(ReturnResult(OwnedReturn(ids.second, owner_id(1))))
+				result = OwnedReturn(ids.second, owner_id(1))
 			}
 
 			match (
@@ -1278,7 +1194,6 @@ pure func test_acquisition_rejects_another_values_live_owner() -> Bool:
 					entrypoint = NoArguments(ids.entrypoint, IntegerExitStatus),
 					functions = [
 						{
-							execution = OrdinaryCalls,
 							signature = {
 								parameters = [],
 								return_type = IntType
@@ -1300,7 +1215,7 @@ pure func test_acquisition_rejects_another_values_live_owner() -> Bool:
 								DropOwner(owner_id(2), span(70)),
 								integer(ids.fourth, 0, 80),
 							],
-							tail = ReturnTail(ReturnResult(UnmanagedReturn(ids.fourth)))
+							result = UnmanagedReturn(ids.fourth)
 						},
 					]
 				},
@@ -1327,23 +1242,21 @@ private pure func arm_string(
 	})
 
 
-private pure func managed_match_program(ids: InputIds, arms: List[OwnedArm]) -> OwnershipProgram:
+private pure func managed_match_program(ids: InputIds, arms: List[OwnedLoopArm]) -> OwnershipProgram:
 	{
 		records = [],
 		unions = ids.unions,
 		entrypoint = NoArguments(ids.entrypoint, IntegerExitStatus),
 		functions = [
 			{
-				execution = OrdinaryCalls,
 				signature = {
 					parameters = [],
 					return_type = IntType
 				},
 				operations = [integer(ids.first, 0, 1)],
-				tail = ReturnTail(ReturnResult(UnmanagedReturn(ids.first)))
+				result = UnmanagedReturn(ids.first)
 			},
 			{
-				execution = OrdinaryCalls,
 				signature = {
 					parameters = [],
 					return_type = StringType
@@ -1354,32 +1267,35 @@ private pure func managed_match_program(ids: InputIds, arms: List[OwnedArm]) -> 
 						operation = ConstructDefinition(ids.second_variant, []),
 						result = UnmanagedResult,
 						span = span(10),
-					}), integer(ids.second, 7, 20)],
-				tail = MatchTail({
-					scrutinee = UnmanagedArgument(ids.first),
-					owner = ids.union_id,
-					arms = arms,
-				})
+					}), integer(ids.second, 7, 20)].append(ExecuteLoop({
+					entry_acquisitions = [],
+					headers = [],
+					result = ManagedJoinParameter({ id = ids.third, value_type = StringType, span = span(90) }, owner_id(0)),
+					carried = [],
+					body = {
+						operations = [],
+						tail = MatchLoop({
+							selection = Selection.branches(UnmanagedArgument(ids.first), ids.second_variant),
+							arms = arms,
+
+						}),
+					},
+				})),
+				result = OwnedReturn(ids.third, owner_id(0))
 			},
 		]
 	}
 
 
-private pure func managed_arms(ids: InputIds) -> List[OwnedArm]:
+private pure func managed_arms(ids: InputIds) -> List[OwnedLoopArm]:
 	[
-		{
-			label = VariantLabel(ids.second_variant),
-			operations = [arm_string(ids.third, ids.second, 0, 30)],
-			exit = ReturnResult(OwnedReturn(ids.third, owner_id(0)))
-		},
-		{
-			label = DefaultLabel,
-			operations = [arm_string(ids.fourth, ids.second, 1, 40)],
-			exit = ReturnResult(OwnedReturn(ids.fourth, owner_id(1)))
-		},
+		{ id = Model.match_arm_id(0), inputs = [], body = { operations = [arm_string(ids.fourth, ids.second, 1, 30), AcquireOwner(owner_id(2), { value = ids.fourth, source = OwnerBorrow(owner_id(1)) }, span(30)), DropOwner(owner_id(1), span(30))], tail = Own.ExitLoop(Break({ value = OwnedReturn(ids.fourth, owner_id(2)), carried = [], span = span(30) })) } },
+		{ id = Model.match_arm_id(1), inputs = [], body = { operations = [arm_string(ids.fifth, ids.second, 3, 40), AcquireOwner(owner_id(4), { value = ids.fifth, source = OwnerBorrow(owner_id(3)) }, span(40)), DropOwner(owner_id(3), span(40))], tail = Own.ExitLoop(Break({ value = OwnedReturn(ids.fifth, owner_id(4)), carried = [], span = span(40) })) } },
 	]
 
 
+-- Each raw managed Loop edge acquires its outgoing occurrence before retiring
+-- the original local; sibling owner ordinals include that complete edge batch.
 pure func test_accepts_independent_managed_arm_transfers() -> Bool:
 	match input_ids():
 		Err(_):
@@ -1402,9 +1318,9 @@ pure func test_rejects_a_missing_managed_arm_transfer() -> Bool:
 					rejects(
 						managed_match_program(
 							ids,
-							[{ first | exit = ReturnResult(UnmanagedReturn(ids.third)) }, second],
+							[{ first | body = { first.body | tail = Own.ExitLoop(Break({ value = UnmanagedReturn(ids.fourth), carried = [], span = span(30) })) } }, second],
 						),
-						"managed return requires an owner transfer",
+						"managed yield requires an owner transfer",
 						30,
 					)
 				_:
@@ -1420,22 +1336,16 @@ pure func test_rejects_an_arm_local_owner_leak() -> Bool:
 				managed_match_program(
 					ids,
 					[
-						{
-							label = VariantLabel(ids.second_variant),
-							operations = [
-								arm_string(ids.third, ids.second, 0, 30),
-								arm_string(ids.fourth, ids.second, 1, 40),
-							],
-							exit = ReturnResult(OwnedReturn(ids.fourth, owner_id(1)))
-						},
-						{
-							label = DefaultLabel,
-							operations = [arm_string(ids.fifth, ids.second, 2, 50)],
-							exit = ReturnResult(OwnedReturn(ids.fifth, owner_id(2)))
-						},
+						{ id = Model.match_arm_id(0), inputs = [], body = { operations = [
+								arm_string(ids.fourth, ids.second, 1, 30),
+								arm_string(ids.fifth, ids.second, 2, 40),
+								AcquireOwner(owner_id(3), { value = ids.fifth, source = OwnerBorrow(owner_id(2)) }, span(40)),
+								DropOwner(owner_id(2), span(40)),
+							], tail = Own.ExitLoop(Break({ value = OwnedReturn(ids.fifth, owner_id(3)), carried = [], span = span(40) })) } },
+						{ id = Model.match_arm_id(1), inputs = [], body = { operations = [arm_string(ids.sixth, ids.second, 4, 50), AcquireOwner(owner_id(5), { value = ids.sixth, source = OwnerBorrow(owner_id(4)) }, span(50)), DropOwner(owner_id(4), span(50))], tail = Own.ExitLoop(Break({ value = OwnedReturn(ids.sixth, owner_id(5)), carried = [], span = span(50) })) } },
 					],
 				),
-				"owner 0 remains live at return",
+				"owner 1 remains live at yield",
 				40,
 			)
 
@@ -1450,12 +1360,12 @@ pure func test_rejects_an_arm_local_double_drop() -> Bool:
 					rejects(
 						managed_match_program(
 							ids,
-							[{ first | operations = first.operations.concat([
-										DropOwner(owner_id(0), span(35)),
-										DropOwner(owner_id(0), span(36)),
-									]) }, second],
+							[{ first | body = { first.body | operations = [arm_string(ids.fourth, ids.second, 1, 30),
+										DropOwner(owner_id(1), span(35)),
+										DropOwner(owner_id(1), span(36)),
+									] } }, second],
 						),
-						"owner 0 has already been discharged",
+						"owner 1 has already been discharged",
 						36,
 					)
 				_:
@@ -1470,13 +1380,13 @@ pure func test_rejects_an_arm_local_dead_borrow() -> Bool:
 			match managed_arms(ids):
 				[first, second]:
 					dead_length = DefineValue({
-						id = ids.fourth,
+						id = ids.fifth,
 						value_type = IntType,
 						operation = CallDefinition(
 							RuntimeFunction(Builtins.StringLength),
 							[BorrowedArgument({
-									value = ids.third,
-									source = OwnerBorrow(owner_id(0)),
+									value = ids.fourth,
+									source = OwnerBorrow(owner_id(1)),
 								})],
 						),
 						result = UnmanagedResult,
@@ -1486,15 +1396,11 @@ pure func test_rejects_an_arm_local_dead_borrow() -> Bool:
 						managed_match_program(
 							ids,
 							[
-								{ first |
-									operations = first.operations.concat(
-										[DropOwner(owner_id(0), span(35)), dead_length],
-									)
-								},
+								{ first | body = { first.body | operations = [arm_string(ids.fourth, ids.second, 1, 30), DropOwner(owner_id(1), span(35)), dead_length] } },
 								second,
 							],
 						),
-						"borrow refers to discharged owner 0",
+						"borrow refers to discharged owner 1",
 						40,
 					)
 				_:
@@ -1513,12 +1419,10 @@ pure func test_rejects_a_sibling_arm_owner_transfer() -> Bool:
 							ids,
 							[
 								first,
-								{ second |
-									exit = ReturnResult(OwnedReturn(ids.fourth, owner_id(0)))
-								},
+								{ second | body = { second.body | tail = Own.ExitLoop(Break({ value = OwnedReturn(ids.fifth, owner_id(1)), carried = [], span = span(40) })) } },
 							],
 						),
-						"owner 0 is not available in this match arm",
+						"owner 1 is not available in this match arm",
 						40,
 					)
 				_:
@@ -1533,13 +1437,13 @@ pure func test_rejects_a_sibling_arm_managed_value() -> Bool:
 			match managed_arms(ids):
 				[first, second]:
 					bad_call = DefineValue({
-						id = ids.fourth,
+						id = ids.fifth,
 						value_type = IntType,
 						operation = CallDefinition(
 							RuntimeFunction(Builtins.StringLength),
 							[BorrowedArgument({
-									value = ids.third,
-									source = OwnerBorrow(owner_id(0)),
+									value = ids.fourth,
+									source = OwnerBorrow(owner_id(1)),
 								})],
 						),
 						result = UnmanagedResult,
@@ -1548,9 +1452,9 @@ pure func test_rejects_a_sibling_arm_managed_value() -> Bool:
 					rejects(
 						managed_match_program(
 							ids,
-							[first, { second | operations = [bad_call] }],
+							[first, { second | body = { second.body | operations = [bad_call] } }],
 						),
-						"value 2 is not defined before use",
+						"value 3 is not defined before use",
 						40,
 					)
 				_:
@@ -1568,18 +1472,16 @@ pure func test_rejects_a_dropped_managed_arm_return() -> Bool:
 						managed_match_program(
 							ids,
 							[
-								{ first |
-									operations = first.operations.append(
+								{ first | body = { first.body | operations = first.body.operations.append(
 										DropOwner(
-											owner_id(0),
+											owner_id(2),
 											span(35),
 										),
-									)
-								},
+									) } },
 								second,
 							],
 						),
-						"return refers to discharged owner 0",
+						"loop transfer refers to a discharged owner",
 						30,
 					)
 				_:
@@ -1598,12 +1500,10 @@ pure func test_rejects_reusing_a_sibling_owner_ordinal() -> Bool:
 							ids,
 							[
 								first,
-								{ second |
-									operations = [arm_string(ids.fourth, ids.second, 0, 40)]
-								},
+								{ second | body = { second.body | operations = [arm_string(ids.fifth, ids.second, 1, 40)] } },
 							],
 						),
-						"owner 0 is defined more than once",
+						"owner 1 is defined more than once",
 						40,
 					)
 				_:
@@ -1622,9 +1522,7 @@ pure func test_rejects_reusing_a_sibling_value_ordinal() -> Bool:
 							ids,
 							[
 								first,
-								{ second |
-									operations = [arm_string(ids.third, ids.second, 1, 40)]
-								},
+								{ second | body = { second.body | operations = [arm_string(ids.fourth, ids.second, 3, 40)] } },
 							],
 						),
 						"value identity is not the next function ordinal",
@@ -1642,13 +1540,13 @@ pure func test_rejects_a_sibling_value_after_a_current_arm_definition() -> Bool:
 			match managed_arms(ids):
 				[first, second]:
 					read_sibling = DefineValue({
-						id = ids.fifth,
+						id = ids.sixth,
 						value_type = IntType,
 						operation = CallDefinition(
 							RuntimeFunction(Builtins.StringLength),
 							[BorrowedArgument({
-									value = ids.third,
-									source = OwnerBorrow(owner_id(0)),
+									value = ids.fourth,
+									source = OwnerBorrow(owner_id(1)),
 								})],
 						),
 						result = UnmanagedResult,
@@ -1659,10 +1557,10 @@ pure func test_rejects_a_sibling_value_after_a_current_arm_definition() -> Bool:
 							ids,
 							[
 								first,
-								{ second | operations = second.operations.append(read_sibling) },
+								{ second | body = { second.body | operations = second.body.operations.append(read_sibling) } },
 							],
 						),
-						"value 2 is not defined before use",
+						"value 3 is not defined before use",
 						50,
 					)
 				_:
@@ -1688,14 +1586,14 @@ private pure func rejects_arm_drop(
 					drop = DropOwner(owner_id(id), span(45))
 
 					operations = if before_definition:
-						[drop].concat(arm.operations)
+						[drop].concat(arm.body.operations)
 					else:
-						arm.operations.append(drop)
+						arm.body.operations.append(drop)
 
 					rejects(
 						managed_match_program(
 							ids,
-							arms.set(arm_index, { arm | operations = operations }),
+							arms.set(arm_index, { arm | body = { arm.body | operations = operations } }),
 						),
 						message,
 						45,
@@ -1711,15 +1609,15 @@ pure func test_rejects_negative_owner_lookup_before_the_second_arm_definition() 
 
 
 pure func test_rejects_future_owner_lookup_before_the_first_arm_definition() -> Bool:
-	rejects_arm_drop(1, 0, True, "owner 1 is not defined")
+	rejects_arm_drop(2, 0, True, "owner 2 is not defined")
 
 
 pure func test_rejects_missing_owner_lookup_before_the_second_arm_definition() -> Bool:
-	rejects_arm_drop(1, 1, True, "owner 1 is not defined")
+	rejects_arm_drop(3, 1, True, "owner 3 is not defined")
 
 
 pure func test_rejects_future_owner_lookup_after_the_second_arm_definition() -> Bool:
-	rejects_arm_drop(2, 1, False, "owner 2 is not defined")
+	rejects_arm_drop(5, 1, False, "owner 5 is not defined")
 
 
 pure func test_rejects_a_gapped_arm_value_ordinal() -> Bool:
@@ -1733,9 +1631,7 @@ pure func test_rejects_a_gapped_arm_value_ordinal() -> Bool:
 						managed_match_program(
 							ids,
 							[
-								{ first |
-									operations = [arm_string(ids.fourth, ids.second, 0, 30)]
-								},
+								{ first | body = { first.body | operations = [arm_string(ids.fifth, ids.second, 1, 30)] } },
 								second,
 							],
 						),
@@ -1758,9 +1654,7 @@ pure func test_rejects_a_gapped_arm_owner_ordinal() -> Bool:
 							ids,
 							[
 								first,
-								{ second |
-									operations = [arm_string(ids.fourth, ids.second, 2, 40)]
-								},
+								{ second | body = { second.body | operations = [arm_string(ids.fifth, ids.second, 4, 40)] } },
 							],
 						),
 						"owner identity is not the next function ordinal",
@@ -1782,14 +1676,12 @@ pure func test_rejects_dropping_a_sibling_arm_owner() -> Bool:
 							ids,
 							[
 								first,
-								{ second |
-									operations = [
-										DropOwner(owner_id(0), span(35)),
-									].concat(second.operations)
-								},
+								{ second | body = { second.body | operations = [
+										DropOwner(owner_id(1), span(35)),
+									].concat(second.body.operations) } },
 							],
 						),
-						"owner 0 is not available in this match arm",
+						"owner 1 is not available in this match arm",
 						35,
 					)
 				_:
@@ -1808,19 +1700,19 @@ pure func test_rejects_acquiring_from_a_sibling_arm_owner() -> Bool:
 							ids,
 							[
 								first,
-								{ second | operations = second.operations.append(
+								{ second | body = { second.body | operations = second.body.operations.append(
 										AcquireOwner(
-											owner_id(2),
+											owner_id(5),
 											{
-												value = ids.fourth,
-												source = OwnerBorrow(owner_id(0))
+												value = ids.fifth,
+												source = OwnerBorrow(owner_id(1))
 											},
 											span(45),
 										),
-									) },
+									) } },
 							],
 						),
-						"owner 0 is not available in this match arm",
+						"owner 1 is not available in this match arm",
 						45,
 					)
 				_:
@@ -1839,17 +1731,15 @@ pure func test_rejects_a_dropped_owner_in_the_second_arm() -> Bool:
 							ids,
 							[
 								first,
-								{ second |
-									operations = second.operations.append(
+								{ second | body = { second.body | operations = second.body.operations.append(
 										DropOwner(
-											owner_id(1),
+											owner_id(4),
 											span(45),
 										),
-									)
-								},
+									) } },
 							],
 						),
-						"return refers to discharged owner 1",
+						"loop transfer refers to a discharged owner",
 						40,
 					)
 				_:
@@ -1868,19 +1758,19 @@ pure func test_reports_the_absolute_leaked_owner_in_the_second_arm() -> Bool:
 							ids,
 							[
 								first,
-								{ second | operations = second.operations.append(
+								{ second | body = { second.body | operations = second.body.operations.append(
 										AcquireOwner(
-											owner_id(2),
+											owner_id(5),
 											{
-												value = ids.fourth,
-												source = OwnerBorrow(owner_id(1))
+												value = ids.fifth,
+												source = OwnerBorrow(owner_id(4))
 											},
 											span(45),
 										),
-									) },
+									) } },
 							],
 						),
-						"owner 2 remains live at return",
+						"owner 5 remains live at yield",
 						40,
 					)
 				_:
@@ -1900,20 +1790,17 @@ pure func test_accepts_acquisition_and_transfer_in_the_second_arm() -> Bool:
 								ids,
 								[
 									first,
-									{ second |
-										operations = second.operations.concat([
+									{ second | body = { second.body | operations = second.body.operations.concat([
 											AcquireOwner(
-												owner_id(2),
+												owner_id(5),
 												{
-													value = ids.fourth,
-													source = OwnerBorrow(owner_id(1))
+													value = ids.fifth,
+													source = OwnerBorrow(owner_id(4))
 												},
 												span(45),
 											),
-											DropOwner(owner_id(1), span(46)),
-										]),
-										exit = ReturnResult(OwnedReturn(ids.fourth, owner_id(2)))
-									},
+											DropOwner(owner_id(4), span(46)),
+										]), tail = Own.ExitLoop(Break({ value = OwnedReturn(ids.fifth, owner_id(5)), carried = [], span = span(40) })) } },
 								],
 							),
 						)
@@ -1938,17 +1825,13 @@ pure func test_accepts_different_value_and_owner_counts_between_arms() -> Bool:
 							managed_match_program(
 								ids,
 								[
-									{ first |
-										operations = first.operations.concat([
-											arm_string(ids.fourth, ids.second, 1, 35),
-											DropOwner(owner_id(0), span(36)),
-										]),
-										exit = ReturnResult(OwnedReturn(ids.fourth, owner_id(1)))
-									},
-									{ second |
-										operations = [arm_string(ids.fifth, ids.second, 2, 40)],
-										exit = ReturnResult(OwnedReturn(ids.fifth, owner_id(2)))
-									},
+									{ first | body = { first.body | operations = [arm_string(ids.fourth, ids.second, 1, 30),
+											arm_string(ids.fifth, ids.second, 2, 35),
+											AcquireOwner(owner_id(3), { value = ids.fifth, source = OwnerBorrow(owner_id(2)) }, span(35)),
+											DropOwner(owner_id(2), span(36)),
+											DropOwner(owner_id(1), span(36)),
+										], tail = Own.ExitLoop(Break({ value = OwnedReturn(ids.fifth, owner_id(3)), carried = [], span = span(40) })) } },
+									{ second | body = { second.body | operations = [arm_string(ids.sixth, ids.second, 4, 40), AcquireOwner(owner_id(5), { value = ids.sixth, source = OwnerBorrow(owner_id(4)) }, span(40)), DropOwner(owner_id(4), span(40))], tail = Own.ExitLoop(Break({ value = OwnedReturn(ids.sixth, owner_id(5)), carried = [], span = span(50) })) } },
 								],
 							),
 						)
@@ -1972,10 +1855,9 @@ pure func test_verifier_rejects_missing_acquisition_in_insertion_output() -> Boo
 					match inserted.operations:
 						[definition, AcquireOwner(_, _, _)]:
 							main: OwnedFunction = {
-								execution = OrdinaryCalls,
 								signature = { parameters = [], return_type = IntType },
 								operations = [integer(ids.first, 0, 50)],
-								tail = ReturnTail(ReturnResult(UnmanagedReturn(ids.first)))
+								result = UnmanagedReturn(ids.first)
 							}
 							input: OwnershipProgram = {
 								records = [],
@@ -1998,7 +1880,11 @@ pure func test_named_managed_callback_product_verifies() -> Bool:
 
 
 pure func test_named_callback_verifier_requires_the_return_acquisition() -> Bool:
-	match lowered(NAMED_CALLBACK_SOURCE).and_then(Own.own):
+	callback_verifier_requires_the_return_acquisition(NAMED_CALLBACK_SOURCE)
+
+
+private pure func callback_verifier_requires_the_return_acquisition(source: String) -> Bool:
+	match lowered(source).and_then(Own.own):
 		Err(_): False
 		Ok(program):
 			match program.functions:
@@ -2011,8 +1897,8 @@ pure func test_named_callback_verifier_requires_the_return_acquisition() -> Bool
 										(UserFunction(apply_id), UserFunction(identity_id)): function_number(apply_id) == 2 and function_number(identity_id) == 1
 										_: False
 								_: False
-							match (definition, identity.tail):
-								(Own.DefineValue(parameter), Own.ReturnTail(Own.ReturnResult(Own.OwnedReturn(_, returned)))):
+							match (definition, identity.result):
+								(Own.DefineValue(parameter), Own.OwnedReturn(_, returned)):
 									-- Preserve issued IDs/transfer/spans; remove only the selected target's acquisition.
 									corrupt = { program | functions = [main, { identity | operations = [definition] }, apply] }
 									match verify(corrupt):
@@ -2022,6 +1908,7 @@ pure func test_named_callback_verifier_requires_the_return_acquisition() -> Bool
 												and error.message == "ownership verification failed: owner 0 is not defined"
 												and error.help == "report this compiler error with the input program"
 												and same_span(error.span, parameter.span) and error.note.is_none()
+												and verify(program).is_ok()
 											)
 										Ok(_): False
 								_: False
@@ -2029,9 +1916,20 @@ pure func test_named_callback_verifier_requires_the_return_acquisition() -> Bool
 				_: False
 
 
+pure func test_lambda_managed_callback_product_verifies() -> Bool:
+	lowered(NONCAPTURING_CALLBACK_SOURCE).and_then(Own.own).and_then(verify).is_ok()
+
+
+pure func test_lambda_callback_verifier_requires_the_return_acquisition() -> Bool:
+	callback_verifier_requires_the_return_acquisition(NONCAPTURING_CALLBACK_SOURCE)
+
+
 tests: TestSuite = {
 	description = "Blorp 2 independent ownership verification",
 	tests = [
+		("terminal arm identity is dense", test_rejects_a_non_dense_terminal_arm_identity),
+		("lambda managed ownership product verifies", test_lambda_managed_callback_product_verifies),
+		("actual lambda acquisition fault rejects and restored product verifies", test_lambda_callback_verifier_requires_the_return_acquisition),
 		("named managed callback ownership product verifies", test_named_managed_callback_product_verifies),
 		("named callback acquisition fault is independently rejected", test_named_callback_verifier_requires_the_return_acquisition),
 		("corrupted insertion output requires acquisition", test_verifier_rejects_missing_acquisition_in_insertion_output),
@@ -2095,14 +1993,14 @@ tests: TestSuite = {
 		("managed arm rejects sibling owner", test_rejects_a_sibling_arm_owner_transfer),
 		("managed arm rejects sibling value", test_rejects_a_sibling_arm_managed_value),
 		("managed arm rejects dropped return", test_rejects_a_dropped_managed_arm_return),
-		("match requires arms", test_rejects_a_match_without_arms),
-		("match requires complete variant coverage", test_rejects_a_match_missing_a_variant),
-		("match rejects repeated variants", test_rejects_a_repeated_match_variant),
-		("match rejects repeated defaults", test_rejects_a_repeated_match_default),
-		("match default must follow variants", test_rejects_a_match_default_before_a_variant),
+		("match requires entry node", test_rejects_a_match_without_an_entry_node),
+		("match requires fallback edge", test_rejects_a_match_missing_its_fallback_edge),
+		("match rejects unreachable decision", test_rejects_an_unreachable_match_decision),
+		("match rejects repeated canonical arm", test_rejects_a_repeated_canonical_match_arm),
+		("match successors must precede test", test_rejects_a_match_with_a_forward_successor),
 		(
-			"match default must cover remaining variants",
-			test_rejects_a_match_default_after_complete_coverage,
+			"canonical arm requires incoming edge",
+			test_rejects_a_canonical_arm_without_an_incoming_edge,
 		),
 		("match accepts all variants", test_accepts_a_match_with_all_variants),
 		("match accepts reversed variants", test_accepts_a_match_with_variants_in_reverse_order),
@@ -2127,13 +2025,13 @@ tests: TestSuite = {
 			"acquisition requires the exact value's live owner",
 			test_acquisition_rejects_another_values_live_owner,
 		),
-		("managed match still requires arms", test_rejects_an_empty_managed_match),
+		("managed match requires entry node", test_rejects_an_empty_managed_match),
 		("entrypoint cannot return String", test_rejects_a_string_returning_entrypoint),
 		("entrypoint cannot take a parameter", test_rejects_an_entrypoint_with_a_parameter),
 		("returned owner must own the returned value", test_rejects_returning_another_values_owner),
 		(
-			"match label requires declared variant",
-			test_match_label_requires_its_variant_declaration,
+			"match test requires declared variant",
+			test_match_test_requires_its_variant_declaration,
 		),
 		("call missing argument", test_rejects_call_with_missing_argument),
 		("call wrong argument type", test_rejects_call_with_wrong_argument_type),

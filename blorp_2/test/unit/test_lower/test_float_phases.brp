@@ -5,11 +5,14 @@ import:
 	../../../src/check/model as Check
 	../../../src/check/render: render_failure
 	../../../src/lower/lower as Lower
+	../../../src/own/own as Own
 	../../../src/parse/assemble: ParsedProgram, parsed_contents
 	../../../src/namespace/builtins as Builtins
 	../../../src/utils/source: module_source, root_module_id, same_source
 	../../../src/specialize/specialize as Concrete
-	../../../src/utils/syntax: Diagnostic, ExpressionBase(FloatExpression), ParsedBody(ParsedValueBody)
+	../../../src/utils/syntax:
+		Diagnostic, ExpressionBase(FloatExpression), ParsedBody(ParsedValueBody),
+		ParsedRuntimeOperation(FloatCopySignBuiltin, FloatEqualsBuiltin, FloatLessThanBuiltin, FloatIsNaNBuiltin, FloatIsFiniteBuiltin)
 	../compilation: compile, compile_modules
 	float as FloatOps
 	../input: setup_diagnostic
@@ -292,8 +295,8 @@ pure func test_lowering_publishes_one_float_definition() -> Bool:
 		Ok(program):
 			match Lower.lowered_functions(program).functions:
 				[_, number]:
-					match (number.steps, number.tail):
-						([Lower.Define(definition)], Lower.ExitValue(Lower.ReturnValue(returned))):
+					match (number.steps, number.result):
+						([Lower.Define(definition)], returned):
 							match definition.operation:
 								Lower.FloatValue(number):
 									(
@@ -692,9 +695,277 @@ pure func test_parse_float_checker_rejects_int_option_payload() -> Bool:
 	)
 
 
+
+private pure func emits_binary_predicate(label: String, condition: String) -> Bool:
+	prefix: String =
+		|pure func predicate(first: Float, second: Float) -> Bool:
+		|
+	suffix: String =
+		|func main() -> Int:
+		|    result = predicate(1.0, 2.0)
+		|    0
+		|
+	source = prefix + "    builtin(\"" + label + "\")\n" + suffix
+	match compile_modules([{ source = source, targets = [] }], TEST_BASE):
+		Ok(output): output.contains(condition) and output.contains("DBL_MANT_DIG==53")
+		Err(_): False
+
+
+private pure func emits_unary_predicate(label: String, condition: String) -> Bool:
+	prefix: String =
+		|pure func predicate(value: Float) -> Bool:
+		|
+	suffix: String =
+		|func main() -> Int:
+		|    result = predicate(1.0)
+		|    0
+		|
+	source = prefix + "    builtin(\"" + label + "\")\n" + suffix
+	match compile_modules([{ source = source, targets = [] }], TEST_BASE):
+		Ok(output): output.contains(condition) and output.contains("DBL_MANT_DIG==53")
+		Err(_): False
+
+
+pure func test_copy_sign_emits_the_direct_math_function() -> Bool:
+	source: String =
+		|pure func copy_sign(value: Float, sign: Float) -> Float:
+		|    builtin("float.copysign")
+		|func main() -> Int:
+		|    result = copy_sign(1.0, -0.0)
+		|    0
+		|
+	match compile(source):
+		Ok(output): output.contains("=copysign(blorp_vl_0,blorp_vl_1)") and not output.contains("blorp_float_copysign")
+		Err(_): False
+
+
+pure func test_float_equality_emits_scalar_comparison() -> Bool:
+	emits_binary_predicate("float.equals", "=(blorp_vl_0==blorp_vl_1)?")
+
+
+pure func test_float_ordering_preserves_operand_order() -> Bool:
+	emits_binary_predicate("float.less_than", "=(blorp_vl_0<blorp_vl_1)?")
+
+
+pure func test_nan_classification_uses_one_operand() -> Bool:
+	emits_unary_predicate("float.is_nan", "=isnan(blorp_vl_0)?")
+
+
+pure func test_finite_classification_uses_one_operand() -> Bool:
+	emits_unary_predicate("float.is_finite", "=isfinite(blorp_vl_0)?")
+
+
+pure func test_float_predicate_rejects_an_int_parameter() -> Bool:
+	rejects_runtime(
+		"pure func predicate(first: Int, second: Float) -> Bool:",
+		"\"float.equals\"",
+		"declare a pure nongeneric function with two Float parameters returning Bool",
+	)
+
+
+pure func test_float_predicate_rejects_an_int_result() -> Bool:
+	rejects_runtime(
+		"pure func predicate(first: Float, second: Float) -> Int:",
+		"\"float.less_than\"",
+		"declare a pure nongeneric function with two Float parameters returning Bool",
+	)
+
+
+pure func test_float_classifier_rejects_impurity() -> Bool:
+	rejects_runtime(
+		"func predicate(value: Float) -> Bool:",
+		"\"float.is_nan\"",
+		"declare a pure nongeneric function with one Float parameter returning Bool",
+	)
+
+
+pure func test_float_classifier_rejects_a_second_parameter() -> Bool:
+	rejects_runtime(
+		"pure func predicate(first: Float, second: Float) -> Bool:",
+		"\"float.is_finite\"",
+		"declare a pure nongeneric function with one Float parameter returning Bool",
+	)
+
+
+pure func test_copy_sign_rejects_a_generic_header() -> Bool:
+	rejects_runtime(
+		"pure func copy_sign[T](value: Float, sign: Float) -> Float:",
+		"\"float.copysign\"",
+		"declare a pure nongeneric function with two Float parameters returning Float",
+	)
+
+
+private pure func binary_float_source(label: String, result_type: String) -> String:
+	prefix = "pure func probe(first: Float, second: Float) -> " + result_type + ":\n"
+	main: String =
+		|func main() -> Int:
+		|    result = probe(1.0, -0.0)
+		|    0
+		|
+	prefix + "    builtin(\"" + label + "\")\n" + main
+
+
+private pure func unary_float_source(label: String) -> String:
+	prefix: String =
+		|pure func probe(value: Float) -> Bool:
+		|
+	main: String =
+		|func main() -> Int:
+		|    result = probe(1.0)
+		|    0
+		|
+	prefix + "    builtin(\"" + label + "\")\n" + main
+
+
+private pure func is_float_operation(target: Concrete.CallTarget, expected: ParsedRuntimeOperation) -> Bool:
+	match (target, expected):
+		(Concrete.RuntimeFunction(Builtins.FloatCopySign), FloatCopySignBuiltin): True
+		(Concrete.RuntimeFunction(Builtins.FloatEquals(_)), FloatEqualsBuiltin): True
+		(Concrete.RuntimeFunction(Builtins.FloatLessThan(_)), FloatLessThanBuiltin): True
+		(Concrete.RuntimeFunction(Builtins.FloatIsNaN(_)), FloatIsNaNBuiltin): True
+		(Concrete.RuntimeFunction(Builtins.FloatIsFinite(_)), FloatIsFiniteBuiltin): True
+		_: False
+
+
+private pure func float_operands(source: String) -> Result[Lower.LoweredProgram, Diagnostic]:
+	parse_modules([{ source = source, targets = [] }])
+		.and_then(pure func(parsed): check(parsed).map_err(setup_diagnostic))
+		.and_then(Concrete.specialize).and_then(Lower.lower)
+
+
+private pure func lowered_float_operands(source: String, expected: ParsedRuntimeOperation) -> Bool:
+	match float_operands(source):
+		Err(_): False
+		Ok(program):
+			contents = Lower.lowered_functions(program)
+			match contents.functions:
+				[_, function]:
+					match (function.steps, function.result):
+						([Lower.Define(first), Lower.Define(second), Lower.Define(result)], returned):
+							match (first.operation, second.operation, result.operation):
+								(Lower.ParameterValue(0), Lower.ParameterValue(1), Lower.CallValue(target, [left, right])):
+									(Concrete.same_type(first.value_type, Concrete.FloatType)
+									and Concrete.same_type(second.value_type, Concrete.FloatType)
+									and Concrete.same_type(result.value_type, function.signature.return_type)
+									and Lower.value_number(first.id) == 0 and Lower.value_number(second.id) == 1
+									and Lower.value_number(left) == 0 and Lower.value_number(right) == 1
+									and Lower.value_number(result.id) == 2 and Lower.value_number(returned) == 2
+									and is_float_operation(target, expected))
+								_: False
+						([Lower.Define(first), Lower.Define(result)], returned):
+							match (first.operation, result.operation):
+								(Lower.ParameterValue(0), Lower.CallValue(target, [argument])):
+									(Concrete.same_type(first.value_type, Concrete.FloatType)
+									and Concrete.same_type(result.value_type, function.signature.return_type)
+									and Lower.value_number(first.id) == 0 and Lower.value_number(argument) == 0
+									and Lower.value_number(result.id) == 1 and Lower.value_number(returned) == 1
+									and is_float_operation(target, expected))
+								_: False
+						_: False
+				_: False
+
+
+private pure func owned_float_operands(source: String, expected: ParsedRuntimeOperation) -> Bool:
+	match float_operands(source):
+		Err(_): False
+		Ok(program):
+			contents = Lower.lowered_functions(program)
+			match contents.functions:
+				[_, function]:
+					match Own.insert_function(function, contents.unions, contents.records):
+						Err(_): False
+						Ok(owned):
+							match (owned.operations, owned.result):
+								([Own.DefineValue(first), Own.DefineValue(second), Own.DefineValue(result)], Own.UnmanagedReturn(returned)):
+									match (first.operation, second.operation, result.operation):
+										(Own.ParameterDefinition(0), Own.ParameterDefinition(1), Own.CallDefinition(target, [Own.UnmanagedArgument(left), Own.UnmanagedArgument(right)])):
+											match (first.result, second.result, result.result):
+												(Own.UnmanagedResult, Own.UnmanagedResult, Own.UnmanagedResult):
+													(Concrete.same_type(first.value_type, Concrete.FloatType)
+													and Concrete.same_type(second.value_type, Concrete.FloatType)
+													and Concrete.same_type(result.value_type, owned.signature.return_type)
+													and Lower.value_number(first.id) == 0 and Lower.value_number(second.id) == 1
+													and Lower.value_number(left) == 0 and Lower.value_number(right) == 1
+													and Lower.value_number(result.id) == 2 and Lower.value_number(returned) == 2
+													and is_float_operation(target, expected))
+												_: False
+										_: False
+								([Own.DefineValue(first), Own.DefineValue(result)], Own.UnmanagedReturn(returned)):
+									match (first.operation, result.operation, first.result, result.result):
+										(Own.ParameterDefinition(0), Own.CallDefinition(target, [Own.UnmanagedArgument(argument)]), Own.UnmanagedResult, Own.UnmanagedResult):
+											(Concrete.same_type(first.value_type, Concrete.FloatType)
+											and Concrete.same_type(result.value_type, owned.signature.return_type)
+											and Lower.value_number(first.id) == 0 and Lower.value_number(argument) == 0
+											and Lower.value_number(result.id) == 1 and Lower.value_number(returned) == 1
+											and is_float_operation(target, expected))
+										_: False
+								_: False
+				_: False
+
+
+pure func test_lowered_copy_sign_preserves_float_operands_and_result() -> Bool:
+	lowered_float_operands(binary_float_source("float.copysign", "Float"), FloatCopySignBuiltin)
+
+
+pure func test_owned_copy_sign_preserves_float_operands_and_result() -> Bool:
+	owned_float_operands(binary_float_source("float.copysign", "Float"), FloatCopySignBuiltin)
+
+
+pure func test_lowered_equality_preserves_float_operands_and_result() -> Bool:
+	lowered_float_operands(binary_float_source("float.equals", "Bool"), FloatEqualsBuiltin)
+
+
+pure func test_owned_equality_preserves_float_operands_and_result() -> Bool:
+	owned_float_operands(binary_float_source("float.equals", "Bool"), FloatEqualsBuiltin)
+
+
+pure func test_lowered_ordering_preserves_float_operands_and_result() -> Bool:
+	lowered_float_operands(binary_float_source("float.less_than", "Bool"), FloatLessThanBuiltin)
+
+
+pure func test_owned_ordering_preserves_float_operands_and_result() -> Bool:
+	owned_float_operands(binary_float_source("float.less_than", "Bool"), FloatLessThanBuiltin)
+
+
+pure func test_lowered_nan_preserves_float_operands_and_result() -> Bool:
+	lowered_float_operands(unary_float_source("float.is_nan"), FloatIsNaNBuiltin)
+
+
+pure func test_owned_nan_preserves_float_operands_and_result() -> Bool:
+	owned_float_operands(unary_float_source("float.is_nan"), FloatIsNaNBuiltin)
+
+
+pure func test_lowered_finite_preserves_float_operands_and_result() -> Bool:
+	lowered_float_operands(unary_float_source("float.is_finite"), FloatIsFiniteBuiltin)
+
+
+pure func test_owned_finite_preserves_float_operands_and_result() -> Bool:
+	owned_float_operands(unary_float_source("float.is_finite"), FloatIsFiniteBuiltin)
+
+
 tests: TestSuite = {
 	description = "Blorp 2 Float producer-to-consumer boundary",
 	tests = [
+		("Float lowered copy_sign operands and result", test_lowered_copy_sign_preserves_float_operands_and_result),
+		("Float owned copy_sign operands and result", test_owned_copy_sign_preserves_float_operands_and_result),
+		("Float lowered equality operands and result", test_lowered_equality_preserves_float_operands_and_result),
+		("Float owned equality operands and result", test_owned_equality_preserves_float_operands_and_result),
+		("Float lowered ordering operands and result", test_lowered_ordering_preserves_float_operands_and_result),
+		("Float owned ordering operands and result", test_owned_ordering_preserves_float_operands_and_result),
+		("Float lowered nan operands and result", test_lowered_nan_preserves_float_operands_and_result),
+		("Float owned nan operands and result", test_owned_nan_preserves_float_operands_and_result),
+		("Float lowered finite operands and result", test_lowered_finite_preserves_float_operands_and_result),
+		("Float owned finite operands and result", test_owned_finite_preserves_float_operands_and_result),
+		("copy sign emits direct math function", test_copy_sign_emits_the_direct_math_function),
+		("Float equality emits scalar comparison", test_float_equality_emits_scalar_comparison),
+		("Float ordering preserves operand order", test_float_ordering_preserves_operand_order),
+		("NaN classification uses one operand", test_nan_classification_uses_one_operand),
+		("finite classification uses one operand", test_finite_classification_uses_one_operand),
+		("Float predicate rejects Int parameter", test_float_predicate_rejects_an_int_parameter),
+		("Float predicate rejects Int result", test_float_predicate_rejects_an_int_result),
+		("Float classifier rejects impurity", test_float_classifier_rejects_impurity),
+		("Float classifier rejects second parameter", test_float_classifier_rejects_a_second_parameter),
+		("copy sign rejects generic header", test_copy_sign_rejects_a_generic_header),
 		(
 			"Float foundation role required without fallback",
 			test_float_foundation_role_is_required_without_fallback,

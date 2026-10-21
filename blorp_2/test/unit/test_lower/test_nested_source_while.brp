@@ -1,0 +1,90 @@
+import:
+	../../../src/lower/lower as Lower
+	../../../src/specialize/specialize as Concrete
+	../../../src/utils/syntax: entry_function
+	../source_while_inputs as Input
+	../nested_while_inputs as Nested
+	test: TestSuite
+
+
+private pure func entry(source: String) -> Option[Lower.LoweredFunction]:
+	program ?= Input.lowered(source).to_option()
+	contents = Lower.lowered_functions(program)
+	contents.functions.get(Concrete.function_number(entry_function(contents.entrypoint)))
+
+
+private pure func first_loop(steps: List[Lower.LoweredStep]) -> Option[Lower.LoweredLoop]:
+	var found: Option[Lower.LoweredLoop] = None
+	for step in steps:
+		match step:
+			Lower.Loop(loop):
+				found = Some(loop)
+				break
+			_: void
+	found
+
+
+private pure func matching(loop: Lower.LoweredLoop) -> Option[Lower.LoopMatch]:
+	match loop.body.tail:
+		Lower.MatchLoop(branch): Some(branch)
+		Lower.ExitLoop(_): None
+
+
+private pure func interval_facts() -> Option[Bool]:
+	function ?= entry(Nested.MANY_ITERATIONS)
+	outer ?= first_loop(function.steps)
+	outer_branch ?= matching(outer)
+	outer_body ?= outer_branch.arms.get(0)
+	inner ?= first_loop(outer_body.body.steps)
+	outer_header ?= outer.headers.get(0)
+	inner_header ?= inner.headers.get(0)
+	outer_last_header ?= outer.headers.get(1)
+	inner_last_output ?= inner.carried.get(1)
+	Some(outer.headers.length() == 2 and inner.headers.length() == 2
+		and Lower.value_number(outer.result.id) < Lower.value_number(outer_header.parameter.id)
+		and Lower.value_number(outer_last_header.parameter.id) < Lower.value_number(inner.result.id)
+		and Lower.value_number(inner_last_output.id) < Lower.value_number(inner_header.parameter.id)
+		and Lower.value_number(inner_header.initial) != Lower.value_number(inner_header.parameter.id))
+
+
+pure func test_nested_loop_headers_follow_own_parent_output_interval() -> Bool:
+	interval_facts().get_or(False)
+
+
+private pure func false_write_facts() -> Option[Bool]:
+	function ?= entry(Nested.FINAL_FALSE_WRITES)
+	outer ?= first_loop(function.steps)
+	outer_branch ?= matching(outer)
+	outer_body ?= outer_branch.arms.get(0)
+	inner ?= first_loop(outer_body.body.steps)
+	inner_output ?= inner.carried.get(0)
+	inner_branch ?= matching(inner)
+	inner_false ?= inner_branch.arms.get(1)
+	condition_step ?= inner.body.steps.get(1)
+	match condition_step:
+		Lower.Join(condition):
+			condition_output ?= condition.carried.get(0)
+			match inner_false.body.tail:
+				Lower.ExitLoop(Lower.Break(outputs)):
+					false_total ?= outputs.carried.get(0)
+					match outer_body.body.tail:
+						Lower.ExitLoop(Lower.Recur(values, _)):
+							outer_total ?= values.get(0)
+							Some(Lower.value_number(false_total) == Lower.value_number(condition_output.id)
+								and Lower.value_number(outer_total) == Lower.value_number(inner_output.id))
+						_: None
+				_: None
+		_: None
+
+
+pure func test_inner_final_false_write_feeds_outer_backedge() -> Bool:
+	false_write_facts().get_or(False)
+
+
+tests: TestSuite = {
+	description = "Blorp 2 nested scalar while lowering",
+	tests = [
+		("nested H follows its own parent P interval", test_nested_loop_headers_follow_own_parent_output_interval),
+		("inner final False write feeds outer backedge", test_inner_final_false_write_feeds_outer_backedge),
+	]
+}

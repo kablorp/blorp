@@ -4,11 +4,13 @@ admission and the pending value tree. Only complete types leave through
 publish_inference_type; temporary inference variables never become published TypeRefs.
 ---
 import:
+	result as ResultOps
+	../utils/boolean: not, and, or
 	./callables:
 		FunctionContract, ReceiverCandidate, ResolvedReceiver(UniqueReceiver, ReceiverCandidates),
 		ResolutionContext, method_sites, receiver_contract
 	./model:
-		BindingId, CallableParameterId, CallableArgument, FunctionSignature,
+		BindingId, CaptureId, ScopedBindingId, LambdaId, CallableParameterId, CallableArgument, FunctionSignature,
 		CallIdentity(DeclaredTarget, ParameterTarget),
 		FieldId,
 		CheckedCall,
@@ -24,6 +26,7 @@ import:
 		CheckError,
 		MethodError(AmbiguousMethod, NoApplicableMethod), method_error,
 		ExpectedTypeSite(SourceAnnotation),
+		ValueError(ExpressionTypeMismatch), value_error,
 		CallError(ArgumentTypeMismatch, GenericArgumentConflict, UninferableTypeParameter, InfiniteTypeArgument),
 		CheckerInvariant(GenericConstructorContract, InvalidInferenceVariable, InvalidInferenceWorklist, MissingCallParameter, MissingGenericParameter),
 		call_error,
@@ -32,7 +35,7 @@ import:
 	../utils/syntax: Span, WrittenName, ReceiverApplication
 	../namespace/namespace: same_head
 	int as IntOps
-	option: to_result
+	option: to_result, map, get_or, is_none, is_some
 
 
 fixed record ExpectedValue {
@@ -64,8 +67,11 @@ fixed union PendingBase:
 	AcceptedFloat(Float)
 	AcceptedString(String)
 	AcceptedBinding(BindingId)
+	AcceptedCapture(CaptureId)
+	PendingCapture(ScopedBindingId)
 	PendingNamedCallable(FunctionId, FunctionSignature, Int)
 	PendingForwardedCallable(CallableParameterId)
+	PendingLambda(LambdaId)
 	PendingDirectCall(PendingCall, List[PendingValue])
 	PendingConstructRecord(RecordId, List[PendingRecordField])
 	PendingUpdateRecord(RecordId, PendingValue, Span, List[PendingRecordField], List[PendingRetainedField])
@@ -122,11 +128,13 @@ private pure func parameter_in_type(parameter: TypeParameterId, value_type: Type
 		ParameterType(actual):
 			same_parameter(parameter, actual)
 		PureCallableType(parameters, result):
-			parameters.any(pure func(value): parameter_in_type(parameter, value)) or parameter_in_type(parameter, result)
+			match parameters.any(pure func(value): parameter_in_type(parameter, value)):
+				True: True
+				False: parameter_in_type(parameter, result)
 		ListType(element):
 			parameter_in_type(parameter, element)
 		AppliedRecordType(_, arguments):
-			var found = False
+			var found: Bool = False
 
 			for argument in arguments:
 				if parameter_in_type(parameter, argument):
@@ -135,7 +143,7 @@ private pure func parameter_in_type(parameter: TypeParameterId, value_type: Type
 
 			found
 		AppliedUnionType(_, arguments):
-			var found = False
+			var found: Bool = False
 
 			for argument in arguments:
 				if parameter_in_type(parameter, argument):
@@ -154,12 +162,12 @@ pure func inference_complete(value_type: InferenceType, slots: List[InferenceSlo
 		CallVariable(_): Ok(False)
 		AcceptedType(_): Ok(True)
 		InferredCallable(parameters, result):
-			var complete = True
+			var complete: Bool = True
 			var failure: Option[CheckError] = None
 			for child in parameters.append(result):
 				match inference_complete(child, slots, span):
 					Ok(ready):
-						if not ready:
+						if ready.not():
 							complete = False
 							break
 					Err(error):
@@ -170,7 +178,7 @@ pure func inference_complete(value_type: InferenceType, slots: List[InferenceSlo
 				None: Ok(complete)
 		InferredList(element): inference_complete(element, slots, span)
 		InferredRecord(_, arguments):
-			var complete = True
+			var complete: Bool = True
 			var failure: Option[CheckError] = None
 
 			for argument in arguments:
@@ -179,7 +187,7 @@ pure func inference_complete(value_type: InferenceType, slots: List[InferenceSlo
 						failure = Some(error)
 						break
 					Ok(value):
-						if not value:
+						if value.not():
 							complete = False
 							break
 
@@ -187,7 +195,7 @@ pure func inference_complete(value_type: InferenceType, slots: List[InferenceSlo
 				Some(error): Err(error)
 				None: Ok(complete)
 		InferredUnion(_, arguments):
-			var complete = True
+			var complete: Bool = True
 			var failure: Option[CheckError] = None
 
 			for argument in arguments:
@@ -196,7 +204,7 @@ pure func inference_complete(value_type: InferenceType, slots: List[InferenceSlo
 						failure = Some(error)
 						break
 					Ok(value):
-						if not value:
+						if value.not():
 							complete = False
 							break
 
@@ -206,21 +214,21 @@ pure func inference_complete(value_type: InferenceType, slots: List[InferenceSlo
 
 
 pure func call_inference_ready(call: PendingCall, slots: List[InferenceSlot]) -> Result[Bool, CheckError]:
-	var complete = True
+	var complete: Bool = True
 	var failure: Option[CheckError] = None
 
 	for parameter in call.contract.signature.type_parameters:
-		variable = CallVariable(into_opaque InferenceVariableId(IntOps.add(call.variable_start, parameter_position(parameter))))
+		variable: InferenceType = CallVariable(into_opaque InferenceVariableId(IntOps.add(call.variable_start, parameter_position(parameter))))
 
 		match inference_complete(variable, slots, call.contract.span):
 			Err(error):
 				failure = Some(error)
 				break
 			Ok(ready):
-				if not ready:
+				if ready.not():
 					complete = False
 
-					if not parameter_in_type(parameter, call.contract.signature.return_type.value_type):
+					if parameter_in_type(parameter, call.contract.signature.return_type.value_type).not():
 						failure = Some(call_error(call.contract.span, UninferableTypeParameter(parameter)))
 						break
 
@@ -360,7 +368,7 @@ private pure func merge_hint(first: InferenceType, next: InferenceType, slots: L
 		BindInference(_, known): Ok(Some(known))
 		CallableEquality(parameters, others, result, other):
 			var values: List[InferenceType] = []
-			var complete = True
+			var complete: Bool = True
 			var failure: Option[CheckError] = None
 			var position = 0
 			for parameter in parameters:
@@ -368,13 +376,13 @@ private pure func merge_hint(first: InferenceType, next: InferenceType, slots: L
 					Ok(Some(value)): values = values.append(value)
 					Ok(None): complete = False
 					Err(error): failure = Some(error)
-				if not complete or failure.is_some():
+				if or(complete.not(), failure.is_some()):
 					break
 				position = IntOps.add(position, 1)
 			match failure:
 				Some(error): Err(error)
 				None:
-					if not complete:
+					if complete.not():
 						Ok(None)
 					else:
 						match merge_hint(result, other, slots, span):
@@ -404,7 +412,7 @@ private pure func merge_hint(first: InferenceType, next: InferenceType, slots: L
 					retained = retained_hint(left, right)
 					var values: List[InferenceType] = []
 					var position = 0
-					var complete = True
+					var complete: Bool = True
 					var failure: Option[CheckError] = None
 
 					for argument in left_arguments:
@@ -441,7 +449,7 @@ private pure func merge_hint(first: InferenceType, next: InferenceType, slots: L
 					retained = retained_hint(left, right)
 					var values: List[InferenceType] = []
 					var position = 0
-					var complete = True
+					var complete: Bool = True
 					var failure: Option[CheckError] = None
 
 					for argument in left_arguments:
@@ -527,10 +535,10 @@ private pure func project_result_hint(contract: FunctionContract, result_hint: I
 
 	var work: List[HintEquality] = [{ pattern = contract.signature.return_type.value_type, known = result_hint }]
 	var depth = 1
-	var compatible = True
+	var compatible: Bool = True
 	var failure: Option[CheckError] = None
 
-	while IntOps.greater_than(depth, 0) and compatible and failure.is_none():
+	while and(and(IntOps.greater_than(depth, 0), compatible), failure.is_none()):
 		depth = IntOps.subtract(depth, 1)
 
 		match work.get(depth):
@@ -582,7 +590,10 @@ private pure func project_result_hint(contract: FunctionContract, result_hint: I
 							AppliedRecordType(owner, arguments):
 								match inference_shape(known):
 									InferredRecord(known_owner, known_arguments):
-										compatible = IntOps.equals(record_number(owner), record_number(known_owner)) and IntOps.equals(arguments.length(), known_arguments.length())
+										compatible = and(
+											IntOps.equals(record_number(owner), record_number(known_owner)),
+											IntOps.equals(arguments.length(), known_arguments.length()),
+										)
 
 										if compatible:
 											var position = arguments.length()
@@ -602,7 +613,10 @@ private pure func project_result_hint(contract: FunctionContract, result_hint: I
 							AppliedUnionType(owner, arguments):
 								match inference_shape(known):
 									InferredUnion(known_owner, known_arguments):
-										compatible = IntOps.equals(union_number(owner), union_number(known_owner)) and IntOps.equals(arguments.length(), known_arguments.length())
+										compatible = and(
+											IntOps.equals(union_number(owner), union_number(known_owner)),
+											IntOps.equals(arguments.length(), known_arguments.length()),
+										)
 
 										if compatible:
 											var position = arguments.length()
@@ -645,7 +659,7 @@ pure func apply_type_hint(value_type: TypeRef, parameters: List[TypeParameterId]
 					None: Some(inference_type(value_type, [], 0))
 			PureCallableType(children, result):
 				var values: List[InferenceType] = []
-				var complete = True
+				var complete: Bool = True
 				for child in children:
 					match apply_type_hint(child, parameters, hints):
 						Some(value): values = values.append(value)
@@ -661,7 +675,7 @@ pure func apply_type_hint(value_type: TypeRef, parameters: List[TypeParameterId]
 				apply_type_hint(element, parameters, hints).map(list_inference_type)
 			AppliedRecordType(owner, arguments):
 				var values: List[InferenceType] = []
-				var complete = True
+				var complete: Bool = True
 
 				for argument in arguments:
 					match apply_type_hint(argument, parameters, hints):
@@ -676,7 +690,7 @@ pure func apply_type_hint(value_type: TypeRef, parameters: List[TypeParameterId]
 					None
 			AppliedUnionType(owner, arguments):
 				var values: List[InferenceType] = []
-				var complete = True
+				var complete: Bool = True
 
 				for argument in arguments:
 					match apply_type_hint(argument, parameters, hints):
@@ -696,12 +710,13 @@ pure func call_argument_hints(call: PendingCall, result_hint: Option[InferenceTy
 	contract = call.contract
 	projection_result: Result[List[Option[InferenceType]], CheckError] = match result_hint:
 		None: Ok([])
-		Some(known): project_result_hint(contract, known, slots).map(pure func(value): value.get_or([]))
+		Some(known): ResultOps.map(project_result_hint(contract, known, slots), pure func(value): value.get_or([]))
 	projection ?= projection_result
 	var candidates: List[Option[InferenceType]] = []
 
+	no_projection: Option[InferenceType] = None
 	for parameter in contract.signature.type_parameters:
-		candidate = projection.get(parameter_position(parameter)).get_or(None).get_or(inference_type(ParameterType(parameter), contract.signature.type_parameters, call.variable_start))
+		candidate = projection.get(parameter_position(parameter)).get_or(no_projection).get_or(inference_type(ParameterType(parameter), contract.signature.type_parameters, call.variable_start))
 		candidates = candidates.append(Some(candidate))
 
 	var hints: List[Option[InferenceType]] = []
@@ -721,7 +736,7 @@ fixed union InferenceReadiness:
 
 pure func record_argument_origin(equality: InferenceEquality, slots: List[InferenceSlot]) -> Result[Option[InferenceSlotUpdate], CheckError]:
 	match equality.origin:
-		ResultConstraint(_): Ok(None)
+		ResultConstraint(_) | LambdaConstraint(_): Ok(None)
 		OpaqueOperandConstraint(_, _): Ok(None)
 		VariantConstraint(_, _): Ok(None)
 		RecordFieldConstraint(_, _, _): Ok(None)
@@ -787,6 +802,7 @@ fixed record CallResultContext {
 fixed union ConstraintOrigin:
 	ArgumentConstraint(PendingCall, Int, InferenceUse, TypeUse)
 	ResultConstraint(CallResultContext)
+	LambdaConstraint(Span)
 	OpaqueOperandConstraint(ExpectedValue, Span)
 	VariantConstraint(PendingVariantContract, Int)
 	RecordFieldConstraint(FieldId, InferenceUse, Span)
@@ -833,7 +849,7 @@ pure func inference_type(
 		match value_type:
 			PureCallableType(parameters, result):
 				var values: List[InferenceType] = []
-				var retained = True
+				var retained: Bool = True
 				for parameter in parameters:
 					value = inference_type(parameter, parameters_of_call, variable_start)
 					values = values.append(value)
@@ -855,7 +871,7 @@ pure func inference_type(
 					_: InferredList(element_type)
 			AppliedRecordType(owner, arguments):
 				var values: List[InferenceType] = []
-				var retained = True
+				var retained: Bool = True
 
 				for argument in arguments:
 					value = inference_type(argument, parameters_of_call, variable_start)
@@ -871,7 +887,7 @@ pure func inference_type(
 					InferredRecord(owner, values)
 			AppliedUnionType(owner, arguments):
 				var values: List[InferenceType] = []
-				var retained = True
+				var retained: Bool = True
 
 				for argument in arguments:
 					value = inference_type(argument, parameters_of_call, variable_start)
@@ -901,7 +917,7 @@ pure func inference_type(
 pure func inference_shape(value: InferenceType) -> InferenceType:
 	match value:
 		AcceptedType(PureCallableType(parameters, result)):
-			InferredCallable(parameters.map(pure func(value): AcceptedType(value)), AcceptedType(result))
+			InferredCallable(parameters.map(pure func(parameter_type): AcceptedType(parameter_type)), AcceptedType(result))
 		AcceptedType(ListType(element)): InferredList(AcceptedType(element))
 		AcceptedType(AppliedRecordType(owner, arguments)):
 			var values: List[InferenceType] = []
@@ -930,7 +946,7 @@ pure func list_inference_type(element: InferenceType) -> InferenceType:
 
 private pure func substituted_record(owner: RecordId, arguments: List[InferenceType]) -> InferenceType:
 	var values: List[TypeRef] = []
-	var complete = True
+	var complete: Bool = True
 
 	for argument in arguments:
 		match argument:
@@ -947,7 +963,7 @@ private pure func substituted_record(owner: RecordId, arguments: List[InferenceT
 
 private pure func substituted_union(owner: UnionId, arguments: List[InferenceType]) -> InferenceType:
 	var values: List[TypeRef] = []
-	var complete = True
+	var complete: Bool = True
 
 	for argument in arguments:
 		match argument:
@@ -968,10 +984,10 @@ pure func inference_head(
 	span: Span,
 ) -> Result[InferenceType, CheckError]:
 	var current = value_type
-	var complete = False
+	var complete: Bool = False
 	var failure: Option[CheckError] = None
 
-	while not complete:
+	while complete.not():
 		match current:
 			CallVariable(id):
 				match slots.get(from_opaque InferenceVariableId(id)):
@@ -1011,10 +1027,10 @@ private pure func inference_occurs(
 ) -> Result[Bool, CheckError]:
 	var pending = [value_type]
 	var pending_count = 1
-	var found = False
+	var found: Bool = False
 	var failure: Option[CheckError] = None
 
-	while IntOps.greater_than(pending_count, 0) and not found:
+	while and(IntOps.greater_than(pending_count, 0), found.not()):
 		pending_count = IntOps.subtract(pending_count, 1)
 
 		match pending.get(pending_count):
@@ -1147,6 +1163,7 @@ private pure func inference_origin_span(origin: ConstraintOrigin) -> Span:
 			actual.span
 		ResultConstraint(result):
 			result.span
+		LambdaConstraint(span): span
 		OpaqueOperandConstraint(_, span): span
 		VariantConstraint(contract, _): contract.span
 		RecordFieldConstraint(_, _, span): span
@@ -1161,7 +1178,7 @@ private pure func inference_conflict(
 	span = inference_origin_span(equality.origin)
 
 	match equality.origin:
-		ResultConstraint(_):
+		ResultConstraint(_) | LambdaConstraint(_):
 			Err(checker_invariant(span, InvalidInferenceWorklist))
 		OpaqueOperandConstraint(_, _): Err(checker_invariant(span, InvalidInferenceWorklist))
 		VariantConstraint(_, _): Err(checker_invariant(span, InvalidInferenceWorklist))
@@ -1260,7 +1277,10 @@ private pure func inference_shape_action(left: InferenceType, right: InferenceTy
 		InferredRecord(left_owner, left_arguments):
 			match right:
 				InferredRecord(right_owner, right_arguments):
-					if IntOps.equals(record_number(left_owner), record_number(right_owner)) and IntOps.equals(left_arguments.length(), right_arguments.length()):
+					if and(
+						IntOps.equals(record_number(left_owner), record_number(right_owner)),
+						IntOps.equals(left_arguments.length(), right_arguments.length()),
+					):
 						RecordEquality(left_arguments, right_arguments)
 					else:
 						InferenceMismatch
@@ -1268,7 +1288,10 @@ private pure func inference_shape_action(left: InferenceType, right: InferenceTy
 		InferredUnion(left_owner, left_arguments):
 			match right:
 				InferredUnion(right_owner, right_arguments):
-					if IntOps.equals(union_number(left_owner), union_number(right_owner)) and IntOps.equals(left_arguments.length(), right_arguments.length()):
+					if and(
+						IntOps.equals(union_number(left_owner), union_number(right_owner)),
+						IntOps.equals(left_arguments.length(), right_arguments.length()),
+					):
 						UnionEquality(left_arguments, right_arguments)
 					else:
 						InferenceMismatch
@@ -1354,6 +1377,10 @@ pure func inspect_inference_equality(
 			match relation:
 				RequireEquality:
 					match current.origin:
+						LambdaConstraint(site):
+							match lambda_constraint_error(current, slots, site):
+								Ok(error): Err(error)
+								Err(error): Err(error)
 						ResultConstraint(_):
 							-- The enclosing expression/field owns this mismatch diagnostic.
 							Ok(IncompatibleResult)
@@ -1404,6 +1431,7 @@ private pure func inference_occurs_error(equality: InferenceEquality, root: Infe
 	site_result: Result[ExpectedTypeSite, CheckError] = match equality.origin:
 		ArgumentConstraint(call, _, _, written): Ok(SourceAnnotation(written.span))
 		ResultConstraint(result): Ok(result.expected.site)
+		LambdaConstraint(lambda_span): Ok(SourceAnnotation(lambda_span))
 		OpaqueOperandConstraint(expected, _): Ok(expected.site)
 		RecordFieldConstraint(_, expected, _): Ok(SourceAnnotation(expected.span))
 		ListElementConstraint(_, element_span): Ok(SourceAnnotation(element_span))
@@ -1455,10 +1483,10 @@ pure func publish_pending_call(
 				failure = Some(error)
 				break
 			Ok(value): types = types.append(value)
-	ready ?= match failure:
+	ready: Void ?= match failure:
 		Some(error): Err(error)
 		None: Ok(void)
-	target = match contract.target:
+	target: CallTarget = match contract.target:
 		DeclaredTarget(function): UserFunction(function, types, callables)
 		ParameterTarget(parameter): CallableParameter(parameter)
 	Ok({ target = target, span = contract.span })
@@ -1471,7 +1499,7 @@ private pure func disjoint_heads(left: TypeRef, right: TypeRef) -> Bool:
 		Some(left_head):
 			match type_head(right):
 				None: False
-				Some(right_head): not same_head(left_head, right_head)
+				Some(right_head): same_head(left_head, right_head).not()
 
 
 private pure func solve_overlap(equality: InferenceEquality, slots: List[InferenceSlot]) -> Result[Option[List[InferenceSlot]], CheckError]:
@@ -1507,7 +1535,7 @@ private pure func solve_overlap_arguments(parent: InferenceEquality, left: List[
 -- A call supplies [] for its actual receiver, keeping caller parameters rigid.
 pure func types_overlap(left: TypeRef, left_parameters: List[TypeParameterId], right: TypeRef, right_parameters: List[TypeParameterId], span: Span) -> Result[Bool, CheckError]:
 	-- With no flexible parameters the solver compares accepted types directly.
-	if left_parameters.is_empty() and right_parameters.is_empty():
+	if and(left_parameters.is_empty(), right_parameters.is_empty()):
 		Ok(same_type(left, right))
 	else if disjoint_heads(left, right):
 		Ok(False)
@@ -1557,3 +1585,11 @@ pure func select_receiver_contract(application: ReceiverApplication, receiver: R
 			match choose_receiver(application.callee, candidates, actual):
 				Err(selection_error): Err(selection_error)
 				Ok(selected): receiver_contract(context.caller, application.callee, application.arguments, selected.function.id, context.signatures)
+
+
+private pure func lambda_constraint_error(equality: InferenceEquality, slots: List[InferenceSlot], span: Span) -> Result[CheckError, CheckError]:
+	expected ?= publish_inference_type(equality.expected, slots, CompleteInference, span)
+	actual ?= publish_inference_type(equality.actual, slots, CompleteInference, span)
+	Ok(value_error(span, ExpressionTypeMismatch({
+		expected = expected, actual = { value_type = actual, span = span }, expected_site = SourceAnnotation(span)
+	})))

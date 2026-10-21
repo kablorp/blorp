@@ -15,7 +15,7 @@ import:
 	../../../src/verify/verify: verify
 	../compilation: compile
 	../input: check_failure, parse, setup_diagnostic
-	../managed_union_inputs: lowered
+	../managed_union_inputs: lowered, lowered_tail_join
 	test: TestSuite
 
 
@@ -450,25 +450,29 @@ pure func test_wildcard_keeps_the_second_same_typed_field_ordinal() -> Bool:
 		Ok(program):
 			match Lower.lowered_functions(program).functions:
 				[_, right]:
-					match (right.steps, right.tail):
-						([Lower.Define(parameter)], Lower.MatchValue(matched)):
-							match matched.arms:
-								[arm]:
-									match (arm.label, arm.body.steps, arm.body.exit):
-										(Lower.VariantLabel(selected), [Lower.Define(child)], Lower.ReturnValue(result)):
-											match child.operation:
-												Lower.PayloadValue(field, receiver):
-													owner = Concrete.variant_field_variant(field)
-													(
-														Concrete.variant_field_number(field) == 1
-														and Concrete.variant_number(owner) == Concrete.variant_number(selected)
-														and Concrete.union_number(Concrete.variant_owner(owner)) == Concrete.union_number(Concrete.variant_owner(selected))
-														and Lower.value_number(receiver) == Lower.value_number(parameter.id)
-														and Lower.value_number(result) == Lower.value_number(child.id)
-														and Concrete.same_type(child.value_type, Concrete.StringType)
-													)
+					match (right.steps, lowered_tail_join(right)):
+						([Lower.Define(parameter), Lower.Join(_)], Some(matched)):
+							match (matched.selection.nodes, matched.arms):
+								([Lower.EnterArm(edge)], [arm]):
+									match arm.exit:
+										Lower.Yield(outputs):
+											match (edge.definitions, edge.arguments, arm.inputs):
+												([Lower.BorrowUnionField(child, field, receiver)], [argument], [input]):
+													match parameter.value_type:
+														Concrete.UnionType(scrutinee_owner):
+															selected = Concrete.variant_field_variant(field)
+															(
+																Concrete.variant_field_number(field) == 1
+																and Concrete.union_number(Concrete.variant_owner(selected)) == Concrete.union_number(scrutinee_owner)
+																and Lower.value_number(receiver) == Lower.value_number(parameter.id)
+																and Lower.value_number(argument) == Lower.value_number(child.id)
+																and Lower.value_number(outputs.value) == Lower.value_number(input.id)
+																and Concrete.same_type(child.value_type, Concrete.StringType)
+																and Concrete.same_type(input.value_type, Concrete.StringType)
+															)
+														_: False
 												_: False
-										_: False
+										Lower.TransferLoop(_, _): False
 								_: False
 						_: False
 				_: False
@@ -492,8 +496,8 @@ pure func test_duplicate_borrowed_child_gets_fresh_owner_for_each_slot() -> Bool
 				[_, make]:
 					match make.operations:
 						[Own.DefineValue(parameter), Own.AcquireOwner(first, first_borrow, _), Own.AcquireOwner(second, second_borrow, _), Own.DefineValue(constructed)]:
-							match (constructed.operation, constructed.result, make.tail):
-								(Own.ConstructDefinition(_, [Own.OwnedPayload(a, a_owner), Own.OwnedPayload(b, b_owner)]), Own.OwnedResult(parent), Own.ReturnTail(Own.ReturnResult(Own.OwnedReturn(returned, returned_owner)))):
+							match (constructed.operation, constructed.result, make.result):
+								(Own.ConstructDefinition(_, [Own.OwnedPayload(a, a_owner), Own.OwnedPayload(b, b_owner)]), Own.OwnedResult(parent), Own.OwnedReturn(returned, returned_owner)):
 									(
 										valid
 										and Lower.value_number(a) == Lower.value_number(parameter.id)

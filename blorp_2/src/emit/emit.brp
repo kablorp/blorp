@@ -1,12 +1,15 @@
 import:
+	option: is_some
+	../utils/boolean: not, and
 	../namespace/builtins:
 		DesignatedBoolean,
 		DesignatedOption,
 		DesignatedResult,
 		RuntimeOperation(
+			FloatCopySign, FloatEquals, FloatLessThan, FloatIsNaN, FloatIsFinite,
 			IntAdd, IntSubtract, IntMultiply, IntDivide, IntRemainder, IntToString, StringLength, StringConcat,
 			StringPrint, StringPrintError, StringParseInt, StringParseFloat, ListRepeat, ListLength, ListGet, ListAppend, ListSet,
-			StringByteAt, StringFromCodepoint, GetCurrentDirectory, ReadFile, WriteFile,
+			StringByteAt, StringFromCodepoint, StringSlice, GetCurrentDirectory, ReadFile, WriteFile,
 			ListConcat, StringEquals,
 			IntEquals, IntLessThan, FloatAdd, FloatSubtract, FloatMultiply, FloatDivide, FloatRemainder,
 			FloatToString,
@@ -25,40 +28,36 @@ import:
 	../runtime/string_concat: STRING_CONCAT_RUNTIME
 	../runtime/memory: MEMORY_RUNTIME
 	int as IntOps
-	list: join
 	../runtime/list:
-		ListElementKey, ListUpdate(AppendUpdate, SetUpdate, ConcatUpdate), arguments_runtime,
+		ListElementKey, ListUpdate(AppendUpdate, SetUpdate, ConcatUpdate, SuffixUpdate), arguments_runtime,
 		list_c_type, list_child_key, list_element_key, list_key_depth, list_key_ordinal,
 		list_key_rank, list_root_allocation, list_runtime, list_slot_store, list_suffix,
 		list_update_name, list_update_runtime, same_list_key
-	../lower/lower: MatchLabel(VariantLabel, DefaultLabel), ValueId, value_number
+	../lower/lower as Lower: ValueId, value_number
+	../check/model: MatchArmId, DecisionNodeId, match_arm_number, decision_node_number, ListLengthTest(ExactLength, MinimumLength)
 	../own/own as Own:
 		OwnedArgument(UnmanagedArgument, BorrowedArgument),
-		OwnedArm,
 		OwnedDefinition,
-		OwnedExit(ReturnResult, RecurArguments),
 		OwnedFunction,
 		OwnedJoin,
 		OwnedJoinParameter(UnmanagedJoinParameter, ManagedJoinParameter),
 		join_parameter,
-		OwnedMatch,
-		OwnedTail(ReturnTail, MatchTail),
 		OwnedValueOperation(
 			ParameterDefinition, VoidDefinition, IntegerDefinition, FloatDefinition,
 			StringDefinition, CallDefinition, ConstructDefinition, ConstructListDefinition,
-			PayloadDefinition, ConstructRecordDefinition, ReadRecordFieldDefinition,
+			PayloadDefinition, ListElementDefinition, ListSuffixDefinition, ConstructRecordDefinition, ReadRecordFieldDefinition,
 		),
 		OwnerId,
-		OwnershipOperation(DefineValue, ExecuteJoin, AcquireOwner, DropOwner),
+		OwnershipOperation(DefineValue, ExecuteJoin, ExecuteLoop, AcquireOwner, DropOwner),
 		OwnershipProgram,
 		ResultOwnership(UnmanagedResult, BorrowedResult, OwnedResult),
 		ReturnTransfer(UnmanagedReturn, OwnedReturn),
 		StoredPayload(UnmanagedPayload, OwnedPayload),
 		owner_number,
 	../utils/source: compiler_source
-	../specialize/specialize:
+	../specialize/specialize as Concrete:
 		CallTarget(UserFunction, RuntimeFunction),
-		ConcreteRecord,
+		ConcreteRecord, ConcretePatternPlace,
 		ConcreteUnion,
 		FieldInstanceId,
 		RecordInstanceId,
@@ -78,6 +77,7 @@ import:
 	string as StringOps
 	../runtime/string:
 		string_equals_runtime,
+		STRING_SLICE_RUNTIME,
 		string_parse_int_runtime,
 		string_print_runtime, STRING_PRINT_ERROR_RUNTIME,
 		string_runtime,
@@ -85,7 +85,6 @@ import:
 		Diagnostic,
 		EntryResult(IntegerExitStatus, SuccessfulExit),
 		Entrypoint(NoArguments, WithArguments),
-		FunctionExecution(OrdinaryCalls, SelfTailLoop),
 		Span,
 		entry_function,
 	../utils/text: concat
@@ -113,80 +112,98 @@ private pure func c_value(id: ValueId) -> String:
 	"blorp_vl_".append_int(value_number(id))
 
 
+private pure func c_header(id: ValueId) -> String:
+	"blorp_h_".append_int(value_number(id))
+
+
+private pure func c_loop_header(target: Lower.LoopTarget) -> String:
+	"blorp_loop_".append_int(value_number(Lower.loop_target_value(target))).concat("_header")
+
+
+private pure func c_loop_break(target: Lower.LoopTarget) -> String:
+	"blorp_loop_".append_int(value_number(Lower.loop_target_value(target))).concat("_break")
+
+
+private pure func c_loop_transfer(target: Lower.LoopTarget, position: Int) -> String:
+	"blorp_loop_".append_int(value_number(Lower.loop_target_value(target))).concat("_transfer_").append_int(position)
+
+
 private pure func c_owner(id: OwnerId) -> String:
 	"blorp_owner_".append_int(owner_number(id))
 
 
-private pure func c_callable(target: CallTarget) -> String:
+-- Designated-Bool operations use statement dispatch and constructor publication,
+-- not the ordinary expression-callable symbol path.
+private pure func c_callable(target: CallTarget) -> Option[String]:
 	match target:
 		UserFunction(id):
-			c_name(function_number(id))
+			Some(c_name(function_number(id)))
 		RuntimeFunction(operation):
 			match operation:
 				StringPrint:
-					"blorp_string_print"
+					Some("blorp_string_print")
 				StringPrintError:
-					"blorp_string_print_error"
+					Some("blorp_string_print_error")
 				IntAdd:
-					"blorp_int_add"
+					Some("blorp_int_add")
 				IntSubtract:
-					"blorp_int_subtract"
+					Some("blorp_int_subtract")
 				IntMultiply:
-					"blorp_int_multiply"
+					Some("blorp_int_multiply")
 				IntDivide:
-					"blorp_int_divide"
+					Some("blorp_int_divide")
 				IntRemainder:
-					"blorp_int_remainder"
+					Some("blorp_int_remainder")
 				IntToString:
-					"blorp_int_to_string"
+					Some("blorp_int_to_string")
 				FloatAdd:
-					"blorp_float_add"
+					Some("blorp_float_add")
 				FloatSubtract:
-					"blorp_float_subtract"
+					Some("blorp_float_subtract")
 				FloatMultiply:
-					"blorp_float_multiply"
+					Some("blorp_float_multiply")
 				FloatDivide:
-					"blorp_float_divide"
+					Some("blorp_float_divide")
 				FloatRemainder:
-					"blorp_float_remainder"
+					Some("blorp_float_remainder")
 				FloatToString:
-					"blorp_float_to_string"
+					Some("blorp_float_to_string")
+				FloatCopySign:
+					Some("copysign")
 				StringLength:
-					"blorp_string_length"
+					Some("blorp_string_length")
 				StringConcat:
-					"blorp_string_concat"
+					Some("blorp_string_concat")
 				StringParseInt(_):
-					"blorp_string_parse_int"
+					Some("blorp_string_parse_int")
 				StringParseFloat(_):
-					"blorp_string_parse_float"
+					Some("blorp_string_parse_float")
 				StringByteAt(_):
-					"blorp_string_byte_at"
+					Some("blorp_string_byte_at")
 				StringFromCodepoint(_):
-					"blorp_string_from_codepoint"
+					Some("blorp_string_from_codepoint")
+				StringSlice(_):
+					Some("blorp_string_slice")
 				ReadFile(_):
-					"blorp_read_file"
+					Some("blorp_read_file")
 				WriteFile(_):
-					"blorp_write_file"
+					Some("blorp_write_file")
 				GetCurrentDirectory(_):
-					"blorp_get_current_directory"
+					Some("blorp_get_current_directory")
 				ListRepeat(element):
-					"blorp_list_repeat_".concat(list_suffix(list_element_key(element)))
+					Some("blorp_list_repeat_".concat(list_suffix(list_element_key(element))))
 				ListLength(element):
-					"blorp_list_length_".concat(list_suffix(list_element_key(element)))
+					Some("blorp_list_length_".concat(list_suffix(list_element_key(element))))
 				ListGet(element, _):
-					"blorp_list_get_".concat(list_suffix(list_element_key(element)))
+					Some("blorp_list_get_".concat(list_suffix(list_element_key(element))))
 				ListAppend(element):
-					list_update_name(AppendUpdate, list_element_key(element))
+					Some(list_update_name(AppendUpdate, list_element_key(element)))
 				ListSet(element):
-					list_update_name(SetUpdate, list_element_key(element))
+					Some(list_update_name(SetUpdate, list_element_key(element)))
 				ListConcat(element):
-					list_update_name(ConcatUpdate, list_element_key(element))
-				StringEquals(_):
-					"blorp_string_equals"
-				IntEquals(_):
-					"blorp_int_equals"
-				IntLessThan(_):
-					"blorp_int_less_than"
+					Some(list_update_name(ConcatUpdate, list_element_key(element)))
+				StringEquals(_) | IntEquals(_) | IntLessThan(_) | FloatEquals(_) | FloatLessThan(_) | FloatIsNaN(_) | FloatIsFinite(_):
+					None
 
 
 private pure func append_integer(output: String, value: Int) -> String:
@@ -212,9 +229,13 @@ private pure func c_literal_bytes(id: ValueId) -> String:
 
 
 private pure func append_string_bytes(output: String, id: ValueId, bytes: String) -> String:
+	append_byte_array(output, c_literal_bytes(id), bytes)
+
+
+private pure func append_byte_array(output: String, name: String, bytes: String) -> String:
 	var projected = output
 		.concat("static const unsigned char ")
-		.concat(c_literal_bytes(id))
+		.concat(name)
 		.concat("[]={")
 	var position = 0
 
@@ -237,7 +258,7 @@ private pure func append_string_bytes(output: String, id: ValueId, bytes: String
 
 
 private pure func has_payload(declaration: ConcreteUnion) -> Bool:
-	declaration.variants.any(pure func(fields): not fields.is_empty())
+	declaration.variants.any(pure func(fields): fields.is_empty().not())
 
 
 private pure func boxed_union_struct(index: Int) -> String:
@@ -273,7 +294,7 @@ private pure func c_local_declaration(
 	span: Span,
 ) -> Result[String, Diagnostic]:
 	type_name ?= c_type(value_type, unions, span)
-	pointer_carrier ?= match value_type:
+	pointer_carrier: Bool ?= match value_type:
 		StringType | ListType(_):
 			Ok(True)
 		UnionType(id):
@@ -481,7 +502,7 @@ private pure func append_union(
 		var failure: Option[Diagnostic] = None
 
 		for fields in declaration.variants:
-			if not fields.is_empty():
+			if fields.is_empty().not():
 				result = result.concat("struct{")
 				var field_position = 0
 				for value_type in fields:
@@ -575,8 +596,8 @@ private pure func append_aggregate_definitions(
 ) -> Result[String, Diagnostic]:
 	-- State vectors and fragments remain local owners while dependencies are
 	-- visited. No recursive carrier retains their previous roots.
-	var record_visits = records.map(pure func(_): UnvisitedAggregate)
-	var union_visits = unions.map(pure func(_): UnvisitedAggregate)
+	var record_visits = records.map(pure func(_) -> AggregateVisit: UnvisitedAggregate)
+	var union_visits = unions.map(pure func(_) -> AggregateVisit: UnvisitedAggregate)
 	var fragments: List[String] = []
 	var pending: List[AggregateVisitStep] = []
 	var pending_count = 0
@@ -604,7 +625,7 @@ private pure func append_aggregate_definitions(
 
 	var invalid: Option[Diagnostic] = None
 
-	while IntOps.greater_than(pending_count, 0) and not invalid.is_some():
+	while and(IntOps.greater_than(pending_count, 0), invalid.is_some().not()):
 		pending_count = IntOps.subtract(pending_count, 1)
 
 		match pending.get(pending_count):
@@ -621,14 +642,14 @@ private pure func append_aggregate_definitions(
 
 						match status:
 							None:
-								missing = match definition:
+								missing: EmissionFailure = match definition:
 									RecordDefinition(index): MissingAggregateVisit(RecordAggregate, index)
 									UnionDefinition(index): MissingAggregateVisit(UnionAggregate, index)
 								invalid = Some(render(internal_span(), missing))
 							Some(EmittedAggregate):
 								void
 							Some(VisitingAggregate):
-								cycle = match definition:
+								cycle: EmissionFailure = match definition:
 									RecordDefinition(index): CyclicByValueAggregate(RecordAggregate, index)
 									UnionDefinition(index): CyclicByValueAggregate(UnionAggregate, index)
 								invalid = Some(render(internal_span(), cycle))
@@ -848,6 +869,7 @@ private pure func append_record_ownership(
 private pure func append_operation(
 	output: String,
 	id: ValueId,
+	value_type: TypeRef,
 	operation: OwnedValueOperation,
 	unions: List[ConcreteUnion],
 	records: List[ConcreteRecord],
@@ -933,25 +955,28 @@ private pure func append_operation(
 			)
 			Ok(length.concat(")"))
 		CallDefinition(target, arguments):
-			var prefix = output
-				.concat(c_callable(target))
-				.concat("(")
-			var index: Int = 0
+			match c_callable(target):
+				None: Err(render(span, StatementOnlyValue(id)))
+				Some(callable):
+					var prefix = output
+						.concat(callable)
+						.concat("(")
+					var index: Int = 0
 
-			for argument in arguments:
-				if IntOps.greater_than(index, 0):
-					prefix = prefix.concat(",")
+					for argument in arguments:
+						if IntOps.greater_than(index, 0):
+							prefix = prefix.concat(",")
 
-				value = match argument:
-					UnmanagedArgument(argument_id):
-						argument_id
-					BorrowedArgument(borrow):
-						borrow.value
+						value = match argument:
+							UnmanagedArgument(argument_id):
+								argument_id
+							BorrowedArgument(borrow):
+								borrow.value
 
-				prefix = prefix.concat(c_value(value))
-				index = IntOps.add(index, 1)
+						prefix = prefix.concat(c_value(value))
+						index = IntOps.add(index, 1)
 
-			Ok(prefix.concat(")"))
+					Ok(prefix.concat(")"))
 		ConstructDefinition(variant_id, fields):
 			var operands: List[String] = []
 			for field in fields:
@@ -966,6 +991,14 @@ private pure func append_operation(
 			-- List construction and joins are written as statements, by
 			-- append_list_construction and append_join; never as expressions.
 			Err(render(span, StatementOnlyValue(id)))
+		ListElementDefinition(index, parent):
+			Ok(output.concat(c_value(parent)).concat("->values[").append_int(index).concat("]"))
+		ListSuffixDefinition(parent, skipped):
+			match value_type:
+				ListType(element):
+					Ok(output.concat(list_update_name(SuffixUpdate, list_element_key(element))).concat("(")
+						.concat(c_value(argument_value(parent))).concat(",INT64_C(").append_int(skipped).concat("))"))
+				_: Err(render(span, StatementOnlyValue(id)))
 		PayloadDefinition(field, source_id):
 			match unions.get(union_number(variant_owner(variant_field_variant(field)))):
 				Some(declaration):
@@ -994,7 +1027,7 @@ private pure func c_union_value(
 	span: Span,
 ) -> Result[String, Diagnostic]:
 	index = union_number(variant_owner(variant))
-	declaration ?= match unions.get(index):
+	declaration: ConcreteUnion ?= match unions.get(index):
 		Some(found): Ok(found)
 		None: Err(render(span, MissingUnionLayout(variant_owner(variant))))
 
@@ -1085,7 +1118,7 @@ private pure func append_parse_number(
 	runtime: String,
 	span: Span,
 ) -> Result[String, Diagnostic]:
-	argument ?= match arguments.get(0):
+	argument: OwnedArgument ?= match arguments.get(0):
 		Some(found): Ok(found)
 		None: Err(render(span, MissingRuntimeArgument(id, 0)))
 	scratch = "blorp_runtime_".append_int(value_number(id))
@@ -1121,10 +1154,10 @@ private pure func append_string_byte_at(
 	unions: List[ConcreteUnion],
 	span: Span,
 ) -> Result[String, Diagnostic]:
-	text ?= match arguments.get(0):
+	text: OwnedArgument ?= match arguments.get(0):
 		Some(found): Ok(found)
 		None: Err(render(span, MissingRuntimeArgument(id, 0)))
-	index ?= match arguments.get(1):
+	index: OwnedArgument ?= match arguments.get(1):
 		Some(found): Ok(found)
 		None: Err(render(span, MissingRuntimeArgument(id, 1)))
 	scratch = "blorp_runtime_".append_int(value_number(id))
@@ -1144,7 +1177,7 @@ private pure func append_string_from_codepoint(
 	unions: List[ConcreteUnion],
 	span: Span,
 ) -> Result[String, Diagnostic]:
-	scalar ?= match arguments.get(0):
+	scalar: OwnedArgument ?= match arguments.get(0):
 		Some(found): Ok(found)
 		None: Err(render(span, MissingRuntimeArgument(id, 0)))
 	scratch = "blorp_runtime_".append_int(value_number(id))
@@ -1153,6 +1186,35 @@ private pure func append_string_from_codepoint(
 		.concat(scratch).concat("_some=blorp_string_from_codepoint(")
 		.concat(c_value(argument_value(scalar))).concat(",&").concat(scratch).concat(");")
 	-- Some takes the fresh root. Scratch is neither retained nor released here.
+	append_optional_value(prefix, id, option, scratch.concat("_some"), scratch, unions, span)
+
+
+private pure func append_string_slice(
+	output: String,
+	id: ValueId,
+	option: DesignatedOption[VariantInstanceId],
+	arguments: List[OwnedArgument],
+	unions: List[ConcreteUnion],
+	span: Span,
+) -> Result[String, Diagnostic]:
+	text: OwnedArgument ?= match arguments.get(0):
+		Some(found): Ok(found)
+		None: Err(render(span, MissingRuntimeArgument(id, 0)))
+	start: OwnedArgument ?= match arguments.get(1):
+		Some(found): Ok(found)
+		None: Err(render(span, MissingRuntimeArgument(id, 1)))
+	end: OwnedArgument ?= match arguments.get(2):
+		Some(found): Ok(found)
+		None: Err(render(span, MissingRuntimeArgument(id, 2)))
+
+	scratch = "blorp_runtime_".append_int(value_number(id))
+	prefix = output
+		.concat("struct blorp_string *").concat(scratch).concat("=NULL;const uint8_t ")
+		.concat(scratch).concat("_some=blorp_string_slice(")
+		.concat(c_value(argument_value(text))).concat(",")
+		.concat(c_value(argument_value(start))).concat(",")
+		.concat(c_value(argument_value(end))).concat(",&").concat(scratch).concat(");")
+	-- Some takes the fresh root. Scratch has no separate ownership obligation.
 	append_optional_value(prefix, id, option, scratch.concat("_some"), scratch, unions, span)
 
 
@@ -1182,7 +1244,7 @@ private pure func append_read_file(
 	unions: List[ConcreteUnion],
 	span: Span,
 ) -> Result[String, Diagnostic]:
-	path ?= match arguments.get(0):
+	path: OwnedArgument ?= match arguments.get(0):
 		Some(found): Ok(found)
 		None: Err(render(span, MissingRuntimeArgument(id, 0)))
 	declaration ?= c_local_declaration(UnionType(variant_owner(result.ok)), InitializedLocal, unions, span)
@@ -1205,10 +1267,10 @@ private pure func append_write_file(
 	unions: List[ConcreteUnion],
 	span: Span,
 ) -> Result[String, Diagnostic]:
-	path ?= match arguments.get(0):
+	path: OwnedArgument ?= match arguments.get(0):
 		Some(found): Ok(found)
 		None: Err(render(span, MissingRuntimeArgument(id, 0)))
-	contents ?= match arguments.get(1):
+	contents: OwnedArgument ?= match arguments.get(1):
 		Some(found): Ok(found)
 		None: Err(render(span, MissingRuntimeArgument(id, 1)))
 	declaration ?= c_local_declaration(UnionType(variant_owner(result.ok)), InitializedLocal, unions, span)
@@ -1232,10 +1294,10 @@ private pure func append_list_get(
 	unions: List[ConcreteUnion],
 	span: Span,
 ) -> Result[String, Diagnostic]:
-	values ?= match arguments.get(0):
+	values: OwnedArgument ?= match arguments.get(0):
 		Some(found): Ok(found)
 		None: Err(render(span, MissingRuntimeArgument(id, 0)))
-	index ?= match arguments.get(1):
+	index: OwnedArgument ?= match arguments.get(1):
 		Some(found): Ok(found)
 		None: Err(render(span, MissingRuntimeArgument(id, 1)))
 	scratch = "blorp_runtime_".append_int(value_number(id))
@@ -1297,6 +1359,8 @@ private pure func append_value(
 					append_string_byte_at(output, id, option, arguments, unions, span)
 				RuntimeFunction(StringFromCodepoint(option)):
 					append_string_from_codepoint(output, id, option, arguments, unions, span)
+				RuntimeFunction(StringSlice(option)):
+					append_string_slice(output, id, option, arguments, unions, span)
 				RuntimeFunction(ReadFile(result)):
 					append_read_file(output, id, result, arguments, unions, span)
 				RuntimeFunction(WriteFile(result)):
@@ -1306,9 +1370,17 @@ private pure func append_value(
 				RuntimeFunction(StringEquals(boolean)):
 					append_comparison(output, id, boolean, arguments, unions, StringEquality, span)
 				RuntimeFunction(IntEquals(boolean)):
-					append_comparison(output, id, boolean, arguments, unions, IntegerEquality, span)
+					append_comparison(output, id, boolean, arguments, unions, ScalarEquality, span)
 				RuntimeFunction(IntLessThan(boolean)):
-					append_comparison(output, id, boolean, arguments, unions, IntegerLessThan, span)
+					append_comparison(output, id, boolean, arguments, unions, ScalarLessThan, span)
+				RuntimeFunction(FloatEquals(boolean)):
+					append_comparison(output, id, boolean, arguments, unions, ScalarEquality, span)
+				RuntimeFunction(FloatLessThan(boolean)):
+					append_comparison(output, id, boolean, arguments, unions, ScalarLessThan, span)
+				RuntimeFunction(FloatIsNaN(boolean)):
+					append_classification(output, id, boolean, arguments, unions, NaNClassification, span)
+				RuntimeFunction(FloatIsFinite(boolean)):
+					append_classification(output, id, boolean, arguments, unions, FiniteClassification, span)
 				_:
 					append_regular_value(output, id, value_type, operation, unions, records, span)
 		ConstructListDefinition(payloads):
@@ -1345,8 +1417,13 @@ private pure func append_list_construction(
 
 private fixed union Comparison:
 	StringEquality
-	IntegerEquality
-	IntegerLessThan
+	ScalarEquality
+	ScalarLessThan
+
+
+private fixed union FloatClassification:
+	NaNClassification
+	FiniteClassification
 
 
 private pure func append_comparison(
@@ -1358,16 +1435,12 @@ private pure func append_comparison(
 	comparison: Comparison,
 	span: Span,
 ) -> Result[String, Diagnostic]:
-	left ?= match arguments.get(0):
+	left: OwnedArgument ?= match arguments.get(0):
 		Some(found): Ok(found)
 		None: Err(render(span, MissingRuntimeArgument(id, 0)))
-	right ?= match arguments.get(1):
+	right: OwnedArgument ?= match arguments.get(1):
 		Some(found): Ok(found)
 		None: Err(render(span, MissingRuntimeArgument(id, 1)))
-	declaration ?= c_local_declaration(UnionType(variant_owner(boolean.true_variant)), InitializedLocal, unions, span)
-	true_value ?= c_union_value(boolean.true_variant, [], unions, span)
-	false_value ?= c_union_value(boolean.false_variant, [], unions, span)
-	name = c_value(id)
 	left_value = c_value(argument_value(left))
 	right_value = c_value(argument_value(right))
 
@@ -1378,18 +1451,53 @@ private pure func append_comparison(
 				.concat(",")
 				.concat(right_value)
 				.concat(")")
-		IntegerEquality:
+		ScalarEquality:
 			"("
 				.concat(left_value)
 				.concat("==")
 				.concat(right_value)
 				.concat(")")
-		IntegerLessThan:
+		ScalarLessThan:
 			"("
 				.concat(left_value)
 				.concat("<")
 				.concat(right_value)
 				.concat(")")
+
+	append_boolean(output, id, boolean, condition, unions, span)
+
+
+private pure func append_classification(
+	output: String,
+	id: ValueId,
+	boolean: DesignatedBoolean[VariantInstanceId],
+	arguments: List[OwnedArgument],
+	unions: List[ConcreteUnion],
+	classification: FloatClassification,
+	span: Span,
+) -> Result[String, Diagnostic]:
+	argument: OwnedArgument ?= match arguments.get(0):
+		Some(found): Ok(found)
+		None: Err(render(span, MissingRuntimeArgument(id, 0)))
+	value = c_value(argument_value(argument))
+	condition = match classification:
+		NaNClassification: "isnan(".concat(value).concat(")")
+		FiniteClassification: "isfinite(".concat(value).concat(")")
+	append_boolean(output, id, boolean, condition, unions, span)
+
+
+private pure func append_boolean(
+	output: String,
+	id: ValueId,
+	boolean: DesignatedBoolean[VariantInstanceId],
+	condition: String,
+	unions: List[ConcreteUnion],
+	span: Span,
+) -> Result[String, Diagnostic]:
+	declaration ?= c_local_declaration(UnionType(variant_owner(boolean.true_variant)), InitializedLocal, unions, span)
+	true_value ?= c_union_value(boolean.true_variant, [], unions, span)
+	false_value ?= c_union_value(boolean.false_variant, [], unions, span)
+	name = c_value(id)
 
 	Ok(
 		output
@@ -1431,6 +1539,7 @@ private pure func append_regular_value(
 			.concat(name)
 			.concat("="),
 		id,
+		value_type,
 		operation,
 		unions,
 		records,
@@ -1497,8 +1606,20 @@ private pure func owner_types(function: OwnedFunction) -> Result[List[TypeRef], 
 	var owners: List[TypeRef] = []
 	var failure: Option[Diagnostic] = None
 
-	for operations in blocks:
-		for operation in operations:
+	for block in blocks:
+		for header in block.headers:
+			fact = join_parameter(header.parameter)
+			values = values.append(fact.value_type)
+			match header.parameter:
+				UnmanagedJoinParameter(_): void
+				ManagedJoinParameter(_, _): owners = owners.append(fact.value_type)
+		for input in block.inputs:
+			fact = join_parameter(input)
+			values = values.append(fact.value_type)
+			match input:
+				UnmanagedJoinParameter(_): void
+				ManagedJoinParameter(_, _): owners = owners.append(fact.value_type)
+		for operation in block.operations:
 			match operation:
 				DefineValue(definition):
 					values = values.append(definition.value_type)
@@ -1510,6 +1631,14 @@ private pure func owner_types(function: OwnedFunction) -> Result[List[TypeRef], 
 							void
 				ExecuteJoin(join):
 					for output in [join.result].concat(join.carried):
+						parameter = join_parameter(output)
+						values = values.append(parameter.value_type)
+						match output:
+							UnmanagedJoinParameter(_): void
+							ManagedJoinParameter(_, _): owners = owners.append(parameter.value_type)
+
+				ExecuteLoop(loop):
+					for output in [loop.result].concat(loop.carried):
 						parameter = join_parameter(output)
 						values = values.append(parameter.value_type)
 						match output:
@@ -1789,13 +1918,15 @@ private pure func append_ownership_operation(
 	operation: OwnershipOperation,
 	unions: List[ConcreteUnion],
 	types: List[TypeRef],
-	records: List[ConcreteRecord],
+	records: List[ConcreteRecord], nearest: Option[Own.OwnedLoop],
 ) -> Result[String, Diagnostic]:
 	match operation:
 		DefineValue(definition):
 			append_owned_definition(output, definition, unions, records)
 		ExecuteJoin(matched_join):
-			append_join(output, matched_join, unions, types, records)
+			append_join(output, matched_join, unions, types, records, nearest)
+		ExecuteLoop(loop):
+			append_loop(output, loop, unions, types, records)
 		AcquireOwner(owner, borrowed, span):
 			match types.get(owner_number(owner)):
 				Some(value_type):
@@ -1821,13 +1952,13 @@ private pure func append_ownership_operations(
 	operations: List[OwnershipOperation],
 	unions: List[ConcreteUnion],
 	types: List[TypeRef],
-	records: List[ConcreteRecord],
+	records: List[ConcreteRecord], nearest: Option[Own.OwnedLoop],
 ) -> Result[String, Diagnostic]:
 	var fragments: List[String] = [output]
 	var failure: Option[Diagnostic] = None
 
 	for operation in operations:
-		match append_ownership_operation("", operation, unions, types, records):
+		match append_ownership_operation("", operation, unions, types, records, nearest):
 			Err(error):
 				failure = Some(error)
 				break
@@ -1841,116 +1972,408 @@ private pure func append_ownership_operations(
 			Ok(fragments.join(""))
 
 
--- A switch on a match's scrutinee tag, up to its first case.
-private pure func append_switch(
-	output: String,
-	scrutinee: OwnedArgument,
-	owner: UnionInstanceId,
-	unions: List[ConcreteUnion],
-	span: Span,
+-- Selection labels project existing value and arm identities. A terminal
+-- selector's arm path distinguishes nested blocks that introduce no values.
+private fixed record SelectionEmissionScope {
+	root: ValueId,
+	path: List[MatchArmId]
+}
+
+
+private pure func c_selection_scope(scope: SelectionEmissionScope) -> String:
+	var name = "blorp_selection_".append_int(value_number(scope.root))
+	for arm in scope.path:
+		name = name.concat("_in_").append_int(match_arm_number(arm))
+	name
+
+
+private pure func c_decision(scope: SelectionEmissionScope, node: DecisionNodeId) -> String:
+	c_selection_scope(scope).concat("_node_").append_int(decision_node_number(node))
+
+
+private pure func c_selection_arm(scope: SelectionEmissionScope, arm: MatchArmId) -> String:
+	c_selection_scope(scope).concat("_arm_").append_int(match_arm_number(arm))
+
+
+private pure func c_pattern_field(
+	parent: ConcretePatternPlace, field: Concrete.VariantFieldInstanceId,
+	scrutinee: ValueId, unions: List[ConcreteUnion], span: Span,
 ) -> Result[String, Diagnostic]:
-	declaration ?= match unions.get(union_number(owner)):
+	base ?= c_pattern_place(parent, scrutinee, unions, span)
+	owner = variant_owner(variant_field_variant(field))
+	layout: ConcreteUnion ?= match unions.get(union_number(owner)):
 		Some(found): Ok(found)
 		None: Err(render(span, MissingUnionLayout(owner)))
-	opening = output.concat("switch(").concat(c_value(argument_value(scrutinee)))
+	Ok("(".concat(base).concat(")").concat(union_member_selector(layout)).concat("payload.")
+		.concat(c_payload_field(variant_field_variant(field), variant_field_number(field))))
 
-	if has_payload(declaration):
-		Ok(opening.concat(union_member_selector(declaration)).concat("tag").concat("){"))
+
+private pure func c_pattern_place(
+	place: ConcretePatternPlace, scrutinee: ValueId,
+	unions: List[ConcreteUnion], span: Span,
+) -> Result[String, Diagnostic]:
+	match place.route:
+		Concrete.MatchRoot: Ok(c_value(scrutinee))
+		Concrete.UnionField(parent, field): c_pattern_field(parent, field, scrutinee, unions, span)
+		Concrete.ListElement(parent, index):
+			match c_pattern_place(parent, scrutinee, unions, span):
+				Err(error): Err(error)
+				Ok(base): Ok("(".concat(base).concat(")->values[").append_int(index).concat("]"))
+
+
+private pure func c_variant_test(
+	place: ConcretePatternPlace, scrutinee: ValueId, variant: VariantInstanceId,
+	unions: List[ConcreteUnion], span: Span,
+) -> Result[String, Diagnostic]:
+	base ?= c_pattern_place(place, scrutinee, unions, span)
+	owner = variant_owner(variant)
+	layout: ConcreteUnion ?= match unions.get(union_number(owner)):
+		Some(found): Ok(found)
+		None: Err(render(span, MissingUnionLayout(owner)))
+	tag = if has_payload(layout):
+		"(".concat(base).concat(")").concat(union_member_selector(layout)).concat("tag")
 	else:
-		Ok(opening.concat("){"))
+		base
+	Ok(tag.concat("==").concat(c_variant(variant)))
 
 
--- Without a written default the final arm is also `default`, so every path
--- through the switch reaches an arm.
-private pure func append_case(output: String, label: MatchLabel, final_default: Bool) -> String:
-	var result = match label:
-		VariantLabel(id):
-			output
-				.concat("case ")
-				.concat(c_variant(id))
-				.concat(":")
-		DefaultLabel:
-			output.concat("default:")
-
-	if final_default:
-		result = result.concat("default:")
-
-	result
-
-
-private pure func labels_have_default(labels: List[MatchLabel]) -> Bool:
-	var found = False
-	for label in labels:
-		match label:
-			DefaultLabel: found = True
-			_: void
-	found
-
-
--- One case of a switch: its label, its operations and the statements that
--- leave it.
-private fixed record SwitchCase {
-	label: MatchLabel,
+private fixed record SelectionEmissionArm {
+	id: MatchArmId,
+	inputs: List[Own.OwnedJoinParameter],
 	operations: List[OwnershipOperation],
 	ending: String
 }
 
 
--- A switch's cases after its opening, then its closing brace.
-private pure func append_cases(
-	opening: String,
-	cases: List[SwitchCase],
-	unions: List[ConcreteUnion],
-	types: List[TypeRef],
-	records: List[ConcreteRecord],
+private pure func append_input_declarations(
+	output: String, inputs: List[Own.OwnedJoinParameter], unions: List[ConcreteUnion],
 ) -> Result[String, Diagnostic]:
-	var fragments: List[String] = [opening]
-	var labels: List[MatchLabel] = []
-
-	for switch_case in cases:
-		labels = labels.append(switch_case.label)
-
-	has_default = labels_have_default(labels)
-	var position: Int = 0
+	var result = output
 	var failure: Option[Diagnostic] = None
-
-	for switch_case in cases:
-		final_default = not has_default and IntOps.equals(IntOps.add(position, 1), cases.length())
-		match append_ownership_operations(append_case("", switch_case.label, final_default).concat("{"), switch_case.operations, unions, types, records):
+	for input in inputs:
+		fact = join_parameter(input)
+		match c_local_declaration(fact.value_type, JoinLocal, unions, fact.span):
+			Ok(declaration): result = result.concat(declaration).concat(c_value(fact.id)).concat(";")
 			Err(error):
 				failure = Some(error)
 				break
-			Ok(body):
-				fragments = fragments.append(body.concat(switch_case.ending).concat("}"))
-		position = IntOps.add(position, 1)
-
 	match failure:
 		Some(error): Err(error)
-		None: Ok(fragments.append("}").join(""))
+		None: Ok(result)
 
 
-private pure func append_match(
-	matched: OwnedMatch,
+private pure func append_input_owners(
+	output: String, inputs: List[Own.OwnedJoinParameter], unions: List[ConcreteUnion],
+) -> Result[String, Diagnostic]:
+	var result = output
+	var failure: Option[Diagnostic] = None
+	for input in inputs:
+		fact = join_parameter(input)
+		result = result.concat("(void)").concat(c_value(fact.id)).concat(";")
+		match input:
+			UnmanagedJoinParameter(_): void
+			ManagedJoinParameter(_, owner):
+				match append_owner_alias(result, owner, fact.id, fact.value_type, unions, fact.span):
+					Ok(aliased): result = aliased
+					Err(error):
+						failure = Some(error)
+						break
+	match failure:
+		Some(error): Err(error)
+		None: Ok(result)
+
+
+private pure func append_selection_edge(
+	output: String, scope: SelectionEmissionScope, edge: Own.OwnedSelectionEdge,
+	arms: List[SelectionEmissionArm], unions: List[ConcreteUnion],
+	types: List[TypeRef], records: List[ConcreteRecord], nearest: Option[Own.OwnedLoop],
+) -> Result[String, Diagnostic]:
+	arm: SelectionEmissionArm ?= match arms.get(match_arm_number(edge.arm)):
+		Some(found): Ok(found)
+		None: Err(render(internal_span(), MissingJoinTransfer(scope.root)))
+	operations ?= append_ownership_operations(output, edge.operations, unions, types, records, nearest)
+	var result = operations
+	var position = 0
+	var failure: Option[Diagnostic] = None
+	for input in arm.inputs:
+		fact = join_parameter(input)
+		match edge.transfers.get(position):
+			Some(transfer): result = result.concat(c_value(fact.id)).concat("=").concat(transfer_value(transfer)).concat(";")
+			None:
+				failure = Some(render(fact.span, MissingJoinTransfer(fact.id)))
+				break
+		position = IntOps.add(position, 1)
+	match failure:
+		Some(error): Err(error)
+		None: Ok(result.concat("goto ").concat(c_selection_arm(scope, edge.arm)).concat(";"))
+
+
+private pure func c_selection_branch(
+	scope: SelectionEmissionScope, test: String,
+	yes: DecisionNodeId, no: DecisionNodeId,
+) -> String:
+	"if(".concat(test).concat(")goto ").concat(c_decision(scope, yes))
+		.concat(";goto ").concat(c_decision(scope, no)).concat(";")
+
+
+private pure func append_selection_node(
+	scope: SelectionEmissionScope, selection: Own.OwnedSelection,
+	node: Own.OwnedDecisionNode, arms: List[SelectionEmissionArm],
+	unions: List[ConcreteUnion], types: List[TypeRef], records: List[ConcreteRecord], nearest: Option[Own.OwnedLoop],
+) -> Result[String, Diagnostic]:
+	match node:
+		Own.TestVariant(place, variant, yes, no):
+			match c_variant_test(place, argument_value(selection.scrutinee), variant, unions, internal_span()):
+				Err(error): Err(error)
+				Ok(test): Ok(c_selection_branch(scope, test, yes, no))
+		Own.TestListLength(place, length, yes, no):
+			match c_pattern_place(place, argument_value(selection.scrutinee), unions, internal_span()):
+				Err(error): Err(error)
+				Ok(base):
+					test = match length:
+						ExactLength(count): "(".concat(base).concat(")->length==INT64_C(").append_int(count).concat(")")
+						MinimumLength(count): "(".concat(base).concat(")->length>=INT64_C(").append_int(count).concat(")")
+					Ok(c_selection_branch(scope, test, yes, no))
+		Own.TestStringBytes(place, bytes, yes, no):
+			match c_pattern_place(place, argument_value(selection.scrutinee), unions, internal_span()):
+				Err(error): Err(error)
+				Ok(base):
+					-- Each node has its own C scope. Static bytes preserve embedded
+					-- NUL and UTF8, with no String construction during testing.
+					name = "blorp_pattern_bytes"
+					data = append_byte_array("", name, bytes)
+					test = "(".concat(base).concat(")->length==INT64_C(").append_int(bytes.length())
+						.concat(")&&memcmp((").concat(base).concat(")->bytes,").concat(name)
+						.concat(",(size_t)").append_int(bytes.length()).concat(")==0")
+					Ok(data.concat(c_selection_branch(scope, test, yes, no)))
+		Own.EnterArm(edge): append_selection_edge("", scope, edge, arms, unions, types, records, nearest)
+
+
+private pure func append_selection(
+	output: String, scope: SelectionEmissionScope, selection: Own.OwnedSelection,
+	arms: List[SelectionEmissionArm], unions: List[ConcreteUnion],
+	types: List[TypeRef], records: List[ConcreteRecord], nearest: Option[Own.OwnedLoop],
+) -> Result[String, Diagnostic]:
+	var result = output
+	var failure: Option[Diagnostic] = None
+	for arm in arms:
+		match append_input_declarations(result, arm.inputs, unions):
+			Ok(declared): result = declared
+			Err(error):
+				failure = Some(error)
+				break
+	declared: Void ?= match failure:
+		Some(error): Err(error)
+		None: Ok(void)
+	result = result.concat("goto ").concat(c_decision(scope, selection.entry)).concat(";")
+	var position = 0
+	for node in selection.nodes:
+		match append_selection_node(scope, selection, node, arms, unions, types, records, nearest):
+			Ok(emitted):
+				label = c_selection_scope(scope).concat("_node_").append_int(position)
+				result = result.concat(label).concat(":{").concat(emitted).concat("}")
+			Err(error):
+				failure = Some(error)
+				break
+		position = IntOps.add(position, 1)
+	nodes: Void ?= match failure:
+		Some(error): Err(error)
+		None: Ok(void)
+	for arm in arms:
+		match append_selection_body(scope, arm, unions, types, records, nearest):
+			Ok(body): result = result.concat(body)
+			Err(error):
+				failure = Some(error)
+				break
+	match failure:
+		Some(error): Err(error)
+		None: Ok(result)
+
+
+private pure func append_selection_body(
+	scope: SelectionEmissionScope, arm: SelectionEmissionArm,
+	unions: List[ConcreteUnion], types: List[TypeRef], records: List[ConcreteRecord], nearest: Option[Own.OwnedLoop],
+) -> Result[String, Diagnostic]:
+	opening = c_selection_arm(scope, arm.id).concat(":{")
+	inputs ?= append_input_owners(opening, arm.inputs, unions)
+	body ?= append_ownership_operations(inputs, arm.operations, unions, types, records, nearest)
+	Ok(body.concat(arm.ending).concat("}"))
+
+
+-- Capture the complete outgoing batch before assigning any destination. The
+-- producer has already acquired every owned occurrence and retired old owners.
+private pure func append_loop_exit(
+	output: String, exit: Own.OwnedLoopExit, loop: Own.OwnedLoop,
+	target: Lower.LoopTarget, unions: List[ConcreteUnion],
+) -> Result[String, Diagnostic]:
+	parameters = match exit:
+		Own.Break(_): [loop.result].concat(loop.carried)
+		Own.Recur(_, _): loop.headers.map(pure func(header): header.parameter)
+	transfers = match exit:
+		Own.Break(outputs): [outputs.value].concat(outputs.carried)
+		Own.Recur(arguments, _): arguments
+	var result = output
+	var position = 0
+	var failure: Option[Diagnostic] = None
+	for parameter in parameters:
+		fact = join_parameter(parameter)
+		match transfers.get(position):
+			None:
+				failure = Some(render(fact.span, MissingJoinTransfer(fact.id)))
+				break
+			Some(transfer):
+				match c_local_declaration(fact.value_type, InitializedLocal, unions, fact.span):
+					Err(error):
+						failure = Some(error)
+						break
+					Ok(declaration):
+						result = result.concat(declaration).concat(c_loop_transfer(target, position))
+							.concat("=").concat(transfer_value(transfer)).concat(";")
+		position = IntOps.add(position, 1)
+	ready: Void ?= match failure:
+		Some(error): Err(error)
+		None: Ok(void)
+	position = 0
+	for parameter in parameters:
+		fact = join_parameter(parameter)
+		name = match exit:
+			Own.Break(_): c_value(fact.id)
+			Own.Recur(_, _): c_header(fact.id)
+		result = result.concat(name).concat("=").concat(c_loop_transfer(target, position)).concat(";")
+		position = IntOps.add(position, 1)
+	label = match exit:
+		Own.Break(_): c_loop_break(target)
+		Own.Recur(_, _): c_loop_header(target)
+	Ok(result.concat("goto ").concat(label).concat(";"))
+
+
+private pure func append_loop_block(
+	output: String, block: Own.OwnedLoopBlock, loop: Own.OwnedLoop,
+	scope: SelectionEmissionScope, unions: List[ConcreteUnion],
+	types: List[TypeRef], records: List[ConcreteRecord],
+) -> Result[String, Diagnostic]:
+	body ?= append_ownership_operations(output, block.operations, unions, types, records, Some(loop))
+	append_loop_tail(body, block.tail, loop, Lower.loop_target(join_parameter(loop.result).id), scope, unions, types, records)
+
+
+private pure func append_loop_tail(
+	output: String, tail: Own.OwnedLoopTail, loop: Own.OwnedLoop,
+	target: Lower.LoopTarget, scope: SelectionEmissionScope,
+	unions: List[ConcreteUnion], types: List[TypeRef], records: List[ConcreteRecord],
+) -> Result[String, Diagnostic]:
+	match tail:
+		Own.ExitLoop(exit): append_loop_exit(output, exit, loop, target, unions)
+		Own.MatchLoop(matched): append_loop_match(output, matched, loop, scope, unions, types, records)
+
+
+private pure func append_loop_match(
+	output: String, matched: Own.OwnedLoopMatch, loop: Own.OwnedLoop,
+	scope: SelectionEmissionScope, unions: List[ConcreteUnion],
+	types: List[TypeRef], records: List[ConcreteRecord],
+) -> Result[String, Diagnostic]:
+	var arms: List[SelectionEmissionArm] = []
+	var failure: Option[Diagnostic] = None
+	for arm in matched.arms:
+		child = { scope | path = scope.path.append(arm.id) }
+		match append_loop_block("", arm.body, loop, child, unions, types, records):
+			Err(error):
+				failure = Some(error)
+				break
+			Ok(ending): arms = arms.append({ id = arm.id, inputs = arm.inputs, operations = [], ending = ending })
+	ready: Void ?= match failure:
+		Some(error): Err(error)
+		None: Ok(void)
+	append_selection(output, scope, matched.selection, arms, unions, types, records, Some(loop))
+
+
+private pure func append_loop(
+	output: String,
+	loop: Own.OwnedLoop,
 	unions: List[ConcreteUnion],
 	types: List[TypeRef],
 	records: List[ConcreteRecord],
 ) -> Result[String, Diagnostic]:
-	opening ?= append_switch("", matched.scrutinee, matched.owner, unions, internal_span())
-	var cases: List[SwitchCase] = []
-	for arm in matched.arms:
-		cases = cases.append({ label = arm.label, operations = arm.operations, ending = append_exit("", arm.exit) })
-	append_cases(opening, cases, unions, types, records)
+	parameters = [loop.result].concat(loop.carried)
+	var declarations = ""
+	var snapshots = ""
+	var failure: Option[Diagnostic] = None
+	for output_parameter in parameters:
+		fact = join_parameter(output_parameter)
+		match c_local_declaration(fact.value_type, JoinLocal, unions, fact.span):
+			Err(error):
+				failure = Some(error)
+				break
+			Ok(declaration): declarations = declarations.concat(declaration).concat(c_value(fact.id)).concat(";")
+	outputs: Void ?= match failure:
+		Some(error): Err(error)
+		None: Ok(void)
+	for header in loop.headers:
+		fact = join_parameter(header.parameter)
+		match c_local_declaration(fact.value_type, JoinLocal, unions, fact.span):
+			Err(error):
+				failure = Some(error)
+				break
+			Ok(declaration):
+				declarations = declarations.concat(declaration).concat(c_header(fact.id)).concat("=").concat(transfer_value(header.initial)).concat(";")
+				match c_local_declaration(fact.value_type, InitializedLocal, unions, fact.span):
+					Err(error):
+						failure = Some(error)
+						break
+					Ok(snapshot): snapshots = snapshots.concat(snapshot).concat(c_value(fact.id)).concat("=").concat(c_header(fact.id)).concat(";(void)").concat(c_value(fact.id)).concat(";")
+				match header.parameter:
+					UnmanagedJoinParameter(_): void
+					ManagedJoinParameter(_, owner):
+						match append_owner_alias(snapshots, owner, fact.id, fact.value_type, unions, fact.span):
+							Ok(aliased): snapshots = aliased
+							Err(error):
+								failure = Some(error)
+								break
+	headers: Void ?= match failure:
+		Some(error): Err(error)
+		None: Ok(void)
+	scope: SelectionEmissionScope = { root = join_parameter(loop.result).id, path = [] }
+	target = Lower.loop_target(scope.root)
+	var entered = output
+	for acquisition in loop.entry_acquisitions:
+		match append_ownership_operation(entered, AcquireOwner(acquisition.owner, acquisition.borrow, join_parameter(loop.result).span), unions, types, records, None):
+			Ok(acquired): entered = acquired
+			Err(error):
+				failure = Some(error)
+				break
+	acquired: Void ?= match failure:
+		Some(error): Err(error)
+		None: Ok(void)
+	-- Acquisitions precede header initialization, which may move their aliases.
+	declared = entered.concat(declarations)
+	body ?= append_loop_block(snapshots, loop.body, loop, scope, unions, types, records)
+	-- Both labels have lexical uses even for a loop with only one exit kind.
+	-- A sealed body always transfers before the final, unreachable goto.
+	var completed = declared.concat("goto ").concat(c_loop_header(target)).concat(";")
+		.concat(c_loop_header(target)).concat(":{").concat(body).concat("}goto ")
+		.concat(c_loop_break(target)).concat(";").concat(c_loop_break(target)).concat(":;")
+	for output_parameter in parameters:
+		fact = join_parameter(output_parameter)
+		completed = completed.concat("(void)").concat(c_value(fact.id)).concat(";")
+		match output_parameter:
+			UnmanagedJoinParameter(_): void
+			ManagedJoinParameter(_, owner):
+				match append_owner_alias(completed, owner, fact.id, fact.value_type, unions, fact.span):
+					Ok(aliased): completed = aliased
+					Err(error):
+						failure = Some(error)
+						break
+	match failure:
+		Some(error): Err(error)
+		None: Ok(completed)
 
-
--- A join's local is declared before its switch and assigned by each arm,
--- which then leaves the switch. A managed value moves in its owner, which
--- the join's own owner takes over after the switch.
+-- Verified ordinary joins have a yielding continuation. Abrupt arms transfer
+-- directly to their typed loop target through the same selection emitter.
 private pure func append_join(
 	output: String,
 	matched_join: OwnedJoin,
 	unions: List[ConcreteUnion],
 	types: List[TypeRef],
-	records: List[ConcreteRecord],
+	records: List[ConcreteRecord], nearest: Option[Own.OwnedLoop],
 ) -> Result[String, Diagnostic]:
 	parameter = join_parameter(matched_join.result)
 	name = c_value(parameter.id)
@@ -1964,37 +2387,43 @@ private pure func append_join(
 				failure = Some(error)
 				break
 			Ok(declaration): declarations = declarations.concat(declaration).concat(c_value(fact.id)).concat(";")
-	declared ?= match failure:
+	declared: Void ?= match failure:
 		Some(error): Err(error)
 		None: Ok(void)
-	opening ?= append_switch(declarations, matched_join.scrutinee, matched_join.owner, unions, parameter.span)
-	var cases: List[SwitchCase] = []
+	scope: SelectionEmissionScope = { root = parameter.id, path = [] }
+	done = c_selection_scope(scope).concat("_done")
+	var arms: List[SelectionEmissionArm] = []
 	for arm in matched_join.arms:
-		moved = match arm.transfer:
-			UnmanagedReturn(value): c_value(value)
-			OwnedReturn(_, owner): c_owner(owner)
-		var ending = name.concat("=").concat(moved).concat(";")
-		var position = 0
-		for output_parameter in matched_join.carried:
-			fact = join_parameter(output_parameter)
-			match arm.carried.get(position):
-				None: failure = Some(render(fact.span, MissingJoinTransfer(fact.id)))
-				Some(transfer):
-					value = match transfer:
-						UnmanagedReturn(id): c_value(id)
-						OwnedReturn(_, owner): c_owner(owner)
-					ending = ending.concat(c_value(fact.id)).concat("=").concat(value).concat(";")
-			if failure.is_some():
+		ending: Result[String, Diagnostic] = match arm.exit:
+			Own.TransferLoop(target, exit):
+				match nearest:
+					None: Err(render(parameter.span, MissingJoinTransfer(Lower.loop_target_value(target))))
+					Some(loop): append_loop_tail("", exit, loop, target, { root = scope.root, path = scope.path.append(arm.id) }, unions, types, records)
+			Own.Yield(outputs):
+				var transferred = name.concat("=").concat(transfer_value(outputs.transfer)).concat(";")
+				var position = 0
+				for output_parameter in matched_join.carried:
+					fact = join_parameter(output_parameter)
+					match outputs.carried.get(position):
+						None:
+							failure = Some(render(fact.span, MissingJoinTransfer(fact.id)))
+							break
+						Some(transfer): transferred = transferred.concat(c_value(fact.id)).concat("=").concat(transfer_value(transfer)).concat(";")
+					position = IntOps.add(position, 1)
+				match failure:
+					Some(error): Err(error)
+					None: Ok(transferred.concat("goto ").concat(done).concat(";"))
+		match ending:
+			Err(error):
+				failure = Some(error)
 				break
-			position = IntOps.add(position, 1)
-		if failure.is_some():
-			break
-		cases = cases.append({ label = arm.label, operations = arm.operations, ending = ending.concat("break;") })
-	transferred ?= match failure:
+			Ok(exit): arms = arms.append({ id = arm.id, inputs = arm.inputs, operations = arm.operations, ending = exit })
+
+	transferred: Void ?= match failure:
 		Some(error): Err(error)
 		None: Ok(void)
-	switched ?= append_cases(opening, cases, unions, types, records)
-	var joined = switched
+	selected ?= append_selection(declarations, scope, matched_join.selection, arms, unions, types, records, nearest)
+	var joined = selected.concat(done).concat(":;")
 	for output_parameter in parameters:
 		fact = join_parameter(output_parameter)
 		-- Include Void and unused outputs, exactly as for ordinary value locals.
@@ -2029,38 +2458,14 @@ private pure func append_signature(
 	)
 
 
+private pure func transfer_value(result: ReturnTransfer) -> String:
+	match result:
+		UnmanagedReturn(id): c_value(id)
+		OwnedReturn(_, owner): c_owner(owner)
+
+
 private pure func append_return(output: String, result: ReturnTransfer) -> String:
-	value = match result:
-		UnmanagedReturn(id):
-			c_value(id)
-		OwnedReturn(_, owner):
-			c_owner(owner)
-
-	output
-		.concat("return ")
-		.concat(value)
-		.concat(";")
-
-
-private pure func append_exit(output: String, exit: OwnedExit) -> String:
-	match exit:
-		ReturnResult(result):
-			append_return(output, result)
-		RecurArguments(arguments, _):
-			var result = output
-			var position: Int = 0
-
-			-- Every operand is already an immutable value local. Replacing slots
-			-- from these captures preserves swaps and repeated arguments.
-			for argument in arguments:
-				result = result
-					.concat(c_parameter(position))
-					.concat("=")
-					.concat(c_value(argument))
-					.concat(";")
-				position = IntOps.add(position, 1)
-
-			result.concat("continue;")
+	output.concat("return ").concat(transfer_value(result)).concat(";")
 
 
 private pure func append_function(
@@ -2071,28 +2476,8 @@ private pure func append_function(
 ) -> Result[String, Diagnostic]:
 	header ?= append_signature("", function, index, unions)
 	types ?= owner_types(function)
-
-	opening = match function.execution:
-		OrdinaryCalls:
-			header.concat("{")
-		SelfTailLoop(_):
-			header.concat("{while (1){")
-
-	body ?= append_ownership_operations("", function.operations, unions, types, records)
-
-	tail ?= match function.tail:
-		ReturnTail(exit):
-			Ok(append_exit("", exit))
-		MatchTail(matched):
-			append_match(matched, unions, types, records)
-
-	closing = match function.execution:
-		OrdinaryCalls:
-			"}"
-		SelfTailLoop(_):
-			"}}"
-
-	Ok([opening, body, tail, closing].join(""))
+	body ?= append_ownership_operations("", function.operations, unions, types, records, None)
+	Ok([header, "{", body, append_return("", function.result), "}"].join(""))
 
 
 -- Unsigned addition wraps. Both signed casts below receive representable values;
@@ -2139,6 +2524,7 @@ private fixed record RuntimeRequirements {
 	integer_parsing: Bool,
 	string_equality: Bool,
 	string_concatenation: Bool,
+	string_slicing: Bool,
 	float_formatting: Bool,
 	float_parsing: Bool
 }
@@ -2158,6 +2544,7 @@ private pure func runtime_requirements(inventory: ProgramInventory) -> RuntimeRe
 		integer_parsing = False,
 		string_equality = False,
 		string_concatenation = False,
+		string_slicing = False,
 		float_formatting = False,
 		float_parsing = False,
 	}
@@ -2181,11 +2568,14 @@ private pure func runtime_requirements(inventory: ProgramInventory) -> RuntimeRe
 			StringParseInt(_): requirements = { requirements | integer_parsing = True }
 			StringEquals(_): requirements = { requirements | string_equality = True }
 			StringConcat: requirements = { requirements | string_concatenation = True }
+			StringSlice(_): requirements = { requirements | string_slicing = True }
 			FloatToString: requirements = { requirements | float_formatting = True }
 			StringParseFloat(_): requirements = { requirements | float_parsing = True }
 			ListRepeat(_) | ListLength(_) | ListGet(_, _) | ListAppend(_) | ListSet(_) | ListConcat(_):
 				void
 			IntEquals(_) | IntLessThan(_) | FloatAdd | FloatSubtract | FloatMultiply | FloatDivide | FloatRemainder | IntToString | StringLength | StringByteAt(_) | StringFromCodepoint(_):
+				void
+			FloatCopySign | FloatEquals(_) | FloatLessThan(_) | FloatIsNaN(_) | FloatIsFinite(_):
 				void
 
 	requirements
@@ -2228,31 +2618,71 @@ private pure func type_list_layouts(value_type: TypeRef) -> List[ListLayout]:
 		_: []
 
 
--- A function's blocks in the order their values and owners are numbered:
--- its prefix, then each match arm, each block followed by its joins' arms.
--- Owner types and the program inventory walk exactly these blocks.
-private pure func function_blocks(function: OwnedFunction) -> List[List[OwnershipOperation]]:
-	var blocks = append_block([], function.operations)
-	match function.tail:
-		ReturnTail(_): void
-		MatchTail(matched):
+-- One transient traversal item. H has no synthetic value definition, so its
+-- types enter the value projection when this child interval is visited.
+private fixed record EmissionBlock {
+	headers: List[Own.OwnedLoopHeader],
+	inputs: List[Own.OwnedJoinParameter],
+	operations: List[OwnershipOperation]
+}
+
+
+private pure func function_blocks(function: OwnedFunction) -> List[EmissionBlock]:
+	append_block([], function.operations, [], [])
+
+
+private pure func append_selection_blocks(
+	blocks: List[EmissionBlock], selection: Own.OwnedSelection,
+) -> List[EmissionBlock]:
+	var collected = blocks
+	for node in selection.nodes:
+		match node:
+			Own.TestVariant(_, _, _, _) | Own.TestListLength(_, _, _, _) | Own.TestStringBytes(_, _, _, _): void
+			Own.EnterArm(edge): collected = append_block(collected, edge.operations, [], [])
+	collected
+
+
+private pure func append_loop_blocks(
+	blocks: List[EmissionBlock], block: Own.OwnedLoopBlock,
+	headers: List[Own.OwnedLoopHeader], inputs: List[Own.OwnedJoinParameter],
+) -> List[EmissionBlock]:
+	append_loop_tail_blocks(append_block(blocks, block.operations, headers, inputs), block.tail)
+
+
+private pure func append_loop_tail_blocks(
+	blocks: List[EmissionBlock], tail: Own.OwnedLoopTail,
+) -> List[EmissionBlock]:
+	var collected = blocks
+	match tail:
+		Own.ExitLoop(_): void
+		Own.MatchLoop(matched):
+			collected = append_selection_blocks(collected, matched.selection)
 			for arm in matched.arms:
-				blocks = append_block(blocks, arm.operations)
-	blocks
+				collected = append_loop_blocks(collected, arm.body, [], arm.inputs)
+	collected
 
 
 private pure func append_block(
-	blocks: List[List[OwnershipOperation]],
-	operations: List[OwnershipOperation],
-) -> List[List[OwnershipOperation]]:
-	var collected = blocks.append(operations)
+	blocks: List[EmissionBlock], operations: List[OwnershipOperation],
+	headers: List[Own.OwnedLoopHeader], inputs: List[Own.OwnedJoinParameter],
+) -> List[EmissionBlock]:
+	var collected: List[EmissionBlock] = blocks.append({ headers = headers, inputs = inputs, operations = operations })
 	for operation in operations:
 		match operation:
 			ExecuteJoin(join):
+				collected = append_selection_blocks(collected, join.selection)
 				for arm in join.arms:
-					collected = append_block(collected, arm.operations)
-			DefineValue(_) | AcquireOwner(_, _, _) | DropOwner(_, _):
-				void
+					collected = append_block(collected, arm.operations, [], arm.inputs)
+					match arm.exit:
+						Own.Yield(_): void
+						Own.TransferLoop(_, tail): collected = append_loop_tail_blocks(collected, tail)
+			ExecuteLoop(loop):
+				acquisitions: List[OwnershipOperation] = loop.entry_acquisitions.map(pure func(acquisition):
+					AcquireOwner(acquisition.owner, acquisition.borrow, join_parameter(loop.result).span)
+				)
+				collected = append_block(collected, acquisitions, [], [])
+				collected = append_loop_blocks(collected, loop.body, loop.headers, [])
+			DefineValue(_) | AcquireOwner(_, _, _) | DropOwner(_, _): void
 	collected
 
 
@@ -2266,13 +2696,15 @@ private pure func append_block(
 -- return type, and the returned value must match the function's.
 private fixed record ProgramInventory {
 	types: List[TypeRef],
-	runtime_calls: List[RuntimeOperation[VariantInstanceId, TypeRef]]
+	runtime_calls: List[RuntimeOperation[VariantInstanceId, TypeRef]],
+	list_updates: List[ListUpdateHelper]
 }
 
 
 private pure func program_inventory(program: OwnershipProgram) -> ProgramInventory:
 	var types: List[TypeRef] = []
 	var runtime_calls: List[RuntimeOperation[VariantInstanceId, TypeRef]] = []
+	var list_updates: List[ListUpdateHelper] = []
 
 	for layout in program.records:
 		for field in layout.fields:
@@ -2285,23 +2717,38 @@ private pure func program_inventory(program: OwnershipProgram) -> ProgramInvento
 
 	for function in program.functions:
 		for block in function_blocks(function):
-			for operation in block:
+			for header in block.headers:
+				types = types.append(join_parameter(header.parameter).value_type)
+			for input in block.inputs:
+				types = types.append(join_parameter(input).value_type)
+			for operation in block.operations:
 				match operation:
 					DefineValue(definition):
 						types = types.append(definition.value_type)
 						match definition.operation:
 							CallDefinition(target, _):
 								match target:
-									RuntimeFunction(runtime): runtime_calls = runtime_calls.append(runtime)
+									RuntimeFunction(runtime):
+										runtime_calls = runtime_calls.append(runtime)
+										match call_list_update(runtime):
+											Some(helper): list_updates = list_updates.append(helper)
+											None: void
+									_: void
+							ListSuffixDefinition(_, _):
+								match definition.value_type:
+									ListType(element): list_updates = list_updates.append(update_helper(SuffixUpdate, element))
 									_: void
 							_: void
 					ExecuteJoin(join):
 						for output in [join.result].concat(join.carried):
 							types = types.append(join_parameter(output).value_type)
+					ExecuteLoop(loop):
+						for output in [loop.result].concat(loop.carried):
+							types = types.append(join_parameter(output).value_type)
 					AcquireOwner(_, _, _) | DropOwner(_, _):
 						void
 
-	{ types = types, runtime_calls = runtime_calls }
+	{ types = types, runtime_calls = runtime_calls, list_updates = list_updates }
 
 
 private pure func list_layouts(inventory: ProgramInventory) -> List[ListLayout]:
@@ -2321,7 +2768,7 @@ private pure func list_layouts(inventory: ProgramInventory) -> List[ListLayout]:
 		duplicate = match previous:
 			Some(key): same_list_key(key, layout.key)
 			None: False
-		if not duplicate:
+		if duplicate.not():
 			unique = unique.append(layout)
 			previous = Some(layout.key)
 	unique
@@ -2329,7 +2776,7 @@ private pure func list_layouts(inventory: ProgramInventory) -> List[ListLayout]:
 
 -- An update helper is emitted only where its operation is called. The
 -- helper list is deduplicated by scanning its own entries: there are at most
--- three per element layout, so the scan stays small for any call count.
+-- four per element layout, so the scan stays small for any call count.
 private fixed record ListUpdateHelper {
 	update: ListUpdate,
 	layout: ListLayout
@@ -2350,6 +2797,10 @@ private pure func same_list_update(left: ListUpdate, right: ListUpdate) -> Bool:
 			match right:
 				ConcatUpdate: True
 				_: False
+		SuffixUpdate:
+			match right:
+				SuffixUpdate: True
+				_: False
 
 
 private pure func update_helper(update: ListUpdate, element: TypeRef) -> ListUpdateHelper:
@@ -2366,17 +2817,18 @@ private pure func call_list_update(operation: RuntimeOperation[VariantInstanceId
 
 private pure func list_update_helpers(inventory: ProgramInventory) -> List[ListUpdateHelper]:
 	var unique: List[ListUpdateHelper] = []
-	for operation in inventory.runtime_calls:
-		match call_list_update(operation):
-			None: void
-			Some(helper):
-				var known = False
-				for existing in unique:
-					if same_list_update(existing.update, helper.update) and same_list_key(existing.layout.key, helper.layout.key):
+	for helper in inventory.list_updates:
+		var known: Bool = False
+		for existing in unique:
+			match same_list_update(existing.update, helper.update):
+				False: void
+				True:
+					if same_list_key(existing.layout.key, helper.layout.key):
 						known = True
 						break
-				if not known:
-					unique = unique.append(helper)
+		match known:
+			True: void
+			False: unique = unique.append(helper)
 	unique
 
 
@@ -2460,7 +2912,7 @@ private pure func append_list_updates(
 	else:
 		var fragments: List[String] = [output]
 		var failure: Option[Diagnostic] = None
-		-- At most three helpers share one layout, so recomputing its few
+		-- At most four helpers share one layout, so recomputing its few
 		-- fragments costs less than keying them from the layout table.
 		for helper in helpers:
 			match element_fragments(helper.layout, unions, records):
@@ -2549,7 +3001,7 @@ private pure func aggregate_runtime_contents(
 
 		index = IntOps.add(index, 1)
 
-	ready ?= match failure:
+	ready: Void ?= match failure:
 		Some(error):
 			Err(error)
 		None:
@@ -2564,7 +3016,7 @@ private pure func aggregate_runtime_contents(
 
 -- Boxed union nodes need the allocation and atomic headers like managed records.
 private pure func has_boxed_union(unions: List[ConcreteUnion]) -> Bool:
-	var boxed = False
+	var boxed: Bool = False
 
 	for layout in unions:
 		match layout.representation:
@@ -2602,15 +3054,19 @@ pure func emit(program: VerifiedProgram) -> Result[String, Diagnostic]:
 		"#include <stdint.h>\n"
 	var fragments: List[String] = [MEMORY_RUNTIME, prelude]
 
-	if (
-		not lists.is_empty() or checked.records.any(pure func(layout):
-			match layout.representation:
-				ManagedRecord:
-					True
-				InlineRecord:
-					False
-		) or has_boxed_union(checked.unions)
-	):
+	needs_allocation_headers: Bool = match lists.is_empty().not():
+		True: True
+		False:
+			match checked.records.any(pure func(layout):
+					match layout.representation:
+						ManagedRecord:
+							True
+						InlineRecord:
+							False
+				):
+				True: True
+				False: has_boxed_union(checked.unions)
+	if needs_allocation_headers:
 		fragments = fragments.append("#include <stdlib.h>\n#include <stdatomic.h>\n")
 
 	if requirements.float_types:
@@ -2652,6 +3108,9 @@ pure func emit(program: VerifiedProgram) -> Result[String, Diagnostic]:
 	if requirements.string_concatenation:
 		fragments = fragments.append(STRING_CONCAT_RUNTIME)
 
+	if requirements.string_slicing:
+		fragments = fragments.append(STRING_SLICE_RUNTIME)
+
 	fragments = fragments.append(aggregates)
 	var index: Int = 0
 	var failure: Option[Diagnostic] = None
@@ -2668,7 +3127,7 @@ pure func emit(program: VerifiedProgram) -> Result[String, Diagnostic]:
 
 		index = IntOps.add(index, 1)
 
-	if not failure.is_some():
+	if failure.is_some().not():
 		index = 0
 
 		for function in checked.functions:

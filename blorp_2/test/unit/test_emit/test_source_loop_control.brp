@@ -1,0 +1,220 @@
+import:
+	../../../src/check/model as Model
+	../../../src/emit/emit: emit
+	../../../src/lower/lower as Lower
+	../../../src/own/own as Own
+	../../../src/specialize/specialize as Concrete
+	../../../src/utils/syntax: Entrypoint(NoArguments), EntryResult(IntegerExitStatus)
+	../../../src/verify/verify: verify
+	../ownership_inputs: InputIds, input_ids, span
+	test: TestSuite
+
+
+-- Identities are issued by real phase authorities; each tested body is raw
+-- ownership IR, independent of source lowering and ownership insertion.
+private pure func program(ids: InputIds, function: Own.OwnedFunction) -> Own.OwnershipProgram:
+	{
+		records = [], unions = ids.unions,
+		functions = [function, {
+			signature = { parameters = [], return_type = Concrete.IntType },
+			operations = [Own.DefineValue({
+				id = ids.first, value_type = Concrete.IntType,
+				operation = Own.IntegerDefinition(0), result = Own.UnmanagedResult, span = span(1),
+			})],
+			result = Own.UnmanagedReturn(ids.first),
+		}],
+		entrypoint = NoArguments(ids.second_function, IntegerExitStatus),
+	}
+
+
+private pure func scalar_loop(ids: InputIds) -> Own.OwnedLoop:
+	{
+		entry_acquisitions = [],
+		headers = [
+			{ parameter = Own.UnmanagedJoinParameter({ id = ids.fourth, value_type = Concrete.IntType, span = span(3) }), initial = Own.UnmanagedReturn(ids.first) },
+			{ parameter = Own.UnmanagedJoinParameter({ id = ids.fifth, value_type = Concrete.IntType, span = span(4) }), initial = Own.UnmanagedReturn(ids.second) },
+		],
+		result = Own.UnmanagedJoinParameter({ id = ids.third, value_type = Concrete.IntType, span = span(2) }),
+		carried = [],
+		body = { operations = [], tail = Own.ExitLoop(Own.Recur([Own.UnmanagedReturn(ids.fifth), Own.UnmanagedReturn(ids.fourth)], span(5))) },
+	}
+
+
+private pure func scalar_function(ids: InputIds, loop: Own.OwnedLoop) -> Own.OwnedFunction:
+	{
+		signature = { parameters = [Concrete.IntType, Concrete.IntType], return_type = Concrete.IntType },
+		operations = [
+			Own.DefineValue({ id = ids.first, value_type = Concrete.IntType, operation = Own.ParameterDefinition(0), result = Own.UnmanagedResult, span = span(0) }),
+			Own.DefineValue({ id = ids.second, value_type = Concrete.IntType, operation = Own.ParameterDefinition(1), result = Own.UnmanagedResult, span = span(1) }),
+			Own.ExecuteLoop(loop),
+		],
+		result = Own.UnmanagedReturn(ids.third),
+	}
+
+
+private pure func batch_facts() -> Option[Bool]:
+	ids ?= input_ids().to_option()
+	code ?= verify(program(ids, scalar_function(ids, scalar_loop(ids)))).and_then(emit).to_option()
+	Some(code.contains("blorp_loop_2_header:{")
+		and code.contains("blorp_vl_3=blorp_h_3;") and code.contains("blorp_vl_4=blorp_h_4;")
+		and code.contains("blorp_loop_2_transfer_0=blorp_vl_4;const int64_t blorp_loop_2_transfer_1=blorp_vl_3;blorp_h_3=blorp_loop_2_transfer_0;blorp_h_4=blorp_loop_2_transfer_1;goto blorp_loop_2_header;")
+		and code.contains("blorp_loop_2_break:;"))
+
+
+pure func test_recur_captures_every_outgoing_value_before_assigning_headers() -> Bool:
+	batch_facts().get_or(False)
+
+
+private pure func selection(ids: InputIds) -> Own.OwnedSelection:
+	{
+		scrutinee = Own.UnmanagedArgument(ids.first),
+		entry = Model.decision_node_id(2),
+		nodes = [
+			Own.EnterArm({ arm = Model.match_arm_id(0), operations = [], transfers = [] }),
+			Own.EnterArm({ arm = Model.match_arm_id(1), operations = [], transfers = [] }),
+			Own.TestVariant({ value_type = Concrete.UnionType(ids.union_id), route = Concrete.MatchRoot }, ids.second_variant, Model.decision_node_id(0), Model.decision_node_id(1)),
+		],
+	}
+
+
+private pure func terminal_selection(ids: InputIds) -> Own.OwnedLoopTail:
+	Own.MatchLoop({
+		selection = {
+			scrutinee = Own.UnmanagedArgument(ids.first), entry = Model.decision_node_id(0),
+			nodes = [Own.EnterArm({ arm = Model.match_arm_id(0), operations = [], transfers = [] })],
+		},
+		arms = [{
+			id = Model.match_arm_id(0), inputs = [],
+			body = { operations = [], tail = Own.ExitLoop(Own.Recur([Own.UnmanagedReturn(ids.fourth)], span(7))) },
+		}],
+	})
+
+
+private pure func mixed_join(ids: InputIds, result: Lower.ValueId) -> Own.OwnedJoin:
+	{
+		result = Own.UnmanagedJoinParameter({ id = result, value_type = Concrete.IntType, span = span(8) }),
+		carried = [], selection = selection(ids),
+		arms = [
+			{ id = Model.match_arm_id(0), inputs = [], operations = [], exit = Own.TransferLoop(Lower.loop_target(ids.third), terminal_selection(ids)) },
+			{ id = Model.match_arm_id(1), inputs = [], operations = [], exit = Own.Yield({ transfer = Own.UnmanagedReturn(ids.fourth), carried = [] }) },
+		],
+	}
+
+
+private pure func selection_function(ids: InputIds, joins: List[Own.OwnershipOperation]) -> Own.OwnedFunction:
+	{
+		signature = { parameters = [Concrete.UnionType(ids.union_id)], return_type = Concrete.IntType },
+		operations = [
+			Own.DefineValue({ id = ids.first, value_type = Concrete.UnionType(ids.union_id), operation = Own.ParameterDefinition(0), result = Own.UnmanagedResult, span = span(0) }),
+			Own.DefineValue({ id = ids.second, value_type = Concrete.IntType, operation = Own.IntegerDefinition(0), result = Own.UnmanagedResult, span = span(1) }),
+			Own.ExecuteLoop({
+				entry_acquisitions = [],
+				headers = [{ parameter = Own.UnmanagedJoinParameter({ id = ids.fourth, value_type = Concrete.IntType, span = span(3) }), initial = Own.UnmanagedReturn(ids.second) }],
+				result = Own.UnmanagedJoinParameter({ id = ids.third, value_type = Concrete.IntType, span = span(2) }), carried = [],
+				body = { operations = joins, tail = Own.ExitLoop(Own.Break({ value = Own.UnmanagedReturn(ids.fourth), carried = [], span = span(9) })) },
+			}),
+		],
+		result = Own.UnmanagedReturn(ids.third),
+	}
+
+
+private pure func unique_selection_facts() -> Option[Bool]:
+	ids ?= input_ids().to_option()
+	function = selection_function(ids, [Own.ExecuteJoin(mixed_join(ids, ids.fifth)), Own.ExecuteJoin(mixed_join(ids, ids.sixth))])
+	code ?= verify(program(ids, function)).and_then(emit).to_option()
+	Some(code.count("blorp_selection_4_in_0_node_0:{") == 1
+		and code.count("blorp_selection_5_in_0_node_0:{") == 1
+		and code.contains("goto blorp_loop_2_header;")
+		and code.contains("goto blorp_selection_4_done;") and code.contains("goto blorp_selection_5_done;"))
+
+
+pure func test_zero_definition_terminal_selectors_in_distinct_joins_have_unique_labels() -> Bool:
+	unique_selection_facts().get_or(False)
+
+
+private pure func abrupt_facts() -> Option[Bool]:
+	ids ?= input_ids().to_option()
+	function = selection_function(ids, [])
+	operation ?= function.operations.get(2)
+	match operation:
+		Own.ExecuteLoop(loop):
+			terminal = terminal_selection(ids)
+			-- All-abrupt control is a terminal selector with no Join P at all.
+			-- The extra level introduces no values and must extend its arm path.
+			nested: Own.OwnedLoopTail = Own.MatchLoop({
+				selection = {
+					scrutinee = Own.UnmanagedArgument(ids.first), entry = Model.decision_node_id(0),
+					nodes = [Own.EnterArm({ arm = Model.match_arm_id(0), operations = [], transfers = [] })],
+				},
+				arms = [{ id = Model.match_arm_id(0), inputs = [], body = { operations = [], tail = terminal } }],
+			})
+			owned = { function | operations = function.operations.set(2, Own.ExecuteLoop({ loop | body = { operations = [], tail = nested } })) }
+			code ?= verify(program(ids, owned)).and_then(emit).to_option()
+			Some(code.count("blorp_selection_2_node_0:{") == 1
+				and code.count("blorp_selection_2_in_0_node_0:{") == 1
+				and code.contains("goto blorp_loop_2_header;")
+				and not code.contains("blorp_vl_4")
+				and not code.contains("blorp_selection_2_done"))
+		_: None
+
+
+pure func test_all_abrupt_terminal_selection_emits_no_continuation_value_or_fake_yield() -> Bool:
+	abrupt_facts().get_or(False)
+
+
+private pure func managed_entry_facts() -> Option[Bool]:
+	ids ?= input_ids().to_option()
+	initial = Own.owner_id(0)
+	header = Own.owner_id(1)
+	outgoing = Own.owner_id(2)
+	function: Own.OwnedFunction = {
+		signature = { parameters = [Concrete.StringType], return_type = Concrete.IntType },
+		operations = [
+			Own.DefineValue({
+				id = ids.first, value_type = Concrete.StringType, operation = Own.ParameterDefinition(0),
+				result = Own.BorrowedResult(Own.ParameterBorrow(ids.first)), span = span(0),
+			}),
+			Own.DefineValue({ id = ids.second, value_type = Concrete.IntType, operation = Own.IntegerDefinition(0), result = Own.UnmanagedResult, span = span(1) }),
+			Own.ExecuteLoop({
+				entry_acquisitions = [{ owner = initial, borrow = { value = ids.first, source = Own.ParameterBorrow(ids.first) } }],
+				headers = [{
+					parameter = Own.ManagedJoinParameter({ id = ids.fourth, value_type = Concrete.StringType, span = span(3) }, header),
+					initial = Own.OwnedReturn(ids.first, initial),
+				}],
+				result = Own.UnmanagedJoinParameter({ id = ids.third, value_type = Concrete.IntType, span = span(2) }), carried = [],
+				body = {
+					operations = [
+						Own.AcquireOwner(outgoing, { value = ids.fourth, source = Own.OwnerBorrow(header) }, span(4)),
+						Own.DropOwner(header, span(5)),
+					],
+					tail = Own.ExitLoop(Own.Recur([Own.OwnedReturn(ids.fourth, outgoing)], span(6))),
+				},
+			}),
+		],
+		result = Own.UnmanagedReturn(ids.third),
+	}
+	code ?= verify(program(ids, function)).and_then(emit).to_option()
+	acquire ?= code.index_of("blorp_string_retain(blorp_vl_0);")
+	initialize ?= code.index_of("blorp_h_3=blorp_owner_0;")
+	label ?= code.index_of("blorp_loop_2_header:{")
+	Some(acquire < initialize and initialize < label
+		and code.count("blorp_string_retain(blorp_vl_0);") == 1
+		and code.count("blorp_string_retain(blorp_vl_3);") == 1
+		and code.contains("blorp_owner_1=blorp_vl_3;")
+		and code.contains("blorp_string_retain(blorp_vl_3);struct blorp_string* const blorp_owner_2=blorp_vl_3;(void)blorp_owner_2;blorp_string_release(blorp_owner_1);")
+		and code.contains("blorp_loop_2_transfer_0=blorp_owner_2;blorp_h_3=blorp_loop_2_transfer_0;goto blorp_loop_2_header;"))
+
+
+pure func test_entry_acquisition_occurs_once_before_header_and_owned_recur_uses_explicit_actions() -> Bool:
+	managed_entry_facts().get_or(False)
+
+
+tests: TestSuite = {
+	description = "Blorp 2 common loop control emission",
+	tests = [
+		("recur captures outgoing batch before header assignments", test_recur_captures_every_outgoing_value_before_assigning_headers),
+		("zero-definition terminal selectors have distinct Join roots", test_zero_definition_terminal_selectors_in_distinct_joins_have_unique_labels),
+		("all-abrupt terminal selection has no continuation or fake yield", test_all_abrupt_terminal_selection_emits_no_continuation_value_or_fake_yield),
+		("entry acquisition precedes header and explicit owned recur actions", test_entry_acquisition_occurs_once_before_header_and_owned_recur_uses_explicit_actions),
+	]
+}

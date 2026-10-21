@@ -1,0 +1,60 @@
+import:
+	../../src/check/check: check
+	../../src/lower/lower as Lower
+	../../src/namespace/builtins as Builtins
+	../../src/specialize/specialize as Concrete
+	../../src/utils/syntax: Diagnostic
+	./input: setup_diagnostic
+	./module_input: parse_modules
+	./ownership_inputs: span
+
+
+SLICE_DECLARATION: String =
+	|pure func slice_text(value: String, start: Int, end: Int) -> Option[String]:
+	|    builtin("string.slice")
+	|
+
+SLICE_SOURCE: String =
+	|pure func slice_text(value: String, start: Int, end: Int) -> Option[String]:
+	|    builtin("string.slice")
+	|pure func escape(value: String) -> String:
+	|    match slice_text(value, 0, 2):
+	|        Some(text): text
+	|        None: "none"
+	|func main() -> Int:
+	|    unused = slice_text("é", 0, 2)
+	|    escaped = escape("é")
+	|    0
+	|
+
+
+fixed record SliceSeed {
+	lowered: Lower.LoweredProgram,
+	query: Lower.LoweredFunction,
+	escape: Lower.LoweredFunction,
+	option: Builtins.DesignatedOption[Concrete.VariantInstanceId]
+}
+
+
+pure func slice_seed() -> Result[SliceSeed, Diagnostic]:
+	parsed ?= parse_modules([{ source = SLICE_SOURCE, targets = [] }])
+	checked ?= check(parsed).map_err(setup_diagnostic)
+	concrete ?= Concrete.specialize(checked)
+	lowered ?= Lower.lower(concrete)
+	match Lower.lowered_functions(lowered).functions:
+		[_, query, escape]:
+			match query.steps:
+				[_, _, _, Lower.Define(result)]:
+					match result.operation:
+						Lower.CallValue(target, [_, _, _]):
+							match target:
+								Concrete.RuntimeFunction(Builtins.StringSlice(option)):
+									Ok({ lowered = lowered, query = query, escape = escape, option = option })
+								_: Err(invalid_seed())
+						_: Err(invalid_seed())
+				_: Err(invalid_seed())
+		_: Err(invalid_seed())
+
+
+private pure func invalid_seed() -> Diagnostic:
+	{ span = span(0), note = None, message = "invalid slice test seed", help = "keep the explicit slice and escape fixture" }

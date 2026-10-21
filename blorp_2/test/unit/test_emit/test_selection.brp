@@ -1,0 +1,111 @@
+import:
+	../../../src/emit/emit: emit
+	../../../src/lex/lex: lex
+	../../../src/own/own: own
+	../../../src/parse/parse: parse_module
+	../../../src/utils/names: program_names
+	../../../src/utils/source: module_source, root_module_id
+	../../../src/verify/verify: verify
+	../managed_union_inputs: lowered
+	string: count
+	system: read_file, write_file
+	int as IntOps
+	test: TestSuite
+
+
+pure func test_alternatives_emit_one_shared_body_after_two_input_edges() -> Bool:
+	source: String =
+		|fixed union Side:
+		|    Left(String, Int)
+		|    Right(Int, String)
+		|func touch(value: String) -> Void:
+		|    void
+		|func chosen(value: Side) -> String:
+		|    match value:
+		|        Left(item, _) | Right(_, item):
+		|            touch(item)
+		|            item
+		|func main() -> Int:
+		|    unused = chosen(Right(11, "right"))
+		|    0
+		|
+	match lowered(source).and_then(own).and_then(verify).and_then(emit):
+		Err(_): False
+		Ok(code):
+			(
+				code.count("blorp_selection_1_arm_0:{") == 1
+				and code.count("goto blorp_selection_1_arm_0;") == 2
+				and code.count("=blorp_f_2(") == 1
+			)
+
+
+func test_string_decisions_compare_exact_static_bytes_without_allocating() -> Bool:
+	source = "pure func classify(value: String) -> Int:\n    match value:\n        \"é\\0x\": 7\n        _: 0\nfunc main() -> Int:\n    classify(\"other\")\n"
+	control = "pure func classify(value: String) -> Int:\n    0\nfunc main() -> Int:\n    classify(\"other\")\n"
+	match lowered(source).and_then(own).and_then(verify).and_then(emit):
+		Err(error):
+			print_error(error.message)
+			False
+		Ok(code):
+			match lowered(control).and_then(own).and_then(verify).and_then(emit):
+				Err(error):
+					print_error(error.message)
+					False
+				Ok(control_code):
+					factory = "blorp_string_from_bytes("
+					-- Matching adds no String construction beyond the same caller
+					-- and runtime helpers in a program without a String decision.
+					valid = (
+						code.contains("static const unsigned char blorp_pattern_bytes[]={195,169,0,120};")
+						and code.contains("->length==INT64_C(4)&&memcmp((blorp_vl_0)->bytes,blorp_pattern_bytes,(size_t)4)==0)")
+						and code.count("blorp_pattern_bytes[]={") == 1
+						and code.count(factory) == control_code.count(factory)
+					)
+					if not valid:
+						print_error("String constructor mentions: decision=" + IntOps.to_string(code.count(factory)) + "; control=" + IntOps.to_string(control_code.count(factory)))
+						match write_file("build/source-patterns/string-decision.c", code):
+							Err(error): print_error(error)
+							Ok(_): void
+						match write_file("build/source-patterns/string-control.c", control_code):
+							Err(error): print_error(error)
+							Ok(_): void
+					valid
+
+
+pure func test_list_length_decision_precedes_borrowed_element_projection() -> Bool:
+	source: String =
+		|pure func choose(values: List[String]) -> String:
+		|    match values:
+		|        [item]: item
+		|        _: "other"
+		|func main() -> Int:
+		|    unused = choose(["selected"])
+		|    0
+		|
+	match lowered(source).and_then(own).and_then(verify).and_then(emit):
+		Err(_): False
+		Ok(code):
+			(
+				code.contains("if((blorp_vl_0)->length==INT64_C(1))goto blorp_selection_1_node_")
+				and code.contains("=blorp_vl_0->values[0];")
+				and code.count("blorp_selection_1_arm_0:{") == 1
+			)
+
+
+func test_changed_emit_production_parses_in_target() -> Bool:
+	match read_file("blorp_2/src/emit/emit.brp"):
+		Err(_): False
+		Ok(source):
+			lex(module_source(root_module_id()), source, program_names().names)
+				.and_then(pure func(tokens): parse_module(tokens, root_module_id())).is_ok()
+
+
+tests: TestSuite = {
+	description = "Emitted shared selection bodies",
+	tests = [
+		("String decisions compare exact static UTF8 and NUL bytes", test_string_decisions_compare_exact_static_bytes_without_allocating),
+		("List length guards its selected element", test_list_length_decision_precedes_borrowed_element_projection),
+		("different input projections share the body", test_alternatives_emit_one_shared_body_after_two_input_edges),
+		("Emit module uses target grammar", test_changed_emit_production_parses_in_target),
+	]
+}

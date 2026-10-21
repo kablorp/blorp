@@ -1,0 +1,468 @@
+import:
+	../../../src/check/model: match_arm_id, decision_node_id
+	../../../src/lower/lower as Lower
+	../../../src/own/own as Own
+	../../../src/specialize/specialize as Concrete
+	../../../src/utils/syntax: same_span
+	../ownership_inputs: InputIds, input_ids, span
+	test: TestSuite
+
+
+-- The seed mints opaque identities only. Every Lower step is constructed here.
+private pure func repeated_headers(ids: InputIds, recur: Bool) -> Lower.LoweredFunction:
+	exit = if recur:
+		Lower.Recur([ids.fourth, ids.third], span(5))
+	else:
+		Lower.Break({ value = ids.third, carried = [], span = span(5) })
+	{
+		signature = { parameters = [Concrete.StringType], return_type = Concrete.StringType },
+		steps = [
+			Lower.Define({ id = ids.first, value_type = Concrete.StringType, operation = Lower.ParameterValue(0), span = span(1) }),
+			Lower.Loop({
+				result = { id = ids.second, value_type = Concrete.StringType, span = span(2) },
+				carried = [], reads = [ids.first],
+				headers = [
+					{ parameter = { id = ids.third, value_type = Concrete.StringType, span = span(3) }, initial = ids.first },
+					{ parameter = { id = ids.fourth, value_type = Concrete.StringType, span = span(4) }, initial = ids.first },
+				],
+				body = { steps = [], tail = Lower.ExitLoop(exit) },
+			}),
+		],
+		result = ids.second,
+	}
+
+
+private pure func owns(transfer: Own.ReturnTransfer, value: Lower.ValueId, owner: Int) -> Bool:
+	match transfer:
+		Own.OwnedReturn(actual, obligation): Lower.value_number(actual) == Lower.value_number(value) and Own.owner_number(obligation) == owner
+		_: False
+
+
+private pure func borrows_owner(borrow: Own.BorrowedValue, value: Lower.ValueId, expected: Int) -> Bool:
+	match borrow.source:
+		Own.OwnerBorrow(owner): Lower.value_number(borrow.value) == Lower.value_number(value) and Own.owner_number(owner) == expected
+		_: False
+
+
+private pure func entry_facts() -> Option[Bool]:
+	ids ?= input_ids().to_option()
+	owned ?= Own.insert_function(repeated_headers(ids, True), [], []).to_option()
+	match owned.operations:
+		[_, Own.ExecuteLoop(loop)]:
+			match loop.entry_acquisitions:
+				[first, second]:
+					match loop.headers:
+						[left, right]:
+							Some(Own.owner_number(first.owner) == 1 and Own.owner_number(second.owner) == 2
+								and Lower.value_number(first.borrow.value) == Lower.value_number(ids.first)
+								and Lower.value_number(second.borrow.value) == Lower.value_number(ids.first)
+								and owns(left.initial, ids.first, 1) and owns(right.initial, ids.first, 2)
+								and header_owner(left.parameter, 3)
+								and header_owner(right.parameter, 4))
+						_: None
+				_: None
+		_: None
+
+
+private pure func header_owner(parameter: Own.OwnedJoinParameter, expected: Int) -> Bool:
+	match parameter:
+		Own.ManagedJoinParameter(_, owner): Own.owner_number(owner) == expected
+		Own.UnmanagedJoinParameter(_): False
+
+
+pure func test_repeated_borrowed_initials_acquire_before_fresh_header_owners() -> Bool:
+	entry_facts().get_or(False)
+
+
+private pure func swap_facts() -> Option[Bool]:
+	ids ?= input_ids().to_option()
+	owned ?= Own.insert_function(repeated_headers(ids, True), [], []).to_option()
+	match owned.operations:
+		[_, Own.ExecuteLoop(loop)]:
+			match loop.body.operations:
+				[Own.AcquireOwner(first, first_borrow, _), Own.AcquireOwner(second, second_borrow, _), Own.DropOwner(left, _), Own.DropOwner(right, _)]:
+					match loop.body.tail:
+						Own.ExitLoop(Own.Recur([first_transfer, second_transfer], _)):
+							Some(owns(first_transfer, ids.fourth, Own.owner_number(first))
+								and owns(second_transfer, ids.third, Own.owner_number(second))
+								and Lower.value_number(first_borrow.value) == Lower.value_number(ids.fourth)
+								and Lower.value_number(second_borrow.value) == Lower.value_number(ids.third)
+								and Own.owner_number(left) == 3 and Own.owner_number(right) == 4)
+						_: None
+				_: None
+		_: None
+
+
+pure func test_swap_acquires_every_outgoing_occurrence_before_retiring_headers() -> Bool:
+	swap_facts().get_or(False)
+
+
+private pure func repeated_outgoing_facts() -> Option[Bool]:
+	ids ?= input_ids().to_option()
+	original = repeated_headers(ids, False)
+	match original.steps:
+		[first, Lower.Loop(loop)]:
+			candidate = { loop |
+				carried = [{ id = ids.third, value_type = Concrete.StringType, span = span(3) }],
+				headers = [
+					{ parameter = { id = ids.fourth, value_type = Concrete.StringType, span = span(4) }, initial = ids.first },
+					{ parameter = { id = ids.fifth, value_type = Concrete.StringType, span = span(5) }, initial = ids.first },
+				],
+				body = { steps = [], tail = Lower.ExitLoop(Lower.Break({ value = ids.fourth, carried = [ids.fourth], span = span(6) })) },
+			}
+			owned ?= Own.insert_function({ original | steps = [first, Lower.Loop(candidate)] }, [], []).to_option()
+			match owned.operations:
+				[_, Own.ExecuteLoop(result), Own.DropOwner(_, _)]:
+					match result.body.operations:
+						[Own.AcquireOwner(left, first_borrow, _), Own.AcquireOwner(right, second_borrow, _), Own.DropOwner(_, _), Own.DropOwner(_, _)]:
+							match result.body.tail:
+								Own.ExitLoop(Own.Break(outputs)):
+									carried ?= outputs.carried.get(0)
+									Some(Own.owner_number(left) != Own.owner_number(right)
+										and owns(outputs.value, ids.fourth, Own.owner_number(left))
+										and owns(carried, ids.fourth, Own.owner_number(right))
+										and Lower.value_number(first_borrow.value) == Lower.value_number(second_borrow.value))
+								_: None
+						_: None
+				_: None
+		_: None
+
+
+pure func test_duplicate_outgoing_value_acquires_distinct_obligations_before_cleanup() -> Bool:
+	repeated_outgoing_facts().get_or(False)
+
+
+private pure func selection(ids: InputIds) -> Lower.LoweredSelection:
+	{
+		scrutinee = ids.second,
+		nodes = [
+			Lower.EnterArm({ arm = match_arm_id(0), definitions = [], arguments = [] }),
+			Lower.EnterArm({ arm = match_arm_id(1), definitions = [], arguments = [] }),
+			Lower.TestVariant({ value_type = Concrete.UnionType(ids.union_id), route = Concrete.MatchRoot }, ids.second_variant, decision_node_id(0), decision_node_id(1)),
+		],
+		entry = decision_node_id(2),
+	}
+
+
+private pure func abrupt_function(ids: InputIds) -> Lower.LoweredFunction:
+	{
+		signature = { parameters = [Concrete.StringType, Concrete.UnionType(ids.union_id)], return_type = Concrete.StringType },
+		steps = [
+			Lower.Define({ id = ids.first, value_type = Concrete.StringType, operation = Lower.ParameterValue(0), span = span(1) }),
+			Lower.Define({ id = ids.second, value_type = Concrete.UnionType(ids.union_id), operation = Lower.ParameterValue(1), span = span(2) }),
+			Lower.Loop({
+				result = { id = ids.third, value_type = Concrete.StringType, span = span(3) },
+				carried = [], reads = [ids.first, ids.second],
+				headers = [{ parameter = { id = ids.fourth, value_type = Concrete.StringType, span = span(4) }, initial = ids.first }],
+				body = {
+					steps = [
+						Lower.Define({ id = ids.fifth, value_type = Concrete.StringType, operation = Lower.StringValue("already retired"), span = span(5) }),
+						Lower.Define({ id = ids.sixth, value_type = Concrete.StringType, operation = Lower.StringValue("outgoing"), span = span(6) }),
+						Lower.Join({
+							result = { id = ids.seventh, value_type = Concrete.VoidType, span = span(7) },
+							carried = [], reads = [ids.second, ids.sixth], selection = selection(ids),
+							arms = [
+								{ id = match_arm_id(0), inputs = [], steps = [], exit = Lower.TransferLoop(Lower.loop_target(ids.third), Lower.ExitLoop(Lower.Break({ value = ids.sixth, carried = [], span = span(8) }))) },
+								{ id = match_arm_id(1), inputs = [], steps = [Lower.Define({ id = ids.eighth, value_type = Concrete.VoidType, operation = Lower.VoidValue, span = span(9) })], exit = Lower.Yield({ value = ids.eighth, carried = [] }) },
+							],
+						}),
+					],
+					tail = Lower.ExitLoop(Lower.Break({ value = ids.fourth, carried = [], span = span(10) })),
+				},
+			}),
+		],
+		result = ids.third,
+	}
+
+
+private pure func abrupt_facts() -> Option[Bool]:
+	ids ?= input_ids().to_option()
+	function ?= Own.insert_function(abrupt_function(ids), ids.unions, []).to_option()
+	match function.operations:
+		[_, _, Own.ExecuteLoop(loop)]:
+			match loop.body.operations:
+				[Own.DefineValue(dead), Own.DropOwner(dead_drop, _), Own.DefineValue(local), Own.ExecuteJoin(join), Own.DropOwner(normal_local_drop, _), _, _]:
+					match join.arms:
+						[first, _]:
+							match first.operations:
+								[Own.AcquireOwner(outgoing, borrow, _), Own.DropOwner(header_drop, _), Own.DropOwner(local_drop, _)]:
+									match first.exit:
+										Own.TransferLoop(_, Own.ExitLoop(Own.Break(outputs))):
+											Some(owns(outputs.value, ids.sixth, Own.owner_number(outgoing))
+												and Own.owner_number(header_drop) == 2
+												and Own.owner_number(local_drop) == Own.owner_number(normal_local_drop)
+												and Own.owner_number(dead_drop) != Own.owner_number(local_drop)
+												and Lower.value_number(borrow.value) == Lower.value_number(local.id)
+												and Lower.value_number(dead.id) != Lower.value_number(local.id))
+										_: None
+								_: None
+						_: None
+				_: None
+		_: None
+
+
+pure func test_abrupt_join_retires_live_lexical_owners_without_redropping_dead_locals() -> Bool:
+	abrupt_facts().get_or(False)
+
+
+private pure func drops(operations: List[Own.OwnershipOperation], owner: Own.OwnerId) -> Int:
+	var count = 0
+	for operation in operations:
+		match operation:
+			Own.DropOwner(actual, _):
+				if Own.owner_number(actual) == Own.owner_number(owner):
+					count = count + 1
+			_: void
+	count
+
+
+private pure func owned_pre_facts() -> Option[Bool]:
+	ids ?= input_ids().to_option()
+	original = abrupt_function(ids)
+	match original.steps:
+		[Lower.Define(first), Lower.Define(second), loop_step]:
+			candidate = { original |
+				signature = { parameters = [Concrete.UnionType(ids.union_id)], return_type = Concrete.StringType },
+				steps = [Lower.Define({ first | operation = Lower.StringValue("PRE") }), Lower.Define({ second | operation = Lower.ParameterValue(0) }), loop_step],
+			}
+			owned ?= Own.insert_function(candidate, ids.unions, []).to_option()
+			match owned.operations:
+				[Own.DefineValue(pre), _, Own.ExecuteLoop(loop), Own.DropOwner(retired, _)]:
+					match pre.result:
+						Own.OwnedResult(owner):
+							match loop.body.operations.get(3):
+								Some(Own.ExecuteJoin(join)):
+									arm ?= join.arms.get(0)
+									Some(Own.owner_number(owner) == Own.owner_number(retired)
+										and drops(loop.body.operations, owner) == 0 and drops(arm.operations, owner) == 0)
+								_: None
+						_: None
+				_: None
+		_: None
+
+
+pure func test_abrupt_cleanup_preserves_owned_pre_until_parent_continuation() -> Bool:
+	owned_pre_facts().get_or(False)
+
+
+private pure func wrong_target_facts() -> Option[Bool]:
+	ids ?= input_ids().to_option()
+	original = abrupt_function(ids)
+	match original.steps:
+		[first, second, Lower.Loop(loop)]:
+			match loop.body.steps:
+				[dead, local, Lower.Join(join)]:
+					arm ?= join.arms.get(0)
+					match arm.exit:
+						Lower.TransferLoop(_, tail):
+							changed = { arm | exit = Lower.TransferLoop(Lower.loop_target(ids.first), tail) }
+							candidate = { original | steps = [first, second, Lower.Loop({ loop | body = { loop.body | steps = [dead, local, Lower.Join({ join | arms = join.arms.set(0, changed) })] } })] }
+							match Own.insert_function(candidate, ids.unions, []):
+								Ok(_): None
+								Err(error): Some(same_span(error.span, span(7))
+									and error.message == "internal compiler error: loop transfer does not target the nearest loop"
+									and error.help == "report this compiler error with the input program" and error.note.is_none())
+						_: None
+				_: None
+		_: None
+
+
+pure func test_abrupt_join_rejects_a_foreign_lexical_target() -> Bool:
+	wrong_target_facts().get_or(False)
+
+
+private pure func recursive_terminal_facts() -> Option[Bool]:
+	ids ?= input_ids().to_option()
+	original = abrupt_function(ids)
+	match original.steps:
+		[first, second, Lower.Loop(loop)]:
+			one = { selection(ids) | nodes = [Lower.EnterArm({ arm = match_arm_id(0), definitions = [], arguments = [] })], entry = decision_node_id(0) }
+			terminal: Lower.LoopTail = Lower.MatchLoop({ selection = one, arms = [
+				{ id = match_arm_id(0), inputs = [], body = { steps = [], tail = Lower.MatchLoop({ selection = one, arms = [
+					{ id = match_arm_id(0), inputs = [], body = { steps = [], tail = Lower.ExitLoop(Lower.Break({ value = ids.fourth, carried = [], span = span(11) })) } },
+				] }) } },
+			] })
+			owned ?= Own.insert_function({ original | steps = [first, second, Lower.Loop({ loop | body = { steps = [], tail = terminal } })] }, ids.unions, []).to_option()
+			match owned.operations:
+				[_, _, Own.ExecuteLoop(result)]:
+					match result.body.tail:
+						Own.MatchLoop(outer):
+							arm ?= outer.arms.get(0)
+							match arm.body.tail:
+								Own.MatchLoop(inner):
+									leaf ?= inner.arms.get(0)
+									match leaf.body.operations:
+										[Own.AcquireOwner(outgoing, borrow, _), Own.DropOwner(old_header, _)]:
+											match leaf.body.tail:
+												Own.ExitLoop(Own.Break(outputs)):
+													Some(Own.owner_number(old_header) == 2
+														and Own.owner_number(outgoing) == 3
+														and borrows_owner(borrow, ids.fourth, 2)
+														and owns(outputs.value, ids.fourth, 3) and outputs.carried.is_empty())
+												_: None
+										_: None
+								_: None
+						_: None
+				_: None
+		_: None
+
+
+pure func test_terminal_selection_recurses_through_the_same_loop_cleanup() -> Bool:
+	recursive_terminal_facts().get_or(False)
+
+
+private pure func owning_union_facts() -> Option[Bool]:
+	ids ?= input_ids().to_option()
+	original = repeated_headers(ids, True)
+	managed_type = Concrete.UnionType(ids.union_id)
+	layouts: List[Concrete.ConcreteUnion] = [{ variants = [[Concrete.StringType], []], representation = Concrete.InlineOwningPayload }]
+	match original.steps:
+		[Lower.Define(parameter), Lower.Loop(loop)]:
+			candidate = { original |
+				signature = { parameters = [managed_type], return_type = managed_type },
+				steps = [
+					Lower.Define({ parameter | value_type = managed_type }),
+					Lower.Loop({ loop |
+						result = { loop.result | value_type = managed_type },
+						headers = loop.headers.map(pure func(header): { header | parameter = { header.parameter | value_type = managed_type } }),
+					}),
+				],
+			}
+			owned ?= Own.insert_function(candidate, layouts, []).to_option()
+			match owned.operations:
+				[_, Own.ExecuteLoop(result)]:
+					match result.headers:
+						[left, right]:
+							match result.body.operations:
+								[Own.AcquireOwner(first, first_borrow, _), Own.AcquireOwner(second, second_borrow, _), Own.DropOwner(first_header, _), Own.DropOwner(second_header, _)]:
+									match result.body.tail:
+										Own.ExitLoop(Own.Recur([first_transfer, second_transfer], _)):
+											Some(result.entry_acquisitions.length() == 2
+												and header_owner(left.parameter, Own.owner_number(first_header))
+												and header_owner(right.parameter, Own.owner_number(second_header))
+												and owns(left.initial, ids.first, 1) and owns(right.initial, ids.first, 2)
+												and owns(first_transfer, ids.fourth, Own.owner_number(first))
+												and owns(second_transfer, ids.third, Own.owner_number(second))
+												and Lower.value_number(first_borrow.value) == Lower.value_number(ids.fourth)
+												and Lower.value_number(second_borrow.value) == Lower.value_number(ids.third))
+										_: None
+								_: None
+						_: None
+				_: None
+		_: None
+
+
+pure func test_owning_union_headers_use_the_generic_entry_and_swap_contract() -> Bool:
+	owning_union_facts().get_or(False)
+
+
+private pure func managed_arm_input_facts() -> Option[Bool]:
+	ids ?= input_ids().to_option()
+	original = abrupt_function(ids)
+	match original.steps:
+		[first, second, Lower.Loop(loop)]:
+			direct: Lower.LoweredSelection = {
+				scrutinee = ids.second,
+				nodes = [Lower.EnterArm({ arm = match_arm_id(0), definitions = [], arguments = [ids.fourth] })],
+				entry = decision_node_id(0),
+			}
+			terminal: Lower.LoopTail = Lower.MatchLoop({ selection = direct, arms = [
+				{ id = match_arm_id(0), inputs = [{ id = ids.fifth, value_type = Concrete.StringType, span = span(5) }], body = {
+					steps = [Lower.Define({ id = ids.sixth, value_type = Concrete.IntType, operation = Lower.IntegerValue(42), span = span(6) })],
+					tail = Lower.ExitLoop(Lower.Break({ value = ids.fourth, carried = [], span = span(7) })),
+				} },
+			] })
+			owned ?= Own.insert_function({ original | steps = [first, second, Lower.Loop({ loop | body = { steps = [], tail = terminal } })] }, ids.unions, []).to_option()
+			match owned.operations:
+				[_, _, Own.ExecuteLoop(result)]:
+					match result.body.tail:
+						Own.MatchLoop(matched):
+							match matched.selection.nodes:
+								[Own.EnterArm(edge)]:
+									arm ?= matched.arms.get(0)
+									match arm.inputs:
+										[Own.ManagedJoinParameter(input, owner)]:
+											match arm.body.operations:
+												[Own.DropOwner(unused_input, _), Own.DefineValue(value), Own.AcquireOwner(outgoing, _, _), Own.DropOwner(header, _)]:
+													match arm.body.tail:
+														Own.ExitLoop(Own.Break(outputs)):
+															match edge.transfers:
+																[transfer]: Some(owns(transfer, ids.fourth, 3)
+																	and Own.owner_number(owner) == 4 and Own.owner_number(unused_input) == 4
+																	and Lower.value_number(input.id) == Lower.value_number(ids.fifth)
+																	and Lower.value_number(value.id) == Lower.value_number(ids.sixth)
+																	and Own.owner_number(header) == 2 and owns(outputs.value, ids.fourth, Own.owner_number(outgoing)))
+																_: None
+														_: None
+												_: None
+										_: None
+								_: None
+						_: None
+				_: None
+		_: None
+
+
+pure func test_unused_managed_arm_input_retires_before_body_without_consuming_header() -> Bool:
+	managed_arm_input_facts().get_or(False)
+
+
+private pure func nested_header_pre_facts() -> Option[Bool]:
+	ids ?= input_ids().to_option()
+	original = repeated_headers(ids, False)
+	match original.steps:
+		[first, Lower.Loop(loop)]:
+			inner: Lower.LoweredLoop = {
+				result = { id = ids.fourth, value_type = Concrete.StringType, span = span(4) },
+				carried = [], reads = [ids.third],
+				headers = [{ parameter = { id = ids.fifth, value_type = Concrete.StringType, span = span(5) }, initial = ids.third }],
+				body = { steps = [], tail = Lower.ExitLoop(Lower.Break({ value = ids.fifth, carried = [], span = span(6) })) },
+			}
+			outer = { loop |
+				headers = [{ parameter = { id = ids.third, value_type = Concrete.StringType, span = span(3) }, initial = ids.first }],
+				body = { steps = [Lower.Loop(inner)], tail = Lower.ExitLoop(Lower.Break({ value = ids.fourth, carried = [], span = span(7) })) },
+			}
+			owned ?= Own.insert_function({ original | steps = [first, Lower.Loop(outer)] }, [], []).to_option()
+			match owned.operations:
+				[_, Own.ExecuteLoop(result)]:
+					match result.body.operations:
+						[Own.ExecuteLoop(nested), Own.AcquireOwner(outer_outgoing, outer_borrow, _), Own.DropOwner(outer_header, _), Own.DropOwner(inner_result, _)]:
+							match nested.body.operations:
+								[Own.AcquireOwner(inner_outgoing, inner_borrow, _), Own.DropOwner(inner_header, _)]:
+									match nested.body.tail:
+										Own.ExitLoop(Own.Break(inner_outputs)):
+											match result.body.tail:
+												Own.ExitLoop(Own.Break(outer_outputs)):
+													Some(Own.owner_number(outer_header) == 2 and Own.owner_number(inner_header) == 6
+														and Own.owner_number(inner_result) == 3
+														and drops(nested.body.operations, outer_header) == 0
+														and borrows_owner(inner_borrow, ids.fifth, 6)
+														and borrows_owner(outer_borrow, ids.fourth, 3)
+														and owns(inner_outputs.value, ids.fifth, Own.owner_number(inner_outgoing))
+														and owns(outer_outputs.value, ids.fourth, Own.owner_number(outer_outgoing)))
+												_: None
+										_: None
+								_: None
+						_: None
+				_: None
+		_: None
+
+
+pure func test_nested_loop_preserves_outer_header_as_pre_until_outer_edge() -> Bool:
+	nested_header_pre_facts().get_or(False)
+
+
+tests: TestSuite = {
+	description = "Blorp 2 common loop ownership transfers",
+	tests = [
+		("repeated borrowed initials precede fresh header owners", test_repeated_borrowed_initials_acquire_before_fresh_header_owners),
+		("swap acquires outgoing occurrences before retiring old headers", test_swap_acquires_every_outgoing_occurrence_before_retiring_headers),
+		("duplicate outgoing slots acquire independent occurrences", test_duplicate_outgoing_value_acquires_distinct_obligations_before_cleanup),
+		("abrupt join retires only live lexical owners", test_abrupt_join_retires_live_lexical_owners_without_redropping_dead_locals),
+		("abrupt cleanup preserves owned PRE", test_abrupt_cleanup_preserves_owned_pre_until_parent_continuation),
+		("abrupt join rejects a foreign target", test_abrupt_join_rejects_a_foreign_lexical_target),
+		("terminal selection uses recursive common loop cleanup", test_terminal_selection_recurses_through_the_same_loop_cleanup),
+		("owning union H shares generic entry and swap", test_owning_union_headers_use_the_generic_entry_and_swap_contract),
+		("unused managed canonical input keeps last-use drop", test_unused_managed_arm_input_retires_before_body_without_consuming_header),
+		("nested loop preserves outer H as PRE", test_nested_loop_preserves_outer_header_as_pre_until_outer_edge),
+	]
+}

@@ -3,16 +3,17 @@ import:
 	../../../src/check/model:
 		BindingOrigin(ParameterBinding, MatchCapture, BodyLocal),
 		CheckedBody(CheckedMatchBody, CheckedValueBody),
-		CheckedExit(ReturnExpression),
+		CheckedExit(ReturnExpression, RecurWith),
 		CheckedForm(Match, LiteralVoid, LiteralInteger, ReadBinding),
 		CheckedFunction,
 		CheckedJoinArm,
-		CheckedPattern(VariantCase),
 		CheckedStatement(InitializeBinding, ReassignBinding, DiscardExpression),
 		TypeRef(IntType, StringType, VoidType),
 		binding_number,
 		same_type,
-	../input: checked_source
+	../../../src/utils/syntax: FunctionExecution(SelfTailLoop), same_span
+	../../../src/check/errors as Errors
+	../input: checked_source, check_failure
 	../module_input: INTEGER_OPERATIONS, TEST_BASE, parse_modules_with_base
 	test: TestSuite
 
@@ -100,19 +101,9 @@ private pure func captures(arm: CheckedJoinArm, ordinal: Int) -> Bool:
 		_:
 			False
 
-	captured = match arm.pattern:
-		VariantCase(_, fields):
-			match fields.get(0):
-				Some(field):
-					match field:
-						Some(id):
-							fields.length() == 1 and binding_number(id) == ordinal
-						None:
-							False
-				None:
-					False
-		_:
-			False
+	captured = match arm.inputs:
+		[id]: binding_number(id) == ordinal
+		_: False
 
 	read and captured
 
@@ -379,6 +370,188 @@ pure func test_tail_arm_may_still_reassign_an_outer_variable() -> Bool:
 	checked_source(source).is_ok()
 
 
+pure func test_ordinary_tail_join_preserves_checked_facts() -> Bool:
+	prefix = SHAPE + "pure func width(shape: Shape) -> Int:\n\tvar total = 0\n\t"
+	matched: String =
+		|match shape:
+		|		Circle(r):
+		|			total = r
+		|			total
+		|		Square(s): s
+
+	match function_named_first(prefix + matched + "\n" + MAIN):
+		None: False
+		Some(function):
+			match (function.statements, function.body):
+				([InitializeBinding(total, initial)], CheckedValueBody(ReturnExpression(value))):
+					match (initial.form, value.form):
+						(LiteralInteger(0), Match(join)):
+							match (join.scrutinee.form, join.arms):
+								(ReadBinding(shape), [first, second]):
+									match (first.inputs, first.statements, first.value.form):
+										(fields, [ReassignBinding(updated, assignment)], ReadBinding(result)):
+											capture_matches = match fields:
+												[capture]: binding_number(capture) == 2
+												_: False
+
+											match assignment.form:
+												ReadBinding(source):
+													(
+														function.bindings.length() == 4
+														and binding_number(shape) == 0
+														and binding_number(total) == 1
+														and binding_number(updated) == 1
+														and binding_number(result) == 1
+														and capture_matches
+														and binding_number(source) == 2
+														and captures(second, 3)
+														and second.statements.is_empty()
+														and same_type(value.value_type, IntType)
+														and value.span.start == prefix.length()
+														and value.span.end == prefix.length() + matched.length()
+														and join.carried.is_empty()
+													)
+												_: False
+										_: False
+								_: False
+						_: False
+				_: False
+
+
+pure func test_ordinary_void_tail_discards_each_arm_once() -> Bool:
+	prefix = SHAPE + "func show(shape: Shape) -> Void:\n\t"
+	matched: String =
+		|match shape:
+		|		Circle(r):
+		|			held = r
+		|			held
+		|		Square(s): s
+
+	match function_named_first(prefix + matched + "\n" + MAIN):
+		None: False
+		Some(function):
+			match (function.statements, function.body):
+				([DiscardExpression(value)], CheckedValueBody(ReturnExpression(returned))):
+					match (value.form, returned.form):
+						(Match(join), LiteralVoid):
+							match join.arms:
+								[first, second]:
+									match (first.statements, second.statements):
+										([InitializeBinding(held, initial), DiscardExpression(first_value)], [DiscardExpression(second_value)]):
+											match (initial.form, first_value.form, second_value.form):
+												(ReadBinding(capture), ReadBinding(first_read), ReadBinding(second_read)):
+													(
+														function.bindings.length() == 4
+														and binding_number(capture) == 1
+														and binding_number(held) == 2
+														and binding_number(first_read) == 2
+														and binding_number(second_read) == 3
+														and same_type(first_value.value_type, IntType)
+														and same_type(second_value.value_type, IntType)
+														and same_type(value.value_type, VoidType)
+														and same_type(returned.value_type, VoidType)
+														and is_void(first)
+														and is_void(second)
+														and same_span(first.value.span, first_value.span)
+														and same_span(second.value.span, second_value.span)
+														and value.span.start == prefix.length()
+														and value.span.end == prefix.length() + matched.length()
+														and same_span(returned.span, value.span)
+														and join.carried.is_empty()
+													)
+												_: False
+										_: False
+								_: False
+						_: False
+				_: False
+
+
+pure func test_annotated_root_match_keeps_its_direct_self_tail() -> Bool:
+	body: String =
+		|@tail_recursive pure func walk(shape: Shape, value: Int) -> Int:
+		|	match shape:
+		|		Circle(_): value
+		|		Square(_): walk(Circle(value), value)
+		|
+
+	match function_named_first(SHAPE + body + MAIN):
+		None: False
+		Some(function):
+			match (function.execution, function.body):
+				(SelfTailLoop(_), CheckedMatchBody(matched)):
+					match matched.arms:
+						[first, second]:
+							match (first.body, second.body):
+								(ReturnExpression(value), RecurWith([_, _], _)):
+									match value.form:
+										ReadBinding(id): binding_number(id) == 1
+										_: False
+								_: False
+						_: False
+				_: False
+
+
+pure func test_root_return_context_precedes_a_later_arm_name_error() -> Bool:
+	header = SHAPE + "pure func width(shape: Shape) -> "
+	prefix = header + "Int:\n\tmatch shape:\n\t\tCircle(_): "
+	marked = "\"wrong\""
+	source = prefix + marked + "\n\t\tSquare(_): missing\n" + MAIN
+	typed = match check_failure(source):
+		Some(error):
+			match error.kind:
+				Errors.ValueRejection(Errors.ExpressionTypeMismatch(mismatch)):
+					match mismatch.expected_site:
+						Errors.SourceAnnotation(annotation):
+							(
+								same_type(mismatch.expected, IntType)
+								and same_type(mismatch.actual.value_type, StringType)
+								and same_span(error.span, mismatch.actual.span)
+								and annotation.start == header.length()
+								and annotation.end == header.length() + 3
+							)
+						_: False
+				_: False
+		None: False
+	typed and rejected(
+		source, prefix.length(), prefix.length() + marked.length(),
+		"expression does not match the expected type", "use an expression of type Int here",
+	)
+
+
+pure func test_pure_void_root_match_keeps_heterogeneous_discard_acceptance() -> Bool:
+	body: String =
+		|pure func ignore(shape: Shape) -> Void:
+		|    match shape:
+		|        Circle(_): 7
+		|        Square(_): "discarded"
+		|
+	checked_source(SHAPE + body + MAIN).is_ok()
+
+
+pure func test_annotated_void_match_recurs_before_discard_normalization() -> Bool:
+	body: String =
+		|@tail_recursive pure func walk(shape: Shape) -> Void:
+		|    match shape:
+		|        Circle(_): 7
+		|        Square(_): walk(Circle(0))
+		|
+	match function_named_first(SHAPE + body + MAIN):
+		None: False
+		Some(function):
+			match (function.execution, function.body):
+				(SelfTailLoop(_), CheckedMatchBody(matched)):
+					match matched.arms:
+						[first, second]:
+							match (first.statements, first.body, second.statements, second.body):
+								([DiscardExpression(value)], ReturnExpression(returned), [], RecurWith([_], _)):
+									match (value.form, returned.form):
+										(LiteralInteger(7), LiteralVoid): same_type(returned.value_type, VoidType)
+										_: False
+								_: False
+						_: False
+				_: False
+
+
 pure func test_match_inside_a_larger_expression_is_rejected_at_the_match() -> Bool:
 	prefix = SHAPE + "pure func identity(value: Int) -> Int:\n\tvalue\npure func width(shape: Shape) -> Int:\n\tidentity("
 	matched = "match shape:\n\t\tCircle(r): r\n\t\tSquare(s): s\n\t"
@@ -471,19 +644,21 @@ pure func test_void_tail_discards_each_nested_arm_value() -> Bool:
 		None:
 			False
 		Some(function):
-			match function.body:
-				CheckedMatchBody(matched):
-					match matched.arms.get(0):
-						Some(arm):
-							nested = match arm.statements:
-								[DiscardExpression(value)]:
-									match value.form:
-										Match(join): same_type(value.value_type, VoidType) and discards_int(join.arms)
+			match (function.statements, function.body):
+				([DiscardExpression(value)], CheckedValueBody(returned)):
+					match value.form:
+						Match(matched):
+							match matched.arms.get(0):
+								Some(arm):
+									nested = match arm.statements:
+										[DiscardExpression(value)]:
+											match value.form:
+												Match(join): same_type(value.value_type, VoidType) and discards_int(join.arms)
+												_: False
 										_: False
-								_: False
-							nested and returns_void(arm.body)
-						None:
-							False
+									nested and is_void(arm) and returns_void(returned)
+								None: False
+						_: False
 				_:
 					False
 
@@ -581,6 +756,18 @@ pure func test_carried_bindings_are_unique_ordered_and_exclude_arm_locals() -> B
 tests: TestSuite = {
 	description = "Bound and statement matches checked as joins",
 	tests = [
+		(
+			"ordinary tail join preserves captures, statements, span and no carriers",
+			test_ordinary_tail_join_preserves_checked_facts,
+		),
+		(
+			"ordinary Void tail join discards each arm once then returns Void",
+			test_ordinary_void_tail_discards_each_arm_once,
+		),
+		("annotated root match keeps its direct self tail", test_annotated_root_match_keeps_its_direct_self_tail),
+		("root return context wins before a later arm name error", test_root_return_context_precedes_a_later_arm_name_error),
+		("pure Void root match keeps heterogeneous discards", test_pure_void_root_match_keeps_heterogeneous_discard_acceptance),
+		("annotated Void match recurs before discard normalization", test_annotated_void_match_recurs_before_discard_normalization),
 		("carriers are unique, ordered and exclude arm locals", test_carried_bindings_are_unique_ordered_and_exclude_arm_locals),
 		("statement join reassigns its enclosing binding", test_statement_join_reassigns_the_enclosing_binding),
 		("allocated String alias survives checked join reassignment", test_allocated_string_alias_survives_a_checked_join_reassignment),

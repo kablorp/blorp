@@ -1,10 +1,12 @@
 import:
 	../../../src/utils/names: program_names
 	../../../src/utils/ids: function_number
-	../../../src/utils/source: module_source, root_module_id
+	../../../src/utils/source: module_source, root_module_id, same_source
 	../../../src/check/check: checked_functions
 	../../../src/check/model:
 		CallTarget(UserFunction, RuntimeFunction, CallableParameter),
+		CallableChoice(LambdaCallable),
+		lambda_number,
 		CheckedBody(CheckedValueBody),
 		CheckedExit(ReturnExpression),
 		CheckedForm(InvokeFunction, LiteralInteger, ReadBinding),
@@ -170,9 +172,75 @@ pure func test_special_spellings_resolve_by_role_and_declaration_order() -> Bool
 					False
 
 
+private pure func returned_lambda_number(function: CheckedFunction) -> Option[Int]:
+	match form_of(function):
+		Some(InvokeFunction(call, _)):
+			match call.target:
+				UserFunction(_, _, [choice]):
+					match choice.choice:
+						LambdaCallable(id, []): Some(lambda_number(id))
+						_: None
+				_: None
+		_: None
+
+
+pure func test_successive_function_bodies_publish_distinct_lambda_rows() -> Bool:
+	source: String =
+		|pure func apply[T](callback: pure (T) -> T, value: T) -> T:
+		|    callback(value)
+		|pure func first(value: Int) -> Int:
+		|    apply(pure func(item: Int): item, value)
+		|pure func second(value: Int) -> Int:
+		|    apply(pure func(item: Int): item, value)
+		|func main() -> Int:
+		|    0
+		|
+	match checked_source(source):
+		Err(_): False
+		Ok(program):
+			checked = checked_functions(program)
+			match (checked.functions, checked.lambdas):
+				([dispatcher, first, second, main], [first_lambda, second_lambda]):
+					(
+						function_number(dispatcher.id) == 0 and function_number(first.id) == 1
+							and function_number(second.id) == 2 and function_number(main.id) == 3
+							and returned_lambda_number(first) == Some(0)
+							and returned_lambda_number(second) == Some(1)
+							and function_number(first_lambda.root) == function_number(first.id)
+							and function_number(second_lambda.root) == function_number(second.id)
+							and first_lambda.captures.is_empty() and second_lambda.captures.is_empty()
+							and first_lambda.parameters.length() == 1 and second_lambda.parameters.length() == 1
+					)
+				_: False
+
+
+pure func test_first_body_error_precedes_a_later_erroneous_declaration() -> Bool:
+	prefix = "func first() -> Int:\n    "
+	marked = "missing_first"
+	suffix: String =
+		|
+		|func second() -> Int:
+		|    missing_second
+		|func main() -> Int:
+		|    0
+		|
+	match checked_source(prefix + marked + suffix):
+		Ok(_): False
+		Err(error):
+			(
+				error.message == "unknown value"
+					and error.help == "use this function's parameter name, a declared variant, or a call"
+					and same_source(error.span.source, module_source(root_module_id()))
+					and error.span.start == prefix.length() and error.span.end == prefix.length() + marked.length()
+					and error.note.is_none()
+			)
+
+
 tests: TestSuite = {
 	description = "Blorp 2 semantic checking",
 	tests = [
+		("successive function bodies publish distinct lambda rows", test_successive_function_bodies_publish_distinct_lambda_rows),
+		("first body error precedes a later erroneous declaration", test_first_body_error_precedes_a_later_erroneous_declaration),
 		(
 			"special spellings resolve by role and declaration order",
 			test_special_spellings_resolve_by_role_and_declaration_order,

@@ -1,0 +1,143 @@
+import:
+	../../../src/load/load: load_program
+	../../../src/parse/assemble: parsed_contents
+	../../../src/check/check: check, checked_functions, check_errors
+	../../../src/check/model as Model
+	../../../src/check/errors as Errors
+	../../../src/utils/ids: inventory_functions, function_number
+	../../../src/utils/names: name_spelling
+	../../../src/utils/source: same_module, same_source, module_source, root_module_id
+	../../../src/utils/syntax: Visibility(Public, Private), Purity(Pure), same_purity
+	../input: setup_diagnostic, singleton_check_error
+	fs: temporary_directory, resource_path, message
+	system: temp_dir, write_file
+	test: TestSuite
+
+
+private pure func private_helper(visibility: Visibility) -> Bool:
+	match visibility:
+		Private(_): True
+		Public: False
+
+
+func test_sort_signature_owns_its_rigid_and_helpers_are_private() -> Bool:
+	match load_program("blorp_2/test/e2e/fixtures/generic/managed/list_sort_by.brp", "blorp_2/standard_library"):
+		Err(_): False
+		Ok(loaded):
+			parsed = parsed_contents(loaded.program)
+			match (parsed.modules.get(0), check(loaded.program)):
+				(Some(root), Ok(program)):
+					rows = checked_functions(program)
+					match root.imports:
+						[list_import, _, _, _]:
+							functions = inventory_functions(parsed.declarations).filter(pure func(row): same_module(row.declaration.module, list_import.target))
+							sort_functions = functions.filter(pure func(row): name_spelling(parsed.names, row.declaration.function_name.id) == Some("sort_by"))
+							first_functions = functions.filter(pure func(row): name_spelling(parsed.names, row.declaration.function_name.id) == Some("merge_first"))
+							prefix_functions = functions.filter(pure func(row): name_spelling(parsed.names, row.declaration.function_name.id) == Some("merge_prefix"))
+							range_functions = functions.filter(pure func(row): name_spelling(parsed.names, row.declaration.function_name.id) == Some("sort_range"))
+							match (sort_functions, first_functions, prefix_functions, range_functions):
+								([sorting], [first], [prefix], [interval]):
+									match (sorting.declaration.visibility, rows.functions.get(function_number(sorting.id))):
+										(Public, Some(function)):
+											match (function.signature.type_parameters, function.signature.parameters):
+												([parameter], [values, key]):
+													owner_matches = match Model.parameter_owner(parameter):
+														Model.FunctionDeclaration(owner): function_number(owner) == function_number(function.id)
+														_: False
+													(
+														owner_matches and same_purity(function.signature.purity, Pure)
+														and Model.same_type(values.value_type, Model.ListType(Model.ParameterType(parameter)))
+														and Model.same_type(key.value_type, Model.PureCallableType([Model.ParameterType(parameter)], Model.IntType))
+														and Model.same_type(function.signature.return_type.value_type, Model.ListType(Model.ParameterType(parameter)))
+														and private_helper(first.declaration.visibility) and private_helper(prefix.declaration.visibility)
+														and private_helper(interval.declaration.visibility)
+													)
+												_: False
+										_: False
+								_: False
+						_: False
+				_: False
+
+
+private TEXT_KEY: String =
+	|import:
+	|    list: sort_by
+	|pure func bad(value: Int) -> String:
+	|    "bad"
+	|func main() -> Int:
+	|    saved = sort_by([1],
+private IMPURE_KEY: String =
+	|import:
+	|    list: sort_by
+	|func bad(value: Int) -> Int:
+	|    value
+	|func main() -> Int:
+	|    saved = sort_by([1],
+
+
+private func rejects_key(
+	prefix: String,
+	message_text: String,
+	help: String,
+	matches: pure (Errors.CheckErrorKind) -> Bool,
+) -> Result[Bool, String]:
+	with directory ?= temporary_directory(temp_dir(), "blorp-2-list-sort-negative-") on error => message(error):
+		path = directory.resource_path() + "/main.brp"
+		marked = "bad"
+		written ?= write_file(path, prefix + marked + ")\n    0\n")
+		loaded ?= load_program(path, "blorp_2/standard_library").map_err(func(failure): failure.diagnostic.message)
+		match check(loaded.program):
+			Ok(_): Ok(False)
+			Err(failure):
+				diagnostic = setup_diagnostic(failure)
+				match singleton_check_error(check_errors(failure)):
+					None: Ok(False)
+					Some(error):
+						Ok(
+							matches(error.kind) and same_source(error.span.source, module_source(root_module_id()))
+							and error.span.start == prefix.length() and error.span.end == prefix.length() + marked.length()
+							and same_source(diagnostic.span.source, error.span.source)
+							and diagnostic.span.start == error.span.start and diagnostic.span.end == error.span.end
+							and diagnostic.message == message_text and diagnostic.help == help and diagnostic.note.is_none()
+						)
+
+
+func test_string_key_result_is_rejected_at_the_reference() -> Bool:
+	rejects_key(TEXT_KEY,
+		"argument type does not match the parameter type", "use an expression of type pure (Int) -> Int here",
+		pure func(kind):
+			match kind:
+				Errors.CallRejection(Errors.ArgumentTypeMismatch(mismatch)):
+					match (mismatch.expected, mismatch.actual.value_type):
+						(Model.PureCallableType([Model.IntType], Model.IntType), Model.PureCallableType([Model.IntType], Model.StringType)):
+							mismatch.argument_position == 1 and mismatch.actual.span.start == TEXT_KEY.length() and mismatch.actual.span.end == TEXT_KEY.length() + 3
+						_: False
+				_: False
+	).get_or(False)
+
+
+func test_impure_key_is_rejected_from_an_impure_caller() -> Bool:
+	rejects_key(IMPURE_KEY,
+		"pure callback requires a pure function", "pass a pure named function; impure functions cannot satisfy a pure callable parameter",
+		pure func(kind):
+			match kind:
+				Errors.CallRejection(Errors.ImpureCallback(_)): True
+				_: False
+	).get_or(False)
+
+
+func test_nested_stress_fixture_checks() -> Bool:
+	match load_program("blorp_2/test/e2e/fixtures/generic/managed/list_sort_by_nested_stress.brp", "blorp_2/standard_library"):
+		Err(_): False
+		Ok(loaded): check(loaded.program).is_ok()
+
+
+tests: TestSuite = {
+	description = "Blorp 2 target stable List sorting contract",
+	tests = [
+		("sort_by owns its generic rigid and exposes only the public API", test_sort_signature_owns_its_rigid_and_helpers_are_private),
+		("sort_by forwards callbacks through nested Lists and the 256-element fixture", test_nested_stress_fixture_checks),
+		("sort_by rejects String key results at the actual reference", test_string_key_result_is_rejected_at_the_reference),
+		("sort_by rejects a compatible impure key from an impure caller", test_impure_key_is_rejected_from_an_impure_caller),
+	]
+}

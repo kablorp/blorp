@@ -1,8 +1,9 @@
 import:
 	../unit/compilation: compile
-	./cost: CostLimits, check_limits
+	./cost: CostLimits
 	./harness:
 		Example,
+		check_resource_limits,
 		measure_compilation_cost,
 		native_case,
 		remove_existing_file,
@@ -27,7 +28,7 @@ private STRESS_LIMITS: CostLimits = {
 }
 
 -- These bounds describe the retained match_many_arms fixture and the emitted
--- function/switch/arm blocks; they are not an inventory of arbitrary inputs.
+-- selector node and shared arm blocks; they do not inventory arbitrary inputs.
 private STRESS_ARM_COUNT: Int = 256
 
 private MAXIMUM_MATCH_BRACE_DEPTH: Int = 3
@@ -55,7 +56,7 @@ private func verify_fixture(compiler: String, directory: String) -> Result[Void,
 	}
 	cost ?= measure_compilation_cost(compiler, directory, example)
 	native ?= verify_native_result(directory, example.first_case.exit_status)
-	check_limits(cost, example.limits)
+	check_resource_limits(cost, example.limits)
 
 
 private pure func maximum_brace_depth(program: String) -> Int:
@@ -84,17 +85,23 @@ private func verify_structure(compiler: String, directory: String) -> Result[Voi
 		limits = STRESS_LIMITS
 	}
 	cost ?= measure_compilation_cost(compiler, directory, stress)
-	bounded ?= check_limits(cost, STRESS_LIMITS)
 	-- Isolate this structural oracle from unrelated default-library helpers.
 	-- The native run below still executes C from the real loader and prelude.
 	source ?= read_file(stress.fixture)
 	program ?= compile(source).map_err(pure func(errors): errors.first.message)
 	depth = maximum_brace_depth(program)
 
-	labels ?= if program.count("case ") == STRESS_ARM_COUNT:
+	-- Each source arm has one body label and one incoming edge. Check each
+	-- identity so duplicated or omitted bodies cannot hide behind a total.
+	var complete = program.count("_arm_") == STRESS_ARM_COUNT * 2
+	for position in 0..STRESS_ARM_COUNT:
+		arm = "_arm_".append_int(position)
+		complete = complete and program.count(arm + ":{") == 1 and program.count(arm + ";") == 1
+
+	labels ?= if complete:
 		Ok(void)
 	else:
-		Err("match C must retain every explicit constructor case")
+		Err("match C must retain one body and incoming edge for every explicit constructor arm")
 
 	flat ?= if depth <= MAXIMUM_MATCH_BRACE_DEPTH:
 		Ok(void)
@@ -116,8 +123,9 @@ private func verify_structure(compiler: String, directory: String) -> Result[Voi
 		limits = STRESS_LIMITS
 	}
 	spine_cost ?= measure_compilation_cost(compiler, directory, spine)
-	spine_bounded ?= check_limits(spine_cost, STRESS_LIMITS)
-	verify_native_result(directory, spine.first_case.exit_status)
+	spine_verified ?= verify_native_result(directory, spine.first_case.exit_status)
+	bounded ?= check_resource_limits(cost, STRESS_LIMITS)
+	check_resource_limits(spine_cost, STRESS_LIMITS)
 
 
 private func verify_rejection(

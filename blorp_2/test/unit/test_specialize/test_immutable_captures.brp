@@ -1,0 +1,436 @@
+import:
+	../../../src/check/check: checked_functions
+	../../../src/check/model as Checked
+	../../../src/specialize/specialize as Concrete
+	../../../src/utils/syntax: Diagnostic, same_span, entry_function
+	../input: checked_source
+	../value_if_inputs: concrete
+	test: TestSuite
+
+
+private APPLY: String =
+	|pure func apply[A, B](callback: pure (A) -> B, value: A) -> B:
+	|    callback(value)
+	|
+
+
+private pure func specialized(source: String) -> Result[Concrete.SpecializedContents, Diagnostic]:
+	checked ?= checked_source(source)
+	program ?= Concrete.specialize(checked)
+	Ok(Concrete.specialized_contents(program))
+
+
+private pure func returned(function: Concrete.ConcreteFunction) -> Option[Concrete.ConcreteExpr]:
+	match function.body:
+		Concrete.ConcreteValueBody(Concrete.ReturnExpression(value)): Some(value)
+		_: None
+
+
+private pure func callee(
+	functions: List[Concrete.ConcreteFunction],
+	value: Concrete.ConcreteExpr,
+) -> Option[Concrete.ConcreteFunction]:
+	match value.form:
+		Concrete.InvokeFunction(call, _):
+			match call.target:
+				Concrete.UserFunction(id): functions.get(Concrete.function_number(id))
+				_: None
+		_: None
+
+
+private pure func read_binding(value: Concrete.ConcreteExpr, expected: Int) -> Bool:
+	match value.form:
+		Concrete.ReadBinding(id): Checked.binding_number(id) == expected
+		_: False
+
+
+private pure func parameter(binding: Concrete.ConcreteBinding, expected: Int) -> Bool:
+	match binding.origin:
+		Checked.ParameterBinding(position): position == expected
+		_: False
+
+
+private pure func environment_type(value: Concrete.TypeRef, expected: Int) -> Bool:
+	match value:
+		Concrete.RecordType(id): Concrete.record_number(id) == expected
+		_: False
+
+
+private pure func field_read(value: Concrete.ConcreteExpr, environment: Int, field: Int, binding: Int) -> Bool:
+	match value.form:
+		Concrete.ReadRecordField(receiver, id):
+			(
+				Concrete.record_number(Concrete.field_owner(id)) == environment
+				and Concrete.field_number(id) == field and read_binding(receiver, binding)
+				and environment_type(receiver.value_type, environment)
+			)
+		_: False
+
+
+pure func test_scalar_capture_is_a_managed_record_with_an_appended_binding() -> Bool:
+	source: String =
+		|func main() -> Int:
+		|    amount = 2
+		|    apply(pure func(item: Int) -> Int: amount, 40)
+		|
+	match specialized(APPLY + source):
+		Err(_): False
+		Ok(program):
+			match (program.functions, program.records):
+				([main, lambda, apply], [layout]):
+					match ((returned(main), returned(lambda), returned(apply)), (layout.fields, layout.representation)):
+						((Some(application), Some(projection), Some(invocation)), ([Concrete.IntType], Concrete.ManagedRecord)):
+							match ((application.form, invocation.form), (lambda.bindings, apply.bindings)):
+								((Concrete.InvokeFunction(_, [environment, argument]), Concrete.InvokeFunction(_, [forwarded, item])), ([lambda_item, lambda_env], [apply_item, apply_env])):
+									match (environment.form, lambda.signature.parameters, apply.signature.parameters):
+										(Concrete.ConstructRecord(owner, [field]), [lambda_type, Concrete.IntType], [apply_type, Concrete.IntType]):
+											(
+												Concrete.record_number(owner) == 0 and Concrete.field_number(field.field) == 0
+												and read_binding(field.value, 0) and field_read(projection, 0, 0, 1)
+												and read_binding(forwarded, 1) and read_binding(item, 0)
+												and parameter(lambda_item, 1) and parameter(lambda_env, 0)
+												and parameter(apply_item, 1) and parameter(apply_env, 0)
+												and environment_type(lambda_type, 0) and environment_type(apply_type, 0)
+												and Concrete.same_type(argument.value_type, Concrete.IntType)
+											)
+										_: False
+								_: False
+						_: False
+				_: False
+
+
+pure func test_managed_aliases_remain_two_distinct_environment_field_occurrences() -> Bool:
+	source: String =
+		|func main() -> Int:
+		|    first = "shared"
+		|    second = first
+		|    result = apply(pure func(item: Int) -> String:
+		|        saved = first
+		|        second
+		|    , 0)
+		|    0
+		|
+	match specialized(APPLY + source):
+		Err(_): False
+		Ok(program):
+			match (program.functions, program.records):
+				([main, lambda, _], [layout]):
+					match ((main.statements, lambda.statements, returned(lambda)), (layout.fields, layout.representation)):
+						(([_, _, Concrete.InitializeBinding(_, application)], [Concrete.InitializeBinding(_, saved)], Some(result)), ([Concrete.StringType, Concrete.StringType], Concrete.ManagedRecord)):
+							match application.form:
+								Concrete.InvokeFunction(_, [environment, _]):
+									match environment.form:
+										Concrete.ConstructRecord(_, [first, second]):
+											(
+												Concrete.field_number(first.field) == 0 and Concrete.field_number(second.field) == 1
+												and read_binding(first.value, 0) and read_binding(second.value, 1)
+												and field_read(saved, 0, 0, 2) and field_read(result, 0, 1, 2)
+												and Concrete.same_type(saved.value_type, Concrete.StringType)
+												and Concrete.same_type(result.value_type, Concrete.StringType)
+											)
+										_: False
+								_: False
+						_: False
+				_: False
+
+
+private pure func forwarded_root(
+	functions: List[Concrete.ConcreteFunction],
+	application: Concrete.ConcreteExpr,
+	expected: Concrete.TypeRef,
+	environment: Int,
+) -> Option[Bool]:
+	forward ?= callee(functions, application)
+	construction ?= returned(forward)
+	route ?= callee(functions, construction)
+	forwarding ?= returned(route)
+	apply ?= callee(functions, forwarding)
+	invocation ?= returned(apply)
+	lambda ?= callee(functions, invocation)
+	projection ?= returned(lambda)
+	match (construction.form, forwarding.form, invocation.form, lambda.signature.parameters):
+		(Concrete.InvokeFunction(_, [created, _]), Concrete.InvokeFunction(_, [routed, _]), Concrete.InvokeFunction(_, [passed, _]), [environment_type_ref, input]):
+			match created.form:
+				Concrete.ConstructRecord(owner, [field]): Some(
+					Concrete.record_number(owner) == environment and read_binding(field.value, 0)
+					and read_binding(routed, 1) and read_binding(passed, 1)
+					and environment_type(environment_type_ref, environment) and field_read(projection, environment, 0, 1)
+					and Concrete.same_type(input, expected) and Concrete.same_type(projection.value_type, expected)
+				)
+				_: Some(False)
+		_: Some(False)
+
+
+pure func test_root_substitutions_specialize_fields_and_forward_the_same_ordinary_environment() -> Bool:
+	source: String =
+		|pure func route[A, B](callback: pure (A) -> B, value: A) -> B:
+		|    apply(callback, value)
+		|pure func forward[T](value: T) -> T:
+		|    route(pure func(item: T) -> T: value, value)
+		|func main() -> Int:
+		|    integer = forward(7)
+		|    text = forward("seven")
+		|    0
+		|
+	match specialized(APPLY + source):
+		Err(_): False
+		Ok(program):
+			match (program.functions, program.records):
+				([main, ..._], [integer_layout, string_layout]):
+					match (main.statements, integer_layout.fields, string_layout.fields):
+						([Concrete.InitializeBinding(_, integer), Concrete.InitializeBinding(_, text)], [Concrete.IntType], [Concrete.StringType]):
+							(
+								forwarded_root(program.functions, integer, Concrete.IntType, 0) == Some(True)
+								and forwarded_root(program.functions, text, Concrete.StringType, 1) == Some(True)
+								and program.functions.length() == 9
+							)
+						_: False
+				_: False
+
+
+pure func test_middle_callback_keeps_written_effect_order_and_dense_binding_ids() -> Bool:
+	source: String =
+		|func mark(value: Int) -> Int:
+		|    value
+		|pure func choose(first: Int, callback: pure (Int) -> Int, last: Int) -> Int:
+		|    callback(last)
+		|func main() -> Int:
+		|    amount = 2
+		|    choose(mark(7), pure func(item: Int): amount, mark(9))
+		|
+	match specialized(source):
+		Err(_): False
+		Ok(program):
+			match program.functions:
+				[main, ..._]:
+					match returned(main):
+						Some(application):
+							match (application.form, callee(program.functions, application)):
+								(Concrete.InvokeFunction(_, [first, environment, last]), Some(choose)):
+									match ((first.form, environment.form, last.form), (choose.signature.parameters, choose.bindings, returned(choose))):
+										((Concrete.InvokeFunction(_, [left]), Concrete.ConstructRecord(_, [_]), Concrete.InvokeFunction(_, [right])), ([Concrete.IntType, env_type, Concrete.IntType], [first_binding, last_binding, env_binding], Some(invocation))):
+											match (left.form, right.form, invocation.form):
+												(Concrete.LiteralInteger(7), Concrete.LiteralInteger(9), Concrete.InvokeFunction(_, [forwarded, item])):
+													(
+														environment_type(env_type, 0) and parameter(first_binding, 0)
+														and parameter(last_binding, 2) and parameter(env_binding, 1)
+														and read_binding(forwarded, 2) and read_binding(item, 1)
+													)
+												_: False
+										_: False
+								_: False
+						_: False
+				_: False
+
+
+pure func test_multiple_callback_slots_keep_site_layouts_and_runtime_ordinals_distinct() -> Bool:
+	source: String =
+		|pure func both(first: pure (Int) -> Int, value: Int, last: pure (Int) -> Int) -> Int:
+		|    first(last(value))
+		|func main() -> Int:
+		|    left = 7
+		|    right = 9
+		|    both(pure func(item: Int): left, 0, pure func(item: Int): right)
+		|
+	match specialized(source):
+		Err(_): False
+		Ok(program):
+			match program.functions:
+				[main, left, right, both]:
+					match ((both.signature.parameters, both.bindings), (returned(both), returned(left), returned(right))):
+						(([first_type, Concrete.IntType, last_type], [data, first_env, last_env]), (Some(outer), Some(left_field), Some(right_field))):
+							match outer.form:
+								Concrete.InvokeFunction(_, [first, inner]):
+									match inner.form:
+										Concrete.InvokeFunction(_, [last, value]):
+											(
+												environment_type(first_type, 0) and environment_type(last_type, 1)
+												and parameter(data, 1) and parameter(first_env, 0) and parameter(last_env, 2)
+												and read_binding(first, 1) and read_binding(last, 2) and read_binding(value, 0)
+												and field_read(left_field, 0, 0, 1) and field_read(right_field, 1, 0, 1)
+												and program.records.length() == 2
+											)
+										_: False
+								_: False
+						_: False
+				_: False
+
+
+private pure func nested_environment(program: Concrete.SpecializedContents) -> Option[Bool]:
+	main ?= program.functions.get(0)
+	application ?= returned(main)
+	apply_outer ?= callee(program.functions, application)
+	outer_call ?= returned(apply_outer)
+	outer ?= callee(program.functions, outer_call)
+	inner_application ?= returned(outer)
+	apply_inner ?= callee(program.functions, inner_application)
+	inner_call ?= returned(apply_inner)
+	inner ?= callee(program.functions, inner_call)
+	projection ?= returned(inner)
+	match inner_application.form:
+		Concrete.InvokeFunction(_, [environment, _]):
+			match environment.form:
+				Concrete.ConstructRecord(owner, [field]): Some(
+					Concrete.record_number(owner) == 1 and Concrete.field_number(field.field) == 0
+					and field_read(field.value, 0, 0, 1) and field_read(projection, 1, 0, 1)
+					and program.records.length() == 2 and program.functions.length() == 5
+				)
+				_: Some(False)
+		_: Some(False)
+
+
+pure func test_nested_environment_projects_the_outer_capture_at_its_written_slot() -> Bool:
+	source: String =
+		|func main() -> Int:
+		|    amount = 7
+		|    apply(pure func(outer: Int) -> Int:
+		|        apply(pure func(inner: Int): amount, outer)
+		|    , 0)
+		|
+	match specialized(APPLY + source):
+		Err(_): False
+		Ok(program): nested_environment(program) == Some(True)
+
+
+pure func test_void_capture_keeps_a_real_field_and_environment_parameter() -> Bool:
+	source: String =
+		|func main() -> Int:
+		|    nothing = void
+		|    ignored = apply(pure func(item: Int): nothing, 0)
+		|    0
+		|
+	match specialized(APPLY + source):
+		Err(_): False
+		Ok(program):
+			match (program.functions, program.records):
+				([_, lambda, apply], [layout]):
+					match ((layout.fields, layout.representation), (lambda.signature.parameters, apply.signature.parameters), (lambda.statements, returned(lambda))):
+						(([Concrete.VoidType], Concrete.ManagedRecord), ([lambda_env, Concrete.IntType], [apply_env, Concrete.IntType]), ([Concrete.DiscardExpression(projection)], Some(result))):
+							match result.form:
+								Concrete.LiteralVoid: environment_type(lambda_env, 0) and environment_type(apply_env, 0) and field_read(projection, 0, 0, 1)
+								_: False
+						_: False
+				_: False
+
+
+pure func test_noncapturing_lambda_keeps_the_existing_environment_free_abi() -> Bool:
+	source: String =
+		|func main() -> Int:
+		|    apply(pure func(item: Int): item, 7)
+		|
+	match specialized(APPLY + source):
+		Err(_): False
+		Ok(program):
+			match (program.functions, program.records):
+				([_, lambda, apply], []):
+					match (lambda.signature.parameters, lambda.bindings, apply.signature.parameters, apply.bindings):
+						([Concrete.IntType], [item], [Concrete.IntType], [argument]): parameter(item, 0) and parameter(argument, 0)
+						_: False
+				_: False
+
+
+pure func test_capture_environment_retains_the_exact_managed_annotated_loop_restriction() -> Bool:
+	source: String =
+		|@tail_recursive
+		|pure func spin(value: Int) -> Int:
+		|    ignored = apply(pure func(item: Int): value, value)
+		|    spin(value)
+		|func main() -> Int:
+		|    spin(0)
+		|
+	match checked_source(APPLY + source):
+		Err(_): False
+		Ok(checked):
+			match checked_functions(checked).functions:
+				[_, spin, _]:
+					match spin.statements:
+						[Checked.InitializeBinding(_, expression)]:
+							match expression.form:
+								Checked.InvokeFunction(call, _):
+									match (call.target, Concrete.specialize(checked)):
+										(Checked.UserFunction(_, _, [choice]), Err(error)):
+											(
+												same_span(error.span, choice.span) and error.note.is_none()
+												and error.message == "managed values in @tail_recursive functions are not supported yet"
+												and error.help == "use an unmanaged helper, or remove @tail_recursive"
+											)
+										_: False
+								_: False
+						_: False
+				_: False
+
+
+private pure func alternative_if_capture_facts() -> Option[Bool]:
+	source: String =
+		|fixed union Side:
+		|    Left(String, String)
+		|    Right(String, String)
+		|func main() -> Int:
+		|    side: Side = Left("saved", "unused")
+		|    selected: String = match side:
+		|        Left(item, _) | Right(_, item):
+		|            apply(pure func(_: Int) -> String:
+		|                flag: Bool = True
+		|                if flag:
+		|                    item
+		|                else:
+		|                    item
+		|            , 0)
+		|    0
+		|
+	program ?= concrete(APPLY + source).map(Concrete.specialized_contents).to_option()
+	main ?= program.functions.get(Concrete.function_number(entry_function(program.entrypoint)))
+	selection ?= match main.statements:
+		[Concrete.InitializeBinding(_, _), Concrete.InitializeBinding(_, value)]:
+			match value.form:
+				Concrete.Match(join): Some(join)
+				_: None
+		_: None
+	arm ?= match selection.arms:
+		[one]: Some(one)
+		_: None
+	forward ?= callee(program.functions, arm.value)
+	invocation ?= returned(forward)
+	lambda ?= callee(program.functions, invocation)
+	result ?= returned(lambda)
+	match (arm.inputs, arm.value.form, result.form):
+		([input], Concrete.InvokeFunction(_, [environment, _]), Concrete.Match(branches)):
+			match (environment.form, branches.arms, selection.selection.nodes):
+				(Concrete.ConstructRecord(owner, [field]), [first, second], [Concrete.EnterArm(right, [_]), Concrete.EnterArm(left, [_]), Concrete.TestVariant(_, _, _, _)]):
+					Some(
+						Checked.match_arm_number(right) == Checked.match_arm_number(arm.id)
+							and Checked.match_arm_number(left) == Checked.match_arm_number(arm.id)
+							and read_binding(field.value, Checked.binding_number(input))
+							and Concrete.field_number(field.field) == 0
+							and field_read(first.value, Concrete.record_number(owner), 0, 2)
+							and field_read(second.value, Concrete.record_number(owner), 0, 2)
+							and lambda.bindings.get(2).map(pure func(binding): parameter(binding, 0)).get_or(False)
+							and program.records.get(Concrete.record_number(owner)).map(pure func(layout):
+								match (layout.fields, layout.representation):
+									([Concrete.StringType], Concrete.ManagedRecord): True
+									_: False
+							).get_or(False)
+					)
+				_: None
+		_: None
+
+
+pure func test_canonical_or_capture_reads_survive_both_value_if_arms() -> Bool:
+	alternative_if_capture_facts().get_or(False)
+
+
+tests: TestSuite = {
+	description = "Immutable capture specialization",
+	tests = [
+		("canonical Or input capture survives both value-if arms", test_canonical_or_capture_reads_survive_both_value_if_arms),
+		("scalar capture uses managed layout and appended bindings", test_scalar_capture_is_a_managed_record_with_an_appended_binding),
+		("managed aliases retain distinct field occurrences", test_managed_aliases_remain_two_distinct_environment_field_occurrences),
+		("root substitutions and declared forwarding preserve environment identity", test_root_substitutions_specialize_fields_and_forward_the_same_ordinary_environment),
+		("middle callback keeps written order and dense bindings", test_middle_callback_keeps_written_effect_order_and_dense_binding_ids),
+		("multiple callbacks retain distinct site layouts and ordinals", test_multiple_callback_slots_keep_site_layouts_and_runtime_ordinals_distinct),
+		("nested environment projects its enclosing capture", test_nested_environment_projects_the_outer_capture_at_its_written_slot),
+		("Void capture keeps a real managed environment", test_void_capture_keeps_a_real_field_and_environment_parameter),
+		("noncapturing lambda keeps the existing ABI", test_noncapturing_lambda_keeps_the_existing_environment_free_abi),
+		("capture environment retains exact annotated-loop restriction", test_capture_environment_retains_the_exact_managed_annotated_loop_restriction),
+	]
+}

@@ -1,0 +1,84 @@
+import:
+	../../../src/check/check: check, checked_functions
+	../../../src/check/model as Model
+	../../../src/utils/ids: function_number
+	../../../src/utils/syntax: entry_function
+	../module_input: TEST_BASE, INTEGER_OPERATIONS, parse_modules_with_base
+	test: TestSuite
+
+
+private SOURCE: String =
+	|pure func apply[T, U](callback: pure (T) -> U, value: T) -> U:
+	|    callback(value)
+	|func main() -> Int:
+	|    var again: Bool = True
+	|    var result: Int = 0
+	|    while again:
+	|        result = if apply(pure func(item: Int) -> Bool: True, 0):
+	|            apply(pure func(item: Int) -> Int:
+	|                var current = item
+	|                var inner: Bool = True
+	|                while inner:
+	|                    current = add(current, 1)
+	|                    inner = False
+	|                current
+	|            , 41)
+	|        else:
+	|            apply(pure func(item: Int) -> Int: 0, 0)
+	|        again = False
+	|    result
+	|
+
+
+private pure func lambda_choice(value: Model.CheckedExpr) -> Option[Int]:
+	match value.form:
+		Model.InvokeFunction(call, _):
+			match call.target:
+				Model.UserFunction(_, _, [argument]):
+					match argument.choice:
+						Model.LambdaCallable(id, captures):
+							match captures.is_empty():
+								True: Some(Model.lambda_number(id))
+								False: None
+						_: None
+				_: None
+		_: None
+
+
+private pure func lambda_and_loop_facts() -> Option[Bool]:
+	parsed ?= parse_modules_with_base([{ source = SOURCE + INTEGER_OPERATIONS, targets = [] }], TEST_BASE).to_option()
+	accepted ?= check(parsed).to_option()
+	contents = checked_functions(accepted)
+	main ?= contents.functions.get(function_number(entry_function(contents.entrypoint)))
+	branch ?= contents.lambdas.get(1)
+	match main.statements:
+		[Model.InitializeBinding(_, _), Model.InitializeBinding(_, _), Model.RunWhile(loop)]:
+			match loop.body:
+				[Model.ReassignBinding(_, selected), Model.ReassignBinding(_, _)]:
+					match selected.form:
+						Model.Match(join):
+							match join.arms:
+								[first, second]:
+									match branch.statements:
+										[Model.InitializeBinding(_, _), Model.InitializeBinding(_, _), Model.RunWhile(inner)]:
+											Some(contents.lambdas.length() == 3
+												and lambda_choice(join.scrutinee) == Some(0)
+												and lambda_choice(first.value) == Some(1)
+												and lambda_choice(second.value) == Some(2)
+												and inner.carried.map(Model.binding_number) == [1, 2]
+												and contents.lambdas.all(pure func(row): function_number(row.root) == function_number(main.id)))
+										_: None
+								_: None
+						_: None
+				_: None
+		_: None
+
+
+pure func test_value_if_threads_global_lambda_ids_and_restores_loop_scope() -> Bool:
+	lambda_and_loop_facts().get_or(False)
+
+
+tests: TestSuite = {
+	description = "Blorp 2 value if lambda and loop context",
+	tests = [("global lambda identities and lambda-local loop scope", test_value_if_threads_global_lambda_ids_and_restores_loop_scope)]
+}

@@ -263,9 +263,7 @@ pure func test_lowering_evaluates_repeat_element_and_count_once_in_source_order(
 							(IntOps.equals(Lower.value_number(values), Lower.value_number(repeated.id))
 							and IntOps.equals(Lower.value_number(offset), Lower.value_number(index.id)))
 						_: False
-					returned = match function.tail:
-						Lower.ExitValue(Lower.ReturnValue(value)): IntOps.equals(Lower.value_number(value), Lower.value_number(selected.id))
-						_: False
+					returned = IntOps.equals(Lower.value_number(function.result), Lower.value_number(selected.id))
 					identities = [number, made, count, repeated, index, selected].map(pure func(definition): Lower.value_number(definition.id)) == [0, 1, 2, 3, 4, 5]
 					literals and made_arguments and repeated_arguments and selected_arguments and returned and identities
 				_: False
@@ -326,8 +324,8 @@ pure func test_runtime_repeat_borrows_element_and_transfers_one_list_root() -> B
 										None: False
 									transfer = match result.result:
 										Own.OwnedResult(owner):
-											match owned.tail:
-												Own.ReturnTail(Own.ReturnResult(Own.OwnedReturn(value, transferred))):
+											match owned.result:
+												Own.OwnedReturn(value, transferred):
 													IntOps.equals(Lower.value_number(value), Lower.value_number(result.id)) and IntOps.equals(Own.owner_number(owner), Own.owner_number(transferred))
 												_: False
 										_: False
@@ -366,8 +364,8 @@ pure func test_runtime_get_returns_an_owned_entry_union_without_extra_acquisitio
 									owned_result = match result.result:
 										Own.OwnedResult(_): True
 										_: False
-									returned = match owned.tail:
-										Own.ReturnTail(Own.ReturnResult(Own.OwnedReturn(value, _))): IntOps.equals(Lower.value_number(value), Lower.value_number(result.id))
+									returned = match owned.result:
+										Own.OwnedReturn(value, _): IntOps.equals(Lower.value_number(value), Lower.value_number(result.id))
 										_: False
 									borrowed and owned_result and returned
 								_: False
@@ -401,8 +399,8 @@ pure func test_runtime_get_numeric_and_void_results_have_no_ownership_obligation
 									Own.UnmanagedResult: True
 									_: False
 							_: False
-						return_unmanaged = match owned.tail:
-							Own.ReturnTail(Own.ReturnResult(Own.UnmanagedReturn(_))): True
+						return_unmanaged = match owned.result:
+							Own.UnmanagedReturn(_): True
 							_: False
 						valid = result_unmanaged and return_unmanaged and valid
 			valid
@@ -429,8 +427,8 @@ pure func test_owned_get_result_survives_list_retirement_before_return_transfer(
 						_: False
 					result_transferred = match selected.result:
 						Own.OwnedResult(owner):
-							match owned.tail:
-								Own.ReturnTail(Own.ReturnResult(Own.OwnedReturn(value, transferred))):
+							match owned.result:
+								Own.OwnedReturn(value, transferred):
 									IntOps.equals(Own.owner_number(owner), Own.owner_number(transferred)) and IntOps.equals(Lower.value_number(value), Lower.value_number(selected.id))
 								_: False
 						_: False
@@ -453,27 +451,42 @@ pure func test_escaped_string_acquisition_precedes_option_and_entry_retirement()
 	match selected_owned(source):
 		Err(_): False
 		Ok(owned):
-			parent: Option[Own.OwnerId] = match owned.operations:
-				[Own.DefineValue(selected)]:
-					match selected.result:
-						Own.OwnedResult(owner): Some(owner)
-						_: None
-				_: None
-			match owned.tail:
-				Own.MatchTail(matched):
-					match matched.arms:
-						[present, _]:
-							match present.operations:
-								[Own.DefineValue(_), Own.DefineValue(text), Own.AcquireOwner(acquired, borrow, _), Own.DropOwner(retired, _)]:
-									parent_retired = match parent:
-										Some(owner): IntOps.equals(Own.owner_number(owner), Own.owner_number(retired))
-										None: False
-									child_acquired = Concrete.same_type(text.value_type, Concrete.StringType) and IntOps.equals(Lower.value_number(borrow.value), Lower.value_number(text.id))
-									child_transferred = match present.exit:
-										Own.ReturnResult(Own.OwnedReturn(value, owner)):
-											IntOps.equals(Own.owner_number(owner), Own.owner_number(acquired)) and IntOps.equals(Lower.value_number(value), Lower.value_number(text.id))
+			match owned.operations:
+				[Own.DefineValue(selected), Own.ExecuteJoin(matched), Own.DropOwner(retired, _)]:
+					match (selected.result, matched.arms):
+						(Own.OwnedResult(parent), [present, _]):
+							match (present.inputs, present.operations, present.exit):
+								([Own.ManagedJoinParameter(input, canonical)], [Own.DefineValue(text), Own.AcquireOwner(acquired, borrow, _), Own.DropOwner(entry_retired, _)], Own.Yield(outputs)):
+									match (text.operation, borrow.source, outputs.transfer):
+										(Own.ReadRecordFieldDefinition(_, Own.BorrowedArgument(entry)), Own.PayloadBorrow(backing), Own.OwnedReturn(value, owner)):
+											match entry.source:
+												Own.OwnerBorrow(entry_owner):
+													(
+														IntOps.equals(Own.owner_number(parent), Own.owner_number(retired))
+														and Concrete.same_type(text.value_type, Concrete.StringType) and IntOps.equals(Lower.value_number(borrow.value), Lower.value_number(text.id))
+														and IntOps.equals(Own.owner_number(owner), Own.owner_number(acquired)) and IntOps.equals(Lower.value_number(value), Lower.value_number(text.id))
+														and Lower.value_number(entry.value) == Lower.value_number(input.id) and Lower.value_number(backing) == Lower.value_number(input.id)
+														and Own.owner_number(entry_owner) == Own.owner_number(canonical) and Own.owner_number(entry_retired) == Own.owner_number(canonical)
+														and Own.owner_number(acquired) != Own.owner_number(canonical) and outputs.carried.is_empty()
+														and matched.selection.nodes.any(pure func(node):
+															match node:
+																Own.EnterArm(edge):
+																	match (edge.operations, edge.transfers):
+																		([Own.DefineValue(payload), Own.AcquireOwner(edge_owner, edge_borrow, _)], [Own.OwnedReturn(edge_value, moved)]):
+																			match (payload.operation, edge_borrow.source):
+																				(Own.PayloadDefinition(_, root), Own.PayloadBorrow(source)):
+																					(Checked.match_arm_number(edge.arm) == Checked.match_arm_number(present.id)
+																						and Lower.value_number(root) == Lower.value_number(selected.id) and Lower.value_number(source) == Lower.value_number(selected.id)
+																						and Lower.value_number(edge_borrow.value) == Lower.value_number(payload.id) and Lower.value_number(edge_value) == Lower.value_number(payload.id)
+																						and Own.owner_number(edge_owner) == Own.owner_number(moved) and Own.owner_number(edge_owner) != Own.owner_number(canonical)
+																						and Lower.value_number(input.id) != Lower.value_number(payload.id))
+																				_: False
+																		_: False
+																_: False
+														)
+													)
+												_: False
 										_: False
-									parent_retired and child_acquired and child_transferred
 								_: False
 						_: False
 				_: False
@@ -566,8 +579,8 @@ private pure func update_wrapper_borrows_inputs_and_transfers_one_root(
 				else:
 					transferred = match definition.result:
 						Own.OwnedResult(owner):
-							match owned.tail:
-								Own.ReturnTail(Own.ReturnResult(Own.OwnedReturn(value, returned))):
+							match owned.result:
+								Own.OwnedReturn(value, returned):
 									(IntOps.equals(Lower.value_number(value), Lower.value_number(definition.id))
 									and IntOps.equals(Own.owner_number(owner), Own.owner_number(returned)))
 								_: False
@@ -701,8 +714,8 @@ pure func test_managed_literal_acquires_each_stored_occurrence_and_owns_one_root
 										_: False
 									transferred = match result.result:
 										Own.OwnedResult(owner):
-											match owned.tail:
-												Own.ReturnTail(Own.ReturnResult(Own.OwnedReturn(value, returned))):
+											match owned.result:
+												Own.OwnedReturn(value, returned):
 													IntOps.equals(Lower.value_number(value), Lower.value_number(result.id)) and IntOps.equals(Own.owner_number(owner), Own.owner_number(returned))
 												_: False
 										_: False
@@ -732,8 +745,8 @@ pure func test_unmanaged_literal_stores_values_without_acquisition_and_owns_one_
 										_: False
 									transferred = match result.result:
 										Own.OwnedResult(owner):
-											match owned.tail:
-												Own.ReturnTail(Own.ReturnResult(Own.OwnedReturn(value, returned))):
+											match owned.result:
+												Own.OwnedReturn(value, returned):
 													IntOps.equals(Lower.value_number(value), Lower.value_number(result.id)) and IntOps.equals(Own.owner_number(owner), Own.owner_number(returned))
 												_: False
 										_: False

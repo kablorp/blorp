@@ -491,9 +491,100 @@ static void test_from_codepoint_invalid(void) {
     blorp_string_release(sentinel);
 }
 
+static const char slice_input[] =
+    "A\xc2\x80\xc2\xbf\xe4\xb8\x96\xf0\x9f\x99\x82\0e\xcc\x81\xef\xbb\xbf\r\nZ";
+
+static void test_slice_values(void) {
+    const struct {
+        int64_t start, end;
+        const char *expected;
+        int64_t length;
+    } cases[] = {
+        {0, 22, slice_input, 22}, {1, 3, "\xc2\x80", 2},
+        {3, 5, "\xc2\xbf", 2}, {5, 8, "\xe4\xb8\x96", 3},
+        {8, 12, "\xf0\x9f\x99\x82", 4}, {12, 13, "\0", 1},
+        {13, 16, "e\xcc\x81", 3}, {16, 19, "\xef\xbb\xbf", 3},
+        {19, 21, "\r\n", 2}, {0, 0, "", 0}, {3, 3, "", 0}, {22, 22, "", 0}
+    };
+    struct blorp_string *source = blorp_string_from_bytes(slice_input, 22);
+    for (size_t i = 0; i < sizeof cases / sizeof cases[0]; i++) {
+        const size_t allocated = allocation_count, destroyed = destruction_count;
+        struct blorp_string *result = NULL;
+        assert(blorp_string_slice(source, cases[i].start, cases[i].end, &result) == 1);
+        assert(destruction_count == destroyed);
+        assert(allocation_count == allocated + 1);
+        assert(result != source);
+        assert(atomic_load(&source->references) == 1);
+        assert(atomic_load(&result->references) == 1);
+        assert_bytes(source, slice_input, 22);
+        assert_bytes(result, cases[i].expected, cases[i].length);
+        blorp_string_release(result);
+        assert(destruction_count == destroyed + 1);
+    }
+    blorp_string_release(source);
+}
+
+static void test_slice_bounds(void) {
+    const int64_t bounds[][2] = {
+        {INT64_MIN, 0}, {-1, 0}, {0, -1}, {5, 3}, {0, 23},
+        {INT64_MAX, INT64_MAX}, {INT64_C(4294967297), INT64_C(4294967298)},
+        {0, INT64_C(4294967297)}, {2, 2}, {4, 4}, {6, 6}, {9, 9},
+        {2, 3}, {1, 2}, {5, 7}, {8, 11}, {14, 15}, {17, 19}
+    };
+    struct blorp_string *source = blorp_string_from_bytes(slice_input, 22);
+    const size_t allocated = allocation_count, destroyed = destruction_count;
+    for (size_t i = 0; i < sizeof bounds / sizeof bounds[0]; i++) {
+        struct blorp_string *result = source;
+        assert(blorp_string_slice(source, bounds[i][0], bounds[i][1], &result) == 0);
+        assert(destruction_count == destroyed);
+        assert(allocation_count == allocated);
+        assert(result == source);
+        assert(atomic_load(&source->references) == 1);
+        assert_bytes(source, slice_input, 22);
+    }
+    blorp_string_release(source);
+}
+
+static void test_slice_ownership(void) {
+    struct blorp_string *source = blorp_string_from_bytes(slice_input, 22);
+    blorp_string_retain(source);
+    struct blorp_string *result = NULL;
+    assert(blorp_string_slice(source, 5, 8, &result) == 1);
+    assert(destruction_count == 0);
+    assert(allocation_count == 2);
+    assert(source != result);
+    assert(atomic_load(&source->references) == 2);
+    assert(atomic_load(&result->references) == 1);
+    blorp_string_release(source);
+    blorp_string_release(source);
+    assert(destruction_count == 1);
+    assert_bytes(result, "\xe4\xb8\x96", 3);
+    blorp_string_release(result);
+    assert(destruction_count == 2);
+
+    source = blorp_string_from_bytes("", 0);
+    result = NULL;
+    assert(blorp_string_slice(source, 0, 0, &result) == 1);
+    assert(destruction_count == 2);
+    assert(allocation_count == 4);
+    assert(source != result);
+    assert_bytes(result, "", 0);
+    assert(atomic_load(&source->references) == 1);
+    assert(atomic_load(&result->references) == 1);
+    blorp_string_release(source);
+    blorp_string_release(result);
+    assert(destruction_count == 4);
+}
+
 int main(int argc, char **argv) {
     assert(argc == 2);
-    if (strcmp(argv[1], "byte_at_bounds") == 0) {
+    if (strcmp(argv[1], "slice_values") == 0) {
+        test_slice_values();
+    } else if (strcmp(argv[1], "slice_bounds") == 0) {
+        test_slice_bounds();
+    } else if (strcmp(argv[1], "slice_ownership") == 0) {
+        test_slice_ownership();
+    } else if (strcmp(argv[1], "byte_at_bounds") == 0) {
         test_byte_at_bounds();
     } else if (strcmp(argv[1], "byte_at_values") == 0) {
         test_byte_at_values();

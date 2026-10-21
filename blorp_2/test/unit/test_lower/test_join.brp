@@ -1,16 +1,15 @@
 import:
-	../../../src/lower/lower:
+	../../../src/lower/lower as Lower:
 		JoinArm,
-		LoweredExit(ReturnValue),
 		LoweredFunction,
 		LoweredJoin,
-		LoweredTail(ExitValue, MatchValue),
-		LoweredStep(Define, Join),
-		ValueOperation(ParameterValue, PayloadValue, StringValue),
+		LoweredStep(Define, Join, Loop),
+		ValueOperation(ParameterValue, StringValue),
 		lowered_functions,
 		value_number,
 	../../../src/specialize/specialize as Concrete
-	../managed_union_inputs: lowered
+	./selection_inputs: selected_field
+	../managed_union_inputs: lowered, lowered_tail_join
 	test: TestSuite
 
 
@@ -42,7 +41,7 @@ private pure func first_join(source: String) -> Option[FoundJoin]:
 						Join(join):
 							if found.is_none():
 								found = Some({ function = function, position = position, join = join })
-						_:
+						Define(_) | Loop(_):
 							void
 					position = position + 1
 			found
@@ -57,27 +56,28 @@ private pure func ids(steps: List[LoweredStep]) -> List[Int]:
 				values = values.append(value_number(join.result.id))
 				for parameter in join.carried:
 					values = values.append(value_number(parameter.id))
+			Loop(loop):
+				values = values.append(value_number(loop.result.id))
+				for parameter in loop.carried:
+					values = values.append(value_number(parameter.id))
 	values
 
 
-private pure func yields(arm: JoinArm) -> Int:
-	value_number(arm.value)
+private pure func yields(arm: JoinArm) -> Option[Int]:
+	match arm.exit:
+		Lower.Yield(outputs): Some(value_number(outputs.value))
+		Lower.TransferLoop(_, _): None
 
 
-private pure func projects(arm: JoinArm) -> Bool:
-	match arm.steps:
-		[Define(definition)]:
-			match definition.operation:
-				PayloadValue(_, scrutinee):
-					value_number(scrutinee) == 0
-				_:
-					False
-		_:
-			False
+private pure func projects(join: LoweredJoin, arm: JoinArm, expected_edge: Int) -> Bool:
+	match (selected_field(join.selection, arm.id), arm.inputs, arm.exit):
+		(Some(projected), [input], Lower.Yield(outputs)):
+			value_number(projected.parent) == 0 and value_number(projected.parameter.id) == expected_edge and arm.steps.is_empty() and value_number(outputs.value) == value_number(input.id)
+		_: False
 
 
 -- The join's own value keeps its place in the block, whose values stay one
--- interval; each arm's values follow the whole block, in arm order.
+-- interval; edge values follow it, then canonical arm inputs and bodies.
 pure func test_bound_match_lowers_to_a_join_numbered_after_its_block() -> Bool:
 	body: String =
 		|pure func width(shape: Shape) -> Int:
@@ -94,26 +94,28 @@ pure func test_bound_match_lowers_to_a_join_numbered_after_its_block() -> Bool:
 		None:
 			False
 		Some(found):
-			returned = match found.function.tail:
-				ExitValue(ReturnValue(value)):
-					value_number(value)
-				_:
-					-1
+			returned = value_number(found.function.result)
 
 			match found.join.arms:
 				[first, second]:
+					empty_yields = match (first.exit, second.exit):
+						(Lower.Yield(first_yield), Lower.Yield(second_yield)): first_yield.carried.is_empty() and second_yield.carried.is_empty()
+						_: False
 					(
 						ids(found.function.steps) == [0, 1]
 						and found.position == 1
-						and found.join.carried.is_empty() and first.carried.is_empty() and second.carried.is_empty()
-						and value_number(found.join.scrutinee) == 0
+						and found.join.carried.is_empty()
+						and empty_yields
+						and value_number(found.join.selection.scrutinee) == 0
 						and returned == 1
-						and ids(first.steps) == [2]
-						and yields(first) == 2
-						and projects(first)
-						and ids(second.steps) == [3]
-						and yields(second) == 3
-						and projects(second)
+						and ids(first.steps) == []
+						and yields(first) == Some(4)
+						and first.inputs.map(pure func(input): value_number(input.id)) == [4]
+						and projects(found.join, first, 3)
+						and ids(second.steps) == []
+						and yields(second) == Some(5)
+						and second.inputs.map(pure func(input): value_number(input.id)) == [5]
+						and projects(found.join, second, 2)
 					)
 				_:
 					False
@@ -144,23 +146,23 @@ pure func test_nested_join_arms_follow_their_enclosing_arm() -> Bool:
 			match found.join.arms:
 				[first, second]:
 					nested = match first.steps:
-						[Define(_), Join(join)]:
+						[Join(join)]:
 							match join.arms:
 								[left, right]:
 									(
-										value_number(join.result.id) == 3
-										and yields(first) == 3
+										value_number(join.result.id) == 5
+										and yields(first) == Some(5)
 										and ids(left.steps) == []
-										and yields(left) == 2
-										and ids(right.steps) == [4]
-										and yields(right) == 4
+										and yields(left) == Some(4)
+										and ids(right.steps) == []
+										and yields(right) == Some(7) and right.inputs.map(pure func(input): value_number(input.id)) == [7]
 									)
 								_:
 									False
 						_:
 							False
 
-					ids(first.steps) == [2, 3] and nested and ids(second.steps) == [5]
+					ids(first.steps) == [5] and first.inputs.map(pure func(input): value_number(input.id)) == [4] and nested and ids(second.steps) == [] and yields(second) == Some(8)
 				_:
 					False
 
@@ -184,14 +186,14 @@ pure func test_prefix_join_arms_precede_tail_arms() -> Bool:
 		None:
 			False
 		Some(found):
-			match found.function.tail:
-				MatchValue(matched):
+			match lowered_tail_join(found.function):
+				Some(matched):
 					match matched.arms:
 						[first, second]:
 							(
-								ids(found.function.steps) == [0, 1]
-								and ids(first.body.steps) == []
-								and ids(second.body.steps) == [4]
+								ids(found.function.steps) == [0, 1, 2]
+								and ids(first.steps) == []
+								and ids(second.steps) == [] and second.inputs.map(pure func(input): value_number(input.id)) == [8]
 							)
 						_:
 							False
@@ -223,7 +225,7 @@ pure func test_statement_match_is_a_void_join() -> Bool:
 					stored = match first.steps:
 						[Define(text), Define(unit)]:
 							match text.operation:
-								StringValue(bytes): bytes == "yes" and yields(first) == value_number(unit.id)
+								StringValue(bytes): bytes == "yes" and yields(first) == Some(value_number(unit.id))
 								_: False
 						_:
 							False
@@ -250,22 +252,25 @@ pure func test_statement_join_publishes_the_new_binding_version_and_unchanged_ed
 	match first_join(source):
 		None: False
 		Some(found):
-			match (found.join.carried, found.join.arms, found.function.tail):
-				([total], [changed, unchanged], ExitValue(ReturnValue(returned))):
-					(
-						found.function.steps.length() == 3
-						and ids(found.function.steps) == [0, 1, 2, 3]
-						and value_number(found.join.result.id) == 2
-						and Concrete.same_type(found.join.result.value_type, Concrete.VoidType)
-						and value_number(total.id) == 3
-						and Concrete.same_type(total.value_type, Concrete.IntType)
-						and value_number(returned) == 3
-						and found.join.reads.map(value_number) == [0, 1]
-						and ids(changed.steps) == [4, 5] and value_number(changed.value) == 5
-						and changed.carried.map(value_number) == [4]
-						and ids(unchanged.steps) == [6] and value_number(unchanged.value) == 6
-						and unchanged.carried.map(value_number) == [1]
-					)
+			match (found.join.carried, found.join.arms, found.function.result):
+				([total], [changed, unchanged], returned):
+					match (changed.exit, unchanged.exit):
+						(Lower.Yield(changed_yield), Lower.Yield(unchanged_yield)):
+							(
+								found.function.steps.length() == 3
+								and ids(found.function.steps) == [0, 1, 2, 3]
+								and value_number(found.join.result.id) == 2
+								and Concrete.same_type(found.join.result.value_type, Concrete.VoidType)
+								and value_number(total.id) == 3
+								and Concrete.same_type(total.value_type, Concrete.IntType)
+								and value_number(returned) == 3
+								and found.join.reads.map(value_number) == [0, 1]
+								and ids(changed.steps) == [4, 5] and value_number(changed_yield.value) == 5
+								and changed_yield.carried.map(value_number) == [4]
+								and ids(unchanged.steps) == [6] and value_number(unchanged_yield.value) == 6
+								and unchanged_yield.carried.map(value_number) == [1]
+							)
+						_: False
 				_: False
 
 
@@ -291,13 +296,16 @@ pure func test_same_type_carriers_keep_binding_order_despite_reversed_writes() -
 		Some(found):
 			match found.join.arms:
 				[changed, unchanged]:
-					(
-						ids(found.function.steps) == [0, 1, 2, 3, 4, 5]
-						and found.join.carried.map(pure func(parameter): value_number(parameter.id)) == [4, 5]
-						and changed.carried.map(value_number) == [7, 6]
-						and unchanged.carried.map(value_number) == [1, 2]
-						and found.join.reads.map(value_number) == [0, 1, 2]
-					)
+					match (changed.exit, unchanged.exit):
+						(Lower.Yield(changed_yield), Lower.Yield(unchanged_yield)):
+							(
+								ids(found.function.steps) == [0, 1, 2, 3, 4, 5]
+								and found.join.carried.map(pure func(parameter): value_number(parameter.id)) == [4, 5]
+								and changed_yield.carried.map(value_number) == [7, 6]
+								and unchanged_yield.carried.map(value_number) == [1, 2]
+								and found.join.reads.map(value_number) == [0, 1, 2]
+							)
+						_: False
 				_: False
 
 
@@ -320,15 +328,18 @@ pure func test_assignment_target_overrides_its_rhs_join_updated_version() -> Boo
 	match first_join(source):
 		None: False
 		Some(found):
-			match (found.function.tail, found.join.arms):
-				(ExitValue(ReturnValue(returned)), [changed, unchanged]):
-					(
-						value_number(returned) == 2
-						and value_number(found.join.result.id) == 2
-						and found.join.carried.map(pure func(parameter): value_number(parameter.id)) == [3]
-						and value_number(changed.value) == 5 and changed.carried.map(value_number) == [4]
-						and value_number(unchanged.value) == 6 and unchanged.carried.map(value_number) == [1]
-					)
+			match (found.function.result, found.join.arms):
+				(returned, [changed, unchanged]):
+					match (changed.exit, unchanged.exit):
+						(Lower.Yield(changed_yield), Lower.Yield(unchanged_yield)):
+							(
+								value_number(returned) == 2
+								and value_number(found.join.result.id) == 2
+								and found.join.carried.map(pure func(parameter): value_number(parameter.id)) == [3]
+								and value_number(changed_yield.value) == 5 and changed_yield.carried.map(value_number) == [4]
+								and value_number(unchanged_yield.value) == 6 and unchanged_yield.carried.map(value_number) == [1]
+							)
+						_: False
 				_: False
 
 
@@ -351,19 +362,22 @@ pure func test_final_nested_join_updates_the_outer_arm_carrier() -> Bool:
 	match first_join(source):
 		None: False
 		Some(found):
-			match (found.join.arms, found.function.tail):
-				([changed, unchanged], ExitValue(ReturnValue(returned))):
-					match changed.steps:
-						[Join(inner)]:
-							(
-								value_number(returned) == 4 and value_number(found.join.result.id) == 3
-								and found.join.carried.map(pure func(parameter): value_number(parameter.id)) == [4]
-								and ids(changed.steps) == [5, 6]
-								and changed.carried.map(value_number) == [6]
-								and unchanged.carried.map(value_number) == [2]
-								and inner.carried.map(pure func(parameter): value_number(parameter.id)) == [6]
-								and found.join.reads.map(value_number) == [0, 1, 2, 2]
-							)
+			match (found.join.arms, found.function.result):
+				([changed, unchanged], returned):
+					match (changed.exit, unchanged.exit):
+						(Lower.Yield(changed_yield), Lower.Yield(unchanged_yield)):
+							match changed.steps:
+								[Join(inner)]:
+									(
+										value_number(returned) == 4 and value_number(found.join.result.id) == 3
+										and found.join.carried.map(pure func(parameter): value_number(parameter.id)) == [4]
+										and ids(changed.steps) == [5, 6]
+										and changed_yield.carried.map(value_number) == [6]
+										and unchanged_yield.carried.map(value_number) == [2]
+										and inner.carried.map(pure func(parameter): value_number(parameter.id)) == [6]
+										and found.join.reads.map(value_number) == [0, 1, 2, 2]
+									)
+								_: False
 						_: False
 				_: False
 

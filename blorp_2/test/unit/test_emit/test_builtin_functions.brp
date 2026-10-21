@@ -1,10 +1,11 @@
 import:
+	../test_verify/selection_inputs as Selection
 	../../../src/runtime/memory: MEMORY_RUNTIME
 	../../../src/check/model as Model
 	../../../src/check/check: CheckedProgram, check, checked_functions
 	../../../src/utils/ids: function_number, inventory_functions
 	../../../src/emit/emit: emit
-	../../../src/lower/lower: MatchLabel(DefaultLabel), lower, value_number
+	../../../src/lower/lower: lower, value_number
 	../../../src/own/own as Own
 	../../../src/parse/assemble: parsed_contents
 	../../../src/namespace/builtins as Builtins:
@@ -20,7 +21,6 @@ import:
 		Entrypoint(NoArguments),
 		EntryResult(IntegerExitStatus),
 		Diagnostic,
-		FunctionExecution(OrdinaryCalls),
 		ParsedBody(ParsedBuiltinBody),
 		ParsedRuntimeOperation(IntegerAddBuiltin),
 		Purity(Pure),
@@ -191,7 +191,7 @@ pure func test_unknown_builtin_label_is_rejected_before_checking() -> Bool:
 				error.span.start == start
 				and error.span.end == start + "\"int.unknown\"".length()
 				and error.message == "unknown builtin operation"
-				and error.help == "use int.equals, int.less_than, int.add, int.subtract, int.multiply, int.divide, int.remainder, int.to_string, float.add, float.subtract, float.multiply, float.divide, float.remainder, float.to_string, string.length, string.add, string.print, string.print_error, string.parse_int, string.parse_float, string.byte_at, string.from_codepoint, system.get_current_directory, system.read_file, system.write_file, string.equals, list.repeat, list.length, list.get, list.append, list.set or list.concat"
+				and error.help == "use int.equals, int.less_than, int.add, int.subtract, int.multiply, int.divide, int.remainder, int.to_string, float.add, float.subtract, float.multiply, float.divide, float.remainder, float.to_string, float.copysign, float.equals, float.less_than, float.is_nan, float.is_finite, string.length, string.add, string.print, string.print_error, string.parse_int, string.parse_float, string.byte_at, string.from_codepoint, string.slice, system.get_current_directory, system.read_file, system.write_file, string.equals, list.repeat, list.length, list.get, list.append, list.set or list.concat"
 			)
 
 
@@ -331,7 +331,6 @@ private pure func owned_add(
 		entrypoint = NoArguments(ids.entrypoint, IntegerExitStatus),
 		functions = [
 			{
-				execution = OrdinaryCalls,
 				signature = {
 					parameters = [],
 					return_type = Concrete.IntType
@@ -362,7 +361,7 @@ private pure func owned_add(
 						span = span(30),
 					}),
 				],
-				tail = Own.ReturnTail(Own.ReturnResult(Own.UnmanagedReturn(ids.third)))
+				result = Own.UnmanagedReturn(ids.third)
 			},
 		]
 	}
@@ -719,8 +718,8 @@ pure func test_module_builtin_transfers_its_fresh_string_result() -> Bool:
 				Ok(program):
 					match program.functions:
 						[caller, helper, _]:
-							match (caller.operations, helper.operations, helper.tail):
-								([Own.DefineValue(_), Own.DefineValue(formatted), Own.DefineValue(_), Own.DropOwner(dropped, _)], [Own.DefineValue(parameter), Own.DefineValue(result)], Own.ReturnTail(Own.ReturnResult(Own.OwnedReturn(value, transferred)))):
+							match (caller.operations, helper.operations, helper.result):
+								([Own.DefineValue(_), Own.DefineValue(formatted), Own.DefineValue(_), Own.DropOwner(dropped, _)], [Own.DefineValue(parameter), Own.DefineValue(result)], Own.OwnedReturn(value, transferred)):
 									match (
 										parameter.operation,
 										result.operation,
@@ -808,7 +807,7 @@ pure func test_emitter_finds_runtime_addition_inside_a_match_arm() -> Bool:
 		Ok(ids):
 			original = owned_add(
 				ids,
-				[Own.UnmanagedArgument(ids.first), Own.UnmanagedArgument(ids.second)],
+				[Own.UnmanagedArgument(ids.first), Own.UnmanagedArgument(ids.third)],
 			)
 
 			match original.functions:
@@ -820,46 +819,47 @@ pure func test_emitter_finds_runtime_addition_inside_a_match_arm() -> Bool:
 								operation = Own.ConstructDefinition(ids.second_variant, []),
 								result = Own.UnmanagedResult,
 								span = span(1),
-							})],
-						tail = Own.MatchTail({
-							scrutinee = Own.UnmanagedArgument(ids.first),
-							owner = ids.union_id,
+							}), Own.ExecuteJoin({
+							result = Own.UnmanagedJoinParameter({ id = ids.second, value_type = Concrete.IntType, span = span(30) }),
+							carried = [],
+							selection = Selection.direct(Own.UnmanagedArgument(ids.first)),
 							arms = [
 								{
-									label = DefaultLabel,
+									id = Model.match_arm_id(0), inputs = [],
 									operations = [
 										Own.DefineValue({
-											id = ids.second,
+											id = ids.third,
 											value_type = Concrete.IntType,
 											operation = Own.IntegerDefinition(20),
 											result = Own.UnmanagedResult,
 											span = span(10),
 										}),
 										Own.DefineValue({
-											id = ids.third,
+											id = ids.fourth,
 											value_type = Concrete.IntType,
 											operation = Own.IntegerDefinition(22),
 											result = Own.UnmanagedResult,
 											span = span(20),
 										}),
 										Own.DefineValue({
-											id = ids.fourth,
+											id = ids.fifth,
 											value_type = Concrete.IntType,
 											operation = Own.CallDefinition(
 												Concrete.RuntimeFunction(Builtins.IntAdd),
 												[
-													Own.UnmanagedArgument(ids.second),
 													Own.UnmanagedArgument(ids.third),
+													Own.UnmanagedArgument(ids.fourth),
 												],
 											),
 											result = Own.UnmanagedResult,
 											span = span(30),
 										}),
 									],
-									exit = Own.ReturnResult(Own.UnmanagedReturn(ids.fourth))
+									exit = Own.Yield({ transfer = Own.UnmanagedReturn(ids.fifth), carried = [] })
 								},
 							],
-						})
+						})],
+						result = Own.UnmanagedReturn(ids.second)
 					}
 
 					match verify({ original |
@@ -871,7 +871,7 @@ pure func test_emitter_finds_runtime_addition_inside_a_match_arm() -> Bool:
 						Ok(code):
 							(
 								code.contains("static int64_t blorp_int_add(")
-								and code.contains("blorp_int_add(blorp_vl_1,blorp_vl_2)")
+								and code.contains("blorp_int_add(blorp_vl_2,blorp_vl_3)")
 							)
 				_:
 					False

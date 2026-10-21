@@ -1,0 +1,382 @@
+import:
+	../../../src/check/model as Model
+	../../../src/lower/lower as Lower
+	../../../src/own/own as Own
+	../../../src/specialize/specialize as Concrete
+	../../../src/utils/syntax as Syntax
+	../../../src/verify/verify: verify
+	../ownership_inputs: InputIds, input_ids, span
+	test: TestSuite
+
+
+private pure func main_function(ids: InputIds) -> Own.OwnedFunction:
+	{ signature = { parameters = [], return_type = Concrete.IntType }, operations = [Own.DefineValue({ id = ids.first, value_type = Concrete.IntType, operation = Own.IntegerDefinition(0), result = Own.UnmanagedResult, span = span(0) })], result = Own.UnmanagedReturn(ids.first) }
+
+
+-- Both entries independently copy a suffix into one ordinary owning List input.
+-- The false edge may copy the complete list; only the true edge may skip two.
+private pure func suffix_program(ids: InputIds, skip: Int, value_type: Concrete.TypeRef, result: Own.ResultOwnership) -> Own.OwnershipProgram:
+	list_type = Concrete.ListType(Concrete.StringType)
+	root: Own.BorrowedValue = { value = ids.first, source = Own.ParameterBorrow(ids.first) }
+	join: Own.OwnedJoin = {
+		result = Own.ManagedJoinParameter({ id = ids.second, value_type = list_type, span = span(2) }, Own.owner_id(0)), carried = [],
+		selection = { scrutinee = Own.BorrowedArgument(root), entry = Model.decision_node_id(2), nodes = [
+			Own.EnterArm({ arm = Model.match_arm_id(0), operations = [Own.DefineValue({ id = ids.third, value_type = value_type, operation = Own.ListSuffixDefinition(Own.BorrowedArgument(root), skip), result = result, span = span(10) })], transfers = [Own.OwnedReturn(ids.third, Own.owner_id(1))] }),
+			Own.EnterArm({ arm = Model.match_arm_id(0), operations = [Own.DefineValue({ id = ids.fourth, value_type = list_type, operation = Own.ListSuffixDefinition(Own.BorrowedArgument(root), 0), result = Own.OwnedResult(Own.owner_id(2)), span = span(11) })], transfers = [Own.OwnedReturn(ids.fourth, Own.owner_id(2))] }),
+			Own.TestListLength({ value_type = list_type, route = Concrete.MatchRoot }, Model.MinimumLength(2), Model.decision_node_id(0), Model.decision_node_id(1)),
+		] },
+		arms = [{ id = Model.match_arm_id(0), inputs = [Own.ManagedJoinParameter({ id = ids.fifth, value_type = list_type, span = span(12) }, Own.owner_id(3))], operations = [], exit = Own.Yield({ transfer = Own.OwnedReturn(ids.fifth, Own.owner_id(3)), carried = [] }) }]
+	}
+	{ records = [], unions = [], entrypoint = Syntax.NoArguments(ids.entrypoint, Syntax.IntegerExitStatus), functions = [main_function(ids), {
+		signature = { parameters = [list_type], return_type = list_type }, operations = [Own.DefineValue({ id = ids.first, value_type = list_type, operation = Own.ParameterDefinition(0), result = Own.BorrowedResult(Own.ParameterBorrow(ids.first)), span = span(1) }), Own.ExecuteJoin(join)], result = Own.OwnedReturn(ids.second, Own.owner_id(0))
+	}] }
+
+
+private pure func rejected(program: Own.OwnershipProgram, message: String, location: Int) -> Bool:
+	match verify(program):
+		Ok(_): False
+		Err(error): error.message == "ownership verification failed: " + message and error.help == "report this compiler error with the input program" and error.note.is_none() and Syntax.same_span(error.span, span(location))
+
+
+pure func test_guarded_suffix_has_independent_normal_list_ownership() -> Bool:
+	match input_ids():
+		Err(_): False
+		Ok(ids): verify(suffix_program(ids, 2, Concrete.ListType(Concrete.StringType), Own.OwnedResult(Own.owner_id(1)))).is_ok()
+
+
+pure func test_suffix_skip_requires_the_actual_minimum_length() -> Bool:
+	match input_ids():
+		Err(_): False
+		Ok(ids): rejected(suffix_program(ids, 3, Concrete.ListType(Concrete.StringType), Own.OwnedResult(Own.owner_id(1))), "list suffix lacks its required length guard", 10)
+
+
+pure func test_negative_suffix_skip_is_rejected() -> Bool:
+	match input_ids():
+		Err(_): False
+		Ok(ids): rejected(suffix_program(ids, -1, Concrete.ListType(Concrete.StringType), Own.OwnedResult(Own.owner_id(1))), "list suffix skip must be nonnegative", 10)
+
+
+pure func test_suffix_result_preserves_the_exact_list_type() -> Bool:
+	match input_ids():
+		Err(_): False
+		Ok(ids): rejected(suffix_program(ids, 2, Concrete.ListType(Concrete.IntType), Own.OwnedResult(Own.owner_id(1))), "definition type does not match its operation", 10)
+
+
+pure func test_fresh_suffix_must_have_its_own_owner() -> Bool:
+	match input_ids():
+		Err(_): False
+		Ok(ids): rejected(suffix_program(ids, 2, Concrete.ListType(Concrete.StringType), Own.UnmanagedResult), "managed result requires an owner", 10)
+
+
+private pure func changed_selection(program: Own.OwnershipProgram, change: pure (Own.OwnedSelection) -> Own.OwnedSelection) -> Own.OwnershipProgram:
+	functions = program.functions.map(pure func(function):
+		operations = function.operations.map(pure func(operation):
+			match operation:
+				Own.ExecuteJoin(join): Own.ExecuteJoin({ join | selection = change(join.selection) })
+				_: operation
+		)
+		{ function | operations = operations }
+	)
+	{ program | functions = functions }
+
+
+pure func test_suffix_cannot_use_the_false_edge_minimum() -> Bool:
+	match input_ids():
+		Err(_): False
+		Ok(ids):
+			program = suffix_program(ids, 2, Concrete.ListType(Concrete.StringType), Own.OwnedResult(Own.owner_id(1)))
+			changed = changed_selection(program, pure func(selection):
+				nodes = selection.nodes.map(pure func(node):
+					match node:
+						Own.TestListLength(place, test, yes, no): Own.TestListLength(place, test, no, yes)
+						_: node
+				)
+				{ selection | nodes = nodes }
+			)
+			rejected(changed, "list suffix lacks its required length guard", 10)
+
+
+pure func test_negative_length_test_is_rejected() -> Bool:
+	match input_ids():
+		Err(_): False
+		Ok(ids):
+			program = suffix_program(ids, 2, Concrete.ListType(Concrete.StringType), Own.OwnedResult(Own.owner_id(1)))
+			changed = changed_selection(program, pure func(selection):
+				nodes = selection.nodes.map(pure func(node):
+					match node:
+						Own.TestListLength(place, _, yes, no): Own.TestListLength(place, Model.MinimumLength(-1), yes, no)
+						_: node
+				)
+				{ selection | nodes = nodes }
+			)
+			rejected(changed, "list length test count must be nonnegative", 1)
+
+
+pure func test_false_exact_lengths_preserve_nonsequential_exclusions() -> Bool:
+	match input_ids():
+		Err(_): False
+		Ok(ids):
+			program = suffix_program(ids, 3, Concrete.ListType(Concrete.StringType), Own.OwnedResult(Own.owner_id(1)))
+			changed = changed_selection(program, pure func(selection):
+				match selection.nodes:
+					[first, fallback, Own.TestListLength(place, _, _, _)]:
+						{ selection | entry = Model.decision_node_id(4), nodes = [first, fallback,
+							Own.TestListLength(place, Model.ExactLength(1), Model.decision_node_id(1), Model.decision_node_id(0)),
+							Own.TestListLength(place, Model.ExactLength(0), Model.decision_node_id(1), Model.decision_node_id(2)),
+							Own.TestListLength(place, Model.ExactLength(2), Model.decision_node_id(1), Model.decision_node_id(3)),
+						] }
+					_: selection
+			)
+			verify(changed).is_ok()
+
+
+pure func test_string_byte_test_rejects_a_list_place() -> Bool:
+	match input_ids():
+		Err(_): False
+		Ok(ids):
+			program = suffix_program(ids, 2, Concrete.ListType(Concrete.StringType), Own.OwnedResult(Own.owner_id(1)))
+			changed = changed_selection(program, pure func(selection):
+				nodes = selection.nodes.map(pure func(node):
+					match node:
+						Own.TestListLength(place, _, yes, no): Own.TestStringBytes(place, "x\0é", yes, no)
+						_: node
+				)
+				{ selection | nodes = nodes }
+			)
+			rejected(changed, "string byte test requires a String place", 1)
+
+
+private pure func nested_program(ids: InputIds) -> Result[Own.OwnershipProgram, Syntax.Diagnostic]:
+	left ?= match ids.union_value.operation:
+		Lower.ConstructValue(variant, []): Ok(variant)
+		_: Err({ span = span(0), note = None, message = "missing union identity seed", help = "fix test seed" })
+	unions = ids.unions.set(Concrete.union_number(ids.union_id), { variants = [[Concrete.StringType], [Concrete.StringType]], representation = Concrete.InlineOwningPayload })
+	field ?= Concrete.variant_field(left, 0, unions, span(11))
+	list_type = Concrete.ListType(Concrete.UnionType(ids.union_id))
+	root: Own.BorrowedValue = { value = ids.first, source = Own.ParameterBorrow(ids.first) }
+	root_place: Concrete.ConcretePatternPlace = { value_type = list_type, route = Concrete.MatchRoot }
+	element_place: Concrete.ConcretePatternPlace = { value_type = Concrete.UnionType(ids.union_id), route = Concrete.ListElement(root_place, 0) }
+	join: Own.OwnedJoin = {
+		result = Own.ManagedJoinParameter({ id = ids.second, value_type = list_type, span = span(2) }, Own.owner_id(0)), carried = [],
+		selection = { scrutinee = Own.BorrowedArgument(root), entry = Model.decision_node_id(3), nodes = [
+			Own.EnterArm({ arm = Model.match_arm_id(0), operations = [
+				Own.DefineValue({ id = ids.third, value_type = Concrete.UnionType(ids.union_id), operation = Own.ListElementDefinition(0, ids.first), result = Own.BorrowedResult(Own.PayloadBorrow(ids.first)), span = span(10) }),
+				Own.DefineValue({ id = ids.fourth, value_type = Concrete.StringType, operation = Own.PayloadDefinition(field, ids.third), result = Own.BorrowedResult(Own.PayloadBorrow(ids.third)), span = span(11) }),
+				Own.AcquireOwner(Own.owner_id(1), root, span(12)),
+			], transfers = [Own.OwnedReturn(ids.first, Own.owner_id(1))] }),
+			Own.EnterArm({ arm = Model.match_arm_id(0), operations = [Own.AcquireOwner(Own.owner_id(2), root, span(13))], transfers = [Own.OwnedReturn(ids.first, Own.owner_id(2))] }),
+			Own.TestVariant(element_place, left, Model.decision_node_id(0), Model.decision_node_id(1)),
+			Own.TestListLength(root_place, Model.MinimumLength(1), Model.decision_node_id(2), Model.decision_node_id(1)),
+		] },
+		arms = [{ id = Model.match_arm_id(0), inputs = [Own.ManagedJoinParameter({ id = ids.fifth, value_type = list_type, span = span(14) }, Own.owner_id(3))], operations = [], exit = Own.Yield({ transfer = Own.OwnedReturn(ids.fifth, Own.owner_id(3)), carried = [] }) }]
+	}
+	Ok({ records = [], unions = unions, entrypoint = Syntax.NoArguments(ids.entrypoint, Syntax.IntegerExitStatus), functions = [main_function(ids), {
+		signature = { parameters = [list_type], return_type = list_type }, operations = [Own.DefineValue({ id = ids.first, value_type = list_type, operation = Own.ParameterDefinition(0), result = Own.BorrowedResult(Own.ParameterBorrow(ids.first)), span = span(1) }), Own.ExecuteJoin(join)], result = Own.OwnedReturn(ids.second, Own.owner_id(0))
+	}] })
+
+
+private pure func nested_case(change: pure (Own.OwnedSelection) -> Own.OwnedSelection, message: String, location: Int) -> Bool:
+	match input_ids():
+		Err(_): False
+		Ok(ids):
+			match nested_program(ids):
+				Err(_): False
+				Ok(program): rejected(changed_selection(program, change), message, location)
+
+
+pure func test_nested_projection_uses_verified_immediate_parent_places() -> Bool:
+	match input_ids():
+		Err(_): False
+		Ok(ids): nested_program(ids).and_then(verify).is_ok()
+
+
+pure func test_nested_test_requires_its_list_ancestor_guard() -> Bool:
+	nested_case(pure func(selection):
+		match selection.nodes:
+			[first, fallback, test, _]: { selection | nodes = [first, fallback, test], entry = Model.decision_node_id(2) }
+			_: selection
+	, "list element lacks its required length guard", 1)
+
+
+pure func test_nested_projection_requires_its_own_variant_guard() -> Bool:
+	nested_case(pure func(selection):
+		match selection.nodes:
+			[first, fallback, _, Own.TestListLength(place, test, _, no)]:
+				{ selection | nodes = [first, fallback, Own.TestListLength(place, test, Model.decision_node_id(0), no)], entry = Model.decision_node_id(2) }
+			_: selection
+	, "payload projection outside its selected match arm", 11)
+
+
+pure func test_shared_node_discards_list_fact_missing_on_one_path() -> Bool:
+	nested_case(pure func(selection):
+		nodes = selection.nodes.map(pure func(node):
+			match node:
+				Own.TestListLength(place, test, yes, _): Own.TestListLength(place, test, yes, Model.decision_node_id(0))
+				_: node
+		)
+		{ selection | nodes = nodes }
+	, "list element lacks its required length guard", 10)
+
+
+private pure func change_nested_definitions(selection: Own.OwnedSelection, change: pure (Own.OwnedDefinition) -> Own.OwnedDefinition) -> Own.OwnedSelection:
+	nodes = selection.nodes.map(pure func(node):
+		match node:
+			Own.EnterArm(edge):
+				operations = edge.operations.map(pure func(operation):
+					match operation:
+						Own.DefineValue(definition): Own.DefineValue(change(definition))
+						_: operation
+				)
+				Own.EnterArm({ edge | operations = operations })
+			_: node
+	)
+	{ selection | nodes = nodes }
+
+
+pure func test_negative_element_index_is_rejected() -> Bool:
+	change_element = pure func(definition: Own.OwnedDefinition) -> Own.OwnedDefinition:
+		match definition.operation:
+			Own.ListElementDefinition(_, parent): { definition | operation = Own.ListElementDefinition(-1, parent) }
+			_: definition
+	change = pure func(selection: Own.OwnedSelection) -> Own.OwnedSelection: change_nested_definitions(selection, change_element)
+	nested_case(change, "list element index must be nonnegative", 10)
+
+
+pure func test_element_index_requires_a_strictly_larger_minimum() -> Bool:
+	change_element = pure func(definition: Own.OwnedDefinition) -> Own.OwnedDefinition:
+		match definition.operation:
+			Own.ListElementDefinition(_, parent): { definition | operation = Own.ListElementDefinition(1, parent) }
+			_: definition
+	change = pure func(selection: Own.OwnedSelection) -> Own.OwnedSelection: change_nested_definitions(selection, change_element)
+	nested_case(change, "list element lacks its required length guard", 10)
+
+
+pure func test_variant_guard_for_another_list_index_cannot_be_reused() -> Bool:
+	nested_case(pure func(selection):
+		changed = change_nested_definitions(selection, pure func(definition):
+			match definition.operation:
+				Own.ListElementDefinition(_, parent): { definition | operation = Own.ListElementDefinition(1, parent) }
+				_: definition
+		)
+		nodes = changed.nodes.map(pure func(node):
+			match node:
+				Own.TestListLength(place, _, yes, no): Own.TestListLength(place, Model.MinimumLength(2), yes, no)
+				_: node
+		)
+		{ changed | nodes = nodes }
+	, "payload projection outside its selected match arm", 11)
+
+
+pure func test_nested_borrow_cannot_skip_its_immediate_parent() -> Bool:
+	change_selection = pure func(selection: Own.OwnedSelection) -> Own.OwnedSelection:
+		match selection.scrutinee:
+			Own.BorrowedArgument(root):
+				change_definition = pure func(definition: Own.OwnedDefinition) -> Own.OwnedDefinition:
+					match definition.operation:
+						Own.PayloadDefinition(_, _): { definition | result = Own.BorrowedResult(Own.PayloadBorrow(root.value)) }
+						_: definition
+				change_nested_definitions(selection, change_definition)
+			_: selection
+	nested_case(change_selection, "payload borrow has the wrong parent value", 11)
+
+
+pure func test_string_test_requires_all_nominal_ancestor_guards() -> Bool:
+	nested_case(pure func(selection):
+		match selection.nodes:
+			[first, fallback, Own.TestVariant(element, variant, yes, no), length]:
+				match first:
+					Own.EnterArm(edge):
+						match edge.operations:
+							[_, Own.DefineValue(definition), _]:
+								match definition.operation:
+									Own.PayloadDefinition(field, _):
+										place: Concrete.ConcretePatternPlace = { value_type = Concrete.StringType, route = Concrete.UnionField(element, field) }
+										{ selection | nodes = [first, fallback, Own.TestStringBytes(place, "x", yes, no), length] }
+									_: selection
+							_: selection
+					_: selection
+			_: selection
+	, "pattern field lacks its selected variant guard", 1)
+
+
+pure func test_string_bytes_under_guarded_nested_place_are_valid() -> Bool:
+	match input_ids():
+		Err(_): False
+		Ok(ids):
+			match nested_program(ids):
+				Err(_): False
+				Ok(program):
+					changed = changed_selection(program, pure func(selection):
+						match selection.nodes:
+							[Own.EnterArm(edge), fallback, Own.TestVariant(element, variant, yes, no), Own.TestListLength(root, test, _, length_no)]:
+								match edge.operations:
+									[_, Own.DefineValue(definition), _]:
+										match definition.operation:
+											Own.PayloadDefinition(field, _):
+												place: Concrete.ConcretePatternPlace = { value_type = Concrete.StringType, route = Concrete.UnionField(element, field) }
+												{ selection | entry = Model.decision_node_id(4), nodes = [Own.EnterArm(edge), fallback,
+													Own.TestStringBytes(place, "x\0é", yes, no),
+													Own.TestVariant(element, variant, Model.decision_node_id(2), no),
+													Own.TestListLength(root, test, Model.decision_node_id(3), length_no),
+												] }
+											_: selection
+									_: selection
+							_: selection
+					)
+					verify(changed).is_ok()
+
+
+pure func test_suffix_argument_cannot_borrow_a_discharged_parent_occurrence() -> Bool:
+	match input_ids():
+		Err(_): False
+		Ok(ids):
+			program = suffix_program(ids, 2, Concrete.ListType(Concrete.StringType), Own.OwnedResult(Own.owner_id(1)))
+			functions = program.functions.map(pure func(function):
+				operations = function.operations.map(pure func(operation):
+					match operation:
+						Own.ExecuteJoin(join):
+							selection = join.selection
+							match (selection.scrutinee, selection.nodes, join.arms):
+								(Own.BorrowedArgument(root), [Own.EnterArm(first), Own.EnterArm(fallback), test], [arm]):
+									match (first.operations, fallback.operations, arm.inputs):
+										([Own.DefineValue(definition)], [Own.DefineValue(other)], [input]):
+											dead: Own.BorrowedValue = { value = root.value, source = Own.OwnerBorrow(Own.owner_id(1)) }
+											first_operations = [Own.AcquireOwner(Own.owner_id(1), root, span(8)), Own.DropOwner(Own.owner_id(1), span(9)), Own.DefineValue({ definition | operation = Own.ListSuffixDefinition(Own.BorrowedArgument(dead), 2), result = Own.OwnedResult(Own.owner_id(2)) })]
+											nodes = [Own.EnterArm({ first | operations = first_operations, transfers = [Own.OwnedReturn(ids.third, Own.owner_id(2))] }), Own.EnterArm({ fallback | operations = [Own.DefineValue({ other | result = Own.OwnedResult(Own.owner_id(3)) })], transfers = [Own.OwnedReturn(ids.fourth, Own.owner_id(3))] }), test]
+											inputs = [Own.ManagedJoinParameter(Own.join_parameter(input), Own.owner_id(4))]
+											Own.ExecuteJoin({ join | selection = { selection | nodes = nodes }, arms = [{ arm | inputs = inputs, exit = Own.Yield({ transfer = Own.OwnedReturn(ids.fifth, Own.owner_id(4)), carried = [] }) }] })
+										_: operation
+								_: operation
+						_: operation
+				)
+				{ function | operations = operations }
+			)
+			rejected({ program | functions = functions }, "borrow refers to discharged owner 1", 10)
+
+
+tests: TestSuite = {
+	description = "Independent structural selection verification",
+	tests = [
+		("nested String bytes use guarded place", test_string_bytes_under_guarded_nested_place_are_valid),
+		("suffix checks actual parent occurrence lifetime", test_suffix_argument_cannot_borrow_a_discharged_parent_occurrence),
+		("nested projection follows actual parents", test_nested_projection_uses_verified_immediate_parent_places),
+		("nested test needs ancestor bound", test_nested_test_requires_its_list_ancestor_guard),
+		("inner projection needs own variant guard", test_nested_projection_requires_its_own_variant_guard),
+		("merged guard missing on one path rejects", test_shared_node_discards_list_fact_missing_on_one_path),
+		("negative List index rejects", test_negative_element_index_is_rejected),
+		("List index needs strict bound", test_element_index_requires_a_strictly_larger_minimum),
+		("different List indices cannot share tag proof", test_variant_guard_for_another_list_index_cannot_be_reused),
+		("nested borrow names immediate parent", test_nested_borrow_cannot_skip_its_immediate_parent),
+		("nested String test checks ancestor tags", test_string_test_requires_all_nominal_ancestor_guards),
+
+		("false edge does not grant a minimum", test_suffix_cannot_use_the_false_edge_minimum),
+		("negative length test rejects", test_negative_length_test_is_rejected),
+		("false exact length exclusions compose", test_false_exact_lengths_preserve_nonsequential_exclusions),
+		("String tests require String places", test_string_byte_test_rejects_a_list_place),
+		("guarded suffix owns an independent List", test_guarded_suffix_has_independent_normal_list_ownership),
+		("suffix skip requires actual bound", test_suffix_skip_requires_the_actual_minimum_length),
+		("negative suffix skip rejects", test_negative_suffix_skip_is_rejected),
+		("suffix retains exact element type", test_suffix_result_preserves_the_exact_list_type),
+		("suffix needs a fresh owner", test_fresh_suffix_must_have_its_own_owner),
+	]
+}

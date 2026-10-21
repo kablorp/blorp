@@ -6,6 +6,7 @@ runtime operation. Bool and Option results are the foundation's designated
 unions, which the operation carries by constructor identity.
 ---
 import:
+	../utils/boolean: or
 	./declarations: TypeScope, TypeAccess(PrivateTypeUse), type_access, declared_parameters, local_type_parameters, resolve_type, occurrence_fields
 	./errors:
 		CheckError,
@@ -55,8 +56,9 @@ import:
 		same_purity,
 		type_span,
 		ParsedRuntimeOperation(
+			FloatEqualsBuiltin, FloatLessThanBuiltin, FloatIsNaNBuiltin, FloatIsFiniteBuiltin,
 			StringParseIntBuiltin, StringParseFloatBuiltin, ListRepeatBuiltin, ListLengthBuiltin, ListGetBuiltin,
-			StringByteAtBuiltin, StringFromCodepointBuiltin, GetCurrentDirectoryBuiltin, ReadFileBuiltin, WriteFileBuiltin,
+			StringByteAtBuiltin, StringFromCodepointBuiltin, StringSliceBuiltin, GetCurrentDirectoryBuiltin, ReadFileBuiltin, WriteFileBuiltin,
 			ListAppendBuiltin, ListSetBuiltin, ListConcatBuiltin, StringEqualsBuiltin, IntegerEqualsBuiltin, IntegerLessThanBuiltin,
 		)
 	int as IntOps
@@ -111,7 +113,7 @@ pure func validate_signatures(
 		.get(function_number(id))
 		.to_result(checker_invariant(parsed.end, InvalidResolvedFunction(id)))
 
-	result = if same_type(main.signature.return_type.value_type, VoidType):
+	result: EntryResult = if same_type(main.signature.return_type.value_type, VoidType):
 		SuccessfulExit
 	else:
 		IntegerExitStatus
@@ -143,7 +145,7 @@ private pure func accept_functions(
 
 			id = row.id
 
-			role = match entrypoint:
+			role: FunctionRole = match entrypoint:
 				Some(entry):
 					if IntOps.equals(function_number(id), function_number(entry)):
 						EntryFunction
@@ -179,7 +181,7 @@ private pure func resolve_signature(
 	module_scope: TypeScope,
 	designated: DesignatedUnions,
 ) -> Result[AcceptedFunction, CheckError]:
-	generic_main ?= match role:
+	generic_main: Void ?= match role:
 		EntryFunction:
 			match function.type_parameters.get(0):
 				Some(name):
@@ -208,16 +210,16 @@ private pure func resolve_signature(
 		None:
 			function.function_name.span
 
-	main_type ?= match role:
+	main_type: Void ?= match role:
 		EntryFunction:
-			if same_type(return_type, IntType) or same_type(return_type, VoidType):
+			if or(same_type(return_type, IntType), same_type(return_type, VoidType)):
 				Ok(void)
 			else:
 				Err(signature_error(return_span, MainReturnType(return_type)))
 		HelperFunction:
 			Ok(void)
 
-	single_main_parameter ?= match role:
+	single_main_parameter: Void ?= match role:
 		EntryFunction:
 			match function.parameters:
 				[_, second, ..._]:
@@ -372,12 +374,17 @@ private pure func accepted_operation(parsed: ParsedRuntimeOperation, site: Built
 		StringParseFloatBuiltin: Ok(Builtins.StringParseFloat(option))
 		StringByteAtBuiltin: Ok(Builtins.StringByteAt(option))
 		StringFromCodepointBuiltin: Ok(Builtins.StringFromCodepoint(option))
+		StringSliceBuiltin: Ok(Builtins.StringSlice(option))
 		ReadFileBuiltin: Ok(Builtins.ReadFile(site.designated.result))
 		WriteFileBuiltin: Ok(Builtins.WriteFile(site.designated.result))
 		GetCurrentDirectoryBuiltin: Ok(Builtins.GetCurrentDirectory(site.designated.result))
 		StringEqualsBuiltin: Ok(Builtins.StringEquals(boolean))
 		IntegerEqualsBuiltin: Ok(Builtins.IntEquals(boolean))
 		IntegerLessThanBuiltin: Ok(Builtins.IntLessThan(boolean))
+		FloatEqualsBuiltin: Ok(Builtins.FloatEquals(boolean))
+		FloatLessThanBuiltin: Ok(Builtins.FloatLessThan(boolean))
+		FloatIsNaNBuiltin: Ok(Builtins.FloatIsNaN(boolean))
+		FloatIsFiniteBuiltin: Ok(Builtins.FloatIsFinite(boolean))
 		_:
 			primitive: Option[RuntimeOperation[VariantId, TypeRef]] = primitive_operation(parsed)
 			match primitive:
@@ -410,7 +417,7 @@ pure func validate_builtin_body(
 	parsed: ParsedRuntimeOperation,
 	site: BuiltinSite,
 ) -> Result[RuntimeOperation[VariantId, TypeRef], CheckError]:
-	annotation ?= match site.function.tail_annotation:
+	annotation: Void ?= match site.function.tail_annotation:
 		Some(annotation):
 			Err(builtin_error(annotation, BuiltinTailAnnotation))
 		None:
@@ -420,25 +427,30 @@ pure func validate_builtin_body(
 	contract = runtime_contract(operation)
 	signature = site.signature
 
-	generic_header = match parsed:
+	generic_header: Bool = match parsed:
 		ListRepeatBuiltin | ListLengthBuiltin | ListGetBuiltin | ListAppendBuiltin | ListSetBuiltin | ListConcatBuiltin: True
 		_: signature.type_parameters.is_empty()
 
-	if (
-		generic_header
-		and same_purity(signature.purity, contract.purity)
-		and same_types(
-			signature.parameters.map(
-				pure func(parameter: TypeUse) -> TypeRef: parameter.value_type,
-			),
-			contract.parameters.map(
-				pure func(
-					parameter: Builtins.RuntimeType[TypeRef],
-				) -> TypeRef: runtime_type_ref(parameter),
-			),
-		)
-		and same_type(signature.return_type.value_type, runtime_result_type(contract.return_type))
-	):
+	matches_contract = match generic_header:
+		True:
+			match same_purity(signature.purity, contract.purity):
+				True:
+					match same_types(
+						signature.parameters.map(
+							pure func(parameter: TypeUse) -> TypeRef: parameter.value_type,
+						),
+						contract.parameters.map(
+							pure func(
+								parameter: Builtins.RuntimeType[TypeRef],
+							) -> TypeRef: runtime_type_ref(parameter),
+						),
+					):
+						True: same_type(signature.return_type.value_type, runtime_result_type(contract.return_type))
+						False: False
+				False: False
+		False: False
+
+	if matches_contract:
 		Ok(operation)
 	else:
 		Err(builtin_error(site.span, BuiltinContractMismatch(parsed)))

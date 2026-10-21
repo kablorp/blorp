@@ -1,0 +1,292 @@
+import:
+	../../../src/check/model as Model
+	../../../src/lower/lower as Lower
+	../../../src/own/own as Own
+	../../../src/specialize/specialize as Concrete
+	../../../src/utils/syntax: Diagnostic
+	../ownership_inputs: InputIds, input_ids, integer, parameter, span
+	test: TestSuite
+
+
+private pure func list_type() -> Concrete.TypeRef:
+	Concrete.ListType(Concrete.StringType)
+
+
+private pure func parameter_value(id: Lower.ValueId, value_type: Concrete.TypeRef) -> Lower.ValueParameter:
+	{ id = id, value_type = value_type, span = span(20) }
+
+
+private pure func function(
+	ids: InputIds,
+	selection: Lower.LoweredSelection,
+	arms: List[Lower.JoinArm],
+	result_type: Concrete.TypeRef,
+) -> Lower.LoweredFunction:
+	{
+		signature = { parameters = [list_type()], return_type = result_type },
+		steps = [
+			Lower.Define(parameter(ids.first, list_type())),
+			Lower.Join({ result = parameter_value(ids.second, result_type), carried = [], selection = selection, arms = arms, reads = [ids.first] }),
+		],
+		result = ids.second,
+	}
+
+
+private pure func selected(function: Lower.LoweredFunction, unions: List[Concrete.ConcreteUnion]) -> Result[Own.OwnedJoin, Diagnostic]:
+	owned ?= Own.insert_function(function, unions, [])
+	match owned.operations:
+		[Own.DefineValue(_), Own.ExecuteJoin(join)]: Ok(join)
+		_: Err({ span = span(0), note = None, message = "expected one owned selection", help = "fix structural ownership test setup" })
+
+
+private pure func suffix_selection(ids: InputIds, test: Model.ListLengthTest) -> Lower.LoweredSelection:
+	{
+		scrutinee = ids.first,
+		nodes = [
+			Lower.EnterArm({ arm = Model.match_arm_id(0), definitions = [Lower.CopyListSuffix(parameter_value(ids.third, list_type()), ids.first, 1)], arguments = [ids.third] }),
+			Lower.EnterArm({ arm = Model.match_arm_id(1), definitions = [], arguments = [] }),
+			Lower.TestListLength({ value_type = list_type(), route = Concrete.MatchRoot }, test, Model.decision_node_id(0), Model.decision_node_id(1)),
+		],
+		entry = Model.decision_node_id(2),
+	}
+
+
+private pure func suffix_arms(ids: InputIds) -> List[Lower.JoinArm]:
+	[
+		{ id = Model.match_arm_id(0), inputs = [parameter_value(ids.fourth, list_type())], steps = [], exit = Lower.Yield({ value = ids.fourth, carried = [] }) },
+		{ id = Model.match_arm_id(1), inputs = [], steps = [Lower.Define({ id = ids.fifth, value_type = list_type(), operation = Lower.ConstructListValue([]), span = span(30) })], exit = Lower.Yield({ value = ids.fifth, carried = [] }) },
+	]
+
+
+private pure func suffix_moves_fresh_root(join: Own.OwnedJoin) -> Bool:
+	match (join.selection.nodes, join.arms):
+		([Own.EnterArm(edge), _, _], [arm, _]):
+			match ((edge.operations, edge.transfers), (arm.inputs, arm.operations, arm.exit)):
+				(([Own.DefineValue(suffix)], [Own.OwnedReturn(value, moved)]), ([Own.ManagedJoinParameter(input, canonical)], [], Own.Yield(outputs))):
+					match (suffix.operation, suffix.result, join.selection.scrutinee, outputs.transfer):
+						(Own.ListSuffixDefinition(Own.BorrowedArgument(parent), 1), Own.OwnedResult(owner), Own.BorrowedArgument(root), Own.OwnedReturn(returned, returned_owner)):
+							(
+								Concrete.same_type(suffix.value_type, list_type())
+								and Lower.value_number(parent.value) == Lower.value_number(root.value)
+								and Lower.value_number(value) == Lower.value_number(suffix.id)
+								and Own.owner_number(owner) == Own.owner_number(moved)
+								and Own.owner_number(owner) != Own.owner_number(canonical)
+								and Own.owner_number(canonical) == Own.owner_number(returned_owner)
+								and Lower.value_number(input.id) == Lower.value_number(returned)
+								and outputs.carried.is_empty()
+							)
+						_: False
+				_: False
+		_: False
+
+
+pure func test_captured_suffix_moves_its_fresh_root_without_an_extra_acquisition() -> Bool:
+	match input_ids():
+		Err(_): False
+		Ok(ids):
+			match selected(function(ids, suffix_selection(ids, Model.MinimumLength(1)), suffix_arms(ids), list_type()), []):
+				Ok(join):
+					match join.selection.nodes.last():
+						Some(Own.TestListLength(_, Model.MinimumLength(1), _, _)): suffix_moves_fresh_root(join)
+						_: False
+				Err(_): False
+
+
+pure func test_captured_empty_suffix_uses_the_same_owned_list_definition() -> Bool:
+	match input_ids():
+		Err(_): False
+		Ok(ids):
+			match selected(function(ids, suffix_selection(ids, Model.ExactLength(1)), suffix_arms(ids), list_type()), []):
+				Ok(join):
+					match join.selection.nodes.last():
+						Some(Own.TestListLength(_, Model.ExactLength(1), _, _)): suffix_moves_fresh_root(join)
+						_: False
+				Err(_): False
+
+
+pure func test_unused_managed_suffix_input_retires_before_the_body() -> Bool:
+	match input_ids():
+		Err(_): False
+		Ok(ids):
+			arms: List[Lower.JoinArm] = [
+				{ id = Model.match_arm_id(0), inputs = [parameter_value(ids.fourth, list_type())], steps = [Lower.Define(integer(ids.fifth, 7, 30))], exit = Lower.Yield({ value = ids.fifth, carried = [] }) },
+				{ id = Model.match_arm_id(1), inputs = [], steps = [Lower.Define(integer(ids.sixth, 0, 40))], exit = Lower.Yield({ value = ids.sixth, carried = [] }) },
+			]
+			match selected(function(ids, suffix_selection(ids, Model.MinimumLength(1)), arms, Concrete.IntType), []):
+				Ok(join):
+					match join.arms:
+						[first, _]:
+							match (first.inputs, first.operations):
+								([Own.ManagedJoinParameter(_, owner)], [Own.DropOwner(dropped, _), Own.DefineValue(_)]): Own.owner_number(owner) == Own.owner_number(dropped)
+								_: False
+						_: False
+				Err(_): False
+
+
+pure func test_aliased_suffix_occurrences_transfer_distinct_owners() -> Bool:
+	match input_ids():
+		Err(_): False
+		Ok(ids):
+			original = suffix_selection(ids, Model.MinimumLength(1))
+			nodes = original.nodes.map(pure func(node):
+				match node:
+					Lower.EnterArm(edge): Lower.EnterArm({ edge | arguments = edge.arguments.concat(edge.arguments) })
+					_: node
+			)
+			selection = { original | nodes = nodes }
+			arms: List[Lower.JoinArm] = [
+				{ id = Model.match_arm_id(0), inputs = [parameter_value(ids.fourth, list_type()), parameter_value(ids.fifth, list_type())], steps = [], exit = Lower.Yield({ value = ids.fourth, carried = [] }) },
+				{ id = Model.match_arm_id(1), inputs = [], steps = [Lower.Define({ id = ids.sixth, value_type = list_type(), operation = Lower.ConstructListValue([]), span = span(30) })], exit = Lower.Yield({ value = ids.sixth, carried = [] }) },
+			]
+			match selected(function(ids, selection, arms, list_type()), []):
+				Ok(join):
+					match (join.selection.nodes, join.arms):
+						([Own.EnterArm(edge), _, _], [arm, _]):
+							match (edge.operations, edge.transfers, arm.inputs, arm.operations):
+								([Own.DefineValue(suffix), Own.AcquireOwner(copy, borrow, _)], [Own.OwnedReturn(left, first), Own.OwnedReturn(right, second)], [Own.ManagedJoinParameter(_, input), Own.ManagedJoinParameter(_, unused)], [Own.DropOwner(dropped, _)]):
+									match suffix.result:
+										Own.OwnedResult(original):
+											(
+												Lower.value_number(left) == Lower.value_number(right)
+												and Lower.value_number(borrow.value) == Lower.value_number(suffix.id)
+												and Own.owner_number(original) == Own.owner_number(first)
+												and Own.owner_number(copy) == Own.owner_number(second)
+												and Own.owner_number(first) != Own.owner_number(second)
+												and Own.owner_number(input) != Own.owner_number(unused)
+												and Own.owner_number(dropped) == Own.owner_number(unused)
+											)
+										_: False
+								_: False
+						_: False
+				Err(_): False
+
+
+pure func test_borrowed_list_and_copied_suffix_enter_one_canonical_input() -> Bool:
+	match input_ids():
+		Err(_): False
+		Ok(ids):
+			selection: Lower.LoweredSelection = {
+				scrutinee = ids.first,
+				nodes = [
+					Lower.EnterArm({ arm = Model.match_arm_id(0), definitions = [], arguments = [ids.first] }),
+					Lower.EnterArm({ arm = Model.match_arm_id(0), definitions = [Lower.CopyListSuffix(parameter_value(ids.third, list_type()), ids.first, 1)], arguments = [ids.third] }),
+					Lower.TestListLength({ value_type = list_type(), route = Concrete.MatchRoot }, Model.ExactLength(0), Model.decision_node_id(0), Model.decision_node_id(1)),
+				], entry = Model.decision_node_id(2),
+			}
+			arms: List[Lower.JoinArm] = [{ id = Model.match_arm_id(0), inputs = [parameter_value(ids.fourth, list_type())], steps = [], exit = Lower.Yield({ value = ids.fourth, carried = [] }) }]
+			match selected(function(ids, selection, arms, list_type()), []):
+				Ok(join):
+					match (join.selection.nodes, join.arms):
+						([Own.EnterArm(borrowed), Own.EnterArm(copied), _], [arm]):
+							match ((borrowed.operations, borrowed.transfers), (copied.operations, copied.transfers), arm.inputs):
+								(([Own.AcquireOwner(acquired, _, _)], [Own.OwnedReturn(_, first)]), ([Own.DefineValue(suffix)], [Own.OwnedReturn(_, second)]), [Own.ManagedJoinParameter(_, canonical)]):
+									match suffix.result:
+										Own.OwnedResult(owner): Own.owner_number(acquired) == Own.owner_number(first) and Own.owner_number(owner) == Own.owner_number(second) and Own.owner_number(first) != Own.owner_number(second) and Own.owner_number(canonical) != Own.owner_number(second)
+										_: False
+								_: False
+						_: False
+				Err(_): False
+
+
+private pure func nested_function(ids: InputIds) -> Result[Own.OwnedJoin, Diagnostic]:
+	unions: List[Concrete.ConcreteUnion] = [{ variants = [[list_type()], []], representation = Concrete.InlineOwningPayload }]
+	match ids.union_value.operation:
+		Lower.ConstructValue(variant, _):
+			match Concrete.variant_field(variant, 0, unions, span(20)):
+				Err(error): Err(error)
+				Ok(field):
+					root_type = Concrete.UnionType(ids.union_id)
+					root: Concrete.ConcretePatternPlace = { value_type = root_type, route = Concrete.MatchRoot }
+					list_place: Concrete.ConcretePatternPlace = { value_type = list_type(), route = Concrete.UnionField(root, field) }
+					selection: Lower.LoweredSelection = {
+						scrutinee = ids.first,
+						nodes = [
+							Lower.EnterArm({
+								arm = Model.match_arm_id(0),
+								definitions = [Lower.BorrowUnionField(parameter_value(ids.third, list_type()), field, ids.first), Lower.BorrowListElement(parameter_value(ids.fourth, Concrete.StringType), 0, ids.third)],
+								arguments = [ids.fourth],
+							}),
+							Lower.EnterArm({ arm = Model.match_arm_id(1), definitions = [], arguments = [] }),
+							Lower.TestListLength(list_place, Model.MinimumLength(1), Model.decision_node_id(0), Model.decision_node_id(1)),
+							Lower.TestVariant(root, variant, Model.decision_node_id(2), Model.decision_node_id(1)),
+						], entry = Model.decision_node_id(3),
+					}
+					arms: List[Lower.JoinArm] = [
+						{ id = Model.match_arm_id(0), inputs = [parameter_value(ids.fifth, Concrete.StringType)], steps = [], exit = Lower.Yield({ value = ids.fifth, carried = [] }) },
+						{ id = Model.match_arm_id(1), inputs = [], steps = [Lower.Define({ id = ids.sixth, value_type = Concrete.StringType, operation = Lower.StringValue("fallback"), span = span(30) })], exit = Lower.Yield({ value = ids.sixth, carried = [] }) },
+					]
+					input: Lower.LoweredFunction = {
+						signature = { parameters = [root_type], return_type = Concrete.StringType },
+						steps = [Lower.Define(parameter(ids.first, root_type)), Lower.Join({ result = parameter_value(ids.second, Concrete.StringType), carried = [], selection = selection, arms = arms, reads = [ids.first] })],
+						result = ids.second,
+					}
+					selected(input, unions)
+		_: Err({ span = span(0), note = None, message = "expected nested route variant", help = "fix structural ownership seed" })
+
+
+pure func test_nested_union_and_list_borrows_preserve_each_immediate_parent() -> Bool:
+	match input_ids().and_then(nested_function):
+		Err(_): False
+		Ok(join):
+			match (join.selection.nodes, join.arms):
+				([Own.EnterArm(edge), _, Own.TestListLength(_, _, _, _), Own.TestVariant(_, _, _, _)], [arm, _]):
+					match (edge.operations, edge.transfers, arm.inputs):
+						([Own.DefineValue(list), Own.DefineValue(element), Own.AcquireOwner(acquired, borrow, _)], [Own.OwnedReturn(value, moved)], [Own.ManagedJoinParameter(_, input_owner)]):
+							match (list.result, element.operation, element.result, borrow.source):
+								(Own.BorrowedResult(Own.PayloadBorrow(root)), Own.ListElementDefinition(0, parent), Own.BorrowedResult(Own.PayloadBorrow(dependency)), Own.PayloadBorrow(acquired_parent)):
+									(
+										Lower.value_number(root) == 0
+										and Lower.value_number(parent) == Lower.value_number(list.id)
+										and Lower.value_number(dependency) == Lower.value_number(parent)
+										and Lower.value_number(acquired_parent) == Lower.value_number(parent)
+										and Lower.value_number(value) == Lower.value_number(element.id)
+										and Own.owner_number(acquired) == Own.owner_number(moved)
+										and Own.owner_number(acquired) != Own.owner_number(input_owner)
+									)
+								_: False
+						_: False
+				_: False
+
+
+pure func test_string_and_length_decisions_remain_pure_selection_nodes() -> Bool:
+	match input_ids():
+		Err(_): False
+		Ok(ids):
+			root: Concrete.ConcretePatternPlace = { value_type = list_type(), route = Concrete.MatchRoot }
+			first: Concrete.ConcretePatternPlace = { value_type = Concrete.StringType, route = Concrete.ListElement(root, 0) }
+			selection: Lower.LoweredSelection = {
+				scrutinee = ids.first,
+				nodes = [
+					Lower.EnterArm({ arm = Model.match_arm_id(0), definitions = [], arguments = [] }),
+					Lower.EnterArm({ arm = Model.match_arm_id(1), definitions = [], arguments = [] }),
+					Lower.TestStringBytes(first, "é\0x", Model.decision_node_id(0), Model.decision_node_id(1)),
+					Lower.TestListLength(root, Model.ExactLength(1), Model.decision_node_id(2), Model.decision_node_id(1)),
+				], entry = Model.decision_node_id(3),
+			}
+			arms: List[Lower.JoinArm] = [
+				{ id = Model.match_arm_id(0), inputs = [], steps = [Lower.Define(integer(ids.third, 7, 30))], exit = Lower.Yield({ value = ids.third, carried = [] }) },
+				{ id = Model.match_arm_id(1), inputs = [], steps = [Lower.Define(integer(ids.fourth, 0, 40))], exit = Lower.Yield({ value = ids.fourth, carried = [] }) },
+			]
+			match selected(function(ids, selection, arms, Concrete.IntType), []):
+				Err(_): False
+				Ok(join):
+					match join.selection.nodes:
+						[Own.EnterArm(left), Own.EnterArm(right), Own.TestStringBytes(place, bytes, _, _), Own.TestListLength(_, Model.ExactLength(1), _, _)]:
+							match place.route:
+								Concrete.ListElement(_, 0): bytes == "é\0x" and left.operations.is_empty() and right.operations.is_empty() and left.transfers.is_empty() and right.transfers.is_empty()
+								_: False
+						_: False
+
+
+tests: TestSuite = {
+	description = "Structural selection ownership",
+	tests = [
+		("String and length decisions create no edge operations", test_string_and_length_decisions_remain_pure_selection_nodes),
+		("nested Union and List borrows retain immediate parents", test_nested_union_and_list_borrows_preserve_each_immediate_parent),
+		("captured suffix moves its fresh managed root", test_captured_suffix_moves_its_fresh_root_without_an_extra_acquisition),
+		("empty captured suffix remains a normal owned List", test_captured_empty_suffix_uses_the_same_owned_list_definition),
+		("unused suffix input retires before body", test_unused_managed_suffix_input_retires_before_the_body),
+		("aliased suffix occurrences transfer distinct owners", test_aliased_suffix_occurrences_transfer_distinct_owners),
+		("borrowed List and fresh suffix share one input", test_borrowed_list_and_copied_suffix_enter_one_canonical_input),
+	]
+}

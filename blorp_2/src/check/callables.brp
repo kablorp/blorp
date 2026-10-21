@@ -4,6 +4,8 @@ a receiver call reaches; inference selects by type after declaration clashes
 have been rejected. Contracts prove arity and purity once.
 ---
 import:
+	../utils/boolean: not, and
+	../namespace/builtins: DesignatedBoolean, DesignatedOption
 	./declarations: TypeScope
 	./errors:
 		CallError(ArgumentCountMismatch, ImpureCall, UnknownFunction),
@@ -15,6 +17,7 @@ import:
 		MethodError(ConstructorUFCS),
 		method_error
 	./model:
+		BodyOwner,
 		CallIdentity(DeclaredTarget, ParameterTarget),
 		CheckedConstant,
 		CheckedOpaque,
@@ -25,7 +28,7 @@ import:
 		type_head
 	./scope: CallableBinding, callable_binding_id, callable_parameters, callable_return_type
 	./signatures: AcceptedFunction
-	../utils/ids: FunctionId, OpaqueRow, function_number
+	../utils/ids: FunctionId, OpaqueRow, VariantId, function_number
 	../utils/syntax:
 		CallNotation(DirectCall, ReceiverCall),
 		Purity(Impure, Pure),
@@ -42,9 +45,9 @@ import:
 	option: to_result
 
 
--- The function whose body contains a call.
+-- The active body owns purity independently of its root declaration.
 fixed record Caller {
-	function: FunctionId,
+	body: BodyOwner,
 	purity: Purity
 }
 
@@ -135,14 +138,20 @@ private pure func validate_purity(
 	callee: FunctionId,
 	signature: FunctionSignature,
 ) -> Result[Void, CheckError]:
-	if same_purity(caller.purity, Pure) and same_purity(signature.purity, Impure):
-		Err(call_error(name.span, ImpureCall(caller.function, callee)))
+	if and(same_purity(caller.purity, Pure), same_purity(signature.purity, Impure)):
+		Err(call_error(name.span, ImpureCall(caller.body, callee)))
 	else:
 		Ok(void)
 
 
+fixed union SourceLoopScope:
+	OutsideSourceLoop
+	WithinSourceLoop
+
+
 fixed record ResolutionContext {
 	caller: Caller,
+	root_function: FunctionId,
 	module: ModuleId,
 	namespace: Namespace,
 	body_types: TypeScope,
@@ -152,6 +161,9 @@ fixed record ResolutionContext {
 	opaque_declarations: List[OpaqueRow],
 	opaques: List[CheckedOpaque],
 	constants: List[CheckedConstant],
+	boolean: DesignatedBoolean[VariantId],
+	option: DesignatedOption[VariantId],
+	loop_scope: SourceLoopScope,
 }
 
 
@@ -176,7 +188,7 @@ private pure func receiver_head(function: AcceptedFunction) -> Option[TypeHead]:
 
 
 private pure func listed_function(candidates: List[ReceiverCandidate], id: FunctionId) -> Bool:
-	var present = False
+	var present: Bool = False
 	for candidate in candidates:
 		if IntOps.equals(function_number(candidate.function.id), function_number(id)):
 			present = True
@@ -193,7 +205,7 @@ pure func receiver_bindings(namespace: Namespace, signatures: List[AcceptedFunct
 	var failure: Option[CheckError] = None
 	match named_value(namespace, module, name.id):
 		Some(NamedFunction(id, source)):
-			site = match source:
+			site: Option[Span] = match source:
 				DeclaredHere: None
 				ImportedAt(span): Some(span)
 			match signatures.get(function_number(id)):
@@ -203,7 +215,7 @@ pure func receiver_bindings(namespace: Namespace, signatures: List[AcceptedFunct
 	for imported in method_imports(namespace, module):
 		match offered_value(namespace, imported.target, name.id):
 			Ok(OfferedFunction(id)):
-				if not listed_function(found, id):
+				if listed_function(found, id).not():
 					match signatures.get(function_number(id)):
 						Some(function):
 							match receiver_head(function):
@@ -272,7 +284,7 @@ pure func callable_contract(
 		parameters = callable_parameters(binding),
 		return_type = callable_return_type(binding)
 	}
-	target = ParameterTarget(callable_binding_id(binding))
+	target: CallIdentity = ParameterTarget(callable_binding_id(binding))
 	arity ?= validate_arity(name, DirectCall, arguments.length(), target, signature)
 	Ok({
 		target = target,

@@ -1,4 +1,5 @@
 import:
+	../../../src/check/model: match_arm_number
 	../../../src/lower/lower as Lower
 	../../../src/own/own as Own
 	../../../src/specialize/specialize as Concrete
@@ -15,8 +16,8 @@ pure func test_two_parameters_remain_borrowed_and_result_transfers() -> Bool:
 			match Own.insert_function(seed.query, Lower.lowered_functions(seed.lowered).unions, []):
 				Err(_): False
 				Ok(function):
-					match (function.operations, function.tail):
-						([Own.DefineValue(path), Own.DefineValue(contents), Own.DefineValue(result)], Own.ReturnTail(Own.ReturnResult(Own.OwnedReturn(value, transferred)))):
+					match (function.operations, function.result):
+						([Own.DefineValue(path), Own.DefineValue(contents), Own.DefineValue(result)], Own.OwnedReturn(value, transferred)):
 							match (result.operation, result.result):
 								(Own.CallDefinition(_, [Own.BorrowedArgument(first), Own.BorrowedArgument(second)]), Own.OwnedResult(owner)):
 									(Lower.value_number(first.value) == Lower.value_number(path.id)
@@ -40,7 +41,7 @@ pure func test_same_string_is_borrowed_twice_without_acquisition() -> Bool:
 	match escaped_function():
 		Some(function):
 			match function.operations:
-				[Own.DefineValue(path), Own.DefineValue(result)]:
+				[Own.DefineValue(path), Own.DefineValue(result), Own.ExecuteJoin(_), Own.DropOwner(_, _)]:
 					match result.operation:
 						Own.CallDefinition(_, [Own.BorrowedArgument(first), Own.BorrowedArgument(second)]):
 							match (first.source, second.source):
@@ -58,21 +59,38 @@ pure func test_same_string_is_borrowed_twice_without_acquisition() -> Bool:
 pure func test_void_projection_is_unmanaged_and_error_acquires_before_parent_drop() -> Bool:
 	match escaped_function():
 		Some(function):
-			match (function.operations, function.tail):
-				([_, Own.DefineValue(parent)], Own.MatchTail(matched)):
-					match (parent.result, matched.arms):
-						(Own.OwnedResult(parent_owner), [ok, error]):
-							match (ok.operations, error.operations, error.exit):
-								([Own.DefineValue(done), Own.DefineValue(_), Own.DropOwner(ok_drop, _)], [Own.DefineValue(child), Own.AcquireOwner(acquired, borrow, _), Own.DropOwner(err_drop, _)], Own.ReturnResult(Own.OwnedReturn(value, returned))):
-									match (done.value_type, done.result, child.result, borrow.source):
-										(Concrete.VoidType, Own.UnmanagedResult, Own.BorrowedResult(Own.PayloadBorrow(source)), Own.PayloadBorrow(borrowed)):
-											(Own.owner_number(ok_drop) == Own.owner_number(parent_owner)
-												and Own.owner_number(err_drop) == Own.owner_number(parent_owner)
-												and Lower.value_number(source) == Lower.value_number(parent.id)
-												and Lower.value_number(borrowed) == Lower.value_number(parent.id)
-												and Lower.value_number(borrow.value) == Lower.value_number(child.id)
-												and Lower.value_number(value) == Lower.value_number(child.id)
-												and Own.owner_number(acquired) == Own.owner_number(returned))
+			match (function.operations, function.result):
+				([_, Own.DefineValue(parent), Own.ExecuteJoin(matched), Own.DropOwner(dropped, _)], Own.OwnedReturn(joined, transferred)):
+					match (parent.result, matched.result, matched.arms):
+						(Own.OwnedResult(parent_owner), Own.ManagedJoinParameter(result, result_owner), [ok, error]):
+							match (matched.selection.nodes, ok.inputs, error.inputs):
+								([Own.EnterArm(error_edge), Own.EnterArm(ok_edge), Own.TestVariant(_, _, _, _)], [Own.UnmanagedJoinParameter(done)], [Own.ManagedJoinParameter(input, canonical)]):
+									match (ok_edge.operations, ok_edge.transfers, ok.operations):
+										([Own.DefineValue(projected)], [Own.UnmanagedReturn(ok_value)], [Own.DefineValue(_)]):
+											match (projected.operation, projected.value_type, projected.result):
+												(Own.PayloadDefinition(_, ok_source), Concrete.VoidType, Own.UnmanagedResult):
+													match error.exit:
+														Own.Yield(outputs):
+															match (error_edge.operations, error_edge.transfers, outputs.transfer):
+																([Own.DefineValue(child), Own.AcquireOwner(acquired, borrow, _)], [Own.OwnedReturn(selected, moved)], Own.OwnedReturn(value, returned)):
+																	match (child.result, borrow.source):
+																		(Own.BorrowedResult(Own.PayloadBorrow(source)), Own.PayloadBorrow(borrowed)):
+																			(Own.owner_number(dropped) == Own.owner_number(parent_owner)
+																				and Lower.value_number(joined) == Lower.value_number(result.id)
+																				and Own.owner_number(transferred) == Own.owner_number(result_owner)
+																				and Concrete.same_type(done.value_type, Concrete.VoidType) and Lower.value_number(ok_source) == Lower.value_number(parent.id)
+																				and Lower.value_number(ok_value) == Lower.value_number(projected.id) and match_arm_number(ok_edge.arm) == match_arm_number(ok.id)
+																				and match_arm_number(error_edge.arm) == match_arm_number(error.id) and error.operations.is_empty()
+																				and Lower.value_number(source) == Lower.value_number(parent.id) and Lower.value_number(borrowed) == Lower.value_number(parent.id)
+																				and Lower.value_number(borrow.value) == Lower.value_number(child.id) and Lower.value_number(selected) == Lower.value_number(child.id)
+																				and Own.owner_number(acquired) == Own.owner_number(moved) and Own.owner_number(acquired) != Own.owner_number(canonical)
+																				and Lower.value_number(input.id) != Lower.value_number(child.id)
+																				and Lower.value_number(value) == Lower.value_number(input.id) and Own.owner_number(returned) == Own.owner_number(canonical)
+																				and outputs.carried.is_empty())
+																		_: False
+																_: False
+														_: False
+												_: False
 										_: False
 								_: False
 						_: False

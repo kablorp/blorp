@@ -1,4 +1,5 @@
 import:
+	../test_verify/selection_inputs as Selection
 	../../../src/check/check: CheckedProgram, check, checked_functions
 	../../../src/check/errors as Errors
 	../../../src/check/model as Check
@@ -12,9 +13,10 @@ import:
 	../../../src/namespace/builtins as Builtins: check_builtin_types, render_builtin_type_error
 	../../../src/utils/source: module_source, root_module_id, same_source
 	../../../src/specialize/specialize as Concrete
-	../../../src/utils/syntax: Diagnostic, Entrypoint(NoArguments, WithArguments), EntryResult(IntegerExitStatus), entry_function, FunctionExecution(OrdinaryCalls)
+	../../../src/utils/syntax: Diagnostic, Entrypoint(NoArguments, WithArguments), EntryResult(IntegerExitStatus), entry_function
 	../../../src/verify/verify: verify
 	../input: check_failure, initial_names, setup_diagnostic
+	../managed_union_inputs: lowered_tail_join
 	option: get_or
 	../module_input: PRIMITIVE_BASE, TEST_BASE, parse_modules_with_base
 	../ownership_inputs: InputIds, input_ids, parameter, function, span
@@ -384,8 +386,8 @@ pure func test_returning_borrowed_list_acquires_then_transfers_root() -> Bool:
 			lowered = function([parameter(ids.first, list_type)], ids.first, [list_type], list_type)
 			match Own.insert_function(lowered, [], []):
 				Ok(function):
-					match (function.operations, function.tail):
-						([Own.DefineValue(parameter), Own.AcquireOwner(owner, borrow, _)], Own.ReturnTail(Own.ReturnResult(Own.OwnedReturn(returned, transferred)))):
+					match (function.operations, function.result):
+						([Own.DefineValue(parameter), Own.AcquireOwner(owner, borrow, _)], Own.OwnedReturn(returned, transferred)):
 							match (parameter.result, borrow.source):
 								(Own.BorrowedResult(Own.ParameterBorrow(source)), Own.ParameterBorrow(dependency)): Lower.value_number(source) == 0 and Lower.value_number(dependency) == 0 and Lower.value_number(borrow.value) == 0 and Lower.value_number(returned) == 0 and Own.owner_number(owner) == Own.owner_number(transferred)
 								_: False
@@ -398,7 +400,7 @@ private pure func definition(ids: InputIds, value_type: Concrete.TypeRef) -> Own
 
 
 private pure func zero(ids: InputIds) -> Own.OwnedFunction:
-	{ execution = OrdinaryCalls, signature = { parameters = [], return_type = Concrete.IntType }, operations = [Own.DefineValue({ id = ids.first, value_type = Concrete.IntType, operation = Own.IntegerDefinition(0), result = Own.UnmanagedResult, span = span(1) })], tail = Own.ReturnTail(Own.ReturnResult(Own.UnmanagedReturn(ids.first))) }
+	{ signature = { parameters = [], return_type = Concrete.IntType }, operations = [Own.DefineValue({ id = ids.first, value_type = Concrete.IntType, operation = Own.IntegerDefinition(0), result = Own.UnmanagedResult, span = span(1) })], result = Own.UnmanagedReturn(ids.first) }
 
 
 private pure func list_identity(ids: InputIds, acquire: Bool) -> Own.OwnedFunction:
@@ -407,7 +409,7 @@ private pure func list_identity(ids: InputIds, acquire: Bool) -> Own.OwnedFuncti
 		[definition(ids, list_type), Own.AcquireOwner(Own.owner_id(0), { value = ids.first, source = Own.ParameterBorrow(ids.first) }, span(10))]
 	else:
 		[definition(ids, list_type)]
-	{ execution = OrdinaryCalls, signature = { parameters = [list_type], return_type = list_type }, operations = operations, tail = Own.ReturnTail(Own.ReturnResult(Own.OwnedReturn(ids.first, Own.owner_id(0)))) }
+	{ signature = { parameters = [list_type], return_type = list_type }, operations = operations, result = Own.OwnedReturn(ids.first, Own.owner_id(0)) }
 
 
 pure func test_verifier_independently_accepts_acquired_list_transfer() -> Bool:
@@ -440,13 +442,12 @@ pure func test_verifier_accepts_numeric_list_in_unused_signature() -> Bool:
 		Ok(ids):
 			list_type = Concrete.ListType(Concrete.IntType)
 			unused: Own.OwnedFunction = {
-				execution = OrdinaryCalls,
 				signature = { parameters = [list_type], return_type = Concrete.IntType },
 				operations = [
 					definition(ids, list_type),
 					Own.DefineValue({ id = ids.second, value_type = Concrete.IntType, operation = Own.IntegerDefinition(0), result = Own.UnmanagedResult, span = span(20) }),
 				],
-				tail = Own.ReturnTail(Own.ReturnResult(Own.UnmanagedReturn(ids.second)))
+				result = Own.UnmanagedReturn(ids.second)
 			}
 			verify({ records = [], unions = [], functions = [zero(ids), unused], entrypoint = NoArguments(ids.entrypoint, IntegerExitStatus) }).is_ok()
 
@@ -468,19 +469,17 @@ private pure func nested_seed() -> Result[NestedSeed, Diagnostic]:
 	facts = Lower.lowered_functions(program)
 	match facts.functions:
 		[_, _, unbox]:
-			match unbox.tail:
-				Lower.MatchValue(matched):
-					match matched.arms:
-						[arm]:
-							match arm.label:
-								Lower.VariantLabel(variant):
-									field ?= Concrete.variant_field(variant, 0, facts.unions, span(0))
-									Ok({ ids = ids, unions = facts.unions, variant = variant, field = field, lowered = unbox })
-								_: Err({ span = span(0), note = None, message = "expected Box variant", help = "fix phase identity seed" })
-						_: Err({ span = span(0), note = None, message = "expected one Box arm", help = "fix phase identity seed" })
+			match lowered_tail_join(unbox):
+				Some(matched):
+					match matched.selection.nodes:
+						[Lower.EnterArm(edge)]:
+							match edge.definitions:
+								[Lower.BorrowUnionField(_, field, _)]:
+									Ok({ ids = ids, unions = facts.unions, variant = Concrete.variant_field_variant(field), field = field, lowered = unbox })
+								_: Err({ span = span(0), note = None, message = "expected Box payload field", help = "fix phase identity seed" })
+						_: Err({ span = span(0), note = None, message = "expected one Box edge", help = "fix phase identity seed" })
 				_: Err({ span = span(0), note = None, message = "expected Box match", help = "fix phase identity seed" })
 		_: Err({ span = span(0), note = None, message = "expected three concrete roots", help = "fix phase identity seed" })
-
 
 pure func test_nested_list_payload_acquires_borrow_and_transfers_its_root() -> Bool:
 	match nested_seed():
@@ -489,32 +488,55 @@ pure func test_nested_list_payload_acquires_borrow_and_transfers_its_root() -> B
 			match Own.insert_function(seed.lowered, seed.unions, []):
 				Err(_): False
 				Ok(function):
-					match function.tail:
-						Own.MatchTail(matched):
-							match matched.arms:
-								[arm]:
-									match (arm.operations, arm.exit):
-										([Own.DefineValue(payload), Own.AcquireOwner(owner, borrow, _)], Own.ReturnResult(Own.OwnedReturn(returned, transferred))):
-											match (payload.result, borrow.source):
-												(Own.BorrowedResult(Own.PayloadBorrow(parent)), Own.PayloadBorrow(dependency)): Concrete.same_type(payload.value_type, Concrete.ListType(Concrete.StringType)) and Lower.value_number(parent) == Lower.value_number(dependency) and Lower.value_number(returned) == Lower.value_number(payload.id) and Own.owner_number(owner) == Own.owner_number(transferred)
+					match function.operations:
+						[Own.DefineValue(_), Own.ExecuteJoin(matched)]:
+							match (matched.selection.nodes, matched.arms):
+								([Own.EnterArm(edge)], [arm]):
+									match arm.exit:
+										Own.Yield(outputs):
+											match ((edge.operations, edge.transfers, arm.inputs, arm.operations), outputs.transfer):
+												(([Own.DefineValue(payload), Own.AcquireOwner(owner, borrow, _)], [Own.OwnedReturn(selected, edge_owner)], [Own.ManagedJoinParameter(input, canonical)], []), Own.OwnedReturn(returned, transferred)):
+													match (payload.result, borrow.source):
+														(Own.BorrowedResult(Own.PayloadBorrow(parent)), Own.PayloadBorrow(dependency)):
+															(
+																Concrete.same_type(payload.value_type, Concrete.ListType(Concrete.StringType))
+																and Lower.value_number(parent) == Lower.value_number(dependency)
+																and Lower.value_number(selected) == Lower.value_number(payload.id)
+																and Lower.value_number(returned) == Lower.value_number(input.id)
+																and Own.owner_number(owner) == Own.owner_number(edge_owner)
+																and Own.owner_number(canonical) == Own.owner_number(transferred)
+																and Own.owner_number(owner) != Own.owner_number(canonical)
+															)
+														_: False
 												_: False
-										_: False
+										Own.TransferLoop(_, _): False
 								_: False
 						_: False
-
 
 private pure func nested_projection(seed: NestedSeed, acquire: Bool) -> Own.OwnedFunction:
 	ids = seed.ids
 	union_type = Concrete.UnionType(Concrete.variant_owner(seed.variant))
 	parameter = definition(ids, union_type)
-	child: Own.OwnershipOperation = Own.DefineValue({ id = ids.second, value_type = Concrete.ListType(Concrete.StringType), operation = Own.PayloadDefinition(seed.field, ids.first), result = Own.BorrowedResult(Own.PayloadBorrow(ids.first)), span = span(20) })
+	child: Own.OwnershipOperation = Own.DefineValue({ id = ids.third, value_type = Concrete.ListType(Concrete.StringType), operation = Own.PayloadDefinition(seed.field, ids.first), result = Own.BorrowedResult(Own.PayloadBorrow(ids.first)), span = span(20) })
 	operations = if acquire:
-		[child, Own.AcquireOwner(Own.owner_id(0), { value = ids.second, source = Own.PayloadBorrow(ids.first) }, span(20))]
+		[child, Own.AcquireOwner(Own.owner_id(1), { value = ids.third, source = Own.PayloadBorrow(ids.first) }, span(20))]
 	else:
 		[child]
-	matched: Own.OwnedMatch = { scrutinee = Own.BorrowedArgument({ value = ids.first, source = Own.ParameterBorrow(ids.first) }), owner = Concrete.variant_owner(seed.variant), arms = [{ label = Lower.VariantLabel(seed.variant), operations = operations, exit = Own.ReturnResult(Own.OwnedReturn(ids.second, Own.owner_id(0))) }] }
-	{ execution = OrdinaryCalls, signature = { parameters = [union_type], return_type = Concrete.ListType(Concrete.StringType) }, operations = [parameter], tail = Own.MatchTail(matched) }
-
+	selection = Selection.direct(Own.BorrowedArgument({ value = ids.first, source = Own.ParameterBorrow(ids.first) }))
+	matched: Own.OwnedJoin = {
+		result = Own.ManagedJoinParameter({ id = ids.second, value_type = Concrete.ListType(Concrete.StringType), span = span(20) }, Own.owner_id(0)),
+		carried = [],
+		selection = { selection | nodes = [Own.EnterArm({ arm = Check.match_arm_id(0), operations = operations, transfers = [Own.OwnedReturn(ids.third, Own.owner_id(1))] })] },
+		arms = [{
+			id = Check.match_arm_id(0),
+			inputs = [Own.ManagedJoinParameter({ id = ids.fourth, value_type = Concrete.ListType(Concrete.StringType), span = span(20) }, Own.owner_id(2))],
+			operations = [], exit = Own.Yield({ transfer = Own.OwnedReturn(ids.fourth, Own.owner_id(2)), carried = [] }),
+		}],
+	}
+	{
+		signature = { parameters = [union_type], return_type = Concrete.ListType(Concrete.StringType) },
+		operations = [parameter, Own.ExecuteJoin(matched)], result = Own.OwnedReturn(ids.second, Own.owner_id(0)),
+	}
 
 pure func test_verifier_independently_accepts_acquired_nested_list_projection() -> Bool:
 	match nested_seed():
@@ -527,7 +549,7 @@ pure func test_verifier_rejects_nested_list_return_without_acquisition() -> Bool
 		Err(_): False
 		Ok(seed):
 			match verify({ records = [], unions = seed.unions, functions = [zero(seed.ids), nested_projection(seed, False)], entrypoint = NoArguments(seed.ids.entrypoint, IntegerExitStatus) }):
-				Err(error): error.message == "ownership verification failed: owner 0 is not defined"
+				Err(error): error.message == "ownership verification failed: owner 1 is not defined"
 				Ok(_): False
 
 
@@ -538,7 +560,7 @@ pure func test_inline_list_union_acquisition_and_drop_emit_root_dispatch() -> Bo
 			ids = seed.ids
 			union_type = Concrete.UnionType(Concrete.variant_owner(seed.variant))
 			borrow: Own.BorrowedValue = { value = ids.first, source = Own.ParameterBorrow(ids.first) }
-			cleanup: Own.OwnedFunction = { execution = OrdinaryCalls, signature = { parameters = [union_type], return_type = Concrete.IntType }, operations = [definition(ids, union_type), Own.AcquireOwner(Own.owner_id(0), borrow, span(20)), Own.DropOwner(Own.owner_id(0), span(30)), Own.DefineValue({ id = ids.second, value_type = Concrete.IntType, operation = Own.IntegerDefinition(0), result = Own.UnmanagedResult, span = span(40) })], tail = Own.ReturnTail(Own.ReturnResult(Own.UnmanagedReturn(ids.second))) }
+			cleanup: Own.OwnedFunction = { signature = { parameters = [union_type], return_type = Concrete.IntType }, operations = [definition(ids, union_type), Own.AcquireOwner(Own.owner_id(0), borrow, span(20)), Own.DropOwner(Own.owner_id(0), span(30)), Own.DefineValue({ id = ids.second, value_type = Concrete.IntType, operation = Own.IntegerDefinition(0), result = Own.UnmanagedResult, span = span(40) })], result = Own.UnmanagedReturn(ids.second) }
 			program: Own.OwnershipProgram = { records = [], unions = seed.unions, functions = [zero(ids), cleanup], entrypoint = NoArguments(ids.entrypoint, IntegerExitStatus) }
 			match verify(program).and_then(emit):
 				Ok(output): output.contains("blorp_list_dup_0_s(value.payload.blorp_up_0.blorp_uf_0)") and output.contains("blorp_list_drop_0_s(value.payload.blorp_up_0.blorp_uf_0)") and output.contains("blorp_union_dup_0(blorp_vl_0)") and output.contains("blorp_union_drop_0(blorp_owner_0)")
@@ -583,7 +605,7 @@ pure func test_verifier_rejects_nullary_convention_for_borrowed_list_parameter()
 	match input_ids():
 		Err(_): False
 		Ok(ids):
-			entry = { zero(ids) | signature = { parameters = [Concrete.ListType(Concrete.StringType)], return_type = Concrete.IntType }, operations = [definition(ids, Concrete.ListType(Concrete.StringType)), Own.DefineValue({ id = ids.second, value_type = Concrete.IntType, operation = Own.IntegerDefinition(0), result = Own.UnmanagedResult, span = span(20) })], tail = Own.ReturnTail(Own.ReturnResult(Own.UnmanagedReturn(ids.second))) }
+			entry = { zero(ids) | signature = { parameters = [Concrete.ListType(Concrete.StringType)], return_type = Concrete.IntType }, operations = [definition(ids, Concrete.ListType(Concrete.StringType)), Own.DefineValue({ id = ids.second, value_type = Concrete.IntType, operation = Own.IntegerDefinition(0), result = Own.UnmanagedResult, span = span(20) })], result = Own.UnmanagedReturn(ids.second) }
 			match verify({ records = [], unions = [], functions = [entry], entrypoint = NoArguments(ids.entrypoint, IntegerExitStatus) }):
 				Err(error): error.message == "ownership verification failed: entrypoint signature does not match its accepted argument and result conventions"
 				Ok(_): False

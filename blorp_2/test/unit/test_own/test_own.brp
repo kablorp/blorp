@@ -1,11 +1,11 @@
 import:
+	../../../src/check/model: match_arm_id, decision_node_id
 	../../../src/utils/syntax: Diagnostic, Span, same_span
 	../../../src/utils/source: compiler_source
-	../../../src/lower/lower:
-		LoweredStep(Define, Join),
-		LoweredExit(ReturnValue, RecurValues),
-		LoweredTail(ExitValue, MatchValue),
-		MatchLabel(DefaultLabel, VariantLabel),
+	../../../src/lower/lower as Lower:
+		LoweredStep(Define, Join, Loop),
+		LoopExit(Recur, Break),
+		LoopTail(MatchLoop),
 		ValueDefinition,
 		ValueOperation(CallValue, ConstructValue, VoidValue),
 		lowered_functions,
@@ -14,10 +14,10 @@ import:
 	../../../src/own/own as Own:
 		BorrowSource(ParameterBorrow, OwnerBorrow),
 		OwnedArgument(BorrowedArgument),
-		OwnedExit(ReturnResult),
-		OwnedTail(ReturnTail, MatchTail),
+		OwnedLoopTail,
+		OwnedLoopExit,
 		OwnedValueOperation(CallDefinition),
-		OwnershipOperation(DefineValue, AcquireOwner, DropOwner),
+		OwnershipOperation(DefineValue, ExecuteLoop, AcquireOwner, DropOwner),
 		ResultOwnership(BorrowedResult, OwnedResult),
 		ReturnTransfer(UnmanagedReturn, OwnedReturn),
 		block_last_uses,
@@ -26,15 +26,31 @@ import:
 		last_uses,
 		owner_number,
 	../../../src/namespace/builtins as Builtins: RuntimeOperation(IntToString, StringLength, IntAdd)
-	../../../src/specialize/specialize:
+	../../../src/specialize/specialize as Concrete:
 		CallTarget(UserFunction),
 		TypeRef(IntType, StringType, UnionType, VoidType),
 		function_number,
 		ValueOwnership(NoOwnership, ManagedStringLeaf),
 		value_ownership,
 	../ownership_inputs: InputIds, function, input_ids, integer, parameter, runtime, span
-	../managed_union_inputs: lowered, NAMED_CALLBACK_SOURCE
+	../managed_union_inputs: lowered, NAMED_CALLBACK_SOURCE, NONCAPTURING_CALLBACK_SOURCE
 	test: TestSuite
+
+
+private pure func default_selection(value: Lower.ValueId) -> Lower.LoweredSelection:
+	{ scrutinee = value, nodes = [Lower.EnterArm({ arm = match_arm_id(0), definitions = [], arguments = [] })], entry = decision_node_id(0) }
+
+
+private pure func binary_selection(value: Lower.ValueId, owner: Concrete.UnionInstanceId, variant: Concrete.VariantInstanceId) -> Lower.LoweredSelection:
+	{
+		scrutinee = value,
+		nodes = [
+			Lower.EnterArm({ arm = match_arm_id(0), definitions = [], arguments = [] }),
+			Lower.EnterArm({ arm = match_arm_id(1), definitions = [], arguments = [] }),
+			Lower.TestVariant({ value_type = UnionType(owner), route = Concrete.MatchRoot }, variant, decision_node_id(0), decision_node_id(1)),
+		],
+		entry = decision_node_id(2),
+	}
 
 
 private pure func borrows_owner(
@@ -132,23 +148,19 @@ pure func test_last_use_records_repeated_call_operands_with_a_prefix_and_offset(
 					[Define(ignored), Define(spare), Define(local), Define(call)]:
 						match call.operation:
 							CallValue(_, arguments):
-								match function.tail:
-									ExitValue(ReturnValue(result)):
-										match block_last_uses([local, call].map(pure func(definition): Define(definition)), result, 2, 2):
-											Ok(uses):
-												definition_ids = [ignored, spare, local, call].map(
-													pure func(definition): value_number(definition.id),
-												)
-												argument_ids = arguments.map(value_number)
-												local_id = value_number(local.id)
-												(
-													definition_ids == [0, 1, 2, 3]
-													and argument_ids == [value_number(spare.id), local_id, local_id]
-													and uses == [Some(1), Some(2)]
-												)
-											Err(_):
-												False
-									_:
+								match block_last_uses([local, call].map(pure func(definition): Define(definition)), function.result, 2, 2):
+									Ok(uses):
+										definition_ids = [ignored, spare, local, call].map(
+											pure func(definition): value_number(definition.id),
+										)
+										argument_ids = arguments.map(value_number)
+										local_id = value_number(local.id)
+										(
+											definition_ids == [0, 1, 2, 3]
+											and argument_ids == [value_number(spare.id), local_id, local_id]
+											and uses == [Some(1), Some(2)]
+										)
+									Err(_):
 										False
 							_:
 								False
@@ -176,20 +188,16 @@ pure func test_repeated_constructor_children_share_one_last_use_slot() -> Bool:
 					[Define(parameter), Define(construction)]:
 						match construction.operation:
 							ConstructValue(_, arguments):
-								match function.tail:
-									ExitValue(ReturnValue(result)):
-										match last_uses(function.steps, result):
-											Ok(uses):
-												(
-													arguments.map(value_number) == [
-														value_number(parameter.id),
-														value_number(parameter.id),
-													]
-													and uses == [Some(1), Some(2)]
-												)
-											Err(_):
-												False
-									_:
+								match last_uses(function.steps, function.result):
+									Ok(uses):
+										(
+											arguments.map(value_number) == [
+												value_number(parameter.id),
+												value_number(parameter.id),
+											]
+											and uses == [Some(1), Some(2)]
+										)
+									Err(_):
 										False
 							_:
 								False
@@ -220,20 +228,19 @@ private pure func unary_join(
 	Join({
 		result = { id = ids.second, value_type = left.value_type, span = span(20) },
 		carried = [],
-		scrutinee = ids.first,
-		owner = ids.union_id,
+		selection = binary_selection(ids.first, ids.union_id, ids.second_variant),
 		arms = [
 			{
-				label = VariantLabel(ids.second_variant),
+				id = match_arm_id(0),
+				inputs = [],
 				steps = [Define(left)],
-				value = left.id,
-				carried = [],
+				exit = Lower.Yield({ value = left.id, carried = [] }),
 			},
 			{
-				label = DefaultLabel,
+				id = match_arm_id(1),
+				inputs = [],
 				steps = [Define(right)],
-				value = right.id,
-				carried = [],
+				exit = Lower.Yield({ value = right.id, carried = [] }),
 			},
 		],
 		reads = [ids.first],
@@ -322,10 +329,10 @@ pure func test_join_outputs_have_separate_value_slots_at_one_step() -> Bool:
 				Join({
 					result = { id = ids.second, value_type = VoidType, span = span(20) },
 					carried = [{ id = ids.third, value_type = IntType, span = span(21) }],
-					scrutinee = ids.first,
-					owner = ids.union_id,
+					selection = default_selection(ids.first),
 					arms = [{
-						label = DefaultLabel,
+						id = match_arm_id(0),
+						inputs = [],
 						steps = [
 							Define({
 								id = ids.fifth,
@@ -335,8 +342,7 @@ pure func test_join_outputs_have_separate_value_slots_at_one_step() -> Bool:
 							}),
 							Define(integer(ids.sixth, 7, 50)),
 						],
-						value = ids.fifth,
-						carried = [ids.sixth],
+						exit = Lower.Yield({ value = ids.fifth, carried = [ids.sixth] }),
 					}],
 					reads = [ids.first],
 				}),
@@ -391,7 +397,7 @@ pure func test_recur_last_use_records_terminal_position_with_repeats_prefix_and_
 		Ok(ids):
 			match exit_last_uses(
 				[integer(ids.fourth, 7, 40), integer(ids.fifth, 9, 50)].map(pure func(definition): Define(definition)),
-				RecurValues([ids.fifth, ids.second, ids.fourth, ids.fifth], span(60)),
+				Recur([ids.fifth, ids.second, ids.fourth, ids.fifth], span(60)),
 				2,
 				3,
 			):
@@ -408,7 +414,7 @@ pure func test_recur_last_use_does_not_invent_an_empty_terminal_operand() -> Boo
 		Ok(ids):
 			match exit_last_uses(
 				[integer(ids.first, 7, 10)].map(pure func(definition): Define(definition)),
-				RecurValues([], span(20)),
+				Recur([], span(20)),
 				0,
 				0,
 			):
@@ -426,7 +432,7 @@ pure func test_recur_last_use_rejects_a_sibling_at_the_explicit_terminal_span() 
 			last_use_rejection(
 				exit_last_uses(
 					[integer(ids.fourth, 7, 40)].map(pure func(definition): Define(definition)),
-					RecurValues([ids.third], span(60)),
+					Recur([ids.third], span(60)),
 					2,
 					3,
 				),
@@ -645,8 +651,8 @@ pure func test_distinct_owners_drop_at_their_separate_final_uses() -> Bool:
 				Ok(output):
 					match output.operations:
 						[DefineValue(_), DefineValue(first), DefineValue(second), DefineValue(first_length), DropOwner(first_drop, first_at), DefineValue(second_length), DropOwner(second_drop, second_at)]:
-							match output.tail:
-								ReturnTail(ReturnResult(UnmanagedReturn(result))):
+							match output.result:
+								UnmanagedReturn(result):
 									(
 										owns_result(first.result, 0)
 										and owns_result(second.result, 1)
@@ -690,8 +696,8 @@ pure func test_owned_return_drops_a_different_unused_owner() -> Bool:
 				Ok(output):
 					match output.operations:
 						[DefineValue(_), DefineValue(unused), DropOwner(dropped, at), DefineValue(returned)]:
-							match output.tail:
-								ReturnTail(ReturnResult(OwnedReturn(value, transferred))):
+							match output.result:
+								OwnedReturn(value, transferred):
 									(
 										owns_result(unused.result, 0)
 										and owner_number(dropped) == 0
@@ -733,8 +739,8 @@ pure func test_repeated_borrows_reuse_one_owner_without_acquisition() -> Bool:
 				Ok(output):
 					match output.operations:
 						[DefineValue(_), DefineValue(string), DefineValue(first), DefineValue(last), DropOwner(dropped, at)]:
-							match output.tail:
-								ReturnTail(ReturnResult(UnmanagedReturn(result))):
+							match output.result:
+								UnmanagedReturn(result):
 									(
 										owns_result(string.result, 0)
 										and borrows_owner(first.operation, 1, 0)
@@ -882,8 +888,8 @@ pure func test_returning_a_borrowed_parameter_acquires_an_owner() -> Bool:
 				Ok(output):
 					match output.operations:
 						[DefineValue(_), AcquireOwner(owner, borrow, _)]:
-							match output.tail:
-								ReturnTail(ReturnResult(OwnedReturn(value, returned))):
+							match output.result:
+								OwnedReturn(value, returned):
 									match borrow.source:
 										ParameterBorrow(_):
 											(
@@ -925,8 +931,8 @@ pure func test_owned_return_transfers_without_dropping() -> Bool:
 				Ok(output):
 					match output.operations:
 						[DefineValue(_), DefineValue(_)]:
-							match output.tail:
-								ReturnTail(ReturnResult(OwnedReturn(value, owner))):
+							match output.result:
+								OwnedReturn(value, owner):
 									value_number(value) == 1 and owner_number(owner) == 0
 								_:
 									False
@@ -988,120 +994,109 @@ pure func test_replacement_result_precedes_old_owner_drop() -> Bool:
 
 pure func test_managed_match_prefix_drops_in_selected_arm() -> Bool:
 	match input_ids():
-		Err(_):
-			False
+		Err(_): False
 		Ok(ids):
-			input = function(
-				[
-					ids.union_value,
-					integer(ids.second, 7, 10),
-					runtime(ids.third, Builtins.IntToString, [ids.second], StringType, 20),
-				],
-				ids.second,
-				[],
-				IntType,
-			)
-
-			match (
-				insert_function(
-					{ input | tail = MatchValue({
-							scrutinee = ids.first,
-							owner = ids.union_id,
-							arms = [
-								{
-									label = DefaultLabel,
-									body = {
-										steps = [],
-										exit = ReturnValue(ids.second)
-									}
-								},
-							],
-						}) },
-					ids.unions,
-					[],
-				)
-			):
+			input = {
+				signature = { parameters = [], return_type = IntType },
+				steps = [Loop({
+					headers = [],
+					result = { id = ids.first, value_type = IntType, span = span(90) },
+					carried = [],
+					reads = [],
+					body = {
+						steps = [
+							Define({ ids.union_value | id = ids.second }),
+							Define(integer(ids.third, 7, 10)),
+							Define(runtime(ids.fourth, Builtins.IntToString, [ids.third], StringType, 20)),
+						],
+						tail = MatchLoop({
+							selection = default_selection(ids.second),
+							arms = [{
+								id = match_arm_id(0),
+								inputs = [],
+								body = {
+									steps = [],
+									tail = Lower.ExitLoop(Break({ value = ids.third, carried = [], span = span(80) }))
+								}
+							}],
+						})
+					}
+				})],
+				result = ids.first
+			}
+			match insert_function(input, ids.unions, []):
 				Ok(owned):
-					match owned.tail:
-						MatchTail(matched):
-							match matched.arms:
-								[arm]:
-									match (arm.operations, arm.exit):
-										([DropOwner(owner, at)], ReturnResult(UnmanagedReturn(returned))):
-											(
-												owner_number(owner) == 0
-												and at.start == 20
-												and value_number(
-													returned,
-												) == value_number(ids.second)
-											)
-										_:
-											False
-								_:
-									False
-						_:
-							False
-				Err(_):
-					False
+					match owned.operations:
+						[ExecuteLoop(loop)]:
+							-- The selected arm retires the unused iteration prefix.
+							match (loop.body.operations, loop.body.tail):
+								([DefineValue(_), DefineValue(_), DefineValue(_)], Own.MatchLoop(matched)):
+									match matched.arms:
+										[arm]:
+											match (arm.body.operations, arm.body.tail):
+												([DropOwner(owner, at)], Own.ExitLoop(Own.Break(outputs))):
+													match outputs.value:
+														UnmanagedReturn(returned):
+															(
+															owner_number(owner) == 0
+															and same_span(at, span(20))
+															and value_number(returned) == 2
+														)
+														_: False
+												_: False
+										_: False
+								_: False
+						_: False
+				_: False
 
 
 pure func test_unused_managed_match_arm_value_is_dropped() -> Bool:
 	match input_ids():
-		Err(_):
-			False
+		Err(_): False
 		Ok(ids):
-			input = function(
-				[ids.union_value, integer(ids.second, 7, 10)],
-				ids.second,
-				[],
-				IntType,
-			)
-
-			match (
-				insert_function(
-					{ input | tail = MatchValue({
-							scrutinee = ids.first,
-							owner = ids.union_id,
-							arms = [
-								{
-									label = DefaultLabel,
-									body = {
-										steps = [
-											runtime(
-												ids.third,
-												Builtins.IntToString,
-												[ids.second],
-												StringType,
-												30,
-											),
-											integer(ids.fourth, 0, 40),
-										].map(pure func(definition): Define(definition)),
-										exit = ReturnValue(ids.fourth)
-									}
-								},
-							],
-						}) },
-					ids.unions,
-					[],
-				)
-			):
+			input = {
+				signature = { parameters = [], return_type = IntType },
+				steps = [Loop({
+					headers = [],
+					result = { id = ids.first, value_type = IntType, span = span(90) },
+					carried = [],
+					reads = [],
+					body = {
+						steps = [Define({ ids.union_value | id = ids.second }), Define(integer(ids.third, 7, 10))],
+						tail = MatchLoop({
+							selection = default_selection(ids.second),
+							arms = [{
+								id = match_arm_id(0),
+								inputs = [],
+								body = {
+									steps = [
+										Define(runtime(ids.fourth, Builtins.IntToString, [ids.third], StringType, 30)),
+										Define(integer(ids.fifth, 0, 40)),
+									],
+									tail = Lower.ExitLoop(Break({ value = ids.fifth, carried = [], span = span(80) }))
+								}
+							}],
+						})
+					}
+				})],
+				result = ids.first
+			}
+			match insert_function(input, ids.unions, []):
 				Ok(output):
-					match output.tail:
-						MatchTail(matched):
-							match matched.arms:
-								[arm]:
-									match arm.operations:
-										[DefineValue(_), DropOwner(owner, at), DefineValue(_)]:
-											owner_number(owner) == 0 and same_span(at, span(30))
-										_:
-											False
-								_:
-									False
-						_:
-							False
-				_:
-					False
-
+					match output.operations:
+						[ExecuteLoop(loop)]:
+							match loop.body.tail:
+								Own.MatchLoop(matched):
+									match matched.arms:
+										[arm]:
+											match arm.body.operations:
+												[DefineValue(_), DropOwner(owner, at), DefineValue(_)]:
+													owner_number(owner) == 0 and same_span(at, span(30))
+												_: False
+										_: False
+								_: False
+						_: False
+				_: False
 
 pure func test_arm_last_use_handles_offset_and_unmanaged_prefix() -> Bool:
 	match input_ids():
@@ -1160,122 +1155,85 @@ pure func test_arm_last_use_rejects_sibling_value_identity() -> Bool:
 
 pure func test_match_arms_drop_unused_owners_and_transfer_distinct_owners() -> Bool:
 	match input_ids():
-		Err(_):
-			False
+		Err(_): False
 		Ok(ids):
-			input = function(
-				[ids.union_value, integer(ids.second, 7, 20)],
-				ids.second,
-				[],
-				StringType,
-			)
-
-			match (
-				insert_function(
-					{ input | tail = MatchValue({
-							scrutinee = ids.first,
-							owner = ids.union_id,
+			input = {
+				signature = { parameters = [], return_type = StringType },
+				steps = [Loop({
+					headers = [],
+					result = { id = ids.first, value_type = StringType, span = span(90) },
+					carried = [],
+					reads = [],
+					body = {
+						steps = [Define({ ids.union_value | id = ids.second }), Define(integer(ids.third, 7, 20))],
+						tail = MatchLoop({
+							selection = binary_selection(ids.second, ids.union_id, ids.second_variant),
 							arms = [
 								{
-									label = VariantLabel(ids.second_variant),
+									id = match_arm_id(0),
+									inputs = [],
 									body = {
 										steps = [
-											runtime(
-												ids.third,
-												Builtins.IntToString,
-												[ids.second],
-												StringType,
-												30,
-											),
-											runtime(
-												ids.fourth,
-												Builtins.IntToString,
-												[ids.second],
-												StringType,
-												40,
-											),
-										].map(pure func(definition): Define(definition)),
-										exit = ReturnValue(ids.fourth)
+											Define(runtime(ids.fourth, Builtins.IntToString, [ids.third], StringType, 30)),
+											Define(runtime(ids.fifth, Builtins.IntToString, [ids.third], StringType, 40)),
+										],
+										tail = Lower.ExitLoop(Break({ value = ids.fifth, carried = [], span = span(80) }))
 									}
 								},
 								{
-									label = DefaultLabel,
+									id = match_arm_id(1),
+									inputs = [],
 									body = {
-										steps = [
-											runtime(
-												ids.fifth,
-												Builtins.IntToString,
-												[ids.second],
-												StringType,
-												50,
-											),
-										].map(pure func(definition): Define(definition)),
-										exit = ReturnValue(ids.fifth)
+										steps = [Define(runtime(ids.sixth, Builtins.IntToString, [ids.third], StringType, 50))],
+										tail = Lower.ExitLoop(Break({ value = ids.sixth, carried = [], span = span(81) }))
 									}
 								},
 							],
-						}) },
-					ids.unions,
-					[],
-				)
-			):
+						})
+					}
+				})],
+				result = ids.first
+			}
+			match insert_function(input, ids.unions, []):
 				Ok(output):
-					match output.tail:
-						MatchTail(matched):
-							match matched.arms:
-								[first, second]:
-									match first.operations:
-										[DefineValue(unused), DropOwner(dropped, at), DefineValue(returned)]:
-											match second.operations:
-												[DefineValue(other)]:
-													match first.exit:
-														ReturnResult(OwnedReturn(value, owner)):
-															match second.exit:
-																ReturnResult(OwnedReturn(other_value, other_owner)):
-																	(
-																		owns_result(
-																			unused.result,
-																			0,
-																		)
-																		and owner_number(
-																			dropped,
-																		) == 0
-																		and same_span(at, span(30))
-																		and owns_result(
-																			returned.result,
-																			1,
-																		)
-																		and value_number(value) == 3
-																		and owner_number(owner) == 1
-																		and owns_result(
-																			other.result,
-																			2,
-																		)
-																		and value_number(
-																			other_value,
-																		) == 4
-																		and owner_number(
-																			other_owner,
-																		) == 2
-																	)
-																_:
-																	False
-														_:
-															False
-												_:
-													False
-										_:
-											False
-								_:
-									False
-						_:
-							False
-				_:
-					False
-
+					match output.operations:
+						[ExecuteLoop(loop)]:
+							match loop.body.tail:
+								Own.MatchLoop(matched):
+									match matched.arms:
+										[first, second]:
+											match (first.body.operations, first.body.tail, second.body.operations, second.body.tail):
+												([DefineValue(unused), DropOwner(dropped, at), DefineValue(returned), AcquireOwner(acquired, _, _), DropOwner(retired, _)], Own.ExitLoop(Own.Break(left)), [DefineValue(other), AcquireOwner(other_acquired, _, _), DropOwner(other_retired, _)], Own.ExitLoop(Own.Break(right))):
+													match (left.value, right.value):
+														(OwnedReturn(value, owner), OwnedReturn(other_value, other_owner)):
+															(
+																owns_result(unused.result, 1)
+																and owner_number(dropped) == 1
+																and same_span(at, span(30))
+																and owns_result(returned.result, 2)
+																and value_number(value) == 4
+																and owner_number(owner) == 3
+																and owner_number(acquired) == 3
+																and owner_number(retired) == 2
+																and owns_result(other.result, 4)
+																and value_number(other_value) == 5
+																and owner_number(other_owner) == 5
+																and owner_number(other_acquired) == 5
+																and owner_number(other_retired) == 4
+															)
+														_: False
+												_: False
+										_: False
+								_: False
+						_: False
+				_: False
 
 pure func test_named_callback_return_acquires_its_borrowed_string() -> Bool:
-	match lowered(NAMED_CALLBACK_SOURCE).and_then(Own.own):
+	callback_return_acquires_its_borrowed_string(NAMED_CALLBACK_SOURCE)
+
+
+private pure func callback_return_acquires_its_borrowed_string(source: String) -> Bool:
+	match lowered(source).and_then(Own.own):
 		Err(_): False
 		Ok(program):
 			match program.functions:
@@ -1288,8 +1246,8 @@ pure func test_named_callback_return_acquires_its_borrowed_string() -> Bool:
 										UserFunction(id): function_number(id) == 1
 										_: False
 								_: False
-							match (identity.operations, identity.tail):
-								([Own.DefineValue(parameter), Own.AcquireOwner(owner, borrow, _)], Own.ReturnTail(Own.ReturnResult(Own.OwnedReturn(value, returned)))):
+							match (identity.operations, identity.result):
+								([Own.DefineValue(parameter), Own.AcquireOwner(owner, borrow, _)], Own.OwnedReturn(value, returned)):
 									match (parameter.operation, parameter.result, borrow.source):
 										(Own.ParameterDefinition(0), Own.BorrowedResult(Own.ParameterBorrow(source)), Own.ParameterBorrow(acquired)):
 											(
@@ -1304,7 +1262,11 @@ pure func test_named_callback_return_acquires_its_borrowed_string() -> Bool:
 
 
 pure func test_named_callback_invocation_transfers_the_owned_call_result() -> Bool:
-	match lowered(NAMED_CALLBACK_SOURCE).and_then(Own.own):
+	callback_invocation_transfers_the_owned_call_result(NAMED_CALLBACK_SOURCE)
+
+
+private pure func callback_invocation_transfers_the_owned_call_result(source: String) -> Bool:
+	match lowered(source).and_then(Own.own):
 		Err(_): False
 		Ok(program):
 			match program.functions:
@@ -1317,8 +1279,8 @@ pure func test_named_callback_invocation_transfers_the_owned_call_result() -> Bo
 										UserFunction(id): function_number(id) == 2
 										_: False
 								_: False
-							match (apply.operations, apply.tail):
-								([Own.DefineValue(parameter), Own.DefineValue(result)], Own.ReturnTail(Own.ReturnResult(Own.OwnedReturn(value, returned)))):
+							match (apply.operations, apply.result):
+								([Own.DefineValue(parameter), Own.DefineValue(result)], Own.OwnedReturn(value, returned)):
 									match (result.operation, result.result):
 										(Own.CallDefinition(call, [Own.BorrowedArgument(borrow)]), Own.OwnedResult(owner)):
 											match (call, borrow.source):
@@ -1336,7 +1298,11 @@ pure func test_named_callback_invocation_transfers_the_owned_call_result() -> Bo
 
 
 pure func test_unused_named_callback_result_is_dropped_once() -> Bool:
-	match lowered(NAMED_CALLBACK_SOURCE).and_then(Own.own):
+	unused_callback_result_is_dropped_once(NAMED_CALLBACK_SOURCE)
+
+
+private pure func unused_callback_result_is_dropped_once(source: String) -> Bool:
+	match lowered(source).and_then(Own.own):
 		Err(_): False
 		Ok(program):
 			match program.functions:
@@ -1358,9 +1324,24 @@ pure func test_unused_named_callback_result_is_dropped_once() -> Bool:
 				_: False
 
 
+pure func test_lambda_return_acquires_its_borrowed_string() -> Bool:
+	callback_return_acquires_its_borrowed_string(NONCAPTURING_CALLBACK_SOURCE)
+
+
+pure func test_lambda_invocation_transfers_the_owned_call_result() -> Bool:
+	callback_invocation_transfers_the_owned_call_result(NONCAPTURING_CALLBACK_SOURCE)
+
+
+pure func test_unused_lambda_result_is_dropped_once() -> Bool:
+	unused_callback_result_is_dropped_once(NONCAPTURING_CALLBACK_SOURCE)
+
+
 tests: TestSuite = {
 	description = "Blorp 2 ownership insertion",
 	tests = [
+		("lambda String return acquires its borrowed parameter", test_lambda_return_acquires_its_borrowed_string),
+		("lambda invocation transfers its owned direct-call result", test_lambda_invocation_transfers_the_owned_call_result),
+		("unused lambda result is dropped exactly once", test_unused_lambda_result_is_dropped_once),
 		("unused named owned result is dropped exactly once", test_unused_named_callback_result_is_dropped_once),
 		("named callback String return acquires borrowed parameter", test_named_callback_return_acquires_its_borrowed_string),
 		("named invocation returns its owned direct-call result", test_named_callback_invocation_transfers_the_owned_call_result),

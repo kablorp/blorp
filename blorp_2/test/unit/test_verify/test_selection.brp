@@ -1,0 +1,395 @@
+import:
+	../../../src/utils/source: module_source, root_module_id
+	../../../src/utils/names: program_names
+	../../../src/lex/lex: lex
+	../../../src/parse/parse: parse_module
+	system: read_file
+	../../../src/check/model as Model
+	../../../src/lower/lower as Lower
+	../../../src/own/own as Own
+	../../../src/specialize/specialize as Concrete
+	../../../src/utils/syntax as Syntax
+	../../../src/verify/verify: verify
+	../ownership_inputs: InputIds, input_ids, span
+	test: TestSuite
+
+
+-- Only opaque identities come from the seed. Layout, edges, acquisitions,
+-- transfers and the common body below are authored independently of Own.
+private pure func raw_program(ids: InputIds, different_ordinal: Bool) -> Result[Own.OwnershipProgram, Syntax.Diagnostic]:
+	left ?= match ids.union_value.operation:
+		Lower.ConstructValue(variant, []): Ok(variant)
+		_: Err({ span = span(0), note = None, message = "invalid selection seed", help = "supply the payload-free union seed" })
+	right_fields = if different_ordinal:
+		[Concrete.IntType, Concrete.StringType]
+	else:
+		[Concrete.StringType]
+	right_ordinal = if different_ordinal:
+		1
+	else:
+		0
+	unions = ids.unions.set(Concrete.union_number(ids.union_id), {
+		variants = [[Concrete.StringType], right_fields], representation = Concrete.InlineOwningPayload
+	})
+	left_field ?= Concrete.variant_field(left, 0, unions, span(12))
+	right_field ?= Concrete.variant_field(ids.second_variant, right_ordinal, unions, span(10))
+	root: Own.BorrowedValue = { value = ids.first, source = Own.ParameterBorrow(ids.first) }
+	right: Own.OwnedSelectionEdge = {
+		arm = Model.match_arm_id(0),
+		operations = [
+			Own.DefineValue({ id = ids.third, value_type = Concrete.StringType, span = span(10),
+				operation = Own.PayloadDefinition(right_field, ids.first),
+				result = Own.BorrowedResult(Own.PayloadBorrow(ids.first)) }),
+			Own.AcquireOwner(Own.owner_id(1), { value = ids.third, source = Own.PayloadBorrow(ids.first) }, span(11)),
+		],
+		transfers = [Own.OwnedReturn(ids.third, Own.owner_id(1))]
+	}
+	left_edge: Own.OwnedSelectionEdge = {
+		arm = Model.match_arm_id(0),
+		operations = [
+			Own.DefineValue({ id = ids.fourth, value_type = Concrete.StringType, span = span(12),
+				operation = Own.PayloadDefinition(left_field, ids.first),
+				result = Own.BorrowedResult(Own.PayloadBorrow(ids.first)) }),
+			Own.AcquireOwner(Own.owner_id(2), { value = ids.fourth, source = Own.PayloadBorrow(ids.first) }, span(13)),
+		],
+		transfers = [Own.OwnedReturn(ids.fourth, Own.owner_id(2))]
+	}
+	join: Own.OwnedJoin = {
+		result = Own.ManagedJoinParameter({ id = ids.second, value_type = Concrete.StringType, span = span(2) }, Own.owner_id(0)),
+		carried = [],
+		selection = {
+			scrutinee = Own.BorrowedArgument(root),
+			nodes = [Own.EnterArm(right), Own.EnterArm(left_edge), Own.TestVariant(
+				{ value_type = Concrete.UnionType(ids.union_id), route = Concrete.MatchRoot }, left,
+				Model.decision_node_id(1), Model.decision_node_id(0)
+			)],
+			entry = Model.decision_node_id(2)
+		},
+		arms = [{ id = Model.match_arm_id(0),
+			inputs = [Own.ManagedJoinParameter({ id = ids.fifth, value_type = Concrete.StringType, span = span(14) }, Own.owner_id(3))],
+			operations = [], exit = Own.Yield({ transfer = Own.OwnedReturn(ids.fifth, Own.owner_id(3)), carried = [] }) }]
+	}
+	Ok({ records = [], unions = unions,
+		entrypoint = Syntax.NoArguments(ids.entrypoint, Syntax.IntegerExitStatus),
+		functions = [
+			{ signature = { parameters = [], return_type = Concrete.IntType },
+				operations = [Own.DefineValue({ id = ids.first, value_type = Concrete.IntType, operation = Own.IntegerDefinition(0), result = Own.UnmanagedResult, span = span(0) })],
+				result = Own.UnmanagedReturn(ids.first) },
+			{ signature = { parameters = [Concrete.UnionType(ids.union_id)], return_type = Concrete.StringType },
+				operations = [Own.DefineValue({ id = ids.first, value_type = Concrete.UnionType(ids.union_id), operation = Own.ParameterDefinition(0), result = Own.BorrowedResult(Own.ParameterBorrow(ids.first)), span = span(1) }), Own.ExecuteJoin(join)],
+				result = Own.OwnedReturn(ids.second, Own.owner_id(0)) }
+		] })
+
+
+private pure func rewrite(
+	program: Own.OwnershipProgram,
+	change: pure (Own.OwnedJoin) -> Own.OwnedJoin,
+) -> Own.OwnershipProgram:
+	functions = program.functions.map(pure func(function):
+		operations = function.operations.map(pure func(operation):
+			match operation:
+				Own.ExecuteJoin(join): Own.ExecuteJoin(change(join))
+				_: operation
+		)
+		{ function | operations = operations }
+	)
+	{ program | functions = functions }
+
+
+private pure func change_first_edge(
+	join: Own.OwnedJoin,
+	change: pure (Own.OwnedSelectionEdge) -> Own.OwnedSelectionEdge,
+) -> Own.OwnedJoin:
+	match join.selection.nodes:
+		[Own.EnterArm(first), second, test]:
+			{ join | selection = { join.selection | nodes = [Own.EnterArm(change(first)), second, test] } }
+		_: join
+
+
+private pure func rejected(
+	change: pure (Own.OwnedJoin) -> Own.OwnedJoin,
+	message: String,
+	at: Int,
+) -> Bool:
+	match input_ids():
+		Err(_): False
+		Ok(ids):
+			match raw_program(ids, True):
+				Err(_): False
+				Ok(program):
+					match verify(rewrite(program, change)):
+						Ok(_): False
+						Err(error):
+							error.message == "ownership verification failed: " + message and error.help == "report this compiler error with the input program" and error.note.is_none() and Syntax.same_span(error.span, span(at))
+
+
+pure func test_alternatives_share_one_managed_input_at_same_ordinal() -> Bool:
+	match input_ids():
+		Err(_): False
+		Ok(ids): raw_program(ids, False).and_then(verify).is_ok()
+
+
+pure func test_alternatives_share_one_managed_input_at_different_ordinals() -> Bool:
+	match input_ids():
+		Err(_): False
+		Ok(ids): raw_program(ids, True).and_then(verify).is_ok()
+
+
+pure func test_unknown_arm_is_rejected() -> Bool:
+	rejected(pure func(join): change_first_edge(join, pure func(edge): { edge | arm = Model.match_arm_id(9) }), "selection enters an unknown arm", 1)
+
+
+pure func test_edge_argument_arity_is_rejected() -> Bool:
+	rejected(pure func(join): change_first_edge(join, pure func(edge): { edge | transfers = [] }), "selection edge argument count does not match its arm inputs", 1)
+
+
+pure func test_edge_without_acquire_is_rejected() -> Bool:
+	change_edge = pure func(edge: Own.OwnedSelectionEdge) -> Own.OwnedSelectionEdge:
+		operations = edge.operations.filter(pure func(operation):
+			match operation:
+				Own.AcquireOwner(_, _, _): False
+				_: True
+		)
+		{ edge | operations = operations }
+	rejected(pure func(join): change_first_edge(join, change_edge), "owner 1 is not defined", 1)
+
+pure func test_missing_canonical_input_owner_is_rejected() -> Bool:
+	rejected(pure func(join):
+		arms = join.arms.map(pure func(arm):
+			inputs = arm.inputs.map(pure func(input): Own.UnmanagedJoinParameter(Own.join_parameter(input)))
+			{ arm | inputs = inputs }
+		)
+		{ join | arms = arms }
+	, "managed result requires an owner", 14)
+
+
+pure func test_edge_local_owner_leak_is_rejected() -> Bool:
+	change_edge = pure func(edge: Own.OwnedSelectionEdge) -> Own.OwnedSelectionEdge:
+		match edge.operations:
+			[definition, Own.AcquireOwner(_, borrow, at)]:
+				{ edge | operations = [definition, Own.AcquireOwner(Own.owner_id(1), borrow, at), Own.AcquireOwner(Own.owner_id(2), borrow, at)] }
+			_: edge
+	rejected(pure func(join): change_first_edge(join, change_edge), "owner 2 remains live at yield", 1)
+
+pure func test_double_edge_transfer_is_rejected() -> Bool:
+	rejected(pure func(join):
+		changed = change_first_edge(join, pure func(edge): { edge | transfers = edge.transfers + edge.transfers })
+		arms = changed.arms.map(pure func(arm): { arm | inputs = arm.inputs + arm.inputs })
+		{ changed | arms = arms }
+	, "yield refers to discharged owner 1", 1)
+
+
+pure func test_backward_node_contract_rejects_cycles() -> Bool:
+	rejected(pure func(join):
+		nodes = join.selection.nodes.map(pure func(node):
+			match node:
+				Own.TestVariant(place, variant, _, no): Own.TestVariant(place, variant, Model.decision_node_id(2), no)
+				_: node
+		)
+		selection = { join.selection | nodes = nodes }
+		{ join | selection = selection }
+	, "selection successor is not an earlier node", 1)
+
+
+pure func test_out_of_range_node_is_rejected() -> Bool:
+	rejected(pure func(join): { join | selection = { join.selection | entry = Model.decision_node_id(99) } }, "selection entry is not a node", 1)
+
+
+pure func test_unreachable_node_is_rejected() -> Bool:
+	rejected(pure func(join): { join | selection = { join.selection | entry = Model.decision_node_id(0) } }, "selection contains an unreachable node", 1)
+
+
+pure func test_shared_node_requires_guard_on_all_incoming_paths() -> Bool:
+	rejected(pure func(join):
+		match join.selection.nodes:
+			[edge, _, Own.TestVariant(place, variant, _, _)]:
+				{ join | selection = { join.selection | nodes = [edge, Own.TestVariant(place, variant, Model.decision_node_id(0), Model.decision_node_id(0))], entry = Model.decision_node_id(1) } }
+			_: join
+	, "payload projection outside its selected match arm", 10)
+
+
+pure func test_other_variant_payload_is_rejected() -> Bool:
+	rejected(pure func(join):
+		match join.selection.nodes:
+			[Own.EnterArm(edge), Own.EnterArm(other), _]:
+				match other.operations:
+					[Own.DefineValue(other_definition), _]:
+						change_first_edge(join, pure func(first):
+							operations = first.operations.map(pure func(operation):
+								match operation:
+									Own.DefineValue(definition): Own.DefineValue({ definition | operation = other_definition.operation })
+									_: operation
+							)
+							{ first | operations = operations }
+						)
+					_: join
+			_: join
+	, "payload projection does not belong to this match arm", 10)
+
+
+private pure func with_owned_root(program: Own.OwnershipProgram, ids: InputIds) -> Own.OwnershipProgram:
+	borrow: Own.BorrowedValue = { value = ids.first, source = Own.ParameterBorrow(ids.first) }
+	changed = rewrite(program, pure func(join):
+		nodes = join.selection.nodes.map(pure func(node):
+			match node:
+				Own.TestVariant(_, _, _, _) | Own.TestListLength(_, _, _, _) | Own.TestStringBytes(_, _, _, _): node
+				Own.EnterArm(edge):
+					operations = edge.operations.map(pure func(operation):
+						match operation:
+							Own.AcquireOwner(owner, source, at): Own.AcquireOwner(Own.owner_id(Own.owner_number(owner) + 1), source, at)
+							_: operation
+					)
+					transfers = edge.transfers.map(pure func(transfer):
+						match transfer:
+							Own.OwnedReturn(value, owner): Own.OwnedReturn(value, Own.owner_id(Own.owner_number(owner) + 1))
+							_: transfer
+					)
+					Own.EnterArm({ edge | operations = operations, transfers = transfers })
+		)
+		selection = { join.selection | scrutinee = Own.BorrowedArgument({ value = ids.first, source = Own.OwnerBorrow(Own.owner_id(0)) }), nodes = nodes }
+		arms = join.arms.map(pure func(arm):
+			inputs = arm.inputs.map(pure func(input): Own.ManagedJoinParameter(Own.join_parameter(input), Own.owner_id(4)))
+			{ arm | inputs = inputs, exit = Own.Yield({ transfer = Own.OwnedReturn(ids.fifth, Own.owner_id(4)), carried = [] }) }
+		)
+		{ join | selection = selection, result = Own.ManagedJoinParameter(Own.join_parameter(join.result), Own.owner_id(1)), arms = arms }
+	)
+	functions = changed.functions.map(pure func(function):
+		match function.operations:
+			[definition, Own.ExecuteJoin(join)]:
+				{ function | operations = [definition, Own.AcquireOwner(Own.owner_id(0), borrow, span(3)), Own.ExecuteJoin(join), Own.DropOwner(Own.owner_id(0), span(4))],
+					result = Own.OwnedReturn(ids.second, Own.owner_id(1)) }
+			_: function
+	)
+	{ changed | functions = functions }
+
+
+private pure func reject_owned_root(
+	change: pure (Own.OwnershipProgram) -> Own.OwnershipProgram,
+	message: String,
+	at: Int,
+) -> Bool:
+	match input_ids():
+		Err(_): False
+		Ok(ids):
+			match raw_program(ids, True):
+				Err(_): False
+				Ok(raw):
+					program = with_owned_root(raw, ids)
+					match verify(change(program)):
+						Ok(_): False
+						Err(error): verify(program).is_ok() and error.message == "ownership verification failed: " + message and Syntax.same_span(error.span, span(at)) and error.help == "report this compiler error with the input program" and error.note.is_none()
+
+
+pure func test_edge_cannot_consume_enclosing_owner() -> Bool:
+	change_edge = pure func(edge: Own.OwnedSelectionEdge) -> Own.OwnedSelectionEdge:
+		{ edge | operations = [Own.DropOwner(Own.owner_id(0), span(8))] + edge.operations }
+	change_join = pure func(join: Own.OwnedJoin) -> Own.OwnedJoin: change_first_edge(join, change_edge)
+	reject_owned_root(pure func(program): rewrite(program, change_join), "selection edge contains an operation outside its local projections", 1)
+
+pure func test_selection_root_must_remain_live() -> Bool:
+	reject_owned_root(pure func(program):
+		functions = program.functions.map(pure func(function):
+			match function.operations:
+				[definition, acquisition, Own.ExecuteJoin(join), drop]:
+					{ function | operations = [definition, acquisition, Own.DropOwner(Own.owner_id(0), span(5)), Own.ExecuteJoin(join), drop] }
+				_: function
+		)
+		{ program | functions = functions }
+	, "borrow refers to discharged owner 0", 2)
+
+
+pure func test_edge_argument_type_must_match_canonical_input() -> Bool:
+	rejected(pure func(join):
+		arms = join.arms.map(pure func(arm):
+			inputs = arm.inputs.map(pure func(input): Own.UnmanagedJoinParameter({ Own.join_parameter(input) | value_type = Concrete.IntType }))
+			{ arm | inputs = inputs }
+		)
+		{ join | arms = arms }
+	, "yield type does not match its join", 1)
+
+
+pure func test_single_variant_direct_entry_proves_its_payload() -> Bool:
+	match input_ids():
+		Err(_): False
+		Ok(ids):
+			match raw_program(ids, False):
+				Err(_): False
+				Ok(program):
+					changed = rewrite(program, pure func(join):
+						match join.selection.nodes:
+							[_, Own.EnterArm(left), _]:
+								operations = left.operations.map(pure func(operation):
+									match operation:
+										Own.DefineValue(definition): Own.DefineValue({ definition | id = ids.third })
+										Own.AcquireOwner(_, _, at): Own.AcquireOwner(Own.owner_id(1), { value = ids.third, source = Own.PayloadBorrow(ids.first) }, at)
+										_: operation
+								)
+								arms = join.arms.map(pure func(arm):
+									{ arm | inputs = [Own.ManagedJoinParameter({ id = ids.fourth, value_type = Concrete.StringType, span = span(14) }, Own.owner_id(2))], exit = Own.Yield({ transfer = Own.OwnedReturn(ids.fourth, Own.owner_id(2)), carried = [] }) }
+								)
+								selection = { join.selection | nodes = [Own.EnterArm({ left | operations = operations, transfers = [Own.OwnedReturn(ids.third, Own.owner_id(1))] })], entry = Model.decision_node_id(0) }
+								{ join | selection = selection, arms = arms }
+							_: join
+					)
+					verify({ changed | unions = changed.unions.set(Concrete.union_number(ids.union_id), { variants = [[Concrete.StringType]], representation = Concrete.InlineOwningPayload }) }).is_ok()
+
+
+pure func test_edge_local_value_cannot_escape_into_common_body() -> Bool:
+	rejected(pure func(join):
+		match join.selection.nodes:
+			[Own.EnterArm(edge), _, _]:
+				match edge.transfers:
+					[Own.OwnedReturn(value, _)]:
+						arms = join.arms.map(pure func(arm): { arm | exit = Own.Yield({ transfer = Own.OwnedReturn(value, Own.owner_id(3)), carried = [] }) })
+						{ join | arms = arms }
+					_: join
+			_: join
+	, "value 2 is not defined before use", 2)
+
+
+pure func test_non_dense_canonical_arm_identity_is_rejected() -> Bool:
+	rejected(pure func(join):
+		nodes = join.selection.nodes.map(pure func(node):
+			match node:
+				Own.EnterArm(edge): Own.EnterArm({ edge | arm = Model.match_arm_id(9) })
+				_: node
+		)
+		selection = { join.selection | nodes = nodes }
+		arms = join.arms.map(pure func(arm): { arm | id = Model.match_arm_id(9) })
+		{ join | selection = selection, arms = arms }
+	, "selection arm identity is not its source ordinal", 1)
+
+
+func test_changed_verify_production_parses_in_target() -> Bool:
+	match read_file("blorp_2/src/verify/verify.brp"):
+		Err(_): False
+		Ok(source):
+			lex(module_source(root_module_id()), source, program_names().names)
+				.and_then(pure func(tokens): parse_module(tokens, root_module_id())).is_ok()
+
+
+tests: TestSuite = {
+	description = "Verify structural selection",
+	tests = [
+		("Verify module uses target grammar", test_changed_verify_production_parses_in_target),
+		("canonical arm identity is dense", test_non_dense_canonical_arm_identity_is_rejected),
+		("edge local cannot escape", test_edge_local_value_cannot_escape_into_common_body),
+		("single variant direct entry", test_single_variant_direct_entry_proves_its_payload),
+		("enclosing owner preserved on entry", test_edge_cannot_consume_enclosing_owner),
+		("source root remains live", test_selection_root_must_remain_live),
+		("edge input type", test_edge_argument_type_must_match_canonical_input),
+		("same ordinal alternatives", test_alternatives_share_one_managed_input_at_same_ordinal),
+		("different ordinal alternatives", test_alternatives_share_one_managed_input_at_different_ordinals),
+		("unknown canonical arm", test_unknown_arm_is_rejected),
+		("edge input arity", test_edge_argument_arity_is_rejected),
+		("edge requires acquisition", test_edge_without_acquire_is_rejected),
+		("canonical input requires owner", test_missing_canonical_input_owner_is_rejected),
+		("edge owners cannot leak", test_edge_local_owner_leak_is_rejected),
+		("edge owner cannot transfer twice", test_double_edge_transfer_is_rejected),
+		("decision cycle", test_backward_node_contract_rejects_cycles),
+		("unknown decision node", test_out_of_range_node_is_rejected),
+		("unreachable decision node", test_unreachable_node_is_rejected),
+		("shared guard intersection", test_shared_node_requires_guard_on_all_incoming_paths),
+		("unrelated variant projection", test_other_variant_payload_is_rejected),
+	]
+}

@@ -1,10 +1,13 @@
 import:
+	../../../src/check/model as Model
+	./selection_inputs as Selection
 	../../../src/lower/lower as Lower
 	../../../src/own/own as Own
 	../../../src/utils/source: compiler_source, same_source
 	../../../src/utils/syntax: Diagnostic, Span
 	../../../src/verify/verify: verify
-	../managed_union_inputs: lowered
+	../managed_union_inputs: lowered, lowered_tail_join
+	../ownership_inputs: InputIds, input_ids
 	test: TestSuite
 
 
@@ -31,7 +34,7 @@ private fixed union RawCase:
 	MissingFirstDrop
 	MissingSecondDrop
 	DoubleFirstDrop
-	WrongPrefixReturn
+	DirectPrefixTransfer
 	EarlyParentDrop
 	SiblingOwner
 	UndefinedOwner
@@ -60,22 +63,23 @@ private pure func seed_error() -> Diagnostic:
 
 
 private pure func raw_arm(
-	arm: Lower.LoweredArm,
+	arm: Lower.JoinArm,
+	identity: Lower.ValueId,
 	parent: Lower.ValueId,
 	ordinal: Int,
 	case: RawCase,
-) -> Result[Own.OwnedArm, Diagnostic]:
+) -> Result[Own.OwnedLoopArm, Diagnostic]:
 	at = if ordinal == 1:
 		span(20)
 	else:
 		span(30)
 
-	match arm.body.steps:
+	match arm.steps:
 		[Lower.Define(child)]:
 			match child.operation:
 				Lower.ReadRecordFieldValue(field, _):
-					root = Own.owner_id(0)
-					acquired = Own.owner_id(ordinal)
+					root = Own.owner_id(1)
+					acquired = Own.owner_id(ordinal + 1)
 					var operations: List[Own.OwnershipOperation] = []
 
 					match case:
@@ -86,7 +90,7 @@ private pure func raw_arm(
 							void
 
 					operations = operations.append(Own.DefineValue({
-						id = child.id,
+						id = identity,
 						value_type = child.value_type,
 						operation = Own.ReadRecordFieldDefinition(
 							field,
@@ -110,7 +114,7 @@ private pure func raw_arm(
 							Own.AcquireOwner(
 								acquired,
 								{
-									value = child.id,
+									value = identity,
 									source = Own.PayloadBorrow(parent)
 								},
 								at,
@@ -118,7 +122,7 @@ private pure func raw_arm(
 						)
 
 					missing = match case:
-						MissingFirstDrop | WrongPrefixReturn:
+						MissingFirstDrop | DirectPrefixTransfer:
 							ordinal == 1
 						MissingSecondDrop:
 							ordinal == 2
@@ -134,7 +138,7 @@ private pure func raw_arm(
 								operations = operations.append(Own.DropOwner(root, at))
 						SiblingOwner:
 							if ordinal == 2:
-								operations = operations.append(Own.DropOwner(Own.owner_id(1), at))
+								operations = operations.append(Own.DropOwner(Own.owner_id(2), at))
 						UndefinedOwner:
 							if ordinal == 1:
 								operations = operations.append(Own.DropOwner(Own.owner_id(99), at))
@@ -142,7 +146,7 @@ private pure func raw_arm(
 							void
 
 					returned = match case:
-						WrongPrefixReturn:
+						DirectPrefixTransfer:
 							if ordinal == 1:
 								root
 							else:
@@ -151,15 +155,11 @@ private pure func raw_arm(
 							acquired
 
 					transfer = if escaping_borrow:
-						Own.UnmanagedReturn(child.id)
+						Own.UnmanagedReturn(identity)
 					else:
-						Own.OwnedReturn(child.id, returned)
+						Own.OwnedReturn(identity, returned)
 
-					Ok({
-						label = arm.label,
-						operations = operations,
-						exit = Own.ReturnResult(transfer),
-					})
+					Ok({ id = arm.id, inputs = [], body = { operations = operations, tail = Own.ExitLoop(Own.Break({ value = transfer, carried = [], span = at })) } })
 				_:
 					Err(seed_error())
 		_:
@@ -169,39 +169,47 @@ private pure func raw_arm(
 private pure func raw_function(
 	function: Lower.LoweredFunction,
 	seed: Lower.LoweredFunctions,
+	values: InputIds,
 	case: RawCase,
 ) -> Result[Own.OwnedFunction, Diagnostic]:
-	match function.tail:
-		Lower.ExitValue(_):
+	match lowered_tail_join(function):
+		None:
 			Own.insert_function(function, seed.unions, seed.records)
-		Lower.MatchValue(matched):
+		Some(matched):
 			match (function.steps, matched.arms):
-				([Lower.Define(parameter), Lower.Define(parent)], [first, second]):
+				([Lower.Define(parameter), Lower.Define(parent), Lower.Join(_)], [first, second]):
 					match parent.operation:
 						Lower.CallValue(call, []):
-							left ?= raw_arm(first, parent.id, 1, case)
-							right ?= raw_arm(second, parent.id, 2, case)
+							left ?= raw_arm(first, values.fourth, values.third, 1, case)
+							right ?= raw_arm(second, values.fifth, values.third, 2, case)
 							Ok({
-								execution = function.execution,
 								signature = function.signature,
 								operations = [Own.DefineValue({
-										id = parameter.id,
+										id = values.first,
 										value_type = parameter.value_type,
 										operation = Own.ParameterDefinition(0),
 										result = Own.UnmanagedResult,
 										span = parameter.span,
-									}), Own.DefineValue({
-										id = parent.id,
-										value_type = parent.value_type,
-										operation = Own.CallDefinition(call, []),
-										result = Own.OwnedResult(Own.owner_id(0)),
-										span = parent.span,
+									}), Own.ExecuteLoop({
+										entry_acquisitions = [],
+										headers = [],
+										result = Own.ManagedJoinParameter({ id = values.second, value_type = function.signature.return_type, span = span(40) }, Own.owner_id(0)),
+										carried = [],
+										body = {
+											operations = [Own.DefineValue({
+												id = values.third,
+												value_type = parent.value_type,
+												operation = Own.CallDefinition(call, []),
+												result = Own.OwnedResult(Own.owner_id(1)),
+												span = parent.span,
+											})],
+											tail = Own.MatchLoop({
+												selection = Selection.empty_from_lower(matched.selection, Own.UnmanagedArgument(values.first)),
+												arms = [left, right],
+											}),
+										},
 									})],
-								tail = Own.MatchTail({
-									scrutinee = Own.UnmanagedArgument(matched.scrutinee),
-									owner = matched.owner,
-									arms = [left, right],
-								}),
+								result = Own.OwnedReturn(values.second, Own.owner_id(0)),
 							})
 						_:
 							Err(seed_error())
@@ -212,13 +220,14 @@ private pure func raw_function(
 -- Lowering supplies sealed identities and nominal types only. The target match's
 -- prefix, acquisitions, drops and returns are authored independently here.
 private pure func raw_program(case: RawCase) -> Result[Own.OwnershipProgram, Diagnostic]:
+	ids ?= input_ids()
 	lowered ?= lowered(SOURCE)
 	seed = Lower.lowered_functions(lowered)
 	var functions: List[Own.OwnedFunction] = []
 	var invalid: Option[Diagnostic] = None
 
 	for function in seed.functions:
-		built = raw_function(function, seed, case)
+		built = raw_function(function, seed, ids, case)
 
 		match built:
 			Ok(function):
@@ -263,27 +272,27 @@ pure func test_independent_arm_prefix_discharge_is_valid() -> Bool:
 
 
 pure func test_first_arm_must_discharge_prefix() -> Bool:
-	rejects(MissingFirstDrop, "owner 0 remains live at return", 20)
+	rejects(MissingFirstDrop, "loop-local owner remains live at an edge", 20)
 
 
 pure func test_second_arm_must_discharge_prefix() -> Bool:
-	rejects(MissingSecondDrop, "owner 0 remains live at return", 30)
+	rejects(MissingSecondDrop, "loop-local owner remains live at an edge", 30)
 
 
 pure func test_prefix_cannot_be_dropped_twice() -> Bool:
-	rejects(DoubleFirstDrop, "owner 0 has already been discharged", 20)
+	rejects(DoubleFirstDrop, "owner 1 has already been discharged", 20)
 
 
-pure func test_prefix_owner_must_own_returned_value() -> Bool:
-	rejects(WrongPrefixReturn, "returned owner does not own the returned value", 20)
+pure func test_loop_output_requires_a_fresh_acquisition() -> Bool:
+	rejects(DirectPrefixTransfer, "loop transfer must use a fresh acquisition", 20)
 
 
 pure func test_parent_must_be_live_at_projection() -> Bool:
-	rejects(EarlyParentDrop, "borrow refers to discharged owner 0", 20)
+	rejects(EarlyParentDrop, "borrow refers to discharged owner 1", 20)
 
 
 pure func test_sibling_owner_gap_is_unavailable() -> Bool:
-	rejects(SiblingOwner, "owner 1 is not available in this match arm", 30)
+	rejects(SiblingOwner, "owner 2 is not available in this match arm", 30)
 
 
 pure func test_unintroduced_owner_is_rejected() -> Bool:
@@ -291,7 +300,7 @@ pure func test_unintroduced_owner_is_rejected() -> Bool:
 
 
 pure func test_borrowed_child_cannot_escape_without_owner() -> Bool:
-	rejects(BorrowedEscape, "managed return requires an owner transfer", 20)
+	rejects(BorrowedEscape, "managed yield requires an owner transfer", 20)
 
 
 private STORED_PREFIX_SOURCE: String =
@@ -316,35 +325,34 @@ private fixed union PrefixSlots:
 
 
 private pure func raw_stored_prefix_arm(
-	arm: Lower.LoweredArm,
+	arm: Lower.JoinArm,
+	identity: Lower.ValueId,
+	text: Lower.ValueId,
 	second: Own.OwnerId,
 	introduced: Own.OwnerId,
+	outgoing: Own.OwnerId,
 	at: Int,
-) -> Result[Own.OwnedArm, Diagnostic]:
-	match arm.body.steps:
+) -> Result[Own.OwnedLoopArm, Diagnostic]:
+	match arm.steps:
 		[Lower.Define(constructed)]:
 			match constructed.operation:
 				Lower.ConstructRecordValue(owner, [left, right]):
-					Ok({
-						label = arm.label,
-						operations = [Own.DefineValue({
-							id = constructed.id,
+					Ok({ id = arm.id, inputs = [], body = { operations = [Own.DefineValue({
+							id = identity,
 							value_type = constructed.value_type,
 							operation = Own.ConstructRecordDefinition(owner, [
 								{
 									field = left.field,
-									value = Own.OwnedPayload(left.value, Own.owner_id(0)),
+									value = Own.OwnedPayload(text, Own.owner_id(1)),
 								},
 								{
 									field = right.field,
-									value = Own.OwnedPayload(right.value, second),
+									value = Own.OwnedPayload(text, second),
 								},
 							]),
 							result = Own.OwnedResult(introduced),
 							span = span(at),
-						})],
-						exit = Own.ReturnResult(Own.OwnedReturn(constructed.id, introduced)),
-					})
+						}), Own.AcquireOwner(outgoing, { value = identity, source = Own.OwnerBorrow(introduced) }, span(at)), Own.DropOwner(introduced, span(at))], tail = Own.ExitLoop(Own.Break({ value = Own.OwnedReturn(identity, outgoing), carried = [], span = span(at) })) } })
 				_:
 					Err(seed_error())
 		_:
@@ -354,65 +362,79 @@ private pure func raw_stored_prefix_arm(
 private pure func raw_stored_prefix_function(
 	function: Lower.LoweredFunction,
 	seed: Lower.LoweredFunctions,
+	values: InputIds,
 	slots: PrefixSlots,
 ) -> Result[Own.OwnedFunction, Diagnostic]:
-	match function.tail:
-		Lower.ExitValue(_):
+	match lowered_tail_join(function):
+		None:
 			Own.insert_function(function, seed.unions, seed.records)
-		Lower.MatchValue(matched):
+		Some(matched):
 			match (function.steps, matched.arms):
-				([Lower.Define(parameter), Lower.Define(text)], [first, second]):
+				([Lower.Define(parameter), Lower.Define(text), Lower.Join(_)], [first, second]):
 					match text.operation:
 						Lower.StringValue(contents):
 							var operations = [Own.DefineValue({
-									id = parameter.id,
-									value_type = parameter.value_type,
-									operation = Own.ParameterDefinition(0),
-									result = Own.UnmanagedResult,
-									span = span(10),
-								}), Own.DefineValue({
-									id = text.id,
+									id = values.third,
 									value_type = text.value_type,
 									operation = Own.StringDefinition(contents),
-									result = Own.OwnedResult(Own.owner_id(0)),
+									result = Own.OwnedResult(Own.owner_id(1)),
 									span = span(11),
 								})]
 
 							second_slot = match slots:
 								DistinctSlots:
 									operations = operations.append(Own.AcquireOwner(
-										Own.owner_id(1),
+										Own.owner_id(2),
 										{
-											value = text.id,
-											source = Own.OwnerBorrow(Own.owner_id(0)),
+											value = values.third,
+											source = Own.OwnerBorrow(Own.owner_id(1)),
 										},
 										span(12),
 									))
-									1
+									2
 								DuplicateSlot:
-									0
+									1
 
 							left ?= raw_stored_prefix_arm(
 								first,
+								values.fourth,
+								values.third,
 								Own.owner_id(second_slot),
 								Own.owner_id(second_slot + 1),
+								Own.owner_id(second_slot + 2),
 								20,
 							)
 							right ?= raw_stored_prefix_arm(
 								second,
+								values.fifth,
+								values.third,
 								Own.owner_id(second_slot),
-								Own.owner_id(second_slot + 2),
+								Own.owner_id(second_slot + 3),
+								Own.owner_id(second_slot + 4),
 								30,
 							)
 							Ok({
-								execution = function.execution,
 								signature = function.signature,
-								operations = operations,
-								tail = Own.MatchTail({
-									scrutinee = Own.UnmanagedArgument(matched.scrutinee),
-									owner = matched.owner,
-									arms = [left, right],
-								}),
+								operations = [Own.DefineValue({
+										id = values.first,
+										value_type = parameter.value_type,
+										operation = Own.ParameterDefinition(0),
+										result = Own.UnmanagedResult,
+										span = span(10),
+									}), Own.ExecuteLoop({
+										entry_acquisitions = [],
+										headers = [],
+										result = Own.ManagedJoinParameter({ id = values.second, value_type = function.signature.return_type, span = span(40) }, Own.owner_id(0)),
+										carried = [],
+										body = {
+											operations = operations,
+											tail = Own.MatchLoop({
+												selection = Selection.empty_from_lower(matched.selection, Own.UnmanagedArgument(values.first)),
+												arms = [left, right],
+											}),
+										},
+									})],
+								result = Own.OwnedReturn(values.second, Own.owner_id(0)),
 							})
 						_:
 							Err(seed_error())
@@ -425,13 +447,14 @@ private pure func raw_stored_prefix_function(
 private pure func raw_stored_prefix_program(
 	slots: PrefixSlots,
 ) -> Result[Own.OwnershipProgram, Diagnostic]:
+	ids ?= input_ids()
 	lowered ?= lowered(STORED_PREFIX_SOURCE)
 	seed = Lower.lowered_functions(lowered)
 	var functions: List[Own.OwnedFunction] = []
 	var invalid: Option[Diagnostic] = None
 
 	for function in seed.functions:
-		match raw_stored_prefix_function(function, seed, slots):
+		match raw_stored_prefix_function(function, seed, ids, slots):
 			Ok(owned):
 				functions = functions.append(owned)
 			Err(error):
@@ -484,7 +507,7 @@ tests: TestSuite = {
 		("first arm prefix leak", test_first_arm_must_discharge_prefix),
 		("second arm prefix leak", test_second_arm_must_discharge_prefix),
 		("prefix double drop", test_prefix_cannot_be_dropped_twice),
-		("prefix owner wrong returned value", test_prefix_owner_must_own_returned_value),
+		("loop output requires a fresh acquisition", test_loop_output_requires_a_fresh_acquisition),
 		("projection after prefix parent drop", test_parent_must_be_live_at_projection),
 		("sibling owner gap", test_sibling_owner_gap_is_unavailable),
 		("unintroduced owner", test_unintroduced_owner_is_rejected),

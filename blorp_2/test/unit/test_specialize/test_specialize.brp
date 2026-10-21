@@ -1,12 +1,13 @@
 import:
 	../../../src/utils/names: program_names
 	../../../src/check/check: check, checked_functions
+	../../../src/check/model as Checked
 	../../../src/utils/ids as Declaration
 	../../../src/lex/lex: lex
 	../../../src/utils/source: compiler_source, module_source, root_module_id, same_source
-	../../../src/specialize/specialize:
+	../../../src/specialize/specialize as Concrete:
 		CallTarget(UserFunction, RuntimeFunction),
-		ConcreteBody(ConcreteValueBody, ConcreteMatchBody),
+		ConcreteBody(ConcreteValueBody),
 		ConcreteExit(ReturnExpression),
 		ConcreteFunction,
 		ConcreteStatement(InitializeBinding, ReassignBinding),
@@ -27,9 +28,14 @@ import:
 		specialized_contents,
 		union_number,
 		value_ownership,
-	../../../src/utils/syntax: Diagnostic, Entrypoint(NoArguments), entry_function, same_span
+		admit_scalar_loop,
+	../../../src/utils/syntax: Diagnostic, Entrypoint(NoArguments), FunctionExecution(SelfTailLoop), Span, diagnostic, entry_function, same_span
+	option: to_result
 	int as IntOps
 	../input: parse, setup_diagnostic
+	../managed_union_inputs: concrete_tail_join
+	../ownership_inputs: input_ids, span
+	../../../src/namespace/builtins as Builtins
 	test: TestSuite
 
 
@@ -107,22 +113,6 @@ private pure func repeated_target(value: ConcreteExpr, expected: Int) -> Bool:
 					equal_targets(target(value), expected) and equal_targets(target(receiver), expected)
 				None:
 					False
-		_:
-			False
-
-
-private pure func returns_type(exit: ConcreteExit, expected: TypeRef) -> Bool:
-	match exit:
-		ReturnExpression(value):
-			same_type(value.value_type, expected)
-		_:
-			False
-
-
-private pure func returns_repeated_target(exit: ConcreteExit, expected: Int) -> Bool:
-	match exit:
-		ReturnExpression(value):
-			repeated_target(value, expected)
 		_:
 			False
 
@@ -345,13 +335,13 @@ pure func test_rigid_return_types_translate_in_every_match_arm() -> Bool:
 
 	match fixture(source):
 		Ok([_, choose, _]):
-			match choose.body:
-				ConcreteMatchBody(matched):
+			match concrete_tail_join(choose.body):
+				Some(matched):
 					match matched.arms:
 						[first, second]:
 							(
-								returns_type(first.body, IntType)
-								and returns_type(second.body, IntType)
+								same_type(first.value.value_type, IntType)
+								and same_type(second.value.value_type, IntType)
 								and same_type(choose.signature.return_type, IntType)
 							)
 						_:
@@ -385,8 +375,8 @@ pure func test_match_scrutinee_assignments_and_results_discover_generic_instance
 
 	match fixture(flag_source + IDENTITY + source):
 		Ok([main, choose, flag, flag_identity, save, int_identity]):
-			match choose.body:
-				ConcreteMatchBody(matched):
+			match concrete_tail_join(choose.body):
+				Some(matched):
 					match matched.arms:
 						[first, second]:
 							match first.statements:
@@ -397,7 +387,7 @@ pure func test_match_scrutinee_assignments_and_results_discover_generic_instance
 												body_target(main) == Some(1)
 												and target(matched.scrutinee) == Some(3)
 												and target(saved) == Some(4)
-												and returns_repeated_target(second.body, 5)
+												and repeated_target(second.value, 5)
 												and same_type(
 													flag_identity.signature.return_type,
 													flag.signature.return_type,
@@ -414,7 +404,7 @@ pure func test_match_scrutinee_assignments_and_results_discover_generic_instance
 												and same_type(save.signature.return_type, IntType)
 												and same_type(saved_binding.value_type, IntType)
 												and same_type(saved.value_type, IntType)
-												and returns_type(first.body, IntType)
+												and same_type(first.value.value_type, IntType)
 											)
 										_:
 											False
@@ -990,11 +980,226 @@ pure func test_projection_visits_child_types_before_later_layout() -> Bool:
 						_: False
 
 
+pure func test_managed_tail_signature_rejects_at_specialization() -> Bool:
+	source: String =
+		|@tail_recursive pure func loop(value: String) -> Int:
+		|	loop(value)
+		|func main() -> Int:
+		|	loop("seed")
+		|
+	match program(source):
+		Ok(_): False
+		Err(error):
+			(
+				same_source(error.span.source, module_source(root_module_id()))
+				and error.span.start == 0
+				and error.span.end == "@tail_recursive".length()
+				and error.message == "managed values in @tail_recursive functions are not supported yet"
+				and error.help == "use an unmanaged helper, or remove @tail_recursive"
+				and error.note.is_none()
+			)
+
+
+pure func test_tail_admission_checks_managed_child_before_parent() -> Bool:
+	source: String =
+		|pure func wrap(value: String) -> String:
+		|	value
+		|@tail_recursive pure func loop(value: Int) -> Int:
+		|	ignored = wrap("child")
+		|	loop(value)
+		|func main() -> Int:
+		|	loop(0)
+		|
+	match program(source):
+		Ok(_): False
+		Err(error):
+			(
+				same_source(error.span.source, module_source(root_module_id()))
+				-- The quoted child literal in the source above spans [115, 122).
+				and error.span.start == 115
+				and error.span.end == 122
+				and error.message == "managed values in @tail_recursive functions are not supported yet"
+				and error.help == "use an unmanaged helper, or remove @tail_recursive"
+				and error.note.is_none()
+			)
+
+
+private pure func capture_before_statement() -> Result[Bool, Diagnostic]:
+	source =
+		|fixed union Box:
+		|	Box(String)
+		|pure func inspect(value: Box) -> Int:
+		|	match value:
+		|		Box(payload): 0
+		|func main() -> Int:
+		|	inspect(Box("seed"))
+		|
+	at: Span = { source = module_source(root_module_id()), start = 31, end = 32 }
+	invalid = diagnostic(at, "invalid capture admission fixture", "fix the test input")
+	contents ?= program(source)
+	function ?= contents.functions.get(1).to_result(invalid)
+	value_result = match function.body:
+		ConcreteValueBody(ReturnExpression(value)): Ok(value)
+		_: Err(invalid)
+	value ?= value_result
+	join ?= concrete_tail_join(function.body).to_result(invalid)
+	arm ?= join.arms.get(0).to_result(invalid)
+	capture ?= arm.inputs.get(0).to_result(invalid)
+	position = Checked.binding_number(capture)
+	binding ?= function.bindings.get(position).to_result(invalid)
+	statement = Concrete.DiscardExpression({
+		form = Concrete.LiteralString("later"), value_type = StringType,
+		span = { at | start = 40, end = 41 },
+	})
+	-- A forged scalar signature isolates this pure admission rule; it does not
+	-- claim that checking could construct the raw function below.
+	raw = { function |
+		execution = SelfTailLoop({ at | start = 10, end = 25 }),
+		signature = { parameters = [IntType], return_type = IntType },
+		bindings = function.bindings.set(position, { binding | span = at }),
+		body = ConcreteValueBody(ReturnExpression({ value |
+			form = Concrete.Match({ join | arms = [{ arm | statements = [statement] }] }),
+		})),
+	}
+	result = match admit_scalar_loop(raw, contents.unions, contents.records):
+		Ok(_): False
+		Err(error):
+			(arm.inputs.length() == 1 and join.arms.length() == 1
+			and same_type(binding.value_type, StringType)
+			and same_span(error.span, at)
+			and error.message == "managed values in @tail_recursive functions are not supported yet"
+			and error.help == "use an unmanaged helper, or remove @tail_recursive"
+			and error.note.is_none())
+	Ok(result)
+
+
+pure func test_tail_admission_checks_capture_before_arm_statement() -> Bool:
+	capture_before_statement().get_or(False)
+
+-- Raw concrete admission probes preserve the retired runtime-origin checks.
+private pure func scalar_admission_seed() -> ConcreteFunction:
+	{
+		execution = SelfTailLoop(span(90)),
+		signature = { parameters = [IntType, IntType], return_type = IntType },
+		bindings = [], statements = [],
+		body = ConcreteValueBody(Concrete.RecurWith([], span(80)))
+	}
+
+
+private pure func scalar_managed_initializer() -> ConcreteExpr:
+	{
+		form = InvokeFunction({ target = RuntimeFunction(Builtins.IntToString), span = span(30) }, [
+			{ form = LiteralInteger(7), value_type = IntType, span = span(29) },
+		]),
+		value_type = StringType, span = span(30)
+	}
+
+
+private pure func rejects_scalar_admission(function: ConcreteFunction, unions: List[Concrete.ConcreteUnion], at: Int) -> Bool:
+	match admit_scalar_loop(function, unions, []):
+		Ok(_): False
+		Err(error):
+			(
+				same_span(error.span, span(at))
+				and error.message == "managed values in @tail_recursive functions are not supported yet"
+				and error.help == "use an unmanaged helper, or remove @tail_recursive"
+				and error.note.is_none()
+			)
+
+
+pure func test_managed_parameter_signature() -> Bool:
+	match input_ids():
+		Err(_): False
+		Ok(ids):
+			original = scalar_admission_seed()
+			rejects_scalar_admission({ original | signature = { original.signature | parameters = [StringType, IntType] } }, ids.unions, 90)
+
+
+pure func test_managed_return_signature() -> Bool:
+	match input_ids():
+		Err(_): False
+		Ok(ids):
+			original = scalar_admission_seed()
+			rejects_scalar_admission({ original | signature = { original.signature | return_type = StringType } }, ids.unions, 90)
+
+
+pure func test_managed_intermediate_even_after_drop() -> Bool:
+	match input_ids():
+		Err(_): False
+		Ok(ids):
+			rejects_scalar_admission({ scalar_admission_seed() | statements = [Concrete.DiscardExpression(scalar_managed_initializer())] }, ids.unions, 30)
+
+
+pure func test_managed_terminal_operand() -> Bool:
+	match input_ids():
+		Err(_): False
+		Ok(ids):
+			rejects_scalar_admission({ scalar_admission_seed() | body = ConcreteValueBody(Concrete.RecurWith([scalar_managed_initializer()], span(80))) }, ids.unions, 30)
+
+
+pure func test_managed_arm_value_already_dropped() -> Bool:
+	match input_ids():
+		Err(_): False
+		Ok(ids):
+			rejects_scalar_admission({ scalar_admission_seed() | body = Concrete.ConcreteMatchBody({
+				scrutinee = { form = ConstructVariant(ids.second_variant, []), value_type = UnionType(ids.union_id), span = span(20) },
+				selection = { nodes = [Concrete.EnterArm(Checked.match_arm_id(0), [])], entry = Checked.decision_node_id(0) },
+				arms = [{ id = Checked.match_arm_id(0), inputs = [], statements = [Concrete.DiscardExpression(scalar_managed_initializer())], body = Concrete.RecurWith([], span(80)) }],
+			}) }, ids.unions, 30)
+
+
+private pure func scalar_carrier_seed() -> Result[SpecializedContents, Diagnostic]:
+	source: String =
+		|fixed union Flag:
+		|    Off
+		|    On
+		|pure func choose(flag: Flag) -> Int:
+		|    var current = 0
+		|    match flag:
+		|        Off: current = 7
+		|        On: void
+		|    current
+		|func main() -> Int:
+		|    choose(Off)
+		|
+	program(source)
+
+
+pure func test_raw_managed_join_carrier_rejects_before_its_arm_operations() -> Bool:
+	match scalar_carrier_seed().map(pure func(contents): (contents.unions, contents.functions)):
+		Ok((unions, [_, function])):
+			match (function.bindings, function.statements):
+				([parameter, carrier], [initialized, Concrete.DiscardExpression(value)]):
+					match value.form:
+						Concrete.Match(join):
+							match join.arms:
+								[first, second]:
+									changed = { first | statements = [Concrete.DiscardExpression({ form = Concrete.LiteralString("arm"), value_type = StringType, span = span(40) })] }
+									rejects_scalar_admission({ function |
+										execution = SelfTailLoop(span(90)),
+										bindings = [parameter, { carrier | value_type = StringType, span = span(31) }],
+										statements = [initialized, Concrete.DiscardExpression({ value | form = Concrete.Match({ join | arms = [changed, second] }) })],
+									}, unions, 31)
+								_: False
+						_: False
+				_: False
+		_: False
+
+
 tests: TestSuite = {
 	description = "Blorp 2 specialization",
 	tests = [
 		("construction visits child types before later layout", test_construction_visits_child_types_before_later_layout),
 		("projection visits child types before later layout", test_projection_visits_child_types_before_later_layout),
+		("raw managed join carrier rejects before its arm operations", test_raw_managed_join_carrier_rejects_before_its_arm_operations),
+		("managed arm value already dropped", test_managed_arm_value_already_dropped),
+		("managed terminal operand", test_managed_terminal_operand),
+		("managed intermediate even after drop", test_managed_intermediate_even_after_drop),
+		("managed return signature", test_managed_return_signature),
+		("managed parameter signature", test_managed_parameter_signature),
+		("tail admission checks captures before arm statements", test_tail_admission_checks_capture_before_arm_statement),
+		("managed tail signature rejects at Specialize", test_managed_tail_signature_rejects_at_specialization),
+		("tail admission checks child before parent", test_tail_admission_checks_managed_child_before_parent),
 		("numeric and Void ownership", test_numeric_and_void_types_have_no_ownership),
 		("String ownership authority", test_string_ownership_is_a_managed_leaf),
 		("String List ownership authority", test_string_list_ownership_is_a_managed_root),

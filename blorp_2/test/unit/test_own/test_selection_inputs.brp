@@ -1,0 +1,314 @@
+import:
+	../../../src/lex/lex: lex
+	../../../src/parse/parse: parse_module
+	../../../src/utils/names: program_names
+	../../../src/utils/source: module_source, root_module_id
+	system: read_file
+	../../../src/check/model: match_arm_id, decision_node_id, match_arm_number
+	../../../src/lower/lower as Lower
+	../../../src/own/own as Own
+	../../../src/specialize/specialize as Concrete
+	../../../src/utils/syntax: Diagnostic
+	../ownership_inputs: InputIds, input_ids, integer, parameter, span
+	test: TestSuite
+
+
+private fixed record SelectionInput {
+	ids: InputIds,
+	unions: List[Concrete.ConcreteUnion],
+	selection: Lower.LoweredSelection
+}
+
+
+-- The opaque identities come from the normal phase authorities. The phase
+-- under test receives a small handwritten Lower product, not source syntax.
+private pure func input() -> Result[SelectionInput, Diagnostic]:
+	ids ?= input_ids()
+	unions = [{ variants = [[Concrete.StringType, Concrete.StringType], [Concrete.StringType, Concrete.StringType]], representation = Concrete.InlineOwningPayload }]
+	match ids.union_value.operation:
+		Lower.ConstructValue(left, _):
+			match Concrete.variant_field(left, 0, unions, span(30)):
+				Err(error): Err(error)
+				Ok(left_field):
+					match Concrete.variant_field(ids.second_variant, 1, unions, span(31)):
+						Err(error): Err(error)
+						Ok(right_field):
+							Ok({
+								ids = ids,
+								unions = unions,
+								selection = {
+									scrutinee = ids.first,
+									nodes = [
+										Lower.EnterArm({ arm = match_arm_id(0), definitions = [Lower.BorrowUnionField({ id = ids.third, value_type = Concrete.StringType, span = span(30) }, left_field, ids.first)], arguments = [ids.third] }),
+										Lower.EnterArm({ arm = match_arm_id(0), definitions = [Lower.BorrowUnionField({ id = ids.fourth, value_type = Concrete.StringType, span = span(31) }, right_field, ids.first)], arguments = [ids.fourth] }),
+										Lower.TestVariant({ value_type = Concrete.UnionType(ids.union_id), route = Concrete.MatchRoot }, left, decision_node_id(0), decision_node_id(1)),
+									],
+									entry = decision_node_id(2),
+								},
+							})
+		_: Err({ span = span(0), note = None, message = "expected a constructor identity", help = "fix selection test setup" })
+
+
+private pure func joined(input: SelectionInput, duplicate: Bool, unused: Bool) -> Result[Own.OwnedFunction, Diagnostic]:
+	ids = input.ids
+	nodes = input.selection.nodes.map(pure func(node):
+		if duplicate:
+			match node:
+				Lower.EnterArm(edge): Lower.EnterArm({ edge | arguments = edge.arguments.concat(edge.arguments) })
+				_: node
+		else:
+			node
+	)
+	selection = { input.selection | nodes = nodes }
+	inputs = if duplicate:
+		[{ id = ids.fifth, value_type = Concrete.StringType, span = span(40) }, { id = ids.sixth, value_type = Concrete.StringType, span = span(41) }]
+	else:
+		[{ id = ids.fifth, value_type = Concrete.StringType, span = span(40) }]
+	steps: List[Lower.LoweredStep] = if unused:
+		[Lower.Define(integer(ids.sixth, 7, 50))]
+	else:
+		[]
+	result = if unused:
+		ids.sixth
+	else:
+		ids.fifth
+	result_type = if unused:
+		Concrete.IntType
+	else:
+		Concrete.StringType
+	Own.insert_function({
+		signature = { parameters = [Concrete.UnionType(ids.union_id)], return_type = result_type },
+		steps = [
+			Lower.Define(parameter(ids.first, Concrete.UnionType(ids.union_id))),
+			Lower.Join({ result = { id = ids.second, value_type = result_type, span = span(20) }, carried = [], selection = selection, arms = [{ id = match_arm_id(0), inputs = inputs, steps = steps, exit = Lower.Yield({ value = result, carried = [] }) }], reads = [ids.first] }),
+		],
+		result = ids.second,
+	}, input.unions, [])
+
+
+private pure func acquired_edge(edge: Own.OwnedSelectionEdge) -> Bool:
+	match (edge.operations, edge.transfers):
+		([Own.DefineValue(projection), Own.AcquireOwner(owner, borrow, _)], [Own.OwnedReturn(value, moved)]):
+			match (projection.operation, projection.result, borrow.source):
+				(Own.PayloadDefinition(_, parent), Own.BorrowedResult(Own.PayloadBorrow(root)), Own.PayloadBorrow(source)):
+					(
+						Lower.value_number(parent) == Lower.value_number(root)
+						and Lower.value_number(root) == Lower.value_number(source)
+						and Lower.value_number(value) == Lower.value_number(projection.id)
+						and Lower.value_number(borrow.value) == Lower.value_number(value)
+						and Own.owner_number(owner) == Own.owner_number(moved)
+					)
+				_: False
+		_: False
+
+
+pure func test_alternative_edges_acquire_before_entering_one_canonical_body() -> Bool:
+	match input().and_then(pure func(input): joined(input, False, False)):
+		Err(_): False
+		Ok(function):
+			match function.operations:
+				[Own.DefineValue(parent), Own.ExecuteJoin(join)]:
+					match (parent.result, join.selection.nodes, join.arms):
+						(Own.BorrowedResult(Own.ParameterBorrow(_)), [Own.EnterArm(left), Own.EnterArm(right), Own.TestVariant(_, _, _, _)], [arm]):
+							match arm.exit:
+								Own.Yield(arm_yield):
+									match (arm.inputs, arm.operations, arm_yield.transfer):
+										([Own.ManagedJoinParameter(parameter, owner)], [], Own.OwnedReturn(value, moved)):
+											(
+												acquired_edge(left)
+												and acquired_edge(right)
+												and match_arm_number(left.arm) == match_arm_number(arm.id)
+												and match_arm_number(right.arm) == match_arm_number(arm.id)
+												and Lower.value_number(value) == Lower.value_number(parameter.id)
+												and Own.owner_number(owner) == Own.owner_number(moved)
+											)
+										_: False
+								Own.TransferLoop(_, _): False
+						_: False
+				_: False
+
+
+pure func test_unused_managed_input_drops_at_body_entry() -> Bool:
+	match input().and_then(pure func(input): joined(input, False, True)):
+		Err(_): False
+		Ok(function):
+			match function.operations:
+				[_, Own.ExecuteJoin(join)]:
+					match join.arms:
+						[arm]:
+							match (arm.inputs, arm.operations):
+								([Own.ManagedJoinParameter(_, owner)], [Own.DropOwner(dropped, _), Own.DefineValue(_)]): Own.owner_number(owner) == Own.owner_number(dropped)
+								_: False
+						_: False
+				_: False
+
+
+pure func test_aliased_arguments_acquire_independent_occurrences_and_inputs() -> Bool:
+	match input().and_then(pure func(input): joined(input, True, False)):
+		Err(_): False
+		Ok(function):
+			match function.operations:
+				[_, Own.ExecuteJoin(join)]:
+					match (join.selection.nodes, join.arms):
+						([Own.EnterArm(left), Own.EnterArm(right), _], [arm]):
+							edges = [left, right].all(pure func(edge):
+								match (edge.operations, edge.transfers):
+									([Own.DefineValue(_), Own.AcquireOwner(first, _, _), Own.AcquireOwner(second, _, _)], [Own.OwnedReturn(value, moved), Own.OwnedReturn(other, again)]):
+										(
+											Lower.value_number(value) == Lower.value_number(other)
+											and Own.owner_number(first) == Own.owner_number(moved)
+											and Own.owner_number(second) == Own.owner_number(again)
+											and Own.owner_number(first) != Own.owner_number(second)
+										)
+									_: False
+							)
+							match arm.exit:
+								Own.Yield(arm_yield):
+									match (arm.inputs, arm.operations, arm_yield.transfer):
+										([Own.ManagedJoinParameter(first, owner), Own.ManagedJoinParameter(_, other)], [Own.DropOwner(unused, _)], Own.OwnedReturn(value, returned)):
+											(
+												edges
+												and Own.owner_number(owner) != Own.owner_number(other)
+												and Own.owner_number(unused) == Own.owner_number(other)
+												and Own.owner_number(returned) == Own.owner_number(owner)
+												and Lower.value_number(value) == Lower.value_number(first.id)
+											)
+										_: False
+								Own.TransferLoop(_, _): False
+						_: False
+				_: False
+
+
+pure func test_terminal_selection_transfers_inputs_before_break_and_recur() -> Bool:
+	match input():
+		Err(_): False
+		Ok(input):
+			ids = input.ids
+			nodes = input.selection.nodes.map(pure func(node):
+				match node:
+					Lower.EnterArm(edge):
+						match edge.arguments:
+							[value]:
+								arm = if Lower.value_number(value) == Lower.value_number(ids.third):
+									match_arm_id(0)
+								else:
+									match_arm_id(1)
+								Lower.EnterArm({ edge | arm = arm })
+							_: node
+					_: node
+			)
+			selection = { input.selection | nodes = nodes }
+			function: Lower.LoweredFunction = {
+				signature = { parameters = [Concrete.UnionType(ids.union_id)], return_type = Concrete.IntType },
+				steps = [Lower.Define(parameter(ids.first, Concrete.UnionType(ids.union_id))), Lower.Loop({
+					headers = [], result = { id = ids.second, value_type = Concrete.IntType, span = span(20) }, carried = [], reads = [ids.first],
+					body = { steps = [], tail = Lower.MatchLoop({ selection = selection, arms = [
+						{ id = match_arm_id(0), inputs = [{ id = ids.fifth, value_type = Concrete.StringType, span = span(40) }], body = { steps = [Lower.Define(integer(ids.sixth, 7, 50))], tail = Lower.ExitLoop(Lower.Break({ value = ids.sixth, carried = [], span = span(60) })) } },
+						{ id = match_arm_id(1), inputs = [{ id = ids.seventh, value_type = Concrete.StringType, span = span(70) }], body = { steps = [], tail = Lower.ExitLoop(Lower.Recur([], span(80))) } },
+					] }) },
+				})],
+				result = ids.second,
+			}
+			match Own.insert_function(function, input.unions, []):
+				Err(_): False
+				Ok(owned):
+					match owned.operations:
+						[_, Own.ExecuteLoop(loop)]:
+							match loop.body.tail:
+								Own.MatchLoop(matched):
+									match (matched.selection.nodes, matched.arms):
+										([Own.EnterArm(left), Own.EnterArm(right), _], [first, second]):
+											match ((first.inputs, first.body.operations, first.body.tail), (second.inputs, second.body.operations, second.body.tail)):
+												(([Own.ManagedJoinParameter(_, first_owner)], [Own.DropOwner(first_drop, _), Own.DefineValue(_)], Own.ExitLoop(Own.Break(_))), ([Own.ManagedJoinParameter(_, second_owner)], [Own.DropOwner(second_drop, _)], Own.ExitLoop(Own.Recur([], _)))):
+													(
+														acquired_edge(left)
+														and acquired_edge(right)
+														and Own.owner_number(first_owner) == Own.owner_number(first_drop)
+														and Own.owner_number(second_owner) == Own.owner_number(second_drop)
+													)
+												_: False
+										_: False
+								_: False
+						_: False
+
+
+pure func test_selected_input_owns_independently_before_enclosing_root_retires() -> Bool:
+	match input():
+		Err(_): False
+		Ok(input):
+			ids = input.ids
+			nodes = input.selection.nodes.map(pure func(node):
+				match node:
+					Lower.EnterArm(edge):
+						match edge.definitions:
+							[Lower.BorrowUnionField(parameter, field, _)]:
+								id = if Lower.value_number(parameter.id) == Lower.value_number(ids.third):
+									ids.fourth
+								else:
+									ids.fifth
+								Lower.EnterArm({ edge | definitions = [Lower.BorrowUnionField({ parameter | id = id }, field, ids.second)], arguments = [id] })
+							_: node
+					_: node
+			)
+			selection = { input.selection | scrutinee = ids.second, nodes = nodes }
+			match ids.union_value.operation:
+				Lower.ConstructValue(variant, _):
+					function: Lower.LoweredFunction = {
+						signature = { parameters = [], return_type = Concrete.StringType },
+						steps = [
+							Lower.Define({ id = ids.first, value_type = Concrete.StringType, operation = Lower.StringValue("held"), span = span(10) }),
+							Lower.Define({ id = ids.second, value_type = Concrete.UnionType(ids.union_id), operation = Lower.ConstructValue(variant, [ids.first, ids.first]), span = span(20) }),
+							Lower.Join({
+								result = { id = ids.third, value_type = Concrete.StringType, span = span(30) },
+								carried = [], selection = selection,
+								arms = [{ id = match_arm_id(0), inputs = [{ id = ids.sixth, value_type = Concrete.StringType, span = span(60) }], steps = [], exit = Lower.Yield({ value = ids.sixth, carried = [] }) }],
+								reads = [ids.second],
+							}),
+						],
+						result = ids.third,
+					}
+					match Own.insert_function(function, input.unions, []):
+						Err(_): False
+						Ok(owned):
+							match owned.operations:
+								[Own.DefineValue(_), Own.AcquireOwner(_, _, _), Own.AcquireOwner(_, _, _), Own.DefineValue(root), Own.DropOwner(_, _), Own.ExecuteJoin(join), Own.DropOwner(retired, _)]:
+									match (root.result, join.selection.nodes, join.arms):
+										(Own.OwnedResult(parent), [Own.EnterArm(left), Own.EnterArm(right), _], [arm]):
+											match arm.inputs:
+												[Own.ManagedJoinParameter(_, input_owner)]:
+													(
+														acquired_edge(left)
+														and acquired_edge(right)
+														and Own.owner_number(parent) == Own.owner_number(retired)
+														and Own.owner_number(parent) != Own.owner_number(input_owner)
+													)
+												_: False
+										_: False
+								_: False
+				_: False
+
+
+func test_ownership_module_stays_within_the_target_parser() -> Bool:
+	match read_file("blorp_2/src/own/own.brp"):
+		Err(error):
+			print_error(error)
+			False
+		Ok(source):
+			match lex(module_source(root_module_id()), source, program_names().names).and_then(pure func(tokens): parse_module(tokens, root_module_id())):
+				Ok(_): True
+				Err(error):
+					print_error(error.message + " at " + "".append_int(error.span.start))
+					False
+
+
+tests: TestSuite = {
+	description = "Shared selection ownership inputs",
+	tests = [
+		("Own production module uses target grammar", test_ownership_module_stays_within_the_target_parser),
+		("alternatives acquire into one canonical arm", test_alternative_edges_acquire_before_entering_one_canonical_body),
+		("unused managed input retires at body entry", test_unused_managed_input_drops_at_body_entry),
+		("aliased arguments own independent occurrences", test_aliased_arguments_acquire_independent_occurrences_and_inputs),
+		("selected input precedes enclosing root retirement", test_selected_input_owns_independently_before_enclosing_root_retires),
+		("terminal Break and Recur share selection inputs", test_terminal_selection_transfers_inputs_before_break_and_recur),
+	],
+}

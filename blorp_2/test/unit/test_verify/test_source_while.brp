@@ -1,0 +1,91 @@
+import:
+	../../../src/own/own as Own
+	../../../src/verify/verify: verify
+	../../../src/utils/syntax: Span, same_span
+	../source_while_inputs as Input
+	test: TestSuite
+
+
+-- Damage actual source-produced common IR; preserve its typed identities and
+-- every other operation. Existing raw-loop tests independently own span90.
+private pure func discharge_captured_pre(function: Own.OwnedFunction, arm_index: Int) -> Option[(Own.OwnedFunction, Span)]:
+	var pre: Option[Own.OwnerId] = None
+	var origin: Option[Span] = None
+	var valid = True
+	var operations: List[Own.OwnershipOperation] = []
+	for operation in function.operations:
+		match operation:
+			Own.DefineValue(definition):
+				match definition.result:
+					Own.OwnedResult(id): pre = Some(id)
+					_: void
+				operations = operations.append(operation)
+			Own.ExecuteLoop(loop):
+				match pre:
+					None:
+						valid = False
+						operations = operations.append(operation)
+					Some(owner):
+						match loop.body.tail:
+							Own.ExitLoop(_): operations = operations.append(operation)
+							Own.MatchLoop(branch):
+								match branch.arms.get(arm_index):
+									None:
+										valid = False
+										operations = operations.append(operation)
+									Some(arm):
+										span = Own.join_parameter(loop.result).span
+										bad_arm = { arm | body = { arm.body | operations = arm.body.operations.append(Own.DropOwner(owner, span)) } }
+										bad_loop = { loop | body = { loop.body | tail = Own.MatchLoop({ branch | arms = branch.arms.set(arm_index, bad_arm) }) } }
+										operations = operations.append(Own.ExecuteLoop(bad_loop))
+										origin = Some(span)
+			_: operations = operations.append(operation)
+	span ?= origin
+	if valid:
+		Some(({ function | operations = operations }, span))
+	else:
+		None
+
+
+private pure func rejects_pre_discharge(arm_index: Int) -> Option[Bool]:
+	lowered ?= Input.lowered(Input.MANAGED_OWNER).to_option()
+	program ?= Own.own(lowered).to_option()
+	baseline = verify(program).is_ok()
+	var position = 0
+	var result: Option[Bool] = None
+	for function in program.functions:
+		match discharge_captured_pre(function, arm_index):
+			None: void
+			Some((changed, origin)):
+				damaged = { program | functions = program.functions.set(position, changed) }
+				result = match verify(damaged):
+					Ok(_): Some(False)
+					Err(error): Some(baseline
+						and same_span(error.span, origin)
+						and error.message == "ownership verification failed: loop edge discharges a captured owner"
+						and error.help == "report this compiler error with the input program"
+						and error.note.is_none())
+		position = position + 1
+	result
+
+
+pure func test_source_true_backedge_cannot_discharge_pre_owner() -> Bool:
+	rejects_pre_discharge(0).get_or(False)
+
+
+pure func test_source_false_exit_cannot_discharge_pre_owner() -> Bool:
+	rejects_pre_discharge(1).get_or(False)
+
+
+pure func test_source_condition_and_body_joins_verify() -> Bool:
+	Input.lowered(Input.CONDITION_WRITES).and_then(Own.own).and_then(verify).is_ok()
+
+
+tests: TestSuite = {
+	description = "Blorp 2 source while verification",
+	tests = [
+		("source backedge cannot discharge captured PRE", test_source_true_backedge_cannot_discharge_pre_owner),
+		("source false exit cannot discharge captured PRE", test_source_false_exit_cannot_discharge_pre_owner),
+		("source condition and body joins verify", test_source_condition_and_body_joins_verify),
+	]
+}

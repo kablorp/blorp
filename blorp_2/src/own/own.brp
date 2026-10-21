@@ -1,22 +1,26 @@
 import:
+	result: map
+	../check/model: MatchArmId, DecisionNodeId, ListLengthTest
+	../utils/boolean: not, and
 	int as IntOps
-	list: repeat, set_index
-	../lower/lower:
+	list: repeat, set_index, contains
+	../lower/lower as Lower:
 		JoinArm,
-		LoweredExit(ReturnValue, RecurValues),
+		LoopExit,
+		LoweredLoop,
 		LoweredFunction,
 		LoweredJoin,
-		LoweredMatch,
 		LoweredProgram,
-		LoweredStep(Define, Join),
-		LoweredTail(ExitValue, MatchValue),
-		MatchLabel,
+		LoweredStep(Define, Join, Loop),
+		LoweredSelection,
+		SelectionEdge,
+		SelectionDefinition(BorrowUnionField, BorrowListElement, CopyListSuffix),
 		ValueDefinition,
 		ValueId,
 		ValueParameter,
 		ValueOperation(
 			ParameterValue, VoidValue, IntegerValue, FloatValue, StringValue,
-			CallValue, ConstructValue, ConstructListValue, PayloadValue, ConstructRecordValue, ReadRecordFieldValue,
+			CallValue, ConstructValue, ConstructListValue, PayloadValue, ListElementValue, ListSuffixValue, ConstructRecordValue, ReadRecordFieldValue,
 		),
 		lowered_functions,
 		block_value_count, step_reads, step_span, step_value_count, value_span,
@@ -25,6 +29,7 @@ import:
 	../utils/source: compiler_source
 	../specialize/specialize:
 		CallTarget,
+		ConcretePatternPlace,
 		ConcreteRecord,
 		ConcreteUnion,
 		FieldInstanceId,
@@ -32,14 +37,13 @@ import:
 		FunctionSignature,
 		RecordInstanceId,
 		TypeRef,
-		UnionInstanceId,
 		ValueOwnership(
 			NoOwnership, ManagedStringLeaf, ManagedListRoot, ManagedRecordRoot,
 			InlineOwnedFields, ManagedUnionRoot,
 		),
 		VariantInstanceId, VariantFieldInstanceId,
 		value_ownership,
-	../utils/syntax: Diagnostic, Entrypoint, FunctionExecution(OrdinaryCalls, SelfTailLoop), Span
+	../utils/syntax: Diagnostic, Entrypoint, Span
 	../utils/text: concat
 
 
@@ -102,6 +106,8 @@ fixed union OwnedValueOperation:
 	ConstructDefinition(VariantInstanceId, List[StoredPayload])
 	ConstructListDefinition(List[StoredPayload])
 	PayloadDefinition(VariantFieldInstanceId, ValueId)
+	ListElementDefinition(Int, ValueId)
+	ListSuffixDefinition(OwnedArgument, Int)
 
 
 fixed record OwnedDefinition {
@@ -116,6 +122,7 @@ fixed record OwnedDefinition {
 fixed union OwnershipOperation:
 	DefineValue(OwnedDefinition)
 	ExecuteJoin(OwnedJoin)
+	ExecuteLoop(OwnedLoop)
 	AcquireOwner(OwnerId, BorrowedValue, Span)
 	DropOwner(OwnerId, Span)
 
@@ -127,12 +134,23 @@ fixed union ReturnTransfer:
 	OwnedReturn(ValueId, OwnerId)
 
 
--- A join arm moves its value into the join.
-fixed record OwnedJoinArm {
-	label: MatchLabel,
-	operations: List[OwnershipOperation],
+fixed record OwnedJoinOutputs {
 	transfer: ReturnTransfer,
 	carried: List[ReturnTransfer]
+}
+
+
+fixed union OwnedJoinExit:
+	Yield(OwnedJoinOutputs)
+	TransferLoop(Lower.LoopTarget, OwnedLoopTail)
+
+
+-- Only yielding arms move values into the join's continuation.
+fixed record OwnedJoinArm {
+	id: MatchArmId,
+	inputs: List[OwnedJoinParameter],
+	operations: List[OwnershipOperation],
+	exit: OwnedJoinExit
 }
 
 
@@ -153,46 +171,91 @@ pure func join_ownership(output: OwnedJoinParameter) -> ResultOwnership:
 		ManagedJoinParameter(_, owner): OwnedResult(owner)
 
 
--- A join's arms follow its block's values and owners, in arm order: each
--- arm's own interval, then its joins' arms.
+-- Selection edges follow their enclosing block in decision-node order;
+-- canonical arm inputs then precede ordinary arm values and nested controls.
 fixed record OwnedJoin {
 	result: OwnedJoinParameter,
 	carried: List[OwnedJoinParameter],
-	scrutinee: OwnedArgument,
-	owner: UnionInstanceId,
+	selection: OwnedSelection,
 	arms: List[OwnedJoinArm]
 }
 
 
-fixed union OwnedExit:
-	ReturnResult(ReturnTransfer)
-	RecurArguments(List[ValueId], Span)
+fixed record OwnedLoopOutputs {
+	value: ReturnTransfer,
+	carried: List[ReturnTransfer],
+	span: Span
+}
 
 
-fixed record OwnedArm {
-	label: MatchLabel,
+fixed union OwnedLoopExit:
+	Break(OwnedLoopOutputs)
+	Recur(List[ReturnTransfer], Span)
+
+
+fixed record OwnedSelectionEdge {
+	arm: MatchArmId,
 	operations: List[OwnershipOperation],
-	exit: OwnedExit
+	transfers: List[ReturnTransfer]
 }
 
 
-fixed record OwnedMatch {
+fixed union OwnedDecisionNode:
+	TestVariant(ConcretePatternPlace, VariantInstanceId, DecisionNodeId, DecisionNodeId)
+	TestListLength(ConcretePatternPlace, ListLengthTest, DecisionNodeId, DecisionNodeId)
+	TestStringBytes(ConcretePatternPlace, String, DecisionNodeId, DecisionNodeId)
+	EnterArm(OwnedSelectionEdge)
+
+
+fixed record OwnedSelection {
 	scrutinee: OwnedArgument,
-	owner: UnionInstanceId,
-	arms: List[OwnedArm]
+	nodes: List[OwnedDecisionNode],
+	entry: DecisionNodeId
 }
 
 
-fixed union OwnedTail:
-	ReturnTail(OwnedExit)
-	MatchTail(OwnedMatch)
+fixed record OwnedLoopArm {
+	id: MatchArmId,
+	inputs: List[OwnedJoinParameter],
+	body: OwnedLoopBlock
+}
+
+
+fixed record OwnedLoopMatch {
+	selection: OwnedSelection,
+	arms: List[OwnedLoopArm]
+}
+
+fixed union OwnedLoopTail:
+	ExitLoop(OwnedLoopExit)
+	MatchLoop(OwnedLoopMatch)
+
+
+fixed record OwnedLoopBlock {
+	operations: List[OwnershipOperation],
+	tail: OwnedLoopTail
+}
+
+
+fixed record OwnedLoopHeader {
+	parameter: OwnedJoinParameter,
+	initial: ReturnTransfer
+}
+
+
+fixed record OwnedLoop {
+	entry_acquisitions: List[OwnerAcquisition],
+	headers: List[OwnedLoopHeader],
+	result: OwnedJoinParameter,
+	carried: List[OwnedJoinParameter],
+	body: OwnedLoopBlock
+}
 
 
 fixed record OwnedFunction {
-	execution: FunctionExecution,
 	signature: FunctionSignature,
 	operations: List[OwnershipOperation],
-	tail: OwnedTail
+	result: ReturnTransfer
 }
 
 
@@ -231,11 +294,13 @@ private fixed record ValueInterval {
 
 
 private pure func in_interval(ordinal: Int, first: Int, count: Int) -> Bool:
-	IntOps.greater_than_or_equal(ordinal, first) and IntOps.less_than(ordinal, IntOps.add(first, count))
+	match IntOps.greater_than_or_equal(ordinal, first):
+		False: False
+		True: IntOps.less_than(ordinal, IntOps.add(first, count))
 
 
 private pure func visible_outside(ordinal: Int, outer: List[ValueInterval]) -> Bool:
-	var visible = False
+	var visible: Bool = False
 	for interval in outer:
 		if in_interval(ordinal, interval.first, interval.count):
 			visible = True
@@ -260,7 +325,7 @@ private pure func use_slot(
 	else if in_interval(ordinal, first_value, introduced_count):
 		index = IntOps.subtract(ordinal, first_value)
 
-		if IntOps.greater_than_or_equal(index, 0) and IntOps.less_than(index, slot_count):
+		if in_interval(index, 0, slot_count):
 			Ok(Some(index))
 		else:
 			Err(internal_error(span, "invalid value identity in ownership use analysis"))
@@ -298,12 +363,13 @@ private pure func block_uses(
 	terminal: BlockTerminal,
 	outer: List[ValueInterval],
 	first_value: Int,
+	seed_count: Int,
 	span_result: Result[Span, Diagnostic],
 ) -> Result[List[Option[Int]], Diagnostic]:
 	unused: Option[Int] = None
-	var uses = repeat(unused, block_value_count(steps))
+	var uses = repeat(unused, IntOps.add(seed_count, block_value_count(steps)))
 	var step_position: Int = 0
-	var introduced_count: Int = 0
+	var introduced_count: Int = seed_count
 	var failure: Option[Diagnostic] = None
 
 	for step in steps:
@@ -311,18 +377,20 @@ private pure func block_uses(
 		first = match step:
 			Define(definition): definition.id
 			Join(join): join.result.id
+			Loop(loop): loop.result.id
 		if IntOps.not_equals(value_number(first), IntOps.add(first_value, introduced_count)):
 			failure = Some(internal_error(span, "nonconsecutive value identity in ownership use analysis"))
 		else:
-			match step:
-				Define(_): void
-				Join(join):
-					var ordinal = IntOps.add(IntOps.add(first_value, introduced_count), 1)
-					for parameter in join.carried:
-						if IntOps.not_equals(value_number(parameter.id), ordinal):
-							failure = Some(internal_error(parameter.span, "nonconsecutive value identity in ownership use analysis"))
-							break
-						ordinal = IntOps.add(ordinal, 1)
+			carried: List[ValueParameter] = match step:
+				Define(_): []
+				Join(join): join.carried
+				Loop(loop): loop.carried
+			var ordinal = IntOps.add(IntOps.add(first_value, introduced_count), 1)
+			for parameter in carried:
+				if IntOps.not_equals(value_number(parameter.id), ordinal):
+					failure = Some(internal_error(parameter.span, "nonconsecutive value identity in ownership use analysis"))
+					break
+				ordinal = IntOps.add(ordinal, 1)
 		if failure.is_some():
 			break
 
@@ -351,7 +419,7 @@ private pure func block_uses(
 		introduced_count = IntOps.add(introduced_count, step_value_count(step))
 		step_position = IntOps.add(step_position, 1)
 
-	ready ?= match failure:
+	ready: Void ?= match failure:
 		Some(error):
 			Err(error)
 		None:
@@ -411,31 +479,21 @@ private pure func block_uses(
 			Ok(terminal_uses)
 
 
-private pure func exit_uses(
-	steps: List[LoweredStep],
-	exit: LoweredExit,
-	outer: List[ValueInterval],
-	first_value: Int,
-	span_result: Result[Span, Diagnostic],
-) -> Result[List[Option[Int]], Diagnostic]:
-	terminal = match exit:
-		RecurValues(arguments, span): TerminalArguments(arguments, span)
-		ReturnValue(result): TerminalValue(result)
-	block_uses(steps, terminal, outer, first_value, span_result)
-
-
--- A block read after a dense prefix of `prefix_count` values.
+-- A loop edge reads every outgoing occurrence before retiring any owner.
 pure func exit_last_uses(
 	steps: List[LoweredStep],
-	exit: LoweredExit,
+	exit: LoopExit,
 	prefix_count: Int,
 	first_value: Int,
 ) -> Result[List[Option[Int]], Diagnostic]:
 	outer: List[ValueInterval] = [{ first = 0, count = prefix_count }]
-	span_result = match exit:
-		ReturnValue(result): terminal_span(steps, result, outer)
-		RecurValues(_, span): Ok(span)
-	exit_uses(steps, exit, outer, first_value, span_result)
+	terminal: BlockTerminal = match exit:
+		Lower.Recur(arguments, span): TerminalArguments(arguments, span)
+		Lower.Break(outputs): TerminalArguments([outputs.value].concat(outputs.carried), outputs.span)
+	span = match exit:
+		Lower.Recur(_, span): span
+		Lower.Break(outputs): outputs.span
+	block_uses(steps, terminal, outer, first_value, 0, Ok(span))
 
 
 pure func block_last_uses(
@@ -444,7 +502,8 @@ pure func block_last_uses(
 	prefix_count: Int,
 	first_value: Int,
 ) -> Result[List[Option[Int]], Diagnostic]:
-	exit_last_uses(steps, ReturnValue(result), prefix_count, first_value)
+	outer: List[ValueInterval] = [{ first = 0, count = prefix_count }]
+	block_uses(steps, TerminalValue(result), outer, first_value, 0, terminal_span(steps, result, outer))
 
 
 pure func last_uses(
@@ -454,15 +513,15 @@ pure func last_uses(
 	block_last_uses(steps, result, 0, 0)
 
 
-private fixed record ChildAcquisition {
+fixed record OwnerAcquisition {
 	owner: OwnerId,
 	borrow: BorrowedValue
 }
 
 
 private fixed union AcquisitionPlan:
-	StoredAcquisitions(List[ChildAcquisition])
-	ProjectedAcquisition(ChildAcquisition)
+	StoredAcquisitions(List[OwnerAcquisition])
+	ProjectedAcquisition(OwnerAcquisition)
 
 
 private fixed record BuiltDefinition {
@@ -522,7 +581,7 @@ private pure func borrow_argument(
 -- transfer cannot safely generalize to repeated values.
 private fixed record StoredPayloads {
 	stored: List[StoredPayload],
-	acquisitions: List[ChildAcquisition],
+	acquisitions: List[OwnerAcquisition],
 	next: Int
 }
 
@@ -533,7 +592,7 @@ private pure func store_payloads(
 	enclosing: List[EnclosingBlock],
 	first_value: Int,
 	span: Span,
-	acquisitions: List[ChildAcquisition],
+	acquisitions: List[OwnerAcquisition],
 	next_owner: Int,
 ) -> Result[StoredPayloads, Diagnostic]:
 	var stored: List[StoredPayload] = []
@@ -567,7 +626,7 @@ private pure func build_definition(
 ) -> Result[BuiltDefinition, Diagnostic]:
 	plan ?= value_ownership(definition.value_type, unions, records)
 	var next = next_owner
-	var acquisitions: List[ChildAcquisition] = []
+	var acquisitions: List[OwnerAcquisition] = []
 
 	operation_result: Result[OwnedValueOperation, Diagnostic] = match definition.operation:
 		ConstructRecordValue(owner, fields):
@@ -637,6 +696,12 @@ private pure func build_definition(
 					Ok(ConstructListDefinition(payloads.stored))
 		PayloadValue(variant, value):
 			Ok(PayloadDefinition(variant, value))
+		ListElementValue(index, value):
+			Ok(ListElementDefinition(index, value))
+		ListSuffixValue(value, skipped):
+			borrow_argument(value, sources, enclosing, first_value, definition.span).map(
+				pure func(argument): ListSuffixDefinition(argument, skipped),
+			)
 		CallValue(target, written):
 			var converted: List[OwnedArgument] = []
 			var failure: Option[Diagnostic] = None
@@ -666,6 +731,8 @@ private pure func build_definition(
 					Ok(BorrowedResult(ParameterBorrow(definition.id)))
 				PayloadDefinition(_, source):
 					Ok(BorrowedResult(PayloadBorrow(source)))
+				ListElementDefinition(_, source):
+					Ok(BorrowedResult(PayloadBorrow(source)))
 				ReadRecordFieldDefinition(_, argument):
 					parent = match argument:
 						UnmanagedArgument(value):
@@ -674,7 +741,7 @@ private pure func build_definition(
 							borrow.value
 
 					Ok(BorrowedResult(PayloadBorrow(parent)))
-				StringDefinition(_) | CallDefinition(_, _) | ConstructDefinition(_, _) | ConstructListDefinition(_) | ConstructRecordDefinition(_, _):
+				StringDefinition(_) | CallDefinition(_, _) | ConstructDefinition(_, _) | ConstructListDefinition(_) | ListSuffixDefinition(_, _) | ConstructRecordDefinition(_, _):
 					Ok(OwnedResult(owner_id(next)))
 				_:
 					Err(internal_error(definition.span, "unsupported managed value operation"))
@@ -687,7 +754,7 @@ private pure func build_definition(
 		_:
 			next
 
-	acquisition_plan = match operation:
+	acquisition_plan: AcquisitionPlan = match operation:
 		ReadRecordFieldDefinition(_, _):
 			match result:
 				BorrowedResult(source):
@@ -720,7 +787,8 @@ private pure func build_definition(
 
 private fixed record ScheduledDrop {
 	owner: OwnerId,
-	span: Span
+	span: Span,
+	last: Int
 }
 
 
@@ -728,7 +796,16 @@ private fixed record ScheduledDrop {
 -- with their ownership.
 private fixed record EnclosingBlock {
 	first_value: Int,
-	sources: List[ResultOwnership]
+	sources: List[ResultOwnership],
+	owners: List[ScheduledDrop],
+	position: Int
+}
+
+
+-- The nearest loop owns cleanup only inside this lexical PRE boundary.
+private fixed record LoopScope {
+	target: Lower.LoopTarget,
+	pre_blocks: Int
 }
 
 
@@ -753,6 +830,15 @@ private fixed record PendingOwnedJoin {
 	scrutinee: OwnedArgument,
 	result: OwnedJoinParameter,
 	carried: List[OwnedJoinParameter],
+	enclosing: List[EnclosingBlock],
+	loop_scope: Option[LoopScope]
+}
+
+
+private fixed record PendingOwnedLoop {
+	loop: LoweredLoop,
+	result: OwnedJoinParameter,
+	carried: List[OwnedJoinParameter],
 	enclosing: List[EnclosingBlock]
 }
 
@@ -762,6 +848,7 @@ private fixed record PendingOwnedJoin {
 private fixed union InsertedEntry:
 	Inserted(OwnershipOperation)
 	AwaitingArms(PendingOwnedJoin)
+	AwaitingLoop(PendingOwnedLoop)
 
 
 private fixed record InsertedSteps {
@@ -789,8 +876,7 @@ private pure func drop_position(
 				None: Err(internal_error(span, "missing value-use row"))
 
 
-private fixed record BuiltJoin {
-	scrutinee: OwnedArgument,
+private fixed record BuiltOutputs {
 	result: OwnedJoinParameter,
 	carried: List[OwnedJoinParameter],
 	next_owner: Int
@@ -809,23 +895,20 @@ private pure func owned_join_parameter(
 		_: Ok(ManagedJoinParameter(parameter, owner_id(next_owner)))
 
 
-private pure func build_join(
-	join: LoweredJoin,
-	sources: List[ResultOwnership],
-	enclosing: List[EnclosingBlock],
-	first_value: Int,
+private pure func build_outputs(
+	result_parameter: ValueParameter,
+	parameters: List[ValueParameter],
 	next_owner: Int,
 	unions: List[ConcreteUnion],
 	records: List[ConcreteRecord],
-) -> Result[BuiltJoin, Diagnostic]:
-	result ?= owned_join_parameter(join.result, next_owner, unions, records)
-	scrutinee ?= borrow_argument(join.scrutinee, sources, enclosing, first_value, join.result.span)
+) -> Result[BuiltOutputs, Diagnostic]:
+	result ?= owned_join_parameter(result_parameter, next_owner, unions, records)
 	var cursor = match result:
 		UnmanagedJoinParameter(_): next_owner
 		ManagedJoinParameter(_, _): IntOps.add(next_owner, 1)
 	var carried: List[OwnedJoinParameter] = []
 	var failure: Option[Diagnostic] = None
-	for parameter in join.carried:
+	for parameter in parameters:
 		match owned_join_parameter(parameter, cursor, unions, records):
 			Err(error):
 				failure = Some(error)
@@ -837,7 +920,39 @@ private pure func build_join(
 					ManagedJoinParameter(_, _): cursor = IntOps.add(cursor, 1)
 	match failure:
 		Some(error): Err(error)
-		None: Ok({ scrutinee = scrutinee, result = result, carried = carried, next_owner = cursor })
+		None: Ok({ result = result, carried = carried, next_owner = cursor })
+
+
+private fixed record BuiltInputs {
+	parameters: List[OwnedJoinParameter],
+	next_owner: Int
+}
+
+
+-- Canonical inputs own separate occurrences, even when an edge supplies the
+-- same borrowed value more than once.
+private pure func build_inputs(
+	parameters: List[ValueParameter],
+	initial_owner: Int,
+	unions: List[ConcreteUnion],
+	records: List[ConcreteRecord],
+) -> Result[BuiltInputs, Diagnostic]:
+	var inputs: List[OwnedJoinParameter] = []
+	var next_owner = initial_owner
+	var failure: Option[Diagnostic] = None
+	for parameter in parameters:
+		match owned_join_parameter(parameter, next_owner, unions, records):
+			Err(error):
+				failure = Some(error)
+				break
+			Ok(input):
+				inputs = inputs.append(input)
+				match input:
+					UnmanagedJoinParameter(_): void
+					ManagedJoinParameter(_, _): next_owner = IntOps.add(next_owner, 1)
+	match failure:
+		Some(error): Err(error)
+		None: Ok({ parameters = inputs, next_owner = next_owner })
 
 
 private pure func insert_steps(
@@ -846,33 +961,72 @@ private pure func insert_steps(
 	enclosing: List[EnclosingBlock],
 	first_value: Int,
 	initial_owner: Int,
+	seed_inputs: List[OwnedJoinParameter],
+	loop_scope: Option[LoopScope],
 	unions: List[ConcreteUnion],
 	records: List[ConcreteRecord],
 ) -> Result[InsertedSteps, Diagnostic]:
 	count = steps.length()
 	var drops = steps.map(pure func(_: LoweredStep) -> List[ScheduledDrop]: [])
 	var entries: List[InsertedEntry] = []
-	var sources: List[ResultOwnership] = []
+	var sources = seed_inputs.map(join_ownership)
 	var owners: List[ScheduledDrop] = []
 	var next_owner = initial_owner
 	var step_position: Int = 0
 	var failure: Option[Diagnostic] = None
 
+	var input_slot = 0
+	for input in seed_inputs:
+		match join_ownership(input):
+			OwnedResult(owner):
+				span = join_parameter(input).span
+				match schedule:
+					DropInEachArm: owners = owners.append({ owner = owner, span = span, last = count })
+					DropAtLastUse(uses):
+						match uses.get(input_slot):
+							None: failure = Some(internal_error(span, "missing input-use row"))
+							Some(None): entries = entries.append(Inserted(DropOwner(owner, span)))
+							Some(Some(last)):
+								owners = owners.append({ owner = owner, span = span, last = last })
+								if IntOps.less_than(last, count):
+									match drops.get(last):
+										Some(bucket): drops = drops.set(last, bucket.append({ owner = owner, span = span, last = last }))
+										None: failure = Some(internal_error(span, "invalid input last-use position"))
+			_: void
+		input_slot = IntOps.add(input_slot, 1)
+
 	for step in steps:
+		if failure.is_some():
+			break
 		value_slot = sources.length()
 		span = step_span(step)
 		var carried: List[OwnedJoinParameter] = []
 		available_result: Result[ResultOwnership, Diagnostic] = match step:
 			Join(join):
-				match build_join(join, sources, enclosing, first_value, next_owner, unions, records):
+				match build_outputs(join.result, join.carried, next_owner, unions, records):
 					Err(error): Err(error)
 					Ok(built):
-						entries = entries.append(AwaitingArms({
-							join = join,
-							scrutinee = built.scrutinee,
-							result = built.result,
-							carried = built.carried,
-							enclosing = enclosing.append({ first_value = first_value, sources = sources }),
+						match borrow_argument(join.selection.scrutinee, sources, enclosing, first_value, join.result.span):
+							Err(error): Err(error)
+							Ok(scrutinee):
+								entries = entries.append(AwaitingArms({
+									join = join,
+									scrutinee = scrutinee,
+									result = built.result,
+									carried = built.carried,
+									enclosing = enclosing.append({ first_value = first_value, sources = sources, owners = owners, position = step_position }),
+									loop_scope = loop_scope,
+								}))
+								next_owner = built.next_owner
+								carried = built.carried
+								Ok(join_ownership(built.result))
+			Loop(loop):
+				match build_outputs(loop.result, loop.carried, next_owner, unions, records):
+					Err(error): Err(error)
+					Ok(built):
+						entries = entries.append(AwaitingLoop({
+							loop = loop, result = built.result, carried = built.carried,
+							enclosing = enclosing.append({ first_value = first_value, sources = sources, owners = owners, position = step_position })
 						}))
 						next_owner = built.next_owner
 						carried = built.carried
@@ -909,7 +1063,7 @@ private pure func insert_steps(
 								failure = Some(error)
 								break
 							Ok(until):
-								owners = owners.append({ owner = owner, span = span })
+								owners = owners.append({ owner = owner, span = span, last = until })
 								-- A use at the block's end transfers or keeps this obligation.
 								if IntOps.less_than(until, count):
 									match drops.get(until):
@@ -922,7 +1076,7 @@ private pure func insert_steps(
 													failure = Some(internal_error(span, "invalid last-use position"))
 													break
 												Some(last):
-													drops = drops.set(until, bucket.append({ owner = owner, span = step_span(last) }))
+													drops = drops.set(until, bucket.append({ owner = owner, span = step_span(last), last = until }))
 					_:
 						void
 
@@ -935,16 +1089,16 @@ private pure func insert_steps(
 			match output:
 				UnmanagedJoinParameter(_): void
 				ManagedJoinParameter(_, owner):
-					owners = owners.append({ owner = owner, span = parameter.span })
 					match drop_position(schedule, slot, step_position, count, parameter.span):
 						Err(error): failure = Some(error)
 						Ok(until):
+							owners = owners.append({ owner = owner, span = parameter.span, last = until })
 							if IntOps.less_than(until, count):
 								match drops.get(until):
 									None: failure = Some(internal_error(parameter.span, "missing drop schedule row"))
 									Some(bucket):
 										match steps.get(until):
-											Some(last): drops = drops.set(until, bucket.append({ owner = owner, span = step_span(last) }))
+											Some(last): drops = drops.set(until, bucket.append({ owner = owner, span = step_span(last), last = until }))
 											None: failure = Some(internal_error(parameter.span, "invalid last-use position"))
 			if failure.is_some():
 				break
@@ -982,6 +1136,13 @@ private fixed record LeavingValue {
 }
 
 
+-- Loop outputs and multiple join outputs acquire before their sources retire.
+private pure func borrowed_result(source: ResultOwnership) -> ResultOwnership:
+	match source:
+		OwnedResult(owner): BorrowedResult(OwnerBorrow(owner))
+		_: source
+
+
 private pure func leave_with(
 	value: ValueId,
 	source: ResultOwnership,
@@ -1003,63 +1164,137 @@ private pure func leave_with(
 			}
 
 
--- A block's entries through its exit, before its joins' arms.
-private fixed record BlockExitEntries {
-	entries: List[InsertedEntry],
-	next_owner: Int,
-	exit: OwnedExit
+
+
+private fixed record InsertedSelectionEdge {
+	edge: OwnedSelectionEdge,
+	next_value: Int,
+	next_owner: Int
 }
 
 
-private fixed record InsertedBlock {
-	operations: List[OwnershipOperation],
-	exit: OwnedExit,
-	next_owner: Int,
-	next_value: Int
-}
+-- Selection borrows enclosing values. Only newly acquired occurrences cross
+-- the successful edge, so the complete enclosing owner snapshot stays live.
+private pure func selection_value(definition: Lower.SelectionDefinition) -> ValueDefinition:
+	match definition:
+		BorrowUnionField(parameter, field, parent):
+			{ id = parameter.id, value_type = parameter.value_type, operation = PayloadValue(field, parent), span = parameter.span }
+		BorrowListElement(parameter, index, parent):
+			{ id = parameter.id, value_type = parameter.value_type, operation = ListElementValue(index, parent), span = parameter.span }
+		CopyListSuffix(parameter, parent, skipped):
+			{ id = parameter.id, value_type = parameter.value_type, operation = ListSuffixValue(parent, skipped), span = parameter.span }
 
 
--- A function's block, or a tail match's arm. Its joins' arms follow its own
--- values and owners.
-private pure func insert_block(
-	steps: List[LoweredStep],
-	exit: LoweredExit,
+private pure func insert_selection_edge(
+	edge: SelectionEdge,
 	enclosing: List[EnclosingBlock],
 	first_value: Int,
 	initial_owner: Int,
 	unions: List[ConcreteUnion],
 	records: List[ConcreteRecord],
-) -> Result[InsertedBlock, Diagnostic]:
-	outer = enclosing_intervals(enclosing)
-	span_result = match exit:
-		ReturnValue(result): terminal_span(steps, result, outer)
-		RecurValues(_, span): Ok(span)
-	uses ?= exit_uses(steps, exit, outer, first_value, span_result)
-	span ?= span_result
-	inserted ?= insert_steps(steps, DropAtLastUse(uses), enclosing, first_value, initial_owner, unions, records)
-	exit_result: Result[BlockExitEntries, Diagnostic] = match exit:
-		RecurValues(arguments, span):
-			Ok({ entries = inserted.entries, next_owner = inserted.next_owner, exit = RecurArguments(arguments, span) })
-		ReturnValue(result):
-			match value_source(result, inserted.sources, enclosing, first_value, span):
-				Ok(source):
-					leaving = leave_with(result, source, inserted.entries, inserted.next_owner, span)
-					Ok({ entries = leaving.entries, next_owner = leaving.next_owner, exit = ReturnResult(leaving.transfer) })
-				Err(error): Err(error)
-	left ?= exit_result
-	completed ?= complete_joins(
-		left.entries,
-		IntOps.add(first_value, inserted.sources.length()),
-		left.next_owner,
-		unions,
-		records,
-	)
-	Ok({
-		operations = completed.operations,
-		exit = left.exit,
-		next_owner = completed.next_owner,
-		next_value = completed.next_value,
-	})
+) -> Result[InsertedSelectionEdge, Diagnostic]:
+	var sources: List[ResultOwnership] = []
+	var operations: List[OwnershipOperation] = []
+	var next_owner = initial_owner
+	var failure: Option[Diagnostic] = None
+	for definition in edge.definitions:
+		lowered = selection_value(definition)
+		match build_definition(lowered, sources, enclosing, first_value, next_owner, unions, records):
+			Err(error):
+				failure = Some(error)
+				break
+			Ok(built):
+				operations = operations.append(DefineValue(built.definition))
+				sources = sources.append(built.definition.result)
+				next_owner = built.next_owner
+	var transfers: List[ReturnTransfer] = []
+	var moved: List[Int] = []
+	for value in edge.arguments:
+		if failure.is_some():
+			break
+		match value_source(value, sources, enclosing, first_value, internal_span()):
+			Err(error): failure = Some(error)
+			Ok(source):
+				transferred_source = match source:
+					OwnedResult(owner):
+						if in_interval(value_number(value), first_value, sources.length()):
+							if moved.contains(owner_number(owner)):
+								borrowed_result(source)
+							else:
+								moved = moved.append(owner_number(owner))
+								source
+						else:
+							borrowed_result(source)
+					_: source
+				leaving = leave_with(value, transferred_source, [], next_owner, internal_span())
+				for entry in leaving.entries:
+					match entry:
+						Inserted(operation): operations = operations.append(operation)
+						_: failure = Some(internal_error(internal_span(), "selection edge contains control flow"))
+				transfers = transfers.append(leaving.transfer)
+				next_owner = leaving.next_owner
+	-- Fresh suffix roots that are not transferred retire locally. An unused
+	-- source wildcard never reaches this point: Lower emits no suffix for it.
+	for source in sources:
+		match source:
+			OwnedResult(owner):
+				if moved.contains(owner_number(owner)):
+					void
+				else:
+					operations = operations.append(DropOwner(owner, internal_span()))
+			_: void
+	match failure:
+		Some(error): Err(error)
+		None: Ok({
+			edge = { arm = edge.arm, operations = operations, transfers = transfers },
+			next_value = IntOps.add(first_value, sources.length()),
+			next_owner = next_owner,
+		})
+
+
+private fixed record InsertedSelection {
+	selection: OwnedSelection,
+	next_value: Int,
+	next_owner: Int
+}
+
+
+private pure func insert_selection(
+	selection: LoweredSelection,
+	scrutinee: OwnedArgument,
+	enclosing: List[EnclosingBlock],
+	first_value: Int,
+	initial_owner: Int,
+	unions: List[ConcreteUnion],
+	records: List[ConcreteRecord],
+) -> Result[InsertedSelection, Diagnostic]:
+	var nodes: List[OwnedDecisionNode] = []
+	var next_value = first_value
+	var next_owner = initial_owner
+	var failure: Option[Diagnostic] = None
+	for node in selection.nodes:
+		match node:
+			Lower.TestVariant(place, variant, yes, no):
+				nodes = nodes.append(TestVariant(place, variant, yes, no))
+			Lower.TestListLength(place, test, yes, no):
+				nodes = nodes.append(TestListLength(place, test, yes, no))
+			Lower.TestStringBytes(place, bytes, yes, no):
+				nodes = nodes.append(TestStringBytes(place, bytes, yes, no))
+			Lower.EnterArm(edge):
+				match insert_selection_edge(edge, enclosing, next_value, next_owner, unions, records):
+					Err(error):
+						failure = Some(error)
+						break
+					Ok(inserted):
+						nodes = nodes.append(EnterArm(inserted.edge))
+						next_value = inserted.next_value
+						next_owner = inserted.next_owner
+	match failure:
+		Some(error): Err(error)
+		None: Ok({
+			selection = { scrutinee = scrutinee, nodes = nodes, entry = selection.entry },
+			next_value = next_value, next_owner = next_owner,
+		})
 
 
 private fixed record InsertedJoinArm {
@@ -1080,8 +1315,39 @@ private fixed record LeavingJoin {
 -- Multiple outgoing occurrences each acquire an independent obligation. Only
 -- after every acquisition may terminal-live arm-local sources retire. Sources
 -- already dropped by insert_steps, and all enclosing owners, remain untouched.
+private pure func retire_terminal_sources(
+	entries: List[InsertedEntry],
+	sources: List[ResultOwnership],
+	uses: List[Option[Int]],
+	position: Int,
+	span: Span,
+) -> Result[List[InsertedEntry], Diagnostic]:
+	var retired = entries
+	var slot = 0
+	var failure: Option[Diagnostic] = None
+	for source in sources:
+		match uses.get(slot):
+			None:
+				failure = Some(internal_error(span, "missing value-use row"))
+				break
+			Some(last_use):
+				match source:
+					OwnedResult(owner):
+						match last_use:
+							Some(last):
+								if IntOps.equals(last, position):
+									retired = retired.append(Inserted(DropOwner(owner, span)))
+							_: void
+					_: void
+		slot = IntOps.add(slot, 1)
+	match failure:
+		Some(error): Err(error)
+		None: Ok(retired)
+
+
 private pure func leave_join(
-	arm: JoinArm,
+	outputs: Lower.JoinOutputs,
+	step_count: Int,
 	parameters: List[ValueParameter],
 	inserted: InsertedSteps,
 	uses: List[Option[Int]],
@@ -1089,30 +1355,32 @@ private pure func leave_join(
 	first_value: Int,
 	span: Span,
 ) -> Result[LeavingJoin, Diagnostic]:
-	result_source ?= value_source(arm.value, inserted.sources, enclosing, first_value, span)
+	result_source ?= value_source(outputs.value, inserted.sources, enclosing, first_value, span)
 	moved = match result_source:
 		OwnedResult(owner):
-			if arm.carried.is_empty() and in_interval(value_number(arm.value), first_value, inserted.sources.length()):
+			movable = if outputs.carried.is_empty():
+				in_interval(value_number(outputs.value), first_value, inserted.sources.length())
+			else:
+				False
+			if movable:
 				result_source
 			else:
-				BorrowedResult(OwnerBorrow(owner))
+				borrowed_result(result_source)
 		_: result_source
-	leaving = leave_with(arm.value, moved, inserted.entries, inserted.next_owner, span)
+	leaving = leave_with(outputs.value, moved, inserted.entries, inserted.next_owner, span)
 	var entries = leaving.entries
 	var next_owner = leaving.next_owner
 	var carried: List[ReturnTransfer] = []
 	var position = 0
 	var failure: Option[Diagnostic] = None
 	for parameter in parameters:
-		match arm.carried.get(position):
+		match outputs.carried.get(position):
 			None: failure = Some(internal_error(span, "join arm carries the wrong number of values"))
 			Some(value):
 				match value_source(value, inserted.sources, enclosing, first_value, parameter.span):
 					Err(error): failure = Some(error)
 					Ok(carrier_source):
-						borrowed = match carrier_source:
-							OwnedResult(owner): BorrowedResult(OwnerBorrow(owner))
-							_: carrier_source
+						borrowed = borrowed_result(carrier_source)
 						left = leave_with(value, borrowed, entries, next_owner, parameter.span)
 						entries = left.entries
 						next_owner = left.next_owner
@@ -1120,77 +1388,136 @@ private pure func leave_join(
 		if failure.is_some():
 			break
 		position = IntOps.add(position, 1)
-	ready ?= match failure:
+	ready: Void ?= match failure:
 		Some(error): Err(error)
 		None: Ok(void)
-	if not arm.carried.is_empty():
-		var slot = 0
-		for source in inserted.sources:
-			match source:
-				OwnedResult(owner):
-					match uses.get(slot):
-						Some(last_use):
-							match last_use:
-								Some(last):
-									if IntOps.equals(last, arm.steps.length()):
-										entries = entries.append(Inserted(DropOwner(owner, span)))
-								None: void
-						None:
-							failure = Some(internal_error(span, "missing value-use row"))
-							break
-				_: void
-			slot = IntOps.add(slot, 1)
+	retired: List[InsertedEntry] ?= if outputs.carried.is_empty():
+		Ok(entries)
+	else:
+		retire_terminal_sources(entries, inserted.sources, uses, step_count, span)
+
 	match failure:
 		Some(error): Err(error)
 		None:
 			Ok({
-				entries = entries,
+				entries = retired,
 				transfer = leaving.transfer,
 				carried = carried,
 				next_owner = next_owner,
 			})
 
 
--- A yield moves only an owner made in its arm, so every edge into the join
--- leaves the same enclosing owners live; a yielded enclosing value is
--- acquired again first.
+private pure func join_terminal_span(arm: JoinArm, result: ValueId, outer: List[ValueInterval]) -> Result[Span, Diagnostic]:
+	var input_span: Option[Span] = None
+	for parameter in arm.inputs:
+		if IntOps.equals(value_number(parameter.id), value_number(result)):
+			input_span = Some(parameter.span)
+			break
+	match input_span:
+		Some(span): Ok(span)
+		None: terminal_span(arm.steps, result, outer)
+
+
+private pure func insert_yielding_arm(
+	arm: JoinArm,
+	outputs: Lower.JoinOutputs,
+	parameters: List[ValueParameter],
+	result_span: Span,
+	enclosing: List[EnclosingBlock],
+	loop_scope: Option[LoopScope],
+	first_value: Int,
+	inputs: BuiltInputs,
+	unions: List[ConcreteUnion],
+	records: List[ConcreteRecord],
+) -> Result[InsertedJoinArm, Diagnostic]:
+	admitted: Void ?= if IntOps.equals(outputs.carried.length(), parameters.length()):
+		Ok(void)
+	else:
+		Err(internal_error(result_span, "join arm carries the wrong number of values"))
+	outer = enclosing_intervals(enclosing)
+	span ?= join_terminal_span(arm, outputs.value, outer)
+	terminal: BlockTerminal = TerminalJoin(outputs.value, outputs.carried, parameters)
+	uses ?= block_uses(arm.steps, terminal, outer, first_value, arm.inputs.length(), Ok(span))
+	inserted ?= insert_steps(arm.steps, DropAtLastUse(uses), enclosing, first_value, inputs.next_owner, inputs.parameters, loop_scope, unions, records)
+	leaving ?= leave_join(outputs, arm.steps.length(), parameters, inserted, uses, enclosing, first_value, span)
+	completed ?= complete_joins(leaving.entries, IntOps.add(first_value, inserted.sources.length()), leaving.next_owner, unions, records)
+	Ok({
+		arm = { id = arm.id, inputs = inputs.parameters, operations = completed.operations, exit = Yield({ transfer = leaving.transfer, carried = leaving.carried }) },
+		next_owner = completed.next_owner, next_value = completed.next_value,
+	})
+
+
+private pure func insert_abrupt_arm(
+	arm: JoinArm,
+	target: Lower.LoopTarget,
+	tail: Lower.LoopTail,
+	result_span: Span,
+	enclosing: List[EnclosingBlock],
+	loop_scope: Option[LoopScope],
+	first_value: Int,
+	inputs: BuiltInputs,
+	unions: List[ConcreteUnion],
+	records: List[ConcreteRecord],
+) -> Result[InsertedJoinArm, Diagnostic]:
+	scope ?= require_loop_scope(loop_scope, target, result_span)
+	body ?= insert_loop_block({ steps = arm.steps, tail = tail }, inputs.parameters, 0, enclosing, scope, first_value, inputs.next_owner, result_span, unions, records)
+	Ok({
+		arm = { id = arm.id, inputs = inputs.parameters, operations = body.body.operations, exit = TransferLoop(target, body.body.tail) },
+		next_owner = body.next_owner, next_value = body.next_value,
+	})
+
+
 private pure func insert_join_arm(
 	arm: JoinArm,
 	parameters: List[ValueParameter],
 	result_span: Span,
 	enclosing: List[EnclosingBlock],
+	loop_scope: Option[LoopScope],
 	first_value: Int,
 	initial_owner: Int,
 	unions: List[ConcreteUnion],
 	records: List[ConcreteRecord],
 ) -> Result[InsertedJoinArm, Diagnostic]:
-	admitted ?= if IntOps.equals(arm.carried.length(), parameters.length()):
-		Ok(void)
-	else:
-		Err(internal_error(result_span, "join arm carries the wrong number of values"))
-	result = arm.value
-	outer = enclosing_intervals(enclosing)
-	span_result = terminal_span(arm.steps, result, outer)
-	terminal = if arm.carried.is_empty():
-		TerminalValue(result)
-	else:
-		TerminalJoin(result, arm.carried, parameters)
-	uses ?= block_uses(arm.steps, terminal, outer, first_value, span_result)
-	span ?= span_result
-	inserted ?= insert_steps(arm.steps, DropAtLastUse(uses), enclosing, first_value, initial_owner, unions, records)
-	leaving ?= leave_join(arm, parameters, inserted, uses, enclosing, first_value, span)
-	completed ?= complete_joins(
-		leaving.entries,
-		IntOps.add(first_value, inserted.sources.length()),
-		leaving.next_owner,
-		unions,
-		records,
-	)
-	Ok({
-		arm = { label = arm.label, operations = completed.operations, transfer = leaving.transfer, carried = leaving.carried },
-		next_owner = completed.next_owner,
-		next_value = completed.next_value,
-	})
+	inputs ?= build_inputs(arm.inputs, initial_owner, unions, records)
+	match arm.exit:
+		Lower.Yield(outputs): insert_yielding_arm(arm, outputs, parameters, result_span, enclosing, loop_scope, first_value, inputs, unions, records)
+		Lower.TransferLoop(target, tail): insert_abrupt_arm(arm, target, tail, result_span, enclosing, loop_scope, first_value, inputs, unions, records)
+
+
+private fixed record CompletedOwnedJoin {
+	join: OwnedJoin,
+	next_value: Int,
+	next_owner: Int
+}
+
+
+private pure func complete_pending_join(
+	pending: PendingOwnedJoin,
+	first_value: Int,
+	initial_owner: Int,
+	unions: List[ConcreteUnion],
+	records: List[ConcreteRecord],
+) -> Result[CompletedOwnedJoin, Diagnostic]:
+	selected ?= insert_selection(pending.join.selection, pending.scrutinee, pending.enclosing, first_value, initial_owner, unions, records)
+	var next_value = selected.next_value
+	var next_owner = selected.next_owner
+	var arms: List[OwnedJoinArm] = []
+	var failure: Option[Diagnostic] = None
+	for arm in pending.join.arms:
+		match insert_join_arm(arm, pending.join.carried, pending.join.result.span, pending.enclosing, pending.loop_scope, next_value, next_owner, unions, records):
+			Err(error):
+				failure = Some(error)
+				break
+			Ok(inserted):
+				arms = arms.append(inserted.arm)
+				next_value = inserted.next_value
+				next_owner = inserted.next_owner
+	match failure:
+		Some(error): Err(error)
+		None: Ok({
+			join = { result = pending.result, carried = pending.carried, selection = selected.selection, arms = arms },
+			next_value = next_value, next_owner = next_owner,
+		})
 
 
 private fixed record CompletedJoins {
@@ -1201,7 +1528,8 @@ private fixed record CompletedJoins {
 
 
 -- Builds each join's definition once its block is complete: its arms are
--- inserted after the block's own values and owners, in join and arm order.
+-- inserted after the block's own values and owners: selection edges first,
+-- then canonical inputs and ordinary arm bodies in arm order.
 private pure func complete_joins(
 	entries: List[InsertedEntry],
 	first_value: Int,
@@ -1217,220 +1545,251 @@ private pure func complete_joins(
 		match entry:
 			Inserted(operation):
 				operations = operations.append(operation)
+			AwaitingLoop(pending):
+				match insert_loop(pending.loop, pending.enclosing, next_value, next_owner, unions, records):
+					Err(error):
+						failure = Some(error)
+						break
+					Ok(built):
+						operations = operations.append(ExecuteLoop({ entry_acquisitions = built.acquisitions, headers = built.headers, result = pending.result, carried = pending.carried, body = built.body }))
+						next_value = built.next_value
+						next_owner = built.next_owner
 			AwaitingArms(join):
-				var arms: List[OwnedJoinArm] = []
-				for arm in join.join.arms:
-					match insert_join_arm(arm, join.join.carried, join.join.result.span, join.enclosing, next_value, next_owner, unions, records):
-						Err(error):
-							failure = Some(error)
-							break
-						Ok(inserted):
-							arms = arms.append(inserted.arm)
-							next_value = inserted.next_value
-							next_owner = inserted.next_owner
-				if failure.is_some():
-					break
-				operations = operations.append(ExecuteJoin({
-					result = join.result,
-					carried = join.carried,
-					scrutinee = join.scrutinee,
-					owner = join.join.owner,
-					arms = arms,
-				}))
+				match complete_pending_join(join, next_value, next_owner, unions, records):
+					Err(error):
+						failure = Some(error)
+						break
+					Ok(completed):
+						operations = operations.append(ExecuteJoin(completed.join))
+						next_value = completed.next_value
+						next_owner = completed.next_owner
 	match failure:
 		Some(error): Err(error)
 		None: Ok({ operations = operations, next_owner = next_owner, next_value = next_value })
 
 
-private pure func insert_match(
-	function: LoweredFunction,
-	matched: LoweredMatch,
-	unions: List[ConcreteUnion],
-	records: List[ConcreteRecord],
-) -> Result[OwnedFunction, Diagnostic]:
-	prefix ?= insert_steps(function.steps, DropInEachArm, [], 0, 0, unions, records)
-	prefix_owners = prefix.owners
-	scrutinee_span ?= value_span(function.steps, matched.scrutinee)
-		.to_result(internal_error(internal_span(), "missing match scrutinee definition"))
-	scrutinee ?= borrow_argument(matched.scrutinee, prefix.sources, [], 0, scrutinee_span)
-	joined ?= complete_joins(prefix.entries, prefix.sources.length(), prefix.next_owner, unions, records)
-	enclosing: List[EnclosingBlock] = [{ first_value = 0, sources = prefix.sources }]
-	var next_value = joined.next_value
-	var next_owner = joined.next_owner
-	var arms: List[OwnedArm] = []
+private fixed record InsertedLoopBlock {
+	body: OwnedLoopBlock,
+	next_value: Int,
+	next_owner: Int
+}
+
+
+private fixed record InsertedLoop {
+	acquisitions: List[OwnerAcquisition],
+	headers: List[OwnedLoopHeader],
+	body: OwnedLoopBlock,
+	next_value: Int,
+	next_owner: Int
+}
+
+
+private fixed record LoopEdgeEntries {
+	entries: List[InsertedEntry],
+	exit: OwnedLoopExit,
+	next_owner: Int
+}
+
+
+private pure func loop_exit_values(exit: LoopExit) -> List[ValueId]:
+	match exit:
+		Lower.Recur(arguments, _): arguments
+		Lower.Break(outputs): [outputs.value].concat(outputs.carried)
+
+
+private pure func loop_exit_span(exit: LoopExit) -> Span:
+	match exit:
+		Lower.Recur(_, span): span
+		Lower.Break(outputs): outputs.span
+
+
+private pure func require_loop_scope(scope: Option[LoopScope], target: Lower.LoopTarget, span: Span) -> Result[LoopScope, Diagnostic]:
+	match scope:
+		None: Err(internal_error(span, "loop transfer has no active loop"))
+		Some(active):
+			if IntOps.equals(value_number(Lower.loop_target_value(active.target)), value_number(Lower.loop_target_value(target))):
+				Ok(active)
+			else:
+				Err(internal_error(span, "loop transfer does not target the nearest loop"))
+
+
+-- Scheduling records are frozen at the exact occurrence. Earlier drops are
+-- excluded without walking or reconstructing the enclosing source body.
+private pure func retire_live(
+	entries: List[InsertedEntry], owners: List[ScheduledDrop], position: Int,
+) -> List[InsertedEntry]:
+	var retired = entries
+	for owner in owners:
+		if IntOps.greater_than_or_equal(owner.last, position):
+			retired = retired.append(Inserted(DropOwner(owner.owner, owner.span)))
+	retired
+
+
+private pure func leave_loop(
+	exit: LoopExit,
+	inserted: InsertedSteps,
+	enclosing: List[EnclosingBlock],
+	scope: LoopScope,
+	first_value: Int,
+	position: Int,
+) -> Result[LoopEdgeEntries, Diagnostic]:
+	span = loop_exit_span(exit)
+	var entries = inserted.entries
+	var next_owner = inserted.next_owner
+	var transfers: List[ReturnTransfer] = []
 	var failure: Option[Diagnostic] = None
-
-	for arm in matched.arms:
-		match insert_block(
-			arm.body.steps,
-			arm.body.exit,
-			enclosing,
-			next_value,
-			next_owner,
-			unions,
-			records,
-		):
-			Ok(built):
-				var arm_operations = built.operations
-
-				returned = match built.exit:
-					ReturnResult(OwnedReturn(_, owner)):
-						Some(owner)
-					_:
-						None
-
-				-- Prefix obligations remain live until this selected arm exits.
-				-- Return acquisition has already run, before any ancestor cleanup.
-				for pending in prefix_owners:
-					transferred = match returned:
-						Some(owner):
-							IntOps.equals(owner_number(owner), owner_number(pending.owner))
-						None:
-							False
-
-					if not transferred:
-						arm_operations = arm_operations.append(
-							DropOwner(
-								pending.owner,
-								pending.span,
-							),
-						)
-
-				arms = arms.append({
-					label = arm.label,
-					operations = arm_operations,
-					exit = built.exit,
-				})
-				next_value = built.next_value
-				next_owner = built.next_owner
+	for value in loop_exit_values(exit):
+		match value_source(value, inserted.sources, enclosing, first_value, span):
 			Err(error):
 				failure = Some(error)
 				break
-
-	match failure:
-		Some(error):
-			Err(error)
-		None:
-			Ok({
-				execution = function.execution,
-				signature = function.signature,
-				operations = joined.operations,
-				tail = MatchTail({
-					scrutinee = scrutinee,
-					owner = matched.owner,
-					arms = arms,
-				}),
-			})
-
-
-private pure func managed_loop(span: Span) -> Diagnostic:
-	{
-		span = span,
-		note = None,
-		message = "managed values in @tail_recursive functions are not supported yet",
-		help = "use an unmanaged helper, or remove @tail_recursive"
-	}
+			Ok(source):
+				leaving = leave_with(value, borrowed_result(source), entries, next_owner, span)
+				entries = leaving.entries
+				next_owner = leaving.next_owner
+				transfers = transfers.append(leaving.transfer)
+	ready: Void ?= match failure:
+		Some(error): Err(error)
+		None: Ok(void)
+	entries = retire_live(entries, inserted.owners, position)
+	var ordinal = 0
+	for block in enclosing:
+		if IntOps.greater_than_or_equal(ordinal, scope.pre_blocks):
+			entries = retire_live(entries, block.owners, block.position)
+		ordinal = IntOps.add(ordinal, 1)
+	owned_exit: OwnedLoopExit ?= match exit:
+		Lower.Recur(_, occurrence): Ok(Recur(transfers, occurrence))
+		Lower.Break(outputs):
+			match transfers:
+				[first, ...carried]: Ok(Break({ value = first, carried = carried, span = outputs.span }))
+				[]: Err(internal_error(span, "missing loop result transfer"))
+	Ok({ entries = entries, exit = owned_exit, next_owner = next_owner })
 
 
-private pure func admit_unmanaged(
-	value_type: TypeRef,
+private pure func insert_loop_exit_block(
+	steps: List[LoweredStep],
+	exit: LoopExit,
+	seed_inputs: List[OwnedJoinParameter],
+	held_headers: Int,
+	enclosing: List[EnclosingBlock],
+	scope: LoopScope,
+	first_value: Int,
+	initial_owner: Int,
 	span: Span,
 	unions: List[ConcreteUnion],
 	records: List[ConcreteRecord],
-) -> Result[Void, Diagnostic]:
-	plan ?= value_ownership(value_type, unions, records)
-	match plan:
-		NoOwnership: Ok(void)
-		_: Err(managed_loop(span))
+) -> Result[InsertedLoopBlock, Diagnostic]:
+	uses ?= block_uses(steps, TerminalArguments(loop_exit_values(exit), loop_exit_span(exit)), enclosing_intervals(enclosing), first_value, seed_inputs.length(), Ok(span))
+	-- Header obligations survive until the complete edge batch, including
+	-- old values that are not outgoing. Arm inputs keep last-use scheduling.
+	var held_uses = uses
+	var input_slot = 0
+	while IntOps.less_than(input_slot, held_headers):
+		held_uses = held_uses.set(input_slot, Some(steps.length()))
+		input_slot = IntOps.add(input_slot, 1)
+	inserted ?= insert_steps(steps, DropAtLastUse(held_uses), enclosing, first_value, initial_owner, seed_inputs, Some(scope), unions, records)
+	leaving ?= leave_loop(exit, inserted, enclosing, scope, first_value, steps.length())
+	completed ?= complete_joins(leaving.entries, IntOps.add(first_value, inserted.sources.length()), leaving.next_owner, unions, records)
+	Ok({ body = { operations = completed.operations, tail = ExitLoop(leaving.exit) }, next_value = completed.next_value, next_owner = completed.next_owner })
 
 
--- A self-tail loop admits only unmanaged current-source values.
-private pure func admit_loop_values(
+private pure func insert_loop_match_block(
 	steps: List[LoweredStep],
+	matched: Lower.LoopMatch,
+	seed_inputs: List[OwnedJoinParameter],
+	enclosing: List[EnclosingBlock],
+	scope: LoopScope,
+	first_value: Int,
+	initial_owner: Int,
+	span: Span,
 	unions: List[ConcreteUnion],
 	records: List[ConcreteRecord],
-) -> Result[Void, Diagnostic]:
-	var invalid: Option[Diagnostic] = None
-	for step in steps:
-		checked = match step:
-			Define(definition): admit_unmanaged(definition.value_type, definition.span, unions, records)
-			Join(join): admit_unmanaged(join.result.value_type, join.result.span, unions, records)
-		match checked:
-			Err(error):
-				invalid = Some(error)
-				break
-			Ok(_): void
-		match step:
-			Define(_): void
-			Join(join):
-				for parameter in join.carried:
-					match admit_unmanaged(parameter.value_type, parameter.span, unions, records):
-						Err(error):
-							invalid = Some(error)
-							break
-						Ok(_): void
-				if invalid.is_some():
-					break
-				for arm in join.arms:
-					match admit_loop_values(arm.steps, unions, records):
-						Err(error):
-							invalid = Some(error)
-							break
-						Ok(_): void
-		if invalid.is_some():
+) -> Result[InsertedLoopBlock, Diagnostic]:
+	prefix ?= insert_steps(steps, DropInEachArm, enclosing, first_value, initial_owner, seed_inputs, Some(scope), unions, records)
+	scrutinee ?= borrow_argument(matched.selection.scrutinee, prefix.sources, enclosing, first_value, span)
+	completed ?= complete_joins(prefix.entries, IntOps.add(first_value, prefix.sources.length()), prefix.next_owner, unions, records)
+	outer: List[EnclosingBlock] = enclosing.append({ first_value = first_value, sources = prefix.sources, owners = prefix.owners, position = steps.length() })
+	selected ?= insert_selection(matched.selection, scrutinee, outer, completed.next_value, completed.next_owner, unions, records)
+	var next_value = selected.next_value
+	var next_owner = selected.next_owner
+	var arms: List[OwnedLoopArm] = []
+	var failure: Option[Diagnostic] = None
+	for arm in matched.arms:
+		match build_inputs(arm.inputs, next_owner, unions, records):
+			Err(error): failure = Some(error)
+			Ok(inputs):
+				match insert_loop_block(arm.body, inputs.parameters, 0, outer, scope, next_value, inputs.next_owner, span, unions, records):
+					Err(error): failure = Some(error)
+					Ok(built):
+						arms = arms.append({ id = arm.id, inputs = inputs.parameters, body = built.body })
+						next_value = built.next_value
+						next_owner = built.next_owner
+		if failure.is_some():
 			break
-	match invalid:
+	match failure:
+		Some(error): Err(error)
+		None: Ok({ body = { operations = completed.operations, tail = MatchLoop({ selection = selected.selection, arms = arms }) }, next_value = next_value, next_owner = next_owner })
+
+
+private pure func insert_loop_block(
+	block: Lower.LoopBlock,
+	seed_inputs: List[OwnedJoinParameter],
+	held_headers: Int,
+	enclosing: List[EnclosingBlock],
+	scope: LoopScope,
+	first_value: Int,
+	initial_owner: Int,
+	span: Span,
+	unions: List[ConcreteUnion],
+	records: List[ConcreteRecord],
+) -> Result[InsertedLoopBlock, Diagnostic]:
+	match block.tail:
+		Lower.ExitLoop(exit): insert_loop_exit_block(block.steps, exit, seed_inputs, held_headers, enclosing, scope, first_value, initial_owner, span, unions, records)
+		Lower.MatchLoop(matched): insert_loop_match_block(block.steps, matched, seed_inputs, enclosing, scope, first_value, initial_owner, span, unions, records)
+
+
+private pure func insert_loop(
+	loop: LoweredLoop,
+	enclosing: List[EnclosingBlock],
+	first_value: Int,
+	initial_owner: Int,
+	unions: List[ConcreteUnion],
+	records: List[ConcreteRecord],
+) -> Result[InsertedLoop, Diagnostic]:
+	var acquisitions: List[OwnerAcquisition] = []
+	var initials: List[ReturnTransfer] = []
+	var next_owner = initial_owner
+	var failure: Option[Diagnostic] = None
+	for header in loop.headers:
+		match value_source(header.initial, [], enclosing, first_value, header.parameter.span):
+			Err(error): failure = Some(error)
+			Ok(source):
+				left = leave_with(header.initial, borrowed_result(source), [], next_owner, header.parameter.span)
+				for entry in left.entries:
+					match entry:
+						Inserted(AcquireOwner(owner, borrow, _)): acquisitions = acquisitions.append({ owner = owner, borrow = borrow })
+						_: failure = Some(internal_error(header.parameter.span, "loop entry contains a non-acquisition operation"))
+				initials = initials.append(left.transfer)
+				next_owner = left.next_owner
+		if failure.is_some():
+			break
+	ready: Void ?= match failure:
 		Some(error): Err(error)
 		None: Ok(void)
-
-
-private pure func admit_loop(
-	function: LoweredFunction,
-	unions: List[ConcreteUnion],
-	records: List[ConcreteRecord],
-) -> Result[Void, Diagnostic]:
-	match function.execution:
-		OrdinaryCalls:
-			Ok(void)
-		SelfTailLoop(annotation):
-			var invalid: Option[Diagnostic] = None
-
-			for value_type in function.signature.parameters.append(function.signature.return_type):
-				match value_ownership(value_type, unions, records):
-					Err(error):
-						invalid = Some(error)
-						break
-					Ok(ManagedStringLeaf) | Ok(ManagedListRoot) | Ok(ManagedRecordRoot(_)) | Ok(InlineOwnedFields(_)) | Ok(ManagedUnionRoot(_)):
-						invalid = Some(managed_loop(annotation))
-						break
-					Ok(NoOwnership):
-						void
-
-			match invalid:
-				Some(error):
-					Err(error)
-				None:
-					match admit_loop_values(function.steps, unions, records):
-						Ok(prefix):
-
-							match function.tail:
-								ExitValue(_):
-									Ok(void)
-								MatchValue(matched):
-									for arm in matched.arms:
-										match admit_loop_values(arm.body.steps, unions, records):
-											Err(error):
-												invalid = Some(error)
-												break
-											Ok(_):
-												void
-
-									match invalid:
-										Some(error):
-											Err(error)
-										None:
-											Ok(void)
-						Err(error): Err(error)
+	inputs ?= build_inputs(loop.headers.map(pure func(header): header.parameter), next_owner, unions, records)
+	var headers: List[OwnedLoopHeader] = []
+	var position = 0
+	for parameter in inputs.parameters:
+		match initials.get(position):
+			None: failure = Some(internal_error(join_parameter(parameter).span, "missing loop initial transfer"))
+			Some(initial): headers = headers.append({ parameter = parameter, initial = initial })
+		position = IntOps.add(position, 1)
+	headers_ready: Void ?= match failure:
+		Some(error): Err(error)
+		None: Ok(void)
+	scope: LoopScope = { target = Lower.loop_target(loop.result.id), pre_blocks = enclosing.length() }
+	body ?= insert_loop_block(loop.body, inputs.parameters, loop.headers.length(), enclosing, scope, first_value, inputs.next_owner, loop.result.span, unions, records)
+	Ok({ acquisitions = acquisitions, headers = headers, body = body.body, next_value = body.next_value, next_owner = body.next_owner })
 
 
 pure func insert_function(
@@ -1438,21 +1797,13 @@ pure func insert_function(
 	unions: List[ConcreteUnion],
 	records: List[ConcreteRecord],
 ) -> Result[OwnedFunction, Diagnostic]:
-	admitted ?= admit_loop(function, unions, records)
-
-	match function.tail:
-		ExitValue(exit):
-			match insert_block(function.steps, exit, [], 0, 0, unions, records):
-				Ok(built):
-					Ok({
-						execution = function.execution,
-						signature = function.signature,
-						operations = built.operations,
-						tail = ReturnTail(built.exit),
-					})
-				Err(error): Err(error)
-		MatchValue(matched):
-			insert_match(function, matched, unions, records)
+	span ?= terminal_span(function.steps, function.result, [])
+	uses ?= block_uses(function.steps, TerminalValue(function.result), [], 0, 0, Ok(span))
+	inserted ?= insert_steps(function.steps, DropAtLastUse(uses), [], 0, 0, [], None, unions, records)
+	source ?= value_source(function.result, inserted.sources, [], 0, span)
+	leaving = leave_with(function.result, source, inserted.entries, inserted.next_owner, span)
+	completed ?= complete_joins(leaving.entries, inserted.sources.length(), leaving.next_owner, unions, records)
+	Ok({ signature = function.signature, operations = completed.operations, result = leaving.transfer })
 
 
 pure func own(program: LoweredProgram) -> Result[OwnershipProgram, Diagnostic]:

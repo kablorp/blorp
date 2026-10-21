@@ -1,4 +1,6 @@
 import:
+	../../../src/verify/verify: verify
+	../../../src/check/model as Checked: match_arm_number
 	../../../src/lower/lower as Lower
 	../../../src/own/own as Own
 	../../../src/specialize/specialize as Concrete
@@ -12,50 +14,119 @@ import:
 	../managed_union_inputs: BOX_INPUTS, BOX_SOURCE, lowered, lowered_modules
 	../module_input: INTEGER_OPERATIONS, ModuleInput, STRING_OPERATIONS
 	../../../src/load/load: load_program
-	../../../src/check/check: check
-	../input: setup_diagnostic
+	../../../src/check/check: check, checked_functions
+	../input: checked_source, setup_diagnostic
 	system: read_file, temp_dir, write_file
 	fs: temporary_directory, resource_path, message
 	test: TestSuite
 
 
-private pure func helper_arm_acquires(arm: Own.OwnedArm, expected: Own.BorrowSource, construct: Bool) -> Bool:
-	acquisitions = arm.operations.filter(pure func(operation):
-		match operation:
-			Own.AcquireOwner(_, _, _): True
-			_: False
-	)
-	match (acquisitions, arm.exit):
-		([Own.AcquireOwner(child, borrow, _)], Own.ReturnResult(Own.OwnedReturn(returned, parent))):
-			source = match (expected, borrow.source):
-				(Own.ParameterBorrow(a), Own.ParameterBorrow(b)): same_value(a, b) and same_value(a, borrow.value)
-				(Own.PayloadBorrow(a), Own.PayloadBorrow(b)):
-					match arm.operations.get(0):
-						Some(Own.DefineValue(payload)):
-							match payload.operation:
-								Own.PayloadDefinition(_, parent_value): same_value(a, b) and same_value(a, parent_value) and same_value(payload.id, borrow.value)
+private pure func selected_payload_acquires(selection: Own.OwnedSelection, arm: Own.OwnedJoinArm, expected: Lower.ValueId) -> Bool:
+	selection.nodes.any(pure func(node):
+		match node:
+			Own.EnterArm(edge):
+				if match_arm_number(edge.arm) == match_arm_number(arm.id):
+					match (edge.operations, edge.transfers, arm.inputs):
+						([Own.DefineValue(payload), Own.AcquireOwner(acquired, borrow, _)], [Own.OwnedReturn(value, moved)], [Own.ManagedJoinParameter(input, canonical)]):
+							match (payload.operation, payload.result, borrow.source):
+								(Own.PayloadDefinition(_, source), Own.BorrowedResult(Own.PayloadBorrow(parent)), Own.PayloadBorrow(backing)):
+									(
+										same_value(source, expected)
+										and same_value(parent, expected)
+										and same_value(backing, expected)
+										and same_value(value, payload.id)
+										and same_value(borrow.value, payload.id)
+										and same_owner(acquired, moved)
+										and not same_owner(acquired, canonical)
+										and not same_value(input.id, payload.id)
+									)
 								_: False
 						_: False
-				_: False
-			definitions = match expected:
-				Own.PayloadBorrow(_): 1
-				_: 0
-			if construct:
-				match arm.operations.get(definitions + 1):
-					Some(Own.DefineValue(result)):
-						match (result.operation, result.result):
-							(Own.ConstructDefinition(_, [Own.OwnedPayload(value, transferred)]), Own.OwnedResult(owner)):
-								(
-									source and arm.operations.length() == definitions + 2
-									and same_value(value, borrow.value) and same_owner(child, transferred)
-									and same_value(returned, result.id) and same_owner(parent, owner)
-								)
-							_: False
-					_: False
-			else:
-				source and arm.operations.length() == definitions + 1 and same_value(returned, borrow.value) and same_owner(child, parent)
-		_: False
+				else:
+					False
+			_: False
+	)
 
+
+private pure func helper_arm_acquires(selection: Own.OwnedSelection, arm: Own.OwnedJoinArm, expected: Own.BorrowSource, construct: Bool) -> Bool:
+	match expected:
+		Own.PayloadBorrow(parent):
+			selected = selected_payload_acquires(selection, arm, parent)
+			match arm.inputs:
+				[Own.ManagedJoinParameter(input, input_owner)]:
+					if construct:
+						match arm.exit:
+							Own.Yield(arm_yield):
+								match (arm.operations, arm_yield.transfer):
+									([Own.AcquireOwner(acquired, borrow, _), Own.DefineValue(result), Own.DropOwner(dropped, _)], Own.OwnedReturn(returned, moved)):
+										match (borrow.source, result.operation, result.result):
+											(Own.OwnerBorrow(backing), Own.ConstructDefinition(_, [Own.OwnedPayload(value, transferred)]), Own.OwnedResult(owner)):
+												(
+													selected
+													and same_owner(backing, input_owner)
+													and same_owner(dropped, input_owner)
+													and same_value(value, input.id)
+													and same_value(borrow.value, input.id)
+													and same_owner(acquired, transferred)
+													and same_value(returned, result.id)
+													and same_owner(owner, moved)
+													and arm_yield.carried.is_empty()
+												)
+											_: False
+									_: False
+							Own.TransferLoop(_, _): False
+					else:
+						match arm.exit:
+							Own.Yield(arm_yield):
+								match (arm.operations, arm_yield.transfer):
+									([], Own.OwnedReturn(value, moved)):
+										(
+											selected
+											and same_value(value, input.id)
+											and same_owner(input_owner, moved)
+											and arm_yield.carried.is_empty()
+										)
+									_: False
+							Own.TransferLoop(_, _): False
+				_: False
+		Own.ParameterBorrow(parameter):
+			if construct:
+				match arm.exit:
+					Own.Yield(arm_yield):
+						match (arm.operations, arm_yield.transfer):
+							([Own.AcquireOwner(acquired, borrow, _), Own.DefineValue(result)], Own.OwnedReturn(value, moved)):
+								match (borrow.source, result.operation, result.result):
+									(Own.ParameterBorrow(source), Own.ConstructDefinition(_, [Own.OwnedPayload(stored, transferred)]), Own.OwnedResult(owner)):
+										(
+											same_value(source, parameter)
+											and same_value(borrow.value, parameter)
+											and same_value(stored, parameter)
+											and same_owner(acquired, transferred)
+											and same_value(value, result.id)
+											and same_owner(owner, moved)
+											and arm_yield.carried.is_empty()
+										)
+									_: False
+							_: False
+					Own.TransferLoop(_, _): False
+			else:
+				match arm.exit:
+					Own.Yield(arm_yield):
+						match (arm.operations, arm_yield.transfer):
+							([Own.AcquireOwner(acquired, borrow, _)], Own.OwnedReturn(value, moved)):
+								match borrow.source:
+									Own.ParameterBorrow(source):
+										(
+											same_value(source, parameter)
+											and same_value(borrow.value, parameter)
+											and same_value(value, parameter)
+											and same_owner(acquired, moved)
+											and arm_yield.carried.is_empty()
+										)
+									_: False
+							_: False
+					Own.TransferLoop(_, _): False
+		_: False
 
 func test_library_helpers_acquire_selected_values_and_leave_predicate_inputs_borrowed() -> Bool:
 	loaded = load_program("blorp_2/test/e2e/fixtures/generic/managed/option_result_helpers.brp", "blorp_2/standard_library").map_err(func(failure): failure.diagnostic.message)
@@ -72,55 +143,90 @@ func test_library_helpers_acquire_selected_values_and_leave_predicate_inputs_bor
 			var predicates = 0
 			var passed = True
 			for function in program.functions:
-				match (function.signature.parameters, function.signature.return_type, function.operations, function.tail):
-					([Concrete.UnionType(_), Concrete.StringType], _, [Own.DefineValue(optional), Own.DefineValue(default)], Own.MatchTail(matched)):
+				match (function.signature.parameters, function.signature.return_type, function.operations, function.result):
+					(
+						[Concrete.UnionType(_), Concrete.StringType], _,
+						[Own.DefineValue(optional), Own.DefineValue(default), Own.ExecuteJoin(matched)],
+						Own.OwnedReturn(function_result, function_owner),
+					):
 						selected = selected + 1
+						output = match matched.result:
+							Own.ManagedJoinParameter(joined, owner):
+								same_value(joined.id, function_result) and same_owner(owner, function_owner)
+							_: False
 						construct = match function.signature.return_type:
 							Concrete.UnionType(_): True
 							_: False
 						arms = match matched.arms:
-							[some, none]: helper_arm_acquires(some, Own.PayloadBorrow(optional.id), construct) and helper_arm_acquires(none, Own.ParameterBorrow(default.id), construct)
+							[some, none]:
+								(
+									helper_arm_acquires(matched.selection, some, Own.PayloadBorrow(optional.id), construct)
+									and helper_arm_acquires(matched.selection, none, Own.ParameterBorrow(default.id), construct)
+								)
 							_: False
-						passed = passed and parameter_scrutinee(matched.scrutinee, optional.id) and arms
-					([Concrete.UnionType(_)], Concrete.UnionType(_), [Own.DefineValue(parameter)], Own.MatchTail(matched)):
+						passed = passed and output and matched.carried.is_empty() and parameter_scrutinee(matched.selection.scrutinee, optional.id) and arms
+					(
+						[Concrete.UnionType(_)], Concrete.UnionType(_),
+						[Own.DefineValue(parameter), Own.ExecuteJoin(matched)],
+						Own.UnmanagedReturn(function_result),
+					):
 						predicates = predicates + 1
-						passed = passed and parameter_scrutinee(matched.scrutinee, parameter.id) and matched.arms.length() == 2 and matched.arms.all(pure func(arm):
-							match (arm.operations, arm.exit):
-								([Own.DefineValue(value)], Own.ReturnResult(Own.UnmanagedReturn(returned))):
-									match (value.operation, value.result):
-										(Own.ConstructDefinition(_, []), Own.UnmanagedResult): same_value(value.id, returned)
+						output = match matched.result:
+							Own.UnmanagedJoinParameter(joined): same_value(joined.id, function_result)
+							_: False
+						arms = matched.arms.all(pure func(arm):
+							match arm.exit:
+								Own.Yield(arm_yield):
+									match (arm.operations, arm_yield.transfer):
+										([Own.DefineValue(value)], Own.UnmanagedReturn(returned)):
+											match (value.operation, value.result):
+												(Own.ConstructDefinition(_, []), Own.UnmanagedResult):
+													same_value(value.id, returned) and arm_yield.carried.is_empty()
+												_: False
 										_: False
-								_: False
+								Own.TransferLoop(_, _): False
+						)
+						passed = (
+							passed
+							and output
+							and matched.carried.is_empty()
+							and parameter_scrutinee(matched.selection.scrutinee, parameter.id)
+							and matched.arms.length() == 2
+							and arms
 						)
 					_: void
 			passed and selected == 2 and predicates == 3
 
 
-private pure func callback_arm_transfers(arm: Own.OwnedArm, input: Lower.ValueId) -> Bool:
-	match (arm.operations, arm.exit):
-		([Own.DefineValue(payload), Own.DefineValue(call), Own.AcquireOwner(acquired, borrow, _), Own.DefineValue(result), Own.DropOwner(dropped, _)], Own.ReturnResult(Own.OwnedReturn(returned, parent))):
-			match (
-				(payload.operation, payload.result, call.operation),
-				(call.result, result.operation, result.result)
-			):
-				(
-					(Own.PayloadDefinition(_, source), Own.BorrowedResult(Own.PayloadBorrow(immediate)), Own.CallDefinition(Concrete.UserFunction(_), [Own.BorrowedArgument(argument)])),
-					(Own.OwnedResult(child), Own.ConstructDefinition(_, [Own.OwnedPayload(value, transferred)]), Own.OwnedResult(owner))
-				):
-					match (argument.source, borrow.source):
-						(Own.PayloadBorrow(borrowed_parent), Own.OwnerBorrow(backing)):
-							(
-								same_value(source, input) and same_value(immediate, input) and same_value(borrowed_parent, input)
-								and same_value(argument.value, payload.id) and same_value(value, call.id)
-								and same_value(borrow.value, call.id) and same_owner(backing, child) and same_owner(dropped, child)
-								and same_owner(acquired, transferred) and not same_owner(child, acquired)
-								and not same_owner(child, owner) and not same_owner(acquired, owner)
-								and same_value(returned, result.id) and same_owner(parent, owner)
-							)
+private pure func callback_arm_transfers(selection: Own.OwnedSelection, arm: Own.OwnedJoinArm, parent: Lower.ValueId) -> Bool:
+	match arm.exit:
+		Own.Yield(arm_yield):
+			match (arm.inputs, arm.operations, arm_yield.transfer):
+				([Own.ManagedJoinParameter(input, input_owner)], [Own.DefineValue(call), Own.DropOwner(input_drop, _), Own.AcquireOwner(acquired, borrow, _), Own.DefineValue(result), Own.DropOwner(dropped, _)], Own.OwnedReturn(returned, moved)):
+					match ((call.operation, call.result, result.operation, result.result), borrow.source):
+						((Own.CallDefinition(Concrete.UserFunction(_), [Own.BorrowedArgument(argument)]), Own.OwnedResult(child), Own.ConstructDefinition(_, [Own.OwnedPayload(value, transferred)]), Own.OwnedResult(owner)), Own.OwnerBorrow(backing)):
+							match argument.source:
+								Own.OwnerBorrow(input_backing):
+									(
+										selected_payload_acquires(selection, arm, parent)
+										and same_value(argument.value, input.id)
+										and same_owner(input_backing, input_owner)
+										and same_owner(input_drop, input_owner)
+										and same_value(value, call.id)
+										and same_value(borrow.value, call.id)
+										and same_owner(backing, child)
+										and same_owner(dropped, child)
+										and same_owner(acquired, transferred)
+										and not same_owner(child, acquired)
+										and not same_owner(child, owner)
+										and not same_owner(acquired, owner)
+										and same_value(returned, result.id)
+										and same_owner(moved, owner)
+									)
+								_: False
 						_: False
 				_: False
-		_: False
-
+		Own.TransferLoop(_, _): False
 
 private func library_callback_ownership() -> Result[Bool, String]:
 	with directory ?= temporary_directory(temp_dir(), "blorp-2-callback-ownership-") on error => message(error):
@@ -155,15 +261,19 @@ private func library_callback_ownership() -> Result[Bool, String]:
 				match call.operation:
 					Own.CallDefinition(Concrete.UserFunction(target), _):
 						function ?= program.functions.get(Concrete.function_number(target)).to_result("missing map instance")
-						match (function.signature.parameters, function.signature.return_type, function.operations, function.tail):
-							([Concrete.UnionType(input)], Concrete.UnionType(output), [Own.DefineValue(parameter)], Own.MatchTail(matched)):
+						match (function.signature.parameters, function.signature.return_type, function.operations, function.result):
+							([Concrete.UnionType(input)], Concrete.UnionType(output), [Own.DefineValue(parameter), Own.ExecuteJoin(matched)], Own.OwnedReturn(function_result, function_owner)):
+								output_matches = match matched.result:
+									Own.ManagedJoinParameter(joined, owner): same_value(joined.id, function_result) and same_owner(owner, function_owner)
+									_: False
 								match (parameter.operation, parameter.result, matched.arms):
 									(Own.ParameterDefinition(0), Own.BorrowedResult(Own.ParameterBorrow(borrowed)), [selected, bypassed]):
 										Ok(
-											Concrete.union_number(input) == Concrete.union_number(output) and Concrete.union_number(matched.owner) == Concrete.union_number(input)
-											and same_value(parameter.id, borrowed) and parameter_scrutinee(matched.scrutinee, parameter.id)
-											and callback_arm_transfers(selected, parameter.id)
-											and helper_arm_acquires(bypassed, Own.PayloadBorrow(parameter.id), True)
+											Concrete.union_number(input) == Concrete.union_number(output)
+											and same_value(parameter.id, borrowed) and parameter_scrutinee(matched.selection.scrutinee, parameter.id)
+											and callback_arm_transfers(matched.selection, selected, parameter.id)
+											and helper_arm_acquires(matched.selection, bypassed, Own.PayloadBorrow(parameter.id), True)
+											and output_matches and matched.carried.is_empty()
 										)
 									_: Ok(False)
 							_: Ok(False)
@@ -173,6 +283,80 @@ private func library_callback_ownership() -> Result[Bool, String]:
 
 func test_library_callback_borrows_input_and_transfers_selected_or_bypassed_owners() -> Bool:
 	library_callback_ownership().get_or(False)
+
+
+private func query_ownership() -> Result[Bool, String]:
+	with directory ?= temporary_directory(temp_dir(), "blorp-2-list-query-owners-") on error => message(error):
+		source: String =
+			|import:
+			|    list: get_or, last
+			|    int as IntOps
+			|pure func escape() -> Option[String]:
+			|    last([IntOps.to_string(42)])
+			|func main() -> Int:
+			|    selected = get_or(["value"], 0, "default")
+			|    escaped = escape()
+			|    0
+			|
+		path = directory.resource_path() + "/main.brp"
+		written ?= write_file(path, source)
+		loaded ?= load_program(path, "blorp_2/standard_library").map_err(func(failure): failure.diagnostic.message)
+		checked ?= check(loaded.program).map_err(pure func(failure): setup_diagnostic(failure).message)
+		concrete ?= Concrete.specialize(checked).map_err(pure func(error): error.message)
+		lowered ?= Lower.lower(concrete).map_err(pure func(error): error.message)
+		program ?= Own.own(lowered).map_err(pure func(error): error.message)
+		verified ?= verify(program).map_err(pure func(error): error.message)
+		var fallback = 0
+		var escaped = 0
+		var passed = True
+		for function in program.functions:
+			match (function.signature.parameters, function.signature.return_type, function.operations, function.result):
+				([Concrete.ListType(Concrete.StringType), Concrete.IntType, Concrete.StringType], Concrete.StringType, [Own.DefineValue(values), Own.DefineValue(_), Own.DefineValue(default), Own.DefineValue(optional), Own.ExecuteJoin(matched), Own.DropOwner(retired, _)], Own.OwnedReturn(returned, transferred)):
+					fallback = fallback + 1
+					match (optional.result, matched.arms, matched.result):
+						(Own.OwnedResult(parent), [some, none], Own.ManagedJoinParameter(joined, result_owner)):
+							scrutinee = match matched.selection.scrutinee:
+								Own.BorrowedArgument(borrow):
+									match borrow.source:
+										Own.OwnerBorrow(actual): same_owner(actual, parent) and same_value(borrow.value, optional.id)
+										_: False
+								_: False
+							passed = (
+								passed and scrutinee and matched.carried.is_empty()
+								and same_owner(parent, retired)
+								and same_value(joined.id, returned) and same_owner(result_owner, transferred)
+								and not same_owner(parent, result_owner)
+								and helper_arm_acquires(matched.selection, some, Own.PayloadBorrow(optional.id), False)
+								and helper_arm_acquires(matched.selection, none, Own.ParameterBorrow(default.id), False)
+							)
+						_: passed = False
+				([], Concrete.UnionType(_), _, Own.OwnedReturn(returned, transferred)):
+					match function.operations.reverse():
+						[Own.DropOwner(retired, _), Own.DefineValue(result), Own.DropOwner(original, _), Own.DefineValue(backing), Own.AcquireOwner(stored, source, _), Own.DefineValue(payload), ..._]:
+							match (backing.result, result.operation, result.result):
+								(Own.OwnedResult(parent), Own.CallDefinition(Concrete.UserFunction(_), [Own.BorrowedArgument(borrow)]), Own.OwnedResult(child)):
+									match (payload.result, backing.operation, source.source):
+										(Own.OwnedResult(initial), Own.ConstructListDefinition([Own.OwnedPayload(value, storage)]), Own.OwnerBorrow(origin)):
+											match borrow.source:
+												Own.OwnerBorrow(owner):
+													escaped = escaped + 1
+													passed = (
+														passed and same_owner(parent, retired) and same_owner(parent, owner) and same_value(backing.id, borrow.value)
+														and same_value(result.id, returned) and same_owner(child, transferred) and not same_owner(parent, child)
+														and same_owner(initial, original) and same_owner(initial, origin)
+														and same_value(payload.id, source.value) and same_value(payload.id, value)
+														and same_owner(stored, storage) and not same_owner(initial, stored)
+													)
+												_: passed = False
+										_: passed = False
+								_: passed = False
+						_: passed = False
+				_: void
+		Ok(passed and fallback == 1 and escaped == 1)
+
+
+func test_list_queries_acquire_each_selected_return_before_retiring_its_container() -> Bool:
+	query_ownership().get_or(False)
 
 
 private FRESH_SOURCE: String =
@@ -251,8 +435,8 @@ private pure func constructor_transfers_child(function: Own.OwnedFunction) -> Bo
 				Own.ConstructDefinition(_, [Own.OwnedPayload(value, transferred)]):
 					match box.result:
 						Own.OwnedResult(parent):
-							match function.tail:
-								Own.ReturnTail(Own.ReturnResult(Own.OwnedReturn(result, returned))):
+							match function.result:
+								Own.OwnedReturn(result, returned):
 									IntOps.equals(
 										Lower.value_number(value),
 										Lower.value_number(parameter.id),
@@ -327,8 +511,8 @@ func test_constant_source_has_the_same_child_transfer() -> Bool:
 private pure func fresh_acquires_child_before_dropping_original(function: Own.OwnedFunction) -> Bool:
 	match function.operations:
 		[Own.DefineValue(_), Own.DefineValue(text), Own.AcquireOwner(acquired, borrow, _), Own.DefineValue(box), Own.DropOwner(original, _)]:
-			match (box.operation, borrow.source, function.tail):
-				(Own.ConstructDefinition(_, [Own.OwnedPayload(value, child)]), Own.OwnerBorrow(backing), Own.ReturnTail(Own.ReturnResult(Own.OwnedReturn(result, parent)))):
+			match (box.operation, borrow.source, function.result):
+				(Own.ConstructDefinition(_, [Own.OwnedPayload(value, child)]), Own.OwnerBorrow(backing), Own.OwnedReturn(result, parent)):
 					(
 						same_value(value, text.id)
 						and same_value(borrow.value, text.id)
@@ -463,17 +647,13 @@ func test_last_uses_keep_constructor_and_later_child_use_distinct() -> Bool:
 				None:
 					False
 				Some(function):
-					match function.tail:
-						Lower.ExitValue(Lower.ReturnValue(result)):
-							match Own.last_uses(function.steps, result):
-								Ok(uses):
-									-- Int is read at 1; String at 2 and 3; Box returns at 4.
-									-- The appended length result is unused.
-									uses == [Some(1), Some(3), Some(4), None]
-								Err(error):
-									print_error(error.message)
-									False
-						_:
+					match Own.last_uses(function.steps, function.result):
+						Ok(uses):
+							-- Int is read at 1; String at 2 and 3; Box returns at 4.
+							-- The appended length result is unused.
+							uses == [Some(1), Some(3), Some(4), None]
+						Err(error):
+							print_error(error.message)
 							False
 
 
@@ -491,40 +671,15 @@ private pure func parameter_scrutinee(argument: Own.OwnedArgument, expected: Low
 
 private pure func projection_borrows_immediate_parent(function: Own.OwnedFunction) -> Bool:
 	match function.operations:
-		[Own.DefineValue(parameter)]:
-			match function.tail:
-				Own.MatchTail(matched):
-					match matched.arms:
-						[arm]:
-							match arm.operations:
-								[Own.DefineValue(payload), Own.AcquireOwner(owner, borrow, _)]:
-									match payload.result:
-										Own.BorrowedResult(Own.PayloadBorrow(parent)):
-											match borrow.source:
-												Own.PayloadBorrow(acquired_parent):
-													(
-														same_value(parent, parameter.id)
-														and parameter_scrutinee(matched.scrutinee, parent)
-														and same_value(acquired_parent, parent)
-														and same_value(borrow.value, payload.id)
-														and IntOps.equals(
-															Own.owner_number(owner),
-															0,
-														)
-													)
-												_:
-													False
-										_:
-											False
-								_:
-									False
-						_:
-							False
-				_:
-					False
-		_:
-			False
-
+		[Own.DefineValue(parameter), Own.ExecuteJoin(matched)]:
+			match (matched.arms, function.result):
+				([arm], Own.OwnedReturn(_, _)):
+					(
+						parameter_scrutinee(matched.selection.scrutinee, parameter.id)
+						and helper_arm_acquires(matched.selection, arm, Own.PayloadBorrow(parameter.id), False)
+					)
+				_: False
+		_: False
 
 func test_extraction_acquires_through_the_immediate_parent_value() -> Bool:
 	contains_function(BOX_INPUTS, projection_borrows_immediate_parent)
@@ -557,8 +712,8 @@ private pure func nullary_owns(function: Own.OwnedFunction) -> Bool:
 		[Own.DefineValue(value)]:
 			match value.operation:
 				Own.ConstructDefinition(_, []):
-					match function.tail:
-						Own.ReturnTail(Own.ReturnResult(Own.OwnedReturn(result, owner))):
+					match function.result:
+						Own.OwnedReturn(result, owner):
 							(
 								same_value(result, value.id)
 								and owns(value.result, 0)
@@ -654,37 +809,31 @@ func test_representation_query_names_the_inline_owned_layout() -> Bool:
 
 
 private pure func loop_rejects(source: String, signature: Bool) -> Bool:
-	match lowered(source):
+	match checked_source(source):
 		Err(_):
 			False
 		Ok(program):
-			contents = Lower.lowered_functions(program)
-			contents.functions.any(pure func(function):
+			checked_functions(program).functions.any(pure func(function):
 				match function.execution:
 					SelfTailLoop(annotation):
-						match function.steps.get(0):
-							Some(Lower.Define(first)):
-								expected = if signature:
-									annotation
-								else:
-									first.span
-
-								match Own.insert_function(
-									function,
-									contents.unions,
-									contents.records,
-								):
-									Err(error):
-										(
-											error.message == "managed values in @tail_recursive functions are not supported yet"
-											and error.help == "use an unmanaged helper, or remove @tail_recursive"
-											and same_span(error.span, expected)
-											and error.note.is_none()
-										)
-									Ok(_):
-										False
-							_:
-								False
+						expected = if signature:
+							Some(annotation)
+						else:
+							match function.statements.get(0):
+								Some(Checked.InitializeBinding(_, first)):
+									match first.form:
+										Checked.InvokeFunction(call, _): Some(call.span)
+										_: None
+								_: None
+						match (expected, Concrete.specialize(program)):
+							(Some(at), Err(error)):
+								(
+									error.message == "managed values in @tail_recursive functions are not supported yet"
+									and error.help == "use an unmanaged helper, or remove @tail_recursive"
+									and same_span(error.span, at)
+									and error.note.is_none()
+								)
+							_: False
 					_:
 						False
 			)
@@ -721,7 +870,7 @@ func test_inline_owning_intermediate_is_rejected_at_its_definition() -> Bool:
 	loop_rejects(source, False)
 
 
-func test_owned_prefix_drops_after_return_acquisition() -> Bool:
+func test_unused_prefix_drops_before_tail_join() -> Bool:
 	source: String =
 		|import:
 		|	int: Int methods_only
@@ -754,25 +903,30 @@ func test_owned_prefix_drops_after_return_acquisition() -> Bool:
 			contents = Lower.lowered_functions(program)
 			contents.functions.any(pure func(function):
 				match function.steps:
-					[Lower.Define(_), Lower.Define(_), Lower.Define(text)]:
+					[Lower.Define(_), Lower.Define(_), Lower.Define(text), Lower.Join(_)]:
 						match Own.insert_function(function, contents.unions, contents.records):
 							Ok(owned):
-								match owned.tail:
-									Own.MatchTail(matched):
+								match owned.operations:
+									[Own.DefineValue(_), Own.DefineValue(_), Own.DefineValue(_), Own.DropOwner(prefix, at), Own.ExecuteJoin(matched)]:
 										match matched.arms:
 											[arm]:
-												match (arm.operations, arm.exit):
-													([Own.DefineValue(child), Own.AcquireOwner(acquired, borrow, _), Own.DropOwner(prefix, at)], Own.ReturnResult(Own.OwnedReturn(returned, transfer))):
-														(
-															same_value(child.id, returned)
-															and same_value(borrow.value, returned)
-															and Own.owner_number(acquired) == 1
-															and Own.owner_number(transfer) == 1
-															and Own.owner_number(prefix) == 0
-															and same_span(at, text.span)
-														)
-													_:
-														False
+												match arm.exit:
+													Own.Yield(arm_yield):
+														match (matched.selection.nodes, arm.inputs, arm.operations, arm_yield.transfer):
+															([Own.EnterArm(edge)], [Own.ManagedJoinParameter(input, canonical)], [], Own.OwnedReturn(returned, transfer)):
+																match edge.operations:
+																	[Own.DefineValue(child), Own.AcquireOwner(acquired, borrow, _)]:
+																		(
+																			same_value(input.id, returned)
+																			and same_value(borrow.value, child.id)
+																			and same_owner(canonical, transfer)
+																			and Own.owner_number(acquired) == 2
+																			and Own.owner_number(prefix) == 0
+																			and same_span(at, text.span)
+																		)
+																	_: False
+															_: False
+													Own.TransferLoop(_, _): False
 											_:
 												False
 									_:
@@ -785,8 +939,8 @@ func test_owned_prefix_drops_after_return_acquisition() -> Bool:
 
 
 private pure func aggregate_identity_acquires(function: Own.OwnedFunction) -> Bool:
-	match (function.operations, function.tail):
-		([Own.DefineValue(parameter), Own.AcquireOwner(owner, borrow, _)], Own.ReturnTail(Own.ReturnResult(Own.OwnedReturn(result, returned)))):
+	match (function.operations, function.result):
+		([Own.DefineValue(parameter), Own.AcquireOwner(owner, borrow, _)], Own.OwnedReturn(result, returned)):
 			match (parameter.value_type, parameter.result, borrow.source):
 				(Concrete.UnionType(_), Own.BorrowedResult(Own.ParameterBorrow(parent)), Own.ParameterBorrow(source)):
 					(
@@ -825,8 +979,8 @@ func test_aggregate_identity_acquires_an_independent_returned_owner() -> Bool:
 
 
 private pure func unused_aggregate_drops(function: Own.OwnedFunction) -> Bool:
-	match (function.operations, function.tail):
-		([Own.DefineValue(_), Own.DefineValue(text), Own.DefineValue(box), Own.DropOwner(child, _), Own.DropOwner(parent, _), Own.DefineValue(result)], Own.ReturnTail(Own.ReturnResult(Own.UnmanagedReturn(returned)))):
+	match (function.operations, function.result):
+		([Own.DefineValue(_), Own.DefineValue(text), Own.DefineValue(box), Own.DropOwner(child, _), Own.DropOwner(parent, _), Own.DefineValue(result)], Own.UnmanagedReturn(returned)):
 			match box.value_type:
 				Concrete.UnionType(_):
 					owns(text.result, 0) and owns(box.result, 1) and IntOps.equals(
@@ -857,8 +1011,8 @@ func test_unused_aggregate_drops_its_owner_after_the_call_argument_owner() -> Bo
 
 
 private pure func unused_constructor_retires_original_and_parent(function: Own.OwnedFunction) -> Bool:
-	match (function.operations, function.tail):
-		([Own.DefineValue(_), Own.DefineValue(text), Own.AcquireOwner(child, borrow, _), Own.DefineValue(box), Own.DropOwner(original, _), Own.DropOwner(parent, _), Own.DefineValue(result)], Own.ReturnTail(Own.ReturnResult(Own.UnmanagedReturn(returned)))):
+	match (function.operations, function.result):
+		([Own.DefineValue(_), Own.DefineValue(text), Own.AcquireOwner(child, borrow, _), Own.DefineValue(box), Own.DropOwner(original, _), Own.DropOwner(parent, _), Own.DefineValue(result)], Own.UnmanagedReturn(returned)):
 			match box.operation:
 				Own.ConstructDefinition(_, [Own.OwnedPayload(value, transferred)]):
 					(
@@ -892,7 +1046,7 @@ func test_unused_constructor_retires_original_and_parent_obligations() -> Bool:
 							unused = { function |
 								signature = { function.signature | return_type = Concrete.IntType },
 								steps = [integer, text, box, result].map(pure func(definition): Lower.Define(definition)),
-								tail = Lower.ExitValue(Lower.ReturnValue(result.id))
+								result = result.id
 							}
 							contents = Lower.lowered_functions(program)
 
@@ -910,8 +1064,15 @@ func test_unused_constructor_retires_original_and_parent_obligations() -> Bool:
 tests: TestSuite = {
 	description = "Blorp 2 managed union ownership insertion",
 	tests = [
-		("library callback borrows input and transfers selected or bypassed owners", test_library_callback_borrows_input_and_transfers_selected_or_bypassed_owners),
-		("library helpers acquire selected values and keep predicates borrowed", test_library_helpers_acquire_selected_values_and_leave_predicate_inputs_borrowed),
+		("List queries acquire selected returns before retiring their containers", test_list_queries_acquire_each_selected_return_before_retiring_its_container),
+		(
+			"library callback borrows input and transfers selected or bypassed owners",
+			test_library_callback_borrows_input_and_transfers_selected_or_bypassed_owners,
+		),
+		(
+			"library helpers acquire selected values and keep predicates borrowed",
+			test_library_helpers_acquire_selected_values_and_leave_predicate_inputs_borrowed,
+		),
 		(
 			"borrowed child acquisition transfers into the inline owner",
 			test_borrowed_child_acquisition_is_transferred_to_the_inline_owner,
@@ -957,8 +1118,8 @@ tests: TestSuite = {
 			test_inline_owning_intermediate_is_rejected_at_its_definition,
 		),
 		(
-			"owned match prefix drops after return acquisition",
-			test_owned_prefix_drops_after_return_acquisition,
+			"unused prefix drops before tail join",
+			test_unused_prefix_drops_before_tail_join,
 		),
 		(
 			"aggregate identity acquires independent returned owner",

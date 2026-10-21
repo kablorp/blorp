@@ -1,0 +1,76 @@
+import:
+	../../../src/load/load: load_program
+	../../../src/check/check: check
+	../../../src/specialize/specialize as Concrete
+	../../../src/lower/lower as Lower
+	../../../src/own/own as Own
+	../../../src/utils/syntax: Diagnostic
+	../input: setup_diagnostic
+	test: TestSuite
+
+
+private func managed_program() -> Result[Lower.LoweredProgram, Diagnostic]:
+	loaded ?= load_program("blorp_2/test/e2e/fixtures/list/take_remove_managed.brp", "blorp_2/standard_library").map_err(pure func(failure): failure.diagnostic)
+	checked ?= check(loaded.program).map_err(setup_diagnostic)
+	concrete ?= Concrete.specialize(checked)
+	Lower.lower(concrete)
+
+
+private pure func transfers_after_input_drop(function: Lower.LoweredFunction, facts: Lower.LoweredFunctions) -> Bool:
+	match function.steps:
+		[Lower.Define(input), Lower.Define(count), Lower.Define(result)]:
+			match (input.operation, count.operation, result.operation):
+				(Lower.CallValue(Concrete.UserFunction(_), []), Lower.IntegerValue(_), Lower.CallValue(Concrete.UserFunction(take), [values, amount])):
+					match Own.insert_function(function, facts.unions, facts.records):
+						Err(_): False
+						Ok(owned):
+							match (owned.operations, owned.result):
+								([Own.DefineValue(original), Own.DefineValue(_), Own.DefineValue(selected), Own.DropOwner(retired, _)], Own.OwnedReturn(returned, transferred)):
+									match (original.result, selected.result, selected.operation):
+										(Own.OwnedResult(source_owner), Own.OwnedResult(result_owner), Own.CallDefinition(Concrete.UserFunction(target), [Own.BorrowedArgument(borrow), Own.UnmanagedArgument(index)])):
+											match borrow.source:
+												Own.OwnerBorrow(borrowed_owner):
+													(Lower.value_number(values) == Lower.value_number(input.id)
+														and Lower.value_number(amount) == Lower.value_number(count.id)
+														and Lower.value_number(original.id) == Lower.value_number(input.id)
+														and Concrete.function_number(target) == Concrete.function_number(take)
+														and Own.owner_number(source_owner) == Own.owner_number(borrowed_owner)
+														and Own.owner_number(source_owner) == Own.owner_number(retired)
+														and Own.owner_number(source_owner) != Own.owner_number(result_owner)
+														and Own.owner_number(result_owner) == Own.owner_number(transferred)
+														and Lower.value_number(borrow.value) == Lower.value_number(input.id)
+														and Lower.value_number(index) == Lower.value_number(count.id)
+														and Lower.value_number(selected.id) == Lower.value_number(result.id)
+														and Lower.value_number(returned) == Lower.value_number(selected.id))
+												_: False
+										_: False
+								_: False
+				_: False
+		_: False
+
+
+func test_escaping_list_transfers_fresh_owner_after_temporary_input_release() -> Bool:
+	match managed_program():
+		Err(_): False
+		Ok(program):
+			facts = Lower.lowered_functions(program)
+			var witnesses = 0
+			for function in facts.functions:
+				match (function.signature.parameters, function.signature.return_type):
+					([], Concrete.ListType(Concrete.RecordType(layout_id))):
+						match facts.records.get(Concrete.record_number(layout_id)):
+							Some(layout):
+								match (layout.representation, layout.fields):
+									(Concrete.ManagedRecord, [Concrete.StringType, Concrete.ListType(Concrete.StringType)]):
+										if transfers_after_input_drop(function, facts):
+											witnesses += 1
+									_: void
+							None: void
+					_: void
+			witnesses == 1
+
+
+tests: TestSuite = {
+	description = "Ordinary take escaping managed aggregate ownership",
+	tests = [("fresh List owner transfers after borrowed temporary input retires", test_escaping_list_transfers_fresh_owner_after_temporary_input_release)]
+}

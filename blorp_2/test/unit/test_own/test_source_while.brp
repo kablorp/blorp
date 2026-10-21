@@ -1,0 +1,120 @@
+import:
+	../../../src/own/own as Own
+	../../../src/verify/verify: verify
+	../source_while_inputs as Input
+	test: TestSuite
+
+
+private pure func owned_loop(function: Own.OwnedFunction) -> Option[Own.OwnedLoop]:
+	var found: Option[Own.OwnedLoop] = None
+	for operation in function.operations:
+		match operation:
+			Own.ExecuteLoop(loop): found = Some(loop)
+			_: void
+	found
+
+
+private pure func mortal_facts() -> Option[Bool]:
+	lowered ?= Input.lowered(Input.MANAGED_LOCAL).to_option()
+	program ?= Own.own(lowered).to_option()
+	var loop_count = 0
+	var local_definitions = 0
+	var local_drops = 0
+	var borrowed_parameter_reads = 0
+	var projections = True
+	for function in program.functions:
+		match owned_loop(function):
+			None: void
+			Some(loop):
+				loop_count = loop_count + 1
+				match loop.body.tail:
+					Own.ExitLoop(_): void
+					Own.MatchLoop(branch):
+						match branch.arms.get(0):
+							None: projections = False
+							Some(true_arm):
+								for operation in true_arm.body.operations:
+									match operation:
+										Own.DefineValue(definition):
+											match definition.operation:
+												Own.CallDefinition(_, arguments):
+													match definition.result:
+														Own.OwnedResult(owner):
+															local_definitions = local_definitions + 1
+															for cleanup in true_arm.body.operations:
+																match cleanup:
+																	Own.DropOwner(dropped, _):
+																		if Own.owner_number(owner) == Own.owner_number(dropped):
+																			local_drops = local_drops + 1
+																	_: void
+														_: void
+													for argument in arguments:
+														match argument:
+															Own.BorrowedArgument(borrow):
+																match borrow.source:
+																	Own.ParameterBorrow(_): borrowed_parameter_reads = borrowed_parameter_reads + 1
+																	_: void
+															_: void
+												_: void
+										_: void
+	Some(projections and loop_count == 1 and local_definitions == 1 and local_drops == 1
+		and borrowed_parameter_reads == 1 and verify(program).is_ok())
+
+
+pure func test_mortal_iteration_owner_retires_once_and_parameter_stays_borrowed() -> Bool:
+	mortal_facts().get_or(False)
+
+
+private pure func pre_facts() -> Option[Bool]:
+	lowered ?= Input.lowered(Input.MANAGED_OWNER).to_option()
+	program ?= Own.own(lowered).to_option()
+	var survived = False
+	var projections = True
+	for function in program.functions:
+		match owned_loop(function):
+			None: void
+			Some(loop):
+				var pre: Option[Own.OwnerId] = None
+				for operation in function.operations:
+					match operation:
+						Own.DefineValue(definition):
+							match definition.result:
+								Own.OwnedResult(owner): pre = Some(owner)
+								_: void
+						_: void
+				match pre:
+					None: projections = False
+					Some(owner):
+						var inner_drops = 0
+						var parent_drops = 0
+						match loop.body.tail:
+							Own.ExitLoop(_): void
+							Own.MatchLoop(branch):
+								for arm in branch.arms:
+									for operation in arm.body.operations:
+										match operation:
+											Own.DropOwner(id, _):
+												if Own.owner_number(id) == Own.owner_number(owner):
+													inner_drops = inner_drops + 1
+											_: void
+						for operation in function.operations:
+							match operation:
+								Own.DropOwner(id, _):
+									if Own.owner_number(id) == Own.owner_number(owner):
+										parent_drops = parent_drops + 1
+								_: void
+						survived = inner_drops == 0 and parent_drops == 1
+	Some(projections and survived and verify(program).is_ok())
+
+
+pure func test_pre_owner_is_dropped_in_parent_after_loop_only() -> Bool:
+	pre_facts().get_or(False)
+
+
+tests: TestSuite = {
+	description = "Blorp 2 source while ownership",
+	tests = [
+		("mortal aliases retire once and parameter remains borrowed", test_mortal_iteration_owner_retires_once_and_parameter_stays_borrowed),
+		("captured PRE owner drops only in parent", test_pre_owner_is_dropped_in_parent_after_loop_only),
+	]
+}

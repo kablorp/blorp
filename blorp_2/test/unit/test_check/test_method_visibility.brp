@@ -1,4 +1,5 @@
 import:
+	../selection_inputs: checked_arm_variant, concrete_arm_variant
 	../../../src/utils/names: program_names
 	../../../src/check/model as Model
 	../../../src/utils/ids as Declaration
@@ -12,7 +13,7 @@ import:
 	../../../src/utils/syntax: Diagnostic
 	option: to_result
 	../module_input: ModuleInput, TEST_BASE, parse_modules, sealed
-	../input: setup_diagnostic
+	../input: setup_diagnostic, checked_tail_join
 	test: TestSuite
 
 
@@ -379,23 +380,32 @@ private pure func generic_library_program() -> Result[ParsedProgram, Diagnostic]
 	sealed(prelude)
 
 
+private pure func projects_second_field(selection: Model.CheckedSelection) -> Bool:
+	match selection.nodes:
+		[Model.EnterArm(_, [Model.BorrowPlace(place)])]:
+			match place.route:
+				Model.UnionField(_, _, ordinal): ordinal == 1
+				_: False
+		_: False
+
+
 private pure func second_field_escapes(
 	function: Model.CheckedFunction,
 	variant: Declaration.VariantId,
 	expected_parameter: Model.TypeRef,
 ) -> Bool:
-	match (function.signature.parameters.get(0), function.body):
-		(Some(parameter), Model.CheckedMatchBody(body)):
+	match (function.signature.parameters.get(0), checked_tail_join(function.body)):
+		(Some(parameter), Some(body)):
 			match body.arms:
 				[arm]:
-					match (arm.pattern, arm.body):
-						(Model.VariantCase(selected, captures), Model.ReturnExpression(result)):
-							-- Indexed observations avoid the host's nested List[Option] pattern trap.
-							match (captures.get(0), captures.get(1), result.form):
-								(Some(None), Some(Some(captured)), Model.ReadBinding(returned)):
+					match (checked_arm_variant(body.selection, arm.id), arm.inputs, arm.value):
+						(Some(selected), captures, result):
+							-- The selector records the field ordinal; body inputs contain only bindings.
+							match (captures, result.form):
+								([captured], Model.ReadBinding(returned)):
 									(
 										Model.same_variant(selected, variant)
-										and captures.length() == 2
+										and captures.length() == 1 and projects_second_field(body.selection)
 										and Model.binding_number(captured) == 1
 										and Model.binding_number(returned) == Model.binding_number(captured)
 										and Model.same_type(result.value_type, Model.StringType)

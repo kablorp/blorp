@@ -1,0 +1,79 @@
+import:
+	../../../src/load/load: load_program
+	../../../src/check/check: check
+	../../../src/specialize/specialize as Concrete
+	../../../src/utils/syntax: Diagnostic
+	../input: setup_diagnostic
+	test: TestSuite
+
+
+private func contents(fixture: String) -> Result[Concrete.SpecializedContents, Diagnostic]:
+	loaded ?= load_program("blorp_2/test/e2e/fixtures/list/" + fixture + ".brp", "blorp_2/standard_library").map_err(pure func(failure): failure.diagnostic)
+	checked ?= check(loaded.program).map_err(setup_diagnostic)
+	program ?= Concrete.specialize(checked)
+	Ok(Concrete.specialized_contents(program))
+
+
+private pure func range_signature(signature: Concrete.FunctionSignature, element: Concrete.TypeRef) -> Bool:
+	match signature.parameters:
+		[Concrete.ListType(actual), Concrete.IntType, Concrete.IntType]:
+			Concrete.same_type(actual, element) and Concrete.same_type(signature.return_type, Concrete.ListType(element))
+		_: False
+
+
+private pure func managed_entry(element: Concrete.TypeRef, facts: Concrete.SpecializedContents) -> Bool:
+	match element:
+		Concrete.IntType | Concrete.VoidType: True
+		Concrete.RecordType(id):
+			match facts.records.get(Concrete.record_number(id)):
+				Some(layout):
+					match (layout.representation, layout.fields):
+						(Concrete.ManagedRecord, [Concrete.StringType, Concrete.ListType(Concrete.StringType)]): True
+						_: False
+				None: False
+		_: False
+
+
+-- Follow the published call identity; never guess a function ordinal/name.
+private pure func one_range_instance(facts: Concrete.SpecializedContents) -> Option[Concrete.TypeRef]:
+	var selected: List[Concrete.TypeRef] = []
+	for wrapper in facts.functions:
+		match (wrapper.signature.parameters, wrapper.signature.return_type, wrapper.body):
+			([Concrete.ListType(element), Concrete.IntType], Concrete.ListType(returned), Concrete.ConcreteValueBody(Concrete.ReturnExpression(value))):
+				match value.form:
+					Concrete.InvokeFunction(call, _):
+						match call.target:
+							Concrete.UserFunction(id):
+								match facts.functions.get(Concrete.function_number(id)):
+									Some(helper):
+										instances = facts.functions.filter(pure func(other): range_signature(other.signature, element))
+										if Concrete.same_type(element, returned) and range_signature(helper.signature, element) and instances.length() == 1 and managed_entry(element, facts):
+											selected = selected.append(element)
+									None: void
+							_: void
+					_: void
+			_: void
+	match selected:
+		[element]: Some(element)
+		_: None
+
+
+func test_repeated_take_and_recursive_range_reuse_each_demanded_element_type() -> Bool:
+	var elements: List[Concrete.TypeRef] = []
+	var valid = True
+	for fixture in ["take_int", "take_remove_void", "take_remove_managed"]:
+		match contents(fixture):
+			Err(_): valid = False
+			Ok(facts):
+				match one_range_instance(facts):
+					Some(element): elements = elements.append(element)
+					None: valid = False
+	match elements:
+		[Concrete.IntType, Concrete.VoidType, Concrete.RecordType(_)]: valid
+		_: False
+
+
+tests: TestSuite = {
+	description = "Ordinary List range specialization identities",
+	tests = [("repeated Int/Void/managed demands keep one range instance per concrete element", test_repeated_take_and_recursive_range_reuse_each_demanded_element_type)]
+}

@@ -1,15 +1,15 @@
 import:
-	../../../src/check/check: check, check_errors
+	../../../src/check/check: check, check_errors, checked_functions
 	../../../src/check/errors as Errors: CheckErrorKind
 	../../../src/check/render: render_failure
-	../../../src/check/model: TypeRef(UnionType), BindingOrigin(ParameterBinding, BodyLocal, MatchCapture)
+	../../../src/check/model as Checked: TypeRef(UnionType), BindingOrigin(ParameterBinding, BodyLocal, MatchCapture)
 	../../../src/namespace/namespace: ValueBinding(FunctionName, ConstantName, ConstructorName, ModuleAliasName)
 	../../../src/parse/assemble: ParsedProgram, parsed_contents
-	../../../src/utils/ids: inventory_unions, union_number, variant_owner, variant_number
+	../../../src/utils/ids: VariantId, inventory_unions, union_number, variant_owner, variant_number
 	../../../src/utils/names: NameId, same_name
 	../../../src/utils/source: module_id, module_source, root_module_id
 	../../../src/utils/syntax: Diagnostic, DiagnosticNote(PreviousDeclaration), Span, same_span
-	../input: existing_name
+	../input: existing_name, checked_tail_join
 	../module_input: parse_modules, parse_modules_with_prelude
 	test: TestSuite
 
@@ -188,6 +188,12 @@ pure func test_field_capture_cannot_hide_a_module_function() -> Bool:
 	collision(prefix, "helper", "): 2\n\t\tEmpty: 0\n", "function", root_span(declaration.length(), 6))
 
 
+pure func test_payload_name_preserves_the_module_constructor_conflict() -> Bool:
+	declaration = "fixed union Shape:\n\t"
+	prefix = declaration + "Empty\n\tOther(Int)\npure func use(value: Shape) -> Int:\n\tmatch value:\n\t\tOther("
+	collision(prefix, "Empty", "): 0\n\t\tEmpty: 0\n", "constructor", root_span(declaration.length(), 5))
+
+
 pure func test_duplicate_parameters_use_the_original_parameter_note() -> Bool:
 	declaration = "pure func use("
 	prefix = declaration + "value: Int, "
@@ -363,16 +369,52 @@ pure func test_unimported_nested_constructor_has_import_help() -> Bool:
 	unimported_constructor(True)
 
 
-pure func test_visible_nested_constructor_keeps_its_unsupported_boundary() -> Bool:
-	prefix = "fixed union Shape:\n\tCyan\nfixed union Wrapper:\n\tHolds(Shape)\npure func use(value: Wrapper) -> Int:\n\tmatch value:\n\t\tHolds("
-	source = prefix + "Cyan): 4\n" + MAIN
-	rejects(parsed(source), prefix, "Cyan", "nested patterns are not supported yet",
-		"bind the field to a name and match it in a second match; nested patterns arrive with the pattern-compilation milestone", None,
-		pure func(program: ParsedProgram, kind: CheckErrorKind) -> Bool:
-			match kind:
-				Errors.UnsupportedSyntax(Errors.NestedPattern): True
-				_: False
-	)
+private pure func variant_has_name(program: ParsedProgram, id: VariantId, name: String) -> Bool:
+	match inventory_unions(parsed_contents(program).declarations).get(union_number(variant_owner(id))):
+		None: False
+		Some(owner):
+			match owner.variants.get(variant_number(id)):
+				None: False
+				Some(variant): has_name(program, variant.declaration.name.id, name)
+
+
+private pure func nested_constructor_facts(program: ParsedProgram, join: Checked.CheckedJoin) -> Bool:
+	var retained = False
+	for node in join.selection.nodes:
+		match node:
+			Checked.TestVariant(place, variant, _, _):
+				match place.route:
+					Checked.UnionField(parent, outer, 0):
+						match (parent.route, place.value_type):
+							(Checked.MatchRoot, Checked.UnionType(shape)):
+								retained = (
+									variant_has_name(program, variant, "Cyan")
+									and variant_has_name(program, outer, "Holds")
+									and union_number(shape) == union_number(variant_owner(variant))
+									and Checked.same_type(parent.value_type, join.scrutinee.value_type)
+								)
+							_: void
+					_: void
+			_: void
+	match join.arms:
+		[first, second]: retained and first.inputs.is_empty() and second.inputs.is_empty()
+		_: False
+
+
+pure func test_visible_nested_constructor_preserves_typed_identity() -> Bool:
+	source = "fixed union Shape:\n\tCyan\n\tMagenta\nfixed union Wrapper:\n\tHolds(Shape)\npure func use(value: Wrapper) -> Int:\n\tmatch value:\n\t\tHolds(Cyan): 4\n\t\t_: 0\n" + MAIN
+	match parsed(source):
+		Err(_): False
+		Ok(program):
+			match check(program):
+				Err(_): False
+				Ok(accepted):
+					match checked_functions(accepted).functions.get(0):
+						None: False
+						Some(function):
+							match checked_tail_join(function.body):
+								None: False
+								Some(join): function.bindings.length() == 1 and nested_constructor_facts(program, join)
 
 
 private pure func accepted(source: String) -> Bool:
@@ -476,15 +518,17 @@ pure func test_option_propagation_requires_a_result_return() -> Bool:
 	)
 
 
-pure func test_for_binder_keeps_its_unsupported_boundary() -> Bool:
-	prefix = "pure func use(value: List[Int]) -> Int:\n\t"
-	form = "for value in value:\n\t\tvoid"
-	source = prefix + form + "\n\t0\n" + MAIN
-	rejects(parsed(source), prefix, form, "`for` is not supported yet",
-		"write a recursive function; loops arrive with the loops milestone", None,
+pure func test_for_binder_cannot_shadow_parameter() -> Bool:
+	declaration = "pure func use("
+	prefix = declaration + "value: List[Int]) -> Int:\n\tfor "
+	form = "value"
+	source = prefix + form + " in value:\n\t\tvoid\n\t0\n" + MAIN
+	rejects(parsed(source), prefix, form, "`value` is already a parameter in this function",
+		"choose a different name for this binding", Some(root_span(declaration.length(), form.length())),
 		pure func(program: ParsedProgram, kind: CheckErrorKind) -> Bool:
 			match kind:
-				Errors.UnsupportedSyntax(Errors.ForStatement): True
+				Errors.BindingRejection(Errors.LocalBindingConflict(previous, ParameterBinding(0))):
+					has_name(program, previous.name, "value") and same_span(previous.span, root_span(declaration.length(), form.length()))
 				_: False
 	)
 
@@ -493,8 +537,8 @@ pure func test_lambda_parameter_keeps_its_unsupported_boundary() -> Bool:
 	prefix = "pure func use(value: Int) -> Int:\n\tclosure = "
 	form = "func(value: Int) -> Int: value"
 	source = prefix + form + "\n\t0\n" + MAIN
-	rejects(parsed(source), prefix, form, "lambdas are not supported yet",
-		"declare a named function and call it; lambdas arrive with the lambdas milestone", None,
+	rejects(parsed(source), prefix, form, "lambda values are only supported as pure callback arguments",
+		"pass a pure func literal to a pure callable parameter; store and return ordinary data", None,
 		pure func(program: ParsedProgram, kind: CheckErrorKind) -> Bool:
 			match kind:
 				Errors.UnsupportedSyntax(Errors.LambdaValue): True
@@ -502,9 +546,22 @@ pure func test_lambda_parameter_keeps_its_unsupported_boundary() -> Bool:
 	)
 
 
+pure func test_lambda_parameter_cannot_shadow_enclosing_parameter() -> Bool:
+	declarations: String =
+		|pure func apply(callback: pure (Int) -> Int, value: Int) -> Int:
+		|    callback(value)
+		|
+	before = declarations + "pure func outer("
+	prefix = before + "value: Int) -> Int:\n    apply(pure func("
+	collision(
+		prefix, "value", ": Int): value, 7)\n", "parameter", root_span(before.length(), 5),
+	)
+
+
 tests: TestSuite = {
 	description = "Binding names and constructor-only match arms",
 	tests = [
+		("lambda parameter cannot shadow an enclosing data parameter", test_lambda_parameter_cannot_shadow_enclosing_parameter),
 		("name predicates reject an unexpected error family", test_name_rejection_predicates_reject_an_unexpected_error_family),
 		("unknown bare name cannot become a catch-all", test_unknown_bare_name_cannot_become_a_catch_all),
 		("another union's bare constructor is not a catch-all", test_another_unions_bare_constructor_is_not_a_catch_all),
@@ -515,6 +572,7 @@ tests: TestSuite = {
 		("parameter cannot hide a module constant", test_parameter_cannot_hide_a_module_constant),
 		("mutable local cannot hide a module constant", test_mutable_local_cannot_hide_a_module_constant),
 		("field capture cannot hide a module constant", test_field_capture_cannot_hide_a_module_constant),
+		("payload name preserves module constructor conflict and note", test_payload_name_preserves_the_module_constructor_conflict),
 		("duplicate parameters retain the original note", test_duplicate_parameters_use_the_original_parameter_note),
 		("unknown parameter annotation precedes duplicate parameter", test_unknown_parameter_annotation_precedes_duplicate_parameter),
 		("mutable local cannot hide a parameter", test_mutable_local_cannot_hide_a_parameter),
@@ -530,7 +588,7 @@ tests: TestSuite = {
 		("prelude-owned alias does not enter user scope", test_prelude_owned_alias_does_not_enter_the_user_scope),
 		("unimported bare constructor has import help", test_unimported_bare_constructor_has_import_help),
 		("unimported nested constructor has import help", test_unimported_nested_constructor_has_import_help),
-		("visible nested constructor keeps unsupported boundary", test_visible_nested_constructor_keeps_its_unsupported_boundary),
+		("visible nested constructor preserves typed identity", test_visible_nested_constructor_preserves_typed_identity),
 		("wildcard remains the whole-arm catch-all", test_wildcard_remains_the_whole_arm_catch_all),
 		("field captures remain legal", test_field_captures_remain_legal),
 		("sibling arms have independent capture scopes", test_sibling_arms_have_independent_capture_scopes),
@@ -541,7 +599,7 @@ tests: TestSuite = {
 		("mutable join assignment checks its initializer", test_mutable_join_assignment_checks_its_initializer),
 		("immutable join target still precedes its initializer", test_immutable_join_assignment_still_precedes_its_initializer),
 		("Option propagation requires a Result return", test_option_propagation_requires_a_result_return),
-		("for binder keeps its unsupported boundary", test_for_binder_keeps_its_unsupported_boundary),
+		("for binder cannot shadow parameter", test_for_binder_cannot_shadow_parameter),
 		("lambda parameter keeps its unsupported boundary", test_lambda_parameter_keeps_its_unsupported_boundary),
 	]
 }

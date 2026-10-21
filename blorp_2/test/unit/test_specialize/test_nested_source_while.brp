@@ -1,0 +1,74 @@
+import:
+	../../../src/check/model as Checked
+	../../../src/specialize/specialize as Concrete
+	../../../src/utils/source: module_source, root_module_id
+	../../../src/utils/syntax: entry_function, same_span
+	../source_while_inputs as Input
+	../nested_while_inputs as Nested
+	test: TestSuite
+
+
+private fixed union CarrierSite:
+	LoopBody
+	ConditionJoin
+
+
+private pure func first_loop(statements: List[Concrete.ConcreteStatement]) -> Option[Concrete.ConcreteWhile]:
+	var result: Option[Concrete.ConcreteWhile] = None
+	for statement in statements:
+		match statement:
+			Concrete.RunWhile(loop):
+				result = Some(loop)
+				break
+			_: void
+	result
+
+
+private pure func nested_managed_carrier(source: String, site: CarrierSite) -> Option[Bool]:
+	accepted ?= Input.concrete(source).to_option()
+	contents = Concrete.specialized_contents(accepted)
+	function ?= contents.functions.get(Concrete.function_number(entry_function(contents.entrypoint)))
+	outer ?= first_loop(function.statements)
+	inner ?= match site:
+		LoopBody: first_loop(outer.body)
+		ConditionJoin:
+			match outer.condition.form:
+				Concrete.Match(join):
+					match join.arms.get(0):
+						Some(arm): first_loop(arm.statements)
+						None: None
+				_: None
+	id ?= inner.carried.get(0)
+	binding ?= function.bindings.get(Checked.binding_number(id))
+	start ?= source.index_of("text: String")
+	plan ?= Concrete.value_ownership(binding.value_type, contents.unions, contents.records).to_option()
+	match plan:
+		Concrete.ManagedStringLeaf:
+			Some(outer.carried.is_empty() and inner.carried.length() == 1 and inner.body.length() == 1
+				and Concrete.same_type(binding.value_type, Concrete.StringType)
+				and same_span(binding.span, { source = module_source(root_module_id()), start = start, end = start + "text".length() }))
+		_: None
+
+
+pure func test_nested_body_header_retains_managed_binding_and_layout() -> Bool:
+	nested_managed_carrier(Nested.MANAGED_INNER_HEADER, LoopBody).get_or(False)
+
+
+pure func test_nested_condition_join_header_retains_managed_binding_and_layout() -> Bool:
+	nested_managed_carrier(Nested.MANAGED_CONDITION_HEADER, ConditionJoin).get_or(False)
+
+
+pure func test_nested_scalar_headers_and_managed_pre_are_specialized() -> Bool:
+	(Input.concrete(Nested.MANY_ITERATIONS).is_ok()
+		and Input.concrete(Nested.FINAL_FALSE_WRITES).is_ok()
+		and Input.concrete(Nested.MANAGED_PRE).is_ok())
+
+
+tests: TestSuite = {
+	description = "Blorp 2 nested source while specialization",
+	tests = [
+		("nested body H retains managed binding and layout", test_nested_body_header_retains_managed_binding_and_layout),
+		("nested condition join H retains managed binding and layout", test_nested_condition_join_header_retains_managed_binding_and_layout),
+		("nested scalar H with managed PRE specializes", test_nested_scalar_headers_and_managed_pre_are_specialized),
+	]
+}

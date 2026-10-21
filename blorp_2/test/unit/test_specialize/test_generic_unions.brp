@@ -9,7 +9,9 @@ import:
 	../../../src/utils/syntax: Diagnostic, entry_function
 	../compilation: compile, compile_modules
 	int as IntOps
-	../input: check_failure, parse, setup_diagnostic
+	../input: check_failure, parse, setup_diagnostic, checked_tail_join
+	../selection_inputs: concrete_arm_variant
+	../managed_union_inputs: concrete_tail_join
 	../module_input: PRIMITIVE_BASE, STRING_OPERATIONS
 	../../../src/load/load: load_program
 	fs: temporary_directory, resource_path, message
@@ -60,21 +62,15 @@ private func helper_instances() -> Result[Bool, String]:
 					text = rows.unions.get(Concrete.union_number(owner))
 						.map(pure func(row): same_variant_fields(row.variants, [[Concrete.StringType], []])).get_or(False)
 				([Concrete.UnionType(option), _], Concrete.UnionType(result)):
-					match function.body:
-						Concrete.ConcreteMatchBody(matched):
-							owners = Concrete.union_number(matched.owner) == Concrete.union_number(option) and matched.arms.all(pure func(arm):
-								match (arm.pattern, arm.body):
-									(Concrete.VariantCase(pattern, _), Concrete.ReturnExpression(value)):
-										match value.form:
-											Concrete.ConstructVariant(constructor, [child]):
-												(
-													Concrete.union_number(Concrete.variant_owner(pattern)) == Concrete.union_number(option)
-													and Concrete.union_number(Concrete.variant_owner(constructor)) == Concrete.union_number(result)
-													and rows.unions.get(Concrete.union_number(result))
-														.and_then(pure func(row): row.variants.get(Concrete.variant_number(constructor)))
-														.map(pure func(fields): same_variant_fields([fields], [[child.value_type]])).get_or(False)
-												)
-											_: False
+					match concrete_tail_join(function.body):
+						Some(matched):
+							empty_carried = matched.carried.is_empty()
+							owners = empty_carried and Concrete.same_type(matched.scrutinee.value_type, Concrete.UnionType(option)) and matched.arms.all(pure func(arm):
+								match arm.value.form:
+									Concrete.ConstructVariant(constructor, [child]):
+										Concrete.union_number(Concrete.variant_owner(constructor)) == Concrete.union_number(result) and rows.unions.get(Concrete.union_number(result))
+											.and_then(pure func(row): row.variants.get(Concrete.variant_number(constructor)))
+											.map(pure func(fields): same_variant_fields([fields], [[child.value_type]])).get_or(False)
 									_: False
 							)
 							match rows.unions.get(Concrete.union_number(result)):
@@ -105,8 +101,8 @@ private pure func callback_map_contract(
 	callback: Concrete.FunctionInstanceId,
 	bypassed: Concrete.VariantInstanceId,
 ) -> Bool:
-	match (function.signature.parameters, function.body):
-		([Concrete.UnionType(owner)], Concrete.ConcreteMatchBody(matched)):
+	match (function.signature.parameters, concrete_tail_join(function.body)):
+		([Concrete.UnionType(owner)], Some(matched)):
 			parameters = function.bindings.filter(pure func(binding):
 				match binding.origin:
 					Model.ParameterBinding(_): True
@@ -121,17 +117,17 @@ private pure func callback_map_contract(
 				parameters.length() == 1 and function.statements.is_empty()
 				and parameter_positions_match
 				and Concrete.union_number(Concrete.variant_owner(bypassed)) == Concrete.union_number(owner)
-				and Concrete.union_number(matched.owner) == Concrete.union_number(owner)
+				and Concrete.same_type(matched.scrutinee.value_type, Concrete.UnionType(owner))
 				and Concrete.same_type(function.signature.return_type, Concrete.UnionType(owner))
 			)
 			var selected = 0
 			var skipped = 0
 			for arm in matched.arms:
 				passed = passed and arm.statements.is_empty()
-				match (arm.pattern, arm.body):
-					(Concrete.VariantCase(tag, captures), Concrete.ReturnExpression(value)):
+				match (concrete_arm_variant(matched.selection, arm.id), arm.value):
+					(Some(tag), value):
 						passed = passed and Concrete.union_number(Concrete.variant_owner(tag)) == Concrete.union_number(owner)
-						match (value.form, single_capture(captures)):
+						match (value.form, single_capture(arm.inputs)):
 							(Concrete.ConstructVariant(returned, [payload]), Some(binding)):
 								passed = passed and (
 									Concrete.union_number(Concrete.variant_owner(returned)) == Concrete.union_number(owner)
@@ -160,20 +156,24 @@ private pure func callback_map_contract(
 
 
 private pure func injected_bypass_is_rejected(function: Concrete.ConcreteFunction, callback: Concrete.FunctionInstanceId, bypass: Concrete.VariantInstanceId) -> Bool:
-	match function.body:
-		Concrete.ConcreteMatchBody(matched):
+	match concrete_tail_join(function.body):
+		Some(matched):
 			match matched.arms:
 				[selected, skipped]:
-					match (selected.body, skipped.pattern, skipped.body):
-						(Concrete.ReturnExpression(value), Concrete.VariantCase(_, captures), Concrete.ReturnExpression(returned)):
+					match (selected.value, skipped.inputs, skipped.value):
+						(value, captures, returned):
 							match (value.form, single_capture(captures)):
 								(Concrete.ConstructVariant(_, [call]), Some(binding)):
 									match call.form:
 										Concrete.InvokeFunction(invoked, [_]):
 											argument = { call | form = Concrete.ReadBinding(binding) }
 											injected = { call | form = Concrete.InvokeFunction(invoked, [argument]) }
-											broken = { skipped | body = Concrete.ReturnExpression({ returned | form = Concrete.ConstructVariant(bypass, [injected]) }) }
-											not callback_map_contract({ function | body = Concrete.ConcreteMatchBody({ matched | arms = [selected, broken] }) }, callback, bypass)
+											broken = { skipped | value = { returned | form = Concrete.ConstructVariant(bypass, [injected]) } }
+											match function.body:
+												Concrete.ConcreteValueBody(Concrete.ReturnExpression(root)):
+													changed = { root | form = Concrete.Match({ matched | arms = [selected, broken] }) }
+													not callback_map_contract({ function | body = Concrete.ConcreteValueBody(Concrete.ReturnExpression(changed)) }, callback, bypass)
+												_: False
 										_: False
 								_: False
 						_: False
@@ -223,6 +223,42 @@ func test_library_map_erases_the_callback_and_keeps_direct_identity() -> Bool:
 
 func test_library_map_count_rejects_a_typed_bypass_invocation() -> Bool:
 	callback_instance(True).get_or(False)
+
+
+func test_list_queries_specialize_int_string_and_void_as_ordinary_calls() -> Bool:
+	loaded = load_program("blorp_2/test/e2e/fixtures/generic/managed/list_queries.brp", "blorp_2/standard_library")
+		.map_err(func(failure): failure.diagnostic.message)
+	concrete = loaded.and_then(pure func(input): check(input.program).map_err(pure func(failure): setup_diagnostic(failure).message))
+		.and_then(pure func(input): Concrete.specialize(input).map_err(pure func(error): error.message))
+	match concrete:
+		Err(_): False
+		Ok(program):
+			rows = Concrete.specialized_contents(program)
+			[Concrete.IntType, Concrete.StringType, Concrete.VoidType].all(pure func(element):
+				fallback = rows.functions.filter(pure func(function):
+					match (function.signature.parameters, concrete_tail_join(function.body)):
+						([Concrete.ListType(child), Concrete.IntType, default], Some(matched)):
+							match matched.scrutinee.form:
+								Concrete.InvokeFunction(call, [_, _]):
+									match call.target:
+										Concrete.UserFunction(_): Concrete.same_type(child, element) and Concrete.same_type(default, element) and Concrete.same_type(function.signature.return_type, element)
+										_: False
+								_: False
+						_: False
+				)
+				final = rows.functions.filter(pure func(function):
+					match (function.signature.parameters, function.signature.return_type, function.body):
+						([Concrete.ListType(child)], Concrete.UnionType(owner), Concrete.ConcreteValueBody(Concrete.ReturnExpression(value))):
+							match value.form:
+								Concrete.InvokeFunction(call, [_, _]):
+									match call.target:
+										Concrete.UserFunction(_): Concrete.same_type(child, element) and rows.unions.get(Concrete.union_number(owner)).map(pure func(row): same_variant_fields(row.variants, [[element], []])).get_or(False)
+										_: False
+								_: False
+						_: False
+				)
+				fallback.length() == 1 and final.length() == 1
+			)
 
 
 private pure func checked(source: String) -> Result[CheckedProgram, Diagnostic]:
@@ -555,9 +591,9 @@ private pure func specialized(source: String) -> Result[Concrete.SpecializedCont
 	Ok(Concrete.specialized_contents(program))
 
 
-private pure func single_capture(captures: List[Option[Model.BindingId]]) -> Option[Model.BindingId]:
+private pure func single_capture(captures: List[Model.BindingId]) -> Option[Model.BindingId]:
 	if captures.length() == 1:
-		captures.get(0).and_then(pure func(capture): capture)
+		captures.get(0)
 	else:
 		None
 
@@ -565,28 +601,24 @@ private pure func single_capture(captures: List[Option[Model.BindingId]]) -> Opt
 private pure func rigid_pattern(function: Model.CheckedFunction) -> Bool:
 	match function.signature.type_parameters:
 		[parameter]:
-			match function.body:
-				Model.CheckedMatchBody(matched):
+			match checked_tail_join(function.body):
+				Some(matched):
 					match matched.arms:
 						[arm]:
-							match arm.pattern:
-								Model.VariantCase(_, captures):
-									match single_capture(captures):
-										Some(id):
-											match function.bindings:
-												[_, payload]:
-													Model.binding_number(id) == 1 and Model.same_type(
-														payload.value_type,
-														Model.ParameterType(parameter),
-													) and Model.same_type(
-														function.signature.return_type.value_type,
-														payload.value_type,
-													)
-												_:
-													False
-										None: False
-								_:
-									False
+							match single_capture(arm.inputs):
+								Some(id):
+									match function.bindings:
+										[_, payload]:
+											Model.binding_number(id) == 1 and Model.same_type(
+												payload.value_type,
+												Model.ParameterType(parameter),
+											) and Model.same_type(
+												function.signature.return_type.value_type,
+												payload.value_type,
+											)
+										_:
+											False
+								None: False
 						_:
 							False
 				_:
@@ -783,18 +815,18 @@ pure func test_box_instance_translates_constructor_pattern_and_binding_types() -
 					layout = match declaration.variants:
 						[[Concrete.IntType]]: True
 						_: False
-					match (box.body, unbox.body):
-						(Concrete.ConcreteValueBody(Concrete.ReturnExpression(value)), Concrete.ConcreteMatchBody(matched)):
+					match (box.body, concrete_tail_join(unbox.body)):
+						(Concrete.ConcreteValueBody(Concrete.ReturnExpression(value)), Some(matched)):
 							match (value.form, matched.arms, unbox.bindings):
 								(Concrete.ConstructVariant(id, [child]), [arm], [_, payload]):
-									match arm.pattern:
-										Concrete.VariantCase(pattern, captures):
-											match single_capture(captures):
+									match concrete_arm_variant(matched.selection, arm.id):
+										Some(pattern):
+											match single_capture(arm.inputs):
 												Some(binding):
 													(
 														layout
 														and Concrete.union_number(Concrete.variant_owner(id)) == 0
-														and Concrete.union_number(matched.owner) == 0
+														and Concrete.same_type(matched.scrutinee.value_type, Concrete.UnionType(Concrete.variant_owner(id)))
 														and Concrete.union_number(Concrete.variant_owner(pattern)) == 0
 														and Concrete.variant_number(pattern) == Concrete.variant_number(id)
 														and Model.binding_number(binding) == 1
@@ -813,6 +845,7 @@ pure func test_box_instance_translates_constructor_pattern_and_binding_types() -
 tests: TestSuite = {
 	description = "Blorp 2 generic unions",
 	tests = [
+		("List queries specialize Int String and Void through ordinary calls", test_list_queries_specialize_int_string_and_void_as_ordinary_calls),
 		("library helpers specialize payloads and constructor owners", test_library_helpers_specialize_payloads_and_constructor_owners),
 		("library map erases callback and preserves direct identity", test_library_map_erases_the_callback_and_keeps_direct_identity),
 		("library map call count rejects typed bypass invocation", test_library_map_count_rejects_a_typed_bypass_invocation),

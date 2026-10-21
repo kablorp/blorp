@@ -2,6 +2,37 @@
 
 ## Status and problem
 
+The 2026-10-20 self-compilation candidate implements bare value and statement
+if through the existing `CheckedJoin`. Functional, native and resource acceptance
+is still pending. Root explicitly revised A's older Void-binding restriction:
+without else, the then block must be Void or statement-only, the if yields
+Void in every receiving position, and its receiving expectation is checked
+afterward. Void bindings are permitted. With else, expected types flow to both
+branches; otherwise the then branch establishes the else expectation. A Void
+tail with else retains ordinary heterogeneous discards. The old A text below
+is historical where it differs from this rule.
+
+The original native input with SHA `5e8e27a3a212d6ed21dac2276c3cedcf2483c96dfcd0caca703c98fe19283704`
+is preserved byte-for-byte at [value_if/return.brp](test/e2e/fixtures/value_if/return.brp),
+with its original 45,000-allocation/200,000,000-instruction ceiling. The maintained
+unsupported fixture now checks an if nested in a call argument. No Boolean
+keyword operators, nested propagation, alternate conditional backend or arbitrary
+operand controls are admitted by this increment. The exact source census must
+decide whether any nested-operand extension is needed.
+
+This candidate keeps A's 210-gross/+160-net production screen and its initial
+45,000-allocation/200,000,000-instruction native limits. Its test screen is
+amended from 700 to 1,000 gross physical lines, and four new fixture files/100
+source lines, for the requested Check/Spec/Lower/Own/Verify/Emit observations,
+exact diagnostics, state/lambda/loop-context witnesses, malformed ownership
+product, and separate String/List selection outcomes. This also replaces the
+initial local 500-line test forecast; coverage is not compressed to fit it.
+The amendment and actual debit require both reviews before landing. Original
+resource baselines, failed samples and the unchanged native input's absolute
+limit remain authoritative. Until self-compilation succeeds, matched unchanged
+owned-input allocation and retired-instruction measurements are proxies, with
+an initial independent ceiling of +1% on each metric.
+
 B's Result-only function-prefix propagation is implemented and validated through
 existing joins; see the [final evidence](../benchmarks/results/blorp_2_result_propagation_2026-10-19.md).
 A remains deferred. The A/old-base handoff below is historical; the revised B

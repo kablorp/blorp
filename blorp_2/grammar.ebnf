@@ -20,7 +20,8 @@
      `not`, `while`, `for`, `in`, `break`, `continue`, `alias`, `debug`,
      `detach`, `foreign`, `from`, `implements`, `resource`, `select`, `trait`,
      `try`, `where` and `_`. They are symbol
-     tokens and never names; written where a name is declared they report
+     tokens; only `and`, `or`, `not` may name functions at the sites below.
+     Other reserved names report
      "`word` is a reserved keyword and cannot be used as a name". The words
      `fixed`, `methods_only`, `tail_recursive` and the base type names are
      names in the host too: the syntax recognises them by identity where a
@@ -72,8 +73,8 @@
    Syntax accepts any unreserved function, parameter and type identifier.
    `fixed` is a contextual word in declaration headers and remains a valid
    function, type, parameter and variant identifier elsewhere; the reserved
-   words listed under Lexical contract are never identifiers, and using one
-   where a name is declared reports the keyword by spelling.
+   words listed under Lexical contract remain keyword tokens. Only `and`, `or`,
+   `not` have function-name exceptions; bindings, types and fields do not.
    Import blocks precede the module's declarations and select functions by their declared names from explicit ./ or leading
    ../ paths, or bare paths under an explicitly supplied target-library root.
    Paths omit .brp and contain adjacent identifier components; interior
@@ -169,15 +170,18 @@
    A Void function evaluates and discards its final expression (of any type),
    including each selected match-arm result, and returns the sole Void value.
    Discarded expressions still undergo ordinary name, type and purity checking.
-   Matches follow any statement prefix and occupy the function tail. Their scrutinee must synthesize
-   a union type from a binding or function result; a constructor alone does not
-   provide a receiving type. A whole-arm bare name must denote a visible
+   Matches are admitted as whole initializers, statements, function tails,
+   and arm or branch values. Their
+   scrutinee must synthesize a union, List or String type. A union constructor
+   alone does not provide a receiving type; use a typed binding or function result. A whole-arm bare name must denote a visible
    constructor of that union; an unknown name is an error and only `_` is a
    catch-all. Constructors from another module must be imported with their union.
    Bind the scrutinee before matching when an arm needs its whole value.
-   Constructor patterns contain
-   one pattern per declared field; checking accepts a binder or wildcard there
-   and rejects a nested pattern until the pattern-compilation milestone. Wildcards preserve positions;
+   Constructor patterns contain one recursive pattern per declared field.
+   List patterns select exact lengths or a prefix with a final rest capture;
+   String patterns compare all decoded UTF8 bytes, including embedded NUL.
+   Alternatives share one body and bind the same names at the same types.
+   Wildcards preserve positions;
    binders in one pattern must be distinct. Nullary patterns allow Empty or
    Empty(). Field binders and wildcards are irrefutable. Checking requires
    exhaustive, useful arms and type-checks every arm result.
@@ -378,7 +382,8 @@ raw_string       = "raw" { space } "\n" indentation "|" raw_text { "\n" indentat
 (* Every bracketed, comma-separated list admits one trailing comma. *)
 trailing_comma   = [ spaces "," ] ;
 arguments        = expression { spaces "," spaces expression } trailing_comma ;
-direct_call      = identifier spaces "(" spaces [ arguments ] spaces ")" ;
+callable_name    = identifier | "not" | "and" | "or" ;
+direct_call      = callable_name spaces "(" spaces [ arguments ] spaces ")" ;
 record_field     = identifier spaces "=" spaces expression ;
 record_literal   = "{" spaces [ record_field { spaces "," spaces record_field } trailing_comma ] spaces "}" ;
 record_update    = "{" spaces expression spaces "|" spaces record_field { spaces "," spaces record_field } trailing_comma spaces "}" ;
@@ -392,7 +397,7 @@ group            = "(" spaces expression spaces ")" ;
 (* The conversion words are reserved: `into_opaque` and `from_opaque` always
    start the form and require the opaque type name and a parenthesised value. *)
 opaque_conversion = ( "into_opaque" | "from_opaque" ) required_spaces identifier spaces "(" spaces expression spaces ")" ;
-qualified_name   = identifier spaces "." spaces identifier ;
+qualified_name   = identifier spaces "." spaces callable_name ;
 qualified_call   = qualified_name spaces "(" spaces [ arguments ] spaces ")" ;
 (* Every element has one type: the expected List's element when the context
    supplies one, otherwise the first element's; an empty literal needs that
@@ -400,14 +405,15 @@ qualified_call   = qualified_name spaces "(" spaces [ arguments ] spaces ")" ;
 list_literal     = "[" spaces [ arguments ] spaces "]" ;
 primary          = "void" | float | integer | string_literal | pipe_string | raw_string | qualified_call | qualified_name
                  | opaque_conversion | identifier | direct_call | list_literal | record_literal | record_update | group ;
-receiver_call    = spaces "." spaces identifier spaces "(" spaces [ arguments ] spaces ")" ;
+receiver_call    = spaces "." spaces callable_name spaces "(" spaces [ arguments ] spaces ")" ;
 field_read       = spaces "." spaces identifier ;
 (* Precedence, lowest first, as in the host: "or", "and", "not", "..",
    then postfix operations; "or" and "and" associate left. A range has no
-   postfix operations of its own, and "not" cannot be a range end without
-   parentheses. and, or, not and ranges parse; checking rejects them until
-   the join milestone (ranges until the loops milestone), as does an
-   if-expression. A line break after
+   postfix operations of its own. A `not` token followed by `(` always starts
+   an ordinary call, including at a range end. Otherwise prefix not and infix
+   and/or parse only to produce invalid-operator diagnostics. Checking admits
+   ascending, end-exclusive Int ranges only as for iterables; general Range
+   values remain unsupported. A line break after
    `and` or `or` is accepted only inside brackets; the host also accepts it
    bare (GRAMMAR 3.5), which is a follow-up. *)
 (* A control form ends its expression at its last block's DEDENT: no
@@ -428,6 +434,13 @@ lambda           = [ "pure" required_spaces ] "func" spaces "(" spaces [ lambda_
 lambda_param     = ( identifier | "_" ) [ spaces ":" spaces type_annotation ] ;
 if_expr          = "if" spaces expression spaces ":" NEWLINE INDENT block DEDENT [ else_branch ] ;
 else_branch      = "else" spaces ":" NEWLINE INDENT block DEDENT | "else" required_spaces if_expr ;
+(* Checking accepts a bare if at a return, initializer, condition or arm value,
+   through the ordinary typed join. Call/list/record operands remain excluded.
+   Conditions have the designated Bool type. Expected result types flow into
+   both branches; otherwise the then result establishes the else expectation.
+   Without else the then block must be Void or statement-only, and the if yields
+   Void even in a binding. A Void return with else discards the selected value.
+   Propagation remains invalid inside every if/match block. *)
 (* Method chains continue across lines (host 4.2): a line starting with "."
    at the same indentation, or one level deeper (an indented chain, whose
    INDENT the chain owns and whose DEDENT ends it), continues the postfix
@@ -453,32 +466,33 @@ pure_function_type = "pure" spaces "(" spaces [ type_annotation { spaces "," spa
                      spaces ")" spaces "->" spaces type_annotation ;
 (* Pure function types parse recursively. Checking admits them only as function
    parameters whose children are ordinary data types. Callback operands are pure
-   named function references or unchanged callable parameters; specialization
-   erases callable slots into ordinary direct calls. Nested callable types,
-   callable storage/returns and lambdas remain unsupported by checking.
+   named function references, unchanged callable parameters or written pure lambdas.
+   Lambdas capture immutable data by value; mutable and callable captures reject.
+   Lambda inputs need complete contextual or annotated types; block bodies need a
+   complete expected result or written result annotation. Specialization emits
+   ordinary direct calls and managed capture environments. Nested callable types
+   and callable storage/returns remain unsupported by checking.
    Bare impure function types remain outside this grammar. *)
 parameter        = identifier spaces ":" spaces type_annotation ;
 type_parameter   = "A".."Z" { letter | digit } ;
 type_parameters = "[" spaces type_parameter { spaces "," spaces type_parameter } trailing_comma spaces "]" spaces ;
-function_header  = [ "pure" required_spaces ] "func" required_spaces identifier spaces [ type_parameters ] "(" spaces
+function_header  = [ "pure" required_spaces ] "func" required_spaces callable_name spaces [ type_parameters ] "(" spaces
                    [ parameter { spaces "," spaces parameter } trailing_comma ] spaces ")" spaces [ "->" spaces type_annotation spaces ] ":"
                    NEWLINE ;
 tail_annotation  = "@tail_recursive" (required_spaces | NEWLINE) ;
 function         = [ tail_annotation ] function_header INDENT body DEDENT ;
-(* A constructor's fields are patterns, so patterns nest. Checking accepts
-   one binder or wildcard per field and rejects a deeper field until the
-   pattern-compilation milestone. *)
-(* Alternatives separated by "|" form an or-pattern, rejected by checking
-   until the pattern-compilation milestone. *)
-(* A list pattern takes no trailing comma, as in the host; the rest comes
-   last. Checking rejects list patterns until the pattern-compilation
-   milestone. *)
+(* Constructor and List fields contain recursive patterns. Alternatives
+   separated by "|" must bind the same names with identical semantic types;
+   each successful alternative enters the same arm body.
+   A list pattern takes no trailing comma, as in the host; the rest comes last.
+   Without a rest it requires an exact length; with a rest it requires at
+   least the number of explicit elements. *)
 spread_target    = "..." spaces ( identifier | "_" ) ;
 list_pattern     = "[" spaces ( [ spread_target ] | pattern { spaces "," spaces pattern } [ spaces "," spaces spread_target ] ) spaces "]" ;
-(* String and Char literal patterns are rejected by checking until the
-   pattern-compilation milestone. *)
+(* String patterns compare exact decoded bytes. Char patterns remain rejected
+   until a Char type is supported. *)
 (* A dot in a pattern qualifies a public constructor by a module alias.
-   Qualified and bare heads accept only names or wildcards in their fields. *)
+   Qualified and bare heads have the same recursive field patterns. *)
 pattern_head     = identifier [ spaces "." spaces identifier ] ;
 alternative      = "_" | string_literal | char_literal | list_pattern
                  | pattern_head spaces [ "(" spaces [ pattern { spaces "," spaces pattern } trailing_comma ] spaces ")" ] ;
@@ -501,7 +515,15 @@ propagation      = identifier [ spaces ":" spaces type_annotation ] spaces "?=" 
 (* Loops are statements with no value. `break` and `continue` are valid only
    inside a loop body (host 5.3); neither may sit in an `if` or `match` used as
    a value within a loop (owner rule). A function body starts a new context.
-   The parser enforces these; checking rejects loops until the loops milestone. *)
+   The parser enforces these. Checking accepts nested while with designated Bool
+   conditions and for over Lists or ascending end-exclusive Int ranges. Bounds
+   and the List expression evaluate once, in written order, before iteration;
+   equal/reversed ranges and empty Lists run no body. The item is immutable.
+   Break/continue target the nearest loop through statement if/match; continue
+   advances a for cursor. Carried values use ordinary concrete ownership layouts,
+   including managed records and unions. Each iteration creates fresh locals;
+   older aliases and borrowed outer values remain valid. Managed annotated tail loops
+   remain unsupported. *)
 while_loop       = "while" spaces expression spaces ":" NEWLINE INDENT block DEDENT ;
 for_loop         = "for" required_spaces ( identifier | "_" ) required_spaces "in" required_spaces expression spaces ":" NEWLINE INDENT block DEDENT ;
 statement        = binding | while_loop | for_loop | "break" NEWLINE | "continue" NEWLINE | expression NEWLINE ;
@@ -510,8 +532,8 @@ function_statement = propagation | statement ;
    may end after a statement and then has none. Where an expression is a
    control form, its final DEDENT stands in for the NEWLINE that ends the
    statement, initializer or value. Whether a block without a
-   value is allowed where it stands is the checker's decision: a tail match's
-   arm must have one. *)
+   value is allowed where it stands is the checker's decision: an arm producing a
+   non-Void value must have one. *)
 block            = { statement } [ expression NEWLINE ] ;
 (* A match case is the one place a statement may share the line with its
    header (host case_body); such an arm has no value. *)
@@ -542,7 +564,7 @@ relative_prefix  = "./" | "../" { "../" } ;
 module_components = identifier { "/" identifier } ;
 module_path      = [ relative_prefix ] module_components ;
 constructor_selection = spaces "(" spaces [ identifier { spaces "," spaces identifier } trailing_comma ] spaces ")" ;
-import_symbol    = identifier [ constructor_selection | required_spaces "methods_only" ] ;
+import_symbol    = callable_name [ constructor_selection | required_spaces "methods_only" ] ;
 import_selection = import_symbol { spaces "," spaces import_symbol } trailing_comma ;
 (* The selections follow the path on its line, or on an indented block of
    lines, each holding one or more selections. *)
@@ -564,10 +586,12 @@ builtin_label    = "\"int.to_string\"" | "\"string.length\"" | "\"string.add\"" 
                    | "\"int.divide\"" | "\"int.remainder\""
                    | "\"float.add\"" | "\"float.subtract\"" | "\"float.multiply\""
                    | "\"float.divide\"" | "\"float.remainder\"" | "\"float.to_string\""
+                   | "\"float.copysign\"" | "\"float.equals\"" | "\"float.less_than\""
+                   | "\"float.is_nan\"" | "\"float.is_finite\""
                    | "\"list.repeat\"" | "\"list.length\""
                    | "\"list.append\"" | "\"list.set\"" | "\"list.concat\""
                    | "\"string.parse_int\"" | "\"string.parse_float\"" | "\"list.get\""
-                   | "\"string.byte_at\"" | "\"string.from_codepoint\""
+                   | "\"string.byte_at\"" | "\"string.from_codepoint\"" | "\"string.slice\""
                    | "\"system.get_current_directory\"" | "\"system.read_file\"" | "\"system.write_file\""
                    | "\"int.equals\"" | "\"int.less_than\"" | "\"string.equals\"" ;
 builtin_body     = "builtin" spaces "(" spaces builtin_label spaces ")" NEWLINE ;

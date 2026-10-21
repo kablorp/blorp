@@ -1,8 +1,9 @@
 -- Pure logical paths; only ASCII '/' is a separator.
 import:
-    _base: Int, String, Bool(True, False), Option(Some, None)
+    _base: Int, String, List, Bool(True, False), Option(Some, None)
     int as IntOps
     string as TextOps
+    list as ListOps
 
 private PATH_SEPARATOR_BYTE: Int = 47
 
@@ -28,3 +29,90 @@ pure func join(base: String, child: String) -> String:
                             TextOps.add(base, child)
                         False:
                             TextOps.add(TextOps.add(base, "/"), child)
+
+-- Ignore trailing separators, remove the final component and its separator run.
+-- Interior components remain lexical; root stays '/', empty/basename becomes '.'.
+pure func dirname(path: String) -> String:
+    var end = TextOps.length(path)
+
+    while IntOps.greater_than(end, 0):
+        match is_separator(path, IntOps.subtract(end, 1)):
+            True: end = IntOps.subtract(end, 1)
+            False: break
+
+    while IntOps.greater_than(end, 0):
+        match is_separator(path, IntOps.subtract(end, 1)):
+            True: break
+            False: end = IntOps.subtract(end, 1)
+
+    while IntOps.greater_than(end, 0):
+        match is_separator(path, IntOps.subtract(end, 1)):
+            True: end = IntOps.subtract(end, 1)
+            False: break
+
+    match IntOps.equals(end, 0):
+        True:
+            match is_separator(path, 0):
+                True: "/"
+                False: "."
+        False:
+            -- 0 < end <= byte length, and byte[end] is ASCII '/'.
+            -- Both endpoints are scalar boundaries; checked Slice cannot fail.
+            match TextOps.slice(path, 0, end):
+                Some(parent): parent
+                None: "."
+
+-- Callers supply one nonempty component cut at proved scalar boundaries.
+-- Only ordinary components cancel; unresolved relative parents remain stacked.
+private pure func normalized_component(components: List[String], component: String, absolute: Bool) -> List[String]:
+    match TextOps.equals(component, "."):
+        True: components
+        False:
+            match TextOps.equals(component, ".."):
+                False: ListOps.append(components, component)
+                True:
+                    match ListOps.last(components):
+                        Some(previous):
+                            match TextOps.equals(previous, ".."):
+                                True: ListOps.append(components, component)
+                                False: ListOps.take(components, IntOps.subtract(ListOps.length(components), 1))
+                        None:
+                            match absolute:
+                                True: components
+                                False: ListOps.append(components, component)
+
+-- Pure logical normalization: no filesystem, symlink or Unicode normalization.
+-- The byte scan/materialization is linear. List append/take still copy slots,
+-- and final List.join uses balanced String copying; no COW cost is assumed.
+pure func normalize(path: String) -> String:
+    absolute = is_separator(path, 0)
+    size = TextOps.length(path)
+    var components: List[String] = []
+    var start = 0
+    var position = 0
+
+    while IntOps.less_than(position, size):
+        if is_separator(path, position):
+            if IntOps.less_than(start, position):
+                -- start is 0 or follows '/'; position points at ASCII '/'.
+                -- 0 <= start < position < size; both are scalar boundaries.
+                components = match TextOps.slice(path, start, position):
+                    Some(component): normalized_component(components, component, absolute)
+                    None: components
+            start = IntOps.add(position, 1)
+        position = IntOps.add(position, 1)
+
+    if IntOps.less_than(start, size):
+        -- start is 0 or follows '/', and size is the input's scalar boundary.
+        -- 0 <= start < size; checked Slice cannot fail at these endpoints.
+        components = match TextOps.slice(path, start, size):
+            Some(component): normalized_component(components, component, absolute)
+            None: components
+
+    joined = ListOps.join(components, "/")
+    match absolute:
+        True: TextOps.add("/", joined)
+        False:
+            match IntOps.equals(ListOps.length(components), 0):
+                True: "."
+                False: joined

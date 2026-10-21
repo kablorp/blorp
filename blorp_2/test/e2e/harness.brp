@@ -2,8 +2,11 @@ import:
 	bytes: to_hex
 	./cost:
 		CompilationCost, CostLimits, InstructionCheck(RequiredInstructions, DisabledInstructions),
-		check_limits, format_cost, parse_allocations, parse_instruction_check, parse_instructions
-	fs: IOError, resource_path, temporary_directory
+		ResourceVerdict(ResourceChecksPassed, InitialBootstrapDebt),
+		assess_resource_limits, format_cost, format_initial_bootstrap_debt,
+		parse_allocations, parse_instruction_check, parse_instructions, parse_resource_policy
+	fs: IOError, create_directories, resource_path, temporary_directory
+	path: dirname
 	process:
 		ProcessCommand,
 		ProcessError,
@@ -14,7 +17,7 @@ import:
 		command,
 		run,
 		run_command,
-	system: file_exists, getenv, read_file, remove_file, temp_dir, write_file
+	system: file_exists, getenv, read_file, remove_file, temp_dir, write_bytes, write_file
 	test: TestSuite, run_suite_result
 
 
@@ -217,6 +220,18 @@ func measure_compilation_cost(
 	Ok(cost)
 
 
+-- Only an already measured budget decision may become initial-bootstrap debt.
+-- Compile, counter, native, sanitizer and strict-accounting errors return earlier.
+func check_resource_limits(cost: CompilationCost, limits: CostLimits) -> Result[Void, String]:
+	policy ?= parse_resource_policy(getenv("BLORP_2_RESOURCE_POLICY"))
+	verdict ?= assess_resource_limits(policy, cost, limits)
+	match verdict:
+		ResourceChecksPassed: Ok(void)
+		InitialBootstrapDebt(measured, ceilings, reason):
+			print(format_initial_bootstrap_debt(measured, ceilings, reason))
+			Ok(void)
+
+
 func verify_native_result(directory: String, expected_exit: Int) -> Result[Void, String]:
 	verify_native_output(directory, expected_exit, "")
 
@@ -231,8 +246,15 @@ func verify_native_output(
 
 
 private func link_native(directory: String) -> Result[String, String]:
+	link_native_mode(directory, 0)
+
+
+private func link_native_mode(directory: String, diagnostics: Int) -> Result[String, String]:
 	generated_c: String = directory + "/program.c"
-	binary: String = directory + "/program"
+	binary = if diagnostics == 0:
+		directory + "/program"
+	else:
+		directory + "/program-strict"
 	linked ?= run_successfully(
 		getenv("BLORP_CC").get_or("clang"),
 		[
@@ -244,6 +266,7 @@ private func link_native(directory: String) -> Result[String, String]:
 			"-O0",
 			"-fsanitize=address,undefined",
 			"-fno-sanitize-recover=all",
+			"-DBLORP_MEMORY_DIAGNOSTICS=" + diagnostics.to_string(),
 			generated_c,
 			"-lm",
 			"-o",
@@ -342,7 +365,7 @@ func verify_rejected_input(compiler: String, directory: String) -> Result[Void, 
 func verify_all(compiler: String, directory: String, example: Example) -> Result[Void, String]:
 	cost ?= measure_compilation_cost(compiler, directory, example)
 	native_result ?= verify_native_cases(directory, example)
-	check_limits(cost, example.limits)
+	check_resource_limits(cost, example.limits)
 
 
 private func check_in_directory(check: (String) -> Result[Void, String]) -> Result[Bool, IOError]:
@@ -405,3 +428,91 @@ func run_output_example(
 			limits = limits
 		},
 	)
+
+
+-- Supplemental target accounting uses the same generated C and real main.
+-- Zero is explicit because a scalar-only fixture can have no target heap work.
+fixed union TargetAllocations:
+	ZeroTargetAllocations
+	PositiveTargetAllocations
+
+
+private func verify_target_allocations(report: Bytes, expected: TargetAllocations) -> Result[Void, String]:
+	match expected:
+		ZeroTargetAllocations:
+			if report == "blorp: leak check: 0 allocs, 0 releases, 0 leaked, 0 bytes\n".to_bytes():
+				Ok(void)
+			else:
+				Err("expected the complete balanced zero-allocation target report; got " + report.to_hex())
+		PositiveTargetAllocations:
+			match parse_allocations(report.to_string()):
+				Err(error): Err("target allocation report: " + error)
+				Ok(count):
+					exact = "blorp: leak check: " + count.to_string() + " allocs, " + count.to_string() + " releases, 0 leaked, 0 bytes\n"
+					if report == exact.to_bytes():
+						Ok(void)
+					else:
+						Err("expected exactly one complete target allocation report; got " + report.to_hex())
+
+
+private func verify_accounted_native_case(
+	binary: String,
+	expected: NativeCase,
+	allocation_policy: TargetAllocations,
+	evidence_c_path: String,
+) -> Result[Void, String]:
+	request = { native_command(binary, expected) |
+		environment = [
+			{ name = "BLORP_LEAK_CHECK", value = Some("strict") },
+			{ name = "BLORP_MEMORY_STATS", value = None },
+		]
+	}
+	actual ?= match run_command(request):
+		Err(error): Err(error.to_string())
+		Ok(result): Ok(result)
+	reported ?= write_bytes(evidence_c_path + ".memory.txt", actual.stderr)
+	accounted ?= verify_target_allocations(actual.stderr, allocation_policy)
+	-- The entire stderr has been consumed as a strict accounting report above.
+	-- Removing only that validated report preserves the original expected stderr
+	-- as well as the normal exact exit/stdout checks.
+	verify_native_case_result(expected, { actual | stderr = "".to_bytes() })
+
+
+private func verify_accounted_example(
+	compiler: String,
+	directory: String,
+	example: Example,
+	allocation_policy: TargetAllocations,
+	evidence_c_path: String,
+) -> Result[Void, String]:
+	cost ?= measure_compilation_cost(compiler, directory, example)
+	generated ?= read_file(directory + "/program.c")
+	prepared ?= create_directories(dirname(evidence_c_path)).map_err(pure func(error): error.to_string())
+	retained ?= write_file(evidence_c_path, generated)
+	normal ?= link_native_mode(directory, 0)
+	normal_passed ?= run_native_case(normal, example.first_case)
+	strict ?= link_native_mode(directory, 1)
+	strict_passed ?= verify_accounted_native_case(strict, example.first_case, allocation_policy, evidence_c_path)
+	check_resource_limits(cost, example.limits)
+
+
+-- This bounded helper has one input case per fixture. The existing ordinary
+-- suite and its multi-input helper retain their normal execution contract.
+func run_accounted_example(
+	compiler: String,
+	fixture: String,
+	expected_exit: Int,
+	expected_stdout: String,
+	limits: CostLimits,
+	allocation_policy: TargetAllocations,
+	evidence_c_path: String,
+) -> Bool:
+	example: Example = {
+		name = fixture,
+		fixture = fixture,
+		expected_c = None,
+		first_case = native_case("native output", "", expected_exit, expected_stdout),
+		remaining_cases = [],
+		limits = limits,
+	}
+	with_directory(func(directory: String): verify_accounted_example(compiler, directory, example, allocation_policy, evidence_c_path))

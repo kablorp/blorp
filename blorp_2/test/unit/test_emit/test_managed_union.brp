@@ -1,4 +1,6 @@
 import:
+	../../../src/check/model as Model
+	../test_verify/selection_inputs as Selection
 	../../../src/runtime/memory: MEMORY_RUNTIME
 	../../../src/emit/emit: emit
 	../../../src/lower/lower as Lower
@@ -9,11 +11,10 @@ import:
 	../../../src/utils/syntax:
 		Diagnostic,
 		Entrypoint(NoArguments), EntryResult(IntegerExitStatus),
-		FunctionExecution(OrdinaryCalls),
 		entry_function,
 	../../../src/utils/text: concat
 	../../../src/verify/verify: verify
-	../managed_union_inputs: lowered, lowered_modules
+	../managed_union_inputs: lowered, lowered_modules, lowered_tail_join
 	../module_input: INTEGER_OPERATIONS, STRING_OPERATIONS
 	option: to_result
 	../ownership_inputs: InputIds, input_ids, span
@@ -179,34 +180,50 @@ private pure func seed_error() -> Diagnostic:
 	}
 
 
+private pure func seed_variant(selection: Lower.LoweredSelection, arm: Lower.JoinArm) -> Result[Concrete.VariantInstanceId, Diagnostic]:
+	var found: Option[Concrete.VariantInstanceId] = None
+	for node in selection.nodes:
+		match node:
+			Lower.EnterArm(edge):
+				if Model.match_arm_number(edge.arm) == Model.match_arm_number(arm.id):
+					match edge.definitions:
+						[Lower.BorrowUnionField(_, field, _)]: found = Some(Concrete.variant_field_variant(field))
+						_: void
+			Lower.TestVariant(_, variant, yes, _):
+				match selection.nodes.get(Model.decision_node_number(yes)):
+					Some(Lower.EnterArm(edge)):
+						if Model.match_arm_number(edge.arm) == Model.match_arm_number(arm.id):
+							found = Some(variant)
+					_: void
+			Lower.TestListLength(_, _, _, _) | Lower.TestStringBytes(_, _, _, _): void
+	match found:
+		Some(variant): Ok(variant)
+		None: Err(seed_error())
+
+
 -- Lowering mints opaque identities only. Every tested layout and ownership
 -- operation below is supplied directly; own() never supplies an expected fact.
 private pure func seed(source: String, function_index: Int) -> Result[EmitIds, Diagnostic]:
 	ids ?= input_ids()
 	input ?= lowered(source)
-	function ?= Lower.lowered_functions(input).functions
-		.get(function_index + 1)
-		.to_result(seed_error())
-
-	match function.tail:
-		Lower.MatchValue(matched):
+	function ?= Lower.lowered_functions(input).functions.get(function_index + 1).to_result(seed_error())
+	match lowered_tail_join(function):
+		Some(matched):
 			var variants: List[Concrete.VariantInstanceId] = []
-
+			var failure: Option[Diagnostic] = None
 			for arm in matched.arms:
-				match arm.label:
-					Lower.VariantLabel(id):
-						variants = variants.append(id)
-					Lower.DefaultLabel:
-						void
-
-			Ok({
-				values = ids,
-				owner = matched.owner,
-				variants = variants,
-			})
-		_:
-			Err(seed_error())
-
+				match seed_variant(matched.selection, arm):
+					Ok(variant): variants = variants.append(variant)
+					Err(error):
+						failure = Some(error)
+						break
+			match failure:
+				Some(error): Err(error)
+				None:
+					match variants.get(0):
+						Some(first): Ok({ values = ids, owner = Concrete.variant_owner(first), variants = variants })
+						None: Err(seed_error())
+		_: Err(seed_error())
 
 private pure func boxed_layout() -> Concrete.ConcreteUnion:
 	{
@@ -289,16 +306,15 @@ private pure func function(
 	parameters: List[Concrete.TypeRef],
 	return_type: Concrete.TypeRef,
 	operations: List[Owned.OwnershipOperation],
-	tail: Owned.OwnedTail,
+	result: Owned.ReturnTransfer,
 ) -> Owned.OwnedFunction:
 	{
-		execution = OrdinaryCalls,
 		signature = {
 			parameters = parameters,
 			return_type = return_type
 		},
 		operations = operations,
-		tail = tail
+		result = result
 	}
 
 
@@ -307,12 +323,12 @@ private pure func main_function(ids: InputIds) -> Owned.OwnedFunction:
 		[],
 		Concrete.IntType,
 		[integer(ids.first, 0)],
-		Owned.ReturnTail(Owned.ReturnResult(Owned.UnmanagedReturn(ids.first))),
+		Owned.UnmanagedReturn(ids.first),
 	)
 
 
-private pure func returned(id: Lower.ValueId, owner: Int) -> Owned.OwnedTail:
-	Owned.ReturnTail(Owned.ReturnResult(Owned.OwnedReturn(id, Owned.owner_id(owner))))
+private pure func returned(id: Lower.ValueId, owner: Int) -> Owned.ReturnTransfer:
+	Owned.OwnedReturn(id, Owned.owner_id(owner))
 
 
 private pure func exact(
@@ -369,7 +385,7 @@ private pure func typed_alias_case() -> Result[Bool, Diagnostic]:
 				Owned.owner_id(0),
 				span(30),
 			), integer(ids.second, 0)],
-		Owned.ReturnTail(Owned.ReturnResult(Owned.UnmanagedReturn(ids.second))),
+		Owned.UnmanagedReturn(ids.second),
 	)
 	expected = expected_box_c()
 		.concat(MAIN_DECL)
@@ -541,69 +557,44 @@ pure func test_borrowed_string_parameter_is_acquired_before_constructor_transfer
 
 private pure func projected_child_case() -> Result[Bool, Diagnostic]:
 	seed ?= seed(BOX_SEED, 0)
-	boxed ?= seed.variants
-		.get(0)
-		.to_result(seed_error())
+	boxed ?= seed.variants.get(0).to_result(seed_error())
 	field ?= Concrete.variant_field(boxed, 0, [boxed_layout()], span(0))
 	ids = seed.values
+	selection = Selection.direct(Owned.BorrowedArgument({ value = ids.first, source = Owned.ParameterBorrow(ids.first) }))
 	helper = function(
-		[Concrete.UnionType(seed.owner)],
-		Concrete.StringType,
-		[parameter(
-				ids.first,
-				Concrete.UnionType(seed.owner),
-			)],
-		Owned.MatchTail({
-			scrutinee = Owned.BorrowedArgument({ value = ids.first, source = Owned.ParameterBorrow(ids.first) }),
-			owner = seed.owner,
-			arms = [
-				{
-					label = Lower.VariantLabel(boxed),
-					operations = [definition(
-							ids.second,
-							Concrete.StringType,
-							Owned.PayloadDefinition(field, ids.first),
-							Owned.BorrowedResult(Owned.PayloadBorrow(ids.first)),
-						), acquire(
-							0,
-							ids.second,
-							Owned.PayloadBorrow(ids.first),
-						)],
-					exit = Owned.ReturnResult(Owned.OwnedReturn(ids.second, Owned.owner_id(0)))
-				},
-			],
-		}),
+		[Concrete.UnionType(seed.owner)], Concrete.StringType,
+		[parameter(ids.first, Concrete.UnionType(seed.owner))].append(Owned.ExecuteJoin({
+			result = Owned.ManagedJoinParameter({ id = ids.second, value_type = Concrete.StringType, span = span(30) }, Owned.owner_id(0)),
+			carried = [],
+			selection = { selection | nodes = [Owned.EnterArm({
+				arm = Model.match_arm_id(0),
+				operations = [definition(ids.third, Concrete.StringType, Owned.PayloadDefinition(field, ids.first), Owned.BorrowedResult(Owned.PayloadBorrow(ids.first))), acquire(1, ids.third, Owned.PayloadBorrow(ids.first))],
+				transfers = [returned(ids.third, 1)],
+			})] },
+			arms = [{
+				id = Model.match_arm_id(0),
+				inputs = [Owned.ManagedJoinParameter({ id = ids.fourth, value_type = Concrete.StringType, span = span(30) }, Owned.owner_id(2))],
+				operations = [], exit = Owned.Yield({ transfer = returned(ids.fourth, 2), carried = [] }),
+			}],
+		})),
+		returned(ids.second, 0),
 	)
 	expected = expected_box_c()
 		.concat(MAIN_DECL)
-		.concat("struct blorp_string* blorp_f_1(struct blorp_u_0 ".concat("blorp_p_0);"))
+		.concat("struct blorp_string* blorp_f_1(struct blorp_u_0 blorp_p_0);")
 		.concat(expected_main_body())
-		.concat(
-			"struct blorp_string* blorp_f_1(struct blorp_u_0 "
-				.concat("blorp_p_0){const struct blorp_u_0 blorp_vl_0=blorp_p_0;")
-				.concat("(void)blorp_vl_0;"),
-		)
-		.concat(
-			"switch(blorp_vl_0.tag){case blorp_v_0_0:default:{struct "
-				.concat("blorp_string* const blorp_vl_1=blorp_vl_0.payload.blorp_")
-				.concat("up_0.blorp_uf_0;(void)blorp_vl_1;"),
-		)
-		.concat(
-			"blorp_string_retain(blorp_vl_1);struct blorp_string* "
-				.concat("const blorp_owner_0=blorp_vl_1;(void)blorp_owner_0;")
-				.concat("return blorp_owner_0;}}}"),
-		)
+		.concat("struct blorp_string* blorp_f_1(struct blorp_u_0 blorp_p_0){")
+		.concat("const struct blorp_u_0 blorp_vl_0=blorp_p_0;(void)blorp_vl_0;")
+		.concat("struct blorp_string* blorp_vl_1;struct blorp_string* blorp_vl_3;")
+		.concat("goto blorp_selection_1_node_0;blorp_selection_1_node_0:{")
+		.concat("struct blorp_string* const blorp_vl_2=blorp_vl_0.payload.blorp_up_0.blorp_uf_0;(void)blorp_vl_2;")
+		.concat("blorp_string_retain(blorp_vl_2);struct blorp_string* const blorp_owner_1=blorp_vl_2;(void)blorp_owner_1;")
+		.concat("blorp_vl_3=blorp_owner_1;goto blorp_selection_1_arm_0;}")
+		.concat("blorp_selection_1_arm_0:{(void)blorp_vl_3;struct blorp_string* const blorp_owner_2=blorp_vl_3;(void)blorp_owner_2;")
+		.concat("blorp_vl_1=blorp_owner_2;goto blorp_selection_1_done;}")
+		.concat("blorp_selection_1_done:;(void)blorp_vl_1;struct blorp_string* const blorp_owner_0=blorp_vl_1;(void)blorp_owner_0;return blorp_owner_0;}")
 		.concat(ENTRYPOINT)
-	Ok(
-		exact(
-			ids,
-			[boxed_layout()],
-			[main_function(ids), helper],
-			string_runtime(),
-			expected,
-		),
-	)
-
+	Ok(exact(ids, [boxed_layout()], [main_function(ids), helper], string_runtime(), expected))
 
 pure func test_selected_payload_is_acquired_inside_its_arm_before_owned_return() -> Bool:
 	projected_child_case().get_or(False)
@@ -820,105 +811,59 @@ pure func test_nested_helpers_precede_parents_and_delegate_one_child_obligation(
 
 private pure func arm_owner_case() -> Result[Bool, Diagnostic]:
 	seed ?= seed(CHOICE_SEED, 0)
-	left ?= seed.variants
-		.get(0)
-		.to_result(seed_error())
-	right ?= seed.variants
-		.get(1)
-		.to_result(seed_error())
+	left ?= seed.variants.get(0).to_result(seed_error())
+	right ?= seed.variants.get(1).to_result(seed_error())
 	ids = seed.values
 	value_type = Concrete.UnionType(seed.owner)
-	layout: Concrete.ConcreteUnion = {
-		variants = [[Concrete.StringType], [Concrete.StringType]],
-		representation = Concrete.InlineOwningPayload
-	}
+	layout: Concrete.ConcreteUnion = { variants = [[Concrete.StringType], [Concrete.StringType]], representation = Concrete.InlineOwningPayload }
 	left_field ?= Concrete.variant_field(left, 0, [layout], span(0))
 	right_field ?= Concrete.variant_field(right, 0, [layout], span(0))
-	helper = function(
-		[value_type],
-		Concrete.StringType,
-		[parameter(ids.first, value_type)],
-		Owned.MatchTail({
-			scrutinee = Owned.BorrowedArgument({ value = ids.first, source = Owned.ParameterBorrow(ids.first) }),
-			owner = seed.owner,
-			arms = [
-				{
-					label = Lower.VariantLabel(left),
-					operations = [definition(
-							ids.second,
-							Concrete.StringType,
-							Owned.PayloadDefinition(left_field, ids.first),
-							Owned.BorrowedResult(Owned.PayloadBorrow(ids.first)),
-						), acquire(
-							0,
-							ids.second,
-							Owned.PayloadBorrow(ids.first),
-						)],
-					exit = Owned.ReturnResult(Owned.OwnedReturn(ids.second, Owned.owner_id(0)))
-				},
-				{
-					label = Lower.VariantLabel(right),
-					operations = [acquire(
-							1,
-							ids.first,
-							Owned.ParameterBorrow(ids.first),
-						), Owned.DropOwner(
-							Owned.owner_id(1),
-							span(30),
-						), definition(
-							ids.third,
-							Concrete.StringType,
-							Owned.PayloadDefinition(right_field, ids.first),
-							Owned.BorrowedResult(Owned.PayloadBorrow(ids.first)),
-						), acquire(
-							2,
-							ids.third,
-							Owned.PayloadBorrow(ids.first),
-						)],
-					exit = Owned.ReturnResult(Owned.OwnedReturn(ids.third, Owned.owner_id(2)))
-				},
+	selection = Selection.branches(Owned.BorrowedArgument({ value = ids.first, source = Owned.ParameterBorrow(ids.first) }), left)
+	nodes = selection.nodes
+		.set(0, Owned.EnterArm({
+			arm = Model.match_arm_id(0),
+			operations = [definition(ids.third, Concrete.StringType, Owned.PayloadDefinition(left_field, ids.first), Owned.BorrowedResult(Owned.PayloadBorrow(ids.first))), acquire(1, ids.third, Owned.PayloadBorrow(ids.first))],
+			transfers = [returned(ids.third, 1)],
+		}))
+		.set(1, Owned.EnterArm({
+			arm = Model.match_arm_id(1),
+			operations = [
+				acquire(2, ids.first, Owned.ParameterBorrow(ids.first)),
+				Owned.DropOwner(Owned.owner_id(2), span(30)),
+				definition(ids.fourth, Concrete.StringType, Owned.PayloadDefinition(right_field, ids.first), Owned.BorrowedResult(Owned.PayloadBorrow(ids.first))),
+				acquire(3, ids.fourth, Owned.PayloadBorrow(ids.first)),
 			],
-		}),
+			transfers = [returned(ids.fourth, 3)],
+		}))
+	helper = function(
+		[value_type], Concrete.StringType,
+		[parameter(ids.first, value_type)].append(Owned.ExecuteJoin({
+			result = Owned.ManagedJoinParameter({ id = ids.second, value_type = Concrete.StringType, span = span(30) }, Owned.owner_id(0)),
+			carried = [], selection = { selection | nodes = nodes },
+			arms = [
+				{ id = Model.match_arm_id(0), inputs = [Owned.ManagedJoinParameter({ id = ids.fifth, value_type = Concrete.StringType, span = span(30) }, Owned.owner_id(4))], operations = [], exit = Owned.Yield({ transfer = returned(ids.fifth, 4), carried = [] }) },
+				{ id = Model.match_arm_id(1), inputs = [Owned.ManagedJoinParameter({ id = ids.sixth, value_type = Concrete.StringType, span = span(30) }, Owned.owner_id(5))], operations = [], exit = Owned.Yield({ transfer = returned(ids.sixth, 5), carried = [] }) },
+			],
+		})),
+		returned(ids.second, 0),
 	)
 	expected = expected_choice_c()
 		.concat(MAIN_DECL)
-		.concat("struct blorp_string* blorp_f_1(struct blorp_u_0 ".concat("blorp_p_0);"))
+		.concat("struct blorp_string* blorp_f_1(struct blorp_u_0 blorp_p_0);")
 		.concat(expected_main_body())
-		.concat(
-			"struct blorp_string* blorp_f_1(struct blorp_u_0 "
-				.concat("blorp_p_0){const struct blorp_u_0 blorp_vl_0=blorp_p_0;")
-				.concat("(void)blorp_vl_0;switch(blorp_vl_0.tag){"),
-		)
-		.concat(
-			"case blorp_v_0_0:{struct blorp_string* const "
-				.concat("blorp_vl_1=blorp_vl_0.payload.blorp_up_0.blorp_uf_0;")
-				.concat("(void)blorp_vl_1;blorp_string_retain(blorp_vl_1);struct ")
-				.concat("blorp_string* const blorp_owner_0=blorp_vl_1;")
-				.concat("(void)blorp_owner_0;return blorp_owner_0;}"),
-		)
-		.concat(
-			"case blorp_v_0_1:default:{blorp_union_dup_0(blorp_vl_0);"
-				.concat("const struct blorp_u_0 blorp_owner_1=blorp_vl_0;")
-				.concat("(void)blorp_owner_1;blorp_union_drop_0(blorp_owner_1);"),
-		)
-		.concat(
-			"struct blorp_string* const "
-				.concat("blorp_vl_2=blorp_vl_0.payload.blorp_up_1.blorp_uf_0;")
-				.concat("(void)blorp_vl_2;blorp_string_retain(blorp_vl_2);struct ")
-				.concat("blorp_string* const blorp_owner_2=blorp_vl_2;")
-				.concat("(void)blorp_owner_2;return blorp_owner_2;}}}"),
-		)
+		.concat("struct blorp_string* blorp_f_1(struct blorp_u_0 blorp_p_0){const struct blorp_u_0 blorp_vl_0=blorp_p_0;(void)blorp_vl_0;")
+		.concat("struct blorp_string* blorp_vl_1;struct blorp_string* blorp_vl_4;struct blorp_string* blorp_vl_5;goto blorp_selection_1_node_2;")
+		.concat("blorp_selection_1_node_0:{struct blorp_string* const blorp_vl_2=blorp_vl_0.payload.blorp_up_0.blorp_uf_0;(void)blorp_vl_2;")
+		.concat("blorp_string_retain(blorp_vl_2);struct blorp_string* const blorp_owner_1=blorp_vl_2;(void)blorp_owner_1;blorp_vl_4=blorp_owner_1;goto blorp_selection_1_arm_0;}")
+		.concat("blorp_selection_1_node_1:{blorp_union_dup_0(blorp_vl_0);const struct blorp_u_0 blorp_owner_2=blorp_vl_0;(void)blorp_owner_2;blorp_union_drop_0(blorp_owner_2);")
+		.concat("struct blorp_string* const blorp_vl_3=blorp_vl_0.payload.blorp_up_1.blorp_uf_0;(void)blorp_vl_3;blorp_string_retain(blorp_vl_3);struct blorp_string* const blorp_owner_3=blorp_vl_3;(void)blorp_owner_3;")
+		.concat("blorp_vl_5=blorp_owner_3;goto blorp_selection_1_arm_1;}")
+		.concat("blorp_selection_1_node_2:{if((blorp_vl_0).tag==blorp_v_0_0)goto blorp_selection_1_node_0;goto blorp_selection_1_node_1;}")
+		.concat("blorp_selection_1_arm_0:{(void)blorp_vl_4;struct blorp_string* const blorp_owner_4=blorp_vl_4;(void)blorp_owner_4;blorp_vl_1=blorp_owner_4;goto blorp_selection_1_done;}")
+		.concat("blorp_selection_1_arm_1:{(void)blorp_vl_5;struct blorp_string* const blorp_owner_5=blorp_vl_5;(void)blorp_owner_5;blorp_vl_1=blorp_owner_5;goto blorp_selection_1_done;}")
+		.concat("blorp_selection_1_done:;(void)blorp_vl_1;struct blorp_string* const blorp_owner_0=blorp_vl_1;(void)blorp_owner_0;return blorp_owner_0;}")
 		.concat(ENTRYPOINT)
-	Ok(
-		exact(
-			ids,
-			[layout],
-			[main_function(ids), helper],
-			string_runtime(),
-			expected,
-		),
-	)
-
+	Ok(exact(ids, [layout], [main_function(ids), helper], string_runtime(), expected))
 
 pure func test_owner_type_projection_keeps_global_arm_ids_and_different_storage_types() -> Bool:
 	arm_owner_case().get_or(False)

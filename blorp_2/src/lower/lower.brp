@@ -1,9 +1,13 @@
 import:
-	../check/model: BindingId, BindingOrigin(ParameterBinding, BodyLocal, MatchCapture), binding_number
+	../utils/boolean: or
+	../check/model:
+		BindingId, BindingOrigin(ParameterBinding, BodyLocal, MatchCapture), binding_id, binding_number,
+		MatchArmId, DecisionNodeId, ListLengthTest, match_arm_id, decision_node_id,
+	../namespace/builtins as Builtins: DesignatedBoolean, DesignatedOption, RuntimeOperation(IntLessThan, ListGet)
 	int as IntOps
 	list: set
-	option: to_result
-	../specialize/specialize:
+	option: to_result, is_some
+	../specialize/specialize as Concrete:
 		ConcreteArm,
 		ConcreteBinding,
 		ConcreteBody(ConcreteValueBody, ConcreteMatchBody),
@@ -18,22 +22,24 @@ import:
 		ConcreteJoin,
 		ConcreteJoinArm,
 		ConcreteMatch,
-		ConcretePattern(VariantCase, WildcardCase),
+		ConcretePatternPlace, ConcreteSelection,
 		ConcreteRecord,
 		ConcreteRecordField,
 		ConcreteRecordUpdate,
-		ConcreteStatement(InitializeBinding, ReassignBinding, DiscardExpression),
-		ConcreteUnion, VariantFieldInstanceId, variant_field,
+		ConcreteStatement(InitializeBinding, ReassignBinding, DiscardExpression, RunWhile, RunFor, BreakSourceLoop, ContinueSourceLoop),
+		ConcreteWhile,
+		ConcreteFor, ConcreteIteration(ListIteration, AscendingIntRange),
+		ConcreteUnion, VariantFieldInstanceId,
 		FieldInstanceId,
 		FunctionInstanceId,
 		FunctionSignature,
 		RecordInstanceId,
 		SpecializedProgram,
-		TypeRef(IntType, RecordType),
-		UnionInstanceId,
+		TypeRef(IntType, RecordType, VoidType),
+		variant_owner,
 		VariantInstanceId,
 		specialized_contents,
-	../utils/syntax: Diagnostic, Entrypoint, FunctionExecution, Span
+	../utils/syntax: Diagnostic, Entrypoint, FunctionExecution(OrdinaryCalls, SelfTailLoop), Span, diagnostic
 
 
 -- A value identity belongs to one lowered function, including its branches.
@@ -42,6 +48,18 @@ opaque type ValueId = Int
 
 pure func value_number(id: ValueId) -> Int:
 	from_opaque ValueId(id)
+
+
+-- A loop's existing primary result identifies its lexical transfer target.
+opaque type LoopTarget = ValueId
+
+
+pure func loop_target(result: ValueId) -> LoopTarget:
+	into_opaque LoopTarget(result)
+
+
+pure func loop_target_value(target: LoopTarget) -> ValueId:
+	from_opaque LoopTarget(target)
 
 
 -- The values an operation reads. A join reads, at its own position, every
@@ -62,6 +80,10 @@ pure func value_reads(operation: ValueOperation) -> List[ValueId]:
 		ConstructListValue(elements):
 			elements
 		PayloadValue(_, value):
+			[value]
+		ListElementValue(_, value):
+			[value]
+		ListSuffixValue(value, _):
 			[value]
 		ParameterValue(_) | VoidValue | IntegerValue(_) | FloatValue(_) | StringValue(_):
 			[]
@@ -86,6 +108,8 @@ fixed union ValueOperation:
 	ConstructListValue(List[ValueId])
 	-- Selected member identity is retained for verification and C projection.
 	PayloadValue(VariantFieldInstanceId, ValueId)
+	ListElementValue(Int, ValueId)
+	ListSuffixValue(ValueId, Int)
 
 
 fixed record ValueDefinition {
@@ -106,44 +130,44 @@ fixed record ValueParameter {
 fixed union LoweredStep:
 	Define(ValueDefinition)
 	Join(LoweredJoin)
+	Loop(LoweredLoop)
 
 
-fixed record ValueBlock {
-	steps: List[LoweredStep],
-	exit: LoweredExit
+fixed record LoopHeader {
+	parameter: ValueParameter,
+	initial: ValueId
 }
 
 
-fixed union MatchLabel:
-	VariantLabel(VariantInstanceId)
-	DefaultLabel
-
-
-fixed record LoweredArm {
-	label: MatchLabel,
-	body: ValueBlock
+fixed record LoopOutputs {
+	value: ValueId,
+	carried: List[ValueId],
+	span: Span
 }
 
 
-fixed record LoweredMatch {
-	scrutinee: ValueId,
-	owner: UnionInstanceId,
-	arms: List[LoweredArm]
-}
+fixed union LoopExit:
+	Break(LoopOutputs)
+	Recur(List[ValueId], Span)
 
 
-fixed union LoweredExit:
-	ReturnValue(ValueId)
-	RecurValues(List[ValueId], Span)
-
-
--- A join arm yields `value` to the join. Only a tail arm returns or loops,
--- so a yield cannot end a function and a backedge cannot leave a join arm.
-fixed record JoinArm {
-	label: MatchLabel,
-	steps: List[LoweredStep],
+fixed record JoinOutputs {
 	value: ValueId,
 	carried: List[ValueId]
+}
+
+
+fixed union JoinExit:
+	Yield(JoinOutputs)
+	TransferLoop(LoopTarget, LoopTail)
+
+
+-- Only yielding arms publish the join's continuation outputs.
+fixed record JoinArm {
+	id: MatchArmId,
+	inputs: List[ValueParameter],
+	steps: List[LoweredStep],
+	exit: JoinExit
 }
 
 
@@ -156,23 +180,78 @@ fixed record JoinArm {
 fixed record LoweredJoin {
 	result: ValueParameter,
 	carried: List[ValueParameter],
-	scrutinee: ValueId,
-	owner: UnionInstanceId,
+	selection: LoweredSelection,
 	arms: List[JoinArm],
 	reads: List[ValueId]
 }
 
 
-fixed union LoweredTail:
-	ExitValue(LoweredExit)
-	MatchValue(LoweredMatch)
+fixed record LoopArm {
+	id: MatchArmId,
+	inputs: List[ValueParameter],
+	body: LoopBlock
+}
+
+
+fixed record LoopMatch {
+	selection: LoweredSelection,
+	arms: List[LoopArm]
+}
+
+
+-- Successful selection edges can only borrow guarded fields. User effects
+-- belong to the single arm body reached through its canonical inputs.
+fixed union SelectionDefinition:
+	BorrowUnionField(ValueParameter, VariantFieldInstanceId, ValueId)
+	BorrowListElement(ValueParameter, Int, ValueId)
+	CopyListSuffix(ValueParameter, ValueId, Int)
+
+
+fixed record SelectionEdge {
+	arm: MatchArmId,
+	definitions: List[SelectionDefinition],
+	arguments: List[ValueId]
+}
+
+
+fixed union LoweredDecisionNode:
+	TestVariant(ConcretePatternPlace, VariantInstanceId, DecisionNodeId, DecisionNodeId)
+	TestListLength(ConcretePatternPlace, ListLengthTest, DecisionNodeId, DecisionNodeId)
+	TestStringBytes(ConcretePatternPlace, String, DecisionNodeId, DecisionNodeId)
+	EnterArm(SelectionEdge)
+
+
+fixed record LoweredSelection {
+	scrutinee: ValueId,
+	nodes: List[LoweredDecisionNode],
+	entry: DecisionNodeId
+}
+
+
+fixed union LoopTail:
+	ExitLoop(LoopExit)
+	MatchLoop(LoopMatch)
+
+
+fixed record LoopBlock {
+	steps: List[LoweredStep],
+	tail: LoopTail
+}
+
+
+fixed record LoweredLoop {
+	headers: List[LoopHeader],
+	result: ValueParameter,
+	carried: List[ValueParameter],
+	body: LoopBlock,
+	reads: List[ValueId]
+}
 
 
 fixed record LoweredFunction {
-	execution: FunctionExecution,
 	signature: FunctionSignature,
 	steps: List[LoweredStep],
-	tail: LoweredTail
+	result: ValueId
 }
 
 
@@ -180,18 +259,21 @@ pure func step_reads(step: LoweredStep) -> List[ValueId]:
 	match step:
 		Define(definition): value_reads(definition.operation)
 		Join(join): join.reads
+		Loop(loop): loop.reads
 
 
 pure func step_span(step: LoweredStep) -> Span:
 	match step:
 		Define(definition): definition.span
 		Join(join): join.result.span
+		Loop(loop): loop.result.span
 
 
 pure func step_value_count(step: LoweredStep) -> Int:
 	match step:
 		Define(_): 1
 		Join(join): IntOps.add(1, join.carried.length())
+		Loop(loop): IntOps.add(1, loop.carried.length())
 
 
 pure func block_value_count(steps: List[LoweredStep]) -> Int:
@@ -214,6 +296,12 @@ pure func value_span(steps: List[LoweredStep], value: ValueId) -> Option[Span]:
 				if IntOps.equals(value_number(join.result.id), value_number(value)):
 					found = Some(join.result.span)
 				for parameter in join.carried:
+					if IntOps.equals(value_number(parameter.id), value_number(value)):
+						found = Some(parameter.span)
+			Loop(loop):
+				if IntOps.equals(value_number(loop.result.id), value_number(value)):
+					found = Some(loop.result.span)
+				for parameter in loop.carried:
 					if IntOps.equals(value_number(parameter.id), value_number(value)):
 						found = Some(parameter.span)
 		if found.is_some():
@@ -244,16 +332,54 @@ private fixed record PendingJoin {
 	result: ValueParameter,
 	carried: List[ValueParameter],
 	scrutinee: ValueId,
-	join: ConcreteJoin,
-	bindings: List[Option[ValueId]]
+	join: PreparedSelection,
+	bindings: List[Option[ValueId]],
+	context: Option[SourceLoopContext]
+}
+
+
+-- Backedges prepend a for cursor's next value; while backedges have no prefix.
+-- The mutable source bindings themselves are read at the exact outgoing edge.
+private fixed record SourceLoopContext {
+	target: LoopTarget,
+	carried: List[BindingId],
+	next: List[ValueId],
+	result: ValueId
 }
 
 
 -- A block's definitions while it is built: complete ones, and joins whose
 -- definitions complete_joins builds once their arms are lowered.
+private fixed record PendingWhile {
+	result: ValueParameter,
+	carried: List[ValueParameter],
+	loop: ConcreteWhile,
+	bindings: List[Option[ValueId]]
+}
+
+
+private fixed union ForInput:
+	ListInput(ValueId, TypeRef, DesignatedOption[VariantInstanceId], ValueId)
+	RangeInput(ValueId, ValueId, DesignatedBoolean[VariantInstanceId])
+
+
+private fixed record PendingFor {
+	result: ValueParameter,
+	carried: List[ValueParameter],
+	iteration: ForInput,
+	item: Option[BindingId],
+	body: PreparedBlock,
+	source_carried: List[BindingId],
+	bindings: List[Option[ValueId]],
+	span: Span
+}
+
+
 private fixed union BlockEntry:
 	Defined(ValueDefinition)
 	AwaitingArms(PendingJoin)
+	AwaitingWhile(PendingWhile)
+	AwaitingFor(PendingFor)
 
 
 -- This builder is confined to one expression; read-only bindings are separate.
@@ -463,7 +589,7 @@ private pure func lower_value(
 				Ok(read): Ok(define_value(read.builder, ReadRecordFieldValue(field, read.value), value.value_type, value.span))
 				Err(error): Err(error)
 		Match(join):
-			match lower_join_value(builder, bindings, join, value.value_type, value.span, binding_facts):
+			match lower_join_value(builder, bindings, join, value.value_type, value.span, binding_facts, None):
 				Ok(result): Ok({ builder = result.builder, value = result.value })
 				Err(error): Err(error)
 
@@ -475,12 +601,27 @@ private pure func lower_join_value(
 	value_type: TypeRef,
 	span: Span,
 	binding_facts: List[ConcreteBinding],
+	context: Option[SourceLoopContext],
 ) -> Result[BuiltBlockValue, Diagnostic]:
-	scrutinee ?= lower_value(builder, bindings, join.scrutinee, binding_facts)
+	match prepare_selection(join, value_type, span):
+		ContinuingBranch(selection): lower_prepared_join(builder, bindings, selection, binding_facts, context)
+		AbruptBranch(_): Err(diagnostic(span, "internal compiler error: abrupt selection used as a value", "report this compiler error with the input program"))
+
+
+private pure func lower_prepared_join(
+	builder: ExpressionBuilder,
+	bindings: List[Option[ValueId]],
+	join: PreparedSelection,
+	binding_facts: List[ConcreteBinding],
+	context: Option[SourceLoopContext],
+) -> Result[BuiltBlockValue, Diagnostic]:
+	span = join.span
+	value_type = join.value_type
+	scrutinee ?= lower_block_value(builder, bindings, join.scrutinee, binding_facts, None)
 	id = into_opaque ValueId(scrutinee.builder.next_value)
 	var next_value = IntOps.add(scrutinee.builder.next_value, 1)
 	var carried: List[ValueParameter] = []
-	var values = bindings
+	var values = scrutinee.bindings
 	var failure: Option[Diagnostic] = None
 	for binding in join.carried:
 		position = binding_number(binding)
@@ -497,7 +638,7 @@ private pure func lower_join_value(
 				carried = carried.append(parameter)
 				values = values.set(position, Some(parameter.id))
 				next_value = IntOps.add(next_value, 1)
-	ready ?= match failure:
+	ready: Void ?= match failure:
 		Some(error): Err(error)
 		None: Ok(void)
 	pending: PendingJoin = {
@@ -505,7 +646,8 @@ private pure func lower_join_value(
 		carried = carried,
 		scrutinee = scrutinee.value,
 		join = join,
-		bindings = bindings,
+		bindings = scrutinee.bindings,
+		context = context,
 	}
 	Ok({
 		builder = { next_value = next_value, entries = scrutinee.builder.entries.append(AwaitingArms(pending)) },
@@ -519,9 +661,10 @@ private pure func lower_block_value(
 	bindings: List[Option[ValueId]],
 	value: ConcreteExpr,
 	binding_facts: List[ConcreteBinding],
+	context: Option[SourceLoopContext],
 ) -> Result[BuiltBlockValue, Diagnostic]:
 	match value.form:
-		Match(join): lower_join_value(builder, bindings, join, value.value_type, value.span, binding_facts)
+		Match(join): lower_join_value(builder, bindings, join, value.value_type, value.span, binding_facts, context)
 		_:
 			match lower_value(builder, bindings, value, binding_facts):
 				Ok(lowered):
@@ -532,31 +675,50 @@ private pure func lower_block_value(
 private fixed record BuiltBlock {
 	next_value: Int,
 	entries: List[BlockEntry],
-	bindings: List[Option[ValueId]]
+	bindings: List[Option[ValueId]],
+	completion: BlockCompletion
 }
+
+
+private fixed union BlockCompletion:
+	Continuing
+	Abrupt(PendingLoopTail)
+
+
+private fixed record PendingLoopMatch {
+	join: PreparedSelection,
+	scrutinee: ValueId,
+	bindings: List[Option[ValueId]],
+	context: SourceLoopContext
+}
+
+
+private fixed union PendingLoopTail:
+	SourceExit(LoopExit)
+	SourceMatch(PendingLoopMatch)
 
 
 private fixed record BuiltExit {
 	next_value: Int,
 	entries: List[BlockEntry],
-	exit: LoweredExit
+	exit: LoopExit
 }
 
 
 private fixed record BuiltMatch {
 	steps: List[LoweredStep],
-	matched: LoweredMatch
+	matched: LoopMatch
 }
 
 
 private fixed record BuiltTail {
 	steps: List[LoweredStep],
-	tail: LoweredTail
+	tail: LoopTail
 }
 
 
 private fixed record BuiltArm {
-	arm: LoweredArm,
+	arm: LoopArm,
 	next_value: Int
 }
 
@@ -593,147 +755,532 @@ private pure func lower_exit(
 ) -> Result[BuiltExit, Diagnostic]:
 	match exit:
 		ReturnExpression(value):
-			match lower_block_value({ next_value = next_value, entries = [] }, bindings, value, binding_facts):
+			match lower_block_value({ next_value = next_value, entries = [] }, bindings, value, binding_facts, None):
 				Ok(result):
 					Ok({
 						next_value = result.builder.next_value,
 						entries = result.builder.entries,
-						exit = ReturnValue(result.value),
+						exit = Break({ value = result.value, carried = [], span = value.span }),
 					})
 				Err(error): Err(error)
 		RecurWith(arguments, span):
-			var cursor = next_value
-			var entries: List[BlockEntry] = []
-			var values: List[ValueId] = []
-			var failure: Option[Diagnostic] = None
-			for argument in arguments:
-				match lower_value({ next_value = cursor, entries = [] }, bindings, argument, binding_facts):
-					Err(error):
-						failure = Some(error)
-						break
-					Ok(result):
-						for entry in result.builder.entries:
-							entries = entries.append(entry)
-						values = values.append(result.value)
-						cursor = result.builder.next_value
-			match failure:
-				Some(error): Err(error)
-				None: Ok({
-					next_value = cursor,
-					entries = entries,
-					exit = RecurValues(values, span),
+			match lower_arguments({ next_value = next_value, entries = [] }, bindings, arguments, binding_facts):
+				Err(error): Err(error)
+				Ok(result):
+					Ok({
+						next_value = result.builder.next_value,
+						entries = result.builder.entries,
+						exit = Recur(result.values, span),
+					})
+
+
+-- Reserve the parent outputs now; headers and the complete local interval are
+-- numbered only after the containing block has published all its definitions.
+private fixed record ReservedLoopOutputs {
+	next_value: Int,
+	result: ValueParameter,
+	carried: List[ValueParameter],
+	bindings: List[Option[ValueId]]
+}
+
+
+private pure func reserve_loop_outputs(
+	next_value: Int,
+	bindings: List[Option[ValueId]],
+	carried_bindings: List[BindingId],
+	span: Span,
+	facts: List[ConcreteBinding],
+) -> Result[ReservedLoopOutputs, Diagnostic]:
+	result: ValueParameter = { id = into_opaque ValueId(next_value), value_type = VoidType, span = span }
+	var cursor = IntOps.add(next_value, 1)
+	var carried: List[ValueParameter] = []
+	var values = bindings
+	var failure: Option[Diagnostic] = None
+	for id in carried_bindings:
+		position = binding_number(id)
+		match facts.get(position):
+			None:
+				failure = Some(invalid_binding(span))
+				break
+			Some(fact):
+				parameter: ValueParameter = { id = into_opaque ValueId(cursor), value_type = fact.value_type, span = fact.span }
+				carried = carried.append(parameter)
+				values = values.set(position, Some(parameter.id))
+				cursor = IntOps.add(cursor, 1)
+	match failure:
+		Some(error): Err(error)
+		None: Ok({ next_value = cursor, result = result, carried = carried, bindings = values })
+
+
+private pure func prepare_while(
+	builder: ExpressionBuilder,
+	bindings: List[Option[ValueId]],
+	loop: ConcreteWhile,
+	facts: List[ConcreteBinding],
+) -> Result[BuiltBlockValue, Diagnostic]:
+	reserved ?= reserve_loop_outputs(builder.next_value, bindings, loop.carried, loop.span, facts)
+	pending: PendingWhile = { result = reserved.result, carried = reserved.carried, loop = loop, bindings = bindings }
+	Ok({
+		builder = { next_value = reserved.next_value, entries = builder.entries.append(AwaitingWhile(pending)) },
+		value = reserved.result.id, bindings = reserved.bindings,
+	})
+
+
+private fixed record PreparedForInput {
+	builder: ExpressionBuilder,
+	bindings: List[Option[ValueId]],
+	iteration: ForInput
+}
+
+
+private pure func prepare_list_input(
+	builder: ExpressionBuilder,
+	bindings: List[Option[ValueId]],
+	iterable: ConcreteExpr,
+	element: TypeRef,
+	option: DesignatedOption[VariantInstanceId],
+	facts: List[ConcreteBinding],
+) -> Result[PreparedForInput, Diagnostic]:
+	list ?= lower_block_value(builder, bindings, iterable, facts, None)
+	zero = define_value(list.builder, IntegerValue(0), IntType, iterable.span)
+	Ok({ builder = zero.builder, bindings = list.bindings, iteration = ListInput(list.value, element, option, zero.value) })
+
+
+private pure func prepare_range_input(
+	builder: ExpressionBuilder,
+	bindings: List[Option[ValueId]],
+	start: ConcreteExpr,
+	end: ConcreteExpr,
+	boolean: DesignatedBoolean[VariantInstanceId],
+	facts: List[ConcreteBinding],
+) -> Result[PreparedForInput, Diagnostic]:
+	first ?= lower_block_value(builder, bindings, start, facts, None)
+	last ?= lower_block_value(first.builder, first.bindings, end, facts, None)
+	Ok({ builder = last.builder, bindings = last.bindings, iteration = RangeInput(first.value, last.value, boolean) })
+
+
+private pure func prepare_for_input(
+	builder: ExpressionBuilder,
+	bindings: List[Option[ValueId]],
+	iteration: ConcreteIteration,
+	facts: List[ConcreteBinding],
+) -> Result[PreparedForInput, Diagnostic]:
+	match iteration:
+		ListIteration(iterable, element, option): prepare_list_input(builder, bindings, iterable, element, option, facts)
+		AscendingIntRange(start, end, boolean): prepare_range_input(builder, bindings, start, end, boolean, facts)
+
+
+private pure func prepare_for(
+	builder: ExpressionBuilder,
+	bindings: List[Option[ValueId]],
+	loop: ConcreteFor,
+	facts: List[ConcreteBinding],
+) -> Result[BuiltBlockValue, Diagnostic]:
+	input ?= prepare_for_input(builder, bindings, loop.iteration, facts)
+	reserved ?= reserve_loop_outputs(input.builder.next_value, input.bindings, loop.carried, loop.span, facts)
+	pending: PendingFor = {
+		result = reserved.result, carried = reserved.carried, iteration = input.iteration,
+		item = loop.item, body = prepare_source_block(loop.body, None), source_carried = loop.carried,
+		bindings = input.bindings, span = loop.span,
+	}
+	Ok({
+		builder = { next_value = reserved.next_value, entries = input.builder.entries.append(AwaitingFor(pending)) },
+		value = reserved.result.id, bindings = reserved.bindings,
+	})
+
+
+private pure func lower_statement(
+	builder: ExpressionBuilder,
+	bindings: List[Option[ValueId]],
+	statement: ConcreteStatement,
+	facts: List[ConcreteBinding],
+	context: Option[SourceLoopContext],
+) -> Result[BuiltBlockValue, Diagnostic]:
+	match statement:
+		InitializeBinding(_, value): lower_block_value(builder, bindings, value, facts, context)
+		ReassignBinding(_, value): lower_block_value(builder, bindings, value, facts, context)
+		DiscardExpression(value): lower_block_value(builder, bindings, value, facts, context)
+		RunWhile(loop): prepare_while(builder, bindings, loop, facts)
+		RunFor(loop): prepare_for(builder, bindings, loop, facts)
+		BreakSourceLoop(span): Err(invalid_binding(span))
+		ContinueSourceLoop(span): Err(invalid_binding(span))
+
+
+-- consume_loop_control in Parse rejects ValueInLoop: initializers,
+-- scrutinees and other value operands cannot export a source transfer.
+-- Normalize statement selections once, retaining the complete terminal tree.
+-- A nested loop's body is normalized when that loop is lowered, not here.
+private fixed union PreparedStatement:
+	StatementValue(ConcreteStatement)
+	SelectStatement(PreparedSelection)
+
+
+private fixed union PreparedValue:
+	SourceValue(ConcreteExpr)
+	SelectedValue(PreparedSelection)
+
+
+private fixed union PreparedTail:
+	ContinuesBlock
+	ProducesValue(PreparedValue)
+	TransfersControl(SourceControl, Span)
+	SelectsTerminal(PreparedSelection)
+
+
+private fixed record PreparedBlock {
+	statements: List[PreparedStatement],
+	tail: PreparedTail
+}
+
+
+private fixed record PreparedArm {
+	id: MatchArmId,
+	span: Span,
+	inputs: List[BindingId],
+	body: PreparedBlock
+}
+
+
+private fixed record PreparedSelection {
+	scrutinee: ConcreteExpr,
+	selection: ConcreteSelection,
+	arms: List[PreparedArm],
+	carried: List[BindingId],
+	value_type: TypeRef,
+	span: Span
+}
+
+
+private fixed union PreparedBranch:
+	ContinuingBranch(PreparedSelection)
+	AbruptBranch(PreparedSelection)
+
+
+private pure func prepare_selection(join: ConcreteJoin, value_type: TypeRef, span: Span) -> PreparedBranch:
+	var arms: List[PreparedArm] = []
+	var yielding = 0
+	for arm in join.arms:
+		body = prepare_source_block(arm.statements, Some(arm.value))
+		arms = arms.append({ id = arm.id, span = arm.value.span, inputs = arm.inputs, body = body })
+		match body.tail:
+			ProducesValue(_): yielding = IntOps.add(yielding, 1)
+			_: void
+	prepared: PreparedSelection = {
+		scrutinee = join.scrutinee, selection = join.selection, arms = arms,
+		carried = join.carried, value_type = value_type, span = span,
+	}
+	if IntOps.equals(yielding, 0):
+		AbruptBranch(prepared)
+	else:
+		ContinuingBranch(prepared)
+
+
+private pure func prepare_value_tail(value: ConcreteExpr) -> PreparedTail:
+	match value.form:
+		Match(join):
+			match prepare_selection(join, value.value_type, value.span):
+				ContinuingBranch(selection): ProducesValue(SelectedValue(selection))
+				AbruptBranch(selection): SelectsTerminal(selection)
+		_: ProducesValue(SourceValue(value))
+
+
+private pure func prepare_source_block(statements: List[ConcreteStatement], final_value: Option[ConcreteExpr]) -> PreparedBlock:
+	var prepared: List[PreparedStatement] = []
+	var tail: PreparedTail = ContinuesBlock
+	for statement in statements:
+		match statement:
+			BreakSourceLoop(span): tail = TransfersControl(BreakSource, span)
+			ContinueSourceLoop(span): tail = TransfersControl(ContinueSource, span)
+			DiscardExpression(value):
+				match value.form:
+					Match(join):
+						match prepare_selection(join, value.value_type, value.span):
+							ContinuingBranch(selection): prepared = prepared.append(SelectStatement(selection))
+							AbruptBranch(selection): tail = SelectsTerminal(selection)
+					_: prepared = prepared.append(StatementValue(statement))
+			_: prepared = prepared.append(StatementValue(statement))
+		match tail:
+			TransfersControl(_, _) | SelectsTerminal(_): break
+			_: void
+	completed: PreparedTail = match tail:
+		ContinuesBlock:
+			match final_value:
+				None: ContinuesBlock
+				Some(value): prepare_value_tail(value)
+		_: tail
+	{ statements = prepared, tail = completed }
+
+
+private fixed union SourceControl:
+	BreakSource
+	ContinueSource
+
+
+private pure func source_edge(
+	context: SourceLoopContext,
+	bindings: List[Option[ValueId]],
+	control: SourceControl,
+	span: Span,
+) -> Result[LoopExit, Diagnostic]:
+	carried ?= carried_values(bindings, context.carried, span)
+	match control:
+		BreakSource: Ok(Break({ value = context.result, carried = carried, span = span }))
+		ContinueSource: Ok(Recur(context.next.concat(carried), span))
+
+
+private pure func lower_control(
+	next_value: Int,
+	bindings: List[Option[ValueId]],
+	control: SourceControl,
+	span: Span,
+	context: Option[SourceLoopContext],
+) -> Result[BuiltBlock, Diagnostic]:
+	loop ?= context.to_result(diagnostic(span, "internal compiler error: source control has no enclosing loop", "report this compiler error with the input program"))
+	exit ?= source_edge(loop, bindings, control, span)
+	Ok({ next_value = next_value, entries = [], bindings = bindings, completion = Abrupt(SourceExit(exit)) })
+
+
+private pure func prepare_terminal_match(
+	next_value: Int,
+	bindings: List[Option[ValueId]],
+	join: PreparedSelection,
+	span: Span,
+	facts: List[ConcreteBinding],
+	context: Option[SourceLoopContext],
+) -> Result[BuiltBlock, Diagnostic]:
+	loop ?= context.to_result(diagnostic(span, "internal compiler error: source control has no enclosing loop", "report this compiler error with the input program"))
+	scrutinee ?= lower_block_value({ next_value = next_value, entries = [] }, bindings, join.scrutinee, facts, None)
+	Ok({
+		next_value = scrutinee.builder.next_value,
+		entries = scrutinee.builder.entries,
+		bindings = scrutinee.bindings,
+		completion = Abrupt(SourceMatch({
+			join = join, scrutinee = scrutinee.value, bindings = scrutinee.bindings,
+			context = loop,
+		})),
+	})
+
+
+private pure func lower_continuing_statement(
+	next_value: Int,
+	bindings: List[Option[ValueId]],
+	statement: ConcreteStatement,
+	facts: List[ConcreteBinding],
+	context: Option[SourceLoopContext],
+) -> Result[BuiltBlock, Diagnostic]:
+	result ?= lower_statement({ next_value = next_value, entries = [] }, bindings, statement, facts, context)
+	var values = result.bindings
+	assigned: Option[BindingId] = match statement:
+		InitializeBinding(id, _): Some(id)
+		ReassignBinding(id, _): Some(id)
+		_: None
+	updated: List[Option[ValueId]] ?= match assigned:
+		None: Ok(values)
+		Some(id):
+			match binding_slot(values, id, statement_span(statement)):
+				Err(error): Err(error)
+				Ok(position): Ok(values.set(position, Some(result.value)))
+	Ok({ next_value = result.builder.next_value, entries = result.builder.entries, bindings = updated, completion = Continuing })
+
+
+private pure func statement_span(statement: ConcreteStatement) -> Span:
+	match statement:
+		InitializeBinding(_, value): value.span
+		ReassignBinding(_, value): value.span
+		DiscardExpression(value): value.span
+		RunWhile(loop): loop.span
+		RunFor(loop): loop.span
+		BreakSourceLoop(span): span
+		ContinueSourceLoop(span): span
+
+
+private pure func lower_prepared_statement(
+	next_value: Int,
+	bindings: List[Option[ValueId]],
+	statement: PreparedStatement,
+	facts: List[ConcreteBinding],
+	context: Option[SourceLoopContext],
+) -> Result[BuiltBlock, Diagnostic]:
+	match statement:
+		StatementValue(value): lower_continuing_statement(next_value, bindings, value, facts, context)
+		SelectStatement(selection):
+			match lower_prepared_join({ next_value = next_value, entries = [] }, bindings, selection, facts, context):
+				Err(error): Err(error)
+				Ok(result): Ok({
+					next_value = result.builder.next_value, entries = result.builder.entries,
+					bindings = result.bindings, completion = Continuing,
 				})
 
 
 private pure func lower_statements(
 	next_value: Int,
 	bindings: List[Option[ValueId]],
-	statements: List[ConcreteStatement],
+	block: PreparedBlock,
 	binding_facts: List[ConcreteBinding],
+	context: Option[SourceLoopContext],
 ) -> Result[BuiltBlock, Diagnostic]:
-	var cursor = next_value
-	var values = bindings
-	var entries: List[BlockEntry] = []
+	var current: BuiltBlock = { next_value = next_value, entries = [], bindings = bindings, completion = Continuing }
 	var failure: Option[Diagnostic] = None
-	for statement in statements:
-		value = match statement:
-			InitializeBinding(_, value): value
-			ReassignBinding(_, value): value
-			DiscardExpression(value): value
-		match lower_block_value({ next_value = cursor, entries = [] }, values, value, binding_facts):
+	for statement in block.statements:
+		match lower_prepared_statement(current.next_value, current.bindings, statement, binding_facts, context):
 			Err(error):
 				failure = Some(error)
 				break
-			Ok(result):
-				for entry in result.builder.entries:
-					entries = entries.append(entry)
-				cursor = result.builder.next_value
-				values = result.bindings
-				assigned = match statement:
-					InitializeBinding(id, _): Some(id)
-					ReassignBinding(id, _): Some(id)
-					DiscardExpression(_): None
-				match assigned:
-					None:
-						void
-					Some(id):
-						match binding_slot(values, id, value.span):
-							Ok(position): values = values.set(position, Some(result.value))
-							Err(error):
-								failure = Some(error)
-								break
-	match failure:
+			Ok(result): current = { result | entries = current.entries.concat(result.entries) }
+	ready: Void ?= match failure:
 		Some(error): Err(error)
-		None: Ok({
-			next_value = cursor,
-			entries = entries,
-			bindings = values,
-		})
+		None: Ok(void)
+	ending: BuiltBlock ?= match block.tail:
+		ContinuesBlock | ProducesValue(_): Ok(current)
+		TransfersControl(control, span):
+			match lower_control(current.next_value, current.bindings, control, span, context):
+				Err(error): Err(error)
+				Ok(result): Ok({ result | entries = current.entries.concat(result.entries) })
+		SelectsTerminal(selection):
+			match prepare_terminal_match(current.next_value, current.bindings, selection, selection.span, binding_facts, context):
+				Err(error): Err(error)
+				Ok(result): Ok({ result | entries = current.entries.concat(result.entries) })
+	Ok(ending)
 
 
--- An arm's captures: the bound scrutinee, or one payload projection per
--- named field. Tail arms and join arms bind them alike.
-private fixed record BoundCaptures {
+-- Arm inputs have their own ordinary value identities. Alternative-specific
+-- projections live in selection edges and transfer to these shared parameters.
+private fixed record BoundInputs {
 	next_value: Int,
-	definitions: List[ValueDefinition],
+	inputs: List[ValueParameter],
 	bindings: List[Option[ValueId]]
 }
 
 
-private pure func bind_captures(
+private pure func bind_inputs(
 	initial_value: Int,
 	outer: List[Option[ValueId]],
-	pattern: ConcretePattern,
-	scrutinee: ValueId,
+	inputs: List[BindingId],
 	span: Span,
 	bindings: List[ConcreteBinding],
-	unions: List[ConcreteUnion],
-) -> Result[BoundCaptures, Diagnostic]:
+) -> Result[BoundInputs, Diagnostic]:
 	var next_value = initial_value
 	var values = outer
-	var definitions: List[ValueDefinition] = []
+	var parameters: List[ValueParameter] = []
 	var failure: Option[Diagnostic] = None
-	match pattern:
-		VariantCase(variant, captures):
-			var position = 0
-			for capture in captures:
-				match capture:
-					None:
-						void
-					Some(id):
-						field_result = variant_field(variant, position, unions, span)
-						found_binding = bindings.get(binding_number(id))
-						match field_result:
-							Err(error):
-								failure = Some(error)
-								break
-							Ok(field):
-								match found_binding:
-									Some(binding):
-										value = into_opaque ValueId(next_value)
-										next_value = IntOps.add(next_value, 1)
-										definitions = definitions.append({
-											id = value,
-											operation = PayloadValue(field, scrutinee),
-											value_type = binding.value_type,
-											span = binding.span,
-										})
-										values = values.set(binding_number(id), Some(value))
-									None:
-										failure = Some(invalid_binding(span))
-										break
-				position = IntOps.add(position, 1)
-		WildcardCase:
-			void
+	for id in inputs:
+		match bindings.get(binding_number(id)):
+			None:
+				failure = Some(invalid_binding(span))
+				break
+			Some(binding):
+				parameter: ValueParameter = {
+					id = into_opaque ValueId(next_value),
+					value_type = binding.value_type,
+					span = binding.span,
+				}
+				parameters = parameters.append(parameter)
+				values = values.set(binding_number(id), Some(parameter.id))
+				next_value = IntOps.add(next_value, 1)
 	match failure:
 		Some(error): Err(error)
-		None: Ok({ next_value = next_value, definitions = definitions, bindings = values })
+		None: Ok({ next_value = next_value, inputs = parameters, bindings = values })
 
 
-private pure func arm_label(pattern: ConcretePattern) -> MatchLabel:
-	match pattern:
-		VariantCase(id, _): VariantLabel(id)
-		_: DefaultLabel
+private fixed record ProjectedPlace {
+	next_value: Int,
+	definitions: List[SelectionDefinition],
+	value: ValueId
+}
+
+
+private pure func project_place(
+	place: ConcretePatternPlace,
+	scrutinee: ValueId,
+	next_value: Int,
+	span: Span,
+) -> ProjectedPlace:
+	match place.route:
+		Concrete.MatchRoot:
+			{ next_value = next_value, definitions = [], value = scrutinee }
+		Concrete.UnionField(parent, field):
+			projected = project_place(parent, scrutinee, next_value, span)
+			parameter: ValueParameter = {
+				id = into_opaque ValueId(projected.next_value),
+				value_type = place.value_type,
+				span = span,
+			}
+			{
+				next_value = IntOps.add(projected.next_value, 1),
+				definitions = projected.definitions.append(BorrowUnionField(parameter, field, projected.value)),
+				value = parameter.id,
+			}
+		Concrete.ListElement(parent, index):
+			projected = project_place(parent, scrutinee, next_value, span)
+			parameter: ValueParameter = {
+				id = into_opaque ValueId(projected.next_value),
+				value_type = place.value_type,
+				span = span,
+			}
+			{
+				next_value = IntOps.add(projected.next_value, 1),
+				definitions = projected.definitions.append(BorrowListElement(parameter, index, projected.value)),
+				value = parameter.id,
+			}
+
+
+private pure func project_argument(
+	argument: Concrete.ConcretePatternArgument,
+	scrutinee: ValueId,
+	next_value: Int,
+	span: Span,
+) -> ProjectedPlace:
+	match argument:
+		Concrete.BorrowPlace(place): project_place(place, scrutinee, next_value, span)
+		Concrete.CopyListSuffix(place, skipped):
+			projected = project_place(place, scrutinee, next_value, span)
+			parameter: ValueParameter = {
+				id = into_opaque ValueId(projected.next_value),
+				value_type = place.value_type,
+				span = span,
+			}
+			{
+				next_value = IntOps.add(projected.next_value, 1),
+				definitions = projected.definitions.append(CopyListSuffix(parameter, projected.value, skipped)),
+				value = parameter.id,
+			}
+
+
+private fixed record BuiltSelection {
+	next_value: Int,
+	selection: LoweredSelection
+}
+
+
+private pure func lower_selection(
+	selection: ConcreteSelection,
+	scrutinee: ValueId,
+	next_value: Int,
+	span: Span,
+) -> BuiltSelection:
+	var nodes: List[LoweredDecisionNode] = []
+	var cursor = next_value
+	for node in selection.nodes:
+		match node:
+			Concrete.TestVariant(place, variant, yes, no):
+				nodes = nodes.append(TestVariant(place, variant, yes, no))
+			Concrete.TestListLength(place, test, yes, no):
+				nodes = nodes.append(TestListLength(place, test, yes, no))
+			Concrete.TestStringBytes(place, bytes, yes, no):
+				nodes = nodes.append(TestStringBytes(place, bytes, yes, no))
+			Concrete.EnterArm(arm, arguments):
+				var definitions: List[SelectionDefinition] = []
+				var values: List[ValueId] = []
+				for argument in arguments:
+					projected = project_argument(argument, scrutinee, cursor, span)
+					cursor = projected.next_value
+					definitions = definitions.concat(projected.definitions)
+					values = values.append(projected.value)
+				nodes = nodes.append(EnterArm({ arm = arm, definitions = definitions, arguments = values }))
+	{
+		next_value = cursor,
+		selection = { scrutinee = scrutinee, nodes = nodes, entry = selection.entry },
+	}
 
 
 -- One complete block: its definitions, with its joins' arms numbered after
@@ -759,11 +1306,29 @@ private pure func complete_joins(
 		match entry:
 			Defined(definition):
 				steps = steps.append(Define(definition))
+			AwaitingWhile(loop):
+				match complete_while(loop, cursor, bindings, unions):
+					Err(error):
+						failure = Some(error)
+						break
+					Ok(completed):
+						steps = steps.concat(completed.steps)
+						cursor = completed.next_value
+			AwaitingFor(loop):
+				match complete_for(loop, cursor, bindings, unions):
+					Err(error):
+						failure = Some(error)
+						break
+					Ok(completed):
+						steps = steps.concat(completed.steps)
+						cursor = completed.next_value
 			AwaitingArms(join):
+				selected = lower_selection(join.join.selection, join.scrutinee, cursor, join.result.span)
+				cursor = selected.next_value
 				var arms: List[JoinArm] = []
 				var reads = [join.scrutinee]
 				for arm in join.join.arms:
-					match lower_join_arm(cursor, join.bindings, arm, join.scrutinee, join.join.carried, bindings, unions):
+					match lower_join_arm(cursor, join.bindings, arm, join.join.carried, bindings, unions, join.context):
 						Err(error):
 							failure = Some(error)
 							break
@@ -776,8 +1341,7 @@ private pure func complete_joins(
 				steps = steps.append(Join({
 					result = join.result,
 					carried = join.carried,
-					scrutinee = join.scrutinee,
-					owner = join.join.owner,
+					selection = selected.selection,
 					arms = arms,
 					reads = reads,
 				}))
@@ -786,86 +1350,445 @@ private pure func complete_joins(
 		None: Ok({ next_value = cursor, steps = steps })
 
 
--- An arm's block: its captures, statements and exit definitions, in order.
-private pure func arm_block(captures: BoundCaptures, prefix: BuiltBlock, last: List[BlockEntry]) -> List[BlockEntry]:
-	var entries: List[BlockEntry] = []
-	for definition in captures.definitions:
-		entries = entries.append(Defined(definition))
-	for entry in prefix.entries:
-		entries = entries.append(entry)
-	for entry in last:
-		entries = entries.append(entry)
-	entries
+private pure func carried_values(
+	bindings: List[Option[ValueId]],
+	carried: List[BindingId],
+	span: Span,
+) -> Result[List[ValueId], Diagnostic]:
+	var values: List[ValueId] = []
+	var failure: Option[Diagnostic] = None
+	for id in carried:
+		match read_binding(bindings, id, span):
+			Ok(value): values = values.append(value)
+			Err(error):
+				failure = Some(error)
+				break
+	match failure:
+		Some(error): Err(error)
+		None: Ok(values)
+
+
+private pure func boolean_selection(scrutinee: ValueId, true_variant: VariantInstanceId) -> LoweredSelection:
+	place: ConcretePatternPlace = { value_type = Concrete.UnionType(variant_owner(true_variant)), route = Concrete.MatchRoot }
+	{
+		scrutinee = scrutinee,
+		nodes = [
+			EnterArm({ arm = match_arm_id(0), definitions = [], arguments = [] }),
+			EnterArm({ arm = match_arm_id(1), definitions = [], arguments = [] }),
+			TestVariant(place, true_variant, decision_node_id(0), decision_node_id(1)),
+		],
+		entry = decision_node_id(2),
+	}
+
+
+private fixed record BuiltHeaders {
+	next_value: Int,
+	headers: List[LoopHeader],
+	bindings: List[Option[ValueId]]
+}
+
+
+private pure func build_headers(
+	next_value: Int,
+	bindings: List[Option[ValueId]],
+	carried: List[BindingId],
+	span: Span,
+	facts: List[ConcreteBinding],
+) -> Result[BuiltHeaders, Diagnostic]:
+	var cursor = next_value
+	var headers: List[LoopHeader] = []
+	var values = bindings
+	var failure: Option[Diagnostic] = None
+	for id in carried:
+		position = binding_number(id)
+		match facts.get(position):
+			None:
+				failure = Some(invalid_binding(span))
+				break
+			Some(fact):
+				match read_binding(bindings, id, span):
+					Err(error):
+						failure = Some(error)
+						break
+					Ok(initial):
+						parameter: ValueParameter = { id = into_opaque ValueId(cursor), value_type = fact.value_type, span = fact.span }
+						headers = headers.append({ parameter = parameter, initial = initial })
+						values = values.set(position, Some(parameter.id))
+						cursor = IntOps.add(cursor, 1)
+	match failure:
+		Some(error): Err(error)
+		None: Ok({ next_value = cursor, headers = headers, bindings = values })
+
+
+private pure func complete_source_body(
+	block: BuiltBlock,
+	context: SourceLoopContext,
+	span: Span,
+	facts: List[ConcreteBinding],
+	unions: List[ConcreteUnion],
+) -> Result[CompletedLoopBlock, Diagnostic]:
+	match block.completion:
+		Abrupt(_): complete_abrupt_block(block, facts, unions, span)
+		Continuing:
+			match source_edge(context, block.bindings, ContinueSource, span):
+				Err(error): Err(error)
+				Ok(exit):
+					match complete_joins(block.entries, block.next_value, facts, unions):
+						Err(error): Err(error)
+						Ok(completed): Ok({ next_value = completed.next_value, body = { steps = completed.steps, tail = ExitLoop(exit) } })
+
+
+private pure func source_loop_step(
+	headers: List[LoopHeader],
+	result: ValueParameter,
+	carried: List[ValueParameter],
+	body: LoopBlock,
+	first: Int,
+	after: Int,
+) -> CompletedBlock:
+	var reads: List[ValueId] = []
+	for header in headers:
+		reads = reads.append(header.initial)
+	for value in loop_block_reads(body):
+		if outside_arm(value, first, after):
+			reads = reads.append(value)
+	{ next_value = after, steps = [Loop({ headers = headers, result = result, carried = carried, body = body, reads = reads })] }
+
+
+private pure func complete_while(
+	pending: PendingWhile,
+	initial_value: Int,
+	facts: List[ConcreteBinding],
+	unions: List[ConcreteUnion],
+) -> Result[CompletedBlock, Diagnostic]:
+	loop = pending.loop
+	headers ?= build_headers(initial_value, pending.bindings, loop.carried, loop.span, facts)
+	empty = define_value({ next_value = headers.next_value, entries = [] }, VoidValue, VoidType, loop.span)
+	condition ?= lower_block_value(empty.builder, headers.bindings, loop.condition, facts, None)
+	-- Both the final False edge and the True body consume the condition's map.
+	false_values ?= carried_values(condition.bindings, loop.carried, loop.span)
+	condition_block ?= complete_joins(condition.builder.entries, condition.builder.next_value, facts, unions)
+	context: SourceLoopContext = { target = loop_target(pending.result.id), carried = loop.carried, next = [], result = empty.value }
+	body ?= lower_statements(condition_block.next_value, condition.bindings, prepare_source_block(loop.body, None), facts, Some(context))
+	true_block ?= complete_source_body(body, context, loop.span, facts, unions)
+	arms: List[LoopArm] = [
+		{ id = match_arm_id(0), inputs = [], body = true_block.body },
+		{ id = match_arm_id(1), inputs = [], body = { steps = [], tail = ExitLoop(Break({ value = empty.value, carried = false_values, span = loop.span })) } },
+	]
+	Ok(source_loop_step(headers.headers, pending.result, pending.carried, {
+		steps = condition_block.steps,
+		tail = MatchLoop({ selection = boolean_selection(condition.value, loop.boolean.true_variant), arms = arms }),
+	}, initial_value, true_block.next_value))
+
+
+private pure func for_initial(iteration: ForInput) -> ValueId:
+	match iteration:
+		ListInput(_, _, _, initial): initial
+		RangeInput(initial, _, _): initial
+
+
+private pure func for_condition(builder: ExpressionBuilder, iteration: ForInput, index: ValueId, span: Span) -> BuiltValue:
+	match iteration:
+		ListInput(iterable, element, option, _):
+			define_value(builder, CallValue(Concrete.RuntimeFunction(ListGet(element, option)), [iterable, index]), Concrete.UnionType(variant_owner(option.some)), span)
+		RangeInput(_, end, boolean):
+			define_value(builder, CallValue(Concrete.RuntimeFunction(IntLessThan(boolean)), [index, end]), Concrete.UnionType(variant_owner(boolean.true_variant)), span)
+
+
+private pure func list_selection(
+	condition: ValueId,
+	element: TypeRef,
+	option: DesignatedOption[VariantInstanceId],
+	item: Option[BindingId],
+	next_value: Int,
+	span: Span,
+	unions: List[ConcreteUnion],
+) -> Result[BuiltSelection, Diagnostic]:
+	root: ConcretePatternPlace = { value_type = Concrete.UnionType(variant_owner(option.some)), route = Concrete.MatchRoot }
+	field ?= Concrete.variant_field(option.some, 0, unions, span)
+	arguments: List[Concrete.ConcretePatternArgument] = match item:
+		None: []
+		Some(_): [Concrete.BorrowPlace({ value_type = element, route = Concrete.UnionField(root, field) })]
+	selection: ConcreteSelection = {
+		nodes = [
+			Concrete.EnterArm(match_arm_id(0), arguments),
+			Concrete.EnterArm(match_arm_id(1), []),
+			Concrete.TestVariant(root, option.some, decision_node_id(0), decision_node_id(1)),
+		],
+		entry = decision_node_id(2),
+	}
+	Ok(lower_selection(selection, condition, next_value, span))
+
+
+private pure func for_selection(
+	condition: ValueId,
+	iteration: ForInput,
+	item: Option[BindingId],
+	next_value: Int,
+	span: Span,
+	unions: List[ConcreteUnion],
+) -> Result[BuiltSelection, Diagnostic]:
+	match iteration:
+		ListInput(_, element, option, _): list_selection(condition, element, option, item, next_value, span, unions)
+		RangeInput(_, _, boolean): Ok({ next_value = next_value, selection = boolean_selection(condition, boolean.true_variant) })
+
+
+private pure func for_inputs(
+	next_value: Int,
+	bindings: List[Option[ValueId]],
+	pending: PendingFor,
+	index: ValueId,
+	facts: List[ConcreteBinding],
+) -> Result[BoundInputs, Diagnostic]:
+	match pending.iteration:
+		ListInput(_, _, _, _):
+			inputs: List[BindingId] = match pending.item:
+				None: []
+				Some(id): [id]
+			bind_inputs(next_value, bindings, inputs, pending.span, facts)
+		RangeInput(_, _, _):
+			values = match pending.item:
+				None: bindings
+				Some(id): bindings.set(binding_number(id), Some(index))
+			Ok({ next_value = next_value, inputs = [], bindings = values })
+
+
+private pure func complete_for(
+	pending: PendingFor,
+	initial_value: Int,
+	facts: List[ConcreteBinding],
+	unions: List[ConcreteUnion],
+) -> Result[CompletedBlock, Diagnostic]:
+	index: ValueParameter = { id = into_opaque ValueId(initial_value), value_type = IntType, span = pending.span }
+	headers ?= build_headers(IntOps.add(initial_value, 1), pending.bindings, pending.source_carried, pending.span, facts)
+	empty = define_value({ next_value = headers.next_value, entries = [] }, VoidValue, VoidType, pending.span)
+	condition = for_condition(empty.builder, pending.iteration, index.id, pending.span)
+	condition_block ?= complete_joins(condition.builder.entries, condition.builder.next_value, facts, unions)
+	selected ?= for_selection(condition.value, pending.iteration, pending.item, condition_block.next_value, pending.span, unions)
+	inputs ?= for_inputs(selected.next_value, headers.bindings, pending, index.id, facts)
+	one = define_value({ next_value = inputs.next_value, entries = [] }, IntegerValue(1), IntType, pending.span)
+	increment: RuntimeOperation[VariantInstanceId, TypeRef] = Builtins.IntAdd
+	next = define_value(one.builder, CallValue(Concrete.RuntimeFunction(increment), [index.id, one.value]), IntType, pending.span)
+	context: SourceLoopContext = { target = loop_target(pending.result.id), carried = pending.source_carried, next = [next.value], result = empty.value }
+	body ?= lower_statements(next.builder.next_value, inputs.bindings, pending.body, facts, Some(context))
+	prefixed = { body | entries = next.builder.entries.concat(body.entries) }
+	true_block ?= complete_source_body(prefixed, context, pending.span, facts, unions)
+	false_values ?= carried_values(headers.bindings, pending.source_carried, pending.span)
+	arms: List[LoopArm] = [
+		{ id = match_arm_id(0), inputs = inputs.inputs, body = true_block.body },
+		{ id = match_arm_id(1), inputs = [], body = { steps = [], tail = ExitLoop(Break({ value = empty.value, carried = false_values, span = pending.span })) } },
+	]
+	all_headers: List[LoopHeader] = [{ parameter = index, initial = for_initial(pending.iteration) }].concat(headers.headers)
+	Ok(source_loop_step(all_headers, pending.result, pending.carried, {
+		steps = condition_block.steps, tail = MatchLoop({ selection = selected.selection, arms = arms }),
+	}, initial_value, true_block.next_value))
 
 
 private pure func lower_arm(
 	initial_value: Int,
 	outer: List[Option[ValueId]],
 	arm: ConcreteArm,
-	scrutinee: ValueId,
 	bindings: List[ConcreteBinding],
 	unions: List[ConcreteUnion],
 ) -> Result[BuiltArm, Diagnostic]:
-	captures ?= bind_captures(initial_value, outer, arm.pattern, scrutinee, exit_span(arm.body), bindings, unions)
-	prefix ?= lower_statements(captures.next_value, captures.bindings, arm.statements, bindings)
+	captures ?= bind_inputs(initial_value, outer, arm.inputs, exit_span(arm.body), bindings)
+	prefix ?= lower_statements(captures.next_value, captures.bindings, prepare_source_block(arm.statements, None), bindings, None)
 	result ?= lower_exit(prefix.next_value, prefix.bindings, arm.body, bindings)
-	completed ?= complete_joins(arm_block(captures, prefix, result.entries), result.next_value, bindings, unions)
+	completed ?= complete_joins(prefix.entries.concat(result.entries), result.next_value, bindings, unions)
 	Ok({
 		arm = {
-			label = arm_label(arm.pattern),
-			body = { steps = completed.steps, exit = result.exit },
+			id = arm.id,
+			inputs = captures.inputs,
+			body = { steps = completed.steps, tail = ExitLoop(result.exit) },
 		},
 		next_value = completed.next_value,
+	})
+
+
+private pure func lower_prepared_value(
+	builder: ExpressionBuilder,
+	bindings: List[Option[ValueId]],
+	value: PreparedValue,
+	facts: List[ConcreteBinding],
+	context: Option[SourceLoopContext],
+) -> Result[BuiltBlockValue, Diagnostic]:
+	match value:
+		SourceValue(expression): lower_block_value(builder, bindings, expression, facts, context)
+		SelectedValue(selection): lower_prepared_join(builder, bindings, selection, facts, context)
+
+
+private fixed record CompletedLoopBlock {
+	next_value: Int,
+	body: LoopBlock
+}
+
+
+private fixed record CompletedLoopTail {
+	next_value: Int,
+	tail: LoopTail
+}
+
+
+private pure func complete_source_tail(
+	tail: PendingLoopTail,
+	next_value: Int,
+	facts: List[ConcreteBinding],
+	unions: List[ConcreteUnion],
+) -> Result[CompletedLoopTail, Diagnostic]:
+	match tail:
+		SourceExit(exit): Ok({ next_value = next_value, tail = ExitLoop(exit) })
+		SourceMatch(pending): complete_terminal_selection(pending, next_value, facts, unions)
+
+
+private pure func complete_abrupt_block(
+	block: BuiltBlock,
+	facts: List[ConcreteBinding],
+	unions: List[ConcreteUnion],
+	span: Span,
+) -> Result[CompletedLoopBlock, Diagnostic]:
+	completed ?= complete_joins(block.entries, block.next_value, facts, unions)
+	pending: PendingLoopTail ?= match block.completion:
+		Abrupt(tail): Ok(tail)
+		Continuing: Err(diagnostic(span, "internal compiler error: terminal selection arm continues", "report this compiler error with the input program"))
+	ending ?= complete_source_tail(pending, completed.next_value, facts, unions)
+	Ok({ next_value = ending.next_value, body = { steps = completed.steps, tail = ending.tail } })
+
+
+private pure func complete_terminal_arm(
+	next_value: Int,
+	pending: PendingLoopMatch,
+	arm: PreparedArm,
+	facts: List[ConcreteBinding],
+	unions: List[ConcreteUnion],
+) -> Result[BuiltArm, Diagnostic]:
+	inputs ?= bind_inputs(next_value, pending.bindings, arm.inputs, pending.join.span, facts)
+	block ?= lower_statements(inputs.next_value, inputs.bindings, arm.body, facts, Some(pending.context))
+	completed ?= complete_abrupt_block(block, facts, unions, pending.join.span)
+	Ok({ next_value = completed.next_value, arm = { id = arm.id, inputs = inputs.inputs, body = completed.body } })
+
+
+private pure func complete_terminal_selection(
+	pending: PendingLoopMatch,
+	next_value: Int,
+	facts: List[ConcreteBinding],
+	unions: List[ConcreteUnion],
+) -> Result[CompletedLoopTail, Diagnostic]:
+	selected = lower_selection(pending.join.selection, pending.scrutinee, next_value, pending.join.span)
+	var cursor = selected.next_value
+	var arms: List[LoopArm] = []
+	var failure: Option[Diagnostic] = None
+	for arm in pending.join.arms:
+		match complete_terminal_arm(cursor, pending, arm, facts, unions):
+			Err(error):
+				failure = Some(error)
+				break
+			Ok(completed):
+				cursor = completed.next_value
+				arms = arms.append(completed.arm)
+	match failure:
+		Some(error): Err(error)
+		None: Ok({ next_value = cursor, tail = MatchLoop({ selection = selected.selection, arms = arms }) })
+
+
+private pure func loop_exit_reads(exit: LoopExit) -> List[ValueId]:
+	match exit:
+		Recur(values, _): values
+		Break(outputs): [outputs.value].concat(outputs.carried)
+
+
+private pure func loop_tail_reads(tail: LoopTail) -> List[ValueId]:
+	match tail:
+		ExitLoop(exit): loop_exit_reads(exit)
+		MatchLoop(selection):
+			var reads = [selection.selection.scrutinee]
+			for arm in selection.arms:
+				reads = reads.concat(loop_block_reads(arm.body))
+			reads
+
+
+private pure func loop_block_reads(block: LoopBlock) -> List[ValueId]:
+	var reads: List[ValueId] = []
+	for step in block.steps:
+		reads = reads.concat(step_reads(step))
+	reads.concat(loop_tail_reads(block.tail))
+
+
+private pure func join_arm_reads(steps: List[LoweredStep], exit: JoinExit, first: Int, after: Int) -> List[ValueId]:
+	var all: List[ValueId] = []
+	for step in steps:
+		all = all.concat(step_reads(step))
+	ending = match exit:
+		Yield(outputs): [outputs.value].concat(outputs.carried)
+		TransferLoop(_, tail): loop_tail_reads(tail)
+	all = all.concat(ending)
+	var reads: List[ValueId] = []
+	for value in all:
+		if outside_arm(value, first, after):
+			reads = reads.append(value)
+	reads
+
+
+private pure func lower_yielding_arm(
+	first: Int,
+	inputs: BoundInputs,
+	prefix: BuiltBlock,
+	arm: PreparedArm,
+	carried: List[BindingId],
+	facts: List[ConcreteBinding],
+	unions: List[ConcreteUnion],
+	context: Option[SourceLoopContext],
+) -> Result[BuiltJoinArm, Diagnostic]:
+	value: PreparedValue ?= match arm.body.tail:
+		ProducesValue(value): Ok(value)
+		_: Err(invalid_binding(arm.span))
+	result ?= lower_prepared_value({ next_value = prefix.next_value, entries = [] }, prefix.bindings, value, facts, context)
+	outgoing ?= carried_values(result.bindings, carried, arm.span)
+	completed ?= complete_joins(prefix.entries.concat(result.builder.entries), result.builder.next_value, facts, unions)
+	exit: JoinExit = Yield({ value = result.value, carried = outgoing })
+	Ok({
+		arm = { id = arm.id, inputs = inputs.inputs, steps = completed.steps, exit = exit },
+		reads = join_arm_reads(completed.steps, exit, first, completed.next_value), next_value = completed.next_value,
+	})
+
+
+private pure func lower_abrupt_arm(
+	first: Int,
+	inputs: BoundInputs,
+	prefix: BuiltBlock,
+	arm: PreparedArm,
+	facts: List[ConcreteBinding],
+	unions: List[ConcreteUnion],
+	context: Option[SourceLoopContext],
+) -> Result[BuiltJoinArm, Diagnostic]:
+	span = arm.span
+	loop ?= context.to_result(invalid_binding(span))
+	completed ?= complete_abrupt_block(prefix, facts, unions, span)
+	exit: JoinExit = TransferLoop(loop.target, completed.body.tail)
+	Ok({
+		arm = { id = arm.id, inputs = inputs.inputs, steps = completed.body.steps, exit = exit },
+		reads = join_arm_reads(completed.body.steps, exit, first, completed.next_value), next_value = completed.next_value,
 	})
 
 
 private pure func lower_join_arm(
 	initial_value: Int,
 	outer: List[Option[ValueId]],
-	arm: ConcreteJoinArm,
-	scrutinee: ValueId,
-	carried_bindings: List[BindingId],
-	bindings: List[ConcreteBinding],
+	arm: PreparedArm,
+	carried: List[BindingId],
+	facts: List[ConcreteBinding],
 	unions: List[ConcreteUnion],
+	context: Option[SourceLoopContext],
 ) -> Result[BuiltJoinArm, Diagnostic]:
-	captures ?= bind_captures(initial_value, outer, arm.pattern, scrutinee, arm.value.span, bindings, unions)
-	prefix ?= lower_statements(captures.next_value, captures.bindings, arm.statements, bindings)
-	result ?= lower_block_value({ next_value = prefix.next_value, entries = [] }, prefix.bindings, arm.value, bindings)
-	var carried: List[ValueId] = []
-	var failure: Option[Diagnostic] = None
-	for binding in carried_bindings:
-		match read_binding(result.bindings, binding, arm.value.span):
-			Ok(value): carried = carried.append(value)
-			Err(error):
-				failure = Some(error)
-				break
-	ready ?= match failure:
-		Some(error): Err(error)
-		None: Ok(void)
-	completed ?= complete_joins(arm_block(captures, prefix, result.builder.entries), result.builder.next_value, bindings, unions)
-	-- The arm's own values are [initial_value, after); its joins' reads
-	-- already exclude their arms' values.
-	after = result.builder.next_value
-	var reads: List[ValueId] = []
-	for step in completed.steps:
-		for read in step_reads(step):
-			if outside_arm(read, initial_value, after):
-				reads = reads.append(read)
-	if outside_arm(result.value, initial_value, after):
-		reads = reads.append(result.value)
-	for value in carried:
-		if outside_arm(value, initial_value, after):
-			reads = reads.append(value)
-	Ok({
-		arm = { label = arm_label(arm.pattern), steps = completed.steps, value = result.value, carried = carried },
-		reads = reads,
-		next_value = completed.next_value,
-	})
+	inputs ?= bind_inputs(initial_value, outer, arm.inputs, arm.span, facts)
+	prefix ?= lower_statements(inputs.next_value, inputs.bindings, arm.body, facts, context)
+	match prefix.completion:
+		Continuing: lower_yielding_arm(initial_value, inputs, prefix, arm, carried, facts, unions, context)
+		Abrupt(_): lower_abrupt_arm(initial_value, inputs, prefix, arm, facts, unions, context)
 
 
 private pure func outside_arm(value: ValueId, first: Int, after: Int) -> Bool:
 	ordinal = value_number(value)
-	IntOps.less_than(ordinal, first) or IntOps.greater_than_or_equal(ordinal, after)
+	or(IntOps.less_than(ordinal, first), IntOps.greater_than_or_equal(ordinal, after))
 
 
 -- The tail match's scrutinee ends the function's block, whose joins' arms
@@ -881,11 +1804,12 @@ private pure func lower_match(
 	for entry in scrutinee.builder.entries:
 		entries = entries.append(entry)
 	completed ?= complete_joins(entries, scrutinee.builder.next_value, bindings, unions)
-	var cursor = completed.next_value
-	var arms: List[LoweredArm] = []
+	selected = lower_selection(matched.selection, scrutinee.value, completed.next_value, matched.scrutinee.span)
+	var cursor = selected.next_value
+	var arms: List[LoopArm] = []
 	var failure: Option[Diagnostic] = None
 	for arm in matched.arms:
-		match lower_arm(cursor, block.bindings, arm, scrutinee.value, bindings, unions):
+		match lower_arm(cursor, block.bindings, arm, bindings, unions):
 			Err(error):
 				failure = Some(error)
 				break
@@ -896,8 +1820,67 @@ private pure func lower_match(
 		Some(error): Err(error)
 		None: Ok({
 			steps = completed.steps,
-			matched = { scrutinee = scrutinee.value, owner = matched.owner, arms = arms },
+			matched = { selection = selected.selection, arms = arms },
 		})
+
+
+private pure func lower_body(
+	function: ConcreteFunction,
+	next_value: Int,
+	values: List[Option[ValueId]],
+	unions: List[ConcreteUnion],
+) -> Result[BuiltTail, Diagnostic]:
+	prefix ?= lower_statements(next_value, values, prepare_source_block(function.statements, None), function.bindings, None)
+	body_result: Result[BuiltTail, Diagnostic] = match function.body:
+		ConcreteValueBody(value):
+			match lower_exit(prefix.next_value, prefix.bindings, value, function.bindings):
+				Ok(result):
+					entries = prefix.entries.concat(result.entries)
+					match complete_joins(entries, result.next_value, function.bindings, unions):
+						Ok(completed): Ok({ steps = completed.steps, tail = ExitLoop(result.exit) })
+						Err(error): Err(error)
+				Err(error): Err(error)
+		ConcreteMatchBody(matched):
+			match lower_match(prefix, matched, function.bindings, unions):
+				Ok(result): Ok({ steps = result.steps, tail = MatchLoop(result.matched) })
+				Err(error): Err(error)
+	body_result
+
+
+-- Dense binding order is independent of ABI order: specialization appends
+-- callback environment bindings without renumbering existing body locals.
+-- This inverse exists only while lowering one function.
+private pure func runtime_parameter_order(
+	bindings: List[ConcreteBinding], count: Int, span: Span,
+) -> Result[List[BindingId], Diagnostic]:
+	var order: List[Option[BindingId]] = []
+	for position in 0..count:
+		order = order.append(None)
+	var binding_position = 0
+	var failure: Option[Diagnostic] = None
+	for binding in bindings:
+		match binding.origin:
+			ParameterBinding(position):
+				match order.get(position):
+					Some(None): order = order.set(position, Some(binding_id(binding_position)))
+					_: failure = Some(invalid_binding(binding.span))
+			_: void
+		if failure.is_some():
+			break
+		binding_position = IntOps.add(binding_position, 1)
+	filled: Void ?= match failure:
+		Some(error): Err(error)
+		None: Ok(void)
+	var ordered: List[BindingId] = []
+	for entry in order:
+		match entry:
+			Some(id): ordered = ordered.append(id)
+			None: failure = Some(invalid_binding(span))
+		if failure.is_some():
+			break
+	match failure:
+		Some(error): Err(error)
+		None: Ok(ordered)
 
 
 private pure func lower_function(
@@ -907,10 +1890,15 @@ private pure func lower_function(
 	var next_value = 0
 	var parameter_definitions: List[ValueDefinition] = []
 	var values = function.bindings.map(pure func(_: ConcreteBinding) -> Option[ValueId]: None)
-	var ordinal = 0
-	for binding in function.bindings:
-		match binding.origin:
-			ParameterBinding(index):
+	span = match function.body:
+		ConcreteValueBody(exit): exit_span(exit)
+		ConcreteMatchBody(matched): matched.scrutinee.span
+	parameter_order ?= runtime_parameter_order(function.bindings, function.signature.parameters.length(), span)
+	var parameter_failure: Option[Diagnostic] = None
+	for id in parameter_order:
+		match function.bindings.get(binding_number(id)):
+			Some(binding):
+				index = parameter_definitions.length()
 				definition: ValueDefinition = {
 					id = into_opaque ValueId(next_value),
 					operation = ParameterValue(index),
@@ -919,39 +1907,79 @@ private pure func lower_function(
 				}
 				next_value = IntOps.add(next_value, 1)
 				parameter_definitions = parameter_definitions.append(definition)
-				values = values.set(ordinal, Some(definition.id))
-			_:
-				void
-		ordinal = IntOps.add(ordinal, 1)
-	prefix ?= lower_statements(next_value, values, function.statements, function.bindings)
-	var entries: List[BlockEntry] = []
+				values = values.set(binding_number(id), Some(definition.id))
+			None:
+				parameter_failure = Some(invalid_binding(span))
+				break
+	parameters: Void ?= match parameter_failure:
+		Some(error): Err(error)
+		None: Ok(void)
+	var steps: List[LoweredStep] = []
 	for definition in parameter_definitions:
-		entries = entries.append(Defined(definition))
-	for entry in prefix.entries:
-		entries = entries.append(entry)
-	block: BuiltBlock = { prefix | entries = entries }
-	body_result: Result[BuiltTail, Diagnostic] = match function.body:
-		ConcreteValueBody(value):
-			match lower_exit(prefix.next_value, prefix.bindings, value, function.bindings):
-				Ok(result):
-					var body_entries = block.entries
-					for entry in result.entries:
-						body_entries = body_entries.append(entry)
-					match complete_joins(body_entries, result.next_value, function.bindings, unions):
-						Ok(completed): Ok({ steps = completed.steps, tail = ExitValue(result.exit) })
+		steps = steps.append(Define(definition))
+	match function.execution:
+		OrdinaryCalls:
+			match lower_body(function, next_value, values, unions):
+				Err(error): Err(error)
+				Ok(body):
+					match body.tail:
+						ExitLoop(loop_exit):
+							match loop_exit:
+								Break(result):
+									Ok({ signature = function.signature, steps = steps.concat(body.steps), result = result.value })
+								Recur(_, _):
+									Err(diagnostic(span, "internal compiler error: non-loop function has a loop tail", "report this compiler error with the input program"))
+						MatchLoop(_):
+							Err(diagnostic(span, "internal compiler error: non-loop function has a loop tail", "report this compiler error with the input program"))
+		SelfTailLoop(annotation):
+			-- ABI values and P complete the parent interval before H and all
+			-- body values, just as for a source loop in an ordinary block.
+			result: ValueParameter = {
+				id = into_opaque ValueId(next_value),
+				value_type = function.signature.return_type,
+				span = annotation,
+			}
+			next_value = IntOps.add(next_value, 1)
+			var headers: List[LoopHeader] = []
+			var reads: List[ValueId] = []
+			var failure: Option[Diagnostic] = None
+			var ordinal = 0
+			for binding in function.bindings:
+				match binding.origin:
+					ParameterBinding(_):
+						match read_binding(values, binding_id(ordinal), binding.span):
+							Err(error):
+								failure = Some(error)
+								break
+							Ok(initial):
+								parameter: ValueParameter = {
+									id = into_opaque ValueId(next_value),
+									value_type = binding.value_type,
+									span = binding.span,
+								}
+								headers = headers.append({ parameter = parameter, initial = initial })
+								reads = reads.append(initial)
+								values = values.set(ordinal, Some(parameter.id))
+								next_value = IntOps.add(next_value, 1)
+					_: void
+				ordinal = IntOps.add(ordinal, 1)
+			match failure:
+				Some(error): Err(error)
+				None:
+					match lower_body(function, next_value, values, unions):
 						Err(error): Err(error)
-				Err(error): Err(error)
-		ConcreteMatchBody(matched):
-			match lower_match(block, matched, function.bindings, unions):
-				Ok(result): Ok({ steps = result.steps, tail = MatchValue(result.matched) })
-				Err(error): Err(error)
-	body ?= body_result
-	Ok({
-		execution = function.execution,
-		signature = function.signature,
-		steps = body.steps,
-		tail = body.tail,
-	})
+						Ok(body):
+							Ok({
+								signature = function.signature,
+								steps = steps.append(Loop({
+									headers = headers,
+									result = result,
+									carried = [],
+									reads = reads,
+									body = { steps = body.steps, tail = body.tail },
+								})),
+								result = result.id,
+							})
 
 
 pure func lower(program: SpecializedProgram) -> Result[LoweredProgram, Diagnostic]:

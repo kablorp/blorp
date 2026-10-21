@@ -8,7 +8,7 @@ import:
 	../../../src/utils/names: name_spelling, foundation_words, same_name
 	../../../src/utils/source: same_module, same_source, module_source, root_module_id
 	../../../src/utils/syntax: Purity(Pure), same_purity
-	../input: setup_diagnostic, singleton_check_error
+	../input: setup_diagnostic, singleton_check_error, checked_tail_join
 	fs: temporary_directory, resource_path, message
 	system: temp_dir, write_file
 	test: TestSuite
@@ -97,14 +97,23 @@ private pure func forwarded_choice(call: Model.CheckedCall, caller: Model.Checke
 private pure func short_circuit_selection(selected: Model.CheckedJoin, range: Model.CheckedFunction, boolean: Model.CheckedUnion) -> Bool:
 	match (selected.scrutinee.form, selected.arms, boolean.variants):
 		(Model.InvokeFunction(left, _), [yes, no], [truth, falsehood]):
-			match (yes.pattern, yes.value.form, no.pattern, no.value.form):
-				(Model.VariantCase(first, []), Model.ConstructVariant(returned, []), Model.VariantCase(second, []), Model.InvokeFunction(right, _)):
-					(
-						yes.statements.is_empty() and no.statements.is_empty()
-						and same_variant(first, truth.id) and same_variant(returned, truth.id)
-						and same_variant(second, falsehood.id)
-						and forwarded_choice(left, range, range) and forwarded_choice(right, range, range)
-					)
+			match selected.selection.nodes.get(Model.decision_node_number(selected.selection.entry)):
+				Some(Model.TestVariant(place, first, when_true, when_false)):
+					match (place.route, yes.value.form, no.value.form):
+						(Model.MatchRoot, Model.ConstructVariant(returned, []), Model.InvokeFunction(right, _)):
+							match (selected.selection.nodes.get(Model.decision_node_number(when_true)), selected.selection.nodes.get(Model.decision_node_number(when_false))):
+								(Some(Model.EnterArm(true_arm, [])), Some(Model.EnterArm(false_arm, []))):
+									(
+										yes.statements.is_empty() and no.statements.is_empty()
+										and same_variant(first, truth.id) and same_variant(returned, truth.id)
+										-- Exhaustive Bool selects False by failing the True tag test.
+										and Model.same_type(place.value_type, Model.UnionType(variant_owner(falsehood.id)))
+										and Model.match_arm_number(true_arm) == Model.match_arm_number(yes.id)
+										and Model.match_arm_number(false_arm) == Model.match_arm_number(no.id)
+										and forwarded_choice(left, range, range) and forwarded_choice(right, range, range)
+									)
+								_: False
+						_: False
 				_: False
 		_: False
 
@@ -114,19 +123,16 @@ func test_any_true_left_branch_returns_without_the_right_call() -> Bool:
 		forwarded = match Model.function_calls(any):
 			[_, call]: forwarded_choice(call, any, range)
 			_: False
-		match range.body:
-			Model.CheckedMatchBody(empty_test):
+		match checked_tail_join(range.body):
+			Some(empty_test):
 				match empty_test.arms:
 					[_, nonempty]:
-						match nonempty.body:
-							Model.ReturnExpression(value):
-								match value.form:
-									Model.Match(singleton):
-										match singleton.arms:
-											[_, split]:
-												match split.value.form:
-													Model.Match(selected): forwarded and short_circuit_selection(selected, range, boolean)
-													_: False
+						match nonempty.value.form:
+							Model.Match(singleton):
+								match singleton.arms:
+									[_, split]:
+										match split.value.form:
+											Model.Match(selected): forwarded and short_circuit_selection(selected, range, boolean)
 											_: False
 									_: False
 							_: False

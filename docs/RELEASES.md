@@ -171,3 +171,67 @@ from extra defensive comparison parentheses is currently benign;
 any new warning before preview rather than adding a blanket suppression.
 Test-artifact timeout defaults and overrides live in
 [`scripts/README.md`](../scripts/README.md#test-gates).
+
+## Blorp 2 bootstrap seeds
+
+The first Blorp 2 seed uses `.github/workflows/blorp2-seed.yml`, separately from
+legacy CLI releases. After the reviewed source/library integration is committed
+and its maintained native/resource gate has an accepted outcome, Root can create
+and push an immutable tag with SSH credentials that trigger Actions:
+
+```bash
+source_sha=$(git rev-parse HEAD)
+seed_tag="blorp2-seed-${source_sha:0:12}"
+git tag "$seed_tag" "$source_sha"
+git push origin "refs/tags/$seed_tag"
+```
+
+The workflow validates the tag against the actual source commit and the three
+native targets: macOS ARM64 on macOS 15, Linux x64 and Linux ARM64 on Ubuntu 24.04.
+Its initial route explicitly
+builds a fresh legacy TestSuite host and reference A, then A emits compiler C,
+Clang links self-built B in normal/diagnostic modes, and B reproduces that C.
+Only B normal is published as `blorp2-<target>`. Maintained component and B diagnostic
+e2e correctness, strict compiler accounting and an ordinary-main strict smoke must pass.
+Each platform also compares every maintained accepted/rejected fixture under A/B:
+exit status, stdout, stderr and emitted-C presence/bytes must match. The complete
+fixture inventory, actual counts, per-fixture logs and hashes remain in provenance.
+Each run must also satisfy the CLI contract: success emits nonempty C with empty
+streams; rejection exits 1 with no C, empty stdout and a nonempty diagnostic.
+Other statuses block publication even if A/B agree. Frozen test sources are
+included in the post-gate source-mutation check.
+Normal and diagnostic B link logs must be empty; new diagnostics block publication.
+A temporary diagnostic B from the same approved C adds ASan/UBSan with recovery
+disabled and performs the existing whole-source strict accounting check. Its
+link log must be empty and its complete stderr must be the exact balanced strict
+report; emitted C must match. Provenance retains its hash and flags, and the
+sanitized binary is not published. Regular diagnostic B runs the native cost suite.
+Ordinary e2e cases run sanitized real mains; accounted cases additionally check
+strict target balance. The approved initial bootstrap exception is bound to compiler
+C SHA-256 `3d0def0d00f6c6ec003923d7acb2f8854fa506a6cf6b7c04611322a47b7b7f8b`,
+checked immediately after A emits C and before B qualification. Only the native
+qualification command sets `BLORP_2_RESOURCE_POLICY=record-initial-bootstrap-debt`.
+The typed test policy retains original caps and records resource overruns as
+structured `BLORP2_RESOURCE_RESULT` FAILs with actual measurements, limits and
+original reasons after all ordinary oracles pass. Provenance and release notes
+label functional PASS and resource FAIL debt; this is not a full M8/resource PASS.
+All other failures remain blocking. Linux instruction
+measurement is explicitly disabled as in CI and is not an instruction-cost PASS;
+macOS requires counters. A nonzero gate blocks publication and retains logs.
+
+All three platforms must agree on compiler C and source/library inventories.
+The release retains one `blorp2-compiler.c.gz`, three provenance archives and
+`SHA256SUMS` alongside the binaries. Provenance includes the full source commit,
+legacy/A/B digests, target/host library inventories, flags, Clang and platform
+SDK/libc/dependency details, raw diagnostics, resource markers and gate logs. Actions' `GITHUB_TOKEN`
+creates the release; local API credentials are unnecessary. Existing B2 seed
+releases are refused, never overwritten. Preserve referenced seeds and their
+provenance indefinitely; expiring Actions logs alone are not release evidence.
+
+This workflow is **initial-seed-only**. The commit adding the first real
+`blorp_2/bootstrap.env` must replace reference-A production with the pinned B2
+resolver and remove the initial-publication guard, so subsequent seeds build
+through B2 only. Do not add a missing-manifest legacy fallback. The legacy host
+may still run the existing TestSuite suites until their separate migration.
+A pin requires actual published three-platform digests and a clean-checkout
+seed-only build proof; this workflow does not create a placeholder manifest.

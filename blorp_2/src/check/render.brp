@@ -1,4 +1,5 @@
 import:
+	../utils/boolean: not
 	../namespace/builtins: builtin_type_name, render_builtin_type_error, runtime_declaration_help
 	./check: CheckFailure, check_errors, failure_program
 	./errors as Errors
@@ -31,7 +32,8 @@ import:
 		ValueBinding(FunctionName, ConstantName, ConstructorName, ModuleAliasName),
 		Unoffered(UnknownName, PrivateName, ImportedThere, ProvidedThere),
 		same_head,
-	option: to_result
+	option: to_result, map
+	result as ResultOps: and_then
 	../parse/assemble: ParsedContents, ParsedProgram, parsed_contents
 	../utils/syntax:
 		CallNotation(DirectCall, ReceiverCall),
@@ -42,8 +44,8 @@ import:
 		),
 		Diagnostics,
 		ParsedBuiltinType(IntegerBuiltin, FloatBuiltin, StringBuiltin, VoidBuiltin, ListBuiltin),
-		Span, NoteLine, same_span,
-	../utils/text as Text
+		Span, NoteLine, WrittenName, same_span,
+	../utils/text as Text: concat
 
 
 pure func render_failure(failure: CheckFailure) -> Diagnostics:
@@ -224,31 +226,21 @@ private pure func render_unsupported_form(span: Span, form: Errors.UnsupportedFo
 		Errors.RangeValue:
 			rendered(span, "ranges are not supported yet", "iterate with an explicit index; low..high arrives with the loops milestone")
 		Errors.AndOrOperator:
-			rendered(span, "`and`/`or` are not supported yet", "match on the Bool operands; `and`/`or` arrive with the join milestone")
+			rendered(span, "`and`/`or` infix syntax is invalid", "call and(left, right) or left.and(right); call or(left, right) or left.or(right)")
 		Errors.NotOperator:
-			rendered(span, "`not` is not supported yet", "match on the Bool operand; `not` arrives with the join milestone")
+			rendered(span, "`not value` is invalid", "call not(value) or value.not()")
 		Errors.IfValue:
-			rendered(span, "`if` is not supported yet", "match on the Bool condition; `if` arrives with the join milestone")
+			rendered(span, "an if nested inside another expression is not supported yet", "bind the if result to a local before using it here")
 		Errors.MatchInExpression:
 			rendered(span, "a `match` inside a larger expression is not supported yet", "bind the match first with name = match ..., then use the name")
 		Errors.Propagation:
 			rendered(span, "`?=` is not supported yet", "match on the Option or Result and return its failing case; `?=` arrives with the join milestone")
 		Errors.WhileStatement:
 			rendered(span, "`while` is not supported yet", "write a recursive function; loops arrive with the loops milestone")
-		Errors.ForStatement:
-			rendered(span, "`for` is not supported yet", "write a recursive function; loops arrive with the loops milestone")
 		Errors.LambdaValue:
-			rendered(span, "lambdas are not supported yet", "declare a named function and call it; lambdas arrive with the lambdas milestone")
+			rendered(span, "lambda values are only supported as pure callback arguments", "pass a pure func literal to a pure callable parameter; store and return ordinary data")
 		Errors.FunctionType:
 			rendered(span, "callable types are only supported as function parameters", "write pure function types only on function parameters; use ordinary data types inside them")
-		Errors.NestedPattern:
-			rendered(span, "nested patterns are not supported yet", "bind the field to a name and match it in a second match; nested patterns arrive with the pattern-compilation milestone")
-		Errors.OrPattern:
-			rendered(span, "or-patterns are not supported yet", "write one arm per alternative; or-patterns arrive with the pattern-compilation milestone")
-		Errors.ListPattern:
-			rendered(span, "list patterns are not supported yet", "match on list.length and list.get; list patterns arrive with the pattern-compilation milestone")
-		Errors.StringPattern:
-			rendered(span, "String literal patterns are not supported yet", "compare with string.equals in the arm; literal patterns arrive with the pattern-compilation milestone")
 		Errors.CharPattern:
 			rendered(span, "Char literal patterns are not supported yet", "compare the character in the arm; literal patterns arrive with the pattern-compilation milestone")
 
@@ -373,7 +365,7 @@ private pure func render_conflict(span: Span, conflict: Conflict, context: Parse
 		Ok(name):
 			incoming = entity_noun(conflict.incoming.entity)
 			previous = entity_noun(conflict.previous.entity)
-			alias_previous = match conflict.previous.entity:
+			alias_previous: Bool = match conflict.previous.entity:
 				Alias(_): True
 				Function(_) | Constant(_) | Constructor(_) | Type(_): False
 			message = match conflict.previous.origin:
@@ -389,7 +381,7 @@ private pure func render_conflict(span: Span, conflict: Conflict, context: Parse
 						"duplicate ".concat(incoming).concat(" name")
 					else:
 						incoming.concat(" name conflicts with a ").concat(previous)
-			alias_incoming = match conflict.incoming.entity:
+			alias_incoming: Bool = match conflict.incoming.entity:
 				Alias(_): True
 				Function(_) | Constant(_) | Constructor(_) | Type(_): False
 			help = match conflict.incoming.origin:
@@ -491,7 +483,7 @@ private pure func render_selection(span: Span, path: ModulePath, selection: Impo
 							rendered(span, name.concat(" is private to ").concat(module), "remove private or import a public declaration")
 						NotOffered(ImportedThere(entity)):
 							message = name.concat(" is imported by ").concat(module).concat(", not declared there")
-							help = match entity:
+							help: Result[String, Diagnostic] = match entity:
 								Constructor(id):
 									match type_spelling(Check.UnionType(variant_owner(id)), context, span):
 										Err(error): Err(error)
@@ -726,6 +718,16 @@ private pure func render_call_error(
 	context: ParsedContents,
 ) -> Diagnostic:
 	match rejection:
+		Errors.ImpureLambda:
+			rendered(span, "pure callback requires a pure lambda", "write pure func for this callback")
+		Errors.LambdaArityMismatch(expected, _):
+			rendered(span, "lambda has the wrong number of parameters", "write ".concat(IntOps.to_string(expected)).concat(" parameters for this callback"))
+		Errors.LambdaInputNeedsType:
+			rendered(span, "cannot infer this lambda's input types", "annotate its parameters or supply a typed ordinary argument")
+		Errors.LambdaBlockNeedsResult:
+			rendered(span, "block lambda needs a complete result type", "write a return annotation or give the callback a complete result context")
+		Errors.CapturedCallable(_):
+			rendered(span, "lambda cannot capture a callable parameter", "pass the data and callback explicitly to a declared helper")
 		Errors.ImpureCall(_, _):
 			rendered(
 				span,
@@ -749,8 +751,8 @@ private pure func render_call_error(
 			)
 		Errors.CallableValueRequired:
 			rendered(
-				span, "callback argument must name a function",
-				"pass a pure named function or forward a callable parameter unchanged",
+				span, "callback argument must be a pure function",
+				"pass a pure named function or pure func literal, or forward a callable parameter unchanged",
 			)
 		Errors.CallableValueEscapes(_):
 			rendered(
@@ -962,16 +964,16 @@ private pure func render_record_error(
 				),
 			)
 		Errors.UnknownRecordField(name, owner):
-			result = parsed_spelling(
+			result: Result[Diagnostic, Diagnostic] = parsed_spelling(
 				name,
 				context.names,
 				span,
 			).and_then(
-				pure func(field): type_spelling(
+				pure func(field): ResultOps.map(type_spelling(
 					Check.RecordType(owner),
 					context,
 					span,
-				).map(pure func(record_name): rendered(
+				), pure func(record_name): rendered(
 						span,
 						"unknown field '"
 							.concat(field)
@@ -1030,6 +1032,12 @@ private pure func render_value_error(
 	context: ParsedContents,
 ) -> Diagnostic:
 	match rejection:
+		Errors.MutableCapture(_):
+			rendered(span, "lambda cannot capture a mutable binding", "copy its current value to an immutable binding before capturing it")
+		Errors.MissingIfElse:
+			rendered(span, "if without else must return Void", "add an else branch to produce a value, or finish the then block with a Void expression")
+		Errors.IfBranchWithoutValue:
+			rendered(span, "if branch has no final value", "finish the branch with a value expression on its own indented line")
 		Errors.UnknownOpaqueType(_):
 			rendered(span, "unknown opaque type", "import or declare an opaque type before converting it")
 		Errors.NonOpaqueConversionType(_):
@@ -1046,10 +1054,19 @@ private pure func render_value_error(
 			)
 		Errors.ExpressionTypeMismatch(mismatch):
 			match mismatch.expected_site:
+				Errors.FirstIfBranchValue:
+					match type_spelling(mismatch.expected, context, span):
+						Err(error): error
+						Ok(expected):
+							rendered(span, "expression does not match the expected type",
+								"the then branch decides this if's type, ".concat(expected)
+									.concat("; give every branch a value of type ").concat(expected))
 				Errors.OpaqueConstruction(_):
 					rendered(span, "opaque construction value has the wrong type", "pass the declared underlying type to into_opaque")
 				Errors.OpaqueProjection(_):
 					rendered(span, "opaque projection value has the wrong type", "pass a value of the named opaque type to from_opaque")
+				Errors.ForRangeBound:
+					rendered(span, "range bound must have type Int", "use an Int expression for each bound in start..end")
 				Errors.FirstArmValue:
 					match type_spelling(mismatch.expected, context, span):
 						Err(error): error
@@ -1132,6 +1149,10 @@ private pure func render_statement_error(
 	rejection: Errors.StatementError,
 ) -> Diagnostic:
 	match rejection:
+		Errors.NonBooleanCondition(_):
+			rendered(span, "condition must have the designated Bool type", "use a Bool value as the condition")
+		Errors.NonIterableFor(_):
+			rendered(span, "for iterable must be a List or an Int range", "iterate a List value, or write start..end with Int bounds")
 		Errors.PropagationNeedsResultReturn(_):
 			rendered(
 				span, "`?=` requires a Result-returning function",
@@ -1156,6 +1177,8 @@ private pure func render_statement_error(
 				span, "cannot assign to a callable parameter",
 				"invoke this parameter, or forward it unchanged; callable parameters are immutable",
 			)
+		Errors.CapturedAssignment(_):
+			rendered(span, "lambda cannot assign to an outer binding", "mutate a lambda-local variable or return the updated value explicitly")
 		Errors.ImmutableAssignment(_):
 			rendered(
 				span,
@@ -1209,19 +1232,29 @@ private pure func render_match_error(
 			)
 		Errors.ArmWithoutValue:
 			rendered(span, "match arm has no final value", "finish the arm with a value expression on its own indented line")
+		Errors.OrPatternBindingsDiffer:
+			rendered(span, "or-pattern alternatives bind different names", "bind the same names in every alternative, or use '_' for fields the arm does not need")
+		Errors.OrPatternBindingTypeMismatch(_, _, _):
+			rendered(span, "or-pattern binding has different types", "bind each name to the same type in every alternative, or use separate match arms")
 		Errors.UnreachableArm:
 			rendered(
 				span,
 				"match arm is unreachable",
 				"remove this arm; earlier arms already cover all values it could match",
 			)
-		Errors.MatchRequiresUnion(_):
+		Errors.InvalidMatchScrutinee(_):
 			rendered(
 				span,
-				"match requires a union value",
-				"match a typed union parameter or a call returning a declared union",
+				"match requires a union, List or String value",
+				"match a union, List or String value; use if for a Boolean condition",
 			)
 
+		Errors.PatternTypeMismatch(_):
+			rendered(span, "pattern does not match the value's type", "use a constructor of that union, a List pattern for a List, or a String literal for a String")
+		Errors.NonExhaustiveStructuralMatch(witness):
+			match render_pattern_witness(witness, span, context):
+				Ok(pattern): rendered(span, "non-exhaustive match", "add an arm for the missing pattern: ".concat(pattern))
+				Err(error): error
 		Errors.NonExhaustiveMatch(missing):
 			missing_coverage(missing, span, context)
 
@@ -1362,7 +1395,7 @@ private pure func parameter_spelling(
 				.get(record_number(owner))
 				.map(pure func(row): row.declaration.type_parameters)
 
-	written ?= match found_parameters:
+	written: WrittenName ?= match found_parameters:
 		Some(parameters):
 			match parameters.get(Check.parameter_position(id)):
 				Some(written):
@@ -1453,7 +1486,7 @@ private pure func type_spelling(
 					for argument in arguments:
 						match type_spelling(argument, context, span):
 							Ok(argument_type):
-								if not IntOps.equals(position, 0):
+								if IntOps.equals(position, 0).not():
 									spelling = spelling.concat(", ")
 
 								spelling = spelling.concat(argument_type)
@@ -1506,6 +1539,70 @@ private pure func type_spellings(
 						spelled.append(spelling),
 					)
 				Err(error): Err(error)
+
+
+private pure func render_pattern_witness(witness: Errors.PatternWitness, span: Span, context: ParsedContents) -> Result[String, Diagnostic]:
+	match witness:
+		Errors.AnyWitness | Errors.OtherStringWitness: Ok("_")
+		Errors.EmptyListWitness: Ok("[]")
+		Errors.ConsListWitness(_): render_list_witness(witness, span, context)
+		Errors.VariantWitness(id, fields): render_variant_witness(id, fields, span, context)
+
+
+private pure func render_variant_witness(id: VariantId, fields: List[Errors.PatternWitness], span: Span, context: ParsedContents) -> Result[String, Diagnostic]:
+	declaration ?= inventory_unions(context.declarations).get(union_number(variant_owner(id))).to_result(render_fault(span, Errors.InvalidResolvedUnion(variant_owner(id))))
+	variant ?= declaration.variants.get(variant_number(id)).to_result(render_fault(span, Errors.InvalidResolvedVariant(id)))
+	name ?= parsed_spelling(variant.declaration.name.id, context.names, span)
+	parts ?= witness_field_names(fields, span, context)
+	if fields.is_empty():
+		Ok(name)
+	else:
+		Ok(name.concat("(").concat(comma_separated(parts)).concat(")"))
+
+
+private pure func witness_field_names(fields: List[Errors.PatternWitness], span: Span, context: ParsedContents) -> Result[List[String], Diagnostic]:
+	var names: List[String] = []
+	var failure: Option[Diagnostic] = None
+	for field in fields:
+		match render_pattern_witness(field, span, context):
+			Ok(name): names = names.append(name)
+			Err(error):
+				failure = Some(error)
+				break
+	ready: Void ?= match failure:
+		Some(error): Err(error)
+		None: Ok(void)
+	Ok(names)
+
+
+private pure func list_witness_incomplete(complete: Bool) -> Bool:
+	match complete:
+		True: False
+		False: True
+
+
+private pure func render_list_witness(witness: Errors.PatternWitness, span: Span, context: ParsedContents) -> Result[String, Diagnostic]:
+	var names: List[String] = []
+	var cursor = witness
+	var failure: Option[Diagnostic] = None
+	var complete: Bool = False
+	while list_witness_incomplete(complete):
+		match cursor:
+			Errors.ConsListWitness(parts):
+				match render_pattern_witness(parts.head, span, context):
+					Ok(name): names = names.append(name)
+					Err(error):
+						failure = Some(error)
+						complete = True
+				cursor = parts.tail
+			Errors.EmptyListWitness: complete = True
+			_:
+				names = names.append("..._")
+				complete = True
+	ready: Void ?= match failure:
+		Some(error): Err(error)
+		None: Ok(void)
+	Ok("[".concat(comma_separated(names)).concat("]"))
 
 
 private pure func missing_variant_name(
@@ -1603,12 +1700,12 @@ private pure func type_diagnostic(
 
 private pure func overlap_notes(primary: Span, site: Errors.MethodCandidateSite, receiver: String) -> List[NoteLine]:
 	var lines: List[NoteLine] = []
-	if not same_span(site.declaration, primary):
+	if same_span(site.declaration, primary).not():
 		lines = lines.append({ span = site.declaration, text = "receiver ".concat(receiver).concat(" is declared here") })
 	match site.import_site:
 		None: void
 		Some(selection):
-			if not same_span(selection, primary):
+			if same_span(selection, primary).not():
 				lines = lines.append({ span = selection, text = "receiver ".concat(receiver).concat(" is imported here") })
 	lines
 

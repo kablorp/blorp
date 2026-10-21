@@ -1,0 +1,114 @@
+import:
+	../../../src/check/model: match_arm_number
+	../../../src/lex/lex: lex
+	../../../src/lower/lower as Lower
+	../../../src/parse/parse: parse_module
+	../../../src/specialize/specialize as Concrete
+	../../../src/utils/names: program_names
+	../../../src/utils/source: module_source, root_module_id
+	../managed_union_inputs: lowered, lowered_tail_join
+	system: read_file
+	test: TestSuite
+
+
+private SOURCE: String =
+	|fixed union Side:
+	|    Left(String, Int)
+	|    Right(Int, String)
+	|pure func chosen(value: Side) -> String:
+	|    match value:
+	|        Left(item, _) | Right(_, item): item
+	|func main() -> Int:
+	|    unused = chosen(Right(11, "right"))
+	|    0
+	|
+
+
+private pure func selected() -> Option[Lower.LoweredJoin]:
+	match lowered(SOURCE):
+		Err(_): None
+		Ok(program):
+			var found: Option[Lower.LoweredJoin] = None
+			for function in Lower.lowered_functions(program).functions:
+				match lowered_tail_join(function):
+					Some(join): found = Some(join)
+					None: void
+			found
+
+
+pure func test_alternatives_have_one_body_and_one_canonical_input() -> Bool:
+	match selected():
+		Some(join):
+			match join.arms:
+				[arm]:
+					match (arm.inputs, arm.exit):
+						([input], Lower.Yield(outputs)):
+							(
+								match_arm_number(arm.id) == 0 and arm.steps.is_empty()
+								and Concrete.same_type(input.value_type, Concrete.StringType)
+								and Lower.value_number(outputs.value) == Lower.value_number(input.id)
+							)
+						_: False
+				_: False
+		None: False
+
+
+pure func test_success_edges_project_the_corresponding_field_only() -> Bool:
+	match selected():
+		Some(join):
+			var ordinals: List[Int] = []
+			var valid = True
+			for node in join.selection.nodes:
+				match node:
+					Lower.EnterArm(edge):
+						match (edge.definitions, edge.arguments):
+							([Lower.BorrowUnionField(parameter, field, parent)], [argument]):
+								ordinals = ordinals.append(Concrete.variant_field_number(field))
+								valid = (
+									valid and match_arm_number(edge.arm) == 0
+									and Lower.value_number(parent) == Lower.value_number(join.selection.scrutinee)
+									and Lower.value_number(argument) == Lower.value_number(parameter.id)
+								)
+							_: valid = False
+					Lower.TestVariant(_, _, _, _) | Lower.TestListLength(_, _, _, _) | Lower.TestStringBytes(_, _, _, _): void
+			valid and ordinals == [1, 0]
+		None: False
+
+
+pure func test_edge_values_precede_canonical_input_without_escaping() -> Bool:
+	match selected():
+		Some(join):
+			match join.arms:
+				[arm]:
+					match arm.inputs:
+						[input]:
+							var valid = True
+							for node in join.selection.nodes:
+								match node:
+									Lower.EnterArm(edge):
+										for value in edge.arguments:
+											valid = valid and Lower.value_number(value) < Lower.value_number(input.id)
+									_: void
+							valid and join.reads.map(Lower.value_number) == [Lower.value_number(join.selection.scrutinee)]
+						_: False
+				_: False
+		None: False
+
+
+func test_changed_lower_production_parses_in_target() -> Bool:
+	match read_file("blorp_2/src/lower/lower.brp"):
+		Err(_): False
+		Ok(source):
+			lex(module_source(root_module_id()), source, program_names().names)
+				.and_then(pure func(tokens): parse_module(tokens, root_module_id())).is_ok()
+
+
+tests: TestSuite = {
+	description = "Lowered shared selection inputs",
+	tests = [
+		("one body and canonical input", test_alternatives_have_one_body_and_one_canonical_input),
+		("successful edges project different field ordinals", test_success_edges_project_the_corresponding_field_only),
+		("edge values cannot become shared body operands", test_edge_values_precede_canonical_input_without_escaping),
+		("Lower module uses target grammar", test_changed_lower_production_parses_in_target),
+	]
+}

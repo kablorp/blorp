@@ -1,4 +1,5 @@
 import:
+	../selection_inputs: checked_arm_variant, concrete_arm_variant
 	../../../src/utils/names: program_names, name_spelling
 	../../../src/check/model as Model
 	../../../src/utils/source: module_source, root_module_id, same_module, same_source
@@ -11,7 +12,7 @@ import:
 	../../../src/lex/lex: lex
 	../../../src/utils/syntax: Diagnostic, entry_function, Purity(Pure), same_purity, same_span
 	../compilation: compile, compile_modules
-	../input: check_failure, parse, setup_diagnostic, check_modules_failure, singleton_check_error
+	../input: check_failure, parse, setup_diagnostic, check_modules_failure, singleton_check_error, checked_tail_join
 	../module_input: PRIMITIVE_BASE, INTEGER_OPERATIONS, STRING_OPERATIONS, ModuleInput
 	../../e2e/harness: with_directory
 	fs: temporary_directory, resource_path, message
@@ -41,15 +42,15 @@ private pure func callback_contract(
 			Model.FunctionDeclaration(owner): function_number(owner) == function_number(function.id)
 			_: False
 	)
-	match function.body:
-		Model.CheckedMatchBody(matched):
+	match checked_tail_join(function.body):
+		Some(matched):
 			var selected_count = 0
 			var bypass_count = 0
 			var passed = signature and rigid and function.statements.is_empty()
 			for arm in matched.arms:
-				calls = Model.function_calls({ function | statements = arm.statements, body = Model.CheckedValueBody(arm.body) })
-				match arm.pattern:
-					Model.VariantCase(variant, _):
+				calls = Model.function_calls({ function | statements = arm.statements, body = Model.CheckedValueBody(Model.ReturnExpression(arm.value)) })
+				match checked_arm_variant(matched.selection, arm.id):
+					Some(variant):
 						if Model.same_variant(variant, selected):
 							selected_count = selected_count + 1
 							valid_call = match calls:
@@ -62,7 +63,20 @@ private pure func callback_contract(
 						else:
 							bypass_count = bypass_count + 1
 							passed = passed and Model.same_variant(variant, bypassed) and calls.is_empty()
-					_: passed = False
+					None:
+						-- A final nullary alternative is selected by excluding the tested tag.
+						match (matched.selection.nodes.get(Model.decision_node_number(matched.selection.entry)), arm.value.form):
+							(Some(Model.TestVariant(place, tested, _, when_false)), Model.ConstructVariant(returned_variant, [])):
+								match (place.route, matched.selection.nodes.get(Model.decision_node_number(when_false))):
+									(Model.MatchRoot, Some(Model.EnterArm(target, []))):
+										bypass_count = bypass_count + 1
+										passed = (
+											passed and Model.same_variant(tested, selected) and Model.same_variant(returned_variant, bypassed)
+											and Model.same_type(place.value_type, input) and Model.match_arm_number(target) == Model.match_arm_number(arm.id)
+											and arm.inputs.is_empty() and calls.is_empty()
+										)
+									_: passed = False
+							_: passed = False
 			passed and selected_count == 1 and bypass_count == 1 and Model.function_calls(function).length() == 1
 		_: False
 

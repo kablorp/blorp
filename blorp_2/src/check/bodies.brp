@@ -3,33 +3,38 @@ Checks function bodies: parameter scope, ordered statements, match arms
 and patterns, and the canonical Void tail.
 ---
 import:
+	result: map
+	../utils/boolean: not
 	./errors:
 		CheckError,
 		RecursionError(
 			CallableTailRecursionUnsupported, GenericTailRecursionUnsupported, PropagationTailRecursionUnsupported,
 		),
 		recursion_error,
-		ValueError(ExpressionTypeMismatch), value_error,
-		CheckerInvariant(InvalidCheckedUnion, InvalidResolvedParameter, UnsupportedPatternReachedResolution, LoopControlOutsideLoop, JoinWithoutArms),
-		ExpectedTypeSite(FirstArmValue, InferredBindingDeclaration, SourceAnnotation),
+		ValueError(ExpressionTypeMismatch, MissingIfElse, IfBranchWithoutValue), value_error,
+		CheckerInvariant(InvalidInferenceWorklist, InvalidCheckedUnion, InvalidResolvedParameter, UnsupportedPatternReachedResolution, LoopControlOutsideLoop, JoinWithoutArms),
+		ExpectedTypeSite(FirstArmValue, FirstIfBranchValue, InferredBindingDeclaration, SourceAnnotation, ForRangeBound),
 		MatchError(
-			ArmWithoutValue, MatchRequiresUnion, NonExhaustiveMatch, PatternFieldCountMismatch, BarePatternName,
-			UnknownConstructorPattern, UnreachableArm,
+			ArmWithoutValue, InvalidMatchScrutinee, NonExhaustiveMatch, PatternFieldCountMismatch, BarePatternName,
+			UnknownConstructorPattern, UnreachableArm, OrPatternBindingsDiffer, OrPatternBindingTypeMismatch,
 		),
 		StatementError(
-			CallableAssignment, ImmutableAssignment, NonVoidMatchArm, NonVoidStatement,
+			CallableAssignment, ImmutableAssignment, CapturedAssignment, NonVoidMatchArm, NonVoidStatement,
 			PropagationNeedsResultReturn, PropagationNeedsResultValue,
+			NonBooleanCondition, NonIterableFor,
 		),
 		checker_invariant,
 		match_error,
 		statement_error,
 		UnsupportedForm(
-			NestedPattern, OrPattern, ListPattern, StringPattern, CharPattern, Propagation,
-			WhileStatement, ForStatement,
+			CharPattern, Propagation,
+			IfValue,
 		),
 		unsupported_form,
-	./callables: ResolutionContext
+	./callables: ResolutionContext, SourceLoopScope(OutsideSourceLoop, WithinSourceLoop)
 	./model:
+		BodyOwner(DeclaredBody), same_body,
+		CheckedBodies, CheckedLambda, LambdaRow(CollectingLambda, CheckedLambdaRow), CheckedValueResult, ResolvedBody,
 		CheckedConstant,
 		BindingDefinition,
 		BindingId,
@@ -44,10 +49,13 @@ import:
 		CheckedExpr,
 		CheckedForm(InvokeFunction, LiteralVoid, Match, ReadBinding, ConstructVariant),
 		CheckedFunction,
-		CheckedMatch,
-		CheckedPattern(VariantCase, WildcardCase),
-		CheckedStatement(DiscardExpression, InitializeBinding, ReassignBinding),
-		TypeRef(PureCallableType, VoidType, AppliedUnionType),
+		CheckedPatternPlace, CheckedPatternRoute(MatchRoot, UnionField),
+		CheckedPatternArgument(BorrowPlace),
+		CheckedSelection, CheckedDecisionNode(TestVariant, EnterArm),
+		MatchArmId, DecisionNodeId, match_arm_id, decision_node_id,
+		CheckedStatement(DiscardExpression, InitializeBinding, ReassignBinding, RunWhile, RunFor, BreakSourceLoop, ContinueSourceLoop),
+		CheckedIteration(ListIteration, AscendingIntRange),
+		TypeRef(PureCallableType, VoidType, IntType, ListType, AppliedUnionType, UnionType),
 		FunctionSignature,
 		TypeUse,
 		UnionOccurrence,
@@ -58,22 +66,26 @@ import:
 		same_type,
 		same_variant,
 		union_occurrence,
+	./patterns as Patterns
 	./recursion: check_execution
 	./signatures: AcceptedBody(BuiltinBody, MatchBody, ValueBody), AcceptedFunction
 	./declarations: CheckedDeclarations, resolve_type
 	./constructors: VariantContract, find_qualified_variant, find_variant
 	./expressions: check_value, synthesize_value
 	./scope: ScopedValue(DataLocal, CallableLocal), LocalBinding, bind_callable, callable_binding_id, bind_local, binding_site, binding_definition, local_binding_id, lookup_binding
+	../utils/names: same_name
+	../utils/source: compiler_source
 	../utils/ids: OpaqueRow, VariantId, union_number, variant_owner
-	../namespace/builtins: DesignatedResult, RuntimeOperation
+	../namespace/builtins: DesignatedResult, DesignatedBoolean, DesignatedOption, RuntimeOperation
 	int as IntOps
-	list: repeat, set
+	list: repeat, set, reverse
 	../namespace/namespace: Namespace
-	option: is_some, to_result
+	option: is_some, to_result, is_none, get_or
 	../utils/syntax:
 		BindingSyntax(ImmutableBinding, MutableBinding),
 		ParsedBinding, ParsedPropagation,
-		ExpressionBase(MatchExpression),
+		ExpressionBase(MatchExpression, IfExpression, VoidExpression, RangeExpression),
+		ParsedBlock, ParsedIf, ParsedWhile, ParsedFor, ParsedBinder(NamedBinder, DiscardBinder), ElseBranch(ElseIf, ElseBlock),
 		ParsedMatch,
 		ParsedMatchArm,
 		ParsedParameter,
@@ -87,236 +99,23 @@ import:
 		WrittenName,
 
 
-private fixed record ResolvedPattern {
-	pattern: CheckedPattern,
-	scope: List[ScopedValue],
-	bindings: List[BindingDefinition]
-}
-
-
--- A pattern that binds nothing new.
-private pure func unbound(pattern: CheckedPattern, scope: List[ScopedValue]) -> ResolvedPattern:
-	{
-		pattern = pattern,
-		scope = scope,
-		bindings = []
-	}
-
-
--- A visible constructor in a field is a nested pattern; a missing import
--- is diagnosed by find_variant before a field can be accepted as a binding.
-private pure func names_a_field_constructor(
-	name: WrittenName,
-	field_type: TypeRef,
-	context: ResolutionContext,
-) -> Result[Bool, CheckError]:
-	match union_occurrence(field_type):
-		None:
-			Ok(False)
-		Some(occurrence):
-			match find_variant(context, occurrence, name):
-				Ok(found): Ok(found.is_some())
-				Err(error): Err(error)
-
-
-private pure func resolve_variant_pattern(
-	contract: VariantContract,
-	fields: List[ParsedPattern],
-	span: Span,
-	ordinal: Int,
-	scope: List[ScopedValue],
-	context: ResolutionContext,
-) -> Result[ResolvedPattern, CheckError]:
-	if not IntOps.equals(contract.fields.length(), fields.length()):
-		Err(match_error(span, PatternFieldCountMismatch(contract.variant, contract.fields.length(), fields.length())))
-	else:
-		var bindings: List[BindingDefinition] = []
-		var captures: List[Option[BindingId]] = []
-		var field_scope = scope
-		var position = 0
-		var failure: Option[CheckError] = None
-		for field in fields:
-			match contract.fields.get(position):
-				None: failure = Some(checker_invariant(span, GenericConstructorContract))
-				Some(annotation):
-					-- A field is one binder or wildcard; the match's pre-scan rejected
-					-- anything deeper before resolution.
-					match field:
-						PatternWildcard(_): captures = captures.append(None)
-						PatternName(name):
-							match names_a_field_constructor(name, annotation.value_type, context):
-								Err(error):
-									failure = Some(error)
-									break
-								Ok(True):
-									failure = Some(unsupported_form(name.span, NestedPattern))
-									break
-								Ok(False):
-									void
-							id = binding_id(IntOps.add(ordinal, bindings.length()))
-							definition: BindingDefinition = {
-								origin = MatchCapture,
-								mutability = Immutable,
-								value_type = annotation.value_type,
-								span = name.span,
-							}
-							match bind_local(field_scope, context.namespace, context.module, context.caller.function, name, id, definition):
-								Ok(binding): field_scope = field_scope.append(binding)
-								Err(error):
-									failure = Some(error)
-									break
-							bindings = bindings.append(definition)
-							captures = captures.append(Some(id))
-						_:
-							failure = Some(checker_invariant(pattern_span(field), UnsupportedPatternReachedResolution))
-							break
-			if failure.is_some():
-				break
-			position = IntOps.add(position, 1)
-		match failure:
-			Some(error): Err(error)
-			None:
-				Ok({
-					pattern = VariantCase(contract.variant, captures),
-					scope = field_scope,
-					bindings = bindings,
-				})
-
-
--- What every arm of one match shares: the scrutinee's union type and
--- occurrence and the scope before the match.
 private fixed record MatchContext {
-	union_type: TypeRef,
-	occurrence: UnionOccurrence,
+	subject: Patterns.PatternSubject,
 	scope: List[ScopedValue]
 }
 
 
--- A whole-arm name denotes a visible constructor; only `_` catches everything.
-private pure func resolve_pattern(
-	pattern: ParsedPattern,
-	match_context: MatchContext,
-	ordinal: Int,
-	context: ResolutionContext,
-) -> Result[ResolvedPattern, CheckError]:
-	scope = match_context.scope
-
-	match pattern:
-		PatternWildcard(_):
-			Ok(unbound(WildcardCase, scope))
-		PatternName(name):
-			match find_variant(context, match_context.occurrence, name):
-				Ok(Some(contract)): resolve_variant_pattern(contract, [], name.span, ordinal, scope, context)
-				Ok(None): Err(match_error(name.span, BarePatternName(name.id, match_context.union_type)))
-				Err(error): Err(error)
-		PatternConstructor(head, fields, span):
-			match head:
-				BareHead(name):
-					match find_variant(context, match_context.occurrence, name):
-						Ok(Some(contract)): resolve_variant_pattern(contract, fields, span, ordinal, scope, context)
-						Ok(None): Err(match_error(span, UnknownConstructorPattern(name.id, match_context.union_type)))
-						Err(error): Err(error)
-				QualifiedHead(qualified):
-					match find_qualified_variant(context, match_context.occurrence, qualified):
-						Ok(Some(contract)): resolve_variant_pattern(contract, fields, span, ordinal, scope, context)
-						Ok(None): Err(match_error(span, UnknownConstructorPattern(qualified.name.id, match_context.union_type)))
-						Err(error): Err(error)
-		PatternOr(_, span):
-			Err(checker_invariant(span, UnsupportedPatternReachedResolution))
-		PatternList(_, _, span):
-			Err(checker_invariant(span, UnsupportedPatternReachedResolution))
-		PatternString(_, span):
-			Err(checker_invariant(span, UnsupportedPatternReachedResolution))
-		PatternChar(span):
-			Err(checker_invariant(span, UnsupportedPatternReachedResolution))
-
-
-private pure func remaining_after(
-	pattern: CheckedPattern,
-	remaining: List[VariantId],
-	span: Span,
-) -> Result[List[VariantId], CheckError]:
-	var next: List[VariantId] = []
-	var useful = False
-
-	match pattern:
-		VariantCase(id, _):
-			for known in remaining:
-				if same_variant(id, known):
-					useful = True
-				else:
-					next = next.append(known)
-		WildcardCase:
-			useful = not IntOps.equals(remaining.length(), 0)
-
-	if useful:
-		Ok(next)
-	else:
-		Err(match_error(span, UnreachableArm))
-
-
 private fixed record ResolvedMatch {
-	body: CheckedMatch,
+	lambdas: List[LambdaRow],
+	body: CheckedJoin,
 	bindings: List[BindingDefinition]
 }
 
 
--- Arms resolved so far, the variants they leave uncovered and the function's
--- bindings including every earlier arm's.
-private fixed record ArmProgress {
-	arms: List[CheckedArm],
-	remaining: List[VariantId],
-	bindings: List[BindingDefinition]
-}
-
-
--- The first pattern form in the arms that has no semantics yet, arms in
--- order and left to right, before the scrutinee is typed: a list pattern on
--- a List scrutinee is then reported as the form, not as a non-union match.
--- A constructor's fields are scanned one level down; a deeper pattern there
--- is a nested pattern.
-private pure func unsupported_pattern_form(arms: List[ParsedMatchArm]) -> Option[CheckError]:
-	var failure: Option[CheckError] = None
-
-	for arm in arms:
-		if failure.is_none():
-			failure = pattern_form_rejection(arm.pattern)
-
-	failure
-
-
-private pure func pattern_form_rejection(pattern: ParsedPattern) -> Option[CheckError]:
-	match pattern:
-		PatternName(_) | PatternWildcard(_):
-			None
-		PatternConstructor(_, fields, _):
-			var failure: Option[CheckError] = None
-
-			for field in fields:
-				if failure.is_none():
-					failure = match field:
-						PatternName(_) | PatternWildcard(_):
-							None
-						PatternConstructor(_, _, _) | PatternOr(_, _) | PatternList(_, _, _) | PatternString(_, _) | PatternChar(_):
-							Some(unsupported_form(pattern_span(field), NestedPattern))
-
-			failure
-		PatternOr(_, span):
-			Some(unsupported_form(span, OrPattern))
-		PatternList(_, _, span):
-			Some(unsupported_form(span, ListPattern))
-		PatternString(_, span):
-			Some(unsupported_form(span, StringPattern))
-		PatternChar(span):
-			Some(unsupported_form(span, CharPattern))
-
-
--- A match's typed scrutinee, its arms' shared context and every variant
--- its arms must cover.
 private fixed record StartedMatch {
+	lambdas: List[LambdaRow],
 	scrutinee: CheckedExpr,
-	match_context: MatchContext,
-	remaining: List[VariantId]
+	match_context: MatchContext
 }
 
 
@@ -324,45 +123,26 @@ private pure func start_match(
 	scope: List[ScopedValue],
 	body: ParsedMatch,
 	context: ResolutionContext,
+	lambdas: List[LambdaRow],
 ) -> Result[StartedMatch, CheckError]:
-	supported ?= match unsupported_pattern_form(body.arms):
+	var unsupported: Option[CheckError] = None
+	for arm in body.arms:
+		if unsupported.is_none():
+			unsupported = Patterns.unsupported_pattern_form(arm.pattern)
+	supported: Void ?= match unsupported:
 		Some(error): Err(error)
 		None: Ok(void)
-	scrutinee ?= synthesize_value(scope, body.scrutinee, None, context)
-	occurrence ?= union_occurrence(
-		scrutinee.value_type,
-	).to_result(match_error(body.scrutinee.span, MatchRequiresUnion(scrutinee.value_type)))
-	declaration ?= context.unions
-		.get(union_number(occurrence.owner))
-		.to_result(checker_invariant(body.keyword_span, InvalidCheckedUnion(occurrence.owner)))
-	var remaining: List[VariantId] = []
-
-	for variant in declaration.variants:
-		remaining = remaining.append(variant.id)
-
-	Ok({
-		scrutinee = scrutinee,
-		match_context = {
-			union_type = scrutinee.value_type,
-			occurrence = occurrence,
-			scope = scope
-		},
-		remaining = remaining,
-	})
+	scrutinee ?= synthesize_value(scope, body.scrutinee, None, context, lambdas, resolve_lambda_block)
+	root_supported: Void ?= match Patterns.supports_root(scrutinee.value.value_type):
+		True: Ok(void)
+		False: Err(match_error(body.scrutinee.span, InvalidMatchScrutinee(scrutinee.value.value_type)))
+	subject ?= Patterns.prepare_subject(scrutinee.value.value_type, context, body.scrutinee.span)
+	Ok({ lambdas = scrutinee.lambdas, scrutinee = scrutinee.value, match_context = { subject = subject, scope = scope } })
 
 
-private pure func exhaustive(remaining: List[VariantId], body: ParsedMatch) -> Result[Void, CheckError]:
-	if remaining.is_empty():
-		Ok(void)
-	else:
-		Err(match_error(body.keyword_span, NonExhaustiveMatch(remaining)))
-
-
--- One arm's pattern and statements, the variants still uncovered after it,
--- and the function's bindings including the arm's.
 private fixed record ResolvedArmPrefix {
-	pattern: CheckedPattern,
-	remaining: List[VariantId],
+	rows: List[Patterns.PatternRow],
+	inputs: List[BindingId],
 	block: ResolvedStatements
 }
 
@@ -370,24 +150,20 @@ private fixed record ResolvedArmPrefix {
 private pure func resolve_arm_prefix(
 	arm: ParsedMatchArm,
 	match_context: MatchContext,
-	remaining: List[VariantId],
+	previous: List[Patterns.PatternRow],
+	id: MatchArmId,
 	bindings: List[BindingDefinition],
 	context: ResolutionContext,
+	lambdas: List[LambdaRow],
 ) -> Result[ResolvedArmPrefix, CheckError]:
-	pattern ?= resolve_pattern(arm.pattern, match_context, bindings.length(), context)
-	uncovered ?= remaining_after(pattern.pattern, remaining, pattern_span(arm.pattern))
-	definitions = bindings.concat(pattern.bindings)
-	block ?= resolve_statements(
-		arm.block.statements,
-		{
-			bindings = definitions,
-			scope = pattern.scope,
-			statements = [],
-			reassigned = []
-		},
-		context,
-	)
-	Ok({ pattern = pattern.pattern, remaining = uncovered, block = block })
+	pattern ?= Patterns.resolve_arm(arm.pattern, match_context.subject, match_context.scope, bindings.length(), id, previous, context)
+	block ?= resolve_statements(arm.block.statements, {
+		lambdas = lambdas,
+		bindings = bindings.concat(pattern.bindings),
+		scope = pattern.scope,
+		statements = [], reassigned = [],
+	}, context)
+	Ok({ rows = pattern.rows, inputs = pattern.inputs, block = block })
 
 
 -- Every arm must be useful, and together the arms must cover every variant.
@@ -397,67 +173,34 @@ private pure func resolve_match(
 	body: ParsedMatch,
 	bindings: List[BindingDefinition],
 	context: ResolutionContext,
+	lambdas: List[LambdaRow],
 ) -> Result[ResolvedMatch, CheckError]:
-	started ?= start_match(scope, body, context)
-	resolved ?= resolve_arms(
+	started ?= start_match(scope, body, context, lambdas)
+	resolved ?= resolve_join_arms(
 		body.arms,
 		started.match_context,
-		return_type,
 		{
+			lambdas = started.lambdas,
 			arms = [],
-			remaining = started.remaining,
-			bindings = bindings
+			cases = [],
+			bindings = bindings,
+			expectation = return_expectation(return_type),
+			reassigned = []
 		},
 		context,
 	)
-	covered ?= exhaustive(resolved.remaining, body)
+	selected ?= Patterns.finish_selection(resolved.cases, started.match_context.subject, body.keyword_span, context)
 	Ok({
 		body = {
 			scrutinee = started.scrutinee,
-			union_type = started.scrutinee.value_type,
-			arms = resolved.arms
+			selection = selected,
+			arms = resolved.arms,
+			-- Only the function return follows this match.
+			carried = []
 		},
+		lambdas = resolved.lambdas,
 		bindings = resolved.bindings,
 	})
-
-
-private pure func resolve_arms(
-	written: List[ParsedMatchArm],
-	match_context: MatchContext,
-	return_type: TypeUse,
-	progress: ArmProgress,
-	context: ResolutionContext,
-) -> Result[ArmProgress, CheckError]:
-	match written.get(progress.arms.length()):
-		None:
-			Ok(progress)
-		Some(arm):
-			-- A tail arm has no continuation, so it may reassign any variable.
-			match resolve_arm_prefix(arm, match_context, progress.remaining, progress.bindings, context):
-				Ok(prefix):
-					-- A tail match's arm must produce the function's value.
-					match arm.block.value.to_result(match_error(arm.span, ArmWithoutValue)):
-						Ok(body):
-							match resolve_value(prefix.block, body, return_expectation(return_type), context):
-								Ok(value):
-									resolve_arms(
-										written,
-										match_context,
-										return_type,
-										{
-											arms = progress.arms.append({
-												pattern = prefix.pattern,
-												statements = prefix.block.statements,
-												body = ReturnExpression(value.value),
-											}),
-											remaining = prefix.remaining,
-											bindings = value.bindings
-										},
-										context,
-									)
-								Err(error): Err(error)
-						Err(error): Err(error)
-				Err(error): Err(error)
 
 
 -- What a block's value, an initializer or an expression statement must
@@ -469,8 +212,13 @@ private pure func resolve_arms(
 -- type decides the later arms'.
 private fixed union ValueExpectation:
 	UntypedValue
+	-- A condition supplies the canonical constructor context; each leaf still
+	-- validates its resulting nominal type before a Bool join can be published.
+	ConditionValue(TypeRef)
 	CheckedAgainst(TypeRef, ExpectedTypeSite)
 	StatementValue
+	-- Without else the then block must be Void, independent of its receiver.
+	AbsentElseBranch(Span)
 	-- An arm of a statement match, or of a match nested as one's value.
 	StatementArm
 	-- A Void function's tail. The match there is Void; its arms keep their
@@ -483,6 +231,7 @@ private fixed union ValueExpectation:
 -- A checked value with the function's bindings after it: a match's arms
 -- add their captures and locals.
 private fixed record ResolvedValue {
+	lambdas: List[LambdaRow],
 	value: CheckedExpr,
 	bindings: List[BindingDefinition],
 	reassigned: List[BindingId]
@@ -492,8 +241,9 @@ private fixed record ResolvedValue {
 -- Arms resolved so far, the uncovered variants and what the next arm's
 -- value must produce.
 private fixed record JoinProgress {
+	lambdas: List[LambdaRow],
 	arms: List[CheckedJoinArm],
-	remaining: List[VariantId],
+	cases: List[Patterns.PatternRow],
 	bindings: List[BindingDefinition],
 	expectation: ValueExpectation,
 	reassigned: List[BindingId]
@@ -530,22 +280,39 @@ private pure func resolve_value(
 	expectation: ValueExpectation,
 	context: ResolutionContext,
 ) -> Result[ResolvedValue, CheckError]:
-	match bare_match(written):
-		Some(matched):
-			resolve_join(block, matched, expectation, context)
-		None:
-			value_result: Result[CheckedExpr, CheckError] = match expectation:
-				UntypedValue | VoidTail:
-					synthesize_value(block.scope, written, None, context)
-				CheckedAgainst(expected, site):
-					check_value(block.scope, written, expected, site, context)
-				StatementValue:
-					statement_value(block.scope, written, ExpressionStatementValue, context)
-				StatementArm:
-					statement_value(block.scope, written, StatementMatchArmValue, context)
-			match value_result:
-				Ok(value): Ok({ value = value, bindings = block.bindings, reassigned = block.reassigned })
-				Err(error): Err(error)
+	match written.base:
+		IfExpression(branch):
+			if written.applications.is_empty():
+				resolve_if(branch, block, expectation, context)
+			else:
+				Err(unsupported_form(written.base_span, IfValue))
+		_:
+			match bare_match(written):
+				Some(matched):
+					resolve_join(block, matched, expectation, context)
+				None:
+					value_result: Result[CheckedValueResult, CheckError] = match expectation:
+						UntypedValue | VoidTail:
+							synthesize_value(block.scope, written, None, context, block.lambdas, resolve_lambda_block)
+						ConditionValue(expected):
+							match synthesize_value(block.scope, written, Some(expected), context, block.lambdas, resolve_lambda_block):
+								Err(error): Err(error)
+								Ok(value):
+									if same_type(value.value.value_type, expected):
+										Ok(value)
+									else:
+										Err(statement_error(written.span, NonBooleanCondition(value.value.value_type)))
+						CheckedAgainst(expected, site):
+							check_value(block.scope, written, expected, site, context, block.lambdas, resolve_lambda_block)
+						StatementValue:
+							statement_value(block.scope, written, ExpressionStatementValue, context, block.lambdas)
+						AbsentElseBranch(origin):
+							statement_value(block.scope, written, IfThenWithoutElse(origin), context, block.lambdas)
+						StatementArm:
+							statement_value(block.scope, written, StatementMatchArmValue, context, block.lambdas)
+					match value_result:
+						Ok(value): Ok({ value = value.value, lambdas = value.lambdas, bindings = block.bindings, reassigned = block.reassigned })
+						Err(error): Err(error)
 
 
 -- Non-final expression statements, and a statement match's arm values, must
@@ -554,6 +321,7 @@ private pure func resolve_value(
 private fixed union VoidPosition:
 	ExpressionStatementValue
 	StatementMatchArmValue
+	IfThenWithoutElse(Span)
 
 
 private pure func statement_value(
@@ -561,15 +329,17 @@ private pure func statement_value(
 	written: ValueExpression,
 	position: VoidPosition,
 	context: ResolutionContext,
-) -> Result[CheckedExpr, CheckError]:
-	value ?= synthesize_value(scope, written, None, context)
-	if same_type(value.value_type, VoidType):
+	lambdas: List[LambdaRow],
+) -> Result[CheckedValueResult, CheckError]:
+	value ?= synthesize_value(scope, written, None, context, lambdas, resolve_lambda_block)
+	if same_type(value.value.value_type, VoidType):
 		Ok(value)
 	else:
-		rejection = match position:
-			ExpressionStatementValue: NonVoidStatement(value.value_type)
-			StatementMatchArmValue: NonVoidMatchArm(value.value_type)
-		Err(statement_error(written.span, rejection))
+		rejection: CheckError = match position:
+			ExpressionStatementValue: statement_error(written.span, NonVoidStatement(value.value.value_type))
+			StatementMatchArmValue: statement_error(written.span, NonVoidMatchArm(value.value.value_type))
+			IfThenWithoutElse(origin): value_error(origin, MissingIfElse)
+		Err(rejection)
 
 
 -- A bound or statement match. Its arms resolve as a tail match's do, except
@@ -580,28 +350,30 @@ private pure func resolve_join(
 	expectation: ValueExpectation,
 	context: ResolutionContext,
 ) -> Result[ResolvedValue, CheckError]:
-	started ?= start_match(block.scope, body, context)
+	started ?= start_match(block.scope, body, context, block.lambdas)
 	-- A statement match's arms, and those of matches nested as their values,
 	-- are statement arms.
-	arm_expectation = match expectation:
-		StatementValue | StatementArm: StatementArm
-		UntypedValue | CheckedAgainst(_, _) | VoidTail: expectation
+	arm_expectation: ValueExpectation = match expectation:
+		StatementValue | StatementArm | AbsentElseBranch(_): StatementArm
+		UntypedValue | ConditionValue(_) | CheckedAgainst(_, _) | VoidTail: expectation
 	resolved ?= resolve_join_arms(
 		body.arms,
 		started.match_context,
 		{
+			lambdas = started.lambdas,
 			arms = [],
-			remaining = started.remaining,
+			cases = [],
 			bindings = block.bindings,
 			expectation = arm_expectation,
 			reassigned = []
 		},
 		context,
 	)
-	covered ?= exhaustive(resolved.remaining, body)
+	selected ?= Patterns.finish_selection(resolved.cases, started.match_context.subject, body.keyword_span, context)
 	decided: Result[TypeRef, CheckError] = match resolved.expectation:
+		ConditionValue(expected): Ok(expected)
 		CheckedAgainst(expected, _): Ok(expected)
-		StatementValue | StatementArm | VoidTail: Ok(VoidType)
+		StatementValue | StatementArm | AbsentElseBranch(_) | VoidTail: Ok(VoidType)
 		-- Only a match without arms leaves its type undecided.
 		UntypedValue: Err(checker_invariant(body.keyword_span, JoinWithoutArms))
 	value_type ?= decided
@@ -613,13 +385,14 @@ private pure func resolve_join(
 		value = {
 			form = Match({
 				scrutinee = started.scrutinee,
-				union_type = started.scrutinee.value_type,
+				selection = selected,
 				arms = resolved.arms,
 				carried = carried
 			}),
 			value_type = value_type,
 			span = body.span,
 		},
+		lambdas = resolved.lambdas,
 		bindings = resolved.bindings,
 		reassigned = block.reassigned.concat(carried),
 	})
@@ -638,9 +411,11 @@ private pure func resolve_join_arms(
 			match resolve_arm_prefix(
 				arm,
 				match_context,
-				progress.remaining,
+				progress.cases,
+				match_arm_id(progress.arms.length()),
 				progress.bindings,
 				context,
+				progress.lambdas,
 			):
 				Ok(prefix):
 					resolved: Result[ResolvedValue, CheckError] = match arm.block.value:
@@ -649,31 +424,34 @@ private pure func resolve_join_arms(
 						None:
 							match progress.expectation:
 								-- An arm of a statement match may end with a statement.
-								StatementValue | StatementArm:
+								StatementValue | StatementArm | AbsentElseBranch(_):
 									Ok({
 										value = { form = LiteralVoid, value_type = VoidType, span = arm.span },
+										lambdas = prefix.block.lambdas,
 										bindings = prefix.block.bindings,
 										reassigned = prefix.block.reassigned,
 									})
-								UntypedValue | CheckedAgainst(_, _) | VoidTail:
+								UntypedValue | ConditionValue(_) | CheckedAgainst(_, _) | VoidTail:
 									Err(match_error(arm.span, ArmWithoutValue))
 					match resolved:
 						Ok(value):
-							expectation = match progress.expectation:
+							expectation: ValueExpectation = match progress.expectation:
 								UntypedValue:
 									CheckedAgainst(value.value.value_type, FirstArmValue)
-								CheckedAgainst(_, _) | StatementValue | StatementArm | VoidTail:
+								ConditionValue(_) | CheckedAgainst(_, _) | StatementValue | StatementArm | AbsentElseBranch(_) | VoidTail:
 									progress.expectation
 							resolve_join_arms(
 								written,
 								match_context,
 								{
 									arms = progress.arms.append({
-										pattern = prefix.pattern,
+										id = match_arm_id(progress.arms.length()),
+										inputs = prefix.inputs,
 										statements = prefix.block.statements,
 										value = value.value,
 									}),
-									remaining = prefix.remaining,
+									cases = progress.cases.concat(prefix.rows),
+									lambdas = value.lambdas,
 									bindings = value.bindings,
 									expectation = expectation,
 									reassigned = progress.reassigned.concat(value.reassigned),
@@ -700,11 +478,11 @@ private pure func parameter_scope(
 			None: failure = Some(checker_invariant(parameter.name.span, InvalidResolvedParameter(position)))
 			Some(value_type):
 				binding_result = match value_type.value_type:
-					PureCallableType(parameters, result):
+					PureCallableType(callable_parameters, result):
 						bind_callable(
-							resolved, context.namespace, context.module, context.caller.function,
-							parameter.name, callable_parameter(context.caller.function, position),
-							parameters, result, value_type.span,
+							resolved, context.namespace, context.module,
+							parameter.name, callable_parameter(context.root_function, position),
+							callable_parameters, result, value_type.span,
 						)
 					_:
 						definition: BindingDefinition = {
@@ -715,7 +493,7 @@ private pure func parameter_scope(
 						}
 						data_ordinal = IntOps.add(data_ordinal, 1)
 						bind_local(
-							resolved, context.namespace, context.module, context.caller.function,
+							resolved, context.namespace, context.module, context.caller.body,
 							parameter.name, binding_id(IntOps.subtract(data_ordinal, 1)), definition,
 						)
 				match binding_result:
@@ -729,16 +507,10 @@ private pure func parameter_scope(
 		None: Ok(resolved)
 
 
-private fixed record ResolvedBody {
-	bindings: List[BindingDefinition],
-	statements: List[CheckedStatement],
-	body: CheckedBody
-}
-
-
 -- A block's checked statements, the scope after them and the function's
 -- bindings so far.
 private fixed record ResolvedStatements {
+	lambdas: List[LambdaRow],
 	bindings: List[BindingDefinition],
 	scope: List[ScopedValue],
 	statements: List[CheckedStatement],
@@ -756,7 +528,7 @@ private fixed union JoinBindingState:
 -- table filters arm locals and freezes each visible identity once, in ordinal
 -- order even though the lexical lookup scope has most recent bindings first.
 private pure func carried_bindings(entry: ResolvedStatements, written: List[BindingId]) -> List[BindingId]:
-	var states = repeat(OutsideJoinScope, entry.bindings.length())
+	var states: List[JoinBindingState] = repeat(OutsideJoinScope, entry.bindings.length())
 	for binding in entry.scope:
 		match binding:
 			DataLocal(data): states = states.set(binding_number(local_binding_id(data)), UntouchedJoinBinding)
@@ -802,19 +574,321 @@ private pure func resolve_statement(
 	match statement:
 		BindingStatement(binding): resolve_assignment(binding, block, context)
 		PropagatingBinding(propagation): Err(unsupported_form(propagation.span, Propagation))
-		WhileLoop(loop): Err(unsupported_form(loop.span, WhileStatement))
-		ForLoop(loop): Err(unsupported_form(loop.span, ForStatement))
-		Break(span): Err(checker_invariant(span, LoopControlOutsideLoop))
-		Continue(span): Err(checker_invariant(span, LoopControlOutsideLoop))
+		WhileLoop(loop): resolve_while(loop, block, context)
+		ForLoop(loop): resolve_for(loop, block, context)
+		Break(span):
+			match context.loop_scope:
+				WithinSourceLoop: Ok({ block | statements = block.statements.append(BreakSourceLoop(span)) })
+				OutsideSourceLoop: Err(checker_invariant(span, LoopControlOutsideLoop))
+		Continue(span):
+			match context.loop_scope:
+				WithinSourceLoop: Ok({ block | statements = block.statements.append(ContinueSourceLoop(span)) })
+				OutsideSourceLoop: Err(checker_invariant(span, LoopControlOutsideLoop))
 		ExpressionStatement(expression):
 			match resolve_value(block, expression, StatementValue, context):
 				Ok(resolved):
 					Ok({ block |
+						lambdas = resolved.lambdas,
 						bindings = resolved.bindings,
 						statements = block.statements.append(DiscardExpression(resolved.value)),
 						reassigned = resolved.reassigned
 					})
 				Err(error): Err(error)
+
+
+private pure func resolve_condition(
+	written: ValueExpression,
+	block: ResolvedStatements,
+	context: ResolutionContext,
+) -> Result[ResolvedValue, CheckError]:
+	expected: TypeRef = UnionType(variant_owner(context.boolean.true_variant))
+	resolve_value({ block | reassigned = [] }, written, ConditionValue(expected), context)
+
+
+-- Statement blocks may finish without a value. A written final expression
+-- remains a statement and must be Void, just like each preceding expression.
+private pure func resolve_statement_block(
+	written: ParsedBlock,
+	block: ResolvedStatements,
+	context: ResolutionContext,
+) -> Result[ResolvedStatements, CheckError]:
+	prefix ?= resolve_statements(written.statements, block, context)
+	match written.value:
+		Some(value): resolve_statement(ExpressionStatement(value), prefix, context)
+		None: Ok(prefix)
+
+
+private fixed record ResolvedIfBranch {
+	block: ResolvedStatements,
+	value: CheckedExpr
+}
+
+
+private pure func resolve_if_branch(
+	written: ParsedBlock,
+	block: ResolvedStatements,
+	expectation: ValueExpectation,
+	context: ResolutionContext,
+) -> Result[ResolvedIfBranch, CheckError]:
+	prefix ?= match expectation:
+		StatementValue | StatementArm: resolve_statement_block(written, block, context)
+		_: resolve_statements(written.statements, block, context)
+	resolved: ResolvedValue ?= match expectation:
+		StatementValue | StatementArm:
+			Ok({
+				value = { form = LiteralVoid, value_type = VoidType, span = written.span },
+				bindings = prefix.bindings, lambdas = prefix.lambdas,
+				reassigned = prefix.reassigned,
+			})
+		_:
+			match written.value:
+				Some(body): resolve_value(prefix, body, expectation, context)
+				None:
+					match expectation:
+						AbsentElseBranch(_):
+							Ok({
+								value = { form = LiteralVoid, value_type = VoidType, span = written.span },
+								bindings = prefix.bindings, lambdas = prefix.lambdas,
+								reassigned = prefix.reassigned,
+							})
+						_: Err(value_error(written.span, IfBranchWithoutValue))
+	Ok({
+		block = { prefix |
+			bindings = resolved.bindings, lambdas = resolved.lambdas,
+			reassigned = resolved.reassigned,
+		},
+		value = resolved.value,
+	})
+
+
+private pure func resolve_if(
+	written: ParsedIf,
+	block: ResolvedStatements,
+	expectation: ValueExpectation,
+	context: ResolutionContext,
+) -> Result[ResolvedValue, CheckError]:
+	condition ?= resolve_condition(written.condition, block, context)
+	entry: ResolvedStatements = {
+		lambdas = condition.lambdas,
+		bindings = condition.bindings, scope = block.scope,
+		statements = [], reassigned = [],
+	}
+	arm_expectation = match written.else_branch:
+		Some(_): expectation
+		None: AbsentElseBranch(written.span)
+	selected ?= resolve_if_branch(written.then_block, entry, arm_expectation, context)
+	next_expectation: ValueExpectation = match expectation:
+		UntypedValue: CheckedAgainst(selected.value.value_type, FirstIfBranchValue)
+		_: expectation
+	other_entry = { entry | bindings = selected.block.bindings, lambdas = selected.block.lambdas }
+	other: ResolvedIfBranch ?= match written.else_branch:
+		None:
+			Ok({ block = other_entry, value = { form = LiteralVoid, value_type = VoidType, span = written.span } })
+		Some(branch):
+			match branch:
+				ElseBlock(body): resolve_if_branch(body, other_entry, next_expectation, context)
+				ElseIf(body):
+					match resolve_if(body, other_entry, next_expectation, context):
+						Err(error): Err(error)
+						Ok(resolved):
+							Ok({
+								block = { other_entry |
+									lambdas = resolved.lambdas, bindings = resolved.bindings,
+									reassigned = resolved.reassigned,
+								},
+								value = resolved.value,
+							})
+	value_type = match expectation:
+		UntypedValue: selected.value.value_type
+		CheckedAgainst(expected, _): expected
+		ConditionValue(expected): expected
+		StatementValue | StatementArm | AbsentElseBranch(_) | VoidTail: VoidType
+	-- With no else, branches were checked without the receiving expectation.
+	-- Validate its canonical Void result before publishing any join facts.
+	admitted: Void ?= match written.else_branch:
+		Some(_): Ok(void)
+		None:
+			match expectation:
+				CheckedAgainst(expected, site):
+					if same_type(expected, VoidType):
+						Ok(void)
+					else:
+						Err(value_error(written.span, ExpressionTypeMismatch({ expected = expected, actual = { value_type = VoidType, span = written.span }, expected_site = site })))
+				ConditionValue(_): Err(statement_error(written.span, NonBooleanCondition(VoidType)))
+				_: Ok(void)
+	carried = carried_bindings(block, condition.reassigned.concat(selected.block.reassigned).concat(other.block.reassigned))
+	matched_selection ?= Patterns.union_selection([
+		{ arm = match_arm_id(0), variant = context.boolean.true_variant, fields = [], arguments = [] },
+		{ arm = match_arm_id(1), variant = context.boolean.false_variant, fields = [], arguments = [] },
+	], condition.value.value_type, written.span, context)
+	Ok({
+		value = {
+			form = Match({
+				scrutinee = condition.value,
+				selection = matched_selection,
+				arms = [
+					{
+						id = match_arm_id(0), inputs = [],
+						statements = selected.block.statements,
+						value = selected.value,
+					},
+					{
+						id = match_arm_id(1), inputs = [],
+						statements = other.block.statements,
+						value = other.value,
+					},
+				],
+				carried = carried,
+			}),
+			value_type = value_type,
+			span = written.span,
+		},
+		lambdas = other.block.lambdas,
+		bindings = other.block.bindings,
+		reassigned = block.reassigned.concat(carried),
+	})
+
+
+private pure func resolve_while(
+	written: ParsedWhile,
+	block: ResolvedStatements,
+	context: ResolutionContext,
+) -> Result[ResolvedStatements, CheckError]:
+	inside = { context | loop_scope = WithinSourceLoop }
+	condition ?= resolve_condition(written.condition, block, inside)
+	body ?= resolve_statement_block(written.body, {
+		lambdas = condition.lambdas,
+		bindings = condition.bindings, scope = block.scope,
+		statements = [], reassigned = [],
+	}, inside)
+	carried = carried_bindings(block, condition.reassigned.concat(body.reassigned))
+	Ok({ block |
+		lambdas = body.lambdas,
+		bindings = body.bindings,
+		statements = block.statements.append(RunWhile({
+			condition = condition.value,
+			body = body.statements,
+			carried = carried,
+			boolean = context.boolean,
+			span = written.span,
+		})),
+		reassigned = block.reassigned.concat(carried),
+	})
+
+
+private fixed record ResolvedIteration {
+	iteration: CheckedIteration,
+	element: TypeRef,
+	block: ResolvedStatements
+}
+
+
+-- Iterable expressions run before the loop. Their writes and LambdaRows flow
+-- into the body's entry, but their locals do not escape their value scopes.
+private pure func resolve_iteration(
+	written: ValueExpression,
+	block: ResolvedStatements,
+	context: ResolutionContext,
+) -> Result[ResolvedIteration, CheckError]:
+	match written.base:
+		RangeExpression(start, end):
+			if written.applications.is_empty():
+				resolve_range_iteration(start, end, block, context)
+			else:
+				resolve_list_iteration(written, block, context)
+		_: resolve_list_iteration(written, block, context)
+
+
+private pure func resolve_range_iteration(
+	start: ValueExpression,
+	end: ValueExpression,
+	block: ResolvedStatements,
+	context: ResolutionContext,
+) -> Result[ResolvedIteration, CheckError]:
+	first ?= resolve_value(block, start, CheckedAgainst(IntType, ForRangeBound), context)
+	previous = { block | lambdas = first.lambdas, bindings = first.bindings, reassigned = first.reassigned }
+	last ?= resolve_value(previous, end, CheckedAgainst(IntType, ForRangeBound), context)
+	Ok({
+		iteration = AscendingIntRange(first.value, last.value, context.boolean),
+		element = IntType,
+		block = { previous | lambdas = last.lambdas, bindings = last.bindings, reassigned = last.reassigned },
+	})
+
+
+private pure func resolve_list_iteration(
+	written: ValueExpression,
+	block: ResolvedStatements,
+	context: ResolutionContext,
+) -> Result[ResolvedIteration, CheckError]:
+	resolved ?= resolve_value(block, written, UntypedValue, context)
+	match resolved.value.value_type:
+		ListType(element):
+			Ok({
+				iteration = ListIteration(resolved.value, element, context.option),
+				element = element,
+				block = { block |
+					lambdas = resolved.lambdas,
+					bindings = resolved.bindings,
+					reassigned = resolved.reassigned,
+				},
+			})
+		_: Err(statement_error(written.span, NonIterableFor(resolved.value.value_type)))
+
+
+private fixed record ForItemScope {
+	item: Option[BindingId],
+	block: ResolvedStatements
+}
+
+
+private pure func bind_for_item(
+	binder: ParsedBinder,
+	element: TypeRef,
+	block: ResolvedStatements,
+	context: ResolutionContext,
+) -> Result[ForItemScope, CheckError]:
+	match binder:
+		DiscardBinder(_): Ok({ item = None, block = block })
+		NamedBinder(name):
+			id = binding_id(block.bindings.length())
+			definition: BindingDefinition = {
+				origin = BodyLocal,
+				mutability = Immutable,
+				value_type = element,
+				span = name.span,
+			}
+			match bind_local(block.scope, context.namespace, context.module, context.caller.body, name, id, definition):
+				Err(error): Err(error)
+				Ok(binding):
+					Ok({
+						item = Some(id),
+						block = { block | bindings = block.bindings.append(definition), scope = [binding].concat(block.scope) },
+					})
+
+
+private pure func resolve_for(
+	written: ParsedFor,
+	block: ResolvedStatements,
+	context: ResolutionContext,
+) -> Result[ResolvedStatements, CheckError]:
+	iterated ?= resolve_iteration(written.iterable, block, context)
+	item ?= bind_for_item(written.binder, iterated.element, {
+		iterated.block | statements = [], reassigned = [],
+	}, context)
+	body ?= resolve_statement_block(written.body, item.block, { context | loop_scope = WithinSourceLoop })
+	carried = carried_bindings(iterated.block, body.reassigned)
+	Ok({ block |
+		lambdas = body.lambdas,
+		bindings = body.bindings,
+		statements = block.statements.append(RunFor({
+			iteration = iterated.iteration,
+			item = item.item,
+			body = body.statements,
+			carried = carried,
+			span = written.span,
+		})),
+		reassigned = iterated.block.reassigned.concat(carried),
+	})
 
 
 -- Resolve a declaration's annotation before its initializer. Propagation stays
@@ -824,7 +898,7 @@ private pure func resolve_initializer(
 	block: ResolvedStatements,
 	context: ResolutionContext,
 ) -> Result[ResolvedValue, CheckError]:
-	expectation ?= match written.annotation:
+	expectation: ValueExpectation ?= match written.annotation:
 		None: Ok(UntypedValue)
 		Some(annotation):
 			match resolve_type(context.body_types, annotation):
@@ -850,21 +924,25 @@ private pure func resolve_assignment(
 						None: Ok(None)
 						Some(CallableLocal(binding)): Err(statement_error(written.name.span, CallableAssignment(callable_binding_id(binding))))
 						Some(DataLocal(binding)):
-							match binding_definition(binding).mutability:
-								Mutable:
-									Ok(Some(binding))
-								Immutable:
-									Err(statement_error(written.name.span, ImmutableAssignment(binding_site(context.caller.function, binding))))
+							if same_body(binding_site(binding).binding.owner, context.caller.body).not():
+								Err(statement_error(written.name.span, CapturedAssignment(binding_site(binding).binding)))
+							else:
+								match binding_definition(binding).mutability:
+									Mutable:
+										Ok(Some(binding))
+									Immutable:
+										Err(statement_error(written.name.span, ImmutableAssignment(binding_site(binding))))
 
 	reassign ?= decision
 
 	match reassign:
 		Some(binding):
-			site = InferredBindingDeclaration(binding_site(context.caller.function, binding))
+			site: ExpectedTypeSite = InferredBindingDeclaration(binding_site(binding))
 			match resolve_value(block, written.initializer, CheckedAgainst(binding_definition(binding).value_type, site), context):
 				Ok(resolved):
 					Ok(
 						{ block |
+							lambdas = resolved.lambdas,
 							bindings = resolved.bindings,
 							statements = block.statements.append(ReassignBinding(local_binding_id(binding), resolved.value)),
 							reassigned = resolved.reassigned.append(local_binding_id(binding))
@@ -876,7 +954,7 @@ private pure func resolve_assignment(
 				Ok(resolved):
 					value = resolved.value
 
-					mutability = match written.mutability:
+					mutability: BindingMutability = match written.mutability:
 						MutableBinding:
 							Mutable
 						ImmutableBinding:
@@ -890,10 +968,11 @@ private pure func resolve_assignment(
 					}
 					-- A match's arm captures and locals precede this binding's ordinal.
 					id = binding_id(resolved.bindings.length())
-					match bind_local(block.scope, context.namespace, context.module, context.caller.function, written.name, id, definition):
+					match bind_local(block.scope, context.namespace, context.module, context.caller.body, written.name, id, definition):
 						Err(error): Err(error)
 						Ok(binding):
 							Ok({
+								lambdas = resolved.lambdas,
 								bindings = resolved.bindings.append(definition),
 								scope = [binding].concat(block.scope),
 								statements = block.statements.append(InitializeBinding(id, value)),
@@ -906,6 +985,7 @@ private pure func resolve_body(
 	accepted: AcceptedFunction,
 	result: DesignatedResult[VariantId],
 	context: ResolutionContext,
+	lambdas: List[LambdaRow],
 ) -> Result[ResolvedBody, CheckError]:
 	signature = accepted.signature
 	tail_decision: Result[Void, CheckError] = match accepted.declaration.tail_annotation:
@@ -928,6 +1008,7 @@ private pure func resolve_body(
 				parameter_bindings = parameter_bindings.append(definition)
 			CallableLocal(_): void
 	block: ResolvedStatements = {
+		lambdas = lambdas,
 		bindings = parameter_bindings,
 		scope = initial,
 		statements = [],
@@ -962,6 +1043,7 @@ private pure func resolve_function_prefix(
 										Err(recursion_error(annotation, GenericTailRecursionUnsupported))
 								None:
 									Ok({
+										lambdas = value.lambdas,
 										bindings = value.bindings,
 										statements = value.statements,
 										body = CheckedValueBody(ReturnExpression(value.value))
@@ -984,6 +1066,7 @@ private pure func finish_body(
 	match accepted.body:
 		BuiltinBody(operation, span):
 			Ok({
+				lambdas = prefix.lambdas,
 				bindings = prefix.bindings,
 				statements = prefix.statements,
 				body = CheckedValueBody(ReturnExpression(builtin_value(signature, initial, operation, span))),
@@ -992,6 +1075,7 @@ private pure func finish_body(
 			match resolve_value(prefix, body, return_expectation(signature.return_type), context):
 				Ok(value):
 					Ok({
+						lambdas = value.lambdas,
 						bindings = value.bindings,
 						statements = prefix.statements,
 						body = CheckedValueBody(ReturnExpression(value.value)),
@@ -1004,12 +1088,35 @@ private pure func finish_body(
 				body,
 				prefix.bindings,
 				context,
+				prefix.lambdas,
 			):
 				Ok(matched):
+					checked_body: CheckedBody = match accepted.declaration.tail_annotation:
+						None:
+							CheckedValueBody(ReturnExpression({
+								form = Match(matched.body),
+								value_type = signature.return_type.value_type,
+								span = body.span
+							}))
+						Some(_):
+							var arms: List[CheckedArm] = []
+							for arm in matched.body.arms:
+								arms = arms.append({
+									id = arm.id,
+									inputs = arm.inputs,
+									statements = arm.statements,
+									body = ReturnExpression(arm.value),
+								})
+							CheckedMatchBody({
+								scrutinee = matched.body.scrutinee,
+								selection = matched.body.selection,
+								arms = arms
+							})
 					Ok({
+						lambdas = matched.lambdas,
 						bindings = matched.bindings,
 						statements = prefix.statements,
-						body = CheckedMatchBody(matched.body),
+						body = checked_body,
 					})
 				Err(error): Err(error)
 
@@ -1040,6 +1147,7 @@ private pure func builtin_value(
 
 -- A Result-valued function suffix. It becomes the ordinary value of an Ok arm.
 private fixed record ResolvedFunctionValue {
+	lambdas: List[LambdaRow],
 	bindings: List[BindingDefinition],
 	statements: List[CheckedStatement],
 	value: CheckedExpr
@@ -1073,6 +1181,7 @@ private pure func resolve_result_prefix(
 				BuiltinBody(operation, span):
 					Ok({
 						value = builtin_value(accepted.signature, initial, operation, span),
+						lambdas = block.lambdas,
 						bindings = block.bindings,
 						reassigned = block.reassigned
 					})
@@ -1081,6 +1190,7 @@ private pure func resolve_result_prefix(
 					Ok({
 						bindings = resolved.bindings,
 						statements = block.statements,
+						lambdas = resolved.lambdas,
 						value = resolved.value
 					})
 				Err(error): Err(error)
@@ -1174,13 +1284,14 @@ private pure func resolve_propagation(
 		span = written.name.span
 	}
 	binding ?= bind_local(
-		block.scope, context.namespace, context.module, context.caller.function,
+		block.scope, context.namespace, context.module, context.caller.body,
 		written.name, success, definition,
 	)
 	continuation ?= resolve_result_prefix(
 		accepted,
 		IntOps.add(position, 1),
 		{
+			lambdas = source.lambdas,
 			bindings = bindings.append(definition),
 			scope = [binding].concat(block.scope),
 			statements = [],
@@ -1200,9 +1311,15 @@ private pure func resolve_propagation(
 		value_type = error_type,
 		span = written.value.span
 	}
+	root: CheckedPatternPlace = { value_type = source.value.value_type, route = MatchRoot }
+	matched_selection ?= Patterns.union_selection([
+		{ arm = match_arm_id(0), variant = result.ok, fields = [success_type], arguments = [BorrowPlace({ value_type = success_type, route = UnionField(root, result.ok, 0) })] },
+		{ arm = match_arm_id(1), variant = result.err, fields = [error_type], arguments = [BorrowPlace({ value_type = error_type, route = UnionField(root, result.err, 0) })] },
+	], source.value.value_type, written.span, context)
 	-- The selected source Err and constructed return Err share a declaration,
 	-- but their enclosing Result instantiations can differ after specialization.
 	Ok({
+		lambdas = continuation.lambdas,
 		bindings = continuation.bindings.append(error_definition),
 		statements = block.statements.append(InitializeBinding(source_id, source.value)),
 		value = {
@@ -1212,16 +1329,16 @@ private pure func resolve_propagation(
 					value_type = source.value.value_type,
 					span = written.value.span
 				},
-				union_type = source.value.value_type,
+				selection = matched_selection,
 				carried = [],
 				arms = [
 					{
-						pattern = VariantCase(result.ok, [Some(success)]),
+						id = match_arm_id(0), inputs = [success],
 						statements = continuation.statements,
 						value = continuation.value
 					},
 					{
-						pattern = VariantCase(result.err, [Some(failure)]),
+						id = match_arm_id(1), inputs = [failure],
 						statements = [],
 						value = {
 							form = ConstructVariant(result.err, [error_value]),
@@ -1245,69 +1362,65 @@ pure func resolve_functions(
 	namespace: Namespace,
 	constants: List[CheckedConstant],
 	result: DesignatedResult[VariantId],
-) -> Result[List[CheckedFunction], CheckError]:
-	check_functions(functions, declarations, opaque_declarations, namespace, constants, result, [])
+	boolean: DesignatedBoolean[VariantId],
+	option: DesignatedOption[VariantId],
+) -> Result[CheckedBodies, CheckError]:
+	var checked: List[CheckedFunction] = []
+	var lambdas: List[LambdaRow] = []
+	var failure: Option[CheckError] = None
+	while failure.is_none():
+		match functions.get(checked.length()):
+			None: break
+			Some(accepted):
+				id = accepted.id
+				context: ResolutionContext = {
+					caller = {
+						body = DeclaredBody(id),
+						purity = accepted.signature.purity
+					},
+					root_function = id,
+					module = accepted.body_types.module,
+					namespace = accepted.body_types.namespace,
+					body_types = accepted.body_types,
+					signatures = functions,
+					unions = declarations.unions,
+					records = declarations.records,
+					opaque_declarations = opaque_declarations,
+					opaques = declarations.opaques,
+					constants = constants,
+					boolean = boolean,
+					option = option,
+					loop_scope = OutsideSourceLoop,
+				}
+				signature = accepted.signature
+				match resolve_body(accepted, result, context, lambdas):
+					Ok(body):
+						match check_execution(accepted.declaration, body.statements, body.body, id):
+							Ok(execution):
 
+								executed: ResolvedBody = { body | body = execution.body }
 
-private pure func check_functions(
-	functions: List[AcceptedFunction],
-	declarations: CheckedDeclarations,
-	opaque_declarations: List[OpaqueRow],
-	namespace: Namespace,
-	constants: List[CheckedConstant],
-	result: DesignatedResult[VariantId],
-	checked: List[CheckedFunction],
-) -> Result[List[CheckedFunction], CheckError]:
-	match functions.get(checked.length()):
-		None:
-			Ok(checked)
-		Some(accepted):
-			id = accepted.id
-			context: ResolutionContext = {
-				caller = {
-					function = id,
-					purity = accepted.signature.purity
-				},
-				module = accepted.body_types.module,
-				namespace = accepted.body_types.namespace,
-				body_types = accepted.body_types,
-				signatures = functions,
-				unions = declarations.unions,
-				records = declarations.records,
-				opaque_declarations = opaque_declarations,
-				opaques = declarations.opaques,
-				constants = constants,
-			}
-			signature = accepted.signature
-			match resolve_body(accepted, result, context):
-				Ok(body):
-					match check_execution(accepted.declaration, body.statements, body.body, id):
-						Ok(execution):
+								published = if same_type(signature.return_type.value_type, VoidType):
+									normalize_void_body(executed)
+								else:
+									executed
 
-							executed: ResolvedBody = { body | body = execution.body }
-
-							published = if same_type(signature.return_type.value_type, VoidType):
-								normalize_void_body(executed)
-							else:
-								executed
-
-							check_functions(
-								functions,
-								declarations,
-								opaque_declarations,
-								namespace,
-								constants,
-								result,
-								checked.append({
+								checked = checked.append({
 									id = id,
 									execution = execution.execution,
 									signature = signature,
 									bindings = published.bindings,
 									statements = published.statements,
 									body = published.body,
-								}),
-							)
-						Err(error): Err(error)
+								})
+								lambdas = published.lambdas
+							Err(error): failure = Some(error)
+					Err(error): failure = Some(error)
+	match failure:
+		Some(error): Err(error)
+		None:
+			match seal_lambda_rows(lambdas):
+				Ok(rows): Ok({ functions = checked, lambdas = rows })
 				Err(error): Err(error)
 
 
@@ -1385,3 +1498,39 @@ private pure func normalize_void_body(resolved: ResolvedBody) -> ResolvedBody:
 				}
 			)
 			{ resolved | body = CheckedMatchBody({ matched | arms = arms }) }
+
+
+-- Seal the single reserved inventory; a missing completion is a checker fault.
+private pure func seal_lambda_rows(rows: List[LambdaRow]) -> Result[List[CheckedLambda], CheckError]:
+	var complete: List[CheckedLambda] = []
+	var missing: Bool = False
+	for row in rows:
+		match row:
+			CheckedLambdaRow(value): complete = complete.append(value)
+			CollectingLambda(_):
+				missing = True
+				break
+	if missing:
+		Err(checker_invariant({ source = compiler_source(), start = 0, end = 0 }, InvalidInferenceWorklist))
+	else:
+		Ok(complete)
+
+
+-- Blocks reuse the root's accepted annotation scope and ordinary body rules.
+pure func resolve_lambda_block(
+	scope: List[ScopedValue], parameters: List[BindingDefinition], block: ParsedBlock,
+	result: TypeUse, context: ResolutionContext, lambdas: List[LambdaRow],
+) -> Result[ResolvedBody, CheckError]:
+	prefix ?= resolve_statements(block.statements, {
+		bindings = parameters, scope = scope, statements = [], reassigned = [], lambdas = lambdas
+	}, context)
+	written: ValueExpression = block.value.get_or({ base = VoidExpression, base_span = block.span, applications = [], span = block.span })
+	value ?= resolve_value(prefix, written, return_expectation(result), context)
+	resolved: ResolvedBody = {
+		bindings = value.bindings, statements = prefix.statements,
+		body = CheckedValueBody(ReturnExpression(value.value)), lambdas = value.lambdas
+	}
+	if same_type(result.value_type, VoidType):
+		Ok(normalize_void_body(resolved))
+	else:
+		Ok(resolved)

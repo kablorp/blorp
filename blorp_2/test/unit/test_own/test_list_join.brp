@@ -7,7 +7,7 @@ import:
 	../../../src/verify/verify: verify
 	../../../src/utils/syntax: same_span
 	../input: setup_diagnostic
-	int as IntOps
+	../../../src/check/model: match_arm_number
 	test: TestSuite
 
 
@@ -27,7 +27,20 @@ private pure func nested_joins(operations: List[Own.OwnershipOperation]) -> List
 				joins = joins.append(join)
 				for arm in join.arms:
 					joins = joins.concat(nested_joins(arm.operations))
+			Own.ExecuteLoop(loop): joins = joins.concat(loop_joins(loop.body))
 			_: void
+	joins
+
+
+-- Terminal matches now live in the same common loop blocks as tail recursion.
+-- This fixture collector follows their arm bodies as well as ordinary joins.
+private pure func loop_joins(block: Own.OwnedLoopBlock) -> List[Own.OwnedJoin]:
+	var joins = nested_joins(block.operations)
+	match block.tail:
+		Own.ExitLoop(_): void
+		Own.MatchLoop(matched):
+			for arm in matched.arms:
+				joins = joins.concat(loop_joins(arm.body))
 	joins
 
 
@@ -38,37 +51,41 @@ func test_join_leaf_acquires_before_optional_parent_release() -> Bool:
 			var leaves = 0
 			var valid = True
 			for function in program.functions:
-				match function.tail:
-					Own.MatchTail(matched):
-						for root_arm in matched.arms:
-							for join in nested_joins(root_arm.operations):
-								for arm in join.arms:
-									match arm.operations:
-										[Own.DefineValue(optional), Own.ExecuteJoin(leaf), Own.DropOwner(parent, _)]:
-											match (optional.result, leaf.arms, leaf.scrutinee):
-												(Own.OwnedResult(container), [some, none], Own.BorrowedArgument(scrutinee)):
-													match (some.operations, some.transfer):
-														([Own.DefineValue(payload), Own.AcquireOwner(child, borrow, _)], Own.OwnedReturn(value, transferred)):
-															match (payload.operation, borrow.source, scrutinee.source):
-																(Own.PayloadDefinition(_, source), Own.PayloadBorrow(origin), Own.OwnerBorrow(owner)):
-																	leaves = leaves + 1
-																	valid = (
-																		valid and Lower.value_number(source) == Lower.value_number(optional.id) and Lower.value_number(origin) == Lower.value_number(source)
-																		and Lower.value_number(scrutinee.value) == Lower.value_number(source) and Lower.value_number(payload.id) == Lower.value_number(borrow.value)
-																		and Lower.value_number(value) == Lower.value_number(payload.id) and Own.owner_number(child) == Own.owner_number(transferred)
-																		and Own.owner_number(container) == Own.owner_number(parent) and Own.owner_number(owner) == Own.owner_number(parent)
-																	)
-																_: valid = False
-														_: valid = False
-													match (none.operations, none.transfer):
-														([Own.DefineValue(empty)], Own.OwnedReturn(value, owner)):
-															match (empty.operation, empty.result):
-																(Own.StringDefinition(""), Own.OwnedResult(output)): valid = valid and Lower.value_number(empty.id) == Lower.value_number(value) and Own.owner_number(output) == Own.owner_number(owner)
-																_: valid = False
-														_: valid = False
-												_: valid = False
-										_: void
-					_: void
+				for join in nested_joins(function.operations):
+					for arm in join.arms:
+						match arm.operations:
+							[Own.DefineValue(optional), Own.ExecuteJoin(leaf), Own.DropOwner(parent, _)]:
+								match (optional.result, leaf.arms, leaf.selection.scrutinee):
+									(Own.OwnedResult(container), [some, none], Own.BorrowedArgument(scrutinee)):
+										leaves = leaves + 1
+										match (leaf.selection.nodes, some.inputs, some.operations, some.exit):
+											([Own.EnterArm(empty_edge), Own.EnterArm(edge), Own.TestVariant(_, _, _, _)], [Own.ManagedJoinParameter(input, canonical)], [], Own.Yield(outputs)):
+												match (edge.operations, edge.transfers, outputs.transfer):
+													([Own.DefineValue(payload), Own.AcquireOwner(child, borrow, _)], [Own.OwnedReturn(value, transferred)], Own.OwnedReturn(returned, returned_owner)):
+														match (payload.operation, payload.result, borrow.source, scrutinee.source):
+															(Own.PayloadDefinition(_, source), Own.BorrowedResult(Own.PayloadBorrow(root)), Own.PayloadBorrow(origin), Own.OwnerBorrow(owner)):
+																valid = (
+																	valid and Lower.value_number(source) == Lower.value_number(optional.id) and Lower.value_number(origin) == Lower.value_number(source)
+																	and Lower.value_number(root) == Lower.value_number(source) and Lower.value_number(scrutinee.value) == Lower.value_number(source)
+																	and Lower.value_number(payload.id) == Lower.value_number(borrow.value) and Lower.value_number(value) == Lower.value_number(payload.id)
+																	and Own.owner_number(child) == Own.owner_number(transferred) and Own.owner_number(child) != Own.owner_number(canonical)
+																	and Lower.value_number(returned) == Lower.value_number(input.id) and Own.owner_number(returned_owner) == Own.owner_number(canonical)
+																	and Own.owner_number(container) == Own.owner_number(parent) and Own.owner_number(owner) == Own.owner_number(parent)
+																	and match_arm_number(edge.arm) == match_arm_number(some.id) and match_arm_number(empty_edge.arm) == match_arm_number(none.id)
+																	and empty_edge.operations.is_empty() and empty_edge.transfers.is_empty() and outputs.carried.is_empty()
+																)
+															_: valid = False
+													_: valid = False
+											_: valid = False
+										match (none.inputs, none.operations, none.exit):
+											([], [Own.DefineValue(empty)], Own.Yield(outputs)):
+												match (empty.operation, empty.result, outputs.transfer):
+													(Own.StringDefinition(""), Own.OwnedResult(output), Own.OwnedReturn(value, owner)):
+														valid = valid and Lower.value_number(empty.id) == Lower.value_number(value) and Own.owner_number(output) == Own.owner_number(owner) and outputs.carried.is_empty()
+													_: valid = False
+											_: valid = False
+									_: valid = False
+							_: void
 			valid and leaves == 1
 
 
@@ -79,39 +96,38 @@ func test_join_retires_intermediate_strings_after_their_consuming_calls() -> Boo
 			var branches = 0
 			var valid = True
 			for function in program.functions:
-				match function.tail:
-					Own.MatchTail(matched):
-						for root_arm in matched.arms:
-							for join in nested_joins(root_arm.operations):
-								for arm in join.arms:
-									managed = arm.operations.filter(pure func(operation):
-										match operation:
-											Own.DefineValue(value): Concrete.same_type(value.value_type, Concrete.StringType)
-											Own.DropOwner(_, _): True
-											_: False
-									)
-									match (managed, arm.transfer):
-										([Own.DefineValue(left), Own.DefineValue(right), Own.DefineValue(prefix), Own.DropOwner(a, _), Own.DefineValue(result), Own.DropOwner(b, _), Own.DropOwner(c, _)], Own.OwnedReturn(value, transferred)):
-											branches = branches + 1
-											match (left.result, right.result, prefix.result, result.result):
-												(Own.OwnedResult(l), Own.OwnedResult(r), Own.OwnedResult(p), Own.OwnedResult(output)):
-													match (left.operation, right.operation, prefix.operation, result.operation):
-														(Own.CallDefinition(Concrete.UserFunction(recur_left), [_, _, _, _]), Own.CallDefinition(Concrete.UserFunction(recur_right), [_, _, _, _]), Own.CallDefinition(Concrete.UserFunction(add_left), [Own.BorrowedArgument(left_read), _]), Own.CallDefinition(Concrete.UserFunction(add_right), [Own.BorrowedArgument(prefix_read), Own.BorrowedArgument(right_read)])):
-															match (left_read.source, right_read.source, prefix_read.source):
-																(Own.OwnerBorrow(left_owner), Own.OwnerBorrow(right_owner), Own.OwnerBorrow(prefix_owner)):
-																	valid = (
-																		valid and Own.owner_number(l) == Own.owner_number(a) and Own.owner_number(r) == Own.owner_number(b) and Own.owner_number(p) == Own.owner_number(c)
-																		and Own.owner_number(output) == Own.owner_number(transferred) and Lower.value_number(value) == Lower.value_number(result.id)
-																		and Concrete.function_number(recur_left) == Concrete.function_number(recur_right) and Concrete.function_number(add_left) == Concrete.function_number(add_right)
-																		and Own.owner_number(left_owner) == Own.owner_number(l) and Lower.value_number(left_read.value) == Lower.value_number(left.id)
-																		and Own.owner_number(right_owner) == Own.owner_number(r) and Lower.value_number(right_read.value) == Lower.value_number(right.id)
-																		and Own.owner_number(prefix_owner) == Own.owner_number(p) and Lower.value_number(prefix_read.value) == Lower.value_number(prefix.id)
-																	)
-																_: valid = False
-														_: valid = False
-												_: valid = False
-										_: void
-					_: void
+				for join in nested_joins(function.operations):
+					for arm in join.arms:
+						managed = arm.operations.filter(pure func(operation):
+							match operation:
+								Own.DefineValue(value): Concrete.same_type(value.value_type, Concrete.StringType)
+								Own.DropOwner(_, _): True
+								_: False
+						)
+						match (managed, arm.exit):
+							([Own.DefineValue(left), Own.DefineValue(right), Own.DefineValue(prefix), Own.DropOwner(a, _), Own.DefineValue(result), Own.DropOwner(b, _), Own.DropOwner(c, _)], Own.Yield(outputs)):
+								match outputs.transfer:
+									Own.OwnedReturn(value, transferred):
+										branches = branches + 1
+										match (left.result, right.result, prefix.result, result.result):
+											(Own.OwnedResult(l), Own.OwnedResult(r), Own.OwnedResult(p), Own.OwnedResult(output)):
+												match (left.operation, right.operation, prefix.operation, result.operation):
+													(Own.CallDefinition(Concrete.UserFunction(recur_left), [_, _, _, _]), Own.CallDefinition(Concrete.UserFunction(recur_right), [_, _, _, _]), Own.CallDefinition(Concrete.UserFunction(add_left), [Own.BorrowedArgument(left_read), _]), Own.CallDefinition(Concrete.UserFunction(add_right), [Own.BorrowedArgument(prefix_read), Own.BorrowedArgument(right_read)])):
+														match (left_read.source, right_read.source, prefix_read.source):
+															(Own.OwnerBorrow(left_owner), Own.OwnerBorrow(right_owner), Own.OwnerBorrow(prefix_owner)):
+																valid = (
+																	valid and Own.owner_number(l) == Own.owner_number(a) and Own.owner_number(r) == Own.owner_number(b) and Own.owner_number(p) == Own.owner_number(c)
+																	and Own.owner_number(output) == Own.owner_number(transferred) and Lower.value_number(value) == Lower.value_number(result.id)
+																	and Concrete.function_number(recur_left) == Concrete.function_number(recur_right) and Concrete.function_number(add_left) == Concrete.function_number(add_right)
+																	and Own.owner_number(left_owner) == Own.owner_number(l) and Lower.value_number(left_read.value) == Lower.value_number(left.id)
+																	and Own.owner_number(right_owner) == Own.owner_number(r) and Lower.value_number(right_read.value) == Lower.value_number(right.id)
+																	and Own.owner_number(prefix_owner) == Own.owner_number(p) and Lower.value_number(prefix_read.value) == Lower.value_number(prefix.id)
+																)
+															_: valid = False
+													_: valid = False
+											_: valid = False
+									_: valid = False
+							_: void
 			valid and branches == 1
 
 
@@ -120,8 +136,8 @@ func test_join_result_outlives_its_temporary_list_and_separator() -> Bool:
 		Err(_): False
 		Ok(program):
 			program.functions.any(pure func(function):
-				match (function.signature.parameters, function.operations.reverse(), function.tail):
-					([], [Own.DropOwner(separator, _), Own.DropOwner(list, _), Own.DefineValue(result), ..._], Own.ReturnTail(Own.ReturnResult(Own.OwnedReturn(returned, transferred)))):
+				match (function.signature.parameters, function.operations.reverse(), function.result):
+					([], [Own.DropOwner(separator, _), Own.DropOwner(list, _), Own.DefineValue(result), ..._], Own.OwnedReturn(returned, transferred)):
 						match (result.operation, result.result):
 							(Own.CallDefinition(Concrete.UserFunction(_), [Own.BorrowedArgument(values), Own.BorrowedArgument(between)]), Own.OwnedResult(owner)):
 								match (values.source, between.source):
@@ -141,8 +157,8 @@ func test_verifier_rejects_retiring_the_public_join_result_before_return() -> Bo
 				Err(_): False
 				Ok(_):
 					program.functions.any(pure func(function):
-						match (function.signature.parameters, function.operations.reverse(), function.tail):
-							([Concrete.ListType(Concrete.StringType), Concrete.StringType], [Own.DefineValue(result), ..._], Own.ReturnTail(Own.ReturnResult(Own.OwnedReturn(_, owner)))):
+						match (function.signature.parameters, function.operations.reverse(), function.result):
+							([Concrete.ListType(Concrete.StringType), Concrete.StringType], [Own.DefineValue(result), ..._], Own.OwnedReturn(_, owner)):
 								fault = {function | operations = function.operations.append(Own.DropOwner(owner, result.span))}
 								functions = program.functions.map(pure func(row):
 									match row.signature.parameters:
@@ -152,7 +168,7 @@ func test_verifier_rejects_retiring_the_public_join_result_before_return() -> Bo
 								broken = {program | functions = functions}
 								match verify(broken):
 									Err(error):
-										error.message == "ownership verification failed: return refers to discharged owner " + IntOps.to_string(Own.owner_number(owner)) and same_span(error.span, result.span) and error.help == "report this compiler error with the input program" and error.note.is_none()
+										error.message == "ownership verification failed: return refers to discharged owner " + "".append_int(Own.owner_number(owner)) and same_span(error.span, result.span) and error.help == "report this compiler error with the input program" and error.note.is_none()
 									Ok(_): False
 							_: False
 					)

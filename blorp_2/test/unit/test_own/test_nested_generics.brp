@@ -1,4 +1,5 @@
 import:
+	../../../src/check/model: match_arm_number
 	../../../src/utils/ids: inventory_functions
 	../../../src/utils/source: module_source, root_module_id
 	../../../src/check/check: check
@@ -12,6 +13,7 @@ import:
 	../../../src/utils/syntax: Diagnostic, TypeSyntax(AtomicType, AppliedType)
 	../compilation: compile
 	../input: check_failure, parse, setup_diagnostic
+	../managed_union_inputs: lowered_tail_join
 	test: TestSuite
 
 
@@ -202,48 +204,32 @@ private pure func lowered(source: String) -> Result[Lower.LoweredProgram, Diagno
 
 pure func test_lowered_projection_preserves_selected_variant_and_aggregate_type() -> Bool:
 	match lowered(BOX + MAIN):
-		Err(_):
-			False
+		Err(_): False
 		Ok(lowered):
-			program = Lower.lowered_functions(lowered)
-			var found = False
-
-			for function in program.functions:
-				match function.tail:
-					Lower.MatchValue(matched):
-						match matched.arms:
-							[arm]:
-								match (arm.label, arm.body.steps):
-									(Lower.VariantLabel(selected), [Lower.Define(projection)]):
-										match (projection.operation, projection.value_type):
-											(Lower.PayloadValue(field, source), Concrete.UnionType(child)):
-												variant = Concrete.variant_field_variant(field)
-												found = (
-													Concrete.union_number(
-														Concrete.variant_owner(variant),
-													) == 1
-													and Concrete.union_number(
-														Concrete.variant_owner(selected),
-													) == 1
-													and Concrete.variant_number(
-														variant,
-													) == Concrete.variant_number(selected)
-													and Lower.value_number(
-														source,
-													) == Lower.value_number(matched.scrutinee)
+			Lower.lowered_functions(lowered).functions.any(pure func(function):
+				match lowered_tail_join(function):
+					Some(matched):
+						match (matched.selection.nodes, matched.arms):
+							([Lower.EnterArm(edge)], [arm]):
+								match ((edge.definitions, edge.arguments, arm.inputs, arm.steps), arm.exit):
+									(([Lower.BorrowUnionField(projection, field, source)], [argument], [input], []), Lower.Yield(outputs)):
+										match (projection.value_type, input.value_type):
+											(Concrete.UnionType(child), Concrete.UnionType(canonical)):
+												(
+													Concrete.union_number(Concrete.variant_owner(Concrete.variant_field_variant(field))) == 1
+													and Concrete.variant_number(Concrete.variant_field_variant(field)) == 0
+													and Lower.value_number(source) == Lower.value_number(matched.selection.scrutinee)
+													and Lower.value_number(argument) == Lower.value_number(projection.id)
+													and Lower.value_number(outputs.value) == Lower.value_number(input.id)
 													and Concrete.union_number(child) == 0
+													and Concrete.union_number(canonical) == 0
+													and match_arm_number(edge.arm) == match_arm_number(arm.id)
 												)
-											_:
-												void
-									_:
-										void
-							_:
-								void
-					_:
-						void
-
-			found
-
+											_: False
+									_: False
+							_: False
+					None: False
+			)
 
 private pure func unmanaged_scrutinee_matches(
 	value: Lower.ValueId,
@@ -258,43 +244,32 @@ private pure func unmanaged_scrutinee_matches(
 
 pure func test_ownership_preserves_unmanaged_projection_without_rc_operations() -> Bool:
 	match lowered(BOX + MAIN).and_then(pure func(program): Owned.own(program)):
-		Err(_):
-			False
+		Err(_): False
 		Ok(program):
-			var found = False
-
-			for function in program.functions:
-				match function.tail:
-					Owned.MatchTail(matched):
-						match matched.arms:
-							[arm]:
-								match arm.operations:
-									[Owned.DefineValue(projection)]:
-										match (
-											projection.operation,
-											projection.value_type,
-											projection.result,
-										):
-											(Owned.PayloadDefinition(field, source), Concrete.UnionType(child), Owned.UnmanagedResult):
-												variant = Concrete.variant_field_variant(field)
-												found = (
-													Concrete.union_number(
-														Concrete.variant_owner(variant),
-													) == 1
-													and unmanaged_scrutinee_matches(source, matched.scrutinee)
-													and Concrete.union_number(child) == 0
-												)
-											_:
-												void
-									_:
-										void
-							_:
-								void
-					_:
-						void
-
-			found
-
+			program.functions.any(pure func(function):
+				match function.operations:
+					[Owned.DefineValue(_), Owned.ExecuteJoin(matched)]:
+						match (matched.selection.nodes, matched.arms):
+							([Owned.EnterArm(edge)], [arm]):
+								match arm.exit:
+									Owned.Yield(arm_yield):
+										match ((edge.operations, edge.transfers, arm.inputs, arm.operations), arm_yield.transfer):
+											(([Owned.DefineValue(projection)], [Owned.UnmanagedReturn(argument)], [Owned.UnmanagedJoinParameter(input)], []), Owned.UnmanagedReturn(returned)):
+												match (projection.operation, projection.value_type, projection.result):
+													(Owned.PayloadDefinition(field, source), Concrete.UnionType(child), Owned.UnmanagedResult):
+														(
+															Concrete.union_number(Concrete.variant_owner(Concrete.variant_field_variant(field))) == 1
+															and unmanaged_scrutinee_matches(source, matched.selection.scrutinee)
+															and Concrete.union_number(child) == 0
+															and Lower.value_number(argument) == Lower.value_number(projection.id)
+															and Lower.value_number(returned) == Lower.value_number(input.id)
+														)
+													_: False
+											_: False
+									Owned.TransferLoop(_, _): False
+							_: False
+					_: False
+			)
 
 pure func test_emission_defines_children_before_variant_specific_payload_storage() -> Bool:
 	match compile(BOX + CHOICE):
@@ -389,110 +364,66 @@ pure func test_missing_inner_bracket_points_to_its_terminator() -> Bool:
 
 pure func test_ownership_preserves_each_heterogeneous_arm_variant_position() -> Bool:
 	match lowered(BOX + CHOICE).and_then(pure func(program): Owned.own(program)):
-		Err(_):
-			False
+		Err(_): False
 		Ok(program):
 			var observed = 0
 			var valid = True
-
 			for function in program.functions:
-				match function.tail:
-					Owned.MatchTail(matched):
-						if Concrete.union_number(matched.owner) == 1:
-							for arm in matched.arms:
-								match (arm.label, arm.operations.get(0)):
-									(Lower.VariantLabel(label), Some(Owned.DefineValue(projection))):
-										match (projection.operation, projection.result):
-											(Owned.PayloadDefinition(field, source), Owned.UnmanagedResult):
-												variant = Concrete.variant_field_variant(field)
-												valid = (
-													valid
-													and Concrete.union_number(
-														Concrete.variant_owner(
-															variant,
-														),
-													) == Concrete.union_number(
-														Concrete.variant_owner(label),
-													)
-													and Concrete.variant_number(
-														variant,
-													) == Concrete.variant_number(label)
-													and unmanaged_scrutinee_matches(source, matched.scrutinee)
-												)
-
-												match projection.value_type:
-													Concrete.UnionType(child):
-														valid = (
-															valid
-															and Concrete.variant_number(label) == 0
-															and Concrete.union_number(child) == 0
-														)
-													Concrete.IntType:
-														valid = (
-															valid
-															and Concrete.variant_number(label) == 1
-														)
-													_:
-														valid = False
-
-												observed += 1
-											_:
-												valid = False
-									_:
-										valid = False
-
-								for operation in arm.operations:
-									match operation:
-										Owned.DefineValue(_):
-											void
-										_:
-											valid = False
-					_:
-						void
-
+				for operation in function.operations:
+					match operation:
+						Owned.ExecuteJoin(matched):
+							for node in matched.selection.nodes:
+								match node:
+									Owned.EnterArm(edge):
+										match edge.operations:
+											[Owned.DefineValue(projection)]:
+												match (projection.operation, projection.result):
+													(Owned.PayloadDefinition(field, source), Owned.UnmanagedResult):
+														variant = Concrete.variant_field_variant(field)
+														if Concrete.union_number(Concrete.variant_owner(variant)) == 1:
+															observed = observed + 1
+															valid = (
+																valid
+																and Concrete.variant_number(variant) == match_arm_number(edge.arm)
+																and unmanaged_scrutinee_matches(source, matched.selection.scrutinee)
+															)
+															match projection.value_type:
+																Concrete.UnionType(child): valid = valid and match_arm_number(edge.arm) == 0 and Concrete.union_number(child) == 0
+																Concrete.IntType: valid = valid and match_arm_number(edge.arm) == 1
+																_: valid = False
+													_: void
+											_: void
+									_: void
+						_: void
 			valid and observed == 2
-
 
 pure func test_lowering_preserves_the_second_variant_projection_identity() -> Bool:
 	match lowered(BOX + CHOICE):
-		Err(_):
-			False
+		Err(_): False
 		Ok(lowered):
-			var found = False
-
-			for function in Lower.lowered_functions(lowered).functions:
-				match function.tail:
-					Lower.MatchValue(matched):
-						match matched.arms:
-							[_, arm]:
-								match (arm.label, arm.body.steps):
-									(Lower.VariantLabel(label), [Lower.Define(projection)]):
-										match (projection.operation, projection.value_type):
-											(Lower.PayloadValue(field, source), Concrete.IntType):
-												variant = Concrete.variant_field_variant(field)
-												found = (
-													Concrete.variant_number(label) == 1
-													and Concrete.variant_number(variant) == 1
-													and Concrete.union_number(
-														Concrete.variant_owner(
-															variant,
-														),
-													) == Concrete.union_number(matched.owner)
-													and Lower.value_number(
-														source,
-													) == Lower.value_number(matched.scrutinee)
-												)
-											_:
-												void
-									_:
-										void
-							_:
-								void
-					_:
-						void
-
-			found
-
+			Lower.lowered_functions(lowered).functions.any(pure func(function):
+				match lowered_tail_join(function):
+					Some(matched):
+						matched.selection.nodes.any(pure func(node):
+							match node:
+								Lower.EnterArm(edge):
+									match edge.definitions:
+										[Lower.BorrowUnionField(projection, field, source)]:
+											match projection.value_type:
+												Concrete.IntType:
+													variant = Concrete.variant_field_variant(field)
+													(
+														match_arm_number(edge.arm) == 1
+														and Concrete.variant_number(variant) == 1
+														and Concrete.union_number(Concrete.variant_owner(variant)) == 1
+														and Lower.value_number(source) == Lower.value_number(matched.selection.scrutinee)
+													)
+												_: False
+										_: False
+								_: False
+						)
+					None: False
+			)
 
 pure func test_nested_expected_result_completes_every_concrete_instance() -> Bool:
 	source: String =
@@ -512,7 +443,12 @@ pure func test_nested_expected_result_completes_every_concrete_instance() -> Boo
 			match program.functions:
 				[_, expected, empty, box]:
 					match box.signature.parameters:
-						[parameter]: Concrete.same_type(expected.signature.return_type, box.signature.return_type) and Concrete.same_type(parameter, empty.signature.return_type) and program.unions.length() == 2
+						[parameter]:
+							(
+								Concrete.same_type(expected.signature.return_type, box.signature.return_type)
+								and Concrete.same_type(parameter, empty.signature.return_type)
+								and program.unions.length() == 2
+							)
 						_: False
 				_: False
 		Err(_): False

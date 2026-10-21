@@ -668,6 +668,75 @@ static void test_concat_empty(void) {
     assert_frees(right_id, 1);
 }
 
+static void test_suffix_mortal_string(void) {
+    struct blorp_string *text = blorp_int_to_string(INT64_C(42));
+    const size_t text_id = runtime_test_allocation_id(text);
+    struct blorp_l_0_s *root = blorp_list_repeat_0_s(text, INT64_C(3));
+    const size_t root_id = runtime_test_allocation_id(root);
+    blorp_list_dup_0_s(root);
+    struct blorp_l_0_s *tail = blorp_list_suffix_0_s(root, INT64_C(1));
+    const size_t tail_id = runtime_test_allocation_id(tail);
+    assert(root != tail && allocation_count == 3 && destruction_count == 0);
+    assert(root->length == 3 && tail->length == 2);
+    assert(tail->values[0] == text && tail->values[1] == text);
+    assert(atomic_load(&text->references) == 6);
+    blorp_list_drop_0_s(root);
+    assert_frees(root_id, 0);
+    assert(atomic_load(&text->references) == 6);
+    blorp_list_drop_0_s(root);
+    assert_frees(root_id, 1);
+    assert(atomic_load(&text->references) == 3);
+    blorp_string_release(text);
+    assert(atomic_load(&tail->values[0]->references) == 2);
+    assert_text(tail->values[1], "42", INT64_C(2));
+    blorp_list_drop_0_s(tail);
+    assert_frees(tail_id, 1);
+    assert_frees(text_id, 1);
+}
+
+static void test_suffix_empty(void) {
+    struct blorp_string *text = blorp_int_to_string(INT64_C(42));
+    const size_t text_id = runtime_test_allocation_id(text);
+    struct blorp_l_0_s *root = blorp_list_repeat_0_s(text, INT64_C(1));
+    const size_t root_id = runtime_test_allocation_id(root);
+    struct blorp_l_0_s *tail = blorp_list_suffix_0_s(root, INT64_C(1));
+    const size_t tail_id = runtime_test_allocation_id(tail);
+    assert(root != tail && tail->length == 0 && allocation_count == 3);
+    assert(atomic_load(&text->references) == 2);
+    blorp_list_drop_0_s(tail);
+    assert_frees(tail_id, 1);
+    assert(atomic_load(&text->references) == 2);
+    blorp_list_drop_0_s(root);
+    assert_frees(root_id, 1);
+    assert(atomic_load(&text->references) == 1);
+    blorp_string_release(text);
+    assert_frees(text_id, 1);
+}
+
+static void test_suffix_nested(void) {
+    struct blorp_string *text = blorp_int_to_string(INT64_C(42));
+    const size_t text_id = runtime_test_allocation_id(text);
+    struct blorp_l_0_s *child = blorp_list_repeat_0_s(text, INT64_C(1));
+    const size_t child_id = runtime_test_allocation_id(child);
+    struct blorp_l_1_s *root = blorp_list_repeat_1_s(child, INT64_C(2));
+    const size_t root_id = runtime_test_allocation_id(root);
+    struct blorp_l_1_s *tail = blorp_list_suffix_1_s(root, INT64_C(1));
+    const size_t tail_id = runtime_test_allocation_id(tail);
+    assert(root != tail && tail->length == 1 && tail->values[0] == child);
+    assert(allocation_count == 4 && atomic_load(&child->references) == 4);
+    blorp_list_drop_1_s(root);
+    assert_frees(root_id, 1);
+    assert(atomic_load(&child->references) == 2);
+    blorp_list_drop_0_s(child);
+    blorp_string_release(text);
+    assert(atomic_load(&tail->values[0]->references) == 1);
+    assert_text(tail->values[0]->values[0], "42", INT64_C(2));
+    blorp_list_drop_1_s(tail);
+    assert_frees(tail_id, 1);
+    assert_frees(child_id, 1);
+    assert_frees(text_id, 1);
+}
+
 int main(int argc, char **argv) {
     assert(argc == 2);
     if (strcmp(argv[1], "int_zero") == 0) test_int_zero();
@@ -703,6 +772,9 @@ int main(int argc, char **argv) {
     else if (strcmp(argv[1], "set_inline_record") == 0) test_set_inline_record();
     else if (strcmp(argv[1], "concat_entries") == 0) test_concat_entries();
     else if (strcmp(argv[1], "concat_empty") == 0) test_concat_empty();
+    else if (strcmp(argv[1], "suffix_mortal_string") == 0) test_suffix_mortal_string();
+    else if (strcmp(argv[1], "suffix_empty") == 0) test_suffix_empty();
+    else if (strcmp(argv[1], "suffix_nested") == 0) test_suffix_nested();
     else assert(0 && "unknown generic List runtime case");
     assert(allocation_count == destruction_count);
     return 0;

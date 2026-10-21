@@ -1,4 +1,6 @@
 import:
+	option: get_or
+	../utils/boolean: not, and, or
 	int as IntOps
 	../utils/names: NameTable, intern_names
 	../utils/source: compiler_source, SourceId
@@ -307,7 +309,7 @@ private fixed record CodeLine {
 
 
 private pure func within(value: Int, first: Int, last: Int) -> Bool:
-	IntOps.greater_than_or_equal(value, first) and IntOps.less_than_or_equal(value, last)
+	and(IntOps.greater_than_or_equal(value, first), IntOps.less_than_or_equal(value, last))
 
 
 private pure func in_class(code: Int, class: ByteClass) -> Bool:
@@ -317,13 +319,19 @@ private pure func in_class(code: Int, class: ByteClass) -> Bool:
 		TabByte:
 			IntOps.equals(code, ASCII_TAB)
 		IndentationByte:
-			IntOps.equals(code, ASCII_SPACE) or IntOps.equals(code, ASCII_TAB)
+			or(IntOps.equals(code, ASCII_SPACE), IntOps.equals(code, ASCII_TAB))
 		DecimalDigit:
 			within(code, ASCII_ZERO, ASCII_NINE)
 		IdentifierStart:
-			within(code, ASCII_LOWER_A, ASCII_LOWER_Z) or within(code, ASCII_UPPER_A, ASCII_UPPER_Z) or IntOps.equals(code, ASCII_UNDERSCORE)
+			or(
+				or(
+					within(code, ASCII_LOWER_A, ASCII_LOWER_Z),
+					within(code, ASCII_UPPER_A, ASCII_UPPER_Z),
+				),
+				IntOps.equals(code, ASCII_UNDERSCORE),
+			)
 		IdentifierByte:
-			in_class(code, IdentifierStart) or in_class(code, DecimalDigit)
+			or(in_class(code, IdentifierStart), in_class(code, DecimalDigit))
 
 
 -- Byte reads compare codes: a one-byte substring would allocate a String.
@@ -365,7 +373,7 @@ private pure func byte_error(text: SourceText, position: Int, error: ErrorText) 
 -- Layout tokens get spacing too; no syntax reads it there.
 private pure func token(text: SourceText, kind: TokenKind, start: Int, end: Int) -> Token:
 	previous = IntOps.subtract(start, 1)
-	spacing = if byte_in(text, previous, IndentationByte):
+	spacing: Spacing = if byte_in(text, previous, IndentationByte):
 		Spaced
 	else:
 		Adjacent
@@ -436,9 +444,13 @@ private pure func utf8_end(text: SourceText, start: Int, lead: Int) -> Result[In
 			match utf8_scalar(text, { start = start, cursor = IntOps.add(start, 1), end = end, scalar = payload }):
 				Ok(scalar):
 					if (
-						IntOps.less_than(scalar, form.minimum)
-						or IntOps.greater_than(scalar, UNICODE_MAX)
-						or within(scalar, UNICODE_SURROGATE_START, UNICODE_SURROGATE_END)
+						or(
+							or(
+								IntOps.less_than(scalar, form.minimum),
+								IntOps.greater_than(scalar, UNICODE_MAX),
+							),
+							within(scalar, UNICODE_SURROGATE_START, UNICODE_SURROGATE_END),
+						)
 					):
 						Err(error_at(text, start, end, invalid_utf8()))
 					else:
@@ -450,7 +462,7 @@ private pure func utf8_end(text: SourceText, start: Int, lead: Int) -> Result[In
 private pure func raw_character_end(text: SourceText, position: Int, byte: Int) -> Result[Int, Diagnostic]:
 	if IntOps.equals(byte, ASCII_LF):
 		Err(byte_error(text, position, string_line_break()))
-	else if IntOps.less_than(byte, ASCII_SPACE) or IntOps.equals(byte, ASCII_DEL):
+	else if or(IntOps.less_than(byte, ASCII_SPACE), IntOps.equals(byte, ASCII_DEL)):
 		Err(byte_error(text, position, raw_control_byte()))
 	else if IntOps.greater_than(byte, ASCII_DEL):
 		utf8_end(text, position, byte)
@@ -468,7 +480,7 @@ private pure func quoted_character_end(text: SourceText, start: Int, cursor: Int
 		None:
 			Err(error_at(text, start, cursor, unterminated_string()))
 		Some(byte):
-			if not IntOps.equals(byte, ASCII_BACKSLASH):
+			if IntOps.equals(byte, ASCII_BACKSLASH).not():
 				raw_character_end(text, cursor, byte)
 			else:
 				match StringOps.byte_at(text.bytes, escaped):
@@ -494,7 +506,9 @@ private pure func quoted_token(text: SourceText, start: Int) -> Result[Token, Di
 				break
 
 	closing ?= scan
-	contents = text.bytes.substring(contents_start, IntOps.subtract(closing, contents_start))
+	-- The successful scan starts after ASCII quote and ends at ASCII quote,
+	-- advancing only across complete UTF-8 scalars and escape pairs.
+	contents = StringOps.slice(text.bytes, contents_start, closing).get_or("")
 	Ok(token(text, QuotedString(contents), start, IntOps.add(closing, 1)))
 
 
@@ -513,11 +527,11 @@ private pure func char_content_end(text: SourceText, start: Int, cursor: Int) ->
 			else if IntOps.equals(byte, ASCII_SINGLE_QUOTE):
 				Err(error_at(text, start, escaped, char_width()))
 			else if IntOps.equals(byte, ASCII_BACKSLASH):
-				if IntOps.equals(escaped, text.bytes.length()) or byte_is(text, escaped, ASCII_LF):
+				if or(IntOps.equals(escaped, text.bytes.length()), byte_is(text, escaped, ASCII_LF)):
 					Err(error_at(text, start, escaped, unterminated_char()))
 				else:
 					Ok(IntOps.add(escaped, 1))
-			else if IntOps.less_than(byte, ASCII_SPACE) or IntOps.equals(byte, ASCII_DEL):
+			else if or(IntOps.less_than(byte, ASCII_SPACE), IntOps.equals(byte, ASCII_DEL)):
 				Err(byte_error(text, cursor, char_control_byte()))
 			else if IntOps.greater_than(byte, ASCII_DEL):
 				utf8_end(text, cursor, byte)
@@ -533,7 +547,7 @@ private pure func char_token(text: SourceText, start: Int) -> Result[Token, Diag
 
 	if byte_is(text, contents_end, ASCII_SINGLE_QUOTE):
 		Ok(token(text, CharLiteral, start, after))
-	else if IntOps.equals(contents_end, text.bytes.length()) or byte_is(text, contents_end, ASCII_LF):
+	else if or(IntOps.equals(contents_end, text.bytes.length()), byte_is(text, contents_end, ASCII_LF)):
 		Err(error_at(text, start, contents_end, unterminated_char()))
 	else:
 		Err(error_at(text, start, after, char_width()))
@@ -543,8 +557,9 @@ private pure func numeric_token_end(text: SourceText, start: Int, end: Int, is_f
 	if byte_in(text, end, IdentifierStart):
 		Err(error_at(text, start, run_end(text, end, IdentifierByte), numeric_suffix()))
 	else:
-		spelling = text.bytes.substring(start, IntOps.subtract(end, start))
-		kind = if is_float:
+		-- The numeric scan stays within its ASCII run, so neither end splits a scalar.
+		spelling = StringOps.slice(text.bytes, start, end).get_or("")
+		kind: TokenKind = if is_float:
 			FloatLiteral(spelling)
 		else:
 			IntegerLiteral(spelling)
@@ -558,7 +573,7 @@ private pure func name_follows(text: SourceText, position: Int) -> Bool:
 
 private pure func exponent_token(text: SourceText, start: Int, marker: Int) -> Result[Token, Diagnostic]:
 	sign = IntOps.add(marker, 1)
-	digits = if byte_is(text, sign, ASCII_PLUS) or byte_is(text, sign, ASCII_MINUS):
+	digits = if or(byte_is(text, sign, ASCII_PLUS), byte_is(text, sign, ASCII_MINUS)):
 		IntOps.add(sign, 1)
 	else:
 		sign
@@ -580,8 +595,8 @@ private pure func numeric_token(text: SourceText, start: Int) -> Result[Token, D
 	integer_end = run_end(text, digit_start, DecimalDigit)
 	after_dot = IntOps.add(integer_end, 1)
 	-- `0..n` is an integer and a range symbol, not a Float missing its fraction.
-	dotted = byte_is(text, integer_end, ASCII_DOT) and not byte_is(text, after_dot, ASCII_DOT)
-	fraction = dotted and byte_in(text, after_dot, DecimalDigit)
+	dotted = and(byte_is(text, integer_end, ASCII_DOT), byte_is(text, after_dot, ASCII_DOT).not())
+	fraction = and(dotted, byte_in(text, after_dot, DecimalDigit))
 	mantissa_end = if fraction:
 		run_end(text, after_dot, DecimalDigit)
 	else:
@@ -589,16 +604,25 @@ private pure func numeric_token(text: SourceText, start: Int) -> Result[Token, D
 
 	if IntOps.equals(integer_end, digit_start):
 		Err(byte_error(text, start, separated_minus()))
-	else if byte_is(text, mantissa_end, ASCII_LOWER_E) or byte_is(text, mantissa_end, ASCII_UPPER_E):
+	else if or(byte_is(text, mantissa_end, ASCII_LOWER_E), byte_is(text, mantissa_end, ASCII_UPPER_E)):
 		exponent_token(text, start, mantissa_end)
-	else if dotted and not fraction and not name_follows(text, after_dot):
-		Err(error_at(text, start, after_dot, missing_fraction()))
 	else:
-		numeric_token_end(text, start, mantissa_end, fraction)
+		missing_fraction_digits = match dotted:
+			True:
+				match fraction.not():
+					True: name_follows(text, after_dot).not()
+					False: False
+			False: False
+
+		if missing_fraction_digits:
+			Err(error_at(text, start, after_dot, missing_fraction()))
+		else:
+			numeric_token_end(text, start, mantissa_end, fraction)
 
 
--- Every word GRAMMAR 1.4 reserves is a keyword token and can never be a name,
--- including words of forms this compiler does not read. This is the sole map.
+-- Every reserved word stays a keyword token, including unsupported forms.
+-- This is the sole spelling map; the parser admits only and/or/not as callable
+-- names through their existing seeded IDs.
 -- The words the parser still recognises by seeded id (`fixed`, `methods_only`,
 -- `tail_recursive`, the base type names) are names in the host too, so they
 -- stay identifiers, as do `True`, `False` and `Self` in this compiler.
@@ -727,7 +751,8 @@ private pure func punctuation(byte: Int) -> Option[Symbol]:
 private pure func code_token(text: SourceText, cursor: Int) -> Result[ScannedToken, Diagnostic]:
 	if byte_in(text, cursor, IdentifierStart):
 		end = run_end(text, IntOps.add(cursor, 1), IdentifierByte)
-		spelling = text.bytes.substring(cursor, IntOps.subtract(end, cursor))
+		-- IdentifierByte accepts ASCII only; run_end cannot cross a scalar boundary.
+		spelling = StringOps.slice(text.bytes, cursor, end).get_or("")
 
 		match word_kind(spelling):
 			Some(kind):
@@ -749,17 +774,23 @@ private pure func literal_or_symbol(text: SourceText, cursor: Int) -> Result[Tok
 		quoted_token(text, cursor)
 	else if byte_is(text, cursor, ASCII_SINGLE_QUOTE):
 		char_token(text, cursor)
-	else if byte_is(text, cursor, ASCII_MINUS) and byte_is(text, next, ASCII_GREATER):
+	else if and(byte_is(text, cursor, ASCII_MINUS), byte_is(text, next, ASCII_GREATER)):
 		Ok(symbol(text, Arrow, cursor, IntOps.add(cursor, 2)))
-	else if byte_is(text, cursor, ASCII_DOT) and byte_is(text, next, ASCII_DOT) and byte_is(text, IntOps.add(cursor, 2), ASCII_DOT):
+	else if and(
+		and(
+			byte_is(text, cursor, ASCII_DOT),
+			byte_is(text, next, ASCII_DOT),
+		),
+		byte_is(text, IntOps.add(cursor, 2), ASCII_DOT),
+	):
 		Ok(symbol(text, Ellipsis, cursor, IntOps.add(cursor, 3)))
-	else if byte_is(text, cursor, ASCII_DOT) and byte_is(text, next, ASCII_DOT):
+	else if and(byte_is(text, cursor, ASCII_DOT), byte_is(text, next, ASCII_DOT)):
 		Ok(symbol(text, DotDot, cursor, IntOps.add(cursor, 2)))
-	else if byte_is(text, cursor, ASCII_QUESTION) and byte_is(text, next, ASCII_EQUALS):
+	else if and(byte_is(text, cursor, ASCII_QUESTION), byte_is(text, next, ASCII_EQUALS)):
 		Ok(symbol(text, QuestionEquals, cursor, IntOps.add(cursor, 2)))
 	else if byte_is(text, cursor, ASCII_PLUS):
 		Err(byte_error(text, cursor, plus_sign()))
-	else if byte_in(text, cursor, DecimalDigit) or byte_is(text, cursor, ASCII_MINUS):
+	else if or(byte_in(text, cursor, DecimalDigit), byte_is(text, cursor, ASCII_MINUS)):
 		numeric_token(text, cursor)
 	else if byte_is(text, cursor, ASCII_CR):
 		Err(byte_error(text, cursor, line_ending()))
@@ -783,10 +814,10 @@ private pure func literal_or_symbol(text: SourceText, cursor: Int) -> Result[Tok
 private pure func comment_end(text: SourceText, start: Int) -> Result[Int, Diagnostic]:
 	var end: Int = IntOps.add(start, 2)
 
-	while IntOps.less_than(end, text.bytes.length()) and comment_continues(text, end):
+	while and(IntOps.less_than(end, text.bytes.length()), comment_continues(text, end)):
 		end = IntOps.add(end, 1)
 
-	if IntOps.equals(end, text.bytes.length()) or byte_is(text, end, ASCII_LF):
+	if or(IntOps.equals(end, text.bytes.length()), byte_is(text, end, ASCII_LF)):
 		Ok(end)
 	else if byte_is(text, end, ASCII_CR):
 		Err(byte_error(text, end, line_ending()))
@@ -797,24 +828,34 @@ private pure func comment_end(text: SourceText, start: Int) -> Result[Int, Diagn
 private pure func comment_continues(text: SourceText, position: Int) -> Bool:
 	match StringOps.byte_at(text.bytes, position):
 		Some(code):
-			IntOps.less_than_or_equal(code, ASCII_DEL) and not IntOps.equals(code, ASCII_LF) and not IntOps.equals(code, ASCII_CR)
+			and(
+				and(
+					IntOps.less_than_or_equal(code, ASCII_DEL),
+					IntOps.equals(code, ASCII_LF).not(),
+				),
+				IntOps.equals(code, ASCII_CR).not(),
+			)
 		None:
 			False
 
 
 private pure func comment_starts(text: SourceText, cursor: Int) -> Bool:
-	byte_is(text, cursor, ASCII_MINUS) and byte_is(text, IntOps.add(cursor, 1), ASCII_MINUS)
+	and(byte_is(text, cursor, ASCII_MINUS), byte_is(text, IntOps.add(cursor, 1), ASCII_MINUS))
 
 
 -- Whether a fence line starts at `start`: DOC_FENCE, spaces, then LF or EOF.
 private pure func fence_at(text: SourceText, start: Int) -> Bool:
 	after_fence = IntOps.add(start, DOC_FENCE_WIDTH)
 	after_spaces = run_end(text, after_fence, SpaceByte)
-	(
-		byte_is(text, start, ASCII_MINUS)
-		and byte_is(text, IntOps.add(start, 1), ASCII_MINUS)
-		and byte_is(text, IntOps.add(start, 2), ASCII_MINUS)
-		and (IntOps.equals(after_spaces, text.bytes.length()) or byte_is(text, after_spaces, ASCII_LF))
+	and(
+		and(
+			and(
+				byte_is(text, start, ASCII_MINUS),
+				byte_is(text, IntOps.add(start, 1), ASCII_MINUS),
+			),
+			byte_is(text, IntOps.add(start, 2), ASCII_MINUS),
+		),
+		(or(IntOps.equals(after_spaces, text.bytes.length()), byte_is(text, after_spaces, ASCII_LF))),
 	)
 
 
@@ -823,7 +864,13 @@ private pure func fence_at(text: SourceText, start: Int) -> Bool:
 private pure func next_line_start(text: SourceText, start: Int) -> Result[Int, Diagnostic]:
 	var end: Int = start
 
-	while IntOps.less_than(end, text.bytes.length()) and not byte_is(text, end, ASCII_LF) and not byte_is(text, end, ASCII_CR):
+	while and(
+		and(
+			IntOps.less_than(end, text.bytes.length()),
+			byte_is(text, end, ASCII_LF).not(),
+		),
+		byte_is(text, end, ASCII_CR).not(),
+	):
 		end = IntOps.add(end, 1)
 
 	if byte_is(text, end, ASCII_CR):
@@ -841,7 +888,7 @@ private pure func doc_block_end(text: SourceText, fence: Int) -> Result[Int, Dia
 	while True:
 		match scan:
 			Ok(line):
-				if IntOps.equals(line, text.bytes.length()) or fence_at(text, line):
+				if or(IntOps.equals(line, text.bytes.length()), fence_at(text, line)):
 					break
 
 				scan = next_line_start(text, line)
@@ -872,7 +919,7 @@ private pure func indentation_level(text: SourceText, prefix: LinePrefix) -> Res
 
 	if IntOps.equals(run_end(text, prefix.start, TabByte), prefix.end):
 		Ok(width)
-	else if IntOps.equals(run_end(text, prefix.start, SpaceByte), prefix.end) and whole_groups:
+	else if and(IntOps.equals(run_end(text, prefix.start, SpaceByte), prefix.end), whole_groups):
 		Ok(IntOps.divide(width, SPACE_INDENT_WIDTH))
 	else:
 		Err(error_at(text, prefix.start, prefix.end, invalid_indentation()))
@@ -891,10 +938,16 @@ private pure func next_code_line(text: SourceText, start: Int) -> Result[CodeLin
 	while True:
 		match scan:
 			Ok(line):
-				if IntOps.equals(line.end, text.bytes.length()) or not (byte_is(text, line.end, ASCII_LF) or comment_starts(text, line.end)):
+				if or(
+					IntOps.equals(line.end, text.bytes.length()),
+					(or(byte_is(text, line.end, ASCII_LF), comment_starts(text, line.end))).not(),
+				):
 					break
 
-				scan = if IntOps.equals(line.start, line.end) and fence_at(text, line.end):
+				starts_doc_block = match IntOps.equals(line.start, line.end):
+					True: fence_at(text, line.end)
+					False: False
+				scan = if starts_doc_block:
 					match doc_block_end(text, line.end):
 						Ok(after_block):
 							Ok(line_prefix(text, after_block))
@@ -962,7 +1015,7 @@ private pure func pipe_line_end(text: SourceText, start: Int, form: PipeForm) ->
 
 						scan = match form:
 							PipeMarkers:
-								if IntOps.equals(byte, ASCII_DOLLAR) and byte_is(text, IntOps.add(cursor, 1), ASCII_LEFT_BRACE):
+								if and(IntOps.equals(byte, ASCII_DOLLAR), byte_is(text, IntOps.add(cursor, 1), ASCII_LEFT_BRACE)):
 									Err(error_at(text, cursor, IntOps.add(cursor, 2), pipe_interpolation()))
 								else:
 									pipe_byte_end(text, cursor, byte)
@@ -981,7 +1034,7 @@ private pure func same_indentation(text: SourceText, first: LinePrefix, line_sta
 	var offset: Int = 0
 	var same: Bool = True
 
-	while same and IntOps.less_than(offset, IntOps.subtract(first.end, first.start)):
+	while and(same, IntOps.less_than(offset, IntOps.subtract(first.end, first.start))):
 		same = match StringOps.byte_at(text.bytes, IntOps.add(first.start, offset)):
 			Some(expected):
 				byte_is(text, IntOps.add(line_start, offset), expected)
@@ -999,7 +1052,14 @@ private pure func continuing_marker(text: SourceText, line_end: Int, first: Line
 	line_start = IntOps.add(line_end, 1)
 	marker = IntOps.add(line_start, IntOps.subtract(first.end, first.start))
 
-	if byte_is(text, line_end, ASCII_LF) and same_indentation(text, first, line_start) and byte_is(text, marker, ASCII_BAR):
+	continues_block = match byte_is(text, line_end, ASCII_LF):
+		True:
+			match same_indentation(text, first, line_start):
+				True: byte_is(text, marker, ASCII_BAR)
+				False: False
+		False: False
+
+	if continues_block:
 		Some(marker)
 	else:
 		None
@@ -1022,7 +1082,10 @@ private pure func pipe_block(text: SourceText, first: LinePrefix, form: PipeForm
 					Err(error):
 						lines = Err(error)
 					Ok(line_end):
-						value = Text.concat(value, text.bytes.substring(text_start, IntOps.subtract(line_end, text_start)))
+						-- A successful line scan starts after ASCII marker and consumes whole
+						-- scalars through LF or source end; both endpoints are in bounds.
+						line_text = StringOps.slice(text.bytes, text_start, line_end).get_or("")
+						value = Text.concat(value, line_text)
 						end = line_end
 
 						match continuing_marker(text, line_end, first):
@@ -1050,13 +1113,19 @@ private pure func raw_block_marker_line(text: SourceText, start: Int) -> Option[
 	line_end = run_end(text, word_end, SpaceByte)
 	marker_line = line_prefix(text, IntOps.add(line_end, 1))
 	is_raw_word = (
-		IntOps.equals(word_end, IntOps.add(start, RAW_WORD_WIDTH))
-		and byte_is(text, start, ASCII_LOWER_R)
-		and byte_is(text, IntOps.add(start, 1), ASCII_LOWER_A)
-		and byte_is(text, IntOps.add(start, 2), ASCII_LOWER_W)
+		and(
+			and(
+				and(
+					IntOps.equals(word_end, IntOps.add(start, RAW_WORD_WIDTH)),
+					byte_is(text, start, ASCII_LOWER_R),
+				),
+				byte_is(text, IntOps.add(start, 1), ASCII_LOWER_A),
+			),
+			byte_is(text, IntOps.add(start, 2), ASCII_LOWER_W),
+		)
 	)
 
-	if is_raw_word and byte_is(text, line_end, ASCII_LF) and byte_is(text, marker_line.end, ASCII_BAR):
+	if and(and(is_raw_word, byte_is(text, line_end, ASCII_LF)), byte_is(text, marker_line.end, ASCII_BAR)):
 		Some(marker_line)
 	else:
 		None
@@ -1106,18 +1175,18 @@ private pure func insignificant_break(brackets: Int, bodies: List[BracketedBlock
 		None:
 			True
 		Some(block):
-			not IntOps.equals(brackets, block.group)
+			IntOps.equals(brackets, block.group).not()
 
 
 -- Host 2.2 `opens_block(depth)`: a `:` ending a line inside brackets opens
 -- a bracketed block, unless one is already open at this depth or deeper.
 private pure func opens_bracketed_block(brackets: Int, last_colon: Bool, bodies: List[BracketedBlock]) -> Bool:
-	open_deeper = match innermost_block(bodies):
+	open_deeper: Bool = match innermost_block(bodies):
 		None:
 			True
 		Some(block):
 			IntOps.greater_than(brackets, block.group)
-	last_colon and open_deeper
+	and(last_colon, open_deeper)
 
 
 -- Host 2.3 DEDENT-TO: a line dedented to `level` closes every bracketed
@@ -1151,9 +1220,16 @@ private pure func closes_bracketed_block(bodies: List[BracketedBlock], brackets:
 		None:
 			None
 		Some(block):
-			between = IntOps.less_than(block.base, level) and IntOps.less_than(level, top_level(levels))
+			between = and(IntOps.less_than(block.base, level), IntOps.less_than(level, top_level(levels)))
 
-			if IntOps.equals(brackets, block.group) and between and not levels.contains(level):
+			closes_between_levels = match IntOps.equals(brackets, block.group):
+				True:
+					match between:
+						True: levels.contains(level).not()
+						False: False
+				False: False
+
+			if closes_between_levels:
 				Some(block.base)
 			else:
 				None
@@ -1223,7 +1299,7 @@ pure func lex(origin: SourceId, source: String, names: NameTable) -> Result[Lexe
 						tokens = tokens.append(ReadyToken(symbol(text, Dedent, line.prefix.start, line.prefix.end)))
 						levels = levels.take(IntOps.subtract(levels.length(), 1))
 
-					if not IntOps.equals(top_level(levels), target):
+					if IntOps.equals(top_level(levels), target).not():
 						lines = Err(error_at(text, line.prefix.start, line.prefix.end, inconsistent_indentation()))
 						break
 
@@ -1253,7 +1329,7 @@ pure func lex(origin: SourceId, source: String, names: NameTable) -> Result[Lexe
 							-- A LF ends the code line at depth zero, when it opens a
 							-- bracketed block, or when it is inside the one open at
 							-- this depth; any other LF inside brackets is trivia.
-							line_ends = if not byte_is(text, cursor, ASCII_LF):
+							line_ends: Bool = if byte_is(text, cursor, ASCII_LF).not():
 								False
 							else if IntOps.equals(brackets, 0):
 								True
@@ -1261,7 +1337,7 @@ pure func lex(origin: SourceId, source: String, names: NameTable) -> Result[Lexe
 								bodies = bodies.append({ group = brackets, base = top_level(levels) })
 								True
 							else:
-								not insignificant_break(brackets, bodies)
+								insignificant_break(brackets, bodies).not()
 
 							if line_ends:
 								break
@@ -1272,7 +1348,11 @@ pure func lex(origin: SourceId, source: String, names: NameTable) -> Result[Lexe
 								-- a pipe String as on any line.
 								continued = line_prefix(text, IntOps.add(cursor, 1))
 
-								if IntOps.equals(continued.start, continued.end) and fence_at(text, continued.end):
+								bracketed_doc_block = match IntOps.equals(continued.start, continued.end):
+									True: fence_at(text, continued.end)
+									False: False
+
+								if bracketed_doc_block:
 									Err(error_at(text, continued.end, IntOps.add(continued.end, DOC_FENCE_WIDTH), doc_block_in_brackets()))
 								else:
 									match line_code(text, continued):
@@ -1345,7 +1425,7 @@ pure func lex(origin: SourceId, source: String, names: NameTable) -> Result[Lexe
 
 				word_position = IntOps.add(word_position, 1)
 
-	minted ?= match missing:
+	minted: Void ?= match missing:
 		Some(error):
 			Err(error)
 		None:

@@ -1,0 +1,87 @@
+import:
+	../../../src/lower/lower as Lower
+	../../../src/specialize/specialize as Concrete
+	../../../src/utils/syntax: Diagnostic
+	../input: checked_source
+	test: TestSuite
+
+
+private APPLY: String =
+	|pure func apply[A, B](callback: pure (A) -> B, value: A) -> B:
+	|    callback(value)
+	|
+
+
+private pure func lowered(source: String) -> Result[Lower.LoweredFunctions, Diagnostic]:
+	checked ?= checked_source(source)
+	concrete ?= Concrete.specialize(checked)
+	program ?= Lower.lower(concrete)
+	Ok(Lower.lowered_functions(program))
+
+
+pure func test_middle_environment_parameter_uses_abi_order_and_preserves_data_reads() -> Bool:
+	source: String =
+		|pure func middle(left: Int, callback: pure (Int) -> String, right: Int) -> String:
+		|    callback(right)
+		|pure func keep(prefix: String) -> String:
+		|    middle(11, pure func(_: Int) -> String: prefix, 31)
+		|func main() -> Int:
+		|    selected = keep("saved")
+		|    0
+		|
+	match lowered(source):
+		Err(_): False
+		Ok(contents):
+			contents.functions.any(pure func(function):
+				match (function.signature.parameters, function.steps):
+					([Concrete.IntType, Concrete.RecordType(_), Concrete.IntType], [Lower.Define(left), Lower.Define(environment), Lower.Define(right), Lower.Define(invocation)]):
+						match (left.operation, environment.operation, right.operation, invocation.operation):
+							(Lower.ParameterValue(0), Lower.ParameterValue(1), Lower.ParameterValue(2), Lower.CallValue(_, [env, item])):
+								(
+									Lower.value_number(left.id) == 0 and Lower.value_number(environment.id) == 1
+										and Lower.value_number(right.id) == 2 and Lower.value_number(env) == 1
+										and Lower.value_number(item) == 2 and Lower.value_number(function.result) == Lower.value_number(invocation.id)
+								)
+							_: False
+					_: False
+			)
+
+
+pure func test_lambda_environment_after_a_local_binding_still_comes_first_in_the_abi() -> Bool:
+	source: String =
+		|pure func keep(prefix: String) -> String:
+		|    apply(pure func(_: Int) -> String:
+		|        saved = prefix
+		|        saved
+		|    , 0)
+		|func main() -> Int:
+		|    selected = keep("saved")
+		|    0
+		|
+	match lowered(APPLY + source):
+		Err(_): False
+		Ok(contents):
+			contents.functions.any(pure func(function):
+				match (function.signature.parameters, function.steps):
+					([Concrete.RecordType(owner), Concrete.IntType], [Lower.Define(environment), Lower.Define(item), Lower.Define(projection)]):
+						match (environment.operation, item.operation, projection.operation):
+							(Lower.ParameterValue(0), Lower.ParameterValue(1), Lower.ReadRecordFieldValue(field, source)):
+								(
+									Lower.value_number(environment.id) == 0 and Lower.value_number(item.id) == 1
+										and Lower.value_number(source) == 0 and Concrete.field_number(field) == 0
+										and Concrete.record_number(Concrete.field_owner(field)) == Concrete.record_number(owner)
+										and Concrete.same_type(projection.value_type, Concrete.StringType)
+										and Lower.value_number(function.result) == Lower.value_number(projection.id)
+								)
+							_: False
+					_: False
+			)
+
+
+tests: TestSuite = {
+	description = "Capture environments lower through ordinary parameter and field operations",
+	tests = [
+		("middle callback environment preserves ABI order and data reads", test_middle_environment_parameter_uses_abi_order_and_preserves_data_reads),
+		("lambda environment after locals still comes first in ABI", test_lambda_environment_after_a_local_binding_still_comes_first_in_the_abi),
+	]
+}

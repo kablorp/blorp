@@ -1,0 +1,603 @@
+import:
+	../../../src/check/check: check_errors, checked_functions
+	../../../src/check/model as Checked
+	../../../src/utils/ids as Declaration
+	../../../src/check/render: render_check_error, render_failure
+	../../../src/utils/source: module_source, root_module_id, same_source, source_module, module_number
+	../../../src/utils/syntax: Diagnostic, entry_function, same_span
+	../input: check, singleton_check_error
+	../module_input: parse_modules, INTEGER_OPERATIONS
+	test: TestSuite
+
+
+private APPLY: String =
+	|import:
+	|    int as IntOps
+	|pure func apply[T, U](f: pure (T) -> U, value: T) -> U:
+	|    f(value)
+	|
+
+
+private BLOCK_MAIN: String =
+	|func main() -> Int:
+	|    apply(pure func(number: Int) -> Int:
+	|        incremented = IntOps.add(number, 1)
+	|        IntOps.add(incremented, 1)
+	|    , 7)
+	|
+
+
+private pure func accepts(source: String) -> Bool:
+	match parse_modules([{ source = source, targets = [1] }, { source = INTEGER_OPERATIONS, targets = [] }]):
+		Err(_): False
+		Ok(program): check(program).is_ok()
+
+
+private pure func rejects(prefix: String, marked: String, suffix: String, message: String, help: String) -> Bool:
+	match parse_modules([{ source = prefix + marked + suffix, targets = [1] }, { source = INTEGER_OPERATIONS, targets = [] }]):
+		Err(_): False
+		Ok(program):
+			match check(program):
+				Ok(_): False
+				Err(failure):
+					match singleton_check_error(check_errors(failure)):
+						None: False
+						Some(error):
+							diagnostic = render_check_error(program, error)
+							(
+								same_source(error.span.source, module_source(root_module_id()))
+								and error.span.start == prefix.length() and error.span.end == prefix.length() + marked.length()
+								and same_source(diagnostic.span.source, error.span.source)
+								and diagnostic.span.start == error.span.start and diagnostic.span.end == error.span.end
+								and diagnostic.message == message and diagnostic.help == help and diagnostic.note.is_none()
+							)
+
+
+pure func test_inline_input_is_solved_by_later_data_argument() -> Bool:
+	body: String =
+		|func main() -> Int:
+		|    apply(pure func(number): IntOps.add(number, 1), 7)
+		|
+	accepts(APPLY + body)
+
+
+pure func test_result_context_solves_the_only_lambda_input() -> Bool:
+	source: String =
+		|import:
+		|    int as IntOps
+		|pure func use[T](callback: pure (T) -> T) -> List[T]:
+		|    []
+		|func main() -> Int:
+		|    items: List[Int] = use(pure func(value): value)
+		|    0
+		|
+	accepts(source)
+
+
+
+pure func test_nested_unresolved_input_precedes_a_later_written_sibling() -> Bool:
+	declarations: String =
+		|import:
+		|    int as IntOps
+		|pure func ignore[U](f: pure (U) -> Int) -> Int:
+		|    0
+		|pure func both[T](first: pure (Int) -> Int, second: pure (T) -> Int) -> Int:
+		|    0
+		|func main() -> Int:
+		|
+	rejects(
+		declarations + "    both(pure func(_: Int): ignore(", "pure func(inner): 0", "), pure func(later): 0)\n",
+		"cannot infer this lambda's input types", "annotate its parameters or supply a typed ordinary argument",
+	)
+
+
+pure func test_typed_inline_callback_changes_the_result_type() -> Bool:
+	body: String =
+		|pure func describe() -> String:
+		|    apply(pure func(number: Int) -> String: IntOps.to_string(number), 7)
+		|func main() -> Int:
+		|    description = describe()
+		|    0
+		|
+	accepts(APPLY + body)
+
+
+pure func test_annotated_block_callback_checks_local_statements() -> Bool:
+	accepts(APPLY + BLOCK_MAIN)
+
+
+pure func test_block_callback_before_data_has_accepted_layout() -> Bool:
+	parse_modules([{ source = APPLY + BLOCK_MAIN, targets = [1] }, { source = INTEGER_OPERATIONS, targets = [] }]).is_ok()
+
+
+pure func test_inline_callback_after_data_uses_the_same_generic_contract() -> Bool:
+	source: String =
+		|import:
+		|    int as IntOps
+		|pure func apply[T, U](value: T, f: pure (T) -> U) -> U:
+		|    f(value)
+		|func main() -> Int:
+		|    apply(7, pure func(number): IntOps.add(number, 1))
+		|
+	accepts(source)
+
+
+pure func test_pure_lambda_in_impure_root_rejects_an_impure_call() -> Bool:
+	declarations: String =
+		|func effect() -> Int:
+		|    1
+		|func main() -> Int:
+		|
+	rejects(
+		APPLY + declarations + "    apply(pure func(_: Int) -> Int: ", "effect", "(), 7)\n",
+		"pure functions cannot call impure functions",
+		"mark the callee pure or remove pure from the caller",
+	)
+
+
+pure func test_outer_mutable_assignment_is_a_capture_before_its_rhs() -> Bool:
+	declarations: String =
+		|func main() -> Int:
+		|    var counter = 0
+		|
+	rejects(
+		APPLY + declarations + "    apply(pure func(_: Int) -> Int:\n        ", "counter", " = missing\n        1\n    , 7)\n",
+		"lambda cannot assign to an outer binding", "mutate a lambda-local variable or return the updated value explicitly",
+	)
+
+
+
+pure func test_impure_named_callback_still_rejects() -> Bool:
+	declarations: String =
+		|func effect(number: Int) -> Int:
+		|    number
+		|func main() -> Int:
+		|
+	rejects(
+		APPLY + declarations + "    apply(", "effect", ", 7)\n",
+		"pure callback requires a pure function",
+		"pass a pure named function; impure functions cannot satisfy a pure callable parameter",
+	)
+
+
+pure func test_callable_return_placement_precedes_unknown_child_lookup() -> Bool:
+	rejects(
+		APPLY + "func make() -> ", "pure (Missing) -> Absent", ":\n    0\nfunc main() -> Int:\n    0\n",
+		"callable types are only supported as function parameters",
+		"write pure function types only on function parameters; use ordinary data types inside them",
+	)
+
+
+private pure func nominal_lambda_facts(checked: Checked.CheckedFunctions) -> Bool:
+	match (checked.records, checked.functions, checked.lambdas):
+		([declaration], [_, main], [lambda]):
+			match (lambda.parameters, lambda.return_type.value_type, lambda.body):
+				([input], Checked.RecordType(result), Checked.CheckedValueBody(Checked.ReturnExpression(value))):
+					match (value.value_type, value.form):
+						(Checked.RecordType(expression), Checked.ConstructRecord(owner, [field])):
+							match field.value.form:
+								Checked.ReadBinding(local):
+									(
+										Declaration.function_number(lambda.root) == Declaration.function_number(main.id)
+										and Checked.same_type(input.value_type, Checked.IntType)
+										and Declaration.record_number(result) == Declaration.record_number(declaration.id)
+										and Declaration.record_number(expression) == Declaration.record_number(declaration.id)
+										and Declaration.record_number(owner) == Declaration.record_number(declaration.id)
+										and Declaration.record_number(Checked.field_owner(field.field)) == Declaration.record_number(declaration.id)
+										and Checked.field_number(field.field) == 0 and Checked.binding_number(local) == 0
+										and Checked.same_type(field.value.value_type, Checked.IntType)
+										and lambda.bindings.length() == 1
+									)
+								_: False
+						_: False
+				_: False
+		_: False
+
+
+private func report_nominal_diagnostic(diagnostic: Diagnostic) -> Void:
+	source_label = match source_module(diagnostic.span.source):
+		Some(module): "module ".append_int(module_number(module))
+		None: "compiler"
+	print("  message: " + diagnostic.message)
+	print("  help: " + diagnostic.help)
+	print(("  span: " + source_label + " [").append_int(diagnostic.span.start)
+		+ ", ".append_int(diagnostic.span.end) + ")")
+
+
+func test_explicit_nominal_lambda_result_supplies_record_context() -> Bool:
+	source: String =
+		|fixed record Token { value: Int }
+		|pure func apply[T, U](callback: pure (T) -> U, value: T) -> U:
+		|    callback(value)
+		|func main() -> Int:
+		|    token = apply(pure func(item: Int) -> Token: { value = item }, 7)
+		|    0
+		|
+	match parse_modules([{ source = source, targets = [] }]):
+		Err(diagnostic):
+			report_nominal_diagnostic(diagnostic)
+			False
+		Ok(parsed):
+			match check(parsed):
+				Err(failure):
+					rendered = render_failure(failure)
+					report_nominal_diagnostic(rendered.first)
+					for diagnostic in rendered.remaining:
+						report_nominal_diagnostic(diagnostic)
+					False
+				Ok(program): nominal_lambda_facts(checked_functions(program))
+
+
+pure func test_lambda_rejects_missing_parameter() -> Bool:
+	rejects(
+		APPLY + "func main() -> Int:\n    apply(", "pure func(): 0", ", 7)\n",
+		"lambda has the wrong number of parameters", "write 1 parameters for this callback",
+	)
+
+
+pure func test_lambda_rejects_extra_parameter() -> Bool:
+	rejects(
+		APPLY + "func main() -> Int:\n    apply(", "pure func(first: Int, second: Int): first", ", 7)\n",
+		"lambda has the wrong number of parameters", "write 1 parameters for this callback",
+	)
+
+
+pure func test_block_lambda_needs_unknown_result() -> Bool:
+	rejects(
+		APPLY + "func main() -> Int:\n    saved = apply(",
+		"pure func(item: Int):\n        item", "\n    , 7)\n    0\n",
+		"block lambda needs a complete result type",
+		"write a return annotation or give the callback a complete result context",
+	)
+
+
+pure func test_block_lambda_needs_complete_option_result() -> Bool:
+	declarations: String =
+		|pure func wrap[T](callback: pure (Int) -> Option[T], value: Int) -> Option[T]:
+		|    callback(value)
+		|func main() -> Int:
+		|
+	rejects(
+		APPLY + declarations + "    saved = wrap(",
+		"pure func(item: Int):\n        Some(item)", "\n    , 7)\n    0\n",
+		"block lambda needs a complete result type",
+		"write a return annotation or give the callback a complete result context",
+	)
+
+
+pure func test_block_lambda_needs_complete_result_result() -> Bool:
+	declarations: String =
+		|pure func wrap[T](callback: pure (Int) -> Result[Int, T], value: Int) -> Result[Int, T]:
+		|    callback(value)
+		|func main() -> Int:
+		|
+	rejects(
+		APPLY + declarations + "    saved = wrap(",
+		"pure func(item: Int):\n        Ok(item)", "\n    , 7)\n    0\n",
+		"block lambda needs a complete result type",
+		"write a return annotation or give the callback a complete result context",
+	)
+
+
+pure func test_immutable_outer_read_is_accepted() -> Bool:
+	accepts(APPLY + "func main() -> Int:\n    original = 7\n    apply(pure func(item: Int): original, 7)\n")
+
+
+pure func test_mutable_outer_read_is_rejected() -> Bool:
+	rejects(
+		APPLY + "func main() -> Int:\n    var original = 7\n    apply(pure func(item: Int): ",
+		"original", ", 7)\n",
+		"lambda cannot capture a mutable binding", "copy its current value to an immutable binding before capturing it",
+	)
+
+
+pure func test_outer_callable_use_is_rejected() -> Bool:
+	declarations: String =
+		|pure func route(callback: pure (Int) -> Int, value: Int) -> Int:
+		|
+	rejects(
+		APPLY + declarations + "    apply(pure func(item: Int) -> Int: ",
+		"callback", "(item), value)\nfunc main() -> Int:\n    0\n",
+		"lambda cannot capture a callable parameter", "pass the data and callback explicitly to a declared helper",
+	)
+
+
+pure func test_deferred_nested_and_sibling_sites_keep_reserved_ids() -> Bool:
+	source: String =
+		|pure func both[A, B](left: pure (A) -> B, right: pure (Int) -> Int, value: A) -> B:
+		|    left(value)
+		|func main() -> Int:
+		|    saved = both(pure func(first): apply(pure func(inner: Int): inner, first), pure func(sibling: Int): sibling, 7)
+		|    0
+		|
+	match parse_modules([{ source = APPLY + source, targets = [1] }, { source = INTEGER_OPERATIONS, targets = [] }]):
+		Err(_): False
+		Ok(parsed):
+			match check(parsed):
+				Err(_): False
+				Ok(program):
+					checked = checked_functions(program)
+					match (checked.functions.get(Declaration.function_number(entry_function(checked.entrypoint))), checked.lambdas):
+						(Some(main), [outer, sibling, inner]):
+							match (main.statements, outer.body, sibling.body, inner.body):
+								([Checked.InitializeBinding(_, call)], Checked.CheckedValueBody(Checked.ReturnExpression(nested)), Checked.CheckedValueBody(Checked.ReturnExpression(sibling_value)), Checked.CheckedValueBody(Checked.ReturnExpression(inner_value))):
+									match (call.form, nested.form, sibling_value.form, inner_value.form):
+										(Checked.InvokeFunction(main_call, [_]), Checked.InvokeFunction(outer_call, [argument]), Checked.ReadBinding(sibling_local), Checked.ReadBinding(inner_local)):
+											match (main_call.target, outer_call.target, argument.form):
+												(Checked.UserFunction(_, _, [first, second]), Checked.UserFunction(_, _, [third]), Checked.ReadBinding(outer_local)):
+													match (first.choice, second.choice, third.choice):
+														(Checked.LambdaCallable(first_id, []), Checked.LambdaCallable(second_id, []), Checked.LambdaCallable(third_id, [])):
+															(
+																Checked.lambda_number(first_id) == 0 and Checked.lambda_number(second_id) == 1
+																and Checked.lambda_number(third_id) == 2
+																and Checked.binding_number(outer_local) == 0 and Checked.binding_number(sibling_local) == 0
+																and Checked.binding_number(inner_local) == 0
+																and [outer, sibling, inner].all(pure func(lambda):
+																	(
+																		Declaration.function_number(lambda.root) == Declaration.function_number(main.id)
+																		and lambda.bindings.length() == 1 and lambda.parameters.length() == 1
+																		and lambda.parameters.all(pure func(parameter): Checked.same_type(parameter.value_type, Checked.IntType))
+																		and Checked.same_type(lambda.return_type.value_type, Checked.IntType)
+																	)
+																)
+															)
+														_: False
+												_: False
+										_: False
+								_: False
+						_: False
+
+
+pure func test_complete_callback_bool_context_admits_block() -> Bool:
+	source: String =
+		|pure func judge(callback: pure (Int) -> Bool, value: Int) -> Bool:
+		|    callback(value)
+		|func main() -> Int:
+		|    selected = judge(pure func(item: Int):
+		|        seen = item
+		|        True
+		|    , 7)
+		|    0
+		|
+	accepts(APPLY + source)
+
+
+pure func test_complete_caller_bool_context_admits_block() -> Bool:
+	source: String =
+		|func main() -> Int:
+		|    selected: Bool = apply(pure func(item: Int):
+		|        truth: Bool = True
+		|        truth
+		|    , 7)
+		|    0
+		|
+	accepts(APPLY + source)
+
+
+pure func test_written_bool_lambda_annotation_admits_block() -> Bool:
+	source: String =
+		|func main() -> Int:
+		|    selected = apply(pure func(item: Int) -> Bool:
+		|        var truth: Bool = False
+		|        truth = True
+		|        truth
+		|    , 7)
+		|    0
+		|
+	accepts(APPLY + source)
+
+
+pure func test_written_result_lambda_annotation_supplies_complete_context() -> Bool:
+	source: String =
+		|pure func wrap[T](callback: pure (Int) -> Result[Int, T], value: Int) -> Result[Int, T]:
+		|    callback(value)
+		|func main() -> Int:
+		|    saved = wrap(pure func(item: Int) -> Result[Int, String]:
+		|        copied = item
+		|        Ok(copied)
+		|    , 7)
+		|    0
+		|
+	accepts(APPLY + source)
+
+
+pure func test_block_without_final_result_rejects() -> Bool:
+	rejects(
+		APPLY + "func main() -> Int:\n    apply(pure func(item: Int) -> Int:\n        ",
+		"unused = item", "\n    , 7)\n",
+		"expression does not match the expected type", "use an expression of type Int here",
+	)
+
+
+-- These sites cross every source-loop expression boundary. The third lambda
+-- owns a loop even while its enclosing declaration is checking a loop body.
+private LOOP_SITES: String =
+	|func main() -> Int:
+	|    flag: Bool = True
+	|    while match flag:
+	|        True: apply(pure func(item: Int) -> Bool: False, 1)
+	|        False: False
+	|    :
+	|        if apply(pure func(item: Int) -> Bool: True, 2):
+	|            chosen = apply(pure func(item: Int) -> Int:
+	|                var again: Bool = True
+	|                var cursor = item
+	|                while again:
+	|                    cursor = IntOps.add(cursor, 1)
+	|                    again = False
+	|                cursor
+	|            , 7)
+	|
+
+
+private pure func lambda_choice(value: Checked.CheckedExpr) -> Option[Int]:
+	match value.form:
+		Checked.InvokeFunction(call, _):
+			match call.target:
+				Checked.UserFunction(_, _, [argument]):
+					match argument.choice:
+						Checked.LambdaCallable(id, []): Some(Checked.lambda_number(id))
+						_: None
+				_: None
+		_: None
+
+
+private pure func loop_sites_facts() -> Option[Bool]:
+	parsed ?= parse_modules([{ source = APPLY + LOOP_SITES + "    0\n", targets = [1] }, { source = INTEGER_OPERATIONS, targets = [] }]).to_option()
+	accepted ?= check(parsed).to_option()
+	contents = checked_functions(accepted)
+	main ?= contents.functions.get(Declaration.function_number(entry_function(contents.entrypoint)))
+	match (main.statements, contents.lambdas):
+		([Checked.InitializeBinding(_, _), Checked.RunWhile(loop)], [condition, branch, child]):
+			match (loop.condition.form, loop.body, child.statements):
+				(Checked.Match(matched), [Checked.DiscardExpression(selected)], [Checked.InitializeBinding(_, _), Checked.InitializeBinding(_, _), Checked.RunWhile(inner)]):
+					match selected.form:
+						Checked.Match(join):
+							match (matched.arms.get(0), join.arms.get(0)):
+								(Some(condition_arm), Some(then_arm)):
+									match then_arm.statements:
+										[Checked.InitializeBinding(_, call)]:
+											Some(lambda_choice(condition_arm.value) == Some(0)
+												and lambda_choice(join.scrutinee) == Some(1) and lambda_choice(call) == Some(2)
+												and inner.carried.map(Checked.binding_number) == [1, 2]
+												and child.bindings.length() == 3 and child.parameters.length() == 1
+												and [condition, branch, child].all(pure func(row):
+													Declaration.function_number(row.root) == Declaration.function_number(main.id)
+												))
+										_: None
+								_: None
+						_: None
+				_: None
+		_: None
+
+
+pure func test_loop_boundaries_preserve_lambda_rows_and_local_loop_scope() -> Bool:
+	loop_sites_facts().get_or(False)
+
+
+private pure func parent_loop_after_lambda() -> Option[Bool]:
+	prefix = APPLY + LOOP_SITES + "        "
+	nested = "while False:\n            unused = 0"
+	control_prefix = prefix + nested + "\n        "
+	source = control_prefix + "continue\n    0\n"
+	parsed ?= parse_modules([{ source = source, targets = [1] }, { source = INTEGER_OPERATIONS, targets = [] }]).to_option()
+	accepted ?= check(parsed).to_option()
+	contents = checked_functions(accepted)
+	main ?= contents.functions.get(Declaration.function_number(entry_function(contents.entrypoint)))
+	outer_start ?= source.index_of("while match flag:")
+	match (main.statements, contents.lambdas):
+		([Checked.InitializeBinding(_, _), Checked.RunWhile(outer)], [condition, branch, child]):
+			match outer.body:
+				[Checked.DiscardExpression(selected), Checked.RunWhile(inner), Checked.ContinueSourceLoop(span)]:
+					condition_id ?= match outer.condition.form:
+						Checked.Match(join): join.arms.get(0).and_then(pure func(arm): lambda_choice(arm.value))
+						_: None
+					branch_id ?= match selected.form:
+						Checked.Match(join): lambda_choice(join.scrutinee)
+						_: None
+					child_id ?= match selected.form:
+						Checked.Match(join):
+							match join.arms.get(0).map(pure func(arm): arm.statements):
+								Some([Checked.InitializeBinding(_, call)]): lambda_choice(call)
+								_: None
+						_: None
+					child_loop ?= match child.statements:
+						[Checked.InitializeBinding(_, _), Checked.InitializeBinding(_, _), Checked.RunWhile(loop)]: Some(loop)
+						_: None
+					Some(condition_id == 0 and branch_id == 1 and child_id == 2
+						and child.bindings.length() == 3 and child.parameters.length() == 1
+						and child_loop.carried.map(Checked.binding_number) == [1, 2]
+						and outer.carried.is_empty() and inner.carried.is_empty()
+						and inner.body.length() == 1
+						and same_span(inner.span, { source = module_source(root_module_id()), start = prefix.length(), end = prefix.length() + nested.length() })
+						and same_span(span, { source = module_source(root_module_id()), start = control_prefix.length(), end = control_prefix.length() + "continue".length() })
+						and same_span(outer.span, { source = module_source(root_module_id()), start = outer_start, end = span.end })
+						and [condition, branch, child].all(pure func(row):
+							Declaration.function_number(row.root) == Declaration.function_number(main.id)
+						))
+				_: None
+		_: None
+
+
+pure func test_lambda_completion_restores_the_parent_loop_scope() -> Bool:
+	parent_loop_after_lambda().get_or(False)
+
+
+pure func test_result_rhs_and_suffix_keep_distinct_root_owned_lambda_rows() -> Bool:
+	source: String =
+		|pure func wrap[T](value: T) -> Result[T, String]:
+		|    Ok(value)
+		|pure func route[T](value: T) -> Result[T, String]:
+		|    item ?= wrap(apply(pure func(first: T) -> T: first, value))
+		|    Ok(apply(pure func(second: T) -> T: second, item))
+		|func main() -> Int:
+		|    saved = route(7)
+		|    0
+		|
+	match parse_modules([{ source = APPLY + source, targets = [1] }, { source = INTEGER_OPERATIONS, targets = [] }]).map(check):
+		Ok(Ok(program)):
+			contents = checked_functions(program)
+			match contents.lambdas:
+				[first, second]:
+					calls = contents.functions.get(Declaration.function_number(first.root)).map(Checked.function_calls).get_or([])
+					choices = calls.map(pure func(call):
+						match call.target:
+							Checked.UserFunction(_, _, [argument]):
+								match argument.choice:
+									Checked.LambdaCallable(id, []): Some(Checked.lambda_number(id))
+									_: None
+							_: None
+					)
+					(
+						choices == [Some(0), None, Some(1)]
+							and Declaration.function_number(first.root) == Declaration.function_number(second.root)
+							and [first, second].all(pure func(row):
+								match row.parameters:
+									[parameter]:
+										match parameter.value_type:
+											Checked.ParameterType(id):
+												match Checked.parameter_owner(id):
+													Checked.FunctionDeclaration(owner): Declaration.function_number(owner) == Declaration.function_number(row.root)
+													_: False
+											_: False
+									_: False
+							)
+					)
+				_: False
+		_: False
+
+
+tests: TestSuite = {
+	description = "Noncapturing pure callbacks use ordinary generic calls",
+	tests = [
+		("loop boundaries retain lambda IDs and lambda-local scope", test_loop_boundaries_preserve_lambda_rows_and_local_loop_scope),
+		("lambda completion restores the enclosing loop scope", test_lambda_completion_restores_the_parent_loop_scope),
+		("Result RHS and suffix retain root-owned lambda rows", test_result_rhs_and_suffix_keep_distinct_root_owned_lambda_rows),
+		("annotated block cannot return only a statement", test_block_without_final_result_rejects),
+		("written Result lambda annotation completes partial context", test_written_result_lambda_annotation_supplies_complete_context),
+		("written Bool lambda result admits a mutable local block", test_written_bool_lambda_annotation_admits_block),
+		("caller Bool annotation solves generic block result", test_complete_caller_bool_context_admits_block),
+		("complete callable Bool result admits a block", test_complete_callback_bool_context_admits_block),
+		("nested completion preserves reserved sibling lambda IDs", test_deferred_nested_and_sibling_sites_keep_reserved_ids),
+		("noncapture rejects an enclosing callable parameter", test_outer_callable_use_is_rejected),
+		("noncapture rejects a mutable outer read", test_mutable_outer_read_is_rejected),
+		("immutable outer read is captured by value", test_immutable_outer_read_is_accepted),
+		("block lambda rejects partial Result context", test_block_lambda_needs_complete_result_result),
+		("block lambda rejects partial Option result context", test_block_lambda_needs_complete_option_result),
+		("block lambda cannot infer an unknown result from its body", test_block_lambda_needs_unknown_result),
+		("lambda arity rejects an extra parameter", test_lambda_rejects_extra_parameter),
+		("lambda arity rejects a missing parameter", test_lambda_rejects_missing_parameter),
+		("inline input is solved by later data argument", test_inline_input_is_solved_by_later_data_argument),
+		("result context solves the only lambda input", test_result_context_solves_the_only_lambda_input),
+		("nested unresolved input precedes a later written sibling", test_nested_unresolved_input_precedes_a_later_written_sibling),
+		("typed inline callback changes the result type", test_typed_inline_callback_changes_the_result_type),
+		("annotated block callback checks local statements", test_annotated_block_callback_checks_local_statements),
+		("block callback before data has accepted layout", test_block_callback_before_data_has_accepted_layout),
+		("inline callback after data uses the same generic contract", test_inline_callback_after_data_uses_the_same_generic_contract),
+		("pure lambda in impure root rejects an impure call", test_pure_lambda_in_impure_root_rejects_an_impure_call),
+		("outer mutable assignment is a capture before its RHS", test_outer_mutable_assignment_is_a_capture_before_its_rhs),
+		("impure named callback still rejects", test_impure_named_callback_still_rejects),
+		("callable return placement precedes unknown child lookup", test_callable_return_placement_precedes_unknown_child_lookup),
+		("explicit nominal lambda result supplies record context", test_explicit_nominal_lambda_result_supplies_record_context),
+	]
+}

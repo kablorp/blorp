@@ -1,0 +1,186 @@
+import:
+	../../../src/lower/lower as Lower
+	../../../src/specialize/specialize as Concrete
+	../../../src/utils/syntax: entry_function
+	../source_while_inputs as Input
+	test: TestSuite
+
+
+private pure func entry(source: String) -> Option[Lower.LoweredFunction]:
+	program ?= Input.lowered(source).to_option()
+	contents = Lower.lowered_functions(program)
+	contents.functions.get(Concrete.function_number(entry_function(contents.entrypoint)))
+
+
+private pure func one_loop(function: Lower.LoweredFunction) -> Option[Lower.LoweredLoop]:
+	var found: Option[Lower.LoweredLoop] = None
+	var count = 0
+	for step in function.steps:
+		match step:
+			Lower.Loop(loop):
+				found = Some(loop)
+				count = count + 1
+			_: void
+	if count == 1:
+		found
+	else:
+		None
+
+
+private pure func joining(step: Lower.LoweredStep) -> Option[Lower.LoweredJoin]:
+	match step:
+		Lower.Join(join): Some(join)
+		_: None
+
+
+private pure func definition(step: Lower.LoweredStep) -> Option[Lower.ValueDefinition]:
+	match step:
+		Lower.Define(value): Some(value)
+		_: None
+
+
+private pure func branches(loop: Lower.LoweredLoop) -> Option[Lower.LoopMatch]:
+	match loop.body.tail:
+		Lower.MatchLoop(branch): Some(branch)
+		Lower.ExitLoop(_): None
+
+
+private pure func recurrence(tail: Lower.LoopTail) -> Option[List[Lower.ValueId]]:
+	match tail:
+		Lower.ExitLoop(Lower.Recur(values, _)): Some(values)
+		_: None
+
+
+private pure func breaking(tail: Lower.LoopTail) -> Option[Lower.LoopOutputs]:
+	match tail:
+		Lower.ExitLoop(Lower.Break(outputs)): Some(outputs)
+		_: None
+
+
+private pure func swap_facts() -> Option[Bool]:
+	function ?= entry(Input.HEADER_SWAP)
+	loop ?= one_loop(function)
+	first ?= loop.headers.get(0)
+	second ?= loop.headers.get(1)
+	again ?= loop.headers.get(2)
+	branch ?= branches(loop)
+	arm ?= branch.arms.get(0)
+	values ?= recurrence(arm.body.tail)
+	first_next ?= values.get(0)
+	second_next ?= values.get(1)
+	Some(values.length() == 3 and loop.headers.length() == 3 and loop.carried.length() == 3
+		and Lower.value_number(first_next) == Lower.value_number(second.parameter.id)
+		and Lower.value_number(second_next) == Lower.value_number(first.parameter.id)
+		and Lower.value_number(branch.selection.scrutinee) == Lower.value_number(again.parameter.id)
+		and Lower.value_number(first.initial) != Lower.value_number(first.parameter.id)
+		and Lower.value_number(second.initial) != Lower.value_number(second.parameter.id)
+		and Concrete.same_type(loop.result.value_type, Concrete.VoidType))
+
+
+pure func test_header_swap_reads_fresh_immutable_snapshots() -> Bool:
+	swap_facts().get_or(False)
+
+
+private pure func parent_interval_facts() -> Option[Bool]:
+	previous: String =
+		|    first
+		|
+	replacement: String =
+		|    after = 17
+		|    first
+		|
+	source = Input.HEADER_SWAP.replace(previous, replacement)
+	function ?= entry(source)
+	loop ?= one_loop(function)
+	after_step ?= function.steps.get(4)
+	after ?= definition(after_step)
+	first ?= loop.headers.get(0)
+	last_output ?= loop.carried.get(2)
+	Some(Lower.value_number(loop.result.id) < Lower.value_number(after.id)
+		and Lower.value_number(last_output.id) < Lower.value_number(after.id)
+		and Lower.value_number(after.id) < Lower.value_number(first.parameter.id)
+		and function.steps.length() == 5 and loop.headers.length() == 3)
+
+
+pure func test_entire_parent_interval_precedes_loop_local_ids() -> Bool:
+	parent_interval_facts().get_or(False)
+
+
+private pure func final_false_facts() -> Option[Bool]:
+	function ?= entry(Input.CONDITION_WRITES)
+	loop ?= one_loop(function)
+	condition_step ?= loop.body.steps.get(1)
+	condition ?= joining(condition_step)
+	condition_output ?= condition.carried.get(0)
+	branch ?= branches(loop)
+	false_arm ?= branch.arms.get(1)
+	outputs ?= breaking(false_arm.body.tail)
+	carried ?= outputs.carried.get(0)
+	void_step ?= loop.body.steps.get(0)
+	void_value ?= definition(void_step)
+	match void_value.operation:
+		Lower.VoidValue:
+			Some(Lower.value_number(carried) == Lower.value_number(condition_output.id)
+				and Lower.value_number(outputs.value) == Lower.value_number(void_value.id)
+				and Lower.value_number(branch.selection.scrutinee) == Lower.value_number(condition.result.id)
+				and loop.headers.length() == 1 and outputs.carried.length() == 1
+				and loop.body.steps.length() == 2 and false_arm.body.steps.is_empty())
+		_: None
+
+
+pure func test_final_false_edge_keeps_condition_match_write() -> Bool:
+	final_false_facts().get_or(False)
+
+
+private pure func nested_if_facts() -> Option[Bool]:
+	source = Input.CONDITION_WRITES.replace("    while match flag:", "    if match flag:")
+	function ?= entry(source)
+	inner_step ?= function.steps.get(2)
+	outer_step ?= function.steps.get(3)
+	inner ?= joining(inner_step)
+	outer ?= joining(outer_step)
+	inner_carrier ?= inner.carried.get(0)
+	false_arm ?= outer.arms.get(1)
+	false_yield ?= match false_arm.exit:
+		Lower.Yield(outputs): Some(outputs)
+		Lower.TransferLoop(_, _): None
+	false_carrier ?= false_yield.carried.get(0)
+	Some(Lower.value_number(outer.selection.scrutinee) == Lower.value_number(inner.result.id)
+		and Lower.value_number(false_carrier) == Lower.value_number(inner_carrier.id)
+		and false_arm.steps.length() == 1 and outer.carried.length() == 1)
+
+
+pure func test_statement_if_uses_nested_condition_continuation_map() -> Bool:
+	nested_if_facts().get_or(False)
+
+
+private pure func zero_header_facts() -> Option[Bool]:
+	source: String =
+		|func main() -> Int:
+		|    while False:
+		|        void
+		|    0
+		|
+	function ?= entry(source)
+	loop ?= one_loop(function)
+	branch ?= branches(loop)
+	false_arm ?= branch.arms.get(1)
+	outputs ?= breaking(false_arm.body.tail)
+	Some(loop.headers.is_empty() and loop.carried.is_empty()
+		and outputs.carried.is_empty() and loop.reads.is_empty())
+
+
+pure func test_zero_header_loop_needs_no_fabricated_carrier() -> Bool:
+	zero_header_facts().get_or(False)
+
+
+tests: TestSuite = {
+	description = "Blorp 2 source while lowering",
+	tests = [
+		("headers swap from fresh immutable snapshots", test_header_swap_reads_fresh_immutable_snapshots),
+		("whole parent interval precedes loop locals", test_entire_parent_interval_precedes_loop_local_ids),
+		("final False edge keeps condition match writes", test_final_false_edge_keeps_condition_match_write),
+		("statement if consumes nested condition map", test_statement_if_uses_nested_condition_continuation_map),
+		("zero H needs no fabricated carrier", test_zero_header_loop_needs_no_fabricated_carrier),
+	]
+}

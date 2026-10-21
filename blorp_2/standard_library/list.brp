@@ -152,3 +152,221 @@ private pure func filter_range[T](
                         IntOps.subtract(count, left_count),
                     )
                     concat(left_values, right_values)
+
+pure func get_or[T](values: List[T], index: Int, default: T) -> T:
+    match get(values, index):
+        Some(value): value
+        None: default
+
+pure func is_empty[T](values: List[T]) -> Bool:
+    IntOps.equals(length(values), 0)
+
+pure func last[T](values: List[T]) -> Option[T]:
+    get(values, IntOps.subtract(length(values), 1))
+
+-- Temporary O(n log n) copied slots and O(log n) stack; no COW fast path.
+-- Replace after an efficient builder is accepted and measured.
+-- Private callers establish 0 <= start <= end <= length(values).
+private pure func copy_range[T](values: List[T], start: Int, end: Int) -> List[T]:
+    match IntOps.equals(start, end):
+        True: []
+        False:
+            match IntOps.equals(IntOps.subtract(end, start), 1):
+                True:
+                    match get(values, start):
+                        Some(value): [value]
+                        None: []
+                False:
+                    middle = IntOps.add(start, IntOps.divide(IntOps.subtract(end, start), 2))
+                    concat(copy_range(values, start, middle), copy_range(values, middle, end))
+
+pure func take[T](values: List[T], count: Int) -> List[T]:
+    copy_range(values, 0, IntOps.min(IntOps.max(count, 0), length(values)))
+
+pure func remove[T](values: List[T], index: Int) -> Option[List[T]]:
+    match IntOps.less_than(index, 0):
+        True: None
+        False:
+            size = length(values)
+            match IntOps.less_than(index, size):
+                False: None
+                True:
+                    Some(concat(copy_range(values, 0, index), copy_range(values, IntOps.add(index, 1), size)))
+
+pure func drop[T](values: List[T], count: Int) -> List[T]:
+    copy_range(values, IntOps.min(IntOps.max(count, 0), length(values)), length(values))
+
+private pure func reverse_range[T](values: List[T], start: Int, end: Int) -> List[T]:
+    match IntOps.less_than(IntOps.subtract(end, start), 2):
+        True: copy_range(values, start, end)
+        False:
+            middle = IntOps.add(start, IntOps.divide(IntOps.subtract(end, start), 2))
+            concat(reverse_range(values, middle, end), reverse_range(values, start, middle))
+
+pure func reverse[T](values: List[T]) -> List[T]:
+    reverse_range(values, 0, length(values))
+
+pure func find[T](values: List[T], predicate: pure (T) -> Bool) -> Option[T]:
+    find_range(values, predicate, 0, length(values))
+
+private pure func find_range[T](
+    values: List[T],
+    predicate: pure (T) -> Bool,
+    start: Int,
+    count: Int,
+) -> Option[T]:
+    match IntOps.equals(count, 0):
+        True: None
+        False:
+            match IntOps.equals(count, 1):
+                True:
+                    match get(values, start):
+                        Some(value):
+                            match predicate(value):
+                                True: Some(value)
+                                False: None
+                        None: None
+                False:
+                    left_count = IntOps.divide(count, 2)
+                    match find_range(values, predicate, start, left_count):
+                        Some(value): Some(value)
+                        None:
+                            find_range(
+                                values, predicate, IntOps.add(start, left_count),
+                                IntOps.subtract(count, left_count),
+                            )
+
+pure func all[T](values: List[T], predicate: pure (T) -> Bool) -> Bool:
+    all_range(values, predicate, 0, length(values))
+
+private pure func all_range[T](
+    values: List[T],
+    predicate: pure (T) -> Bool,
+    start: Int,
+    count: Int,
+) -> Bool:
+    match IntOps.equals(count, 0):
+        True: True
+        False:
+            match IntOps.equals(count, 1):
+                True:
+                    match get(values, start):
+                        Some(value): predicate(value)
+                        None: True
+                False:
+                    left_count = IntOps.divide(count, 2)
+                    match all_range(values, predicate, start, left_count):
+                        True:
+                            all_range(
+                                values, predicate, IntOps.add(start, left_count),
+                                IntOps.subtract(count, left_count),
+                            )
+                        False: False
+
+-- Balanced immutable merging copies O(n * log(n + 1)^2) slots in the worst case;
+-- it is not a linear builder or COW merge, and keys may be evaluated repeatedly.
+private fixed record MergedPrefix[T] {
+    values: List[T],
+    left_position: Int,
+    right_position: Int
+}
+
+private pure func merge_first[T](
+    left: List[T],
+    right: List[T],
+    left_position: Int,
+    right_position: Int,
+    key: pure (T) -> Int,
+) -> MergedPrefix[T]:
+    match get(left, left_position):
+        Some(left_value):
+            match get(right, right_position):
+                Some(right_value):
+                    left_key = key(left_value)
+                    right_key = key(right_value)
+                    match IntOps.less_than(right_key, left_key):
+                        True: {
+                            values = [right_value],
+                            left_position = left_position,
+                            right_position = IntOps.add(right_position, 1)
+                        }
+                        False: {
+                            values = [left_value],
+                            left_position = IntOps.add(left_position, 1),
+                            right_position = right_position
+                        }
+                None: {
+                    values = [left_value],
+                    left_position = IntOps.add(left_position, 1),
+                    right_position = right_position
+                }
+        None:
+            match get(right, right_position):
+                Some(right_value): {
+                    values = [right_value],
+                    left_position = left_position,
+                    right_position = IntOps.add(right_position, 1)
+                }
+                None: {
+                    values = [],
+                    left_position = left_position,
+                    right_position = right_position
+                }
+
+-- Count is a nonnegative prefix of the still-unread child ranges. The first
+-- result owns the updated positions used by the second; no cursor is shared.
+private pure func merge_prefix[T](
+    left: List[T],
+    right: List[T],
+    left_position: Int,
+    right_position: Int,
+    count: Int,
+    key: pure (T) -> Int,
+) -> MergedPrefix[T]:
+    match IntOps.equals(count, 0):
+        True: {
+            values = [],
+            left_position = left_position,
+            right_position = right_position
+        }
+        False:
+            match IntOps.equals(count, 1):
+                True: merge_first(left, right, left_position, right_position, key)
+                False:
+                    first_count = IntOps.divide(count, 2)
+                    first = merge_prefix(left, right, left_position, right_position, first_count, key)
+                    second = merge_prefix(left, right, first.left_position, first.right_position, IntOps.subtract(count, first_count), key)
+                    {
+                        values = concat(first.values, second.values),
+                        left_position = second.left_position,
+                        right_position = second.right_position
+                    }
+
+private pure func sort_range[T](
+    values: List[T],
+    start: Int,
+    count: Int,
+    key: pure (T) -> Int,
+) -> List[T]:
+    match IntOps.equals(count, 0):
+        True: []
+        False:
+            match IntOps.equals(count, 1):
+                True:
+                    match get(values, start):
+                        Some(value): [value]
+                        None: []
+                False:
+                    left_count = IntOps.divide(count, 2)
+                    left = sort_range(values, start, left_count, key)
+                    right = sort_range(values, IntOps.add(start, left_count), IntOps.subtract(count, left_count), key)
+                    merged = merge_prefix(left, right, 0, 0, count, key)
+                    merged.values
+
+-- Stable ascending sort. Equal keys keep input order; key is pure and may run
+-- more than once per element. Int is the temporary bootstrap key restriction;
+-- eventual generic K:Orderable requires accepted generic ordering, not a shim.
+pure func sort_by[T](values: List[T], key: pure (T) -> Int) -> List[T]:
+    match IntOps.less_than(length(values), 2):
+        True: values
+        False: sort_range(values, 0, length(values), key)

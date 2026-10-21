@@ -1,0 +1,400 @@
+name: Blorp 2 initial seed
+
+# One-time reference-A production. The first real B2 pin must replace that
+# step with the pinned B2 resolver and remove the initial-publication guard.
+on:
+  push:
+    tags: ['blorp2-seed-*']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: blorp2-initial-seed
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            target: aarch64-apple-darwin
+            instructions: required
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            instructions: disabled
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            instructions: disabled
+    env:
+      BLORP_CC: clang
+      LC_ALL: C
+      SEED_TARGET: ${{ matrix.target }}
+      BLORP_2_INSTRUCTION_CHECK: ${{ matrix.instructions }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          ref: ${{ github.ref }}
+          persist-credentials: false
+
+      - name: Validate initial source and native target
+        id: source
+        shell: bash
+        env:
+          SEED_TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          source_sha=$(git rev-parse HEAD)
+          if [[ ! "$SEED_TAG" =~ ^blorp2-seed-[0-9a-f]{12}$ ]] ||
+             [ "$SEED_TAG" != "blorp2-seed-${source_sha:0:12}" ]; then
+            echo "Seed tag must identify the checked-out source commit." >&2
+            exit 1
+          fi
+          test -z "$(git status --porcelain)"
+          test "$(scripts/target-triple)" = "$SEED_TARGET"
+          if [ -e blorp_2/bootstrap.env ]; then
+            echo "A B2 pin exists: replace initial reference-A production with the B2 resolver." >&2
+            exit 1
+          fi
+          echo "sha=$source_sha" >> "$GITHUB_OUTPUT"
+          mkdir -p build/blorp2-seed/provenance
+          printf '%s\n' "$source_sha" > build/blorp2-seed/provenance/source-commit.txt
+
+      - name: Install Linux host dependencies
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y clang libssl-dev pkg-config binutils
+
+      - name: Build the legacy TestSuite host
+        env:
+          BLORP_BUILD_COMMIT: ${{ steps.source.outputs.sha }}
+          BLORP_BUILD_TARGET: ${{ matrix.target }}
+          BLORP_BUILD_CHANNEL: ci
+          BLORP_BUILD_DIRTY: 'false'
+        shell: bash
+        run: |
+          set -euo pipefail
+          make > build/blorp2-seed/provenance/host-build.log 2>&1
+          bin/blorp --version > build/blorp2-seed/provenance/host-version.txt
+          shasum -a 256 bin/blorp > build/blorp2-seed/provenance/host.sha256
+          cp blorp/build/bootstrap.env build/blorp2-seed/provenance/legacy-bootstrap.env
+
+      - name: Build reference A (initial seed only)
+        shell: bash
+        run: |
+          set -euo pipefail
+          work=build/blorp2-seed
+          # Deliberate initial provenance, never a missing-manifest fallback.
+          bin/blorp compile --no-format blorp_2/src/main.brp -o "$work/reference-a.c" \
+            > "$work/provenance/reference-a.stdout" 2> "$work/provenance/reference-a.stderr"
+          clang -O0 -DBLORP_MEMORY_DIAGNOSTICS=0 "$work/reference-a.c" \
+            -o "$work/reference-a" -lm -lpthread > "$work/provenance/reference-a-link.log" 2>&1
+          shasum -a 256 "$work/reference-a.c" "$work/reference-a" > "$work/provenance/reference-a.sha256"
+
+      - name: A emits B and B reproduces its compiler C
+        shell: bash
+        run: |
+          set -euo pipefail
+          work=build/blorp2-seed
+          env -u BLORP_LEAK_CHECK -u BLORP_MEMORY_STATS "$work/reference-a" \
+            --library-root blorp_2/standard_library blorp_2/src/main.brp "$work/compiler.c" \
+            > "$work/provenance/a-emits.stdout" 2> "$work/provenance/a-emits.stderr"
+          test ! -s "$work/provenance/a-emits.stdout"
+          test ! -s "$work/provenance/a-emits.stderr"
+          # The approved initial cost debt applies only to this compiler C.
+          approved_compiler_c_sha256=3d0def0d00f6c6ec003923d7acb2f8854fa506a6cf6b7c04611322a47b7b7f8b
+          actual_compiler_c_sha256=$(shasum -a 256 "$work/compiler.c" | cut -d ' ' -f 1)
+          test "$actual_compiler_c_sha256" = "$approved_compiler_c_sha256"
+          printf '%s\n' "$approved_compiler_c_sha256" > "$work/provenance/approved-initial-compiler-c.sha256"
+          clang -O0 -DBLORP_MEMORY_DIAGNOSTICS=0 "$work/compiler.c" \
+            -o "$work/compiler-b" -lm -lpthread > "$work/provenance/b-normal-link.log" 2>&1
+          test ! -s "$work/provenance/b-normal-link.log"
+          clang -O0 -DBLORP_MEMORY_DIAGNOSTICS=1 "$work/compiler.c" \
+            -o "$work/compiler-b-diagnostic" -lm -lpthread > "$work/provenance/b-diagnostic-link.log" 2>&1
+          test ! -s "$work/provenance/b-diagnostic-link.log"
+          clang -O0 -DBLORP_MEMORY_DIAGNOSTICS=1 -fsanitize=address,undefined \
+            -fno-sanitize-recover=all "$work/compiler.c" -o "$work/compiler-b-sanitized" \
+            -lm -lpthread > "$work/provenance/b-sanitized-link.log" 2>&1
+          test ! -s "$work/provenance/b-sanitized-link.log"
+          env -u BLORP_LEAK_CHECK -u BLORP_MEMORY_STATS "$work/compiler-b" \
+            --library-root blorp_2/standard_library blorp_2/src/main.brp "$work/reproduced.c" \
+            > "$work/provenance/b-emits.stdout" 2> "$work/provenance/b-emits.stderr"
+          test ! -s "$work/provenance/b-emits.stdout"
+          test ! -s "$work/provenance/b-emits.stderr"
+          cmp "$work/compiler.c" "$work/reproduced.c"
+          shasum -a 256 "$work/compiler.c" "$work/reproduced.c" "$work/compiler-b" \
+            "$work/compiler-b-diagnostic" "$work/compiler-b-sanitized" > "$work/provenance/b.sha256"
+
+      - name: Every maintained fixture under A and B
+        shell: bash
+        run: |
+          set -euo pipefail
+          work=build/blorp2-seed
+          parity=$work/provenance/fixture-parity
+          fixture_root=blorp_2/test/e2e/fixtures
+          mkdir -p "$parity"
+          find "$fixture_root" -name '*.brp' | LC_ALL=C sort > "$parity/fixtures.txt"
+          test -s "$parity/fixtures.txt"
+          count=0
+          accepted=0
+          rejected=0
+          while IFS= read -r fixture; do
+            shasum -a 256 "$fixture" >> "$parity/fixtures.sha256"
+            relative=${fixture#"$fixture_root"/}
+            for stage in a b; do
+              case "$stage" in a) compiler=$work/reference-a ;; b) compiler=$work/compiler-b ;; esac
+              out=$parity/$stage/$relative
+              mkdir -p "$(dirname "$out")"
+              status=0
+              env -u BLORP_LEAK_CHECK -u BLORP_MEMORY_STATS "$compiler" \
+                --library-root blorp_2/standard_library "$fixture" "$out.c" \
+                < /dev/null > "$out.stdout" 2> "$out.stderr" || status=$?
+              printf '%s\n' "$status" > "$out.exit"
+              shasum -a 256 "$out.exit" "$out.stdout" "$out.stderr" > "$out.sha256"
+              if [ -e "$out.c" ]; then shasum -a 256 "$out.c" >> "$out.sha256"; fi
+              case "$status" in
+                0)
+                  test -s "$out.c"
+                  test ! -s "$out.stdout"
+                  test ! -s "$out.stderr" ;;
+                1)
+                  test ! -e "$out.c"
+                  test ! -s "$out.stdout"
+                  test -s "$out.stderr" ;;
+                *) echo "Invalid compiler exit $status for $stage on $fixture" >&2; exit 1 ;;
+              esac
+            done
+            out_a=$parity/a/$relative
+            out_b=$parity/b/$relative
+            for part in exit stdout stderr; do cmp "$out_a.$part" "$out_b.$part"; done
+            if [ -e "$out_a.c" ] || [ -e "$out_b.c" ]; then
+              test -e "$out_a.c" && test -e "$out_b.c"
+              cmp "$out_a.c" "$out_b.c"
+            fi
+            count=$((count + 1))
+            if [ "$(cat "$out_a.exit")" = 0 ]; then accepted=$((accepted + 1)); else rejected=$((rejected + 1)); fi
+          done < "$parity/fixtures.txt"
+          test "$count" -eq "$(wc -l < "$parity/fixtures.txt" | tr -d ' ')"
+          printf 'identical=%s\naccepted=%s\nrejected=%s\n' "$count" "$accepted" "$rejected" > "$parity/counts.txt"
+
+      - name: Strict compiler accounting and ordinary B main smoke
+        shell: bash
+        run: |
+          set -euo pipefail
+          work=build/blorp2-seed
+          env -u BLORP_MEMORY_STATS BLORP_LEAK_CHECK=strict "$work/compiler-b-sanitized" \
+            --library-root blorp_2/standard_library blorp_2/src/main.brp "$work/accounted.c" \
+            > "$work/provenance/b-accounted.stdout" 2> "$work/provenance/b-accounted.stderr"
+          test ! -s "$work/provenance/b-accounted.stdout"
+          report=$(cat "$work/provenance/b-accounted.stderr")
+          if [[ ! "$report" =~ ^blorp:\ leak\ check:\ ([0-9]+)\ allocs,\ ([0-9]+)\ releases,\ 0\ leaked,\ 0\ bytes$ ]] ||
+             [ "${BASH_REMATCH[1]:-0}" != "${BASH_REMATCH[2]:-}" ] ||
+             [ "${BASH_REMATCH[1]:-0}" -le 0 ]; then
+            echo "Expected one positive balanced strict compiler report." >&2
+            exit 1
+          fi
+          printf '%s\n' "$report" > "$work/provenance/expected-accounting.txt"
+          cmp "$work/provenance/expected-accounting.txt" "$work/provenance/b-accounted.stderr"
+          cmp "$work/compiler.c" "$work/accounted.c"
+          env -u BLORP_LEAK_CHECK -u BLORP_MEMORY_STATS "$work/compiler-b" \
+            --library-root blorp_2/standard_library blorp_2/test/e2e/fixtures/return/zero.brp "$work/smoke.c" \
+            > "$work/provenance/smoke-compile.stdout" 2> "$work/provenance/smoke-compile.stderr"
+          test ! -s "$work/provenance/smoke-compile.stdout"
+          test ! -s "$work/provenance/smoke-compile.stderr"
+          clang -std=c11 -Wall -Wextra -Werror -pedantic -O0 -fsanitize=address,undefined \
+            -fno-sanitize-recover=all -DBLORP_MEMORY_DIAGNOSTICS=1 "$work/smoke.c" \
+            -o "$work/smoke" -lm > "$work/provenance/smoke-link.log" 2>&1
+          env -u BLORP_MEMORY_STATS BLORP_LEAK_CHECK=strict "$work/smoke" \
+            > "$work/provenance/smoke.stdout" 2> "$work/provenance/smoke.stderr"
+          test ! -s "$work/provenance/smoke.stdout"
+          printf 'blorp: leak check: 0 allocs, 0 releases, 0 leaked, 0 bytes\n' > "$work/provenance/smoke-expected.stderr"
+          cmp "$work/provenance/smoke-expected.stderr" "$work/provenance/smoke.stderr"
+
+      - name: Maintained components and B diagnostic native suites
+        shell: bash
+        run: |
+          set -euo pipefail
+          work=build/blorp2-seed
+          bin/blorp test --suite --timeout 180 \
+            blorp_2/test/unit blorp_2/test/runtime blorp_2/test/test_grammar \
+            > "$work/provenance/components.log" 2>&1
+          BLORP2_COMPILER="$PWD/$work/compiler-b-diagnostic" \
+            BLORP_2_RESOURCE_POLICY=record-initial-bootstrap-debt \
+            bin/blorp test --suite --timeout 0 blorp_2/test/e2e \
+            > "$work/provenance/native.log" 2>&1
+          # Typed test policy records original resource FAILs after ordinary
+          # oracles; every remaining nonzero suite result blocks publication.
+
+      - name: Record source, platform and toolchain provenance
+        shell: bash
+        run: |
+          set -euo pipefail
+          work=build/blorp2-seed
+          qualified_input_status=$(git status --porcelain -- blorp_2/src blorp_2/test blorp_2/standard_library standard_library/src .github/workflows/blorp2-seed.yml blorp/build/bootstrap.env)
+          test -z "$qualified_input_status"
+          for tree in blorp_2/src blorp_2/standard_library standard_library/src; do
+            inventory=${tree//\//-}
+            git ls-files -z -- "$tree" | while IFS= read -r -d '' path; do
+              shasum -a 256 "$path"
+            done > "$work/provenance/$inventory.sha256"
+            test -s "$work/provenance/$inventory.sha256"
+          done
+          {
+            echo 'producer=initial-legacy-reference-a-then-self-built-b'
+            echo "target=$SEED_TARGET"
+            echo "instructions=$BLORP_2_INSTRUCTION_CHECK"
+            echo 'linux_instructions=unavailable-not-qualified'
+            echo 'compiler_c_flags=-O0'
+            echo 'normal_macro=BLORP_MEMORY_DIAGNOSTICS=0'
+            echo 'diagnostic_macro=BLORP_MEMORY_DIAGNOSTICS=1'
+            echo 'strict_compiler=compiler-b-sanitized'
+            echo 'strict_compiler_flags=-O0 -DBLORP_MEMORY_DIAGNOSTICS=1 -fsanitize=address,undefined -fno-sanitize-recover=all'
+            echo 'link_libraries=-lm -lpthread'
+            echo 'functional_qualification=PASS'
+            echo 'resource_qualification=FAIL-initial-bootstrap-debt'
+            echo 'resource_policy=record-initial-bootstrap-debt'
+            echo 'resource_limits=original-unchanged'
+            echo 'resource_results=native.log:BLORP2_RESOURCE_RESULT'
+            echo 'fixture_parity=fixture-parity/counts.txt'
+            echo 'b_link_diagnostics=empty-required'
+            echo "source=$(git rev-parse HEAD)"
+            echo "source_date=$(git show -s --format=%cI HEAD)"
+            uname -a
+          } > "$work/provenance/provenance.txt"
+          clang --version > "$work/provenance/clang-version.txt"
+          file "$work/compiler-b" > "$work/provenance/b-file.txt"
+          if [ "$RUNNER_OS" = macOS ]; then
+            test "$(lipo -archs "$work/compiler-b")" = arm64
+            sw_vers > "$work/provenance/os-version.txt"
+            xcodebuild -version > "$work/provenance/xcode-version.txt"
+            xcrun --show-sdk-version > "$work/provenance/sdk-version.txt"
+            otool -l "$work/compiler-b" > "$work/provenance/b-load-commands.txt"
+            otool -L "$work/compiler-b" > "$work/provenance/b-dependencies.txt"
+          else
+            readelf -h "$work/compiler-b" > "$work/provenance/b-elf-header.txt"
+            case "$SEED_TARGET" in
+              x86_64-unknown-linux-gnu) grep -Eq 'Machine:.*Advanced Micro Devices X86-64' "$work/provenance/b-elf-header.txt" ;;
+              aarch64-unknown-linux-gnu) grep -Eq 'Machine:.*AArch64' "$work/provenance/b-elf-header.txt" ;;
+              *) exit 1 ;;
+            esac
+            cat /etc/os-release > "$work/provenance/os-version.txt"
+            getconf GNU_LIBC_VERSION > "$work/provenance/libc-version.txt"
+            ldd "$work/compiler-b" > "$work/provenance/b-dependencies.txt"
+            ld --version > "$work/provenance/linker-version.txt"
+          fi
+          cp .github/workflows/blorp2-seed.yml "$work/provenance/workflow.yml"
+
+      - name: Package only the self-built B normal seed
+        shell: bash
+        run: |
+          set -euo pipefail
+          work=build/blorp2-seed
+          mkdir -p dist
+          cp "$work/compiler-b" "dist/blorp2-$SEED_TARGET"
+          chmod 0755 "dist/blorp2-$SEED_TARGET"
+          gzip -n -c "$work/compiler.c" > "dist/blorp2-compiler-$SEED_TARGET.c.gz"
+          tar -czf "dist/blorp2-provenance-$SEED_TARGET.tar.gz" -C "$work" provenance
+
+      - name: Retain qualification logs, including failures
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: blorp2-qualification-${{ matrix.target }}
+          path: |
+            build/blorp2-seed/provenance
+            build/blorp2-seed/*.c
+            build/source-patterns/native-subset01/artifacts
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Upload qualified seed candidate
+        uses: actions/upload-artifact@v6
+        with:
+          name: blorp2-seed-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+          compression-level: 0
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      actions: read
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      SEED_TAG: ${{ github.ref_name }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          ref: ${{ github.ref }}
+          persist-credentials: false
+      - uses: actions/download-artifact@v7
+        with:
+          pattern: blorp2-seed-*
+          merge-multiple: true
+          path: dist
+      - name: Validate complete initial release and publish once
+        shell: bash
+        run: |
+          set -euo pipefail
+          source_sha=$(git rev-parse HEAD)
+          test "$SEED_TAG" = "blorp2-seed-${source_sha:0:12}"
+          git fetch --quiet --no-tags origin "refs/tags/$SEED_TAG"
+          test "$(git rev-parse 'FETCH_HEAD^{commit}')" = "$source_sha"
+          # This route is explicitly initial-only, never a legacy fallback.
+          gh api --paginate "repos/$GH_REPO/releases" --jq '.[].tag_name' > existing-release-tags.txt
+          if grep -Eq '^blorp2-seed-' existing-release-tags.txt; then
+            echo "A B2 seed release already exists; use the pinned-B2 release route without mutating it." >&2
+            exit 1
+          fi
+          targets=(aarch64-apple-darwin x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu)
+          shopt -s nullglob
+          candidates=(dist/*)
+          test "${#candidates[@]}" -eq 9
+          mkdir -p proof
+          first=${targets[0]}
+          for target in "${targets[@]}"; do
+            test -s "dist/blorp2-$target"
+            test -s "dist/blorp2-compiler-$target.c.gz"
+            test -s "dist/blorp2-provenance-$target.tar.gz"
+            mkdir -p "proof/$target"
+            tar -xzf "dist/blorp2-provenance-$target.tar.gz" -C "proof/$target"
+            test "$(cat "proof/$target/provenance/source-commit.txt")" = "$source_sha"
+            gzip -dc "dist/blorp2-compiler-$target.c.gz" > "proof/$target/compiler.c"
+            expected_binary=$(awk '$2 == "build/blorp2-seed/compiler-b" {print $1}' "proof/$target/provenance/b.sha256")
+            expected_c=$(awk '$2 == "build/blorp2-seed/compiler.c" {print $1}' "proof/$target/provenance/b.sha256")
+            [[ "$expected_binary" =~ ^[0-9a-f]{64}$ ]]
+            [[ "$expected_c" =~ ^[0-9a-f]{64}$ ]]
+            test "$(sha256sum "dist/blorp2-$target" | cut -d ' ' -f 1)" = "$expected_binary"
+            test "$(sha256sum "proof/$target/compiler.c" | cut -d ' ' -f 1)" = "$expected_c"
+            cmp "proof/$first/compiler.c" "proof/$target/compiler.c"
+            for inventory in blorp_2-src blorp_2-standard_library standard_library-src; do
+              cmp "proof/$first/provenance/$inventory.sha256" "proof/$target/provenance/$inventory.sha256"
+            done
+          done
+          cp "dist/blorp2-compiler-$first.c.gz" dist/blorp2-compiler.c.gz
+          for target in "${targets[@]}"; do rm "dist/blorp2-compiler-$target.c.gz"; done
+          (cd dist && sha256sum blorp2-* > SHA256SUMS)
+          cat > release-notes.md <<NOTES
+          Initial self-built Blorp 2 seed from $source_sha.
+          Functional qualification PASS: each native seed B reproduced its compiler C and passed maintained component/native correctness and strict accounting checks.
+          Every maintained accepted/rejected fixture was compared under A/B for exit status, stdout, stderr and emitted-C presence/bytes; per-fixture logs, hashes, inventory and actual counts are retained. Both B link logs were empty.
+          A temporary ASan/UBSan diagnostic B built from the same approved C performed the existing whole-source strict accounting check and emitted identical C, with an empty link log and only the exact balanced accounting report. Its hash/flags are retained; only normal B is published.
+          Resource qualification FAIL, approved initial-bootstrap debt: original caps remain unchanged; native.log retains structured BLORP2_RESOURCE_RESULT markers, actual measurements, limits and original failure reasons.
+          The exception is bound to compiler C SHA-256 3d0def0d00f6c6ec003923d7acb2f8854fa506a6cf6b7c04611322a47b7b7f8b and applies only after ordinary correctness oracles. This is not a resource PASS or complete M8 gate.
+          Linux retired-instruction measurement was unavailable, not qualified; macOS required counters.
+          Ordinary fixtures check sanitized real mains and strict compiler balance; accounted fixtures additionally check strict target balance.
+          The per-platform provenance archives retain inputs, compiler modes, toolchains, SDK/libc details and raw gates. Non-resource failures remain blocking.
+          Keep this release and all assets while retained source history references them; never replace assets in place.
+          NOTES
+          gh release create "$SEED_TAG" dist/* --verify-tag --prerelease --latest=false \
+            --title "Blorp 2 initial seed ${source_sha:0:12}" --notes-file release-notes.md

@@ -1,0 +1,382 @@
+import:
+	../../../src/check/model as Model
+	../../../src/lower/lower as Lower
+	../../../src/namespace/builtins as Builtins
+	../../../src/own/own as Own
+	../../../src/specialize/specialize as Concrete
+	../../../src/utils/syntax as Syntax
+	../../../src/verify/verify: verify
+	../ownership_inputs: InputIds, input_ids, span
+	./selection_inputs as Selection
+	test: TestSuite
+
+
+private fixed union HeaderFault:
+	RepeatedValues
+	SwappedValues
+	SwappedBackedge
+	RepeatedBackedgeOwner
+	LiveBackedgeHeader
+	MissingInitialOwner
+	RepeatedInitialOwner
+	InitialConsumesPre
+	UnusedEntryAcquisition
+	LiveOldHeader
+	RetiredPre
+	RepeatedOutgoingOwner
+	DirectHeaderTransfer
+	WrongInitialType
+	MissingOutgoingValue
+
+
+private pure func integer(id: Lower.ValueId, value: Int, at: Int) -> Own.OwnershipOperation:
+	Own.DefineValue({ id = id, value_type = Concrete.IntType,
+		operation = Own.IntegerDefinition(value), result = Own.UnmanagedResult, span = span(at) })
+
+
+private pure func managed(id: Lower.ValueId, owner: Int, at: Int) -> Own.OwnedJoinParameter:
+	Own.ManagedJoinParameter({ id = id, value_type = Concrete.StringType, span = span(at) }, Own.owner_id(owner))
+
+
+-- The seed supplies opaque ids and nominal layouts only. Entry acquisitions,
+-- header obligations, retirement and both transfer batches are authored here.
+private pure func managed_program(ids: InputIds, fault: HeaderFault) -> Own.OwnershipProgram:
+	borrow: Own.BorrowedValue = { value = ids.first, source = Own.ParameterBorrow(ids.first) }
+	var acquisitions: List[Own.OwnerAcquisition] = [
+		{ owner = Own.owner_id(3), borrow = borrow },
+		{ owner = Own.owner_id(4), borrow = borrow },
+	]
+	var second_initial = Own.OwnedReturn(ids.first, Own.owner_id(4))
+	match fault:
+		SwappedValues:
+			acquisitions = acquisitions.set(1, { owner = Own.owner_id(4), borrow = { value = ids.third, source = Own.OwnerBorrow(Own.owner_id(0)) } })
+			second_initial = Own.OwnedReturn(ids.third, Own.owner_id(4))
+		MissingInitialOwner: second_initial = Own.UnmanagedReturn(ids.first)
+		RepeatedInitialOwner: second_initial = Own.OwnedReturn(ids.first, Own.owner_id(3))
+		InitialConsumesPre: second_initial = Own.OwnedReturn(ids.third, Own.owner_id(0))
+		UnusedEntryAcquisition: acquisitions = acquisitions.append({ owner = Own.owner_id(5), borrow = borrow })
+		WrongInitialType: second_initial = Own.UnmanagedReturn(ids.second)
+		_: void
+	var edge_operations: List[Own.OwnershipOperation] = [
+		integer(ids.ninth, 42, 70),
+		Own.AcquireOwner(Own.owner_id(7), { value = ids.eighth, source = Own.OwnerBorrow(Own.owner_id(6)) }, span(71)),
+		Own.AcquireOwner(Own.owner_id(8), { value = ids.seventh, source = Own.OwnerBorrow(Own.owner_id(5)) }, span(72)),
+	]
+	match fault:
+		LiveOldHeader | LiveBackedgeHeader: void
+		_: edge_operations = edge_operations.append(Own.DropOwner(Own.owner_id(5), span(73)))
+	match fault:
+		DirectHeaderTransfer: void
+		_: edge_operations = edge_operations.append(Own.DropOwner(Own.owner_id(6), span(74)))
+	match fault:
+		RetiredPre: edge_operations = edge_operations.append(Own.DropOwner(Own.owner_id(0), span(75)))
+		_: void
+	var outgoing = [Own.OwnedReturn(ids.eighth, Own.owner_id(7)), Own.OwnedReturn(ids.seventh, Own.owner_id(8))]
+	match fault:
+		RepeatedOutgoingOwner | RepeatedBackedgeOwner: outgoing = [Own.OwnedReturn(ids.eighth, Own.owner_id(7)), Own.OwnedReturn(ids.eighth, Own.owner_id(7))]
+		DirectHeaderTransfer: outgoing = outgoing.set(0, Own.OwnedReturn(ids.eighth, Own.owner_id(6)))
+		MissingOutgoingValue: outgoing = [Own.OwnedReturn(ids.eighth, Own.owner_id(7))]
+		_: void
+	tail = match fault:
+		SwappedBackedge | RepeatedBackedgeOwner | LiveBackedgeHeader: Own.ExitLoop(Own.Recur(outgoing, span(80)))
+		_: Own.ExitLoop(Own.Break({ value = Own.UnmanagedReturn(ids.ninth), carried = outgoing, span = span(80) }))
+	loop: Own.OwnedLoop = {
+		entry_acquisitions = acquisitions,
+		headers = [
+			{ parameter = managed(ids.seventh, 5, 50), initial = Own.OwnedReturn(ids.first, Own.owner_id(3)) },
+			{ parameter = managed(ids.eighth, 6, 60), initial = second_initial },
+		],
+		result = Own.UnmanagedJoinParameter({ id = ids.fourth, value_type = Concrete.IntType, span = span(40) }),
+		carried = [managed(ids.fifth, 1, 41), managed(ids.sixth, 2, 42)],
+		body = { operations = edge_operations, tail = tail },
+	}
+	{ records = [], unions = ids.unions,
+		functions = [
+			{ signature = { parameters = [Concrete.StringType], return_type = Concrete.IntType },
+				operations = [
+					Own.DefineValue({ id = ids.first, value_type = Concrete.StringType, operation = Own.ParameterDefinition(0),
+						result = Own.BorrowedResult(Own.ParameterBorrow(ids.first)), span = span(10) }),
+					integer(ids.second, 7, 20),
+					Own.DefineValue({ id = ids.third, value_type = Concrete.StringType,
+						operation = Own.CallDefinition(Concrete.RuntimeFunction(Builtins.IntToString), [Own.UnmanagedArgument(ids.second)]),
+						result = Own.OwnedResult(Own.owner_id(0)), span = span(30) }),
+					Own.ExecuteLoop(loop),
+					Own.DropOwner(Own.owner_id(1), span(90)), Own.DropOwner(Own.owner_id(2), span(91)),
+					Own.DropOwner(Own.owner_id(0), span(92)),
+				], result = Own.UnmanagedReturn(ids.fourth) },
+			{ signature = { parameters = [], return_type = Concrete.IntType },
+				operations = [integer(ids.first, 0, 1)], result = Own.UnmanagedReturn(ids.first) },
+		], entrypoint = Syntax.NoArguments(ids.second_function, Syntax.IntegerExitStatus) }
+
+
+private pure func exact(error: Syntax.Diagnostic, message: String, at: Int) -> Bool:
+	(error.message == "ownership verification failed: " + message
+		and error.help == "report this compiler error with the input program"
+		and error.note.is_none() and Syntax.same_span(error.span, span(at)))
+
+
+private pure func rejects_header(fault: HeaderFault, message: String, at: Int) -> Bool:
+	match input_ids():
+		Err(_): False
+		Ok(ids):
+			baseline = verify(managed_program(ids, RepeatedValues)).is_ok()
+			match verify(managed_program(ids, fault)):
+				Ok(_): False
+				Err(error): baseline and exact(error, message, at)
+
+
+pure func test_managed_headers_accept_repeated_borrowed_initial_values() -> Bool:
+	match input_ids():
+		Err(_): False
+		Ok(ids): verify(managed_program(ids, RepeatedValues)).is_ok()
+
+
+pure func test_managed_headers_accept_distinct_initial_values_and_swapped_outputs() -> Bool:
+	match input_ids():
+		Err(_): False
+		Ok(ids): verify(managed_program(ids, SwappedValues)).is_ok()
+
+
+private pure func list_parameter(parameter: Own.OwnedJoinParameter) -> Own.OwnedJoinParameter:
+	fact = { Own.join_parameter(parameter) | value_type = Concrete.ListType(Concrete.StringType) }
+	match parameter:
+		Own.UnmanagedJoinParameter(_): Own.UnmanagedJoinParameter(fact)
+		Own.ManagedJoinParameter(_, owner): Own.ManagedJoinParameter(fact, owner)
+
+
+pure func test_managed_list_headers_use_the_same_transfer_contract() -> Bool:
+	match input_ids():
+		Err(_): False
+		Ok(ids):
+			base = managed_program(ids, RepeatedValues)
+			match base.functions.get(0):
+				None: False
+				Some(function):
+					operations = function.operations.map(pure func(operation):
+						match operation:
+							Own.DefineValue(definition):
+								if Lower.value_number(definition.id) == Lower.value_number(ids.first):
+									Own.DefineValue({ definition | value_type = Concrete.ListType(Concrete.StringType) })
+								else:
+									operation
+							Own.ExecuteLoop(loop): Own.ExecuteLoop({ loop |
+								headers = loop.headers.map(pure func(header): { header | parameter = list_parameter(header.parameter) }),
+								carried = loop.carried.map(list_parameter),
+							})
+							_: operation
+					)
+					changed = { function | signature = { function.signature | parameters = [Concrete.ListType(Concrete.StringType)] }, operations = operations }
+					verify({ base | functions = base.functions.set(0, changed) }).is_ok()
+
+
+pure func test_managed_backedge_accepts_fresh_swapped_occurrences() -> Bool:
+	match input_ids():
+		Err(_): False
+		Ok(ids): verify(managed_program(ids, SwappedBackedge)).is_ok()
+
+
+pure func test_managed_backedge_cannot_reuse_an_occurrence() -> Bool:
+	rejects_header(RepeatedBackedgeOwner, "loop transfer refers to a discharged owner", 80)
+
+
+pure func test_old_header_must_retire_on_backedge() -> Bool:
+	rejects_header(LiveBackedgeHeader, "owner 5 remains live at yield", 80)
+
+
+pure func test_managed_initial_requires_an_owner() -> Bool:
+	rejects_header(MissingInitialOwner, "managed yield requires an owner transfer", 60)
+
+
+pure func test_managed_initial_cannot_reuse_an_occurrence() -> Bool:
+	rejects_header(RepeatedInitialOwner, "loop transfer refers to a discharged owner", 60)
+
+
+pure func test_entry_acquisition_must_be_consumed_by_an_initial() -> Bool:
+	rejects_header(UnusedEntryAcquisition, "owner 5 remains live at yield", 40)
+
+
+pure func test_initial_cannot_consume_pre_owner() -> Bool:
+	rejects_header(InitialConsumesPre, "loop transfer must use a fresh acquisition", 60)
+
+
+pure func test_old_header_obligation_must_retire() -> Bool:
+	rejects_header(LiveOldHeader, "owner 5 remains live at yield", 80)
+
+
+pure func test_managed_edge_preserves_pre() -> Bool:
+	rejects_header(RetiredPre, "loop edge discharges a captured owner", 80)
+
+
+pure func test_outgoing_occurrences_cannot_share_an_owner() -> Bool:
+	rejects_header(RepeatedOutgoingOwner, "loop transfer refers to a discharged owner", 80)
+
+
+pure func test_old_header_cannot_replace_a_fresh_outgoing_acquisition() -> Bool:
+	rejects_header(DirectHeaderTransfer, "loop transfer must use a fresh acquisition", 80)
+
+
+pure func test_initial_type_is_checked_before_header_publication() -> Bool:
+	rejects_header(WrongInitialType, "loop initial type does not match its header", 60)
+
+
+pure func test_outgoing_arity_is_exact() -> Bool:
+	rejects_header(MissingOutgoingValue, "loop edge has the wrong number of values", 80)
+
+
+private fixed union TargetFault:
+	NearestTarget
+	ForeignTarget
+	OuterTarget
+	SiblingTarget
+	UnissuedTarget
+	AbsentTarget
+	AllAbruptJoin
+
+
+private pure func control_program(ids: InputIds, fault: TargetFault) -> Own.OwnershipProgram:
+	var result = ids.fifth
+	var abrupt_value = ids.sixth
+	var yielded_value = ids.seventh
+	var target = Lower.loop_target(ids.fourth)
+	var inner_result = ids.fourth
+	match fault:
+		ForeignTarget: target = Lower.loop_target(ids.second)
+		OuterTarget: target = Lower.loop_target(ids.third)
+		SiblingTarget:
+			target = Lower.loop_target(ids.fourth)
+			inner_result = ids.fifth
+			result = ids.sixth
+			abrupt_value = ids.seventh
+			yielded_value = ids.eighth
+		UnissuedTarget: target = Lower.loop_target(ids.ninth)
+		AbsentTarget:
+			result = ids.third
+			abrupt_value = ids.fourth
+			yielded_value = ids.fifth
+		_: void
+	-- A recursive terminal selector exercises the same target and PRE contract.
+	abrupt = Own.TransferLoop(target, Own.MatchLoop({
+		selection = Selection.direct(Own.UnmanagedArgument(ids.first)),
+		arms = [{ id = Model.match_arm_id(0), inputs = [], body = {
+			operations = [integer(abrupt_value, 11, 70)],
+			tail = Own.ExitLoop(Own.Break({ value = Own.UnmanagedReturn(abrupt_value), carried = [], span = span(80) })),
+		} }],
+	}))
+	var normal = Own.Yield({ transfer = Own.UnmanagedReturn(yielded_value), carried = [] })
+	match fault:
+		AllAbruptJoin: normal = abrupt
+		_: void
+	join: Own.OwnedJoin = {
+		result = Own.UnmanagedJoinParameter({ id = result, value_type = Concrete.IntType, span = span(55) }), carried = [],
+		selection = Selection.branches(Own.UnmanagedArgument(ids.first), ids.second_variant),
+		arms = [
+			{ id = Model.match_arm_id(0), inputs = [], operations = [], exit = abrupt },
+			{ id = Model.match_arm_id(1), inputs = [], operations = [integer(yielded_value, 42, 81)], exit = normal },
+		],
+	}
+	inner: Own.OwnedLoop = {
+		entry_acquisitions = [], headers = [],
+		result = Own.UnmanagedJoinParameter({ id = inner_result, value_type = Concrete.IntType, span = span(40) }), carried = [],
+		body = { operations = [Own.ExecuteJoin(join)],
+			tail = Own.ExitLoop(Own.Break({ value = Own.UnmanagedReturn(result), carried = [], span = span(85) })) },
+	}
+	var nested = [Own.ExecuteLoop(inner)]
+	match fault:
+		SiblingTarget:
+			sibling: Own.OwnedLoop = {
+				entry_acquisitions = [], headers = [],
+				result = Own.UnmanagedJoinParameter({ id = ids.fourth, value_type = Concrete.IntType, span = span(35) }), carried = [],
+				body = { operations = [], tail = Own.ExitLoop(Own.Break({ value = Own.UnmanagedReturn(ids.second), carried = [], span = span(36) })) },
+			}
+			nested = [Own.ExecuteLoop(sibling), Own.ExecuteLoop(inner)]
+		_: void
+	outer: Own.OwnedLoop = {
+		entry_acquisitions = [], headers = [],
+		result = Own.UnmanagedJoinParameter({ id = ids.third, value_type = Concrete.IntType, span = span(30) }), carried = [],
+		body = { operations = nested,
+			tail = Own.ExitLoop(Own.Break({ value = Own.UnmanagedReturn(inner_result), carried = [], span = span(90) })) },
+	}
+	control = match fault:
+		AbsentTarget: Own.ExecuteJoin(join)
+		_: Own.ExecuteLoop(outer)
+	{ records = [], unions = ids.unions,
+		functions = [
+			{ signature = { parameters = [Concrete.UnionType(ids.union_id)], return_type = Concrete.IntType },
+				operations = [
+					Own.DefineValue({ id = ids.first, value_type = Concrete.UnionType(ids.union_id),
+						operation = Own.ParameterDefinition(0), result = Own.UnmanagedResult, span = span(10) }),
+					integer(ids.second, 7, 20), control,
+				], result = Own.UnmanagedReturn(ids.third) },
+			{ signature = { parameters = [], return_type = Concrete.IntType },
+				operations = [integer(ids.first, 0, 1)], result = Own.UnmanagedReturn(ids.first) },
+		], entrypoint = Syntax.NoArguments(ids.second_function, Syntax.IntegerExitStatus) }
+
+
+private pure func rejects_target(fault: TargetFault, message: String, at: Int) -> Bool:
+	match input_ids():
+		Err(_): False
+		Ok(ids):
+			baseline = verify(control_program(ids, NearestTarget)).is_ok()
+			match verify(control_program(ids, fault)):
+				Ok(_): False
+				Err(error): baseline and exact(error, message, at)
+
+
+pure func test_recursive_abrupt_arm_targets_nearest_loop() -> Bool:
+	match input_ids():
+		Err(_): False
+		Ok(ids): verify(control_program(ids, NearestTarget)).is_ok()
+
+
+pure func test_foreign_target_is_rejected() -> Bool:
+	rejects_target(ForeignTarget, "loop transfer does not target the nearest active loop", 80)
+
+
+pure func test_outer_target_is_rejected() -> Bool:
+	rejects_target(OuterTarget, "loop transfer does not target the nearest active loop", 80)
+
+
+pure func test_sibling_target_is_rejected() -> Bool:
+	rejects_target(SiblingTarget, "loop transfer does not target the nearest active loop", 80)
+
+
+pure func test_unissued_target_is_rejected() -> Bool:
+	rejects_target(UnissuedTarget, "loop transfer does not target the nearest active loop", 80)
+
+
+pure func test_target_requires_active_loop() -> Bool:
+	rejects_target(AbsentTarget, "loop transfer has no active loop", 80)
+
+
+pure func test_all_abrupt_ordinary_join_cannot_publish_outputs() -> Bool:
+	rejects_target(AllAbruptJoin, "join has no yielding arm", 55)
+
+
+tests: TestSuite = {
+	description = "Blorp 2 independent source loop control verification",
+	tests = [
+		("managed H accepts repeated borrowed initial values", test_managed_headers_accept_repeated_borrowed_initial_values),
+		("managed H accepts distinct initial values and swapped outputs", test_managed_headers_accept_distinct_initial_values_and_swapped_outputs),
+		("managed List H uses same transfer contract", test_managed_list_headers_use_the_same_transfer_contract),
+		("managed backedge accepts fresh swapped occurrences", test_managed_backedge_accepts_fresh_swapped_occurrences),
+		("managed backedge cannot reuse occurrence", test_managed_backedge_cannot_reuse_an_occurrence),
+		("old H must retire on backedge", test_old_header_must_retire_on_backedge),
+		("managed initial requires an owner", test_managed_initial_requires_an_owner),
+		("managed initial cannot reuse an occurrence", test_managed_initial_cannot_reuse_an_occurrence),
+		("entry acquisition must feed an initial", test_entry_acquisition_must_be_consumed_by_an_initial),
+		("initial cannot consume PRE owner", test_initial_cannot_consume_pre_owner),
+		("old H obligation must retire", test_old_header_obligation_must_retire),
+		("managed edge preserves PRE", test_managed_edge_preserves_pre),
+		("outgoing occurrences cannot share owner", test_outgoing_occurrences_cannot_share_an_owner),
+		("old H cannot replace outgoing acquisition", test_old_header_cannot_replace_a_fresh_outgoing_acquisition),
+		("initial type checked before H publication", test_initial_type_is_checked_before_header_publication),
+		("outgoing arity is exact", test_outgoing_arity_is_exact),
+		("recursive abrupt arm targets nearest loop", test_recursive_abrupt_arm_targets_nearest_loop),
+		("foreign target rejected", test_foreign_target_is_rejected),
+		("outer target rejected", test_outer_target_is_rejected),
+		("sibling target rejected", test_sibling_target_is_rejected),
+		("unissued target rejected", test_unissued_target_is_rejected),
+		("target requires active loop", test_target_requires_active_loop),
+		("all abrupt Join cannot publish outputs", test_all_abrupt_ordinary_join_cannot_publish_outputs),
+	]
+}

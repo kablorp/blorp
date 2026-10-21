@@ -1,4 +1,6 @@
 import:
+	../../../src/check/model as Model
+	./selection_inputs as Selection
 	../../../src/check/check: check
 	../../../src/lower/lower as Lower
 	../../../src/own/own as Own
@@ -108,12 +110,9 @@ pure func test_parse_last_uses_include_borrow_and_unmanaged_return() -> Bool:
 	match seed():
 		Err(_): False
 		Ok(seed):
-			match seed.parse_function.tail:
-				Lower.ExitValue(Lower.ReturnValue(returned)):
-					match Own.last_uses(seed.parse_function.steps, returned):
-						Ok(uses): uses == [Some(1), Some(2)]
-						Err(_): False
-				_: False
+			match Own.last_uses(seed.parse_function.steps, seed.parse_function.result):
+				Ok(uses): uses == [Some(1), Some(2)]
+				Err(_): False
 
 
 pure func test_parse_borrows_parameter_without_acquiring_result() -> Bool:
@@ -123,8 +122,8 @@ pure func test_parse_borrows_parameter_without_acquiring_result() -> Bool:
 			match Own.insert_function(seed.parse_function, seed.unions, []):
 				Err(_): False
 				Ok(function):
-					match (function.operations, function.tail):
-						([Own.DefineValue(parameter), Own.DefineValue(result)], Own.ReturnTail(Own.ReturnResult(Own.UnmanagedReturn(returned)))):
+					match (function.operations, function.result):
+						([Own.DefineValue(parameter), Own.DefineValue(result)], Own.UnmanagedReturn(returned)):
 							match (parameter.result, result.operation, result.result):
 								(Own.BorrowedResult(Own.ParameterBorrow(source)), Own.CallDefinition(_, [Own.BorrowedArgument(argument)]), Own.UnmanagedResult):
 									match argument.source:
@@ -188,8 +187,8 @@ pure func test_returned_list_get_transfers_fresh_owner() -> Bool:
 		Ok(seed):
 			match Own.insert_function(read_function(seed, True), seed.unions, []):
 				Ok(function):
-					match (function.operations, function.tail):
-						([Own.DefineValue(_), Own.DefineValue(_), Own.DefineValue(read)], Own.ReturnTail(Own.ReturnResult(Own.OwnedReturn(value, owner)))):
+					match (function.operations, function.result):
+						([Own.DefineValue(_), Own.DefineValue(_), Own.DefineValue(read)], Own.OwnedReturn(value, owner)):
 							match read.result:
 								Own.OwnedResult(fresh): Own.owner_number(fresh) == 0 and Own.owner_number(owner) == 0 and Lower.value_number(value) == Lower.value_number(read.id)
 								_: False
@@ -200,20 +199,34 @@ pure func test_returned_list_get_transfers_fresh_owner() -> Bool:
 private pure func child_function(seed: Seed) -> Lower.LoweredFunction:
 	ids = seed.ids
 	option = seed.string_option
+	selection = Selection.lowered_branches(ids.first, option.none)
 	{
-		execution = OrdinaryCalls,
 		signature = { parameters = [result_type(option)], return_type = Concrete.StringType },
-		steps = [parameter(ids.first, result_type(option))].map(pure func(definition): Lower.Define(definition)),
-		tail = Lower.MatchValue({
-			scrutinee = ids.first,
-			owner = Concrete.variant_owner(option.some),
+		steps = [Lower.Define(parameter(ids.first, result_type(option))), Lower.Join({
+			result = { id = ids.second, value_type = Concrete.StringType, span = span(40) },
+			carried = [], reads = [ids.first],
+			selection = { selection | nodes = selection.nodes.set(1, Lower.EnterArm({
+				arm = Model.match_arm_id(1),
+				definitions = [Lower.BorrowUnionField({ id = ids.third, value_type = Concrete.StringType, span = span(30) }, seed.string_field, ids.first)],
+				arguments = [ids.third],
+			})) },
 			arms = [
-				{ label = Lower.VariantLabel(option.none), body = { steps = [{ id = ids.second, value_type = Concrete.StringType, operation = Lower.StringValue("fallback"), span = span(20) }].map(pure func(definition): Lower.Define(definition)), exit = Lower.ReturnValue(ids.second) } },
-				{ label = Lower.VariantLabel(option.some), body = { steps = [{ id = ids.third, value_type = Concrete.StringType, operation = Lower.PayloadValue(seed.string_field, ids.first), span = span(30) }].map(pure func(definition): Lower.Define(definition)), exit = Lower.ReturnValue(ids.third) } },
+				{
+					id = Model.match_arm_id(0),
+					inputs = [],
+					steps = [Lower.Define({
+						id = ids.fourth,
+						value_type = Concrete.StringType,
+						operation = Lower.StringValue("fallback"),
+						span = span(20)
+					})],
+					exit = Lower.Yield({ value = ids.fourth, carried = [] })
+				},
+				{ id = Model.match_arm_id(1), inputs = [{ id = ids.fifth, value_type = Concrete.StringType, span = span(30) }], steps = [], exit = Lower.Yield({ value = ids.fifth, carried = [] }) },
 			]
-		})
+		})],
+		result = ids.second,
 	}
-
 
 pure func test_returned_child_acquires_only_its_selected_arm_borrow() -> Bool:
 	match seed():
@@ -222,106 +235,97 @@ pure func test_returned_child_acquires_only_its_selected_arm_borrow() -> Bool:
 			match Own.insert_function(child_function(seed), seed.unions, []):
 				Err(_): False
 				Ok(function):
-					match (function.operations, function.tail):
-						([Own.DefineValue(_)], Own.MatchTail(matched)):
-							match matched.arms:
-								[absent, present]:
-									match (absent.operations, absent.exit, present.operations, present.exit):
-										([Own.DefineValue(fallback)], Own.ReturnResult(Own.OwnedReturn(_, fallback_owner)), [Own.DefineValue(child), Own.AcquireOwner(owner, borrow, at)], Own.ReturnResult(Own.OwnedReturn(returned, transferred))):
-											match (fallback.result, child.result, borrow.source):
-												(Own.OwnedResult(fresh), Own.BorrowedResult(Own.PayloadBorrow(parent)), Own.PayloadBorrow(source)):
-													Own.owner_number(fresh) == 0 and Own.owner_number(fallback_owner) == 0 and Own.owner_number(owner) == 1 and Own.owner_number(transferred) == 1 and Lower.value_number(parent) == 0 and Lower.value_number(source) == 0 and Lower.value_number(borrow.value) == 2 and Lower.value_number(returned) == 2 and at.start == 30
+					match (function.operations, function.result):
+						([Own.DefineValue(_), Own.ExecuteJoin(matched)], Own.OwnedReturn(_, joined)):
+							match (matched.selection.nodes, matched.arms):
+								([Own.EnterArm(absent_edge), Own.EnterArm(present_edge), _], [absent, present]):
+									match (absent.exit, present.exit):
+										(Own.Yield(absent_outputs), Own.Yield(present_outputs)):
+											match ((absent_edge.operations, absent.operations, absent_outputs.transfer, present_edge.operations), (present.inputs, present.operations, present_outputs.transfer)):
+												(([], [Own.DefineValue(fallback)], Own.OwnedReturn(_, fallback_owner), [Own.DefineValue(child), Own.AcquireOwner(owner, borrow, _)]), ([Own.ManagedJoinParameter(input, canonical)], [], Own.OwnedReturn(returned, transferred))):
+													match (fallback.result, child.result, borrow.source):
+														(Own.OwnedResult(fresh), Own.BorrowedResult(Own.PayloadBorrow(parent)), Own.PayloadBorrow(source)):
+															(
+																Own.owner_number(joined) == 0
+																and Own.owner_number(fresh) == Own.owner_number(fallback_owner)
+																and Own.owner_number(owner) != Own.owner_number(canonical)
+																and Own.owner_number(canonical) == Own.owner_number(transferred)
+																and Lower.value_number(parent) == 0
+																and Lower.value_number(source) == 0
+																and Lower.value_number(borrow.value) == Lower.value_number(child.id)
+																and Lower.value_number(returned) == Lower.value_number(input.id)
+															)
+														_: False
 												_: False
 										_: False
 								_: False
 						_: False
 
-
 pure func test_owned_list_get_prefix_drops_in_each_arm() -> Bool:
 	match seed():
-		Err(_):
-			False
+		Err(_): False
 		Ok(seed):
 			ids = seed.ids
 			list_type = Concrete.ListType(Concrete.StringType)
 			option = seed.integer_option
 			owned: Lower.LoweredFunction = {
-				execution = OrdinaryCalls,
-				signature = {
-					parameters = [list_type, result_type(option)],
-					return_type = Concrete.IntType
-				},
+				signature = { parameters = [list_type, result_type(option)], return_type = Concrete.IntType },
 				steps = [
-					parameter(ids.first, list_type),
-					{ parameter(ids.second, result_type(option)) |
-						operation = Lower.ParameterValue(1)
-					},
-					integer(ids.third, 0, 20),
-					runtime(
-						ids.fourth,
-						Builtins.ListGet(Concrete.StringType, seed.string_option),
-						[ids.first, ids.third],
-						result_type(seed.string_option),
-						30,
-					),
-					integer(ids.fifth, 0, 50),
-				].map(pure func(definition): Lower.Define(definition)),
-				tail = Lower.MatchValue({
-					scrutinee = ids.second,
-					owner = Concrete.variant_owner(option.some),
-					arms = [
-						{
-							label = Lower.VariantLabel(option.none),
-							body = {
-								steps = [],
-								exit = Lower.ReturnValue(ids.fifth)
-							}
+					Lower.Define(parameter(ids.first, list_type)),
+					Lower.Define({ parameter(ids.second, result_type(option)) | operation = Lower.ParameterValue(1) }),
+					Lower.Loop({
+						headers = [],
+						result = { id = ids.third, value_type = Concrete.IntType, span = span(60) },
+						carried = [], reads = [ids.first, ids.second],
+						body = {
+							steps = [
+								integer(ids.fourth, 0, 20),
+								runtime(ids.fifth, Builtins.ListGet(Concrete.StringType, seed.string_option), [ids.first, ids.fourth], result_type(seed.string_option), 30),
+								integer(ids.sixth, 0, 50),
+							].map(pure func(definition): Lower.Define(definition)),
+							tail = Lower.MatchLoop({
+								selection = Selection.lowered_branches(ids.second, option.none),
+								arms = [
+									{ id = Model.match_arm_id(0), inputs = [], body = { steps = [], tail = Lower.ExitLoop(Lower.Break({ value = ids.sixth, carried = [], span = span(50) })) } },
+									{ id = Model.match_arm_id(1), inputs = [], body = { steps = [], tail = Lower.ExitLoop(Lower.Break({ value = ids.sixth, carried = [], span = span(50) })) } },
+								],
+							}),
 						},
-						{
-							label = Lower.VariantLabel(option.some),
-							body = {
-								steps = [],
-								exit = Lower.ReturnValue(ids.fifth)
-							}
-						},
-					],
-				})
+					}),
+				],
+				result = ids.third,
 			}
-
 			match Own.insert_function(owned, seed.unions, []):
-				Err(_):
-					False
+				Err(_): False
 				Ok(inserted):
-					match inserted.tail:
-						Own.MatchTail(matched):
-							matched.arms.all(pure func(arm):
-								match (arm.operations, arm.exit):
-									([Own.DropOwner(owner, at)], Own.ReturnResult(Own.UnmanagedReturn(returned))):
-										(
-											Own.owner_number(owner) == 0
-											and at.start == 30
-											and Lower.value_number(
-												returned,
-											) == Lower.value_number(ids.fifth)
-										)
-									_:
-										False
-							)
-						_:
-							False
+					match inserted.operations:
+						[Own.DefineValue(_), Own.DefineValue(_), Own.ExecuteLoop(loop)]:
+							match loop.body.tail:
+								Own.MatchLoop(matched):
+									matched.arms.all(pure func(arm):
+										match (arm.body.operations, arm.body.tail):
+											([Own.DropOwner(owner, at)], Own.ExitLoop(Own.Break(outputs))):
+												match outputs.value:
+													Own.UnmanagedReturn(returned):
+														Own.owner_number(owner) == 0 and at.start == 30 and Lower.value_number(returned) == Lower.value_number(ids.sixth)
+													_: False
+											_: False
+									)
+								_: False
+						_: False
 
 
 private pure func define(id: Lower.ValueId, value_type: Concrete.TypeRef, operation: Own.OwnedValueOperation, result: Own.ResultOwnership, at: Int) -> Own.OwnershipOperation:
 	Own.DefineValue({ id = id, value_type = value_type, operation = operation, result = result, span = span(at) })
 
 
-private pure func raw_function(operations: List[Own.OwnershipOperation], tail: Own.OwnedTail, parameters: List[Concrete.TypeRef], return_type: Concrete.TypeRef) -> Own.OwnedFunction:
-	{ execution = OrdinaryCalls, signature = { parameters = parameters, return_type = return_type }, operations = operations, tail = tail }
+private pure func raw_function(operations: List[Own.OwnershipOperation], result: Own.ReturnTransfer, parameters: List[Concrete.TypeRef], return_type: Concrete.TypeRef) -> Own.OwnedFunction:
+	{ signature = { parameters = parameters, return_type = return_type }, operations = operations, result = result }
 
 
 private pure func raw_program(seed: Seed, tested: Own.OwnedFunction) -> Own.OwnershipProgram:
 	ids = seed.ids
-	entry = raw_function([define(ids.first, Concrete.IntType, Own.IntegerDefinition(0), Own.UnmanagedResult, 1)], Own.ReturnTail(Own.ReturnResult(Own.UnmanagedReturn(ids.first))), [], Concrete.IntType)
+	entry = raw_function([define(ids.first, Concrete.IntType, Own.IntegerDefinition(0), Own.UnmanagedResult, 1)], Own.UnmanagedReturn(ids.first), [], Concrete.IntType)
 	{ records = [], unions = seed.unions, functions = [entry, tested], entrypoint = NoArguments(ids.entrypoint, IntegerExitStatus) }
 
 
@@ -332,7 +336,7 @@ private pure func raw_parse(seed: Seed, option: Builtins.DesignatedOption[Concre
 		define(ids.first, Concrete.StringType, Own.ParameterDefinition(0), Own.BorrowedResult(Own.ParameterBorrow(ids.first)), 10),
 		define(ids.second, value_type, Own.CallDefinition(call, [argument]), result, 30),
 		define(ids.third, Concrete.IntType, Own.IntegerDefinition(0), Own.UnmanagedResult, 50),
-	], Own.ReturnTail(Own.ReturnResult(Own.UnmanagedReturn(ids.third))), [Concrete.StringType], Concrete.IntType))
+	], Own.UnmanagedReturn(ids.third), [Concrete.StringType], Concrete.IntType))
 
 
 private pure func parse_argument(seed: Seed) -> Own.OwnedArgument:
@@ -450,7 +454,7 @@ pure func test_verifier_rejects_parse_borrow_after_input_drop() -> Bool:
 				Own.DropOwner(Own.owner_id(0), span(20)),
 				define(ids.second, result_type(seed.integer_option), Own.CallDefinition(call, [Own.BorrowedArgument({ value = ids.first, source = Own.OwnerBorrow(Own.owner_id(0)) })]), Own.UnmanagedResult, 30),
 				define(ids.third, Concrete.IntType, Own.IntegerDefinition(0), Own.UnmanagedResult, 50),
-			], Own.ReturnTail(Own.ReturnResult(Own.UnmanagedReturn(ids.third))), [], Concrete.IntType)
+			], Own.UnmanagedReturn(ids.third), [], Concrete.IntType)
 			rejects(raw_program(seed, tested), "borrow refers to discharged owner 0", 30)
 
 
@@ -467,7 +471,7 @@ private pure func raw_read_call(seed: Seed, option: Builtins.DesignatedOption[Co
 		define(ids.second, Concrete.IntType, Own.IntegerDefinition(0), Own.UnmanagedResult, 20),
 		define(ids.third, value_type, Own.CallDefinition(call, arguments), result, 30)
 	] + drops + [define(ids.fourth, Concrete.IntType, Own.IntegerDefinition(0), Own.UnmanagedResult, 50)]
-	raw_program(seed, raw_function(operations, Own.ReturnTail(Own.ReturnResult(Own.UnmanagedReturn(ids.fourth))), [list_type], Concrete.IntType))
+	raw_program(seed, raw_function(operations, Own.UnmanagedReturn(ids.fourth), [list_type], Concrete.IntType))
 
 
 private pure func raw_read(seed: Seed, result: Own.ResultOwnership, drops: List[Own.OwnershipOperation]) -> Own.OwnershipProgram:
@@ -563,26 +567,59 @@ private pure func raw_child(seed: Seed, acquire: Bool, transfer: Bool) -> Own.Ow
 	ids = seed.ids
 	option = seed.string_option
 	borrow: Own.BorrowedValue = { value = ids.third, source = Own.PayloadBorrow(ids.first) }
-	no_acquisition: List[Own.OwnershipOperation] = []
-	acquisition = if acquire:
+	acquisition: List[Own.OwnershipOperation] = if acquire:
 		[Own.AcquireOwner(Own.owner_id(1), borrow, span(30))]
 	else:
-		no_acquisition
+		[]
 	returned = if transfer:
 		Own.OwnedReturn(ids.third, Own.owner_id(1))
 	else:
 		Own.UnmanagedReturn(ids.third)
-	matched: Own.OwnedMatch = {
-		scrutinee = Own.BorrowedArgument({ value = ids.first, source = Own.ParameterBorrow(ids.first) }),
-		owner = Concrete.variant_owner(option.some),
+	selection = Selection.branches(Own.BorrowedArgument({ value = ids.first, source = Own.ParameterBorrow(ids.first) }), option.none)
+	matched: Own.OwnedLoopMatch = {
+		selection = { selection | nodes = selection.nodes.set(1, Own.EnterArm({
+			arm = Model.match_arm_id(1),
+			operations = [define(ids.third, Concrete.StringType, Own.PayloadDefinition(seed.string_field, ids.first), Own.BorrowedResult(Own.PayloadBorrow(ids.first)), 30)] + acquisition,
+			transfers = [returned],
+		})) },
 		arms = [
-			{ label = Lower.VariantLabel(option.none), operations = [define(ids.second, Concrete.StringType, Own.StringDefinition("fallback"), Own.OwnedResult(Own.owner_id(0)), 20)], exit = Own.ReturnResult(Own.OwnedReturn(ids.second, Own.owner_id(0))) },
-			{ label = Lower.VariantLabel(option.some), operations = [define(ids.third, Concrete.StringType, Own.PayloadDefinition(seed.string_field, ids.first), Own.BorrowedResult(Own.PayloadBorrow(ids.first)), 30)] + acquisition, exit = Own.ReturnResult(returned) },
+			{
+				id = Model.match_arm_id(0),
+				inputs = [],
+				body = {
+					operations = [define(ids.fourth, Concrete.StringType, Own.StringDefinition("fallback"), Own.OwnedResult(Own.owner_id(2)), 20), Own.AcquireOwner(Own.owner_id(3), { value = ids.fourth, source = Own.OwnerBorrow(Own.owner_id(2)) }, span(20)), Own.DropOwner(Own.owner_id(2), span(20))],
+					tail = Own.ExitLoop(Own.Break({
+						value = Own.OwnedReturn(ids.fourth, Own.owner_id(3)),
+						carried = [],
+						span = span(20)
+					}))
+				}
+			},
+			{
+				id = Model.match_arm_id(1),
+				inputs = [Own.ManagedJoinParameter({
+					id = ids.fifth,
+					value_type = Concrete.StringType,
+					span = span(30)
+				}, Own.owner_id(4))],
+				body = {
+					operations = [Own.AcquireOwner(Own.owner_id(5), { value = ids.fifth, source = Own.OwnerBorrow(Own.owner_id(4)) }, span(30)), Own.DropOwner(Own.owner_id(4), span(30))],
+					tail = Own.ExitLoop(Own.Break({
+						value = Own.OwnedReturn(ids.fifth, Own.owner_id(5)),
+						carried = [],
+						span = span(30)
+					}))
+				}
+			},
 		]
 	}
 	parameter = define(ids.first, result_type(option), Own.ParameterDefinition(0), Own.BorrowedResult(Own.ParameterBorrow(ids.first)), 10)
-	raw_program(seed, raw_function([parameter], Own.MatchTail(matched), [result_type(option)], Concrete.StringType))
-
+	raw_program(seed, raw_function([parameter, Own.ExecuteLoop({
+		entry_acquisitions = [],
+		headers = [],
+		result = Own.ManagedJoinParameter({ id = ids.second, value_type = Concrete.StringType, span = span(40) }, Own.owner_id(0)),
+		carried = [], body = { operations = [], tail = Own.MatchLoop(matched) },
+	})], Own.OwnedReturn(ids.second, Own.owner_id(0)), [result_type(option)], Concrete.StringType))
 
 pure func test_raw_selected_child_acquisition_and_transfer_are_valid() -> Bool:
 	match seed():
@@ -592,13 +629,13 @@ pure func test_raw_selected_child_acquisition_and_transfer_are_valid() -> Bool:
 
 pure func test_verifier_rejects_child_transfer_without_acquisition() -> Bool:
 	match seed():
-		Ok(seed): rejects(raw_child(seed, False, True), "owner 1 is not defined", 30)
+		Ok(seed): rejects(raw_child(seed, False, True), "owner 1 is not defined", 10)
 		Err(_): False
 
 
 pure func test_verifier_rejects_unmanaged_borrowed_child_return() -> Bool:
 	match seed():
-		Ok(seed): rejects(raw_child(seed, False, False), "managed return requires an owner transfer", 30)
+		Ok(seed): rejects(raw_child(seed, False, False), "managed yield requires an owner transfer", 10)
 		Err(_): False
 
 
@@ -611,19 +648,16 @@ pure func test_verifier_accepts_dropped_list_get_before_unmanaged_match() -> Boo
 			list_type = Concrete.ListType(Concrete.StringType)
 			option = seed.integer_option
 			call: Concrete.CallTarget = Concrete.RuntimeFunction(Builtins.ListGet(Concrete.StringType, seed.string_option))
-			matched: Own.OwnedMatch = {
-				scrutinee = Own.UnmanagedArgument(ids.second),
-				owner = Concrete.variant_owner(option.some),
+			matched: Own.OwnedLoopMatch = {
+				selection = Selection.branches(Own.UnmanagedArgument(ids.second), option.none),
 				arms = [
 					{
-						label = Lower.VariantLabel(option.none),
-						operations = [],
-						exit = Own.ReturnResult(Own.UnmanagedReturn(ids.fifth))
+						id = Model.match_arm_id(0), inputs = [],
+						body = { operations = [], tail = Own.ExitLoop(Own.Break({ value = Own.UnmanagedReturn(ids.fifth), carried = [], span = span(50) })) }
 					},
 					{
-						label = Lower.VariantLabel(option.some),
-						operations = [],
-						exit = Own.ReturnResult(Own.UnmanagedReturn(ids.fifth))
+						id = Model.match_arm_id(1), inputs = [],
+						body = { operations = [], tail = Own.ExitLoop(Own.Break({ value = Own.UnmanagedReturn(ids.fifth), carried = [], span = span(50) })) }
 					},
 				]
 			}
@@ -674,8 +708,14 @@ pure func test_verifier_accepts_dropped_list_get_before_unmanaged_match() -> Boo
 						Own.UnmanagedResult,
 						50,
 					),
-				],
-				Own.MatchTail(matched),
+				].append(Own.ExecuteLoop({
+					entry_acquisitions = [],
+					headers = [],
+					result = Own.UnmanagedJoinParameter({ id = ids.sixth, value_type = Concrete.IntType, span = span(60) }),
+					carried = [],
+					body = { operations = [], tail = Own.MatchLoop(matched) },
+				})),
+				Own.UnmanagedReturn(ids.sixth),
 				[list_type, result_type(option)],
 				Concrete.IntType,
 			)
@@ -691,7 +731,7 @@ private pure func raw_encoder(seed: Seed, result: Own.ResultOwnership) -> Own.Ow
 		define(ids.second, result_type(seed.string_option), Own.CallDefinition(call, [Own.UnmanagedArgument(ids.first)]), result, 30),
 		Own.DropOwner(Own.owner_id(0), span(40)),
 		define(ids.third, Concrete.IntType, Own.IntegerDefinition(0), Own.UnmanagedResult, 50),
-	], Own.ReturnTail(Own.ReturnResult(Own.UnmanagedReturn(ids.third))), [], Concrete.IntType))
+	], Own.UnmanagedReturn(ids.third), [], Concrete.IntType))
 
 
 pure func test_verifier_requires_a_fresh_encoder_result_owner() -> Bool:

@@ -52,6 +52,8 @@ it adds no grammar form. User
 modules also receive the ordinary prelude's selected methods; library operation
 modules receive the base alone. Explicit and implicit exposures of the same
 function are idempotent; different applicable functions remain ambiguous.
+Blorp 2 uses explicit `bool: not, and, or` imports for ordinary eager Boolean calls;
+only their callable-name positions accept those keyword tokens. Prefix/infix forms are invalid there.
 Closed runtime bodies name one operation, as in `builtin("string.parse_int")`,
 which returns the foundation's designated `Option[Int]`; `builtin("int.equals")`
 and `builtin("int.less_than")` require pure nongeneric two-Int declarations
@@ -342,6 +344,9 @@ including continuation bytes, without decoding a scalar.
 rejecting negatives, U+D800-U+DFFF and values above U+10FFFF before narrowing.
 NUL, unassigned scalars and noncharacters are accepted. Both interfaces
 preserve String's UTF-8 invariant.
+`string.slice(String, Int, Int) -> Option[String]` uses ordinary calls and UFCS.
+It requires half-open byte bounds at scalar boundaries and returns a fresh
+String in Some, or None for invalid bounds; literal syntax is unchanged.
 
 **Plain string** `"..."`: a double quote, then any characters except `"`, `\`,
 a line feed, or a `${` hole opener, then a closing `"` (`STR:132-152`,
@@ -1279,6 +1284,9 @@ lambda_body  = NEWLINE block              (* a bracketed block when inside brack
   follows its header's `:` on a new line, so `if c: 1`, `else: 2` and
   `while c: f()` are ``expected newline before indented block``. Only a
   `match` case may put its body on the case's line.
+- An absent `else` gives the if type `Void`; its then block must return `Void`
+  or end with a statement. This applies in a binding as well as a statement
+  position. Producing a non-Void result requires both branches.
 - A block opened inside an expression (the block of an `if` or `match` used as
   a value, a block lambda) must also satisfy the
   [bracketed-block anchor](#41-the-bracketed-block-anchor). The `with`,
@@ -1378,6 +1386,10 @@ dim_atom      = DIMNAME | "#" "_" | "#" INT | INT | "(" dim_expr ")" ;
   stack in the current implementation; they add no grammar production.
 - Blorp 2's [List callback helpers](../blorp_2/LIST_CALLBACK_PLAN.md) use the
   same pure callable parameter syntax; they introduce no additional grammar.
+- Blorp 2's [List queries and copies](../blorp_2/standard_library/README.md#list-queries-and-copies)
+  use ordinary selective imports, generic calls and UFCS: `list: get_or,
+  is_empty, last, take, drop, remove, reverse, find, all`. Find/all use the
+  existing `pure (T) -> Bool` parameter syntax; they add no grammar production.
 - `(T)` is `T`. `(T,)` is ``a tuple type has two to four elements, and `(T,)`
   has one``. A function type's return type extends as far as a type can, so
   `(A) -> (B) -> C` returns `(B) -> C`.
@@ -1875,6 +1887,15 @@ Any other target is a syntax error. Owner decisions:
 >   *(pending language change)*
 
 ### 5.3 `break`, `continue` and `?=`
+
+The [Blorp 2 subset](../blorp_2/grammar.ebnf) checks nested `while` with designated
+Bool conditions and `for` over Lists or ascending, end-exclusive Int ranges.
+The iterable or bounds evaluate once before iteration; empty Lists and equal or
+reversed ranges run no body. `break` and `continue` target the nearest loop,
+including through statement `if` and `match`; `continue` advances a `for`
+cursor. Managed carried values retain ordinary value semantics. Its parser
+still rejects loop control in value-position `if`/`match` and propagation in
+loop bodies. These pilot limits do not narrow the language rules below.
 
 - `break` and `continue` are valid only inside the body of a `while`, `for` or
   `for ... concurrently` loop. A function body, a lambda body and a

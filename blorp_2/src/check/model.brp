@@ -3,9 +3,11 @@ The checked program model that checking publishes and specialization reads:
 resolved types, signatures, bindings, values and function bodies.
 ---
 import:
+	../utils/boolean: not, and
 	../namespace/builtins:
 		PrimitiveType(BuiltinInt, BuiltinFloat, BuiltinString, BuiltinVoid),
 		RuntimeOperation,
+		DesignatedBoolean, DesignatedOption,
 	../utils/ids:
 		ConstantId,
 		FunctionId,
@@ -135,15 +137,16 @@ pure func callable_position(id: CallableParameterId) -> Int:
 
 
 pure func same_callable_parameter(left: CallableParameterId, right: CallableParameterId) -> Bool:
-	(
-		IntOps.equals(function_number(callable_owner(left)), function_number(callable_owner(right)))
-		and IntOps.equals(callable_position(left), callable_position(right))
+	and(
+		IntOps.equals(function_number(callable_owner(left)), function_number(callable_owner(right))),
+		IntOps.equals(callable_position(left), callable_position(right)),
 	)
 
 
 fixed union CallableChoice:
 	NamedCallable(FunctionId, List[TypeRef])
 	ForwardedCallable(CallableParameterId)
+	LambdaCallable(LambdaId, List[CheckedExpr])
 
 
 fixed record CallableArgument {
@@ -186,6 +189,67 @@ pure func primitive_ref(value_type: PrimitiveType) -> TypeRef:
 -- checking. binding_id is public only so the checking modules can issue them;
 -- an ordinal names a binding, never a role.
 opaque type BindingId = Int
+
+
+opaque type LambdaId = Int
+
+
+fixed union BodyOwner:
+	DeclaredBody(FunctionId)
+	LambdaBody(LambdaId)
+
+
+fixed record ScopedBindingId {
+	owner: BodyOwner,
+	binding: BindingId
+}
+
+
+private fixed record CaptureIdentity {
+	owner: LambdaId,
+	position: Int
+}
+
+
+opaque type CaptureId = CaptureIdentity
+
+
+pure func capture_id(owner: LambdaId, position: Int) -> CaptureId:
+	into_opaque CaptureId({ owner = owner, position = position })
+
+
+pure func capture_owner(id: CaptureId) -> LambdaId:
+	from_opaque CaptureId(id).owner
+
+
+pure func capture_number(id: CaptureId) -> Int:
+	from_opaque CaptureId(id).position
+
+
+pure func lambda_id(ordinal: Int) -> LambdaId:
+	into_opaque LambdaId(ordinal)
+
+
+pure func lambda_number(id: LambdaId) -> Int:
+	from_opaque LambdaId(id)
+
+
+pure func same_body(left: BodyOwner, right: BodyOwner) -> Bool:
+	match left:
+		DeclaredBody(first):
+			match right:
+				DeclaredBody(second): IntOps.equals(function_number(first), function_number(second))
+				_: False
+		LambdaBody(first):
+			match right:
+				LambdaBody(second): IntOps.equals(lambda_number(first), lambda_number(second))
+				_: False
+
+
+pure func same_scoped_binding(left: ScopedBindingId, right: ScopedBindingId) -> Bool:
+	match same_body(left.owner, right.owner):
+		True: IntOps.equals(binding_number(left.binding), binding_number(right.binding))
+		False: False
 
 
 fixed union BindingOrigin:
@@ -242,12 +306,13 @@ fixed union CheckedForm:
 	LiteralFloat(Float)
 	LiteralString(String)
 	ReadBinding(BindingId)
+	ReadCapture(CaptureId)
 	ConstructVariant(VariantId, List[CheckedExpr])
 	ConstructRecord(RecordId, List[CheckedRecordField])
 	ConstructList(List[CheckedExpr])
 	ConstructOpaque(OpaqueId, CheckedExpr)
 	ProjectOpaque(OpaqueId, CheckedExpr)
-	-- A bound or statement match; the tail match is a CheckedMatchBody.
+	-- A value match, including an ordinary function's tail expression.
 	Match(CheckedJoin)
 	UpdateRecord(RecordId, CheckedRecordUpdate)
 	InvokeFunction(CheckedCall, List[CheckedExpr])
@@ -268,15 +333,99 @@ fixed union CheckedStatement:
 	InitializeBinding(BindingId, CheckedExpr)
 	ReassignBinding(BindingId, CheckedExpr)
 	DiscardExpression(CheckedExpr)
+	RunWhile(CheckedWhile)
+	RunFor(CheckedFor)
+	BreakSourceLoop(Span)
+	ContinueSourceLoop(Span)
 
 
-fixed union CheckedPattern:
-	VariantCase(VariantId, List[Option[BindingId]])
-	WildcardCase
+-- Check owns the condition's designation and ordered enclosing writes. Locals
+-- belong to the body; specialization decides header eligibility from layouts.
+fixed record CheckedWhile {
+	condition: CheckedExpr,
+	body: List[CheckedStatement],
+	carried: List[BindingId],
+	boolean: DesignatedBoolean[VariantId],
+	span: Span
+}
+
+
+fixed union CheckedIteration:
+	ListIteration(CheckedExpr, TypeRef, DesignatedOption[VariantId])
+	AscendingIntRange(CheckedExpr, CheckedExpr, DesignatedBoolean[VariantId])
+
+
+fixed record CheckedFor {
+	iteration: CheckedIteration,
+	item: Option[BindingId],
+	body: List[CheckedStatement],
+	carried: List[BindingId],
+	span: Span
+}
+
+
+-- Selection identities live within one checked match and survive specialization.
+opaque type MatchArmId = Int
+
+
+opaque type DecisionNodeId = Int
+
+
+pure func match_arm_id(ordinal: Int) -> MatchArmId:
+	into_opaque MatchArmId(ordinal)
+
+
+pure func match_arm_number(id: MatchArmId) -> Int:
+	from_opaque MatchArmId(id)
+
+
+pure func decision_node_id(ordinal: Int) -> DecisionNodeId:
+	into_opaque DecisionNodeId(ordinal)
+
+
+pure func decision_node_number(id: DecisionNodeId) -> Int:
+	from_opaque DecisionNodeId(id)
+
+
+fixed record CheckedPatternPlace {
+	value_type: TypeRef,
+	route: CheckedPatternRoute
+}
+
+
+fixed union CheckedPatternRoute:
+	MatchRoot
+	UnionField(CheckedPatternPlace, VariantId, Int)
+	ListElement(CheckedPatternPlace, Int)
+
+
+fixed union ListLengthTest:
+	ExactLength(Int)
+	MinimumLength(Int)
+
+
+fixed union CheckedPatternArgument:
+	BorrowPlace(CheckedPatternPlace)
+	CopyListSuffix(CheckedPatternPlace, Int)
+
+
+fixed union CheckedDecisionNode:
+	TestVariant(CheckedPatternPlace, VariantId, DecisionNodeId, DecisionNodeId)
+	EnterArm(MatchArmId, List[CheckedPatternArgument])
+	TestListLength(CheckedPatternPlace, ListLengthTest, DecisionNodeId, DecisionNodeId)
+	TestStringBytes(CheckedPatternPlace, String, DecisionNodeId, DecisionNodeId)
+
+
+-- Successors precede their tests; exhaustive checking establishes the last entry.
+fixed record CheckedSelection {
+	nodes: List[CheckedDecisionNode],
+	entry: DecisionNodeId
+}
 
 
 fixed record CheckedArm {
-	pattern: CheckedPattern,
+	id: MatchArmId,
+	inputs: List[BindingId],
 	statements: List[CheckedStatement],
 	body: CheckedExit
 }
@@ -284,7 +433,7 @@ fixed record CheckedArm {
 
 fixed record CheckedMatch {
 	scrutinee: CheckedExpr,
-	union_type: TypeRef,
+	selection: CheckedSelection,
 	arms: List[CheckedArm]
 }
 
@@ -294,21 +443,22 @@ fixed union CheckedExit:
 	RecurWith(List[CheckedExpr], Span)
 
 
--- An arm of a bound or statement match: after its statements it yields
--- `value` to the join. No source form leaves such an arm by returning yet.
+-- A value-match arm, including an ordinary function tail: after its
+-- statements it yields `value` to the join, then the enclosing body continues.
 fixed record CheckedJoinArm {
-	pattern: CheckedPattern,
+	id: MatchArmId,
+	inputs: List[BindingId],
 	statements: List[CheckedStatement],
 	value: CheckedExpr
 }
 
 
--- A match that is not the function's tail: the function continues after it
--- with the value its selected arm yields, of the expression's type (Void for
--- a statement match). Union and pattern facts are the tail match's.
+-- A value match: the enclosing body continues with the selected arm's value,
+-- including the return after an ordinary function tail. The expression's type
+-- is Void for a statement match; annotated root tails use CheckedMatchBody.
 fixed record CheckedJoin {
 	scrutinee: CheckedExpr,
-	union_type: TypeRef,
+	selection: CheckedSelection,
 	arms: List[CheckedJoinArm],
 	carried: List[BindingId]
 }
@@ -326,6 +476,57 @@ fixed record CheckedFunction {
 	bindings: List[BindingDefinition],
 	statements: List[CheckedStatement],
 	body: CheckedBody
+}
+
+
+-- One global row per admitted site; local bindings belong to this body only.
+fixed record CheckedCapture {
+	binding: ScopedBindingId,
+	value_type: TypeUse
+}
+
+
+fixed record CheckedLambda {
+	root: FunctionId,
+	parameters: List[TypeUse],
+	return_type: TypeUse,
+	bindings: List[BindingDefinition],
+	captures: List[CheckedCapture],
+	statements: List[CheckedStatement],
+	body: CheckedBody
+}
+
+
+-- Construction rows retain the lexical parent while descendants resolve free
+-- reads. Only CheckedLambda rows pass the final Check publication boundary.
+fixed record PendingLambdaRow {
+	parent: BodyOwner,
+	captures: List[CheckedCapture]
+}
+
+
+fixed union LambdaRow:
+	CollectingLambda(PendingLambdaRow)
+	CheckedLambdaRow(CheckedLambda)
+
+
+fixed record CheckedValueResult {
+	value: CheckedExpr,
+	lambdas: List[LambdaRow]
+}
+
+
+fixed record ResolvedBody {
+	bindings: List[BindingDefinition],
+	statements: List[CheckedStatement],
+	body: CheckedBody,
+	lambdas: List[LambdaRow]
+}
+
+
+fixed record CheckedBodies {
+	functions: List[CheckedFunction],
+	lambdas: List[CheckedLambda]
 }
 
 
@@ -348,6 +549,7 @@ fixed record CheckedFunctions {
 	unions: List[CheckedUnion],
 	opaques: List[CheckedOpaque],
 	functions: List[CheckedFunction],
+	lambdas: List[CheckedLambda],
 	entrypoint: Entrypoint[FunctionId]
 }
 
@@ -401,24 +603,25 @@ pure func same_type(left: TypeRef, right: TypeRef) -> Bool:
 		AppliedRecordType(owner, arguments):
 			match right:
 				AppliedRecordType(other_owner, others):
-					(
-						IntOps.equals(record_number(owner), record_number(other_owner))
-						and same_types(arguments, others)
-					)
+					match IntOps.equals(record_number(owner), record_number(other_owner)):
+						True: same_types(arguments, others)
+						False: False
 				_:
 					False
 		AppliedUnionType(owner, arguments):
 			match right:
 				AppliedUnionType(other_owner, others):
-					(
-						IntOps.equals(union_number(owner), union_number(other_owner))
-						and same_types(arguments, others)
-					)
+					match IntOps.equals(union_number(owner), union_number(other_owner)):
+						True: same_types(arguments, others)
+						False: False
 				_:
 					False
 		PureCallableType(parameters, result):
 			match right:
-				PureCallableType(others, other): same_types(parameters, others) and same_type(result, other)
+				PureCallableType(others, other):
+					match same_types(parameters, others):
+						True: same_type(result, other)
+						False: False
 				_: False
 		ParameterType(parameter):
 			match right:
@@ -465,11 +668,13 @@ pure func same_types(left: List[TypeRef], right: List[TypeRef]) -> Bool:
 	for value in left:
 		match right.get(index):
 			Some(other):
-				matches = matches and same_type(value, other)
+				matches = match matches:
+					True: same_type(value, other)
+					False: False
 			None:
 				matches = False
 
-		if not matches:
+		if matches.not():
 			break
 
 		index = IntOps.add(index, 1)
@@ -507,9 +712,9 @@ pure func same_owner(left: TypeParameterOwner, right: TypeParameterOwner) -> Boo
 					False
 
 pure func same_parameter(left: TypeParameterId, right: TypeParameterId) -> Bool:
-	(
-		same_owner(parameter_owner(left), parameter_owner(right))
-		and IntOps.equals(parameter_position(left), parameter_position(right))
+	and(
+		same_owner(parameter_owner(left), parameter_owner(right)),
+		IntOps.equals(parameter_position(left), parameter_position(right)),
 	)
 
 
@@ -538,9 +743,9 @@ pure func union_occurrence(value: TypeRef) -> Option[UnionOccurrence]:
 
 
 pure func same_variant(left: VariantId, right: VariantId) -> Bool:
-	(
-		IntOps.equals(union_number(variant_owner(left)), union_number(variant_owner(right)))
-		and IntOps.equals(variant_number(left), variant_number(right))
+	and(
+		IntOps.equals(union_number(variant_owner(left)), union_number(variant_owner(right))),
+		IntOps.equals(variant_number(left), variant_number(right)),
 	)
 
 
@@ -597,7 +802,7 @@ private pure func append_value_calls(
 			calls = calls.append(call)
 		ReadRecordField(receiver, _):
 			calls = append_value_calls(calls, receiver)
-		LiteralVoid | LiteralInteger(_) | LiteralFloat(_) | LiteralString(_) | ReadBinding(_):
+		LiteralVoid | LiteralInteger(_) | LiteralFloat(_) | LiteralString(_) | ReadBinding(_) | ReadCapture(_):
 			void
 
 	calls
@@ -617,14 +822,31 @@ private pure func append_statement_calls(
 				calls = append_value_calls(calls, value)
 			ReassignBinding(_, value):
 				calls = append_value_calls(calls, value)
+			RunWhile(loop):
+				calls = append_statement_calls(append_value_calls(calls, loop.condition), loop.body)
+			BreakSourceLoop(_) | ContinueSourceLoop(_): void
+			RunFor(loop):
+				match loop.iteration:
+					ListIteration(iterable, _, _): calls = append_value_calls(calls, iterable)
+					AscendingIntRange(start, end, _):
+						calls = append_value_calls(append_value_calls(calls, start), end)
+				calls = append_statement_calls(calls, loop.body)
 
 	calls
 
 
 pure func function_calls(function: CheckedFunction) -> List[CheckedCall]:
-	var calls = append_statement_calls([], function.statements)
+	body_calls(function.statements, function.body)
 
-	match function.body:
+
+pure func lambda_calls(lambda: CheckedLambda) -> List[CheckedCall]:
+	body_calls(lambda.statements, lambda.body)
+
+
+pure func body_calls(statements: List[CheckedStatement], body: CheckedBody) -> List[CheckedCall]:
+	var calls = append_statement_calls([], statements)
+
+	match body:
 		CheckedValueBody(value):
 			append_exit_calls(calls, value)
 		CheckedMatchBody(matched):

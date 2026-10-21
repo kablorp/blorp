@@ -1,0 +1,114 @@
+import:
+	../../../src/lower/lower as Lower
+	../../../src/namespace/builtins as Builtins
+	../../../src/own/own as Own
+	../../../src/specialize/specialize as Concrete
+	../../../src/utils/source: same_source
+	../../../src/utils/syntax: Diagnostic
+	../../../src/verify/verify: verify
+	../ownership_inputs: span
+	../string_slice_inputs: slice_seed
+	test: TestSuite
+
+
+private fixed union RawSliceCase:
+	Valid
+	WrongSource
+	WrongStart
+	SwappedConstructors
+	MissingDrop
+	DuplicateDrop
+
+
+private pure func define(id: Lower.ValueId, value_type: Concrete.TypeRef, operation: Own.OwnedValueOperation, result: Own.ResultOwnership, at: Int) -> Own.OwnershipOperation:
+	Own.DefineValue({ id = id, value_type = value_type, operation = operation, result = result, span = span(at) })
+
+
+-- Only Lower identities/layouts come from the seed; all ownership IR is raw.
+private pure func raw_slice(case: RawSliceCase) -> Result[Own.OwnershipProgram, Diagnostic]:
+	seed ?= slice_seed()
+	contents = Lower.lowered_functions(seed.lowered)
+	match seed.query.steps:
+		[Lower.Define(source), Lower.Define(start), Lower.Define(end), Lower.Define(sliced)]:
+			borrowed: Own.OwnedArgument = Own.BorrowedArgument({ value = source.id, source = Own.ParameterBorrow(source.id) })
+			first: Own.OwnedArgument = Own.UnmanagedArgument(start.id)
+			last: Own.OwnedArgument = Own.UnmanagedArgument(end.id)
+			arguments = match case:
+				WrongSource: [first, first, last]
+				WrongStart: [borrowed, borrowed, last]
+				_: [borrowed, first, last]
+			option = match case:
+				SwappedConstructors: { some = seed.option.none, none = seed.option.some }
+				_: seed.option
+			drops: List[Own.OwnershipOperation] = match case:
+				MissingDrop: []
+				DuplicateDrop: [Own.DropOwner(Own.owner_id(0), span(40)), Own.DropOwner(Own.owner_id(0), span(41))]
+				_: [Own.DropOwner(Own.owner_id(0), span(40))]
+			target: Concrete.CallTarget = Concrete.RuntimeFunction(Builtins.StringSlice(option))
+			worker: Own.OwnedFunction = {
+				signature = { parameters = [Concrete.StringType, Concrete.IntType, Concrete.IntType], return_type = Concrete.IntType },
+				operations = [
+					define(source.id, Concrete.StringType, Own.ParameterDefinition(0), Own.BorrowedResult(Own.ParameterBorrow(source.id)), 10),
+					define(start.id, Concrete.IntType, Own.ParameterDefinition(1), Own.UnmanagedResult, 20),
+					define(end.id, Concrete.IntType, Own.ParameterDefinition(2), Own.UnmanagedResult, 25),
+					define(sliced.id, Concrete.UnionType(Concrete.variant_owner(seed.option.some)), Own.CallDefinition(target, arguments), Own.OwnedResult(Own.owner_id(0)), 30),
+				] + drops,
+				result = Own.UnmanagedReturn(start.id)
+			}
+			main: Own.OwnedFunction = {
+				signature = { parameters = [], return_type = Concrete.IntType },
+				operations = [define(source.id, Concrete.IntType, Own.IntegerDefinition(0), Own.UnmanagedResult, 1)],
+				result = Own.UnmanagedReturn(source.id)
+			}
+			Ok({ records = contents.records, unions = contents.unions, functions = [main, worker], entrypoint = contents.entrypoint })
+		_: Err({ span = span(0), note = None, message = "expected four slice seed definitions", help = "keep the explicit slice seed" })
+
+
+private pure func rejects(case: RawSliceCase, message: String, at: Int) -> Bool:
+	match raw_slice(case).and_then(pure func(program): verify(program)):
+		Ok(_): False
+		Err(error):
+			(
+				error.message == "ownership verification failed: " + message
+				and error.help == "report this compiler error with the input program"
+				and same_source(error.span.source, span(at).source)
+				and error.span.start == at and error.span.end == at + 1 and error.note.is_none()
+			)
+
+
+pure func test_raw_slice_owner_and_drop_are_valid() -> Bool:
+	raw_slice(Valid).and_then(pure func(program): verify(program)).is_ok()
+
+
+pure func test_slice_rejects_wrong_source() -> Bool:
+	rejects(WrongSource, "call argument type does not match its contract", 30)
+
+
+pure func test_slice_rejects_wrong_start() -> Bool:
+	rejects(WrongStart, "call argument type does not match its contract", 30)
+
+
+pure func test_slice_rejects_constructor_payload_mismatch() -> Bool:
+	rejects(SwappedConstructors, "variant field count does not match its operation", 30)
+
+
+pure func test_slice_rejects_missing_retirement() -> Bool:
+	rejects(MissingDrop, "owner 0 remains live at return", 20)
+
+
+pure func test_slice_rejects_duplicate_retirement() -> Bool:
+	rejects(DuplicateDrop, "owner 0 has already been discharged", 41)
+
+
+tests: TestSuite = {
+	description = "Blorp 2 independent checked String slice verification",
+	-- Generic missing owners and child-transfer negatives remain in test_option_ownership.
+	tests = [
+		("raw borrowed input and fresh Option retire validly", test_raw_slice_owner_and_drop_are_valid),
+		("Int cannot occupy String argument", test_slice_rejects_wrong_source),
+		("String cannot occupy start argument", test_slice_rejects_wrong_start),
+		("constructors preserve payload meaning", test_slice_rejects_constructor_payload_mismatch),
+		("fresh Option requires retirement", test_slice_rejects_missing_retirement),
+		("fresh Option cannot retire twice", test_slice_rejects_duplicate_retirement),
+	]
+}

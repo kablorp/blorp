@@ -1,0 +1,156 @@
+import:
+	../../../src/check/check: checked_functions
+	../../../src/check/errors: CheckErrorKind(CallRejection), CallError(ArgumentCountMismatch, ArgumentTypeMismatch, ImpureCall, UnknownFunction)
+	../../../src/check/model: CheckedBody(CheckedValueBody), CheckedExit(ReturnExpression), CheckedExpr, CallTarget(UserFunction), CheckedForm(InvokeFunction), TypeRef(IntType), same_type
+	../../../src/utils/ids: FunctionId, function_number
+	../../../src/utils/source: module_source, root_module_id, same_source
+	../input: check, checked_source, rejects_at
+	../module_input: parse_modules
+	test: TestSuite
+
+
+-- Int signatures prove these names use ordinary contracts, not wired-in Bool rules.
+private FUNCTIONS: String =
+	|pure func not(value: Int) -> Int:
+	|    value
+	|pure func and(left: Int, right: Int) -> Int:
+	|    left
+	|pure func or(left: Int, right: Int) -> Int:
+	|    right
+	|
+
+private MAIN: String = "pure func main() -> Int:\n    "
+
+
+private pure func calls(value: CheckedExpr, target: FunctionId) -> Bool:
+	match value.form:
+		InvokeFunction(call, _):
+			match call.target:
+				UserFunction(actual, [], []): function_number(actual) == function_number(target)
+				_: False
+		_: False
+
+
+pure func test_direct_and_receiver_calls_keep_ordinary_function_ids() -> Bool:
+	match checked_source(FUNCTIONS + MAIN + "and(not(1), or(2, 3)).not()\n"):
+		Err(_): False
+		Ok(program):
+			match checked_functions(program).functions:
+				[negation, conjunction, disjunction, main]:
+					match main.body:
+						CheckedValueBody(ReturnExpression(value)):
+							match value.form:
+								InvokeFunction(_, [receiver]):
+									match receiver.form:
+										InvokeFunction(_, [left, right]):
+											(calls(value, negation.id) and calls(receiver, conjunction.id)
+												and calls(left, negation.id) and calls(right, disjunction.id)
+												and same_type(value.value_type, IntType))
+										_: False
+								_: False
+						_: False
+				_: False
+
+
+pure func test_each_callable_keyword_accepts_both_call_forms() -> Bool:
+	["not(1)", "1.not()", "and(1, 2)", "1.and(2)", "or(1, 2)", "1.or(2)"].all(pure func(expression):
+		checked_source(FUNCTIONS + MAIN + expression + "\n").is_ok()
+	)
+
+
+pure func test_selected_qualified_and_receiver_calls_share_the_imported_function() -> Bool:
+	source: String =
+		|import:
+		|    ./ops as Ops: not, and, or
+		|func main() -> Int:
+		|    and(Ops.not(1), 2).or(3)
+		|
+	match parse_modules([{ source = source, targets = [1] }, { source = FUNCTIONS, targets = [] }]):
+		Err(_): False
+		Ok(parsed):
+			match check(parsed):
+				Err(_): False
+				Ok(program):
+					match checked_functions(program).functions:
+						[main, negation, conjunction, disjunction]:
+							match main.body:
+								CheckedValueBody(ReturnExpression(value)):
+									match value.form:
+										InvokeFunction(_, [receiver, _]):
+											match receiver.form:
+												InvokeFunction(_, [left, _]):
+													calls(value, disjunction.id) and calls(receiver, conjunction.id) and calls(left, negation.id)
+												_: False
+										_: False
+								_: False
+						_: False
+
+
+private pure func rejects_call(prefix: String, marked: String, suffix: String, matches: pure (CheckErrorKind) -> Bool, message: String, help: String) -> Bool:
+	source = prefix + marked + suffix
+	match checked_source(source):
+		Err(error):
+			(rejects_at(source, prefix.length(), prefix.length() + marked.length(), matches)
+				and error.message == message and error.help == help and error.note.is_none()
+				and same_source(error.span.source, module_source(root_module_id()))
+				and error.span.start == prefix.length() and error.span.end == prefix.length() + marked.length())
+		Ok(_): False
+
+
+pure func test_unknown_callable_keyword_is_an_ordinary_unknown_function() -> Bool:
+	matches = pure func(kind: CheckErrorKind) -> Bool:
+		match kind:
+			CallRejection(UnknownFunction(_)): True
+			_: False
+	rejects_call(MAIN, "not", "(1)\n", matches,
+		"unknown function", "declare the function locally or import it by name; type selections enable receiver calls only")
+
+
+pure func test_callable_keyword_arity_keeps_the_ordinary_diagnostic() -> Bool:
+	matches = pure func(kind: CheckErrorKind) -> Bool:
+		match kind:
+			CallRejection(ArgumentCountMismatch(_)): True
+			_: False
+	rejects_call(FUNCTIONS + MAIN, "and", "(1)\n", matches,
+		"argument count does not match the function parameters", "pass one expression for each declared parameter; UFCS supplies the receiver first")
+
+
+pure func test_callable_keyword_operand_type_keeps_the_ordinary_diagnostic() -> Bool:
+	declarations: String =
+		|fixed union Bool:
+		|    True
+		|    False
+		|pure func not(value: Bool) -> Bool:
+		|    value
+		|func main() -> Int:
+		|
+	matches = pure func(kind: CheckErrorKind) -> Bool:
+		match kind:
+			CallRejection(ArgumentTypeMismatch(_)): True
+			_: False
+	rejects_call(declarations + "    ignored = ", "not", "(1)\n    0\n", matches,
+		"argument type does not match the parameter type", "use an expression of type Bool here")
+
+
+pure func test_eager_rhs_keeps_the_callers_purity() -> Bool:
+	prefix = FUNCTIONS + "func effect() -> Int:\n    1\n" + MAIN + "and(0, "
+	matches = pure func(kind: CheckErrorKind) -> Bool:
+		match kind:
+			CallRejection(ImpureCall(_, _)): True
+			_: False
+	rejects_call(prefix, "effect", "())\n", matches,
+		"pure functions cannot call impure functions", "mark the callee pure or remove pure from the caller")
+
+
+tests: TestSuite = {
+	description = "Ordinary callable keyword contracts",
+	tests = [
+		("direct and receiver calls retain ordinary function IDs", test_direct_and_receiver_calls_keep_ordinary_function_ids),
+		("each callable keyword accepts direct and receiver syntax", test_each_callable_keyword_accepts_both_call_forms),
+		("selected qualified and receiver calls share declarations", test_selected_qualified_and_receiver_calls_share_the_imported_function),
+		("unknown keyword callee keeps ordinary lookup failure", test_unknown_callable_keyword_is_an_ordinary_unknown_function),
+		("keyword callee keeps ordinary arity failure", test_callable_keyword_arity_keeps_the_ordinary_diagnostic),
+		("keyword callee keeps ordinary argument-type failure", test_callable_keyword_operand_type_keeps_the_ordinary_diagnostic),
+		("eager RHS keeps caller purity", test_eager_rhs_keeps_the_callers_purity),
+	]
+}

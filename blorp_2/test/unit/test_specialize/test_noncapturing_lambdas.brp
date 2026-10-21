@@ -1,0 +1,396 @@
+import:
+	../../../src/check/check: checked_functions
+	../../../src/check/model as Checked
+	../../../src/utils/ids as Declaration
+	../../../src/utils/source: module_source, root_module_id
+	../../../src/specialize/specialize as Concrete
+	../../../src/utils/syntax: Diagnostic, FunctionExecution(OrdinaryCalls, SelfTailLoop), same_span, entry_function
+	../source_while_inputs as Input
+	../input: checked_source
+	test: TestSuite
+
+
+private APPLY: String =
+	|pure func apply[A, B](f: pure (A) -> B, value: A) -> B:
+	|    f(value)
+	|
+
+
+private SITES: String =
+	|fixed record Token { value: Int }
+	|func main() -> Int:
+	|    first = apply(pure func(item: Int) -> Token: { value = item }, 7)
+	|    second = apply(pure func(item: Int) -> Token: { value = item }, 9)
+	|    0
+	|
+
+
+private FORWARD: String =
+	|pure func unused[T](value: T) -> T:
+	|    value
+	|pure func route[A, B](f: pure (A) -> B, value: A) -> B:
+	|    apply(f, value)
+	|pure func forward[T](value: T) -> T:
+	|    route(pure func(item: T) -> T: item, value)
+	|func main() -> Int:
+	|    integer = forward(7)
+	|    text = forward("seven")
+	|    0
+	|
+
+
+private pure func specialized(source: String) -> Result[Concrete.SpecializedContents, Diagnostic]:
+	checked ?= checked_source(source)
+	program ?= Concrete.specialize(checked)
+	Ok(Concrete.specialized_contents(program))
+
+
+private pure func returned(function: Concrete.ConcreteFunction) -> Option[Concrete.ConcreteExpr]:
+	match function.body:
+		Concrete.ConcreteValueBody(Concrete.ReturnExpression(value)): Some(value)
+		_: None
+
+
+private pure func target(value: Concrete.ConcreteExpr) -> Option[Int]:
+	match value.form:
+		Concrete.InvokeFunction(call, _):
+			match call.target:
+				Concrete.UserFunction(id): Some(Concrete.function_number(id))
+				_: None
+		_: None
+
+
+private pure func callee(
+	functions: List[Concrete.ConcreteFunction],
+	value: Concrete.ConcreteExpr,
+) -> Option[Concrete.ConcreteFunction]:
+	id ?= target(value)
+	functions.get(id)
+
+
+private pure func callback_target(
+	functions: List[Concrete.ConcreteFunction],
+	application: Concrete.ConcreteExpr,
+) -> Option[Int]:
+	apply ?= callee(functions, application)
+	value ?= returned(apply)
+	target(value)
+
+
+private pure func checked_site(value: Checked.CheckedExpr) -> Option[Checked.LambdaId]:
+	match value.form:
+		Checked.InvokeFunction(call, _):
+			match call.target:
+				Checked.UserFunction(_, _, [argument]):
+					match argument.choice:
+						Checked.LambdaCallable(id, []): Some(id)
+						_: None
+				_: None
+		_: None
+
+
+pure func test_distinct_sites_keep_equal_local_ordinals_separate() -> Bool:
+	match checked_source(APPLY + SITES):
+		Err(_): False
+		Ok(program):
+			checked = checked_functions(program)
+			match (checked.functions, checked.lambdas):
+				([_, main], [first, second]):
+					match (main.statements, first.bindings, second.bindings):
+						([Checked.InitializeBinding(_, left), Checked.InitializeBinding(_, right)], [left_binding], [right_binding]):
+							match (checked_site(left), checked_site(right), left_binding.origin, right_binding.origin):
+								(Some(left_id), Some(right_id), Checked.ParameterBinding(0), Checked.ParameterBinding(0)):
+									match (first.body, second.body):
+										(Checked.CheckedValueBody(Checked.ReturnExpression(left_value)), Checked.CheckedValueBody(Checked.ReturnExpression(right_value))):
+											match (left_value.form, right_value.form):
+												(Checked.ConstructRecord(_, [left_field]), Checked.ConstructRecord(_, [right_field])):
+													match (left_field.value.form, right_field.value.form):
+														(Checked.ReadBinding(left_local), Checked.ReadBinding(right_local)):
+															(
+																Checked.lambda_number(left_id) == 0 and Checked.lambda_number(right_id) == 1
+																and Checked.binding_number(left_local) == 0 and Checked.binding_number(right_local) == 0
+																and Declaration.function_number(first.root) == Declaration.function_number(main.id)
+																and Declaration.function_number(second.root) == Declaration.function_number(main.id)
+															)
+														_: False
+												_: False
+										_: False
+								_: False
+						_: False
+				_: False
+
+
+pure func test_distinct_lambda_instances_share_only_the_nominal_result_layout() -> Bool:
+	match specialized(APPLY + SITES):
+		Err(_): False
+		Ok(program):
+			match (program.functions, program.records):
+				([main, ..._], [layout]):
+					match (main.statements, layout.fields):
+						([Concrete.InitializeBinding(_, first), Concrete.InitializeBinding(_, second)], [Concrete.IntType]):
+							match (target(first), target(second), callback_target(program.functions, first), callback_target(program.functions, second)):
+								(Some(first_apply), Some(second_apply), Some(first_lambda), Some(second_lambda)):
+									match (program.functions.get(first_lambda), program.functions.get(second_lambda)):
+										(Some(left), Some(right)):
+											match (left.signature.return_type, right.signature.return_type):
+												(Concrete.RecordType(left_result), Concrete.RecordType(right_result)):
+													(
+														first_apply != second_apply and first_lambda != second_lambda
+														and Concrete.record_number(left_result) == 0 and Concrete.record_number(right_result) == 0
+														and Concrete.same_type(first.value_type, left.signature.return_type)
+														and Concrete.same_type(second.value_type, right.signature.return_type)
+														and program.functions.length() == 5
+													)
+												_: False
+										_: False
+								_: False
+						_: False
+				_: False
+
+
+pure func test_lambda_rigids_belong_to_the_genuine_enclosing_root() -> Bool:
+	match checked_source(APPLY + FORWARD):
+		Err(_): False
+		Ok(program):
+			checked = checked_functions(program)
+			match (checked.functions, checked.lambdas):
+				([_, unused, _, forward, _], [lambda]):
+					match (forward.signature.type_parameters, unused.signature.type_parameters, lambda.parameters, lambda.return_type.value_type):
+						([root_parameter], [foreign_parameter], [input], Checked.ParameterType(output)):
+							match (input.value_type, Checked.parameter_owner(root_parameter)):
+								(Checked.ParameterType(parameter), Checked.FunctionDeclaration(owner)):
+									(
+										Declaration.function_number(lambda.root) == Declaration.function_number(forward.id)
+										and Declaration.function_number(owner) == Declaration.function_number(forward.id)
+										and Checked.same_parameter(parameter, root_parameter) and Checked.same_parameter(output, root_parameter)
+										and not Checked.same_parameter(parameter, foreign_parameter)
+										and Checked.parameter_position(parameter) == 0
+									)
+								_: False
+						_: False
+				_: False
+
+
+private pure func forwarded_identity(
+	functions: List[Concrete.ConcreteFunction],
+	call: Concrete.ConcreteExpr,
+	expected: Concrete.TypeRef,
+) -> Option[Bool]:
+	forward ?= callee(functions, call)
+	forwarded ?= returned(forward)
+	route ?= callee(functions, forwarded)
+	application ?= returned(route)
+	apply ?= callee(functions, application)
+	invocation ?= returned(apply)
+	lambda ?= callee(functions, invocation)
+	value ?= returned(lambda)
+	match ((forward.signature.parameters, route.signature.parameters, apply.signature.parameters), (lambda.signature.parameters, lambda.bindings, value.form)):
+		(([forward_input], [route_input], [apply_input]), ([lambda_input], [binding], Concrete.ReadBinding(id))):
+			Some(
+				Concrete.same_type(forward_input, expected) and Concrete.same_type(route_input, expected)
+				and Concrete.same_type(apply_input, expected) and Concrete.same_type(route.signature.return_type, expected)
+				and Concrete.same_type(lambda_input, expected) and Concrete.same_type(binding.value_type, expected)
+				and Concrete.same_type(forward.signature.return_type, expected) and Concrete.same_type(apply.signature.return_type, expected)
+				and Concrete.same_type(lambda.signature.return_type, expected) and Concrete.same_type(value.value_type, expected)
+				and Checked.binding_number(id) == 0
+			)
+		_: Some(False)
+
+
+pure func test_one_generic_lambda_site_gets_both_forwarded_root_substitutions() -> Bool:
+	match specialized(APPLY + FORWARD):
+		Err(_): False
+		Ok(program):
+			match program.functions:
+				[main, ..._]:
+					match main.statements:
+						[Concrete.InitializeBinding(_, integer), Concrete.InitializeBinding(_, text)]:
+							(
+								forwarded_identity(program.functions, integer, Concrete.IntType) == Some(True)
+								and forwarded_identity(program.functions, text, Concrete.StringType) == Some(True)
+								and program.functions.length() == 9
+							)
+						_: False
+				_: False
+
+
+pure func test_declared_tail_execution_does_not_leak_into_its_lambda() -> Bool:
+	source: String =
+		|@tail_recursive
+		|pure func spin(value: Int) -> Int:
+		|    ignored = apply(pure func(item: Int): spin(item), value)
+		|    spin(value)
+		|func main() -> Int:
+		|    spin(0)
+		|
+	match specialized(APPLY + source):
+		Err(_): False
+		Ok(program):
+			match program.functions:
+				[_, spin, lambda, apply]:
+					match ((spin.execution, lambda.execution, apply.execution), (spin.body, lambda.body)):
+						((SelfTailLoop(_), OrdinaryCalls, OrdinaryCalls), (Concrete.ConcreteValueBody(Concrete.RecurWith([argument], _)), Concrete.ConcreteValueBody(Concrete.ReturnExpression(call)))):
+							match argument.form:
+								Concrete.ReadBinding(id):
+									target(call) == Some(1) and Checked.binding_number(id) == 0
+								_: False
+						_: False
+				_: False
+
+
+pure func test_erased_callable_keeps_dense_data_parameters_and_direct_calls() -> Bool:
+	source: String =
+		|pure func choose(first: Int, f: pure (Int) -> Int, last: Int) -> Int:
+		|    f(last)
+		|func main() -> Int:
+		|    choose(7, pure func(item: Int): item, 9)
+		|
+	match specialized(source):
+		Err(_): False
+		Ok(program):
+			match (program.functions, program.records):
+				([main, lambda, choose], []):
+					match ((returned(main), returned(choose), returned(lambda)), (choose.bindings, lambda.bindings)):
+						((Some(main_value), Some(choose_value), Some(lambda_value)), ([first, last], [parameter])):
+							match ((main_value.form, choose_value.form, lambda_value.form), (choose.signature.parameters, lambda.signature.parameters)):
+								((Concrete.InvokeFunction(_, [left, right]), Concrete.InvokeFunction(_, [argument]), Concrete.ReadBinding(local)), ([Concrete.IntType, Concrete.IntType], [Concrete.IntType])):
+									match ((left.form, right.form, argument.form), (first.origin, last.origin, parameter.origin)):
+										((Concrete.LiteralInteger(7), Concrete.LiteralInteger(9), Concrete.ReadBinding(input)), (Checked.ParameterBinding(0), Checked.ParameterBinding(1), Checked.ParameterBinding(0))):
+											(
+												target(main_value) == Some(2) and target(choose_value) == Some(1)
+												and Checked.binding_number(input) == 1 and Checked.binding_number(local) == 0
+												and Concrete.same_type(choose.signature.return_type, Concrete.IntType)
+												and Concrete.same_type(lambda.signature.return_type, Concrete.IntType)
+												and main.bindings.is_empty() and choose.statements.is_empty() and lambda.statements.is_empty()
+											)
+										_: False
+								_: False
+						_: False
+				_: False
+
+
+private LOOP_RESULT: String =
+	|pure func wrap[T](value: T) -> Result[T, String]:
+	|    Ok(value)
+	|pure func route[T](value: T) -> Result[T, String]:
+	|    item ?= wrap(apply(pure func(first: T) -> T: first, value))
+	|    Ok(apply(pure func(second: T) -> T:
+	|        var current = second
+	|        while False:
+	|            current = second
+	|        current
+	|    , item))
+	|func main() -> Int:
+	|
+
+private SCALAR_LOOP_CALL: String =
+	|    result = route(7)
+	|    0
+	|
+
+private MANAGED_LOOP_CALL: String =
+	|    result = route("old")
+	|    0
+	|
+
+
+pure func test_result_lambda_scalar_header_uses_the_current_layout_admission() -> Bool:
+	Input.concrete(APPLY + LOOP_RESULT + SCALAR_LOOP_CALL).is_ok()
+
+
+-- Follow the actual Result success payload and apply target; lambda and
+-- concrete-function ordinals belong to different identity authorities.
+private pure func managed_lambda_header_facts() -> Option[Bool]:
+	source = APPLY + LOOP_RESULT + MANAGED_LOOP_CALL
+	accepted ?= Input.checked(source).to_option()
+	local_start ?= source.index_of("current = second")
+	checked = checked_functions(accepted)
+	root_main ?= checked.functions.get(Declaration.function_number(entry_function(checked.entrypoint)))
+	root_call ?= match root_main.statements:
+		[Checked.InitializeBinding(_, value)]: Some(value)
+		_: None
+	root_id ?= match root_call.form:
+		Checked.InvokeFunction(call, _):
+			match call.target:
+				Checked.UserFunction(id, _, []): Some(id)
+				_: None
+		_: None
+	root ?= checked.functions.get(Declaration.function_number(root_id))
+	joined ?= match root.body:
+		Checked.CheckedValueBody(Checked.ReturnExpression(value)):
+			match value.form:
+				Checked.Match(join): Some(join)
+				_: None
+		_: None
+	success ?= joined.arms.get(0)
+	application ?= match success.value.form:
+		Checked.ConstructVariant(_, [value]): Some(value)
+		_: None
+	site ?= checked_site(application)
+	lambda ?= checked.lambdas.get(Checked.lambda_number(site))
+	binding ?= lambda.bindings.get(1)
+	parameter_binding ?= lambda.bindings.get(0)
+	checked_loop ?= match lambda.statements:
+		[Checked.InitializeBinding(_, _), Checked.RunWhile(loop)]: Some(loop)
+		_: None
+	program ?= Concrete.specialize(accepted).to_option()
+	contents = Concrete.specialized_contents(program)
+	main ?= contents.functions.get(Concrete.function_number(entry_function(contents.entrypoint)))
+	call ?= match main.statements:
+		[Concrete.InitializeBinding(_, value)]: Some(value)
+		_: None
+	route ?= callee(contents.functions, call)
+	result ?= returned(route)
+	concrete_join ?= match result.form:
+		Concrete.Match(join): Some(join)
+		_: None
+	concrete_success ?= concrete_join.arms.get(0)
+	concrete_application ?= match concrete_success.value.form:
+		Concrete.ConstructVariant(_, [value]): Some(value)
+		_: None
+	target_id ?= callback_target(contents.functions, concrete_application)
+	function ?= contents.functions.get(target_id)
+	match (function.bindings, function.statements, returned(function)):
+		([parameter, local], [Concrete.InitializeBinding(initial, input), Concrete.RunWhile(loop)], Some(output)):
+			plan ?= Concrete.value_ownership(local.value_type, contents.unions, contents.records).to_option()
+			match ((binding.origin, binding.mutability, parameter.origin, local.origin), (loop.carried, loop.body), (input.form, output.form), (plan, function.execution)):
+				((Checked.BodyLocal, Checked.Mutable, Checked.ParameterBinding(0), Checked.BodyLocal), ([carried], [Concrete.ReassignBinding(assigned, value)]), (Concrete.ReadBinding(input_id), Concrete.ReadBinding(returned_id)), (Concrete.ManagedStringLeaf, OrdinaryCalls)):
+					match value.form:
+						Concrete.ReadBinding(reassigned):
+							Some(Checked.lambda_number(site) == 1 and checked.lambdas.length() == 2
+								and Declaration.function_number(lambda.root) == Declaration.function_number(root.id)
+								and Checked.binding_number(initial) == 1 and Checked.binding_number(carried) == 1
+								and Checked.binding_number(assigned) == 1 and Checked.binding_number(returned_id) == 1
+								and Checked.binding_number(input_id) == 0 and Checked.binding_number(reassigned) == 0
+								and checked_loop.carried.map(Checked.binding_number) == [1]
+								and lambda.captures.is_empty() and lambda.parameters.length() == 1
+								and same_span(local.span, binding.span) and same_span(parameter.span, parameter_binding.span)
+								and same_span(binding.span, { source = module_source(root_module_id()), start = local_start, end = local_start + "current".length() })
+								and same_span(loop.span, checked_loop.span)
+								and Concrete.same_type(local.value_type, Concrete.StringType)
+								and Concrete.same_type(parameter.value_type, Concrete.StringType)
+								and function.signature.parameters.length() == 1
+								and function.signature.parameters.all(pure func(parameter_type): Concrete.same_type(parameter_type, Concrete.StringType))
+								and Concrete.same_type(function.signature.return_type, Concrete.StringType))
+						_: None
+				_: None
+		_: None
+
+
+pure func test_result_lambda_managed_header_retains_its_actual_binding() -> Bool:
+	managed_lambda_header_facts().get_or(False)
+
+
+tests: TestSuite = {
+	description = "Noncapturing lambda specialization",
+	tests = [
+		("Result lambda scalar header uses current layout admission", test_result_lambda_scalar_header_uses_the_current_layout_admission),
+		("Result lambda managed header retains its actual binding", test_result_lambda_managed_header_retains_its_actual_binding),
+		("distinct lambda sites keep equal local ordinals separate", test_distinct_sites_keep_equal_local_ordinals_separate),
+		("distinct lambda instances share only the nominal result layout", test_distinct_lambda_instances_share_only_the_nominal_result_layout),
+		("lambda rigids belong to the genuine enclosing root", test_lambda_rigids_belong_to_the_genuine_enclosing_root),
+		("one generic lambda site gets both forwarded root substitutions", test_one_generic_lambda_site_gets_both_forwarded_root_substitutions),
+		("declared tail execution does not leak into its lambda", test_declared_tail_execution_does_not_leak_into_its_lambda),
+		("erased callable keeps dense data parameters and direct calls", test_erased_callable_keeps_dense_data_parameters_and_direct_calls),
+	]
+}
