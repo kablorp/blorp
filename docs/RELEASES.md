@@ -207,14 +207,21 @@ link log must be empty and its complete stderr must be the exact balanced strict
 report; emitted C must match. Provenance retains its hash and flags, and the
 sanitized binary is not published. Regular diagnostic B runs the native cost suite.
 Ordinary e2e cases run sanitized real mains; accounted cases additionally check
-strict target balance. The approved initial bootstrap exception is bound to compiler
-C SHA-256 `3d0def0d00f6c6ec003923d7acb2f8854fa506a6cf6b7c04611322a47b7b7f8b`,
-checked immediately after A emits C and before B qualification. Only the native
-qualification command sets `BLORP_2_RESOURCE_POLICY=record-initial-bootstrap-debt`.
-The typed test policy retains original caps and records resource overruns as
-structured `BLORP2_RESOURCE_RESULT` FAILs with actual measurements, limits and
-original reasons after all ordinary oracles pass. Provenance and release notes
-label functional PASS and resource FAIL debt; this is not a full M8/resource PASS.
+strict target balance. The stored-callable/tuple bridge keeps compiler, library
+and test source at `9c12cc79e3b7b919af93debde139595b4288e42e`; its reviewed workflow
+and documentation changes receive a new commit and seed tag. This compiler
+supports stored callable values and structural tuples, allowing later compiler
+source to use those features. Its compiler C is locked to SHA-256
+`46c041be4c5be389cd5e6b6d288f5abd8e673ca78b003914849232ac456ee4e3`, checked
+immediately after A emits C and before B qualification. Each provenance archive
+retains `reviewed-compiler-c.sha256`; the publisher checks the emitted C against
+that digest and requires all platforms to agree.
+Only the native qualification command sets
+`BLORP_2_RESOURCE_POLICY=record-allocation-debt`, matching CI. The typed test policy
+retains original caps and records allocation overruns as structured
+`BLORP2_ALLOCATION_RESULT` FAILs with actual measurements, limits and original
+reasons after all ordinary oracles pass. Provenance and release notes distinguish
+functional PASS from recorded allocation debt; this is not a full M8/resource PASS.
 All other failures remain blocking. Hosted instruction measurement is explicitly
 disabled on all three platforms, as in CI; instruction costs are unmeasured and
 not qualified. The raw macOS time preflight is retained for observation only and
@@ -229,8 +236,12 @@ SDK/libc/dependency details, raw diagnostics, resource markers and gate logs. Ac
 creates the release; local API credentials are unnecessary. An existing release for the requested seed tag is refused, never overwritten. Preserve referenced seeds and their
 provenance indefinitely; expiring Actions logs alone are not release evidence.
 
-The first seed was qualified through an explicit legacy reference A. Subsequent
-seeds use `scripts/blorp2-compiler-bootstrap` and the real seven-field
+The first seed was qualified through an explicit legacy reference A and the
+`record-initial-bootstrap-debt` policy, bound to compiler C SHA-256
+`3d0def0d00f6c6ec003923d7acb2f8854fa506a6cf6b7c04611322a47b7b7f8b`.
+That historical qualification remains recorded with the first seed; it does not
+qualify the bridge. Subsequent seeds use `scripts/blorp2-compiler-bootstrap` and
+the real seven-field
 `blorp_2/bootstrap.env` pin to generate A; the release retains that seed identity,
 manifest and binary digest. No missing-manifest legacy fallback exists. The
 legacy host still runs TestSuite suites until their separate migration.
