@@ -69,13 +69,13 @@ private pure func captured_source(body: String) -> Option[Checked.CheckedFunctio
 				Ok(checked): Some(checked_functions(checked))
 
 
-private pure func returned_choice(function: Checked.CheckedFunction) -> Option[Checked.CallableArgument]:
+private pure func returned_choice(function: Checked.CheckedFunction) -> Option[Checked.CallableChoice]:
 	match function.body:
 		Checked.CheckedValueBody(Checked.ReturnExpression(value)):
 			match value.form:
-				Checked.InvokeFunction(call, _):
-					match call.target:
-						Checked.UserFunction(_, _, [argument]): Some(argument)
+				Checked.InvokeFunction(call):
+					match (call.target, call.operands):
+						(Checked.UserFunction(_, _), [Checked.CallableOperand(_, argument, _), Checked.ValueOperand(_)]): Some(argument)
 						_: None
 				_: None
 		_: None
@@ -109,16 +109,19 @@ private pure func scalar_capture_facts() -> Option[Bool]:
 	row ?= lambda
 	root ?= contents.functions.get(Declaration.function_number(row.root))
 	choice ?= returned_choice(root)
-	match (row.captures, row.body, choice.choice):
+	match (row.captures, row.body, choice):
 		([capture], Checked.CheckedValueBody(Checked.ReturnExpression(value)), Checked.LambdaCallable(id, [operand])):
 			match (value.form, operand.form):
-				(Checked.InvokeFunction(_, [item, outer]), Checked.ReadBinding(binding)):
-					match item.form:
-						Checked.ReadBinding(local): Some(
-							captures_binding(capture, Checked.DeclaredBody(root.id), 1, Checked.IntType)
-								and reads_capture(outer, id, 0) and Checked.binding_number(local) == 0
-								and Checked.binding_number(binding) == 1 and Checked.same_type(operand.value_type, Checked.IntType)
-						)
+				(Checked.InvokeFunction(operand_call_1), Checked.ReadBinding(binding)):
+					match operand_call_1.operands:
+						[Checked.ValueOperand(item), Checked.ValueOperand(outer)]:
+							match item.form:
+								Checked.ReadBinding(local): Some(
+									captures_binding(capture, Checked.DeclaredBody(root.id), 1, Checked.IntType)
+										and reads_capture(outer, id, 0) and Checked.binding_number(local) == 0
+										and Checked.binding_number(binding) == 1 and Checked.same_type(operand.value_type, Checked.IntType)
+								)
+								_: None
 						_: None
 				_: None
 		_: None
@@ -140,13 +143,16 @@ pure func test_repeated_reads_deduplicate_the_resolved_scoped_identity() -> Bool
 				[row]:
 					match (row.captures, row.body, contents.functions.get(Declaration.function_number(row.root)).and_then(returned_choice)):
 						([capture], Checked.CheckedValueBody(Checked.ReturnExpression(value)), Some(choice)):
-							match (value.form, choice.choice):
-								(Checked.InvokeFunction(_, [left, right]), Checked.LambdaCallable(id, [operand])):
-									(
-									captures_binding(capture, Checked.DeclaredBody(row.root), 0, Checked.IntType)
-											and reads_capture(left, id, 0) and reads_capture(right, id, 0)
-											and Checked.same_type(operand.value_type, Checked.IntType)
-									)
+							match (value.form, choice):
+								(Checked.InvokeFunction(operand_call_2), Checked.LambdaCallable(id, [operand])):
+									match operand_call_2.operands:
+										[Checked.ValueOperand(left), Checked.ValueOperand(right)]:
+											(
+											captures_binding(capture, Checked.DeclaredBody(row.root), 0, Checked.IntType)
+													and reads_capture(left, id, 0) and reads_capture(right, id, 0)
+													and Checked.same_type(operand.value_type, Checked.IntType)
+											)
+										_: False
 								_: False
 						_: False
 				_: False
@@ -171,7 +177,7 @@ pure func test_managed_aliases_are_distinct_source_bindings_and_capture_slots() 
 				[row]:
 					match (row.captures, row.statements, row.body, contents.functions.get(Declaration.function_number(row.root)).and_then(returned_choice)):
 						([first, second], [Checked.InitializeBinding(_, saved)], Checked.CheckedValueBody(Checked.ReturnExpression(returned)), Some(choice)):
-							match choice.choice:
+							match choice:
 								Checked.LambdaCallable(id, [left, right]):
 									match (left.form, right.form):
 										(Checked.ReadBinding(original), Checked.ReadBinding(copy)):
@@ -203,10 +209,10 @@ pure func test_nested_child_creation_forwards_the_only_grandparent_use() -> Bool
 					match (parent.captures, child.captures, parent.body, child.body):
 						([outer_capture], [inner_capture], Checked.CheckedValueBody(Checked.ReturnExpression(creation)), Checked.CheckedValueBody(Checked.ReturnExpression(read))):
 							match creation.form:
-								Checked.InvokeFunction(call, _):
-									match call.target:
-										Checked.UserFunction(_, _, [choice]):
-											match choice.choice:
+								Checked.InvokeFunction(call):
+									match (call.target, call.operands):
+										(Checked.UserFunction(_, _), [Checked.CallableOperand(_, choice, _), Checked.ValueOperand(_)]):
+											match choice:
 												Checked.LambdaCallable(child_id, [operand]):
 													(
 														captures_binding(outer_capture, Checked.DeclaredBody(parent.root), 0, Checked.StringType)
@@ -242,7 +248,7 @@ pure func test_equal_local_ordinals_in_parent_and_root_keep_distinct_capture_ide
 				[parent, child]:
 					match (parent.captures, child.captures, contents.functions.get(Declaration.function_number(parent.root)).and_then(returned_choice)):
 						([outer], [grandparent, local], Some(choice)):
-							match choice.choice:
+							match choice:
 								Checked.LambdaCallable(parent_id, [_]):
 									(
 										captures_binding(outer, Checked.DeclaredBody(parent.root), 0, Checked.StringType)
@@ -283,11 +289,11 @@ pure func test_deferred_sibling_and_nested_capture_rows_survive_parent_restorati
 				_: False
 
 
-private pure func invocation_choice(value: Checked.CheckedExpr) -> Option[Checked.CallableArgument]:
+private pure func invocation_choice(value: Checked.CheckedExpr) -> Option[Checked.CallableChoice]:
 	match value.form:
-		Checked.InvokeFunction(call, _):
-			match call.target:
-				Checked.UserFunction(_, _, [argument]): Some(argument)
+		Checked.InvokeFunction(call):
+			match (call.target, call.operands):
+				(Checked.UserFunction(_, _), [Checked.CallableOperand(_, argument, _), Checked.ValueOperand(_)]): Some(argument)
 				_: None
 		_: None
 
@@ -314,7 +320,7 @@ private pure func alternative_capture_facts() -> Option[Bool]:
 		[one]: Some(one)
 		_: None
 	choice ?= invocation_choice(arm.value)
-	match (arm.inputs, row.captures, row.body, choice.choice):
+	match (arm.inputs, row.captures, row.body, choice):
 		([input], [capture], Checked.CheckedValueBody(Checked.ReturnExpression(read)), Checked.LambdaCallable(id, [operand])):
 			match (join.selection.nodes, operand.form):
 				([Checked.EnterArm(right, [_]), Checked.EnterArm(left, [_]), Checked.TestVariant(_, _, _, _)], Checked.ReadBinding(binding)):
@@ -360,7 +366,7 @@ private pure func conditional_capture_facts() -> Option[Bool]:
 		[Checked.InitializeBinding(_, value)]: Some(value)
 		_: None
 	child_choice ?= invocation_choice(creation)
-	match (condition_choice.choice, child_choice.choice, first_choice.choice, second_choice.choice):
+	match (condition_choice, child_choice, first_choice, second_choice):
 		(Checked.LambdaCallable(condition_id, [_]), Checked.LambdaCallable(child_id, [operand]), Checked.LambdaCallable(first_id, [_]), Checked.LambdaCallable(second_id, [_])):
 			match child.body:
 				Checked.CheckedValueBody(Checked.ReturnExpression(read)):
@@ -419,7 +425,7 @@ private pure func structural_capture_facts() -> Option[Bool]:
 		_: None
 	choice ?= invocation_choice(arm.value)
 	branches ?= checked_tail_join(row.body)
-	match (row.captures, choice.choice, branches.arms):
+	match (row.captures, choice, branches.arms):
 		([capture], Checked.LambdaCallable(id, [operand]), [first, second]):
 			match operand.form:
 				Checked.ReadBinding(binding):

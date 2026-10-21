@@ -25,7 +25,7 @@ import:
 		CheckedRecordUpdate,
 		RetainedRecordField,
 		CheckedExpr,
-		CheckedCall, CallableChoice(NamedCallable, ForwardedCallable, LambdaCallable), CallableArgument,
+		CheckedCall, CallableChoice(NamedCallable, ForwardedCallable, LambdaCallable), CheckedCallOperand(ValueOperand, CallableOperand),
 		CheckedLambda, CheckedCapture, LambdaRow(CollectingLambda, CheckedLambdaRow), CheckedValueResult, ResolvedBody, LambdaId, lambda_id, lambda_number,
 		CaptureId, capture_id, same_scoped_binding, ScopedBindingId,
 		CheckedBody(CheckedValueBody), CheckedExit(ReturnExpression), CheckedStatement(DiscardExpression),
@@ -165,12 +165,6 @@ private pure func freeze_record_fields(fields: List[PendingRecordField], slots: 
 		None: Ok(void)
 	valid ?= validate_record_fields(fields, slots)
 	Ok(frozen)
-
-
-private fixed record ResolvedArguments {
-	values: List[CheckedExpr],
-	call: CheckedCall
-}
 
 
 private fixed record PostfixHints {
@@ -1380,10 +1374,9 @@ private pure func freeze_pending_values(values: List[PendingValue], slots: List[
 
 -- A receiver call's frozen receiver is its first argument. Seeding the list with
 -- it, rather than concatenating, saves one list allocation per UFCS call.
-private pure func freeze_pending_call(call: PendingCall, values: List[PendingValue], receiver: Option[CheckedExpr], slots: List[InferenceSlot], captures: CaptureScope) -> Result[ResolvedArguments, CheckError]:
+private pure func freeze_pending_call(call: PendingCall, values: List[PendingValue], receiver: Option[CheckedExpr], slots: List[InferenceSlot], captures: CaptureScope) -> Result[CheckedCall, CheckError]:
 	var actual = pending_arguments(values)
-	var arguments: List[CheckedExpr] = []
-	var callable_arguments: List[CallableArgument] = []
+	var operands: List[CheckedCallOperand] = []
 	var written_position = if receiver.is_some():
 		1
 	else:
@@ -1394,7 +1387,7 @@ private pure func freeze_pending_call(call: PendingCall, values: List[PendingVal
 		Some(frozen_receiver):
 			receiver_use: InferenceUse = { value_type = AcceptedType(frozen_receiver.value_type), span = call.contract.span }
 			actual = [receiver_use].concat(actual)
-			arguments = [frozen_receiver]
+			operands = [ValueOperand(frozen_receiver)]
 		None: void
 
 	for value in values:
@@ -1412,11 +1405,11 @@ private pure func freeze_pending_call(call: PendingCall, values: List[PendingVal
 							break
 				match call.contract.target:
 					DeclaredTarget(owner):
-						callable_arguments = callable_arguments.append({
-							parameter = callable_parameter(owner, written_position),
-							choice = NamedCallable(id, types),
-							span = value.span
-						})
+						operands = operands.append(CallableOperand(
+							callable_parameter(owner, written_position),
+							NamedCallable(id, types),
+							value.span,
+						))
 					_: failure = Some(checker_invariant(value.span, InvalidInferenceWorklist))
 			PendingLambda(id):
 				match call.contract.target:
@@ -1424,24 +1417,25 @@ private pure func freeze_pending_call(call: PendingCall, values: List[PendingVal
 						match capture_operands(id, captures, value.span):
 							Err(error): failure = Some(error)
 							Ok(environment):
-								callable_arguments = callable_arguments.append({
-									parameter = callable_parameter(owner, written_position),
-									choice = LambdaCallable(id, environment), span = value.span
-								})
+								operands = operands.append(CallableOperand(
+									callable_parameter(owner, written_position),
+									LambdaCallable(id, environment),
+									value.span,
+								))
 					_: failure = Some(checker_invariant(value.span, InvalidInferenceWorklist))
 			PendingForwardedCallable(id):
 				match call.contract.target:
 					DeclaredTarget(owner):
-						callable_arguments = callable_arguments.append({
-							parameter = callable_parameter(owner, written_position),
-							choice = ForwardedCallable(id),
-							span = value.span
-						})
+						operands = operands.append(CallableOperand(
+							callable_parameter(owner, written_position),
+							ForwardedCallable(id),
+							value.span,
+						))
 					_: failure = Some(checker_invariant(value.span, InvalidInferenceWorklist))
 			_:
 				match freeze_pending_value(value, slots, captures):
 					Err(error): failure = Some(error)
-					Ok(frozen_value): arguments = arguments.append(frozen_value)
+					Ok(frozen_value): operands = operands.append(ValueOperand(frozen_value))
 		if failure.is_some():
 			break
 		written_position = IntOps.add(written_position, 1)
@@ -1449,11 +1443,11 @@ private pure func freeze_pending_call(call: PendingCall, values: List[PendingVal
 	ready: Void ?= match failure:
 		Some(error): Err(error)
 		None: Ok(void)
-	checked_call ?= publish_pending_call(call, callable_arguments, slots)
+	checked_call ?= publish_pending_call(call, operands, slots)
 	parameters ?= admit_call_parameters(call, slots)
 	return_type ?= admit_call_type(call.contract.signature.return_type.value_type, call, slots, call.contract.span)
 	valid ?= validate_complete_arguments(call.contract, parameters, return_type, actual, slots)
-	Ok({ values = arguments, call = checked_call })
+	Ok(checked_call)
 
 
 private pure func freeze_retained_fields(fields: List[PendingRetainedField], slots: List[InferenceSlot], span: Span) -> Result[List[RetainedRecordField], CheckError]:
@@ -1530,7 +1524,7 @@ private pure func freeze_pending_value(value: PendingValue, slots: List[Inferenc
 				Err(error): Err(error)
 		PendingDirectCall(call, arguments):
 			match freeze_pending_call(call, arguments, None, slots, captures):
-				Ok(resolved): Ok(InvokeFunction(resolved.call, resolved.values))
+				Ok(resolved): Ok(InvokeFunction(resolved))
 				Err(error): Err(error)
 	base ?= base_result
 	base_type ?= publish_inference_type(value.base_type, slots, CompleteInference, value.base_span)
@@ -1576,7 +1570,7 @@ private pure func freeze_pending_step(step: PendingStep, receiver: CheckedExpr, 
 		AcceptedField(field): Ok(ReadRecordField(receiver, field))
 		PendingInvocation(call, values):
 			match freeze_pending_call(call, values, Some(receiver), slots, captures):
-				Ok(resolved): Ok(InvokeFunction(resolved.call, resolved.values))
+				Ok(resolved): Ok(InvokeFunction(resolved))
 				Err(error): Err(error)
 	form ?= form_result
 	value_type ?= publish_inference_type(step.value_type, slots, CompleteInference, step.span)

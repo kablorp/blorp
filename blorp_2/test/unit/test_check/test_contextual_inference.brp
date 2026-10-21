@@ -43,8 +43,13 @@ private pure func body_value(function: Model.CheckedFunction) -> Option[Model.Ch
 
 
 private pure func one_type_argument(call: Model.CheckedCall, expected: Model.TypeRef) -> Bool:
-	match call.target:
-		Model.UserFunction(_, [actual], []):
+	ordinary = call.operands.all(pure func(operand):
+		match operand:
+			Model.ValueOperand(_): True
+			Model.CallableOperand(_, _, _): False
+	)
+	match (call.target, ordinary):
+		(Model.UserFunction(_, [actual]), True):
 			Model.same_type(actual, expected)
 		_:
 			False
@@ -60,8 +65,11 @@ pure func test_annotated_result_publishes_complete_zero_argument_substitution() 
 			match API.checked_functions(program).functions.get(2).and_then(body_value):
 				Some(value):
 					match value.form:
-						Model.InvokeFunction(call, []):
-							one_type_argument(call, Model.IntType)
+						Model.InvokeFunction(call):
+							match call.operands:
+								[]:
+									one_type_argument(call, Model.IntType)
+								_: False
 						_:
 							False
 				None:
@@ -82,15 +90,21 @@ pure func test_result_context_flows_through_a_nested_generic_call() -> Bool:
 					match body_value(function):
 						Some(value):
 							match value.form:
-								Model.InvokeFunction(outer, [inner]):
-									match inner.form:
-										Model.InvokeFunction(call, []):
-											(
-												one_type_argument(outer, function.signature.return_type.value_type)
-												and one_type_argument(call, Model.IntType)
-											)
-										_:
-											False
+								Model.InvokeFunction(outer):
+									match outer.operands:
+										[Model.ValueOperand(inner)]:
+											match inner.form:
+												Model.InvokeFunction(call):
+													match call.operands:
+														[]:
+															(
+																one_type_argument(outer, function.signature.return_type.value_type)
+																and one_type_argument(call, Model.IntType)
+															)
+														_: False
+												_:
+													False
+										_: False
 								_:
 									False
 						None:
@@ -113,12 +127,18 @@ pure func test_concrete_argument_context_solves_a_nested_empty_call() -> Bool:
 			match API.checked_functions(program).functions.get(3).and_then(body_value):
 				Some(value):
 					match value.form:
-						Model.InvokeFunction(_, [inner]):
-							match inner.form:
-								Model.InvokeFunction(call, []):
-									one_type_argument(call, Model.IntType)
-								_:
-									False
+						Model.InvokeFunction(operand_call_1):
+							match operand_call_1.operands:
+								[Model.ValueOperand(inner)]:
+									match inner.form:
+										Model.InvokeFunction(call):
+											match call.operands:
+												[]:
+													one_type_argument(call, Model.IntType)
+												_: False
+										_:
+											False
+								_: False
 						_:
 							False
 				None:
@@ -144,15 +164,21 @@ pure func test_later_sibling_evidence_solves_an_earlier_nested_call() -> Bool:
 					match function.statements:
 						[Model.InitializeBinding(_, value)]:
 							match value.form:
-								Model.InvokeFunction(outer, [inner, _]):
-									match inner.form:
-										Model.InvokeFunction(call, []):
-											(
-												one_type_argument(call, Model.IntType)
-												and one_type_argument(outer, value.value_type)
-											)
-										_:
-											False
+								Model.InvokeFunction(outer):
+									match outer.operands:
+										[Model.ValueOperand(inner), Model.ValueOperand(_)]:
+											match inner.form:
+												Model.InvokeFunction(call):
+													match call.operands:
+														[]:
+															(
+																one_type_argument(call, Model.IntType)
+																and one_type_argument(outer, value.value_type)
+															)
+														_: False
+												_:
+													False
+										_: False
 								_:
 									False
 						_:
@@ -175,8 +201,11 @@ pure func test_generic_result_context_preserves_the_caller_rigid_parameter() -> 
 					match (function.signature.type_parameters, body_value(function)):
 						([parameter], Some(value)):
 							match value.form:
-								Model.InvokeFunction(call, []):
-									one_type_argument(call, Model.ParameterType(parameter))
+								Model.InvokeFunction(call):
+									match call.operands:
+										[]:
+											one_type_argument(call, Model.ParameterType(parameter))
+										_: False
 								_:
 									False
 						_:
@@ -411,10 +440,13 @@ pure func test_partial_nominal_argument_hint_solves_constructor_payload() -> Boo
 			match API.checked_functions(program).functions.get(3).and_then(body_value):
 				Some(value):
 					match value.form:
-						Model.InvokeFunction(call, [argument]):
-							match argument.form:
-								Model.ConstructVariant(_, [child]):
-									one_type_argument(call, Model.IntType) and Model.same_type(child.value_type, Model.IntType)
+						Model.InvokeFunction(call):
+							match call.operands:
+								[Model.ValueOperand(argument)]:
+									match argument.form:
+										Model.ConstructVariant(_, [child]):
+											one_type_argument(call, Model.IntType) and Model.same_type(child.value_type, Model.IntType)
+										_: False
 								_: False
 						_: False
 				None: False
@@ -533,7 +565,10 @@ pure func test_unique_ufcs_partial_nominal_receiver_solves_payload() -> Bool:
 			match API.checked_functions(program).functions.get(3).and_then(body_value):
 				Some(value):
 					match value.form:
-						Model.InvokeFunction(call, [_]): one_type_argument(call, Model.IntType)
+						Model.InvokeFunction(call):
+							match call.operands:
+								[Model.ValueOperand(_)]: one_type_argument(call, Model.IntType)
+								_: False
 						_: False
 				None: False
 		Err(_): False
@@ -562,7 +597,10 @@ pure func test_two_independent_pending_calls_keep_distinct_fresh_variables() -> 
 			match API.checked_functions(program).functions.get(4).and_then(body_value):
 				Some(value):
 					match value.form:
-						Model.InvokeFunction(_, [left, right]): independent_inspection(left, Model.IntType) and independent_inspection(right, Model.StringType)
+						Model.InvokeFunction(operand_call_2):
+							match operand_call_2.operands:
+								[Model.ValueOperand(left), Model.ValueOperand(right)]: independent_inspection(left, Model.IntType) and independent_inspection(right, Model.StringType)
+								_: False
 						_: False
 				None: False
 		Err(_): False
@@ -570,9 +608,15 @@ pure func test_two_independent_pending_calls_keep_distinct_fresh_variables() -> 
 
 private pure func independent_inspection(value: Model.CheckedExpr, expected: Model.TypeRef) -> Bool:
 	match value.form:
-		Model.InvokeFunction(call, [inner, _]):
-			match inner.form:
-				Model.InvokeFunction(nested, []): one_type_argument(call, expected) and one_type_argument(nested, expected)
+		Model.InvokeFunction(call):
+			match call.operands:
+				[Model.ValueOperand(inner), Model.ValueOperand(_)]:
+					match inner.form:
+						Model.InvokeFunction(nested):
+							match nested.operands:
+								[]: one_type_argument(call, expected) and one_type_argument(nested, expected)
+								_: False
+						_: False
 				_: False
 		_: False
 
@@ -599,32 +643,38 @@ pure func test_repeated_result_projection_keeps_a_common_partial_nominal_head() 
 
 private pure func repeated_result_substitutions(value: Model.CheckedExpr) -> Bool:
 	match value.form:
-		Model.InvokeFunction(call, [repeated, _, _]):
-			outer = match call.target:
-				Model.UserFunction(owner, [Model.IntType, Model.IntType], []): Declaration.function_number(owner) == 3
+		Model.InvokeFunction(call):
+			match call.operands:
+				[Model.ValueOperand(repeated), Model.ValueOperand(_), Model.ValueOperand(_)]:
+					outer = match call.target:
+						Model.UserFunction(owner, [Model.IntType, Model.IntType]): Declaration.function_number(owner) == 3
+						_: False
+					outer and repeated_argument_substitution(repeated)
 				_: False
-			outer and repeated_argument_substitution(repeated)
 		_: False
 
 
 private pure func repeated_argument_substitution(value: Model.CheckedExpr) -> Bool:
 	match value.form:
-		Model.InvokeFunction(call, [payload]):
-			match (call.target, payload.form, value.value_type):
-				(Model.UserFunction(owner, [argument], []), Model.ConstructVariant(variant, [child]), Model.AppliedUnionType(pair, [first, second])):
-					match payload.value_type:
-						Model.AppliedUnionType(choice, [Model.IntType]):
-							(
-								Declaration.function_number(owner) == 2
-								and Declaration.union_number(pair) == 1
-								and Declaration.union_number(choice) == 0
-								and Declaration.union_number(Declaration.variant_owner(variant)) == 0
-								and Declaration.variant_number(variant) == 1
-								and Model.same_type(child.value_type, Model.IntType)
-								and Model.same_type(argument, payload.value_type)
-								and Model.same_type(first, argument)
-								and Model.same_type(second, argument)
-							)
+		Model.InvokeFunction(call):
+			match call.operands:
+				[Model.ValueOperand(payload)]:
+					match (call.target, payload.form, value.value_type):
+						(Model.UserFunction(owner, [argument]), Model.ConstructVariant(variant, [child]), Model.AppliedUnionType(pair, [first, second])):
+							match payload.value_type:
+								Model.AppliedUnionType(choice, [Model.IntType]):
+									(
+										Declaration.function_number(owner) == 2
+										and Declaration.union_number(pair) == 1
+										and Declaration.union_number(choice) == 0
+										and Declaration.union_number(Declaration.variant_owner(variant)) == 0
+										and Declaration.variant_number(variant) == 1
+										and Model.same_type(child.value_type, Model.IntType)
+										and Model.same_type(argument, payload.value_type)
+										and Model.same_type(first, argument)
+										and Model.same_type(second, argument)
+									)
+								_: False
 						_: False
 				_: False
 		_: False
@@ -739,8 +789,11 @@ pure func test_direct_result_hint_rebuilds_the_substituted_compound() -> Bool:
 			match API.checked_functions(program).functions.get(3).and_then(body_value):
 				Some(value):
 					match value.form:
-						Model.InvokeFunction(call, [constructor, _]):
-							one_type_argument(call, Model.IntType) and choice_argument_is_int(constructor)
+						Model.InvokeFunction(call):
+							match call.operands:
+								[Model.ValueOperand(constructor), Model.ValueOperand(_)]:
+									one_type_argument(call, Model.IntType) and choice_argument_is_int(constructor)
+								_: False
 						_: False
 				None: False
 		Err(_): False
@@ -756,7 +809,10 @@ pure func test_ufcs_result_hint_rebuilds_the_substituted_receiver_compound() -> 
 			match API.checked_functions(program).functions.get(3).and_then(body_value):
 				Some(value):
 					match value.form:
-						Model.InvokeFunction(call, [_, _]): one_type_argument(call, Model.IntType) and Model.same_type(value.value_type, Model.IntType)
+						Model.InvokeFunction(call):
+							match call.operands:
+								[Model.ValueOperand(_), Model.ValueOperand(_)]: one_type_argument(call, Model.IntType) and Model.same_type(value.value_type, Model.IntType)
+								_: False
 						_: False
 				None: False
 		Err(_): False
@@ -780,7 +836,10 @@ pure func test_known_list_context_opens_only_the_mixed_inference_shape() -> Bool
 			match API.checked_functions(program).functions.get(3).and_then(body_value):
 				Some(value):
 					match value.form:
-						Model.InvokeFunction(call, []): one_type_argument(call, Model.StringType)
+						Model.InvokeFunction(call):
+							match call.operands:
+								[]: one_type_argument(call, Model.StringType)
+								_: False
 						_: False
 				None: False
 		Err(_): False
@@ -803,11 +862,17 @@ pure func test_closed_nested_results_publish_complete_nominal_ancestry() -> Bool
 					match function.statements:
 						[Model.InitializeBinding(_, value)]:
 							match value.form:
-								Model.InvokeFunction(outer, [inner]):
-									match inner.form:
-										Model.InvokeFunction(call, [_]):
-											match value.value_type:
-												Model.AppliedUnionType(owner, [child]): Declaration.union_number(owner) == 0 and Model.same_type(child, inner.value_type) and one_type_argument(outer, inner.value_type) and one_type_argument(call, Model.IntType)
+								Model.InvokeFunction(outer):
+									match outer.operands:
+										[Model.ValueOperand(inner)]:
+											match inner.form:
+												Model.InvokeFunction(call):
+													match call.operands:
+														[Model.ValueOperand(_)]:
+															match value.value_type:
+																Model.AppliedUnionType(owner, [child]): Declaration.union_number(owner) == 0 and Model.same_type(child, inner.value_type) and one_type_argument(outer, inner.value_type) and one_type_argument(call, Model.IntType)
+																_: False
+														_: False
 												_: False
 										_: False
 								_: False
@@ -942,19 +1007,22 @@ pure func test_forwarded_choices_keep_written_positions_and_rigid_owner() -> Boo
 					match (forward.signature.type_parameters, body_value(forward)):
 						([parameter], Some(value)):
 							match value.form:
-								Model.InvokeFunction(call, [argument]):
-									match (call.target, argument.form):
-										(Model.UserFunction(owner, [Model.ParameterType(actual)], [left, right]), Model.ReadBinding(binding)):
-											match (left.choice, right.choice):
-												(Model.ForwardedCallable(first), Model.ForwardedCallable(second)):
-													(
-														Declaration.function_number(owner) == Declaration.function_number(compose.id)
-														and Model.same_parameter(actual, parameter) and Model.binding_number(binding) == 0
-														and Model.same_callable_parameter(left.parameter, Model.callable_parameter(compose.id, 1))
-														and Model.same_callable_parameter(right.parameter, Model.callable_parameter(compose.id, 2))
-														and Model.same_callable_parameter(first, Model.callable_parameter(forward.id, 0))
-														and Model.same_callable_parameter(second, Model.callable_parameter(forward.id, 2))
-													)
+								Model.InvokeFunction(call):
+									match call.operands:
+										[Model.ValueOperand(argument), Model.CallableOperand(left_parameter, left_choice, _), Model.CallableOperand(right_parameter, right_choice, _)]:
+											match (call.target, argument.form):
+												(Model.UserFunction(owner, [Model.ParameterType(actual)]), Model.ReadBinding(binding)):
+													match (left_choice, right_choice):
+														(Model.ForwardedCallable(first), Model.ForwardedCallable(second)):
+															(
+																Declaration.function_number(owner) == Declaration.function_number(compose.id)
+																and Model.same_parameter(actual, parameter) and Model.binding_number(binding) == 0
+																and Model.same_callable_parameter(left_parameter, Model.callable_parameter(compose.id, 1))
+																and Model.same_callable_parameter(right_parameter, Model.callable_parameter(compose.id, 2))
+																and Model.same_callable_parameter(first, Model.callable_parameter(forward.id, 0))
+																and Model.same_callable_parameter(second, Model.callable_parameter(forward.id, 2))
+															)
+														_: False
 												_: False
 										_: False
 								_: False
@@ -985,16 +1053,19 @@ pure func test_interleaved_data_and_locals_keep_dense_ids() -> Bool:
 					match (apply.signature.type_parameters, apply.bindings, apply.statements):
 						([input, output], [first, second, local], [Model.InitializeBinding(saved, value)]):
 							match (first.origin, second.origin, local.origin, value.form):
-								(Model.ParameterBinding(0), Model.ParameterBinding(1), Model.BodyLocal, Model.InvokeFunction(call, [argument])):
-									match (call.target, argument.form):
-										(Model.CallableParameter(parameter), Model.ReadBinding(actual)):
-											(
-												Model.binding_number(saved) == 2 and Model.binding_number(actual) == 0
-												and Model.same_type(first.value_type, Model.ParameterType(input))
-												and Model.same_type(second.value_type, Model.ParameterType(output))
-												and Model.same_type(local.value_type, Model.ParameterType(output))
-												and Model.same_callable_parameter(parameter, Model.callable_parameter(apply.id, 0))
-											)
+								(Model.ParameterBinding(0), Model.ParameterBinding(1), Model.BodyLocal, Model.InvokeFunction(call)):
+									match call.operands:
+										[Model.ValueOperand(argument)]:
+											match (call.target, argument.form):
+												(Model.CallableParameter(parameter), Model.ReadBinding(actual)):
+													(
+														Model.binding_number(saved) == 2 and Model.binding_number(actual) == 0
+														and Model.same_type(first.value_type, Model.ParameterType(input))
+														and Model.same_type(second.value_type, Model.ParameterType(output))
+														and Model.same_type(local.value_type, Model.ParameterType(output))
+														and Model.same_callable_parameter(parameter, Model.callable_parameter(apply.id, 0))
+													)
+												_: False
 										_: False
 								_: False
 						_: False

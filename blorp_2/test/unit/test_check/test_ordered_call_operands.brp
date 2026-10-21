@@ -1,0 +1,133 @@
+import:
+	../../../src/check/check: checked_functions
+	../../../src/check/model as Checked
+	../../../src/utils/ids as Declaration
+	../../../src/utils/source: same_source
+	../input: checked_source
+	test: TestSuite
+
+
+private MIXED_CALLS: String =
+	|pure func named(value: Int) -> Int:
+	|    value
+	|pure func combine(first: Int, named_callback: pure (Int) -> Int, middle: Int, captured: pure (Int) -> Int, forwarded: pure (Int) -> Int, last: Int) -> Int:
+	|    forwarded(captured(named_callback(first)))
+	|pure func route(callback: pure (Int) -> Int, amount: Int) -> Int:
+	|    direct = combine(named(7), named, 9, pure func(item: Int): amount, callback, 11)
+	|    named(7).combine(named, 9, pure func(item: Int): amount, callback, 11)
+	|func main() -> Int:
+	|    route(named, 2)
+	|
+
+
+private pure func returned(function: Checked.CheckedFunction) -> Option[Checked.CheckedExpr]:
+	match function.body:
+		Checked.CheckedValueBody(Checked.ReturnExpression(value)): Some(value)
+		_: None
+
+
+private pure func integer(value: Checked.CheckedExpr, expected: Int) -> Bool:
+	match value.form:
+		Checked.LiteralInteger(actual): actual == expected
+		_: False
+
+
+private pure func mixed_call(value: Checked.CheckedExpr, lambda: Int) -> Bool:
+	named_prefix = if lambda == 0:
+		"combine(named(7), "
+	else:
+		"named(7).combine("
+	captured_prefix = named_prefix + "named, 9, "
+	forwarded_prefix = captured_prefix + "pure func(item: Int): amount, "
+	match value.form:
+		Checked.InvokeFunction(call):
+			match (call.target, call.operands):
+				(Checked.UserFunction(target, []), [Checked.ValueOperand(first),
+					Checked.CallableOperand(named_parameter, Checked.NamedCallable(named_id, []), named_span),
+					Checked.ValueOperand(middle),
+					Checked.CallableOperand(captured_parameter, Checked.LambdaCallable(lambda_id, [capture]), captured_span),
+					Checked.CallableOperand(forwarded_parameter, Checked.ForwardedCallable(forwarded_id), forwarded_span),
+					Checked.ValueOperand(last)]):
+					match (first.form, capture.form):
+						(Checked.InvokeFunction(first_call), Checked.ReadBinding(binding)):
+							match (first_call.target, first_call.operands):
+								(Checked.UserFunction(first_id, []), [Checked.ValueOperand(argument)]):
+									(
+										Declaration.function_number(target) == 1 and Declaration.function_number(named_id) == 0
+											and Declaration.function_number(first_id) == 0 and integer(argument, 7)
+											and integer(middle, 9) and integer(last, 11)
+											and Checked.callable_position(named_parameter) == 1
+											and Checked.callable_position(captured_parameter) == 3
+											and Checked.callable_position(forwarded_parameter) == 4
+											and Declaration.function_number(Checked.callable_owner(named_parameter)) == 1
+											and Declaration.function_number(Checked.callable_owner(captured_parameter)) == 1
+											and Declaration.function_number(Checked.callable_owner(forwarded_parameter)) == 1
+											and Declaration.function_number(Checked.callable_owner(forwarded_id)) == 2
+											and Checked.callable_position(forwarded_id) == 0
+											and Checked.lambda_number(lambda_id) == lambda and Checked.binding_number(binding) == 0
+											and same_source(named_span.source, value.span.source)
+											and same_source(captured_span.source, value.span.source)
+											and same_source(forwarded_span.source, value.span.source)
+											and named_span.start == value.span.start + named_prefix.length()
+											and named_span.end == value.span.start + named_prefix.length() + "named".length()
+											and captured_span.start == value.span.start + captured_prefix.length()
+											and captured_span.end == value.span.start + captured_prefix.length() + "pure func(item: Int): amount".length()
+											and forwarded_span.start == value.span.start + forwarded_prefix.length()
+											and forwarded_span.end == value.span.start + forwarded_prefix.length() + "callback".length()
+									)
+								_: False
+						_: False
+				_: False
+		_: False
+
+pure func test_direct_and_ufcs_preserve_interleaved_callable_identities() -> Bool:
+	match checked_source(MIXED_CALLS):
+		Err(_): False
+		Ok(program):
+			match checked_functions(program).functions:
+				[_, _, route, _]:
+					match (route.statements, returned(route)):
+						([Checked.InitializeBinding(_, direct)], Some(ufcs)):
+							mixed_call(direct, 0) and mixed_call(ufcs, 1)
+						_: False
+				_: False
+
+
+pure func test_model_call_traversal_excludes_callback_capture_metadata() -> Bool:
+	match checked_source(MIXED_CALLS):
+		Err(_): False
+		Ok(program):
+			match checked_functions(program).functions:
+				[_, _, route, _]:
+					match returned(route):
+						Some(value):
+							match value.form:
+								Checked.InvokeFunction(call):
+									match call.operands:
+										[Checked.ValueOperand(first), named, Checked.ValueOperand(middle),
+											Checked.CallableOperand(parameter, Checked.LambdaCallable(id, [_]), span), forwarded, Checked.ValueOperand(last)]:
+											-- Make metadata traversal observable independently of capture creation:
+											-- the ordinary child call must still be collected exactly once.
+											metadata: Checked.CheckedCallOperand = Checked.CallableOperand(parameter, Checked.LambdaCallable(id, [first]), span)
+											changed = { call | operands = [Checked.ValueOperand(first), named, Checked.ValueOperand(middle), metadata, forwarded, Checked.ValueOperand(last)] }
+											body: Checked.CheckedBody = Checked.CheckedValueBody(Checked.ReturnExpression({ value | form = Checked.InvokeFunction(changed) }))
+											match Checked.body_calls([], body):
+												[ordinary, outer]:
+													match (ordinary.target, outer.target):
+														(Checked.UserFunction(first_id, []), Checked.UserFunction(outer_id, [])):
+															Declaration.function_number(first_id) == 0 and Declaration.function_number(outer_id) == 1
+														_: False
+												_: False
+										_: False
+								_: False
+						_: False
+				_: False
+
+
+tests: TestSuite = {
+	description = "Checked call operand order and traversal contracts",
+	tests = [
+		("direct and UFCS preserve mixed callback identities", test_direct_and_ufcs_preserve_interleaved_callable_identities),
+		("model traversal excludes capture metadata", test_model_call_traversal_excludes_callback_capture_metadata),
+	]
+}

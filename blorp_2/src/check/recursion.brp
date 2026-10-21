@@ -16,7 +16,7 @@ import:
 		CallTarget(RuntimeFunction, UserFunction, CallableParameter),
 		CheckedArm,
 		CheckedBody(CheckedMatchBody, CheckedValueBody),
-		CheckedCall, CallableChoice(NamedCallable, ForwardedCallable, LambdaCallable),
+		CheckedCall, CheckedCallOperand(ValueOperand, CallableOperand), CallableChoice(NamedCallable, ForwardedCallable, LambdaCallable),
 		CheckedExit(RecurWith, ReturnExpression),
 		CheckedExpr,
 		CheckedForm(
@@ -41,7 +41,7 @@ import:
 
 private pure func is_self_call(call: CheckedCall, current: FunctionId) -> Bool:
 	match call.target:
-		UserFunction(id, _, _):
+		UserFunction(id, _):
 			IntOps.equals(function_number(id), function_number(current))
 		RuntimeFunction(_) | CallableParameter(_):
 			False
@@ -69,8 +69,15 @@ private pure func self_call_in(value: CheckedExpr, current: FunctionId) -> Optio
 			self_call_in(child, current)
 		ProjectOpaque(_, child):
 			self_call_in(child, current)
-		InvokeFunction(call, arguments):
-			match first_self_call(arguments, current):
+		InvokeFunction(call):
+			var found: Option[Span] = None
+			for operand in call.operands:
+				match operand:
+					ValueOperand(argument): found = self_call_in(argument, current)
+					CallableOperand(_, _, _): void
+				if found.is_some():
+					break
+			match found:
 				Some(span):
 					Some(span)
 				None:
@@ -151,8 +158,13 @@ private fixed record TailCall {
 
 private pure func tail_call(value: CheckedExpr, current: FunctionId) -> Option[TailCall]:
 	match value.form:
-		InvokeFunction(call, arguments):
+		InvokeFunction(call):
 			if is_self_call(call, current):
+				var arguments: List[CheckedExpr] = []
+				for operand in call.operands:
+					match operand:
+						ValueOperand(argument): arguments = arguments.append(argument)
+						CallableOperand(_, _, _): void
 				Some({
 					arguments = arguments,
 					span = value.span,
@@ -432,7 +444,7 @@ private pure func append_call_dependencies(
 	var dependencies = previous
 	for call in calls:
 		match call.target:
-			UserFunction(declaration, arguments, callables):
+			UserFunction(declaration, arguments):
 				var position = 0
 
 				for argument in arguments:
@@ -445,18 +457,21 @@ private pure func append_call_dependencies(
 						call.span,
 					)
 					position = IntOps.add(position, 1)
-				for callable in callables:
-					match callable.choice:
-						NamedCallable(id, types):
-							var named_position = 0
-							for value in types:
-								dependencies = append_dependencies(
-									dependencies, value, type_parameter_id(FunctionDeclaration(id), named_position),
-									PreservedParameter, callable.span,
-								)
-								named_position = IntOps.add(named_position, 1)
-						ForwardedCallable(_): void
-						LambdaCallable(_, _): void
+				for operand in call.operands:
+					match operand:
+						ValueOperand(_): void
+						CallableOperand(_, choice, span):
+							match choice:
+								NamedCallable(id, types):
+									var named_position = 0
+									for value in types:
+										dependencies = append_dependencies(
+											dependencies, value, type_parameter_id(FunctionDeclaration(id), named_position),
+											PreservedParameter, span,
+										)
+										named_position = IntOps.add(named_position, 1)
+								ForwardedCallable(_): void
+								LambdaCallable(_, _): void
 
 			RuntimeFunction(_) | CallableParameter(_):
 				void

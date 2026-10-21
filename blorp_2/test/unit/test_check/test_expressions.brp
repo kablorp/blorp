@@ -5,13 +5,14 @@ import:
 		CallError(UncallableBinding, UnknownFunction),
 		ValueError(UnknownValue)
 	../../../src/check/model:
+		CheckedCallOperand(ValueOperand, CallableOperand),
 		BindingOrigin(ParameterBinding),
 		CallTarget(UserFunction, RuntimeFunction, CallableParameter),
 		CheckedBody(CheckedValueBody),
 		CheckedExit(ReturnExpression),
 		CheckedExpr,
 		CheckedForm(ConstructVariant, InvokeFunction, LiteralInteger, ReadBinding),
-		CheckedFunction,
+		CheckedFunction, CheckedCall,
 		CheckedStatement(InitializeBinding),
 		TypeRef(IntType),
 		TypeUse,
@@ -22,11 +23,16 @@ import:
 	test: TestSuite
 
 
-private pure func user_function_number(target: CallTarget) -> Option[Int]:
-	match target:
-		UserFunction(id, _, []):
+private pure func user_function_number(call: CheckedCall) -> Option[Int]:
+	ordinary = call.operands.all(pure func(operand):
+		match operand:
+			ValueOperand(_): True
+			CallableOperand(_, _, _): False
+	)
+	match (call.target, ordinary):
+		(UserFunction(id, _), True):
 			Some(function_number(id))
-		UserFunction(_, _, _) | RuntimeFunction(_) | CallableParameter(_):
+		_:
 			None
 
 
@@ -165,29 +171,35 @@ pure func test_parameter_slot_and_repeated_wrappers() -> Bool:
 							False
 
 					match returned_form(main):
-						Some(InvokeFunction(outer, [nested])):
-							match nested.form:
-								InvokeFunction(inner, [literal]):
-									match literal.form:
-										LiteralInteger(1):
-											(
-												parameter_is_value
-												and integer_parameter(identity.signature.parameters)
-												and identity.signature.purity == Pure
-												and no_parameter(first.signature.parameters)
-												and no_parameter(main.signature.parameters)
-												and user_function_number(inner.target) == Some(1)
-												and user_function_number(outer.target) == Some(1)
-												and inner.span.start == 99
-												and inner.span.end == 107
-												and outer.span.start == 90
-												and outer.span.end == 98
-												and function_number(entry_function(checked.entrypoint)) == 2
-											)
+						Some(InvokeFunction(outer)):
+							match outer.operands:
+								[ValueOperand(nested)]:
+									match nested.form:
+										InvokeFunction(inner):
+											match inner.operands:
+												[ValueOperand(literal)]:
+													match literal.form:
+														LiteralInteger(1):
+															(
+																parameter_is_value
+																and integer_parameter(identity.signature.parameters)
+																and identity.signature.purity == Pure
+																and no_parameter(first.signature.parameters)
+																and no_parameter(main.signature.parameters)
+																and user_function_number(inner) == Some(1)
+																and user_function_number(outer) == Some(1)
+																and inner.span.start == 99
+																and inner.span.end == 107
+																and outer.span.start == 90
+																and outer.span.end == 98
+																and function_number(entry_function(checked.entrypoint)) == 2
+															)
+														_:
+															False
+												_: False
 										_:
 											False
-								_:
-									False
+								_: False
 						_:
 							False
 				_:
@@ -275,27 +287,33 @@ pure func test_ufcs_chain_nests_each_receiver_as_first_argument() -> Bool:
 					match returned(main):
 						Some(outer):
 							match outer.form:
-								InvokeFunction(zero, [inner]):
-									match inner.form:
-										InvokeFunction(one, [seven]):
-											match seven.form:
-												LiteralInteger(7):
-													(
-														user_function_number(zero.target) == Some(1)
-														and user_function_number(one.target) == Some(0)
-														and spans_at(outer, 96, 110)
-														and spans_at(inner, 96, 103)
-														and spans_at(seven, 96, 97)
-														and zero.span.start == 104
-														and zero.span.end == 108
-														and one.span.start == 98
-														and one.span.end == 101
-														and same_type(outer.value_type, IntType)
-													)
+								InvokeFunction(zero):
+									match zero.operands:
+										[ValueOperand(inner)]:
+											match inner.form:
+												InvokeFunction(one):
+													match one.operands:
+														[ValueOperand(seven)]:
+															match seven.form:
+																LiteralInteger(7):
+																	(
+																		user_function_number(zero) == Some(1)
+																		and user_function_number(one) == Some(0)
+																		and spans_at(outer, 96, 110)
+																		and spans_at(inner, 96, 103)
+																		and spans_at(seven, 96, 97)
+																		and zero.span.start == 104
+																		and zero.span.end == 108
+																		and one.span.start == 98
+																		and one.span.end == 101
+																		and same_type(outer.value_type, IntType)
+																	)
+																_:
+																	False
+														_: False
 												_:
 													False
-										_:
-											False
+										_: False
 								_:
 									False
 						None:
@@ -306,15 +324,16 @@ pure func test_ufcs_chain_nests_each_receiver_as_first_argument() -> Bool:
 
 private pure func argument_integers(expr: CheckedExpr) -> List[Int]:
 	match expr.form:
-		InvokeFunction(_, arguments):
+		InvokeFunction(call):
 			var integers: List[Int] = []
 
-			for argument in arguments:
-				match argument.form:
-					LiteralInteger(integer):
-						integers = integers.append(integer)
-					_:
-						void
+			for operand in call.operands:
+				match operand:
+					ValueOperand(argument):
+						match argument.form:
+							LiteralInteger(integer): integers = integers.append(integer)
+							_: void
+					CallableOperand(_, _, _): void
 
 			integers
 		_:
@@ -377,12 +396,15 @@ pure func test_payload_free_variant_is_a_construct_with_no_arguments() -> Bool:
 			match checked_functions(program).functions:
 				[_, main]:
 					match returned_form(main):
-						Some(InvokeFunction(_, [stop])):
-							match stop.form:
-								ConstructVariant(_, []):
-									True
-								_:
-									False
+						Some(InvokeFunction(operand_call_1)):
+							match operand_call_1.operands:
+								[ValueOperand(stop)]:
+									match stop.form:
+										ConstructVariant(_, []):
+											True
+										_:
+											False
+								_: False
 						_:
 							False
 				_:

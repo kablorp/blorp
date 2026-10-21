@@ -2000,7 +2000,7 @@ private pure func value_types(value: Checked.CheckedExpr) -> List[Checked.TypeUs
 -- A call's callee anchor locates its type errors; any other node's own span does.
 private pure func anchor(value: Checked.CheckedExpr) -> Span:
 	match value.form:
-		Checked.InvokeFunction(call, _):
+		Checked.InvokeFunction(call):
 			call.span
 		_:
 			value.span
@@ -2043,9 +2043,11 @@ private pure func append_value_types(
 			for arm in join.arms:
 				types = types.concat(statement_types(arm.statements))
 				types = append_value_types(types, arm.value)
-		Checked.InvokeFunction(_, arguments):
-			for argument in arguments:
-				types = append_value_types(types, argument)
+		Checked.InvokeFunction(call):
+			for operand in call.operands:
+				match operand:
+					Checked.ValueOperand(argument): types = append_value_types(types, argument)
+					Checked.CallableOperand(_, _, _): void
 		Checked.ReadRecordField(receiver, _):
 			types = append_value_types(types, receiver)
 		Checked.LiteralVoid | Checked.LiteralInteger(_) | Checked.LiteralFloat(_) | Checked.LiteralString(_) | Checked.ReadBinding(_) | Checked.ReadCapture(_):
@@ -2295,7 +2297,7 @@ private pure func prepare_function(
 								arguments = choice.arguments,
 								callables = []
 							}, request.source)
-				Checked.UserFunction(declaration, arguments, callables):
+				Checked.UserFunction(declaration, arguments):
 					var concrete: List[TypeRef] = []
 					var depends_on_caller: Bool = False
 
@@ -2334,55 +2336,58 @@ private pure func prepare_function(
 						break
 
 					var choices: List[KnownCallable] = []
-					for callable in callables:
-						var choice_depends_on_caller: Bool = False
-						choice_result: Result[KnownCallable, Diagnostic] = match callable.choice:
-							Checked.ForwardedCallable(parameter):
-								-- A forwarded selection depends on the current caller's key.
-								choice_depends_on_caller = True
-								callable_choice(request.key.callables, parameter, callable.span)
-									.map(pure func(choice): { choice | parameter = callable.parameter })
-							Checked.LambdaCallable(id, captures):
-								choice_depends_on_caller = has_type_parameters
-								match prepare_callable_storage(id, captures, request.key.arguments, checked, prepared, callable.span):
-									Err(error): Err(error)
-									Ok(storage):
-										prepared = storage.prepared
-										Ok({
-											parameter = callable.parameter,
-											body = Checked.LambdaBody(id),
-											arguments = request.key.arguments,
-											storage = storage.storage
-										})
-							Checked.NamedCallable(id, named_arguments):
-								choice_depends_on_caller = match has_type_parameters:
-									True: named_arguments.any(contains_parameter)
-									False: False
-								match prepare_arguments(
-									named_arguments, substitution, checked, prepared.unions,
-									request_span(choice_depends_on_caller, request.source, callable.span), prepared.records, [],
-								):
-									Err(error): Err(error)
-									Ok(types):
-										prepared = { prepared | unions = types.unions, records = types.records }
-										known_types(types.arguments, callable.span).map(pure func(values): {
-											parameter = callable.parameter,
-											body = Checked.DeclaredBody(id),
-											arguments = values,
-											storage = ErasedCallable
-										})
-						depends_on_caller = or(depends_on_caller, choice_depends_on_caller)
-						match choice_result:
-							Err(error):
-								failure = Some(error)
-								break
-							Ok(choice):
-								choices = choices.append(choice)
-								prepared = request_instance(prepared, {
-									body = choice.body,
-									arguments = choice.arguments,
-									callables = []
-								}, ConcreteRequest(request_span(choice_depends_on_caller, request.source, callable.span)))
+					for operand in call.operands:
+						match operand:
+							Checked.ValueOperand(_): void
+							Checked.CallableOperand(written_parameter, written_choice, written_span):
+								var choice_depends_on_caller: Bool = False
+								choice_result: Result[KnownCallable, Diagnostic] = match written_choice:
+									Checked.ForwardedCallable(parameter):
+										-- A forwarded selection depends on the current caller's key.
+										choice_depends_on_caller = True
+										callable_choice(request.key.callables, parameter, written_span)
+											.map(pure func(choice): { choice | parameter = written_parameter })
+									Checked.LambdaCallable(id, captures):
+										choice_depends_on_caller = has_type_parameters
+										match prepare_callable_storage(id, captures, request.key.arguments, checked, prepared, written_span):
+											Err(error): Err(error)
+											Ok(storage):
+												prepared = storage.prepared
+												Ok({
+													parameter = written_parameter,
+													body = Checked.LambdaBody(id),
+													arguments = request.key.arguments,
+													storage = storage.storage
+												})
+									Checked.NamedCallable(id, named_arguments):
+										choice_depends_on_caller = match has_type_parameters:
+											True: named_arguments.any(contains_parameter)
+											False: False
+										match prepare_arguments(
+											named_arguments, substitution, checked, prepared.unions,
+											request_span(choice_depends_on_caller, request.source, written_span), prepared.records, [],
+										):
+											Err(error): Err(error)
+											Ok(types):
+												prepared = { prepared | unions = types.unions, records = types.records }
+												known_types(types.arguments, written_span).map(pure func(values): {
+													parameter = written_parameter,
+													body = Checked.DeclaredBody(id),
+													arguments = values,
+													storage = ErasedCallable
+												})
+								depends_on_caller = or(depends_on_caller, choice_depends_on_caller)
+								match choice_result:
+									Err(error):
+										failure = Some(error)
+										break
+									Ok(choice):
+										choices = choices.append(choice)
+										prepared = request_instance(prepared, {
+											body = choice.body,
+											arguments = choice.arguments,
+											callables = []
+										}, ConcreteRequest(request_span(choice_depends_on_caller, request.source, written_span)))
 					if failure.is_some().not():
 						prepared = request_instance(prepared, {
 							body = Checked.DeclaredBody(declaration),
@@ -2700,37 +2705,40 @@ private pure func translate_call(
 						arguments = choice.arguments,
 						callables = []
 					}).to_result(invalid(call.span, "unexpanded callable target")).map(pure func(id): UserFunction(id))
-		Checked.UserFunction(declaration, arguments, written_choices):
+		Checked.UserFunction(declaration, arguments):
 			match concrete_types(opaques, arguments, substitution, unions, call.span, records):
 				Err(error): Err(error)
 				Ok(concrete):
 					var choices: List[KnownCallable] = []
 					var failure: Option[Diagnostic] = None
-					for written in written_choices:
-						choice_result: Result[KnownCallable, Diagnostic] = match written.choice:
-							Checked.ForwardedCallable(parameter):
-								callable_choice(callables.callables, parameter, written.span)
-									.map(pure func(choice): { choice | parameter = written.parameter })
-							Checked.LambdaCallable(id, captures):
-								root_arguments = substitution.map(pure func(value): value.value_type)
-								lambda_storage(id, captures, root_arguments, records, written.span).map(pure func(storage): {
-									parameter = written.parameter,
-									body = Checked.LambdaBody(id),
-									arguments = root_arguments,
-									storage = storage
-								})
-							Checked.NamedCallable(id, named_arguments):
-								concrete_types(opaques, named_arguments, substitution, unions, written.span, records).map(pure func(values): {
-									parameter = written.parameter,
-									body = Checked.DeclaredBody(id),
-									arguments = values,
-									storage = ErasedCallable
-								})
-						match choice_result:
-							Ok(choice): choices = choices.append(choice)
-							Err(error):
-								failure = Some(error)
-								break
+					for operand in call.operands:
+						match operand:
+							Checked.ValueOperand(_): void
+							Checked.CallableOperand(written_parameter, written_choice, written_span):
+								choice_result: Result[KnownCallable, Diagnostic] = match written_choice:
+									Checked.ForwardedCallable(parameter):
+										callable_choice(callables.callables, parameter, written_span)
+											.map(pure func(choice): { choice | parameter = written_parameter })
+									Checked.LambdaCallable(id, captures):
+										root_arguments = substitution.map(pure func(value): value.value_type)
+										lambda_storage(id, captures, root_arguments, records, written_span).map(pure func(storage): {
+											parameter = written_parameter,
+											body = Checked.LambdaBody(id),
+											arguments = root_arguments,
+											storage = storage
+										})
+									Checked.NamedCallable(id, named_arguments):
+										concrete_types(opaques, named_arguments, substitution, unions, written_span, records).map(pure func(values): {
+											parameter = written_parameter,
+											body = Checked.DeclaredBody(id),
+											arguments = values,
+											storage = ErasedCallable
+										})
+								match choice_result:
+									Ok(choice): choices = choices.append(choice)
+									Err(error):
+										failure = Some(error)
+										break
 					match failure:
 						Some(error): Err(error)
 						None:
@@ -2864,12 +2872,12 @@ private pure func translate_expr(
 								Err(error): Err(error)
 						_: Err(invalid(value.span, "record operation has a non-record receiver"))
 				Err(error): Err(error)
-		Checked.InvokeFunction(call, arguments):
+		Checked.InvokeFunction(call):
 			match concrete_type(opaques, value.value_type, substitution, unions, call.span, records):
 				Ok(value_type):
 					match translate_call(opaques, call, substitution, callables, keys, unions, records, value_type):
 						Ok(concrete):
-							match translate_call_arguments(opaques, call, arguments, substitution, callables, keys, unions, records):
+							match translate_call_arguments(opaques, call, substitution, callables, keys, unions, records):
 								Ok(values): Ok({ form = InvokeFunction(concrete, values), value_type = value_type, span = value.span })
 								Err(error): Err(error)
 						Err(error): Err(error)
@@ -2966,95 +2974,71 @@ private pure func translate_leaf(
 	Ok({ form = form, value_type = value_type, span = value.span })
 
 
--- Check retains ordinary operands densely; callback identities carry written
--- positions. Merge in that order before Lower evaluates the ordinary expressions.
+-- Ordinary values and callback environments retain written operand order.
 private pure func translate_call_arguments(
 	opaques: List[Checked.CheckedOpaque],
 	call: Checked.CheckedCall,
-	arguments: List[Checked.CheckedExpr],
 	substitution: List[TypeSubstitution[TypeRef]],
 	translation: TranslationBindings,
 	keys: List[FunctionRequest],
 	unions: List[UnionInstance],
 	records: List[RecordInstance],
 ) -> Result[List[ConcreteExpr], Diagnostic]:
+	var values: List[ConcreteExpr] = []
+	var failure: Option[Diagnostic] = None
+	for operand in call.operands:
+		match operand:
+			Checked.ValueOperand(argument):
+				match translate_expr(opaques, argument, substitution, translation, keys, unions, records):
+					Err(error): failure = Some(error)
+					Ok(value): values = values.append(value)
+			Checked.CallableOperand(_, choice, span):
+				match translate_callable_operand(opaques, choice, span, substitution, translation, keys, unions, records):
+					Err(error): failure = Some(error)
+					Ok(environment):
+						match environment:
+							None: void
+							Some(value): values = values.append(value)
+		if failure.is_some():
+			break
+	ready: Void ?= match failure:
+		Some(error): Err(error)
+		None: Ok(void)
 	match call.target:
-		Checked.RuntimeFunction(_):
-			translate_exprs(opaques, arguments, substitution, translation, keys, unions, records)
 		Checked.CallableParameter(parameter):
-			match translate_exprs(opaques, arguments, substitution, translation, keys, unions, records):
+			match callable_choice(translation.callables, parameter, call.span):
 				Err(error): Err(error)
-				Ok(values):
-					match callable_choice(translation.callables, parameter, call.span):
-						Err(error): Err(error)
-						Ok(choice):
-							match choice.storage:
-								ErasedCallable: Ok(values)
-								EnvironmentCallable(_):
-									match callable_environment(parameter, translation, call.span):
-										Err(error): Err(error)
-										Ok(environment): Ok([environment].concat(values))
-		Checked.UserFunction(_, _, choices):
-			if choices.is_empty():
-				translate_exprs(opaques, arguments, substitution, translation, keys, unions, records)
-			else:
-				var values: List[ConcreteExpr] = []
-				var data_position = 0
-				var choice_position = 0
-				var written_position = 0
-				var failure: Option[Diagnostic] = None
-				while IntOps.less_than(written_position, IntOps.add(arguments.length(), choices.length())):
-					written = choices.get(choice_position)
-					is_callback = match written:
-						Some(choice): IntOps.equals(Checked.callable_position(choice.parameter), written_position)
-						None: False
-					if is_callback:
-						match written:
-							None: failure = Some(invalid(call.span, "missing written callable operand"))
-							Some(choice):
-								match translate_callable_operand(opaques, choice, substitution, translation, keys, unions, records):
-									Err(error): failure = Some(error)
-									Ok(environment):
-										match environment:
-											None: void
-											Some(value): values = values.append(value)
-						choice_position = IntOps.add(choice_position, 1)
-					else:
-						match arguments.get(data_position):
-							None: failure = Some(invalid(call.span, "missing ordinary call operand"))
-							Some(argument):
-								match translate_expr(opaques, argument, substitution, translation, keys, unions, records):
-									Err(error): failure = Some(error)
-									Ok(value): values = values.append(value)
-						data_position = IntOps.add(data_position, 1)
-					if failure.is_some():
-						break
-					written_position = IntOps.add(written_position, 1)
-				match failure:
-					Some(error): Err(error)
-					None: Ok(values)
+				Ok(choice):
+					match choice.storage:
+						ErasedCallable: Ok(values)
+						EnvironmentCallable(_):
+							match callable_environment(parameter, translation, call.span):
+								Err(error): Err(error)
+								Ok(environment): Ok([environment].concat(values))
+		Checked.RuntimeFunction(_) | Checked.UserFunction(_, _): Ok(values)
 
 
 private pure func translate_callable_operand(
 	opaques: List[Checked.CheckedOpaque],
-	choice: Checked.CallableArgument,
+	choice: Checked.CallableChoice,
+	span: Span,
 	substitution: List[TypeSubstitution[TypeRef]],
 	translation: TranslationBindings,
 	keys: List[FunctionRequest],
 	unions: List[UnionInstance],
 	records: List[RecordInstance],
 ) -> Result[Option[ConcreteExpr], Diagnostic]:
-	match choice.choice:
+	match choice:
 		Checked.NamedCallable(_, _): Ok(None)
 		Checked.ForwardedCallable(parameter):
-			match callable_choice(translation.callables, parameter, choice.span):
+			match callable_choice(translation.callables, parameter, span):
 				Err(error): Err(error)
 				Ok(known):
 					match known.storage:
 						ErasedCallable: Ok(None)
-						EnvironmentCallable(_): callable_environment(parameter, translation, choice.span).map(pure func(value): Some(value))
+						EnvironmentCallable(_): callable_environment(parameter, translation, span).map(pure func(value): Some(value))
 		Checked.LambdaCallable(id, captures):
-			match lambda_storage(id, captures, substitution.map(pure func(value): value.value_type), records, choice.span):
+			match lambda_storage(id, captures, substitution.map(pure func(value): value.value_type), records, span):
 				Err(error): Err(error)
 				Ok(ErasedCallable): Ok(None)
 				Ok(EnvironmentCallable(owner)):
@@ -3066,7 +3050,7 @@ private pure func translate_callable_operand(
 							for value in children:
 								fields = fields.append({ field = into_opaque FieldInstanceId({ owner = owner, position = position }), value = value })
 								position = IntOps.add(position, 1)
-							Ok(Some({ form = ConstructRecord(owner, fields), value_type = RecordType(owner), span = choice.span }))
+							Ok(Some({ form = ConstructRecord(owner, fields), value_type = RecordType(owner), span = span }))
 
 
 private pure func translate_exprs(
