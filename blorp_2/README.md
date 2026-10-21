@@ -358,15 +358,29 @@ make -C blorp_2 test             # Run the Blorp TestSuite tests.
 ```
 
 `example` keeps its generated C and executable in `blorp_2/build/` for
-inspection. Host suites use temporary directories; the target text gate keeps
+inspection. Host suites use temporary directories; the target component gate keeps
 its C and executable in `blorp_2/build/self-hosted-tests/`. `BLORP_CC` selects a C
 compiler executable (default `clang`).
 `make -C blorp_2 test-compiler test-components` runs the complete component
 gate: the temporary existing-compiler host runs the unit/runtime/grammar
-roots, then the Blorp 2 compiler runs the existing text suite through its
-`tests: TestSuite` constant. The host directory run also discovers that suite;
-the separate target execution is still required for the complete gate. `test-components BLORP2_COMPILER=PATH` uses an
-already-built compiler without selecting a fallback.
+roots, then Blorp 2 runs the explicit `TARGET_COMPONENT_SOURCES` in the Makefile.
+The selection currently covers text, Boolean calls, constant/declaration IDs,
+IntMap, source identities and syntax publication. The names suite still needs
+the separate shared-input migration. Each selected suite uses its ordinary
+`tests: TestSuite` entry; generated C and executables mirror its source path
+under `blorp_2/build/self-hosted-tests/`.
+
+`test-components BLORP2_COMPILER=PATH` uses an already-built compiler without a
+fallback. To run just the target selection, use:
+
+```sh
+make -C blorp_2 test-target-components BLORP2_COMPILER=PATH
+```
+
+This target does not build or use the legacy host. Compilation, native linking,
+failed callbacks and strict leak failures all fail the target; an empty source
+selection is an error. The host run also discovers these suites, but their
+separate target execution remains required for the complete component gate.
 
 The explicit compile-only test entry is:
 

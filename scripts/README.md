@@ -31,8 +31,10 @@ CI's Blorp 2 lanes run on Linux x64 and ARM64 with Clang, Linux x64 with GCC,
 and macOS with Clang. Each restores the temporary existing-compiler TestSuite
 host, builds the pilot once from the pinned Blorp 2 seed, then runs
 `make -C blorp_2 test-components test-e2e`. The component target runs the
-existing host roots and the exact target-owned text factory; a host-only
-directory invocation omits that factory. Every e2e fixture uses the named pilot.
+existing host roots and the Makefile's explicit `TARGET_COMPONENT_SOURCES`
+through ordinary constant TestSuite entries. `test-target-components` runs only
+that target selection with an already-built compiler; host-only discovery does
+not replace it. Every e2e fixture uses the named pilot.
 Hosted runners do not guarantee the required retired-instruction counters,
 so the CI step explicitly sets `BLORP_2_INSTRUCTION_CHECK=disabled`. It skips
 only instruction measurement and limits; allocation caps, strict leak parsing,
