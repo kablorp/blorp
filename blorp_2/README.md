@@ -368,10 +368,19 @@ roots, then Blorp 2 runs the explicit `TARGET_COMPONENT_SOURCES` in the Makefile
 The selection currently covers text, Boolean calls, constant/declaration IDs,
 IntMap, names, source identities and syntax publication, plus Lexer token traces,
 float boundaries, keyword roles, source origins, character literals, continuation,
-doc fences, ranges, lexical trivia and runtime-text round trips. Each selected
-suite uses its ordinary
+doc fences, ranges, lexical trivia, pipe Strings and runtime-text round trips.
+Parse coverage includes constant inventories, source provenance, and String,
+integer, Float and file builtin labels. The selection has 27 suites with 188
+active cases. Each selected suite uses its ordinary
 `tests: TestSuite` entry; generated C and executables mirror its source path
 under `blorp_2/build/self-hosted-tests/`.
+
+Twelve Lexer cases are explicitly deferred in source comments: eleven bracketed
+block cases need `String.split`, and one pipe String case needs a byte-input
+boundary for invalid UTF-8. Their original inputs and assertions remain beside
+the TODOs. Deferred cases receive no PASS credit; the empty bracketed-block suite
+is not in the target selection. Other untranslated suites retain the temporary
+host until they can be ported without new library work or large refactors.
 
 `test-components BLORP2_COMPILER=PATH` uses an already-built compiler without a
 fallback. To run just the target selection, use:
