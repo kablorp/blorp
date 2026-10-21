@@ -2099,12 +2099,20 @@ private pure func append_union_ownership(
 			append_boxed_union_release(append_boxed_union_retain(constructed, index), layout, index, unions)
 
 
+-- Exit destinations are prepared once; nested emission does not need the body.
+private fixed record LoopEmissionContext {
+	break_parameters: List[Own.OwnedJoinParameter],
+	recur_parameters: List[Own.OwnedJoinParameter],
+	target: Lower.LoopTarget
+}
+
+
 private pure func append_ownership_operation(
 	output: String,
 	operation: OwnershipOperation,
 	unions: List[ConcreteUnion],
 	types: List[TypeRef],
-	records: List[ConcreteRecord], nearest: Option[Own.OwnedLoop],
+	records: List[ConcreteRecord], nearest: Option[LoopEmissionContext],
 ) -> Result[String, Diagnostic]:
 	match operation:
 		DefineValue(definition):
@@ -2138,7 +2146,7 @@ private pure func append_ownership_operations(
 	operations: List[OwnershipOperation],
 	unions: List[ConcreteUnion],
 	types: List[TypeRef],
-	records: List[ConcreteRecord], nearest: Option[Own.OwnedLoop],
+	records: List[ConcreteRecord], nearest: Option[LoopEmissionContext],
 ) -> Result[String, Diagnostic]:
 	var fragments: List[String] = [output]
 	var failure: Option[Diagnostic] = None
@@ -2288,7 +2296,7 @@ private pure func append_input_owners(
 private pure func append_selection_edge(
 	output: String, scope: SelectionEmissionScope, edge: Own.OwnedSelectionEdge,
 	arms: List[SelectionEmissionArm], unions: List[ConcreteUnion],
-	types: List[TypeRef], records: List[ConcreteRecord], nearest: Option[Own.OwnedLoop],
+	types: List[TypeRef], records: List[ConcreteRecord], nearest: Option[LoopEmissionContext],
 ) -> Result[String, Diagnostic]:
 	arm: SelectionEmissionArm ?= match arms.get(match_arm_number(edge.arm)):
 		Some(found): Ok(found)
@@ -2321,7 +2329,7 @@ private pure func c_selection_branch(
 private pure func append_selection_node(
 	scope: SelectionEmissionScope, selection: Own.OwnedSelection,
 	node: Own.OwnedDecisionNode, arms: List[SelectionEmissionArm],
-	unions: List[ConcreteUnion], types: List[TypeRef], records: List[ConcreteRecord], nearest: Option[Own.OwnedLoop],
+	unions: List[ConcreteUnion], types: List[TypeRef], records: List[ConcreteRecord], nearest: Option[LoopEmissionContext],
 ) -> Result[String, Diagnostic]:
 	match node:
 		Own.TestVariant(place, variant, yes, no):
@@ -2354,7 +2362,7 @@ private pure func append_selection_node(
 private pure func append_selection(
 	output: String, scope: SelectionEmissionScope, selection: Own.OwnedSelection,
 	arms: List[SelectionEmissionArm], unions: List[ConcreteUnion],
-	types: List[TypeRef], records: List[ConcreteRecord], nearest: Option[Own.OwnedLoop],
+	types: List[TypeRef], records: List[ConcreteRecord], nearest: Option[LoopEmissionContext],
 ) -> Result[String, Diagnostic]:
 	var result = output
 	var failure: Option[Diagnostic] = None
@@ -2394,7 +2402,7 @@ private pure func append_selection(
 
 private pure func append_selection_body(
 	scope: SelectionEmissionScope, arm: SelectionEmissionArm,
-	unions: List[ConcreteUnion], types: List[TypeRef], records: List[ConcreteRecord], nearest: Option[Own.OwnedLoop],
+	unions: List[ConcreteUnion], types: List[TypeRef], records: List[ConcreteRecord], nearest: Option[LoopEmissionContext],
 ) -> Result[String, Diagnostic]:
 	opening = c_selection_arm(scope, arm.id).concat(":{")
 	inputs ?= append_input_owners(opening, arm.inputs, unions)
@@ -2405,12 +2413,12 @@ private pure func append_selection_body(
 -- Capture the complete outgoing batch before assigning any destination. The
 -- producer has already acquired every owned occurrence and retired old owners.
 private pure func append_loop_exit(
-	output: String, exit: Own.OwnedLoopExit, loop: Own.OwnedLoop,
-	target: Lower.LoopTarget, unions: List[ConcreteUnion],
+	output: String, exit: Own.OwnedLoopExit, context: LoopEmissionContext,
+	unions: List[ConcreteUnion],
 ) -> Result[String, Diagnostic]:
 	parameters = match exit:
-		Own.Break(_): [loop.result].concat(loop.carried)
-		Own.Recur(_, _): loop.headers.map(pure func(header): header.parameter)
+		Own.Break(_): context.break_parameters
+		Own.Recur(_, _): context.recur_parameters
 	transfers = match exit:
 		Own.Break(outputs): [outputs.value].concat(outputs.carried)
 		Own.Recur(arguments, _): arguments
@@ -2429,7 +2437,7 @@ private pure func append_loop_exit(
 						failure = Some(error)
 						break
 					Ok(declaration):
-						result = result.concat(declaration).concat(c_loop_transfer(target, position))
+						result = result.concat(declaration).concat(c_loop_transfer(context.target, position))
 							.concat("=").concat(transfer_value(transfer)).concat(";")
 		position = IntOps.add(position, 1)
 	ready: Void ?= match failure:
@@ -2441,35 +2449,35 @@ private pure func append_loop_exit(
 		name = match exit:
 			Own.Break(_): c_value(fact.id)
 			Own.Recur(_, _): c_header(fact.id)
-		result = result.concat(name).concat("=").concat(c_loop_transfer(target, position)).concat(";")
+		result = result.concat(name).concat("=").concat(c_loop_transfer(context.target, position)).concat(";")
 		position = IntOps.add(position, 1)
 	label = match exit:
-		Own.Break(_): c_loop_break(target)
-		Own.Recur(_, _): c_loop_header(target)
+		Own.Break(_): c_loop_break(context.target)
+		Own.Recur(_, _): c_loop_header(context.target)
 	Ok(result.concat("goto ").concat(label).concat(";"))
 
 
 private pure func append_loop_block(
-	output: String, block: Own.OwnedLoopBlock, loop: Own.OwnedLoop,
+	output: String, block: Own.OwnedLoopBlock, context: LoopEmissionContext,
 	scope: SelectionEmissionScope, unions: List[ConcreteUnion],
 	types: List[TypeRef], records: List[ConcreteRecord],
 ) -> Result[String, Diagnostic]:
-	body ?= append_ownership_operations(output, block.operations, unions, types, records, Some(loop))
-	append_loop_tail(body, block.tail, loop, Lower.loop_target(join_parameter(loop.result).id), scope, unions, types, records)
+	body ?= append_ownership_operations(output, block.operations, unions, types, records, Some(context))
+	append_loop_tail(body, block.tail, context, scope, unions, types, records)
 
 
 private pure func append_loop_tail(
-	output: String, tail: Own.OwnedLoopTail, loop: Own.OwnedLoop,
-	target: Lower.LoopTarget, scope: SelectionEmissionScope,
+	output: String, tail: Own.OwnedLoopTail, context: LoopEmissionContext,
+	scope: SelectionEmissionScope,
 	unions: List[ConcreteUnion], types: List[TypeRef], records: List[ConcreteRecord],
 ) -> Result[String, Diagnostic]:
 	match tail:
-		Own.ExitLoop(exit): append_loop_exit(output, exit, loop, target, unions)
-		Own.MatchLoop(matched): append_loop_match(output, matched, loop, scope, unions, types, records)
+		Own.ExitLoop(exit): append_loop_exit(output, exit, context, unions)
+		Own.MatchLoop(matched): append_loop_match(output, matched, context, scope, unions, types, records)
 
 
 private pure func append_loop_match(
-	output: String, matched: Own.OwnedLoopMatch, loop: Own.OwnedLoop,
+	output: String, matched: Own.OwnedLoopMatch, context: LoopEmissionContext,
 	scope: SelectionEmissionScope, unions: List[ConcreteUnion],
 	types: List[TypeRef], records: List[ConcreteRecord],
 ) -> Result[String, Diagnostic]:
@@ -2477,7 +2485,7 @@ private pure func append_loop_match(
 	var failure: Option[Diagnostic] = None
 	for arm in matched.arms:
 		child = { scope | path = scope.path.append(arm.id) }
-		match append_loop_block("", arm.body, loop, child, unions, types, records):
+		match append_loop_block("", arm.body, context, child, unions, types, records):
 			Err(error):
 				failure = Some(error)
 				break
@@ -2485,7 +2493,7 @@ private pure func append_loop_match(
 	ready: Void ?= match failure:
 		Some(error): Err(error)
 		None: Ok(void)
-	append_selection(output, scope, matched.selection, arms, unions, types, records, Some(loop))
+	append_selection(output, scope, matched.selection, arms, unions, types, records, Some(context))
 
 
 private pure func append_loop(
@@ -2496,19 +2504,10 @@ private pure func append_loop(
 	records: List[ConcreteRecord],
 ) -> Result[String, Diagnostic]:
 	parameters = [loop.result].concat(loop.carried)
-	var declarations = ""
+	output_declarations ?= append_input_declarations("", parameters, unions)
+	var declarations = output_declarations
 	var snapshots = ""
 	var failure: Option[Diagnostic] = None
-	for output_parameter in parameters:
-		fact = join_parameter(output_parameter)
-		match c_local_declaration(fact.value_type, JoinLocal, unions, fact.span):
-			Err(error):
-				failure = Some(error)
-				break
-			Ok(declaration): declarations = declarations.concat(declaration).concat(c_value(fact.id)).concat(";")
-	outputs: Void ?= match failure:
-		Some(error): Err(error)
-		None: Ok(void)
 	for header in loop.headers:
 		fact = join_parameter(header.parameter)
 		match c_local_declaration(fact.value_type, JoinLocal, unions, fact.span):
@@ -2534,7 +2533,11 @@ private pure func append_loop(
 		Some(error): Err(error)
 		None: Ok(void)
 	scope: SelectionEmissionScope = { root = join_parameter(loop.result).id, path = [] }
-	target = Lower.loop_target(scope.root)
+	context: LoopEmissionContext = {
+		break_parameters = parameters,
+		recur_parameters = loop.headers.map(pure func(header): header.parameter),
+		target = Lower.loop_target(scope.root)
+	}
 	var entered = output
 	for acquisition in loop.entry_acquisitions:
 		match append_ownership_operation(entered, AcquireOwner(acquisition.owner, acquisition.borrow, join_parameter(loop.result).span), unions, types, records, None):
@@ -2547,26 +2550,13 @@ private pure func append_loop(
 		None: Ok(void)
 	-- Acquisitions precede header initialization, which may move their aliases.
 	declared = entered.concat(declarations)
-	body ?= append_loop_block(snapshots, loop.body, loop, scope, unions, types, records)
+	body ?= append_loop_block(snapshots, loop.body, context, scope, unions, types, records)
 	-- Both labels have lexical uses even for a loop with only one exit kind.
 	-- A sealed body always transfers before the final, unreachable goto.
-	var completed = declared.concat("goto ").concat(c_loop_header(target)).concat(";")
-		.concat(c_loop_header(target)).concat(":{").concat(body).concat("}goto ")
-		.concat(c_loop_break(target)).concat(";").concat(c_loop_break(target)).concat(":;")
-	for output_parameter in parameters:
-		fact = join_parameter(output_parameter)
-		completed = completed.concat("(void)").concat(c_value(fact.id)).concat(";")
-		match output_parameter:
-			UnmanagedJoinParameter(_): void
-			ManagedJoinParameter(_, owner):
-				match append_owner_alias(completed, owner, fact.id, fact.value_type, unions, fact.span):
-					Ok(aliased): completed = aliased
-					Err(error):
-						failure = Some(error)
-						break
-	match failure:
-		Some(error): Err(error)
-		None: Ok(completed)
+	completed = declared.concat("goto ").concat(c_loop_header(context.target)).concat(";")
+		.concat(c_loop_header(context.target)).concat(":{").concat(body).concat("}goto ")
+		.concat(c_loop_break(context.target)).concat(";").concat(c_loop_break(context.target)).concat(":;")
+	append_input_owners(completed, parameters, unions)
 
 -- Verified ordinary joins have a yielding continuation. Abrupt arms transfer
 -- directly to their typed loop target through the same selection emitter.
@@ -2575,7 +2565,7 @@ private pure func append_join(
 	matched_join: OwnedJoin,
 	unions: List[ConcreteUnion],
 	types: List[TypeRef],
-	records: List[ConcreteRecord], nearest: Option[Own.OwnedLoop],
+	records: List[ConcreteRecord], nearest: Option[LoopEmissionContext],
 ) -> Result[String, Diagnostic]:
 	parameter = join_parameter(matched_join.result)
 	name = c_value(parameter.id)
@@ -2600,7 +2590,7 @@ private pure func append_join(
 			Own.TransferLoop(target, exit):
 				match nearest:
 					None: Err(render(parameter.span, MissingJoinTransfer(Lower.loop_target_value(target))))
-					Some(loop): append_loop_tail("", exit, loop, target, { root = scope.root, path = scope.path.append(arm.id) }, unions, types, records)
+					Some(context): append_loop_tail("", exit, context, { root = scope.root, path = scope.path.append(arm.id) }, unions, types, records)
 			Own.Yield(outputs):
 				var transferred = name.concat("=").concat(transfer_value(outputs.transfer)).concat(";")
 				var position = 0
