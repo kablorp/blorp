@@ -2,9 +2,9 @@ import:
 	../../e2e/cost:
 		CompilationCost, CostLimits,
 		InstructionCheck(RequiredInstructions, DisabledInstructions),
-		ResourcePolicy(EnforceLimits, RecordInitialBootstrapDebt),
-		ResourceVerdict(ResourceChecksPassed, InitialBootstrapDebt),
-		assess_resource_limits, check_limits, format_cost, format_initial_bootstrap_debt,
+		ResourcePolicy(EnforceLimits, RecordInitialBootstrapDebt, RecordAllocationDebt),
+		ResourceVerdict(ResourceChecksPassed, InitialBootstrapDebt, AllocationDebt),
+		assess_resource_limits, check_limits, format_cost, format_initial_bootstrap_debt, format_allocation_debt,
 		parse_allocations, parse_instruction_check, parse_instructions, parse_resource_policy
 	test: TestSuite
 
@@ -175,12 +175,12 @@ pure func test_initial_bootstrap_debt_requires_exact_opt_in() -> Bool:
 
 private pure func rejects_resource_policy(value: String) -> Bool:
 	match parse_resource_policy(Some(value)):
-		Err(error): error == "BLORP_2_RESOURCE_POLICY must be 'enforce-limits' or 'record-initial-bootstrap-debt'; unset it to enforce resource limits"
+		Err(error): error == "BLORP_2_RESOURCE_POLICY must be 'enforce-limits', 'record-initial-bootstrap-debt' or 'record-allocation-debt'; unset it to enforce resource limits"
 		Ok(_): False
 
 
 pure func test_invalid_resource_policies_keep_exact_error() -> Bool:
-	rejects_resource_policy("") and rejects_resource_policy("record") and rejects_resource_policy("Enforce-Limits") and rejects_resource_policy(" record-initial-bootstrap-debt ")
+	rejects_resource_policy("") and rejects_resource_policy("record") and rejects_resource_policy("Enforce-Limits") and rejects_resource_policy(" record-initial-bootstrap-debt ") and rejects_resource_policy(" record-allocation-debt ")
 
 
 pure func test_policy_preserves_strict_allocation_error() -> Bool:
@@ -195,13 +195,16 @@ pure func test_policy_preserves_strict_instruction_error() -> Bool:
 		Ok(_): False
 
 
-pure func test_both_policies_pass_costs_at_limits() -> Bool:
+pure func test_all_policies_pass_costs_at_limits() -> Bool:
 	cost: CompilationCost = { allocations = 81, instructions = Some(12345) }
 	limits: CostLimits = { allocations = 81, instructions = 12345 }
 	match assess_resource_limits(EnforceLimits, cost, limits):
 		Ok(ResourceChecksPassed):
 			match assess_resource_limits(RecordInitialBootstrapDebt, cost, limits):
-				Ok(ResourceChecksPassed): True
+				Ok(ResourceChecksPassed):
+					match assess_resource_limits(RecordAllocationDebt, cost, limits):
+						Ok(ResourceChecksPassed): True
+						_: False
 				_: False
 		_: False
 
@@ -241,6 +244,58 @@ pure func test_unmeasured_debt_record_still_preserves_instruction_limit() -> Boo
 	) == "BLORP2_RESOURCE_RESULT status=FAIL policy=record-initial-bootstrap-debt allocations=82 allocation_limit=81 instructions=unmeasured instruction_limit=12345 reason=compiler allocations exceeded limit: 82 > 81"
 
 
+pure func test_allocation_debt_requires_exact_opt_in() -> Bool:
+	match parse_resource_policy(Some("record-allocation-debt")):
+		Ok(RecordAllocationDebt): True
+		_: False
+
+
+pure func test_allocation_only_debt_preserves_counters_limits_and_reason() -> Bool:
+	match assess_resource_limits(RecordAllocationDebt, { allocations = 82, instructions = Some(12345) }, { allocations = 81, instructions = 12345 }):
+		Ok(AllocationDebt(cost, limits, reason)):
+			cost.allocations == 82 and cost.instructions == Some(12345) and limits.allocations == 81 and limits.instructions == 12345 and reason == "compiler allocations exceeded limit: 82 > 81"
+		_: False
+
+
+pure func test_allocation_debt_still_rejects_instruction_overrun() -> Bool:
+	match assess_resource_limits(RecordAllocationDebt, { allocations = 81, instructions = Some(12346) }, { allocations = 81, instructions = 12345 }):
+		Err(error): error == "compiler retired instructions exceeded limit: 12346 > 12345"
+		Ok(_): False
+
+
+pure func test_allocation_debt_rejects_instructions_when_both_limits_exceeded() -> Bool:
+	match assess_resource_limits(RecordAllocationDebt, { allocations = 82, instructions = Some(12346) }, { allocations = 81, instructions = 12345 }):
+		Err(error): error == "compiler retired instructions exceeded limit: 12346 > 12345"
+		Ok(_): False
+
+
+pure func test_unmeasured_allocation_debt_does_not_invent_instructions() -> Bool:
+	match assess_resource_limits(RecordAllocationDebt, { allocations = 82, instructions = None }, { allocations = 81, instructions = 12345 }):
+		Ok(AllocationDebt(cost, limits, reason)):
+			cost.allocations == 82 and cost.instructions.is_none() and limits.instructions == 12345 and reason == "compiler allocations exceeded limit: 82 > 81"
+		_: False
+
+
+pure func test_allocation_debt_below_limits_does_not_report_debt() -> Bool:
+	match assess_resource_limits(RecordAllocationDebt, { allocations = 80, instructions = Some(12344) }, { allocations = 81, instructions = 12345 }):
+		Ok(ResourceChecksPassed): True
+		_: False
+
+
+pure func test_allocation_debt_record_is_distinct_and_complete() -> Bool:
+	format_allocation_debt(
+		{ allocations = 82, instructions = Some(12345) }, { allocations = 81, instructions = 12345 },
+		"compiler allocations exceeded limit: 82 > 81",
+	) == "BLORP2_ALLOCATION_RESULT status=FAIL policy=record-allocation-debt allocations=82 allocation_limit=81 instructions=12345 instruction_limit=12345 reason=compiler allocations exceeded limit: 82 > 81"
+
+
+pure func test_unmeasured_allocation_debt_record_keeps_instruction_limit() -> Bool:
+	format_allocation_debt(
+		{ allocations = 82, instructions = None }, { allocations = 81, instructions = 12345 },
+		"compiler allocations exceeded limit: 82 > 81",
+	) == "BLORP2_ALLOCATION_RESULT status=FAIL policy=record-allocation-debt allocations=82 allocation_limit=81 instructions=unmeasured instruction_limit=12345 reason=compiler allocations exceeded limit: 82 > 81"
+
+
 tests: TestSuite = {
 	description = "Blorp 2 compilation cost reports",
 	tests = [
@@ -273,11 +328,19 @@ tests: TestSuite = {
 		("invalid resource policies keep exact error", test_invalid_resource_policies_keep_exact_error),
 		("policy preserves strict allocation error", test_policy_preserves_strict_allocation_error),
 		("policy preserves strict instruction error", test_policy_preserves_strict_instruction_error),
-		("both policies pass costs at limits", test_both_policies_pass_costs_at_limits),
+		("all resource policies pass costs at limits", test_all_policies_pass_costs_at_limits),
 		("debt retains both counters limits and original error", test_debt_retains_both_counters_limits_and_original_error),
 		("instruction debt keeps original error", test_instruction_debt_keeps_its_original_error),
 		("unmeasured debt invents no instructions", test_unmeasured_debt_does_not_invent_instructions),
 		("debt record preserves every value and reason", test_debt_record_preserves_every_value_and_original_reason),
 		("unmeasured debt record preserves instruction limit", test_unmeasured_debt_record_still_preserves_instruction_limit),
+		("allocation debt requires exact opt in", test_allocation_debt_requires_exact_opt_in),
+		("allocation-only debt preserves counters limits and reason", test_allocation_only_debt_preserves_counters_limits_and_reason),
+		("allocation debt still rejects instruction overrun", test_allocation_debt_still_rejects_instruction_overrun),
+		("allocation debt rejects instructions when both limits exceeded", test_allocation_debt_rejects_instructions_when_both_limits_exceeded),
+		("unmeasured allocation debt invents no instructions", test_unmeasured_allocation_debt_does_not_invent_instructions),
+		("allocation debt below limits reports no debt", test_allocation_debt_below_limits_does_not_report_debt),
+		("allocation debt record is distinct and complete", test_allocation_debt_record_is_distinct_and_complete),
+		("unmeasured allocation debt record keeps instruction limit", test_unmeasured_allocation_debt_record_keeps_instruction_limit),
 	]
 }

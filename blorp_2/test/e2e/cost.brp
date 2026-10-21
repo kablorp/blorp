@@ -20,11 +20,13 @@ record CostLimits {
 fixed union ResourcePolicy:
 	EnforceLimits
 	RecordInitialBootstrapDebt
+	RecordAllocationDebt
 
 
 union ResourceVerdict:
 	ResourceChecksPassed
 	InitialBootstrapDebt(CompilationCost, CostLimits, String)
+	AllocationDebt(CompilationCost, CostLimits, String)
 
 
 pure func parse_resource_policy(setting: Option[String]) -> Result[ResourcePolicy, String]:
@@ -32,8 +34,9 @@ pure func parse_resource_policy(setting: Option[String]) -> Result[ResourcePolic
 		None: Ok(EnforceLimits)
 		Some("enforce-limits"): Ok(EnforceLimits)
 		Some("record-initial-bootstrap-debt"): Ok(RecordInitialBootstrapDebt)
+		Some("record-allocation-debt"): Ok(RecordAllocationDebt)
 		Some(_):
-			Err("BLORP_2_RESOURCE_POLICY must be 'enforce-limits' or 'record-initial-bootstrap-debt'; unset it to enforce resource limits")
+			Err("BLORP_2_RESOURCE_POLICY must be 'enforce-limits', 'record-initial-bootstrap-debt' or 'record-allocation-debt'; unset it to enforce resource limits")
 
 
 private ALLOCATION_PREFIX: String = "blorp: leak check: "
@@ -127,18 +130,22 @@ pure func check_limits(cost: CompilationCost, limits: CostLimits) -> Result[Void
 			) + " > " + "".append_int(limits.allocations),
 		)
 	else:
-		match cost.instructions:
-			Some(instructions):
-				if instructions > limits.instructions:
-					Err(
-						"compiler retired instructions exceeded limit: " + "".append_int(
-							instructions,
-						) + " > " + "".append_int(limits.instructions),
-					)
-				else:
-					Ok(void)
-			None:
+		check_instruction_limit(cost, limits)
+
+
+private pure func check_instruction_limit(cost: CompilationCost, limits: CostLimits) -> Result[Void, String]:
+	match cost.instructions:
+		Some(instructions):
+			if instructions > limits.instructions:
+				Err(
+					"compiler retired instructions exceeded limit: " + "".append_int(
+						instructions,
+					) + " > " + "".append_int(limits.instructions),
+				)
+			else:
 				Ok(void)
+		None:
+			Ok(void)
 
 
 pure func assess_resource_limits(
@@ -146,12 +153,18 @@ pure func assess_resource_limits(
 	cost: CompilationCost,
 	limits: CostLimits,
 ) -> Result[ResourceVerdict, String]:
+	-- Allocation debt must never hide an instruction failure behind the
+	-- strict checker's allocation-first diagnostic.
+	instruction_checked ?= match policy:
+		RecordAllocationDebt: check_instruction_limit(cost, limits)
+		EnforceLimits | RecordInitialBootstrapDebt: Ok(void)
 	match check_limits(cost, limits):
 		Ok(_): Ok(ResourceChecksPassed)
 		Err(error):
 			match policy:
 				EnforceLimits: Err(error)
 				RecordInitialBootstrapDebt: Ok(InitialBootstrapDebt(cost, limits, error))
+				RecordAllocationDebt: Ok(AllocationDebt(cost, limits, error))
 
 
 pure func format_initial_bootstrap_debt(cost: CompilationCost, limits: CostLimits, reason: String) -> String:
@@ -160,6 +173,17 @@ pure func format_initial_bootstrap_debt(cost: CompilationCost, limits: CostLimit
 		None: "unmeasured"
 	(
 		"BLORP2_RESOURCE_RESULT status=FAIL policy=record-initial-bootstrap-debt allocations=" + cost.allocations.to_string()
+		+ " allocation_limit=" + limits.allocations.to_string() + " instructions=" + instructions
+		+ " instruction_limit=" + limits.instructions.to_string() + " reason=" + reason
+	)
+
+
+pure func format_allocation_debt(cost: CompilationCost, limits: CostLimits, reason: String) -> String:
+	instructions = match cost.instructions:
+		Some(count): count.to_string()
+		None: "unmeasured"
+	(
+		"BLORP2_ALLOCATION_RESULT status=FAIL policy=record-allocation-debt allocations=" + cost.allocations.to_string()
 		+ " allocation_limit=" + limits.allocations.to_string() + " instructions=" + instructions
 		+ " instruction_limit=" + limits.instructions.to_string() + " reason=" + reason
 	)

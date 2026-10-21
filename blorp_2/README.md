@@ -425,6 +425,14 @@ still fail. Empty or unknown policy values fail even when costs are within limit
 Passing behavioral callbacks under this initial policy retain resource FAIL debt;
 they do not establish resource or full M8 acceptance. Ordinary runs stay strict.
 
+CI temporarily selects `record-allocation-debt` only for its e2e command.
+Allocation overruns print `BLORP2_ALLOCATION_RESULT status=FAIL` with the actual
+counters, limits and original allocation error. Instruction overruns still fail,
+including when allocations also exceed their limit. Counter validity, strict
+balance, ordinary native behavior and sanitizer failures remain blocking.
+CI's existing disabled instruction measurement is unchanged; no instruction
+measurement PASS is inferred. Unit tests and compiler generation stay strict.
+
 Every host-compiled source module has a matching unit suite under `test/unit/test_<stage>/`,
 mirroring its folder under `src/`; the support modules that suites share stay in `test/unit/`.
 `src/` has one folder per stage (`lex`, `parse`, `load`, `namespace`, `check`, `specialize`,
