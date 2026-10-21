@@ -515,6 +515,7 @@ tooling-check: build-blorp-cli
 	@blorp/test/test_build/test_build_configuration.sh
 	@blorp/test/test_build/test_build_source_generator.sh
 	@blorp/test/test_build/test_release_toolchain.sh
+	@blorp/test/test_build/test_blorp2_bootstrap.sh
 	@blorp/test/test_build/test_gate_verdicts.sh
 	@blorp/test/test_build/test_c_static_analysis_cache.sh
 	@blorp/test/test_build/test_split_translation_units.sh

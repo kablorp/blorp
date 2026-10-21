@@ -1,7 +1,7 @@
-name: Blorp 2 initial seed
+name: Blorp 2 seed
 
-# One-time reference-A production. The first real B2 pin must replace that
-# step with the pinned B2 resolver and remove the initial-publication guard.
+# Production generations use the immutable B2 seed pinned by this checkout.
+# The legacy compiler remains only the hosted TestSuite dependency.
 on:
   push:
     tags: ['blorp2-seed-*']
@@ -10,7 +10,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: blorp2-initial-seed
+  group: blorp2-seed
   cancel-in-progress: false
 
 jobs:
@@ -43,7 +43,7 @@ jobs:
           ref: ${{ github.ref }}
           persist-credentials: false
 
-      - name: Validate initial source and native target
+      - name: Validate source and native target
         id: source
         shell: bash
         env:
@@ -58,10 +58,7 @@ jobs:
           fi
           test -z "$(git status --porcelain)"
           test "$(scripts/target-triple)" = "$SEED_TARGET"
-          if [ -e blorp_2/bootstrap.env ]; then
-            echo "A B2 pin exists: replace initial reference-A production with the B2 resolver." >&2
-            exit 1
-          fi
+          test -r blorp_2/bootstrap.env
           echo "sha=$source_sha" >> "$GITHUB_OUTPUT"
           mkdir -p build/blorp2-seed/provenance
           printf '%s\n' "$source_sha" > build/blorp2-seed/provenance/source-commit.txt
@@ -92,16 +89,23 @@ jobs:
           shasum -a 256 bin/blorp > build/blorp2-seed/provenance/host.sha256
           cp blorp/build/bootstrap.env build/blorp2-seed/provenance/legacy-bootstrap.env
 
-      - name: Build reference A (initial seed only)
+      - name: Build reference A from the pinned B2 seed
         shell: bash
         run: |
           set -euo pipefail
           work=build/blorp2-seed
-          # Deliberate initial provenance, never a missing-manifest fallback.
-          bin/blorp compile --no-format blorp_2/src/main.brp -o "$work/reference-a.c" \
+          scripts/blorp2-compiler-bootstrap --print-id > "$work/provenance/seed-identity.txt"
+          seed_binary=$(scripts/blorp2-compiler-bootstrap --print-path)
+          shasum -a 256 "$seed_binary" > "$work/provenance/seed.sha256"
+          cp blorp_2/bootstrap.env "$work/provenance/b2-bootstrap.env"
+          scripts/blorp2-compiler-bootstrap --library-root blorp_2/standard_library \
+            blorp_2/src/main.brp "$work/reference-a.c" \
             > "$work/provenance/reference-a.stdout" 2> "$work/provenance/reference-a.stderr"
+          test ! -s "$work/provenance/reference-a.stdout"
+          test ! -s "$work/provenance/reference-a.stderr"
           clang -O0 -DBLORP_MEMORY_DIAGNOSTICS=0 "$work/reference-a.c" \
             -o "$work/reference-a" -lm -lpthread > "$work/provenance/reference-a-link.log" 2>&1
+          test ! -s "$work/provenance/reference-a-link.log"
           shasum -a 256 "$work/reference-a.c" "$work/reference-a" > "$work/provenance/reference-a.sha256"
 
       - name: A emits B and B reproduces its compiler C
@@ -253,7 +257,7 @@ jobs:
             test -s "$work/provenance/$inventory.sha256"
           done
           {
-            echo 'producer=initial-legacy-reference-a-then-self-built-b'
+            echo 'producer=pinned-blorp2-seed-then-self-built-b'
             echo "target=$SEED_TARGET"
             echo "instructions=$BLORP_2_INSTRUCTION_CHECK"
             echo 'instruction_qualification=unmeasured-not-qualified'
@@ -350,7 +354,7 @@ jobs:
           pattern: blorp2-seed-*
           merge-multiple: true
           path: dist
-      - name: Validate complete initial release and publish once
+      - name: Validate complete release and publish once
         shell: bash
         run: |
           set -euo pipefail
@@ -358,10 +362,10 @@ jobs:
           test "$SEED_TAG" = "blorp2-seed-${source_sha:0:12}"
           git fetch --quiet --no-tags origin "refs/tags/$SEED_TAG"
           test "$(git rev-parse 'FETCH_HEAD^{commit}')" = "$source_sha"
-          # This route is explicitly initial-only, never a legacy fallback.
+          # Existing immutable releases remain available to pinned checkouts.
           gh api --paginate "repos/$GH_REPO/releases" --jq '.[].tag_name' > existing-release-tags.txt
-          if grep -Eq '^blorp2-seed-' existing-release-tags.txt; then
-            echo "A B2 seed release already exists; use the pinned-B2 release route without mutating it." >&2
+          if grep -Fxq "$SEED_TAG" existing-release-tags.txt; then
+            echo "This immutable B2 seed release already exists; never overwrite it." >&2
             exit 1
           fi
           targets=(aarch64-apple-darwin x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu)
@@ -393,7 +397,7 @@ jobs:
           for target in "${targets[@]}"; do rm "dist/blorp2-compiler-$target.c.gz"; done
           (cd dist && sha256sum blorp2-* > SHA256SUMS)
           cat > release-notes.md <<NOTES
-          Initial self-built Blorp 2 seed from $source_sha.
+          Self-built Blorp 2 seed from $source_sha using the pinned B2 producer.
           Functional qualification PASS: each native seed B reproduced its compiler C and passed maintained component/native correctness and strict accounting checks.
           Every maintained accepted/rejected fixture was compared under A/B for exit status, stdout, stderr and emitted-C presence/bytes; per-fixture logs, hashes, inventory and actual counts are retained. Both B link logs were empty.
           A temporary ASan/UBSan diagnostic B built from the same approved C performed the existing whole-source strict accounting check and emitted identical C, with an empty link log and only the exact balanced accounting report. Its hash/flags are retained; only normal B is published.
@@ -405,4 +409,4 @@ jobs:
           Keep this release and all assets while retained source history references them; never replace assets in place.
           NOTES
           gh release create "$SEED_TAG" dist/* --verify-tag --prerelease --latest=false \
-            --title "Blorp 2 initial seed ${source_sha:0:12}" --notes-file release-notes.md
+            --title "Blorp 2 seed ${source_sha:0:12}" --notes-file release-notes.md

@@ -1,0 +1,147 @@
+#!/usr/bin/env bash
+# Resolve only the immutable Blorp 2 seed named by this checkout.
+set -euo pipefail
+
+script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
+repo_root=$(cd "$script_dir/.." && pwd -P)
+manifest="$repo_root/blorp_2/bootstrap.env"
+
+usage() {
+	cat <<'EOF'
+Usage: scripts/blorp2-compiler-bootstrap [--print-path | --print-id | --help]
+       scripts/blorp2-compiler-bootstrap [--] [compiler-arguments...]
+
+Verify and run the checkout's pinned Blorp 2 seed from the repository root.
+Compiler arguments are forwarded unchanged; this is not the legacy CLI.
+
+Options:
+  --print-path  Resolve and verify the executable without running it
+  --print-id    Print the validated repository, tag and full source commit
+  -h, --help    Show this help (no manifest or download required)
+
+Environment:
+  BLORP2_COMPILER_BOOTSTRAP_CACHE_DIR  Override the separate Blorp 2 cache
+EOF
+}
+
+fail() { printf 'Blorp 2 bootstrap: %s\n' "$*" >&2; exit 1; }
+action=run
+case "${1:-}" in
+	-h | --help) usage; exit 0 ;;
+	--print-path | --print-id)
+		[ "$#" = 1 ] || fail "$1 does not accept compiler arguments"
+		action="${1#--}"
+		;;
+	--) shift ;;
+esac
+
+[ -r "$manifest" ] || fail "manifest is missing: $manifest"
+fields=(
+	BLORP2_BOOTSTRAP_FORMAT BLORP2_BOOTSTRAP_REPO BLORP2_BOOTSTRAP_TAG
+	BLORP2_BOOTSTRAP_SOURCE_COMMIT BLORP2_BOOTSTRAP_SHA256_AARCH64_APPLE_DARWIN
+	BLORP2_BOOTSTRAP_SHA256_X86_64_UNKNOWN_LINUX_GNU
+	BLORP2_BOOTSTRAP_SHA256_AARCH64_UNKNOWN_LINUX_GNU
+)
+# The repository manifest is plain data. Ambient variables cannot fill a
+# missing field or override its release identity.
+for field in "${fields[@]}"; do unset "$field"; done
+while IFS= read -r line || [ -n "$line" ]; do
+	case "$line" in '' | \#*) continue ;; esac
+	[[ "$line" =~ ^([A-Z0-9_]+)=([A-Za-z0-9_./-]+)$ ]] || fail "invalid field in $manifest; use KEY=value"
+	key="${BASH_REMATCH[1]}"
+	value="${BASH_REMATCH[2]}"
+	case "$key" in
+		BLORP2_BOOTSTRAP_FORMAT | BLORP2_BOOTSTRAP_REPO | BLORP2_BOOTSTRAP_TAG | \
+		BLORP2_BOOTSTRAP_SOURCE_COMMIT | BLORP2_BOOTSTRAP_SHA256_AARCH64_APPLE_DARWIN | \
+		BLORP2_BOOTSTRAP_SHA256_X86_64_UNKNOWN_LINUX_GNU | BLORP2_BOOTSTRAP_SHA256_AARCH64_UNKNOWN_LINUX_GNU) ;;
+		*) fail "unknown field $key in $manifest" ;;
+	esac
+	[ -z "${!key+x}" ] || fail "duplicate field $key in $manifest"
+	printf -v "$key" '%s' "$value"
+done <"$manifest"
+for field in "${fields[@]}"; do
+	[ -n "${!field:-}" ] || fail "manifest is missing $field: $manifest"
+done
+[ "$BLORP2_BOOTSTRAP_FORMAT" = 1 ] || fail "unsupported format: $BLORP2_BOOTSTRAP_FORMAT"
+repo="$BLORP2_BOOTSTRAP_REPO"
+tag="$BLORP2_BOOTSTRAP_TAG"
+source_commit="$BLORP2_BOOTSTRAP_SOURCE_COMMIT"
+[[ "$repo" =~ ^[A-Za-z0-9][A-Za-z0-9-]*/[A-Za-z0-9][A-Za-z0-9_.-]*$ ]] || fail "invalid GitHub repository: $repo"
+[[ "$tag" =~ ^blorp2-seed-[0-9a-f]{12}$ ]] || fail "tag must be immutable blorp2-seed-<12hex>: $tag"
+[[ "$source_commit" =~ ^[0-9a-f]{40}$ ]] || fail "expected full source commit (40 lowercase hex digits)"
+[ "${tag#blorp2-seed-}" = "${source_commit:0:12}" ] || fail "tag does not match source commit"
+for digest in \
+	"$BLORP2_BOOTSTRAP_SHA256_AARCH64_APPLE_DARWIN" \
+	"$BLORP2_BOOTSTRAP_SHA256_X86_64_UNKNOWN_LINUX_GNU" \
+	"$BLORP2_BOOTSTRAP_SHA256_AARCH64_UNKNOWN_LINUX_GNU"
+do
+	[[ "$digest" =~ ^[0-9a-f]{64}$ ]] || fail "invalid SHA-256 in $manifest"
+done
+if [ "$action" = print-id ]; then
+	printf '%s %s %s\n' "$repo" "$tag" "$source_commit"
+	exit 0
+fi
+
+os=$(uname -s)
+arch=$(uname -m)
+case "$os:$arch" in
+	Darwin:arm64)
+		target=aarch64-apple-darwin
+		digest="$BLORP2_BOOTSTRAP_SHA256_AARCH64_APPLE_DARWIN" ;;
+	Linux:x86_64)
+		target=x86_64-unknown-linux-gnu
+		digest="$BLORP2_BOOTSTRAP_SHA256_X86_64_UNKNOWN_LINUX_GNU" ;;
+	Linux:aarch64 | Linux:arm64)
+		target=aarch64-unknown-linux-gnu
+		digest="$BLORP2_BOOTSTRAP_SHA256_AARCH64_UNKNOWN_LINUX_GNU" ;;
+	*) fail "Unsupported Blorp 2 bootstrap target: $os/$arch" ;;
+esac
+
+sha256_file() {
+	if command -v shasum >/dev/null 2>&1; then
+		shasum -a 256 "$1" | awk '{print $1}'
+	elif command -v sha256sum >/dev/null 2>&1; then
+		sha256sum "$1" | awk '{print $1}'
+	else
+		fail 'verification requires shasum or sha256sum'
+	fi
+}
+
+cache_root="${BLORP2_COMPILER_BOOTSTRAP_CACHE_DIR:-${XDG_CACHE_HOME:-${HOME:-/tmp}/.cache}/blorp/blorp2-bootstrap}"
+case "$cache_root" in /*) ;; *) cache_root="$repo_root/$cache_root" ;; esac
+install_dir="$cache_root/$repo/$tag/$target/$digest"
+binary="$install_dir/blorp2"
+stage_dir=
+cleanup() {
+	if [ -n "$stage_dir" ]; then rm -rf "$stage_dir"; fi
+}
+trap cleanup EXIT
+
+# Check before creating any directory: a verified read-only/offline cache hit
+# needs neither writes nor transport. Digest identity replaces a marker file.
+if [ ! -f "$binary" ] || [ ! -x "$binary" ] || [ "$(sha256_file "$binary")" != "$digest" ]; then
+	mkdir -p "$install_dir"
+	stage_dir=$(mktemp -d "$install_dir/.stage.XXXXXX")
+	staged="$stage_dir/blorp2"
+	url="https://github.com/$repo/releases/download/$tag/blorp2-$target"
+	if command -v curl >/dev/null 2>&1; then
+		curl -fsSL "$url" -o "$staged"
+	elif command -v wget >/dev/null 2>&1; then
+		wget -q "$url" -O "$staged"
+	else
+		fail 'download requires curl or wget'
+	fi
+	[ "$(sha256_file "$staged")" = "$digest" ] || fail 'downloaded seed failed checksum verification'
+	chmod 0755 "$staged"
+	# Staging is on the cache filesystem; rename publishes only verified bytes.
+	mv -f "$staged" "$binary"
+	rmdir "$stage_dir"
+	stage_dir=
+fi
+
+if [ "$action" = print-path ]; then
+	printf '%s\n' "$binary"
+	exit 0
+fi
+cd "$repo_root"
+exec "$binary" "$@"

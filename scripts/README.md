@@ -364,6 +364,36 @@ commit relinks rather than recompiles the compiler.
   checksums together, only after release CI has published the merged revision.
   `--print-id|tag|path|toolchain-dir` print the resolved values.
 
+### Blorp 2 seed build
+
+`make -C blorp_2` (or the explicit `compiler` target) uses
+`scripts/blorp2-compiler-bootstrap` to generate compiler C through a pinned
+Blorp 2 seed's direct CLI, then links normal mode at `-O0` with memory
+diagnostics disabled. `test-compiler` generates once and links diagnostic
+mode instead. `link-test-compiler` still links an explicitly supplied C path
+for fixpoint stages. Output paths, `BLORP_CC`, `TEST_COMPILER_FLAGS` and
+`TEST_COMPILER_LIBRARIES` accept Make command-line overrides. Build targets
+are serialized because normal and diagnostic modes share the output path.
+
+The resolver uses the real `blorp_2/bootstrap.env` pin, recorded after all
+three native seed assets were qualified. It validates the full source commit, matching
+immutable `blorp2-seed-<12hex>` tag and all three SHA-256 values. It downloads
+`blorp2-<target>` from that release and rehashes cached bytes before every use.
+The separate cache defaults to `$XDG_CACHE_HOME/blorp/blorp2-bootstrap` or
+`$HOME/.cache/blorp/blorp2-bootstrap`; `BLORP2_COMPILER_BOOTSTRAP_CACHE_DIR`
+is its only explicit override. Relative cache paths resolve from the repository
+root. Release identity cannot be overridden through environment variables.
+`--print-path` verifies the seed without running it; `--print-id` validates and
+prints the repository, tag and source commit without downloading it. Other
+arguments are forwarded unchanged from the repository root.
+
+The `example` target uses the newly built B2 compiler. Unit/runtime/grammar
+tests and the e2e runner still require a FRESH legacy host through `host-check`.
+Run the isolated behavioral shell tests with
+`bash blorp/test/test_build/test_blorp2_bootstrap.sh`; they use fake transport,
+seed and C compiler tools, including quoted paths and parallel target requests.
+Cold/warm clean-checkout qualification uses the actual published seed assets.
+
 ### Compiler fixpoint
 
 `scripts/compiler-fixpoint` builds stage 2 from stage 1's C and stage 3 from
@@ -378,8 +408,8 @@ stage could not be built.
 ### Blorp 2 fixpoint
 
 `scripts/blorp2-fixpoint` is the same proof for the Blorp 2 pilot
-(`blorp_2/src`), strengthened per its self-compile plan: the host builds **A**,
-A builds **B**, B builds **C**, all linked at `-O0` through
+(`blorp_2/src`), strengthened per its self-compile plan: the pinned seed builds
+**A**, A builds **B**, B builds **C**, all linked at `-O0` through
 `make -C blorp_2 test-compiler` and `link-test-compiler` so the flags have one
 source. `--prove` requires B and C to emit byte-identical C for `blorp_2/src`
 (the first differing line is printed), A and B to agree on exit status, output
@@ -393,6 +423,9 @@ in both modes: a stage A build failure, or in `--frontier` a failing or
 count-less source-tree suite run. Artifacts, digests and `provenance.txt` are written
 under `blorp_2/build/fixpoint/`. The rungs and their meaning are in the
 script's `--help`.
+The script requires and records a FRESH legacy host only for its hosted suites;
+it records the pinned B2 seed identity and digest separately from that host.
+It is not a seed-only qualification command.
 
 ## Static and hygiene checks
 

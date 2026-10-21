@@ -51,7 +51,7 @@ It does not mark the complete M8 resource gate green.
 
 The fixpoint the old compiler already uses, strengthened:
 
-1. The host builds `blorp_2/src` and `standard_library` into compiler **A**.
+1. The pinned B2 seed builds `blorp_2/src` and the target library into compiler **A**.
 2. **A** compiles the same source into **B**; **B** compiles it into **C**.
 3. **B** and **C** emit byte-identical C. **B** passes the full e2e suite. For
    every e2e fixture, **A** and **B** emit byte-identical C. A self-consistent
@@ -1080,9 +1080,9 @@ the self-built compiler passes all 559 e2e functional callbacks under the explic
 initial-bootstrap cost-debt policy. Whole-source `-O0` ASan/UBSan compilation reproduces the same C and balances
 27,373,418 allocations/releases with no tracked leaks after replacing flat
 declaration recursion with an ordinary source loop. The final native run also
-passes from a fresh working directory. Seed publication and the default builder
-switch remain pending. Platform qualification and
-the remaining cost obligations above are still pending; this checkpoint does
+passes from a fresh working directory. The verified three-platform seed is pinned and the default B2 build uses it.
+Legacy TestSuite hosting remains separate. The remaining cost obligations above
+are still pending; this checkpoint does
 not mark the complete M8 resource gate green.
 
 The [runtime accounting preparation](../benchmarks/results/blorp_2_pilot_memory_accounting_2026-10-18.md)

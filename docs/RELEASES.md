@@ -174,8 +174,8 @@ Test-artifact timeout defaults and overrides live in
 
 ## Blorp 2 bootstrap seeds
 
-The first Blorp 2 seed uses `.github/workflows/blorp2-seed.yml`, separately from
-legacy CLI releases. After the reviewed source/library integration is committed
+Blorp 2 seeds use `.github/workflows/blorp2-seed.yml`, separately from legacy
+CLI releases. After the reviewed source/library integration is committed
 and its maintained native/resource gate has an accepted outcome, Root can create
 and push an immutable tag with SSH credentials that trigger Actions:
 
@@ -188,8 +188,8 @@ git push origin "refs/tags/$seed_tag"
 
 The workflow validates the tag against the actual source commit and the three
 native targets: macOS ARM64 on macOS 15, Linux x64 and Linux ARM64 on Ubuntu 24.04.
-Its initial route explicitly
-builds a fresh legacy TestSuite host and reference A, then A emits compiler C,
+The workflow builds a fresh legacy TestSuite host for tests. The pinned B2 seed
+generates reference A, then A emits compiler C,
 Clang links self-built B in normal/diagnostic modes, and B reproduces that C.
 Only B normal is published as `blorp2-<target>`. Maintained component and B diagnostic
 e2e correctness, strict compiler accounting and an ordinary-main strict smoke must pass.
@@ -226,14 +226,13 @@ The release retains one `blorp2-compiler.c.gz`, three provenance archives and
 `SHA256SUMS` alongside the binaries. Provenance includes the full source commit,
 legacy/A/B digests, target/host library inventories, flags, Clang and platform
 SDK/libc/dependency details, raw diagnostics, resource markers and gate logs. Actions' `GITHUB_TOKEN`
-creates the release; local API credentials are unnecessary. Existing B2 seed
-releases are refused, never overwritten. Preserve referenced seeds and their
+creates the release; local API credentials are unnecessary. An existing release for the requested seed tag is refused, never overwritten. Preserve referenced seeds and their
 provenance indefinitely; expiring Actions logs alone are not release evidence.
 
-This workflow is **initial-seed-only**. The commit adding the first real
-`blorp_2/bootstrap.env` must replace reference-A production with the pinned B2
-resolver and remove the initial-publication guard, so subsequent seeds build
-through B2 only. Do not add a missing-manifest legacy fallback. The legacy host
-may still run the existing TestSuite suites until their separate migration.
+The first seed was qualified through an explicit legacy reference A. Subsequent
+seeds use `scripts/blorp2-compiler-bootstrap` and the real seven-field
+`blorp_2/bootstrap.env` pin to generate A; the release retains that seed identity,
+manifest and binary digest. No missing-manifest legacy fallback exists. The
+legacy host still runs TestSuite suites until their separate migration.
 A pin requires actual published three-platform digests and a clean-checkout
-seed-only build proof; this workflow does not create a placeholder manifest.
+seed-only build proof. Never commit a missing or placeholder pin.

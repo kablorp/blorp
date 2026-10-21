@@ -2,9 +2,9 @@
 
 A new compiler written in Blorp that emits C. Each increment starts with a
 small program, defines the grammar it needs, and tests that program through
-native execution. It can compile itself. The repository build still uses the
-legacy compiler until a qualified Blorp 2 seed is published and pinned; unit
-and runtime suites continue using the legacy TestSuite host.
+native execution. It can compile itself. `make -C blorp_2` uses the verified,
+digest-pinned Blorp 2 seed as its production builder. Unit, runtime and grammar
+suites continue using the legacy TestSuite host.
 
 The combined integration implements pure lambdas with immutable captures,
 structural patterns, value conditionals and managed source loops. The target
@@ -371,7 +371,7 @@ generated suite, including every fixture. End-to-end runs disable that
 deadline. `make -C blorp_2 test` runs e2e separately with `--timeout 0`; the
 other suites retain their 180-second deadline.
 
-`test-compiler` builds the pilot once: the host compiler generates
+`test-compiler` builds the pilot once: the pinned Blorp 2 seed generates
 `build/compiler.c`, then the C compiler links one `-O0` executable with
 allocation diagnostics enabled. `test-e2e` names that executable on the
 suite's command line through the Makefile variable `BLORP2_COMPILER`
