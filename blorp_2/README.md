@@ -363,9 +363,9 @@ its C and executable in `blorp_2/build/self-hosted-tests/`. `BLORP_CC` selects a
 compiler executable (default `clang`).
 `make -C blorp_2 test-compiler test-components` runs the complete component
 gate: the temporary existing-compiler host runs the unit/runtime/grammar
-roots, then the Blorp 2 compiler runs the existing text suite through its typed
-`tests()` factory. The old host directory invocation alone omits that factory
-and is not the complete gate. `test-components BLORP2_COMPILER=PATH` uses an
+roots, then the Blorp 2 compiler runs the existing text suite through its
+`tests: TestSuite` constant. The host directory run also discovers that suite;
+the separate target execution is still required for the complete gate. `test-components BLORP2_COMPILER=PATH` uses an
 already-built compiler without selecting a fallback.
 
 The explicit compile-only test entry is:
@@ -375,18 +375,20 @@ blorp_2/build/compiler --library-root blorp_2/standard_library --test-suite \
   blorp_2/test/unit/test_utils/test_text.brp blorp_2/build/test_text.c
 ```
 
-The root scope's visible pure zero-argument `tests` factory (including an
-explicit import) must return the configured library's `TestSuite`. The
+The root scope's visible `tests: TestSuite` constant (including an explicit
+import) must have the configured library's `TestSuite` type. The
 compiler-owned entry calls the ordinary library runner and returns 0 when
 its actual `TestCounts.failed` is zero, otherwise 1. It follows normal
 checking, specialization, ownership insertion, independent verification and
 emission. This mode neither discovers directories nor links/runs C; the
 component gate links and runs that output with strict memory checking.
-The target `test` module defines `TestCase { name: String, run: () -> Bool }`,
-`TestSuite { description: String, tests: List[TestCase] }` and
+The target `test` module defines
+`TestSuite { description: String, tests: List[(String, () -> Bool)] }` and
 `TestCounts { passed: Int, failed: Int }`. `run_suite_result` prints and returns
-counts; `run_suite` invokes the pure factory and derives the exit status.
-Case callbacks may be impure even though constructing the suite is pure.
+counts; `run_suite` accepts the suite value and derives the exit status.
+Case callbacks may be pure or impure; execution follows registration order and
+continues after a failed callback. Empty suites succeed. Suite constants use
+ordinary closed initializers; inline lambda entries remain unsupported.
 The [existing text suite](test/unit/test_utils/test_text.brp) is the first example.
 
 To run only end-to-end tests, build the pilot and run the suite against it:
@@ -1497,8 +1499,8 @@ Lexical and layout rules:
   the read's span; aggregate children retain their initializer's source spans.
   Callable constants support ordinary direct and qualified calls; scalar constants
   cannot be called, and constants do not enter UFCS method selection.
-  Test-suite mode still requires the pure `tests()` factory; aggregate constant
-  support does not change test registration or the runner API.
+  Test-suite mode uses an ordinary `tests: TestSuite` constant with named
+  callbacks; inline lambda initializers remain unsupported.
 
 - Every token must be consumed. Malformed declarations and statements are errors.
 

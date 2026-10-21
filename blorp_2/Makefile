@@ -42,7 +42,7 @@ test: host-check
 	@$(MAKE) --no-print-directory test-components
 	@$(MAKE) --no-print-directory test-e2e
 
-# The text factory is target-owned; host discovery retains all other suites.
+# The text constant is discovered by the host and also required through the target entry.
 # Callers build once or supply the exact compiler under test, as with test-e2e.
 test-components: host-check
 	@cd .. && bin/blorp test --suite --timeout 180 blorp_2/test/unit blorp_2/test/runtime blorp_2/test/test_grammar

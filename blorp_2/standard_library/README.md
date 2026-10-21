@@ -236,3 +236,14 @@ are preserved. OS operations independently reject NUL paths.
 The byte scan/materialization is linear, but temporary List append/take and
 balanced String joining still copy data; no linear total-cost or COW claim is
 made. See the [shell/path boundary](../ROADMAP.md#seven-shell-and-path-functions).
+
+### Test registration
+
+`test: TestSuite` holds `description: String` and
+`tests: List[(String, () -> Bool)]`. Export a `tests: TestSuite` constant with
+named callback entries. `--test-suite` passes that ordinary value to `run_suite`;
+a `tests()` factory is not the entry API. Both pure and impure callbacks run in
+registration order, including entries after a False result. Empty suites pass.
+`run_suite_result` prints results and returns `TestCounts { passed, failed }`;
+`run_suite` returns 0 for no failures and 1 otherwise. See the
+[text suite](../test/unit/test_utils/test_text.brp).

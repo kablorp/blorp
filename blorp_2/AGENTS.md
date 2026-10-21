@@ -98,8 +98,8 @@ Every host-compiled source module has a unit suite under
 [test/unit/](test/unit/), in the `test_<stage>/` folder that mirrors the module's
 folder under `src/`. Grammar cases live under
 [test/test_grammar/](test/test_grammar/) and change with the EBNF.
-The existing text suite is the first target-owned typed `tests()` factory;
-`make -C blorp_2 test-compiler test-components` retains the other host suites
+The existing text suite exports an ordinary `tests: TestSuite` constant;
+`make -C blorp_2 test-compiler test-components` retains the host suites
 and requires that exact target suite as well. A host-only directory run is
 not the complete component gate.
 Rejections check exact message, help and span. Embedded programs use aligned
