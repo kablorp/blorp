@@ -215,9 +215,11 @@ The typed test policy retains original caps and records resource overruns as
 structured `BLORP2_RESOURCE_RESULT` FAILs with actual measurements, limits and
 original reasons after all ordinary oracles pass. Provenance and release notes
 label functional PASS and resource FAIL debt; this is not a full M8/resource PASS.
-All other failures remain blocking. Linux instruction
-measurement is explicitly disabled as in CI and is not an instruction-cost PASS;
-macOS requires counters. A nonzero gate blocks publication and retains logs.
+All other failures remain blocking. Hosted instruction measurement is explicitly
+disabled on all three platforms, as in CI; instruction costs are unmeasured and
+not qualified. The raw macOS time preflight is retained for observation only and
+does not establish an instruction-cost PASS. Component and native output is
+visible in Actions and retained in provenance; pipeline failures remain blocking.
 
 All three platforms must agree on compiler C and source/library inventories.
 The release retains one `blorp2-compiler.c.gz`, three provenance archives and
