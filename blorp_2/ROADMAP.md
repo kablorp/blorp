@@ -13,16 +13,23 @@ from Git; they are not current source or acceptance authorities.
 
 [README.md](README.md) and [grammar.ebnf](grammar.ebnf) describe implemented
 behavior. The [imports/prelude reference](README.md#local-modules) describes
-that implemented subsystem. [LIBRARY_PARITY.md](LIBRARY_PARITY.md) is the
-authority for which library functions the compiler source may use while the
-host still builds it. Examples and unfinished milestones here are planned
-capabilities, not claims that the current compiler accepts them.
+that implemented subsystem. The [target API reference](standard_library/README.md)
+owns the current library contracts. Examples and unfinished milestones here are
+planned capabilities, not claims that the current compiler accepts them.
 
-[BOOTSTRAP_SOURCE_PLAN.md](BOOTSTRAP_SOURCE_PLAN.md) now owns the reviewed
-source-simplification direction. Source convenience alone does not justify a
-new compiler mechanism. Retain implemented language behavior and migrate the
-compiler source before removing a deferred feature from the prerequisite set.
-The M8 proof below is unchanged.
+Source convenience alone does not justify a new compiler mechanism. Retain
+implemented language behavior and migrate the compiler source before removing a
+deferred feature from the prerequisite set. The M8 proof below is unchanged.
+Completed source-migration plans and superseded inventories are retained in Git.
+The unique deferred designs for [Char](CHAR_PLAN.md),
+[general expression control](COMPOSITIONAL_CONTROL_PLAN.md) and
+[union-only recursive storage](RECURSIVE_UNION_CYCLES_PLAN.md) remain separate;
+their historical budgets and anchors are not current execution approval.
+
+The [incremental layout roadmap](LAYOUT_MIGRATION.md) owns the proposed in-place
+representation migration and its measured acceptance gates. It preserves this
+roadmap's ownership and phase-test contracts; it starts after CI/bootstrap repair
+and the bounded test migration.
 
 After M8 passes, [M9](#m9-post-self-compilation-architecture-audit) audits the
 complete compiler against actual self-compilation evidence before the next major
@@ -69,7 +76,7 @@ their own inventory and plan after M8.
   stays host-compilable: only syntax the host already accepts enters `src`, and
   every library function `src` imports exists in both the host library and
   `standard_library` with the same module, name and signature.
-  [LIBRARY_PARITY.md](LIBRARY_PARITY.md) is the authority.
+  The [target API reference](standard_library/README.md) records the contracts.
 - **Fixture first.** Each increment starts with a small real-main e2e fixture
   shaped like the source's own use, failing granular tests, runnable acceptance
   criteria and `should_fail` fixtures with exact text, under a bounded handoff
@@ -129,11 +136,12 @@ not a portable nesting threshold or a product-destruction proof.
 | [M3](#m3-loops-and-tail-recursion) | Managed List/while loops, explicit exits and existing scalar TCO | Common source while/for, managed headers and lexical exits implemented in integration; acceptance pending. Managed/generic annotated TCO remains deferred. |
 | [M4](#m4-recursive-types) | Existing unary/mixed recursive shapes plus ordinary opaque semantics | Steps 1/2a and ordinary opaque semantics implemented. Actual source-product depth acceptance remains. No current source witness requires unlanded 2b/2c. |
 | [M6](#m6-library-and-shell) | First-order library parity, integer-facing String APIs and seven shell/path functions | String byte/scalar APIs, checked Slice, concrete library helpers and shell/path integration implemented in the combined candidate; final composition and acceptance pending. Target Char/Bytes remain outside the bootstrap prerequisite set. |
-| [M7](#m7-lambdas) | Pure function types/lambdas | Pure lambdas, immutable captures, forwarding and direct-call specialization implemented in integration; acceptance pending. Callback-removal history remains retained. |
+| [M7](#m7-lambdas) | Pure function types/lambdas | Historical pre-stored-callable checkpoint: pure lambdas, immutable captures, forwarding and direct-call specialization implemented in integration; acceptance was pending. Current callable behavior and evidence are linked below. |
 | [M8](#m8-the-fixpoint-gate) | Fixpoint gate | Own-source self-compilation, identical compiler C and all 556 A/B fixture comparisons pass. All 559 e2e functional callbacks pass with the approved initial cost-debt policy; resource FAILs remain recorded and platform qualification is pending. |
 | [M9](#m9-post-self-compilation-architecture-audit) | Complete architecture audit using the self-compiled compiler | Planned immediately after M8, before the next major feature expansion. |
 
-Remaining dependency order (source migrations may overlap disjoint work):
+Historical dependency order for the self-compilation integration (not a current
+work assignment):
 
 ```
 reviewed source plan + small constructor/control preparations
@@ -163,8 +171,8 @@ review. Hold record/reference constants, the general compositional workloop,
 primitive Char and union-only recursion candidates off the bootstrap path while
 their source requirements are removed or disproven. Keep their reviewed designs
 and evidence; neither delete them nor count them as accepted implementation.
-The source plan names pilot stop rules before the larger migrations. M4.2b/2c
-reopen only with a concrete retained stored-payload witness.
+The historical source pilots had independent stop rules. M4.2b/2c reopen only
+with a concrete retained stored-payload witness.
 
 Standalone evidence proves the exact frozen source and boundary that produced
 it. After integrating onto an accepted base, review the source/API delta and
@@ -249,8 +257,9 @@ its report. Later milestones build on these and do not reopen them.
 - **[scripts/blorp2-fixpoint](../scripts/blorp2-fixpoint)**: the three stages, a
   SHA-256 per stage with the first differing line, A == B over fixtures, e2e
   under B, `-O0`, and `--frontier`.
-- **Parity table:** [LIBRARY_PARITY.md](LIBRARY_PARITY.md), landed. Regenerate it
-  whenever `src` gains or loses a library dependency.
+- **Library dependencies:** check actual source imports against the
+  [target API reference](standard_library/README.md) when dependencies change;
+  historical parity counts are not a current inventory.
 - **Source corrections.** No `+` String operator in `src`; inventory
   corrections: 61 lambdas, 64 constants, sibling imports already relative.
 
@@ -371,7 +380,8 @@ ownership verified, C read, ceilings measured; see the
 
 **Status.** Done (`append`, `set`, `concat`, literal). Target `set_index`
 returns `Option[List[T]]` through an ordinary `get`/match wrapper, matching the
-host interface. The cleaner names are [deferred to a coordinated change](LIBRARY_PARITY.md#deferred-list-update-naming).
+host interface. A coordinated rename to checked `set` and no-op `set_or_keep`
+must update both libraries and all callers together.
 
 ## M1b: names and the foundation
 
@@ -401,13 +411,14 @@ and `for` consumers arrive with M2.2, M2.3 and M3.
 
 **Bootstrap goal.** Use the accepted literal Int/Float/String constant path.
 The baseline 99-global inventory had 71 such declarations; the other 27 records
-and one opaque marker are now named construction functions under the source plan.
+and one opaque marker became named construction functions in that historical
+source migration.
 This explicit bootstrap compromise removes initializer references, graph-cycle
 validation and opaque constant initialization from the prerequisite set.
 
-The [constants plan](CONSTANTS_PLAN.md) retains the reviewed M5a.2/M5b feature
-design for later language work. Do not implement it solely to bootstrap these
-28 source declarations. Ordinary opaque semantics still belong to M4.
+This source migration is historical. The [current constant contract](README.md)
+describes implemented aggregate construction and its initializer restrictions.
+Ordinary opaque semantics still belong to M4.
 
 **Decision.** Accepted constants materialise at use: no static data, immortal
 storage class or runtime change. Static data/CTFE remain future language work,
@@ -473,9 +484,8 @@ arguments; MIR `SwitchInt` with a join block.
 Checked side: one form, `Match(CheckedMatch[CheckedExpr])`, a tail match always
 being the body form. Desugarings happen in the checker, never the parser, which
 must not know `Bool`. The operator rows below are historical and superseded by
-[ordinary Boolean calls](BOOL_FUNCTIONS_PLAN.md); the separate
-[`.not()` source migration](BOOLEAN_SOURCE_PLAN.md) is implemented in the
-combined source, with no
+[ordinary Boolean calls](standard_library/README.md); the `.not()` source
+migration is implemented in the combined source, with no
 further legacy parser, host-library or bootstrap-pin work.
 
 ```
@@ -490,7 +500,7 @@ value ?= parse(text)           value = Match parse(text):
 
 `?=` desugars only among a function body's own top-level statements. It is
 rejected inside every `if` and `match` block, as well as loop and lambda bodies
-(see the [current propagation contract](RESTRICTED_CONTROL_PLAN.md)). Its failure arm
+(see the [current language reference](README.md)). Its failure arm
 returns from the function and discharges the function's live owners; it never
 exits an intermediate value join. The accepted Result-only implementation
 resolves the remaining function prefix inside an ordinary successful match arm;
@@ -544,9 +554,9 @@ designated `Result` independently of restricted `if`, with the function return's
 ownership discharge and independent verification. It requires no early-return
 form for a join arm: nested propagation is a parser error.
 
-The [restricted control plan](RESTRICTED_CONTROL_PLAN.md) retains the implemented candidate
-`if` contract and its pending acceptance, and records accepted Result propagation with its ownership, test
-and cost evidence; ordinary Boolean calls follow their separate active plan.
+The [language reference](README.md) owns current `if` and propagation behavior.
+The [Result propagation report](../benchmarks/results/blorp_2_result_propagation_2026-10-19.md)
+retains its historical ownership, test and cost evidence.
 
 ## M2b: pattern compilation
 
@@ -581,13 +591,11 @@ Historical focused passes do not establish current acceptance. Qualified heads
 reuse exported constructor identities and existing flat-field checking;
 constructor groups and broader source-pattern rewrites remain separate.
 
-The approved [six-site first-order source pilot](QUALIFIED_PATTERN_SOURCE_PLAN.md)
-depends on qualified-feature acceptance. Source implementation waits for actual
-accepted-base/region pins and a separate grant. Source cost setup remains held
-for the baseline policy decision.
+The historical six-site first-order source pilot is not an active bootstrap
+requirement. Its plan and source-growth forecasts remain available in Git.
 
-The source plan pilots successive matches for 236 nested-test arm headers,
-and length/get/equality replacements for list/String patterns. Do not duplicate
+The historical source proposal piloted successive matches for 236 nested-test
+arm headers, and length/get/equality replacements for list/String patterns. Do not duplicate
 substantial actions to force a ban: full source-growth and cost gates apply.
 General nested patterns, binder-unifying alternatives and list/literal pattern
 compilation remain deferred only after their source uses are actually removed.
@@ -607,10 +615,9 @@ report and source-removal forecasts above retain their original boundaries.
 
 ## M3: loops and tail recursion
 
-The first two bounded slices and their review gates are specified in
-[M3_LOOP_PLAN.md](M3_LOOP_PLAN.md): scalar representation preparation, then
-managed String while. They precede the broader exit proof below; neither
-slice alone completes M3.
+The historical implementation began with scalar representation preparation,
+then managed String while. Neither slice alone establishes the broader exit
+proof below; the current loop contract is in [README.md](README.md).
 
 **Goal.** Managed List/while loops, with one explicit edge/ownership mechanism.
 Retain existing scalar `@tail_recursive` behavior; broader managed/generic tail-
@@ -828,18 +835,16 @@ The ordinary [String integer-appending wrapper](README.md#counted-string-operati
 is implemented over accepted formatting and concat. Its fixtures preserve signed
 extrema, UTF-8/NUL bytes and aliases; self-compilation remains a separate gate.
 
-The current [Option/Result catalog and addition plan](OPTION_RESULT_PLAN.md)
-retains the historical nine-API inventory. All nine library definitions are
-implemented, including four [named-callback helpers](standard_library/README.md).
+The [target API reference](standard_library/README.md) documents the implemented
+Option/Result helpers, including four callback helpers.
 Lambdas/captures and explicit compiler-source operation imports are implemented
 in the combined candidate; source-frontier and resource acceptance remain pending.
 This library increment does not close those consumers. The prelude stays unchanged.
 The superseded five-helper proposal is recoverable from Git.
 
-The [loader/shell integration draft](LOADER_SHELL_INTEGRATION_PLAN.md) maps actual
-source callers and missing leaves, beginning with fallible CWD and explicit stderr.
-Source review and [fixed-baseline SOURCE cost acceptance](BOOTSTRAP_SOURCE_PLAN.md#source-cost-acceptance)
-remain separate from library acceptance; historical R0 failures stay recorded.
+Loader/shell integration uses fallible CWD and explicit stderr. Source review
+and [cost acceptance](#cost-and-evidence-rules) remain separate from library
+acceptance; historical R0 failures stay recorded.
 
 **Goal.** The real compiler source loads and checks against the real temporary
 library, with no remaining required parity row missing. Use the reduced resolved
@@ -850,19 +855,18 @@ remaining first-order numeric comparisons/classification; ordinary Option/Result
 helpers; byte-exact String operations; and the shell/path surface below. Implemented
 `string.byte_at -> Option[Int]` and `string.from_codepoint -> Option[String]`
 avoid target Char/Bytes. Strings contain valid UTF-8; byte observation retains
-byte coordinates, and scalar encoding validates before narrowing. Planned
-[`string.slice`](STRING_SLICE_PLAN.md) checks half-open byte bounds and scalar
-boundaries. See the source plan for exact contracts and the owning Some[String]
-transfer tests.
+byte coordinates, and scalar encoding validates before narrowing.
+[`string.slice`](README.md#counted-string-operations) checks half-open byte
+bounds and scalar boundaries; Some[String] carries ordinary owning payloads.
 
 Write ordinary helpers in Blorp where the reduced subset and measured cost allow.
 Do not reconstruct raw substring bytes through scalar encoding. `starts_with`
 can compare counted bytes without per-position substring allocation. Remove
 Unicode case mapping or search from the prerequisite set only after the parser's
 actual ASCII-classification calls disappear. Large String concatenation/join
-has a bounded [ordinary List[String].join plan](LIST_JOIN_PLAN.md), whose
-copying and stack costs are explicit. Implementation acceptance remains pending;
-no native join primitive, generic builder or M6 completion follows.
+uses the ordinary [List[String].join helper](standard_library/README.md), whose
+copying and stack costs are explicit. No native join primitive, generic builder
+or M6 completion follows from that helper alone.
 
 ```blorp
 pure func starts_with(text: String, prefix: String) -> Bool:
@@ -904,7 +908,8 @@ The last three implement the proposed join_paths/parent_directory/normalize_path
 semantics. Keeping the existing module names avoids parallel synonyms and a
 cosmetic cross-repository rename. The host's broader generic print_error still
 provides this String instantiation; the temporary twin is concretely String,
-as explicitly recorded in the parity table. No host trait enters target code.
+as documented in the [target API reference](standard_library/README.md). No
+host trait enters target code.
 
 - **Current directory:** owned, nonempty absolute path on success; useful Err
   otherwise. Grow storage as required by the OS; no fixed buffer or empty failure
@@ -917,8 +922,8 @@ as explicitly recorded in the parity table. No host trait enters target code.
   Target encoding help omits the host read_bytes suggestion because that API
   is unavailable; both reject malformed UTF-8 before String publication.
   Malformed UTF-8 returns Err before publishing contents as a String. The native
-  [file-admission pilot](BOOTSTRAP_SOURCE_PLAN.md#native-file-admission-pilot)
-  pins its diagnostic and priority. Preserve malformed-input coverage here.
+  file-admission tests pin its diagnostic and priority. Preserve malformed-input
+  coverage here.
   Reject NUL in a path before opening. Missing/unreadable input, incomplete reads
   and close failure return Err; clean up every opened handle. This increment
   needs stable source files, not arbitrary streams or concurrent snapshots.
@@ -997,12 +1002,16 @@ still proves real rebuilt-compiler output identity.
 
 ## M7: lambdas
 
-**Integration status.** Pure callback types, named references, forwarding, pure
-lambdas and immutable data captures are implemented. Mutable/callable captures,
-callable storage/returns and runtime-selected callbacks remain unsupported.
-The owner stopped the remaining callback-removal migration on 2026-10-19. The [lambda plan](LAMBDAS_PLAN.md) owns the
-noncapturing and immutable-capture increments; the [Option/Result plan](OPTION_RESULT_PLAN.md)
-records helper demand and the required callable witnesses.
+**Historical pre-stored-callable checkpoint.** Pure callback types, named
+references, forwarding, pure lambdas and immutable data captures were implemented.
+Mutable/callable captures, callable storage/returns and runtime-selected callbacks
+were unsupported at that checkpoint. The owner stopped the remaining
+callback-removal migration on 2026-10-19. The
+[language reference](README.md#grammar-for-this-increment) owns the current
+callable contract, including stored values and immutable callable captures; the
+[stored-callable acceptance report](../benchmarks/results/blorp2_stored_callables_2026-10-21.md)
+records validation and measured cost limits. The
+[target API reference](standard_library/README.md) records callback helpers.
 The source-removal work below is retained history.
 
 **Historical bootstrap decision.** Migrate the current 53 pure lambda literals, 64
@@ -1014,7 +1023,7 @@ language function values remain future work; existing parser/rejection behavior
 is preserved.
 
 The abandoned callback-removal estimates grant no implementation allowance.
-Remaining SOURCE slices follow the [user-approved fixed-baseline cost policy](BOOTSTRAP_SOURCE_PLAN.md#source-cost-acceptance);
+Any future source slice follows the [fixed-baseline cost policy](#cost-and-evidence-rules);
 retain historical R0 failures and cumulative trends without automatic baseline
 changes after failure.
 
@@ -1023,13 +1032,9 @@ is implemented and validated: [3,920 matched calls](../benchmarks/results/blorp_
 pass the +3% per-input and original-checkpoint-proxy limits. Historical R0
 compliance remains UNVERIFIED; eight callbacks and the broader M7 dependency remain.
 
-The [stable layout ordering pilot](STABLE_LAYOUT_ORDER_PLAN.md) has a reviewed
-design; implementation and measurements have not started.
-
-The [constant-fill plan](FIRST_ORDER_FILLS_PLAN.md) maps six remaining source maps
-to existing `repeat`; unary preparation already migrated the seventh historical
-site. Implementation and the unwaived SOURCE cumulative acceptance remain pending;
-the historical overall callback census is not refreshed by this bounded mapping.
+The historical stable-layout-ordering and six-site constant-fill proposals
+belong to the stopped callback-removal campaign. They are retained in Git, not
+active bootstrap prerequisites or grants for further implementation.
 
 **Retained design sketch.** Lambdas at known callees, including managed captures.
 The model, not an
@@ -1051,10 +1056,14 @@ offsets.map(pure func(value): IntOps.add(value, base))
 combinator and at a user generic; ownership of borrowed managed captures
 verified; frontier reaches emit.
 
-**Status.** Pure callback types, named references, callable parameter forwarding
-and direct-call specialization, lambdas and immutable capture specialization
-are implemented in the combined candidate. Integrated correctness, resource and
-self-compilation acceptance remain pending under [their bounded plan](LAMBDAS_PLAN.md).
+**Historical pre-stored-callable acceptance status.** Pure callback types, named
+references, callable parameter forwarding, direct-call specialization, lambdas
+and immutable capture specialization were implemented in the combined candidate;
+integrated correctness, resource and self-compilation acceptance were still
+separate obligations. For current behavior and the later acceptance evidence,
+use [README.md](README.md#grammar-for-this-increment) and the
+[stored-callable report](../benchmarks/results/blorp2_stored_callables_2026-10-21.md).
+Historical resource failures retain their original verdicts.
 
 ## M8: the fixpoint gate
 
@@ -1337,13 +1346,15 @@ Supporting-host compile-time leaks follow the
 - **Preparatory refactors** freeze a matched same-toolchain baseline, emit
   identical existing target C and stay within +3% allocations and minimum
   retired instructions per frozen input. Remaining SOURCE migrations follow the
-  [dated fixed-baseline policy](BOOTSTRAP_SOURCE_PLAN.md#source-cost-acceptance):
+  fixed-baseline policy:
   root names accepted B and complete C before setup; each owned input and the
   original construction-checkpoint proxy must independently pass +3% allocations
   and normal min3 instructions. Historical R0 failures and cumulative trends
   remain recorded; no baseline rolls after failure. A required native-host
   transition is measured separately and both sources are rebuilt under one
-  frozen measurement epoch.
+  frozen measurement epoch. The historical layout sorter still records
+  10,166 allocations against its 9,923 threshold (R0 9,634), despite a local
+  12-allocation reduction. A later accepted slice does not relabel that failure.
   A lowering preparation stops for design
   review above +50 production lines or a wider algorithmic change.
 - **Features** may change emitted C and increase costs: set numerical fixture

@@ -11,7 +11,7 @@ declarations. Specialization projects ordinary literals at each use span;
 existing lowering/ownership handles fresh values and Strings. No evaluator,
 global owner, concrete constant table or runtime change is introduced.
 Record initializers, initializer references/cycles and ordinary opaque constants
-remain subsequent slices in [the plan](../../blorp_2/CONSTANTS_PLAN.md).
+remain subsequent slices in [the plan](https://github.com/kablorp/blorp/blob/2ebbebf83c08b45cdf0c807453f89e12fb4b4ac9/blorp_2/CONSTANTS_PLAN.md).
 
 Against the accepted keyword/UFCS source `225c8f764`: production **351 added /
 92 deleted, net +259**; tests excluding fixtures **1041/11, net +1030**;

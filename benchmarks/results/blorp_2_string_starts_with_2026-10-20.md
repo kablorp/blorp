@@ -31,8 +31,8 @@ Token-table offsets count decoded Unicode text characters, not UTF-8 bytes.
 
 Implementation and validation are complete under the human-approved finite
 allocation and test-size exception. Root owns final independent review, commit,
-merge and publication. The [plan](../../blorp_2/STRING_STARTS_WITH_PLAN.md#current-validated-status-2026-10-20)
-records current status and preserves the historical proposal and failed thresholds.
+merge and publication. The [plan](https://github.com/kablorp/blorp/blob/2ebbebf83c08b45cdf0c807453f89e12fb4b4ac9/blorp_2/STRING_STARTS_WITH_PLAN.md#current-validated-status-2026-10-20)
+records that checkpoint and preserves its historical proposal and failed thresholds.
 
 The pure helper compares counted bytes: empty prefix is true; a mismatch or
 missing value byte is false. Named and UFCS calls borrow both Strings. UTF-8

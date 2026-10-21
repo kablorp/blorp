@@ -5,7 +5,7 @@ For source `Result[V,E]` and returned `Result[R,E]`, Ok binds V and continues;
 Err constructs the returned Result's Err. A private immutable RHS initializer
 preserves once evaluation and mutable versions carried by an RHS match. There
 are no new Lower, Own, Verify, Emit or runtime products. Option, nested statement
-contexts and annotated TCO remain rejected. See the [contract](../../blorp_2/RESTRICTED_CONTROL_PLAN.md#b-frontend-result-propagation-checkpoint-2026-10-19).
+contexts and annotated TCO remain rejected. See the [contract](https://github.com/kablorp/blorp/blob/2ebbebf83c08b45cdf0c807453f89e12fb4b4ac9/blorp_2/RESTRICTED_CONTROL_PLAN.md#b-frontend-result-propagation-checkpoint-2026-10-19).
 
 Fixed accepted B is `2aaedc28967f16d9d640256f264e731cf9922d48`; C is B plus
 four Check leaves, production patch `d26f859540359c29d0ace337c96d037182a7cc9c376faaf1cba53ad07d1780a0`.

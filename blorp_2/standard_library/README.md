@@ -73,8 +73,7 @@ Generic `any`, `map` and `filter` accept pure named functions, pure lambdas
 `filter` keeps input order, and `any` skips later elements after its first True.
 These ordinary source helpers use balanced recursion: logarithmic C stack,
 with O(n log n) copied List slots for map/filter as a temporary bootstrap cost.
-See [the callback plan](../LIST_CALLBACK_PLAN.md); no constant-stack or COW claim
-is implied.
+No constant-stack or COW claim is implied.
 
 List literals are supported. `set_index(values, index, value)` returns
 `Option[List[T]]`: `Some(updated)` for a valid index, or `None` for a negative
@@ -134,7 +133,7 @@ The List update names match the unchanged host library because the same compiler
 must build against both libraries. The internal `list.set` builtin implements the
 no-op-on-invalid update; checked `set_index` is an ordinary function. The desired
 later rename to checked `set` and no-op `set_or_keep` must update both libraries
-and all callers together; see [the deferred note](../LIBRARY_PARITY.md#deferred-list-update-naming).
+and all callers together.
 The base module provides the ordinary generic Result union with Ok/Err for
 pure calculator parsing and evaluation; it has no compiler-specific behavior.
 
@@ -162,9 +161,8 @@ The other branch preserves its variant and payload without invoking the callback
 Data arguments evaluate eagerly. Inputs are borrowed and returned managed values
 remain independently owned, including bypass payloads. Void payloads are supported.
 Lambdas/captures and explicit compiler-source operation imports are implemented
-in the combined compiler. The [catalog and addition plan](../OPTION_RESULT_PLAN.md)
-retains the historical inventory; integrated self-compilation and resource
-acceptance remain separate.
+in the combined compiler. Integrated self-compilation and resource acceptance
+remain separate.
 
 The String adapter
 exposes strict counted-byte `parse_int`, `parse_float` and `equals` operations.

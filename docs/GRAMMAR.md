@@ -1384,7 +1384,7 @@ dim_atom      = DIMNAME | "#" "_" | "#" INT | INT | "(" dim_expr ")" ;
   The pilot's [List membership APIs](../blorp_2/standard_library/README.md#list-membership)
   use this ordinary callable syntax, with a temporary Int adapter and linear O0
   stack in the current implementation; they add no grammar production.
-- Blorp 2's [List callback helpers](../blorp_2/LIST_CALLBACK_PLAN.md) use the
+- Blorp 2's [List callback helpers](../blorp_2/standard_library/README.md) use the
   same pure callable parameter syntax; they introduce no additional grammar.
 - Blorp 2's [List queries and copies](../blorp_2/standard_library/README.md#list-queries-and-copies)
   use ordinary selective imports, generic calls and UFCS: `list: get_or,

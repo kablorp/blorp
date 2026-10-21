@@ -1,7 +1,7 @@
 # M6a: Unicode Char values and their numeric projection
 
 **Bootstrap scope update.** This reviewed primitive-Char design and the held
-decoder preparation remain future work. The active [source plan](BOOTSTRAP_SOURCE_PLAN.md)
+decoder preparation remain future work. The implemented compiler source
 uses String byte access and checked scalar encoding through Int-facing APIs,
 avoiding target Char and Bytes representations while preserving UTF-8. The
 budgets below do not transfer to that different implementation route.
@@ -62,8 +62,8 @@ Delivery order:
 
 The names are existing APIs: `standard_library/src/char.brp:20` supplies
 `to_int(Char)->Int`; there is no proposed `to_code`. Host trait implementation
-syntax is not copied into the target library. The parity table's noteA already
-establishes qualified `CharOps.to_int` as host-compatible.
+syntax is not copied into the target library. The historical parity audit
+established qualified `CharOps.to_int` as host-compatible at the planning base.
 
 First ordinary fixture, `fixtures/char/scalar.brp`:
 

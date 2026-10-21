@@ -1,8 +1,8 @@
 # M4.2b: finite values with union-only recursive storage
 
-**Bootstrap scope update.** The [source plan](BOOTSTRAP_SOURCE_PLAN.md#retained-recursive-types)
-finds no current compiler-source witness requiring M4.2b or M4.2c. Preserve this
-design and its held candidate, but keep them off the bootstrap critical path.
+**Bootstrap scope update.** The historical source inventory found no
+compiler-source witness requiring M4.2b or M4.2c. Preserve this design and its held
+candidate, but keep them off the bootstrap critical path.
 Reopen only on an exact substituted stored-payload witness after refreshing the
 inventory over migrated source and the actual temporary library. Existing unary
 and mixed record/union/List recursion remain required.

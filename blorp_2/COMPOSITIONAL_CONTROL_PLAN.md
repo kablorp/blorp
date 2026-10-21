@@ -1,13 +1,13 @@
 # M2.2: compositional blocks and if
 
 **Bootstrap scope update.** This is the future general-expression design. The
-active [source plan](BOOTSTRAP_SOURCE_PLAN.md) lifts expression-child controls
+compiler-source subset lifts expression-child controls
 into preceding bindings and retains restricted body control, outer-variable
 joins and managed loops. General expression inference and workloop relocation
 below are deferred; the existing join/ownership contracts remain authoritative.
 
 The logical-operator candidate used for the historical anchors below is paused;
-[ordinary Boolean functions](BOOL_FUNCTIONS_PLAN.md) are the active direction.
+[ordinary Boolean functions](standard_library/README.md) are implemented.
 This general-expression design grants no implementation or cost acceptance.
 Resolve named declarations against the accepted source rather than relying
 on scratch files or old line numbers. The accepted quality APIs, including

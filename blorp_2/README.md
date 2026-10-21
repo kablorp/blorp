@@ -19,9 +19,7 @@ and resource acceptance remain separate; measured cost failures stay recorded.
 The [module and prelude sections](#local-modules) define explicit
 type/method visibility and a shared base/prelude for the target
 [standard library](standard_library/README.md) at `blorp_2/standard_library`.
-Its syntax and layout are implemented in this pilot. The
-[Option/Result catalog and addition plan](OPTION_RESULT_PLAN.md) records current
-compiler demand and separates ordinary helpers from callable prerequisites.
+Its syntax and layout are implemented in this pilot.
 The target library provides generic pure Option `is_some`, `is_none`, `get_or`,
 `to_result`, `map` and Result `is_ok`, `map`, `map_err`, `and_then` through explicit
 imports. Default/error arguments are eager. The four callback helpers accept pure
@@ -34,9 +32,12 @@ Current language examples and limits are below; [grammar.ebnf](grammar.ebnf)
 owns the formal syntax. The [roadmap](ROADMAP.md) owns planned increments,
 immutable-fact and ownership contracts, and required validation. It consolidates
 the earlier memory, aggregate, generics and recursion plans.
-The [bootstrap source plan](BOOTSTRAP_SOURCE_PLAN.md) defines the smaller source
-subset and the bounded migrations toward it; it does not remove currently
-supported input features.
+The compiler-source subset is governed by [AGENTS.md](AGENTS.md); source
+convenience does not remove currently supported input features.
+
+The [incremental layout migration](LAYOUT_MIGRATION.md) defines the proposed
+physical-layout model, staged replacements, code examples and cost gates.
+Implementation starts after CI/bootstrap repair and the bounded test migration.
 
 Completed increment plans and handoffs are retained in Git; validation reports
 remain under [benchmarks/results](../benchmarks/results/). Historical research
@@ -1809,9 +1810,8 @@ symbol binding. The base types module owns `Int`, `Float`, `String`, `Void` and 
 The [validation report](../benchmarks/results/blorp_2_int_add_2026-10-11.md) records
 strict tests, native fixtures, matched costs and the existing compiler's
 different trait-based `add` import surface.
-[The current library accounting](STANDARD_LIBRARY_GAPS.md) lists the compiler's
-library dependencies, missing APIs and parallel ownership. [LIBRARY_PARITY.md](LIBRARY_PARITY.md)
-retains the historical inventory and coordinated API contracts.
+The [target API reference](standard_library/README.md) documents the current
+library contracts and temporary implementation limits.
 
 ## Quoted UTF-8 String literals
 
@@ -1839,9 +1839,8 @@ current ASCII restriction.
 
 Every String's required contract is valid UTF-8, including counted NUL. Native
 argv admission validates each argument before constructing its String. Legacy
-host byte APIs still have enforcement gaps; the
-[source plan](BOOTSTRAP_SOURCE_PLAN.md#string-and-library-boundary) tracks their
-removal. Planned checked slicing preserves scalar boundaries; byte access remains useful.
+host byte APIs still have enforcement gaps. Target checked slicing preserves
+scalar boundaries; byte access remains useful.
 An ASCII refinement type is deferred.
 
 The fixed escapes are `\n`, `\r`, `\t`, `\0`, `\\`, `\"`, `\'`, `\{` and
@@ -2012,7 +2011,7 @@ Pass pure named functions or forward callable parameters. `any` stops at the
 first True result; `map` and `filter` preserve input order. Empty inputs return
 False or an empty List. The temporary balanced implementation uses logarithmic
 C stack and copies O(n log n) List slots for map/filter; it has no COW fast path.
-See the [List callback plan](LIST_CALLBACK_PLAN.md) for its limits and evidence.
+The [target API reference](standard_library/README.md) records these limits.
 
 `repeat` evaluates its element and count once. A nonpositive count produces an
 empty List, including the minimum Int value. Each repeated occurrence owns its
@@ -2033,8 +2032,8 @@ exists only where its operation is called.
 Checked `set_index` returns `Some(updated)` for a valid index and `None` otherwise.
 Both update APIs evaluate their replacement argument eagerly, including invalid
 indices. These names match the host library so the same compiler source can
-be compiled by both compilers. The later coordinated rename is tracked in
-[library parity](LIBRARY_PARITY.md#deferred-list-update-naming).
+be compiled by both compilers. A future coordinated rename to checked `set`
+and no-op `set_or_keep` must update both libraries and all callers together.
 
 A list literal `[a, b]` constructs one fresh root of exactly n slots inline
 at its site, storing each element once; `[x, x]` acquires `x` twice, as a

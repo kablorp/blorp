@@ -4,7 +4,7 @@ Fixed-EA costs passed for `ea881c84d0df9df04a6ec5c4406a3b69cf406735` plus qualif
 The composition on accepted local-annotation base `0f052d713` also passed its destination functional gate.
 Neither result is a target self-compilation claim.
 
-The [owned plan](../../blorp_2/QUALIFIED_PATTERN_SOURCE_PLAN.md) permits qualified public constructor heads
+The [owned plan](https://github.com/kablorp/blorp/blob/2ebbebf83c08b45cdf0c807453f89e12fb4b4ac9/blorp_2/QUALIFIED_PATTERN_SOURCE_PLAN.md) permits qualified public constructor heads
 with the existing flat field rules. Check resolves the real variant/union identity and uses the scrutinee's
 actual generic arguments; no parser product, runtime representation or ownership backend was added.
 Nested/list/literal/or-pattern work remains separate.

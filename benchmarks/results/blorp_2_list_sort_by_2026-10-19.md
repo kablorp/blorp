@@ -1,6 +1,6 @@
 # Held stable Int-key List.sort_by candidate
 
-The candidate implements the [reviewed ordinary source contract](../../blorp_2/LIST_SORT_BY_PLAN.md)
+The candidate implements the [reviewed ordinary source contract](https://github.com/kablorp/blorp/blob/2ebbebf83c08b45cdf0c807453f89e12fb4b4ac9/blorp_2/LIST_SORT_BY_PLAN.md)
 in the isolated `codex/list-sort-by` worktree. It is held and unmerged: native
 behavior passed, but the first shared-input instruction checkpoint exceeded its
 10% hard ceiling. No resource waiver or further compiled calls are authorized.

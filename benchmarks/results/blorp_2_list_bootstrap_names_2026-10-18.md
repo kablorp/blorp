@@ -11,7 +11,7 @@ Compiler sources, host library, intrinsic labels and every cost limit are unchan
 The same compiler source is built against both libraries. A target-only rename
 breaks its imports and a source-only rename breaks the host build. The desired
 checked `set` / no-op `set_or_keep` naming is therefore
-[deferred to one coordinated change](../../blorp_2/LIBRARY_PARITY.md#deferred-list-update-naming)
+[deferred to one coordinated change](https://github.com/kablorp/blorp/blob/2ebbebf83c08b45cdf0c807453f89e12fb4b4ac9/blorp_2/LIBRARY_PARITY.md#deferred-list-update-naming)
 across both libraries, callers, tests and docs. No compatibility alias or build
 adapter is added. The earlier checked-helper allocation approval remains in
 force; this change grants no new allowance.
