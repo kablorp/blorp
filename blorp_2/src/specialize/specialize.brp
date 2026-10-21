@@ -2406,6 +2406,33 @@ private pure func prepare_callable_storage(
 					Ok(_): Err(invalid(span, "capture environment has a non-record layout"))
 
 
+private pure func prepare_named_creation(
+	id: Declaration.FunctionId,
+	arguments: List[Checked.TypeRef],
+	substitution: List[TypeSubstitution[PartialType]],
+	checked: Checked.CheckedFunctions,
+	initial: PreparedInstances,
+	span: Span,
+) -> Result[PreparedInstances, Diagnostic]:
+	types ?= prepare_arguments(arguments, substitution, checked, initial.unions, span, initial.records, [])
+	concrete ?= known_types(types.arguments, span)
+	key ?= runtime_key(Checked.DeclaredBody(id), concrete, checked, span)
+	Ok(request_instance({ initial | unions = types.unions, records = types.records }, key, ConcreteRequest(span)))
+
+
+private pure func prepare_lambda_creation(
+	id: Checked.LambdaId,
+	captures: List[Checked.CheckedExpr],
+	arguments: List[TypeRef],
+	checked: Checked.CheckedFunctions,
+	initial: PreparedInstances,
+	span: Span,
+) -> Result[PreparedInstances, Diagnostic]:
+	storage ?= prepare_callable_storage(id, captures, arguments, checked, initial, span)
+	key ?= runtime_key(Checked.LambdaBody(id), arguments, checked, span)
+	Ok(request_instance(storage.prepared, key, ConcreteRequest(span)))
+
+
 private pure func prepare_creation(
 	value: Checked.CheckedExpr, request: FunctionRequest,
 	substitution: List[TypeSubstitution[PartialType]], checked: Checked.CheckedFunctions,
@@ -2413,24 +2440,9 @@ private pure func prepare_creation(
 ) -> Result[PreparedInstances, Diagnostic]:
 	match value.form:
 		Checked.MakeCallable(Checked.NamedCallable(id, arguments)):
-			match prepare_arguments(arguments, substitution, checked, initial.unions, value.span, initial.records, []):
-				Err(error): Err(error)
-				Ok(types):
-					match known_types(types.arguments, value.span):
-						Err(error): Err(error)
-						Ok(concrete):
-							match runtime_key(Checked.DeclaredBody(id), concrete, checked, value.span):
-								Err(error): Err(error)
-								Ok(key):
-									Ok(request_instance({ initial | unions = types.unions, records = types.records }, key, ConcreteRequest(value.span)))
+			prepare_named_creation(id, arguments, substitution, checked, initial, value.span)
 		Checked.MakeCallable(Checked.LambdaCallable(id, captures)):
-			match prepare_callable_storage(id, captures, request.key.arguments, checked, initial, value.span):
-				Err(error): Err(error)
-				Ok(storage):
-					match runtime_key(Checked.LambdaBody(id), request.key.arguments, checked, value.span):
-						Err(error): Err(error)
-						Ok(key):
-							Ok(request_instance(storage.prepared, key, ConcreteRequest(value.span)))
+			prepare_lambda_creation(id, captures, request.key.arguments, checked, initial, value.span)
 		_: Ok(initial)
 
 
@@ -3589,6 +3601,16 @@ private pure func translate_statements(
 	)
 
 
+private pure func translate_place_variant(
+	value_type: TypeRef,
+	id: Declaration.VariantId,
+	unions: List[UnionInstance],
+	span: Span,
+) -> Result[VariantInstanceId, Diagnostic]:
+	owner ?= concrete_union_owner(value_type, span)
+	translate_variant(id, owner, unions, span)
+
+
 private pure func translate_place(
 	opaques: List[Checked.CheckedOpaque],
 	place: Checked.CheckedPatternPlace,
@@ -3615,13 +3637,10 @@ private pure func translate_place(
 			match translate_place(opaques, parent, substitution, unions, records, span):
 				Err(error): Err(error)
 				Ok(concrete_parent):
-					match concrete_union_owner(concrete_parent.value_type, span):
+					match translate_place_variant(concrete_parent.value_type, id, unions, span):
 						Err(error): Err(error)
-						Ok(owner):
-							match translate_variant(id, owner, unions, span):
-								Err(error): Err(error)
-								Ok(variant):
-									Ok(UnionField(concrete_parent, into_opaque VariantFieldInstanceId({ variant = variant, position = ordinal })))
+						Ok(variant):
+							Ok(UnionField(concrete_parent, into_opaque VariantFieldInstanceId({ variant = variant, position = ordinal })))
 	translated ?= route
 	Ok({ value_type = value_type, route = translated })
 
@@ -3636,9 +3655,7 @@ private pure func translate_pattern_argument(
 ) -> Result[ConcretePatternArgument, Diagnostic]:
 	match argument:
 		Checked.BorrowPlace(place):
-			match translate_place(opaques, place, substitution, unions, records, span):
-				Ok(concrete): Ok(BorrowPlace(concrete))
-				Err(error): Err(error)
+			translate_place(opaques, place, substitution, unions, records, span).map(pure func(concrete): BorrowPlace(concrete))
 		Checked.CopyListSuffix(place, skipped):
 			match translate_place(opaques, place, substitution, unions, records, span):
 				Ok(concrete): Ok(CopyListSuffix(concrete, skipped))
@@ -3671,12 +3688,9 @@ private pure func translate_selection(
 				match translate_place(opaques, place, substitution, unions, records, span):
 					Err(error): Err(error)
 					Ok(concrete_place):
-						match concrete_union_owner(concrete_place.value_type, span):
+						match translate_place_variant(concrete_place.value_type, id, unions, span):
+							Ok(variant): Ok(TestVariant(concrete_place, variant, yes, no))
 							Err(error): Err(error)
-							Ok(owner):
-								match translate_variant(id, owner, unions, span):
-									Ok(variant): Ok(TestVariant(concrete_place, variant, yes, no))
-									Err(error): Err(error)
 	)
 	Ok({ nodes = nodes, entry = selection.entry })
 
@@ -4137,13 +4151,9 @@ private pure func translate_function(
 
 	body_result: Result[ConcreteBody, Diagnostic] = match function.body:
 		Checked.CheckedValueBody(value):
-			match translate_exit(opaques, value, substitution, translation, keys, unions, records):
-				Ok(concrete): Ok(ConcreteValueBody(concrete))
-				Err(error): Err(error)
+			translate_exit(opaques, value, substitution, translation, keys, unions, records).map(pure func(concrete): ConcreteValueBody(concrete))
 		Checked.CheckedMatchBody(matched):
-			match translate_match(opaques, matched, substitution, translation, keys, unions, records, span):
-				Ok(concrete): Ok(ConcreteMatchBody(concrete))
-				Err(error): Err(error)
+			translate_match(opaques, matched, substitution, translation, keys, unions, records, span).map(pure func(concrete): ConcreteMatchBody(concrete))
 
 	body ?= body_result
 	concrete: ConcreteFunction = {
