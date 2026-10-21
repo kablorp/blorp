@@ -1092,7 +1092,24 @@ private pure func record_field_type(
 			.to_result(verification_error(span, "unknown record field"))
 
 
-private pure func operation_type(
+private pure func definition_value(
+	definition: OwnedDefinition, expected: TypeRef,
+	projection_parent: Option[BorrowedValue],
+	projection_place: Option[ConcretePatternPlace],
+) -> Result[KnownValue, Diagnostic]:
+	if same_type(expected, definition.value_type):
+		Ok({
+			value_type = definition.value_type,
+			span = definition.span,
+			result = definition.result,
+			projection_parent = projection_parent,
+			projection_place = projection_place
+		})
+	else:
+		Err(verification_error(definition.span, "definition type does not match its operation"))
+
+
+private pure func operation_value(
 	definition: OwnedDefinition,
 	state: VerificationFacts,
 	signature: FunctionSignature,
@@ -1102,7 +1119,7 @@ private pure func operation_type(
 	records: List[ConcreteRecord],
 	discharged: List[Bool],
 	owners: List[OwnerState],
-) -> Result[TypeRef, Diagnostic]:
+) -> Result[KnownValue, Diagnostic]:
 	match definition.operation:
 		ConstructRecordDefinition(owner, fields):
 			match record_layout(owner, records, definition.span):
@@ -1155,7 +1172,7 @@ private pure func operation_type(
 							Some(error):
 								Err(error)
 							None:
-								Ok(RecordType(owner))
+								definition_value(definition, RecordType(owner), None, None)
 					else:
 						Err(
 							verification_error(
@@ -1188,7 +1205,14 @@ private pure func operation_type(
 										discharged,
 										owners,
 									):
-										Ok(live): record_field_type(field, owner, layout, definition.span)
+										Ok(live):
+											match record_field_type(field, owner, layout, definition.span):
+												Err(error): Err(error)
+												Ok(expected):
+													parent: Option[BorrowedValue] = match argument:
+														BorrowedArgument(borrow): Some(borrow)
+														UnmanagedArgument(_): None
+													definition_value(definition, expected, parent, None)
 										Err(error): Err(error)
 								Err(error): Err(error)
 						_:
@@ -1205,23 +1229,20 @@ private pure func operation_type(
 					),
 				)
 			else:
-				signature.parameters
-					.get(index)
-					.to_result(
-						verification_error(
-							definition.span,
-							"parameter value in a zero-argument function",
-						),
-					)
+				match signature.parameters.get(index).to_result(
+					verification_error(definition.span, "parameter value in a zero-argument function"),
+				):
+					Err(error): Err(error)
+					Ok(expected): definition_value(definition, expected, None, None)
 		VoidDefinition:
-			Ok(VoidType)
+			definition_value(definition, VoidType, None, None)
 		StringDefinition(_):
-			Ok(StringType)
+			definition_value(definition, StringType, None, None)
 		IntegerDefinition(_):
-			Ok(IntType)
+			definition_value(definition, IntType, None, None)
 		FloatDefinition(value):
 			if FloatOps.is_finite(value):
-				Ok(FloatType)
+				definition_value(definition, FloatType, None, None)
 			else:
 				Err(verification_error(definition.span, "Float literal must be finite"))
 		CallDefinition(target, arguments):
@@ -1240,7 +1261,7 @@ private pure func operation_type(
 						Ok(valid):
 
 							if same_type(contract.return_type, definition.value_type):
-								Ok(contract.return_type)
+								definition_value(definition, contract.return_type, None, None)
 							else:
 								Err(verification_error(definition.span, "call result type does not match its contract"))
 						Err(error): Err(error)
@@ -1260,7 +1281,9 @@ private pure func operation_type(
 			match found_error:
 				Some(error): Err(error)
 				None:
-					variant_type(id, types, unions, definition.span)
+					match variant_type(id, types, unions, definition.span):
+						Err(error): Err(error)
+						Ok(expected): definition_value(definition, expected, None, None)
 		ConstructListDefinition(payloads):
 			-- The definition's List type is the one authority for E; every
 			-- stored element must carry exactly that type.
@@ -1281,15 +1304,17 @@ private pure func operation_type(
 									break
 					match found_error:
 						Some(error): Err(error)
-						None: Ok(definition.value_type)
+						None: definition_value(definition, definition.value_type, None, None)
 				_: Err(verification_error(definition.span, "list construction result must be a List"))
 
 		PayloadDefinition(field, source):
-			payload_projection_type(field, source, state, projection, unions, records, definition.span, discharged, owners)
+			payload_projection_value(field, source, state, projection, unions, records, definition, discharged, owners)
 		ListElementDefinition(index, source):
-			element_projection_type(index, source, state, projection, unions, records, definition.span, discharged, owners)
+			element_projection_value(index, source, state, projection, unions, records, definition, discharged, owners)
 		ListSuffixDefinition(argument, skip):
-			suffix_projection_type(argument, skip, state, projection, unions, records, definition.span, discharged, owners)
+			match suffix_projection_type(argument, skip, state, projection, unions, records, definition.span, discharged, owners):
+				Err(error): Err(error)
+				Ok(expected): definition_value(definition, expected, None, None)
 
 
 -- Owner slots after every stored payload of one construction discharged its
@@ -1537,22 +1562,31 @@ private pure func value_place(value: ValueId, state: VerificationFacts, projecti
 				known.projection_place.to_result(verification_error(span, "selection projection parent is not one of its verified places"))
 
 
+-- The selected root's explicit borrow may differ from its definition result.
+-- Descendants instead depend on their already verified immediate parent.
+private fixed record ProjectionParent {
+	place: ConcretePatternPlace,
+	borrow: Option[BorrowedValue]
+}
+
+
 private pure func verified_projection_parent(
 	value: ValueId, state: VerificationFacts, projection: ProjectionContext,
 	unions: List[ConcreteUnion], records: List[ConcreteRecord], span: Span,
 	discharged: List[Bool], owners: List[OwnerState],
-) -> Result[ConcretePatternPlace, Diagnostic]:
+) -> Result[ProjectionParent, Diagnostic]:
 	place ?= value_place(value, state, projection, span)
 	known ?= known_value(state, value, span)
-	-- The selected root may have acquired its own owner after its definition.
-	-- Descendants still depend on their recorded projection parent.
-	parent_live: Void ?= match projection:
+	parent_argument: OwnedArgument ?= match projection:
 		NoProjection: Err(verification_error(span, "payload projection outside its selected match arm"))
 		SelectionProjection(root, _):
-			if IntOps.equals(value_number(value), value_number(argument_value(root))):
-				verify_match_argument(root, state, unions, records, span, discharged, owners)
+			argument = if IntOps.equals(value_number(value), value_number(argument_value(root))):
+				root
 			else:
-				verify_match_argument(value_argument(value, known), state, unions, records, span, discharged, owners)
+				value_argument(value, known)
+			match verify_match_argument(argument, state, unions, records, span, discharged, owners):
+				Err(error): Err(error)
+				Ok(_): Ok(argument)
 	match projection:
 		NoProjection: Err(verification_error(span, "payload projection outside its selected match arm"))
 		SelectionProjection(root, facts):
@@ -1564,50 +1598,63 @@ private pure func verified_projection_parent(
 						Ok(_):
 							match verify_pattern_place(place, root_value.value_type, facts, unions, span):
 								Err(error): Err(error)
-								Ok(_): Ok(place)
+								Ok(_):
+									borrow: Option[BorrowedValue] = match parent_argument:
+										BorrowedArgument(parent): Some(parent)
+										UnmanagedArgument(_): None
+									Ok({ place = place, borrow = borrow })
 
 
-private pure func payload_projection_type(
+private pure func payload_projection_value(
 	field: VariantFieldInstanceId, source: ValueId, state: VerificationFacts,
 	projection: ProjectionContext, unions: List[ConcreteUnion], records: List[ConcreteRecord],
-	span: Span, discharged: List[Bool], owners: List[OwnerState],
-) -> Result[TypeRef, Diagnostic]:
+	definition: OwnedDefinition, discharged: List[Bool], owners: List[OwnerState],
+) -> Result[KnownValue, Diagnostic]:
+	span = definition.span
 	parent ?= verified_projection_parent(source, state, projection, unions, records, span, discharged, owners)
 	selected = variant_field_variant(field)
 	fields ?= variant_shape(selected, unions, span)
 	payload_type ?= fields.get(variant_field_number(field)).to_result(verification_error(span, "unknown variant field identity"))
-	nominal: Void ?= if same_type(parent.value_type, UnionType(variant_owner(selected))):
+	nominal: Void ?= if same_type(parent.place.value_type, UnionType(variant_owner(selected))):
 		Ok(void)
 	else:
 		Err(verification_error(span, "payload projection does not belong to this match arm"))
 	match projection:
 		NoProjection: Err(verification_error(span, "payload projection outside its selected match arm"))
 		SelectionProjection(_, facts):
-			match variant_possibilities(parent, facts, unions, span):
+			match variant_possibilities(parent.place, facts, unions, span):
 				Err(error): Err(error)
 				Ok(possible):
 					if projection_includes(possible, variant_number(selected)):
 						if singleton_variant(possible, variant_number(selected)):
-							Ok(payload_type)
+							definition_value(
+								definition, payload_type, parent.borrow,
+								Some({ value_type = definition.value_type, route = UnionField(parent.place, field) }),
+							)
 						else:
 							Err(verification_error(span, "payload projection outside its selected match arm"))
 					else:
 						Err(verification_error(span, "payload projection does not belong to this match arm"))
 
 
-private pure func element_projection_type(
+private pure func element_projection_value(
 	index: Int, source: ValueId, state: VerificationFacts, projection: ProjectionContext,
-	unions: List[ConcreteUnion], records: List[ConcreteRecord], span: Span,
+	unions: List[ConcreteUnion], records: List[ConcreteRecord], definition: OwnedDefinition,
 	discharged: List[Bool], owners: List[OwnerState],
-) -> Result[TypeRef, Diagnostic]:
+) -> Result[KnownValue, Diagnostic]:
+	span = definition.span
 	parent ?= verified_projection_parent(source, state, projection, unions, records, span, discharged, owners)
-	element ?= list_element_type(parent.value_type, span)
+	element ?= list_element_type(parent.place.value_type, span)
 	match projection:
 		NoProjection: Err(verification_error(span, "list element outside its selected match arm"))
 		SelectionProjection(_, facts):
-			match verify_element_bound(parent, index, facts, span):
+			match verify_element_bound(parent.place, index, facts, span):
 				Err(error): Err(error)
-				Ok(_): Ok(element)
+				Ok(_):
+					definition_value(
+						definition, element, parent.borrow,
+						Some({ value_type = definition.value_type, route = ListElement(parent.place, index) }),
+					)
 
 
 private pure func suffix_projection_type(
@@ -1617,7 +1664,7 @@ private pure func suffix_projection_type(
 ) -> Result[TypeRef, Diagnostic]:
 	live ?= verify_match_argument(argument, state, unions, records, span, discharged, owners)
 	parent ?= verified_projection_parent(argument_value(argument), state, projection, unions, records, span, discharged, owners)
-	element ?= list_element_type(parent.value_type, span)
+	element ?= list_element_type(parent.place.value_type, span)
 	nonnegative: Void ?= if IntOps.less_than(skip, 0):
 		Err(verification_error(span, "list suffix skip must be nonnegative"))
 	else:
@@ -1625,48 +1672,10 @@ private pure func suffix_projection_type(
 	match projection:
 		NoProjection: Err(verification_error(span, "list suffix outside its selected match arm"))
 		SelectionProjection(_, facts):
-			if IntOps.greater_than_or_equal(length_bounds(parent, facts).minimum, skip):
+			if IntOps.greater_than_or_equal(length_bounds(parent.place, facts).minimum, skip):
 				Ok(ListType(element))
 			else:
 				Err(verification_error(span, "list suffix lacks its required length guard"))
-
-
-private pure func immediate_parent(value: ValueId, state: VerificationFacts, projection: ProjectionContext, span: Span) -> Option[BorrowedValue]:
-	match projection:
-		SelectionProjection(root, _):
-			if IntOps.equals(value_number(value), value_number(argument_value(root))):
-				match root:
-					BorrowedArgument(borrow): Some(borrow)
-					UnmanagedArgument(_): None
-			else:
-				match known_value(state, value, span):
-					Err(_): None
-					Ok(known):
-						match value_argument(value, known):
-							BorrowedArgument(borrow): Some(borrow)
-							UnmanagedArgument(_): None
-		NoProjection: None
-
-
-private pure func definition_parent(definition: OwnedDefinition, state: VerificationFacts, projection: ProjectionContext) -> Option[BorrowedValue]:
-	match definition.operation:
-		ReadRecordFieldDefinition(_, BorrowedArgument(parent)): Some(parent)
-		PayloadDefinition(_, parent): immediate_parent(parent, state, projection, definition.span)
-		ListElementDefinition(_, parent): immediate_parent(parent, state, projection, definition.span)
-		_: None
-
-
-private pure func definition_place(definition: OwnedDefinition, state: VerificationFacts, projection: ProjectionContext) -> Option[ConcretePatternPlace]:
-	match definition.operation:
-		PayloadDefinition(field, source):
-			match value_place(source, state, projection, definition.span):
-				Ok(parent): Some({ value_type = definition.value_type, route = UnionField(parent, field) })
-				Err(_): None
-		ListElementDefinition(index, source):
-			match value_place(source, state, projection, definition.span):
-				Ok(parent): Some({ value_type = definition.value_type, route = ListElement(parent, index) })
-				Err(_): None
-		_: None
 
 
 private pure func verify_definition_type(
@@ -1679,37 +1688,28 @@ private pure func verify_definition_type(
 	records: List[ConcreteRecord],
 	discharged: List[Bool],
 	owners: List[OwnerState],
-) -> Result[Void, Diagnostic]:
-	if IntOps.not_equals(
+) -> Result[KnownValue, Diagnostic]:
+	ordinal: Void ?= if IntOps.not_equals(
 		value_number(definition.id),
 		IntOps.add(state.first_value, state.values.length()),
 	):
 		Err(verification_error(definition.span, "value identity is not the next function ordinal"))
 	else:
-		membership_result: Result[Void, Diagnostic] = match definition.value_type:
-			ListType(element): verify_type_membership(element, unions, records, definition.span)
-			VoidType | IntType | FloatType | StringType | RecordType(_) | UnionType(_): Ok(void)
-		match membership_result:
-			Ok(_):
-				match operation_type(
-					definition,
-					state,
-					signature,
-					functions,
-					unions,
-					projection,
-					records,
-					discharged,
-					owners,
-				):
-					Ok(expected):
-
-						if same_type(expected, definition.value_type):
-							Ok(void)
-						else:
-							Err(verification_error(definition.span, "definition type does not match its operation"))
-					Err(error): Err(error)
-			Err(error): Err(error)
+		Ok(void)
+	membership: Void ?= match definition.value_type:
+		ListType(element): verify_type_membership(element, unions, records, definition.span)
+		VoidType | IntType | FloatType | StringType | RecordType(_) | UnionType(_): Ok(void)
+	operation_value(
+		definition,
+		state,
+		signature,
+		functions,
+		unions,
+		projection,
+		records,
+		discharged,
+		owners,
+	)
 
 
 private pure func verified_drop(
@@ -1889,7 +1889,7 @@ private pure func verify_operations(
 				):
 					Err(error):
 						Err(error)
-					Ok(_):
+					Ok(candidate):
 						stored: Result[Void, Diagnostic] = match definition.operation:
 							ConstructListDefinition(payloads):
 								match discharge_payloads(payloads, state, discharged, owners, unions, records, definition.span):
@@ -1955,13 +1955,7 @@ private pure func verify_operations(
 														state.parameters
 
 												state = { state |
-													values = state.values.append({
-														value_type = definition.value_type,
-														span = definition.span,
-														result = definition.result,
-														projection_parent = definition_parent(definition, state, projection),
-														projection_place = definition_place(definition, state, projection),
-													}),
+													values = state.values.append(candidate),
 													parameters = parameters
 												}
 												Ok(void)
