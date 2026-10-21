@@ -1,0 +1,291 @@
+import:
+	../../../src/check/check: checked_functions, check_errors
+	../../../src/check/errors: CheckErrorKind(CallRejection), CallError(ImpureCallableCall, ArgumentTypeMismatch)
+	../../../src/check/model as Checked
+	../../../src/check/render: render_check_error
+	../../../src/lex/lex: lex
+	../../../src/utils/names: program_names
+	../../../src/utils/source: module_source, root_module_id
+	../../../src/utils/ids: function_number
+	../../../src/utils/syntax: Purity(Pure, Impure), same_purity, same_span
+	../input: checked_source, check, parse, singleton_check_error
+	test: TestSuite
+
+
+private PURE_STORAGE: String =
+	|fixed record TestCase {
+	|    run: pure () -> Int
+	|}
+	|
+	|pure func answer() -> Int:
+	|    42
+	|
+	|pure func main() -> Int:
+	|    test: TestCase = { run = answer }
+	|    callback: pure () -> Int = test.run
+	|    callback()
+
+
+private RETURNED_CAPTURE: String =
+	|pure func stored(amount: Int) -> () -> Int:
+	|    func() -> Int: amount
+	|func main() -> Int:
+	|    callback: () -> Int = stored(7)
+	|    callback()
+
+
+private MIXED_ENVIRONMENTS: String =
+	|fixed record TestCase {
+	|    run: () -> Int
+	|}
+	|pure func forget(value: String) -> Int:
+	|    2
+	|pure func stored(left: Int, right: String) -> List[TestCase]:
+	|    [
+	|        { run = func() -> Int: left },
+	|        { run = func() -> Int: forget(right) },
+	|    ]
+	|pure func main() -> Int:
+	|    values = stored(3, "kept")
+	|    0
+
+
+private PURE_INVOCATION: String =
+	|func read_value() -> Int:
+	|    1
+	|pure func main() -> Int:
+	|    callback: () -> Int = read_value
+	|    callback()
+
+
+pure func test_stored_pure_callable_is_read_from_a_record_and_invoked() -> Bool:
+	checked_source(PURE_STORAGE).is_ok()
+
+
+pure func test_returned_impure_callable_captures_an_immutable_parameter() -> Bool:
+	match checked_source(RETURNED_CAPTURE):
+		Err(_): False
+		Ok(program):
+			match checked_functions(program).lambdas:
+				[row]:
+					match row.captures:
+						[capture]:
+							(
+								Checked.binding_number(capture.binding.binding) == 0
+									and Checked.same_type(capture.value_type.value_type, Checked.IntType)
+									and function_number(row.root) == 0
+									and same_purity(row.purity, Impure)
+									and Checked.same_body(capture.binding.owner, Checked.DeclaredBody(row.root))
+							)
+						_: False
+				_: False
+
+
+pure func test_pure_creation_preserves_two_different_capture_layouts() -> Bool:
+	match checked_source(MIXED_ENVIRONMENTS):
+		Err(_): False
+		Ok(program):
+			match checked_functions(program).lambdas:
+				[left, right]:
+					match (left.captures, right.captures):
+						([first], [second]): (
+							Checked.same_type(first.value_type.value_type, Checked.IntType)
+								and Checked.same_type(second.value_type.value_type, Checked.StringType)
+								and Checked.binding_number(first.binding.binding) == 0
+								and Checked.binding_number(second.binding.binding) == 1
+								and function_number(left.root) == 1 and function_number(right.root) == 1
+								and same_purity(left.purity, Impure) and same_purity(right.purity, Impure)
+								and Checked.same_body(first.binding.owner, Checked.DeclaredBody(left.root))
+								and Checked.same_body(second.binding.owner, Checked.DeclaredBody(right.root))
+							)
+						_: False
+				_: False
+
+
+pure func test_pure_caller_cannot_invoke_an_impure_stored_value() -> Bool:
+	parsed = lex(module_source(root_module_id()), PURE_INVOCATION, program_names().names).and_then(pure func(tokens): parse(tokens))
+	match parsed:
+		Err(_): False
+		Ok(program):
+			match check(program):
+				Ok(_): False
+				Err(failure):
+					match singleton_check_error(check_errors(failure)):
+						None: False
+						Some(error):
+							match error.kind:
+								CallRejection(ImpureCallableCall(_)):
+									diagnostic = render_check_error(program, error)
+									(
+										same_span(error.span, { source = module_source(root_module_id()), start = 98, end = 106 })
+											and same_span(diagnostic.span, error.span)
+											and diagnostic.message == "pure functions cannot call an impure callable"
+											and diagnostic.help == "use a pure callable type, or remove pure from the calling function"
+											and diagnostic.note.is_none()
+									)
+								_: False
+
+
+pure func test_captured_callable_call_uses_the_issued_capture_leaf() -> Bool:
+	source =
+		|pure func saved(callback: () -> Int) -> () -> Int:
+		|    func() -> Int: callback()
+		|pure func answer() -> Int:
+		|    42
+		|func main() -> Int:
+		|    returned: () -> Int = saved(answer)
+		|    returned()
+	match checked_source(source):
+		Err(_): False
+		Ok(program):
+			match checked_functions(program).lambdas:
+				[row]:
+					match (row.captures, row.body):
+						([capture], Checked.CheckedValueBody(Checked.ReturnExpression(value))):
+							match value.form:
+								Checked.InvokeFunction(call):
+									match (call.target, call.operands):
+										(Checked.ValueCall(callee), []):
+											match callee.form:
+												Checked.ReadCapture(id): (
+													Checked.capture_number(id) == 0 and Checked.lambda_number(Checked.capture_owner(id)) == 0
+													and Checked.binding_number(capture.binding.binding) == 0
+													and Checked.same_body(capture.binding.owner, Checked.DeclaredBody(row.root))
+													and Checked.same_type(callee.value_type, capture.value_type.value_type)
+												)
+												_: False
+										_: False
+								_: False
+						_: False
+				_: False
+
+
+private INTERLEAVED: String =
+	|pure func identity(value: Int) -> Int:
+	|    value
+	|pure func use(callback: pure (Int) -> Int, value: Int, later: pure (Int) -> Int) -> Int:
+	|    later(callback(value))
+	|func main() -> Int:
+	|    saved: pure (Int) -> Int = identity
+	|    saved.use(17, identity)
+	|
+
+
+private OUTER_PERMISSION: String =
+	|pure func identity(value: Int) -> Int:
+	|    value
+	|func use(callback: (Int) -> Int, value: Int) -> Int:
+	|    callback(value)
+	|func main() -> Int:
+	|    saved: pure (Int) -> Int = identity
+	|    saved.use(17)
+	|
+
+
+private IMPURE_RECEIVER: String =
+	|func identity(value: Int) -> Int:
+	|    value
+	|pure func use(callback: pure (Int) -> Int, value: Int) -> Int:
+	|    callback(value)
+	|func main() -> Int:
+	|    saved: (Int) -> Int = identity
+	|    saved.use(17)
+	|
+
+
+pure func test_receiver_and_later_callable_keep_their_written_formal_ids() -> Bool:
+	match checked_source(INTERLEAVED):
+		Err(_): False
+		Ok(program):
+			match checked_functions(program).functions:
+				[_, _, main]:
+					match main.body:
+						Checked.CheckedValueBody(Checked.ReturnExpression(value)):
+							match value.form:
+								Checked.InvokeFunction(call):
+									match (call.target, call.operands):
+										(Checked.UserFunction(target, []), [Checked.CallableOperand(first, Checked.StoredCallable(receiver), _), Checked.ValueOperand(argument), Checked.CallableOperand(later, Checked.NamedCallable(identity, []), _)]):
+											match argument.form:
+												Checked.LiteralInteger(17):
+													match receiver.form:
+														Checked.ReadBinding(id):
+															(function_number(target) == 1 and function_number(identity) == 0 and Checked.binding_number(id) == 0
+																and Checked.same_callable_parameter(first, Checked.callable_parameter(target, 0))
+																and Checked.same_callable_parameter(later, Checked.callable_parameter(target, 2))
+																and Checked.same_type(receiver.value_type, Checked.CallableType(Pure, [Checked.IntType], Checked.IntType)))
+														_: False
+												_: False
+										_: False
+								_: False
+						_: False
+				_: False
+
+
+pure func test_receiver_uses_the_same_outer_purity_permission_as_a_direct_argument() -> Bool:
+	match checked_source(OUTER_PERMISSION):
+		Err(_): False
+		Ok(program):
+			match checked_functions(program).functions:
+				[_, _, main]:
+					match (main.bindings, main.body):
+						([local], Checked.CheckedValueBody(Checked.ReturnExpression(value))):
+							match value.form:
+								Checked.InvokeFunction(call):
+									match (call.target, call.operands):
+										(Checked.UserFunction(target, []), [Checked.CallableOperand(first, Checked.StoredCallable(receiver), _), Checked.ValueOperand(argument)]):
+											match argument.form:
+												Checked.LiteralInteger(17):
+													match receiver.form:
+														Checked.ReadBinding(id):
+															(Checked.binding_number(id) == 0 and function_number(target) == 1
+																and Checked.same_callable_parameter(first, Checked.callable_parameter(target, 0))
+																and Checked.same_type(local.value_type, Checked.CallableType(Pure, [Checked.IntType], Checked.IntType))
+																and Checked.same_type(receiver.value_type, Checked.CallableType(Impure, [Checked.IntType], Checked.IntType)))
+														_: False
+												_: False
+										_: False
+								_: False
+						_: False
+				_: False
+
+
+pure func test_impure_stored_receiver_cannot_enter_a_pure_callable_formal() -> Bool:
+	parsed = lex(module_source(root_module_id()), IMPURE_RECEIVER, program_names().names).and_then(pure func(tokens): parse(tokens))
+	match parsed:
+		Err(_): False
+		Ok(program):
+			match check(program):
+				Ok(_): False
+				Err(failure):
+					match singleton_check_error(check_errors(failure)):
+						None: False
+						Some(error):
+							match error.kind:
+								CallRejection(ArgumentTypeMismatch(mismatch)):
+									diagnostic = render_check_error(program, error)
+									(
+										mismatch.argument_position == 0
+											and Checked.same_type(mismatch.expected, Checked.CallableType(Pure, [Checked.IntType], Checked.IntType))
+											and Checked.same_type(mismatch.actual.value_type, Checked.CallableType(Impure, [Checked.IntType], Checked.IntType))
+											and same_span(error.span, { source = module_source(root_module_id()), start = 192, end = 195 })
+											and same_span(diagnostic.span, error.span)
+											and diagnostic.message == "argument type does not match the parameter type"
+											and diagnostic.help == "use an expression of type pure (Int) -> Int here"
+											and diagnostic.note.is_none()
+									)
+								_: False
+
+
+tests: TestSuite = {
+	description = "Blorp 2 stored callable values",
+	tests = [
+		("captured callable invocation uses its issued capture leaf", test_captured_callable_call_uses_the_issued_capture_leaf),
+		("stored pure callable is read from a record and invoked", test_stored_pure_callable_is_read_from_a_record_and_invoked),
+		("returned impure callable captures its immutable parameter", test_returned_impure_callable_captures_an_immutable_parameter),
+		("pure creation preserves two different capture layouts", test_pure_creation_preserves_two_different_capture_layouts),
+		("pure caller cannot invoke an impure stored value", test_pure_caller_cannot_invoke_an_impure_stored_value),
+		("receiver and later callable keep exact written formal IDs", test_receiver_and_later_callable_keep_their_written_formal_ids),
+		("receiver admits the same outer purity permission as direct syntax", test_receiver_uses_the_same_outer_purity_permission_as_a_direct_argument),
+		("impure stored receiver cannot enter a pure callable formal", test_impure_stored_receiver_cannot_enter_a_pure_callable_formal),
+	]
+}

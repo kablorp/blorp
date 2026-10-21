@@ -36,6 +36,7 @@ import:
 	result as ResultOps: and_then
 	../parse/assemble: ParsedContents, ParsedProgram, parsed_contents
 	../utils/syntax:
+		Purity(Pure, Impure),
 		CallNotation(DirectCall, ReceiverCall),
 		Diagnostic,
 		DiagnosticNote(
@@ -237,10 +238,6 @@ private pure func render_unsupported_form(span: Span, form: Errors.UnsupportedFo
 			rendered(span, "`?=` is not supported yet", "match on the Option or Result and return its failing case; `?=` arrives with the join milestone")
 		Errors.WhileStatement:
 			rendered(span, "`while` is not supported yet", "write a recursive function; loops arrive with the loops milestone")
-		Errors.LambdaValue:
-			rendered(span, "lambda values are only supported as pure callback arguments", "pass a pure func literal to a pure callable parameter; store and return ordinary data")
-		Errors.FunctionType:
-			rendered(span, "callable types are only supported as function parameters", "write pure function types only on function parameters; use ordinary data types inside them")
 		Errors.CharPattern:
 			rendered(span, "Char literal patterns are not supported yet", "compare the character in the arm; literal patterns arrive with the pattern-compilation milestone")
 
@@ -303,14 +300,6 @@ private pure func render_qualified_error(span: Span, rejection: Errors.Qualified
 											rendered(span, selected_spelling.concat(" is private to ").concat(module), "remove private or qualify a public declaration")
 										UnknownName | ImportedThere(_) | ProvidedThere(_):
 											rendered(span, "module ".concat(module).concat(" declares no public ").concat(selected_spelling), alias_spelling.concat(" names module ").concat(module).concat("; qualify a public function, constructor or type it declares; imports are not reexported"))
-		Errors.QualifiedFunctionNotCalled(aliased, name):
-			match parsed_spelling(aliased, context.names, span):
-				Err(error): error
-				Ok(alias_spelling):
-					match parsed_spelling(name, context.names, span):
-						Err(error): error
-						Ok(selected_spelling):
-							rendered(span, alias_spelling.concat(".").concat(selected_spelling).concat(" names a function"), "call this function or pass it directly to a pure callable parameter")
 
 
 -- Every namespace problem: a conflict in one table, a selection by its reason.
@@ -726,8 +715,8 @@ private pure func render_call_error(
 			rendered(span, "cannot infer this lambda's input types", "annotate its parameters or supply a typed ordinary argument")
 		Errors.LambdaBlockNeedsResult:
 			rendered(span, "block lambda needs a complete result type", "write a return annotation or give the callback a complete result context")
-		Errors.CapturedCallable(_):
-			rendered(span, "lambda cannot capture a callable parameter", "pass the data and callback explicitly to a declared helper")
+		Errors.LambdaResultNeedsType:
+			rendered(span, "standalone lambda needs a complete result type", "write a return annotation or give the lambda a callable type annotation")
 		Errors.ImpureCall(_, _):
 			rendered(
 				span,
@@ -739,11 +728,8 @@ private pure func render_call_error(
 				span, "callbacks require direct-call syntax",
 				"invoke the callback as f(value), or forward it in a declared helper's argument list",
 			)
-		Errors.CallableCandidateHasCallableParameters(_):
-			rendered(
-				span, "callback signature must contain only data types",
-				"pass a named function whose parameters and result are ordinary data types",
-			)
+		Errors.ImpureCallableCall(_):
+			rendered(span, "pure functions cannot call an impure callable", "use a pure callable type, or remove pure from the calling function")
 		Errors.ImpureCallback(_):
 			rendered(
 				span, "pure callback requires a pure function",
@@ -753,11 +739,6 @@ private pure func render_call_error(
 			rendered(
 				span, "callback argument must be a pure function",
 				"pass a pure named function or pure func literal, or forward a callable parameter unchanged",
-			)
-		Errors.CallableValueEscapes(_):
-			rendered(
-				span, "function references are not data values",
-				"call this function or pass it directly to a pure callable parameter",
 			)
 		Errors.UnknownFunction(_):
 			rendered(
@@ -781,7 +762,7 @@ private pure func render_call_error(
 			)
 		Errors.UncallableBinding(_, origin, value_type):
 			match origin:
-				Check.ParameterBinding(_):
+				Check.ParameterBinding(_) | Check.CallableParameterBinding(_):
 					message = if Check.same_type(value_type, Check.IntType):
 						"Int parameters cannot be called"
 					else:
@@ -1139,7 +1120,7 @@ private pure func render_binding_error(span: Span, rejection: Errors.BindingErro
 			)
 		Errors.LocalBindingConflict(previous, origin):
 			kind = match origin:
-				Check.ParameterBinding(_): "parameter"
+				Check.ParameterBinding(_) | Check.CallableParameterBinding(_): "parameter"
 				Check.BodyLocal | Check.MatchCapture: "local"
 			binding_conflict(span, previous.name, kind, "function", previous.span, context)
 
@@ -1419,13 +1400,17 @@ private pure func type_spelling(
 	span: Span,
 ) -> Result[String, Diagnostic]:
 	match value:
-		Check.PureCallableType(parameters, result):
+		Check.CallableType(purity, parameters, result):
 			match type_spellings(parameters, context, span, []):
 				Err(error): Err(error)
 				Ok(spelled):
 					match type_spelling(result, context, span):
 						Err(error): Err(error)
-						Ok(returned): Ok("pure (".concat(comma_separated(spelled)).concat(") -> ").concat(returned))
+						Ok(returned):
+							prefix: String = match purity:
+								Pure: "pure ("
+								Impure: "("
+							Ok(prefix.concat(comma_separated(spelled)).concat(") -> ").concat(returned))
 		Check.OpaqueType(id):
 			match inventory_opaques(context.declarations).get(opaque_number(id)):
 				Some(declaration): parsed_spelling(declaration.declaration.type_name.id, context.names, span)

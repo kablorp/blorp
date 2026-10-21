@@ -7,8 +7,9 @@ Supporting a feature in the existing compiler does not put it in scope here.
 
 ## Scope
 
-The existing compiler builds this compiler until it can build itself. Compiler
-source stays within the eventual bootstrap subset in the README: no
+The pinned Blorp 2 seed builds the current compiler. The legacy TestSuite host
+remains temporary for untranslated component suites. Compiler source stays
+within the eventual bootstrap subset in the README: no
 concurrency, parallelism, tensors or dimension types, tuples, debug blocks,
 numeric widths other than Int64 and Float64, traits, doctests, channels or
 FFI. Use concrete functions such as `add` and `concat`, and pattern matching,
@@ -97,6 +98,10 @@ Every host-compiled source module has a unit suite under
 [test/unit/](test/unit/), in the `test_<stage>/` folder that mirrors the module's
 folder under `src/`. Grammar cases live under
 [test/test_grammar/](test/test_grammar/) and change with the EBNF.
+The existing text suite is the first target-owned typed `tests()` factory;
+`make -C blorp_2 test-compiler test-components` retains the other host suites
+and requires that exact target suite as well. A host-only directory run is
+not the complete component gate.
 Rejections check exact message, help and span. Embedded programs use aligned
 multiline strings with exact contents; keep quoted escapes where they make
 the bytes clearer, such as CRLF or malformed indentation. Using multiline

@@ -1,0 +1,267 @@
+import:
+	../../../src/lower/lower as Lower
+	../../../src/own/own as Own
+	../../../src/specialize/specialize as Concrete
+	../../../src/utils/syntax: Diagnostic, entry_function
+	../input: checked_source
+	test: TestSuite
+
+
+private pure func owned(source: String) -> Result[Own.OwnershipProgram, Diagnostic]:
+	checked ?= checked_source(source)
+	concrete ?= Concrete.specialize(checked)
+	lowered ?= Lower.lower(concrete)
+	Own.own(lowered)
+
+
+private pure func same_value(left: Lower.ValueId, right: Lower.ValueId) -> Bool:
+	Lower.value_number(left) == Lower.value_number(right)
+
+
+private pure func same_owner(left: Own.OwnerId, right: Own.OwnerId) -> Bool:
+	Own.owner_number(left) == Own.owner_number(right)
+
+
+private pure func definitions(function: Own.OwnedFunction) -> List[Own.OwnedDefinition]:
+	function.operations.filter_map(pure func(operation):
+		match operation:
+			Own.DefineValue(value): Some(value)
+			_: None
+	)
+
+
+private pure func definition_position(function: Own.OwnedFunction, value: Lower.ValueId) -> Int:
+	var found = -1
+	for index in 0..function.operations.length():
+		match function.operations.get(index):
+			Some(Own.DefineValue(definition)):
+				if same_value(definition.id, value):
+					found = index
+			_: void
+	found
+
+
+private pure func drop_positions(function: Own.OwnedFunction, owner: Own.OwnerId) -> List[Int]:
+	var positions: List[Int] = []
+	for index in 0..function.operations.length():
+		match function.operations.get(index):
+			Some(Own.DropOwner(dropped, _)):
+				if same_owner(dropped, owner):
+					positions = positions.append(index)
+			_: void
+	positions
+
+
+private pure func borrows_owner(argument: Own.OwnedArgument, value: Lower.ValueId, owner: Own.OwnerId) -> Bool:
+	match argument:
+		Own.BorrowedArgument(borrow):
+			match borrow.source:
+				Own.OwnerBorrow(actual): same_value(borrow.value, value) and same_owner(actual, owner)
+				_: False
+		_: False
+
+
+pure func test_callable_creation_acquires_and_transfers_the_genuine_environment() -> Bool:
+	source: String =
+		|pure func make(text: String) -> () -> String:
+		|    func() -> String: text
+		|func main() -> Int:
+		|    callback: () -> String = make("kept")
+		|    first = callback()
+		|    second = callback()
+		|    0
+		|
+	match owned(source):
+		Err(_): False
+		Ok(program):
+			var matched = 0
+			for function in program.functions:
+				values = definitions(function)
+				for value in values:
+					match (value.operation, value.result, function.result):
+						(Own.CapturedCallableDefinition(code, Own.OwnedPayload(environment, payload_owner)), Own.OwnedResult(callable_owner), Own.OwnedReturn(returned, transferred)):
+							match (values.find(pure func(parent): same_value(parent.id, environment)), program.functions.get(Concrete.function_number(code))):
+								(Some(parent), Some(entry)):
+									match (parent.operation, parent.result, entry.signature.parameters):
+										(Own.ConstructRecordDefinition(record_id, [_]), Own.OwnedResult(parent_owner), [Concrete.RecordType(entry_record)]):
+											var acquisitions = 0
+											var transfers = 0
+											for index in 0..function.operations.length():
+												match function.operations.get(index):
+													Some(Own.AcquireOwner(acquired, borrow, _)):
+														match borrow.source:
+															Own.OwnerBorrow(backing):
+																if same_owner(acquired, payload_owner) and same_owner(backing, parent_owner) and same_value(borrow.value, environment) and index < definition_position(function, value.id):
+																	acquisitions = acquisitions + 1
+															_: void
+													Some(Own.DefineValue(candidate)):
+														match candidate.operation:
+															Own.CapturedCallableDefinition(_, Own.OwnedPayload(_, owner)):
+																if same_owner(owner, payload_owner):
+																	transfers = transfers + 1
+															_: void
+													_: void
+											if (acquisitions == 1 and transfers == 1 and drop_positions(function, payload_owner).is_empty() and drop_positions(function, callable_owner).is_empty()
+												and same_value(returned, value.id) and same_owner(transferred, callable_owner)
+												and Concrete.record_number(record_id) == Concrete.record_number(entry_record)
+												and Concrete.same_type(value.value_type, Concrete.CallableType([], Concrete.StringType))
+												and Concrete.same_type(entry.signature.return_type, Concrete.StringType)):
+												matched = matched + 1
+										_: void
+								_: void
+						_: void
+			matched == 1
+
+
+pure func test_aliased_callable_owner_stays_live_through_arguments_and_both_invocations() -> Bool:
+	source: String =
+		|pure func make(text: String) -> (Int) -> String:
+		|    func(_: Int) -> String: text
+		|func argument() -> Int:
+		|    17
+		|func main() -> Int:
+		|    callback: (Int) -> String = make("kept")
+		|    copied: (Int) -> String = callback
+		|    first = copied(argument())
+		|    second = callback(argument())
+		|    0
+		|
+	match owned(source):
+		Err(_): False
+		Ok(program):
+			match program.functions.get(Concrete.function_number(entry_function(program.entrypoint))):
+				None: False
+				Some(main):
+					values = definitions(main)
+					creators = values.filter(pure func(value): Concrete.same_type(value.value_type, Concrete.CallableType([Concrete.IntType], Concrete.StringType)))
+					invocations = values.filter(pure func(value):
+						match value.operation:
+							Own.InvokeCallableDefinition(_, _): True
+							_: False
+					)
+					arguments = values.filter(pure func(value):
+						match value.operation:
+							Own.CallDefinition(_, []): Concrete.same_type(value.value_type, Concrete.IntType)
+							_: False
+					)
+					match (creators, invocations, arguments):
+						([creator], [first, second], [left, right]):
+							match (creator.result, first.operation, second.operation):
+								(Own.OwnedResult(owner), Own.InvokeCallableDefinition(first_callee, [Own.UnmanagedArgument(first_argument)]), Own.InvokeCallableDefinition(second_callee, [Own.UnmanagedArgument(second_argument)])):
+									match (drop_positions(main, owner), left.operation, right.operation):
+										([dropped], Own.CallDefinition(Concrete.UserFunction(left_code), []), Own.CallDefinition(Concrete.UserFunction(right_code), [])):
+											(
+												borrows_owner(first_callee, creator.id, owner) and borrows_owner(second_callee, creator.id, owner)
+													and same_value(first_argument, left.id) and same_value(second_argument, right.id)
+													and Concrete.function_number(left_code) == Concrete.function_number(right_code)
+													and definition_position(main, creator.id) < definition_position(main, left.id)
+													and definition_position(main, left.id) < definition_position(main, first.id)
+													and definition_position(main, first.id) < definition_position(main, right.id)
+													and definition_position(main, right.id) < definition_position(main, second.id)
+													and dropped > definition_position(main, second.id)
+											)
+										_: False
+								_: False
+						_: False
+
+
+private pure func projection_transfers_owner(function: Own.OwnedFunction, field: Own.OwnedDefinition, parent: Lower.ValueId) -> Bool:
+	match function.result:
+		Own.OwnedReturn(returned, transferred):
+			var acquisitions = 0
+			for index in 0..function.operations.length():
+				match function.operations.get(index):
+					Some(Own.AcquireOwner(owner, borrow, _)):
+						match borrow.source:
+							Own.PayloadBorrow(source):
+								if same_owner(owner, transferred) and same_value(borrow.value, field.id) and same_value(source, parent) and index > definition_position(function, field.id):
+									acquisitions = acquisitions + 1
+							_: void
+					_: void
+			same_value(returned, field.id) and acquisitions == 1 and drop_positions(function, transferred).is_empty()
+		_: False
+
+
+private pure func caller_releases_record_before_using_returned_callable(
+	main: Own.OwnedFunction, call: Own.OwnedDefinition, box: Own.BorrowedValue,
+	callback_owner: Own.OwnerId, record_id: Concrete.RecordInstanceId,
+) -> Bool:
+	match (box.source, definitions(main).find(pure func(value): same_value(value.id, box.value))):
+		(Own.OwnerBorrow(box_owner), Some(parent)):
+			match (parent.operation, parent.result, drop_positions(main, box_owner)):
+				(Own.ConstructRecordDefinition(actual_record, [_]), Own.OwnedResult(parent_owner), [parent_drop]):
+					var matched = 0
+					for invocation in definitions(main):
+						match (invocation.operation, drop_positions(main, callback_owner)):
+							(Own.InvokeCallableDefinition(callee, []), [callback_drop]):
+								if (same_owner(parent_owner, box_owner) and not same_owner(box_owner, callback_owner)
+									and Concrete.record_number(actual_record) == Concrete.record_number(record_id)
+									and borrows_owner(callee, call.id, callback_owner)
+									and definition_position(main, parent.id) < definition_position(main, call.id)
+									and parent_drop > definition_position(main, call.id) and parent_drop < definition_position(main, invocation.id)
+									and callback_drop > definition_position(main, invocation.id)):
+									matched = matched + 1
+							_: void
+					matched == 1
+				_: False
+		_: False
+
+
+private pure func projection_parameter_is_genuine(function: Own.OwnedFunction, parent: Own.BorrowedValue, record_id: Concrete.RecordInstanceId) -> Bool:
+	match (parent.source, definitions(function).find(pure func(value): same_value(value.id, parent.value))):
+		(Own.ParameterBorrow(parameter), Some(value)):
+			match (value.operation, value.value_type):
+				(Own.ParameterDefinition(_), Concrete.RecordType(owner)):
+					same_value(parameter, value.id) and Concrete.record_number(owner) == Concrete.record_number(record_id)
+				_: False
+		_: False
+
+
+pure func test_projected_callable_outlives_the_released_source_record() -> Bool:
+	source: String =
+		|fixed record Holder { run: () -> String }
+		|pure func make(text: String) -> () -> String:
+		|    func() -> String: text
+		|pure func extract(box: Holder) -> () -> String:
+		|    box.run
+		|func main() -> Int:
+		|    box: Holder = { run = make("kept") }
+		|    callback: () -> String = extract(box)
+		|    result = callback()
+		|    0
+		|
+	match owned(source):
+		Err(_): False
+		Ok(program):
+			var matched = 0
+			for position in 0..program.functions.length():
+				match program.functions.get(position):
+					None: void
+					Some(extract):
+						for field in definitions(extract):
+							match (field.operation, field.result):
+								(Own.ReadRecordFieldDefinition(field_id, Own.BorrowedArgument(parent)), Own.BorrowedResult(Own.PayloadBorrow(source_parent))):
+									if (Concrete.same_type(field.value_type, Concrete.CallableType([], Concrete.StringType))
+										and same_value(parent.value, source_parent) and projection_transfers_owner(extract, field, parent.value)
+										and projection_parameter_is_genuine(extract, parent, Concrete.field_owner(field_id))):
+										match program.functions.get(Concrete.function_number(entry_function(program.entrypoint))):
+											None: void
+											Some(main):
+												for call in definitions(main):
+													match (call.operation, call.result):
+														(Own.CallDefinition(Concrete.UserFunction(code), [Own.BorrowedArgument(box)]), Own.OwnedResult(callback_owner)):
+															if Concrete.function_number(code) == position and caller_releases_record_before_using_returned_callable(main, call, box, callback_owner, Concrete.field_owner(field_id)):
+																matched = matched + 1
+														_: void
+								_: void
+			matched == 1
+
+
+tests: TestSuite = {
+	description = "Stored callable ownership publishes environment and callee lifetimes",
+	tests = [
+		("callable creation acquires and transfers its genuine environment", test_callable_creation_acquires_and_transfers_the_genuine_environment),
+		("aliased callable stays live through arguments and both invocations", test_aliased_callable_owner_stays_live_through_arguments_and_both_invocations),
+		("projected callable outlives its released source record", test_projected_callable_outlives_the_released_source_record),
+	]
+}

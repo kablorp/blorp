@@ -7,7 +7,7 @@ import:
 	../../../src/utils/ids: FunctionId
 	../../../src/utils/names: NameTable, same_name
 	../../../src/utils/source: module_source, root_module_id
-	../../../src/utils/syntax: Span, WrittenName, same_span
+	../../../src/utils/syntax: Span, WrittenName, Purity(Pure), same_span
 	../input: existing_name
 	../module_input: parse_modules
 	test: TestSuite
@@ -180,44 +180,67 @@ pure func test_callable_scope_preserves_its_contract_and_rejects_data_shadowing(
 				Some(name):
 					id = Model.callable_parameter(setup.function, 2)
 					match Scope.bind_callable([], setup.namespace, root_module_id(),
-						name, id, [Model.StringType, Model.IntType], Model.VoidType, span(70)):
+						name, id, { value_type = Model.CallableType(Pure, [Model.StringType, Model.IntType], Model.VoidType), span = span(70) },
+						Model.DeclaredBody(setup.function), Model.binding_id(0)):
 						Ok(Scope.CallableLocal(binding)):
-							contract_matches = match Scope.callable_parameters(binding):
-								[first, second]:
-									(
-										Model.same_type(first.value_type, Model.StringType)
-										and Model.same_type(second.value_type, Model.IntType)
-										and same_span(first.span, span(70)) and same_span(second.span, span(70))
-									)
-								_: False
-							shadow = { name | span = span(140) }
-							conflict_matches = match bind_local([Scope.CallableLocal(binding)], setup.namespace,
-								root_module_id(), Model.DeclaredBody(setup.function), shadow, Model.binding_id(0),
-								definition(Model.BodyLocal, shadow.span)):
-								Err(error):
-									match error.kind:
-										Errors.BindingRejection(Errors.CallableBindingConflict(previous, previous_span)):
+							match Scope.callable_parameter_contract(binding):
+								Err(_): False
+								Ok(accepted):
+									contract_matches = match accepted.signature.parameters:
+										[first, second]:
 											(
-												Model.same_callable_parameter(previous, id) and same_span(previous_span, name.span)
-												and same_span(error.span, shadow.span)
+												Model.same_type(first.value_type, Model.StringType)
+												and Model.same_type(second.value_type, Model.IntType)
+												and same_span(first.span, span(70)) and same_span(second.span, span(70))
 											)
 										_: False
+									shadow = { name | span = span(140) }
+									conflict_matches = match bind_local([Scope.CallableLocal(binding)], setup.namespace,
+										root_module_id(), Model.DeclaredBody(setup.function), shadow, Model.binding_id(0),
+										definition(Model.BodyLocal, shadow.span)):
+										Err(error):
+											match error.kind:
+												Errors.BindingRejection(Errors.CallableBindingConflict(previous, previous_span)):
+													(
+														Model.same_callable_parameter(previous, id) and same_span(previous_span, name.span)
+														and same_span(error.span, shadow.span)
+													)
+												_: False
+										_: False
+									(
+										contract_matches and conflict_matches
+										and Model.same_callable_parameter(accepted.parameter, id)
+										and same_name(binding_site(Scope.callable_local(binding)).name, name.id)
+										and same_span(binding_site(Scope.callable_local(binding)).span, name.span)
+										and Model.same_type(accepted.signature.return_type.value_type, Model.VoidType)
+										and same_span(accepted.signature.return_type.span, span(70))
+										and lookup_binding([Scope.CallableLocal(binding)], name.id).is_some()
+									)
+						_: False
+
+
+pure func test_callable_constructor_rejects_a_noncallable_annotation() -> Bool:
+	match fixture():
+		None: False
+		Some(setup):
+			match written(setup, "candidate", 90):
+				None: False
+				Some(name):
+					match Scope.bind_callable([], setup.namespace, root_module_id(), name,
+						Model.callable_parameter(setup.function, 2),
+						{ value_type = Model.IntType, span = span(70) },
+						Model.DeclaredBody(setup.function), Model.binding_id(0)):
+						Err(error):
+							match error.kind:
+								Errors.InternalInvariant(Errors.InvalidFunctionContract): same_span(error.span, span(70))
 								_: False
-							(
-								contract_matches and conflict_matches
-								and Model.same_callable_parameter(Scope.callable_binding_id(binding), id)
-								and same_name(Scope.callable_binding_name(binding).id, name.id)
-								and same_span(Scope.callable_binding_name(binding).span, name.span)
-								and Model.same_type(Scope.callable_return_type(binding).value_type, Model.VoidType)
-								and same_span(Scope.callable_return_type(binding).span, span(70))
-								and lookup_binding([Scope.CallableLocal(binding)], name.id).is_some()
-							)
 						_: False
 
 
 tests: TestSuite = {
 	description = "Accepted local binding construction",
 	tests = [
+		("callable constructor rejects noncallable annotation", test_callable_constructor_rejects_a_noncallable_annotation),
 		("callable scope retains contract and data conflict identity", test_callable_scope_preserves_its_contract_and_rejects_data_shadowing),
 		("constructor preserves complete binding definition", test_constructor_preserves_the_complete_binding_definition),
 		("function collision carries namespace occurrence", test_function_collision_carries_its_namespace_occurrence),

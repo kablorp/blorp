@@ -1,0 +1,215 @@
+import:
+	../../../src/lower/lower as Lower
+	../../../src/own/own as Own
+	../../../src/specialize/specialize as Concrete
+	../../../src/utils/syntax: Diagnostic, Span, same_span
+	../../../src/utils/source: compiler_source
+	../../../src/verify/verify: verify
+	../input: checked_source
+	test: TestSuite
+
+
+private SOURCE: String =
+	|pure func saved(callback: () -> Int) -> () -> Int:
+	|    func() -> Int: callback()
+	|pure func answer() -> Int:
+	|    42
+	|func main() -> Int:
+	|    callback: () -> Int = answer
+	|    returned: () -> Int = saved(callback)
+	|    returned()
+
+
+private pure func owned() -> Result[Own.OwnershipProgram, Diagnostic]:
+	checked ?= checked_source(SOURCE)
+	concrete ?= Concrete.specialize(checked)
+	lowered ?= Lower.lower(concrete)
+	Own.own(lowered)
+
+
+private pure func rejects(program: Own.OwnershipProgram, message: String, span: Span) -> Bool:
+	match verify(program):
+		Err(error): (
+			error.message == "ownership verification failed: " + message
+				and error.help == "report this compiler error with the input program"
+				and same_span(error.span, span) and error.note.is_none()
+			)
+		Ok(_): False
+
+
+pure func test_environment_transfer_and_indirect_borrow_verify_independently() -> Bool:
+	match owned():
+		Err(_): False
+		Ok(program):
+			var environments = 0
+			var invocations = 0
+			for function in program.functions:
+				for operation in function.operations:
+					match operation:
+						Own.DefineValue(definition):
+							match definition.operation:
+								Own.CapturedCallableDefinition(_, Own.OwnedPayload(_, _)): environments = environments + 1
+								Own.InvokeCallableDefinition(Own.BorrowedArgument(_), []): invocations = invocations + 1
+								_: void
+						_: void
+			verify(program).is_ok() and environments == 1 and invocations == 2
+
+
+pure func test_indirect_callee_cannot_discard_its_owner_dependent_borrow() -> Bool:
+	match owned():
+		Err(_): False
+		Ok(program):
+			var observed = 0
+			for position in 0..program.functions.length():
+				match program.functions.get(position):
+					None: void
+					Some(function):
+						for index in 0..function.operations.length():
+							match function.operations.get(index):
+								Some(Own.DefineValue(definition)):
+									match definition.operation:
+										Own.InvokeCallableDefinition(Own.BorrowedArgument(borrow), arguments):
+											changed = function.operations.set(index, Own.DefineValue({ definition | operation = Own.InvokeCallableDefinition(Own.UnmanagedArgument(borrow.value), arguments) }))
+											candidate = { program | functions = program.functions.set(position, { function | operations = changed }) }
+											if rejects(candidate, "managed call argument requires an owner-dependent borrow", definition.span):
+												observed = observed + 1
+										_: void
+								_: void
+			observed == 2
+
+
+pure func test_callable_environment_cannot_lose_its_transferred_owner() -> Bool:
+	match owned():
+		Err(_): False
+		Ok(program):
+			var observed = 0
+			for position in 0..program.functions.length():
+				match program.functions.get(position):
+					None: void
+					Some(function):
+						for index in 0..function.operations.length():
+							match function.operations.get(index):
+								Some(Own.DefineValue(definition)):
+									match definition.operation:
+										Own.CapturedCallableDefinition(body, Own.OwnedPayload(value, _)):
+											changed = function.operations.set(index, Own.DefineValue({ definition | operation = Own.CapturedCallableDefinition(body, Own.UnmanagedPayload(value)) }))
+											candidate = { program | functions = program.functions.set(position, { function | operations = changed }) }
+											if rejects(candidate, "managed payload requires an owner transfer", definition.span):
+												observed = observed + 1
+										_: void
+								_: void
+			observed == 1
+
+
+pure func test_free_callable_entry_cannot_publish_a_different_signature() -> Bool:
+	match owned():
+		Err(_): False
+		Ok(program):
+			var observed = 0
+			for position in 0..program.functions.length():
+				match program.functions.get(position):
+					None: void
+					Some(function):
+						for index in 0..function.operations.length():
+							match function.operations.get(index):
+								Some(Own.DefineValue(definition)):
+									match definition.operation:
+										Own.FreeCallableDefinition(_):
+											changed = function.operations.set(index, Own.DefineValue({ definition | value_type = Concrete.CallableType([Concrete.IntType], Concrete.IntType) }))
+											candidate = { program | functions = program.functions.set(position, { function | operations = changed }) }
+											if rejects(candidate, "definition type does not match its operation", definition.span):
+												observed = observed + 1
+										_: void
+								_: void
+			observed == 1
+
+
+
+
+pure func test_unused_list_callable_field_requires_nominal_membership() -> Bool:
+	source: String =
+		|fixed record First { value: Int }
+		|fixed record Second { text: String }
+		|func main() -> Int:
+		|    zero = 0
+		|    left: First = { value = 1 }
+		|    right: Second = { text = "kept" }
+		|    zero
+	match checked_source(source).and_then(Concrete.specialize).and_then(Lower.lower).and_then(Own.own):
+		Err(_): False
+		Ok(program):
+			match program.functions:
+				[main]:
+					var records: List[Concrete.RecordInstanceId] = []
+					for operation in main.operations:
+						match operation:
+							Own.DefineValue(definition):
+								match definition.operation:
+									Own.ConstructRecordDefinition(owner, _): records = records.append(owner)
+									_: void
+							_: void
+					match (records, main.operations.get(0)):
+						([retained, missing], Some(Own.DefineValue(first))):
+							valid_return: Bool = match (first.operation, main.result):
+								(Own.IntegerDefinition(0), Own.UnmanagedReturn(returned)):
+									Lower.value_number(first.id) == 0 and Lower.value_number(returned) == Lower.value_number(first.id)
+								_: False
+							valid_seed = (
+								verify(program).is_ok() and program.records.length() == 2
+								and Concrete.record_number(retained) == 0 and Concrete.record_number(missing) == 1
+								and valid_return
+							)
+							if valid_seed:
+								unused: Concrete.ConcreteRecord = {
+									fields = [Concrete.ListType(Concrete.CallableType([Concrete.RecordType(missing)], Concrete.IntType))],
+									representation = Concrete.ManagedRecord,
+								}
+								-- Remove every executable record use, retaining the genuine Int return.
+								-- Only the unused catalogue field now mentions the removed issued target.
+								catalogue = program.records.take(Concrete.record_number(missing)).set(Concrete.record_number(retained), unused)
+								candidate = { program | records = catalogue, functions = [{ main | operations = [Own.DefineValue(first)] }] }
+								match verify(candidate):
+									Ok(_): False
+									Err(error): (
+										error.message == "internal compiler error: invalid record identity in ownership representation"
+											and error.help == "report this compiler error with the input program"
+											and same_span(error.span, { source = compiler_source(), start = 0, end = 0 })
+											and error.note.is_none()
+										)
+							else:
+								False
+						_: False
+				_: False
+
+
+pure func test_unused_list_callable_signature_may_reference_its_own_record() -> Bool:
+	source: String =
+		|fixed record Node { callbacks: List[pure (Node) -> Node] }
+		|pure func empty() -> Node:
+		|    { callbacks = [] }
+		|func main() -> Int:
+		|    retained = empty()
+		|    0
+	match checked_source(source).and_then(Concrete.specialize).and_then(Lower.lower).and_then(Own.own):
+		Err(_): False
+		Ok(program):
+			match program.records:
+				[layout]:
+					match layout.fields:
+						[Concrete.ListType(Concrete.CallableType([Concrete.RecordType(input)], Concrete.RecordType(output)))]:
+							Concrete.record_number(input) == 0 and Concrete.record_number(output) == Concrete.record_number(input) and verify(program).is_ok()
+						_: False
+				_: False
+
+
+tests: TestSuite = {
+	description = "Blorp 2 stored callable ownership",
+	tests = [
+		("unused List callable field validates nominal signature membership", test_unused_list_callable_field_requires_nominal_membership),
+		("unused List callable signature may reference its own record", test_unused_list_callable_signature_may_reference_its_own_record),
+		("environment transfer and indirect borrow independently verify", test_environment_transfer_and_indirect_borrow_verify_independently),
+		("indirect callee cannot discard its owner-dependent borrow", test_indirect_callee_cannot_discard_its_owner_dependent_borrow),
+		("callable environment cannot lose its transferred owner", test_callable_environment_cannot_lose_its_transferred_owner),
+		("free callable entry cannot publish a different signature", test_free_callable_entry_cannot_publish_a_different_signature),
+	]
+}

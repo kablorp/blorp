@@ -3,7 +3,8 @@ import:
 	int as IntOps
 	../specialize/specialize:
 		RecordInstanceId,
-		TypeRef(VoidType, IntType, FloatType, StringType, ListType, RecordType, UnionType),
+		TypeRef(VoidType, IntType, FloatType, StringType, ListType, CallableType, RecordType, UnionType),
+		same_type,
 		UnionInstanceId,
 		record_number,
 		union_number,
@@ -17,6 +18,7 @@ private fixed union ElementTerminal:
 	StringElement
 	RecordElement(RecordInstanceId)
 	UnionElement(UnionInstanceId)
+	CallableElement(List[TypeRef], TypeRef)
 
 
 private fixed record ElementKey {
@@ -43,6 +45,7 @@ private pure func element_key_at_depth(element: TypeRef, depth: Int) -> ListElem
 		StringType: terminal_key(StringElement, depth)
 		RecordType(id): terminal_key(RecordElement(id), depth)
 		UnionType(id): terminal_key(UnionElement(id), depth)
+		CallableType(parameters, result): terminal_key(CallableElement(parameters, result), depth)
 
 
 pure func list_element_key(element: TypeRef) -> ListElementKey:
@@ -69,6 +72,7 @@ private FLOAT_RANK: Int = 2
 private STRING_RANK: Int = 3
 private RECORD_RANK: Int = 4
 private UNION_RANK: Int = 5
+private CALLABLE_RANK: Int = 6
 private NO_NOMINAL_ORDINAL: Int = 0
 
 
@@ -80,22 +84,35 @@ pure func list_key_rank(key: ListElementKey) -> Int:
 		StringElement: STRING_RANK
 		RecordElement(_): RECORD_RANK
 		UnionElement(_): UNION_RANK
+		CallableElement(_, _): CALLABLE_RANK
+
+
+pure func list_key_is_callable(key: ListElementKey) -> Bool:
+	match from_opaque ListElementKey(key).terminal:
+		CallableElement(_, _): True
+		_: False
 
 
 pure func list_key_ordinal(key: ListElementKey) -> Int:
 	match from_opaque ListElementKey(key).terminal:
 		RecordElement(id): record_number(id)
 		UnionElement(id): union_number(id)
-		VoidElement | IntElement | FloatElement | StringElement: NO_NOMINAL_ORDINAL
+		VoidElement | IntElement | FloatElement | StringElement | CallableElement(_, _): NO_NOMINAL_ORDINAL
 
 
 pure func same_list_key(left: ListElementKey, right: ListElementKey) -> Bool:
+	ordinals: Bool = match from_opaque ListElementKey(left).terminal:
+		CallableElement(parameters, result):
+			match from_opaque ListElementKey(right).terminal:
+				CallableElement(others, other): same_type(CallableType(parameters, result), CallableType(others, other))
+				_: False
+		_: IntOps.equals(list_key_ordinal(left), list_key_ordinal(right))
 	and(
 		and(
 			IntOps.equals(list_key_depth(left), list_key_depth(right)),
 			IntOps.equals(list_key_rank(left), list_key_rank(right)),
 		),
-		IntOps.equals(list_key_ordinal(left), list_key_ordinal(right)),
+		ordinals,
 	)
 
 
@@ -107,7 +124,29 @@ pure func list_suffix(key: ListElementKey) -> String:
 		StringElement: "s"
 		RecordElement(id): "r".append_int(record_number(id))
 		UnionElement(id): "u".append_int(union_number(id))
+		CallableElement(parameters, result): "c".concat(callable_suffix(parameters, result))
 	"".append_int(list_key_depth(key)).concat("_").concat(terminal)
+
+
+-- Serialization happens after typed equality; delimiters retain every kind,
+-- arity, nesting boundary and nominal instance ordinal without a hash identity.
+private pure func type_suffix(value: TypeRef) -> String:
+	match value:
+		VoidType: "v"
+		IntType: "i"
+		FloatType: "f"
+		StringType: "s"
+		ListType(element): "l".concat(type_suffix(element)).concat("e")
+		RecordType(id): "r".append_int(record_number(id)).concat("e")
+		UnionType(id): "u".append_int(union_number(id)).concat("e")
+		CallableType(parameters, result): "c".concat(callable_suffix(parameters, result))
+
+
+pure func callable_suffix(parameters: List[TypeRef], result: TypeRef) -> String:
+	var suffix = "p".append_int(parameters.length()).concat("_")
+	for parameter in parameters:
+		suffix = suffix.concat(type_suffix(parameter)).concat("_")
+	suffix.concat("r_").concat(type_suffix(result)).concat("_e")
 
 
 pure func list_c_type(key: ListElementKey) -> String:

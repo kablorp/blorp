@@ -358,8 +358,37 @@ make -C blorp_2 test             # Run the Blorp TestSuite tests.
 ```
 
 `example` keeps its generated C and executable in `blorp_2/build/` for
-inspection. The tests use temporary directories. `BLORP_CC` selects a C
+inspection. Host suites use temporary directories; the target text gate keeps
+its C and executable in `blorp_2/build/self-hosted-tests/`. `BLORP_CC` selects a C
 compiler executable (default `clang`).
+`make -C blorp_2 test-compiler test-components` runs the complete component
+gate: the temporary existing-compiler host runs the unit/runtime/grammar
+roots, then the Blorp 2 compiler runs the existing text suite through its typed
+`tests()` factory. The old host directory invocation alone omits that factory
+and is not the complete gate. `test-components BLORP2_COMPILER=PATH` uses an
+already-built compiler without selecting a fallback.
+
+The explicit compile-only test entry is:
+
+```sh
+blorp_2/build/compiler --library-root blorp_2/standard_library --test-suite \
+  blorp_2/test/unit/test_utils/test_text.brp blorp_2/build/test_text.c
+```
+
+The root scope's visible pure zero-argument `tests` factory (including an
+explicit import) must return the configured library's `TestSuite`. The
+compiler-owned entry calls the ordinary library runner and returns 0 when
+its actual `TestCounts.failed` is zero, otherwise 1. It follows normal
+checking, specialization, ownership insertion, independent verification and
+emission. This mode neither discovers directories nor links/runs C; the
+component gate links and runs that output with strict memory checking.
+The target `test` module defines `TestCase { name: String, run: () -> Bool }`,
+`TestSuite { description: String, tests: List[TestCase] }` and
+`TestCounts { passed: Int, failed: Int }`. `run_suite_result` prints and returns
+counts; `run_suite` invokes the pure factory and derives the exit status.
+Case callbacks may be impure even though constructing the suite is pure.
+The [existing text suite](test/unit/test_utils/test_text.brp) is the first example.
+
 To run only end-to-end tests, build the pilot and run the suite against it:
 
 ```sh
@@ -385,9 +414,9 @@ the variable: `make -C blorp_2 test-e2e BLORP2_COMPILER=path/to/pilot`
 
 CI's Blorp 2 lanes run on Linux x64 and ARM64 with Clang, Linux x64 with GCC,
 and macOS with Clang. Each waits for the matching existing compiler's build
-and restores that toolchain artifact. It runs unit, runtime and grammar
-suites, then `make -C blorp_2 test-compiler test-e2e`, which uses that host compiler
-to build the pilot once and tests every fixture. Hosted runners do not guarantee
+and restores that temporary TestSuite host artifact. It builds the pilot once
+from the pinned Blorp 2 seed, runs `test-components`, then `test-e2e` against
+that pilot. Hosted runners do not guarantee
 the required retired-instruction counters, so that CI step explicitly sets
 `BLORP_2_INSTRUCTION_CHECK=disabled`. Allocation caps, strict leak reports and
 all native ASan/UBSan cases still run. Failures upload their test logs. Clang
@@ -1077,11 +1106,12 @@ the same line or an indented block (inside brackets, a bracketed block,
 which must end before the bracket closes: a `)` on the block's last line is
 an error, as in the host). A lambda body starts a new statement context, so
 a loop control inside one needs a loop of its own, and by owner decision
-`?=` is rejected anywhere inside one, where the host accepts it. Written
-`pure func` lambdas are accepted as arguments to pure callable parameters. Explicit
-`pure (Int, String) -> Int` function types also parse, including zero parameters,
-trailing commas and nested callback types. Checking accepts pure callable types
-only as function parameters, with ordinary data parameter and result types:
+`?=` is rejected anywhere inside one, where the host accepts it. `pure func` and `func` lambdas carry their declared purity. Function types are
+`pure (Int, String) -> Int` for a pure callable and `(Int, String) -> Int` for
+an impure-capable callable. Both admit zero parameters, trailing commas and
+nested callable parameter/result types. Callables are ordinary values: they may
+be local bindings, record/union fields, List elements, return values and generic
+type arguments.
 
 ```blorp
 pure func identity[T](value: T) -> T:
@@ -1094,23 +1124,31 @@ func main() -> Int:
     apply(17, identity)
 ```
 
-A callback argument is a pure function declared in the current module, an
-imported or module-qualified pure function reference, a `pure func` lambda, or
-unchanged forwarding of a callable parameter. Generic references
-infer fresh type arguments at each use; enclosing generic parameters stay rigid
-when invoking or forwarding a callable parameter. Zero and multiple parameters
-and Void results are supported. Lambda input types must be complete from their
-annotations, the expected callable type or ordinary arguments; a later ordinary
-argument may solve an earlier callback's input. Inline bodies infer their result.
-A block body needs a written return annotation or a complete expected result.
-A written nominal result annotation supplies the context for record literals.
+A callable value may be a declared, imported or module-qualified function
+reference, a lambda, or another callable binding. Generic references infer fresh
+type arguments at each use; enclosing generic parameters stay rigid. A generic
+reference whose types lack concrete evidence still rejects rather than creating
+a runtime generic function. Zero and multiple parameters and Void results are
+supported. A pure callable may satisfy an impure-capable context with the same
+parameter and result types; the reverse is rejected. Purity weakening applies to
+the outer callable only, not arbitrary nested parameter/result types. A pure
+function may create an impure callable but may not invoke one.
 
-Lambdas capture immutable outer data by value, including Strings, Lists and
-records. Repeated reads of one binding share one capture; two alias bindings
-remain separate captures. Nested lambdas may read their parent's or a further
-ancestor's immutable data. Mutable outer bindings and enclosing callable
-parameters cannot be captured. Copy a mutable value into an immutable binding
-to capture its current value. A lambda may mutate its own local variables.
+Lambda input types must be complete from annotations, the expected callable type
+or ordinary arguments; a later ordinary argument may solve an earlier callback's
+input. Inline bodies infer their result when the lambda has a callable context.
+A standalone lambda without a callable context currently needs complete written
+parameter types and a return annotation. A block body needs a written return
+annotation or a complete expected result. A written nominal result annotation
+supplies the context for record literals.
+
+Lambdas capture immutable outer values by value, including Strings, Lists,
+records and callable parameters or locals. Repeated reads of one binding share
+one capture; two alias bindings remain separate captures. Nested lambdas may
+read their parent's or a further ancestor's immutable values. A stored or
+returned callable keeps its capture environment alive independently of the
+creating call. Mutable outer bindings cannot be captured: copy the current value
+into an immutable binding first. A lambda may mutate its own local variables.
 
 ```blorp
 import:
@@ -1123,22 +1161,42 @@ pure func offset(value: Int, amount: Int) -> Int:
     apply(pure func(item: Int) -> Int: IntOps.add(item, amount), value)
 ```
 
-`offset(40, 2)` returns 42. Each lambda has its own purity and loop scope: a
-pure lambda inside an impure function still cannot call an impure function,
-and a loop inside it does not inherit its enclosing function's loop context.
+`offset(40, 2)` returns 42.
 
-Specialization selects ordinary direct calls. Named and noncapturing callbacks
-occupy no runtime data slots; a capturing callback passes one ordinary managed
-environment at its written argument position. Forwarding preserves that same
-environment. Data arguments retain written evaluation order and existing
-data-receiver UFCS works for declared helpers.
-Invoke a callable parameter with `callback(value)`; `value.callback()` and
-`callback.use(value)` are rejected. Callables cannot be stored, returned,
-placed in aggregates, selected at runtime or used as ordinary type arguments;
-nested callable types remain rejected by checking. Named references and lambda
-bodies participate in the generic cycle-growth check even when their callee
-ignores them. Functions with callable parameters cannot use `@tail_recursive`,
-and an annotated function cannot pass itself as a callback.
+```blorp
+fixed record Operation {
+    run: () -> Int
+}
+
+pure func stored(value: Int) -> Operation:
+    { run = func() -> Int: value }
+
+func main() -> Int:
+    operation = stored(42)
+    callback: () -> Int = operation.run
+    callback()
+```
+
+This returns 42. Read a callable field into a local before invoking it:
+`operation.run()` retains its existing UFCS meaning, not field-call precedence.
+Invoke a callable binding with `callback(value)`. An ordinary stored local also
+works as a helper's UFCS receiver: `saved.use(17)` means `use(saved, 17)`, with
+the same outer purity permission and argument order. Statically selected callable
+parameters and bare named references retain their direct-call restrictions;
+`formal.use(17)`, `value.formal()` and `identity.use(17)` remain rejected.
+Each lambda has its own purity and loop scope: a pure lambda inside an impure function still cannot call an impure
+function, and a loop inside it does not inherit the enclosing loop context.
+
+Statically selected callbacks keep the existing ordinary direct-call path:
+named and noncapturing callbacks need no runtime data slot, while a statically
+selected capturing callback passes its managed environment. Stored values use
+their concrete callable signature and keep that environment through ordinary
+copies, returns and aggregate storage. Data arguments retain written evaluation
+order, and data-receiver UFCS still works for declared helpers. Creating a
+function value does not execute its body. Named references and lambda bodies
+still participate in the generic cycle-growth check even when the receiving
+function ignores them. Functions with callable parameters cannot use
+`@tail_recursive`, and an annotated function cannot pass itself as a callback.
 
 A `match` anywhere but a function's tail (bound, nested in an arm
 or branch block, or followed by further lines) is likewise one expression

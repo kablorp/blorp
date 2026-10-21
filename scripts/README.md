@@ -28,10 +28,11 @@ Changes under `blorp_2/` are validated with `make -C blorp_2 test`;
 `scripts/compiler-check` selects nothing for that tree.
 
 CI's Blorp 2 lanes run on Linux x64 and ARM64 with Clang, Linux x64 with GCC,
-and macOS with Clang. Each restores its existing compiler's build artifact and
-runs unit, runtime and grammar suites, then e2e tests
-(`make -C blorp_2 test-compiler test-e2e`), which build the pilot once using
-the restored compiler and run every fixture against it.
+and macOS with Clang. Each restores the temporary existing-compiler TestSuite
+host, builds the pilot once from the pinned Blorp 2 seed, then runs
+`make -C blorp_2 test-components test-e2e`. The component target runs the
+existing host roots and the exact target-owned text factory; a host-only
+directory invocation omits that factory. Every e2e fixture uses the named pilot.
 Hosted runners do not guarantee the required retired-instruction counters,
 so the CI step explicitly sets `BLORP_2_INSTRUCTION_CHECK=disabled`. It skips
 only instruction measurement and limits; allocation caps, strict leak parsing,

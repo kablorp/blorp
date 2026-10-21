@@ -4,8 +4,11 @@ import:
 	../../src/utils/names: NameTable, name_spelling, program_names
 	../../src/utils/source: module_source, root_module_id, same_source
 	../../src/utils/syntax:
+		Purity(Pure, Impure),
+		ParsedBody(ParsedValueBody),
+		ExpressionBase(IntegerExpression),
 		Diagnostic, Span, WrittenName, type_span,
-		TypeSyntax(AtomicType, AppliedType, QualifiedType, PureFunctionType)
+		TypeSyntax(AtomicType, AppliedType, QualifiedType, CallableTypeSyntax)
 	test: TestSuite
 
 
@@ -39,7 +42,7 @@ pure func test_generic_pure_callback_parameter_parses() -> Bool:
 					match (function.parameters, function.return_type):
 						([values, translate], Some(AppliedType(result, [AppliedType(list, [AtomicType(u)], list_span), AtomicType(diagnostic)], result_span))):
 							match (values.type_name, translate.type_name):
-								(AppliedType(input_list, [AtomicType(t)], input_span), PureFunctionType([AtomicType(input)], AppliedType(output_result, [AtomicType(output), AtomicType(error)], output_span), callback_span)):
+								(AppliedType(input_list, [AtomicType(t)], input_span), CallableTypeSyntax(Pure, [AtomicType(input)], AppliedType(output_result, [AtomicType(output), AtomicType(error)], output_span), callback_span)):
 									(
 										named(names, values.name, "values") and named(names, translate.name, "translate")
 										and named(names, input_list, "List") and named(names, t, "T") and named(names, input, "T")
@@ -61,7 +64,7 @@ pure func test_nullary_pure_callback_return_parses() -> Bool:
 			match module_contents(parsed).functions:
 				[function]:
 					match function.return_type:
-						Some(PureFunctionType([], AtomicType(result), span)):
+						Some(CallableTypeSyntax(Pure, [], AtomicType(result), span)):
 							named(module_names(parsed), result, "Int") and located(result.span, 26, 29) and located(span, 15, 29)
 						_: False
 				_: False
@@ -82,7 +85,7 @@ pure func test_nested_pure_callback_types_parse() -> Bool:
 					match function.parameters:
 						[parameter]:
 							match parameter.type_name:
-								PureFunctionType([PureFunctionType([], AtomicType(first), parameter_span)], PureFunctionType([AtomicType(argument)], AtomicType(result), return_span), span):
+								CallableTypeSyntax(Pure, [CallableTypeSyntax(Pure, [], AtomicType(first), parameter_span)], CallableTypeSyntax(Pure, [AtomicType(argument)], AtomicType(result), return_span), span):
 									(
 										named(contents.names, first, "Int") and named(contents.names, argument, "String") and named(contents.names, result, "Int")
 										and located(first.span, 38, 41) and located(argument.span, 52, 58) and located(result.span, 63, 66)
@@ -112,7 +115,7 @@ pure func test_multiline_pure_callback_parameters_parse() -> Bool:
 					match function.parameters:
 						[callback, other]:
 							match (callback.type_name, other.type_name):
-								(PureFunctionType([AtomicType(integer), QualifiedType(box, [AtomicType(string)], box_span)], AppliedType(result, [AtomicType(left), AtomicType(right)], result_span), span), AtomicType(other_type)):
+								(CallableTypeSyntax(Pure, [AtomicType(integer), QualifiedType(box, [AtomicType(string)], box_span)], AppliedType(result, [AtomicType(left), AtomicType(right)], result_span), span), AtomicType(other_type)):
 									(
 										named(names, integer, "Int") and named(names, box.module, "Shared") and named(names, box.name, "Box")
 										and named(names, string, "String") and named(names, result, "Result") and named(names, left, "Int") and named(names, right, "String")
@@ -142,7 +145,7 @@ private pure func rejects(prefix: String, marked: String, suffix: String, messag
 
 
 pure func test_missing_callback_opening_parenthesis() -> Bool:
-	rejects("func use(cb: pure ", "Int", ") -> Int) -> Int:\n\t0\n", "expected '(' after 'pure' in a function type", CALLBACK_HELP)
+	rejects("func use(cb: pure ", "Int", ") -> Int) -> Int:\n\t0\n", "expected '(' at the start of a callable type", CALLBACK_HELP)
 
 
 pure func test_missing_callback_closing_parenthesis() -> Bool:
@@ -165,8 +168,30 @@ pure func test_named_callback_parameters_are_rejected() -> Bool:
 	rejects("func use(cb: pure (value", ":", " Int) -> Int) -> Int:\n\t0\n", "expected ')' after the callback parameter types", CLOSING_HELP)
 
 
-pure func test_bare_impure_callback_type_is_rejected() -> Bool:
-	rejects("func use(cb: ", "(", "Int) -> Int) -> Int:\n\t0\n", "expected a parameter type", IDENTIFIER_HELP)
+pure func test_bare_impure_callback_type_parses() -> Bool:
+	match parse_source("func use(cb: (Int) -> Int) -> Int:\n\t0\n"):
+		Err(_): False
+		Ok(parsed):
+			names = module_names(parsed)
+			match module_contents(parsed).functions:
+				[function]:
+					match (function.purity, function.parameters, function.return_type, function.body):
+						(Impure, [parameter], Some(AtomicType(function_result)), ParsedValueBody(body)):
+							match (parameter.type_name, body.base):
+								(CallableTypeSyntax(Impure, [AtomicType(input)], AtomicType(result), span), IntegerExpression(0)):
+									(
+										named(names, function.function_name, "use") and located(function.function_name.span, 5, 8)
+											and named(names, parameter.name, "cb") and located(parameter.name.span, 9, 11)
+											and named(names, input, "Int") and located(input.span, 14, 17)
+											and named(names, result, "Int") and located(result.span, 22, 25)
+											and named(names, function_result, "Int") and located(function_result.span, 30, 33)
+											and located(span, 13, 25) and located(type_span(parameter.type_name), 13, 25)
+											and located(body.base_span, 36, 37) and located(body.span, 36, 37)
+											and function.type_parameters.is_empty() and function.statements.is_empty() and body.applications.is_empty()
+									)
+								_: False
+						_: False
+				_: False
 
 
 tests: TestSuite = {
@@ -182,6 +207,6 @@ tests: TestSuite = {
 		("missing callback return type", test_missing_callback_return_type),
 		("missing callback parameter comma", test_missing_callback_parameter_comma),
 		("named callback parameters are rejected", test_named_callback_parameters_are_rejected),
-		("bare impure callback type is rejected", test_bare_impure_callback_type_is_rejected),
+		("bare impure callback type parses", test_bare_impure_callback_type_parses),
 	]
 }

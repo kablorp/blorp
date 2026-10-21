@@ -1,5 +1,6 @@
 import:
-	option: is_some
+	option: is_some, to_result
+	result: and_then, map
 	../utils/boolean: not, and
 	../namespace/builtins:
 		DesignatedBoolean,
@@ -30,8 +31,8 @@ import:
 	int as IntOps
 	../runtime/list:
 		ListElementKey, ListUpdate(AppendUpdate, SetUpdate, ConcatUpdate, SuffixUpdate), arguments_runtime,
-		list_c_type, list_child_key, list_element_key, list_key_depth, list_key_ordinal,
-		list_key_rank, list_root_allocation, list_runtime, list_slot_store, list_suffix,
+		callable_suffix, list_c_type, list_child_key, list_element_key, list_key_depth, list_key_ordinal,
+		list_key_rank, list_key_is_callable, list_root_allocation, list_runtime, list_slot_store, list_suffix,
 		list_update_name, list_update_runtime, same_list_key
 	../lower/lower as Lower: ValueId, value_number
 	../check/model: MatchArmId, DecisionNodeId, match_arm_number, decision_node_number, ListLengthTest(ExactLength, MinimumLength)
@@ -44,7 +45,7 @@ import:
 		join_parameter,
 		OwnedValueOperation(
 			ParameterDefinition, VoidDefinition, IntegerDefinition, FloatDefinition,
-			StringDefinition, CallDefinition, ConstructDefinition, ConstructListDefinition,
+			StringDefinition, CallDefinition, InvokeCallableDefinition, FreeCallableDefinition, CapturedCallableDefinition, ConstructDefinition, ConstructListDefinition,
 			PayloadDefinition, ListElementDefinition, ListSuffixDefinition, ConstructRecordDefinition, ReadRecordFieldDefinition,
 		),
 		OwnerId,
@@ -62,7 +63,7 @@ import:
 		FieldInstanceId,
 		RecordInstanceId,
 		RecordRepresentation(InlineRecord, ManagedRecord),
-		TypeRef(VoidType, IntType, FloatType, StringType, ListType, UnionType, RecordType),
+		TypeRef(VoidType, IntType, FloatType, StringType, ListType, CallableType, UnionType, RecordType),
 		UnionInstanceId,
 		UnionRepresentation(InlineUnmanaged, InlineOwningPayload, BoxedRecursive),
 		VariantInstanceId, variant_field_variant, variant_field_number,
@@ -373,6 +374,148 @@ private pure func append_record(
 			Ok(result.concat("};"))
 
 
+-- These names serialize already sealed concrete types. Equality and catalogue
+-- deduplication use TypeRefs, never the generated C spelling.
+private pure func callable_c_type(parameters: List[TypeRef], result: TypeRef) -> String:
+	"struct blorp_c_".concat(callable_suffix(parameters, result))
+
+
+private pure func callable_entry_name(body: Concrete.FunctionInstanceId, value_type: TypeRef) -> String:
+	"blorp_ce_".append_int(function_number(body)).concat("_").concat(list_suffix(list_element_key(value_type)))
+
+
+private pure func callable_types(values: List[TypeRef]) -> List[TypeRef]:
+	var found: List[TypeRef] = []
+	for value in values:
+		match value:
+			ListType(element):
+				for child in callable_types([element]):
+					if found.any(pure func(other): Concrete.same_type(child, other)).not():
+						found = found.append(child)
+			CallableType(parameters, result):
+				if found.any(pure func(other): Concrete.same_type(value, other)).not():
+					found = found.append(value)
+				for child in callable_types(parameters.append(result)):
+					if found.any(pure func(other): Concrete.same_type(child, other)).not():
+						found = found.append(child)
+			_: void
+	found
+
+
+private pure func callable_parameters(parameters: List[TypeRef], unions: List[ConcreteUnion]) -> Result[String, Diagnostic]:
+	var output = "(void* environment"
+	var failure: Option[Diagnostic] = None
+	var ordinal = 0
+	for parameter in parameters:
+		match c_type(parameter, unions, internal_span()):
+			Ok(name): output = output.concat(",").concat(name).concat(" ").concat(c_parameter(ordinal))
+			Err(error):
+				failure = Some(error)
+				break
+		ordinal = IntOps.add(ordinal, 1)
+	match failure:
+		Some(error): Err(error)
+		None: Ok(output.concat(")"))
+
+
+-- Complete every pair before any aggregate or function ABI mentions it. Ops
+-- tags may be incomplete here; their function members follow aggregate bodies.
+private pure func callable_declarations(types: List[TypeRef]) -> String:
+	var fragments: List[String] = []
+	for value in types:
+		match value:
+			CallableType(parameters, result):
+				suffix = callable_suffix(parameters, result)
+				name = callable_c_type(parameters, result)
+				ops_forward = "struct blorp_co_".concat(suffix).concat(";")
+				pair_definition = name.concat("{const struct blorp_co_").concat(suffix).concat("* ops;void* environment;};")
+				retain_declaration = "void blorp_callable_dup_".concat(suffix).concat("(").concat(name).concat(");")
+				drop_declaration = "void blorp_callable_drop_".concat(suffix).concat("(").concat(name).concat(");\n")
+				fragments = fragments.append(ops_forward.concat(pair_definition).concat(retain_declaration).concat(drop_declaration))
+			_: void
+	fragments.join("")
+
+
+private pure func callable_ops(types: List[TypeRef], unions: List[ConcreteUnion]) -> Result[String, Diagnostic]:
+	var fragments: List[String] = []
+	var failure: Option[Diagnostic] = None
+	for value in types:
+		match value:
+			CallableType(parameters, result):
+				signature: Result[String, Diagnostic] = c_type(result, unions, internal_span()).and_then(pure func(returned):
+					callable_parameters(parameters, unions).map(pure func(arguments):
+						suffix = callable_suffix(parameters, result)
+						name = callable_c_type(parameters, result)
+						ops_definition = "struct blorp_co_".concat(suffix).concat("{").concat(returned).concat(" (*invoke)").concat(arguments)
+							.concat(";void (*retain)(void*);void (*drop)(void*);};")
+						retain_definition = "void blorp_callable_dup_".concat(suffix).concat("(").concat(name).concat(" value){value.ops->retain(value.environment);}")
+						drop_definition = "void blorp_callable_drop_".concat(suffix).concat("(").concat(name).concat(" value){value.ops->drop(value.environment);}\n")
+						ops_definition.concat(retain_definition).concat(drop_definition)
+					)
+				)
+				match signature:
+					Ok(text): fragments = fragments.append(text)
+					Err(error): failure = Some(error)
+			_: void
+		if failure.is_some():
+			break
+	match failure:
+		Some(error): Err(error)
+		None: Ok(fragments.join(""))
+
+
+private pure func append_callable_entry(
+	definition: OwnedDefinition, program: OwnershipProgram,
+) -> Result[String, Diagnostic]:
+	selected: Result[Concrete.FunctionInstanceId, Diagnostic] = match definition.operation:
+		FreeCallableDefinition(id): Ok(id)
+		CapturedCallableDefinition(id, _): Ok(id)
+		_: Err(render(definition.span, StatementOnlyValue(definition.id)))
+	body ?= selected
+	function ?= program.functions.get(function_number(body)).to_result(render(definition.span, MissingValueType(definition.id)))
+	match definition.value_type:
+		CallableType(parameters, result):
+			name = callable_entry_name(body, definition.value_type)
+			match c_type(result, program.unions, definition.span):
+				Err(error): Err(error)
+				Ok(returned):
+					match callable_parameters(parameters, program.unions):
+						Err(error): Err(error)
+						Ok(arguments):
+							var invocation = c_name(function_number(body)).concat("(")
+							var retain = "(void)environment;"
+							var drop = retain
+							var prefix = "(void)environment;"
+							match definition.operation:
+								CapturedCallableDefinition(_, _):
+									match function.signature.parameters.get(0):
+										Some(RecordType(owner)):
+											cast = "(".concat(record_c_type(owner)).concat(")environment")
+											invocation = invocation.concat(cast)
+											retain = "blorp_record_dup_".append_int(record_number(owner)).concat("(").concat(cast).concat(");")
+											drop = "blorp_record_drop_".append_int(record_number(owner)).concat("(").concat(cast).concat(");")
+											prefix = ""
+										_: void
+								_: void
+							var separator: Bool = match definition.operation:
+								CapturedCallableDefinition(_, _): True
+								_: False
+							var ordinal = 0
+							for _ in parameters:
+								if separator:
+									invocation = invocation.concat(",")
+								invocation = invocation.concat(c_parameter(ordinal))
+								separator = True
+								ordinal = IntOps.add(ordinal, 1)
+							invoke_adapter = returned.concat(" ").concat(name).concat("_invoke").concat(arguments).concat("{").concat(prefix).concat("return ").concat(invocation).concat(");}")
+							retain_adapter = "void ".concat(name).concat("_retain(void* environment){").concat(retain).concat("}")
+							drop_adapter = "void ".concat(name).concat("_drop(void* environment){").concat(drop).concat("}")
+							ops_type = "const struct blorp_co_".concat(callable_suffix(parameters, result)).concat(" ").concat(name)
+							ops_initializer = ops_type.concat("={").concat(name).concat("_invoke,").concat(name).concat("_retain,").concat(name).concat("_drop};\n")
+							Ok(invoke_adapter.concat(retain_adapter).concat(drop_adapter).concat(ops_initializer))
+		_: Err(render(definition.span, StatementOnlyValue(definition.id)))
+
+
 private pure func c_type(
 	type_ref: TypeRef,
 	unions: List[ConcreteUnion],
@@ -389,6 +532,7 @@ private pure func c_type(
 			Ok("double")
 		StringType:
 			Ok("struct blorp_string*")
+		CallableType(parameters, result): Ok(callable_c_type(parameters, result))
 		ListType(element):
 			Ok(list_c_type(list_element_key(element)))
 		UnionType(id):
@@ -954,6 +1098,25 @@ private pure func append_operation(
 				bytes.length(),
 			)
 			Ok(length.concat(")"))
+		FreeCallableDefinition(body):
+			match c_type(value_type, unions, span):
+				Err(error): Err(error)
+				Ok(name):
+					Ok(output.concat("((").concat(name).concat("){&").concat(callable_entry_name(body, value_type)).concat(",(void*)0})"))
+		CapturedCallableDefinition(body, payload):
+			match c_type(value_type, unions, span):
+				Err(error): Err(error)
+				Ok(name):
+					value = match payload:
+						UnmanagedPayload(stored): stored
+						OwnedPayload(stored, _): stored
+					Ok(output.concat("((").concat(name).concat("){&").concat(callable_entry_name(body, value_type)).concat(",").concat(c_value(value)).concat("})"))
+		InvokeCallableDefinition(callee, arguments):
+			value = c_value(argument_value(callee))
+			var invocation = output.concat(value).concat(".ops->invoke(").concat(value).concat(".environment")
+			for argument in arguments:
+				invocation = invocation.concat(",").concat(c_value(argument_value(argument)))
+			Ok(invocation.concat(")"))
 		CallDefinition(target, arguments):
 			match c_callable(target):
 				None: Err(render(span, StatementOnlyValue(id)))
@@ -1679,6 +1842,11 @@ private pure func append_storage_operation(
 	span: Span,
 ) -> Result[String, Diagnostic]:
 	name_result: Result[Option[String], Diagnostic] = match value_type:
+		CallableType(parameters, result):
+			prefix = match action:
+				DuplicateValue: "blorp_callable_dup_"
+				DestroyValue: "blorp_callable_drop_"
+			Ok(Some(prefix.concat(callable_suffix(parameters, result))))
 		RecordType(id):
 			prefix = match action:
 				DuplicateValue:
@@ -2697,7 +2865,8 @@ private pure func append_block(
 private fixed record ProgramInventory {
 	types: List[TypeRef],
 	runtime_calls: List[RuntimeOperation[VariantInstanceId, TypeRef]],
-	list_updates: List[ListUpdateHelper]
+	list_updates: List[ListUpdateHelper],
+	callable_entries: List[OwnedDefinition]
 }
 
 
@@ -2705,6 +2874,7 @@ private pure func program_inventory(program: OwnershipProgram) -> ProgramInvento
 	var types: List[TypeRef] = []
 	var runtime_calls: List[RuntimeOperation[VariantInstanceId, TypeRef]] = []
 	var list_updates: List[ListUpdateHelper] = []
+	var callable_entries: List[OwnedDefinition] = []
 
 	for layout in program.records:
 		for field in layout.fields:
@@ -2725,6 +2895,23 @@ private pure func program_inventory(program: OwnershipProgram) -> ProgramInvento
 				match operation:
 					DefineValue(definition):
 						types = types.append(definition.value_type)
+						body: Option[Concrete.FunctionInstanceId] = match definition.operation:
+							FreeCallableDefinition(id): Some(id)
+							CapturedCallableDefinition(id, _): Some(id)
+							_: None
+						match body:
+							None: void
+							Some(id):
+								-- These verified definitions are disposable emission entries,
+								-- keyed by their code entry and full concrete signature.
+								duplicate = callable_entries.any(pure func(previous):
+									match previous.operation:
+										FreeCallableDefinition(other): and(IntOps.equals(function_number(id), function_number(other)), Concrete.same_type(definition.value_type, previous.value_type))
+										CapturedCallableDefinition(other, _): and(IntOps.equals(function_number(id), function_number(other)), Concrete.same_type(definition.value_type, previous.value_type))
+										_: False
+								)
+								if duplicate.not():
+									callable_entries = callable_entries.append(definition)
 						match definition.operation:
 							CallDefinition(target, _):
 								match target:
@@ -2748,7 +2935,11 @@ private pure func program_inventory(program: OwnershipProgram) -> ProgramInvento
 					AcquireOwner(_, _, _) | DropOwner(_, _):
 						void
 
-	{ types = types, runtime_calls = runtime_calls, list_updates = list_updates }
+	for value in callable_types(types):
+		match value:
+			CallableType(parameters, result): types = types.concat(parameters).append(result)
+			_: void
+	{ types = types, runtime_calls = runtime_calls, list_updates = list_updates, callable_entries = callable_entries }
 
 
 private pure func list_layouts(inventory: ProgramInventory) -> List[ListLayout]:
@@ -2765,9 +2956,14 @@ private pure func list_layouts(inventory: ProgramInventory) -> List[ListLayout]:
 	var unique: List[ListLayout] = []
 	var previous: Option[ListElementKey] = None
 	for layout in ordered:
-		duplicate = match previous:
-			Some(key): same_list_key(key, layout.key)
-			None: False
+		duplicate = if list_key_is_callable(layout.key):
+			-- Structural signatures share the non-nominal sort ordinal; use the
+			-- complete typed key, including nonadjacent equal signatures.
+			unique.any(pure func(other): same_list_key(other.key, layout.key))
+		else:
+			match previous:
+				Some(key): same_list_key(key, layout.key)
+				None: False
 		if duplicate.not():
 			unique = unique.append(layout)
 			previous = Some(layout.key)
@@ -2954,13 +3150,15 @@ private pure func aggregate_runtime_contents(
 	checked: OwnershipProgram,
 	lists: List[ListLayout],
 	helpers: List[ListUpdateHelper],
+	callables: List[TypeRef],
 ) -> Result[String, Diagnostic]:
 	-- The host copies a `var` list on each append after a `?=` that follows its declaration.
 	-- Both `?=` therefore precede `fragments`; `ready ?=` follows the loops and costs one copy.
 	ordered ?= append_aggregate_definitions(checked.records, checked.unions)
 	completed ?= append_list_runtime("", lists, checked.unions, checked.records)
 	updates ?= append_list_updates("", helpers, checked.unions, checked.records)
-	var fragments: List[String] = [append_list_prototypes("", lists)]
+	ops ?= callable_ops(callables, checked.unions)
+	var fragments: List[String] = [callable_declarations(callables), append_list_prototypes("", lists)]
 	var index: Int = 0
 
 	-- Complete declarations and helper groups end physical C lines so GCC can
@@ -3010,7 +3208,7 @@ private pure func aggregate_runtime_contents(
 	arguments = match checked.entrypoint:
 		WithArguments(_, _): arguments_runtime()
 		NoArguments(_, _): ""
-	fragments = fragments.concat([completed, updates, arguments])
+	fragments = fragments.concat([completed, updates, arguments, ops])
 	Ok(fragments.join(""))
 
 
@@ -3032,7 +3230,7 @@ private pure func has_boxed_union(unions: List[ConcreteUnion]) -> Bool:
 pure func aggregate_runtime(program: VerifiedProgram) -> Result[String, Diagnostic]:
 	checked = verified_contents(program)
 	inventory = program_inventory(checked)
-	aggregate_runtime_contents(checked, list_layouts(inventory), list_update_helpers(inventory))
+	aggregate_runtime_contents(checked, list_layouts(inventory), list_update_helpers(inventory), callable_types(inventory.types))
 
 
 pure func emit(program: VerifiedProgram) -> Result[String, Diagnostic]:
@@ -3041,7 +3239,7 @@ pure func emit(program: VerifiedProgram) -> Result[String, Diagnostic]:
 	inventory = program_inventory(checked)
 	requirements = runtime_requirements(inventory)
 	lists = list_layouts(inventory)
-	aggregates ?= aggregate_runtime_contents(checked, lists, list_update_helpers(inventory))
+	aggregates ?= aggregate_runtime_contents(checked, lists, list_update_helpers(inventory), callable_types(inventory.types))
 
 	-- C is collected as fragments and joined once; appending each one to the
 	-- whole output would copy everything emitted so far at every step. The host
@@ -3126,6 +3324,14 @@ pure func emit(program: VerifiedProgram) -> Result[String, Diagnostic]:
 				fragments = fragments.append(signature.concat(";"))
 
 		index = IntOps.add(index, 1)
+
+	if failure.is_some().not():
+		for entry in inventory.callable_entries:
+			match append_callable_entry(entry, checked):
+				Ok(adapter): fragments = fragments.append(adapter)
+				Err(error):
+					failure = Some(error)
+					break
 
 	if failure.is_some().not():
 		index = 0

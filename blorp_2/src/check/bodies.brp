@@ -56,7 +56,7 @@ import:
 		MatchArmId, DecisionNodeId, match_arm_id, decision_node_id,
 		CheckedStatement(DiscardExpression, InitializeBinding, ReassignBinding, RunWhile, RunFor, BreakSourceLoop, ContinueSourceLoop),
 		CheckedIteration(ListIteration, AscendingIntRange),
-		TypeRef(PureCallableType, VoidType, IntType, ListType, AppliedUnionType, UnionType),
+		TypeRef(CallableType, VoidType, IntType, ListType, AppliedUnionType, UnionType),
 		FunctionSignature,
 		TypeUse,
 		UnionOccurrence,
@@ -73,7 +73,7 @@ import:
 	./declarations: CheckedDeclarations, resolve_type
 	./constructors: VariantContract, find_qualified_variant, find_variant
 	./expressions: check_value, synthesize_value
-	./scope: ScopedValue(DataLocal, CallableLocal), LocalBinding, bind_callable, callable_binding_id, bind_local, binding_site, binding_definition, local_binding_id, lookup_binding
+	./scope: ScopedValue(DataLocal, CallableLocal), LocalBinding, bind_callable, callable_local, callable_parameter_contract, bind_local, binding_site, binding_definition, local_binding_id, lookup_binding
 	../utils/names: same_name
 	../utils/source: compiler_source
 	../utils/ids: OpaqueRow, VariantId, union_number, variant_owner
@@ -479,12 +479,14 @@ private pure func parameter_scope(
 			None: failure = Some(checker_invariant(parameter.name.span, InvalidResolvedParameter(position)))
 			Some(value_type):
 				binding_result = match value_type.value_type:
-					PureCallableType(callable_parameters, result):
-						bind_callable(
+					CallableType(_, _, _):
+						accepted = bind_callable(
 							resolved, context.namespace, context.module,
 							parameter.name, callable_parameter(context.root_function, position),
-							callable_parameters, result, value_type.span,
+							value_type, context.caller.body, binding_id(data_ordinal),
 						)
+						data_ordinal = IntOps.add(data_ordinal, 1)
+						accepted
 					_:
 						definition: BindingDefinition = {
 							origin = ParameterBinding(data_ordinal),
@@ -923,7 +925,10 @@ private pure func resolve_assignment(
 				ImmutableBinding:
 					match lookup_binding(block.scope, written.name.id):
 						None: Ok(None)
-						Some(CallableLocal(binding)): Err(statement_error(written.name.span, CallableAssignment(callable_binding_id(binding))))
+						Some(CallableLocal(binding)):
+							match callable_parameter_contract(binding):
+								Err(error): Err(error)
+								Ok(accepted): Err(statement_error(written.name.span, CallableAssignment(accepted.parameter)))
 						Some(DataLocal(binding)):
 							if same_body(binding_site(binding).binding.owner, context.caller.body).not():
 								Err(statement_error(written.name.span, CapturedAssignment(binding_site(binding).binding)))
@@ -1007,7 +1012,7 @@ private pure func resolve_body(
 			DataLocal(data):
 				definition = binding_definition(data)
 				parameter_bindings = parameter_bindings.append(definition)
-			CallableLocal(_): void
+			CallableLocal(callable): parameter_bindings = parameter_bindings.append(binding_definition(callable_local(callable)))
 	block: ResolvedStatements = {
 		lambdas = lambdas,
 		bindings = parameter_bindings,

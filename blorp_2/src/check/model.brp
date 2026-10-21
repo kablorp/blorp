@@ -24,7 +24,7 @@ import:
 	int as IntOps
 	../namespace/namespace:
 		TypeHead(ListHead, PrimitiveHead, RecordHead, UnionHead, OpaqueHead),
-	../utils/syntax: Entrypoint, FunctionExecution, Purity, Span, WrittenName
+	../utils/syntax: Entrypoint, FunctionExecution, Purity(Pure, Impure), Span, WrittenName, same_purity
 
 
 private fixed record FieldIdentity {
@@ -79,7 +79,7 @@ fixed union TypeRef:
 	AppliedUnionType(UnionId, List[TypeRef])
 	OpaqueType(OpaqueId)
 	ParameterType(TypeParameterId)
-	PureCallableType(List[TypeRef], TypeRef)
+	CallableType(Purity, List[TypeRef], TypeRef)
 
 
 -- A declared variant: its identity, written name and ordered field annotations.
@@ -147,6 +147,7 @@ fixed union CallableChoice:
 	NamedCallable(FunctionId, List[TypeRef])
 	ForwardedCallable(CallableParameterId)
 	LambdaCallable(LambdaId, List[CheckedExpr])
+	StoredCallable(CheckedExpr)
 
 
 fixed union CheckedCallOperand:
@@ -157,11 +158,13 @@ fixed union CheckedCallOperand:
 fixed union CallIdentity:
 	DeclaredTarget(FunctionId)
 	ParameterTarget(CallableParameterId)
+	ValueTarget(ScopedBindingId)
 
 
 fixed union CallTarget:
 	UserFunction(FunctionId, List[TypeRef])
 	CallableParameter(CallableParameterId)
+	ValueCall(CheckedExpr)
 	RuntimeFunction(RuntimeOperation[VariantId, TypeRef])
 
 
@@ -255,6 +258,7 @@ pure func same_scoped_binding(left: ScopedBindingId, right: ScopedBindingId) -> 
 
 fixed union BindingOrigin:
 	ParameterBinding(Int)
+	CallableParameterBinding(CallableParameterId)
 	BodyLocal
 	MatchCapture
 
@@ -300,6 +304,7 @@ fixed record CheckedRecordUpdate {
 
 -- What an expression computes. A payload-free variant has no arguments.
 fixed union CheckedForm:
+	MakeCallable(CallableChoice)
 	LiteralVoid
 	LiteralInteger(Int)
 	LiteralFloat(Float)
@@ -486,6 +491,7 @@ fixed record CheckedCapture {
 
 
 fixed record CheckedLambda {
+	purity: Purity,
 	root: FunctionId,
 	parameters: List[TypeUse],
 	return_type: TypeUse,
@@ -585,7 +591,7 @@ pure func type_head(value_type: TypeRef) -> Option[TypeHead]:
 			Some(UnionHead(id))
 		OpaqueType(id):
 			Some(OpaqueHead(id))
-		ParameterType(_) | PureCallableType(_, _):
+		ParameterType(_) | CallableType(_, _, _):
 			None
 
 
@@ -615,10 +621,10 @@ pure func same_type(left: TypeRef, right: TypeRef) -> Bool:
 						False: False
 				_:
 					False
-		PureCallableType(parameters, result):
+		CallableType(purity, parameters, result):
 			match right:
-				PureCallableType(others, other):
-					match same_types(parameters, others):
+				CallableType(other_purity, others, other):
+					match and(same_purity(purity, other_purity), same_types(parameters, others)):
 						True: same_type(result, other)
 						False: False
 				_: False
@@ -795,14 +801,24 @@ private pure func append_value_calls(
 				calls = append_statement_calls(calls, arm.statements)
 				calls = append_value_calls(calls, arm.value)
 		InvokeFunction(call):
+			match call.target:
+				ValueCall(callee): calls = append_value_calls(calls, callee)
+				UserFunction(_, _) | CallableParameter(_) | RuntimeFunction(_): void
 			for operand in call.operands:
 				match operand:
 					ValueOperand(argument): calls = append_value_calls(calls, argument)
-					CallableOperand(_, _, _): void
+					CallableOperand(_, choice, _):
+						match choice:
+							StoredCallable(child): calls = append_value_calls(calls, child)
+							NamedCallable(_, _) | ForwardedCallable(_) | LambdaCallable(_, _): void
 
 			calls = calls.append(call)
 		ReadRecordField(receiver, _):
 			calls = append_value_calls(calls, receiver)
+		MakeCallable(choice):
+			match choice:
+				StoredCallable(child): calls = append_value_calls(calls, child)
+				NamedCallable(_, _) | ForwardedCallable(_) | LambdaCallable(_, _): void
 		LiteralVoid | LiteralInteger(_) | LiteralFloat(_) | LiteralString(_) | ReadBinding(_) | ReadCapture(_):
 			void
 
@@ -881,6 +897,81 @@ pure func binding_id(ordinal: Int) -> BindingId:
 pure func has_callable_parameters(signature: FunctionSignature) -> Bool:
 	signature.parameters.any(pure func(parameter):
 		match parameter.value_type:
-			PureCallableType(_, _): True
+			CallableType(_, _, _): True
 			_: False
 	)
+
+
+-- Value creation requests a body instance but does not execute it. This walk
+-- follows only evaluated operands; each lambda's body is a separate request.
+private pure func callable_creations(values: List[CheckedExpr]) -> List[CheckedExpr]:
+	var found: List[CheckedExpr] = []
+	for value in values:
+		var children: List[CheckedExpr] = []
+		match value.form:
+			MakeCallable(choice):
+				found = found.append(value)
+				match choice:
+					LambdaCallable(_, captures): children = captures
+					StoredCallable(child): children = [child]
+					NamedCallable(_, _) | ForwardedCallable(_): void
+			InvokeFunction(call):
+				match call.target:
+					ValueCall(callee): children = [callee]
+					UserFunction(_, _) | CallableParameter(_) | RuntimeFunction(_): void
+				for operand in call.operands:
+					match operand:
+						ValueOperand(argument): children = children.append(argument)
+						CallableOperand(_, choice, _):
+							match choice:
+								StoredCallable(child): children = children.append(child)
+								LambdaCallable(_, captures): children = children.concat(captures)
+								NamedCallable(_, _) | ForwardedCallable(_): void
+			ConstructList(elements): children = elements
+			ConstructVariant(_, elements): children = elements
+			ConstructRecord(_, fields): children = fields.map(pure func(field): field.value)
+			UpdateRecord(_, update): children = [update.base].concat(update.replacements.map(pure func(field): field.value))
+			ConstructOpaque(_, child): children = [child]
+			ProjectOpaque(_, child): children = [child]
+			ReadRecordField(child, _): children = [child]
+			Match(join):
+				found = found.concat(callable_creations([join.scrutinee]))
+				for arm in join.arms:
+					found = found.concat(statement_creations(arm.statements)).concat(callable_creations([arm.value]))
+			LiteralVoid | LiteralInteger(_) | LiteralFloat(_) | LiteralString(_) | ReadBinding(_) | ReadCapture(_): void
+		found = found.concat(callable_creations(children))
+	found
+
+
+private pure func statement_creations(statements: List[CheckedStatement]) -> List[CheckedExpr]:
+	var found: List[CheckedExpr] = []
+	for statement in statements:
+		match statement:
+			InitializeBinding(_, value): found = found.concat(callable_creations([value]))
+			ReassignBinding(_, value): found = found.concat(callable_creations([value]))
+			DiscardExpression(value): found = found.concat(callable_creations([value]))
+			RunWhile(loop): found = found.concat(callable_creations([loop.condition])).concat(statement_creations(loop.body))
+			RunFor(loop):
+				match loop.iteration:
+					ListIteration(value, _, _): found = found.concat(callable_creations([value]))
+					AscendingIntRange(start, end, _): found = found.concat(callable_creations([start, end]))
+				found = found.concat(statement_creations(loop.body))
+			BreakSourceLoop(_) | ContinueSourceLoop(_): void
+	found
+
+
+private pure func exit_creations(exit: CheckedExit) -> List[CheckedExpr]:
+	match exit:
+		ReturnExpression(value): callable_creations([value])
+		RecurWith(arguments, _): callable_creations(arguments)
+
+
+pure func body_callable_creations(statements: List[CheckedStatement], body: CheckedBody) -> List[CheckedExpr]:
+	var found = statement_creations(statements)
+	match body:
+		CheckedValueBody(exit): found = found.concat(exit_creations(exit))
+		CheckedMatchBody(matched):
+			found = found.concat(callable_creations([matched.scrutinee]))
+			for arm in matched.arms:
+				found = found.concat(statement_creations(arm.statements)).concat(exit_creations(arm.body))
+	found

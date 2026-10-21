@@ -1,0 +1,209 @@
+import:
+	../../../src/check/model as Checked
+	../../../src/specialize/specialize as Concrete
+	../../../src/utils/syntax: Diagnostic
+	../input: checked_source
+	test: TestSuite
+
+
+private pure func specialized(source: String) -> Result[Concrete.SpecializedContents, Diagnostic]:
+	checked ?= checked_source(source)
+	program ?= Concrete.specialize(checked)
+	Ok(Concrete.specialized_contents(program))
+
+
+private STORAGE: String =
+	|fixed record TestCase { run: pure () -> Int }
+	|pure func answer() -> Int:
+	|    42
+	|pure func main() -> Int:
+	|    test: TestCase = { run = answer }
+	|    callback: pure () -> Int = test.run
+	|    callback()
+
+
+private FORWARDED: String =
+	|pure func saved(callback: () -> Int) -> () -> Int:
+	|    func() -> Int: callback()
+	|pure func answer() -> Int:
+	|    42
+	|func main() -> Int:
+	|    callback: () -> Int = answer
+	|    returned: () -> Int = saved(callback)
+	|    returned()
+
+
+private HIGHER_ORDER: String =
+	|pure func use(callback: pure (Int) -> Int, amount: Int) -> Int:
+	|    callback(amount)
+	|pure func identity(amount: Int) -> Int:
+	|    amount
+	|pure func main() -> Int:
+	|    direct = use(identity, 1)
+	|    invoke: pure (pure (Int) -> Int, Int) -> Int = use
+	|    invoke(identity, direct)
+
+
+pure func test_stored_callable_has_a_structural_type_and_environment_obligation() -> Bool:
+	match specialized(STORAGE):
+		Err(_): False
+		Ok(program):
+			match program.records:
+				[layout]:
+					match (layout.representation, layout.fields):
+						(Concrete.ManagedRecord, [callable]):
+							match callable:
+								Concrete.CallableType([], Concrete.IntType):
+									match Concrete.value_ownership(callable, program.unions, program.records):
+										Ok(Concrete.ManagedCallableEnvironment): True
+										_: False
+								_: False
+						_: False
+				_: False
+
+
+pure func test_returned_closure_captures_a_runtime_callable_as_one_managed_field() -> Bool:
+	match specialized(FORWARDED):
+		Err(_): False
+		Ok(program):
+			match program.records:
+				[layout]:
+					match (layout.representation, layout.fields):
+						(Concrete.ManagedRecord, [Concrete.CallableType([], Concrete.IntType)]):
+							var readers = 0
+							for function in program.functions:
+								match function.body:
+									Concrete.ConcreteValueBody(Concrete.ReturnExpression(value)):
+										match value.form:
+											Concrete.InvokeCallable(callee, []):
+												match callee.form:
+													Concrete.ReadRecordField(_, field):
+														if Concrete.field_number(field) == 0:
+															readers = readers + 1
+													_: void
+											_: void
+									_: void
+							readers == 1
+						_: False
+				_: False
+
+
+pure func test_one_higher_order_declaration_keeps_static_and_runtime_abis_distinct() -> Bool:
+	match specialized(HIGHER_ORDER):
+		Err(_): False
+		Ok(program):
+			var direct = 0
+			var stored = 0
+			for function in program.functions:
+				match function.signature.parameters:
+					[Concrete.IntType]:
+						match function.body:
+							Concrete.ConcreteValueBody(Concrete.ReturnExpression(value)):
+								match value.form:
+									Concrete.InvokeFunction(_, [_]): direct = direct + 1
+									_: void
+							_: void
+					[Concrete.CallableType([Concrete.IntType], Concrete.IntType), Concrete.IntType]:
+						match function.body:
+							Concrete.ConcreteValueBody(Concrete.ReturnExpression(value)):
+								match value.form:
+									Concrete.InvokeCallable(callee, [argument]):
+										match (callee.form, argument.form):
+											(Concrete.ReadBinding(callback), Concrete.ReadBinding(amount)):
+												if Checked.binding_number(callback) == 0 and Checked.binding_number(amount) == 1:
+													stored = stored + 1
+											_: void
+									_: void
+							_: void
+					_: void
+			direct == 1 and stored == 1
+
+
+private pure func returns_its_parameter(function: Concrete.ConcreteFunction, expected: Concrete.TypeRef) -> Bool:
+	match (function.signature.parameters, function.body):
+		([parameter], Concrete.ConcreteValueBody(Concrete.ReturnExpression(value))):
+			match value.form:
+				Concrete.ReadBinding(id):
+					match function.bindings.get(Checked.binding_number(id)):
+						Some(binding):
+							match binding.origin:
+								Checked.ParameterBinding(0):
+									(Concrete.same_type(parameter, expected) and Concrete.same_type(binding.value_type, expected)
+										and Concrete.same_type(function.signature.return_type, expected) and Concrete.same_type(value.value_type, expected))
+								_: False
+						None: False
+				_: False
+		_: False
+
+
+pure func test_annotated_lambda_generic_argument_keeps_one_runtime_value() -> Bool:
+	source: String =
+		|pure func identity[T](value: T) -> T:
+		|    value
+		|func main() -> Int:
+		|    closure = identity(pure func(item: Int) -> Int: item)
+		|    closure(7)
+		|
+	match specialized(source):
+		Err(_): False
+		Ok(program):
+			var actuals = 0
+			for function in program.functions:
+				for statement in function.statements:
+					match statement:
+						Concrete.InitializeBinding(_, value):
+							match value.form:
+								Concrete.InvokeFunction(call, [argument]):
+									match (call.target, argument.form):
+										(Concrete.UserFunction(target), Concrete.FreeCallable(code)):
+											match (program.functions.get(Concrete.function_number(target)), program.functions.get(Concrete.function_number(code))):
+												(Some(identity), Some(lambda)):
+													callable = Concrete.CallableType([Concrete.IntType], Concrete.IntType)
+													if returns_its_parameter(identity, callable) and returns_its_parameter(lambda, Concrete.IntType) and Concrete.same_type(argument.value_type, callable) and Concrete.same_type(value.value_type, callable):
+														actuals = actuals + 1
+												_: void
+										_: void
+								_: void
+						_: void
+			actuals == 1
+
+
+pure func test_annotated_lambda_direct_list_has_a_concrete_callable_element() -> Bool:
+	source: String =
+		|func main() -> Int:
+		|    closures = [pure func(item: Int) -> Int: item]
+		|    0
+		|
+	match specialized(source):
+		Err(_): False
+		Ok(program):
+			var lists = 0
+			for function in program.functions:
+				for statement in function.statements:
+					match statement:
+						Concrete.InitializeBinding(_, value):
+							match (value.value_type, value.form):
+								(Concrete.ListType(Concrete.CallableType([Concrete.IntType], Concrete.IntType)), Concrete.ConstructList([element])):
+									match element.form:
+										Concrete.FreeCallable(code):
+											match program.functions.get(Concrete.function_number(code)):
+												Some(lambda):
+													if returns_its_parameter(lambda, Concrete.IntType) and Concrete.same_type(element.value_type, Concrete.CallableType([Concrete.IntType], Concrete.IntType)):
+														lists = lists + 1
+												None: void
+										_: void
+								_: void
+						_: void
+			lists == 1
+
+
+tests: TestSuite = {
+	description = "Blorp 2 concrete stored callables",
+	tests = [
+		("annotated generic lambda keeps one runtime value", test_annotated_lambda_generic_argument_keeps_one_runtime_value),
+		("annotated direct List lambda has concrete element", test_annotated_lambda_direct_list_has_a_concrete_callable_element),
+		("callable signature seals one environment obligation", test_stored_callable_has_a_structural_type_and_environment_obligation),
+		("returned closure captures a runtime callable parameter", test_returned_closure_captures_a_runtime_callable_as_one_managed_field),
+		("one declaration retains distinct static and runtime callback ABIs", test_one_higher_order_declaration_keeps_static_and_runtime_abis_distinct),
+	]
+}

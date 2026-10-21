@@ -7,7 +7,7 @@ import:
 	../../../src/parse/assemble: ParsedProgram
 	../../../src/utils/ids as Declaration
 	../../../src/utils/source: module_source, root_module_id
-	../../../src/utils/syntax: Diagnostic, DiagnosticNote(PreviousDeclaration), Span, same_span
+	../../../src/utils/syntax: Diagnostic, DiagnosticNote(PreviousDeclaration), Span, same_span, Purity(Pure)
 	../input: setup_diagnostic
 	../module_input: ModuleInput, TEST_BASE, parse_modules_with_base
 	test: TestSuite
@@ -479,17 +479,36 @@ pure func test_annotation_preserves_scalar_constant_value_and_use_span() -> Bool
 				_: False
 
 
-pure func test_local_callable_annotation_rejects_full_type_before_children_and_rhs() -> Bool:
-	prefix = "func main() -> Int:\n    callback: "
-	annotation = "pure (Missing) -> Absent"
-	rejects(parsed(prefix + annotation + " = missing\n    0\n"), prefix.length(), prefix.length() + annotation.length(),
+pure func test_callable_local_annotation_preserves_storage_and_rejects_unknown_child() -> Bool:
+	source =
+		|pure func identity(value: Int) -> Int:
+		|    value
+		|pure func preserve() -> pure (Int) -> Int:
+		|    callback: pure (Int) -> Int = identity
+		|    callback
+		|
+	accepted = match function(source, 1):
+		None: False
+		Some(selected):
+			match (selected.bindings, selected.statements, selected.body):
+				([local], [Model.InitializeBinding(id, initializer)], Model.CheckedValueBody(Model.ReturnExpression(result))):
+					match (local.value_type, initializer.form):
+						(Model.CallableType(Pure, [Model.IntType], Model.IntType), Model.MakeCallable(Model.NamedCallable(target, []))):
+							(Declaration.function_number(target) == 0 and Model.binding_number(id) == 0 and reads(result, 0)
+								and Model.same_type(initializer.value_type, local.value_type)
+								and Model.same_type(selected.signature.return_type.value_type, local.value_type))
+						_: False
+				_: False
+	-- Keep the original source's unknown child and invalid initializer, checking
+	-- that supported callable placement does not defer the annotation error.
+	prefix = "func main() -> Int:\n    callback: pure ("
+	accepted and rejects(parsed(prefix + "Missing) -> Absent = missing\n    0\n"), prefix.length(), prefix.length() + 7,
 		(pure func(kind):
 			match kind:
-				Errors.UnsupportedSyntax(Errors.FunctionType): True
+				Errors.TypeTermRejection(Errors.UnknownType(_)): True
 				_: False
 		),
-		"callable types are only supported as function parameters",
-		"write pure function types only on function parameters; use ordinary data types inside them", None)
+		"unknown type", "declare or import this type; builtin types and declared type parameters are also available", None)
 
 
 pure func test_callable_parameter_assignment_precedes_invalid_rhs() -> Bool:
@@ -531,7 +550,7 @@ tests: TestSuite = {
 		("annotated match preserves M2 carried binding", test_annotated_match_preserves_m2_carried_binding),
 		("annotation preserves opaque construction identity", test_annotation_preserves_opaque_construction_identity),
 		("annotation preserves scalar constant value and use span", test_annotation_preserves_scalar_constant_value_and_use_span),
-		("local callable annotation rejects full type before children and RHS", test_local_callable_annotation_rejects_full_type_before_children_and_rhs),
+		("callable local annotation preserves storage and rejects unknown child", test_callable_local_annotation_preserves_storage_and_rejects_unknown_child),
 		("callable parameter assignment precedes invalid RHS", test_callable_parameter_assignment_precedes_invalid_rhs),
 	]
 }

@@ -1,6 +1,6 @@
 import:
-	./errors: BindingSite, CheckError, BindingError(ModuleBindingConflict, LocalBindingConflict, CallableBindingConflict), binding_error
-	./model: BindingDefinition, BindingId, BodyOwner, ScopedBindingId, CallableParameterId, TypeRef, TypeUse
+	./errors: BindingSite, CheckError, BindingError(ModuleBindingConflict, LocalBindingConflict, CallableBindingConflict), binding_error, CheckerInvariant(InvalidFunctionContract), checker_invariant
+	./model: BindingDefinition, BindingId, BodyOwner, ScopedBindingId, CallableParameterId, FunctionSignature, TypeRef(CallableType), TypeUse, BindingOrigin(CallableParameterBinding), BindingMutability(Immutable)
 	../namespace/namespace: Namespace, value_binding
 	../utils/names: NameId, same_name
 	../utils/source: ModuleId
@@ -29,7 +29,7 @@ pure func lookup_binding(scope: List[ScopedValue], name: NameId) -> Option[Scope
 	for binding in scope:
 		binding_name = match binding:
 			DataLocal(data): from_opaque LocalBinding(data).name
-			CallableLocal(callable): callable_binding_name(callable).id
+			CallableLocal(callable): binding_site(callable_local(callable)).name
 		if same_name(binding_name, name):
 			found = Some(binding)
 			break
@@ -67,9 +67,7 @@ pure func bind_local(
 						binding_site(previous), binding_definition(previous).origin,
 					)))
 				Some(CallableLocal(previous)):
-					Err(binding_error(name.span, CallableBindingConflict(
-						callable_binding_id(previous), callable_binding_name(previous).span,
-					)))
+					Err(callable_conflict(name.span, previous))
 				None:
 					Ok(DataLocal(into_opaque LocalBinding({
 						name = name.id,
@@ -84,9 +82,9 @@ pure func bind_callable(
 	module: ModuleId,
 	name: WrittenName,
 	id: CallableParameterId,
-	parameters: List[TypeRef],
-	result: TypeRef,
-	annotation: Span,
+	value_type: TypeUse,
+	owner: BodyOwner,
+	binding: BindingId,
 ) -> Result[ScopedValue, CheckError]:
 	match value_binding(namespace, module, name.id):
 		Some(previous): Err(binding_error(name.span, ModuleBindingConflict(previous)))
@@ -97,38 +95,60 @@ pure func bind_callable(
 						binding_site(previous), binding_definition(previous).origin,
 					)))
 				Some(CallableLocal(previous)):
-					Err(binding_error(name.span, CallableBindingConflict(
-						callable_binding_id(previous), callable_binding_name(previous).span,
-					)))
+					Err(callable_conflict(name.span, previous))
 				None:
-					Ok(CallableLocal(into_opaque CallableBinding({
-						name = name,
-						id = id,
-						parameters = parameters.map(pure func(value): { value_type = value, span = annotation }),
-						return_type = { value_type = result, span = annotation }
-					})))
+					match value_type.value_type:
+						CallableType(_, _, _):
+							Ok(CallableLocal(into_opaque CallableBinding({
+								local = into_opaque LocalBinding({
+									name = name.id,
+									id = { owner = owner, binding = binding },
+									definition = {
+										origin = CallableParameterBinding(id), mutability = Immutable,
+										value_type = value_type.value_type, span = name.span,
+									}
+								}),
+								annotation = value_type.span
+							})))
+						_: Err(checker_invariant(value_type.span, InvalidFunctionContract))
 
 
 private fixed record ScopedCallable {
-	name: WrittenName,
-	id: CallableParameterId,
-	parameters: List[TypeUse],
-	return_type: TypeUse
+	local: LocalBinding,
+	annotation: Span
 }
 opaque type CallableBinding = ScopedCallable
 
 
-pure func callable_binding_id(binding: CallableBinding) -> CallableParameterId:
-	from_opaque CallableBinding(binding).id
+fixed record CallableParameterContract {
+	parameter: CallableParameterId,
+	signature: FunctionSignature
+}
 
 
-pure func callable_binding_name(binding: CallableBinding) -> WrittenName:
-	from_opaque CallableBinding(binding).name
+-- A transient projection of the canonical local definition, not a second
+-- stored signature or identity. Annotation spans remain declaration-owned.
+pure func callable_parameter_contract(binding: CallableBinding) -> Result[CallableParameterContract, CheckError]:
+	accepted = from_opaque CallableBinding(binding)
+	definition = binding_definition(accepted.local)
+	match definition.origin:
+		CallableParameterBinding(parameter):
+			match definition.value_type:
+				CallableType(purity, parameters, result):
+					Ok({ parameter = parameter, signature = {
+						type_parameters = [], purity = purity,
+						parameters = parameters.map(pure func(value) -> TypeUse: { value_type = value, span = accepted.annotation }),
+						return_type = { value_type = result, span = accepted.annotation },
+					} })
+				_: Err(checker_invariant(definition.span, InvalidFunctionContract))
+		_: Err(checker_invariant(definition.span, InvalidFunctionContract))
 
 
-pure func callable_parameters(binding: CallableBinding) -> List[TypeUse]:
-	from_opaque CallableBinding(binding).parameters
+pure func callable_local(binding: CallableBinding) -> LocalBinding:
+	from_opaque CallableBinding(binding).local
 
 
-pure func callable_return_type(binding: CallableBinding) -> TypeUse:
-	from_opaque CallableBinding(binding).return_type
+private pure func callable_conflict(span: Span, previous: CallableBinding) -> CheckError:
+	match callable_parameter_contract(previous):
+		Err(error): error
+		Ok(accepted): binding_error(span, CallableBindingConflict(accepted.parameter, binding_site(callable_local(previous)).span))

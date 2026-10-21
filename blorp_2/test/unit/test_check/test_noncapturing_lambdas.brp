@@ -4,7 +4,7 @@ import:
 	../../../src/utils/ids as Declaration
 	../../../src/check/render: render_check_error, render_failure
 	../../../src/utils/source: module_source, root_module_id, same_source, source_module, module_number
-	../../../src/utils/syntax: Diagnostic, entry_function, same_span
+	../../../src/utils/syntax: Diagnostic, entry_function, same_span, Purity(Pure)
 	../input: check, singleton_check_error
 	../module_input: parse_modules, INTEGER_OPERATIONS
 	test: TestSuite
@@ -160,11 +160,11 @@ pure func test_impure_named_callback_still_rejects() -> Bool:
 	)
 
 
-pure func test_callable_return_placement_precedes_unknown_child_lookup() -> Bool:
+pure func test_callable_return_resolves_unknown_child_before_body() -> Bool:
 	rejects(
-		APPLY + "func make() -> ", "pure (Missing) -> Absent", ":\n    0\nfunc main() -> Int:\n    0\n",
-		"callable types are only supported as function parameters",
-		"write pure function types only on function parameters; use ordinary data types inside them",
+		APPLY + "func make() -> pure (", "Missing", ") -> Absent:\n    0\nfunc main() -> Int:\n    0\n",
+		"unknown type",
+		"declare or import this type; builtin types and declared type parameters are also available",
 	)
 
 
@@ -291,15 +291,36 @@ pure func test_mutable_outer_read_is_rejected() -> Bool:
 	)
 
 
-pure func test_outer_callable_use_is_rejected() -> Bool:
+pure func test_outer_callable_use_preserves_the_issued_capture() -> Bool:
 	declarations: String =
 		|pure func route(callback: pure (Int) -> Int, value: Int) -> Int:
 		|
-	rejects(
-		APPLY + declarations + "    apply(pure func(item: Int) -> Int: ",
-		"callback", "(item), value)\nfunc main() -> Int:\n    0\n",
-		"lambda cannot capture a callable parameter", "pass the data and callback explicitly to a declared helper",
-	)
+	source = APPLY + declarations + "    apply(pure func(item: Int) -> Int: callback(item), value)\nfunc main() -> Int:\n    0\n"
+	match parse_modules([{ source = source, targets = [1] }, { source = INTEGER_OPERATIONS, targets = [] }]):
+		Err(_): False
+		Ok(parsed):
+			match check(parsed):
+				Err(_): False
+				Ok(program):
+					match checked_functions(program).lambdas:
+						[row]:
+							match (row.captures, row.body):
+								([capture], Checked.CheckedValueBody(Checked.ReturnExpression(value))):
+									match value.form:
+										Checked.InvokeFunction(call):
+											match (call.target, call.operands, capture.value_type.value_type):
+												(Checked.ValueCall(callee), [Checked.ValueOperand(argument)], Checked.CallableType(Pure, [Checked.IntType], Checked.IntType)):
+													match (callee.form, argument.form):
+														(Checked.ReadCapture(id), Checked.ReadBinding(input)):
+															(Checked.capture_number(id) == 0 and Checked.lambda_number(Checked.capture_owner(id)) == 0
+																and Checked.binding_number(input) == 0 and Checked.binding_number(capture.binding.binding) == 0
+																and Checked.same_body(capture.binding.owner, Checked.DeclaredBody(row.root))
+																and Checked.same_type(callee.value_type, capture.value_type.value_type))
+														_: False
+												_: False
+										_: False
+								_: False
+						_: False
 
 
 pure func test_deferred_nested_and_sibling_sites_keep_reserved_ids() -> Bool:
@@ -571,7 +592,7 @@ pure func test_result_rhs_and_suffix_keep_distinct_root_owned_lambda_rows() -> B
 
 
 tests: TestSuite = {
-	description = "Noncapturing pure callbacks use ordinary generic calls",
+	description = "Lambda scopes, callable captures and generic calls",
 	tests = [
 		("loop boundaries retain lambda IDs and lambda-local scope", test_loop_boundaries_preserve_lambda_rows_and_local_loop_scope),
 		("lambda completion restores the enclosing loop scope", test_lambda_completion_restores_the_parent_loop_scope),
@@ -582,8 +603,8 @@ tests: TestSuite = {
 		("caller Bool annotation solves generic block result", test_complete_caller_bool_context_admits_block),
 		("complete callable Bool result admits a block", test_complete_callback_bool_context_admits_block),
 		("nested completion preserves reserved sibling lambda IDs", test_deferred_nested_and_sibling_sites_keep_reserved_ids),
-		("noncapture rejects an enclosing callable parameter", test_outer_callable_use_is_rejected),
-		("noncapture rejects a mutable outer read", test_mutable_outer_read_is_rejected),
+		("lambda captures an enclosing callable parameter by issued ID", test_outer_callable_use_preserves_the_issued_capture),
+		("lambda rejects a mutable outer read", test_mutable_outer_read_is_rejected),
 		("immutable outer read is captured by value", test_immutable_outer_read_is_accepted),
 		("block lambda rejects partial Result context", test_block_lambda_needs_complete_result_result),
 		("block lambda rejects partial Option result context", test_block_lambda_needs_complete_option_result),
@@ -600,7 +621,7 @@ tests: TestSuite = {
 		("pure lambda in impure root rejects an impure call", test_pure_lambda_in_impure_root_rejects_an_impure_call),
 		("outer mutable assignment is a capture before its RHS", test_outer_mutable_assignment_is_a_capture_before_its_rhs),
 		("impure named callback still rejects", test_impure_named_callback_still_rejects),
-		("callable return placement precedes unknown child lookup", test_callable_return_placement_precedes_unknown_child_lookup),
+		("callable return resolves unknown child before body", test_callable_return_resolves_unknown_child_before_body),
 		("explicit nominal lambda result supplies record context", test_explicit_nominal_lambda_result_supplies_record_context),
 	]
 }

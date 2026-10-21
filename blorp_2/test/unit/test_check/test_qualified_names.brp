@@ -1,6 +1,9 @@
 import:
-	../../../src/utils/ids: function_number, record_number, union_number, variant_owner
-	../../../src/utils/syntax: entry_function
+	../../../src/utils/ids: function_number, inventory_functions, record_number, union_number, variant_owner
+	../../../src/utils/syntax: entry_function, Purity(Pure)
+	../../../src/parse/assemble: parsed_contents
+	../../../src/utils/names: name_spelling
+	../../../src/utils/source: module_source, root_module_id, same_source
 	../../../src/check/check: checked_functions, check_errors
 	../../../src/check/errors as Errors
 	../../../src/check/model as Checked
@@ -241,15 +244,34 @@ pure func test_bare_alias_in_value_position_is_rejected() -> Bool:
 	)
 
 
-pure func test_qualified_function_without_a_call_is_rejected() -> Bool:
-	rejects(
-		"import:\n    ./helper as H\nfunc main() -> Int:\n    value = ", "H.answer", "\n    0\n",
-		"H.answer names a function", "call this function or pass it directly to a pure callable parameter",
-		pure func(kind):
-			match kind:
-				Errors.QualifiedRejection(Errors.QualifiedFunctionNotCalled(_, _)): True
-				_: False
-	)
+pure func test_qualified_function_reference_keeps_its_issued_target() -> Bool:
+	prefix = "import:\n    ./helper as H\nfunc main() -> Int:\n    value = "
+	reference = "H.answer"
+	match parse_modules([{ source = prefix + reference + "\n    0\n", targets = [1] }, { source = HELPER, targets = [] }]):
+		Err(_): False
+		Ok(parsed):
+			match check(parsed):
+				Err(_): False
+				Ok(program):
+					facts = checked_functions(program)
+					match facts.functions.get(function_number(entry_function(facts.entrypoint))):
+						None: False
+						Some(main):
+							match (main.bindings, main.statements, main.body):
+								([local], [Checked.InitializeBinding(id, value)], Checked.CheckedValueBody(Checked.ReturnExpression(result))):
+									match (local.value_type, value.form, result.form):
+										(Checked.CallableType(Pure, [], Checked.IntType), Checked.MakeCallable(Checked.NamedCallable(target, [])), Checked.LiteralInteger(0)):
+											match inventory_functions(parsed_contents(parsed).declarations).get(function_number(target)):
+												None: False
+												Some(issued):
+													(Checked.binding_number(id) == 0
+														and Checked.same_type(local.value_type, value.value_type)
+														and function_number(target) == function_number(issued.id)
+														and name_spelling(parsed_contents(parsed).names, issued.declaration.function_name.id).get_or("") == "answer"
+														and same_source(value.span.source, module_source(root_module_id()))
+														and value.span.start == prefix.length() and value.span.end == prefix.length() + reference.length())
+										_: False
+								_: False
 
 
 pure func test_type_selection_binds_public_methods_only() -> Bool:
@@ -301,7 +323,7 @@ tests: TestSuite = {
 		("qualifying a private type is rejected", test_qualifying_a_private_type_is_rejected),
 		("unknown qualified name names the alias and module", test_unknown_qualified_name_names_the_alias_and_module),
 		("bare alias in value position is rejected", test_bare_alias_in_value_position_is_rejected),
-		("qualified function without a call is rejected", test_qualified_function_without_a_call_is_rejected),
+		("qualified function reference keeps its issued target", test_qualified_function_reference_keeps_its_issued_target),
 		("unknown alias in a type is rejected", test_unknown_alias_in_a_type_is_rejected),
 		("type selection binds public methods only", test_type_selection_binds_public_methods_only),
 	]

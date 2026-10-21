@@ -1,0 +1,154 @@
+import:
+	../../../src/lower/lower as Lower
+	../../../src/specialize/specialize as Concrete
+	../../../src/utils/syntax: Diagnostic, entry_function, same_span
+	../../../src/utils/source: module_source, root_module_id
+	../input: checked_source
+	test: TestSuite
+
+
+private pure func lowered(source: String) -> Result[Lower.LoweredFunctions, Diagnostic]:
+	checked ?= checked_source(source)
+	concrete ?= Concrete.specialize(checked)
+	program ?= Lower.lower(concrete)
+	Ok(Lower.lowered_functions(program))
+
+
+private pure func same_value(left: Lower.ValueId, right: Lower.ValueId) -> Bool:
+	Lower.value_number(left) == Lower.value_number(right)
+
+
+private pure func definitions(function: Lower.LoweredFunction) -> List[Lower.ValueDefinition]:
+	function.steps.filter_map(pure func(step):
+		match step:
+			Lower.Define(value): Some(value)
+			_: None
+	)
+
+
+private pure func indirect_reads_callee_before_argument(function: Lower.LoweredFunction) -> Bool:
+	values = definitions(function)
+	var matched = 0
+	for position in 0..values.length():
+		match values.get(position):
+			Some(value):
+				match (value.operation, Lower.value_reads(value.operation)):
+					(Lower.InvokeCallableValue(callee, [argument]), [first, second]):
+						prior = values.take(position)
+						if (same_value(first, callee) and same_value(second, argument)
+							and prior.any(pure func(parent): same_value(parent.id, callee))
+							and prior.any(pure func(parent): same_value(parent.id, argument))):
+							matched = matched + 1
+					_: void
+			None: void
+	matched == 1
+
+
+pure func test_receiver_producer_precedes_argument_and_retains_formal_zero() -> Bool:
+	source: String =
+		|pure func identity(value: Int) -> Int:
+		|    value
+		|pure func make() -> pure (Int) -> Int:
+		|    identity
+		|func argument() -> Int:
+		|    17
+		|pure func use(callback: pure (Int) -> Int, value: Int) -> Int:
+		|    callback(value)
+		|func main() -> Int:
+		|    make().use(argument())
+		|
+	match lowered(source):
+		Err(_): False
+		Ok(program):
+			match program.functions.get(Concrete.function_number(entry_function(program.entrypoint))):
+				None: False
+				Some(main):
+					calls = definitions(main).filter(pure func(value):
+						match value.operation:
+							Lower.CallValue(_, _): True
+							_: False
+					)
+					match calls:
+						[receiver, argument, invocation]:
+							match (receiver.operation, argument.operation, invocation.operation):
+								(Lower.CallValue(Concrete.UserFunction(make_id), []), Lower.CallValue(Concrete.UserFunction(argument_id), []), Lower.CallValue(Concrete.UserFunction(use_id), [first, second])):
+									match (program.functions.get(Concrete.function_number(make_id)), program.functions.get(Concrete.function_number(argument_id)), program.functions.get(Concrete.function_number(use_id))):
+										(Some(make), Some(producer), Some(use)):
+											match (make.signature.parameters, producer.signature.parameters, use.signature.parameters):
+												([], [], [Concrete.CallableType([Concrete.IntType], Concrete.IntType), Concrete.IntType]):
+													start = source.index_of("make().use(argument())").get_or(-1)
+													(
+														same_value(first, receiver.id) and same_value(second, argument.id)
+															and same_value(main.result, invocation.id) and indirect_reads_callee_before_argument(use)
+															and Concrete.same_type(receiver.value_type, make.signature.return_type)
+															and Concrete.same_type(make.signature.return_type, Concrete.CallableType([Concrete.IntType], Concrete.IntType))
+															and Concrete.same_type(producer.signature.return_type, Concrete.IntType)
+															and Concrete.same_type(use.signature.return_type, Concrete.IntType)
+															and same_span(receiver.span, { source = module_source(root_module_id()), start = start, end = start + 4 })
+															and same_span(invocation.span, { source = module_source(root_module_id()), start = start + 7, end = start + 10 })
+															and same_span(argument.span, { source = module_source(root_module_id()), start = start + 11, end = start + 19 })
+													)
+												_: False
+										_: False
+								_: False
+						_: False
+
+
+pure func test_callable_creation_and_invocation_publish_exact_value_reads() -> Bool:
+	source: String =
+		|pure func saved(callback: () -> Int) -> () -> Int:
+		|    func() -> Int: callback()
+		|pure func answer() -> Int:
+		|    42
+		|func main() -> Int:
+		|    callback: () -> Int = answer
+		|    returned: () -> Int = saved(callback)
+		|    returned()
+		|
+	match lowered(source):
+		Err(_): False
+		Ok(program):
+			var free = 0
+			var captured = 0
+			var invoked = 0
+			var valid = True
+			for function in program.functions:
+				values = definitions(function)
+				for position in 0..values.length():
+					match values.get(position):
+						None: valid = False
+						Some(value):
+							match value.operation:
+								Lower.FreeCallableValue(code):
+									free = free + 1
+									match (program.functions.get(Concrete.function_number(code)), Lower.value_reads(value.operation)):
+										(Some(entry), []):
+											valid = valid and Concrete.same_type(value.value_type, Concrete.CallableType(entry.signature.parameters, entry.signature.return_type))
+										_: valid = False
+								Lower.CapturedCallableValue(code, environment):
+									captured = captured + 1
+									parent = values.take(position).find(pure func(candidate): same_value(candidate.id, environment))
+									match (program.functions.get(Concrete.function_number(code)), parent, Lower.value_reads(value.operation)):
+										(Some(entry), Some(environment_definition), [read]):
+											match (entry.signature.parameters, environment_definition.operation, value.value_type):
+												([Concrete.RecordType(owner)], Lower.ConstructRecordValue(actual, [_]), Concrete.CallableType([], Concrete.IntType)):
+													valid = valid and same_value(read, environment) and Concrete.record_number(owner) == Concrete.record_number(actual) and Concrete.same_type(entry.signature.return_type, Concrete.IntType)
+												_: valid = False
+										_: valid = False
+								Lower.InvokeCallableValue(callee, arguments):
+									invoked = invoked + 1
+									parent = values.take(position).find(pure func(candidate): same_value(candidate.id, callee))
+									match (parent, Lower.value_reads(value.operation), arguments):
+										(Some(_), [read], []): valid = valid and same_value(read, callee)
+										_: valid = False
+								_: void
+			valid and free == 1 and captured == 1 and invoked == 2
+
+
+tests: TestSuite = {
+	description = "Stored callable lowering preserves ordered values and read sets",
+	tests = [
+		("receiver producer precedes argument and retains formal zero", test_receiver_producer_precedes_argument_and_retains_formal_zero),
+		("callable creation and invocation publish exact value reads", test_callable_creation_and_invocation_publish_exact_value_reads),
+	]
+}

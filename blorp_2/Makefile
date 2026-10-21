@@ -12,7 +12,7 @@ BLORP2_COMPILER_C := blorp_2/build/compiler.c
 TEST_COMPILER_FLAGS := -O0
 TEST_COMPILER_LIBRARIES := -lm -lpthread
 
-.PHONY: compiler generate-compiler link-compiler example test test-compiler link-test-compiler test-e2e host-check
+.PHONY: compiler generate-compiler link-compiler example test test-components test-compiler link-test-compiler test-e2e host-check
 
 compiler: generate-compiler
 	@$(MAKE) --no-print-directory link-compiler
@@ -38,9 +38,21 @@ example: compiler
 	@build/return_zero
 
 test: host-check
-	@cd .. && bin/blorp test --suite --timeout 180 blorp_2/test/unit blorp_2/test/runtime blorp_2/test/test_grammar
 	@$(MAKE) --no-print-directory test-compiler
+	@$(MAKE) --no-print-directory test-components
 	@$(MAKE) --no-print-directory test-e2e
+
+# The text factory is target-owned; host discovery retains all other suites.
+# Callers build once or supply the exact compiler under test, as with test-e2e.
+test-components: host-check
+	@cd .. && bin/blorp test --suite --timeout 180 blorp_2/test/unit blorp_2/test/runtime blorp_2/test/test_grammar
+	@mkdir -p build/self-hosted-tests
+	@cd .. && "$(BLORP2_COMPILER)" --library-root blorp_2/standard_library --test-suite \
+		blorp_2/test/unit/test_utils/test_text.brp blorp_2/build/self-hosted-tests/text.c
+	@"$(BLORP_CC)" -std=c11 -Wall -Wextra -Werror -pedantic -O0 \
+		-DBLORP_MEMORY_DIAGNOSTICS=1 build/self-hosted-tests/text.c \
+		-o build/self-hosted-tests/text $(TEST_COMPILER_LIBRARIES)
+	@BLORP_LEAK_CHECK=strict build/self-hosted-tests/text
 
 # Each e2e run builds once and passes its binary to its fixture groups.
 test-compiler: generate-compiler

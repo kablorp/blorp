@@ -5,7 +5,7 @@ import:
 	../utils/names: NameId, NameTable, name_spelling
 	option: to_result, is_none, get_or
 	../parse/assemble:
-		ParsedAssembly, ParsedProgram, SealFailure(MalformedBundle, ImportCycle), append_module, assembly_names, begin_program, seal_program
+		ParsedAssembly, ParsedProgram, SealFailure(MalformedBundle, ImportCycle), append_module, assembly_names, begin_program, prepare_test_entry, seal_program
 	../parse/parse:
 		ParsedModule, ParsedImport, ImportOrigin(RelativeImport, LibraryImport), module_imports, module_names, parse_module
 	path as Path
@@ -293,6 +293,28 @@ private func load_queue(state: LoadState) -> Result[LoadState, LoadFailure]:
 				Err(error): Err(error)
 
 
+private fixed union LoadMode:
+	ApplicationInput
+	TestSuiteInput
+
+
+-- Queue the exact configured-library path after ordinary loading, so existing
+-- source IDs never move. A local file or alias spelling cannot supply this role.
+private func load_test_entry(state: LoadState) -> Result[LoadState, LoadFailure]:
+	path = Path.join(from_opaque LibraryLayout(state.layout).root, "test.brp")
+	known = known_module(state.requests, path)
+	id: ModuleId ?= match known:
+		Some(request): Ok(request.id)
+		None: module_id(state.requests.length()).to_result(failure(state.modules, internal_error("test library module identity exceeds the source inventory")))
+	pending: LoadState = match known:
+		Some(_): state
+		None: { state | requests = state.requests.append(designated(id, path, LibraryModule)) }
+	loaded ?= load_queue(pending)
+	match prepare_test_entry(loaded.assembly, id, foundation_types_module_id()):
+		Err(error): Err(failure(loaded.modules, error))
+		Ok(assembly): Ok({ loaded | assembly = assembly })
+
+
 private IMPORT_CYCLE_HELP: String = "move the declarations both modules need into a third module that both import"
 
 
@@ -321,6 +343,14 @@ pure func working_directory_result(result: Result[String, String]) -> Result[Str
 
 -- Every queued path has one identity, role, read, and parse in this invocation.
 func load_program(root_path: String, library_root: String) -> Result[LoadedProgram, LoadFailure]:
+	load_input(root_path, library_root, ApplicationInput)
+
+
+func load_test_program(root_path: String, library_root: String) -> Result[LoadedProgram, LoadFailure]:
+	load_input(root_path, library_root, TestSuiteInput)
+
+
+private func load_input(root_path: String, library_root: String, mode: LoadMode) -> Result[LoadedProgram, LoadFailure]:
 	working_directory ?= working_directory_result(get_current_directory())
 	layout = library_layout(Path.join(working_directory, library_root))
 	foundation = from_opaque LibraryLayout(layout)
@@ -334,7 +364,7 @@ func load_program(root_path: String, library_root: String) -> Result[LoadedProgr
 			))
 		LibraryModule | UserModule:
 			Ok(void)
-	loaded ?= load_queue({
+	initial ?= load_queue({
 		layout = layout,
 		root_path = root_path,
 		requests = [
@@ -345,6 +375,9 @@ func load_program(root_path: String, library_root: String) -> Result[LoadedProgr
 		assembly = begin_program(),
 		modules = [],
 	})
+	loaded: LoadState ?= match mode:
+		ApplicationInput: Ok(initial)
+		TestSuiteInput: load_test_entry(initial)
 	sources: SourceInputs = { modules = loaded.modules }
 	match seal_program(loaded.assembly):
 		Ok(program):

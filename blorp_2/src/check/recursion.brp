@@ -13,13 +13,15 @@ import:
 		),
 		recursion_error,
 	./model:
-		CallTarget(RuntimeFunction, UserFunction, CallableParameter),
+		CallTarget(RuntimeFunction, UserFunction, CallableParameter, ValueCall),
 		CheckedArm,
 		CheckedBody(CheckedMatchBody, CheckedValueBody),
-		CheckedCall, CheckedCallOperand(ValueOperand, CallableOperand), CallableChoice(NamedCallable, ForwardedCallable, LambdaCallable),
+		CheckedCallOperand(ValueOperand, CallableOperand),
+		CheckedCall, CallableChoice(NamedCallable, ForwardedCallable, LambdaCallable, StoredCallable),
 		CheckedExit(RecurWith, ReturnExpression),
 		CheckedExpr,
 		CheckedForm(
+			MakeCallable,
 			ConstructOpaque, ProjectOpaque,
 			ConstructRecord, ConstructVariant, ConstructList, InvokeFunction, LiteralFloat, LiteralInteger,
 			LiteralString, LiteralVoid, Match, ReadBinding, ReadCapture, ReadRecordField, UpdateRecord,
@@ -29,8 +31,8 @@ import:
 		CheckedIteration(ListIteration, AscendingIntRange),
 		TypeParameterId,
 		TypeParameterOwner(FunctionDeclaration),
-		TypeRef(PureCallableType, AppliedUnionType, AppliedRecordType, ListType, ParameterType),
-		function_calls, lambda_calls,
+		TypeRef(CallableType, AppliedUnionType, AppliedRecordType, ListType, ParameterType),
+		function_calls, lambda_calls, body_callable_creations,
 		same_parameter,
 		type_parameter_id,
 	../utils/ids: FunctionId, function_number
@@ -43,7 +45,7 @@ private pure func is_self_call(call: CheckedCall, current: FunctionId) -> Bool:
 	match call.target:
 		UserFunction(id, _):
 			IntOps.equals(function_number(id), function_number(current))
-		RuntimeFunction(_) | CallableParameter(_):
+		RuntimeFunction(_) | CallableParameter(_) | ValueCall(_):
 			False
 
 
@@ -70,13 +72,18 @@ private pure func self_call_in(value: CheckedExpr, current: FunctionId) -> Optio
 		ProjectOpaque(_, child):
 			self_call_in(child, current)
 		InvokeFunction(call):
-			var found: Option[Span] = None
+			var found: Option[Span] = match call.target:
+				ValueCall(callee): self_call_in(callee, current)
+				UserFunction(_, _) | RuntimeFunction(_) | CallableParameter(_): None
 			for operand in call.operands:
-				match operand:
-					ValueOperand(argument): found = self_call_in(argument, current)
-					CallableOperand(_, _, _): void
 				if found.is_some():
 					break
+				match operand:
+					ValueOperand(argument): found = self_call_in(argument, current)
+					CallableOperand(_, choice, _):
+						match choice:
+							StoredCallable(child): found = self_call_in(child, current)
+							NamedCallable(_, _) | ForwardedCallable(_) | LambdaCallable(_, _): void
 			match found:
 				Some(span):
 					Some(span)
@@ -112,6 +119,10 @@ private pure func self_call_in(value: CheckedExpr, current: FunctionId) -> Optio
 			found
 		ReadRecordField(receiver, _):
 			self_call_in(receiver, current)
+		MakeCallable(choice):
+			match choice:
+				StoredCallable(operand): self_call_in(operand, current)
+				NamedCallable(_, _) | ForwardedCallable(_) | LambdaCallable(_, _): None
 		LiteralVoid | LiteralInteger(_) | LiteralFloat(_) | LiteralString(_) | ReadBinding(_) | ReadCapture(_):
 			None
 
@@ -343,9 +354,9 @@ private pure func append_dependencies(
 				growth = growth,
 				span = span,
 			})
-		PureCallableType(parameters, result):
+		CallableType(purity, parameters, result):
 			for value in parameters.append(result):
-				collected = append_dependencies(collected, value, target, growth, span)
+				collected = append_dependencies(collected, value, target, NestedParameter, span)
 		ListType(element):
 			collected = append_dependencies(collected, element, target, NestedParameter, span)
 		AppliedRecordType(_, arguments):
@@ -416,9 +427,11 @@ pure func validate_recursive_instantiation(
 
 	for function in functions:
 		dependencies = append_call_dependencies(dependencies, function_calls(function))
+		dependencies = append_creation_dependencies(dependencies, body_callable_creations(function.statements, function.body))
 	-- Potential calls include ignored and nested lambdas, independently of runtime selection.
 	for lambda in lambdas:
 		dependencies = append_call_dependencies(dependencies, lambda_calls(lambda))
+		dependencies = append_creation_dependencies(dependencies, body_callable_creations(lambda.statements, lambda.body))
 
 	var growing: Option[ParameterDependency] = None
 
@@ -463,17 +476,39 @@ private pure func append_call_dependencies(
 						CallableOperand(_, choice, span):
 							match choice:
 								NamedCallable(id, types):
-									var named_position = 0
-									for value in types:
-										dependencies = append_dependencies(
-											dependencies, value, type_parameter_id(FunctionDeclaration(id), named_position),
-											PreservedParameter, span,
-										)
-										named_position = IntOps.add(named_position, 1)
-								ForwardedCallable(_): void
-								LambdaCallable(_, _): void
+									dependencies = append_named_dependencies(dependencies, id, types, span)
+								ForwardedCallable(_) | StoredCallable(_) | LambdaCallable(_, _): void
 
-			RuntimeFunction(_) | CallableParameter(_):
+			RuntimeFunction(_) | CallableParameter(_) | ValueCall(_):
 				void
 
+	dependencies
+
+
+-- Creating a named value requests its body specialization without executing it.
+-- The issued substitution contributes the same finite-instantiation edges as a
+-- named callback argument; executable call/tail-call inventories stay separate.
+private pure func append_creation_dependencies(
+	previous: List[ParameterDependency], creations: List[CheckedExpr],
+) -> List[ParameterDependency]:
+	var dependencies = previous
+	for value in creations:
+		match value.form:
+			MakeCallable(NamedCallable(id, types)):
+				dependencies = append_named_dependencies(dependencies, id, types, value.span)
+			_: void
+	dependencies
+
+
+private pure func append_named_dependencies(
+	previous: List[ParameterDependency], id: FunctionId, types: List[TypeRef], span: Span,
+) -> List[ParameterDependency]:
+	var dependencies = previous
+	var position = 0
+	for value in types:
+		dependencies = append_dependencies(
+			dependencies, value, type_parameter_id(FunctionDeclaration(id), position),
+			PreservedParameter, span,
+		)
+		position = IntOps.add(position, 1)
 	dependencies

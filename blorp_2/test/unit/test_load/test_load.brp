@@ -1,6 +1,6 @@
 import:
     ../../../src/utils/ids: inventory_functions
-    ../../../src/load/load: LoadFailure, SourceFile, import_path, library_layout, load_program, module_role, working_directory_result
+    ../../../src/load/load: LoadFailure, SourceFile, import_path, library_layout, load_program, load_test_program, module_role, working_directory_result
     ../../../src/utils/names: NameId, intern_names, program_names
     ../../../src/parse/assemble: ParsedModuleRow, parsed_contents
     ../../../src/parse/parse: ImportOrigin(RelativeImport, LibraryImport)
@@ -688,6 +688,54 @@ private func invalid_utf8_documentation(directory: String) -> Result[Bool, Strin
     )
 
 
+private func test_entry_uses_configured_library(directory: String) -> Result[Bool, String]:
+    lib ?= library(directory, "")
+    helper = "pure func run_suite() -> Int:\n    0\n"
+    target ?= write_module(lib, "test.brp", helper)
+    decoy ?= write_module(directory, "test.brp", "pure func local() -> Int:\n    7\n")
+    source: String =
+        |import:
+        |    ./test: local
+        |pure func tests() -> Int:
+        |    local()
+        |
+    root ?= write_module(directory, "main.brp", source)
+    original ?= load_program(root, lib).map_err(func(error): error.diagnostic.message)
+    loaded ?= load_test_program(root, lib).map_err(func(error): error.diagnostic.message)
+    rows = parsed_contents(loaded.program).modules
+    matching = match (rows.get(0), rows.get(4)):
+        (Some(root_row), Some(library_row)):
+            (
+                library_row.role == LibraryModule and root_row.imports.length() == 3
+                and root_row.imports.any(func(request): same_module(request.target, library_row.module))
+            )
+        _: False
+    Ok(
+        loaded.sources.modules.take(original.sources.modules.length()) == original.sources.modules
+        and matching_rows(loaded.sources.modules, target) == 1
+        and matching_rows(loaded.sources.modules, decoy) == 1
+        and rows.length() == 5 and matching
+    )
+
+
+private func test_entry_has_no_local_library_fallback(directory: String) -> Result[Bool, String]:
+    lib ?= library(directory, "")
+    decoy ?= write_module(directory, "test.brp", "pure func run_suite() -> Int:\n    0\n")
+    root ?= write_module(directory, "main.brp", "pure func tests() -> Int:\n    0\n")
+    Ok(match load_test_program(root, lib):
+        Ok(_): False
+        Err(error):
+            (
+                error.diagnostic.message.starts_with("could not read module ".concat(Path.join(lib, "test.brp")))
+                and same_source(error.diagnostic.span.source, compiler_source())
+                and error.diagnostic.span.start == 0 and error.diagnostic.span.end == 0
+                and error.diagnostic.help == "check the import path and provide a readable .brp file under its source root"
+                and error.diagnostic.note.is_none()
+                and matching_rows(error.sources.modules, decoy) == 0
+            )
+    )
+
+
 private func optional_operations(directory: String, header: String, options: Int, results: Int) -> Result[Bool, String]:
     target = Path.join(getcwd(), "blorp_2/standard_library")
     root ?= write_module(directory, "main.brp", header + "func main() -> Int:\n    0\n")
@@ -781,6 +829,8 @@ tests: TestSuite = {
         ("missing prelude has source path", func(): in_directory(func(dir): missing_foundation(dir, "prelude.brp"))),
         ("imported parse error retains bytes", func(): in_directory(imported_parse_error)),
         ("missing library module does not fall back", func(): in_directory(no_fallback)),
+        ("test entry uses exact configured library and preserves source ids", func(): in_directory(test_entry_uses_configured_library)),
+        ("test entry has no local library fallback", func(): in_directory(test_entry_has_no_local_library_fallback)),
         ("invalid UTF-8 documentation rejects before source publication", func(): in_directory(invalid_utf8_documentation)),
     ]
 }

@@ -2,13 +2,13 @@ import:
 	../../../src/check/check: check, check_errors, checked_functions
 	../../../src/check/errors as Errors: CheckErrorKind
 	../../../src/check/render: render_failure
-	../../../src/check/model as Checked: TypeRef(UnionType), BindingOrigin(ParameterBinding, BodyLocal, MatchCapture)
+	../../../src/check/model as Checked: TypeRef(UnionType), BindingOrigin(ParameterBinding, CallableParameterBinding, BodyLocal, MatchCapture)
 	../../../src/namespace/namespace: ValueBinding(FunctionName, ConstantName, ConstructorName, ModuleAliasName)
 	../../../src/parse/assemble: ParsedProgram, parsed_contents
-	../../../src/utils/ids: VariantId, inventory_unions, union_number, variant_owner, variant_number
+	../../../src/utils/ids as Declaration: VariantId, inventory_unions, union_number, variant_owner, variant_number
 	../../../src/utils/names: NameId, same_name
 	../../../src/utils/source: module_id, module_source, root_module_id
-	../../../src/utils/syntax: Diagnostic, DiagnosticNote(PreviousDeclaration), Span, same_span
+	../../../src/utils/syntax: Diagnostic, DiagnosticNote(PreviousDeclaration), Span, same_span, Purity(Pure, Impure)
 	../input: existing_name, checked_tail_join
 	../module_input: parse_modules, parse_modules_with_prelude
 	test: TestSuite
@@ -53,6 +53,7 @@ private pure func binding_rejection(program: ParsedProgram, actual: CheckErrorKi
 		Errors.BindingRejection(Errors.LocalBindingConflict(binding, origin)):
 			kind_matches = match origin:
 				ParameterBinding(_): kind == "parameter"
+				CallableParameterBinding(_): False
 				BodyLocal | MatchCapture: kind == "local"
 			kind_matches and has_name(program, binding.name, name) and same_span(binding.span, previous)
 		_: False
@@ -533,17 +534,10 @@ pure func test_for_binder_cannot_shadow_parameter() -> Bool:
 	)
 
 
-pure func test_lambda_parameter_keeps_its_unsupported_boundary() -> Bool:
-	prefix = "pure func use(value: Int) -> Int:\n\tclosure = "
-	form = "func(value: Int) -> Int: value"
-	source = prefix + form + "\n\t0\n" + MAIN
-	rejects(parsed(source), prefix, form, "lambda values are only supported as pure callback arguments",
-		"pass a pure func literal to a pure callable parameter; store and return ordinary data", None,
-		pure func(program: ParsedProgram, kind: CheckErrorKind) -> Bool:
-			match kind:
-				Errors.UnsupportedSyntax(Errors.LambdaValue): True
-				_: False
-	)
+pure func test_stored_lambda_parameter_cannot_shadow_enclosing_parameter() -> Bool:
+	declaration = "pure func use("
+	prefix = declaration + "value: Int) -> Int:\n\tclosure = func("
+	collision(prefix, "value", ": Int) -> Int: value\n\t0\n", "parameter", root_span(declaration.length(), 5))
 
 
 pure func test_lambda_parameter_cannot_shadow_enclosing_parameter() -> Bool:
@@ -558,9 +552,191 @@ pure func test_lambda_parameter_cannot_shadow_enclosing_parameter() -> Bool:
 	)
 
 
+pure func test_standalone_annotated_lambda_publishes_its_written_shape() -> Bool:
+	source: String =
+		|pure func use() -> Int:
+		|    closure = func(item: Int) -> Int: item
+		|    0
+		|
+	match parsed(source + MAIN):
+		Err(_): False
+		Ok(input):
+			match check(input):
+				Err(_): False
+				Ok(program):
+					match (checked_functions(program).functions, checked_functions(program).lambdas):
+						([use, _], [lambda]):
+							match (use.bindings, use.statements, lambda.parameters, lambda.body):
+								([local], [Checked.InitializeBinding(id, value)], [parameter], Checked.CheckedValueBody(Checked.ReturnExpression(result))):
+									match (local.value_type, value.form, result.form):
+										(Checked.CallableType(Impure, [Checked.IntType], Checked.IntType), Checked.MakeCallable(Checked.LambdaCallable(target, [])), Checked.ReadBinding(item)):
+											(Checked.binding_number(id) == 0 and Checked.lambda_number(target) == 0
+												and Checked.binding_number(item) == 0 and lambda.captures.is_empty()
+												and Checked.same_type(parameter.value_type, Checked.IntType)
+												and Checked.same_type(lambda.return_type.value_type, Checked.IntType)
+												and Checked.same_type(value.value_type, local.value_type))
+										_: False
+								_: False
+						_: False
+
+
+pure func test_standalone_lambda_requires_input_before_result() -> Bool:
+	prefix = "pure func use() -> Int:\n\tclosure = "
+	form = "func(item): item"
+	rejects(parsed(prefix + form + "\n\t0\n" + MAIN), prefix, form,
+		"cannot infer this lambda's input types", "annotate its parameters or supply a typed ordinary argument", None,
+		pure func(program: ParsedProgram, kind: CheckErrorKind) -> Bool:
+			match kind:
+				Errors.CallRejection(Errors.LambdaInputNeedsType): True
+				_: False
+	)
+
+
+pure func test_standalone_inline_lambda_requires_written_result() -> Bool:
+	prefix = "pure func use() -> Int:\n\tclosure = "
+	form = "func(item: Int): item"
+	rejects(parsed(prefix + form + "\n\t0\n" + MAIN), prefix, form,
+		"standalone lambda needs a complete result type", "write a return annotation or give the lambda a callable type annotation", None,
+		pure func(program: ParsedProgram, kind: CheckErrorKind) -> Bool:
+			match kind:
+				Errors.CallRejection(Errors.LambdaResultNeedsType): True
+				_: False
+	)
+
+
+pure func test_standalone_block_lambda_requires_written_result() -> Bool:
+	prefix = "pure func use() -> Int:\n\tclosure = "
+	form = "func(item: Int):\n\t\titem"
+	rejects(parsed(prefix + form + "\n\t0\n" + MAIN), prefix, form,
+		"block lambda needs a complete result type", "write a return annotation or give the callback a complete result context", None,
+		pure func(program: ParsedProgram, kind: CheckErrorKind) -> Bool:
+			match kind:
+				Errors.CallRejection(Errors.LambdaBlockNeedsResult): True
+				_: False
+	)
+
+
+pure func test_standalone_lambda_resolves_nested_annotation_before_missing_result() -> Bool:
+	prefix = "pure func use() -> Int:\n\tclosure = func(item: List["
+	rejects(parsed(prefix + "Missing]): item\n\t0\n" + MAIN), prefix, "Missing",
+		"unknown type", "declare or import this type; builtin types and declared type parameters are also available", None,
+		pure func(program: ParsedProgram, kind: CheckErrorKind) -> Bool:
+			match kind:
+				Errors.TypeTermRejection(Errors.UnknownType(name)): has_name(program, name, "Missing")
+				_: False
+	)
+
+
+pure func test_contextual_inline_lambda_still_infers_its_result() -> Bool:
+	source: String =
+		|pure func use() -> Int:
+		|    closure: pure (Int) -> Int = pure func(item): item
+		|    closure(7)
+		|
+	match parsed(source + MAIN):
+		Err(_): False
+		Ok(input):
+			match check(input):
+				Err(_): False
+				Ok(program):
+					match checked_functions(program).lambdas:
+						[lambda]:
+							match (lambda.purity, lambda.parameters, lambda.return_type.value_type, lambda.body):
+								(Pure, [parameter], Checked.IntType, Checked.CheckedValueBody(Checked.ReturnExpression(value))):
+									match value.form:
+										Checked.ReadBinding(id): Checked.binding_number(id) == 0 and Checked.same_type(parameter.value_type, Checked.IntType)
+										_: False
+								_: False
+						_: False
+
+
+pure func test_annotated_lambda_infers_an_ordinary_generic_argument() -> Bool:
+	source: String =
+		|pure func identity[T](value: T) -> T:
+		|    value
+		|func main() -> Int:
+		|    closure = identity(pure func(item: Int) -> Int: item)
+		|    closure(7)
+		|
+	match parsed(source):
+		Err(_): False
+		Ok(input):
+			match check(input):
+				Err(_): False
+				Ok(program):
+					match checked_functions(program).functions:
+						[identity, main]:
+							match main.statements:
+								[Checked.InitializeBinding(_, value)]:
+									match value.form:
+										Checked.InvokeFunction(call):
+											match (call.target, call.operands, value.value_type):
+												(Checked.UserFunction(target, [Checked.CallableType(Pure, [Checked.IntType], Checked.IntType)]), [Checked.ValueOperand(lambda)], Checked.CallableType(Pure, [Checked.IntType], Checked.IntType)):
+													match lambda.form:
+														Checked.MakeCallable(Checked.LambdaCallable(id, [])):
+															Declaration.function_number(target) == Declaration.function_number(identity.id) and Checked.lambda_number(id) == 0
+														_: False
+												_: False
+										_: False
+								_: False
+						_: False
+
+
+pure func test_annotated_lambda_establishes_a_direct_list_element_type() -> Bool:
+	source: String =
+		|func main() -> Int:
+		|    closures = [pure func(item: Int) -> Int: item]
+		|    0
+		|
+	match parsed(source):
+		Err(_): False
+		Ok(input):
+			match check(input):
+				Err(_): False
+				Ok(program):
+					match checked_functions(program).functions:
+						[main]:
+							match main.statements:
+								[Checked.InitializeBinding(_, value)]:
+									match (value.value_type, value.form):
+										(Checked.ListType(Checked.CallableType(Pure, [Checked.IntType], Checked.IntType)), Checked.ConstructList([element])):
+											match element.form:
+												Checked.MakeCallable(Checked.LambdaCallable(id, [])): Checked.lambda_number(id) == 0
+												_: False
+										_: False
+								_: False
+						_: False
+
+
+pure func test_annotated_lambda_cannot_masquerade_as_an_int_argument() -> Bool:
+	callee_prefix = "pure func consume(value: Int) -> Int:\n\tvalue\nfunc main() -> Int:\n\t"
+	prefix = callee_prefix + "consume("
+	form = "pure func(item: Int) -> Int: item"
+	rejects(parsed(prefix + form + ")\n"), callee_prefix, "consume",
+		"argument type does not match the parameter type", "use an expression of type Int here", None,
+		pure func(program: ParsedProgram, kind: CheckErrorKind) -> Bool:
+			match kind:
+				Errors.CallRejection(Errors.ArgumentTypeMismatch(mismatch)):
+					match (mismatch.expected, mismatch.actual.value_type):
+						(Checked.IntType, Checked.CallableType(Pure, [Checked.IntType], Checked.IntType)):
+							mismatch.argument_position == 0 and same_span(mismatch.actual.span, root_span(prefix.length(), form.length()))
+						_: False
+				_: False
+	)
+
+
 tests: TestSuite = {
 	description = "Binding names and constructor-only match arms",
 	tests = [
+		("annotated lambda infers ordinary generic argument", test_annotated_lambda_infers_an_ordinary_generic_argument),
+		("annotated lambda establishes direct List element", test_annotated_lambda_establishes_a_direct_list_element_type),
+		("annotated lambda cannot masquerade as Int", test_annotated_lambda_cannot_masquerade_as_an_int_argument),
+		("standalone annotated lambda publishes its written shape", test_standalone_annotated_lambda_publishes_its_written_shape),
+		("standalone lambda needs input before result", test_standalone_lambda_requires_input_before_result),
+		("standalone inline lambda needs written result", test_standalone_inline_lambda_requires_written_result),
+		("standalone block lambda needs written result", test_standalone_block_lambda_requires_written_result),
+		("standalone nested annotation precedes missing result", test_standalone_lambda_resolves_nested_annotation_before_missing_result),
+		("contextual inline lambda still infers its result", test_contextual_inline_lambda_still_infers_its_result),
 		("lambda parameter cannot shadow an enclosing data parameter", test_lambda_parameter_cannot_shadow_enclosing_parameter),
 		("name predicates reject an unexpected error family", test_name_rejection_predicates_reject_an_unexpected_error_family),
 		("unknown bare name cannot become a catch-all", test_unknown_bare_name_cannot_become_a_catch_all),
@@ -600,6 +776,6 @@ tests: TestSuite = {
 		("immutable join target still precedes its initializer", test_immutable_join_assignment_still_precedes_its_initializer),
 		("Option propagation requires a Result return", test_option_propagation_requires_a_result_return),
 		("for binder cannot shadow parameter", test_for_binder_cannot_shadow_parameter),
-		("lambda parameter keeps its unsupported boundary", test_lambda_parameter_keeps_its_unsupported_boundary),
+		("stored lambda parameter cannot shadow enclosing parameter", test_stored_lambda_parameter_cannot_shadow_enclosing_parameter),
 	]
 }

@@ -20,7 +20,7 @@ import:
 		ValueParameter,
 		ValueOperation(
 			ParameterValue, VoidValue, IntegerValue, FloatValue, StringValue,
-			CallValue, ConstructValue, ConstructListValue, PayloadValue, ListElementValue, ListSuffixValue, ConstructRecordValue, ReadRecordFieldValue,
+			CallValue, InvokeCallableValue, FreeCallableValue, CapturedCallableValue, ConstructValue, ConstructListValue, PayloadValue, ListElementValue, ListSuffixValue, ConstructRecordValue, ReadRecordFieldValue,
 		),
 		lowered_functions,
 		block_value_count, step_reads, step_span, step_value_count, value_span,
@@ -38,7 +38,7 @@ import:
 		RecordInstanceId,
 		TypeRef,
 		ValueOwnership(
-			NoOwnership, ManagedStringLeaf, ManagedListRoot, ManagedRecordRoot,
+			NoOwnership, ManagedStringLeaf, ManagedCallableEnvironment, ManagedListRoot, ManagedRecordRoot,
 			InlineOwnedFields, ManagedUnionRoot,
 		),
 		VariantInstanceId, VariantFieldInstanceId,
@@ -103,6 +103,9 @@ fixed union OwnedValueOperation:
 	FloatDefinition(Float)
 	StringDefinition(String)
 	CallDefinition(CallTarget, List[OwnedArgument])
+	InvokeCallableDefinition(OwnedArgument, List[OwnedArgument])
+	FreeCallableDefinition(FunctionInstanceId)
+	CapturedCallableDefinition(FunctionInstanceId, StoredPayload)
 	ConstructDefinition(VariantInstanceId, List[StoredPayload])
 	ConstructListDefinition(List[StoredPayload])
 	PayloadDefinition(VariantFieldInstanceId, ValueId)
@@ -615,6 +618,23 @@ private pure func store_payloads(
 		None: Ok({ stored = stored, acquisitions = acquired, next = next })
 
 
+private pure func borrowed_arguments(
+	values: List[ValueId], sources: List[ResultOwnership], enclosing: List[EnclosingBlock],
+	first_value: Int, span: Span,
+) -> Result[List[OwnedArgument], Diagnostic]:
+	var arguments: List[OwnedArgument] = []
+	var failure: Option[Diagnostic] = None
+	for value in values:
+		match borrow_argument(value, sources, enclosing, first_value, span):
+			Ok(argument): arguments = arguments.append(argument)
+			Err(error):
+				failure = Some(error)
+				break
+	match failure:
+		Some(error): Err(error)
+		None: Ok(arguments)
+
+
 private pure func build_definition(
 	definition: ValueDefinition,
 	sources: List[ResultOwnership],
@@ -702,30 +722,34 @@ private pure func build_definition(
 			borrow_argument(value, sources, enclosing, first_value, definition.span).map(
 				pure func(argument): ListSuffixDefinition(argument, skipped),
 			)
+		FreeCallableValue(body): Ok(FreeCallableDefinition(body))
+		CapturedCallableValue(body, environment):
+			match store_payloads([environment], sources, enclosing, first_value, definition.span, acquisitions, next):
+				Err(error): Err(error)
+				Ok(payloads):
+					acquisitions = payloads.acquisitions
+					next = payloads.next
+					match payloads.stored.get(0).to_result(internal_error(definition.span, "missing callable environment payload")):
+						Err(error): Err(error)
+						Ok(payload):
+							Ok(CapturedCallableDefinition(body, payload))
+		InvokeCallableValue(callee, written):
+			match borrow_argument(callee, sources, enclosing, first_value, definition.span):
+				Err(error): Err(error)
+				Ok(callable):
+					match borrowed_arguments(written, sources, enclosing, first_value, definition.span):
+						Err(error): Err(error)
+						Ok(arguments):
+							Ok(InvokeCallableDefinition(callable, arguments))
 		CallValue(target, written):
-			var converted: List[OwnedArgument] = []
-			var failure: Option[Diagnostic] = None
-
-			for value in written:
-				match borrow_argument(value, sources, enclosing, first_value, definition.span):
-					Err(error):
-						failure = Some(error)
-						break
-					Ok(argument):
-						converted = converted.append(argument)
-
-			match failure:
-				Some(error):
-					Err(error)
-				None:
-					Ok(CallDefinition(target, converted))
+			borrowed_arguments(written, sources, enclosing, first_value, definition.span).map(pure func(arguments): CallDefinition(target, arguments))
 
 	operation ?= operation_result
 
 	ownership_result: Result[ResultOwnership, Diagnostic] = match plan:
 		NoOwnership:
 			Ok(UnmanagedResult)
-		ManagedStringLeaf | ManagedListRoot | ManagedRecordRoot(_) | InlineOwnedFields(_) | ManagedUnionRoot(_):
+		ManagedStringLeaf | ManagedCallableEnvironment | ManagedListRoot | ManagedRecordRoot(_) | InlineOwnedFields(_) | ManagedUnionRoot(_):
 			match operation:
 				ParameterDefinition(_):
 					Ok(BorrowedResult(ParameterBorrow(definition.id)))
@@ -741,7 +765,7 @@ private pure func build_definition(
 							borrow.value
 
 					Ok(BorrowedResult(PayloadBorrow(parent)))
-				StringDefinition(_) | CallDefinition(_, _) | ConstructDefinition(_, _) | ConstructListDefinition(_) | ListSuffixDefinition(_, _) | ConstructRecordDefinition(_, _):
+				StringDefinition(_) | CallDefinition(_, _) | InvokeCallableDefinition(_, _) | FreeCallableDefinition(_) | CapturedCallableDefinition(_, _) | ConstructDefinition(_, _) | ConstructListDefinition(_) | ListSuffixDefinition(_, _) | ConstructRecordDefinition(_, _):
 					Ok(OwnedResult(owner_id(next)))
 				_:
 					Err(internal_error(definition.span, "unsupported managed value operation"))

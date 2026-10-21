@@ -27,7 +27,7 @@ import:
 		OwnedLoopMatch, OwnedLoopBlock,
 		OwnedValueOperation(
 			ParameterDefinition, VoidDefinition, IntegerDefinition, FloatDefinition,
-			StringDefinition, CallDefinition, ConstructDefinition, ConstructListDefinition,
+			StringDefinition, CallDefinition, InvokeCallableDefinition, FreeCallableDefinition, CapturedCallableDefinition, ConstructDefinition, ConstructListDefinition,
 			PayloadDefinition, ListElementDefinition, ListSuffixDefinition, ConstructRecordDefinition, ReadRecordFieldDefinition,
 		),
 		OwnerId,
@@ -48,11 +48,11 @@ import:
 		FunctionSignature,
 		RecordInstanceId,
 		RecordRepresentation(InlineRecord, ManagedRecord),
-		TypeRef(VoidType, IntType, FloatType, StringType, ListType, UnionType, RecordType),
+		TypeRef(VoidType, IntType, FloatType, StringType, ListType, CallableType, UnionType, RecordType),
 		UnionInstanceId,
 		UnionRepresentation(InlineUnmanaged, InlineOwningPayload, BoxedRecursive),
 		ValueOwnership(
-			NoOwnership, ManagedStringLeaf, ManagedListRoot, ManagedRecordRoot,
+			NoOwnership, ManagedStringLeaf, ManagedCallableEnvironment, ManagedListRoot, ManagedRecordRoot,
 			InlineOwnedFields, ManagedUnionRoot,
 		),
 		VariantFieldInstanceId, VariantInstanceId, variant_field_variant, variant_field_number,
@@ -99,19 +99,25 @@ private pure func verification_error(span: Span, message: String) -> Diagnostic:
 -- List storage ownership is a root fact. Raw IR must also name a member of
 -- each supplied concrete catalogue; do not expand nominal fields per query.
 private pure func verify_type_membership(
-	value_type: TypeRef,
-	unions: List[ConcreteUnion],
-	records: List[ConcreteRecord],
-	span: Span,
+	value_type: TypeRef, unions: List[ConcreteUnion], records: List[ConcreteRecord], span: Span,
 ) -> Result[Void, Diagnostic]:
-	var terminal = value_type
-	while True:
-		match terminal:
-			ListType(element): terminal = element
-			VoidType | IntType | FloatType | StringType | RecordType(_) | UnionType(_): break
-	match value_ownership(terminal, unions, records):
-		Ok(_): Ok(void)
-		Err(error): Err({ error | span = span })
+	match value_type:
+		ListType(element): verify_type_membership(element, unions, records, span)
+		CallableType(parameters, result):
+			var failure: Option[Diagnostic] = None
+			for parameter in parameters.append(result):
+				match verify_type_membership(parameter, unions, records, span):
+					Ok(_): void
+					Err(error):
+						failure = Some(error)
+						break
+			match failure:
+				Some(error): Err(error)
+				None: Ok(void)
+		_:
+			match value_ownership(value_type, unions, records):
+				Ok(_): Ok(void)
+				Err(error): Err({ error | span = span })
 
 
 private fixed record KnownValue {
@@ -569,7 +575,7 @@ private pure func verify_argument(
 						match plan:
 							NoOwnership:
 								Ok(void)
-							ManagedStringLeaf | ManagedListRoot | ManagedRecordRoot(_) | InlineOwnedFields(_) | ManagedUnionRoot(_):
+							ManagedStringLeaf | ManagedCallableEnvironment | ManagedListRoot | ManagedRecordRoot(_) | InlineOwnedFields(_) | ManagedUnionRoot(_):
 								Err(
 									verification_error(
 										span,
@@ -728,7 +734,7 @@ private pure func valid_union_layout(
 					StringType:
 						owning = True
 						True
-					ListType(_):
+					ListType(_) | CallableType(_, _):
 						owning = True
 						True
 
@@ -815,6 +821,7 @@ private pure func list_terminal_presence(
 			ListType(inner): terminal = inner
 			_: break
 	match terminal:
+		CallableType(_, _): verify_type_membership(terminal, unions, records, span)
 		RecordType(id):
 			match records.get(record_number(id)):
 				Some(_): Ok(void)
@@ -909,6 +916,11 @@ private pure func verify_layout_graph(
 								-- A pointer edge whose target must exist; its layout is
 								-- walked as a root of its own, not from here.
 								match list_terminal_presence(element, records, unions):
+									Ok(_): void
+									Err(error): invalid = Some(error)
+							CallableType(_, _):
+								-- A callable stores an ops/environment pair, not its signature children.
+								match verify_type_membership(value_type, unions, records, span):
 									Ok(_): void
 									Err(error): invalid = Some(error)
 							VoidType | IntType | FloatType | StringType:
@@ -1245,6 +1257,51 @@ private pure func operation_value(
 				definition_value(definition, FloatType, None, None)
 			else:
 				Err(verification_error(definition.span, "Float literal must be finite"))
+		FreeCallableDefinition(id):
+			match functions.get(function_number(id)).to_result(verification_error(definition.span, "unknown callable body")):
+				Err(error): Err(error)
+				Ok(function):
+					definition_value(definition, CallableType(function.signature.parameters, function.signature.return_type), None, None)
+		CapturedCallableDefinition(id, payload):
+			stored = match payload:
+				UnmanagedPayload(value): value
+				OwnedPayload(value, _): value
+			match known_value(state, stored, definition.span):
+				Err(error): Err(error)
+				Ok(environment):
+					match functions.get(function_number(id)).to_result(verification_error(definition.span, "unknown callable body")):
+						Err(error): Err(error)
+						Ok(function):
+							match environment.value_type:
+								RecordType(owner):
+									match function.signature.parameters:
+										[]: Err(verification_error(definition.span, "captured callable requires an environment parameter"))
+										[parameter, ...parameters]:
+											match record_layout(owner, records, definition.span):
+												Err(error): Err(error)
+												Ok(layout):
+													match layout.representation:
+														InlineRecord: Err(verification_error(definition.span, "callable environment must be a managed record"))
+														ManagedRecord:
+															if same_type(parameter, environment.value_type):
+																definition_value(definition, CallableType(parameters, function.signature.return_type), None, None)
+															else:
+																Err(verification_error(definition.span, "callable body environment type does not match its stored environment"))
+								_: Err(verification_error(definition.span, "captured callable requires an environment parameter"))
+		InvokeCallableDefinition(callee, arguments):
+			match known_value(state, argument_value(callee), definition.span):
+				Err(error): Err(error)
+				Ok(known):
+					match verify_argument(callee, known.value_type, state, unions, definition.span, records, discharged, owners):
+						Err(error): Err(error)
+						Ok(live):
+							match known.value_type:
+								CallableType(parameters, result):
+									match verify_arguments(arguments, parameters, state, unions, definition.span, records, discharged, owners):
+										Err(error): Err(error)
+										Ok(valid):
+											definition_value(definition, result, None, None)
+								_: Err(verification_error(definition.span, "indirect call requires a callable value"))
 		CallDefinition(target, arguments):
 			match call_signature(target, definition.span, functions, unions, records):
 				Ok(contract):
@@ -1420,7 +1477,7 @@ private pure func verify_definition_result(
 					Ok(None)
 				_:
 					Err(verification_error(definition.span, "unmanaged value carries an ownership obligation"))
-		ManagedStringLeaf | ManagedListRoot | ManagedRecordRoot(_) | InlineOwnedFields(_) | ManagedUnionRoot(_):
+		ManagedStringLeaf | ManagedCallableEnvironment | ManagedListRoot | ManagedRecordRoot(_) | InlineOwnedFields(_) | ManagedUnionRoot(_):
 			match definition.operation:
 				ParameterDefinition(_):
 					match definition.result:
@@ -1499,7 +1556,7 @@ private pure func verify_definition_result(
 									"managed projection requires its parent borrow",
 								),
 							)
-				StringDefinition(_) | CallDefinition(_, _) | ConstructDefinition(_, _) | ConstructListDefinition(_) | ConstructRecordDefinition(_, _) | ListSuffixDefinition(_, _):
+				StringDefinition(_) | CallDefinition(_, _) | InvokeCallableDefinition(_, _) | FreeCallableDefinition(_) | CapturedCallableDefinition(_, _) | ConstructDefinition(_, _) | ConstructListDefinition(_) | ConstructRecordDefinition(_, _) | ListSuffixDefinition(_, _):
 					match definition.result:
 						OwnedResult(owner):
 							Ok(Some(owner))
@@ -1697,7 +1754,7 @@ private pure func verify_definition_type(
 	else:
 		Ok(void)
 	membership: Void ?= match definition.value_type:
-		ListType(element): verify_type_membership(element, unions, records, definition.span)
+		ListType(_) | CallableType(_, _): verify_type_membership(definition.value_type, unions, records, definition.span)
 		VoidType | IntType | FloatType | StringType | RecordType(_) | UnionType(_): Ok(void)
 	operation_value(
 		definition,
@@ -1777,7 +1834,7 @@ private pure func verify_join_header(
 	else:
 		Err(verification_error(parameter.span, "value identity is not the next function ordinal"))
 	membership: Void ?= match parameter.value_type:
-		ListType(element): verify_type_membership(element, unions, records, parameter.span)
+		ListType(_) | CallableType(_, _): verify_type_membership(parameter.value_type, unions, records, parameter.span)
 		_: Ok(void)
 	verify_match_argument(join.selection.scrutinee, state, unions, records, parameter.span, discharged, owners)
 
@@ -1900,6 +1957,13 @@ private pure func verify_operations(
 										Ok(void)
 							ConstructDefinition(_, payloads):
 								match discharge_payloads(payloads, state, discharged, owners, unions, records, definition.span):
+									Err(error): Err(error)
+									Ok(moved):
+										discharged = moved.discharged
+										owners = moved.owners
+										Ok(void)
+							CapturedCallableDefinition(_, payload):
+								match discharge_payloads([payload], state, discharged, owners, unions, records, definition.span):
 									Err(error): Err(error)
 									Ok(moved):
 										discharged = moved.discharged
@@ -2132,7 +2196,7 @@ private pure func verify_return(
 								Ok(void)
 							Some(_):
 								Err(verification_error(result.span, "unmanaged return cannot transfer an owner"))
-					ManagedStringLeaf | ManagedListRoot | ManagedRecordRoot(_) | InlineOwnedFields(_) | ManagedUnionRoot(_):
+					ManagedStringLeaf | ManagedCallableEnvironment | ManagedListRoot | ManagedRecordRoot(_) | InlineOwnedFields(_) | ManagedUnionRoot(_):
 						match returned_owner:
 							None:
 								Err(verification_error(result.span, "managed return requires an owner transfer"))
@@ -2263,7 +2327,7 @@ private pure func consume_yield(
 			match moved:
 				None: Ok(None)
 				Some(_): Err(verification_error(span, "unmanaged yield cannot transfer an owner"))
-		ManagedStringLeaf | ManagedListRoot | ManagedRecordRoot(_) | InlineOwnedFields(_) | ManagedUnionRoot(_):
+		ManagedStringLeaf | ManagedCallableEnvironment | ManagedListRoot | ManagedRecordRoot(_) | InlineOwnedFields(_) | ManagedUnionRoot(_):
 			match moved:
 				None:
 					Err(verification_error(span, "managed yield requires an owner transfer"))
