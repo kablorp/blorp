@@ -339,13 +339,11 @@ static void test_list_empty(void) {
 }
 
 static void test_void_root(void) {
-    /* Void's existing canonical zero carrier owns no child allocation. */
-    blorp_r_5 root = blorp_record_make_5((struct blorp_r_5){
-        .blorp_rf_5_0 = (uint8_t)0
-    });
+    /* Logical Void has no physical field and owns no child allocation. */
+    blorp_r_5 root = blorp_record_make_5((struct blorp_r_5){0});
     const size_t root_id = runtime_test_allocation_id(root);
     assert(allocation_count == 1);
-    assert(root->blorp_rf_5_0 == (uint8_t)0);
+    assert(sizeof *root == sizeof root->references);
     blorp_record_dup_5(root);
     blorp_record_drop_5(root);
     assert_frees(root_id, 0);

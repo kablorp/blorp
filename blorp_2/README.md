@@ -977,6 +977,53 @@ reject before layout expansion.
 The [roadmap](ROADMAP.md#delivered-foundation) tracks final
 integrated acceptance and later aggregate extensions.
 
+## Structural tuples
+
+Tuples contain two to four ordered elements with independent types:
+
+```blorp
+pure func first(value: (Int, String, Bool)) -> Int:
+	(number, _, _) = value
+	number
+
+func main() -> Int:
+	value: (Int, String, Bool) = (1, "one", True)
+	value[0]
+```
+
+Tuple types nest inside tuples, generic arguments, record fields, callable
+parameters and results. As elsewhere, bare union constructors need a receiving
+type; annotate a tuple when its elements need that context. `(value)` groups one expression and `(Type)` groups one
+type. Neither `(value,)` nor `(Type,)` denotes a tuple. Tuples of two to four
+elements may have a trailing comma. An arrow after enclosed types selects a
+callable type: `(Int, String) -> Int` has two parameters, while
+`((Int, String)) -> Int` has one tuple parameter. Callable parameter arity is
+independent of the tuple limit.
+
+Read an element with an integer literal index, starting at zero. Computed and
+out-of-range indices are compile errors. Tuple patterns are recursive, including
+`Some((number, _))` and `(Some(number), (other, _))`; they use the ordinary
+exhaustiveness and alternative-binder rules. A tuple may be a direct match
+subject, as in `match (left, right):`.
+
+`(first, _, third) = value` declares immutable names. A for loop accepts the same
+flat target, such as `for (name, _) in entries:`. Wildcards discard their
+elements. These targets contain two to four names or `_`, with optional trailing
+commas, and evaluate their subject once. Nested declaration/for targets,
+per-member annotations, tuple `?=`, tuple parameters written as patterns, and
+subscript assignment are unsupported. A destructuring always declares its names;
+an ordinary mutable variable containing a tuple may still be replaced as a whole.
+Destructure a nested tuple in a separate declaration. Ordinary named parameters
+may have tuple type annotations.
+
+Tuple elements evaluate once from left to right, including Void elements whose
+values have no physical storage. Tuples have value semantics and remain
+structurally typed, distinct from authored named records. Once concrete, they
+use the ordinary managed record storage and ownership machinery. Tuple
+equality, ordering and traits are outside this increment.
+The [tuple validation and cost report](../benchmarks/results/blorp_2_tuples_2026-10-21.md)
+records matched self-compilation costs, ownership checks and native coverage.
+
 ## Fresh record updates
 
 `{ base | field = expression }` creates a complete record with selected fields
@@ -2597,7 +2644,9 @@ Supporting every one of these in input programs is future work, not a claim
 about this increment. Equality is written with concrete functions such as
 `IntOps.equals` and pattern matching, never `==` or `!=`.
 
-Concurrency, parallelism, tensors and dimension types, tuples, `debug:`, other
+The compiler accepts tuple input as described above, but its own source keeps
+avoiding tuple syntax until the pinned seed is rotated. Concurrency, parallelism,
+tensors and dimension types, tuples in compiler source, `debug:`, other
 numeric widths, traits, doctests, channels, and FFI are excluded. Compiler tests
 are written in Blorp; the target runtime has explicitly approved C unit tests
 run by Blorp `TestSuite`. Build commands may use Make and the C toolchain.

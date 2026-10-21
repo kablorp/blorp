@@ -146,16 +146,16 @@ static void test_repeated(void) {
 }
 
 static void test_void_root(void) {
-    blorp_r_2 old = blorp_record_make_2((struct blorp_r_2){ .blorp_rf_2_0 = 0 });
+    blorp_r_2 old = blorp_record_make_2((struct blorp_r_2){0});
     const size_t old_id = runtime_test_allocation_id(old);
-    blorp_r_2 fresh = blorp_record_make_2((struct blorp_r_2){ .blorp_rf_2_0 = 0 });
+    blorp_r_2 fresh = blorp_record_make_2((struct blorp_r_2){0});
     const size_t fresh_id = runtime_test_allocation_id(fresh);
     assert(old != fresh && old_id != fresh_id && allocation_count == 2);
     assert(atomic_load(&old->references) == 1 && atomic_load(&fresh->references) == 1);
     blorp_record_drop_2(old);
     assert_frees(old_id, 1);
     assert_frees(fresh_id, 0);
-    assert(fresh->blorp_rf_2_0 == 0);
+    assert(sizeof *fresh == sizeof fresh->references);
     blorp_record_drop_2(fresh);
     assert_frees(fresh_id, 1);
 }

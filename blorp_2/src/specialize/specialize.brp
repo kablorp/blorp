@@ -65,6 +65,7 @@ fixed record ConcreteRecord {
 private fixed union RecordOrigin:
 	DeclaredRecord(Declaration.RecordId)
 	CaptureEnvironment(Checked.LambdaId)
+	StructuralTuple
 
 
 private fixed record RecordKey {
@@ -304,6 +305,7 @@ fixed union ConcretePatternRoute:
 	MatchRoot
 	UnionField(ConcretePatternPlace, VariantFieldInstanceId)
 	ListElement(ConcretePatternPlace, Int)
+	RecordField(ConcretePatternPlace, FieldInstanceId)
 
 
 fixed union ConcretePatternArgument:
@@ -617,6 +619,10 @@ private pure func same_record_origin(left: RecordOrigin, right: RecordOrigin) ->
 			match right:
 				DeclaredRecord(other): IntOps.equals(Declaration.record_number(id), Declaration.record_number(other))
 				_: False
+		StructuralTuple:
+			match right:
+				StructuralTuple: True
+				_: False
 		CaptureEnvironment(id):
 			match right:
 				CaptureEnvironment(other): IntOps.equals(Checked.lambda_number(id), Checked.lambda_number(other))
@@ -770,6 +776,8 @@ private pure func concrete_type(
 			Ok(FloatType)
 		Checked.StringType:
 			Ok(StringType)
+		Checked.TupleType(elements):
+			concrete_tuple_type(opaques, elements, substitution, unions, span, records)
 		Checked.ListType(element):
 			match concrete_type(opaques, element, substitution, unions, span, records):
 				Ok(concrete): Ok(ListType(concrete))
@@ -815,6 +823,16 @@ private pure func concrete_type(
 					Ok(value)
 				None:
 					Err(invalid(span, "unresolved or foreign type parameter"))
+
+
+private pure func concrete_tuple_type(
+	opaques: List[Checked.CheckedOpaque], elements: List[Checked.TypeRef],
+	substitution: List[TypeSubstitution[TypeRef]], unions: List[UnionInstance],
+	span: Span, records: List[RecordInstance],
+) -> Result[TypeRef, Diagnostic]:
+	arguments ?= concrete_types(opaques, elements, substitution, unions, span, records)
+	owner ?= find_record_instance(records, { origin = StructuralTuple, arguments = arguments }).to_result(invalid(span, "unprepared structural tuple instance"))
+	Ok(RecordType(owner))
 
 
 private pure func same_arguments(left: List[TypeRef], right: List[TypeRef]) -> Bool:
@@ -1118,6 +1136,8 @@ private pure func contains_parameter(value: Checked.TypeRef) -> Bool:
 			match parameters.any(contains_parameter):
 				True: True
 				False: contains_parameter(result)
+		Checked.TupleType(elements):
+			elements.any(contains_parameter)
 		Checked.ListType(element):
 			contains_parameter(element)
 		Checked.ParameterType(_):
@@ -1830,44 +1850,55 @@ private fixed record SelectedRecord {
 }
 
 
-private pure func selected_record(
-	origin: RecordOrigin,
-	checked: Checked.CheckedFunctions,
-	span: Span,
-) -> Result[SelectedRecord, Diagnostic]:
-	match origin:
-		DeclaredRecord(id):
-			match checked.records.get(Declaration.record_number(id)):
-				None: Err(invalid(span, "unknown record declaration"))
-				Some(declaration): Ok({
-					type_parameters = declaration.type_parameters,
-					parameter_owner = Checked.RecordDeclaration(id),
-					fields = declaration.fields.map(pure func(field): field.value_type),
-					storage = InlineEligible
-				})
-		CaptureEnvironment(id):
-			match checked.lambdas.get(Checked.lambda_number(id)):
-				None: Err(invalid(span, "unknown capture environment lambda"))
-				Some(lambda):
-					match checked.functions.get(Declaration.function_number(lambda.root)):
-						None: Err(invalid(span, "unknown capture environment root"))
-						Some(root): Ok({
-							type_parameters = root.signature.type_parameters,
-							parameter_owner = Checked.FunctionDeclaration(lambda.root),
-							fields = lambda.captures.map(pure func(capture): capture.value_type),
-							storage = AlwaysManaged
-						})
-
-
 private pure func prepare_record(
-	key: PartialRecordKey,
-	checked: Checked.CheckedFunctions,
-	unions: List[UnionSlot],
-	span: Span,
-	records: List[RecordSlot],
+	key: PartialRecordKey, checked: Checked.CheckedFunctions,
+	unions: List[UnionSlot], span: Span, records: List[RecordSlot],
 	in_progress: List[InProgressLayout],
 ) -> Result[PreparedType, Diagnostic]:
-	declaration ?= selected_record(key.origin, checked, span)
+	match key.origin:
+		StructuralTuple:
+			publish_record(
+				key, key.arguments, ManagedRecord, unions, span, records,
+				in_progress.append(InProgressRecord(key, NotReferencedBack)),
+				unions.length(), records.length(),
+			)
+		DeclaredRecord(id): prepare_source_record(key, id, checked, unions, span, records, in_progress)
+		CaptureEnvironment(id): prepare_capture_record(key, id, checked, unions, span, records, in_progress)
+
+
+private pure func prepare_source_record(
+	key: PartialRecordKey, id: Declaration.RecordId, checked: Checked.CheckedFunctions,
+	unions: List[UnionSlot], span: Span, records: List[RecordSlot], in_progress: List[InProgressLayout],
+) -> Result[PreparedType, Diagnostic]:
+	declaration ?= checked.records.get(Declaration.record_number(id)).to_result(invalid(span, "unknown record declaration"))
+	selected: SelectedRecord = {
+		type_parameters = declaration.type_parameters,
+		parameter_owner = Checked.RecordDeclaration(id),
+		fields = declaration.fields.map(pure func(field): field.value_type),
+		storage = InlineEligible,
+	}
+	prepare_declared_record(key, selected, checked, unions, span, records, in_progress)
+
+
+private pure func prepare_capture_record(
+	key: PartialRecordKey, id: Checked.LambdaId, checked: Checked.CheckedFunctions,
+	unions: List[UnionSlot], span: Span, records: List[RecordSlot], in_progress: List[InProgressLayout],
+) -> Result[PreparedType, Diagnostic]:
+	lambda ?= checked.lambdas.get(Checked.lambda_number(id)).to_result(invalid(span, "unknown capture environment lambda"))
+	root ?= checked.functions.get(Declaration.function_number(lambda.root)).to_result(invalid(span, "unknown capture environment root"))
+	selected: SelectedRecord = {
+		type_parameters = root.signature.type_parameters,
+		parameter_owner = Checked.FunctionDeclaration(lambda.root),
+		fields = lambda.captures.map(pure func(capture): capture.value_type),
+		storage = AlwaysManaged,
+	}
+	prepare_declared_record(key, selected, checked, unions, span, records, in_progress)
+
+
+private pure func prepare_declared_record(
+	key: PartialRecordKey, declaration: SelectedRecord, checked: Checked.CheckedFunctions,
+	unions: List[UnionSlot], span: Span, records: List[RecordSlot], in_progress: List[InProgressLayout],
+) -> Result[PreparedType, Diagnostic]:
 	substitution ?= parameter_substitution(declaration.type_parameters, key.arguments, declaration.parameter_owner, span)
 	var fields: List[PartialType] = []
 	var dependencies = unions
@@ -1909,6 +1940,16 @@ private pure func prepare_record(
 		ManagedRecord
 	else:
 		InlineRecord
+	publish_record(key, fields, representation, dependencies, span, record_dependencies, layouts, unions.length(), records.length())
+
+
+-- Both source-owned products and structural tuples settle through one record inventory.
+private pure func publish_record(
+	key: PartialRecordKey, fields: List[PartialType], representation: RecordRepresentation,
+	dependencies: List[UnionSlot], span: Span,
+	record_dependencies: List[RecordSlot], layouts: List[InProgressLayout],
+	first_union: Int, first_record: Int,
+) -> Result[PreparedType, Diagnostic]:
 	instance: RecordInstanceId = into_opaque RecordInstanceId(record_dependencies.length())
 	slot ?= settle_record({ key = key, fields = fields, representation = representation }, span)
 	published = record_dependencies.append(slot)
@@ -1918,9 +1959,9 @@ private pure func prepare_record(
 			Ok({ value_type = KnownType(RecordType(instance)), unions = dependencies, records = published, in_progress = left.remaining })
 		ReferencedBack:
 			completed: CompletedLayout = CompletedRecord(key, instance)
-			match resolve_union_slots(dependencies, unions.length(), completed, span):
+			match resolve_union_slots(dependencies, first_union, completed, span):
 				Ok(resolved_unions):
-					match resolve_record_slots(published, records.length(), completed, span):
+					match resolve_record_slots(published, first_record, completed, span):
 						Ok(resolved_records):
 							Ok({
 								value_type = KnownType(RecordType(instance)),
@@ -2015,6 +2056,8 @@ private pure func prepare_type(
 					Ok({ value_type = replaced, unions = unions, records = records, in_progress = in_progress })
 				None:
 					Err(invalid(span, "unresolved or foreign type parameter"))
+		Checked.TupleType(elements):
+			prepare_tuple_type(elements, substitution, checked, unions, span, records, in_progress)
 		Checked.ListType(element):
 			match prepare_type(element, substitution, checked, unions, span, records, in_progress):
 				Ok(prepared): Ok({ prepared | value_type = partial_list(prepared.value_type) })
@@ -2031,6 +2074,15 @@ private pure func prepare_type(
 			match prepare_arguments(arguments, substitution, checked, unions, span, records, in_progress):
 				Ok(prepared): ensure_union({ declaration = id, arguments = prepared.arguments }, checked, prepared.unions, span, prepared.records, prepared.in_progress)
 				Err(error): Err(error)
+
+
+private pure func prepare_tuple_type(
+	elements: List[Checked.TypeRef], substitution: List[TypeSubstitution[PartialType]],
+	checked: Checked.CheckedFunctions, unions: List[UnionSlot], span: Span,
+	records: List[RecordSlot], in_progress: List[InProgressLayout],
+) -> Result[PreparedType, Diagnostic]:
+	prepared ?= prepare_arguments(elements, substitution, checked, unions, span, records, in_progress)
+	ensure_record({ origin = StructuralTuple, arguments = prepared.arguments }, checked, prepared.unions, span, prepared.records, prepared.in_progress)
 
 
 -- Every slot is complete once no layout is in progress; sealing projects the
@@ -2118,6 +2170,9 @@ private pure func append_value_types(
 			types = append_value_types(types, child)
 		Checked.ProjectOpaque(_, child):
 			types = append_value_types(types, child)
+		Checked.ConstructTuple(elements):
+			for element in elements:
+				types = append_value_types(types, element)
 		Checked.ConstructList(elements):
 			for element in elements:
 				types = append_value_types(types, element)
@@ -2148,6 +2203,8 @@ private pure func append_value_types(
 						types = append_value_types(types, capture)
 				Checked.StoredCallable(child): types = append_value_types(types, child)
 				Checked.NamedCallable(_, _) | Checked.ForwardedCallable(_): void
+		Checked.ReadTupleElement(receiver, _):
+			types = append_value_types(types, receiver)
 		Checked.ReadRecordField(receiver, _):
 			types = append_value_types(types, receiver)
 		Checked.LiteralVoid | Checked.LiteralInteger(_) | Checked.LiteralFloat(_) | Checked.LiteralString(_) | Checked.ReadBinding(_) | Checked.ReadCapture(_):
@@ -2262,6 +2319,7 @@ private pure func place_types(place: Checked.CheckedPatternPlace, span: Span) ->
 		Checked.MatchRoot: [own]
 		Checked.UnionField(parent, _, _): [own].concat(place_types(parent, span))
 		Checked.ListElement(parent, _): [own].concat(place_types(parent, span))
+		Checked.RecordField(parent, _): [own].concat(place_types(parent, span))
 
 
 private pure func selection_types(selection: Checked.CheckedSelection, span: Span) -> List[Checked.TypeUse]:
@@ -3147,6 +3205,39 @@ private pure func translate_invocation(
 							Ok({ form = InvokeFunction(concrete, values), value_type = value_type, span = value.span })
 
 
+private pure func translate_tuple_element(
+	opaques: List[Checked.CheckedOpaque], value: Checked.CheckedExpr,
+	receiver: Checked.CheckedExpr, ordinal: Int,
+	substitution: List[TypeSubstitution[TypeRef]], callables: TranslationBindings,
+	keys: List[FunctionRequest], unions: List[UnionInstance], records: List[RecordInstance],
+) -> Result[ConcreteExpr, Diagnostic]:
+	source ?= translate_expr(opaques, receiver, substitution, callables, keys, unions, records)
+	match source.value_type:
+		RecordType(owner):
+			field = into_opaque FieldInstanceId({ owner = owner, position = ordinal })
+			translate_leaf(opaques, ReadRecordField(source, field), value, substitution, unions, records)
+		_: Err(invalid(value.span, "tuple projection has a non-record concrete receiver"))
+
+
+private pure func translate_tuple(
+	opaques: List[Checked.CheckedOpaque], value: Checked.CheckedExpr,
+	elements: List[Checked.CheckedExpr], substitution: List[TypeSubstitution[TypeRef]],
+	callables: TranslationBindings, keys: List[FunctionRequest],
+	unions: List[UnionInstance], records: List[RecordInstance],
+) -> Result[ConcreteExpr, Diagnostic]:
+	value_type ?= concrete_type(opaques, value.value_type, substitution, unions, value.span, records)
+	values ?= translate_exprs(opaques, elements, substitution, callables, keys, unions, records)
+	match value_type:
+		RecordType(owner):
+			var fields: List[ConcreteRecordField] = []
+			var ordinal = 0
+			for child in values:
+				fields = fields.append({ field = into_opaque FieldInstanceId({ owner = owner, position = ordinal }), value = child })
+				ordinal = IntOps.add(ordinal, 1)
+			Ok({ form = ConstructRecord(owner, fields), value_type = value_type, span = value.span })
+		_: Err(invalid(value.span, "tuple construction has a non-record concrete type"))
+
+
 private pure func translate_expr(
 	opaques: List[Checked.CheckedOpaque],
 	value: Checked.CheckedExpr,
@@ -3170,6 +3261,8 @@ private pure func translate_expr(
 			match translate_expr(opaques, child, substitution, callables, keys, unions, records):
 				Ok(translated): Ok({ translated | span = value.span })
 				Err(error): Err(error)
+		Checked.ReadTupleElement(receiver, ordinal):
+			translate_tuple_element(opaques, value, receiver, ordinal, substitution, callables, keys, unions, records)
 		Checked.ReadRecordField(receiver, field):
 			match translate_expr(opaques, receiver, substitution, callables, keys, unions, records):
 				Ok(source):
@@ -3222,6 +3315,8 @@ private pure func translate_expr(
 								Err(error): Err(error)
 						Err(error): Err(error)
 				Err(error): Err(error)
+		Checked.ConstructTuple(elements):
+			translate_tuple(opaques, value, elements, substitution, callables, keys, unions, records)
 		Checked.ConstructRecord(declaration, fields):
 			match record_instance(opaques, declaration, value, substitution, unions, records):
 				Ok(owner):
@@ -3529,6 +3624,13 @@ private pure func translate_place(
 	value_type ?= concrete_type(opaques, place.value_type, substitution, unions, span, records)
 	route: Result[ConcretePatternRoute, Diagnostic] = match place.route:
 		Checked.MatchRoot: Ok(MatchRoot)
+		Checked.RecordField(parent, ordinal):
+			match translate_place(opaques, parent, substitution, unions, records, span):
+				Err(error): Err(error)
+				Ok(concrete_parent):
+					match concrete_parent.value_type:
+						RecordType(owner): Ok(RecordField(concrete_parent, into_opaque FieldInstanceId({ owner = owner, position = ordinal })))
+						_: Err(invalid(span, "pattern record projection has a non-record parent"))
 		Checked.ListElement(parent, index):
 			match translate_place(opaques, parent, substitution, unions, records, span):
 				Err(error): Err(error)

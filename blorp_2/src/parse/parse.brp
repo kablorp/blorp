@@ -12,7 +12,7 @@ import:
 		DiagnosticNote(PreviousDeclaration),
 		ExpressionBase(
 			VoidExpression, IntegerExpression, FloatExpression, StringExpression, NameExpression, DirectApplication,
-			QualifiedName, QualifiedApplication, OpaqueWrap, OpaqueUnwrap, ListExpression, RangeExpression, RecordExpression,
+			QualifiedName, QualifiedApplication, OpaqueWrap, OpaqueUnwrap, ListExpression, TupleExpression, RangeExpression, RecordExpression,
 			RecordUpdateExpression, LogicalExpression, NotExpression, LambdaExpression, IfExpression, MatchExpression,
 		),
 		LogicalOperator(AndOperator, OrOperator),
@@ -20,6 +20,7 @@ import:
 		ParsedIf,
 		ParsedQualified,
 		ParsedBinder(NamedBinder, DiscardBinder),
+		ForBinder(SingleForBinder, TupleForBinder),
 		LambdaParameter,
 		LambdaBody(InlineBody, BlockBody),
 		ParsedLambda,
@@ -42,7 +43,7 @@ import:
 		ParsedMatchArm,
 		ParsedOpaque,
 		ParsedParameter,
-		ParsedPattern(PatternName, PatternWildcard, PatternConstructor, PatternOr, PatternList, PatternString, PatternChar),
+		ParsedPattern(PatternName, PatternWildcard, PatternConstructor, PatternOr, PatternList, PatternTuple, PatternString, PatternChar),
 		PatternHead(BareHead, QualifiedHead),
 		ParsedRecord,
 		ParsedRecordField,
@@ -59,10 +60,10 @@ import:
 		ParsedPropagation,
 		ParsedWhile,
 		ParsedFor,
-		ParsedStatement(BindingStatement, PropagatingBinding, ExpressionStatement, WhileLoop, ForLoop, Break, Continue),
+		ParsedStatement(BindingStatement, TupleBinding, PropagatingBinding, ExpressionStatement, WhileLoop, ForLoop, Break, Continue),
 		ParsedUnion,
 		ParsedVariant,
-		PostfixOperation(ReceiverInvocation, FieldAccess),
+		PostfixOperation(ReceiverInvocation, FieldAccess, TupleIndex),
 		Purity(Pure, Impure),
 		Spacing(Adjacent, Spaced),
 		Span,
@@ -73,7 +74,7 @@ import:
 		),
 		Token,
 		TokenKind(IdentifierToken, KeywordToken, SymbolToken, IntegerLiteral, FloatLiteral, QuotedString, PipeString, CharLiteral),
-		TypeSyntax(AtomicType, AppliedType, QualifiedType, CallableTypeSyntax),
+		TypeSyntax(AtomicType, AppliedType, QualifiedType, CallableTypeSyntax, TupleTypeSyntax),
 		type_span,
 		UTF8_CONTINUATION_END,
 		UTF8_CONTINUATION_START,
@@ -1239,13 +1240,6 @@ private pure func consume_call_arguments(state: ParserState) -> Result[ParsedArg
 	Ok({ arguments = listed.values, end = parser_span(listed.next).end, next = with_enclosure(closed, state.enclosure) })
 
 
-private pure func reject_function_type_arguments(state: ParserState) -> Result[Void, Diagnostic]:
-	if at_left_bracket(state):
-		Err(expected_syntax(state, "explicit function type arguments are unsupported", "omit the brackets at calls; argument types determine the type parameters"))
-	else:
-		Ok(void)
-
-
 -- Whether the import block declared `id` as a module alias.
 private pure func is_module_alias(state: ParserState, id: NameId) -> Bool:
 	var found: Bool = False
@@ -1272,7 +1266,6 @@ private pure func consume_qualified(module: ParsedName) -> Result[ParsedBase, Di
 
 private pure func consume_name_or_call(start: ParserState) -> Result[ParsedBase, Diagnostic]:
 	name ?= consume_callable_name(start, "expected a value name")
-	explicit_types ?= reject_function_type_arguments(name.next)
 	after_dot = shifted(name.next, 1)
 
 	if at_left_paren(name.next):
@@ -1300,6 +1293,8 @@ private pure func consume_base(start: ParserState, token: Token) -> Result[Parse
 		SymbolToken(AtSign):
 			Err(misplaced_annotation(start))
 		KeywordToken(VoidKeyword):
+			Ok({ base = VoidExpression, span = token.span, next = after })
+		SymbolToken(Wildcard):
 			Ok({ base = VoidExpression, span = token.span, next = after })
 		-- `.5` teaches the Float form; any other leading dot (a UFCS call on
 		-- its own line, say) is simply no expression, as in the host.
@@ -1392,7 +1387,6 @@ private pure func consume_postfix(state: ParserState) -> Result[ParsedPostfix, D
 		consume_callable_name(state, "expected a field or function name after '.'")
 	else:
 		consume_name(state, "expected a field or function name after '.'")
-	explicit_types ?= reject_function_type_arguments(name.next)
 
 	if at_left_paren(name.next):
 		match consume_call_arguments(name.next):
@@ -1428,6 +1422,19 @@ private pure func consume_postfixes(state: ParserState, applications: List[Postf
 	consume_chain(state, applications, end, 0)
 
 
+-- Index syntax is independent of the receiver's type. Check establishes the
+-- tuple and literal ordinal once; no spelling distinguishes type arguments.
+private pure func consume_tuple_index(state: ParserState) -> Result[ParsedPostfix, Diagnostic]:
+	opened = with_enclosure(shifted(state, 1), Bracketed)
+	index ?= consume_value(opened)
+	closed ?= expect(index.next, at_right_bracket(index.next), "expected ']' after the tuple index", "write one integer literal index, such as value[0]")
+	if at_left_paren(closed):
+		Err(expected_syntax(state, "explicit function type arguments are unsupported", "omit the brackets at calls; argument types determine the type parameters"))
+	else:
+		span = { parser_span(state) | end = parser_span(index.next).end }
+		Ok({ operation = TupleIndex(index.body, span), end = span.end, next = with_enclosure(closed, state.enclosure) })
+
+
 -- The postfix loop with the host's method-chain continuation (4.2): a `.`
 -- on the next line continues the chain, at the same indentation or one
 -- Indent deeper, and the chain owns each Indent it takes (`owned`). A
@@ -1438,7 +1445,11 @@ private pure func consume_postfixes(state: ParserState, applications: List[Postf
 private pure func consume_chain(state: ParserState, applications: List[PostfixOperation], end: Int, owned: Int) -> Result[ParsedPostfixes, Diagnostic]:
 	after_newline = shifted(state, 1)
 
-	if at_dot(state):
+	if at_left_bracket(state):
+		match consume_tuple_index(state):
+			Ok(postfix): consume_chain(postfix.next, applications.append(postfix.operation), postfix.end, owned)
+			Err(error): Err(error)
+	else if at_dot(state):
 		match consume_postfix(shifted(state, 1)):
 			Ok(postfix): consume_chain(postfix.next, applications.append(postfix.operation), postfix.end, owned)
 			Err(error): Err(error)
@@ -1471,6 +1482,10 @@ private pure func close_chain_level(state: ParserState, applications: List[Postf
 -- range, so `not a..b` negates the range and `a..not b` needs parentheses.
 private pure func consume_value(start: ParserState) -> Result[ParsedValue, Diagnostic]:
 	first ?= consume_conjunction(start)
+	consume_disjunction_rest(first)
+
+
+private pure func consume_disjunction_rest(first: ParsedValue) -> Result[ParsedValue, Diagnostic]:
 	var current = first
 	var failure: Option[Diagnostic] = None
 
@@ -1488,6 +1503,10 @@ private pure func consume_value(start: ParserState) -> Result[ParsedValue, Diagn
 
 private pure func consume_conjunction(start: ParserState) -> Result[ParsedValue, Diagnostic]:
 	first ?= consume_negation(start)
+	consume_conjunction_rest(first)
+
+
+private pure func consume_conjunction_rest(first: ParsedValue) -> Result[ParsedValue, Diagnostic]:
 	var current = first
 	var failure: Option[Diagnostic] = None
 
@@ -1526,6 +1545,10 @@ private pure func consume_negation(start: ParserState) -> Result[ParsedValue, Di
 -- postfix operations of its own; group it to apply any.
 private pure func consume_range(start: ParserState) -> Result[ParsedValue, Diagnostic]:
 	low ?= consume_operand(start)
+	consume_range_rest(low)
+
+
+private pure func consume_range_rest(low: ParsedValue) -> Result[ParsedValue, Diagnostic]:
 
 	if (and(inline(low), at_dot_dot(low.next))).not():
 		Ok(low)
@@ -1846,31 +1869,131 @@ private pure func consume_list_literal(start: ParserState, opening: Span) -> Res
 	Ok({ base = ListExpression(listed.values), span = { opening | end = parser_span(listed.next).end }, next = with_enclosure(closed, start.enclosure) })
 
 
--- `start` is at an opening parenthesis: one expression, then ')'. The group
--- is transparent: the grouped expression's base and postfix operations are
--- the result, its span widens to the parentheses, and further postfix
--- operations may follow the ')'.
-private pure func consume_grouped_value(start: ParserState, opening: Span) -> Result[ParsedValue, Diagnostic]:
-	inner ?= consume_value(with_enclosure(shifted(start, 1), Bracketed))
-	closing = parser_span(inner.next)
-	closed ?= expect(
-		inner.next,
-		at_right_paren(inner.next),
-		"expected ')' after the grouped expression",
-		"close the parentheses after one expression; UFCS and field reads may follow ')'",
-	)
-	postfixes ?= consume_postfixes(with_enclosure(closed, start.enclosure), inner.body.applications, closing.end)
+private TUPLE_MINIMUM_ELEMENTS: Int = 2
+
+private TUPLE_MAXIMUM_ELEMENTS: Int = 4
+
+private TUPLE_SIZE_HELP: String = "nest tuples or use a named record for more fields"
+
+private FLAT_TUPLE_MESSAGE: String = "tuple destructuring requires flat names or '_'"
+
+private FLAT_TUPLE_HELP: String = "bind a nested tuple to a name, then destructure it separately"
+
+private TUPLE_BINDER_ANNOTATION_MESSAGE: String = "tuple destructuring names cannot have type annotations"
+
+private TUPLE_BINDER_ANNOTATION_HELP: String = "annotate the tuple value before destructuring it"
+
+
+-- Preserve a bare binder at its syntactic boundary. A leading parenthesized
+-- line is parsed once, then '=' distinguishes declaration from expression.
+-- This avoids rescanning tokens or recovering binders from expression shapes.
+private fixed union EnclosedMember:
+	BareMember(ParsedBinder, ValueExpression)
+	ValueMember(ValueExpression)
+
+
+private pure func enclosed_value(member: EnclosedMember) -> ValueExpression:
+	match member:
+		BareMember(_, value): value
+		ValueMember(value): value
+
+
+private fixed record ParsedMember {
+	member: EnclosedMember,
+	next: ParserState
+}
+
+
+private pure func consume_enclosed_member(state: ParserState) -> Result[ParsedMember, Diagnostic]:
+	after = shifted(state, 1)
+	bare = and(or(at_identifier(state), at_wildcard(state)), or(at_comma(after), at_right_paren(after)))
+	if and(or(at_identifier(state), at_wildcard(state)), at_colon(after)):
+		Err(expected_syntax(after, TUPLE_BINDER_ANNOTATION_MESSAGE, TUPLE_BINDER_ANNOTATION_HELP))
+	else if bare:
+		consume_bare_member(state)
+	else:
+		match consume_value(state):
+			Ok(value): Ok({ member = ValueMember(value.body), next = value.next })
+			Err(error): Err(error)
+
+
+private pure func consume_bare_member(state: ParserState) -> Result[ParsedMember, Diagnostic]:
+	binder ?= consume_binder(state, "expected a tuple element")
+	base: ExpressionBase = match binder.binder:
+		NamedBinder(name): NameExpression(name)
+		DiscardBinder(_): VoidExpression
+	span = parser_span(state)
+	value: ValueExpression = { base = base, base_span = span, applications = [], span = span }
+	Ok({ member = BareMember(binder.binder, value), next = binder.next })
+
+
+private fixed union EnclosedContents:
+	GroupedContents(ValueExpression)
+	TupleContents(List[EnclosedMember])
+
+
+private fixed record ParsedEnclosed {
+	contents: EnclosedContents,
+	span: Span,
+	next: ParserState
+}
+
+
+-- `start` is at '('. Commas select a tuple; without one the group remains
+-- transparent, including the inner expression's existing postfix operations.
+private pure func consume_enclosed_values(start: ParserState, opening: Span) -> Result[ParsedEnclosed, Diagnostic]:
+	first ?= consume_enclosed_member(with_enclosure(shifted(start, 1), Bracketed))
+	if at_comma(first.next).not():
+		match expect(first.next, at_right_paren(first.next), "expected ')' after the grouped expression", "close the parentheses after one expression; UFCS and field reads may follow ')'"):
+			Ok(closed): Ok({ contents = GroupedContents(enclosed_value(first.member)), span = { opening | end = parser_span(first.next).end }, next = with_enclosure(closed, start.enclosure) })
+			Err(error): Err(error)
+	else:
+		consume_tuple_values(start, opening, first)
+
+
+private pure func consume_tuple_values(start: ParserState, opening: Span, first: ParsedMember) -> Result[ParsedEnclosed, Diagnostic]:
+	var current = shifted(first.next, 1)
+	var members: List[EnclosedMember] = [first.member]
+	var failure: Option[Diagnostic] = None
+	while and(at_right_paren(current).not(), failure.is_none()):
+		match consume_enclosed_member(current):
+			Err(error): failure = Some(error)
+			Ok(member):
+				if IntOps.equals(members.length(), TUPLE_MAXIMUM_ELEMENTS):
+					failure = Some(diagnostic(enclosed_value(member.member).span, "tuples support two to four elements", TUPLE_SIZE_HELP))
+				else:
+					members = members.append(member.member)
+					match list_separator(member.next):
+						ListContinues(next): current = next
+						ListEnds(next):
+							current = next
+							break
+	ready: Void ?= match failure:
+		Some(error): Err(error)
+		None: Ok(void)
+	closed ?= expect(current, at_right_paren(current), "expected ')' after the tuple elements", "separate complete expressions with commas, then close the tuple with ')'")
+	span = { opening | end = parser_span(current).end }
+	if IntOps.less_than(members.length(), TUPLE_MINIMUM_ELEMENTS):
+		Err(diagnostic(span, "a tuple requires two to four elements", "write the value itself for one element, or [value] for a one-element List"))
+	else:
+		Ok({ contents = TupleContents(members), span = span, next = with_enclosure(closed, start.enclosure) })
+
+
+private pure func finish_enclosed_value(enclosed: ParsedEnclosed) -> Result[ParsedValue, Diagnostic]:
+	inner: ValueExpression = match enclosed.contents:
+		GroupedContents(value): value
+		TupleContents(members):
+			{ base = TupleExpression(members.map(enclosed_value)), base_span = enclosed.span, applications = [], span = enclosed.span }
+	postfixes ?= consume_postfixes(enclosed.next, inner.applications, enclosed.span.end)
 	Ok({
-		body = {
-			base = inner.body.base,
-			base_span = inner.body.base_span,
-			applications = postfixes.applications,
-			span = { opening | end = postfixes.end }
-		},
-		next = postfixes.next,
-		ending = postfixes.ending,
-		owed = postfixes.owed,
+		body = { base = inner.base, base_span = inner.base_span, applications = postfixes.applications, span = { enclosed.span | end = postfixes.end } },
+		next = postfixes.next, ending = postfixes.ending, owed = postfixes.owed,
 	})
+
+
+private pure func consume_grouped_value(start: ParserState, opening: Span) -> Result[ParsedValue, Diagnostic]:
+	enclosed ?= consume_enclosed_values(start, opening)
+	finish_enclosed_value(enclosed)
 
 
 private fixed record ParsedType {
@@ -1922,9 +2045,32 @@ private pure func consume_optional_type_arguments(state: ParserState, name_end: 
 			Err(error): Err(error)
 
 
--- The return type recurses through consume_type, so callback returns associate
--- to the right and keep their complete written span.
-private pure func consume_function_type(state: ParserState, purity: Purity, opened_at: ParserState) -> Result[ParsedType, Diagnostic]:
+private fixed union EnclosedTypeMode:
+	PureCallable
+	TupleOrCallable
+
+
+private fixed union EnclosedTypes:
+	UnseparatedType(TypeSyntax, ParserState)
+	SeparatedTypes(List[TypeSyntax], ParserState)
+
+
+private pure func consume_first_enclosed_type(state: ParserState) -> Result[EnclosedTypes, Diagnostic]:
+	first ?= consume_type(state, "expected an enclosed type")
+	if at_comma(first.next).not():
+		Ok(UnseparatedType(first.written, first.next))
+	else:
+		match list_separator(first.next):
+			ListEnds(next): Ok(SeparatedTypes([first.written], next))
+			ListContinues(next):
+				match consume_types(next, [first.written], "expected an enclosed type"):
+					Ok(types): Ok(SeparatedTypes(types.types, types.next))
+					Err(error): Err(error)
+
+
+-- Read the enclosed types once before classifying the closing arrow. Callable
+-- parameter lists have no tuple arity limit; result types associate right.
+private pure func consume_enclosed_type(state: ParserState, mode: EnclosedTypeMode, opened_at: ParserState) -> Result[ParsedType, Diagnostic]:
 	parenthesized ?= expect(
 		opened_at,
 		at_left_paren(opened_at),
@@ -1932,25 +2078,52 @@ private pure func consume_function_type(state: ParserState, purity: Purity, open
 		"write a callback type as pure (Int, String) -> Int",
 	)
 	opened = with_enclosure(parenthesized, Bracketed)
-	parameters: ParsedTypes ?= if at_right_paren(opened):
-		Ok({ types = [], next = opened })
+	members: EnclosedTypes ?= if at_right_paren(opened):
+		Ok(SeparatedTypes([], opened))
 	else:
-		consume_types(opened, [], "expected a callback parameter type")
+		consume_first_enclosed_type(opened)
+	parameters: ParsedTypes = match members:
+		UnseparatedType(only, next): { types = [only], next = next }
+		SeparatedTypes(types, next): { types = types, next = next }
+	closing_message = match mode:
+		PureCallable: "expected ')' after the callback parameter types"
+		TupleOrCallable: "expected ')' after the enclosed types"
+	closing_help = match mode:
+		PureCallable: "write parameter types separated by commas, then ')' and '-> ReturnType'"
+		TupleOrCallable: "separate complete types with commas, then close the parentheses with ')'"
 	closed ?= expect(
 		parameters.next,
 		at_right_paren(parameters.next),
-		"expected ')' after the callback parameter types",
-		"write parameter types separated by commas, then ')' and '-> ReturnType'",
+		closing_message,
+		closing_help,
 	)
-	arrow ?= expect(
-		with_enclosure(closed, state.enclosure),
-		at_arrow(closed),
-		"expected '->' after the callback parameter types",
-		"write a callback type as pure (Int, String) -> Int",
-	)
+	after = with_enclosure(closed, state.enclosure)
+	required: Bool = match mode:
+		PureCallable: True
+		TupleOrCallable: False
+	if or(required, at_arrow(after)):
+		consume_callable_result(state, mode, parameters.types, after)
+	else:
+		span = { parser_span(state) | end = parser_span(parameters.next).end }
+		match members:
+			UnseparatedType(only, _): Ok({ written = only, next = after })
+			SeparatedTypes(types, _):
+				if IntOps.less_than(types.length(), TUPLE_MINIMUM_ELEMENTS):
+					Err(diagnostic(span, "a tuple type requires two to four elements", "write the type itself for one element, or List[Type] for a List type"))
+				else:
+					match types.get(TUPLE_MAXIMUM_ELEMENTS):
+						Some(fifth): Err(diagnostic(type_span(fifth), "tuple types support two to four elements", "nest tuple types or use a named record for more fields"))
+						None: Ok({ written = TupleTypeSyntax(types, span), next = after })
+
+
+private pure func consume_callable_result(state: ParserState, mode: EnclosedTypeMode, parameters: List[TypeSyntax], after: ParserState) -> Result[ParsedType, Diagnostic]:
+	arrow ?= expect(after, at_arrow(after), "expected '->' after the callback parameter types", "write a callback type as pure (Int, String) -> Int")
 	returned ?= consume_type(arrow, "expected a callback return type after '->'")
 	span = { parser_span(state) | end = type_span(returned.written).end }
-	Ok({ written = CallableTypeSyntax(purity, parameters.types, returned.written, span), next = returned.next })
+	purity: Purity = match mode:
+		PureCallable: Pure
+		TupleOrCallable: Impure
+	Ok({ written = CallableTypeSyntax(purity, parameters, returned.written, span), next = returned.next })
 
 
 -- A dot in a named type can only qualify, so no alias set is consulted here.
@@ -1978,9 +2151,9 @@ private pure func consume_named_type(state: ParserState, message: String) -> Res
 
 private pure func consume_type(state: ParserState, message: String) -> Result[ParsedType, Diagnostic]:
 	if at_pure(state):
-		consume_function_type(state, Pure, shifted(state, 1))
+		consume_enclosed_type(state, PureCallable, shifted(state, 1))
 	else if at_left_paren(state):
-		consume_function_type(state, Impure, state)
+		consume_enclosed_type(state, TupleOrCallable, state)
 	else:
 		consume_named_type(state, message)
 
@@ -2140,6 +2313,34 @@ private pure func consume_list_pattern(start: ParserState, opening: Span) -> Res
 	Ok({ pattern = PatternList(elements, spread, span), span = span, next = shifted(current, 1) })
 
 
+private pure func consume_tuple_pattern(start: ParserState, opening: Span) -> Result[PatternResult, Diagnostic]:
+	var current = start
+	var fields: List[ParsedPattern] = []
+	var failure: Option[Diagnostic] = None
+	while and(at_right_paren(current).not(), failure.is_none()):
+		match consume_pattern(current):
+			Err(error): failure = Some(error)
+			Ok(field):
+				if IntOps.equals(fields.length(), TUPLE_MAXIMUM_ELEMENTS):
+					failure = Some(diagnostic(field.span, "tuple patterns support two to four elements", TUPLE_SIZE_HELP))
+				else:
+					fields = fields.append(field.pattern)
+					match list_separator(field.next):
+						ListContinues(next): current = next
+						ListEnds(next):
+							current = next
+							break
+	ready: Void ?= match failure:
+		Some(error): Err(error)
+		None: Ok(void)
+	closed ?= expect(current, at_right_paren(current), "expected ')' after the tuple pattern", "separate two to four patterns with commas, such as (first, _)")
+	span = { opening | end = parser_span(current).end }
+	if IntOps.less_than(fields.length(), TUPLE_MINIMUM_ELEMENTS):
+		Err(diagnostic(span, "a tuple pattern requires two to four elements", "write two to four comma-separated patterns, such as (first, _)"))
+	else:
+		Ok({ pattern = PatternTuple(fields, span), span = span, next = closed })
+
+
 -- A String or Char literal token at `state` as a pattern, or None when
 -- the token is not a literal. A String pattern's escapes decode as in a
 -- String expression.
@@ -2168,6 +2369,8 @@ private pure func consume_alternative(state: ParserState, message: String) -> Re
 		Ok({ pattern = PatternWildcard(parser_span(state)), span = parser_span(state), next = shifted(state, 1) })
 	else if at_left_bracket(state):
 		consume_list_pattern(shifted(state, 1), parser_span(state))
+	else if at_left_paren(state):
+		consume_tuple_pattern(shifted(state, 1), parser_span(state))
 	else:
 		match literal_pattern(state):
 			Some(literal):
@@ -2346,7 +2549,10 @@ private pure func consume_binding(state: ParserState) -> Result[LineForm, Diagno
 			shifted(state, 1)
 		ImmutableBinding:
 			state
-	name ?= consume_name(after_keyword, "expected a binding name")
+	name: ParsedName ?= if at_left_paren(after_keyword):
+		Err(expected_syntax(after_keyword, "tuple destructuring declares immutable names", "omit var before the tuple target; declare individual mutable bindings separately if needed"))
+	else:
+		consume_name(after_keyword, "expected a binding name")
 	annotation ?= consume_optional_annotation(name.next, "expected the binding's type after ':'")
 
 	-- Only an immutable name propagates; `var` keeps the plain binding form.
@@ -2379,6 +2585,61 @@ private pure func consume_binding(state: ParserState) -> Result[LineForm, Diagno
 						Ok(StatementForm(BindingStatement(binding), initializer.next))
 					Err(error): Err(error)
 			Err(error): Err(error)
+
+
+private pure func tuple_declaration_binders(enclosed: ParsedEnclosed) -> Result[List[ParsedBinder], Diagnostic]:
+	match enclosed.contents:
+		GroupedContents(_):
+			Err(diagnostic(enclosed.span, "tuple destructuring requires two to four names", "write two to four comma-separated names or '_', such as (first, _) = value"))
+		TupleContents(members):
+			var binders: List[ParsedBinder] = []
+			var failure: Option[Diagnostic] = None
+			for member in members:
+				match member:
+					BareMember(binder, _): binders = binders.append(binder)
+					ValueMember(value):
+						failure = Some(diagnostic(value.span, FLAT_TUPLE_MESSAGE, FLAT_TUPLE_HELP))
+						break
+			match failure:
+				Some(error): Err(error)
+				None: Ok(binders)
+
+
+private pure func consume_tuple_binding(enclosed: ParsedEnclosed) -> Result[LineForm, Diagnostic]:
+	binders ?= tuple_declaration_binders(enclosed)
+	equals ?= expect(enclosed.next, at_equals(enclosed.next), "tuple destructuring requires '='", "propagate into a name first, then destructure the result")
+	initializer ?= consume_initializer(equals, Assign, BINDING_LINE_MESSAGE, BINDING_LINE_HELP)
+	Ok(StatementForm(TupleBinding(binders, initializer.body, enclosed.span), initializer.next))
+
+
+-- A line beginning with '(' shares the ordinary expression parser's rest
+-- functions after classification, so ranges and logical operators still parse.
+private pure func consume_parenthesized_line(state: ParserState) -> Result[LineForm, Diagnostic]:
+	enclosed ?= consume_enclosed_values(state, parser_span(state))
+	if at_assignment(enclosed.next):
+		consume_tuple_binding(enclosed)
+	else:
+		consume_parenthesized_line_value(enclosed)
+
+
+private pure func consume_parenthesized_line_value(enclosed: ParsedEnclosed) -> Result[LineForm, Diagnostic]:
+	operand ?= finish_enclosed_value(enclosed)
+	range ?= consume_range_rest(operand)
+	conjunction ?= consume_conjunction_rest(range)
+	value ?= consume_disjunction_rest(conjunction)
+	value_line_form(value)
+
+
+private pure func value_line_form(value: ParsedValue) -> Result[LineForm, Diagnostic]:
+	var indexed: Bool = False
+	for application in value.body.applications:
+		match application:
+			TupleIndex(_, _): indexed = True
+			ReceiverInvocation(_) | FieldAccess(_): void
+	if and(indexed, at_assignment(value.next)):
+		Err(expected_syntax(value.next, "tuple elements cannot be assigned", "construct a new tuple and bind it to a name instead"))
+	else:
+		Ok(ValueForm(value))
 
 
 private fixed record OptionalAnnotation {
@@ -2423,8 +2684,12 @@ private pure func consume_block_line(state: ParserState) -> Result[BlockLine, Di
 private pure func consume_line_form(state: ParserState) -> Result[LineForm, Diagnostic]:
 	if and(at_import(state), at_colon(shifted(state, 1))):
 		Err(expected_syntax(state, IMPORT_IN_BODY_MESSAGE, IMPORT_IN_BODY_HELP))
+	else if and(at_wildcard(state), at_assignment(shifted(state, 1))):
+		Err(expected_syntax(state, "expected a return expression", EXPRESSION_HELP))
 	else if at_binding(state):
 		consume_binding(state)
+	else if at_left_paren(state):
+		consume_parenthesized_line(state)
 	else if at_while(state):
 		consume_while(state)
 	else if at_for(state):
@@ -2441,7 +2706,7 @@ private pure func consume_line_form(state: ParserState) -> Result[LineForm, Diag
 				else:
 					consume_value(state)
 				match value_result:
-					Ok(value): Ok(ValueForm(value))
+					Ok(value): value_line_form(value)
 					Err(error): Err(error)
 
 
@@ -2459,12 +2724,60 @@ private pure func consume_while(state: ParserState) -> Result[LineForm, Diagnost
 -- and a loop body.
 private pure func consume_for(state: ParserState) -> Result[LineForm, Diagnostic]:
 	keyword = parser_span(state)
-	binder ?= consume_binder(shifted(state, 1), "expected a loop variable after `for`")
+	binder ?= consume_for_binder(shifted(state, 1))
 	in_word ?= expect(binder.next, at_in(binder.next), "expected `in` after for loop variable", KEYWORD_HELP)
 	iterable ?= consume_header_value(in_word)
 	body ?= consume_header_block(with_context(iterable.next, LoopBody), "expected `:` after for loop iterable")
 	loop: ParsedFor = { binder = binder.binder, iterable = iterable.body, body = body.block, span = { keyword | end = body.block.span.end } }
 	Ok(StatementForm(ForLoop(loop), with_context(body.next, state.context)))
+
+
+private fixed record ForBinderResult {
+	binder: ForBinder,
+	next: ParserState
+}
+
+
+private pure func consume_for_binder(state: ParserState) -> Result[ForBinderResult, Diagnostic]:
+	if at_left_paren(state):
+		consume_tuple_for_binder(state)
+	else:
+		match consume_binder(state, "expected a loop variable after `for`"):
+			Ok(binder): Ok({ binder = SingleForBinder(binder.binder), next = binder.next })
+			Err(error): Err(error)
+
+
+private pure func consume_tuple_for_binder(state: ParserState) -> Result[ForBinderResult, Diagnostic]:
+	var current = shifted(state, 1)
+	var binders: List[ParsedBinder] = []
+	var failure: Option[Diagnostic] = None
+	while and(at_right_paren(current).not(), failure.is_none()):
+		if at_left_paren(current):
+			failure = Some(expected_syntax(current, FLAT_TUPLE_MESSAGE, FLAT_TUPLE_HELP))
+		else:
+			match consume_binder(current, FLAT_TUPLE_MESSAGE):
+				Err(error): failure = Some(error)
+				Ok(binder):
+					if at_colon(binder.next):
+						failure = Some(expected_syntax(binder.next, TUPLE_BINDER_ANNOTATION_MESSAGE, TUPLE_BINDER_ANNOTATION_HELP))
+					else if IntOps.equals(binders.length(), TUPLE_MAXIMUM_ELEMENTS):
+						failure = Some(expected_syntax(current, "tuple binders support two to four elements", TUPLE_SIZE_HELP))
+					else:
+						binders = binders.append(binder.binder)
+						match list_separator(binder.next):
+							ListContinues(next): current = next
+							ListEnds(next):
+								current = next
+								break
+	ready: Void ?= match failure:
+		Some(error): Err(error)
+		None: Ok(void)
+	closed ?= expect(current, at_right_paren(current), FLAT_TUPLE_MESSAGE, FLAT_TUPLE_HELP)
+	span = { parser_span(state) | end = parser_span(current).end }
+	if IntOps.less_than(binders.length(), TUPLE_MINIMUM_ELEMENTS):
+		Err(diagnostic(span, "tuple destructuring requires two to four names", "write two to four comma-separated names or '_', such as (first, _)"))
+	else:
+		Ok({ binder = TupleForBinder(binders, span), next = closed })
 
 
 -- `state` is at `break` or `continue`: a statement of its own line, valid
@@ -2533,6 +2846,8 @@ private pure func statement_end(statement: ParsedStatement) -> Int:
 	match statement:
 		BindingStatement(binding):
 			binding.initializer.span.end
+		TupleBinding(_, initializer, _):
+			initializer.span.end
 		PropagatingBinding(propagation):
 			propagation.value.span.end
 		ExpressionStatement(value):

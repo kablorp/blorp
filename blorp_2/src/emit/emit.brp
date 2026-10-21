@@ -352,6 +352,11 @@ private pure func append_record(
 	var invalid: Option[Diagnostic] = None
 
 	for field in layout.fields:
+		match field:
+			VoidType:
+				position = IntOps.add(position, 1)
+				continue
+			_: void
 		match c_type(field, unions, internal_span()):
 			Ok(name):
 				result = result
@@ -986,7 +991,7 @@ private pure func append_record_ownership(
 						.append_int(index)
 						.concat("(struct blorp_r_")
 						.append_int(index)
-						.concat(" fields){blorp_r_")
+						.concat(" fields){(void)fields;blorp_r_")
 						.append_int(index)
 						.concat(
 							" value=blorp_memory_allocate(sizeof *value);if(!value)abort();atomic_init(&value->references,"
@@ -994,7 +999,12 @@ private pure func append_record_ownership(
 						)
 					position = 0
 
-					for _ in layout.fields:
+					for value_type in layout.fields:
+						match value_type:
+							VoidType:
+								position = IntOps.add(position, 1)
+								continue
+							_: void
 						field = "blorp_rf_"
 							.append_int(index)
 							.concat("_")
@@ -1040,6 +1050,9 @@ private pure func append_operation(
 					var position = 0
 
 					for field in fields:
+						match layout.fields.get(field_number(field.field)):
+							Some(VoidType): continue
+							_: void
 						if IntOps.greater_than(position, 0):
 							result = result.concat(",")
 
@@ -1056,30 +1069,35 @@ private pure func append_operation(
 							.concat(c_value(stored))
 						position = IntOps.add(position, 1)
 
+					if IntOps.equals(position, 0):
+						result = result.concat("0")
 					Ok(result.concat("})"))
 				None: Err(render(span, MissingRecordLayout(owner)))
 		ReadRecordFieldDefinition(field, argument):
 			match records.get(record_number(field_owner(field))):
 				Some(layout):
 
-					value = match argument:
-						UnmanagedArgument(value):
-							value
-						BorrowedArgument(borrow):
-							borrow.value
+					match value_type:
+						VoidType: Ok(output.concat("0"))
+						_:
+							value = match argument:
+								UnmanagedArgument(value):
+									value
+								BorrowedArgument(borrow):
+									borrow.value
 
-					selector = match layout.representation:
-						InlineRecord:
-							"."
-						ManagedRecord:
-							"->"
+							selector = match layout.representation:
+								InlineRecord:
+									"."
+								ManagedRecord:
+									"->"
 
-					Ok(
-						output
-							.concat(c_value(value))
-							.concat(selector)
-							.concat(c_field(field)),
-					)
+							Ok(
+								output
+									.concat(c_value(value))
+									.concat(selector)
+									.concat(c_field(field)),
+							)
 				None: Err(render(span, MissingRecordLayout(field_owner(field))))
 		ParameterDefinition(index):
 			Ok(output.concat(c_parameter(index)))
@@ -2165,9 +2183,9 @@ private pure func c_selection_arm(scope: SelectionEmissionScope, arm: MatchArmId
 
 private pure func c_pattern_field(
 	parent: ConcretePatternPlace, field: Concrete.VariantFieldInstanceId,
-	scrutinee: ValueId, unions: List[ConcreteUnion], span: Span,
+	scrutinee: ValueId, unions: List[ConcreteUnion], records: List[ConcreteRecord], span: Span,
 ) -> Result[String, Diagnostic]:
-	base ?= c_pattern_place(parent, scrutinee, unions, span)
+	base ?= c_pattern_place(parent, scrutinee, unions, records, span)
 	owner = variant_owner(variant_field_variant(field))
 	layout: ConcreteUnion ?= match unions.get(union_number(owner)):
 		Some(found): Ok(found)
@@ -2178,22 +2196,38 @@ private pure func c_pattern_field(
 
 private pure func c_pattern_place(
 	place: ConcretePatternPlace, scrutinee: ValueId,
-	unions: List[ConcreteUnion], span: Span,
+	unions: List[ConcreteUnion], records: List[ConcreteRecord], span: Span,
 ) -> Result[String, Diagnostic]:
 	match place.route:
 		Concrete.MatchRoot: Ok(c_value(scrutinee))
-		Concrete.UnionField(parent, field): c_pattern_field(parent, field, scrutinee, unions, span)
+		Concrete.UnionField(parent, field): c_pattern_field(parent, field, scrutinee, unions, records, span)
+		Concrete.RecordField(parent, field): c_pattern_record_field(place, parent, field, scrutinee, unions, records, span)
 		Concrete.ListElement(parent, index):
-			match c_pattern_place(parent, scrutinee, unions, span):
+			match c_pattern_place(parent, scrutinee, unions, records, span):
 				Err(error): Err(error)
 				Ok(base): Ok("(".concat(base).concat(")->values[").append_int(index).concat("]"))
 
 
+private pure func c_pattern_record_field(
+	place: ConcretePatternPlace, parent: ConcretePatternPlace, field: FieldInstanceId,
+	scrutinee: ValueId, unions: List[ConcreteUnion], records: List[ConcreteRecord], span: Span,
+) -> Result[String, Diagnostic]:
+	base ?= c_pattern_place(parent, scrutinee, unions, records, span)
+	layout ?= records.get(record_number(field_owner(field))).to_result(render(span, MissingRecordLayout(field_owner(field))))
+	match place.value_type:
+		VoidType: Ok("0")
+		_:
+			selector = match layout.representation:
+				InlineRecord: "."
+				ManagedRecord: "->"
+			Ok("(".concat(base).concat(")").concat(selector).concat(c_field(field)))
+
+
 private pure func c_variant_test(
 	place: ConcretePatternPlace, scrutinee: ValueId, variant: VariantInstanceId,
-	unions: List[ConcreteUnion], span: Span,
+	unions: List[ConcreteUnion], records: List[ConcreteRecord], span: Span,
 ) -> Result[String, Diagnostic]:
-	base ?= c_pattern_place(place, scrutinee, unions, span)
+	base ?= c_pattern_place(place, scrutinee, unions, records, span)
 	owner = variant_owner(variant)
 	layout: ConcreteUnion ?= match unions.get(union_number(owner)):
 		Some(found): Ok(found)
@@ -2291,11 +2325,11 @@ private pure func append_selection_node(
 ) -> Result[String, Diagnostic]:
 	match node:
 		Own.TestVariant(place, variant, yes, no):
-			match c_variant_test(place, argument_value(selection.scrutinee), variant, unions, internal_span()):
+			match c_variant_test(place, argument_value(selection.scrutinee), variant, unions, records, internal_span()):
 				Err(error): Err(error)
 				Ok(test): Ok(c_selection_branch(scope, test, yes, no))
 		Own.TestListLength(place, length, yes, no):
-			match c_pattern_place(place, argument_value(selection.scrutinee), unions, internal_span()):
+			match c_pattern_place(place, argument_value(selection.scrutinee), unions, records, internal_span()):
 				Err(error): Err(error)
 				Ok(base):
 					test = match length:
@@ -2303,7 +2337,7 @@ private pure func append_selection_node(
 						MinimumLength(count): "(".concat(base).concat(")->length>=INT64_C(").append_int(count).concat(")")
 					Ok(c_selection_branch(scope, test, yes, no))
 		Own.TestStringBytes(place, bytes, yes, no):
-			match c_pattern_place(place, argument_value(selection.scrutinee), unions, internal_span()):
+			match c_pattern_place(place, argument_value(selection.scrutinee), unions, records, internal_span()):
 				Err(error): Err(error)
 				Ok(base):
 					-- Each node has its own C scope. Static bytes preserve embedded

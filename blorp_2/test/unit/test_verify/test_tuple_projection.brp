@@ -1,0 +1,189 @@
+import:
+	../../../src/check/model as Model
+	../../../src/lower/lower as Lower
+	../../../src/own/own as Own
+	../../../src/specialize/specialize as Concrete
+	../../../src/utils/syntax as Syntax
+	../../../src/verify/verify: verify
+	../ownership_inputs: RecordIds, record_ids, span
+	test: TestSuite
+
+
+private pure func parameter(id: Lower.ValueId, value_type: Concrete.TypeRef) -> Lower.ValueParameter:
+	{ id = id, value_type = value_type, span = span(10) }
+
+
+-- Ownership IR is authored independently of Own, including every owner transfer.
+private pure func selected(ids: RecordIds, field: Concrete.FieldInstanceId, value_type: Concrete.TypeRef) -> Own.OwnershipProgram:
+	root_type = Concrete.RecordType(ids.record_id)
+	root: Own.BorrowedValue = { value = ids.first, source = Own.ParameterBorrow(ids.first) }
+	borrow: Own.BorrowedValue = { value = ids.third, source = Own.PayloadBorrow(ids.first) }
+	join: Own.OwnedJoin = {
+		result = Own.ManagedJoinParameter(parameter(ids.second, Concrete.StringType), Own.owner_id(0)),
+		carried = [],
+		selection = {
+			scrutinee = Own.BorrowedArgument(root),
+			entry = Model.decision_node_id(0),
+			nodes = [Own.EnterArm({
+				arm = Model.match_arm_id(0),
+				operations = [
+					Own.DefineValue({ id = ids.third, value_type = value_type, operation = Own.ReadRecordFieldDefinition(field, Own.BorrowedArgument(root)), result = Own.BorrowedResult(Own.PayloadBorrow(ids.first)), span = span(20) }),
+					Own.AcquireOwner(Own.owner_id(1), borrow, span(21)),
+				],
+				transfers = [Own.OwnedReturn(ids.third, Own.owner_id(1))],
+			})],
+		},
+		arms = [{
+			id = Model.match_arm_id(0),
+			inputs = [Own.ManagedJoinParameter(parameter(ids.fourth, Concrete.StringType), Own.owner_id(2))],
+			operations = [],
+			exit = Own.Yield({ transfer = Own.OwnedReturn(ids.fourth, Own.owner_id(2)), carried = [] }),
+		}],
+	}
+	{
+		records = ids.records.set(Concrete.record_number(ids.record_id), { fields = [Concrete.StringType, Concrete.VoidType], representation = Concrete.ManagedRecord }),
+		unions = [],
+		entrypoint = Syntax.NoArguments(ids.entrypoint, Syntax.IntegerExitStatus),
+		functions = [
+			{ signature = { parameters = [], return_type = Concrete.IntType }, operations = [Own.DefineValue({ id = ids.first, value_type = Concrete.IntType, operation = Own.IntegerDefinition(0), result = Own.UnmanagedResult, span = span(0) })], result = Own.UnmanagedReturn(ids.first) },
+			{ signature = { parameters = [root_type], return_type = Concrete.StringType }, operations = [Own.DefineValue({ id = ids.first, value_type = root_type, operation = Own.ParameterDefinition(0), result = Own.BorrowedResult(Own.ParameterBorrow(ids.first)), span = span(1) }), Own.ExecuteJoin(join)], result = Own.OwnedReturn(ids.second, Own.owner_id(0)) },
+		],
+	}
+
+
+private pure func rejects(program: Own.OwnershipProgram, message: String) -> Bool:
+	match verify(program):
+		Ok(_): False
+		Err(error):
+			(
+				error.message == "ownership verification failed: " + message
+				and error.help == "report this compiler error with the input program"
+				and Syntax.same_span(error.span, span(20))
+			)
+
+
+pure func test_record_selection_checks_the_actual_parent_borrow() -> Bool:
+	match record_ids():
+		Err(_): False
+		Ok(ids): verify(selected(ids, ids.first_field, Concrete.StringType)).is_ok()
+
+
+pure func test_record_selection_rejects_another_layout_field() -> Bool:
+	match record_ids():
+		Err(_): False
+		Ok(ids): rejects(selected(ids, ids.other_field, Concrete.StringType), "field belongs to a different record layout")
+
+
+pure func test_record_selection_rejects_wrong_logical_field_type() -> Bool:
+	match record_ids():
+		Err(_): False
+		Ok(ids): rejects(selected(ids, ids.first_field, Concrete.IntType), "definition type does not match its operation")
+
+
+
+pure func test_record_selection_rejects_an_ordinal_removed_from_layout() -> Bool:
+	match record_ids():
+		Err(_): False
+		Ok(ids):
+			program = selected(ids, ids.second_field, Concrete.StringType)
+			malformed = { program | records = program.records.set(Concrete.record_number(ids.record_id), { fields = [Concrete.VoidType], representation = Concrete.ManagedRecord }) }
+			rejects(malformed, "unknown record field")
+
+
+pure func test_selection_rejects_a_discharged_record_root() -> Bool:
+	match record_ids():
+		Err(_): False
+		Ok(ids):
+			root_type = Concrete.RecordType(ids.record_id)
+			root: Own.BorrowedValue = { value = ids.second, source = Own.OwnerBorrow(Own.owner_id(2)) }
+			join: Own.OwnedJoin = {
+				result = Own.ManagedJoinParameter(parameter(ids.third, Concrete.StringType), Own.owner_id(3)),
+				carried = [],
+				selection = { scrutinee = Own.BorrowedArgument(root), entry = Model.decision_node_id(0), nodes = [Own.EnterArm({
+					arm = Model.match_arm_id(0),
+					operations = [Own.DefineValue({ id = ids.fourth, value_type = Concrete.StringType, operation = Own.ReadRecordFieldDefinition(ids.first_field, Own.BorrowedArgument(root)), result = Own.BorrowedResult(Own.OwnerBorrow(Own.owner_id(2))), span = span(20) })],
+					transfers = [Own.OwnedReturn(ids.fourth, Own.owner_id(4))],
+				})] },
+				arms = [{ id = Model.match_arm_id(0), inputs = [Own.ManagedJoinParameter(parameter(ids.fifth, Concrete.StringType), Own.owner_id(5))], operations = [], exit = Own.Yield({ transfer = Own.OwnedReturn(ids.fifth, Own.owner_id(5)), carried = [] }) }],
+			}
+			program = selected(ids, ids.first_field, Concrete.StringType)
+			helper: Own.OwnedFunction = {
+				signature = { parameters = [], return_type = Concrete.StringType },
+				operations = [
+					Own.DefineValue({ id = ids.first, value_type = Concrete.StringType, operation = Own.StringDefinition("text"), result = Own.OwnedResult(Own.owner_id(0)), span = span(1) }),
+					Own.AcquireOwner(Own.owner_id(1), { value = ids.first, source = Own.OwnerBorrow(Own.owner_id(0)) }, span(2)),
+					Own.DefineValue({ id = ids.second, value_type = root_type, operation = Own.ConstructRecordDefinition(ids.record_id, [{ field = ids.first_field, value = Own.OwnedPayload(ids.first, Own.owner_id(1)) }]), result = Own.OwnedResult(Own.owner_id(2)), span = span(3) }),
+					Own.DropOwner(Own.owner_id(0), span(4)),
+					Own.DropOwner(Own.owner_id(2), span(5)),
+					Own.ExecuteJoin(join),
+				],
+				result = Own.OwnedReturn(ids.third, Own.owner_id(3)),
+			}
+			malformed = { program | records = program.records.set(Concrete.record_number(ids.record_id), { fields = [Concrete.StringType], representation = Concrete.ManagedRecord }), functions = program.functions.set(1, helper) }
+			match verify(malformed):
+				Ok(_): False
+				Err(error):
+					(error.message == "ownership verification failed: borrow refers to discharged owner 2"
+					and error.help == "report this compiler error with the input program"
+					and Syntax.same_span(error.span, span(10)))
+
+
+private pure func nested_selected(ids: RecordIds, retire_before_read: Bool) -> Own.OwnershipProgram:
+	program = selected(ids, ids.first_field, Concrete.StringType)
+	outer = Own.BorrowedArgument({ value = ids.first, source = Own.ParameterBorrow(ids.first) })
+	retired = Own.BorrowedArgument({ value = ids.third, source = Own.OwnerBorrow(Own.owner_id(1)) })
+	outer_projection: Own.OwnershipOperation = Own.DefineValue({ id = ids.third, value_type = Concrete.RecordType(ids.other_record), operation = Own.ReadRecordFieldDefinition(ids.first_field, outer), result = Own.BorrowedResult(Own.PayloadBorrow(ids.first)), span = span(10) })
+	outer_acquisition: Own.OwnershipOperation = Own.AcquireOwner(Own.owner_id(1), { value = ids.third, source = Own.PayloadBorrow(ids.first) }, span(11))
+	outer_drop: Own.OwnershipOperation = Own.DropOwner(Own.owner_id(1), span(12))
+	child_projection: Own.OwnershipOperation = Own.DefineValue({ id = ids.fourth, value_type = Concrete.StringType, operation = Own.ReadRecordFieldDefinition(ids.other_field, retired), result = Own.BorrowedResult(Own.PayloadBorrow(ids.third)), span = span(20) })
+	child_acquisition: Own.OwnershipOperation = Own.AcquireOwner(Own.owner_id(2), { value = ids.fourth, source = Own.PayloadBorrow(ids.third) }, span(21))
+	operations = if retire_before_read:
+		[outer_projection, outer_acquisition, outer_drop, child_projection, child_acquisition]
+	else:
+		[outer_projection, outer_acquisition, child_projection, child_acquisition, outer_drop]
+	join: Own.OwnedJoin = {
+		result = Own.ManagedJoinParameter(parameter(ids.second, Concrete.StringType), Own.owner_id(0)), carried = [],
+		selection = { scrutinee = outer, entry = Model.decision_node_id(0), nodes = [Own.EnterArm({
+			arm = Model.match_arm_id(0),
+			operations = operations,
+			transfers = [Own.OwnedReturn(ids.fourth, Own.owner_id(2))],
+		})] },
+		arms = [{ id = Model.match_arm_id(0), inputs = [Own.ManagedJoinParameter(parameter(ids.fifth, Concrete.StringType), Own.owner_id(3))], operations = [], exit = Own.Yield({ transfer = Own.OwnedReturn(ids.fifth, Own.owner_id(3)), carried = [] }) }],
+	}
+	root_type = Concrete.RecordType(ids.record_id)
+	helper: Own.OwnedFunction = {
+		signature = { parameters = [root_type], return_type = Concrete.StringType },
+		operations = [Own.DefineValue({ id = ids.first, value_type = root_type, operation = Own.ParameterDefinition(0), result = Own.BorrowedResult(Own.ParameterBorrow(ids.first)), span = span(1) }), Own.ExecuteJoin(join)],
+		result = Own.OwnedReturn(ids.second, Own.owner_id(0)),
+	}
+	records = program.records
+		.set(Concrete.record_number(ids.record_id), { fields = [Concrete.RecordType(ids.other_record)], representation = Concrete.ManagedRecord })
+		.set(Concrete.record_number(ids.other_record), { fields = [Concrete.StringType], representation = Concrete.ManagedRecord })
+	malformed = { program | records = records, functions = program.functions.set(1, helper) }
+	malformed
+
+
+pure func test_selected_nested_record_rejects_its_discharged_acquisition() -> Bool:
+	match record_ids():
+		Err(_): False
+		Ok(ids): rejects(nested_selected(ids, True), "borrow refers to discharged owner 1")
+
+
+pure func test_selected_nested_record_allows_retirement_after_child_acquisition() -> Bool:
+	match record_ids():
+		Err(_): False
+		Ok(ids): verify(nested_selected(ids, False)).is_ok()
+
+
+tests: TestSuite = {
+	description = "Independent tuple record projection verification",
+	tests = [
+		("nested acquisition survives until child is secured", test_selected_nested_record_allows_retirement_after_child_acquisition),
+		("nested acquisition lifetime is checked", test_selected_nested_record_rejects_its_discharged_acquisition),
+		("removed logical ordinal is rejected", test_record_selection_rejects_an_ordinal_removed_from_layout),
+		("discharged record root is rejected", test_selection_rejects_a_discharged_record_root),
+		("selected record field verifies", test_record_selection_checks_the_actual_parent_borrow),
+		("another record owner is rejected", test_record_selection_rejects_another_layout_field),
+		("wrong selected field type is rejected", test_record_selection_rejects_wrong_logical_field_type),
+	]
+}

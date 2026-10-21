@@ -9,14 +9,14 @@ import:
 	./declarations: occurrence_fields
 	./errors:
 		CheckError, match_error, checker_invariant, unsupported_form,
-		MatchError(BarePatternName, UnknownConstructorPattern, PatternFieldCountMismatch, UnreachableArm, OrPatternBindingsDiffer, OrPatternBindingTypeMismatch, PatternTypeMismatch, NonExhaustiveMatch, NonExhaustiveStructuralMatch),
+		MatchError(BarePatternName, UnknownConstructorPattern, PatternFieldCountMismatch, UnreachableArm, OrPatternBindingsDiffer, OrPatternBindingTypeMismatch, PatternTypeMismatch, NonExhaustiveMatch, NonExhaustiveStructuralMatch, TuplePatternRequiresTuple, TuplePatternArityMismatch),
 		CheckerInvariant(InvalidCheckedUnion, JoinWithoutArms, UnsupportedPatternReachedResolution),
 		UnsupportedForm(CharPattern),
-		PatternWitness(AnyWitness, VariantWitness, EmptyListWitness, ConsListWitness, OtherStringWitness)
+		PatternWitness(AnyWitness, VariantWitness, EmptyListWitness, ConsListWitness, OtherStringWitness, TupleWitness)
 	./model:
 		BindingDefinition, BindingId, BindingOrigin(MatchCapture), BindingMutability(Immutable),
-		TypeRef(ListType, StringType), TypeUse, UnionOccurrence, same_type, same_variant, union_occurrence,
-		CheckedPatternPlace, CheckedPatternRoute(MatchRoot, UnionField, ListElement),
+		TypeRef(ListType, StringType, TupleType), TypeUse, UnionOccurrence, same_type, same_variant, union_occurrence,
+		CheckedPatternPlace, CheckedPatternRoute(MatchRoot, UnionField, ListElement, RecordField),
 		CheckedPatternArgument(BorrowPlace, CopyListSuffix),
 		CheckedDecisionNode(TestVariant, TestListLength, TestStringBytes, EnterArm),
 		ListLengthTest(ExactLength, MinimumLength), CheckedSelection,
@@ -26,7 +26,7 @@ import:
 	../utils/source: compiler_source
 	../utils/names: same_name
 	../utils/syntax:
-		ParsedPattern(PatternName, PatternWildcard, PatternConstructor, PatternOr, PatternList, PatternString, PatternChar),
+		ParsedPattern(PatternName, PatternWildcard, PatternConstructor, PatternOr, PatternList, PatternString, PatternChar, PatternTuple),
 		PatternHead(BareHead, QualifiedHead), SpreadTarget(SpreadName, SpreadWildcard),
 		Span, WrittenName, pattern_span
 	int as IntOps
@@ -38,6 +38,7 @@ import:
 fixed union Pattern:
 	Anything
 	VariantPattern(VariantId, List[Pattern])
+	TuplePattern(List[Pattern])
 	EmptyListPattern
 	ConsListPattern(PatternChildren)
 	BytesPattern(String)
@@ -235,6 +236,25 @@ private pure func resolve_variant_fields(
 	Ok({ cases = cases, scope = resolved.scope, bindings = resolved.bindings, checks = resolved.checks, next_alternative = resolved.next_alternative, pending_failure = resolved.pending_failure })
 
 
+private pure func resolve_tuple(fields: List[ParsedPattern], span: Span, place: CheckedPatternPlace, scope: List[ScopedValue], ordinal: Int, next: Int, context: ResolutionContext) -> Result[ResolvedPattern, CheckError]:
+	selected: Result[List[TypeRef], CheckError] = match place.value_type:
+		TupleType(elements): Ok(elements)
+		_: Err(match_error(span, TuplePatternRequiresTuple(place.value_type)))
+	types ?= selected
+	counted: Void ?= if IntOps.equals(types.length(), fields.length()):
+		Ok(void)
+	else:
+		Err(match_error(span, TuplePatternArityMismatch(types.length(), fields.length())))
+	var places: List[CheckedPatternPlace] = []
+	var position = 0
+	for value_type in types:
+		places = places.append({ value_type = value_type, route = RecordField(place, position) })
+		position = IntOps.add(position, 1)
+	resolved ?= resolve_fields(fields, places, scope, ordinal, next, context)
+	cases: List[PatternCase] = resolved.parts.map(pure func(part: PatternParts) -> PatternCase: { pattern = TuplePattern(part.patterns), captures = part.captures, alternatives = part.alternatives })
+	Ok({ cases = cases, scope = resolved.scope, bindings = resolved.bindings, checks = resolved.checks, next_alternative = resolved.next_alternative, pending_failure = resolved.pending_failure })
+
+
 private pure func resolve_name(
 	name: WrittenName,
 	place: CheckedPatternPlace,
@@ -379,6 +399,7 @@ private pure func defer_list_capture(error: CheckError, resolved: ResolvedFields
 
 private pure func resolve_pattern(pattern: ParsedPattern, place: CheckedPatternPlace, position: PatternPosition, scope: List[ScopedValue], ordinal: Int, next: Int, context: ResolutionContext) -> Result[ResolvedPattern, CheckError]:
 	match pattern:
+		PatternTuple(fields, span): resolve_tuple(fields, span, place, scope, ordinal, next, context)
 		PatternWildcard(_): Ok(plain(Anything, scope, next))
 		PatternName(name): resolve_name(name, place, position, scope, ordinal, next, context)
 		PatternConstructor(head, fields, span): resolve_constructor(head, fields, span, place, scope, ordinal, next, context)
@@ -397,6 +418,7 @@ pure func unsupported_pattern_form(pattern: ParsedPattern) -> Option[CheckError]
 		PatternChar(span): Some(unsupported_form(span, CharPattern))
 		PatternConstructor(_, fields, _): unsupported_children(fields)
 		PatternOr(fields, _): unsupported_children(fields)
+		PatternTuple(fields, _): unsupported_children(fields)
 		PatternList(fields, _, _): unsupported_children(fields)
 		_: None
 
@@ -414,7 +436,7 @@ pure func supports_root(value_type: TypeRef) -> Bool:
 		Some(_): True
 		None:
 			match value_type:
-				ListType(_) | StringType: True
+				ListType(_) | StringType | TupleType(_): True
 				_: False
 
 
@@ -425,6 +447,7 @@ private fixed union PatternCursor:
 
 private fixed union Head:
 	UnionHead(VariantId, List[TypeRef])
+	TupleHead(List[TypeRef])
 	NilHead
 	ConsHead(TypeRef)
 	StringHead(String)
@@ -465,6 +488,7 @@ private pure func column(place: CheckedPatternPlace, cursor: PatternCursor, cont
 		Some(occurrence): union_column(place, cursor, occurrence, context, span)
 		None:
 			domain: ColumnDomain = match place.value_type:
+				TupleType(elements): ClosedDomain([TupleHead(elements)])
 				ListType(element): ClosedDomain([NilHead, ConsHead(element)])
 				StringType: StringDomain
 				_: ScalarDomain
@@ -493,6 +517,10 @@ private pure func same_head(left: Head, right: Head) -> Bool:
 			match right:
 				UnionHead(other, _): same_variant(id, other)
 				_: False
+		TupleHead(_):
+			match right:
+				TupleHead(_): True
+				_: False
 		NilHead:
 			match right:
 				NilHead: True
@@ -510,6 +538,7 @@ private pure func same_head(left: Head, right: Head) -> Bool:
 private pure func arity(head: Head) -> Int:
 	match head:
 		UnionHead(_, fields): fields.length()
+		TupleHead(fields): fields.length()
 		ConsHead(_): 2
 		NilHead | StringHead(_): 0
 
@@ -519,6 +548,10 @@ private pure func pattern_head(pattern: Pattern, domain: ColumnDomain) -> Option
 		Anything: None
 		EmptyListPattern: Some(NilHead)
 		BytesPattern(bytes): Some(StringHead(bytes))
+		TuplePattern(_):
+			match domain:
+				ClosedDomain([head]): Some(head)
+				_: None
 		ConsListPattern(_):
 			match domain:
 				ClosedDomain(heads):
@@ -546,6 +579,7 @@ private pure func children(pattern: Pattern, head: Head) -> List[Pattern]:
 	match pattern:
 		Anything: repeat(Anything, arity(head))
 		VariantPattern(_, fields): fields
+		TuplePattern(fields): fields
 		ConsListPattern(parts): [parts.head, parts.tail]
 		EmptyListPattern | BytesPattern(_): []
 
@@ -553,6 +587,10 @@ private pure func children(pattern: Pattern, head: Head) -> List[Pattern]:
 private pure func matches_head(pattern: Pattern, head: Head) -> Bool:
 	match pattern:
 		Anything: True
+		TuplePattern(_):
+			match head:
+				TupleHead(_): True
+				_: False
 		VariantPattern(id, _): has_variant(head, id)
 		ConsListPattern(_): is_cons(head)
 		EmptyListPattern:
@@ -614,6 +652,7 @@ private pure func child_columns(parent: Column, head: Head, context: ResolutionC
 	place = root_place(parent.cursor)
 	match head:
 		UnionHead(id, fields): union_child_columns(place, id, fields, context, span)
+		TupleHead(fields): tuple_child_columns(place, fields, context, span)
 		ConsHead(element): list_child_columns(place, list_skip(parent.cursor), element, context, span)
 		NilHead | StringHead(_): Ok([])
 
@@ -624,6 +663,24 @@ private pure func union_child_columns(parent: CheckedPatternPlace, id: VariantId
 	var failure: Option[CheckError] = None
 	for value_type in fields:
 		place: CheckedPatternPlace = { value_type = value_type, route = UnionField(parent, id, ordinal) }
+		match column(place, ValueCursor(place), context, span):
+			Ok(child): columns = columns.append(child)
+			Err(error):
+				failure = Some(error)
+				break
+		ordinal = IntOps.add(ordinal, 1)
+	ready: Void ?= match failure:
+		Some(error): Err(error)
+		None: Ok(void)
+	Ok(columns)
+
+
+private pure func tuple_child_columns(parent: CheckedPatternPlace, fields: List[TypeRef], context: ResolutionContext, span: Span) -> Result[List[Column], CheckError]:
+	var columns: List[Column] = []
+	var ordinal = 0
+	var failure: Option[CheckError] = None
+	for value_type in fields:
+		place: CheckedPatternPlace = { value_type = value_type, route = RecordField(parent, ordinal) }
 		match column(place, ValueCursor(place), context, span):
 			Ok(child): columns = columns.append(child)
 			Err(error):
@@ -648,6 +705,7 @@ private pure func wrap_witness(head: Head, witnesses: List[PatternWitness]) -> L
 	rest = witnesses.drop(arity(head))
 	witness: PatternWitness = match head:
 		UnionHead(id, _): VariantWitness(id, fields)
+		TupleHead(_): TupleWitness(fields)
 		NilHead: EmptyListWitness
 		ConsHead(_):
 			match fields:
@@ -664,6 +722,7 @@ private pure func pattern_witness(pattern: Pattern) -> PatternWitness:
 	match pattern:
 		Anything: AnyWitness
 		VariantPattern(id, fields): VariantWitness(id, fields.map(pattern_witness))
+		TuplePattern(fields): TupleWitness(fields.map(pattern_witness))
 		EmptyListPattern: EmptyListWitness
 		ConsListPattern(parts):
 			ConsListWitness({
@@ -946,11 +1005,12 @@ private pure func compile_split(rows: List[PatternRow], current: Column, followi
 	no ?= compile_rows(excluding_rows(rows, head), [exclude_head(current, head)].concat(following), nodes, context, span)
 	yes ?= compile_rows(specialize_rows(rows, head), fields.concat(following), no.nodes, context, span)
 	place = root_place(current.cursor)
-	test: CheckedDecisionNode = match head:
-		UnionHead(variant, _): TestVariant(place, variant, yes.entry, no.entry)
-		NilHead: TestListLength(place, ExactLength(list_skip(current.cursor)), yes.entry, no.entry)
-		ConsHead(_): TestListLength(place, MinimumLength(IntOps.add(list_skip(current.cursor), 1)), yes.entry, no.entry)
-		StringHead(bytes): TestStringBytes(place, bytes, yes.entry, no.entry)
+	test: CheckedDecisionNode ?= match head:
+		TupleHead(_): Err(checker_invariant(span, UnsupportedPatternReachedResolution))
+		UnionHead(variant, _): Ok(TestVariant(place, variant, yes.entry, no.entry))
+		NilHead: Ok(TestListLength(place, ExactLength(list_skip(current.cursor)), yes.entry, no.entry))
+		ConsHead(_): Ok(TestListLength(place, MinimumLength(IntOps.add(list_skip(current.cursor), 1)), yes.entry, no.entry))
+		StringHead(bytes): Ok(TestStringBytes(place, bytes, yes.entry, no.entry))
 	Ok({ nodes = yes.nodes.append(test), entry = decision_node_id(yes.nodes.length()) })
 
 

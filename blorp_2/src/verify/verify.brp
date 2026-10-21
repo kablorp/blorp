@@ -40,7 +40,7 @@ import:
 	../utils/source: compiler_source
 	../specialize/specialize:
 		CallTarget(UserFunction, RuntimeFunction),
-		ConcretePatternPlace, ConcretePatternRoute(MatchRoot, UnionField, ListElement),
+		ConcretePatternPlace, ConcretePatternRoute(MatchRoot, UnionField, RecordField, ListElement),
 		ConcreteRecord,
 		ConcreteUnion,
 		FieldInstanceId,
@@ -1194,42 +1194,7 @@ private pure func operation_value(
 						)
 				Err(error): Err(error)
 		ReadRecordFieldDefinition(field, argument):
-			source = match argument:
-				UnmanagedArgument(value):
-					value
-				BorrowedArgument(borrow):
-					borrow.value
-
-			match known_value(state, source, definition.span):
-				Ok(known):
-
-					match known.value_type:
-						RecordType(owner):
-							match record_layout(owner, records, definition.span):
-								Ok(layout):
-									match verify_arguments(
-										[argument],
-										[known.value_type],
-										state,
-										unions,
-										definition.span,
-										records,
-										discharged,
-										owners,
-									):
-										Ok(live):
-											match record_field_type(field, owner, layout, definition.span):
-												Err(error): Err(error)
-												Ok(expected):
-													parent: Option[BorrowedValue] = match argument:
-														BorrowedArgument(borrow): Some(borrow)
-														UnmanagedArgument(_): None
-													definition_value(definition, expected, parent, None)
-										Err(error): Err(error)
-								Err(error): Err(error)
-						_:
-							Err(verification_error(definition.span, "field projection requires a record value"))
-				Err(error): Err(error)
+			record_projection_value(field, argument, definition, state, unions, records, projection, discharged, owners)
 		ParameterDefinition(index):
 			if IntOps.less_than(index, state.parameters.length()):
 				Err(verification_error(definition.span, "function parameter is defined more than once"))
@@ -1653,13 +1618,41 @@ private pure func verified_projection_parent(
 					match verify_match_argument(root, state, unions, records, span, discharged, owners):
 						Err(error): Err(error)
 						Ok(_):
-							match verify_pattern_place(place, root_value.value_type, facts, unions, span):
+							match verify_pattern_place(place, root_value.value_type, facts, unions, span, records):
 								Err(error): Err(error)
 								Ok(_):
 									borrow: Option[BorrowedValue] = match parent_argument:
 										BorrowedArgument(parent): Some(parent)
 										UnmanagedArgument(_): None
 									Ok({ place = place, borrow = borrow })
+
+
+-- Ordinary record reads and selected product fields use the same layout and
+-- borrow checks. Selection reads additionally publish their verified path.
+private pure func record_projection_value(
+	field: FieldInstanceId, argument: OwnedArgument, definition: OwnedDefinition,
+	state: VerificationFacts, unions: List[ConcreteUnion], records: List[ConcreteRecord],
+	projection: ProjectionContext, discharged: List[Bool], owners: List[OwnerState],
+) -> Result[KnownValue, Diagnostic]:
+	source = argument_value(argument)
+	known ?= known_value(state, source, definition.span)
+	owner_result: Result[RecordInstanceId, Diagnostic] = match known.value_type:
+		RecordType(id): Ok(id)
+		_: Err(verification_error(definition.span, "field projection requires a record value"))
+	owner ?= owner_result
+	layout ?= record_layout(owner, records, definition.span)
+	live ?= verify_arguments([argument], [known.value_type], state, unions, definition.span, records, discharged, owners)
+	expected ?= record_field_type(field, owner, layout, definition.span)
+	match projection:
+		NoProjection:
+			parent: Option[BorrowedValue] = match argument:
+				BorrowedArgument(borrow): Some(borrow)
+				UnmanagedArgument(_): None
+			definition_value(definition, expected, parent, None)
+		SelectionProjection(_, _):
+			match verified_projection_parent(source, state, projection, unions, records, definition.span, discharged, owners):
+				Err(error): Err(error)
+				Ok(parent): definition_value(definition, expected, parent.borrow, Some({ value_type = expected, route = RecordField(parent.place, field) }))
 
 
 private pure func payload_projection_value(
@@ -2490,6 +2483,17 @@ private pure func same_place(left: ConcretePatternPlace, right: ConcretePatternP
 						else:
 							False
 					_: False
+			RecordField(parent, field):
+				match right.route:
+					RecordField(other_parent, other_field):
+						if IntOps.equals(record_number(field_owner(field)), record_number(field_owner(other_field))):
+							if IntOps.equals(field_number(field), field_number(other_field)):
+								same_place(parent, other_parent)
+							else:
+								False
+						else:
+							False
+					_: False
 			ListElement(parent, index):
 				match right.route:
 					ListElement(other_parent, other_index):
@@ -2559,19 +2563,38 @@ private pure func singleton_variant(possible: List[Bool], ordinal: Int) -> Bool:
 
 -- Every ancestor is checked before the next borrowed field or element can be
 -- evaluated. Equal ordinals in another nominal union prove nothing.
-private pure func verify_pattern_place(place: ConcretePatternPlace, root_type: TypeRef, facts: List[PlaceFact], unions: List[ConcreteUnion], span: Span) -> Result[Void, Diagnostic]:
+private pure func verify_pattern_place(place: ConcretePatternPlace, root_type: TypeRef, facts: List[PlaceFact], unions: List[ConcreteUnion], span: Span, records: List[ConcreteRecord]) -> Result[Void, Diagnostic]:
 	match place.route:
 		MatchRoot:
 			if same_type(place.value_type, root_type):
 				Ok(void)
 			else:
 				Err(verification_error(span, "pattern root type does not match its scrutinee"))
-		UnionField(parent, field): verify_field_place(place, parent, field, root_type, facts, unions, span)
-		ListElement(parent, index): verify_element_place(place, parent, index, root_type, facts, unions, span)
+		UnionField(parent, field): verify_field_place(place, parent, field, root_type, facts, unions, span, records)
+		RecordField(parent, field): verify_record_place(place, parent, field, root_type, facts, unions, span, records)
+		ListElement(parent, index): verify_element_place(place, parent, index, root_type, facts, unions, span, records)
 
 
-private pure func verify_field_place(place: ConcretePatternPlace, parent: ConcretePatternPlace, field: VariantFieldInstanceId, root_type: TypeRef, facts: List[PlaceFact], unions: List[ConcreteUnion], span: Span) -> Result[Void, Diagnostic]:
-	ancestor ?= verify_pattern_place(parent, root_type, facts, unions, span)
+private pure func verify_record_place(
+	place: ConcretePatternPlace, parent: ConcretePatternPlace, field: FieldInstanceId,
+	root_type: TypeRef, facts: List[PlaceFact], unions: List[ConcreteUnion], span: Span,
+	records: List[ConcreteRecord],
+) -> Result[Void, Diagnostic]:
+	ancestor ?= verify_pattern_place(parent, root_type, facts, unions, span, records)
+	owner_result: Result[RecordInstanceId, Diagnostic] = match parent.value_type:
+		RecordType(id): Ok(id)
+		_: Err(verification_error(span, "pattern record projection requires a record parent"))
+	owner ?= owner_result
+	layout ?= record_layout(owner, records, span)
+	expected ?= record_field_type(field, owner, layout, span)
+	if same_type(expected, place.value_type):
+		Ok(void)
+	else:
+		Err(verification_error(span, "pattern record field type does not match its layout"))
+
+
+private pure func verify_field_place(place: ConcretePatternPlace, parent: ConcretePatternPlace, field: VariantFieldInstanceId, root_type: TypeRef, facts: List[PlaceFact], unions: List[ConcreteUnion], span: Span, records: List[ConcreteRecord]) -> Result[Void, Diagnostic]:
+	ancestor ?= verify_pattern_place(parent, root_type, facts, unions, span, records)
 	selected = variant_field_variant(field)
 	nominal: Void ?= if same_type(parent.value_type, UnionType(variant_owner(selected))):
 		Ok(void)
@@ -2590,8 +2613,8 @@ private pure func verify_field_place(place: ConcretePatternPlace, parent: Concre
 		Err(verification_error(span, "pattern field lacks its selected variant guard"))
 
 
-private pure func verify_element_place(place: ConcretePatternPlace, parent: ConcretePatternPlace, index: Int, root_type: TypeRef, facts: List[PlaceFact], unions: List[ConcreteUnion], span: Span) -> Result[Void, Diagnostic]:
-	ancestor ?= verify_pattern_place(parent, root_type, facts, unions, span)
+private pure func verify_element_place(place: ConcretePatternPlace, parent: ConcretePatternPlace, index: Int, root_type: TypeRef, facts: List[PlaceFact], unions: List[ConcreteUnion], span: Span, records: List[ConcreteRecord]) -> Result[Void, Diagnostic]:
+	ancestor ?= verify_pattern_place(parent, root_type, facts, unions, span, records)
 	element ?= list_element_type(parent.value_type, span)
 	typed: Void ?= if same_type(element, place.value_type):
 		Ok(void)
@@ -2755,23 +2778,23 @@ private fixed record DecisionBranches {
 }
 
 
-private pure func decision_branches(node: OwnedDecisionNode, root_type: TypeRef, facts: List[PlaceFact], unions: List[ConcreteUnion], span: Span) -> Result[DecisionBranches, Diagnostic]:
+private pure func decision_branches(node: OwnedDecisionNode, root_type: TypeRef, facts: List[PlaceFact], unions: List[ConcreteUnion], span: Span, records: List[ConcreteRecord]) -> Result[DecisionBranches, Diagnostic]:
 	match node:
-		TestVariant(place, variant, _, _): variant_branches(place, variant, root_type, facts, unions, span)
-		TestListLength(place, test, _, _): length_branches(place, test, root_type, facts, unions, span)
-		TestStringBytes(place, _, _, _): string_branches(place, root_type, facts, unions, span)
+		TestVariant(place, variant, _, _): variant_branches(place, variant, root_type, facts, unions, span, records)
+		TestListLength(place, test, _, _): length_branches(place, test, root_type, facts, unions, span, records)
+		TestStringBytes(place, _, _, _): string_branches(place, root_type, facts, unions, span, records)
 		EnterArm(_): Ok({ yes = Some(facts), no = Some(facts) })
 
 
-private pure func variant_branches(place: ConcretePatternPlace, variant: VariantInstanceId, root_type: TypeRef, facts: List[PlaceFact], unions: List[ConcreteUnion], span: Span) -> Result[DecisionBranches, Diagnostic]:
-	valid ?= verify_pattern_place(place, root_type, facts, unions, span)
+private pure func variant_branches(place: ConcretePatternPlace, variant: VariantInstanceId, root_type: TypeRef, facts: List[PlaceFact], unions: List[ConcreteUnion], span: Span, records: List[ConcreteRecord]) -> Result[DecisionBranches, Diagnostic]:
+	valid ?= verify_pattern_place(place, root_type, facts, unions, span, records)
 	yes ?= refine_variants(place, variant, True, facts, unions, span)
 	no ?= refine_variants(place, variant, False, facts, unions, span)
 	Ok({ yes = yes, no = no })
 
 
-private pure func length_branches(place: ConcretePatternPlace, test: ListLengthTest, root_type: TypeRef, facts: List[PlaceFact], unions: List[ConcreteUnion], span: Span) -> Result[DecisionBranches, Diagnostic]:
-	valid ?= verify_pattern_place(place, root_type, facts, unions, span)
+private pure func length_branches(place: ConcretePatternPlace, test: ListLengthTest, root_type: TypeRef, facts: List[PlaceFact], unions: List[ConcreteUnion], span: Span, records: List[ConcreteRecord]) -> Result[DecisionBranches, Diagnostic]:
+	valid ?= verify_pattern_place(place, root_type, facts, unions, span, records)
 	element ?= list_element_type(place.value_type, span)
 	count = match test:
 		ExactLength(length): length
@@ -2783,8 +2806,8 @@ private pure func length_branches(place: ConcretePatternPlace, test: ListLengthT
 	Ok({ yes = refine_lengths(place, test, True, facts), no = refine_lengths(place, test, False, facts) })
 
 
-private pure func string_branches(place: ConcretePatternPlace, root_type: TypeRef, facts: List[PlaceFact], unions: List[ConcreteUnion], span: Span) -> Result[DecisionBranches, Diagnostic]:
-	valid ?= verify_pattern_place(place, root_type, facts, unions, span)
+private pure func string_branches(place: ConcretePatternPlace, root_type: TypeRef, facts: List[PlaceFact], unions: List[ConcreteUnion], span: Span, records: List[ConcreteRecord]) -> Result[DecisionBranches, Diagnostic]:
+	valid ?= verify_pattern_place(place, root_type, facts, unions, span, records)
 	if same_type(place.value_type, StringType):
 		Ok({ yes = Some(facts), no = Some(facts) })
 	else:
@@ -2797,6 +2820,7 @@ private pure func selection_possibilities(
 	selection: OwnedSelection,
 	scrutinee: KnownValue,
 	unions: List[ConcreteUnion],
+	records: List[ConcreteRecord],
 ) -> Result[List[Option[List[PlaceFact]]], Diagnostic]:
 	span = scrutinee.span
 	var incoming: List[Option[List[PlaceFact]]] = []
@@ -2817,7 +2841,7 @@ private pure func selection_possibilities(
 			Some(node):
 				match incoming.get(position):
 					Some(Some(facts)):
-						match decision_branches(node, scrutinee.value_type, facts, unions, span):
+						match decision_branches(node, scrutinee.value_type, facts, unions, span, records):
 							Err(error): failure = Some(error)
 							Ok(branches):
 								match node:
@@ -2904,6 +2928,7 @@ private pure func verify_selection_edge(
 		allowed = match operation:
 			DefineValue(definition):
 				match definition.operation:
+					ReadRecordFieldDefinition(_, argument): edge_value_allowed(argument_value(argument), root, initial.facts.first_value)
 					PayloadDefinition(_, source): edge_value_allowed(source, root, initial.facts.first_value)
 					ListElementDefinition(_, source): edge_value_allowed(source, root, initial.facts.first_value)
 					ListSuffixDefinition(source, _): edge_value_allowed(argument_value(source), root, initial.facts.first_value)
@@ -2962,7 +2987,7 @@ private pure func verify_selection(
 	span: Span = { source = compiler_source(), start = 0, end = 0 }
 	scrutinee ?= known_value(state.facts, argument_value(selection.scrutinee), span)
 	live ?= verify_match_argument(selection.scrutinee, state.facts, unions, records, scrutinee.span, state.discharged, state.owners)
-	incoming ?= selection_possibilities(selection, scrutinee, unions)
+	incoming ?= selection_possibilities(selection, scrutinee, unions, records)
 	var seen: List[Int] = []
 	var failure: Option[Diagnostic] = None
 	var target_ordinal = 0

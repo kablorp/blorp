@@ -1,7 +1,7 @@
 import:
 	../../../src/check/check: CheckedProgram, check, checked_functions
 	../../../src/check/model as Checked
-	../../../src/utils/syntax: Diagnostic
+	../../../src/utils/syntax: Diagnostic, DiagnosticNote(PreviousDeclaration)
 	../../../src/utils/source: module_source, root_module_id, same_source
 	../module_input: TEST_BASE, parse_modules_with_base
 	../input: setup_diagnostic, checked_tail_join
@@ -241,9 +241,104 @@ pure func test_nested_selection_keeps_one_body_per_source_arm_under_depth() -> B
 			tests == depth and join.arms.length() == 2
 
 
+pure func test_tuple_capture_routes_keep_logical_ordinals() -> Bool:
+	source = "pure func chosen(value: (Int, String, Bool)) -> String:\n    match value:\n        (_, text, _): text\n" + MAIN
+	match joined(source):
+		Some(join):
+			match join.selection.nodes:
+				[Checked.EnterArm(_, [Checked.BorrowPlace(place)])]:
+					match place.route:
+						Checked.RecordField(parent, 1):
+							match parent.value_type:
+								Checked.TupleType(fields): fields.length() == 3 and Checked.same_type(place.value_type, Checked.StringType)
+								_: False
+						_: False
+				_: False
+		None: False
+
+
+pure func test_tuple_missing_witness_preserves_nested_constructor() -> Bool:
+	prefix = "pure func chosen(value: (Option[Int], Int)) -> Int:\n    "
+	rejects(prefix + "match value:\n        (Some(item), _): item\n" + MAIN, prefix.length(), 5, "non-exhaustive match", "add an arm for the missing pattern: (None, _)")
+
+
+pure func test_tuple_pattern_arity_has_exact_diagnostic() -> Bool:
+	prefix = "pure func chosen(value: (Int, Int, Int)) -> Int:\n    match value:\n        "
+	rejects(prefix + "(_, _): 0\n" + MAIN, prefix.length(), 6, "tuple pattern element count does not match the tuple", "expected 3 elements, got 2; write one pattern per tuple element")
+
+
+pure func test_tuple_pattern_rejects_nominal_record() -> Bool:
+	prefix = "fixed record Pair { first: Int, second: Int }\npure func chosen(value: Option[Pair]) -> Int:\n    match value:\n        Some("
+	rejects(prefix + "(_, _)): 0\n        None: 0\n" + MAIN, prefix.length(), 6, "tuple pattern requires a tuple value", "match a structural tuple, or use the named record's fields explicitly")
+
+
+pure func test_nested_tuple_patterns_project_through_union_and_record_routes() -> Bool:
+	source = "pure func chosen(value: Option[(Int, (String, Int))]) -> Int:\n    match value:\n        Some((_, (_, number))): number\n        None: 0\n" + MAIN
+	match joined(source):
+		None: False
+		Some(join):
+			var found = False
+			for node in join.selection.nodes:
+				match node:
+					Checked.EnterArm(_, [Checked.BorrowPlace(place)]):
+						match place.route:
+							Checked.RecordField(inner, 1):
+								match inner.route:
+									Checked.RecordField(outer, 1):
+										match outer.route:
+											Checked.UnionField(_, _, 0): found = Checked.same_type(place.value_type, Checked.IntType)
+											_: void
+									_: void
+							_: void
+					_: void
+			found
+
+
+pure func test_tuple_alternative_captures_follow_corresponding_ordinals() -> Bool:
+	source = "pure func chosen(value: (Option[Int], Option[Int])) -> Int:\n    match value:\n        (Some(item), _) | (_, Some(item)): item\n        (None, None): 0\n" + MAIN
+	program(source).is_ok()
+
+
+pure func test_tuple_alternatives_reject_different_capture_types() -> Bool:
+	prefix = "pure func chosen(value: (Option[Int], Option[String])) -> Int:\n    match value:\n        (Some(item), _) | (_, Some("
+	rejects(prefix + "item)): 0\n        (None, None): 0\n" + MAIN, prefix.length(), 4, "or-pattern binding has different types", "bind each name to the same type in every alternative, or use separate match arms")
+
+
+pure func test_tuple_declaration_type_diagnostic_is_exact() -> Bool:
+	prefix = "func main() -> Int:\n    "
+	rejects(prefix + "(first, second) = 1\n    0\n", prefix.length(), 15, "tuple destructuring requires a tuple value", "destructure a structural tuple with one name or '_' per element")
+
+
+pure func test_tuple_declaration_arity_diagnostic_is_exact() -> Bool:
+	prefix = "func main() -> Int:\n    "
+	rejects(prefix + "(first, second) = (1, 2, 3)\n    0\n", prefix.length(), 15, "tuple binder count does not match the tuple", "expected 3 binders, got 2; write one name or '_' per tuple element")
+
+
+pure func test_tuple_declaration_cannot_reassign_existing_binding() -> Bool:
+	prefix = "func main() -> Int:\n    var "
+	before = prefix + "first = 1\n    ("
+	match program(before + "first, second) = (2, 3)\n    first\n"):
+		Ok(_): False
+		Err(error):
+			previous = match error.note:
+				Some(PreviousDeclaration(span)): span.start == prefix.length() and span.end == prefix.length() + 5
+				_: False
+			error.span.start == before.length() and error.span.end == before.length() + 5 and error.message == "`first` is already a local in this function" and error.help == "choose a different name for this binding" and previous
+
+
 tests: TestSuite = {
 	description = "Typed structural matrix selection",
 	tests = [
+		("tuple declaration requires structural tuple diagnostic", test_tuple_declaration_type_diagnostic_is_exact),
+		("tuple declaration arity diagnostic", test_tuple_declaration_arity_diagnostic_is_exact),
+		("tuple declaration does not reassign existing binding", test_tuple_declaration_cannot_reassign_existing_binding),
+		("nested tuple routes preserve union and tuple ordinals", test_nested_tuple_patterns_project_through_union_and_record_routes),
+		("tuple alternatives share corresponding captures", test_tuple_alternative_captures_follow_corresponding_ordinals),
+		("tuple alternatives require exact capture types", test_tuple_alternatives_reject_different_capture_types),
+		("tuple captures retain logical ordinals", test_tuple_capture_routes_keep_logical_ordinals),
+		("tuple witness keeps nested constructor", test_tuple_missing_witness_preserves_nested_constructor),
+		("tuple pattern arity diagnostic", test_tuple_pattern_arity_has_exact_diagnostic),
+		("tuple pattern rejects nominal record", test_tuple_pattern_rejects_nominal_record),
 		("nested missing witness names inner constructor", test_nested_missing_witness_identifies_the_inner_constructor),
 		("covered nested constructor has later span", test_nested_covered_constructor_has_its_exact_later_span),
 		("nested coverage precedes binder mismatch", test_nested_or_coverage_precedes_renamed_binding_mismatch),

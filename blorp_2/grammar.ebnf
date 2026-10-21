@@ -172,12 +172,20 @@
    Discarded expressions still undergo ordinary name, type and purity checking.
    Matches are admitted as whole initializers, statements, function tails,
    and arm or branch values. Their
-   scrutinee must synthesize a union, List or String type. A union constructor
+   scrutinee must synthesize a union, List, String or structural tuple type. A union constructor
    alone does not provide a receiving type; use a typed binding or function result. A whole-arm bare name must denote a visible
    constructor of that union; an unknown name is an error and only `_` is a
    catch-all. Constructors from another module must be imported with their union.
    Bind the scrutinee before matching when an arm needs its whole value.
    Constructor patterns contain one recursive pattern per declared field.
+   Tuple patterns contain one recursive pattern per ordered element, including
+   tuples nested inside constructor fields. Structural tuples have two to four
+   elements; singleton parentheses group a value or type, and a trailing comma
+   does not make a singleton tuple. Element expressions evaluate once in written
+   order, including Void elements. Tuple literal indices select logical fields;
+   their integer literal and range are established during checking. Tuple types
+   remain distinct from nominal records. After specialization they share managed
+   record storage and ownership; Void elements require no physical field.
    List patterns select exact lengths or a prefix with a final rest capture;
    String patterns compare all decoded UTF8 bytes, including embedded NUL.
    Alternatives share one body and bind the same names at the same types.
@@ -192,6 +200,13 @@
    are rejected. Annotated occurrences declare a new binding and resolve the
    written type before checking the initializer against it; unannotated new
    locals infer their type. Reassignment retains the established type.
+   Flat tuple declarations always introduce immutable names and permit '_' to
+   discard elements. Flat for tuple binders introduce the same names per item.
+   Both forms require two to four names or wildcards and evaluate the subject
+   once. Nested declaration/for destructuring, member annotations, tuple binding
+   propagation, destructuring reassignment and subscript assignment remain
+   unsupported. An ordinary mutable variable may be replaced with another tuple
+   of its established type.
    Bare constructors need a receiving type. Every initializer is
    checked and evaluated, even when its binding is unused. An arm may contain
    an inline expression or a depth-three block of statements and a final value.
@@ -390,6 +405,8 @@ record_update    = "{" spaces expression spaces "|" spaces record_field { spaces
 (* A group is transparent: its expression is the result, and postfix
    operations may follow the closing parenthesis. *)
 group            = "(" spaces expression spaces ")" ;
+tuple            = "(" spaces expression spaces "," spaces expression
+                   [ spaces "," spaces expression [ spaces "," spaces expression ] ] trailing_comma spaces ")" ;
 (* A qualified form is minted only when its first identifier is a module
    alias of the import block, even when a local of that spelling is in
    scope; otherwise `name . name` is a UFCS call or field read. Qualified
@@ -403,10 +420,11 @@ qualified_call   = qualified_name spaces "(" spaces [ arguments ] spaces ")" ;
    supplies one, otherwise the first element's; an empty literal needs that
    context. *)
 list_literal     = "[" spaces [ arguments ] spaces "]" ;
-primary          = "void" | float | integer | string_literal | pipe_string | raw_string | qualified_call | qualified_name
-                 | opaque_conversion | identifier | direct_call | list_literal | record_literal | record_update | group ;
+primary          = "void" | "_" | float | integer | string_literal | pipe_string | raw_string | qualified_call | qualified_name
+                 | opaque_conversion | identifier | direct_call | list_literal | record_literal | record_update | group | tuple ;
 receiver_call    = spaces "." spaces callable_name spaces "(" spaces [ arguments ] spaces ")" ;
 field_read       = spaces "." spaces identifier ;
+tuple_index      = spaces "[" spaces expression spaces "]" ;
 (* Precedence, lowest first, as in the host: "or", "and", "not", "..",
    then postfix operations; "or" and "and" associate left. A range has no
    postfix operations of its own. A `not` token followed by `(` always starts
@@ -452,7 +470,7 @@ else_branch      = "else" spaces ":" NEWLINE INDENT block DEDENT | "else" requir
    `match` header has no line end to consume them, so an indented chain
    there is an error. *)
 indented_chain   = NEWLINE INDENT "." ( receiver_call | field_read ) { receiver_call | field_read | NEWLINE "." ( receiver_call | field_read ) | indented_chain } [ NEWLINE ] DEDENT ;
-operand          = control | primary { receiver_call | field_read | NEWLINE "." ( receiver_call | field_read ) | indented_chain } ;
+operand          = control | primary { receiver_call | field_read | tuple_index | NEWLINE "." ( receiver_call | field_read ) | indented_chain } ;
 range_expr       = operand [ spaces ".." spaces operand ] ;
 not_expr         = "not" required_spaces not_expr | range_expr ;
 and_expr         = not_expr { required_spaces "and" required_spaces not_expr } ;
@@ -460,8 +478,11 @@ or_expr          = and_expr { required_spaces "or" required_spaces and_expr } ;
 expression       = or_expr ;
 (* In a type, a dot can only qualify, so no alias set is consulted. *)
 type_arguments   = "[" spaces type_annotation { spaces "," spaces type_annotation } trailing_comma spaces "]" ;
-type_annotation  = named_type | function_type ;
+type_annotation  = named_type | function_type | grouped_type | tuple_type ;
 named_type       = identifier [ spaces "." spaces identifier ] spaces [ type_arguments ] ;
+grouped_type     = "(" spaces type_annotation spaces ")" ;
+tuple_type       = "(" spaces type_annotation spaces "," spaces type_annotation
+                   [ spaces "," spaces type_annotation [ spaces "," spaces type_annotation ] ] trailing_comma spaces ")" ;
 function_type    = [ "pure" spaces ] "(" spaces [ type_annotation { spaces "," spaces type_annotation } trailing_comma ]
                    spaces ")" spaces "->" spaces type_annotation ;
 (* Function types recurse through parameters/results and are ordinary value types,
@@ -483,7 +504,7 @@ function_header  = [ "pure" required_spaces ] "func" required_spaces callable_na
                    NEWLINE ;
 tail_annotation  = "@tail_recursive" (required_spaces | NEWLINE) ;
 function         = [ tail_annotation ] function_header INDENT body DEDENT ;
-(* Constructor and List fields contain recursive patterns. Alternatives
+(* Constructor, tuple and List fields contain recursive patterns. Alternatives
    separated by "|" must bind the same names with identical semantic types;
    each successful alternative enters the same arm body.
    A list pattern takes no trailing comma, as in the host; the rest comes last.
@@ -491,12 +512,14 @@ function         = [ tail_annotation ] function_header INDENT body DEDENT ;
    least the number of explicit elements. *)
 spread_target    = "..." spaces ( identifier | "_" ) ;
 list_pattern     = "[" spaces ( [ spread_target ] | pattern { spaces "," spaces pattern } [ spaces "," spaces spread_target ] ) spaces "]" ;
+tuple_pattern    = "(" spaces pattern spaces "," spaces pattern
+                   [ spaces "," spaces pattern [ spaces "," spaces pattern ] ] trailing_comma spaces ")" ;
 (* String patterns compare exact decoded bytes. Char patterns remain rejected
    until a Char type is supported. *)
 (* A dot in a pattern qualifies a public constructor by a module alias.
    Qualified and bare heads have the same recursive field patterns. *)
 pattern_head     = identifier [ spaces "." spaces identifier ] ;
-alternative      = "_" | string_literal | char_literal | list_pattern
+alternative      = "_" | string_literal | char_literal | list_pattern | tuple_pattern
                  | pattern_head spaces [ "(" spaces [ pattern { spaces "," spaces pattern } trailing_comma ] spaces ")" ] ;
 pattern          = alternative { spaces "|" spaces alternative } ;
 (* After '=' the value is on the same line, or alone on an indented next
@@ -505,6 +528,9 @@ initializer      = spaces expression NEWLINE | NEWLINE INDENT expression NEWLINE
 (* An annotation supplies the initializer's expected type. It declares a new
    binding under the same no-shadowing rule as var. *)
 binding          = [ "var" required_spaces ] identifier [ spaces ":" spaces type_annotation ] spaces "=" initializer ;
+tuple_binder     = "(" spaces ( identifier | "_" ) spaces "," spaces ( identifier | "_" )
+                   [ spaces "," spaces ( identifier | "_" ) [ spaces "," spaces ( identifier | "_" ) ] ] trailing_comma spaces ")" ;
+tuple_binding    = tuple_binder spaces "=" initializer ;
 (* `name ?= value` binds the success payload or returns the failure; it is
    never `var` and is valid only among a function body's own top-level
    statements, never inside an if/match block, loop body or lambda body,
@@ -527,8 +553,8 @@ propagation      = identifier [ spaces ":" spaces type_annotation ] spaces "?=" 
    older aliases and borrowed outer values remain valid. Managed annotated tail loops
    remain unsupported. *)
 while_loop       = "while" spaces expression spaces ":" NEWLINE INDENT block DEDENT ;
-for_loop         = "for" required_spaces ( identifier | "_" ) required_spaces "in" required_spaces expression spaces ":" NEWLINE INDENT block DEDENT ;
-statement        = binding | while_loop | for_loop | "break" NEWLINE | "continue" NEWLINE | expression NEWLINE ;
+for_loop         = "for" required_spaces ( identifier | "_" | tuple_binder ) required_spaces "in" required_spaces expression spaces ":" NEWLINE INDENT block DEDENT ;
+statement        = binding | tuple_binding | while_loop | for_loop | "break" NEWLINE | "continue" NEWLINE | expression NEWLINE ;
 function_statement = propagation | statement ;
 (* A block's value is its last item when that item is an expression; a block
    may end after a statement and then has none. Where an expression is a

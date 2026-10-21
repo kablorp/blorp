@@ -14,7 +14,7 @@ import:
 		LoweredStep(Define, Join, Loop),
 		LoweredSelection,
 		SelectionEdge,
-		SelectionDefinition(BorrowUnionField, BorrowListElement, CopyListSuffix),
+		SelectionDefinition(BorrowUnionField, BorrowRecordField, BorrowListElement, CopyListSuffix),
 		ValueDefinition,
 		ValueId,
 		ValueParameter,
@@ -1201,6 +1201,8 @@ private fixed record InsertedSelectionEdge {
 -- the successful edge, so the complete enclosing owner snapshot stays live.
 private pure func selection_value(definition: Lower.SelectionDefinition) -> ValueDefinition:
 	match definition:
+		BorrowRecordField(parameter, field, parent):
+			{ id = parameter.id, value_type = parameter.value_type, operation = ReadRecordFieldValue(field, parent), span = parameter.span }
 		BorrowUnionField(parameter, field, parent):
 			{ id = parameter.id, value_type = parameter.value_type, operation = PayloadValue(field, parent), span = parameter.span }
 		BorrowListElement(parameter, index, parent):
@@ -1228,8 +1230,16 @@ private pure func insert_selection_edge(
 				failure = Some(error)
 				break
 			Ok(built):
-				operations = operations.append(DefineValue(built.definition))
-				sources = sources.append(built.definition.result)
+				match built.acquisitions:
+					StoredAcquisitions(acquisitions):
+						for acquired in acquisitions:
+							operations = operations.append(AcquireOwner(acquired.owner, acquired.borrow, lowered.span))
+						operations = operations.append(DefineValue(built.definition))
+						sources = sources.append(built.definition.result)
+					ProjectedAcquisition(acquired):
+						operations = operations.append(DefineValue(built.definition))
+						operations = operations.append(AcquireOwner(acquired.owner, acquired.borrow, lowered.span))
+						sources = sources.append(OwnedResult(acquired.owner))
 				next_owner = built.next_owner
 	var transfers: List[ReturnTransfer] = []
 	var moved: List[Int] = []
@@ -1257,8 +1267,8 @@ private pure func insert_selection_edge(
 						_: failure = Some(internal_error(internal_span(), "selection edge contains control flow"))
 				transfers = transfers.append(leaving.transfer)
 				next_owner = leaving.next_owner
-	-- Fresh suffix roots that are not transferred retire locally. An unused
-	-- source wildcard never reaches this point: Lower emits no suffix for it.
+	-- Fresh suffix roots and acquired record projections that are not transferred
+	-- retire locally. Source wildcards never create a projection or acquisition.
 	for source in sources:
 		match source:
 			OwnedResult(owner):

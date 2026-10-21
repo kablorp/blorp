@@ -1,0 +1,244 @@
+import:
+	../../../src/lex/lex: lex
+	../../../src/parse/parse: ParsedModule, module_contents, parse_module
+	../../../src/utils/names: program_names
+	../../../src/utils/source: module_source, root_module_id
+	../../../src/utils/syntax:
+		Diagnostic,
+		ExpressionBase(IntegerExpression, NameExpression, TupleExpression),
+		ForBinder(TupleForBinder),
+		ParsedBinder(NamedBinder, DiscardBinder),
+		ParsedBody(ParsedValueBody, ParsedMatchBody),
+		ParsedFunction,
+		ParsedPattern(PatternTuple, PatternConstructor, PatternOr),
+		ParsedStatement(TupleBinding, ForLoop),
+		PostfixOperation(TupleIndex, ReceiverInvocation),
+		TypeSyntax(AtomicType, AppliedType, TupleTypeSyntax, CallableTypeSyntax),
+	test: TestSuite
+
+
+private HEADER: String = "func main() -> Int:\n"
+
+
+private pure func parse_source(source: String) -> Result[ParsedModule, Diagnostic]:
+	tokens ?= lex(module_source(root_module_id()), source, program_names().names)
+	parse_module(tokens, root_module_id())
+
+
+private pure func first_function(source: String) -> Option[ParsedFunction]:
+	match parse_source(source):
+		Ok(parsed): module_contents(parsed).functions.get(0)
+		Err(_): None
+
+
+private pure func rejects(prefix: String, marked: String, suffix: String, message: String, help: String) -> Bool:
+	match parse_source(prefix + marked + suffix):
+		Err(error):
+			(
+				error.span.start == prefix.length()
+				and error.span.end == prefix.length() + marked.length()
+				and error.message == message and error.help == help
+			)
+		Ok(_): False
+
+
+pure func test_two_three_and_four_elements_keep_source_order() -> Bool:
+	match (
+		first_function(HEADER + "\t(1, 2)\n"),
+		first_function(HEADER + "\t(1, 2, 3)\n"),
+		first_function(HEADER + "\t(1, 2, 3, 4,)\n"),
+	):
+		(Some(pair), Some(triple), Some(quadruple)):
+			match (pair.body, triple.body, quadruple.body):
+				(ParsedValueBody(first), ParsedValueBody(second), ParsedValueBody(third)):
+					match (first.base, second.base, third.base):
+						(TupleExpression([a, b]), TupleExpression([_, _, c]), TupleExpression([_, _, _, d])):
+							match (a.base, b.base, c.base, d.base):
+								(IntegerExpression(1), IntegerExpression(2), IntegerExpression(3), IntegerExpression(4)): True
+								_: False
+						_: False
+				_: False
+		_: False
+
+
+pure func test_nested_tuple_and_postfix_indices_keep_spans() -> Bool:
+	match first_function(HEADER + "\t((1, 2), 3)[0][1].identity()\n"):
+		Some(function):
+			match function.body:
+				ParsedValueBody(value):
+					match (value.base, value.applications):
+						(TupleExpression([nested, _]), [TupleIndex(first, first_span), TupleIndex(second, second_span), ReceiverInvocation(_)]):
+							match (nested.base, first.base, second.base):
+								(TupleExpression([_, _]), IntegerExpression(0), IntegerExpression(1)):
+									value.base_span.start == 21 and value.base_span.end == 32 and first_span.start == 32 and first_span.end == 35 and second_span.start == 35 and second_span.end == 38
+								_: False
+						_: False
+				_: False
+		None: False
+
+
+pure func test_named_and_computed_indices_are_parsed_for_typechecking() -> Bool:
+	match first_function("func read(value: (Int, Int), index: Int) -> Int:\n\tvalue[index]\n"):
+		Some(function):
+			match function.body:
+				ParsedValueBody(value):
+					match value.applications:
+						[TupleIndex(index, _)]:
+							match index.base:
+								NameExpression(_): True
+								_: False
+						_: False
+				_: False
+		None: False
+
+
+pure func test_tuple_annotations_nest_inside_generic_arguments() -> Bool:
+	match first_function("func read(value: Option[(Int, (String, Bool))]) -> (Int, String, Bool):\n\tvalue\n"):
+		Some(function):
+			match (function.parameters, function.return_type):
+				([parameter], Some(TupleTypeSyntax([_, _, _], _))):
+					match parameter.type_name:
+						AppliedType(_, [TupleTypeSyntax([_, TupleTypeSyntax([_, _], _)], _)], _): True
+						_: False
+				_: False
+		None: False
+
+
+pure func test_callable_arity_is_not_limited_by_tuple_arity() -> Bool:
+	match first_function("func read(empty: () -> Int, one: (Int,) -> Int, many: pure (Int, Int, Int, Int, Int) -> (Int, String)) -> Int:\n\t0\n"):
+		Some(function):
+			match function.parameters:
+				[a, b, c]:
+					match (a.type_name, b.type_name, c.type_name):
+						(CallableTypeSyntax(_, [], _, _), CallableTypeSyntax(_, [_], _, _), CallableTypeSyntax(_, [_, _, _, _, _], TupleTypeSyntax([_, _], _), _)): True
+						_: False
+				_: False
+		None: False
+
+
+pure func test_parenthesized_single_type_is_transparent() -> Bool:
+	match first_function("func read(value: (Int)) -> Int:\n\tvalue\n"):
+		Some(function):
+			match function.parameters:
+				[parameter]:
+					match parameter.type_name:
+						AtomicType(_): True
+						_: False
+				_: False
+		None: False
+
+
+pure func test_tuple_patterns_nest_and_preserve_alternatives() -> Bool:
+	source: String =
+		|func read(value: Value) -> Int:
+		|    match value:
+		|        Some((Left | Right, (name, _))) | Other((Left, (name, _))): 0
+		|
+
+	match first_function(source):
+		Some(function):
+			match function.body:
+				ParsedMatchBody(body):
+					match body.arms.get(0).map(pure func(arm): arm.pattern):
+						Some(PatternOr([PatternConstructor(_, [PatternTuple([PatternOr([_, _], _), PatternTuple([_, _], _)], _)], _), _], _)): True
+						_: False
+				_: False
+		None: False
+
+
+pure func test_declaration_destructuring_and_for_binders_are_flat() -> Bool:
+	source: String =
+		|func main() -> Int:
+		|    (first, _, third,) = values()
+		|    for (left, _, right) in rows():
+		|        consume(left, right)
+		|    0
+		|
+
+	match first_function(source):
+		Some(function):
+			match function.statements:
+				[TupleBinding([NamedBinder(_), DiscardBinder(_), NamedBinder(_)], _, span), ForLoop(loop)]:
+					match loop.binder:
+						TupleForBinder([NamedBinder(_), DiscardBinder(_), NamedBinder(_)], _): span.start == 24 and span.end == 42
+						_: False
+				_: False
+		None: False
+
+
+pure func test_tuple_expression_statements_are_not_declarations() -> Bool:
+	first_function(HEADER + "\t(first, second)\n\t0\n").is_some()
+
+
+pure func test_singleton_values_and_types_have_teaching_diagnostics() -> Bool:
+	(
+		rejects(HEADER + "\t", "(1,)", "\n", "a tuple requires two to four elements", "write the value itself for one element, or [value] for a one-element List")
+		and rejects("func read(value: ", "(Int,)", ") -> Int:\n\t0\n", "a tuple type requires two to four elements", "write the type itself for one element, or List[Type] for a List type")
+	)
+
+
+pure func test_fifth_elements_have_exact_diagnostics() -> Bool:
+	(
+		rejects(HEADER + "\t(1, 2, 3, 4, ", "5", ")\n", "tuples support two to four elements", "nest tuples or use a named record for more fields")
+		and rejects("func read(value: (Int, Int, Int, Int, ", "String", ")) -> Int:\n\t0\n", "tuple types support two to four elements", "nest tuple types or use a named record for more fields")
+	)
+
+
+pure func test_nested_flat_binders_are_rejected_with_guidance() -> Bool:
+	(
+		rejects(HEADER + "\t(a, ", "(b, c)", ") = value\n\t0\n", "tuple destructuring requires flat names or '_'", "bind a nested tuple to a name, then destructure it separately")
+		and rejects(HEADER + "\tfor (a, ", "(", "b, c)) in rows:\n\t\tvoid\n\t0\n", "tuple destructuring requires flat names or '_'", "bind a nested tuple to a name, then destructure it separately")
+	)
+
+
+pure func test_subscript_assignment_is_rejected_explicitly() -> Bool:
+	rejects(HEADER + "\tvalue[0] ", "=", " 1\n\t0\n", "tuple elements cannot be assigned", "construct a new tuple and bind it to a name instead")
+
+
+pure func test_tuple_patterns_enforce_arity_at_their_own_boundary() -> Bool:
+	(
+		rejects(HEADER + "\tmatch value:\n\t\t", "(only,)", ": 0\n", "a tuple pattern requires two to four elements", "write two to four comma-separated patterns, such as (first, _)")
+		and rejects(HEADER + "\tmatch value:\n\t\t(a, b, c, d, ", "last", "): 0\n", "tuple patterns support two to four elements", "nest tuples or use a named record for more fields")
+	)
+
+
+pure func test_member_access_is_not_a_declaration_binder() -> Bool:
+	rejects(HEADER + "\t(", "value.field", ", second) = pair\n\t0\n", "tuple destructuring requires flat names or '_'", "bind a nested tuple to a name, then destructure it separately")
+
+
+pure func test_mutable_and_propagating_tuple_targets_are_rejected() -> Bool:
+	(
+		rejects(HEADER + "\tvar ", "(", "a, b) = value\n\t0\n", "tuple destructuring declares immutable names", "omit var before the tuple target; declare individual mutable bindings separately if needed")
+		and rejects(HEADER + "\t(a, b) ", "?=", " value\n\t0\n", "tuple destructuring requires '='", "propagate into a name first, then destructure the result")
+	)
+
+
+pure func test_flat_binder_annotations_are_rejected_at_the_colon() -> Bool:
+	(
+		rejects(HEADER + "\t(first", ":", " Int, second) = pair\n\t0\n", "tuple destructuring names cannot have type annotations", "annotate the tuple value before destructuring it")
+		and rejects(HEADER + "\tfor (first", ":", " Int, second) in rows:\n\t\tvoid\n\t0\n", "tuple destructuring names cannot have type annotations", "annotate the tuple value before destructuring it")
+	)
+
+
+tests: TestSuite = {
+	description = "Blorp 2 tuple syntax",
+	tests = [
+		("two three and four elements keep source order", test_two_three_and_four_elements_keep_source_order),
+		("nested tuples and postfix indices keep spans", test_nested_tuple_and_postfix_indices_keep_spans),
+		("computed indices reach typechecking", test_named_and_computed_indices_are_parsed_for_typechecking),
+		("tuple annotations nest inside generic arguments", test_tuple_annotations_nest_inside_generic_arguments),
+		("callable arity is independent", test_callable_arity_is_not_limited_by_tuple_arity),
+		("single type parentheses are transparent", test_parenthesized_single_type_is_transparent),
+		("tuple patterns nest with alternatives", test_tuple_patterns_nest_and_preserve_alternatives),
+		("declaration and for binders are flat", test_declaration_destructuring_and_for_binders_are_flat),
+		("tuple expressions are not declarations", test_tuple_expression_statements_are_not_declarations),
+		("singletons have teaching diagnostics", test_singleton_values_and_types_have_teaching_diagnostics),
+		("fifth elements have exact diagnostics", test_fifth_elements_have_exact_diagnostics),
+		("nested flat binders are rejected", test_nested_flat_binders_are_rejected_with_guidance),
+		("subscript assignment is explicit", test_subscript_assignment_is_rejected_explicitly),
+		("tuple pattern arity is checked during parsing", test_tuple_patterns_enforce_arity_at_their_own_boundary),
+		("member access is not a binder", test_member_access_is_not_a_declaration_binder),
+		("mutable and propagating tuple targets are rejected", test_mutable_and_propagating_tuple_targets_are_rejected),
+		("flat binder annotations are rejected at the colon", test_flat_binder_annotations_are_rejected_at_the_colon),
+	]
+}

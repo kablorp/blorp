@@ -1,0 +1,83 @@
+import:
+	../../../src/emit/emit: emit
+	../../../src/lower/lower: lower
+	../../../src/own/own: own
+	../../../src/specialize/specialize: specialize
+	../../../src/utils/syntax: Diagnostic
+	../../../src/verify/verify: verify
+	../input: checked_source
+	test: TestSuite
+
+
+private pure func emitted(source: String) -> Result[String, Diagnostic]:
+	checked ?= checked_source(source)
+	concrete ?= specialize(checked)
+	lowered ?= lower(concrete)
+	owned ?= own(lowered)
+	verified ?= verify(owned)
+	emit(verified)
+
+
+pure func test_void_tuple_fields_are_absent_and_logical_index_stays_stable() -> Bool:
+	source: String =
+		|func main() -> Int:
+		|    value = (void, 7, void)
+		|    value[1]
+		|
+	match emitted(source):
+		Err(_): False
+		Ok(code):
+			(
+				code.contains("struct blorp_r_0{_Atomic uint64_t references;int64_t blorp_rf_0_1;};")
+				and not code.contains("blorp_rf_0_0")
+				and not code.contains("blorp_rf_0_2")
+				and code.contains("value->blorp_rf_0_1=fields.blorp_rf_0_1;")
+				and code.contains("->blorp_rf_0_1")
+			)
+
+
+pure func test_all_void_tuple_uses_portable_zero_initializer_and_unit_read() -> Bool:
+	source: String =
+		|func empty() -> Void:
+		|    value = (void, void)
+		|    value[1]
+		|func main() -> Int:
+		|    empty()
+		|    0
+		|
+	match emitted(source):
+		Err(_): False
+		Ok(code):
+			(
+				code.contains("struct blorp_r_0{_Atomic uint64_t references;};")
+				and code.contains("((struct blorp_r_0){0})")
+				and not code.contains("blorp_rf_0_")
+				and not code.contains("struct blorp_r_0){}")
+			)
+
+
+pure func test_tuple_managed_members_reuse_record_release_operations() -> Bool:
+	source: String =
+		|func main() -> Int:
+		|    value = ("left", "right")
+		|    0
+		|
+	match emitted(source):
+		Err(_): False
+		Ok(code):
+			(
+				code.contains("blorp_string_release(value->blorp_rf_0_0);")
+				and code.contains("blorp_string_release(value->blorp_rf_0_1);")
+				and code.contains("blorp_record_make_0")
+				and not code.contains("blorp_tuple_")
+			)
+
+
+tests: TestSuite = {
+	description = "Tuple C uses shared record storage",
+	tests = [
+		("Void omits storage without renumbering", test_void_tuple_fields_are_absent_and_logical_index_stays_stable),
+		("all Void initializer is portable", test_all_void_tuple_uses_portable_zero_initializer_and_unit_read),
+		("managed elements use record releases", test_tuple_managed_members_reuse_record_release_operations),
+	]
+}

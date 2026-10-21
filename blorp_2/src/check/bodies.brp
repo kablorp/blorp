@@ -21,7 +21,7 @@ import:
 		StatementError(
 			CallableAssignment, ImmutableAssignment, CapturedAssignment, NonVoidMatchArm, NonVoidStatement,
 			PropagationNeedsResultReturn, PropagationNeedsResultValue,
-			NonBooleanCondition, NonIterableFor,
+			NonBooleanCondition, NonIterableFor, TupleBindingRequiresTuple, TupleBindingArityMismatch,
 		),
 		checker_invariant,
 		match_error,
@@ -47,7 +47,7 @@ import:
 		CheckedJoin,
 		CheckedJoinArm,
 		CheckedExpr,
-		CheckedForm(InvokeFunction, LiteralVoid, Match, ReadBinding, ConstructVariant),
+		CheckedForm(InvokeFunction, LiteralVoid, Match, ReadBinding, ConstructVariant, ReadTupleElement),
 		CheckedCallOperand(ValueOperand),
 		CheckedFunction,
 		CheckedPatternPlace, CheckedPatternRoute(MatchRoot, UnionField),
@@ -56,7 +56,7 @@ import:
 		MatchArmId, DecisionNodeId, match_arm_id, decision_node_id,
 		CheckedStatement(DiscardExpression, InitializeBinding, ReassignBinding, RunWhile, RunFor, BreakSourceLoop, ContinueSourceLoop),
 		CheckedIteration(ListIteration, AscendingIntRange),
-		TypeRef(CallableType, VoidType, IntType, ListType, AppliedUnionType, UnionType),
+		TypeRef(CallableType, VoidType, IntType, ListType, AppliedUnionType, UnionType, TupleType),
 		FunctionSignature,
 		TypeUse,
 		UnionOccurrence,
@@ -86,6 +86,7 @@ import:
 		BindingSyntax(ImmutableBinding, MutableBinding),
 		ParsedBinding, ParsedPropagation,
 		ExpressionBase(MatchExpression, IfExpression, VoidExpression, RangeExpression),
+		ForBinder(SingleForBinder, TupleForBinder),
 		ParsedBlock, ParsedIf, ParsedWhile, ParsedFor, ParsedBinder(NamedBinder, DiscardBinder), ElseBranch(ElseIf, ElseBlock),
 		ParsedMatch,
 		ParsedMatchArm,
@@ -93,7 +94,7 @@ import:
 		ParsedPattern(PatternName, PatternWildcard, PatternConstructor, PatternOr, PatternList, PatternString, PatternChar),
 		PatternHead(BareHead, QualifiedHead),
 		pattern_span,
-		ParsedStatement(BindingStatement, PropagatingBinding, ExpressionStatement, WhileLoop, ForLoop, Break, Continue),
+		ParsedStatement(TupleBinding, BindingStatement, PropagatingBinding, ExpressionStatement, WhileLoop, ForLoop, Break, Continue),
 		type_span,
 		Span,
 		ValueExpression,
@@ -561,11 +562,20 @@ private pure func resolve_statements(
 	block: ResolvedStatements,
 	context: ResolutionContext,
 ) -> Result[ResolvedStatements, CheckError]:
-	match written.get(block.statements.length()):
+	resolve_statement_prefix(written, 0, block, context)
+
+
+-- One source destructuring statement expands to several ordinary bindings.
+-- Track written position independently of the checked statement count.
+private pure func resolve_statement_prefix(
+	written: List[ParsedStatement], position: Int,
+	block: ResolvedStatements, context: ResolutionContext,
+) -> Result[ResolvedStatements, CheckError]:
+	match written.get(position):
 		None: Ok(block)
 		Some(statement):
 			match resolve_statement(statement, block, context):
-				Ok(next): resolve_statements(written, next, context)
+				Ok(next): resolve_statement_prefix(written, IntOps.add(position, 1), next, context)
 				Err(error): Err(error)
 
 
@@ -575,6 +585,7 @@ private pure func resolve_statement(
 	context: ResolutionContext,
 ) -> Result[ResolvedStatements, CheckError]:
 	match statement:
+		TupleBinding(binders, initializer, span): resolve_tuple_binding(binders, initializer, span, block, context)
 		BindingStatement(binding): resolve_assignment(binding, block, context)
 		PropagatingBinding(propagation): Err(unsupported_form(propagation.span, Propagation))
 		WhileLoop(loop): resolve_while(loop, block, context)
@@ -869,13 +880,97 @@ private pure func bind_for_item(
 					})
 
 
+private pure func tuple_binder_types(binders: List[ParsedBinder], value_type: TypeRef, span: Span) -> Result[List[TypeRef], CheckError]:
+	selected: Result[List[TypeRef], CheckError] = match value_type:
+		TupleType(elements): Ok(elements)
+		_: Err(statement_error(span, TupleBindingRequiresTuple(value_type)))
+	fields ?= selected
+	if IntOps.equals(fields.length(), binders.length()):
+		Ok(fields)
+	else:
+		Err(statement_error(span, TupleBindingArityMismatch(fields.length(), binders.length())))
+
+
+-- The unnamed subject owns the whole tuple. Named projections use ordinary
+-- bindings, while '_' leaves its element owned only by that subject.
+private pure func bind_tuple_elements(
+	binders: List[ParsedBinder], fields: List[TypeRef], subject: CheckedExpr,
+	block: ResolvedStatements, context: ResolutionContext,
+) -> Result[ResolvedStatements, CheckError]:
+	var resolved = block
+	var position = 0
+	var failure: Option[CheckError] = None
+	for binder in binders:
+		match binder:
+			DiscardBinder(_): void
+			NamedBinder(name):
+				match fields.get(position):
+					None: failure = Some(checker_invariant(name.span, UnsupportedPatternReachedResolution))
+					Some(value_type):
+						id = binding_id(resolved.bindings.length())
+						definition: BindingDefinition = { origin = BodyLocal, mutability = Immutable, value_type = value_type, span = name.span }
+						match bind_local(resolved.scope, context.namespace, context.module, context.caller.body, name, id, definition):
+							Err(error): failure = Some(error)
+							Ok(binding):
+								projection: CheckedExpr = { form = ReadTupleElement(subject, position), value_type = value_type, span = name.span }
+								resolved = { resolved |
+									bindings = resolved.bindings.append(definition),
+									scope = [binding].concat(resolved.scope),
+									statements = resolved.statements.append(InitializeBinding(id, projection)),
+								}
+		if failure.is_some():
+			break
+		position = IntOps.add(position, 1)
+	match failure:
+		Some(error): Err(error)
+		None: Ok(resolved)
+
+
+private pure func resolve_tuple_binding(
+	binders: List[ParsedBinder], initializer: ValueExpression, span: Span,
+	block: ResolvedStatements, context: ResolutionContext,
+) -> Result[ResolvedStatements, CheckError]:
+	resolved ?= resolve_value(block, initializer, UntypedValue, context)
+	fields ?= tuple_binder_types(binders, resolved.value.value_type, span)
+	id = binding_id(resolved.bindings.length())
+	definition: BindingDefinition = { origin = BodyLocal, mutability = Immutable, value_type = resolved.value.value_type, span = initializer.span }
+	subject: CheckedExpr = { form = ReadBinding(id), value_type = resolved.value.value_type, span = initializer.span }
+	bind_tuple_elements(binders, fields, subject, {
+		lambdas = resolved.lambdas,
+		bindings = resolved.bindings.append(definition), scope = block.scope,
+		statements = block.statements.append(InitializeBinding(id, resolved.value)),
+		reassigned = resolved.reassigned,
+	}, context)
+
+
+private pure func bind_for_binder(
+	binder: ForBinder, element: TypeRef,
+	block: ResolvedStatements, context: ResolutionContext,
+) -> Result[ForItemScope, CheckError]:
+	match binder:
+		SingleForBinder(single): bind_for_item(single, element, block, context)
+		TupleForBinder(binders, span): bind_tuple_for_item(binders, span, element, block, context)
+
+
+private pure func bind_tuple_for_item(
+	binders: List[ParsedBinder], span: Span, element: TypeRef,
+	block: ResolvedStatements, context: ResolutionContext,
+) -> Result[ForItemScope, CheckError]:
+	fields ?= tuple_binder_types(binders, element, span)
+	id = binding_id(block.bindings.length())
+	definition: BindingDefinition = { origin = BodyLocal, mutability = Immutable, value_type = element, span = span }
+	subject: CheckedExpr = { form = ReadBinding(id), value_type = element, span = span }
+	resolved ?= bind_tuple_elements(binders, fields, subject, { block | bindings = block.bindings.append(definition) }, context)
+	Ok({ item = Some(id), block = resolved })
+
+
 private pure func resolve_for(
 	written: ParsedFor,
 	block: ResolvedStatements,
 	context: ResolutionContext,
 ) -> Result[ResolvedStatements, CheckError]:
 	iterated ?= resolve_iteration(written.iterable, block, context)
-	item ?= bind_for_item(written.binder, iterated.element, {
+	item ?= bind_for_binder(written.binder, iterated.element, {
 		iterated.block | statements = [], reassigned = [],
 	}, context)
 	body ?= resolve_statement_block(written.body, item.block, { context | loop_scope = WithinSourceLoop })

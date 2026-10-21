@@ -1,4 +1,7 @@
 import:
+	../../../src/check/check: checked_functions
+	../../../src/check/model as Checked
+	../source_while_inputs as Input
 	../../../src/check/errors: CheckErrorKind(ValueRejection), ValueError(UnknownValue)
 	../input: checked_source, rejects_at
 	test: TestSuite
@@ -40,9 +43,69 @@ pure func test_parameter_does_not_leak_to_other_function() -> Bool:
 	)
 
 
+pure func test_tuple_declaration_has_one_subject_and_named_projections() -> Bool:
+	source: String =
+		|pure func pair() -> (Int, String, Int):
+		|    (1, "middle", 3)
+		|func main() -> Int:
+		|    (first, _, last) = pair()
+		|    following = last
+		|    first
+		|
+	match Input.checked(source):
+		Err(_): False
+		Ok(accepted):
+			match checked_functions(accepted).functions.get(1):
+				None: False
+				Some(function):
+					match function.statements:
+						[Checked.InitializeBinding(subject, initializer), Checked.InitializeBinding(_, first), Checked.InitializeBinding(_, last), Checked.InitializeBinding(_, following)]:
+							match (initializer.form, first.form, last.form, following.form):
+								(Checked.InvokeFunction(_), Checked.ReadTupleElement(left, 0), Checked.ReadTupleElement(right, 2), Checked.ReadBinding(_)):
+									match (left.form, right.form):
+										(Checked.ReadBinding(left_id), Checked.ReadBinding(right_id)):
+											Checked.binding_number(subject) == Checked.binding_number(left_id) and Checked.binding_number(subject) == Checked.binding_number(right_id) and function.bindings.length() == 4
+										_: False
+								_: False
+						_: False
+
+
+pure func test_tuple_declaration_inside_match_keeps_following_statement() -> Bool:
+	source: String =
+		|func main() -> Int:
+		|    wrapped: Option[(Int, Int)] = Some((1, 2))
+		|    match wrapped:
+		|        Some(value):
+		|            (first, second) = value
+		|            after = second
+		|            after
+		|        None: 0
+		|
+	Input.checked(source).is_ok()
+
+
+pure func test_tuple_discard_keeps_only_subject_owner() -> Bool:
+	source = "func main() -> Int:\n    (_, _) = (\"left\", \"right\")\n    0\n"
+	match Input.checked(source):
+		Err(_): False
+		Ok(accepted):
+			match checked_functions(accepted).functions.get(0):
+				Some(function):
+					match function.statements:
+						[Checked.InitializeBinding(_, value)]:
+							match value.form:
+								Checked.ConstructTuple(elements): function.bindings.length() == 1 and elements.length() == 2
+								_: False
+						_: False
+				None: False
+
+
 tests: TestSuite = {
 	description = "Blorp 2 function bodies",
 	tests = [
+		("tuple wildcards create no aliases", test_tuple_discard_keeps_only_subject_owner),
+		("tuple declaration evaluates one subject and projects names", test_tuple_declaration_has_one_subject_and_named_projections),
+		("tuple declaration preserves following match statement", test_tuple_declaration_inside_match_keeps_following_statement),
 		("payload match example is accepted", test_payload_match_example_is_accepted),
 		(
 			"parameter does not leak to other functions",

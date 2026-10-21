@@ -73,6 +73,7 @@ fixed union TypeRef:
 	FloatType
 	StringType
 	ListType(TypeRef)
+	TupleType(List[TypeRef])
 	RecordType(RecordId)
 	AppliedRecordType(RecordId, List[TypeRef])
 	UnionType(UnionId)
@@ -314,6 +315,7 @@ fixed union CheckedForm:
 	ConstructVariant(VariantId, List[CheckedExpr])
 	ConstructRecord(RecordId, List[CheckedRecordField])
 	ConstructList(List[CheckedExpr])
+	ConstructTuple(List[CheckedExpr])
 	ConstructOpaque(OpaqueId, CheckedExpr)
 	ProjectOpaque(OpaqueId, CheckedExpr)
 	-- A value match, including an ordinary function's tail expression.
@@ -321,6 +323,7 @@ fixed union CheckedForm:
 	UpdateRecord(RecordId, CheckedRecordUpdate)
 	InvokeFunction(CheckedCall)
 	ReadRecordField(CheckedExpr, FieldId)
+	ReadTupleElement(CheckedExpr, Int)
 
 
 -- One checked expression. `span` is the node's own occurrence: a written base's
@@ -401,6 +404,7 @@ fixed union CheckedPatternRoute:
 	MatchRoot
 	UnionField(CheckedPatternPlace, VariantId, Int)
 	ListElement(CheckedPatternPlace, Int)
+	RecordField(CheckedPatternPlace, Int)
 
 
 fixed union ListLengthTest:
@@ -591,7 +595,7 @@ pure func type_head(value_type: TypeRef) -> Option[TypeHead]:
 			Some(UnionHead(id))
 		OpaqueType(id):
 			Some(OpaqueHead(id))
-		ParameterType(_) | CallableType(_, _, _):
+		ParameterType(_) | CallableType(_, _, _) | TupleType(_):
 			None
 
 
@@ -599,6 +603,10 @@ pure func type_head(value_type: TypeRef) -> Option[TypeHead]:
 -- exactly when they name the same type.
 pure func same_type(left: TypeRef, right: TypeRef) -> Bool:
 	match left:
+		TupleType(elements):
+			match right:
+				TupleType(others): same_types(elements, others)
+				_: False
 		ListType(element):
 			match right:
 				ListType(other):
@@ -792,6 +800,9 @@ private pure func append_value_calls(
 		ConstructVariant(_, fields):
 			for field in fields:
 				calls = append_value_calls(calls, field)
+		ConstructTuple(elements):
+			for element in elements:
+				calls = append_value_calls(calls, element)
 		ConstructList(elements):
 			for element in elements:
 				calls = append_value_calls(calls, element)
@@ -813,6 +824,8 @@ private pure func append_value_calls(
 							NamedCallable(_, _) | ForwardedCallable(_) | LambdaCallable(_, _): void
 
 			calls = calls.append(call)
+		ReadTupleElement(receiver, _):
+			calls = append_value_calls(calls, receiver)
 		ReadRecordField(receiver, _):
 			calls = append_value_calls(calls, receiver)
 		MakeCallable(choice):
@@ -927,12 +940,14 @@ private pure func callable_creations(values: List[CheckedExpr]) -> List[CheckedE
 								StoredCallable(child): children = children.append(child)
 								LambdaCallable(_, captures): children = children.concat(captures)
 								NamedCallable(_, _) | ForwardedCallable(_): void
+			ConstructTuple(elements): children = elements
 			ConstructList(elements): children = elements
 			ConstructVariant(_, elements): children = elements
 			ConstructRecord(_, fields): children = fields.map(pure func(field): field.value)
 			UpdateRecord(_, update): children = [update.base].concat(update.replacements.map(pure func(field): field.value))
 			ConstructOpaque(_, child): children = [child]
 			ProjectOpaque(_, child): children = [child]
+			ReadTupleElement(child, _): children = [child]
 			ReadRecordField(child, _): children = [child]
 			Match(join):
 				found = found.concat(callable_creations([join.scrutinee]))

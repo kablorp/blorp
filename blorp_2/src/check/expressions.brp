@@ -18,7 +18,7 @@ import:
 		classify_receiver,
 		method_sites,
 	./model as Checked:
-		CheckedForm(MakeCallable, UpdateRecord, ConstructRecord, ConstructVariant, ConstructList, ConstructOpaque, ProjectOpaque, LiteralVoid, LiteralInteger, LiteralFloat, LiteralString, ReadBinding, ReadCapture, InvokeFunction, ReadRecordField),
+		CheckedForm(ConstructTuple, ReadTupleElement, MakeCallable, UpdateRecord, ConstructRecord, ConstructVariant, ConstructList, ConstructOpaque, ProjectOpaque, LiteralVoid, LiteralInteger, LiteralFloat, LiteralString, ReadBinding, ReadCapture, InvokeFunction, ReadRecordField),
 		ClosedConstant(IntegerConstant, FloatConstant, StringConstant),
 		BodyOwner(DeclaredBody), same_body,
 		CheckedRecordField,
@@ -42,7 +42,7 @@ import:
 		ConstantError(ConstantCalled), constant_error,
 		ConstructorError(ConstructorNeedsExpectedType),
 		RecordError(RecordNeedsExpectedType, FieldRequiresRecord),
-		ValueError(MutableCapture, UnknownValue, ExpressionTypeMismatch, UnknownOpaqueType, NonOpaqueConversionType, ForeignOpaqueConstruction, ForeignOpaqueProjection),
+		ValueError(TupleIndexRequiresTuple, TupleIndexMustBeLiteral, TupleIndexOutOfRange, MutableCapture, UnknownValue, ExpressionTypeMismatch, UnknownOpaqueType, NonOpaqueConversionType, ForeignOpaqueConstruction, ForeignOpaqueProjection),
 		MethodError(MethodReceiverNeedsType),
 		CheckerInvariant(InvalidOpaqueDeclaration, InvalidRecordDeclaration, InvalidRecordField, GenericConstructorContract, InvalidInferenceWorklist, MissingCallParameter),
 		call_error,
@@ -56,10 +56,10 @@ import:
 		checker_invariant
 	./inference:
 		select_receiver_contract,
-		PendingBase(PendingLambda, PendingNamedCallable, PendingForwardedCallable, AcceptedBinding, AcceptedCapture, PendingCapture, AcceptedFloat, AcceptedInteger, AcceptedString, AcceptedVoid, PendingConstructRecord, PendingConstructVariant, PendingConstructList, PendingConstructOpaque, PendingProjectOpaque, PendingDirectCall, PendingUpdateRecord),
+		PendingBase(PendingConstructTuple, PendingLambda, PendingNamedCallable, PendingForwardedCallable, AcceptedBinding, AcceptedCapture, PendingCapture, AcceptedFloat, AcceptedInteger, AcceptedString, AcceptedVoid, PendingConstructRecord, PendingConstructVariant, PendingConstructList, PendingConstructOpaque, PendingProjectOpaque, PendingDirectCall, PendingUpdateRecord),
 		ListElementSource(ExpectedElementType, FirstElementType),
-		PendingOperation(AcceptedField, PendingInvocation),
-		InferenceType(AcceptedType, InferredCallable),
+		PendingOperation(AcceptedTupleElement, AcceptedField, PendingInvocation),
+		InferenceType(AcceptedType, InferredTuple, InferredCallable),
 		ConstraintOrigin(LambdaConstraint, ArgumentConstraint, RecordFieldConstraint, ResultConstraint, OpaqueOperandConstraint, VariantConstraint, ListElementConstraint, ReceiverOverlapConstraint),
 		CallResultContext,
 		InferenceReadiness(ClosedInference, DeferredInference),
@@ -86,7 +86,7 @@ import:
 		call_inference_ready,
 		inference_child, inference_complete, inference_shape,
 		inference_head,
-		inference_type,
+		inference_type, tuple_inference_type,
 		inspect_inference_equality,
 		pending_arguments,
 		pending_type,
@@ -96,7 +96,7 @@ import:
 		validate_complete_arguments
 	./constructors:
 		CallPlacement(ReceiverPlacement, ReturnPlacement),
-		PlannedBase(PlannedCallable, PlannedCall, PlannedLeaf, PlannedRecord, PlannedUpdate, PlannedVariant, PlannedList, PlannedConstructOpaque, PlannedProjectOpaque),
+		PlannedBase(PlannedTuple, PlannedCallable, PlannedCall, PlannedLeaf, PlannedRecord, PlannedUpdate, PlannedVariant, PlannedList, PlannedConstructOpaque, PlannedProjectOpaque),
 		finish_pending_list,
 		list_element_type,
 		plan_list_literal,
@@ -127,11 +127,11 @@ import:
 		ValueExpression,
 		WrittenName,
 		ParsedRecordField,
-		PostfixOperation(ReceiverInvocation, FieldAccess),
+		PostfixOperation(TupleIndex, ReceiverInvocation, FieldAccess),
 		ReceiverApplication,
 		ExpressionBase(
 			VoidExpression, IntegerExpression, FloatExpression, StringExpression, NameExpression, DirectApplication,
-			QualifiedName, QualifiedApplication, OpaqueWrap, OpaqueUnwrap, ListExpression, RangeExpression, RecordExpression,
+			QualifiedName, QualifiedApplication, OpaqueWrap, OpaqueUnwrap, TupleExpression, ListExpression, RangeExpression, RecordExpression,
 			RecordUpdateExpression, LogicalExpression, NotExpression, IfExpression, MatchExpression, LambdaExpression,
 		),
 		Purity(Pure, Impure), same_purity, permits_purity,
@@ -140,6 +140,7 @@ import:
 
 private fixed union ResolvedPostfix:
 	InvokeReceiver(ReceiverApplication, ResolvedReceiver)
+	ReadIndex(ValueExpression, Span)
 	ReadField(WrittenName)
 
 
@@ -196,7 +197,7 @@ private pure func postfix_hints(postfixes: List[PendingPostfix], result_hint: Op
 			Some(PendingOverloadInvocation(_, _)):
 				-- A common concrete receiver hint would prove a declaration clash.
 				hint = None
-			Some(PendingField(_)): hint = None
+			Some(PendingField(_)) | Some(PendingTupleIndex(_, _)): hint = None
 			None:
 				failure = Some(checker_invariant({ source = compiler_source(), start = 0, end = 0 }, InvalidInferenceWorklist))
 				break
@@ -207,6 +208,7 @@ private pure func postfix_hints(postfixes: List[PendingPostfix], result_hint: Op
 
 
 private fixed union PendingPostfix:
+	PendingTupleIndex(ValueExpression, Span)
 	PendingField(WrittenName)
 	PendingReceiverInvocation(ReceiverApplication, PendingCall)
 	PendingOverloadInvocation(ReceiverApplication, List[ReceiverCandidate])
@@ -244,6 +246,7 @@ private fixed union ExpressionWork:
 	FinishRecord(PlannedRecordFields, OperandRange)
 	CheckRecord(PlannedRecordFields, List[PendingRecordField])
 	ContinueList(ListProgress)
+	FinishTuple(OperandRange, Span, Span)
 	FinishList(ListElementSource, OperandRange, Span, Span)
 	CheckList(ListElementSource, List[PendingValue], Span, Span)
 	SolveConstraint(InferenceEquality)
@@ -575,6 +578,10 @@ private pure func plan_base(scope: List[ScopedValue], body: ValueExpression, exp
 						match context.opaques.get(opaque_number(declaration.id)):
 							None: Err(checker_invariant(name.span, InvalidOpaqueDeclaration(declaration.id)))
 							Some(accepted): Ok(PlannedProjectOpaque(declaration.id, accepted.underlying_type.value_type, operand))
+		TupleExpression(elements):
+			match tuple_hints(expectation, slots, body.base_span):
+				Ok(hints): Ok(PlannedTuple(elements, hints))
+				Err(error): Err(error)
 		ListExpression(elements): plan_list_literal(elements, expectation, body.base_span)
 		RangeExpression(_, _): Err(unsupported_form(body.base_span, RangeValue))
 		LogicalExpression(_, _, _): Err(unsupported_form(body.base_span, AndOrOperator))
@@ -649,6 +656,7 @@ private pure func resolve_postfixes(scope: List[ScopedValue], body: ValueExpress
 
 	for postfix in body.applications:
 		match postfix:
+			TupleIndex(index, span): contracts = contracts.append(ReadIndex(index, span))
 			FieldAccess(name): contracts = contracts.append(ReadField(name))
 			ReceiverInvocation(application):
 				match lookup_binding(scope, application.callee.id):
@@ -704,6 +712,40 @@ private pure func pending_receiver_contract(current: PendingValue, application: 
 			match publish_inference_type(pending_type(current), slots, CompleteInference, application.callee.span):
 				Ok(actual): select_receiver_contract(application, receiver, { value_type = actual, span = current.base_span }, context)
 				Err(error): Err(error)
+
+
+private pure func tuple_hints(expectation: Option[InferenceType], slots: List[InferenceSlot], span: Span) -> Result[List[Option[InferenceType]], CheckError]:
+	match expectation:
+		None: Ok([])
+		Some(expected):
+			match inference_head(expected, slots, span):
+				Err(error): Err(error)
+				Ok(head):
+					match inference_shape(head):
+						InferredTuple(elements): Ok(elements.map(pure func(element): Some(element)))
+						_: Ok([])
+
+
+private pure func pending_tuple_index(index: ValueExpression, span: Span, current: PendingValue, slots: List[InferenceSlot]) -> Result[PendingValue, CheckError]:
+	head ?= inference_head(pending_type(current), slots, index.span)
+	element_result: Result[List[InferenceType], CheckError] = match inference_shape(head):
+		InferredTuple(values): Ok(values)
+		_:
+			ResultOps.and_then(
+				publish_inference_type(head, slots, DiagnosticInference, index.span),
+				pure func(actual: TypeRef) -> Result[List[InferenceType], CheckError]: Err(value_error(index.span, TupleIndexRequiresTuple(actual)))
+			)
+	elements ?= element_result
+	position_result: Result[Int, CheckError] = match index.base:
+		IntegerExpression(value):
+			if index.applications.is_empty():
+				Ok(value)
+			else:
+				Err(value_error(index.span, TupleIndexMustBeLiteral))
+		_: Err(value_error(index.span, TupleIndexMustBeLiteral))
+	position ?= position_result
+	selected ?= elements.get(position).to_result(value_error(index.span, TupleIndexOutOfRange(position, elements.length())))
+	Ok({ current | operations = PendingOperationLink({ operation = AcceptedTupleElement(position), value_type = selected, span = span }, current.operations) })
 
 
 private pure func pending_field(name: WrittenName, current: PendingValue, slots: List[InferenceSlot], context: ResolutionContext) -> Result[PendingValue, CheckError]:
@@ -864,6 +906,7 @@ private pure func elaborate_value(
 
 								for postfix in resolved:
 									match postfix:
+										ReadIndex(index, span): postfixes = postfixes.append(PendingTupleIndex(index, span))
 										ReadField(name): postfixes = postfixes.append(PendingField(name))
 										InvokeReceiver(application, receiver):
 											match receiver:
@@ -940,9 +983,38 @@ private pure func elaborate_value(
 											PlannedCall(contract, arguments, placement, call_hint):
 												work = push_expression_work(work, work_count, ScheduleCall(contract, arguments, placement, call_hint))
 												work_count = IntOps.add(work_count, 1)
+											PlannedTuple(elements, hints):
+												range: OperandRange = { start = operand_count, count = elements.length() }
+												work = push_expression_work(work, work_count, FinishTuple(range, written.base_span, written.span))
+												work_count = IntOps.add(work_count, 1)
+												var position = elements.length()
+												while IntOps.greater_than(position, 0):
+													position = IntOps.subtract(position, 1)
+													match elements.get(position):
+														Some(element):
+															work = push_expression_work(work, work_count, EnterExpression(element, hints.get(position).get_or(None)))
+															work_count = IntOps.add(work_count, 1)
+														None: failure = Some(checker_invariant(written.span, InvalidInferenceWorklist))
 											PlannedList(elements, source):
 												work = push_expression_work(work, work_count, ContinueList({ source = source, elements = elements, position = 0, start = operand_count, base_span = written.base_span, span = written.span }))
 												work_count = IntOps.add(work_count, 1)
+					FinishTuple(range, base_span, span):
+						match call_operands(operands, range, span):
+							Err(error): failure = Some(error)
+							Ok(elements):
+								for position in range.start..operand_count:
+									operands = operands.set(position, None)
+								operand_count = range.start
+								value: PendingValue = {
+									base = PendingConstructTuple(elements),
+									base_type = tuple_inference_type(elements.map(pending_type)),
+									readiness = DeferredInference,
+									base_span = base_span,
+									span = span,
+									operations = NoPendingOperations,
+								}
+								operands = push_operand(operands, operand_count, value)
+								operand_count = IntOps.add(operand_count, 1)
 					FinishConstructOpaque(id, underlying, span):
 						position = IntOps.subtract(operand_count, 1)
 						match expression_operand(operands, position, span):
@@ -1250,6 +1322,12 @@ private pure func elaborate_value(
 									work_count = IntOps.add(work_count, 1)
 
 									match postfixes.get(position):
+										Some(PendingTupleIndex(index, index_span)):
+											match pending_tuple_index(index, { source = base_span.source, start = base_span.start, end = index_span.end }, current, slots):
+												Err(error): failure = Some(error)
+												Ok(value):
+													operands = push_operand(operands, operand_count, value)
+													operand_count = IntOps.add(operand_count, 1)
 										Some(PendingField(name)):
 											match pending_field(name, current, slots, context):
 												Err(error): failure = Some(error)
@@ -1603,6 +1681,10 @@ private pure func freeze_pending_value(value: PendingValue, slots: List[Inferenc
 						Ok(valid): Ok(ConstructVariant(contract.variant, frozen))
 						Err(error): Err(error)
 				Err(error): Err(error)
+		PendingConstructTuple(values):
+			match freeze_pending_values(values, slots, captures):
+				Ok(frozen): Ok(ConstructTuple(frozen))
+				Err(error): Err(error)
 		PendingConstructList(source, values):
 			match freeze_pending_values(values, slots, captures):
 				Ok(frozen):
@@ -1655,6 +1737,7 @@ private pure func freeze_pending_value(value: PendingValue, slots: List[Inferenc
 
 private pure func freeze_pending_step(step: PendingStep, receiver: CheckedExpr, slots: List[InferenceSlot], captures: CaptureScope) -> Result[CheckedExpr, CheckError]:
 	form_result: Result[CheckedForm, CheckError] = match step.operation:
+		AcceptedTupleElement(position): Ok(ReadTupleElement(receiver, position))
 		AcceptedField(field): Ok(ReadRecordField(receiver, field))
 		PendingInvocation(call, values):
 			match freeze_pending_call(call, values, Some(receiver), slots, captures):

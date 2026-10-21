@@ -1,0 +1,92 @@
+import:
+	../../../src/lower/lower as Lower
+	../../../src/specialize/specialize as Concrete
+	../managed_union_inputs: lowered, lowered_tail_join
+	test: TestSuite
+
+
+private pure func integer(definition: Lower.ValueDefinition, expected: Int) -> Bool:
+	match definition.operation:
+		Lower.IntegerValue(value): value == expected
+		_: False
+
+
+private pure func is_void(definition: Lower.ValueDefinition) -> Bool:
+	match definition.operation:
+		Lower.VoidValue: True
+		_: False
+
+
+private pure func projects(definition: Lower.ValueDefinition, parent: Lower.ValueId, ordinal: Int) -> Bool:
+	match definition.operation:
+		Lower.ReadRecordFieldValue(field, value):
+			Concrete.field_number(field) == ordinal and Lower.value_number(value) == Lower.value_number(parent)
+		_: False
+
+
+pure func test_tuple_children_lower_once_in_logical_order_including_void() -> Bool:
+	source: String =
+		|func main() -> Int:
+		|    value = (1, void, 3)
+		|    value[2]
+		|
+	match lowered(source):
+		Err(_): False
+		Ok(program):
+			match Lower.lowered_functions(program).functions:
+				[main]:
+					match main.steps:
+						[Lower.Define(first), Lower.Define(empty), Lower.Define(third), Lower.Define(tuple), Lower.Define(read)]:
+							match tuple.operation:
+								Lower.ConstructRecordValue(_, [left, middle, right]):
+									(integer(first, 1) and is_void(empty) and integer(third, 3)
+									and Lower.value_number(left.value) == Lower.value_number(first.id)
+									and Lower.value_number(middle.value) == Lower.value_number(empty.id)
+									and Lower.value_number(right.value) == Lower.value_number(third.id)
+									and projects(read, tuple.id, 2)
+									and Concrete.field_number(middle.field) == 1)
+								_: False
+						_: False
+				_: False
+
+
+pure func test_nested_tuple_pattern_materializes_immediate_record_parents() -> Bool:
+	source: String =
+		|pure func selected(value: ((Int, String), Int)) -> String:
+		|    match value:
+		|        ((_, text), _): text
+		|func main() -> Int:
+		|    unused = selected(((1, "kept"), 2))
+		|    0
+		|
+	match lowered(source):
+		Err(_): False
+		Ok(program):
+			Lower.lowered_functions(program).functions.any(pure func(function):
+				match lowered_tail_join(function):
+					None: False
+					Some(join):
+						join.selection.nodes.any(pure func(node):
+							match node:
+								Lower.EnterArm(edge):
+									match edge.definitions:
+										[Lower.BorrowRecordField(outer, first, root), Lower.BorrowRecordField(inner, second, parent)]:
+											(
+												Concrete.field_number(first) == 0 and Concrete.field_number(second) == 1
+												and Lower.value_number(root) == Lower.value_number(join.selection.scrutinee)
+												and Lower.value_number(parent) == Lower.value_number(outer.id)
+												and Concrete.same_type(inner.value_type, Concrete.StringType)
+											)
+										_: False
+								_: False
+						)
+			)
+
+
+tests: TestSuite = {
+	description = "Tuple lowering uses record operations",
+	tests = [
+		("children and Void retain order", test_tuple_children_lower_once_in_logical_order_including_void),
+		("nested pattern keeps immediate parents", test_nested_tuple_pattern_materializes_immediate_record_parents),
+	]
+}

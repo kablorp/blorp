@@ -1,0 +1,135 @@
+import:
+	../../../src/check/model as Model
+	../../../src/lower/lower as Lower
+	../../../src/own/own as Own
+	../../../src/specialize/specialize as Concrete
+	../ownership_inputs: RecordIds, record_ids, span
+	test: TestSuite
+
+
+private pure func parameter(id: Lower.ValueId, value_type: Concrete.TypeRef) -> Lower.ValueParameter:
+	{ id = id, value_type = value_type, span = span(10) }
+
+
+-- The seed provides identities only. This test authors the complete Lower input.
+private pure func projected(ids: RecordIds) -> Lower.LoweredFunction:
+	root_type = Concrete.RecordType(ids.record_id)
+	join: Lower.LoweredJoin = {
+		result = parameter(ids.second, Concrete.StringType),
+		carried = [],
+		selection = {
+			scrutinee = ids.first,
+			entry = Model.decision_node_id(0),
+			nodes = [Lower.EnterArm({
+				arm = Model.match_arm_id(0),
+				definitions = [Lower.BorrowRecordField(parameter(ids.third, Concrete.StringType), ids.first_field, ids.first)],
+				arguments = [ids.third],
+			})],
+		},
+		arms = [{
+			id = Model.match_arm_id(0),
+			inputs = [parameter(ids.fourth, Concrete.StringType)],
+			steps = [],
+			exit = Lower.Yield({ value = ids.fourth, carried = [] }),
+		}],
+		reads = [ids.first],
+	}
+	{
+		signature = { parameters = [root_type], return_type = Concrete.StringType },
+		steps = [
+			Lower.Define({ id = ids.first, value_type = root_type, operation = Lower.ParameterValue(0), span = span(1) }),
+			Lower.Join(join),
+		],
+		result = ids.second,
+	}
+
+
+pure func test_selected_managed_field_borrows_parent_and_acquires_one_occurrence() -> Bool:
+	match record_ids():
+		Err(_): False
+		Ok(ids):
+			records = ids.records.set(Concrete.record_number(ids.record_id), { fields = [Concrete.StringType, Concrete.VoidType], representation = Concrete.ManagedRecord })
+			match Own.insert_function(projected(ids), [], records):
+				Ok(function):
+					match function.operations:
+						[Own.DefineValue(_), Own.ExecuteJoin(join)]:
+							match join.selection.nodes:
+								[Own.EnterArm(edge)]:
+									match edge.operations:
+										[Own.DefineValue(field), Own.AcquireOwner(_, acquired, _)]:
+											match (field.operation, field.result):
+												(Own.ReadRecordFieldDefinition(id, Own.BorrowedArgument(parent)), Own.BorrowedResult(Own.PayloadBorrow(source))):
+													(
+														Concrete.field_number(id) == 0
+														and Lower.value_number(parent.value) == Lower.value_number(ids.first)
+								and Lower.value_number(source) == Lower.value_number(ids.first)
+														and Lower.value_number(acquired.value) == Lower.value_number(field.id)
+														and edge.transfers.length() == 1
+													)
+												_: False
+										_: False
+								_: False
+						_: False
+				Err(_): False
+
+
+
+private pure func nested(ids: RecordIds) -> Lower.LoweredFunction:
+	root_type = Concrete.RecordType(ids.record_id)
+	join: Lower.LoweredJoin = {
+		result = parameter(ids.second, Concrete.StringType), carried = [],
+		selection = { scrutinee = ids.first, entry = Model.decision_node_id(0), nodes = [Lower.EnterArm({
+			arm = Model.match_arm_id(0),
+			definitions = [
+				Lower.BorrowRecordField(parameter(ids.third, Concrete.RecordType(ids.other_record)), ids.first_field, ids.first),
+				Lower.BorrowRecordField(parameter(ids.fourth, Concrete.StringType), ids.other_field, ids.third),
+			],
+			arguments = [ids.fourth],
+		})] },
+		arms = [{ id = Model.match_arm_id(0), inputs = [parameter(ids.fifth, Concrete.StringType)], steps = [], exit = Lower.Yield({ value = ids.fifth, carried = [] }) }],
+		reads = [ids.first],
+	}
+	{
+		signature = { parameters = [root_type], return_type = Concrete.StringType },
+		steps = [Lower.Define({ id = ids.first, value_type = root_type, operation = Lower.ParameterValue(0), span = span(1) }), Lower.Join(join)],
+		result = ids.second,
+	}
+
+
+private pure func nested_owners_are_dense(ids: RecordIds, join: Own.OwnedJoin) -> Bool:
+	match (join.result, join.selection.nodes, join.arms):
+		(Own.ManagedJoinParameter(_, result_owner), [Own.EnterArm(edge)], [arm]):
+			match (edge.operations, edge.transfers, arm.inputs):
+				([Own.DefineValue(outer), Own.AcquireOwner(outer_owner, outer_borrow, _), Own.DefineValue(child), Own.AcquireOwner(child_owner, child_borrow, _), Own.DropOwner(retired, _)], [Own.OwnedReturn(transferred, moved)], [Own.ManagedJoinParameter(input, input_owner)]):
+					(Own.owner_number(result_owner) == 0 and Own.owner_number(outer_owner) == 1
+					and Own.owner_number(child_owner) == 2 and Own.owner_number(input_owner) == 3
+					and Own.owner_number(retired) == 1 and Own.owner_number(moved) == 2
+					and Lower.value_number(outer_borrow.value) == Lower.value_number(outer.id)
+					and Lower.value_number(child_borrow.value) == Lower.value_number(child.id)
+					and Lower.value_number(transferred) == Lower.value_number(child.id)
+					and Lower.value_number(input.id) == Lower.value_number(ids.fifth))
+				_: False
+		_: False
+
+
+pure func test_nested_record_selection_transfers_child_and_retires_only_intermediate() -> Bool:
+	match record_ids():
+		Err(_): False
+		Ok(ids):
+			records = ids.records
+				.set(Concrete.record_number(ids.record_id), { fields = [Concrete.RecordType(ids.other_record)], representation = Concrete.ManagedRecord })
+				.set(Concrete.record_number(ids.other_record), { fields = [Concrete.StringType], representation = Concrete.ManagedRecord })
+			match Own.insert_function(nested(ids), [], records):
+				Err(_): False
+				Ok(function):
+					match function.operations:
+						[Own.DefineValue(_), Own.ExecuteJoin(join)]: nested_owners_are_dense(ids, join)
+						_: False
+
+tests: TestSuite = {
+	description = "Tuple fields use ordinary record ownership",
+	tests = [
+		("nested selection transfers child and drops intermediate", test_nested_record_selection_transfers_child_and_retires_only_intermediate),
+		("selected managed field acquires one occurrence", test_selected_managed_field_borrows_parent_and_acquires_one_occurrence),
+	]
+}

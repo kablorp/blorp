@@ -1,0 +1,150 @@
+import:
+	../../../src/check/model as Model
+	../../../src/lower/lower as Lower
+	../../../src/own/own as Own
+	../../../src/specialize/specialize as Concrete
+	../../../src/utils/syntax as Syntax
+	../../../src/verify/verify: verify
+	../managed_union_inputs: lowered, lowered_tail_join
+	../ownership_inputs: span
+	option: to_result
+	test: TestSuite
+
+
+private SOURCE: String =
+	|fixed union Choice:
+	|    Present(Int)
+	|    Absent
+	|pure func chosen(value: (Choice, Int)) -> Int:
+	|    match value:
+	|        (Present(number), _): number
+	|        (Absent, _): 0
+	|func main() -> Int:
+	|    chosen((Present(7), 0))
+	|
+
+
+private fixed record ProjectionIds {
+	facts: Lower.LoweredFunctions,
+	root: Lower.ValueDefinition,
+	result: Lower.ValueParameter,
+	product: Lower.ValueParameter,
+	field: Concrete.FieldInstanceId,
+	payload: Lower.ValueParameter,
+	variant_field: Concrete.VariantFieldInstanceId,
+	input: Lower.ValueParameter,
+	fallback: Lower.ValueDefinition,
+	signature: Concrete.FunctionSignature,
+}
+
+
+private pure func seed_error() -> Syntax.Diagnostic:
+	{ span = span(0), note = None, message = "missing tuple guard identities", help = "fix the projection identity seed" }
+
+
+private pure func edge_ids(facts: Lower.LoweredFunctions, root: Lower.ValueDefinition, chosen: Lower.LoweredFunction, join: Lower.LoweredJoin, edge: Lower.SelectionEdge) -> Option[ProjectionIds]:
+	match (edge.definitions, join.arms):
+		([Lower.BorrowRecordField(product, field, _), Lower.BorrowUnionField(payload, variant_field, _)], [selected, fallback]):
+			match (selected.inputs, fallback.steps):
+				([input], [Lower.Define(value)]): Some({ facts = facts, root = root, result = join.result, product = product, field = field, payload = payload, variant_field = variant_field, input = input, fallback = value, signature = chosen.signature })
+				_: None
+		_: None
+
+
+-- Lower supplies opaque identities only, never ownership facts or the oracle.
+private pure func projection_ids() -> Result[ProjectionIds, Syntax.Diagnostic]:
+	program ?= lowered(SOURCE)
+	facts = Lower.lowered_functions(program)
+	chosen ?= facts.functions.get(1).to_result(seed_error())
+	root: Lower.ValueDefinition ?= match chosen.steps.get(0):
+		Some(Lower.Define(value)): Ok(value)
+		_: Err(seed_error())
+	join ?= lowered_tail_join(chosen).to_result(seed_error())
+	var found: Option[ProjectionIds] = None
+	for node in join.selection.nodes:
+		match node:
+			Lower.EnterArm(edge):
+				match edge_ids(facts, root, chosen, join, edge):
+					Some(ids): found = Some(ids)
+					None: void
+			_: void
+	found.to_result(seed_error())
+
+
+private pure func selected_edge(ids: ProjectionIds, root: Own.OwnedArgument) -> Own.OwnedDecisionNode:
+	Own.EnterArm({
+		arm = Model.match_arm_id(0),
+		operations = [
+			Own.DefineValue({ id = ids.product.id, value_type = ids.product.value_type, operation = Own.ReadRecordFieldDefinition(ids.field, root), result = Own.UnmanagedResult, span = span(10) }),
+			Own.DefineValue({ id = ids.payload.id, value_type = Concrete.IntType, operation = Own.PayloadDefinition(ids.variant_field, ids.product.id), result = Own.UnmanagedResult, span = span(20) }),
+		],
+		transfers = [Own.UnmanagedReturn(ids.payload.id)],
+	})
+
+
+private pure func selection(ids: ProjectionIds, root: Own.OwnedArgument, guarded: Bool) -> Own.OwnedSelection:
+	selected = selected_edge(ids, root)
+	place: Concrete.ConcretePatternPlace = { value_type = ids.product.value_type, route = Concrete.RecordField({ value_type = ids.root.value_type, route = Concrete.MatchRoot }, ids.field) }
+	if guarded:
+		{ scrutinee = root, entry = Model.decision_node_id(2), nodes = [
+			selected,
+			Own.EnterArm({ arm = Model.match_arm_id(1), operations = [], transfers = [] }),
+			Own.TestVariant(place, Concrete.variant_field_variant(ids.variant_field), Model.decision_node_id(0), Model.decision_node_id(1)),
+		] }
+	else:
+		{ scrutinee = root, entry = Model.decision_node_id(0), nodes = [selected] }
+
+
+private pure func arms(ids: ProjectionIds, guarded: Bool) -> List[Own.OwnedJoinArm]:
+	first: Own.OwnedJoinArm = {
+		id = Model.match_arm_id(0), inputs = [Own.UnmanagedJoinParameter(ids.input)], operations = [],
+		exit = Own.Yield({ transfer = Own.UnmanagedReturn(ids.input.id), carried = [] }),
+	}
+	if guarded:
+		[first, {
+			id = Model.match_arm_id(1), inputs = [],
+			operations = [Own.DefineValue({ id = ids.fallback.id, value_type = Concrete.IntType, operation = Own.IntegerDefinition(0), result = Own.UnmanagedResult, span = span(30) })],
+			exit = Own.Yield({ transfer = Own.UnmanagedReturn(ids.fallback.id), carried = [] }),
+		}]
+	else:
+		[first]
+
+
+-- Every tested ownership definition and transfer is authored independently.
+private pure func authored(ids: ProjectionIds, guarded: Bool) -> Own.OwnershipProgram:
+	root = Own.BorrowedArgument({ value = ids.root.id, source = Own.ParameterBorrow(ids.root.id) })
+	join: Own.OwnedJoin = { result = Own.UnmanagedJoinParameter(ids.result), carried = [], selection = selection(ids, root, guarded), arms = arms(ids, guarded) }
+	{
+		records = ids.facts.records, unions = ids.facts.unions, entrypoint = ids.facts.entrypoint,
+		functions = [
+			{ signature = { parameters = [], return_type = Concrete.IntType }, operations = [Own.DefineValue({ id = ids.root.id, value_type = Concrete.IntType, operation = Own.IntegerDefinition(0), result = Own.UnmanagedResult, span = span(0) })], result = Own.UnmanagedReturn(ids.root.id) },
+			{ signature = ids.signature, operations = [Own.DefineValue({ id = ids.root.id, value_type = ids.root.value_type, operation = Own.ParameterDefinition(0), result = Own.BorrowedResult(Own.ParameterBorrow(ids.root.id)), span = span(1) }), Own.ExecuteJoin(join)], result = Own.UnmanagedReturn(ids.result.id) },
+		],
+	}
+
+
+pure func test_guard_fact_survives_the_record_field_route() -> Bool:
+	match projection_ids():
+		Err(_): False
+		Ok(ids): verify(authored(ids, True)).is_ok()
+
+
+pure func test_record_route_does_not_grant_an_unguarded_union_payload() -> Bool:
+	match projection_ids():
+		Err(_): False
+		Ok(ids):
+			match verify(authored(ids, False)):
+				Ok(_): False
+				Err(error):
+					(error.message == "ownership verification failed: payload projection outside its selected match arm"
+					and error.help == "report this compiler error with the input program"
+					and Syntax.same_span(error.span, span(20)))
+
+
+tests: TestSuite = {
+	description = "Independent tuple ancestry guard verification",
+	tests = [
+		("guarded tuple union payload verifies", test_guard_fact_survives_the_record_field_route),
+		("tuple does not invent a union guard", test_record_route_does_not_grant_an_unguarded_union_payload),
+	]
+}
