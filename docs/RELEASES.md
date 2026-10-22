@@ -207,15 +207,17 @@ link log must be empty and its complete stderr must be the exact balanced strict
 report; emitted C must match. Provenance retains its hash and flags, and the
 sanitized binary is not published. Regular diagnostic B runs the native cost suite.
 Ordinary e2e cases run sanitized real mains; accounted cases additionally check
-strict target balance. The stored-callable/tuple bridge keeps compiler, library
-and test source at `9c12cc79e3b7b919af93debde139595b4288e42e`; its reviewed workflow
-and documentation changes receive a new commit and seed tag. This compiler
-supports stored callable values and structural tuples, allowing later compiler
-source to use those features. Its compiler C is locked to SHA-256
-`46c041be4c5be389cd5e6b6d288f5abd8e673ca78b003914849232ac456ee4e3`, checked
+strict target balance. The current interpolation-capable producer's compiler,
+library and test inputs match `6ef8b68296ee70e63fcee18b7cedce23e1720b48`.
+It supports quoted and pipe String interpolation, allowing subsequent compiler
+source to adopt those forms. The reviewed workflow and release documentation
+changes receive their own commit and seed tag. Compiler C is locked to SHA-256
+`18de404e94f2f10be33031ddcd246b1b867296fead0942d2755fc124781988d9`, checked
 immediately after A emits C and before B qualification. Each provenance archive
 retains `reviewed-compiler-c.sha256`; the publisher checks the emitted C against
-that digest and requires all platforms to agree.
+that digest and requires all platforms to agree. The earlier stored-callable/tuple
+bridge recorded source `9c12cc79e3b7b919af93debde139595b4288e42e` and compiler C
+`46c041be4c5be389cd5e6b6d288f5abd8e673ca78b003914849232ac456ee4e3`.
 Only the native qualification command sets
 `BLORP_2_RESOURCE_POLICY=record-allocation-debt`, matching CI. The typed test policy
 retains original caps and records allocation overruns as structured
