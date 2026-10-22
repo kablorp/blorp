@@ -42,14 +42,13 @@ import:
 		CallTarget(UserFunction, RuntimeFunction),
 		ConcretePatternPlace, ConcretePatternRoute(MatchRoot, UnionField, RecordField, ListElement),
 		ConcreteRecord(InlineFields, CountedFields),
-		ConcreteUnion,
+		ConcreteUnion(PlainCases, OwningCases, BoxedCases),
 		FieldInstanceId,
 		FunctionInstanceId,
 		FunctionSignature,
 		RecordInstanceId,
 		TypeRef(VoidType, IntType, FloatType, StringType, ListType, CallableType, UnionType, RecordType),
 		UnionInstanceId,
-		UnionRepresentation(InlineUnmanaged, InlineOwningPayload, BoxedRecursive),
 		VariantFieldInstanceId, VariantInstanceId, variant_field_variant, variant_field_number,
 		field_number,
 		field_owner,
@@ -60,6 +59,7 @@ import:
 		runtime_type_ref,
 		same_type,
 		union_number,
+		union_variants,
 		value_needs_ownership,
 		variant_number,
 		variant_owner,
@@ -532,7 +532,7 @@ private pure func verify_two_variant_union(
 		and(
 			and(
 				same_type(first_type, second_type),
-				IntOps.equals(layout.variants.length(), 2),
+				IntOps.equals(union_variants(layout).length(), 2),
 			),
 			IntOps.equals(variant_number(first), variant_number(second)).not(),
 		)
@@ -634,7 +634,7 @@ private pure func verify_arguments(
 
 private pure func variant_shape(id: VariantInstanceId, unions: List[ConcreteUnion], span: Span) -> Result[List[TypeRef], Diagnostic]:
 	declaration ?= unions.get(union_number(variant_owner(id))).to_result(verification_error(span, "unknown variant owner"))
-	declaration.variants.get(variant_number(id)).to_result(verification_error(span, "unknown variant identity"))
+	union_variants(declaration).get(variant_number(id)).to_result(verification_error(span, "unknown variant identity"))
 
 
 private pure func variant_type(id: VariantInstanceId, expected: List[TypeRef], unions: List[ConcreteUnion], span: Span) -> Result[TypeRef, Diagnostic]:
@@ -670,14 +670,16 @@ private pure func valid_union_layout(
 		end = 0
 	}
 
-	if IntOps.equals(layout.variants.length(), 0):
+	variants = union_variants(layout)
+
+	if IntOps.equals(variants.length(), 0):
 		Err(verification_error(span, "union layout must contain one or more variants"))
 	else:
 		var invalid: Option[Diagnostic] = None
 		var owning: Bool = False
 		var self_referencing: Bool = False
 
-		for fields in layout.variants:
+		for fields in variants:
 			var self_payloads = 0
 
 			for value_type in fields:
@@ -703,11 +705,11 @@ private pure func valid_union_layout(
 							self_referencing = True
 							self_payloads = IntOps.add(self_payloads, 1)
 
-							match layout.representation:
-								BoxedRecursive:
+							match layout:
+								BoxedCases(_):
 									if IntOps.greater_than(self_payloads, 1):
 										invalid = Some(verification_error(span, "boxed union variant may store at most one self-reference"))
-								InlineUnmanaged | InlineOwningPayload:
+								PlainCases(_) | OwningCases(_):
 									invalid = Some(verification_error(span, "recursive union payload requires the boxed representation"))
 
 							True
@@ -718,10 +720,10 @@ private pure func valid_union_layout(
 							-- acyclic. Definition order is the emitter's concern.
 							match unions.get(union_number(id)):
 								Some(child):
-									match child.representation:
-										InlineOwningPayload | BoxedRecursive:
+									match child:
+										OwningCases(_) | BoxedCases(_):
 											owning = True
-										InlineUnmanaged:
+										PlainCases(_):
 											void
 
 									True
@@ -752,18 +754,18 @@ private pure func valid_union_layout(
 			Some(error):
 				Err(error)
 			None:
-				match layout.representation:
-					BoxedRecursive:
+				match layout:
+					BoxedCases(_):
 						if self_referencing:
 							Ok(void)
 						else:
 							Err(verification_error(span, "boxed union representation requires a self-referencing payload"))
-					InlineUnmanaged:
+					PlainCases(_):
 						if owning:
 							Err(verification_error(span, "union ownership summary does not match its payloads"))
 						else:
 							Ok(void)
-					InlineOwningPayload:
+					OwningCases(_):
 						if owning:
 							Ok(void)
 						else:
@@ -898,15 +900,15 @@ private pure func verify_layout_graph(
 									None:
 										invalid = Some(verification_error(span, "unknown union layout"))
 									Some(child):
-										match child.representation:
-											InlineUnmanaged | InlineOwningPayload:
+										match child:
+											PlainCases(_) | OwningCases(_):
 												pending = push_layout_visit(
 													pending,
 													pending_count,
 													VisitUnionLayout(union_number(id)),
 												)
 												pending_count = IntOps.add(pending_count, 1)
-											BoxedRecursive:
+											BoxedCases(_):
 												void
 							ListType(element):
 								-- A pointer edge whose target must exist; its layout is
@@ -993,12 +995,13 @@ private pure func verify_layout_graph(
 											FinishUnionLayout(index),
 										)
 										pending_count = IntOps.add(pending_count, 1)
-										var child = layout.variants.length()
+										variants = union_variants(layout)
+										var child = variants.length()
 
 										while IntOps.greater_than(child, 0):
 											child = IntOps.subtract(child, 1)
 
-											match layout.variants.get(child):
+											match variants.get(child):
 												Some(fields):
 													var field_position = fields.length()
 													while IntOps.greater_than(field_position, 0):
@@ -2535,7 +2538,7 @@ private pure func variant_possibilities(place: ConcretePatternPlace, facts: List
 						None: Err(verification_error(span, "unknown match union"))
 						Some(layout):
 							var possible: List[Bool] = []
-							for _ in layout.variants:
+							for _ in union_variants(layout):
 								possible = possible.append(True)
 							Ok(possible)
 				_: Err(verification_error(span, "variant test requires a union place"))

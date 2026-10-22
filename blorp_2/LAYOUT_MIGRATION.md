@@ -1,6 +1,6 @@
 # Simplifying layout and ownership representation in place
 
-Status: M1, M2 and E1 implemented and qualified, 2026-10-22; see the
+Status: M1, M2, E1 and E2 implemented and qualified, 2026-10-22. See the
 [binary ownership report](../benchmarks/results/blorp_2_binary_ownership_2026-10-21.md)
 and [flat union reader report](../benchmarks/results/blorp_2_flat_layout_readers_2026-10-21.md).
 This simplified roadmap supersedes the uniform heap-catalogue proposal in
@@ -67,7 +67,7 @@ part of this roadmap.
 | M1: binary ownership query | Remove seven-way ValueOwnership and migrate every actual consumer | Fewer production types/constructors/branches, with nonregressing costs | M0 |
 | M2: simpler flat consumers | One demonstrated duplicated physical decision and all its readers | Actual code or measured work reduction; otherwise drop it | M1; independently useful |
 | E1: completed record sum | Fuse fields and storage choice through construction, raw verification and emission | Wrapper-allocation or independent code/work win; otherwise reject | Reviewed record-row hypothesis after M1/M2 |
-| E2: further adoption | A separately bounded completed-union experiment, only if E1 earned adoption | Its own benefit against accepted parent | Accepted E1; no automatic commitment |
+| E2: completed union sum | Fuse the existing variants list and storage choice through construction, raw verification and emission | Its own allocation benefit without material offsetting growth | Accepted E1; implemented and qualified |
 
 M1 is complete: 32 fewer production lines, 1.016% fewer allocations and
 nonregressing instructions. M2 is complete: one private boxed-union predicate
@@ -77,7 +77,11 @@ retired instructions are effectively flat (+0.00303%). E1 is complete: the
 completed record sum removes 475 allocations on the fixed workload
 (0.001548% of Parent), with effectively flat instructions and net +13 production
 lines. See the [record-sum report](../benchmarks/results/blorp_2_record_layout_sum_2026-10-21.md).
-E2 remains a separate experiment requiring its own benefit before adoption.
+E2 has independently reproduced 885 fewer allocations (0.00288373% of Parent),
+minimum-of-three instructions +0.00283581% with overlapping ranges and
+net +19 production lines. Composed component/native/fixpoint and whole-source
+strict/sanitizer qualification passed. See the
+[union-sum report](../benchmarks/results/blorp_2_union_layout_sum_2026-10-22.md).
 Each implementation brief follows [HANDOFF_SPEC](../docs/HANDOFF_SPEC.md), stays
 under its prose limit and references this design rather than duplicating it.
 
@@ -438,15 +442,49 @@ workload has 475 actual record rows; the separate current-parent compiler census
 has 477. Do not turn this observation into a general allocation-per-row promise.
 Qualification and independent acceptance still decide adoption.
 
-### E2 remains independently optional
+### E2: completed union sum, adopted
 
-Read-only union-row inventory may proceed before E1 adoption; that inventory is
-a hypothesis, not implementation approval. Implementation requires accepted E1
-and its own reviewed brief. PlainCases, OwningCases and BoxedCases may each carry
-the existing ordered List[List[TypeRef]]. Keep existing nominal IDs, private pending choices, union
-owning accumulation and independent Verify checks. This is a hypothesis, not an
-approved implementation or a commitment to a SlotLayout/List graph. It must show
-its own benefit against its accepted parent without material offsetting growth.
+Against actual accepted Parent `ef9dc72d597ca64588777b06bd23ad2fec20be26`,
+`ConcreteUnion` now directly publishes `PlainCases`, `OwningCases` or
+`BoxedCases`, each carrying the same ordered `List[List[TypeRef]]`.
+`UnionRepresentation` remains private to pending builders. `union_variants`
+returns the existing list; completed-to-pending adaptation and the existing
+eight-reader Emit helper match the completed constructor. Settlement preserves
+all known-type checks and error order before publishing once.
+
+Raw rows remain untrusted claims: every payload membership, owning/self summary
+and independent layout-graph check remains, including unused rows and later
+List/callable signature members. IDs, source storage policy, actual recursive
+edges/List cuts, Void ordinals/effects, callable signatures, release order and
+repeated ownership are unchanged. No second arrays/catalogue/cache/phase or
+independent eligibility-rescan optimization was added. Two append-only raw
+callbacks passed on the old model before migration, then each showed its exact
+single named failure under a separate source-valid fault. Existing boxed raw
+and physical faults retained their complete predicted vectors and exact
+restoration. Canonical/restored pinned-Make compiler C matches.
+
+Actual C removes the managed completed-row wrapper, while native table elements
+widen 8 → 16 B and UnionInstance 24 → 32 B; the inline carrier is 16 B versus
+the previous 24 B wrapper. The projection retains its existing list without allocation or
+rebuilding. These facts and 885 exactly repeated fewer allocations do not imply
+aggregate retained-byte savings or speed. The sole normal-nine instruction
+batch is effectively flat (+0.00283581% minimum of three versus Parent,
+overlapping ranges) and passes the prospective +0.25% guard; fixed Original allocation/instruction
++3% guards and production net +40 also pass. There was exactly one fresh strict
+O/P/C allocation confirmation, with all roles' exact counts repeated, no second
+normal batch or third strict batch.
+
+The [union-sum report](../benchmarks/results/blorp_2_union_layout_sum_2026-10-22.md)
+records source02's three production and 54 test edits, corrected CheckedUnion
+census false positives, unchanged 57-owner, 917-callback selection plus 142 nested native
+assertions, local ordinary/fault/C/resource evidence and all limitations.
+Root qualification passed 4,539 component checks, all 581 fixture contracts and
+584 native cases, plus the current-source strict and ASan/UBSan runs. The existing
+117 allocation-debt markers remain visible; broad instructions remain unmeasured.
+The current-source strict count rose by 10,020 allocations across changed inputs,
+a separate observation from the matched 885-allocation reduction. Two independent
+code and test reviews govern landing. This completes the simplified roadmap; it
+does not introduce a SlotLayout/List graph or authorize another experiment.
 
 ## Tests and behavior oracles
 

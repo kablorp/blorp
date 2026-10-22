@@ -59,12 +59,11 @@ import:
 	../specialize/specialize as Concrete:
 		CallTarget(UserFunction, RuntimeFunction),
 		ConcreteRecord(InlineFields, CountedFields), ConcretePatternPlace,
-		ConcreteUnion,
+		ConcreteUnion(PlainCases, OwningCases, BoxedCases),
 		FieldInstanceId,
 		RecordInstanceId,
 		TypeRef(VoidType, IntType, FloatType, StringType, ListType, CallableType, UnionType, RecordType),
 		UnionInstanceId,
-		UnionRepresentation(InlineUnmanaged, InlineOwningPayload, BoxedRecursive),
 		VariantInstanceId, variant_field_variant, variant_field_number,
 		field_number,
 		field_owner,
@@ -72,6 +71,7 @@ import:
 		record_fields,
 		record_number,
 		union_number,
+		union_variants,
 		variant_number,
 		variant_owner,
 		value_needs_ownership,
@@ -259,22 +259,22 @@ private pure func append_byte_array(output: String, name: String, bytes: String)
 
 
 private pure func has_payload(declaration: ConcreteUnion) -> Bool:
-	declaration.variants.any(pure func(fields): fields.is_empty().not())
+	union_variants(declaration).any(pure func(fields): fields.is_empty().not())
 
 
 private pure func boxed_union_struct(index: Int) -> String:
 	"struct blorp_u_".append_int(index)
 
 
-private pure func union_is_boxed(representation: UnionRepresentation) -> Bool:
-	match representation:
-		BoxedRecursive: True
-		InlineUnmanaged | InlineOwningPayload: False
+private pure func union_is_boxed(layout: ConcreteUnion) -> Bool:
+	match layout:
+		BoxedCases(_): True
+		PlainCases(_) | OwningCases(_): False
 
 
 -- A boxed union value is a pointer to its counted node.
 private pure func union_c_type(id: UnionInstanceId, declaration: ConcreteUnion) -> String:
-	match union_is_boxed(declaration.representation):
+	match union_is_boxed(declaration):
 		True:
 			boxed_union_struct(union_number(id)).concat("*")
 		False:
@@ -309,7 +309,7 @@ private pure func c_local_declaration(
 				None:
 					Err(render(span, MissingUnionLayout(id)))
 				Some(layout):
-					Ok(union_is_boxed(layout.representation))
+					Ok(union_is_boxed(layout))
 		_:
 			Ok(False)
 	declaration: String = match assignment:
@@ -592,7 +592,7 @@ private pure func c_parameters(
 
 -- Inline unions are read by value; boxed unions through their node pointer.
 private pure func union_member_selector(declaration: ConcreteUnion) -> String:
-	match union_is_boxed(declaration.representation):
+	match union_is_boxed(declaration):
 		True: "->"
 		False: "."
 
@@ -611,6 +611,7 @@ private pure func append_union(
 	index: Int,
 	unions: List[ConcreteUnion],
 ) -> Result[String, Diagnostic]:
+	variants = union_variants(declaration)
 	payload = has_payload(declaration)
 
 	prefix = if payload:
@@ -624,7 +625,7 @@ private pure func append_union(
 		.concat("{")
 	var position: Int = 0
 
-	for shape in declaration.variants:
+	for shape in variants:
 		if IntOps.not_equals(position, 0):
 			result = result.concat(",")
 
@@ -642,7 +643,7 @@ private pure func append_union(
 			.concat("struct blorp_u_")
 			.append_int(index)
 			.concat("{")
-		reference_header: String = match union_is_boxed(declaration.representation):
+		reference_header: String = match union_is_boxed(declaration):
 			True: "_Atomic uint64_t references;"
 			False: ""
 		result = struct_prefix
@@ -653,7 +654,7 @@ private pure func append_union(
 		position = 0
 		var failure: Option[Diagnostic] = None
 
-		for fields in declaration.variants:
+		for fields in variants:
 			if fields.is_empty().not():
 				result = result.concat("struct{")
 				var field_position = 0
@@ -734,7 +735,7 @@ private pure func stored_by_value(value_type: TypeRef, records: List[ConcreteRec
 		UnionType(id):
 			match unions.get(union_number(id)):
 				Some(layout):
-					match union_is_boxed(layout.representation):
+					match union_is_boxed(layout):
 						False: Some(UnionDefinition(union_number(id)))
 						True: None
 				None: None
@@ -845,12 +846,13 @@ private pure func append_aggregate_definitions(
 											None:
 												invalid = Some(render(internal_span(), MissingAggregateLayout(UnionAggregate, index)))
 											Some(layout):
-												var child = layout.variants.length()
+												variants = union_variants(layout)
+												var child = variants.length()
 
 												while IntOps.greater_than(child, 0):
 													child = IntOps.subtract(child, 1)
 
-													match layout.variants.get(child):
+													match variants.get(child):
 														Some(fields):
 															var field_position = fields.length()
 															while IntOps.greater_than(field_position, 0):
@@ -1218,7 +1220,7 @@ private pure func c_union_value(
 		None: Err(render(span, MissingUnionLayout(variant_owner(variant))))
 
 	if has_payload(declaration):
-		opening = match union_is_boxed(declaration.representation):
+		opening = match union_is_boxed(declaration):
 			True:
 				"blorp_union_make_".append_int(index).concat("((").concat(boxed_union_struct(index))
 			False:
@@ -1893,10 +1895,10 @@ private pure func append_storage_operation(
 		UnionType(id):
 			match unions.get(union_number(id)):
 				Some(layout):
-					union_helper: Option[String] = match layout.representation:
-						InlineUnmanaged:
+					union_helper: Option[String] = match layout:
+						PlainCases(_):
 							None
-						InlineOwningPayload | BoxedRecursive:
+						OwningCases(_) | BoxedCases(_):
 							prefix = match action:
 								DuplicateValue:
 									"blorp_union_dup_"
@@ -1944,7 +1946,7 @@ private pure func append_union_action(
 	var position = 0
 	var failure: Option[Diagnostic] = None
 
-	for fields in layout.variants:
+	for fields in union_variants(layout):
 		result = result
 			.concat("case blorp_v_")
 			.append_int(index)
@@ -2009,7 +2011,7 @@ private pure func append_boxed_union_prototypes(output: String, unions: List[Con
 	var index = 0
 
 	for layout in unions:
-		if union_is_boxed(layout.representation):
+		if union_is_boxed(layout):
 			node = boxed_union_struct(index)
 			fragments = fragments.append(
 				node.concat(";void blorp_union_dup_").append_int(index).concat("(").concat(node)
@@ -2046,7 +2048,7 @@ private pure func append_boxed_union_release(
 	var position = 0
 	var failure: Option[Diagnostic] = None
 
-	for fields in layout.variants:
+	for fields in union_variants(layout):
 		result = result
 			.concat("case blorp_v_")
 			.append_int(index)
@@ -2089,14 +2091,14 @@ private pure func append_union_ownership(
 	index: Int,
 	unions: List[ConcreteUnion],
 ) -> Result[String, Diagnostic]:
-	match layout.representation:
-		InlineUnmanaged:
+	match layout:
+		PlainCases(_):
 			Ok(output)
-		InlineOwningPayload:
+		OwningCases(_):
 			match append_union_action(output, layout, index, unions, DuplicateValue):
 				Ok(duplicated): append_union_action(duplicated, layout, index, unions, DestroyValue)
 				Err(error): Err(error)
-		BoxedRecursive:
+		BoxedCases(_):
 			constructed = append_boxed_union_constructor(output, index)
 			append_boxed_union_release(append_boxed_union_retain(constructed, index), layout, index, unions)
 
@@ -2907,7 +2909,7 @@ private pure func program_inventory(program: OwnershipProgram) -> ProgramInvento
 			types = types.append(field)
 
 	for layout in program.unions:
-		for fields in layout.variants:
+		for fields in union_variants(layout):
 			for value_type in fields:
 				types = types.append(value_type)
 
@@ -3242,7 +3244,7 @@ private pure func has_boxed_union(unions: List[ConcreteUnion]) -> Bool:
 	var boxed: Bool = False
 
 	for layout in unions:
-		if union_is_boxed(layout.representation):
+		if union_is_boxed(layout):
 			boxed = True
 			break
 

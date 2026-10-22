@@ -118,7 +118,7 @@ pure func variant_field(
 	span: Span,
 ) -> Result[VariantFieldInstanceId, Diagnostic]:
 	layout ?= unions.get(union_number(variant_owner(id))).to_result(invalid(span, "unknown variant owner"))
-	fields ?= layout.variants.get(variant_number(id)).to_result(invalid(span, "unknown variant identity"))
+	fields ?= union_variants(layout).get(variant_number(id)).to_result(invalid(span, "unknown variant identity"))
 	valid ?= fields.get(position).to_result(invalid(span, "unknown variant field"))
 	Ok(into_opaque VariantFieldInstanceId({ variant = id, position = position }))
 
@@ -136,18 +136,25 @@ fixed union TypeRef:
 
 -- A union naming itself as a payload has no finite inline storage, so every
 -- value of it is a counted heap node and the self payload is a pointer edge.
-fixed union UnionRepresentation:
+private fixed union UnionRepresentation:
 	InlineUnmanaged
 	InlineOwningPayload
 	BoxedRecursive
 
 
-fixed record ConcreteUnion {
-	-- Complete storage; the summary is derived once from every child. A
-	-- BoxedRecursive layout's own instance appears among its payloads.
-	variants: List[List[TypeRef]],
-	representation: UnionRepresentation
-}
+-- Complete storage; the case is derived once from every child. A
+-- BoxedCases layout's own instance appears among its payloads.
+fixed union ConcreteUnion:
+	PlainCases(List[List[TypeRef]])
+	OwningCases(List[List[TypeRef]])
+	BoxedCases(List[List[TypeRef]])
+
+
+pure func union_variants(layout: ConcreteUnion) -> List[List[TypeRef]]:
+	match layout:
+		PlainCases(variants): variants
+		OwningCases(variants): variants
+		BoxedCases(variants): variants
 
 
 fixed record FunctionSignature {
@@ -565,10 +572,9 @@ pure func value_needs_ownership(
 				None:
 					Err(ownership_error("invalid union identity in ownership representation"))
 				Some(declaration):
-					needs_owner: Bool = match declaration.representation:
-						InlineUnmanaged: False
-						InlineOwningPayload | BoxedRecursive: True
-					Ok(needs_owner)
+					match declaration:
+						PlainCases(_): Ok(False)
+						OwningCases(_) | BoxedCases(_): Ok(True)
 
 
 private pure func translated_list[T, U](
@@ -1286,7 +1292,11 @@ private pure func slot_has_record_key(slot: RecordSlot, key: PartialRecordKey) -
 
 private pure func slot_union_representation(slot: UnionSlot) -> UnionRepresentation:
 	match slot:
-		CompleteUnion(instance): instance.layout.representation
+		CompleteUnion(instance):
+			match instance.layout:
+				PlainCases(_): InlineUnmanaged
+				OwningCases(_): InlineOwningPayload
+				BoxedCases(_): BoxedRecursive
 		PendingUnion(instance): instance.representation
 
 
@@ -1523,9 +1533,13 @@ private pure func settle_union(instance: PendingUnionInstance, span: Span) -> Re
 					Some(error):
 						Err(error)
 					None:
+						layout: ConcreteUnion = match instance.representation:
+							InlineUnmanaged: PlainCases(variants)
+							InlineOwningPayload: OwningCases(variants)
+							BoxedRecursive: BoxedCases(variants)
 						Ok(CompleteUnion({
 							key = { declaration = instance.key.declaration, arguments = arguments },
-							layout = { variants = variants, representation = instance.representation },
+							layout = layout,
 						}))
 			Err(error): Err(error)
 
@@ -3058,7 +3072,7 @@ private pure func translate_variant(
 		Err(invalid(span, "variant belongs to a different union declaration"))
 
 	position = Declaration.variant_number(id)
-	member ?= instance.layout.variants
+	member ?= union_variants(instance.layout)
 		.get(position)
 		.to_result(invalid(span, "unknown union variant"))
 	Ok(into_opaque VariantInstanceId({
