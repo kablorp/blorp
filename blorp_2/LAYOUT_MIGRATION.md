@@ -1,7 +1,8 @@
 # Simplifying layout and ownership representation in place
 
-Status: M1 implemented and qualified, 2026-10-21; see the
-[binary ownership report](../benchmarks/results/blorp_2_binary_ownership_2026-10-21.md).
+Status: M1 and M2 implemented and qualified, 2026-10-21; see the
+[binary ownership report](../benchmarks/results/blorp_2_binary_ownership_2026-10-21.md)
+and [flat union reader report](../benchmarks/results/blorp_2_flat_layout_readers_2026-10-21.md).
 This simplified roadmap supersedes the uniform heap-catalogue proposal in
 commit `7237afb9a`. Design examples below retain their inspection snapshot
 `2ebbebf83c08b45cdf0c807453f89e12fb4b4ac9`; M1's matched measurements freeze source
@@ -69,9 +70,11 @@ part of this roadmap.
 | E2: further adoption | A separately bounded union/List path, only if E1 earned adoption | Its own benefit against accepted parent | Accepted E1; no automatic commitment |
 
 M1 is complete: 32 fewer production lines, 1.016% fewer allocations and
-nonregressing instructions. M2 is an optional bounded source audit followed by
-a concrete diff, not permission for a general query framework. E1/E2 are
-unmerged experiments, not foundations that may land while awaiting later savings.
+nonregressing instructions. M2 is complete: one private boxed-union predicate
+serves all eight physical readers, removing seven duplicate classifications and
+three production lines. Allocations are unchanged from its immediate parent;
+retired instructions are effectively flat (+0.00303%). E1/E2 remain unmerged
+experiments, not foundations that may land while awaiting later savings.
 Each implementation brief follows [HANDOFF_SPEC](../docs/HANDOFF_SPEC.md), stays
 under its prose limit and references this design rather than duplicating it.
 
@@ -289,9 +292,12 @@ Source record eligibility is narrower than “unmanaged”: only Int, Float and
 eligible inline record children qualify; Void and plain unions do not. A
 shared ownership query must not replace that source policy.
 
-M2 owns one concrete duplication and its full reader family. It is optional if
-M1 leaves no worthwhile candidate. A complete removal/metric benefit is required
-before merging; there is no obligation to manufacture another milestone.
+M2 implemented the complete eight-reader family above, retaining both distinct
+ownership readers and the existing flat loops. Its independent benefit is the
+small actual production reduction; it introduces no retained layout carrier.
+The linked report records isolated costs and composed fixpoint/component/e2e,
+strict leak and sanitizer results. Further work still needs its own concrete
+deletion hypothesis; completing M2 does not authorize E1/E2 implementation.
 
 ## E1: smaller physical-slot candidate, only if it earns adoption
 
