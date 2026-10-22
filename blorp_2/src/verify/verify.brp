@@ -41,13 +41,12 @@ import:
 	../specialize/specialize:
 		CallTarget(UserFunction, RuntimeFunction),
 		ConcretePatternPlace, ConcretePatternRoute(MatchRoot, UnionField, RecordField, ListElement),
-		ConcreteRecord,
+		ConcreteRecord(InlineFields, CountedFields),
 		ConcreteUnion,
 		FieldInstanceId,
 		FunctionInstanceId,
 		FunctionSignature,
 		RecordInstanceId,
-		RecordRepresentation(InlineRecord, ManagedRecord),
 		TypeRef(VoidType, IntType, FloatType, StringType, ListType, CallableType, UnionType, RecordType),
 		UnionInstanceId,
 		UnionRepresentation(InlineUnmanaged, InlineOwningPayload, BoxedRecursive),
@@ -55,6 +54,7 @@ import:
 		field_number,
 		field_owner,
 		function_number,
+		record_fields,
 		record_number,
 		runtime_signature,
 		runtime_type_ref,
@@ -687,10 +687,10 @@ private pure func valid_union_layout(
 					RecordType(id):
 						match records.get(record_number(id)):
 							Some(child):
-								match child.representation:
-									ManagedRecord:
+								match child:
+									CountedFields(_):
 										owning = True
-									InlineRecord:
+									InlineFields(_):
 										void
 
 								True
@@ -774,7 +774,7 @@ private pure func valid_record_layout(
 	layout: ConcreteRecord,
 	span: Span,
 ) -> Result[ConcreteRecord, Diagnostic]:
-	if IntOps.greater_than(layout.fields.length(), 0):
+	if IntOps.greater_than(record_fields(layout).length(), 0):
 		Ok(layout)
 	else:
 		Err(verification_error(span, "record layout must contain one or more fields"))
@@ -883,15 +883,15 @@ private pure func verify_layout_graph(
 									None:
 										invalid = Some(verification_error(span, "unknown record layout"))
 									Some(child):
-										match child.representation:
-											InlineRecord:
+										match child:
+											InlineFields(_):
 												pending = push_layout_visit(
 													pending,
 													pending_count,
 													VisitRecordLayout(record_number(id)),
 												)
 												pending_count = IntOps.add(pending_count, 1)
-											ManagedRecord:
+											CountedFields(_):
 												void
 							UnionType(id):
 								match unions.get(union_number(id)):
@@ -946,12 +946,13 @@ private pure func verify_layout_graph(
 											FinishRecordLayout(index),
 										)
 										pending_count = IntOps.add(pending_count, 1)
-										var child = layout.fields.length()
+										fields = record_fields(layout)
+										var child = fields.length()
 
 										while IntOps.greater_than(child, 0):
 											child = IntOps.subtract(child, 1)
 
-											match layout.fields.get(child):
+											match fields.get(child):
 												Some(field):
 													pending = push_layout_visit(
 														pending,
@@ -1026,17 +1027,17 @@ private pure func verify_layout_graph(
 							Some(layout):
 								var inline: Bool = True
 
-								for field in layout.fields:
+								for field in record_fields(layout):
 									match field:
 										IntType | FloatType:
 											void
 										RecordType(child):
 											match records.get(record_number(child)):
 												Some(child_layout):
-													match child_layout.representation:
-														InlineRecord:
+													match child_layout:
+														InlineFields(_):
 															void
-														ManagedRecord:
+														CountedFields(_):
 															inline = False
 												None:
 													invalid = Some(
@@ -1049,10 +1050,10 @@ private pure func verify_layout_graph(
 										_:
 											inline = False
 
-								matches = match layout.representation:
-									InlineRecord:
+								matches = match layout:
+									InlineFields(_):
 										inline
-									ManagedRecord:
+									CountedFields(_):
 										-- Counted storage also permits inline fields; Spec owns
 										-- the storage choice. Only inline storage constrains fields.
 										True
@@ -1095,7 +1096,7 @@ private pure func record_field_type(
 	if IntOps.equals(record_number(field_owner(field)), record_number(owner)).not():
 		Err(verification_error(span, "field belongs to a different record layout"))
 	else:
-		layout.fields
+		record_fields(layout)
 			.get(field_number(field))
 			.to_result(verification_error(span, "unknown record field"))
 
@@ -1133,7 +1134,7 @@ private pure func operation_value(
 			match record_layout(owner, records, definition.span):
 				Ok(layout):
 
-					if IntOps.equals(fields.length(), layout.fields.length()):
+					if IntOps.equals(fields.length(), record_fields(layout).length()):
 						var seen: List[Int] = []
 						var invalid: Option[Diagnostic] = None
 
@@ -1241,9 +1242,9 @@ private pure func operation_value(
 											match record_layout(owner, records, definition.span):
 												Err(error): Err(error)
 												Ok(layout):
-													match layout.representation:
-														InlineRecord: Err(verification_error(definition.span, "callable environment must be a managed record"))
-														ManagedRecord:
+													match layout:
+														InlineFields(_): Err(verification_error(definition.span, "callable environment must be a managed record"))
+														CountedFields(_):
 															if same_type(parameter, environment.value_type):
 																definition_value(definition, CallableType(parameters, function.signature.return_type), None, None)
 															else:

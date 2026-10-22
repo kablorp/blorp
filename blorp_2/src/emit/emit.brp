@@ -58,11 +58,10 @@ import:
 	../utils/source: compiler_source
 	../specialize/specialize as Concrete:
 		CallTarget(UserFunction, RuntimeFunction),
-		ConcreteRecord, ConcretePatternPlace,
+		ConcreteRecord(InlineFields, CountedFields), ConcretePatternPlace,
 		ConcreteUnion,
 		FieldInstanceId,
 		RecordInstanceId,
-		RecordRepresentation(InlineRecord, ManagedRecord),
 		TypeRef(VoidType, IntType, FloatType, StringType, ListType, CallableType, UnionType, RecordType),
 		UnionInstanceId,
 		UnionRepresentation(InlineUnmanaged, InlineOwningPayload, BoxedRecursive),
@@ -70,6 +69,7 @@ import:
 		field_number,
 		field_owner,
 		function_number,
+		record_fields,
 		record_number,
 		union_number,
 		variant_number,
@@ -345,16 +345,16 @@ private pure func append_record(
 		.append_int(index)
 		.concat("{")
 
-	match layout.representation:
-		ManagedRecord:
+	match layout:
+		CountedFields(_):
 			result = result.concat("_Atomic uint64_t references;")
-		InlineRecord:
+		InlineFields(_):
 			void
 
 	var position = 0
 	var invalid: Option[Diagnostic] = None
 
-	for field in layout.fields:
+	for field in record_fields(layout):
 		match field:
 			VoidType:
 				position = IntOps.add(position, 1)
@@ -727,9 +727,9 @@ private pure func stored_by_value(value_type: TypeRef, records: List[ConcreteRec
 		RecordType(id):
 			match records.get(record_number(id)):
 				Some(layout):
-					match layout.representation:
-						InlineRecord: Some(RecordDefinition(record_number(id)))
-						ManagedRecord: None
+					match layout:
+						InlineFields(_): Some(RecordDefinition(record_number(id)))
+						CountedFields(_): None
 				None: None
 		UnionType(id):
 			match unions.get(union_number(id)):
@@ -821,12 +821,13 @@ private pure func append_aggregate_definitions(
 											None:
 												invalid = Some(render(internal_span(), MissingAggregateLayout(RecordAggregate, index)))
 											Some(layout):
-												var child = layout.fields.length()
+												fields = record_fields(layout)
+												var child = fields.length()
 
 												while IntOps.greater_than(child, 0):
 													child = IntOps.subtract(child, 1)
 
-													match layout.fields.get(child):
+													match fields.get(child):
 														Some(field):
 															match stored_by_value(field, records, unions):
 																Some(dependency):
@@ -933,8 +934,8 @@ private pure func append_record_ownership(
 		.append_int(index)
 		.concat(" value){")
 
-	match layout.representation:
-		InlineRecord:
+	match layout:
+		InlineFields(_):
 			Ok(
 				prefix
 					.concat("(void)value;}void blorp_record_drop_")
@@ -943,7 +944,7 @@ private pure func append_record_ownership(
 					.append_int(index)
 					.concat(" value){(void)value;}"),
 			)
-		ManagedRecord:
+		CountedFields(fields):
 			var result = prefix
 				.concat(
 					"(void)atomic_fetch_add_explicit(&value->references,UINT64_C(1),"
@@ -960,7 +961,7 @@ private pure func append_record_ownership(
 			var position = 0
 			var invalid: Option[Diagnostic] = None
 
-			for field in layout.fields:
+			for field in fields:
 				match (
 					append_storage_operation(
 						result,
@@ -1002,7 +1003,7 @@ private pure func append_record_ownership(
 						)
 					position = 0
 
-					for value_type in layout.fields:
+					for value_type in fields:
 						match value_type:
 							VoidType:
 								position = IntOps.add(position, 1)
@@ -1037,10 +1038,10 @@ private pure func append_operation(
 			match records.get(record_number(owner)):
 				Some(layout):
 
-					var result = match layout.representation:
-						InlineRecord:
+					var result = match layout:
+						InlineFields(_):
 							output.concat("((")
-						ManagedRecord:
+						CountedFields(_):
 							output
 								.concat("blorp_record_make_")
 								.append_int(record_number(owner))
@@ -1051,9 +1052,10 @@ private pure func append_operation(
 						.append_int(record_number(owner))
 						.concat("){")
 					var position = 0
+					layout_fields = record_fields(layout)
 
 					for field in fields:
-						match layout.fields.get(field_number(field.field)):
+						match layout_fields.get(field_number(field.field)):
 							Some(VoidType): continue
 							_: void
 						if IntOps.greater_than(position, 0):
@@ -1089,10 +1091,10 @@ private pure func append_operation(
 								BorrowedArgument(borrow):
 									borrow.value
 
-							selector = match layout.representation:
-								InlineRecord:
+							selector = match layout:
+								InlineFields(_):
 									"."
-								ManagedRecord:
+								CountedFields(_):
 									"->"
 
 							Ok(
@@ -2225,9 +2227,9 @@ private pure func c_pattern_record_field(
 	match place.value_type:
 		VoidType: Ok("0")
 		_:
-			selector = match layout.representation:
-				InlineRecord: "."
-				ManagedRecord: "->"
+			selector = match layout:
+				InlineFields(_): "."
+				CountedFields(_): "->"
 			Ok("(".concat(base).concat(")").concat(selector).concat(c_field(field)))
 
 
@@ -2901,7 +2903,7 @@ private pure func program_inventory(program: OwnershipProgram) -> ProgramInvento
 	var callable_entries: List[OwnedDefinition] = []
 
 	for layout in program.records:
-		for field in layout.fields:
+		for field in record_fields(layout):
 			types = types.append(field)
 
 	for layout in program.unions:
@@ -3189,10 +3191,10 @@ private pure func aggregate_runtime_contents(
 	for layout in checked.records:
 		typedef_prefix: String = "typedef struct blorp_r_"
 			.append_int(index)
-		pointer_marker: String = match layout.representation:
-			InlineRecord:
+		pointer_marker: String = match layout:
+			InlineFields(_):
 				" "
-			ManagedRecord:
+			CountedFields(_):
 				"* "
 		fragments = fragments.append(typedef_prefix
 			.concat(pointer_marker)
@@ -3276,10 +3278,10 @@ pure func emit(program: VerifiedProgram) -> Result[String, Diagnostic]:
 		True: True
 		False:
 			match checked.records.any(pure func(layout):
-					match layout.representation:
-						ManagedRecord:
+					match layout:
+						CountedFields(_):
 							True
-						InlineRecord:
+						InlineFields(_):
 							False
 				):
 				True: True
