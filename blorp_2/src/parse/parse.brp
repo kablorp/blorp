@@ -11,7 +11,7 @@ import:
 		Diagnostic,
 		DiagnosticNote(PreviousDeclaration),
 		ExpressionBase(
-			VoidExpression, IntegerExpression, FloatExpression, StringExpression, NameExpression, DirectApplication,
+			VoidExpression, IntegerExpression, FloatExpression, StringExpression, InterpolatedString, NameExpression, DirectApplication,
 			QualifiedName, QualifiedApplication, OpaqueWrap, OpaqueUnwrap, ListExpression, TupleExpression, RangeExpression, RecordExpression,
 			RecordUpdateExpression, LogicalExpression, NotExpression, LambdaExpression, IfExpression, MatchExpression,
 		),
@@ -73,7 +73,8 @@ import:
 			Bar, Comma, AtSign, Slash, Star, DotDot, Ellipsis,
 		),
 		Token,
-		TokenKind(IdentifierToken, KeywordToken, SymbolToken, IntegerLiteral, FloatLiteral, QuotedString, PipeString, CharLiteral),
+		TokenKind(IdentifierToken, KeywordToken, SymbolToken, IntegerLiteral, FloatLiteral, QuotedString, PipeString, StringStart, StringSegment, InterpolationOpen, InterpolationClose, StringEnd, CharLiteral),
+		StringForm(QuotedStringForm, PipeStringForm),
 		TypeSyntax(AtomicType, AppliedType, QualifiedType, CallableTypeSyntax, TupleTypeSyntax),
 		type_span,
 		UTF8_CONTINUATION_END,
@@ -933,10 +934,9 @@ private pure func float_value(spelling: String, span: Span) -> Result[Float, Dia
 				Err(diagnostic(span, "invalid decimal Float literal", "write a decimal Float such as 1.0, 0.5 or 1e2"))
 
 
--- `start` and `end` are offsets within the quoted contents after the opening quote.
+-- Offsets are within the actual contents, including an interpolated segment.
 private pure func string_error(span: Span, start: Int, end: Int, message: String, help: String) -> Diagnostic:
-	contents = IntOps.add(span.start, 1)
-	diagnostic({ span | start = IntOps.add(contents, start), end = IntOps.add(contents, end) }, message, help)
+	diagnostic({ span | start = IntOps.add(span.start, start), end = IntOps.add(span.start, end) }, message, help)
 
 
 -- The lexer has validated UTF-8; this only finds one scalar's byte extent for
@@ -1071,20 +1071,11 @@ private pure func byte_is(raw: String, position: Int, expected: Int) -> Bool:
 			False
 
 
--- The first position at or after `start` of a backslash or a raw interpolation
--- opener, or the end of `raw`.
+-- The next backslash or the end of a lexer-delimited text segment.
 private pure func escape_start(raw: String, start: Int) -> Int:
 	var position = start
 
-	while (
-		and(
-			and(
-				IntOps.less_than(position, raw.length()),
-				byte_is(raw, position, BACKSLASH_BYTE).not(),
-			),
-			(and(byte_is(raw, position, DOLLAR_BYTE), byte_is(raw, IntOps.add(position, 1), OPEN_BRACE_BYTE))).not(),
-		)
-	):
+	while and(IntOps.less_than(position, raw.length()), byte_is(raw, position, BACKSLASH_BYTE).not()):
 		position = IntOps.add(position, 1)
 
 	position
@@ -1100,24 +1091,19 @@ private pure func string_value(raw: String, span: Span) -> Result[String, Diagno
 
 	while failure.is_none():
 		stop = escape_start(raw, cursor)
-		-- cursor is zero or a decoded escape end; stop is ASCII escape/opener or
+		-- cursor is zero or a decoded escape end; stop is ASCII backslash or
 		-- raw end. Validated source UTF-8 puts both on scalar boundaries.
 		pieces = pieces.append(StringOps.slice(raw, cursor, stop).get_or(""))
 
 		if IntOps.equals(stop, raw.length()):
 			break
 
-		-- escape_start stops only at a backslash or a `${` opener, so a `$` here is
-		-- the opener.
-		if byte_is(raw, stop, DOLLAR_BYTE):
-			failure = Some(string_error(span, stop, IntOps.add(stop, 2), "String interpolation is not supported yet", "escape the opening brace as \\{ for literal $".concat("{ text")))
-		else:
-			match decode_escape(raw, stop, span):
-				Ok(decoded):
-					pieces = pieces.append(decoded.bytes)
-					cursor = decoded.next
-				Err(error):
-					failure = Some(error)
+		match decode_escape(raw, stop, span):
+			Ok(decoded):
+				pieces = pieces.append(decoded.bytes)
+				cursor = decoded.next
+			Err(error):
+				failure = Some(error)
 
 	match failure:
 		Some(error):
@@ -1286,6 +1272,76 @@ private pure func consume_name_or_call(start: ParserState) -> Result[ParsedBase,
 			Ok({ base = NameExpression(name.name), span = name.name.span, next = name.next })
 
 
+private fixed record StringTextPiece {
+	bytes: String,
+	span: Span
+}
+
+
+-- Decode against each physical span first, then publish one literal per
+-- contiguous text run, including a pipe run's joining LFs.
+private pure func append_string_text(parts: List[ValueExpression], pieces: List[StringTextPiece]) -> List[ValueExpression]:
+	match pieces.get(0):
+		None: parts
+		Some(first):
+			var bytes: List[String] = []
+			var last = first.span
+			for piece in pieces:
+				bytes = bytes.append(piece.bytes)
+				last = piece.span
+			span = { first.span | end = last.end }
+			parts.append({ base = StringExpression(bytes.join("")), base_span = span, applications = [], span = span })
+
+
+-- Parts are flat and already located: no reparsing, fake declaration or
+-- synthetic callable name is needed to parse a hole in its lexical scope.
+private pure func consume_interpolated(start: ParserState, opening: Span, form: StringForm) -> Result[ParsedBase, Diagnostic]:
+	var parts: List[ValueExpression] = []
+	var text: List[StringTextPiece] = []
+	var scan: Result[ParserState, Diagnostic] = Ok(shifted(start, 1))
+	var end = opening.end
+	while True:
+		match scan:
+			Err(_): break
+			Ok(current):
+				match current_token(current):
+					Some(token):
+						match token.kind:
+							StringEnd:
+								parts = append_string_text(parts, text)
+								end = token.span.end
+								scan = Ok(shifted(current, 1))
+								break
+							StringSegment(raw):
+								decoded = match form:
+									QuotedStringForm: string_value(raw, token.span)
+									PipeStringForm: Ok(raw)
+								scan = match decoded:
+									Err(error): Err(error)
+									Ok(bytes):
+										if IntOps.greater_than(bytes.length(), 0):
+											text = text.append({ bytes = bytes, span = token.span })
+										Ok(shifted(current, 1))
+							InterpolationOpen:
+								parts = append_string_text(parts, text)
+								text = []
+								scan = match consume_value(shifted(current, 1)):
+									Err(error): Err(error)
+									Ok(hole):
+										match current_token(hole.next):
+											Some(closing):
+												match closing.kind:
+													InterpolationClose:
+														parts = parts.append(hole.body)
+														Ok(shifted(hole.next, 1))
+													_: Err(expected_syntax(hole.next, "an interpolation hole must hold exactly one expression", "remove extra tokens or bind the expression before the String"))
+											None: Err(expected_syntax(hole.next, "expected '}' after the interpolation expression", "close each hole on the same line"))
+							_: scan = Err(expected_syntax(current, "expected String text or an interpolation hole", "close the String after its text and holes"))
+					None: scan = Err(expected_syntax(current, "unterminated interpolated String", "close the String after its text and holes"))
+	next ?= scan
+	Ok({ base = InterpolatedString(parts), span = { opening | end = end }, next = next })
+
+
 private pure func consume_base(start: ParserState, token: Token) -> Result[ParsedBase, Diagnostic]:
 	after = shifted(start, 1)
 
@@ -1316,11 +1372,15 @@ private pure func consume_base(start: ParserState, token: Token) -> Result[Parse
 				Ok(value): Ok({ base = IntegerExpression(value), span = token.span, next = after })
 				Err(error): Err(error)
 		QuotedString(raw):
-			match string_value(raw, token.span):
+			match string_value(raw, { token.span | start = IntOps.add(token.span.start, 1), end = IntOps.subtract(token.span.end, 1) }):
 				Ok(bytes): Ok({ base = StringExpression(bytes), span = token.span, next = after })
 				Err(error): Err(error)
 		PipeString(value):
 			Ok({ base = StringExpression(value), span = token.span, next = after })
+		StringStart(form):
+			consume_interpolated(start, token.span, form)
+		InterpolationClose:
+			Err(diagnostic(token.span, "expected an expression in interpolation hole", "write one String expression between the hole's braces"))
 		CharLiteral:
 			Err(diagnostic(token.span, "Char literals are not supported yet", "use a one-character String literal such as \"a\""))
 		IdentifierToken(_):
@@ -2349,7 +2409,7 @@ private pure func literal_pattern(state: ParserState) -> Option[Result[PatternRe
 		Some(token):
 			match token.kind:
 				QuotedString(raw):
-					decoded: Result[PatternResult, Diagnostic] = match string_value(raw, token.span):
+					decoded: Result[PatternResult, Diagnostic] = match string_value(raw, { token.span | start = IntOps.add(token.span.start, 1), end = IntOps.subtract(token.span.end, 1) }):
 						Ok(bytes):
 							Ok({ pattern = PatternString(bytes, token.span), span = token.span, next = shifted(state, 1) })
 						Err(error):
@@ -2357,6 +2417,8 @@ private pure func literal_pattern(state: ParserState) -> Option[Result[PatternRe
 					Some(decoded)
 				CharLiteral:
 					Some(Ok({ pattern = PatternChar(token.span), span = token.span, next = shifted(state, 1) }))
+				StringStart(_):
+					Some(Err(diagnostic(token.span, "interpolated Strings are not patterns", "use a literal String pattern, or bind the String and compare it in the arm")))
 				_:
 					None
 		None:
@@ -3099,6 +3161,8 @@ private pure func consume_builtin_body(start: ParserState) -> Result[BodyResult,
 			match label.kind:
 				QuotedString(spelling):
 					consume_builtin_operation(opened, spelling)
+				StringStart(_):
+					Err(diagnostic(label.span, "builtin labels cannot contain interpolation holes", "write one concrete quoted operation label such as \"string.add\""))
 				_:
 					Err(expected_syntax(opened, "expected a quoted builtin label", BUILTIN_LABEL_HELP))
 		None:

@@ -1,0 +1,180 @@
+import:
+	../../../src/check/check: check, checked_functions, check_errors
+	../../../src/check/errors: CheckErrorKind(ValueRejection), ValueError(InterpolationRequiresString)
+	../../../src/check/model as Model
+	../../../src/check/render: render_failure
+	../../../src/namespace/builtins as Builtins
+	../../../src/utils/text as Text: concat
+	../../../src/utils/source: module_source, root_module_id, same_source
+	../input: setup_diagnostic
+	../module_input: parse_modules
+	int as IntOps
+	test: TestSuite
+
+
+private pure func opener() -> String:
+	Text.concat("$", "{")
+
+
+private pure func accepts(source: String) -> Bool:
+	parse_modules([{ source = source, targets = [] }])
+		.and_then(pure func(parsed): check(parsed).map_err(setup_diagnostic)).is_ok()
+
+
+private pure func rejects(source: String, start: Int, end: Int, message: String, help: String) -> Bool:
+	match parse_modules([{ source = source, targets = [] }]):
+		Err(_): False
+		Ok(parsed):
+			match check(parsed):
+				Ok(_): False
+				Err(failure):
+					diagnostics = render_failure(failure)
+					error = diagnostics.first
+					(
+						diagnostics.remaining.is_empty() and error.span.start == start and error.span.end == end
+							and error.message == message and error.help == help
+							and error.note.is_none() and same_source(error.span.source, module_source(root_module_id()))
+					)
+
+
+pure func test_sole_int_hole_does_not_escape_string_validation() -> Bool:
+	before = "func main() -> Int:\n    discarded = \"".concat(opener())
+	rejects(before.concat("42}\"\n    0\n"), before.length(), before.length() + 2,
+		"interpolation hole has type Int; expected String",
+		"convert Int or Float explicitly with to_string; every hole must produce a String")
+
+
+pure func test_sole_int_hole_publishes_the_typed_mismatch() -> Bool:
+	before = "func main() -> Int:\n    discarded = \"".concat(opener())
+	match parse_modules([{ source = before.concat("42}\"\n    0\n"), targets = [] }]):
+		Err(_): False
+		Ok(parsed):
+			match check(parsed):
+				Ok(_): False
+				Err(failure):
+					errors = check_errors(failure)
+					match errors.first.kind:
+						ValueRejection(InterpolationRequiresString(actual)):
+							(
+								errors.remaining.is_empty() and Model.same_type(actual, Model.IntType)
+								and errors.first.span.start == before.length() and errors.first.span.end == before.length() + 2
+								and same_source(errors.first.span.source, module_source(root_module_id()))
+							)
+						_: False
+
+
+pure func test_sole_string_hole_reuses_the_checked_value_without_empty_concat() -> Bool:
+	source = "pure func text(value: String) -> String:\n    \"".concat(opener()).concat("value}\"\nfunc main() -> Int:\n    0\n")
+	match parse_modules([{ source = source, targets = [] }]).and_then(pure func(parsed): check(parsed).map_err(setup_diagnostic)):
+		Err(_): False
+		Ok(program):
+			match checked_functions(program).functions.get(0):
+				Some(function):
+					match function.body:
+						Model.CheckedValueBody(Model.ReturnExpression(value)):
+							match value.form:
+								Model.ReadBinding(_): Model.same_type(value.value_type, Model.StringType)
+								_: False
+						_: False
+				None: False
+
+
+pure func test_multiple_parts_publish_only_existing_runtime_concat_calls() -> Bool:
+	source = "pure func text(value: String) -> String:\n    \"a".concat(opener()).concat("value}b\"\nfunc main() -> Int:\n    0\n")
+	match parse_modules([{ source = source, targets = [] }]).and_then(pure func(parsed): check(parsed).map_err(setup_diagnostic)):
+		Err(_): False
+		Ok(program):
+			match checked_functions(program).functions.get(0):
+				Some(function):
+					match function.body:
+						Model.CheckedValueBody(Model.ReturnExpression(value)):
+							match value.form:
+								Model.InvokeFunction(call):
+									match call.target:
+										Model.RuntimeFunction(Builtins.StringConcat): call.operands.length() == 2
+										_: False
+								_: False
+						_: False
+				None: False
+
+
+pure func test_pipe_static_tail_requires_only_one_concat() -> Bool:
+	source = "pure func text(value: String) -> String:\n    |".concat(opener()).concat("value}\n    |a\n    |b\nfunc main() -> Int:\n    0\n")
+	match parse_modules([{ source = source, targets = [] }]).and_then(pure func(parsed): check(parsed).map_err(setup_diagnostic)):
+		Err(_): False
+		Ok(program):
+			match checked_functions(program).functions.get(0):
+				Some(function):
+					match function.body:
+						Model.CheckedValueBody(Model.ReturnExpression(value)):
+							match value.form:
+								Model.InvokeFunction(call):
+									match (call.target, call.operands):
+										(Model.RuntimeFunction(Builtins.StringConcat), [Model.ValueOperand(hole), Model.ValueOperand(text)]):
+											match (hole.form, text.form):
+												(Model.ReadBinding(_), Model.LiteralString(bytes)): bytes == "\na\nb"
+												_: False
+										_: False
+								_: False
+						_: False
+				None: False
+
+
+pure func test_interpolation_does_not_expand_closed_constant_initializers() -> Bool:
+	before = "TEXT: String = "
+	literal = "\"".concat(opener()).concat("\"text\"}\"")
+	rejects(before.concat(literal).concat("\nfunc main() -> Int:\n    0\n"), before.length(), before.length() + literal.length(),
+		"constant initializer is not a closed value",
+		"use literals, constructor data, or named function references; calls, constant references and lambdas are not allowed")
+
+
+pure func test_hole_calls_keep_the_enclosing_purity_rule() -> Bool:
+	before = "func effect() -> String:\n    \"text\"\npure func text() -> String:\n    \"".concat(opener())
+	rejects(before.concat("effect()}\"\nfunc main() -> Int:\n    0\n"), before.length(), before.length() + "effect".length(),
+		"pure functions cannot call impure functions", "mark the callee pure or remove pure from the caller")
+
+
+private pure func concat_depth(value: Model.CheckedExpr) -> Int:
+	match value.form:
+		Model.InvokeFunction(call):
+			match (call.target, call.operands):
+				(Model.RuntimeFunction(Builtins.StringConcat), [Model.ValueOperand(left), Model.ValueOperand(right)]):
+					1 + IntOps.max(concat_depth(left), concat_depth(right))
+				_: 0
+		_: 0
+
+
+private pure func balanced_depth(count: Int, expected: Int) -> Bool:
+	source = "pure func text(value: String) -> String:\n    \""
+		.concat(opener().concat("value}").repeat(count))
+		.concat("\"\nfunc main() -> Int:\n    0\n")
+	match parse_modules([{ source = source, targets = [] }]).and_then(pure func(parsed): check(parsed).map_err(setup_diagnostic)):
+		Err(_): False
+		Ok(program):
+			match checked_functions(program).functions.get(0):
+				Some(function):
+					match function.body:
+						Model.CheckedValueBody(Model.ReturnExpression(value)): concat_depth(value) == expected
+						_: False
+				None: False
+
+
+tests: TestSuite = {
+	description = "Blorp 2 interpolation type and call contracts",
+	tests = [
+		("sole Int hole must still be String", test_sole_int_hole_does_not_escape_string_validation),
+		("sole Int hole publishes typed mismatch", test_sole_int_hole_publishes_the_typed_mismatch),
+		("sole String hole needs no empty concat", test_sole_string_hole_reuses_the_checked_value_without_empty_concat),
+		("parts publish existing runtime concat calls", test_multiple_parts_publish_only_existing_runtime_concat_calls),
+		("pipe static tail needs one concat", test_pipe_static_tail_requires_only_one_concat),
+		("constant initializer rules remain closed", test_interpolation_does_not_expand_closed_constant_initializers),
+		("holes retain enclosing purity checks", test_hole_calls_keep_the_enclosing_purity_rule),
+		("eight hole call tree has depth three", pure func(): balanced_depth(8, 3)),
+		("thirty two hole call tree has depth five", pure func(): balanced_depth(32, 5)),
+		("one hundred twenty eight hole call tree has depth seven", pure func(): balanced_depth(128, 7)),
+		("explicit Int conversion is accepted", pure func(): accepts(
+				"pure func digits(value: Int) -> String:\n    builtin(\"int.to_string\")\nfunc main() -> Int:\n    discarded = \"".concat(opener()).concat("digits(42)}\"\n    0\n"))),
+		("explicit Float conversion is accepted", pure func(): accepts(
+				"pure func digits(value: Float) -> String:\n    builtin(\"float.to_string\")\nfunc main() -> Int:\n    discarded = \"".concat(opener()).concat("digits(1.5)}\"\n    0\n"))),
+	]
+}

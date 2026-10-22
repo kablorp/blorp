@@ -1,0 +1,172 @@
+import:
+	../../../src/lex/lex: lex
+	../../../src/utils/names: program_names
+	../../../src/utils/ids: inventory_functions
+	../../../src/utils/source: module_source, root_module_id, same_module, same_source
+	../../../src/utils/syntax:
+		ExpressionBase(InterpolatedString, StringExpression, NameExpression),
+		ParsedBody(ParsedValueBody),
+	../../../src/parse/assemble: parsed_contents
+	../../../src/utils/text as Text: concat
+	../input: parse
+	test: TestSuite
+
+
+private pure func opener() -> String:
+	Text.concat("$", "{")
+
+
+private HEADER: String = "pure func text(value: String) -> String:\n    "
+
+
+private pure func accepts(expression: String) -> Bool:
+	lex(module_source(root_module_id()), HEADER.concat(expression).concat("\n"), program_names().names)
+		.and_then(pure func(tokens): parse(tokens)).is_ok()
+
+
+private pure func rejects(source: String, start: Int, end: Int, message: String, help: String) -> Bool:
+	match lex(module_source(root_module_id()), source, program_names().names).and_then(pure func(tokens): parse(tokens)):
+		Ok(_): False
+		Err(error):
+			(
+				error.message == message and error.help == help and error.span.start == start and error.span.end == end
+				and error.note.is_none() and same_source(error.span.source, module_source(root_module_id()))
+			)
+
+
+pure func test_parts_decode_text_and_keep_hole_spans() -> Bool:
+	source = HEADER.concat("\"é\\0").concat(opener()).concat("value}!\"\n")
+	match lex(module_source(root_module_id()), source, program_names().names).and_then(pure func(tokens): parse(tokens)):
+		Err(_): False
+		Ok(parsed):
+			functions = inventory_functions(parsed_contents(parsed).declarations)
+				.filter(pure func(row): same_module(row.declaration.module, root_module_id()))
+			match functions:
+				[row]:
+					match row.declaration.body:
+						ParsedValueBody(value):
+							match value.base:
+								InterpolatedString([first, hole, last]):
+									match (first.base, hole.base, last.base):
+										(StringExpression(bytes), NameExpression(_), StringExpression(suffix)):
+											(
+												bytes == "é\0" and suffix == "!"
+													and first.span.start == HEADER.length() + 1
+													and hole.span.start == HEADER.length() + "\"é\\0".length() + 2
+													and hole.span.end == hole.span.start + "value".length()
+											)
+										_: False
+								_: False
+						_: False
+				_: False
+
+
+pure func test_pipe_static_tail_is_one_decoded_text_part() -> Bool:
+	source = "pure func text(value: String) -> String:\n    |".concat(opener()).concat("value}\n    |a\n    |b\n")
+	match lex(module_source(root_module_id()), source, program_names().names).and_then(pure func(tokens): parse(tokens)):
+		Err(_): False
+		Ok(parsed):
+			match inventory_functions(parsed_contents(parsed).declarations).filter(pure func(row): same_module(row.declaration.module, root_module_id())):
+				[row]:
+					match row.declaration.body:
+						ParsedValueBody(value):
+							match value.base:
+								InterpolatedString([hole, text]):
+									match (hole.base, text.base):
+										(NameExpression(_), StringExpression(bytes)): bytes == "\na\nb"
+										_: False
+								_: False
+						_: False
+				_: False
+
+
+pure func test_empty_hole_has_a_teaching_diagnostic() -> Bool:
+	before = HEADER.concat("\"").concat(opener())
+	rejects(before.concat("}\"\n"), before.length(), before.length() + 1,
+		"expected an expression in interpolation hole", "write one String expression between the hole's braces")
+
+
+pure func test_extra_hole_tokens_are_rejected() -> Bool:
+	before = HEADER.concat("\"").concat(opener()).concat("value ")
+	rejects(before.concat("other}\"\n"), before.length(), before.length() + "other".length(),
+		"an interpolation hole must hold exactly one expression", "remove extra tokens or bind the expression before the String")
+
+
+pure func test_missing_brace_keeps_the_original_opener_span() -> Bool:
+	before = HEADER.concat("\"prefix")
+	rejects(before.concat(opener()).concat("value\n"), before.length(), before.length() + 2,
+		"unterminated interpolation hole", "close the hole with '}' on the same line; each hole holds one expression")
+
+
+pure func test_missing_brace_before_a_quote_teaches_both_closers() -> Bool:
+	before = HEADER.concat("\"").concat(opener()).concat("value")
+	rejects(before.concat("\"\n"), before.length(), before.length() + 1,
+		"unterminated quoted String in interpolation hole", "close the nested quote and then close the hole with '}' on the same line")
+
+
+private PIPE_PREFIX: String = "pure func text(value: String) -> String:\n    |é\n    |"
+
+
+pure func test_later_pipe_empty_hole_keeps_physical_span() -> Bool:
+	before = PIPE_PREFIX.concat(opener())
+	rejects(before.concat("}\n"), before.length(), before.length() + 1,
+		"expected an expression in interpolation hole", "write one String expression between the hole's braces")
+
+
+pure func test_later_pipe_extra_tokens_keep_physical_span() -> Bool:
+	before = PIPE_PREFIX.concat(opener()).concat("value ")
+	rejects(before.concat("other}\n"), before.length(), before.length() + "other".length(),
+		"an interpolation hole must hold exactly one expression", "remove extra tokens or bind the expression before the String")
+
+
+pure func test_later_pipe_missing_brace_keeps_physical_span() -> Bool:
+	rejects(PIPE_PREFIX.concat(opener()).concat("value\n"), PIPE_PREFIX.length(), PIPE_PREFIX.length() + 2,
+		"unterminated interpolation hole", "close the hole with '}' on the same line; each hole holds one expression")
+
+
+pure func test_nested_interpolation_is_rejected_at_its_opener() -> Bool:
+	before = HEADER.concat("\"").concat(opener()).concat("\"inner")
+	rejects(before.concat(opener()).concat("value}\"}\"\n"), before.length(), before.length() + 2,
+		"an interpolated String cannot appear inside an interpolation hole",
+		"bind the inner interpolated String before the outer String, then use that binding in the hole")
+
+
+pure func test_escape_error_after_a_hole_uses_the_segment_source_span() -> Bool:
+	before = HEADER.concat("\"").concat(opener()).concat("value}")
+	rejects(before.concat("\\q\"\n"), before.length(), before.length() + 2,
+		"unknown String escape", "use \\n, \\r, \\t, \\0, \\\\, \\\", \\', \\{, \\}, or a Unicode scalar escape such as \\u{E9}")
+
+
+pure func test_patterns_reject_interpolation_at_the_opening_quote() -> Bool:
+	before = "func main() -> Int:\n    match value:\n        "
+	rejects(before.concat("\"a").concat(opener()).concat("value}\": 0\n"), before.length(), before.length() + 1,
+		"interpolated Strings are not patterns", "use a literal String pattern, or bind the String and compare it in the arm")
+
+
+pure func test_builtin_labels_reject_interpolation_at_the_opening_quote() -> Bool:
+	before = "pure func text() -> String:\n    builtin("
+	rejects(before.concat("\"string.").concat(opener()).concat("value}\")\n"), before.length(), before.length() + 1,
+		"builtin labels cannot contain interpolation holes", "write one concrete quoted operation label such as \"string.add\"")
+
+
+tests: TestSuite = {
+	description = "Blorp 2 interpolation parsing",
+	tests = [
+		("text decoding and original hole spans", test_parts_decode_text_and_keep_hole_spans),
+		("pipe static tail is one text part", test_pipe_static_tail_is_one_decoded_text_part),
+		("sole hole parses", pure func(): accepts("\"".concat(opener()).concat("value}\""))),
+		("plain quoted braces stay inside the hole", pure func(): accepts("\"".concat(opener()).concat("identity(\"}\")}\""))),
+		("record braces balance inside the hole", pure func(): accepts("\"".concat(opener()).concat("identity({ value = \"}\" })}\""))),
+		("empty hole teaches an expression", test_empty_hole_has_a_teaching_diagnostic),
+		("extra hole tokens reject", test_extra_hole_tokens_are_rejected),
+		("missing brace preserves opener span", test_missing_brace_keeps_the_original_opener_span),
+		("missing brace before quote teaches both closers", test_missing_brace_before_a_quote_teaches_both_closers),
+		("later pipe empty hole keeps physical span", test_later_pipe_empty_hole_keeps_physical_span),
+		("later pipe extra tokens keep physical span", test_later_pipe_extra_tokens_keep_physical_span),
+		("later pipe missing brace keeps physical span", test_later_pipe_missing_brace_keeps_physical_span),
+		("nested interpolation rejects", test_nested_interpolation_is_rejected_at_its_opener),
+		("escape after hole preserves source span", test_escape_error_after_a_hole_uses_the_segment_source_span),
+		("interpolation is not a pattern", test_patterns_reject_interpolation_at_the_opening_quote),
+		("interpolation is not a builtin label", test_builtin_labels_reject_interpolation_at_the_opening_quote),
+	]
+}

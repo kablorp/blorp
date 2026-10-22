@@ -83,8 +83,13 @@ values through the pilot pipeline. Strict `string.parse_float` returns ordinary
 Option[Float]; source literals require finite values, while arithmetic may
 produce canonical infinity/NaN output. The pilot reference specifies decimal
 input, rounding, formatting, signed zero and native execution requirements.
-Interpolation and multiline literals remain deferred; arbitrary FFI and traits
-remain excluded. The pilot reference states its scope and restrictions.
+The pilot accepts quoted Strings, LF-joined pipe Strings and raw blocks.
+Quoted and pipe Strings support `${expression}` with String-only holes; convert
+primitive values explicitly with `to_string`. Holes evaluate once in written
+order and retain ordinary scope and purity checks. Nested interpolation,
+interpolation in patterns, builtin labels and closed constant initializers are
+rejected. See the [pilot String rules](../blorp_2/README.md#quoted-utf-8-string-literals) for exact
+syntax and escapes. Arbitrary FFI and traits remain excluded.
 
 ---
 

@@ -23,7 +23,8 @@ import:
 			RightBracket, LeftBrace, RightBrace, Bar, Comma, AtSign, Slash, Star, DotDot, Ellipsis,
 		),
 		Token,
-		TokenKind(IdentifierToken, KeywordToken, SymbolToken, IntegerLiteral, FloatLiteral, QuotedString, PipeString, CharLiteral),
+		TokenKind(IdentifierToken, KeywordToken, SymbolToken, IntegerLiteral, FloatLiteral, QuotedString, PipeString, StringStart, StringSegment, InterpolationOpen, InterpolationClose, StringEnd, CharLiteral),
+		StringForm(QuotedStringForm, PipeStringForm),
 		UTF8_CONTINUATION_END,
 		UTF8_CONTINUATION_START,
 		diagnostic,
@@ -175,10 +176,24 @@ private pure func char_control_byte() -> ErrorText:
 	}
 
 
-private pure func pipe_interpolation() -> ErrorText:
+private pure func nested_interpolation() -> ErrorText:
 	{
-		message = "String interpolation is not supported yet",
-		help = "pipe String lines have no escapes or interpolation; build the text with concat"
+		message = "an interpolated String cannot appear inside an interpolation hole",
+		help = "bind the inner interpolated String before the outer String, then use that binding in the hole"
+	}
+
+
+private pure func unclosed_interpolation() -> ErrorText:
+	{
+		message = "unterminated interpolation hole",
+		help = "close the hole with '}' on the same line; each hole holds one expression"
+	}
+
+
+private pure func unclosed_hole_string() -> ErrorText:
+	{
+		message = "unterminated quoted String in interpolation hole",
+		help = "close the nested quote and then close the hole with '}' on the same line"
 	}
 
 
@@ -500,6 +515,12 @@ private pure func quoted_token(text: SourceText, start: Int) -> Result[Token, Di
 			Ok(cursor):
 				if byte_is(text, cursor, ASCII_DOUBLE_QUOTE):
 					break
+				if or(IntOps.equals(cursor, text.bytes.length()), byte_is(text, cursor, ASCII_LF)):
+					scan = Err(error_at(text, start, cursor, unclosed_hole_string()))
+					break
+				if and(byte_is(text, cursor, ASCII_DOLLAR), byte_is(text, IntOps.add(cursor, 1), ASCII_LEFT_BRACE)):
+					scan = Err(error_at(text, cursor, IntOps.add(cursor, 2), nested_interpolation()))
+					break
 
 				scan = quoted_character_end(text, start, cursor)
 			Err(_):
@@ -714,6 +735,13 @@ private fixed union ScannedToken:
 	ReadyToken(Token)
 
 
+-- A flat batch shares the outer lexer's one identifier-interning operation.
+private fixed record ScannedCode {
+	tokens: List[ScannedToken],
+	end: Int
+}
+
+
 private pure func punctuation(byte: Int) -> Option[Symbol]:
 	if IntOps.equals(byte, ASCII_AT_SIGN):
 		Some(AtSign)
@@ -808,6 +836,84 @@ private pure func literal_or_symbol(text: SourceText, cursor: Int) -> Result[Tok
 				Ok(symbol(text, value, cursor, next))
 			None:
 				Err(byte_error(text, cursor, unsupported_character()))
+
+
+-- Braces belong to record expressions until the hole's own closing brace.
+-- Quoted/Char tokens are scanned atomically, so their braces cannot close it.
+private pure func interpolation_tokens(text: SourceText, opening: Int) -> Result[ScannedCode, Diagnostic]:
+	var tokens: List[ScannedToken] = [ReadyToken(token(text, InterpolationOpen, opening, IntOps.add(opening, 2)))]
+	var scan: Result[Int, Diagnostic] = Ok(IntOps.add(opening, 2))
+	var braces = 0
+	while True:
+		match scan:
+			Err(_): break
+			Ok(cursor):
+				if or(IntOps.equals(cursor, text.bytes.length()), byte_is(text, cursor, ASCII_LF)):
+					scan = Err(error_at(text, opening, IntOps.add(opening, 2), unclosed_interpolation()))
+				else if byte_is(text, cursor, ASCII_SPACE):
+					scan = Ok(IntOps.add(cursor, 1))
+				else if comment_starts(text, cursor):
+					scan = comment_end(text, cursor)
+				else if and(byte_is(text, cursor, ASCII_RIGHT_BRACE), IntOps.equals(braces, 0)):
+					end = IntOps.add(cursor, 1)
+					tokens = tokens.append(ReadyToken(token(text, InterpolationClose, cursor, end)))
+					scan = Ok(end)
+					break
+				else:
+					scan = match code_token(text, cursor):
+						Err(error): Err(error)
+						Ok(scanned):
+							tokens = tokens.append(scanned)
+							match scanned:
+								WordToken(_, _, end): Ok(end)
+								ReadyToken(ready):
+									match ready.kind:
+										SymbolToken(LeftBrace): braces = IntOps.add(braces, 1)
+										SymbolToken(RightBrace): braces = IntOps.subtract(braces, 1)
+										_: void
+									Ok(ready.span.end)
+	end ?= scan
+	Ok({ tokens = tokens, end = end })
+
+
+private pure func quoted_tokens(text: SourceText, opening: Int) -> Result[ScannedCode, Diagnostic]:
+	contents = IntOps.add(opening, 1)
+	var scan: Result[Int, Diagnostic] = Ok(contents)
+	var start = contents
+	var tokens: List[ScannedToken] = []
+	while True:
+		match scan:
+			Err(_): break
+			Ok(cursor):
+				if byte_is(text, cursor, ASCII_DOUBLE_QUOTE):
+					end = IntOps.add(cursor, 1)
+					if tokens.is_empty():
+						bytes = StringOps.slice(text.bytes, contents, cursor).get_or("")
+						tokens = [ReadyToken(token(text, QuotedString(bytes), opening, end))]
+					else:
+						if IntOps.less_than(start, cursor):
+							bytes = StringOps.slice(text.bytes, start, cursor).get_or("")
+							tokens = tokens.append(ReadyToken(token(text, StringSegment(bytes), start, cursor)))
+						tokens = tokens.append(ReadyToken(token(text, StringEnd, cursor, end)))
+					scan = Ok(end)
+					break
+				else if and(byte_is(text, cursor, ASCII_DOLLAR), byte_is(text, IntOps.add(cursor, 1), ASCII_LEFT_BRACE)):
+					if tokens.is_empty():
+						tokens = tokens.append(ReadyToken(token(text, StringStart(QuotedStringForm), opening, contents)))
+					if IntOps.less_than(start, cursor):
+						bytes = StringOps.slice(text.bytes, start, cursor).get_or("")
+						tokens = tokens.append(ReadyToken(token(text, StringSegment(bytes), start, cursor)))
+					scan = match interpolation_tokens(text, cursor):
+						Err(error): Err(error)
+						Ok(hole):
+							for item in hole.tokens:
+								tokens = tokens.append(item)
+							start = hole.end
+							Ok(hole.end)
+				else:
+					scan = quoted_character_end(text, opening, cursor)
+	end ?= scan
+	Ok({ tokens = tokens, end = end })
 
 
 -- A comment holds ASCII bytes other than CR, up to the LF or EOF ending its line.
@@ -973,8 +1079,7 @@ private pure func next_code_line(text: SourceText, start: Int) -> Result[CodeLin
 			Err(error): Err(error)
 
 
--- The two pipe String forms differ only in one byte pair: a pipe String
--- rejects an interpolation opener; a raw block keeps every byte. In both, a
+-- A pipe scan stops at an interpolation opener; a raw block keeps every byte. In both, a
 -- line's text starts after its single marker, so `||` yields one bar.
 private fixed union PipeForm:
 	PipeMarkers
@@ -1013,14 +1118,13 @@ private pure func pipe_line_end(text: SourceText, start: Int, form: PipeForm) ->
 						if IntOps.equals(byte, ASCII_LF):
 							break
 
-						scan = match form:
+						opens_hole = match form:
 							PipeMarkers:
-								if and(IntOps.equals(byte, ASCII_DOLLAR), byte_is(text, IntOps.add(cursor, 1), ASCII_LEFT_BRACE)):
-									Err(error_at(text, cursor, IntOps.add(cursor, 2), pipe_interpolation()))
-								else:
-									pipe_byte_end(text, cursor, byte)
-							RawText:
-								pipe_byte_end(text, cursor, byte)
+								and(IntOps.equals(byte, ASCII_DOLLAR), byte_is(text, IntOps.add(cursor, 1), ASCII_LEFT_BRACE))
+							RawText: False
+						if opens_hole:
+							break
+						scan = pipe_byte_end(text, cursor, byte)
 			Err(_):
 				break
 
@@ -1101,6 +1205,55 @@ private pure func pipe_block(text: SourceText, first: LinePrefix, form: PipeForm
 	Ok({ value = value, end = end })
 
 
+-- A no-hole pipe keeps the existing joined token. Once a hole occurs, text
+-- and code tokens retain original source offsets rather than joined offsets.
+private pure func pipe_tokens(text: SourceText, first: LinePrefix) -> Result[ScannedCode, Diagnostic]:
+	contents = IntOps.add(first.end, 1)
+	var scan: Result[Int, Diagnostic] = Ok(contents)
+	var prefix: List[String] = []
+	var tokens: List[ScannedToken] = []
+	var end = contents
+	while True:
+		match scan:
+			Err(_): break
+			Ok(start):
+				match pipe_line_end(text, start, PipeMarkers):
+					Err(error): scan = Err(error)
+					Ok(stop):
+						bytes = StringOps.slice(text.bytes, start, stop).get_or("")
+						if tokens.is_empty():
+							prefix = prefix.append(bytes)
+						else if IntOps.less_than(start, stop):
+							tokens = tokens.append(ReadyToken(token(text, StringSegment(bytes), start, stop)))
+						if byte_is(text, stop, ASCII_DOLLAR):
+							if tokens.is_empty():
+								tokens = tokens.append(ReadyToken(token(text, StringStart(PipeStringForm), first.end, contents)))
+								if prefix.is_empty().not():
+									tokens = tokens.append(ReadyToken(token(text, StringSegment(prefix.join("")), contents, stop)))
+								prefix = []
+							scan = match interpolation_tokens(text, stop):
+								Err(error): Err(error)
+								Ok(hole):
+									for item in hole.tokens:
+										tokens = tokens.append(item)
+									Ok(hole.end)
+						else:
+							end = stop
+							match continuing_marker(text, stop, first):
+								None: break
+								Some(marker):
+									if tokens.is_empty():
+										prefix = prefix.append("\n")
+									else:
+										tokens = tokens.append(ReadyToken(token(text, StringSegment("\n"), stop, IntOps.add(stop, 1))))
+									scan = Ok(IntOps.add(marker, 1))
+	finished ?= scan
+	if tokens.is_empty():
+		Ok({ tokens = [ReadyToken(token(text, PipeString(prefix.join("")), first.end, end))], end = end })
+	else:
+		Ok({ tokens = tokens.append(ReadyToken(token(text, StringEnd, end, end))), end = end })
+
+
 -- The word `raw` is compared byte by byte: a substring would allocate.
 private RAW_WORD_WIDTH: Int = 3
 
@@ -1134,7 +1287,7 @@ private pure func raw_block_marker_line(text: SourceText, start: Int) -> Option[
 -- What the code of a line is, after its indentation prefix: a pipe String
 -- or raw block token, or ordinary code starting at the prefix's end.
 private fixed union LineCode:
-	PipeLine(Token)
+	PipeLine(ScannedCode)
 	OrdinaryCode
 
 
@@ -1142,14 +1295,14 @@ private fixed union LineCode:
 -- the line, on any line including a continuation line inside brackets.
 private pure func line_code(text: SourceText, prefix: LinePrefix) -> Result[LineCode, Diagnostic]:
 	if byte_is(text, prefix.end, ASCII_BAR):
-		match pipe_block(text, prefix, PipeMarkers):
-			Ok(block): Ok(PipeLine(token(text, PipeString(block.value), prefix.end, block.end)))
+		match pipe_tokens(text, prefix):
+			Ok(block): Ok(PipeLine(block))
 			Err(error): Err(error)
 	else:
 		match raw_block_marker_line(text, prefix.end):
 			Some(marker_line):
 				match pipe_block(text, marker_line, RawText):
-					Ok(block): Ok(PipeLine(token(text, PipeString(block.value), prefix.end, block.end)))
+					Ok(block): Ok(PipeLine({ tokens = [ReadyToken(token(text, PipeString(block.value), prefix.end, block.end))], end = block.end }))
 					Err(error): Err(error)
 			None:
 				Ok(OrdinaryCode)
@@ -1311,8 +1464,12 @@ pure func lex(origin: SourceId, source: String, names: NameTable) -> Result[Lexe
 				-- One Result carries the cursor across the line to its LF or EOF, or the first error.
 				var code: Result[Int, Diagnostic] = match line_code(text, line.prefix):
 					Ok(PipeLine(pipe)):
-						tokens = tokens.append(ReadyToken(pipe))
-						Ok(pipe.span.end)
+						for item in pipe.tokens:
+							tokens = tokens.append(item)
+							match item:
+								WordToken(spelling, _, _): spellings = spellings.append(spelling)
+								_: void
+						Ok(pipe.end)
 					Ok(OrdinaryCode):
 						Ok(line.prefix.end)
 					Err(error):
@@ -1357,9 +1514,13 @@ pure func lex(origin: SourceId, source: String, names: NameTable) -> Result[Lexe
 								else:
 									match line_code(text, continued):
 										Ok(PipeLine(pipe)):
-											tokens = tokens.append(ReadyToken(pipe))
+											for item in pipe.tokens:
+												tokens = tokens.append(item)
+												match item:
+													WordToken(spelling, _, _): spellings = spellings.append(spelling)
+													_: void
 											last_colon = False
-											Ok(pipe.span.end)
+											Ok(pipe.end)
 										Ok(OrdinaryCode):
 											Ok(continued.end)
 										Err(error):
@@ -1368,6 +1529,17 @@ pure func lex(origin: SourceId, source: String, names: NameTable) -> Result[Lexe
 								Ok(IntOps.add(cursor, 1))
 							else if comment_starts(text, cursor):
 								comment_end(text, cursor)
+							else if byte_is(text, cursor, ASCII_DOUBLE_QUOTE):
+								match quoted_tokens(text, cursor):
+									Err(error): Err(error)
+									Ok(quoted):
+										for item in quoted.tokens:
+											tokens = tokens.append(item)
+											match item:
+												WordToken(spelling, _, _): spellings = spellings.append(spelling)
+												_: void
+										last_colon = False
+										Ok(quoted.end)
 							else:
 								match code_token(text, cursor):
 									Ok(scanned):

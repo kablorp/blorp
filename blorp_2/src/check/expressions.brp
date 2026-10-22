@@ -5,6 +5,7 @@ complete checked facts leave this module; temporary inference variables never be
 published TypeRefs.
 ---
 import:
+	../namespace/builtins as Builtins: RuntimeOperation
 	result as ResultOps
 	../utils/boolean: not, and
 	./scope: CallableBinding, callable_local, callable_parameter_contract, ScopedValue(DataLocal, CallableLocal), LocalBinding, binding_site, binding_definition, local_binding_id, lookup_binding, bind_local
@@ -30,6 +31,7 @@ import:
 		CheckedBody(CheckedValueBody), CheckedExit(ReturnExpression), CheckedStatement(DiscardExpression),
 		BindingDefinition, BindingOrigin(ParameterBinding), BindingMutability(Immutable, Mutable), TypeUse, binding_id,
 		CallIdentity(DeclaredTarget, ParameterTarget, ValueTarget, ConstantTarget), callable_parameter,
+		CallTarget(RuntimeFunction),
 		TypeRef(ParameterType, CallableType, VoidType, IntType, FloatType, StringType, OpaqueType),
 		same_type,
 		parameter_position
@@ -41,7 +43,7 @@ import:
 		ConstantError(ConstantCalled, NonClosedInitializer), constant_error,
 		ConstructorError(ConstructorNeedsExpectedType),
 		RecordError(RecordNeedsExpectedType, FieldRequiresRecord),
-		ValueError(TupleIndexRequiresTuple, TupleIndexMustBeLiteral, TupleIndexOutOfRange, MutableCapture, UnknownValue, ExpressionTypeMismatch, UnknownOpaqueType, NonOpaqueConversionType, ForeignOpaqueConstruction, ForeignOpaqueProjection),
+		ValueError(InterpolationRequiresString, TupleIndexRequiresTuple, TupleIndexMustBeLiteral, TupleIndexOutOfRange, MutableCapture, UnknownValue, ExpressionTypeMismatch, UnknownOpaqueType, NonOpaqueConversionType, ForeignOpaqueConstruction, ForeignOpaqueProjection),
 		MethodError(MethodReceiverNeedsType),
 		CheckerInvariant(InvalidFunctionContract, InvalidConstantDeclaration, InvalidOpaqueDeclaration, InvalidRecordDeclaration, InvalidRecordField, GenericConstructorContract, InvalidInferenceWorklist, MissingCallParameter),
 		call_error,
@@ -55,11 +57,11 @@ import:
 		checker_invariant
 	./inference:
 		select_receiver_contract,
-		PendingBase(PendingConstructTuple, PendingLambda, PendingNamedCallable, PendingForwardedCallable, AcceptedBinding, AcceptedCapture, PendingCapture, AcceptedFloat, AcceptedInteger, AcceptedString, AcceptedConstant, AcceptedVoid, PendingConstructRecord, PendingConstructVariant, PendingConstructList, PendingConstructOpaque, PendingProjectOpaque, PendingDirectCall, PendingUpdateRecord),
+		PendingBase(PendingInterpolatedString, PendingConstructTuple, PendingLambda, PendingNamedCallable, PendingForwardedCallable, AcceptedBinding, AcceptedCapture, PendingCapture, AcceptedFloat, AcceptedInteger, AcceptedString, AcceptedConstant, AcceptedVoid, PendingConstructRecord, PendingConstructVariant, PendingConstructList, PendingConstructOpaque, PendingProjectOpaque, PendingDirectCall, PendingUpdateRecord),
 		ListElementSource(ExpectedElementType, FirstElementType),
 		PendingOperation(AcceptedTupleElement, AcceptedField, PendingInvocation),
 		InferenceType(AcceptedType, InferredTuple, InferredCallable),
-		ConstraintOrigin(LambdaConstraint, ArgumentConstraint, RecordFieldConstraint, ResultConstraint, OpaqueOperandConstraint, VariantConstraint, ListElementConstraint, ReceiverOverlapConstraint),
+		ConstraintOrigin(InterpolationConstraint, LambdaConstraint, ArgumentConstraint, RecordFieldConstraint, ResultConstraint, OpaqueOperandConstraint, VariantConstraint, ListElementConstraint, ReceiverOverlapConstraint),
 		CallResultContext,
 		InferenceReadiness(ClosedInference, DeferredInference),
 		InferenceRelation(CollectArguments, RequireEquality),
@@ -96,7 +98,7 @@ import:
 	./constructors:
 		ConstructionContext, construction_context,
 		CallPlacement(ReceiverPlacement, ReturnPlacement),
-		PlannedBase(PlannedTuple, PlannedCallable, PlannedCall, PlannedStoredCall, PlannedLeaf, PlannedRecord, PlannedUpdate, PlannedVariant, PlannedList, PlannedConstructOpaque, PlannedProjectOpaque),
+		PlannedBase(PlannedInterpolation, PlannedTuple, PlannedCallable, PlannedCall, PlannedStoredCall, PlannedLeaf, PlannedRecord, PlannedUpdate, PlannedVariant, PlannedList, PlannedConstructOpaque, PlannedProjectOpaque),
 		finish_pending_list,
 		list_element_type,
 		plan_list_literal,
@@ -114,7 +116,7 @@ import:
 		resolve_record_field,
 		validate_record_fields,
 		validate_variant_fields
-	../utils/ids: FunctionId, OpaqueId, OpaqueRow, opaque_number, function_number, record_number, variant_owner
+	../utils/ids: FunctionId, VariantId, OpaqueId, OpaqueRow, opaque_number, function_number, record_number, variant_owner
 	./declarations: aliased_module, resolve_type
 	../namespace/namespace: NamedValue(NamedFunction, NamedConstant, NamedConstructor, NamedAlias), OfferedValue(OfferedFunction, OfferedConstant, OfferedConstructor), TypeHead(OpaqueHead), named_type, named_value, offered_value
 	int as IntOps
@@ -130,7 +132,7 @@ import:
 		PostfixOperation(TupleIndex, ReceiverInvocation, FieldAccess),
 		ReceiverApplication,
 		ExpressionBase(
-			VoidExpression, IntegerExpression, FloatExpression, StringExpression, NameExpression, DirectApplication,
+			VoidExpression, IntegerExpression, FloatExpression, StringExpression, InterpolatedString, NameExpression, DirectApplication,
 			QualifiedName, QualifiedApplication, OpaqueWrap, OpaqueUnwrap, TupleExpression, ListExpression, RangeExpression, RecordExpression,
 			RecordUpdateExpression, LogicalExpression, NotExpression, IfExpression, MatchExpression, LambdaExpression,
 		),
@@ -274,6 +276,7 @@ private fixed union ExpressionWork:
 	CheckRecord(PlannedRecordFields, List[PendingRecordField])
 	ContinueList(ListProgress)
 	FinishTuple(OperandRange, Span, Span)
+	FinishInterpolation(OperandRange, Span, Span)
 	FinishList(ListElementSource, OperandRange, Span, Span)
 	CheckList(ListElementSource, List[PendingValue], Span, Span)
 	SolveConstraint(InferenceEquality)
@@ -547,6 +550,10 @@ private pure func plan_base(
 		ListExpression(elements): plan_list_literal(elements, expectation, body.base_span)
 		VoidExpression: Ok(PlannedLeaf(AcceptedVoid, VoidType))
 		StringExpression(value): Ok(PlannedLeaf(AcceptedString(value), StringType))
+		InterpolatedString(parts):
+			match site:
+				ConstantInitializer(_, _): Err(constant_error(body.span, NonClosedInitializer))
+				BodyExpression(_, _): Ok(PlannedInterpolation(parts))
 		IntegerExpression(value): Ok(PlannedLeaf(AcceptedInteger(value), IntType))
 		FloatExpression(value): Ok(PlannedLeaf(AcceptedFloat(value), FloatType))
 		TupleExpression(elements):
@@ -664,7 +671,7 @@ private pure func plan_body_base(scope: List[ScopedValue], body: ValueExpression
 		MatchExpression(_): Err(unsupported_form(body.base_span, MatchInExpression))
 		LambdaExpression(_): Ok(PlannedCallable(body, expectation))
 
-		RecordExpression(_) | ListExpression(_) | TupleExpression(_) | VoidExpression | StringExpression(_) | IntegerExpression(_) | FloatExpression(_): Err(checker_invariant(body.span, InvalidInferenceWorklist))
+		RecordExpression(_) | ListExpression(_) | TupleExpression(_) | VoidExpression | InterpolatedString(_) | StringExpression(_) | IntegerExpression(_) | FloatExpression(_): Err(checker_invariant(body.span, InvalidInferenceWorklist))
 
 
 -- `Alias.name` resolves through the alias row to the target's own exported
@@ -1077,6 +1084,18 @@ private pure func elaborate_value(
 											PlannedCall(contract, arguments, placement, call_hint):
 												work = push_expression_work(work, work_count, ScheduleCall(contract, arguments, placement, call_hint))
 												work_count = IntOps.add(work_count, 1)
+											PlannedInterpolation(parts):
+												range: OperandRange = { start = operand_count, count = parts.length() }
+												work = push_expression_work(work, work_count, FinishInterpolation(range, written.base_span, written.span))
+												work_count = IntOps.add(work_count, 1)
+												var position = parts.length()
+												while IntOps.greater_than(position, 0):
+													position = IntOps.subtract(position, 1)
+													match parts.get(position):
+														None: failure = Some(checker_invariant(written.span, InvalidInferenceWorklist))
+														Some(part):
+															work = push_expression_work(work, work_count, EnterExpression(part, Some(AcceptedType(StringType))))
+															work_count = IntOps.add(work_count, 1)
 											PlannedTuple(elements, hints):
 												range: OperandRange = { start = operand_count, count = elements.length() }
 												work = push_expression_work(work, work_count, FinishTuple(range, written.base_span, written.span))
@@ -1092,6 +1111,20 @@ private pure func elaborate_value(
 											PlannedList(elements, source):
 												work = push_expression_work(work, work_count, ContinueList({ source = source, elements = elements, position = 0, start = operand_count, base_span = written.base_span, span = written.span }))
 												work_count = IntOps.add(work_count, 1)
+					FinishInterpolation(range, base_span, span):
+						match call_operands(operands, range, base_span):
+							Err(error): failure = Some(error)
+							Ok(parts):
+								for position in range.start..operand_count:
+									operands = operands.set(position, None)
+								operand_count = range.start
+								value: PendingValue = { base = PendingInterpolatedString(parts), base_type = AcceptedType(StringType), readiness = DeferredInference, base_span = base_span, span = span, operations = NoPendingOperations }
+								operands = push_operand(operands, operand_count, value)
+								operand_count = IntOps.add(operand_count, 1)
+								for part in parts:
+									equality: InferenceEquality = { expected = AcceptedType(StringType), actual = pending_type(part), origin = InterpolationConstraint(part.span), relation = RequireEquality, parameter = None }
+									work = push_expression_work(work, work_count, SolveConstraint(equality))
+									work_count = IntOps.add(work_count, 1)
 					FinishTuple(range, base_span, span):
 						match call_operands(operands, range, span):
 							Err(error): failure = Some(error)
@@ -1454,6 +1487,7 @@ private pure func elaborate_value(
 							LambdaConstraint(_): void
 							ArgumentConstraint(_, _, _, _): void
 							OpaqueOperandConstraint(_, _): void
+							InterpolationConstraint(_): void
 							VariantConstraint(_, _): void
 							RecordFieldConstraint(_, _, _): void
 							ListElementConstraint(_, _): void
@@ -1760,6 +1794,48 @@ private pure func freeze_record_update(
 	Ok({ base = frozen_base, base_expression_span = expression_span, replacements = replacements, inherited = frozen_inherited })
 
 
+-- Balancing keeps the existing binary runtime operation while bounding recursive
+-- consumers' depth. Its leaves still evaluate once, in written order.
+private pure func concat_checked_parts(parts: List[CheckedExpr], first: Int, count: Int, span: Span) -> Result[CheckedExpr, CheckError]:
+	if IntOps.equals(count, 0):
+		Ok({ form = LiteralString(""), value_type = StringType, span = span })
+	else if IntOps.equals(count, 1):
+		match parts.get(first):
+			Some(part): Ok(part)
+			None: Err(checker_invariant(span, InvalidInferenceWorklist))
+	else:
+		left_count = IntOps.divide(count, 2)
+		match concat_checked_parts(parts, first, left_count, span):
+			Err(error): Err(error)
+			Ok(left):
+				match concat_checked_parts(parts, IntOps.add(first, left_count), IntOps.subtract(count, left_count), span):
+					Err(error): Err(error)
+					Ok(right):
+						operation: RuntimeOperation[VariantId, TypeRef] = Builtins.StringConcat
+						call: CheckedCall = { target = RuntimeFunction(operation), operands = [ValueOperand(left), ValueOperand(right)], span = span }
+						Ok({ form = InvokeFunction(call), value_type = StringType, span = span })
+
+
+private pure func freeze_interpolated(parts: List[PendingValue], slots: List[InferenceSlot], captures: CaptureScope, span: Span) -> Result[CheckedExpr, CheckError]:
+	var checked: List[CheckedExpr] = []
+	var failure: Option[CheckError] = None
+	for part in parts:
+		match freeze_pending_value(part, slots, captures):
+			Err(error):
+				failure = Some(error)
+				break
+			Ok(value):
+				if same_type(value.value_type, StringType):
+					checked = checked.append(value)
+				else:
+					failure = Some(value_error(part.span, InterpolationRequiresString(value.value_type)))
+					break
+	ready: Void ?= match failure:
+		Some(error): Err(error)
+		None: Ok(void)
+	concat_checked_parts(checked, 0, checked.length(), span)
+
+
 private pure func freeze_pending_value(value: PendingValue, slots: List[InferenceSlot], captures: CaptureScope) -> Result[CheckedExpr, CheckError]:
 	base_result: Result[CheckedForm, CheckError] = match value.base:
 		PendingNamedCallable(_, _, _) | PendingForwardedCallable(_) | PendingLambda(_):
@@ -1795,6 +1871,8 @@ private pure func freeze_pending_value(value: PendingValue, slots: List[Inferenc
 						Ok(valid): Ok(ConstructVariant(contract.variant, frozen))
 						Err(error): Err(error)
 				Err(error): Err(error)
+		PendingInterpolatedString(values):
+			ResultOps.map(freeze_interpolated(values, slots, captures, value.base_span), pure func(joined): joined.form)
 		PendingConstructTuple(values):
 			ResultOps.map(freeze_pending_values(values, slots, captures), pure func(frozen): ConstructTuple(frozen))
 		PendingConstructList(source, values):

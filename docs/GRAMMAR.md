@@ -64,8 +64,12 @@ and function reexports remain unsupported.
 Decimal Float tokens carry an optional minus, a decimal fraction or exponent,
 or both. Parsing checks canonical source spelling and finite binary64 range;
 `1.identity()` remains an Int receiver call. The restricted EBNF owns the exact
-Float syntax and runtime builtin label set. Interpolation, raw/multiline literals
-and recursive data declarations remain unsupported.
+Float syntax and runtime builtin label set. Quoted and LF-joined pipe Strings
+accept `${expression}` holes, each containing one expression on one physical
+line. Holes require String values; nested interpolation is rejected. Raw blocks
+retain literal `${` text. The [restricted EBNF](../blorp_2/grammar.ebnf) owns
+these forms; interpolation is not admitted in patterns, builtin labels or closed
+constant initializers. Recursive data declarations remain unsupported.
 The grammar below describes the full language.
 
 This document is the authoritative specification of Blorp's syntax. A parser

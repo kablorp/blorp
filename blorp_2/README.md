@@ -1357,7 +1357,7 @@ Lexical and layout rules:
   starts a pipe String: each line's text after its marker, verbatim and
   without escapes, joined with LF; the literal continues while the next line
   has the first line's exact indentation bytes before its `|`. `||` yields one
-  `|` and `${` is rejected. `raw` alone on a line followed by marker lines
+  `|` and `${expression}` opens an interpolation hole. `raw` alone on a line followed by marker lines
   starts a raw block, where `${` is text. The literal is the whole code of its
   lines, so it stands where an expression line does or as an argument on its
   own lines; a record update bar therefore never starts a line.
@@ -1857,8 +1857,29 @@ The fixed escapes are `\n`, `\r`, `\t`, `\0`, `\\`, `\"`, `\'`, `\{` and
 valid scalar from U+0000 through U+10FFFF, excluding U+D800 through U+DFFF.
 Embedded NUL counts toward length and is preserved. Raw ASCII control bytes,
 DEL, malformed UTF-8, invalid escapes and missing quotes are errors with help.
-Quoted literals stay on one source line. Interpolation, raw strings and
-multiline literals are deferred; write `"$\{"` to preserve literal `${` text.
+Quoted literals stay on one source line. Pipe Strings join marker lines with
+LF without escapes; `raw` blocks preserve literal `${` text. Write `"$\{"` in
+a quoted literal to preserve literal `${` text.
+
+Quoted and pipe Strings support `${expression}` holes. Each hole holds one
+expression on one physical line and must produce a `String`; convert `Int`
+and `Float` explicitly with their concrete `to_string` functions:
+
+```blorp
+import:
+    int as IntOps
+pure func describe(name: String, count: Int) -> String:
+    "${name}: ${IntOps.to_string(count)}"
+```
+
+Holes use normal scope, calls, UFCS, generic inference and purity checks.
+Plain quoted values and record braces may occur inside a hole; another
+interpolated String may not. Bind an inner interpolated value before the
+outer String. Interpolation is rejected in patterns, builtin labels and
+closed constant initializers. Each hole evaluates exactly once in written
+order. Checking balances the existing binary String concatenations to keep
+their tree depth logarithmic; their allocation association differs from a
+handwritten left fold. No interpolation representation reaches the backend.
 
 Builtin declaration labels retain their exact raw spelling; String escape
 decoding does not create aliases for closed runtime operations. The

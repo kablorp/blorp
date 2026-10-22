@@ -48,7 +48,7 @@
      each marker, verbatim, joined with LF, with no escapes. The literal
      continues on the next line when that line starts with the first marker
      line's exact indentation bytes and then `|`. The text starts after the
-     single marker, so `||` yields one `|`; `${` is rejected. The word `raw`
+     single marker, so `||` yields one `|`; `${expression}` opens a hole. The word `raw`
      alone on a code line, followed by a marker line, starts a raw block: the
      same, but `${` is text. The last line's LF is the line's NEWLINE. Pipe
      text admits tabs, printable bytes and UTF-8.
@@ -60,6 +60,14 @@
      must denote scalars through 10FFFF, excluding D800..DFFF. Raw UTF-8 must
      use shortest scalar encodings. No normalization occurs. Length and spans
      count bytes. Raw ASCII controls and DEL are unsupported inside quotes.
+   - Quoted and pipe Strings admit `${expression}` holes. Each hole holds
+     exactly one expression on one physical line; its braces balance record
+     braces and ignore braces inside plain quoted or Char tokens. Interpolated
+     Strings cannot occur inside holes. Hole expressions must have type String;
+     Int and Float require explicit to_string calls. Raw blocks keep `${` text.
+     Holes evaluate once in written order. Checking balances existing binary
+     String concat operations, so allocation association differs from a left fold.
+     Interpolation is not a String pattern, builtin label or closed initializer.
    - `--` starts a single-line comment ending before LF or EOF. It takes
      precedence over a signed integer; `->` still forms an arrow.
    - A line holding only `---` at column 1, with optional trailing spaces,
@@ -383,6 +391,11 @@ string_byte      = "\x20".."\x21" | "\x23".."\x5B" | "\x5D".."\x7E" | utf8_scala
 string_contents  = { string_byte | string_escape } ;
 (* Raw interpolation openers are excluded; $\{ remains literal text. *)
 string_literal   = "\"" (string_contents - (string_contents "${" string_contents)) "\"" ;
+(* Lexing delimits a hole before parsing its expression: no LF or nested
+   interpolated String occurs within it, and nested record braces balance. *)
+interpolation_hole = "${" spaces expression spaces "}" ;
+quoted_text      = string_contents - (string_contents "${" string_contents) ;
+interpolated_string = "\"" quoted_text interpolation_hole { quoted_text interpolation_hole } quoted_text "\"" ;
 char_byte        = "\x20".."\x26" | "\x28".."\x5B" | "\x5D".."\x7E" | utf8_scalar ;
 char_literal     = "'" ( char_byte | "\\" ( ascii_byte - "\n" ) ) "'" ;
 pipe_byte        = "\t" | "\x20".."\x7E" | utf8_scalar ;
@@ -392,7 +405,8 @@ raw_text         = { pipe_byte } ;
    indentation bytes; the lexer compares them. A pipe_string begins only
    where a line's code begins, so a "|" after other code on its line is the
    record update bar. *)
-pipe_string      = "|" pipe_text { "\n" indentation "|" pipe_text } ;
+pipe_line        = pipe_text { interpolation_hole pipe_text } ;
+pipe_string      = "|" pipe_line { "\n" indentation "|" pipe_line } ;
 raw_string       = "raw" { space } "\n" indentation "|" raw_text { "\n" indentation "|" raw_text } ;
 (* Every bracketed, comma-separated list admits one trailing comma. *)
 trailing_comma   = [ spaces "," ] ;
@@ -420,7 +434,7 @@ qualified_call   = qualified_name spaces "(" spaces [ arguments ] spaces ")" ;
    supplies one, otherwise the first element's; an empty literal needs that
    context. *)
 list_literal     = "[" spaces [ arguments ] spaces "]" ;
-primary          = "void" | "_" | float | integer | string_literal | pipe_string | raw_string | qualified_call | qualified_name
+primary          = "void" | "_" | float | integer | string_literal | interpolated_string | pipe_string | raw_string | qualified_call | qualified_name
                  | opaque_conversion | identifier | direct_call | list_literal | record_literal | record_update | group | tuple ;
 receiver_call    = spaces "." spaces callable_name spaces "(" spaces [ arguments ] spaces ")" ;
 field_read       = spaces "." spaces identifier ;
