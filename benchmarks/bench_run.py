@@ -36,6 +36,22 @@ EXPECTED_OUTPUTS = {
         "intersect: 2500000\n"
         "difference: 2500000\n"
     ),
+    "compiler_ast": "compiler_ast checksum: 2390849568879\n",
+    "compiler_emit": (
+        "compiler_emit checksum: -4239430305840994758\n"
+        "compiler_emit bytes: 263793\n"
+    ),
+    # The suite's shared binary_trees argument is 15 (benchmarks/args/).
+    "binary_trees": (
+        "stretch tree of depth 16 check: 6442483711\n"
+        "32768 trees of depth 4 check: 12812288\n"
+        "8192 trees of depth 6 check: 50585600\n"
+        "2048 trees of depth 8 check: 201586688\n"
+        "512 trees of depth 10 check: 805568000\n"
+        "128 trees of depth 12 check: 3221487488\n"
+        "32 trees of depth 14 check: 12885164000\n"
+        "long lived tree of depth 15 check: 1610629119\n"
+    ),
 }
 BENCH_RE = re.compile(
     r"^BENCH\s+.*(?:seconds=([0-9]+(?:\.[0-9]+)?)|microseconds=([0-9]+)|micros=([0-9]+))",
@@ -58,7 +74,12 @@ def run_once(name: str, command: list[str]) -> float:
             sys.stderr.write(proc.stderr)
         raise SystemExit(proc.returncode)
 
-    if expected_output is not None and proc.stdout != expected_output:
+    actual_output = proc.stdout
+    if name == "binary_trees":
+        # Existing variants use tabs or spaces between the same exact fields.
+        # Preserve line boundaries, order and every checksum digit.
+        actual_output = re.sub(r"[ \t]+", " ", actual_output)
+    if expected_output is not None and actual_output != expected_output:
         sys.stderr.write(
             f"{name} output mismatch: expected {expected_output!r}, "
             f"got {proc.stdout[:120]!r}\n"

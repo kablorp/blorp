@@ -1,12 +1,13 @@
 # blorp Benchmarks
 
-Performance benchmarks comparing blorp against C, Go, OCaml, and Python.
+Performance benchmarks comparing blorp, Blorp 2, C, Go, OCaml, and Python.
 
 ## Quick Start
 
 ```bash
-# Build bin/blorp first
+# Build both compilers first
 make
+make -C blorp_2 compiler
 
 # Run the default benchmark suite
 bash benchmarks/bench.sh
@@ -27,6 +28,7 @@ and build setup:
 benchmarks/
   blorp/support/benchmark.brp  # shared helper module for Blorp benchmarks
   blorp/<name>.brp
+  blorp_2/<name>.brp      # supported Blorp 2 ports; separate table column
   c/<name>.c
   go/<name>.go
   ocaml/<name>.ml
@@ -46,19 +48,47 @@ Blorp benchmark sources can import harness helpers from `./support/benchmark`.
 Reusable low-level timing and optimizer-barrier primitives live in the standard
 `instrumentation` module.
 
+### Blorp 2
+
+The `blorp2` column uses `blorp_2/build/compiler` and the explicit
+`blorp_2/standard_library` root. Set `BLORP2_COMPILER` to select another compiler
+executable. There is no fallback to the legacy compiler. A missing compiler is
+an error when the selected workload has a Blorp 2 port; unsupported rows show
+`-`. Listing the workloads needs neither compiler.
+
+The initial ports are `numeric_loop`, `fib`, `binary_trees`, `compiler_ast`,
+`list_ops`, and `compiler_emit`. They preserve the existing inputs, iteration
+counts and result checksums. Both Blorp compilers' generated C uses the same
+native optimization flags and the same whole-main timing wrapper.
+The `blorp2/blorp time` note is Blorp 2 elapsed time divided by legacy elapsed
+time: a value above 1 means Blorp 2 took longer.
+
+The tree and AST ports use a managed record containing an inline union, matching
+the supported recursive-data idiom. Every logical node, including a leaf, has
+one managed record root; there is no additional union box. The logical trees,
+construction counts and child evaluation order stay the same, but the storage
+representation differs. Their Blorp 2 comparisons are marked provisional.
+
+`list_ops` and `compiler_emit` compare the current libraries as well as code
+generation. Blorp 2 List updates copy, its filter/reverse/sort helpers use
+temporary immutable algorithms, and the fold port uses an explicit summing loop
+instead of `fold_left`. Its String emitter has no capacity reservation and uses
+fresh concatenations and temporary integer strings. These comparisons are
+provisional; see [the audit](AUDIT.md). They do not isolate compiler quality.
+
 ## Default Benchmark Suite
 
 These run when the filter is omitted or set to `all`.
 
 | Benchmark | What it tests | Languages |
 |-----------|--------------|-----------|
-| `numeric_loop` | Collatz sequence (1M numbers), arithmetic loops | blorp, C, Go, OCaml, Python |
-| `fib` | Recursive fib(40), function call overhead | blorp, C, Go, OCaml, Python |
+| `numeric_loop` | Collatz sequence (1M numbers), arithmetic loops | blorp, Blorp 2, C, Go, OCaml, Python |
+| `fib` | Recursive fib(40), function call overhead | blorp, Blorp 2, C, Go, OCaml, Python |
 | `string` | Checksum-based search, replace, substring, case conversion, split, trim, and reverse | blorp, C, Go, OCaml, Python |
 | `array_sum` | Explicit integer vector sum (10k iterations, 1000 elements) | blorp, C, Go, OCaml, Python |
 | `array_ops` | Integer vector add + scale + sum (10k iterations) | blorp, C, Go, OCaml, Python |
 | `dict_ops` | Hash map build/lookup/remove/iterate | blorp, Go, OCaml, Python |
-| `list_ops` | List append/sort/filter/fold/reverse/concat | blorp, Go, OCaml, Python |
+| `list_ops` | List append/sort/filter/fold/reverse/concat | blorp, Blorp 2, Go, OCaml, Python |
 | `set_ops` | Hash set build/contains/union/intersect/diff | blorp, Go, OCaml, Python |
 | `threaded_cpu_map` | Fixed-width CPU-bound worker partitioning | blorp, C, Go, OCaml, Python |
 | `channel_pipeline` | Producer/worker/consumer channel pipeline; Blorp currently uses structured concurrent list processing | blorp, C, Go, OCaml, Python |
@@ -66,15 +96,15 @@ These run when the filter is omitted or set to `all`.
 | `options` | `Option` representation and layout costs | blorp |
 | `simd` | 16-element numeric tensor add, multiply, sum, and dot kernels | blorp, C |
 | `nbody` | Struct-of-arrays N-body planetary simulation; Blorp currently uses list-backed storage | blorp, C, Go, OCaml, Python |
-| `binary_trees` | Allocation-heavy binary tree construction/checking | blorp, C, Go, OCaml, Python |
+| `binary_trees` | Allocation-heavy binary tree construction/checking | blorp, Blorp 2, C, Go, OCaml, Python |
 | `fannkuch` | Permutation-heavy integer workload | blorp, C, Go, OCaml, Python |
 | `spectral_norm` | Floating-point matrix/vector kernel with fresh intermediates | blorp, C, Go, OCaml, Python |
 | `mandelbrot` | Complex-number style nested numeric loops | blorp, C, Go, OCaml, Python |
 | `knucleotide` | String slicing and frequency maps | blorp, Go, OCaml, Python |
 | `reverse_complement` | Shared FASTA reverse-complement transforms | blorp, Go, OCaml, Python |
-| `compiler_ast` | Recursive AST construction, immutable tree rewrites, and pattern matching | blorp, Go, OCaml |
+| `compiler_ast` | Recursive AST construction, immutable tree rewrites, and pattern matching | blorp, Blorp 2, Go, OCaml |
 | `compiler_symbols` | Persistent symbol tables, nested scope walks, and repeated lookups | blorp, Go, OCaml |
-| `compiler_emit` | C-like code emission and generated-text checksumming | blorp, Go, OCaml |
+| `compiler_emit` | C-like code emission and generated-text checksumming | blorp, Blorp 2, Go, OCaml |
 
 ## Extra Benchmarks
 
@@ -275,7 +305,7 @@ optimization level.
 `bench.sh` first compiles all compiled-language binaries for the selected
 benchmark set into a temporary directory. Timed execution remains
 benchmark-major, so the comparison table still runs `fib` across
-blorp/C/Go/OCaml/Python before moving to the next benchmark.
+blorp/blorp2/C/Go/OCaml/Python before moving to the next benchmark.
 Blorp-generated C and the C comparison programs are compiled and linked at
 `-O2`; this is a benchmark setting, not a substitute for output validation.
 
@@ -293,10 +323,19 @@ This excludes shell overhead, process launch time, and dynamic-loader startup
 from the measured result.
 
 For `fib`, `numeric_loop`, `array_sum`, `array_ops`, `dict_ops`, `list_ops`, and
-`set_ops`, the sample runner checks exact stdout on every warmup and timed run
+`set_ops`, `compiler_ast`, and `compiler_emit`, the sample runner checks exact stdout on every warmup and timed run
 before accepting its `BENCH` marker. Their expected outputs are recorded in
-`benchmarks/bench_run.py`. Other rows do not yet have an output contract in the
+`benchmarks/bench_run.py`. `binary_trees` also checks every result, allowing only
+the existing spaces-versus-tabs formatting difference. Its contract uses the
+shared depth-15 argument. Other rows do not yet have an output contract in the
 sample runner.
+
+`BENCH_ALLOC_STATS=1` builds separate diagnostic binaries for blorp and Blorp 2.
+Timed samples always use normal binaries with memory diagnostics disabled.
+Allocation runs use each runtime's leak-check mode and fail the benchmark on
+diagnostic errors. The counts are labeled separately: legacy managed-object
+counts and Blorp 2 allocator-call counts have different accounting boundaries.
+The reported `bytes` field is live bytes at exit, not total bytes allocated.
 
 The current runners instrument the full benchmark `main` body. That means
 benchmark-specific setup and output are included unless the source factors them
@@ -312,12 +351,13 @@ PYTHON_CONCURRENCY=python3.14t  bash benchmarks/bench.sh   # Free-threaded Pytho
 GO=go1.22                       bash benchmarks/bench.sh   # Use specific Go
 OCAMLOPT=ocamlopt               bash benchmarks/bench.sh   # Use specific OCaml native compiler
 CC=gcc                          bash benchmarks/bench.sh   # Use specific C compiler
+BLORP2_COMPILER=/path/compiler  bash benchmarks/bench.sh fib # Select Blorp 2 compiler
 BENCH_THREADS=4                 bash benchmarks/bench.sh   # Worker/task width for concurrency rows
 BLORP_THREADS=4                 bash benchmarks/bench.sh   # Blorp runtime thread width for concurrency rows
 GOMAXPROCS=4                    bash benchmarks/bench.sh   # Go runtime parallelism for concurrency rows
 BENCH_RUNS=5                    bash benchmarks/bench.sh   # Timed runs per language (default: 1)
 BENCH_WARMUPS=1                 bash benchmarks/bench.sh   # Untimed warmup runs (default: 0)
-BENCH_ALLOC_STATS=1             bash benchmarks/bench.sh   # Add Blorp allocation/release counts
+BENCH_ALLOC_STATS=1             bash benchmarks/bench.sh   # Separate allocation runs for both Blorp runtimes
 BENCH_VERBOSE=1                 bash benchmarks/bench.sh   # Print build logs on failures
 ```
 
@@ -329,7 +369,7 @@ that the GIL is disabled.
 ## Adding a New Benchmark
 
 1. Add `benchmarks/blorp/<name>.brp`.
-2. Optionally add `benchmarks/c/<name>.c`, `benchmarks/go/<name>.go`,
+2. Optionally add `benchmarks/blorp_2/<name>.brp`, `benchmarks/c/<name>.c`, `benchmarks/go/<name>.go`,
    `benchmarks/ocaml/<name>.ml`, and `benchmarks/python/<name>.py`.
 3. If every language should receive the same CLI args, add
    `benchmarks/args/<name>.txt`.

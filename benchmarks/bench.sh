@@ -3,6 +3,7 @@
 #
 # Layout:
 #   benchmarks/blorp/<name>.brp
+#   benchmarks/blorp_2/<name>.brp
 #   benchmarks/c/<name>.c
 #   benchmarks/go/<name>.go
 #   benchmarks/ocaml/<name>.ml
@@ -24,12 +25,13 @@
 #   GO=go1.22                          bash benchmarks/bench.sh   # Use specific Go
 #   OCAMLOPT=ocamlopt                  bash benchmarks/bench.sh   # Use specific OCaml native compiler
 #   CC=gcc                             bash benchmarks/bench.sh   # Use specific C compiler
+#   BLORP2_COMPILER=/path/compiler      bash benchmarks/bench.sh fib # Select Blorp 2 compiler
 #   BENCH_THREADS=4                    bash benchmarks/bench.sh   # Worker/task width for concurrency rows
 #   BLORP_THREADS=4                    bash benchmarks/bench.sh   # Blorp runtime thread width for concurrency rows
 #   GOMAXPROCS=4                       bash benchmarks/bench.sh   # Go runtime parallelism for concurrency rows
 #   BENCH_RUNS=5                       bash benchmarks/bench.sh   # Timed runs per language (default: 1)
 #   BENCH_WARMUPS=1                    bash benchmarks/bench.sh   # Untimed warmup runs (default: 0)
-#   BENCH_ALLOC_STATS=1                bash benchmarks/bench.sh   # Add Blorp allocation/release counts
+#   BENCH_ALLOC_STATS=1                bash benchmarks/bench.sh   # Separate allocation runs for both Blorp runtimes
 #   BENCH_VERBOSE=1                    bash benchmarks/bench.sh   # Print build logs on failures
 
 set -e
@@ -37,6 +39,7 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 BLORP="$PROJECT_DIR/bin/blorp"
+BLORP2_COMPILER="${BLORP2_COMPILER:-$PROJECT_DIR/blorp_2/build/compiler}"
 PYTHON="${PYTHON:-python3}"
 if [ "${PYTHON_CONCURRENCY+x}" ]; then
     PYTHON_CONCURRENCY_DEFAULTED=0
@@ -130,6 +133,7 @@ src_for() {
     local lang="$1" name="$2"
     case "$lang" in
         blorp) printf "%s/blorp/%s.brp" "$SCRIPT_DIR" "$name" ;;
+        blorp2) printf "%s/blorp_2/%s.brp" "$SCRIPT_DIR" "$name" ;;
         c) printf "%s/c/%s.c" "$SCRIPT_DIR" "$name" ;;
         go) printf "%s/go/%s.go" "$SCRIPT_DIR" "$name" ;;
         ocaml) printf "%s/ocaml/%s.ml" "$SCRIPT_DIR" "$name" ;;
@@ -248,33 +252,41 @@ EOF
 }
 
 compile_blorp() {
-    local name="$1" src="$2" out="$3"
-    local bench_src="$TEMP_DIR/${name}_blorp.brp"
-    local bench_c="$TEMP_DIR/${name}_blorp.c"
-    local obj="$TEMP_DIR/${name}_blorp.o"
-    local timer_c="$TEMP_DIR/${name}_blorp_timer.c"
-    local timer_o="$TEMP_DIR/${name}_blorp_timer.o"
+    local lang="$1" name="$2" src="$3" out="$4"
+    local bench_src="$TEMP_DIR/${name}_${lang}.brp"
+    local bench_c="$TEMP_DIR/${name}_${lang}.c"
+    local timer_c="$TEMP_DIR/${name}_${lang}_timer.c"
+    local timer_o="$TEMP_DIR/${name}_${lang}_timer.o"
     local helper_src="$SCRIPT_DIR/blorp/support"
-    local memory_diagnostics=0
-    if [ "$BENCH_ALLOC_STATS" = "1" ]; then
-        memory_diagnostics=1
-    fi
+    local modes="0" memory_diagnostics obj binary
 
-    cp "$src" "$bench_src"
-    if [ -d "$helper_src" ]; then
-        cp -R "$helper_src" "$TEMP_DIR/support"
+    cp "$src" "$bench_src" || return 1
+    if [ "$lang" = "blorp2" ]; then
+        "$BLORP2_COMPILER" --library-root "$PROJECT_DIR/blorp_2/standard_library" \
+            "$bench_src" "$bench_c" >/dev/null || return 1
+    else
+        if [ -d "$helper_src" ]; then
+            cp -R "$helper_src" "$TEMP_DIR/support" || return 1
+        fi
+        (
+            cd "$PROJECT_DIR"
+            "$BLORP" compile "$bench_src" >/dev/null
+        ) || return 1
     fi
-    (
-        cd "$PROJECT_DIR"
-        "$BLORP" compile "$bench_src" >/dev/null
-    )
     [ -f "$bench_c" ] || return 1
 
-    write_c_timer "$timer_c" "$name" "blorp" 1
-    $CC -fwrapv -O2 -march=native -flto -pthread -Dmain=bench_main \
-        "-DBLORP_MEMORY_DIAGNOSTICS=$memory_diagnostics" -c "$bench_c" -o "$obj"
-    $CC -fwrapv -O2 -march=native -flto -pthread -c "$timer_c" -o "$timer_o"
-    $CC -fwrapv -O2 -march=native -flto -pthread -o "$out" "$obj" "$timer_o" -lm -lpthread
+    write_c_timer "$timer_c" "$name" "$lang" 1
+    $CC -fwrapv -O2 -march=native -flto -pthread -c "$timer_c" -o "$timer_o" || return 1
+    [ "$BENCH_ALLOC_STATS" = "1" ] && modes="0 1"
+    for memory_diagnostics in $modes; do
+        obj="$TEMP_DIR/${name}_${lang}_${memory_diagnostics}.o"
+        binary="$out"
+        [ "$memory_diagnostics" = "1" ] && binary="$out.alloc"
+        $CC -fwrapv -O2 -march=native -flto -pthread -Dmain=bench_main \
+            "-DBLORP_MEMORY_DIAGNOSTICS=$memory_diagnostics" -c "$bench_c" -o "$obj" || return 1
+        $CC -fwrapv -O2 -march=native -flto -pthread -o "$binary" "$obj" "$timer_o" -lm -lpthread || return 1
+        [ -x "$binary" ] || return 1
+    done
 }
 
 compile_c() {
@@ -380,7 +392,7 @@ EOF
 
 build_compiled_lang() {
     local lang="$1" name="$2"
-    local src out log
+    local src out log status=0
 
     has_bench "$lang" "$name" || return 0
     if [ "$lang" = "go" ] && ! has_cmd "$GO"; then
@@ -397,14 +409,14 @@ build_compiled_lang() {
     log="$(build_log_for "$lang" "$name")"
 
     case "$lang" in
-        blorp) compile_blorp "$name" "$src" "$out" >"$log" 2>&1 ;;
+        blorp|blorp2) compile_blorp "$lang" "$name" "$src" "$out" >"$log" 2>&1 ;;
         c) compile_c "$name" "$src" "$out" >"$log" 2>&1 ;;
         go) compile_go "$name" "$src" "$out" >"$log" 2>&1 ;;
         ocaml) compile_ocaml "$name" "$src" "$out" >"$log" 2>&1 ;;
         *) return 1 ;;
-    esac
+    esac || status=$?
 
-    if [ -x "$out" ]; then
+    if [ "$status" -eq 0 ] && [ -x "$out" ]; then
         mark_build_status "$lang" "$name" "ok"
         return 0
     fi
@@ -422,7 +434,7 @@ build_compiled_benchmarks() {
     local name lang total=0 failed=0
 
     for name in $names; do
-        for lang in blorp c go ocaml; do
+        for lang in blorp blorp2 c go ocaml; do
             has_bench "$lang" "$name" || continue
             if [ "$lang" = "go" ] && ! has_cmd "$GO"; then
                 mark_build_status "$lang" "$name" "skip"
@@ -496,6 +508,7 @@ list_benchmarks() {
     for name in $ALL_BENCHMARKS $EXTRA_BENCHMARKS; do
         has_bench blorp "$name" || continue
         local langs="blorp"
+        has_bench blorp2 "$name" && langs="$langs, blorp2"
         has_bench c "$name" && langs="$langs, C"
         has_bench go "$name" && langs="$langs, Go"
         has_bench ocaml "$name" && langs="$langs, OCaml"
@@ -528,21 +541,23 @@ run_built_lang() {
 }
 
 run_blorp_alloc_stats() {
-    local name="$1"
-    shift
+    local lang="$1" name="$2"
+    shift 2
     local args=("$@")
-    local out
+    local out mode=1
 
-    is_built blorp "$name" || return 1
-    out="$(compiled_out_for blorp "$name")"
+    is_built "$lang" "$name" || return 1
+    out="$(compiled_out_for "$lang" "$name").alloc"
+    [ "$lang" = "blorp2" ] && mode=strict
+    [ -x "$out" ] || return 1
     if is_concurrency_benchmark "$name"; then
         run_and_read_blorp_alloc_stats env \
             "BLORP_THREADS=$BLORP_CONCURRENCY_THREADS" \
-            "BLORP_LEAK_CHECK=1" \
+            "BLORP_LEAK_CHECK=$mode" \
             "$out" "${args[@]}"
     else
         run_and_read_blorp_alloc_stats env \
-            "BLORP_LEAK_CHECK=1" \
+            "BLORP_LEAK_CHECK=$mode" \
             "$out" "${args[@]}"
     fi
 }
@@ -581,8 +596,8 @@ PY
 
 run_one() {
     local name="$1"
-    local bt="" ct="" gt="" ot="" pt=""
-    local blorp_alloc_stats=""
+    local bt="" b2t="" ct="" gt="" ot="" pt=""
+    local blorp_alloc_stats="" blorp2_alloc_stats=""
     local args_text src
     local args=()
 
@@ -602,11 +617,31 @@ run_one() {
     if bt=$(run_built_lang blorp "$name" "${args[@]}" 2>/dev/null); then
         printf "  %9ss" "$bt"
         if [ "$BENCH_ALLOC_STATS" = "1" ]; then
-            blorp_alloc_stats="$(run_blorp_alloc_stats "$name" "${args[@]}" 2>/dev/null || true)"
+            if ! blorp_alloc_stats=$(run_blorp_alloc_stats blorp "$name" "${args[@]}"); then
+                BENCH_FAILED=1
+                blorp_alloc_stats="allocation run FAILED"
+            fi
         fi
     else
         BENCH_FAILED=1
         printf "  %8s" "FAIL"
+    fi
+
+    if has_bench blorp2 "$name"; then
+        if b2t=$(run_built_lang blorp2 "$name" "${args[@]}" 2>/dev/null); then
+            printf "  %9ss" "$b2t"
+            if [ "$BENCH_ALLOC_STATS" = "1" ]; then
+                if ! blorp2_alloc_stats=$(run_blorp_alloc_stats blorp2 "$name" "${args[@]}"); then
+                    BENCH_FAILED=1
+                    blorp2_alloc_stats="allocation run FAILED"
+                fi
+            fi
+        else
+            BENCH_FAILED=1
+            printf "  %8s" "FAIL"
+        fi
+    else
+        printf "  %8s" "-"
     fi
 
     if has_bench c "$name"; then
@@ -660,7 +695,19 @@ run_one() {
         printf "   speedups suppressed (see benchmarks/AUDIT.md)"
     elif [ -n "$bt" ]; then
         local notes=""
-        [ -n "$blorp_alloc_stats" ] && notes="$blorp_alloc_stats"
+        [ -n "$blorp_alloc_stats" ] && notes="blorp: $blorp_alloc_stats"
+        if [ -n "$blorp2_alloc_stats" ]; then
+            [ -n "$notes" ] && notes="$notes, "
+            notes="${notes}blorp2: $blorp2_alloc_stats"
+        fi
+        if [ -n "$b2t" ]; then
+            [ -n "$notes" ] && notes="$notes, "
+            notes="${notes}blorp2/blorp time: $(fmt_speedup "$bt" "$b2t")"
+            case "$name" in
+                list_ops|compiler_emit) notes="$notes (provisional: current libraries)" ;;
+                compiler_ast|binary_trees) notes="$notes (provisional: representations differ)" ;;
+            esac
+        fi
         if [ -n "$ct" ]; then
             [ -n "$notes" ] && notes="$notes, "
             notes="${notes}vs C: $(fmt_speedup "$bt" "$ct")"
@@ -682,8 +729,6 @@ run_one() {
 
     echo ""
 }
-
-[ ! -f "$BLORP" ] && die "blorp binary not found. Run 'make' first."
 
 FILTER="${1:-all}"
 RUN_BENCHMARKS=""
@@ -707,6 +752,10 @@ echo "blorp Benchmark Suite"
 echo "====================="
 echo "Timing: in-process BENCH markers from language-specific runners"
 echo "blorp: $BLORP"
+echo "blorp2: $BLORP2_COMPILER"
+if [ "$BENCH_ALLOC_STATS" = "1" ]; then
+    echo "Allocation runs: blorp counts managed objects; blorp2 counts allocator calls; bytes are live at exit."
+fi
 echo "C:     $($CC --version 2>&1 | head -1)"
 has_cmd "$GO" && echo "Go:    $($GO version 2>&1 | sed 's/go version //')"
 has_cmd "$OCAMLOPT" && echo "OCaml: $($OCAMLOPT -version 2>&1 | sed 's/^/ /')"
@@ -718,6 +767,13 @@ else
     is_known_benchmark "$FILTER" && has_bench blorp "$FILTER" || die "unknown benchmark: $FILTER"
     RUN_BENCHMARKS="$FILTER"
 fi
+
+[ -x "$BLORP" ] || die "blorp binary not found. Run 'make' first."
+for name in $RUN_BENCHMARKS; do
+    if has_bench blorp2 "$name" && [ ! -x "$BLORP2_COMPILER" ]; then
+        die "BLORP2_COMPILER is not executable: $BLORP2_COMPILER; run 'make -C blorp_2 compiler' or set BLORP2_COMPILER"
+    fi
+done
 
 if contains_concurrency_benchmark $RUN_BENCHMARKS; then
     resolve_default_python_concurrency || true
@@ -731,8 +787,8 @@ echo ""
 build_compiled_benchmarks "$RUN_BENCHMARKS"
 echo ""
 
-printf "  %-18s  %10s  %10s  %10s  %10s  %10s\n" "Benchmark" "blorp" "C" "Go" "OCaml" "Python"
-printf "  %-18s  %10s  %10s  %10s  %10s  %10s\n" "---------" "-----" "-" "--" "-----" "------"
+printf "  %-18s  %10s  %10s  %10s  %10s  %10s  %10s\n" "Benchmark" "blorp" "blorp2" "C" "Go" "OCaml" "Python"
+printf "  %-18s  %10s  %10s  %10s  %10s  %10s  %10s\n" "---------" "-----" "------" "-" "--" "-----" "------"
 
 for name in $RUN_BENCHMARKS; do
     run_one "$name"

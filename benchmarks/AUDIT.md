@@ -2,6 +2,18 @@
 
 Last audited: 2026-05-26.
 
+Blorp 2 ports reviewed: 2026-10-22. Its `numeric_loop`, `fib`, and
+`binary_trees` ports preserve the existing algorithms, work counts and results.
+The tree and AST ports use counted record roots containing inline unions, with
+one allocation per logical node including leaves. These Blorp 2 columns are
+provisional because their recursive storage representation differs. The
+`list_ops` and `compiler_emit` Blorp 2 columns are provisional comparisons of
+current libraries: List append/update copies; filter/reverse/sort use temporary
+immutable algorithms; fold uses an explicit left-to-right loop; String emission
+has no capacity reservation and constructs fresh concatenations. These rows do
+not isolate code-generator overhead. Allocation observations also use different
+runtime accounting units and must not be interpreted as allocation ratios.
+
 This file tracks whether each public benchmark compares the same work across
 language implementations. A benchmark is apples-to-apples only when variants use
 the same input, same core algorithm, same work count, and no external native
