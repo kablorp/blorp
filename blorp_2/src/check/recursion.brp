@@ -13,7 +13,7 @@ import:
 		),
 		recursion_error,
 	./model:
-		AcceptedTraits, AcceptedMethodCall, method_body, method_receiver, method_identity, ImplementedBody(AuthoredMethod, TraitDefault),
+		BodyOwner(DeclaredBody, LambdaBody, DerivedEqualityBody), aggregate_owner, body_calls, AcceptedTraits, AcceptedMethodCall, method_body, method_receiver, method_identity, ImplementedBody(AuthoredMethod, TraitDefault, StructuralEquality),
 		CallTarget(TraitMethod, RuntimeFunction, UserFunction, CallableParameter, ValueCall),
 		CheckedArm,
 		CheckedBody(CheckedMatchBody, CheckedValueBody),
@@ -46,7 +46,10 @@ private pure func is_self_call(call: CheckedCall, current: FunctionId, traits: A
 	match call.target:
 		TraitMethod(method):
 			match method_body(traits, method):
-				Some(selected): IntOps.equals(function_number(selected.function), function_number(current))
+				Some(selected):
+					match selected.body:
+						DeclaredBody(function): IntOps.equals(function_number(function), function_number(current))
+						_: False
 				None: False
 		UserFunction(id, _):
 			IntOps.equals(function_number(id), function_number(current))
@@ -452,6 +455,14 @@ pure func validate_recursive_instantiation(
 		dependencies = append_call_dependencies(dependencies, lambda_calls(lambda), traits)
 		dependencies = append_creation_dependencies(dependencies, body_callable_creations(lambda.statements, lambda.body), traits)
 
+	for implementation in traits.implementations:
+		for member in implementation.methods:
+			match member.body:
+				StructuralEquality(_, template):
+					dependencies = append_call_dependencies(dependencies, body_calls([], template.body), traits)
+					dependencies = append_creation_dependencies(dependencies, body_callable_creations([], template.body), traits)
+				_: void
+
 	-- Keep the ordinary language's first growing-edge diagnostic unchanged.
 	-- New trait edges may contract a term and are checked by signed relaxation.
 	var growing: Option[ParameterDependency] = None
@@ -597,7 +608,10 @@ private pure func append_method_dependencies(previous: List[ParameterDependency]
 		Some(selected):
 			var position = 0
 			for argument in selected.arguments:
-				dependencies = append_dependencies(dependencies, argument, type_parameter_id(FunctionDeclaration(selected.function), position), 0, TraitDependency, span)
+				match selected.body:
+					DeclaredBody(function): dependencies = append_dependencies(dependencies, argument, type_parameter_id(FunctionDeclaration(function), position), 0, TraitDependency, span)
+					DerivedEqualityBody(aggregate): dependencies = append_dependencies(dependencies, argument, type_parameter_id(aggregate_owner(aggregate), position), 0, TraitDependency, span)
+					LambdaBody(_): void
 				position = IntOps.add(position, 1)
 		None:
 			-- Only a rigid Self has no selected head after Check accepted a call.
@@ -610,6 +624,11 @@ private pure func append_method_dependencies(previous: List[ParameterDependency]
 							AuthoredMethod(function):
 								for position in 0..implementation.parameter_bounds.length():
 									dependencies = append_dependencies(dependencies, method_receiver(method), type_parameter_id(FunctionDeclaration(function), position), -1, TraitDependency, span)
+							StructuralEquality(_, _): void
 							TraitDefault(function):
-								dependencies = append_dependencies(dependencies, method_receiver(method), type_parameter_id(FunctionDeclaration(function), 0), 0, TraitDependency, span)
+								-- A closed family's selected Self is its fixed ground head,
+								-- so no caller parameter flows into the default. `[[]]`
+								-- is a generic family and still keeps whole symbolic Self.
+								if implementation.parameter_bounds.is_empty().not():
+									dependencies = append_dependencies(dependencies, method_receiver(method), type_parameter_id(FunctionDeclaration(function), 0), 0, TraitDependency, span)
 	dependencies

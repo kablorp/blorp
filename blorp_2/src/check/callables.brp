@@ -7,7 +7,7 @@ import:
 	../utils/boolean: not, and
 	../namespace/builtins: DesignatedBoolean, DesignatedOption
 	./declarations: TypeScope
-	./traits: prove_trait
+	./traits: TraitAvailability, accepted_traits, prove_trait, equality_error
 	./errors:
 		CallError(ArgumentCountMismatch, ImpureCall, ImpureCallableCall, UnknownFunction),
 		CheckError,
@@ -152,7 +152,7 @@ fixed union SourceLoopScope:
 
 
 fixed record ResolutionContext {
-	traits: AcceptedTraits,
+	traits: TraitAvailability,
 	caller: Caller,
 	root_function: FunctionId,
 	module: ModuleId,
@@ -256,10 +256,10 @@ pure func classify_receiver(
 ) -> Result[ResolvedReceiver, CheckError]:
 	name = application.callee
 
-	method ?= visible_method(context.namespace, context.traits, context.signatures, context.module, name)
+	method ?= visible_method(context.namespace, accepted_traits(context.traits), context.signatures, context.module, name)
 	match method:
 		Some(id):
-			match method_contract(name, IntOps.add(application.arguments.length(), 1), ReceiverCall, id, context.traits):
+			match method_contract(name, IntOps.add(application.arguments.length(), 1), ReceiverCall, id, accepted_traits(context.traits)):
 				Ok(contract): Ok(UniqueReceiver(contract))
 				Err(error): Err(error)
 		None: classify_function_receiver(application, context)
@@ -330,14 +330,18 @@ pure func method_contract(name: WrittenName, count: Int, notation: CallNotation,
 
 -- The receiver is already solved by ordinary equations. Implementation search
 -- proves the obligation; it never supplies missing inference evidence.
-pure func accept_method_call(traits: AcceptedTraits, method: TraitMethodId, receiver: TypeRef, assumptions: List[TraitRequirement], span: Span) -> Result[AcceptedMethodCall, CheckError]:
+pure func accept_method_call(traits: TraitAvailability, method: TraitMethodId, receiver: TypeRef, assumptions: List[TraitRequirement], span: Span) -> Result[AcceptedMethodCall, CheckError]:
 	accepted = accepted_method(method, receiver)
 	available: Void ?= match receiver:
 		ParameterType(_): Ok(void)
 		_:
-			match method_body(traits, accepted):
+			match method_body(accepted_traits(traits), accepted):
 				Some(_): Ok(void)
-				None: Err(trait_error(span, MissingImplementation(method, receiver)))
+				None:
+					rejection: CheckError = match equality_error(traits, trait_method_owner(method), receiver, span):
+						Some(error): error
+						None: trait_error(span, MissingImplementation(method, receiver))
+					Err(rejection)
 	justified ?= prove_trait(traits, trait_method_owner(method), receiver, assumptions, span)
 	Ok(accepted)
 
@@ -353,10 +357,13 @@ private fixed record MethodBinding {
 pure func provider_owns_method(traits: AcceptedTraits, edge: MethodImport, method: TraitMethodId) -> Bool:
 	var owns: Bool = False
 	for implementation in traits.implementations:
-		if same_module(implementation.module, edge.target):
-			member = implementation.methods.any(pure func(member): same_trait_method(member.method, method))
-			if and(same_head(implementation.receiver_head, edge.receiver), member):
-				owns = True
+		match implementation.method_provider:
+			None: void
+			Some(provider):
+				if same_module(provider, edge.target):
+					member = implementation.methods.any(pure func(member): same_trait_method(member.method, method))
+					if and(same_head(implementation.receiver_head, edge.receiver), member):
+						owns = True
 	owns
 
 

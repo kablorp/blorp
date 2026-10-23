@@ -37,9 +37,11 @@ convenience does not remove currently supported input features.
 
 Concrete, authored traits are supported as described in [concrete traits](#concrete-traits).
 Function bounds, full generic receiver families, default methods and contextual
-method references extend that surface. The [Equatable-first trait plan](TRAITS_PLAN.md)
-owns remaining automatic record/union equality and library migration, together
-with phase boundaries and acceptance gates.
+method references extend that surface. Automatic equality for nongeneric named
+records and unions is complete; its [qualification report](../benchmarks/results/blorp2-derived-equality-2026-10-23.md)
+records proof and costs. The [Equatable-first trait plan](TRAITS_PLAN.md) owns
+remaining generic automatic equality and library migration, together with phase
+boundaries and acceptance gates.
 
 The [incremental layout migration](LAYOUT_MIGRATION.md) defines the proposed
 physical-layout model, staged replacements, code examples and cost gates.
@@ -90,7 +92,7 @@ use the same family. Trait declarations also introduce their families, while
 implementation bodies are never independent free-function offers. Multiple
 routes to one family coalesce; different families or a free function with the
 same name need an alias or renamed declaration. A type's `methods_only` route
-requires the provider to own an implementation for that receiver head.
+requires the provider to own a written implementation for that receiver head.
 
 Function type parameters declare their required traits with `:` and combine
 bounds with `+`. Each generic body is checked once against those declarations;
@@ -135,7 +137,7 @@ explicit temporary limits; ordinary deeply nested field dispatch must be
 closed before the structural-equality milestone can complete.
 
 Traits remain parameterless, with no independently generic methods, impure
-requirements, top-level callable formals or automatic derives. Record/union
+requirements or top-level callable formals. Record/union
 declaration bounds remain deferred. Traits are separate from value types, and
 `Self[Int]` cannot apply scoped `Self`; qualified module type names retain their
 normal meaning. Check validates contracts and bound obligations once, then
@@ -148,6 +150,53 @@ The [concrete fixture](test/e2e/trait_inputs/concrete/main.brp) supplies its own
 an explicit `--library-root`. The production library continues to use its
 existing concrete APIs until the later library migration. Compiler source
 continues to obey the separately pinned [bootstrap subset](AGENTS.md).
+
+## Automatic equality for nongeneric aggregates
+
+With the designated foundation's canonical `Equatable`, a nongeneric named
+record or union supports equality when every actual field or payload supports
+it. Both fixed spellings use the same rule. No annotation or implementation
+block is needed. The method family must still be visible through ordinary
+imports. Automatic capability does not publish operation names: importing an
+automatically supported type, including Bool through the prelude, does not
+implicitly import `equals`
+or its defaults. A written implementation may offer the family through the
+ordinary type/methods_only route. An unrelated trait spelled `Equatable` does
+not enable automatic equality.
+
+```blorp
+fixed record Point { x: Int, y: Int }
+fixed union Reply:
+    Empty
+    Value(Point)
+```
+
+Record fields compare in declaration order and stop at the first False. Union
+tags must agree before payloads compare in order; a payloadless matching case
+returns True. Logical Void fields and payloads still call their written equality
+implementation even when their storage is erased. NaN remains unequal to itself;
+there is no same-object or pointer shortcut. Empty record and union declarations
+remain outside the accepted grammar.
+
+Written implementations replace automatic equality for their whole receiver
+head. An enclosing aggregate calls the selected written implementation, including
+its declared conditions; failed conditions never fall back to structural equality.
+Ground fields may therefore use ordinary conditional families such as
+`Custom[Int]` requiring `Int: Visit`, without inventing an Equatable requirement
+for an unused type argument. Recursive nongeneric Tree/List and mutual aggregate
+dependencies close only after all outgoing member requirements succeed.
+
+An unused declaration with a callback or otherwise unsupported member remains
+legal. Equality use reports the actual unsupported field or payload annotation.
+Generic aggregate heads, including phantom heads, require a written full-family
+implementation for now; their automatic equality is the open T4b increment.
+Tuples, opaque types and callable values receive no automatic implementation.
+A foundation without canonical Equatable creates no automatic equality bodies.
+
+Derived methods use ordinary direct calls, defaults and contextual callable
+references through the existing specialization graph. Only reachable bodies
+emit code; no trait representation reaches lower phases. The production target
+library retains its existing APIs until T5 qualifies and pins a capable seed.
 
 ## First example
 

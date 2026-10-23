@@ -98,8 +98,11 @@ an expected callable contract determining `Self`; stored, returned and callback
 values obey ordinary purity and ownership. Generic bodies use only declared
 bounds. The conservative finite-dispatch proof can reject finite wrapped relays
 and deeply nested generic fields; see the linked pilot rules for these temporary
-limits. Automatic derives, trait parameters, independently generic methods and
-top-level callable trait formals remain deferred. The production pilot library
+limits. Nongeneric named records and unions now support canonical automatic
+equality from their actual fields and payloads, with authored implementations
+winning. Generic automatic equality, trait parameters, independently generic
+methods and top-level callable trait formals remain deferred. See the linked
+pilot rules for use-site diagnostics and recursive eligibility. The production pilot library
 and compiler-source bootstrap subset do not acquire trait syntax from this input
 surface.
 

@@ -1,0 +1,194 @@
+---
+Ordinary checked equality templates for supported nongeneric aggregates. Eligibility
+belongs to traits; this module receives its accepted canonical method contract.
+---
+import:
+	./model as Checked
+	./declarations: Substitution, substitute_type
+	./errors: CheckError, checker_invariant, CheckerInvariant(InvalidFunctionContract)
+	../namespace/builtins: DesignatedBoolean
+	../utils/ids: VariantId, variant_owner, trait_method_owner, record_number, union_number
+	../utils/syntax: Span
+	int as IntOps
+
+
+private pure func boolean_value(value: Bool, boolean: DesignatedBoolean[VariantId], span: Span) -> Checked.CheckedExpr:
+	variant = match value:
+		True: boolean.true_variant
+		False: boolean.false_variant
+	{ form = Checked.ConstructVariant(variant, []), value_type = Checked.UnionType(variant_owner(variant)), span = span }
+
+
+-- Both successors precede the test. Only the successful comparison evaluates
+-- the remaining fields, retaining normal checked join/control-flow semantics.
+private pure func and_then(comparison: Checked.CheckedExpr, following: Checked.CheckedExpr, boolean: DesignatedBoolean[VariantId]) -> Checked.CheckedExpr:
+	span = comparison.span
+	false_arm = Checked.match_arm_id(0)
+	true_arm = Checked.match_arm_id(1)
+	place: Checked.CheckedPatternPlace = { route = Checked.MatchRoot, value_type = comparison.value_type }
+	{
+		form = Checked.Match({
+			scrutinee = comparison,
+			selection = {
+				nodes = [Checked.EnterArm(false_arm, []), Checked.EnterArm(true_arm, []), Checked.TestVariant(place, boolean.true_variant, Checked.decision_node_id(1), Checked.decision_node_id(0))],
+				entry = Checked.decision_node_id(2)
+			},
+			arms = [
+				{ id = false_arm, inputs = [], statements = [], value = boolean_value(False, boolean, span) },
+				{ id = true_arm, inputs = [], statements = [], value = following }
+			],
+			carried = []
+		}),
+		value_type = following.value_type,
+		span = span
+	}
+
+
+private pure func read_parameter(position: Int, value_type: Checked.TypeRef, span: Span) -> Checked.CheckedExpr:
+	{ form = Checked.ReadBinding(Checked.binding_id(position)), value_type = value_type, span = span }
+
+
+private pure func compare(left: Checked.CheckedExpr, right: Checked.CheckedExpr, method: Checked.AcceptedTraitMethod) -> Checked.CheckedExpr:
+	{
+		form = Checked.InvokeFunction({
+			target = Checked.TraitMethod(Checked.accepted_method(method.id, left.value_type)),
+			operands = [Checked.ValueOperand(left), Checked.ValueOperand(right)],
+			span = left.span
+		}),
+		value_type = method.signature.return_type.value_type,
+		span = left.span
+	}
+
+
+private pure func record_value(record_row: Checked.CheckedRecord, method: Checked.AcceptedTraitMethod, boolean: DesignatedBoolean[VariantId], span: Span) -> Checked.CheckedExpr:
+	var result = boolean_value(True, boolean, span)
+	var remaining = record_row.fields.length()
+	while IntOps.greater_than(remaining, 0):
+		remaining = IntOps.subtract(remaining, 1)
+		match record_row.fields.get(remaining):
+			Some(field):
+				left: Checked.CheckedExpr = { form = Checked.ReadRecordField(read_parameter(0, Checked.RecordType(record_row.id), span), field.id), value_type = field.value_type.value_type, span = field.value_type.span }
+				right: Checked.CheckedExpr = { form = Checked.ReadRecordField(read_parameter(1, Checked.RecordType(record_row.id), span), field.id), value_type = field.value_type.value_type, span = field.value_type.span }
+				result = and_then(compare(left, right, method), result, boolean)
+			None: void
+	result
+
+
+private pure func parameter_binding(position: Int, value_type: Checked.TypeRef, span: Span) -> Checked.BindingDefinition:
+	{ origin = Checked.ParameterBinding(position), mutability = Checked.Immutable, value_type = value_type, span = span }
+
+
+private pure func union_template(union_row: Checked.CheckedUnion, signature: Checked.FunctionSignature, method: Checked.AcceptedTraitMethod, boolean: DesignatedBoolean[VariantId], span: Span) -> Checked.CheckedEqualityBody:
+	value_type = Checked.UnionType(union_row.id)
+	root: Checked.CheckedPatternPlace = { route = Checked.MatchRoot, value_type = value_type }
+	var bindings = [parameter_binding(0, value_type, span), parameter_binding(1, value_type, span)]
+	var arms: List[Checked.CheckedJoinArm] = []
+	var nodes: List[Checked.CheckedDecisionNode] = []
+	for variant in union_row.variants:
+		var left_inputs: List[Checked.BindingId] = []
+		var right_inputs: List[Checked.BindingId] = []
+		var arguments: List[Checked.CheckedPatternArgument] = []
+		var position = 0
+		for field in variant.fields:
+			left_inputs = left_inputs.append(Checked.binding_id(bindings.length()))
+			bindings = bindings.append({ origin = Checked.MatchCapture, mutability = Checked.Immutable, value_type = field.value_type, span = field.span })
+			right_inputs = right_inputs.append(Checked.binding_id(bindings.length()))
+			bindings = bindings.append({ origin = Checked.MatchCapture, mutability = Checked.Immutable, value_type = field.value_type, span = field.span })
+			arguments = arguments.append(Checked.BorrowPlace({ route = Checked.UnionField(root, variant.id, position), value_type = field.value_type }))
+			position = IntOps.add(position, 1)
+		var equal_value = boolean_value(True, boolean, span)
+		while IntOps.greater_than(position, 0):
+			position = IntOps.subtract(position, 1)
+			match variant.fields.get(position):
+				Some(field):
+					match left_inputs.get(position):
+						Some(left):
+							match right_inputs.get(position):
+								Some(right):
+									left_value: Checked.CheckedExpr = { form = Checked.ReadBinding(left), value_type = field.value_type, span = field.span }
+									right_value: Checked.CheckedExpr = { form = Checked.ReadBinding(right), value_type = field.value_type, span = field.span }
+									equal_value = and_then(compare(left_value, right_value, method), equal_value, boolean)
+								None: void
+						None: void
+				None: void
+		mismatch = Checked.match_arm_id(0)
+		singleton = IntOps.equals(union_row.variants.length(), 1)
+		matched_position = if singleton:
+			0
+		else:
+			1
+		matched = Checked.match_arm_id(matched_position)
+		-- A singleton domain has no mismatching tag. Retain only its success
+		-- arm, as ordinary exhaustive pattern compilation does.
+		right_selection: Checked.CheckedSelection = if singleton:
+			{ nodes = [Checked.EnterArm(matched, arguments)], entry = Checked.decision_node_id(0) }
+		else:
+			{
+				nodes = [Checked.EnterArm(mismatch, []), Checked.EnterArm(matched, arguments), Checked.TestVariant(root, variant.id, Checked.decision_node_id(1), Checked.decision_node_id(0))],
+				entry = Checked.decision_node_id(2)
+			}
+		right_arms: List[Checked.CheckedJoinArm] = if singleton:
+			[{ id = matched, inputs = right_inputs, statements = [], value = equal_value }]
+		else:
+			[
+				{ id = mismatch, inputs = [], statements = [], value = boolean_value(False, boolean, span) },
+				{ id = matched, inputs = right_inputs, statements = [], value = equal_value }
+			]
+		right_match: Checked.CheckedExpr = {
+			form = Checked.Match({
+				scrutinee = read_parameter(1, value_type, span),
+				selection = right_selection, arms = right_arms, carried = []
+			}),
+			value_type = signature.return_type.value_type,
+			span = span
+		}
+		arm = Checked.match_arm_id(arms.length())
+		arms = arms.append({ id = arm, inputs = left_inputs, statements = [], value = right_match })
+		nodes = nodes.append(Checked.EnterArm(arm, arguments))
+	-- The last tag is the exhaustive fallback; each earlier test has one
+	-- success arm and the previous fallback. This is linear in variant count.
+	var entry = Checked.decision_node_id(IntOps.subtract(nodes.length(), 1))
+	var remaining = IntOps.subtract(union_row.variants.length(), 1)
+	while IntOps.greater_than(remaining, 0):
+		remaining = IntOps.subtract(remaining, 1)
+		match union_row.variants.get(remaining):
+			Some(variant):
+				nodes = nodes.append(Checked.TestVariant(root, variant.id, Checked.decision_node_id(remaining), entry))
+				entry = Checked.decision_node_id(IntOps.subtract(nodes.length(), 1))
+			None: void
+	{
+		signature = signature, bindings = bindings,
+		body = Checked.CheckedValueBody(Checked.ReturnExpression({
+			form = Checked.Match({ scrutinee = read_parameter(0, value_type, span), selection = { nodes = nodes, entry = entry }, arms = arms, carried = [] }),
+			value_type = signature.return_type.value_type, span = span
+		}))
+	}
+
+
+-- The canonical contract is already accepted. Substitute its genuine Self
+-- once; no parsed header, spelling or new implicit parameter domain is needed.
+pure func equality_template(aggregate: Checked.AggregateId, records: List[Checked.CheckedRecord], unions: List[Checked.CheckedUnion], method: Checked.AcceptedTraitMethod, boolean: DesignatedBoolean[VariantId], span: Span) -> Result[Checked.CheckedEqualityBody, CheckError]:
+	receiver = match aggregate:
+		Checked.RecordAggregate(record_row): Checked.RecordType(record_row)
+		Checked.UnionAggregate(union_row): Checked.UnionType(union_row)
+	substitution: Substitution = { owner = Checked.TraitDeclaration(trait_method_owner(method.id)), values = [receiver] }
+	var parameters: List[Checked.TypeUse] = []
+	var failure: Option[CheckError] = None
+	for parameter in method.signature.parameters:
+		match substitute_type(parameter.value_type, substitution, parameter.span):
+			Ok(value): parameters = parameters.append({ value_type = value, span = parameter.span })
+			Err(error): failure = Some(error)
+	ready: Void ?= match failure:
+		Some(error): Err(error)
+		None: Ok(void)
+	result ?= substitute_type(method.signature.return_type.value_type, substitution, span)
+	signature: Checked.FunctionSignature = { type_parameters = [], requirements = [], purity = method.signature.purity, parameters = parameters, return_type = { value_type = result, span = span } }
+	match aggregate:
+		Checked.RecordAggregate(record_row):
+			match records.get(record_number(record_row)):
+				Some(row): Ok({ signature = signature, bindings = [parameter_binding(0, receiver, span), parameter_binding(1, receiver, span)], body = Checked.CheckedValueBody(Checked.ReturnExpression(record_value(row, method, boolean, span))) })
+				None: Err(checker_invariant(span, InvalidFunctionContract))
+		Checked.UnionAggregate(union_row):
+			match unions.get(union_number(union_row)):
+				Some(row): Ok(union_template(row, signature, method, boolean, span))
+				None: Err(checker_invariant(span, InvalidFunctionContract))

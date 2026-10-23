@@ -1,8 +1,9 @@
 # Static traits, starting with Equatable
 
-Status: T0 inference, T1 concrete traits, T2 semantic instance identity and
-T3 bounds/defaults/contextual method references are complete. T4 automatic
-structural equality and T5 production-library rollout remain open. Original
+Status: T0 inference, T1 concrete traits, T2 semantic instance identity,
+T3 bounds/defaults/contextual method references and T4a nongeneric automatic
+equality are complete. T4b generic automatic equality and T5 production-library
+rollout remain open. Original
 measurement baseline: `02b13d25d04b7c5670cb94052ea9675cc9ba3428`.
 The accepted trait surface and explicit conservative finite-dispatch limits
 are defined in README/grammar. Code marked **model sketch** describes compiler
@@ -347,8 +348,9 @@ validates members, receiver types and ownership; this introduces no dependency
 from Namespace to Check. Coalescing an imported and declared family must retain
 the declared offer authority.
 
-For Type methods_only, the provider must have an accepted own implementation
-for that receiver head. Expose its family across Self after admission; merely
+For Type methods_only, the provider must have an accepted authored implementation
+for that receiver head. Its genuine written module is the method provider; an
+automatic structural implementation supplies capability without publishing names. Expose its family across Self after admission; merely
 importing Int into a provider must not expose an unrelated Foo implementation.
 
 **Source: importing an implementation's method does not restrict Self to Int.**
@@ -398,6 +400,20 @@ distinct function bodies and callable choices. The completed T2 report above
 records collision/reuse coverage, instance/C growth and matched compiler costs.
 
 ## 4. Automatic equality as ordinary checked code
+
+T4a implements this contract for nongeneric named records and unions. Its
+[qualification report](../benchmarks/results/blorp2-derived-equality-2026-10-23.md)
+records its accepted scope, proof and costs. README owns the current semantics. Generic heads,
+including Phantom[T], are explicitly deferred at equality use; their ordinary
+construction remains legal. The generic examples and requirements below are
+T4b acceptance obligations, not claims of current support.
+
+T4a prepares conditional availability before checking bodies, closes recursive
+candidates provisionally, and generates each supported ground template once.
+Unavailable candidates remain checker-local use-site causes; the final checked
+program retains only the accepted implementation authority. Eager preparation
+of valid unused templates does not make their bodies reachable for emission.
+
 
 Requirements come from actual fields and variant payloads, with declared
 function/receiver assumptions respected. They do not come from every formal
@@ -581,7 +597,8 @@ implements Equatable for List[Element: Equatable]:
 -- Option cases are handled without panics; inputs are evaluated once.
 ```
 
-Option/Result/Bool are ordinary unions and use the same derivation rule.
+Nongeneric Bool uses the same derivation rule. Generic Option/Result automatic
+equality remains a T4b obligation; written families may be used today.
 String/Int/Float keep their existing primitive semantics. Float NaN remains
 unequal to itself; this work adds no stronger reflexivity guarantee.
 
@@ -609,14 +626,14 @@ framework. References were checked on 2026-10-22.
 - **Swift: memberwise synthesis.** Stored properties and enum payloads determine
   eligibility; user implementations replace synthesized equality. Swift's
   synthesis generally requires explicit conformance. Blorp deliberately needs
-  no opt-in declaration and derives only on demand, so its recursive eligibility
+  no opt-in declaration and reports unavailable equality only on use, so recursive eligibility
   cannot merely assume that another type opted in.
   [SE-0185, implemented design](https://github.com/swiftlang/swift-evolution/blob/main/proposals/0185-synthesize-equatable-hashable.md).
 - **Haskell: derived requirements and recursion.** The report defines derived
   constraints from constituent types and describes fixed-point calculation for
   mutual recursion; comparisons proceed left to right. This supports the
   phantom-parameter and complete-dependency rules above. Blorp's generation is
-  demand-driven, needs no deriving clause and emits ordinary specialized calls.
+  implicit, needs no deriving clause and emits only reachable specialized calls.
   [Derived instances, sections 10–10.1](https://www.haskell.org/onlinereport/derived.html).
 - **Rust: PartialEq is the relevant equality comparison.** Its structure/enum
   behavior, required equality/default inequality and Float NaN distinction are
@@ -629,16 +646,15 @@ framework. References were checked on 2026-10-22.
 
 No parse-only scaffolding milestone lands by itself. Each milestone includes
 its complete producer/consumer path, exact diagnostics, reference/EBNF updates,
-two independent reviews and one coherent commit. T0 through T3 are complete.
+two independent reviews and one coherent commit. T0 through T4a are complete.
 The table contains only open milestones.
 
-Start each remaining milestone with its red oracle. T4 starts with a derived
-container whose nested authored equality intentionally differs from fieldwise
-comparison. Do not remove old negative coverage merely to turn a suite green.
+Start each remaining milestone with its red oracle. Do not remove old negative
+coverage merely to turn a suite green.
 
 | Milestone | Deliverable and changed boundary | Completion oracle |
 | --- | --- | --- |
-| T4: structural equality | Ordinary derived record/union templates, dependency closure, ordinary List prerequisite in isolated fixture library | Recursive/custom/phantom/invalid-field cases below pass; no trait-specific concrete/lower products |
+| T4b: generic equality | Actual-member conditional requirements and sound deep generic-field admission | Phantom/custom conditional bounds and deeply composed generic fields pass without changing on-use errors |
 | T5: production library rollout | Qualify/publish/pin capable seed, then migrate target library APIs | Clean bootstrap/fixpoint and all component/native/platform gates pass without legacy building Blorp 2 |
 
 The accepted canonical equals-only declaration validates the exact pure
@@ -747,12 +763,15 @@ milestone with tests/library/docs separately. This is a complexity guard,
 not a target; never compress formatting or delete coverage to meet it.
 Required test growth is reviewed for value rather than forced into that cap.
 
-Current cumulative production growth is +2,158 net lines. T3 accepted a bounded
+At T3, cumulative production growth was +2,158 net lines. T3 accepted a bounded
 +2,200 envelope after investigation, recording the 158-line variance against the
 original +2,000 envelope. Its matched cumulative allocation growth is +0.646%
 and normal retired-instruction growth +0.331%, within the unchanged +5% ceilings.
-T4 needs a prospective reviewed complexity envelope before implementation; do
-not compress formatting or remove coverage to conceal growth.
+T4a has a reviewed +500 net production investigation trigger and +750 ceiling
+(cumulative +2,908), retaining the unchanged +5% measured ceilings. Current
+production growth is +591 for this slice (+2,749 cumulative). T4b needs a separate prospective
+architecture and complexity review; do not compress formatting or remove
+coverage to conceal growth.
 
 Freeze baseline sources/library, CWD/output pathname, environment, seed,
 normal/diagnostic binaries and C toolchain. Use one strict original/candidate

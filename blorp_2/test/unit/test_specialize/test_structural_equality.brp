@@ -1,0 +1,120 @@
+import:
+	../../../src/check/check: check
+	../../../src/check/model as Model
+	../../../src/specialize/specialize as Concrete
+	../../../src/utils/syntax: entry_function
+	../test_check/test_structural_equality: parse_nested_custom_fixture, closed_default_fixture
+	test: TestSuite
+
+
+private pure func projected_formal(value: Concrete.ConcreteExpr, expected: Concrete.RecordInstanceId, position: Int) -> Bool:
+	match value.form:
+		Concrete.ReadRecordField(base, field):
+			match base.form:
+				Concrete.ReadBinding(binding): Model.binding_number(binding) == position and Concrete.record_number(Concrete.field_owner(field)) == Concrete.record_number(expected) and Concrete.field_number(field) == 0
+				_: False
+		_: False
+
+
+private pure func nested_authored_false(contents: Concrete.SpecializedContents, equality: Concrete.FunctionInstanceId) -> Bool:
+	match contents.functions.get(Concrete.function_number(equality)):
+		None: False
+		Some(derived):
+			match (derived.signature.parameters, derived.body):
+				([Concrete.RecordType(left_type), Concrete.RecordType(right_type)], Concrete.ConcreteValueBody(Concrete.ReturnExpression(result))):
+					match result.form:
+						Concrete.Match(join):
+							match join.scrutinee.form:
+								Concrete.InvokeFunction(call, [left, right]):
+									match call.target:
+										Concrete.UserFunction(authored):
+											match contents.functions.get(Concrete.function_number(authored)):
+												None: False
+												Some(body):
+													match body.body:
+														Concrete.ConcreteValueBody(Concrete.ReturnExpression(answer)):
+															match answer.form:
+																Concrete.ConstructVariant(false_variant, []):
+																	-- False is the second logical case in TestFoundation.
+																	Concrete.variant_number(false_variant) == 1 and Concrete.record_number(left_type) == Concrete.record_number(right_type) and projected_formal(left, left_type, 0) and projected_formal(right, right_type, 1)
+																_: False
+														_: False
+										_: False
+								_: False
+						_: False
+				_: False
+
+
+private pure func repeated_requests(count: Int) -> Bool:
+	var source: String = "import:\n    int: equals, envelope\nfunc main() -> Int:\n"
+	for position in 0..count:
+		source = source + "    result".append_int(position) + " = equals(envelope(7), envelope(7))\n"
+	source = source + "    0\n"
+	match parse_nested_custom_fixture(source):
+		Err(_): False
+		Ok(parsed):
+			match check(parsed):
+				Err(_): False
+				Ok(checked):
+					match Concrete.specialize(checked):
+						Err(_): False
+						Ok(program):
+							contents = Concrete.specialized_contents(program)
+							match contents.functions.get(Concrete.function_number(entry_function(contents.entrypoint))):
+								None: False
+								Some(main):
+									var selected: Option[Concrete.FunctionInstanceId] = None
+									var valid: Bool = main.statements.length() == count and contents.functions.length() == 4 and contents.records.length() == 2
+									for statement in main.statements:
+										match statement:
+											Concrete.InitializeBinding(_, value):
+												match value.form:
+													Concrete.InvokeFunction(call, [_, _]):
+														match call.target:
+															Concrete.UserFunction(target):
+																match selected:
+																	None: selected = Some(target)
+																	Some(previous): valid = valid and Concrete.function_number(previous) == Concrete.function_number(target)
+															_: valid = False
+													_: valid = False
+											_: valid = False
+									match selected:
+										Some(target): valid and nested_authored_false(contents, target)
+										None: False
+
+
+pure func test_one_derived_request_reaches_the_nested_authored_false_body() -> Bool:
+	repeated_requests(1)
+
+
+pure func test_sixteen_identical_semantic_receivers_reuse_one_derived_request() -> Bool:
+	repeated_requests(16)
+
+
+pure func test_sixty_four_identical_semantic_receivers_reuse_one_derived_request() -> Bool:
+	repeated_requests(64)
+
+
+pure func test_closed_default_projection_has_finitely_many_ordinary_requests() -> Bool:
+	-- This program repeats at runtime. It is a finite specialization-key oracle,
+	-- never a native termination fixture.
+	match closed_default_fixture():
+		Err(_): False
+		Ok(parsed):
+			match check(parsed):
+				Err(_): False
+				Ok(checked):
+					match Concrete.specialize(checked):
+						Err(_): False
+						Ok(program): Concrete.specialized_contents(program).functions.length() == 6
+
+
+tests: TestSuite = {
+	description = "Blorp 2 derived equality uses ordinary semantic requests",
+	tests = [
+		("derived request calls nested authored False", test_one_derived_request_reaches_the_nested_authored_false_body),
+		("sixteen equal receivers reuse derived request", test_sixteen_identical_semantic_receivers_reuse_one_derived_request),
+		("sixty-four equal receivers reuse derived request", test_sixty_four_identical_semantic_receivers_reuse_one_derived_request),
+		("closed default projection has finite ordinary requests", test_closed_default_projection_has_finitely_many_ordinary_requests),
+	]
+}

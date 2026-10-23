@@ -1,0 +1,176 @@
+import:
+	../../../src/check/check: check, check_errors, checked_functions
+	../../../src/check/model as Model
+	../../../src/check/errors: CheckErrorKind(CallRejection), CallError(UnknownFunction)
+	../../../src/check/render: render_failure
+	../../../src/parse/assemble: ParsedProgram, parsed_contents
+	../../../src/utils/ids: inventory_traits, trait_method_header
+	../../../src/utils/source: module_source, root_module_id, same_source, module_id, compiler_source
+	../../../src/utils/syntax: Diagnostic, diagnostic, same_span
+	../../../src/utils/names: same_name
+	./test_traits: parse_trait_fixture, parse_trait_fixture_from
+	test: TestSuite
+
+
+private REQUIREMENT: String =
+	|trait Equatable:
+	|    pure func equals(left: Self, right: Self) -> Bool
+	|    pure func not_equals(left: Self, right: Self) -> Bool:
+	|        match equals(left, right):
+	|            True: False
+	|            False: True
+	|
+
+private PROVIDER: String =
+	|import:
+	|    _base: Int, Bool, Equatable
+	|fixed record Point { value: Int }
+	|implements Equatable for Int:
+	|    pure func equals(left: Self, right: Self) -> Bool:
+	|        builtin("int.equals")
+	|pure func point() -> Point:
+	|    { value = 7 }
+	|
+
+
+-- The chosen method is read from the real canonical declaration. A missing
+-- source name must not be confused with an unsatisfied receiver capability.
+private func operation_is_not_imported(imports: String, receiver: String, operation: String, member: Int, parse: pure (String) -> Result[ParsedProgram, Diagnostic]) -> Bool:
+	prefix = imports + "pure func compare(value: " + receiver + ") -> Bool:\n    "
+	direct = prefix + operation + "(value, value)\nfunc main() -> Int:\n    0\n"
+	receiver_prefix = prefix + "value."
+	receiver_call_source = receiver_prefix + operation + "(value)\nfunc main() -> Int:\n    0\n"
+	direct_missing = operation_rejected(parse(direct), prefix, operation, member)
+	receiver_missing = operation_rejected(parse(receiver_call_source), receiver_prefix, operation, member)
+	direct_missing and receiver_missing
+
+
+private func operation_rejected(program: Result[ParsedProgram, Diagnostic], prefix: String, operation: String, member: Int) -> Bool:
+	match program:
+		Err(error):
+			print("parse setup: " + error.message)
+			False
+		Ok(parsed):
+			match check(parsed):
+				Ok(_):
+					print("unexpected accepted unimported operation " + operation)
+					False
+				Err(failure):
+					error = check_errors(failure).first
+					diagnostic = render_failure(failure).first
+					match (inventory_traits(parsed_contents(parsed).declarations), error.kind):
+						([canonical], CallRejection(UnknownFunction(name))):
+							match canonical.methods.get(member):
+								Some(method):
+									match trait_method_header(method, parsed_contents(parsed).declarations):
+										Some(header):
+											(
+												same_name(name, header.function_name.id)
+												and same_source(error.span.source, module_source(root_module_id()))
+												and error.span.start == prefix.length() and error.span.end == prefix.length() + operation.length()
+												and same_span(error.span, diagnostic.span) and check_errors(failure).remaining.is_empty()
+												and diagnostic.message == "unknown function"
+												and diagnostic.help == "declare the function locally or import it by name; type selections enable receiver calls only"
+												and diagnostic.note.is_none()
+											)
+										None: False
+								None: False
+						_:
+							print("unexpected rejection: " + diagnostic.message + " | " + diagnostic.help)
+							False
+
+
+-- A published family also reserves its name during coherence checking. Merely
+-- receiving an automatically equatable type must not reserve ordinary functions.
+private func local_operations_remain_legal(imports: String, receiver: String, parse: pure (String) -> Result[ParsedProgram, Diagnostic]) -> Bool:
+	source = imports + "pure func equals(left: " + receiver + ", right: " + receiver + ") -> Bool:\n    True\npure func not_equals(left: " + receiver + ", right: " + receiver + ") -> Bool:\n    False\nfunc main() -> Int:\n    0\n"
+	match parse(source):
+		Err(error):
+			print("parse setup: " + error.message)
+			False
+		Ok(parsed):
+			match check(parsed):
+				Ok(_): True
+				Err(failure):
+					diagnostic = render_failure(failure).first
+					print("unexpected local-operation conflict: " + diagnostic.message + " | " + diagnostic.help)
+					False
+
+
+private pure func parse_provider_fixture(source: String) -> Result[ParsedProgram, Diagnostic]:
+	parse_trait_fixture(source, PROVIDER, REQUIREMENT)
+
+
+private pure func parse_foundation_point_with_prelude(source: String, prelude: String) -> Result[ParsedProgram, Diagnostic]:
+	match module_id(2):
+		Some(base): parse_trait_fixture_from(source, PROVIDER, REQUIREMENT + "fixed record Point { value: Int }\n", base, prelude)
+		None: Err(diagnostic({ source = compiler_source(), start = 0, end = 0 }, "invalid fixture base", "use the existing four-module fixture"))
+
+
+private pure func parse_foundation_point(source: String) -> Result[ParsedProgram, Diagnostic]:
+	parse_foundation_point_with_prelude(source, "import:\n    _base: Int, Bool(True, False)\n")
+
+
+private pure func parse_inherited_foundation_point(source: String) -> Result[ParsedProgram, Diagnostic]:
+	parse_foundation_point_with_prelude(source, "import:\n    _base: Int, Bool(True, False), Point\n")
+
+
+private func publication_policy_holds(imports: String, receiver: String, parse: pure (String) -> Result[ParsedProgram, Diagnostic]) -> Bool:
+	equality_absent = operation_is_not_imported(imports, receiver, "equals", 0, parse)
+	default_absent = operation_is_not_imported(imports, receiver, "not_equals", 1, parse)
+	local_legal = local_operations_remain_legal(imports, receiver, parse)
+	equality_absent and default_absent and local_legal
+
+
+func test_a_bool_type_import_does_not_publish_derived_operation_names() -> Bool:
+	-- Bool arrives through the ordinary foundation prelude type import.
+	publication_policy_holds("import:\n    int: point\n", "Bool", parse_provider_fixture)
+
+
+func test_a_record_type_import_does_not_publish_derived_operation_names() -> Bool:
+	-- The configured foundation actually offers canonical equals. Its Point
+	-- capability must still not turn a type or methods_only import into an offer.
+	type_only = publication_policy_holds("import:\n    _base: Point\n", "Point", parse_foundation_point)
+	methods_only = publication_policy_holds("import:\n    _base: Point methods_only\n", "Point", parse_inherited_foundation_point)
+	type_only and methods_only
+
+
+func test_an_explicit_family_supports_derived_direct_default_and_callable_paths() -> Bool:
+	source: String =
+		|import:
+		|    int: Point, point, equals, not_equals
+		|func main() -> Int:
+		|    value = point()
+		|    direct = equals(value, value)
+		|    different = not_equals(value, value)
+		|    receiver = value.equals(value)
+		|    callback: pure (Point, Point) -> Bool = equals
+		|    default_callback: pure (Point, Point) -> Bool = not_equals
+		|    match [direct, different, receiver, callback(value, value), default_callback(value, value)]:
+		|        [True, False, True, True, False]: 23
+		|        _: 0
+		|
+	match parse_trait_fixture(source, PROVIDER, REQUIREMENT):
+		Err(error):
+			print("parse setup: " + error.message)
+			False
+		Ok(parsed):
+			match check(parsed):
+				Err(failure):
+					print("explicit family rejected: " + render_failure(failure).first.message)
+					False
+				Ok(program):
+					checked = checked_functions(program)
+					match checked.records:
+						[point]: Model.equality_body(checked.traits, Model.RecordAggregate(point.id)).is_some()
+						_: False
+
+
+tests: TestSuite = {
+	description = "Blorp 2 automatic capability without implicit operation publication",
+	tests = [
+		("Bool type import does not publish automatic operation names", test_a_bool_type_import_does_not_publish_derived_operation_names),
+		("record type import does not publish automatic operation names", test_a_record_type_import_does_not_publish_derived_operation_names),
+		("explicit family retains direct default UFCS and callable paths", test_an_explicit_family_supports_derived_direct_default_and_callable_paths),
+	]
+}

@@ -8,7 +8,7 @@ import:
 	../namespace/builtins as Builtins: RuntimeOperation
 	result as ResultOps
 	../utils/boolean: not, and
-	./traits: prove_requirements
+	./traits: TraitAvailability, accepted_traits, prove_requirements
 	./scope: CallableBinding, callable_local, callable_parameter_contract, ScopedValue(DataLocal, CallableLocal), LocalBinding, binding_site, binding_definition, local_binding_id, lookup_binding, bind_local
 	./signatures: AcceptedFunction
 	./callables:
@@ -149,7 +149,7 @@ private fixed union ExpressionSite:
 		List[ScopedValue], List[BindingDefinition], ParsedBlock,
 		TypeUse, ResolutionContext, List[LambdaRow],
 	) -> Result[ResolvedBody, CheckError])
-	ConstantInitializer(ConstructionContext, List[AcceptedFunction], Checked.AcceptedTraits)
+	ConstantInitializer(ConstructionContext, List[AcceptedFunction], TraitAvailability)
 
 
 private pure func site_construction(site: ExpressionSite) -> ConstructionContext:
@@ -164,7 +164,7 @@ private pure func site_signatures(site: ExpressionSite) -> List[AcceptedFunction
 		ConstantInitializer(_, signatures, _): signatures
 
 
-private pure func site_traits(site: ExpressionSite) -> Checked.AcceptedTraits:
+private pure func site_traits(site: ExpressionSite) -> TraitAvailability:
 	match site:
 		BodyExpression(context, _): context.traits
 		ConstantInitializer(_, _, traits): traits
@@ -197,7 +197,7 @@ private fixed union ResolvedApplication:
 	ConstructorApplication(VariantId, WrittenName)
 
 
-private pure func freeze_record_fields(fields: List[PendingRecordField], slots: List[InferenceSlot], captures: CaptureScope, constructions: List[ContextWork], assumptions: List[Checked.TraitRequirement], traits: Checked.AcceptedTraits) -> Result[List[CheckedRecordField], CheckError]:
+private pure func freeze_record_fields(fields: List[PendingRecordField], slots: List[InferenceSlot], captures: CaptureScope, constructions: List[ContextWork], assumptions: List[Checked.TraitRequirement], traits: TraitAvailability) -> Result[List[CheckedRecordField], CheckError]:
 	var frozen: List[CheckedRecordField] = []
 	var failure: Option[CheckError] = None
 
@@ -401,7 +401,7 @@ private pure func register_capture(
 						Ok(lambdas)
 					else:
 						match pending.parent:
-							DeclaredBody(_): Err(checker_invariant(value_type.span, InvalidInferenceWorklist))
+							DeclaredBody(_) | Checked.DerivedEqualityBody(_): Err(checker_invariant(value_type.span, InvalidInferenceWorklist))
 							Checked.LambdaBody(parent):
 								match register_capture(lambdas, parent, binding, value_type):
 									Ok(registered): Ok(registered.lambdas)
@@ -435,7 +435,7 @@ private pure func capture_operands(id: LambdaId, parent_body: BodyOwner, lambdas
 			Ok(ReadBinding(capture.binding.binding))
 		else:
 			match parent_body:
-				DeclaredBody(_): Err(checker_invariant(span, InvalidInferenceWorklist))
+				DeclaredBody(_) | Checked.DerivedEqualityBody(_): Err(checker_invariant(span, InvalidInferenceWorklist))
 				Checked.LambdaBody(owner):
 					match lambda_captures(lambdas, owner, span):
 						Err(error): Err(error)
@@ -735,7 +735,7 @@ private pure func plan_qualified(
 			plan_qualified_variant(variant_owner(variant), variant, name, arguments, called, expectation, construction, slots)
 		Ok(OfferedMethod(method)):
 			if called:
-				match method_contract(name, arguments.length(), DirectCall, method, context.traits):
+				match method_contract(name, arguments.length(), DirectCall, method, accepted_traits(context.traits)):
 					Ok(contract): Ok(PlannedCall(contract, arguments, ReturnPlacement(body.base_span, body.span), expectation))
 					Err(error): Err(error)
 			else:
@@ -1080,7 +1080,7 @@ private pure func elaborate_value(
 															Err(error): Err(error)
 															Ok(context):
 																match context.caller.body:
-																	DeclaredBody(_): Err(checker_invariant(written.span, InvalidInferenceWorklist))
+																	DeclaredBody(_) | Checked.DerivedEqualityBody(_): Err(checker_invariant(written.span, InvalidInferenceWorklist))
 																	Checked.LambdaBody(owner):
 																		match register_capture(lambdas, owner, binding, { value_type = value_type, span = written.base_span }):
 																			Err(error): Err(error)
@@ -1420,7 +1420,7 @@ private pure func elaborate_value(
 											Ok(PendingStored({ form = ReadBinding(binding.binding), value_type = value_type, span = contract.span }))
 										else:
 											match context.caller.body:
-												DeclaredBody(_): Err(checker_invariant(contract.span, InvalidInferenceWorklist))
+												DeclaredBody(_) | Checked.DerivedEqualityBody(_): Err(checker_invariant(contract.span, InvalidInferenceWorklist))
 												Checked.LambdaBody(owner):
 													match register_capture(lambdas, owner, binding, { value_type = value_type, span = contract.span }):
 														Err(error): Err(error)
@@ -1774,7 +1774,7 @@ private pure func elaborate_value(
 				None: Err(checker_invariant(body.span, InvalidInferenceWorklist))
 
 
-private pure func freeze_pending_values(values: List[PendingValue], slots: List[InferenceSlot], captures: CaptureScope, constructions: List[ContextWork], assumptions: List[Checked.TraitRequirement], traits: Checked.AcceptedTraits) -> Result[List[CheckedExpr], CheckError]:
+private pure func freeze_pending_values(values: List[PendingValue], slots: List[InferenceSlot], captures: CaptureScope, constructions: List[ContextWork], assumptions: List[Checked.TraitRequirement], traits: TraitAvailability) -> Result[List[CheckedExpr], CheckError]:
 	var frozen: List[CheckedExpr] = []
 	var failure: Option[CheckError] = None
 
@@ -1793,7 +1793,7 @@ private pure func freeze_pending_values(values: List[PendingValue], slots: List[
 
 -- A receiver is written formal0. Its declared formal decides value versus
 -- callable operand; both remain in actual typechecking at the same position.
-private pure func freeze_pending_call(call: PendingCall, values: List[PendingValue], receiver: Option[CheckedExpr], slots: List[InferenceSlot], captures: CaptureScope, constructions: List[ContextWork], assumptions: List[Checked.TraitRequirement], traits: Checked.AcceptedTraits) -> Result[CheckedCall, CheckError]:
+private pure func freeze_pending_call(call: PendingCall, values: List[PendingValue], receiver: Option[CheckedExpr], slots: List[InferenceSlot], captures: CaptureScope, constructions: List[ContextWork], assumptions: List[Checked.TraitRequirement], traits: TraitAvailability) -> Result[CheckedCall, CheckError]:
 	var actual = pending_arguments(values)
 	var operands: List[CheckedCallOperand] = []
 	var written_position = if receiver.is_some():
@@ -1866,7 +1866,7 @@ private pure func freeze_retained_fields(fields: List[PendingRetainedField], slo
 		None: Ok(frozen)
 
 
-private pure func freeze_opaque_operand(operand: PendingValue, expected: TypeRef, site: ExpectedTypeSite, slots: List[InferenceSlot], captures: CaptureScope, constructions: List[ContextWork], assumptions: List[Checked.TraitRequirement], traits: Checked.AcceptedTraits) -> Result[CheckedExpr, CheckError]:
+private pure func freeze_opaque_operand(operand: PendingValue, expected: TypeRef, site: ExpectedTypeSite, slots: List[InferenceSlot], captures: CaptureScope, constructions: List[ContextWork], assumptions: List[Checked.TraitRequirement], traits: TraitAvailability) -> Result[CheckedExpr, CheckError]:
 	value ?= freeze_pending_value(operand, slots, captures, constructions, assumptions, traits)
 	if same_type(value.value_type, expected):
 		Ok(value)
@@ -1877,7 +1877,7 @@ private pure func freeze_opaque_operand(operand: PendingValue, expected: TypeRef
 -- Steps fold over their frozen receiver in source order. The loop keeps the
 -- checker from recursing on chain length.
 private pure func freeze_callable_choice(
-	value: PendingValue, slots: List[InferenceSlot], captures: CaptureScope, constructions: List[ContextWork], assumptions: List[Checked.TraitRequirement], traits: Checked.AcceptedTraits,
+	value: PendingValue, slots: List[InferenceSlot], captures: CaptureScope, constructions: List[ContextWork], assumptions: List[Checked.TraitRequirement], traits: TraitAvailability,
 ) -> Result[Checked.CallableChoice, CheckError]:
 	match value.base:
 		PendingNamedCallable(id, signature, start):
@@ -1907,7 +1907,7 @@ private pure func freeze_callable_choice(
 			ResultOps.map(freeze_pending_value(value, slots, captures, constructions, assumptions, traits), pure func(frozen): StoredCallable(frozen))
 
 
-private pure func freeze_method_callable(method: TraitMethodId, signature: FunctionSignature, start: Int, span: Span, slots: List[InferenceSlot], assumptions: List[Checked.TraitRequirement], traits: Checked.AcceptedTraits) -> Result[Checked.CallableChoice, CheckError]:
+private pure func freeze_method_callable(method: TraitMethodId, signature: FunctionSignature, start: Int, span: Span, slots: List[InferenceSlot], assumptions: List[Checked.TraitRequirement], traits: TraitAvailability) -> Result[Checked.CallableChoice, CheckError]:
 	parameter ?= signature.type_parameters.get(0).to_result(checker_invariant(span, InvalidFunctionContract))
 	published = publish_inference_type(inference_type(ParameterType(parameter), signature.type_parameters, start), slots, CompleteInference, span)
 	receiver: TypeRef ?= match published:
@@ -1927,7 +1927,7 @@ private pure func freeze_record_update(
 	fields: List[PendingRecordField],
 	inherited: List[PendingRetainedField],
 	slots: List[InferenceSlot],
-	captures: CaptureScope, constructions: List[ContextWork], assumptions: List[Checked.TraitRequirement], traits: Checked.AcceptedTraits,
+	captures: CaptureScope, constructions: List[ContextWork], assumptions: List[Checked.TraitRequirement], traits: TraitAvailability,
 ) -> Result[CheckedRecordUpdate, CheckError]:
 	frozen_base ?= freeze_pending_value(base, slots, captures, constructions, assumptions, traits)
 	replacements ?= freeze_record_fields(fields, slots, captures, constructions, assumptions, traits)
@@ -1957,7 +1957,7 @@ private pure func concat_checked_parts(parts: List[CheckedExpr], first: Int, cou
 						Ok({ form = InvokeFunction(call), value_type = StringType, span = span })
 
 
-private pure func freeze_interpolated(parts: List[PendingValue], slots: List[InferenceSlot], captures: CaptureScope, constructions: List[ContextWork], assumptions: List[Checked.TraitRequirement], traits: Checked.AcceptedTraits, span: Span) -> Result[CheckedExpr, CheckError]:
+private pure func freeze_interpolated(parts: List[PendingValue], slots: List[InferenceSlot], captures: CaptureScope, constructions: List[ContextWork], assumptions: List[Checked.TraitRequirement], traits: TraitAvailability, span: Span) -> Result[CheckedExpr, CheckError]:
 	var checked: List[CheckedExpr] = []
 	var failure: Option[CheckError] = None
 	for part in parts:
@@ -1977,7 +1977,7 @@ private pure func freeze_interpolated(parts: List[PendingValue], slots: List[Inf
 	concat_checked_parts(checked, 0, checked.length(), span)
 
 
-private pure func freeze_pending_value(value: PendingValue, slots: List[InferenceSlot], captures: CaptureScope, constructions: List[ContextWork], assumptions: List[Checked.TraitRequirement], traits: Checked.AcceptedTraits) -> Result[CheckedExpr, CheckError]:
+private pure func freeze_pending_value(value: PendingValue, slots: List[InferenceSlot], captures: CaptureScope, constructions: List[ContextWork], assumptions: List[Checked.TraitRequirement], traits: TraitAvailability) -> Result[CheckedExpr, CheckError]:
 	base_result: Result[CheckedForm, CheckError] = match value.base:
 		PendingContext(id):
 			match constructions.get(construction_number(id)):
@@ -2070,7 +2070,7 @@ private pure func freeze_pending_value(value: PendingValue, slots: List[Inferenc
 	Ok(current)
 
 
-private pure func freeze_pending_step(step: PendingStep, receiver: CheckedExpr, slots: List[InferenceSlot], captures: CaptureScope, constructions: List[ContextWork], assumptions: List[Checked.TraitRequirement], traits: Checked.AcceptedTraits) -> Result[CheckedExpr, CheckError]:
+private pure func freeze_pending_step(step: PendingStep, receiver: CheckedExpr, slots: List[InferenceSlot], captures: CaptureScope, constructions: List[ContextWork], assumptions: List[Checked.TraitRequirement], traits: TraitAvailability) -> Result[CheckedExpr, CheckError]:
 	form_result: Result[CheckedForm, CheckError] = match step.operation:
 		AcceptedTupleElement(position): Ok(ReadTupleElement(receiver, position))
 		AcceptedField(field): Ok(ReadRecordField(receiver, field))
@@ -2111,7 +2111,7 @@ pure func check_value(
 
 
 pure func check_constant_initializer(
-	body: ValueExpression, annotation: TypeUse, construction: ConstructionContext, signatures: List[AcceptedFunction], traits: Checked.AcceptedTraits,
+	body: ValueExpression, annotation: TypeUse, construction: ConstructionContext, signatures: List[AcceptedFunction], traits: TraitAvailability,
 ) -> Result[CheckedExpr, CheckError]:
 	obligation: ExpectedValue = { value_type = annotation.value_type, site = SourceAnnotation(annotation.span) }
 	checked ?= elaborate_value([], body, Some(annotation.value_type), Some({ expected = obligation, span = body.span }), ConstantInitializer(construction, signatures, traits), [])
@@ -2189,7 +2189,7 @@ private pure func classify_direct_call(
 						Err(error): Err(error)
 						Ok(row): constant_application(row, name, arguments, name.span, context)
 				Some(NamedMethod(method)):
-					ResultOps.map(method_contract(name, arguments.length(), DirectCall, method, context.traits), pure func(contract): FunctionApplication(contract))
+					ResultOps.map(method_contract(name, arguments.length(), DirectCall, method, accepted_traits(context.traits)), pure func(contract): FunctionApplication(contract))
 				Some(NamedFunction(target, _)):
 					match function_contract(
 						context.caller,
@@ -2263,7 +2263,7 @@ private pure func named_callable_value(accepted: AcceptedFunction, written: Valu
 
 private pure func method_callable_operand(method: TraitMethodId, written: ValueExpression, site: ExpressionSite, start: Int) -> Result[PendingValue, CheckError]:
 	traits = site_traits(site)
-	owner ?= traits.declarations.get(trait_number(trait_method_owner(method))).to_result(checker_invariant(written.base_span, InvalidFunctionContract))
+	owner ?= accepted_traits(traits).declarations.get(trait_number(trait_method_owner(method))).to_result(checker_invariant(written.base_span, InvalidFunctionContract))
 	accepted ?= owner.methods.get(trait_method_number(method)).to_result(checker_invariant(written.base_span, InvalidFunctionContract))
 	Ok({
 		span = written.span, readiness = DeferredInference,
@@ -2516,7 +2516,7 @@ private pure func checked_lambda(
 
 -- Inline bodies share their caller's inference slots until the whole expression settles.
 private pure func freeze_lambdas(
-	pending: List[LambdaWork], slots: List[InferenceSlot], rows: List[LambdaRow], constructions: List[ContextWork], assumptions: List[Checked.TraitRequirement], traits: Checked.AcceptedTraits,
+	pending: List[LambdaWork], slots: List[InferenceSlot], rows: List[LambdaRow], constructions: List[ContextWork], assumptions: List[Checked.TraitRequirement], traits: TraitAvailability,
 ) -> Result[List[LambdaRow], CheckError]:
 	var complete = rows
 	var failure: Option[CheckError] = None

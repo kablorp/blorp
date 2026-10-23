@@ -24,8 +24,10 @@ families accept bounds such as `Value: Equatable + Visit` and `Box[Value: Visit]
 A default-only `implements Trait for Type` header ends at the newline, without a
 colon. Contextual unbound method references use ordinary expressions and need an
 expected callable type determining `Self`. See the [pilot trait rules](../blorp_2/README.md#concrete-traits)
-for conservative finite-dispatch limits. Derives, trait parameters, independently
-generic methods and top-level callable trait formals remain deferred; the host
+for conservative finite-dispatch limits and automatic equality for nongeneric
+named records and unions. This uses existing call syntax; generic automatic
+equality, trait parameters, independently generic methods and top-level callable
+trait formals remain deferred. Empty aggregate declarations remain rejected; the host
 language grammar below does not broaden the pilot subset.
 The ordinary [pilot `append_int` API](../blorp_2/README.md#counted-string-operations)
 uses the existing function-call and UFCS grammar.

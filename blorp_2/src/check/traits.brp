@@ -5,15 +5,16 @@ the resolved requirement-to-body mapping consumed by checking and specialization
 ---
 import:
 	./declarations: TypeScope, type_access, previous_declaration, resolve_type, Substitution, substitute_type
-	./errors: CheckError, checker_invariant, CheckerInvariant(InvalidFunctionContract), TraitError(DuplicateRequirementParameter, ImpureRequirement, GenericRequirement, FirstParameterMustBeSelf, CallableFormalDeferred, OrphanImplementation, DuplicateImplementation, MissingImplementationMethod, MissingTraitBound, UnknownImplementationMethod, DuplicateImplementationMethod, ImplementationSignatureMismatch, MalformedCanonicalTrait), trait_error
-	./model: AcceptedTraits, AcceptedTrait, AcceptedTraitMethod, AcceptedImplementation, ImplementedMethod, ImplementedBody(AuthoredMethod, TraitDefault), TraitRequirement, receiver_arguments, receiver_type, type_head, parameter_owner, same_parameter, ImplementationHeader, FunctionSignature, TypeUse, TypeRef(ListType, AppliedRecordType, AppliedUnionType, ParameterType, VoidType, IntType, FloatType, StringType, CallableType, UnionType, RecordType, OpaqueType), TypeParameterOwner(TraitDeclaration), type_parameter_id, same_type, same_types
+	./errors: CheckError, checker_invariant, CheckerInvariant(InvalidFunctionContract), TraitError(GenericEqualityDeferred, EqualityMemberUnsupported, DuplicateRequirementParameter, ImpureRequirement, GenericRequirement, FirstParameterMustBeSelf, CallableFormalDeferred, OrphanImplementation, DuplicateImplementation, MissingImplementationMethod, MissingTraitBound, UnknownImplementationMethod, DuplicateImplementationMethod, ImplementationSignatureMismatch, MalformedCanonicalTrait), trait_error
+	./model: AggregateId(RecordAggregate, UnionAggregate), EqualityMember(EqualityField, EqualityPayload), CheckedRecord, CheckedUnion, AcceptedTraits, AcceptedTrait, AcceptedTraitMethod, AcceptedImplementation, ImplementedMethod, ImplementedBody(AuthoredMethod, TraitDefault, StructuralEquality), TraitRequirement, receiver_arguments, receiver_type, type_head, parameter_owner, same_parameter, ImplementationHeader, FunctionSignature, TypeUse, TypeRef(ListType, AppliedRecordType, AppliedUnionType, ParameterType, VoidType, IntType, FloatType, StringType, CallableType, UnionType, RecordType, OpaqueType), TypeParameterOwner(TraitDeclaration), type_parameter_id, same_type, same_types
+	./equality: equality_template
 	./signatures: AcceptedFunction
 	../namespace/builtins: DesignatedBoolean
 	../namespace/namespace: Namespace, TypeHead(PrimitiveHead, ListHead, RecordHead, UnionHead, OpaqueHead), same_head, named_trait, implementation_trait
 	../parse/assemble: ParsedContents
-	../utils/ids: FunctionId, VariantId, TraitMethodId, TraitMethodDeclaration(RequiredMethod, DefaultMethod), trait_method_header, trait_method_number, trait_method_owner, TraitRow, TraitMethodRow, ImplRow, TraitId, inventory_traits, inventory_implementations, inventory_functions, inventory_records, inventory_unions, inventory_opaques, trait_number, impl_number, function_number, record_number, union_number, opaque_number, variant_owner, same_trait_method
+	../utils/ids: RecordRow, UnionRow, FunctionId, VariantId, TraitMethodId, TraitMethodDeclaration(RequiredMethod, DefaultMethod), trait_method_header, trait_method_number, trait_method_owner, TraitRow, TraitMethodRow, ImplRow, TraitId, inventory_traits, inventory_implementations, inventory_functions, inventory_records, inventory_unions, inventory_opaques, trait_number, impl_number, function_number, record_number, union_number, opaque_number, variant_owner, same_trait_method
 	../utils/names: contextual_words, foundation_words, same_name
-	../utils/source: ModuleId, same_module, module_number, ModuleKind(LibraryModule)
+	../utils/source: ModuleId, compiler_source, same_module, module_number, ModuleKind(LibraryModule)
 	../utils/syntax: FunctionHeader, WrittenName, TypeSyntax(CallableTypeSyntax), Purity(Pure), type_span, same_purity, Span
 	int as IntOps
 	option: map, to_result, is_some, is_none
@@ -196,7 +197,7 @@ private pure func accept_implementation(
 				None: failure = Some(trait_error(row.header.span, MissingImplementationMethod(required.id)))
 	match failure:
 		Some(error): Err(error)
-		None: Ok({ trait_id = owner, receiver_head = header.receiver_head, parameter_bounds = header.parameter_bounds, methods = members, module = row.header.module, span = row.header.span })
+		None: Ok({ trait_id = owner, receiver_head = header.receiver_head, parameter_bounds = header.parameter_bounds, methods = members, method_provider = Some(row.header.module), span = row.header.span })
 
 
 private pure func member_contract(
@@ -311,7 +312,7 @@ private pure func unique_requirement_parameters(method: TraitMethodId, header: F
 
 -- A rigid parameter is justified only by its declaration. A family checks each
 -- bound on a strict child of the actual receiver, so proof always terminates.
-pure func prove_trait(traits: AcceptedTraits, required: TraitId, receiver: TypeRef, assumptions: List[TraitRequirement], span: Span) -> Result[Void, CheckError]:
+pure func prove_trait(availability: TraitAvailability, required: TraitId, receiver: TypeRef, assumptions: List[TraitRequirement], span: Span) -> Result[Void, CheckError]:
 	match receiver:
 		ParameterType(parameter):
 			known = assumptions.any(pure func(assumption): and(same_parameter(assumption.parameter, parameter), IntOps.equals(trait_number(assumption.required_trait), trait_number(required))))
@@ -320,16 +321,21 @@ pure func prove_trait(traits: AcceptedTraits, required: TraitId, receiver: TypeR
 			else:
 				Err(trait_error(span, MissingTraitBound(required, receiver)))
 		_:
-			prove_family(traits, required, receiver, assumptions, span)
+			prove_family(availability, required, receiver, assumptions, span)
 
 
-private pure func prove_family(traits: AcceptedTraits, required: TraitId, receiver: TypeRef, assumptions: List[TraitRequirement], span: Span) -> Result[Void, CheckError]:
+private pure func prove_family(availability: TraitAvailability, required: TraitId, receiver: TypeRef, assumptions: List[TraitRequirement], span: Span) -> Result[Void, CheckError]:
+	traits = accepted_traits(availability)
 	head ?= type_head(receiver).to_result(trait_error(span, MissingTraitBound(required, receiver)))
-	var family: Option[AcceptedImplementation] = None
-	for implementation in traits.implementations:
-		if and(IntOps.equals(trait_number(implementation.trait_id), trait_number(required)), same_head(implementation.receiver_head, head)):
-			family = Some(implementation)
-	accepted ?= family.to_result(trait_error(span, MissingTraitBound(required, receiver)))
+	family = family_for(traits, required, head)
+	selected: Result[AcceptedImplementation, CheckError] = match family:
+		Some(implementation): Ok(implementation)
+		None:
+			rejection: CheckError = match equality_error(availability, required, receiver, span):
+				Some(error): error
+				None: trait_error(span, MissingTraitBound(required, receiver))
+			Err(rejection)
+	accepted ?= selected
 	arguments = receiver_arguments(receiver)
 	var position = 0
 	var failure: Option[CheckError] = None
@@ -338,7 +344,7 @@ private pure func prove_family(traits: AcceptedTraits, required: TraitId, receiv
 			None: failure = Some(checker_invariant(span, InvalidFunctionContract))
 			Some(argument):
 				for bound in bounds:
-					match prove_trait(traits, bound.required_trait, argument, assumptions, span):
+					match prove_trait(availability, bound.required_trait, argument, assumptions, span):
 						Ok(_): void
 						Err(error):
 							failure = Some(error)
@@ -353,14 +359,14 @@ private pure func prove_family(traits: AcceptedTraits, required: TraitId, receiv
 
 -- Source construction seals a callable's obligations. Invoking a stored or
 -- forwarded callable later consumes that sealed callable type without reproving.
-pure func prove_requirements(traits: AcceptedTraits, signature: FunctionSignature, arguments: List[TypeRef], assumptions: List[TraitRequirement], span: Span) -> Result[Void, CheckError]:
+pure func prove_requirements(availability: TraitAvailability, signature: FunctionSignature, arguments: List[TypeRef], assumptions: List[TraitRequirement], span: Span) -> Result[Void, CheckError]:
 	var failure: Option[CheckError] = None
 	for required in signature.requirements:
 		substitution: Substitution = { owner = parameter_owner(required.parameter), values = arguments }
 		match substitute_type(ParameterType(required.parameter), substitution, span):
 			Err(error): failure = Some(error)
 			Ok(receiver):
-				match prove_trait(traits, required.required_trait, receiver, assumptions, span):
+				match prove_trait(availability, required.required_trait, receiver, assumptions, span):
 					Ok(_): void
 					Err(error): failure = Some(error)
 		if failure.is_some():
@@ -368,3 +374,260 @@ pure func prove_requirements(traits: AcceptedTraits, signature: FunctionSignatur
 	match failure:
 		Some(error): Err(error)
 		None: Ok(void)
+
+
+-- Negative causes are checker-local. Successful publication keeps only the
+-- same accepted view; no partially supported body or proof cache escapes.
+private fixed record EqualityUnavailable {
+	aggregate: AggregateId,
+	member: EqualityMember,
+	required_trait: TraitId,
+	receiver: TypeRef
+}
+
+
+private fixed union EqualityOutcome:
+	SupportedEquality(AcceptedImplementation)
+	UnsupportedEquality(EqualityUnavailable)
+
+
+private fixed record AvailabilityContents {
+	accepted: AcceptedTraits,
+	unavailable: List[EqualityUnavailable]
+}
+
+opaque type TraitAvailability = AvailabilityContents
+
+
+pure func accepted_traits(availability: TraitAvailability) -> AcceptedTraits:
+	from_opaque TraitAvailability(availability).accepted
+
+
+-- Signature-only test observers may deliberately have no derivation candidates.
+pure func authored_traits(traits: AcceptedTraits) -> TraitAvailability:
+	into_opaque TraitAvailability({ accepted = traits, unavailable = [] })
+
+
+private pure func aggregate_head(aggregate: AggregateId) -> TypeHead:
+	match aggregate:
+		RecordAggregate(record_row): RecordHead(record_row)
+		UnionAggregate(union_row): UnionHead(union_row)
+
+
+private pure func family_for(traits: AcceptedTraits, required: TraitId, head: TypeHead) -> Option[AcceptedImplementation]:
+	var family: Option[AcceptedImplementation] = None
+	for implementation in traits.implementations:
+		if and(IntOps.equals(trait_number(implementation.trait_id), trait_number(required)), same_head(implementation.receiver_head, head)):
+			family = Some(implementation)
+	family
+
+
+private fixed record UnsatisfiedEquality {
+	required_trait: TraitId,
+	receiver: TypeRef
+}
+
+
+-- Only provisional candidate membership can close a recursive group. Authored
+-- families retain precedence and discharge their actual ground child bounds.
+private pure func unsupported_goal(traits: AcceptedTraits, required: TraitId, receiver: TypeRef, possible: List[AggregateId]) -> Result[Option[UnsatisfiedEquality], CheckError]:
+	var invalid: Option[CheckError] = None
+	var failure: Option[UnsatisfiedEquality] = None
+	match type_head(receiver):
+		None: failure = Some({ required_trait = required, receiver = receiver })
+		Some(head):
+			match family_for(traits, required, head):
+				Some(family):
+					arguments = receiver_arguments(receiver)
+					var position = 0
+					for bounds in family.parameter_bounds:
+						match arguments.get(position):
+							Some(argument):
+								for bound in bounds:
+									match unsupported_goal(traits, bound.required_trait, argument, possible):
+										Ok(unsupported): failure = unsupported
+										Err(error): invalid = Some(error)
+									if or(failure.is_some(), invalid.is_some()):
+										break
+							None: invalid = Some(checker_invariant(compiler_span(), InvalidFunctionContract))
+						if or(failure.is_some(), invalid.is_some()):
+							break
+						position = IntOps.add(position, 1)
+				None:
+					canonical: Bool = match traits.canonical:
+						Some(owner): IntOps.equals(trait_number(owner), trait_number(required))
+						None: False
+					provisional = and(canonical, possible.any(pure func(aggregate): same_head(aggregate_head(aggregate), head)))
+					if provisional.not():
+						failure = Some({ required_trait = required, receiver = receiver })
+	match invalid:
+		Some(error): Err(error)
+		None: Ok(failure)
+
+
+private pure func unsupported_member(traits: AcceptedTraits, required: TraitId, aggregate: AggregateId, records: List[CheckedRecord], unions: List[CheckedUnion], possible: List[AggregateId]) -> Result[Option[EqualityUnavailable], CheckError]:
+	var invalid: Option[CheckError] = None
+	var failure: Option[EqualityUnavailable] = None
+	match aggregate:
+		RecordAggregate(record_row):
+			match records.get(record_number(record_row)):
+				Some(row):
+					for field in row.fields:
+						match unsupported_goal(traits, required, field.value_type.value_type, possible):
+							Ok(Some(goal)): failure = Some({ aggregate = aggregate, member = EqualityField(field.id), required_trait = goal.required_trait, receiver = goal.receiver })
+							Ok(None): void
+							Err(error): invalid = Some(error)
+						if or(failure.is_some(), invalid.is_some()):
+							break
+				None: invalid = Some(checker_invariant(compiler_span(), InvalidFunctionContract))
+		UnionAggregate(union_row):
+			match unions.get(union_number(union_row)):
+				Some(row):
+					for variant in row.variants:
+						var position = 0
+						for field in variant.fields:
+							match unsupported_goal(traits, required, field.value_type, possible):
+								Ok(Some(goal)): failure = Some({ aggregate = aggregate, member = EqualityPayload(variant.id, position), required_trait = goal.required_trait, receiver = goal.receiver })
+								Ok(None): void
+								Err(error): invalid = Some(error)
+							if or(failure.is_some(), invalid.is_some()):
+								break
+							position = IntOps.add(position, 1)
+						if or(failure.is_some(), invalid.is_some()):
+							break
+				None: invalid = Some(checker_invariant(compiler_span(), InvalidFunctionContract))
+	match invalid:
+		Some(error): Err(error)
+		None: Ok(failure)
+
+
+pure func prepare_equality_availability(parsed: ParsedContents, traits: AcceptedTraits, records: List[CheckedRecord], unions: List[CheckedUnion], boolean: DesignatedBoolean[VariantId]) -> Result[TraitAvailability, CheckError]:
+	match traits.canonical:
+		None: Ok(authored_traits(traits))
+		Some(canonical): complete_equality_availability(parsed, traits, records, unions, boolean, canonical)
+
+
+private pure func complete_equality_availability(parsed: ParsedContents, traits: AcceptedTraits, records: List[CheckedRecord], unions: List[CheckedUnion], boolean: DesignatedBoolean[VariantId], canonical: TraitId) -> Result[TraitAvailability, CheckError]:
+	var possible: List[AggregateId] = []
+	for record_row in records:
+		if and(record_row.type_parameters.is_empty(), family_for(traits, canonical, RecordHead(record_row.id)).is_none()):
+			possible = possible.append(RecordAggregate(record_row.id))
+	for union_row in unions:
+		if and(union_row.type_parameters.is_empty(), family_for(traits, canonical, UnionHead(union_row.id)).is_none()):
+			possible = possible.append(UnionAggregate(union_row.id))
+	var unavailable: List[EqualityUnavailable] = []
+	var invalid: Option[CheckError] = None
+	var changed: Bool = True
+	while and(changed, invalid.is_none()):
+		changed = False
+		var retained: List[AggregateId] = []
+		for aggregate in possible:
+			match unsupported_member(traits, canonical, aggregate, records, unions, possible):
+				Ok(Some(failure)):
+					unavailable = unavailable.append(failure)
+					changed = True
+				Ok(None): retained = retained.append(aggregate)
+				Err(error): invalid = Some(error)
+		possible = retained
+	valid: Void ?= match invalid:
+		Some(error): Err(error)
+		None: Ok(void)
+	contract ?= traits.declarations.get(trait_number(canonical)).to_result(checker_invariant(compiler_span(), InvalidFunctionContract))
+	written_records = inventory_records(parsed.declarations)
+	written_unions = inventory_unions(parsed.declarations)
+	var outcomes: List[EqualityOutcome] = unavailable.map(pure func(failure) -> EqualityOutcome: UnsupportedEquality(failure))
+	var error: Option[CheckError] = None
+	for aggregate in possible:
+		match supported_implementation(written_records, written_unions, aggregate, records, unions, contract, boolean, canonical):
+			Ok(implementation): outcomes = outcomes.append(SupportedEquality(implementation))
+			Err(failure): error = Some(failure)
+	ready: Void ?= match error:
+		Some(failure): Err(failure)
+		None: Ok(void)
+	-- Exactly one tagged result for each original candidate; partition once.
+	var implementations = traits.implementations
+	var rejected: List[EqualityUnavailable] = []
+	for outcome in outcomes:
+		match outcome:
+			SupportedEquality(implementation): implementations = implementations.append(implementation)
+			UnsupportedEquality(failure): rejected = rejected.append(failure)
+	Ok(into_opaque TraitAvailability({ accepted = { traits | implementations = implementations }, unavailable = rejected }))
+
+
+private pure func supported_implementation(written_records: List[RecordRow], written_unions: List[UnionRow], aggregate: AggregateId, records: List[CheckedRecord], unions: List[CheckedUnion], contract: AcceptedTrait, boolean: DesignatedBoolean[VariantId], canonical: TraitId) -> Result[AcceptedImplementation, CheckError]:
+	span ?= aggregate_span(written_records, written_unions, aggregate)
+	var methods: List[ImplementedMethod] = []
+	var error: Option[CheckError] = None
+	for method in contract.methods:
+		match method.default_body:
+			Some(function): methods = methods.append({ method = method.id, body = TraitDefault(function) })
+			None:
+				match equality_template(aggregate, records, unions, method, boolean, span):
+					Ok(template): methods = methods.append({ method = method.id, body = StructuralEquality(aggregate, template) })
+					Err(failure): error = Some(failure)
+	ready: Void ?= match error:
+		Some(failure): Err(failure)
+		None: Ok(void)
+	Ok({ trait_id = canonical, receiver_head = aggregate_head(aggregate), parameter_bounds = [], methods = methods, method_provider = None, span = span })
+
+
+private pure func aggregate_span(written_records: List[RecordRow], written_unions: List[UnionRow], aggregate: AggregateId) -> Result[Span, CheckError]:
+	match aggregate:
+		RecordAggregate(record_row):
+			match written_records.get(record_number(record_row)):
+				Some(row): Ok(row.declaration.type_name.span)
+				None: Err(checker_invariant(compiler_span(), InvalidFunctionContract))
+		UnionAggregate(union_row):
+			match written_unions.get(union_number(union_row)):
+				Some(row): Ok(row.type_name.span)
+				None: Err(checker_invariant(compiler_span(), InvalidFunctionContract))
+
+
+private pure func compiler_span() -> Span:
+	{ source = compiler_source(), start = 0, end = 0 }
+
+
+-- Canonical identity is checked before either structural failure or generic
+-- deferral. An unrelated same-spelled trait keeps ordinary proof semantics.
+pure func equality_error(availability: TraitAvailability, required: TraitId, receiver: TypeRef, span: Span) -> Option[CheckError]:
+	contents = from_opaque TraitAvailability(availability)
+	canonical: Bool = match contents.accepted.canonical:
+		Some(owner): IntOps.equals(trait_number(owner), trait_number(required))
+		None: False
+	if canonical.not():
+		None
+	else:
+		-- Applied aggregate forms have accepted nonzero declared arity. Bare
+		-- nongeneric heads use RecordType/UnionType, never empty applications.
+		match receiver:
+			AppliedRecordType(_, _) | AppliedUnionType(_, _): Some(trait_error(span, GenericEqualityDeferred(receiver, None)))
+			_:
+				var terminal: Option[EqualityUnavailable] = None
+				var current = receiver
+				var current_trait = required
+				var searching: Bool = True
+				while searching:
+					searching = False
+					match type_head(current):
+						None: void
+						Some(head):
+							if IntOps.equals(trait_number(current_trait), trait_number(required)):
+								for failure in contents.unavailable:
+									if same_head(aggregate_head(failure.aggregate), head):
+										terminal = Some(failure)
+										current = failure.receiver
+										current_trait = failure.required_trait
+										searching = True
+										break
+				-- Each cause points into an earlier removal round or a terminal
+				-- authored-bound/member failure; no cyclic failure links exist.
+				match terminal:
+					None: None
+					Some(failure):
+						generic: Bool = match failure.receiver:
+							AppliedRecordType(_, _) | AppliedUnionType(_, _): IntOps.equals(trait_number(failure.required_trait), trait_number(required))
+							_: False
+						if generic:
+							Some(trait_error(span, GenericEqualityDeferred(failure.receiver, Some(failure.member))))
+						else:
+							Some(trait_error(span, EqualityMemberUnsupported(failure.required_trait, failure.receiver, failure.member)))

@@ -973,7 +973,7 @@ private pure func parameter_substitution[T](
 private pure func function_substitution(
 	function: SelectedBody, arguments: List[Checked.TypeRef], span: Span,
 ) -> Result[Declarations.Substitution, Diagnostic]:
-	owner: Checked.TypeParameterOwner = Checked.FunctionDeclaration(function.root)
+	owner: Checked.TypeParameterOwner = function.parameter_owner
 	valid ?= validate_type_parameters(function.type_parameters, arguments.length(), owner, span)
 	Ok({ owner = owner, values = arguments })
 
@@ -2257,7 +2257,7 @@ private pure func exit_types(exit: Checked.CheckedExit) -> List[Checked.TypeUse]
 -- This view is local to preparation/translation, never a published function row.
 private fixed record SelectedBody {
 	captures: List[Checked.CheckedCapture],
-	root: Declaration.FunctionId,
+	parameter_owner: Checked.TypeParameterOwner,
 	type_parameters: List[Checked.TypeParameterId],
 	parameters: List[Checked.TypeUse],
 	return_type: Checked.TypeUse,
@@ -2279,7 +2279,7 @@ private pure func selected_body(
 				None: Err(missing_body(source, "unknown function declaration"))
 				Some(function): Ok({
 					captures = [],
-					root = function.id,
+					parameter_owner = Checked.FunctionDeclaration(function.id),
 					type_parameters = function.signature.type_parameters,
 					parameters = function.signature.parameters,
 					return_type = function.signature.return_type,
@@ -2296,7 +2296,7 @@ private pure func selected_body(
 						None: Err(invalid(lambda.return_type.span, "unknown lambda root"))
 						Some(root): Ok({
 							captures = lambda.captures,
-							root = root.id,
+							parameter_owner = Checked.FunctionDeclaration(root.id),
 							type_parameters = root.signature.type_parameters,
 							parameters = lambda.parameters,
 							return_type = lambda.return_type,
@@ -2305,6 +2305,17 @@ private pure func selected_body(
 							body = lambda.body,
 							execution = OrdinaryCalls
 						})
+
+		Checked.DerivedEqualityBody(aggregate):
+			match Checked.equality_body(checked.traits, aggregate):
+				None: Err(missing_body(source, "unknown derived equality body"))
+				Some(template): Ok({
+					captures = [], parameter_owner = Checked.aggregate_owner(aggregate),
+					type_parameters = template.signature.type_parameters,
+					parameters = template.signature.parameters, return_type = template.signature.return_type,
+					bindings = template.bindings, statements = [], body = template.body,
+					execution = OrdinaryCalls
+				})
 
 
 private pure func place_types(place: Checked.CheckedPatternPlace, span: Span) -> List[Checked.TypeUse]:
@@ -2432,11 +2443,15 @@ private pure func selected_method_body(method: Checked.AcceptedMethodCall, subst
 		.to_result(invalid(span, "accepted method has no implementation body"))
 
 
-private pure func prepare_named_instance(id: Declaration.FunctionId, arguments: List[Checked.TypeRef], checked: Checked.CheckedFunctions, initial: PreparedInstances, span: Span) -> Result[PreparedInstances, Diagnostic]:
+private pure func prepare_body_instance(body: Checked.BodyOwner, arguments: List[Checked.TypeRef], checked: Checked.CheckedFunctions, initial: PreparedInstances, span: Span) -> Result[PreparedInstances, Diagnostic]:
 	types ?= prepare_arguments(arguments, [], checked, initial.unions, span, initial.records, [])
 	concrete ?= known_types(types.arguments, span)
-	key ?= runtime_key(Checked.DeclaredBody(id), arguments, checked, span)
+	key ?= runtime_key(body, arguments, checked, span)
 	Ok(request_instance({ initial | unions = types.unions, records = types.records }, key, ConcreteRequest(span)))
+
+
+private pure func prepare_named_instance(id: Declaration.FunctionId, arguments: List[Checked.TypeRef], checked: Checked.CheckedFunctions, initial: PreparedInstances, span: Span) -> Result[PreparedInstances, Diagnostic]:
+	prepare_body_instance(Checked.DeclaredBody(id), arguments, checked, initial, span)
 
 
 private pure func prepare_named_creation(
@@ -2466,7 +2481,7 @@ private pure func prepare_creation(
 	match value.form:
 		Checked.MakeCallable(Checked.MethodCallable(method)):
 			match selected_method_body(method, substitution, checked.traits, value.span):
-				Ok(selected): prepare_named_instance(selected.function, selected.arguments, checked, initial, value.span)
+				Ok(selected): prepare_body_instance(selected.body, selected.arguments, checked, initial, value.span)
 				Err(error): Err(error)
 		Checked.MakeCallable(Checked.NamedCallable(id, arguments)):
 			prepare_named_creation(id, arguments, substitution, checked, initial, value.span)
@@ -2477,7 +2492,7 @@ private pure func prepare_creation(
 
 private pure func method_callable(method: Checked.AcceptedMethodCall, parameter: Checked.CallableParameterId, substitution: Declarations.Substitution, traits: Checked.AcceptedTraits, span: Span) -> Result[CallableMode, Diagnostic]:
 	selected ?= selected_method_body(method, substitution, traits, span)
-	Ok(StaticCallable({ parameter = parameter, body = Checked.DeclaredBody(selected.function), arguments = selected.arguments, storage = ErasedCallable }))
+	Ok(StaticCallable({ parameter = parameter, body = selected.body, arguments = selected.arguments, storage = ErasedCallable }))
 
 
 private pure func prepare_function(
@@ -2491,7 +2506,7 @@ private pure func prepare_function(
 	storage_arguments ?= known_types(argument_layouts.arguments, function.return_type.span)
 	substitution ?= parameter_substitution(
 		function.type_parameters, argument_layouts.arguments,
-		Checked.FunctionDeclaration(function.root), function.return_type.span,
+		function.parameter_owner, function.return_type.span,
 	)
 	var prepared = { initial | unions = argument_layouts.unions, records = argument_layouts.records }
 	var failure: Option[Diagnostic] = None
@@ -2534,7 +2549,7 @@ private pure func prepare_function(
 					match selected_method_body(method, semantic, checked.traits, call.span):
 						Err(error): failure = Some(error)
 						Ok(selected):
-							match prepare_named_instance(selected.function, selected.arguments, checked, prepared, call.span):
+							match prepare_body_instance(selected.body, selected.arguments, checked, prepared, call.span):
 								Err(error): failure = Some(error)
 								Ok(next): prepared = next
 				Checked.RuntimeFunction(_): void
@@ -2612,7 +2627,7 @@ private pure func prepare_function(
 													Err(error): Err(error)
 													Ok(layouts):
 														prepared = { prepared | unions = layouts.unions, records = layouts.records }
-														known_types(layouts.arguments, written_span).map(pure func(_): StaticCallable({ parameter = written_parameter, body = Checked.DeclaredBody(selected.function), arguments = selected.arguments, storage = ErasedCallable }))
+														known_types(layouts.arguments, written_span).map(pure func(_): StaticCallable({ parameter = written_parameter, body = selected.body, arguments = selected.arguments, storage = ErasedCallable }))
 									Checked.NamedCallable(id, named_arguments):
 										choice_depends_on_caller = match has_type_parameters:
 											True: named_arguments.any(contains_parameter)
@@ -2866,7 +2881,7 @@ private pure func translate_call(
 		Checked.TraitMethod(method):
 			match selected_method_body(method, substitution, callables.traits, call.span):
 				Err(error): Err(error)
-				Ok(selected): runtime_instance(keys, Checked.DeclaredBody(selected.function), selected.arguments, call.span).map(pure func(id): UserFunction(id))
+				Ok(selected): runtime_instance(keys, selected.body, selected.arguments, call.span).map(pure func(id): UserFunction(id))
 		Checked.RuntimeFunction(operation):
 			concrete_result: Result[RuntimeOperation[VariantInstanceId, TypeRef], Diagnostic] = match operation:
 				IntAdd:
@@ -3198,7 +3213,7 @@ private pure func translate_callable_value(
 			match selected_method_body(method, substitution, translation.traits, span):
 				Err(error): Err(error)
 				Ok(selected):
-					runtime_instance(keys, Checked.DeclaredBody(selected.function), selected.arguments, span).map(pure func(body) -> ConcreteExpr: { form = FreeCallable(body), value_type = value_type, span = span })
+					runtime_instance(keys, selected.body, selected.arguments, span).map(pure func(body) -> ConcreteExpr: { form = FreeCallable(body), value_type = value_type, span = span })
 		Checked.NamedCallable(id, arguments):
 			match semantic_arguments(arguments, substitution, span):
 				Err(error): Err(error)
@@ -4079,7 +4094,7 @@ private pure func translate_parameters(
 	var capture: CaptureBinding = NoCaptureBinding
 	var failure: Option[Diagnostic] = None
 	match key.body:
-		Checked.DeclaredBody(_): void
+		Checked.DeclaredBody(_) | Checked.DerivedEqualityBody(_): void
 		Checked.LambdaBody(id):
 			match lambda_storage(id, function.captures.length(), key.arguments, opaques, substitution, unions, records, span):
 				Err(error): failure = Some(error)

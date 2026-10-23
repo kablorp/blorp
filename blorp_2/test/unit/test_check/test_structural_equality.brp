@@ -1,0 +1,669 @@
+import:
+	../../../src/check/check: check, checked_functions, check_errors, CheckFailure
+	../../../src/check/model as Model
+	../../../src/namespace/builtins: DesignatedBoolean, check_builtin_types
+	../../../src/utils/ids: RecordId, VariantId, variant_owner, inventory_traits, inventory_records, inventory_unions, trait_number, same_trait_method, record_number, inventory_implementations, inventory_functions
+	../../../src/utils/source: same_source, module_source, root_module_id
+	../../../src/check/render: render_failure
+	../../../src/check/errors: CheckErrorKind(TraitRejection, RecursionRejection), TraitError(GenericEqualityDeferred, EqualityMemberUnsupported, MissingTraitBound, MissingImplementation), RecursionError(UnprovenTraitInstantiation)
+	../../../src/parse/assemble: ParsedProgram, parsed_contents
+	../../../src/utils/syntax: Diagnostic, same_span, type_span, Purity(Pure), DiagnosticNote(RecordFieldDeclaration, UnionPayloadDeclaration)
+	../module_input: FOUNDATION_TYPES, parse_modules_with_base, test_base
+	./test_traits: parse_trait_fixture
+	test: TestSuite
+
+
+private EQUALITY: String =
+	|trait Equatable:
+	|    pure func equals(left: Self, right: Self) -> Bool
+	|
+
+
+-- Public fixture products let the retained pre-implementation witness inspect
+-- the exact typed failure without changing these acceptance predicates.
+pure func parse_nested_custom_fixture(main_source: String) -> Result[ParsedProgram, Diagnostic]:
+	provider: String =
+		|import:
+		|    _base: Int, Bool(False), Equatable
+		|fixed record Handler { tag: Int }
+		|fixed record Envelope { handler: Handler }
+		|implements Equatable for Handler:
+		|    pure func equals(left: Self, right: Self) -> Bool:
+		|        False
+		|pure func envelope(value: Int) -> Envelope:
+		|    { handler = { tag = value } }
+		|
+	parse_trait_fixture(main_source, provider, EQUALITY)
+
+
+pure func nested_custom_fixture() -> Result[ParsedProgram, Diagnostic]:
+	main_source: String =
+		|import:
+		|    int: equals, envelope
+		|func main() -> Int:
+		|    match equals(envelope(7), envelope(7)):
+		|        False: 23
+		|        True: 0
+		|
+	parse_nested_custom_fixture(main_source)
+
+
+pure func closed_default_fixture() -> Result[ParsedProgram, Diagnostic]:
+	requirements: String =
+		|trait Equatable:
+		|    pure func equals(left: Self, right: Self) -> Bool
+		|    pure func probe(value: Self) -> Bool:
+		|        probe2([value])
+		|    pure func probe2(value: Self) -> Bool:
+		|        True
+		|
+	provider: String =
+		|import:
+		|    _base: Int, Bool(True), List, Equatable
+		|fixed record R { tag: Int }
+		|implements Equatable for R:
+		|    pure func equals(left: Self, right: Self) -> Bool:
+		|        True
+		|implements Equatable for List[Element: Equatable]:
+		|    pure func equals(left: Self, right: Self) -> Bool:
+		|        True
+		|    pure func probe(value: Self) -> Bool:
+		|        g(value)
+		|    pure func probe2(value: Self) -> Bool:
+		|        probe(value)
+		|pure func g[Value: Equatable](value: Value) -> Bool:
+		|    probe(value)
+		|pure func make() -> R:
+		|    { tag = 7 }
+		|
+	main_source: String =
+		|import:
+		|    int: make, probe
+		|func main() -> Int:
+		|    match probe(make()):
+		|        True: 23
+		|        False: 0
+		|
+	parse_trait_fixture(main_source, provider, requirements)
+
+
+func test_a_closed_family_default_has_no_symbolic_receiver_dependency() -> Bool:
+	match closed_default_fixture():
+		Err(_): False
+		Ok(parsed):
+			match check(parsed):
+				Err(failure):
+					diagnostic = render_failure(failure).first
+					print(diagnostic.message + " | " + diagnostic.help)
+					print("span ".append_int(diagnostic.span.start) + ":".append_int(diagnostic.span.end))
+					match check_errors(failure).first.kind:
+						RecursionRejection(UnprovenTraitInstantiation): print("typed UnprovenTraitInstantiation")
+						TraitRejection(MissingTraitBound(_, _)): print("typed MissingTraitBound")
+						TraitRejection(MissingImplementation(_, _)): print("typed MissingImplementation")
+						_: print("unexpected rejection kind")
+					False
+				Ok(_): True
+
+
+func test_nongeneric_equality_uses_a_nested_authored_implementation() -> Bool:
+	match nested_custom_fixture():
+		Err(_): False
+		Ok(parsed):
+			match check(parsed):
+				Err(failure):
+					diagnostic = render_failure(failure).first
+					print(diagnostic.message + " | " + diagnostic.help)
+					print("span ".append_int(diagnostic.span.start) + ":".append_int(diagnostic.span.end))
+					match check_errors(failure).first.kind:
+						RecursionRejection(UnprovenTraitInstantiation): print("typed UnprovenTraitInstantiation")
+						TraitRejection(MissingTraitBound(_, _)): print("typed MissingTraitBound")
+						TraitRejection(MissingImplementation(_, _)): print("typed MissingImplementation")
+						_: print("unexpected rejection kind")
+					False
+				Ok(_): True
+
+
+tests: TestSuite = {
+	description = "Blorp 2 automatic equality for nongeneric aggregates",
+	tests = [
+		("closed family default has no symbolic receiver dependency", test_a_closed_family_default_has_no_symbolic_receiver_dependency),
+		("nongeneric equality uses nested authored implementation", test_nongeneric_equality_uses_a_nested_authored_implementation),
+		("template retains genuine aggregate and nested method identities", test_the_template_owns_real_aggregate_and_nested_method_identities),
+		("foundation without canonical equality creates no templates", test_a_foundation_without_canonical_equality_creates_no_templates),
+		("unbounded generic default calls retain whole Self", test_unbounded_generic_default_calls_keep_the_whole_self_dependency),
+		("unbounded generic default method creation retains whole Self", test_unbounded_generic_default_method_creation_keeps_the_whole_self_dependency),
+		("same-spelled unrelated Equatable gets no automatic implementation", test_an_unrelated_equatable_identity_does_not_receive_automatic_implementations),
+		("generic automatic equality is deferred at exact use", test_generic_automatic_equality_is_deferred_at_the_exact_use),
+		("generic declaration and construction without equality remain legal", test_generic_declaration_and_construction_without_equality_remain_legal),
+		("recursive children do not hide later callback poison", test_recursive_children_do_not_hide_a_later_callback_field),
+		("callback poison before recursive children remains unavailable", test_a_callback_field_poisons_the_same_group_before_recursive_children),
+		("record template decision nodes scale with logical fields", test_record_templates_have_three_decision_nodes_per_logical_field),
+		("union template decision nodes scale with tags and logical payloads", test_union_templates_grow_linearly_with_tags_and_logical_payloads),
+		("record comparisons short circuit in declared field order", test_record_comparisons_short_circuit_in_declared_field_order),
+		("unused union variant still requires payload equality", test_an_unused_union_variant_still_requires_payload_equality),
+	]
+}
+
+
+-- Append-only acceptance callbacks; imports/registry entries are applied after
+-- candidate02's guarded generation and links close.
+
+private pure func projects_formal(value: Model.CheckedExpr, field: Model.FieldId, position: Int) -> Bool:
+	match value.form:
+		Model.ReadRecordField(receiver, actual):
+			match receiver.form:
+				Model.ReadBinding(binding): Model.binding_number(binding) == position and record_number(Model.field_owner(actual)) == record_number(Model.field_owner(field)) and Model.field_number(actual) == Model.field_number(field)
+				_: False
+		_: False
+
+
+pure func test_the_template_owns_real_aggregate_and_nested_method_identities() -> Bool:
+	match nested_custom_fixture():
+		Err(_): False
+		Ok(parsed):
+			match check(parsed):
+				Err(_): False
+				Ok(program):
+					checked = checked_functions(program)
+					match (checked.records, inventory_implementations(parsed_contents(parsed).declarations)):
+						([handler, envelope], [written]):
+							match (written.methods, envelope.fields, Model.equality_body(checked.traits, Model.RecordAggregate(envelope.id))):
+								([authored], [field], Some(template)):
+									match (template.signature.parameters, template.bindings, Model.body_calls([], template.body)):
+										([left_type, right_type], [left_binding, right_binding], [call]):
+											match (call.target, call.operands, left_binding.origin, right_binding.origin):
+												(Model.TraitMethod(method), [Model.ValueOperand(left), Model.ValueOperand(right)], Model.ParameterBinding(0), Model.ParameterBinding(1)):
+													match Model.method_body(checked.traits, method):
+														Some(selected):
+															(
+																template.signature.type_parameters.is_empty() and template.signature.requirements.is_empty()
+																and Model.same_type(left_type.value_type, Model.RecordType(envelope.id))
+																and Model.same_type(right_type.value_type, Model.RecordType(envelope.id))
+																and Model.same_type(Model.method_receiver(method), Model.RecordType(handler.id))
+																and Model.same_body(selected.body, Model.DeclaredBody(authored)) and selected.arguments.is_empty()
+																and projects_formal(left, field.id, 0) and projects_formal(right, field.id, 1)
+																and checked.functions.length() == inventory_functions(parsed_contents(parsed).declarations).length()
+															and source_selects_derived_body(checked, envelope.id)
+															)
+														None: False
+												_: False
+										_: False
+								_: False
+						_: False
+
+
+pure func test_a_foundation_without_canonical_equality_creates_no_templates() -> Bool:
+	source: String =
+		|fixed record Point { value: Int }
+		|pure func point() -> Point:
+		|    { value = 7 }
+		|func main() -> Int:
+		|    value = point()
+		|    0
+		|
+	match parse_modules_with_base([{ source = source, targets = [] }], test_base()):
+		Err(_): False
+		Ok(parsed):
+			match check(parsed):
+				Err(_): False
+				Ok(program):
+					checked = checked_functions(program)
+					checked.traits.canonical.is_none() and checked.traits.declarations.is_empty() and checked.traits.implementations.is_empty()
+
+
+private func rejects_generic_default_growth(method_value: Bool) -> Bool:
+	before_call: String =
+		|trait Equatable:
+		|    pure func equals(left: Self, right: Self) -> Bool
+		|    pure func probe(value: Self) -> Bool:
+		|
+	prefix = before_call + "        step([value])\n    pure func step(value: Self) -> Bool:\n"
+	before_use = if method_value:
+		"        callback: pure (Self) -> Bool = "
+	else:
+		"        "
+	body = if method_value:
+		before_use + "probe\n        True\n"
+	else:
+		before_use + "probe(value)\n"
+	provider: String =
+		|import:
+		|    _base: Int, List, Bool(True), Equatable
+		|implements Equatable for List[Element]:
+		|    pure func equals(left: Self, right: Self) -> Bool:
+		|        True
+		|
+	main_source: String =
+		|import:
+		|    int as Integer
+		|func main() -> Int:
+		|    0
+		|
+	match parse_trait_fixture(main_source, provider, prefix + body):
+		Err(error):
+			print("parse generic default: " + error.message)
+			False
+		Ok(parsed):
+			match check(parsed):
+				Ok(_): False
+				Err(failure):
+					error = check_errors(failure).first
+					diagnostic = render_failure(failure).first
+					match error.kind:
+						RecursionRejection(UnprovenTraitInstantiation):
+							(
+								same_source(error.span.source, module_source(parsed_contents(parsed).foundation.types))
+								and error.span.start == FOUNDATION_TYPES.length() + prefix.length() + before_use.length()
+								and error.span.end == FOUNDATION_TYPES.length() + prefix.length() + before_use.length() + 5
+								and diagnostic.message == "cannot prove finite generic trait instantiation"
+								and diagnostic.help == "avoid recursively wrapping generic receivers through trait dispatch; this increment uses a conservative constructor-depth proof"
+								and same_span(error.span, diagnostic.span) and diagnostic.note.is_none()
+							)
+						_: False
+
+
+func test_unbounded_generic_default_calls_keep_the_whole_self_dependency() -> Bool:
+	rejects_generic_default_growth(False)
+
+
+func test_unbounded_generic_default_method_creation_keeps_the_whole_self_dependency() -> Bool:
+	rejects_generic_default_growth(True)
+
+
+private pure func source_selects_derived_body(checked: Model.CheckedFunctions, receiver: RecordId) -> Bool:
+	var found: Bool = False
+	for function in checked.functions:
+		for call in Model.function_calls(function):
+			match call.target:
+				Model.TraitMethod(method):
+					if Model.same_type(Model.method_receiver(method), Model.RecordType(receiver)):
+						match Model.method_body(checked.traits, method):
+							Some(selected): found = Model.same_body(selected.body, Model.DerivedEqualityBody(Model.RecordAggregate(receiver))) and selected.arguments.is_empty()
+							None: found = False
+				_: void
+	found
+
+
+-- Matching spellings do not turn an unrelated trait into canonical equality.
+func test_an_unrelated_equatable_identity_does_not_receive_automatic_implementations() -> Bool:
+	provider: String =
+		|import:
+		|    _base: Int
+		|pure func marker() -> Int:
+		|    0
+		|
+	before_call: String =
+		|import:
+		|    int as Integer
+		|trait Equatable:
+		|    pure func equals(left: Self, right: Self) -> Bool
+		|fixed record Point { value: Int }
+		|pure func compare(value: Point) -> Bool:
+		|
+	prefix = before_call + "    "
+	source = prefix + "equals(value, value)\nfunc main() -> Int:\n    0\n"
+	match parse_trait_fixture(source, provider, EQUALITY):
+		Err(error):
+			print("parse unrelated: " + error.message)
+			False
+		Ok(parsed):
+			declarations = parsed_contents(parsed).declarations
+			observed = check(parsed)
+			match (inventory_traits(declarations), inventory_records(declarations), observed):
+				([local, designated], [point], Err(failure)):
+					error = check_errors(failure).first
+					diagnostic = render_failure(failure).first
+					match (local.methods, error.kind):
+						([method], TraitRejection(MissingImplementation(actual, Model.RecordType(receiver)))):
+							(
+								same_trait_method(actual, method.id) and trait_number(local.id) != trait_number(designated.id)
+								and record_number(receiver) == record_number(point.id)
+								and same_source(error.span.source, module_source(root_module_id()))
+								and error.span.start == prefix.length() and error.span.end == prefix.length() + 6
+								and same_span(error.span, diagnostic.span)
+								and diagnostic.message == "receiver does not implement this trait"
+								and diagnostic.help == "declare a matching implementation; generic functions must declare their required trait bounds"
+								and diagnostic.note.is_none()
+							)
+						_: False
+				_: False
+
+
+private GENERIC_PROVIDER: String =
+	|import:
+	|    _base: Int, Bool, Equatable
+	|fixed record Box[Element] { value: Element }
+	|implements Equatable for Int:
+	|    pure func equals(left: Self, right: Self) -> Bool:
+	|        builtin("int.equals")
+	|pure func box() -> Box[Int]:
+	|    { value = 7 }
+	|
+
+
+pure func test_generic_automatic_equality_is_deferred_at_the_exact_use() -> Bool:
+	before_call: String =
+		|import:
+		|    int: Box, equals
+		|pure func compare(value: Box[Int]) -> Bool:
+		|
+	prefix = before_call + "    "
+	match parse_trait_fixture(prefix + "equals(value, value)\nfunc main() -> Int:\n    0\n", GENERIC_PROVIDER, EQUALITY):
+		Err(_): False
+		Ok(parsed):
+			match (inventory_records(parsed_contents(parsed).declarations), check(parsed)):
+				([box], Err(failure)):
+					error = check_errors(failure).first
+					diagnostic = render_failure(failure).first
+					match error.kind:
+						TraitRejection(GenericEqualityDeferred(Model.AppliedRecordType(receiver, [Model.IntType]), None)):
+							(
+								record_number(receiver) == record_number(box.id)
+								and error.span.start == prefix.length() and error.span.end == prefix.length() + 6
+								and same_source(error.span.source, module_source(root_module_id()))
+								and same_span(error.span, diagnostic.span) and diagnostic.note.is_none()
+								and diagnostic.message == "automatic equality for generic aggregate heads is not supported yet"
+								and diagnostic.help == "write an explicit full-family Equatable implementation for this type; automatic generic equality is a later increment"
+							)
+						_: False
+				_: False
+
+
+pure func test_generic_declaration_and_construction_without_equality_remain_legal() -> Bool:
+	source: String =
+		|import:
+		|    int: box
+		|func main() -> Int:
+		|    value = box()
+		|    0
+		|
+	match parse_trait_fixture(source, GENERIC_PROVIDER, EQUALITY):
+		Err(_): False
+		Ok(parsed):
+			match check(parsed):
+				Err(_): False
+				Ok(program):
+					match checked_functions(program).records:
+						[box]: Model.equality_body(checked_functions(program).traits, Model.RecordAggregate(box.id)).is_none()
+						_: False
+
+
+private pure func recursive_poison_rejected(callback_first: Bool) -> Bool:
+	fields = if callback_first:
+		"callback: pure (Int) -> Int, children: List[Bad]"
+	else:
+		"children: List[Bad], callback: pure (Int) -> Int"
+	provider_prefix: String =
+		|import:
+		|    _base: Int, List, Bool(True), Equatable
+		|
+	family: String =
+		|implements Equatable for List[Element: Equatable]:
+		|    pure func equals(left: Self, right: Self) -> Bool:
+		|        True
+		|
+	provider = provider_prefix + "fixed record Bad { " + fields + " }\n" + family
+	before_call: String =
+		|import:
+		|    int: Bad, equals
+		|pure func compare(value: Bad) -> Bool:
+		|
+	prefix = before_call + "    "
+	match parse_trait_fixture(prefix + "equals(value, value)\nfunc main() -> Int:\n    0\n", provider, EQUALITY):
+		Err(_): False
+		Ok(parsed):
+			declarations = parsed_contents(parsed).declarations
+			match (inventory_records(declarations), inventory_traits(declarations), check(parsed)):
+				([bad], [canonical], Err(failure)):
+					error = check_errors(failure).first
+					diagnostic = render_failure(failure).first
+					position = if callback_first:
+						0
+					else:
+						1
+					match (error.kind, diagnostic.note, bad.declaration.fields.get(position)):
+						(TraitRejection(EqualityMemberUnsupported(required, receiver, Model.EqualityField(field))), Some(RecordFieldDeclaration(note)), Some(written)):
+							(
+								trait_number(required) == trait_number(canonical.id)
+								and Model.same_type(receiver, Model.CallableType(Pure, [Model.IntType], Model.IntType))
+								and record_number(Model.field_owner(field)) == record_number(bad.id) and Model.field_number(field) == position
+								and same_span(note, type_span(written.type_name))
+								and same_source(error.span.source, module_source(root_module_id()))
+								and error.span.start == prefix.length() and error.span.end == prefix.length() + 6
+								and same_span(error.span, diagnostic.span)
+								and diagnostic.message == "automatic equality is unavailable for a field or payload"
+								and diagnostic.help == "provide the member's required trait implementation, or write an Equatable implementation for the containing type"
+							)
+						_: False
+				_: False
+
+
+pure func test_recursive_children_do_not_hide_a_later_callback_field() -> Bool:
+	recursive_poison_rejected(False)
+
+
+pure func test_a_callback_field_poisons_the_same_group_before_recursive_children() -> Bool:
+	recursive_poison_rejected(True)
+
+
+private pure func decision_nodes(value: Model.CheckedExpr) -> Option[Int]:
+	match value.form:
+		Model.Match(join):
+			var total: Option[Int] = match decision_nodes(join.scrutinee):
+				Some(amount): Some(amount + join.selection.nodes.length())
+				None: None
+			for arm in join.arms:
+				total = match (total, decision_nodes(arm.value)):
+					(Some(previous), Some(amount)): Some(previous + amount)
+					_: None
+			total
+		Model.InvokeFunction(call):
+			var total: Option[Int] = Some(0)
+			for operand in call.operands:
+				match operand:
+					Model.ValueOperand(child):
+						total = match (total, decision_nodes(child)):
+							(Some(previous), Some(amount)): Some(previous + amount)
+							_: None
+					_: total = None
+			total
+		Model.ReadRecordField(receiver, _): decision_nodes(receiver)
+		Model.ReadBinding(_): Some(0)
+		Model.ConstructVariant(_, []): Some(0)
+		_: None
+
+
+private pure func has_template_size(checked: Model.CheckedFunctions, aggregate: Model.AggregateId, calls: Int, nodes: Int, bindings: Int) -> Bool:
+	match Model.equality_body(checked.traits, aggregate):
+		None: False
+		Some(template):
+			match template.body:
+				Model.CheckedValueBody(Model.ReturnExpression(value)):
+					match decision_nodes(value):
+						Some(actual): actual == nodes and Model.body_calls([], template.body).length() == calls and template.bindings.length() == bindings
+						None: False
+				_: False
+
+
+private pure func size_fixture(declarations: String) -> Result[ParsedProgram, Diagnostic]:
+	provider: String =
+		|import:
+		|    _base: Int, Void, Bool(False), Equatable
+		|implements Equatable for Int:
+		|    pure func equals(left: Self, right: Self) -> Bool:
+		|        builtin("int.equals")
+		|implements Equatable for Void:
+		|    pure func equals(left: Self, right: Self) -> Bool:
+		|        False
+		|
+	main_source: String =
+		|import:
+		|    int as Definitions
+		|func main() -> Int:
+		|    0
+		|
+	parse_trait_fixture(main_source, provider + declarations, EQUALITY)
+
+
+pure func test_record_templates_have_three_decision_nodes_per_logical_field() -> Bool:
+	declarations: String =
+		|fixed record Four { first: Int, erased: Void, middle: Int, last: Int }
+		|fixed record Sixteen {
+		|    first: Int, second: Int, third: Int, fourth: Int,
+		|    fifth: Int, sixth: Int, seventh: Int, eighth: Int,
+		|    ninth: Int, tenth: Int, eleventh: Int, twelfth: Int,
+		|    thirteenth: Int, fourteenth: Int, fifteenth: Int, sixteenth: Int
+		|}
+		|
+	match size_fixture(declarations):
+		Err(_): False
+		Ok(parsed):
+			match check(parsed):
+				Err(_): False
+				Ok(program):
+					checked = checked_functions(program)
+					match checked.records:
+						[four, sixteen]: has_template_size(checked, Model.RecordAggregate(four.id), 4, 12, 2) and has_template_size(checked, Model.RecordAggregate(sixteen.id), 16, 48, 2)
+						_: False
+
+
+pure func test_union_templates_grow_linearly_with_tags_and_logical_payloads() -> Bool:
+	declarations: String =
+		|fixed union Two:
+		|    Pair(Int, Void)
+		|    Empty
+		|fixed union Eight:
+		|    First(Int, Void)
+		|    Second(Int)
+		|    Third(Int)
+		|    Fourth(Int)
+		|    Fifth(Int)
+		|    Sixth(Int)
+		|    Seventh(Int)
+		|    Eighth(Int)
+		|fixed union Single:
+		|    Value(Int, Void)
+		|
+	match size_fixture(declarations):
+		Err(_): False
+		Ok(parsed):
+			match check(parsed):
+				Err(_): False
+				Ok(program):
+					checked = checked_functions(program)
+					match inventory_unions(parsed_contents(parsed).declarations):
+						[two, eight, single, ..._]:
+							(
+								has_template_size(checked, Model.UnionAggregate(two.id), 2, 15, 6)
+								and has_template_size(checked, Model.UnionAggregate(eight.id), 9, 66, 20)
+								and has_template_size(checked, Model.UnionAggregate(single.id), 2, 8, 6)
+							)
+						_: False
+
+
+-- Inspect only the ordinary record comparison chain: every failed comparison
+-- returns False immediately, and only its True arm reaches the next field.
+private pure func ordered_record_comparisons(value: Model.CheckedExpr, fields: List[Model.CheckedField], boolean: DesignatedBoolean[VariantId]) -> Bool:
+	var following = value
+	var valid = True
+	for field in fields:
+		match following.form:
+			Model.Match(join):
+				match (join.scrutinee.form, join.arms, join.selection.nodes):
+					(Model.InvokeFunction(call), [failed, succeeded], [Model.EnterArm(false_arm, []), Model.EnterArm(true_arm, []), Model.TestVariant(place, tag, yes, no)]):
+						match (call.target, call.operands, failed.value.form, place.route):
+							(Model.TraitMethod(_), [Model.ValueOperand(left), Model.ValueOperand(right)], Model.ConstructVariant(false_tag, []), Model.MatchRoot):
+								valid = (valid and projects_formal(left, field.id, 0) and projects_formal(right, field.id, 1)
+									and Model.same_variant(false_tag, boolean.false_variant) and Model.same_variant(tag, boolean.true_variant)
+									and Model.same_type(place.value_type, join.scrutinee.value_type)
+									and Model.match_arm_number(false_arm) == Model.match_arm_number(failed.id)
+									and Model.match_arm_number(true_arm) == Model.match_arm_number(succeeded.id)
+									and Model.decision_node_number(yes) == 1 and Model.decision_node_number(no) == 0
+									and Model.decision_node_number(join.selection.entry) == 2
+									and failed.inputs.is_empty() and failed.statements.is_empty()
+									and succeeded.inputs.is_empty() and succeeded.statements.is_empty() and join.carried.is_empty())
+								following = succeeded.value
+							_: valid = False
+					_: valid = False
+			_: valid = False
+	match following.form:
+		Model.ConstructVariant(tag, []): valid and Model.same_variant(tag, boolean.true_variant)
+		_: False
+
+
+pure func test_record_comparisons_short_circuit_in_declared_field_order() -> Bool:
+	declarations: String =
+		|fixed record Triple { first: Int, erased: Void, last: Int }
+		|
+	match size_fixture(declarations):
+		Err(_): False
+		Ok(parsed):
+			match (check(parsed), check_builtin_types(parsed)):
+				(Ok(program), Ok(foundation)):
+					checked = checked_functions(program)
+					match checked.records:
+						[triple]:
+							match Model.equality_body(checked.traits, Model.RecordAggregate(triple.id)):
+								Some(template):
+									match template.body:
+										Model.CheckedValueBody(Model.ReturnExpression(value)): ordered_record_comparisons(value, triple.fields, foundation.designated.boolean)
+										_: False
+								None: False
+						_: False
+				_: False
+
+
+pure func test_an_unused_union_variant_still_requires_payload_equality() -> Bool:
+	provider: String =
+		|import:
+		|    _base: Int, Bool, Equatable
+		|fixed union Reply:
+		|    Good
+		|    Bad(pure (Int) -> Bool)
+		|implements Equatable for Int:
+		|    pure func equals(left: Self, right: Self) -> Bool:
+		|        builtin("int.equals")
+		|pure func good() -> Reply:
+		|    Good
+		|
+	before_use: String =
+		|import:
+		|    int: equals, good
+		|pure func compare() -> Bool:
+		|
+	prefix = before_use + "    "
+	unused: String =
+		|import:
+		|    int: good
+		|func main() -> Int:
+		|    value = good()
+		|    0
+		|
+	match (parse_trait_fixture(prefix + "equals(good(), good())\nfunc main() -> Int:\n    0\n", provider, EQUALITY), parse_trait_fixture(unused, provider, EQUALITY)):
+		(Ok(parsed), Ok(unused_parsed)):
+			match (check(parsed), check(unused_parsed), check_builtin_types(parsed)):
+				(Err(failure), Ok(_), Ok(foundation)):
+					match (inventory_unions(parsed_contents(parsed).declarations), inventory_traits(parsed_contents(parsed).declarations)):
+						([reply, ..._], [canonical]):
+							error = check_errors(failure).first
+							diagnostic = render_failure(failure).first
+							match (reply.variants, error.kind, diagnostic.note):
+								([_, bad], TraitRejection(EqualityMemberUnsupported(required, receiver, Model.EqualityPayload(variant, position))), Some(UnionPayloadDeclaration(note))):
+									match bad.declaration.fields:
+										[written]:
+											(
+												trait_number(required) == trait_number(canonical.id)
+												and Model.same_variant(variant, bad.id) and position == 0
+												and Model.same_type(receiver, Model.CallableType(Pure, [Model.IntType], Model.UnionType(variant_owner(foundation.designated.boolean.true_variant))))
+												and same_span(note, type_span(written))
+												and same_source(error.span.source, module_source(root_module_id()))
+												and error.span.start == prefix.length() and error.span.end == prefix.length() + 6
+												and same_span(error.span, diagnostic.span) and check_errors(failure).remaining.is_empty()
+												and diagnostic.message == "automatic equality is unavailable for a field or payload"
+												and diagnostic.help == "provide the member's required trait implementation, or write an Equatable implementation for the containing type"
+											)
+										_: False
+								_: False
+						_: False
+				_: False
+		_: False

@@ -1,0 +1,152 @@
+import:
+	./harness:
+		run_accounted_example, verify_rejected_command, with_directory,
+		TargetAllocations(PositiveTargetAllocations)
+	./cost: CostLimits
+	system: file_exists, read_file, write_file
+	test: TestSuite
+
+
+private LIBRARY_ROOT: String = "blorp_2/test/e2e/trait_inputs/derived/library"
+
+private fixed record NativeLimits {
+	values: CostLimits,
+	semantics: CostLimits,
+	recursive: CostLimits,
+	callables: CostLimits
+}
+
+
+-- First direct compiler samples (allocations / retired instructions):
+-- values 89,769 / 228,097,875; semantics 57,234 / 151,469,243;
+-- recursive 130,699 / 271,974,524; callables 55,272 / 146,069,416.
+-- These initial limits precede maintained harness measurements; its output paths
+-- and command boundary can differ from the retained direct CLI samples.
+private LIMITS: NativeLimits = {
+	values = { allocations = 100000, instructions = 260000000 },
+	semantics = { allocations = 65000, instructions = 175000000 },
+	recursive = { allocations = 150000, instructions = 315000000 },
+	callables = { allocations = 62000, instructions = 170000000 },
+}
+
+
+func test_derived_values_tags_nan_and_operand_order(compiler: String, limits: CostLimits) -> Bool:
+	run_accounted_example(
+		compiler, LIBRARY_ROOT,
+		"blorp_2/test/e2e/trait_inputs/derived/values.brp", 23, "left\nright\n", limits,
+		PositiveTargetAllocations, "build/traits-T4a/native/values.c",
+	)
+
+
+func test_authored_answers_and_logical_void_positions(compiler: String, limits: CostLimits) -> Bool:
+	run_accounted_example(
+		compiler, LIBRARY_ROOT,
+		"blorp_2/test/e2e/trait_inputs/derived/semantics.brp", 23, "", limits,
+		PositiveTargetAllocations, "build/traits-T4a/native/semantics.c",
+	)
+
+
+func test_ground_recursive_and_deep_list_equality(compiler: String, limits: CostLimits) -> Bool:
+	run_accounted_example(
+		compiler, LIBRARY_ROOT,
+		"blorp_2/test/e2e/trait_inputs/derived/recursive.brp", 23, "", limits,
+		PositiveTargetAllocations, "build/traits-T4a/native/recursive.c",
+	)
+
+
+func test_derived_method_values_defaults_and_forwarding(compiler: String, limits: CostLimits) -> Bool:
+	run_accounted_example(
+		compiler, LIBRARY_ROOT,
+		"blorp_2/test/e2e/trait_inputs/derived/callables.brp", 23, "", limits,
+		PositiveTargetAllocations, "build/traits-T4a/native/callables.c",
+	)
+
+
+private BOUND_ERROR: String =
+	|: error: type does not satisfy the required trait bound
+	|help: add the required trait to this function's type parameter bounds, or provide an implementation for the concrete receiver
+	|
+
+private MEMBER_ERROR: String =
+	|: error: automatic equality is unavailable for a field or payload
+	|help: provide the member's required trait implementation, or write an Equatable implementation for the containing type
+	|
+
+private GENERIC_ERROR: String =
+	|: error: automatic equality for generic aggregate heads is not supported yet
+	|help: write an explicit full-family Equatable implementation for this type; automatic generic equality is a later increment
+	|
+
+
+private func rejected_in_directory(compiler: String, input: String, expected: String, directory: String) -> Result[Void, String]:
+	output = directory + "/rejected.c"
+	absent ?= verify_rejected_command(compiler, LIBRARY_ROOT, input, output, expected)
+	unpublished ?= if file_exists(output):
+		Err("unavailable equality created a C output")
+	else:
+		Ok(void)
+	written ?= write_file(output, "preserve derived output")
+	existing ?= verify_rejected_command(compiler, LIBRARY_ROOT, input, output, expected)
+	actual ?= read_file(output)
+	if actual == "preserve derived output":
+		Ok(void)
+	else:
+		Err("unavailable equality overwrote existing output")
+
+
+private func rejected_use(compiler: String, input: String, expected: String) -> Bool:
+	with_directory(func(directory: String): rejected_in_directory(compiler, input, expected, directory))
+
+
+func test_recursive_callback_member_is_reported_at_use(compiler: String) -> Bool:
+	input = "blorp_2/test/e2e/trait_inputs/derived/reject_callback.brp"
+	expected = (
+		input + ":8:5" + MEMBER_ERROR
+		+ input + ":5:57: note: record field declared here\n"
+	)
+	rejected_use(compiler, input, expected)
+
+
+func test_callback_before_recursive_child_keeps_the_terminal_member(compiler: String) -> Bool:
+	input = "blorp_2/test/e2e/trait_inputs/derived/reject_callback_reordered.brp"
+	expected = (
+		input + ":8:5" + MEMBER_ERROR
+		+ input + ":5:33: note: record field declared here\n"
+	)
+	rejected_use(compiler, input, expected)
+
+
+func test_generic_automatic_equality_is_deferred_at_use(compiler: String) -> Bool:
+	input = "blorp_2/test/e2e/trait_inputs/derived/reject_generic_head.brp"
+	rejected_use(compiler, input, input + ":7:5" + GENERIC_ERROR)
+
+
+func test_nested_generic_head_reports_its_actual_member(compiler: String) -> Bool:
+	input = "blorp_2/test/e2e/trait_inputs/derived/reject_nested_generic_head.brp"
+	expected = (
+		input + ":8:5" + GENERIC_ERROR
+		+ input + ":5:31: note: record field declared here\n"
+	)
+	rejected_use(compiler, input, expected)
+
+
+func test_authored_ground_family_never_falls_back_after_a_failed_bound(compiler: String) -> Bool:
+	input = "blorp_2/test/e2e/trait_inputs/derived/reject_authored_bound.brp"
+	rejected_use(compiler, input, input + ":15:5" + BOUND_ERROR)
+
+
+pure func suite(compiler: String) -> TestSuite:
+	{
+		description = "Blorp 2 nongeneric structural equality native behavior",
+		tests = [
+			("derived values preserve tags NaN and written operand order", func(): test_derived_values_tags_nan_and_operand_order(compiler, LIMITS.values)),
+			("authored nested answers include logical erased Void", func(): test_authored_answers_and_logical_void_positions(compiler, LIMITS.semantics)),
+			("ground recursive and List cubed equality reaches main", func(): test_ground_recursive_and_deep_list_equality(compiler, LIMITS.recursive)),
+			("derived method values defaults and forwarding remain ordinary", func(): test_derived_method_values_defaults_and_forwarding(compiler, LIMITS.callables)),
+			("recursive callback member rejects only at equality use", func(): test_recursive_callback_member_is_reported_at_use(compiler)),
+			("callback first still names the real terminal member", func(): test_callback_before_recursive_child_keeps_the_terminal_member(compiler)),
+			("generic automatic equality remains explicitly deferred", func(): test_generic_automatic_equality_is_deferred_at_use(compiler)),
+			("nested generic deferred cause retains the field note", func(): test_nested_generic_head_reports_its_actual_member(compiler)),
+			("authored ground family does not fall back on failed bounds", func(): test_authored_ground_family_never_falls_back_after_a_failed_bound(compiler)),
+		]
+	}
