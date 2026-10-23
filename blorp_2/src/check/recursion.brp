@@ -13,7 +13,8 @@ import:
 		),
 		recursion_error,
 	./model:
-		CallTarget(RuntimeFunction, UserFunction, CallableParameter, ValueCall),
+		AcceptedTraits, method_body,
+		CallTarget(TraitMethod, RuntimeFunction, UserFunction, CallableParameter, ValueCall),
 		CheckedArm,
 		CheckedBody(CheckedMatchBody, CheckedValueBody),
 		CheckedCallOperand(ValueOperand, CallableOperand),
@@ -41,8 +42,12 @@ import:
 	../utils/syntax: FunctionExecution(OrdinaryCalls, SelfTailLoop), ParsedFunction, Span
 
 
-private pure func is_self_call(call: CheckedCall, current: FunctionId) -> Bool:
+private pure func is_self_call(call: CheckedCall, current: FunctionId, traits: AcceptedTraits) -> Bool:
 	match call.target:
+		TraitMethod(method):
+			match method_body(traits, method):
+				Some(id): IntOps.equals(function_number(id), function_number(current))
+				None: False
 		UserFunction(id, _):
 			IntOps.equals(function_number(id), function_number(current))
 		RuntimeFunction(_) | CallableParameter(_) | ValueCall(_):
@@ -51,11 +56,11 @@ private pure func is_self_call(call: CheckedCall, current: FunctionId) -> Bool:
 
 -- The first direct self call among evaluated values, in evaluation order.
 -- These checks traverse evaluated children, never recovering identity from names.
-private pure func first_self_call(values: List[CheckedExpr], current: FunctionId) -> Option[Span]:
+private pure func first_self_call(values: List[CheckedExpr], current: FunctionId, traits: AcceptedTraits) -> Option[Span]:
 	var found: Option[Span] = None
 
 	for value in values:
-		found = self_call_in(value, current)
+		found = self_call_in(value, current, traits)
 
 		if found.is_some():
 			break
@@ -65,67 +70,67 @@ private pure func first_self_call(values: List[CheckedExpr], current: FunctionId
 
 -- A node's children are evaluated before the node, so a call's arguments,
 -- receiver first, are searched before the call itself.
-private pure func self_call_in(value: CheckedExpr, current: FunctionId) -> Option[Span]:
+private pure func self_call_in(value: CheckedExpr, current: FunctionId, traits: AcceptedTraits) -> Option[Span]:
 	match value.form:
 		ConstructOpaque(_, child):
-			self_call_in(child, current)
+			self_call_in(child, current, traits)
 		ProjectOpaque(_, child):
-			self_call_in(child, current)
+			self_call_in(child, current, traits)
 		InvokeFunction(call):
 			var found: Option[Span] = match call.target:
-				ValueCall(callee): self_call_in(callee, current)
-				UserFunction(_, _) | RuntimeFunction(_) | CallableParameter(_): None
+				ValueCall(callee): self_call_in(callee, current, traits)
+				TraitMethod(_) | UserFunction(_, _) | RuntimeFunction(_) | CallableParameter(_): None
 			for operand in call.operands:
 				if found.is_some():
 					break
 				match operand:
-					ValueOperand(argument): found = self_call_in(argument, current)
+					ValueOperand(argument): found = self_call_in(argument, current, traits)
 					CallableOperand(_, choice, _):
 						match choice:
-							StoredCallable(child): found = self_call_in(child, current)
+							StoredCallable(child): found = self_call_in(child, current, traits)
 							NamedCallable(_, _) | ForwardedCallable(_) | LambdaCallable(_, _): void
 			match found:
 				Some(span):
 					Some(span)
 				None:
-					if is_self_call(call, current):
+					if is_self_call(call, current, traits):
 						Some(value.span)
 					else:
 						None
 		ConstructVariant(_, fields):
-			first_self_call(fields, current)
+			first_self_call(fields, current, traits)
 		ConstructTuple(elements):
-			first_self_call(elements, current)
+			first_self_call(elements, current, traits)
 		ConstructList(elements):
-			first_self_call(elements, current)
+			first_self_call(elements, current, traits)
 		Match(join):
 			-- A self call anywhere in a non-tail match is a non-tail call.
-			var found = self_call_in(join.scrutinee, current)
+			var found = self_call_in(join.scrutinee, current, traits)
 			for arm in join.arms:
 				if found.is_none():
-					found = first_self_call(statement_values(arm.statements).append(arm.value), current)
+					found = first_self_call(statement_values(arm.statements).append(arm.value), current, traits)
 			found
 		ConstructRecord(_, fields):
 			var found: Option[Span] = None
 			for field in fields:
 				if found.is_some():
 					break
-				found = self_call_in(field.value, current)
+				found = self_call_in(field.value, current, traits)
 			found
 		UpdateRecord(_, update):
-			var found = self_call_in(update.base, current)
+			var found = self_call_in(update.base, current, traits)
 			for field in update.replacements:
 				if found.is_some():
 					break
-				found = self_call_in(field.value, current)
+				found = self_call_in(field.value, current, traits)
 			found
 		ReadTupleElement(receiver, _):
-			self_call_in(receiver, current)
+			self_call_in(receiver, current, traits)
 		ReadRecordField(receiver, _):
-			self_call_in(receiver, current)
+			self_call_in(receiver, current, traits)
 		MakeCallable(choice):
 			match choice:
-				StoredCallable(operand): self_call_in(operand, current)
+				StoredCallable(operand): self_call_in(operand, current, traits)
 				NamedCallable(_, _) | ForwardedCallable(_) | LambdaCallable(_, _): None
 		LiteralVoid | LiteralInteger(_) | LiteralFloat(_) | LiteralString(_) | ReadBinding(_) | ReadCapture(_):
 			None
@@ -133,9 +138,9 @@ private pure func self_call_in(value: CheckedExpr, current: FunctionId) -> Optio
 
 private pure func reject_self_calls(
 	values: List[CheckedExpr],
-	current: FunctionId,
+	current: FunctionId, traits: AcceptedTraits,
 ) -> Result[Void, CheckError]:
-	match first_self_call(values, current):
+	match first_self_call(values, current, traits):
 		Some(span):
 			Err(recursion_error(span, NonTailSelfCall(current)))
 		None:
@@ -171,10 +176,10 @@ private fixed record TailCall {
 }
 
 
-private pure func tail_call(value: CheckedExpr, current: FunctionId) -> Option[TailCall]:
+private pure func tail_call(value: CheckedExpr, current: FunctionId, traits: AcceptedTraits) -> Option[TailCall]:
 	match value.form:
 		InvokeFunction(call):
-			if is_self_call(call, current):
+			if is_self_call(call, current, traits):
 				var arguments: List[CheckedExpr] = []
 				for operand in call.operands:
 					match operand:
@@ -192,19 +197,19 @@ private pure func tail_call(value: CheckedExpr, current: FunctionId) -> Option[T
 
 private pure func tail_exit(
 	exit: CheckedExit,
-	current: FunctionId,
+	current: FunctionId, traits: AcceptedTraits,
 ) -> Result[CheckedExit, CheckError]:
 	match exit:
 		RecurWith(_, _):
 			Ok(exit)
 		ReturnExpression(value):
-			match tail_call(value, current):
+			match tail_call(value, current, traits):
 				Some(call):
-					match reject_self_calls(call.arguments, current):
+					match reject_self_calls(call.arguments, current, traits):
 						Ok(valid): Ok(RecurWith(call.arguments, call.span))
 						Err(error): Err(error)
 				None:
-					match nested_tail(value, current):
+					match nested_tail(value, current, traits):
 						Ok(valid): Ok(exit)
 						Err(error): Err(error)
 
@@ -213,40 +218,40 @@ private pure func tail_exit(
 -- to each arm's value: a self call that is such a value needs a backedge out
 -- of a join, which does not exist yet; a self call anywhere else is an
 -- ordinary non-tail call.
-private pure func nested_tail(value: CheckedExpr, current: FunctionId) -> Result[Void, CheckError]:
-	match tail_call(value, current):
+private pure func nested_tail(value: CheckedExpr, current: FunctionId, traits: AcceptedTraits) -> Result[Void, CheckError]:
+	match tail_call(value, current, traits):
 		Some(call):
 			Err(recursion_error(call.span, TailCallInNestedMatch))
 		None:
 			match value.form:
 				Match(join):
-					var checked = reject_self_calls([join.scrutinee], current)
+					var checked = reject_self_calls([join.scrutinee], current, traits)
 					for arm in join.arms:
 						if checked.is_ok():
-							checked = reject_self_calls(statement_values(arm.statements), current)
+							checked = reject_self_calls(statement_values(arm.statements), current, traits)
 						if checked.is_ok():
-							checked = nested_tail(arm.value, current)
+							checked = nested_tail(arm.value, current, traits)
 					checked
 				_:
-					reject_self_calls([value], current)
+					reject_self_calls([value], current, traits)
 
 
 private pure func tail_arms(
 	arms: List[CheckedArm],
-	current: FunctionId,
+	current: FunctionId, traits: AcceptedTraits,
 	checked: List[CheckedArm],
 ) -> Result[List[CheckedArm], CheckError]:
 	match arms.get(checked.length()):
 		None:
 			Ok(checked)
 		Some(arm):
-			match reject_self_calls(statement_values(arm.statements), current):
+			match reject_self_calls(statement_values(arm.statements), current, traits):
 				Ok(prefix):
-					match tail_exit(arm.body, current):
+					match tail_exit(arm.body, current, traits):
 						Ok(exit):
 							tail_arms(
 								arms,
-								current,
+								current, traits,
 								checked.append({ arm | body = exit }),
 							)
 						Err(error): Err(error)
@@ -286,7 +291,7 @@ pure func check_execution(
 	function: ParsedFunction,
 	statements: List[CheckedStatement],
 	body: CheckedBody,
-	current: FunctionId,
+	current: FunctionId, traits: AcceptedTraits,
 ) -> Result[CheckedExecution, CheckError]:
 	match function.tail_annotation:
 		None:
@@ -296,18 +301,18 @@ pure func check_execution(
 			})
 		Some(annotation):
 			if IntOps.equals(function.type_parameters.length(), 0):
-				match reject_self_calls(statement_values(statements), current):
+				match reject_self_calls(statement_values(statements), current, traits):
 					Ok(prefix):
 
 						tail_body: Result[CheckedBody, CheckError] = match body:
 							CheckedValueBody(value):
-								match tail_exit(value, current):
+								match tail_exit(value, current, traits):
 									Ok(exit): Ok(CheckedValueBody(exit))
 									Err(error): Err(error)
 							CheckedMatchBody(matched):
-								match reject_self_calls([matched.scrutinee], current):
+								match reject_self_calls([matched.scrutinee], current, traits):
 									Ok(scrutinee):
-										match tail_arms(matched.arms, current, []):
+										match tail_arms(matched.arms, current, traits, []):
 											Ok(arms): Ok(CheckedMatchBody({ matched | arms = arms }))
 											Err(error): Err(error)
 									Err(error): Err(error)
@@ -420,7 +425,7 @@ private pure func parameter_reaches(
 
 
 pure func validate_recursive_instantiation(
-	functions: List[CheckedFunction], lambdas: List[CheckedLambda],
+	functions: List[CheckedFunction], lambdas: List[CheckedLambda], traits: AcceptedTraits,
 ) -> Result[Void, CheckError]:
 	-- These transient edges relate declaration-owned parameter identities, using
 	-- each checked call's simultaneous substitution. They are discarded before
@@ -433,11 +438,11 @@ pure func validate_recursive_instantiation(
 	var dependencies: List[ParameterDependency] = []
 
 	for function in functions:
-		dependencies = append_call_dependencies(dependencies, function_calls(function))
+		dependencies = append_call_dependencies(dependencies, function_calls(function), traits)
 		dependencies = append_creation_dependencies(dependencies, body_callable_creations(function.statements, function.body))
 	-- Potential calls include ignored and nested lambdas, independently of runtime selection.
 	for lambda in lambdas:
-		dependencies = append_call_dependencies(dependencies, lambda_calls(lambda))
+		dependencies = append_call_dependencies(dependencies, lambda_calls(lambda), traits)
 		dependencies = append_creation_dependencies(dependencies, body_callable_creations(lambda.statements, lambda.body))
 
 	var growing: Option[ParameterDependency] = None
@@ -459,11 +464,15 @@ pure func validate_recursive_instantiation(
 
 
 private pure func append_call_dependencies(
-	previous: List[ParameterDependency], calls: List[CheckedCall],
+	previous: List[ParameterDependency], calls: List[CheckedCall], traits: AcceptedTraits,
 ) -> List[ParameterDependency]:
 	var dependencies = previous
 	for call in calls:
 		match call.target:
+			TraitMethod(method):
+				match method_body(traits, method):
+					Some(declaration): dependencies = append_named_dependencies(dependencies, declaration, [], call.span)
+					None: void
 			UserFunction(declaration, arguments):
 				var position = 0
 

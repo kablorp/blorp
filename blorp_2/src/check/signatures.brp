@@ -12,12 +12,12 @@ import:
 		CheckError,
 		CheckerInvariant(InvalidResolvedFunction, RuntimeContractMismatch),
 		SignatureError(GenericMain, MainHasParameters, MainParameterType, MainReturnType, MissingMain),
-		checker_invariant,
+		checker_invariant, trait_error, TraitError(ConcreteReceiverRequired),
 		signature_error,
 		BuiltinError(BuiltinContractMismatch, BuiltinTailAnnotation),
 		builtin_error
 	./model:
-		FunctionSignature,
+		FunctionSignature, ImplementationHeader,
 		TypeParameterOwner(FunctionDeclaration),
 		TypeRef(CallableType, IntType, ListType, StringType, VoidType, UnionType, AppliedUnionType),
 		TypeUse,
@@ -35,7 +35,7 @@ import:
 	../namespace/namespace: Namespace, FunctionSource(DeclaredHere), NamedValue(NamedFunction), named_value
 	../parse/assemble: ParsedContents
 	../utils/ids:
-		FunctionId,
+		FunctionId, FunctionRole(ImplementationBody, FreeFunctionBody), inventory_implementations, impl_number,
 		VariantId,
 		function_number,
 		inventory_functions,
@@ -43,8 +43,9 @@ import:
 		inventory_unions,
 		variant_owner
 	../utils/source: root_module_id
+	../utils/names: contextual_words
 	../utils/syntax:
-		TypeSyntax(CallableTypeSyntax),
+		TypeSyntax(CallableTypeSyntax, AtomicType, QualifiedType),
 		EntryResult(IntegerExitStatus, SuccessfulExit),
 		Entrypoint(NoArguments, WithArguments),
 		ParsedBody(ParsedBuiltinBody, ParsedMatchBody, ParsedValueBody),
@@ -65,7 +66,7 @@ import:
 	option: to_result
 
 
-private fixed union FunctionRole:
+private fixed union SignatureRole:
 	EntryFunction
 	HelperFunction
 
@@ -93,6 +94,7 @@ fixed record AcceptedFunction {
 
 
 fixed record CheckedSignatures {
+	implementation_headers: List[ImplementationHeader],
 	functions: List[AcceptedFunction],
 	entrypoint: Entrypoint[FunctionId]
 }
@@ -108,7 +110,8 @@ pure func validate_signatures(
 	entrypoint: Option[FunctionId] = match named_value(namespace, root_module_id(), parsed.entrypoint):
 		Some(NamedFunction(id, DeclaredHere)): Some(id)
 		_: None
-	functions ?= accept_functions(parsed, namespace, designated, entrypoint, [])
+	headers ?= implementation_headers(parsed, namespace)
+	functions ?= accept_functions(parsed, namespace, designated, entrypoint, headers, [])
 	id ?= entrypoint.to_result(signature_error(parsed.end, MissingMain))
 	main ?= functions
 		.get(function_number(id))
@@ -127,6 +130,7 @@ pure func validate_signatures(
 
 	Ok({
 		functions = functions,
+		implementation_headers = headers,
 		entrypoint = accepted,
 	})
 
@@ -136,6 +140,7 @@ private pure func accept_functions(
 	namespace: Namespace,
 	designated: DesignatedUnions,
 	entrypoint: Option[FunctionId],
+	headers: List[ImplementationHeader],
 	accepted: List[AcceptedFunction],
 ) -> Result[List[AcceptedFunction], CheckError]:
 	match inventory_functions(parsed.declarations).get(accepted.length()):
@@ -146,7 +151,7 @@ private pure func accept_functions(
 
 			id = row.id
 
-			role: FunctionRole = match entrypoint:
+			role: SignatureRole = match entrypoint:
 				Some(entry):
 					if IntOps.equals(function_number(id), function_number(entry)):
 						EntryFunction
@@ -156,6 +161,7 @@ private pure func accept_functions(
 					HelperFunction
 
 			scope: TypeScope = {
+				self_binding = None,
 				records = inventory_records(parsed.declarations),
 				unions = inventory_unions(parsed.declarations),
 				namespace = namespace,
@@ -163,13 +169,17 @@ private pure func accept_functions(
 				access = type_access(function.visibility, function.function_name.id),
 				parameters = []
 			}
-			match resolve_signature(function, id, role, scope, designated):
+			definition_scope = match row.role:
+				FreeFunctionBody: scope
+				ImplementationBody: implementation_scope(parsed, headers, row.id, scope)
+			match resolve_signature(function, id, role, definition_scope, designated):
 				Ok(signature):
 					accept_functions(
 						parsed,
 						namespace,
 						designated,
 						entrypoint,
+						headers,
 						accepted.append(signature),
 					)
 				Err(error): Err(error)
@@ -178,7 +188,7 @@ private pure func accept_functions(
 private pure func resolve_signature(
 	function: ParsedFunction,
 	id: FunctionId,
-	role: FunctionRole,
+	role: SignatureRole,
 	module_scope: TypeScope,
 	designated: DesignatedUnions,
 ) -> Result[AcceptedFunction, CheckError]:
@@ -259,7 +269,7 @@ private pure func resolve_signature(
 -- Resolves parameter types; the body scope validates every parameter name.
 private pure func resolve_parameters(
 	parameters: List[ParsedParameter],
-	role: FunctionRole,
+	role: SignatureRole,
 	scope: TypeScope,
 	resolved: List[TypeUse],
 ) -> Result[List[TypeUse], CheckError]:
@@ -455,3 +465,41 @@ pure func validate_builtin_body(
 		Ok(operation)
 	else:
 		Err(builtin_error(site.span, BuiltinContractMismatch(parsed)))
+
+
+-- Concrete receiver types are established once, before member signatures.
+private pure func implementation_headers(parsed: ParsedContents, namespace: Namespace) -> Result[List[ImplementationHeader], CheckError]:
+	var headers: List[ImplementationHeader] = []
+	var failure: Option[CheckError] = None
+	for row in inventory_implementations(parsed.declarations):
+		scope: TypeScope = {
+			records = inventory_records(parsed.declarations), unions = inventory_unions(parsed.declarations),
+			namespace = namespace, module = row.header.module, access = PrivateTypeUse,
+			parameters = [], self_binding = None
+		}
+		resolved: Result[TypeRef, CheckError] = match row.header.receiver:
+			AtomicType(_) | QualifiedType(_, [], _): resolve_type(scope, row.header.receiver)
+			_: Err(trait_error(type_span(row.header.receiver), ConcreteReceiverRequired))
+		match resolved:
+			Ok(receiver):
+				header: ImplementationHeader = { receiver = receiver }
+				headers = headers.append(header)
+			Err(error):
+				failure = Some(error)
+				break
+	match failure:
+		Some(error): Err(error)
+		None: Ok(headers)
+
+
+-- Inventory alone owns body membership. This transient definition scope gives
+-- authored Self its actual type without adding it to function generic arguments.
+private pure func implementation_scope(parsed: ParsedContents, headers: List[ImplementationHeader], function: FunctionId, scope: TypeScope) -> TypeScope:
+	var definition = scope
+	for row in inventory_implementations(parsed.declarations):
+		for member in row.methods:
+			if IntOps.equals(function_number(member), function_number(function)):
+				match headers.get(impl_number(row.id)):
+					Some(header): definition = { scope | access = PrivateTypeUse, self_binding = Some({ name = contextual_words(parsed.names).self_word, value_type = header.receiver }) }
+					None: void
+	definition

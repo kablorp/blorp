@@ -1,0 +1,113 @@
+import:
+	../../../src/lex/lex: lex
+	../../../src/parse/parse: ParsedModule, module_contents, parse_module
+	../../../src/utils/names: name_spelling, program_names
+	../../../src/utils/source: module_source, root_module_id, same_module, same_source
+	../../../src/utils/syntax: Diagnostic, ParsedFunctionGroup(FreeFunction, ImplementationGroup), ParsedBody(ParsedValueBody), ExpressionBase(IntegerExpression), TypeSyntax(AtomicType, QualifiedType), Purity(Pure), same_purity
+	test: TestSuite
+
+
+private REQUIREMENT: String =
+	|trait Equatable:
+	|    pure func equals(left: Self, right: Self) -> Bool
+	|
+
+
+private pure func parsed(source: String) -> Result[ParsedModule, Diagnostic]:
+	tokens ?= lex(module_source(root_module_id()), source, program_names().names)
+	parse_module(tokens, root_module_id())
+
+
+pure func test_signature_only_trait_requirement_has_located_fields() -> Bool:
+	match parsed(REQUIREMENT):
+		Err(_): False
+		Ok(module):
+			contents = module_contents(module)
+			match contents.traits:
+				[declaration]:
+					match declaration.methods:
+						[method]:
+							match (method.header.parameters, method.header.return_type):
+								([left, right], Some(AtomicType(result))):
+									match (left.type_name, right.type_name):
+										(AtomicType(first), AtomicType(second)):
+											(contents.functions.is_empty() and same_module(declaration.module, root_module_id())
+												and name_spelling(contents.names, declaration.type_name.id) == Some("Equatable")
+												and declaration.type_name.span.start == 6 and declaration.type_name.span.end == 15
+												and name_spelling(contents.names, method.header.function_name.id) == Some("equals")
+												and method.header.function_name.span.start == 31 and method.header.function_name.span.end == 37
+												and same_source(method.span.source, module_source(root_module_id())) and method.span.start == 21 and method.span.end == REQUIREMENT.length() - 1
+												and same_purity(method.header.purity, Pure) and method.header.type_parameters.is_empty()
+												and name_spelling(contents.names, first.id) == Some("Self") and name_spelling(contents.names, second.id) == Some("Self")
+												and name_spelling(contents.names, result.id) == Some("Bool"))
+										_: False
+								_: False
+						_: False
+				_: False
+
+
+pure func test_trait_method_omitted_return_is_signature_void() -> Bool:
+	match parsed("trait Observable:\n    pure func observe(value: Self)\n"):
+		Err(_): False
+		Ok(module):
+			match module_contents(module).traits:
+				[declaration]:
+					match declaration.methods:
+						[method]: method.header.return_type.is_none()
+						_: False
+				_: False
+
+
+pure func test_implementation_owns_real_bodies_between_free_functions() -> Bool:
+	match parsed("pure func before() -> Int:\n    1\nimplements Ops.Equatable for Shape:\n    pure func equals(left: Shape, right: Shape) -> Int:\n        7\npure func after() -> Int:\n    2\n"):
+		Err(_): False
+		Ok(module):
+			contents = module_contents(module)
+			match contents.functions:
+				[FreeFunction(before), ImplementationGroup(header, [method]), FreeFunction(after)]:
+					match (header.trait_name, header.receiver, method.body):
+						(QualifiedType(requirement, [], _), AtomicType(receiver), ParsedValueBody(value)):
+							match value.base:
+								IntegerExpression(7):
+									(same_module(header.module, root_module_id()) and same_module(method.module, root_module_id())
+										and name_spelling(contents.names, requirement.module.id) == Some("Ops") and name_spelling(contents.names, requirement.name.id) == Some("Equatable")
+										and name_spelling(contents.names, receiver.id) == Some("Shape")
+										and name_spelling(contents.names, before.function_name.id) == Some("before") and name_spelling(contents.names, after.function_name.id) == Some("after")
+										and before.function_name.span.start < header.span.start and method.function_name.span.start < after.function_name.span.start)
+								_: False
+						_: False
+				_: False
+
+
+private pure func rejected_at(prefix: String, marked: String, suffix: String, message: String, help: String) -> Bool:
+	match parsed(prefix + marked + suffix):
+		Ok(_): False
+		Err(error):
+			(same_source(error.span.source, module_source(root_module_id()))
+				and error.span.start == prefix.length() and error.span.end == prefix.length() + marked.length()
+				and error.message == message and error.help == help and error.note.is_none())
+
+
+pure func test_requirement_default_body_is_rejected_at_colon() -> Bool:
+	rejected_at("trait Equatable:\n    pure func equals(left: Self, right: Self) -> Bool", ":", "\n        True\n", "trait method defaults are not supported yet", "declare the signature only")
+
+
+pure func test_trait_parameters_are_rejected_at_their_opening() -> Bool:
+	rejected_at("trait Equatable", "[", "T]:\n    pure func equals(left: Self, right: Self) -> Bool\n", "traits do not take type parameters", "use Self for the implementing type")
+
+
+pure func test_generic_implementation_prefix_is_rejected_at_its_opening() -> Bool:
+	rejected_at("implements", "[", "T] Equatable for Box[T]:\n    pure func equals(left: Box[T], right: Box[T]) -> Bool:\n        True\n", "generic implementations are not supported yet", "implement a concrete receiver type")
+
+
+tests: TestSuite = {
+	description = "Blorp 2 located trait and implementation syntax",
+	tests = [
+		("signature-only requirement retains located fields without a function body", test_signature_only_trait_requirement_has_located_fields),
+		("omitted requirement return uses the implicit Void signature", test_trait_method_omitted_return_is_signature_void),
+		("implementation owns real bodies in written function order", test_implementation_owns_real_bodies_between_free_functions),
+		("trait default body rejects at its colon", test_requirement_default_body_is_rejected_at_colon),
+		("trait type parameters reject at their opening bracket", test_trait_parameters_are_rejected_at_their_opening),
+		("generic implementation prefix rejects at its opening bracket", test_generic_implementation_prefix_is_rejected_at_its_opening),
+	]
+}

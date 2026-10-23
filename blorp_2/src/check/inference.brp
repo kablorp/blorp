@@ -8,16 +8,17 @@ import:
 	../utils/boolean: not, and, or
 	./callables:
 		FunctionContract, ReceiverCandidate, ResolvedReceiver(UniqueReceiver, ReceiverCandidates),
-		ResolutionContext, method_sites, receiver_contract
+		ResolutionContext, method_sites, receiver_contract, accept_method_call
 	./model:
 		CheckedExpr, BindingId, CaptureId, ScopedBindingId, LambdaId, CallableParameterId, CheckedCallOperand, FunctionSignature,
-		CallIdentity(DeclaredTarget, ParameterTarget, ValueTarget, ConstantTarget),
+		AcceptedTraits,
+		CallIdentity(MethodTarget, DeclaredTarget, ParameterTarget, ValueTarget, ConstantTarget),
 		FieldId,
 		CheckedCall,
 		TypeParameterId,
 		TypeRef(TupleType, CallableType, ListType, AppliedRecordType, AppliedUnionType, ParameterType),
 		TypeUse,
-		CallTarget(UserFunction, CallableParameter, ValueCall),
+		CallTarget(TraitMethod, UserFunction, CallableParameter, ValueCall),
 		same_type,
 		same_parameter,
 		parameter_position,
@@ -31,7 +32,7 @@ import:
 		CheckerInvariant(GenericConstructorContract, InvalidInferenceVariable, InvalidInferenceWorklist, InvalidFunctionContract, MissingCallParameter, MissingGenericParameter),
 		call_error,
 		checker_invariant
-	../utils/ids: FunctionId, OpaqueId, RecordId, UnionId, VariantId, record_number, union_number
+	../utils/ids: TraitMethodId, FunctionId, OpaqueId, RecordId, UnionId, VariantId, record_number, union_number
 	../utils/syntax: Purity, same_purity, Span, WrittenName, ReceiverApplication
 	../namespace/namespace: same_head
 	int as IntOps
@@ -57,6 +58,7 @@ fixed record PendingRecordField {
 -- The scheduling boundary consumes the resolved identity. Stored callees are
 -- already accepted local/capture reads, not another pending inference tree.
 fixed union PendingCallTarget:
+	PendingMethod(TraitMethodId)
 	PendingDeclared(FunctionId)
 	PendingParameter(CallableParameterId)
 	PendingStored(CheckedExpr)
@@ -72,6 +74,7 @@ fixed record PendingCall {
 
 pure func static_pending_call(contract: FunctionContract, start: Int) -> Result[PendingCall, CheckError]:
 	selected: Result[PendingCallTarget, CheckError] = match contract.target:
+		MethodTarget(id): Ok(PendingMethod(id))
 		DeclaredTarget(id): Ok(PendingDeclared(id))
 		ParameterTarget(id): Ok(PendingParameter(id))
 		ValueTarget(_) | ConstantTarget(_): Err(checker_invariant(contract.span, InvalidFunctionContract))
@@ -1687,6 +1690,7 @@ pure func publish_pending_call(
 	call: PendingCall,
 	operands: List[CheckedCallOperand],
 	slots: List[InferenceSlot],
+	traits: AcceptedTraits,
 ) -> Result[CheckedCall, CheckError]:
 	var types: List[TypeRef] = []
 	var failure: Option[CheckError] = None
@@ -1699,10 +1703,14 @@ pure func publish_pending_call(
 	ready: Void ?= match failure:
 		Some(error): Err(error)
 		None: Ok(void)
-	target: CallTarget = match call.target:
-		PendingDeclared(function): UserFunction(function, types)
-		PendingParameter(parameter): CallableParameter(parameter)
-		PendingStored(callee): ValueCall(callee)
+	target: CallTarget ?= match call.target:
+		PendingMethod(method):
+			match types:
+				[receiver]: ResultOps.map(accept_method_call(traits, method, receiver, call.span), pure func(accepted): TraitMethod(accepted))
+				_: Err(checker_invariant(call.span, InvalidFunctionContract))
+		PendingDeclared(function): Ok(UserFunction(function, types))
+		PendingParameter(parameter): Ok(CallableParameter(parameter))
+		PendingStored(callee): Ok(ValueCall(callee))
 	Ok({ target = target, operands = operands, span = call.span })
 
 

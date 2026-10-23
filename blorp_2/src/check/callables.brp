@@ -10,15 +10,16 @@ import:
 	./errors:
 		CallError(ArgumentCountMismatch, ImpureCall, ImpureCallableCall, UnknownFunction),
 		CheckError,
-		CheckerInvariant(InvalidResolvedFunction),
+		CheckerInvariant(InvalidResolvedFunction, InvalidFunctionContract),
 		call_error,
-		checker_invariant,
+		checker_invariant, trait_error, TraitError(MissingImplementation, DifferentMethodFamilies, FamilyFunctionConflict),
 		MethodCandidateSite,
 		MethodError(ConstructorUFCS),
 		method_error
 	./model:
 		BodyOwner, ScopedBindingId,
-		CallIdentity(DeclaredTarget, ParameterTarget),
+		AcceptedTraits, AcceptedMethodCall, accepted_method, method_body,
+		CallIdentity(MethodTarget, DeclaredTarget, ParameterTarget),
 		CheckedConstant,
 		CheckedOpaque,
 		FunctionSignature,
@@ -28,7 +29,7 @@ import:
 		type_head
 	./scope: CallableBinding, callable_parameter_contract
 	./signatures: AcceptedFunction
-	../utils/ids: FunctionId, OpaqueRow, VariantId, function_number
+	../utils/ids: TraitMethodId, trait_method_owner, trait_method_number, trait_number, same_trait_method, FunctionId, OpaqueRow, VariantId, function_number
 	../utils/syntax:
 		CallNotation(DirectCall, ReceiverCall),
 		Purity(Impure, Pure),
@@ -38,11 +39,11 @@ import:
 		same_purity,
 		ReceiverApplication
 	../namespace/namespace:
-		FunctionSource(DeclaredHere, ImportedAt), Namespace, NamedValue(NamedFunction, NamedConstructor), OfferedValue(OfferedFunction), TypeHead,
+		FunctionSource(DeclaredHere, ImportedAt), Namespace, NamedValue(NamedMethod, NamedFunction, NamedConstructor), OfferedValue(OfferedMethod, OfferedFunction), TypeHead, MethodImport, ValueBinding(MethodName), value_binding,
 		method_imports, named_value, offered_value, same_head,
-	../utils/source: ModuleId
+	../utils/source: ModuleId, same_module, module_source, same_source
 	int as IntOps
-	option: to_result
+	option: to_result, is_some
 
 
 -- The active body owns purity independently of its root declaration.
@@ -150,6 +151,7 @@ fixed union SourceLoopScope:
 
 
 fixed record ResolutionContext {
+	traits: AcceptedTraits,
 	caller: Caller,
 	root_function: FunctionId,
 	module: ModuleId,
@@ -253,6 +255,17 @@ pure func classify_receiver(
 ) -> Result[ResolvedReceiver, CheckError]:
 	name = application.callee
 
+	method ?= visible_method(context.namespace, context.traits, context.signatures, context.module, name)
+	match method:
+		Some(id):
+			match method_contract(name, IntOps.add(application.arguments.length(), 1), ReceiverCall, id, context.traits):
+				Ok(contract): Ok(UniqueReceiver(contract))
+				Err(error): Err(error)
+		None: classify_function_receiver(application, context)
+
+
+private pure func classify_function_receiver(application: ReceiverApplication, context: ResolutionContext) -> Result[ResolvedReceiver, CheckError]:
+	name = application.callee
 	candidates ?= receiver_bindings(context.namespace, context.signatures, context.module, name)
 	match candidates:
 		[]:
@@ -305,3 +318,104 @@ pure func value_callable_contract(
 	else:
 		Ok(void)
 	Ok({ target = target, signature = signature, span = name.span })
+
+
+pure func method_contract(name: WrittenName, count: Int, notation: CallNotation, method: TraitMethodId, traits: AcceptedTraits) -> Result[FunctionContract, CheckError]:
+	owner ?= traits.declarations.get(trait_number(trait_method_owner(method))).to_result(checker_invariant(name.span, InvalidFunctionContract))
+	accepted ?= owner.methods.get(trait_method_number(method)).to_result(checker_invariant(name.span, InvalidFunctionContract))
+	arity ?= validate_arity(name, notation, count, MethodTarget(method), accepted.signature)
+	Ok({ target = MethodTarget(method), signature = accepted.signature, span = name.span })
+
+
+-- The receiver is already solved by ordinary equations. Implementation search
+-- proves the obligation; it never supplies missing inference evidence.
+pure func accept_method_call(traits: AcceptedTraits, method: TraitMethodId, receiver: TypeRef, span: Span) -> Result[AcceptedMethodCall, CheckError]:
+	accepted = accepted_method(method, receiver)
+	match method_body(traits, accepted):
+		Some(_): Ok(accepted)
+		None: Err(trait_error(span, MissingImplementation(method, receiver)))
+
+
+
+private fixed record MethodBinding {
+	method: TraitMethodId,
+	span: Span
+}
+
+
+-- The selected type exposes this provider's own accepted implementation. Once
+-- exposed, the family remains the same across every implementing Self type.
+pure func provider_owns_method(traits: AcceptedTraits, edge: MethodImport, method: TraitMethodId) -> Bool:
+	var owns: Bool = False
+	for implementation in traits.implementations:
+		if same_module(implementation.module, edge.target):
+			match type_head(implementation.receiver):
+				Some(head):
+					member = implementation.methods.any(pure func(member): same_trait_method(member.method, method))
+					if and(same_head(head, edge.receiver), member):
+						owns = True
+				None: void
+	owns
+
+
+private pure func add_family(previous: Option[MethodBinding], method: TraitMethodId, span: Span, module: ModuleId) -> Result[Option[MethodBinding], CheckError]:
+	match previous:
+		None: Ok(Some({ method = method, span = span }))
+		Some(held):
+			if same_trait_method(held.method, method):
+				Ok(previous)
+			else:
+				if incoming_diagnostic_site(held.span, span, module):
+					Err(trait_error(span, DifferentMethodFamilies(method, held.method, held.span)))
+				else:
+					Err(trait_error(held.span, DifferentMethodFamilies(held.method, method, span)))
+
+
+pure func visible_method(namespace: Namespace, traits: AcceptedTraits, signatures: List[AcceptedFunction], module: ModuleId, name: WrittenName) -> Result[Option[TraitMethodId], CheckError]:
+	var found: Option[MethodBinding] = match named_value(namespace, module, name.id):
+		Some(NamedMethod(id)):
+			match value_binding(namespace, module, name.id):
+				Some(MethodName(written)): Some({ method = id, span = written.span })
+				_: None
+		_: None
+	var failure: Option[CheckError] = None
+	for imported in method_imports(namespace, module):
+		match offered_value(namespace, imported.target, name.id):
+			Ok(OfferedMethod(method)):
+				if provider_owns_method(traits, imported, method):
+					match add_family(found, method, imported.name.span, module):
+						Ok(accepted): found = accepted
+						Err(error): failure = Some(error)
+			_: void
+		if failure.is_some():
+			break
+	ready: Void ?= match failure:
+		Some(error): Err(error)
+		None: Ok(void)
+	functions ?= receiver_bindings(namespace, signatures, module, name)
+	match found:
+		None: Ok(None)
+		Some(family):
+			match functions:
+				[]: Ok(Some(family.method))
+				[function, ..._]:
+					function_span = match function.import_site:
+						Some(span): span
+						None: function.function.declaration.function_name.span
+					if incoming_diagnostic_site(family.span, function_span, module):
+						Err(trait_error(function_span, FamilyFunctionConflict(family.method, function.function.id, family.span)))
+					else:
+						Err(trait_error(family.span, FamilyFunctionConflict(family.method, function.function.id, function_span)))
+
+
+-- Local written order selects diagnostic sites only. Offsets in different
+-- sources are unrelated; a local introduction takes priority over inheritance.
+private pure func incoming_diagnostic_site(previous: Span, incoming: Span, module: ModuleId) -> Bool:
+	if same_source(previous.source, incoming.source):
+		IntOps.less_than(incoming.start, previous.start).not()
+	else if same_source(incoming.source, module_source(module)):
+		True
+	else if same_source(previous.source, module_source(module)):
+		False
+	else:
+		True

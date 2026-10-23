@@ -89,7 +89,10 @@ primitive values explicitly with `to_string`. Holes evaluate once in written
 order and retain ordinary scope and purity checks. Nested interpolation,
 interpolation in patterns, builtin labels and closed constant initializers are
 rejected. See the [pilot String rules](../blorp_2/README.md#quoted-utf-8-string-literals) for exact
-syntax and escapes. Arbitrary FFI and traits remain excluded.
+syntax and escapes. Arbitrary FFI remains excluded. The pilot supports
+[concrete authored traits](../blorp_2/README.md#concrete-traits) with pure
+signature-only requirements and ordinary static method calls; bounds, defaults,
+generic implementations, method references and derives remain deferred.
 
 ---
 

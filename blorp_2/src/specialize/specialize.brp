@@ -933,34 +933,7 @@ private pure func validate_type_parameters(
 		Err(invalid(span, "type argument count differs from the declaration"))
 	else:
 		for parameter in parameters:
-			owner_matches = match Checked.parameter_owner(parameter):
-				Checked.FunctionDeclaration(id):
-					match owner:
-						Checked.FunctionDeclaration(expected):
-							IntOps.equals(
-								Declaration.function_number(id),
-								Declaration.function_number(expected),
-							)
-						_:
-							False
-				Checked.RecordDeclaration(id):
-					match owner:
-						Checked.RecordDeclaration(expected):
-							IntOps.equals(
-								Declaration.record_number(id),
-								Declaration.record_number(expected),
-							)
-						_:
-							False
-				Checked.UnionDeclaration(id):
-					match owner:
-						Checked.UnionDeclaration(expected):
-							IntOps.equals(
-								Declaration.union_number(id),
-								Declaration.union_number(expected),
-							)
-						_:
-							False
+			owner_matches = Checked.same_owner(Checked.parameter_owner(parameter), owner)
 
 			if or(
 				owner_matches.not(),
@@ -2536,6 +2509,13 @@ private pure func prepare_function(
 	if failure.is_some().not():
 		for call in Checked.body_calls(function.statements, function.body):
 			match call.target:
+				Checked.TraitMethod(method):
+					match Checked.method_body(checked.traits, method):
+						None: failure = Some(invalid(call.span, "accepted method has no implementation body"))
+						Some(body):
+							match runtime_key(Checked.DeclaredBody(body), [], checked, call.span):
+								Err(error): failure = Some(error)
+								Ok(key): prepared = request_instance(prepared, key, ConcreteRequest(call.span))
 				Checked.RuntimeFunction(_): void
 				Checked.ValueCall(_): void
 				Checked.CallableParameter(parameter):
@@ -2752,6 +2732,7 @@ private fixed union BindingTranslation:
 
 
 private fixed record TranslationBindings {
+	traits: Checked.AcceptedTraits,
 	bindings: List[BindingTranslation],
 	capture: CaptureBinding
 }
@@ -2851,6 +2832,10 @@ private pure func translate_call(
 	result_type: TypeRef,
 ) -> Result[ConcreteCall, Diagnostic]:
 	target_result: Result[CallTarget, Diagnostic] = match call.target:
+		Checked.TraitMethod(method):
+			match Checked.method_body(callables.traits, method):
+				None: Err(invalid(call.span, "accepted method has no implementation body"))
+				Some(body): runtime_instance(keys, Checked.DeclaredBody(body), [], call.span).map(pure func(id): UserFunction(id))
 		Checked.RuntimeFunction(operation):
 			concrete_result: Result[RuntimeOperation[VariantInstanceId, TypeRef], Diagnostic] = match operation:
 				IntAdd:
@@ -3459,7 +3444,7 @@ private pure func translate_call_arguments(
 								Err(error): Err(error)
 								Ok(environment): Ok([environment].concat(values))
 						_: Err(invalid(call.span, "runtime callable reached direct argument translation"))
-		Checked.RuntimeFunction(_) | Checked.UserFunction(_, _) | Checked.ValueCall(_): Ok(values)
+		Checked.TraitMethod(_) | Checked.RuntimeFunction(_) | Checked.UserFunction(_, _) | Checked.ValueCall(_): Ok(values)
 
 
 private pure func translate_callable_operand(
@@ -4048,6 +4033,7 @@ private pure func translate_parameters(
 	substitution: Declarations.Substitution,
 	unions: List[UnionInstance],
 	records: List[RecordInstance],
+	traits: Checked.AcceptedTraits,
 ) -> Result[TranslatedParameters, Diagnostic]:
 	span = function.return_type.span
 	var parameters: List[TypeRef] = []
@@ -4116,7 +4102,7 @@ private pure func translate_parameters(
 		Some(error): Err(error)
 		None: Ok({
 			parameters = parameters, bindings = bindings,
-			translation = { bindings = translations, capture = capture },
+			translation = { bindings = translations, capture = capture, traits = traits },
 		})
 
 
@@ -4163,11 +4149,12 @@ private pure func translate_function(
 	records: List[RecordInstance],
 	union_layouts: List[ConcreteUnion],
 	record_layouts: List[ConcreteRecord],
+	traits: Checked.AcceptedTraits,
 ) -> Result[ConcreteFunction, Diagnostic]:
 	span = function.return_type.span
 	substitution ?= function_substitution(function, key.arguments, span)
 
-	runtime ?= translate_parameters(opaques, function, key, substitution, unions, records)
+	runtime ?= translate_parameters(opaques, function, key, substitution, unions, records, traits)
 	parameters = runtime.parameters
 	bindings = runtime.bindings
 	translation = runtime.translation
@@ -4244,6 +4231,7 @@ pure func specialize(program: CheckedProgram) -> Result[SpecializedProgram, Diag
 					prepared.records,
 					union_layouts,
 					record_layouts,
+					checked.traits,
 				)
 	)
 	entrypoint ?= find_instance(

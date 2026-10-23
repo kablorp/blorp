@@ -2,7 +2,7 @@ import:
 	./boolean: and
 	int as IntOps
 	./source: ModuleId, module_number, same_module
-	./syntax: ParsedConstant, ParsedFunction, ParsedOpaque, ParsedRecord, ParsedUnion, ParsedVariant, Visibility, WrittenName
+	./syntax: ParsedConstant, ParsedFunction, ParsedTrait, ParsedTraitMethod, ParsedImplementationHeader, ParsedFunctionGroup(FreeFunction, ImplementationGroup), ParsedOpaque, ParsedRecord, ParsedUnion, ParsedVariant, Visibility, WrittenName, Span
 
 
 -- Declaration identities are dense ordinals in one sealed parsed program.
@@ -16,6 +16,40 @@ opaque type RecordId = Int
 opaque type OpaqueId = Int
 
 opaque type ConstantId = Int
+
+
+opaque type TraitId = Int
+
+opaque type ImplId = Int
+
+
+private fixed record TraitMethodIdentity {
+	owner: TraitId,
+	position: Int
+}
+
+
+opaque type TraitMethodId = TraitMethodIdentity
+
+
+pure func trait_number(id: TraitId) -> Int:
+	from_opaque TraitId(id)
+
+
+pure func impl_number(id: ImplId) -> Int:
+	from_opaque ImplId(id)
+
+
+pure func trait_method_owner(id: TraitMethodId) -> TraitId:
+	from_opaque TraitMethodId(id).owner
+
+
+pure func trait_method_number(id: TraitMethodId) -> Int:
+	from_opaque TraitMethodId(id).position
+
+
+pure func same_trait_method(left: TraitMethodId, right: TraitMethodId) -> Bool:
+	and(IntOps.equals(trait_number(trait_method_owner(left)), trait_number(trait_method_owner(right))), IntOps.equals(trait_method_number(left), trait_method_number(right)))
 
 
 private fixed record VariantIdentity {
@@ -79,9 +113,40 @@ pure func variant_number(id: VariantId) -> Int:
 	from_opaque VariantId(id).position
 
 
+fixed union FunctionRole:
+	FreeFunctionBody
+	ImplementationBody
+
+
 fixed record FunctionRow {
 	id: FunctionId,
+	role: FunctionRole,
 	declaration: ParsedFunction
+}
+
+
+fixed record TraitMethodRow {
+	id: TraitMethodId,
+	declaration: ParsedTraitMethod
+}
+
+
+fixed record TraitRow {
+	id: TraitId,
+	module: ModuleId,
+	visibility: Visibility,
+	type_name: WrittenName,
+	methods: List[TraitMethodRow],
+	span: Span
+}
+
+
+-- The sole implementation-to-body membership authority. A function's role only
+-- prevents offering the body as an ordinary free function, with no backpointer.
+fixed record ImplRow {
+	id: ImplId,
+	header: ParsedImplementationHeader,
+	methods: List[FunctionId]
 }
 
 
@@ -122,6 +187,8 @@ fixed record UnionRow {
 
 private fixed record DeclarationRows {
 	functions: List[FunctionRow],
+	traits: List[TraitRow],
+	implementations: List[ImplRow],
 	records: List[RecordRow],
 	unions: List[UnionRow],
 	opaques: List[OpaqueRow],
@@ -135,19 +202,46 @@ opaque type DeclarationInventory = DeclarationRows
 -- Assembly calls this once with complete syntax. Each local builder issues its
 -- dense ordinal before appending, then the complete inventory freezes once.
 pure func issue_inventory(
-	functions: List[ParsedFunction],
+	functions: List[ParsedFunctionGroup],
 	records: List[ParsedRecord],
 	unions: List[ParsedUnion],
 	opaques: List[ParsedOpaque],
 	constants: List[ParsedConstant],
+	traits: List[ParsedTrait],
 ) -> DeclarationInventory:
 	var function_rows: List[FunctionRow] = []
+	var trait_rows: List[TraitRow] = []
+	var impl_rows: List[ImplRow] = []
 	var record_rows: List[RecordRow] = []
 	var union_rows: List[UnionRow] = []
 	var opaque_rows: List[OpaqueRow] = []
 	var constant_rows: List[ConstantRow] = []
-	for declaration in functions:
-		function_rows = function_rows.append({ id = function_id(function_rows.length()), declaration = declaration })
+	for group in functions:
+		match group:
+			FreeFunction(declaration):
+				row: FunctionRow = { id = function_id(function_rows.length()), role = FreeFunctionBody, declaration = declaration }
+				function_rows = function_rows.append(row)
+			ImplementationGroup(header, methods):
+				var method_ids: List[FunctionId] = []
+				for declaration in methods:
+					id = function_id(function_rows.length())
+					row: FunctionRow = { id = id, role = ImplementationBody, declaration = declaration }
+					function_rows = function_rows.append(row)
+					method_ids = method_ids.append(id)
+				implementation: ImplRow = { id = into_opaque ImplId(impl_rows.length()), header = header, methods = method_ids }
+				impl_rows = impl_rows.append(implementation)
+	for declaration in traits:
+		owner = into_opaque TraitId(trait_rows.length())
+		var methods: List[TraitMethodRow] = []
+		for method in declaration.methods:
+			id = into_opaque TraitMethodId({ owner = owner, position = methods.length() })
+			row: TraitMethodRow = { id = id, declaration = method }
+			methods = methods.append(row)
+		declaration_row: TraitRow = {
+			id = owner, module = declaration.module, visibility = declaration.visibility,
+			type_name = declaration.type_name, methods = methods, span = declaration.span
+		}
+		trait_rows = trait_rows.append(declaration_row)
 	for declaration in records:
 		record_rows = record_rows.append({ id = record_id(record_rows.length()), declaration = declaration })
 	for declaration in unions:
@@ -169,6 +263,8 @@ pure func issue_inventory(
 		constant_rows = constant_rows.append({ id = constant_id(constant_rows.length()), declaration = declaration })
 	into_opaque DeclarationInventory({
 		functions = function_rows,
+		traits = trait_rows,
+		implementations = impl_rows,
 		records = record_rows,
 		unions = union_rows,
 		opaques = opaque_rows,
@@ -178,6 +274,14 @@ pure func issue_inventory(
 
 pure func inventory_functions(inventory: DeclarationInventory) -> List[FunctionRow]:
 	from_opaque DeclarationInventory(inventory).functions
+
+
+pure func inventory_traits(inventory: DeclarationInventory) -> List[TraitRow]:
+	from_opaque DeclarationInventory(inventory).traits
+
+
+pure func inventory_implementations(inventory: DeclarationInventory) -> List[ImplRow]:
+	from_opaque DeclarationInventory(inventory).implementations
 
 
 pure func inventory_records(inventory: DeclarationInventory) -> List[RecordRow]:

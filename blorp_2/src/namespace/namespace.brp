@@ -16,21 +16,21 @@ import:
 	option: is_some
 	../utils/boolean: and
 	../utils/ids:
-		ConstantId, ConstantRow, FunctionId, FunctionRow, OpaqueId, RecordId, UnionId, UnionRow, VariantId,
+		TraitId, ImplId, TraitRow, trait_number, impl_number, TraitMethodId, same_trait_method, inventory_traits, inventory_implementations, FunctionRole(FreeFunctionBody, ImplementationBody), ConstantId, ConstantRow, FunctionId, FunctionRow, OpaqueId, RecordId, UnionId, UnionRow, VariantId,
 		constant_number, function_number, inventory_constants, inventory_functions, next_nominal, record_number,
 		opaque_number, union_number, variant_number, variant_owner,
 		NominalRow(UnionDeclarationRow, RecordDeclarationRow, OpaqueDeclarationRow),
 	int as IntOps
 	list: repeat
 	../utils/int_map as IntMaps
-	../utils/names: NameId, name_number
+	../utils/names: NameId, name_number, same_name
 	../parse/assemble: ModuleImport, ParsedContents, ParsedModuleRow, ParsedProgram, parsed_contents
 	../parse/parse: ImportSelection(NamedSelection, ConstructorSelection, MethodsOnlySelection), ModulePath, selection_name
 	./builtins: PrimitiveType(BuiltinInt, BuiltinFloat, BuiltinString, BuiltinVoid), builtin_type_name
-	../utils/source: ModuleId, ModuleKind(UserModule, LibraryModule, FoundationTypesModule, FoundationPreludeModule), module_number, same_module
+	../utils/source: ModuleId, ModuleKind(UserModule, LibraryModule, FoundationTypesModule, FoundationPreludeModule), module_number, same_module, same_source
 	../utils/syntax:
 		ParsedBuiltinType(IntegerBuiltin, FloatBuiltin, StringBuiltin, VoidBuiltin, ListBuiltin),
-		Span, Visibility(Public, Private), WrittenName,
+		Span, TypeSyntax(AtomicType, QualifiedType), type_span, Visibility(Public, Private), WrittenName,
 
 
 
@@ -56,6 +56,8 @@ fixed record AliasedModule {
 
 -- What a written name denotes in a module.
 fixed union Entity:
+	Trait(TraitId)
+	Method(TraitMethodId)
 	Function(FunctionId)
 	Constant(ConstantId)
 	Constructor(VariantId)
@@ -80,6 +82,7 @@ fixed record NamedType {
 
 -- A value-space name already claimed in this module, with its original site.
 fixed union ValueBinding:
+	MethodName(WrittenName)
 	FunctionName(WrittenName)
 	ConstantName(WrittenName)
 	ConstructorName(WrittenName)
@@ -112,9 +115,16 @@ fixed record MethodImport {
 
 
 -- One module's names, in the order they entered, keyed by `space_key`.
+fixed record ResolvedImplementation {
+	id: ImplId,
+	trait_id: TraitId
+}
+
+
 private fixed record ModuleScope {
 	names: IntMaps.IntMap[Entry],
-	methods: List[MethodImport]
+	methods: List[MethodImport],
+	implementations: List[ResolvedImplementation]
 }
 
 
@@ -150,6 +160,7 @@ fixed record Conflict {
 fixed union NamespaceProblem:
 	NameConflict(Conflict)
 	SelectionFailure(ModulePath, ImportSelection, SelectionProblem)
+	InvalidImplementationTrait(TypeSyntax)
 
 
 -- A module's scope as it is built, with its first problem in source order.
@@ -157,6 +168,7 @@ fixed union NamespaceProblem:
 private fixed record BuiltScope {
 	names: IntMaps.IntMap[Entry],
 	methods: List[MethodImport],
+	implementations: List[ResolvedImplementation],
 	problem: Option[NamespaceProblem]
 }
 
@@ -174,6 +186,7 @@ fixed union FunctionSource:
 
 -- What a name denotes in the value space.
 fixed union NamedValue:
+	NamedMethod(TraitMethodId)
 	NamedFunction(FunctionId, FunctionSource)
 	NamedConstant(ConstantId)
 	NamedConstructor(VariantId)
@@ -182,6 +195,7 @@ fixed union NamedValue:
 
 -- What a module offers importers in the value space: never an alias.
 fixed union OfferedValue:
+	OfferedMethod(TraitMethodId)
 	OfferedFunction(FunctionId)
 	OfferedConstant(ConstantId)
 	OfferedConstructor(VariantId)
@@ -228,6 +242,14 @@ pure func same_head(left: TypeHead, right: TypeHead) -> Bool:
 
 private pure func same_entity(left: Entity, right: Entity) -> Bool:
 	match left:
+		Trait(first):
+			match right:
+				Trait(second): IntOps.equals(trait_number(first), trait_number(second))
+				_: False
+		Method(first):
+			match right:
+				Method(second): same_trait_method(first, second)
+				_: False
 		Function(first):
 			match right:
 				Function(second): IntOps.equals(function_number(first), function_number(second))
@@ -269,7 +291,7 @@ pure func builtin_head(declaration: ParsedBuiltinType) -> TypeHead:
 
 private pure func empty_scope() -> ModuleScope:
 	none: List[MethodImport] = []
-	{ names = IntMaps.empty_int_map(), methods = none }
+	{ names = IntMaps.empty_int_map(), methods = none, implementations = [] }
 
 
 -- A spelling's entry in each space has its own key: 2n for values and 2n + 1
@@ -303,9 +325,9 @@ private pure func first_problem(found: Option[NamespaceProblem], later: Namespac
 -- What `names` already holds in a space that `entity` named `name` claims.
 private pure func claimant(names: IntMaps.IntMap[Entry], name: NameId, entity: Entity) -> Option[Entry]:
 	match entity:
-		Function(_) | Constant(_) | Constructor(_):
+		Method(_) | Function(_) | Constant(_) | Constructor(_):
 			holder(names, Values, name)
-		Type(_):
+		Type(_) | Trait(_):
 			holder(names, Types, name)
 		Alias(_):
 			match holder(names, Values, name):
@@ -324,9 +346,9 @@ private pure func claimant(names: IntMaps.IntMap[Entry], name: NameId, entity: E
 private pure func claimed(names: IntMaps.IntMap[Entry], incoming: Entry) -> IntMaps.IntMap[Entry]:
 	name = incoming.name.id
 	match incoming.entity:
-		Function(_) | Constant(_) | Constructor(_):
+		Method(_) | Function(_) | Constant(_) | Constructor(_):
 			IntMaps.set(names, space_key(Values, name), incoming)
-		Type(_):
+		Type(_) | Trait(_):
 			IntMaps.set(names, space_key(Types, name), incoming)
 		Alias(_):
 			IntMaps.set(IntMaps.set(names, space_key(Values, name), incoming), space_key(Types, name), incoming)
@@ -342,13 +364,45 @@ private pure func enter(built: BuiltScope, incoming: Entry) -> BuiltScope:
 		None:
 			{ built | names = claimed(built.names, incoming) }
 		Some(held):
+			family_again = match held.entity:
+				Method(first):
+					match incoming.entity:
+						Method(second): same_trait_method(first, second)
+						_: False
+				_: False
 			arrives_again: Bool = match incoming.origin:
 				Declared(_): False
 				Imported | Implicit: same_entity(held.entity, incoming.entity)
-			if arrives_again:
+			if family_again:
+				match held.origin:
+					Declared(Public): built
+					_:
+						match incoming.origin:
+							Imported | Implicit: built
+							Declared(_): { built | names = claimed(built.names, incoming) }
+			else if arrives_again:
 				built
 			else:
-				{ built | problem = first_problem(built.problem, NameConflict({ incoming = incoming, previous = held })) }
+				{ built | problem = first_problem(built.problem, NameConflict(staged_conflict(incoming, held))) }
+
+
+-- Implementations enter after the module's ordinary declarations. Only this
+-- new staged own-method case needs diagnostic orientation by written order.
+private pure func staged_conflict(incoming: Entry, previous: Entry) -> Conflict:
+	conflict: Conflict = { incoming = incoming, previous = previous }
+	match incoming.entity:
+		Method(_):
+			match incoming.origin:
+				Declared(_):
+					match previous.origin:
+						Declared(_):
+							if and(same_source(incoming.name.span.source, previous.name.span.source), IntOps.less_than(incoming.name.span.start, previous.name.span.start)):
+								{ incoming = previous, previous = incoming }
+							else:
+								conflict
+						_: conflict
+				_: conflict
+		_: conflict
 
 
 -- A module offers importers only its own public declarations (decided
@@ -359,7 +413,7 @@ private pure func offer(found: Option[Entry]) -> Result[Entity, Unoffered]:
 		Some(entry):
 			match entry.entity:
 				Alias(_): Err(UnknownName)
-				Function(_) | Constant(_) | Constructor(_) | Type(_):
+				Method(_) | Function(_) | Constant(_) | Constructor(_) | Type(_) | Trait(_):
 					match entry.origin:
 						Declared(Public): Ok(entry.entity)
 						Declared(Private(_)): Err(PrivateName)
@@ -411,6 +465,8 @@ private pure func written_before(nominal: NominalRow, function: Option[FunctionR
 private pure func declared_entries(parsed: ParsedContents) -> List[List[Entry]]:
 	functions = inventory_functions(parsed.declarations)
 	constants = inventory_constants(parsed.declarations)
+	traits = inventory_traits(parsed.declarations)
+	var traits_seen = 0
 	var builtins_seen = 0
 	var functions_seen = 0
 	var constants_seen = 0
@@ -461,31 +517,56 @@ private pure func declared_entries(parsed: ParsedContents) -> List[List[Entry]]:
 					else:
 						None
 				None: None
-			match constant:
-				Some(constant_row):
-					declaration = constant_row.declaration
-					entries = entries.append({ name = declaration.name, entity = Constant(constant_row.id), origin = Declared(declaration.visibility) })
-					constants_seen = IntOps.add(constants_seen, 1)
+			trait_declaration: Option[TraitRow] = match traits.get(traits_seen):
+				Some(candidate):
+					before_function = match function:
+						Some(next): IntOps.less_than(candidate.type_name.span.start, next.declaration.function_name.span.start)
+						None: True
+					before_nominal = match nominal:
+						Some(next): IntOps.less_than(candidate.type_name.span.start, nominal_start(next))
+						None: True
+					before_constant = match constant:
+						Some(next): IntOps.less_than(candidate.type_name.span.start, next.declaration.name.span.start)
+						None: True
+					if and(and(same_module(candidate.module, row.module), before_function), and(before_nominal, before_constant)):
+						Some(candidate)
+					else:
+						None
+				None: None
+			match trait_declaration:
+				Some(trait_row):
+					entries = entries.append({ name = trait_row.type_name, entity = Trait(trait_row.id), origin = Declared(trait_row.visibility) })
+					for method in trait_row.methods:
+						entries = entries.append({ name = method.declaration.header.function_name, entity = Method(method.id), origin = Declared(trait_row.visibility) })
+					traits_seen = IntOps.add(traits_seen, 1)
 				None:
-					match nominal:
-						Some(UnionDeclarationRow(union_row)):
-							entries = with_union(entries, union_row)
-							unions_seen = IntOps.add(unions_seen, 1)
-						Some(RecordDeclarationRow(record_row)):
-							declaration = record_row.declaration
-							entries = entries.append({ name = declaration.type_name, entity = Type(RecordHead(record_row.id)), origin = Declared(declaration.visibility) })
-							records_seen = IntOps.add(records_seen, 1)
-						Some(OpaqueDeclarationRow(opaque_row)):
-							declaration = opaque_row.declaration
-							entries = entries.append({ name = declaration.type_name, entity = Type(OpaqueHead(opaque_row.id)), origin = Declared(declaration.visibility) })
-							opaques_seen = IntOps.add(opaques_seen, 1)
+					match constant:
+						Some(constant_row):
+							declaration = constant_row.declaration
+							entries = entries.append({ name = declaration.name, entity = Constant(constant_row.id), origin = Declared(declaration.visibility) })
+							constants_seen = IntOps.add(constants_seen, 1)
 						None:
-							match function:
-								Some(function_row):
-									entries = entries.append({ name = function_row.declaration.function_name, entity = Function(function_row.id), origin = Declared(function_row.declaration.visibility) })
-									functions_seen = IntOps.add(functions_seen, 1)
+							match nominal:
+								Some(UnionDeclarationRow(union_row)):
+									entries = with_union(entries, union_row)
+									unions_seen = IntOps.add(unions_seen, 1)
+								Some(RecordDeclarationRow(record_row)):
+									declaration = record_row.declaration
+									entries = entries.append({ name = declaration.type_name, entity = Type(RecordHead(record_row.id)), origin = Declared(declaration.visibility) })
+									records_seen = IntOps.add(records_seen, 1)
+								Some(OpaqueDeclarationRow(opaque_row)):
+									declaration = opaque_row.declaration
+									entries = entries.append({ name = declaration.type_name, entity = Type(OpaqueHead(opaque_row.id)), origin = Declared(declaration.visibility) })
+									opaques_seen = IntOps.add(opaques_seen, 1)
 								None:
-									reading = False
+									match function:
+										Some(function_row):
+											match function_row.role:
+												FreeFunctionBody: entries = entries.append({ name = function_row.declaration.function_name, entity = Function(function_row.id), origin = Declared(function_row.declaration.visibility) })
+												ImplementationBody: void
+											functions_seen = IntOps.add(functions_seen, 1)
+										None:
+											reading = False
 		declared = declared.append(entries)
 	declared
 
@@ -497,7 +578,7 @@ private pure func provided(prelude: ModuleScope) -> List[Entry]:
 	for entry in IntMaps.values(prelude.names):
 		match entry.entity:
 			Alias(_): void
-			Function(_) | Constant(_) | Constructor(_) | Type(_):
+			Method(_) | Function(_) | Constant(_) | Constructor(_) | Type(_) | Trait(_):
 				match entry.origin:
 					Imported: entries = entries.append({ entry | origin = Implicit })
 					Declared(_) | Implicit: void
@@ -512,7 +593,7 @@ private pure func provided(prelude: ModuleScope) -> List[Entry]:
 -- the modules that import it, so it is never read.
 private pure func build_module(scopes: List[ModuleScope], empty: ModuleScope, row: ParsedModuleRow, declared: List[Entry], received: List[Entry], methods: List[MethodImport]) -> BuiltScope:
 	expected = IntOps.add(IntOps.add(received.length(), declared.length()), row.imports.length())
-	var built: BuiltScope = { names = IntMaps.int_map_with_capacity(expected), methods = methods, problem = None }
+	var built: BuiltScope = { names = IntMaps.int_map_with_capacity(expected), methods = methods, implementations = [], problem = None }
 	for entry in received:
 		built = enter(built, entry)
 	for request in row.imports:
@@ -522,6 +603,57 @@ private pure func build_module(scopes: List[ModuleScope], empty: ModuleScope, ro
 	for entry in declared:
 		built = enter(built, entry)
 	built
+
+
+private pure func trait_reference(names: IntMaps.IntMap[Entry], scopes: List[ModuleScope], written: TypeSyntax) -> Option[TraitId]:
+	found: Option[Entry] = match written:
+		AtomicType(name): holder(names, Types, name.id)
+		QualifiedType(qualified, [], _):
+			match holder(names, Values, qualified.module.id):
+				Some(entry):
+					match entry.entity:
+						Alias(aliased):
+							match scopes.get(module_number(aliased.target)):
+								Some(scope):
+									match offer(holder(scope.names, Types, qualified.name.id)):
+										Ok(Trait(id)): Some({ name = qualified.name, entity = Trait(id), origin = Imported })
+										_: None
+								None: None
+						_: None
+				None: None
+		_: None
+	match found:
+		Some(entry):
+			match entry.entity:
+				Trait(id): Some(id)
+				_: None
+		None: None
+
+
+-- This is name resolution only. Check later accepts members/receiver/coherence.
+-- The resolved TraitId is retained once; method membership stays in inventory.
+private pure func publish_implementations(built: BuiltScope, scopes: List[ModuleScope], module: ModuleId, parsed: ParsedContents) -> BuiltScope:
+	var next = built
+	for implementation in inventory_implementations(parsed.declarations):
+		if same_module(implementation.header.module, module):
+			match trait_reference(next.names, scopes, implementation.header.trait_name):
+				None: next = { next | problem = first_problem(next.problem, InvalidImplementationTrait(implementation.header.trait_name)) }
+				Some(id):
+					resolved: ResolvedImplementation = { id = implementation.id, trait_id = id }
+					next = { next | implementations = next.implementations.append(resolved) }
+					match inventory_traits(parsed.declarations).get(trait_number(id)):
+						Some(owner):
+							for method in owner.methods:
+								var name: WrittenName = { method.declaration.header.function_name | span = implementation.header.span }
+								for body in implementation.methods:
+									match inventory_functions(parsed.declarations).get(function_number(body)):
+										Some(function):
+											if same_name(function.declaration.function_name.id, name.id):
+												name = function.declaration.function_name
+										None: void
+								next = enter(next, { name = name, entity = Method(method.id), origin = Declared(implementation.header.visibility) })
+						None: next = { next | problem = first_problem(next.problem, InvalidImplementationTrait(implementation.header.trait_name)) }
+	next
 
 
 -- Host `get` defaults are unreachable: every index is a sealed module number,
@@ -538,11 +670,12 @@ pure func build_namespace(program: ParsedProgram) -> Result[Namespace, Namespace
 	var failure: Option[NamespaceProblem] = None
 	for row in parsed.dependency_order:
 		number = module_number(row.module)
-		built = match row.role:
+		var built = match row.role:
 			UserModule: build_module(scopes, empty, row, declared.get_or(number, nothing), prelude_entries, prelude_methods)
 			FoundationTypesModule | FoundationPreludeModule | LibraryModule: build_module(scopes, empty, row, declared.get_or(number, nothing), nothing, none)
+		built = publish_implementations(built, scopes, row.module, parsed)
 		failure = built.problem
-		scope: ModuleScope = { names = built.names, methods = built.methods }
+		scope: ModuleScope = { names = built.names, methods = built.methods, implementations = built.implementations }
 		scopes = scopes.set(number, scope)
 		if same_module(row.module, parsed.foundation.prelude):
 			prelude_entries = provided(scope)
@@ -612,10 +745,10 @@ private pure func bare_selection(target: ModuleScope, name: NameId) -> Result[En
 			match selected_type:
 				Ok(_):
 					match selected:
-						Function(_): Err(AmbiguousFunction)
+						Function(_) | Method(_): Err(AmbiguousFunction)
 						Constant(_): Err(AmbiguousConstant)
 						Constructor(variant): Err(BareConstructor(variant))
-						Type(_) | Alias(_): Err(NotOffered(UnknownName))
+						Type(_) | Trait(_) | Alias(_): Err(NotOffered(UnknownName))
 				Err(_): Ok(selected)
 		Err(value_reason):
 			match selected_type:
@@ -630,7 +763,7 @@ private pure func bind(built: BuiltScope, request: ModuleImport, name: WrittenNa
 	match entity:
 		Type(receiver):
 			{ entered | methods = entered.methods.append({ target = request.target, receiver = receiver, name = name }) }
-		Function(_) | Constant(_) | Constructor(_) | Alias(_):
+		Method(_) | Function(_) | Constant(_) | Constructor(_) | Alias(_) | Trait(_):
 			entered
 
 
@@ -741,7 +874,8 @@ pure func named_value(namespace: Namespace, module: ModuleId, name: NameId) -> O
 				Constant(id): Some(NamedConstant(id))
 				Constructor(variant): Some(NamedConstructor(variant))
 				Alias(aliased): Some(NamedAlias(aliased))
-				Type(_): None
+				Method(id): Some(NamedMethod(id))
+				Type(_) | Trait(_): None
 		None:
 			None
 
@@ -752,11 +886,32 @@ pure func value_binding(namespace: Namespace, module: ModuleId, name: NameId) ->
 		None: None
 		Some(entry):
 			match entry.entity:
+				Method(_): Some(MethodName(entry.name))
 				Function(_): Some(FunctionName(entry.name))
 				Constant(_): Some(ConstantName(entry.name))
 				Constructor(_): Some(ConstructorName(entry.name))
 				Alias(_): Some(ModuleAliasName(entry.name))
-				Type(_): None
+				Type(_) | Trait(_): None
+
+
+pure func named_trait(namespace: Namespace, module: ModuleId, name: NameId) -> Option[TraitId]:
+	match held_in(namespace, module, Types, name):
+		Some(entry):
+			match entry.entity:
+				Trait(id): Some(id)
+				_: None
+		None: None
+
+
+pure func implementation_trait(namespace: Namespace, module: ModuleId, id: ImplId) -> Option[TraitId]:
+	match from_opaque Namespace(namespace).get(module_number(module)):
+		Some(scope):
+			var found: Option[TraitId] = None
+			for implementation in scope.implementations:
+				if IntOps.equals(impl_number(implementation.id), impl_number(id)):
+					found = Some(implementation.trait_id)
+			found
+		None: None
 
 
 -- The type `name` denotes in `module`; a module alias, which also claims the
@@ -766,7 +921,7 @@ pure func named_type(namespace: Namespace, module: ModuleId, name: NameId) -> Op
 		Some(entry):
 			match entry.entity:
 				Type(head): Some({ head = head, origin = entry.origin })
-				Function(_) | Constant(_) | Constructor(_) | Alias(_): None
+				Method(_) | Function(_) | Constant(_) | Constructor(_) | Alias(_) | Trait(_): None
 		None:
 			None
 
@@ -774,6 +929,7 @@ pure func named_type(namespace: Namespace, module: ModuleId, name: NameId) -> Op
 -- The function, constant or constructor `target` offers as `name`.
 pure func offered_value(namespace: Namespace, target: ModuleId, name: NameId) -> Result[OfferedValue, Unoffered]:
 	match offer(held_in(namespace, target, Values, name)):
+		Ok(Method(id)): Ok(OfferedMethod(id))
 		Ok(Function(id)): Ok(OfferedFunction(id))
 		Ok(Constant(id)): Ok(OfferedConstant(id))
 		Ok(Constructor(variant)): Ok(OfferedConstructor(variant))
@@ -829,9 +985,17 @@ pure func offered_function(entry: Entry) -> Option[FunctionId]:
 
 pure func namespace_problem_span(problem: NamespaceProblem) -> Span:
 	match problem:
+		InvalidImplementationTrait(written): type_span(written)
 		NameConflict(conflict):
 			conflict.incoming.name.span
 		SelectionFailure(_, _, NotAConstructor(constructor)):
 			constructor.span
 		SelectionFailure(_, selection, _):
 			selection_name(selection).span
+
+
+pure func offered_trait(namespace: Namespace, target: ModuleId, name: NameId) -> Result[TraitId, Unoffered]:
+	match offer(held_in(namespace, target, Types, name)):
+		Ok(Trait(id)): Ok(id)
+		Ok(_): Err(UnknownName)
+		Err(reason): Err(reason)

@@ -14,7 +14,7 @@ import:
 			DuplicateRecordField, DuplicateTypeParameter, TypeParameterTypeNameConflict, RecursiveAggregateType, RecursiveOpaqueRepresentation,
 		),
 		TypeTermError(
-			PrivateTypeInPublicDeclaration,
+			PrivateTypeInPublicDeclaration, TraitUsedAsType,
 			ListTypeArgumentCount, MissingUnionTypeArguments, NonApplicableType, MissingRecordTypeArguments, RecordTypeArgumentCountMismatch, OrdinaryRecordApplied,
 			OrdinaryUnionApplied, UnionTypeArgumentCountMismatch, UnknownType,
 		),
@@ -60,8 +60,8 @@ import:
 	int as IntOps
 	../utils/names: NameId, same_name
 	../namespace/namespace:
-		AliasedModule, Namespace, NamedValue(NamedAlias), TypeHead(PrimitiveHead, ListHead, UnionHead, RecordHead, OpaqueHead),
-		Origin(Declared), named_type, named_value, offered_type,
+		AliasedModule, Unoffered, Namespace, NamedValue(NamedAlias), TypeHead(PrimitiveHead, ListHead, UnionHead, RecordHead, OpaqueHead),
+		Origin(Declared), named_trait, named_type, named_value, offered_type, offered_trait,
 	option: to_result, is_none, is_some
 	../parse/assemble: ParsedContents
 	../utils/source: compiler_source, ModuleId
@@ -88,7 +88,14 @@ pure func previous_declaration(previous: List[WrittenName], name: NameId) -> Opt
 
 -- The type names visible where a type is written: the module's namespace, the
 -- declared unions and the enclosing declaration's own type parameters.
+fixed record SelfBinding {
+	name: NameId,
+	value_type: TypeRef
+}
+
+
 fixed record TypeScope {
+	self_binding: Option[SelfBinding],
 	records: List[RecordRow],
 	unions: List[UnionRow],
 	namespace: Namespace,
@@ -228,7 +235,10 @@ private pure func resolve_atomic_head(
 -- One unqualified lookup validates access before publishing the head.
 private pure func resolve_head(scope: TypeScope, name: WrittenName, missing: TypeTermError) -> Result[TypeHead, CheckError]:
 	match named_type(scope.namespace, scope.module, name.id):
-		None: Err(type_term_error(name.span, missing))
+		None:
+			match named_trait(scope.namespace, scope.module, name.id):
+				Some(id): Err(type_term_error(name.span, TraitUsedAsType(id)))
+				None: Err(type_term_error(name.span, missing))
 		Some(found):
 			match scope.access:
 				PublicTypeUse(declaration):
@@ -238,18 +248,29 @@ private pure func resolve_head(scope: TypeScope, name: WrittenName, missing: Typ
 				PrivateTypeUse: Ok(found.head)
 
 
+private pure func scoped_type(scope: TypeScope, name: WrittenName) -> Option[TypeRef]:
+	match scope.self_binding:
+		Some(binding):
+			if same_name(binding.name, name.id):
+				Some(binding.value_type)
+			else:
+				None
+		None: None
+
+
 private pure func resolve_atomic_type(
 	scope: TypeScope,
 	name: WrittenName,
 ) -> Result[TypeRef, CheckError]:
-	match lookup_type_parameter(scope.parameters, name.id):
-		Some(parameter):
-			Ok(ParameterType(parameter.id))
+	match scoped_type(scope, name):
+		Some(value_type): Ok(value_type)
 		None:
-			match resolve_head(scope, name, UnknownType(name.id)):
-				Ok(head): resolve_atomic_head(scope, head, name)
-				Err(error): Err(error)
-
+			match lookup_type_parameter(scope.parameters, name.id):
+				Some(parameter): Ok(ParameterType(parameter.id))
+				None:
+					match resolve_head(scope, name, UnknownType(name.id)):
+						Ok(head): resolve_atomic_head(scope, head, name)
+						Err(error): Err(error)
 
 -- A head applied to written arguments; the head's own arity rules.
 private pure func resolve_applied_head(
@@ -319,11 +340,19 @@ private pure func resolve_qualified_type(
 	aliased ?= aliased_module(scope.namespace, scope.module, qualified.module)
 	head: TypeHead ?= match offered_type(scope.namespace, aliased.target, qualified.name.id):
 		Ok(head): Ok(head)
-		Err(reason): Err(qualified_error(qualified.name.span, QualifiedNotOffered(qualified.module.id, qualified.name.id, aliased.path, reason)))
+		Err(reason): Err(qualified_type_rejection(scope, aliased, qualified, reason))
 	if arguments.is_empty():
 		resolve_atomic_head(scope, head, qualified.name)
 	else:
 		resolve_applied_head(scope, head, qualified.name, arguments, span)
+
+
+-- Produce the rejection fact before wrapping it in the caller's Result. This
+-- keeps the two failed lookup cases on one ordinary publication boundary.
+private pure func qualified_type_rejection(scope: TypeScope, aliased: AliasedModule, qualified: ParsedQualified, reason: Unoffered) -> CheckError:
+	match offered_trait(scope.namespace, aliased.target, qualified.name.id):
+		Ok(id): type_term_error(qualified.name.span, TraitUsedAsType(id))
+		Err(_): qualified_error(qualified.name.span, QualifiedNotOffered(qualified.module.id, qualified.name.id, aliased.path, reason))
 
 
 pure func resolve_type(scope: TypeScope, written: TypeSyntax) -> Result[TypeRef, CheckError]:
@@ -343,9 +372,12 @@ pure func resolve_type(scope: TypeScope, written: TypeSyntax) -> Result[TypeRef,
 		AtomicType(name):
 			resolve_atomic_type(scope, name)
 		AppliedType(name, arguments, span):
-			match resolve_head(scope, name, NonApplicableType(name.id)):
-				Ok(head): resolve_applied_head(scope, head, name, arguments, span)
-				Err(error): Err(error)
+			match scoped_type(scope, name):
+				Some(_): Err(type_term_error(name.span, NonApplicableType(name.id)))
+				None:
+					match resolve_head(scope, name, NonApplicableType(name.id)):
+						Ok(head): resolve_applied_head(scope, head, name, arguments, span)
+						Err(error): Err(error)
 
 
 private pure func resolve_types(
@@ -417,6 +449,7 @@ private pure func declare_types(
 				RecordDeclarationRow(row): type_access(row.declaration.visibility, row.declaration.type_name.id)
 				OpaqueDeclarationRow(_): PrivateTypeUse
 			scope: TypeScope = {
+				self_binding = None,
 				records = inventory_records(parsed.declarations),
 				unions = inventory_unions(parsed.declarations),
 				namespace = namespace,

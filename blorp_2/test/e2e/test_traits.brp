@@ -1,0 +1,65 @@
+import:
+	./harness: run_accounted_example, verify_rejected_command, with_directory, TargetAllocations(ZeroTargetAllocations, PositiveTargetAllocations)
+	./cost: CostLimits
+	system: file_exists, read_file, write_file
+	test: TestSuite
+
+
+private LIBRARY_ROOT: String = "blorp_2/test/e2e/trait_inputs/concrete/library"
+
+-- Direct CLI: 17,282 allocations and 56,730,399 instructions.
+-- Maintained harness: 17,282 allocations and 51,316,897 instructions.
+-- These initial limits leave headroom above both observed boundaries.
+private MANAGED_LIMITS: CostLimits = { allocations = 19000, instructions = 70000000 }
+
+
+func test_concrete_trait_calls_its_authored_body(compiler: String) -> Bool:
+	run_accounted_example(
+		compiler, LIBRARY_ROOT,
+		"blorp_2/test/e2e/trait_inputs/concrete/main.brp", 23, "",
+		-- Existing initial limits remain unchanged.
+		{ allocations = 7000, instructions = 55000000 },
+		ZeroTargetAllocations, "build/traits-T1/native-managed/scalar.c",
+	)
+
+
+-- Its real main requires both custom answers.
+func test_managed_trait_operands_are_accounted(compiler: String) -> Bool:
+	run_accounted_example(
+		compiler, LIBRARY_ROOT,
+		"blorp_2/test/e2e/trait_inputs/concrete/managed.brp", 23, "", MANAGED_LIMITS,
+		PositiveTargetAllocations, "build/traits-T1/native-managed/managed.c",
+	)
+
+
+private func reject_mismatched_signature(compiler: String, directory: String) -> Result[Void, String]:
+	input: String = "blorp_2/test/e2e/trait_inputs/concrete/reject_signature.brp"
+	output = directory + "/rejected.c"
+	expected = input + ":4:15: error: implementation signature does not match the trait requirement\nhelp: match the requirement's purity, parameter types and return type, replacing Self with the receiver\n"
+	missing ?= verify_rejected_command(compiler, LIBRARY_ROOT, input, output, expected)
+	unpublished ?= if file_exists(output):
+		Err("rejected trait signature created a C output")
+	else:
+		Ok(void)
+	sentinel ?= write_file(output, "preserve trait output")
+	existing ?= verify_rejected_command(compiler, LIBRARY_ROOT, input, output, expected)
+	actual ?= read_file(output)
+	if actual == "preserve trait output":
+		Ok(void)
+	else:
+		Err("rejected trait signature overwrote existing output")
+
+
+func test_invalid_trait_signature_preserves_output(compiler: String) -> Bool:
+	with_directory(func(directory: String): reject_mismatched_signature(compiler, directory))
+
+
+pure func suite(compiler: String) -> TestSuite:
+	{
+		description = "Concrete authored traits",
+		tests = [
+			("concrete equals uses an ordinary body and native entrypoint", func(): test_concrete_trait_calls_its_authored_body(compiler)),
+			("managed List receiver has balanced positive target allocations", func(): test_managed_trait_operands_are_accounted(compiler)),
+			("wrong implementation signature preserves missing/existing output", func(): test_invalid_trait_signature_preserves_output(compiler)),
+		]
+	}

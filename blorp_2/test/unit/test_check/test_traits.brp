@@ -1,0 +1,753 @@
+import:
+	../../../src/check/check: check, checked_functions, check_errors
+	../../../src/check/model: TypeRef(IntType, RecordType, AppliedRecordType, ParameterType, ListType), field_owner, parameter_owner, TypeParameterOwner(TraitDeclaration), same_type, function_calls, CallTarget(TraitMethod), method_identity, method_receiver, method_body
+	../../../src/lex/lex: lex
+	../../../src/parse/parse: parse_module
+	../../../src/parse/assemble: ParsedAssembly, ParsedProgram, begin_program, append_module, assembly_names, parsed_contents
+	../../../src/utils/source: ModuleId, ModuleKind(UserModule, LibraryModule, FoundationTypesModule, FoundationPreludeModule), module_id, module_source, root_module_id, compiler_source, same_source
+	../../../src/utils/ids: inventory_traits, inventory_functions, inventory_records, trait_method_number, record_number, FunctionRole(FreeFunctionBody), same_trait_method, function_number, trait_number
+	../../../src/check/errors: CheckErrorKind(TraitRejection, TypeTermRejection, CallRejection, QualifiedRejection), QualifiedError(QualifiedNotOffered), CallError(UnknownFunction), TypeTermError(UnknownType, NonApplicableType, TraitUsedAsType), TraitError(DuplicateRequirementParameter,DifferentMethodFamilies, FamilyFunctionConflict, OrphanImplementation, ImpureRequirement, GenericRequirement, FirstParameterMustBeSelf, CallableFormalDeferred)
+	../../../src/check/render: render_failure
+	../../../src/namespace/namespace: Unoffered(UnknownName)
+	../../../src/utils/names: same_name
+	int as IntOps
+	../../../src/utils/syntax: TypeSyntax(AtomicType, AppliedType, QualifiedType), Diagnostic, Span, DiagnosticNote(PreviousDeclaration), same_span, type_span, diagnostic
+	../module_input: FOUNDATION_TYPES, sealed
+	option: to_result, is_none
+	result: and_then, is_err
+	system: read_file
+	test: TestSuite
+
+
+private REQUIREMENT: String =
+	|trait Equatable:
+	|    pure func equals(left: Self, right: Self) -> Bool
+	|
+
+private IMPLEMENTATION: String =
+	|import:
+	|    _base: Int, Bool, Equatable
+	|
+	|implements Equatable for Int:
+	|    pure func equals(left: Int, right: Int) -> Bool:
+	|        builtin("int.equals")
+	|
+
+private MAIN: String =
+	|import:
+	|    int: equals
+	|
+	|func main() -> Int:
+	|    match equals(7, 7):
+	|        True: 23
+	|        False: 0
+	|
+
+
+private PRELUDE: String =
+	|import:
+	|    _base: Int, Float, String, Void, List, Bool(True, False), Option(Some, None), Result(Ok, Err)
+	|
+
+
+private pure func append_fixture_source(assembly: ParsedAssembly, module: ModuleId, source: String, targets: List[ModuleId], role: ModuleKind) -> Result[ParsedAssembly, Diagnostic]:
+	tokens ?= lex(module_source(module), source, assembly_names(assembly))
+	parsed ?= parse_module(tokens, module)
+	append_module(assembly, parsed, targets, role)
+
+
+-- A test-local explicit bundle: forward imports name real module IDs, and the
+-- implementation belongs to the library rather than a user-module exception.
+-- Public only so the ignored first-red witness can identify its parser boundary.
+pure func parse_concrete_trait_fixture() -> Result[ParsedProgram, Diagnostic]:
+	parse_trait_fixture(MAIN, IMPLEMENTATION, REQUIREMENT)
+
+
+pure func parse_trait_fixture(main_source: String, implementation_source: String, requirements: String) -> Result[ParsedProgram, Diagnostic]:
+	invalid = diagnostic({ source = compiler_source(), start = 0, end = 0 }, "invalid trait fixture module identity", "use the four explicit fixture module ordinals")
+	provider ?= module_id(1).to_result(invalid)
+	parse_trait_fixture_from(main_source, implementation_source, requirements, provider, PRELUDE)
+
+
+private pure func parse_trait_fixture_from(main_source: String, implementation_source: String, requirements: String, provider: ModuleId, prelude_source: String) -> Result[ParsedProgram, Diagnostic]:
+	invalid = diagnostic({ source = compiler_source(), start = 0, end = 0 }, "invalid trait fixture module identity", "use the four explicit fixture module ordinals")
+	integer ?= module_id(1).to_result(invalid)
+	base ?= module_id(2).to_result(invalid)
+	prelude ?= module_id(3).to_result(invalid)
+	root ?= append_fixture_source(begin_program(), root_module_id(), main_source, [provider], UserModule)
+	with_integer ?= append_fixture_source(root, integer, implementation_source, [base], LibraryModule)
+	with_base ?= append_fixture_source(with_integer, base, FOUNDATION_TYPES + requirements, [], FoundationTypesModule)
+	with_prelude ?= append_fixture_source(with_base, prelude, prelude_source, [base], FoundationPreludeModule)
+	sealed(with_prelude)
+
+
+-- Calls retain the accepted family and semantic receiver; only Specialize
+-- selects the already validated genuine authored body through the mapping.
+pure func test_concrete_authored_equality_checks_with_an_integer_entrypoint() -> Bool:
+	match parse_concrete_trait_fixture():
+		Err(_): False
+		Ok(parsed):
+			match (inventory_traits(parsed_contents(parsed).declarations), inventory_functions(parsed_contents(parsed).declarations), check(parsed)):
+				([owner], [_, implementation], Ok(program)):
+					checked = checked_functions(program)
+					match (owner.methods, checked.functions.get(0), checked.traits.canonical):
+						([method], Some(main), Some(canonical)):
+							match function_calls(main):
+								[call]:
+									match call.target:
+										TraitMethod(accepted):
+											match method_body(checked.traits, accepted):
+												Some(body): same_trait_method(method_identity(accepted), method.id) and same_type(method_receiver(accepted), IntType) and IntOps.equals(function_number(body), function_number(implementation.id)) and same_type(main.signature.return_type.value_type, IntType) and IntOps.equals(trait_number(canonical), trait_number(owner.id))
+												None: False
+										_: False
+								_: False
+						_: False
+				_: False
+
+
+pure func test_reverse_written_bodies_map_by_method_identity() -> Bool:
+	requirements: String =
+		|trait Observable:
+		|    pure func observe(value: Self) -> Int
+		|    pure func reset(value: Self) -> Int
+		|
+	implementation: String =
+		|import:
+		|    _base: Int, Observable
+		|implements Observable for Int:
+		|    pure func reset(value: Self) -> Int:
+		|        23
+		|    pure func observe(value: Self) -> Int:
+		|        0
+		|
+	main_source: String = "import:\n    int: reset\nfunc main() -> Int:\n    reset(7)\n"
+	match parse_trait_fixture(main_source, implementation, requirements):
+		Err(_): False
+		Ok(parsed):
+			match check(parsed):
+				Err(_): False
+				Ok(program):
+					checked = checked_functions(program)
+					match (checked.traits.implementations, checked.functions):
+						([accepted], [main, reset, observe]):
+							match (accepted.methods, function_calls(main)):
+								([reset_member, observe_member], [call]):
+									match call.target:
+										TraitMethod(method): same_trait_method(method_identity(method), reset_member.method) and trait_method_number(reset_member.method) == 1 and trait_method_number(observe_member.method) == 0 and function_number(reset_member.function) == function_number(reset.id) and function_number(observe_member.function) == function_number(observe.id) and reset.signature.type_parameters.is_empty() and observe.signature.type_parameters.is_empty()
+										_: False
+								_: False
+						_: False
+
+
+pure func test_public_implementation_body_can_use_a_private_local_receiver() -> Bool:
+	implementation: String =
+		|import:
+		|    _base: Int, Bool(True, False), Equatable
+		|private fixed record Secret { value: Int }
+		|implements Equatable for Secret:
+		|    pure func equals(left: Self, right: Self) -> Bool:
+		|        True
+		|pure func exercise() -> Int:
+		|    left: Secret = { value = 7 }
+		|    right: Secret = { value = 8 }
+		|    match equals(left, right):
+		|        True: 23
+		|        False: 0
+		|
+	match parse_trait_fixture("import:\n    int: exercise\nfunc main() -> Int:\n    exercise()\n", implementation, REQUIREMENT):
+		Err(_): False
+		Ok(parsed):
+			match (inventory_records(parsed_contents(parsed).declarations), check(parsed)):
+				([owner], Ok(program)):
+					match (checked_functions(program).traits.implementations, checked_functions(program).functions):
+						([accepted], [_, body, _]): same_type(accepted.receiver, RecordType(owner.id)) and body.signature.type_parameters.is_empty() and body.signature.parameters.all(pure func(parameter): same_type(parameter.value_type, accepted.receiver))
+						_: False
+				_: False
+
+
+pure func test_library_foundation_allowance_does_not_claim_a_foreign_receiver() -> Bool:
+	match (module_id(1), module_id(2), module_id(3), module_id(4)):
+		(Some(library), Some(base), Some(prelude), Some(foreign_module)):
+			implementation: String =
+				|import:
+				|    _base: Equatable, Bool
+				|    ./outside: Foreign
+				|implements Equatable for Foreign:
+				|    pure func equals(left: Self, right: Self) -> Bool:
+				|        True
+				|
+			assembled = append_fixture_source(begin_program(), root_module_id(), "import:\n    int as Integer\nfunc main() -> Int:\n    0\n", [library], UserModule)
+				.and_then(pure func(root): append_fixture_source(root, library, implementation, [base, foreign_module], LibraryModule))
+				.and_then(pure func(root): append_fixture_source(root, base, FOUNDATION_TYPES + REQUIREMENT, [], FoundationTypesModule))
+				.and_then(pure func(root): append_fixture_source(root, prelude, PRELUDE, [base], FoundationPreludeModule))
+				.and_then(pure func(root): append_fixture_source(root, foreign_module, "fixed record Foreign { value: Int }\n", [], UserModule))
+				.and_then(sealed)
+			match assembled:
+				Err(_): False
+				Ok(parsed):
+					match (inventory_traits(parsed_contents(parsed).declarations), inventory_records(parsed_contents(parsed).declarations), check(parsed)):
+						([trait_owner], [receiver], Err(failure)):
+							error = check_errors(failure).first
+							diagnostic = render_failure(failure).first
+							match error.kind:
+								TraitRejection(OrphanImplementation(owner, actual)): trait_number(owner) == trait_number(trait_owner.id) and same_type(actual, RecordType(receiver.id)) and error.span.start == 58 and error.span.end == 91 and diagnostic.message == "implementation belongs to neither the trait nor receiver module" and diagnostic.help == "declare it beside the trait or receiver type; foundation types may be implemented by their library" and diagnostic.note.is_none()
+								_: False
+						_: False
+		_: False
+
+
+pure func parse_custom_trait_fixture(main_source: String, custom_source: String) -> Result[ParsedProgram, Diagnostic]:
+	parse_custom_trait_fixture_in_order(main_source, custom_source, False)
+
+
+private pure func parse_custom_trait_fixture_in_order(main_source: String, custom_source: String, custom_first: Bool) -> Result[ParsedProgram, Diagnostic]:
+	invalid = diagnostic({ source = compiler_source(), start = 0, end = 0 }, "invalid trait fixture module identity", "use the five explicit fixture module ordinals")
+	integer ?= module_id(1).to_result(invalid)
+	base ?= module_id(2).to_result(invalid)
+	prelude ?= module_id(3).to_result(invalid)
+	custom ?= module_id(4).to_result(invalid)
+	root_targets: List[ModuleId] = if custom_first:
+		[custom, integer]
+	else:
+		[integer, custom]
+	root ?= append_fixture_source(begin_program(), root_module_id(), main_source, root_targets, UserModule)
+	with_integer ?= append_fixture_source(root, integer, IMPLEMENTATION, [base], LibraryModule)
+	with_base ?= append_fixture_source(with_integer, base, FOUNDATION_TYPES + REQUIREMENT, [], FoundationTypesModule)
+	with_prelude ?= append_fixture_source(with_base, prelude, PRELUDE, [base], FoundationPreludeModule)
+	with_custom ?= append_fixture_source(with_prelude, custom, custom_source, [base], UserModule)
+	sealed(with_custom)
+
+
+private CUSTOM: String =
+	|import:
+	|    _base: Equatable
+	|fixed record Shape { value: Int }
+	|pure func make() -> Shape:
+	|    { value = 7 }
+	|implements Equatable for Shape:
+	|    pure func equals(left: Self, right: Self) -> Bool:
+	|        True
+	|
+
+
+private pure func cross_self_call_checks(imports: String, expression: String) -> Bool:
+	main_source = imports + "func main() -> Int:\n    match " + expression + ":\n        True: 23\n        False: 0\n"
+	match parse_custom_trait_fixture(main_source, CUSTOM):
+		Err(_): False
+		Ok(parsed):
+			match (inventory_records(parsed_contents(parsed).declarations), check(parsed)):
+				([record_owner], Ok(program)):
+					checked = checked_functions(program)
+					match checked.functions.get(0):
+						Some(main):
+							methods = function_calls(main).filter(pure func(call):
+								match call.target:
+									TraitMethod(_): True
+									_: False
+							)
+							match methods:
+								[call]:
+									match call.target:
+										TraitMethod(method):
+											match method_body(checked.traits, method):
+												Some(body): same_type(method_receiver(method), RecordType(record_owner.id)) and function_number(body) == 3
+												None: False
+										_: False
+								_: False
+						None: False
+				_: False
+
+
+pure func test_integer_family_import_selects_custom_receiver_implementation() -> Bool:
+	cross_self_call_checks("import:\n    int: equals\n    ./custom as Custom\n", "equals(Custom.make(), Custom.make())")
+
+
+pure func test_integer_methods_only_family_selects_custom_receiver_implementation() -> Bool:
+	cross_self_call_checks("import:\n    int: Int methods_only\n    ./custom as Custom\n", "Custom.make().equals(Custom.make())")
+
+
+pure func test_qualified_integer_family_selects_custom_receiver_implementation() -> Bool:
+	cross_self_call_checks("import:\n    int as Integer\n    ./custom as Custom\n", "Integer.equals(Custom.make(), Custom.make())")
+
+
+pure func test_distinct_method_families_clash_without_a_call() -> Bool:
+	custom: String =
+		|import:
+		|    _base: Int
+		|trait Other:
+		|    pure func equals(left: Self, right: Self) -> Bool
+		|fixed record Shape { value: Int }
+		|implements Other for Shape:
+		|    pure func equals(left: Self, right: Self) -> Bool:
+		|        True
+		|
+	match parse_custom_trait_fixture("import:\n    int: Int methods_only\n    ./custom: Shape\nfunc main() -> Int:\n    0\n", custom):
+		Err(_): False
+		Ok(parsed): family_clash_expected(parsed, 1, 0, False, { source = module_source(root_module_id()), start = 48, end = 53 }, { source = module_source(root_module_id()), start = 17, end = 20 })
+
+
+pure func test_method_family_and_free_function_clash_without_a_call() -> Bool:
+	custom: String =
+		|import:
+		|    _base: Int
+		|fixed record Shape { value: Int }
+		|pure func equals(left: Shape, right: Shape) -> Bool:
+		|    True
+		|
+	match parse_custom_trait_fixture("import:\n    int: Int methods_only\n    ./custom: Shape\nfunc main() -> Int:\n    0\n", custom):
+		Err(_): False
+		Ok(parsed): family_clash_expected(parsed, 0, 0, True, { source = module_source(root_module_id()), start = 48, end = 53 }, { source = module_source(root_module_id()), start = 17, end = 20 })
+
+
+private fixed union RequirementRejection:
+	ImpureRequirementCase
+	GenericRequirementCase
+	FirstSelfCase
+	CallableFormalCase
+
+
+private pure func requirement_rejected(requirements: String, expected: RequirementRejection, message: String, help: String) -> Bool:
+	match parse_trait_fixture("import:\n    int as Integer\nfunc main() -> Int:\n    0\n", "import:\n    _base: Int\n", requirements):
+		Err(_): False
+		Ok(parsed):
+			match (inventory_traits(parsed_contents(parsed).declarations), check(parsed)):
+				([owner], Err(failure)):
+					match owner.methods:
+						[method]:
+							error = check_errors(failure).first
+							diagnostic = render_failure(failure).first
+							matches = match (error.kind, expected):
+								(TraitRejection(ImpureRequirement(id)), ImpureRequirementCase): same_trait_method(id, method.id)
+								(TraitRejection(GenericRequirement(id)), GenericRequirementCase): same_trait_method(id, method.id)
+								(TraitRejection(FirstParameterMustBeSelf(id)), FirstSelfCase): same_trait_method(id, method.id)
+								(TraitRejection(CallableFormalDeferred(id)), CallableFormalCase): same_trait_method(id, method.id)
+								_: False
+							expected_site: Option[Span] = match expected:
+								ImpureRequirementCase | GenericRequirementCase: Some(method.declaration.header.function_name.span)
+								FirstSelfCase: method.declaration.header.parameters.get(0).map(pure func(parameter): type_span(parameter.type_name))
+								CallableFormalCase: method.declaration.header.parameters.get(1).map(pure func(parameter): type_span(parameter.type_name))
+							match expected_site:
+								Some(site): matches and same_span(error.span, site) and same_span(diagnostic.span, site) and diagnostic.message == message and diagnostic.help == help and diagnostic.note.is_none()
+								None: False
+						_: False
+				_: False
+
+
+pure func test_impure_requirement_is_rejected_before_calls() -> Bool:
+	requirement_rejected("trait Comparable:\n    func equals(left: Self, right: Self) -> Bool\n", ImpureRequirementCase, "trait requirements must be pure", "declare a pure func requirement and a pure implementation")
+
+
+pure func test_method_type_parameters_are_deferred_explicitly() -> Bool:
+	requirement_rejected("trait Comparable:\n    pure func equals[T](left: Self, right: Self) -> Bool\n", GenericRequirementCase, "trait methods cannot declare type parameters", "use Self and ordinary concrete parameter types")
+
+
+pure func test_first_formal_must_be_exactly_self() -> Bool:
+	requirement_rejected("trait Comparable:\n    pure func equals(left: Int, right: Self) -> Bool\n", FirstSelfCase, "a trait method's first parameter must be Self", "write a first parameter such as value: Self")
+
+
+pure func test_callable_formals_are_deferred_without_a_fake_function_owner() -> Bool:
+	requirement_rejected("trait Comparable:\n    pure func equals(left: Self, callback: pure () -> Int) -> Bool\n", CallableFormalCase, "trait callable parameters are not supported yet", "use ordinary value parameters; callable formal ownership requires a later increment")
+
+
+private pure func family_clash_expected(parsed: ParsedProgram, current_owner: Int, previous_owner: Int, free_function: Bool, current: Span, previous: Span) -> Bool:
+	contents = parsed_contents(parsed)
+	match (inventory_traits(contents.declarations).get(current_owner), check(parsed)):
+		(Some(owner), Err(failure)):
+			match owner.methods:
+				[method]:
+					error = check_errors(failure).first
+					diagnostic = render_failure(failure).first
+					facts = match error.kind:
+						TraitRejection(DifferentMethodFamilies(actual, earlier, site)):
+							match inventory_traits(contents.declarations).get(previous_owner):
+								Some(other):
+									match other.methods:
+										[other_method]: not free_function and same_trait_method(actual, method.id) and same_trait_method(earlier, other_method.id) and same_span(site, previous)
+										_: False
+								None: False
+						TraitRejection(FamilyFunctionConflict(actual, function, site)):
+							free = inventory_functions(contents.declarations).filter(pure func(row):
+								match row.role:
+									FreeFunctionBody: same_name(row.declaration.function_name.id, method.declaration.header.function_name.id)
+									_: False
+							)
+							match free:
+								[body]: free_function and same_trait_method(actual, method.id) and function_number(function) == function_number(body.id) and same_span(site, previous)
+								_: False
+						_: False
+					message = if free_function:
+						"trait method family conflicts with a free function"
+					else:
+						"different trait method families share this name"
+					help = if free_function:
+						"rename the free function, or import one declaration through a module alias"
+					else:
+						"select one family, or reach the other through a module alias"
+					match diagnostic.note:
+						Some(PreviousDeclaration(note)): facts and same_span(error.span, current) and same_span(diagnostic.span, current) and same_span(note, previous) and diagnostic.message == message and diagnostic.help == help
+						_: False
+				_: False
+		_: False
+
+
+pure func test_family_clash_reversed_imports_points_to_the_later_written_route() -> Bool:
+	custom: String =
+		|import:
+		|    _base: Int
+		|trait Other:
+		|    pure func equals(left: Self, right: Self) -> Bool
+		|fixed record Shape { value: Int }
+		|implements Other for Shape:
+		|    pure func equals(left: Self, right: Self) -> Bool:
+		|        True
+		|
+	match parse_custom_trait_fixture_in_order("import:\n    ./custom: Shape\n    int: Int methods_only\nfunc main() -> Int:\n    0\n", custom, True):
+		Err(_): False
+		Ok(parsed): family_clash_expected(parsed, 0, 1, False, { source = module_source(root_module_id()), start = 37, end = 40 }, { source = module_source(root_module_id()), start = 22, end = 27 })
+
+
+
+pure func test_duplicate_abstract_formals_are_rejected() -> Bool:
+	requirements: String = "trait Observe:\n    pure func observe(value: Self, value: Self) -> Int\n"
+	match parse_trait_fixture("import:\n    int as Integer\nfunc main() -> Int:\n    0\n", "import:\n    _base: Int\n", requirements):
+		Err(_): False
+		Ok(parsed):
+			match (inventory_traits(parsed_contents(parsed).declarations), check(parsed)):
+				([owner], Err(failure)):
+					match owner.methods:
+						[method]:
+							match method.declaration.header.parameters:
+								[first, second]:
+									error = check_errors(failure).first
+									diagnostic = render_failure(failure).first
+									match (error.kind, diagnostic.note):
+										(TraitRejection(DuplicateRequirementParameter(id, earlier)), Some(PreviousDeclaration(note))): same_trait_method(id, method.id) and same_name(earlier.id, first.name.id) and same_span(earlier.span, first.name.span) and same_span(error.span, second.name.span) and same_span(note, first.name.span) and diagnostic.message == "`value` is already a parameter in this function" and diagnostic.help == "choose a different name for this binding"
+										_: False
+								_: False
+						_: False
+				_: False
+
+
+pure func test_unknown_abstract_annotation_precedes_duplicate_names() -> Bool:
+	requirements: String = "trait Observe:\n    pure func observe(value: Self, value: Missing) -> Int\n"
+	match parse_trait_fixture("import:\n    int as Integer\nfunc main() -> Int:\n    0\n", "import:\n    _base: Int\n", requirements):
+		Err(_): False
+		Ok(parsed):
+			match (inventory_traits(parsed_contents(parsed).declarations), check(parsed)):
+				([owner], Err(failure)):
+					match owner.methods:
+						[method]:
+							match method.declaration.header.parameters:
+								[_, second]:
+									error = check_errors(failure).first
+									diagnostic = render_failure(failure).first
+									match (error.kind, second.type_name):
+										(TypeTermRejection(UnknownType(id)), AtomicType(written)): same_name(id, written.id) and same_span(error.span, written.span) and diagnostic.message == "unknown type" and diagnostic.help == "declare or import this type; builtin types and declared type parameters are also available" and diagnostic.note.is_none()
+										_: False
+								_: False
+						_: False
+				_: False
+
+
+private SELF_RECORD: String =
+	|fixed record Self[T] { value: T }
+	|
+
+
+pure func test_scoped_self_cannot_resolve_an_applied_module_constructor() -> Bool:
+	requirements: String = SELF_RECORD + "trait Observe:\n    pure func observe(value: Self) -> Self[Int]\n"
+	match parse_trait_fixture("import:\n    int as Integer\nfunc main() -> Int:\n    0\n", "import:\n    _base: Int\n", requirements):
+		Err(_): False
+		Ok(parsed):
+			match (inventory_traits(parsed_contents(parsed).declarations), check(parsed)):
+				([owner], Err(failure)):
+					match owner.methods:
+						[method]:
+							match method.declaration.header.return_type:
+								Some(AppliedType(name, _, _)):
+									error = check_errors(failure).first
+									diagnostic = render_failure(failure).first
+									match error.kind:
+										TypeTermRejection(NonApplicableType(id)): same_name(id, name.id) and same_span(error.span, name.span) and diagnostic.message == "type does not accept a type argument" and diagnostic.help == "apply a declared generic union or record, such as Box[Int]" and diagnostic.note.is_none()
+										_: False
+								_: False
+						_: False
+				_: False
+
+
+pure func test_module_self_type_and_explicit_qualification_keep_their_nominal_owner() -> Bool:
+	main_source: String =
+		|import:
+		|    _base as Base
+		|fixed record Self[T] { value: T }
+		|trait Observe:
+		|    pure func observe(value: Self) -> Base.Self[Int]
+		|func main() -> Int:
+		|    module_value().value
+		|pure func module_value() -> Self[Int]:
+		|    { value = 7 }
+		|
+	match module_id(2):
+		None: False
+		Some(base):
+			match parse_trait_fixture_from(main_source, "import:\n    _base: Int\n", SELF_RECORD, base, PRELUDE):
+				Err(_): False
+				Ok(parsed):
+					match (inventory_records(parsed_contents(parsed).declarations), inventory_traits(parsed_contents(parsed).declarations), check(parsed)):
+						([local_record, base_record], [trait_owner], Ok(program)):
+							checked = checked_functions(program)
+							match (checked.traits.declarations, checked.functions):
+								([accepted_trait], [main, helper]):
+									match accepted_trait.methods:
+										[method]:
+											match (method.signature.return_type.value_type, helper.signature.return_type.value_type, method.signature.parameters):
+												(AppliedRecordType(returned, [IntType]), AppliedRecordType(ordinary, [IntType]), [formal]):
+													match formal.value_type:
+														ParameterType(parameter):
+															match parameter_owner(parameter):
+																TraitDeclaration(owner): record_number(returned) == record_number(base_record.id) and record_number(ordinary) == record_number(local_record.id) and trait_number(owner) == trait_number(trait_owner.id) and same_type(main.signature.return_type.value_type, IntType)
+																_: False
+														_: False
+												_: False
+										_: False
+								_: False
+						_: False
+
+
+
+private INHERITED_PADDING: String =
+	|    -- The inherited introduction deliberately has a larger byte offset
+	|    -- than either local declaration. Cross-file offsets do not order sites.
+	|
+
+
+private pure func parse_inherited_trait_fixture(main_source: String) -> Result[ParsedProgram, Diagnostic]:
+	invalid = diagnostic({ source = compiler_source(), start = 0, end = 0 }, "invalid trait fixture module identity", "use the four explicit fixture module ordinals")
+	integer ?= module_id(1).to_result(invalid)
+	base ?= module_id(2).to_result(invalid)
+	prelude ?= module_id(3).to_result(invalid)
+	root ?= append_fixture_source(begin_program(), root_module_id(), main_source, [integer], UserModule)
+	with_integer ?= append_fixture_source(root, integer, IMPLEMENTATION, [base], LibraryModule)
+	with_base ?= append_fixture_source(with_integer, base, FOUNDATION_TYPES + REQUIREMENT, [], FoundationTypesModule)
+	with_prelude ?= append_fixture_source(with_base, prelude, PRELUDE + INHERITED_PADDING + "    int: Int methods_only\n", [base, integer], FoundationPreludeModule)
+	sealed(with_prelude)
+
+
+pure func test_local_family_clash_points_to_local_declaration_before_inherited_route() -> Bool:
+	prefix: String = "import:\n    int as Integer\ntrait Other:\n    pure func "
+	source = prefix + "equals(left: Self, right: Self) -> Bool\nfunc main() -> Int:\n    0\n"
+	match parse_inherited_trait_fixture(source):
+		Err(_): False
+		Ok(parsed):
+			previous_start = PRELUDE.length() + INHERITED_PADDING.length() + "    int: ".length()
+			family_clash_expected(parsed, 0, 1, False,
+				{ source = module_source(root_module_id()), start = prefix.length(), end = prefix.length() + 6 },
+				{ source = module_source(parsed_contents(parsed).foundation.prelude), start = previous_start, end = previous_start + 3 })
+
+
+pure func test_local_free_function_clash_points_to_local_declaration_before_inherited_route() -> Bool:
+	prefix: String = "import:\n    int as Integer\npure func "
+	source = prefix + "equals(left: Int, right: Int) -> Bool:\n    True\nfunc main() -> Int:\n    0\n"
+	match parse_inherited_trait_fixture(source):
+		Err(_): False
+		Ok(parsed):
+			previous_start = PRELUDE.length() + INHERITED_PADDING.length() + "    int: ".length()
+			family_clash_expected(parsed, 0, 0, True,
+				{ source = module_source(root_module_id()), start = prefix.length(), end = prefix.length() + 6 },
+				{ source = module_source(parsed_contents(parsed).foundation.prelude), start = previous_start, end = previous_start + 3 })
+
+
+pure func test_methods_only_requires_provider_implementation_for_selected_head() -> Bool:
+	prefix: String = "import:\n    int: Int methods_only\nfunc main() -> Int:\n    match "
+	implementation: String =
+		|import:
+		|    _base: Int, Float, Bool, Equatable
+		|implements Equatable for Float:
+		|    pure func equals(left: Self, right: Self) -> Bool:
+		|        builtin("float.equals")
+		|
+	match parse_trait_fixture(prefix + "equals(7, 7):\n        True: 23\n        False: 0\n", implementation, REQUIREMENT):
+		Err(_): False
+		Ok(parsed):
+			match check(parsed):
+				Ok(_): False
+				Err(failure):
+					error = check_errors(failure).first
+					diagnostic = render_failure(failure).first
+					expected: Span = { source = module_source(root_module_id()), start = prefix.length(), end = prefix.length() + 6 }
+					match error.kind:
+						CallRejection(UnknownFunction(name)):
+							match inventory_traits(parsed_contents(parsed).declarations):
+								[owner]:
+									match owner.methods:
+										[method]: same_name(name, method.declaration.header.function_name.id) and same_span(error.span, expected) and same_span(diagnostic.span, expected) and diagnostic.message == "unknown function" and diagnostic.help == "declare the function locally or import it by name; type selections enable receiver calls only" and diagnostic.note.is_none()
+										_: False
+								_: False
+						_: False
+
+
+
+private pure func trait_as_type_rejection(prefix: String, qualified: Bool) -> Bool:
+	requirements: String = "trait Observe:\n    pure func observe(value: Self) -> Int\n"
+	match module_id(2):
+		None: False
+		Some(base):
+			match parse_trait_fixture_from(prefix + "Observe:\n    0\n", "import:\n    _base: Int\n", requirements, base, PRELUDE):
+				Err(_): False
+				Ok(parsed):
+					match (inventory_traits(parsed_contents(parsed).declarations), inventory_functions(parsed_contents(parsed).declarations), check(parsed)):
+						([owner], [_, helper], Err(failure)):
+							error = check_errors(failure).first
+							diagnostic = render_failure(failure).first
+							expected: Span = { source = module_source(root_module_id()), start = prefix.length(), end = prefix.length() + 7 }
+							written = match helper.declaration.return_type:
+								Some(AtomicType(name)): not qualified and same_name(name.id, owner.type_name.id) and same_span(name.span, expected)
+								Some(QualifiedType(name, [], _)): qualified and same_name(name.name.id, owner.type_name.id) and same_span(name.name.span, expected)
+								_: False
+							match error.kind:
+								TypeTermRejection(TraitUsedAsType(id)): written and trait_number(id) == trait_number(owner.id) and same_span(error.span, expected) and same_span(diagnostic.span, expected) and diagnostic.message == "a trait is not a value type" and diagnostic.help == "use a concrete implementing type; generic bounds arrive in a later increment" and diagnostic.note.is_none()
+								_: False
+						_: False
+
+
+pure func test_unqualified_trait_is_separate_from_value_types() -> Bool:
+	trait_as_type_rejection("import:\n    _base: Observe\nfunc main() -> Int:\n    0\npure func value() -> ", False)
+
+
+pure func test_qualified_trait_is_separate_from_value_types() -> Bool:
+	trait_as_type_rejection("import:\n    _base as Base\nfunc main() -> Int:\n    0\npure func value() -> Base.", True)
+
+
+pure func test_unknown_qualified_type_preserves_the_ordinary_not_offered_diagnostic() -> Bool:
+	prefix: String = "import:\n    _base as Base\nfunc main() -> Int:\n    0\npure func value() -> Base."
+	match module_id(2):
+		None: False
+		Some(base):
+			match parse_trait_fixture_from(prefix + "Missing:\n    0\n", "import:\n    _base: Int\n", "", base, PRELUDE):
+				Err(_): False
+				Ok(parsed):
+					match (inventory_functions(parsed_contents(parsed).declarations), check(parsed)):
+						([_, helper], Err(failure)):
+							match helper.declaration.return_type:
+								Some(QualifiedType(written, [], _)):
+									error = check_errors(failure).first
+									diagnostic = render_failure(failure).first
+									expected: Span = { source = module_source(root_module_id()), start = prefix.length(), end = prefix.length() + 7 }
+									match error.kind:
+										QualifiedRejection(QualifiedNotOffered(alias_name, name, _, UnknownName)): same_name(alias_name, written.module.id) and same_name(name, written.name.id) and same_span(error.span, expected) and same_span(diagnostic.span, expected) and diagnostic.message == "module _base declares no public Missing" and diagnostic.help == "Base names module _base; qualify a public function, constructor or type it declares; imports are not reexported" and diagnostic.note.is_none()
+										_: False
+								_: False
+						_: False
+
+
+
+pure func test_same_spelled_user_trait_does_not_become_canonical_equatable() -> Bool:
+	main_source: String =
+		|import:
+		|    int as Integer
+		|trait Equatable:
+		|    pure func equals(value: Self) -> Int
+		|implements Equatable for Int:
+		|    pure func equals(value: Self) -> Int:
+		|        7
+		|func main() -> Int:
+		|    equals(7)
+		|
+	match parse_trait_fixture(main_source, "import:\n    _base: Int\n", ""):
+		Err(_): False
+		Ok(parsed):
+			contents = parsed_contents(parsed)
+			match (inventory_traits(contents.declarations), inventory_functions(contents.declarations), check(parsed)):
+				([owner], [body, _], Ok(program)):
+					checked = checked_functions(program)
+					match (owner.methods, checked.functions):
+						([method], [_, main]):
+							match function_calls(main):
+								[call]:
+									match call.target:
+										TraitMethod(accepted):
+											match method_body(checked.traits, accepted):
+												Some(function): checked.traits.canonical.is_none() and same_source(module_source(owner.module), module_source(root_module_id())) and same_trait_method(method_identity(accepted), method.id) and same_type(method_receiver(accepted), IntType) and function_number(function) == function_number(body.id) and same_type(main.signature.return_type.value_type, IntType)
+												None: False
+										_: False
+								_: False
+						_: False
+				_: False
+
+
+
+-- Read the same written main exercised by the native suite. The existing
+-- explicit-role fixture helper supplies the ordinary foundation contract.
+func test_managed_fixture_retains_receiver_field_and_body_identities() -> Bool:
+	match (read_file("blorp_2/test/e2e/trait_inputs/concrete/managed.brp"), read_file("blorp_2/test/e2e/trait_inputs/concrete/library/int.brp"), read_file("blorp_2/test/e2e/trait_inputs/concrete/library/prelude.brp"), module_id(1)):
+		(Ok(source), Ok(integer_source), Ok(prelude_source), Some(provider)):
+			match parse_trait_fixture_from(source, integer_source, REQUIREMENT, provider, prelude_source):
+				Err(_): False
+				Ok(parsed): managed_fixture_mapping(parsed)
+		_: False
+
+
+private pure func managed_fixture_mapping(parsed: ParsedProgram) -> Bool:
+	declarations = parsed_contents(parsed).declarations
+	match (inventory_records(declarations), inventory_traits(declarations), inventory_functions(declarations), check(parsed)):
+		([record_owner], [trait_owner], [authored_body, _, integer_body], Ok(program)):
+			checked = checked_functions(program)
+			match (trait_owner.methods, checked.records, checked.functions):
+				([method], [record_type], [authored, main, _]):
+					match record_type.fields:
+						[field]:
+							main_calls = function_calls(main)
+							nested_calls = function_calls(authored)
+							main_mapping = main_calls.all(pure func(call):
+								match call.target:
+									TraitMethod(accepted):
+										match method_body(checked.traits, accepted):
+											Some(body): same_trait_method(method_identity(accepted), method.id) and same_type(method_receiver(accepted), RecordType(record_owner.id)) and function_number(body) == function_number(authored_body.id)
+											None: False
+									_: False
+							)
+							nested_mapping = nested_calls.all(pure func(call):
+								match call.target:
+									TraitMethod(accepted):
+										match method_body(checked.traits, accepted):
+											Some(body): same_trait_method(method_identity(accepted), method.id) and same_type(method_receiver(accepted), IntType) and function_number(body) == function_number(integer_body.id)
+											None: False
+									_: False
+							)
+							main_calls.length() == 2 and nested_calls.length() == 2 and main_mapping and nested_mapping and same_type(field.value_type.value_type, ListType(IntType)) and record_number(field_owner(field.id)) == record_number(record_owner.id)
+						_: False
+				_: False
+		_: False
+
+
+tests: TestSuite = {
+	description = "Blorp 2 concrete authored trait contracts",
+	tests = [
+		("managed fixture keeps receiver field and nested body identities", test_managed_fixture_retains_receiver_field_and_body_identities),
+		("same-spelled user trait is not canonical Equatable", test_same_spelled_user_trait_does_not_become_canonical_equatable),
+		("unqualified trait is not a value type", test_unqualified_trait_is_separate_from_value_types),
+		("qualified trait is not a value type", test_qualified_trait_is_separate_from_value_types),
+		("qualified missing type keeps ordinary diagnostic", test_unknown_qualified_type_preserves_the_ordinary_not_offered_diagnostic),
+		("methods_only requires provider implementation for selected head", test_methods_only_requires_provider_implementation_for_selected_head),
+		("local family clash wins over inherited route", test_local_family_clash_points_to_local_declaration_before_inherited_route),
+		("local free function clash wins over inherited route", test_local_free_function_clash_points_to_local_declaration_before_inherited_route),
+		("applied Self cannot bypass its scoped binding", test_scoped_self_cannot_resolve_an_applied_module_constructor),
+		("module Self and qualified Self retain nominal identity", test_module_self_type_and_explicit_qualification_keep_their_nominal_owner),
+		("unknown abstract annotation precedes duplicate formal", test_unknown_abstract_annotation_precedes_duplicate_names),
+		("duplicate abstract formal names reject", test_duplicate_abstract_formals_are_rejected),
+		("reversed family imports preserve written diagnostic order", test_family_clash_reversed_imports_points_to_the_later_written_route),
+		("impure requirement rejects before calls", test_impure_requirement_is_rejected_before_calls),
+		("method type parameters are explicitly deferred", test_method_type_parameters_are_deferred_explicitly),
+		("first formal is exactly Self", test_first_formal_must_be_exactly_self),
+		("callable formals are explicitly deferred", test_callable_formals_are_deferred_without_a_fake_function_owner),
+		("integer family import selects custom receiver", test_integer_family_import_selects_custom_receiver_implementation),
+		("integer methods_only family selects custom receiver", test_integer_methods_only_family_selects_custom_receiver_implementation),
+		("qualified integer family selects custom receiver", test_qualified_integer_family_selects_custom_receiver_implementation),
+		("different method families clash without a call", test_distinct_method_families_clash_without_a_call),
+		("method family and free function clash without a call", test_method_family_and_free_function_clash_without_a_call),
+		("reverse member order preserves identity", test_reverse_written_bodies_map_by_method_identity),
+		("private local receiver in public implementation body", test_public_implementation_body_can_use_a_private_local_receiver),
+		("library allowance excludes foreign receivers", test_library_foundation_allowance_does_not_claim_a_foreign_receiver),
+		("concrete authored equality checks with an Int entrypoint", test_concrete_authored_equality_checks_with_an_integer_entrypoint),
+	]
+}

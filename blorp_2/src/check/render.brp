@@ -5,7 +5,7 @@ import:
 	./errors as Errors
 	./model as Check
 	../utils/ids:
-		VariantId,
+		VariantId, inventory_traits, trait_number, trait_method_owner, trait_method_number,
 		constant_number,
 		inventory_constants,
 		inventory_functions,
@@ -24,12 +24,12 @@ import:
 	../namespace/namespace:
 		builtin_head,
 		Conflict,
-		Entity(Function, Constant, Constructor, Type, Alias),
-		NamespaceProblem(NameConflict, SelectionFailure),
+		Entity(Trait, Method, Function, Constant, Constructor, Type, Alias),
+		NamespaceProblem(InvalidImplementationTrait, NameConflict, SelectionFailure),
 		Origin(Declared, Imported, Implicit),
 		SelectionProblem(NotOffered, AlreadyFromPrelude, AlreadyImported, AmbiguousFunction, AmbiguousConstant, BareConstructor, NotAConstructor, ReceiverNotVisible),
 		TypeHead(UnionHead, RecordHead, OpaqueHead),
-		ValueBinding(FunctionName, ConstantName, ConstructorName, ModuleAliasName),
+		ValueBinding(MethodName, FunctionName, ConstantName, ConstructorName, ModuleAliasName),
 		Unoffered(UnknownName, PrivateName, ImportedThere, ProvidedThere),
 		same_head,
 	option: to_result, map
@@ -179,6 +179,7 @@ pure func render_check_error(program: ParsedProgram, error: Errors.CheckError) -
 			render_type_declaration_error(error.span, rejection)
 		Errors.TypeTermRejection(rejection):
 			render_type_term_error(error.span, rejection, context)
+		Errors.TraitRejection(rejection): render_trait_error(error.span, rejection, context)
 		Errors.SignatureRejection(rejection):
 			render_signature_error(error.span, rejection)
 		Errors.BuiltinRejection(rejection):
@@ -305,6 +306,7 @@ private pure func render_qualified_error(span: Span, rejection: Errors.Qualified
 -- Every namespace problem: a conflict in one table, a selection by its reason.
 private pure func render_namespace_problem(span: Span, problem: NamespaceProblem, context: ParsedContents) -> Diagnostic:
 	match problem:
+		InvalidImplementationTrait(_): rendered(span, "implementation requires a visible trait name", "import a parameterless trait and name it after implements")
 		NameConflict(conflict):
 			render_conflict(span, conflict, context)
 		SelectionFailure(path, selection, reason):
@@ -313,6 +315,8 @@ private pure func render_namespace_problem(span: Span, problem: NamespaceProblem
 
 private pure func entity_noun(entity: Entity) -> String:
 	match entity:
+		Trait(_): "trait"
+		Method(_): "trait method"
 		Function(_): "function"
 		Constant(_): "constant"
 		Constructor(_): "constructor"
@@ -322,6 +326,14 @@ private pure func entity_noun(entity: Entity) -> String:
 
 private pure func same_kind(left: Entity, right: Entity) -> Bool:
 	match left:
+		Trait(_):
+			match right:
+				Trait(_): True
+				_: False
+		Method(_):
+			match right:
+				Method(_): True
+				_: False
 		Function(_):
 			match right:
 				Function(_): True
@@ -356,7 +368,7 @@ private pure func render_conflict(span: Span, conflict: Conflict, context: Parse
 			previous = entity_noun(conflict.previous.entity)
 			alias_previous: Bool = match conflict.previous.entity:
 				Alias(_): True
-				Function(_) | Constant(_) | Constructor(_) | Type(_): False
+				Trait(_) | Method(_) | Function(_) | Constant(_) | Constructor(_) | Type(_): False
 			message = match conflict.previous.origin:
 				Implicit:
 					"${name} is provided by the prelude"
@@ -372,7 +384,7 @@ private pure func render_conflict(span: Span, conflict: Conflict, context: Parse
 						"${incoming} name conflicts with a ${previous}"
 			alias_incoming: Bool = match conflict.incoming.entity:
 				Alias(_): True
-				Function(_) | Constant(_) | Constructor(_) | Type(_): False
+				Trait(_) | Method(_) | Function(_) | Constant(_) | Constructor(_) | Type(_): False
 			help = match conflict.incoming.origin:
 				Declared(_):
 					match conflict.previous.origin:
@@ -406,6 +418,17 @@ private pure func render_conflict(span: Span, conflict: Conflict, context: Parse
 private pure func declaration_span(entity: Entity, context: ParsedContents) -> Option[Span]:
 	var found: Option[Span] = None
 	match entity:
+		Trait(id):
+			match inventory_traits(context.declarations).get(trait_number(id)):
+				Some(row): found = Some(row.type_name.span)
+				None: void
+		Method(id):
+			match inventory_traits(context.declarations).get(trait_number(trait_method_owner(id))):
+				Some(row):
+					match row.methods.get(trait_method_number(id)):
+						Some(method): found = Some(method.declaration.header.function_name.span)
+						None: void
+				None: void
 		Function(id):
 			match inventory_functions(context.declarations).get(function_number(id)):
 				Some(row): found = Some(row.declaration.function_name.span)
@@ -446,7 +469,7 @@ private pure func declaration_span(entity: Entity, context: ParsedContents) -> O
 private pure func methods_hint(entity: Entity, name: String, module: String) -> String:
 	match entity:
 		Type(_): ", or write ${module}: ${name} methods_only to use the functions ${module} declares on ${name}"
-		Function(_) | Constant(_) | Constructor(_) | Alias(_): ""
+		Trait(_) | Method(_) | Function(_) | Constant(_) | Constructor(_) | Alias(_): ""
 
 
 -- A selection that binds nothing, named by the target's written path.
@@ -477,7 +500,7 @@ private pure func render_selection(span: Span, path: ModulePath, selection: Impo
 									match type_spelling(Check.UnionType(variant_owner(id)), context, span):
 										Err(error): Err(error)
 										Ok(union_name): Ok("import the union from the module that declares it, selecting ${union_name}(${name})")
-								Function(_) | Constant(_) | Type(_) | Alias(_):
+								Trait(_) | Method(_) | Function(_) | Constant(_) | Type(_) | Alias(_):
 									Ok("import ${name} from the module that declares it${methods_hint(entity, name, module)}")
 							match help:
 								Err(error): error
@@ -552,6 +575,7 @@ private pure func render_type_declaration_error(
 
 private pure func render_type_term_error(span: Span, rejection: Errors.TypeTermError, context: ParsedContents) -> Diagnostic:
 	match rejection:
+		Errors.TraitUsedAsType(_): rendered(span, "a trait is not a value type", "use a concrete implementing type; generic bounds arrive in a later increment")
 		Errors.PrivateTypeInPublicDeclaration(private_type, declaration):
 			match parsed_spelling(private_type, context.names, span):
 				Err(error): error
@@ -1076,6 +1100,7 @@ private pure func render_binding_error(span: Span, rejection: Errors.BindingErro
 	match rejection:
 		Errors.ModuleBindingConflict(previous):
 			match previous:
+				MethodName(name): binding_conflict(span, name.id, "trait method", "module", name.span, context)
 				FunctionName(name): binding_conflict(span, name.id, "function", "module", name.span, context)
 				ConstantName(name): binding_conflict(span, name.id, "constant", "module", name.span, context)
 				ConstructorName(name): binding_conflict(span, name.id, "constructor", "module", name.span, context)
@@ -1324,12 +1349,13 @@ private pure func builtin_spelling(
 			)
 
 
-private pure func parameter_spelling(
+private pure func ordinary_parameter_spelling(
 	id: Check.TypeParameterId,
 	context: ParsedContents,
 	span: Span,
 ) -> Result[String, Diagnostic]:
-	found_parameters = match Check.parameter_owner(id):
+	found_parameters: Option[List[WrittenName]] = match Check.parameter_owner(id):
+		Check.TraitDeclaration(_): None
 		Check.FunctionDeclaration(owner):
 			inventory_functions(context.declarations)
 				.get(function_number(owner))
@@ -1671,3 +1697,30 @@ private pure func render_receiver_overlap(span: Span, name: NameId, overlap: Err
 		"rename one of them, or change a first parameter so that no value fits both receivers, ${introduced} and ${other}",
 		NoteLines(overlap_notes(span, overlap.introduced, introduced).concat(overlap_notes(span, overlap.other, other))),
 	))
+
+
+private pure func render_trait_error(span: Span, rejection: Errors.TraitError, context: ParsedContents) -> Diagnostic:
+	match rejection:
+		Errors.DuplicateRequirementParameter(_, previous): binding_conflict(span, previous.id, "parameter", "function", previous.span, context)
+		Errors.DifferentMethodFamilies(_, _, previous): noted(span, "different trait method families share this name", "select one family, or reach the other through a module alias", PreviousDeclaration(previous))
+		Errors.FamilyFunctionConflict(_, _, previous): noted(span, "trait method family conflicts with a free function", "rename the free function, or import one declaration through a module alias", PreviousDeclaration(previous))
+		Errors.ImpureRequirement(_): rendered(span, "trait requirements must be pure", "declare a pure func requirement and a pure implementation")
+		Errors.GenericRequirement(_): rendered(span, "trait methods cannot declare type parameters", "use Self and ordinary concrete parameter types")
+		Errors.FirstParameterMustBeSelf(_): rendered(span, "a trait method's first parameter must be Self", "write a first parameter such as value: Self")
+		Errors.CallableFormalDeferred(_): rendered(span, "trait callable parameters are not supported yet", "use ordinary value parameters; callable formal ownership requires a later increment")
+		Errors.ConcreteReceiverRequired: rendered(span, "this increment requires a concrete implementation receiver", "name a nongeneric primitive, record, union or opaque type; generic families arrive with bounds")
+		Errors.OrphanImplementation(_, _): rendered(span, "implementation belongs to neither the trait nor receiver module", "declare it beside the trait or receiver type; foundation types may be implemented by their library")
+		Errors.DuplicateImplementation(_, _, previous): noted(span, "this trait already has an implementation for the receiver", "keep one implementation for each trait and receiver head", PreviousDeclaration(previous))
+		Errors.MissingImplementationMethod(_): rendered(span, "implementation is missing a required method", "provide every trait requirement; defaults arrive with bounds")
+		Errors.UnknownImplementationMethod(_): rendered(span, "implementation method is not declared by the trait", "remove this method or add a matching requirement to the trait")
+		Errors.DuplicateImplementationMethod(_, previous): noted(span, "implementation repeats a method", "provide each required method once", PreviousDeclaration(previous))
+		Errors.ImplementationSignatureMismatch(_, _, _): rendered(span, "implementation signature does not match the trait requirement", "match the requirement's purity, parameter types and return type, replacing Self with the receiver")
+		Errors.MalformedCanonicalTrait(_): rendered(span, "canonical Equatable must declare only pure equals(Self, Self) -> Bool", "keep equals as its sole abstract requirement; defaults arrive with bounds")
+		Errors.MissingImplementation(_, _): rendered(span, "receiver does not implement this trait", "declare an implementation for this concrete receiver; generic bounds arrive in a later increment")
+		Errors.MethodValueDeferred(_): rendered(span, "trait methods cannot be used as values in this increment", "call the method directly or with receiver syntax; method values arrive with bounds")
+
+
+private pure func parameter_spelling(id: Check.TypeParameterId, context: ParsedContents, span: Span) -> Result[String, Diagnostic]:
+	match Check.parameter_owner(id):
+		Check.TraitDeclaration(_): Ok("Self")
+		_: ordinary_parameter_spelling(id, context, span)

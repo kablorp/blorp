@@ -1,0 +1,175 @@
+import:
+	../../../src/namespace/namespace: build_namespace, module_entries, declared_function, offered_function, Entity(Method, Trait, Function), NamespaceProblem(NameConflict), Origin(Declared)
+	../../../src/parse/assemble: parsed_contents
+	../../../src/utils/ids: inventory_traits, inventory_functions, same_trait_method, trait_number, function_number, FunctionRole(FreeFunctionBody, ImplementationBody)
+	../../../src/utils/names: same_name
+	../../../src/utils/source: root_module_id
+	../../../src/utils/syntax: Visibility(Public), DiagnosticNote(PreviousDeclaration), same_span
+	../module_input: ModuleInput, parse_modules
+	../../../src/check/check: check
+	../../../src/check/render: render_failure
+	int as IntOps
+	test: TestSuite
+
+
+private REQUIREMENT: String =
+	|trait Comparable:
+	|    pure func equals(left: Self, right: Self) -> Bool
+	|
+
+private INTEGER: String =
+	|implements Comparable for Int:
+	|    pure func equals(left: Int, right: Int) -> Bool:
+	|        True
+	|
+
+
+private pure func root_has_genuine_family(inputs: List[ModuleInput]) -> Bool:
+	match parse_modules(inputs):
+		Err(_): False
+		Ok(parsed):
+			match (inventory_traits(parsed_contents(parsed).declarations), build_namespace(parsed)):
+				([owner], Ok(namespace)):
+					match owner.methods:
+						[method]:
+							entries = module_entries(namespace, root_module_id()).filter(pure func(entry): same_name(entry.name.id, method.declaration.header.function_name.id))
+							match entries:
+								[entry]:
+									match entry.entity:
+										Method(id): same_trait_method(id, method.id) and declared_function(entry).is_none() and offered_function(entry).is_none()
+										_: False
+								_: False
+						_: False
+				_: False
+
+
+pure func test_implementation_offers_family_without_free_body() -> Bool:
+	root_has_genuine_family([{source = REQUIREMENT + INTEGER + "func main() -> Int:\n    0\n", targets = []}])
+
+
+pure func test_imported_integer_family_keeps_the_same_identity_across_self() -> Bool:
+	root: String =
+		|import:
+		|    ./integer: equals
+		|    ./custom as Custom
+		|func main() -> Int:
+		|    0
+		|
+	custom: String =
+		|import:
+		|    ./traits: Comparable
+		|fixed record Shape { value: Int }
+		|pure func shape() -> Shape:
+		|    { value = 7 }
+		|implements Comparable for Shape:
+		|    pure func equals(left: Shape, right: Shape) -> Bool:
+		|        True
+		|
+	root_has_genuine_family([
+		{source = root, targets = [1, 2]},
+		{source = "import:\n    ./traits: Comparable\n" + INTEGER, targets = [3]},
+		{source = custom, targets = [3]},
+		{source = REQUIREMENT, targets = []},
+	])
+
+
+pure func test_trait_declaration_makes_its_family_available_without_an_implementation() -> Bool:
+	root_has_genuine_family([{source = REQUIREMENT + "func main() -> Int:\n    0\n", targets = []}])
+
+
+pure func test_imported_trait_collision_points_to_later_own_declaration() -> Bool:
+	root: String =
+		|import:
+		|    ./other: Comparable
+		|trait Comparable:
+		|    pure func compare(left: Self) -> Int
+		|func main() -> Int:
+		|    0
+		|
+	match parse_modules([{source = root, targets = [1]}, {source = REQUIREMENT, targets = []}]):
+		Err(_): False
+		Ok(parsed):
+			match build_namespace(parsed):
+				Err(NameConflict(conflict)):
+					match (conflict.previous.entity, conflict.incoming.entity, conflict.incoming.origin):
+						(Trait(previous), Trait(current), Declared(Public)):
+							IntOps.equals(trait_number(previous), 1) and IntOps.equals(trait_number(current), 0) and
+							IntOps.equals(conflict.previous.name.span.start, 21) and IntOps.equals(conflict.previous.name.span.end, 31) and
+							IntOps.equals(conflict.incoming.name.span.start, 38) and IntOps.equals(conflict.incoming.name.span.end, 48)
+						_: False
+				_: False
+
+
+private OBSERVE: String =
+	|trait Observe:
+	|    pure func measure(value: Self) -> Int
+	|
+
+private OWN_IMPLEMENTATION: String =
+	|implements Observe for Shape:
+	|    pure func measure(value: Self) -> Int:
+	|        1
+	|
+
+private OWN_FUNCTION: String =
+	|pure func measure(value: Shape) -> Int:
+	|    2
+	|
+
+
+private pure func own_method_conflict_is_oriented(implementation_first: Bool) -> Bool:
+	prefix: String = "import:\n    ./traits: Observe\nfixed record Shape { value: Int }\n"
+	written = if implementation_first:
+		prefix + OWN_IMPLEMENTATION + OWN_FUNCTION + "func main() -> Int:\n    0\n"
+	else:
+		prefix + OWN_FUNCTION + OWN_IMPLEMENTATION + "func main() -> Int:\n    0\n"
+	match parse_modules([{source = written, targets = [1]}, {source = OBSERVE, targets = []}]):
+		Err(_): False
+		Ok(parsed):
+			match (inventory_traits(parsed_contents(parsed).declarations), inventory_functions(parsed_contents(parsed).declarations), build_namespace(parsed)):
+				([trait_row], [first, second, _], Err(NameConflict(conflict))):
+					match trait_row.methods:
+						[method]:
+							identities = if implementation_first:
+								match (first.role, second.role, conflict.incoming.entity, conflict.previous.entity):
+									(ImplementationBody, FreeFunctionBody, Function(free), Method(family)): function_number(free) == function_number(second.id) and same_trait_method(family, method.id)
+									_: False
+							else:
+								match (first.role, second.role, conflict.incoming.entity, conflict.previous.entity):
+									(FreeFunctionBody, ImplementationBody, Method(family), Function(free)): function_number(free) == function_number(first.id) and same_trait_method(family, method.id)
+									_: False
+							match check(parsed):
+								Err(failure):
+									diagnostic = render_failure(failure).first
+									message = if implementation_first:
+										"function name conflicts with a trait method"
+									else:
+										"trait method name conflicts with a function"
+									match diagnostic.note:
+										Some(PreviousDeclaration(previous)):
+											identities and same_span(conflict.incoming.name.span, second.declaration.function_name.span) and same_span(conflict.previous.name.span, first.declaration.function_name.span) and same_span(diagnostic.span, second.declaration.function_name.span) and same_span(previous, first.declaration.function_name.span) and diagnostic.message == message
+										_: False
+								Ok(_): False
+						_: False
+				_: False
+
+
+pure func test_earlier_implementation_method_reports_later_free_declaration() -> Bool:
+	own_method_conflict_is_oriented(True)
+
+
+pure func test_earlier_free_declaration_reports_later_implementation_method() -> Bool:
+	own_method_conflict_is_oriented(False)
+
+
+tests: TestSuite = {
+	description = "Blorp 2 trait method family namespace",
+	tests = [
+		("earlier implementation reports later free declaration", test_earlier_implementation_method_reports_later_free_declaration),
+		("earlier free declaration reports later implementation", test_earlier_free_declaration_reports_later_implementation_method),
+		("trait declaration exposes its own family without an implementation", test_trait_declaration_makes_its_family_available_without_an_implementation),
+		("import collision points to the later own trait declaration", test_imported_trait_collision_points_to_later_own_declaration),
+		("implementation offers genuine method family without a free body", test_implementation_offers_family_without_free_body),
+		("integer family import retains identity across Self", test_imported_integer_family_keeps_the_same_identity_across_self),
+	]
+}

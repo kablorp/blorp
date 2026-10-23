@@ -1,0 +1,333 @@
+import:
+	./test_traits: parse_trait_fixture
+	../../../src/check/check: CheckFailure, check, check_errors
+	../../../src/check/errors as Errors
+	../../../src/check/model as Model
+	../../../src/check/render: render_failure
+	../../../src/parse/assemble: parsed_contents
+	../../../src/utils/ids: inventory_traits, inventory_implementations, inventory_functions, same_trait_method, trait_number
+	../../../src/utils/names: same_name
+	../../../src/utils/source: module_source, root_module_id, same_source
+	../../../src/utils/syntax: Span, Purity(Pure, Impure), DiagnosticNote(PreviousDeclaration), same_span, same_purity, type_span
+	test: TestSuite
+
+
+private REQUIREMENT: String =
+	|trait Observable:
+	|    pure func observe(value: Self) -> Int
+	|
+
+private UNUSED_MAIN: String =
+	|import:
+	|    int: observe
+	|
+	|func main() -> Int:
+	|    0
+	|
+
+private IMPLEMENTATION: String =
+	|import:
+	|    _base: Int, Observable
+	|
+	|implements Observable for Int:
+	|    pure func observe(value: Self) -> Int:
+	|        7
+	|
+
+
+-- Each rejection must be a singleton with the same exact primary site in the
+-- typed error and rendering. Declaration sites come from genuine parsed rows.
+private pure func diagnostic_matches(failure: CheckFailure, site: Span, message: String, help: String, previous: Option[Span]) -> Bool:
+	errors = check_errors(failure)
+	diagnostics = render_failure(failure)
+	note_matches = match (previous, diagnostics.first.note):
+		(None, None): True
+		(Some(expected), Some(PreviousDeclaration(actual))): same_span(actual, expected)
+		_: False
+	(
+		errors.remaining.is_empty()
+		and diagnostics.remaining.is_empty()
+		and same_span(errors.first.span, site)
+		and same_span(diagnostics.first.span, site)
+		and diagnostics.first.message == message
+		and diagnostics.first.help == help
+		and note_matches
+	)
+
+
+pure func test_missing_method_names_the_unimplemented_requirement() -> Bool:
+	requirements: String =
+		|trait Observable:
+		|    pure func observe(value: Self) -> Int
+		|    pure func reset(value: Self) -> Int
+		|
+	match parse_trait_fixture(UNUSED_MAIN, IMPLEMENTATION, requirements):
+		Err(_): False
+		Ok(parsed):
+			declarations = parsed_contents(parsed).declarations
+			match (inventory_traits(declarations), inventory_implementations(declarations), check(parsed)):
+				([owner], [implementation], Err(failure)):
+					match (owner.methods, check_errors(failure).first.kind):
+						([_, missing], Errors.TraitRejection(Errors.MissingImplementationMethod(id))):
+							(
+								same_trait_method(id, missing.id)
+								and same_source(implementation.header.span.source, module_source(implementation.header.module))
+								and diagnostic_matches(failure, implementation.header.span, "implementation is missing a required method", "provide every trait requirement; defaults arrive with bounds", None)
+							)
+						_: False
+				_: False
+
+
+pure func test_extra_method_names_the_undeclared_member() -> Bool:
+	implementation: String =
+		|import:
+		|    _base: Int, Observable
+		|
+		|implements Observable for Int:
+		|    pure func observe(value: Self) -> Int:
+		|        7
+		|    pure func reset(value: Self) -> Int:
+		|        9
+		|
+	match parse_trait_fixture(UNUSED_MAIN, implementation, REQUIREMENT):
+		Err(_): False
+		Ok(parsed):
+			match (inventory_functions(parsed_contents(parsed).declarations), check(parsed)):
+				([_, _, extra], Err(failure)):
+					match check_errors(failure).first.kind:
+						Errors.TraitRejection(Errors.UnknownImplementationMethod(name)):
+							(
+								same_name(name, extra.declaration.function_name.id)
+								and same_source(extra.declaration.function_name.span.source, module_source(extra.declaration.module))
+								and diagnostic_matches(failure, extra.declaration.function_name.span, "implementation method is not declared by the trait", "remove this method or add a matching requirement to the trait", None)
+							)
+						_: False
+				_: False
+
+
+pure func test_duplicate_member_notes_the_first_method() -> Bool:
+	implementation: String =
+		|import:
+		|    _base: Int, Observable
+		|
+		|implements Observable for Int:
+		|    pure func observe(value: Self) -> Int:
+		|        7
+		|    pure func observe(value: Self) -> Int:
+		|        9
+		|
+	match parse_trait_fixture(UNUSED_MAIN, implementation, REQUIREMENT):
+		Err(_): False
+		Ok(parsed):
+			match (inventory_functions(parsed_contents(parsed).declarations), check(parsed)):
+				([_, first, repeated], Err(failure)):
+					match check_errors(failure).first.kind:
+						Errors.TraitRejection(Errors.DuplicateImplementationMethod(name, previous)):
+							(
+								same_name(name, repeated.declaration.function_name.id)
+								and same_span(previous, first.declaration.function_name.span)
+								and diagnostic_matches(failure, repeated.declaration.function_name.span, "implementation repeats a method", "provide each required method once", Some(first.declaration.function_name.span))
+							)
+						_: False
+				_: False
+
+
+-- The expected signature keeps the requirement's annotation sites while Self
+-- becomes Int. The actual signature keeps this implementation's own sites.
+private pure func signature_rejected(implementation: String, parameter_type: Model.TypeRef, return_type: Model.TypeRef, purity: Purity) -> Bool:
+	match parse_trait_fixture(UNUSED_MAIN, implementation, REQUIREMENT):
+		Err(_): False
+		Ok(parsed):
+			declarations = parsed_contents(parsed).declarations
+			match (inventory_traits(declarations), inventory_functions(declarations), check(parsed)):
+				([owner], [_, body], Err(failure)):
+					match (owner.methods, check_errors(failure).first.kind):
+						([method], Errors.TraitRejection(Errors.ImplementationSignatureMismatch(id, expected, actual))):
+							match (expected.parameters, actual.parameters, method.declaration.header.parameters, body.declaration.parameters):
+								([expected_parameter], [actual_parameter], [written_requirement], [written_body]):
+									match (method.declaration.header.return_type, body.declaration.return_type):
+										(Some(requirement_return), Some(body_return)):
+											(
+												same_trait_method(id, method.id)
+												and expected.type_parameters.is_empty()
+												and actual.type_parameters.is_empty()
+												and same_purity(expected.purity, Pure)
+												and same_purity(actual.purity, purity)
+												and Model.same_type(expected_parameter.value_type, Model.IntType)
+												and Model.same_type(expected.return_type.value_type, Model.IntType)
+												and Model.same_type(actual_parameter.value_type, parameter_type)
+												and Model.same_type(actual.return_type.value_type, return_type)
+												and same_span(expected_parameter.span, type_span(written_requirement.type_name))
+												and same_span(expected.return_type.span, type_span(requirement_return))
+												and same_span(actual_parameter.span, type_span(written_body.type_name))
+												and same_span(actual.return_type.span, type_span(body_return))
+												and diagnostic_matches(failure, body.declaration.function_name.span, "implementation signature does not match the trait requirement", "match the requirement's purity, parameter types and return type, replacing Self with the receiver", None)
+											)
+										_: False
+								_: False
+						_: False
+				_: False
+
+
+pure func test_wrong_parameter_type_preserves_both_signature_sites() -> Bool:
+	implementation: String =
+		|import:
+		|    _base: Int, String, Observable
+		|
+		|implements Observable for Int:
+		|    pure func observe(value: String) -> Int:
+		|        7
+		|
+	signature_rejected(implementation, Model.StringType, Model.IntType, Pure)
+
+
+pure func test_wrong_return_type_preserves_both_signature_sites() -> Bool:
+	implementation: String =
+		|import:
+		|    _base: Int, String, Observable
+		|
+		|implements Observable for Int:
+		|    pure func observe(value: Self) -> String:
+		|        "wrong"
+		|
+	signature_rejected(implementation, Model.IntType, Model.StringType, Pure)
+
+
+pure func test_wrong_purity_preserves_both_signature_sites() -> Bool:
+	implementation: String =
+		|import:
+		|    _base: Int, Observable
+		|
+		|implements Observable for Int:
+		|    func observe(value: Self) -> Int:
+		|        7
+		|
+	signature_rejected(implementation, Model.IntType, Model.IntType, Impure)
+
+
+pure func test_duplicate_implementation_notes_the_first_header() -> Bool:
+	implementation: String =
+		|import:
+		|    _base: Int, Observable
+		|
+		|implements Observable for Int:
+		|    pure func observe(value: Self) -> Int:
+		|        7
+		|implements Observable for Int:
+		|    pure func observe(value: Self) -> Int:
+		|        9
+		|
+	match parse_trait_fixture(UNUSED_MAIN, implementation, REQUIREMENT):
+		Err(_): False
+		Ok(parsed):
+			declarations = parsed_contents(parsed).declarations
+			match (inventory_traits(declarations), inventory_implementations(declarations), check(parsed)):
+				([owner], [first, repeated], Err(failure)):
+					match check_errors(failure).first.kind:
+						Errors.TraitRejection(Errors.DuplicateImplementation(id, receiver, previous)):
+							(
+								trait_number(id) == trait_number(owner.id)
+								and Model.same_type(receiver, Model.IntType)
+								and same_span(previous, first.header.span)
+								and diagnostic_matches(failure, repeated.header.span, "this trait already has an implementation for the receiver", "keep one implementation for each trait and receiver head", Some(first.header.span))
+							)
+						_: False
+				_: False
+
+
+pure func test_designated_equatable_rejects_a_non_boolean_result() -> Bool:
+	main_source: String =
+		|import:
+		|    int as Integer
+		|func main() -> Int:
+		|    0
+		|
+	implementation: String =
+		|import:
+		|    _base: Int
+		|
+	requirements: String =
+		|trait Equatable:
+		|    pure func equals(left: Self, right: Self) -> Int
+		|
+	match parse_trait_fixture(main_source, implementation, requirements):
+		Err(_): False
+		Ok(parsed):
+			match (inventory_traits(parsed_contents(parsed).declarations), check(parsed)):
+				([owner], Err(failure)):
+					match check_errors(failure).first.kind:
+						Errors.TraitRejection(Errors.MalformedCanonicalTrait(id)):
+							(
+								trait_number(id) == trait_number(owner.id)
+								and same_source(owner.type_name.span.source, module_source(parsed_contents(parsed).foundation.types))
+								and diagnostic_matches(failure, owner.type_name.span, "canonical Equatable must declare only pure equals(Self, Self) -> Bool", "keep equals as its sole abstract requirement; defaults arrive with bounds", None)
+							)
+						_: False
+				_: False
+
+
+pure func test_method_call_without_receiver_implementation_points_to_the_call() -> Bool:
+	main_source: String =
+		|import:
+		|    int: observe
+		|func main() -> Int:
+		|    observe("text")
+		|
+	prefix: String = "import:\n    int: observe\nfunc main() -> Int:\n    "
+	match parse_trait_fixture(main_source, IMPLEMENTATION, REQUIREMENT):
+		Err(_): False
+		Ok(parsed):
+			match (inventory_traits(parsed_contents(parsed).declarations), check(parsed)):
+				([owner], Err(failure)):
+					match (owner.methods, check_errors(failure).first.kind):
+						([method], Errors.TraitRejection(Errors.MissingImplementation(id, receiver))):
+							site: Span = { source = module_source(root_module_id()), start = prefix.length(), end = prefix.length() + 7 }
+							(
+								same_trait_method(id, method.id)
+								and Model.same_type(receiver, Model.StringType)
+								and diagnostic_matches(failure, site, "receiver does not implement this trait", "declare an implementation for this concrete receiver; generic bounds arrive in a later increment", None)
+							)
+						_: False
+				_: False
+
+
+pure func test_method_value_is_explicitly_deferred() -> Bool:
+	main_source: String =
+		|import:
+		|    int: observe
+		|func main() -> Int:
+		|    callback: pure (Int) -> Int = observe
+		|    0
+		|
+	prefix: String = "import:\n    int: observe\nfunc main() -> Int:\n    callback: pure (Int) -> Int = "
+	match parse_trait_fixture(main_source, IMPLEMENTATION, REQUIREMENT):
+		Err(_): False
+		Ok(parsed):
+			match (inventory_traits(parsed_contents(parsed).declarations), check(parsed)):
+				([owner], Err(failure)):
+					match (owner.methods, check_errors(failure).first.kind):
+						([method], Errors.TraitRejection(Errors.MethodValueDeferred(id))):
+							site: Span = { source = module_source(root_module_id()), start = prefix.length(), end = prefix.length() + 7 }
+							(
+								same_trait_method(id, method.id)
+								and diagnostic_matches(failure, site, "trait methods cannot be used as values in this increment", "call the method directly or with receiver syntax; method values arrive with bounds", None)
+							)
+						_: False
+				_: False
+
+
+tests: TestSuite = {
+	description = "Blorp 2 implementation contract rejections",
+	tests = [
+		("missing method identifies the required member", test_missing_method_names_the_unimplemented_requirement),
+		("extra method identifies its undeclared name", test_extra_method_names_the_undeclared_member),
+		("duplicate member notes the first declaration", test_duplicate_member_notes_the_first_method),
+		("wrong parameter type retains signature sites", test_wrong_parameter_type_preserves_both_signature_sites),
+		("wrong return type retains signature sites", test_wrong_return_type_preserves_both_signature_sites),
+		("wrong purity retains signature sites", test_wrong_purity_preserves_both_signature_sites),
+		("duplicate implementation notes the first header", test_duplicate_implementation_notes_the_first_header),
+		("designated Equatable requires a Boolean result", test_designated_equatable_rejects_a_non_boolean_result),
+		("method call requires a receiver implementation", test_method_call_without_receiver_implementation_points_to_the_call),
+		("method value is explicitly deferred", test_method_value_is_explicitly_deferred),
+	]
+}

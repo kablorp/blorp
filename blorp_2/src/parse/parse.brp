@@ -30,7 +30,7 @@ import:
 			PureKeyword, FunctionKeyword, MatchKeyword, VarKeyword, VoidKeyword,
 			AndKeyword, OrKeyword, NotKeyword, IfKeyword, ElseKeyword,
 			WhileKeyword, ForKeyword, InKeyword, BreakKeyword, ContinueKeyword,
-			ImportKeyword, TypeKeyword, PrivateKeyword, RecordKeyword, UnionKeyword,
+			ImportKeyword, TypeKeyword, PrivateKeyword, RecordKeyword, UnionKeyword, TraitKeyword, ImplementsKeyword,
 			BuiltinKeyword, AsKeyword, OpaqueKeyword, IntoOpaqueKeyword, FromOpaqueKeyword,
 		),
 		LexedProgram,
@@ -39,7 +39,8 @@ import:
 		ParsedBody(ParsedBuiltinBody, ParsedValueBody, ParsedMatchBody),
 		ParsedBuiltinType(IntegerBuiltin, FloatBuiltin, StringBuiltin, VoidBuiltin, ListBuiltin),
 		ParsedConstant,
-		ParsedFunction,
+		ParsedFunction, ParsedTrait, ParsedTraitMethod, ParsedImplementationHeader,
+		ParsedFunctionGroup(FreeFunction, ImplementationGroup),
 		ParsedMatchArm,
 		ParsedOpaque,
 		ParsedParameter,
@@ -167,7 +168,8 @@ fixed record ParsedModuleContents {
 	module: ModuleId,
 	imports: List[ParsedImport],
 	builtin_types: List[ParsedBuiltinType],
-	functions: List[ParsedFunction],
+	functions: List[ParsedFunctionGroup],
+	traits: List[ParsedTrait],
 	unions: List[ParsedUnion],
 	records: List[ParsedRecord],
 	opaques: List[ParsedOpaque],
@@ -373,6 +375,18 @@ private pure func at_import(state: ParserState) -> Bool:
 			True
 		_:
 			False
+
+
+private pure func at_trait(state: ParserState) -> Bool:
+	match current_keyword(state):
+		Some(TraitKeyword): True
+		_: False
+
+
+private pure func at_implements(state: ParserState) -> Bool:
+	match current_keyword(state):
+		Some(ImplementsKeyword): True
+		_: False
 
 
 private pure func at_type_keyword(state: ParserState) -> Bool:
@@ -3331,7 +3345,7 @@ private fixed record ParsedReturnAnnotation {
 
 
 private pure func consume_return_annotation(start: ParserState) -> Result[ParsedReturnAnnotation, Diagnostic]:
-	if at_colon(start):
+	if or(at_colon(start), at_newline(start)):
 		Ok({ written = None, next = start })
 	else:
 		match current_symbol(start):
@@ -3349,8 +3363,8 @@ private fixed record HeaderResult {
 }
 
 
--- Ends at the function body's Indent.
-private pure func consume_header(start: ParserState) -> Result[HeaderResult, Diagnostic]:
+-- The shared signature ends before its body colon or requirement newline.
+private pure func consume_signature(start: ParserState) -> Result[HeaderResult, Diagnostic]:
 	purity: Purity = if at_pure(start):
 		Pure
 	else:
@@ -3366,9 +3380,6 @@ private pure func consume_header(start: ParserState) -> Result[HeaderResult, Dia
 	after_open ?= expect(type_parameters.next, at_left_paren(type_parameters.next), "expected '(' after the function name", "write main() or helper(value: Int)")
 	parameters ?= consume_parameters(after_open)
 	return_type ?= consume_return_annotation(parameters.next)
-	after_header ?= expect(return_type.next, at_colon(return_type.next), "expected ':' after the function header", "end the header with ':' and put the return expression on the next line")
-	after_newline ?= expect(after_header, at_newline(after_header), "expected a newline after the function header", "put the return expression on the next line")
-	after_indent ?= expect(after_newline, at_indent(after_newline), INDENTED_BLOCK_MESSAGE, INDENTED_BLOCK_HELP)
 	Ok({
 		header = {
 			purity = purity,
@@ -3377,8 +3388,17 @@ private pure func consume_header(start: ParserState) -> Result[HeaderResult, Dia
 			parameters = parameters.parameters,
 			return_type = return_type.written
 		},
-		next = after_indent,
+		next = return_type.next,
 	})
+
+
+-- Ordinary functions still require their colon and actual indented body.
+private pure func consume_header(start: ParserState) -> Result[HeaderResult, Diagnostic]:
+	signature ?= consume_signature(start)
+	after_header ?= expect(signature.next, at_colon(signature.next), "expected ':' after the function header", "end the header with ':' and put the return expression on the next line")
+	after_newline ?= expect(after_header, at_newline(after_header), "expected a newline after the function header", "put the return expression on the next line")
+	after_indent ?= expect(after_newline, at_indent(after_newline), INDENTED_BLOCK_MESSAGE, INDENTED_BLOCK_HELP)
+	Ok({ signature | next = after_indent })
 
 
 private fixed record ParsedAnnotation {
@@ -3447,6 +3467,98 @@ private pure func consume_function(start: ParserState, module: ModuleId, visibil
 			body = body.body
 		},
 		next = body.next,
+	})
+
+
+private fixed record ParsedTraitMethods {
+	methods: List[ParsedTraitMethod],
+	next: ParserState
+}
+
+
+private pure func consume_trait_methods(state: ParserState, methods: List[ParsedTraitMethod]) -> Result[ParsedTraitMethods, Diagnostic]:
+	signature ?= consume_signature(state)
+	signature_only: Void ?= if at_colon(signature.next):
+		Err(expected_syntax(signature.next, "trait method defaults are not supported yet", "declare the signature only"))
+	else:
+		Ok(void)
+	next ?= consume_line_end(signature.next, "expected a newline after the trait method signature", "put each method signature on its own indented line")
+	span = { parser_span(state) | end = parser_span(signature.next).start }
+	method: ParsedTraitMethod = { header = signature.header, span = span }
+	gathered = methods.append(method)
+	if at_dedent(next):
+		Ok({ methods = gathered, next = shifted(next, 1) })
+	else:
+		consume_trait_methods(next, gathered)
+
+
+private fixed record TraitResult {
+	declaration: ParsedTrait,
+	next: ParserState
+}
+
+
+private pure func consume_trait(start: ParserState, module: ModuleId, visibility: Visibility) -> Result[TraitResult, Diagnostic]:
+	name ?= consume_name(shifted(start, 1), "expected a trait name")
+	parameterless: Void ?= if at_left_bracket(name.next):
+		Err(expected_syntax(name.next, "traits do not take type parameters", "use Self for the implementing type"))
+	else:
+		Ok(void)
+	colon ?= expect(name.next, at_colon(name.next), "expected ':' after the trait name", "write trait Equatable: followed by indented method signatures")
+	newline ?= expect(colon, at_newline(colon), "expected a newline after the trait header", "put each method signature on its own indented line")
+	opened ?= expect(newline, at_indent(newline), "expected an indented trait method", "declare at least one pure method signature")
+	methods ?= consume_trait_methods(opened, [])
+	Ok({
+		declaration = {
+			module = module, visibility = visibility, type_name = name.name,
+			methods = methods.methods, span = { parser_span(start) | end = parser_span(colon).start }
+		},
+		next = methods.next
+	})
+
+
+private fixed record ImplementationMethods {
+	methods: List[ParsedFunction],
+	next: ParserState
+}
+
+
+private pure func consume_implementation_methods(state: ParserState, module: ModuleId, visibility: Visibility, methods: List[ParsedFunction]) -> Result[ImplementationMethods, Diagnostic]:
+	method ?= consume_function(state, module, visibility)
+	gathered = methods.append(method.function)
+	if at_dedent(method.next):
+		Ok({ methods = gathered, next = shifted(method.next, 1) })
+	else:
+		consume_implementation_methods(method.next, module, visibility, gathered)
+
+
+private fixed record ImplementationResult {
+	header: ParsedImplementationHeader,
+	methods: List[ParsedFunction],
+	next: ParserState
+}
+
+
+private pure func consume_implementation(start: ParserState, module: ModuleId, visibility: Visibility) -> Result[ImplementationResult, Diagnostic]:
+	after_keyword = shifted(start, 1)
+	trait_start: ParserState ?= if at_left_bracket(after_keyword):
+		Err(expected_syntax(after_keyword, "generic implementations are not supported yet", "implement a concrete receiver type"))
+	else:
+		Ok(after_keyword)
+	requirement ?= consume_type(trait_start, "expected the implemented trait name")
+	after_for ?= expect(requirement.next, at_for(requirement.next), "expected 'for' after the trait name", "write implements Equatable for Int:")
+	receiver ?= consume_type(after_for, "expected the implementation receiver type")
+	colon ?= expect(receiver.next, at_colon(receiver.next), "expected ':' after the implementation receiver", "put each method body on its own indented line")
+	newline ?= expect(colon, at_newline(colon), "expected a newline after the implementation header", "put each method body on its own indented line")
+	opened ?= expect(newline, at_indent(newline), "expected an indented implementation method", "define the trait's methods with ordinary function bodies")
+	methods ?= consume_implementation_methods(opened, module, visibility, [])
+	Ok({
+		header = {
+			module = module, visibility = visibility, trait_name = requirement.written,
+			receiver = receiver.written, span = { parser_span(start) | end = parser_span(colon).start }
+		},
+		methods = methods.methods,
+		next = methods.next
 	})
 
 
@@ -3978,7 +4090,8 @@ private pure func consume_import_block(start: ParserState) -> Result[ImportBlock
 private fixed union Declaration:
 	ImportBlock(List[ParsedImport])
 	BuiltinTypeDeclaration(ParsedBuiltinType)
-	FunctionDeclaration(ParsedFunction)
+	FunctionDeclaration(ParsedFunctionGroup)
+	TraitDeclaration(ParsedTrait)
 	UnionDeclaration(ParsedUnion)
 	RecordDeclaration(ParsedRecord)
 	OpaqueDeclaration(ParsedOpaque)
@@ -4061,7 +4174,15 @@ private pure func consume_declaration(state: ParserState, module: ModuleId, decl
 
 -- The declarations that may carry `private`.
 private pure func consume_visible_declaration(state: ParserState, module: ModuleId, visibility: Visibility) -> Result[DeclarationResult, Diagnostic]:
-	if and(at_word(state, recognized_words(state).fixed_word), at_record(shifted(state, 1))):
+	if at_trait(state):
+		match consume_trait(state, module, visibility):
+			Ok(parsed): Ok({ declaration = TraitDeclaration(parsed.declaration), next = parsed.next })
+			Err(error): Err(error)
+	else if at_implements(state):
+		match consume_implementation(state, module, visibility):
+			Ok(parsed): Ok({ declaration = FunctionDeclaration(ImplementationGroup(parsed.header, parsed.methods)), next = parsed.next })
+			Err(error): Err(error)
+	else if and(at_word(state, recognized_words(state).fixed_word), at_record(shifted(state, 1))):
 		match consume_record(state, module, visibility):
 			Ok(parsed):
 				match end_value_line(parsed.next):
@@ -4082,7 +4203,7 @@ private pure func consume_visible_declaration(state: ParserState, module: Module
 			Err(error): Err(error)
 	else:
 		match consume_function(state, module, visibility):
-			Ok(parsed): Ok({ declaration = FunctionDeclaration(parsed.function), next = parsed.next })
+			Ok(parsed): Ok({ declaration = FunctionDeclaration(FreeFunction(parsed.function)), next = parsed.next })
 			Err(error): Err(error)
 
 
@@ -4098,7 +4219,8 @@ pure func parse_module(input: LexedProgram, module: ModuleId) -> Result[ParsedMo
 		Err(source_bundle_error("parsed module's source does not match its module identity"))
 	var imports: List[ParsedImport] = []
 	var builtin_types: List[ParsedBuiltinType] = []
-	var functions: List[ParsedFunction] = []
+	var functions: List[ParsedFunctionGroup] = []
+	var traits: List[ParsedTrait] = []
 	var unions: List[ParsedUnion] = []
 	var records: List[ParsedRecord] = []
 	var opaques: List[ParsedOpaque] = []
@@ -4112,7 +4234,7 @@ pure func parse_module(input: LexedProgram, module: ModuleId) -> Result[ParsedMo
 				if at_end(state):
 					break
 
-				declared = (and(
+				declared = or((and(
 					and(
 						and(
 							and(
@@ -4127,7 +4249,7 @@ pure func parse_module(input: LexedProgram, module: ModuleId) -> Result[ParsedMo
 						opaques.is_empty(),
 					),
 					constants.is_empty(),
-				)).not()
+				)).not(), traits.is_empty().not())
 				scan = match consume_declaration(state, module, declared):
 					Ok(parsed):
 						match parsed.declaration:
@@ -4138,6 +4260,8 @@ pure func parse_module(input: LexedProgram, module: ModuleId) -> Result[ParsedMo
 								builtin_types = builtin_types.append(declaration)
 							FunctionDeclaration(function):
 								functions = functions.append(function)
+							TraitDeclaration(declaration):
+								traits = traits.append(declaration)
 							UnionDeclaration(declaration):
 								unions = unions.append(declaration)
 							RecordDeclaration(declaration):
@@ -4161,6 +4285,7 @@ pure func parse_module(input: LexedProgram, module: ModuleId) -> Result[ParsedMo
 				imports = imports,
 				builtin_types = builtin_types,
 				functions = functions,
+				traits = traits,
 				unions = unions,
 				records = records,
 				opaques = opaques,

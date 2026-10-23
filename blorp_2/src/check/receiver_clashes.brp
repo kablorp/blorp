@@ -6,12 +6,12 @@ checked once; only the exact inherited prelude subset reuses a proof.
 import:
 	option: get_or, is_some
 	../utils/boolean: not, and
-	./callables: ReceiverCandidate, method_site, receiver_bindings
+	./callables: ReceiverCandidate, method_site, receiver_bindings, visible_method
 	./errors: CheckError, CheckerInvariant(InvalidResolvedFunction), MethodError(OverlappingReceivers), checker_invariant, method_error
 	./inference: types_overlap
-	./model: type_head
+	./model: AcceptedTraits, type_head
 	./signatures: AcceptedFunction
-	../namespace/namespace: Namespace, MethodImport, declared_function, method_imports, module_entries, offered_function, same_head
+	../namespace/namespace: Namespace, MethodImport, declared_function, method_imports, module_entries, offered_function, same_head, Entity(Method)
 	../parse/assemble: ModuleImport, ParsedModuleRow
 	../parse/parse: ImportSelection(NamedSelection)
 	../utils/ids: FunctionId, function_number
@@ -172,13 +172,19 @@ private pure func reject_group(name: WrittenName, candidates: List[ReceiverCandi
 		None: Ok(void)
 
 
-pure func reject_receiver_clashes(namespace: Namespace, signatures: List[AcceptedFunction], modules: List[ParsedModuleRow]) -> Result[Void, CheckError]:
+pure func reject_receiver_clashes(namespace: Namespace, signatures: List[AcceptedFunction], modules: List[ParsedModuleRow], traits: AcceptedTraits) -> Result[Void, CheckError]:
 	counts = name_counts(signatures)
 	unprovided: IntMaps.IntMap[List[FunctionId]] = IntMaps.empty_int_map()
 	var supplied = unprovided
 	var supplied_methods = 0
 	var failure: Option[CheckError] = None
 	for row in modules:
+		if traits.declarations.is_empty().not():
+			match reject_module_families(namespace, traits, signatures, row):
+				Err(error): failure = Some(error)
+				Ok(_): void
+			if failure.is_some():
+				break
 		first_method = match row.role:
 			UserModule: supplied_methods
 			_: 0
@@ -222,4 +228,29 @@ pure func reject_receiver_clashes(namespace: Namespace, signatures: List[Accepte
 			break
 	match failure:
 		Some(clash): Err(clash)
+		None: Ok(void)
+
+
+-- Family clashes do not depend on a future receiver type or an actual call.
+-- Query the same visibility rule used by call admission, including type imports.
+private pure func reject_module_families(namespace: Namespace, traits: AcceptedTraits, signatures: List[AcceptedFunction], row: ParsedModuleRow) -> Result[Void, CheckError]:
+	var names: List[WrittenName] = []
+	for entry in module_entries(namespace, row.module):
+		match entry.entity:
+			Method(_): names = names.append(entry.name)
+			_: void
+	for imported in method_imports(namespace, row.module):
+		for entry in module_entries(namespace, imported.target):
+			match entry.entity:
+				Method(_): names = names.append(entry.name)
+				_: void
+	var failure: Option[CheckError] = None
+	for name in names:
+		match visible_method(namespace, traits, signatures, row.module, name):
+			Err(error):
+				failure = Some(error)
+				break
+			Ok(_): void
+	match failure:
+		Some(error): Err(error)
 		None: Ok(void)

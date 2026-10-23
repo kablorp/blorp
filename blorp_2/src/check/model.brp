@@ -9,6 +9,7 @@ import:
 		RuntimeOperation,
 		DesignatedBoolean, DesignatedOption,
 	../utils/ids:
+		TraitId, TraitMethodId, trait_number, same_trait_method,
 		ConstantId, constant_number,
 		FunctionId,
 		OpaqueId,
@@ -22,6 +23,7 @@ import:
 		variant_number,
 		variant_owner,
 	int as IntOps
+	../utils/source: ModuleId
 	../namespace/namespace:
 		TypeHead(ListHead, PrimitiveHead, RecordHead, UnionHead, OpaqueHead),
 	../utils/syntax: Entrypoint, FunctionExecution, Purity(Pure, Impure), Span, WrittenName, same_purity
@@ -52,6 +54,7 @@ fixed record CheckedRecord {
 
 
 fixed union TypeParameterOwner:
+	TraitDeclaration(TraitId)
 	FunctionDeclaration(FunctionId)
 	UnionDeclaration(UnionId)
 	RecordDeclaration(RecordId)
@@ -118,6 +121,78 @@ fixed record FunctionSignature {
 }
 
 
+fixed record AcceptedTraitMethod {
+	id: TraitMethodId,
+	signature: FunctionSignature
+}
+
+
+fixed record AcceptedTrait {
+	id: TraitId,
+	methods: List[AcceptedTraitMethod]
+}
+
+
+-- Header types are resolved once before authored signatures; contract validation
+-- consumes these transient rows when it publishes the accepted authority.
+fixed record ImplementationHeader {
+	receiver: TypeRef
+}
+
+
+fixed record ImplementedMethod {
+	method: TraitMethodId,
+	function: FunctionId
+}
+
+
+fixed record AcceptedImplementation {
+	span: Span,
+	trait_id: TraitId,
+	receiver: TypeRef,
+	methods: List[ImplementedMethod],
+	module: ModuleId
+}
+
+
+fixed record AcceptedTraits {
+	declarations: List[AcceptedTrait],
+	implementations: List[AcceptedImplementation],
+	canonical: Option[TraitId]
+}
+
+
+private fixed record MethodCallContents {
+	method: TraitMethodId,
+	receiver: TypeRef
+}
+opaque type AcceptedMethodCall = MethodCallContents
+
+
+pure func accepted_method(method: TraitMethodId, receiver: TypeRef) -> AcceptedMethodCall:
+	into_opaque AcceptedMethodCall({ method = method, receiver = receiver })
+
+
+pure func method_identity(call: AcceptedMethodCall) -> TraitMethodId:
+	from_opaque AcceptedMethodCall(call).method
+
+
+pure func method_receiver(call: AcceptedMethodCall) -> TypeRef:
+	from_opaque AcceptedMethodCall(call).receiver
+
+
+-- Consumers follow the one accepted member mapping, including recursion and
+-- specialization; no downstream phase rediscovers an implementation.
+pure func method_body(traits: AcceptedTraits, call: AcceptedMethodCall) -> Option[FunctionId]:
+	var found: Option[FunctionId] = None
+	for implementation in traits.implementations:
+		if same_type(implementation.receiver, method_receiver(call)):
+			for member in implementation.methods:
+				if same_trait_method(member.method, method_identity(call)):
+					found = Some(member.function)
+	found
+
+
 private fixed record CallableParameterIdentity {
 	owner: FunctionId,
 	position: Int
@@ -157,6 +232,7 @@ fixed union CheckedCallOperand:
 
 
 fixed union CallIdentity:
+	MethodTarget(TraitMethodId)
 	DeclaredTarget(FunctionId)
 	ParameterTarget(CallableParameterId)
 	ValueTarget(ScopedBindingId)
@@ -164,6 +240,7 @@ fixed union CallIdentity:
 
 
 fixed union CallTarget:
+	TraitMethod(AcceptedMethodCall)
 	UserFunction(FunctionId, List[TypeRef])
 	CallableParameter(CallableParameterId)
 	ValueCall(CheckedExpr)
@@ -553,6 +630,7 @@ pure func constant_row(constants: List[CheckedConstant], id: ConstantId) -> Opti
 
 
 fixed record CheckedFunctions {
+	traits: AcceptedTraits,
 	records: List[CheckedRecord],
 	unions: List[CheckedUnion],
 	opaques: List[CheckedOpaque],
@@ -704,6 +782,10 @@ pure func parameter_position(id: TypeParameterId) -> Int:
 
 pure func same_owner(left: TypeParameterOwner, right: TypeParameterOwner) -> Bool:
 	match left:
+		TraitDeclaration(left_trait):
+			match right:
+				TraitDeclaration(right_trait): IntOps.equals(trait_number(left_trait), trait_number(right_trait))
+				_: False
 		FunctionDeclaration(left_function):
 			match right:
 				FunctionDeclaration(right_function):
@@ -813,7 +895,7 @@ private pure func append_value_calls(
 		InvokeFunction(call):
 			match call.target:
 				ValueCall(callee): calls = append_value_calls(calls, callee)
-				UserFunction(_, _) | CallableParameter(_) | RuntimeFunction(_): void
+				TraitMethod(_) | UserFunction(_, _) | CallableParameter(_) | RuntimeFunction(_): void
 			for operand in call.operands:
 				match operand:
 					ValueOperand(argument): calls = append_value_calls(calls, argument)
@@ -930,7 +1012,7 @@ private pure func callable_creations(values: List[CheckedExpr]) -> List[CheckedE
 			InvokeFunction(call):
 				match call.target:
 					ValueCall(callee): children = [callee]
-					UserFunction(_, _) | CallableParameter(_) | RuntimeFunction(_): void
+					TraitMethod(_) | UserFunction(_, _) | CallableParameter(_) | RuntimeFunction(_): void
 				for operand in call.operands:
 					match operand:
 						ValueOperand(argument): children = children.append(argument)

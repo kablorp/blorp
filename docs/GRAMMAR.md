@@ -17,6 +17,10 @@ receive it. Import cycles, including self-imports, are rejected, and modules
 under the library root cannot import user modules. Concrete
 functions may use a sole closed builtin body, including `builtin("int.add")`,
 with an exact runtime signature.
+The pilot also accepts signature-only `trait` declarations and concrete
+`implements Trait for Type` blocks. Its [concrete trait rules](../blorp_2/README.md#concrete-traits)
+require pure methods whose first formal is `Self`; generic bounds, defaults,
+generic implementations, method references and derives remain deferred.
 The ordinary [pilot `append_int` API](../blorp_2/README.md#counted-string-operations)
 uses the existing function-call and UFCS grammar.
 The [pilot prefix helper](../blorp_2/README.md#counted-string-operations) also

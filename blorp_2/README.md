@@ -35,10 +35,10 @@ the earlier memory, aggregate, generics and recursion plans.
 The compiler-source subset is governed by [AGENTS.md](AGENTS.md); source
 convenience does not remove currently supported input features.
 
-The [Equatable-first trait plan](TRAITS_PLAN.md) describes the proposed static
-trait implementation, focused inference preparation, automatic record/union
-equality, phase boundaries, examples and acceptance gates. Traits remain
-unsupported until those increments land.
+Concrete, authored traits are supported as described in [concrete traits](#concrete-traits).
+The [Equatable-first trait plan](TRAITS_PLAN.md) owns the remaining generic
+bounds, defaults, automatic record/union equality and library migration, together
+with phase boundaries and acceptance gates.
 
 The [incremental layout migration](LAYOUT_MIGRATION.md) defines the proposed
 physical-layout model, staged replacements, code examples and cost gates.
@@ -55,6 +55,51 @@ The [scaffolding cleanup report](../benchmarks/results/blorp_2_cleanup_2026-10-1
 records explicit unit inputs, reachable specialization, the slim target library,
 matched costs and validation limits. Its measurements supersede earlier cost
 examples for this implementation; older increment reports retain their history.
+
+## Concrete traits
+
+A trait declares pure method signatures using the implicit type `Self`. Each
+method's first parameter must have exactly that type. Signatures have no body;
+an omitted return annotation means Void, as for ordinary functions.
+
+```blorp
+trait Equatable:
+	pure func equals(left: Self, right: Self) -> Bool
+
+implements Equatable for Int:
+	pure func equals(left: Self, right: Self) -> Bool:
+		builtin("int.equals")
+```
+
+The designated foundation's `Equatable` has exactly the signature above.
+Implementations define every required method with matching parameter, result
+and purity contracts; their bodies are ordinary checked functions. A module
+must own the trait or receiver declaration. A library operation module may
+also implement a foundation trait for a foundation receiver.
+
+Method names denote trait families. Importing `int: equals` makes that family
+available for every receiver with an accepted implementation, including custom
+records; the import does not fix `Self` to Int. UFCS and module-qualified calls
+use the same family. Trait declarations also introduce their families, while
+implementation bodies are never independent free-function offers. Multiple
+routes to one family coalesce; different families or a free function with the
+same name need an alias or renamed declaration. A type's `methods_only` route
+requires the provider to own an implementation for that receiver head.
+
+This increment accepts scalar builtins and nongeneric named records, unions or
+opaque receiver types. Applied receivers and generic families are deferred.
+Bounds, generic implementations, method type parameters, default bodies,
+method references, callable formals in
+requirements and derives are deferred with explicit diagnostics. Traits are
+separate from value types, and `Self[Int]` cannot apply the scoped `Self` type.
+Qualified module type names retain their normal meaning.
+
+The [concrete fixture](test/e2e/trait_inputs/concrete/main.brp) supplies its own
+[isolated library](test/e2e/trait_inputs/concrete/library/) and returns 23 for
+`equals(7, 7)`. These inputs live outside the ordinary fixture scan and require
+an explicit `--library-root`. The production library continues to use its
+existing concrete APIs until the later library migration. Compiler source
+continues to obey the separately pinned [bootstrap subset](AGENTS.md).
 
 ## First example
 
@@ -1807,8 +1852,9 @@ func main() -> Int:
 ```
 
 It exits 42. `20.add(22)` uses the same declaration through UFCS. Int addition
-wraps at the signed 64-bit limits. Arithmetic operators and traits remain
-unsupported.
+wraps at the signed 64-bit limits. Arithmetic operators remain unsupported.
+[Concrete authored traits](#concrete-traits) are available; the production
+arithmetic helpers retain their ordinary APIs until the later library migration.
 
 Supply the target library explicitly:
 
@@ -2839,9 +2885,10 @@ consult the filesystem, environment, clock or shared mutable caches. Any reports
 or measurements produced by a phase are returned as data for the shell to present.
 
 Compiler source calls concrete arithmetic, comparison and concatenation functions;
-it does not use trait-dispatched operators. Future traits and operator syntax can
-select these same functions, keeping one implementation per operation. The current
-host library declares some concrete functions inside trait implementations; the
-future subset library will expose ordinary function declarations instead.
+it does not use trait-dispatched operators. Concrete input traits do not expand
+that compiler-source subset. The target library continues to expose ordinary
+functions until the later Equatable library rollout; operator syntax remains
+separate later work. The legacy host library's trait implementations do not
+permit trait declarations or dispatch in compiler source.
 Exact String equality uses the ordinary `string.equals` API in both libraries;
 `src/utils/text.brp` retains only its concatenation bridge.

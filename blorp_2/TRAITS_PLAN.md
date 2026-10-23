@@ -1,12 +1,16 @@
 # Static traits, starting with Equatable
 
-Status: T0 inference and T2 semantic instance identity complete; T1, T3–T5 remain
-open, 2026-10-22. Original measurement baseline:
-`02b13d25d04b7c5670cb94052ea9675cc9ba3428`. Nothing below claims that
-traits are currently accepted by Blorp 2. Code marked **source** describes
-the proposed input language; code marked **model sketch** describes compiler
-data, not a second language or an additional runtime representation.
+Status: T0 inference, T1 concrete traits and T2 semantic instance identity are
+complete; T3–T5 remain open, 2026-10-22. T1 is qualified for publication;
+its landing is coordinated separately. Original measurement baseline:
+`02b13d25d04b7c5670cb94052ea9675cc9ba3428`. The accepted concrete trait
+surface is defined in README/grammar; bounds, defaults, method values and
+automatic equality below belong to the remaining milestones. Code marked
+**model sketch** describes compiler data, not another input language or an
+additional runtime representation.
 
+Completed T1 qualification evidence is retained in the
+[concrete traits report](../benchmarks/results/blorp2-concrete-traits-2026-10-22.md).
 Completed T2 evidence is retained in the
 [semantic instance identity report](../benchmarks/results/blorp2-semantic-instance-keys-2026-10-22.md).
 
@@ -17,9 +21,10 @@ measurements in benchmarks/results. Agent messages follow
 
 ## 1. Problem and agreed contract
 
-Today Blorp 2 exposes concrete functions such as `int.equals` and has no
-accepted trait declarations or bounds. Introducing equality must preserve
-ordinary type inference, nominal identity, purity, imports and ownership.
+Blorp 2 accepts concrete authored trait declarations and static method calls;
+its production library still exposes concrete functions such as `int.equals`.
+Adding bounds, defaults and automatic equality must preserve ordinary type
+inference, nominal identity, purity, imports and ownership.
 It must not create a parallel call graph or carry trait machinery into
 lowering, ownership, verification or C emission.
 
@@ -244,7 +249,9 @@ fixed record CheckedTrait {
 }
 
 -- requirements joins the existing FunctionSignature, not a parallel signature.
--- TraitDeclaration and ImplementationDeclaration join TypeParameterOwner.
+-- TraitDeclaration joins TypeParameterOwner for abstract Self.
+-- Authored/default body binders normalize to their genuine FunctionDeclaration.
+-- Implementation headers introduce no separate parameter-owner domain.
 -- Record/union declaration bounds are outside this increment.
 ```
 
@@ -330,11 +337,13 @@ function and family sharing one spelling, retain explicit conflict/qualification
 rules. Keep module aliases; do not add arbitrary overload sets.
 
 Keep one namespace build. Within its existing dependency-order walk, enter a
-module's type/trait headers and ordinary declarations, resolve its
-imports/aliases/prelude against frozen dependencies, then resolve own impl
-trait references in that same scope. Publish every method family of the trait,
-including omitted defaults, and freeze one ModuleScope. Impl/default function
-rows are tagged as such and never also offered as free functions. Check later
+module's received prelude, imports/aliases, methods_only selections and ordinary
+declarations in that existing order; trait headers and their method families
+join the declared entries. Then resolve own impl trait references in that same
+scope, publish their method families, and freeze one ModuleScope. This preserves
+existing conflict sites while making a declaration's families available even
+without an own implementation. Later default bodies use that ordinary scope.
+Impl/default function rows are tagged as such and never also offered as free functions. Check later
 validates members, receiver types and ownership; this introduces no dependency
 from Namespace to Check. Coalescing an imported and declared family must retain
 the declared offer authority.
@@ -612,26 +621,23 @@ framework. References were checked on 2026-10-22.
 
 No parse-only scaffolding milestone lands by itself. Each milestone includes
 its complete producer/consumer path, exact diagnostics, reference/EBNF updates,
-two independent reviews and one coherent commit. T0 and T2 are complete;
-T3 must land before T4. The table below contains only open milestones.
+two independent reviews and one coherent commit. T0, T1 and T2 are complete;
+T3 must land before T4. The table contains only open milestones.
 
-Start each milestone with its red oracle. T1 begins with the
-exit-23 fixture and contract rejections. T3 adds the missing-bound rejection
-before admission; T4 starts with a derived
+Start each remaining milestone with its red oracle. T3 adds the missing-bound
+rejection before admission; T4 starts with a derived
 container whose nested authored equality intentionally differs from fieldwise
 comparison. Do not remove old negative coverage merely to turn a suite green.
 
 | Milestone | Deliverable and changed boundary | Completion oracle |
 | --- | --- | --- |
-| T1: concrete explicit traits | Parse, inventory, namespace, Check; abstract methods and concrete impls; default bodies deferred explicitly | Fixture Int and custom type direct/UFCS/qualified calls; missing/extra/duplicate/impure members and orphan impls reject in Check |
 | T3: bounds/defaults/callables | Function/receiver bounds; default bodies; contextual method references; accepted symbolic target | Generic forwarding works, missing bounds reject without callers; default dispatch honors override; callbacks keep evaluation order/purity |
 | T4: structural equality | Ordinary derived record/union templates, dependency closure, ordinary List prerequisite in isolated fixture library | Recursive/custom/phantom/invalid-field cases below pass; no trait-specific concrete/lower products |
 | T5: production library rollout | Qualify/publish/pin capable seed, then migrate target library APIs | Clean bootstrap/fixpoint and all component/native/platform gates pass without legacy building Blorp 2 |
 
-T1 accepts a canonical equals-only declaration in its isolated fixture base;
-the designation validates that required method's exact pure Self/Self -> Bool
-contract. T3 adds the ordinary not_equals default. No magic semantics are
-attached to any other method spelling.
+The accepted canonical equals-only declaration validates the exact pure
+Self/Self -> Bool contract. T3 adds the ordinary not_equals default. No magic
+semantics are attached to any other method spelling.
 
 ### Acceptance matrix
 
@@ -668,7 +674,7 @@ scripts/compiler-build-status
 bin/blorp test --std-dir standard_library/src --suite --timeout 180 \
   blorp_2/test/unit/test_check/test_records.brp
 
-# T1–T4 create these ordinary suites, then run only the relevant one first.
+# T3–T4 extend these ordinary suites; run the relevant owner first.
 bin/blorp test --std-dir standard_library/src --suite --timeout 180 \
   blorp_2/test/unit/test_parse/test_traits.brp \
   blorp_2/test/unit/test_check/test_traits.brp \
