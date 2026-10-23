@@ -12,7 +12,7 @@ import:
 		CheckedRecord, CheckedUnion,
 		CheckedField,
 		TypeParameterId,
-		TypeRef(RecordType, UnionType, AppliedUnionType),
+		TypeRef(RecordType, UnionType, AppliedUnionType, ListType),
 		TypeUse, CheckedExpr,
 		UnionOccurrence,
 		same_type,
@@ -56,13 +56,14 @@ import:
 		list_inference_type,
 		pending_type,
 		publish_inference_type
-	../utils/ids: OpaqueId, RecordId, UnionId, VariantId, record_number, union_number, variant_number
+	../utils/ids: OpaqueId, RecordId, UnionId, VariantId, variant_owner, record_number, union_number, variant_number
 	../utils/source: ModuleId
 	../utils/names: same_name
 	../namespace/namespace: Namespace, NamedValue(NamedConstructor), OfferedValue(OfferedConstructor), named_value, offered_value
 	../utils/syntax: Span, ValueExpression, WrittenName, ParsedRecordField, ParsedQualified
 	int as IntOps
 	option: is_some, to_result
+	result as ResultOps
 
 
 -- Construction reads declarations and module visibility, never a body owner.
@@ -85,7 +86,7 @@ fixed record VariantContract {
 }
 
 
-private fixed record DeclaredVariantContract {
+fixed record DeclaredVariantContract {
 	variant: VariantId,
 	fields: List[TypeUse],
 	parameters: List[TypeParameterId]
@@ -289,10 +290,17 @@ pure func plan_record_literal(
 	span: Span,
 	expectation: Option[InferenceType],
 	context: ConstructionContext,
+	slots: List[InferenceSlot],
 ) -> Result[PlannedBase, CheckError]:
-	term ?= expectation.to_result(record_error(span, RecordNeedsExpectedType))
-	-- The supplied hint must establish the owner. A solved bare call variable
-	-- can constrain types, but cannot give a later literal its nominal shape.
+	written_term ?= expectation.to_result(record_error(span, RecordNeedsExpectedType))
+	term ?= inference_head(written_term, slots, span)
+	match term:
+		CallVariable(_):
+			Ok(PlannedContext(SuspendedRecord(written, span), term))
+		_: plan_known_record(written, span, term, context)
+
+
+private pure func plan_known_record(written: List[ParsedRecordField], span: Span, term: InferenceType, context: ConstructionContext) -> Result[PlannedBase, CheckError]:
 	occurrence ?= record_occurrence(term).to_result(record_error(span, RecordNeedsExpectedType))
 	owner = occurrence.owner
 	declaration ?= context.records
@@ -407,6 +415,14 @@ pure func validate_record_fields(fields: List[PendingRecordField], slots: List[I
 		None: Ok(void)
 
 
+-- Closed construction checks establish an actual type, not just a repeated
+-- contextual term. Retain it as argument evidence just as closed calls do.
+private pure func construction_result_type(term: InferenceType, readiness: InferenceReadiness, slots: List[InferenceSlot], span: Span) -> Result[InferenceType, CheckError]:
+	match readiness:
+		ClosedInference: ResultOps.map(publish_inference_type(term, slots, CompleteInference, span), pure func(accepted): AcceptedType(accepted))
+		DeferredInference: Ok(term)
+
+
 pure func finish_pending_record(plan: PlannedRecordFields, fields: List[PendingRecordField], slots: List[InferenceSlot]) -> Result[PendingValue, CheckError]:
 	var readiness: InferenceReadiness = match plan.origin:
 		LiteralRecord(_): ClosedInference
@@ -421,22 +437,22 @@ pure func finish_pending_record(plan: PlannedRecordFields, fields: List[PendingR
 	valid: Void ?= match readiness:
 		ClosedInference: validate_record_fields(fields, slots)
 		DeferredInference: Ok(void)
+	value_type ?= construction_result_type(plan.value_type, readiness, slots, plan.span)
 	base: PendingBase = match plan.origin:
 		LiteralRecord(owner): PendingConstructRecord(owner, fields)
 		UpdatedRecord(owner, base, expression_span, inherited): PendingUpdateRecord(owner, base, expression_span, fields, inherited)
-	Ok({ span = plan.span, readiness = readiness, base = base, base_type = plan.value_type, base_span = plan.span, operations = NoPendingOperations })
+	Ok({ span = plan.span, readiness = readiness, base = base, base_type = value_type, base_span = plan.span, operations = NoPendingOperations })
 
 
 private pure func pending_variant(
+	variant_id: VariantId,
 	name: WrittenName,
 	expected: Option[InferenceType],
 	slots: List[InferenceSlot],
 	context: ConstructionContext,
 ) -> Result[PendingVariantContract, CheckError]:
 	term ?= expected.to_result(constructor_error(name.span, ConstructorNeedsExpectedType(name.id)))
-	-- Select a constructor only from a structurally established nominal hint;
-	-- a sibling's solution of a bare call variable supplies no owner authority.
-	head = term
+	head ?= inference_head(term, slots, name.span)
 	shape = inference_shape(head)
 	owner_result: Result[UnionId, CheckError] = match shape:
 		InferredUnion(owner, _): Ok(owner)
@@ -447,7 +463,7 @@ private pure func pending_variant(
 				Ok(snapshot): Err(constructor_error(name.span, VariantNotInExpectedType(name.id, snapshot)))
 				Err(error): Err(error)
 	owner ?= owner_result
-	declared ?= find_declared_variant(context, owner, name)
+	declared ?= declared_variant_contract(context, owner, variant_id, name.span)
 	variant_result: Result[DeclaredVariantContract, CheckError] = match declared:
 		Some(variant): Ok(variant)
 		None:
@@ -501,14 +517,11 @@ private pure func instantiate_variant(
 -- is needed to find the owner; a generic union still takes its arguments
 -- from the expectation, as a bare constructor does.
 private pure func pending_qualified_variant(
-	owner: UnionId,
-	variant: VariantId,
+	declared: DeclaredVariantContract,
 	name: WrittenName,
 	expected: Option[InferenceType],
-	context: ConstructionContext,
 ) -> Result[PendingVariantContract, CheckError]:
-	contract ?= declared_variant_contract(context, owner, variant, name.span)
-	declared ?= contract.to_result(checker_invariant(name.span, InvalidCheckedUnion(owner)))
+	owner = variant_owner(declared.variant)
 	arguments: List[InferenceType] = match expected:
 		Some(hint):
 			match inference_shape(hint):
@@ -538,8 +551,31 @@ pure func plan_qualified_variant(
 	called: Bool,
 	expected: Option[InferenceType],
 	context: ConstructionContext,
+	slots: List[InferenceSlot],
 ) -> Result[PlannedBase, CheckError]:
-	contract ?= pending_qualified_variant(owner, variant, name, expected, context)
+	contract ?= declared_variant_contract(context, owner, variant, name.span)
+	declared ?= contract.to_result(checker_invariant(name.span, InvalidCheckedUnion(owner)))
+	normalized: Result[Option[InferenceType], CheckError] = match expected:
+		Some(term):
+			match inference_head(term, slots, name.span):
+				Ok(head): Ok(Some(head))
+				Err(error): Err(error)
+		None: Ok(None)
+	head ?= normalized
+	match head:
+		Some(term):
+			match term:
+				CallVariable(_):
+					if declared.parameters.is_empty():
+						plan_known_qualified_variant(declared, name, arguments, called, head)
+					else:
+						Ok(PlannedContext(SuspendedQualifiedVariant(declared, name, arguments, called), term))
+				_: plan_known_qualified_variant(declared, name, arguments, called, head)
+		_: plan_known_qualified_variant(declared, name, arguments, called, head)
+
+
+private pure func plan_known_qualified_variant(declared: DeclaredVariantContract, name: WrittenName, arguments: List[ValueExpression], called: Bool, expected: Option[InferenceType]) -> Result[PlannedBase, CheckError]:
+	contract ?= pending_qualified_variant(declared, name, expected)
 	if and(contract.fields.is_empty(), called):
 		Err(constructor_error(name.span, PayloadFreeVariantCalled(contract.variant)))
 	else if IntOps.equals(contract.fields.length(), arguments.length()).not():
@@ -549,6 +585,7 @@ pure func plan_qualified_variant(
 
 
 pure func plan_variant(
+	variant: VariantId,
 	name: WrittenName,
 	arguments: List[ValueExpression],
 	called: Bool,
@@ -556,7 +593,15 @@ pure func plan_variant(
 	slots: List[InferenceSlot],
 	context: ConstructionContext,
 ) -> Result[PlannedBase, CheckError]:
-	contract ?= pending_variant(name, expected, slots, context)
+	term ?= expected.to_result(constructor_error(name.span, ConstructorNeedsExpectedType(name.id)))
+	head ?= inference_head(term, slots, name.span)
+	match head:
+		CallVariable(_): Ok(PlannedContext(SuspendedVariant(variant, name, arguments, called), head))
+		_: plan_known_variant(variant, name, arguments, called, head, slots, context)
+
+
+private pure func plan_known_variant(variant: VariantId, name: WrittenName, arguments: List[ValueExpression], called: Bool, expected: InferenceType, slots: List[InferenceSlot], context: ConstructionContext) -> Result[PlannedBase, CheckError]:
+	contract ?= pending_variant(variant, name, Some(expected), slots, context)
 	if and(contract.fields.is_empty(), called):
 		Err(constructor_error(name.span, PayloadFreeVariantCalled(contract.variant)))
 	else if IntOps.equals(contract.fields.length(), arguments.length()).not():
@@ -634,11 +679,12 @@ pure func finish_pending_variant(
 	valid: Void ?= match readiness:
 		ClosedInference: validate_variant_fields(contract, values, slots)
 		DeferredInference: Ok(void)
+	value_type ?= construction_result_type(contract.result_type, readiness, slots, span)
 	Ok({
 		span = span,
 		readiness = readiness,
 		base = PendingConstructVariant(contract, values),
-		base_type = contract.result_type,
+		base_type = value_type,
 		base_span = contract.span,
 		operations = NoPendingOperations,
 	})
@@ -687,7 +733,7 @@ pure func validate_list_elements(
 	values: List[PendingValue],
 	slots: List[InferenceSlot],
 	span: Span,
-) -> Result[Void, CheckError]:
+) -> Result[TypeRef, CheckError]:
 	element ?= list_element_type(source, values, span)
 	expected ?= publish_inference_type(element, slots, CompleteInference, span)
 	reference: ListElementReference = match source:
@@ -709,7 +755,7 @@ pure func validate_list_elements(
 		position = IntOps.add(position, 1)
 	match failure:
 		Some(error): Err(error)
-		None: Ok(void)
+		None: Ok(expected)
 
 
 pure func finish_pending_list(
@@ -728,14 +774,14 @@ pure func finish_pending_list(
 	complete ?= inference_complete(element, slots, base_span)
 	if complete.not():
 		readiness = DeferredInference
-	valid: Void ?= match readiness:
-		ClosedInference: validate_list_elements(source, values, slots, base_span)
-		DeferredInference: Ok(void)
+	value_type: InferenceType ?= match readiness:
+		ClosedInference: ResultOps.map(validate_list_elements(source, values, slots, base_span), pure func(accepted): AcceptedType(ListType(accepted)))
+		DeferredInference: Ok(list_inference_type(element))
 	Ok({
 		span = span,
 		readiness = readiness,
 		base = PendingConstructList(source, values),
-		base_type = list_inference_type(element),
+		base_type = value_type,
 		base_span = base_span,
 		operations = NoPendingOperations,
 	})
@@ -746,7 +792,32 @@ fixed union CallPlacement:
 	ReceiverPlacement(PendingValue, Span)
 
 
+-- A construct whose nominal expected head is still a call-local variable.
+-- Names already resolved to variants retain that identity while waiting.
+fixed union SuspendedConstruction:
+	SuspendedRecord(List[ParsedRecordField], Span)
+	SuspendedVariant(VariantId, WrittenName, List[ValueExpression], Bool)
+	SuspendedQualifiedVariant(DeclaredVariantContract, WrittenName, List[ValueExpression], Bool)
+
+
+pure func resume_construction(written: SuspendedConstruction, head: InferenceType, context: ConstructionContext, slots: List[InferenceSlot]) -> Result[PlannedBase, CheckError]:
+	match written:
+		SuspendedRecord(fields, span): plan_known_record(fields, span, head, context)
+		SuspendedVariant(variant, name, arguments, called): plan_known_variant(variant, name, arguments, called, head, slots, context)
+		SuspendedQualifiedVariant(declared, name, arguments, called): plan_known_qualified_variant(declared, name, arguments, called, Some(head))
+
+
+pure func construction_context_error(written: SuspendedConstruction) -> CheckError:
+	match written:
+		SuspendedRecord(_, span): record_error(span, RecordNeedsExpectedType)
+		SuspendedVariant(_, name, _, _):
+			constructor_error(name.span, ConstructorNeedsExpectedType(name.id))
+		SuspendedQualifiedVariant(_, name, _, _):
+			constructor_error(name.span, ConstructorNeedsExpectedType(name.id))
+
+
 fixed union PlannedBase:
+	PlannedContext(SuspendedConstruction, InferenceType)
 	PlannedCallable(ValueExpression, Option[InferenceType])
 	PlannedLeaf(PendingBase, TypeRef)
 	PlannedConstructOpaque(OpaqueId, TypeRef, ValueExpression)

@@ -205,7 +205,23 @@ pure func test_unique_generic_ufcs_supplies_concrete_literal_context() -> Bool:
 	accepts(PAIR + generic + main_prefix + "\t{ first = 7, second = 9 }.read(1)\n")
 
 
-pure func test_earlier_generic_argument_does_not_contextualize_later_literal() -> Bool:
+private pure func pair_literal(value: Model.CheckedExpr, owner: Declaration.RecordId) -> Bool:
+	match value.form:
+		Model.ConstructRecord(actual_owner, [first, second]):
+			match (first.value.form, second.value.form):
+				(Model.LiteralInteger(7), Model.LiteralInteger(9)):
+					(
+						Model.same_type(value.value_type, Model.RecordType(owner))
+						and Model.same_type(Model.RecordType(actual_owner), Model.RecordType(owner))
+						and Model.field_number(first.field) == 0 and Model.field_number(second.field) == 1
+						and Model.same_type(first.value.value_type, Model.IntType)
+						and Model.same_type(second.value.value_type, Model.IntType)
+					)
+				_: False
+		_: False
+
+
+private pure func sibling_literal_has_pair_type(arguments: String, literal_first: Bool) -> Bool:
 	generic: String =
 		|pure func pick[T](left: T, right: T) -> T:
 		|	left
@@ -213,14 +229,420 @@ pure func test_earlier_generic_argument_does_not_contextualize_later_literal() -
 	main_prefix: String =
 		|func main() -> Int:
 		|
-	rejects(PAIR + MAKE + generic + main_prefix + "\tpick(make_pair(), ", "{ first = 7, second = 9 }", ").first\n", pure func(
-		kind,
-	):
+	match checked(PAIR + MAKE + generic + main_prefix + "\tpick(" + arguments + ").first\n"):
+		Ok(program):
+			contents = API.checked_functions(program)
+			match (contents.records, contents.functions):
+				([declaration], [make, pick, main]):
+					match main.body:
+						Model.CheckedValueBody(Model.ReturnExpression(value)):
+							match value.form:
+								Model.ReadRecordField(receiver, field):
+									match receiver.form:
+										Model.InvokeFunction(call):
+											match (call.target, call.operands):
+												(Model.UserFunction(callee, [substitution]), [Model.ValueOperand(left), Model.ValueOperand(right)]):
+													literal = if literal_first:
+														left
+													else:
+														right
+													sibling = if literal_first:
+														right
+													else:
+														left
+													match sibling.form:
+														Model.InvokeFunction(sibling_call):
+															match sibling_call.target:
+																Model.UserFunction(sibling_id, []):
+																	(
+																		Declaration.function_number(callee) == Declaration.function_number(pick.id)
+																		and Declaration.function_number(sibling_id) == Declaration.function_number(make.id)
+																		and Model.same_type(substitution, Model.RecordType(declaration.id))
+																		and Model.same_type(value.value_type, Model.IntType)
+																		and Model.field_number(field) == 0
+																		and pair_literal(literal, declaration.id)
+																	)
+																_: False
+														_: False
+												_: False
+										_: False
+								_: False
+						_: False
+				_: False
+		Err(_): False
+
+
+pure func test_earlier_generic_argument_contextualizes_later_literal() -> Bool:
+	sibling_literal_has_pair_type("make_pair(), { first = 7, second = 9 }", False)
+
+
+pure func test_later_generic_argument_contextualizes_earlier_literal() -> Bool:
+	sibling_literal_has_pair_type("{ first = 7, second = 9 }, make_pair()", True)
+
+
+private PICK: String =
+	|pure func pick[T](left: T, right: T) -> T:
+	|    left
+	|pure func pick3[T](left: T, middle: T, right: T) -> T:
+	|    left
+	|
+
+
+private pure func deferred_unknown(before: String, after: String) -> Bool:
+	prefix = PAIR + MAKE + PICK + "func main() -> Int:\n    " + before
+	structured = rejects(prefix, "missing", after + "\n", pure func(kind):
 		match kind:
-			Errors.RecordRejection(Errors.RecordNeedsExpectedType):
-				True
-			_:
-				False
+			Errors.ValueRejection(Errors.UnknownValue(_)): True
+			_: False
+	)
+	match diagnostic(prefix + "missing" + after + "\n"):
+		Some(error):
+			(
+				structured and error.message == "unknown value"
+				and error.help == "use this function's parameter name, a declared variant, or a call"
+				and error.note.is_none()
+				and error.span.start == prefix.length() and error.span.end == prefix.length() + "missing".length()
+			)
+		None: False
+
+
+pure func test_deferred_record_child_errors_follow_sibling_inference() -> Bool:
+	(
+		deferred_unknown("pick(make_pair(), { first = ", ", second = 9 }).first")
+		and deferred_unknown("pick({ first = ", ", second = 9 }, make_pair()).first")
+	)
+
+
+pure func test_later_ordinary_child_precedes_deferred_record_child() -> Bool:
+	(
+		deferred_unknown("pick3({ first = unknown, second = 9 }, make_pair(), ", ").first")
+		and deferred_unknown("pick3(make_pair(), { first = unknown, second = 9 }, ", ").first")
+	)
+
+
+pure func test_sibling_context_reaches_literal_in_nested_generic_call() -> Bool:
+	generic: String =
+		|pure func identity[T](value: T) -> T:
+		|    value
+		|func main() -> Int:
+		|    selected = pick(identity({ first = 7, second = 9 }), make_pair())
+		|    selected.first
+		|
+	match checked(PAIR + MAKE + PICK + generic):
+		Ok(program):
+			contents = API.checked_functions(program)
+			match (contents.records, contents.functions.get(4)):
+				([declaration], Some(main)):
+					match main.statements:
+						[Model.InitializeBinding(_, value)]:
+							match value.form:
+								Model.InvokeFunction(outer):
+									match outer.operands:
+										[Model.ValueOperand(inner), Model.ValueOperand(_)]:
+											match inner.form:
+												Model.InvokeFunction(call):
+													match (call.target, call.operands):
+														(Model.UserFunction(_, [substitution]), [Model.ValueOperand(literal)]):
+															Model.same_type(substitution, Model.RecordType(declaration.id)) and pair_literal(literal, declaration.id)
+														_: False
+												_: False
+										_: False
+								_: False
+						_: False
+				_: False
+		Err(_): False
+
+
+pure func test_deferred_record_still_validates_duplicate_and_missing_fields() -> Bool:
+	prefix = PAIR + MAKE + PICK + "func main() -> Int:\n    pick("
+	(
+		rejects(prefix + "{ first = 7, ", "first", " = 9 }, make_pair()).first\n", pure func(kind):
+			match kind:
+				Errors.RecordRejection(Errors.DuplicateLiteralField(_, _)): True
+				_: False
+		)
+		and rejects(prefix, "{ first = missing }", ", make_pair()).first\n", pure func(kind):
+			match kind:
+				Errors.RecordRejection(Errors.MissingRecordField(field, _)): Model.field_number(field) == 1
+				_: False
+		)
+	)
+
+
+pure func test_unresolved_sibling_literals_do_not_guess_same_shaped_records() -> Bool:
+	other = "fixed record Other { first: Int, second: Int }\n"
+	prefix = PAIR + other + PICK + "func main() -> Int:\n    unused = pick("
+	literal = "{ first = 7, second = 9 }"
+	suffix = ", " + literal + ")\n    0\n"
+	rejects(prefix, literal, suffix, pure func(kind):
+		match kind:
+			Errors.RecordRejection(Errors.RecordNeedsExpectedType): True
+			_: False
+	) and rendered_as(prefix + literal + suffix,
+		"record literal needs an expected record type",
+		"pass the literal to a concrete record parameter or return it from a helper declaring that record")
+
+
+pure func test_authoritative_nominal_conflict_precedes_deferred_literal() -> Bool:
+	other: String =
+		|fixed record Other { first: Int, second: Int }
+		|pure func make_other() -> Other:
+		|    { first = 1, second = 2 }
+		|
+	call_prefix = PAIR + MAKE + other + PICK + "func main() -> Int:\n    pick3("
+	prefix = call_prefix + "make_pair(), "
+	rejects(prefix, "make_other()", ", { first = 7, second = 9 }).first\n", pure func(kind):
+		match kind:
+			Errors.CallRejection(Errors.GenericArgumentConflict(conflict)):
+				match (conflict.previous.value_type, conflict.current.value_type):
+					(Model.RecordType(previous), Model.RecordType(current)):
+						(
+							Declaration.record_number(previous) == 0 and Declaration.record_number(current) == 1
+							and conflict.previous.span.start == call_prefix.length()
+							and conflict.previous.span.end == call_prefix.length() + "make_pair()".length()
+							and conflict.current.span.start == prefix.length()
+							and conflict.current.span.end == prefix.length() + "make_other()".length()
+							and Model.same_type(conflict.mismatch.expected, conflict.previous.value_type)
+							and conflict.mismatch.argument_position == 1
+							and Model.parameter_position(conflict.parameter) == 0
+						)
+					_: False
+			_: False
+	)
+
+
+pure func test_lambda_result_supplies_sibling_literal_context_in_both_orders() -> Bool:
+	functions: String =
+		|pure func choose[T](make: pure () -> T, value: T) -> T:
+		|    make()
+		|pure func reverse[T](value: T, make: pure () -> T) -> T:
+		|    make()
+		|func main() -> Int:
+		|    first = choose(pure func(): make_pair(), { first = 7, second = 9 })
+		|    second = reverse({ first = 7, second = 9 }, pure func(): make_pair())
+		|    second.first
+		|
+	match checked(PAIR + MAKE + functions):
+		Ok(program):
+			match API.checked_functions(program).functions:
+				[make, _, _, main]:
+					match main.statements:
+						[Model.InitializeBinding(_, first), Model.InitializeBinding(_, second)]:
+							(
+								Model.same_type(first.value_type, make.signature.return_type.value_type)
+								and Model.same_type(second.value_type, make.signature.return_type.value_type)
+							)
+						_: False
+				_: False
+		Err(_): False
+
+
+pure func test_sibling_list_context_reaches_deferred_record_element() -> Bool:
+	functions: String =
+		|pure func choose[T](left: List[T], right: List[T]) -> List[T]:
+		|    left
+		|func main() -> Int:
+		|    values = choose([{ first = 7, second = 9 }], [make_pair()])
+		|    0
+		|
+	match checked(PAIR + MAKE + functions):
+		Ok(program):
+			match API.checked_functions(program).functions:
+				[make, _, main]:
+					match main.statements:
+						[Model.InitializeBinding(_, value)]:
+							Model.same_type(value.value_type, Model.ListType(make.signature.return_type.value_type))
+						_: False
+				_: False
+		Err(_): False
+
+
+pure func test_resumed_field_lambda_retains_scope_and_distinct_admission_identity() -> Bool:
+	source: String =
+		|fixed record Holder { run: pure () -> Int }
+		|pure func make() -> Holder:
+		|    { run = pure func() -> Int: 7 }
+		|pure func choose[T](left: T, ordinary: pure () -> Int, right: T) -> T:
+		|    left
+		|func main() -> Int:
+		|    seed = 7
+		|    selected = choose({ run = pure func() -> Int: seed }, pure func() -> Int: seed, make())
+		|    callback: pure () -> Int = selected.run
+		|    callback()
+		|
+	match checked(source):
+		Ok(program):
+			contents = API.checked_functions(program)
+			match (contents.functions, contents.lambdas):
+				([_, _, main], [_, ordinary, deferred]):
+					identities = match main.statements:
+						[Model.InitializeBinding(_, _), Model.InitializeBinding(_, selected), Model.InitializeBinding(_, _)]:
+							match selected.form:
+								Model.InvokeFunction(call):
+									match call.operands:
+										[Model.ValueOperand(literal), Model.CallableOperand(_, Model.LambdaCallable(ordinary_id, _), _), Model.ValueOperand(_)]:
+											match literal.form:
+												Model.ConstructRecord(_, [field]):
+													match field.value.form:
+														Model.MakeCallable(Model.LambdaCallable(field_id, _)):
+															Model.lambda_number(ordinary_id) == 1 and Model.lambda_number(field_id) == 2
+														_: False
+												_: False
+										_: False
+								_: False
+						_: False
+					match (ordinary.captures, deferred.captures):
+						([ordinary_capture], [field_capture]):
+							(
+								identities
+								and Model.same_body(ordinary_capture.binding.owner, Model.DeclaredBody(main.id))
+								and Model.same_body(field_capture.binding.owner, Model.DeclaredBody(main.id))
+								and Model.binding_number(ordinary_capture.binding.binding) == 0
+								and Model.binding_number(field_capture.binding.binding) == 0
+								and Model.same_type(field_capture.value_type.value_type, Model.IntType)
+							)
+						_: False
+				_: False
+		Err(_): False
+
+
+pure func test_joint_context_and_lambda_stall_reports_first_written_construct() -> Bool:
+	functions: String =
+		|pure func choose[T,A,B](value: T, callback: pure (A) -> B) -> Int:
+		|    0
+		|pure func reverse[A,B,T](callback: pure (A) -> B, value: T) -> Int:
+		|    0
+		|func main() -> Int:
+		|
+	prefix = PAIR + functions + "    "
+	(
+		rejects(prefix + "choose(", "{ first = 7, second = 9 }", ", pure func(value): value)\n", pure func(kind):
+			match kind:
+				Errors.RecordRejection(Errors.RecordNeedsExpectedType): True
+				_: False
+		)
+		and rejects(prefix + "reverse(", "pure func(value): value", ", { first = 7, second = 9 })\n", pure func(kind):
+			match kind:
+				Errors.CallRejection(Errors.LambdaInputNeedsType): True
+				_: False
+		)
+		and rendered_as(prefix + "reverse(pure func(value): value, { first = 7, second = 9 })\n",
+			"cannot infer this lambda's input types", "annotate its parameters or supply a typed ordinary argument")
+	)
+
+
+pure func test_unknown_call_projection_does_not_guess_a_record_owner() -> Bool:
+	prefix = PAIR + PICK + "func main() -> Int:\n    pick({ first = 7, second = 9 }, { first = 7, second = 9 })."
+	rejects(prefix, "first", "\n", pure func(kind):
+		match kind:
+			Errors.RecordRejection(Errors.FieldRequiresRecord(_)): True
+			_: False
+	)
+
+
+pure func test_rigid_parameter_never_supplies_a_nominal_record_head() -> Bool:
+	prefix = PAIR + PICK + "pure func keep[A](value: A) -> A:\n    pick(value, "
+	rejects(prefix, "{ first = 7, second = 9 }", ")\n" + MAIN, pure func(kind):
+		match kind:
+			Errors.RecordRejection(Errors.RecordNeedsExpectedType): True
+			_: False
+	)
+
+
+pure func test_linked_placeholder_does_not_own_the_authoritative_conflict_note() -> Bool:
+	declarations: String =
+		|fixed record Other { first: Int, second: Int }
+		|pure func make_other() -> Other:
+		|    { first = 1, second = 2 }
+		|pure func identity[T](value: T) -> T:
+		|    value
+		|
+	call_prefix = PAIR + MAKE + declarations + PICK + "func main() -> Int:\n    pick3(identity({ first = 7, second = 9 }), "
+	prefix = call_prefix + "make_pair(), "
+	rejects(prefix, "make_other()", ").first\n", pure func(kind):
+		match kind:
+			Errors.CallRejection(Errors.GenericArgumentConflict(conflict)):
+				(
+					conflict.previous.span.start == call_prefix.length()
+					and conflict.previous.span.end == call_prefix.length() + "make_pair()".length()
+					and conflict.current.span.start == prefix.length()
+					and conflict.current.span.end == prefix.length() + "make_other()".length()
+				)
+			_: False
+	)
+
+
+pure func test_bound_placeholder_preserves_the_later_authoritative_conflict_note() -> Bool:
+	declarations: String =
+		|fixed record Other { first: Int, second: Int }
+		|pure func make_other() -> Other:
+		|    { first = 1, second = 2 }
+		|pure func choose4[T](value: T, callback: pure () -> T, witness: T, other: T) -> T:
+		|    value
+		|func main() -> Int:
+		|
+	witness_prefix = PAIR + MAKE + declarations + "    choose4({ first = 7, second = 9 }, pure func() -> Pair: make_pair(), "
+	prefix = witness_prefix + "make_pair(), "
+	rejects(prefix, "make_other()", ").first\n", pure func(kind):
+		match kind:
+			Errors.CallRejection(Errors.GenericArgumentConflict(conflict)):
+				(
+					conflict.previous.span.start == witness_prefix.length()
+					and conflict.previous.span.end == witness_prefix.length() + "make_pair()".length()
+					and conflict.current.span.start == prefix.length()
+					and conflict.current.span.end == prefix.length() + "make_other()".length()
+				)
+			_: False
+	)
+
+
+pure func test_resumed_lambda_context_uses_written_order_for_stalled_diagnostic() -> Bool:
+	declarations: String =
+		|pure func identity[T](value: T) -> T:
+		|    value
+		|pure func choose[A,B](callback: pure () -> A, value: B) -> Int:
+		|    0
+		|func main() -> Int:
+		|
+	prefix = PAIR + declarations + "    choose(pure func(): identity("
+	rejects(prefix, "{ first = 7, second = 9 }", "), { first = 7, second = 9 })\n", pure func(kind):
+		match kind:
+			Errors.RecordRejection(Errors.RecordNeedsExpectedType): True
+			_: False
+	)
+
+
+private pure func deferred_field_mismatch(before: String, after: String) -> Bool:
+	prefix = PAIR + MAKE + PICK + "func main() -> Int:\n    " + before
+	source = prefix + "\"bad\"" + after + "\n"
+	structured = rejects(prefix, "\"bad\"", after + "\n", pure func(kind):
+		match kind:
+			Errors.RecordRejection(Errors.RecordFieldTypeMismatch(field, actual, annotation)):
+				(
+					Model.field_number(field) == 0
+					and Model.same_type(actual.value_type, Model.StringType)
+					and Model.same_type(annotation.value_type, Model.IntType)
+					and annotation.span.start == 27 and annotation.span.end == 30
+				)
+			_: False
+	)
+	match diagnostic(source):
+		Some(error):
+			match error.note:
+				Some(RecordFieldDeclaration(annotation)):
+					(
+						structured and error.message == "record field requires Int"
+						and error.help == "use an expression of type Int here"
+						and annotation.start == 27 and annotation.end == 30
+					)
+				_: False
+		None: False
+
+
+pure func test_deferred_record_field_mismatch_retains_annotation_and_span() -> Bool:
+	(
+		deferred_field_mismatch("pick(make_pair(), { first = ", ", second = 9 }).first")
+		and deferred_field_mismatch("pick({ first = ", ", second = 9 }, make_pair()).first")
 	)
 
 
@@ -690,9 +1112,29 @@ tests: TestSuite = {
 		("field postfix never infers literal shape", test_field_postfix_never_infers_literal_shape),
 		("unique generic UFCS supplies concrete literal context", test_unique_generic_ufcs_supplies_concrete_literal_context),
 		(
-			"earlier generic argument does not contextualize later literal",
-			test_earlier_generic_argument_does_not_contextualize_later_literal,
+			"earlier generic argument contextualizes later literal",
+			test_earlier_generic_argument_contextualizes_later_literal,
 		),
+		(
+			"later generic argument contextualizes earlier literal",
+			test_later_generic_argument_contextualizes_earlier_literal,
+		),
+		("linked placeholder does not own authoritative conflict note", test_linked_placeholder_does_not_own_the_authoritative_conflict_note),
+		("bound placeholder preserves later authoritative conflict note", test_bound_placeholder_preserves_the_later_authoritative_conflict_note),
+		("resumed lambda context preserves written stalled diagnostic order", test_resumed_lambda_context_uses_written_order_for_stalled_diagnostic),
+		("joint context and lambda stall reports first written construct", test_joint_context_and_lambda_stall_reports_first_written_construct),
+		("unknown call projection never guesses a record owner", test_unknown_call_projection_does_not_guess_a_record_owner),
+		("rigid parameter never supplies nominal record head", test_rigid_parameter_never_supplies_a_nominal_record_head),
+		("lambda results contextualize sibling literals in both orders", test_lambda_result_supplies_sibling_literal_context_in_both_orders),
+		("sibling List context reaches a deferred record element", test_sibling_list_context_reaches_deferred_record_element),
+		("resumed field lambda retains scope and distinct identity", test_resumed_field_lambda_retains_scope_and_distinct_admission_identity),
+		("unresolved sibling literals never guess same-shaped record heads", test_unresolved_sibling_literals_do_not_guess_same_shaped_records),
+		("authoritative nominal conflict precedes deferred literal", test_authoritative_nominal_conflict_precedes_deferred_literal),
+		("nested generic call receives sibling literal context", test_sibling_context_reaches_literal_in_nested_generic_call),
+		("deferred record validates duplicate and missing fields", test_deferred_record_still_validates_duplicate_and_missing_fields),
+		("deferred record child errors follow sibling inference", test_deferred_record_child_errors_follow_sibling_inference),
+		("ordinary later child precedes deferred record child", test_later_ordinary_child_precedes_deferred_record_child),
+		("deferred field mismatch retains annotation and span", test_deferred_record_field_mismatch_retains_annotation_and_span),
 		("copies and whole-value reassignment", test_record_copies_and_whole_value_reassignment),
 		("identical layouts are nominally distinct", test_identical_layouts_are_nominally_distinct),
 		("structural errors precede children", test_structural_errors_precede_children),

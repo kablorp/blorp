@@ -78,9 +78,21 @@ pure func static_pending_call(contract: FunctionContract, start: Int) -> Result[
 	target ?= selected
 	Ok({ target = target, signature = contract.signature, span = contract.span, variable_start = start })
 
+-- Issued by one expression's suspended-construction worklist; never published.
+opaque type ConstructionId = Int
+
+
+pure func construction_id(position: Int) -> ConstructionId:
+	into_opaque ConstructionId(position)
+
+
+pure func construction_number(id: ConstructionId) -> Int:
+	from_opaque ConstructionId(id)
+
 
 -- Only leaves are accepted before freezing: they have no children to infer.
 fixed union PendingBase:
+	PendingContext(ConstructionId)
 	AcceptedVoid
 	AcceptedInteger(Int)
 	AcceptedFloat(Float)
@@ -839,6 +851,19 @@ fixed union InferenceReadiness:
 	DeferredInference
 
 
+-- Called only for distinct variables: known types are not another variable's
+-- identity, and raw self-equations remain self-equations even after binding.
+private pure func same_unbound_variable(expected: InferenceVariableId, actual: InferenceVariableId, slots: List[InferenceSlot], span: Span) -> Result[Bool, CheckError]:
+	left ?= inference_head(CallVariable(expected), slots, span)
+	right ?= inference_head(CallVariable(actual), slots, span)
+	match left:
+		CallVariable(expected_root):
+			match right:
+				CallVariable(actual_root): Ok(IntOps.equals(from_opaque InferenceVariableId(expected_root), from_opaque InferenceVariableId(actual_root)))
+				_: Ok(False)
+		_: Ok(False)
+
+
 pure func record_argument_origin(equality: InferenceEquality, slots: List[InferenceSlot]) -> Result[Option[InferenceSlotUpdate], CheckError]:
 	match equality.origin:
 		ResultConstraint(_) | LambdaConstraint(_): Ok(None)
@@ -854,14 +879,26 @@ pure func record_argument_origin(equality: InferenceEquality, slots: List[Infere
 				None:
 					match equality.expected:
 						CallVariable(id):
-							position = from_opaque InferenceVariableId(id)
-							match slots.get(position).to_result(checker_invariant(actual.span, InvalidInferenceVariable(position))):
-								Ok(slot):
-
-									match slot.first_argument:
-										Some(_): Ok(None)
-										None: Ok(Some({ position = position, slot = { slot | first_argument = Some({ value_type = equality.actual, span = actual.span }) } }))
+							-- A suspended literal repeats its expected variable; this is
+							-- no authoritative argument use and must not own a conflict note.
+							self_equation: Result[Bool, CheckError] = match equality.actual:
+								CallVariable(actual_id):
+									if IntOps.equals(from_opaque InferenceVariableId(id), from_opaque InferenceVariableId(actual_id)):
+										Ok(True)
+									else:
+										same_unbound_variable(id, actual_id, slots, actual.span)
+								_: Ok(False)
+							match self_equation:
 								Err(error): Err(error)
+								Ok(True): Ok(None)
+								Ok(False):
+									position = from_opaque InferenceVariableId(id)
+									match slots.get(position).to_result(checker_invariant(actual.span, InvalidInferenceVariable(position))):
+										Ok(slot):
+											match slot.first_argument:
+												Some(_): Ok(None)
+												None: Ok(Some({ position = position, slot = { slot | first_argument = Some({ value_type = equality.actual, span = actual.span }) } }))
+										Err(error): Err(error)
 						_: Ok(None)
 
 

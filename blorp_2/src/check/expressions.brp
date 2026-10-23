@@ -57,10 +57,10 @@ import:
 		checker_invariant
 	./inference:
 		select_receiver_contract,
-		PendingBase(PendingInterpolatedString, PendingConstructTuple, PendingLambda, PendingNamedCallable, PendingForwardedCallable, AcceptedBinding, AcceptedCapture, PendingCapture, AcceptedFloat, AcceptedInteger, AcceptedString, AcceptedConstant, AcceptedVoid, PendingConstructRecord, PendingConstructVariant, PendingConstructList, PendingConstructOpaque, PendingProjectOpaque, PendingDirectCall, PendingUpdateRecord),
+		PendingBase(PendingContext, PendingInterpolatedString, PendingConstructTuple, PendingLambda, PendingNamedCallable, PendingForwardedCallable, AcceptedBinding, AcceptedCapture, PendingCapture, AcceptedFloat, AcceptedInteger, AcceptedString, AcceptedConstant, AcceptedVoid, PendingConstructRecord, PendingConstructVariant, PendingConstructList, PendingConstructOpaque, PendingProjectOpaque, PendingDirectCall, PendingUpdateRecord),
 		ListElementSource(ExpectedElementType, FirstElementType),
 		PendingOperation(AcceptedTupleElement, AcceptedField, PendingInvocation),
-		InferenceType(AcceptedType, InferredTuple, InferredCallable),
+		InferenceType(AcceptedType, CallVariable, InferredTuple, InferredCallable),
 		ConstraintOrigin(InterpolationConstraint, LambdaConstraint, ArgumentConstraint, RecordFieldConstraint, ResultConstraint, OpaqueOperandConstraint, VariantConstraint, ListElementConstraint, ReceiverOverlapConstraint),
 		CallResultContext,
 		InferenceReadiness(ClosedInference, DeferredInference),
@@ -68,6 +68,7 @@ import:
 		InferenceStep(CompleteEquality, ExpandInferenceArguments, ExpandInferenceList, IncompatibleResult, UpdateInferenceSlots),
 		InferencePublication(CompleteInference, DiagnosticInference),
 		ExpectedValue,
+		construction_id, construction_number,
 		InferenceEquality,
 		InferenceSlot,
 		InferenceUse,
@@ -97,8 +98,9 @@ import:
 		validate_complete_arguments
 	./constructors:
 		ConstructionContext, construction_context,
+		SuspendedConstruction, resume_construction, construction_context_error,
 		CallPlacement(ReceiverPlacement, ReturnPlacement),
-		PlannedBase(PlannedInterpolation, PlannedTuple, PlannedCallable, PlannedCall, PlannedStoredCall, PlannedLeaf, PlannedRecord, PlannedUpdate, PlannedVariant, PlannedList, PlannedConstructOpaque, PlannedProjectOpaque),
+		PlannedBase(PlannedContext, PlannedInterpolation, PlannedTuple, PlannedCallable, PlannedCall, PlannedStoredCall, PlannedLeaf, PlannedRecord, PlannedUpdate, PlannedVariant, PlannedList, PlannedConstructOpaque, PlannedProjectOpaque),
 		finish_pending_list,
 		list_element_type,
 		plan_list_literal,
@@ -175,16 +177,16 @@ private fixed union ResolvedPostfix:
 private fixed union ResolvedApplication:
 	FunctionApplication(FunctionContract)
 	StoredApplication(CheckedExpr, FunctionContract)
-	ConstructorApplication(WrittenName)
+	ConstructorApplication(VariantId, WrittenName)
 
 
-private pure func freeze_record_fields(fields: List[PendingRecordField], slots: List[InferenceSlot], captures: CaptureScope) -> Result[List[CheckedRecordField], CheckError]:
+private pure func freeze_record_fields(fields: List[PendingRecordField], slots: List[InferenceSlot], captures: CaptureScope, constructions: List[ContextWork]) -> Result[List[CheckedRecordField], CheckError]:
 	var frozen: List[CheckedRecordField] = []
 	var failure: Option[CheckError] = None
 
 	-- All child errors precede ordinary field mismatches, including later children.
 	for field in fields:
-		match freeze_pending_value(field.value, slots, captures):
+		match freeze_pending_value(field.value, slots, captures, constructions):
 			Ok(value): frozen = frozen.append({ field = field.field, value = value, span = field.value.span })
 			Err(error):
 				failure = Some(error)
@@ -259,6 +261,9 @@ private fixed record OperandRange {
 private fixed union ExpressionWork:
 	EnterExpression(ValueExpression, Option[InferenceType])
 	EnterCallable(ValueExpression, Option[InferenceType])
+	ResolveContexts(Int, Int)
+	FinishContext(Int, List[ScopedValue], ExpressionSite, Int)
+	ScheduleVariant(PendingVariantContract, List[ValueExpression], Span)
 	ResolveLambdas(Int, Int)
 	FinishLambda(LambdaFinish)
 	FinishConstructOpaque(OpaqueId, TypeRef, Span)
@@ -295,6 +300,11 @@ private fixed record ListProgress {
 	base_span: Span,
 	span: Span
 }
+
+
+private fixed union ContextWork:
+	AwaitingContext(SuspendedConstruction, InferenceType, List[ScopedValue], ExpressionSite, Span)
+	CompletedContext(PendingValue)
 
 
 private fixed record LambdaAdmission {
@@ -545,7 +555,7 @@ private pure func plan_base(
 	site: ExpressionSite, construction: ConstructionContext, slots: List[InferenceSlot],
 ) -> Result[PlannedBase, CheckError]:
 	match body.base:
-		RecordExpression(fields): plan_record_literal(fields, body.base_span, expectation, construction)
+		RecordExpression(fields): plan_record_literal(fields, body.base_span, expectation, construction, slots)
 
 		ListExpression(elements): plan_list_literal(elements, expectation, body.base_span)
 		VoidExpression: Ok(PlannedLeaf(AcceptedVoid, VoidType))
@@ -573,26 +583,26 @@ private pure func plan_closed_base(
 		NameExpression(name):
 			match named_value(construction.namespace, construction.module, name.id):
 				Some(NamedFunction(_, _)): Ok(PlannedCallable(body, expectation))
-				Some(NamedConstructor(_)): plan_variant(name, [], False, expectation, slots, construction)
+				Some(NamedConstructor(variant)): plan_variant(variant, name, [], False, expectation, slots, construction)
 				Some(NamedConstant(_)): Err(constant_error(body.span, NonClosedInitializer))
 				_: Err(value_error(name.span, UnknownValue(name.id)))
 		DirectApplication(name, arguments):
 			match named_value(construction.namespace, construction.module, name.id):
-				Some(NamedConstructor(_)): plan_variant(name, arguments, True, expectation, slots, construction)
+				Some(NamedConstructor(variant)): plan_variant(variant, name, arguments, True, expectation, slots, construction)
 				_: Err(constant_error(body.span, NonClosedInitializer))
-		QualifiedName(qualified): plan_closed_qualified(qualified, [], False, body, expectation, construction)
-		QualifiedApplication(qualified, arguments): plan_closed_qualified(qualified, arguments, True, body, expectation, construction)
+		QualifiedName(qualified): plan_closed_qualified(qualified, [], False, body, expectation, construction, slots)
+		QualifiedApplication(qualified, arguments): plan_closed_qualified(qualified, arguments, True, body, expectation, construction, slots)
 		_: Err(constant_error(body.span, NonClosedInitializer))
 
 
 private pure func plan_closed_qualified(
 	qualified: ParsedQualified, arguments: List[ValueExpression], called: Bool, body: ValueExpression,
-	expectation: Option[InferenceType], construction: ConstructionContext,
+	expectation: Option[InferenceType], construction: ConstructionContext, slots: List[InferenceSlot],
 ) -> Result[PlannedBase, CheckError]:
 	aliased ?= aliased_module(construction.namespace, construction.module, qualified.module)
 	match offered_value(construction.namespace, aliased.target, qualified.name.id):
 		Ok(OfferedConstructor(variant)):
-			plan_qualified_variant(variant_owner(variant), variant, qualified.name, arguments, called, expectation, construction)
+			plan_qualified_variant(variant_owner(variant), variant, qualified.name, arguments, called, expectation, construction, slots)
 		Ok(OfferedFunction(_)):
 			if called:
 				Err(constant_error(body.span, NonClosedInitializer))
@@ -611,7 +621,7 @@ private pure func plan_body_base(scope: List[ScopedValue], body: ValueExpression
 					match classified:
 						FunctionApplication(contract): Ok(PlannedCall(contract, arguments, ReturnPlacement(body.base_span, body.span), expectation))
 						StoredApplication(callee, contract): Ok(PlannedStoredCall(callee, contract, arguments, ReturnPlacement(body.base_span, body.span), expectation))
-						ConstructorApplication(constructor_name): plan_variant(constructor_name, arguments, True, expectation, slots, construction)
+						ConstructorApplication(variant, constructor_name): plan_variant(variant, constructor_name, arguments, True, expectation, slots, construction)
 				Err(error): Err(error)
 		NameExpression(name):
 			match lookup_binding(scope, name.id):
@@ -637,7 +647,7 @@ private pure func plan_body_base(scope: List[ScopedValue], body: ValueExpression
 								constant_row(context.constants, id).to_result(checker_invariant(name.span, InvalidConstantDeclaration(id))),
 								pure func(row): PlannedLeaf(AcceptedConstant(row.value), row.value.value_type),
 							)
-						Some(NamedConstructor(_)): plan_variant(name, [], False, expectation, slots, construction)
+						Some(NamedConstructor(variant)): plan_variant(variant, name, [], False, expectation, slots, construction)
 						Some(NamedAlias(_)): Err(qualified_error(name.span, BareModuleAlias(name.id)))
 						_: Err(value_error(name.span, UnknownValue(name.id)))
 		QualifiedName(qualified): plan_qualified(qualified, [], False, expectation, slots, context, construction, body)
@@ -702,7 +712,7 @@ private pure func plan_qualified(
 					else:
 						Ok(PlannedLeaf(AcceptedConstant(row.value), row.value.value_type))
 		Ok(OfferedConstructor(variant)):
-			plan_qualified_variant(variant_owner(variant), variant, name, arguments, called, expectation, construction)
+			plan_qualified_variant(variant_owner(variant), variant, name, arguments, called, expectation, construction, slots)
 		Ok(OfferedFunction(function)):
 			if called:
 				match function_contract(context.caller, name, arguments, function, context.signatures):
@@ -931,6 +941,7 @@ private pure func elaborate_value(
 	var bindings: List[BindingDefinition] = []
 	var lambdas = initial_lambdas
 	var lambda_work: List[LambdaWork] = []
+	var context_work: List[ContextWork] = []
 	var inference_revision = 0
 	var slots: List[InferenceSlot] = []
 	var work: List[Option[ExpressionWork]] = [Some(FinishRoot), Some(EnterExpression(body, constructor_type.map(pure func(value): inference_type(value, [], 0))))]
@@ -961,6 +972,7 @@ private pure func elaborate_value(
 											Ok(admitted):
 												lambdas = lambdas.append(CollectingLambda({ parent = context.caller.body, captures = [] }))
 												lambda_work = lambda_work.append(AwaitingLambda(admitted.admission))
+												inference_revision = IntOps.add(inference_revision, 1)
 												value: PendingValue = { span = written.span, readiness = DeferredInference, base = PendingLambda(id),
 													base_type = admitted.value_type, base_span = written.base_span, operations = NoPendingOperations }
 												operands = push_operand(operands, operand_count, value)
@@ -1019,6 +1031,14 @@ private pure func elaborate_value(
 										work_count = IntOps.add(work_count, 1)
 
 										match plan.base:
+											PlannedContext(construct, expected):
+												id = construction_id(context_work.length())
+												context_work = context_work.append(AwaitingContext(construct, expected, scope, site, written.base_span))
+												inference_revision = IntOps.add(inference_revision, 1)
+												value: PendingValue = { span = written.span, readiness = DeferredInference, base = PendingContext(id), base_type = expected, base_span = written.base_span, operations = NoPendingOperations }
+												operands = push_operand(operands, operand_count, value)
+												operand_count = IntOps.add(operand_count, 1)
+
 											PlannedCallable(value, callable_hint):
 												work = push_expression_work(work, work_count, EnterCallable(value, callable_hint))
 												work_count = IntOps.add(work_count, 1)
@@ -1063,20 +1083,8 @@ private pure func elaborate_value(
 												work = push_expression_work(work, work_count, EnterExpression(base, update_hint))
 												work_count = IntOps.add(work_count, 1)
 											PlannedVariant(contract, arguments):
-												range: OperandRange = { start = operand_count, count = arguments.length() }
-												work = push_expression_work(work, work_count, FinishVariant(contract, range, written.span))
+												work = push_expression_work(work, work_count, ScheduleVariant(contract, arguments, written.span))
 												work_count = IntOps.add(work_count, 1)
-												var position = arguments.length()
-												while IntOps.greater_than(position, 0):
-													position = IntOps.subtract(position, 1)
-													match arguments.get(position):
-														None: failure = Some(checker_invariant(contract.span, GenericConstructorContract))
-														Some(argument):
-															match contract.fields.get(position):
-																None: failure = Some(checker_invariant(contract.span, GenericConstructorContract))
-																Some(field):
-																	work = push_expression_work(work, work_count, EnterExpression(argument, Some(field.value_type)))
-																	work_count = IntOps.add(work_count, 1)
 											PlannedStoredCall(callee, contract, arguments, placement, call_hint):
 												call: PendingCall = { target = PendingStored(callee), signature = contract.signature, span = contract.span, variable_start = slots.length() }
 												work = push_expression_work(work, work_count, StartCall(call, arguments, placement, call_hint))
@@ -1111,6 +1119,21 @@ private pure func elaborate_value(
 											PlannedList(elements, source):
 												work = push_expression_work(work, work_count, ContinueList({ source = source, elements = elements, position = 0, start = operand_count, base_span = written.base_span, span = written.span }))
 												work_count = IntOps.add(work_count, 1)
+					ScheduleVariant(contract, arguments, span):
+						range: OperandRange = { start = operand_count, count = arguments.length() }
+						work = push_expression_work(work, work_count, FinishVariant(contract, range, span))
+						work_count = IntOps.add(work_count, 1)
+						var position = arguments.length()
+						while IntOps.greater_than(position, 0):
+							position = IntOps.subtract(position, 1)
+							match arguments.get(position):
+								None: failure = Some(checker_invariant(contract.span, GenericConstructorContract))
+								Some(argument):
+									match contract.fields.get(position):
+										None: failure = Some(checker_invariant(contract.span, GenericConstructorContract))
+										Some(field):
+											work = push_expression_work(work, work_count, EnterExpression(argument, Some(field.value_type)))
+											work_count = IntOps.add(work_count, 1)
 					FinishInterpolation(range, base_span, span):
 						match call_operands(operands, range, base_span):
 							Err(error): failure = Some(error)
@@ -1526,6 +1549,46 @@ private pure func elaborate_value(
 														Ok(child):
 															work = push_expression_work(work, work_count, SolveConstraint(child))
 															work_count = IntOps.add(work_count, 1)
+					ResolveContexts(position, revision):
+						match context_work.get(position):
+							None:
+								work = push_expression_work(work, work_count, ResolveLambdas(0, revision))
+								work_count = IntOps.add(work_count, 1)
+							Some(item):
+								work = push_expression_work(work, work_count, ResolveContexts(IntOps.add(position, 1), revision))
+								work_count = IntOps.add(work_count, 1)
+								match item:
+									CompletedContext(_): void
+									AwaitingContext(construct, expected, local_scope, local_site, span):
+										match inference_head(expected, slots, span):
+											Err(error): failure = Some(error)
+											Ok(CallVariable(_)): void
+											Ok(head):
+												match resume_construction(construct, head, site_construction(local_site), slots):
+													Err(error): failure = Some(error)
+													Ok(plan):
+														work = push_expression_work(work, work_count, FinishContext(position, scope, site, operand_count))
+														work_count = IntOps.add(work_count, 1)
+														scope = local_scope
+														site = local_site
+														match plan:
+															PlannedRecord(literal):
+																work = push_expression_work(work, work_count, ScheduleRecord(literal))
+																work_count = IntOps.add(work_count, 1)
+															PlannedVariant(contract, arguments):
+																work = push_expression_work(work, work_count, ScheduleVariant(contract, arguments, span))
+																work_count = IntOps.add(work_count, 1)
+															_: failure = Some(checker_invariant(span, InvalidInferenceWorklist))
+					FinishContext(position, parent_scope, parent_site, start):
+						match expression_operand(operands, start, body.span):
+							Err(error): failure = Some(error)
+							Ok(value): context_work = context_work.set(position, CompletedContext(value))
+						operands = operands.set(start, None)
+						operand_count = start
+						scope = parent_scope
+						site = parent_site
+						inference_revision = IntOps.add(inference_revision, 1)
+
 					ResolveLambdas(position, revision):
 						match site:
 							ConstantInitializer(_, _): void
@@ -1533,9 +1596,24 @@ private pure func elaborate_value(
 								match lambda_work.get(position):
 									None:
 										if IntOps.equals(revision, inference_revision).not():
-											work = push_expression_work(work, work_count, ResolveLambdas(0, inference_revision))
+											next_resolution: ExpressionWork = if context_work.is_empty():
+												ResolveLambdas(0, inference_revision)
+											else:
+												ResolveContexts(0, inference_revision)
+											work = push_expression_work(work, work_count, next_resolution)
 											work_count = IntOps.add(work_count, 1)
 										else:
+											for pending in context_work:
+												match pending:
+													AwaitingContext(construct, _, _, _, _):
+														error = construction_context_error(construct)
+														match failure:
+															None: failure = Some(error)
+															Some(previous):
+																if IntOps.less_than(error.span.start, previous.span.start):
+																	failure = Some(error)
+													CompletedContext(_): void
+
 											has_unready = lambda_work.any(pure func(item):
 												match item:
 													AwaitingLambda(_): True
@@ -1543,7 +1621,14 @@ private pure func elaborate_value(
 											)
 											if has_unready:
 												match reject_unready_lambdas(lambda_work, slots, context.caller.body):
-													Err(error): failure = Some(error)
+													Err(error):
+														match failure:
+															None: failure = Some(error)
+															Some(context_error):
+																-- Span order chooses diagnostics within this expression;
+																-- it establishes no semantic identity or inference fact.
+																if IntOps.less_than(error.span.start, context_error.span.start):
+																	failure = Some(error)
 													Ok(_): void
 									Some(item):
 										work = push_expression_work(work, work_count, ResolveLambdas(IntOps.add(position, 1), revision))
@@ -1602,6 +1687,7 @@ private pure func elaborate_value(
 									Err(error): failure = Some(error)
 									Ok(value):
 										lambda_work = lambda_work.set(finish.position, InferredLambda(admission, completed_bindings, value))
+										inference_revision = IntOps.add(inference_revision, 1)
 										match inference_head(admission.result, slots, value.span):
 											Err(error): failure = Some(error)
 											Ok(AcceptedType(VoidType)): void
@@ -1620,7 +1706,11 @@ private pure func elaborate_value(
 							Ok(value):
 								work = push_expression_work(work, work_count, FreezeRoot(value))
 								work_count = IntOps.add(work_count, 1)
-								work = push_expression_work(work, work_count, ResolveLambdas(0, inference_revision))
+								progress: ExpressionWork = if context_work.is_empty():
+									ResolveLambdas(0, inference_revision)
+								else:
+									ResolveContexts(0, inference_revision)
+								work = push_expression_work(work, work_count, progress)
 								work_count = IntOps.add(work_count, 1)
 
 								match result_context:
@@ -1632,14 +1722,14 @@ private pure func elaborate_value(
 											result_state = SolvingResultInference
 									None: void
 					FreezeRoot(value):
-						match freeze_lambdas(lambda_work, slots, lambdas):
+						match freeze_lambdas(lambda_work, slots, lambdas, context_work):
 							Err(error): failure = Some(error)
 							Ok(rows):
 								lambdas = rows
 								captures: CaptureScope = match site:
 									BodyExpression(context, _): BodyCaptures(context.caller.body, lambdas)
 									ConstantInitializer(_, _): NoCaptures
-								match freeze_pending_value(value, slots, captures):
+								match freeze_pending_value(value, slots, captures, context_work):
 									Err(error): failure = Some(error)
 									Ok(frozen_value): accepted = Some(frozen_value)
 			_: failure = Some(checker_invariant(body.span, InvalidInferenceWorklist))
@@ -1652,12 +1742,12 @@ private pure func elaborate_value(
 				None: Err(checker_invariant(body.span, InvalidInferenceWorklist))
 
 
-private pure func freeze_pending_values(values: List[PendingValue], slots: List[InferenceSlot], captures: CaptureScope) -> Result[List[CheckedExpr], CheckError]:
+private pure func freeze_pending_values(values: List[PendingValue], slots: List[InferenceSlot], captures: CaptureScope, constructions: List[ContextWork]) -> Result[List[CheckedExpr], CheckError]:
 	var frozen: List[CheckedExpr] = []
 	var failure: Option[CheckError] = None
 
 	for value in values:
-		match freeze_pending_value(value, slots, captures):
+		match freeze_pending_value(value, slots, captures, constructions):
 			Err(error):
 				failure = Some(error)
 				break
@@ -1671,7 +1761,7 @@ private pure func freeze_pending_values(values: List[PendingValue], slots: List[
 
 -- A receiver is written formal0. Its declared formal decides value versus
 -- callable operand; both remain in actual typechecking at the same position.
-private pure func freeze_pending_call(call: PendingCall, values: List[PendingValue], receiver: Option[CheckedExpr], slots: List[InferenceSlot], captures: CaptureScope) -> Result[CheckedCall, CheckError]:
+private pure func freeze_pending_call(call: PendingCall, values: List[PendingValue], receiver: Option[CheckedExpr], slots: List[InferenceSlot], captures: CaptureScope, constructions: List[ContextWork]) -> Result[CheckedCall, CheckError]:
 	var actual = pending_arguments(values)
 	var operands: List[CheckedCallOperand] = []
 	var written_position = if receiver.is_some():
@@ -1707,15 +1797,15 @@ private pure func freeze_pending_call(call: PendingCall, values: List[PendingVal
 					PendingDeclared(owner):
 						match parameter.value_type:
 							CallableType(_, _, _):
-								match freeze_callable_choice(value, slots, captures):
+								match freeze_callable_choice(value, slots, captures, constructions):
 									Ok(choice): operands = operands.append(CallableOperand(callable_parameter(owner, written_position), choice, value.span))
 									Err(error): failure = Some(error)
 							_:
-								match freeze_pending_value(value, slots, captures):
+								match freeze_pending_value(value, slots, captures, constructions):
 									Ok(frozen): operands = operands.append(ValueOperand(frozen))
 									Err(error): failure = Some(error)
 					PendingParameter(_) | PendingStored(_):
-						match freeze_pending_value(value, slots, captures):
+						match freeze_pending_value(value, slots, captures, constructions):
 							Ok(frozen): operands = operands.append(ValueOperand(frozen))
 							Err(error): failure = Some(error)
 		written_position = IntOps.add(written_position, 1)
@@ -1744,8 +1834,8 @@ private pure func freeze_retained_fields(fields: List[PendingRetainedField], slo
 		None: Ok(frozen)
 
 
-private pure func freeze_opaque_operand(operand: PendingValue, expected: TypeRef, site: ExpectedTypeSite, slots: List[InferenceSlot], captures: CaptureScope) -> Result[CheckedExpr, CheckError]:
-	value ?= freeze_pending_value(operand, slots, captures)
+private pure func freeze_opaque_operand(operand: PendingValue, expected: TypeRef, site: ExpectedTypeSite, slots: List[InferenceSlot], captures: CaptureScope, constructions: List[ContextWork]) -> Result[CheckedExpr, CheckError]:
+	value ?= freeze_pending_value(operand, slots, captures, constructions)
 	if same_type(value.value_type, expected):
 		Ok(value)
 	else:
@@ -1755,7 +1845,7 @@ private pure func freeze_opaque_operand(operand: PendingValue, expected: TypeRef
 -- Steps fold over their frozen receiver in source order. The loop keeps the
 -- checker from recursing on chain length.
 private pure func freeze_callable_choice(
-	value: PendingValue, slots: List[InferenceSlot], captures: CaptureScope,
+	value: PendingValue, slots: List[InferenceSlot], captures: CaptureScope, constructions: List[ContextWork],
 ) -> Result[Checked.CallableChoice, CheckError]:
 	match value.base:
 		PendingNamedCallable(id, signature, start):
@@ -1777,7 +1867,7 @@ private pure func freeze_callable_choice(
 						Ok(environment): Ok(LambdaCallable(id, environment))
 						Err(error): Err(error)
 		_:
-			ResultOps.map(freeze_pending_value(value, slots, captures), pure func(frozen): StoredCallable(frozen))
+			ResultOps.map(freeze_pending_value(value, slots, captures, constructions), pure func(frozen): StoredCallable(frozen))
 
 
 private pure func freeze_record_update(
@@ -1786,10 +1876,10 @@ private pure func freeze_record_update(
 	fields: List[PendingRecordField],
 	inherited: List[PendingRetainedField],
 	slots: List[InferenceSlot],
-	captures: CaptureScope,
+	captures: CaptureScope, constructions: List[ContextWork],
 ) -> Result[CheckedRecordUpdate, CheckError]:
-	frozen_base ?= freeze_pending_value(base, slots, captures)
-	replacements ?= freeze_record_fields(fields, slots, captures)
+	frozen_base ?= freeze_pending_value(base, slots, captures, constructions)
+	replacements ?= freeze_record_fields(fields, slots, captures, constructions)
 	frozen_inherited ?= freeze_retained_fields(inherited, slots, expression_span)
 	Ok({ base = frozen_base, base_expression_span = expression_span, replacements = replacements, inherited = frozen_inherited })
 
@@ -1816,11 +1906,11 @@ private pure func concat_checked_parts(parts: List[CheckedExpr], first: Int, cou
 						Ok({ form = InvokeFunction(call), value_type = StringType, span = span })
 
 
-private pure func freeze_interpolated(parts: List[PendingValue], slots: List[InferenceSlot], captures: CaptureScope, span: Span) -> Result[CheckedExpr, CheckError]:
+private pure func freeze_interpolated(parts: List[PendingValue], slots: List[InferenceSlot], captures: CaptureScope, constructions: List[ContextWork], span: Span) -> Result[CheckedExpr, CheckError]:
 	var checked: List[CheckedExpr] = []
 	var failure: Option[CheckError] = None
 	for part in parts:
-		match freeze_pending_value(part, slots, captures):
+		match freeze_pending_value(part, slots, captures, constructions):
 			Err(error):
 				failure = Some(error)
 				break
@@ -1836,10 +1926,16 @@ private pure func freeze_interpolated(parts: List[PendingValue], slots: List[Inf
 	concat_checked_parts(checked, 0, checked.length(), span)
 
 
-private pure func freeze_pending_value(value: PendingValue, slots: List[InferenceSlot], captures: CaptureScope) -> Result[CheckedExpr, CheckError]:
+private pure func freeze_pending_value(value: PendingValue, slots: List[InferenceSlot], captures: CaptureScope, constructions: List[ContextWork]) -> Result[CheckedExpr, CheckError]:
 	base_result: Result[CheckedForm, CheckError] = match value.base:
+		PendingContext(id):
+			match constructions.get(construction_number(id)):
+				Some(CompletedContext(completed)):
+					ResultOps.map(freeze_pending_value(completed, slots, captures, constructions), pure func(frozen): frozen.form)
+				_: Err(checker_invariant(value.span, InvalidInferenceWorklist))
+
 		PendingNamedCallable(_, _, _) | PendingForwardedCallable(_) | PendingLambda(_):
-			ResultOps.map(freeze_callable_choice(value, slots, captures), pure func(choice): MakeCallable(choice))
+			ResultOps.map(freeze_callable_choice(value, slots, captures, constructions), pure func(choice): MakeCallable(choice))
 		AcceptedVoid: Ok(LiteralVoid)
 		AcceptedInteger(integer): Ok(LiteralInteger(integer))
 		AcceptedFloat(number): Ok(LiteralFloat(number))
@@ -1849,41 +1945,41 @@ private pure func freeze_pending_value(value: PendingValue, slots: List[Inferenc
 		AcceptedCapture(id): Ok(ReadCapture(id))
 		PendingCapture(_): Err(checker_invariant(value.span, InvalidInferenceWorklist))
 		PendingConstructOpaque(id, underlying, operand):
-			match freeze_opaque_operand(operand, underlying, OpaqueConstruction(id), slots, captures):
+			match freeze_opaque_operand(operand, underlying, OpaqueConstruction(id), slots, captures, constructions):
 				Ok(frozen_operand): Ok(ConstructOpaque(id, frozen_operand))
 				Err(error): Err(error)
 		PendingProjectOpaque(id, operand):
-			match freeze_opaque_operand(operand, OpaqueType(id), OpaqueProjection(id), slots, captures):
+			match freeze_opaque_operand(operand, OpaqueType(id), OpaqueProjection(id), slots, captures, constructions):
 				Ok(frozen_operand): Ok(ProjectOpaque(id, frozen_operand))
 				Err(error): Err(error)
 		PendingConstructRecord(owner, fields):
-			match freeze_record_fields(fields, slots, captures):
+			match freeze_record_fields(fields, slots, captures, constructions):
 				Ok(frozen): Ok(ConstructRecord(owner, frozen))
 				Err(error): Err(error)
 		PendingUpdateRecord(owner, base, expression_span, fields, inherited):
-			match freeze_record_update(base, expression_span, fields, inherited, slots, captures):
+			match freeze_record_update(base, expression_span, fields, inherited, slots, captures, constructions):
 				Ok(update): Ok(UpdateRecord(owner, update))
 				Err(error): Err(error)
 		PendingConstructVariant(contract, values):
-			match freeze_pending_values(values, slots, captures):
+			match freeze_pending_values(values, slots, captures, constructions):
 				Ok(frozen):
 					match validate_variant_fields(contract, values, slots):
 						Ok(valid): Ok(ConstructVariant(contract.variant, frozen))
 						Err(error): Err(error)
 				Err(error): Err(error)
 		PendingInterpolatedString(values):
-			ResultOps.map(freeze_interpolated(values, slots, captures, value.base_span), pure func(joined): joined.form)
+			ResultOps.map(freeze_interpolated(values, slots, captures, constructions, value.base_span), pure func(joined): joined.form)
 		PendingConstructTuple(values):
-			ResultOps.map(freeze_pending_values(values, slots, captures), pure func(frozen): ConstructTuple(frozen))
+			ResultOps.map(freeze_pending_values(values, slots, captures, constructions), pure func(frozen): ConstructTuple(frozen))
 		PendingConstructList(source, values):
-			match freeze_pending_values(values, slots, captures):
+			match freeze_pending_values(values, slots, captures, constructions):
 				Ok(frozen):
 					match validate_list_elements(source, values, slots, value.base_span):
 						Ok(valid): Ok(ConstructList(frozen))
 						Err(error): Err(error)
 				Err(error): Err(error)
 		PendingDirectCall(call, arguments):
-			ResultOps.map(freeze_pending_call(call, arguments, None, slots, captures), pure func(resolved): InvokeFunction(resolved))
+			ResultOps.map(freeze_pending_call(call, arguments, None, slots, captures, constructions), pure func(resolved): InvokeFunction(resolved))
 	base ?= base_result
 	base_type ?= publish_inference_type(value.base_type, slots, CompleteInference, value.base_span)
 	var current: CheckedExpr = { form = base, value_type = base_type, span = value.base_span }
@@ -1910,7 +2006,7 @@ private pure func freeze_pending_value(value: PendingValue, slots: List[Inferenc
 				failure = Some(checker_invariant(value.span, InvalidInferenceWorklist))
 				break
 			Some(step):
-				match freeze_pending_step(step, current, slots, captures):
+				match freeze_pending_step(step, current, slots, captures, constructions):
 					Err(error):
 						failure = Some(error)
 						break
@@ -1923,12 +2019,12 @@ private pure func freeze_pending_value(value: PendingValue, slots: List[Inferenc
 	Ok(current)
 
 
-private pure func freeze_pending_step(step: PendingStep, receiver: CheckedExpr, slots: List[InferenceSlot], captures: CaptureScope) -> Result[CheckedExpr, CheckError]:
+private pure func freeze_pending_step(step: PendingStep, receiver: CheckedExpr, slots: List[InferenceSlot], captures: CaptureScope, constructions: List[ContextWork]) -> Result[CheckedExpr, CheckError]:
 	form_result: Result[CheckedForm, CheckError] = match step.operation:
 		AcceptedTupleElement(position): Ok(ReadTupleElement(receiver, position))
 		AcceptedField(field): Ok(ReadRecordField(receiver, field))
 		PendingInvocation(call, values):
-			match freeze_pending_call(call, values, Some(receiver), slots, captures):
+			match freeze_pending_call(call, values, Some(receiver), slots, captures, constructions):
 				Ok(resolved): Ok(InvokeFunction(resolved))
 				Err(error): Err(error)
 	form ?= form_result
@@ -2051,8 +2147,8 @@ private pure func classify_direct_call(
 					):
 						Ok(contract): Ok(FunctionApplication(contract))
 						Err(error): Err(error)
-				Some(NamedConstructor(_)):
-					Ok(ConstructorApplication(name))
+				Some(NamedConstructor(variant)):
+					Ok(ConstructorApplication(variant, name))
 				_:
 					Err(call_error(name.span, UnknownFunction(name.id)))
 
@@ -2351,7 +2447,7 @@ private pure func checked_lambda(
 
 -- Inline bodies share their caller's inference slots until the whole expression settles.
 private pure func freeze_lambdas(
-	pending: List[LambdaWork], slots: List[InferenceSlot], rows: List[LambdaRow],
+	pending: List[LambdaWork], slots: List[InferenceSlot], rows: List[LambdaRow], constructions: List[ContextWork],
 ) -> Result[List[LambdaRow], CheckError]:
 	var complete = rows
 	var failure: Option[CheckError] = None
@@ -2361,7 +2457,7 @@ private pure func freeze_lambdas(
 			AwaitingLambda(admission):
 				failure = Some(call_error(admission.written.span, LambdaInputNeedsType))
 			InferredLambda(admission, bindings, value):
-				match freeze_pending_value(value, slots, BodyCaptures(Checked.LambdaBody(admission.id), complete)):
+				match freeze_pending_value(value, slots, BodyCaptures(Checked.LambdaBody(admission.id), complete), constructions):
 					Err(error): failure = Some(error)
 					Ok(frozen):
 						match checked_lambda(admission, bindings, [], CheckedValueBody(ReturnExpression(frozen)), slots, complete):

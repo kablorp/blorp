@@ -35,6 +35,11 @@ the earlier memory, aggregate, generics and recursion plans.
 The compiler-source subset is governed by [AGENTS.md](AGENTS.md); source
 convenience does not remove currently supported input features.
 
+The [Equatable-first trait plan](TRAITS_PLAN.md) describes the proposed static
+trait implementation, focused inference preparation, automatic record/union
+equality, phase boundaries, examples and acceptance gates. Traits remain
+unsupported until those increments land.
+
 The [incremental layout migration](LAYOUT_MIGRATION.md) defines the proposed
 physical-layout model, staged replacements, code examples and cost gates.
 Implementation starts after CI/bootstrap repair and the bounded test migration.
@@ -1414,8 +1419,9 @@ Lexical and layout rules:
   Literal fields constrain those arguments on the same expression-local inference
   state. A field read supplies
   none, and later operations never infer a literal's type through an earlier
-  field read. Earlier generic sibling evidence alone does not choose a record
-  literal's owner. Records pass and return by
+  field read. Within one generic call, a typed sibling supplies a literal's
+  nominal record context in either operand order, including through nested
+  calls. Field names never select an owner. Records pass and return by
   value, including through existing generic functions whose arguments infer
   a concrete record. Copies and whole-binding reassignment preserve old aliases.
 - `match expression:` starts a nonempty sequence of depth-two arms written
@@ -1651,7 +1657,11 @@ Semantic rules:
   `main` cannot declare type parameters. List repeat, length, get, append, set and concat builtin wrappers may be generic; other closed builtin bodies remain nongeneric.
   Direct and UFCS calls solve private call variables structurally, processing
   argument constraints before a declared expected result. Later sibling evidence
-  can solve an earlier pending call. Repeated occurrences, including structural
+  can solve an earlier pending call or supply the nominal context for a
+  record literal or constructor. The initial walk checks available children
+  in written order, then ordinary argument constraints progress before
+  deferred literal children resume. Their fields and payloads are checked
+  once; runtime operands still evaluate once in written order. Repeated occurrences, including structural
   `Box[T]` occurrences, must agree; infinitely nested type equations are rejected.
   Generic forwarding preserves the caller's rigid parameter until specialization.
   Expected results can contextualize nested calls and constructors. A known
@@ -2461,7 +2471,14 @@ diagnostic rendering are pure. The pipeline publishes these complete results:
    caller-owned parameters stay rigid. Closed nested errors are checked before
    later siblings. Deferred descendants finish child-first after solving; a later
    fatal name error can precede their unresolved ambiguity. Publication freezes
-   complete calls and discards the temporary solver.
+   complete calls and discards the temporary solver. A construct waiting for
+   a nominal head retains one expression-local suspension, including its
+   resolved variant identity and lexical scope. Ordinary equations provide
+   that head; the same worklist resumes its fields or payloads once before
+   publication. Unresolved suspensions retain their context diagnostic. If
+   both a construction and a lambda remain unresolved after joint progress
+   stops, the earlier written diagnostic wins. This does not infer a field
+   projection from a call whose result type is still unknown.
    Nominal requirements introduced by generic calls are checked child-first
    during freezing; a later fatal name error can precede that new requirement
    failure. Existing direct List and pure-result readiness checks retain their

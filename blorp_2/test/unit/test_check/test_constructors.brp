@@ -1,8 +1,10 @@
 import:
-	../../../src/check/check: check_errors
+	../../../src/check/check as API: check_errors
+	../../../src/check/model as Model
+	../../../src/utils/ids as Declaration
 	../../../src/check/errors: CheckErrorKind(ConstructorRejection), ConstructorError(VariantNotInExpectedType)
 	../../../src/check/render: render_failure
-	../input: check
+	../input: check, setup_diagnostic
 	../module_input: parse_modules
 	test: TestSuite
 
@@ -42,9 +44,117 @@ pure func test_constructor_of_another_union_is_not_a_variant_of_the_expected_uni
 							False
 
 
+private CHOICE: String =
+	|fixed union Choice[T]:
+	|    Empty
+	|    Full(T)
+	|pure func make() -> Choice[Int]:
+	|    Full(7)
+	|pure func pick[T](left: T, right: T) -> T:
+	|    left
+	|
+
+
+private pure func sibling_constructor_is_checked(arguments: String, constructor_first: Bool) -> Bool:
+	source = CHOICE + "func main() -> Int:\n    selected = pick(" + arguments + ")\n    0\n"
+	match parse_modules([{ source = source, targets = [] }]).and_then(pure func(parsed): check(parsed).map_err(setup_diagnostic)):
+		Err(_): False
+		Ok(program):
+			contents = API.checked_functions(program)
+			match contents.functions:
+				[make, pick, main]:
+					match main.statements:
+						[Model.InitializeBinding(_, value)]:
+							match value.form:
+								Model.InvokeFunction(call):
+									match (call.target, call.operands):
+										(Model.UserFunction(callee, [substitution]), [Model.ValueOperand(left), Model.ValueOperand(right)]):
+											constructor = if constructor_first:
+												left
+											else:
+												right
+											match constructor.form:
+												Model.ConstructVariant(variant, [payload]):
+													match payload.form:
+														Model.LiteralInteger(7):
+															(
+																Declaration.function_number(callee) == Declaration.function_number(pick.id)
+																and Model.same_type(constructor.value_type, make.signature.return_type.value_type)
+																and Declaration.variant_number(variant) == 1
+																and Model.same_type(substitution, make.signature.return_type.value_type)
+																and Model.same_type(payload.value_type, Model.IntType)
+															)
+														_: False
+												_: False
+										_: False
+								_: False
+						_: False
+				_: False
+
+
+pure func test_earlier_sibling_supplies_generic_constructor_context() -> Bool:
+	sibling_constructor_is_checked("make(), Full(7)", False)
+
+
+pure func test_later_sibling_supplies_generic_constructor_context() -> Bool:
+	sibling_constructor_is_checked("Full(7), make()", True)
+
+
+private pure func qualified_sibling_constructor_is_checked(arguments: String) -> Bool:
+	root = "import:\n    ./choice as C\nfunc main() -> Int:\n    selected = C.pick(" + arguments + ")\n    0\n"
+	match parse_modules([{ source = root, targets = [1] }, { source = CHOICE, targets = [] }]).and_then(pure func(parsed): check(parsed).map_err(setup_diagnostic)):
+		Err(_): False
+		Ok(program):
+			match API.checked_functions(program).functions.get(0):
+				Some(main):
+					match main.statements:
+						[Model.InitializeBinding(_, value)]:
+							match value.value_type:
+								Model.AppliedUnionType(_, [Model.IntType]): True
+								_: False
+						_: False
+				None: False
+
+
+pure func test_qualified_generic_constructor_uses_sibling_context_in_both_orders() -> Bool:
+	(
+		qualified_sibling_constructor_is_checked("C.make(), C.Full(7)")
+		and qualified_sibling_constructor_is_checked("C.Full(7), C.make()")
+	)
+
+
+pure func test_qualified_nongeneric_constructor_supplies_its_own_nominal_head() -> Bool:
+	library = "fixed union Choice:\n    Empty\n"
+	root: String =
+		|import:
+		|    ./choice as C
+		|pure func identity[T](value: T) -> T:
+		|    value
+		|func main() -> Int:
+		|    selected = identity(C.Empty)
+		|    0
+		|
+	match parse_modules([{ source = root, targets = [1] }, { source = library, targets = [] }]).and_then(pure func(parsed): check(parsed).map_err(setup_diagnostic)):
+		Err(_): False
+		Ok(program):
+			match API.checked_functions(program).functions.get(1):
+				Some(main):
+					match main.statements:
+						[Model.InitializeBinding(_, value)]:
+							match value.value_type:
+								Model.UnionType(_): True
+								_: False
+						_: False
+				None: False
+
+
 tests: TestSuite = {
 	description = "Blorp 2 constructor planning",
 	tests = [
+		("qualified generic constructor takes sibling context in both orders", test_qualified_generic_constructor_uses_sibling_context_in_both_orders),
+		("qualified nongeneric constructor supplies its own nominal head", test_qualified_nongeneric_constructor_supplies_its_own_nominal_head),
+		("earlier sibling supplies generic constructor context", test_earlier_sibling_supplies_generic_constructor_context),
+		("later sibling supplies generic constructor context", test_later_sibling_supplies_generic_constructor_context),
 		(
 			"constructor of another union is not a variant of the expected union",
 			test_constructor_of_another_union_is_not_a_variant_of_the_expected_union,

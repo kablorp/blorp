@@ -247,12 +247,26 @@ pure func test_contextless_and_unowned_identity_literals_reject() -> Bool:
 		|    value
 		|func main() -> Int:
 		|
-	match (check_failure(prefix + "    identity({ value = 7 }).value\n"), check_failure(prefix + "    { value = 7 }.value\n")):
-		(Some(first), Some(second)):
-			match (first.kind, second.kind):
-				(Errors.RecordRejection(Errors.RecordNeedsExpectedType), Errors.RecordRejection(Errors.RecordNeedsExpectedType)): True
+	(
+		exact_rejection(prefix + "    identity({ value = 7 }).", "value", "\n", "field access requires a record value", "read a declared record field, or use parentheses for a UFCS function call", pure func(kind):
+			match kind:
+				Errors.RecordRejection(Errors.FieldRequiresRecord(Model.ParameterType(parameter))):
+					match Model.parameter_owner(parameter):
+						Model.FunctionDeclaration(owner): Declaration.function_number(owner) == 0 and Model.parameter_position(parameter) == 0
+						_: False
 				_: False
-		_: False
+		)
+		and exact_rejection(prefix + "    ", "{ value = 7 }", ".value\n", "record literal needs an expected record type", "pass the literal to a concrete record parameter or return it from a helper declaring that record", pure func(kind):
+			match kind:
+				Errors.RecordRejection(Errors.RecordNeedsExpectedType): True
+				_: False
+		)
+		and exact_rejection(prefix + "    value = identity(", "{ value = 7 }", ")\n    0\n", "record literal needs an expected record type", "pass the literal to a concrete record parameter or return it from a helper declaring that record", pure func(kind):
+			match kind:
+				Errors.RecordRejection(Errors.RecordNeedsExpectedType): True
+				_: False
+		)
+	)
 
 
 private MARKER: String =
@@ -645,8 +659,93 @@ pure func test_partial_record_application_occurs_check_keeps_finite_origin() -> 
 	)
 
 
-pure func test_record_child_solution_cannot_supply_a_sibling_literal_owner() -> Bool:
-	prefix: String =
+private pure func closed_construction_keeps_argument_origin(declarations: String, first: String) -> Bool:
+	prefix = declarations + "func main() -> Int:\n    f("
+	before_bad = prefix + first + ", "
+	exact_rejection(before_bad, "\"bad\"", ")\n", "argument type does not match the parameter type", "use an expression of type Int here", pure func(kind):
+		match kind:
+			Errors.CallRejection(Errors.GenericArgumentConflict(conflict)):
+				owner_matches = match Model.parameter_owner(conflict.parameter):
+					Model.FunctionDeclaration(owner): Declaration.function_number(owner) == 0 and Model.parameter_position(conflict.parameter) == 0
+					_: False
+				(owner_matches and conflict.mismatch.argument_position == 1
+					and Model.same_type(conflict.previous.value_type, Model.IntType) and Model.same_type(conflict.current.value_type, Model.StringType)
+					and Model.same_type(conflict.mismatch.expected, Model.IntType) and Model.same_type(conflict.mismatch.actual.value_type, Model.StringType)
+					and same_source(conflict.previous.span.source, module_source(root_module_id()))
+					and conflict.previous.span.start == prefix.length() and conflict.previous.span.end == prefix.length() + first.length()
+					and same_source(conflict.current.span.source, module_source(root_module_id()))
+					and conflict.current.span.start == before_bad.length() and conflict.current.span.end == before_bad.length() + 5)
+			_: False
+	)
+
+
+pure func test_closed_record_keeps_argument_origin() -> Bool:
+	closed_construction_keeps_argument_origin("fixed record Box[A] { value: A }\npure func f[A](box: Box[A], other: A) -> Int:\n    0\n", "{ value = 1 }")
+
+
+pure func test_closed_variant_keeps_argument_origin() -> Bool:
+	closed_construction_keeps_argument_origin("fixed union Choice[A]:\n    Value(A)\npure func f[A](choice: Choice[A], other: A) -> Int:\n    0\n", "Value(1)")
+
+
+-- Both children use the actual declaration rows that Check published: the Box
+-- field's typed helper supplies T, and the resumed sibling retains that owner.
+private pure func record_child_publishes_sibling(source: String, literal: Bool) -> Bool:
+	match checked(source):
+		Err(_): False
+		Ok(program):
+			rows = API.checked_functions(program)
+			match (rows.functions, rows.records):
+				([make, inspect, main], records):
+					match main.body:
+						Model.CheckedValueBody(Model.ReturnExpression(value)):
+							match value.form:
+								Model.InvokeFunction(call):
+									match (call.target, call.operands):
+										(Model.UserFunction(target, [argument]), [Model.ValueOperand(left), Model.ValueOperand(right)]):
+											owner_matches = Model.same_type(argument, make.signature.return_type.value_type) and Model.same_type(right.value_type, argument) and Declaration.function_number(target) == Declaration.function_number(inspect.id)
+											left_matches = match (left.form, left.value_type):
+												(Model.ConstructRecord(owner, [field]), Model.AppliedRecordType(applied, [child])):
+													match field.value.form:
+														Model.InvokeFunction(helper):
+															match helper.target:
+																Model.UserFunction(id, []):
+																	(Declaration.function_number(id) == Declaration.function_number(make.id)
+																		and Model.same_type(child, argument)
+																		and Model.same_type(field.value.value_type, argument)
+																		and Declaration.record_number(owner) == Declaration.record_number(applied)
+																		and Declaration.record_number(Model.field_owner(field.field)) == Declaration.record_number(owner)
+																		and Model.field_number(field.field) == 0)
+																_: False
+														_: False
+												_: False
+											right_matches = if literal:
+												match (right.form, records):
+													(Model.ConstructRecord(owner, [field]), [pair, box]):
+														match (pair.fields, field.value.form):
+															([declared], Model.LiteralInteger(7)):
+																(Declaration.record_number(owner) == Declaration.record_number(pair.id)
+																	and Model.field_number(field.field) == Model.field_number(declared.id)
+																	and Declaration.record_number(Model.field_owner(field.field)) == Declaration.record_number(pair.id)
+																	and Model.same_type(field.value.value_type, Model.IntType)
+																	and Model.same_type(left.value_type, Model.AppliedRecordType(box.id, [argument])))
+															_: False
+													_: False
+											else:
+												match (right.form, rows.unions, records):
+													(Model.ConstructVariant(variant, []), [choice, _, _, _], [box]):
+														match choice.variants:
+															[declared]: Model.same_variant(variant, declared.id) and Model.same_type(argument, Model.UnionType(choice.id)) and Model.same_type(left.value_type, Model.AppliedRecordType(box.id, [argument]))
+															_: False
+													_: False
+											owner_matches and left_matches and right_matches and specialized(source).is_ok()
+										_: False
+								_: False
+						_: False
+				_: False
+
+
+pure func test_record_child_solution_supplies_a_sibling_literal_owner() -> Bool:
+	source: String =
 		|fixed record Pair { first: Int }
 		|fixed record Box[T] { value: T }
 		|pure func make_pair() -> Pair:
@@ -654,22 +753,13 @@ pure func test_record_child_solution_cannot_supply_a_sibling_literal_owner() -> 
 		|pure func inspect[T](left: Box[T], right: T) -> Int:
 		|    0
 		|func main() -> Int:
-		|    inspect({ value = make_pair() },${" "}
-	exact_rejection(
-		prefix,
-		"{ first = 7 }",
-		")\n",
-		"record literal needs an expected record type",
-		"pass the literal to a concrete record parameter or return it from a helper declaring that record",
-		pure func(kind):
-			match kind:
-				Errors.RecordRejection(Errors.RecordNeedsExpectedType): True
-				_: False
-	)
+		|    inspect({ value = make_pair() }, { first = 7 })
+		|
+	record_child_publishes_sibling(source, True)
 
 
-pure func test_record_child_solution_cannot_supply_a_sibling_constructor_owner() -> Bool:
-	prefix: String =
+pure func test_record_child_solution_supplies_a_sibling_constructor_owner() -> Bool:
+	source: String =
 		|fixed union Choice:
 		|    First
 		|fixed record Box[T] { value: T }
@@ -678,18 +768,9 @@ pure func test_record_child_solution_cannot_supply_a_sibling_constructor_owner()
 		|pure func inspect[T](left: Box[T], right: T) -> Int:
 		|    0
 		|func main() -> Int:
-		|    inspect({ value = make_choice() },${" "}
-	exact_rejection(
-		prefix,
-		"First",
-		")\n",
-		"constructor needs an expected union type",
-		"pass an already-typed union value or call a concrete helper returning the union",
-		pure func(kind):
-			match kind:
-				Errors.ConstructorRejection(Errors.ConstructorNeedsExpectedType(_)): True
-				_: False
-	)
+		|    inspect({ value = make_choice() }, First)
+		|
+	record_child_publishes_sibling(source, False)
 
 
 private pure func explicit_result_context_publishes_sibling_type(source: String) -> Bool:
@@ -756,8 +837,10 @@ tests: TestSuite = {
 	tests = [
 		("explicit record result keeps sibling nominal hint", test_explicit_record_result_context_keeps_nominal_sibling_hint),
 		("explicit union result keeps sibling nominal hint", test_explicit_union_result_context_keeps_nominal_sibling_hint),
-		("record child cannot establish sibling literal owner", test_record_child_solution_cannot_supply_a_sibling_literal_owner),
-		("record child cannot establish sibling constructor owner", test_record_child_solution_cannot_supply_a_sibling_constructor_owner),
+		("closed record keeps argument origin", test_closed_record_keeps_argument_origin),
+		("closed variant keeps argument origin", test_closed_variant_keeps_argument_origin),
+		("record child supplies sibling literal owner", test_record_child_solution_supplies_a_sibling_literal_owner),
+		("record child supplies sibling constructor owner", test_record_child_solution_supplies_a_sibling_constructor_owner),
 		("ordered parameter syntax and spans", test_ordered_record_parameters_retain_spans_and_names),
 		("record occurs keeps finite origin", test_partial_record_application_occurs_check_keeps_finite_origin),
 		("unknown generic field type", test_unknown_generic_field_annotation_has_exact_diagnostic),
