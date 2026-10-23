@@ -1,18 +1,17 @@
 # Static traits, starting with Equatable
 
-Status: T0 inference, T1 concrete traits and T2 semantic instance identity are
-complete; T3–T5 remain open, 2026-10-22. T1 is qualified for publication;
-its landing is coordinated separately. Original measurement baseline:
-`02b13d25d04b7c5670cb94052ea9675cc9ba3428`. The accepted concrete trait
-surface is defined in README/grammar; bounds, defaults, method values and
-automatic equality below belong to the remaining milestones. Code marked
-**model sketch** describes compiler data, not another input language or an
-additional runtime representation.
+Status: T0 inference, T1 concrete traits, T2 semantic instance identity and
+T3 bounds/defaults/contextual method references are complete. T4 automatic
+structural equality and T5 production-library rollout remain open. Original
+measurement baseline: `02b13d25d04b7c5670cb94052ea9675cc9ba3428`.
+The accepted trait surface and explicit conservative finite-dispatch limits
+are defined in README/grammar. Code marked **model sketch** describes compiler
+data, not another input language or an additional runtime representation.
 
-Completed T1 qualification evidence is retained in the
-[concrete traits report](../benchmarks/results/blorp2-concrete-traits-2026-10-22.md).
-Completed T2 evidence is retained in the
-[semantic instance identity report](../benchmarks/results/blorp2-semantic-instance-keys-2026-10-22.md).
+Completed qualification evidence is retained in the
+[concrete traits report](../benchmarks/results/blorp2-concrete-traits-2026-10-22.md),
+[semantic instance identity report](../benchmarks/results/blorp2-semantic-instance-keys-2026-10-22.md)
+and [bounds/defaults report](../benchmarks/results/blorp2-trait-bounds-2026-10-22.md).
 
 This is the single plan for the open work. Delete completed milestone
 instructions as they land; retain semantic rules in README/grammar and
@@ -535,6 +534,15 @@ Project symbolic trait edges through the accepted receiver-to-body argument
 mapping into the existing finite-instantiation analysis. Merely adding a
 TraitMethod match arm to its current FunctionId-only call observer is insufficient.
 
+The completed T3 implementation uses a sufficient constructor-depth proof. Existing
+phase regressions admit List/Tree and mutual aggregate dispatch, but explicitly
+reject a finite Box-to-Wrap relay and a generic field with three nested Lists.
+These diagnostics are conservative admission limits, not evidence that the
+source necessarily expands forever. The ordinary deeply nested generic-field
+case is a T4 completion blocker; do not claim structural equality complete
+while it remains rejected. No solver redesign or downstream trait mechanism is
+introduced to hide that limit.
+
 List equality is an ordinary bounded implementation, not compiler derivation
 or a generic runtime hook. Keep the algorithm linear without zipped/copied Lists.
 
@@ -621,22 +629,20 @@ framework. References were checked on 2026-10-22.
 
 No parse-only scaffolding milestone lands by itself. Each milestone includes
 its complete producer/consumer path, exact diagnostics, reference/EBNF updates,
-two independent reviews and one coherent commit. T0, T1 and T2 are complete;
-T3 must land before T4. The table contains only open milestones.
+two independent reviews and one coherent commit. T0 through T3 are complete.
+The table contains only open milestones.
 
-Start each remaining milestone with its red oracle. T3 adds the missing-bound
-rejection before admission; T4 starts with a derived
+Start each remaining milestone with its red oracle. T4 starts with a derived
 container whose nested authored equality intentionally differs from fieldwise
 comparison. Do not remove old negative coverage merely to turn a suite green.
 
 | Milestone | Deliverable and changed boundary | Completion oracle |
 | --- | --- | --- |
-| T3: bounds/defaults/callables | Function/receiver bounds; default bodies; contextual method references; accepted symbolic target | Generic forwarding works, missing bounds reject without callers; default dispatch honors override; callbacks keep evaluation order/purity |
 | T4: structural equality | Ordinary derived record/union templates, dependency closure, ordinary List prerequisite in isolated fixture library | Recursive/custom/phantom/invalid-field cases below pass; no trait-specific concrete/lower products |
 | T5: production library rollout | Qualify/publish/pin capable seed, then migrate target library APIs | Clean bootstrap/fixpoint and all component/native/platform gates pass without legacy building Blorp 2 |
 
 The accepted canonical equals-only declaration validates the exact pure
-Self/Self -> Bool contract. T3 adds the ordinary not_equals default. No magic
+Self/Self -> Bool contract. T3 supports the ordinary not_equals default. No magic
 semantics are attached to any other method spelling.
 
 ### Acceptance matrix
@@ -674,7 +680,7 @@ scripts/compiler-build-status
 bin/blorp test --std-dir standard_library/src --suite --timeout 180 \
   blorp_2/test/unit/test_check/test_records.brp
 
-# T3–T4 extend these ordinary suites; run the relevant owner first.
+# Extend these ordinary suites for T4; run the relevant owner first.
 bin/blorp test --std-dir standard_library/src --suite --timeout 180 \
   blorp_2/test/unit/test_parse/test_traits.brp \
   blorp_2/test/unit/test_check/test_traits.brp \
@@ -740,6 +746,13 @@ T0–T4, investigate the forecast at +1,500, and report gross ADD/DEL/net per
 milestone with tests/library/docs separately. This is a complexity guard,
 not a target; never compress formatting or delete coverage to meet it.
 Required test growth is reviewed for value rather than forced into that cap.
+
+Current cumulative production growth is +2,158 net lines. T3 accepted a bounded
++2,200 envelope after investigation, recording the 158-line variance against the
+original +2,000 envelope. Its matched cumulative allocation growth is +0.646%
+and normal retired-instruction growth +0.331%, within the unchanged +5% ceilings.
+T4 needs a prospective reviewed complexity envelope before implementation; do
+not compress formatting or remove coverage to conceal growth.
 
 Freeze baseline sources/library, CWD/output pathname, environment, seed,
 normal/diagnostic binaries and C toolchain. Use one strict original/candidate

@@ -39,7 +39,8 @@ import:
 		ParsedBody(ParsedBuiltinBody, ParsedValueBody, ParsedMatchBody),
 		ParsedBuiltinType(IntegerBuiltin, FloatBuiltin, StringBuiltin, VoidBuiltin, ListBuiltin),
 		ParsedConstant,
-		ParsedFunction, ParsedTrait, ParsedTraitMethod, ParsedImplementationHeader,
+		ParsedFunction, ParsedTrait, ParsedTraitMethod(AbstractTraitMethod, DefaultTraitMethod), ParsedImplementationHeader,
+		ParsedTypeParameter, ParsedReceiverHead(ReceiverName, QualifiedReceiverName),
 		ParsedFunctionGroup(FreeFunction, ImplementationGroup),
 		ParsedMatchArm,
 		ParsedOpaque,
@@ -71,7 +72,7 @@ import:
 		Symbol(
 			Wildcard, LeftParen, RightParen, Dot, Arrow, Colon, Newline, Indent, Dedent,
 			Equals, QuestionEquals, LeftBracket, RightBracket, LeftBrace, RightBrace,
-			Bar, Comma, AtSign, Slash, Star, DotDot, Ellipsis,
+			Bar, Comma, AtSign, Slash, Star, Plus, DotDot, Ellipsis,
 		),
 		Token,
 		TokenKind(IdentifierToken, KeywordToken, SymbolToken, IntegerLiteral, FloatLiteral, QuotedString, PipeString, StringStart, StringSegment, InterpolationOpen, InterpolationClose, StringEnd, CharLiteral),
@@ -335,6 +336,12 @@ private pure func at_newline(state: ParserState) -> Bool:
 			True
 		_:
 			False
+
+
+private pure func at_plus(state: ParserState) -> Bool:
+	match current_symbol(state):
+		Some(Plus): True
+		_: False
 
 
 private pure func at_slash(state: ParserState) -> Bool:
@@ -1519,7 +1526,9 @@ private pure func consume_tuple_index(state: ParserState) -> Result[ParsedPostfi
 private pure func consume_chain(state: ParserState, applications: List[PostfixOperation], end: Int, owned: Int) -> Result[ParsedPostfixes, Diagnostic]:
 	after_newline = shifted(state, 1)
 
-	if at_left_bracket(state):
+	if at_plus(state):
+		Err(expected_syntax(state, "'+' is only supported between trait bounds", "use a named arithmetic function in expressions; write multiple bounds as T: First + Second"))
+	else if at_left_bracket(state):
 		match consume_tuple_index(state):
 			Ok(postfix): consume_chain(postfix.next, applications.append(postfix.operation), postfix.end, owned)
 			Err(error): Err(error)
@@ -2269,7 +2278,8 @@ private pure func consume_parameter_list(
 
 private pure func consume_parameters(start: ParserState) -> Result[ParsedParameters, Diagnostic]:
 	listed: ParsedParameters ?= if at_right_paren(start):
-		Ok({ parameters = [], next = start })
+		empty: ParsedParameters = { parameters = [], next = start }
+		Ok(empty)
 	else:
 		consume_parameter_list(start, "expected a parameter name or ')'", [])
 	closed ?= expect(listed.next, at_right_paren(listed.next), "expected ')' after the parameters", "separate explicitly typed parameters with commas, then close with ')'")
@@ -3338,6 +3348,44 @@ private pure func consume_type_parameters(state: ParserState) -> Result[NameList
 		Ok({ names = [], next = state })
 
 
+private fixed record BoundedParameters {
+	parameters: List[ParsedTypeParameter],
+	next: ParserState
+}
+
+
+private pure func consume_parameter_bounds(state: ParserState, bounds: List[TypeSyntax]) -> Result[ParsedTypes, Diagnostic]:
+	bound ?= consume_type(state, "expected a trait name after ':' or '+'")
+	gathered = bounds.append(bound.written)
+	match current_symbol(bound.next):
+		Some(Plus): consume_parameter_bounds(shifted(bound.next, 1), gathered)
+		_: Ok({ types = gathered, next = bound.next })
+
+
+private pure func consume_bounded_parameter_list(state: ParserState, parameters: List[ParsedTypeParameter]) -> Result[BoundedParameters, Diagnostic]:
+	name ?= consume_type_parameter(state)
+	bounds: ParsedTypes ?= if at_colon(name.next):
+		consume_parameter_bounds(shifted(name.next, 1), [])
+	else:
+		Ok({ types = [], next = name.next })
+	parameter: ParsedTypeParameter = { name = name.name, bounds = bounds.types }
+	gathered = parameters.append(parameter)
+	match list_separator(bounds.next):
+		ListContinues(next): consume_bounded_parameter_list(next, gathered)
+		ListEnds(next):
+			if at_right_bracket(next):
+				Ok({ parameters = gathered, next = shifted(next, 1) })
+			else:
+				Err(expected_syntax(next, "expected ',' or ']' after a type parameter", "separate type parameters with commas and close the list with ']'"))
+
+
+private pure func consume_bounded_parameters(state: ParserState) -> Result[BoundedParameters, Diagnostic]:
+	if at_left_bracket(state):
+		consume_bounded_parameter_list(shifted(state, 1), [])
+	else:
+		Ok({ parameters = [], next = state })
+
+
 private fixed record ParsedReturnAnnotation {
 	written: Option[TypeSyntax],
 	next: ParserState
@@ -3376,7 +3424,7 @@ private pure func consume_signature(start: ParserState) -> Result[HeaderResult, 
 		Impure:
 			expect(start, at_func(start), "expected a function declaration at column 1", "start with func main() -> Int:")
 	function ?= consume_callable_name(after_func, "expected a function name")
-	type_parameters ?= consume_type_parameters(function.next)
+	type_parameters ?= consume_bounded_parameters(function.next)
 	after_open ?= expect(type_parameters.next, at_left_paren(type_parameters.next), "expected '(' after the function name", "write main() or helper(value: Int)")
 	parameters ?= consume_parameters(after_open)
 	return_type ?= consume_return_annotation(parameters.next)
@@ -3384,7 +3432,7 @@ private pure func consume_signature(start: ParserState) -> Result[HeaderResult, 
 		header = {
 			purity = purity,
 			function_name = function.name,
-			type_parameters = type_parameters.names,
+			type_parameters = type_parameters.parameters,
 			parameters = parameters.parameters,
 			return_type = return_type.written
 		},
@@ -3476,20 +3524,39 @@ private fixed record ParsedTraitMethods {
 }
 
 
-private pure func consume_trait_methods(state: ParserState, methods: List[ParsedTraitMethod]) -> Result[ParsedTraitMethods, Diagnostic]:
-	signature ?= consume_signature(state)
-	signature_only: Void ?= if at_colon(signature.next):
-		Err(expected_syntax(signature.next, "trait method defaults are not supported yet", "declare the signature only"))
-	else:
-		Ok(void)
-	next ?= consume_line_end(signature.next, "expected a newline after the trait method signature", "put each method signature on its own indented line")
+private pure func consume_default_trait_method(state: ParserState, signature: HeaderResult, module: ModuleId, visibility: Visibility) -> Result[ParsedTraitMethods, Diagnostic]:
+	after_colon = shifted(signature.next, 1)
+	newline ?= expect(after_colon, at_newline(after_colon), "expected a newline after the default method header", "put the return expression on the next line")
+	opened ?= expect(newline, at_indent(newline), INDENTED_BLOCK_MESSAGE, INDENTED_BLOCK_HELP)
+	body ?= consume_function_lines(opened)
+	function: ParsedFunction = {
+		module = module, visibility = visibility, tail_annotation = None,
+		purity = signature.header.purity, function_name = signature.header.function_name,
+		type_parameters = signature.header.type_parameters, parameters = signature.header.parameters,
+		return_type = signature.header.return_type, statements = body.statements, body = body.body
+	}
 	span = { parser_span(state) | end = parser_span(signature.next).start }
-	method: ParsedTraitMethod = { header = signature.header, span = span }
-	gathered = methods.append(method)
-	if at_dedent(next):
-		Ok({ methods = gathered, next = shifted(next, 1) })
+	Ok({ methods = [DefaultTraitMethod(function, span)], next = body.next })
+
+
+private pure func consume_trait_method(state: ParserState, module: ModuleId, visibility: Visibility) -> Result[ParsedTraitMethods, Diagnostic]:
+	signature ?= consume_signature(state)
+	span = { parser_span(state) | end = parser_span(signature.next).start }
+	if at_colon(signature.next):
+		consume_default_trait_method(state, signature, module, visibility)
 	else:
-		consume_trait_methods(next, gathered)
+		match consume_line_end(signature.next, "expected a newline after the trait method signature", "put each method signature on its own indented line"):
+			Ok(next): Ok({ methods = [AbstractTraitMethod(signature.header, span)], next = next })
+			Err(error): Err(error)
+
+
+private pure func consume_trait_methods(state: ParserState, module: ModuleId, visibility: Visibility, methods: List[ParsedTraitMethod]) -> Result[ParsedTraitMethods, Diagnostic]:
+	method ?= consume_trait_method(state, module, visibility)
+	gathered = methods.concat(method.methods)
+	if at_dedent(method.next):
+		Ok({ methods = gathered, next = shifted(method.next, 1) })
+	else:
+		consume_trait_methods(method.next, module, visibility, gathered)
 
 
 private fixed record TraitResult {
@@ -3507,7 +3574,7 @@ private pure func consume_trait(start: ParserState, module: ModuleId, visibility
 	colon ?= expect(name.next, at_colon(name.next), "expected ':' after the trait name", "write trait Equatable: followed by indented method signatures")
 	newline ?= expect(colon, at_newline(colon), "expected a newline after the trait header", "put each method signature on its own indented line")
 	opened ?= expect(newline, at_indent(newline), "expected an indented trait method", "declare at least one pure method signature")
-	methods ?= consume_trait_methods(opened, [])
+	methods ?= consume_trait_methods(opened, module, visibility, [])
 	Ok({
 		declaration = {
 			module = module, visibility = visibility, type_name = name.name,
@@ -3539,23 +3606,59 @@ private fixed record ImplementationResult {
 }
 
 
+private fixed record ReceiverHeadResult {
+	head: ParsedReceiverHead,
+	next: ParserState
+}
+
+
+private pure func consume_receiver_head(state: ParserState) -> Result[ReceiverHeadResult, Diagnostic]:
+	name ?= consume_name(state, "expected a named implementation receiver")
+	if at_dot(name.next):
+		match consume_name(shifted(name.next, 1), "expected a receiver type after the module alias and '.'"):
+			Ok(member): Ok({ head = QualifiedReceiverName({ module = name.name, name = member.name }), next = member.next })
+			Err(error): Err(error)
+	else:
+		Ok({ head = ReceiverName(name.name), next = name.next })
+
+
+private pure func consume_authored_implementation(state: ParserState, module: ModuleId, visibility: Visibility) -> Result[ImplementationMethods, Diagnostic]:
+	after_colon = shifted(state, 1)
+	newline ?= expect(after_colon, at_newline(after_colon), "expected a newline after the implementation header", "put each method body on its own indented line")
+	opened ?= expect(newline, at_indent(newline), "expected an indented implementation method", "define at least one method after ':', or omit ':' to use only trait defaults")
+	consume_implementation_methods(opened, module, visibility, [])
+
+
+private pure func consume_implementation_body(state: ParserState, module: ModuleId, visibility: Visibility) -> Result[ImplementationMethods, Diagnostic]:
+	if at_colon(state):
+		consume_authored_implementation(state, module, visibility)
+	else if at_end(state):
+		Ok({ methods = [], next = state })
+	else:
+		match consume_line_end(state, "expected ':' or a newline after the implementation receiver", "add ':' before authored methods, or end the line to use only trait defaults"):
+			Ok(next): Ok({ methods = [], next = next })
+			Err(error): Err(error)
+
+
 private pure func consume_implementation(start: ParserState, module: ModuleId, visibility: Visibility) -> Result[ImplementationResult, Diagnostic]:
 	after_keyword = shifted(start, 1)
-	trait_start: ParserState ?= if at_left_bracket(after_keyword):
-		Err(expected_syntax(after_keyword, "generic implementations are not supported yet", "implement a concrete receiver type"))
+	requirement: ParsedType ?= if at_left_bracket(after_keyword):
+		Err(expected_syntax(after_keyword, "implementation parameters belong after the receiver head", "write implements Equatable for Box[T: Equatable]"))
 	else:
-		Ok(after_keyword)
-	requirement ?= consume_type(trait_start, "expected the implemented trait name")
+		consume_type(after_keyword, "expected the implemented trait name")
 	after_for ?= expect(requirement.next, at_for(requirement.next), "expected 'for' after the trait name", "write implements Equatable for Int:")
-	receiver ?= consume_type(after_for, "expected the implementation receiver type")
-	colon ?= expect(receiver.next, at_colon(receiver.next), "expected ':' after the implementation receiver", "put each method body on its own indented line")
-	newline ?= expect(colon, at_newline(colon), "expected a newline after the implementation header", "put each method body on its own indented line")
-	opened ?= expect(newline, at_indent(newline), "expected an indented implementation method", "define the trait's methods with ordinary function bodies")
-	methods ?= consume_implementation_methods(opened, module, visibility, [])
+	receiver ?= consume_receiver_head(after_for)
+	parameters ?= consume_bounded_parameters(receiver.next)
+	methods ?= consume_implementation_body(parameters.next, module, visibility)
+	header_end = if at_colon(parameters.next):
+		parser_span(shifted(parameters.next, 1)).start
+	else:
+		parser_span(parameters.next).start
 	Ok({
 		header = {
 			module = module, visibility = visibility, trait_name = requirement.written,
-			receiver = receiver.written, span = { parser_span(start) | end = parser_span(colon).start }
+			receiver = receiver.head, type_parameters = parameters.parameters,
+			span = { parser_span(start) | end = header_end }
 		},
 		methods = methods.methods,
 		next = methods.next

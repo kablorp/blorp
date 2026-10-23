@@ -1,0 +1,146 @@
+import:
+	../../../src/check/check: check
+	../../../src/specialize/specialize as Concrete
+	../module_input: parse_modules_with_base, test_base
+	test: TestSuite
+
+
+private VISIT: String =
+	|trait Visit:
+	|    pure func visit(value: Self) -> Int
+	|opaque type First = Int
+	|opaque type Second = Int
+	|implements Visit for First:
+	|    pure func visit(value: Self) -> Int:
+	|        7
+	|implements Visit for Second:
+	|    pure func visit(value: Self) -> Int:
+	|        9
+	|
+
+
+private pure func returns_integer(function: Concrete.ConcreteFunction, expected: Int) -> Bool:
+	match function.body:
+		Concrete.ConcreteValueBody(Concrete.ReturnExpression(value)):
+			match value.form:
+				Concrete.LiteralInteger(actual): actual == expected
+				_: False
+		_: False
+
+
+private pure func integer_argument(function: Concrete.ConcreteFunction) -> Bool:
+	match function.signature.parameters:
+		[Concrete.IntType]: Concrete.same_type(function.signature.return_type, Concrete.IntType)
+		_: False
+
+
+private pure func routed_literal(functions: List[Concrete.ConcreteFunction], target: Concrete.FunctionInstanceId, expected: Int) -> Bool:
+	match functions.get(Concrete.function_number(target)):
+		None: False
+		Some(route):
+			match route.body:
+				Concrete.ConcreteValueBody(Concrete.ReturnExpression(value)):
+					match value.form:
+						Concrete.InvokeFunction(call, [_]):
+							match call.target:
+								Concrete.UserFunction(selected):
+									match functions.get(Concrete.function_number(selected)):
+										None: False
+										Some(body): integer_argument(route) and integer_argument(body) and returns_integer(body, expected)
+								_: False
+						_: False
+				_: False
+
+
+pure func test_same_storage_receivers_select_distinct_bodies_and_reuse_equal_keys() -> Bool:
+	body_source: String =
+		|pure func route[Element: Visit](value: Element) -> Int:
+		|    visit(value)
+		|func main() -> Int:
+		|    first = route(into_opaque First(1))
+		|    second = route(into_opaque Second(2))
+		|    repeated = route(into_opaque First(3))
+		|    0
+		|
+	match parse_modules_with_base([{ source = VISIT + body_source, targets = [] }], test_base()):
+		Err(_): False
+		Ok(parsed):
+			match check(parsed):
+				Err(_): False
+				Ok(checked):
+					match Concrete.specialize(checked):
+						Err(_): False
+						Ok(program):
+							functions = Concrete.specialized_contents(program).functions
+							match functions:
+								[main, _, _, _, _]:
+									match main.statements:
+										[Concrete.InitializeBinding(_, first), Concrete.InitializeBinding(_, second), Concrete.InitializeBinding(_, repeated)]:
+											match (first.form, second.form, repeated.form):
+												(Concrete.InvokeFunction(a, [_]), Concrete.InvokeFunction(b, [_]), Concrete.InvokeFunction(c, [_])):
+													match (a.target, b.target, c.target):
+														(Concrete.UserFunction(left), Concrete.UserFunction(right), Concrete.UserFunction(again)):
+															(
+																Concrete.function_number(left) != Concrete.function_number(right)
+																and Concrete.function_number(left) == Concrete.function_number(again)
+																and routed_literal(functions, left, 7)
+																and routed_literal(functions, right, 9)
+															)
+														_: False
+												_: False
+										_: False
+								_: False
+
+
+pure func test_a_returned_method_value_uses_its_ground_semantic_receiver() -> Bool:
+	body_source: String =
+		|pure func reference[Element: Visit](witness: Element) -> pure (Element) -> Int:
+		|    visit
+		|func main() -> Int:
+		|    first = reference(into_opaque First(1))
+		|    second = reference(into_opaque Second(2))
+		|    repeated = reference(into_opaque First(3))
+		|    first_result = first(into_opaque First(4))
+		|    second_result = second(into_opaque Second(5))
+		|    repeated_result = repeated(into_opaque First(6))
+		|    0
+		|
+	match parse_modules_with_base([{ source = VISIT + body_source, targets = [] }], test_base()):
+		Err(_): False
+		Ok(parsed):
+			match check(parsed):
+				Err(_): False
+				Ok(checked):
+					match Concrete.specialize(checked):
+						Err(_): False
+						Ok(program):
+							functions = Concrete.specialized_contents(program).functions
+							var selected: List[Concrete.FunctionInstanceId] = []
+							for function in functions:
+								match function.body:
+									Concrete.ConcreteValueBody(Concrete.ReturnExpression(value)):
+										match value.form:
+											Concrete.FreeCallable(target): selected = selected.append(target)
+											_: void
+									_: void
+							match selected:
+								[first, second]:
+									match (functions.get(Concrete.function_number(first)), functions.get(Concrete.function_number(second))):
+										(Some(left), Some(right)):
+											(
+												functions.length() == 5
+												and Concrete.function_number(first) != Concrete.function_number(second)
+												and integer_argument(left) and integer_argument(right)
+												and returns_integer(left, 7) and returns_integer(right, 9)
+											)
+										_: False
+								_: False
+
+
+tests: TestSuite = {
+	description = "Blorp 2 bounded trait specialization and semantic callable identity",
+	tests = [
+		("same storage receivers select distinct ordinary bodies", test_same_storage_receivers_select_distinct_bodies_and_reuse_equal_keys),
+		("returned method values use their ground semantic receiver", test_a_returned_method_value_uses_its_ground_semantic_receiver),
+	]
+}

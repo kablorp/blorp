@@ -1,0 +1,211 @@
+import:
+	../../../src/check/check: check, check_errors, checked_functions
+	../../../src/check/model as Model
+	../../../src/check/errors: CheckErrorKind(TraitRejection, TypeDeclarationRejection, CallRejection), CallError(UnknownFunction), TraitError(ImpureRequirement, FirstParameterMustBeSelf), TypeDeclarationError(TypeParameterTypeNameConflict)
+	../../../src/check/render: render_failure
+	../../../src/parse/assemble: parsed_contents
+	../../../src/utils/ids: inventory_traits, inventory_implementations, inventory_functions, trait_method_header, same_trait_method, function_number, TraitMethodDeclaration(DefaultMethod)
+	../../../src/utils/names: same_name, name_spelling
+	../../../src/utils/syntax: same_span, type_span, ParsedBody(ParsedValueBody), ExpressionBase(DirectApplication)
+	../module_input: parse_modules_with_base, test_base
+	test: TestSuite
+
+
+private REQUIREMENT: String =
+	|trait Equatable:
+	|    pure func equals(left: Self, right: Self) -> Bool
+	|implements Equatable for Int:
+	|    pure func equals(left: Self, right: Self) -> Bool:
+	|        builtin("int.equals")
+	|
+
+
+pure func test_impure_generic_default_reports_purity_before_genericity() -> Bool:
+	source: String =
+		|trait Observe:
+		|    func observe[Element](value: Self) -> Int:
+		|        7
+		|func main() -> Int:
+		|    0
+		|
+	match parse_modules_with_base([{ source = source, targets = [] }], test_base()):
+		Err(_): False
+		Ok(parsed):
+			contents = parsed_contents(parsed)
+			match (inventory_traits(contents.declarations), check(parsed)):
+				([owner], Err(failure)):
+					match owner.methods:
+						[method]:
+							match trait_method_header(method, contents.declarations):
+								None: False
+								Some(header):
+									error = check_errors(failure).first
+									diagnostic = render_failure(failure).first
+									match error.kind:
+										TraitRejection(ImpureRequirement(id)):
+											(
+												same_trait_method(id, method.id)
+												and same_span(error.span, header.function_name.span)
+												and same_span(diagnostic.span, header.function_name.span)
+												and diagnostic.message == "trait requirements must be pure"
+												and diagnostic.help == "declare a pure func requirement and a pure implementation"
+												and diagnostic.note.is_none()
+											)
+										_: False
+						_: False
+				_: False
+
+
+pure func test_wrong_first_self_precedes_invalid_default_result() -> Bool:
+	source: String =
+		|trait Observe:
+		|    pure func observe(value: Int) -> Missing:
+		|        7
+		|func main() -> Int:
+		|    0
+		|
+	match parse_modules_with_base([{ source = source, targets = [] }], test_base()):
+		Err(_): False
+		Ok(parsed):
+			contents = parsed_contents(parsed)
+			match (inventory_traits(contents.declarations), check(parsed)):
+				([owner], Err(failure)):
+					match owner.methods:
+						[method]:
+							match trait_method_header(method, contents.declarations):
+								None: False
+								Some(header):
+									match header.parameters:
+										[parameter]:
+											error = check_errors(failure).first
+											diagnostic = render_failure(failure).first
+											match error.kind:
+												TraitRejection(FirstParameterMustBeSelf(id)):
+													(
+														same_trait_method(id, method.id)
+														and same_span(error.span, type_span(parameter.type_name))
+														and same_span(diagnostic.span, type_span(parameter.type_name))
+														and diagnostic.message == "a trait method's first parameter must be Self"
+														and diagnostic.help == "write a first parameter such as value: Self"
+														and diagnostic.note.is_none()
+													)
+												_: False
+										_: False
+						_: False
+				_: False
+
+
+pure func test_receiver_binder_cannot_mask_implicit_self() -> Bool:
+	family_source: String =
+		|fixed record Box[Element] { value: Element }
+		|implements Equatable for Box[Self: Equatable]
+		|func main() -> Int:
+		|    0
+		|
+	source = REQUIREMENT + family_source
+	match parse_modules_with_base([{ source = source, targets = [] }], test_base()):
+		Err(_): False
+		Ok(parsed):
+			match (inventory_implementations(parsed_contents(parsed).declarations), check(parsed)):
+				([_, family], Err(failure)):
+					match family.header.type_parameters:
+						[parameter]:
+							error = check_errors(failure).first
+							diagnostic = render_failure(failure).first
+							match error.kind:
+								TypeDeclarationRejection(TypeParameterTypeNameConflict(name)):
+									(
+										same_name(name, parameter.name.id)
+										and same_span(error.span, parameter.name.span)
+										and same_span(diagnostic.span, parameter.name.span)
+										and diagnostic.message == "type parameter conflicts with a type name"
+										and diagnostic.help == "choose a distinct type parameter name, such as T"
+										and diagnostic.note.is_none()
+									)
+								_: False
+						_: False
+				_: False
+
+
+
+pure func test_free_function_may_name_its_generic_self() -> Bool:
+	source: String =
+		|pure func identity[Self](value: Self) -> Self:
+		|    value
+		|func main() -> Int:
+		|    0
+		|
+	match parse_modules_with_base([{ source = source, targets = [] }], test_base()):
+		Err(_): False
+		Ok(parsed):
+			match check(parsed):
+				Err(_): False
+				Ok(program):
+					match (inventory_functions(parsed_contents(parsed).declarations), checked_functions(program).functions):
+						([written_identity, _], [identity, _]):
+							match (written_identity.declaration.type_parameters, identity.signature.type_parameters):
+								([written], [parameter]):
+									(
+										name_spelling(parsed_contents(parsed).names, written.name.id) == Some("Self")
+										and Model.same_parameter(parameter, Model.type_parameter_id(Model.FunctionDeclaration(identity.id), 0))
+										and Model.same_type(identity.signature.return_type.value_type, Model.ParameterType(parameter))
+										and identity.signature.requirements.is_empty()
+									)
+								_: False
+						_: False
+
+
+pure func test_an_unused_default_body_still_checks_its_called_name() -> Bool:
+	source: String =
+		|trait Observe:
+		|    pure func observe(value: Self) -> Int:
+		|        missing_default_helper()
+		|func main() -> Int:
+		|    0
+		|
+	match parse_modules_with_base([{ source = source, targets = [] }], test_base()):
+		Err(_): False
+		Ok(parsed):
+			contents = parsed_contents(parsed)
+			match (inventory_traits(contents.declarations), inventory_functions(contents.declarations), check(parsed)):
+				([owner], [_, written], Err(failure)):
+					match owner.methods:
+						[method]:
+							match (method.declaration, written.declaration.body):
+								(DefaultMethod(default_id), ParsedValueBody(value)):
+									match value.base:
+										DirectApplication(name, _):
+											errors = check_errors(failure)
+											diagnostics = render_failure(failure)
+											error = errors.first
+											diagnostic = diagnostics.first
+											match error.kind:
+												CallRejection(UnknownFunction(actual)):
+													(
+														function_number(default_id) == function_number(written.id)
+														and same_name(actual, name.id)
+														and same_span(error.span, name.span)
+														and same_span(diagnostic.span, name.span)
+														and errors.remaining.is_empty()
+														and diagnostics.remaining.is_empty()
+														and diagnostic.message == "unknown function"
+														and diagnostic.help == "declare the function locally or import it by name; type selections enable receiver calls only"
+														and diagnostic.note.is_none()
+													)
+												_: False
+										_: False
+								_: False
+						_: False
+				_: False
+
+
+tests: TestSuite = {
+	description = "Blorp 2 default contract precedence and implicit Self",
+	tests = [
+		("impure generic default reports purity first", test_impure_generic_default_reports_purity_before_genericity),
+		("wrong first Self precedes an invalid default result", test_wrong_first_self_precedes_invalid_default_result),
+		("receiver binder cannot mask implicit Self", test_receiver_binder_cannot_mask_implicit_self),
+		("free function may name its generic Self", test_free_function_may_name_its_generic_self),
+		("unused default body checks its called name", test_an_unused_default_body_still_checks_its_called_name),
+	]
+}

@@ -36,8 +36,9 @@ The compiler-source subset is governed by [AGENTS.md](AGENTS.md); source
 convenience does not remove currently supported input features.
 
 Concrete, authored traits are supported as described in [concrete traits](#concrete-traits).
-The [Equatable-first trait plan](TRAITS_PLAN.md) owns the remaining generic
-bounds, defaults, automatic record/union equality and library migration, together
+Function bounds, full generic receiver families, default methods and contextual
+method references extend that surface. The [Equatable-first trait plan](TRAITS_PLAN.md)
+owns remaining automatic record/union equality and library migration, together
 with phase boundaries and acceptance gates.
 
 The [incremental layout migration](LAYOUT_MIGRATION.md) defines the proposed
@@ -59,8 +60,9 @@ examples for this implementation; older increment reports retain their history.
 ## Concrete traits
 
 A trait declares pure method signatures using the implicit type `Self`. Each
-method's first parameter must have exactly that type. Signatures have no body;
-an omitted return annotation means Void, as for ordinary functions.
+method's first parameter must have exactly that type. A signature without a
+colon is abstract; a colon introduces an ordinary default body. An omitted
+return annotation means Void, as for ordinary functions.
 
 ```blorp
 trait Equatable:
@@ -71,9 +73,13 @@ implements Equatable for Int:
 		builtin("int.equals")
 ```
 
-The designated foundation's `Equatable` has exactly the signature above.
-Implementations define every required method with matching parameter, result
-and purity contracts; their bodies are ordinary checked functions. A module
+The designated foundation's `Equatable` has `equals` as its sole abstract
+requirement; additional pure methods need defaults. Implementations define every
+abstract method with matching parameter, result and purity contracts. They may
+override defaults; omitted defaults use the trait definition's lexical scope.
+Default bodies and authored bodies are ordinary checked functions, including
+unused bodies. A default-only implementation ends after its receiver, without
+a colon or an empty indented block. A module
 must own the trait or receiver declaration. A library operation module may
 also implement a foundation trait for a foundation receiver.
 
@@ -86,13 +92,55 @@ routes to one family coalesce; different families or a free function with the
 same name need an alias or renamed declaration. A type's `methods_only` route
 requires the provider to own an implementation for that receiver head.
 
-This increment accepts scalar builtins and nongeneric named records, unions or
-opaque receiver types. Applied receivers and generic families are deferred.
-Bounds, generic implementations, method type parameters, default bodies,
-method references, callable formals in
-requirements and derives are deferred with explicit diagnostics. Traits are
-separate from value types, and `Self[Int]` cannot apply the scoped `Self` type.
-Qualified module type names retain their normal meaning.
+Function type parameters declare their required traits with `:` and combine
+bounds with `+`. Each generic body is checked once against those declarations;
+future callers never supply a missing bound. Receiver families introduce every
+parameter directly after their named head, using distinct fresh names:
+
+```blorp
+trait Visit:
+    pure func visit(value: Self) -> Int
+    pure func repeated(value: Self) -> Int:
+        visit(value)
+
+fixed record Box[Element] { value: Element }
+
+implements Visit for Box[Element: Visit]:
+    pure func visit(value: Self) -> Int:
+        visit(value.value)
+
+pure func forward[Value: Equatable + Visit](value: Value) -> Int:
+    repeated(value)
+```
+
+A concrete default-only header is written `implements Observe for Shape` on its
+own line when every method has a default. A complete family such as `Box[T]`
+applies to that entire nominal head. Bounds do not distinguish overlapping
+implementations; a failed bound never selects another implementation. Partial,
+concrete-argument or nested receiver patterns are rejected.
+
+A method family can be an ordinary function value when an expected callable
+contract determines `Self`, for example `callback: pure (Int) -> Int = visit`
+for a visible one-argument family `visit`. Typed callback arguments, stored
+callables and returned callables use the same rule. Without sufficient context,
+the diagnostic asks for a callable annotation or a typed callback parameter.
+Invoking these values follows ordinary purity, capture and ownership rules;
+operands evaluate once in written order.
+
+The existing finite-instantiation check includes trait calls and method-value
+creation before specialization. Its constructor-depth proof is conservative:
+it can reject a finite `Box` to `Wrap` relay or a generic field containing three
+nested Lists with `cannot prove finite generic trait instantiation`. These are
+explicit temporary limits; ordinary deeply nested field dispatch must be
+closed before the structural-equality milestone can complete.
+
+Traits remain parameterless, with no independently generic methods, impure
+requirements, top-level callable formals or automatic derives. Record/union
+declaration bounds remain deferred. Traits are separate from value types, and
+`Self[Int]` cannot apply scoped `Self`; qualified module type names retain their
+normal meaning. Check validates contracts and bound obligations once, then
+Specialize selects ordinary bodies through the existing instance graph. No
+trait representation reaches lowering, ownership or emission.
 
 The [concrete fixture](test/e2e/trait_inputs/concrete/main.brp) supplies its own
 [isolated library](test/e2e/trait_inputs/concrete/library/) and returns 23 for
@@ -1531,8 +1579,9 @@ Lexical and layout rules:
   nested match, a join whose value the arm returns or yields.
 - Integer literals are decimal values from `-9223372036854775808` through
   `9223372036854775807`, with an optional adjacent minus. `-0` is accepted
-  and has value zero. Leading zeros (`00`, `-01`), plus signs, separated minus
-  signs and arithmetic operators are rejected. The lexer preserves the whole
+  and has value zero. Leading zeros (`00`, `-01`), leading numeric plus,
+  separated minus signs and arithmetic operators are rejected. The `+` token
+  separates trait bounds; it does not enable arithmetic. The lexer preserves the whole
   digit run; the parser validates spelling and range before converting it.
   A dot followed by a function name starts UFCS: `42.identity()` is a call;
   `42.5` is a Float literal.

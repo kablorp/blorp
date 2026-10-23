@@ -6,20 +6,20 @@ runtime operation. Bool and Option results are the foundation's designated
 unions, which the operation carries by constructor identity.
 ---
 import:
-	../utils/boolean: or
-	./declarations: TypeScope, TypeAccess(PrivateTypeUse), type_access, declared_parameters, local_type_parameters, resolve_type, occurrence_fields
+	../utils/boolean: or, and, not
+	./declarations: TypeScope, LocalTypeParameter, Substitution, substitute_type, TypeAccess(PrivateTypeUse), type_access, declared_parameters, local_type_parameters, resolve_type, occurrence_fields, resolve_receiver_head, receiver_arity
 	./errors:
 		CheckError,
-		CheckerInvariant(InvalidResolvedFunction, RuntimeContractMismatch),
+		CheckerInvariant(InvalidFunctionContract, InvalidResolvedFunction, RuntimeContractMismatch),
 		SignatureError(GenericMain, MainHasParameters, MainParameterType, MainReturnType, MissingMain),
-		checker_invariant, trait_error, TraitError(ConcreteReceiverRequired),
+		checker_invariant, type_declaration_error, TypeDeclarationError(TypeParameterTypeNameConflict), trait_error, TraitError(InvalidTraitBound, DuplicateReceiverParameter, ReceiverParameterCount, IndependentImplementationParameters),
 		signature_error,
 		BuiltinError(BuiltinContractMismatch, BuiltinTailAnnotation),
 		builtin_error
 	./model:
-		FunctionSignature, ImplementationHeader,
-		TypeParameterOwner(FunctionDeclaration),
-		TypeRef(CallableType, IntType, ListType, StringType, VoidType, UnionType, AppliedUnionType),
+		AcceptedTrait, AcceptedTraitMethod, FunctionSignature, ImplementationHeader, TraitRequirement, LocatedTrait, TypeParameterId, receiver_type,
+		TypeParameterOwner(FunctionDeclaration, TraitDeclaration),
+		TypeRef(ParameterType, CallableType, IntType, ListType, StringType, VoidType, UnionType, AppliedUnionType),
 		TypeUse,
 		same_type,
 		type_parameter_id,
@@ -32,10 +32,10 @@ import:
 		RuntimeResult(ValueResult, OptionalResult, ResultResult, BooleanResult),
 		primitive_operation,
 		runtime_contract
-	../namespace/namespace: Namespace, FunctionSource(DeclaredHere), NamedValue(NamedFunction), named_value
+	../namespace/namespace: Namespace, resolve_trait, named_type, FunctionSource(DeclaredHere), NamedValue(NamedFunction), named_value
 	../parse/assemble: ParsedContents
 	../utils/ids:
-		FunctionId, FunctionRole(ImplementationBody, FreeFunctionBody), inventory_implementations, impl_number,
+		FunctionId, FunctionRow, ImplRow, FunctionRole(ImplementationBody, FreeFunctionBody, TraitDefaultBody), inventory_implementations, impl_number,
 		VariantId,
 		function_number,
 		inventory_functions,
@@ -43,13 +43,13 @@ import:
 		inventory_unions,
 		variant_owner
 	../utils/source: root_module_id
-	../utils/names: contextual_words
+	../utils/names: NameId, contextual_words, same_name
 	../utils/syntax:
 		TypeSyntax(CallableTypeSyntax, AtomicType, QualifiedType),
 		EntryResult(IntegerExitStatus, SuccessfulExit),
 		Entrypoint(NoArguments, WithArguments),
 		ParsedBody(ParsedBuiltinBody, ParsedMatchBody, ParsedValueBody),
-		ParsedFunction,
+		ParsedFunction, ParsedTypeParameter, receiver_head_span, WrittenName,
 		ParsedMatch,
 		ParsedParameter,
 		Span,
@@ -63,7 +63,7 @@ import:
 			ListAppendBuiltin, ListSetBuiltin, ListConcatBuiltin, StringEqualsBuiltin, IntegerEqualsBuiltin, IntegerLessThanBuiltin,
 		)
 	int as IntOps
-	option: to_result
+	option: to_result, is_some, is_none
 
 
 private fixed union SignatureRole:
@@ -104,6 +104,7 @@ pure func validate_signatures(
 	parsed: ParsedContents,
 	namespace: Namespace,
 	designated: DesignatedUnions,
+	contracts: List[AcceptedTrait],
 ) -> Result[CheckedSignatures, CheckError]:
 	-- Assembly selects the entry name: application main or the compiler-owned
 	-- test wrapper. Only a function declared by the root has the process ABI.
@@ -111,7 +112,7 @@ pure func validate_signatures(
 		Some(NamedFunction(id, DeclaredHere)): Some(id)
 		_: None
 	headers ?= implementation_headers(parsed, namespace)
-	functions ?= accept_functions(parsed, namespace, designated, entrypoint, headers, [])
+	functions ?= accept_functions(parsed, namespace, designated, entrypoint, headers, contracts, [])
 	id ?= entrypoint.to_result(signature_error(parsed.end, MissingMain))
 	main ?= functions
 		.get(function_number(id))
@@ -141,6 +142,7 @@ private pure func accept_functions(
 	designated: DesignatedUnions,
 	entrypoint: Option[FunctionId],
 	headers: List[ImplementationHeader],
+	contracts: List[AcceptedTrait],
 	accepted: List[AcceptedFunction],
 ) -> Result[List[AcceptedFunction], CheckError]:
 	match inventory_functions(parsed.declarations).get(accepted.length()):
@@ -169,10 +171,7 @@ private pure func accept_functions(
 				access = type_access(function.visibility, function.function_name.id),
 				parameters = []
 			}
-			definition_scope = match row.role:
-				FreeFunctionBody: scope
-				ImplementationBody: implementation_scope(parsed, headers, row.id, scope)
-			match resolve_signature(function, id, role, definition_scope, designated):
+			match resolve_function(row, parsed, headers, contracts, role, scope, designated):
 				Ok(signature):
 					accept_functions(
 						parsed,
@@ -180,6 +179,7 @@ private pure func accept_functions(
 						designated,
 						entrypoint,
 						headers,
+						contracts,
 						accepted.append(signature),
 					)
 				Err(error): Err(error)
@@ -189,25 +189,12 @@ private pure func resolve_signature(
 	function: ParsedFunction,
 	id: FunctionId,
 	role: SignatureRole,
-	module_scope: TypeScope,
+	scope: TypeScope,
+	parameters: List[TypeParameterId],
+	requirements: List[TraitRequirement],
 	designated: DesignatedUnions,
 ) -> Result[AcceptedFunction, CheckError]:
-	generic_main: Void ?= match role:
-		EntryFunction:
-			match function.type_parameters.get(0):
-				Some(name):
-					Err(
-						signature_error(
-							name.span,
-							GenericMain(type_parameter_id(FunctionDeclaration(id), 0)),
-						),
-					)
-				None:
-					Ok(void)
-		HelperFunction:
-			Ok(void)
 
-	scope ?= local_type_parameters(function.type_parameters, FunctionDeclaration(id), module_scope)
 
 	return_type ?= match function.return_type:
 		Some(written):
@@ -245,11 +232,12 @@ private pure func resolve_signature(
 		HelperFunction:
 			Ok(void)
 
-	parameters ?= resolve_parameters(function.parameters, role, scope, [])
+	formal_parameters ?= resolve_parameters(function.parameters, role, scope, [])
 	signature: FunctionSignature = {
-		type_parameters = declared_parameters(scope),
+		type_parameters = parameters,
+		requirements = requirements,
 		purity = function.purity,
-		parameters = parameters,
+		parameters = formal_parameters,
 		return_type = {
 			value_type = return_type,
 			span = return_span
@@ -467,7 +455,72 @@ pure func validate_builtin_body(
 		Err(builtin_error(site.span, BuiltinContractMismatch(parsed)))
 
 
--- Concrete receiver types are established once, before member signatures.
+-- Bounds are resolved once at their written declaration. Body normalization
+-- only attaches these accepted traits to the body's genuine parameter domain.
+private pure func resolve_bounds(parameters: List[ParsedTypeParameter], scope: TypeScope) -> Result[List[List[LocatedTrait]], CheckError]:
+	var resolved: List[List[LocatedTrait]] = []
+	var failure: Option[CheckError] = None
+	for parameter in parameters:
+		var bounds: List[LocatedTrait] = []
+		for written in parameter.bounds:
+			match resolve_trait(scope.namespace, scope.module, written):
+				Some(id): bounds = bounds.append({ required_trait = id, span = type_span(written) })
+				None:
+					failure = Some(trait_error(type_span(written), InvalidTraitBound))
+					break
+		resolved = resolved.append(bounds)
+		if failure.is_some():
+			break
+	match failure:
+		Some(error): Err(error)
+		None: Ok(resolved)
+
+
+private pure func body_requirements(bounds: List[List[LocatedTrait]], function: FunctionId) -> List[TraitRequirement]:
+	var requirements: List[TraitRequirement] = []
+	var position = 0
+	for parameter in bounds:
+		for bound in parameter:
+			requirements = requirements.append({ parameter = type_parameter_id(FunctionDeclaration(function), position), required_trait = bound.required_trait, span = bound.span })
+		position = IntOps.add(position, 1)
+	requirements
+
+
+-- Families have no parameter identity domain. Validate their source names here;
+-- each actual body receives its own identities only during normalization.
+private pure func receiver_parameters(parameters: List[ParsedTypeParameter], scope: TypeScope, self_name: NameId) -> Result[Void, CheckError]:
+	var seen: List[WrittenName] = []
+	var failure: Option[CheckError] = None
+	for parameter in parameters:
+		for previous in seen:
+			if same_name(previous.id, parameter.name.id):
+				failure = Some(trait_error(parameter.name.span, DuplicateReceiverParameter(previous)))
+		if failure.is_none():
+			if same_name(parameter.name.id, self_name):
+				failure = Some(type_declaration_error(parameter.name.span, TypeParameterTypeNameConflict(parameter.name.id)))
+			else:
+				match named_type(scope.namespace, scope.module, parameter.name.id):
+					Some(_): failure = Some(type_declaration_error(parameter.name.span, TypeParameterTypeNameConflict(parameter.name.id)))
+					None: seen = seen.append(parameter.name)
+		if failure.is_some():
+			break
+	match failure:
+		Some(error): Err(error)
+		None: Ok(void)
+
+
+private pure func implementation_header(row: ImplRow, scope: TypeScope, parsed: ParsedContents) -> Result[ImplementationHeader, CheckError]:
+	head ?= resolve_receiver_head(scope, row.header.receiver)
+	arity ?= receiver_arity(scope, head, receiver_head_span(row.header.receiver))
+	complete: Void ?= if IntOps.equals(arity, row.header.type_parameters.length()):
+		Ok(void)
+	else:
+		Err(trait_error(receiver_head_span(row.header.receiver), ReceiverParameterCount(arity, row.header.type_parameters.length())))
+	fresh ?= receiver_parameters(row.header.type_parameters, scope, contextual_words(parsed.names).self_word)
+	bounds ?= resolve_bounds(row.header.type_parameters, scope)
+	Ok({ receiver_head = head, parameter_bounds = bounds })
+
+
 private pure func implementation_headers(parsed: ParsedContents, namespace: Namespace) -> Result[List[ImplementationHeader], CheckError]:
 	var headers: List[ImplementationHeader] = []
 	var failure: Option[CheckError] = None
@@ -477,13 +530,8 @@ private pure func implementation_headers(parsed: ParsedContents, namespace: Name
 			namespace = namespace, module = row.header.module, access = PrivateTypeUse,
 			parameters = [], self_binding = None
 		}
-		resolved: Result[TypeRef, CheckError] = match row.header.receiver:
-			AtomicType(_) | QualifiedType(_, [], _): resolve_type(scope, row.header.receiver)
-			_: Err(trait_error(type_span(row.header.receiver), ConcreteReceiverRequired))
-		match resolved:
-			Ok(receiver):
-				header: ImplementationHeader = { receiver = receiver }
-				headers = headers.append(header)
+		match implementation_header(row, scope, parsed):
+			Ok(header): headers = headers.append(header)
 			Err(error):
 				failure = Some(error)
 				break
@@ -492,14 +540,102 @@ private pure func implementation_headers(parsed: ParsedContents, namespace: Name
 		None: Ok(headers)
 
 
--- Inventory alone owns body membership. This transient definition scope gives
--- authored Self its actual type without adding it to function generic arguments.
-private pure func implementation_scope(parsed: ParsedContents, headers: List[ImplementationHeader], function: FunctionId, scope: TypeScope) -> TypeScope:
-	var definition = scope
-	for row in inventory_implementations(parsed.declarations):
-		for member in row.methods:
-			if IntOps.equals(function_number(member), function_number(function)):
-				match headers.get(impl_number(row.id)):
-					Some(header): definition = { scope | access = PrivateTypeUse, self_binding = Some({ name = contextual_words(parsed.names).self_word, value_type = header.receiver }) }
-					None: void
-	definition
+private pure func resolve_implementation_function(row: FunctionRow, implementation: ImplRow, header: ImplementationHeader, parsed: ParsedContents, role: SignatureRole, scope: TypeScope, designated: DesignatedUnions) -> Result[AcceptedFunction, CheckError]:
+	ordinary: Void ?= match row.declaration.type_parameters:
+		[first, ..._]: Err(trait_error(first.name.span, IndependentImplementationParameters))
+		[]: Ok(void)
+	var parameters: List[LocalTypeParameter] = []
+	for parameter in implementation.header.type_parameters:
+		parameters = parameters.append({ name = parameter.name, id = type_parameter_id(FunctionDeclaration(row.id), parameters.length()) })
+	body_scope = { scope | parameters = parameters }
+	identities = declared_parameters(body_scope)
+	receiver ?= receiver_type(header.receiver_head, identities.map(pure func(id): ParameterType(id)))
+		.to_result(checker_invariant(implementation.header.span, InvalidFunctionContract))
+	normalized = { body_scope | self_binding = Some({ name = contextual_words(parsed.names).self_word, value_type = receiver }) }
+	resolve_signature(row.declaration, row.id, role, normalized, identities, body_requirements(header.parameter_bounds, row.id), designated)
+
+
+-- The default's written contract is accepted once in its trait domain.
+-- Normalization changes only that domain to this genuine body's Self; source
+-- annotations are neither reconstructed nor resolved a second time.
+private pure func resolve_default_function(
+	row: FunctionRow,
+	owner: AcceptedTrait,
+	method: AcceptedTraitMethod,
+	parsed: ParsedContents,
+	scope: TypeScope,
+	designated: DesignatedUnions,
+) -> Result[AcceptedFunction, CheckError]:
+	self = type_parameter_id(FunctionDeclaration(row.id), 0)
+	substitution: Substitution = { owner = TraitDeclaration(owner.id), values = [ParameterType(self)] }
+	var parameters: List[TypeUse] = []
+	var failure: Option[CheckError] = None
+	for parameter in method.signature.parameters:
+		match substitute_type(parameter.value_type, substitution, parameter.span):
+			Ok(value_type): parameters = parameters.append({ parameter | value_type = value_type })
+			Err(error):
+				failure = Some(error)
+				break
+	ready: Void ?= match failure:
+		Some(error): Err(error)
+		None: Ok(void)
+	result ?= substitute_type(method.signature.return_type.value_type, substitution, method.signature.return_type.span)
+	requirement: TraitRequirement = { parameter = self, required_trait = owner.id, span = row.declaration.function_name.span }
+	signature: FunctionSignature = {
+		type_parameters = [self], requirements = [requirement],
+		purity = method.signature.purity, parameters = parameters,
+		return_type = { method.signature.return_type | value_type = result }
+	}
+	body ?= accept_body(row.declaration, signature, designated)
+	Ok({
+		id = row.id, declaration = row.declaration, signature = signature,
+		body_types = { scope | access = PrivateTypeUse, self_binding = Some({ name = contextual_words(parsed.names).self_word, value_type = ParameterType(self) }) },
+		body = body
+	})
+
+
+private pure func resolve_function(row: FunctionRow, parsed: ParsedContents, headers: List[ImplementationHeader], contracts: List[AcceptedTrait], role: SignatureRole, scope: TypeScope, designated: DesignatedUnions) -> Result[AcceptedFunction, CheckError]:
+	match row.role:
+		FreeFunctionBody:
+			resolve_free_function(row, role, scope, designated)
+		ImplementationBody:
+			var accepted: Result[AcceptedFunction, CheckError] = Err(checker_invariant(row.declaration.function_name.span, InvalidResolvedFunction(row.id)))
+			for implementation in inventory_implementations(parsed.declarations):
+				for member in implementation.methods:
+					if IntOps.equals(function_number(member), function_number(row.id)):
+						match headers.get(impl_number(implementation.id)):
+							Some(header): accepted = resolve_implementation_function(row, implementation, header, parsed, role, scope, designated)
+							None: void
+			accepted
+		TraitDefaultBody:
+			var accepted: Result[AcceptedFunction, CheckError] = Err(checker_invariant(row.declaration.function_name.span, InvalidResolvedFunction(row.id)))
+			for owner in contracts:
+				for method in owner.methods:
+					match method.default_body:
+						Some(function):
+							if IntOps.equals(function_number(function), function_number(row.id)):
+								accepted = resolve_default_function(row, owner, method, parsed, scope, designated)
+						None: void
+			accepted
+
+
+
+private pure func resolve_free_function(row: FunctionRow, role: SignatureRole, scope: TypeScope, designated: DesignatedUnions) -> Result[AcceptedFunction, CheckError]:
+	generic_main: Void ?= match role:
+		EntryFunction:
+			match row.declaration.type_parameters.get(0):
+				Some(name):
+					Err(
+						signature_error(
+							name.name.span,
+							GenericMain(type_parameter_id(FunctionDeclaration(row.id), 0)),
+						),
+					)
+				None:
+					Ok(void)
+		HelperFunction:
+			Ok(void)
+
+	parameters ?= local_type_parameters(row.declaration.type_parameters.map(pure func(parameter): parameter.name), FunctionDeclaration(row.id), scope)
+	bounds ?= resolve_bounds(row.declaration.type_parameters, parameters)
+	resolve_signature(row.declaration, row.id, role, parameters, declared_parameters(parameters), body_requirements(bounds, row.id), designated)

@@ -25,7 +25,7 @@ import:
 	int as IntOps
 	../utils/source: ModuleId
 	../namespace/namespace:
-		TypeHead(ListHead, PrimitiveHead, RecordHead, UnionHead, OpaqueHead),
+		TypeHead(ListHead, PrimitiveHead, RecordHead, UnionHead, OpaqueHead), same_head,
 	../utils/syntax: Entrypoint, FunctionExecution, Purity(Pure, Impure), Span, WrittenName, same_purity
 
 
@@ -113,8 +113,18 @@ fixed record TypeUse {
 }
 
 
+-- A declared bound belongs to one genuine parameter domain. Receiver goals
+-- are substituted transiently at a call/reference, never retained in a registry.
+fixed record TraitRequirement {
+	parameter: TypeParameterId,
+	required_trait: TraitId,
+	span: Span
+}
+
+
 fixed record FunctionSignature {
 	type_parameters: List[TypeParameterId],
+	requirements: List[TraitRequirement],
 	purity: Purity,
 	parameters: List[TypeUse],
 	return_type: TypeUse
@@ -123,7 +133,8 @@ fixed record FunctionSignature {
 
 fixed record AcceptedTraitMethod {
 	id: TraitMethodId,
-	signature: FunctionSignature
+	signature: FunctionSignature,
+	default_body: Option[FunctionId]
 }
 
 
@@ -133,23 +144,38 @@ fixed record AcceptedTrait {
 }
 
 
--- Header types are resolved once before authored signatures; contract validation
--- consumes these transient rows when it publishes the accepted authority.
-fixed record ImplementationHeader {
-	receiver: TypeRef
+-- Full receiver families own head/argument positions, not a fabricated
+-- generic owner. These located bounds are resolved once at the header.
+fixed record LocatedTrait {
+	required_trait: TraitId,
+	span: Span
 }
+
+
+fixed record ImplementationHeader {
+	receiver_head: TypeHead,
+	parameter_bounds: List[List[LocatedTrait]]
+}
+
+
+-- Authored methods normalize each header argument into their own function
+-- domain. A default normalizes only whole Self into its actual function domain.
+fixed union ImplementedBody:
+	AuthoredMethod(FunctionId)
+	TraitDefault(FunctionId)
 
 
 fixed record ImplementedMethod {
 	method: TraitMethodId,
-	function: FunctionId
+	body: ImplementedBody
 }
 
 
 fixed record AcceptedImplementation {
 	span: Span,
 	trait_id: TraitId,
-	receiver: TypeRef,
+	receiver_head: TypeHead,
+	parameter_bounds: List[List[LocatedTrait]],
 	methods: List[ImplementedMethod],
 	module: ModuleId
 }
@@ -181,15 +207,35 @@ pure func method_receiver(call: AcceptedMethodCall) -> TypeRef:
 	from_opaque AcceptedMethodCall(call).receiver
 
 
--- Consumers follow the one accepted member mapping, including recursion and
--- specialization; no downstream phase rediscovers an implementation.
-pure func method_body(traits: AcceptedTraits, call: AcceptedMethodCall) -> Option[FunctionId]:
-	var found: Option[FunctionId] = None
-	for implementation in traits.implementations:
-		if same_type(implementation.receiver, method_receiver(call)):
-			for member in implementation.methods:
-				if same_trait_method(member.method, method_identity(call)):
-					found = Some(member.function)
+-- A transient projection into the ordinary function-request graph, not a
+-- second dispatch table or a retained per-call proof.
+fixed record SelectedMethodBody {
+	function: FunctionId,
+	arguments: List[TypeRef]
+}
+
+
+pure func receiver_arguments(receiver: TypeRef) -> List[TypeRef]:
+	match receiver:
+		AppliedRecordType(_, arguments): arguments
+		AppliedUnionType(_, arguments): arguments
+		ListType(element): [element]
+		_: []
+
+
+pure func method_body(traits: AcceptedTraits, call: AcceptedMethodCall) -> Option[SelectedMethodBody]:
+	var found: Option[SelectedMethodBody] = None
+	receiver = method_receiver(call)
+	match type_head(receiver):
+		None: void
+		Some(head):
+			for implementation in traits.implementations:
+				if same_head(implementation.receiver_head, head):
+					for member in implementation.methods:
+						if same_trait_method(member.method, method_identity(call)):
+							match member.body:
+								AuthoredMethod(function): found = Some({ function = function, arguments = receiver_arguments(receiver) })
+								TraitDefault(function): found = Some({ function = function, arguments = [receiver] })
 	found
 
 
@@ -220,6 +266,7 @@ pure func same_callable_parameter(left: CallableParameterId, right: CallablePara
 
 
 fixed union CallableChoice:
+	MethodCallable(AcceptedMethodCall)
 	NamedCallable(FunctionId, List[TypeRef])
 	ForwardedCallable(CallableParameterId)
 	LambdaCallable(LambdaId, List[CheckedExpr])
@@ -676,6 +723,27 @@ pure func type_head(value_type: TypeRef) -> Option[TypeHead]:
 			None
 
 
+-- Header arity is established before this semantic application is requested.
+pure func receiver_type(head: TypeHead, arguments: List[TypeRef]) -> Option[TypeRef]:
+	match head:
+		PrimitiveHead(primitive): Some(primitive_ref(primitive))
+		OpaqueHead(owner): Some(OpaqueType(owner))
+		RecordHead(owner):
+			if arguments.is_empty():
+				Some(RecordType(owner))
+			else:
+				Some(AppliedRecordType(owner, arguments))
+		UnionHead(owner):
+			if arguments.is_empty():
+				Some(UnionType(owner))
+			else:
+				Some(AppliedUnionType(owner, arguments))
+		ListHead:
+			match arguments:
+				[element]: Some(ListType(element))
+				_: None
+
+
 -- Composite types compare their children. The remaining leaf types are equal
 -- exactly when they name the same type.
 pure func same_type(left: TypeRef, right: TypeRef) -> Bool:
@@ -902,7 +970,7 @@ private pure func append_value_calls(
 					CallableOperand(_, choice, _):
 						match choice:
 							StoredCallable(child): calls = append_value_calls(calls, child)
-							NamedCallable(_, _) | ForwardedCallable(_) | LambdaCallable(_, _): void
+							MethodCallable(_) | NamedCallable(_, _) | ForwardedCallable(_) | LambdaCallable(_, _): void
 
 			calls = calls.append(call)
 		ReadTupleElement(receiver, _):
@@ -912,7 +980,7 @@ private pure func append_value_calls(
 		MakeCallable(choice):
 			match choice:
 				StoredCallable(child): calls = append_value_calls(calls, child)
-				NamedCallable(_, _) | ForwardedCallable(_) | LambdaCallable(_, _): void
+				MethodCallable(_) | NamedCallable(_, _) | ForwardedCallable(_) | LambdaCallable(_, _): void
 		LiteralVoid | LiteralInteger(_) | LiteralFloat(_) | LiteralString(_) | ReadBinding(_) | ReadCapture(_):
 			void
 
@@ -1008,7 +1076,7 @@ private pure func callable_creations(values: List[CheckedExpr]) -> List[CheckedE
 				match choice:
 					LambdaCallable(_, captures): children = captures
 					StoredCallable(child): children = [child]
-					NamedCallable(_, _) | ForwardedCallable(_): void
+					MethodCallable(_) | NamedCallable(_, _) | ForwardedCallable(_): void
 			InvokeFunction(call):
 				match call.target:
 					ValueCall(callee): children = [callee]
@@ -1020,7 +1088,7 @@ private pure func callable_creations(values: List[CheckedExpr]) -> List[CheckedE
 							match choice:
 								StoredCallable(child): children = children.append(child)
 								LambdaCallable(_, captures): children = children.concat(captures)
-								NamedCallable(_, _) | ForwardedCallable(_): void
+								MethodCallable(_) | NamedCallable(_, _) | ForwardedCallable(_): void
 			ConstructTuple(elements): children = elements
 			ConstructList(elements): children = elements
 			ConstructVariant(_, elements): children = elements

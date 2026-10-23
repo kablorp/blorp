@@ -1,0 +1,85 @@
+import:
+	./harness:
+		run_accounted_example, verify_rejected_command, with_directory,
+		TargetAllocations(PositiveTargetAllocations)
+	./cost: CostLimits
+	system: file_exists, read_file, write_file
+	test: TestSuite
+
+
+private LIBRARY_ROOT: String = "blorp_2/test/e2e/trait_inputs/bounds/library"
+
+private fixed record NativeLimits {
+	dispatch: CostLimits,
+	defaults: CostLimits,
+	finite: CostLimits
+}
+
+
+-- Initial direct CLI samples (allocations / retired instructions):
+-- dispatch 44,225 / 147,810,120; defaults 27,515 / 77,330,450;
+-- finite 71,635 / 185,566,452. Limits are frozen before maintained runs.
+private LIMITS: NativeLimits = {
+	dispatch = { allocations = 49000, instructions = 170000000 },
+	defaults = { allocations = 31000, instructions = 90000000 },
+	finite = { allocations = 80000, instructions = 210000000 },
+}
+
+
+func test_generic_method_values_and_written_operand_order(compiler: String, limits: CostLimits) -> Bool:
+	run_accounted_example(
+		compiler, LIBRARY_ROOT,
+		"blorp_2/test/e2e/trait_inputs/bounds/dispatch/main.brp", 23, "left\nright\n", limits,
+		PositiveTargetAllocations, "build/traits-T3/native/dispatch.c",
+	)
+
+
+func test_default_scope_and_authored_override(compiler: String, limits: CostLimits) -> Bool:
+	run_accounted_example(
+		compiler, LIBRARY_ROOT,
+		"blorp_2/test/e2e/trait_inputs/bounds/defaults/main.brp", 23, "", limits,
+		PositiveTargetAllocations, "build/traits-T3/native/defaults.c",
+	)
+
+
+func test_reachable_finite_generic_dispatch(compiler: String, limits: CostLimits) -> Bool:
+	run_accounted_example(
+		compiler, LIBRARY_ROOT,
+		"blorp_2/test/e2e/trait_inputs/bounds/finite/main.brp", 23, "", limits,
+		PositiveTargetAllocations, "build/traits-T3/native/finite.c",
+	)
+
+
+private func reject_without_callers(compiler: String, directory: String) -> Result[Void, String]:
+	input: String = "blorp_2/test/e2e/trait_inputs/bounds/reject_unbounded.brp"
+	output = directory + "/rejected.c"
+	expected = input + ":5:5: error: type does not satisfy the required trait bound\nhelp: add the required trait to this function's type parameter bounds, or provide an implementation for the concrete receiver\n"
+	missing ?= verify_rejected_command(compiler, LIBRARY_ROOT, input, output, expected)
+	unpublished ?= if file_exists(output):
+		Err("missing generic bound created a C output")
+	else:
+		Ok(void)
+	sentinel ?= write_file(output, "preserve bound output")
+	existing ?= verify_rejected_command(compiler, LIBRARY_ROOT, input, output, expected)
+	actual ?= read_file(output)
+	if actual == "preserve bound output":
+		Ok(void)
+	else:
+		Err("missing generic bound overwrote existing output")
+
+
+func test_unbounded_body_without_callers_preserves_output(compiler: String) -> Bool:
+	with_directory(func(directory: String): reject_without_callers(compiler, directory))
+
+
+-- All cases use the ordinary real-main harness and the same governing limits.
+pure func suite(compiler: String) -> TestSuite:
+	{
+		description = "Blorp 2 bounded defaults and contextual method values",
+		tests = [
+			("generic method values keep opaque choice and written order", func(): test_generic_method_values_and_written_operand_order(compiler, LIMITS.dispatch)),
+			("default lexical scope and authored override remain distinct", func(): test_default_scope_and_authored_override(compiler, LIMITS.defaults)),
+			("finite generic dispatch reaches real native values", func(): test_reachable_finite_generic_dispatch(compiler, LIMITS.finite)),
+			("uncalled unbounded body rejects and preserves output", func(): test_unbounded_body_without_callers_preserves_output(compiler)),
+		]
+	}

@@ -90,9 +90,18 @@ order and retain ordinary scope and purity checks. Nested interpolation,
 interpolation in patterns, builtin labels and closed constant initializers are
 rejected. See the [pilot String rules](../blorp_2/README.md#quoted-utf-8-string-literals) for exact
 syntax and escapes. Arbitrary FFI remains excluded. The pilot supports
-[concrete authored traits](../blorp_2/README.md#concrete-traits) with pure
-signature-only requirements and ordinary static method calls; bounds, defaults,
-generic implementations, method references and derives remain deferred.
+[static traits](../blorp_2/README.md#concrete-traits) with pure abstract or
+default methods, function bounds (`Value: Equatable + Visit`), complete receiver
+families (`Box[Value: Visit]`) and contextual unbound method references.
+Default-only implementations omit the colon and body. Method references need
+an expected callable contract determining `Self`; stored, returned and callback
+values obey ordinary purity and ownership. Generic bodies use only declared
+bounds. The conservative finite-dispatch proof can reject finite wrapped relays
+and deeply nested generic fields; see the linked pilot rules for these temporary
+limits. Automatic derives, trait parameters, independently generic methods and
+top-level callable trait formals remain deferred. The production pilot library
+and compiler-source bootstrap subset do not acquire trait syntax from this input
+surface.
 
 ---
 

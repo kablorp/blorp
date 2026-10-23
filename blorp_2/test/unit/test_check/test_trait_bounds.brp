@@ -1,0 +1,306 @@
+import:
+	../../../src/check/check: check, checked_functions, check_errors
+	../../../src/check/render: render_failure
+	../../../src/check/errors: CheckErrorKind(RecursionRejection), RecursionError(GenericTailRecursionUnsupported)
+	../../../src/check/model as Model
+	../../../src/parse/assemble: parsed_contents
+	../../../src/utils/ids: inventory_functions, inventory_implementations, inventory_traits, function_number, trait_number, same_trait_method, TraitId, FunctionRole(TraitDefaultBody), TraitMethodDeclaration(DefaultMethod)
+	../../../src/utils/syntax: Purity(Pure), same_span
+	../module_input: parse_modules_with_base, test_base
+	test: TestSuite
+
+
+private REQUIREMENT: String =
+	|trait Equatable:
+	|    pure func equals(left: Self, right: Self) -> Bool
+	|
+
+private INTEGER_IMPLEMENTATION: String =
+	|implements Equatable for Int:
+	|    pure func equals(left: Self, right: Self) -> Bool:
+	|        builtin("int.equals")
+	|
+
+
+private pure func declares_bound(function: Model.CheckedFunction, parameter: Model.TypeParameterId, owner: TraitId) -> Bool:
+	match function.signature.requirements:
+		[requirement]: Model.same_parameter(requirement.parameter, parameter) and trait_number(requirement.required_trait) == trait_number(owner)
+		_: False
+
+
+-- These first red cases use an ordinary root-local trait and TestFoundation.
+-- There is no library exception, reexport, invented body or bootstrap shortcut.
+pure func test_declared_bounds_authorize_generic_calls_and_forwarding() -> Bool:
+	source: String =
+		|pure func same[A: Equatable](left: A, right: A) -> Bool:
+		|    equals(left, right)
+		|pure func forward[B: Equatable](left: B, right: B) -> Bool:
+		|    same(left, right)
+		|func main() -> Int:
+		|    match forward(7, 7):
+		|        True: 23
+		|        False: 0
+		|
+	match parse_modules_with_base([{ source = REQUIREMENT + INTEGER_IMPLEMENTATION + source, targets = [] }], test_base()):
+		Err(_): False
+		Ok(parsed):
+			match check(parsed):
+				Err(_): False
+				Ok(program):
+					match (inventory_traits(parsed_contents(parsed).declarations), checked_functions(program).functions):
+						([declaration], [_, same, forward, _]):
+							match (same.signature.type_parameters, forward.signature.type_parameters, Model.function_calls(same), Model.function_calls(forward)):
+								([first], [second], [method_call], [forward_call]):
+									match (Model.parameter_owner(first), Model.parameter_owner(second), method_call.target, forward_call.target):
+										(Model.FunctionDeclaration(same_owner), Model.FunctionDeclaration(forward_owner), Model.TraitMethod(method), Model.UserFunction(target, [argument])):
+											(
+												function_number(same_owner) == function_number(same.id)
+												and function_number(forward_owner) == function_number(forward.id)
+												and function_number(target) == function_number(same.id)
+												and Model.same_type(Model.method_receiver(method), Model.ParameterType(first))
+												and Model.same_type(argument, Model.ParameterType(second))
+												and declares_bound(same, first, declaration.id)
+												and declares_bound(forward, second, declaration.id)
+											)
+										_: False
+								_: False
+						_: False
+
+
+pure func test_full_receiver_family_uses_the_authored_body_parameter_owner() -> Bool:
+	source: String =
+		|fixed record Box[T] { value: T }
+		|implements Equatable for Box[Element: Equatable]:
+		|    pure func equals(left: Self, right: Self) -> Bool:
+		|        equals(left.value, right.value)
+		|pure func boxed(value: Int) -> Box[Int]:
+		|    { value = value }
+		|func main() -> Int:
+		|    match equals(boxed(7), boxed(7)):
+		|        True: 23
+		|        False: 0
+		|
+	match parse_modules_with_base([{ source = REQUIREMENT + INTEGER_IMPLEMENTATION + source, targets = [] }], test_base()):
+		Err(_): False
+		Ok(parsed):
+			match check(parsed):
+				Err(_): False
+				Ok(program):
+					match (inventory_traits(parsed_contents(parsed).declarations), inventory_functions(parsed_contents(parsed).declarations), checked_functions(program).functions):
+						([declaration], [_, written, _, _], [_, member, _, _]):
+							match (member.signature.type_parameters, Model.function_calls(member)):
+								([parameter], [call]):
+									match (Model.parameter_owner(parameter), call.target):
+										(Model.FunctionDeclaration(owner), Model.TraitMethod(method)):
+											(
+												written.declaration.type_parameters.is_empty()
+												and function_number(owner) == function_number(written.id)
+												and function_number(member.id) == function_number(written.id)
+												and Model.same_type(Model.method_receiver(method), Model.ParameterType(parameter))
+												and declares_bound(member, parameter, declaration.id)
+											)
+										_: False
+								_: False
+						_: False
+
+
+pure func test_default_body_has_a_real_function_and_normalized_self() -> Bool:
+	requirements: String =
+		|trait Equatable:
+		|    pure func equals(left: Self, right: Self) -> Bool
+		|    pure func not_equals(left: Self, right: Self) -> Bool:
+		|        match equals(left, right):
+		|            True: False
+		|            False: True
+		|
+	main_source: String =
+		|func main() -> Int:
+		|    match not_equals(7, 8):
+		|        True: 23
+		|        False: 0
+		|
+	match parse_modules_with_base([{ source = requirements + INTEGER_IMPLEMENTATION + main_source, targets = [] }], test_base()):
+		Err(_): False
+		Ok(parsed):
+			match check(parsed):
+				Err(_): False
+				Ok(program):
+					checked = checked_functions(program)
+					declarations = parsed_contents(parsed).declarations
+					match inventory_traits(declarations):
+						[declaration]:
+							match declaration.methods:
+								[_, method]:
+									match method.declaration:
+										DefaultMethod(default_id):
+											match (inventory_functions(declarations).get(function_number(default_id)), checked.functions.get(function_number(default_id))):
+												(Some(written), Some(body)):
+													match (written.role, body.signature.type_parameters, Model.function_calls(body)):
+														(TraitDefaultBody, [self], [call]):
+															match (Model.parameter_owner(self), call.target):
+																(Model.FunctionDeclaration(owner), Model.TraitMethod(selected)):
+																	(
+																		written.declaration.type_parameters.is_empty()
+																		and function_number(owner) == function_number(default_id)
+																		and function_number(body.id) == function_number(default_id)
+																		and Model.same_type(Model.method_receiver(selected), Model.ParameterType(self))
+																		and declares_bound(body, self, declaration.id)
+																	)
+																_: False
+														_: False
+												_: False
+										_: False
+								_: False
+						_: False
+
+
+pure func test_expected_callable_type_admits_an_unbound_method_value() -> Bool:
+	main_source: String =
+		|func main() -> Int:
+		|    compare: pure (Int, Int) -> Bool = equals
+		|    match compare(7, 7):
+		|        True: 23
+		|        False: 0
+		|
+	match parse_modules_with_base([{ source = REQUIREMENT + INTEGER_IMPLEMENTATION + main_source, targets = [] }], test_base()):
+		Err(_): False
+		Ok(parsed):
+			match check(parsed):
+				Err(_): False
+				Ok(program):
+					match (inventory_traits(parsed_contents(parsed).declarations), checked_functions(program).functions):
+						([declaration], [equals_body, main]):
+							match main.statements:
+								[Model.InitializeBinding(_, value)]:
+									match value.form:
+										Model.MakeCallable(Model.MethodCallable(selected)):
+											match declaration.methods:
+												[method]:
+													(
+														same_trait_method(Model.method_identity(selected), method.id)
+														and Model.same_type(Model.method_receiver(selected), Model.IntType)
+														and Model.same_type(value.value_type, Model.CallableType(Pure, [Model.IntType, Model.IntType], equals_body.signature.return_type.value_type))
+													)
+												_: False
+										_: False
+								_: False
+						_: False
+
+
+pure func test_bodyless_implementation_reuses_the_genuine_trait_default() -> Bool:
+	source: String =
+		|trait Observe:
+		|    pure func observe(value: Self) -> Int:
+		|        7
+		|implements Observe for Int
+		|func main() -> Int:
+		|    observe(7)
+		|
+	match parse_modules_with_base([{ source = source, targets = [] }], test_base()):
+		Err(_): False
+		Ok(parsed):
+			declarations = parsed_contents(parsed).declarations
+			match (inventory_implementations(declarations), inventory_traits(declarations), check(parsed)):
+				([implementation], [declaration], Ok(program)):
+					checked = checked_functions(program)
+					match (declaration.methods, checked.functions):
+						([method], [main, default_body]):
+							match (method.declaration, Model.function_calls(main)):
+								(DefaultMethod(default_id), [call]):
+									match call.target:
+										Model.TraitMethod(selected):
+											match Model.method_body(checked.traits, selected):
+												Some(body):
+													match body.arguments:
+														[receiver]:
+															(
+																implementation.methods.is_empty()
+																and function_number(body.function) == function_number(default_id)
+																and function_number(default_body.id) == function_number(default_id)
+																and same_trait_method(Model.method_identity(selected), method.id)
+																and Model.same_type(receiver, Model.IntType)
+																and default_body.signature.type_parameters.length() == 1
+															)
+														_: False
+												None: False
+										_: False
+								_: False
+						_: False
+				_: False
+
+
+pure func test_concrete_trait_control_remains_accepted() -> Bool:
+	main_source: String =
+		|func main() -> Int:
+		|    match equals(7, 7):
+		|        True: 23
+		|        False: 0
+		|
+	match parse_modules_with_base([{ source = REQUIREMENT + INTEGER_IMPLEMENTATION + main_source, targets = [] }], test_base()):
+		Err(_): False
+		Ok(parsed):
+			match check(parsed):
+				Err(_): False
+				Ok(program):
+					match checked_functions(program).functions:
+						[_, main]:
+							match Model.function_calls(main):
+								[call]:
+									match call.target:
+										Model.TraitMethod(method): Model.same_type(Model.method_receiver(method), Model.IntType)
+										_: False
+								_: False
+						_: False
+
+
+pure func test_receiver_family_normalization_preserves_the_generic_tail_restriction() -> Bool:
+	source: String =
+		|trait Observe:
+		|    pure func observe(value: Self) -> Int
+		|fixed record Box[Element] { value: Element }
+		|implements Observe for Box[Element]:
+		|    @tail_recursive pure func observe(value: Self) -> Int:
+		|        7
+		|func main() -> Int:
+		|    0
+		|
+	match parse_modules_with_base([{ source = source, targets = [] }], test_base()):
+		Err(_): False
+		Ok(parsed):
+			match (inventory_functions(parsed_contents(parsed).declarations), check(parsed)):
+				([written, _], Err(failure)):
+					match written.declaration.tail_annotation:
+						None: False
+						Some(annotation):
+							errors = check_errors(failure)
+							diagnostics = render_failure(failure)
+							error = errors.first
+							diagnostic = diagnostics.first
+							match error.kind:
+								RecursionRejection(GenericTailRecursionUnsupported):
+									(
+										written.declaration.type_parameters.is_empty()
+										and same_span(error.span, annotation)
+										and same_span(diagnostic.span, annotation)
+										and errors.remaining.is_empty()
+										and diagnostics.remaining.is_empty()
+										and diagnostic.message == "generic @tail_recursive functions are not supported yet"
+										and diagnostic.help == "use a nongeneric helper, or remove @tail_recursive"
+										and diagnostic.note.is_none()
+									)
+								_: False
+				_: False
+
+
+tests: TestSuite = {
+	description = "Blorp 2 declared bounds, family normalization and method values",
+	tests = [
+		("concrete trait fixture remains accepted", test_concrete_trait_control_remains_accepted),
+		("declared bounds authorize calls and forwarding", test_declared_bounds_authorize_generic_calls_and_forwarding),
+		("full family binds the actual authored function", test_full_receiver_family_uses_the_authored_body_parameter_owner),
+		("default body has a genuine normalized owner", test_default_body_has_a_real_function_and_normalized_self),
+		("expected callable admits an unbound method", test_expected_callable_type_admits_an_unbound_method_value),
+		("bodyless implementation reuses a genuine default", test_bodyless_implementation_reuses_the_genuine_trait_default),
+		("normalized family parameters retain the generic tail restriction", test_receiver_family_normalization_preserves_the_generic_tail_restriction),
+	]
+}

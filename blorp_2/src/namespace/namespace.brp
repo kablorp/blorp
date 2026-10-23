@@ -16,7 +16,7 @@ import:
 	option: is_some
 	../utils/boolean: and
 	../utils/ids:
-		TraitId, ImplId, TraitRow, trait_number, impl_number, TraitMethodId, same_trait_method, inventory_traits, inventory_implementations, FunctionRole(FreeFunctionBody, ImplementationBody), ConstantId, ConstantRow, FunctionId, FunctionRow, OpaqueId, RecordId, UnionId, UnionRow, VariantId,
+		TraitId, ImplId, TraitRow, trait_method_header, trait_number, impl_number, TraitMethodId, same_trait_method, inventory_traits, inventory_implementations, FunctionRole(FreeFunctionBody, ImplementationBody, TraitDefaultBody), ConstantId, ConstantRow, FunctionId, FunctionRow, OpaqueId, RecordId, UnionId, UnionRow, VariantId,
 		constant_number, function_number, inventory_constants, inventory_functions, next_nominal, record_number,
 		opaque_number, union_number, variant_number, variant_owner,
 		NominalRow(UnionDeclarationRow, RecordDeclarationRow, OpaqueDeclarationRow),
@@ -161,6 +161,7 @@ fixed union NamespaceProblem:
 	NameConflict(Conflict)
 	SelectionFailure(ModulePath, ImportSelection, SelectionProblem)
 	InvalidImplementationTrait(TypeSyntax)
+	InvalidTraitInventory(Span)
 
 
 -- A module's scope as it is built, with its first problem in source order.
@@ -462,10 +463,11 @@ private pure func written_before(nominal: NominalRow, function: Option[FunctionR
 -- rows grouped by module in module order, so one cursor per kind reads each
 -- row once; its next nominal declaration, function and constant are
 -- taken in the order they are written.
-private pure func declared_entries(parsed: ParsedContents) -> List[List[Entry]]:
+private pure func declared_entries(parsed: ParsedContents) -> Result[List[List[Entry]], NamespaceProblem]:
 	functions = inventory_functions(parsed.declarations)
 	constants = inventory_constants(parsed.declarations)
 	traits = inventory_traits(parsed.declarations)
+	var failure: Option[NamespaceProblem] = None
 	var traits_seen = 0
 	var builtins_seen = 0
 	var functions_seen = 0
@@ -537,7 +539,9 @@ private pure func declared_entries(parsed: ParsedContents) -> List[List[Entry]]:
 				Some(trait_row):
 					entries = entries.append({ name = trait_row.type_name, entity = Trait(trait_row.id), origin = Declared(trait_row.visibility) })
 					for method in trait_row.methods:
-						entries = entries.append({ name = method.declaration.header.function_name, entity = Method(method.id), origin = Declared(trait_row.visibility) })
+						match trait_method_header(method, parsed.declarations):
+							Some(header): entries = entries.append({ name = header.function_name, entity = Method(method.id), origin = Declared(trait_row.visibility) })
+							None: failure = Some(InvalidTraitInventory(method.span))
 					traits_seen = IntOps.add(traits_seen, 1)
 				None:
 					match constant:
@@ -563,12 +567,14 @@ private pure func declared_entries(parsed: ParsedContents) -> List[List[Entry]]:
 										Some(function_row):
 											match function_row.role:
 												FreeFunctionBody: entries = entries.append({ name = function_row.declaration.function_name, entity = Function(function_row.id), origin = Declared(function_row.declaration.visibility) })
-												ImplementationBody: void
+												ImplementationBody | TraitDefaultBody: void
 											functions_seen = IntOps.add(functions_seen, 1)
 										None:
 											reading = False
 		declared = declared.append(entries)
-	declared
+	match failure:
+		Some(problem): Err(problem)
+		None: Ok(declared)
 
 
 -- The prelude's selections, as every user module receives them. Its aliases
@@ -630,6 +636,14 @@ private pure func trait_reference(names: IntMaps.IntMap[Entry], scopes: List[Mod
 		None: None
 
 
+-- Bounds resolve through the same visible trait lookup as implementation heads.
+pure func resolve_trait(namespace: Namespace, module: ModuleId, written: TypeSyntax) -> Option[TraitId]:
+	scopes = from_opaque Namespace(namespace)
+	match scopes.get(module_number(module)):
+		Some(scope): trait_reference(scope.names, scopes, written)
+		None: None
+
+
 -- This is name resolution only. Check later accepts members/receiver/coherence.
 -- The resolved TraitId is retained once; method membership stays in inventory.
 private pure func publish_implementations(built: BuiltScope, scopes: List[ModuleScope], module: ModuleId, parsed: ParsedContents) -> BuiltScope:
@@ -644,14 +658,17 @@ private pure func publish_implementations(built: BuiltScope, scopes: List[Module
 					match inventory_traits(parsed.declarations).get(trait_number(id)):
 						Some(owner):
 							for method in owner.methods:
-								var name: WrittenName = { method.declaration.header.function_name | span = implementation.header.span }
-								for body in implementation.methods:
-									match inventory_functions(parsed.declarations).get(function_number(body)):
-										Some(function):
-											if same_name(function.declaration.function_name.id, name.id):
-												name = function.declaration.function_name
-										None: void
-								next = enter(next, { name = name, entity = Method(method.id), origin = Declared(implementation.header.visibility) })
+								match trait_method_header(method, parsed.declarations):
+									None: next = { next | problem = first_problem(next.problem, InvalidTraitInventory(method.span)) }
+									Some(header):
+										var name: WrittenName = { header.function_name | span = implementation.header.span }
+										for body in implementation.methods:
+											match inventory_functions(parsed.declarations).get(function_number(body)):
+												Some(function):
+													if same_name(function.declaration.function_name.id, name.id):
+														name = function.declaration.function_name
+												None: void
+										next = enter(next, { name = name, entity = Method(method.id), origin = Declared(implementation.header.visibility) })
 						None: next = { next | problem = first_problem(next.problem, InvalidImplementationTrait(implementation.header.trait_name)) }
 	next
 
@@ -660,7 +677,7 @@ private pure func publish_implementations(built: BuiltScope, scopes: List[Module
 -- and the prelude precedes every user module in dependency order.
 pure func build_namespace(program: ParsedProgram) -> Result[Namespace, NamespaceProblem]:
 	parsed = parsed_contents(program)
-	declared = declared_entries(parsed)
+	declared ?= declared_entries(parsed)
 	none: List[MethodImport] = []
 	nothing: List[Entry] = []
 	empty = empty_scope()
@@ -986,6 +1003,7 @@ pure func offered_function(entry: Entry) -> Option[FunctionId]:
 pure func namespace_problem_span(problem: NamespaceProblem) -> Span:
 	match problem:
 		InvalidImplementationTrait(written): type_span(written)
+		InvalidTraitInventory(span): span
 		NameConflict(conflict):
 			conflict.incoming.name.span
 		SelectionFailure(_, _, NotAConstructor(constructor)):

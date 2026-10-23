@@ -3,7 +3,7 @@ import:
 	../../../src/parse/parse: ParsedModule, module_contents, parse_module
 	../../../src/utils/names: name_spelling, program_names
 	../../../src/utils/source: module_source, root_module_id, same_module, same_source
-	../../../src/utils/syntax: Diagnostic, ParsedFunctionGroup(FreeFunction, ImplementationGroup), ParsedBody(ParsedValueBody), ExpressionBase(IntegerExpression), TypeSyntax(AtomicType, QualifiedType), Purity(Pure), same_purity
+	../../../src/utils/syntax: Diagnostic, ParsedTraitMethod(AbstractTraitMethod, DefaultTraitMethod), ParsedReceiverHead(ReceiverName), ParsedFunctionGroup(FreeFunction, ImplementationGroup), ParsedBody(ParsedValueBody), ExpressionBase(IntegerExpression, NameExpression), TypeSyntax(AtomicType, QualifiedType), Purity(Pure), same_purity
 	test: TestSuite
 
 
@@ -26,18 +26,18 @@ pure func test_signature_only_trait_requirement_has_located_fields() -> Bool:
 			match contents.traits:
 				[declaration]:
 					match declaration.methods:
-						[method]:
-							match (method.header.parameters, method.header.return_type):
+						[AbstractTraitMethod(header, span)]:
+							match (header.parameters, header.return_type):
 								([left, right], Some(AtomicType(result))):
 									match (left.type_name, right.type_name):
 										(AtomicType(first), AtomicType(second)):
 											(contents.functions.is_empty() and same_module(declaration.module, root_module_id())
 												and name_spelling(contents.names, declaration.type_name.id) == Some("Equatable")
 												and declaration.type_name.span.start == 6 and declaration.type_name.span.end == 15
-												and name_spelling(contents.names, method.header.function_name.id) == Some("equals")
-												and method.header.function_name.span.start == 31 and method.header.function_name.span.end == 37
-												and same_source(method.span.source, module_source(root_module_id())) and method.span.start == 21 and method.span.end == REQUIREMENT.length() - 1
-												and same_purity(method.header.purity, Pure) and method.header.type_parameters.is_empty()
+												and name_spelling(contents.names, header.function_name.id) == Some("equals")
+												and header.function_name.span.start == 31 and header.function_name.span.end == 37
+												and same_source(span.source, module_source(root_module_id())) and span.start == 21 and span.end == REQUIREMENT.length() - 1
+												and same_purity(header.purity, Pure) and header.type_parameters.is_empty()
 												and name_spelling(contents.names, first.id) == Some("Self") and name_spelling(contents.names, second.id) == Some("Self")
 												and name_spelling(contents.names, result.id) == Some("Bool"))
 										_: False
@@ -53,7 +53,7 @@ pure func test_trait_method_omitted_return_is_signature_void() -> Bool:
 			match module_contents(module).traits:
 				[declaration]:
 					match declaration.methods:
-						[method]: method.header.return_type.is_none()
+						[AbstractTraitMethod(header, span)]: header.return_type.is_none()
 						_: False
 				_: False
 
@@ -66,7 +66,7 @@ pure func test_implementation_owns_real_bodies_between_free_functions() -> Bool:
 			match contents.functions:
 				[FreeFunction(before), ImplementationGroup(header, [method]), FreeFunction(after)]:
 					match (header.trait_name, header.receiver, method.body):
-						(QualifiedType(requirement, [], _), AtomicType(receiver), ParsedValueBody(value)):
+						(QualifiedType(requirement, [], _), ReceiverName(receiver), ParsedValueBody(value)):
 							match value.base:
 								IntegerExpression(7):
 									(same_module(header.module, root_module_id()) and same_module(method.module, root_module_id())
@@ -88,8 +88,38 @@ private pure func rejected_at(prefix: String, marked: String, suffix: String, me
 				and error.message == message and error.help == help and error.note.is_none())
 
 
-pure func test_requirement_default_body_is_rejected_at_colon() -> Bool:
-	rejected_at("trait Equatable:\n    pure func equals(left: Self, right: Self) -> Bool", ":", "\n        True\n", "trait method defaults are not supported yet", "declare the signature only")
+pure func test_trait_default_owns_its_actual_parsed_body() -> Bool:
+	source: String =
+		|trait Equatable:
+		|    pure func equals(left: Self, right: Self) -> Bool:
+		|        True
+		|
+	match parsed(source):
+		Err(_): False
+		Ok(module):
+			contents = module_contents(module)
+			match contents.traits:
+				[declaration]:
+					match declaration.methods:
+						[DefaultTraitMethod(function, span)]:
+							match function.body:
+								ParsedValueBody(value):
+									match value.base:
+										NameExpression(name):
+											(
+												contents.functions.is_empty()
+												and same_module(function.module, declaration.module)
+												and name_spelling(contents.names, name.id) == Some("True")
+												and name_spelling(contents.names, function.function_name.id) == Some("equals")
+												and same_purity(function.purity, Pure)
+												and function.type_parameters.is_empty()
+												and span.start < function.function_name.span.start
+												and function.function_name.span.end < value.span.start
+											)
+										_: False
+								_: False
+						_: False
+				_: False
 
 
 pure func test_trait_parameters_are_rejected_at_their_opening() -> Bool:
@@ -97,7 +127,90 @@ pure func test_trait_parameters_are_rejected_at_their_opening() -> Bool:
 
 
 pure func test_generic_implementation_prefix_is_rejected_at_its_opening() -> Bool:
-	rejected_at("implements", "[", "T] Equatable for Box[T]:\n    pure func equals(left: Box[T], right: Box[T]) -> Bool:\n        True\n", "generic implementations are not supported yet", "implement a concrete receiver type")
+	rejected_at("implements", "[", "T] Equatable for Box[T]:\n    pure func equals(left: Box[T], right: Box[T]) -> Bool:\n        True\n", "implementation parameters belong after the receiver head", "write implements Equatable for Box[T: Equatable]")
+
+
+private pure func default_only_at_end(ending: String) -> Bool:
+	match parsed("implements Observe for Int" + ending):
+		Err(_): False
+		Ok(module):
+			contents = module_contents(module)
+			match contents.functions:
+				[ImplementationGroup(header, [])]:
+					match header.receiver:
+						ReceiverName(name):
+							(
+								header.type_parameters.is_empty()
+								and name_spelling(contents.names, name.id) == Some("Int")
+								and same_module(header.module, root_module_id())
+							)
+						_: False
+				_: False
+
+
+pure func test_default_only_implementation_ends_at_lf_or_eof() -> Bool:
+	default_only_at_end("\n") and default_only_at_end("")
+
+
+pure func test_bounded_function_parameters_keep_names_and_bound_order() -> Bool:
+	source: String =
+		|pure func same[Element: Eq + Observe, Other](left: Element, right: Other) -> Element:
+		|    left
+		|
+	match parsed(source):
+		Err(_): False
+		Ok(module):
+			contents = module_contents(module)
+			match contents.functions:
+				[FreeFunction(function)]:
+					match function.type_parameters:
+						[first, second]:
+							match first.bounds:
+								[AtomicType(equality), AtomicType(observe)]:
+									(
+										name_spelling(contents.names, first.name.id) == Some("Element")
+										and name_spelling(contents.names, second.name.id) == Some("Other")
+										and name_spelling(contents.names, equality.id) == Some("Eq")
+										and name_spelling(contents.names, observe.id) == Some("Observe")
+										and first.name.span.end < equality.span.start
+										and equality.span.end < observe.span.start
+										and observe.span.end < second.name.span.start
+										and second.bounds.is_empty()
+									)
+								_: False
+						_: False
+				_: False
+
+
+pure func test_receiver_binders_own_their_bounds_without_type_patterns() -> Bool:
+	source: String =
+		|implements Eq for Box[Element: Eq]
+		|
+	match parsed(source):
+		Err(_): False
+		Ok(module):
+			contents = module_contents(module)
+			match contents.functions:
+				[ImplementationGroup(header, [])]:
+					match (header.receiver, header.type_parameters):
+						(ReceiverName(receiver), [parameter]):
+							match parameter.bounds:
+								[AtomicType(bound)]:
+									(
+										name_spelling(contents.names, receiver.id) == Some("Box")
+										and name_spelling(contents.names, parameter.name.id) == Some("Element")
+										and name_spelling(contents.names, bound.id) == Some("Eq")
+										and receiver.span.end < parameter.name.span.start
+										and parameter.name.span.end < bound.span.start
+									)
+								_: False
+						_: False
+				_: False
+
+
+
+pure func test_bound_separator_does_not_enable_expression_addition() -> Bool:
+	rejected_at("pure func sum(left: Int, right: Int) -> Int:\n    left ", "+", " right\n", "'+' is only supported between trait bounds", "use a named arithmetic function in expressions; write multiple bounds as T: First + Second")
 
 
 tests: TestSuite = {
@@ -106,8 +219,12 @@ tests: TestSuite = {
 		("signature-only requirement retains located fields without a function body", test_signature_only_trait_requirement_has_located_fields),
 		("omitted requirement return uses the implicit Void signature", test_trait_method_omitted_return_is_signature_void),
 		("implementation owns real bodies in written function order", test_implementation_owns_real_bodies_between_free_functions),
-		("trait default body rejects at its colon", test_requirement_default_body_is_rejected_at_colon),
+		("trait default owns its actual parsed body", test_trait_default_owns_its_actual_parsed_body),
 		("trait type parameters reject at their opening bracket", test_trait_parameters_are_rejected_at_their_opening),
 		("generic implementation prefix rejects at its opening bracket", test_generic_implementation_prefix_is_rejected_at_its_opening),
+		("default-only implementation ends at LF or EOF", test_default_only_implementation_ends_at_lf_or_eof),
+		("bounded function parameters keep names and bound order", test_bounded_function_parameters_keep_names_and_bound_order),
+		("receiver binders own bounds without type patterns", test_receiver_binders_own_their_bounds_without_type_patterns),
+		("bound separator does not enable expression addition", test_bound_separator_does_not_enable_expression_addition),
 	]
 }

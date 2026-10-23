@@ -3,8 +3,8 @@ import:
 	../../src/check/check as Check: CheckFailure, CheckedProgram, check_errors
 	../../src/check/model as Checked
 	../../src/check/errors: BuiltinError(BuiltinTypesRejected), CheckError, CheckErrorKind, CheckErrors, builtin_error
+	../../src/check/traits: designated_trait, accept_trait_contracts, validate_implementations
 	../../src/check/signatures: CheckedSignatures, validate_signatures
-	../../src/check/traits: validate_traits
 	../../src/namespace/namespace: Namespace
 	../../src/check/render: render_failure
 	../../src/lex/lex: lex
@@ -12,6 +12,7 @@ import:
 	../../src/parse/assemble: ParsedProgram, parsed_contents
 	../../src/namespace/builtins: CheckedFoundation, check_builtin_types, render_builtin_type_error
 	../../src/utils/syntax: Diagnostic, LexedProgram
+	../../src/utils/ids: TraitId
 	./module_input: ModuleInput, TestFoundation, parse_modules_with_base, parse_root
 	result: and_then, map_err
 	int as IntOps
@@ -39,28 +40,39 @@ pure func initial_names() -> Result[InitialNames, Diagnostic]:
 	Ok(foundation.initial)
 
 
--- Signature validation against the designation of a foundation the builtin
--- check accepts, as checking composes them.
-pure func accepted_signatures(program: ParsedProgram, namespace: Namespace) -> Result[CheckedSignatures, CheckError]:
+-- Test setup borrows one accepted contract list across the signatures and
+-- implementation boundaries, while signature-only observers stop before the latter.
+fixed record PreparedSignatures {
+	signatures: CheckedSignatures,
+	contracts: List[Checked.AcceptedTrait],
+	canonical: Option[TraitId]
+}
+
+
+pure func prepare_signatures(program: ParsedProgram, namespace: Namespace) -> Result[PreparedSignatures, CheckError]:
 	foundation: CheckedFoundation ?= match check_builtin_types(program):
 		Ok(accepted): Ok(accepted)
 		Err(error): Err(builtin_error(error.span, BuiltinTypesRejected(error)))
-	validate_signatures(parsed_contents(program), namespace, foundation.designated)
+	parsed = parsed_contents(program)
+	canonical = designated_trait(parsed, namespace)
+	contracts ?= accept_trait_contracts(parsed, namespace, foundation.designated.boolean, canonical)
+	signatures ?= validate_signatures(parsed, namespace, foundation.designated, contracts)
+	Ok({ signatures = signatures, contracts = contracts, canonical = canonical })
 
 
--- Phase observers use the same validated authority that checking passes to
--- constants and bodies, without checking those later products in advance.
+pure func accepted_signatures(program: ParsedProgram, namespace: Namespace) -> Result[CheckedSignatures, CheckError]:
+	prepared ?= prepare_signatures(program, namespace)
+	Ok(prepared.signatures)
+
+
 pure func accepted_traits(
 	program: ParsedProgram,
 	namespace: Namespace,
-	signatures: CheckedSignatures,
+	prepared: PreparedSignatures,
 ) -> Result[Checked.AcceptedTraits, CheckError]:
-	foundation: CheckedFoundation ?= match check_builtin_types(program):
-		Ok(accepted): Ok(accepted)
-		Err(error): Err(builtin_error(error.span, BuiltinTypesRejected(error)))
-	validate_traits(
-		parsed_contents(program), namespace, signatures.implementation_headers,
-		signatures.functions, foundation.designated.boolean,
+	validate_implementations(
+		parsed_contents(program), namespace, prepared.signatures.implementation_headers,
+		prepared.signatures.functions, prepared.contracts, prepared.canonical,
 	)
 
 

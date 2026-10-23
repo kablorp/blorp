@@ -1,0 +1,196 @@
+import:
+	../../../src/check/check: CheckFailure, check, check_errors
+	../../../src/check/model as Model
+	../../../src/check/errors: CheckErrorKind(TraitRejection, TypeDeclarationRejection), TypeDeclarationError(TypeParameterTypeNameConflict), TraitError(MissingTraitBound, DuplicateImplementation)
+	../../../src/check/render: render_failure
+	../../../src/parse/assemble: parsed_contents
+	../../../src/utils/ids: inventory_records, inventory_functions, inventory_implementations, inventory_traits, trait_number, TraitId
+	../../../src/utils/names: same_name
+	../../../src/utils/syntax: ParsedBody(ParsedValueBody), ExpressionBase(DirectApplication, NameExpression), ParsedStatement(BindingStatement), Span, same_span, DiagnosticNote(PreviousDeclaration)
+	../../../src/namespace/namespace: same_head, TypeHead(RecordHead)
+	../module_input: parse_modules_with_base, test_base
+	test: TestSuite
+
+
+private REQUIREMENT: String =
+	|trait Equatable:
+	|    pure func equals(left: Self, right: Self) -> Bool
+	|implements Equatable for Int:
+	|    pure func equals(left: Self, right: Self) -> Bool:
+	|        builtin("int.equals")
+	|
+
+
+private pure func missing_bound_matches(failure: CheckFailure, owner: TraitId, expected_receiver: Model.TypeRef, span: Span) -> Bool:
+	error = check_errors(failure).first
+	diagnostic = render_failure(failure).first
+	match error.kind:
+		TraitRejection(MissingTraitBound(required, receiver)):
+			(
+				trait_number(required) == trait_number(owner)
+				and Model.same_type(receiver, expected_receiver)
+				and same_span(error.span, span)
+				and same_span(diagnostic.span, span)
+				and diagnostic.message == "type does not satisfy the required trait bound"
+				and diagnostic.help == "add the required trait to this function's type parameter bounds, or provide an implementation for the concrete receiver"
+				and diagnostic.note.is_none()
+			)
+		_: False
+
+
+pure func test_only_valid_callers_do_not_supply_a_missing_declared_bound() -> Bool:
+	body_source: String =
+		|pure func missing[Element](left: Element, right: Element) -> Bool:
+		|    equals(left, right)
+		|func main() -> Int:
+		|    result = missing(7, 9)
+		|    0
+		|
+	source = REQUIREMENT + body_source
+	match parse_modules_with_base([{ source = source, targets = [] }], test_base()):
+		Err(_): False
+		Ok(parsed):
+			contents = parsed_contents(parsed)
+			match (inventory_traits(contents.declarations), inventory_functions(contents.declarations), check(parsed)):
+				([owner], [_, missing, _], Err(failure)):
+					match missing.declaration.body:
+						ParsedValueBody(value):
+							match value.base:
+								DirectApplication(name, _):
+									missing_bound_matches(failure, owner.id, Model.ParameterType(Model.type_parameter_id(Model.FunctionDeclaration(missing.id), 0)), name.span)
+								_: False
+						_: False
+				_: False
+
+
+pure func test_an_authored_family_does_not_fall_back_when_its_bound_fails() -> Bool:
+	-- An explicit Box[Float] annotation supplies the nominal head independently
+	-- of the trait obligation; implementation search must never infer that head.
+	annotated_body: String =
+		|fixed record Box[Element] { value: Element }
+		|implements Equatable for Box[Element: Equatable]:
+		|    pure func equals(left: Self, right: Self) -> Bool:
+		|        equals(left.value, right.value)
+		|func main() -> Int:
+		|    left: Box[Float] = {value = 1.0}
+		|    right: Box[Float] = {value = 2.0}
+		|    result = equals(left, right)
+		|    0
+		|
+	annotated = REQUIREMENT + annotated_body
+	match parse_modules_with_base([{ source = annotated, targets = [] }], test_base()):
+		Err(_): False
+		Ok(parsed):
+			contents = parsed_contents(parsed)
+			match (inventory_traits(contents.declarations), inventory_functions(contents.declarations), check(parsed)):
+				([owner], [_, _, main], Err(failure)):
+					match main.declaration.statements:
+						[BindingStatement(_), BindingStatement(_), BindingStatement(result)]:
+							match result.initializer.base:
+								DirectApplication(name, _): missing_bound_matches(failure, owner.id, Model.FloatType, name.span)
+								_: False
+						_: False
+				_: False
+
+
+pure func test_a_named_reference_discharge_uses_its_own_declared_context() -> Bool:
+	body_source: String =
+		|pure func limited[Element: Equatable](value: Element) -> Element:
+		|    value
+		|pure func missing[Other](value: Other) -> Other:
+		|    callback: pure (Other) -> Other = limited
+		|    callback(value)
+		|func main() -> Int:
+		|    0
+		|
+	source = REQUIREMENT + body_source
+	match parse_modules_with_base([{ source = source, targets = [] }], test_base()):
+		Err(_): False
+		Ok(parsed):
+			contents = parsed_contents(parsed)
+			match (inventory_traits(contents.declarations), inventory_functions(contents.declarations), check(parsed)):
+				([owner], [_, _, missing, _], Err(failure)):
+					match missing.declaration.statements:
+						[BindingStatement(callback)]:
+							match callback.initializer.base:
+								NameExpression(name): missing_bound_matches(failure, owner.id, Model.ParameterType(Model.type_parameter_id(Model.FunctionDeclaration(missing.id), 0)), name.span)
+								_: False
+						_: False
+				_: False
+
+
+pure func test_an_uncalled_generic_body_cannot_infer_a_bound_from_future_callers() -> Bool:
+	body_source: String =
+		|pure func missing[Element](left: Element, right: Element) -> Bool:
+		|    equals(left, right)
+		|func main() -> Int:
+		|    0
+		|
+	match parse_modules_with_base([{ source = REQUIREMENT + body_source, targets = [] }], test_base()):
+		Err(_): False
+		Ok(parsed):
+			contents = parsed_contents(parsed)
+			match (inventory_traits(contents.declarations), inventory_functions(contents.declarations), check(parsed)):
+				([owner], [_, missing, _], Err(failure)):
+					match missing.declaration.body:
+						ParsedValueBody(value):
+							match value.base:
+								DirectApplication(name, _):
+									missing_bound_matches(failure, owner.id, Model.ParameterType(Model.type_parameter_id(Model.FunctionDeclaration(missing.id), 0)), name.span)
+								_: False
+						_: False
+				_: False
+
+
+pure func test_receiver_bounds_do_not_create_a_second_implementation_head() -> Bool:
+	family_source: String =
+		|trait Observe:
+		|    pure func observe(value: Self) -> Int
+		|fixed record Box[Element] { value: Element }
+		|implements Equatable for Box[FirstElement: Equatable]:
+		|    pure func equals(left: Self, right: Self) -> Bool:
+		|        True
+		|implements Equatable for Box[SecondElement: Observe]:
+		|    pure func equals(left: Self, right: Self) -> Bool:
+		|        True
+		|func main() -> Int:
+		|    0
+		|
+	match parse_modules_with_base([{ source = REQUIREMENT + family_source, targets = [] }], test_base()):
+		Err(_): False
+		Ok(parsed):
+			contents = parsed_contents(parsed)
+			match (inventory_traits(contents.declarations), inventory_records(contents.declarations), inventory_implementations(contents.declarations), check(parsed)):
+				([owner, _], [record_owner], [_, first, repeated], Err(failure)):
+					errors = check_errors(failure)
+					diagnostics = render_failure(failure)
+					error = errors.first
+					diagnostic = diagnostics.first
+					match (error.kind, diagnostic.note):
+						(TraitRejection(DuplicateImplementation(required, receiver, previous)), Some(PreviousDeclaration(note))):
+							(
+								trait_number(required) == trait_number(owner.id)
+								and same_head(receiver, RecordHead(record_owner.id))
+								and same_span(previous, first.header.span)
+								and same_span(note, first.header.span)
+								and same_span(error.span, repeated.header.span)
+								and same_span(diagnostic.span, repeated.header.span)
+								and errors.remaining.is_empty()
+								and diagnostics.remaining.is_empty()
+								and diagnostic.message == "this trait already has an implementation for the receiver"
+								and diagnostic.help == "keep one implementation for each trait and receiver head"
+							)
+						_: False
+				_: False
+
+
+tests: TestSuite = {
+	description = "Blorp 2 declared trait-bound rejection contracts",
+	tests = [
+		("valid callers do not supply missing declared bounds", test_only_valid_callers_do_not_supply_a_missing_declared_bound),
+		("authored family never falls back after a failed bound", test_an_authored_family_does_not_fall_back_when_its_bound_fails),
+		("named reference discharges in the declaration's context", test_a_named_reference_discharge_uses_its_own_declared_context),
+		("uncalled generic body still needs its declared bound", test_an_uncalled_generic_body_cannot_infer_a_bound_from_future_callers),
+		("bounds never distinguish a full implementation head", test_receiver_bounds_do_not_create_a_second_implementation_head),
+	]
+}

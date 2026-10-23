@@ -5,23 +5,23 @@ the resolved requirement-to-body mapping consumed by checking and specialization
 ---
 import:
 	./declarations: TypeScope, type_access, previous_declaration, resolve_type, Substitution, substitute_type
-	./errors: CheckError, TraitError(DuplicateRequirementParameter, ImpureRequirement, GenericRequirement, FirstParameterMustBeSelf, CallableFormalDeferred, ConcreteReceiverRequired, OrphanImplementation, DuplicateImplementation, MissingImplementationMethod, UnknownImplementationMethod, DuplicateImplementationMethod, ImplementationSignatureMismatch, MalformedCanonicalTrait), trait_error
-	./model: AcceptedTraits, AcceptedTrait, AcceptedTraitMethod, AcceptedImplementation, ImplementedMethod, ImplementationHeader, FunctionSignature, TypeUse, TypeRef(ParameterType, VoidType, IntType, FloatType, StringType, CallableType, UnionType, RecordType, OpaqueType), TypeParameterOwner(TraitDeclaration), type_parameter_id, same_type, same_types
+	./errors: CheckError, checker_invariant, CheckerInvariant(InvalidFunctionContract), TraitError(DuplicateRequirementParameter, ImpureRequirement, GenericRequirement, FirstParameterMustBeSelf, CallableFormalDeferred, OrphanImplementation, DuplicateImplementation, MissingImplementationMethod, MissingTraitBound, UnknownImplementationMethod, DuplicateImplementationMethod, ImplementationSignatureMismatch, MalformedCanonicalTrait), trait_error
+	./model: AcceptedTraits, AcceptedTrait, AcceptedTraitMethod, AcceptedImplementation, ImplementedMethod, ImplementedBody(AuthoredMethod, TraitDefault), TraitRequirement, receiver_arguments, receiver_type, type_head, parameter_owner, same_parameter, ImplementationHeader, FunctionSignature, TypeUse, TypeRef(ListType, AppliedRecordType, AppliedUnionType, ParameterType, VoidType, IntType, FloatType, StringType, CallableType, UnionType, RecordType, OpaqueType), TypeParameterOwner(TraitDeclaration), type_parameter_id, same_type, same_types
 	./signatures: AcceptedFunction
 	../namespace/builtins: DesignatedBoolean
-	../namespace/namespace: Namespace, implementation_trait
+	../namespace/namespace: Namespace, TypeHead(PrimitiveHead, ListHead, RecordHead, UnionHead, OpaqueHead), same_head, named_trait, implementation_trait
 	../parse/assemble: ParsedContents
-	../utils/ids: VariantId, trait_method_number, trait_method_owner, TraitRow, TraitMethodRow, ImplRow, TraitId, inventory_traits, inventory_implementations, inventory_functions, inventory_records, inventory_unions, inventory_opaques, trait_number, impl_number, function_number, record_number, union_number, opaque_number, variant_owner, same_trait_method
+	../utils/ids: FunctionId, VariantId, TraitMethodId, TraitMethodDeclaration(RequiredMethod, DefaultMethod), trait_method_header, trait_method_number, trait_method_owner, TraitRow, TraitMethodRow, ImplRow, TraitId, inventory_traits, inventory_implementations, inventory_functions, inventory_records, inventory_unions, inventory_opaques, trait_number, impl_number, function_number, record_number, union_number, opaque_number, variant_owner, same_trait_method
 	../utils/names: contextual_words, foundation_words, same_name
 	../utils/source: ModuleId, same_module, module_number, ModuleKind(LibraryModule)
-	../utils/syntax: WrittenName, TypeSyntax(CallableTypeSyntax), Purity(Pure), type_span, same_purity, Span
+	../utils/syntax: FunctionHeader, WrittenName, TypeSyntax(CallableTypeSyntax), Purity(Pure), type_span, same_purity, Span
 	int as IntOps
 	option: map, to_result, is_some, is_none
 	../utils/boolean: not, and, or
 
 
-private pure func requirement(row: TraitMethodRow, scope: TypeScope, owner: TraitId) -> Result[AcceptedTraitMethod, CheckError]:
-	header = row.declaration.header
+private pure func requirement(row: TraitMethodRow, scope: TypeScope, owner: TraitId, parsed: ParsedContents) -> Result[AcceptedTraitMethod, CheckError]:
+	header ?= trait_method_header(row, parsed.declarations).to_result(checker_invariant(row.span, InvalidFunctionContract))
 	pure_requirement: Void ?= if same_purity(header.purity, Pure):
 		Ok(void)
 	else:
@@ -58,11 +58,14 @@ private pure func requirement(row: TraitMethodRow, scope: TypeScope, owner: Trai
 	result_span = match header.return_type:
 		Some(written): type_span(written)
 		None: header.function_name.span
-	unique ?= unique_requirement_parameters(row)
-	Ok({ id = row.id, signature = { type_parameters = [self], purity = Pure, parameters = parameters, return_type = { value_type = result, span = result_span } } })
+	unique ?= unique_requirement_parameters(row.id, header)
+	default_body: Option[FunctionId] = match row.declaration:
+		RequiredMethod(_): None
+		DefaultMethod(function): Some(function)
+	Ok({ id = row.id, default_body = default_body, signature = { type_parameters = [self], requirements = [], purity = Pure, parameters = parameters, return_type = { value_type = result, span = result_span } } })
 
 
-private pure func accept_trait(row: TraitRow, parsed: ParsedContents, namespace: Namespace, boolean: DesignatedBoolean[VariantId]) -> Result[AcceptedTrait, CheckError]:
+private pure func accept_trait(row: TraitRow, parsed: ParsedContents, namespace: Namespace, boolean: DesignatedBoolean[VariantId], canonical: Option[TraitId]) -> Result[AcceptedTrait, CheckError]:
 	self = type_parameter_id(TraitDeclaration(row.id), 0)
 	scope: TypeScope = {
 		records = inventory_records(parsed.declarations), unions = inventory_unions(parsed.declarations),
@@ -72,7 +75,7 @@ private pure func accept_trait(row: TraitRow, parsed: ParsedContents, namespace:
 	var methods: List[AcceptedTraitMethod] = []
 	var failure: Option[CheckError] = None
 	for method in row.methods:
-		match requirement(method, scope, row.id):
+		match requirement(method, scope, row.id, parsed):
 			Ok(accepted): methods = methods.append(accepted)
 			Err(error):
 				failure = Some(error)
@@ -80,15 +83,25 @@ private pure func accept_trait(row: TraitRow, parsed: ParsedContents, namespace:
 	ready: Void ?= match failure:
 		Some(error): Err(error)
 		None: Ok(void)
-	canonical: Void ?= if and(same_module(row.module, parsed.foundation.types), same_name(row.type_name.id, foundation_words(parsed.names).equatable_word)):
-		valid = match methods:
+	designated: Bool = match canonical:
+		Some(id): IntOps.equals(trait_number(row.id), trait_number(id))
+		None: False
+	canonical_shape: Void ?= if designated:
+		var abstract_methods: List[AcceptedTraitMethod] = []
+		for method in methods:
+			if method.default_body.is_none():
+				abstract_methods = abstract_methods.append(method)
+		valid: Bool = match abstract_methods:
 			[method]:
-				match row.methods:
-					[written]:
-						and(same_name(written.declaration.header.function_name.id, foundation_words(parsed.names).equals_word),
-							and(same_types(method.signature.parameters.map(pure func(parameter): parameter.value_type), [ParameterType(self), ParameterType(self)]),
-								same_type(method.signature.return_type.value_type, UnionType(variant_owner(boolean.true_variant)))))
-					_: False
+				match row.methods.get(trait_method_number(method.id)):
+					Some(written):
+						match written.declaration:
+							RequiredMethod(header):
+								and(same_name(header.function_name.id, foundation_words(parsed.names).equals_word),
+									and(same_types(method.signature.parameters.map(pure func(parameter): parameter.value_type), [ParameterType(self), ParameterType(self)]),
+										same_type(method.signature.return_type.value_type, UnionType(variant_owner(boolean.true_variant)))))
+							DefaultMethod(_): False
+					None: False
 			_: False
 		if valid:
 			Ok(void)
@@ -99,16 +112,15 @@ private pure func accept_trait(row: TraitRow, parsed: ParsedContents, namespace:
 	Ok({ id = row.id, methods = methods })
 
 
-private pure func receiver_module(receiver: TypeRef, parsed: ParsedContents) -> Option[ModuleId]:
+private pure func receiver_module(receiver: TypeHead, parsed: ParsedContents) -> Option[ModuleId]:
 	match receiver:
-		IntType | FloatType | StringType | VoidType: Some(parsed.foundation.types)
-		RecordType(id):
+		PrimitiveHead(_) | ListHead: Some(parsed.foundation.types)
+		RecordHead(id):
 			inventory_records(parsed.declarations).get(record_number(id)).map(pure func(owner): owner.declaration.module)
-		UnionType(id):
+		UnionHead(id):
 			inventory_unions(parsed.declarations).get(union_number(id)).map(pure func(owner): owner.module)
-		OpaqueType(id):
+		OpaqueHead(id):
 			inventory_opaques(parsed.declarations).get(opaque_number(id)).map(pure func(owner): owner.declaration.module)
-		_: None
 
 private pure func accept_implementation(
 	row: ImplRow,
@@ -119,10 +131,10 @@ private pure func accept_implementation(
 	functions: List[AcceptedFunction],
 	previous: List[AcceptedImplementation],
 ) -> Result[AcceptedImplementation, CheckError]:
-	owner ?= implementation_trait(namespace, row.header.module, row.id).to_result(trait_error(row.header.span, ConcreteReceiverRequired))
-	written ?= inventory_traits(parsed.declarations).get(trait_number(owner)).to_result(trait_error(row.header.span, ConcreteReceiverRequired))
-	declaration ?= traits.get(trait_number(owner)).to_result(trait_error(row.header.span, ConcreteReceiverRequired))
-	receiver_owner = receiver_module(header.receiver, parsed)
+	owner ?= implementation_trait(namespace, row.header.module, row.id).to_result(checker_invariant(row.header.span, InvalidFunctionContract))
+	written ?= inventory_traits(parsed.declarations).get(trait_number(owner)).to_result(checker_invariant(row.header.span, InvalidFunctionContract))
+	declaration ?= traits.get(trait_number(owner)).to_result(checker_invariant(row.header.span, InvalidFunctionContract))
+	receiver_owner = receiver_module(header.receiver_head, parsed)
 	own_receiver = match receiver_owner:
 		Some(module): same_module(module, row.header.module)
 		None: False
@@ -138,11 +150,11 @@ private pure func accept_implementation(
 	orphan: Void ?= if or(same_module(written.module, row.header.module), or(own_receiver, library)):
 		Ok(void)
 	else:
-		Err(trait_error(row.header.span, OrphanImplementation(owner, header.receiver)))
+		Err(trait_error(row.header.span, OrphanImplementation(owner, header.receiver_head)))
 	var failure: Option[CheckError] = None
 	for existing in previous:
-		if and(IntOps.equals(trait_number(existing.trait_id), trait_number(owner)), same_type(existing.receiver, header.receiver)):
-			failure = Some(trait_error(row.header.span, DuplicateImplementation(owner, header.receiver, existing.span)))
+		if and(IntOps.equals(trait_number(existing.trait_id), trait_number(owner)), same_head(existing.receiver_head, header.receiver_head)):
+			failure = Some(trait_error(row.header.span, DuplicateImplementation(owner, header.receiver_head, existing.span)))
 	var members: List[ImplementedMethod] = []
 	var seen: List[AcceptedFunction] = []
 	for body in row.methods:
@@ -154,9 +166,12 @@ private pure func accept_implementation(
 				for required in declaration.methods:
 					match written.methods.get(trait_method_number(required.id)):
 						Some(source):
-							if same_name(source.declaration.header.function_name.id, function.declaration.function_name.id):
-								method = Some(required)
-						None: void
+							match trait_method_header(source, parsed.declarations):
+								Some(source_header):
+									if same_name(source_header.function_name.id, function.declaration.function_name.id):
+										method = Some(required)
+								None: failure = Some(checker_invariant(source.span, InvalidFunctionContract))
+						None: failure = Some(checker_invariant(row.header.span, InvalidFunctionContract))
 				for earlier in seen:
 					if same_name(earlier.declaration.function_name.id, function.declaration.function_name.id):
 						failure = Some(trait_error(function.declaration.function_name.span, DuplicateImplementationMethod(function.declaration.function_name.id, earlier.declaration.function_name.span)))
@@ -164,29 +179,33 @@ private pure func accept_implementation(
 					match method:
 						None: failure = Some(trait_error(function.declaration.function_name.span, UnknownImplementationMethod(function.declaration.function_name.id)))
 						Some(required):
-							match member_contract(required, header.receiver, function):
+							match member_contract(required, header, function):
 								Err(error): failure = Some(error)
 								Ok(_):
-									member: ImplementedMethod = { method = required.id, function = body }
+									member: ImplementedMethod = { method = required.id, body = AuthoredMethod(body) }
 									members = members.append(member)
 				seen = seen.append(function)
-			None: void
+			None: failure = Some(checker_invariant(row.header.span, InvalidFunctionContract))
 		if failure.is_some():
 			break
 	for required in declaration.methods:
 		implemented = members.any(pure func(member): same_trait_method(member.method, required.id))
 		if and(implemented.not(), failure.is_none()):
-			failure = Some(trait_error(row.header.span, MissingImplementationMethod(required.id)))
+			match required.default_body:
+				Some(function): members = members.append({ method = required.id, body = TraitDefault(function) })
+				None: failure = Some(trait_error(row.header.span, MissingImplementationMethod(required.id)))
 	match failure:
 		Some(error): Err(error)
-		None: Ok({ trait_id = owner, receiver = header.receiver, methods = members, module = row.header.module, span = row.header.span })
+		None: Ok({ trait_id = owner, receiver_head = header.receiver_head, parameter_bounds = header.parameter_bounds, methods = members, module = row.header.module, span = row.header.span })
 
 
 private pure func member_contract(
 	required: AcceptedTraitMethod,
-	receiver: TypeRef,
+	header: ImplementationHeader,
 	function: AcceptedFunction,
 ) -> Result[Void, CheckError]:
+	receiver ?= receiver_type(header.receiver_head, function.signature.type_parameters.map(pure func(parameter): ParameterType(parameter)))
+		.to_result(checker_invariant(function.declaration.function_name.span, InvalidFunctionContract))
 	substitution: Substitution = { owner = TraitDeclaration(trait_method_owner(required.id)), values = [receiver] }
 	var parameters: List[TypeUse] = []
 	var failure: Option[CheckError] = None
@@ -199,7 +218,8 @@ private pure func member_contract(
 		None: Ok(void)
 	result ?= substitute_type(required.signature.return_type.value_type, substitution, required.signature.return_type.span)
 	expected: FunctionSignature = {
-		type_parameters = [],
+		type_parameters = function.signature.type_parameters,
+		requirements = function.signature.requirements,
 		purity = required.signature.purity,
 		parameters = parameters,
 		return_type = { required.signature.return_type | value_type = result }
@@ -207,7 +227,7 @@ private pure func member_contract(
 	parameter_types = parameters.map(pure func(parameter): parameter.value_type)
 	actual_types = function.signature.parameters.map(pure func(parameter): parameter.value_type)
 	valid = and(
-		function.signature.type_parameters.is_empty(),
+		IntOps.equals(function.signature.type_parameters.length(), header.parameter_bounds.length()),
 		and(
 			same_purity(expected.purity, function.signature.purity),
 			and(
@@ -222,35 +242,52 @@ private pure func member_contract(
 		Err(trait_error(function.declaration.function_name.span, ImplementationSignatureMismatch(required.id, expected, function.signature)))
 
 
-pure func validate_traits(
+-- The configured foundation owns this semantic identity. Recognition happens
+-- once; later shape checking and dispatch compare the accepted TraitId.
+pure func designated_trait(parsed: ParsedContents, namespace: Namespace) -> Option[TraitId]:
+	named_trait(namespace, parsed.foundation.types, foundation_words(parsed.names).equatable_word)
+
+
+pure func accept_trait_contracts(
+	parsed: ParsedContents,
+	namespace: Namespace,
+	boolean: DesignatedBoolean[VariantId],
+	canonical: Option[TraitId],
+) -> Result[List[AcceptedTrait], CheckError]:
+	var declarations: List[AcceptedTrait] = []
+	var failure: Option[CheckError] = None
+	for row in inventory_traits(parsed.declarations):
+		match accept_trait(row, parsed, namespace, boolean, canonical):
+			Ok(accepted): declarations = declarations.append(accepted)
+			Err(error):
+				failure = Some(error)
+				break
+	match failure:
+		Some(error): Err(error)
+		None: Ok(declarations)
+
+
+-- Method contracts are already accepted. Authored implementation signatures
+-- and default identities now complete this same authority without reacceptance.
+pure func validate_implementations(
 	parsed: ParsedContents,
 	namespace: Namespace,
 	headers: List[ImplementationHeader],
 	functions: List[AcceptedFunction],
-	boolean: DesignatedBoolean[VariantId],
+	declarations: List[AcceptedTrait],
+	canonical: Option[TraitId],
 ) -> Result[AcceptedTraits, CheckError]:
-	var declarations: List[AcceptedTrait] = []
 	var implementations: List[AcceptedImplementation] = []
-	var canonical: Option[TraitId] = None
 	var failure: Option[CheckError] = None
-	for row in inventory_traits(parsed.declarations):
-		match accept_trait(row, parsed, namespace, boolean):
-			Ok(accepted):
-				declarations = declarations.append(accepted)
-				if and(same_module(row.module, parsed.foundation.types), same_name(row.type_name.id, foundation_words(parsed.names).equatable_word)):
-					canonical = Some(row.id)
-			Err(error):
-				failure = Some(error)
-				break
 	for row in inventory_implementations(parsed.declarations):
-		if failure.is_some():
-			break
 		match headers.get(impl_number(row.id)):
 			Some(header):
 				match accept_implementation(row, header, parsed, namespace, declarations, functions, implementations):
 					Ok(accepted): implementations = implementations.append(accepted)
 					Err(error): failure = Some(error)
-			None: failure = Some(trait_error(row.header.span, ConcreteReceiverRequired))
+			None: failure = Some(checker_invariant(row.header.span, InvalidFunctionContract))
+		if failure.is_some():
+			break
 	match failure:
 		Some(error): Err(error)
 		None: Ok({ declarations = declarations, implementations = implementations, canonical = canonical })
@@ -258,15 +295,76 @@ pure func validate_traits(
 
 -- Abstract signatures have no body owner. Check their formal names only after
 -- all annotations resolve, without manufacturing local binding identities.
-private pure func unique_requirement_parameters(row: TraitMethodRow) -> Result[Void, CheckError]:
+private pure func unique_requirement_parameters(method: TraitMethodId, header: FunctionHeader) -> Result[Void, CheckError]:
 	var names: List[WrittenName] = []
 	var failure: Option[CheckError] = None
-	for parameter in row.declaration.header.parameters:
+	for parameter in header.parameters:
 		match previous_declaration(names, parameter.name.id):
 			Some(previous):
-				failure = Some(trait_error(parameter.name.span, DuplicateRequirementParameter(row.id, previous)))
+				failure = Some(trait_error(parameter.name.span, DuplicateRequirementParameter(method, previous)))
 				break
 			None: names = names.append(parameter.name)
+	match failure:
+		Some(error): Err(error)
+		None: Ok(void)
+
+
+-- A rigid parameter is justified only by its declaration. A family checks each
+-- bound on a strict child of the actual receiver, so proof always terminates.
+pure func prove_trait(traits: AcceptedTraits, required: TraitId, receiver: TypeRef, assumptions: List[TraitRequirement], span: Span) -> Result[Void, CheckError]:
+	match receiver:
+		ParameterType(parameter):
+			known = assumptions.any(pure func(assumption): and(same_parameter(assumption.parameter, parameter), IntOps.equals(trait_number(assumption.required_trait), trait_number(required))))
+			if known:
+				Ok(void)
+			else:
+				Err(trait_error(span, MissingTraitBound(required, receiver)))
+		_:
+			prove_family(traits, required, receiver, assumptions, span)
+
+
+private pure func prove_family(traits: AcceptedTraits, required: TraitId, receiver: TypeRef, assumptions: List[TraitRequirement], span: Span) -> Result[Void, CheckError]:
+	head ?= type_head(receiver).to_result(trait_error(span, MissingTraitBound(required, receiver)))
+	var family: Option[AcceptedImplementation] = None
+	for implementation in traits.implementations:
+		if and(IntOps.equals(trait_number(implementation.trait_id), trait_number(required)), same_head(implementation.receiver_head, head)):
+			family = Some(implementation)
+	accepted ?= family.to_result(trait_error(span, MissingTraitBound(required, receiver)))
+	arguments = receiver_arguments(receiver)
+	var position = 0
+	var failure: Option[CheckError] = None
+	for bounds in accepted.parameter_bounds:
+		match arguments.get(position):
+			None: failure = Some(checker_invariant(span, InvalidFunctionContract))
+			Some(argument):
+				for bound in bounds:
+					match prove_trait(traits, bound.required_trait, argument, assumptions, span):
+						Ok(_): void
+						Err(error):
+							failure = Some(error)
+							break
+		position = IntOps.add(position, 1)
+		if failure.is_some():
+			break
+	match failure:
+		Some(error): Err(error)
+		None: Ok(void)
+
+
+-- Source construction seals a callable's obligations. Invoking a stored or
+-- forwarded callable later consumes that sealed callable type without reproving.
+pure func prove_requirements(traits: AcceptedTraits, signature: FunctionSignature, arguments: List[TypeRef], assumptions: List[TraitRequirement], span: Span) -> Result[Void, CheckError]:
+	var failure: Option[CheckError] = None
+	for required in signature.requirements:
+		substitution: Substitution = { owner = parameter_owner(required.parameter), values = arguments }
+		match substitute_type(ParameterType(required.parameter), substitution, span):
+			Err(error): failure = Some(error)
+			Ok(receiver):
+				match prove_trait(traits, required.required_trait, receiver, assumptions, span):
+					Ok(_): void
+					Err(error): failure = Some(error)
+		if failure.is_some():
+			break
 	match failure:
 		Some(error): Err(error)
 		None: Ok(void)

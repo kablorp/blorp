@@ -1,0 +1,195 @@
+import:
+	../../../src/check/check: check, check_errors
+	../../../src/check/errors as Errors
+	../../../src/check/render: render_failure
+	../../../src/utils/source: module_source, root_module_id, same_source
+	../../../src/utils/syntax: same_span
+	../module_input: parse_modules_with_base, test_base
+	test: TestSuite
+
+
+private VISIT: String =
+	|trait Visit:
+	|    pure func visit(value: Self) -> Int
+	|implements Visit for Int:
+	|    pure func visit(value: Self) -> Int:
+	|        0
+	|
+
+private MAIN: String =
+	|func main() -> Int:
+	|    0
+	|
+
+
+private pure func accepts(source: String) -> Bool:
+	match parse_modules_with_base([{ source = source, targets = [] }], test_base()):
+		Err(_): False
+		Ok(parsed):
+			match check(parsed):
+				Err(_): False
+				Ok(_): True
+
+
+-- Every rejection pins the actual source call selected by the sufficient proof,
+-- independently of the exact type/namespace identities issued for this fixture.
+private pure func rejects_unproven(prefix: String, call: String, suffix: String) -> Bool:
+	match parse_modules_with_base([{ source = prefix + call + suffix, targets = [] }], test_base()):
+		Err(_): False
+		Ok(parsed):
+			match check(parsed):
+				Ok(_): False
+				Err(failure):
+					errors = check_errors(failure)
+					diagnostics = render_failure(failure)
+					error = errors.first
+					diagnostic = diagnostics.first
+					match error.kind:
+						Errors.RecursionRejection(Errors.UnprovenTraitInstantiation):
+							(
+								errors.remaining.is_empty()
+								and diagnostics.remaining.is_empty()
+								and same_source(error.span.source, module_source(root_module_id()))
+								and error.span.start == prefix.length()
+								and error.span.end == prefix.length() + call.length()
+								and same_span(error.span, diagnostic.span)
+								and diagnostic.message == "cannot prove finite generic trait instantiation"
+								and diagnostic.help == "avoid recursively wrapping generic receivers through trait dispatch; this increment uses a conservative constructor-depth proof"
+								and diagnostic.note.is_none()
+							)
+						_: False
+
+
+pure func test_list_relay_preserves_a_finite_semantic_key_cycle() -> Bool:
+	source: String =
+		|implements Visit for List[Element: Visit]:
+		|    pure func visit(value: Self) -> Int:
+		|        relay(value)
+		|pure func relay[Value: Visit](value: Value) -> Int:
+		|    visit(value)
+		|
+	accepts(VISIT + source + MAIN)
+
+
+pure func test_list_relay_wrapping_the_whole_receiver_cannot_prove_finite() -> Bool:
+	family: String =
+		|implements Visit for List[Element: Visit]:
+		|    pure func visit(value: Self) -> Int:
+		|        relay([value])
+		|pure func relay[Value: Visit](value: Value) -> Int:
+		|
+	prefix = VISIT + family + "    "
+	rejects_unproven(prefix, "visit", "(value)\n" + MAIN)
+
+
+pure func test_tree_and_list_dispatch_have_a_finite_generic_family() -> Bool:
+	source: String =
+		|fixed union Tree:
+		|    Leaf(Int)
+		|    Branch(List[Tree])
+		|implements Visit for List[Element: Visit]:
+		|    pure func visit(value: Self) -> Int:
+		|        match value:
+		|            []: 0
+		|            [head, ..._]: visit(head)
+		|implements Visit for Tree:
+		|    pure func visit(value: Self) -> Int:
+		|        match value:
+		|            Leaf(item): visit(item)
+		|            Branch(children): visit(children)
+		|
+	accepts(VISIT + source + MAIN)
+
+
+pure func test_mutual_aggregates_through_lists_have_finite_dispatch() -> Bool:
+	source: String =
+		|fixed record Left { children: List[Right] }
+		|fixed union Right:
+		|    Empty
+		|    Back(List[Left])
+		|implements Visit for List[Element: Visit]:
+		|    pure func visit(value: Self) -> Int:
+		|        match value:
+		|            []: 0
+		|            [head, ..._]: visit(head)
+		|implements Visit for Left:
+		|    pure func visit(value: Self) -> Int:
+		|        visit(value.children)
+		|implements Visit for Right:
+		|    pure func visit(value: Self) -> Int:
+		|        match value:
+		|            Empty: 0
+		|            Back(children): visit(children)
+		|
+	accepts(VISIT + source + MAIN)
+
+
+-- The concrete dispatch goes Box -> Wrap and stops. The abstract relay can
+-- also select Box, which is deliberately beyond this increment's depth proof.
+pure func test_finite_box_to_wrap_is_an_explicit_conservative_limit() -> Bool:
+	family: String =
+		|fixed record Box[Element] { value: Element }
+		|fixed record Wrap[Element] { value: Element }
+		|implements Visit for Wrap[Element]:
+		|    pure func visit(value: Self) -> Int:
+		|        0
+		|implements Visit for Box[Element: Visit]:
+		|    pure func visit(value: Self) -> Int:
+		|        relay(wrap(value))
+		|pure func wrap[Element](value: Element) -> Wrap[Element]:
+		|    {value = value}
+		|pure func relay[Value: Visit](value: Value) -> Int:
+		|
+	prefix = VISIT + family + "    "
+	rejects_unproven(prefix, "visit", "(value)\n" + MAIN)
+
+
+-- This is temporary T3 admission, not the final automatic-equality contract.
+-- T4 must close the ordinary deeply nested generic-field case before completion.
+pure func test_three_nested_lists_in_a_generic_field_need_a_stronger_proof() -> Bool:
+	family: String =
+		|fixed record Box[Element] { values: List[List[List[Element]]] }
+		|implements Visit for List[Element: Visit]:
+		|    pure func visit(value: Self) -> Int:
+		|        match value:
+		|            []: 0
+		|            [head, ..._]: visit(head)
+		|implements Visit for Box[Element: Visit]:
+		|    pure func visit(value: Self) -> Int:
+		|
+	prefix = VISIT + family + "        "
+	rejects_unproven(prefix, "visit", "(value.values)\n" + MAIN)
+
+
+pure func test_creating_a_more_wrapped_method_value_cannot_prove_finite() -> Bool:
+	family: String =
+		|implements Visit for List[Element: Visit]:
+		|    pure func visit(value: Self) -> Int:
+		|
+	prefix = VISIT + family + "        callback: pure (List[List[Element]]) -> Int = "
+	rejects_unproven(prefix, "visit", "\n        0\n" + MAIN)
+
+
+pure func test_creating_an_unchanged_method_value_preserves_a_finite_key() -> Bool:
+	family: String =
+		|implements Visit for List[Element: Visit]:
+		|    pure func visit(value: Self) -> Int:
+		|        callback: pure (List[Element]) -> Int = visit
+		|        0
+		|
+	accepts(VISIT + family + MAIN)
+
+
+tests: TestSuite = {
+	description = "Blorp 2 sufficient proof of finite trait instantiation",
+	tests = [
+		("List relay preserves a finite semantic key cycle", test_list_relay_preserves_a_finite_semantic_key_cycle),
+		("wrapping a List receiver cannot prove finite", test_list_relay_wrapping_the_whole_receiver_cannot_prove_finite),
+		("Tree and List have finite dispatch", test_tree_and_list_dispatch_have_a_finite_generic_family),
+		("mutual aggregates through Lists have finite dispatch", test_mutual_aggregates_through_lists_have_finite_dispatch),
+		("finite Box to Wrap is a conservative limit", test_finite_box_to_wrap_is_an_explicit_conservative_limit),
+		("three nested Lists need a stronger proof", test_three_nested_lists_in_a_generic_field_need_a_stronger_proof),
+		("creating a wrapped method value cannot prove finite", test_creating_a_more_wrapped_method_value_cannot_prove_finite),
+		("creating an unchanged method value preserves finite keys", test_creating_an_unchanged_method_value_preserves_a_finite_key),
+	]
+}

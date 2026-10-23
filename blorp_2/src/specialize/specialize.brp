@@ -2189,14 +2189,14 @@ private pure func append_value_types(
 								for capture in captures:
 									types = append_value_types(types, capture)
 							Checked.StoredCallable(child): types = append_value_types(types, child)
-							Checked.NamedCallable(_, _) | Checked.ForwardedCallable(_): void
+							Checked.MethodCallable(_) | Checked.NamedCallable(_, _) | Checked.ForwardedCallable(_): void
 		Checked.MakeCallable(choice):
 			match choice:
 				Checked.LambdaCallable(_, captures):
 					for capture in captures:
 						types = append_value_types(types, capture)
 				Checked.StoredCallable(child): types = append_value_types(types, child)
-				Checked.NamedCallable(_, _) | Checked.ForwardedCallable(_): void
+				Checked.MethodCallable(_) | Checked.NamedCallable(_, _) | Checked.ForwardedCallable(_): void
 		Checked.ReadTupleElement(receiver, _):
 			types = append_value_types(types, receiver)
 		Checked.ReadRecordField(receiver, _):
@@ -2424,16 +2424,28 @@ private pure func prepare_callable_storage(
 					Ok(_): Err(invalid(span, "capture environment has a non-record layout"))
 
 
+-- Check has proved the obligation. Ground semantic Self before selecting the
+-- ordinary body request; opaque receiver identity never comes from its layout.
+private pure func selected_method_body(method: Checked.AcceptedMethodCall, substitution: Declarations.Substitution, traits: Checked.AcceptedTraits, span: Span) -> Result[Checked.SelectedMethodBody, Diagnostic]:
+	receiver ?= semantic_type(Checked.method_receiver(method), substitution, span)
+	Checked.method_body(traits, Checked.accepted_method(Checked.method_identity(method), receiver))
+		.to_result(invalid(span, "accepted method has no implementation body"))
+
+
+private pure func prepare_named_instance(id: Declaration.FunctionId, arguments: List[Checked.TypeRef], checked: Checked.CheckedFunctions, initial: PreparedInstances, span: Span) -> Result[PreparedInstances, Diagnostic]:
+	types ?= prepare_arguments(arguments, [], checked, initial.unions, span, initial.records, [])
+	concrete ?= known_types(types.arguments, span)
+	key ?= runtime_key(Checked.DeclaredBody(id), arguments, checked, span)
+	Ok(request_instance({ initial | unions = types.unions, records = types.records }, key, ConcreteRequest(span)))
+
+
 private pure func prepare_named_creation(
 	id: Declaration.FunctionId, arguments: List[Checked.TypeRef],
 	substitution: Declarations.Substitution, checked: Checked.CheckedFunctions,
 	initial: PreparedInstances, span: Span,
 ) -> Result[PreparedInstances, Diagnostic]:
 	semantic ?= semantic_arguments(arguments, substitution, span)
-	types ?= prepare_arguments(semantic, [], checked, initial.unions, span, initial.records, [])
-	concrete ?= known_types(types.arguments, span)
-	key ?= runtime_key(Checked.DeclaredBody(id), semantic, checked, span)
-	Ok(request_instance({ initial | unions = types.unions, records = types.records }, key, ConcreteRequest(span)))
+	prepare_named_instance(id, semantic, checked, initial, span)
 
 
 private pure func prepare_lambda_creation(
@@ -2452,11 +2464,20 @@ private pure func prepare_creation(
 	checked: Checked.CheckedFunctions, initial: PreparedInstances,
 ) -> Result[PreparedInstances, Diagnostic]:
 	match value.form:
+		Checked.MakeCallable(Checked.MethodCallable(method)):
+			match selected_method_body(method, substitution, checked.traits, value.span):
+				Ok(selected): prepare_named_instance(selected.function, selected.arguments, checked, initial, value.span)
+				Err(error): Err(error)
 		Checked.MakeCallable(Checked.NamedCallable(id, arguments)):
 			prepare_named_creation(id, arguments, substitution, checked, initial, value.span)
 		Checked.MakeCallable(Checked.LambdaCallable(id, captures)):
 			prepare_lambda_creation(id, captures, request.key.arguments, storage_arguments, checked, initial, value.span)
 		_: Ok(initial)
+
+
+private pure func method_callable(method: Checked.AcceptedMethodCall, parameter: Checked.CallableParameterId, substitution: Declarations.Substitution, traits: Checked.AcceptedTraits, span: Span) -> Result[CallableMode, Diagnostic]:
+	selected ?= selected_method_body(method, substitution, traits, span)
+	Ok(StaticCallable({ parameter = parameter, body = Checked.DeclaredBody(selected.function), arguments = selected.arguments, storage = ErasedCallable }))
 
 
 private pure func prepare_function(
@@ -2510,12 +2531,12 @@ private pure func prepare_function(
 		for call in Checked.body_calls(function.statements, function.body):
 			match call.target:
 				Checked.TraitMethod(method):
-					match Checked.method_body(checked.traits, method):
-						None: failure = Some(invalid(call.span, "accepted method has no implementation body"))
-						Some(body):
-							match runtime_key(Checked.DeclaredBody(body), [], checked, call.span):
+					match selected_method_body(method, semantic, checked.traits, call.span):
+						Err(error): failure = Some(error)
+						Ok(selected):
+							match prepare_named_instance(selected.function, selected.arguments, checked, prepared, call.span):
 								Err(error): failure = Some(error)
-								Ok(key): prepared = request_instance(prepared, key, ConcreteRequest(call.span))
+								Ok(next): prepared = next
 				Checked.RuntimeFunction(_): void
 				Checked.ValueCall(_): void
 				Checked.CallableParameter(parameter):
@@ -2582,6 +2603,16 @@ private pure func prepare_function(
 													arguments = request.key.arguments,
 													storage = storage.storage
 												}))
+									Checked.MethodCallable(method):
+										choice_depends_on_caller = has_type_parameters
+										match selected_method_body(method, semantic, checked.traits, written_span):
+											Err(error): Err(error)
+											Ok(selected):
+												match prepare_arguments(selected.arguments, [], checked, prepared.unions, written_span, prepared.records, []):
+													Err(error): Err(error)
+													Ok(layouts):
+														prepared = { prepared | unions = layouts.unions, records = layouts.records }
+														known_types(layouts.arguments, written_span).map(pure func(_): StaticCallable({ parameter = written_parameter, body = Checked.DeclaredBody(selected.function), arguments = selected.arguments, storage = ErasedCallable }))
 									Checked.NamedCallable(id, named_arguments):
 										choice_depends_on_caller = match has_type_parameters:
 											True: named_arguments.any(contains_parameter)
@@ -2833,9 +2864,9 @@ private pure func translate_call(
 ) -> Result[ConcreteCall, Diagnostic]:
 	target_result: Result[CallTarget, Diagnostic] = match call.target:
 		Checked.TraitMethod(method):
-			match Checked.method_body(callables.traits, method):
-				None: Err(invalid(call.span, "accepted method has no implementation body"))
-				Some(body): runtime_instance(keys, Checked.DeclaredBody(body), [], call.span).map(pure func(id): UserFunction(id))
+			match selected_method_body(method, substitution, callables.traits, call.span):
+				Err(error): Err(error)
+				Ok(selected): runtime_instance(keys, Checked.DeclaredBody(selected.function), selected.arguments, call.span).map(pure func(id): UserFunction(id))
 		Checked.RuntimeFunction(operation):
 			concrete_result: Result[RuntimeOperation[VariantInstanceId, TypeRef], Diagnostic] = match operation:
 				IntAdd:
@@ -3014,6 +3045,7 @@ private pure func translate_call(
 											arguments = root_arguments,
 											storage = storage
 										}))
+									Checked.MethodCallable(method): method_callable(method, written_parameter, substitution, callables.traits, written_span)
 									Checked.NamedCallable(id, named_arguments):
 										semantic_arguments(named_arguments, substitution, written_span).map(pure func(values): StaticCallable({
 											parameter = written_parameter,
@@ -3162,6 +3194,11 @@ private pure func translate_callable_value(
 				Err(error): Err(error)
 				Ok(binding):
 					callable_binding_value(binding, keys, span)
+		Checked.MethodCallable(method):
+			match selected_method_body(method, substitution, translation.traits, span):
+				Err(error): Err(error)
+				Ok(selected):
+					runtime_instance(keys, Checked.DeclaredBody(selected.function), selected.arguments, span).map(pure func(body) -> ConcreteExpr: { form = FreeCallable(body), value_type = value_type, span = span })
 		Checked.NamedCallable(id, arguments):
 			match semantic_arguments(arguments, substitution, span):
 				Err(error): Err(error)
@@ -3458,7 +3495,7 @@ private pure func translate_callable_operand(
 	records: List[RecordInstance],
 ) -> Result[Option[ConcreteExpr], Diagnostic]:
 	match choice:
-		Checked.NamedCallable(_, _): Ok(None)
+		Checked.MethodCallable(_) | Checked.NamedCallable(_, _): Ok(None)
 		Checked.StoredCallable(value): translate_expr(opaques, value, substitution, translation, keys, unions, records).map(pure func(concrete): Some(concrete))
 		Checked.ForwardedCallable(parameter):
 			match translated_callable(translation, parameter, span):

@@ -17,10 +17,16 @@ receive it. Import cycles, including self-imports, are rejected, and modules
 under the library root cannot import user modules. Concrete
 functions may use a sole closed builtin body, including `builtin("int.add")`,
 with an exact runtime signature.
-The pilot also accepts signature-only `trait` declarations and concrete
-`implements Trait for Type` blocks. Its [concrete trait rules](../blorp_2/README.md#concrete-traits)
-require pure methods whose first formal is `Self`; generic bounds, defaults,
-generic implementations, method references and derives remain deferred.
+The pilot accepts parameterless `trait` declarations with pure methods whose
+first formal is `Self`. A method without `:` is abstract; one with `:` has an
+ordinary default body. Function type parameters and complete implementation receiver
+families accept bounds such as `Value: Equatable + Visit` and `Box[Value: Visit]`.
+A default-only `implements Trait for Type` header ends at the newline, without a
+colon. Contextual unbound method references use ordinary expressions and need an
+expected callable type determining `Self`. See the [pilot trait rules](../blorp_2/README.md#concrete-traits)
+for conservative finite-dispatch limits. Derives, trait parameters, independently
+generic methods and top-level callable trait formals remain deferred; the host
+language grammar below does not broaden the pilot subset.
 The ordinary [pilot `append_int` API](../blorp_2/README.md#counted-string-operations)
 uses the existing function-call and UFCS grammar.
 The [pilot prefix helper](../blorp_2/README.md#counted-string-operations) also

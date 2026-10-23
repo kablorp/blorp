@@ -4,21 +4,21 @@ rejection of recursive calls that grow type arguments without bound.
 ---
 import:
 	result: is_ok
-	../utils/boolean: not
+	../utils/boolean: not, and
 	./errors:
 		CheckError,
 		RecursionError(
-			GenericTailRecursionUnsupported, GrowingRecursiveInstantiation, NoSelfRecursion,
+			GenericTailRecursionUnsupported, GrowingRecursiveInstantiation, UnprovenTraitInstantiation, NoSelfRecursion,
 			NonTailSelfCall, TailCallInNestedMatch,
 		),
 		recursion_error,
 	./model:
-		AcceptedTraits, method_body,
+		AcceptedTraits, AcceptedMethodCall, method_body, method_receiver, method_identity, ImplementedBody(AuthoredMethod, TraitDefault),
 		CallTarget(TraitMethod, RuntimeFunction, UserFunction, CallableParameter, ValueCall),
 		CheckedArm,
 		CheckedBody(CheckedMatchBody, CheckedValueBody),
 		CheckedCallOperand(ValueOperand, CallableOperand),
-		CheckedCall, CallableChoice(NamedCallable, ForwardedCallable, LambdaCallable, StoredCallable),
+		CheckedCall, CallableChoice(MethodCallable, NamedCallable, ForwardedCallable, LambdaCallable, StoredCallable),
 		CheckedExit(RecurWith, ReturnExpression),
 		CheckedExpr,
 		CheckedForm(
@@ -36,7 +36,7 @@ import:
 		function_calls, lambda_calls, body_callable_creations,
 		same_parameter,
 		type_parameter_id,
-	../utils/ids: FunctionId, function_number
+	../utils/ids: FunctionId, function_number, same_trait_method
 	int as IntOps
 	option: is_some, is_none
 	../utils/syntax: FunctionExecution(OrdinaryCalls, SelfTailLoop), ParsedFunction, Span
@@ -46,7 +46,7 @@ private pure func is_self_call(call: CheckedCall, current: FunctionId, traits: A
 	match call.target:
 		TraitMethod(method):
 			match method_body(traits, method):
-				Some(id): IntOps.equals(function_number(id), function_number(current))
+				Some(selected): IntOps.equals(function_number(selected.function), function_number(current))
 				None: False
 		UserFunction(id, _):
 			IntOps.equals(function_number(id), function_number(current))
@@ -88,7 +88,7 @@ private pure func self_call_in(value: CheckedExpr, current: FunctionId, traits: 
 					CallableOperand(_, choice, _):
 						match choice:
 							StoredCallable(child): found = self_call_in(child, current, traits)
-							NamedCallable(_, _) | ForwardedCallable(_) | LambdaCallable(_, _): void
+							MethodCallable(_) | NamedCallable(_, _) | ForwardedCallable(_) | LambdaCallable(_, _): void
 			match found:
 				Some(span):
 					Some(span)
@@ -131,7 +131,7 @@ private pure func self_call_in(value: CheckedExpr, current: FunctionId, traits: 
 		MakeCallable(choice):
 			match choice:
 				StoredCallable(operand): self_call_in(operand, current, traits)
-				NamedCallable(_, _) | ForwardedCallable(_) | LambdaCallable(_, _): None
+				MethodCallable(_) | NamedCallable(_, _) | ForwardedCallable(_) | LambdaCallable(_, _): None
 		LiteralVoid | LiteralInteger(_) | LiteralFloat(_) | LiteralString(_) | ReadBinding(_) | ReadCapture(_):
 			None
 
@@ -289,6 +289,7 @@ fixed record CheckedExecution {
 
 pure func check_execution(
 	function: ParsedFunction,
+	parameters: List[TypeParameterId],
 	statements: List[CheckedStatement],
 	body: CheckedBody,
 	current: FunctionId, traits: AcceptedTraits,
@@ -300,7 +301,7 @@ pure func check_execution(
 				body = body,
 			})
 		Some(annotation):
-			if IntOps.equals(function.type_parameters.length(), 0):
+			if parameters.is_empty():
 				match reject_self_calls(statement_values(statements), current, traits):
 					Ok(prefix):
 
@@ -333,15 +334,16 @@ pure func check_execution(
 				Err(recursion_error(annotation, GenericTailRecursionUnsupported))
 
 
-private fixed union ParameterGrowth:
-	PreservedParameter
-	NestedParameter
+private fixed union DependencyOrigin:
+	OrdinaryDependency
+	TraitDependency
 
 
 private fixed record ParameterDependency {
 	source: TypeParameterId,
 	target: TypeParameterId,
-	growth: ParameterGrowth,
+	growth: Int,
+	origin: DependencyOrigin,
 	span: Span
 }
 
@@ -350,7 +352,8 @@ private pure func append_dependencies(
 	dependencies: List[ParameterDependency],
 	argument: TypeRef,
 	target: TypeParameterId,
-	growth: ParameterGrowth,
+	growth: Int,
+	origin: DependencyOrigin,
 	span: Span,
 ) -> List[ParameterDependency]:
 	var collected = dependencies
@@ -361,22 +364,23 @@ private pure func append_dependencies(
 				source = source,
 				target = target,
 				growth = growth,
+				origin = origin,
 				span = span,
 			})
 		CallableType(purity, parameters, result):
 			for value in parameters.append(result):
-				collected = append_dependencies(collected, value, target, NestedParameter, span)
+				collected = append_dependencies(collected, value, target, IntOps.add(growth, 1), origin, span)
 		TupleType(elements):
 			for child in elements:
-				collected = append_dependencies(collected, child, target, NestedParameter, span)
+				collected = append_dependencies(collected, child, target, IntOps.add(growth, 1), origin, span)
 		ListType(element):
-			collected = append_dependencies(collected, element, target, NestedParameter, span)
+			collected = append_dependencies(collected, element, target, IntOps.add(growth, 1), origin, span)
 		AppliedRecordType(_, arguments):
 			for child in arguments:
-				collected = append_dependencies(collected, child, target, NestedParameter, span)
+				collected = append_dependencies(collected, child, target, IntOps.add(growth, 1), origin, span)
 		AppliedUnionType(_, arguments):
 			for child in arguments:
-				collected = append_dependencies(collected, child, target, NestedParameter, span)
+				collected = append_dependencies(collected, child, target, IntOps.add(growth, 1), origin, span)
 		_:
 			void
 
@@ -411,7 +415,10 @@ private pure func parameter_reaches(
 
 		for current in frontier:
 			for dependency in dependencies:
-				unreached_dependency = match same_parameter(dependency.source, current):
+				ordinary: Bool = match dependency.origin:
+					OrdinaryDependency: True
+					TraitDependency: False
+				unreached_dependency: Bool = match and(ordinary, same_parameter(dependency.source, current)):
 					True: contains_parameter_id(reached, dependency.target).not()
 					False: False
 
@@ -439,28 +446,82 @@ pure func validate_recursive_instantiation(
 
 	for function in functions:
 		dependencies = append_call_dependencies(dependencies, function_calls(function), traits)
-		dependencies = append_creation_dependencies(dependencies, body_callable_creations(function.statements, function.body))
+		dependencies = append_creation_dependencies(dependencies, body_callable_creations(function.statements, function.body), traits)
 	-- Potential calls include ignored and nested lambdas, independently of runtime selection.
 	for lambda in lambdas:
 		dependencies = append_call_dependencies(dependencies, lambda_calls(lambda), traits)
-		dependencies = append_creation_dependencies(dependencies, body_callable_creations(lambda.statements, lambda.body))
+		dependencies = append_creation_dependencies(dependencies, body_callable_creations(lambda.statements, lambda.body), traits)
 
+	-- Keep the ordinary language's first growing-edge diagnostic unchanged.
+	-- New trait edges may contract a term and are checked by signed relaxation.
 	var growing: Option[ParameterDependency] = None
-
 	for dependency in dependencies:
-		match dependency.growth:
-			NestedParameter:
-				if parameter_reaches(dependency.target, dependency.source, dependencies):
+		match dependency.origin:
+			OrdinaryDependency:
+				if and(IntOps.greater_than(dependency.growth, 0), parameter_reaches(dependency.target, dependency.source, dependencies)):
 					growing = Some(dependency)
 					break
-			PreservedParameter:
-				void
-
+			TraitDependency: void
 	match growing:
-		Some(dependency):
-			Err(recursion_error(dependency.span, GrowingRecursiveInstantiation))
+		Some(dependency): Err(recursion_error(dependency.span, GrowingRecursiveInstantiation))
 		None:
-			Ok(void)
+			if dependencies.any(is_trait_dependency):
+				match positive_depth_cycle(dependencies):
+					Some(span): Err(recursion_error(span, UnprovenTraitInstantiation))
+					None: Ok(void)
+			else:
+				Ok(void)
+
+
+private pure func is_trait_dependency(dependency: ParameterDependency) -> Bool:
+	match dependency.origin:
+		TraitDependency: True
+		OrdinaryDependency: False
+
+
+private fixed record ParameterDepth {
+	parameter: TypeParameterId,
+	maximum: Int
+}
+
+
+private pure func depth_position(depths: List[ParameterDepth], parameter: TypeParameterId) -> Int:
+	var position = 0
+	for depth in depths:
+		if same_parameter(depth.parameter, parameter):
+			break
+		position = IntOps.add(position, 1)
+	position
+
+
+-- A positive-weight cycle is exactly an improvement on the Nth pass. Edges
+-- bound constructor depth, so nonpositive cycles prove a finite depth bound.
+-- This deliberately overapproximates head compatibility for trait projections.
+private pure func positive_depth_cycle(dependencies: List[ParameterDependency]) -> Option[Span]:
+	var depths: List[ParameterDepth] = []
+	for dependency in dependencies:
+		for parameter in [dependency.source, dependency.target]:
+			if IntOps.equals(depth_position(depths, parameter), depths.length()):
+				depths = depths.append({ parameter = parameter, maximum = 0 })
+	var changed: Option[Span] = None
+	for pass in 0..depths.length():
+		changed = None
+		for dependency in dependencies:
+			source = depth_position(depths, dependency.source)
+			target = depth_position(depths, dependency.target)
+			match depths.get(source):
+				None: void
+				Some(source_depth):
+					match depths.get(target):
+						None: void
+						Some(target_depth):
+							candidate = IntOps.add(source_depth.maximum, dependency.growth)
+							if IntOps.greater_than(candidate, target_depth.maximum):
+								depths = depths.set(target, { target_depth | maximum = candidate })
+								changed = Some(dependency.span)
+		if changed.is_none():
+			break
+	changed
 
 
 private pure func append_call_dependencies(
@@ -470,9 +531,7 @@ private pure func append_call_dependencies(
 	for call in calls:
 		match call.target:
 			TraitMethod(method):
-				match method_body(traits, method):
-					Some(declaration): dependencies = append_named_dependencies(dependencies, declaration, [], call.span)
-					None: void
+				dependencies = append_method_dependencies(dependencies, method, traits, call.span)
 			UserFunction(declaration, arguments):
 				var position = 0
 
@@ -482,7 +541,7 @@ private pure func append_call_dependencies(
 						dependencies,
 						argument,
 						target,
-						PreservedParameter,
+						0, OrdinaryDependency,
 						call.span,
 					)
 					position = IntOps.add(position, 1)
@@ -491,6 +550,7 @@ private pure func append_call_dependencies(
 						ValueOperand(_): void
 						CallableOperand(_, choice, span):
 							match choice:
+								MethodCallable(method): dependencies = append_method_dependencies(dependencies, method, traits, span)
 								NamedCallable(id, types):
 									dependencies = append_named_dependencies(dependencies, id, types, span)
 								ForwardedCallable(_) | StoredCallable(_) | LambdaCallable(_, _): void
@@ -505,11 +565,12 @@ private pure func append_call_dependencies(
 -- The issued substitution contributes the same finite-instantiation edges as a
 -- named callback argument; executable call/tail-call inventories stay separate.
 private pure func append_creation_dependencies(
-	previous: List[ParameterDependency], creations: List[CheckedExpr],
+	previous: List[ParameterDependency], creations: List[CheckedExpr], traits: AcceptedTraits,
 ) -> List[ParameterDependency]:
 	var dependencies = previous
 	for value in creations:
 		match value.form:
+			MakeCallable(MethodCallable(method)): dependencies = append_method_dependencies(dependencies, method, traits, value.span)
 			MakeCallable(NamedCallable(id, types)):
 				dependencies = append_named_dependencies(dependencies, id, types, value.span)
 			_: void
@@ -524,7 +585,31 @@ private pure func append_named_dependencies(
 	for value in types:
 		dependencies = append_dependencies(
 			dependencies, value, type_parameter_id(FunctionDeclaration(id), position),
-			PreservedParameter, span,
+			0, OrdinaryDependency, span,
 		)
 		position = IntOps.add(position, 1)
+	dependencies
+
+
+private pure func append_method_dependencies(previous: List[ParameterDependency], method: AcceptedMethodCall, traits: AcceptedTraits, span: Span) -> List[ParameterDependency]:
+	var dependencies = previous
+	match method_body(traits, method):
+		Some(selected):
+			var position = 0
+			for argument in selected.arguments:
+				dependencies = append_dependencies(dependencies, argument, type_parameter_id(FunctionDeclaration(selected.function), position), 0, TraitDependency, span)
+				position = IntOps.add(position, 1)
+		None:
+			-- Only a rigid Self has no selected head after Check accepted a call.
+			-- Every permitted family is a possible static instantiation. Direct
+			-- child extraction contracts depth by one; defaults keep whole Self.
+			for implementation in traits.implementations:
+				for member in implementation.methods:
+					if same_trait_method(member.method, method_identity(method)):
+						match member.body:
+							AuthoredMethod(function):
+								for position in 0..implementation.parameter_bounds.length():
+									dependencies = append_dependencies(dependencies, method_receiver(method), type_parameter_id(FunctionDeclaration(function), position), -1, TraitDependency, span)
+							TraitDefault(function):
+								dependencies = append_dependencies(dependencies, method_receiver(method), type_parameter_id(FunctionDeclaration(function), 0), 0, TraitDependency, span)
 	dependencies

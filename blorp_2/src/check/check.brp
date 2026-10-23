@@ -7,11 +7,12 @@ import:
 	./bodies: resolve_functions
 	./constants: constant_annotations, validate_constants
 	./errors: BuiltinError(BuiltinTypesRejected), CheckError, CheckErrors, builtin_error, namespace_rejection
-	./traits: validate_traits
+	./traits: designated_trait, accept_trait_contracts, validate_implementations
 	./model: CheckedFunctions
 	./recursion: validate_recursive_instantiation
 	./receiver_clashes: reject_receiver_clashes
-	./signatures: validate_signatures
+	./signatures: AcceptedFunction, validate_signatures
+	result: map_err
 	./declarations: validate_declarations, validate_finite_declarations
 	../utils/ids: FunctionId, RecordId, UnionId, inventory_opaques
 	../namespace/namespace: Namespace, build_namespace, namespace_problem_span
@@ -52,37 +53,42 @@ pure func union_declaration_id(program: CheckedProgram, position: Int) -> Option
 
 private fixed record FailureContents {
 	program: ParsedProgram,
-	errors: CheckErrors
+	errors: CheckErrors,
+	functions: List[AcceptedFunction]
 }
 
 
 opaque type CheckFailure = FailureContents
 
 
-private pure func check_program(program: ParsedProgram) -> Result[CheckedProgram, CheckError]:
+private pure func check_program(program: ParsedProgram) -> Result[CheckedProgram, CheckFailure]:
 	parsed = parsed_contents(program)
 
-	foundation: CheckedFoundation ?= match check_builtin_types(program):
+	foundation_result: Result[CheckedFoundation, CheckError] = match check_builtin_types(program):
 		Ok(accepted):
 			Ok(accepted)
 		Err(error):
 			Err(builtin_error(error.span, BuiltinTypesRejected(error)))
 
-	namespace: Namespace ?= match build_namespace(program):
+	foundation ?= foundation_result.map_err(pure func(error): failed(program, error, []))
+	namespace_result: Result[Namespace, CheckError] = match build_namespace(program):
 		Ok(accepted): Ok(accepted)
 		Err(problem): Err(namespace_rejection(namespace_problem_span(problem), problem))
-	declarations ?= validate_declarations(parsed, namespace)
-	declarations_finite ?= validate_finite_declarations(declarations)
-	annotations ?= constant_annotations(parsed, namespace)
-	signatures ?= validate_signatures(parsed, namespace, foundation.designated)
-	traits ?= validate_traits(parsed, namespace, signatures.implementation_headers, signatures.functions, foundation.designated.boolean)
-	receivers ?= reject_receiver_clashes(namespace, signatures.functions, parsed.dependency_order, traits)
-	constants ?= validate_constants(parsed, namespace, annotations, declarations.records, declarations.unions, signatures.functions, traits)
+	namespace ?= namespace_result.map_err(pure func(error): failed(program, error, []))
+	declarations ?= validate_declarations(parsed, namespace).map_err(pure func(error): failed(program, error, []))
+	declarations_finite ?= validate_finite_declarations(declarations).map_err(pure func(error): failed(program, error, []))
+	annotations ?= constant_annotations(parsed, namespace).map_err(pure func(error): failed(program, error, []))
+	canonical = designated_trait(parsed, namespace)
+	contracts ?= accept_trait_contracts(parsed, namespace, foundation.designated.boolean, canonical).map_err(pure func(error): failed(program, error, []))
+	signatures ?= validate_signatures(parsed, namespace, foundation.designated, contracts).map_err(pure func(error): failed(program, error, []))
+	traits ?= validate_implementations(parsed, namespace, signatures.implementation_headers, signatures.functions, contracts, canonical).map_err(pure func(error): failed(program, error, signatures.functions))
+	receivers ?= reject_receiver_clashes(namespace, signatures.functions, parsed.dependency_order, traits).map_err(pure func(error): failed(program, error, signatures.functions))
+	constants ?= validate_constants(parsed, namespace, annotations, declarations.records, declarations.unions, signatures.functions, traits).map_err(pure func(error): failed(program, error, signatures.functions))
 	functions ?= resolve_functions(
 		signatures.functions, declarations, inventory_opaques(parsed.declarations),
 		namespace, constants, traits, foundation.designated.result, foundation.designated.boolean, foundation.designated.option,
-	)
-	finite ?= validate_recursive_instantiation(functions.functions, functions.lambdas, traits)
+	).map_err(pure func(error): failed(program, error, signatures.functions))
+	finite ?= validate_recursive_instantiation(functions.functions, functions.lambdas, traits).map_err(pure func(error): failed(program, error, signatures.functions))
 	Ok(into_opaque CheckedProgram({
 				traits = traits,
 				unions = declarations.unions,
@@ -94,18 +100,18 @@ private pure func check_program(program: ParsedProgram) -> Result[CheckedProgram
 			}))
 
 
+private pure func failed(program: ParsedProgram, error: CheckError, functions: List[AcceptedFunction]) -> CheckFailure:
+	into_opaque CheckFailure({ program = program, errors = { first = error, remaining = [] }, functions = functions })
+
+
 pure func check(program: ParsedProgram) -> Result[CheckedProgram, CheckFailure]:
-	match check_program(program):
-		Ok(checked):
-			Ok(checked)
-		Err(error):
-			Err(into_opaque CheckFailure({
-						program = program,
-						errors = {
-							first = error,
-							remaining = []
-						}
-					}))
+	check_program(program)
+
+
+-- Only failed post-signature checking keeps this borrowed accepted view for
+-- normalized binder spelling. Successful checked programs discard the scopes.
+pure func failure_functions(failure: CheckFailure) -> List[AcceptedFunction]:
+	from_opaque CheckFailure(failure).functions
 
 
 pure func check_errors(failure: CheckFailure) -> CheckErrors:

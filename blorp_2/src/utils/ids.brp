@@ -1,8 +1,8 @@
 import:
-	./boolean: and
+	./boolean: and, not
 	int as IntOps
 	./source: ModuleId, module_number, same_module
-	./syntax: ParsedConstant, ParsedFunction, ParsedTrait, ParsedTraitMethod, ParsedImplementationHeader, ParsedFunctionGroup(FreeFunction, ImplementationGroup), ParsedOpaque, ParsedRecord, ParsedUnion, ParsedVariant, Visibility, WrittenName, Span
+	./syntax: ParsedConstant, ParsedFunction, ParsedTrait, ParsedTraitMethod(DefaultTraitMethod, AbstractTraitMethod), function_header, trait_method_span, FunctionHeader, ParsedImplementationHeader, ParsedFunctionGroup(FreeFunction, ImplementationGroup), function_group_module, ParsedOpaque, ParsedRecord, ParsedUnion, ParsedVariant, Visibility, WrittenName, Span
 
 
 -- Declaration identities are dense ordinals in one sealed parsed program.
@@ -116,6 +116,7 @@ pure func variant_number(id: VariantId) -> Int:
 fixed union FunctionRole:
 	FreeFunctionBody
 	ImplementationBody
+	TraitDefaultBody
 
 
 fixed record FunctionRow {
@@ -125,9 +126,17 @@ fixed record FunctionRow {
 }
 
 
+-- Required methods own their written header. A default refers to the sole
+-- actual FunctionRow; it does not retain a second header or source body.
+fixed union TraitMethodDeclaration:
+	RequiredMethod(FunctionHeader)
+	DefaultMethod(FunctionId)
+
+
 fixed record TraitMethodRow {
 	id: TraitMethodId,
-	declaration: ParsedTraitMethod
+	declaration: TraitMethodDeclaration,
+	span: Span
 }
 
 
@@ -199,6 +208,21 @@ private fixed record DeclarationRows {
 opaque type DeclarationInventory = DeclarationRows
 
 
+-- The genuine inventory owns both alternatives. Missing/wrong-role defaults
+-- remain explicit so callers can report a compiler invariant, never fabricate
+-- an abstract header or infer one from a spelling.
+pure func trait_method_header(method: TraitMethodRow, inventory: DeclarationInventory) -> Option[FunctionHeader]:
+	match method.declaration:
+		RequiredMethod(header): Some(header)
+		DefaultMethod(id):
+			match from_opaque DeclarationInventory(inventory).functions.get(function_number(id)):
+				None: None
+				Some(row):
+					match row.role:
+						TraitDefaultBody: Some(function_header(row.declaration))
+						_: None
+
+
 -- Assembly calls this once with complete syntax. Each local builder issues its
 -- dense ordinal before appending, then the complete inventory freezes once.
 pure func issue_inventory(
@@ -216,32 +240,74 @@ pure func issue_inventory(
 	var union_rows: List[UnionRow] = []
 	var opaque_rows: List[OpaqueRow] = []
 	var constant_rows: List[ConstantRow] = []
-	for group in functions:
-		match group:
-			FreeFunction(declaration):
-				row: FunctionRow = { id = function_id(function_rows.length()), role = FreeFunctionBody, declaration = declaration }
-				function_rows = function_rows.append(row)
-			ImplementationGroup(header, methods):
-				var method_ids: List[FunctionId] = []
-				for declaration in methods:
-					id = function_id(function_rows.length())
-					row: FunctionRow = { id = id, role = ImplementationBody, declaration = declaration }
-					function_rows = function_rows.append(row)
-					method_ids = method_ids.append(id)
-				implementation: ImplRow = { id = into_opaque ImplId(impl_rows.length()), header = header, methods = method_ids }
-				impl_rows = impl_rows.append(implementation)
-	for declaration in traits:
-		owner = into_opaque TraitId(trait_rows.length())
-		var methods: List[TraitMethodRow] = []
-		for method in declaration.methods:
-			id = into_opaque TraitMethodId({ owner = owner, position = methods.length() })
-			row: TraitMethodRow = { id = id, declaration = method }
-			methods = methods.append(row)
-		declaration_row: TraitRow = {
-			id = owner, module = declaration.module, visibility = declaration.visibility,
-			type_name = declaration.type_name, methods = methods, span = declaration.span
-		}
-		trait_rows = trait_rows.append(declaration_row)
+	-- Both syntax lists follow module inventory order. Merge their cursors so a
+	-- module's authored groups precede its defaults, including modules that have
+	-- only traits. Relative authored and trait/member order never changes.
+	var function_position = 0
+	var trait_position = 0
+	while True:
+		next_module: Option[ModuleId] = match functions.get(function_position):
+			None:
+				match traits.get(trait_position):
+					None: None
+					Some(declaration): Some(declaration.module)
+			Some(group):
+				group_module = function_group_module(group)
+				match traits.get(trait_position):
+					None: Some(group_module)
+					Some(declaration):
+						if IntOps.less_than_or_equal(module_number(group_module), module_number(declaration.module)):
+							Some(group_module)
+						else:
+							Some(declaration.module)
+		match next_module:
+			None: break
+			Some(module):
+				while True:
+					match functions.get(function_position):
+						None: break
+						Some(group):
+							if same_module(function_group_module(group), module).not():
+								break
+							match group:
+								FreeFunction(declaration):
+									row: FunctionRow = { id = function_id(function_rows.length()), role = FreeFunctionBody, declaration = declaration }
+									function_rows = function_rows.append(row)
+								ImplementationGroup(header, methods):
+									var method_ids: List[FunctionId] = []
+									for declaration in methods:
+										id = function_id(function_rows.length())
+										row: FunctionRow = { id = id, role = ImplementationBody, declaration = declaration }
+										function_rows = function_rows.append(row)
+										method_ids = method_ids.append(id)
+									implementation: ImplRow = { id = into_opaque ImplId(impl_rows.length()), header = header, methods = method_ids }
+									impl_rows = impl_rows.append(implementation)
+							function_position = IntOps.add(function_position, 1)
+				while True:
+					match traits.get(trait_position):
+						None: break
+						Some(declaration):
+							if same_module(declaration.module, module).not():
+								break
+							owner = into_opaque TraitId(trait_rows.length())
+							var methods: List[TraitMethodRow] = []
+							for method in declaration.methods:
+								id = into_opaque TraitMethodId({ owner = owner, position = methods.length() })
+								written: TraitMethodDeclaration = match method:
+									AbstractTraitMethod(header, _): RequiredMethod(header)
+									DefaultTraitMethod(function, _):
+										body_id = function_id(function_rows.length())
+										function_row: FunctionRow = { id = body_id, role = TraitDefaultBody, declaration = function }
+										function_rows = function_rows.append(function_row)
+										DefaultMethod(body_id)
+								row: TraitMethodRow = { id = id, declaration = written, span = trait_method_span(method) }
+								methods = methods.append(row)
+							trait_row: TraitRow = {
+								id = owner, module = declaration.module, visibility = declaration.visibility,
+								type_name = declaration.type_name, methods = methods, span = declaration.span
+							}
+							trait_rows = trait_rows.append(trait_row)
+							trait_position = IntOps.add(trait_position, 1)
 	for declaration in records:
 		record_rows = record_rows.append({ id = record_id(record_rows.length()), declaration = declaration })
 	for declaration in unions:
