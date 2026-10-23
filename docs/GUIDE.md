@@ -107,9 +107,10 @@ These conditions constrain equality use, not ordinary construction, and authored
 implementations always win. Unavailable members or unproved finite automatic
 families reject at use. Trait parameters, independently generic methods and
 top-level callable trait formals remain deferred. See the linked
-pilot rules for use-site diagnostics and recursive eligibility. The production pilot library
-and compiler-source bootstrap subset do not acquire trait syntax from this input
-surface.
+pilot rules for use-site diagnostics and recursive eligibility. The production
+pilot library defines canonical Equatable in its traits module. Int/Float/String/List
+supply written implementations, and generic List contains requires Element:Equatable.
+The compiler-source subset remains distinct from this input surface.
 
 ---
 

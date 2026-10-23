@@ -3,10 +3,12 @@ import:
 	../../../src/utils/names: program_names, name_spelling
 	../../../src/check/model as Model
 	../../../src/utils/source: module_source, root_module_id, same_module, same_source
-	../../../src/utils/ids: inventory_functions, function_number, VariantId
+	../../../src/utils/ids: inventory_functions, inventory_traits, function_number, trait_number, trait_method_owner, VariantId
 	../../../src/load/load: load_program
 	../../../src/parse/assemble: parsed_contents
-	../../../src/check/check: CheckedProgram, check, checked_functions, check_errors
+	../../../src/check/check: CheckedProgram, check, checked_functions, check_errors, failure_functions
+	../../../src/namespace/namespace: build_namespace
+	../../../src/check/traits: designated_trait
 	../../../src/check/errors as Errors
 	../../../src/check/render: render_check_error
 	../../../src/lex/lex: lex
@@ -786,34 +788,97 @@ func test_contains_library_preserves_its_rigid_parameter_and_designated_bool() -
 							)
 							functions = checked_functions(checked).functions
 							match rows.map(pure func(row): functions.get(function_number(row.id))):
-								[Some(generic), Some(adapter)]:
-									match (
-										generic.signature.type_parameters, generic.signature.parameters,
-										adapter.signature.type_parameters, adapter.signature.parameters,
-									):
-										([parameter], [values, needle, equality], [], [integers, integer]):
-											match Model.parameter_owner(parameter):
-												Model.FunctionDeclaration(owner):
-													bool_type = Model.UnionType(boolean.id)
-													(
-														function_number(owner) == function_number(generic.id)
-														and same_purity(generic.signature.purity, Pure)
-														and same_purity(adapter.signature.purity, Pure)
-														and Model.same_type(values.value_type, Model.ListType(Model.ParameterType(parameter)))
-														and Model.same_type(needle.value_type, Model.ParameterType(parameter))
-														and Model.same_type(equality.value_type, Model.CallableType(Pure, [
-															Model.ParameterType(parameter), Model.ParameterType(parameter),
-														], bool_type))
-														and Model.same_type(generic.signature.return_type.value_type, bool_type)
-														and Model.same_type(adapter.signature.return_type.value_type, bool_type)
-														and Model.same_type(integers.value_type, Model.ListType(Model.IntType))
-														and Model.same_type(integer.value_type, Model.IntType)
-													)
+								[Some(generic), Some(membership)]:
+									match (generic.signature.type_parameters, generic.signature.parameters, membership.signature.type_parameters, membership.signature.parameters):
+										([parameter], [values, needle, equality], [element], [items, wanted]):
+											match (membership.signature.requirements, checked_functions(checked).traits.canonical, Model.function_calls(membership)):
+												([requirement], Some(canonical), [call]):
+													match (Model.parameter_owner(parameter), Model.parameter_owner(element), call.target, call.operands):
+														(
+															Model.FunctionDeclaration(owner), Model.FunctionDeclaration(member_owner),
+															Model.UserFunction(target, [argument]),
+															[Model.ValueOperand(_), Model.ValueOperand(_), Model.CallableOperand(destination, Model.MethodCallable(method), _)],
+														):
+															bool_type = Model.UnionType(boolean.id)
+															(
+																function_number(owner) == function_number(generic.id)
+																and function_number(member_owner) == function_number(membership.id)
+																and same_purity(generic.signature.purity, Pure)
+																and same_purity(membership.signature.purity, Pure)
+																and generic.signature.requirements.is_empty()
+																and Model.same_type(values.value_type, Model.ListType(Model.ParameterType(parameter)))
+																and Model.same_type(needle.value_type, Model.ParameterType(parameter))
+																and Model.same_type(equality.value_type, Model.CallableType(Pure, [
+																	Model.ParameterType(parameter), Model.ParameterType(parameter),
+																], bool_type))
+																and Model.same_type(generic.signature.return_type.value_type, bool_type)
+																and Model.same_type(membership.signature.return_type.value_type, bool_type)
+																and Model.same_type(items.value_type, Model.ListType(Model.ParameterType(element)))
+																and Model.same_type(wanted.value_type, Model.ParameterType(element))
+																and Model.same_parameter(requirement.parameter, element)
+																and trait_number(requirement.required_trait) == trait_number(canonical)
+																and function_number(target) == function_number(generic.id)
+																and Model.same_type(argument, Model.ParameterType(element))
+																and Model.same_callable_parameter(destination, Model.callable_parameter(generic.id, 2))
+																and trait_number(trait_method_owner(Model.method_identity(method))) == trait_number(canonical)
+																and Model.same_type(Model.method_receiver(method), Model.ParameterType(element))
+															)
+														_: False
 												_: False
 										_: False
 								_: False
 						_: False
 				_: False
+
+
+func test_contains_requires_a_declared_bound_even_without_callers() -> Bool:
+	before_call: String =
+		|import:
+		|    list as Lists
+		|
+		|pure func unbounded[Element](values: List[Element], needle: Element) -> Bool:
+		|
+	prefix = before_call + "    Lists."
+	source = prefix + "contains(values, needle)\n\nfunc main() -> Int:\n    0\n"
+	with_directory(func(directory: String):
+		path = directory + "/main.brp"
+		written ?= write_file(path, source)
+		loaded ?= load_program(path, "blorp_2/standard_library").map_err(pure func(failure): failure.diagnostic.message)
+		parsed = parsed_contents(loaded.program)
+		root_functions = inventory_functions(parsed.declarations)
+			.filter(pure func(row): same_module(row.declaration.module, root_module_id()))
+		valid = match (build_namespace(loaded.program), check(loaded.program), root_functions):
+			(Ok(namespace), Err(failure), [unbounded, _]):
+				match (designated_trait(parsed, namespace), singleton_check_error(check_errors(failure)), failure_functions(failure).get(function_number(unbounded.id))):
+					(Some(canonical), Some(error), Some(accepted)):
+						match (inventory_traits(parsed.declarations).get(trait_number(canonical)), accepted.signature.type_parameters, error.kind):
+							(Some(owner), [parameter], Errors.TraitRejection(Errors.MissingTraitBound(required, Model.ParameterType(actual)))):
+								match Model.parameter_owner(parameter):
+									Model.FunctionDeclaration(function):
+										diagnostic = render_check_error(loaded.program, error)
+										(
+											trait_number(required) == trait_number(owner.id)
+											and trait_number(owner.id) == trait_number(canonical)
+											and function_number(function) == function_number(unbounded.id)
+											and Model.parameter_position(parameter) == 0
+											and Model.same_parameter(parameter, actual)
+											and accepted.signature.requirements.is_empty()
+											and same_source(error.span.source, module_source(root_module_id()))
+											and error.span.start == prefix.length() and error.span.end == prefix.length() + 8
+											and same_span(error.span, diagnostic.span)
+											and diagnostic.note.is_none()
+											and diagnostic.message == "type does not satisfy the required trait bound"
+											and diagnostic.help == "add the required trait to this function's type parameter bounds, or provide an implementation for the concrete receiver"
+										)
+									_: False
+							_: False
+					_: False
+			_: False
+		if valid:
+			Ok(void)
+		else:
+			Err("uncalled membership must reject its actual unbounded parameter at the callee")
+	)
 
 
 func test_contains_with_keeps_named_and_forwarded_callback_identities() -> Bool:
@@ -925,17 +990,23 @@ private func rejects_contains_call(
 	)
 
 
-func test_contains_int_adapter_rejects_a_string_needle() -> Bool:
+func test_int_membership_rejects_a_string_needle() -> Bool:
 	rejects_contains_call("contains([1], ", "\"wrong\"", ")",
 		"argument type does not match the parameter type", "use an expression of type Int here",
 		pure func(kind):
 			match kind:
-				Errors.CallRejection(Errors.ArgumentTypeMismatch(mismatch)):
-					(
-						mismatch.argument_position == 1
-						and Model.same_type(mismatch.expected, Model.IntType)
-						and Model.same_type(mismatch.actual.value_type, Model.StringType)
-					)
+				Errors.CallRejection(Errors.GenericArgumentConflict(conflict)):
+					match Model.parameter_owner(conflict.parameter):
+						Model.FunctionDeclaration(_):
+							(
+								Model.parameter_position(conflict.parameter) == 0
+								and Model.same_type(conflict.previous.value_type, Model.IntType)
+								and Model.same_type(conflict.current.value_type, Model.StringType)
+								and conflict.mismatch.argument_position == 1
+								and Model.same_type(conflict.mismatch.expected, Model.IntType)
+								and Model.same_type(conflict.mismatch.actual.value_type, Model.StringType)
+							)
+						_: False
 				_: False
 	)
 
@@ -1010,8 +1081,9 @@ tests: TestSuite = {
 	description = "Blorp 2 generic functions",
 	tests = [
 		("actual membership APIs retain their own rigid and designated Bool", test_contains_library_preserves_its_rigid_parameter_and_designated_bool),
+		("uncalled membership requires its actual declared bound", test_contains_requires_a_declared_bound_even_without_callers),
 		("actual membership API preserves named and forwarded callback identities", test_contains_with_keeps_named_and_forwarded_callback_identities),
-		("Int membership adapter requires an Int needle", test_contains_int_adapter_rejects_a_string_needle),
+		("Int membership rejects a String needle", test_int_membership_rejects_a_string_needle),
 		("membership callback has the written three-argument contract", test_contains_with_requires_three_arguments),
 		("membership comparator input matches the actual element", test_contains_with_rejects_a_comparator_for_another_element_type),
 		("membership comparator returns Bool", test_contains_with_requires_a_boolean_comparator_result),

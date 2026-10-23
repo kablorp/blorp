@@ -10,9 +10,12 @@ Supporting a feature in the existing compiler does not put it in scope here.
 The pinned Blorp 2 seed builds the current compiler. The legacy TestSuite host
 remains temporary for untranslated component suites. Compiler source stays
 within the eventual bootstrap subset in the README: no
-concurrency, parallelism, tensors or dimension types, tuples, debug blocks,
-numeric widths other than Int64 and Float64, traits, doctests, channels or
-FFI. Use concrete functions such as `add` and `concat`, and pattern matching,
+concurrency, parallelism, tensors or dimension types, debug blocks,
+numeric widths other than Int64 and Float64, doctests, channels or FFI.
+Tuples and static traits are supported by the current seed; their use in compiler
+implementation remains bounded by each reviewed task. Production library trait
+activation does not authorize a general compiler-source comparison rewrite.
+Use concrete functions such as `add` and `concat`, and pattern matching,
 not trait-dispatched operators such as `==`. Host-library dependencies and
 the host TestSuite API are temporary; they neither establish bootstrap
 readiness nor expand the input language.

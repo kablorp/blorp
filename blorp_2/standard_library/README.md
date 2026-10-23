@@ -1,7 +1,8 @@
 # Blorp 2 standard library
 
 These modules are compiled by Blorp 2 for input programs. They are separate
-from the host library at `standard_library/src/` that builds the pilot compiler.
+from the temporary TestSuite host library at `standard_library/src/`. The
+pinned Blorp2 compiler uses this target library when compiling compiler source.
 
 The directory was renamed from `standard_library_temp` on 2026-10-18. Dated
 benchmark reports and retained raw evidence keep the historical path to preserve
@@ -18,6 +19,10 @@ The library root contains two designated foundation modules:
 
 Library modules receive nothing implicitly. Each one imports what it uses,
 including base types, for example `_base: Int, Bool(True, False)` in `int.brp`.
+`traits.brp` owns canonical Equatable and imports only Bool and its constructors
+from _base. The prelude selects that trait; operation modules provide written
+Int/Float/String/List implementations. Equality imports name this one family,
+so aliases and contextual callable references dispatch by the actual receiver.
 
 `bool.brp` defines pure, ordinary `not`, `and` and `or`; select them explicitly
 with `bool: not, and, or` for direct calls and UFCS. Both binary arguments are eager;
@@ -28,7 +33,8 @@ They import only other library modules and `_base`, never user modules.
 For example, `42.add(1).to_string().length()` needs no imports. Direct calls
 still require named imports such as `int: add`. IO remains explicit.
 Int ordering uses one signed64 `less_than` builtin; the other relations,
-`not_equals`, `min` and `max` are ordinary pure functions. Imported `INT_MIN`
+`min` and `max` are ordinary pure functions. `not_equals` uses the canonical
+trait default. Imported `INT_MIN`
 and `INT_MAX` are closed scalar literals, with no runtime global storage.
 The [imports design](../README.md#local-modules) defines the full rules.
 
@@ -119,15 +125,18 @@ Integrated correctness, self-compilation and resource acceptance remain separate
 
 ### List membership
 
-`contains_with[A](values: List[A], needle: A, equals: pure (A, A) -> Bool) -> Bool`
+`contains_with[A](values: List[A], needle: A, comparison: pure (A, A) -> Bool) -> Bool`
 uses supplied equality in element/needle order and stops at the first match.
-`contains(values: List[Int], needle: Int) -> Bool` uses `int.equals`.
+`contains[Element: Equatable](values: List[Element], needle: Element) -> Bool`
+uses the selected equality implementation. String, named record and nested
+List elements work when they satisfy that bound; authored equality takes precedence.
 Both functions are pure and borrow their inputs; managed aliases remain valid.
-The Int-only adapter is temporary: replace it with general `contains[T: Equatable]`
-when the target supports equality traits. The supplied-equality API stays generic.
+The supplied-comparison API needs no Equatable bound and preserves its comparator
+contract. List equality itself uses a single length/get index walk, without
+copying suffixes. Float NaN remains unequal to itself.
 Indexed `get` and ordinary recursion do O(n) work, with linear C stack at O0 and
 ordinary temporary ARC costs. No bounded-stack or zero-allocation claim is made.
-Equality traits and optimization of these temporary helpers remain separate.
+Further helper optimization is deferred; these equality contracts are supported.
 
 The List update names match the unchanged host library because the same compiler source
 must build against both libraries. The internal `list.set` builtin implements the

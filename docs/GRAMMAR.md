@@ -1401,8 +1401,9 @@ dim_atom      = DIMNAME | "#" "_" | "#" INT | INT | "(" dim_expr ")" ;
   and lambdas remain unsupported by checking. Bare impure function types remain
   outside its grammar.
   The pilot's [List membership APIs](../blorp_2/standard_library/README.md#list-membership)
-  use this ordinary callable syntax, with a temporary Int adapter and linear O0
-  stack in the current implementation; they add no grammar production.
+  use this ordinary callable syntax. `contains[Element: Equatable]` selects
+  equality; contains_with accepts a supplied pure comparator without that bound.
+  Indexed recursion still uses linear O0 stack; these APIs add no grammar production.
 - Blorp 2's [List callback helpers](../blorp_2/standard_library/README.md) use the
   same pure callable parameter syntax; they introduce no additional grammar.
 - Blorp 2's [List queries and copies](../blorp_2/standard_library/README.md#list-queries-and-copies)

@@ -1,0 +1,49 @@
+# Blorp 2 production equality library activation
+
+The production library defines canonical `Equatable` in `traits.brp`, imports it through the configured prelude, and supplies ordinary written Int, Float, String and bounded List families. Builtin equality labels remain unchanged. Generic `contains[Element: Equatable]` passes the contextual family reference to the unchanged comparator-based membership path. List equality checks length and walks indices until its first unequal element; it does not copy suffixes. Compiler production changes: zero.
+
+The inherited, separately qualified seed pin is `blorp2-seed-de61a35911ba` at full source commit `de61a35911baf9222ccc470d64ecf815fe519012`. Its eight release assets, seven checksums, three target-platform qualification and independent cold-build/code/test reviews were verified in the seed publication task. This feature preserves that newer pin on parent `29e503c1`; it does not replace it with the earlier aa87 seed. A fresh, isolated seed-only Make example against the activated library passed in 79.048 s from an empty private cache, with no legacy host or build. It emitted d7a6 compiler C; all seven file-backed sections of its new normal A match the qualified T4 normal B. Resolver-only warm ID/path checks returned the exact de61 pin and verified unchanged seed-cache bytes, mode and modification time. This is program identity reuse, not a fresh repeated full proof or a claim that this A matches the old aa87 A6115. The older aa87 cold/warm proof remains historical evidence only. A legitimate local legacy TestSuite host served component suites; it did not compile Blorp 2 fixture sources.
+
+Fresh same-version proof passed in 888.616s: A/B/C emit identical d7a6 C, all 584 fixture pairs agree, and 607 native cases pass. Broad allocation-debt mode records 118 inherited and 7 new debt rows without changing old caps; broad instruction checks remain disabled. The component gate passes 4,620 hosted and 188 target callbacks, with 27 positive balanced target accounting reports. The three old loader inventory expectations now explicitly include exactly one imported traits module and retain the exact Option/Result absence/presence checks.
+
+The dedicated 19-answer membership case passes actual B with 211,742 compiler allocations and 1,809,680,583 retired instructions under its unchanged 250,000/2,000,000,000 caps, real main 23, stdout `needle` followed by a newline, and 29 allocations/releases with zero leaks in its strict target run. A deliberate ordinary library-copy List.equals=True fault produces exact main 0 instead of 23. That fault stops before the harness strict-target and final resource callback, so no mutant strict/accounting credit is claimed. The four new production-library A/B missing-bound CLI calls retain exact 5:11 diagnostics, empty stdout and absent/unchanged-sentinel outputs.
+
+Fresh current-source strict self-compilation passes with 31,918,599 allocations/releases, zero leaks, exact d7a6 C and stable guards. The whole sanitized compiler passed in 330.943 s with the same 31,918,599 balanced allocations, zero leaks, no ASan/UBSan diagnostics and identical C. The archived, unmodified 19-answer target C also passed ASan/UBSan with main 23, exact `needle` followed by a newline output and 29 balanced allocations. These rollout results were obtained on macOS; the three-platform results above qualify the released seed, not this new library candidate.
+
+The qualified T4 compiler C/program and all 46 compiler sources are unchanged. Reusing its fixed Original02b matched cost evidence and 54 isolated CLI results is explicit historical evidence, supported by current A/B exact seven-section identity and unchanged isolated inputs; those 54 calls and the compiler-runtime cost samples were not rerun. Fresh old/new production-library input measurements below isolate the changed library input and do not replace that frozen Original comparison. The reused Original comparison is −9.877477% allocations and +0.524167% retired instructions, within the unchanged cumulative +5% ceilings. No compounded percentages or broad resource PASS is claimed.
+
+Final change counts are compiler 0; library 52 ADD / 19 DEL / +33; tests 174 ADD / 35 DEL / +139 (including the final sample-basis comment); reference docs 138 ADD / 87 DEL / +51. This report is counted separately. The feature preserves its parent’s bootstrap pin. Raw failures, setup-only attempts and unrun malformed mutation predecessors are retained under ignored build evidence and provide no acceptance credit.
+
+The seven new allocation-debt rows are retained without cap changes:
+
+- `blorp_2/test/e2e/fixtures/tuple/patterns.brp`: 142,788/140,000 allocations (+1.99%).
+- `ordinary target logical path normalization`: 200,082/200,000 allocations (+0.04%).
+- `blorp_2/test/e2e/fixtures/generic/nested/deep.brp`: 186,859/180,000 allocations (+3.81%).
+- `blorp_2/test/e2e/fixtures/list/take_int.brp`: 151,306/150,000 allocations (+0.87%).
+- `blorp_2/test/e2e/fixtures/list/remove_int.brp`: 154,503/150,000 allocations (+3.00%).
+- `blorp_2/test/e2e/fixtures/list/take_remove_void.brp`: 151,512/150,000 allocations (+1.01%).
+- `blorp_2/test/e2e/fixtures/list/take_remove_moderate.brp`: 152,854/150,000 allocations (+1.90%).
+
+The largest new overage is 6,859 allocations (3.81%); these are recorded debt, not resource PASS. The previous concrete-main debt row no longer exceeds its existing cap. All new debt remains accepted recorded debt; no ceiling was raised.
+
+Measurements ran on macOS arm64 with Apple clang 21 through the official Make link recipes: `-O0`, `-DBLORP_MEMORY_DIAGNOSTICS=0/1`, and `-lm -lpthread`. The paired compiler C is `d7a6e56fd5654d92ecbd7abdecd19302244a08289d77d15ada2620f64d52c11e`; normal binary is `2a073edf07ed413bc01f2ff5feae38e5d6d174916a6ae451cb8372de42f6a484`, diagnostic binary `0459c12743aab160a0eda3d55ed9cf32601eda4aadf19b578e19876656eb6144`. The exact four source workloads are:
+
+- `/Users/keithphilpott/.codex/worktrees/equatable-library-rollout/blorp/blorp_2/test/e2e/fixtures/return/zero.brp`
+- `/Users/keithphilpott/.codex/worktrees/equatable-library-rollout/blorp/blorp_2/test/e2e/fixtures/string_literal/empty.brp`
+- `/Users/keithphilpott/.codex/worktrees/equatable-library-rollout/blorp/blorp_2/test/e2e/fixtures/list/contains_int.brp`
+- `/Users/keithphilpott/.codex/worktrees/equatable-library-rollout/blorp/blorp_2/src/main.brp`
+
+Matched activation measurements use the same qualified normal/diagnostic compiler pair, four identical source workloads, one physical output path, private environment and fixed old/new library inventories. All old/new C outputs match. Eight strict runs and 24 normal samples complete the fixed P1 C1 C2 P2 P3 C3 schedule per workload; instruction comparisons use minimum of three. One whole P3 call failed its input guard when an unrelated, qualified bootstrap update landed on Root. Its output and raw counters were retained and excluded; the reviewed replacement P3-R1 and previously unrun C3 completed the schedule. No other samples were repeated or discarded.
+
+| Workload | Allocations old → new | Change | Retired instructions, min3 old → new | Change |
+| --- | ---: | ---: | ---: | ---: |
+| Return zero | 106,374 → 117,430 | +10.3935% | 1,359,638,501 → 1,549,811,403 | +13.9870% |
+| Empty String | 107,015 → 118,071 | +10.3313% | 1,361,209,150 → 1,550,744,459 | +13.9240% |
+| Existing Int membership | 157,805 → 169,814 | +7.6100% | 1,467,318,710 → 1,658,474,792 | +13.0276% |
+| Current compiler | 31,773,235 → 31,918,599 | +0.4575% | 1,083,787,247,603 → 1,085,255,534,622 | +0.1355% |
+
+Peak RSS ranges in bytes are retained separately: return zero 9,207,808–9,650,176 old / 9,601,024–9,650,176 new; empty String 9,895,936–9,977,856 / 9,846,784–10,387,456; Int membership 10,403,840–10,731,520 / 10,452,992–11,010,048; compiler 301,858,816–309,592,064 / 301,334,528–308,510,720. These ranges do not establish a memory improvement.
+
+The first two allocation comparisons and all three tiny instruction comparisons exceed the 10% investigation trigger. Read-only investigation identifies the changed frontend work: the prelude now selects canonical Eq instead of taking the None fast path. Checking validates one trait with two methods, four authored families, and base Bool/Option/Result member availability/templates, then trait dependency analysis. The equal +11,056 allocation difference for two unrelated tiny programs is consistent with a fixed frontend startup contribution. This is a qualitative source-boundary explanation, not measured per-phase attribution. No library-only skip was identified that would preserve the reviewed validation/availability contract; no cache, lazy-derivation mechanism, optimization or cap change was introduced. Root accepted this non-egregious feature overhead as recorded after investigation. Whole-compiler allocations and instructions are below the separate 2% investigation trigger. Both independent final raw-cost reviews approved all 32 valid slots, with the administrative replacement explicit.
+
+Raw source/spec/receipt evidence is retained under the absolute worker prefix `/Users/keithphilpott/.codex/worktrees/equatable-library-rollout/blorp/build/traits-T5-rollout/`: `current-activation-recovery01/ACTIVATION_FINAL_RESULT.json` (c7b80fd2), independent final cost review (0620a948), `correctness01/CORRECTNESS_RESULT.json` (e94124e1), `required-native03/NATIVE_ORACLE_FINAL_RESULT.json` (372ab09e), and `new-seed-cold01/FINAL_RESULT.json` (6185236f). Raw commands, guards, streams and time reports reside under `/Users/keithphilpott/CLionProjects/blorp/build/traits-implementation-2026-10-22/T0-qualification/`. Isolated source04/prototype measurements remain historical; this report’s current activation measurements use the completed T4b compiler program and actual production library activation.

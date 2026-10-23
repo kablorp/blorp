@@ -2,8 +2,8 @@
 
 Status: T0 inference, T1 concrete traits, T2 semantic instance identity,
 T3 bounds/defaults/contextual method references, T4a nongeneric automatic
-equality and T4b generic automatic equality are qualified for publication.
-T5 production-library rollout remains open. Original
+equality, T4b generic automatic equality and T5 production-library rollout
+are qualified for publication. Original
 measurement baseline: `02b13d25d04b7c5670cb94052ea9675cc9ba3428`.
 The accepted trait surface and explicit conservative finite-dispatch limits
 are defined in README/grammar. Code marked **model sketch** describes compiler
@@ -13,17 +13,19 @@ Completed qualification evidence is retained in the
 [concrete traits report](../benchmarks/results/blorp2-concrete-traits-2026-10-22.md),
 [semantic instance identity report](../benchmarks/results/blorp2-semantic-instance-keys-2026-10-22.md),
 the [bounds/defaults report](../benchmarks/results/blorp2-trait-bounds-2026-10-22.md),
-and the [generic equality report](../benchmarks/results/blorp2-generic-equality-2026-10-23.md).
+the [generic equality report](../benchmarks/results/blorp2-generic-equality-2026-10-23.md),
+and the [production library report](../benchmarks/results/blorp2-trait-library-2026-10-23.md).
 
-This is the single plan for the open work. Delete completed milestone
-instructions as they land; retain semantic rules in README/grammar and
-measurements in benchmarks/results. Agent messages follow
+This document retains the agreed trait scope and acceptance contracts. Delete
+completed milestone instructions as they land; retain semantic rules in
+README/grammar and measurements in benchmarks/results. Agent messages follow
 [HANDOFF_SPEC](../docs/HANDOFF_SPEC.md); do not create a separate plan per worker.
 
 ## 1. Problem and agreed contract
 
-Blorp 2 accepts concrete authored trait declarations and static method calls;
-its production library still exposes concrete functions such as `int.equals`.
+Blorp 2 accepts authored trait declarations and static method calls. Its
+production library supplies written Int, Float, String and bounded List equality
+families; membership uses the element family through an ordinary callable.
 Adding bounds, defaults and automatic equality must preserve ordinary type
 inference, nominal identity, purity, imports and ownership.
 It must not create a parallel call graph or carry trait machinery into
@@ -87,8 +89,9 @@ Revisiting partial implementations requires its own coherent language decision.
 
 ## 2. Source examples and inference prerequisite
 
-Examples are fragments unless module names are shown. The proposed fixture
-prelude imports base types and Equatable; operation imports remain explicit.
+Examples are fragments unless module names are shown. The production
+prelude imports base types and the trait from `traits`; operation imports
+remain explicit.
 
 **Source: final canonical declaration selected by the configured prelude.**
 
@@ -104,14 +107,15 @@ trait Equatable:
             False: True
 ```
 
-**Source: ordinary primitive implementation, in the fixture's int module.**
+**Source: production library Int equality implementation.**
 
 ```blorp
 import:
-    _base: Int, Bool, Equatable
+    _base: Int, Bool
+    traits: Equatable
 
 implements Equatable for Int:
-    pure func equals(left: Int, right: Int) -> Bool:
+    pure func equals(left: Self, right: Self) -> Bool:
         builtin("int.equals")
     -- not_equals uses the trait default; no second primitive hook.
 ```
@@ -589,39 +593,30 @@ arbitrary candidate as the culprit.
 List equality is an ordinary bounded implementation, not compiler derivation
 or a generic runtime hook. Keep the algorithm linear without zipped/copied Lists.
 
-**Source: T4 isolated fixture-library method; production migration waits for T5.**
+**Source: production library List equality implementation.**
 
 ```blorp
 implements Equatable for List[Element: Equatable]:
-    pure func equals(left: List[Element], right: List[Element]) -> Bool:
+    pure func equals(left: Self, right: Self) -> Bool:
         count = length(left)
         match IntOps.equals(count, length(right)):
             False: False
             True:
-                var index = 0
-                var matched = True
-                while IntOps.less_than(index, count):
-                    match get(left, index):
-                        None:
-                            matched = False
-                            break
-                        Some(left_item):
+                var same: Bool = True
+                for index in 0..count:
+                    same = match get(left, index):
+                        None: False
+                        Some(element):
                             match get(right, index):
-                                None:
-                                    matched = False
-                                    break
-                                Some(right_item):
-                                    match equals(left_item, right_item):
-                                        False:
-                                            matched = False
-                                            break
-                                        True:
-                                            index = IntOps.add(index, 1)
-                matched
--- Imports: _base Int/List/Equatable/Bool(True,False)/Option(Some,None),
--- and int as IntOps; length/get are local ordinary functions.
+                                None: False
+                                Some(other): equals(element, other)
+                    match same:
+                        False: break
+                        True: void
+                same
+-- Imports: _base Int/List/Bool(True,False)/Option(Some,None),
+-- traits Equatable and int as IntOps; length/get are local functions.
 -- The nested equals names the same family with Self = Element.
--- Option cases are handled without panics; inputs are evaluated once.
 ```
 
 Bool and generic Option/Result use the same actual-member derivation rule;
@@ -673,15 +668,10 @@ framework. References were checked on 2026-10-22.
 
 No parse-only scaffolding milestone lands by itself. Each milestone includes
 its complete producer/consumer path, exact diagnostics, reference/EBNF updates,
-two independent reviews and one coherent commit. T0 through T4b are complete.
-The table contains only open milestones.
-
-Start each remaining milestone with its red oracle. Do not remove old negative
-coverage merely to turn a suite green.
-
-| Milestone | Deliverable and changed boundary | Completion oracle |
-| --- | --- | --- |
-| T5: production library rollout | Qualify/publish/pin capable seed, then migrate target library APIs | Clean bootstrap/fixpoint and all component/native/platform gates pass without legacy building Blorp 2 |
+two independent reviews and one coherent commit. T0 through T5 are complete;
+there are no remaining milestones in this plan. Retain the acceptance contracts
+below for later changes, and begin any new increment with its red oracle.
+Do not remove old negative coverage merely to turn a suite green.
 
 The accepted canonical equals-only declaration validates the exact pure
 Self/Self -> Bool contract. T3 supports the ordinary not_equals default. No magic
@@ -858,12 +848,10 @@ rescoping. No efficiency improvement is claimed by this proposal.
 
 ### Bootstrap and library boundary
 
-The current [bootstrap manifest](bootstrap.env) pins a trait-capable seed.
-Keep compiler implementation source within its supported subset. Before moving
-the production canonical declaration out of _base, qualify and pin a compiler
-that recognizes the prelude-selected identity and its library ownership rule.
-The production target library stays unchanged during that preparatory slice;
-explicit fixture libraries exercise the new rule without an alternate builder.
+The current [bootstrap manifest](bootstrap.env) pins the qualified seed that
+recognizes the prelude-selected canonical identity and library ownership rule.
+The production declaration lives in `traits.brp`; _base stays import-free.
+Keep compiler implementation source within the supported seed subset.
 
 Canonical Eq is optional: `None` means no ordinary Equatable binding in the
 configured prelude, not fallback recognition by spelling elsewhere. When
@@ -872,13 +860,10 @@ namespace authority. _base may contain specifically owned trait default bodies,
 while unrelated free functions/imports remain rejected. Same-spelled traits
 with different IDs remain ordinary, subject to the existing name-conflict rules.
 
-T5 uses the maintained [release procedure](../docs/RELEASES.md) and
-[bootstrap launcher](../scripts/blorp2-compiler-bootstrap).
-Publish/qualify the capable seed and pin it before any default library syntax
-migration. Then move equals/not_equals into written implementations atomically
-with all affected target-library consumers/tests/reference docs. Preserve
-builtin primitive contracts. Compiler-source migration is a later bounded
-cleanup, not permission to rewrite every comparison now.
+Future seed updates use the maintained [release procedure](../docs/RELEASES.md)
+and [bootstrap launcher](../scripts/blorp2-compiler-bootstrap). Written equality
+families preserve builtin primitive contracts. Compiler-source comparison
+migration is a separate bounded cleanup.
 
 Update Blorp 2 README/grammar at each feature milestone; update shared
 GUIDE/GRAMMAR where their contracts change. In particular remove stale claims

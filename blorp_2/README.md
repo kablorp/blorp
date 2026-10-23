@@ -8,7 +8,7 @@ suites continue using the legacy TestSuite host.
 
 The combined integration implements pure lambdas with immutable captures,
 structural patterns, value conditionals and managed source loops. The target
-library includes the temporary concrete helpers described below. Focused
+library provides the equality families and ordinary helpers described below. Focused
 functional results are supplemented by an actual self-compilation: all 43
 compiler source modules emit C, that C links, and the resulting compiler emits
 byte-identical C from the same source and library. The [self-compilation
@@ -43,7 +43,7 @@ implementations and semantic type arguments. The [generic equality report](../be
 records qualification evidence and matched costs; the earlier
 [nongeneric report](../benchmarks/results/blorp2-derived-equality-2026-10-23.md)
 retains its original proof and costs. The [Equatable-first trait plan](TRAITS_PLAN.md)
-owns production-library migration and the remaining acceptance gates.
+owns production-library contracts and the retained acceptance criteria.
 
 The [incremental layout migration](LAYOUT_MIGRATION.md) defines the proposed
 physical-layout model, staged replacements, code examples and cost gates.
@@ -68,13 +68,61 @@ method's first parameter must have exactly that type. A signature without a
 colon is abstract; a colon introduces an ordinary default body. An omitted
 return annotation means Void, as for ordinary functions.
 
+The library's [traits module](standard_library/traits.brp) owns the canonical
+contract. It imports Bool from the import-free base:
+
 ```blorp
+-- blorp_2/standard_library/traits.brp
+import:
+    _base: Bool(True, False)
+
 trait Equatable:
-	pure func equals(left: Self, right: Self) -> Bool
+    pure func equals(left: Self, right: Self) -> Bool
+    pure func not_equals(left: Self, right: Self) -> Bool:
+        match equals(left, right):
+            True: False
+            False: True
+```
+
+The equality part of the library's [Int module](standard_library/int.brp)
+uses its library ownership allowance and preserves the existing builtin:
+
+```blorp
+-- blorp_2/standard_library/int.brp
+import:
+    _base: Int, String, Bool(True, False)
+    traits: Equatable
 
 implements Equatable for Int:
-	pure func equals(left: Self, right: Self) -> Bool:
-		builtin("int.equals")
+    pure func equals(left: Self, right: Self) -> Bool:
+        builtin("int.equals")
+```
+
+An application receives Equatable through the prelude. It can use automatic
+Point equality and define its own Tagged implementation, which compares only tag:
+
+```blorp
+-- main.brp
+import:
+    int as IntOps
+
+fixed record Point { value: Int }
+fixed record Tagged { tag: Int, detail: Int }
+
+implements Equatable for Tagged:
+    pure func equals(left: Self, right: Self) -> Bool:
+        IntOps.equals(left.tag, right.tag)
+
+func main() -> Int:
+    point: Point = { value = 7 }
+    first: Tagged = { tag = 7, detail = 1 }
+    second: Tagged = { tag = 7, detail = 9 }
+    match IntOps.equals(point, point):
+        False: 0
+        True:
+            match IntOps.equals(first, second):
+                True: 23
+                False: 0
 ```
 
 The configured prelude's ordinary `Equatable` binding selects the canonical
@@ -155,9 +203,10 @@ trait representation reaches lowering, ownership or emission.
 The [concrete fixture](test/e2e/trait_inputs/concrete/main.brp) supplies its own
 [isolated library](test/e2e/trait_inputs/concrete/library/) and returns 23 for
 `equals(7, 7)`. These inputs live outside the ordinary fixture scan and require
-an explicit `--library-root`. The production library continues to use its
-existing concrete APIs until the later library migration. Compiler source
-continues to obey the separately pinned [bootstrap subset](AGENTS.md).
+an explicit `--library-root`. The production library defines canonical Equatable
+in `traits`; Int, Float, String and List publish written implementations through
+their operation modules. Compiler source continues to obey the separately pinned
+[bootstrap subset](AGENTS.md).
 
 ## Automatic equality for named aggregates
 
@@ -221,8 +270,8 @@ A prelude without the canonical Equatable binding creates no automatic equality 
 Derived methods use ordinary direct calls, defaults and contextual callable
 references through the existing specialization graph. Only reachable bodies
 emit code; no trait representation reaches lower phases. The production target
-library retains its existing APIs. T5 must qualify and pin a seed supporting
-this declaration-location rule before moving its canonical trait and implementations.
+library uses its prelude-selected Equatable for generic List membership and
+written element equality; automatic aggregate capability adds no operation names.
 
 ## First example
 
@@ -1095,7 +1144,10 @@ still use ordinary C call depth, and managed values remain outside
 
 
 Ordinary [List membership](standard_library/README.md#list-membership) accepts a
-supplied pure equality callback, with a temporary concrete Int adapter.
+supplied pure comparison callback or `contains[Element: Equatable]`. The
+canonical trait lives in the ordinary traits module, selected by the prelude;
+Int, Float, String and List have written implementations. Nested Lists and
+named records use their accepted equality implementations.
 Its indexed recursion does O(n) work and uses linear C stack at O0.
 
 ## Recursive data through records and Lists
@@ -1987,8 +2039,8 @@ func main() -> Int:
 
 It exits 42. `20.add(22)` uses the same declaration through UFCS. Int addition
 wraps at the signed 64-bit limits. Arithmetic operators remain unsupported.
-[Concrete authored traits](#concrete-traits) are available; the production
-arithmetic helpers retain their ordinary APIs until the later library migration.
+[Concrete authored traits](#concrete-traits) provide equality in the production
+library. Arithmetic helpers such as `add` remain ordinary functions.
 
 Supply the target library explicitly:
 
