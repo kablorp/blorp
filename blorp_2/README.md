@@ -37,11 +37,13 @@ convenience does not remove currently supported input features.
 
 Concrete, authored traits are supported as described in [concrete traits](#concrete-traits).
 Function bounds, full generic receiver families, default methods and contextual
-method references extend that surface. Automatic equality for nongeneric named
-records and unions is complete; its [qualification report](../benchmarks/results/blorp2-derived-equality-2026-10-23.md)
-records proof and costs. The [Equatable-first trait plan](TRAITS_PLAN.md) owns
-remaining generic automatic equality and library migration, together with phase
-boundaries and acceptance gates.
+method references extend that surface. Automatic equality for named records and
+unions infers conditional bounds from their actual members, preserving authored
+implementations and semantic type arguments. The [generic equality report](../benchmarks/results/blorp2-generic-equality-2026-10-23.md)
+records qualification evidence and matched costs; the earlier
+[nongeneric report](../benchmarks/results/blorp2-derived-equality-2026-10-23.md)
+retains its original proof and costs. The [Equatable-first trait plan](TRAITS_PLAN.md)
+owns production-library migration and the remaining acceptance gates.
 
 The [incremental layout migration](LAYOUT_MIGRATION.md) defines the proposed
 physical-layout model, staged replacements, code examples and cost gates.
@@ -133,12 +135,14 @@ the diagnostic asks for a callable annotation or a typed callback parameter.
 Invoking these values follows ordinary purity, capture and ownership rules;
 operands evaluate once in written order.
 
-The existing finite-instantiation check includes trait calls and method-value
-creation before specialization. Its constructor-depth proof is conservative:
-it can reject a finite `Box` to `Wrap` relay or a generic field containing three
-nested Lists with `cannot prove finite generic trait instantiation`. These are
-explicit temporary limits; ordinary deeply nested field dispatch must be
-closed before the structural-equality milestone can complete.
+Check validates finite instantiation for trait calls and method-value creation
+before specialization. Its constructor-path proof distinguishes actual receiver
+heads and ordered type arguments, including deeply nested List fields and finite
+Box-to-Wrap relays. It remains a sufficient proof: an unproved family reports
+`cannot prove finite generic trait instantiation`, even if a more precise analysis
+could establish finiteness. This proves a finite set of specialized instances,
+not runtime termination. Defaults retain complete Self, including phantom arguments;
+a true wrapping cycle is rejected before Specialize.
 
 Traits remain parameterless, with no independently generic methods, impure
 requirements or top-level callable formals. Record/union
@@ -155,11 +159,10 @@ an explicit `--library-root`. The production library continues to use its
 existing concrete APIs until the later library migration. Compiler source
 continues to obey the separately pinned [bootstrap subset](AGENTS.md).
 
-## Automatic equality for nongeneric aggregates
+## Automatic equality for named aggregates
 
-With the designated foundation's canonical `Equatable`, a nongeneric named
-record or union supports equality when every actual field or payload supports
-it. Both fixed spellings use the same rule. No annotation or implementation
+With the configured prelude's canonical `Equatable`, a named record or union
+supports equality when every actual field or payload supports it. Both fixed spellings use the same rule. No annotation or implementation
 block is needed. The method family must still be visible through ordinary
 imports. Automatic capability does not publish operation names: importing an
 automatically supported type, including Bool through the prelude, does not
@@ -185,16 +188,34 @@ remain outside the accepted grammar.
 Written implementations replace automatic equality for their whole receiver
 head. An enclosing aggregate calls the selected written implementation, including
 its declared conditions; failed conditions never fall back to structural equality.
-Ground fields may therefore use ordinary conditional families such as
-`Custom[Int]` requiring `Int: Visit`, without inventing an Equatable requirement
-for an unused type argument. Recursive nongeneric Tree/List and mutual aggregate
-dependencies close only after all outgoing member requirements succeed.
+Actual members determine a generic head's conditions. For example:
+
+```blorp
+fixed record Box[Element] { values: List[List[List[Element]]] }
+fixed record Phantom[Element] { tag: Int }
+fixed record Holder[Element] { child: Custom[Element] }
+```
+
+Box equality requires `Element: Equatable` when the visible ordinary List family
+has that bound. Phantom requires no bound on Element, even for a callable type
+argument. If a written `Equatable` family for Custom requires `Element: Visit`,
+Holder propagates Visit rather than inventing an Equatable bound. These are
+conditions on equality, not restrictions on ordinary construction. Generic
+function callers must declare the conditions they use. Every semantic argument,
+including a phantom argument, remains part of specialization identity.
+
+Recursive Tree/List and mutual aggregate dependencies close only after all
+outgoing member requirements succeed. This capability closure is separate from
+Check's finite-instantiation proof.
 
 An unused declaration with a callback or otherwise unsupported member remains
 legal. Equality use reports the actual unsupported field or payload annotation.
-Generic aggregate heads, including phantom heads, require a written full-family
-implementation for now; their automatic equality is the open T4b increment.
-Tuples, opaque types and callable values receive no automatic implementation.
+Generic heads use the same actual-member rule. A failed authored family never
+falls back to an automatic body. If the finite path proof cannot admit a new
+automatic family, unused declarations remain legal; an actual equality or bounded
+callable use rejects before the checked program is sealed. Nongeneric parents
+also propagate an unavailable generic child. Tuples, opaque types and callable
+values receive no automatic implementation.
 A prelude without the canonical Equatable binding creates no automatic equality bodies.
 
 Derived methods use ordinary direct calls, defaults and contextual callable

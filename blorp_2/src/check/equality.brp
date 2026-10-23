@@ -1,5 +1,5 @@
 ---
-Ordinary checked equality templates for supported nongeneric aggregates. Eligibility
+Ordinary checked equality templates for supported aggregates. Eligibility
 belongs to traits; this module receives its accepted canonical method contract.
 ---
 import:
@@ -60,15 +60,15 @@ private pure func compare(left: Checked.CheckedExpr, right: Checked.CheckedExpr,
 	}
 
 
-private pure func record_value(record_row: Checked.CheckedRecord, method: Checked.AcceptedTraitMethod, boolean: DesignatedBoolean[VariantId], span: Span) -> Checked.CheckedExpr:
+private pure func record_value(record_row: Checked.CheckedRecord, receiver: Checked.TypeRef, method: Checked.AcceptedTraitMethod, boolean: DesignatedBoolean[VariantId], span: Span) -> Checked.CheckedExpr:
 	var result = boolean_value(True, boolean, span)
 	var remaining = record_row.fields.length()
 	while IntOps.greater_than(remaining, 0):
 		remaining = IntOps.subtract(remaining, 1)
 		match record_row.fields.get(remaining):
 			Some(field):
-				left: Checked.CheckedExpr = { form = Checked.ReadRecordField(read_parameter(0, Checked.RecordType(record_row.id), span), field.id), value_type = field.value_type.value_type, span = field.value_type.span }
-				right: Checked.CheckedExpr = { form = Checked.ReadRecordField(read_parameter(1, Checked.RecordType(record_row.id), span), field.id), value_type = field.value_type.value_type, span = field.value_type.span }
+				left: Checked.CheckedExpr = { form = Checked.ReadRecordField(read_parameter(0, receiver, span), field.id), value_type = field.value_type.value_type, span = field.value_type.span }
+				right: Checked.CheckedExpr = { form = Checked.ReadRecordField(read_parameter(1, receiver, span), field.id), value_type = field.value_type.value_type, span = field.value_type.span }
 				result = and_then(compare(left, right, method), result, boolean)
 			None: void
 	result
@@ -78,8 +78,7 @@ private pure func parameter_binding(position: Int, value_type: Checked.TypeRef, 
 	{ origin = Checked.ParameterBinding(position), mutability = Checked.Immutable, value_type = value_type, span = span }
 
 
-private pure func union_template(union_row: Checked.CheckedUnion, signature: Checked.FunctionSignature, method: Checked.AcceptedTraitMethod, boolean: DesignatedBoolean[VariantId], span: Span) -> Checked.CheckedEqualityBody:
-	value_type = Checked.UnionType(union_row.id)
+private pure func union_template(union_row: Checked.CheckedUnion, value_type: Checked.TypeRef, signature: Checked.FunctionSignature, method: Checked.AcceptedTraitMethod, boolean: DesignatedBoolean[VariantId], span: Span) -> Checked.CheckedEqualityBody:
 	root: Checked.CheckedPatternPlace = { route = Checked.MatchRoot, value_type = value_type }
 	var bindings = [parameter_binding(0, value_type, span), parameter_binding(1, value_type, span)]
 	var arms: List[Checked.CheckedJoinArm] = []
@@ -167,10 +166,28 @@ private pure func union_template(union_row: Checked.CheckedUnion, signature: Che
 
 -- The canonical contract is already accepted. Substitute its genuine Self
 -- once; no parsed header, spelling or new implicit parameter domain is needed.
-pure func equality_template(aggregate: Checked.AggregateId, records: List[Checked.CheckedRecord], unions: List[Checked.CheckedUnion], method: Checked.AcceptedTraitMethod, boolean: DesignatedBoolean[VariantId], span: Span) -> Result[Checked.CheckedEqualityBody, CheckError]:
-	receiver = match aggregate:
-		Checked.RecordAggregate(record_row): Checked.RecordType(record_row)
-		Checked.UnionAggregate(union_row): Checked.UnionType(union_row)
+pure func equality_template(
+	aggregate: Checked.AggregateId,
+	type_parameters: List[Checked.TypeParameterId],
+	requirements: List[Checked.TraitRequirement],
+	records: List[Checked.CheckedRecord],
+	unions: List[Checked.CheckedUnion],
+	method: Checked.AcceptedTraitMethod,
+	boolean: DesignatedBoolean[VariantId],
+	span: Span,
+) -> Result[Checked.CheckedEqualityBody, CheckError]:
+	arguments = type_parameters.map(pure func(parameter) -> Checked.TypeRef: Checked.ParameterType(parameter))
+	receiver: Checked.TypeRef = match aggregate:
+		Checked.RecordAggregate(record_row):
+			if arguments.is_empty():
+				Checked.RecordType(record_row)
+			else:
+				Checked.AppliedRecordType(record_row, arguments)
+		Checked.UnionAggregate(union_row):
+			if arguments.is_empty():
+				Checked.UnionType(union_row)
+			else:
+				Checked.AppliedUnionType(union_row, arguments)
 	substitution: Substitution = { owner = Checked.TraitDeclaration(trait_method_owner(method.id)), values = [receiver] }
 	var parameters: List[Checked.TypeUse] = []
 	var failure: Option[CheckError] = None
@@ -182,13 +199,17 @@ pure func equality_template(aggregate: Checked.AggregateId, records: List[Checke
 		Some(error): Err(error)
 		None: Ok(void)
 	result ?= substitute_type(method.signature.return_type.value_type, substitution, span)
-	signature: Checked.FunctionSignature = { type_parameters = [], requirements = [], purity = method.signature.purity, parameters = parameters, return_type = { value_type = result, span = span } }
+	signature: Checked.FunctionSignature = {
+		type_parameters = type_parameters, requirements = requirements,
+		purity = method.signature.purity, parameters = parameters,
+		return_type = { value_type = result, span = span }
+	}
 	match aggregate:
 		Checked.RecordAggregate(record_row):
 			match records.get(record_number(record_row)):
-				Some(row): Ok({ signature = signature, bindings = [parameter_binding(0, receiver, span), parameter_binding(1, receiver, span)], body = Checked.CheckedValueBody(Checked.ReturnExpression(record_value(row, method, boolean, span))) })
+				Some(row): Ok({ signature = signature, bindings = [parameter_binding(0, receiver, span), parameter_binding(1, receiver, span)], body = Checked.CheckedValueBody(Checked.ReturnExpression(record_value(row, receiver, method, boolean, span))) })
 				None: Err(checker_invariant(span, InvalidFunctionContract))
 		Checked.UnionAggregate(union_row):
 			match unions.get(union_number(union_row)):
-				Some(row): Ok(union_template(row, signature, method, boolean, span))
+				Some(row): Ok(union_template(row, receiver, signature, method, boolean, span))
 				None: Err(checker_invariant(span, InvalidFunctionContract))

@@ -1,0 +1,203 @@
+---
+Transient constructor-path boundedness for checking generic instantiation.
+Controls and symbols are local indices issued by the dependency producer.
+No semantic declaration identity is invented or erased by this analysis.
+---
+import:
+	../utils/int_map as IntMaps
+	../utils/boolean: and, not
+	int as IntOps
+	option: is_some
+
+
+fixed union PathOperation:
+	KeepPath
+	PushPath(Int)
+	PopPath(Int)
+
+
+fixed record InstantiationPath {
+	source: Int,
+	target: Int,
+	operation: PathOperation
+}
+
+
+fixed union PathBoundedness:
+	BoundedPaths
+	-- All original transition positions on any pump, including alternative
+	-- balanced derivations. The producer owns their spans and family origins.
+	UnboundedPaths(List[Int])
+
+
+private fixed record PathPair {
+	source: Int,
+	target: Int
+}
+
+
+-- Entry validation establishes 0 <= source,target < count and count*count <=
+-- INT_MAX, so this dense key is injective and cannot wrap.
+private pure func pair_key(count: Int, source: Int, target: Int) -> Int:
+	IntOps.add(IntOps.multiply(source, count), target)
+
+
+private pure func contains(paths: IntMaps.IntMap[PathPair], count: Int, source: Int, target: Int) -> Bool:
+	IntMaps.get(paths, pair_key(count, source, target)).is_some()
+
+
+private pure func insert(paths: IntMaps.IntMap[PathPair], count: Int, source: Int, target: Int) -> IntMaps.IntMap[PathPair]:
+	key = pair_key(count, source, target)
+	if IntMaps.get(paths, key).is_some():
+		paths
+	else:
+		pair: PathPair = { source = source, target = target }
+		IntMaps.set(paths, key, pair)
+
+
+-- The insertion-ordered map is also the worklist: each new pair is processed
+-- once. Empty matching transitions request plain transitive closure.
+private pure func close_paths(initial: IntMaps.IntMap[PathPair], count: Int, matching: List[InstantiationPath]) -> IntMaps.IntMap[PathPair]:
+	var paths = initial
+	var position = 0
+	while IntOps.less_than(position, IntMaps.values(paths).length()):
+		match IntMaps.values(paths).get(position):
+			None: void
+			Some(pair):
+				for control in 0..count:
+					if contains(paths, count, control, pair.source):
+						paths = insert(paths, count, control, pair.target)
+					if contains(paths, count, pair.target, control):
+						paths = insert(paths, count, pair.source, control)
+				for opening in matching:
+					match opening.operation:
+						PushPath(symbol):
+							if IntOps.equals(opening.target, pair.source):
+								for closing in matching:
+									match closing.operation:
+										PopPath(other):
+											if and(IntOps.equals(symbol, other), IntOps.equals(closing.source, pair.target)):
+												paths = insert(paths, count, opening.source, closing.target)
+										_: void
+						_: void
+		position = IntOps.add(position, 1)
+	paths
+
+
+private pure func pump_edge(reachable: IntMaps.IntMap[PathPair], count: Int, anchors: List[Int], source: Int, target: Int) -> Bool:
+	var found: Bool = False
+	for anchor in anchors:
+		if and(contains(reachable, count, anchor, source), contains(reachable, count, target, anchor)):
+			found = True
+			break
+	found
+
+
+-- Each anchor denotes a positive SCC in balanced-plus-push reachability.
+-- Choices of anchor affect no membership result; no first-witness pruning.
+private pure func pump_anchors(reachable: IntMaps.IntMap[PathPair], count: Int, transitions: List[InstantiationPath]) -> List[Int]:
+	var anchors: List[Int] = []
+	for transition in transitions:
+		match transition.operation:
+			PushPath(_):
+				if and(contains(reachable, count, transition.target, transition.source), pump_edge(reachable, count, anchors, transition.source, transition.target).not()):
+					anchors = anchors.append(transition.source)
+			_: void
+	anchors
+
+
+private pure func mark(marked: List[Int], position: Int) -> List[Int]:
+	if marked.any(pure func(found): IntOps.equals(found, position)):
+		marked
+	else:
+		marked.append(position)
+
+
+-- Mark EVERY derivation of a balanced pair, not only its first producer.
+-- Space is quadratic in controls; split/matching scans have product time.
+private pure func pump_transitions(balanced: IntMaps.IntMap[PathPair], reachable: IntMaps.IntMap[PathPair], count: Int, anchors: List[Int], transitions: List[InstantiationPath]) -> List[Int]:
+	var pairs: IntMaps.IntMap[PathPair] = IntMaps.empty_int_map()
+	for pair in IntMaps.values(balanced):
+		if pump_edge(reachable, count, anchors, pair.source, pair.target):
+			pairs = insert(pairs, count, pair.source, pair.target)
+	var marked: List[Int] = []
+	var edge_position = 0
+	for transition in transitions:
+		match transition.operation:
+			PushPath(_):
+				if pump_edge(reachable, count, anchors, transition.source, transition.target):
+					marked = mark(marked, edge_position)
+			_: void
+		edge_position = IntOps.add(edge_position, 1)
+	var cursor = 0
+	while IntOps.less_than(cursor, IntMaps.values(pairs).length()):
+		match IntMaps.values(pairs).get(cursor):
+			None: void
+			Some(pair):
+				for split in 0..count:
+					if and(contains(balanced, count, pair.source, split), contains(balanced, count, split, pair.target)):
+						pairs = insert(pairs, count, pair.source, split)
+						pairs = insert(pairs, count, split, pair.target)
+				var opening_position = 0
+				for opening in transitions:
+					if IntOps.equals(opening.source, pair.source):
+						match opening.operation:
+							KeepPath:
+								if IntOps.equals(opening.target, pair.target):
+									marked = mark(marked, opening_position)
+							PushPath(symbol):
+								var closing_position = 0
+								for closing in transitions:
+									if IntOps.equals(closing.target, pair.target):
+										match closing.operation:
+											PopPath(other):
+												if and(IntOps.equals(symbol, other), contains(balanced, count, opening.target, closing.source)):
+													marked = mark(marked, opening_position)
+													marked = mark(marked, closing_position)
+													pairs = insert(pairs, count, opening.target, closing.source)
+											_: void
+									closing_position = IntOps.add(closing_position, 1)
+							PopPath(_): void
+					opening_position = IntOps.add(opening_position, 1)
+		cursor = IntOps.add(cursor, 1)
+	marked
+
+
+pure func bound_instantiation_paths(count: Int, transitions: List[InstantiationPath]) -> Option[PathBoundedness]:
+	-- A malformed dependency producer is distinct from a bounded graph.
+	var valid: Bool = IntOps.greater_than_or_equal(count, 0)
+	if IntOps.greater_than(count, 0):
+		valid = IntOps.less_than_or_equal(count, IntOps.divide(IntOps.INT_MAX, count))
+	for transition in transitions:
+		valid = and(valid, and(
+			and(IntOps.greater_than_or_equal(transition.source, 0), IntOps.less_than(transition.source, count)),
+			and(IntOps.greater_than_or_equal(transition.target, 0), IntOps.less_than(transition.target, count))
+		))
+		match transition.operation:
+			PushPath(symbol): valid = and(valid, IntOps.greater_than_or_equal(symbol, 0))
+			PopPath(symbol): valid = and(valid, IntOps.greater_than_or_equal(symbol, 0))
+			KeepPath: void
+		if valid.not():
+			break
+	if valid.not():
+		None
+	else:
+		var initial: IntMaps.IntMap[PathPair] = IntMaps.empty_int_map()
+		for control in 0..count:
+			initial = insert(initial, count, control, control)
+		for transition in transitions:
+			match transition.operation:
+				KeepPath: initial = insert(initial, count, transition.source, transition.target)
+				_: void
+		balanced = close_paths(initial, count, transitions)
+		var forward = balanced
+		for transition in transitions:
+			match transition.operation:
+				PushPath(_): forward = insert(forward, count, transition.source, transition.target)
+				_: void
+		reachable = close_paths(forward, count, [])
+		anchors = pump_anchors(reachable, count, transitions)
+		if anchors.is_empty():
+			Some(BoundedPaths)
+		else:
+			Some(UnboundedPaths(pump_transitions(balanced, reachable, count, anchors, transitions)))

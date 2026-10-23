@@ -5,7 +5,7 @@ import:
 	../../../src/utils/ids: RecordId, VariantId, variant_owner, inventory_traits, inventory_records, inventory_unions, trait_number, same_trait_method, record_number, inventory_implementations, inventory_functions
 	../../../src/utils/source: same_source, module_source, root_module_id
 	../../../src/check/render: render_failure
-	../../../src/check/errors: CheckErrorKind(TraitRejection, RecursionRejection), TraitError(GenericEqualityDeferred, EqualityMemberUnsupported, MissingTraitBound, MissingImplementation), RecursionError(UnprovenTraitInstantiation)
+	../../../src/check/errors: CheckErrorKind(TraitRejection, RecursionRejection), TraitError(EqualityMemberUnsupported, MissingTraitBound, MissingImplementation), RecursionError(UnprovenTraitInstantiation)
 	../../../src/parse/assemble: ParsedProgram, parsed_contents
 	../../../src/utils/syntax: Diagnostic, same_span, type_span, Purity(Pure), DiagnosticNote(RecordFieldDeclaration, UnionPayloadDeclaration)
 	../module_input: FOUNDATION_TYPES, parse_modules_with_base, test_base
@@ -124,7 +124,7 @@ func test_nongeneric_equality_uses_a_nested_authored_implementation() -> Bool:
 
 
 tests: TestSuite = {
-	description = "Blorp 2 automatic equality for nongeneric aggregates",
+	description = "Blorp 2 aggregate equality templates",
 	tests = [
 		("closed family default has no symbolic receiver dependency", test_a_closed_family_default_has_no_symbolic_receiver_dependency),
 		("nongeneric equality uses nested authored implementation", test_nongeneric_equality_uses_a_nested_authored_implementation),
@@ -133,8 +133,8 @@ tests: TestSuite = {
 		("unbounded generic default calls retain whole Self", test_unbounded_generic_default_calls_keep_the_whole_self_dependency),
 		("unbounded generic default method creation retains whole Self", test_unbounded_generic_default_method_creation_keeps_the_whole_self_dependency),
 		("same-spelled unrelated Equatable gets no automatic implementation", test_an_unrelated_equatable_identity_does_not_receive_automatic_implementations),
-		("generic automatic equality is deferred at exact use", test_generic_automatic_equality_is_deferred_at_the_exact_use),
-		("generic declaration and construction without equality remain legal", test_generic_declaration_and_construction_without_equality_remain_legal),
+		("generic equality retains template and receiver arguments", test_generic_equality_uses_the_real_aggregate_template_and_arguments),
+		("generic construction does not require equality bounds", test_generic_construction_does_not_require_the_equality_template_bounds),
 		("recursive children do not hide later callback poison", test_recursive_children_do_not_hide_a_later_callback_field),
 		("callback poison before recursive children remains unavailable", test_a_callback_field_poisons_the_same_group_before_recursive_children),
 		("record template decision nodes scale with logical fields", test_record_templates_have_three_decision_nodes_per_logical_field),
@@ -253,10 +253,10 @@ private func rejects_generic_default_growth(method_value: Bool) -> Bool:
 						RecursionRejection(UnprovenTraitInstantiation):
 							(
 								same_source(error.span.source, module_source(parsed_contents(parsed).foundation.types))
-								and error.span.start == FOUNDATION_TYPES.length() + prefix.length() + before_use.length()
-								and error.span.end == FOUNDATION_TYPES.length() + prefix.length() + before_use.length() + 5
+								and error.span.start == FOUNDATION_TYPES.length() + before_call.length() + 8
+								and error.span.end == FOUNDATION_TYPES.length() + before_call.length() + 12
 								and diagnostic.message == "cannot prove finite generic trait instantiation"
-								and diagnostic.help == "avoid recursively wrapping generic receivers through trait dispatch; this increment uses a conservative constructor-depth proof"
+								and diagnostic.help == "avoid recursively wrapping generic receivers through trait dispatch; this increment uses a conservative constructor-path proof"
 								and same_span(error.span, diagnostic.span) and diagnostic.note.is_none()
 							)
 						_: False
@@ -341,38 +341,45 @@ private GENERIC_PROVIDER: String =
 	|
 
 
-pure func test_generic_automatic_equality_is_deferred_at_the_exact_use() -> Bool:
-	before_call: String =
+pure func test_generic_equality_uses_the_real_aggregate_template_and_arguments() -> Bool:
+	source: String =
 		|import:
 		|    int: Box, equals
 		|pure func compare(value: Box[Int]) -> Bool:
+		|    equals(value, value)
+		|func main() -> Int:
+		|    0
 		|
-	prefix = before_call + "    "
-	match parse_equatable_fixture(prefix + "equals(value, value)\nfunc main() -> Int:\n    0\n", GENERIC_PROVIDER, EQUALITY):
+	match parse_equatable_fixture(source, GENERIC_PROVIDER, EQUALITY):
 		Err(_): False
 		Ok(parsed):
 			match (inventory_records(parsed_contents(parsed).declarations), check(parsed)):
-				([box], Err(failure)):
-					error = check_errors(failure).first
-					diagnostic = render_failure(failure).first
-					match error.kind:
-						TraitRejection(GenericEqualityDeferred(Model.AppliedRecordType(receiver, [Model.IntType]), None)):
-							(
-								record_number(receiver) == record_number(box.id)
-								and error.span.start == prefix.length() and error.span.end == prefix.length() + 6
-								and same_source(error.span.source, module_source(root_module_id()))
-								and same_span(error.span, diagnostic.span) and diagnostic.note.is_none()
-								and diagnostic.message == "automatic equality for generic aggregate heads is not supported yet"
-								and diagnostic.help == "write an explicit full-family Equatable implementation for this type; automatic generic equality is a later increment"
-							)
-						_: False
+				([box], Ok(program)):
+					checked = checked_functions(program)
+					match Model.equality_body(checked.traits, Model.RecordAggregate(box.id)):
+						Some(template):
+							var selected = False
+							for function in checked.functions:
+								for call in Model.function_calls(function):
+									match call.target:
+										Model.TraitMethod(method):
+											match Model.method_body(checked.traits, method):
+												Some(body): selected = Model.same_body(body.body, Model.DerivedEqualityBody(Model.RecordAggregate(box.id))) and Model.same_types(body.arguments, [Model.IntType])
+												None: void
+										_: void
+							match (template.signature.type_parameters, template.signature.requirements):
+								([parameter], [required]): selected and Model.same_owner(Model.parameter_owner(parameter), Model.RecordDeclaration(box.id)) and Model.same_parameter(parameter, required.parameter)
+								_: False
+						None: False
 				_: False
 
 
-pure func test_generic_declaration_and_construction_without_equality_remain_legal() -> Bool:
+pure func test_generic_construction_does_not_require_the_equality_template_bounds() -> Bool:
 	source: String =
 		|import:
-		|    int: box
+		|    int: Box, box
+		|pure func create(callback: pure (Int) -> Int) -> Box[pure (Int) -> Int]:
+		|    { value = callback }
 		|func main() -> Int:
 		|    value = box()
 		|    0
@@ -383,8 +390,12 @@ pure func test_generic_declaration_and_construction_without_equality_remain_lega
 			match check(parsed):
 				Err(_): False
 				Ok(program):
-					match checked_functions(program).records:
-						[box]: Model.equality_body(checked_functions(program).traits, Model.RecordAggregate(box.id)).is_none()
+					checked = checked_functions(program)
+					match checked.records:
+						[box]:
+							match Model.equality_body(checked.traits, Model.RecordAggregate(box.id)):
+								Some(template): template.signature.requirements.length() == 1
+								None: False
 						_: False
 
 

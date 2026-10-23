@@ -1,0 +1,461 @@
+import:
+	../../../src/check/check: check, checked_functions, check_errors
+	../../../src/check/model as Model
+	../../../src/check/render: render_failure
+	../../../src/check/errors: CheckErrorKind(TraitRejection, RecursionRejection), TraitError(EqualityMemberUnsupported), RecursionError(UnprovenTraitInstantiation)
+	../../../src/namespace/namespace: same_head, TypeHead(RecordHead, UnionHead)
+	../../../src/parse/assemble: ParsedProgram, parsed_contents
+	../../../src/utils/ids: inventory_records, inventory_unions, inventory_traits, record_number, trait_number
+	./test_traits: parse_equatable_fixture, parse_trait_fixture_from
+	../../../src/utils/source: module_id, compiler_source, same_source, module_source, root_module_id
+	../../../src/utils/syntax: Diagnostic, diagnostic, same_span, type_span, Purity(Pure), DiagnosticNote(RecordFieldDeclaration, UnionPayloadDeclaration)
+	option: to_result
+	test: TestSuite
+
+
+private REQUIREMENTS: String =
+	|trait Equatable:
+	|    pure func equals(left: Self, right: Self) -> Bool
+	|trait Visit:
+	|    pure func visit(value: Self) -> Int
+	|
+
+
+private INTEGER: String =
+	|import:
+	|    _base: Int, List, Bool(True, False), Equatable, Visit
+	|implements Equatable for Int:
+	|    pure func equals(left: Self, right: Self) -> Bool:
+	|        builtin("int.equals")
+	|
+
+
+private LIST: String =
+	|implements Equatable for List[Element: Equatable]:
+	|    pure func equals(left: Self, right: Self) -> Bool:
+	|        match left:
+	|            []: True
+	|            [head, ..._]:
+	|                match right:
+	|                    []: False
+	|                    [other, ..._]: equals(head, other)
+	|
+
+
+private PRELUDE: String =
+	|import:
+	|    _base: Int, Float, String, Void, List, Bool(True, False), Option(Some, None), Result(Ok, Err), Equatable, Visit
+	|
+
+
+pure func parse_generic_fixture(source: String, provider: String) -> Result[ParsedProgram, Diagnostic]:
+	invalid = diagnostic({ source = compiler_source(), start = 0, end = 0 }, "invalid trait fixture provider", "use the genuine module ordinal")
+	owner ?= module_id(1).to_result(invalid)
+	parse_trait_fixture_from(source, provider, REQUIREMENTS, owner, PRELUDE)
+
+
+private pure func selects_all_receiver_arguments(checked: Model.CheckedFunctions, aggregate: Model.AggregateId) -> Bool:
+	var found = False
+	for function in checked.functions:
+		for call in Model.function_calls(function):
+			match call.target:
+				Model.TraitMethod(method):
+					match Model.method_body(checked.traits, method):
+						Some(selected):
+							if Model.same_body(selected.body, Model.DerivedEqualityBody(aggregate)):
+								found = Model.same_types(selected.arguments, Model.receiver_arguments(Model.method_receiver(method)))
+						None: void
+				_: void
+	found
+
+
+-- The expected bound is selected from the genuine parsed trait rows; the
+-- generated body must retain the actual aggregate-owned parameter identity.
+private func accepts_record_family(source: String, provider: String, record_position: Int, expected_bounds: List[List[Int]], first_member_provenance: Bool) -> Bool:
+	match parse_generic_fixture(source, INTEGER + provider):
+		Err(error):
+			print(error.message + " | " + error.help)
+			False
+		Ok(parsed):
+			written = parsed_contents(parsed)
+			match (inventory_records(written.declarations).get(record_position), check(parsed)):
+				(Some(row), Ok(program)):
+					checked = checked_functions(program)
+					match checked.records.get(record_position):
+						Some(record_row):
+							var found = False
+							for family in checked.traits.implementations:
+								if same_head(family.receiver_head, RecordHead(row.id)):
+									match (family.parameter_bounds, record_row.type_parameters, Model.equality_body(checked.traits, Model.RecordAggregate(row.id))):
+										(bound_rows, parameters, Some(template)):
+											var matches = bound_rows.length() == parameters.length() and expected_bounds.length() == parameters.length() and template.signature.type_parameters.length() == parameters.length()
+											for parameter_position in 0..parameters.length():
+												match (bound_rows.get(parameter_position), parameters.get(parameter_position), template.signature.type_parameters.get(parameter_position), expected_bounds.get(parameter_position)):
+													(Some(bounds), Some(parameter), Some(owned), Some(expected_traits)):
+														requirements = template.signature.requirements.filter(pure func(required): Model.same_parameter(required.parameter, parameter))
+														matches = matches and bounds.length() == expected_traits.length() and requirements.length() == bounds.length() and Model.same_parameter(owned, parameter) and Model.same_owner(Model.parameter_owner(owned), Model.RecordDeclaration(row.id))
+														for position in 0..bounds.length():
+															match (bounds.get(position), requirements.get(position), expected_traits.get(position)):
+																(Some(bound), Some(required), Some(trait_position)):
+																	match inventory_traits(written.declarations).get(trait_position):
+																		Some(owner):
+																			matches = matches and trait_number(bound.required_trait) == trait_number(owner.id) and trait_number(required.required_trait) == trait_number(owner.id) and same_span(bound.span, required.span)
+																			if first_member_provenance:
+																				match record_row.fields.get(0):
+																					Some(first_field): matches = matches and same_span(required.span, first_field.value_type.span)
+																					None: matches = False
+																		None: matches = False
+																_: matches = False
+													_: matches = False
+											found = matches and record_number(record_row.id) == record_number(row.id) and selects_all_receiver_arguments(checked, Model.RecordAggregate(row.id))
+										_: void
+							found
+						None: False
+				(_, Err(failure)):
+					error = render_failure(failure).first
+					print(error.message + " | " + error.help)
+					False
+				_: False
+
+
+func test_actual_parameter_field_requires_canonical_equality() -> Bool:
+	provider: String =
+		|fixed record Box[Element] { value: Element }
+		|
+	source: String =
+		|import:
+		|    int: Box, equals
+		|pure func compare[Element: Equatable](value: Box[Element]) -> Bool:
+		|    equals(value, value)
+		|func main() -> Int:
+		|    0
+		|
+	accepts_record_family(source, provider, 0, [[0]], True)
+
+
+func test_phantom_callable_argument_has_no_invented_equality_bound() -> Bool:
+	provider: String =
+		|fixed record Phantom[Element] { tag: Int }
+		|
+	source: String =
+		|import:
+		|    int: Phantom, equals
+		|pure func compare(value: Phantom[pure (Int) -> Int]) -> Bool:
+		|    equals(value, value)
+		|func main() -> Int:
+		|    0
+		|
+	accepts_record_family(source, provider, 0, [[]], True)
+
+
+func test_authored_child_family_propagates_visit_instead_of_equality() -> Bool:
+	provider: String =
+		|fixed record Custom[Element] { tag: Int }
+		|fixed record Holder[Element] { child: Custom[Element] }
+		|implements Equatable for Custom[Element: Visit]:
+		|    pure func equals(left: Self, right: Self) -> Bool:
+		|        True
+		|
+	source: String =
+		|import:
+		|    int: Holder, equals
+		|pure func compare[Element: Visit](value: Holder[Element]) -> Bool:
+		|    equals(value, value)
+		|func main() -> Int:
+		|    0
+		|
+	accepts_record_family(source, provider, 1, [[1]], True)
+
+
+func test_three_list_fields_propagate_only_the_actual_leaf_requirement() -> Bool:
+	provider: String =
+		|fixed record Box[Element] { value: List[List[List[Element]]] }
+		|
+	source: String =
+		|import:
+		|    int: Box, equals
+		|pure func compare[Element: Equatable](value: Box[Element]) -> Bool:
+		|    equals(value, value)
+		|func main() -> Int:
+		|    0
+		|
+	accepts_record_family(source, LIST + provider, 0, [[0]], True)
+
+
+func test_delayed_earlier_member_owns_the_inferred_bound_span() -> Bool:
+	provider: String =
+		|fixed record Child[Element] { value: Element }
+		|fixed record Holder[Element] { earlier: Child[Element], later: Element }
+		|
+	source: String =
+		|import:
+		|    int: Holder, equals
+		|pure func compare[Element: Equatable](value: Holder[Element]) -> Bool:
+		|    equals(value, value)
+		|func main() -> Int:
+		|    0
+		|
+	accepts_record_family(source, provider, 1, [[0]], True)
+
+
+func test_delayed_reversed_bounds_keep_first_established_atom_order() -> Bool:
+	provider: String =
+		|fixed record Custom[Element] { tag: Int }
+		|fixed record Child[Element] { first: Custom[Element], second: Element }
+		|fixed record Holder[Element] { earlier: Child[Element], value: Element, visitor: Custom[Element] }
+		|implements Equatable for Custom[Element: Visit]:
+		|    pure func equals(left: Self, right: Self) -> Bool:
+		|        True
+		|
+	unrelated: String =
+		|fixed record MoreRounds[Element] { value: Outer[Element] }
+		|fixed record Outer[Element] { value: Inner[Element] }
+		|fixed record Inner[Element] { value: Element }
+		|
+	source: String =
+		|import:
+		|    int: Holder, equals
+		|pure func compare[Element: Equatable + Visit](value: Holder[Element]) -> Bool:
+		|    equals(value, value)
+		|func main() -> Int:
+		|    0
+		|
+	accepts_record_family(source, provider, 2, [[0, 1]], True) and accepts_record_family(source, provider + unrelated, 2, [[0, 1]], True)
+
+
+func test_two_parameter_child_projection_preserves_written_argument_positions() -> Bool:
+	provider: String =
+		|fixed record Custom[Element] { tag: Int }
+		|fixed record Child[Left, Right] { first: Left, second: Custom[Right] }
+		|fixed record Holder[Left, Right] { child: Child[Right, Left] }
+		|implements Equatable for Custom[Element: Visit]:
+		|    pure func equals(left: Self, right: Self) -> Bool:
+		|        True
+		|
+	source: String =
+		|import:
+		|    int: Holder, equals
+		|pure func compare[Left: Visit, Right: Equatable](value: Holder[Left, Right]) -> Bool:
+		|    equals(value, value)
+		|func main() -> Int:
+		|    0
+		|
+	accepts_record_family(source, provider, 2, [[1], [0]], True)
+
+
+func test_union_payload_requirements_keep_the_union_parameter_owner() -> Bool:
+	provider: String =
+		|fixed union Choice[Element]:
+		|    Empty
+		|    Value(Element)
+		|
+	source: String =
+		|import:
+		|    int: Choice, equals
+		|pure func compare[Element: Equatable](value: Choice[Element]) -> Bool:
+		|    equals(value, value)
+		|func main() -> Int:
+		|    0
+		|
+	match parse_generic_fixture(source, INTEGER + provider):
+		Err(_): False
+		Ok(parsed):
+			written = parsed_contents(parsed)
+			match (inventory_unions(written.declarations).get(0), inventory_traits(written.declarations).get(0), check(parsed)):
+				(Some(row), Some(canonical), Ok(program)):
+					checked = checked_functions(program)
+					var found = False
+					for family in checked.traits.implementations:
+						if same_head(family.receiver_head, UnionHead(row.id)):
+							match (family.parameter_bounds, checked.unions.get(0), Model.equality_body(checked.traits, Model.UnionAggregate(row.id))):
+								([[bound]], Some(union_row), Some(template)):
+									match (union_row.type_parameters, template.signature.type_parameters, template.signature.requirements):
+										([parameter], [owned], [required]):
+											found = (trait_number(family.trait_id) == trait_number(canonical.id)
+											and trait_number(bound.required_trait) == trait_number(canonical.id)
+											and trait_number(required.required_trait) == trait_number(canonical.id)
+											and Model.same_parameter(owned, parameter) and Model.same_parameter(required.parameter, parameter)
+											and Model.same_owner(Model.parameter_owner(parameter), Model.UnionDeclaration(row.id))
+											and selects_all_receiver_arguments(checked, Model.UnionAggregate(row.id)))
+										_: void
+								_: void
+					found
+				_: False
+
+
+private func rejects_projected_poison(payload: Bool) -> Bool:
+	bad: String = if payload:
+		"fixed union Bad[Left, Right]:\n    Empty\n    Value(pure (Left) -> Right)\n"
+	else:
+		"fixed record Bad[Left, Right] { callback: pure (Left) -> Right }\n"
+	provider = INTEGER + bad + "fixed record Holder[Left, Right] { child: Bad[Right, Left] }\n"
+	before_use: String =
+		|import:
+		|    int: Holder, equals
+		|pure func compare(value: Holder[Int, String]) -> Bool:
+		|
+	prefix = before_use + "    "
+	source = prefix + "equals(value, value)\nfunc main() -> Int:\n    0\n"
+	match (parse_generic_fixture(source, provider), parse_generic_fixture("import:\n    int: Holder\nfunc main() -> Int:\n    0\n", provider)):
+		(Ok(parsed), Ok(unused)):
+			match (check(parsed), check(unused), inventory_traits(parsed_contents(parsed).declarations).get(0)):
+				(Err(failure), Ok(_), Some(canonical)):
+					error = check_errors(failure).first
+					diagnostic = render_failure(failure).first
+					match error.kind:
+						TraitRejection(EqualityMemberUnsupported(required, receiver, member)):
+							var terminal_matches = False
+							match (member, diagnostic.note):
+								(Model.EqualityField(field), Some(RecordFieldDeclaration(note))):
+									match inventory_records(parsed_contents(parsed).declarations).get(0):
+										Some(row):
+											match row.declaration.fields:
+												[written]: terminal_matches = not payload and record_number(Model.field_owner(field)) == record_number(row.id) and Model.field_number(field) == 0 and same_span(note, type_span(written.type_name))
+												_: void
+										None: void
+								(Model.EqualityPayload(variant, position), Some(UnionPayloadDeclaration(note))):
+									match inventory_unions(parsed_contents(parsed).declarations).get(0):
+										Some(row):
+											match row.variants:
+												[_, bad_variant]:
+													match bad_variant.declaration.fields:
+														[written]: terminal_matches = payload and Model.same_variant(variant, bad_variant.id) and position == 0 and same_span(note, type_span(written))
+														_: void
+												_: void
+										None: void
+								_: void
+							(terminal_matches and trait_number(required) == trait_number(canonical.id)
+							and Model.same_type(receiver, Model.CallableType(Pure, [Model.StringType], Model.IntType))
+							and same_source(error.span.source, module_source(root_module_id()))
+							and error.span.start == prefix.length() and error.span.end == prefix.length() + 6
+							and same_span(error.span, diagnostic.span) and check_errors(failure).remaining.is_empty()
+							and diagnostic.message == "automatic equality is unavailable for a field or payload"
+							and diagnostic.help == "provide the member's required trait implementation, or write an Equatable implementation for the containing type")
+						_: False
+				_: False
+		_: False
+
+
+func test_nested_generic_record_failure_substitutes_reversed_arguments() -> Bool:
+	rejects_projected_poison(False)
+
+
+func test_nested_generic_payload_failure_substitutes_reversed_arguments() -> Bool:
+	rejects_projected_poison(True)
+
+
+-- Finite semantic requests, but an intentional runtime loop. This fixture is
+-- admitted and specialized only; no native execution is a termination oracle.
+pure func generic_phantom_default_fixture() -> Result[ParsedProgram, Diagnostic]:
+	requirements: String =
+		|trait Equatable:
+		|    pure func equals(left: Self, right: Self) -> Bool
+		|    pure func probe(value: Self) -> Bool:
+		|        probe2([value])
+		|    pure func probe2(value: Self) -> Bool:
+		|        True
+		|
+	provider: String =
+		|import:
+		|    _base: Int, Bool(True), List, Equatable
+		|fixed record Phantom[Element] { tag: Int }
+		|implements Equatable for Int:
+		|    pure func equals(left: Self, right: Self) -> Bool:
+		|        builtin("int.equals")
+		|implements Equatable for List[Element: Equatable]:
+		|    pure func equals(left: Self, right: Self) -> Bool:
+		|        True
+		|    pure func probe(value: Self) -> Bool:
+		|        g(value)
+		|    pure func probe2(value: Self) -> Bool:
+		|        probe(value)
+		|pure func g[Value: Equatable](value: Value) -> Bool:
+		|    probe(value)
+		|pure func make() -> Phantom[Int]:
+		|    { tag = 7 }
+		|
+	main_source: String =
+		|import:
+		|    int: make, probe
+		|func main() -> Int:
+		|    match probe(make()):
+		|        True: 23
+		|        False: 0
+		|
+	parse_equatable_fixture(main_source, provider, requirements)
+
+
+func test_phantom_default_head_guard_preserves_a_finite_key_cycle() -> Bool:
+	match generic_phantom_default_fixture():
+		Err(_): False
+		Ok(parsed):
+			match (inventory_records(parsed_contents(parsed).declarations), check(parsed)):
+				([phantom], Ok(program)):
+					checked = checked_functions(program)
+					var found = False
+					for family in checked.traits.implementations:
+						if same_head(family.receiver_head, RecordHead(phantom.id)):
+							match (family.parameter_bounds, Model.equality_body(checked.traits, Model.RecordAggregate(phantom.id))):
+								([[]], Some(template)):
+									match template.signature.type_parameters:
+										[parameter]: found = template.signature.requirements.is_empty() and Model.same_owner(Model.parameter_owner(parameter), Model.RecordDeclaration(phantom.id))
+										_: void
+								_: void
+					found
+				_: False
+
+
+func test_an_uncalled_use_of_an_expanding_automatic_family_rejects_before_sealing() -> Bool:
+	provider: String =
+		|fixed record Box[Element] { value: Element }
+		|implements Equatable for List[Element: Equatable]:
+		|    pure func equals(left: Self, right: Self) -> Bool:
+		|        relay(left)
+		|pure func relay[Value: Equatable](value: Value) -> Bool:
+		|    wrapped: Box[List[Value]] = { value = [value] }
+		|    equals(wrapped, wrapped)
+		|
+	before_use: String =
+		|import:
+		|    int: Box, equals
+		|pure func uncalled(value: Box[Int]) -> Bool:
+		|
+	prefix = before_use + "    "
+	match parse_generic_fixture(prefix + "equals(value, value)\nfunc main() -> Int:\n    0\n", INTEGER + provider):
+		Err(_): False
+		Ok(parsed):
+			match check(parsed):
+				Ok(_): False
+				Err(failure):
+					error = check_errors(failure).first
+					diagnostic = render_failure(failure).first
+					match error.kind:
+						RecursionRejection(UnprovenTraitInstantiation):
+							(
+								same_source(error.span.source, module_source(root_module_id()))
+								and error.span.start == prefix.length() and error.span.end == prefix.length() + 6
+								and check_errors(failure).remaining.is_empty()
+								and same_span(error.span, diagnostic.span) and diagnostic.note.is_none()
+								and diagnostic.message == "cannot prove finite generic trait instantiation"
+								and diagnostic.help == "avoid recursively wrapping generic receivers through trait dispatch; this increment uses a conservative constructor-path proof"
+							)
+						_: False
+
+
+tests: TestSuite = {
+	description = "Generic structural equality actual members",
+	tests = [
+	("a parameter field requires canonical equality", test_actual_parameter_field_requires_canonical_equality),
+	("a phantom callable argument requires no equality", test_phantom_callable_argument_has_no_invented_equality_bound),
+	("an authored child propagates Visit rather than equality", test_authored_child_family_propagates_visit_instead_of_equality),
+	("three Lists project the actual leaf requirement", test_three_list_fields_propagate_only_the_actual_leaf_requirement),
+	("a delayed earlier member owns bound provenance", test_delayed_earlier_member_owns_the_inferred_bound_span),
+	("delayed reversed bounds retain stable atom order", test_delayed_reversed_bounds_keep_first_established_atom_order),
+	("two parameters project through reversed child arguments", test_two_parameter_child_projection_preserves_written_argument_positions),
+	("union payloads retain genuine union parameter ownership", test_union_payload_requirements_keep_the_union_parameter_owner),
+	("nested record poison substitutes reversed arguments", test_nested_generic_record_failure_substitutes_reversed_arguments),
+	("nested payload poison substitutes reversed arguments", test_nested_generic_payload_failure_substitutes_reversed_arguments),
+	("phantom default guards preserve finite semantic keys", test_phantom_default_head_guard_preserves_a_finite_key_cycle),
+	("uncalled expanding automatic equality rejects before sealing", test_an_uncalled_use_of_an_expanding_automatic_family_rejects_before_sealing)
+	]
+}

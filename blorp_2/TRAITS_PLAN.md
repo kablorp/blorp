@@ -1,9 +1,9 @@
 # Static traits, starting with Equatable
 
 Status: T0 inference, T1 concrete traits, T2 semantic instance identity,
-T3 bounds/defaults/contextual method references and T4a nongeneric automatic
-equality are complete. T4b generic automatic equality and T5 production-library
-rollout remain open. Original
+T3 bounds/defaults/contextual method references, T4a nongeneric automatic
+equality and T4b generic automatic equality are qualified for publication.
+T5 production-library rollout remains open. Original
 measurement baseline: `02b13d25d04b7c5670cb94052ea9675cc9ba3428`.
 The accepted trait surface and explicit conservative finite-dispatch limits
 are defined in README/grammar. Code marked **model sketch** describes compiler
@@ -11,8 +11,9 @@ data, not another input language or an additional runtime representation.
 
 Completed qualification evidence is retained in the
 [concrete traits report](../benchmarks/results/blorp2-concrete-traits-2026-10-22.md),
-[semantic instance identity report](../benchmarks/results/blorp2-semantic-instance-keys-2026-10-22.md)
-and [bounds/defaults report](../benchmarks/results/blorp2-trait-bounds-2026-10-22.md).
+[semantic instance identity report](../benchmarks/results/blorp2-semantic-instance-keys-2026-10-22.md),
+the [bounds/defaults report](../benchmarks/results/blorp2-trait-bounds-2026-10-22.md),
+and the [generic equality report](../benchmarks/results/blorp2-generic-equality-2026-10-23.md).
 
 This is the single plan for the open work. Delete completed milestone
 instructions as they land; retain semantic rules in README/grammar and
@@ -161,7 +162,7 @@ qualification and original cost baseline in the
 **Source: supported expression-local context, independent of traits.**
 
 ```blorp
-record Pair { first: Int, second: Int }
+fixed record Pair { first: Int, second: Int }
 
 pure func make_pair() -> Pair:
     { first = 7, second = 9 }
@@ -406,16 +407,28 @@ records collision/reuse coverage, instance/C growth and matched compiler costs.
 
 T4a implements this contract for nongeneric named records and unions. Its
 [qualification report](../benchmarks/results/blorp2-derived-equality-2026-10-23.md)
-records its accepted scope, proof and costs. README owns the current semantics. Generic heads,
-including Phantom[T], are explicitly deferred at equality use; their ordinary
-construction remains legal. The generic examples and requirements below are
-T4b acceptance obligations, not claims of current support.
+records its accepted scope, proof and costs. README owns the source semantics.
+T4b implements the generic examples below; its report records complete acceptance
+gates, matched costs and conservative proof limits.
 
-T4a prepares conditional availability before checking bodies, closes recursive
-candidates provisionally, and generates each supported ground template once.
-Unavailable candidates remain checker-local use-site causes; the final checked
-program retains only the accepted implementation authority. Eager preparation
-of valid unused templates does not make their bodies reachable for emission.
+Check prepares actual-member conditional availability before checking bodies.
+Each candidate owns a monotone set of genuine aggregate-parameter/trait requirements;
+projection through another head substitutes its ordered receiver arguments. Authored
+families take precedence. The finite requirement closure can add at most P×Q
+atoms and remove at most A candidates; it is not a finite-specialization proof.
+One completed summary supplies the ordinary family bounds and generic template.
+All semantic arguments, including phantom arguments, remain in method selection
+and instance keys.
+
+Member, bound, name and type errors retain ordinary elaboration order. New generic
+automatic finite availability is finalized at the existing final Check boundary.
+Constants are inspected before discard, then every function/default/authored body
+and lambda, including uncalled bodies. Actual call and callable-creation products
+supply obligations without replaying earlier proofs. Unavailable automatic children
+propagate through all automatic parents, including nongeneric parents. Only final
+accepted rows enter CheckedProgram; no extra proof authority reaches Specialize.
+A later ordinary name error can therefore precede this new final finite-use error.
+Eager preparation of valid unused templates does not make them reachable for emission.
 
 
 Requirements come from actual fields and variant payloads, with declared
@@ -425,10 +438,10 @@ type parameter or silently constrain ordinary record construction.
 **Source: conditional derivation and authored replacement.**
 
 ```blorp
-record Wrap[T] { value: T }      -- Requires T: Equatable when equality is used.
-record Phantom[T] { tag: Int }  -- Does not require T: Equatable.
+fixed record Wrap[T] { value: T }      -- Requires T: Equatable when equality is used.
+fixed record Phantom[T] { tag: Int }  -- Does not require T: Equatable.
 
-record Handler {
+fixed record Handler {
     key: Int,
     callback: pure (Int) -> Int
 }
@@ -440,7 +453,7 @@ implements Equatable for Handler:
 -- This whole authored implementation intentionally ignores callback.
 -- An enclosing derived record must call it, not inspect Handler's fields.
 
-record Envelope { handler: Handler }
+fixed record Envelope { handler: Handler }
 
 -- A generic authored family replaces auto equality for every Wrap.
 implements Equatable for Wrap[T: Equatable]:
@@ -521,7 +534,7 @@ fixed union Tree:
 -- Tree -> written List equality -> Tree can close once every other
 -- obligation succeeds. Actual values are finite and acyclic.
 
-record BadNode {
+fixed record BadNode {
     children: List[BadNode],
     callback: pure (Int) -> Int
 }
@@ -553,14 +566,25 @@ Project symbolic trait edges through the accepted receiver-to-body argument
 mapping into the existing finite-instantiation analysis. Merely adding a
 TraitMethod match arm to its current FunctionId-only call observer is insufficient.
 
-The completed T3 implementation uses a sufficient constructor-depth proof. Existing
-phase regressions admit List/Tree and mutual aggregate dispatch, but explicitly
-reject a finite Box-to-Wrap relay and a generic field with three nested Lists.
-These diagnostics are conservative admission limits, not evidence that the
-source necessarily expands forever. The ordinary deeply nested generic-field
-case is a T4 completion blocker; do not claim structural equality complete
-while it remains rejected. No solver redesign or downstream trait mechanism is
-introduced to hide that limit.
+T4b replaces the transient signed trait-depth approximation with
+constructor paths in the same Check analysis. Construction pushes genuine
+head/ordered-child symbols; family selection pops the matching head and child.
+A generic default checks its receiver head while retaining complete Self through
+pop-then-push, including phantom arguments. It is not an unconditional empty edge.
+Balanced paths cancel only matching push-then-pop pairs. All pumping derivations
+contribute their new automatic candidates; classification does not depend on one
+chosen witness. Existing ordinary/authored diagnostics first use the base graph
+without new automatic contributions. A trait-free dependency graph skips path closure.
+
+The sufficient path proof admits the old finite Box-to-Wrap and List-cubed controls,
+as well as the finite phantom/default instance-key cycle. That last source loops
+at runtime and is a Check/Specialize-only oracle. True wrapping calls and method
+values still reject before Specialize. This remains conservative outside the
+required controls and retains the existing callable/layout finiteness assumptions;
+it does not establish termination of arbitrary source execution. The finite error
+uses the first marked trait-dispatch transition for existing base errors, and an
+actual source-use span for a new unavailable automatic family, without naming an
+arbitrary candidate as the culprit.
 
 List equality is an ordinary bounded implementation, not compiler derivation
 or a generic runtime hook. Keep the algorithm linear without zipped/copied Lists.
@@ -600,8 +624,8 @@ implements Equatable for List[Element: Equatable]:
 -- Option cases are handled without panics; inputs are evaluated once.
 ```
 
-Nongeneric Bool uses the same derivation rule. Generic Option/Result automatic
-equality remains a T4b obligation; written families may be used today.
+Bool and generic Option/Result use the same actual-member derivation rule;
+written families retain precedence.
 String/Int/Float keep their existing primitive semantics. Float NaN remains
 unequal to itself; this work adds no stronger reflexivity guarantee.
 
@@ -649,7 +673,7 @@ framework. References were checked on 2026-10-22.
 
 No parse-only scaffolding milestone lands by itself. Each milestone includes
 its complete producer/consumer path, exact diagnostics, reference/EBNF updates,
-two independent reviews and one coherent commit. T0 through T4a are complete.
+two independent reviews and one coherent commit. T0 through T4b are complete.
 The table contains only open milestones.
 
 Start each remaining milestone with its red oracle. Do not remove old negative
@@ -657,7 +681,6 @@ coverage merely to turn a suite green.
 
 | Milestone | Deliverable and changed boundary | Completion oracle |
 | --- | --- | --- |
-| T4b: generic equality | Actual-member conditional requirements and sound deep generic-field admission | Phantom/custom conditional bounds and deeply composed generic fields pass without changing on-use errors |
 | T5: production library rollout | Qualify/publish/pin capable seed, then migrate target library APIs | Clean bootstrap/fixpoint and all component/native/platform gates pass without legacy building Blorp 2 |
 
 The accepted canonical equals-only declaration validates the exact pure
@@ -772,18 +795,36 @@ original +2,000 envelope. Its matched cumulative allocation growth is +0.646%
 and normal retired-instruction growth +0.331%, within the unchanged +5% ceilings.
 T4a has a reviewed +500 net production investigation trigger and +750 ceiling
 (cumulative +2,908), retaining the unchanged +5% measured ceilings. Current
-production growth is +591 for this slice (+2,749 cumulative). T4b needs a separate prospective
-architecture and complexity review; do not compress formatting or remove
-coverage to conceal growth.
+production growth is +591 for this slice (+2,749 cumulative). T4b has a reviewed
+prospective +650 net compiler investigation trigger and +900 ceiling, with the
+unchanged cumulative +5% allocation/instruction limits. The qualified implementation
+is +626 net compiler lines; recursion replacement is
++308 and its path analysis module +203. Necessary tests and fixture sources are
+reported separately. Do not compress formatting or remove coverage to conceal growth.
+
+The retained compact phase probe grew 10.939× in retired instructions from 32 to 64
+controls (3.873× allocations), triggering investigation. An observing copy confirmed
+intermediate IntMap-capacity clustering: queries grew 7.758× and actual probe steps
+12.765×. Those IO counters are attribution, not instruction samples; no hash/capacity
+change or favorable sample replacement was made. Reverse pumping work was not
+exercised by that bounded control. Actual matched whole-compiler costs and the separate canonical-active workload
+passed; these results do not erase the retained phase-scaling limitation.
 
 Freeze baseline sources/library, CWD/output pathname, environment, seed,
-normal/diagnostic binaries and C toolchain. Use one strict original/candidate
-pair and one predetermined six-normal schedule P1 C1 C2 P2 P3 C3 at -O0.
-P always means the preserved original pre-T0 compiler, C the current candidate.
-Strict runs must have positive balanced allocations/releases and zero leaks.
+normal/diagnostic binaries and C toolchain. T4b uses genuine self-built B roles
+for the current parent and candidate, plus the preserved Original compiler.
+Run three strict samples in Original/Parent/Candidate order, then the fixed
+normal order OriginalP1 ParentP1 C1 C2 OriginalP2 ParentP2 OriginalP3 ParentP3 C3
+at -O0. Each comparison projects the same P1 C1 C2 P2 P3 C3 schedule; the three
+candidate observations are shared transparently, never selected or repeated.
+Retain the cumulative Original +5% limits. Separately investigate parent-relative
+increases above 2% and retain a 5% ceiling for both allocations and instructions,
+so unrelated runtime savings cannot mask the feature's cost.
+Strict runs require positive balanced allocations/releases and zero leaks.
 Compare minimum-of-three actual normal retired instructions. Retain every
-sample, hash and failure; no favorable reruns. Also record current-source
-self-compile separately from the frozen-input comparison.
+sample, hash and failure; no favorable reruns. Record current-source compilation
+with the default library and explicitly supplied canonical-active prototype
+separately from the frozen-input comparisons; no default activation is implied.
 
 Retain the original baseline compiler roles for every comparison; compare
 original and current candidate quietly on that same input, never compound

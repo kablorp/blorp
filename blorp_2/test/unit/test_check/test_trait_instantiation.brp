@@ -1,5 +1,9 @@
 import:
-	../../../src/check/check: check, check_errors
+	../../../src/check/check: check, checked_functions, check_errors
+	../../../src/check/model as Model
+	../../../src/parse/assemble: parsed_contents
+	../../../src/utils/ids: inventory_records, inventory_traits, TraitMethodId, same_trait_method
+	../../../src/namespace/namespace: TypeHead(RecordHead, ListHead), same_head
 	../../../src/check/errors as Errors
 	../../../src/check/render: render_failure
 	../../../src/utils/source: module_source, root_module_id, same_source
@@ -54,7 +58,7 @@ private pure func rejects_unproven(prefix: String, call: String, suffix: String)
 								and error.span.end == prefix.length() + call.length()
 								and same_span(error.span, diagnostic.span)
 								and diagnostic.message == "cannot prove finite generic trait instantiation"
-								and diagnostic.help == "avoid recursively wrapping generic receivers through trait dispatch; this increment uses a conservative constructor-depth proof"
+								and diagnostic.help == "avoid recursively wrapping generic receivers through trait dispatch; this increment uses a conservative constructor-path proof"
 								and diagnostic.note.is_none()
 							)
 						_: False
@@ -124,9 +128,25 @@ pure func test_mutual_aggregates_through_lists_have_finite_dispatch() -> Bool:
 	accepts(VISIT + source + MAIN)
 
 
--- The concrete dispatch goes Box -> Wrap and stops. The abstract relay can
--- also select Box, which is deliberately beyond this increment's depth proof.
-pure func test_finite_box_to_wrap_is_an_explicit_conservative_limit() -> Bool:
+-- Read the real accepted family mapping independently of function order or IDs.
+private pure func selects_authored_family(
+	checked: Model.CheckedFunctions, method: TraitMethodId,
+	receiver: Model.TypeRef, head: TypeHead, arguments: List[Model.TypeRef],
+) -> Bool:
+	var found = False
+	for family in checked.traits.implementations:
+		if same_head(family.receiver_head, head):
+			for member in family.methods:
+				if same_trait_method(member.method, method):
+					match (member.body, Model.method_body(checked.traits, Model.accepted_method(method, receiver))):
+						(Model.AuthoredMethod(function), Some(selected)):
+							found = Model.same_body(selected.body, Model.DeclaredBody(function)) and Model.same_types(selected.arguments, arguments)
+						_: void
+	found
+
+
+-- Matching constructor paths distinguish the actual Wrap receiver from Box.
+pure func test_finite_box_to_wrap_selects_the_actual_authored_family() -> Bool:
 	family: String =
 		|fixed record Box[Element] { value: Element }
 		|fixed record Wrap[Element] { value: Element }
@@ -141,12 +161,37 @@ pure func test_finite_box_to_wrap_is_an_explicit_conservative_limit() -> Bool:
 		|pure func relay[Value: Visit](value: Value) -> Int:
 		|
 	prefix = VISIT + family + "    "
-	rejects_unproven(prefix, "visit", "(value)\n" + MAIN)
+	match parse_modules_with_base([{ source = prefix + "visit(value)\n" + MAIN, targets = [] }], test_base()):
+		Err(_): False
+		Ok(parsed):
+			match (inventory_records(parsed_contents(parsed).declarations), inventory_traits(parsed_contents(parsed).declarations), check(parsed)):
+				([box, wrap], [visit], Ok(program)):
+					checked = checked_functions(program)
+					var found = False
+					match visit.methods:
+						[method]:
+							for function in checked.functions:
+								for call in Model.function_calls(function):
+									match call.target:
+										Model.UserFunction(_, [Model.AppliedRecordType(actual_wrap, [Model.AppliedRecordType(actual_box, [Model.ParameterType(parameter)])])]):
+											receiver = Model.AppliedRecordType(actual_wrap, [Model.AppliedRecordType(actual_box, [Model.ParameterType(parameter)])])
+											match (function.signature.type_parameters, function.signature.parameters):
+												([owned], [value]):
+													found = (
+														Model.same_type(receiver, Model.AppliedRecordType(wrap.id, [Model.AppliedRecordType(box.id, [Model.ParameterType(parameter)])]))
+														and Model.same_parameter(owned, parameter)
+														and Model.same_type(value.value_type, Model.AppliedRecordType(box.id, [Model.ParameterType(parameter)]))
+														and selects_authored_family(checked, method.id, receiver, RecordHead(wrap.id), [Model.AppliedRecordType(box.id, [Model.ParameterType(parameter)])])
+													)
+												_: void
+										_: void
+						_: void
+					found
+				_: False
 
 
--- This is temporary T3 admission, not the final automatic-equality contract.
--- T4 must close the ordinary deeply nested generic-field case before completion.
-pure func test_three_nested_lists_in_a_generic_field_need_a_stronger_proof() -> Bool:
+-- Each selected List family consumes exactly one actual constructor layer.
+pure func test_three_nested_lists_in_a_generic_field_have_finite_dispatch() -> Bool:
 	family: String =
 		|fixed record Box[Element] { values: List[List[List[Element]]] }
 		|implements Visit for List[Element: Visit]:
@@ -158,7 +203,32 @@ pure func test_three_nested_lists_in_a_generic_field_need_a_stronger_proof() -> 
 		|    pure func visit(value: Self) -> Int:
 		|
 	prefix = VISIT + family + "        "
-	rejects_unproven(prefix, "visit", "(value.values)\n" + MAIN)
+	match parse_modules_with_base([{ source = prefix + "visit(value.values)\n" + MAIN, targets = [] }], test_base()):
+		Err(_): False
+		Ok(parsed):
+			match (inventory_records(parsed_contents(parsed).declarations), check(parsed)):
+				([box], Ok(program)):
+					checked = checked_functions(program)
+					var found = False
+					for function in checked.functions:
+						for call in Model.function_calls(function):
+							match call.target:
+								Model.TraitMethod(method):
+									receiver = Model.method_receiver(method)
+									match receiver:
+										Model.ListType(Model.ListType(Model.ListType(Model.ParameterType(parameter)))):
+											match (function.signature.type_parameters, function.signature.parameters):
+												([owned], [value]):
+													found = (
+														Model.same_parameter(owned, parameter)
+														and Model.same_type(value.value_type, Model.AppliedRecordType(box.id, [Model.ParameterType(parameter)]))
+														and selects_authored_family(checked, Model.method_identity(method), receiver, ListHead, [Model.ListType(Model.ListType(Model.ParameterType(parameter)))])
+													)
+												_: void
+										_: void
+								_: void
+					found
+				_: False
 
 
 pure func test_creating_a_more_wrapped_method_value_cannot_prove_finite() -> Bool:
@@ -187,8 +257,8 @@ tests: TestSuite = {
 		("wrapping a List receiver cannot prove finite", test_list_relay_wrapping_the_whole_receiver_cannot_prove_finite),
 		("Tree and List have finite dispatch", test_tree_and_list_dispatch_have_a_finite_generic_family),
 		("mutual aggregates through Lists have finite dispatch", test_mutual_aggregates_through_lists_have_finite_dispatch),
-		("finite Box to Wrap is a conservative limit", test_finite_box_to_wrap_is_an_explicit_conservative_limit),
-		("three nested Lists need a stronger proof", test_three_nested_lists_in_a_generic_field_need_a_stronger_proof),
+		("finite Box to Wrap selects the actual family", test_finite_box_to_wrap_selects_the_actual_authored_family),
+		("three nested Lists have finite dispatch", test_three_nested_lists_in_a_generic_field_have_finite_dispatch),
 		("creating a wrapped method value cannot prove finite", test_creating_a_more_wrapped_method_value_cannot_prove_finite),
 		("creating an unchanged method value preserves finite keys", test_creating_an_unchanged_method_value_preserves_a_finite_key),
 	]

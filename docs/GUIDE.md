@@ -98,12 +98,15 @@ binding; an unrelated same-spelled trait does not enable automatic equality.
 Default-only implementations omit the colon and body. Method references need
 an expected callable contract determining `Self`; stored, returned and callback
 values obey ordinary purity and ownership. Generic bodies use only declared
-bounds. The conservative finite-dispatch proof can reject finite wrapped relays
-and deeply nested generic fields; see the linked pilot rules for these temporary
-limits. Nongeneric named records and unions now support canonical automatic
-equality from their actual fields and payloads, with authored implementations
-winning. Generic automatic equality, trait parameters, independently generic
-methods and top-level callable trait formals remain deferred. See the linked
+bounds. Check's conservative constructor-path proof validates finite specialized
+instance sets before Specialize; this does not prove runtime termination. Named
+records and unions support canonical automatic equality from actual fields and
+payloads, including generic heads and deeply nested fields. A phantom parameter
+needs no equality bound; an authored child family propagates its actual conditions.
+These conditions constrain equality use, not ordinary construction, and authored
+implementations always win. Unavailable members or unproved finite automatic
+families reject at use. Trait parameters, independently generic methods and
+top-level callable trait formals remain deferred. See the linked
 pilot rules for use-site diagnostics and recursive eligibility. The production pilot library
 and compiler-source bootstrap subset do not acquire trait syntax from this input
 surface.

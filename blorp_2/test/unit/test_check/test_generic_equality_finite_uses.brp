@@ -1,0 +1,183 @@
+import:
+	../../../src/check/model as Model
+	../../../src/check/declarations: validate_declarations
+	../../../src/check/constants: constant_annotations, validate_constants
+	../../../src/check/bodies: resolve_functions
+	../../../src/check/traits as Traits
+	../../../src/check/recursion: finalize_trait_instances
+	../../../src/check/errors: CheckError, CheckErrorKind(RecursionRejection), RecursionError(UnprovenTraitInstantiation), namespace_rejection
+	../../../src/check/render: render_check_error
+	../../../src/namespace/namespace: build_namespace, namespace_problem_span
+	../../../src/parse/assemble: ParsedProgram, parsed_contents
+	../../../src/utils/ids: inventory_records, inventory_opaques
+	../../../src/utils/source: module_source, root_module_id, same_source
+	../../../src/utils/syntax: same_span
+	../input: prepare_signatures, accepted_traits
+	./test_generic_structural_equality: parse_generic_fixture
+	result: map_err
+	test: TestSuite
+
+
+private PROVIDER: String =
+	|import:
+	|    _base: Int, Bool(True, False), Equatable
+	|fixed record Box[Element] { value: Element }
+	|fixed record Holder { child: Box[Int] }
+	|fixed record Stable { value: Int }
+	|implements Equatable for Int:
+	|    pure func equals(left: Self, right: Self) -> Bool:
+	|        builtin("int.equals")
+	|
+
+
+private IMPORTS: String =
+	|import:
+	|    int: Box, Holder, equals
+	|
+
+private MAIN: String =
+	|func main() -> Int:
+	|    0
+	|
+
+
+private fixed record FiniteUses {
+	constants: List[Model.CheckedConstant],
+	bodies: Model.CheckedBodies,
+	traits: Model.AcceptedTraits
+}
+
+
+-- Stop at the real pre-sealing phase product so constants are still present.
+-- The tests inject only the finite classifier's unavailable-head result; names,
+-- signatures, requirements, constants, bodies and callable choices are genuine.
+private pure func prepare_uses(program: ParsedProgram) -> Result[FiniteUses, CheckError]:
+	parsed = parsed_contents(program)
+	namespace ?= build_namespace(program).map_err(pure func(problem): namespace_rejection(namespace_problem_span(problem), problem))
+	declarations ?= validate_declarations(parsed, namespace)
+	prepared ?= prepare_signatures(program, namespace)
+	availability ?= accepted_traits(program, namespace, prepared, declarations)
+	annotations ?= constant_annotations(parsed, namespace)
+	constants ?= validate_constants(parsed, namespace, annotations, declarations.records, declarations.unions, prepared.signatures.functions, availability)
+	bodies ?= resolve_functions(prepared.signatures.functions, declarations, inventory_opaques(parsed.declarations), namespace, constants, availability, prepared.designated.result, prepared.designated.boolean, prepared.designated.option)
+	Ok({ constants = constants, bodies = bodies, traits = Traits.accepted_traits(availability) })
+
+
+private func rejects_at_creation(prefix: String, use: String, suffix: String) -> Bool:
+	match parse_generic_fixture(prefix + use + suffix, PROVIDER):
+		Err(error):
+			print(error.message)
+			False
+		Ok(parsed):
+			match (inventory_records(parsed_contents(parsed).declarations), prepare_uses(parsed)):
+				([box, ..._], Ok(prepared)):
+					match finalize_trait_instances(prepared.constants, prepared.bodies.functions, prepared.bodies.lambdas, prepared.traits, [Model.RecordAggregate(box.id)]):
+						Ok(_): False
+						Err(error):
+							diagnostic = render_check_error(parsed, error)
+							match error.kind:
+								RecursionRejection(UnprovenTraitInstantiation):
+									(
+										same_source(error.span.source, module_source(root_module_id()))
+										and error.span.start == prefix.length() and error.span.end == prefix.length() + use.length()
+										and same_span(error.span, diagnostic.span) and diagnostic.note.is_none()
+										and diagnostic.message == "cannot prove finite generic trait instantiation"
+										and diagnostic.help == "avoid recursively wrapping generic receivers through trait dispatch; this increment uses a conservative constructor-path proof"
+									)
+								_: False
+				(_, Err(error)):
+					print(render_check_error(parsed, error).message)
+					False
+				_: False
+
+
+func test_final_use_checks_an_uncalled_direct_method() -> Bool:
+	prefix = IMPORTS + "pure func compare(value: Box[Int]) -> Bool:\n    "
+	rejects_at_creation(prefix, "equals", "(value, value)\n" + MAIN)
+
+
+private GENERIC: String =
+	|pure func observe[Value: Equatable](value: Value) -> Int:
+	|    7
+	|
+
+
+-- The root's canonical type bound is explicitly visible through the prelude
+-- supplied by parse_generic_fixture, not inferred from observe's spelling.
+func test_final_use_projects_a_named_callee_requirement() -> Bool:
+	prefix = IMPORTS + GENERIC + "pure func compare(value: Box[Int]) -> Int:\n    "
+	rejects_at_creation(prefix, "observe", "(value)\n" + MAIN)
+
+
+func test_final_use_checks_named_callback_arguments() -> Bool:
+	before: String =
+		|pure func apply(value: Box[Int], callback: pure (Box[Int]) -> Int) -> Int:
+		|    callback(value)
+		|pure func compare(value: Box[Int]) -> Int:
+		|
+	prefix = IMPORTS + GENERIC + before + "    apply(value, "
+	rejects_at_creation(prefix, "observe", ")\n" + MAIN)
+
+
+func test_final_use_checks_a_returned_named_callable() -> Bool:
+	prefix = IMPORTS + GENERIC + "pure func handler() -> pure (Box[Int]) -> Int:\n    "
+	rejects_at_creation(prefix, "observe", "\n" + MAIN)
+
+
+func test_final_use_checks_a_stored_method_at_creation() -> Bool:
+	prefix = IMPORTS + "pure func compare(value: Box[Int]) -> Bool:\n    callback: pure (Box[Int], Box[Int]) -> Bool = "
+	rejects_at_creation(prefix, "equals", "\n    callback(value, value)\n" + MAIN)
+
+
+func test_final_use_checks_a_constant_named_callable_before_discard() -> Bool:
+	prefix = IMPORTS + GENERIC + "CALLBACK: pure (Box[Int]) -> Int = "
+	rejects_at_creation(prefix, "observe", "\n" + MAIN)
+
+
+func test_final_use_checks_a_constant_method_before_discard() -> Bool:
+	prefix = IMPORTS + "CALLBACK: pure (Box[Int], Box[Int]) -> Bool = "
+	rejects_at_creation(prefix, "equals", "\n" + MAIN)
+
+
+func test_final_use_checks_every_lambda_body() -> Bool:
+	prefix = IMPORTS + "pure func handler() -> pure (Box[Int]) -> Bool:\n    pure func(value: Box[Int]): "
+	rejects_at_creation(prefix, "equals", "(value, value)\n" + MAIN)
+
+
+func test_final_use_rejects_a_nongeneric_parent_of_an_unavailable_child() -> Bool:
+	prefix = IMPORTS + "pure func compare(value: Holder) -> Bool:\n    "
+	rejects_at_creation(prefix, "equals", "(value, value)\n" + MAIN)
+
+
+func test_unused_removed_families_do_not_remove_unrelated_automatic_equality() -> Bool:
+	match parse_generic_fixture(IMPORTS + MAIN, PROVIDER):
+		Err(_): False
+		Ok(parsed):
+			match (inventory_records(parsed_contents(parsed).declarations), prepare_uses(parsed)):
+				([box, holder, stable], Ok(prepared)):
+					match finalize_trait_instances(prepared.constants, prepared.bodies.functions, prepared.bodies.lambdas, prepared.traits, [Model.RecordAggregate(box.id)]):
+						Err(_): False
+						Ok(accepted):
+							(
+								Model.equality_body(accepted, Model.RecordAggregate(box.id)).is_none()
+								and Model.equality_body(accepted, Model.RecordAggregate(holder.id)).is_none()
+								and Model.equality_body(accepted, Model.RecordAggregate(stable.id)).is_some()
+							)
+				_: False
+
+
+tests: TestSuite = {
+	description = "Generic equality final finite-use validation",
+	tests = [
+		("uncalled direct method", test_final_use_checks_an_uncalled_direct_method),
+		("named callee requirements", test_final_use_projects_a_named_callee_requirement),
+		("named callback argument", test_final_use_checks_named_callback_arguments),
+		("returned named callable", test_final_use_checks_a_returned_named_callable),
+		("stored method creation", test_final_use_checks_a_stored_method_at_creation),
+		("constant named callable", test_final_use_checks_a_constant_named_callable_before_discard),
+		("constant method callable", test_final_use_checks_a_constant_method_before_discard),
+		("lambda body", test_final_use_checks_every_lambda_body),
+		("nongeneric automatic parent", test_final_use_rejects_a_nongeneric_parent_of_an_unavailable_child),
+		("unused removed families preserve unrelated automatic equality", test_unused_removed_families_do_not_remove_unrelated_automatic_equality)
+	]
+}
