@@ -207,12 +207,15 @@ link log must be empty and its complete stderr must be the exact balanced strict
 report; emitted C must match. Provenance retains its hash and flags, and the
 sanitized binary is not published. Regular diagnostic B runs the native cost suite.
 Ordinary e2e cases run sanitized real mains; accounted cases additionally check
-strict target balance. The current interpolation-capable producer's compiler,
-library and test inputs match `6ef8b68296ee70e63fcee18b7cedce23e1720b48`.
-It supports quoted and pipe String interpolation, allowing subsequent compiler
-source to adopt those forms. The reviewed workflow and release documentation
-changes receive their own commit and seed tag. Compiler C is locked to SHA-256
-`18de404e94f2f10be33031ddcd246b1b867296fead0942d2755fc124781988d9`, checked
+strict target balance. The current reviewed producer supports static trait bounds,
+default methods, contextual method references and automatic equality for nongeneric
+named records/unions. Generic aggregate automatic equality remains deferred. The
+seed tag identifies the final approved source commit, retained in each archive's
+`source-commit.txt`; compiler and library inventories must match across platforms.
+The reviewed workflow and release documentation changes receive their own commit
+and seed tag before the default library adopts trait syntax. Compiler C is locked
+to SHA-256
+`0d12c2441150582ff78e40e762d923493f781bf9d019946cb81b5eb9aba54830`, checked
 immediately after A emits C and before B qualification. Each provenance archive
 retains `reviewed-compiler-c.sha256`; the publisher checks the emitted C against
 that digest and requires all platforms to agree. The earlier stored-callable/tuple
