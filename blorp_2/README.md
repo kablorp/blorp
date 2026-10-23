@@ -75,7 +75,9 @@ implements Equatable for Int:
 		builtin("int.equals")
 ```
 
-The designated foundation's `Equatable` has `equals` as its sole abstract
+The configured prelude's ordinary `Equatable` binding selects the canonical
+trait identity, including when imported from a library module. Without that
+binding, no trait is canonical. The selected trait has `equals` as its sole abstract
 requirement; additional pure methods need defaults. Implementations define every
 abstract method with matching parameter, result and purity contracts. They may
 override defaults; omitted defaults use the trait definition's lexical scope.
@@ -83,7 +85,9 @@ Default bodies and authored bodies are ordinary checked functions, including
 unused bodies. A default-only implementation ends after its receiver, without
 a colon or an empty indented block. A module
 must own the trait or receiver declaration. A library operation module may
-also implement a foundation trait for a foundation receiver.
+also implement a foundation trait for a foundation receiver. The same allowance
+applies to the selected canonical trait when its declaration belongs to an
+actual library module; unrelated library traits gain no such permission.
 
 Method names denote trait families. Importing `int: equals` makes that family
 available for every receiver with an accepted implementation, including custom
@@ -191,12 +195,13 @@ legal. Equality use reports the actual unsupported field or payload annotation.
 Generic aggregate heads, including phantom heads, require a written full-family
 implementation for now; their automatic equality is the open T4b increment.
 Tuples, opaque types and callable values receive no automatic implementation.
-A foundation without canonical Equatable creates no automatic equality bodies.
+A prelude without the canonical Equatable binding creates no automatic equality bodies.
 
 Derived methods use ordinary direct calls, defaults and contextual callable
 references through the existing specialization graph. Only reachable bodies
 emit code; no trait representation reaches lower phases. The production target
-library retains its existing APIs until T5 qualifies and pins a capable seed.
+library retains its existing APIs. T5 must qualify and pin a seed supporting
+this declaration-location rule before moving its canonical trait and implementations.
 
 ## First example
 

@@ -89,7 +89,7 @@ Revisiting partial implementations requires its own coherent language decision.
 Examples are fragments unless module names are shown. The proposed fixture
 prelude imports base types and Equatable; operation imports remain explicit.
 
-**Source: final canonical declaration in the configured foundation.**
+**Source: final canonical declaration selected by the configured prelude.**
 
 ```blorp
 trait Equatable:
@@ -259,8 +259,9 @@ Keep check_builtin_types before Namespace for primitive/Bool/Option/Result
 validation and the foundation-shape allowance. It publishes no unvalidated Eq.
 Within the existing checker composition: resolve trait headers/Self and ordinary
 declarations/signatures, validate method signatures, then designate optional
-canonical Eq in the single accepted trait authority. Match only the foundation
-module's declared Eq name and validate pure Self/Self -> designated Bool once.
+canonical Eq in the single accepted trait authority. Resolve the configured
+prelude's ordinary Equatable binding to its genuine TraitId, then validate
+pure Self/Self -> designated Bool once.
 equals must be its sole abstract requirement; any additional admitted method
 must have an ordinary default. Reject an extra abstract requirement as a
 malformed canonical trait, with a precise header diagnostic, before derivation.
@@ -371,9 +372,11 @@ pure func same_mode(left: Mode, right: Mode) -> Bool:
 ```
 
 Authored impls belong in the trait's or receiver's declaring module.
-One explicit standard-library allowance is necessary: when BOTH declarations
-belong to the designated foundation module, an implementation may live in a
-sealed `LibraryModule`. This accommodates Int/List operations outside _base.
+One explicit standard-library allowance is necessary: a sealed `LibraryModule`
+may implement a foundation-owned receiver when the trait is foundation-owned,
+or when it is the selected canonical TraitId declared in a `LibraryModule`.
+Unrelated library traits gain no permission over foundation receivers. This
+accommodates Int/List operations outside _base.
 Use declaration module IDs and `ParsedModuleRow.role`, never filenames,
 directory prefixes or importing-module ownership. Application roots remain
 `UserModule` even beneath the supplied library directory. The allowance does
@@ -814,17 +817,19 @@ rescoping. No efficiency improvement is claimed by this proposal.
 
 ### Bootstrap and library boundary
 
-The current [bootstrap manifest](bootstrap.env) pins a seed that cannot parse
-traits. Keep compiler implementation source and the default target library
-seed-compatible through T4. Qualify new source-language fixtures with an
-explicit trait-capable test foundation/library; do not add an alternate builder.
+The current [bootstrap manifest](bootstrap.env) pins a trait-capable seed.
+Keep compiler implementation source within its supported subset. Before moving
+the production canonical declaration out of _base, qualify and pin a compiler
+that recognizes the prelude-selected identity and its library ownership rule.
+The production target library stays unchanged during that preparatory slice;
+explicit fixture libraries exercise the new rule without an alternate builder.
 
-Canonical Eq is optional while the supplied old foundation has no trait:
-`None` means no canonical auto equality, not fallback recognition by spelling.
-When present, designate and validate genuine Eq/equals IDs once through the
-existing foundation authority. _base may contain specifically owned trait
-default bodies after T3, while unrelated free functions/imports remain rejected.
-A same-spelled trait outside the designated base remains ordinary.
+Canonical Eq is optional: `None` means no ordinary Equatable binding in the
+configured prelude, not fallback recognition by spelling elsewhere. When
+present, resolve and validate genuine Eq/equals IDs once through the existing
+namespace authority. _base may contain specifically owned trait default bodies,
+while unrelated free functions/imports remain rejected. Same-spelled traits
+with different IDs remain ordinary, subject to the existing name-conflict rules.
 
 T5 uses the maintained [release procedure](../docs/RELEASES.md) and
 [bootstrap launcher](../scripts/blorp2-compiler-bootstrap).

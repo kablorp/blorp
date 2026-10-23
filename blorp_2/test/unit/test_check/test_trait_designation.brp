@@ -1,0 +1,344 @@
+import:
+	../../../src/check/check: check, checked_functions, check_errors
+	../../../src/check/traits: designated_trait
+	../../../src/check/model as Model
+	./test_traits: parse_trait_fixture
+	../../../src/check/errors: CheckErrorKind(TraitRejection), TraitError(OrphanImplementation, MalformedCanonicalTrait, MissingImplementation)
+	../../../src/check/render: render_failure
+	../../../src/namespace/namespace: build_namespace
+	../../../src/parse/assemble: ParsedAssembly, ParsedProgram, begin_program, append_module, assembly_names, parsed_contents
+	../../../src/lex/lex: lex
+	../../../src/parse/parse: parse_module
+	../../../src/utils/source: ModuleId, ModuleKind(UserModule, LibraryModule, FoundationTypesModule, FoundationPreludeModule), module_id, root_module_id, module_source, same_module, same_source, compiler_source
+	../../../src/utils/ids: inventory_traits, inventory_implementations, inventory_records, trait_number, same_trait_method, record_number
+	../../../src/utils/syntax: Diagnostic, diagnostic, same_span
+	../module_input: FOUNDATION_TYPES, sealed
+	option: to_result
+	io: print_error
+	test: TestSuite
+
+
+private CONTRACT: String =
+	|import:
+	|    _base: Int, Bool(True, False)
+	|trait Equatable:
+	|    pure func equals(left: Self, right: Self) -> Bool
+	|    pure func not_equals(left: Self, right: Self) -> Bool:
+	|        match equals(left, right):
+	|            True: False
+	|            False: True
+	|
+
+private PROVIDER: String =
+	|import:
+	|    _base: Int, Bool
+	|    ./contract: Equatable
+	|implements Equatable for Int:
+	|    pure func equals(left: Self, right: Self) -> Bool:
+	|        builtin("int.equals")
+	|
+
+private ROOT: String =
+	|import:
+	|    int as Integer
+	|    ./contract: Equatable
+	|    _base: Int, Bool(True, False)
+	|func main() -> Int:
+	|    match Integer.equals(7, 7):
+	|        True: 23
+	|        False: 0
+	|
+
+private PRELUDE: String =
+	|import:
+	|    _base: Int, Float, String, Void, List, Bool(True, False), Option(Some, None), Result(Ok, Err)
+	|    ./contract: Equatable
+	|
+
+
+private pure func append_source(assembly: ParsedAssembly, module: ModuleId, source: String, targets: List[ModuleId], role: ModuleKind) -> Result[ParsedAssembly, Diagnostic]:
+	tokens ?= lex(module_source(module), source, assembly_names(assembly))
+	parsed ?= parse_module(tokens, module)
+	append_module(assembly, parsed, targets, role)
+
+
+-- Five real modules use the same import topology as the configured library:
+-- user -> provider -> contract -> import-free base, with the prelude selecting
+-- the contract's actual trait. No declaration or body identity is fabricated.
+private pure func fixture(main_source: String, provider_source: String, contract_source: String) -> Result[ParsedProgram, Diagnostic]:
+	invalid = diagnostic({ source = compiler_source(), start = 0, end = 0 }, "invalid trait location fixture", "use the five explicit module ordinals")
+	provider ?= module_id(1).to_result(invalid)
+	contract ?= module_id(2).to_result(invalid)
+	base ?= module_id(3).to_result(invalid)
+	prelude ?= module_id(4).to_result(invalid)
+	root ?= append_source(begin_program(), root_module_id(), main_source, [provider, contract, base], UserModule)
+	with_provider ?= append_source(root, provider, provider_source, [base, contract], LibraryModule)
+	with_contract ?= append_source(with_provider, contract, contract_source, [base], LibraryModule)
+	with_base ?= append_source(with_contract, base, FOUNDATION_TYPES, [], FoundationTypesModule)
+	complete ?= append_source(with_base, prelude, PRELUDE, [base, contract], FoundationPreludeModule)
+	sealed(complete)
+
+
+func test_the_prelude_selects_the_real_imported_canonical_trait() -> Bool:
+	match fixture(ROOT, PROVIDER, CONTRACT):
+		Err(error):
+			print_error(error.message)
+			False
+		Ok(program):
+			match inventory_traits(parsed_contents(program).declarations):
+				[written]:
+					match build_namespace(program):
+						Err(_): False
+						Ok(namespace):
+							match designated_trait(parsed_contents(program), namespace):
+								Some(actual): trait_number(actual) == trait_number(written.id)
+								None: False
+				_: False
+
+
+func test_a_library_can_implement_the_selected_trait_for_a_base_receiver() -> Bool:
+	match fixture(ROOT, PROVIDER, CONTRACT):
+		Err(error):
+			print_error(error.message)
+			False
+		Ok(program):
+			match check(program):
+				Err(failure):
+					print_error(render_failure(failure).first.message)
+					False
+				Ok(checked):
+					match inventory_traits(parsed_contents(program).declarations):
+						[written]:
+							traits = checked_functions(checked).traits
+							match traits.canonical:
+								Some(actual):
+									publishes = traits.implementations.any(pure func(implementation):
+										match implementation.method_provider:
+											Some(provider):
+												match inventory_implementations(parsed_contents(program).declarations):
+													[row]: same_module(provider, row.header.module)
+													_: False
+											None: False
+									)
+									trait_number(actual) == trait_number(written.id) and publishes
+								None: False
+						_: False
+
+
+func test_an_imported_canonical_contract_keeps_its_shape_diagnostic() -> Bool:
+	contract: String =
+		|import:
+		|    _base: Int, Bool(True, False)
+		|trait Equatable:
+		|    pure func equals(left: Self, right: Self) -> Int
+		|
+	match fixture(ROOT, PROVIDER, contract):
+		Err(error):
+			print_error(error.message)
+			False
+		Ok(program):
+			match inventory_traits(parsed_contents(program).declarations):
+				[written]:
+					match check(program):
+						Ok(_): False
+						Err(failure):
+							error = check_errors(failure).first
+							rendered = render_failure(failure).first
+							match error.kind:
+								TraitRejection(MalformedCanonicalTrait(actual)):
+									trait_number(actual) == trait_number(written.id) and same_span(error.span, written.type_name.span) and same_span(rendered.span, error.span) and rendered.message == "canonical Equatable requires pure equals(Self, Self) -> Bool as its sole abstract method" and rendered.help == "keep equals abstract; additional pure methods require default bodies" and rendered.note.is_none()
+								_: False
+				_: False
+
+
+func test_a_user_module_does_not_gain_the_library_ownership_exception() -> Bool:
+	main_source: String =
+		|import:
+		|    int as Integer
+		|    ./contract: Equatable
+		|    _base: Int, Bool(True, False)
+		|implements Equatable for Int:
+		|    pure func equals(left: Self, right: Self) -> Bool:
+		|        True
+		|func main() -> Int:
+		|    0
+		|
+	provider: String =
+		|import:
+		|    _base: Int, Bool
+		|    ./contract: Equatable
+		|
+	match fixture(main_source, provider, CONTRACT):
+		Err(error):
+			print_error(error.message)
+			False
+		Ok(program):
+			match inventory_implementations(parsed_contents(program).declarations):
+				[written]:
+					match check(program):
+						Ok(_): False
+						Err(failure):
+							error = check_errors(failure).first
+							rendered = render_failure(failure).first
+							match error.kind:
+								TraitRejection(OrphanImplementation(_, _)):
+									same_source(error.span.source, module_source(root_module_id())) and same_span(error.span, written.header.span) and same_span(rendered.span, error.span) and rendered.message == "implementation belongs to neither the trait nor receiver module" and rendered.help == "declare it beside the trait or receiver type; foundation types may be implemented by their library" and rendered.note.is_none()
+								_: False
+				_: False
+
+
+func test_a_selected_library_trait_can_implement_a_base_nominal_receiver() -> Bool:
+	provider: String =
+		|import:
+		|    _base: Int, Bool(True, False)
+		|    ./contract: Equatable
+		|implements Equatable for Bool:
+		|    pure func equals(left: Self, right: Self) -> Bool:
+		|        True
+		|
+	main_source: String =
+		|import:
+		|    int as Integer
+		|    ./contract: Equatable
+		|    _base: Int, Bool(True, False)
+		|func main() -> Int:
+		|    left: Bool = True
+		|    right: Bool = False
+		|    match Integer.equals(left, right):
+		|        True: 23
+		|        False: 0
+		|
+	match fixture(main_source, provider, CONTRACT):
+		Err(_): False
+		Ok(program):
+			match check(program):
+				Err(failure):
+					print_error(render_failure(failure).first.message)
+					False
+				Ok(checked):
+					checked_functions(checked).traits.implementations.any(pure func(implementation): implementation.method_provider.is_some())
+
+
+func test_another_library_trait_has_no_foundation_receiver_privilege() -> Bool:
+	contract = CONTRACT + "trait Observable:\n    pure func observe(value: Self) -> Int\n"
+	provider: String =
+		|import:
+		|    _base: Int, Bool
+		|    ./contract: Observable
+		|implements Observable for Int:
+		|    pure func observe(value: Self) -> Int:
+		|        7
+		|
+	main_source: String =
+		|import:
+		|    int as Integer
+		|    ./contract: Equatable
+		|    _base: Int, Bool(True, False)
+		|func main() -> Int:
+		|    0
+		|
+	match fixture(main_source, provider, contract):
+		Err(_): False
+		Ok(program):
+			match (inventory_traits(parsed_contents(program).declarations), inventory_implementations(parsed_contents(program).declarations), check(program)):
+				([canonical, other], [written], Err(failure)):
+					error = check_errors(failure).first
+					rendered = render_failure(failure).first
+					match error.kind:
+						TraitRejection(OrphanImplementation(owner, _)):
+							(
+								trait_number(owner) == trait_number(other.id)
+								and trait_number(owner) != trait_number(canonical.id)
+								and same_span(error.span, written.header.span)
+								and same_span(rendered.span, error.span)
+								and rendered.message == "implementation belongs to neither the trait nor receiver module"
+								and rendered.help == "declare it beside the trait or receiver type; foundation types may be implemented by their library"
+								and rendered.note.is_none()
+							)
+						_: False
+				_: False
+
+
+func test_an_unselected_library_equatable_gets_no_automatic_implementation() -> Bool:
+	prefix: String =
+		|import:
+		|    _base: Int, Bool
+		|    ./contract as Canonical
+		|trait Equatable:
+		|    pure func equals(left: Self, right: Self) -> Bool
+		|fixed record Point { value: Int }
+		|pure func compare(value: Point) -> Bool:
+		|
+	provider = prefix + "    equals(value, value)\n"
+	main_source: String =
+		|import:
+		|    int as Integer
+		|    ./contract: Equatable
+		|    _base: Int, Bool(True, False)
+		|func main() -> Int:
+		|    0
+		|
+	match fixture(main_source, provider, CONTRACT):
+		Err(_): False
+		Ok(program):
+			contents = parsed_contents(program)
+			match (inventory_traits(contents.declarations), inventory_records(contents.declarations), build_namespace(program), check(program)):
+				([other, selected], [point], Ok(namespace), Err(failure)):
+					error = check_errors(failure).first
+					rendered = render_failure(failure).first
+					match (designated_trait(contents, namespace), other.methods, error.kind):
+						(Some(canonical), [method], TraitRejection(MissingImplementation(actual, Model.RecordType(receiver)))):
+							(
+								trait_number(canonical) == trait_number(selected.id)
+								and trait_number(canonical) != trait_number(other.id)
+								and same_trait_method(actual, method.id)
+								and record_number(receiver) == record_number(point.id)
+								and error.span.start == prefix.length() + 4 and error.span.end == prefix.length() + 10
+								and rendered.message == "receiver does not implement this trait"
+								and rendered.help == "declare a matching implementation; generic functions must declare their required trait bounds"
+								and rendered.note.is_none()
+							)
+						_: False
+				_: False
+
+
+func test_a_base_trait_not_selected_by_the_prelude_is_not_canonical() -> Bool:
+	requirement: String =
+		|trait Equatable:
+		|    pure func equals(left: Self, right: Self) -> Bool
+		|fixed record Point { value: Int }
+		|
+	provider: String =
+		|import:
+		|    _base: Int, Bool, Equatable
+		|implements Equatable for Int:
+		|    pure func equals(left: Self, right: Self) -> Bool:
+		|        builtin("int.equals")
+		|
+	main_source: String = "import:\n    int as Integer\nfunc main() -> Int:\n    0\n"
+	match parse_trait_fixture(main_source, provider, requirement):
+		Err(_): False
+		Ok(program):
+			match check(program):
+				Err(_): False
+				Ok(checked):
+					traits = checked_functions(checked).traits
+					-- Only the authored Int row exists: neither Point nor Bool derives.
+					match traits.implementations:
+						[written]: traits.canonical.is_none() and written.method_provider.is_some()
+						_: False
+
+
+tests: TestSuite = {
+	description = "Prelude-selected canonical trait and library ownership",
+	tests = [
+		("prelude selects the imported actual canonical TraitId", test_the_prelude_selects_the_real_imported_canonical_trait),
+		("written library family implements the selected trait for a base receiver", test_a_library_can_implement_the_selected_trait_for_a_base_receiver),
+		("selected imported canonical contract keeps exact malformed-shape diagnostic", test_an_imported_canonical_contract_keeps_its_shape_diagnostic),
+		("user implementation remains outside the library ownership allowance", test_a_user_module_does_not_gain_the_library_ownership_exception),
+		("selected library trait supports base nominal Bool receiver", test_a_selected_library_trait_can_implement_a_base_nominal_receiver),
+		("noncanonical library trait has no base receiver privilege", test_another_library_trait_has_no_foundation_receiver_privilege),
+		("same-spelled unselected library trait gets no automatic equality", test_an_unselected_library_equatable_gets_no_automatic_implementation),
+		("unselected base Equatable does not trigger fallback derivation", test_a_base_trait_not_selected_by_the_prelude_is_not_canonical)
+	]
+}

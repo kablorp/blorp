@@ -21,6 +21,8 @@ The pilot accepts parameterless `trait` declarations with pure methods whose
 first formal is `Self`. A method without `:` is abstract; one with `:` has an
 ordinary default body. Function type parameters and complete implementation receiver
 families accept bounds such as `Value: Equatable + Visit` and `Box[Value: Visit]`.
+The configured prelude selects canonical Equatable through its ordinary imported
+trait binding; this adds no syntax or implicit method import.
 A default-only `implements Trait for Type` header ends at the newline, without a
 colon. Contextual unbound method references use ordinary expressions and need an
 expected callable type determining `Self`. See the [pilot trait rules](../blorp_2/README.md#concrete-traits)

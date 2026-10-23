@@ -93,6 +93,8 @@ syntax and escapes. Arbitrary FFI remains excluded. The pilot supports
 [static traits](../blorp_2/README.md#concrete-traits) with pure abstract or
 default methods, function bounds (`Value: Equatable + Visit`), complete receiver
 families (`Box[Value: Visit]`) and contextual unbound method references.
+The configured prelude selects canonical Equatable through its ordinary trait
+binding; an unrelated same-spelled trait does not enable automatic equality.
 Default-only implementations omit the colon and body. Method references need
 an expected callable contract determining `Self`; stored, returned and callback
 values obey ordinary purity and ownership. Generic bodies use only declared
