@@ -2,18 +2,50 @@
 -- Unrepresentable storage is infrastructure exhaustion, like failed malloc.
 STRING_CONCAT_RUNTIME: String =
 	raw
+		|static int64_t blorp_string_concat_length(const struct blorp_string *left,const struct blorp_string *right) {
+		|const uintmax_t maximum=(uintmax_t)blorp_string_maximum_capacity();
+		|if((uintmax_t)right->length>maximum||(uintmax_t)left->length>maximum-(uintmax_t)right->length){abort();}
+		|return left->length+right->length;
+		|}
 		|struct blorp_string *blorp_string_concat(const struct blorp_string *left,const struct blorp_string *right) {
-		|if(left->length>INT64_MAX-right->length){abort();}
-		|const size_t maximum_bytes=SIZE_MAX-sizeof(struct blorp_string)-1;
-		|if((uint64_t)left->length>(uint64_t)maximum_bytes||(uint64_t)right->length>(uint64_t)maximum_bytes-(uint64_t)left->length){abort();}
-		|const int64_t length=left->length+right->length;
+		|const int64_t length=blorp_string_concat_length(left,right);
 		|struct blorp_string *result=blorp_memory_allocate(sizeof *result+(size_t)length+1);
 		|if(result==NULL){abort();}
 		|atomic_init(&result->references,1);
 		|result->length=length;
+		|result->capacity=(size_t)length;
 		|memcpy(result->bytes,left->bytes,(size_t)left->length);
 		|memcpy(result->bytes+(size_t)left->length,right->bytes,(size_t)right->length);
 		|result->bytes[length]='\0';
 		|return result;
+		|}
+		|/* Only a transferred unique root reaches this helper. Growth is capped
+		| * before doubling so both the capacity and allocation size stay valid. */
+		|static struct blorp_string *blorp_string_reserve_unique(struct blorp_string *value,int64_t length) {
+		|if((size_t)length<=value->capacity){return value;}
+		|const size_t maximum=blorp_string_maximum_capacity();
+		|size_t capacity=value->capacity==0?1:value->capacity;
+		|while(capacity<(size_t)length){
+		|capacity=capacity>maximum/2?maximum:capacity*2;
+		|}
+		|struct blorp_string *result=blorp_memory_resize(value,sizeof *value+capacity+1);
+		|if(result==NULL){abort();}
+		|result->capacity=capacity;
+		|return result;
+		|}
+		|/* Transfer one left reference; right stays borrowed and has no uncounted
+		| * dependency on left. Counted aliases force the shared copying branch. */
+		|struct blorp_string *blorp_string_concat_take_left(struct blorp_string *left,const struct blorp_string *right) {
+		|if(atomic_load_explicit(&left->references,memory_order_acquire)!=1){
+		|struct blorp_string *result=blorp_string_concat(left,right);
+		|blorp_string_release(left);
+		|return result;
+		|}
+		|const int64_t length=blorp_string_concat_length(left,right);
+		|left=blorp_string_reserve_unique(left,length);
+		|memcpy(left->bytes+(size_t)left->length,right->bytes,(size_t)right->length);
+		|left->length=length;
+		|left->bytes[length]='\0';
+		|return left;
 		|}
 		|

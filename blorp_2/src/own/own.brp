@@ -1,7 +1,8 @@
 import:
+	../namespace/builtins: RuntimeOperation(StringConcat)
 	result: map
 	../check/model: MatchArmId, DecisionNodeId, ListLengthTest
-	../utils/boolean: not, and
+	../utils/boolean: not, and, or
 	int as IntOps
 	list: repeat, set_index, contains
 	../lower/lower as Lower:
@@ -28,7 +29,7 @@ import:
 	option: is_some, to_result
 	../utils/source: compiler_source
 	../specialize/specialize:
-		CallTarget,
+		CallTarget(RuntimeFunction),
 		ConcretePatternPlace,
 		ConcreteRecord,
 		ConcreteUnion,
@@ -71,6 +72,7 @@ fixed record BorrowedValue {
 fixed union OwnedArgument:
 	UnmanagedArgument(ValueId)
 	BorrowedArgument(BorrowedValue)
+	ConsumedArgument(ValueId, OwnerId)
 
 
 fixed union ResultOwnership:
@@ -603,6 +605,7 @@ private pure func store_payloads(
 			Err(error):
 				failure = Some(error)
 				break
+			Ok(ConsumedArgument(_, _)): failure = Some(internal_error(span, "stored payload cannot consume a call argument"))
 			Ok(UnmanagedArgument(unmanaged_value)): stored = stored.append(UnmanagedPayload(unmanaged_value))
 			Ok(BorrowedArgument(borrow)):
 				child_owner = owner_id(next)
@@ -659,6 +662,7 @@ private pure func build_definition(
 							field = field.field,
 							value = UnmanagedPayload(value),
 						})
+					Ok(ConsumedArgument(_, _)): failure = Some(internal_error(definition.span, "record field cannot consume a call argument"))
 					Ok(BorrowedArgument(borrow)):
 						child_owner = owner_id(next)
 						next = IntOps.add(next, 1)
@@ -757,6 +761,8 @@ private pure func build_definition(
 					parent = match argument:
 						UnmanagedArgument(value):
 							value
+						ConsumedArgument(value, _):
+							value
 						BorrowedArgument(borrow):
 							borrow.value
 
@@ -818,7 +824,8 @@ private fixed record EnclosingBlock {
 	first_value: Int,
 	sources: List[ResultOwnership],
 	owners: List[ScheduledDrop],
-	position: Int
+	position: Int,
+	consumed: List[OwnerId]
 }
 
 
@@ -872,6 +879,7 @@ private fixed union InsertedEntry:
 
 
 private fixed record InsertedSteps {
+	consumed: List[OwnerId],
 	entries: List[InsertedEntry],
 	sources: List[ResultOwnership],
 	owners: List[ScheduledDrop],
@@ -975,6 +983,105 @@ private pure func build_inputs(
 		None: Ok({ parameters = inputs, next_owner = next_owner })
 
 
+-- Borrow dependencies follow their published provenance, including projections.
+private pure func dependency_owner(
+	value: ValueId, sources: List[ResultOwnership], enclosing: List[EnclosingBlock],
+	first_value: Int, span: Span,
+) -> Result[Option[OwnerId], Diagnostic]:
+	source ?= value_source(value, sources, enclosing, first_value, span)
+	match source:
+		OwnedResult(owner): Ok(Some(owner))
+		BorrowedResult(OwnerBorrow(owner)): Ok(Some(owner))
+		BorrowedResult(PayloadBorrow(parent)): dependency_owner(parent, sources, enclosing, first_value, span)
+		_: Ok(None)
+
+
+private pure func has_consumed(consumed: List[OwnerId], owner: OwnerId) -> Bool:
+	var found: Bool = False
+	for previous in consumed:
+		if IntOps.equals(owner_number(previous), owner_number(owner)):
+			found = True
+	found
+
+
+private pure func matches_last_use(rows: List[ScheduledDrop], owner: OwnerId, position: Int) -> Bool:
+	var last: Bool = False
+	for row in rows:
+		if and(IntOps.equals(owner_number(row.owner), owner_number(owner)), IntOps.equals(row.last, position)):
+			last = True
+	last
+
+
+private pure func consume_concat_left(
+	definition: OwnedDefinition, target: CallTarget, left: BorrowedValue, right: OwnedArgument,
+	pre_step_drops: Option[List[ScheduledDrop]], loop_uses: List[ScheduledDrop], consumed: List[OwnerId],
+	position: Int, sources: List[ResultOwnership], enclosing: List[EnclosingBlock], first_value: Int,
+) -> Result[OwnedDefinition, Diagnostic]:
+	owners ?= pre_step_drops.to_result(internal_error(definition.span, "missing drop schedule row"))
+	source ?= value_source(left.value, sources, enclosing, first_value, definition.span)
+	dependency ?= match right:
+		BorrowedArgument(borrow): dependency_owner(borrow.value, sources, enclosing, first_value, definition.span)
+		_: Ok(None)
+	match source:
+		OwnedResult(owner):
+			last: Bool = matches_last_use(owners, owner, position).or(matches_last_use(loop_uses, owner, position))
+			independent: Bool = match dependency:
+				Some(other): IntOps.not_equals(owner_number(other), owner_number(owner))
+				None: True
+			if and(and(last, independent), has_consumed(consumed, owner).not()):
+				Ok({ definition | operation = CallDefinition(target, [ConsumedArgument(left.value, owner), right]) })
+			else:
+				Ok(definition)
+		_: Ok(definition)
+
+
+private pure func consume_concat(
+	definition: OwnedDefinition, pre_step_drops: Option[List[ScheduledDrop]], loop_uses: List[ScheduledDrop],
+	consumed: List[OwnerId], position: Int, sources: List[ResultOwnership],
+	enclosing: List[EnclosingBlock], first_value: Int,
+) -> Result[OwnedDefinition, Diagnostic]:
+	match definition.operation:
+		CallDefinition(target, [BorrowedArgument(left), right]):
+			match target:
+				RuntimeFunction(StringConcat): consume_concat_left(definition, target, left, right, pre_step_drops, loop_uses, consumed, position, sources, enclosing, first_value)
+				_: Ok(definition)
+		_: Ok(definition)
+
+
+-- Only the nearest loop's enclosing values receive rows, once for this terminal
+-- block. Nested reads and outgoing occurrences participate in the same last use.
+private pure func loop_consumption_uses(
+	steps: List[LoweredStep], exit: LoopExit, enclosing: List[EnclosingBlock], scope: LoopScope,
+) -> Result[List[ScheduledDrop], Diagnostic]:
+	var rows: List[ScheduledDrop] = []
+	var block_position = 0
+	for block in enclosing:
+		if IntOps.greater_than_or_equal(block_position, scope.pre_blocks):
+			for owner in block.owners:
+				if and(IntOps.greater_than_or_equal(owner.last, block.position), has_consumed(block.consumed, owner.owner).not()):
+					rows = rows.append({ owner | last = steps.length() })
+		block_position = IntOps.add(block_position, 1)
+	outer = enclosing_intervals(enclosing)
+	var failure: Option[Diagnostic] = None
+	var position = 0
+	for reads in steps.map(step_reads).append(loop_exit_values(exit)):
+		for value in reads:
+			if visible_outside(value_number(value), outer):
+				match dependency_owner(value, [], enclosing, 0, loop_exit_span(exit)):
+					Err(error): failure = Some(error)
+					Ok(None): void
+					Ok(Some(owner)):
+						var index = 0
+						for row in rows:
+							if IntOps.equals(owner_number(row.owner), owner_number(owner)):
+								rows = rows.set(index, { row | last = position })
+							index = IntOps.add(index, 1)
+		position = IntOps.add(position, 1)
+	match failure:
+		Some(error): Err(error)
+		None: Ok(rows)
+
+
 private pure func insert_steps(
 	steps: List[LoweredStep],
 	schedule: DropSchedule,
@@ -983,11 +1090,15 @@ private pure func insert_steps(
 	initial_owner: Int,
 	seed_inputs: List[OwnedJoinParameter],
 	loop_scope: Option[LoopScope],
+	loop_uses: List[ScheduledDrop],
 	unions: List[ConcreteUnion],
 	records: List[ConcreteRecord],
 ) -> Result[InsertedSteps, Diagnostic]:
 	count = steps.length()
 	var drops = steps.map(pure func(_: LoweredStep) -> List[ScheduledDrop]: [])
+	var consumed: List[OwnerId] = match enclosing.get(IntOps.subtract(enclosing.length(), 1)):
+		Some(block): block.consumed
+		None: []
 	var entries: List[InsertedEntry] = []
 	var sources = seed_inputs.map(join_ownership)
 	var owners: List[ScheduledDrop] = []
@@ -1021,6 +1132,10 @@ private pure func insert_steps(
 		value_slot = sources.length()
 		span = step_span(step)
 		var carried: List[OwnedJoinParameter] = []
+		var consumed_here: Option[OwnerId] = None
+		-- Candidates use the pre-call bucket; current-result scheduling below may
+		-- add a new drop, so retirement must read the updated bucket afterward.
+		pre_step_drops = drops.get(step_position)
 		available_result: Result[ResultOwnership, Diagnostic] = match step:
 			Join(join):
 				match build_outputs(join.result, join.carried, next_owner, unions, records):
@@ -1034,7 +1149,7 @@ private pure func insert_steps(
 									scrutinee = scrutinee,
 									result = built.result,
 									carried = built.carried,
-									enclosing = enclosing.append({ first_value = first_value, sources = sources, owners = owners, position = step_position }),
+									enclosing = enclosing.append({ first_value = first_value, sources = sources, owners = owners, position = step_position, consumed = consumed }),
 									loop_scope = loop_scope,
 								}))
 								next_owner = built.next_owner
@@ -1046,7 +1161,7 @@ private pure func insert_steps(
 					Ok(built):
 						entries = entries.append(AwaitingLoop({
 							loop = loop, result = built.result, carried = built.carried,
-							enclosing = enclosing.append({ first_value = first_value, sources = sources, owners = owners, position = step_position })
+							enclosing = enclosing.append({ first_value = first_value, sources = sources, owners = owners, position = step_position, consumed = consumed })
 						}))
 						next_owner = built.next_owner
 						carried = built.carried
@@ -1055,19 +1170,28 @@ private pure func insert_steps(
 				match build_definition(definition, sources, enclosing, first_value, next_owner, unions, records):
 					Err(error): Err(error)
 					Ok(built):
-						next_owner = built.next_owner
-						-- Stored payloads are acquired before the definition; a
-						-- projection's own acquisition follows it and owns its value.
-						match built.acquisitions:
-							StoredAcquisitions(acquired):
-								for acquisition in acquired:
-									entries = entries.append(Inserted(AcquireOwner(acquisition.owner, acquisition.borrow, span)))
-								entries = entries.append(Inserted(DefineValue(built.definition)))
-								Ok(built.definition.result)
-							ProjectedAcquisition(acquired):
-								entries = entries.append(Inserted(DefineValue(built.definition)))
-								entries = entries.append(Inserted(AcquireOwner(acquired.owner, acquired.borrow, span)))
-								Ok(OwnedResult(acquired.owner))
+						match consume_concat(built.definition, pre_step_drops, loop_uses, consumed, step_position, sources, enclosing, first_value):
+							Err(error): Err(error)
+							Ok(consuming):
+								match consuming.operation:
+									CallDefinition(_, [ConsumedArgument(_, owner), _]):
+										consumed_here = Some(owner)
+										if matches_last_use(loop_uses, owner, step_position):
+											consumed = consumed.append(owner)
+									_: void
+								next_owner = built.next_owner
+								-- Stored payloads are acquired before the definition; a
+								-- projection's own acquisition follows it and owns its value.
+								match built.acquisitions:
+									StoredAcquisitions(acquired):
+										for acquisition in acquired:
+											entries = entries.append(Inserted(AcquireOwner(acquisition.owner, acquisition.borrow, span)))
+										entries = entries.append(Inserted(DefineValue(consuming)))
+										Ok(built.definition.result)
+									ProjectedAcquisition(acquired):
+										entries = entries.append(Inserted(DefineValue(consuming)))
+										entries = entries.append(Inserted(AcquireOwner(acquired.owner, acquired.borrow, span)))
+										Ok(OwnedResult(acquired.owner))
 
 		match available_result:
 			Err(error):
@@ -1128,7 +1252,11 @@ private pure func insert_steps(
 		match drops.get(step_position):
 			Some(bucket):
 				for dropped in bucket:
-					entries = entries.append(Inserted(DropOwner(dropped.owner, dropped.span)))
+					transferred_here: Bool = match consumed_here:
+						Some(owner): IntOps.equals(owner_number(owner), owner_number(dropped.owner))
+						None: False
+					if and(transferred_here.not(), has_consumed(consumed, dropped.owner).not()):
+						entries = entries.append(Inserted(DropOwner(dropped.owner, dropped.span)))
 			None:
 				failure = Some(internal_error(span, "missing drop schedule row"))
 				break
@@ -1140,6 +1268,7 @@ private pure func insert_steps(
 			Err(error)
 		None:
 			Ok({
+				consumed = consumed,
 				entries = entries,
 				sources = sources,
 				owners = owners,
@@ -1468,7 +1597,7 @@ private pure func insert_yielding_arm(
 	span ?= join_terminal_span(arm, outputs.value, outer)
 	terminal: BlockTerminal = TerminalJoin(outputs.value, outputs.carried, parameters)
 	uses ?= block_uses(arm.steps, terminal, outer, first_value, arm.inputs.length(), Ok(span))
-	inserted ?= insert_steps(arm.steps, DropAtLastUse(uses), enclosing, first_value, inputs.next_owner, inputs.parameters, loop_scope, unions, records)
+	inserted ?= insert_steps(arm.steps, DropAtLastUse(uses), enclosing, first_value, inputs.next_owner, inputs.parameters, loop_scope, [], unions, records)
 	leaving ?= leave_join(outputs, arm.steps.length(), parameters, inserted, uses, enclosing, first_value, span)
 	completed ?= complete_joins(leaving.entries, IntOps.add(first_value, inserted.sources.length()), leaving.next_owner, unions, records)
 	Ok({
@@ -1646,11 +1775,11 @@ private pure func require_loop_scope(scope: Option[LoopScope], target: Lower.Loo
 -- Scheduling records are frozen at the exact occurrence. Earlier drops are
 -- excluded without walking or reconstructing the enclosing source body.
 private pure func retire_live(
-	entries: List[InsertedEntry], owners: List[ScheduledDrop], position: Int,
+	entries: List[InsertedEntry], owners: List[ScheduledDrop], position: Int, consumed: List[OwnerId],
 ) -> List[InsertedEntry]:
 	var retired = entries
 	for owner in owners:
-		if IntOps.greater_than_or_equal(owner.last, position):
+		if and(IntOps.greater_than_or_equal(owner.last, position), has_consumed(consumed, owner.owner).not()):
 			retired = retired.append(Inserted(DropOwner(owner.owner, owner.span)))
 	retired
 
@@ -1681,11 +1810,11 @@ private pure func leave_loop(
 	ready: Void ?= match failure:
 		Some(error): Err(error)
 		None: Ok(void)
-	entries = retire_live(entries, inserted.owners, position)
+	entries = retire_live(entries, inserted.owners, position, inserted.consumed)
 	var ordinal = 0
 	for block in enclosing:
 		if IntOps.greater_than_or_equal(ordinal, scope.pre_blocks):
-			entries = retire_live(entries, block.owners, block.position)
+			entries = retire_live(entries, block.owners, block.position, inserted.consumed)
 		ordinal = IntOps.add(ordinal, 1)
 	owned_exit: OwnedLoopExit ?= match exit:
 		Lower.Recur(_, occurrence): Ok(Recur(transfers, occurrence))
@@ -1713,11 +1842,19 @@ private pure func insert_loop_exit_block(
 	-- Header obligations survive until the complete edge batch, including
 	-- old values that are not outgoing. Arm inputs keep last-use scheduling.
 	var held_uses = uses
+	enclosing_uses ?= loop_consumption_uses(steps, exit, enclosing, scope)
+	var loop_uses = enclosing_uses
 	var input_slot = 0
 	while IntOps.less_than(input_slot, held_headers):
+		match seed_inputs.get(input_slot):
+			Some(ManagedJoinParameter(parameter, owner)):
+				match uses.get(input_slot):
+					Some(Some(last)): loop_uses = loop_uses.append({ owner = owner, span = parameter.span, last = last })
+					_: void
+			_: void
 		held_uses = held_uses.set(input_slot, Some(steps.length()))
 		input_slot = IntOps.add(input_slot, 1)
-	inserted ?= insert_steps(steps, DropAtLastUse(held_uses), enclosing, first_value, initial_owner, seed_inputs, Some(scope), unions, records)
+	inserted ?= insert_steps(steps, DropAtLastUse(held_uses), enclosing, first_value, initial_owner, seed_inputs, Some(scope), loop_uses, unions, records)
 	leaving ?= leave_loop(exit, inserted, enclosing, scope, first_value, steps.length())
 	completed ?= complete_joins(leaving.entries, IntOps.add(first_value, inserted.sources.length()), leaving.next_owner, unions, records)
 	Ok({ body = { operations = completed.operations, tail = ExitLoop(leaving.exit) }, next_value = completed.next_value, next_owner = completed.next_owner })
@@ -1735,10 +1872,10 @@ private pure func insert_loop_match_block(
 	unions: List[ConcreteUnion],
 	records: List[ConcreteRecord],
 ) -> Result[InsertedLoopBlock, Diagnostic]:
-	prefix ?= insert_steps(steps, DropInEachArm, enclosing, first_value, initial_owner, seed_inputs, Some(scope), unions, records)
+	prefix ?= insert_steps(steps, DropInEachArm, enclosing, first_value, initial_owner, seed_inputs, Some(scope), [], unions, records)
 	scrutinee ?= borrow_argument(matched.selection.scrutinee, prefix.sources, enclosing, first_value, span)
 	completed ?= complete_joins(prefix.entries, IntOps.add(first_value, prefix.sources.length()), prefix.next_owner, unions, records)
-	outer: List[EnclosingBlock] = enclosing.append({ first_value = first_value, sources = prefix.sources, owners = prefix.owners, position = steps.length() })
+	outer: List[EnclosingBlock] = enclosing.append({ first_value = first_value, sources = prefix.sources, owners = prefix.owners, position = steps.length(), consumed = prefix.consumed })
 	selected ?= insert_selection(matched.selection, scrutinee, outer, completed.next_value, completed.next_owner, unions, records)
 	var next_value = selected.next_value
 	var next_owner = selected.next_owner
@@ -1829,7 +1966,7 @@ pure func insert_function(
 ) -> Result[OwnedFunction, Diagnostic]:
 	span ?= terminal_span(function.steps, function.result, [])
 	uses ?= block_uses(function.steps, TerminalValue(function.result), [], 0, 0, Ok(span))
-	inserted ?= insert_steps(function.steps, DropAtLastUse(uses), [], 0, 0, [], None, unions, records)
+	inserted ?= insert_steps(function.steps, DropAtLastUse(uses), [], 0, 0, [], None, [], unions, records)
 	source ?= value_source(function.result, inserted.sources, [], 0, span)
 	leaving = leave_with(function.result, source, inserted.entries, inserted.next_owner, span)
 	completed ?= complete_joins(leaving.entries, inserted.sources.length(), leaving.next_owner, unions, records)

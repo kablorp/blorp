@@ -6,18 +6,22 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <signal.h>
+#include <sys/wait.h>
+#include <unistd.h>
 
 /* Observe allocation occurrences independently, including when malloc reuses
  * an address. After release, assertions read the observation, never the root. */
 enum { MAX_ALLOCATION_OCCURRENCES = 128 };
-struct Allocation { void *pointer; int live; };
+struct Allocation { void *pointer; size_t bytes; int live; };
 static struct Allocation allocations[MAX_ALLOCATION_OCCURRENCES];
 static size_t allocation_count, live_count, free_count;
+static size_t resize_count, resized_bytes;
 
 static void *observed_malloc(size_t bytes) {
     void *pointer = malloc(bytes);
     assert(pointer && allocation_count < MAX_ALLOCATION_OCCURRENCES);
-    allocations[allocation_count++] = (struct Allocation){pointer, 1};
+    allocations[allocation_count++] = (struct Allocation){pointer, bytes, 1};
     live_count++;
     return pointer;
 }
@@ -37,14 +41,36 @@ static void observed_free(void *pointer) {
     abort();
 }
 
+/* Allocate before freeing so every resize relocates. Observations refer to
+ * occurrences; neither tests nor this wrapper inspect a retired allocation. */
+static void *observed_realloc(void *pointer, size_t bytes) {
+    for (size_t cursor = allocation_count; cursor > 0; cursor--) {
+        const struct Allocation allocation = allocations[cursor - 1];
+        if (allocation.live && allocation.pointer == pointer) {
+            void *result = observed_malloc(bytes);
+            const size_t copied = allocation.bytes < bytes ? allocation.bytes : bytes;
+            memcpy(result, pointer, copied);
+            resized_bytes += copied;
+            resize_count++;
+            observed_free(pointer);
+            return result;
+        }
+    }
+    abort();
+}
+
 #define malloc observed_malloc
+#define realloc observed_realloc
 #define free observed_free
 #include "string_concat_runtime.c"
 #undef free
 #undef malloc
+#undef realloc
 
 static void assert_bytes(const struct blorp_string *text, const char *bytes, int64_t length) {
     assert(text->length == length);
+    assert(text->capacity >= (size_t)length);
+    assert(text->capacity <= blorp_string_maximum_capacity());
     assert(memcmp(text->bytes, bytes, (size_t)length) == 0);
     assert(text->bytes[length] == '\0');
     assert(atomic_load(&text->references) == 1);
@@ -58,6 +84,9 @@ static void concat_case(const char *left_bytes, int64_t left_length,
     struct blorp_string *right = blorp_string_from_bytes(right_bytes, right_length);
     const size_t result_occurrence = allocation_count;
     struct blorp_string *result = blorp_string_concat(left, right);
+    assert(left->capacity == (size_t)left_length);
+    assert(right->capacity == (size_t)right_length);
+    assert(result->capacity == (size_t)expected_length);
     assert(allocation_count == result_occurrence + 1 && live_count == 3);
     assert_bytes(left, left_bytes, left_length);
     assert_bytes(right, right_bytes, right_length);
@@ -86,7 +115,96 @@ static void concat_alias(void) {
     blorp_string_release(source);
 }
 
+static void take_left_bytes(const char *prefix, int64_t prefix_length,
+                            const char *suffix, int64_t suffix_length,
+                            const char *expected, int64_t length) {
+    struct blorp_string *left = blorp_string_from_bytes(prefix, prefix_length);
+    struct blorp_string *right = blorp_string_from_bytes(suffix, suffix_length);
+    const size_t calls = allocation_count, resizes = resize_count;
+    struct blorp_string *result = blorp_string_concat_take_left(left, right);
+    assert(resize_count == resizes + (suffix_length != 0));
+    assert(allocation_count == calls + (suffix_length != 0));
+    assert_bytes(result, expected, length);
+    assert_bytes(right, suffix, suffix_length);
+    blorp_string_release(right);
+    blorp_string_release(result);
+}
+
+static void take_left_spare_capacity(void) {
+    struct blorp_string *value = blorp_string_from_bytes("abc", 3);
+    struct blorp_string *suffix = blorp_string_from_bytes("z", 1);
+    value = blorp_string_concat_take_left(value, suffix);
+    assert(value->capacity > (size_t)value->length);
+    const size_t calls = allocation_count, resizes = resize_count;
+    const size_t current_occurrence = allocation_count - 1;
+    value = blorp_string_concat_take_left(value, suffix);
+    assert(allocation_count == calls && resize_count == resizes);
+    assert(allocations[current_occurrence].live);
+    assert_bytes(value, "abczz", 5);
+    blorp_string_release(suffix);
+    blorp_string_release(value);
+}
+
+static void take_left_shared(int same_root) {
+    struct blorp_string *source = blorp_string_from_bytes("ab", 2);
+    struct blorp_string *right = same_root ? source : blorp_string_from_bytes("z", 1);
+    blorp_string_retain(source);
+    const size_t calls = allocation_count, resizes = resize_count;
+    struct blorp_string *result = blorp_string_concat_take_left(source, right);
+    assert(allocation_count == calls + 1 && resize_count == resizes);
+    assert_bytes(source, "ab", 2); /* The transferred reference was released. */
+    assert_bytes(result, same_root ? "abab" : "abz", same_root ? 4 : 3);
+    if (!same_root) blorp_string_release(right);
+    blorp_string_release(source);
+    assert_bytes(result, same_root ? "abab" : "abz", same_root ? 4 : 3);
+    blorp_string_release(result);
+}
+
+static void take_left_geometric_growth(void) {
+    enum { APPENDS = 4096, MAX_RESIZES = 13 };
+    struct blorp_string *value = blorp_string_from_bytes("", 0);
+    struct blorp_string *suffix = blorp_string_from_bytes("x", 1);
+    for (int64_t index = 0; index < APPENDS; index++) {
+        const size_t old_capacity = value->capacity, calls = allocation_count;
+        value = blorp_string_concat_take_left(value, suffix);
+        assert(value->length == index + 1);
+        assert(value->bytes[index] == 'x' && value->bytes[index + 1] == '\0');
+        if ((size_t)index < old_capacity) assert(allocation_count == calls);
+        else assert(value->capacity == (old_capacity == 0 ? 1 : 2 * old_capacity));
+    }
+    assert(resize_count == MAX_RESIZES);
+    /* Forced relocation copies each old allocation, including fixed metadata.
+     * The geometric series of prefixes stays below twice the final length. */
+    assert(resized_bytes < 2 * APPENDS + MAX_RESIZES *
+           (sizeof(struct blorp_string) + 1 + sizeof(max_align_t)));
+    for (int64_t index = 0; index < APPENDS; index++) assert(value->bytes[index] == 'x');
+    assert(blorp_utf8_is_valid(value->bytes, (size_t)value->length));
+    blorp_string_release(suffix);
+    blorp_string_release(value);
+}
+
+static void overflow_is_rejected(void) {
+    for (int scenario = 0; scenario < 3; scenario++) {
+        const pid_t child = fork();
+        assert(child >= 0);
+        if (child == 0) {
+            if (scenario == 0) (void)blorp_string_from_bytes("", -1);
+            struct blorp_string left = {0}, right = {0};
+            atomic_init(&left.references, 1);
+            left.length = INT64_MAX;
+            right.length = 1;
+            if (scenario == 1) (void)blorp_string_concat(&left, &right);
+            else (void)blorp_string_concat_take_left(&left, &right);
+            _Exit(EXIT_FAILURE);
+        }
+        int status;
+        assert(waitpid(child, &status, 0) == child);
+        assert(WIFSIGNALED(status) && WTERMSIG(status) == SIGABRT);
+    }
+}
+
 int main(int argc, char **argv) {
+    blorp_memory_start();
     assert(argc == 2);
     const char *name = argv[1];
     if (strcmp(name, "concat_empty") == 0) concat_case("", 0, "", 0, "", 0);
@@ -97,7 +215,16 @@ int main(int argc, char **argv) {
     else if (strcmp(name, "concat_nul") == 0) concat_case("a\0b", 3, "\0z", 2, "a\0b\0z", 5);
     else if (strcmp(name, "concat_normalization") == 0) concat_case("\xc3\xa9", 2, "e\xcc\x81", 3, "\xc3\xa9" "e\xcc\x81", 5);
     else if (strcmp(name, "concat_alias") == 0) concat_alias();
+    else if (strcmp(name, "take_empty") == 0) take_left_bytes("", 0, "", 0, "", 0);
+    else if (strcmp(name, "take_left_empty") == 0) take_left_bytes("", 0, "right", 5, "right", 5);
+    else if (strcmp(name, "take_right_empty") == 0) take_left_bytes("left", 4, "", 0, "left", 4);
+    else if (strcmp(name, "take_utf8_nul") == 0) take_left_bytes("\xc3\xa9\0", 3, "\xf0\x9f\x98\x80", 4, "\xc3\xa9\0\xf0\x9f\x98\x80", 7);
+    else if (strcmp(name, "take_spare_capacity") == 0) take_left_spare_capacity();
+    else if (strcmp(name, "take_shared") == 0) take_left_shared(0);
+    else if (strcmp(name, "take_shared_alias") == 0) take_left_shared(1);
+    else if (strcmp(name, "take_geometric_growth") == 0) take_left_geometric_growth();
+    else if (strcmp(name, "overflow") == 0) overflow_is_rejected();
     else abort();
     assert(live_count == 0 && allocation_count == free_count);
-    return 0;
+    return blorp_memory_finish(0);
 }

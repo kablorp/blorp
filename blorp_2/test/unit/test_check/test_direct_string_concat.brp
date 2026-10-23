@@ -1,0 +1,199 @@
+import:
+	../../../src/check/check: check, checked_functions
+	../../../src/check/model as Checked
+	../../../src/check/callables: FunctionContract, function_contract, receiver_contract
+	../../../src/check/inference as Inference
+	../../../src/check/traits: authored_traits
+	../../../src/check/render: render_failure
+	../../../src/check/errors as Errors
+	../../../src/utils/source: module_source, root_module_id
+	../../../src/namespace/namespace: build_namespace
+	../../../src/utils/syntax: Purity(Pure), ParsedBody(ParsedValueBody), ExpressionBase(DirectApplication), CallNotation(DirectCall, ReceiverCall), same_span
+	../input: accepted_signatures
+	../../../src/namespace/builtins as Builtins
+	../../../src/utils/ids: function_number
+	../module_input: parse_modules
+	../direct_string_concat_inputs:
+		CONCAT_DECLARATION, DIRECT_CONCAT, RECEIVER_CONCAT,
+		WRAPPED_CONCAT, NAMED_CONCAT, STORED_CONCAT
+	result: to_option
+	test: TestSuite
+
+
+private pure func returned_form(source: String, position: Int) -> Option[Checked.CheckedForm]:
+	parsed ?= parse_modules([{ source = CONCAT_DECLARATION + source, targets = [] }]).to_option()
+	program ?= check(parsed).to_option()
+	function ?= checked_functions(program).functions.get(position)
+	match function.body:
+		Checked.CheckedValueBody(Checked.ReturnExpression(value)): Some(value.form)
+		_: None
+
+
+private pure func direct_concat(source: String) -> Bool:
+	match returned_form(source, 1):
+		Some(Checked.InvokeFunction(call)):
+			match (call.target, call.operands):
+				(Checked.RuntimeFunction(Builtins.StringConcat), [Checked.ValueOperand(left), Checked.ValueOperand(right)]):
+					match (left.form, right.form):
+						(Checked.ReadBinding(left_id), Checked.ReadBinding(right_id)):
+							Checked.binding_number(left_id) == 0 and Checked.binding_number(right_id) == 1
+						_: False
+				_: False
+		_: False
+
+
+pure func test_user_wrapper_remains_a_declared_call() -> Bool:
+	match returned_form(WRAPPED_CONCAT, 2):
+		Some(Checked.InvokeFunction(call)):
+			match (call.target, call.operands):
+				(Checked.UserFunction(id, []), [Checked.ValueOperand(_), Checked.ValueOperand(_)]): function_number(id) == 1
+				_: False
+		_: False
+
+
+pure func test_named_builtin_callable_retains_its_declaration() -> Bool:
+	match returned_form(NAMED_CONCAT, 2):
+		Some(Checked.InvokeFunction(call)):
+			match (call.target, call.operands):
+				(Checked.UserFunction(id, []), [Checked.CallableOperand(_, Checked.NamedCallable(builtin_id, []), _), Checked.ValueOperand(_), Checked.ValueOperand(_)]):
+					function_number(id) == 1 and function_number(builtin_id) == 0
+				_: False
+		_: False
+
+
+pure func test_stored_builtin_callable_retains_its_declaration() -> Bool:
+	match returned_form(STORED_CONCAT, 1):
+		Some(Checked.MakeCallable(Checked.NamedCallable(builtin_id, []))): function_number(builtin_id) == 0
+		_: False
+
+
+-- Exercise the admission and publication boundaries without checking a body.
+private pure func concat_contract(receiver: Bool) -> Option[FunctionContract]:
+	parsed ?= parse_modules([{ source = CONCAT_DECLARATION + DIRECT_CONCAT, targets = [] }]).to_option()
+	namespace ?= build_namespace(parsed).to_option()
+	signatures ?= accepted_signatures(parsed, namespace).to_option()
+	callee ?= signatures.functions.get(0)
+	caller ?= signatures.functions.get(1)
+	match caller.declaration.body:
+		ParsedValueBody(value):
+			match value.base:
+				DirectApplication(name, arguments):
+					active = { body = Checked.DeclaredBody(caller.id), purity = Pure }
+					if receiver:
+						receiver_contract(active, name, arguments.drop(1), callee.id, signatures.functions).to_option()
+					else:
+						function_contract(active, name, arguments, callee.id, signatures.functions).to_option()
+				_: None
+		_: None
+
+
+private pure func contract_has_runtime_target(receiver: Bool) -> Bool:
+	match concat_contract(receiver):
+		Some(contract):
+			match contract.target:
+				Checked.RuntimeTarget(Builtins.StringConcat):
+					contract.signature.type_parameters.is_empty() and contract.signature.requirements.is_empty()
+				_: False
+		None: False
+
+
+private pure func rejected_concat_contract(receiver: Bool) -> Option[Errors.CheckError]:
+	parsed ?= parse_modules([{ source = CONCAT_DECLARATION + DIRECT_CONCAT, targets = [] }]).to_option()
+	namespace ?= build_namespace(parsed).to_option()
+	signatures ?= accepted_signatures(parsed, namespace).to_option()
+	callee ?= signatures.functions.get(0)
+	caller ?= signatures.functions.get(1)
+	active = { body = Checked.DeclaredBody(caller.id), purity = Pure }
+	admission = if receiver:
+		receiver_contract(active, callee.declaration.function_name, [], callee.id, signatures.functions)
+	else:
+		function_contract(active, callee.declaration.function_name, [], callee.id, signatures.functions)
+	match admission:
+		Err(error): Some(error)
+		Ok(_): None
+
+
+private pure func arity_keeps_declared_identity(receiver: Bool) -> Bool:
+	match rejected_concat_contract(receiver):
+		Some(error):
+			match error.kind:
+				Errors.CallRejection(Errors.ArgumentCountMismatch(mismatch)):
+					match (mismatch.target, mismatch.notation):
+						(Checked.DeclaredTarget(id), notation):
+							expected_actual = if receiver:
+								1
+							else:
+								0
+							expected_notation = if receiver:
+								ReceiverCall
+							else:
+								DirectCall
+							(function_number(id) == 0 and mismatch.expected == 2 and mismatch.actual == expected_actual
+								and notation == expected_notation
+								and same_span(error.span, { source = module_source(root_module_id()), start = "pure func ".length(), end = "pure func concatenate".length() }))
+						_: False
+				_: False
+		None: False
+
+
+private pure func published_concat() -> Option[Checked.CheckedCall]:
+	contract ?= concat_contract(False)
+	pending ?= Inference.static_pending_call(contract, 0).to_option()
+	left = Checked.ValueOperand({ form = Checked.LiteralString("left"), value_type = Checked.StringType, span = contract.span })
+	right = Checked.ValueOperand({ form = Checked.LiteralString("right"), value_type = Checked.StringType, span = contract.span })
+	traits = authored_traits({ declarations = [], implementations = [], canonical = None })
+	Inference.publish_pending_call(pending, [left, right], [], traits, []).to_option()
+
+
+pure func test_pending_runtime_call_publishes_operation_and_value_operands() -> Bool:
+	match published_concat():
+		Some(call):
+			match (call.target, call.operands):
+				(Checked.RuntimeFunction(Builtins.StringConcat), [Checked.ValueOperand(left), Checked.ValueOperand(right)]):
+					match (left.form, right.form):
+						(Checked.LiteralString("left"), Checked.LiteralString("right")): True
+						_: False
+				_: False
+		None: False
+
+
+pure func test_invalid_builtin_call_keeps_declared_arity_diagnostic() -> Bool:
+	suffix: String =
+		|func main() -> Int:
+		|    unused = concatenate("left")
+		|    0
+		|
+	source = CONCAT_DECLARATION + suffix
+	match parse_modules([{ source = source, targets = [] }]):
+		Err(_): False
+		Ok(parsed):
+			match check(parsed):
+				Ok(_): False
+				Err(failure):
+					diagnostics = render_failure(failure)
+					start = source.index_of("concatenate(\"left\")").get_or(-1)
+					diagnostic = diagnostics.first
+					(
+						diagnostics.remaining.is_empty() and diagnostic.note.is_none()
+						and diagnostic.message == "argument count does not match the function parameters"
+						and diagnostic.help == "pass one expression for each declared parameter; UFCS supplies the receiver first"
+						and diagnostic.span.start == start and diagnostic.span.end == start + "concatenate".length()
+					)
+
+
+tests: TestSuite = {
+	description = "Blorp 2 direct String concat publication",
+	tests = [
+		("invalid direct contract preserves declared diagnostic identity", pure func(): arity_keeps_declared_identity(False)),
+		("invalid receiver contract preserves declared diagnostic identity", pure func(): arity_keeps_declared_identity(True)),
+		("direct contract selects accepted builtin operation", pure func(): contract_has_runtime_target(False)),
+		("receiver contract selects accepted builtin operation", pure func(): contract_has_runtime_target(True)),
+		("pending runtime call publishes operation and ordered values", test_pending_runtime_call_publishes_operation_and_value_operands),
+		("invalid builtin call preserves arity diagnostic", test_invalid_builtin_call_keeps_declared_arity_diagnostic),
+		("direct declared builtin publishes runtime target", pure func(): direct_concat(DIRECT_CONCAT)),
+		("UFCS declared builtin publishes runtime target and ordered values", pure func(): direct_concat(RECEIVER_CONCAT)),
+		("ordinary user wrapper retains declared target", test_user_wrapper_remains_a_declared_call),
+		("named builtin callable retains declared target", test_named_builtin_callable_retains_its_declaration),
+		("stored builtin callable retains declared target", test_stored_builtin_callable_retains_its_declaration),
+	]
+}

@@ -1865,8 +1865,18 @@ Semantic rules:
   are admitted before an ordinary terminating match. Each selected arm discharges
   prefix obligations after securing its result. Literal construction creates a
   fresh ordinary String owner. A join's arms follow the same rules and move a
-  managed result into the join, which owns it afterwards. COW and managed
-  annotated loops are deferred.
+  managed result into the join, which owns it afterwards. Direct String `add`
+  calls and interpolation may instead transfer a last-used owner into
+  concatenation. The verifier checks that transfer independently; ordinary
+  function parameters still borrow. String buffers carry byte length and
+  capacity: a transferred unique buffer appends in place when capacity suffices
+  and otherwise grows geometrically. Shared buffers copy, preserving value
+  semantics. Concat-only accumulation can transfer a nearest-loop-owned String
+  in a terminal arm; captured outer owners and continuing joins stay borrowed.
+  `append_int` still uses its ordinary borrowed wrapper and a temporary decimal
+  String, so this increment does not remove its growing-prefix copies.
+  [Buffer-reuse measurements](../benchmarks/results/blorp2-string-buffer-reuse-2026-10-23.md)
+  record allocation/instruction results and the validation boundary.
 - Union-only recursive layouts, generic self-reinstantiation,
   guards, Char patterns, constructor UFCS,
   and function
@@ -2713,7 +2723,11 @@ diagnostic rendering are pure. The pipeline publishes these complete results:
    parent value of a projected field. Every managed stored occurrence acquires
    a fresh child obligation, even when two slots contain the same value; construction
    transfers those obligations sequentially. Last-use cleanup keeps an argument alive
-   until a call has established its result owner. Tail-match
+   until a call has established its result owner. A consuming String concat
+   argument instead transfers its obligation into the call; its result receives
+   a distinct owner identity even when storage is reused. That transferred
+   obligation is not also dropped. Loop edges retain their acquire-before-retire
+   batches, including repeated outgoing values. Tail-match
    arms publish the same ownership operations and typed return transfers as a
    straight-line block. Value and owner identities remain function-wide; sibling
    arms cannot observe each other's values or obligations.

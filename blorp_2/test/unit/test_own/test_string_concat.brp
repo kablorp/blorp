@@ -8,7 +8,9 @@ import:
 	../../../src/own/own as Own
 	../../../src/specialize/specialize as Concrete
 	../../../src/utils/syntax: Purity(Pure)
-	../ownership_inputs: InputIds, function, input_ids, integer, parameter, runtime
+	../ownership_inputs: InputIds, function, input_ids, integer, parameter, runtime, span
+	../../../src/verify/verify: verify
+	../source_while_inputs as LoopInput
 	test: TestSuite
 
 
@@ -80,7 +82,7 @@ pure func test_append_int_releases_formatted_digits_and_transfers_fresh_result()
 		Err(_): False
 		Ok(program):
 			match program.functions:
-				[_, wrapper, _, _]:
+				[_, wrapper, ..._]:
 					match (wrapper.operations, wrapper.result):
 						([Own.DefineValue(prefix), Own.DefineValue(number),
 							Own.DefineValue(digits), Own.DefineValue(result), Own.DropOwner(dropped, _)],
@@ -104,9 +106,227 @@ pure func test_append_int_releases_formatted_digits_and_transfers_fresh_result()
 				_: False
 
 
+pure func test_local_last_use_transfers_input_without_a_drop() -> Bool:
+	match input_ids():
+		Err(_): False
+		Ok(ids):
+			definitions = [
+				{ id = ids.first, value_type = Concrete.StringType,
+					operation = Lower.StringValue("prefix"), span = span(10) },
+				{ id = ids.second, value_type = Concrete.StringType,
+					operation = Lower.StringValue("suffix"), span = span(20) },
+				runtime(ids.third, Builtins.StringConcat, [ids.first, ids.second], Concrete.StringType, 30),
+			]
+			match Own.insert_function(function(definitions, ids.third, [], Concrete.StringType), [], []):
+				Err(_): False
+				Ok(owned):
+					match owned.operations:
+						[Own.DefineValue(_), Own.DefineValue(_), Own.DefineValue(call), Own.DropOwner(owner, _)]:
+							match call.operation:
+								Own.CallDefinition(_, [Own.ConsumedArgument(value, transferred), Own.BorrowedArgument(_)]):
+									(Own.owner_number(owner) == 1 and Own.owner_number(transferred) == 0
+										and Lower.value_number(value) == Lower.value_number(ids.first))
+								_: False
+						_: False
+
+
+private pure func consumed_count(operations: List[Own.OwnershipOperation]) -> Int:
+	var count = 0
+	for operation in operations:
+		match operation:
+			Own.DefineValue(definition):
+				match definition.operation:
+					Own.CallDefinition(_, [Own.ConsumedArgument(_, _), _]): count = count + 1
+					_: void
+			_: void
+	count
+
+
+pure func test_self_concat_keeps_the_original_obligation_borrowed() -> Bool:
+	match input_ids():
+		Err(_): False
+		Ok(ids):
+			definitions = [
+				{ id = ids.first, value_type = Concrete.StringType, operation = Lower.StringValue("same"), span = span(10) },
+				runtime(ids.second, Builtins.StringConcat, [ids.first, ids.first], Concrete.StringType, 30),
+			]
+			match Own.insert_function(function(definitions, ids.second, [], Concrete.StringType), [], []):
+				Err(_): False
+				Ok(owned): consumed_count(owned.operations) == 0
+
+
+pure func test_later_old_value_read_prevents_consumption() -> Bool:
+	match input_ids():
+		Err(_): False
+		Ok(ids):
+			definitions = [
+				{ id = ids.first, value_type = Concrete.StringType, operation = Lower.StringValue("old"), span = span(10) },
+				{ id = ids.second, value_type = Concrete.StringType, operation = Lower.StringValue("suffix"), span = span(20) },
+				runtime(ids.third, Builtins.StringConcat, [ids.first, ids.second], Concrete.StringType, 30),
+				runtime(ids.fourth, Builtins.StringLength, [ids.first], Concrete.IntType, 40),
+			]
+			match Own.insert_function(function(definitions, ids.fourth, [], Concrete.IntType), [], []):
+				Err(_): False
+				Ok(owned): consumed_count(owned.operations) == 0
+
+
+private pure func fresh_edge_without_old_drop(
+	operations: List[Own.OwnershipOperation], definition: Own.OwnedDefinition, owner: Own.OwnerId,
+) -> Bool:
+	var old_drops = 0
+	var acquired_result = 0
+	for after in operations:
+		match after:
+			Own.DropOwner(dropped, _):
+				if Own.owner_number(dropped) == Own.owner_number(owner):
+					old_drops = old_drops + 1
+			Own.AcquireOwner(_, borrow, _):
+				if Lower.value_number(borrow.value) == Lower.value_number(definition.id):
+					acquired_result = acquired_result + 1
+			_: void
+	old_drops == 0 and acquired_result == 1
+
+
+pure func test_loop_consumes_carried_prefix_and_keeps_fresh_edge_acquisition() -> Bool:
+	source: String =
+		|pure func concatenate(left: String, right: String) -> String:
+		|    builtin("string.add")
+		|pure func length(text: String) -> Int:
+		|    builtin("string.length")
+		|pure func less_than(left: Int, right: Int) -> Bool:
+		|    builtin("int.less_than")
+		|pure func run() -> String:
+		|    var output = ""
+		|    while less_than(length(output), 3):
+		|        output = concatenate(output, "x")
+		|    output
+		|func main() -> Int:
+		|    output = run()
+		|    0
+		|
+	match LoopInput.lowered(source).and_then(Own.own):
+		Err(_): False
+		Ok(program):
+			var consuming = 0
+			var valid_transfers = True
+			for function in program.functions:
+				for operation in function.operations:
+					match operation:
+						Own.ExecuteLoop(loop):
+							match loop.body.tail:
+								Own.MatchLoop(matched):
+									for arm in matched.arms:
+										consuming = consuming + consumed_count(arm.body.operations)
+										for nested in arm.body.operations:
+											match nested:
+												Own.DefineValue(definition):
+													match definition.operation:
+														Own.CallDefinition(_, [Own.ConsumedArgument(_, owner), _]):
+															valid_transfers = valid_transfers and fresh_edge_without_old_drop(arm.body.operations, definition, owner)
+														_: void
+												_: void
+								_: void
+						_: void
+			consuming == 1 and valid_transfers and verify(program).is_ok()
+
+
+private pure func loop_consuming_count(program: Own.OwnershipProgram) -> Int:
+	var count = 0
+	for function in program.functions:
+		for operation in function.operations:
+			match operation:
+				Own.ExecuteLoop(loop):
+					match loop.body.tail:
+						Own.MatchLoop(matched):
+							for arm in matched.arms:
+								count = count + consumed_count(arm.body.operations)
+						_: void
+				_: void
+	count
+
+
+pure func test_loop_preserves_captured_pre_loop_owner() -> Bool:
+	match LoopInput.lowered(LoopInput.MANAGED_OWNER).and_then(Own.own):
+		Err(_): False
+		Ok(program): loop_consuming_count(program) == 0 and verify(program).is_ok()
+
+
+pure func test_old_header_outgoing_occurrence_prevents_consumption() -> Bool:
+	source: String =
+		|pure func concatenate(left: String, right: String) -> String:
+		|    builtin("string.add")
+		|pure func run() -> String:
+		|    var output = ""
+		|    var retained = ""
+		|    var retained_twice = ""
+		|    var again: Bool = True
+		|    while again:
+		|        retained = output
+		|        retained_twice = output
+		|        output = concatenate(output, "x")
+		|        again = False
+		|    concatenate(retained, retained_twice)
+		|func main() -> Int:
+		|    unused = run()
+		|    0
+		|
+	match LoopInput.lowered(source).and_then(Own.own):
+		Err(_): False
+		Ok(program): loop_consuming_count(program) == 0 and verify(program).is_ok()
+
+
+pure func test_nested_later_header_read_prevents_consumption() -> Bool:
+	source: String =
+		|pure func concatenate(left: String, right: String) -> String:
+		|    builtin("string.add")
+		|pure func length(text: String) -> Int:
+		|    builtin("string.length")
+		|pure func run() -> String:
+		|    var output = ""
+		|    var again: Bool = True
+		|    while again:
+		|        previous = output
+		|        output = concatenate(output, "x")
+		|        if True:
+		|            observed = length(previous)
+		|        again = False
+		|    output
+		|func main() -> Int:
+		|    unused = run()
+		|    0
+		|
+	match LoopInput.lowered(source).and_then(Own.own):
+		Err(_): False
+		Ok(program): loop_consuming_count(program) == 0 and verify(program).is_ok()
+
+
+pure func test_unused_managed_result_in_yielding_arm_retires_at_its_definition() -> Bool:
+	source: String =
+		|pure func concatenate(left: String, right: String) -> String:
+		|    builtin("string.add")
+		|func main() -> Int:
+		|    flag: Bool = True
+		|    selected = if flag:
+		|        unused = concatenate("left", "right")
+		|        1
+		|    else:
+		|        0
+		|    selected
+		|
+	LoopInput.lowered(source).and_then(Own.own).and_then(verify).is_ok()
+
+
 tests: TestSuite = {
 	description = "Blorp 2 String concat contract and ownership insertion",
 	tests = [
+		("unused managed result in yielding arm retires immediately", test_unused_managed_result_in_yielding_arm_retires_at_its_definition),
+		("captured pre-loop owner stays borrowed", test_loop_preserves_captured_pre_loop_owner),
+		("duplicate old header outgoing occurrences prevent consumption", test_old_header_outgoing_occurrence_prevents_consumption),
+		("nested later header read prevents consumption", test_nested_later_header_read_prevents_consumption),
+		("self concat preserves borrowed inputs", test_self_concat_keeps_the_original_obligation_borrowed),
+		("later old-value read prevents consumption", test_later_old_value_read_prevents_consumption),
+		("loop consumes carried prefix and acquires fresh edge", test_loop_consumes_carried_prefix_and_keeps_fresh_edge_acquisition),
+		("local last use transfers without a drop", test_local_last_use_transfers_input_without_a_drop),
 		("append_int releases digits and transfers fresh result", test_append_int_releases_formatted_digits_and_transfers_fresh_result),
 		("contract is Pure String String to String", test_concat_contract_is_pure_two_strings_to_string),
 		("aliased inputs borrow and fresh result transfers", test_concat_borrows_aliased_inputs_and_transfers_its_fresh_owner),

@@ -14,7 +14,7 @@ import:
 	../own/own:
 		BorrowSource(ParameterBorrow, OwnerBorrow, PayloadBorrow),
 		BorrowedValue,
-		OwnedArgument(UnmanagedArgument, BorrowedArgument),
+		OwnedArgument(UnmanagedArgument, BorrowedArgument, ConsumedArgument),
 		OwnedDefinition,
 		OwnedLoop,
 		OwnedLoopExit(Break, Recur),
@@ -340,6 +340,8 @@ private pure func argument_value(argument: OwnedArgument) -> ValueId:
 	match argument:
 		UnmanagedArgument(id):
 			id
+		ConsumedArgument(id, _):
+			id
 		BorrowedArgument(borrow):
 			borrow.value
 
@@ -542,6 +544,8 @@ private pure func verify_argument(
 	id = match argument:
 		UnmanagedArgument(id):
 			id
+		ConsumedArgument(id, _):
+			id
 		BorrowedArgument(borrow):
 			borrow.value
 
@@ -551,6 +555,7 @@ private pure func verify_argument(
 		Err(verification_error(span, "call argument type does not match its contract"))
 	else:
 		match argument:
+			ConsumedArgument(_, _): Err(verification_error(span, "consumed argument requires the first String concat operand"))
 			UnmanagedArgument(_):
 				match value_needs_ownership(expected, unions, records):
 					Ok(needs_owner):
@@ -568,6 +573,18 @@ private pure func verify_argument(
 					Err(error): Err(error)
 			BorrowedArgument(borrow):
 				verify_borrow(borrow, state, span, discharged, owners)
+
+
+-- Borrow validation uses the complete pre-call state; only this typed target
+-- and position may subsequently transfer the obligation.
+private pure func concat_borrows(target: CallTarget, arguments: List[OwnedArgument]) -> List[OwnedArgument]:
+	match target:
+		RuntimeFunction(Builtins.StringConcat):
+			match arguments:
+				[ConsumedArgument(value, owner), right]:
+					[BorrowedArgument({ value = value, source = OwnerBorrow(owner) }), right]
+				_: arguments
+		_: arguments
 
 
 private pure func verify_arguments(
@@ -1255,10 +1272,11 @@ private pure func operation_value(
 											definition_value(definition, result, None, None)
 								_: Err(verification_error(definition.span, "indirect call requires a callable value"))
 		CallDefinition(target, arguments):
+			borrows = concat_borrows(target, arguments)
 			match call_signature(target, definition.span, functions, unions, records):
 				Ok(contract):
 					match verify_arguments(
-						arguments,
+						borrows,
 						contract.parameters,
 						state,
 						unions,
@@ -1362,6 +1380,25 @@ private pure func discharge_payloads(
 	match failure_slot:
 		Some(error): Err(error)
 		None: Ok({ discharged = enclosing, owners = local })
+
+
+-- Revalidate the other operand after discharging, so projection ancestry and
+-- direct same-owner borrows cannot survive a consuming call. Distinct counted
+-- owners remain valid even when they reference the same runtime allocation.
+private pure func discharge_concat(
+	arguments: List[OwnedArgument], state: VerificationFacts,
+	discharged: List[Bool], owners: List[OwnerState],
+	unions: List[ConcreteUnion], records: List[ConcreteRecord], span: Span,
+) -> Result[DischargedOwners, Diagnostic]:
+	match arguments:
+		[ConsumedArgument(value, owner), right]:
+			match discharge_payloads([OwnedPayload(value, owner)], state, discharged, owners, unions, records, span):
+				Err(error): Err(error)
+				Ok(moved):
+					match verify_argument(right, StringType, state, unions, span, records, moved.discharged, moved.owners):
+						Err(error): Err(error)
+						Ok(_): Ok(moved)
+		_: Ok({ discharged = discharged, owners = owners })
 
 
 private pure func stored_payload_transfer(
@@ -1487,6 +1524,8 @@ private pure func verify_definition_result(
 					parent = match argument:
 						UnmanagedArgument(value):
 							value
+						ConsumedArgument(value, _):
+							value
 						BorrowedArgument(borrow):
 							borrow.value
 
@@ -1530,6 +1569,7 @@ private pure func verify_match_argument(
 	owners: List[OwnerState],
 ) -> Result[Void, Diagnostic]:
 	match argument:
+		ConsumedArgument(_, _): Err(verification_error(span, "match or projection cannot consume a call argument"))
 		BorrowedArgument(borrow):
 			verify_borrow(borrow, state, span, discharged, owners)
 		UnmanagedArgument(id):
@@ -1610,7 +1650,7 @@ private pure func verified_projection_parent(
 								Ok(_):
 									borrow: Option[BorrowedValue] = match parent_argument:
 										BorrowedArgument(parent): Some(parent)
-										UnmanagedArgument(_): None
+										UnmanagedArgument(_) | ConsumedArgument(_, _): None
 									Ok({ place = place, borrow = borrow })
 
 
@@ -1634,7 +1674,7 @@ private pure func record_projection_value(
 		NoProjection:
 			parent: Option[BorrowedValue] = match argument:
 				BorrowedArgument(borrow): Some(borrow)
-				UnmanagedArgument(_): None
+				UnmanagedArgument(_) | ConsumedArgument(_, _): None
 			definition_value(definition, expected, parent, None)
 		SelectionProjection(_, _):
 			match verified_projection_parent(source, state, projection, unions, records, definition.span, discharged, owners):
@@ -1926,6 +1966,13 @@ private pure func verify_operations(
 						Err(error)
 					Ok(candidate):
 						stored: Result[Void, Diagnostic] = match definition.operation:
+							CallDefinition(_, arguments):
+								match discharge_concat(arguments, state, discharged, owners, unions, records, definition.span):
+									Err(error): Err(error)
+									Ok(moved):
+										discharged = moved.discharged
+										owners = moved.owners
+										Ok(void)
 							ConstructListDefinition(payloads):
 								match discharge_payloads(payloads, state, discharged, owners, unions, records, definition.span):
 									Err(error): Err(error)

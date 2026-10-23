@@ -8,13 +8,21 @@ import:
 	test: TestSuite, run_suite_result
 
 
-private func native_case(executable: String, name: String) -> Bool:
-	match run("/usr/bin/env", ["-u", "BLORP_LEAK_CHECK", "-u", "BLORP_MEMORY_STATS", executable, name]):
+private func native_case(executable: String, name: String, diagnostics: Bool) -> Bool:
+	arguments = if diagnostics:
+		["-u", "BLORP_MEMORY_STATS", "BLORP_LEAK_CHECK=strict", executable, name]
+	else:
+		["-u", "BLORP_LEAK_CHECK", "-u", "BLORP_MEMORY_STATS", executable, name]
+	match run("/usr/bin/env", arguments):
 		Err(error):
 			print_error(error)
 			False
 		Ok(output):
-			if output.exit_code() == 0 and output.stdout() == "" and output.stderr() == "":
+			stderr_valid = if diagnostics:
+				output.stderr().starts_with("blorp: leak check: ") and output.stderr().ends_with("0 leaked, 0 bytes\n")
+			else:
+				output.stderr() == ""
+			if output.exit_code() == 0 and output.stdout() == "" and stderr_valid:
 				True
 			else:
 				print_error(name + ": " + output.stderr())
@@ -27,8 +35,10 @@ private func native_checks(directory: String) -> Result[Bool, String]:
 	test_written ?= write_file(directory + "/string_concat_test.c", fixture)
 	executable = directory + "/string_concat_test"
 	compiled ?= run(getenv("BLORP_CC").get_or("clang"), ["-std=c11", "-O0", "-Wall", "-Wextra", "-Werror", "-pedantic", "-fsanitize=address,undefined", "-fno-sanitize-recover=all", directory + "/string_concat_test.c", "-o", executable])
-	if compiled.exit_code() != 0 or compiled.stdout() != "" or compiled.stderr() != "":
-		Err("String concat native build failed: " + compiled.stderr())
+	diagnostic_executable = executable + "_diagnostics"
+	diagnostic_compiled ?= run(getenv("BLORP_CC").get_or("clang"), ["-std=c11", "-O0", "-Wall", "-Wextra", "-Werror", "-pedantic", "-fsanitize=address,undefined", "-fno-sanitize-recover=all", "-DBLORP_MEMORY_DIAGNOSTICS=1", directory + "/string_concat_test.c", "-o", diagnostic_executable])
+	if compiled.exit_code() != 0 or compiled.stdout() != "" or compiled.stderr() != "" or diagnostic_compiled.exit_code() != 0 or diagnostic_compiled.stdout() != "" or diagnostic_compiled.stderr() != "":
+		Err("String concat native build failed: " + compiled.stderr() + diagnostic_compiled.stderr())
 	else:
 		cases = [
 			("empty operands create one fresh owner", "concat_empty"),
@@ -39,10 +49,20 @@ private func native_checks(directory: String) -> Result[Bool, String]:
 			("concatenation preserves embedded NUL and following bytes", "concat_nul"),
 			("concatenation preserves distinct normalization forms", "concat_normalization"),
 			("aliasing operands borrow one source obligation", "concat_alias"),
+			("consuming empty operands keeps exact bytes", "take_empty"),
+			("consuming empty prefix grows through relocation", "take_left_empty"),
+			("consuming empty suffix needs no allocation", "take_right_empty"),
+			("consuming concat preserves UTF-8 and embedded NUL", "take_utf8_nul"),
+			("unique spare capacity needs zero allocation or resize", "take_spare_capacity"),
+			("shared prefix is preserved and one reference discharged", "take_shared"),
+			("distinct counted owners may alias the same root", "take_shared_alias"),
+			("geometric growth relocates with bounded total copying", "take_geometric_growth"),
+			("unrepresentable lengths abort before accessing bytes", "overflow"),
 		]
 		suite: TestSuite = {
 			description = "Counted String concat lifetimes and bytes",
-			tests = cases.map(func(item): (item[0], func(): native_case(executable, item[1])))
+			tests = cases.map(func(item): (item[0], func(): native_case(executable, item[1], False)))
+				.concat(cases.map(func(item): (item[0] + " with strict leak checks", func(): native_case(diagnostic_executable, item[1], True))))
 		}
 		result = run_suite_result(suite)
 		Ok(result[1] == 0)

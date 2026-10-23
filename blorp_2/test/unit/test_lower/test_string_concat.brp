@@ -6,15 +6,18 @@ import:
 	../../../src/utils/source: module_source, root_module_id, same_source
 	../input: setup_diagnostic
 	../module_input: parse_modules
-	../string_concat_inputs: CONCAT_SOURCE, APPEND_INT_CALLER, APPEND_INT_METHOD
+	../string_concat_inputs: APPEND_INT_CALLER, APPEND_INT_METHOD
+	../direct_string_concat_inputs: CONCAT_DECLARATION, DIRECT_CONCAT, RECEIVER_CONCAT, WRAPPED_CONCAT, NAMED_CONCAT, STORED_CONCAT
+	result: to_option
 	test: TestSuite
 
 
-pure func test_concat_lowering_preserves_operands_span_and_result() -> Bool:
+private pure func concat_lowering_preserves_operands_span_and_result(suffix: String, anchor: String) -> Bool:
+	source = CONCAT_DECLARATION + suffix
 	expected_source = module_source(root_module_id())
-	expected_start = "pure func concatenate(left: String, right: String) -> String:\n    builtin(".length()
-	expected_end = expected_start + "\"string.add\"".length()
-	match parse_modules([{ source = CONCAT_SOURCE, targets = [] }])
+	expected_start = source.index_of(anchor).get_or(-1)
+	expected_end = expected_start + "concatenate".length()
+	match parse_modules([{ source = source, targets = [] }])
 		.and_then(pure func(parsed): check(parsed).map_err(setup_diagnostic))
 		.and_then(Concrete.specialize).and_then(Lower.lower):
 		Err(_): False
@@ -50,7 +53,7 @@ pure func test_append_int_formats_then_concatenates_in_argument_order() -> Bool:
 		Err(_): False
 		Ok(program):
 			match Lower.lowered_functions(program).functions:
-				[_, wrapper, format, concat]:
+				[_, wrapper, format]:
 					match (wrapper.steps, wrapper.result):
 						([
 							Lower.Define(prefix), Lower.Define(number),
@@ -58,26 +61,21 @@ pure func test_append_int_formats_then_concatenates_in_argument_order() -> Bool:
 						], returned):
 							match (prefix.operation, number.operation, digits.operation, result.operation):
 								(Lower.ParameterValue(0), Lower.ParameterValue(1),
-									Lower.CallValue(format_call, [format_argument]),
-									Lower.CallValue(concat_call, [left, right])):
-									match (format_call, concat_call, format.steps, concat.steps):
-										(Concrete.UserFunction(format_id), Concrete.UserFunction(concat_id),
-											[Lower.Define(_), Lower.Define(conversion)],
-											[Lower.Define(_), Lower.Define(_), Lower.Define(addition)]):
-											match (conversion.operation, addition.operation):
-												(Lower.CallValue(convert, [_]), Lower.CallValue(add, [_, _])):
-													match (convert, add):
-														(Concrete.RuntimeFunction(Builtins.IntToString), Concrete.RuntimeFunction(Builtins.StringConcat)):
-															(Concrete.function_number(format_id) == 2 and Concrete.function_number(concat_id) == 3
-																and Concrete.same_type(prefix.value_type, Concrete.StringType)
-																and Concrete.same_type(number.value_type, Concrete.IntType)
-																and Concrete.same_type(digits.value_type, Concrete.StringType)
-																and Concrete.same_type(result.value_type, Concrete.StringType)
-																and Lower.value_number(format_argument) == Lower.value_number(number.id)
-																and Lower.value_number(left) == Lower.value_number(prefix.id)
-																and Lower.value_number(right) == Lower.value_number(digits.id)
-																and Lower.value_number(returned) == Lower.value_number(result.id))
-														_: False
+									Lower.CallValue(Concrete.UserFunction(format_id), [format_argument]),
+									Lower.CallValue(Concrete.RuntimeFunction(Builtins.StringConcat), [left, right])):
+									match format.steps:
+										[Lower.Define(_), Lower.Define(conversion)]:
+											match conversion.operation:
+												Lower.CallValue(Concrete.RuntimeFunction(Builtins.IntToString), [_]):
+													(Concrete.function_number(format_id) == 2
+														and Concrete.same_type(prefix.value_type, Concrete.StringType)
+														and Concrete.same_type(number.value_type, Concrete.IntType)
+														and Concrete.same_type(digits.value_type, Concrete.StringType)
+														and Concrete.same_type(result.value_type, Concrete.StringType)
+														and Lower.value_number(format_argument) == Lower.value_number(number.id)
+														and Lower.value_number(left) == Lower.value_number(prefix.id)
+														and Lower.value_number(right) == Lower.value_number(digits.id)
+														and Lower.value_number(returned) == Lower.value_number(result.id))
 												_: False
 										_: False
 								_: False
@@ -85,10 +83,87 @@ pure func test_append_int_formats_then_concatenates_in_argument_order() -> Bool:
 				_: False
 
 
+private pure func lowered_concat(suffix: String) -> Option[Lower.LoweredFunctions]:
+	parsed ?= parse_modules([{ source = CONCAT_DECLARATION + suffix, targets = [] }]).to_option()
+	checked ?= check(parsed).to_option()
+	concrete ?= Concrete.specialize(checked).to_option()
+	program ?= Lower.lower(concrete).to_option()
+	Some(Lower.lowered_functions(program))
+
+
+private pure func concat_body(function: Lower.LoweredFunction) -> Bool:
+	match (function.signature.parameters, function.steps):
+		([Concrete.StringType, Concrete.StringType], [Lower.Define(left), Lower.Define(right), Lower.Define(result)]):
+			match (left.operation, right.operation, result.operation):
+				(Lower.ParameterValue(0), Lower.ParameterValue(1), Lower.CallValue(Concrete.RuntimeFunction(Builtins.StringConcat), [_, _])): True
+				_: False
+		_: False
+
+
+pure func test_user_wrapper_call_remains_in_lowered_program() -> Bool:
+	match lowered_concat(WRAPPED_CONCAT):
+		Some(program):
+			match program.functions:
+				[_, caller, wrapper]:
+					match caller.steps:
+						[Lower.Define(_), Lower.Define(_), Lower.Define(result)]:
+							match result.operation:
+								Lower.CallValue(Concrete.UserFunction(id), [_, _]):
+									Concrete.function_number(id) == 2 and concat_body(wrapper)
+								_: False
+						_: False
+				_: False
+		None: False
+
+
+pure func test_named_builtin_callable_retains_reachable_wrapper() -> Bool:
+	match lowered_concat(NAMED_CONCAT):
+		Some(program):
+			match program.functions:
+				[_, _, wrapper, apply]:
+					match apply.steps:
+						[Lower.Define(_), Lower.Define(_), Lower.Define(result)]:
+							match result.operation:
+								Lower.CallValue(Concrete.UserFunction(id), [_, _]):
+									Concrete.function_number(id) == 2 and concat_body(wrapper)
+								_: False
+						_: False
+				_: False
+		None: False
+
+
+pure func test_stored_builtin_callable_retains_reachable_wrapper() -> Bool:
+	match lowered_concat(STORED_CONCAT):
+		Some(program):
+			match program.functions:
+				[main, stored, wrapper]:
+					match stored.steps:
+						[Lower.Define(value)]:
+							match value.operation:
+								Lower.FreeCallableValue(id):
+									indirect = main.steps.any(pure func(step):
+										match step:
+											Lower.Define(invocation):
+												match invocation.operation:
+													Lower.InvokeCallableValue(_, [_, _]): True
+													_: False
+											_: False
+									)
+									Concrete.function_number(id) == 2 and concat_body(wrapper) and indirect
+								_: False
+						_: False
+				_: False
+		None: False
+
+
 tests: TestSuite = {
 	description = "Blorp 2 String concat lowering",
 	tests = [
-		("ordered operands and source occurrence survive lowering", test_concat_lowering_preserves_operands_span_and_result),
+		("ordinary wrapper remains a declared lowered call", test_user_wrapper_call_remains_in_lowered_program),
+		("named builtin callable keeps its reachable wrapper", test_named_builtin_callable_retains_reachable_wrapper),
+		("stored builtin callable keeps its reachable wrapper", test_stored_builtin_callable_retains_reachable_wrapper),
+		("direct source operands and call span survive lowering", pure func(): concat_lowering_preserves_operands_span_and_result(DIRECT_CONCAT, "concatenate(left, right)")),
+		("UFCS source operands and call span survive lowering", pure func(): concat_lowering_preserves_operands_span_and_result(RECEIVER_CONCAT, "concatenate(right)")),
 		("append_int formats then concatenates in argument order", test_append_int_formats_then_concatenates_in_argument_order),
 	]
 }

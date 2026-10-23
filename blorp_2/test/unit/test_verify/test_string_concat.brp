@@ -1,11 +1,15 @@
 import:
+	../../../src/check/model: match_arm_id
+	./selection_inputs as Selection
 	../../../src/namespace/builtins as Builtins
 	../../../src/own/own as Own
 	../../../src/specialize/specialize as Concrete
 	../../../src/utils/source: same_source
-	../../../src/utils/syntax: FunctionExecution(OrdinaryCalls), Entrypoint(NoArguments), EntryResult(IntegerExitStatus)
 	../../../src/verify/verify: verify
 	../ownership_inputs: InputIds, input_ids, span
+	../source_while_inputs as LoopInput
+	../../../src/utils/syntax: Span, FunctionExecution(OrdinaryCalls), Entrypoint(NoArguments), EntryResult(IntegerExitStatus)
+	list: set_index
 	test: TestSuite
 
 
@@ -128,9 +132,347 @@ pure func test_concat_rejects_wrong_parameter_borrow() -> Bool:
 		Err(_): False
 
 
+private pure func consuming_program(
+	ids: InputIds, arguments: List[Own.OwnedArgument], after: List[Own.OwnershipOperation],
+) -> Own.OwnershipProgram:
+	left: Own.OwnedDefinition = {
+		id = ids.first, value_type = Concrete.StringType, operation = Own.StringDefinition("left"),
+		result = Own.OwnedResult(Own.owner_id(0)), span = span(10)
+	}
+	right: Own.OwnedDefinition = {
+		id = ids.second, value_type = Concrete.StringType, operation = Own.StringDefinition("right"),
+		result = Own.OwnedResult(Own.owner_id(1)), span = span(20)
+	}
+	call: Own.OwnedDefinition = {
+		id = ids.third, value_type = Concrete.StringType,
+		operation = Own.CallDefinition(Concrete.RuntimeFunction(Builtins.StringConcat), arguments),
+		result = Own.OwnedResult(Own.owner_id(2)), span = span(30)
+	}
+	worker: Own.OwnedFunction = {
+		signature = { parameters = [], return_type = Concrete.StringType },
+		operations = [Own.DefineValue(left), Own.DefineValue(right), Own.DefineValue(call)].concat(after),
+		result = Own.OwnedReturn(ids.third, Own.owner_id(2))
+	}
+	main: Own.OwnedFunction = {
+		signature = { parameters = [], return_type = Concrete.IntType },
+		operations = [Own.DefineValue({ id = ids.first, value_type = Concrete.IntType,
+			operation = Own.IntegerDefinition(0), result = Own.UnmanagedResult, span = span(50) })],
+		result = Own.UnmanagedReturn(ids.first)
+	}
+	{ records = [], unions = [], functions = [main, worker], entrypoint = NoArguments(ids.entrypoint, IntegerExitStatus) }
+
+
+private pure func consuming_arguments(ids: InputIds) -> List[Own.OwnedArgument]:
+	[Own.ConsumedArgument(ids.first, Own.owner_id(0)),
+		Own.BorrowedArgument({ value = ids.second, source = Own.OwnerBorrow(Own.owner_id(1)) })]
+
+
+pure func test_consumption_discharges_input_and_introduces_fresh_result() -> Bool:
+	match input_ids():
+		Err(_): False
+		Ok(ids): verify(consuming_program(ids, consuming_arguments(ids), [Own.DropOwner(Own.owner_id(1), span(40))])).is_ok()
+
+
+pure func test_consumption_rejects_additional_old_owner_drop() -> Bool:
+	match input_ids():
+		Err(_): False
+		Ok(ids): rejects(consuming_program(ids, consuming_arguments(ids), [Own.DropOwner(Own.owner_id(0), span(40))]),
+			"owner 0 has already been discharged", 40)
+
+
+pure func test_consumption_rejects_same_owner_other_operand() -> Bool:
+	match input_ids():
+		Err(_): False
+		Ok(ids):
+			arguments = [Own.ConsumedArgument(ids.first, Own.owner_id(0)),
+				Own.BorrowedArgument({ value = ids.first, source = Own.OwnerBorrow(Own.owner_id(0)) })]
+			rejects(consuming_program(ids, arguments, []), "borrow refers to discharged owner 0", 30)
+
+
+pure func test_consumption_rejects_wrong_owner() -> Bool:
+	match input_ids():
+		Err(_): False
+		Ok(ids): rejects(consuming_program(ids, consuming_arguments(ids).set(0, Own.ConsumedArgument(ids.first, Own.owner_id(1))), []),
+			"owner 1 does not own value 0", 30)
+
+
+pure func test_consumption_rejects_second_operand_and_duplicate_transfer() -> Bool:
+	match input_ids():
+		Err(_): False
+		Ok(ids): rejects(consuming_program(ids, consuming_arguments(ids).set(1, Own.ConsumedArgument(ids.second, Own.owner_id(1))), []),
+			"consumed argument requires the first String concat operand", 30)
+
+
+pure func test_consumption_rejects_later_old_value_borrow() -> Bool:
+	match input_ids():
+		Err(_): False
+		Ok(ids):
+			after: List[Own.OwnershipOperation] = [Own.DefineValue({
+				id = ids.fourth, value_type = Concrete.IntType,
+				operation = Own.CallDefinition(Concrete.RuntimeFunction(Builtins.StringLength), [
+					Own.BorrowedArgument({ value = ids.first, source = Own.OwnerBorrow(Own.owner_id(0)) })]),
+				result = Own.UnmanagedResult, span = span(40)
+			})]
+			rejects(consuming_program(ids, consuming_arguments(ids), after), "borrow refers to discharged owner 0", 40)
+
+
+-- String is a leaf: its valid later dependencies are borrows, not projections.
+pure func test_consumption_rejects_later_borrow_in_nested_join() -> Bool:
+	match input_ids():
+		Err(_): False
+		Ok(ids):
+			read: Own.OwnedDefinition = {
+				id = ids.sixth, value_type = Concrete.IntType,
+				operation = Own.CallDefinition(Concrete.RuntimeFunction(Builtins.StringLength), [
+					Own.BorrowedArgument({ value = ids.third, source = Own.OwnerBorrow(Own.owner_id(2)) })]),
+				result = Own.UnmanagedResult, span = span(60)
+			}
+			join: Own.OwnedJoin = {
+				result = Own.UnmanagedJoinParameter({ id = ids.fifth, value_type = Concrete.IntType, span = span(50) }),
+				carried = [], selection = Selection.direct(Own.UnmanagedArgument(ids.fourth)),
+				arms = [{ id = match_arm_id(0), inputs = [], operations = [Own.DefineValue(read)],
+					exit = Own.Yield({ transfer = Own.UnmanagedReturn(ids.sixth), carried = [] }) }]
+			}
+			after: List[Own.OwnershipOperation] = [Own.DropOwner(Own.owner_id(1), span(40)), Own.DefineValue({
+				id = ids.fourth, value_type = Concrete.IntType, operation = Own.IntegerDefinition(0),
+				result = Own.UnmanagedResult, span = span(45)
+			})]
+			valid = consuming_program(ids, consuming_arguments(ids), after.append(Own.ExecuteJoin(join)))
+			old_read = { read | operation = Own.CallDefinition(Concrete.RuntimeFunction(Builtins.StringLength), [
+				Own.BorrowedArgument({ value = ids.first, source = Own.OwnerBorrow(Own.owner_id(0)) })]) }
+			old_join = { join | arms = [{ id = match_arm_id(0), inputs = [], operations = [Own.DefineValue(old_read)],
+				exit = Own.Yield({ transfer = Own.UnmanagedReturn(ids.sixth), carried = [] }) }] }
+			invalid = consuming_program(ids, consuming_arguments(ids), after.append(Own.ExecuteJoin(old_join)))
+			rejects(invalid, "borrow refers to discharged owner 0", 60) and verify(valid).is_ok()
+
+
+pure func test_consumption_rejects_wrong_call_target() -> Bool:
+	match input_ids():
+		Err(_): False
+		Ok(ids):
+			program = consuming_program(ids, consuming_arguments(ids), [])
+			match program.functions:
+				[main, worker]:
+					match worker.operations:
+						[first, second, Own.DefineValue(call)]:
+							wrong = { call | operation = Own.CallDefinition(Concrete.UserFunction(ids.second_function), consuming_arguments(ids)) }
+							callee: Own.OwnedFunction = { worker | signature = { parameters = [Concrete.StringType, Concrete.StringType], return_type = Concrete.StringType },
+								operations = [first, second, Own.DefineValue(wrong)] }
+							rejects({ program | functions = [main, callee] }, "consumed argument requires the first String concat operand", 30)
+						_: False
+				_: False
+
+
+pure func test_distinct_counted_owner_of_same_value_stays_live() -> Bool:
+	match input_ids():
+		Err(_): False
+		Ok(ids):
+			program = consuming_program(ids, consuming_arguments(ids), [])
+			match program.functions:
+				[main, worker]:
+					match worker.operations:
+						[first, Own.DefineValue(second), Own.DefineValue(call)]:
+							counted = Own.AcquireOwner(Own.owner_id(1), { value = ids.first, source = Own.OwnerBorrow(Own.owner_id(0)) }, span(20))
+							dummy = { second | value_type = Concrete.IntType, operation = Own.IntegerDefinition(0), result = Own.UnmanagedResult }
+							shared = { call | operation = Own.CallDefinition(Concrete.RuntimeFunction(Builtins.StringConcat), [
+								Own.ConsumedArgument(ids.first, Own.owner_id(0)),
+								Own.BorrowedArgument({ value = ids.first, source = Own.OwnerBorrow(Own.owner_id(1)) })]) }
+							verify({ program | functions = [main, { worker | operations = [first, Own.DefineValue(dummy), counted,
+								Own.DefineValue(shared), Own.DropOwner(Own.owner_id(1), span(40))] }] }).is_ok()
+						_: False
+				_: False
+
+
+pure func test_consumption_rejects_already_discharged_owner() -> Bool:
+	match input_ids():
+		Err(_): False
+		Ok(ids):
+			program = consuming_program(ids, consuming_arguments(ids), [])
+			match program.functions:
+				[main, worker]:
+					match worker.operations:
+						[first, second, call]:
+							rejects({ program | functions = [main, { worker | operations = [first, second,
+								Own.DropOwner(Own.owner_id(0), span(25)), call] }] }, "borrow refers to discharged owner 0", 30)
+						_: False
+				_: False
+
+
+pure func test_consumption_rejects_non_string_operand() -> Bool:
+	match input_ids():
+		Err(_): False
+		Ok(ids):
+			program = consuming_program(ids, consuming_arguments(ids), [])
+			match program.functions:
+				[main, worker]:
+					match worker.operations:
+						[first, Own.DefineValue(second), Own.DefineValue(call)]:
+							number = { second | value_type = Concrete.IntType, operation = Own.IntegerDefinition(0), result = Own.UnmanagedResult }
+							wrong = { call | operation = Own.CallDefinition(Concrete.RuntimeFunction(Builtins.StringConcat), [
+								Own.ConsumedArgument(ids.second, Own.owner_id(1)),
+								Own.BorrowedArgument({ value = ids.first, source = Own.OwnerBorrow(Own.owner_id(0)) })]) }
+							rejects({ program | functions = [main, { worker | operations = [first, Own.DefineValue(number), Own.DefineValue(wrong)] }] },
+								"call argument type does not match its contract", 30)
+						_: False
+				_: False
+
+
+pure func test_projection_cannot_consume_an_argument() -> Bool:
+	match input_ids():
+		Err(_): False
+		Ok(ids):
+			program = consuming_program(ids, consuming_arguments(ids), [])
+			match program.functions:
+				[main, worker]:
+					match worker.operations:
+						[first, second, Own.DefineValue(call)]:
+							wrong = { call | operation = Own.ListSuffixDefinition(Own.ConsumedArgument(ids.first, Own.owner_id(0)), 0) }
+							rejects({ program | functions = [main, { worker | operations = [first, second, Own.DefineValue(wrong)] }] },
+								"match or projection cannot consume a call argument", 30)
+						_: False
+				_: False
+
+
+pure func test_callable_invocation_cannot_consume_an_argument() -> Bool:
+	match input_ids():
+		Err(_): False
+		Ok(ids):
+			program = consuming_program(ids, consuming_arguments(ids), [])
+			match program.functions:
+				[main, worker]:
+					match worker.operations:
+						[first, second, Own.DefineValue(call)]:
+							callable: Own.OwnedDefinition = {
+								id = ids.third, value_type = Concrete.CallableType([Concrete.StringType, Concrete.StringType], Concrete.StringType),
+								operation = Own.FreeCallableDefinition(ids.second_function), result = Own.OwnedResult(Own.owner_id(2)), span = span(25)
+							}
+							wrong = { call | id = ids.fourth, result = Own.OwnedResult(Own.owner_id(3)), operation = Own.InvokeCallableDefinition(
+								Own.BorrowedArgument({ value = ids.third, source = Own.OwnerBorrow(Own.owner_id(2)) }), consuming_arguments(ids)) }
+							callee: Own.OwnedFunction = { worker | signature = { parameters = [Concrete.StringType, Concrete.StringType], return_type = Concrete.StringType },
+								operations = [first, second, Own.DefineValue(callable), Own.DefineValue(wrong)], result = Own.OwnedReturn(ids.fourth, Own.owner_id(3)) }
+							rejects({ program | functions = [main, callee] }, "consumed argument requires the first String concat operand", 30)
+						_: False
+				_: False
+
+
+private pure func force_borrowed_concat(operation: Own.OwnershipOperation) -> Own.OwnershipOperation:
+	match operation:
+		Own.DefineValue(definition):
+			match definition.operation:
+				Own.CallDefinition(target, [Own.BorrowedArgument(left), right]):
+					match target:
+						Concrete.RuntimeFunction(Builtins.StringConcat):
+							match left.source:
+								Own.OwnerBorrow(owner): Own.DefineValue({ definition | operation = Own.CallDefinition(target, [Own.ConsumedArgument(left.value, owner), right]) })
+								_: operation
+						_: operation
+				_: operation
+		_: operation
+
+
+private pure func rejects_at(program: Own.OwnershipProgram, message: String, expected: Span) -> Bool:
+	match verify(program):
+		Ok(_): False
+		Err(error):
+			(error.message == "ownership verification failed: " + message
+				and error.help == "report this compiler error with the input program" and error.note.is_none()
+				and same_source(error.span.source, expected.source)
+				and error.span.start == expected.start and error.span.end == expected.end)
+
+
+pure func test_loop_cannot_consume_captured_pre_loop_owner() -> Bool:
+	match LoopInput.lowered(LoopInput.MANAGED_OWNER).and_then(Own.own):
+		Err(_): False
+		Ok(program):
+			var expected: Option[Span] = None
+			var functions: List[Own.OwnedFunction] = []
+			for function in program.functions:
+				var operations: List[Own.OwnershipOperation] = []
+				for operation in function.operations:
+					match operation:
+						Own.ExecuteLoop(loop):
+							match loop.body.tail:
+								Own.MatchLoop(matched):
+									var arms: List[Own.OwnedLoopArm] = []
+									for arm in matched.arms:
+										match arm.body.tail:
+											Own.ExitLoop(Own.Recur(_, at)): expected = Some(at)
+											_: void
+										arms = arms.append({ arm | body = { arm.body | operations = arm.body.operations.map(force_borrowed_concat) } })
+									operations = operations.append(Own.ExecuteLoop({ loop | body = { loop.body | tail = Own.MatchLoop({ matched | arms = arms }) } }))
+								_: operations = operations.append(operation)
+						_: operations = operations.append(operation)
+				functions = functions.append({ function | operations = operations })
+			match expected:
+				None: False
+				Some(at): rejects_at({ program | functions = functions }, "loop edge discharges a captured owner", at)
+
+
+pure func test_continuing_join_cannot_consume_its_enclosing_owner() -> Bool:
+	source: String =
+		|pure func concatenate(left: String, right: String) -> String:
+		|    builtin("string.add")
+		|func main() -> Int:
+		|    prefix = concatenate("left", "right")
+		|    flag: Bool = True
+		|    selected = if flag:
+		|        concatenate(prefix, "tail")
+		|    else:
+		|        "other"
+		|    kept = prefix
+		|    0
+		|
+	match LoopInput.lowered(source).and_then(Own.own):
+		Err(_): False
+		Ok(program):
+			var expected: Option[Own.OwnedDefinition] = None
+			var functions: List[Own.OwnedFunction] = []
+			for function in program.functions:
+				var operations: List[Own.OwnershipOperation] = []
+				for operation in function.operations:
+					match operation:
+						Own.ExecuteJoin(join):
+							var arms: List[Own.OwnedJoinArm] = []
+							for arm in join.arms:
+								forced = arm.operations.map(force_borrowed_concat)
+								for nested in forced:
+									match nested:
+										Own.DefineValue(definition):
+											match definition.operation:
+												Own.CallDefinition(_, [Own.ConsumedArgument(_, _), _]): expected = Some(definition)
+												_: void
+										_: void
+								arms = arms.append({ arm | operations = forced })
+							operations = operations.append(Own.ExecuteJoin({ join | arms = arms }))
+						_: operations = operations.append(operation)
+				functions = functions.append({ function | operations = operations })
+			match expected:
+				Some(definition):
+					match definition.operation:
+						Own.CallDefinition(_, [Own.ConsumedArgument(_, owner), _]):
+							rejects_at({ program | functions = functions }, "owner ".append_int(Own.owner_number(owner)) + " is discharged before its join", definition.span)
+						_: False
+				None: False
+
+
 tests: TestSuite = {
 	description = "Blorp 2 independent String concat verification",
 	tests = [
+		("nested later old-owner borrow rejects", test_consumption_rejects_later_borrow_in_nested_join),
+		("loop cannot consume captured pre-loop owner", test_loop_cannot_consume_captured_pre_loop_owner),
+		("continuing join preserves enclosing owner", test_continuing_join_cannot_consume_its_enclosing_owner),
+		("non-String consumed operand rejects", test_consumption_rejects_non_string_operand),
+		("projection cannot consume", test_projection_cannot_consume_an_argument),
+		("callable invocation cannot consume", test_callable_invocation_cannot_consume_an_argument),
+		("distinct counted owner of same value remains valid", test_distinct_counted_owner_of_same_value_stays_live),
+		("already discharged consumed owner rejects", test_consumption_rejects_already_discharged_owner),
+		("consumption discharges input before fresh result", test_consumption_discharges_input_and_introduces_fresh_result),
+		("extra transferred-owner drop rejects", test_consumption_rejects_additional_old_owner_drop),
+		("same-owner RHS rejects", test_consumption_rejects_same_owner_other_operand),
+		("wrong transferred owner rejects", test_consumption_rejects_wrong_owner),
+		("second operand and duplicate consumption reject", test_consumption_rejects_second_operand_and_duplicate_transfer),
+		("later old value borrow rejects", test_consumption_rejects_later_old_value_borrow),
+		("ordinary call target cannot consume", test_consumption_rejects_wrong_call_target),
 		("valid fresh result drops once", test_raw_concat_has_one_fresh_owner_and_drop),
 		("unmanaged result rejects", test_concat_rejects_unmanaged_result),
 		("missing result drop rejects", test_concat_rejects_missing_drop),
