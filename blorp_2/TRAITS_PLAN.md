@@ -1,10 +1,14 @@
 # Static traits, starting with Equatable
 
-Status: T0 inference prerequisite complete; T1–T5 remain open, 2026-10-22. Source baseline:
+Status: T0 inference and T2 semantic instance identity complete; T1, T3–T5 remain
+open, 2026-10-22. Original measurement baseline:
 `02b13d25d04b7c5670cb94052ea9675cc9ba3428`. Nothing below claims that
 traits are currently accepted by Blorp 2. Code marked **source** describes
 the proposed input language; code marked **model sketch** describes compiler
 data, not a second language or an additional runtime representation.
+
+Completed T2 evidence is retained in the
+[semantic instance identity report](../benchmarks/results/blorp2-semantic-instance-keys-2026-10-22.md).
 
 This is the single plan for the open work. Delete completed milestone
 instructions as they land; retain semantic rules in README/grammar and
@@ -372,37 +376,18 @@ implementation scope. Coherence does not depend on declaration/import order.
 
 ### Semantic identity before representation erasure
 
-Current [InstanceKey](src/specialize/specialize.brp):501 contains physical
-`List[TypeRef]` arguments. `concrete_type` at line 731 erases opaque identities.
-That key is insufficient when two equal-storage types select different methods.
+Function instance and known-callable keys retain fully substituted semantic
+checked types, including opaque identity and callable purity. No rigid parameter
+may remain in these arguments. Repeated requests with the same semantic types
+and callable choices reuse the existing function-request graph; no parallel
+semantic/physical public key or recursive witness graph is introduced.
 
-**Model sketch: replace, rather than supplement, the key's type authority.**
-
-```blorp
--- Before: arguments: List[TypeRef]             -- physical Concrete types
--- After:
-private fixed record InstanceKey {
-    body: Checked.BodyOwner,
-    arguments: List[Checked.TypeRef],          -- fully substituted semantic types
-    callables: List[CallableMode]
-}
--- No rigid ParameterType may remain in these arguments.
--- Derive physical substitutions for existing preparation/translation.
--- Keep opaque/nominal identity and callable purity until dispatch is fixed.
-```
-
-Pilot this before generic trait calls. Do not retain parallel semantic and
-physical public keys, encode choices as strings, or build recursive witness
-keys. Existing layout identities may remain representation-based; function
-behavior identity is a different fact. Measure increased instance count and
-C size as well as compiler costs; sharing old physical bodies is not presumed.
-
-Make the same replacement in KnownCallable.arguments (currently physical at
-line 487), not only InstanceKey.arguments. Audit named-callable preparation,
-lambda creation/root arguments, ordinary calls, runtime-instance lookup,
-translation and capture-layout conversion. Derive physical environments at the
-layout boundary. A non-generic consumer receiving a generic callback over two
-same-storage opaque types is a required collision regression.
+Record, union and callable-capture layout keys retain representation sharing
+within their existing declaration/site identities. Physical substitutions are
+projected at layout boundaries; they never reconstruct behavior identity.
+Same-storage opaque substitutions therefore may share storage while keeping
+distinct function bodies and callable choices. The completed T2 report above
+records collision/reuse coverage, instance/C growth and matched compiler costs.
 
 ## 4. Automatic equality as ordinary checked code
 
@@ -627,20 +612,18 @@ framework. References were checked on 2026-10-22.
 
 No parse-only scaffolding milestone lands by itself. Each milestone includes
 its complete producer/consumer path, exact diagnostics, reference/EBNF updates,
-two independent reviews and one coherent commit. T0 is complete;
-T2 must land before T3, and T3 before T4.
+two independent reviews and one coherent commit. T0 and T2 are complete;
+T3 must land before T4. The table below contains only open milestones.
 
 Start each milestone with its red oracle. T1 begins with the
-exit-23 fixture and contract rejections. T2 begins with two existing-syntax
-opaque instantiations whose calls must have distinct concrete function IDs.
-T3 adds the missing-bound rejection before admission; T4 starts with a derived
+exit-23 fixture and contract rejections. T3 adds the missing-bound rejection
+before admission; T4 starts with a derived
 container whose nested authored equality intentionally differs from fieldwise
 comparison. Do not remove old negative coverage merely to turn a suite green.
 
 | Milestone | Deliverable and changed boundary | Completion oracle |
 | --- | --- | --- |
 | T1: concrete explicit traits | Parse, inventory, namespace, Check; abstract methods and concrete impls; default bodies deferred explicitly | Fixture Int and custom type direct/UFCS/qualified calls; missing/extra/duplicate/impure members and orphan impls reject in Check |
-| T2: semantic instance identity | Replace InstanceKey's physical argument authority; retain one request graph | Same-storage opaque types remain distinct keys; same semantic requests reuse; ordinary old fixtures preserve behavior |
 | T3: bounds/defaults/callables | Function/receiver bounds; default bodies; contextual method references; accepted symbolic target | Generic forwarding works, missing bounds reject without callers; default dispatch honors override; callbacks keep evaluation order/purity |
 | T4: structural equality | Ordinary derived record/union templates, dependency closure, ordinary List prerequisite in isolated fixture library | Recursive/custom/phantom/invalid-field cases below pass; no trait-specific concrete/lower products |
 | T5: production library rollout | Qualify/publish/pin capable seed, then migrate target library APIs | Clean bootstrap/fixpoint and all component/native/platform gates pass without legacy building Blorp 2 |
@@ -740,12 +723,11 @@ rewriting. Give every compiled gate a finite administrative deadline.
 
 ### Prospective ceilings and measurement
 
-For T0, target at most +1% matched self-compile allocations and normal retired
-instructions versus the original pre-T0 role. For the full traits feature, use a +5% cumulative ceiling for
-each against the one frozen pre-T0 compiler workload, not compounded milestone
-allowances. T2's identity pilot additionally stops for investigation above +2%
-against that same original pre-T0 reference, or if equal semantic requests
-duplicate instances.
+For the full traits feature, retain the +5% cumulative ceiling for matched
+self-compile allocations and normal retired instructions against the one frozen
+pre-T0 compiler workload, not compounded milestone allowances. Completed T0 used
+a +1% ceiling and T2 a +2% investigation trigger against that same reference;
+their reports retain the actual results.
 
 Use a production-code review envelope of +2,000 net handwritten lines for
 T0–T4, investigate the forecast at +1,500, and report gross ADD/DEL/net per
@@ -764,13 +746,13 @@ self-compile separately from the frozen-input comparison.
 
 Retain the original baseline compiler roles for every comparison; compare
 original and current candidate quietly on that same input, never compound
-parent ratios. T0's +1%, T2's +2% trigger and the final +5% ceiling share this
+parent ratios. The completed milestone limits and final +5% ceiling share this
 one reference. Immediate-parent source diffs do not change the cost baseline.
 Before each call ensure the one physical output path is absent; archive its
 result afterward. Freeze all of these details before the first sample.
-T0 requires old-input C identity. T2 may intentionally split old opaque
-instances and change C; require old-input native/diagnostic parity and same-version
-A/B fixpoint instead. Record this distinction before measuring, not after a miss.
+Semantic instance splitting can change old-input C; require old-input
+native/diagnostic parity and same-version A/B fixpoint. Freeze the expected
+output policy before measuring, not after a miss.
 
 Build paired binaries from the same actual compiler C, with
 `BLORP_MEMORY_DIAGNOSTICS=0/1`. See [Makefile](Makefile)'s separate link targets.

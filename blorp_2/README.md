@@ -1504,10 +1504,16 @@ Lexical and layout rules:
   `from_opaque Name(value)` projects it, only inside the declaring module.
   Export ordinary constructor/accessor functions for other modules, as in the
   [two-file Int example](test/e2e/fixtures/opaque/int/main.brp). Two opaque types
-  remain distinct during checking even when they wrap the same type, including
-  inside Lists and generic records. Conversions evaluate their operand once;
-  afterward they use the underlying layout and ownership operations without a
-  runtime wrapper. Opaque types do not inherit representation fields or methods.
+  remain distinct during checking and function specialization even when they wrap
+  the same type, including inside Lists and generic records. A generic function
+  has distinct body instances for those opaque types and their underlying type;
+  repeated requests with the same semantic type arguments and callable choices
+  reuse that function's instance. Named and lambda callable choices retain the
+  same semantic distinction. Within one record or union declaration or capture
+  site, same-storage opaque substitutions may still share a physical layout.
+  Conversions evaluate their operand once; afterward they use the underlying
+  layout and ownership operations without a runtime wrapper. Opaque types do not
+  inherit representation fields or methods.
   Public opaques may hide private representations. Cyclic opaque representations
   are rejected; wrapping an independently recursive aggregate remains valid.
   The conversion words are reserved: `into_opaque(7)` is a syntax error.

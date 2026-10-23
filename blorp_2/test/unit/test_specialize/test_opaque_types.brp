@@ -1,9 +1,10 @@
 import:
 	../../../src/specialize/specialize:
 		ConcreteBody(ConcreteValueBody), ConcreteExit(ReturnExpression),
-		ConcreteForm(InvokeFunction, LiteralInteger),
+		ConcreteForm(InvokeFunction, LiteralInteger, FreeCallable, ConstructRecord),
+		ConcreteFunction, ConcreteExpr, FunctionInstanceId,
 		ConcreteStatement(InitializeBinding), CallTarget(UserFunction),
-		TypeRef(IntType, RecordType), record_number, record_fields, function_number, specialize, specialized_contents
+		TypeRef(IntType, RecordType, CallableType), same_type, record_number, record_fields, function_number, specialize, specialized_contents
 	../input: checked_source
 	test: TestSuite
 
@@ -30,7 +31,13 @@ pure func test_int_conversions_erase_to_existing_data_types() -> Bool:
 				_: False
 
 
-pure func test_equal_opaque_representations_reuse_generic_instance() -> Bool:
+private pure func integer_signature(function: ConcreteFunction) -> Bool:
+	match (function.signature.parameters, function.signature.return_type):
+		([IntType], IntType): True
+		_: False
+
+
+pure func test_semantic_opaque_arguments_split_instances_and_reuse_equal_requests() -> Bool:
 	source: String =
 		|opaque type A = Int
 		|opaque type B = Int
@@ -39,27 +46,54 @@ pure func test_equal_opaque_representations_reuse_generic_instance() -> Bool:
 		|func main() -> Int:
 		|    first = identity(into_opaque A(7))
 		|    second = identity(into_opaque B(9))
-		|    identity(11)
+		|    repeated = identity(into_opaque A(11))
+		|    identity(13)
 		|
 	match checked_source(source).and_then(specialize):
 		Err(_): False
 		Ok(program):
 			match specialized_contents(program).functions:
-				[main, identity]:
-					match (main.statements, main.body, identity.signature.parameters, identity.signature.return_type):
-						([InitializeBinding(_, first), InitializeBinding(_, second)], ConcreteValueBody(ReturnExpression(last)), [IntType], IntType):
-							match (first.form, second.form, last.form):
-								(InvokeFunction(a, [left]), InvokeFunction(b, [right]), InvokeFunction(c, [raw])):
-									match ((a.target, b.target, c.target), (left.form, right.form, raw.form)):
-										((UserFunction(x), UserFunction(y), UserFunction(z)), (LiteralInteger(7), LiteralInteger(9), LiteralInteger(11))):
-											function_number(x) == 1 and function_number(y) == 1 and function_number(z) == 1
+				[main, first_body, second_body, raw_body]:
+					match (main.statements, main.body):
+						([InitializeBinding(_, first), InitializeBinding(_, second), InitializeBinding(_, repeated)], ConcreteValueBody(ReturnExpression(last))):
+							match (first.form, second.form, repeated.form, last.form):
+								(InvokeFunction(a, [left]), InvokeFunction(b, [right]), InvokeFunction(c, [again]), InvokeFunction(d, [raw])):
+									match ((a.target, b.target, c.target, d.target), (left.form, right.form, again.form, raw.form)):
+										((UserFunction(x), UserFunction(y), UserFunction(z), UserFunction(w)), (LiteralInteger(7), LiteralInteger(9), LiteralInteger(11), LiteralInteger(13))):
+											(function_number(x) == 1 and function_number(y) == 2 and function_number(z) == 1 and function_number(w) == 3
+												and integer_signature(first_body) and integer_signature(second_body) and integer_signature(raw_body))
 										_: False
 								_: False
 						_: False
 				_: False
 
 
-pure func test_box_arguments_share_the_erased_layout_and_function() -> Bool:
+private pure func boxed_signature(function: ConcreteFunction) -> Bool:
+	match (function.signature.parameters, function.signature.return_type):
+		([RecordType(parameter)], RecordType(returned)): record_number(parameter) == 0 and record_number(returned) == 0
+		_: False
+
+
+private pure func box_constructor_signature(function: ConcreteFunction) -> Bool:
+	match (function.signature.parameters, function.signature.return_type):
+		([IntType], RecordType(returned)): record_number(returned) == 0
+		_: False
+
+
+private pure func boxed_call(value: ConcreteExpr, expected_constructor: Int, expected_identity: Int, literal: Int) -> Bool:
+	match value.form:
+		InvokeFunction(identity, [construction]):
+			match (identity.target, construction.form):
+				(UserFunction(identity_id), InvokeFunction(constructor, [argument])):
+					match (constructor.target, argument.form):
+						(UserFunction(constructor_id), LiteralInteger(actual)):
+							function_number(identity_id) == expected_identity and function_number(constructor_id) == expected_constructor and actual == literal
+						_: False
+				_: False
+		_: False
+
+
+pure func test_box_layout_shares_while_semantic_function_instances_split() -> Bool:
 	source: String =
 		|opaque type A = Int
 		|opaque type B = Int
@@ -71,7 +105,8 @@ pure func test_box_arguments_share_the_erased_layout_and_function() -> Bool:
 		|func main() -> Int:
 		|    first = identity(box(into_opaque A(7)))
 		|    second = identity(box(into_opaque B(9)))
-		|    third = identity(box(11))
+		|    repeated = identity(box(into_opaque A(11)))
+		|    third = identity(box(13))
 		|    0
 		|
 	match checked_source(source).and_then(specialize):
@@ -79,10 +114,12 @@ pure func test_box_arguments_share_the_erased_layout_and_function() -> Bool:
 		Ok(program):
 			contents = specialized_contents(program)
 			match (contents.records, contents.functions):
-				([box], [_, constructor, identity]):
-					match (record_fields(box), constructor.signature.parameters, identity.signature.parameters, identity.signature.return_type):
-						([IntType], [IntType], [RecordType(parameter)], RecordType(returned)):
-							record_number(parameter) == 0 and record_number(returned) == 0
+				([box], [main, first_constructor, first_identity, second_constructor, second_identity, raw_constructor, raw_identity]):
+					match (record_fields(box), main.statements):
+						([IntType], [InitializeBinding(_, first), InitializeBinding(_, second), InitializeBinding(_, repeated), InitializeBinding(_, raw)]):
+							(box_constructor_signature(first_constructor) and box_constructor_signature(second_constructor) and box_constructor_signature(raw_constructor)
+								and boxed_signature(first_identity) and boxed_signature(second_identity) and boxed_signature(raw_identity)
+								and boxed_call(first, 1, 2, 7) and boxed_call(second, 3, 4, 9) and boxed_call(repeated, 1, 2, 11) and boxed_call(raw, 5, 6, 13))
 						_: False
 				_: False
 
@@ -122,12 +159,121 @@ pure func test_erasure_preserves_named_callback_target_choices() -> Bool:
 				_: False
 
 
+private pure func returned(function: ConcreteFunction) -> Option[ConcreteExpr]:
+	match function.body:
+		ConcreteValueBody(ReturnExpression(value)): Some(value)
+		_: None
+
+
+private pure func callee(value: ConcreteExpr) -> Option[FunctionInstanceId]:
+	match value.form:
+		InvokeFunction(call, _):
+			match call.target:
+				UserFunction(id): Some(id)
+				_: None
+		_: None
+
+
+pure func test_same_generic_named_callable_keeps_semantic_choices_and_reuses_them() -> Bool:
+	source: String =
+		|opaque type A = Int
+		|opaque type B = Int
+		|pure func marker[T](value: T) -> Int:
+		|    7
+		|func main() -> Int:
+		|    first: pure (A) -> Int = marker
+		|    second: pure (B) -> Int = marker
+		|    repeated: pure (A) -> Int = marker
+		|    left = first(into_opaque A(7))
+		|    right = second(into_opaque B(9))
+		|    repeated(into_opaque A(11))
+		|
+	match checked_source(source).and_then(specialize):
+		Err(_): False
+		Ok(program):
+			match specialized_contents(program).functions:
+				[main, first_body, second_body]:
+					match main.statements:
+						[InitializeBinding(_, first), InitializeBinding(_, second), InitializeBinding(_, repeated), _, _]:
+							match (first.form, second.form, repeated.form):
+								(FreeCallable(a), FreeCallable(b), FreeCallable(c)):
+									(function_number(a) == 1 and function_number(b) == 2 and function_number(c) == 1
+										and integer_signature(first_body) and integer_signature(second_body)
+										and same_type(first.value_type, CallableType([IntType], IntType))
+										and same_type(second.value_type, first.value_type) and same_type(repeated.value_type, first.value_type))
+								_: False
+						_: False
+				_: False
+
+
+private pure func captured_path(functions: List[ConcreteFunction], route_id: FunctionInstanceId) -> Option[List[Int]]:
+	route ?= functions.get(function_number(route_id))
+	application ?= returned(route)
+	use_id ?= callee(application)
+	use ?= functions.get(function_number(use_id))
+	invocation ?= returned(use)
+	lambda_id ?= callee(invocation)
+	lambda ?= functions.get(function_number(lambda_id))
+	selection ?= returned(lambda)
+	marker_id ?= callee(selection)
+	marker ?= functions.get(function_number(marker_id))
+	match (application.form, use.signature.parameters, lambda.signature.parameters):
+		(InvokeFunction(_, [environment]), [RecordType(use_environment)], [RecordType(lambda_environment)]):
+			match environment.form:
+				ConstructRecord(owner, [_]):
+					if record_number(owner) == 0 and record_number(use_environment) == 0 and record_number(lambda_environment) == 0 and integer_signature(route) and integer_signature(marker):
+						Some([function_number(use_id), function_number(lambda_id), function_number(marker_id)])
+					else:
+						None
+				_: None
+		_: None
+
+
+pure func test_monomorphic_consumer_splits_semantic_lambda_choices_but_shares_capture_layout() -> Bool:
+	source: String =
+		|opaque type A = Int
+		|opaque type B = Int
+		|pure func marker[T](value: T) -> Int:
+		|    7
+		|pure func use(callback: pure () -> Int) -> Int:
+		|    callback()
+		|pure func route[T](item: T) -> Int:
+		|    use(pure func() -> Int: marker(item))
+		|func main() -> Int:
+		|    first = route(into_opaque A(7))
+		|    second = route(into_opaque B(9))
+		|    route(into_opaque A(11))
+		|
+	match checked_source(source).and_then(specialize):
+		Err(_): False
+		Ok(program):
+			contents = specialized_contents(program)
+			match (contents.functions, contents.records):
+				([main, ..._], [environment]):
+					match (main.statements, returned(main), record_fields(environment)):
+						([InitializeBinding(_, first), InitializeBinding(_, second)], Some(repeated), [IntType]):
+							match (callee(first), callee(second), callee(repeated)):
+								(Some(a), Some(b), Some(c)):
+									match (captured_path(contents.functions, a), captured_path(contents.functions, b), captured_path(contents.functions, c)):
+										(Some([first_use, first_lambda, first_marker]), Some([second_use, second_lambda, second_marker]), Some([same_use, same_lambda, same_marker])):
+											(function_number(a) != function_number(b) and function_number(a) == function_number(c)
+												and first_use != second_use and first_lambda != second_lambda and first_marker != second_marker
+												and first_use == same_use and first_lambda == same_lambda and first_marker == same_marker
+												and contents.functions.length() == 9)
+										_: False
+								_: False
+						_: False
+				_: False
+
+
 tests: TestSuite = {
 	description = "Opaque representation erasure",
 	tests = [
-		("Box A B and Int reuse one erased layout and function", test_box_arguments_share_the_erased_layout_and_function),
+		("Box A B and Int share one layout but split semantic function instances", test_box_layout_shares_while_semantic_function_instances_split),
 		("distinct named callback choices survive erased type arguments", test_erasure_preserves_named_callback_target_choices),
 		("Int conversions erase to ordinary data signatures", test_int_conversions_erase_to_existing_data_types),
-		("A B and raw Int share a generic runtime instance", test_equal_opaque_representations_reuse_generic_instance),
+		("A B and raw Int split instances while repeated A reuses", test_semantic_opaque_arguments_split_instances_and_reuse_equal_requests),
+		("one generic named callable splits A B and reuses A", test_same_generic_named_callable_keeps_semantic_choices_and_reuses_them),
+		("monomorphic use splits one generic lambda site while its physical capture layout shares", test_monomorphic_consumer_splits_semantic_lambda_choices_but_shares_capture_layout),
 	]
 }

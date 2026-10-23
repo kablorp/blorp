@@ -19,6 +19,7 @@ import:
 		runtime_contract,
 	../check/check: CheckedProgram, checked_functions
 	../check/model as Checked
+	../check/declarations as Declarations
 	../utils/ids as Declaration
 	int as IntOps
 	option: to_result, is_some
@@ -487,7 +488,7 @@ private fixed union CallableStorage:
 private fixed record KnownCallable {
 	parameter: Checked.CallableParameterId,
 	body: Checked.BodyOwner,
-	arguments: List[TypeRef],
+	arguments: List[Checked.TypeRef],
 	storage: CallableStorage
 }
 
@@ -500,13 +501,12 @@ private fixed union CallableMode:
 -- Lambda arguments substitute its genuine root parameters; callable choices stay ordered.
 private fixed record InstanceKey {
 	body: Checked.BodyOwner,
-	arguments: List[TypeRef],
+	arguments: List[Checked.TypeRef],
 	callables: List[CallableMode]
 }
 
 
--- A declaration parameter and the type that replaces it: a concrete TypeRef
--- during translation, a PartialType while layouts are being prepared.
+-- A declaration parameter and its physical replacement while layouts are prepared.
 private fixed record TypeSubstitution[T] {
 	parameter: Checked.TypeParameterId,
 	value_type: T
@@ -664,7 +664,7 @@ private pure func concrete_record(
 	opaques: List[Checked.CheckedOpaque],
 	declaration: Declaration.RecordId,
 	arguments: List[Checked.TypeRef],
-	substitution: List[TypeSubstitution[TypeRef]],
+	substitution: Declarations.Substitution,
 	unions: List[UnionInstance],
 	span: Span,
 	records: List[RecordInstance],
@@ -689,7 +689,7 @@ private pure func record_instance(
 	opaques: List[Checked.CheckedOpaque],
 	declaration: Declaration.RecordId,
 	value: Checked.CheckedExpr,
-	substitution: List[TypeSubstitution[TypeRef]],
+	substitution: Declarations.Substitution,
 	unions: List[UnionInstance],
 	records: List[RecordInstance],
 ) -> Result[RecordInstanceId, Diagnostic]:
@@ -705,7 +705,7 @@ private pure func record_instance(
 private pure func concrete_types(
 	opaques: List[Checked.CheckedOpaque],
 	arguments: List[Checked.TypeRef],
-	substitution: List[TypeSubstitution[TypeRef]],
+	substitution: Declarations.Substitution,
 	unions: List[UnionInstance],
 	span: Span,
 	records: List[RecordInstance],
@@ -731,7 +731,7 @@ private pure func concrete_types(
 private pure func concrete_type(
 	opaques: List[Checked.CheckedOpaque],
 	value_type: Checked.TypeRef,
-	substitution: List[TypeSubstitution[TypeRef]],
+	substitution: Declarations.Substitution,
 	unions: List[UnionInstance],
 	span: Span,
 	records: List[RecordInstance],
@@ -739,7 +739,7 @@ private pure func concrete_type(
 	match value_type:
 		Checked.OpaqueType(id):
 			match opaques.get(Declaration.opaque_number(id)):
-				Some(declaration): concrete_type(opaques, declaration.underlying_type.value_type, [], unions, span, records)
+				Some(declaration): concrete_type(opaques, declaration.underlying_type.value_type, { substitution | values = [] }, unions, span, records)
 				None: Err(invalid(span, "unknown opaque declaration"))
 		Checked.CallableType(_, parameters, result):
 			match concrete_types(opaques, parameters, substitution, unions, span, records):
@@ -796,24 +796,14 @@ private pure func concrete_type(
 				Ok(union_id): Ok(UnionType(union_id))
 				Err(error): Err(error)
 		Checked.ParameterType(id):
-			var replacement: Option[TypeRef] = None
-
-			for argument in substitution:
-				if Checked.same_parameter(id, argument.parameter):
-					-- A supplied concrete replacement is terminal.
-					replacement = Some(argument.value_type)
-					break
-
-			match replacement:
-				Some(value):
-					Ok(value)
-				None:
-					Err(invalid(span, "unresolved or foreign type parameter"))
+			match semantic_type(Checked.ParameterType(id), substitution, span):
+				Err(error): Err(error)
+				Ok(value): concrete_type(opaques, value, substitution, unions, span, records)
 
 
 private pure func concrete_tuple_type(
 	opaques: List[Checked.CheckedOpaque], elements: List[Checked.TypeRef],
-	substitution: List[TypeSubstitution[TypeRef]], unions: List[UnionInstance],
+	substitution: Declarations.Substitution, unions: List[UnionInstance],
 	span: Span, records: List[RecordInstance],
 ) -> Result[TypeRef, Diagnostic]:
 	arguments ?= concrete_types(opaques, elements, substitution, unions, span, records)
@@ -852,7 +842,7 @@ private pure func find_instance(
 	for known in keys:
 		matches_key = match Checked.same_body(known.key.body, key.body):
 			True:
-				match same_arguments(known.key.arguments, key.arguments):
+				match Checked.same_types(known.key.arguments, key.arguments):
 					True: same_callables(known.key.callables, key.callables)
 					False: False
 			False: False
@@ -891,7 +881,7 @@ private pure func same_callable_mode(left: CallableMode, right: CallableMode) ->
 					match and(Checked.same_callable_parameter(value.parameter, other.parameter), Checked.same_body(value.body, other.body)):
 						False: False
 						True:
-							match same_arguments(value.arguments, other.arguments):
+							match Checked.same_types(value.arguments, other.arguments):
 								True: same_callable_storage(value.storage, other.storage)
 								False: False
 
@@ -933,17 +923,13 @@ private pure func forward_callable(
 		RuntimeCallable(_): Ok(RuntimeCallable(destination_parameter))
 
 
-private pure func parameter_substitution[T](
-	parameters: List[Checked.TypeParameterId],
-	arguments: List[T],
-	owner: Checked.TypeParameterOwner,
-	span: Span,
-) -> Result[List[TypeSubstitution[T]], Diagnostic]:
-	var substitution: List[TypeSubstitution[T]] = []
+private pure func validate_type_parameters(
+	parameters: List[Checked.TypeParameterId], argument_count: Int,
+	owner: Checked.TypeParameterOwner, span: Span,
+) -> Result[Void, Diagnostic]:
 	var failure: Option[Diagnostic] = None
-	var position: Int = 0
-
-	if IntOps.equals(parameters.length(), arguments.length()).not():
+	var position = 0
+	if IntOps.equals(parameters.length(), argument_count).not():
 		Err(invalid(span, "type argument count differs from the declaration"))
 	else:
 		for parameter in parameters:
@@ -983,23 +969,58 @@ private pure func parameter_substitution[T](
 				failure = Some(invalid(span, "invalid declaration type parameter"))
 				break
 
-			match arguments.get(position):
-				Some(value):
-					substitution = substitution.append({
-						parameter = parameter,
-						value_type = value,
-					})
-				None:
-					failure = Some(invalid(span, "missing concrete type argument"))
-					break
-
 			position = IntOps.add(position, 1)
-
 		match failure:
-			Some(error):
-				Err(error)
+			Some(error): Err(error)
+			None: Ok(void)
+
+
+private pure func parameter_substitution[T](
+	parameters: List[Checked.TypeParameterId], arguments: List[T],
+	owner: Checked.TypeParameterOwner, span: Span,
+) -> Result[List[TypeSubstitution[T]], Diagnostic]:
+	valid ?= validate_type_parameters(parameters, arguments.length(), owner, span)
+	var substitution: List[TypeSubstitution[T]] = []
+	var failure: Option[Diagnostic] = None
+	var position = 0
+	for parameter in parameters:
+		match arguments.get(position):
+			Some(value): substitution = substitution.append({ parameter = parameter, value_type = value })
 			None:
-				Ok(substitution)
+				failure = Some(invalid(span, "missing concrete type argument"))
+				break
+		position = IntOps.add(position, 1)
+	match failure:
+		Some(error): Err(error)
+		None: Ok(substitution)
+
+
+-- Keys retain ground semantic arguments. Layout projection cannot replace this
+-- authority: same-storage opaque types may select different ordinary bodies.
+private pure func function_substitution(
+	function: SelectedBody, arguments: List[Checked.TypeRef], span: Span,
+) -> Result[Declarations.Substitution, Diagnostic]:
+	owner: Checked.TypeParameterOwner = Checked.FunctionDeclaration(function.root)
+	valid ?= validate_type_parameters(function.type_parameters, arguments.length(), owner, span)
+	Ok({ owner = owner, values = arguments })
+
+
+private pure func semantic_type(
+	value: Checked.TypeRef, substitution: Declarations.Substitution, span: Span,
+) -> Result[Checked.TypeRef, Diagnostic]:
+	match Declarations.substitute_type(value, substitution, span):
+		Err(_): Err(invalid(span, "unresolved or foreign type parameter"))
+		Ok(replaced):
+			if contains_parameter(replaced):
+				Err(invalid(span, "unresolved or foreign type parameter"))
+			else:
+				Ok(replaced)
+
+
+private pure func semantic_arguments(
+	arguments: List[Checked.TypeRef], substitution: Declarations.Substitution, span: Span,
+) -> Result[List[Checked.TypeRef], Diagnostic]:
+	translated_list(arguments, pure func(value: Checked.TypeRef) -> Result[Checked.TypeRef, Diagnostic]: semantic_type(value, substitution, span))
 
 
 private fixed record UnionKey {
@@ -2360,7 +2381,7 @@ private pure func function_types(function: SelectedBody) -> List[Checked.TypeUse
 
 
 private pure func runtime_key(
-	body: Checked.BodyOwner, arguments: List[TypeRef], checked: Checked.CheckedFunctions, span: Span,
+	body: Checked.BodyOwner, arguments: List[Checked.TypeRef], checked: Checked.CheckedFunctions, span: Span,
 ) -> Result[InstanceKey, Diagnostic]:
 	function ?= selected_body(checked, body, ConcreteRequest(span))
 	var modes: List[CallableMode] = []
@@ -2372,12 +2393,12 @@ private pure func runtime_key(
 
 
 private pure func runtime_instance(
-	keys: List[FunctionRequest], body: Checked.BodyOwner, arguments: List[TypeRef], span: Span,
+	keys: List[FunctionRequest], body: Checked.BodyOwner, arguments: List[Checked.TypeRef], span: Span,
 ) -> Result[FunctionInstanceId, Diagnostic]:
 	var found: Option[FunctionInstanceId] = None
 	var position = 0
 	for request in keys:
-		if and(Checked.same_body(request.key.body, body), same_arguments(request.key.arguments, arguments)):
+		if and(Checked.same_body(request.key.body, body), Checked.same_types(request.key.arguments, arguments)):
 			var all_runtime: Bool = True
 			for mode in request.key.callables:
 				match mode:
@@ -2431,42 +2452,37 @@ private pure func prepare_callable_storage(
 
 
 private pure func prepare_named_creation(
-	id: Declaration.FunctionId,
-	arguments: List[Checked.TypeRef],
-	substitution: List[TypeSubstitution[PartialType]],
-	checked: Checked.CheckedFunctions,
-	initial: PreparedInstances,
-	span: Span,
+	id: Declaration.FunctionId, arguments: List[Checked.TypeRef],
+	substitution: Declarations.Substitution, checked: Checked.CheckedFunctions,
+	initial: PreparedInstances, span: Span,
 ) -> Result[PreparedInstances, Diagnostic]:
-	types ?= prepare_arguments(arguments, substitution, checked, initial.unions, span, initial.records, [])
+	semantic ?= semantic_arguments(arguments, substitution, span)
+	types ?= prepare_arguments(semantic, [], checked, initial.unions, span, initial.records, [])
 	concrete ?= known_types(types.arguments, span)
-	key ?= runtime_key(Checked.DeclaredBody(id), concrete, checked, span)
+	key ?= runtime_key(Checked.DeclaredBody(id), semantic, checked, span)
 	Ok(request_instance({ initial | unions = types.unions, records = types.records }, key, ConcreteRequest(span)))
 
 
 private pure func prepare_lambda_creation(
-	id: Checked.LambdaId,
-	captures: List[Checked.CheckedExpr],
-	arguments: List[TypeRef],
-	checked: Checked.CheckedFunctions,
-	initial: PreparedInstances,
-	span: Span,
+	id: Checked.LambdaId, captures: List[Checked.CheckedExpr],
+	arguments: List[Checked.TypeRef], storage_arguments: List[TypeRef],
+	checked: Checked.CheckedFunctions, initial: PreparedInstances, span: Span,
 ) -> Result[PreparedInstances, Diagnostic]:
-	storage ?= prepare_callable_storage(id, captures, arguments, checked, initial, span)
+	storage ?= prepare_callable_storage(id, captures, storage_arguments, checked, initial, span)
 	key ?= runtime_key(Checked.LambdaBody(id), arguments, checked, span)
 	Ok(request_instance(storage.prepared, key, ConcreteRequest(span)))
 
 
 private pure func prepare_creation(
 	value: Checked.CheckedExpr, request: FunctionRequest,
-	substitution: List[TypeSubstitution[PartialType]], checked: Checked.CheckedFunctions,
-	initial: PreparedInstances,
+	substitution: Declarations.Substitution, storage_arguments: List[TypeRef],
+	checked: Checked.CheckedFunctions, initial: PreparedInstances,
 ) -> Result[PreparedInstances, Diagnostic]:
 	match value.form:
 		Checked.MakeCallable(Checked.NamedCallable(id, arguments)):
 			prepare_named_creation(id, arguments, substitution, checked, initial, value.span)
 		Checked.MakeCallable(Checked.LambdaCallable(id, captures)):
-			prepare_lambda_creation(id, captures, request.key.arguments, checked, initial, value.span)
+			prepare_lambda_creation(id, captures, request.key.arguments, storage_arguments, checked, initial, value.span)
 		_: Ok(initial)
 
 
@@ -2476,13 +2492,14 @@ private pure func prepare_function(
 	checked: Checked.CheckedFunctions,
 	initial: PreparedInstances,
 ) -> Result[PreparedInstances, Diagnostic]:
+	semantic ?= function_substitution(function, request.key.arguments, function.return_type.span)
+	argument_layouts ?= prepare_arguments(request.key.arguments, [], checked, initial.unions, function.return_type.span, initial.records, [])
+	storage_arguments ?= known_types(argument_layouts.arguments, function.return_type.span)
 	substitution ?= parameter_substitution(
-		function.type_parameters,
-		known_arguments(request.key.arguments),
-		Checked.FunctionDeclaration(function.root),
-		function.return_type.span,
+		function.type_parameters, argument_layouts.arguments,
+		Checked.FunctionDeclaration(function.root), function.return_type.span,
 	)
-	var prepared = initial
+	var prepared = { initial | unions = argument_layouts.unions, records = argument_layouts.records }
 	var failure: Option[Diagnostic] = None
 	has_type_parameters = function.type_parameters.is_empty().not()
 
@@ -2510,7 +2527,7 @@ private pure func prepare_function(
 
 	if failure.is_some().not():
 		for value in Checked.body_callable_creations(function.statements, function.body):
-			match prepare_creation(value, request, substitution, checked, prepared):
+			match prepare_creation(value, request, semantic, storage_arguments, checked, prepared):
 				Ok(next): prepared = next
 				Err(error):
 					failure = Some(error)
@@ -2530,7 +2547,7 @@ private pure func prepare_function(
 								Ok(key): prepared = request_instance(prepared, key, request.source)
 								Err(error): failure = Some(error)
 				Checked.UserFunction(declaration, arguments):
-					var concrete: List[TypeRef] = []
+					var concrete: List[Checked.TypeRef] = []
 					var depends_on_caller: Bool = False
 
 					for argument in arguments:
@@ -2540,29 +2557,24 @@ private pure func prepare_function(
 							True: contains_parameter(argument)
 							False: False
 						depends_on_caller = or(depends_on_caller, argument_depends_on_caller)
-						match prepare_type(
-							argument,
-							substitution,
-							checked,
-							prepared.unions,
-							request_span(argument_depends_on_caller, request.source, call.span),
-							prepared.records,
-							[],
-						):
-							Ok(value):
-								prepared = { prepared |
-									unions = value.unions,
-									records = value.records
-								}
-								-- No layout is in progress at a function boundary.
-								match known_type(value.value_type, call.span):
-									Ok(known): concrete = concrete.append(known)
-									Err(error):
-										failure = Some(error)
-										break
+						argument_span = request_span(argument_depends_on_caller, request.source, call.span)
+						match semantic_type(argument, semantic, argument_span):
 							Err(error):
 								failure = Some(error)
 								break
+							Ok(replaced):
+								match prepare_type(replaced, [], checked, prepared.unions, argument_span, prepared.records, []):
+									Err(error):
+										failure = Some(error)
+										break
+									Ok(value):
+										prepared = { prepared | unions = value.unions, records = value.records }
+										-- No layout is in progress at a function boundary.
+										match known_type(value.value_type, call.span):
+											Ok(_): concrete = concrete.append(replaced)
+											Err(error):
+												failure = Some(error)
+												break
 
 					if failure.is_some():
 						break
@@ -2580,7 +2592,7 @@ private pure func prepare_function(
 										forward_callable(request.key.callables, parameter, written_parameter, written_span)
 									Checked.LambdaCallable(id, captures):
 										choice_depends_on_caller = has_type_parameters
-										match prepare_callable_storage(id, captures, request.key.arguments, checked, prepared, written_span):
+										match prepare_callable_storage(id, captures, storage_arguments, checked, prepared, written_span):
 											Err(error): Err(error)
 											Ok(storage):
 												prepared = storage.prepared
@@ -2594,19 +2606,20 @@ private pure func prepare_function(
 										choice_depends_on_caller = match has_type_parameters:
 											True: named_arguments.any(contains_parameter)
 											False: False
-										match prepare_arguments(
-											named_arguments, substitution, checked, prepared.unions,
-											request_span(choice_depends_on_caller, request.source, written_span), prepared.records, [],
-										):
+										span = request_span(choice_depends_on_caller, request.source, written_span)
+										match semantic_arguments(named_arguments, semantic, span):
 											Err(error): Err(error)
-											Ok(types):
-												prepared = { prepared | unions = types.unions, records = types.records }
-												known_types(types.arguments, written_span).map(pure func(values): StaticCallable({
-													parameter = written_parameter,
-													body = Checked.DeclaredBody(id),
-													arguments = values,
-													storage = ErasedCallable
-												}))
+											Ok(callable_arguments):
+												match prepare_arguments(callable_arguments, [], checked, prepared.unions, span, prepared.records, []):
+													Err(error): Err(error)
+													Ok(callable_layouts):
+														prepared = { prepared | unions = callable_layouts.unions, records = callable_layouts.records }
+														known_types(callable_layouts.arguments, written_span).map(pure func(_): StaticCallable({
+															parameter = written_parameter,
+															body = Checked.DeclaredBody(id),
+															arguments = callable_arguments,
+															storage = ErasedCallable
+														}))
 									Checked.StoredCallable(_): Ok(RuntimeCallable(written_parameter))
 								depends_on_caller = or(depends_on_caller, choice_depends_on_caller)
 								match choice_result:
@@ -2797,17 +2810,20 @@ private pure func forward_translation(
 
 private pure func lambda_storage(
 	id: Checked.LambdaId,
-	captures: List[Checked.CheckedExpr],
-	arguments: List[TypeRef],
-	records: List[RecordInstance],
-	span: Span,
+	capture_count: Int,
+	arguments: List[Checked.TypeRef], opaques: List[Checked.CheckedOpaque],
+	substitution: Declarations.Substitution, unions: List[UnionInstance],
+	records: List[RecordInstance], span: Span,
 ) -> Result[CallableStorage, Diagnostic]:
-	if captures.is_empty():
+	if IntOps.equals(capture_count, 0):
 		Ok(ErasedCallable)
 	else:
-		match find_record_instance(records, { origin = CaptureEnvironment(id), arguments = arguments }):
-			None: Err(invalid(span, "unprepared capture environment"))
-			Some(owner): Ok(EnvironmentCallable(owner))
+		match concrete_types(opaques, arguments, substitution, unions, span, records):
+			Err(error): Err(error)
+			Ok(physical):
+				match find_record_instance(records, { origin = CaptureEnvironment(id), arguments = physical }):
+					None: Err(invalid(span, "unprepared capture environment"))
+					Some(owner): Ok(EnvironmentCallable(owner))
 
 
 private pure func callable_environment(
@@ -2827,7 +2843,7 @@ private pure func callable_environment(
 private pure func translate_call(
 	opaques: List[Checked.CheckedOpaque],
 	call: Checked.CheckedCall,
-	substitution: List[TypeSubstitution[TypeRef]],
+	substitution: Declarations.Substitution,
 	callables: TranslationBindings,
 	keys: List[FunctionRequest],
 	unions: List[UnionInstance],
@@ -2993,7 +3009,7 @@ private pure func translate_call(
 						Ok(known):
 							runtime_instance(keys, known.body, known.arguments, call.span).map(pure func(id): UserFunction(id))
 		Checked.UserFunction(declaration, arguments):
-			match concrete_types(opaques, arguments, substitution, unions, call.span, records):
+			match semantic_arguments(arguments, substitution, call.span):
 				Err(error): Err(error)
 				Ok(concrete):
 					var choices: List[CallableMode] = []
@@ -3006,15 +3022,15 @@ private pure func translate_call(
 									Checked.ForwardedCallable(parameter):
 										forward_translation(callables, parameter, written_parameter, written_span)
 									Checked.LambdaCallable(id, captures):
-										root_arguments = substitution.map(pure func(value): value.value_type)
-										lambda_storage(id, captures, root_arguments, records, written_span).map(pure func(storage): StaticCallable({
+										root_arguments = substitution.values
+										lambda_storage(id, captures.length(), root_arguments, opaques, substitution, unions, records, written_span).map(pure func(storage): StaticCallable({
 											parameter = written_parameter,
 											body = Checked.LambdaBody(id),
 											arguments = root_arguments,
 											storage = storage
 										}))
 									Checked.NamedCallable(id, named_arguments):
-										concrete_types(opaques, named_arguments, substitution, unions, written_span, records).map(pure func(values): StaticCallable({
+										semantic_arguments(named_arguments, substitution, written_span).map(pure func(values): StaticCallable({
 											parameter = written_parameter,
 											body = Checked.DeclaredBody(id),
 											arguments = values,
@@ -3086,7 +3102,7 @@ private pure func translate_record_field(
 	opaques: List[Checked.CheckedOpaque],
 	field: Checked.CheckedRecordField,
 	owner: RecordInstanceId,
-	substitution: List[TypeSubstitution[TypeRef]],
+	substitution: Declarations.Substitution,
 	callables: TranslationBindings,
 	keys: List[FunctionRequest],
 	unions: List[UnionInstance],
@@ -3101,7 +3117,7 @@ private pure func translate_record_fields(
 	opaques: List[Checked.CheckedOpaque],
 	fields: List[Checked.CheckedRecordField],
 	owner: RecordInstanceId,
-	substitution: List[TypeSubstitution[TypeRef]],
+	substitution: Declarations.Substitution,
 	callables: TranslationBindings,
 	keys: List[FunctionRequest],
 	unions: List[UnionInstance],
@@ -3151,7 +3167,7 @@ private pure func callable_binding_value(
 
 private pure func translate_callable_value(
 	opaques: List[Checked.CheckedOpaque], choice: Checked.CallableChoice, value_type: TypeRef,
-	substitution: List[TypeSubstitution[TypeRef]], translation: TranslationBindings,
+	substitution: Declarations.Substitution, translation: TranslationBindings,
 	keys: List[FunctionRequest], unions: List[UnionInstance], records: List[RecordInstance], span: Span,
 ) -> Result[ConcreteExpr, Diagnostic]:
 	match choice:
@@ -3162,7 +3178,7 @@ private pure func translate_callable_value(
 				Ok(binding):
 					callable_binding_value(binding, keys, span)
 		Checked.NamedCallable(id, arguments):
-			match concrete_types(opaques, arguments, substitution, unions, span, records):
+			match semantic_arguments(arguments, substitution, span):
 				Err(error): Err(error)
 				Ok(concrete):
 					match runtime_instance(keys, Checked.DeclaredBody(id), concrete, span):
@@ -3170,7 +3186,7 @@ private pure func translate_callable_value(
 						Ok(body):
 							Ok({ form = FreeCallable(body), value_type = value_type, span = span })
 		Checked.LambdaCallable(id, captures):
-			arguments = substitution.map(pure func(value): value.value_type)
+			arguments = substitution.values
 			match runtime_instance(keys, Checked.LambdaBody(id), arguments, span):
 				Err(error): Err(error)
 				Ok(body):
@@ -3186,7 +3202,7 @@ private pure func translate_callable_value(
 private pure func translate_invocation(
 	opaques: List[Checked.CheckedOpaque], value: Checked.CheckedExpr,
 	call: Checked.CheckedCall,
-	substitution: List[TypeSubstitution[TypeRef]], translation: TranslationBindings,
+	substitution: Declarations.Substitution, translation: TranslationBindings,
 	keys: List[FunctionRequest], unions: List[UnionInstance], records: List[RecordInstance],
 ) -> Result[ConcreteExpr, Diagnostic]:
 	callee: Result[Option[ConcreteExpr], Diagnostic] = match call.target:
@@ -3220,7 +3236,7 @@ private pure func translate_invocation(
 private pure func translate_tuple_element(
 	opaques: List[Checked.CheckedOpaque], value: Checked.CheckedExpr,
 	receiver: Checked.CheckedExpr, ordinal: Int,
-	substitution: List[TypeSubstitution[TypeRef]], callables: TranslationBindings,
+	substitution: Declarations.Substitution, callables: TranslationBindings,
 	keys: List[FunctionRequest], unions: List[UnionInstance], records: List[RecordInstance],
 ) -> Result[ConcreteExpr, Diagnostic]:
 	source ?= translate_expr(opaques, receiver, substitution, callables, keys, unions, records)
@@ -3233,7 +3249,7 @@ private pure func translate_tuple_element(
 
 private pure func translate_tuple(
 	opaques: List[Checked.CheckedOpaque], value: Checked.CheckedExpr,
-	elements: List[Checked.CheckedExpr], substitution: List[TypeSubstitution[TypeRef]],
+	elements: List[Checked.CheckedExpr], substitution: Declarations.Substitution,
 	callables: TranslationBindings, keys: List[FunctionRequest],
 	unions: List[UnionInstance], records: List[RecordInstance],
 ) -> Result[ConcreteExpr, Diagnostic]:
@@ -3253,7 +3269,7 @@ private pure func translate_tuple(
 private pure func translate_expr(
 	opaques: List[Checked.CheckedOpaque],
 	value: Checked.CheckedExpr,
-	substitution: List[TypeSubstitution[TypeRef]],
+	substitution: Declarations.Substitution,
 	callables: TranslationBindings,
 	keys: List[FunctionRequest],
 	unions: List[UnionInstance],
@@ -3380,7 +3396,7 @@ private pure func translate_leaf(
 	opaques: List[Checked.CheckedOpaque],
 	form: ConcreteForm,
 	value: Checked.CheckedExpr,
-	substitution: List[TypeSubstitution[TypeRef]],
+	substitution: Declarations.Substitution,
 	unions: List[UnionInstance],
 	records: List[RecordInstance],
 ) -> Result[ConcreteExpr, Diagnostic]:
@@ -3392,7 +3408,7 @@ private pure func translate_leaf(
 private pure func translate_call_operands(
 	opaques: List[Checked.CheckedOpaque],
 	call: Checked.CheckedCall,
-	substitution: List[TypeSubstitution[TypeRef]],
+	substitution: Declarations.Substitution,
 	translation: TranslationBindings,
 	keys: List[FunctionRequest],
 	unions: List[UnionInstance],
@@ -3424,7 +3440,7 @@ private pure func translate_call_operands(
 private pure func translate_call_arguments(
 	opaques: List[Checked.CheckedOpaque],
 	call: Checked.CheckedCall,
-	substitution: List[TypeSubstitution[TypeRef]],
+	substitution: Declarations.Substitution,
 	translation: TranslationBindings,
 	keys: List[FunctionRequest],
 	unions: List[UnionInstance],
@@ -3450,7 +3466,7 @@ private pure func translate_callable_operand(
 	opaques: List[Checked.CheckedOpaque],
 	choice: Checked.CallableChoice,
 	span: Span,
-	substitution: List[TypeSubstitution[TypeRef]],
+	substitution: Declarations.Substitution,
 	translation: TranslationBindings,
 	keys: List[FunctionRequest],
 	unions: List[UnionInstance],
@@ -3474,10 +3490,10 @@ private pure func translate_callable_operand(
 
 private pure func translate_capture_environment(
 	opaques: List[Checked.CheckedOpaque], id: Checked.LambdaId, captures: List[Checked.CheckedExpr],
-	substitution: List[TypeSubstitution[TypeRef]], translation: TranslationBindings,
+	substitution: Declarations.Substitution, translation: TranslationBindings,
 	keys: List[FunctionRequest], unions: List[UnionInstance], records: List[RecordInstance], span: Span,
 ) -> Result[Option[ConcreteExpr], Diagnostic]:
-	match lambda_storage(id, captures, substitution.map(pure func(value): value.value_type), records, span):
+	match lambda_storage(id, captures.length(), substitution.values, opaques, substitution, unions, records, span):
 		Err(error): Err(error)
 		Ok(ErasedCallable): Ok(None)
 		Ok(EnvironmentCallable(owner)):
@@ -3492,11 +3508,10 @@ private pure func translate_capture_environment(
 					Ok(Some({ form = ConstructRecord(owner, fields), value_type = RecordType(owner), span = span }))
 
 
-
 private pure func translate_exprs(
 	opaques: List[Checked.CheckedOpaque],
 	values: List[Checked.CheckedExpr],
-	substitution: List[TypeSubstitution[TypeRef]],
+	substitution: Declarations.Substitution,
 	callables: TranslationBindings,
 	keys: List[FunctionRequest],
 	unions: List[UnionInstance],
@@ -3523,7 +3538,7 @@ private pure func translate_exprs(
 private pure func translate_statements(
 	opaques: List[Checked.CheckedOpaque],
 	statements: List[Checked.CheckedStatement],
-	substitution: List[TypeSubstitution[TypeRef]],
+	substitution: Declarations.Substitution,
 	callables: TranslationBindings,
 	keys: List[FunctionRequest],
 	unions: List[UnionInstance],
@@ -3638,7 +3653,7 @@ private pure func translate_place_variant(
 private pure func translate_place(
 	opaques: List[Checked.CheckedOpaque],
 	place: Checked.CheckedPatternPlace,
-	substitution: List[TypeSubstitution[TypeRef]],
+	substitution: Declarations.Substitution,
 	unions: List[UnionInstance],
 	records: List[RecordInstance],
 	span: Span,
@@ -3672,7 +3687,7 @@ private pure func translate_place(
 private pure func translate_pattern_argument(
 	opaques: List[Checked.CheckedOpaque],
 	argument: Checked.CheckedPatternArgument,
-	substitution: List[TypeSubstitution[TypeRef]],
+	substitution: Declarations.Substitution,
 	unions: List[UnionInstance],
 	records: List[RecordInstance],
 	span: Span,
@@ -3689,7 +3704,7 @@ private pure func translate_pattern_argument(
 private pure func translate_selection(
 	opaques: List[Checked.CheckedOpaque],
 	selection: Checked.CheckedSelection,
-	substitution: List[TypeSubstitution[TypeRef]],
+	substitution: Declarations.Substitution,
 	unions: List[UnionInstance],
 	records: List[RecordInstance],
 	span: Span,
@@ -3723,7 +3738,7 @@ private pure func translate_selection(
 private pure func translate_join(
 	opaques: List[Checked.CheckedOpaque],
 	join: Checked.CheckedJoin,
-	substitution: List[TypeSubstitution[TypeRef]],
+	substitution: Declarations.Substitution,
 	callables: TranslationBindings,
 	keys: List[FunctionRequest],
 	unions: List[UnionInstance],
@@ -3750,7 +3765,7 @@ private pure func translate_join(
 private pure func translate_join_arm(
 	opaques: List[Checked.CheckedOpaque],
 	arm: Checked.CheckedJoinArm,
-	substitution: List[TypeSubstitution[TypeRef]],
+	substitution: Declarations.Substitution,
 	callables: TranslationBindings,
 	keys: List[FunctionRequest],
 	unions: List[UnionInstance],
@@ -3766,7 +3781,7 @@ private pure func translate_join_arm(
 private pure func translate_exit(
 	opaques: List[Checked.CheckedOpaque],
 	exit: Checked.CheckedExit,
-	substitution: List[TypeSubstitution[TypeRef]],
+	substitution: Declarations.Substitution,
 	callables: TranslationBindings,
 	keys: List[FunctionRequest],
 	unions: List[UnionInstance],
@@ -4030,7 +4045,7 @@ private pure func translate_parameters(
 	opaques: List[Checked.CheckedOpaque],
 	function: SelectedBody,
 	key: InstanceKey,
-	substitution: List[TypeSubstitution[TypeRef]],
+	substitution: Declarations.Substitution,
 	unions: List[UnionInstance],
 	records: List[RecordInstance],
 ) -> Result[TranslatedParameters, Diagnostic]:
@@ -4043,12 +4058,12 @@ private pure func translate_parameters(
 	match key.body:
 		Checked.DeclaredBody(_): void
 		Checked.LambdaBody(id):
-			if function.captures.is_empty().not():
-				match find_record_instance(records, { origin = CaptureEnvironment(id), arguments = key.arguments }):
-					None: failure = Some(invalid(span, "missing lambda capture layout"))
-					Some(owner):
-						capture = LambdaCaptureBinding(id, owner, Checked.binding_id(function.bindings.length()))
-						parameters = [RecordType(owner)]
+			match lambda_storage(id, function.captures.length(), key.arguments, opaques, substitution, unions, records, span):
+				Err(error): failure = Some(error)
+				Ok(ErasedCallable): void
+				Ok(EnvironmentCallable(owner)):
+					capture = LambdaCaptureBinding(id, owner, Checked.binding_id(function.bindings.length()))
+					parameters = [RecordType(owner)]
 
 	-- The checked binding origin carries the formal link. Erasing a selected
 	-- callable cannot shift another checked id: this map records every old id.
@@ -4108,7 +4123,7 @@ private pure func translate_parameters(
 private pure func translate_match_arm(
 	opaques: List[Checked.CheckedOpaque],
 	arm: Checked.CheckedArm,
-	substitution: List[TypeSubstitution[TypeRef]],
+	substitution: Declarations.Substitution,
 	callables: TranslationBindings,
 	keys: List[FunctionRequest],
 	unions: List[UnionInstance],
@@ -4124,7 +4139,7 @@ private pure func translate_match_arm(
 private pure func translate_match(
 	opaques: List[Checked.CheckedOpaque],
 	matched: Checked.CheckedMatch,
-	substitution: List[TypeSubstitution[TypeRef]],
+	substitution: Declarations.Substitution,
 	callables: TranslationBindings,
 	keys: List[FunctionRequest],
 	unions: List[UnionInstance],
@@ -4150,12 +4165,7 @@ private pure func translate_function(
 	record_layouts: List[ConcreteRecord],
 ) -> Result[ConcreteFunction, Diagnostic]:
 	span = function.return_type.span
-	substitution ?= parameter_substitution(
-		function.type_parameters,
-		key.arguments,
-		Checked.FunctionDeclaration(function.root),
-		span,
-	)
+	substitution ?= function_substitution(function, key.arguments, span)
 
 	runtime ?= translate_parameters(opaques, function, key, substitution, unions, records)
 	parameters = runtime.parameters
