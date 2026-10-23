@@ -211,13 +211,15 @@ strict target balance. The current reviewed producer supports static trait bound
 default methods, contextual method references and automatic equality for nongeneric
 named records/unions. Its configured prelude selects the canonical trait through
 an ordinary imported binding, permitting that trait to live in a library module
-while _base remains import-free. Generic aggregate automatic equality remains deferred. The
+while _base remains import-free. It also supports consuming String concatenation
+with checked capacity growth and unique-buffer reuse. Generic aggregate automatic
+equality remains deferred. The
 seed tag identifies the final approved source commit, retained in each archive's
 `source-commit.txt`; compiler and library inventories must match across platforms.
 The reviewed workflow and release documentation changes receive their own commit
 and seed tag before the default library adopts trait syntax. Compiler C is locked
 to SHA-256
-`9e7f0baea10268e5dac8d457a2b1ff16ed13ef5cc9d48aacec02815504c4f85f`, checked
+`044ce4ce23c1085f76027967e3e0c946f6b580a23bd567d1085bbf01edd3c299`, checked
 immediately after A emits C and before B qualification. Each provenance archive
 retains `reviewed-compiler-c.sha256`; the publisher checks the emitted C against
 that digest and requires all platforms to agree. The earlier stored-callable/tuple
