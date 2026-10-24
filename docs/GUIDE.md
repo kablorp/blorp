@@ -4,6 +4,14 @@ A comprehensive reference for the blorp programming language.
 
 The Blorp 2 pilot uses explicit `bool: not, and, or` imports for eager calls and UFCS: `not(value)`, `and(left, right)` and `or(left, right)`.
 Its prefix/infix Boolean forms are invalid; use an explicit `match` to skip an argument.
+The pilot supports fixed equality operators: `left == right` calls canonical
+`Equatable.equals`, and `left != right` calls canonical `Equatable.not_equals`,
+including an implementation override. Operands evaluate once from left to right,
+with ordinary trait bounds and the same receiver type. These canonical calls
+need no method-name import; ordinary UFCS retains its visibility rules.
+Comparisons cannot chain. They bind below ranges/postfix calls and above prefix
+`not`; use parentheses for an intended nested comparison. Newlines after a
+symbol continue only inside brackets. See the [pilot operator rules](../blorp_2/README.md#equality-operators).
 
 The separate [Blorp 2 pilot](../blorp_2/README.md) implements a restricted
 subset. Its current examples include immutable bindings and local `var`

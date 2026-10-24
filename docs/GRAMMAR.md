@@ -22,7 +22,14 @@ first formal is `Self`. A method without `:` is abstract; one with `:` has an
 ordinary default body. Function type parameters and complete implementation receiver
 families accept bounds such as `Value: Equatable + Visit` and `Box[Value: Visit]`.
 The configured prelude selects canonical Equatable through its ordinary imported
-trait binding; this adds no syntax or implicit method import.
+trait binding. Fixed `==` and `!=` expressions select that trait's `equals` and
+`not_equals` methods directly, without an ordinary method-name import. The
+adjacent symbols bind below ranges and above prefix `not`, and cannot chain;
+parenthesize nested comparisons. Their operands evaluate once, left then right.
+A newline after a symbol continues only inside brackets. The comparison layer is
+`range_expr [ spaces ("==" | "!=") spaces range_expr ]`; ordinary UFCS visibility
+and trait implementation rules remain unchanged. Other infix operators remain
+outside the pilot checker.
 A default-only `implements Trait for Type` header ends at the newline, without a
 colon. Contextual unbound method references use ordinary expressions and need an
 expected callable type determining `Self`. See the [pilot trait rules](../blorp_2/README.md#concrete-traits)

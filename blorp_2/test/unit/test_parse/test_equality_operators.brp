@@ -1,0 +1,175 @@
+import:
+	../parse_function_inputs: free_functions
+	../../../src/lex/lex: lex
+	../../../src/parse/parse: ParsedModule, module_contents, parse_module
+	../../../src/utils/names: program_names
+	../../../src/utils/source: module_source, root_module_id
+	../../../src/utils/syntax:
+		Diagnostic, ValueExpression,
+		EqualityOperator(EqualOperator, NotEqualOperator),
+		LogicalOperator(AndOperator, OrOperator),
+		ExpressionBase(EqualityExpression, RangeExpression, NotExpression, LogicalExpression, DirectApplication, TupleExpression),
+		ParsedBody(ParsedValueBody), ParsedStatement(BindingStatement, TupleBinding),
+	test: TestSuite
+
+
+private HEADER: String = "func main() -> Int:\n"
+
+
+private pure func parse_source(source: String) -> Result[ParsedModule, Diagnostic]:
+	tokens ?= lex(module_source(root_module_id()), source, program_names().names)
+	parse_module(tokens, root_module_id())
+
+
+private pure func value(source: String) -> Option[ValueExpression]:
+	match parse_source(HEADER + source):
+		Err(_): None
+		Ok(parsed):
+			match free_functions(module_contents(parsed).functions).get(0).map(pure func(function): function.body):
+				Some(ParsedValueBody(body)): Some(body)
+				_: None
+
+
+private pure func rejects(source: String, start: Int, end: Int, message: String, help: String) -> Bool:
+	match parse_source(HEADER + source):
+		Ok(_): False
+		Err(error): error.span.start == start and error.span.end == end and error.message == message and error.help == help
+
+
+pure func test_equality_expression_parses() -> Bool:
+	match value("\ta==b\n"):
+		Some(body):
+			match body.base:
+				EqualityExpression(EqualOperator, span, left, right):
+					span.start == 22 and span.end == 24 and left.span.start == 21 and left.span.end == 22 and right.span.start == 24 and right.span.end == 25 and body.span.start == 21 and body.span.end == 25
+				_: False
+		None: False
+
+
+pure func test_both_parenthesized_entry_paths_preserve_comparison() -> Bool:
+	match (value("\t(a) != b\n"), value("\t(a == b) == c\n")):
+		(Some(first), Some(second)):
+			match (first.base, second.base):
+				(EqualityExpression(NotEqualOperator, span, _, _), EqualityExpression(EqualOperator, _, nested, _)):
+					match nested.base:
+						EqualityExpression(EqualOperator, _, _, _): span.start == 25 and span.end == 27 and first.span.start == 21 and first.span.end == 29
+						_: False
+				_: False
+		_: False
+
+
+pure func test_range_and_postfix_bind_above_comparison() -> Bool:
+	match value("\ta.f()..b == c..d.g()\n"):
+		Some(body):
+			match body.base:
+				EqualityExpression(EqualOperator, _, left, right):
+					match (left.base, right.base):
+						(RangeExpression(low, _), RangeExpression(_, high)): low.applications.length() == 1 and high.applications.length() == 1 and body.applications.is_empty()
+						_: False
+				_: False
+		None: False
+
+
+pure func test_comparison_binds_above_not_and_boolean_operators() -> Bool:
+	match value("\tnot a == b and c != d or e\n"):
+		Some(body):
+			match body.base:
+				LogicalExpression(OrOperator, conjunction, _):
+					match conjunction.base:
+						LogicalExpression(AndOperator, left, right):
+							match (left.base, right.base):
+								(NotExpression(inner), EqualityExpression(NotEqualOperator, _, _, _)):
+									match inner.base:
+										EqualityExpression(EqualOperator, _, _, _): True
+										_: False
+								_: False
+						_: False
+				_: False
+		None: False
+
+
+pure func test_not_call_is_an_ordinary_right_operand() -> Bool:
+	match value("\ta == not(b)\n"):
+		Some(body):
+			match body.base:
+				EqualityExpression(_, _, _, right):
+					match right.base:
+						DirectApplication(_, [_]): True
+						_: False
+				_: False
+		None: False
+
+
+pure func test_chains_reject_at_the_second_operator() -> Bool:
+	rejects("\ta == b != c\n", 28, 30, "comparisons cannot be chained", "compare each pair separately, or parenthesize an intended nested comparison") and rejects("\t(a) != b == c\n", 30, 32, "comparisons cannot be chained", "compare each pair separately, or parenthesize an intended nested comparison")
+
+
+pure func test_prefix_not_requires_grouping_as_right_operand() -> Bool:
+	rejects("\ta == not b\n", 26, 29, "'not' cannot be an equality operand", "write (not value) in parentheses; not binds below comparison")
+
+
+pure func test_multiline_grouping_preserves_existing_layout_rules() -> Bool:
+	value("\t(a ==\n\t\tb)\n").is_some() and rejects("\ta ==\n\t\tb\n", 25, 26, "expected a return expression", "use a literal, a parameter or variant name, or a call as the entire body")
+
+
+pure func test_right_block_and_chain_dedents_finish_the_binding() -> Bool:
+	block: String =
+		|    result = a == if b:
+		|        c
+		|    else:
+		|        d
+		|    result
+		|
+	chain: String =
+		|    result = (a) == b
+		|        .f()
+		|    result
+		|
+	[block, chain].all(pure func(source):
+		match parse_source(HEADER + source):
+			Err(_): False
+			Ok(parsed):
+				match free_functions(module_contents(parsed).functions).get(0):
+					Some(function):
+						match (function.statements, function.body):
+							([BindingStatement(binding)], ParsedValueBody(_)):
+								match binding.initializer.base:
+									EqualityExpression(_, _, _, _): True
+									_: False
+							_: False
+					_: False
+	)
+
+
+pure func test_tuple_assignment_classification_still_wins() -> Bool:
+	match parse_source(HEADER + "\t(a, b) = (1, 2)\n\ta\n"):
+		Err(_): False
+		Ok(parsed):
+			match free_functions(module_contents(parsed).functions).get(0):
+				Some(function):
+					match function.statements:
+						[TupleBinding(_, _, _)]: True
+						_: False
+				_: False
+
+
+pure func test_extra_equals_is_rejected_at_the_unpaired_token() -> Bool:
+	rejects("\ta === b\n", 25, 26, "expected a return expression", "use a literal, a parameter or variant name, or a call as the entire body") and rejects("\ta !== b\n", 25, 26, "expected a return expression", "use a literal, a parameter or variant name, or a call as the entire body")
+
+
+tests: TestSuite = {
+	description = "equality operator parsing",
+	tests = [
+		("equality expression preserves exact spans", test_equality_expression_parses),
+		("both parenthesized entry paths compare", test_both_parenthesized_entry_paths_preserve_comparison),
+		("range and postfix precede comparison", test_range_and_postfix_bind_above_comparison),
+		("comparison precedes not and Boolean operators", test_comparison_binds_above_not_and_boolean_operators),
+		("ordinary not call is a right operand", test_not_call_is_an_ordinary_right_operand),
+		("chains reject the second operator", test_chains_reject_at_the_second_operator),
+		("prefix not needs right operand grouping", test_prefix_not_requires_grouping_as_right_operand),
+		("grouping and bare newline layout", test_multiline_grouping_preserves_existing_layout_rules),
+		("right block and chain dedents finish bindings", test_right_block_and_chain_dedents_finish_the_binding),
+		("tuple assignment classification wins", test_tuple_assignment_classification_still_wins),
+		("extra equals rejects its unpaired token", test_extra_equals_is_rejected_at_the_unpaired_token),
+	]
+}

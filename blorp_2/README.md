@@ -208,6 +208,47 @@ in `traits`; Int, Float, String and List publish written implementations through
 their operation modules. Compiler source continues to obey the separately pinned
 [bootstrap subset](AGENTS.md).
 
+## Equality operators
+
+`left == right` calls the configured prelude's canonical `Equatable.equals`
+method; `left != right` calls its `not_equals` method, including an authored
+implementation override. Both operands evaluate once, left then right. These
+are fixed compiler-defined symbols; users implement ordinary trait methods,
+and cannot introduce operators or change their precedence.
+
+```blorp
+pure func same[Value: Equatable](left: Value, right: Value) -> Bool:
+    left == right
+```
+
+Operator selection uses the canonical method identity, independently of whether
+`equals` or `not_equals` is imported as an ordinary method name. Unrelated
+same-spelled functions or trait families cannot redirect an operator. Ordinary
+UFCS still uses visible method families. Both forms enter the same checked
+trait-call path, with ordinary type inference, generic bounds, purity and
+implementation rules. Both operands have the same `Self` type; a Bool result
+does not determine an otherwise unknown operand type. `[] == []` therefore
+still needs element-type evidence. Unconstrained union constructors such as
+`True == True` also need receiver-type evidence; use typed Bool bindings. These
+are the same inference restrictions as ordinary explicit calls. Closed module
+constants retain their existing restrictions on calls.
+
+Comparisons bind below ranges and postfix operations, above prefix `not` and
+then `and`/`or`. Those Boolean operator forms remain unsupported by checking;
+use the eager Boolean helper calls. Comparisons cannot chain: `a == b == c` is
+an error, while `(a == b) == c` is explicit nesting subject to ordinary typing.
+Both symbol bytes must be adjacent; spaces around the whole symbol are optional.
+A newline after a comparison symbol continues only inside brackets.
+
+A custom canonical declaration may provide only abstract `equals`; `==` works
+there, while `!=` reports the absent `not_equals`. If present, canonical
+`not_equals` must have a pure `(Self, Self) -> Bool` default contract. A written
+implementation can override that default; `!=` is never rewritten to a negation
+that bypasses the override.
+
+Compiler and library implementation sources retain their current call syntax
+until an operator-capable bootstrap is published and pinned.
+
 ## Automatic equality for named aggregates
 
 With the configured prelude's canonical `Equatable`, a named record or union
@@ -1391,8 +1432,8 @@ indentation or one level deeper (a method chain, as in the host); inside an
 indented chain every line starts with `.`, and an `if`, `while`, `for` or
 `match` header may not hold an indented chain.
 `low..high` is a range of two such operands; `not a`, `a and b` and `a or b`
-combine them with the host's precedence (`or` below `and` below `not` below
-`..`, `and`/`or` left-associative). A line break after `and` or `or` is
+combine them with the precedence `or` below `and` below `not` below
+`==`/`!=` below `..`; `and`/`or` associate left and comparisons do not chain. A line break after `and` or `or` is
 accepted only inside brackets; the host also accepts it bare, which is a
 follow-up. `if condition:` opens an indented block, optionally followed by
 `else:` with a block or `else if condition:`, which nests the next
@@ -3082,9 +3123,10 @@ or measurements produced by a phase are returned as data for the shell to presen
 
 Compiler source calls concrete arithmetic, comparison and concatenation functions;
 it does not use trait-dispatched operators. Concrete input traits do not expand
-that compiler-source subset. The target library continues to expose ordinary
-functions until the later Equatable library rollout; operator syntax remains
-separate later work. The legacy host library's trait implementations do not
-permit trait declarations or dispatch in compiler source.
+that compiler-source subset. The production library supplies ordinary Equatable
+implementations; input programs may call their methods or use the fixed equality
+operators. Compiler-source operator migration awaits a capable bootstrap pin.
+The legacy host library's trait implementations do not expand the compiler-source
+subset.
 Exact String equality uses the ordinary `string.equals` API in both libraries;
 `src/utils/text.brp` retains only its concatenation bridge.

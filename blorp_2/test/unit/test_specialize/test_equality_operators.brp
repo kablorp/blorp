@@ -1,0 +1,90 @@
+import:
+	../../../src/check/check: check
+	../../../src/specialize/specialize as Concrete
+	../../../src/utils/syntax: entry_function
+	../test_check/test_traits: parse_equatable_fixture
+	test: TestSuite
+
+
+private CONTRACT: String =
+	|trait Equatable:
+	|    pure func equals(left: Self, right: Self) -> Bool
+	|    pure func not_equals(left: Self, right: Self) -> Bool:
+	|        False
+	|
+
+private IMPLEMENTATION: String =
+	|import:
+	|    _base: Int, Bool, Equatable
+	|implements Equatable for Int:
+	|    pure func equals(left: Self, right: Self) -> Bool:
+	|        builtin("int.equals")
+	|
+
+
+private pure func called_instance(statement: Concrete.ConcreteStatement) -> Option[Concrete.FunctionInstanceId]:
+	match statement:
+		Concrete.InitializeBinding(_, value):
+			match value.form:
+				Concrete.InvokeFunction(call, [_, _]):
+					match call.target:
+						Concrete.UserFunction(target): Some(target)
+						_: None
+				_: None
+		_: None
+
+
+-- Compare identities inside one specialization domain: each operator and its
+-- explicit receiver call must reuse the same ordinary body instance.
+private pure func calls_share_instances(source: String) -> Bool:
+	match parse_equatable_fixture(source, IMPLEMENTATION, CONTRACT):
+		Err(_): False
+		Ok(parsed):
+			match check(parsed):
+				Err(_): False
+				Ok(checked):
+					match Concrete.specialize(checked):
+						Err(_): False
+						Ok(program):
+							contents = Concrete.specialized_contents(program)
+							match contents.functions.get(Concrete.function_number(entry_function(contents.entrypoint))):
+								None: False
+								Some(main):
+									match main.statements:
+										[_, _, first, second, third, fourth]:
+											match (called_instance(first), called_instance(second), called_instance(third), called_instance(fourth)):
+												(Some(equal_operator), Some(equal_method), Some(unequal_operator), Some(unequal_method)):
+													(
+														Concrete.function_number(equal_operator) == Concrete.function_number(equal_method)
+														and Concrete.function_number(unequal_operator) == Concrete.function_number(unequal_method)
+														and Concrete.function_number(equal_operator) != Concrete.function_number(unequal_operator)
+													)
+												_: False
+										_: False
+
+
+pure func test_authored_operator_and_receiver_calls_reuse_the_same_instances() -> Bool:
+	calls_share_instances(
+		"import:\n    int: equals, not_equals\nfunc main() -> Int:\n"
+		+ "    left: Int = 7\n    right: Int = 9\n"
+		+ "    operator_equal = left == right\n    method_equal = left.equals(right)\n"
+		+ "    operator_unequal = left != right\n    method_unequal = left.not_equals(right)\n    0\n",
+	)
+
+
+pure func test_derived_operator_and_receiver_calls_reuse_the_same_instances() -> Bool:
+	calls_share_instances(
+		"import:\n    int: equals, not_equals\nfixed record Point { value: Int }\nfunc main() -> Int:\n"
+		+ "    left: Point = { value = 7 }\n    right: Point = { value = 9 }\n"
+		+ "    operator_equal = left == right\n    method_equal = left.equals(right)\n"
+		+ "    operator_unequal = left != right\n    method_unequal = left.not_equals(right)\n    0\n",
+	)
+
+
+tests: TestSuite = {
+	description = "Equality operators reuse ordinary specialization",
+	tests = [
+		("authored operators and receiver calls reuse body instances", test_authored_operator_and_receiver_calls_reuse_the_same_instances),
+		("derived operators and receiver calls reuse body instances", test_derived_operator_and_receiver_calls_reuse_the_same_instances),
+	]
+}

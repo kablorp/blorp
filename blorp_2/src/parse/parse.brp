@@ -13,8 +13,9 @@ import:
 		ExpressionBase(
 			VoidExpression, IntegerExpression, FloatExpression, StringExpression, InterpolatedString, NameExpression, DirectApplication,
 			QualifiedName, QualifiedApplication, OpaqueWrap, OpaqueUnwrap, ListExpression, TupleExpression, RangeExpression, RecordExpression,
-			RecordUpdateExpression, LogicalExpression, NotExpression, LambdaExpression, IfExpression, MatchExpression,
+			RecordUpdateExpression, EqualityExpression, LogicalExpression, NotExpression, LambdaExpression, IfExpression, MatchExpression,
 		),
+		EqualityOperator(EqualOperator, NotEqualOperator),
 		LogicalOperator(AndOperator, OrOperator),
 		ElseBranch(ElseIf, ElseBlock),
 		ParsedIf,
@@ -71,7 +72,7 @@ import:
 		Span,
 		Symbol(
 			Wildcard, LeftParen, RightParen, Dot, Arrow, Colon, Newline, Indent, Dedent,
-			Equals, QuestionEquals, LeftBracket, RightBracket, LeftBrace, RightBrace,
+			Equals, EqualsEquals, NotEquals, QuestionEquals, LeftBracket, RightBracket, LeftBrace, RightBrace,
 			Bar, Comma, AtSign, Slash, Star, Plus, DotDot, Ellipsis,
 		),
 		Token,
@@ -1552,7 +1553,7 @@ private pure func close_chain_level(state: ParserState, applications: List[Postf
 		consume_chain(state, applications, end, remaining)
 
 
--- Precedence, lowest first, as in the host: `or`, `and`, `not`, `..`, then
+-- Precedence, lowest first: `or`, `and`, `not`, equality, `..`, then
 -- postfix operations. `or` and `and` associate left. A `not` binds below a
 -- range, so `not a..b` negates the range and `a..not b` needs parentheses.
 private pure func consume_value(start: ParserState) -> Result[ParsedValue, Diagnostic]:
@@ -1606,7 +1607,7 @@ private pure func logical(operator: LogicalOperator, left: ParsedValue, right: P
 
 private pure func consume_negation(start: ParserState) -> Result[ParsedValue, Diagnostic]:
 	if or(at_not(start).not(), at_left_paren(shifted(start, 1))):
-		consume_range(start)
+		consume_comparison(start)
 	else:
 		keyword = parser_span(start)
 		match consume_negation(shifted(start, 1)):
@@ -1615,6 +1616,46 @@ private pure func consume_negation(start: ParserState) -> Result[ParsedValue, Di
 				Ok({ body = { base = NotExpression(operand.body), base_span = span, applications = [], span = span }, next = operand.next, ending = operand.ending, owed = operand.owed })
 			Err(error): Err(error)
 
+
+private pure func comparison_operator(state: ParserState) -> Option[EqualityOperator]:
+	match current_token(state):
+		Some(token):
+			match token.kind:
+				SymbolToken(EqualsEquals): Some(EqualOperator)
+				SymbolToken(NotEquals): Some(NotEqualOperator)
+				_: None
+		None: None
+
+
+-- Comparison owns only its token and operands; preserve the right operand's
+-- layout ending and both operands' outstanding chain levels.
+private pure func consume_comparison(start: ParserState) -> Result[ParsedValue, Diagnostic]:
+	left ?= consume_range(start)
+	consume_comparison_rest(left)
+
+
+private pure func consume_comparison_rest(left: ParsedValue) -> Result[ParsedValue, Diagnostic]:
+	match comparison_operator(left.next):
+		Some(operator):
+			if inline(left):
+				consume_comparison_right(left, operator)
+			else:
+				Ok(left)
+		None: Ok(left)
+
+
+private pure func consume_comparison_right(left: ParsedValue, operator: EqualityOperator) -> Result[ParsedValue, Diagnostic]:
+	token = parser_span(left.next)
+	after = shifted(left.next, 1)
+	right: ParsedValue ?= if and(at_not(after), at_left_paren(shifted(after, 1)).not()):
+		Err(expected_syntax(after, "'not' cannot be an equality operand", "write (not value) in parentheses; not binds below comparison"))
+	else:
+		consume_range(after)
+	if and(inline(right), comparison_operator(right.next).is_some()):
+		Err(expected_syntax(right.next, "comparisons cannot be chained", "compare each pair separately, or parenthesize an intended nested comparison"))
+	else:
+		span = { left.body.span | end = right.body.span.end }
+		Ok({ body = { base = EqualityExpression(operator, token, left.body, right.body), base_span = span, applications = [], span = span }, next = right.next, ending = right.ending, owed = IntOps.add(left.owed, right.owed) })
 
 -- One operand, or `low..high`: two operands around '..'. A range has no
 -- postfix operations of its own; group it to apply any.
@@ -2699,7 +2740,8 @@ private pure func consume_parenthesized_line(state: ParserState) -> Result[LineF
 private pure func consume_parenthesized_line_value(enclosed: ParsedEnclosed) -> Result[LineForm, Diagnostic]:
 	operand ?= finish_enclosed_value(enclosed)
 	range ?= consume_range_rest(operand)
-	conjunction ?= consume_conjunction_rest(range)
+	comparison ?= consume_comparison_rest(range)
+	conjunction ?= consume_conjunction_rest(comparison)
 	value ?= consume_disjunction_rest(conjunction)
 	value_line_form(value)
 

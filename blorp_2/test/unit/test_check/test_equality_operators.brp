@@ -1,0 +1,426 @@
+import:
+	./test_traits: parse_equatable_fixture, parse_trait_fixture
+	../../../src/check/check: CheckFailure, check, checked_functions, check_errors
+	../../../src/check/model as Model
+	../../../src/check/errors as Errors
+	../../../src/check/render: render_failure
+	../../../src/parse/assemble: ParsedProgram, parsed_contents
+	../../../src/utils/ids: inventory_traits, inventory_functions, trait_method_header, same_trait_method
+	../../../src/utils/source: module_source, root_module_id
+	../../../src/utils/syntax: Diagnostic, Span, same_span, type_span, ParsedBody(ParsedValueBody), ExpressionBase(EqualityExpression, DirectApplication)
+	test: TestSuite
+
+
+private IMPORT: String = "import:\n    int as Integer\n"
+private BODY: String = "pure func compare() -> Bool:\n    "
+private ENTRY: String = "\nfunc main() -> Int:\n    0\n"
+private REQUIREMENT: String =
+	|trait Equatable:
+	|    pure func equals(left: Self, right: Self) -> Bool
+	|
+private CONTRACT: String =
+	|trait Equatable:
+	|    pure func equals(left: Self, right: Self) -> Bool
+	|    pure func not_equals(left: Self, right: Self) -> Bool:
+	|        match equals(left, right):
+	|            True: False
+	|            False: True
+	|
+private IMPLEMENTATION: String =
+	|import:
+	|    _base: Int, Bool(True, False), List, Equatable
+	|implements Equatable for Int:
+	|    pure func equals(left: Self, right: Self) -> Bool:
+	|        builtin("int.equals")
+	|implements Equatable for List[Element]:
+	|    pure func equals(left: Self, right: Self) -> Bool:
+	|        True
+	|
+
+
+private pure func fixture(source: String, contract: String) -> Result[ParsedProgram, Diagnostic]:
+	parse_equatable_fixture(IMPORT + source, IMPLEMENTATION, contract)
+
+
+private pure func span(start: Int, end: Int) -> Span:
+	{ source = module_source(root_module_id()), start = start, end = end }
+
+
+private pure func diagnostic_matches(failure: CheckFailure, expected: Span, message: String, help: String) -> Bool:
+	diagnostics = render_failure(failure)
+	errors = check_errors(failure)
+	(diagnostics.remaining.is_empty() and errors.remaining.is_empty()
+		and same_span(errors.first.span, expected) and same_span(diagnostics.first.span, expected)
+		and diagnostics.first.message == message and diagnostics.first.help == help
+		and diagnostics.first.note.is_none())
+
+
+pure func test_operator_checks_without_method_import() -> Bool:
+	match fixture(BODY + "7 == 7" + ENTRY, REQUIREMENT):
+		Err(_): False
+		Ok(parsed):
+			match check(parsed):
+				Err(_): False
+				Ok(checked):
+					functions = checked_functions(checked)
+					match (functions.traits.canonical, functions.functions.get(0)):
+						(Some(canonical), Some(compare)):
+							match Model.function_calls(compare):
+								[call]:
+									match call.target:
+										Model.TraitMethod(method): same_trait_method(Model.method_identity(method), Model.canonical_equals(canonical)) and Model.same_type(Model.method_receiver(method), Model.IntType)
+										_: False
+								_: False
+						_: False
+
+
+pure func test_inequality_publishes_the_reserved_member_identity() -> Bool:
+	match fixture(BODY + "7 != 7" + ENTRY, CONTRACT):
+		Err(_): False
+		Ok(parsed):
+			match check(parsed):
+				Err(_): False
+				Ok(checked):
+					functions = checked_functions(checked)
+					match (functions.traits.canonical, functions.functions.get(0)):
+						(Some(canonical), Some(compare)):
+							match (Model.canonical_not_equals(canonical), Model.function_calls(compare)):
+								(Some(expected), [call]):
+									match call.target:
+										Model.TraitMethod(method): same_trait_method(Model.method_identity(method), expected) and not same_trait_method(expected, Model.canonical_equals(canonical))
+										_: False
+								_: False
+						_: False
+
+
+pure func test_equals_only_contract_rejects_only_inequality() -> Bool:
+	prefix = IMPORT + BODY + "7 "
+	match fixture(BODY + "7 != 7" + ENTRY, REQUIREMENT):
+		Err(_): False
+		Ok(parsed):
+			match check(parsed):
+				Ok(_): False
+				Err(failure):
+					match check_errors(failure).first.kind:
+						Errors.TraitRejection(Errors.MissingCanonicalInequality): diagnostic_matches(failure, span(prefix.length(), prefix.length() + 2), "canonical Equatable does not define not_equals", "add a pure not_equals(Self, Self) -> Bool default to the selected trait")
+						_: False
+
+
+pure func test_absent_canonical_rejects_either_symbol_at_the_token() -> Bool:
+	["==", "!="].all(pure func(operator):
+		match parse_trait_fixture(IMPORT + BODY + "7 " + operator + " 7" + ENTRY, IMPLEMENTATION, CONTRACT):
+			Err(_): False
+			Ok(parsed):
+				match check(parsed):
+					Ok(_): False
+					Err(failure):
+						prefix = IMPORT + BODY + "7 "
+						match check_errors(failure).first.kind:
+							Errors.TraitRejection(Errors.EqualityRequiresCanonical): diagnostic_matches(failure, span(prefix.length(), prefix.length() + 2), "equality operators require the canonical Equatable trait", "select Equatable in the configured prelude")
+							_: False
+	)
+
+
+private pure func malformed_contract(declaration: String, message: String, help: String, canonical_site: Bool) -> Bool:
+	match fixture("func main() -> Int:\n    0\n", REQUIREMENT + declaration):
+		Err(_): False
+		Ok(parsed):
+			match (inventory_traits(parsed_contents(parsed).declarations), check(parsed)):
+				([owner], Err(failure)):
+					match owner.methods.get(1).and_then(pure func(method): trait_method_header(method, parsed_contents(parsed).declarations)):
+						None: False
+						Some(header):
+							expected = if canonical_site:
+								owner.type_name.span
+							else:
+								header.function_name.span
+							diagnostic_matches(failure, expected, message, help)
+				_: False
+
+
+pure func test_malformed_inequality_defaults_reject_even_when_unused() -> Bool:
+	[
+		"    pure func not_equals(left: Self) -> Bool:\n        True\n",
+		"    pure func not_equals(left: Self, right: Int) -> Bool:\n        True\n",
+		"    pure func not_equals(left: Self, right: Self) -> Int:\n        0\n",
+	].all(pure func(declaration): malformed_contract(declaration, "canonical Equatable.not_equals requires pure (Self, Self) -> Bool with a default body", "use that signature and provide a default body, or rename this helper", False))
+
+
+pure func test_abstract_inequality_keeps_the_existing_canonical_error() -> Bool:
+	malformed_contract("    pure func not_equals(left: Self, right: Self) -> Bool\n", "canonical Equatable requires pure equals(Self, Self) -> Bool as its sole abstract method", "keep equals abstract; additional pure methods require default bodies", True)
+
+
+pure func test_impure_and_generic_defaults_keep_ordinary_errors() -> Bool:
+	(malformed_contract("    func not_equals(left: Self, right: Self) -> Int:\n        0\n", "trait requirements must be pure", "declare a pure func requirement and a pure implementation", False)
+	and malformed_contract("    pure func not_equals[Element](left: Self, right: Self) -> Int:\n        0\n", "trait methods cannot declare type parameters", "use Self and ordinary concrete parameter types", False))
+
+
+pure func test_unknown_annotation_precedes_bad_canonical_return() -> Bool:
+	declaration = "    pure func not_equals(left: Self, right: Missing) -> Int:\n        0\n"
+	match fixture("func main() -> Int:\n    0\n", REQUIREMENT + declaration):
+		Err(_): False
+		Ok(parsed):
+			match (inventory_traits(parsed_contents(parsed).declarations), check(parsed)):
+				([owner], Err(failure)):
+					match owner.methods.get(1).and_then(pure func(method): trait_method_header(method, parsed_contents(parsed).declarations)):
+						Some(header):
+							match header.parameters:
+								[_, parameter]: diagnostic_matches(failure, type_span(parameter.type_name), "unknown type", "declare or import this type; builtin types and declared type parameters are also available")
+								_: False
+						None: False
+				_: False
+
+
+pure func test_unrelated_and_free_names_do_not_redirect_operators() -> Bool:
+	declarations = [
+		("trait Other:\n    pure func equals(left: Self, right: Self) -> Int\n", 0),
+		("pure func equals(left: Int, right: Int) -> Int:\n    0\npure func not_equals(left: Int, right: Int) -> Int:\n    0\n", 2),
+	]
+	declarations.all(pure func(test_case):
+		match test_case:
+			(declaration, ordinal):
+				source = declaration + "func main() -> Int:\n    match 1 == 1:\n        True: 23\n        False: 0\n"
+				match fixture(source, CONTRACT):
+					Err(_): False
+					Ok(parsed):
+						match check(parsed):
+							Err(_): False
+							Ok(checked):
+								functions = checked_functions(checked)
+								match (functions.traits.canonical, functions.functions.get(ordinal)):
+									(Some(canonical), Some(main)):
+										match Model.function_calls(main):
+											[call]:
+												match call.target:
+													Model.TraitMethod(method): same_trait_method(Model.method_identity(method), Model.canonical_equals(canonical))
+													_: False
+											_: False
+									_: False
+	)
+
+
+pure func test_typed_sibling_literals_keep_explicit_call_inference() -> Bool:
+	cases = [
+		("[] == [1]", "Integer.equals([], [1])", 0),
+		("[1] == []", "Integer.equals([1], [])", 7),
+		("[] != [1]", "Integer.not_equals([], [1])", 0),
+		("[1] != []", "Integer.not_equals([1], [])", 7),
+	]
+	cases.all(pure func(test_case):
+		match test_case:
+			(expression, explicit, offset):
+				match fixture(BODY + expression + ENTRY, CONTRACT):
+					Err(_): False
+					Ok(parsed):
+						match check(parsed):
+							Ok(_): False
+							Err(failure):
+								match check_errors(failure).first.kind:
+									Errors.ValueRejection(Errors.EmptyListNeedsElementType):
+										start = IMPORT.length() + BODY.length() + offset
+										diagnostic_matches(failure, span(start, start + 2), "cannot infer the element type of an empty list literal", "give it a context with a List type, such as a List parameter, return type or append argument") and same_rejection(expression, explicit)
+									_: False
+	)
+
+
+-- Inference and operand errors retain the ordinary call's wording and note.
+-- Separate tests below pin operator and operand locations explicitly.
+private pure func same_rejection(operator: String, explicit: String) -> Bool:
+	match (fixture(BODY + operator + ENTRY, CONTRACT), fixture(BODY + explicit + ENTRY, CONTRACT)):
+		(Ok(left), Ok(right)):
+			match (check(left), check(right)):
+				(Err(first), Err(second)):
+					actual = render_failure(first).first
+					expected = render_failure(second).first
+					actual.message == expected.message and actual.help == expected.help and actual.note.is_none() and expected.note.is_none() and check_errors(first).remaining.is_empty() and check_errors(second).remaining.is_empty()
+				_: False
+		_: False
+
+
+pure func test_unknown_and_conflicting_operands_keep_explicit_call_errors() -> Bool:
+	same_rejection("[] == []", "Integer.equals([], [])") and same_rejection("1 == True", "Integer.equals(1, True)")
+
+
+pure func test_generic_bound_and_derived_nominal_receivers_check() -> Bool:
+	source: String =
+		|fixed record Box[Element] { value: Element }
+		|pure func same[Element: Equatable](left: Element, right: Element) -> Bool:
+		|    left == right
+		|func main() -> Int:
+		|    left: Box[Int] = { value = 1 }
+		|    right: Box[Int] = { value = 2 }
+		|    match same(left, right):
+		|        True: 23
+		|        False: 0
+		|
+	-- Import the semantic bound explicitly; operator member names remain absent.
+	main = IMPORT + source
+	match parse_equatable_fixture(main, IMPLEMENTATION, CONTRACT):
+		Err(_): False
+		Ok(parsed): check(parsed).is_ok()
+
+
+pure func test_closed_constants_still_reject_operator_calls() -> Bool:
+	source = "answer: Bool = 1 == 1\nfunc main() -> Int:\n    0\n"
+	match fixture(source, CONTRACT):
+		Err(_): False
+		Ok(parsed):
+			match check(parsed):
+				Ok(_): False
+				Err(failure):
+					match check_errors(failure).first.kind:
+						Errors.ConstantRejection(Errors.NonClosedInitializer): diagnostic_matches(failure, span(IMPORT.length() + 15, IMPORT.length() + 21), "constant initializer is not a closed value", "use literals, constructor data, or named function references; calls, constant references and lambdas are not allowed")
+						_: False
+
+
+pure func test_missing_generic_bound_reports_at_the_operator() -> Bool:
+	prefix = "pure func same[Element](left: Element, right: Element) -> Bool:\n    left "
+	source = prefix + "== right\nfunc main() -> Int:\n    0\n"
+	match fixture(source, CONTRACT):
+		Err(_): False
+		Ok(parsed):
+			match check(parsed):
+				Ok(_): False
+				Err(failure):
+					match check_errors(failure).first.kind:
+						Errors.TraitRejection(Errors.MissingTraitBound(_, _)): diagnostic_matches(failure, span(IMPORT.length() + prefix.length(), IMPORT.length() + prefix.length() + 2), "type does not satisfy the required trait bound", "add the required trait to this function's type parameter bounds, or provide an implementation for the concrete receiver")
+						_: False
+
+
+pure func test_opaque_receiver_requires_its_own_implementation() -> Bool:
+	prefix = "opaque type Secret = Int\npure func compare(left: Secret, right: Secret) -> Bool:\n    left "
+	match fixture(prefix + "!= right" + ENTRY, CONTRACT):
+		Err(_): False
+		Ok(parsed):
+			match check(parsed):
+				Ok(_): False
+				Err(failure):
+					match check_errors(failure).first.kind:
+						Errors.TraitRejection(Errors.MissingImplementation(_, Model.OpaqueType(_))):
+							diagnostic = render_failure(failure).first
+							same_span(diagnostic.span, span(IMPORT.length() + prefix.length(), IMPORT.length() + prefix.length() + 2)) and diagnostic.message == "receiver does not implement this trait" and diagnostic.help == "declare a matching implementation; generic functions must declare their required trait bounds"
+						_: False
+
+
+pure func test_pure_callers_reject_impure_operands_at_the_operand() -> Bool:
+	prefix = "func obtain() -> Int:\n    1\npure func compare() -> Bool:\n    "
+	match fixture(prefix + "obtain() == 1" + ENTRY, CONTRACT):
+		Err(_): False
+		Ok(parsed):
+			match check(parsed):
+				Ok(_): False
+				Err(failure):
+					match check_errors(failure).first.kind:
+						Errors.CallRejection(Errors.ImpureCall(_, _)): diagnostic_matches(failure, span(IMPORT.length() + prefix.length(), IMPORT.length() + prefix.length() + 6), "pure functions cannot call impure functions", "mark the callee pure or remove pure from the caller")
+						_: False
+
+
+pure func test_mixed_operand_error_retains_the_right_operand_span() -> Bool:
+	prefix = IMPORT + BODY + "1 == "
+	match fixture(BODY + "1 == True" + ENTRY, CONTRACT):
+		Err(_): False
+		Ok(parsed):
+			match check(parsed):
+				Ok(_): False
+				Err(failure):
+					error = check_errors(failure).first
+					match error.kind:
+						Errors.ConstructorRejection(Errors.VariantNotInExpectedType(_, expected)):
+							Model.same_type(expected, Model.IntType) and diagnostic_matches(failure, span(prefix.length(), prefix.length() + 4), "variant does not belong to the expected type", "use an expression of type Int here") and same_rejection("1 == True", "Integer.equals(1, True)")
+						_: False
+
+
+pure func test_contextual_nominal_constructors_and_lambda_results_check() -> Bool:
+	source: String =
+		|fixed union Choice[Element]:
+		|    Item(Element)
+		|    Empty
+		|pure func use(callback: pure () -> Bool) -> Bool:
+		|    callback()
+		|func main() -> Int:
+		|    first: Choice[Int] = Item(1)
+		|    callback: pure () -> Bool = pure func() -> Bool: first == Empty
+		|    match use(callback):
+		|        True: 23
+		|        False: 0
+		|
+	match fixture(source, CONTRACT):
+		Err(_): False
+		Ok(parsed): check(parsed).is_ok()
+
+
+pure func test_default_body_operators_use_the_same_canonical_contract() -> Bool:
+	contract = REQUIREMENT + "    pure func not_equals(left: Self, right: Self) -> Bool:\n        match left == right:\n            True: False\n            False: True\n"
+	match fixture(BODY + "1 != 2" + ENTRY, contract):
+		Err(_): False
+		Ok(parsed): check(parsed).is_ok()
+
+
+private pure func finite_rejection(expression: String) -> Bool:
+	contract = REQUIREMENT + "    pure func not_equals(left: Self, right: Self) -> Bool:\n        " + expression + "\n"
+	match fixture("func main() -> Int:\n    0\n", contract):
+		Err(_): False
+		Ok(parsed):
+			contents = parsed_contents(parsed)
+			match (check(parsed), inventory_functions(contents.declarations).last()):
+				(Err(failure), Some(method)):
+					match (check_errors(failure).first.kind, method.declaration.body):
+						(Errors.RecursionRejection(Errors.UnprovenTraitInstantiation), ParsedValueBody(value)):
+							match value.base:
+								EqualityExpression(_, operator, _, _): diagnostic_matches(failure, operator, "cannot prove finite generic trait instantiation", "avoid recursively wrapping generic receivers through trait dispatch; this increment uses a conservative constructor-path proof")
+								DirectApplication(name, _): diagnostic_matches(failure, name.span, "cannot prove finite generic trait instantiation", "avoid recursively wrapping generic receivers through trait dispatch; this increment uses a conservative constructor-path proof")
+								_: False
+						_: False
+				_: False
+
+
+pure func test_finite_trait_proof_rejects_operator_and_explicit_growth() -> Bool:
+	finite_rejection("[left] != [right]") and finite_rejection("not_equals([left], [right])")
+
+
+pure func test_boolean_result_context_cannot_infer_untyped_constructors() -> Bool:
+	["==", "!="].all(pure func(operator):
+		expression = "True " + operator + " True"
+		explicit = if operator == "==":
+			"Integer.equals(True, True)"
+		else:
+			"Integer.not_equals(True, True)"
+		match fixture(BODY + expression + ENTRY, CONTRACT):
+			Err(_): False
+			Ok(parsed):
+				match check(parsed):
+					Ok(_): False
+					Err(failure):
+						start = IMPORT.length() + BODY.length()
+						match check_errors(failure).first.kind:
+							Errors.ConstructorRejection(Errors.ConstructorNeedsExpectedType(_)): diagnostic_matches(failure, span(start, start + 4), "constructor needs an expected union type", "pass an already-typed union value or call a concrete helper returning the union") and same_rejection(expression, explicit)
+							_: False
+	)
+
+
+tests: TestSuite = {
+	description = "equality operator checking",
+	tests = [
+		("operator checks without method import", test_operator_checks_without_method_import),
+		("inequality publishes reserved member identity", test_inequality_publishes_the_reserved_member_identity),
+		("equals-only contract rejects inequality", test_equals_only_contract_rejects_only_inequality),
+		("absent canonical rejects both tokens", test_absent_canonical_rejects_either_symbol_at_the_token),
+		("malformed inequality defaults reject unused", test_malformed_inequality_defaults_reject_even_when_unused),
+		("abstract inequality preserves canonical error", test_abstract_inequality_keeps_the_existing_canonical_error),
+		("impure and generic defaults preserve signature errors", test_impure_and_generic_defaults_keep_ordinary_errors),
+		("unknown annotation precedes canonical return shape", test_unknown_annotation_precedes_bad_canonical_return),
+		("unrelated and free names cannot redirect operators", test_unrelated_and_free_names_do_not_redirect_operators),
+		("typed list siblings retain explicit inference in both orders", test_typed_sibling_literals_keep_explicit_call_inference),
+		("unknown and mixed operands preserve explicit errors", test_unknown_and_conflicting_operands_keep_explicit_call_errors),
+		("generic bound and derived nominal receivers", test_generic_bound_and_derived_nominal_receivers_check),
+		("closed constants still reject operator calls", test_closed_constants_still_reject_operator_calls),
+		("missing generic bound locates the operator", test_missing_generic_bound_reports_at_the_operator),
+		("opaque receiver needs its own implementation", test_opaque_receiver_requires_its_own_implementation),
+		("purity rejection locates the impure operand", test_pure_callers_reject_impure_operands_at_the_operand),
+		("mixed operand error retains its operand span", test_mixed_operand_error_retains_the_right_operand_span),
+		("nominal constructors and lambda result contexts", test_contextual_nominal_constructors_and_lambda_results_check),
+		("default body operators share canonical contract", test_default_body_operators_use_the_same_canonical_contract),
+		("finite trait proof rejects operator and explicit growth", test_finite_trait_proof_rejects_operator_and_explicit_growth),
+		("Bool result cannot infer untyped constructor operands", test_boolean_result_context_cannot_infer_untyped_constructors),
+	]
+}

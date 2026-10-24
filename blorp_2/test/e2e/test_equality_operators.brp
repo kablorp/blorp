@@ -1,0 +1,92 @@
+import:
+	./harness: run_accounted_example, verify_rejected_command, with_directory, TargetAllocations(PositiveTargetAllocations)
+	./cost: CostLimits
+	system: file_exists, read_file, write_file
+	test: TestSuite
+
+
+private LIBRARY_ROOT: String = "blorp_2/standard_library"
+
+-- First actual self-built B diagnostic CLI samples (allocations / instructions):
+-- operators 236,887 / 1,914,654,836; dispatch 129,178 / 1,609,196,282;
+-- order 126,438 / 1,600,311,068; nesting 176,650 / 1,886,750,177.
+-- New limits leave approximately 15--18% headroom. The maintained harness uses
+-- different temporary paths; its complete final run remains required.
+private VALUES_LIMITS: CostLimits = { allocations = 275000, instructions = 2250000000 }
+private DISPATCH_LIMITS: CostLimits = { allocations = 150000, instructions = 1900000000 }
+private ORDER_LIMITS: CostLimits = { allocations = 145000, instructions = 1850000000 }
+private NESTING_LIMITS: CostLimits = { allocations = 205000, instructions = 2200000000 }
+
+
+func test_scalar_managed_and_generic_equality(compiler: String) -> Bool:
+	run_accounted_example(
+		compiler, LIBRARY_ROOT, "blorp_2/test/e2e/fixtures/equality/operators.brp",
+		23, "", VALUES_LIMITS, PositiveTargetAllocations,
+		"build/equality-operators/native/operators.c",
+	)
+
+
+func test_inequality_override_and_opaque_receiver(compiler: String) -> Bool:
+	run_accounted_example(
+		compiler, LIBRARY_ROOT, "blorp_2/test/e2e/fixtures/equality/dispatch.brp",
+		23, "", DISPATCH_LIMITS, PositiveTargetAllocations,
+		"build/equality-operators/native/dispatch.c",
+	)
+
+
+func test_operands_run_once_in_written_order(compiler: String) -> Bool:
+	run_accounted_example(
+		compiler, LIBRARY_ROOT, "blorp_2/test/e2e/fixtures/equality/order.brp",
+		23, "left\nright\nleft\nright\n", ORDER_LIMITS, PositiveTargetAllocations,
+		"build/equality-operators/native/order.c",
+	)
+
+
+func test_grouped_comparisons_and_method_calls_share_depth_support(compiler: String) -> Bool:
+	run_accounted_example(
+		compiler, LIBRARY_ROOT, "blorp_2/test/e2e/fixtures/equality/nesting.brp",
+		23, "", NESTING_LIMITS, PositiveTargetAllocations,
+		"build/equality-operators/native/nesting.c",
+	)
+
+
+private func rejected_in_directory(compiler: String, input: String, expected: String, directory: String) -> Result[Void, String]:
+	output = directory + "/rejected.c"
+	absent ?= verify_rejected_command(compiler, LIBRARY_ROOT, input, output, expected)
+	unpublished ?= if file_exists(output):
+		Err("rejected equality created a C output")
+	else:
+		Ok(void)
+	written ?= write_file(output, "preserve equality output")
+	existing ?= verify_rejected_command(compiler, LIBRARY_ROOT, input, output, expected)
+	actual ?= read_file(output)
+	if actual == "preserve equality output":
+		Ok(void)
+	else:
+		Err("rejected equality overwrote existing output")
+
+
+func test_missing_bound_preserves_output(compiler: String) -> Bool:
+	input = "blorp_2/test/e2e/trait_inputs/operators/reject_bound.brp"
+	expected = input + ":2:10: error: type does not satisfy the required trait bound\nhelp: add the required trait to this function's type parameter bounds, or provide an implementation for the concrete receiver\n"
+	with_directory(func(directory: String): rejected_in_directory(compiler, input, expected, directory))
+
+
+func test_chained_comparison_preserves_output(compiler: String) -> Bool:
+	input = "blorp_2/test/e2e/trait_inputs/operators/reject_chain.brp"
+	expected = input + ":2:18: error: comparisons cannot be chained\nhelp: compare each pair separately, or parenthesize an intended nested comparison\n"
+	with_directory(func(directory: String): rejected_in_directory(compiler, input, expected, directory))
+
+
+pure func suite(compiler: String) -> TestSuite:
+	{
+		description = "Canonical equality operators",
+		tests = [
+			("operators compare scalar managed derived and generic values", func(): test_scalar_managed_and_generic_equality(compiler)),
+			("inequality honors an override and opaque equality uses its authored body", func(): test_inequality_override_and_opaque_receiver(compiler)),
+			("both operators evaluate operands once from left to right", func(): test_operands_run_once_in_written_order(compiler)),
+			("64 grouped comparisons and ordinary calls compile under default limits", func(): test_grouped_comparisons_and_method_calls_share_depth_support(compiler)),
+			("missing generic bound has exact diagnostics and preserves outputs", func(): test_missing_bound_preserves_output(compiler)),
+			("chained comparison has exact diagnostics and preserves outputs", func(): test_chained_comparison_preserves_output(compiler)),
+		]
+	}
