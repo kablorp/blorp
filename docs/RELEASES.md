@@ -176,7 +176,8 @@ Test-artifact timeout defaults and overrides live in
 
 Blorp 2 seeds use `.github/workflows/blorp2-seed.yml`, separately from legacy
 CLI releases. After the reviewed source/library integration is committed
-and its maintained native/resource gate has an accepted outcome, Root can create
+and its active self-hosted qualification has an accepted outcome with deferred
+coverage disclosed, Root can create
 and push an immutable tag with SSH credentials that trigger Actions:
 
 ```bash
@@ -188,11 +189,14 @@ git push origin "refs/tags/$seed_tag"
 
 The workflow validates the tag against the actual source commit and the three
 native targets: macOS ARM64 on macOS 15, Linux x64 and Linux ARM64 on Ubuntu 24.04.
-The workflow builds a fresh legacy TestSuite host for tests. The pinned B2 seed
-generates reference A, then A emits compiler C,
+The workflow uses no legacy host. The pinned B2 seed generates reference A,
+then A emits compiler C,
 Clang links self-built B in normal/diagnostic modes, and B reproduces that C.
-Only B normal is published as `blorp2-<target>`. Maintained component and B diagnostic
-e2e correctness, strict compiler accounting and an ordinary-main strict smoke must pass.
+Only B normal is published as `blorp2-<target>`. The explicit self-hosted
+components, strict compiler accounting and ordinary-main strict smoke must pass.
+Unported unit/runtime/grammar/tooling and full native e2e execution are DEFERRED;
+their sources remain for incremental ports. Qualification metadata must state
+that boundary, without claiming a full native correctness/resource PASS.
 Each platform also compares every maintained accepted/rejected fixture under A/B:
 exit status, stdout, stderr and emitted-C presence/bytes must match. The complete
 fixture inventory, actual counts, per-fixture logs and hashes remain in provenance.
@@ -205,9 +209,8 @@ A temporary diagnostic B from the same approved C adds ASan/UBSan with recovery
 disabled and performs the existing whole-source strict accounting check. Its
 link log must be empty and its complete stderr must be the exact balanced strict
 report; emitted C must match. Provenance retains its hash and flags, and the
-sanitized binary is not published. Regular diagnostic B runs the native cost suite.
-Ordinary e2e cases run sanitized real mains; accounted cases additionally check
-strict target balance. The current reviewed producer supports static trait bounds,
+sanitized binary is not published. Full native/resource suites remain DEFERRED;
+fixture parity alone does not prove execution of those fixture mains. The current reviewed producer supports static trait bounds,
 default methods, contextual method references and automatic equality for
 named records/unions, including generic aggregates. Its configured prelude selects the canonical trait through
 an ordinary imported binding, permitting that trait to live in a library module
@@ -226,23 +229,19 @@ retains `reviewed-compiler-c.sha256`; the publisher checks the emitted C against
 that digest and requires all platforms to agree. The earlier stored-callable/tuple
 bridge recorded source `9c12cc79e3b7b919af93debde139595b4288e42e` and compiler C
 `46c041be4c5be389cd5e6b6d288f5abd8e673ca78b003914849232ac456ee4e3`.
-Only the native qualification command sets
-`BLORP_2_RESOURCE_POLICY=record-allocation-debt`, matching CI. The typed test policy
-retains original caps and records allocation overruns as structured
-`BLORP2_ALLOCATION_RESULT` FAILs with actual measurements, limits and original
-reasons after all ordinary oracles pass. Provenance and release notes distinguish
-functional PASS from recorded allocation debt; this is not a full M8/resource PASS.
-All other failures remain blocking. Hosted instruction measurement is explicitly
-disabled on all three platforms, as in CI; instruction costs are unmeasured and
-not qualified. The raw macOS time preflight is retained for observation only and
-does not establish an instruction-cost PASS. Component and native output is
-visible in Actions and retained in provenance; pipeline failures remain blocking.
+Native fixture cost limits and original resource-policy oracles remain in source;
+they are not executed or relabelled as PASS while the driver is deferred.
+Hosted instruction measurement remains disabled and unmeasured on all three
+platforms. The raw macOS time preflight is observational, not cost qualification.
+Active self-hosted component output, compiler parity, strict/sanitizer results,
+native smoke and explicit deferrals remain visible in Actions and provenance;
+all failures in those active gates block publication.
 
 All three platforms must agree on compiler C and source/library inventories.
 The release retains one `blorp2-compiler.c.gz`, three provenance archives and
 `SHA256SUMS` alongside the binaries. Provenance includes the full source commit,
-legacy/A/B digests, target/host library inventories, flags, Clang and platform
-SDK/libc/dependency details, raw diagnostics, resource markers and gate logs. Actions' `GITHUB_TOKEN`
+seed/A/B digests, target/library inventories, flags, Clang and platform
+SDK/libc/dependency details, raw diagnostics, explicit coverage deferrals and gate logs. Actions' `GITHUB_TOKEN`
 creates the release; local API credentials are unnecessary. An existing release for the requested seed tag is refused, never overwritten. Preserve referenced seeds and their
 provenance indefinitely; expiring Actions logs alone are not release evidence.
 
@@ -253,7 +252,7 @@ That historical qualification remains recorded with the first seed; it does not
 qualify the bridge. Subsequent seeds use `scripts/blorp2-compiler-bootstrap` and
 the real seven-field
 `blorp_2/bootstrap.env` pin to generate A; the release retains that seed identity,
-manifest and binary digest. No missing-manifest legacy fallback exists. The
-legacy host still runs TestSuite suites until their separate migration.
+manifest and binary digest. No missing-manifest or test-time legacy fallback
+exists. Unported TestSuite suites remain explicitly deferred.
 A pin requires actual published three-platform digests and a clean-checkout
 seed-only build proof. Never commit a missing or placeholder pin.

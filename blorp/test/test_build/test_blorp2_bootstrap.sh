@@ -26,7 +26,7 @@ sha256_file() {
 }
 
 export TEST_SEED_LOG="$scratch/seed.log" TEST_CC_LOG="$scratch/cc.log"
-export TEST_CC_ARGS="$scratch/cc-args"
+export TEST_CC_ARGS="$scratch/cc-args" TEST_COMPONENT_LOG="$scratch/components.log"
 export TEST_DOWNLOAD_LOG="$scratch/download.log" TEST_LEGACY_LOG="$scratch/legacy.log"
 export TEST_SEED="$scratch/seed payload" TEST_DOWNLOAD_MODE=good
 export TEST_OS=Linux TEST_ARCH=x86_64
@@ -75,14 +75,33 @@ while [ $# -gt 0 ]; do
 done
 [ -n "$input" ] && [ -s "$input" ] || exit 24
 printf 'link:%s\n' "$mode" >>"$TEST_CC_LOG"
-cat >"$output" <<'SEED'
+if [ "${TEST_CC_STATUS:-0}" -ne 0 ]; then exit "$TEST_CC_STATUS"; fi
+case "$input" in
+	*/self-hosted-tests/*)
+		cat >"$output" <<'SEED'
+#!/usr/bin/env bash
+set -euo pipefail
+printf 'native:%s\n' "${BLORP_LEAK_CHECK:-unset}" >>"$TEST_COMPONENT_LOG"
+exit "${TEST_COMPONENT_NATIVE_STATUS:-0}"
+SEED
+		;;
+	*)
+		cat >"$output" <<'SEED'
 #!/usr/bin/env bash
 set -euo pipefail
 printf 'built\n' >>"$TEST_CC_LOG"
 if [ "${1:-}" = --library-root ]; then
-	printf '/* fake fixture C */\n' >"$4"
+	if [ "${3:-}" = --test-suite ]; then
+		printf 'compile:%s\n' "$4" >>"$TEST_COMPONENT_LOG"
+		if [ "${TEST_COMPONENT_COMPILE_STATUS:-0}" -ne 0 ]; then exit "$TEST_COMPONENT_COMPILE_STATUS"; fi
+		printf '/* fake component C */\n' >"$5"
+	else
+		printf '/* fake fixture C */\n' >"$4"
+	fi
 fi
 SEED
+		;;
+esac
 chmod +x "$output"
 SH
 chmod +x "$tools/"*
@@ -278,4 +297,67 @@ make -s -C "$fixture/blorp_2" example BLORP_CC="$tools/fake cc" >"$scratch/make.
 [ "$(grep -c '^built$' "$TEST_CC_LOG")" = 2 ] || fail 'example did not use new compiler and real main'
 [ ! -e "$TEST_LEGACY_LOG" ] || fail 'example touched legacy'
 pass 'example uses newly built B2 executable'
+# Every public B2 test route must avoid the legacy tripwires above.
+component_sources='blorp_2/test/unit/test_utils/test_boolean.brp blorp_2/test/unit/test_lex/test_lex.brp'
+for target in test test-components; do
+	: >"$TEST_COMPONENT_LOG"
+	: >"$TEST_CC_ARGS"
+	if ! make -s -C "$fixture/blorp_2" "$target" BLORP_CC="$tools/fake cc" \
+		BLORP2_COMPILER='blorp_2/build/output compiler' \
+		BLORP2_COMPILER_C='blorp_2/build/output compiler.c' \
+		TARGET_COMPONENT_SOURCES="$component_sources" >"$scratch/make.stdout" 2>"$scratch/make.stderr"; then
+		cat "$scratch/make.stderr" >&2
+		fail "$target must run the self-hosted selection"
+	fi
+	printf 'compile:%s\nnative:strict\ncompile:%s\nnative:strict\n' \
+		blorp_2/test/unit/test_utils/test_boolean.brp blorp_2/test/unit/test_lex/test_lex.brp >"$scratch/expected"
+	cmp -s "$TEST_COMPONENT_LOG" "$scratch/expected" || fail "$target selected sources, order or strict native entrypoint"
+	if [ "$target" = test-components ]; then
+		: >"$scratch/expected"
+		for source in $component_sources; do
+			program="blorp_2/build/self-hosted-tests/${source#blorp_2/test/}"
+			program="${program%.brp}"
+			printf '%s\0' -std=c11 -Wall -Wextra -Werror -pedantic -O0 \
+				-DBLORP_MEMORY_DIAGNOSTICS=1 "$program.c" -o "$program" -lm -lpthread >>"$scratch/expected"
+		done
+		if ! cmp -s "$TEST_CC_ARGS" "$scratch/expected"; then fail 'selected C compiler flags or mirrored output paths'; fi
+	fi
+	if ! grep -Fq 'DEFERRED:' "$scratch/make.stdout"; then fail "$target omitted unported coverage status"; fi
+	if [ -e "$TEST_LEGACY_LOG" ]; then fail "$target invoked a legacy host/build-status/bootstrap"; fi
+	pass "$target runs only the selected B2 suites with strict normal entrypoints"
+done
+
+: >"$TEST_COMPONENT_LOG"
+e2e_status=0
+make -s -C "$fixture/blorp_2" test-e2e >"$scratch/make.stdout" 2>"$scratch/make.stderr" || e2e_status=$?
+if [ "$e2e_status" -ne 2 ]; then fail 'deferred native e2e must exit 2'; fi
+if ! grep -Fq 'DEFERRED: native e2e' "$scratch/make.stderr"; then fail 'missing explicit e2e deferral diagnostic'; fi
+if ! grep -Fq 'port the driver to blorp_2' "$scratch/make.stderr"; then fail 'missing e2e deferral help'; fi
+if [ -s "$TEST_COMPONENT_LOG" ] || [ -e "$TEST_LEGACY_LOG" ]; then fail 'deferred e2e executed a test or legacy host'; fi
+pass 'test-e2e rejects with explicit deferral instead of a false native pass'
+
+: >"$TEST_COMPONENT_LOG"
+expect_failure 'no target component sources selected' make -s -C "$fixture/blorp_2" test-components TARGET_COMPONENT_SOURCES=
+if [ -s "$TEST_COMPONENT_LOG" ]; then fail 'empty selection executed components'; fi
+pass 'empty self-hosted selection fails closed'
+
+for failure_kind in compile link native; do
+	: >"$TEST_COMPONENT_LOG"
+	export TEST_COMPONENT_COMPILE_STATUS=0 TEST_CC_STATUS=0 TEST_COMPONENT_NATIVE_STATUS=0
+	case "$failure_kind" in
+		compile) TEST_COMPONENT_COMPILE_STATUS=31 ;;
+		link) TEST_CC_STATUS=32 ;;
+		native) TEST_COMPONENT_NATIVE_STATUS=33 ;;
+	esac
+	if make -s -C "$fixture/blorp_2" test-components BLORP_CC="$tools/fake cc" \
+		BLORP2_COMPILER='blorp_2/build/output compiler' TARGET_COMPONENT_SOURCES="$component_sources" \
+		>"$scratch/make.stdout" 2>"$scratch/make.stderr"; then
+		fail "$failure_kind failure was ignored"
+	fi
+	if grep -Fq 'compile:blorp_2/test/unit/test_lex/test_lex.brp' "$TEST_COMPONENT_LOG"; then fail "$failure_kind failure continued to the next source"; fi
+	if [ "$failure_kind" != native ] && grep -Fq 'native:' "$TEST_COMPONENT_LOG"; then fail "$failure_kind failure executed stale native output"; fi
+	if [ -e "$TEST_LEGACY_LOG" ]; then fail "$failure_kind failure invoked legacy"; fi
+	pass "self-hosted $failure_kind failure blocks and stops the selection"
+done
+unset TEST_COMPONENT_COMPILE_STATUS TEST_CC_STATUS TEST_COMPONENT_NATIVE_STATUS
 printf '%s tests passed\n' "$passed"

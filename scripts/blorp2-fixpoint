@@ -6,23 +6,23 @@
 #   B   A compiles blorp_2/src; the C compiler links B
 #   C   B compiles blorp_2/src; the C compiler links C; C compiles blorp_2/src
 # The fixpoint holds when B and C emit byte-identical C for blorp_2/src, A and B
-# emit identical C and diagnostics for every e2e fixture, and B passes the e2e
-# suite. Every stage links at -O0 through the Makefile's own recipes
+# emit identical C and diagnostics for every fixture, and B passes the explicit
+# self-hosted component selection. Native e2e execution remains DEFERRED.
+# Every stage links at -O0 through the Makefile's own recipes
 # (make -C blorp_2 test-compiler and link-test-compiler), so the compile and
-# link flags have one source; the e2e suite then runs B through the same
-# Makefile (make -C blorp_2 test-e2e BLORP2_COMPILER=...).
+# link flags have one source. No stage builds or runs the legacy compiler.
 #
 # Usage:
 #   scripts/blorp2-fixpoint --frontier   how far the pilot gets on its own source;
 #                                        a measurement, so it always exits 0
-#   scripts/blorp2-fixpoint --prove      the M8 gate: exit 0 at the fixpoint, 1 at
+#   scripts/blorp2-fixpoint --prove      the source/component proof: exit 0 at the fixpoint, 1 at
 #                                        the first failed stage with its reason
-# Setup errors exit 2 in both modes: a stale host, missing tools, a failed stage A
-# build, or (--frontier) a failing or count-less source-tree suite run.
+# Setup errors exit 2 in both modes, including a failed stage A build.
 #
 # The frontier is one rung of this ladder, the first that fails:
-#   parsed N/M      N of M files under blorp_2/src parse, as the unit suite
-#                   test/unit/test_parse/test_source_tree reports (frontier only)
+# The old per-file parse inventory is DEFERRED until its filesystem driver is
+# self-hosted; the actual seed/A loaders still parse the compiler source.
+#
 #   rejected        A rejects main.brp with a diagnostic in a source file: loading,
 #                   parsing or checking; the pilot does not name the phase
 #   internal-error  A rejects main.brp with a compiler-located diagnostic
@@ -33,7 +33,7 @@
 #   c-emits         C fails on main.brp
 #   b-equals-c      B and C emit different C (the first differing line is printed)
 #   fixtures        A and B differ on an e2e fixture
-#   e2e             B fails the e2e suite
+#   components      B fails the explicit self-hosted component selection
 #   fixpoint        every stage passed
 #
 # Artifacts and provenance.txt are written under blorp_2/build/fixpoint/, which
@@ -155,25 +155,22 @@ first_difference() {
 
 # --- setup and provenance -------------------------------------------------
 
-[ -x bin/blorp ] || die "bin/blorp is missing; run make first"
-scripts/compiler-build-status --quiet || die "bin/blorp is not FRESH; run make first"
 rm -rf "$work"
 mkdir -p "$work"
 cc=${BLORP_CC:-clang}
 note "mode=$mode"
 note "revision=$(git rev-parse HEAD)"
-note "host_role=legacy TestSuite host only"
-note "host_binary=bin/blorp"
-note "host_commit=$(bin/blorp --version | sed -n 's/^commit: //p')"
-note "host_binary_sha256=$(sha bin/blorp)"
+note "test_route=self-hosted B2 components only"
+note "native_e2e=DEFERRED (driver not self-hosted)"
+note "source_parse_inventory=DEFERRED (filesystem driver not self-hosted)"
 note "seed_identity=$(scripts/blorp2-compiler-bootstrap --print-id)"
 seed_binary=$(scripts/blorp2-compiler-bootstrap --print-path)
 note "seed_binary_sha256=$(sha "$seed_binary")"
 note "cc=$cc"
 note "cc_version=$("$cc" --version | head -n 1)"
-note "stage_link=make -C blorp_2 link-test-compiler TEST_COMPILER_FLAGS=$stage_flags (memory diagnostics on, as the e2e suite requires)"
+note "stage_link=make -C blorp_2 link-test-compiler TEST_COMPILER_FLAGS=$stage_flags (memory diagnostics on)"
 note "library_root=$library_root"
-note "BLORP_2_INSTRUCTION_CHECK=${BLORP_2_INSTRUCTION_CHECK:-unset (the e2e harness requires counters)}"
+note "native_resource_checks=DEFERRED with native e2e"
 note "started_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
 # --- stage A: the pinned B2 seed builds the pilot -------------------------
@@ -185,25 +182,8 @@ build_stage "$seed_c" "$stage_a" "stage A: pinned B2 seed emits $source_dir; lin
 note "seed_c_sha256=$(sha "$seed_c")"
 note "stage_a_sha256=$(sha "$stage_a")"
 
-# --- frontier only: how many source files parse ---------------------------
-# The unit suite parses each file directly and prints one line per file
-# ("parsed  PATH" or "stopped PATH at MESSAGE") and the count.
-
-if [ "$mode" = frontier ]; then
-    suite=blorp_2/test/unit/test_parse/test_source_tree.brp
-    echo "== $suite"
-    if ! bin/blorp test --timeout 180 "$suite" > "$work/source_tree.log" 2>&1; then
-        tail -n 20 "$work/source_tree.log" >&2
-        die "the source-tree parse suite failed; see $work/source_tree.log"
-    fi
-    count=$(sed -n 's/^\([0-9][0-9]*\/[0-9][0-9]*\) source files parsed$/\1/p' "$work/source_tree.log")
-    [ -n "$count" ] || die "the source-tree parse suite printed no 'N/M source files parsed' line; see $work/source_tree.log"
-    note "parsed=$count"
-    if [ "${count%/*}" -ne "${count#*/}" ]; then
-        grep '^stopped ' "$work/source_tree.log" || true
-        stop "parsed $count" "the files above do not parse; the suite's output is in $work/source_tree.log"
-    fi
-fi
+# The old hosted source-tree inventory is deliberately not executed.
+# A's ordinary source compilation below is the parser/checker frontier.
 
 # --- stage B: A compiles the pilot ----------------------------------------
 
@@ -285,19 +265,21 @@ while IFS= read -r fixture; do
 done < "$work/fixtures.txt"
 note "fixtures_identical_under_a_and_b=$fixture_total"
 
-# --- the e2e suite under B ------------------------------------------------
+# --- the self-hosted component selection under B -------------------------
 
-echo "== the e2e suite under B (log: $work/e2e.log)"
-if ! make -C blorp_2 --no-print-directory test-e2e BLORP2_COMPILER="$stage_b" > "$work/e2e.log" 2>&1; then
-    tail -n 20 "$work/e2e.log"
-    stop e2e "B fails the e2e suite; see $work/e2e.log"
+echo "== self-hosted components under B (log: $work/components.log)"
+if ! make -C blorp_2 --no-print-directory test-components BLORP2_COMPILER="$stage_b" > "$work/components.log" 2>&1; then
+    tail -n 20 "$work/components.log"
+    stop components "B fails the self-hosted selection; see $work/components.log"
 fi
-note "e2e_under_b=passed"
+note "self_hosted_components_under_b=passed"
+note "native_e2e_under_b=DEFERRED (fixture parity is not native execution)"
 
 echo
 if [ "$mode" = frontier ]; then
     echo "frontier: fixpoint"
 else
-    echo "FIXPOINT: B and C emit identical C; A and B agree on every fixture; B passes e2e"
+    echo "FIXPOINT: B/C source identity; A/B fixture parity; B self-hosted components passed"
 fi
+echo "DEFERRED: native e2e and per-file source parse inventory; drivers are not self-hosted"
 echo "artifacts: $work"

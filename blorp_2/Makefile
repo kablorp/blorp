@@ -3,15 +3,15 @@ BLORP_CC ?= clang
 # Normal and diagnostic targets share output overrides. Serialize this small
 # Makefile so `make -j compiler test-compiler` cannot race competing links.
 .NOTPARALLEL:
-# Paths are relative to the repository root, where every recipe runs. The e2e
-# suite tests BLORP2_COMPILER, which test-compiler links from BLORP2_COMPILER_C;
+# Paths are relative to the repository root, where every recipe runs.
+# test-compiler links BLORP2_COMPILER from BLORP2_COMPILER_C;
 # scripts/blorp2-fixpoint sets both per stage and links at -O0. A command-line
 # VAR=value overrides these; the environment does not (hence := and not ?=).
 BLORP2_COMPILER := blorp_2/build/compiler
 BLORP2_COMPILER_C := blorp_2/build/compiler.c
 TEST_COMPILER_FLAGS := -O0
 TEST_COMPILER_LIBRARIES := -lm -lpthread
-# These maintained suites run through Blorp 2 as well as the temporary host.
+# Explicitly ported suites: every active B2 test runs through Blorp 2.
 TARGET_COMPONENT_SOURCES := \
 	blorp_2/test/unit/test_utils/test_boolean.brp \
 	blorp_2/test/unit/test_utils/test_constant_ids.brp \
@@ -41,7 +41,7 @@ TARGET_COMPONENT_SOURCES := \
 	blorp_2/test/unit/test_parse/test_string_slice.brp \
 	blorp_2/test/unit/test_parse/test_write_file.brp
 
-.PHONY: compiler generate-compiler link-compiler example test test-components test-target-components test-compiler link-test-compiler test-e2e host-check
+.PHONY: compiler generate-compiler link-compiler example test test-components test-target-components test-compiler link-test-compiler test-e2e
 
 compiler: generate-compiler
 	@$(MAKE) --no-print-directory link-compiler
@@ -66,16 +66,15 @@ example: compiler
 		build/return_zero.c -o build/return_zero
 	@build/return_zero
 
-test: host-check
+test:
 	@$(MAKE) --no-print-directory test-compiler
 	@$(MAKE) --no-print-directory test-components
-	@$(MAKE) --no-print-directory test-e2e
 
-# Keep the temporary host roots until every suite can run through Blorp 2.
-# Callers build once or supply the exact compiler under test, as with test-e2e.
-test-components: host-check
-	@cd .. && bin/blorp test --suite --timeout 180 blorp_2/test/unit blorp_2/test/runtime blorp_2/test/test_grammar
+# Other suites remain in source for incremental self-hosted migration.
+# Callers build once or supply the exact B2 compiler under test.
+test-components:
 	@$(MAKE) --no-print-directory test-target-components
+	@printf '%s\n' 'DEFERRED: unported unit/runtime/grammar/tooling and native e2e suites; self-hosted selection only.'
 
 # Each selected source keeps its own normal test entry and strict native run.
 # Mirror source paths so equally named suites never overwrite each other's C.
@@ -104,9 +103,7 @@ link-test-compiler:
 		&& "$(BLORP_CC)" $(TEST_COMPILER_FLAGS) -DBLORP_MEMORY_DIAGNOSTICS=1 \
 			"$(BLORP2_COMPILER_C)" -o "$(BLORP2_COMPILER)" $(TEST_COMPILER_LIBRARIES)
 
-# The harness receives the compiler under test here, never from a default.
-test-e2e: host-check
-	@cd .. && BLORP2_COMPILER="$(BLORP2_COMPILER)" bin/blorp test --suite --timeout 0 blorp_2/test/e2e
-
-host-check:
-	@cd .. && scripts/compiler-build-status --quiet
+# An explicit request for unavailable coverage must not look like a pass.
+test-e2e:
+	@printf '%s\n' 'DEFERRED: native e2e requires unsupported process/filesystem/bytes APIs; port the driver to blorp_2 before running test-e2e.' >&2
+	@exit 2

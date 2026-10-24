@@ -3,8 +3,8 @@
 A new compiler written in Blorp that emits C. Each increment starts with a
 small program, defines the grammar it needs, and tests that program through
 native execution. It can compile itself. `make -C blorp_2` uses the verified,
-digest-pinned Blorp 2 seed as its production builder. Unit, runtime and grammar
-suites continue using the legacy TestSuite host.
+digest-pinned Blorp 2 seed as its production builder. All active tests are
+self-hosted; unported unit/runtime/grammar/e2e/tooling suites are DEFERRED.
 
 The combined integration implements pure lambdas with immutable captures,
 structural patterns, value conditionals and managed source loops. The target
@@ -616,18 +616,16 @@ Format host compiler/tests separately: the host formatter also supports syntax
 outside this pilot's restricted grammar.
 
 ```sh
-make                            # Build the existing compiler first.
 make -C blorp_2 example          # Compile the example to C, build it, run it.
-make -C blorp_2 test             # Run the Blorp TestSuite tests.
+make -C blorp_2 test             # Build B2; run the explicit self-hosted selection.
 ```
 
 `example` keeps its generated C and executable in `blorp_2/build/` for
-inspection. Host suites use temporary directories; the target component gate keeps
+inspection. The self-hosted component gate keeps
 its C and executable in `blorp_2/build/self-hosted-tests/`. `BLORP_CC` selects a C
 compiler executable (default `clang`).
-`make -C blorp_2 test-compiler test-components` runs the complete component
-gate: the temporary existing-compiler host runs the unit/runtime/grammar
-roots, then Blorp 2 runs the explicit `TARGET_COMPONENT_SOURCES` in the Makefile.
+`make -C blorp_2 test-compiler test-components` runs the active component
+gate: Blorp 2 compiles the explicit `TARGET_COMPONENT_SOURCES` in the Makefile.
 The selection currently covers text, Boolean calls, constant/declaration IDs,
 IntMap, names, source identities and syntax publication, plus Lexer token traces,
 float boundaries, keyword roles, source origins, character literals, continuation,
@@ -642,8 +640,9 @@ Twelve Lexer cases are explicitly deferred in source comments: eleven bracketed
 block cases need `String.split`, and one pipe String case needs a byte-input
 boundary for invalid UTF-8. Their original inputs and assertions remain beside
 the TODOs. Deferred cases receive no PASS credit; the empty bracketed-block suite
-is not in the target selection. Other untranslated suites retain the temporary
-host until they can be ported without new library work or large refactors.
+is not in the target selection. Other untranslated unit/runtime/grammar/tooling suites and the native e2e
+driver are DEFERRED. Their sources stay intact for bounded incremental ports;
+no legacy host or replacement test framework runs them.
 
 `test-components BLORP2_COMPILER=PATH` uses an already-built compiler without a
 fallback. To run just the target selection, use:
@@ -654,8 +653,8 @@ make -C blorp_2 test-target-components BLORP2_COMPILER=PATH
 
 This target does not build or use the legacy host. Compilation, native linking,
 failed callbacks and strict leak failures all fail the target; an empty source
-selection is an error. The host run also discovers these suites, but their
-separate target execution remains required for the complete component gate.
+selection is an error. Active coverage is only this explicit selection; deferred
+coverage receives no PASS credit.
 
 The explicit compile-only test entry is:
 
@@ -680,80 +679,27 @@ continues after a failed callback. Empty suites succeed. Suite constants use
 ordinary closed initializers; inline lambda entries remain unsupported.
 The [existing text suite](test/unit/test_utils/test_text.brp) is the first example.
 
-To run only end-to-end tests, build the pilot and run the suite against it:
+Full native end-to-end execution is **DEFERRED**: its existing Blorp driver
+imports process/filesystem/bytes facilities not yet supported by the target
+library. `make -C blorp_2 test-e2e` exits nonzero with a deferral message and a
+porting hint. Default `test` runs only the self-hosted selection and prints the
+coverage deferral; it never invokes a legacy compiler or silently skips a
+requested e2e gate.
 
-```sh
-make -C blorp_2 test-compiler test-e2e
-```
+CI has four independent self-hosted lanes: Linux x64 with Clang and GCC,
+Linux ARM64 with Clang, and macOS ARM64 with Clang. Each checks out source,
+installs its C compiler when needed, and runs `make -C blorp_2 test` using the
+pinned B2 seed. No legacy toolchain artifact or FRESH host is required.
 
-The host test runner's default 30-second deadline applies to the entire
-generated suite, including every fixture. End-to-end runs disable that
-deadline. `make -C blorp_2 test` runs e2e separately with `--timeout 0`; the
-other suites retain their 180-second deadline.
+The seed workflow and `scripts/blorp2-fixpoint --prove` retain real compiler
+self-compilation, B/C output identity, A/B accepted/rejected fixture parity,
+and self-hosted components. Seed publication additionally retains its existing
+whole-source strict accounting/sanitizer checks and ordinary-main native smoke.
+Fixture parity is compiler-output agreement, not native execution. Full native
+correctness/resource qualification and unported suites remain DEFERRED;
+existing e2e inputs, oracles and cost ceilings stay in source for future ports.
 
-`test-compiler` builds the pilot once: the pinned Blorp 2 seed generates
-`build/compiler.c`, then the C compiler links one `-O0` executable with
-allocation diagnostics enabled. `test-e2e` names that executable on the
-suite's command line through the Makefile variable `BLORP2_COMPILER`
-(default `blorp_2/build/compiler`), and the harness passes it explicitly to
-every test group; the harness has no default and rejects a missing or unset
-compiler with an exact message. Build failure stops the run before any fixture
-executes. Existing artifacts are overwritten on the next run; there is no
-persistent compiler cache or input manifest. To test another executable, pass
-the variable: `make -C blorp_2 test-e2e BLORP2_COMPILER=path/to/pilot`
-(relative to the repository root).
-
-CI's Blorp 2 lanes run on Linux x64 and ARM64 with Clang, Linux x64 with GCC,
-and macOS with Clang. Each waits for the matching existing compiler's build
-and restores that temporary TestSuite host artifact. It builds the pilot once
-from the pinned Blorp 2 seed, runs `test-components`, then `test-e2e` against
-that pilot. Hosted runners do not guarantee
-the required retired-instruction counters, so that CI step explicitly sets
-`BLORP_2_INSTRUCTION_CHECK=disabled`. Allocation caps, strict leak reports and
-all native ASan/UBSan cases still run. Failures upload their test logs. Clang
-platform jobs package release binaries only after their test lanes pass.
-Clang and GCC builds have separate caches and artifacts. The macOS lane also
-runs the compiler-comparison tooling suite, whose command requires macOS
-`/usr/bin/time -l` and does not support Linux.
-
-[`test_end_to_end.brp`](test/e2e/test_end_to_end.brp) is the sole e2e test
-entrypoint; the other case modules provide groups to it and are not standalone
-runnable suites.
-Each fixture owns fresh temporary output and one measured compilation, followed
-by one strict C11 native `-O0` build under ASan and UBSan. Explicit native cases
-reuse that binary with explicit argument vectors, byte stdin and exact exit status, stdout and stderr
-assertions. Every example has a first case and a list of remaining cases;
-existing examples have one case. Failures identify the case and mismatched
-channel, with output shown as hex so embedded NUL and UTF-8 bytes remain visible.
-By default, `BLORP_2_INSTRUCTION_CHECK` is `required`: allocation and retired-
-instruction counters come from the same compilation, once per fixture. Missing,
-malformed or nonpositive instruction counters remain errors. Explicit `disabled`
-skips `/usr/bin/time` and instruction limits, records instructions as unmeasured,
-and keeps allocation parsing and caps. Empty or unknown settings reject before
-fixture compilation or output changes. These checks never reuse output from an
-earlier fixture compilation.
-
-`BLORP_2_RESOURCE_POLICY` defaults to `enforce-limits`; an unset value or that
-exact spelling preserves every resource-limit error. Initial bootstrap
-qualification may explicitly select `record-initial-bootstrap-debt`. Each
-exceeded cost decision then prints a `BLORP2_RESOURCE_RESULT status=FAIL` record
-with its policy, both counters and limits, and the original error. An explicitly
-disabled instruction counter is recorded as `unmeasured` with its limit retained.
-Only this cost decision permits the behavioral callback to continue; compiler,
-counter, native, sanitizer, strict-accounting and independent file-state errors
-still fail. Empty or unknown policy values fail even when costs are within limits.
-Passing behavioral callbacks under this initial policy retain resource FAIL debt;
-they do not establish resource or full M8 acceptance. Ordinary runs stay strict.
-
-CI temporarily selects `record-allocation-debt` only for its e2e command.
-Allocation overruns print `BLORP2_ALLOCATION_RESULT status=FAIL` with the actual
-counters, limits and original allocation error. Instruction overruns still fail,
-including when allocations also exceed their limit. Counter validity, strict
-balance, ordinary native behavior and sanitizer failures remain blocking.
-CI's existing disabled instruction measurement is unchanged; no instruction
-measurement PASS is inferred. Unit tests and compiler generation stay strict.
-
-Every host-compiled source module has a matching unit suite under `test/unit/test_<stage>/`,
+Every compiler source module has a matching unit suite under `test/unit/test_<stage>/`,
 mirroring its folder under `src/`; the support modules that suites share stay in `test/unit/`.
 `src/` has one folder per stage (`lex`, `parse`, `load`, `namespace`, `check`, `specialize`,
 `lower`, `own`, `verify`, `emit`), `utils` for modules several stages share and `runtime` for the C
@@ -764,18 +710,10 @@ Integration
 and native execution suites live under `test/e2e/`; their input programs live
 under `test/e2e/fixtures/`, grouped by feature. Folders carry the shared prefix,
 as in `match/shadow.brp` and `mortal_string/identity.brp`. Base examples without
-a distinguishing suffix use `basic.brp`. The suites use the existing compiler's
-`TestSuite` API and run with `bin/blorp test --suite`; the example
-fixture is not a test entrypoint. The host test API uses tuple-based test
-registration. The compiler source under `src/` stays within the agreed subset.
-
-Direct C unit tests of the target String runtime live under `test/runtime/`,
-with Blorp `TestSuite` orchestration. Run them with
-`bin/blorp test blorp_2/test/runtime`. They compile the same runtime fragment
-used by emission at `-O0` with ASan/UBSan. Small test-local allocator wrappers
-observe actual allocation/free calls; production runtime code has no test mode.
-Generated unit-test code uses the host command's default `-O0`; omit `--release`
-for development tests. Sanitizer builds also use `-O0`.
+a distinguishing suffix use `basic.brp`. The unported e2e and direct-C runtime orchestration suites remain deferred;
+their sources and original oracles are preserved. Active TestSuite callbacks
+use the target library and their generated normal entrypoint under strict
+memory checking.
 
 Each executable example defines its allocation and retired-instruction ceilings
 in its end-to-end test under [test/e2e/](test/e2e/); those tests are the only

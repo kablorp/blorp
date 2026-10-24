@@ -27,23 +27,17 @@ not required before landing.
 Changes under `blorp_2/` are validated with `make -C blorp_2 test`;
 `scripts/compiler-check` selects nothing for that tree.
 
-CI's Blorp 2 lanes run on Linux x64 and ARM64 with Clang, Linux x64 with GCC,
-and macOS with Clang. Each restores the temporary existing-compiler TestSuite
-host, builds the pilot once from the pinned Blorp 2 seed, then runs
-`make -C blorp_2 test-components test-e2e`. The component target runs the
-existing host roots and the Makefile's explicit `TARGET_COMPONENT_SOURCES`
-through ordinary constant TestSuite entries. `test-target-components` runs only
-that target selection with an already-built compiler; host-only discovery does
-not replace it. Every e2e fixture uses the named pilot.
-Hosted runners do not guarantee the required retired-instruction counters,
-so the CI step explicitly sets `BLORP_2_INSTRUCTION_CHECK=disabled`. It skips
-only instruction measurement and limits; allocation caps, strict leak parsing,
-native sanitizers and every fixture remain enabled. Local e2e defaults to
-`required`; missing counters still fail, and empty or unknown settings reject.
-E2e disables the suite timeout; the CI job retains its 45-minute limit. Failures
-upload the test logs, and Clang packaging waits for that platform's test lanes.
-The macOS lane also runs the compiler-comparison tooling suite: that tool
-requires macOS `/usr/bin/time -l` and does not support Linux.
+CI's independent Blorp 2 job runs Linux x64 with Clang and GCC, Linux ARM64
+with Clang, and macOS ARM64 with Clang. Each checks out source and runs
+`make -C blorp_2 test` with the pinned B2 seed and selected C compiler.
+No legacy build, artifact or FRESH-host check is involved. The Makefile's
+explicit `TARGET_COMPONENT_SOURCES` selection runs through ordinary target
+TestSuite entries, C11 `-O0` linking and strict native memory checks.
+Unported unit/runtime/grammar/tooling and full native e2e suites are DEFERRED,
+with their sources preserved for incremental ports. `test-e2e` rejects an
+explicit request with a porting hint; it never reports a deferred gate as PASS.
+Logs retain active results and deferral status. Other project CI lanes remain
+on their existing compiler/test routes.
 The shared workflow selects `BLORP_CC` through its `c_compiler` input (default
 `clang`). Compiler build caches and artifacts distinguish Clang from GCC;
 only the Clang jobs package release binaries.
@@ -390,8 +384,9 @@ root. Release identity cannot be overridden through environment variables.
 prints the repository, tag and source commit without downloading it. Other
 arguments are forwarded unchanged from the repository root.
 
-The `example` target uses the newly built B2 compiler. Unit/runtime/grammar
-tests and the e2e runner still require a FRESH legacy host through `host-check`.
+The `example` target uses the newly built B2 compiler. `test` builds B2 and
+runs its explicit self-hosted component selection; `test-components` uses an
+already-built B2 compiler. Unported suites are deferred without a host fallback.
 Run the isolated behavioral shell tests with
 `bash blorp/test/test_build/test_blorp2_bootstrap.sh`; they use fake transport,
 seed and C compiler tools, including quoted paths and parallel target requests.
@@ -410,25 +405,19 @@ stage could not be built.
 
 ### Blorp 2 fixpoint
 
-`scripts/blorp2-fixpoint` is the same proof for the Blorp 2 pilot
-(`blorp_2/src`), strengthened per its self-compile plan: the pinned seed builds
-**A**, A builds **B**, B builds **C**, all linked at `-O0` through
-`make -C blorp_2 test-compiler` and `link-test-compiler` so the flags have one
-source. `--prove` requires B and C to emit byte-identical C for `blorp_2/src`
-(the first differing line is printed), A and B to agree on exit status, output
-and C for every e2e fixture, and B to pass the e2e suite
-(`make -C blorp_2 test-e2e BLORP2_COMPILER=...`); it exits 0 at the fixpoint,
-1 at the first failed stage with a one-line reason, 2 on a setup error.
-`--frontier` is the measurement: it reports how many files of `blorp_2/src`
-parse, as `blorp_2/test/unit/test_parse/test_source_tree` counts them, then
-the first rung of the same ladder that fails, and exits 0. Setup errors exit 2
-in both modes: a stage A build failure, or in `--frontier` a failing or
-count-less source-tree suite run. Artifacts, digests and `provenance.txt` are written
-under `blorp_2/build/fixpoint/`. The rungs and their meaning are in the
-script's `--help`.
-The script requires and records a FRESH legacy host only for its hosted suites;
-it records the pinned B2 seed identity and digest separately from that host.
-It is not a seed-only qualification command.
+`scripts/blorp2-fixpoint` builds **A** from the pinned B2 seed, A builds **B**,
+B builds **C**, and C compiles the source again, all linked at `-O0` through
+`test-compiler`/`link-test-compiler`. `--prove` requires B/C source-C identity,
+A/B exit/stdout/stderr/emitted-C parity for every fixture, and B's explicit
+self-hosted components. It exits 0 for that bounded proof, 1 at a failed stage,
+and 2 for setup failure. Full native e2e execution is DEFERRED and is never
+claimed by a successful fixpoint result.
+`--frontier` reports the first failed rung of the same source/component ladder
+and exits 0 except for setup failures. The old per-file parse inventory is
+DEFERRED because its filesystem driver is unported; the actual seed/A loader
+still parses the compiler source. No legacy binary or FRESH-host check is used.
+Artifacts, hashes and explicit coverage status stay under
+`blorp_2/build/fixpoint/`. See `--help` for the current rungs.
 
 ## Static and hygiene checks
 

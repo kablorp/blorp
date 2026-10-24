@@ -7,8 +7,9 @@ Supporting a feature in the existing compiler does not put it in scope here.
 
 ## Scope
 
-The pinned Blorp 2 seed builds the current compiler. The legacy TestSuite host
-remains temporary for untranslated component suites. Compiler source stays
+The pinned Blorp 2 seed builds the current compiler. All active Blorp 2 tests
+are self-hosted. Unported suites remain in source and are explicitly deferred;
+never run them through the legacy compiler. Compiler source stays
 within the eventual bootstrap subset in the README: no
 concurrency, parallelism, tensors or dimension types, debug blocks,
 numeric widths other than Int64 and Float64, doctests, channels or FFI.
@@ -16,9 +17,8 @@ Tuples and static traits are supported by the current seed; their use in compile
 implementation remains bounded by each reviewed task. Production library trait
 activation does not authorize a general compiler-source comparison rewrite.
 Use concrete functions such as `add` and `concat`, and pattern matching,
-not trait-dispatched operators such as `==`. Host-library dependencies and
-the host TestSuite API are temporary; they neither establish bootstrap
-readiness nor expand the input language.
+not trait-dispatched operators such as `==`. Dependencies on the old host library or TestSuite API mark deferred tests;
+port bounded suites incrementally without expanding the input language.
 
 Each increment starts from a small executable fixture and its expected
 behavior, including rejections. Define only the grammar and rules that
@@ -97,31 +97,29 @@ a requirement, report the limitation instead of adding one.
 ## Validation
 
 **Tests.** Compiler tests are Blorp `TestSuite`s, not a test `main` or Python.
-Every host-compiled source module has a unit suite under
+Every compiler source module has a unit suite under
 [test/unit/](test/unit/), in the `test_<stage>/` folder that mirrors the module's
 folder under `src/`. Grammar cases live under
 [test/test_grammar/](test/test_grammar/) and change with the EBNF.
 Target component suites export ordinary `tests: TestSuite` constants.
-`make -C blorp_2 test-compiler test-components` retains the host suites
-and also runs the explicit `TARGET_COMPONENT_SOURCES` from the Makefile through
-Blorp 2. `test-target-components` runs that selection with an already-built
-compiler and no legacy host. A host-only directory run is not the complete
-component gate.
+`make -C blorp_2 test` builds Blorp 2 and runs only the explicit
+`TARGET_COMPONENT_SOURCES` selection through its ordinary TestSuite entries.
+`test-components` and `test-target-components` run that selection with an
+already-built B2 compiler. Unported unit/runtime/grammar/tooling suites are
+DEFERRED, preserved for incremental migration, and receive no PASS credit.
 Rejections check exact message, help and span. Embedded programs use aligned
 multiline strings with exact contents; keep quoted escapes where they make
 the bytes clearer, such as CRLF or malformed indentation. Using multiline
 literals in tests does not add them to the pilot's input grammar.
 
-**End-to-end.** Suites live under [test/e2e/](test/e2e/), with programs in
-[test/e2e/fixtures/](test/e2e/fixtures/). Build the compiler once per run with
-`make -C blorp_2 test-compiler`, never per fixture, and compile each fixture
-once at `-O0`. The C compiler builds the unmodified output, and the suite checks the fixture's
-real `main` for exit status, stdout and stderr. Each fixture exposes its
-behavior through that entrypoint; precise phase facts belong in unit tests.
-Run e2e with `make -C blorp_2 test-e2e`, which names the compiler under test
-on the suite's command line through the Makefile's `BLORP2_COMPILER`; the
-harness has no default. Keep artifacts under the ignored `build/` or
-temporary directories; add no persistent compiler cache.
+**End-to-end.** Sources remain under [test/e2e/](test/e2e/), with programs in
+[test/e2e/fixtures/](test/e2e/fixtures/). The existing driver depends on process,
+filesystem and bytes APIs not yet available to self-hosted tests. Full native
+e2e execution is DEFERRED; `make -C blorp_2 test-e2e` rejects with an explicit
+message. Do not substitute the legacy host or a replacement test framework.
+Port bounded suites incrementally through ordinary target TestSuites and real
+fixture mains. Existing fixture parity checks compare compiler outputs only;
+they do not establish native execution. Keep artifacts under ignored `build/`.
 
 **The direct C exception.** Unit tests of target runtime helpers under
 `test/runtime/` may be C, compiled and run by a Blorp `TestSuite`. This includes
