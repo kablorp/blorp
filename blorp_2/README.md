@@ -1987,9 +1987,8 @@ Semantic rules:
   and otherwise grows geometrically. Shared buffers copy, preserving value
   semantics. Concat-only accumulation can transfer a nearest-loop-owned String
   in a terminal arm; captured outer owners and continuing joins stay borrowed.
-  `append_int` still uses its ordinary borrowed wrapper and a temporary decimal
-  String until the supporting compiler seed is published and pinned. The
-  compiler accepts `builtin("string.append_int")` on a pure nongeneric
+  The pinned seed supports `append_int` as `builtin("string.append_int")`,
+  now used by the production library. The builtin requires a pure nongeneric
   `(String, Int) -> String` declaration. Direct calls can transfer a last-used
   destination through the same ownership contract as concat; integer digits
   use a checked stack buffer and append through the same capacity machinery.
@@ -2467,7 +2466,8 @@ Empty prefix is True; UTF-8/NUL spelling is exact. The temporary implementation
 uses native stack linear in the matching prefix; no constant-stack claim is made.
 
 `string.append_int(self: String, value: Int) -> String` appends signed Int64 decimal digits.
-The ordinary pure wrapper preserves UTF-8/NUL prefix bytes and earlier aliases.
+The pure builtin preserves UTF-8/NUL prefix bytes and earlier aliases. It
+formats digits on the stack and can reuse a transferred unique destination.
 The [edge fixture](test/e2e/fixtures/string_operations/append_int_edges.brp)
 checks signed extrema, counted bytes and aliases; its owning suite retains the resource limits.
 

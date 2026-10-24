@@ -11,13 +11,14 @@ List optimization or legacy compiler change.
 
 ## Staged integration
 
-Compiler support lands with the existing production library implementation,
-`add(self, IntOps.to_string(value))`. A supporting seed must then pass the
-maintained three-platform publication gates and be pinned before that library
-body changes to `builtin("string.append_int")`. Support-only compiler costs
-and activated-library costs are distinct measurements. An explicitly selected
-local library copy may validate activation before publication; it is never a
-default-build fallback or evidence that the production library is activated.
+Compiler support landed as `a9b1939155aa748d5ccfc1eea85eeb51e771bafa`,
+with the production library still using `add(self, IntOps.to_string(value))`.
+The supporting `blorp2-seed-a9b1939155aa` release then passed all three platform
+gates and publication. Its binaries and provenance were verified before pinning
+it and changing the library body to `builtin("string.append_int")`.
+Support-only compiler costs and activated-library costs remain distinct.
+The original explicitly selected local library copy established preview results;
+the cold default build below confirms the production compiler has the same C.
 
 ## Fixed measurement boundary
 
@@ -32,8 +33,12 @@ Normal and diagnostic performance compilers link the same physical C at
 Whole-compilation measurements use the same frozen source/library, working
 directory and physical output pathname, with three interleaved serial samples
 per version and mode. Allocations are deterministic strict diagnostic counts;
-normal instructions use the minimum of three. Every raw sample, failed attempt,
-input/binary/toolchain hash, command, output hash and memory report is retained.
+normal instructions use the minimum of three. Raw samples, failed attempts,
+input/binary/toolchain hashes, commands and reports were retained during review.
+That original ignored evidence packet did not survive the interruption before
+activation. The table below preserves the committed, previously reviewed results;
+it is not presented as a newly repeated matched measurement. Fresh publication,
+default-build, regression and candidate-only benchmark evidence is kept separately.
 Output may intentionally differ between versions but must be stable within each.
 
 The unchanged `compiler_emit` workload uses the corresponding old/new library
@@ -53,7 +58,7 @@ deletions and net changes are reported separately. Existing fixture caps and
 the allocation-debt policy remain unchanged; broad disabled instruction checks
 are not instruction-cost qualification.
 
-## Matched measurements
+## Historical matched measurements
 
 | Boundary | Baseline allocations | Candidate allocations | Change | Baseline normal instructions | Candidate normal instructions | Change |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
@@ -84,17 +89,18 @@ activated preview reproduces its own compiler C exactly at SHA-256
 Both support and activated compilers emit the same stable C for the frozen
 baseline input, SHA-256
 `a5ea78af325b71fd09f04e703109b2b540601ca4511c7f2ff51784ed64c79508`.
-Full binary/toolchain/input hashes and serial commands are in
-`performance-spec.json`, the build folders and `measurements/`.
-These preview gains are not yet the production default: supporting-seed
-publication, pin verification and library activation remain required.
+The original `performance-spec.json`, build folders and `measurements/` packet
+are no longer available. The fresh cold default build reproduces the preview
+compiler C `551613a1...` exactly; this establishes that the generated C is
+identical without claiming recovery of the old sample logs. The profiling
+compilers used `-O2`; the default builder and correctness gates use `-O0`.
 
 Handwritten compiler production changes: 89 lines added, 37 deleted, **+52 net**
 across nine files. Tests: 910 added, 8 deleted, **+902 net** across 17 files,
 including the fixture and independently requested emitter matrix. Combined
 String A+B production growth is **+305**, below the unchanged +550 ceiling.
 
-## Validation status
+## Historical pre-publication validation
 
 The old compiler rejects the new label with the exact unknown-builtin diagnostic.
 The maintained parser regression failed before implementation and passed after.
@@ -123,10 +129,60 @@ named failures: incorrect Int64-minimum formatting, missing transferred-referenc
 release, hardcoded String validation of the unmanaged Int operand, and loss of
 unique-buffer reuse. Every mutation was restored byte for byte; the final runtime
 and verifier run passes all 58 reported callbacks.
-Local support correctness and cost qualification are complete. Supporting-seed
-publication/pin and production-library activation remain separate stages.
+These are the original local support results; the published qualification below
+is a separate run with its own actual counters.
 
-Raw evidence lives under the ignored
-`build/audits/string-append-int-2026-10-23/`. The earlier approved String A+B
-design, cost ceilings and architecture reviews remain under
-`build/audits/string-cow-plan-2026-10-23/`.
+## Published supporting seed and activated default
+
+The supporting release is
+[`blorp2-seed-a9b1939155aa`](https://github.com/kablorp/blorp/releases/tag/blorp2-seed-a9b1939155aa),
+qualified by [run 40048300138](https://github.com/kablorp/blorp/actions/runs/40048300138).
+All eight asset digests and seven `SHA256SUMS` rows match actual downloaded bytes.
+All three archives bind the exact source commit, published normal binary and
+reviewed compiler C `09c3f134...`. Their compiler, target-library and host-library
+inventories match Git exactly. Each platform passes 585 fixture comparisons
+(490 accepted, 95 rejected), 608 e2e cases, 4,690 host callbacks and 188 target
+callbacks across 27 strictly balanced suites. Each whole-source sanitizer run
+balances 31,950,865 allocations/releases with zero leaks. The release retains
+125 original-limit allocation-debt FAIL rows per platform; hosted instructions
+are disabled and unqualified. These counts differ from the earlier local run.
+
+A fresh checkout of the support commit plus the activation patch, without a
+legacy binary or build artifacts and with a separate empty seed cache, passes
+the default `make -C blorp_2 example`. It downloads the pinned published seed and
+emits compiler C `551613a1...`, exactly matching the measured activation preview.
+Compiler/library/pin inputs stay unchanged, and no legacy binary is produced.
+The library activation itself changes one production line, with no new compiler
+or ownership representation.
+
+Fresh default validation passes the complete fixpoint, 585 fixture comparisons
+and all 608 e2e cases. Components pass 4,690 host and 188 target assertions;
+all 27 target strict reports balance. Whole-source ASan/UBSan compilation emits
+the identical compiler C and balances 30,113,914 allocations/releases, with zero
+leaks. The activated compiler records 122 allocation-debt FAIL rows, down from
+the supporting release's 125, with every existing limit unchanged. Broad e2e
+instructions remain unmeasured. These gates used the support source plus the
+activation; the later parser-formatting commit `e94940f6d` is preserved during
+integration. The integrated source emits byte-identical compiler C
+`551613a1...`, preserving the fully tested compiler program.
+
+Fresh candidate-only `compiler_emit` corroboration retains the exact checksum
+and byte count. All five strict samples balance 54,969 allocations/releases.
+Five normal samples observe 147,808,484–148,927,123 retired instructions;
+minimum 147,808,484. Unrelated activity in a separate worktree is disclosed in
+the raw snapshots. This is corroboration, not a new matched speedup or a
+quiet-machine claim. An initial component attempt was conservatively stopped
+after mistaking identical relative command paths for a possible collision;
+the complete fresh rerun above passed, and no output collision was established.
+
+Activation adds one production line and removes one, with no compiler changes;
+its only test edit corrects a stale prepublication comment. Existing gates and
+resource policies remain unchanged.
+Fresh raw evidence is retained under
+`build/audits/string-append-int-resume-2026-10-23/`, with independent release
+review under `build/audits/string-append-int-release-review-2026-10-23/`.
+
+Integration also preserves the subsequently landed equality-operator commit
+`d7dc9fc73`. The full gate counts above describe the activation snapshot;
+no additional full suite was run on that combined tree before publication,
+as requested by the user. Upstream publication guards are left unchanged.

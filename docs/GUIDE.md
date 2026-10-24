@@ -46,7 +46,7 @@ module provides concrete wrapping `add`. Closed builtin bodies
 require their exact runtime signature. Quoted String literals accept valid UTF-8
 and Unicode scalar escapes; String length and source locations count bytes.
 Literal construction, copies and returns use ordinary managed ownership.
-Its [ordinary `append_int` wrapper](../blorp_2/README.md#counted-string-operations)
+Its [`append_int` helper](../blorp_2/README.md#counted-string-operations)
 appends signed Int64 digits while preserving counted UTF-8 and NUL bytes.
 Its [ordinary prefix helper](../blorp_2/README.md#counted-string-operations)
 compares exact counted bytes with temporary native stack linear in the prefix.
