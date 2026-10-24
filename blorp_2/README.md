@@ -1947,8 +1947,14 @@ Semantic rules:
   semantics. Concat-only accumulation can transfer a nearest-loop-owned String
   in a terminal arm; captured outer owners and continuing joins stay borrowed.
   `append_int` still uses its ordinary borrowed wrapper and a temporary decimal
-  String, so this increment does not remove its growing-prefix copies.
-  [Buffer-reuse measurements](../benchmarks/results/blorp2-string-buffer-reuse-2026-10-23.md)
+  String until the supporting compiler seed is published and pinned. The
+  compiler accepts `builtin("string.append_int")` on a pure nongeneric
+  `(String, Int) -> String` declaration. Direct calls can transfer a last-used
+  destination through the same ownership contract as concat; integer digits
+  use a checked stack buffer and append through the same capacity machinery.
+  Named and stored callable references retain their borrowed wrappers.
+  [Buffer-reuse measurements](../benchmarks/results/blorp2-string-buffer-reuse-2026-10-23.md) and
+  [integer-append measurements](../benchmarks/results/blorp2-string-append-int-2026-10-23.md)
   record allocation/instruction results and the validation boundary.
 - Union-only recursive layouts, generic self-reinstantiation,
   guards, Char patterns, constructor UFCS,

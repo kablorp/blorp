@@ -203,6 +203,103 @@ static void overflow_is_rejected(void) {
     }
 }
 
+static void append_int_borrowed(const char *prefix, int64_t prefix_length,
+                                int64_t number, const char *expected, int64_t length) {
+    struct blorp_string *source = blorp_string_from_bytes(prefix, prefix_length);
+    const size_t calls = allocation_count, resizes = resize_count;
+    struct blorp_string *result = blorp_string_append_int(source, number);
+    assert(allocation_count == calls + 1 && resize_count == resizes);
+    assert_bytes(source, prefix, prefix_length);
+    assert_bytes(result, expected, length);
+    blorp_string_release(source);
+    assert_bytes(result, expected, length);
+    blorp_string_release(result);
+}
+
+static void append_int_limits(void) {
+    const int64_t values[] = {0, -7, INT64_MIN, INT64_MAX};
+    const char *expected[] = {"0", "-7", "-9223372036854775808", "9223372036854775807"};
+    const int64_t lengths[] = {1, 2, 20, 19};
+    for (size_t index = 0; index < sizeof values / sizeof values[0]; index++) {
+        append_int_borrowed("", 0, values[index], expected[index], lengths[index]);
+        struct blorp_string *value = blorp_string_from_bytes("", 0);
+        const size_t calls = allocation_count, resizes = resize_count;
+        value = blorp_string_append_int_take_left(value, values[index]);
+        assert(allocation_count == calls + 1 && resize_count == resizes + 1);
+        assert_bytes(value, expected[index], lengths[index]);
+        blorp_string_release(value);
+    }
+}
+
+static void append_int_shared(void) {
+    struct blorp_string *source = blorp_string_from_bytes("prefix=", 7);
+    blorp_string_retain(source);
+    const size_t calls = allocation_count, resizes = resize_count;
+    struct blorp_string *result = blorp_string_append_int_take_left(source, -42);
+    assert(allocation_count == calls + 1 && resize_count == resizes);
+    assert_bytes(source, "prefix=", 7);
+    assert_bytes(result, "prefix=-42", 10);
+    blorp_string_release(source);
+    assert_bytes(result, "prefix=-42", 10);
+    blorp_string_release(result);
+}
+
+static void append_int_utf8_nul(void) {
+    append_int_borrowed("\xc3\xa9\0", 3, -42, "\xc3\xa9\0-42", 6);
+    struct blorp_string *value = blorp_string_from_bytes("\xc3\xa9\0", 3);
+    const size_t calls = allocation_count, resizes = resize_count;
+    value = blorp_string_append_int_take_left(value, -42);
+    assert(allocation_count == calls + 1 && resize_count == resizes + 1);
+    assert_bytes(value, "\xc3\xa9\0-42", 6);
+    blorp_string_release(value);
+}
+
+static void append_int_spare_capacity(void) {
+    struct blorp_string *value = blorp_string_from_bytes("abc", 3);
+    struct blorp_string *suffix = blorp_string_from_bytes("z", 1);
+    value = blorp_string_concat_take_left(value, suffix);
+    blorp_string_release(suffix);
+    assert(value->capacity > (size_t)value->length);
+    const size_t calls = allocation_count, resizes = resize_count;
+    value = blorp_string_append_int_take_left(value, 7);
+    assert(allocation_count == calls && resize_count == resizes);
+    assert_bytes(value, "abcz7", 5);
+    blorp_string_release(value);
+}
+
+static void append_int_geometric_growth(void) {
+    enum { APPENDS = 4096, MAX_RESIZES = 13 };
+    struct blorp_string *value = blorp_string_from_bytes("", 0);
+    const size_t calls = allocation_count;
+    for (int64_t index = 0; index < APPENDS; index++) {
+        value = blorp_string_append_int_take_left(value, 7);
+        assert(value->length == index + 1 && value->bytes[index + 1] == '\0');
+    }
+    assert(resize_count == MAX_RESIZES && allocation_count == calls + MAX_RESIZES);
+    assert(resized_bytes < 2 * APPENDS + MAX_RESIZES *
+           (sizeof(struct blorp_string) + 1 + sizeof(max_align_t)));
+    for (int64_t index = 0; index < APPENDS; index++) assert(value->bytes[index] == '7');
+    blorp_string_release(value);
+}
+
+static void append_int_overflow_is_rejected(void) {
+    for (int scenario = 0; scenario < 4; scenario++) {
+        const pid_t child = fork();
+        assert(child >= 0);
+        if (child == 0) {
+            struct blorp_string prefix = {0};
+            atomic_init(&prefix.references, 1);
+            prefix.length = scenario < 2 ? INT64_MAX : -1;
+            if (scenario % 2 == 0) (void)blorp_string_append_int(&prefix, 7);
+            else (void)blorp_string_append_int_take_left(&prefix, 7);
+            _Exit(EXIT_FAILURE);
+        }
+        int status;
+        assert(waitpid(child, &status, 0) == child);
+        assert(WIFSIGNALED(status) && WTERMSIG(status) == SIGABRT);
+    }
+}
+
 int main(int argc, char **argv) {
     blorp_memory_start();
     assert(argc == 2);
@@ -224,6 +321,13 @@ int main(int argc, char **argv) {
     else if (strcmp(name, "take_shared_alias") == 0) take_left_shared(1);
     else if (strcmp(name, "take_geometric_growth") == 0) take_left_geometric_growth();
     else if (strcmp(name, "overflow") == 0) overflow_is_rejected();
+    else if (strcmp(name, "append_int_borrowed") == 0) append_int_borrowed("prefix=", 7, 42, "prefix=42", 9);
+    else if (strcmp(name, "append_int_limits") == 0) append_int_limits();
+    else if (strcmp(name, "append_int_utf8_nul") == 0) append_int_utf8_nul();
+    else if (strcmp(name, "append_int_shared") == 0) append_int_shared();
+    else if (strcmp(name, "append_int_spare") == 0) append_int_spare_capacity();
+    else if (strcmp(name, "append_int_growth") == 0) append_int_geometric_growth();
+    else if (strcmp(name, "append_int_overflow") == 0) append_int_overflow_is_rejected();
     else abort();
     assert(live_count == 0 && allocation_count == free_count);
     return blorp_memory_finish(0);

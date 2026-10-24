@@ -1,0 +1,150 @@
+import:
+	../../../src/check/check: check, checked_functions
+	../../../src/check/model as Checked
+	../../../src/check/callables: function_contract, receiver_contract, FunctionContract
+	../../../src/check/inference as Inference
+	../../../src/check/traits: authored_traits
+	../../../src/check/render: render_failure
+	../../../src/namespace/namespace: build_namespace
+	../../../src/namespace/builtins as Builtins
+	../../../src/utils/ids: function_number
+	../../../src/utils/source: module_source, root_module_id, same_source
+	../../../src/utils/syntax: Purity(Pure), ParsedBody(ParsedValueBody), ExpressionBase(DirectApplication)
+	../input: accepted_signatures
+	../module_input: parse_modules
+	../string_append_int_inputs: APPEND_DECLARATION, DIRECT_APPEND, RECEIVER_APPEND, WRAPPED_APPEND, NAMED_APPEND, STORED_APPEND
+	result: to_option
+	test: TestSuite
+
+
+private pure func returned_form(source: String, position: Int) -> Option[Checked.CheckedForm]:
+	parsed ?= parse_modules([{ source = APPEND_DECLARATION + source, targets = [] }]).to_option()
+	program ?= check(parsed).to_option()
+	function ?= checked_functions(program).functions.get(position)
+	match function.body:
+		Checked.CheckedValueBody(Checked.ReturnExpression(value)): Some(value.form)
+		_: None
+
+
+private pure func direct_append(source: String) -> Bool:
+	match returned_form(source, 1):
+		Some(Checked.InvokeFunction(call)):
+			match (call.target, call.operands):
+				(Checked.RuntimeFunction(Builtins.StringAppendInt), [Checked.ValueOperand(text), Checked.ValueOperand(number)]):
+					match (text.form, text.value_type, number.form, number.value_type):
+						(Checked.ReadBinding(text_id), Checked.StringType, Checked.ReadBinding(number_id), Checked.IntType):
+							Checked.binding_number(text_id) == 0 and Checked.binding_number(number_id) == 1
+						_: False
+				_: False
+		_: False
+
+
+private pure func contract(receiver: Bool) -> Option[FunctionContract]:
+	parsed ?= parse_modules([{ source = APPEND_DECLARATION + DIRECT_APPEND, targets = [] }]).to_option()
+	namespace ?= build_namespace(parsed).to_option()
+	signatures ?= accepted_signatures(parsed, namespace).to_option()
+	callee ?= signatures.functions.get(0)
+	caller ?= signatures.functions.get(1)
+	active = { body = Checked.DeclaredBody(caller.id), purity = Pure }
+	match caller.declaration.body:
+		ParsedValueBody(value):
+			match value.base:
+				DirectApplication(name, arguments):
+					if receiver:
+						receiver_contract(active, name, arguments.drop(1), callee.id, signatures.functions).to_option()
+					else:
+						function_contract(active, name, arguments, callee.id, signatures.functions).to_option()
+				_: None
+		_: None
+
+
+private pure func contract_selects_append(receiver: Bool) -> Bool:
+	match contract(receiver):
+		Some(accepted):
+			match accepted.target:
+				Checked.RuntimeTarget(Builtins.StringAppendInt):
+					accepted.signature.type_parameters.is_empty() and accepted.signature.requirements.is_empty()
+				_: False
+		None: False
+
+
+private pure func published_append() -> Option[Checked.CheckedCall]:
+	accepted ?= contract(False)
+	pending ?= Inference.static_pending_call(accepted, 0).to_option()
+	text = Checked.ValueOperand({ form = Checked.LiteralString("value="), value_type = Checked.StringType, span = accepted.span })
+	number = Checked.ValueOperand({ form = Checked.LiteralInteger(-7), value_type = Checked.IntType, span = accepted.span })
+	traits = authored_traits({ declarations = [], implementations = [], canonical = None })
+	Inference.publish_pending_call(pending, [text, number], [], traits, []).to_option()
+
+
+pure func test_pending_append_publishes_runtime_and_scalar_operands() -> Bool:
+	match published_append():
+		Some(call):
+			match (call.target, call.operands):
+				(Checked.RuntimeFunction(Builtins.StringAppendInt), [Checked.ValueOperand(first), Checked.ValueOperand(second)]):
+					match (first.value_type, second.value_type):
+						(Checked.StringType, Checked.IntType): True
+						_: False
+				_: False
+		None: False
+
+
+pure func test_user_wrapper_stays_a_declared_call() -> Bool:
+	match returned_form(WRAPPED_APPEND, 2):
+		Some(Checked.InvokeFunction(call)):
+			match call.target:
+				Checked.UserFunction(id, []): function_number(id) == 1
+				_: False
+		_: False
+
+
+pure func test_named_callable_keeps_its_declaration() -> Bool:
+	match returned_form(NAMED_APPEND, 2):
+		Some(Checked.InvokeFunction(call)):
+			match call.operands:
+				[Checked.CallableOperand(_, Checked.NamedCallable(id, []), _), Checked.ValueOperand(_), Checked.ValueOperand(_)]: function_number(id) == 0
+				_: False
+		_: False
+
+
+pure func test_stored_callable_keeps_its_declaration() -> Bool:
+	match returned_form(STORED_APPEND, 1):
+		Some(Checked.MakeCallable(Checked.NamedCallable(id, []))): function_number(id) == 0
+		_: False
+
+
+private pure func rejects_header(header: String) -> Bool:
+	source = header + "\n    builtin(\"string.append_int\")\nfunc main() -> Int:\n    0\n"
+	label = header.length() + "\n    builtin(".length()
+	match parse_modules([{ source = source, targets = [] }]):
+		Err(_): False
+		Ok(parsed):
+			match check(parsed):
+				Ok(_): False
+				Err(failure):
+					diagnostics = render_failure(failure)
+					error = diagnostics.first
+					(error.message == "builtin declaration does not match its runtime contract"
+						and error.help == "declare a pure nongeneric function with String and Int parameters returning String"
+						and same_source(error.span.source, module_source(root_module_id()))
+						and error.span.start == label and error.span.end == label + "\"string.append_int\"".length()
+						and error.note.is_none() and diagnostics.remaining.is_empty())
+
+
+tests: TestSuite = {
+	description = "Blorp 2 direct integer append checking",
+	tests = [
+		("direct admission selects runtime contract", pure func(): contract_selects_append(False)),
+		("receiver admission selects runtime contract", pure func(): contract_selects_append(True)),
+		("pending call publishes scalar Int without callable conversion", test_pending_append_publishes_runtime_and_scalar_operands),
+		("direct call publishes typed String and Int operands", pure func(): direct_append(DIRECT_APPEND)),
+		("UFCS call publishes typed String and Int operands", pure func(): direct_append(RECEIVER_APPEND)),
+		("ordinary user wrapper stays declared", test_user_wrapper_stays_a_declared_call),
+		("named builtin callable retains declaration", test_named_callable_keeps_its_declaration),
+		("stored builtin callable retains declaration", test_stored_callable_keeps_its_declaration),
+		("impure declaration rejects with exact help and span", pure func(): rejects_header("func append_number(text: String, number: Int) -> String:")),
+		("reversed parameter types reject", pure func(): rejects_header("pure func append_number(number: Int, text: String) -> String:")),
+		("generic header rejects", pure func(): rejects_header("pure func append_number[T](text: String, number: Int) -> String:")),
+		("wrong result rejects", pure func(): rejects_header("pure func append_number(text: String, number: Int) -> Int:")),
+	]
+}

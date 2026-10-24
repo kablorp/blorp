@@ -72,7 +72,8 @@ only their callable-name positions accept those keyword tokens. Prefix/infix for
 Closed runtime bodies name one operation, as in `builtin("string.parse_int")`,
 which returns the foundation's designated `Option[Int]`; `builtin("int.equals")`
 and `builtin("int.less_than")` require pure nongeneric two-Int declarations
-returning the designated `Bool`. Ordering uses signed64 values. The foundation
+returning the designated `Bool`. `builtin("string.append_int")` requires a pure
+nongeneric `(String, Int) -> String` declaration. Ordering uses signed64 values. The foundation
 check designates Bool, Option and Result once, by name in `_base.brp`.
 Constructors of other imported types require explicit selection. Wildcards
 and function reexports remain unsupported.

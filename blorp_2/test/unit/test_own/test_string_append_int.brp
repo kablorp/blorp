@@ -1,0 +1,133 @@
+import:
+	../../../src/lower/lower as Lower
+	../../../src/namespace/builtins as Builtins
+	../../../src/own/own as Own
+	../../../src/specialize/specialize as Concrete
+	../../../src/verify/verify: verify
+	../ownership_inputs: function, input_ids, integer, parameter, runtime, span
+	../source_while_inputs as Input
+	../string_append_int_inputs: APPEND_DECLARATION, MIXED_LOOP
+	test: TestSuite
+
+
+private pure func append_modes(function: Own.OwnedFunction, consuming: Bool) -> Bool:
+	match function.operations:
+		[Own.DefineValue(text), Own.DefineValue(number), Own.DefineValue(result)]:
+			match (result.operation, result.result, function.result):
+				(Own.CallDefinition(Concrete.RuntimeFunction(Builtins.StringAppendInt), [left, Own.UnmanagedArgument(right)]), Own.OwnedResult(fresh), Own.OwnedReturn(value, returned)):
+					correct_left = match left:
+						Own.ConsumedArgument(old_value, owner):
+							consuming and Lower.value_number(old_value) == Lower.value_number(text.id) and Own.owner_number(owner) != Own.owner_number(fresh)
+						Own.BorrowedArgument(borrow):
+							match borrow.source:
+								Own.ParameterBorrow(source):
+									not consuming and Lower.value_number(source) == Lower.value_number(text.id)
+								_: False
+						_: False
+					(correct_left and Lower.value_number(right) == Lower.value_number(number.id)
+						and Lower.value_number(value) == Lower.value_number(result.id)
+						and Own.owner_number(returned) == Own.owner_number(fresh))
+				_: False
+		_: False
+
+
+pure func test_local_prefix_consumes_without_a_digits_owner() -> Bool:
+	match input_ids():
+		Err(_): False
+		Ok(ids):
+			text: Lower.ValueDefinition = { id = ids.first, value_type = Concrete.StringType, operation = Lower.StringValue("value="), span = span(10) }
+			definitions = [text, integer(ids.second, -7, 20), runtime(ids.third, Builtins.StringAppendInt, [ids.first, ids.second], Concrete.StringType, 30)]
+			match Own.insert_function(function(definitions, ids.third, [], Concrete.StringType), [], []):
+				Ok(owned): append_modes(owned, True)
+				Err(_): False
+
+
+pure func test_borrowed_parameter_keeps_int_unmanaged() -> Bool:
+	match input_ids():
+		Err(_): False
+		Ok(ids):
+			definitions = [parameter(ids.first, Concrete.StringType), integer(ids.second, 0, 20), runtime(ids.third, Builtins.StringAppendInt, [ids.first, ids.second], Concrete.StringType, 30)]
+			match Own.insert_function(function(definitions, ids.third, [Concrete.StringType], Concrete.StringType), [], []):
+				Ok(owned): append_modes(owned, False)
+				Err(_): False
+
+
+pure func test_later_prefix_read_prevents_consumption() -> Bool:
+	match input_ids():
+		Err(_): False
+		Ok(ids):
+			text: Lower.ValueDefinition = { id = ids.first, value_type = Concrete.StringType, operation = Lower.StringValue("old"), span = span(10) }
+			definitions = [text, integer(ids.second, 9, 20), runtime(ids.third, Builtins.StringAppendInt, [ids.first, ids.second], Concrete.StringType, 30), runtime(ids.fourth, Builtins.StringLength, [ids.first], Concrete.IntType, 40)]
+			match Own.insert_function(function(definitions, ids.fourth, [], Concrete.IntType), [], []):
+				Err(_): False
+				Ok(owned):
+					owned.operations.any(pure func(operation):
+						match operation:
+							Own.DefineValue(definition):
+								match definition.operation:
+									Own.CallDefinition(Concrete.RuntimeFunction(Builtins.StringAppendInt), [Own.BorrowedArgument(_), Own.UnmanagedArgument(_)]): True
+									_: False
+							_: False
+					)
+
+
+private pure func drops_owner(operations: List[Own.OwnershipOperation], owner: Own.OwnerId) -> Bool:
+	operations.any(pure func(operation):
+		match operation:
+			Own.DropOwner(dropped, _): Own.owner_number(dropped) == Own.owner_number(owner)
+			_: False
+	)
+
+
+pure func test_mixed_loop_consumes_integer_append_and_preserves_fresh_recur() -> Bool:
+	match Input.lowered(APPEND_DECLARATION + MIXED_LOOP).and_then(Own.own):
+		Err(_): False
+		Ok(program):
+			var appended = 0
+			var fresh_edges = 0
+			var valid = True
+			for function in program.functions:
+				for operation in function.operations:
+					match operation:
+						Own.ExecuteLoop(loop):
+							match loop.body.tail:
+								Own.MatchLoop(branch):
+									for arm in branch.arms:
+										var arm_appends = 0
+										var arm_acquisitions = 0
+										for nested in arm.body.operations:
+											match nested:
+												Own.DefineValue(definition):
+													match definition.operation:
+														Own.CallDefinition(Concrete.RuntimeFunction(Builtins.StringAppendInt), [Own.ConsumedArgument(_, owner), Own.UnmanagedArgument(_)]):
+															appended = appended + 1
+															arm_appends = arm_appends + 1
+															valid = valid and not drops_owner(arm.body.operations, owner)
+														_: void
+												Own.AcquireOwner(acquired, borrow, _):
+													match arm.body.tail:
+														Own.ExitLoop(Own.Recur(transfers, _)):
+															for transfer in transfers:
+																match transfer:
+																	Own.OwnedReturn(value, owner):
+																		if Lower.value_number(value) == Lower.value_number(borrow.value) and Own.owner_number(owner) == Own.owner_number(acquired):
+																			arm_acquisitions = arm_acquisitions + 1
+																	_: void
+														_: void
+												_: void
+										if arm_appends == 1:
+											fresh_edges = fresh_edges + arm_acquisitions
+								_: void
+						_: void
+			appended == 1 and fresh_edges == 1 and valid and verify(program).is_ok()
+
+
+tests: TestSuite = {
+	description = "Blorp 2 integer append ownership insertion",
+	tests = [
+		("local last use consumes prefix with scalar Int and no digits owner", test_local_prefix_consumes_without_a_digits_owner),
+		("borrowed parameter retains scalar argument", test_borrowed_parameter_keeps_int_unmanaged),
+		("later prefix read keeps its old owner live", test_later_prefix_read_prevents_consumption),
+		("mixed loop consumes integer append and uses fresh recur acquisition", test_mixed_loop_consumes_integer_append_and_preserves_fresh_recur),
+	]
+}

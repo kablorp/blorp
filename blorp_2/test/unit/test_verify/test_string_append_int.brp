@@ -1,0 +1,148 @@
+import:
+	../../../src/namespace/builtins as Builtins
+	../../../src/own/own as Own
+	../../../src/specialize/specialize as Concrete
+	../../../src/utils/source: same_source
+	../../../src/utils/syntax: Entrypoint(NoArguments), EntryResult(IntegerExitStatus)
+	../../../src/verify/verify: verify
+	../ownership_inputs: InputIds, input_ids, span
+	test: TestSuite
+
+
+-- Raw ownership IR supplies no insertion-derived liveness or discharge facts.
+private pure func raw_append(
+	ids: InputIds, arguments: List[Own.OwnedArgument], after: List[Own.OwnershipOperation],
+) -> Own.OwnershipProgram:
+	text: Own.OwnedDefinition = {
+		id = ids.first, value_type = Concrete.StringType, operation = Own.StringDefinition("value="),
+		result = Own.OwnedResult(Own.owner_id(0)), span = span(10)
+	}
+	number: Own.OwnedDefinition = {
+		id = ids.second, value_type = Concrete.IntType, operation = Own.IntegerDefinition(-7),
+		result = Own.UnmanagedResult, span = span(20)
+	}
+	call: Own.OwnedDefinition = {
+		id = ids.third, value_type = Concrete.StringType,
+		operation = Own.CallDefinition(Concrete.RuntimeFunction(Builtins.StringAppendInt), arguments),
+		result = Own.OwnedResult(Own.owner_id(1)), span = span(30)
+	}
+	worker: Own.OwnedFunction = {
+		signature = { parameters = [], return_type = Concrete.StringType },
+		operations = [Own.DefineValue(text), Own.DefineValue(number), Own.DefineValue(call)].concat(after),
+		result = Own.OwnedReturn(ids.third, Own.owner_id(1))
+	}
+	main: Own.OwnedFunction = {
+		signature = { parameters = [], return_type = Concrete.IntType },
+		operations = [Own.DefineValue({ number | id = ids.first, operation = Own.IntegerDefinition(0), span = span(50) })],
+		result = Own.UnmanagedReturn(ids.first)
+	}
+	{ records = [], unions = [], functions = [main, worker], entrypoint = NoArguments(ids.entrypoint, IntegerExitStatus) }
+
+
+private pure func arguments(ids: InputIds) -> List[Own.OwnedArgument]:
+	[Own.ConsumedArgument(ids.first, Own.owner_id(0)), Own.UnmanagedArgument(ids.second)]
+
+
+private pure func borrowed(ids: InputIds) -> Own.OwnedArgument:
+	Own.BorrowedArgument({ value = ids.first, source = Own.OwnerBorrow(Own.owner_id(0)) })
+
+
+private pure func rejects(program: Own.OwnershipProgram, message: String, at: Int) -> Bool:
+	match verify(program):
+		Ok(_): False
+		Err(error):
+			(error.message == "ownership verification failed: " + message
+				and error.help == "report this compiler error with the input program"
+				and same_source(error.span.source, span(at).source)
+				and error.span.start == at and error.span.end == at + 1 and error.note.is_none())
+
+
+pure func test_consuming_append_accepts_unmanaged_integer_after_discharge() -> Bool:
+	match input_ids():
+		Ok(ids): verify(raw_append(ids, arguments(ids), [])).is_ok()
+		Err(_): False
+
+
+pure func test_borrowed_append_preserves_the_original_owner() -> Bool:
+	match input_ids():
+		Ok(ids): verify(raw_append(ids, [borrowed(ids), Own.UnmanagedArgument(ids.second)], [Own.DropOwner(Own.owner_id(0), span(40))])).is_ok()
+		Err(_): False
+
+
+pure func test_consumed_integer_position_rejects() -> Bool:
+	match input_ids():
+		Ok(ids): rejects(raw_append(ids, [borrowed(ids), Own.ConsumedArgument(ids.second, Own.owner_id(0))], []), "consumed argument requires the first String append operand", 30)
+		Err(_): False
+
+
+pure func test_wrong_integer_type_rejects_before_discharge() -> Bool:
+	match input_ids():
+		Ok(ids): rejects(raw_append(ids, [Own.ConsumedArgument(ids.first, Own.owner_id(0)), Own.UnmanagedArgument(ids.first)], []), "call argument type does not match its contract", 30)
+		Err(_): False
+
+
+pure func test_unknown_consumed_owner_rejects() -> Bool:
+	match input_ids():
+		Ok(ids): rejects(raw_append(ids, [Own.ConsumedArgument(ids.first, Own.owner_id(7)), Own.UnmanagedArgument(ids.second)], []), "owner 7 is not defined", 30)
+		Err(_): False
+
+
+pure func test_additional_old_owner_drop_rejects() -> Bool:
+	match input_ids():
+		Ok(ids): rejects(raw_append(ids, arguments(ids), [Own.DropOwner(Own.owner_id(0), span(40))]), "owner 0 has already been discharged", 40)
+		Err(_): False
+
+
+pure func test_later_old_prefix_borrow_rejects() -> Bool:
+	match input_ids():
+		Err(_): False
+		Ok(ids):
+			after: List[Own.OwnershipOperation] = [Own.DefineValue({
+				id = ids.fourth, value_type = Concrete.IntType,
+				operation = Own.CallDefinition(Concrete.RuntimeFunction(Builtins.StringLength), [borrowed(ids)]),
+				result = Own.UnmanagedResult, span = span(40)
+			})]
+			rejects(raw_append(ids, arguments(ids), after), "borrow refers to discharged owner 0", 40)
+
+
+pure func test_repeated_consumption_rejects() -> Bool:
+	match input_ids():
+		Err(_): False
+		Ok(ids):
+			after: List[Own.OwnershipOperation] = [Own.DefineValue({
+				id = ids.fourth, value_type = Concrete.StringType,
+				operation = Own.CallDefinition(Concrete.RuntimeFunction(Builtins.StringAppendInt), arguments(ids)),
+				result = Own.OwnedResult(Own.owner_id(2)), span = span(40)
+			})]
+			rejects(raw_append(ids, arguments(ids), after), "borrow refers to discharged owner 0", 40)
+
+
+pure func test_other_runtime_target_cannot_consume() -> Bool:
+	match input_ids():
+		Err(_): False
+		Ok(ids):
+			program = raw_append(ids, arguments(ids), [])
+			match program.functions:
+				[main, worker]:
+					match worker.operations:
+						[text, number, Own.DefineValue(call)]:
+							changed = { call | operation = Own.CallDefinition(Concrete.RuntimeFunction(Builtins.StringLength), [Own.ConsumedArgument(ids.first, Own.owner_id(0))]) }
+							rejects({ program | functions = [main, { worker | operations = [text, number, Own.DefineValue(changed)] }] }, "consumed argument requires the first String append operand", 30)
+						_: False
+				_: False
+
+
+tests: TestSuite = {
+	description = "Blorp 2 independent integer append ownership verification",
+	tests = [
+		("consuming prefix leaves Int unmanaged after discharge", test_consuming_append_accepts_unmanaged_integer_after_discharge),
+		("borrowed call keeps its old owner available", test_borrowed_append_preserves_the_original_owner),
+		("integer operand cannot consume", test_consumed_integer_position_rejects),
+		("wrong second operand type rejects before transfer", test_wrong_integer_type_rejects_before_discharge),
+		("unknown consumed owner rejects", test_unknown_consumed_owner_rejects),
+		("old prefix cannot be dropped after transfer", test_additional_old_owner_drop_rejects),
+		("old prefix cannot be borrowed later", test_later_old_prefix_borrow_rejects),
+		("old prefix cannot be consumed twice", test_repeated_consumption_rejects),
+		("other runtime target cannot consume", test_other_runtime_target_cannot_consume),
+	]
+}

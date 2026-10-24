@@ -2,22 +2,25 @@
 -- Unrepresentable storage is infrastructure exhaustion, like failed malloc.
 STRING_CONCAT_RUNTIME: String =
 	raw
-		|static int64_t blorp_string_concat_length(const struct blorp_string *left,const struct blorp_string *right) {
+		|static int64_t blorp_string_append_length(const struct blorp_string *left,int64_t suffix_length) {
 		|const uintmax_t maximum=(uintmax_t)blorp_string_maximum_capacity();
-		|if((uintmax_t)right->length>maximum||(uintmax_t)left->length>maximum-(uintmax_t)right->length){abort();}
-		|return left->length+right->length;
+		|if((uintmax_t)suffix_length>maximum||(uintmax_t)left->length>maximum-(uintmax_t)suffix_length){abort();}
+		|return left->length+suffix_length;
 		|}
-		|struct blorp_string *blorp_string_concat(const struct blorp_string *left,const struct blorp_string *right) {
-		|const int64_t length=blorp_string_concat_length(left,right);
+		|static struct blorp_string *blorp_string_append_bytes(const struct blorp_string *left,const char *suffix,int64_t suffix_length) {
+		|const int64_t length=blorp_string_append_length(left,suffix_length);
 		|struct blorp_string *result=blorp_memory_allocate(sizeof *result+(size_t)length+1);
 		|if(result==NULL){abort();}
 		|atomic_init(&result->references,1);
 		|result->length=length;
 		|result->capacity=(size_t)length;
 		|memcpy(result->bytes,left->bytes,(size_t)left->length);
-		|memcpy(result->bytes+(size_t)left->length,right->bytes,(size_t)right->length);
+		|memcpy(result->bytes+(size_t)left->length,suffix,(size_t)suffix_length);
 		|result->bytes[length]='\0';
 		|return result;
+		|}
+		|struct blorp_string *blorp_string_concat(const struct blorp_string *left,const struct blorp_string *right) {
+		|return blorp_string_append_bytes(left,right->bytes,right->length);
 		|}
 		|/* Only a transferred unique root reaches this helper. Growth is capped
 		| * before doubling so both the capacity and allocation size stay valid. */
@@ -33,19 +36,41 @@ STRING_CONCAT_RUNTIME: String =
 		|result->capacity=capacity;
 		|return result;
 		|}
-		|/* Transfer one left reference; right stays borrowed and has no uncounted
-		| * dependency on left. Counted aliases force the shared copying branch. */
-		|struct blorp_string *blorp_string_concat_take_left(struct blorp_string *left,const struct blorp_string *right) {
+		|/* Transfer one left reference; suffix stays live independently of left.
+		| * Counted aliases force the shared copying branch before relocation. */
+		|static struct blorp_string *blorp_string_append_bytes_take_left(struct blorp_string *left,const char *suffix,int64_t suffix_length) {
 		|if(atomic_load_explicit(&left->references,memory_order_acquire)!=1){
-		|struct blorp_string *result=blorp_string_concat(left,right);
+		|struct blorp_string *result=blorp_string_append_bytes(left,suffix,suffix_length);
 		|blorp_string_release(left);
 		|return result;
 		|}
-		|const int64_t length=blorp_string_concat_length(left,right);
+		|const int64_t length=blorp_string_append_length(left,suffix_length);
 		|left=blorp_string_reserve_unique(left,length);
-		|memcpy(left->bytes+(size_t)left->length,right->bytes,(size_t)right->length);
+		|memcpy(left->bytes+(size_t)left->length,suffix,(size_t)suffix_length);
 		|left->length=length;
 		|left->bytes[length]='\0';
 		|return left;
+		|}
+		|struct blorp_string *blorp_string_concat_take_left(struct blorp_string *left,const struct blorp_string *right) {
+		|return blorp_string_append_bytes_take_left(left,right->bytes,right->length);
+		|}
+		|
+
+
+-- Requires STRING_CONCAT_RUNTIME first for the shared counted-byte storage.
+-- Decimal ASCII lives on the stack; no managed digit String is constructed.
+STRING_APPEND_INT_RUNTIME: String =
+	raw
+		|struct blorp_string *blorp_string_append_int(const struct blorp_string *left,int64_t value) {
+		|char digits[BLORP_INT64_DECIMAL_CAPACITY];
+		|const int length=snprintf(digits,sizeof digits,"%" PRId64,value);
+		|if(length<0||(size_t)length>=sizeof digits){abort();}
+		|return blorp_string_append_bytes(left,digits,(int64_t)length);
+		|}
+		|struct blorp_string *blorp_string_append_int_take_left(struct blorp_string *left,int64_t value) {
+		|char digits[BLORP_INT64_DECIMAL_CAPACITY];
+		|const int length=snprintf(digits,sizeof digits,"%" PRId64,value);
+		|if(length<0||(size_t)length>=sizeof digits){abort();}
+		|return blorp_string_append_bytes_take_left(left,digits,(int64_t)length);
 		|}
 		|
