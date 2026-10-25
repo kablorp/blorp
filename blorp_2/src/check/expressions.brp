@@ -14,7 +14,7 @@ import:
 	./callables:
 		FunctionContract, accept_method_call, method_contract, method_id_contract, callable_contract,
 		function_contract, value_callable_contract,
-		ResolutionContext, SourceLoopScope(OutsideSourceLoop),
+		ResolutionContext,
 		ResolvedReceiver(ReceiverCandidates, UniqueReceiver),
 		ReceiverCandidate,
 		classify_receiver,
@@ -30,7 +30,7 @@ import:
 		FunctionSignature, CheckedLambda, CheckedCapture, LambdaRow(CollectingLambda, CheckedLambdaRow), CheckedValueResult, ResolvedBody, LambdaId, lambda_id, lambda_number,
 		CaptureId, capture_id, same_scoped_binding, ScopedBindingId,
 		CheckedBody(CheckedValueBody), CheckedExit(ReturnExpression), CheckedStatement(DiscardExpression),
-		BindingDefinition, BindingOrigin(ParameterBinding), BindingMutability(Immutable, Mutable), TypeUse, binding_id,
+		BindingDefinition, BindingOrigin(ParameterBinding), TypeUse, binding_id,
 		CallIdentity(RuntimeTarget, MethodTarget, DeclaredTarget, ParameterTarget, ValueTarget, ConstantTarget), callable_parameter,
 		CallTarget(RuntimeFunction),
 		TypeRef(ParameterType, CallableType, VoidType, IntType, FloatType, StringType, OpaqueType),
@@ -140,7 +140,6 @@ import:
 			QualifiedName, QualifiedApplication, OpaqueWrap, OpaqueUnwrap, TupleExpression, ListExpression, RangeExpression, RecordExpression,
 			RecordUpdateExpression, EqualityExpression, LogicalExpression, NotExpression, IfExpression, MatchExpression, LambdaExpression,
 		),
-		CallNotation(DirectCall),
 		Purity(Pure, Impure), same_purity, permits_purity,
 		same_span
 
@@ -659,9 +658,10 @@ private pure func plan_body_base(scope: List[ScopedValue], body: ValueExpression
 					if same_body(binding_site(binding).binding.owner, context.caller.body):
 						Ok(PlannedLeaf(AcceptedBinding(local_binding_id(binding)), binding_definition(binding).value_type))
 					else:
-						match binding_definition(binding).mutability:
-							Mutable: Err(value_error(name.span, MutableCapture(binding_site(binding).binding)))
-							Immutable: Ok(PlannedLeaf(PendingCapture(binding_site(binding).binding), binding_definition(binding).value_type))
+						if binding_definition(binding).mutable:
+							Err(value_error(name.span, MutableCapture(binding_site(binding).binding)))
+						else:
+							Ok(PlannedLeaf(PendingCapture(binding_site(binding).binding), binding_definition(binding).value_type))
 				Some(CallableLocal(binding)):
 					local = callable_local(binding)
 					base: PendingBase = if same_body(binding_site(local).binding.owner, context.caller.body):
@@ -745,7 +745,7 @@ private pure func plan_qualified(
 			plan_qualified_variant(variant_owner(variant), variant, name, arguments, called, expectation, construction, slots)
 		Ok(OfferedMethod(method)):
 			if called:
-				match method_contract(name, arguments.length(), DirectCall, method, accepted_traits(context.traits)):
+				match method_contract(name, arguments.length(), False, method, accepted_traits(context.traits)):
 					Ok(contract): Ok(PlannedCall(contract, arguments, ReturnPlacement(body.base_span, body.span), expectation))
 					Err(error): Err(error)
 			else:
@@ -1684,7 +1684,7 @@ private pure func elaborate_value(
 														match lambda_scope(admission, slots):
 															Err(error): failure = Some(error)
 															Ok(local):
-																lambda_context = { admission.context | caller = { body = Checked.LambdaBody(admission.id), purity = admission.written.purity }, loop_scope = OutsideSourceLoop }
+																lambda_context = { admission.context | caller = { body = Checked.LambdaBody(admission.id), purity = admission.written.purity }, in_source_loop = False }
 																match admission.written.body:
 																	InlineBody(value):
 																		finish: LambdaFinish = { position = position, scope = scope, context = context, bindings = bindings, operand_start = operand_count }
@@ -2143,9 +2143,10 @@ private pure func data_callable_application(
 			immutable_capture_result: Result[Void, CheckError] = if same_body(binding_site(binding).binding.owner, context.caller.body):
 				Ok(void)
 			else:
-				match definition.mutability:
-					Mutable: Err(value_error(name.span, MutableCapture(binding_site(binding).binding)))
-					Immutable: Ok(void)
+				if definition.mutable:
+					Err(value_error(name.span, MutableCapture(binding_site(binding).binding)))
+				else:
+					Ok(void)
 			match immutable_capture_result:
 				Err(error): Err(error)
 				Ok(immutable_capture):
@@ -2199,7 +2200,7 @@ private pure func classify_direct_call(
 						Err(error): Err(error)
 						Ok(row): constant_application(row, name, arguments, name.span, context)
 				Some(NamedMethod(method)):
-					method_contract(name, arguments.length(), DirectCall, method, accepted_traits(context.traits)).map(pure func(contract): FunctionApplication(contract))
+					method_contract(name, arguments.length(), False, method, accepted_traits(context.traits)).map(pure func(contract): FunctionApplication(contract))
 				Some(NamedFunction(target, _)):
 					match function_contract(
 						context.caller,
@@ -2486,7 +2487,7 @@ private pure func lambda_scope(admission: LambdaAdmission, slots: List[Inference
 		match parameter_type:
 			Err(error): failure = Some(error)
 			Ok(value_type):
-				definition: BindingDefinition = { origin = ParameterBinding(position), mutability = Immutable, value_type = value_type, span = span }
+				definition: BindingDefinition = { origin = ParameterBinding(position), mutable = False, value_type = value_type, span = span }
 				definitions = definitions.append(definition)
 				match parameter.binder:
 					DiscardBinder(_): void

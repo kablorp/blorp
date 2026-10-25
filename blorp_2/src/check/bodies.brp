@@ -32,14 +32,13 @@ import:
 			IfValue,
 		),
 		unsupported_form,
-	./callables: ResolutionContext, SourceLoopScope(OutsideSourceLoop, WithinSourceLoop)
+	./callables: ResolutionContext
 	./model:
 		BodyOwner(DeclaredBody), same_body,
 		CheckedBodies, CheckedLambda, LambdaRow(CollectingLambda, CheckedLambdaRow), CheckedValueResult, ResolvedBody,
 		CheckedConstant,
 		BindingDefinition,
 		BindingId,
-		BindingMutability(Immutable, Mutable),
 		BindingOrigin(BodyLocal, MatchCapture, ParameterBinding),
 		CallTarget(RuntimeFunction),
 		CheckedArm,
@@ -84,7 +83,6 @@ import:
 	../namespace/namespace: Namespace
 	option: Option methods_only
 	../utils/syntax:
-		BindingSyntax(ImmutableBinding, MutableBinding),
 		ParsedBinding, ParsedPropagation,
 		ExpressionBase(MatchExpression, IfExpression, VoidExpression, RangeExpression),
 		ForBinder(SingleForBinder, TupleForBinder),
@@ -492,7 +490,7 @@ private pure func parameter_scope(
 					_:
 						definition: BindingDefinition = {
 							origin = ParameterBinding(data_ordinal),
-							mutability = Immutable,
+							mutable = False,
 							value_type = value_type.value_type,
 							span = parameter.name.span
 						}
@@ -592,13 +590,15 @@ private pure func resolve_statement(
 		WhileLoop(loop): resolve_while(loop, block, context)
 		ForLoop(loop): resolve_for(loop, block, context)
 		Break(span):
-			match context.loop_scope:
-				WithinSourceLoop: Ok({ block | statements = block.statements.append(BreakSourceLoop(span)) })
-				OutsideSourceLoop: Err(checker_invariant(span, LoopControlOutsideLoop))
+			if context.in_source_loop:
+				Ok({ block | statements = block.statements.append(BreakSourceLoop(span)) })
+			else:
+				Err(checker_invariant(span, LoopControlOutsideLoop))
 		Continue(span):
-			match context.loop_scope:
-				WithinSourceLoop: Ok({ block | statements = block.statements.append(ContinueSourceLoop(span)) })
-				OutsideSourceLoop: Err(checker_invariant(span, LoopControlOutsideLoop))
+			if context.in_source_loop:
+				Ok({ block | statements = block.statements.append(ContinueSourceLoop(span)) })
+			else:
+				Err(checker_invariant(span, LoopControlOutsideLoop))
 		ExpressionStatement(expression):
 			match resolve_value(block, expression, StatementValue, context):
 				Ok(resolved):
@@ -769,7 +769,7 @@ private pure func resolve_while(
 	block: ResolvedStatements,
 	context: ResolutionContext,
 ) -> Result[ResolvedStatements, CheckError]:
-	inside = { context | loop_scope = WithinSourceLoop }
+	inside = { context | in_source_loop = True }
 	condition ?= resolve_condition(written.condition, block, inside)
 	body ?= resolve_statement_block(written.body, {
 		lambdas = condition.lambdas,
@@ -868,7 +868,7 @@ private pure func bind_for_item(
 			id = binding_id(block.bindings.length())
 			definition: BindingDefinition = {
 				origin = BodyLocal,
-				mutability = Immutable,
+				mutable = False,
 				value_type = element,
 				span = name.span,
 			}
@@ -909,7 +909,7 @@ private pure func bind_tuple_elements(
 					None: failure = Some(checker_invariant(name.span, UnsupportedPatternReachedResolution))
 					Some(value_type):
 						id = binding_id(resolved.bindings.length())
-						definition: BindingDefinition = { origin = BodyLocal, mutability = Immutable, value_type = value_type, span = name.span }
+						definition: BindingDefinition = { origin = BodyLocal, mutable = False, value_type = value_type, span = name.span }
 						match bind_local(resolved.scope, context.namespace, context.module, context.caller.body, name, id, definition):
 							Err(error): failure = Some(error)
 							Ok(binding):
@@ -934,7 +934,7 @@ private pure func resolve_tuple_binding(
 	resolved ?= resolve_value(block, initializer, UntypedValue, context)
 	fields ?= tuple_binder_types(binders, resolved.value.value_type, span)
 	id = binding_id(resolved.bindings.length())
-	definition: BindingDefinition = { origin = BodyLocal, mutability = Immutable, value_type = resolved.value.value_type, span = initializer.span }
+	definition: BindingDefinition = { origin = BodyLocal, mutable = False, value_type = resolved.value.value_type, span = initializer.span }
 	subject: CheckedExpr = { form = ReadBinding(id), value_type = resolved.value.value_type, span = initializer.span }
 	bind_tuple_elements(binders, fields, subject, {
 		lambdas = resolved.lambdas,
@@ -959,7 +959,7 @@ private pure func bind_tuple_for_item(
 ) -> Result[ForItemScope, CheckError]:
 	fields ?= tuple_binder_types(binders, element, span)
 	id = binding_id(block.bindings.length())
-	definition: BindingDefinition = { origin = BodyLocal, mutability = Immutable, value_type = element, span = span }
+	definition: BindingDefinition = { origin = BodyLocal, mutable = False, value_type = element, span = span }
 	subject: CheckedExpr = { form = ReadBinding(id), value_type = element, span = span }
 	resolved ?= bind_tuple_elements(binders, fields, subject, { block | bindings = block.bindings.append(definition) }, context)
 	Ok({ item = Some(id), block = resolved })
@@ -974,7 +974,7 @@ private pure func resolve_for(
 	item ?= bind_for_binder(written.binder, iterated.element, {
 		iterated.block | statements = [], reassigned = [],
 	}, context)
-	body ?= resolve_statement_block(written.body, item.block, { context | loop_scope = WithinSourceLoop })
+	body ?= resolve_statement_block(written.body, item.block, { context | in_source_loop = True })
 	carried = carried_bindings(iterated.block, body.reassigned)
 	Ok({ block |
 		lambdas = body.lambdas,
@@ -1016,24 +1016,23 @@ private pure func resolve_assignment(
 	decision: Result[Option[LocalBinding], CheckError] = match written.annotation:
 		Some(_): Ok(None)
 		None:
-			match written.mutability:
-				MutableBinding: Ok(None)
-				ImmutableBinding:
-					match lookup_binding(block.scope, written.name.id):
-						None: Ok(None)
-						Some(CallableLocal(binding)):
-							match callable_parameter_contract(binding):
-								Err(error): Err(error)
-								Ok(accepted): Err(statement_error(written.name.span, CallableAssignment(accepted.parameter)))
-						Some(DataLocal(binding)):
-							if same_body(binding_site(binding).binding.owner, context.caller.body).not():
-								Err(statement_error(written.name.span, CapturedAssignment(binding_site(binding).binding)))
+			if written.mutable:
+				Ok(None)
+			else:
+				match lookup_binding(block.scope, written.name.id):
+					None: Ok(None)
+					Some(CallableLocal(binding)):
+						match callable_parameter_contract(binding):
+							Err(error): Err(error)
+							Ok(accepted): Err(statement_error(written.name.span, CallableAssignment(accepted.parameter)))
+					Some(DataLocal(binding)):
+						if same_body(binding_site(binding).binding.owner, context.caller.body).not():
+							Err(statement_error(written.name.span, CapturedAssignment(binding_site(binding).binding)))
+						else:
+							if binding_definition(binding).mutable:
+								Ok(Some(binding))
 							else:
-								match binding_definition(binding).mutability:
-									Mutable:
-										Ok(Some(binding))
-									Immutable:
-										Err(statement_error(written.name.span, ImmutableAssignment(binding_site(binding))))
+								Err(statement_error(written.name.span, ImmutableAssignment(binding_site(binding))))
 
 	reassign ?= decision
 
@@ -1056,15 +1055,9 @@ private pure func resolve_assignment(
 				Ok(resolved):
 					value = resolved.value
 
-					mutability: BindingMutability = match written.mutability:
-						MutableBinding:
-							Mutable
-						ImmutableBinding:
-							Immutable
-
 					definition: BindingDefinition = {
 						origin = BodyLocal,
-						mutability = mutability,
+						mutable = written.mutable,
 						value_type = value.value_type,
 						span = written.name.span
 					}
@@ -1373,7 +1366,7 @@ private pure func resolve_propagation(
 	source_id = binding_id(source.bindings.length())
 	source_definition: BindingDefinition = {
 		origin = BodyLocal,
-		mutability = Immutable,
+		mutable = False,
 		value_type = source.value.value_type,
 		span = written.value.span
 	}
@@ -1381,7 +1374,7 @@ private pure func resolve_propagation(
 	success = binding_id(bindings.length())
 	definition: BindingDefinition = {
 		origin = MatchCapture,
-		mutability = Immutable,
+		mutable = False,
 		value_type = success_type,
 		span = written.name.span
 	}
@@ -1404,7 +1397,7 @@ private pure func resolve_propagation(
 	failure = binding_id(continuation.bindings.length())
 	error_definition: BindingDefinition = {
 		origin = MatchCapture,
-		mutability = Immutable,
+		mutable = False,
 		value_type = error_type,
 		span = written.value.span
 	}
@@ -1494,7 +1487,7 @@ pure func resolve_functions(
 					constants = constants,
 					boolean = boolean,
 					option = option,
-					loop_scope = OutsideSourceLoop,
+					in_source_loop = False,
 				}
 				signature = accepted.signature
 				match resolve_body(accepted, result, context, lambdas):
