@@ -83,7 +83,13 @@ through normal main entrypoints with explicit process arguments and exact
 stdout, stderr and exit status. Their parsing and evaluation are pure and return
 ordinary Result values; only the output boundary prints. List[String] is the
 first supported concrete List instantiation; list construction and mutation
-remain deferred. The pilot no longer exposes read_line.
+remain deferred. The pilot no longer exposes read_line. Its explicitly imported
+`process.run_to_files(program, arguments, stdout_path, stderr_path, timeout_ms)`
+returns ordinary `Result[Int, String]`: an exit status or an owned infrastructure
+error. It runs an explicit executable path without a shell or PATH search, reads
+stdin as EOF and exclusively creates two new regular text-capture files.
+Arguments exclude the executable name and are passed literally. See the
+[target process contract](../blorp_2/standard_library/README.md#process-execution).
 Flat [qualified constructor patterns](../blorp_2/README.md#local-modules)
 resolve public heads through a local module alias and permit payload captures.
 Float64 literals and concrete arithmetic/formatting preserve typed numeric

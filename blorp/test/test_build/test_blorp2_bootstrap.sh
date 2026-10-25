@@ -26,6 +26,7 @@ sha256_file() {
 }
 
 export TEST_SEED_LOG="$scratch/seed.log" TEST_CC_LOG="$scratch/cc.log"
+export TEST_E2E_LOG="$scratch/e2e.log" TEST_E2E_ARGS="$scratch/e2e.args"
 export TEST_CC_ARGS="$scratch/cc-args" TEST_COMPONENT_LOG="$scratch/components.log"
 export TEST_DOWNLOAD_LOG="$scratch/download.log" TEST_LEGACY_LOG="$scratch/legacy.log"
 export TEST_SEED="$scratch/seed payload" TEST_DOWNLOAD_MODE=good
@@ -77,6 +78,16 @@ done
 printf 'link:%s\n' "$mode" >>"$TEST_CC_LOG"
 if [ "${TEST_CC_STATUS:-0}" -ne 0 ]; then exit "$TEST_CC_STATUS"; fi
 case "$input" in
+	*/runner.c)
+		cat >"$output" <<'SEED'
+#!/usr/bin/env bash
+set -euo pipefail
+printf 'e2e:%s\n' "${BLORP_LEAK_CHECK:-unset}" >>"$TEST_E2E_LOG"
+printf '%s\0' "$@" >>"$TEST_E2E_ARGS"
+[ "$#" = 3 ] && [ -x "$1" ] && [ -x "$2" ] && [ -d "$3" ] || exit 94
+exit "${TEST_E2E_STATUS:-0}"
+SEED
+		;;
 	*/self-hosted-tests/*)
 		cat >"$output" <<'SEED'
 #!/usr/bin/env bash
@@ -96,6 +107,7 @@ if [ "${1:-}" = --library-root ]; then
 		if [ "${TEST_COMPONENT_COMPILE_STATUS:-0}" -ne 0 ]; then exit "$TEST_COMPONENT_COMPILE_STATUS"; fi
 		printf '/* fake component C */\n' >"$5"
 	else
+		if [ "${TEST_E2E_COMPILE_STATUS:-0}" -ne 0 ]; then exit "$TEST_E2E_COMPILE_STATUS"; fi
 		printf '/* fake fixture C */\n' >"$4"
 	fi
 fi
@@ -301,6 +313,8 @@ pass 'example uses newly built B2 executable'
 component_sources='blorp_2/test/unit/test_utils/test_boolean.brp blorp_2/test/unit/test_lex/test_lex.brp'
 for target in test test-components; do
 	: >"$TEST_COMPONENT_LOG"
+	: >"$TEST_E2E_LOG"
+	: >"$TEST_E2E_ARGS"
 	: >"$TEST_CC_ARGS"
 	if ! make -s -C "$fixture/blorp_2" "$target" BLORP_CC="$tools/fake cc" \
 		BLORP2_COMPILER='blorp_2/build/output compiler' \
@@ -312,6 +326,11 @@ for target in test test-components; do
 	printf 'compile:%s\nnative:strict\ncompile:%s\nnative:strict\n' \
 		blorp_2/test/unit/test_utils/test_boolean.brp blorp_2/test/unit/test_lex/test_lex.brp >"$scratch/expected"
 	cmp -s "$TEST_COMPONENT_LOG" "$scratch/expected" || fail "$target selected sources, order or strict native entrypoint"
+	if [ "$target" = test ]; then
+		grep -Fxq 'e2e:strict' "$TEST_E2E_LOG" || fail 'default test did not run self-hosted e2e';
+	else
+		[ ! -s "$TEST_E2E_LOG" ] || fail 'component target ran e2e';
+	fi
 	if [ "$target" = test-components ]; then
 		: >"$scratch/expected"
 		for source in $component_sources; do
@@ -327,14 +346,33 @@ for target in test test-components; do
 	pass "$target runs only the selected B2 suites with strict normal entrypoints"
 done
 
-: >"$TEST_COMPONENT_LOG"
-e2e_status=0
-make -s -C "$fixture/blorp_2" test-e2e >"$scratch/make.stdout" 2>"$scratch/make.stderr" || e2e_status=$?
-if [ "$e2e_status" -ne 2 ]; then fail 'deferred native e2e must exit 2'; fi
-if ! grep -Fq 'DEFERRED: native e2e' "$scratch/make.stderr"; then fail 'missing explicit e2e deferral diagnostic'; fi
-if ! grep -Fq 'port the driver to blorp_2' "$scratch/make.stderr"; then fail 'missing e2e deferral help'; fi
-if [ -s "$TEST_COMPONENT_LOG" ] || [ -e "$TEST_LEGACY_LOG" ]; then fail 'deferred e2e executed a test or legacy host'; fi
-pass 'test-e2e rejects with explicit deferral instead of a false native pass'
+: >"$TEST_E2E_LOG"
+: >"$TEST_E2E_ARGS"
+make -s -C "$fixture/blorp_2" test-e2e BLORP_CC="$tools/fake cc" \
+	BLORP2_COMPILER='blorp_2/build/output compiler' >"$scratch/e2e.stdout" 2>"$scratch/e2e.stderr" || { cat "$scratch/e2e.stderr" >&2; fail 'self-hosted e2e route'; }
+grep -Fxq 'e2e:strict' "$TEST_E2E_LOG" || fail 'e2e did not run the strict ordinary driver main'
+[ ! -e "$TEST_LEGACY_LOG" ] || fail 'e2e invoked legacy'
+pass 'test-e2e runs its new B2 driver with explicit executable and temporary paths'
+
+for failure_kind in compile link native; do
+	: >"$TEST_E2E_LOG"
+	export TEST_E2E_COMPILE_STATUS=0 TEST_CC_STATUS=0 TEST_E2E_STATUS=0
+	case "$failure_kind" in
+		compile) TEST_E2E_COMPILE_STATUS=41 ;;
+		link) TEST_CC_STATUS=42 ;;
+		native) TEST_E2E_STATUS=43 ;;
+	esac
+	if make -s -C "$fixture/blorp_2" test-e2e BLORP_CC="$tools/fake cc" \
+		BLORP2_COMPILER='blorp_2/build/output compiler' >"$scratch/e2e.stdout" 2>"$scratch/e2e.stderr"; then
+		fail "e2e $failure_kind failure was ignored"
+	fi
+	if [ "$failure_kind" != native ] && [ -s "$TEST_E2E_LOG" ]; then fail 'failed compile/link ran a stale e2e driver'; fi
+	pass "self-hosted e2e $failure_kind failure stops and fails the target"
+done
+unset TEST_E2E_COMPILE_STATUS TEST_CC_STATUS TEST_E2E_STATUS
+
+expect_failure 'missing Blorp 2 test compiler' make -s -C "$fixture/blorp_2" test-e2e BLORP2_COMPILER=missing-compiler
+pass 'e2e missing compiler fails with actionable build help'
 
 : >"$TEST_COMPONENT_LOG"
 expect_failure 'no target component sources selected' make -s -C "$fixture/blorp_2" test-components TARGET_COMPONENT_SOURCES=

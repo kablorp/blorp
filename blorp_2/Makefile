@@ -39,7 +39,15 @@ TARGET_COMPONENT_SOURCES := \
 	blorp_2/test/unit/test_parse/test_provenance.brp \
 	blorp_2/test/unit/test_parse/test_string_concat.brp \
 	blorp_2/test/unit/test_parse/test_string_slice.brp \
-	blorp_2/test/unit/test_parse/test_write_file.brp
+	blorp_2/test/unit/test_parse/test_write_file.brp \
+	blorp_2/test/unit/test_harness/test_self_hosted_reports.brp \
+	blorp_2/test/unit/test_parse/test_run_to_files.brp \
+	blorp_2/test/unit/test_check/test_run_to_files.brp \
+	blorp_2/test/unit/test_specialize/test_run_to_files.brp \
+	blorp_2/test/unit/test_lower/test_run_to_files.brp \
+	blorp_2/test/unit/test_own/test_run_to_files.brp \
+	blorp_2/test/unit/test_verify/test_run_to_files.brp \
+	blorp_2/test/unit/test_emit/test_run_to_files.brp
 
 .PHONY: compiler generate-compiler link-compiler example test test-components test-target-components test-compiler link-test-compiler test-e2e
 
@@ -69,12 +77,13 @@ example: compiler
 test:
 	@$(MAKE) --no-print-directory test-compiler
 	@$(MAKE) --no-print-directory test-components
+	@$(MAKE) --no-print-directory test-e2e
 
 # Other suites remain in source for incremental self-hosted migration.
 # Callers build once or supply the exact B2 compiler under test.
 test-components:
 	@$(MAKE) --no-print-directory test-target-components
-	@printf '%s\n' 'DEFERRED: unported unit/runtime/grammar/tooling and native e2e suites; self-hosted selection only.'
+	@printf '%s\n' 'DEFERRED: remaining unit/runtime/grammar/tooling and broader native e2e suites; only explicit self-hosted selections run.'
 
 # Each selected source keeps its own normal test entry and strict native run.
 # Mirror source paths so equally named suites never overwrite each other's C.
@@ -103,7 +112,26 @@ link-test-compiler:
 		&& "$(BLORP_CC)" $(TEST_COMPILER_FLAGS) -DBLORP_MEMORY_DIAGNOSTICS=1 \
 			"$(BLORP2_COMPILER_C)" -o "$(BLORP2_COMPILER)" $(TEST_COMPILER_LIBRARIES)
 
-# An explicit request for unavailable coverage must not look like a pass.
+# The driver is an ordinary B2 main(args) running TestSuites; fixtures retain
+# their own real mains. It receives all configuration explicitly from Make.
 test-e2e:
-	@printf '%s\n' 'DEFERRED: native e2e requires unsupported process/filesystem/bytes APIs; port the driver to blorp_2 before running test-e2e.' >&2
-	@exit 2
+	@set -eu; cd ..; \
+		compiler_path="$(BLORP2_COMPILER)"; \
+		case "$$compiler_path" in /*) ;; *) compiler_path="$$PWD/$$compiler_path";; esac; \
+		if [ ! -x "$$compiler_path" ]; then \
+			printf '%s\n' 'missing Blorp 2 test compiler; run make -C blorp_2 test-compiler first' >&2; exit 1; \
+		fi; \
+		cc_path=$$(command -v "$(BLORP_CC)") || { printf '%s\n' 'C compiler executable not found' >&2; exit 1; }; \
+		case "$$cc_path" in /*) ;; *) cc_path="$$PWD/$$cc_path";; esac; \
+		if [ ! -x "$$cc_path" ]; then printf '%s\n' 'C compiler must resolve to an executable file' >&2; exit 1; fi; \
+		runner_directory=$$(mktemp -d "$${TMPDIR:-/tmp}/blorp2-e2e.XXXXXX"); \
+		runner_directory=$$(cd "$$runner_directory" && pwd -P); \
+		trap 'rm -rf "$$runner_directory"' EXIT; \
+		trap 'exit 1' HUP INT TERM; \
+		BLORP_LEAK_CHECK=strict "$$compiler_path" --library-root blorp_2/standard_library \
+			blorp_2/test/e2e/self_hosted.brp "$$runner_directory/runner.c"; \
+		"$$cc_path" -std=c11 -Wall -Wextra -Werror -pedantic -O0 \
+			-fsanitize=address,undefined -fno-sanitize-recover=all \
+			-DBLORP_MEMORY_DIAGNOSTICS=1 "$$runner_directory/runner.c" \
+			-o "$$runner_directory/runner" $(TEST_COMPILER_LIBRARIES); \
+		BLORP_LEAK_CHECK=strict "$$runner_directory/runner" "$$compiler_path" "$$cc_path" "$$runner_directory"

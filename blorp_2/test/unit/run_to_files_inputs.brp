@@ -1,0 +1,64 @@
+import:
+	../../src/check/check: check
+	../../src/check/render: render_failure
+	../../src/lower/lower as Lower
+	../../src/namespace/builtins as Builtins
+	../../src/specialize/specialize as Concrete
+	../../src/utils/source: compiler_source
+	../../src/utils/syntax: Diagnostic, entry_function
+	./module_input: TestFoundation, parse_modules_with_base
+	option: Option methods_only
+	result: Result methods_only
+	list: List methods_only
+
+
+PROCESS_HEADER: String = "func query(program: String, arguments: List[String], out: String, err: String, timeout: Int) -> Result[Int, String]:\n    builtin("
+PROCESS_SOURCE: String =
+	|func query(program: String, arguments: List[String], out: String, err: String, timeout: Int) -> Result[Int, String]:
+	|    builtin("process.run_to_files")
+	|func main() -> Int:
+	|    arguments: List[String] = ["argument"]
+	|    result = query("/program", arguments, "out", "err", 1000)
+	|    0
+	|
+
+
+fixed record ProcessSeed {
+	lowered: Lower.LoweredProgram,
+	query: Lower.LoweredFunction,
+	query_id: Concrete.FunctionInstanceId,
+	constructors: Builtins.DesignatedResult[Concrete.VariantInstanceId]
+}
+
+
+private pure func invalid() -> Diagnostic:
+	{ span = { source = compiler_source(), start = 0, end = 0 }, message = "invalid process test input", help = "retain the ordinary query call", note = None }
+
+
+private pure func called_function(step: Lower.LoweredStep) -> Option[Concrete.FunctionInstanceId]:
+	match step:
+		Lower.Define(definition):
+			match definition.operation:
+				Lower.CallValue(Concrete.UserFunction(id), _): Some(id)
+				_: None
+		_: None
+
+
+pure func process_seed(foundation: TestFoundation) -> Result[ProcessSeed, Diagnostic]:
+	parsed ?= parse_modules_with_base([{ source = PROCESS_SOURCE, targets = [] }], foundation)
+	checked ?= check(parsed).map_err(pure func(failure): render_failure(failure).first)
+	concrete ?= Concrete.specialize(checked)
+	lowered ?= Lower.lower(concrete)
+	contents = Lower.lowered_functions(lowered)
+	main ?= contents.functions.get(Concrete.function_number(entry_function(contents.entrypoint))).to_result(invalid())
+	query_id: Concrete.FunctionInstanceId ?= match main.steps.filter(pure func(step: Lower.LoweredStep) -> Bool: called_function(step).is_some()):
+		[call]: called_function(call).to_result(invalid())
+		_: Err(invalid())
+	query ?= contents.functions.get(Concrete.function_number(query_id)).to_result(invalid())
+	constructors: Builtins.DesignatedResult[Concrete.VariantInstanceId] ?= match query.steps:
+		[_, _, _, _, _, Lower.Define(result)]:
+			match result.operation:
+				Lower.CallValue(Concrete.RuntimeFunction(Builtins.RunToFiles(accepted)), _): Ok(accepted)
+				_: Err(invalid())
+		_: Err(invalid())
+	Ok({ lowered = lowered, query = query, query_id = query_id, constructors = constructors })

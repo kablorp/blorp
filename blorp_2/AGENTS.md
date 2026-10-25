@@ -102,8 +102,9 @@ Every compiler source module has a unit suite under
 folder under `src/`. Grammar cases live under
 [test/test_grammar/](test/test_grammar/) and change with the EBNF.
 Target component suites export ordinary `tests: TestSuite` constants.
-`make -C blorp_2 test` builds Blorp 2 and runs only the explicit
-`TARGET_COMPONENT_SOURCES` selection through its ordinary TestSuite entries.
+`make -C blorp_2 test` builds Blorp 2, runs the explicit
+`TARGET_COMPONENT_SOURCES` selection through its ordinary TestSuite entries,
+and runs the first self-hosted native e2e selection.
 `test-components` and `test-target-components` run that selection with an
 already-built B2 compiler. Unported unit/runtime/grammar/tooling suites are
 DEFERRED, preserved for incremental migration, and receive no PASS credit.
@@ -113,10 +114,13 @@ the bytes clearer, such as CRLF or malformed indentation. Using multiline
 literals in tests does not add them to the pilot's input grammar.
 
 **End-to-end.** Sources remain under [test/e2e/](test/e2e/), with programs in
-[test/e2e/fixtures/](test/e2e/fixtures/). The existing driver depends on process,
-filesystem and bytes APIs not yet available to self-hosted tests. Full native
-e2e execution is DEFERRED; `make -C blorp_2 test-e2e` rejects with an explicit
-message. Do not substitute the legacy host or a replacement test framework.
+[test/e2e/fixtures/](test/e2e/fixtures/). `make -C blorp_2 test-e2e` runs the first four native cases and process-runtime
+checks. Its approved orchestration entry is an ordinary `main(args)` that
+constructs Blorp `TestSuite`s and calls `test.run_suite`; Make passes the exact
+compiler, C compiler and private work-directory paths as argv. This narrow entry
+exception does not authorize alternate fixture mains or assertion frameworks.
+The older driver depends on additional process/filesystem/bytes APIs; its
+remaining cases are DEFERRED. Do not substitute the legacy host.
 Port bounded suites incrementally through ordinary target TestSuites and real
 fixture mains. Existing fixture parity checks compare compiler outputs only;
 they do not establish native execution. Keep artifacts under ignored `build/`.

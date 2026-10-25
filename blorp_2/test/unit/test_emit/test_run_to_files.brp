@@ -1,0 +1,85 @@
+import:
+	../../../src/emit/emit: emit
+	../../../src/own/own: own
+	../../../src/verify/verify: verify
+	../../../src/check/check: check
+	../../../src/check/render: render_failure
+	../../../src/specialize/specialize: specialize
+	../../../src/lower/lower: lower
+	../../../src/runtime/process: PROCESS_POSIX_PRELUDE
+	../../../src/utils/syntax: Diagnostic
+	../run_to_files_inputs: process_seed
+	../module_input: test_base, parse_modules
+	string: String methods_only
+	int: Int methods_only
+	bool: Bool methods_only
+	option: Option methods_only
+	result: Result methods_only
+	test: TestSuite
+
+
+private pure func find_text(text: String, pattern: String) -> Option[Int]:
+	var position: Int = 0
+	var found: Option[Int] = None
+	while position.add(pattern.length()).less_than_or_equal(text.length()):
+		var matches: Bool = True
+		for index in 0..pattern.length():
+			match (text.byte_at(position.add(index)), pattern.byte_at(index)):
+				(Some(actual), Some(expected)): matches = matches.and(actual.equals(expected))
+				_: matches = False
+		match matches:
+			True:
+				found = Some(position)
+				break
+			False: position = position.add(1)
+	found
+
+
+private pure func process_c() -> Result[String, Diagnostic]:
+	seed ?= process_seed(test_base())
+	owned ?= own(seed.lowered)
+	verified ?= verify(owned)
+	emit(verified)
+
+
+pure func test_posix_prelude_and_list_layout_precede_helper() -> Bool:
+	match process_c():
+		Err(_): False
+		Ok(code):
+			match (find_text(code, "struct blorp_l_0_s{"), find_text(code, "uint8_t blorp_process_run_to_files(")):
+				(Some(layout), Some(helper)): code.starts_with(PROCESS_POSIX_PRELUDE).and(layout.less_than(helper))
+				_: False
+
+
+pure func test_result_owns_only_the_error_string() -> Bool:
+	match process_c():
+		Err(_): False
+		Ok(code):
+			find_text(code, "int64_t blorp_runtime_5_status=0;struct blorp_string *blorp_runtime_5_error=NULL;").is_some()
+				.and(find_text(code, "blorp_process_run_to_files(blorp_vl_0,blorp_vl_1,blorp_vl_2,blorp_vl_3,blorp_vl_4,&blorp_runtime_5_status,&blorp_runtime_5_error)").is_some())
+				.and(find_text(code, ".blorp_uf_0=blorp_runtime_5_status").is_some())
+				.and(find_text(code, ".blorp_uf_0=blorp_runtime_5_error").is_some())
+				.and(find_text(code, "blorp_string_release(blorp_runtime_5_error)").is_none())
+
+
+pure func test_unused_process_declaration_selects_no_posix_or_native_helper() -> Bool:
+	source = "func query(program: String, args: List[String], out: String, err: String, timeout: Int) -> Result[Int, String]:\n    builtin(\"process.run_to_files\")\nfunc main() -> Int:\n    0\n"
+	match parse_modules([{ source = source, targets = [] }]):
+		Err(_): False
+		Ok(parsed):
+			match check(parsed):
+				Err(_): False
+				Ok(checked):
+					match specialize(checked).and_then(lower).and_then(own).and_then(verify).and_then(emit):
+						Err(_): False
+						Ok(code): find_text(code, "_POSIX_C_SOURCE").is_none().and(find_text(code, "blorp_process_run_to_files").is_none())
+
+
+tests: TestSuite = {
+	description = "Process builtin C emission",
+	tests = [
+		("POSIX feature prelude first and helper after String list layout", test_posix_prelude_and_list_layout_precede_helper),
+		("ordinary Result receives primitive success or owned error", test_result_owns_only_the_error_string),
+		("unused process declaration selects no process fragments", test_unused_process_declaration_selects_no_posix_or_native_helper),
+	]
+}

@@ -16,7 +16,10 @@ loaded and parsed once, including the designated `_base.brp` and ordinary
 receive it. Import cycles, including self-imports, are rejected, and modules
 under the library root cannot import user modules. Concrete
 functions may use a sole closed builtin body, including `builtin("int.add")`,
-with an exact runtime signature.
+with an exact runtime signature. Explicitly imported Blorp 2
+`process.run_to_files(String, List[String], String, String, Int) -> Result[Int, String]`
+uses that existing closed builtin form and ordinary calls; it adds no syntax.
+See the [target process contract](../blorp_2/standard_library/README.md#process-execution).
 The pilot accepts parameterless `trait` declarations with pure methods whose
 first formal is `Self`. A method without `:` is abstract; one with `:` has an
 ordinary default body. Function type parameters and complete implementation receiver

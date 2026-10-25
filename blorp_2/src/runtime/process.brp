@@ -1,0 +1,444 @@
+-- The optional process feature must request declarations before any headers.
+PROCESS_POSIX_PRELUDE: String =
+	raw
+		|#ifndef _POSIX_C_SOURCE
+		|#define _POSIX_C_SOURCE 200809L
+		|#elif _POSIX_C_SOURCE < 200809L
+		|#error process.run_to_files requires POSIX.1-2008 declarations
+		|#endif
+		|
+
+
+private PROCESS_SUPPORT: String =
+	raw
+		|#include <errno.h>
+		|#include <fcntl.h>
+		|#include <limits.h>
+		|#include <poll.h>
+		|#include <signal.h>
+		|#include <sys/types.h>
+		|#include <sys/stat.h>
+		|#include <sys/wait.h>
+		|#include <time.h>
+		|#include <unistd.h>
+		|extern char **environ;
+		|enum {
+		|    BLORP_PROCESS_OK = 1,
+		|    BLORP_PROCESS_ERROR = 0,
+		|    BLORP_PROCESS_PRIVATE_FD = STDERR_FILENO + 1,
+		|    BLORP_PROCESS_POLL_MS = 10,
+		|    BLORP_PROCESS_EXEC_FAILURE_EXIT = 127
+		|};
+		|static uint8_t blorp_process_failure(struct blorp_string **error, const char *stage, int number) {
+		|    static const char fallback[] = "process.run_to_files: native error formatting failed";
+		|    const int measured =
+		|        number == 0 ? snprintf(NULL, 0, "process.run_to_files: %s", stage)
+		|                    : snprintf(NULL, 0, "process.run_to_files: %s; errno=%d", stage, number);
+		|    if (measured < 0) {
+		|        *error = blorp_string_from_bytes(fallback, (int64_t)(sizeof fallback - 1));
+		|        return BLORP_PROCESS_ERROR;
+		|    }
+		|    const size_t capacity = (size_t)measured + 1;
+		|    char *message = blorp_memory_allocate(capacity);
+		|    if (message == NULL) {
+		|        abort();
+		|    }
+		|    const int written = number == 0 ? snprintf(message, capacity, "process.run_to_files: %s", stage)
+		|                                    : snprintf(message, capacity,
+		|                                               "process.run_to_files: %s; errno=%d", stage, number);
+		|    if (written != measured) {
+		|        blorp_memory_release(message);
+		|        *error = blorp_string_from_bytes(fallback, (int64_t)(sizeof fallback - 1));
+		|        return BLORP_PROCESS_ERROR;
+		|    }
+		|    *error = blorp_string_from_bytes(message, (int64_t)written);
+		|    blorp_memory_release(message);
+		|    return BLORP_PROCESS_ERROR;
+		|}
+		|static int blorp_process_close(int *descriptor) {
+		|    if (*descriptor < 0) {
+		|        return 0;
+		|    }
+		|    const int current = *descriptor;
+		|    *descriptor = -1;
+		|    /* Retrying close after EINTR can close a reused descriptor on supported POSIX. */
+		|    if (close(current) == 0) {
+		|        return 0;
+		|    }
+		|    return errno;
+		|}
+		|static int blorp_process_private(int descriptor) {
+		|    if (descriptor < 0) {
+		|        return -1;
+		|    }
+		|    int private_descriptor = descriptor;
+		|    if (descriptor < BLORP_PROCESS_PRIVATE_FD) {
+		|        private_descriptor = fcntl(descriptor, F_DUPFD_CLOEXEC, BLORP_PROCESS_PRIVATE_FD);
+		|        const int saved_errno = errno;
+		|        if (close(descriptor) != 0) {
+		|            const int problem = errno;
+		|            if (private_descriptor >= 0) {
+		|                (void)close(private_descriptor);
+		|            }
+		|            errno = problem;
+		|            return -1;
+		|        }
+		|        if (private_descriptor < 0) {
+		|            errno = saved_errno;
+		|            return -1;
+		|        }
+		|    }
+		|    if (fcntl(private_descriptor, F_SETFD, FD_CLOEXEC) != 0) {
+		|        const int saved_errno = errno;
+		|        (void)close(private_descriptor);
+		|        errno = saved_errno;
+		|        return -1;
+		|    }
+		|    return private_descriptor;
+		|}
+		|static int blorp_process_capture(const struct blorp_string *path) {
+		|    const int descriptor =
+		|        open(path->bytes, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, S_IRUSR | S_IWUSR);
+		|    if (descriptor < 0) {
+		|        return -1;
+		|    }
+		|    const int private_descriptor = blorp_process_private(descriptor);
+		|    if (private_descriptor < 0) {
+		|        return -1;
+		|    }
+		|    struct stat metadata;
+		|    if (fstat(private_descriptor, &metadata) != 0) {
+		|        const int saved_errno = errno;
+		|        (void)close(private_descriptor);
+		|        errno = saved_errno;
+		|        return -1;
+		|    }
+		|    if (!S_ISREG(metadata.st_mode)) {
+		|        (void)close(private_descriptor);
+		|        errno = EINVAL;
+		|        return -1;
+		|    }
+		|    return private_descriptor;
+		|}
+		|static int blorp_process_now(int64_t *milliseconds) {
+		|    struct timespec now;
+		|    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) {
+		|        return errno;
+		|    }
+		|    if (now.tv_sec < 0 || (uintmax_t)now.tv_sec > (uintmax_t)(INT64_MAX / 1000)) {
+		|        return EOVERFLOW;
+		|    }
+		|    const int64_t whole = (int64_t)now.tv_sec * 1000;
+		|    const int64_t fraction = now.tv_nsec / 1000000;
+		|    if (whole > INT64_MAX - fraction) {
+		|        return EOVERFLOW;
+		|    }
+		|    *milliseconds = whole + fraction;
+		|    return 0;
+		|}
+		|static int blorp_process_signal(pid_t child, int group) {
+		|    int status;
+		|    do {
+		|        status = kill(group ? -child : child, SIGKILL);
+		|    } while (status != 0 && errno == EINTR);
+		|    return status == 0 || errno == ESRCH ? 0 : errno;
+		|}
+		|/* Only direct-child termination/reaping is guaranteed. Darwin returns EPERM
+		| * for zombie-only groups, so group signals are best-effort cleanup attempts.
+		| * Keep the leader unreaped until both attempts to prevent PID/PGID reuse. */
+		|static int blorp_process_reap(pid_t child, int *status) {
+		|    (void)blorp_process_signal(child, 1);
+		|    int failure = blorp_process_signal(child, 0);
+		|    siginfo_t observed;
+		|    memset(&observed, 0, sizeof observed);
+		|    int waited;
+		|    do {
+		|        waited = waitid(P_PID, (id_t)child, &observed, WEXITED | WNOWAIT);
+		|    } while (waited != 0 && errno == EINTR);
+		|    if (waited != 0) {
+		|        failure = errno;
+		|    }
+		|    /* ECHILD means the reservation is lost; never signal that number again. */
+		|    if (waited == 0) {
+		|        (void)blorp_process_signal(child, 1);
+		|    }
+		|    pid_t reaped;
+		|    do {
+		|        reaped = waitpid(child, status, 0);
+		|    } while (reaped < 0 && errno == EINTR);
+		|    if (reaped != child) {
+		|        return errno;
+		|    }
+		|    return failure;
+		|}
+		|/* Only async-signal-safe operations execute between fork and execve/_exit. */
+		|static void blorp_process_child(int input, int output, int errors, int failure_fd,
+		|                                char *const arguments[]) {
+		|    int failure = 0;
+		|    if (setpgid(0, 0) != 0) {
+		|        failure = errno;
+		|    }
+		|    if (failure == 0 && dup2(input, STDIN_FILENO) < 0) {
+		|        failure = errno;
+		|    }
+		|    if (failure == 0 && dup2(output, STDOUT_FILENO) < 0) {
+		|        failure = errno;
+		|    }
+		|    if (failure == 0 && dup2(errors, STDERR_FILENO) < 0) {
+		|        failure = errno;
+		|    }
+		|    (void)close(input);
+		|    (void)close(output);
+		|    (void)close(errors);
+		|    if (failure == 0) {
+		|        execve(arguments[0], arguments, environ);
+		|        failure = errno;
+		|    }
+		|    const unsigned char *bytes = (const unsigned char *)&failure;
+		|    size_t remaining = sizeof failure;
+		|    while (remaining != 0) {
+		|        const ssize_t written = write(failure_fd, bytes, remaining);
+		|        if (written < 0 && errno == EINTR) {
+		|            continue;
+		|        }
+		|        if (written <= 0) {
+		|            break;
+		|        }
+		|        bytes += (size_t)written;
+		|        remaining -= (size_t)written;
+		|    }
+		|    _exit(BLORP_PROCESS_EXEC_FAILURE_EXIT);
+		|}
+		|
+
+
+private PROCESS_BODY: String =
+	raw
+		|
+		|    *exit_status = 0;
+		|    *error = NULL;
+		|    if (timeout_ms <= 0) {
+		|        return blorp_process_failure(error, "timeout must be positive", 0);
+		|    }
+		|    if (program->length == 0) {
+		|        return blorp_process_failure(error, "program path is empty", 0);
+		|    }
+		|    if (stdout_path->length == 0 || stderr_path->length == 0) {
+		|        return blorp_process_failure(error, "capture path is empty", 0);
+		|    }
+		|    const struct blorp_string *paths[] = {program, stdout_path, stderr_path};
+		|    for (size_t index = 0; index < sizeof paths / sizeof *paths; index++) {
+		|        if (memchr(paths[index]->bytes, '\0', (size_t)paths[index]->length) != NULL) {
+		|            return blorp_process_failure(error, "path contains embedded NUL", 0);
+		|        }
+		|    }
+		|    for (int64_t index = 0; index < arguments->length; index++) {
+		|        const struct blorp_string *argument = arguments->values[index];
+		|        if (memchr(argument->bytes, '\0', (size_t)argument->length) != NULL) {
+		|            return blorp_process_failure(error, "argument contains embedded NUL", 0);
+		|        }
+		|    }
+		|    struct sigaction disposition;
+		|    if (sigaction(SIGCHLD, NULL, &disposition) != 0) {
+		|        return blorp_process_failure(error, "inspect SIGCHLD", errno);
+		|    }
+		|    if (disposition.sa_handler != SIG_DFL || (disposition.sa_flags & SA_NOCLDWAIT) != 0) {
+		|        return blorp_process_failure(error, "requires default SIGCHLD", 0);
+		|    }
+		|    if ((uintmax_t)arguments->length > (uintmax_t)(SIZE_MAX / sizeof(char *) - 2)) {
+		|        return blorp_process_failure(error, "too many arguments", 0);
+		|    }
+		|    const size_t count = (size_t)arguments->length;
+		|    char **argv = blorp_memory_allocate((count + 2) * sizeof *argv);
+		|    if (argv == NULL) {
+		|        abort();
+		|    }
+		|    /* Strings already have a trailing NUL; their owners outlive this synchronous call. */
+		|    argv[0] = (char *)program->bytes;
+		|    for (size_t index = 0; index < count; index++) {
+		|        argv[index + 1] = arguments->values[index]->bytes;
+		|    }
+		|    argv[count + 1] = NULL;
+		|    int input = -1, output = -1, errors = -1;
+		|    int channel[2] = {-1, -1};
+		|    pid_t child = -1;
+		|    const char *failure = NULL;
+		|    int number = 0, status = 0, problem = 0;
+		|    int64_t now = 0, deadline = 0;
+		|    number = blorp_process_now(&now);
+		|    if (number != 0) {
+		|        failure = "read monotonic clock";
+		|        goto cleanup;
+		|    }
+		|    if (timeout_ms > INT64_MAX - now) {
+		|        failure = "timeout exceeds clock range";
+		|        goto cleanup;
+		|    }
+		|    deadline = now + timeout_ms;
+		|    output = blorp_process_capture(stdout_path);
+		|    if (output < 0) {
+		|        failure = "create stdout capture";
+		|        number = errno;
+		|        goto cleanup;
+		|    }
+		|    errors = blorp_process_capture(stderr_path);
+		|    if (errors < 0) {
+		|        failure = "create stderr capture";
+		|        number = errno;
+		|        goto cleanup;
+		|    }
+		|    input = blorp_process_private(open("/dev/null", O_RDONLY | O_CLOEXEC));
+		|    if (input < 0) {
+		|        failure = "open null stdin";
+		|        number = errno;
+		|        goto cleanup;
+		|    }
+		|    if (pipe(channel) != 0) {
+		|        failure = "create exec channel";
+		|        number = errno;
+		|        goto cleanup;
+		|    }
+		|    channel[0] = blorp_process_private(channel[0]);
+		|    if (channel[0] < 0) {
+		|        failure = "normalize exec reader";
+		|        number = errno;
+		|        goto cleanup;
+		|    }
+		|    channel[1] = blorp_process_private(channel[1]);
+		|    if (channel[1] < 0) {
+		|        failure = "normalize exec writer";
+		|        number = errno;
+		|        goto cleanup;
+		|    }
+		|    if (fcntl(channel[0], F_SETFL, O_NONBLOCK) != 0) {
+		|        failure = "configure exec reader";
+		|        number = errno;
+		|        goto cleanup;
+		|    }
+		|    child = fork();
+		|    if (child < 0) {
+		|        failure = "fork";
+		|        number = errno;
+		|        goto cleanup;
+		|    }
+		|    if (child == 0) {
+		|        (void)close(channel[0]);
+		|        blorp_process_child(input, output, errors, channel[1], argv);
+		|    }
+		|    /* The child also sets its group before exec. EACCES means it passed exec. */
+		|    if (setpgid(child, child) != 0 && errno != EACCES && errno != ESRCH) {
+		|        failure = "create child group";
+		|        number = errno;
+		|        goto cleanup;
+		|    }
+		|    problem = blorp_process_close(&channel[1]);
+		|    if (problem != 0) {
+		|        failure = "close exec writer";
+		|        number = problem;
+		|        goto cleanup;
+		|    }
+		|    int exec_error = 0;
+		|    size_t received = 0;
+		|    int exec_complete = 0;
+		|    for (;;) {
+		|        number = blorp_process_now(&now);
+		|        if (number != 0) {
+		|            failure = "read monotonic clock";
+		|            break;
+		|        }
+		|        if (now >= deadline) {
+		|            failure = "timed out";
+		|            number = 0;
+		|            break;
+		|        }
+		|        if (!exec_complete) {
+		|            ssize_t amount = read(channel[0], ((unsigned char *)&exec_error) + received,
+		|                                  sizeof exec_error - received);
+		|            if (amount > 0) {
+		|                received += (size_t)amount;
+		|                if (received == sizeof exec_error) {
+		|                    failure = "exec or child setup";
+		|                    number = exec_error;
+		|                    break;
+		|                }
+		|            } else if (amount == 0) {
+		|                if (received != 0) {
+		|                    failure = "incomplete exec report";
+		|                    number = 0;
+		|                    break;
+		|                }
+		|                exec_complete = 1;
+		|                problem = blorp_process_close(&channel[0]);
+		|                if (problem != 0) {
+		|                    failure = "close exec reader";
+		|                    number = problem;
+		|                    break;
+		|                }
+		|            } else if (errno != EINTR && errno != EAGAIN && errno != EWOULDBLOCK) {
+		|                failure = "read exec report";
+		|                number = errno;
+		|                break;
+		|            }
+		|        }
+		|        siginfo_t observed;
+		|        memset(&observed, 0, sizeof observed);
+		|        int observed_status;
+		|        observed_status = waitid(P_PID, (id_t)child, &observed, WEXITED | WNOHANG | WNOWAIT);
+		|        if (observed_status != 0 && errno == EINTR) {
+		|            continue;
+		|        }
+		|        if (observed_status != 0) {
+		|            failure = "observe child";
+		|            number = errno;
+		|            break;
+		|        }
+		|        if (observed.si_pid == child && exec_complete) {
+		|            if (observed.si_code != CLD_EXITED) {
+		|                failure = "child terminated by signal";
+		|                number = 0;
+		|            }
+		|            break;
+		|        }
+		|        const int64_t remaining = deadline - now;
+		|        const int delay =
+		|            remaining < BLORP_PROCESS_POLL_MS ? (int)remaining : BLORP_PROCESS_POLL_MS;
+		|        struct pollfd ready = {channel[0], POLLIN, 0};
+		|        if (poll(exec_complete ? NULL : &ready, exec_complete ? 0 : 1, delay) < 0 &&
+		|            errno != EINTR) {
+		|            failure = "wait for child";
+		|            number = errno;
+		|            break;
+		|        }
+		|    }
+		|cleanup:
+		|    if (child > 0) {
+		|        problem = blorp_process_reap(child, &status);
+		|        if (problem != 0) {
+		|            failure = "clean direct child";
+		|            number = problem;
+		|        }
+		|    }
+		|    int *descriptors[] = {&input, &output, &errors, &channel[0], &channel[1]};
+		|    for (size_t index = 0; index < sizeof descriptors / sizeof *descriptors; index++) {
+		|        problem = blorp_process_close(descriptors[index]);
+		|        if (problem != 0 && failure == NULL) {
+		|            failure = "close process descriptor";
+		|            number = problem;
+		|        }
+		|    }
+		|    blorp_memory_release(argv);
+		|    if (failure != NULL) {
+		|        return blorp_process_failure(error, failure, number);
+		|    }
+		|    if (!WIFEXITED(status)) {
+		|        return blorp_process_failure(error, "child terminated by signal", 0);
+		|    }
+		|    *exit_status = (int64_t)WEXITSTATUS(status);
+		|    return BLORP_PROCESS_OK;
+		|}
+		|
+
+
+-- The emitter supplies the String-list C type from its existing typed key.
+pure func process_runtime(arguments_type: String) -> String:
+	"\n${PROCESS_SUPPORT}uint8_t blorp_process_run_to_files(const struct blorp_string *program,${arguments_type} arguments,const struct blorp_string *stdout_path,const struct blorp_string *stderr_path,int64_t timeout_ms,int64_t *exit_status,struct blorp_string **error){\n${PROCESS_BODY}"

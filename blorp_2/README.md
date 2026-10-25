@@ -9,8 +9,8 @@ self-hosted; unported unit/runtime/grammar/e2e/tooling suites are DEFERRED.
 The combined integration implements pure lambdas with immutable captures,
 structural patterns, value conditionals and managed source loops. The target
 library provides the equality families and ordinary helpers described below. Focused
-functional results are supplemented by an actual self-compilation: all 43
-compiler source modules emit C, that C links, and the resulting compiler emits
+functional results are supplemented by an actual self-compilation: the complete
+compiler import graph emits C, that C links, and the resulting compiler emits
 byte-identical C from the same source and library. The [self-compilation
 report](../benchmarks/results/blorp_2_self_compiled_bootstrap_2026-10-20.md)
 records the proof and matched build costs. Full fixture parity, native-suite
@@ -617,7 +617,8 @@ outside this pilot's restricted grammar.
 
 ```sh
 make -C blorp_2 example          # Compile the example to C, build it, run it.
-make -C blorp_2 test             # Build B2; run the explicit self-hosted selection.
+make -C blorp_2 test             # Build B2; run components and first native e2e cases.
+make -C blorp_2 test-e2e         # Use the already-built diagnostic B2 compiler.
 ```
 
 `example` keeps its generated C and executable in `blorp_2/build/` for
@@ -631,8 +632,8 @@ IntMap, names, source identities and syntax publication, plus Lexer token traces
 float boundaries, keyword roles, source origins, character literals, continuation,
 doc fences, ranges, lexical trivia, pipe Strings and runtime-text round trips.
 Parse coverage includes constant inventories, source provenance, and String,
-integer, Float and file builtin labels. The selection has 27 suites with 188
-active cases. Each selected suite uses its ordinary
+integer, Float and file builtin labels. The process increment adds exact builtin-contract, lowering, ownership,
+verification and C-emission suites, plus strict-report parser checks. Each selected suite uses its ordinary
 `tests: TestSuite` entry; generated C and executables mirror its source path
 under `blorp_2/build/self-hosted-tests/`.
 
@@ -640,8 +641,8 @@ Twelve Lexer cases are explicitly deferred in source comments: eleven bracketed
 block cases need `String.split`, and one pipe String case needs a byte-input
 boundary for invalid UTF-8. Their original inputs and assertions remain beside
 the TODOs. Deferred cases receive no PASS credit; the empty bracketed-block suite
-is not in the target selection. Other untranslated unit/runtime/grammar/tooling suites and the native e2e
-driver are DEFERRED. Their sources stay intact for bounded incremental ports;
+is not in the target selection. Other untranslated unit/runtime/grammar/tooling suites and the remaining
+native e2e cases are DEFERRED. Their sources stay intact for bounded incremental ports;
 no legacy host or replacement test framework runs them.
 
 `test-components BLORP2_COMPILER=PATH` uses an already-built compiler without a
@@ -679,12 +680,21 @@ continues after a failed callback. Empty suites succeed. Suite constants use
 ordinary closed initializers; inline lambda entries remain unsupported.
 The [existing text suite](test/unit/test_utils/test_text.brp) is the first example.
 
-Full native end-to-end execution is **DEFERRED**: its existing Blorp driver
-imports process/filesystem/bytes facilities not yet supported by the target
-library. `make -C blorp_2 test-e2e` exits nonzero with a deferral message and a
-porting hint. Default `test` runs only the self-hosted selection and prints the
-coverage deferral; it never invokes a legacy compiler or silently skips a
-requested e2e gate.
+`make -C blorp_2 test-e2e` runs Blorp TestSuites for four native cases: return
+zero, return 23, exact text output and rejected compilation with an existing
+output preserved. Each accepted fixture retains its ordinary main. Its unchanged
+emitted C links into separate normal and strict-memory executables with C11,
+`-O0`, ASan and UBSan; both executions check exact exit/stdout/stderr. Successful
+compiler calls require positive balanced strict accounting. The rejected call
+checks the complete diagnostic and help text with accounting disabled.
+
+The same driver runs the process-runtime lifecycle tests. Make resolves
+`BLORP2_COMPILER` and `BLORP_CC` to explicit executable paths, supplies a private
+temporary directory and removes it on completion. All test assertions are Blorp
+TestSuite callbacks; its ordinary `main(args)` exists only to receive those three
+paths. No legacy compiler, alternate fixture main or replacement test framework
+is involved. Remaining cases in the older driver need additional APIs and remain
+**DEFERRED**, including full native resource qualification.
 
 CI has four independent self-hosted lanes: Linux x64 with Clang and GCC,
 Linux ARM64 with Clang, and macOS ARM64 with Clang. Each checks out source,
@@ -693,7 +703,7 @@ pinned B2 seed. No legacy toolchain artifact or FRESH host is required.
 
 The seed workflow and `scripts/blorp2-fixpoint --prove` retain real compiler
 self-compilation, B/C output identity, A/B accepted/rejected fixture parity,
-and self-hosted components. Seed publication additionally retains its existing
+self-hosted components and the first native e2e selection. Seed publication additionally retains its existing
 whole-source strict accounting/sanitizer checks and ordinary-main native smoke.
 Fixture parity is compiler-output agreement, not native execution. Full native
 correctness/resource qualification and unported suites remain DEFERRED;

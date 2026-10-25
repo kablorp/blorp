@@ -10,7 +10,7 @@ import:
 			FloatCopySign, FloatEquals, FloatLessThan, FloatIsNaN, FloatIsFinite,
 			IntAdd, IntSubtract, IntMultiply, IntDivide, IntRemainder, IntToString, StringLength, StringConcat, StringAppendInt,
 			StringPrint, StringPrintError, StringParseInt, StringParseFloat, ListRepeat, ListLength, ListGet, ListAppend, ListSet,
-			StringByteAt, StringFromCodepoint, StringSlice, GetCurrentDirectory, ReadFile, WriteFile,
+			StringByteAt, StringFromCodepoint, StringSlice, GetCurrentDirectory, ReadFile, WriteFile, RunToFiles,
 			ListConcat, StringEquals,
 			IntEquals, IntLessThan, FloatAdd, FloatSubtract, FloatMultiply, FloatDivide, FloatRemainder,
 			FloatToString,
@@ -28,6 +28,7 @@ import:
 	../runtime/system: SYSTEM_CURRENT_DIRECTORY_RUNTIME, SYSTEM_READ_FILE_RUNTIME, SYSTEM_WRITE_FILE_RUNTIME
 	../runtime/string_concat: STRING_CONCAT_RUNTIME, STRING_APPEND_INT_RUNTIME
 	../runtime/memory: MEMORY_RUNTIME
+	../runtime/process: PROCESS_POSIX_PRELUDE, process_runtime
 	int: INT_MIN, Int methods_only
 	../runtime/list:
 		ListElementKey, ListUpdate(AppendUpdate, SetUpdate, ConcatUpdate, SuffixUpdate), arguments_runtime,
@@ -187,6 +188,8 @@ private pure func c_callable(target: CallTarget) -> Option[String]:
 					Some("blorp_string_from_codepoint")
 				StringSlice(_):
 					Some("blorp_string_slice")
+				RunToFiles(_):
+					Some("blorp_process_run_to_files")
 				ReadFile(_):
 					Some("blorp_read_file")
 				WriteFile(_):
@@ -1301,6 +1304,21 @@ private pure func append_read_file(
 		.concat("${declaration}${c_value(id)}=${scratch}_ok?${ok}:${error};(void)${c_value(id)};"))
 
 
+-- Native outputs stay private; only the designated ordinary Result escapes.
+private pure func append_run_to_files(
+	output: String, id: ValueId, result: DesignatedResult[VariantInstanceId],
+	arguments: List[OwnedArgument], unions: List[ConcreteUnion], span: Span,
+) -> Result[String, Diagnostic]:
+	values = arguments.map(pure func(argument: OwnedArgument) -> String: c_value(argument_value(argument))).join(",")
+	declaration ?= c_local_declaration(UnionType(variant_owner(result.ok)), InitializedLocal, unions, span)
+	scratch = "blorp_runtime_".append_int(value_number(id))
+	ok ?= c_union_value(result.ok, ["${scratch}_status"], unions, span)
+	error ?= c_union_value(result.err, ["${scratch}_error"], unions, span)
+	Ok("${output}int64_t ${scratch}_status=0;struct blorp_string *${scratch}_error=NULL;"
+		.concat("const uint8_t ${scratch}_ok=blorp_process_run_to_files(${values},&${scratch}_status,&${scratch}_error);")
+		.concat("${declaration}${c_value(id)}=${scratch}_ok?${ok}:${error};(void)${c_value(id)};"))
+
+
 private pure func append_write_file(
 	output: String,
 	id: ValueId,
@@ -1397,6 +1415,8 @@ private pure func append_value(
 					append_string_from_codepoint(output, id, option, arguments, unions, span)
 				RuntimeFunction(StringSlice(option)):
 					append_string_slice(output, id, option, arguments, unions, span)
+				RuntimeFunction(RunToFiles(result)):
+					append_run_to_files(output, id, result, arguments, unions, span)
 				RuntimeFunction(ReadFile(result)):
 					append_read_file(output, id, result, arguments, unions, span)
 				RuntimeFunction(WriteFile(result)):
@@ -2465,6 +2485,7 @@ private pure func innermost_element(value_type: TypeRef) -> TypeRef:
 -- selects its own helper. Allocation headers follow from the layouts and the
 -- argument vector from the entrypoint, which already own those facts.
 private fixed record RuntimeRequirements {
+	process: Bool,
 	current_directory: Bool,
 	file_read: Bool,
 	file_write: Bool,
@@ -2486,6 +2507,7 @@ private fixed record RuntimeRequirements {
 
 private pure func runtime_requirements(inventory: ProgramInventory) -> RuntimeRequirements:
 	var requirements: RuntimeRequirements = {
+		process = False,
 		current_directory = False,
 		file_read = False,
 		file_write = False,
@@ -2512,6 +2534,7 @@ private pure func runtime_requirements(inventory: ProgramInventory) -> RuntimeRe
 
 	for operation in inventory.runtime_calls:
 		match operation:
+			RunToFiles(_): requirements = { requirements | process = True }
 			ReadFile(_): requirements = { requirements | file_read = True }
 			WriteFile(_): requirements = { requirements | file_write = True }
 			GetCurrentDirectory(_): requirements = { requirements | current_directory = True }
@@ -3028,7 +3051,10 @@ pure func emit(program: VerifiedProgram) -> Result[String, Diagnostic]:
 		string_runtime()
 	else:
 		"#include <stdint.h>\n"
-	var fragments: List[String] = [MEMORY_RUNTIME, prelude]
+	var fragments: List[String] = if requirements.process:
+		[PROCESS_POSIX_PRELUDE, MEMORY_RUNTIME, prelude]
+	else:
+		[MEMORY_RUNTIME, prelude]
 
 	needs_allocation_headers: Bool = match lists.is_empty().not():
 		True: True
@@ -3091,6 +3117,8 @@ pure func emit(program: VerifiedProgram) -> Result[String, Diagnostic]:
 		fragments = fragments.append(STRING_SLICE_RUNTIME)
 
 	fragments = fragments.append(aggregates)
+	if requirements.process:
+		fragments = fragments.append(process_runtime(list_c_type(list_element_key(StringType))))
 	var index: Int = 0
 	var failure: Option[Diagnostic] = None
 
