@@ -114,7 +114,7 @@ the bytes clearer, such as CRLF or malformed indentation. Using multiline
 literals in tests does not add them to the pilot's input grammar.
 
 **End-to-end.** Sources remain under [test/e2e/](test/e2e/), with programs in
-[test/e2e/fixtures/](test/e2e/fixtures/). `make -C blorp_2 test-e2e` runs the first four native cases and process-runtime
+[test/e2e/fixtures/](test/e2e/fixtures/). `make -C blorp_2 test-e2e` runs the first selected native cases and process-runtime
 checks. Its approved orchestration entry is an ordinary `main(args)` that
 constructs Blorp `TestSuite`s and calls `test.run_suite`; Make passes the exact
 compiler, C compiler and private work-directory paths as argv. This narrow entry

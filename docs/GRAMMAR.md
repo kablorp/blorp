@@ -20,6 +20,12 @@ with an exact runtime signature. Explicitly imported Blorp 2
 `process.run_to_files(String, List[String], String, String, Int) -> Result[Int, String]`
 uses that existing closed builtin form and ordinary calls; it adds no syntax.
 See the [target process contract](../blorp_2/standard_library/README.md#process-execution).
+The pilot propagation target may be a name or `_`, with an optional success-type
+annotation: `(identifier | "_") [ ":" type_annotation ] "?=" initializer`.
+The discard adds no source binding; named and discard forms share the existing
+top-level-only Result rules. Ordinary `_ = expression` remains invalid.
+The pilot accepts `_` only in binder/pattern positions, never as a primary
+expression or as a Void alias, including grouped/tuple/List/argument values.
 The pilot accepts parameterless `trait` declarations with pure methods whose
 first formal is `Self`. A method without `:` is abstract; one with `:` has an
 ordinary default body. Function type parameters and complete implementation receiver

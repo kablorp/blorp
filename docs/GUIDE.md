@@ -2249,6 +2249,13 @@ func process() -> Option[Int]:
     Some(x * 2)
 ```
 
+Blorp 2 also accepts `_ ?= expression` to discard an `Ok` payload while
+propagating `Err`. The RHS determines its type; an optional `_: Type ?=`
+annotation supplies context. In Blorp 2 `_` is never an expression or a Void
+alias; use `void` for the Void value. This adds no local name and releases managed
+payloads through ordinary ownership cleanup. Blorp 2 retains its top-level-only
+Result propagation rules.
+
 Rules for `?=`:
 
 - `?=` binds `Some(value)` or `Ok(value)` to the name on the left.

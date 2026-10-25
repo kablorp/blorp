@@ -203,6 +203,10 @@ private IDENTIFIER_HELP: String = "use an ASCII identifier starting with a lette
 
 private EXPRESSION_HELP: String = "use a literal, a parameter or variant name, or a call as the entire body"
 
+private DISCARD_VALUE_MESSAGE: String = "`_` is not a value"
+
+private DISCARD_VALUE_HELP: String = "use a named value or void; use _ only as a binder or pattern"
+
 private DECIMAL_RADIX: Int = 10
 
 private STRING_ESCAPE_HELP: String = "use \\n, \\r, \\t, \\0, \\\\, \\\", \\', \\{, \\}, or a Unicode scalar escape such as \\u{E9}"
@@ -1364,7 +1368,7 @@ private pure func consume_base(start: ParserState, token: Token) -> Result[Parse
 		KeywordToken(VoidKeyword):
 			Ok({ base = VoidExpression, span = token.span, next = after })
 		SymbolToken(Wildcard):
-			Ok({ base = VoidExpression, span = token.span, next = after })
+			Err(diagnostic(token.span, DISCARD_VALUE_MESSAGE, DISCARD_VALUE_HELP))
 		-- `.5` teaches the Float form; any other leading dot (a UFCS call on
 		-- its own line, say) is simply no expression, as in the host.
 		SymbolToken(Dot):
@@ -2003,14 +2007,16 @@ private TUPLE_BINDER_ANNOTATION_HELP: String = "annotate the tuple value before 
 -- line is parsed once, then '=' distinguishes declaration from expression.
 -- This avoids rescanning tokens or recovering binders from expression shapes.
 private fixed union EnclosedMember:
-	BareMember(ParsedBinder, ValueExpression)
+	BareMember(ParsedBinder)
 	ValueMember(ValueExpression)
 
 
-private pure func enclosed_value(member: EnclosedMember) -> ValueExpression:
+private pure func enclosed_value(member: EnclosedMember) -> Result[ValueExpression, Diagnostic]:
 	match member:
-		BareMember(_, value): value
-		ValueMember(value): value
+		BareMember(NamedBinder(name)):
+			Ok({ base = NameExpression(name), base_span = name.span, applications = [], span = name.span })
+		BareMember(DiscardBinder(span)): Err(diagnostic(span, DISCARD_VALUE_MESSAGE, DISCARD_VALUE_HELP))
+		ValueMember(value): Ok(value)
 
 
 private fixed record ParsedMember {
@@ -2034,12 +2040,7 @@ private pure func consume_enclosed_member(state: ParserState) -> Result[ParsedMe
 
 private pure func consume_bare_member(state: ParserState) -> Result[ParsedMember, Diagnostic]:
 	binder ?= consume_binder(state, "expected a tuple element")
-	base: ExpressionBase = match binder.binder:
-		NamedBinder(name): NameExpression(name)
-		DiscardBinder(_): VoidExpression
-	span = parser_span(state)
-	value: ValueExpression = { base = base, base_span = span, applications = [], span = span }
-	Ok({ member = BareMember(binder.binder, value), next = binder.next })
+	Ok({ member = BareMember(binder.binder), next = binder.next })
 
 
 private fixed union EnclosedContents:
@@ -2060,7 +2061,10 @@ private pure func consume_enclosed_values(start: ParserState, opening: Span) -> 
 	first ?= consume_enclosed_member(with_enclosure(shifted(start, 1), Bracketed))
 	if at_comma(first.next).not():
 		match expect(first.next, at_right_paren(first.next), "expected ')' after the grouped expression", "close the parentheses after one expression; UFCS and field reads may follow ')'"):
-			Ok(closed): Ok({ contents = GroupedContents(enclosed_value(first.member)), span = { opening | end = parser_span(first.next).end }, next = with_enclosure(closed, start.enclosure) })
+			Ok(closed):
+				match enclosed_value(first.member):
+					Err(error): Err(error)
+					Ok(value): Ok({ contents = GroupedContents(value), span = { opening | end = parser_span(first.next).end }, next = with_enclosure(closed, start.enclosure) })
 			Err(error): Err(error)
 	else:
 		consume_tuple_values(start, opening, first)
@@ -2075,7 +2079,11 @@ private pure func consume_tuple_values(start: ParserState, opening: Span, first:
 			Err(error): failure = Some(error)
 			Ok(member):
 				if members.length().equals(TUPLE_MAXIMUM_ELEMENTS):
-					failure = Some(diagnostic(enclosed_value(member.member).span, "tuples support two to four elements", TUPLE_SIZE_HELP))
+					span = match member.member:
+						BareMember(NamedBinder(name)): name.span
+						BareMember(DiscardBinder(span)): span
+						ValueMember(value): value.span
+					failure = Some(diagnostic(span, "tuples support two to four elements", TUPLE_SIZE_HELP))
 				else:
 					members = members.append(member.member)
 					match list_separator(member.next):
@@ -2095,10 +2103,20 @@ private pure func consume_tuple_values(start: ParserState, opening: Span, first:
 
 
 private pure func finish_enclosed_value(enclosed: ParsedEnclosed) -> Result[ParsedValue, Diagnostic]:
-	inner: ValueExpression = match enclosed.contents:
-		GroupedContents(value): value
+	inner: ValueExpression ?= match enclosed.contents:
+		GroupedContents(value): Ok(value)
 		TupleContents(members):
-			{ base = TupleExpression(members.map(enclosed_value)), base_span = enclosed.span, applications = [], span = enclosed.span }
+			var values: List[ValueExpression] = []
+			var failure: Option[Diagnostic] = None
+			for member in members:
+				match enclosed_value(member):
+					Ok(value): values = values.append(value)
+					Err(error):
+						failure = Some(error)
+						break
+			match failure:
+				Some(error): Err(error)
+				None: Ok({ base = TupleExpression(values), base_span = enclosed.span, applications = [], span = enclosed.span })
 	postfixes ?= consume_postfixes(enclosed.next, inner.applications, enclosed.span.end)
 	Ok({
 		body = { base = inner.base, base_span = inner.base_span, applications = postfixes.applications, span = { enclosed.span | end = postfixes.end } },
@@ -2570,7 +2588,7 @@ private fixed union LineForm:
 	ValueForm(ParsedValue)
 
 
--- A line that declares a binding: `var`, a name followed by '=', '?=' or
+-- A binding line: `var`, a name/discard followed by '=', '?=' or
 -- ':', or a keyword followed by '=' or '?=' so that `in = 1` reports the
 -- reserved word rather than a missing expression. `else:` is a block
 -- header, not a binding.
@@ -2578,7 +2596,7 @@ private pure func at_binding(state: ParserState) -> Bool:
 	or(
 		or(
 			at_var(state),
-			(and(at_identifier(state), (or(at_assignment(shifted(state, 1)), at_colon(shifted(state, 1)))))),
+			(and(or(at_identifier(state), at_wildcard(state)), (or(at_assignment(shifted(state, 1)), at_colon(shifted(state, 1)))))),
 		),
 		(and(at_keyword(state), at_assignment(shifted(state, 1)))),
 	)
@@ -2659,13 +2677,21 @@ private pure func consume_binding(state: ParserState) -> Result[LineForm, Diagno
 		shifted(state, 1)
 	else:
 		state
-	name: ParsedName ?= if at_left_paren(after_keyword):
+	target: BinderResult ?= if at_left_paren(after_keyword):
 		Err(expected_syntax(after_keyword, "tuple destructuring declares immutable names", "omit var before the tuple target; declare individual mutable bindings separately if needed"))
 	else:
-		consume_name(after_keyword, "expected a binding name")
-	annotation ?= consume_optional_annotation(name.next, "expected the binding's type after ':'")
+		if mutable:
+			match consume_name(after_keyword, "expected a binding name"):
+				Ok(name): Ok({ binder = NamedBinder(name.name), next = name.next })
+				Err(error): Err(error)
+		else:
+			consume_binder(after_keyword, "expected a binding name")
+	annotation ?= consume_optional_annotation(target.next, "expected the binding's type after ':'")
+	binder_span = match target.binder:
+		NamedBinder(name): name.span
+		DiscardBinder(span): span
 
-	-- Only an immutable name propagates; `var` keeps the plain binding form.
+	-- Only an immutable binder propagates; `var` keeps the plain binding form.
 	propagating = and(not(mutable), at_question_equals(annotation.next))
 
 	if propagating:
@@ -2673,7 +2699,7 @@ private pure func consume_binding(state: ParserState) -> Result[LineForm, Diagno
 			FunctionBody:
 				match consume_initializer(shifted(annotation.next, 1), Propagate, BINDING_LINE_MESSAGE, BINDING_LINE_HELP):
 					Ok(value):
-						propagation: ParsedPropagation = { name = name.name, annotation = annotation.written, value = value.body, span = { name.name.span | end = value.body.span.end } }
+						propagation: ParsedPropagation = { binder = target.binder, annotation = annotation.written, value = value.body, span = { binder_span | end = value.body.span.end } }
 						Ok(StatementForm(PropagatingBinding(propagation), value.next))
 					Err(error): Err(error)
 			InsideLambda:
@@ -2683,14 +2709,17 @@ private pure func consume_binding(state: ParserState) -> Result[LineForm, Diagno
 			LoopBody | ValueInLoop:
 				Err(expected_syntax(annotation.next, "`?=` cannot be used inside a loop body", "bind it before the loop, or use `match` inside the loop"))
 	else:
-		match expect(annotation.next, at_equals(annotation.next), "expected '=' after the binding name", "write name = expression or var name = expression; a propagating binding is name ?= expression"):
-			Ok(equals):
-				match consume_initializer(equals, Assign, BINDING_LINE_MESSAGE, BINDING_LINE_HELP):
-					Ok(initializer):
-						binding: ParsedBinding = { name = name.name, annotation = annotation.written, mutable = mutable, initializer = initializer.body }
-						Ok(StatementForm(BindingStatement(binding), initializer.next))
+		match target.binder:
+			DiscardBinder(_): Err(expected_syntax(after_keyword, "discard binding requires '?='", "write _ ?= expression to propagate and discard a Result payload"))
+			NamedBinder(name):
+				match expect(annotation.next, at_equals(annotation.next), "expected '=' after the binding name", "write name = expression or var name = expression; a propagating binding is name ?= expression"):
+					Ok(equals):
+						match consume_initializer(equals, Assign, BINDING_LINE_MESSAGE, BINDING_LINE_HELP):
+							Ok(initializer):
+								binding: ParsedBinding = { name = name, annotation = annotation.written, mutable = mutable, initializer = initializer.body }
+								Ok(StatementForm(BindingStatement(binding), initializer.next))
+							Err(error): Err(error)
 					Err(error): Err(error)
-			Err(error): Err(error)
 
 
 private pure func tuple_declaration_binders(enclosed: ParsedEnclosed) -> Result[List[ParsedBinder], Diagnostic]:
@@ -2702,7 +2731,7 @@ private pure func tuple_declaration_binders(enclosed: ParsedEnclosed) -> Result[
 			var failure: Option[Diagnostic] = None
 			for member in members:
 				match member:
-					BareMember(binder, _): binders = binders.append(binder)
+					BareMember(binder): binders = binders.append(binder)
 					ValueMember(value):
 						failure = Some(diagnostic(value.span, FLAT_TUPLE_MESSAGE, FLAT_TUPLE_HELP))
 						break
@@ -2791,7 +2820,7 @@ private pure func consume_block_line(state: ParserState) -> Result[BlockLine, Di
 private pure func consume_line_form(state: ParserState) -> Result[LineForm, Diagnostic]:
 	if and(at_import(state), at_colon(shifted(state, 1))):
 		Err(expected_syntax(state, IMPORT_IN_BODY_MESSAGE, IMPORT_IN_BODY_HELP))
-	else if and(at_wildcard(state), at_assignment(shifted(state, 1))):
+	else if and(at_wildcard(state), at_equals(shifted(state, 1))):
 		Err(expected_syntax(state, "expected a return expression", EXPRESSION_HELP))
 	else if at_binding(state):
 		consume_binding(state)

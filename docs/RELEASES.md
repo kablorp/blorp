@@ -193,7 +193,7 @@ The workflow uses no legacy host. The pinned B2 seed generates reference A,
 then A emits compiler C,
 Clang links self-built B in normal/diagnostic modes, and B reproduces that C.
 Only B normal is published as `blorp2-<target>`. The explicit self-hosted
-components, first four native e2e cases, process-runtime lifecycle checks,
+components, selected native e2e cases, process-runtime lifecycle checks,
 strict compiler accounting and ordinary-main strict smoke must pass.
 Unported unit/runtime/grammar/tooling and remaining native e2e cases are DEFERRED;
 their sources remain for incremental ports. Qualification metadata must state

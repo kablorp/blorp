@@ -1,0 +1,111 @@
+import:
+    ../../../src/lex/lex: lex
+    ../../../src/parse/parse: parse_module, module_contents
+    ../parse_function_inputs: free_functions
+    ../../../src/utils/syntax: ParsedStatement(PropagatingBinding), ParsedBinder(DiscardBinder)
+    ../../../src/utils/names: program_names
+    ../../../src/utils/source: module_source, root_module_id, same_source
+    string: String methods_only
+    int: Int methods_only
+    bool: and
+    result: Result methods_only
+    test: TestSuite
+
+
+private HEADER: String = "func main() -> Int:\n"
+
+
+private pure func accepts(statements: String) -> Bool:
+    match lex(module_source(root_module_id()), "${HEADER}${statements}    0\n", program_names().names):
+        Err(_): False
+        Ok(tokens): parse_module(tokens, root_module_id()).is_ok()
+
+
+pure func test_discard_and_annotation_parse() -> Bool:
+    accepts("    _ ?= query()\n").and(accepts("    _: String ?= query()\n"))
+
+
+pure func test_repeated_and_indented_discards_parse() -> Bool:
+    accepts("    _ ?= query()\n    _ ?=\n        query()\n")
+
+
+pure func test_discard_retains_underscore_and_statement_spans() -> Bool:
+    source = "${HEADER}    _ ?= query()\n    0\n"
+    match lex(module_source(root_module_id()), source, program_names().names):
+        Err(_): False
+        Ok(tokens):
+            match parse_module(tokens, root_module_id()):
+                Err(_): False
+                Ok(parsed):
+                    match free_functions(module_contents(parsed).functions).get(0):
+                        None: False
+                        Some(function):
+                            match function.statements:
+                                [PropagatingBinding(written)]:
+                                    match written.binder:
+                                        DiscardBinder(span):
+                                            span.start.equals(HEADER.length().add(4))
+                                                .and(span.end.equals(HEADER.length().add(5)))
+                                                .and(written.span.start.equals(span.start))
+                                                .and(written.span.end.equals(HEADER.length().add(16)))
+                                        _: False
+                                _: False
+
+
+private pure func rejects(statement: String, position: Int, end: Int, message: String, help: String) -> Bool:
+    match lex(module_source(root_module_id()), "${HEADER}${statement}    0\n", program_names().names):
+        Err(_): False
+        Ok(tokens):
+            match parse_module(tokens, root_module_id()):
+                Ok(_): False
+                Err(error):
+                    same_source(error.span.source, module_source(root_module_id()))
+                        .and(error.span.start.equals(HEADER.length().add(position)))
+                        .and(error.span.end.equals(HEADER.length().add(end)))
+                        .and(error.message.equals(message)).and(error.help.equals(help))
+
+
+pure func test_plain_and_mutable_discards_stay_rejected() -> Bool:
+    rejects("    _ = query()\n", 4, 5, "expected a return expression", "use a literal, a parameter or variant name, or a call as the entire body")
+        .and(rejects("    _: String = query()\n", 4, 5, "discard binding requires '?='", "write _ ?= expression to propagate and discard a Result payload"))
+        .and(rejects("    var _ ?= query()\n", 8, 9, "expected a binding name", "use an ASCII identifier starting with a letter or underscore; keywords and lone '_' are reserved"))
+
+
+pure func test_nested_discard_stays_rejected() -> Bool:
+    rejects("    if True:\n        _ ?= query()\n", 23, 25, "`?=` cannot be used inside an `if` or `match` block", "match on the Result or Option in place, or move the block into its own function and use `?=` at its top")
+
+
+pure func test_underscore_is_never_a_value() -> Bool:
+    message = "`_` is not a value"
+    help = "use a named value or void; use _ only as a binder or pattern"
+    rejects("    _\n", 4, 5, message, help)
+        .and(rejects("    (_)\n", 5, 6, message, help))
+        .and(rejects("    value = (1, _)\n", 16, 17, message, help))
+        .and(rejects("    value = [_]\n", 13, 14, message, help))
+        .and(rejects("    query(_)\n", 10, 11, message, help))
+        .and(rejects("    value = _\n", 12, 13, message, help))
+        .and(rejects("    (_).query()\n", 5, 6, message, help))
+
+
+pure func test_existing_binders_and_named_values_remain_valid() -> Bool:
+    accepts("    (_, value) = pair()\n")
+        .and(accepts("    for _ in values:\n        void\n"))
+        .and(accepts("    for (_, value) in pairs:\n        void\n"))
+        .and(accepts("    callback = pure func(_: Int) -> Int: 7\n"))
+        .and(accepts("    match value:\n        _: void\n"))
+        .and(accepts("    pair = (first, second)\n"))
+        .and(accepts("    (value)\n"))
+
+
+tests: TestSuite = {
+    description = "Discard Result propagation syntax",
+    tests = [
+        ("discard and optional annotation", test_discard_and_annotation_parse),
+        ("underscore and statement spans", test_discard_retains_underscore_and_statement_spans),
+        ("repeated and indented discards", test_repeated_and_indented_discards_parse),
+        ("plain and mutable discards remain invalid", test_plain_and_mutable_discards_stay_rejected),
+        ("nested propagation remains invalid", test_nested_discard_stays_rejected),
+        ("underscore is never an expression", test_underscore_is_never_a_value),
+        ("existing binders and named values remain valid", test_existing_binders_and_named_values_remain_valid),
+    ]
+}

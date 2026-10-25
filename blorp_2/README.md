@@ -680,9 +680,10 @@ continues after a failed callback. Empty suites succeed. Suite constants use
 ordinary closed initializers; inline lambda entries remain unsupported.
 The [existing text suite](test/unit/test_utils/test_text.brp) is the first example.
 
-`make -C blorp_2 test-e2e` runs Blorp TestSuites for four native cases: return
-zero, return 23, exact text output and rejected compilation with an existing
-output preserved. Each accepted fixture retains its ordinary main. Its unchanged
+`make -C blorp_2 test-e2e` runs Blorp TestSuites for selected native cases: return
+zero, return 23, exact text output, discard propagation with managed payloads,
+and rejected compilation with an existing output preserved. Each accepted
+fixture retains its ordinary main. Its unchanged
 emitted C links into separate normal and strict-memory executables with C11,
 `-O0`, ASan and UBSan; both executions check exact exit/stdout/stderr. Successful
 compiler calls require positive balanced strict accounting. The rejected call
@@ -708,6 +709,29 @@ whole-source strict accounting/sanitizer checks and ordinary-main native smoke.
 Fixture parity is compiler-output agreement, not native execution. Full native
 correctness/resource qualification and unported suites remain DEFERRED;
 existing e2e inputs, oracles and cost ceilings stay in source for future ports.
+
+The discard-propagation increment (2026-10-25) passed 213 component checks,
+26 process-runtime checks, five native cases and 591-fixture parity through
+`scripts/blorp2-fixpoint --prove`; seed/A/B/C emitted identical compiler C.
+Its seven parser and four checker callbacks also passed ASan/UBSan and strict
+accounting. The candidate discard and unused-named controls, plus the baseline
+unused-named control, emitted byte-identical C, preserving ordinary cleanup.
+Production changed by 77 added / 43 deleted lines (+34); tests by 308 / 24 (+284).
+
+Matched macOS self-built B measurements against `7ec2a0ae02d0` used the same
+frozen final source/library inputs, `-O0`, three normal samples after warmup
+and one separate strict diagnostic sample per compiler and workload:
+
+| Compilation input | Allocations, baseline → candidate | Normal retired instructions, minimum | Normal peak RSS, maximum bytes |
+| --- | --- | --- | --- |
+| `return/zero.brp` | 116,474 → 116,501 (+0.0232%) | 1,450,626,657 → 1,450,231,245 (−0.0273%) | 9,814,016 → 9,535,488 |
+| Entire final compiler | 30,378,949 → 30,384,881 (+0.0195%) | 1,095,767,678,372 → 1,095,601,009,969 (−0.0152%) | 323,387,392 → 321,863,680 |
+
+Every diagnostic run balanced allocations/releases with zero leaks, and every
+version/mode emitted identical C for each input. These small instruction
+differences do not establish a speed improvement. Raw commands, source/binary
+hashes, samples and output identities are retained under
+`build/discard-propagation/integration/final/` in the implementation worktree.
 
 Every compiler source module has a matching unit suite under `test/unit/test_<stage>/`,
 mirroring its folder under `src/`; the support modules that suites share stay in `test/unit/`.
@@ -1664,6 +1688,11 @@ Lexical and layout rules:
   must match. It binds the `Ok` payload once and returns an `Err` before
   evaluating later statements. A binding annotation names the success type:
   `value: String ?= expression` supplies `Result[String, Error]` context.
+  `_ ?= expression` discards the success payload without introducing a name;
+  managed payloads follow ordinary ownership cleanup. `_` is never a value,
+  including within parentheses, tuples, arguments or Lists; write `void` for
+  the Void value. Discards can repeat, and `_: String ?= expression` supplies
+  the same optional type context.
   Otherwise the RHS must infer a complete type through ordinary inference;
   bind a typed Result first when a constructor needs more context. `Option`
   propagation and `?=` in `@tail_recursive` functions remain unsupported.
