@@ -36,13 +36,13 @@ These govern design and review. A change that breaks one is incomplete.
    resolution, rejoin a signature, or recheck established arity, purity or
    types. Transient facts may be discarded after validation. A change to a
    fact's representation names its producer, owner, lifetime and consumers.
-2. **Make illegal states unrepresentable, with the smallest direct design.**
-   Prefer precise variants, opaque identities and construction-time checks
-   over flags, parallel lists, optional fields with hidden coupling and
-   invariant guards. A guard for a state the types permit marks a model to
-   fix. Guard against over-modelling: add no type, helper, layer or
-   abstraction beyond what the current example needs; single-use
-   indirection and speculative generality count against a design.
+2. **Keep the model small, and do not encode the same fact twice.**
+   Use a variant or opaque identity when cases carry different data or when
+   two fields could otherwise disagree. Two empty tags used only as a
+   switch are usually a `Bool` whose field name is the concept. Prefer
+   construction-time checks over parallel lists and optional fields with
+   hidden coupling, but do not add a type, helper or layer beyond what the
+   current example needs; single-use indirection counts against a design.
 3. **Keep code readable and structure discoverable.** Module and type names
    state their phase and concept, so a reader finds where a fact lives
    without searching. Each concept has one home; public surfaces are as

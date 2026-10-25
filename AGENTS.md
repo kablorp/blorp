@@ -173,7 +173,7 @@ When choosing implementation strategies:
 
 - Do not rely on flimsy heuristics. If correctness depends on a distinction, represent it explicitly in the AST/IR/data model, a parser or type-checker rule, or a named configuration point. Avoid guessing from names, shapes, string prefixes, source formatting, or "usually true" patterns unless there is no better representation; if a heuristic is unavoidable, isolate it, document the tradeoff, and cover failure modes with tests.
 - Avoid magic values. Give non-obvious numbers, strings, limits, sentinel values, and protocol constants meaningful names at the narrowest useful scope. If a literal is required by an external format, ABI, wire protocol, or compiler invariant, name it or document that source of truth near the value.
-- Make illegal states unrepresentable, especially in compiler code. Prefer precise variants, phase-specific types, explicit enums, and smart constructors over boolean flag combinations, stringly typed tags, nullable fields with hidden coupling, or comments that describe invariants the type system could enforce. Push validation to construction boundaries so later phases can rely on well-formed inputs.
+- Prefer types that cannot disagree with themselves. A variant with a payload, or a phase-specific product, is worth it when a `Bool` plus an `Option` (or two flags) could be true together in a way that is nonsense. Two empty tags used only as a switch are usually a named `Bool`: the field name is the concept, and a first-time reader should not have to open a type to learn it has two cases and no data. Do not mint a union just to avoid writing `True`/`False`.
 
 ---
 
@@ -188,7 +188,8 @@ main. Review (rule 12) checks this.
 
 - **Work**: the behavior is correct and covered by tests.
 - **Right**: the code follows [`docs/CODE_STYLE.md`](docs/CODE_STYLE.md) and
-  rule 15, and its data model makes illegal states unrepresentable.
+  rule 15, and its data model does not encode the same fact twice in ways
+  that can disagree.
 - **Fast**: optimize afterward, guided by measurement.
 
 Do not bend a design to avoid a cost the compiler imposes today. Measure the
