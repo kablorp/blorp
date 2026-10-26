@@ -195,6 +195,8 @@ Clang links self-built B in normal/diagnostic modes, and B reproduces that C.
 Only B normal is published as `blorp2-<target>`. The explicit self-hosted
 components, selected native e2e cases, process-runtime lifecycle checks,
 strict compiler accounting and ordinary-main strict smoke must pass.
+The per-platform job has a 120-minute limit, with self-hosted components and
+native e2e in separate steps so a slow or failing phase is visible.
 Unported unit/runtime/grammar/tooling and remaining native e2e cases are DEFERRED;
 their sources remain for incremental ports. Qualification metadata must state
 that boundary, without claiming a full native correctness/resource PASS.
