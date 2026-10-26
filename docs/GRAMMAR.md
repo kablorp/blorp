@@ -69,9 +69,10 @@ A bare import selector selects an unambiguous type or function. Type selections
 enable the selected module's local receiver functions through UFCS; named
 function imports enable direct calls and UFCS. `Option(Some, None)` selects a
 fixed union and explicit constructors, while `Option()` selects its type alone.
-`Foo methods_only` enables receiver functions for an independently visible,
-exact Foo type without importing that type or its constructors. The foundation's
-ordinary Bool, Option and Result types and constructors are implicit. Named
+Blorp 2's `Foo methods` (also accepted as `Foo methods_only`) enables receiver
+functions for an independently visible, exact Foo type without importing that
+type or its constructors. The foundation's ordinary Bool, Option and Result
+types and constructors are implicit. Named
 `option: is_some, is_none, get_or, to_result, map` and
 `result: is_ok, map, map_err, and_then` imports use the same function-import syntax
 and enable both direct calls and UFCS. Their ordinary named-callback definitions
