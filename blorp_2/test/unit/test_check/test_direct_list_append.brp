@@ -1,0 +1,262 @@
+import:
+	../../../src/check/check: check, checked_functions
+	../../../src/check/model as Checked
+	../../../src/check/render: render_failure
+	../../../src/namespace/builtins as Builtins
+	../../../src/utils/ids: function_number
+	../../../src/utils/source: module_source, root_module_id, same_source
+	../module_input: parse_modules
+	bool: Bool methods_only
+	int: Int methods_only
+	list: List methods_only
+	option: Option methods_only
+	result: Result methods_only
+	string: String methods_only
+	test: TestSuite
+
+
+private APPEND: String =
+	|pure func append[Element](values: List[Element], value: Element) -> List[Element]:
+	|    builtin("list.append")
+	|
+
+private MAIN: String = "func main() -> Int:\n    0\n"
+
+
+private pure func checked_function(source: String, position: Int) -> Option[Checked.CheckedFunction]:
+	match parse_modules([{ source = source, targets = [] }]):
+		Err(_): None
+		Ok(parsed):
+			match check(parsed):
+				Err(_): None
+				Ok(program): checked_functions(program).functions.get(position)
+
+
+private pure func returned_call(function: Checked.CheckedFunction) -> Option[Checked.CheckedCall]:
+	match function.body:
+		Checked.CheckedValueBody(Checked.ReturnExpression(value)):
+			match value.form:
+				Checked.InvokeFunction(call): Some(call)
+				_: None
+		_: None
+
+
+private pure func append_operands(function: Checked.CheckedFunction, expected: Checked.TypeRef, left_position: Int, right_position: Int) -> Bool:
+	match returned_call(function):
+		Some(call):
+			match (call.target, call.operands):
+				(Checked.RuntimeFunction(Builtins.ListAppend(element)), [Checked.ValueOperand(left), Checked.ValueOperand(right)]):
+					match (left.form, right.form):
+						(Checked.ReadBinding(left_id), Checked.ReadBinding(right_id)):
+							Checked.same_type(element, expected)
+								.and(Checked.same_type(left.value_type, Checked.ListType(expected)))
+								.and(Checked.same_type(right.value_type, expected))
+								.and(Checked.binding_number(left_id).equals(left_position))
+								.and(Checked.binding_number(right_id).equals(right_position))
+						_: False
+				_: False
+		None: False
+
+
+private pure func concrete_call(element_name: String, element: Checked.TypeRef, expression: String) -> Bool:
+	source = "${APPEND}pure func caller(values: List[${element_name}], value: ${element_name}) -> List[${element_name}]:\n    ${expression}\n${MAIN}"
+	match checked_function(source, 1):
+		Some(function): append_operands(function, element, 0, 1)
+		None: False
+
+
+pure func test_direct_concrete_append() -> Bool:
+	concrete_call("Int", Checked.IntType, "append(values, value)")
+
+
+pure func test_receiver_concrete_append() -> Bool:
+	concrete_call("String", Checked.StringType, "values.append(value)")
+
+
+pure func test_nested_element_substitution() -> Bool:
+	concrete_call("List[String]", Checked.ListType(Checked.StringType), "append(values, value)")
+
+
+private pure func generic_call(expression: String) -> Bool:
+	-- The caller element is its second parameter, owned by another declaration.
+	-- Callee parameter position zero must never leak into the checked operation.
+	source = "${APPEND}pure func caller[Ignored, Payload](ignored: Ignored, values: List[Payload], value: Payload) -> List[Payload]:\n    ${expression}\n${MAIN}"
+	match checked_function(source, 1):
+		Some(function):
+			match function.signature.type_parameters:
+				[_, element]: append_operands(function, Checked.ParameterType(element), 1, 2)
+				_: False
+		None: False
+
+
+pure func test_direct_generic_append() -> Bool:
+	generic_call("append(values, value)")
+
+
+pure func test_receiver_generic_append() -> Bool:
+	generic_call("values.append(value)")
+
+
+pure func test_expected_list_type_reaches_the_runtime_operation() -> Bool:
+	source: String =
+		|pure func caller() -> List[Option[String]]:
+		|    append([], None)
+		|
+	match checked_function("${APPEND}${source}${MAIN}", 1):
+		Some(function):
+			match returned_call(function):
+				Some(call):
+					match (call.target, call.operands):
+						(Checked.RuntimeFunction(Builtins.ListAppend(element)), [Checked.ValueOperand(values), Checked.ValueOperand(value)]):
+							match function.signature.return_type.value_type:
+								Checked.ListType(expected):
+									Checked.same_type(element, expected)
+										.and(Checked.same_type(values.value_type, Checked.ListType(expected)))
+										.and(Checked.same_type(value.value_type, expected))
+								_: False
+						_: False
+				None: False
+		None: False
+
+
+pure func test_user_wrapper_retains_its_declared_target() -> Bool:
+	source: String =
+		|pure func wrapper(values: List[Int], value: Int) -> List[Int]:
+		|    append(values, value)
+		|pure func caller(values: List[Int], value: Int) -> List[Int]:
+		|    wrapper(values, value)
+		|
+	match checked_function("${APPEND}${source}${MAIN}", 2):
+		Some(function):
+			match returned_call(function):
+				Some(call):
+					match call.target:
+						Checked.UserFunction(id, []): function_number(id).equals(1)
+						_: False
+				None: False
+		None: False
+
+
+pure func test_named_append_callable_retains_its_declared_wrapper() -> Bool:
+	source: String =
+		|pure func apply(callback: pure (List[Int], Int) -> List[Int], values: List[Int], value: Int) -> List[Int]:
+		|    callback(values, value)
+		|pure func caller(values: List[Int], value: Int) -> List[Int]:
+		|    apply(append, values, value)
+		|
+	match checked_function("${APPEND}${source}${MAIN}", 2):
+		Some(function):
+			match returned_call(function):
+				Some(call):
+					match (call.target, call.operands):
+						(Checked.UserFunction(apply_id, []), [Checked.CallableOperand(_, Checked.NamedCallable(append_id, [element]), _), Checked.ValueOperand(_), Checked.ValueOperand(_)]):
+							function_number(apply_id).equals(1).and(function_number(append_id).equals(0))
+								.and(Checked.same_type(element, Checked.IntType))
+						_: False
+				None: False
+		None: False
+
+
+pure func test_stored_append_callable_retains_its_declared_wrapper() -> Bool:
+	source: String =
+		|pure func stored() -> pure (List[String], String) -> List[String]:
+		|    append
+		|
+	match checked_function("${APPEND}${source}${MAIN}", 1):
+		Some(function):
+			match function.body:
+				Checked.CheckedValueBody(Checked.ReturnExpression(value)):
+					match value.form:
+						Checked.MakeCallable(Checked.NamedCallable(id, [element])):
+							function_number(id).equals(0).and(Checked.same_type(element, Checked.StringType))
+						_: False
+				_: False
+		None: False
+
+
+private pure func rejects(prefix: String, marked: String, suffix: String, message: String, help: String) -> Bool:
+	source = "${prefix}${marked}${suffix}${MAIN}"
+	match parse_modules([{ source = source, targets = [] }]):
+		Err(_): False
+		Ok(parsed):
+			match check(parsed):
+				Ok(_): False
+				Err(failure):
+					diagnostics = render_failure(failure)
+					error = diagnostics.first
+					error.message.equals(message).and(error.help.equals(help))
+						.and(same_source(error.span.source, module_source(root_module_id())))
+						.and(error.span.start.equals(prefix.length()))
+						.and(error.span.end.equals(prefix.length().add(marked.length())))
+						.and(error.note.is_none()).and(diagnostics.remaining.is_empty())
+
+
+pure func test_argument_type_mismatch_still_rejects() -> Bool:
+	prefix = "${APPEND}pure func caller(values: List[Int]) -> List[Int]:\n    append(values, "
+	rejects(prefix, "\"wrong\"", ")\n", "argument type does not match the parameter type", "use an expression of type Int here")
+
+
+pure func test_direct_arity_still_rejects_at_the_function_name() -> Bool:
+	prefix = "${APPEND}pure func caller(values: List[Int]) -> List[Int]:\n    "
+	rejects(prefix, "append", "(values)\n", "argument count does not match the function parameters", "pass one expression for each declared parameter; UFCS supplies the receiver first")
+
+
+pure func test_receiver_arity_still_rejects_at_the_function_name() -> Bool:
+	prefix = "${APPEND}pure func caller(values: List[Int]) -> List[Int]:\n    values."
+	rejects(prefix, "append", "()\n", "argument count does not match the function parameters", "pass one expression for each declared parameter; UFCS supplies the receiver first")
+
+
+private BOUNDED_APPEND: String =
+	|trait Allowed:
+	|    pure func permit(value: Self) -> Int
+	|pure func append[Element: Allowed](values: List[Element], value: Element) -> List[Element]:
+	|    builtin("list.append")
+	|
+
+private BOUND_MESSAGE: String = "type does not satisfy the required trait bound"
+private BOUND_HELP: String = "add the required trait to this function's type parameter bounds, or provide an implementation for the concrete receiver"
+
+
+pure func test_runtime_call_proves_concrete_signature_bounds() -> Bool:
+	prefix = "${BOUNDED_APPEND}pure func caller(values: List[Int], value: Int) -> List[Int]:\n    "
+	rejects(prefix, "append", "(values, value)\n", BOUND_MESSAGE, BOUND_HELP)
+
+
+pure func test_runtime_call_proves_generic_signature_bounds() -> Bool:
+	prefix = "${BOUNDED_APPEND}pure func caller[Payload](values: List[Payload], value: Payload) -> List[Payload]:\n    values."
+	rejects(prefix, "append", "(value)\n", BOUND_MESSAGE, BOUND_HELP)
+
+
+pure func test_runtime_call_accepts_proved_generic_signature_bounds() -> Bool:
+	source: String =
+		|pure func caller[Payload: Allowed](values: List[Payload], value: Payload) -> List[Payload]:
+		|    append(values, value)
+		|
+	match checked_function("${BOUNDED_APPEND}${source}${MAIN}", 1):
+		Some(function):
+			match function.signature.type_parameters:
+				[element]: append_operands(function, Checked.ParameterType(element), 0, 1)
+				_: False
+		None: False
+
+
+tests: TestSuite = {
+	description = "Direct List append checking and generic publication",
+	tests = [
+		("direct concrete call selects runtime append", test_direct_concrete_append),
+		("UFCS concrete call selects runtime append", test_receiver_concrete_append),
+		("nested List element substitutes without callee parameters", test_nested_element_substitution),
+		("direct generic call publishes caller-owned element", test_direct_generic_append),
+		("UFCS generic call publishes caller-owned element", test_receiver_generic_append),
+		("expected List type reaches runtime operation and operands", test_expected_list_type_reaches_the_runtime_operation),
+		("ordinary wrapper call stays declared", test_user_wrapper_retains_its_declared_target),
+		("named callable retains borrowed wrapper", test_named_append_callable_retains_its_declared_wrapper),
+		("stored callable retains borrowed wrapper", test_stored_append_callable_retains_its_declared_wrapper),
+		("mismatched element rejects with exact diagnostic", test_argument_type_mismatch_still_rejects),
+		("direct arity rejects with exact diagnostic", test_direct_arity_still_rejects_at_the_function_name),
+		("UFCS arity rejects with exact diagnostic", test_receiver_arity_still_rejects_at_the_function_name),
+		("runtime target proves concrete signature bounds", test_runtime_call_proves_concrete_signature_bounds),
+		("runtime target proves generic signature bounds", test_runtime_call_proves_generic_signature_bounds),
+		("runtime target accepts caller's proved bounds", test_runtime_call_accepts_proved_generic_signature_bounds),
+	]
+}

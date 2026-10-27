@@ -43,6 +43,10 @@ TARGET_COMPONENT_SOURCES := \
 	blorp_2/test/unit/test_harness/test_self_hosted_reports.brp \
 	blorp_2/test/unit/test_parse/test_discard_propagation.brp \
 	blorp_2/test/unit/test_check/test_discard_propagation.brp \
+	blorp_2/test/unit/test_check/test_direct_list_append.brp \
+	blorp_2/test/unit/test_own/test_list_append.brp \
+	blorp_2/test/unit/test_verify/test_list_append.brp \
+	blorp_2/test/unit/test_emit/test_list_append.brp \
 	blorp_2/test/unit/test_parse/test_run_to_files.brp \
 	blorp_2/test/unit/test_check/test_run_to_files.brp \
 	blorp_2/test/unit/test_specialize/test_run_to_files.brp \

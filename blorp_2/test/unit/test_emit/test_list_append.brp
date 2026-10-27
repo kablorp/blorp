@@ -1,0 +1,88 @@
+import:
+	../../../src/emit/emit: emit
+	../../../src/own/own as Own
+	../../../src/verify/verify: verify
+	../list_append_inputs: input_ids, span, raw_integer_append, raw_append, append_arguments
+	bool: Bool methods_only
+	int: Int methods_only
+	list: List methods_only
+	result: Result methods_only
+	string: String methods_only
+	test: TestSuite
+
+
+-- Match emitted bytes using the target library's existing byte API.
+private pure func occurrences(text: String, pattern: String) -> Int:
+	var position: Int = 0
+	var count: Int = 0
+	while position.add(pattern.length()).less_than_or_equal(text.length()):
+		var matches: Bool = True
+		for index in 0..pattern.length():
+			match (text.byte_at(position.add(index)), pattern.byte_at(index)):
+				(Some(actual), Some(expected)): matches = matches.and(actual.equals(expected))
+				_: matches = False
+		if matches:
+			count = count.add(1)
+		position = position.add(1)
+	count
+
+
+private pure func has_text(text: String, pattern: String) -> Bool:
+	occurrences(text, pattern).greater_than(0)
+
+
+pure func test_consumed_integer_append_selects_transfer_helper() -> Bool:
+	match input_ids():
+		Err(_): False
+		Ok(ids):
+			match verify(raw_integer_append(ids, True)).and_then(emit):
+				Err(_): False
+				Ok(code):
+					has_text(code, "=blorp_list_append_take_left_0_i(blorp_vl_0,blorp_vl_1);")
+						.and(has_text(code, "blorp_list_drop_0_i(blorp_owner_0);").not())
+
+
+pure func test_borrowed_integer_append_selects_copy_helper() -> Bool:
+	match input_ids():
+		Err(_): False
+		Ok(ids):
+			match verify(raw_integer_append(ids, False)).and_then(emit):
+				Err(_): False
+				Ok(code):
+					has_text(code, "=blorp_list_append_0_i(blorp_vl_0,blorp_vl_1);")
+						.and(has_text(code, "blorp_list_drop_0_i(blorp_owner_0);"))
+
+
+pure func test_consumed_managed_append_keeps_element_cleanup() -> Bool:
+	match input_ids():
+		Err(_): False
+		Ok(ids):
+			program = raw_append(ids, append_arguments(ids), [Own.DropOwner(Own.owner_id(1), span(40))])
+			match verify(program).and_then(emit):
+				Err(_): False
+				Ok(code):
+					has_text(code, "=blorp_list_append_take_left_0_s(blorp_vl_0,blorp_vl_1);")
+						.and(has_text(code, "blorp_list_drop_0_s(blorp_owner_0);").not())
+						.and(occurrences(code, "blorp_string_release(blorp_owner_1);").equals(1))
+
+
+pure func test_empty_literal_reserves_no_element_slots() -> Bool:
+	match input_ids():
+		Err(_): False
+		Ok(ids):
+			match verify(raw_integer_append(ids, True)).and_then(emit):
+				Err(_): False
+				Ok(code):
+					has_text(code, "const size_t blorp_vl_0_capacity=0;")
+						.and(has_text(code, "blorp_vl_0->capacity=(size_t)blorp_vl_0_capacity;"))
+
+
+tests: TestSuite = {
+	description = "List append ownership-directed emission",
+	tests = [
+		("empty List literal reserves zero element slots", test_empty_literal_reserves_no_element_slots),
+		("consumed integer List emits transfer helper with ordered operands", test_consumed_integer_append_selects_transfer_helper),
+		("borrowed integer List emits copy helper and old-root cleanup", test_borrowed_integer_append_selects_copy_helper),
+		("managed append transfers List while retaining element cleanup", test_consumed_managed_append_keeps_element_cleanup),
+	]
+}

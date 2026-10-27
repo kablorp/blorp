@@ -59,6 +59,7 @@ static struct blorp_l_0_r0 *leaves(size_t count) {
     assert(root != NULL);
     atomic_init(&root->references, 1);
     root->length = 0;
+    root->capacity = count;
     for (size_t index = 0; index < count; index += 1) {
         root->values[index] = leaf((int64_t)index);
         root->length += 1;

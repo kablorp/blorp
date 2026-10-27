@@ -153,12 +153,29 @@ pure func list_c_type(key: ListElementKey) -> String:
 	"struct blorp_l_${list_suffix(key)}*"
 
 
+-- One shared slot policy; callers supply the concrete root/element byte limit.
+-- Use the same ordinary linkage as other emitted List runtime utilities: a
+-- program may need only exact-sized constructors, leaving growth unused.
+LIST_CAPACITY_RUNTIME: String =
+	raw
+		|enum {BLORP_LIST_DEFAULT_CAPACITY=4};
+		|size_t blorp_list_capacity(size_t current,size_t required,size_t maximum){
+		|if((uintmax_t)maximum>(uintmax_t)INT64_MAX)maximum=(size_t)INT64_MAX;
+		|if(current>maximum||required>maximum)abort();
+		|size_t capacity=current;
+		|if(capacity<BLORP_LIST_DEFAULT_CAPACITY)capacity=maximum<BLORP_LIST_DEFAULT_CAPACITY?maximum:BLORP_LIST_DEFAULT_CAPACITY;
+		|while(capacity<required)capacity=capacity>maximum/2?maximum:capacity*2;
+		|return capacity;
+		|}
+		|
+
+
 -- A fresh root named `name` with `count` slots, published empty; callers
 -- initialize each slot through list_slot_store so length never exceeds
 -- initialized storage. Helpers and inline literal construction share it.
 pure func list_root_allocation(declaration: String, name: String, count: String) -> String:
 	"${declaration} ${name}=blorp_memory_allocate(sizeof *${name}+(size_t)${count}*sizeof *${name}->values);"
-		.concat("if(!${name})abort();atomic_init(&${name}->references,1);${name}->length=0;")
+		.concat("if(!${name})abort();atomic_init(&${name}->references,1);${name}->length=0;${name}->capacity=(size_t)${count};")
 
 
 private pure func allocate_root(type_name: String, count: String) -> String:
@@ -185,7 +202,7 @@ pure func list_runtime(
 ) -> String:
 	suffix = list_suffix(key)
 	type_name = list_c_type(key)
-	"struct blorp_l_${suffix}{atomic_size_t references;int64_t length;${element_type} values[];};"
+	"struct blorp_l_${suffix}{atomic_size_t references;int64_t length;size_t capacity;${element_type} values[];};"
 		.concat("void blorp_list_dup_${suffix}(${type_name} value){atomic_fetch_add_explicit(&value->references,1,memory_order_relaxed);}")
 		.concat("void blorp_list_drop_${suffix}(${type_name} value){")
 		.concat("if(atomic_fetch_sub_explicit(&value->references,1,memory_order_acq_rel)!=1)return;")
@@ -217,11 +234,10 @@ pure func list_update_name(update: ListUpdate, key: ListElementKey) -> String:
 	prefix.concat(list_suffix(key))
 
 
--- Updates borrow their inputs and build one fresh root: unmanaged slots are
--- copied and every stored occurrence, surviving or replacement, is acquired.
--- Old roots keep every alias. `set` outside the range copies unchanged and
--- reuses an allocation size that already succeeded; `append` and `concat`
--- check that `length` stays within int64_t and the allocation within size_t.
+-- Borrowed updates copy live slots, acquiring every stored occurrence.
+-- Consumed append checks uniqueness before resizing; relocation preserves the
+-- old slots' obligations. `set` outside the range copies unchanged. Growing
+-- outputs check int64_t length and size_t storage before arithmetic.
 pure func list_update_runtime(
 	update: ListUpdate,
 	key: ListElementKey,
@@ -240,6 +256,14 @@ pure func list_update_runtime(
 				.concat("${allocate_root(type_name, "(count+1)")}for(uint64_t index=0;index<count;index++){")
 				.concat("${element_type} element=values->values[index];${store_occurrence(acquire, "index")}}${element_type} element=value;")
 				.concat("${store_occurrence(acquire, "count")}return result;}")
+				.concat("${type_name} blorp_list_append_take_left_${suffix}(${type_name} values,${element_type} value){")
+				.concat("if(atomic_load_explicit(&values->references,memory_order_acquire)!=1){")
+				.concat("${type_name} result=${name}(values,value);blorp_list_drop_${suffix}(values);return result;}")
+				.concat("const size_t count=(size_t)values->length;if(count>=(uintmax_t)INT64_MAX||count>=${capacity})abort();")
+				.concat("if(count==values->capacity){const size_t capacity=blorp_list_capacity(values->capacity,count+1,${capacity});")
+				.concat("${type_name} grown=blorp_memory_resize(values,sizeof *values+capacity*sizeof *values->values);if(!grown)abort();")
+				.concat("values=grown;values->capacity=capacity;}${element_type} element=value;${acquire}")
+				.concat(list_slot_store("values", "count", "element")).concat("return values;}")
 		SetUpdate:
 			"${type_name} ${name}(${borrowed}values,int64_t index,${element_type} value){"
 				.concat("const uint64_t count=(uint64_t)values->length;")
@@ -270,7 +294,7 @@ pure func arguments_runtime() -> String:
 		|if(count>(SIZE_MAX-sizeof(struct blorp_l_0_s))/sizeof(struct blorp_string *)){abort();}
 		|struct blorp_l_0_s *result=blorp_memory_allocate(sizeof *result+count*sizeof *result->values);
 		|if(result==NULL){abort();}
-		|atomic_init(&result->references,1);result->length=0;
+		|atomic_init(&result->references,1);result->length=0;result->capacity=count;
 		|for(size_t index=0;index<count;index++){
 		|const size_t length=strlen(argv[index]);
 		|if(length>(size_t)INT64_MAX||length>SIZE_MAX-sizeof(struct blorp_string)-1){abort();}

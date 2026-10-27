@@ -1,0 +1,151 @@
+import:
+    ../../src/emit/emit: aggregate_runtime
+    ../../src/own/own: own
+    ../../src/verify/verify: verify, verified_contents, VerifiedProgram
+    ../../src/specialize/specialize as Concrete
+    ../../src/runtime/memory: MEMORY_RUNTIME
+    ../../src/runtime/string: string_runtime
+    ../unit/list_append_inputs: lowered
+    ../e2e/self_hosted_reports: verify_accounting
+    process: run_to_files
+    system: read_file, write_file
+    io: print_error
+    test: TestSuite
+    string: String methods_only
+    int: Int methods_only
+    bool: and
+    result: Result methods_only
+
+
+-- Shared with the native probe's EXPECTED_CAPACITY_ABORT status.
+private EXPECTED_CAPACITY_ABORT: Int = 73
+
+
+-- Only the public phases establish the concrete aggregate helpers. The C probe
+-- includes their runtime fragment and never a generated language function.
+private SOURCE: String =
+    |fixed record Entry { text: String }
+    |fixed record Point { number: Int }
+    |fixed union Choice:
+    |    Text(String)
+    |    Empty
+    |pure func repeat[T](element: T, count: Int) -> List[T]:
+    |    builtin("list.repeat")
+    |pure func append[T](values: List[T], element: T) -> List[T]:
+    |    builtin("list.append")
+    |pure func set[T](values: List[T], index: Int, element: T) -> List[T]:
+    |    builtin("list.set")
+    |pure func concat[T](left: List[T], right: List[T]) -> List[T]:
+    |    builtin("list.concat")
+    |pure func rest[T](values: List[T]) -> List[T]:
+    |    match values:
+    |        []: []
+    |        [_, ...remaining]: remaining
+    |pure func identity() -> Int:
+    |    0
+    |func main(args: List[String]) -> Int:
+    |    entry: Entry = { text = "text" }
+    |    point: Point = { number = 1 }
+    |    entries = append(repeat(entry, 0), entry)
+    |    points = append(repeat(point, 0), point)
+    |    choices: List[Choice] = append(repeat(Text("text"), 0), Text("other"))
+    |    ints = append(repeat(0, 0), 1)
+    |    replaced = set(ints, 0, 2)
+    |    joined = concat(ints, ints)
+    |    texts = append(repeat("text", 0), "other")
+    |    nested = append(repeat(texts, 0), texts)
+    |    units = append(repeat(void, 0), void)
+    |    callbacks = append(repeat(identity, 0), identity)
+    |    tail = rest(texts)
+    |    0
+    |
+
+
+-- The probe's concrete C names are admitted only after this typed catalogue.
+private pure func catalogue(program: VerifiedProgram) -> Bool:
+    contents = verified_contents(program)
+    match (contents.records, contents.unions):
+        ([entry, point], [choice]):
+            match ((entry, Concrete.record_fields(entry)), (point, Concrete.record_fields(point)), (choice, Concrete.union_variants(choice))):
+                ((Concrete.CountedFields(_), [Concrete.StringType]), (Concrete.InlineFields(_), [Concrete.IntType]), (Concrete.OwningCases(_), [[Concrete.StringType], []])): True
+                _: False
+        _: False
+
+
+private func ready(c_compiler: String, directory: String) -> Result[String, String]:
+    program ?= lowered(SOURCE).and_then(own).and_then(verify).map_err(pure func(error): error.message.add("; ").add(error.help))
+    _: Void ?= if catalogue(program):
+        Ok(void)
+    else:
+        Err("list runtime concrete catalogue differs")
+    aggregates ?= aggregate_runtime(program).map_err(pure func(error): error.message.add("; ").add(error.help))
+    _ ?= write_file(directory.add("/list_memory.c"), MEMORY_RUNTIME)
+    _ ?= write_file(directory.add("/list_values.c"), string_runtime().add(aggregates).add("\n"))
+    executable = directory.add("/list_reuse_probe")
+    prefix = directory.add("/list-reuse-build")
+    status ?= run_to_files(c_compiler, ["-std=c11", "-O0", "-Wall", "-Wextra", "-Werror", "-pedantic", "-fsanitize=address,undefined", "-fno-sanitize-recover=all", "-DBLORP_MEMORY_DIAGNOSTICS=1", "-I", directory, "blorp_2/test/runtime/fixtures/list_reuse_test.c", "-o", executable], prefix.add(".out"), prefix.add(".err"), 600000)
+    out ?= read_file(prefix.add(".out"))
+    err ?= read_file(prefix.add(".err"))
+    if and(status.equals(0), and(out.equals(""), err.equals(""))):
+        Ok(executable)
+    else:
+        Err("list reuse native build: ".add(err))
+
+
+private func probe(executable: String, directory: String, name: String) -> Bool:
+    prefix = directory.add("/list-reuse-").add(name)
+    result: Result[Void, String] = match run_to_files("/usr/bin/env", ["-u", "BLORP_MEMORY_STATS", "BLORP_LEAK_CHECK=strict", executable, name], prefix.add(".out"), prefix.add(".err"), 10000):
+        Err(error): Err(error)
+        Ok(status):
+            match read_file(prefix.add(".out")):
+                Err(error): Err(error)
+                Ok(out):
+                    match read_file(prefix.add(".err")):
+                        Err(error): Err(error)
+                        Ok(err):
+                            if and(status.equals(0), out.equals("")):
+                                verify_accounting(err, False)
+                            else:
+                                Err("list reuse ".add(name).add(": ").add(err))
+    match result:
+        Ok(_): True
+        Err(error):
+            print_error(error)
+            False
+
+
+-- The C probe maps SIGABRT to this fixed status before invoking only the
+-- arithmetic helper. A normal return and any other signal fail this oracle.
+private func rejected_capacity(executable: String, directory: String, mode: String) -> Bool:
+    prefix = directory.add("/list-reuse-").add(mode)
+    match run_to_files(executable, [mode], prefix.add(".out"), prefix.add(".err"), 10000):
+        Err(error):
+            print_error(error)
+            False
+        Ok(status):
+            match (read_file(prefix.add(".out")), read_file(prefix.add(".err"))):
+                (Ok(out), Ok(err)): and(status.equals(EXPECTED_CAPACITY_ABORT), and(out.equals(""), err.equals("")))
+                _: False
+
+
+func suite(c_compiler: String, directory: String) -> TestSuite:
+    match ready(c_compiler, directory):
+        Err(error):
+            print_error(error)
+            { description = "List reuse setup", tests = [("native runtime probe builds", func(): False)] }
+        Ok(executable):
+            {
+                description = "List consumed append runtime",
+                tests = [
+                    ("capacity boundaries 0 1 3 4 5 8 9", func(): probe(executable, directory, "boundaries")),
+                    ("unique relocation preserves child obligations", func(): probe(executable, directory, "strings")),
+                    ("shared roots preserve aliases and acquire once", func(): probe(executable, directory, "shared")),
+                    ("nested root occurrence remains independently owned", func(): probe(executable, directory, "nested")),
+                    ("inline record slots move by value", func(): probe(executable, directory, "inline")),
+                    ("managed records and owning unions retain exact children", func(): probe(executable, directory, "managed")),
+                    ("callable environments and Void slots", func(): probe(executable, directory, "callable")),
+                    ("capacity clamps to byte and Int64 bounds", func(): probe(executable, directory, "bounds")),
+                    ("required capacity beyond byte limit aborts", func(): rejected_capacity(executable, directory, "required-overflow")),
+                    ("invalid current capacity aborts before growth", func(): rejected_capacity(executable, directory, "current-overflow")),
+                ]
+            }

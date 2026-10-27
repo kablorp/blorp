@@ -682,6 +682,7 @@ The [existing text suite](test/unit/test_utils/test_text.brp) is the first examp
 
 `make -C blorp_2 test-e2e` runs Blorp TestSuites for selected native cases: return
 zero, return 23, exact text output, discard propagation with managed payloads,
+List growth with shared snapshots and managed children, a literal-only List,
 and rejected compilation with an existing output preserved. Each accepted
 fixture retains its ordinary main. Its unchanged
 emitted C links into separate normal and strict-memory executables with C11,
@@ -2322,10 +2323,13 @@ otherwise. Zero, Void, an empty String and a nullary union case are valid Some
 payloads. Retaining a List root does not acquire its children again; its final
 release destroys each initialized slot exactly once.
 
-`append`, `set` and `concat` borrow their inputs and return a fresh owned
-List; every old alias keeps its original elements. Each stored occurrence of
-the result, surviving or replacement, is acquired independently, so one
-managed value may appear in both the input and the result. `set` with a
+`append`, `set` and `concat` return an owned List; every old alias keeps its
+original elements. Direct `append` calls may transfer a last-used List owner,
+verified independently before emission. A unique transferred root reuses spare
+capacity and grows geometrically without acquiring/dropping existing children;
+the newly appended occurrence is acquired once. Shared roots copy. Ordinary
+parameters and named/stored callable wrappers still borrow. `set` and `concat`
+currently borrow and copy every stored result occurrence. `set` with a
 negative or out-of-range index returns an unchanged value; `append` and
 `concat` always produce the longer List. The runtime helper for an update
 exists only where its operation is called.
@@ -2336,8 +2340,13 @@ indices. These names match the host library so the same compiler source can
 be compiled by both compilers. A future coordinated rename to checked `set`
 and no-op `set_or_keep` must update both libraries and all callers together.
 
-A list literal `[a, b]` constructs one fresh root of exactly n slots inline
-at its site, storing each element once; `[x, x]` acquires `x` twice, as a
+A list literal `[a, b]` constructs one fresh root of exactly n slots inline at
+its site, including a header-only `[]` with zero element slots. First growth
+from zero reserves four slots when permitted, then buffers grow geometrically,
+capped by Int64 length and the concrete allocation limit. Known-size
+repeat/argv/copy results retain exact capacities, including zero. Only
+initialized slots are read or destroyed. Each element is stored
+once; `[x, x]` acquires `x` twice, as a
 variant payload would. Every element must have one type: the first element
 decides it, and a later element of another type is rejected at that element
 (`list elements must have one type: element 2 is Float, element 1 is Int`).

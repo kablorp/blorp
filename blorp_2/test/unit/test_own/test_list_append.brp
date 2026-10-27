@@ -1,0 +1,197 @@
+import:
+	../../../src/lower/lower as Lower
+	../../../src/namespace/builtins as Builtins
+	../../../src/own/own as Own
+	../../../src/specialize/specialize as Concrete
+	../../../src/verify/verify: verify
+	../list_append_inputs: input_ids, lowered_function, parameter, runtime, integer, span, child, empty_list, consumed_appends, no_consumed_drop, owned_source, program_consumed, program_appends
+	int: Int methods_only
+	bool: Bool methods_only
+	list: List methods_only
+	string: String methods_only
+	result: Result methods_only
+	test: TestSuite
+
+
+pure func test_local_last_use_transfers_without_old_drop() -> Bool:
+	match input_ids():
+		Err(_): False
+		Ok(ids):
+			definitions = [empty_list(ids.first, Concrete.StringType), child(ids.second),
+				runtime(ids.third, Builtins.ListAppend(Concrete.StringType), [ids.first, ids.second], Concrete.ListType(Concrete.StringType), 30)]
+			match Own.insert_function(lowered_function(definitions, ids.third, [], Concrete.ListType(Concrete.StringType)), [], []):
+				Err(_): False
+				Ok(owned): consumed_appends(owned.operations).equals(1).and(no_consumed_drop(owned.operations))
+
+
+pure func test_parameter_keeps_borrowed_contract() -> Bool:
+	match input_ids():
+		Err(_): False
+		Ok(ids):
+			definitions = [parameter(ids.first, Concrete.ListType(Concrete.StringType)), child(ids.second),
+				runtime(ids.third, Builtins.ListAppend(Concrete.StringType), [ids.first, ids.second], Concrete.ListType(Concrete.StringType), 30)]
+			match Own.insert_function(lowered_function(definitions, ids.third, [Concrete.ListType(Concrete.StringType)], Concrete.ListType(Concrete.StringType)), [], []):
+				Err(_): False
+				Ok(owned): consumed_appends(owned.operations).equals(0)
+
+
+pure func test_direct_loop_consumes_carried_list() -> Bool:
+	body: String =
+		|pure func collect() -> List[Int]:
+		|    var values: List[Int] = []
+		|    while less_than(length(values), 12):
+		|        values = append(values, 7)
+		|    values
+		|func main() -> Int:
+		|    unused = collect()
+		|    0
+		|
+	match owned_source(body):
+		Err(_): False
+		Ok(program): program_consumed(program).equals(1).and(program_appends(program).equals(1)).and(verify(program).is_ok()).and(program.functions.all(pure func(owned): no_consumed_drop(owned.operations)))
+
+
+private pure func source_consumes(body: String, expected: Int) -> Bool:
+	match owned_source(body):
+		Err(_): False
+		Ok(program): program_consumed(program).equals(expected).and(program_appends(program).equals(1)).and(verify(program).is_ok()).and(program.functions.all(pure func(owned): no_consumed_drop(owned.operations)))
+
+
+pure func test_later_snapshot_read_keeps_input_borrowed() -> Bool:
+	match input_ids():
+		Err(_): False
+		Ok(ids):
+			definitions = [empty_list(ids.first, Concrete.StringType), child(ids.second),
+				runtime(ids.third, Builtins.ListAppend(Concrete.StringType), [ids.first, ids.second], Concrete.ListType(Concrete.StringType), 30),
+				runtime(ids.fourth, Builtins.ListLength(Concrete.StringType), [ids.first], Concrete.IntType, 40)]
+			match Own.insert_function(lowered_function(definitions, ids.fourth, [], Concrete.IntType), [], []):
+				Err(_): False
+				Ok(owned): consumed_appends(owned.operations).equals(0)
+
+
+pure func test_captured_outer_owner_stays_borrowed() -> Bool:
+	body: String =
+		|pure func collect() -> List[Int]:
+		|    original: List[Int] = []
+		|    var again: Bool = True
+		|    while again:
+		|        unused = append(original, 7)
+		|        again = False
+		|    original
+		|func main() -> Int:
+		|    unused = collect()
+		|    0
+		|
+	source_consumes(body, 0)
+
+
+pure func test_continuing_join_keeps_enclosing_owner() -> Bool:
+	body: String =
+		|func main() -> Int:
+		|    original: List[Int] = []
+		|    flag: Bool = True
+		|    selected = if flag:
+		|        append(original, 7)
+		|    else:
+		|        original
+		|    length(original)
+		|
+	source_consumes(body, 0)
+
+
+pure func test_nearest_nested_loop_consumes_its_accumulator() -> Bool:
+	body: String =
+		|pure func collect() -> List[Int]:
+		|    var result: List[Int] = []
+		|    var again: Bool = True
+		|    while again:
+		|        var local: List[Int] = []
+		|        while less_than(length(local), 12):
+		|            local = append(local, 7)
+		|        result = local
+		|        again = False
+		|    result
+		|func main() -> Int:
+		|    unused = collect()
+		|    0
+		|
+	source_consumes(body, 1)
+
+
+pure func test_dependent_child_keeps_root_borrowed() -> Bool:
+	body: String =
+		|pure func collect() -> List[List[String]]:
+		|    values = [["child"]]
+		|    match values:
+		|        [first, ..._]: append(values, first)
+		|        []: values
+		|func main() -> Int:
+		|    unused = collect()
+		|    0
+		|
+	source_consumes(body, 0)
+
+
+-- Selection establishes projection bounds upstream. This direct Lower input
+-- isolates insertion's RHS dependency decision; it is not a verifier oracle.
+pure func test_rhs_payload_dependency_prevents_root_consumption() -> Bool:
+	match input_ids():
+		Err(_): False
+		Ok(ids):
+			definitions: List[Lower.ValueDefinition] = [
+				child(ids.first),
+				{ id = ids.second, value_type = Concrete.ListType(Concrete.StringType), operation = Lower.ConstructListValue([ids.first]), span = span(20) },
+				{ id = ids.third, value_type = Concrete.StringType, operation = Lower.ListElementValue(0, ids.second), span = span(25) },
+				runtime(ids.fourth, Builtins.ListAppend(Concrete.StringType), [ids.second, ids.third], Concrete.ListType(Concrete.StringType), 30),
+			]
+			match Own.insert_function(lowered_function(definitions, ids.fourth, [], Concrete.ListType(Concrete.StringType)), [], []):
+				Err(_): False
+				Ok(owned):
+					var borrowed: Bool = False
+					for operation in owned.operations:
+						match operation:
+							Own.DefineValue(definition):
+								match definition.operation:
+									Own.CallDefinition(Concrete.RuntimeFunction(Builtins.ListAppend(_)), [Own.BorrowedArgument(left), Own.BorrowedArgument(right)]):
+										match (left.source, right.source):
+											(Own.OwnerBorrow(_), Own.PayloadBorrow(parent)):
+												borrowed = Lower.value_number(left.value).equals(Lower.value_number(ids.second))
+													.and(Lower.value_number(right.value).equals(Lower.value_number(ids.third)))
+													.and(Lower.value_number(parent).equals(Lower.value_number(ids.second)))
+											_: void
+									_: void
+							_: void
+					borrowed.and(consumed_appends(owned.operations).equals(0))
+
+
+pure func test_nested_payload_root_remains_borrowed() -> Bool:
+	match input_ids():
+		Err(_): False
+		Ok(ids):
+			definitions: List[Lower.ValueDefinition] = [
+				empty_list(ids.first, Concrete.ListType(Concrete.ListType(Concrete.StringType))),
+				{ id = ids.second, value_type = Concrete.ListType(Concrete.ListType(Concrete.StringType)), operation = Lower.ListElementValue(0, ids.first), span = span(15) },
+				{ id = ids.third, value_type = Concrete.ListType(Concrete.StringType), operation = Lower.ListElementValue(0, ids.second), span = span(20) },
+				child(ids.fourth),
+				runtime(ids.fifth, Builtins.ListAppend(Concrete.StringType), [ids.third, ids.fourth], Concrete.ListType(Concrete.StringType), 30),
+			]
+			match Own.insert_function(lowered_function(definitions, ids.fifth, [], Concrete.ListType(Concrete.StringType)), [], []):
+				Err(_): False
+				Ok(owned): consumed_appends(owned.operations).equals(0)
+
+
+tests: TestSuite = {
+	description = "List append ownership insertion",
+	tests = [
+		("later snapshot use keeps its old List root borrowed", test_later_snapshot_read_keeps_input_borrowed),
+		("captured outer-loop List stays borrowed", test_captured_outer_owner_stays_borrowed),
+		("continuing join preserves enclosing List", test_continuing_join_keeps_enclosing_owner),
+		("nearest nested loop consumes its own List", test_nearest_nested_loop_consumes_its_accumulator),
+		("child derived from consumed List prevents transfer", test_dependent_child_keeps_root_borrowed),
+		("RHS payload dependency prevents consuming its List root", test_rhs_payload_dependency_prevents_root_consumption),
+		("nested payload List cannot transfer its ancestor owner", test_nested_payload_root_remains_borrowed),
+		("last local use transfers List owner without a second drop", test_local_last_use_transfers_without_old_drop),
+		("borrowed List parameter remains borrowed", test_parameter_keeps_borrowed_contract),
+		("direct accumulator loop consumes its carried List", test_direct_loop_consumes_carried_list),
+	]
+}

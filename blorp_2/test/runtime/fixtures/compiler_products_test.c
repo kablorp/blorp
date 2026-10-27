@@ -80,6 +80,7 @@ static struct blorp_l_0_r0 *children(size_t count) {
     struct blorp_l_0_r0 *result = product_allocate(sizeof *result + count * sizeof *result->values);
     atomic_init(&result->references, 1);
     result->length = 0;
+    result->capacity = count;
     return result;
 }
 

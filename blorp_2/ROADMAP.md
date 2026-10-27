@@ -129,6 +129,7 @@ not a portable nesting threshold or a product-destruction proof.
 | [M0](#m0-foundation-closeout) | Re-cut, perf fixes, parser statement loop, fixpoint script, parity table | Landed. M3 owns the recorded managed-value call limits. |
 | [M1a](#m1a-surface-syntax-parity) | Layout and parsed source syntax | Pure lambda and callback syntax is implemented; current source-frontier evidence remains separate. |
 | [ML](#ml-list-construction) | `append`, `set`, `concat`, list literal | Done. Checked `set_index` is an ordinary target-library wrapper. |
+| [List buffer reuse](#list-buffer-reuse-roadmap) | Ownership-aware updates, four-slot first growth, doubling and simpler library loops | L1 exact-literal policy under validation on `codex/list-buffer-reuse`; later milestones pending. |
 | [M1b](#m1b-names-and-the-foundation) | Namespace: private, aliases, qualified names, designated `Bool`/`Option`/`Result` | Parts A and B done; control-flow consumers follow in M2/M3. |
 | [M5](#m5-constants) | Literal scalar/String constants | Implemented. Source construction functions replace the need for record/opaque constants and initializer dependencies. |
 | [M2](#m2-the-join) | Restricted control positions, outer-variable joins, ordinary Boolean calls, `?=` and annotations | Joins, Result propagation, annotations, ordinary Boolean calls and restricted value/statement `if` implemented in integration; acceptance pending. General operand controls remain deferred. |
@@ -382,6 +383,406 @@ ownership verified, C read, ceilings measured; see the
 returns `Option[List[T]]` through an ordinary `get`/match wrapper, matching the
 host interface. A coordinated rename to checked `set` and no-op `set_or_keep`
 must update both libraries and all callers together.
+
+## List buffer reuse roadmap
+
+### Problem and established boundaries
+
+Status: L1 exact-literal implementation approved, 2026-10-26; L2 is next.
+The earlier eager four-slot empty-literal variant passed
+functional gates but exceeded the RSS investigation threshold; its measurements
+remain recorded below. Implement in order, with code-reviewer and
+test-runner approval at every mergeable milestone. This section is the handoff;
+do not introduce companion planning documents.
+
+`src/runtime/list.brp:185` emits roots containing a reference count, length and
+inline element slots, but no capacity. Its update helpers at line 226 borrow
+their inputs, allocate exactly the output size and acquire every copied
+managed occurrence. This ordinary compiler-source loop therefore copies
+`n * (n - 1) / 2` old slots:
+
+```blorp
+pure func collect(count: Int) -> List[Int]:
+    var values: List[Int] = []
+    for index in 0..count:
+        values = values.append(index)
+    values
+```
+
+The retained workload is `benchmarks/blorp_2/list_ops.brp`; reproduce with the
+Blorp 2 compiler directly (same native flags for baseline and candidate):
+
+```bash
+mkdir -p build/list-buffer-reuse
+blorp_2/build/compiler --library-root blorp_2/standard_library \
+  benchmarks/blorp_2/list_ops.brp build/list-buffer-reuse/list_ops.c
+clang -O2 build/list-buffer-reuse/list_ops.c -lm -lpthread \
+  -o build/list-buffer-reuse/list_ops
+build/list-buffer-reuse/list_ops
+```
+
+This is the existing benchmark's ordinary main, not a new timing harness.
+See `benchmarks/README.md` for its broader comparison route. Compiler token accumulation
+in `src/lex/lex.brp` is a real consumer of the same pattern. Assignment shares
+a counted root; updates, rather than assignment, cause these element copies.
+
+The legacy runtime confirms the intended precedent:
+`blorp/src/lib/runtime/native/runtime.c:8004` defines default capacity four;
+`blorp_list_append` doubles full buffers, and `blorp_list_move_to_capacity`
+relocates unique slots without retaining/dropping their children. Read these
+as reference, not code to port: legacy storage modes and ownership ABI differ.
+
+Blorp 2 already has the required architecture for Strings:
+`check/callables.brp:118` maps an accepted String builtin declaration's direct
+calls to `RuntimeTarget`, while callable values retain the borrowed wrapper;
+`own/own.brp:1015` selects a safe last-use transfer;
+`verify/verify.brp:580` and `discharge_string_argument` check it independently;
+`emit/emit.brp:1046` selects the consuming helper;
+`runtime/string_concat.brp:25` implements geometric capacity and shared fallback.
+Use the existing `ConsumedArgument(ValueId, OwnerId)` representation for Lists.
+Do not add consumption facts to parsed/checked expressions or type inference.
+
+### Capacity and ownership contract
+
+Four means **four element slots**, not four bytes or four times the current
+length. Name the internal constant `BLORP_LIST_DEFAULT_CAPACITY`. Every literal
+reserves exactly its known element count: `[]` owns a counted header with zero
+element slots. Growth from zero starts at `min(4, maximum)`; growth from an
+exact-sized nonempty root starts at `max(current, min(4, maximum))` and doubles
+until sufficient. Thus an append-built buffer grows `4, 8, 16, 32, ...` after
+its first append. Reserve enough for a whole concat in one growth operation.
+`repeat`, argv and borrowed-copy results also allocate their known size directly,
+including zero. This avoids reserving large inline elements for retained empty
+values. No public reservation API is needed. This explicitly revises the initial
+proposal that `[]` eagerly reserve four slots.
+Emit the shared constant once, not once per concrete element helper.
+
+The emitted structure changes only at the runtime boundary. Schematic C:
+
+```c
+/* Before: */
+struct list_E { atomic_size_t references; int64_t length; E values[]; };
+/* After: every constructor initializes capacity, even exact-sized roots. */
+struct list_E {
+    atomic_size_t references;
+    int64_t length;
+    size_t capacity;
+    E values[];
+};
+```
+
+Keep `0 <= length <= capacity <= min(INT64_MAX, byte-size limit)`; only
+`[0, length)` contains initialized owned
+occurrences. Destruction never visits spare capacity. Check required length
+against both `INT64_MAX` and `(SIZE_MAX - sizeof(root)) / sizeof(E)` **before**
+addition, multiplication or doubling. Cap doubling at that maximum; tiny
+theoretical maximum capacities must not make the default four invalid.
+Reuse the existing allocator/resize authority, including strict accounting.
+Relocating unique slots transfers their existing obligations; it must not run
+the old root's element destructor or acquire each element again.
+
+There are two independent permissions:
+
+1. Ownership insertion proves a particular owner can transfer at this call;
+   all remaining arguments/borrows must remain valid after the transfer.
+2. The runtime checks the transferred root's reference count. Only count one
+   permits in-place mutation; independently counted aliases require a copy.
+
+Reference count one alone does not make a borrowed parameter mutable. General
+function parameters, record fields and stored-callable wrappers continue to
+borrow. No interprocedural consuming ABI or record-update optimization is part
+of this roadmap. Record missed opportunities for later measured work.
+
+The superseded eager-four experiment passed 251 component checks, 43 native/
+runtime checks, 592-fixture parity and A/B/C source identity. Its measured
+self-compilation costs against actual self-built B at `7f0e8c9a6` were:
+
+| Metric | Baseline | Eager-four candidate | Change |
+| --- | ---: | ---: | ---: |
+| Allocations | 30,423,838 | 29,782,037 | −2.11% |
+| Normal retired instructions, minimum of three | 1,098,945,173,101 | 1,055,666,253,468 | −3.94% |
+| Normal peak RSS, maximum of three bytes | 317,685,760 | 351,993,856 | +10.80% |
+| Diagnostic peak RSS, bytes | 315,047,936 | 356,663,296 | +13.21% |
+
+These serial `-O0` compiler runs used one frozen final input/library, normal
+warmups and three samples, then one separate strict diagnostic sample. All
+strict reports balanced; emitted C matched within each compiler version.
+The 4,096-element native append workload (`-O2`) reduced logical allocations
+4,099→4 and minimum instructions 26,671,596→11,697,239 (−56.14%), with identical
+ordinary-main stdout. Native totals include process startup. Forced-relocation
+runtime tests separately establish linear moved slots and no old-child RC churn.
+Production grew 37 net lines; tests grew 1,437 lines, counted separately.
+
+Lower instructions do not waive the repeatable whole-compiler RSS increase.
+This variant is not accepted. The exact-sized literal revision below resolves
+that threshold miss in the measured workload; the historical comparison does
+not isolate how much peak memory was caused by padding.
+Raw commands, hashes and samples remain in ignored
+`build/list-buffer-reuse/measurement/{compilation-final,native-final}` with
+`eager4-results.json`; do not reuse those as final exact-literal results.
+
+### L1 exact-literal validation
+
+The final policy passed 252 component checks across 41 suites, 43 runtime/native
+checks and all 592 A/B fixture comparisons (497 successes and 95 rejections).
+A, B and C emit identical compiler C (`d3269ecf4de2`); all 43 strict accounting
+reports balance with zero leaks. The 1,249 proof inputs remained unchanged.
+Two independent source and final evidence reviews approve the change with no
+issues; the test-runner and performance reviews also approve it.
+
+Fresh serial measurements compare the original self-built B at `7f0e8c9a6`
+with the proved exact-literal B against one frozen final source/library. Both
+compilers use Apple Clang 21 at `-O0`, with one normal warmup, three normal
+samples and one separate strict sample per workload:
+
+| Whole self-compilation metric | Baseline | Exact-literal candidate | Change |
+| --- | ---: | ---: | ---: |
+| Allocations | 30,420,198 | 29,775,893 | −2.12% |
+| Normal retired instructions, minimum of three | 1,097,350,589,227 | 1,053,979,299,199 | −3.95% |
+| Normal peak RSS, maximum of three bytes | 324,747,264 | 335,200,256 | +3.22% |
+| Diagnostic peak RSS, bytes | 321,388,544 | 339,951,616 | +5.78% |
+
+Normal RSS ranges overlap: baseline 321,912,832–324,747,264 bytes; candidate
+322,813,952–335,200,256. Both normal and diagnostic increases are below the
+10% investigation threshold. The `return 0` compiler control reduced allocations
+1.17% and normal instructions 1.35%, with normal peak RSS up 0.66%.
+
+Native append controls at 1,024 / 2,048 / 4,096 elements reduce logical
+allocations 1,027 / 2,051 / 4,099 → 4 / 4 / 4. The largest control reduces
+normal instructions 26,853,580 → 11,799,614 (−56.06%). These totals include
+process startup; forced-relocation runtime tests separately verify growth work
+and preservation of old child obligations. The unchanged retained `list_ops.brp`
+main reduces allocations 139,923,218 → 134,893,722 and normal instructions
+111,225,998,056 → 67,391,995,532 (−39.41%). All six checksum lines match.
+Native executables use the same `-O2` warmup/three-normal/strict protocol.
+
+Production grows 34 net lines (44,684 → 44,718); tests grow 1,449 lines
+(142,678 → 144,127), counted separately. Every strict measurement balances;
+normal and diagnostic C match within each compiler version. Intentional
+baseline/candidate code generation differs. All 85 compiler and 120 native
+artifact/input hash guards match. Raw samples, commands, flags and provenance
+are under ignored `build/list-buffer-reuse/exact-literals/measurement/`; the
+maintained correctness proof is under
+`build/list-buffer-reuse/exact-literals/proof/`. No cost limits or bootstrap
+pins changed.
+
+### L0: freeze the baseline and prove the seam
+
+No standalone planning-only landing. Include this evidence with L1.
+Freeze current source, library, seed, C compiler and flags. Build actual
+self-built B compilers, normal and diagnostic; a runtime source edit cannot
+change the executable that was previously built from it. Measure append sizes
+1,024 / 2,048 / 4,096, the retained list workload and whole self-compilation.
+Keep output checksums, allocation/release counts, copied-slot evidence, normal
+retired instructions, peak RSS and production/test line counts separately.
+
+Before broad implementation, inspect the lowered and owned form of `collect`.
+Locate its loop-header owner, last-use row, outgoing transfer and drop. Show
+that changing the intrinsic to consume that owner preserves the existing loop
+contract; do not assume the String selector covers every loop. Currently direct
+List calls remain declared wrapper calls, whose parameters borrow. Extend the
+existing typed `declared_call_target` match for the admitted List operation,
+then prove generic element substitution, UFCS and direct calls all reach the
+same runtime target. Callable values must retain their borrowed wrappers.
+Review this seam early. If accumulator loops require a new ownership model, stop
+and present the small failing case before adding one.
+
+### L1: append, capacity and ownership as one vertical slice
+
+Extend the existing `check/callables.brp` direct-builtin match to `ListAppend`;
+retain all existing signature, inference, purity and operand-order checks.
+Generic publication needs one corresponding change in
+`check/inference.brp:1694`: `publish_pending_call` currently publishes
+`PendingRuntime(operation)` unchanged. Unlike String operations, List operations
+contain a callee-owned element parameter. Substitute through the existing solved
+call context before publishing the checked target. The relevant match becomes,
+schematically inside the runtime-operation branch:
+
+```blorp
+ListAppend(element):
+    admit_call_type(element, call, slots, call.span).map(
+        pure func(concrete): RuntimeFunction(ListAppend(concrete))
+    )
+```
+
+L2 does the same for `ListSet` and `ListConcat`. Do not apply a later caller
+substitution to an unsubstituted callee parameter, or recover types from names.
+Keep signature trait-requirement proofs when a declared call becomes a runtime
+call: the current `PendingRuntime` proof arm is a no-op because previously
+eligible String declarations are nongeneric. Reuse `prove_requirements` with
+the solved signature arguments; do not skip a builtin declaration's bounds.
+Test direct/UFCS calls from both concrete and generic callers, distinct element
+types, and rejected unsatisfied bounds. No callee-owned parameter may survive
+checked publication; a caller's properly substituted parameter may remain.
+
+Change `runtime/list.brp`, list construction in `emit/emit.brp`, ownership
+selection and independent verification together. Update every root constructor,
+including argv, literals, repeat, suffix and existing update results. Keep
+borrowed append available when transfer cannot be proved. Rename narrowly
+String-specific ownership helpers only where their existing implementation is
+actually shared; prefer a small typed `match` on runtime operations to another
+policy registry or parallel ownership analysis.
+
+The desired call sequence is schematic, not a new IR:
+
+```text
+Before:
+  append(borrow list, borrow element) -> fresh list
+  drop old list owner
+After, when independently verified safe:
+  append(consumed list owner, borrow element) -> owned result
+  -- no second drop of the transferred owner
+```
+
+The consuming runtime helper chooses:
+
+```text
+shared root: copy live slots/acquire copied children, then release one input root
+unique root: reserve geometrically if needed; retain existing slot obligations
+both paths: acquire the newly stored element occurrence, initialize it, extend length
+```
+
+The element must remain independently live across relocation. A borrow derived
+from the consumed list cannot simply be passed through; initially keep that
+call borrowed, using the existing dependency/ancestry checks. Apply these checks
+to nested projections as well as direct values. No source spelling heuristics.
+
+Acceptance: the actual local accumulator selects the consuming helper; appends
+within capacity allocate no new buffer, growth follows the policy, and growing
+from four to `n` has logarithmic growth events and linear cumulative relocation
+work. Test counters must observe growth even if `realloc` returns the same
+address. The diagnostic allocator counts logical allocations, not resize calls;
+allocation counts alone cannot establish the improvement.
+
+### L2: set and concat reuse
+
+After L1 lands, extend direct-builtin selection and the same transfer path to
+the first List operand of `ListSet(E)` and `ListConcat(E)`. Set has **three**
+arguments; remove hard-coded
+two-argument assumptions in selection, consumed-owner tracking and verification
+without introducing another representation. Verify every remaining argument
+against the discharged state. Emitter chooses helpers from the typed runtime
+target and verified operand, never a source function name.
+
+For unique `set`, acquire the incoming occurrence before dropping the replaced
+occurrence, including equal pointers. Invalid indices retain the current
+unchanged-value behavior and do not acquire the unused replacement. A consumed
+invalid update can return the transferred root. Shared updates copy; existing
+aliases remain unchanged.
+
+For unique left concat, reserve once, keep left slots and acquire right slots.
+The right input stays borrowed and valid throughout. Same-owner or dependent
+right borrows remain on the copying path initially. Independently counted
+aliases, including two owners of the same root, trigger runtime shared fallback.
+Empty inputs must preserve ownership obligations even when no slots are copied.
+Right consumption and symmetric reuse are deferred until profiling warrants them.
+
+Acceptance: unique `set` is constant work independent of list length; unique
+concat with sufficient capacity copies/acquires only right-hand slots. Preserve
+all current contents, error/Option behavior and value semantics.
+
+### L3: replace temporary balanced library copying
+
+`standard_library/list.brp:123` implements map/filter through recursive splitting
+and concat; `copy_range` and `reverse_range` do similar work. After L1, replace
+these with ordinary loops and a local append accumulator. For example:
+
+```blorp
+pure func map[T, U](values: List[T], callback: pure (T) -> U) -> List[U]:
+    var mapped: List[U] = []
+    for value in values:
+        mapped = mapped.append(callback(value))
+    mapped
+```
+
+This keeps source order and evaluates each callback once. Filter keeps matching
+elements in order; take/drop/copy-range clamp bounds exactly as today; reverse
+walks source indices backward. Port remove only through these existing helpers.
+Continuing joins deliberately keep captured owners borrowed. Do not put a growing
+accumulator append inside such a branch and assume it reuses. For filter, select
+an independently owned `[]` or `[value]` chunk in the branch, then concatenate
+that chunk into the accumulator **after** the join using L2's consuming path.
+Use the same structure around fallible `get` for bounded copying/reverse.
+This is linear work, including transient chunk roots; it is not allocation-free
+skipping. Require an owned-IR witness that concat consumes the accumulator and
+that empty right chunks do not copy its live slots before claiming linearity.
+Delete replaced recursion and temporary concatenation paths in the same change.
+Do not rewrite unrelated compiler call sites to compensate for a missing fast
+path. Acceptance: linear element visits/output construction, constant traversal
+stack and fewer production lines; retain exact callback order and all boundary
+cases. Check the resulting owned calls actually consume the accumulator.
+
+### L4: simplify stable sorting
+
+Separately replace `MergedPrefix`, `merge_first` and recursive `merge_prefix`
+with one ordinary linear merge loop. Preserve stable left-first tie selection
+and existing key/callback semantics; key caching is a separate API decision.
+The outer merge sort may keep its bounded recursion. Delete superseded state
+and helpers. Acceptance: O(n) work per merge and O(n log n) total sorting work
+for constant-cost keys, stable duplicates, bounded stack, and fewer production
+lines. Do not add a new sorting algorithm or mutable public builder.
+
+### Tests, measurements and landing
+
+Add ordinary self-hosted TestSuite cases at each changed boundary: selection,
+independent verification (including malformed consumed arguments), emitter and
+runtime helper. Existing runtime cases are in
+`test/runtime/test_generic_list.brp`; port only the bounded required cases if
+their current harness is deferred. Keep unaffected borrowed-helper tests and
+add consuming-helper tests; do not delete shared-alias coverage to accommodate
+reuse. Runtime allocator wrappers may observe/force relocation under the existing
+direct-C test exception; do not add production tracing or alternate fixture mains.
+
+Cover lengths 0/1/3/4/5/8/9, exact-sized constructors, shared roots, repeated
+child pointers, self/dependent operands, nested Lists, Strings, inline records,
+managed records, unions, callable elements and Void. Check no double drops,
+uninitialized reads or alias mutation. Add a real-main source accumulator fixture
+with strict accounting and ASan/UBSan, and a retained large growth workload.
+Prove oracles by disabling reuse or breaking a transfer/drop, observing the
+specific failing test, then restoring it. Runtime bounds receive synthetic
+boundary tests without attempting enormous allocations.
+
+Run one narrow suite before the broad gates, for example:
+
+```bash
+make -C blorp_2 test-compiler
+make -C blorp_2 test-target-components \
+  TARGET_COMPONENT_SOURCES=blorp_2/test/unit/test_own/test_list_reuse.brp
+scripts/blorp2-fixpoint --prove
+```
+
+`test_list_reuse.brp` is a proposed new suite, not an existing test. Wire the
+necessary granular suites and new fixture into the active self-hosted selection
+in the same milestone. Never run deferred cases using the legacy compiler.
+`--prove` includes the active component/e2e gates; `make -C blorp_2 test` is
+the shorter broad iteration gate, not an extra required repeat after the proof.
+Run serialized matched baseline/candidate self-built B measurements at identical
+optimization levels, with three normal samples after warmup and separate strict
+diagnostics. Retain exact commands, hashes, toolchain and raw samples in ignored
+`build/`; summarize the results in this maintained section rather than creating
+another report. Intentional emitted-C changes require semantic checks and a new
+fixpoint; baseline/candidate C identity is not an acceptance requirement.
+
+The existing ML bounds remain: investigate above +5% allocations or normal
+minimum retired instructions per frozen control; +10% is the rejection/rescope
+ceiling. Also investigate peak RSS increases above 10%; do not trade large
+padding/retention growth for a favorable counter. Target at least 50% fewer
+logical old-slot copies on the largest unique-append control, logarithmic growth
+events and linear relocation scaling. These are design targets to verify, not
+predicted compiler-wide speedups. Initial production-growth design bounds are
++250 net lines for L1 and +150 for L2, including removal of replaced code;
+L3/L4 must reduce production lines. Report test growth separately. A missed
+bound calls for examining the responsible code and rescoping, not an expanding
+framework or repeated trivial allowance requests.
+
+Land each complete approved slice as one squash commit; no plans-only or
+capacity-only production commits. Keep bootstrap activation separate: prove the
+candidate self-hosts, then use the existing qualified seed publication/pin
+process when the change should reach the default builder. Return the commit,
+two review verdicts, test counts/failures, matched metrics/line counts, evidence
+path and remaining borrowed-call opportunities. Stop for coordinator guidance
+on an ownership ambiguity, an ABI change beyond this reviewed List capacity
+layout/ownership contract, or a material regression.
 
 ## M1b: names and the foundation
 
