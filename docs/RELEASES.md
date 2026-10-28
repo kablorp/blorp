@@ -224,7 +224,7 @@ verified and pinned. The seed tag identifies the final approved source commit, r
 The reviewed workflow and release documentation changes accompany compiler
 support before integer-append library activation. Compiler C is locked
 to SHA-256
-`d3269ecf4de27ceca84ce190f41516c3dd8990f83bf42dedf802e74bd1f261bb`, checked
+`cdd5e9e7405e4fd9f14a4a128d2229d843073a1ce88d79b6cb87111f9666e6e6`, checked
 immediately after A emits C and before B qualification. Each provenance archive
 retains `reviewed-compiler-c.sha256`; the publisher checks the emitted C against
 that digest and requires all platforms to agree. The earlier stored-callable/tuple

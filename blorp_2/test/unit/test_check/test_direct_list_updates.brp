@@ -240,9 +240,230 @@ pure func test_runtime_call_accepts_proved_generic_signature_bounds() -> Bool:
 		None: False
 
 
+private pure func update_declaration(is_set: Bool, bounded: Bool) -> String:
+	parameter = if bounded:
+		"Element: Allowed"
+	else:
+		"Element"
+	if is_set:
+		"pure func set[${parameter}](values: List[Element], index: Int, value: Element) -> List[Element]:\n    builtin(\"list.set\")\n"
+	else:
+		"pure func concat[${parameter}](left: List[Element], right: List[Element]) -> List[Element]:\n    builtin(\"list.concat\")\n"
+
+
+private pure func binding_at(value: Checked.CheckedExpr, position: Int) -> Bool:
+	match value.form:
+		Checked.ReadBinding(id): Checked.binding_number(id).equals(position)
+		_: False
+
+
+private pure func update_operands(function: Checked.CheckedFunction, expected: Checked.TypeRef, is_set: Bool, left_position: Int) -> Bool:
+	match returned_call(function):
+		None: False
+		Some(call):
+			match (call.target, call.operands):
+				(Checked.RuntimeFunction(Builtins.ListSet(element)), [Checked.ValueOperand(left), Checked.ValueOperand(index), Checked.ValueOperand(right)]):
+					is_set.and(Checked.same_type(element, expected))
+						.and(Checked.same_type(left.value_type, Checked.ListType(expected)))
+						.and(Checked.same_type(index.value_type, Checked.IntType)).and(Checked.same_type(right.value_type, expected))
+						.and(binding_at(left, left_position)).and(binding_at(index, left_position.add(1))).and(binding_at(right, left_position.add(2)))
+				(Checked.RuntimeFunction(Builtins.ListConcat(element)), [Checked.ValueOperand(left), Checked.ValueOperand(right)]):
+					is_set.not().and(Checked.same_type(element, expected))
+						.and(Checked.same_type(left.value_type, Checked.ListType(expected))).and(Checked.same_type(right.value_type, Checked.ListType(expected)))
+						.and(binding_at(left, left_position)).and(binding_at(right, left_position.add(1)))
+				_: False
+
+
+private pure func checked_update(is_set: Bool, generic: Bool, receiver: Bool) -> Bool:
+	parameters = if is_set:
+		"values: List[Payload], index: Int, value: Payload"
+	else:
+		"values: List[Payload], right: List[Payload]"
+	expression = if is_set:
+		if receiver:
+			"values.set(index, value)"
+		else:
+			"set(values, index, value)"
+	else:
+		if receiver:
+			"values.concat(right)"
+		else:
+			"concat(values, right)"
+	caller = if generic:
+		"pure func caller[Ignored, Payload](ignored: Ignored, ${parameters}) -> List[Payload]:\n    ${expression}\n"
+	else:
+		if is_set:
+			"pure func caller(values: List[String], index: Int, value: String) -> List[String]:\n    ${expression}\n"
+		else:
+			"pure func caller(values: List[String], right: List[String]) -> List[String]:\n    ${expression}\n"
+	match checked_function("${update_declaration(is_set, False)}${caller}${MAIN}", 1):
+		None: False
+		Some(function):
+			if generic:
+				match function.signature.type_parameters:
+					[_, element]: update_operands(function, Checked.ParameterType(element), is_set, 1)
+					_: False
+			else:
+				update_operands(function, Checked.StringType, is_set, 0)
+
+
+pure func test_set_direct_concrete() -> Bool:
+	checked_update(True, False, False)
+
+
+pure func test_set_receiver_concrete() -> Bool:
+	checked_update(True, False, True)
+
+
+pure func test_set_direct_generic() -> Bool:
+	checked_update(True, True, False)
+
+
+pure func test_set_receiver_generic() -> Bool:
+	checked_update(True, True, True)
+
+
+pure func test_concat_direct_concrete() -> Bool:
+	checked_update(False, False, False)
+
+
+pure func test_concat_receiver_concrete() -> Bool:
+	checked_update(False, False, True)
+
+
+pure func test_concat_direct_generic() -> Bool:
+	checked_update(False, True, False)
+
+
+pure func test_concat_receiver_generic() -> Bool:
+	checked_update(False, True, True)
+
+
+private pure func update_stored_wrapper(is_set: Bool) -> Bool:
+	body = if is_set:
+		"pure func stored() -> pure (List[String], Int, String) -> List[String]:\n    set\n"
+	else:
+		"pure func stored() -> pure (List[String], List[String]) -> List[String]:\n    concat\n"
+	match checked_function("${update_declaration(is_set, False)}${body}${MAIN}", 1):
+		None: False
+		Some(function):
+			match function.body:
+				Checked.CheckedValueBody(Checked.ReturnExpression(value)):
+					match value.form:
+						Checked.MakeCallable(Checked.NamedCallable(id, [element])): function_number(id).equals(0).and(Checked.same_type(element, Checked.StringType))
+						_: False
+				_: False
+
+
+pure func test_set_stored_wrapper() -> Bool:
+	update_stored_wrapper(True)
+
+
+pure func test_concat_stored_wrapper() -> Bool:
+	update_stored_wrapper(False)
+
+
+private pure func update_named_wrapper(is_set: Bool) -> Bool:
+	body = if is_set:
+		"pure func apply(callback: pure (List[Int], Int, Int) -> List[Int], values: List[Int], index: Int, value: Int) -> List[Int]:\n    callback(values, index, value)\npure func caller(values: List[Int], index: Int, value: Int) -> List[Int]:\n    apply(set, values, index, value)\n"
+	else:
+		"pure func apply(callback: pure (List[Int], List[Int]) -> List[Int], values: List[Int], right: List[Int]) -> List[Int]:\n    callback(values, right)\npure func caller(values: List[Int], right: List[Int]) -> List[Int]:\n    apply(concat, values, right)\n"
+	match checked_function("${update_declaration(is_set, False)}${body}${MAIN}", 2):
+		None: False
+		Some(function):
+			match returned_call(function):
+				Some(call):
+					match call.operands.get(0):
+						Some(Checked.CallableOperand(_, Checked.NamedCallable(id, [element]), _)): function_number(id).equals(0).and(Checked.same_type(element, Checked.IntType))
+						_: False
+				None: False
+
+
+pure func test_set_named_wrapper() -> Bool:
+	update_named_wrapper(True)
+
+
+pure func test_concat_named_wrapper() -> Bool:
+	update_named_wrapper(False)
+
+
+private ALLOWED_TRAIT: String = "trait Allowed:\n    pure func permit(value: Self) -> Int\n"
+
+
+private pure func update_bound_rejects(is_set: Bool, generic: Bool) -> Bool:
+	header = if generic:
+		"pure func caller[Ignored, Payload](ignored: Ignored, values: List[Payload], value: Payload, right: List[Payload]) -> List[Payload]:\n    "
+	else:
+		"pure func caller(values: List[Int], value: Int, right: List[Int]) -> List[Int]:\n    "
+	name = if is_set:
+		"set"
+	else:
+		"concat"
+	arguments = if is_set:
+		"(values, 0, value)\n"
+	else:
+		"(values, right)\n"
+	rejects("${ALLOWED_TRAIT}${update_declaration(is_set, True)}${header}", name, arguments, BOUND_MESSAGE, BOUND_HELP)
+
+
+pure func test_set_concrete_bound_rejects() -> Bool:
+	update_bound_rejects(True, False)
+
+
+pure func test_set_generic_bound_rejects() -> Bool:
+	update_bound_rejects(True, True)
+
+
+pure func test_concat_concrete_bound_rejects() -> Bool:
+	update_bound_rejects(False, False)
+
+
+pure func test_concat_generic_bound_rejects() -> Bool:
+	update_bound_rejects(False, True)
+
+
+private pure func update_bound_accepts(is_set: Bool) -> Bool:
+	body = if is_set:
+		"pure func caller[Ignored, Payload: Allowed](ignored: Ignored, values: List[Payload], index: Int, value: Payload) -> List[Payload]:\n    set(values, index, value)\n"
+	else:
+		"pure func caller[Ignored, Payload: Allowed](ignored: Ignored, values: List[Payload], right: List[Payload]) -> List[Payload]:\n    concat(values, right)\n"
+	match checked_function("${ALLOWED_TRAIT}${update_declaration(is_set, True)}${body}${MAIN}", 1):
+		None: False
+		Some(function):
+			match function.signature.type_parameters:
+				[_, element]: update_operands(function, Checked.ParameterType(element), is_set, 1)
+				_: False
+
+
+pure func test_set_bound_accepts() -> Bool:
+	update_bound_accepts(True)
+
+
+pure func test_concat_bound_accepts() -> Bool:
+	update_bound_accepts(False)
+
+
 tests: TestSuite = {
-	description = "Direct List append checking and generic publication",
+	description = "Direct List update checking and generic publication",
 	tests = [
+		("set concrete direct publishes typed runtime", test_set_direct_concrete),
+		("set concrete UFCS publishes typed runtime", test_set_receiver_concrete),
+		("set generic direct substitutes second caller parameter", test_set_direct_generic),
+		("set generic UFCS substitutes second caller parameter", test_set_receiver_generic),
+		("concat concrete direct publishes typed runtime", test_concat_direct_concrete),
+		("concat concrete UFCS publishes typed runtime", test_concat_receiver_concrete),
+		("concat generic direct substitutes second caller parameter", test_concat_direct_generic),
+		("concat generic UFCS substitutes second caller parameter", test_concat_receiver_generic),
+		("set stored callable retains wrapper", test_set_stored_wrapper),
+		("concat stored callable retains wrapper", test_concat_stored_wrapper),
+		("set named callable retains wrapper", test_set_named_wrapper),
+		("concat named callable retains wrapper", test_concat_named_wrapper),
+		("set concrete trait bound rejects exactly", test_set_concrete_bound_rejects),
+		("set generic trait bound rejects exactly", test_set_generic_bound_rejects),
+		("concat concrete trait bound rejects exactly", test_concat_concrete_bound_rejects),
+		("concat generic trait bound rejects exactly", test_concat_generic_bound_rejects),
+		("set accepts proved caller trait bound", test_set_bound_accepts),
+		("concat accepts proved caller trait bound", test_concat_bound_accepts),
 		("direct concrete call selects runtime append", test_direct_concrete_append),
 		("UFCS concrete call selects runtime append", test_receiver_concrete_append),
 		("nested List element substitutes without callee parameters", test_nested_element_substitution),

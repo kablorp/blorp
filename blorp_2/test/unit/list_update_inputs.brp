@@ -78,9 +78,13 @@ pure func lowered_function(
 	{ signature = { parameters = parameters, return_type = return_type }, steps = definitions.map(pure func(definition): Lower.Define(definition)), result = result }
 
 
-APPEND_DECLARATIONS: String =
+UPDATE_DECLARATIONS: String =
 	|pure func append[T](values: List[T], value: T) -> List[T]:
 	|    builtin("list.append")
+	|pure func set[T](values: List[T], index: Int, value: T) -> List[T]:
+	|    builtin("list.set")
+	|pure func concat[T](left: List[T], right: List[T]) -> List[T]:
+	|    builtin("list.concat")
 	|pure func length[T](values: List[T]) -> Int:
 	|    builtin("list.length")
 	|pure func less_than(left: Int, right: Int) -> Bool:
@@ -89,7 +93,7 @@ APPEND_DECLARATIONS: String =
 
 
 pure func owned_source(body: String) -> Result[Own.OwnershipProgram, Diagnostic]:
-	lowered(APPEND_DECLARATIONS.add(body)).and_then(Own.own)
+	lowered(UPDATE_DECLARATIONS.add(body)).and_then(Own.own)
 
 
 pure func empty_list(id: Lower.ValueId, element: Concrete.TypeRef) -> Lower.ValueDefinition:
@@ -139,52 +143,52 @@ pure func append_arguments(ids: InputIds) -> List[Own.OwnedArgument]:
 
 
 
-private pure func tail_appends(tail: Own.OwnedLoopTail, consumed_only: Bool) -> Int:
+private pure func tail_updates(tail: Own.OwnedLoopTail, consumed_only: Bool) -> Int:
 	match tail:
 		Own.ExitLoop(_): 0
 		Own.MatchLoop(matched):
 			var count = 0
 			for arm in matched.arms:
-				count = count.add(count_appends(arm.body.operations, consumed_only)).add(tail_appends(arm.body.tail, consumed_only))
+				count = count.add(count_updates(arm.body.operations, consumed_only)).add(tail_updates(arm.body.tail, consumed_only))
 			count
 
 
-private pure func count_appends(operations: List[Own.OwnershipOperation], consumed_only: Bool) -> Int:
+private pure func count_updates(operations: List[Own.OwnershipOperation], consumed_only: Bool) -> Int:
 	var count = 0
 	for operation in operations:
 		match operation:
 			Own.DefineValue(definition):
 				match definition.operation:
-					Own.CallDefinition(Concrete.RuntimeFunction(Builtins.ListAppend(_)), arguments):
-						match arguments:
-							[Own.ConsumedArgument(_, _), _]: count = count.add(1)
+					Own.CallDefinition(Concrete.RuntimeFunction(Builtins.ListAppend(_) | Builtins.ListSet(_) | Builtins.ListConcat(_)), arguments):
+						match arguments.get(0):
+							Some(Own.ConsumedArgument(_, _)): count = count.add(1)
 							_:
 								if consumed_only.not():
 									count = count.add(1)
 					_: void
 			Own.ExecuteJoin(join):
 				for arm in join.arms:
-					count = count.add(count_appends(arm.operations, consumed_only))
-			Own.ExecuteLoop(loop): count = count.add(count_appends(loop.body.operations, consumed_only)).add(tail_appends(loop.body.tail, consumed_only))
+					count = count.add(count_updates(arm.operations, consumed_only))
+			Own.ExecuteLoop(loop): count = count.add(count_updates(loop.body.operations, consumed_only)).add(tail_updates(loop.body.tail, consumed_only))
 			_: void
 	count
 
 
-pure func consumed_appends(operations: List[Own.OwnershipOperation]) -> Int:
-	count_appends(operations, True)
+pure func consumed_updates(operations: List[Own.OwnershipOperation]) -> Int:
+	count_updates(operations, True)
 
 
-pure func program_appends(program: Own.OwnershipProgram) -> Int:
+pure func program_updates(program: Own.OwnershipProgram) -> Int:
 	var count = 0
 	for function in program.functions:
-		count = count.add(count_appends(function.operations, False))
+		count = count.add(count_updates(function.operations, False))
 	count
 
 
 pure func program_consumed(program: Own.OwnershipProgram) -> Int:
 	var count = 0
 	for function in program.functions:
-		count = count.add(consumed_appends(function.operations))
+		count = count.add(consumed_updates(function.operations))
 	count
 
 
@@ -205,11 +209,14 @@ pure func no_consumed_drop(operations: List[Own.OwnershipOperation]) -> Bool:
 		match operation:
 			Own.DefineValue(definition):
 				match definition.operation:
-					Own.CallDefinition(Concrete.RuntimeFunction(Builtins.ListAppend(_)), [Own.ConsumedArgument(_, owner), _]):
-						for later in operations:
-							match later:
-								Own.DropOwner(dropped, _): valid = valid.and(Own.owner_number(dropped).not_equals(Own.owner_number(owner)))
-								_: void
+					Own.CallDefinition(Concrete.RuntimeFunction(Builtins.ListAppend(_) | Builtins.ListSet(_) | Builtins.ListConcat(_)), arguments):
+						match arguments.get(0):
+							Some(Own.ConsumedArgument(_, owner)):
+								for later in operations:
+									match later:
+										Own.DropOwner(dropped, _): valid = valid.and(Own.owner_number(dropped).not_equals(Own.owner_number(owner)))
+										_: void
+							_: void
 					_: void
 			Own.ExecuteJoin(join):
 				for arm in join.arms:
@@ -250,3 +257,50 @@ pure func raw_integer_append(ids: InputIds, consumed: Bool) -> Own.OwnershipProg
 				result = Own.OwnedReturn(ids.third, Own.owner_id(1))
 			}] }
 		_: program
+
+
+-- The raw set/concat programs define their contracts and obligations directly.
+-- The unmanaged index is present in both seeds so callers share minted ids.
+pure func raw_list_update(
+	ids: InputIds, is_set: Bool, arguments: List[Own.OwnedArgument], after: List[Own.OwnershipOperation],
+) -> Own.OwnershipProgram:
+	base = raw_append(ids, [], [])
+	list_type: Concrete.TypeRef = Concrete.ListType(Concrete.StringType)
+	left: Own.OwnedDefinition = {
+		id = ids.first, value_type = list_type, operation = Own.ConstructListDefinition([]),
+		result = Own.OwnedResult(Own.owner_id(0)), span = span(10)
+	}
+	right: Own.OwnedDefinition = if is_set:
+		{ id = ids.second, value_type = Concrete.StringType, operation = Own.StringDefinition("replacement"), result = Own.OwnedResult(Own.owner_id(1)), span = span(20) }
+	else:
+		{ id = ids.second, value_type = list_type, operation = Own.ConstructListDefinition([]), result = Own.OwnedResult(Own.owner_id(1)), span = span(20) }
+	index: Own.OwnedDefinition = {
+		id = ids.third, value_type = Concrete.IntType, operation = Own.IntegerDefinition(0),
+		result = Own.UnmanagedResult, span = span(25)
+	}
+	target: Builtins.RuntimeOperation[Concrete.VariantInstanceId, Concrete.TypeRef] = if is_set:
+		Builtins.ListSet(Concrete.StringType)
+	else:
+		Builtins.ListConcat(Concrete.StringType)
+	updated: Own.OwnedDefinition = {
+		id = ids.fourth, value_type = list_type, operation = Own.CallDefinition(Concrete.RuntimeFunction(target), arguments),
+		result = Own.OwnedResult(Own.owner_id(2)), span = span(30)
+	}
+	match base.functions:
+		[main, worker]:
+			{ base | functions = [main, { worker | signature = { parameters = [], return_type = list_type },
+				operations = [Own.DefineValue(left), Own.DefineValue(right), Own.DefineValue(index), Own.DefineValue(updated)].concat(after),
+				result = Own.OwnedReturn(ids.fourth, Own.owner_id(2)) }] }
+		_: base
+
+
+pure func update_arguments(ids: InputIds, is_set: Bool, consumed: Bool) -> List[Own.OwnedArgument]:
+	left: Own.OwnedArgument = if consumed:
+		Own.ConsumedArgument(ids.first, Own.owner_id(0))
+	else:
+		Own.BorrowedArgument({ value = ids.first, source = Own.OwnerBorrow(Own.owner_id(0)) })
+	right: Own.OwnedArgument = Own.BorrowedArgument({ value = ids.second, source = Own.OwnerBorrow(Own.owner_id(1)) })
+	if is_set:
+		[left, Own.UnmanagedArgument(ids.third), right]
+	else:
+		[left, right]

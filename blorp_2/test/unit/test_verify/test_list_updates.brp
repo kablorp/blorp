@@ -1,0 +1,319 @@
+import:
+	../../../src/check/model as Model
+	../../../src/lower/lower as Lower
+	../../../src/namespace/builtins as Builtins
+	../../../src/own/own as Own
+	../../../src/specialize/specialize as Concrete
+	../../../src/utils/source: same_source
+	../../../src/verify/verify: verify
+	../list_update_inputs: InputIds, input_ids, span, raw_append, append_arguments, raw_integer_append, raw_list_update, update_arguments
+	int: Int methods_only
+	bool: Bool methods_only
+	string: String methods_only
+	list: List methods_only
+	option: Option methods_only
+	result: Result methods_only
+	test: TestSuite
+
+
+private pure func rejects(program: Own.OwnershipProgram, message: String, at: Int) -> Bool:
+	match verify(program):
+		Ok(_): False
+		Err(error):
+			error.message.equals("ownership verification failed: ".add(message))
+				.and(error.help.equals("report this compiler error with the input program"))
+				.and(same_source(error.span.source, span(at).source))
+				.and(error.span.start.equals(at)).and(error.span.end.equals(at.add(1)))
+				.and(error.note.is_none())
+
+
+pure func test_independent_consuming_append_verifies() -> Bool:
+	match input_ids():
+		Err(_): False
+		Ok(ids): verify(raw_append(ids, append_arguments(ids), [Own.DropOwner(Own.owner_id(1), span(40))])).is_ok()
+
+
+pure func test_trailing_old_owner_drop_rejected() -> Bool:
+	match input_ids():
+		Err(_): False
+		Ok(ids): rejects(raw_append(ids, append_arguments(ids), [Own.DropOwner(Own.owner_id(0), span(40))]), "owner 0 has already been discharged", 40)
+
+
+pure func test_second_operand_cannot_be_consumed() -> Bool:
+	match input_ids():
+		Err(_): False
+		Ok(ids):
+			arguments = append_arguments(ids).set(1, Own.ConsumedArgument(ids.second, Own.owner_id(1)))
+			rejects(raw_append(ids, arguments, []), "consumed argument requires the first supported update operand", 30)
+
+
+pure func test_wrong_list_element_type_rejected() -> Bool:
+	match input_ids():
+		Err(_): False
+		Ok(ids):
+			arguments = append_arguments(ids).set(0, Own.ConsumedArgument(ids.second, Own.owner_id(1)))
+			rejects(raw_append(ids, arguments, []), "call argument type does not match its contract", 30)
+
+
+pure func test_stale_list_borrow_rejected() -> Bool:
+	match input_ids():
+		Err(_): False
+		Ok(ids):
+			read: Own.OwnedDefinition = {
+				id = ids.fourth, value_type = Concrete.IntType,
+				operation = Own.CallDefinition(Concrete.RuntimeFunction(Builtins.ListLength(Concrete.StringType)), [
+					Own.BorrowedArgument({ value = ids.first, source = Own.OwnerBorrow(Own.owner_id(0)) })]),
+				result = Own.UnmanagedResult, span = span(40)
+			}
+			rejects(raw_append(ids, append_arguments(ids), [Own.DefineValue(read)]), "borrow refers to discharged owner 0", 40)
+
+
+pure func test_consumed_list_with_unmanaged_integer_verifies() -> Bool:
+	match input_ids():
+		Err(_): False
+		Ok(ids): verify(raw_integer_append(ids, True)).is_ok()
+
+
+pure func test_wrong_runtime_target_rejected() -> Bool:
+	match input_ids():
+		Err(_): False
+		Ok(ids):
+			program = raw_integer_append(ids, True)
+			match program.functions:
+				[main, worker]:
+					operations = worker.operations.map(pure func(operation) -> Own.OwnershipOperation:
+						match operation:
+							Own.DefineValue(definition):
+								match definition.operation:
+									Own.CallDefinition(_, _): Own.DefineValue({ definition | value_type = Concrete.IntType,
+										operation = Own.CallDefinition(Concrete.RuntimeFunction(Builtins.ListLength(Concrete.IntType)), [Own.ConsumedArgument(ids.first, Own.owner_id(0))]), result = Own.UnmanagedResult })
+									_: operation
+							_: operation
+					)
+					updated = { worker | signature = { parameters = [], return_type = Concrete.IntType }, operations = operations.append(Own.DropOwner(Own.owner_id(0), span(40))), result = Own.UnmanagedReturn(ids.third) }
+					rejects({ program | functions = [main, updated] }, "consumed argument requires the first supported update operand", 30)
+				_: False
+
+
+pure func test_duplicate_owner_consumption_rejected() -> Bool:
+	match input_ids():
+		Err(_): False
+		Ok(ids):
+			second: Own.OwnedDefinition = {
+				id = ids.fourth, value_type = Concrete.ListType(Concrete.StringType),
+				operation = Own.CallDefinition(Concrete.RuntimeFunction(Builtins.ListAppend(Concrete.StringType)), append_arguments(ids)),
+				result = Own.OwnedResult(Own.owner_id(3)), span = span(40)
+			}
+			rejects(raw_append(ids, append_arguments(ids), [Own.DefineValue(second)]), "borrow refers to discharged owner 0", 40)
+
+
+pure func test_wrong_counted_owner_rejected() -> Bool:
+	match input_ids():
+		Err(_): False
+		Ok(ids):
+			arguments = append_arguments(ids).set(0, Own.ConsumedArgument(ids.first, Own.owner_id(1)))
+			rejects(raw_append(ids, arguments, []), "owner 1 does not own value 0", 30)
+
+
+-- The guarded edge is authored directly, independently of ownership insertion.
+-- Calls are forbidden here before transfer/lifetime checking can be reached.
+private pure func forbidden_selection_call(ids: InputIds) -> Own.OwnershipProgram:
+	base = raw_append(ids, [], [])
+	element: Concrete.TypeRef = Concrete.ListType(Concrete.StringType)
+	list_type: Concrete.TypeRef = Concrete.ListType(element)
+	root: Own.BorrowedValue = { value = ids.first, source = Own.OwnerBorrow(Own.owner_id(0)) }
+	left: Own.OwnedArgument = Own.ConsumedArgument(ids.first, Own.owner_id(0))
+	projected: Own.OwnedDefinition = {
+		id = ids.third, value_type = element, operation = Own.ListElementDefinition(0, ids.first),
+		result = Own.BorrowedResult(Own.PayloadBorrow(ids.first)), span = span(20)
+	}
+	appended: Own.OwnedDefinition = {
+		id = ids.fourth, value_type = list_type,
+		operation = Own.CallDefinition(Concrete.RuntimeFunction(Builtins.ListAppend(element)), [left, Own.BorrowedArgument({ value = ids.third, source = Own.PayloadBorrow(ids.first) })]),
+		result = Own.OwnedResult(Own.owner_id(2)), span = span(30)
+	}
+	join: Own.OwnedJoin = {
+		result = Own.ManagedJoinParameter({ id = ids.second, value_type = list_type, span = span(15) }, Own.owner_id(1)), carried = [],
+		selection = { scrutinee = Own.BorrowedArgument(root), entry = Model.decision_node_id(2), nodes = [
+			Own.EnterArm({ arm = Model.match_arm_id(0), operations = [Own.DefineValue(projected), Own.DefineValue(appended)], transfers = [Own.OwnedReturn(ids.fourth, Own.owner_id(2))] }),
+			Own.EnterArm({ arm = Model.match_arm_id(0), operations = [Own.AcquireOwner(Own.owner_id(3), root, span(31))], transfers = [Own.OwnedReturn(ids.first, Own.owner_id(3))] }),
+			Own.TestListLength({ value_type = list_type, route = Concrete.MatchRoot }, Model.MinimumLength(1), Model.decision_node_id(0), Model.decision_node_id(1)),
+		] },
+		arms = [{ id = Model.match_arm_id(0), inputs = [Own.ManagedJoinParameter({ id = ids.fifth, value_type = list_type, span = span(32) }, Own.owner_id(4))], operations = [], exit = Own.Yield({ transfer = Own.OwnedReturn(ids.fifth, Own.owner_id(4)), carried = [] }) }]
+	}
+	match base.functions:
+		[main, worker]:
+			{ base | functions = [main, {
+				worker | signature = { parameters = [], return_type = list_type },
+				operations = [Own.DefineValue({ id = ids.first, value_type = list_type, operation = Own.ConstructListDefinition([]), result = Own.OwnedResult(Own.owner_id(0)), span = span(10) }), Own.ExecuteJoin(join), Own.DropOwner(Own.owner_id(0), span(40))],
+				result = Own.OwnedReturn(ids.second, Own.owner_id(1))
+			}] }
+		_: base
+
+
+pure func test_selection_edge_cannot_append_a_projected_child() -> Bool:
+	match input_ids():
+		Err(_): False
+		Ok(ids): rejects(forbidden_selection_call(ids), "selection edge contains an operation outside its local projections", 10)
+
+
+private pure func update_verifies(is_set: Bool) -> Bool:
+	match input_ids():
+		Err(_): False
+		Ok(ids): verify(raw_list_update(ids, is_set, update_arguments(ids, is_set, True), [Own.DropOwner(Own.owner_id(1), span(40))])).is_ok()
+
+
+pure func test_consumed_set_verifies() -> Bool:
+	update_verifies(True)
+
+
+pure func test_consumed_concat_verifies() -> Bool:
+	update_verifies(False)
+
+
+pure func test_set_third_argument_cannot_consume() -> Bool:
+	match input_ids():
+		Err(_): False
+		Ok(ids):
+			arguments = update_arguments(ids, True, True).set(2, Own.ConsumedArgument(ids.second, Own.owner_id(1)))
+			rejects(raw_list_update(ids, True, arguments, []), "consumed argument requires the first supported update operand", 30)
+
+
+pure func test_set_missing_third_argument_rejects() -> Bool:
+	match input_ids():
+		Err(_): False
+		Ok(ids): rejects(raw_list_update(ids, True, [Own.ConsumedArgument(ids.first, Own.owner_id(0)), Own.UnmanagedArgument(ids.third)], []), "call is missing its argument", 30)
+
+
+pure func test_concat_extra_argument_rejects() -> Bool:
+	match input_ids():
+		Err(_): False
+		Ok(ids): rejects(raw_list_update(ids, False, update_arguments(ids, False, True).append(Own.UnmanagedArgument(ids.third)), []), "call has an unexpected argument", 30)
+
+
+pure func test_set_wrong_index_type_rejects() -> Bool:
+	match input_ids():
+		Err(_): False
+		Ok(ids): rejects(raw_list_update(ids, True, update_arguments(ids, True, True).set(1, Own.UnmanagedArgument(ids.second)), []), "call argument type does not match its contract", 30)
+
+
+private pure func update_wrong_owner_rejects(is_set: Bool) -> Bool:
+	match input_ids():
+		Err(_): False
+		Ok(ids): rejects(raw_list_update(ids, is_set, update_arguments(ids, is_set, True).set(0, Own.ConsumedArgument(ids.first, Own.owner_id(1))), []), "owner 1 does not own value 0", 30)
+
+
+pure func test_set_wrong_owner_rejects() -> Bool:
+	update_wrong_owner_rejects(True)
+
+
+pure func test_concat_wrong_owner_rejects() -> Bool:
+	update_wrong_owner_rejects(False)
+
+
+private pure func update_old_drop_rejects(is_set: Bool) -> Bool:
+	match input_ids():
+		Err(_): False
+		Ok(ids): rejects(raw_list_update(ids, is_set, update_arguments(ids, is_set, True), [Own.DropOwner(Own.owner_id(0), span(40))]), "owner 0 has already been discharged", 40)
+
+
+pure func test_set_old_drop_rejects() -> Bool:
+	update_old_drop_rejects(True)
+
+
+pure func test_concat_old_drop_rejects() -> Bool:
+	update_old_drop_rejects(False)
+
+
+private pure func update_stale_borrow_rejects(is_set: Bool) -> Bool:
+	match input_ids():
+		Err(_): False
+		Ok(ids):
+			stale: Own.OwnedDefinition = { id = ids.fifth, value_type = Concrete.IntType,
+				operation = Own.CallDefinition(Concrete.RuntimeFunction(Builtins.ListLength(Concrete.StringType)), [Own.BorrowedArgument({ value = ids.first, source = Own.OwnerBorrow(Own.owner_id(0)) })]), result = Own.UnmanagedResult, span = span(40) }
+			rejects(raw_list_update(ids, is_set, update_arguments(ids, is_set, True), [Own.DefineValue(stale)]), "borrow refers to discharged owner 0", 40)
+
+
+pure func test_set_stale_borrow_rejects() -> Bool:
+	update_stale_borrow_rejects(True)
+
+
+pure func test_concat_stale_borrow_rejects() -> Bool:
+	update_stale_borrow_rejects(False)
+
+
+pure func test_concat_same_owner_rhs_rejects_after_discharge() -> Bool:
+	match input_ids():
+		Err(_): False
+		Ok(ids):
+			arguments = [Own.ConsumedArgument(ids.first, Own.owner_id(0)), Own.BorrowedArgument({ value = ids.first, source = Own.OwnerBorrow(Own.owner_id(0)) })]
+			rejects(raw_list_update(ids, False, arguments, [Own.DropOwner(Own.owner_id(1), span(40))]), "borrow refers to discharged owner 0", 30)
+
+
+private pure func counted_alias_program(ids: InputIds, consumed: Bool) -> Own.OwnershipProgram:
+	counted_alias: Own.BorrowedValue = { value = ids.first, source = Own.OwnerBorrow(Own.owner_id(0)) }
+	arguments = update_arguments(ids, False, consumed).set(1, Own.BorrowedArgument({ value = ids.first, source = Own.OwnerBorrow(Own.owner_id(1)) }))
+	cleanup = if consumed:
+		[Own.DropOwner(Own.owner_id(1), span(40))]
+	else:
+		[Own.DropOwner(Own.owner_id(0), span(40)), Own.DropOwner(Own.owner_id(1), span(41))]
+	program = raw_list_update(ids, False, arguments, cleanup)
+	functions = program.functions.map(pure func(function) -> Own.OwnedFunction:
+		var operations: List[Own.OwnershipOperation] = []
+		for operation in function.operations:
+			match operation:
+				Own.DefineValue(definition):
+					if Lower.value_number(definition.id).equals(Lower.value_number(ids.second)):
+						-- Preserve the contiguous value ordinal while acquiring another owner of the first value.
+						operations = operations.append(Own.DefineValue({ definition | value_type = Concrete.IntType, operation = Own.IntegerDefinition(0), result = Own.UnmanagedResult }))
+						operations = operations.append(Own.AcquireOwner(Own.owner_id(1), counted_alias, span(20)))
+					else:
+						operations = operations.append(operation)
+				_: operations = operations.append(operation)
+		{ function | operations = operations }
+	)
+	{ program | functions = functions }
+
+
+pure func test_concat_independent_counted_alias_verifies() -> Bool:
+	match input_ids():
+		Err(_): False
+		Ok(ids): verify(counted_alias_program(ids, True)).is_ok()
+
+
+pure func test_concat_borrowed_counted_alias_control_verifies() -> Bool:
+	match input_ids():
+		Err(_): False
+		Ok(ids): verify(counted_alias_program(ids, False)).is_ok()
+
+
+tests: TestSuite = {
+	description = "List update independent ownership verification",
+	tests = [
+		("concat borrowed counted alias raw control is well formed", test_concat_borrowed_counted_alias_control_verifies),
+		("raw consumed set verifies all three typed operands", test_consumed_set_verifies),
+		("raw consumed concat transfers only left owner", test_consumed_concat_verifies),
+		("set third argument cannot consume replacement owner", test_set_third_argument_cannot_consume),
+		("set requires its third argument before transfer", test_set_missing_third_argument_rejects),
+		("concat rejects extra argument before transfer", test_concat_extra_argument_rejects),
+		("set index contract rejects wrong type", test_set_wrong_index_type_rejects),
+		("set first argument requires its own counted owner", test_set_wrong_owner_rejects),
+		("concat first argument requires its own counted owner", test_concat_wrong_owner_rejects),
+		("set old owner cannot be dropped again", test_set_old_drop_rejects),
+		("concat old owner cannot be dropped again", test_concat_old_drop_rejects),
+		("set later stale left borrow rejects", test_set_stale_borrow_rejects),
+		("concat later stale left borrow rejects", test_concat_stale_borrow_rejects),
+		("concat same owner RHS rejects after first discharge", test_concat_same_owner_rhs_rejects_after_discharge),
+		("concat distinct counted alias remains valid after discharge", test_concat_independent_counted_alias_verifies),
+		("consumed List accepts unmanaged Int element", test_consumed_list_with_unmanaged_integer_verifies),
+		("unadmitted List runtime target cannot consume", test_wrong_runtime_target_rejected),
+		("same owner cannot be consumed by two calls", test_duplicate_owner_consumption_rejected),
+		("consumption requires the owner of this List value", test_wrong_counted_owner_rejected),
+		("selection edge rejects append before a dependent projection can escape", test_selection_edge_cannot_append_a_projected_child),
+		("raw consumed append transfers input and returns fresh owner", test_independent_consuming_append_verifies),
+		("transferred List cannot be dropped again", test_trailing_old_owner_drop_rejected),
+		("element position cannot consume an owner", test_second_operand_cannot_be_consumed),
+		("consumed operand must match List element contract", test_wrong_list_element_type_rejected),
+		("later borrow of transferred List is rejected", test_stale_list_borrow_rejected),
+	]
+}
