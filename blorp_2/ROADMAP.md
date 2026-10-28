@@ -38,7 +38,9 @@ feature expansion. This audit does not defer existing correctness work or gates.
 Correctness and useful composition come before memory optimization. Extra
 retains, copies and fresh allocations are acceptable. Unique-owner String and
 List buffer reuse has landed (see [List buffer reuse](#list-buffer-reuse-roadmap));
-retain elimination and consuming-ABI inference remain deferred.
+consuming-ABI inference is planned in
+[Ownership contracts](#ownership-contracts-roadmap); retain elimination remains
+deferred.
 Existing test cost guards remain; adjust them deliberately with evidence rather
 than distorting the design to avoid a host-compiler cost. During integration,
 ordinary allocation-cap overruns are deferred cost debt and do not block
@@ -131,6 +133,7 @@ not a portable nesting threshold or a product-destruction proof.
 | [M1a](#m1a-surface-syntax-parity) | Layout and parsed source syntax | Pure lambda and callback syntax is implemented; current source-frontier evidence remains separate. |
 | [ML](#ml-list-construction) | `append`, `set`, `concat`, list literal | Done. Checked `set_index` is an ordinary target-library wrapper. |
 | [List buffer reuse](#list-buffer-reuse-roadmap) | Ownership-aware updates, four-slot first growth, doubling and simpler library loops | L1 append (`85c1eabc3`) and L2 set/concat (`90f684248`) landed. L2 seed pinned. L2b.1 (loop entry) landed; L2b.2 (joins) is next, then an L2b seed, then L3/L4. |
+| [Ownership contracts](#ownership-contracts-roadmap) | Owned/borrowed parameter contracts inferred from in-place runtime operations; record update binds before rebuilding; cell reuse | Planned and approved 2026-10-28; starts after the L2b seed with the O0 re-measure. Cell reuse is decided after O0. |
 | [M1b](#m1b-names-and-the-foundation) | Namespace: private, aliases, qualified names, designated `Bool`/`Option`/`Result` | Parts A and B done; control-flow consumers follow in M2/M3. |
 | [M5](#m5-constants) | Literal scalar/String constants | Implemented. Source construction functions replace the need for record/opaque constants and initializer dependencies. |
 | [M2](#m2-the-join) | Restricted control positions, outer-variable joins, ordinary Boolean calls, `?=` and annotations | Joins, Result propagation, annotations, ordinary Boolean calls and restricted value/statement `if` implemented in integration; acceptance pending. General operand controls remain deferred. |
@@ -1354,6 +1357,499 @@ path and remaining borrowed-call opportunities. Stop for coordinator guidance
 on an ownership ambiguity, an ABI change beyond this reviewed List capacity
 layout/ownership contract, or a material regression.
 
+## Ownership contracts roadmap
+
+Status: planned 2026-10-28; two design reviews approved the plan. Keith
+adopted owned-parameter contracts and the step-0 spike; pinned callables, the
+entry and `foreign` as borrowed, with no tail-call owning use, provided that
+stays simpler than the alternatives; approved the test-only labelling
+parameter; and approved reordering record-update projections. Cell reuse (O3)
+is decided after the O0 measurement. O0 and O1 wait for L2b.2 and its seed
+pin; O2 touches only lowering and may land at any time.
+
+| Step | Scope | Status |
+| --- | --- | --- |
+| [O0](#o0-re-measure-after-l2b) | Re-run the self-compile copy attribution and count atomic RC operations | Gate; waits for the L2b seed |
+| [O1](#o1-owned-parameter-contracts) | Per-parameter owned/borrowed contracts, inferred from in-place runtime operations | Approved; step-0 spike first |
+| [O2](#o2-record-update-binds-before-it-rebuilds) | Project the base fields an update reads before its replacements run | Approved; may land before O1 |
+| [O3](#o3-cell-reuse-for-records-and-union-nodes) | Reuse tokens for unique record cells and boxed union nodes | Undecided until O0 |
+
+### Problem
+
+L1/L2 reuse a List or String buffer only when a consuming runtime call holds
+the value's last owner. Every user parameter borrows (`own/own.brp:754`
+publishes `BorrowedResult(ParameterBorrow(...))`), so a callee can never reuse
+its argument, and an accumulator threaded through a helper is copied on every
+call:
+
+```blorp
+pure func emit_line(output: String, line: String) -> String:
+	"${output}${line}\n"                  -- StringConcat on a borrowed output copies it
+
+pure func render(lines: List[String]) -> String:
+	var output = ""
+	for line in lines:
+		output = emit_line(output, line)  -- O(total bytes × lines)
+	output
+```
+
+The same shape copies the whole bucket table in `with_bucket_entry`
+(`utils/names.brp:154`) and the list in the library's `set_index`. A record
+update copies a field accumulator because the base is still alive when the
+replacement runs (`lower/lower.brp:538-557`):
+
+```blorp
+record State { items: List[Int], count: Int }
+
+pure func push(state: State, item: Int) -> State:
+	{ state | items = state.items.append(item), count = state.count.add(1) }   -- n pushes: O(n²)
+```
+
+Self-compile attribution at `de2d4e4dd`, by a marker-instrumented B that
+emits identical C, found:
+
+| Path | Calls | Copied |
+| --- | ---: | ---: |
+| List borrowed update | 4,062,692 | 9,984,472,912 slots |
+| List shared fallback | 714,382 | 431,986,070 slots |
+| String borrowed update | 1,168,464 | 725,080,074 bytes |
+| String shared fallback | 348,224 | 191,986,727 bytes |
+
+`lex`, `program_inventory` and `intern_names` hold 10.2 B of the 10.4 B
+slots; they are appends in join arms and loops inside arms, which L2b.2
+targets. That 98% is an upper bound until O0 measures it. What L2b leaves is
+the parameter case: at least 548 MB of String from `append_byte_array`,
+`append_owner_alias` and `append_selection`, whose `output` parameter borrows,
+and 65.5 M slots from `with_bucket_entry`. Four emit helpers
+(`emit/emit.brp:1827`, `1956`, `2860`, `2931`) work around it with a local
+`fragments` list.
+
+The reproduction is a scratch benchmark with modes `list_helper`,
+`string_helper`, `set_helper` and `none`, one helper call per update. Normal
+instructions minus the `none` control grow 3.1-4.0× per doubling from 4,096
+to 131,072 updates; linear is 2×.
+
+### Background
+
+The model follows Perceus (Reinking et al., 2021) and Lean 4's borrow
+inference (Ullrich and de Moura, "Counting Immutable Beans", 2019). Lean
+infers labels starting from borrowed, and its owning uses include constructor
+arguments, closure application, `reset` and tail calls. Blorp keeps only
+reuse: returning or storing a borrowed parameter costs one acquisition, so
+only reuse inside the callee changes the asymptotics. Reference counts are
+atomic, so every unneeded transfer costs two atomic operations.
+
+The [ownership invariants](#ownership-and-destruction) remain the authority.
+The verifier proves exactly-once discharge and live borrow backing; it does not
+prove placement minimal, and correctness never depends on the inference.
+
+### Proposed solution and code
+
+**Labels come from the runtime operations that may update in place.** The
+compiler names them in one function. A managed user parameter becomes owned
+when its obligation can reach such an operand, or another function's owned
+parameter. Labels are per parameter and per concrete instance, so a caller of
+a mutating helper is itself labelled only in the positions that flow there.
+
+**A caller not at its last use acquires and transfers.** A reference count
+cannot see a borrow. Passing a still-needed value without a counted reference
+would let the callee's `references == 1` check pass and mutate a live value:
+
+```blorp
+pure func caller(xs: List[Int]) -> Int:
+	ys = grow(xs, 1)      -- grow's `items` is owned; xs is still used below
+	xs.length().add(ys.length())
+```
+
+Own inserts `AcquireOwner` before the call and transfers that fresh owner;
+`grow` sees count two and copies, as today, for two extra atomic operations.
+
+**The ownership stage refines the signature**, rather than keeping a parallel
+table. Every function carries its passing by construction:
+
+```blorp
+-- How the ownership stage passes one parameter. Replaces
+-- FunctionSignature.parameters in the published OwnedFunction.
+fixed record ManagedPassing {
+	value_type: TypeRef,
+	-- The caller transfers one obligation; the callee discharges it.
+	owned: Bool
+}
+
+fixed union OwnedParameter:
+	UnmanagedParameter(TypeRef)
+	ManagedParameter(ManagedPassing)
+
+fixed record OwnedFunction {
+	parameters: List[OwnedParameter],
+	return_type: TypeRef,
+	operations: List[OwnershipOperation],
+	result: ReturnTransfer
+}
+```
+
+A `ParameterDefinition`'s result kind is built from its row, and the existing
+result-shape rule (`verify/verify.brp:1485`) reads the row.
+
+**Pins.** Instances taken as callables (`FreeCallableDefinition`,
+`CapturedCallableDefinition` targets), the entrypoint and future `foreign`
+functions are pinned borrowed. One function, `pinned_instances(program)`, in
+`own/own.brp`, which defines the ownership IR, finds them; own and verify both
+call it. Invocation keeps today's borrowed callable ABI and needs no adapters. The
+cost is that `rows.map(add_zero)` still copies each row, and so do direct calls
+of a pinned `add_zero`. Keith accepted the pins "so long as this is simpler
+than the alternative" and would like the callable restriction lifted in
+future. A suggested trigger, not his condition: callbacks specialising into
+direct calls.
+
+**No tail-call owning use.** Only annotated self tail recursion is
+guaranteed, and it becomes a loop that L2b.1 handles. Suggested revisit: the
+mutual-tail-call design.
+
+**Runtime-operation contract.** A builtin's reusable operand takes a move when
+one is available and otherwise accepts a plain borrow, which selects the copying
+helper with no atomic operations. User owned positions always receive a
+transfer. One function next to `Builtins` is the only authority:
+
+```blorp
+-- namespace/builtins.brp. Whether a runtime operation may reuse operand 0's
+-- buffer in place when it receives that operand's obligation.
+pure func reuses_first_operand[V, T](operation: RuntimeOperation[V, T]) -> Bool:
+	match operation:
+		StringConcat | StringAppendInt | ListAppend(_) | ListSet(_) | ListConcat(_): True
+		_: False
+```
+
+It replaces the four hard-coded copies at `own/own.brp:1083-1090`,
+`verify/verify.brp:578-586` (`consuming_update_borrows`),
+`emit/emit.brp:1049-1065` and `call_list_update` (`emit/emit.brp:2831`).
+
+**Inference is a monotone fixpoint over insertion's own decisions**, not a
+second copy of the move rules. The analysis runs insertion with the current
+contracts and with every managed parameter of the analysed function
+provisionally owned, giving each an owner o_p. Parameter p is labelled owned
+only if o_p itself reaches a `ConsumedArgument` at a reusing builtin operand
+or an owned user position, directly or through an L2b.1 header take, an L2b.2
+join entry, or a projection acquired after o_p is discharged. A fresh
+acquisition at a non-last-use call does not count, nor does a take that is
+only dropped or returned. For
+`pure func f(a: List[Int], b: List[Int]) -> List[Int]: a.append(b.length())`
+the provisional pass consumes o_a and drops o_b, so `a` is owned, `b`
+borrowed, and insertion re-runs.
+
+Labels only move from borrowed to owned. A flip adds a consuming position and
+turns a `BorrowedArgument`, which can block a move, into an acquisition, which
+cannot; if position 1 of `g(xs, xs)` becomes owned, `xs` can move into
+position 0. The worklist is seeded with functions that have a managed
+parameter and any `reuses_first_operand` call (the operand need not be the
+parameter: a loop header fed by it qualifies). Afterwards only callers of
+flipped functions are re-analysed, and a function whose final labels equal its
+provisional ones keeps that result. Each parameter flips at most once, so the
+work is O(S + P·C) analyses for S seeds, P managed parameters and C the
+largest caller count; strongly connected components need nothing special.
+
+**Call sites:**
+
+```text
+user call, owned position j, argument backed by owner o:
+	o dies at this step, no BorrowedArgument of the call depends on o,
+	and no later owned position of the call also receives o   -> ConsumedArgument(v, o)
+	otherwise                                                -> AcquireOwner(fresh) before the call;
+	                                                            ConsumedArgument(v, fresh)
+builtin operand 0 where reuses_first_operand                 -> move if o may move, else BorrowedArgument
+borrowed position                                            -> BorrowedArgument (today)
+```
+
+The dependency check generalises `consume_update_left` (`own/own.brp:1041`)
+to every owned position, through projection ancestry (`dependency_owner`).
+An owned parameter is then an ordinary local obligation: drop buckets, header
+takes, join entering and return moves apply unchanged.
+
+**Verifier.** Contracts are a specification; the verifier does not re-infer
+them. Rows must match specialization types and `value_needs_ownership`, and
+every row of a pinned instance is borrowed. Call sites are checked in two
+passes: first discharge consumed owners in argument order (a second discharge
+fails with "owner N has already been discharged"; a consumed argument appears
+only at an owned position or a reusing operand, and an owned position must
+receive one), then recheck every borrow against the post-discharge state
+through projection ancestry, as `discharge_update_argument` does today. An
+owned parameter introduces `ActiveOwner(DefinedOwner)`, which the existing exit
+checks must discharge.
+
+**Emitted C** keeps its types; only who drops changes, and a transferring call
+becomes eligible for a C sibling call:
+
+```c
+/* Borrowed: the caller drops after the call, and the callee copies. */
+struct blorp_l_0_i* const blorp_vl_9=blorp_f_42(blorp_vl_7,blorp_vl_8);
+blorp_list_drop_0_i(blorp_owner_3);
+return blorp_vl_9;
+/* Owned: the caller transfers, and the callee consumes or drops. */
+struct blorp_l_0_i* const blorp_vl_9=blorp_f_42(blorp_vl_7,blorp_vl_8);
+return blorp_vl_9;
+```
+
+Passing changes no semantics, so it needs no syntax.
+
+**Rejected.** Case-by-case fixes, because the parameter gaps need an
+interprocedural fact anyway. A Perceus rewrite of `own`, which already places
+drops by liveness; a rewrite adds the largest bootstrap risk for no capability
+this lacks.
+
+### O0: re-measure after L2b
+
+After L2b.2 and its seed pin, re-run the copy attribution on the new B. Add
+exact atomic increment and decrement counters at the RC sites and a sampled
+instruction profile; today's record and union dup counts include nested and
+no-op visits, so they are not atomic-operation counts. Report which copies
+L2b closed and the record, union and String RC traffic. O1 does not start
+before this report; O3 is decided from it.
+
+O0 also compares Blorp 2 against the legacy compiler. Its Core passes in
+`blorp/src/compiler/stage_09_core/` already infer consumed user-call arguments
+(`ownership_contracts.brp`), clone consuming record callees
+(`consume_specialize.brp`) and reuse record and union cells (`reuse.brp`, `record_update.brp`). The plan must match that
+reach with independent verification and far less code. Land `helper_accumulators` (modes `list_helper`,
+`string_helper`, `set_helper`, `none`) in `benchmarks/blorp/` and
+`benchmarks/blorp_2/` with an `args` file and an `EXTRA_BENCHMARKS` entry,
+like `control_flow_accumulators`. Build `helper_accumulators`,
+`control_flow_accumulators`, `compiler_ast`, `binary_trees` and
+`compiler_emit` with both compilers from the same commit, with the same C
+compiler and flags. Run each native program directly and serially. Report
+normal instructions and logical allocations per mode and size, and growth per
+doubling. The List and String modes set O1's legacy parity criterion;
+`compiler_ast` and `binary_trees` measure the record and union gap that
+decides O3.
+
+### O1: owned-parameter contracts
+
+**Preparation (separate commit).** One function, `consuming_helper_name`,
+produces the symbol of the in-place helper for a `RuntimeFunction` target
+where `reuses_first_operand` holds, never for a user call. The runtime
+definitions (`runtime/list.brp:268`, `282`, `302`; the literal C at
+`runtime/string_concat.brp:54` and `70`) and emit use it. A new fixture calls
+all five operations consumingly, so a missing helper fails to link.
+
+**Step 0: a bounded spike, reviewed before the main work.** Implement the
+contract and inference on a scratch branch that never lands. Confirm by
+diffing generated C that emit needs only the shared contract. Count
+transfers that needed an acquisition because the call was not the last use,
+statically and at run time. Report `own`'s share of self-compile instructions,
+the inference's added instructions and allocations, the pinned-instance count,
+and seed and re-analysis counts. The spike sets the binding ceilings below.
+
+**Then O1 proper**, test-first (see Testing). Production `own(program)` keeps
+its signature and calls an internal `insert_ownership(program, labelling)`
+with `InferredLabels`; tests call it with `AllBorrowed` or
+`AllOwnedExceptPinned` to prove labels never change behaviour (approved
+2026-10-28 as a test-only mechanism).
+
+O1 deletes the four copies of the five-target set, `consuming_update_borrows`, the
+operand-0 restriction and its message, and replaces these statements:
+`README.md` "Parameters borrow" (1230, 1950, 1963, 2334) and "Parameters
+never transfer" (2843); in this roadmap L1's "List calls remain declared
+wrapper calls, whose parameters borrow", "No interprocedural consuming ABI" under
+[capacity and ownership](#capacity-and-ownership-contract), the L2b
+statements that loop entry never retires the caller's obligation, and
+"Keep ordinary synchronous parameters borrowed" under
+[required ownership invariants](#required-ownership-invariants).
+`README.md:547` (a returned borrowed parameter) stays true.
+
+### O2: record update binds before it rebuilds
+
+Today lowering runs the base, the replacement expressions, then projections
+of unchanged fields, then a fresh construction. O2 projects the base fields
+the update reads first, and points replacement reads of `base.field` at those
+projections through typed field and value identities. That is sound because
+the base is immutable and projections have no effects:
+
+```text
+items0 = state.items      -- projected first
+count0 = state.count
+drop state                -- last use; items0 is unique if state was
+items1 = items0.append(item)
+count1 = count0.add(1)
+{ items = items1, count = count1 }
+```
+
+Replacement expressions still run once in written order, and the order
+fixture's output is unchanged. It replaces the evaluation-order text at
+`README.md:1320-1322` and the order comment at `lower/lower.brp:536-537`. O2 touches only lowering and may land before O1, but
+`push` becomes linear only once O1 makes `state` owned.
+
+### O3: cell reuse for records and union nodes
+
+Undecided until O0. Every update and rebuild allocates a fresh root
+(`README.md:1326`):
+
+```blorp
+pure func rename_all(path: Path, suffix: String) -> Path:
+	match path:
+		End: End
+		Step(name, rest): Step(name.add(suffix), rename_all(rest, suffix))   -- new node per step
+```
+
+The design is a reuse-token obligation: drop-for-reuse of a unique cell yields
+a token, and construction of the same instance consumes it; the token joins
+`reuses_first_operand`'s root match, which stays sound. It is a constant
+factor, adds a verifier owner state and two runtime helpers per layout, and
+spreads parameter labels, so it proceeds only if O0 shows record and union
+allocation traffic worth it. Without O3, Blorp 2 stays behind the legacy
+compiler on record and union rebuilding; O0's `compiler_ast` and
+`binary_trees` comparison sizes that gap.
+
+### Scope and non-goals
+
+O1 touches `own`, `verify`, `namespace/builtins.brp`, the runtime helper names and their tests. Emit changes only through the
+shared contract. Not in this plan: moves at stores and control edges
+(acquire-then-drop costs two atomic operations each; revisit after O0
+counts), a report, LSP or `@in_place` (new surface, needs approval),
+Lean-style owning uses beyond reuse (only after O3), owned callable parameters
+and tail-call owning use (see Pins). Do not touch L2b's worktrees or reopen
+its design.
+
+### Risks and unknowns
+
+- **B cost.** The seed-built B pays the inference without its benefit.
+  Interpolation lowers to `StringConcat` chains
+  (`check/expressions.brp:1950`), so many string-building functions are
+  seeded and may run insertion twice. If B breaches its cap, narrow the seed to
+  operands whose value flows from a parameter through headers, joins or
+  projections; that still over-approximates, so it stays safe.
+- **Atomic cost of acquisitions.** A labelled parameter whose callers are
+  rarely at a last use costs two atomics per call for no gain. Step 0 counts
+  these; the wasteful-label test catches labels never consumed.
+- **Pins.** Step 0 counts pinned instances. A large count means callbacks
+  dominate and the callable restriction should be revisited sooner.
+- **Bootstrap.** The old seed compiles O1, so the inference itself uses local
+  loops and never threads an accumulator through a helper.
+
+### Dependencies
+
+L2b.2 landed and its seed pinned; the O0 report. The preparation commit
+precedes O1. O2 is independent.
+
+### Testing
+
+Failing tests first:
+
+- **Own units:** roots; propagation through a chain, a strongly connected
+  component, a header take and a join entry; pins; generic instances; the
+  provisional-differs case above.
+- **Verify negatives:** `f(x, x)` with both positions owned (double
+  discharge); `f(xs, xs)` with position 0 owned and position 1 borrowed (the
+  borrow is backed by the moved owner); the same with position 1 a raw-IR
+  `ListElementDefinition` of `xs`, for projection ancestry; a consumed
+  argument at a borrowed position; a borrowed argument at an owned position;
+  an owned parameter live at return; a pinned owned row; a row that disagrees
+  with its type. Each checks its diagnostic text.
+- **Benchmark:** `helper_accumulators`, landed by O0 for both compilers. It
+  fails before O1.
+- **E2E fixtures** under strict accounting and ASan/UBSan: an owned parameter
+  on a return that lowers to `Break` (`lower_exit`, `lower/lower.brp:784-798`); on `?=`
+  exits; and a `@tail_recursive` List accumulator whose header takes the owned
+  parameter (the first managed tail-recursion fixture; stop and report if it
+  fails for unrelated reasons).
+- **Wasteful labels:** every owned label in self-compile and the fixtures is
+  consumed on some path; a violation fails the test gate, not compilation.
+
+| Mutation | Expected failures |
+| --- | --- |
+| Oracle: all borrowed | only benchmark and fixture cost ceilings; outputs identical |
+| Oracle: all owned except pins | no output change; every program verifies |
+| own: no acquisition before a non-last-use transfer | verify rejects a use of a discharged owner |
+| own: ignore borrowed dependencies in the move rule | the `f(xs, xs)` case, rejected by verify |
+| own: drop the pin scan | the callable-taken fixture: "pinned instance has an owned parameter" |
+| verify: skip the post-discharge recheck | the two dependency negatives only |
+| verify: skip the contract check | consumed-at-borrowed and borrowed-at-owned |
+| inference: one round only | the chain and SCC unit cases |
+
+Test migration: 58 test files reference `OwnershipProgram`, 57 build
+`BorrowedArgument` and 39 build `ParameterDefinition`; each `OwnedFunction`
+literal states its rows with explicit `owned = False`.
+
+Commands, narrowest first. The own and verify suites are new files beside
+`test_ownership_transfer.brp`, registered in `blorp_2/Makefile`:
+
+```bash
+make -C blorp_2 test-target-components \
+  TARGET_COMPONENT_SOURCES=blorp_2/test/unit/test_own/test_owned_parameters.brp
+make -C blorp_2 test-target-components \
+  TARGET_COMPONENT_SOURCES=blorp_2/test/unit/test_verify/test_owned_parameters.brp
+make -C blorp_2 test
+scripts/blorp2-fixpoint --prove
+git diff --check
+```
+
+Benchmarks, for both compilers at one commit, with `side` set to `base` or
+`candidate`. Allocations come from a second build with
+`-DBLORP_MEMORY_DIAGNOSTICS=1`, as `BENCH_ALLOC_STATS=1` does in
+`benchmarks/bench.sh`. Run every binary serially:
+
+```bash
+make && make -C blorp_2 compiler
+out=build/ownership/$side && mkdir -p $out
+for name in helper_accumulators control_flow_accumulators compiler_ast binary_trees compiler_emit; do
+  bin/blorp compile benchmarks/blorp/$name.brp -o $out/${name}_legacy.c
+  blorp_2/build/compiler --library-root blorp_2/standard_library \
+    benchmarks/blorp_2/$name.brp $out/${name}_blorp2.c
+  for compiler in legacy blorp2; do
+    clang -fwrapv -O2 -DBLORP_MEMORY_DIAGNOSTICS=0 $out/${name}_$compiler.c \
+      -o $out/${name}_$compiler -lm -lpthread
+  done
+done
+# Each mode at 4,096 doubling to 131,072; subtract the `none` control.
+/usr/bin/time -l $out/helper_accumulators_blorp2 list_helper 4096
+```
+
+### Acceptance criteria
+
+Provisional until step 0 sets them:
+
+- **Benchmark:** at most 2.3× normal instructions per doubling in every mode,
+  and equal logical allocations across sizes for `list_helper` and
+  `set_helper`.
+- **Legacy parity:** in every List and String mode of `helper_accumulators`
+  and `control_flow_accumulators`, at the largest size, Blorp 2's normal
+  instructions and logical allocations are at most the legacy compiler's,
+  and its growth per doubling is no worse. Report `compiler_ast`,
+  `binary_trees` and `compiler_emit` against O0 without a ceiling; they
+  belong to O3.
+- **Self-compile B** (built by the seed): instructions and allocations grow
+  by at most the step-0 inference cost plus 0.5%; hard cap +3%.
+- **Self-compile C** (built by B): no increase in allocations or minimum
+  instructions; identical behaviour on all e2e fixtures.
+- **Peak RSS:** investigate above +5%, ceiling +10%. **Emitted C bytes:**
+  investigate above +3%, ceiling +5%.
+- **Compile-time scaling:** generated chains of 16-128 helpers, 8-64 owned
+  parameters and strongly connected rings of 8-64 functions each compile
+  within 1.10× of base B, with no near-quadratic doubling; report worklist
+  analyses.
+- **Size:** about +370 to +580 production code lines (own +320-470, verify
+  +60-100, builtins +10), tests separate; step 0 sets the
+  binding ceiling. Legacy needs about 41,400 lines for comparable reach
+  (`perceus.brp`, `perceus/`, `ownership.brp`, `ownership_contracts.brp`,
+  `reuse.brp`, `consume_specialize.brp` and `record_update.brp` in
+  `blorp/src/compiler/stage_09_core/`), with special-case rewrites such as destination
+  forwarding and clone classification. If O1 needs a rewrite that the
+  contracts and the call-site rule cannot express, stop and ask instead of
+  adding one.
+
+### Release strategy
+
+Separate landings, each green: the helper-name preparation, O1, O2 (any time),
+O3 if approved. O1 needs no seed for correctness; publish a seed after it so
+the default builder gains the savings. Back out O1 by switching production to
+`AllBorrowed`, which the oracle proves equivalent, then revert.
+
+### Handback
+
+Return the branch and commits, the step-0 report before any O1 work, evidence
+for each criterion, the two review verdicts and remaining borrowed-call
+opportunities. Stop and ask on a premise that proves wrong, a ceiling breach,
+an ABI change beyond these contracts, or a result that looks like a compiler
+bug.
+
 ## M1b: names and the foundation
 
 **Goal.** The source's 34 namespaces resolve. **Scope.**
@@ -2393,8 +2889,9 @@ when the corresponding complete source-plus-library migration/inventory gate
 passes. Preserve reviewed future designs and held candidates. A retained stored
 payload witness can reopen the appropriate recursive-type prerequisite.
 
-Allocation reuse beyond unique-owner String and List buffers, retain
-elimination, consuming-ABI inference, List removal, Set/Dict
+Allocation reuse beyond unique-owner String and List buffers (record and union
+cell reuse is [O3](#o3-cell-reuse-for-records-and-union-nodes), pending its
+measurement), retain elimination, List removal, Set/Dict
 key semantics (storing a type does not make it a key), mutual tail calls,
 tail-modulo-constructor, closure escape and closure values, and the unit-test
 migration plan. When reuse is introduced, its enabled and always-fresh paths must
