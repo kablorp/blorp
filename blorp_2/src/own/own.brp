@@ -1,5 +1,5 @@
 import:
-	../namespace/builtins: RuntimeOperation(StringConcat, StringAppendInt, ListAppend)
+	../namespace/builtins: RuntimeOperation(StringConcat, StringAppendInt, ListAppend, ListSet, ListConcat)
 	result: Result methods_only
 	../check/model: MatchArmId, DecisionNodeId, ListLengthTest
 	../utils/boolean: not, and, or
@@ -1015,25 +1015,39 @@ private pure func matches_last_use(rows: List[ScheduledDrop], owner: OwnerId, po
 
 
 private pure func consume_update_left(
-	definition: OwnedDefinition, target: CallTarget, left: BorrowedValue, right: OwnedArgument,
+	definition: OwnedDefinition, target: CallTarget, left: BorrowedValue, arguments: List[OwnedArgument],
 	pre_step_drops: Option[List[ScheduledDrop]], loop_uses: List[ScheduledDrop], consumed: List[OwnerId],
 	position: Int, sources: List[ResultOwnership], enclosing: List[EnclosingBlock], first_value: Int,
 ) -> Result[OwnedDefinition, Diagnostic]:
 	owners ?= pre_step_drops.to_result(internal_error(definition.span, "missing drop schedule row"))
 	source ?= value_source(left.value, sources, enclosing, first_value, definition.span)
-	dependency ?= match right:
-		BorrowedArgument(borrow): dependency_owner(borrow.value, sources, enclosing, first_value, definition.span)
-		_: Ok(None)
 	match source:
 		OwnedResult(owner):
+			var independent: Bool = True
+			var failure: Option[Diagnostic] = None
+			var index = 0
+			for argument in arguments:
+				if index.greater_than(0):
+					match argument:
+						BorrowedArgument(borrow):
+							match dependency_owner(borrow.value, sources, enclosing, first_value, definition.span):
+								Err(error):
+									failure = Some(error)
+									break
+								Ok(Some(other)):
+									if owner_number(other).equals(owner_number(owner)):
+										independent = False
+								Ok(None): void
+						_: void
+				index = index.add(1)
 			last: Bool = matches_last_use(owners, owner, position).or(matches_last_use(loop_uses, owner, position))
-			independent: Bool = match dependency:
-				Some(other): owner_number(other).not_equals(owner_number(owner))
-				None: True
-			if and(and(last, independent), has_consumed(consumed, owner).not()):
-				Ok({ definition | operation = CallDefinition(target, [ConsumedArgument(left.value, owner), right]) })
-			else:
-				Ok(definition)
+			match failure:
+				Some(error): Err(error)
+				None:
+					if and(and(last, independent), has_consumed(consumed, owner).not()):
+						Ok({ definition | operation = CallDefinition(target, arguments.set(0, ConsumedArgument(left.value, owner))) })
+					else:
+						Ok(definition)
 		_: Ok(definition)
 
 
@@ -1043,9 +1057,12 @@ private pure func consume_update_argument(
 	enclosing: List[EnclosingBlock], first_value: Int,
 ) -> Result[OwnedDefinition, Diagnostic]:
 	match definition.operation:
-		CallDefinition(target, [BorrowedArgument(left), right]):
+		CallDefinition(target, arguments):
 			match target:
-				RuntimeFunction(StringConcat) | RuntimeFunction(StringAppendInt) | RuntimeFunction(ListAppend(_)): consume_update_left(definition, target, left, right, pre_step_drops, loop_uses, consumed, position, sources, enclosing, first_value)
+				RuntimeFunction(StringConcat) | RuntimeFunction(StringAppendInt) | RuntimeFunction(ListAppend(_)) | RuntimeFunction(ListSet(_)) | RuntimeFunction(ListConcat(_)):
+					match arguments.get(0):
+						Some(BorrowedArgument(left)): consume_update_left(definition, target, left, arguments, pre_step_drops, loop_uses, consumed, position, sources, enclosing, first_value)
+						_: Ok(definition)
 				_: Ok(definition)
 		_: Ok(definition)
 
@@ -1176,10 +1193,13 @@ private pure func insert_steps(
 							Err(error): Err(error)
 							Ok(consuming):
 								match consuming.operation:
-									CallDefinition(_, [ConsumedArgument(_, owner), _]):
-										consumed_here = Some(owner)
-										if matches_last_use(loop_uses, owner, step_position):
-											consumed = consumed.append(owner)
+									CallDefinition(_, arguments):
+										match arguments.get(0):
+											Some(ConsumedArgument(_, owner)):
+												consumed_here = Some(owner)
+												if matches_last_use(loop_uses, owner, step_position):
+													consumed = consumed.append(owner)
+											_: void
 									_: void
 								next_owner = built.next_owner
 								-- Stored payloads are acquired before the definition; a

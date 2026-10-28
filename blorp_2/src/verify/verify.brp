@@ -579,10 +579,10 @@ private pure func verify_argument(
 -- and position may subsequently transfer the obligation.
 private pure func consuming_update_borrows(target: CallTarget, arguments: List[OwnedArgument]) -> List[OwnedArgument]:
 	match target:
-		RuntimeFunction(Builtins.StringConcat) | RuntimeFunction(Builtins.StringAppendInt) | RuntimeFunction(Builtins.ListAppend(_)):
-			match arguments:
-				[ConsumedArgument(value, owner), right]:
-					[BorrowedArgument({ value = value, source = OwnerBorrow(owner) }), right]
+		RuntimeFunction(Builtins.StringConcat) | RuntimeFunction(Builtins.StringAppendInt) | RuntimeFunction(Builtins.ListAppend(_)) | RuntimeFunction(Builtins.ListSet(_)) | RuntimeFunction(Builtins.ListConcat(_)):
+			match arguments.get(0):
+				Some(ConsumedArgument(value, owner)):
+					arguments.set(0, BorrowedArgument({ value = value, source = OwnerBorrow(owner) }))
 				_: arguments
 		_: arguments
 
@@ -1382,26 +1382,36 @@ private pure func discharge_payloads(
 		None: Ok({ discharged = enclosing, owners = local })
 
 
--- Revalidate the other operand after discharging, so projection ancestry and
--- direct same-owner borrows cannot survive a consuming call. Distinct counted
+-- Revalidate every remaining operand after discharging, so projection ancestry
+-- and direct same-owner borrows cannot survive a consuming call. Distinct counted
 -- owners remain valid even when they reference the same runtime allocation.
 private pure func discharge_update_argument(
 	arguments: List[OwnedArgument], state: VerificationFacts,
 	discharged: List[Bool], owners: List[OwnerState],
 	unions: List[ConcreteUnion], records: List[ConcreteRecord], span: Span,
 ) -> Result[DischargedOwners, Diagnostic]:
-	match arguments:
-		[ConsumedArgument(value, owner), right]:
+	match arguments.get(0):
+		Some(ConsumedArgument(value, owner)):
 			match discharge_payloads([OwnedPayload(value, owner)], state, discharged, owners, unions, records, span):
 				Err(error): Err(error)
 				Ok(moved):
-					match right:
-						BorrowedArgument(borrow):
-							match verify_borrow(borrow, state, span, moved.discharged, moved.owners):
-								Err(error): Err(error)
-								Ok(_): Ok(moved)
-						UnmanagedArgument(_): Ok(moved)
-						ConsumedArgument(_, _): Err(verification_error(span, "consumed argument requires the first supported update operand"))
+					var failure: Option[Diagnostic] = None
+					var index = 0
+					for argument in arguments:
+						if index.greater_than(0):
+							checked: Result[Void, Diagnostic] = match argument:
+								BorrowedArgument(borrow): verify_borrow(borrow, state, span, moved.discharged, moved.owners)
+								UnmanagedArgument(_): Ok(void)
+								ConsumedArgument(_, _): Err(verification_error(span, "consumed argument requires the first supported update operand"))
+							match checked:
+								Err(error):
+									failure = Some(error)
+									break
+								Ok(_): void
+						index = index.add(1)
+					match failure:
+						Some(error): Err(error)
+						None: Ok(moved)
 		_: Ok({ discharged = discharged, owners = owners })
 
 

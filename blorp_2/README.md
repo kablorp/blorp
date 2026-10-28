@@ -2324,14 +2324,16 @@ payloads. Retaining a List root does not acquire its children again; its final
 release destroys each initialized slot exactly once.
 
 `append`, `set` and `concat` return an owned List; every old alias keeps its
-original elements. Direct `append` calls may transfer a last-used List owner,
-verified independently before emission. A unique transferred root reuses spare
-capacity and grows geometrically without acquiring/dropping existing children;
-the newly appended occurrence is acquired once. Shared roots copy. Ordinary
-parameters and named/stored callable wrappers still borrow. `set` and `concat`
-currently borrow and copy every stored result occurrence. `set` with a
-negative or out-of-range index returns an unchanged value; `append` and
-`concat` always produce the longer List. The runtime helper for an update
+original elements. Direct `append`, `set` and `concat` calls may transfer a
+last-used List owner, verified independently before emission. A unique
+transferred root reuses its storage: append/concat reserve geometrically and
+acquire only the incoming occurrences; set acquires the replacement before
+destroying the old occurrence. Existing unchanged children are not acquired or
+dropped again. Shared roots copy. Ordinary parameters and named/stored callable
+wrappers still borrow. Every other operand must remain valid after the transfer.
+`set` with a
+negative or out-of-range index returns an unchanged value. `append` adds one
+element; `concat` preserves both input sequences. The runtime helper for an update
 exists only where its operation is called.
 
 Checked `set_index` returns `Some(updated)` for a valid index and `None` otherwise.

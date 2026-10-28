@@ -388,7 +388,8 @@ must update both libraries and all callers together.
 
 ### Problem and established boundaries
 
-Status: L1 exact-literal implementation approved, 2026-10-26; L2 is next.
+Status: L1 landed as `85c1eabc3`; L2 is approved for publication and an
+L2-capable bootstrap is next.
 The earlier eager four-slot empty-literal variant passed
 functional gates but exceeded the RSS investigation threshold; its measurements
 remain recorded below. Implement in order, with code-reviewer and
@@ -680,6 +681,50 @@ Right consumption and symmetric reuse are deferred until profiling warrants them
 Acceptance: unique `set` is constant work independent of list length; unique
 concat with sufficient capacity copies/acquires only right-hand slots. Preserve
 all current contents, error/Option behavior and value semantics.
+
+### L2 validation
+
+The complete proof passes 301 component checks across 41 suites, 52 runtime/native
+checks and all 593 A/B fixture comparisons. A/B/C compiler C is identical
+(`cdd5e9e7405e`); all 43 strict suite reports balance with zero leaks.
+Forcing Set/Concat to copy produces exactly five expected runtime failures;
+releasing before acquiring produces exactly the same-child ASan failure.
+Both mutations use source snapshots; the real source and proved B stay unchanged.
+
+Matched measurements compare original self-built B at `7f0e8c9a6` with L2 on one
+frozen final L2 input/library. These are cumulative L1+L2 effects, not isolated
+incremental L2 gains. Compiler runs use Clang 21, `-O0`, one warmup, three normal
+pairs and one separate strict pair:
+
+| Whole self-compilation metric | Baseline | L2 candidate | Change |
+| --- | ---: | ---: | ---: |
+| Allocations | 30,494,724 | 28,617,145 | −6.16% |
+| Normal retired instructions, minimum of three | 1,101,555,890,537 | 1,053,827,395,104 | −4.33% |
+| Normal peak RSS, maximum bytes | 324,534,272 | 321,961,984 | −0.79% |
+| Diagnostic peak RSS, bytes | 323,043,328 | 324,796,416 | +0.54% |
+
+The user approved less repetition while measurement was underway. All three
+compiler normal pairs had already completed; native checks therefore use one
+normal and one strict observation per version, with no warmup, at `-O2`.
+Those approximate native totals include startup. The unchanged `list_ops.brp`
+main reduces allocations 139,923,218 → 95,171,822 (−31.98%) and normal instructions
+111,432,838,684 → 78,423,945,557 (−29.62%), with all six checksum lines identical.
+Append controls still reduce 1,027 / 2,051 / 4,099 allocations to four each.
+Do not infer an exact incremental speedup from historical L1 native samples.
+
+All 20 strict measurement reports balance with zero leaks; output identities and
+frozen guards pass. L2 adds 66 production and 977 test lines separately, within
+its production bound. Raw commands, source/binary hashes, actual sample counts,
+baseline snapshot repair and caveats are retained under ignored
+`build/list-buffer-reuse/l2/{proof,mutations,measurement}/`. No resource limits
+changed. Two independent source/cost/document reviews and the functional test
+review approve the complete change.
+
+Publish and pin an L2-capable seed before landing concat-based library loops:
+the current append-only seed cannot give those loops consuming concat calls in
+the first compiler it builds. Draft validation may use the explicitly proved
+L2 compiler while platform publication runs; the maintained proof follows pin
+activation. No implicit fallback or mixed library producer is permitted.
 
 ### L3: replace temporary balanced library copying
 
