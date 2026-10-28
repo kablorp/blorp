@@ -130,7 +130,7 @@ not a portable nesting threshold or a product-destruction proof.
 | [M0](#m0-foundation-closeout) | Re-cut, perf fixes, parser statement loop, fixpoint script, parity table | Landed. M3 owns the recorded managed-value call limits. |
 | [M1a](#m1a-surface-syntax-parity) | Layout and parsed source syntax | Pure lambda and callback syntax is implemented; current source-frontier evidence remains separate. |
 | [ML](#ml-list-construction) | `append`, `set`, `concat`, list literal | Done. Checked `set_index` is an ordinary target-library wrapper. |
-| [List buffer reuse](#list-buffer-reuse-roadmap) | Ownership-aware updates, four-slot first growth, doubling and simpler library loops | L1 append (`85c1eabc3`) and L2 set/concat (`90f684248`) landed. L2b (ownership transfer into loop entry and joins) is next, then one L2/L2b seed, then L3/L4. |
+| [List buffer reuse](#list-buffer-reuse-roadmap) | Ownership-aware updates, four-slot first growth, doubling and simpler library loops | L1 append (`85c1eabc3`) and L2 set/concat (`90f684248`) landed. L2 seed pinned. L2b (ownership transfer into loop entry and joins) is next, then an L2b seed, then L3/L4. |
 | [M1b](#m1b-names-and-the-foundation) | Namespace: private, aliases, qualified names, designated `Bool`/`Option`/`Result` | Parts A and B done; control-flow consumers follow in M2/M3. |
 | [M5](#m5-constants) | Literal scalar/String constants | Implemented. Source construction functions replace the need for record/opaque constants and initializer dependencies. |
 | [M2](#m2-the-join) | Restricted control positions, outer-variable joins, ordinary Boolean calls, `?=` and annotations | Joins, Result propagation, annotations, ordinary Boolean calls and restricted value/statement `if` implemented in integration; acceptance pending. General operand controls remain deferred. |
@@ -390,8 +390,9 @@ must update both libraries and all callers together.
 ### Problem and established boundaries
 
 Status: L1 landed as `85c1eabc3` with its seed pinned in `8d44d250b`; L2
-landed as `90f684248`. [L2b](#l2b-transfer-ownership-into-joins-and-loop-entry) is
-next, then one seed carrying L2 and L2b, before L3.
+landed as `90f684248`, and its seed `blorp2-seed-90f684248521` is pinned.
+[L2b](#l2b-transfer-ownership-into-joins-and-loop-entry) is next, then a seed
+carrying L2b, before L3.
 The earlier eager four-slot empty-literal variant passed
 functional gates but exceeded the RSS investigation threshold; its measurements
 remain recorded below. Implement in order, with code-reviewer and
@@ -722,16 +723,17 @@ baseline snapshot repair and caveats are retained under ignored
 changed. Two independent source/cost/document reviews and the functional test
 review approve the complete change.
 
-Publish and pin one seed carrying L2 and [L2b](#l2b-transfer-ownership-into-joins-and-loop-entry)
-before landing the L3 library loops: the current append-only seed cannot give
-those loops consuming calls in the first compiler it builds. Draft validation may use the explicitly proved
+The pinned L2 seed gives the L3 library loops consuming `set` and `concat` in
+the first compiler it builds. Publish and pin a seed carrying
+[L2b](#l2b-transfer-ownership-into-joins-and-loop-entry) before landing them,
+so appends inside their branches consume too. Draft validation may use the explicitly proved
 L2 compiler while platform publication runs; the maintained proof follows pin
 activation. No implicit fallback or mixed library producer is permitted.
 
 ### L2b: transfer ownership into joins and loop entry
 
 Status: planned. Land L2b.1 (loop entry) and then L2b.2 (joins) before L3, then
-publish one seed carrying L2 and L2b; L3 follows that pin.
+publish a seed carrying L2b; L3 follows that pin.
 
 #### Problem
 
@@ -1164,8 +1166,9 @@ For each stage:
 #### Release strategy
 
 Land L2b.1 and L2b.2 as separate squash commits, each after code review, test
-review and its measurements. Then publish and pin one seed carrying L2 and
-L2b through the qualified process; that pin unblocks L3. Each commit backs
+review and its measurements. Then publish and pin a seed carrying L2b (the
+L2 seed is already pinned) through the qualified process; that pin unblocks
+L3. Each commit backs
 out by revert: no format, ABI or library contract changes.
 
 #### Handback
