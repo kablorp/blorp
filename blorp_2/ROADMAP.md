@@ -130,7 +130,7 @@ not a portable nesting threshold or a product-destruction proof.
 | [M0](#m0-foundation-closeout) | Re-cut, perf fixes, parser statement loop, fixpoint script, parity table | Landed. M3 owns the recorded managed-value call limits. |
 | [M1a](#m1a-surface-syntax-parity) | Layout and parsed source syntax | Pure lambda and callback syntax is implemented; current source-frontier evidence remains separate. |
 | [ML](#ml-list-construction) | `append`, `set`, `concat`, list literal | Done. Checked `set_index` is an ordinary target-library wrapper. |
-| [List buffer reuse](#list-buffer-reuse-roadmap) | Ownership-aware updates, four-slot first growth, doubling and simpler library loops | L1 append (`85c1eabc3`) and L2 set/concat (`90f684248`) landed; an L2-capable seed, then L3/L4, are next. |
+| [List buffer reuse](#list-buffer-reuse-roadmap) | Ownership-aware updates, four-slot first growth, doubling and simpler library loops | L1 append (`85c1eabc3`) and L2 set/concat (`90f684248`) landed. L2b (ownership transfer into loop entry and joins) is next, then one L2/L2b seed, then L3/L4. |
 | [M1b](#m1b-names-and-the-foundation) | Namespace: private, aliases, qualified names, designated `Bool`/`Option`/`Result` | Parts A and B done; control-flow consumers follow in M2/M3. |
 | [M5](#m5-constants) | Literal scalar/String constants | Implemented. Source construction functions replace the need for record/opaque constants and initializer dependencies. |
 | [M2](#m2-the-join) | Restricted control positions, outer-variable joins, ordinary Boolean calls, `?=` and annotations | Joins, Result propagation, annotations, ordinary Boolean calls and restricted value/statement `if` implemented in integration; acceptance pending. General operand controls remain deferred. |
@@ -390,7 +390,8 @@ must update both libraries and all callers together.
 ### Problem and established boundaries
 
 Status: L1 landed as `85c1eabc3` with its seed pinned in `8d44d250b`; L2
-landed as `90f684248`. Publishing an L2-capable seed is next, before L3.
+landed as `90f684248`. [L2b](#l2b-transfer-ownership-into-joins-and-loop-entry) is
+next, then one seed carrying L2 and L2b, before L3.
 The earlier eager four-slot empty-literal variant passed
 functional gates but exceeded the RSS investigation threshold; its measurements
 remain recorded below. Implement in order, with code-reviewer and
@@ -721,11 +722,460 @@ baseline snapshot repair and caveats are retained under ignored
 changed. Two independent source/cost/document reviews and the functional test
 review approve the complete change.
 
-Publish and pin an L2-capable seed before landing concat-based library loops:
-the current append-only seed cannot give those loops consuming concat calls in
-the first compiler it builds. Draft validation may use the explicitly proved
+Publish and pin one seed carrying L2 and [L2b](#l2b-transfer-ownership-into-joins-and-loop-entry)
+before landing the L3 library loops: the current append-only seed cannot give
+those loops consuming calls in the first compiler it builds. Draft validation may use the explicitly proved
 L2 compiler while platform publication runs; the maintained proof follows pin
 activation. No implicit fallback or mixed library producer is permitted.
+
+### L2b: transfer ownership into joins and loop entry
+
+Status: planned. Land L2b.1 (loop entry) and then L2b.2 (joins) before L3, then
+publish one seed carrying L2 and L2b; L3 follows that pin.
+
+#### Problem
+
+L1/L2 reuse a List or String buffer only when a consuming call holds its last
+owner with reference count one. Two conservative rules defeat that inside
+control flow, and each copies the whole accumulator:
+
+1. **Loop entry always acquires.** Each managed header takes a fresh
+   acquisition of its initial value while the enclosing owner stays live until
+   after the loop, so the loop's first update sees count two and copies, once
+   per entry of an inner loop.
+2. **A join arm cannot discharge an enclosing owner.** An update inside an arm
+   borrows and copies every slot; the enclosing block drops the old owner after
+   the join, once per iteration.
+
+Both are quadratic for an accumulator. L2b.1 retains the reproduction as
+`benchmarks/blorp/control_flow_accumulators.brp` with its Blorp 2 port in
+`benchmarks/blorp_2/`, an `args` file and an `EXTRA_BENCHMARKS` entry, per
+`benchmarks/README.md`. Acceptance runs invoke the built native program
+directly with each mode and size. Its ordinary `main(args)` reads a mode and
+a total append count:
+
+```blorp
+import:
+	io: print
+	string: parse_int
+
+pure func in_arms(count: Int) -> List[Int]:
+	var values: List[Int] = []
+	for index in 0..count:
+		match index.remainder(2).equals(0):
+			True:
+				values = values.append(index)
+			False:
+				values = values.append(index.add(1))
+	values
+
+pure func nested(count: Int) -> List[Int]:
+	var values: List[Int] = []
+	for row in 0..count.divide(16):
+		for column in 0..16:
+			values = values.append(column)
+	values
+
+pure func flat(count: Int) -> List[Int]:
+	var values: List[Int] = []
+	for index in 0..count:
+		values = values.append(index)
+	values
+```
+
+`main` selects `in_arms`, `nested`, `flat` or a `none` control by its first
+argument, and prints the length. Measured at `9227d0418` with these
+functions, `blorp_2/build/compiler` from `make -C blorp_2 compiler`, then
+`clang -O2 x.c -lm -lpthread` and `/usr/bin/time -l` (retired instructions,
+about 12M of which is process startup):
+
+| Workload (n) | n | 2n | 4n |
+| --- | ---: | ---: | ---: |
+| in arms, 10,000 | 99,749,284 | 342,127,670 | 1,276,769,701 |
+| flat, 10,000 | 11,972,994 | 12,423,719 | 13,177,646 |
+| nested, 1,000 rows × 16 | 28,893,362 | 68,381,329 | 224,037,602 |
+
+Generated C confirms both mechanisms. In arms, the borrowed helper copies and
+the header owner retires only at the back edge:
+
+```c
+blorp_selection_15_arm_0:{
+  struct blorp_l_0_i* const blorp_vl_17=blorp_list_append_0_i(blorp_vl_6,blorp_vl_5);
+  blorp_list_dup_0_i(blorp_vl_17); blorp_list_drop_0_i(blorp_owner_6);
+  goto blorp_selection_15_done;
+...
+blorp_list_drop_0_i(blorp_owner_3);   /* old header, live through the arm */
+goto blorp_loop_3_header;
+```
+
+Nested, inner entry emits `blorp_list_dup_0_i(blorp_vl_6)` before the consuming
+`blorp_list_append_take_left_0_i`, whose shared fallback then copies once per
+row. An accumulator matched on itself, `match acc: Some(list): acc =
+Some(list.append(x))`, also takes the shared fallback every iteration in
+generated C (observed, not timed): `acc` stays live through the arm, so its
+payload is shared.
+
+Self-compilation has the same shape. A diagnostic `sample` profile (1 ms) of
+the seed-generated `blorp_2/build/compiler.c` (compiler A) rebuilt
+`-O2 -g -fno-omit-frame-pointer`, compiling `blorp_2/src/main.brp`, took
+32.1 s and 265,218,331,153 instructions. Of 24,689 samples, `lex`
+(`src/lex/lex.brp:1432`) held about 55% inclusive and `program_inventory`
+(`src/emit/emit.brp:2698`) about 28%, plus 8% dropping its `TypeRef` copies
+under `emit`. Both append in arms and nested loops. These are proxies; the
+matched baseline is self-built B (see [L2 validation](#l2-validation)).
+
+#### Background
+
+- Entry rule: `insert_loop` (`src/own/own.brp:1956`) calls
+  `leave_with(header.initial, borrowed_result(source), ...)`;
+  `consume_loop_transfer` (`src/verify/verify.brp:3293`) rejects
+  `DefinedOwner` with "loop transfer must use a fresh acquisition", for entry
+  (`verify.brp:3343`) and back edges (`verify.brp:3279`). M3 says "Entry
+  acquires internal loop owners from borrowed parameters and never retires
+  the caller's obligation."
+- Arm rule: yielding arms get `KeepsEnclosing` (`verify.brp:3144`; rationale
+  at `verify.brp:2341`). `insert_yielding_arm` (`own.brp:1602`) passes no
+  consumable rows to `insert_steps` (`own.brp:1622`), so `consume_update_left`
+  (`own.brp:1017`) never sees an enclosing owner's last use in an arm.
+- Existing pieces this reuses: `loop_consumption_uses` (`own.brp:1072`), the
+  owner-keyed last-use scan that gives loop terminals consumable rows;
+  `consumed`, inherited by nested blocks from their snapshot (`own.brp:1118`),
+  which suppresses the post-step drop (`own.brp:1280`) and edge retirement
+  (`retire_live`, `own.brp:1799`); `complete_loop_owners`, which compares
+  owners discharged since a captured state.
+- The selector `consume_update_argument` (`own.brp:1054`) is shared by
+  `StringConcat`, `StringAppendInt`, `ListAppend`, `ListSet` and `ListConcat`,
+  so String accumulators benefit equally.
+- [Invariant 1](#required-ownership-invariants) requires loops and joins to
+  carry obligations explicitly on edges.
+
+#### Proposed solution
+
+One rule: **an obligation whose last use in its block is a loop entry or a
+join transfers into that construct instead of being dropped after it.** A
+header initial and a join become consuming positions, beside the first
+operand of an admitted runtime update.
+
+- **L2b.1 loop entry.** At a `Loop` step, an owner transfers to a header when
+  it is last used at this step (its drop bucket, or inside a loop its loop
+  row), not consumed, backs exactly one header
+  initial (directly or through `dependency_owner`), and backs no body read.
+  The header's initial becomes `OwnedReturn(initial, owner)`: no entry
+  acquisition and no later retirement. Any other shared use keeps today's
+  acquisition, so two headers fed by one owner both acquire.
+- **L2b.2 joins.** At a `Join` step, the owners last used there and not
+  consumed (the step's drop bucket, loop rows and entering rows) become the
+  join's `entering` owners. Each yielding arm discharges each one exactly
+  once, at its last use within the arm: consumed by an update, transferred
+  into a nested join or loop header, dropped after its last read, dropped on
+  arm entry (after the selection edge's acquisitions) when unread, or retired
+  after the yield's acquisitions when the yield reads it. Abrupt arms already
+  retire every live loop-scope owner at the edge and can consume through loop
+  rows, so they need nothing new. Selection edges keep every owner live.
+
+This is the Perceus branch rule ([references](#established-references-and-local-choices);
+Lean's RC insertion does the same): an owned variable not live in the
+continuation belongs to the branches. The verifier checks the stated
+contract against actual operations, as it does for `ConsumedArgument`. Doing
+L2b.1 first is smaller and establishes the pattern L2b.2 reuses: the
+continuation records the discharge at the construct, and the construct's
+blocks are checked against it.
+
+Rejected alternatives:
+
+1. **Rewrite `lex`, `program_inventory` and L3's `filter`** around the limit.
+   That fixes one site at a time, distorts source (Blorp 2 principle 6) and
+   leaves every other accumulator quadratic.
+2. **Infer the entering set in the verifier.** Verification checks the
+   continuation before the arms, so it needs the set first; inferring it from
+   arm discharges would also make errors depend on arm order.
+3. **Pass entering values as new arm parameters.** Lowering would need
+   ownership facts and every arm reference would be renamed.
+4. **Enter only owners some arm consumes.** The enclosing drop decision would
+   wait on arm insertion, needing a second pass. Reconsider only if the
+   emitted-C ceiling fails.
+5. **Acquire at entry and drop the outer owner immediately.** Acquisitions
+   live inside `ExecuteLoop`, so that drop needs a new entry-drop list on
+   `OwnedLoop`; the transfer needs no new field, because a header transfer
+   naming an enclosing owner already states it.
+6. **A new `EnclosingDischarge` variant** restricting which owners an arm may
+   discharge. That would enforce one invariant in two places (each discharge
+   and the yield). One exact-set check at the yield suffices, mirroring
+   `complete_loop_owners`.
+7. **Count occurrences in today's `LoweredLoop.reads`** to tell whether the
+   body reads an owner. `reads` repeats every header initial, so the answer
+   would rest on an unstated counting convention; publishing body reads
+   alone states it and removes the duplicate.
+
+Phases: lower publishes body reads; own decides; verify checks. Check,
+specialize, emit and the runtime do not change: emit writes drops where they
+occur and initializes headers from `transfer_value(header.initial)`
+(`src/emit/emit.brp:2318`) whatever the owner. Parameters stay borrowed and
+never transfer.
+
+#### Code
+
+The "after" sketches are schematic; helper names are proposals.
+
+**L2b.1, lower.** `LoweredLoop.reads` (`src/lower/lower.brp:255`) repeats the
+initials (`lower.brp:1492`; tail-recursion loops at `lower.brp:2001`). It
+becomes `body_reads`; `step_reads` (`lower.brp:266`) returns
+`loop.headers.map(initial).concat(loop.body_reads)`, so use analysis and C are
+unchanged. Tail-recursion loops publish empty `body_reads`.
+
+**L2b.1, own.** The `Loop(loop)` case of `insert_steps` (`own.brp:1177`)
+records one decision per header in `PendingOwnedLoop`:
+
+```blorp
+-- A header takes its initial's obligation when this entry is the owner's last
+-- use and nothing else in the loop depends on it.
+private fixed union HeaderEntry:
+	AcquireAtEntry
+	TakeOwner(OwnerId)
+```
+
+`TakeOwner` owners join `consumed`. `insert_loop` (`own.brp:1940`) reads the
+decisions: `TakeOwner(owner)` emits `OwnedReturn(header.initial, owner)`;
+`AcquireAtEntry` keeps `leave_with(..., borrowed_result(source), ...)`.
+
+**L2b.1, verify.** Today `ExecuteLoop` (`verify.brp:2077`) leaves the
+continuation's `discharged` unchanged and `initialize_loop` runs later from
+`enter(pre, ...)`. After the change, at `ExecuteLoop`, each header initial
+whose owner is not one of `loop.entry_acquisitions` (membership, not
+`OwnerOrigin`: a projected owner is `AcquiredOwner`) is checked exactly as a
+`DropOwner` there via `verified_drop`, plus a new check that the owner owns
+that initial, and is marked discharged. `VerifyLoop` receives that one
+post-transfer state: under the exactly-one rule no entry acquisition borrows a
+transferred owner, and the body inherits its flags, so a body read or drop of
+a transferred initial is rejected as a use of a discharged owner. Back edges
+keep requiring fresh acquisitions.
+
+**L2b.2, own.** `OwnedJoin` (`own.brp:177`) gains the contract:
+
+```blorp
+fixed record OwnedJoin {
+	result: OwnedJoinParameter,
+	carried: List[OwnedJoinParameter],
+	-- Obligations whose last enclosing use is this join; every yielding arm
+	-- discharges each exactly once, and abrupt arms retire them at the edge.
+	entering: List[OwnerId],
+	selection: OwnedSelection,
+	arms: List[OwnedJoinArm]
+}
+```
+
+In `insert_steps`, the `Join(join)` case (`own.brp:1159`) snapshots the block
+for the arms **before** recording the transfer, so arms do not inherit the
+entering owners as consumed:
+
+```blorp
+Join(join):
+	entering = last_used_here(pre_step_drops, loop_uses, entering_rows, consumed, step_position)
+	snapshot = enclosing.append({ ..., consumed = consumed })   -- excludes entering
+	entries = entries.append(AwaitingArms({ join = join, entering = entering, enclosing = snapshot, ... }))
+	consumed = consumed.concat(entering)                          -- continuation only
+```
+
+`loop_consumption_uses` splits into candidate selection and a shared
+owner-keyed scan, `enclosing_owner_uses`. `insert_yielding_arm` calls it for
+`pending.entering` and passes the rows to `insert_steps` as `entering_rows`.
+These rows go into drop buckets, never into the arm's `owners`, so the
+enclosing snapshot keeps the single row that abrupt arms retire. A row with
+no use drops on entry; a terminal row is retired by `leave_join` after the
+yield's acquisitions (`retire_terminal_sources`, `own.brp:1499`, cannot: the
+owner has no local slot). Every discharge of an entering row in the arm
+(consume, drop, nested join, header) appends it to the arm's `consumed`, as
+`own.brp:1200–1201` already does for loop rows, so a later `break` cannot retire
+it again. Abrupt arms receive no entering rows.
+
+**L2b.2, verify.** At `ExecuteJoin` (`verify.brp:2064`) each entering owner is
+checked as a `DropOwner` there and marked discharged in the continuation; the
+arms start from the pre-join `start`. Yielding arms receive
+`MayDischargeEnclosing` instead of `KeepsEnclosing` (`verify.brp:3144`), and
+`verify_join_transfers` (`verify.brp:2409`) requires the enclosing owners
+newly discharged since arm entry to equal `join.entering` exactly, reporting
+"join arm leaves entering owner N live" or "join arm discharges owner N, which
+does not enter its join". `KeepsEnclosing` remains for selection edges. Those
+edges already admit only local drops and transfers (`verify.brp:2975`), so
+confirm whether its arm of `discharge` (`verify.brp:280`) becomes
+unreachable; if so, delete `EnclosingDischarge` in the same change.
+
+#### Scope and non-goals
+
+Production: `src/lower/lower.brp` (`body_reads`), `src/own/own.brp`,
+`src/verify/verify.brp`. Every `OwnedJoin` and `LoweredLoop` literal in active
+and deferred suites is updated mechanically in the same change (`ExecuteJoin(`
+appears 93 times in 41 test files; `reads =` 24 times in `.brp` tests). Expectations that
+encode a replaced rule change deliberately. In L2b.1, `InitialConsumesPre`
+(`test/unit/test_verify/test_source_loop_control.brp:199`) becomes an
+accepted transfer or a sharper rejection. In L2b.2, four deferred raw-IR cases expect
+"owner N is discharged before its join" from a yielding arm
+(`test_verify/test_join.brp:320,513`, `test_carried_join.brp:288`,
+`test_string_concat.brp:453`); that message becomes unreachable there, and
+they expect "join arm discharges owner N, which does not enter its join" at
+the yield's span. The source cases `test_own/test_list_updates.brp:366,369`
+still hold for owners read after the join and are only renamed.
+
+Documentation updated with the code: README.md:603–607 and 1967; the
+`verify.brp` comments at 150–152 and 2339–2342; the M3 entry sentence.
+
+Out of scope: emit, runtime, check, specialize, the target library, the
+compiler-source witnesses, consuming parameters, record-update reuse
+(`{ s | items = s.items.append(x) }` stays quadratic and may appear in the
+re-profile), loop-invariant obligations discharged at exits, transferring
+carried yield outputs, and the `DropInEachArm` loop-match prefix. Report a
+need to change these.
+
+#### Risks and unknowns
+
+- **Double discharge at an abrupt edge** is the central trap; the snapshot and
+  `consumed` rules in L2b.2 own exist for it.
+- **Emitted C grows** where unconsumed entering owners drop in each arm,
+  multiplied by nesting depth in `?=` and else-if chains (1,046 `?=` lines in
+  `src`). A static scan of today's generated compiler C, counting drops that
+  directly follow a join's completion (5,056 after 3,711 joins), estimates
+  +0.98% before the nesting multiplier.
+- **Bootstrap.** Compiler A applies the new rules to what it compiles, but its
+  own code was built by the L1 seed; cost claims use self-built B, and
+  `make -C blorp_2` stays slow until the L2b seed is pinned.
+- **Another quadratic pattern** may surface; re-profile and report it rather
+  than adding a source workaround.
+
+#### Dependencies
+
+Keith's approval of this plan, including the `OwnedJoin.entering` contract and
+the transfer rule. L2 has landed; no seed is needed to start.
+
+#### Testing
+
+New suites, each added to `TARGET_COMPONENT_SOURCES` (`blorp_2/Makefile:15`)
+so `make -C blorp_2 test` and `--prove` run them:
+
+- `test/unit/test_lower/test_loop_reads.brp`: `body_reads` excludes initials;
+  `step_reads` keeps them; tail-recursion loops publish none.
+- `test/unit/test_own/test_ownership_transfer.brp`:
+  - L2b.1: a dying owner transfers; acquire when the body also reads it and
+    when two headers share it; a
+    projected owner (`var items = state.items`) transfers, and two headers
+    initialized from projections of one record each take their own acquired
+    owner; a String accumulator.
+  - L2b.2: the entering set of a statement `if`, a value `match`, a `?=`
+    chain with live prefix owners, and an else-if chain; no entry for an owner
+    read after the join or kept by `old = values`; an owner unread in one
+    arm, read in another, consumed in a third; nested forwarding, including
+    into a join with a `break` arm; a `break` after an in-arm consumption
+    retires nothing again; the Option accumulator matched on itself consumes
+    its payload; a String accumulator; a loop inside a join arm taking an
+    entering owner.
+- `test/unit/test_verify/test_ownership_transfer.brp`, raw negatives with
+  exact messages; the header cases land in L2b.1, the join cases in L2b.2: a drop or read of a transferred header owner after the loop
+  or in its body; a header owner that does not own its initial; a loop in a
+  yielding arm taking a non-entering owner ("owner N is discharged before its
+  join" in L2b.1, the yield's exact-set message after L2b.2); an inactive or duplicate entering
+  owner; a drop after the join; an arm leaving an entering owner live; an arm
+  discharging a non-entering owner; a selection edge discharging an entering
+  owner; an abrupt arm discharging an entering owner twice; a borrow of an
+  entering owner's value after the join.
+- `test/unit/test_emit/test_ownership_transfer.brp`: no entry `dup` for a
+  taken header; the consuming helper in each arm; per-arm drops and none
+  after the join.
+- E2e: `test/e2e/fixtures/list/loop_entry_accumulator.brp` and
+  `branch_accumulator.brp`, registered in `self_hosted_harness.brp` with exact
+  stdout and allocations, covering snapshots printed after updates, nested
+  `List[String]` elements, a String accumulator, the Option accumulator and
+  a `break` arm, under
+  strict accounting and ASan/UBSan.
+
+Oracle mutations (restore before gates):
+
+| Mutation | Expected failures |
+| --- | --- |
+| own: always `AcquireAtEntry` | loop-entry e2e allocations, own and emit L2b.1 transfer cases |
+| verify: skip the new owns-its-initial check | the not-its-initial negative only |
+| verify: skip the `ExecuteLoop` discharge | the after-loop drop and body-read negatives, and every own-produced transfer, which then fails at return, yield or an edge because its owner stays live |
+| own: `entering = []` | branch e2e allocations, own and emit L2b.2 entry cases |
+| own: snapshot includes `entering` in `consumed` | own-produced IR rejects with "join arm leaves entering owner N live", and abrupt arms with "loop-local owner remains live at an edge" |
+| own: entering rows also in the arm's `owners` | the `break` own case and the e2e `break` case fail verification |
+| verify: skip the yield exact-set check | the two arm-discharge negatives only |
+
+Commands, narrowest first:
+
+```bash
+make -C blorp_2 test-compiler
+make -C blorp_2 test-target-components \
+  TARGET_COMPONENT_SOURCES=blorp_2/test/unit/test_own/test_ownership_transfer.brp
+make -C blorp_2 test-target-components \
+  TARGET_COMPONENT_SOURCES=blorp_2/test/unit/test_verify/test_ownership_transfer.brp
+make -C blorp_2 test
+scripts/blorp2-fixpoint --prove
+git diff --check
+```
+
+Profile recipe, run once at the base commit and once at the candidate
+(macOS `sample`). `fixpoint/b.c` is the C that B emits, identical to B's own
+source at the fixpoint; `--prove` overwrites `blorp_2/build/fixpoint/`, so
+copy each run's artifacts first:
+
+```bash
+side=base   # or candidate
+mkdir -p build/l2b/$side
+scripts/blorp2-fixpoint --prove
+cp blorp_2/build/fixpoint/b.c build/l2b/$side/b.c
+clang -O2 -g -fno-omit-frame-pointer -DBLORP_MEMORY_DIAGNOSTICS=0 \
+  build/l2b/$side/b.c -o build/l2b/$side/b_profile -lm -lpthread
+build/l2b/$side/b_profile --library-root blorp_2/standard_library \
+  blorp_2/src/main.brp build/l2b/$side/self.c &
+sample $! 600 1 -mayDie -file build/l2b/$side/sample.txt
+```
+
+#### Acceptance criteria
+
+For each stage:
+
+1. The new suites and fixtures fail before and pass after; each oracle
+   mutation fails exactly its listed tests.
+2. **Scaling.** `control_flow_accumulators.brp` at 16,384 / 32,768 / 65,536 /
+   131,072 appends, in mode `nested` for L2b.1 and `in_arms` for L2b.2: logical allocations are equal at
+   every size (growth resizes; the [capacity
+   contract](#capacity-and-ownership-contract) counts logical allocations),
+   and native normal instructions minus the `none` control grow at most 2.3×
+   per doubling.
+3. **Compile-time scaling.** B compiling inputs of 16 / 32 / 64 / 128
+   sequential and nested `if` arms that append, generated by a scratch script
+   under `build/l2b/` that is not retained: candidate whole-compile
+   instructions are within 1.10× of base B at every size, and no repeatable
+   near-quadratic doubling appears that base lacks.
+4. `scripts/blorp2-fixpoint --prove` passes; every strict report balances.
+5. **Fixtures.** No e2e allocation count increases. Every differing emitted
+   fixture C (A, base versus candidate) is classified as drops moved into
+   arms, a borrowed update becoming consuming, or a removed entry
+   acquisition, with counts reported; any other difference is investigated.
+6. **Self-compilation** on one frozen input, B at `-O0`, one warmup, three
+   normal samples and one strict, against self-built B at `9227d0418`:
+   allocations and normal minimum instructions do not increase; peak RSS is
+   investigated above +10%; emitted C bytes are investigated above +5% with a
+   +10% ceiling (the roadmap's feature default; the static estimate is about
+   +1%). After L2b.2, the target is at least 50% fewer instructions, with
+   `lex` and `program_inventory` each under 5% of inclusive samples in the
+   matched profile; a miss means re-profiling and reporting.
+7. **Production lines**, formatted, tests separate: L2b.1 investigate above
+   +60, ceiling +80; L2b.2 investigate above +120, ceiling +150.
+
+#### Release strategy
+
+Land L2b.1 and L2b.2 as separate squash commits, each after code review, test
+review and its measurements. Then publish and pin one seed carrying L2 and
+L2b through the qualified process; that pin unblocks L3. Each commit backs
+out by revert: no format, ABI or library contract changes.
+
+#### Handback
+
+Return commits, review verdicts, test counts and failures, mutation outcomes,
+matched metrics, line counts, profile tops before and after, evidence paths
+under `build/l2b/`, and remaining borrowed updates in `lex` and
+`program_inventory`. Stop and ask when the verifier needs a permission kind
+beyond the existing two, emit or the runtime must change, a ceiling fails,
+the shared scan shows in the profile, or a premise above proves wrong.
 
 ### L3: replace temporary balanced library copying
 
@@ -744,14 +1194,10 @@ pure func map[T, U](values: List[T], callback: pure (T) -> U) -> List[U]:
 This keeps source order and evaluates each callback once. Filter keeps matching
 elements in order; take/drop/copy-range clamp bounds exactly as today; reverse
 walks source indices backward. Port remove only through these existing helpers.
-Continuing joins deliberately keep captured owners borrowed. Do not put a growing
-accumulator append inside such a branch and assume it reuses. For filter, select
-an independently owned `[]` or `[value]` chunk in the branch, then concatenate
-that chunk into the accumulator **after** the join using L2's consuming path.
-Use the same structure around fallible `get` for bounded copying/reverse.
-This is linear work, including transient chunk roots; it is not allocation-free
-skipping. Require an owned-IR witness that concat consumes the accumulator and
-that empty right chunks do not copy its live slots before claiming linearity.
+After L2b, an append inside a branch consumes the accumulator, so filter appends
+each matching element in its branch, and bounded copying/reverse append inside
+the match on fallible `get`. Require an owned-IR witness that each append
+consumes the accumulator before claiming linearity.
 Delete replaced recursion and temporary concatenation paths in the same change.
 Do not rewrite unrelated compiler call sites to compensate for a missing fast
 path. Acceptance: linear element visits/output construction, constant traversal
