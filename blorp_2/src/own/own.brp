@@ -862,8 +862,24 @@ private fixed record PendingOwnedJoin {
 }
 
 
+-- How a loop header receives its initial value, decided once at the loop step.
+-- A header takes the obligation of an owner whose last use is this entry and
+-- that nothing else in the loop depends on; any other initial acquires.
+private fixed union HeaderEntry:
+	AcquireAtEntry
+	TakeOwner(OwnerId)
+
+
+private fixed record EnteringHeader {
+	header: Lower.LoopHeader,
+	entry: HeaderEntry
+}
+
+
+-- `headers` are the loop's headers in order, each with its entry decision.
 private fixed record PendingOwnedLoop {
 	loop: LoweredLoop,
+	headers: List[EnteringHeader],
 	result: OwnedJoinParameter,
 	carried: List[OwnedJoinParameter],
 	enclosing: List[EnclosingBlock]
@@ -1014,6 +1030,14 @@ private pure func matches_last_use(rows: List[ScheduledDrop], owner: OwnerId, po
 	last
 
 
+-- An obligation may transfer at this step when the step is its last use, in
+-- this block's drop bucket or an enclosing loop row, and it is not consumed.
+private pure func transferable_here(
+	step_drops: List[ScheduledDrop], loop_uses: List[ScheduledDrop], consumed: List[OwnerId], owner: OwnerId, position: Int,
+) -> Bool:
+	and(matches_last_use(step_drops, owner, position).or(matches_last_use(loop_uses, owner, position)), has_consumed(consumed, owner).not())
+
+
 private pure func consume_update_left(
 	definition: OwnedDefinition, target: CallTarget, left: BorrowedValue, arguments: List[OwnedArgument],
 	pre_step_drops: Option[List[ScheduledDrop]], loop_uses: List[ScheduledDrop], consumed: List[OwnerId],
@@ -1040,11 +1064,10 @@ private pure func consume_update_left(
 								Ok(None): void
 						_: void
 				index = index.add(1)
-			last: Bool = matches_last_use(owners, owner, position).or(matches_last_use(loop_uses, owner, position))
 			match failure:
 				Some(error): Err(error)
 				None:
-					if and(and(last, independent), has_consumed(consumed, owner).not()):
+					if and(independent, transferable_here(owners, loop_uses, consumed, owner, position)):
 						Ok({ definition | operation = CallDefinition(target, arguments.set(0, ConsumedArgument(left.value, owner))) })
 					else:
 						Ok(definition)
@@ -1099,6 +1122,68 @@ private pure func loop_consumption_uses(
 	match failure:
 		Some(error): Err(error)
 		None: Ok(rows)
+
+
+-- A transferable owner moves into its header only when its own initial is
+-- the one read of the loop step it backs: `reads` holds every header initial
+-- and every body read. Two headers fed by one owner therefore both acquire.
+private pure func sole_backer_entry(
+	owner: OwnerId, reads: List[ValueId], sources: List[ResultOwnership],
+	enclosing: List[EnclosingBlock], first_value: Int, span: Span,
+) -> Result[HeaderEntry, Diagnostic]:
+	var backed = 0
+	var failure: Option[Diagnostic] = None
+	for value in reads:
+		match dependency_owner(value, sources, enclosing, first_value, span):
+			Ok(Some(other)):
+				if owner_number(other).equals(owner_number(owner)):
+					backed = backed.add(1)
+			Ok(None): void
+			Err(error):
+				failure = Some(error)
+				break
+	match failure:
+		Some(error): Err(error)
+		None:
+			if backed.equals(1):
+				Ok(TakeOwner(owner))
+			else:
+				Ok(AcquireAtEntry)
+
+
+-- A header takes its initial's obligation when the owner holds the initial
+-- itself, may transfer at this step and backs no other read of the step.
+private pure func header_entry(
+	header: Lower.LoopHeader, reads: List[ValueId], step_drops: List[ScheduledDrop], loop_uses: List[ScheduledDrop],
+	consumed: List[OwnerId], position: Int, sources: List[ResultOwnership], enclosing: List[EnclosingBlock], first_value: Int,
+) -> Result[HeaderEntry, Diagnostic]:
+	source ?= value_source(header.initial, sources, enclosing, first_value, header.parameter.span)
+	match source:
+		OwnedResult(owner):
+			if transferable_here(step_drops, loop_uses, consumed, owner, position):
+				sole_backer_entry(owner, reads, sources, enclosing, first_value, header.parameter.span)
+			else:
+				Ok(AcquireAtEntry)
+		_: Ok(AcquireAtEntry)
+
+
+private pure func entering_headers(
+	loop: LoweredLoop, reads: List[ValueId], pre_step_drops: Option[List[ScheduledDrop]],
+	loop_uses: List[ScheduledDrop], consumed: List[OwnerId], position: Int,
+	sources: List[ResultOwnership], enclosing: List[EnclosingBlock], first_value: Int,
+) -> Result[List[EnteringHeader], Diagnostic]:
+	step_drops ?= pre_step_drops.to_result(internal_error(loop.result.span, "missing drop schedule row"))
+	var entering: List[EnteringHeader] = []
+	var failure: Option[Diagnostic] = None
+	for header in loop.headers:
+		match header_entry(header, reads, step_drops, loop_uses, consumed, position, sources, enclosing, first_value):
+			Ok(entry): entering = entering.append({ header = header, entry = entry })
+			Err(error):
+				failure = Some(error)
+				break
+	match failure:
+		Some(error): Err(error)
+		None: Ok(entering)
 
 
 private pure func insert_steps(
@@ -1178,13 +1263,22 @@ private pure func insert_steps(
 				match build_outputs(loop.result, loop.carried, next_owner, unions, records):
 					Err(error): Err(error)
 					Ok(built):
-						entries = entries.append(AwaitingLoop({
-							loop = loop, result = built.result, carried = built.carried,
-							enclosing = enclosing.append({ first_value = first_value, sources = sources, owners = owners, position = step_position, consumed = consumed })
-						}))
-						next_owner = built.next_owner
-						carried = built.carried
-						Ok(join_ownership(built.result))
+						match entering_headers(loop, step_reads(step), pre_step_drops, loop_uses, consumed, step_position, sources, enclosing, first_value):
+							Err(error): Err(error)
+							Ok(entering):
+								-- Taken owners belong to their headers: no drop after this step,
+								-- and no retirement at an enclosing loop's edge.
+								for decided in entering:
+									match decided.entry:
+										TakeOwner(owner): consumed = consumed.append(owner)
+										AcquireAtEntry: void
+								entries = entries.append(AwaitingLoop({
+									loop = loop, headers = entering, result = built.result, carried = built.carried,
+									enclosing = enclosing.append({ first_value = first_value, sources = sources, owners = owners, position = step_position, consumed = consumed })
+								}))
+								next_owner = built.next_owner
+								carried = built.carried
+								Ok(join_ownership(built.result))
 			Define(definition):
 				match build_definition(definition, sources, enclosing, first_value, next_owner, unions, records):
 					Err(error): Err(error)
@@ -1727,7 +1821,7 @@ private pure func complete_joins(
 			Inserted(operation):
 				operations = operations.append(operation)
 			AwaitingLoop(pending):
-				match insert_loop(pending.loop, pending.enclosing, next_value, next_owner, unions, records):
+				match insert_loop(pending.loop, pending.headers, pending.enclosing, next_value, next_owner, unions, records):
 					Err(error):
 						failure = Some(error)
 						break
@@ -1939,6 +2033,7 @@ private pure func insert_loop_block(
 
 private pure func insert_loop(
 	loop: LoweredLoop,
+	entering: List[EnteringHeader],
 	enclosing: List[EnclosingBlock],
 	first_value: Int,
 	initial_owner: Int,
@@ -1949,23 +2044,26 @@ private pure func insert_loop(
 	var initials: List[ReturnTransfer] = []
 	var next_owner = initial_owner
 	var failure: Option[Diagnostic] = None
-	for header in loop.headers:
-		match value_source(header.initial, [], enclosing, first_value, header.parameter.span):
-			Err(error): failure = Some(error)
-			Ok(source):
-				left = leave_with(header.initial, borrowed_result(source), [], next_owner, header.parameter.span)
-				for entry in left.entries:
-					match entry:
-						Inserted(AcquireOwner(owner, borrow, _)): acquisitions = acquisitions.append({ owner = owner, borrow = borrow })
-						_: failure = Some(internal_error(header.parameter.span, "loop entry contains a non-acquisition operation"))
-				initials = initials.append(left.transfer)
-				next_owner = left.next_owner
+	for decided in entering:
+		match decided.entry:
+			TakeOwner(owner): initials = initials.append(OwnedReturn(decided.header.initial, owner))
+			AcquireAtEntry:
+				match value_source(decided.header.initial, [], enclosing, first_value, decided.header.parameter.span):
+					Err(error): failure = Some(error)
+					Ok(source):
+						left = leave_with(decided.header.initial, borrowed_result(source), [], next_owner, decided.header.parameter.span)
+						for entry in left.entries:
+							match entry:
+								Inserted(AcquireOwner(owner, borrow, _)): acquisitions = acquisitions.append({ owner = owner, borrow = borrow })
+								_: failure = Some(internal_error(decided.header.parameter.span, "loop entry contains a non-acquisition operation"))
+						initials = initials.append(left.transfer)
+						next_owner = left.next_owner
 		if failure.is_some():
 			break
 	ready: Void ?= match failure:
 		Some(error): Err(error)
 		None: Ok(void)
-	inputs ?= build_inputs(loop.headers.map(pure func(header): header.parameter), next_owner, unions, records)
+	inputs ?= build_inputs(entering.map(pure func(decided): decided.header.parameter), next_owner, unions, records)
 	var headers: List[OwnedLoopHeader] = []
 	var position = 0
 	for parameter in inputs.parameters:
@@ -1977,7 +2075,7 @@ private pure func insert_loop(
 		Some(error): Err(error)
 		None: Ok(void)
 	scope: LoopScope = { target = Lower.loop_target(loop.result.id), pre_blocks = enclosing.length() }
-	body ?= insert_loop_block(loop.body, inputs.parameters, loop.headers.length(), enclosing, scope, first_value, inputs.next_owner, loop.result.span, unions, records)
+	body ?= insert_loop_block(loop.body, inputs.parameters, entering.length(), enclosing, scope, first_value, inputs.next_owner, loop.result.span, unions, records)
 	Ok({ acquisitions = acquisitions, headers = headers, body = body.body, next_value = body.next_value, next_owner = body.next_owner })
 
 

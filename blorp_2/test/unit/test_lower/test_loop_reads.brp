@@ -1,0 +1,129 @@
+import:
+	../../../src/lower/lower as Lower
+	../list_update_inputs: lowered, UPDATE_DECLARATIONS
+	int: Int methods_only
+	bool: Bool methods_only
+	list: List methods_only
+	string: String methods_only
+	result: Result methods_only
+	option: Option methods_only
+	test: TestSuite
+
+
+-- The only loop of a lowered program, with the definition ids of its function.
+private fixed record FoundLoop {
+	loop: Lower.LoweredLoop,
+	step: Lower.LoweredStep,
+	defined: List[Lower.ValueId]
+}
+
+
+private pure func only_loop(source: String) -> Option[FoundLoop]:
+	var found: Option[FoundLoop] = None
+	functions = match lowered(source):
+		Ok(program): Lower.lowered_functions(program).functions
+		Err(_): []
+	for function in functions:
+		var defined: List[Lower.ValueId] = []
+		for step in function.steps:
+			match step:
+				Lower.Define(definition): defined = defined.append(definition.id)
+				Lower.Loop(loop): found = Some({ loop = loop, step = step, defined = defined })
+				Lower.Join(_): void
+	found
+
+
+private pure func same_values(left: List[Lower.ValueId], right: List[Lower.ValueId]) -> Bool:
+	var same: Bool = left.length().equals(right.length())
+	var index = 0
+	for value in left:
+		match right.get(index):
+			Some(other): same = same.and(Lower.value_number(value).equals(Lower.value_number(other)))
+			None: same = False
+		index = index.add(1)
+	same
+
+
+private pure func initials(loop: Lower.LoweredLoop) -> List[Lower.ValueId]:
+	loop.headers.map(pure func(header): header.initial)
+
+
+pure func test_body_reads_exclude_header_initials() -> Bool:
+	body: String =
+		|pure func collect() -> List[Int]:
+		|    var values: List[Int] = []
+		|    limit = 12
+		|    while less_than(length(values), limit):
+		|        values = append(values, 7)
+		|    values
+		|func main() -> Int:
+		|    unused = collect()
+		|    0
+		|
+	match only_loop(UPDATE_DECLARATIONS.add(body)):
+		None: False
+		Some(found):
+			match found.defined:
+				[empty, limit]:
+					same_values(initials(found.loop), [empty])
+						.and(same_values(found.loop.body_reads, [limit]))
+						.and(same_values(Lower.step_reads(found.step), [empty, limit]))
+				_: False
+
+
+-- A body that itself reads the initial's value publishes that read once.
+pure func test_body_read_of_an_initial_value_is_published_once() -> Bool:
+	body: String =
+		|pure func collect() -> List[Int]:
+		|    original: List[Int] = []
+		|    var values = original
+		|    while less_than(length(values), 12):
+		|        values = append(values, length(original))
+		|    values
+		|func main() -> Int:
+		|    unused = collect()
+		|    0
+		|
+	match only_loop(UPDATE_DECLARATIONS.add(body)):
+		None: False
+		Some(found):
+			match found.defined:
+				[original]:
+					same_values(initials(found.loop), [original])
+						.and(same_values(found.loop.body_reads, [original]))
+						.and(same_values(Lower.step_reads(found.step), [original, original]))
+				_: False
+
+
+pure func test_tail_recursion_loop_publishes_no_body_reads() -> Bool:
+	body: String =
+		|fixed union Step:
+		|    Stop
+		|    Once
+		|@tail_recursive
+		|pure func walk(step: Step, left: Int, right: Int) -> Int:
+		|    match step:
+		|        Stop:
+		|            left
+		|        Once:
+		|            walk(Stop, right, left)
+		|func main() -> Int:
+		|    walk(Once, 7, 9)
+		|
+	match only_loop(body):
+		None: False
+		Some(found):
+			found.loop.headers.length().equals(3)
+				.and(found.loop.body_reads.is_empty())
+				.and(same_values(Lower.step_reads(found.step), initials(found.loop)))
+				.and(same_values(initials(found.loop), found.defined))
+
+
+tests: TestSuite = {
+	description = "Lowered loop reads",
+	tests = [
+		("body reads exclude header initials while step reads keep them", test_body_reads_exclude_header_initials),
+		("a body read of an initial value is published once", test_body_read_of_an_initial_value_is_published_once),
+		("tail-recursion loops publish no body reads", test_tail_recursion_loop_publishes_no_body_reads),
+	]
+}

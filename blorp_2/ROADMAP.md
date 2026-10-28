@@ -130,7 +130,7 @@ not a portable nesting threshold or a product-destruction proof.
 | [M0](#m0-foundation-closeout) | Re-cut, perf fixes, parser statement loop, fixpoint script, parity table | Landed. M3 owns the recorded managed-value call limits. |
 | [M1a](#m1a-surface-syntax-parity) | Layout and parsed source syntax | Pure lambda and callback syntax is implemented; current source-frontier evidence remains separate. |
 | [ML](#ml-list-construction) | `append`, `set`, `concat`, list literal | Done. Checked `set_index` is an ordinary target-library wrapper. |
-| [List buffer reuse](#list-buffer-reuse-roadmap) | Ownership-aware updates, four-slot first growth, doubling and simpler library loops | L1 append (`85c1eabc3`) and L2 set/concat (`90f684248`) landed. L2 seed pinned. L2b (ownership transfer into loop entry and joins) is next, then an L2b seed, then L3/L4. |
+| [List buffer reuse](#list-buffer-reuse-roadmap) | Ownership-aware updates, four-slot first growth, doubling and simpler library loops | L1 append (`85c1eabc3`) and L2 set/concat (`90f684248`) landed. L2 seed pinned. L2b.1 (loop entry) landed; L2b.2 (joins) is next, then an L2b seed, then L3/L4. |
 | [M1b](#m1b-names-and-the-foundation) | Namespace: private, aliases, qualified names, designated `Bool`/`Option`/`Result` | Parts A and B done; control-flow consumers follow in M2/M3. |
 | [M5](#m5-constants) | Literal scalar/String constants | Implemented. Source construction functions replace the need for record/opaque constants and initializer dependencies. |
 | [M2](#m2-the-join) | Restricted control positions, outer-variable joins, ordinary Boolean calls, `?=` and annotations | Joins, Result propagation, annotations, ordinary Boolean calls and restricted value/statement `if` implemented in integration; acceptance pending. General operand controls remain deferred. |
@@ -732,8 +732,9 @@ activation. No implicit fallback or mixed library producer is permitted.
 
 ### L2b: transfer ownership into joins and loop entry
 
-Status: planned. Land L2b.1 (loop entry) and then L2b.2 (joins) before L3, then
-publish a seed carrying L2b; L3 follows that pin.
+Status: the L2 seed is pinned. L2b.1 (loop entry) landed
+([L2b.1 validation](#l2b1-validation)); L2b.2 (joins) is next. Both land before L3, then a seed carrying L2b is published;
+L3 follows that pin.
 
 #### Problem
 
@@ -828,13 +829,13 @@ matched baseline is self-built B (see [L2 validation](#l2-validation)).
 
 #### Background
 
-- Entry rule: `insert_loop` (`src/own/own.brp:1956`) calls
-  `leave_with(header.initial, borrowed_result(source), ...)`;
-  `consume_loop_transfer` (`src/verify/verify.brp:3293`) rejects
-  `DefinedOwner` with "loop transfer must use a fresh acquisition", for entry
-  (`verify.brp:3343`) and back edges (`verify.brp:3279`). M3 says "Entry
-  acquires internal loop owners from borrowed parameters and never retires
-  the caller's obligation."
+- Entry rule before L2b.1: `insert_loop` always called
+  `leave_with(header.initial, borrowed_result(source), ...)`, and the
+  verifier's `consume_loop_transfer` rejected a `DefinedOwner` with "loop
+  transfer must use a fresh acquisition" at entry and on back edges. Since
+  L2b.1 it checks only entry acquisitions and back edges; a taken header is
+  checked at `ExecuteLoop`. M3 said "Entry acquires internal loop owners from
+  borrowed parameters and never retires the caller's obligation."
 - Arm rule: yielding arms get `KeepsEnclosing` (`verify.brp:3144`; rationale
   at `verify.brp:2341`). `insert_yielding_arm` (`own.brp:1602`) passes no
   consumable rows to `insert_steps` (`own.brp:1622`), so `consume_update_left`
@@ -860,8 +861,9 @@ operand of an admitted runtime update.
 
 - **L2b.1 loop entry.** At a `Loop` step, an owner transfers to a header when
   it is last used at this step (its drop bucket, or inside a loop its loop
-  row), not consumed, backs exactly one header
-  initial (directly or through `dependency_owner`), and backs no body read.
+  row), not consumed, holds the initial itself (`OwnedResult`), and backs no
+  other read of the step: no other header initial and no body read, counted
+  through `dependency_owner`.
   The header's initial becomes `OwnedReturn(initial, owner)`: no entry
   acquisition and no later retirement. Any other shared use keeps today's
   acquisition, so two headers fed by one owner both acquire.
@@ -1078,9 +1080,10 @@ so `make -C blorp_2 test` and `--prove` run them:
   discharging a non-entering owner; a selection edge discharging an entering
   owner; an abrupt arm discharging an entering owner twice; a borrow of an
   entering owner's value after the join.
-- `test/unit/test_emit/test_ownership_transfer.brp`: no entry `dup` for a
-  taken header; the consuming helper in each arm; per-arm drops and none
-  after the join.
+- `test/unit/test_emit/test_ownership_transfer.brp` (L2b.2): the consuming
+  helper in each arm; per-arm drops and none after the join. L2b.1 has no
+  emit suite: emit is unchanged, and the loop-entry e2e fixture checks its C
+  under strict accounting and sanitizers without pinning generated text.
 - E2e: `test/e2e/fixtures/list/loop_entry_accumulator.brp` and
   `branch_accumulator.brp`, registered in `self_hosted_harness.brp` with exact
   stdout and allocations, covering snapshots printed after updates, nested
@@ -1161,7 +1164,8 @@ For each stage:
    `lex` and `program_inventory` each under 5% of inclusive samples in the
    matched profile; a miss means re-profiling and reporting.
 7. **Production lines**, formatted, tests separate: L2b.1 investigate above
-   +60, ceiling +80; L2b.2 investigate above +120, ceiling +150.
+   +60, ceiling +100 (raised from +80 after measuring +92: the decision plus
+   `for`-loop error plumbing); L2b.2 investigate above +120, ceiling +150.
 
 #### Release strategy
 
@@ -1179,6 +1183,77 @@ under `build/l2b/`, and remaining borrowed updates in `lex` and
 `program_inventory`. Stop and ask when the verifier needs a permission kind
 beyond the existing two, emit or the runtime must change, a ceiling fails,
 the shared scan shows in the profile, or a premise above proves wrong.
+
+### L2b.1 validation
+
+L2b.1 as landed includes its review follow-up. With the follow-up, `make -C
+blorp_2 test` reports 47 suites and 375 tests with no failures, native e2e 9
+of 9; `scripts/blorp2-fixpoint --prove` reaches the fixpoint: A, B and C emit
+identical compiler C (`af1ca68e54d1`), all 594 fixtures match under A and B,
+and B passes the components (322 tests, every strict report balanced) and the
+native e2e selection. The new loop-entry fixture prints identical output and
+allocates 29 times instead of 42; `append_reuse` drops from 31 to 27. Against
+the base own and verify, the new suites fail: own 6 of 8 (its two acquire
+controls hold) and verify 10 of 10. L2b.1 has no emit suite: emit is
+unchanged, and a generated-C check would only pin owner numbering.
+
+Mutations are applied to source snapshots compiled by the unmutated A, with
+the follow-up:
+
+| Mutation | Failures |
+| --- | --- |
+| own: always `AcquireAtEntry` | own transfer 6 of 8 (all but the two acquire controls), e2e `loop_entry_accumulator` and `append_reuse` |
+| verify: skip the owns-its-initial check | only "a taken owner must own its header initial" |
+| verify: skip the `ExecuteLoop` discharge | verify 10 of 10 (the accepted baseline leaks at return), own transfer 6 of 8, own List updates 4 of 22 |
+| own, probe: ignore loop rows | the two nested accumulators and the abrupt-arm loop-row case; the earlier-break case uses the drop bucket and passes |
+
+`control_flow_accumulators` in mode `nested` (`-O2`, minimum of three, normal
+instructions minus the `none` control):
+
+| Appends | Allocations, base → L2b.1 | Base | L2b.1 | L2b.1 per doubling |
+| ---: | ---: | ---: | ---: | ---: |
+| 16,384 | 1,032 → 8 | 17,651,439 | 721,860 | |
+| 32,768 | 2,056 → 8 | 60,011,877 | 1,540,505 | 2.13× |
+| 65,536 | 4,104 → 8 | 222,571,107 | 2,838,012 | 1.84× |
+| 131,072 | 8,200 → 8 | 921,700,562 | 5,641,800 | 1.99× |
+
+`in_arms` is unchanged (L2b.2). Compiling 16 to 128 sequential and nested
+appending `if` arms, B takes 0.994 to 0.998 of base instructions, with
+identical C. Of 593 shared fixtures, A emits identical C for 493; the rest
+differ only by removed entry acquisitions (10 acquire/release pairs in 5
+fixtures). All exits, stdout and diagnostics match.
+
+Self-compilation of the first implementation, before the review follow-up, on one frozen input against self-built base
+B, both at `-O0`, one warmup, three normal samples and one strict:
+
+| Whole self-compilation metric | Base | L2b.1 | Change |
+| --- | ---: | ---: | ---: |
+| Allocations | 28,731,623 | 28,415,377 | −1.10% |
+| Normal retired instructions, minimum of three | 1,060,582,567,898 | 1,023,088,165,772 | −3.54% |
+| Normal peak RSS, maximum bytes | 332,595,200 | 334,217,216 | +0.49% |
+| Emitted C bytes | 22,704,582 | 22,570,583 | −0.59% |
+
+| Code lines (formatted, excluding blanks and comments) | Change |
+| --- | ---: |
+| `own.brp` | +73 |
+| `verify.brp` | +31 |
+| `lower.brp` | −4 |
+| Production | +100 |
+| Tests | +730 |
+
+These include the follow-up, against `25dffb1de`; the first implementation
+measured +92. The follow-up pairs each header with its decision and shares one
+transfer predicate with update consumption. The `step_reads` change in
+`lower.brp` predates the follow-up, so its cost is inside the self-compile
+table above.
+
+Remaining borrowed updates, left for L2b.2: in `lex`, the per-token appends
+to `tokens`, `spellings`, `levels` and `bodies` sit in `if` and `match` arms
+(L2b.1 removes only the copy at each line's inner loop entry); in
+`program_inventory`, the appends to `types`, `runtime_calls`, `list_updates`
+and `callable_entries` sit in `match operation` arms (its nested loop entries
+now transfer). Raw samples, commands and logs are local, under ignored
+`build/l2b/` in the implementing worktree.
 
 ### L3: replace temporary balanced library copying
 
@@ -1555,7 +1630,10 @@ with an error accumulator/break; it does not introduce lambda workarounds.
 **Managed carried values** (179 loops carry a `List`/`String`, 173 an
 `Option`/`Result`) are the larger half. Keep the external borrowed ABI; internal
 carried obligations are explicit. Entry acquires internal loop owners from
-borrowed parameters and never retires the caller's obligation. Each managed
+borrowed parameters and never retires the caller's obligation. A header instead
+takes an owned initial's obligation when the loop step is that owner's last use,
+the owner holds the initial and backs no other header initial or body read
+([L2b](#l2b-transfer-ownership-into-joins-and-loop-entry)). Each managed
 parameter occurrence carries its own obligation, including duplicate aliases.
 On the back edge: evaluate the next values, acquire or transfer next owners,
 retire the old obligations, rebind and jump; no pending cleanup follows the back

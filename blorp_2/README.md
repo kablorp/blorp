@@ -1965,6 +1965,8 @@ Semantic rules:
   and otherwise grows geometrically. Shared buffers copy, preserving value
   semantics. Concat-only accumulation can transfer a nearest-loop-owned String
   in a terminal arm; captured outer owners and continuing joins stay borrowed.
+  A String or List accumulator whose last use is an inner loop's entry moves
+  into that loop's header, so its first update there sees a unique buffer.
   The pinned seed supports `append_int` as `builtin("string.append_int")`,
   now used by the production library. The builtin requires a pure nongeneric
   `(String, Int) -> String` declaration. Direct calls can transfer a last-used
@@ -2834,8 +2836,13 @@ diagnostic rendering are pure. The pipeline publishes these complete results:
    until a call has established its result owner. A consuming String concat
    argument instead transfers its obligation into the call; its result receives
    a distinct owner identity even when storage is reused. That transferred
-   obligation is not also dropped. Loop edges retain their acquire-before-retire
-   batches, including repeated outgoing values. Tail-match
+   obligation is not also dropped. Loop entry acquires each managed header
+   from its initial, except that a header takes the obligation of an owner
+   whose last use is the loop step, which holds the initial itself and backs
+   no other header initial or body read; that obligation is then neither
+   acquired at entry nor dropped after the loop. Parameters never transfer.
+   Loop edges retain their acquire-before-retire batches, including repeated
+   outgoing values. Tail-match
    arms publish the same ownership operations and typed return transfers as a
    straight-line block. Value and owner identities remain function-wide; sibling
    arms cannot observe each other's values or obligations.

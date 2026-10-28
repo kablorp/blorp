@@ -247,12 +247,16 @@ fixed record LoopBlock {
 }
 
 
+-- `body_reads` are the values the body reads from outside the loop, published
+-- with it so use analysis never walks the body. Header initials are not body
+-- reads: they are read once, at entry, and ownership insertion tells the two
+-- apart to decide whether a header may take its initial's obligation.
 fixed record LoweredLoop {
 	headers: List[LoopHeader],
 	result: ValueParameter,
 	carried: List[ValueParameter],
 	body: LoopBlock,
-	reads: List[ValueId]
+	body_reads: List[ValueId]
 }
 
 
@@ -267,7 +271,7 @@ pure func step_reads(step: LoweredStep) -> List[ValueId]:
 	match step:
 		Define(definition): value_reads(definition.operation)
 		Join(join): join.reads
-		Loop(loop): loop.reads
+		Loop(loop): loop.headers.map(pure func(header): header.initial).concat(loop.body_reads)
 
 
 pure func step_span(step: LoweredStep) -> Span:
@@ -1487,13 +1491,11 @@ private pure func source_loop_step(
 	first: Int,
 	after: Int,
 ) -> CompletedBlock:
-	var reads: List[ValueId] = []
-	for header in headers:
-		reads = reads.append(header.initial)
+	var body_reads: List[ValueId] = []
 	for value in loop_block_reads(body):
 		if outside_arm(value, first, after):
-			reads = reads.append(value)
-	{ next_value = after, steps = [Loop({ headers = headers, result = result, carried = carried, body = body, reads = reads })] }
+			body_reads = body_reads.append(value)
+	{ next_value = after, steps = [Loop({ headers = headers, result = result, carried = carried, body = body, body_reads = body_reads })] }
 
 
 private pure func complete_while(
@@ -1981,7 +1983,6 @@ private pure func lower_function(
 			}
 			next_value = next_value.add(1)
 			var headers: List[LoopHeader] = []
-			var reads: List[ValueId] = []
 			var failure: Option[Diagnostic] = None
 			var ordinal = 0
 			for binding in function.bindings:
@@ -1998,7 +1999,6 @@ private pure func lower_function(
 									span = binding.span,
 								}
 								headers = headers.append({ parameter = parameter, initial = initial })
-								reads = reads.append(initial)
 								values = values.set(ordinal, Some(parameter.id))
 								next_value = next_value.add(1)
 					_: void
@@ -2015,7 +2015,8 @@ private pure func lower_function(
 									headers = headers,
 									result = result,
 									carried = [],
-									reads = reads,
+									-- The body is the whole function: it reads nothing outside.
+									body_reads = [],
 									body = { steps = body.steps, tail = body.tail },
 								})),
 								result = result.id,

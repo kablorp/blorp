@@ -1823,6 +1823,39 @@ private pure func verified_drop(
 			owner_slot(state, owners.length(), id, span)
 
 
+-- A header initial whose owner is not one of the loop's entry acquisitions
+-- takes that existing obligation. Membership, not origin, decides: a
+-- projection's owner is itself an acquisition made before the loop.
+private pure func takes_existing_owner(loop: OwnedLoop, owner: OwnerId) -> Bool:
+	loop.entry_acquisitions.all(pure func(acquisition): owner_number(acquisition.owner).not_equals(owner_number(owner)))
+
+
+-- Each taken header owner must own its initial, as an owner borrow would, and
+-- is then discharged by a drop at the loop step, checked as any other drop.
+-- The loop and its continuation both start from that one post-transfer state,
+-- so a later drop or a body read of a taken owner uses a discharged owner.
+private pure func transfer_loop_entry(
+	loop: OwnedLoop, state: VerificationState, signature: FunctionSignature, functions: List[OwnedFunction],
+	unions: List[ConcreteUnion], projection: ProjectionContext, records: List[ConcreteRecord],
+) -> Result[VerificationState, Diagnostic]:
+	var drops: List[OwnershipOperation] = []
+	var failure: Option[Diagnostic] = None
+	for header in loop.headers:
+		match header.initial:
+			UnmanagedReturn(_): void
+			OwnedReturn(value, owner):
+				if takes_existing_owner(loop, owner):
+					span = join_parameter(header.parameter).span
+					match verify_borrow({ value = value, source = OwnerBorrow(owner) }, state.facts, span, state.discharged, state.owners):
+						Err(error): failure = Some(error)
+						Ok(_): drops = drops.append(DropOwner(owner, span))
+		if failure.is_some():
+			break
+	match failure:
+		Some(error): Err(error)
+		None: verify_operations(drops, state, signature, functions, unions, projection, records).map(pure func(transferred): transferred.state)
+
+
 -- A join whose arms are verified after its block, as they are numbered:
 -- each arm starts from `start`, the block's state just before the join.
 private fixed record PendingJoin {
@@ -2075,14 +2108,17 @@ private pure func verify_operations(
 								Ok(void)
 
 			ExecuteLoop(loop):
-				start: VerificationState = { facts = state, discharged = discharged, owners = owners }
-				match introduce_outputs([loop.result].concat(loop.carried), start, unions, records):
+				match transfer_loop_entry(loop, { facts = state, discharged = discharged, owners = owners }, signature, functions, unions, projection, records):
 					Err(error): Err(error)
-					Ok(introduced):
-						pending = pending.append(VerifyLoop(loop, start))
-						state = introduced.facts
-						owners = introduced.owners
-						Ok(void)
+					Ok(start):
+						match introduce_outputs([loop.result].concat(loop.carried), start, unions, records):
+							Err(error): Err(error)
+							Ok(introduced):
+								pending = pending.append(VerifyLoop(loop, start))
+								state = introduced.facts
+								discharged = introduced.discharged
+								owners = introduced.owners
+								Ok(void)
 
 			AcquireOwner(id, borrow, span):
 				match verify_borrow(borrow, state, span, discharged, owners):
@@ -3312,8 +3348,9 @@ private pure func consume_loop_transfer(
 	consume_yield(transfer, state, value_type, unions, records, span)
 
 
--- PRE precedes entry acquisitions and P. Acquisitions live only in this private
--- interval; every managed initial consumes one before any fresh H is published.
+-- PRE follows the loop step's header transfers and precedes entry acquisitions
+-- and P. Acquisitions live only in this private interval; every other managed
+-- initial consumes one before any fresh H is published.
 private pure func initialize_loop(
 	loop: OwnedLoop,
 	pre: VerificationState,
@@ -3336,13 +3373,20 @@ private pure func initialize_loop(
 		value = match header.initial:
 			UnmanagedReturn(id): id
 			OwnedReturn(id, _): id
+		taken: Bool = match header.initial:
+			UnmanagedReturn(_): False
+			OwnedReturn(_, owner): takes_existing_owner(loop, owner)
 		match known_value(pre.facts, value, parameter.span):
 			Err(error): failure = Some(error)
 			Ok(source):
 				if same_type(source.value_type, parameter.value_type):
-					match consume_loop_transfer(header.initial, current, parameter.value_type, unions, records, parameter.span):
-						Err(error): failure = Some(error)
-						Ok(consumed): current = consumed
+					-- ExecuteLoop already discharged a taken owner, before PRE.
+					if taken:
+						void
+					else:
+						match consume_loop_transfer(header.initial, current, parameter.value_type, unions, records, parameter.span):
+							Err(error): failure = Some(error)
+							Ok(consumed): current = consumed
 				else:
 					failure = Some(verification_error(parameter.span, "loop initial type does not match its header"))
 		if failure.is_some():

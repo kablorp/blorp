@@ -1,0 +1,257 @@
+import:
+	../../../src/check/model as Model
+	../../../src/lower/lower as Lower
+	../../../src/namespace/builtins as Builtins
+	../../../src/own/own as Own
+	../../../src/specialize/specialize as Concrete
+	../../../src/utils/source: same_source
+	../../../src/utils/syntax: Diagnostic, Entrypoint(NoArguments), EntryResult(IntegerExitStatus), entry_function
+	../../../src/verify/verify: verify
+	../list_update_inputs: lowered, span
+	int: Int methods_only
+	bool: Bool methods_only
+	string: String methods_only
+	list: List methods_only
+	option: Option methods_only
+	result: Result methods_only
+	test: TestSuite
+
+
+fixed record TransferIds {
+	first: Lower.ValueId,
+	second: Lower.ValueId,
+	third: Lower.ValueId,
+	fourth: Lower.ValueId,
+	fifth: Lower.ValueId,
+	sixth: Lower.ValueId,
+	seventh: Lower.ValueId,
+	eighth: Lower.ValueId,
+	entrypoint: Concrete.FunctionInstanceId
+}
+
+
+-- Mint opaque identities through lowering; this seed supplies no ownership facts.
+private pure func transfer_ids() -> Result[TransferIds, Diagnostic]:
+	source: String =
+		|func main() -> Int:
+		|    first = 1
+		|    second = 2
+		|    third = 3
+		|    fourth = 4
+		|    fifth = 5
+		|    sixth = 6
+		|    seventh = 7
+		|    eighth = 8
+		|    9
+		|
+	program ?= lowered(source).map(Lower.lowered_functions)
+	failure: Diagnostic = { span = span(0), note = None, message = "expected nine identity seed definitions", help = "fix the ownership transfer test seed" }
+	match program.functions:
+		[seed]:
+			match seed.steps:
+				[Lower.Define(first), Lower.Define(second), Lower.Define(third), Lower.Define(fourth), Lower.Define(fifth), Lower.Define(sixth), Lower.Define(seventh), Lower.Define(eighth), Lower.Define(_)]:
+					Ok({
+						first = first.id, second = second.id, third = third.id, fourth = fourth.id,
+						fifth = fifth.id, sixth = sixth.id, seventh = seventh.id, eighth = eighth.id,
+						entrypoint = entry_function(program.entrypoint),
+					})
+				_: Err(failure)
+		_: Err(failure)
+
+
+private pure func rejects(program: Own.OwnershipProgram, message: String, at: Int) -> Bool:
+	match verify(program):
+		Ok(_): False
+		Err(error):
+			error.message.equals("ownership verification failed: ".add(message))
+				.and(error.help.equals("report this compiler error with the input program"))
+				.and(same_source(error.span.source, span(at).source))
+				.and(error.span.start.equals(at)).and(error.span.end.equals(at.add(1)))
+				.and(error.note.is_none())
+
+
+private pure func list_type() -> Concrete.TypeRef:
+	Concrete.ListType(Concrete.IntType)
+
+
+private pure func empty_list(id: Lower.ValueId, owner: Int, at: Int) -> Own.OwnershipOperation:
+	Own.DefineValue({ id = id, value_type = list_type(), operation = Own.ConstructListDefinition([]), result = Own.OwnedResult(Own.owner_id(owner)), span = span(at) })
+
+
+private pure func integer(id: Lower.ValueId, value: Int, at: Int) -> Own.OwnershipOperation:
+	Own.DefineValue({ id = id, value_type = Concrete.IntType, operation = Own.IntegerDefinition(value), result = Own.UnmanagedResult, span = span(at) })
+
+
+private pure func length_of(id: Lower.ValueId, list: Lower.ValueId, owner: Int, at: Int) -> Own.OwnershipOperation:
+	argument: Own.OwnedArgument = Own.BorrowedArgument({ value = list, source = Own.OwnerBorrow(Own.owner_id(owner)) })
+	Own.DefineValue({ id = id, value_type = Concrete.IntType, operation = Own.CallDefinition(Concrete.RuntimeFunction(Builtins.ListLength(Concrete.IntType)), [argument]), result = Own.UnmanagedResult, span = span(at) })
+
+
+private pure func header(id: Lower.ValueId, owner: Int, initial: Own.ReturnTransfer, at: Int) -> Own.OwnedLoopHeader:
+	{ parameter = Own.ManagedJoinParameter({ id = id, value_type = list_type(), span = span(at) }, Own.owner_id(owner)), initial = initial }
+
+
+private pure func program_with(ids: TransferIds, worker: Own.OwnedFunction) -> Own.OwnershipProgram:
+	main: Own.OwnedFunction = {
+		signature = { parameters = [], return_type = Concrete.IntType },
+		operations = [integer(ids.first, 0, 1)], result = Own.UnmanagedReturn(ids.first)
+	}
+	{ records = [], unions = [], functions = [main, worker], entrypoint = NoArguments(ids.entrypoint, IntegerExitStatus) }
+
+
+-- One raw contract per fault. Its accepted form: v0 and v1 own fresh Lists;
+-- the loop header takes v0's owner 0 with no entry acquisition, reads its own
+-- header in the body and drops it at the break; the continuation drops only
+-- owner 1. The loop body's values and owners follow the block (v4, owner 2).
+private fixed union HeaderFault:
+	NoFault
+	AcquiredOwnerTransfers
+	DropAfterLoop
+	ReadAfterLoop
+	DropInBody
+	ReadInBody
+	NotItsInitial
+	TakenTwice
+	AcquiresFromTaken
+
+
+private pure func header_program(ids: TransferIds, fault: HeaderFault) -> Own.OwnershipProgram:
+	var prefix: List[Own.OwnershipOperation] = [empty_list(ids.first, 0, 10), empty_list(ids.second, 1, 11)]
+	var acquisitions: List[Own.OwnerAcquisition] = []
+	var headers = [header(ids.fifth, 2, Own.OwnedReturn(ids.first, Own.owner_id(0)), 40)]
+	var body: List[Own.OwnershipOperation] = [length_of(ids.sixth, ids.fifth, 2, 45), Own.DropOwner(Own.owner_id(2), span(46))]
+	var after: List[Own.OwnershipOperation] = [integer(ids.fourth, 0, 60), Own.DropOwner(Own.owner_id(1), span(61))]
+	match fault:
+		NoFault: void
+		AcquiredOwnerTransfers:
+			-- Owner 1 is an acquisition of v0 made before the loop, as a
+			-- projection's owner is; the header takes it and owner 0 drops later.
+			prefix = [empty_list(ids.first, 0, 10), Own.AcquireOwner(Own.owner_id(1), { value = ids.first, source = Own.OwnerBorrow(Own.owner_id(0)) }, span(11)), integer(ids.second, 0, 12)]
+			headers = [header(ids.fifth, 2, Own.OwnedReturn(ids.first, Own.owner_id(1)), 40)]
+			after = [integer(ids.fourth, 0, 60), Own.DropOwner(Own.owner_id(0), span(61))]
+		DropAfterLoop: after = after.append(Own.DropOwner(Own.owner_id(0), span(62)))
+		ReadAfterLoop: after = [length_of(ids.fourth, ids.first, 0, 60), Own.DropOwner(Own.owner_id(1), span(61))]
+		DropInBody: body = [Own.DropOwner(Own.owner_id(0), span(44))].concat(body)
+		ReadInBody: body = [length_of(ids.sixth, ids.first, 0, 45), Own.DropOwner(Own.owner_id(2), span(46))]
+		NotItsInitial: headers = [header(ids.fifth, 2, Own.OwnedReturn(ids.first, Own.owner_id(1)), 40)]
+		TakenTwice:
+			headers = headers.append(header(ids.sixth, 3, Own.OwnedReturn(ids.first, Own.owner_id(0)), 41))
+			body = [length_of(ids.seventh, ids.fifth, 2, 45), Own.DropOwner(Own.owner_id(2), span(46)), Own.DropOwner(Own.owner_id(3), span(47))]
+		AcquiresFromTaken:
+			acquisitions = [{ owner = Own.owner_id(2), borrow = { value = ids.first, source = Own.OwnerBorrow(Own.owner_id(0)) } }]
+			headers = [header(ids.fifth, 3, Own.OwnedReturn(ids.first, Own.owner_id(0)), 40), header(ids.sixth, 4, Own.OwnedReturn(ids.first, Own.owner_id(2)), 41)]
+			body = [length_of(ids.seventh, ids.fifth, 3, 45), Own.DropOwner(Own.owner_id(3), span(46)), Own.DropOwner(Own.owner_id(4), span(47))]
+	result = match body.get(0):
+		Some(Own.DefineValue(definition)): definition.id
+		_: ids.sixth
+	loop: Own.OwnedLoop = {
+		entry_acquisitions = acquisitions,
+		headers = headers,
+		result = Own.UnmanagedJoinParameter({ id = ids.third, value_type = Concrete.IntType, span = span(30) }),
+		carried = [],
+		body = { operations = body, tail = Own.ExitLoop(Own.Break({ value = Own.UnmanagedReturn(result), carried = [], span = span(50) })) },
+	}
+	program_with(ids, {
+		signature = { parameters = [], return_type = Concrete.IntType },
+		operations = prefix.append(Own.ExecuteLoop(loop)).concat(after),
+		result = Own.UnmanagedReturn(ids.fourth),
+	})
+
+
+private pure func header_rejects(fault: HeaderFault, message: String, at: Int) -> Bool:
+	match transfer_ids():
+		Err(_): False
+		Ok(ids): verify(header_program(ids, NoFault)).is_ok().and(rejects(header_program(ids, fault), message, at))
+
+
+pure func test_header_takes_a_dying_owner() -> Bool:
+	match transfer_ids():
+		Err(_): False
+		Ok(ids): verify(header_program(ids, NoFault)).is_ok()
+
+
+pure func test_acquired_owner_transfers_by_membership_not_origin() -> Bool:
+	match transfer_ids():
+		Err(_): False
+		Ok(ids): verify(header_program(ids, AcquiredOwnerTransfers)).is_ok()
+
+
+pure func test_taken_owner_cannot_drop_after_the_loop() -> Bool:
+	header_rejects(DropAfterLoop, "owner 0 has already been discharged", 62)
+
+
+pure func test_taken_owner_cannot_be_read_after_the_loop() -> Bool:
+	header_rejects(ReadAfterLoop, "borrow refers to discharged owner 0", 60)
+
+
+pure func test_taken_owner_cannot_drop_in_the_body() -> Bool:
+	header_rejects(DropInBody, "owner 0 has already been discharged", 44)
+
+
+pure func test_taken_owner_cannot_be_read_in_the_body() -> Bool:
+	header_rejects(ReadInBody, "borrow refers to discharged owner 0", 45)
+
+
+pure func test_taken_owner_must_own_its_initial() -> Bool:
+	header_rejects(NotItsInitial, "owner 1 does not own value 0", 40)
+
+
+pure func test_two_headers_cannot_take_one_owner() -> Bool:
+	header_rejects(TakenTwice, "owner 0 has already been discharged", 41)
+
+
+pure func test_entry_acquisition_cannot_borrow_a_taken_owner() -> Bool:
+	header_rejects(AcquiresFromTaken, "borrow refers to discharged owner 0", 30)
+
+
+-- A yielding arm keeps every enclosing owner live through its join, so a loop
+-- in it cannot take one. The continuation drops owner 0 after the join.
+private pure func arm_loop_program(ids: TransferIds) -> Own.OwnershipProgram:
+	loop: Own.OwnedLoop = {
+		entry_acquisitions = [],
+		headers = [header(ids.fifth, 1, Own.OwnedReturn(ids.first, Own.owner_id(0)), 40)],
+		result = Own.UnmanagedJoinParameter({ id = ids.fourth, value_type = Concrete.IntType, span = span(30) }),
+		carried = [],
+		body = {
+			operations = [length_of(ids.sixth, ids.fifth, 1, 45), Own.DropOwner(Own.owner_id(1), span(46))],
+			tail = Own.ExitLoop(Own.Break({ value = Own.UnmanagedReturn(ids.sixth), carried = [], span = span(50) })),
+		},
+	}
+	join: Own.OwnedJoin = {
+		result = Own.UnmanagedJoinParameter({ id = ids.third, value_type = Concrete.IntType, span = span(20) }),
+		carried = [],
+		selection = {
+			scrutinee = Own.UnmanagedArgument(ids.second),
+			entry = Model.decision_node_id(0),
+			nodes = [Own.EnterArm({ arm = Model.match_arm_id(0), operations = [], transfers = [] })],
+		},
+		arms = [{ id = Model.match_arm_id(0), inputs = [], operations = [Own.ExecuteLoop(loop)], exit = Own.Yield({ transfer = Own.UnmanagedReturn(ids.fourth), carried = [] }) }],
+	}
+	program_with(ids, {
+		signature = { parameters = [], return_type = Concrete.IntType },
+		operations = [empty_list(ids.first, 0, 10), integer(ids.second, 7, 11), Own.ExecuteJoin(join), Own.DropOwner(Own.owner_id(0), span(61))],
+		result = Own.UnmanagedReturn(ids.third),
+	})
+
+
+pure func test_loop_in_a_yielding_arm_cannot_take_an_enclosing_owner() -> Bool:
+	match transfer_ids():
+		Err(_): False
+		Ok(ids): rejects(arm_loop_program(ids), "owner 0 is discharged before its join", 40)
+
+
+tests: TestSuite = {
+	description = "Loop entry ownership transfer verification",
+	tests = [
+		("a header takes a dying owner without an entry acquisition", test_header_takes_a_dying_owner),
+		("an acquired owner transfers by membership, not origin", test_acquired_owner_transfers_by_membership_not_origin),
+		("a taken owner cannot be dropped after the loop", test_taken_owner_cannot_drop_after_the_loop),
+		("a taken owner cannot be read after the loop", test_taken_owner_cannot_be_read_after_the_loop),
+		("a taken owner cannot be dropped in the loop body", test_taken_owner_cannot_drop_in_the_body),
+		("a taken owner cannot be read in the loop body", test_taken_owner_cannot_be_read_in_the_body),
+		("a taken owner must own its header initial", test_taken_owner_must_own_its_initial),
+		("two headers cannot take one owner", test_two_headers_cannot_take_one_owner),
+		("an entry acquisition cannot borrow a taken owner", test_entry_acquisition_cannot_borrow_a_taken_owner),
+		("a loop in a yielding arm cannot take an enclosing owner", test_loop_in_a_yielding_arm_cannot_take_an_enclosing_owner),
+	]
+}

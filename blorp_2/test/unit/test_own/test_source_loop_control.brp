@@ -20,7 +20,7 @@ private pure func repeated_headers(ids: InputIds, recur: Bool) -> Lower.LoweredF
 			Lower.Define({ id = ids.first, value_type = Concrete.StringType, operation = Lower.ParameterValue(0), span = span(1) }),
 			Lower.Loop({
 				result = { id = ids.second, value_type = Concrete.StringType, span = span(2) },
-				carried = [], reads = [ids.first],
+				carried = [], body_reads = [],
 				headers = [
 					{ parameter = { id = ids.third, value_type = Concrete.StringType, span = span(3) }, initial = ids.first },
 					{ parameter = { id = ids.fourth, value_type = Concrete.StringType, span = span(4) }, initial = ids.first },
@@ -152,7 +152,7 @@ private pure func abrupt_function(ids: InputIds) -> Lower.LoweredFunction:
 			Lower.Define({ id = ids.second, value_type = Concrete.UnionType(ids.union_id), operation = Lower.ParameterValue(1), span = span(2) }),
 			Lower.Loop({
 				result = { id = ids.third, value_type = Concrete.StringType, span = span(3) },
-				carried = [], reads = [ids.first, ids.second],
+				carried = [], body_reads = [ids.second],
 				headers = [{ parameter = { id = ids.fourth, value_type = Concrete.StringType, span = span(4) }, initial = ids.first }],
 				body = {
 					steps = [
@@ -413,7 +413,7 @@ private pure func nested_header_pre_facts() -> Option[Bool]:
 		[first, Lower.Loop(loop)]:
 			inner: Lower.LoweredLoop = {
 				result = { id = ids.fourth, value_type = Concrete.StringType, span = span(4) },
-				carried = [], reads = [ids.third],
+				carried = [], body_reads = [],
 				headers = [{ parameter = { id = ids.fifth, value_type = Concrete.StringType, span = span(5) }, initial = ids.third }],
 				body = { steps = [], tail = Lower.ExitLoop(Lower.Break({ value = ids.fifth, carried = [], span = span(6) })) },
 			}
@@ -425,17 +425,19 @@ private pure func nested_header_pre_facts() -> Option[Bool]:
 			match owned.operations:
 				[_, Own.ExecuteLoop(result)]:
 					match result.body.operations:
-						[Own.ExecuteLoop(nested), Own.AcquireOwner(outer_outgoing, outer_borrow, _), Own.DropOwner(outer_header, _), Own.DropOwner(inner_result, _)]:
-							match nested.body.operations:
-								[Own.AcquireOwner(inner_outgoing, inner_borrow, _), Own.DropOwner(inner_header, _)]:
+						-- The inner header takes outer H, owner 2, at entry: no entry
+						-- acquisition, and the outer edge retires only the inner result.
+						[Own.ExecuteLoop(nested), Own.AcquireOwner(outer_outgoing, outer_borrow, _), Own.DropOwner(inner_result, _)]:
+							match (nested.entry_acquisitions, nested.headers, nested.body.operations):
+								([], [taken], [Own.AcquireOwner(inner_outgoing, inner_borrow, _), Own.DropOwner(inner_header, _)]):
 									match nested.body.tail:
 										Own.ExitLoop(Own.Break(inner_outputs)):
 											match result.body.tail:
 												Own.ExitLoop(Own.Break(outer_outputs)):
-													Some(Own.owner_number(outer_header) == 2 and Own.owner_number(inner_header) == 6
+													Some(owns(taken.initial, ids.third, 2) and Own.owner_number(inner_header) == 5
 														and Own.owner_number(inner_result) == 3
-														and drops(nested.body.operations, outer_header) == 0
-														and borrows_owner(inner_borrow, ids.fifth, 6)
+														and drops(result.body.operations, Own.owner_id(2)) == 0
+														and borrows_owner(inner_borrow, ids.fifth, 5)
 														and borrows_owner(outer_borrow, ids.fourth, 3)
 														and owns(inner_outputs.value, ids.fifth, Own.owner_number(inner_outgoing))
 														and owns(outer_outputs.value, ids.fourth, Own.owner_number(outer_outgoing)))
@@ -447,7 +449,7 @@ private pure func nested_header_pre_facts() -> Option[Bool]:
 		_: None
 
 
-pure func test_nested_loop_preserves_outer_header_as_pre_until_outer_edge() -> Bool:
+pure func test_nested_loop_takes_the_dying_outer_header_at_entry() -> Bool:
 	nested_header_pre_facts().get_or(False)
 
 
@@ -463,6 +465,6 @@ tests: TestSuite = {
 		("terminal selection uses recursive common loop cleanup", test_terminal_selection_recurses_through_the_same_loop_cleanup),
 		("owning union H shares generic entry and swap", test_owning_union_headers_use_the_generic_entry_and_swap_contract),
 		("unused managed canonical input keeps last-use drop", test_unused_managed_arm_input_retires_before_body_without_consuming_header),
-		("nested loop preserves outer H as PRE", test_nested_loop_preserves_outer_header_as_pre_until_outer_edge),
+		("nested loop takes the dying outer H at entry", test_nested_loop_takes_the_dying_outer_header_at_entry),
 	]
 }
