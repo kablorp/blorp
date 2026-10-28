@@ -601,10 +601,14 @@ value on an arm that leaves it unchanged. Older immutable aliases keep their
 values. A match nested inside a
 larger expression, such as a call argument, must be bound first. Each yielding
 arm moves its value into the join: a managed value moves an owner made in its
-arm, so a yielded prefix value is acquired again, and owners live before the
-join stay live through every arm and are dropped after it at their last use.
-With carried variables, every managed outgoing occurrence acquires its own
-obligation before arm-local sources retire; enclosing owners stay live.
+arm, so a yielded prefix value is acquired again. An owner read after the
+join stays live through every arm and is dropped after it at its last use. An
+owner whose last use is the join enters it instead: each yielding arm
+discharges it exactly once, on entry when the arm never reads it, else after
+its last read there, which may be an update consuming it, and an abrupt arm
+retires it at its edge. With carried variables, every managed outgoing
+occurrence acquires its own obligation before arm-local sources and entering
+owners retire.
 In C the join's outputs are locals declared before selection and assigned in each
 shared arm body. The [join examples](test/e2e/test_join.brp) include sixteen
 nested bound matches.
@@ -1964,9 +1968,10 @@ Semantic rules:
   capacity: a transferred unique buffer appends in place when capacity suffices
   and otherwise grows geometrically. Shared buffers copy, preserving value
   semantics. Concat-only accumulation can transfer a nearest-loop-owned String
-  in a terminal arm; captured outer owners and continuing joins stay borrowed.
-  A String or List accumulator whose last use is an inner loop's entry moves
-  into that loop's header, so its first update there sees a unique buffer.
+  in a terminal arm; captured outer owners stay borrowed. A String or List
+  accumulator whose last use is an inner loop's entry moves into that loop's
+  header, and one whose last use is a join enters the join, so an update in
+  either sees a unique buffer.
   The pinned seed supports `append_int` as `builtin("string.append_int")`,
   now used by the production library. The builtin requires a pure nongeneric
   `(String, Int) -> String` declaration. Direct calls can transfer a last-used

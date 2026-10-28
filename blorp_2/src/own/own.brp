@@ -177,6 +177,9 @@ pure func join_ownership(output: OwnedJoinParameter) -> ResultOwnership:
 fixed record OwnedJoin {
 	result: OwnedJoinParameter,
 	carried: List[OwnedJoinParameter],
+	-- Obligations whose last enclosing use is this join; every yielding arm
+	-- discharges each exactly once, and abrupt arms retire them at the edge.
+	entering: List[OwnerId],
 	selection: OwnedSelection,
 	arms: List[OwnedJoinArm]
 }
@@ -852,14 +855,25 @@ private fixed union DropSchedule:
 
 -- A pending join sees the pre-output snapshot. Its arms follow the complete
 -- block's values and owners, keeping both introduction intervals consecutive.
+-- `entering` rows are the obligations the join takes; the snapshot does not
+-- count them consumed, so its arms can discharge them.
 private fixed record PendingOwnedJoin {
 	join: LoweredJoin,
 	scrutinee: OwnedArgument,
 	result: OwnedJoinParameter,
 	carried: List[OwnedJoinParameter],
+	entering: List[ScheduledDrop],
 	enclosing: List[EnclosingBlock],
 	loop_scope: Option[LoopScope]
 }
+
+
+-- Where a yielding arm discharges an obligation entering its join: on entry
+-- when the arm never reads it, else at its last read there, a step or the
+-- yield at the block's end, whose acquisitions precede the retirement.
+private fixed union EnteringDischarge:
+	DropOnEntry(OwnerId, Span)
+	LastReadInArm(ScheduledDrop)
 
 
 -- How a loop header receives its initial value, decided once at the loop step.
@@ -1035,7 +1049,18 @@ private pure func matches_last_use(rows: List[ScheduledDrop], owner: OwnerId, po
 private pure func transferable_here(
 	step_drops: List[ScheduledDrop], loop_uses: List[ScheduledDrop], consumed: List[OwnerId], owner: OwnerId, position: Int,
 ) -> Bool:
-	and(matches_last_use(step_drops, owner, position).or(matches_last_use(loop_uses, owner, position)), has_consumed(consumed, owner).not())
+	last_use_here = matches_last_use(step_drops, owner, position).or(matches_last_use(loop_uses, owner, position))
+	and(last_use_here, has_consumed(consumed, owner).not())
+
+
+-- A join takes every obligation that may transfer at its step: the step's
+-- drop bucket, which holds an arm's entering rows, and the loop rows.
+private pure func join_entering(
+	pre_step_drops: Option[List[ScheduledDrop]], loop_uses: List[ScheduledDrop], consumed: List[OwnerId], position: Int, span: Span,
+) -> Result[List[ScheduledDrop], Diagnostic]:
+	step_drops ?= pre_step_drops.to_result(internal_error(span, "missing drop schedule row"))
+	candidates = step_drops.concat(loop_uses)
+	Ok(candidates.filter(pure func(row): transferable_here(step_drops, loop_uses, consumed, row.owner, position)))
 
 
 private pure func consume_update_left(
@@ -1090,38 +1115,58 @@ private pure func consume_update_argument(
 		_: Ok(definition)
 
 
+-- The candidate enclosing obligations a block reads, directly or through a
+-- borrow, each at its last read: a step, or the terminal after the last step.
+-- Nested reads and outgoing occurrences participate in the same last use.
+private pure func enclosing_owner_uses(
+	steps: List[LoweredStep], terminal: List[ValueId], candidates: List[ScheduledDrop],
+	enclosing: List[EnclosingBlock], span: Span,
+) -> Result[List[ScheduledDrop], Diagnostic]:
+	outer = enclosing_intervals(enclosing)
+	var uses: List[ScheduledDrop] = []
+	var failure: Option[Diagnostic] = None
+	var position = 0
+	for reads in steps.map(step_reads).append(terminal):
+		for value in reads:
+			if visible_outside(value_number(value), outer):
+				match dependency_owner(value, [], enclosing, 0, span):
+					Err(error): failure = Some(error)
+					Ok(None): void
+					Ok(Some(owner)):
+						match candidates.find(pure func(row): owner_number(row.owner).equals(owner_number(owner))):
+							None: void
+							Some(row):
+								var recorded: Option[Int] = None
+								var index = 0
+								for use in uses:
+									if owner_number(use.owner).equals(owner_number(owner)):
+										recorded = Some(index)
+										break
+									index = index.add(1)
+								read: ScheduledDrop = { row | last = position }
+								match recorded:
+									Some(at): uses = uses.set(at, read)
+									None: uses = uses.append(read)
+		position = position.add(1)
+	match failure:
+		Some(error): Err(error)
+		None: Ok(uses)
+
+
 -- Only the nearest loop's enclosing values receive rows, once for this terminal
--- block. Nested reads and outgoing occurrences participate in the same last use.
+-- block. A row the block never reads stays live to the edge, which retires it.
 private pure func loop_consumption_uses(
 	steps: List[LoweredStep], exit: LoopExit, enclosing: List[EnclosingBlock], scope: LoopScope,
 ) -> Result[List[ScheduledDrop], Diagnostic]:
-	var rows: List[ScheduledDrop] = []
+	var candidates: List[ScheduledDrop] = []
 	var block_position = 0
 	for block in enclosing:
 		if block_position.greater_than_or_equal(scope.pre_blocks):
 			for owner in block.owners:
 				if and(owner.last.greater_than_or_equal(block.position), has_consumed(block.consumed, owner.owner).not()):
-					rows = rows.append({ owner | last = steps.length() })
+					candidates = candidates.append(owner)
 		block_position = block_position.add(1)
-	outer = enclosing_intervals(enclosing)
-	var failure: Option[Diagnostic] = None
-	var position = 0
-	for reads in steps.map(step_reads).append(loop_exit_values(exit)):
-		for value in reads:
-			if visible_outside(value_number(value), outer):
-				match dependency_owner(value, [], enclosing, 0, loop_exit_span(exit)):
-					Err(error): failure = Some(error)
-					Ok(None): void
-					Ok(Some(owner)):
-						var index = 0
-						for row in rows:
-							if owner_number(row.owner).equals(owner_number(owner)):
-								rows = rows.set(index, { row | last = position })
-							index = index.add(1)
-		position = position.add(1)
-	match failure:
-		Some(error): Err(error)
-		None: Ok(rows)
+	enclosing_owner_uses(steps, loop_exit_values(exit), candidates, enclosing, loop_exit_span(exit))
 
 
 -- A transferable owner moves into its header only when its own initial is
@@ -1195,6 +1240,7 @@ private pure func insert_steps(
 	seed_inputs: List[OwnedJoinParameter],
 	loop_scope: Option[LoopScope],
 	loop_uses: List[ScheduledDrop],
+	discharges: List[EnteringDischarge],
 	unions: List[ConcreteUnion],
 	records: List[ConcreteRecord],
 ) -> Result[InsertedSteps, Diagnostic]:
@@ -1230,6 +1276,20 @@ private pure func insert_steps(
 			_: void
 		input_slot = input_slot.add(1)
 
+	-- Entering obligations go into drop buckets, never into `owners`: the
+	-- enclosing snapshot keeps the one row an abrupt edge retires. Each one
+	-- discharged here joins `consumed`, so a later abrupt edge leaves it alone.
+	for discharge in discharges:
+		match discharge:
+			DropOnEntry(owner, drop_span):
+				entries = entries.append(Inserted(DropOwner(owner, drop_span)))
+				consumed = consumed.append(owner)
+			LastReadInArm(row):
+				if row.last.less_than(count):
+					match drops.get(row.last):
+						Some(bucket): drops = drops.set(row.last, bucket.append(row))
+						None: failure = Some(internal_error(row.span, "invalid entering last-use position"))
+
 	for step in steps:
 		if failure.is_some():
 			break
@@ -1248,17 +1308,24 @@ private pure func insert_steps(
 						match borrow_argument(join.selection.scrutinee, sources, enclosing, first_value, join.result.span):
 							Err(error): Err(error)
 							Ok(scrutinee):
-								entries = entries.append(AwaitingArms({
-									join = join,
-									scrutinee = scrutinee,
-									result = built.result,
-									carried = built.carried,
-									enclosing = enclosing.append({ first_value = first_value, sources = sources, owners = owners, position = step_position, consumed = consumed }),
-									loop_scope = loop_scope,
-								}))
-								next_owner = built.next_owner
-								carried = built.carried
-								Ok(join_ownership(built.result))
+								match join_entering(pre_step_drops, loop_uses, consumed, step_position, span):
+									Err(error): Err(error)
+									Ok(taken):
+										-- The arms' snapshot precedes the transfer, so they can discharge
+										-- what enters; only the continuation counts it consumed.
+										entries = entries.append(AwaitingArms({
+											join = join,
+											scrutinee = scrutinee,
+											result = built.result,
+											carried = built.carried,
+											entering = taken,
+											enclosing = enclosing.append({ first_value = first_value, sources = sources, owners = owners, position = step_position, consumed = consumed }),
+											loop_scope = loop_scope,
+										}))
+										consumed = consumed.concat(taken.map(pure func(row): row.owner))
+										next_owner = built.next_owner
+										carried = built.carried
+										Ok(join_ownership(built.result))
 			Loop(loop):
 				match build_outputs(loop.result, loop.carried, next_owner, unions, records):
 					Err(error): Err(error)
@@ -1371,8 +1438,17 @@ private pure func insert_steps(
 					transferred_here: Bool = match consumed_here:
 						Some(owner): owner_number(owner).equals(owner_number(dropped.owner))
 						None: False
-					if and(transferred_here.not(), has_consumed(consumed, dropped.owner).not()):
-						entries = entries.append(Inserted(DropOwner(dropped.owner, dropped.span)))
+					-- An entering obligation read here leaves the arm at this step.
+					entering_here: Bool = discharges.any(pure func(discharge):
+						match discharge:
+							LastReadInArm(row): owner_number(row.owner).equals(owner_number(dropped.owner))
+							DropOnEntry(_, _): False
+					)
+					if has_consumed(consumed, dropped.owner).not():
+						if transferred_here.not():
+							entries = entries.append(Inserted(DropOwner(dropped.owner, dropped.span)))
+						if entering_here:
+							consumed = consumed.append(dropped.owner)
 			None:
 				failure = Some(internal_error(span, "missing drop schedule row"))
 				break
@@ -1626,6 +1702,7 @@ private pure func leave_join(
 	parameters: List[ValueParameter],
 	inserted: InsertedSteps,
 	uses: List[Option[Int]],
+	discharges: List[EnteringDischarge],
 	enclosing: List[EnclosingBlock],
 	first_value: Int,
 	span: Span,
@@ -1670,12 +1747,21 @@ private pure func leave_join(
 		Ok(entries)
 	else:
 		retire_terminal_sources(entries, inserted.sources, uses, step_count, span)
+	-- An entering obligation the yield reads has no slot in this arm; it
+	-- retires here, after the yield's acquisitions.
+	var completed = retired
+	for discharge in discharges:
+		match discharge:
+			LastReadInArm(row):
+				if row.last.equals(step_count):
+					completed = completed.append(Inserted(DropOwner(row.owner, span)))
+			DropOnEntry(_, _): void
 
 	match failure:
 		Some(error): Err(error)
 		None:
 			Ok({
-				entries = retired,
+				entries = completed,
 				transfer = leaving.transfer,
 				carried = carried,
 				next_owner = next_owner,
@@ -1693,11 +1779,25 @@ private pure func join_terminal_span(arm: JoinArm, result: ValueId, outer: List[
 		None: terminal_span(arm.steps, result, outer)
 
 
+-- Where one yielding arm discharges each obligation entering its join.
+private pure func entering_discharges(
+	arm: JoinArm, outputs: Lower.JoinOutputs, entering: List[ScheduledDrop], enclosing: List[EnclosingBlock], span: Span,
+) -> Result[List[EnteringDischarge], Diagnostic]:
+	reads ?= enclosing_owner_uses(arm.steps, [outputs.value].concat(outputs.carried), entering, enclosing, span)
+	var discharges: List[EnteringDischarge] = []
+	for row in entering:
+		match reads.find(pure func(read): owner_number(read.owner).equals(owner_number(row.owner))):
+			Some(read): discharges = discharges.append(LastReadInArm(read))
+			None: discharges = discharges.append(DropOnEntry(row.owner, row.span))
+	Ok(discharges)
+
+
 private pure func insert_yielding_arm(
 	arm: JoinArm,
 	outputs: Lower.JoinOutputs,
 	parameters: List[ValueParameter],
 	result_span: Span,
+	entering: List[ScheduledDrop],
 	enclosing: List[EnclosingBlock],
 	loop_scope: Option[LoopScope],
 	first_value: Int,
@@ -1713,8 +1813,9 @@ private pure func insert_yielding_arm(
 	span ?= join_terminal_span(arm, outputs.value, outer)
 	terminal: BlockTerminal = TerminalJoin(outputs.value, outputs.carried, parameters)
 	uses ?= block_uses(arm.steps, terminal, outer, first_value, arm.inputs.length(), Ok(span))
-	inserted ?= insert_steps(arm.steps, DropAtLastUse(uses), enclosing, first_value, inputs.next_owner, inputs.parameters, loop_scope, [], unions, records)
-	leaving ?= leave_join(outputs, arm.steps.length(), parameters, inserted, uses, enclosing, first_value, span)
+	discharges ?= entering_discharges(arm, outputs, entering, enclosing, span)
+	inserted ?= insert_steps(arm.steps, DropAtLastUse(uses), enclosing, first_value, inputs.next_owner, inputs.parameters, loop_scope, [], discharges, unions, records)
+	leaving ?= leave_join(outputs, arm.steps.length(), parameters, inserted, uses, discharges, enclosing, first_value, span)
 	completed ?= complete_joins(leaving.entries, first_value.add(inserted.sources.length()), leaving.next_owner, unions, records)
 	Ok({
 		arm = { id = arm.id, inputs = inputs.parameters, operations = completed.operations, exit = Yield({ transfer = leaving.transfer, carried = leaving.carried }) },
@@ -1742,10 +1843,13 @@ private pure func insert_abrupt_arm(
 	})
 
 
+-- Abrupt arms receive no entering obligations: their edge retires every
+-- live loop-scope owner, and the snapshot does not count those consumed.
 private pure func insert_join_arm(
 	arm: JoinArm,
 	parameters: List[ValueParameter],
 	result_span: Span,
+	entering: List[ScheduledDrop],
 	enclosing: List[EnclosingBlock],
 	loop_scope: Option[LoopScope],
 	first_value: Int,
@@ -1755,7 +1859,7 @@ private pure func insert_join_arm(
 ) -> Result[InsertedJoinArm, Diagnostic]:
 	inputs ?= build_inputs(arm.inputs, initial_owner, unions, records)
 	match arm.exit:
-		Lower.Yield(outputs): insert_yielding_arm(arm, outputs, parameters, result_span, enclosing, loop_scope, first_value, inputs, unions, records)
+		Lower.Yield(outputs): insert_yielding_arm(arm, outputs, parameters, result_span, entering, enclosing, loop_scope, first_value, inputs, unions, records)
 		Lower.TransferLoop(target, tail): insert_abrupt_arm(arm, target, tail, result_span, enclosing, loop_scope, first_value, inputs, unions, records)
 
 
@@ -1779,7 +1883,7 @@ private pure func complete_pending_join(
 	var arms: List[OwnedJoinArm] = []
 	var failure: Option[Diagnostic] = None
 	for arm in pending.join.arms:
-		match insert_join_arm(arm, pending.join.carried, pending.join.result.span, pending.enclosing, pending.loop_scope, next_value, next_owner, unions, records):
+		match insert_join_arm(arm, pending.join.carried, pending.join.result.span, pending.entering, pending.enclosing, pending.loop_scope, next_value, next_owner, unions, records):
 			Err(error):
 				failure = Some(error)
 				break
@@ -1790,7 +1894,10 @@ private pure func complete_pending_join(
 	match failure:
 		Some(error): Err(error)
 		None: Ok({
-			join = { result = pending.result, carried = pending.carried, selection = selected.selection, arms = arms },
+			join = {
+				result = pending.result, carried = pending.carried, entering = pending.entering.map(pure func(row): row.owner),
+				selection = selected.selection, arms = arms,
+			},
 			next_value = next_value, next_owner = next_owner,
 		})
 
@@ -1970,7 +2077,7 @@ private pure func insert_loop_exit_block(
 			_: void
 		held_uses = held_uses.set(input_slot, Some(steps.length()))
 		input_slot = input_slot.add(1)
-	inserted ?= insert_steps(steps, DropAtLastUse(held_uses), enclosing, first_value, initial_owner, seed_inputs, Some(scope), loop_uses, unions, records)
+	inserted ?= insert_steps(steps, DropAtLastUse(held_uses), enclosing, first_value, initial_owner, seed_inputs, Some(scope), loop_uses, [], unions, records)
 	leaving ?= leave_loop(exit, inserted, enclosing, scope, first_value, steps.length())
 	completed ?= complete_joins(leaving.entries, first_value.add(inserted.sources.length()), leaving.next_owner, unions, records)
 	Ok({ body = { operations = completed.operations, tail = ExitLoop(leaving.exit) }, next_value = completed.next_value, next_owner = completed.next_owner })
@@ -1988,7 +2095,7 @@ private pure func insert_loop_match_block(
 	unions: List[ConcreteUnion],
 	records: List[ConcreteRecord],
 ) -> Result[InsertedLoopBlock, Diagnostic]:
-	prefix ?= insert_steps(steps, DropInEachArm, enclosing, first_value, initial_owner, seed_inputs, Some(scope), [], unions, records)
+	prefix ?= insert_steps(steps, DropInEachArm, enclosing, first_value, initial_owner, seed_inputs, Some(scope), [], [], unions, records)
 	scrutinee ?= borrow_argument(matched.selection.scrutinee, prefix.sources, enclosing, first_value, span)
 	completed ?= complete_joins(prefix.entries, first_value.add(prefix.sources.length()), prefix.next_owner, unions, records)
 	outer: List[EnclosingBlock] = enclosing.append({ first_value = first_value, sources = prefix.sources, owners = prefix.owners, position = steps.length(), consumed = prefix.consumed })
@@ -2086,7 +2193,7 @@ pure func insert_function(
 ) -> Result[OwnedFunction, Diagnostic]:
 	span ?= terminal_span(function.steps, function.result, [])
 	uses ?= block_uses(function.steps, TerminalValue(function.result), [], 0, 0, Ok(span))
-	inserted ?= insert_steps(function.steps, DropAtLastUse(uses), [], 0, 0, [], None, [], unions, records)
+	inserted ?= insert_steps(function.steps, DropAtLastUse(uses), [], 0, 0, [], None, [], [], unions, records)
 	source ?= value_source(function.result, inserted.sources, [], 0, span)
 	leaving = leave_with(function.result, source, inserted.entries, inserted.next_owner, span)
 	completed ?= complete_joins(leaving.entries, inserted.sources.length(), leaving.next_owner, unions, records)

@@ -229,7 +229,7 @@ pure func test_consumption_rejects_later_borrow_in_nested_join() -> Bool:
 			}
 			join: Own.OwnedJoin = {
 				result = Own.UnmanagedJoinParameter({ id = ids.fifth, value_type = Concrete.IntType, span = span(50) }),
-				carried = [], selection = Selection.direct(Own.UnmanagedArgument(ids.fourth)),
+				carried = [], entering = [], selection = Selection.direct(Own.UnmanagedArgument(ids.fourth)),
 				arms = [{ id = match_arm_id(0), inputs = [], operations = [Own.DefineValue(read)],
 					exit = Own.Yield({ transfer = Own.UnmanagedReturn(ids.sixth), carried = [] }) }]
 			}
@@ -408,7 +408,11 @@ pure func test_loop_cannot_consume_captured_pre_loop_owner() -> Bool:
 				Some(at): rejects_at({ program | functions = functions }, "loop edge discharges a captured owner", at)
 
 
-pure func test_continuing_join_cannot_consume_its_enclosing_owner() -> Bool:
+-- `kept = prefix` reads nothing, so `prefix` enters the join and its arm's
+-- concat consumes it, which the verifier accepts. Restoring the old shape, a
+-- join that takes nothing with `prefix` dropped after it, makes that same
+-- consumption discharge an owner the join does not take.
+pure func test_join_arm_consumes_only_an_entering_owner() -> Bool:
 	source: String =
 		|pure func concatenate(left: String, right: String) -> String:
 		|    builtin("string.add")
@@ -425,34 +429,27 @@ pure func test_continuing_join_cannot_consume_its_enclosing_owner() -> Bool:
 	match LoopInput.lowered(source).and_then(Own.own):
 		Err(_): False
 		Ok(program):
-			var expected: Option[Own.OwnedDefinition] = None
+			var expected: Option[Span] = None
+			var entered: Option[Own.OwnerId] = None
 			var functions: List[Own.OwnedFunction] = []
 			for function in program.functions:
 				var operations: List[Own.OwnershipOperation] = []
 				for operation in function.operations:
 					match operation:
 						Own.ExecuteJoin(join):
-							var arms: List[Own.OwnedJoinArm] = []
-							for arm in join.arms:
-								forced = arm.operations.map(force_borrowed_concat)
-								for nested in forced:
-									match nested:
-										Own.DefineValue(definition):
-											match definition.operation:
-												Own.CallDefinition(_, [Own.ConsumedArgument(_, _), _]): expected = Some(definition)
-												_: void
-										_: void
-								arms = arms.append({ arm | operations = forced })
-							operations = operations.append(Own.ExecuteJoin({ join | arms = arms }))
+							match join.entering:
+								[owner]:
+									expected = Some(Own.join_parameter(join.result).span)
+									entered = Some(owner)
+									operations = operations.append(Own.ExecuteJoin({ join | entering = [] })).append(Own.DropOwner(owner, Own.join_parameter(join.result).span))
+								_: operations = operations.append(operation)
 						_: operations = operations.append(operation)
 				functions = functions.append({ function | operations = operations })
-			match expected:
-				Some(definition):
-					match definition.operation:
-						Own.CallDefinition(_, [Own.ConsumedArgument(_, owner), _]):
-							rejects_at({ program | functions = functions }, "owner ".append_int(Own.owner_number(owner)) + " is discharged before its join", definition.span)
-						_: False
-				None: False
+			match (expected, entered):
+				(Some(span), Some(owner)):
+					message = "join arm discharges owner ".append_int(Own.owner_number(owner)) + ", which does not enter its join"
+					verify(program).is_ok() and rejects_at({ program | functions = functions }, message, span)
+				_: False
 
 
 tests: TestSuite = {
@@ -460,7 +457,7 @@ tests: TestSuite = {
 	tests = [
 		("nested later old-owner borrow rejects", test_consumption_rejects_later_borrow_in_nested_join),
 		("loop cannot consume captured pre-loop owner", test_loop_cannot_consume_captured_pre_loop_owner),
-		("continuing join preserves enclosing owner", test_continuing_join_cannot_consume_its_enclosing_owner),
+		("a join arm consumes only an entering owner", test_join_arm_consumes_only_an_entering_owner),
 		("non-String consumed operand rejects", test_consumption_rejects_non_string_operand),
 		("projection cannot consume", test_projection_cannot_consume_an_argument),
 		("callable invocation cannot consume", test_callable_invocation_cannot_consume_an_argument),

@@ -147,17 +147,8 @@ private fixed record EnclosingScope {
 }
 
 
--- Whether a block may discharge enclosing owners. A tail arm discharges the
--- function prefix's on its way out; a join arm continues into its join, so
--- every enclosing owner must stay live through it.
-private fixed union EnclosingDischarge:
-	MayDischargeEnclosing
-	KeepsEnclosing
-
-
 private fixed record VerificationFacts {
 	enclosing: List[EnclosingScope],
-	enclosing_discharge: EnclosingDischarge,
 	first_value: Int,
 	values: List[KnownValue],
 	first_owner: Int,
@@ -274,16 +265,15 @@ private pure func discharged_already(discharged: List[Bool], ordinal: Int) -> Bo
 		None: False
 
 
--- Discharges enclosing owner `ordinal`, which only a block that may do so can.
-private pure func discharge(state: VerificationFacts, discharged: List[Bool], ordinal: Int, span: Span) -> Result[List[Bool], Diagnostic]:
-	match state.enclosing_discharge:
-		KeepsEnclosing:
-			Err(verification_error(span, "owner ${ordinal.to_string()} is discharged before its join"))
-		MayDischargeEnclosing:
-			var flags = discharged
-			while flags.length().less_than(ordinal.add(1)):
-				flags = flags.append(False)
-			Ok(flags.set(ordinal, True))
+-- Flags enclosing owner `ordinal` discharged. Which enclosing owners a block
+-- may discharge is checked where it leaves: a yield against its join's
+-- entering owners, a loop edge against PRE. Selection edges admit only local
+-- drops and transfers, so they never reach this.
+private pure func discharge(discharged: List[Bool], ordinal: Int) -> List[Bool]:
+	var flags = discharged
+	while flags.length().less_than(ordinal.add(1)):
+		flags = flags.append(False)
+	flags.set(ordinal, True)
 
 
 private pure func known_owner(
@@ -1369,12 +1359,7 @@ private pure func discharge_payloads(
 			Err(error):
 				failure_slot = Some(error)
 				break
-			Ok(Some(EnclosingSlot(ordinal))):
-				match discharge(state, enclosing, ordinal, span):
-					Ok(flags): enclosing = flags
-					Err(error):
-						failure_slot = Some(error)
-						break
+			Ok(Some(EnclosingSlot(ordinal))): enclosing = discharge(enclosing, ordinal)
 			Ok(Some(LocalSlot(index))): local = local.set(index, DischargedOwner)
 			Ok(None): void
 	match failure_slot:
@@ -1856,6 +1841,18 @@ private pure func transfer_loop_entry(
 		None: verify_operations(drops, state, signature, functions, unions, projection, records).map(pure func(transferred): transferred.state)
 
 
+-- Each entering owner is discharged at the join step, checked as a drop
+-- there. The arms start from the state before it and the continuation from
+-- the state after, so a later drop or read of an entering owner is rejected.
+private pure func transfer_join_entry(
+	join: OwnedJoin, state: VerificationState, signature: FunctionSignature, functions: List[OwnedFunction],
+	unions: List[ConcreteUnion], projection: ProjectionContext, records: List[ConcreteRecord],
+) -> Result[VerificationState, Diagnostic]:
+	span = join_parameter(join.result).span
+	drops = join.entering.map(pure func(owner: OwnerId) -> OwnershipOperation: DropOwner(owner, span))
+	verify_operations(drops, state, signature, functions, unions, projection, records).map(pure func(entered): entered.state)
+
+
 -- A join whose arms are verified after its block, as they are numbered:
 -- each arm starts from `start`, the block's state just before the join.
 private fixed record PendingJoin {
@@ -2099,13 +2096,17 @@ private pure func verify_operations(
 				match verify_join_header(join, state, unions, records, discharged, owners):
 					Err(error): Err(error)
 					Ok(_):
-						match introduce_outputs([join.result].concat(join.carried), start, unions, records):
+						match transfer_join_entry(join, start, signature, functions, unions, projection, records):
 							Err(error): Err(error)
-							Ok(introduced):
-								pending = pending.append(VerifyJoin({ join = join, start = start }))
-								state = introduced.facts
-								owners = introduced.owners
-								Ok(void)
+							Ok(entered):
+								match introduce_outputs([join.result].concat(join.carried), entered, unions, records):
+									Err(error): Err(error)
+									Ok(introduced):
+										pending = pending.append(VerifyJoin({ join = join, start = start }))
+										state = introduced.facts
+										discharged = introduced.discharged
+										owners = introduced.owners
+										Ok(void)
 
 			ExecuteLoop(loop):
 				match transfer_loop_entry(loop, { facts = state, discharged = discharged, owners = owners }, signature, functions, unions, projection, records):
@@ -2136,12 +2137,8 @@ private pure func verify_operations(
 					Err(error):
 						Err(error)
 					Ok(EnclosingSlot(ordinal)):
-						match discharge(state, discharged, ordinal, span):
-							Err(error):
-								Err(error)
-							Ok(flags):
-								discharged = flags
-								Ok(void)
+						discharged = discharge(discharged, ordinal)
+						Ok(void)
 					Ok(LocalSlot(index)):
 						owners = owners.set(index, DischargedOwner)
 						Ok(void)
@@ -2337,7 +2334,6 @@ private pure func enter(
 	start: VerificationState,
 	first_value: Int,
 	first_owner: Int,
-	enclosing_discharge: EnclosingDischarge,
 ) -> VerificationState:
 	facts = start.facts
 	{
@@ -2348,7 +2344,6 @@ private pure func enter(
 				first_owner = facts.first_owner,
 				owners = start.owners
 			}),
-			enclosing_discharge = enclosing_discharge,
 			first_value = first_value,
 			values = [],
 			first_owner = first_owner
@@ -2374,8 +2369,8 @@ private pure func block_end(state: VerificationState) -> BlockEnd:
 
 -- A yield moves the joined value into the join's own definition. It may
 -- move only an owner made in its arm, and must have discharged the arm's
--- other owners. Every enclosing owner is still live: a join arm cannot
--- discharge one, so all edges into the join agree.
+-- other owners. Its enclosing discharges are checked against the join's
+-- entering owners, so all edges into the join agree.
 private pure func consume_yield(
 	transfer: ReturnTransfer,
 	state: VerificationState,
@@ -2442,9 +2437,35 @@ private pure func verify_yield(
 	complete_owners(consumed.owners, state.facts.first_owner, None, YieldEdge, span)
 
 
+-- A yielding arm discharges exactly its join's entering owners, so every edge
+-- into the continuation agrees on which enclosing owners remain live. `entry`
+-- holds the flags the arm was entered with.
+private pure func verify_entering_discharges(entering: List[OwnerId], entry: List[Bool], state: VerificationState, span: Span) -> Result[Void, Diagnostic]:
+	var failure: Option[Diagnostic] = None
+	for scope in state.facts.enclosing:
+		var ordinal = scope.first_owner
+		for owner in scope.owners:
+			current = ordinal
+			newly = discharged_already(state.discharged, current).and(discharged_already(entry, current).not())
+			enters = entering.any(pure func(id): owner_number(id).equals(current))
+			match owner:
+				ActiveOwner(_, _):
+					if failure.is_none():
+						if and(enters, newly.not()):
+							failure = Some(verification_error(span, "join arm leaves entering owner ${current.to_string()} live"))
+						else if and(newly, enters.not()):
+							failure = Some(verification_error(span, "join arm discharges owner ${current.to_string()}, which does not enter its join"))
+				DischargedOwner: void
+			ordinal = ordinal.add(1)
+	match failure:
+		Some(error): Err(error)
+		None: Ok(void)
+
+
 private pure func verify_join_transfers(
 	outputs: OwnedJoinOutputs,
 	join: OwnedJoin,
+	entry: List[Bool],
 	state: VerificationState,
 	unions: List[ConcreteUnion],
 	records: List[ConcreteRecord],
@@ -2454,7 +2475,7 @@ private pure func verify_join_transfers(
 		Ok(void)
 	else:
 		Err(verification_error(result.span, "join arm carries the wrong number of values"))
-	if join.carried.is_empty():
+	yielded: Void ?= if join.carried.is_empty():
 		verify_yield(outputs.transfer, state, result.value_type, unions, records, result.span)
 	else:
 		match consume_yield(outputs.transfer, state, result.value_type, unions, records, result.span):
@@ -2477,6 +2498,7 @@ private pure func verify_join_transfers(
 				match invalid:
 					Some(error): Err(error)
 					None: complete_owners(current.owners, state.facts.first_owner, None, YieldEdge, result.span)
+	verify_entering_discharges(join.entering, entry, state, result.span)
 
 
 -- Canonical arm identity is independent of the variant route used to enter it.
@@ -3098,7 +3120,7 @@ private pure func verify_selection(
 							None: failure = Some(verification_error(scrutinee.span, "selection node is missing"))
 							Some(None): failure = Some(verification_error(scrutinee.span, "selection contains an unreachable node"))
 							Some(Some(facts)):
-								initial = enter(state, cursor.next_value, cursor.next_owner, KeepsEnclosing)
+								initial = enter(state, cursor.next_value, cursor.next_owner)
 								projection: ProjectionContext = SelectionProjection(selection.scrutinee, facts)
 								match verify_selection_edge(edge, target, selection, initial, projection, signature, functions, unions, records, scrutinee.span):
 									Err(error): failure = Some(error)
@@ -3176,17 +3198,14 @@ private pure func verify_join_arm(
 	unions: List[ConcreteUnion],
 	records: List[ConcreteRecord],
 ) -> Result[BlockEnd, Diagnostic]:
-	permissions: EnclosingDischarge = match arm.exit:
-		Yield(_): KeepsEnclosing
-		TransferLoop(_, _): MayDischargeEnclosing
-	initial = enter(join.start, cursor.next_value, cursor.next_owner, permissions)
+	initial = enter(join.start, cursor.next_value, cursor.next_owner)
 	start ?= introduce_outputs(arm.inputs, initial, unions, records)
 	match arm.exit:
 		Yield(outputs):
 			match verify_operations(arm.operations, start, signature, functions, unions, NoProjection, records):
 				Err(error): Err(error)
 				Ok(verified):
-					match verify_join_transfers(outputs, join.join, verified.state, unions, records):
+					match verify_join_transfers(outputs, join.join, join.start.discharged, verified.state, unions, records):
 						Err(error): Err(error)
 						Ok(_): verify_joins(verified.pending, active, block_end(verified.state), signature, functions, unions, records)
 		TransferLoop(target, tail):
@@ -3361,7 +3380,7 @@ private pure func initialize_loop(
 	records: List[ConcreteRecord],
 ) -> Result[VerificationState, Diagnostic]:
 	span = join_parameter(loop.result).span
-	start = enter(pre, cursor.next_value, cursor.next_owner, MayDischargeEnclosing)
+	start = enter(pre, cursor.next_value, cursor.next_owner)
 	var operations: List[OwnershipOperation] = []
 	for acquisition in loop.entry_acquisitions:
 		operations = operations.append(AcquireOwner(acquisition.owner, acquisition.borrow, span))
@@ -3443,7 +3462,7 @@ private pure func verify_loop_match(
 	var cursor = selected
 	var invalid: Option[Diagnostic] = None
 	for arm in matched.arms:
-		initial = enter(state, cursor.next_value, cursor.next_owner, MayDischargeEnclosing)
+		initial = enter(state, cursor.next_value, cursor.next_owner)
 		match introduce_outputs(arm.inputs, initial, unions, records):
 			Err(error): invalid = Some(error)
 			Ok(branch_start):
@@ -3490,7 +3509,6 @@ private pure func verify_function(
 	initial: VerificationState = {
 		facts = {
 			enclosing = [],
-			enclosing_discharge = MayDischargeEnclosing,
 			first_value = 0,
 			values = [],
 			first_owner = 0,

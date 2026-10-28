@@ -312,12 +312,12 @@ private pure func leaked(arms: List[Own.OwnedJoinArm]) -> List[Own.OwnedJoinArm]
 			arms
 
 
--- Dropping the prefix owner in one arm only would leave the join's edges
--- with different live prefixes.
-pure func test_prefix_owner_dropped_in_one_arm_is_rejected() -> Bool:
+-- PICK's `kept`, owner 0, enters its join. Keeping it live in one arm only
+-- would leave the join's edges with different live prefixes.
+pure func test_entering_owner_kept_in_one_arm_is_rejected() -> Bool:
 	rejects_pick_arms(
-		pure func(arms): rewrite_arm(arms, 1, pure func(arm, _): { arm | operations = arm.operations.append(Own.DropOwner(Own.owner_id(0), SPAN)) }),
-		"owner 0 is discharged before its join",
+		pure func(arms): rewrite_arm(arms, 1, pure func(arm, _): { arm | operations = without_drop(arm.operations, 0) }),
+		"join arm leaves entering owner 0 live",
 	)
 
 
@@ -338,7 +338,9 @@ pure func test_undischarged_join_value_is_rejected() -> Bool:
 		Ok(program): rejected(with_operations(program, pure func(operations): without_drop(operations, 0)), "owner 0 remains live at return")
 
 
-pure func test_ordinary_tail_join_requires_parent_cleanup_before_return() -> Bool:
+-- The parent's last use is the tail join, so it enters the join and each arm
+-- discharges it; an arm that keeps it leaves the edges disagreeing.
+pure func test_ordinary_tail_join_arms_discharge_the_entering_parent() -> Bool:
 	match owned(ORDINARY_PICK):
 		Err(_): False
 		Ok(program):
@@ -346,11 +348,11 @@ pure func test_ordinary_tail_join_requires_parent_cleanup_before_return() -> Boo
 				None: False
 				Some(function):
 					match function.operations:
-						[Own.DefineValue(_), Own.DefineValue(_), Own.ExecuteJoin(join), Own.DropOwner(_, _)]:
+						[Own.DefineValue(_), Own.DefineValue(_), Own.ExecuteJoin(join)]:
 							(verify(program).is_ok()
 							and rejected_at(
-								with_operations(program, pure func(operations): without_drop(operations, 0)),
-								"owner 0 remains live at return",
+								with_operations(program, pure func(operations): map_join_arms(operations, pure func(arms): rewrite_arm(arms, 0, pure func(arm, _): { arm | operations = without_drop(arm.operations, 0) }))),
+								"join arm leaves entering owner 0 live",
 								Own.join_parameter(join.result).span,
 							))
 						_: False
@@ -387,7 +389,7 @@ private pure func string_scrutinee(operation: Own.OwnershipOperation) -> Own.Own
 				Some(arm):
 					match yielded(arm):
 						Some(value):
-							-- PICK keeps this String's prefix owner 0 live until after the join.
+							-- Owner 0 is live when the join's header is checked, before it enters.
 							borrow: Own.BorrowedValue = { value = value, source = Own.OwnerBorrow(Own.owner_id(0)) }
 							Own.ExecuteJoin({ join | selection = { join.selection | scrutinee = Own.BorrowedArgument(borrow) } })
 						None: operation
@@ -483,7 +485,7 @@ private WRAP: String =
 	|
 
 
--- Storing the prefix owner 0 itself would discharge it inside a join arm.
+-- Stores the prefix owner 0 itself instead of the acquired occurrence.
 private pure func stores_prefix_owner(operation: Own.OwnershipOperation) -> Own.OwnershipOperation:
 	match operation:
 		Own.DefineValue(definition):
@@ -503,21 +505,23 @@ private pure func prefix_payload(payload: Own.StoredPayload) -> Own.StoredPayloa
 		Own.UnmanagedPayload(_): payload
 
 
-pure func test_payload_storing_a_prefix_owner_in_a_join_arm_is_rejected() -> Bool:
+-- WRAP's `kept`, owner 0, enters its join, whose `Yes` arm drops it after
+-- storing an acquired occurrence. Storing owner 0 itself discharges it twice.
+pure func test_payload_storing_an_entering_owner_it_also_drops_is_rejected() -> Bool:
 	match owned(WRAP):
 		Err(_):
 			False
 		Ok(program):
 			rejected(
 				with_operations(program, pure func(operations): map_join_arms(operations, pure func(arms): arms.map(pure func(arm): { arm | operations = arm.operations.map(pure func(operation): stores_prefix_owner(operation)) }))),
-				"owner 0 is discharged before its join",
+				"owner 0 has already been discharged",
 			)
 
 
 tests: TestSuite = {
 	description = "Verification of join edges",
 	tests = [
-		("ordinary tail join requires parent cleanup", test_ordinary_tail_join_requires_parent_cleanup_before_return),
+		("ordinary tail join arms discharge the entering parent", test_ordinary_tail_join_arms_discharge_the_entering_parent),
 		("inserted joins are verified", test_inserted_joins_are_verified),
 		("String output cannot be unmanaged", test_string_join_parameter_cannot_be_unmanaged),
 		("List output cannot be unmanaged", test_list_join_parameter_cannot_be_unmanaged),
@@ -534,9 +538,9 @@ tests: TestSuite = {
 		("yield of a prefix owner without acquisition is rejected", test_yield_of_a_prefix_owner_without_acquisition_is_rejected),
 		("managed yield without an owner is rejected", test_managed_yield_without_an_owner_is_rejected),
 		("arm owner leaked across a yield is rejected", test_arm_owner_leaked_across_a_yield_is_rejected),
-		("prefix owner dropped in one arm is rejected", test_prefix_owner_dropped_in_one_arm_is_rejected),
+		("entering owner kept in one arm is rejected", test_entering_owner_kept_in_one_arm_is_rejected),
 		("undischarged join value is rejected", test_undischarged_join_value_is_rejected),
-		("payload storing a prefix owner in a join arm is rejected", test_payload_storing_a_prefix_owner_in_a_join_arm_is_rejected),
+		("payload storing an entering owner it also drops is rejected", test_payload_storing_an_entering_owner_it_also_drops_is_rejected),
 		("join scrutinee of another type is rejected", test_join_scrutinee_of_another_type_is_rejected),
 		("yield of another type is rejected", test_yield_of_another_type_is_rejected),
 		("unmanaged yield moving an owner is rejected", test_unmanaged_yield_moving_an_owner_is_rejected),

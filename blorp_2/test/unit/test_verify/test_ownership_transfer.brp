@@ -7,7 +7,7 @@ import:
 	../../../src/utils/source: same_source
 	../../../src/utils/syntax: Diagnostic, Entrypoint(NoArguments), EntryResult(IntegerExitStatus), entry_function
 	../../../src/verify/verify: verify
-	../list_update_inputs: lowered, span
+	../list_update_inputs: lowered, owned_source, span
 	int: Int methods_only
 	bool: Bool methods_only
 	string: String methods_only
@@ -204,9 +204,10 @@ pure func test_entry_acquisition_cannot_borrow_a_taken_owner() -> Bool:
 	header_rejects(AcquiresFromTaken, "borrow refers to discharged owner 0", 30)
 
 
--- A yielding arm keeps every enclosing owner live through its join, so a loop
--- in it cannot take one. The continuation drops owner 0 after the join.
-private pure func arm_loop_program(ids: TransferIds) -> Own.OwnershipProgram:
+-- A loop in a yielding arm may take only an owner entering its join. With
+-- `takes_entering`, owner 0 enters and the loop's header takes it; otherwise
+-- the continuation keeps owner 0 and drops it after the join.
+private pure func arm_loop_program(ids: TransferIds, takes_entering: Bool) -> Own.OwnershipProgram:
 	loop: Own.OwnedLoop = {
 		entry_acquisitions = [],
 		headers = [header(ids.fifth, 1, Own.OwnedReturn(ids.first, Own.owner_id(0)), 40)],
@@ -217,9 +218,14 @@ private pure func arm_loop_program(ids: TransferIds) -> Own.OwnershipProgram:
 			tail = Own.ExitLoop(Own.Break({ value = Own.UnmanagedReturn(ids.sixth), carried = [], span = span(50) })),
 		},
 	}
+	entering: List[Own.OwnerId] = if takes_entering:
+		[Own.owner_id(0)]
+	else:
+		[]
 	join: Own.OwnedJoin = {
 		result = Own.UnmanagedJoinParameter({ id = ids.third, value_type = Concrete.IntType, span = span(20) }),
 		carried = [],
+		entering = entering,
 		selection = {
 			scrutinee = Own.UnmanagedArgument(ids.second),
 			entry = Model.decision_node_id(0),
@@ -227,21 +233,223 @@ private pure func arm_loop_program(ids: TransferIds) -> Own.OwnershipProgram:
 		},
 		arms = [{ id = Model.match_arm_id(0), inputs = [], operations = [Own.ExecuteLoop(loop)], exit = Own.Yield({ transfer = Own.UnmanagedReturn(ids.fourth), carried = [] }) }],
 	}
+	var operations = [empty_list(ids.first, 0, 10), integer(ids.second, 7, 11), Own.ExecuteJoin(join)]
+	if takes_entering.not():
+		operations = operations.append(Own.DropOwner(Own.owner_id(0), span(61)))
 	program_with(ids, {
 		signature = { parameters = [], return_type = Concrete.IntType },
-		operations = [empty_list(ids.first, 0, 10), integer(ids.second, 7, 11), Own.ExecuteJoin(join), Own.DropOwner(Own.owner_id(0), span(61))],
+		operations = operations,
 		result = Own.UnmanagedReturn(ids.third),
 	})
 
 
-pure func test_loop_in_a_yielding_arm_cannot_take_an_enclosing_owner() -> Bool:
+pure func test_loop_in_a_yielding_arm_takes_an_entering_owner() -> Bool:
 	match transfer_ids():
 		Err(_): False
-		Ok(ids): rejects(arm_loop_program(ids), "owner 0 is discharged before its join", 40)
+		Ok(ids): verify(arm_loop_program(ids, True)).is_ok()
+
+
+pure func test_loop_in_a_yielding_arm_cannot_take_a_non_entering_owner() -> Bool:
+	match transfer_ids():
+		Err(_): False
+		Ok(ids): rejects(arm_loop_program(ids, False), "join arm discharges owner 0, which does not enter its join", 20)
+
+
+-- One raw contract per join fault. Its accepted form: v0 and v1 own fresh
+-- Lists, owners 0 and 1; owner 0 enters the join on Int v2, whose one arm
+-- reads v0 and drops owner 0; the continuation defines v4 and drops owner 1.
+-- The arm's value v5 follows the block's values. `StoresEntering` is a second
+-- accepted form: the arm discharges owner 0 by storing v0 in a new List.
+private fixed union JoinFault:
+	NoJoinFault
+	StoresEntering
+	StoresNonEntering
+	InactiveEntering
+	RepeatedEntering
+	UnknownEntering
+	DropAfterJoin
+	ReadAfterJoin
+	LeavesEnteringLive
+	DischargesNonEntering
+	EdgeDischargesEntering
+
+
+private pure func join_program(ids: TransferIds, fault: JoinFault) -> Own.OwnershipProgram:
+	var prefix: List[Own.OwnershipOperation] = [empty_list(ids.first, 0, 10), empty_list(ids.second, 1, 11), integer(ids.third, 7, 12)]
+	var entering = [Own.owner_id(0)]
+	var edge: List[Own.OwnershipOperation] = []
+	var arm: List[Own.OwnershipOperation] = [length_of(ids.sixth, ids.first, 0, 45), Own.DropOwner(Own.owner_id(0), span(46))]
+	var after: List[Own.OwnershipOperation] = [integer(ids.fifth, 0, 60), Own.DropOwner(Own.owner_id(1), span(61))]
+	match fault:
+		NoJoinFault: void
+		InactiveEntering: prefix = prefix.append(Own.DropOwner(Own.owner_id(0), span(13)))
+		RepeatedEntering: entering = entering.append(Own.owner_id(0))
+		UnknownEntering: entering = entering.append(Own.owner_id(7))
+		DropAfterJoin: after = after.append(Own.DropOwner(Own.owner_id(0), span(62)))
+		ReadAfterJoin: after = [length_of(ids.fifth, ids.first, 0, 60), Own.DropOwner(Own.owner_id(1), span(61))]
+		LeavesEnteringLive: arm = [length_of(ids.sixth, ids.first, 0, 45)]
+		DischargesNonEntering: arm = arm.append(Own.DropOwner(Own.owner_id(1), span(47)))
+		EdgeDischargesEntering: edge = [Own.DropOwner(Own.owner_id(0), span(15))]
+		StoresEntering: arm = stored_in_list(ids, ids.first, 0)
+		StoresNonEntering: arm = stored_in_list(ids, ids.second, 1).append(Own.DropOwner(Own.owner_id(0), span(48)))
+	yielded = match fault:
+		StoresEntering | StoresNonEntering: ids.seventh
+		_: ids.sixth
+	join: Own.OwnedJoin = {
+		result = Own.UnmanagedJoinParameter({ id = ids.fourth, value_type = Concrete.IntType, span = span(20) }),
+		carried = [],
+		entering = entering,
+		selection = {
+			scrutinee = Own.UnmanagedArgument(ids.third),
+			entry = Model.decision_node_id(0),
+			nodes = [Own.EnterArm({ arm = Model.match_arm_id(0), operations = edge, transfers = [] })],
+		},
+		arms = [{ id = Model.match_arm_id(0), inputs = [], operations = arm, exit = Own.Yield({ transfer = Own.UnmanagedReturn(yielded), carried = [] }) }],
+	}
+	program_with(ids, {
+		signature = { parameters = [], return_type = Concrete.IntType },
+		operations = prefix.append(Own.ExecuteJoin(join)).concat(after),
+		result = Own.UnmanagedReturn(ids.fourth),
+	})
+
+
+-- An arm that stores `stored`, with its owner, as the one element of a new
+-- List v5 (owner 2), measures it as v6 and drops the new List.
+private pure func stored_in_list(ids: TransferIds, stored: Lower.ValueId, owner: Int) -> List[Own.OwnershipOperation]:
+	nested: Concrete.TypeRef = Concrete.ListType(list_type())
+	borrow: Own.OwnedArgument = Own.BorrowedArgument({ value = ids.sixth, source = Own.OwnerBorrow(Own.owner_id(2)) })
+	[
+		Own.DefineValue({ id = ids.sixth, value_type = nested, operation = Own.ConstructListDefinition([Own.OwnedPayload(stored, Own.owner_id(owner))]), result = Own.OwnedResult(Own.owner_id(2)), span = span(45) }),
+		Own.DefineValue({ id = ids.seventh, value_type = Concrete.IntType, operation = Own.CallDefinition(Concrete.RuntimeFunction(Builtins.ListLength(list_type())), [borrow]), result = Own.UnmanagedResult, span = span(46) }),
+		Own.DropOwner(Own.owner_id(2), span(47)),
+	]
+
+
+private pure func join_rejects(fault: JoinFault, message: String, at: Int) -> Bool:
+	match transfer_ids():
+		Err(_): False
+		Ok(ids): verify(join_program(ids, NoJoinFault)).is_ok().and(rejects(join_program(ids, fault), message, at))
+
+
+pure func test_join_takes_an_entering_owner() -> Bool:
+	match transfer_ids():
+		Err(_): False
+		Ok(ids): verify(join_program(ids, NoJoinFault)).is_ok()
+
+
+pure func test_arm_may_store_an_entering_owner() -> Bool:
+	match transfer_ids():
+		Err(_): False
+		Ok(ids): verify(join_program(ids, StoresEntering)).is_ok()
+
+
+pure func test_arm_cannot_store_a_non_entering_owner() -> Bool:
+	join_rejects(StoresNonEntering, "join arm discharges owner 1, which does not enter its join", 20)
+
+
+pure func test_entering_owner_must_be_live_at_the_join() -> Bool:
+	join_rejects(InactiveEntering, "owner 0 has already been discharged", 20)
+
+
+pure func test_entering_owner_cannot_repeat() -> Bool:
+	join_rejects(RepeatedEntering, "owner 0 has already been discharged", 20)
+
+
+pure func test_entering_owner_must_be_defined() -> Bool:
+	join_rejects(UnknownEntering, "owner 7 is not defined", 20)
+
+
+pure func test_entering_owner_cannot_drop_after_the_join() -> Bool:
+	join_rejects(DropAfterJoin, "owner 0 has already been discharged", 62)
+
+
+pure func test_entering_owner_cannot_be_read_after_the_join() -> Bool:
+	join_rejects(ReadAfterJoin, "borrow refers to discharged owner 0", 60)
+
+
+pure func test_arm_cannot_leave_an_entering_owner_live() -> Bool:
+	join_rejects(LeavesEnteringLive, "join arm leaves entering owner 0 live", 20)
+
+
+pure func test_arm_cannot_discharge_a_non_entering_owner() -> Bool:
+	join_rejects(DischargesNonEntering, "join arm discharges owner 1, which does not enter its join", 20)
+
+
+pure func test_selection_edge_cannot_discharge_an_entering_owner() -> Bool:
+	join_rejects(EdgeDischargesEntering, "selection edge contains an operation outside its local projections", 12)
+
+
+-- Rewrites every join's arms in these operations and the blocks nested in them.
+private pure func map_joins(operations: List[Own.OwnershipOperation], change: pure (Own.OwnedJoin) -> Own.OwnedJoin) -> List[Own.OwnershipOperation]:
+	operations.map(pure func(operation):
+		match operation:
+			Own.ExecuteJoin(join):
+				arms = join.arms.map(pure func(arm): { arm | operations = map_joins(arm.operations, change) })
+				Own.ExecuteJoin(change({ join | arms = arms }))
+			Own.ExecuteLoop(loop): Own.ExecuteLoop({ loop | body = map_loop_joins(loop.body, change) })
+			_: operation
+	)
+
+
+private pure func map_loop_joins(block: Own.OwnedLoopBlock, change: pure (Own.OwnedJoin) -> Own.OwnedJoin) -> Own.OwnedLoopBlock:
+	tail: Own.OwnedLoopTail = match block.tail:
+		Own.ExitLoop(_): block.tail
+		Own.MatchLoop(matched): Own.MatchLoop({ matched | arms = matched.arms.map(pure func(arm): { arm | body = map_loop_joins(arm.body, change) }) })
+	{ operations = map_joins(block.operations, change), tail = tail }
+
+
+-- A `break` arm retires an entering owner at its edge; a second drop there
+-- discharges it twice.
+private pure func drop_entering_again(join: Own.OwnedJoin) -> Own.OwnedJoin:
+	match join.entering:
+		[owner, ..._]:
+			{ join | arms = join.arms.map(pure func(arm):
+				match arm.exit:
+					Own.TransferLoop(_, _): { arm | operations = arm.operations.append(Own.DropOwner(owner, span(77))) }
+					Own.Yield(_): arm
+			) }
+		[]: join
+
+
+pure func test_abrupt_arm_cannot_discharge_an_entering_owner_twice() -> Bool:
+	body: String =
+		|pure func collect() -> List[Int]:
+		|    var values: List[Int] = []
+		|    while less_than(length(values), 12):
+		|        if less_than(length(values), 3):
+		|            values = append(values, 1)
+		|        else:
+		|            break
+		|    values
+		|func main() -> Int:
+		|    unused = collect()
+		|    0
+		|
+	match owned_source(body):
+		Err(_): False
+		Ok(program):
+			changed = program.functions.map(pure func(function): { function | operations = map_joins(function.operations, drop_entering_again) })
+			var entered: List[Int] = []
+			for function in changed:
+				for operation in function.operations:
+					match operation:
+						Own.ExecuteLoop(loop):
+							match loop.body.tail:
+								Own.MatchLoop(matched):
+									for arm in matched.arms:
+										for nested in arm.body.operations:
+											match nested:
+												Own.ExecuteJoin(join): entered = entered.concat(join.entering.map(pure func(owner): Own.owner_number(owner)))
+												_: void
+								Own.ExitLoop(_): void
+						_: void
+			match entered:
+				[owner]: verify(program).is_ok().and(rejects({ program | functions = changed }, "owner ${owner.to_string()} has already been discharged", 77))
+				_: False
 
 
 tests: TestSuite = {
-	description = "Loop entry ownership transfer verification",
+	description = "Loop entry and join ownership transfer verification",
 	tests = [
 		("a header takes a dying owner without an entry acquisition", test_header_takes_a_dying_owner),
 		("an acquired owner transfers by membership, not origin", test_acquired_owner_transfers_by_membership_not_origin),
@@ -252,6 +460,19 @@ tests: TestSuite = {
 		("a taken owner must own its header initial", test_taken_owner_must_own_its_initial),
 		("two headers cannot take one owner", test_two_headers_cannot_take_one_owner),
 		("an entry acquisition cannot borrow a taken owner", test_entry_acquisition_cannot_borrow_a_taken_owner),
-		("a loop in a yielding arm cannot take an enclosing owner", test_loop_in_a_yielding_arm_cannot_take_an_enclosing_owner),
+		("a loop in a yielding arm takes an entering owner", test_loop_in_a_yielding_arm_takes_an_entering_owner),
+		("a loop in a yielding arm cannot take a non-entering owner", test_loop_in_a_yielding_arm_cannot_take_a_non_entering_owner),
+		("a join takes an entering owner its arm discharges", test_join_takes_an_entering_owner),
+		("a join arm may store an entering owner", test_arm_may_store_an_entering_owner),
+		("a join arm cannot store a non-entering owner", test_arm_cannot_store_a_non_entering_owner),
+		("an entering owner must be live at the join", test_entering_owner_must_be_live_at_the_join),
+		("an entering owner cannot repeat", test_entering_owner_cannot_repeat),
+		("an entering owner must be defined", test_entering_owner_must_be_defined),
+		("an entering owner cannot be dropped after the join", test_entering_owner_cannot_drop_after_the_join),
+		("an entering owner cannot be read after the join", test_entering_owner_cannot_be_read_after_the_join),
+		("a join arm cannot leave an entering owner live", test_arm_cannot_leave_an_entering_owner_live),
+		("a join arm cannot discharge a non-entering owner", test_arm_cannot_discharge_a_non_entering_owner),
+		("a selection edge cannot discharge an entering owner", test_selection_edge_cannot_discharge_an_entering_owner),
+		("an abrupt arm cannot discharge an entering owner twice", test_abrupt_arm_cannot_discharge_an_entering_owner_twice),
 	]
 }
