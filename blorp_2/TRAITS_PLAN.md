@@ -10,11 +10,11 @@ are defined in README/grammar. Code marked **model sketch** describes compiler
 data, not another input language or an additional runtime representation.
 
 Completed qualification evidence is retained in the
-[concrete traits report](../benchmarks/results/blorp2-concrete-traits-2026-10-22.md),
-[semantic instance identity report](../benchmarks/results/blorp2-semantic-instance-keys-2026-10-22.md),
-the [bounds/defaults report](../benchmarks/results/blorp2-trait-bounds-2026-10-22.md),
-the [generic equality report](../benchmarks/results/blorp2-generic-equality-2026-10-23.md),
-and the [production library report](../benchmarks/results/blorp2-trait-library-2026-10-23.md).
+[concrete traits report](https://github.com/kablorp/blorp/blob/1e07c4dce85e51cd7ad911142e9bc96a5e0d91c7/benchmarks/results/blorp2-concrete-traits-2026-10-22.md),
+[semantic instance identity report](https://github.com/kablorp/blorp/blob/1e07c4dce85e51cd7ad911142e9bc96a5e0d91c7/benchmarks/results/blorp2-semantic-instance-keys-2026-10-22.md),
+the [bounds/defaults report](https://github.com/kablorp/blorp/blob/1e07c4dce85e51cd7ad911142e9bc96a5e0d91c7/benchmarks/results/blorp2-trait-bounds-2026-10-22.md),
+the [generic equality report](https://github.com/kablorp/blorp/blob/1e07c4dce85e51cd7ad911142e9bc96a5e0d91c7/benchmarks/results/blorp2-generic-equality-2026-10-23.md),
+and the [production library report](https://github.com/kablorp/blorp/blob/1e07c4dce85e51cd7ad911142e9bc96a5e0d91c7/benchmarks/results/blorp2-trait-library-2026-10-23.md).
 
 This document retains the agreed trait scope and acceptance contracts. Delete
 completed milestone instructions as they land; retain semantic rules in
@@ -161,7 +161,7 @@ in either argument order, including nested calls. Its current rules live in
 [test_records](test/unit/test_check/test_records.brp) and
 [contextual tests](test/unit/test_check/test_contextual_inference.brp), and its
 qualification and original cost baseline in the
-[T0 report](../benchmarks/results/blorp2-nominal-context-2026-10-22.md).
+[T0 report](https://github.com/kablorp/blorp/blob/1e07c4dce85e51cd7ad911142e9bc96a5e0d91c7/benchmarks/results/blorp2-nominal-context-2026-10-22.md).
 
 **Source: supported expression-local context, independent of traits.**
 
@@ -410,7 +410,7 @@ records collision/reuse coverage, instance/C growth and matched compiler costs.
 ## 4. Automatic equality as ordinary checked code
 
 T4a implements this contract for nongeneric named records and unions. Its
-[qualification report](../benchmarks/results/blorp2-derived-equality-2026-10-23.md)
+[qualification report](https://github.com/kablorp/blorp/blob/1e07c4dce85e51cd7ad911142e9bc96a5e0d91c7/benchmarks/results/blorp2-derived-equality-2026-10-23.md)
 records its accepted scope, proof and costs. README owns the source semantics.
 T4b implements the generic examples below; its report records complete acceptance
 gates, matched costs and conservative proof limits.

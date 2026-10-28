@@ -1,7 +1,7 @@
 # First self-hosted e2e tests
 
 Status: implemented after three design approvals; independent qualification
-passed. See the [results](../benchmarks/results/blorp_2_self_hosted_e2e_2026-10-24.md).
+passed. See the [results](https://github.com/kablorp/blorp/blob/1e07c4dce85e51cd7ad911142e9bc96a5e0d91c7/benchmarks/results/blorp_2_self_hosted_e2e_2026-10-24.md).
 Base: `40a58a45b` on main (equivalent isolated
 routing change `ab1895a1a`). The implementation is in this change; no new bootstrap pin is required.
 This is a small executable slice, not a port of the complete deferred harness.

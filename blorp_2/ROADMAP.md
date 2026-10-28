@@ -3,8 +3,8 @@
 This is the single plan for getting Blorp 2 to compile itself, and for the
 aggregate, ownership, generics and recursion contracts that path depends on. It
 replaces MEMORY_PLAN, MANAGED_RECORDS_PLAN, GENERICS_PLAN and RECURSION_PLAN;
-completed evidence stays in Git and
-[benchmarks/results](../benchmarks/results/). Read both [AGENTS.md](AGENTS.md)
+completed evidence stays in Git, with reports at
+[their last revision](https://github.com/kablorp/blorp/tree/1e07c4dce85e51cd7ad911142e9bc96a5e0d91c7/benchmarks/results). Read both [AGENTS.md](AGENTS.md)
 and the [parent AGENTS.md](../AGENTS.md).
 
 The milestone status below distinguishes implemented capabilities from pending
@@ -36,8 +36,9 @@ complete compiler against actual self-compilation evidence before the next major
 feature expansion. This audit does not defer existing correctness work or gates.
 
 Correctness and useful composition come before memory optimization. Extra
-retains, copies and fresh allocations are acceptable; unique-root COW,
-allocation reuse, retain elimination and consuming-ABI inference are deferred.
+retains, copies and fresh allocations are acceptable. Unique-owner String and
+List buffer reuse has landed (see [List buffer reuse](#list-buffer-reuse-roadmap));
+retain elimination and consuming-ABI inference remain deferred.
 Existing test cost guards remain; adjust them deliberately with evidence rather
 than distorting the design to avoid a host-compiler cost. During integration,
 ordinary allocation-cap overruns are deferred cost debt and do not block
@@ -49,7 +50,7 @@ and changes no existing ceiling.
 
 For the initial self-built bootstrap switch, the user approved the recorded
 compiler cost overruns described in the [self-compilation acceptance
-report](../benchmarks/results/blorp_2_self_compiled_bootstrap_2026-10-20.md).
+report](https://github.com/kablorp/blorp/blob/1e07c4dce85e51cd7ad911142e9bc96a5e0d91c7/benchmarks/results/blorp_2_self_compiled_bootstrap_2026-10-20.md).
 That exception preserves every limit and resource FAIL and remains conditional
 on actual identity, behavior, ownership, sanitizer and platform qualification.
 It does not mark the complete M8 resource gate green.
@@ -115,7 +116,7 @@ their own inventory and plan after M8.
 Corrections, language rules and cleanups decided at the 2026-10-16 quality reset,
 including the namespace redesign, the `?=` placement rule, pattern and binding
 names, private types and UFCS clashes, are complete and published. Their reports
-remain under [benchmarks/results](../benchmarks/results/). Deferred scaling work
+are retained at [their last revision](https://github.com/kablorp/blorp/tree/1e07c4dce85e51cd7ad911142e9bc96a5e0d91c7/benchmarks/results). Deferred scaling work
 below stays separate from that completed correctness and maintenance queue.
 
 The [phase and ownership contracts](#identity-and-immutable-facts) remain the
@@ -129,7 +130,7 @@ not a portable nesting threshold or a product-destruction proof.
 | [M0](#m0-foundation-closeout) | Re-cut, perf fixes, parser statement loop, fixpoint script, parity table | Landed. M3 owns the recorded managed-value call limits. |
 | [M1a](#m1a-surface-syntax-parity) | Layout and parsed source syntax | Pure lambda and callback syntax is implemented; current source-frontier evidence remains separate. |
 | [ML](#ml-list-construction) | `append`, `set`, `concat`, list literal | Done. Checked `set_index` is an ordinary target-library wrapper. |
-| [List buffer reuse](#list-buffer-reuse-roadmap) | Ownership-aware updates, four-slot first growth, doubling and simpler library loops | L1 exact-literal policy under validation on `codex/list-buffer-reuse`; later milestones pending. |
+| [List buffer reuse](#list-buffer-reuse-roadmap) | Ownership-aware updates, four-slot first growth, doubling and simpler library loops | L1 append (`85c1eabc3`) and L2 set/concat (`90f684248`) landed; an L2-capable seed, then L3/L4, are next. |
 | [M1b](#m1b-names-and-the-foundation) | Namespace: private, aliases, qualified names, designated `Bool`/`Option`/`Result` | Parts A and B done; control-flow consumers follow in M2/M3. |
 | [M5](#m5-constants) | Literal scalar/String constants | Implemented. Source construction functions replace the need for record/opaque constants and initializer dependencies. |
 | [M2](#m2-the-join) | Restricted control positions, outer-variable joins, ordinary Boolean calls, `?=` and annotations | Joins, Result propagation, annotations, ordinary Boolean calls and restricted value/statement `if` implemented in integration; acceptance pending. General operand controls remain deferred. |
@@ -195,55 +196,55 @@ host rebuild; freeze it before subsequent matched comparisons.
 Accepted, each with independent reviews, mutation oracles and matched costs in
 its report. Later milestones build on these and do not reopen them.
 
-- **Scalars to recursion.** [Bindings](../benchmarks/results/blorp_2_bindings_2026-10-09.md),
-  [arm blocks](../benchmarks/results/blorp_2_arm_bindings_2026-10-09.md),
-  [managed Strings](../benchmarks/results/blorp_2_managed_strings_2026-10-09.md),
-  [tail-arm ownership](../benchmarks/results/blorp_2_tail_strings_2026-10-09.md),
-  [typed errors](../benchmarks/results/blorp_2_typed_checker_errors_2026-10-09.md),
-  [checking/synthesis](../benchmarks/results/blorp_2_synthesis_checking_2026-10-09.md),
-  [function parameters](../benchmarks/results/blorp_2_function_type_parameters_2026-10-09.md),
-  [union parameters](../benchmarks/results/blorp_2_union_type_parameters_2026-10-10.md),
-  [nested applications](../benchmarks/results/blorp_2_generic_nested_2026-10-10.md),
-  [managed union payloads](../benchmarks/results/blorp_2_managed_union_payloads_2026-10-11.md),
-  [fixed records](../benchmarks/results/blorp_2_fixed_records_2026-10-10.md),
-  [function recursion](../benchmarks/results/blorp_2_function_recursion_2026-10-10.md),
-  [tail loops](../benchmarks/results/blorp_2_tail_recursion_2026-10-10.md) (unmanaged,
+- **Scalars to recursion.** [Bindings](https://github.com/kablorp/blorp/blob/1e07c4dce85e51cd7ad911142e9bc96a5e0d91c7/benchmarks/results/blorp_2_bindings_2026-10-09.md),
+  [arm blocks](https://github.com/kablorp/blorp/blob/1e07c4dce85e51cd7ad911142e9bc96a5e0d91c7/benchmarks/results/blorp_2_arm_bindings_2026-10-09.md),
+  [managed Strings](https://github.com/kablorp/blorp/blob/1e07c4dce85e51cd7ad911142e9bc96a5e0d91c7/benchmarks/results/blorp_2_managed_strings_2026-10-09.md),
+  [tail-arm ownership](https://github.com/kablorp/blorp/blob/1e07c4dce85e51cd7ad911142e9bc96a5e0d91c7/benchmarks/results/blorp_2_tail_strings_2026-10-09.md),
+  [typed errors](https://github.com/kablorp/blorp/blob/1e07c4dce85e51cd7ad911142e9bc96a5e0d91c7/benchmarks/results/blorp_2_typed_checker_errors_2026-10-09.md),
+  [checking/synthesis](https://github.com/kablorp/blorp/blob/1e07c4dce85e51cd7ad911142e9bc96a5e0d91c7/benchmarks/results/blorp_2_synthesis_checking_2026-10-09.md),
+  [function parameters](https://github.com/kablorp/blorp/blob/1e07c4dce85e51cd7ad911142e9bc96a5e0d91c7/benchmarks/results/blorp_2_function_type_parameters_2026-10-09.md),
+  [union parameters](https://github.com/kablorp/blorp/blob/1e07c4dce85e51cd7ad911142e9bc96a5e0d91c7/benchmarks/results/blorp_2_union_type_parameters_2026-10-10.md),
+  [nested applications](https://github.com/kablorp/blorp/blob/1e07c4dce85e51cd7ad911142e9bc96a5e0d91c7/benchmarks/results/blorp_2_generic_nested_2026-10-10.md),
+  [managed union payloads](https://github.com/kablorp/blorp/blob/1e07c4dce85e51cd7ad911142e9bc96a5e0d91c7/benchmarks/results/blorp_2_managed_union_payloads_2026-10-11.md),
+  [fixed records](https://github.com/kablorp/blorp/blob/1e07c4dce85e51cd7ad911142e9bc96a5e0d91c7/benchmarks/results/blorp_2_fixed_records_2026-10-10.md),
+  [function recursion](https://github.com/kablorp/blorp/blob/1e07c4dce85e51cd7ad911142e9bc96a5e0d91c7/benchmarks/results/blorp_2_function_recursion_2026-10-10.md),
+  [tail loops](https://github.com/kablorp/blorp/blob/1e07c4dce85e51cd7ad911142e9bc96a5e0d91c7/benchmarks/results/blorp_2_tail_recursion_2026-10-10.md) (unmanaged,
   nongeneric, direct-self; the billion-iteration run is in the
-  [argument report](../benchmarks/results/blorp_2_arguments_2026-10-12.md)),
-  [argv](../benchmarks/results/blorp_2_arguments_2026-10-12.md) and
-  [ownership reconciliation](../benchmarks/results/blorp_2_argv_reconciliation_2026-10-12.md).
-- **Finite aggregates.** [Mixed finite records and safe projections](../benchmarks/results/blorp_2_mixed_records_2026-10-13.md),
-  [generic records](../benchmarks/results/blorp_2_generic_records_2026-10-13.md),
-  [direct union payload types](../benchmarks/results/blorp_2_direct_union_payloads_2026-10-13.md),
-  [multiple union fields](../benchmarks/results/blorp_2_multiple_union_fields_2026-10-13.md),
-  [owned match-prefix values](../benchmarks/results/blorp_2_owned_match_prefix_2026-10-13.md)
-  and [record updates](../benchmarks/results/blorp_2_record_updates_2026-10-14.md).
+  [argument report](https://github.com/kablorp/blorp/blob/1e07c4dce85e51cd7ad911142e9bc96a5e0d91c7/benchmarks/results/blorp_2_arguments_2026-10-12.md)),
+  [argv](https://github.com/kablorp/blorp/blob/1e07c4dce85e51cd7ad911142e9bc96a5e0d91c7/benchmarks/results/blorp_2_arguments_2026-10-12.md) and
+  [ownership reconciliation](https://github.com/kablorp/blorp/blob/1e07c4dce85e51cd7ad911142e9bc96a5e0d91c7/benchmarks/results/blorp_2_argv_reconciliation_2026-10-12.md).
+- **Finite aggregates.** [Mixed finite records and safe projections](https://github.com/kablorp/blorp/blob/1e07c4dce85e51cd7ad911142e9bc96a5e0d91c7/benchmarks/results/blorp_2_mixed_records_2026-10-13.md),
+  [generic records](https://github.com/kablorp/blorp/blob/1e07c4dce85e51cd7ad911142e9bc96a5e0d91c7/benchmarks/results/blorp_2_generic_records_2026-10-13.md),
+  [direct union payload types](https://github.com/kablorp/blorp/blob/1e07c4dce85e51cd7ad911142e9bc96a5e0d91c7/benchmarks/results/blorp_2_direct_union_payloads_2026-10-13.md),
+  [multiple union fields](https://github.com/kablorp/blorp/blob/1e07c4dce85e51cd7ad911142e9bc96a5e0d91c7/benchmarks/results/blorp_2_multiple_union_fields_2026-10-13.md),
+  [owned match-prefix values](https://github.com/kablorp/blorp/blob/1e07c4dce85e51cd7ad911142e9bc96a5e0d91c7/benchmarks/results/blorp_2_owned_match_prefix_2026-10-13.md)
+  and [record updates](https://github.com/kablorp/blorp/blob/1e07c4dce85e51cd7ad911142e9bc96a5e0d91c7/benchmarks/results/blorp_2_record_updates_2026-10-14.md).
   A record update evaluates the base once, then the replacements in written
   order, then reads the inherited fields in declaration order into one fresh
   construction; old aliases never change. Checking publishes the exact
   replacement/inherited partition, so lowering needs no ordinal table.
-- **Contextual inference.** [Report](../benchmarks/results/blorp_2_contextual_inference_2026-10-13.md).
+- **Contextual inference.** [Report](https://github.com/kablorp/blorp/blob/1e07c4dce85e51cd7ad911142e9bc96a5e0d91c7/benchmarks/results/blorp_2_contextual_inference_2026-10-13.md).
   One expression-local work loop owns temporary variables; caller-owned
   parameters stay rigid; nothing tentative escapes into a published product.
   Explicit call type arguments, let polymorphism, traits and bounds,
   higher-kinded types and polymorphic function values remain deferred.
-- **Lists.** [General `List[T]`](../benchmarks/results/blorp_2_general_lists_2026-10-14.md):
+- **Lists.** [General `List[T]`](https://github.com/kablorp/blorp/blob/1e07c4dce85e51cd7ad911142e9bc96a5e0d91c7/benchmarks/results/blorp_2_general_lists_2026-10-14.md):
   `repeat`, `length` and owned `get` over every supported finite element type,
   with typed concrete slots and per-occurrence ownership.
-- **Preparation and authority repairs.** [Use-vector builders](../benchmarks/results/blorp_2_ownership_builders_2026-10-13.md),
-  [block-local lowering](../benchmarks/results/blorp_2_block_lowering_2026-10-14.md)
+- **Preparation and authority repairs.** [Use-vector builders](https://github.com/kablorp/blorp/blob/1e07c4dce85e51cd7ad911142e9bc96a5e0d91c7/benchmarks/results/blorp_2_ownership_builders_2026-10-13.md),
+  [block-local lowering](https://github.com/kablorp/blorp/blob/1e07c4dce85e51cd7ad911142e9bc96a5e0d91c7/benchmarks/results/blorp_2_block_lowering_2026-10-14.md)
   (recursive expression-local copying remains documented debt),
-  [authority fixes](../benchmarks/results/blorp_2_authority_fixes_2026-10-13.md),
-  [namespace publication](../benchmarks/results/blorp_2_namespace_publication_2026-10-14.md),
-  [milestone integration](../benchmarks/results/blorp_2_milestone_integration_2026-10-13.md),
-  [main rebase](../benchmarks/results/blorp_2_main_rebase_2026-10-14.md) and
-  [performance fixes](../benchmarks/results/blorp_2_perf_fixes_2026-10-15.md)
+  [authority fixes](https://github.com/kablorp/blorp/blob/1e07c4dce85e51cd7ad911142e9bc96a5e0d91c7/benchmarks/results/blorp_2_authority_fixes_2026-10-13.md),
+  [namespace publication](https://github.com/kablorp/blorp/blob/1e07c4dce85e51cd7ad911142e9bc96a5e0d91c7/benchmarks/results/blorp_2_namespace_publication_2026-10-14.md),
+  [milestone integration](https://github.com/kablorp/blorp/blob/1e07c4dce85e51cd7ad911142e9bc96a5e0d91c7/benchmarks/results/blorp_2_milestone_integration_2026-10-13.md),
+  [main rebase](https://github.com/kablorp/blorp/blob/1e07c4dce85e51cd7ad911142e9bc96a5e0d91c7/benchmarks/results/blorp_2_main_rebase_2026-10-14.md) and
+  [performance fixes](https://github.com/kablorp/blorp/blob/1e07c4dce85e51cd7ad911142e9bc96a5e0d91c7/benchmarks/results/blorp_2_perf_fixes_2026-10-15.md)
   (linear emission, indexed name lookup).
 - **Library cost.** Each generic library wrapper costs every compile about 340
   allocations (lexing 146, parsing 104, checking 90). Checking only referenced
   library declarations was measured and rejected, because loading must stay
   complete for the prelude's `methods_only` imports; see the
-  [referenced library check report](../benchmarks/results/blorp_2_referenced_library_check_2026-10-15.md).
+  [referenced library check report](https://github.com/kablorp/blorp/blob/1e07c4dce85e51cd7ad911142e9bc96a5e0d91c7/benchmarks/results/blorp_2_referenced_library_check_2026-10-15.md).
 - **Not claimed.** No whole-compiler linearity. The pilot cannot self-compile.
 
 ## M0: foundation closeout
@@ -373,11 +374,11 @@ The +5% assessment targets and +10% instruction hard limit remain unchanged;
 missed targets and original failures remain reported. Six existing native
 allocation constants increase by 1,500; all other allocation limits and all
 instruction limits stay unchanged. This grants no future List allowance; see
-the [validation report](../benchmarks/results/blorp_2_list_set_names_2026-10-18.md).
+the [validation report](https://github.com/kablorp/blorp/blob/1e07c4dce85e51cd7ad911142e9bc96a5e0d91c7/benchmarks/results/blorp_2_list_set_names_2026-10-18.md).
 
 **Exit proof.** Fixtures for append/set/concat/literal with managed elements,
 ownership verified, C read, ceilings measured; see the
-[list intrinsics report](../benchmarks/results/blorp_2_list_intrinsics_2026-10-15.md).
+[list intrinsics report](https://github.com/kablorp/blorp/blob/1e07c4dce85e51cd7ad911142e9bc96a5e0d91c7/benchmarks/results/blorp_2_list_intrinsics_2026-10-15.md).
 
 **Status.** Done (`append`, `set`, `concat`, literal). Target `set_index`
 returns `Option[List[T]]` through an ordinary `get`/match wrapper, matching the
@@ -388,8 +389,8 @@ must update both libraries and all callers together.
 
 ### Problem and established boundaries
 
-Status: L1 landed as `85c1eabc3`; L2 is approved for publication and an
-L2-capable bootstrap is next.
+Status: L1 landed as `85c1eabc3` with its seed pinned in `8d44d250b`; L2
+landed as `90f684248`. Publishing an L2-capable seed is next, before L3.
 The earlier eager four-slot empty-literal variant passed
 functional gates but exceeded the RSS investigation threshold; its measurements
 remain recorded below. Implement in order, with code-reviewer and
@@ -838,7 +839,7 @@ layout/ownership contract, or a material regression.
   the parser mints a qualified-name form from the module's import block, and the
   checker resolves it in expressions, types (`Builtins.RuntimeType[T]`),
   constructors and patterns. See the
-  [namespace aliases report](../benchmarks/results/blorp_2_namespace_aliases_2026-10-15.md).
+  [namespace aliases report](https://github.com/kablorp/blorp/blob/1e07c4dce85e51cd7ad911142e9bc96a5e0d91c7/benchmarks/results/blorp_2_namespace_aliases_2026-10-15.md).
 - **Part B.** **Decision:** `Bool`, `Option` and `Result` are designated
   foundation unions. One fact, established by the builtin check from `_base`,
   names the unions and their variant ids. `if`, `and`/`or`/`not`, `?=` and `for`
@@ -876,15 +877,15 @@ C/diagnostics and granular ownership tests remain unchanged on shared fixtures.
 
 **Status.** M5a.1 scalar/String facts, identity/ownership tests, six mutation
 oracles, matched costs and the actual-main 2894-component/452-e2e gate pass.
-The [scalar report](../benchmarks/results/blorp_2_scalar_constants_2026-10-16.md)
+The [scalar report](https://github.com/kablorp/blorp/blob/1e07c4dce85e51cd7ad911142e9bc96a5e0d91c7/benchmarks/results/blorp_2_scalar_constants_2026-10-16.md)
 records that bounded path. M5a.2's shared field-admission preparation passes
 focused, mutation and matched cost checks, plus actual-main 2902-component/
 452-e2e acceptance and the unchanged 36/38 frontier.
-The [admission report](../benchmarks/results/blorp_2_record_field_admission_2026-10-16.md)
+The [admission report](https://github.com/kablorp/blorp/blob/1e07c4dce85e51cd7ad911142e9bc96a5e0d91c7/benchmarks/results/blorp_2_record_field_admission_2026-10-16.md)
 records its 42 added / +7 net production lines. Closed records, initializer
 references/cycles and opaque constant forms are deferred language features.
 No M5a.2 production implementation had begun when this scope changed.
-The [construction migration](../benchmarks/results/blorp_2_construction_values_2026-10-16.md)
+The [construction migration](https://github.com/kablorp/blorp/blob/1e07c4dce85e51cd7ad911142e9bc96a5e0d91c7/benchmarks/results/blorp_2_construction_values_2026-10-16.md)
 now replaces all 28 aggregate/opaque globals in compiler source. Fresh host Core
 retains only 71 literal globals; shared fixture behavior and diagnostics match,
 and all 452 e2e cases pass. Ordinary opaque semantics remain a separate M4 task.
@@ -899,7 +900,7 @@ establish integrated functional or resource acceptance.
 **Bootstrap boundary.** Keep statement/binding/function-tail/arm-tail control,
 qualified flat matching, restricted if, outer-variable flow, local annotations
 and function-top-level propagation. The
-[16 source argument matches are now lifted](../benchmarks/results/blorp_2_argument_controls_2026-10-16.md),
+[16 source argument matches are now lifted](https://github.com/kablorp/blorp/blob/1e07c4dce85e51cd7ad911142e9bc96a5e0d91c7/benchmarks/results/blorp_2_argument_controls_2026-10-16.md),
 removing their need for general expression inference. The reviewed
 [compositional plan](COMPOSITIONAL_CONTROL_PLAN.md) remains a broader language
 design; its workloop relocation and arbitrary-expression match/if are deferred.
@@ -971,7 +972,7 @@ depth.
 
 **Status.** M2.1 implemented: bound and statement `match`, nested joins and
 joins in tail arms, with byte-identical C for every existing fixture; see the
-[join report](../benchmarks/results/blorp_2_join_2026-10-16.md). It settled
+[join report](https://github.com/kablorp/blorp/blob/1e07c4dce85e51cd7ad911142e9bc96a5e0d91c7/benchmarks/results/blorp_2_join_2026-10-16.md). It settled
 three details of the sketch above. The original `JoinValue` definition is replaced
 by `LoweredStep.Define/Join` and explicit typed parameters in the written unary
 preparation. M2.1b now also publishes the reassigned enclosing bindings as
@@ -980,16 +981,16 @@ A yielding join arm publishes its value and continuation outputs. An abrupt
 arm instead transfers to its resolved enclosing loop through `TransferLoop`;
 it publishes no join outputs. The checker records each enclosing `var` reassigned by an
 arm; lowering publishes its selected immutable version after the join. The reviewed
-[carried-bindings report](../benchmarks/results/blorp_2_carried_bindings_2026-10-18.md) defines structured multi-output
+[carried-bindings report](https://github.com/kablorp/blorp/blob/1e07c4dce85e51cd7ad911142e9bc96a5e0d91c7/benchmarks/results/blorp_2_carried_bindings_2026-10-18.md) defines structured multi-output
 steps, first as a behavior-preserving preparation. Preparation budgets are
 accepted and the early physical screen is measured. The current unary port at
 accepted main `782824efb` includes the later concat/write-file typed consumers;
 its functional gates and 3,944 fixed-epoch cost calls pass. See the
-[preparation report](../benchmarks/results/blorp_2_unary_preparation_2026-10-18.md)
+[preparation report](https://github.com/kablorp/blorp/blob/1e07c4dce85e51cd7ad911142e9bc96a5e0d91c7/benchmarks/results/blorp_2_unary_preparation_2026-10-18.md)
 for current evidence and the separate historical R0 limitation. The carried
 feature's approved budgets and
 implementation acceptance remain separate from the preparation. The
-[carried-feature report](../benchmarks/results/blorp_2_carried_bindings_2026-10-18.md)
+[carried-feature report](https://github.com/kablorp/blorp/blob/1e07c4dce85e51cd7ad911142e9bc96a5e0d91c7/benchmarks/results/blorp_2_carried_bindings_2026-10-18.md)
 records current functional validation and the 3,976-call frozen cost campaign.
 The checked form is `Match(CheckedJoin)` with value arms; the tail match keeps
 `CheckedMatchBody`. A match at a Void function's tail discards each arm's
@@ -1001,7 +1002,7 @@ ownership discharge and independent verification. It requires no early-return
 form for a join arm: nested propagation is a parser error.
 
 The [language reference](README.md) owns current `if` and propagation behavior.
-The [Result propagation report](../benchmarks/results/blorp_2_result_propagation_2026-10-19.md)
+The [Result propagation report](https://github.com/kablorp/blorp/blob/1e07c4dce85e51cd7ad911142e9bc96a5e0d91c7/benchmarks/results/blorp_2_result_propagation_2026-10-19.md)
 retains its historical ownership, test and cost evidence.
 
 ## M2b: pattern compilation
@@ -1024,7 +1025,7 @@ verification checks every label but grants no payload-projection permission.
 This feature is bounded to 650 gross added / +450 net production lines.
 
 The qualified-head-only port passed current-composition acceptance; see its
-[report](../benchmarks/results/blorp_2_qualified_patterns_2026-10-19.md).
+[report](https://github.com/kablorp/blorp/blob/1e07c4dce85e51cd7ad911142e9bc96a5e0d91c7/benchmarks/results/blorp_2_qualified_patterns_2026-10-19.md).
 Its fixed accepted B is `ea881c84d0df9df04a6ec5c4406a3b69cf406735`.
 The implementation is 42 ADD / 19 DEL / +23 production; the earlier
 41 ADD / 20 DEL / +21 forecast remains historical evidence.
@@ -1212,9 +1213,9 @@ to the declaring module, using namespace-owned declaration authority.
 Specialize projects the accepted underlying type before forming runtime keys,
 so equal representations may share instances and the concrete `TypeRef` has no
 opaque variant. Ordinary declaration identities and resolved callback choices
-remain authoritative. The [ordinary opaque types plan](../benchmarks/results/blorp_2_opaque_types_2026-10-18.md)
+remain authoritative. The [ordinary opaque types plan](https://github.com/kablorp/blorp/blob/1e07c4dce85e51cd7ad911142e9bc96a5e0d91c7/benchmarks/results/blorp_2_opaque_types_2026-10-18.md)
 is implemented without SemanticRef/key preparation or backend/runtime changes;
-the [validation report](../benchmarks/results/blorp_2_opaque_types_2026-10-18.md)
+the [validation report](https://github.com/kablorp/blorp/blob/1e07c4dce85e51cd7ad911142e9bc96a5e0d91c7/benchmarks/results/blorp_2_opaque_types_2026-10-18.md)
 records current-base acceptance and its limits. After restoring host-compatible
 List update names, the actual source probe stops at the missing public
 `list.contains` export in `verify/verify.brp:8:8`, before complete source checking.
@@ -1233,11 +1234,11 @@ borrowed input.
 **Exit proof.** A `CheckedExpr`-shaped fixture; a release-depth table for the
 admitted shapes at the source's deepest nesting under `ulimit -s 512`; step 1's
 100,000-node chain still passes. See the
-[unary recursion report](../benchmarks/results/blorp_2_recursive_unary_2026-10-15.md).
+[unary recursion report](https://github.com/kablorp/blorp/blob/1e07c4dce85e51cd7ad911142e9bc96a5e0d91c7/benchmarks/results/blorp_2_recursive_unary_2026-10-15.md).
 
 **Status.** Step 1 done. Step 2a done: non-generic recursion through record
 fields and `List` elements, released by recursive helpers; see the
-[recursive group report](../benchmarks/results/blorp_2_recursive_mixed_2026-10-15.md).
+[recursive group report](https://github.com/kablorp/blorp/blob/1e07c4dce85e51cd7ad911142e9bc96a5e0d91c7/benchmarks/results/blorp_2_recursive_mixed_2026-10-15.md).
 Ordinary opaque semantics are implemented. Bootstrap remaining: actual
 source-product depth acceptance. Union-only cycles (2b) and own-parameter recursion (2c) are deferred
 language extensions with no current bootstrap witness.
@@ -1247,33 +1248,33 @@ language extensions with no current bootstrap witness.
 **Status.** Reviewed acceptance of matching host/target `string.byte_at` and
 `string.from_codepoint` interfaces. Target phase/native ownership tests, six mutations,
 the full 456-case e2e gate and 3,640 matched cost calls pass hard ceilings.
-The [API report](../benchmarks/results/blorp_2_string_integer_apis_2026-10-16.md)
+The [API report](https://github.com/kablorp/blorp/blob/1e07c4dce85e51cd7ad911142e9bc96a5e0d91c7/benchmarks/results/blorp_2_string_integer_apis_2026-10-16.md)
 retains all 105 allocation misses of the +5% target (maximum +5.62%); normal
 instructions stay within +5%. Implementation, cost and documentation reviews are
 complete.
 Source Char and ASCII classification migration is complete in `abd0aa1a0`:
 all 39 compiler modules reconcile to fresh pre-DCE facts, with 3,109 component
-checks and 461 e2e fixtures passing. The [migration report](../benchmarks/results/blorp_2_source_byte_lazy_screen_2026-10-17.md)
+checks and 461 e2e fixtures passing. The [migration report](https://github.com/kablorp/blorp/blob/1e07c4dce85e51cd7ad911142e9bc96a5e0d91c7/benchmarks/results/blorp_2_source_byte_lazy_screen_2026-10-17.md)
 preserves the failed historical cost screen and the separately reviewed fixed-A/D
 acceptance. Slicing, remaining library and shell/path work still leave M6 open.
 
-The standalone [target current-directory Result slice](../benchmarks/results/blorp_2_target_current_directory_2026-10-17.md)
+The standalone [target current-directory Result slice](https://github.com/kablorp/blorp/blob/1e07c4dce85e51cd7ad911142e9bc96a5e0d91c7/benchmarks/results/blorp_2_target_current_directory_2026-10-17.md)
 is implemented and validated: ordinary owning Result, phase/native tests, six
 effective/restored mutations and all 483 logical cost cases meet their gates.
-The [cost report](../benchmarks/results/blorp_2_target_current_directory_2026-10-17.md)
+The [cost report](https://github.com/kablorp/blorp/blob/1e07c4dce85e51cd7ad911142e9bc96a5e0d91c7/benchmarks/results/blorp_2_target_current_directory_2026-10-17.md)
 records host proxy allocation/instruction ceilings passing under the explicit
 host-only bootstrap leak exception; both host strict memory observations remain
 failed. No pilot/native memory exception applies. Compiler loader migration and
 all broader M6 shell/library integration retain the dependency order above;
 this accepted bounded witness establishes no self-compilation or M6 completion.
 
-[Target file reading](../benchmarks/results/blorp_2_target_file_read_2026-10-17.md) is implemented and validated with phase/native,
-mutation, full-suite and matched-cost gates; [evidence](../benchmarks/results/blorp_2_target_file_read_2026-10-17.md)
+[Target file reading](https://github.com/kablorp/blorp/blob/1e07c4dce85e51cd7ad911142e9bc96a5e0d91c7/benchmarks/results/blorp_2_target_file_read_2026-10-17.md) is implemented and validated with phase/native,
+mutation, full-suite and matched-cost gates; [evidence](https://github.com/kablorp/blorp/blob/1e07c4dce85e51cd7ad911142e9bc96a5e0d91c7/benchmarks/results/blorp_2_target_file_read_2026-10-17.md)
 retains failed host strict checks. Destination e2e passed; loader migration remains pending.
 
-The bounded [target file-writing slice](../benchmarks/results/blorp_2_target_write_file_2026-10-18.md) implements
+The bounded [target file-writing slice](https://github.com/kablorp/blorp/blob/1e07c4dce85e51cd7ad911142e9bc96a5e0d91c7/benchmarks/results/blorp_2_target_write_file_2026-10-18.md) implements
 ordinary `Result[Void, String]` with two borrowed Strings. Its phase/native, full
-functional and matched FEATURE cost gates pass; [evidence](../benchmarks/results/blorp_2_target_write_file_2026-10-18.md)
+functional and matched FEATURE cost gates pass; [evidence](https://github.com/kablorp/blorp/blob/1e07c4dce85e51cd7ad911142e9bc96a5e0d91c7/benchmarks/results/blorp_2_target_write_file_2026-10-18.md)
 retains the failed supporting-host strict checks. Main/loader migration remains
 a separate gate. This does not complete M6.
 
@@ -1374,7 +1375,7 @@ host trait enters target code.
   and close failure return Err; clean up every opened handle. This increment
   needs stable source files, not arbitrary streams or concurrent snapshots.
 - **Write:** implemented and validated; the
-  [acceptance report](../benchmarks/results/blorp_2_target_write_file_2026-10-18.md)
+  [acceptance report](https://github.com/kablorp/blorp/blob/1e07c4dce85e51cd7ad911142e9bc96a5e0d91c7/benchmarks/results/blorp_2_target_write_file_2026-10-18.md)
   retains the contracts and evidence.
   Create/truncate, write all counted contents and close successfully
   before Ok(void). Reject NUL paths; missing parents fail. A failure may leave
@@ -1387,7 +1388,7 @@ host trait enters target code.
 - **Stderr:** attempt the complete counted message plus one additional LF,
   preserving internal newlines/NUL and writing nothing to stdout. Void reports
   no delivery status; stop on unrecoverable output error.
-  The [target stderr implementation](../benchmarks/results/blorp_2_print_error_2026-10-18.md) is validated;
+  The [target stderr implementation](https://github.com/kablorp/blorp/blob/1e07c4dce85e51cd7ad911142e9bc96a5e0d91c7/benchmarks/results/blorp_2_print_error_2026-10-18.md) is validated;
   the integrated compiler shell uses this target API; whole-compiler acceptance
   remains pending.
 - **Join:** an absolute child replaces base. Empty base returns child, including
@@ -1455,7 +1456,7 @@ were unsupported at that checkpoint. The owner stopped the remaining
 callback-removal migration on 2026-10-19. The
 [language reference](README.md#grammar-for-this-increment) owns the current
 callable contract, including stored values and immutable callable captures; the
-[stored-callable acceptance report](../benchmarks/results/blorp2_stored_callables_2026-10-21.md)
+[stored-callable acceptance report](https://github.com/kablorp/blorp/blob/1e07c4dce85e51cd7ad911142e9bc96a5e0d91c7/benchmarks/results/blorp2_stored_callables_2026-10-21.md)
 records validation and measured cost limits. The
 [target API reference](standard_library/README.md) records callback helpers.
 The source-removal work below is retained history.
@@ -1473,8 +1474,8 @@ Any future source slice follows the [fixed-baseline cost policy](#cost-and-evide
 retain historical R0 failures and cumulative trends without automatic baseline
 changes after failure.
 
-The bounded [three-site type-argument translation](../benchmarks/results/blorp_2_first_order_type_arguments_2026-10-18.md)
-is implemented and validated: [3,920 matched calls](../benchmarks/results/blorp_2_first_order_type_arguments_2026-10-18.md)
+The bounded [three-site type-argument translation](https://github.com/kablorp/blorp/blob/1e07c4dce85e51cd7ad911142e9bc96a5e0d91c7/benchmarks/results/blorp_2_first_order_type_arguments_2026-10-18.md)
+is implemented and validated: [3,920 matched calls](https://github.com/kablorp/blorp/blob/1e07c4dce85e51cd7ad911142e9bc96a5e0d91c7/benchmarks/results/blorp_2_first_order_type_arguments_2026-10-18.md)
 pass the +3% per-input and original-checkpoint-proxy limits. Historical R0
 compliance remains UNVERIFIED; eight callbacks and the broader M7 dependency remain.
 
@@ -1508,7 +1509,7 @@ and immutable capture specialization were implemented in the combined candidate;
 integrated correctness, resource and self-compilation acceptance were still
 separate obligations. For current behavior and the later acceptance evidence,
 use [README.md](README.md#grammar-for-this-increment) and the
-[stored-callable report](../benchmarks/results/blorp2_stored_callables_2026-10-21.md).
+[stored-callable report](https://github.com/kablorp/blorp/blob/1e07c4dce85e51cd7ad911142e9bc96a5e0d91c7/benchmarks/results/blorp2_stored_callables_2026-10-21.md).
 Historical resource failures retain their original verdicts.
 
 ## M8: the fixpoint gate
@@ -1528,7 +1529,7 @@ be rewritten once blorp_2 is mature. The unit-test migration is a separate plan.
 **Status.** In progress. The compiler accepts all 43 of its own source modules,
 emits C that links without warnings, and the resulting compiler emits
 byte-identical C from the same source and library. The [self-compilation
-report](../benchmarks/results/blorp_2_self_compiled_bootstrap_2026-10-20.md)
+report](https://github.com/kablorp/blorp/blob/1e07c4dce85e51cd7ad911142e9bc96a5e0d91c7/benchmarks/results/blorp_2_self_compiled_bootstrap_2026-10-20.md)
 records the exact inputs and matched `-O0` execution cost. Host-backed component
 validation passes 4,174 checks. All 556 maintained fixture files agree under A/B;
 the self-built compiler passes all 559 e2e functional callbacks under the explicit
@@ -1540,9 +1541,9 @@ Legacy TestSuite hosting remains separate. The remaining cost obligations above
 are still pending; this checkpoint does
 not mark the complete M8 resource gate green.
 
-The [runtime accounting preparation](../benchmarks/results/blorp_2_pilot_memory_accounting_2026-10-18.md)
+The [runtime accounting preparation](https://github.com/kablorp/blorp/blob/1e07c4dce85e51cd7ad911142e9bc96a5e0d91c7/benchmarks/results/blorp_2_pilot_memory_accounting_2026-10-18.md)
 has passed its bounded runtime and matched host-proxy gates
-([evidence](../benchmarks/results/blorp_2_pilot_memory_accounting_2026-10-18.md)).
+([evidence](https://github.com/kablorp/blorp/blob/1e07c4dce85e51cd7ad911142e9bc96a5e0d91c7/benchmarks/results/blorp_2_pilot_memory_accounting_2026-10-18.md)).
 Those historical pilot counts do not by themselves establish target-built strict
 self-compilation; the current proof is recorded above. Matched mode 0/mode 1
 target allocator overhead remains M8 work.
@@ -1822,7 +1823,7 @@ Supporting-host compile-time leaks follow the
   one published row or slot per concrete fact.
 
 For the unary typed-step preparation only, the
-[reviewed fixed-current contract](../benchmarks/results/blorp_2_carried_bindings_2026-10-18.md)
+[reviewed fixed-current contract](https://github.com/kablorp/blorp/blob/1e07c4dce85e51cd7ad911142e9bc96a5e0d91c7/benchmarks/results/blorp_2_carried_bindings_2026-10-18.md)
 was approved before current cost sampling. One fixed final accepted B and complete
 C must pass +3% allocations and normal min3 instructions per current input and the
 original construction-checkpoint proxy, with all absolute/LOC/strict-zero/identity
@@ -1865,8 +1866,8 @@ when the corresponding complete source-plus-library migration/inventory gate
 passes. Preserve reviewed future designs and held candidates. A retained stored
 payload witness can reopen the appropriate recursive-type prerequisite.
 
-Unique-root COW and allocation reuse (first candidate if M8 shows quadratic
-`append`), retain elimination, consuming-ABI inference, List removal, Set/Dict
+Allocation reuse beyond unique-owner String and List buffers, retain
+elimination, consuming-ABI inference, List removal, Set/Dict
 key semantics (storing a type does not make it a key), mutual tail calls,
 tail-modulo-constructor, closure escape and closure values, and the unit-test
 migration plan. When reuse is introduced, its enabled and always-fresh paths must
@@ -1917,7 +1918,7 @@ failures supply regression ideas, not claims about current bugs.
 Completed experiments, counts, historical budgets and host-compiler limitations
 live in the reports linked under [Delivered foundation](#delivered-foundation)
 and in the milestones above, plus the
-[host temporary-projection repair](../benchmarks/results/compiler_nested_temporary_projection_2026-10-11.md);
+[host temporary-projection repair](https://github.com/kablorp/blorp/blob/1e07c4dce85e51cd7ad911142e9bc96a5e0d91c7/benchmarks/results/compiler_nested_temporary_projection_2026-10-11.md);
 passing pilot checks do not imply an incomplete broader host gate passed.
 Old slice-specific thresholds and counts are historical evidence, not current
 budgets.

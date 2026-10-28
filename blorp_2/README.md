@@ -12,7 +12,7 @@ library provides the equality families and ordinary helpers described below. Foc
 functional results are supplemented by an actual self-compilation: the complete
 compiler import graph emits C, that C links, and the resulting compiler emits
 byte-identical C from the same source and library. The [self-compilation
-report](../benchmarks/results/blorp_2_self_compiled_bootstrap_2026-10-20.md)
+report](https://github.com/kablorp/blorp/blob/1e07c4dce85e51cd7ad911142e9bc96a5e0d91c7/benchmarks/results/blorp_2_self_compiled_bootstrap_2026-10-20.md)
 records the proof and matched build costs. Full fixture parity, native-suite
 and resource acceptance remain separate; measured cost failures stay recorded.
 
@@ -39,9 +39,9 @@ Concrete, authored traits are supported as described in [concrete traits](#concr
 Function bounds, full generic receiver families, default methods and contextual
 method references extend that surface. Automatic equality for named records and
 unions infers conditional bounds from their actual members, preserving authored
-implementations and semantic type arguments. The [generic equality report](../benchmarks/results/blorp2-generic-equality-2026-10-23.md)
+implementations and semantic type arguments. The [generic equality report](https://github.com/kablorp/blorp/blob/1e07c4dce85e51cd7ad911142e9bc96a5e0d91c7/benchmarks/results/blorp2-generic-equality-2026-10-23.md)
 records qualification evidence and matched costs; the earlier
-[nongeneric report](../benchmarks/results/blorp2-derived-equality-2026-10-23.md)
+[nongeneric report](https://github.com/kablorp/blorp/blob/1e07c4dce85e51cd7ad911142e9bc96a5e0d91c7/benchmarks/results/blorp2-derived-equality-2026-10-23.md)
 retains its original proof and costs. The [Equatable-first trait plan](TRAITS_PLAN.md)
 owns production-library contracts and the retained acceptance criteria.
 
@@ -50,13 +50,13 @@ physical-layout model, staged replacements, code examples and cost gates.
 Implementation starts after CI/bootstrap repair and the bounded test migration.
 
 Completed increment plans and handoffs are retained in Git; validation reports
-remain under [benchmarks/results](../benchmarks/results/). Historical research
+are retained at [their last revision](https://github.com/kablorp/blorp/tree/1e07c4dce85e51cd7ad911142e9bc96a5e0d91c7/benchmarks/results). Historical research
 is available in the committed designs for
 [pattern matching across Haskell, OCaml, Rust, Scala and Elm](https://github.com/kablorp/blorp/blob/4b05ea3b431d9fbe4e906a0802bd41060b6f397f/blorp_2/MATCH_PLAN.md#cross-language-implementation-references),
 [module identities and visibility](https://github.com/kablorp/blorp/blob/4b05ea3b431d9fbe4e906a0802bd41060b6f397f/blorp_2/MODULES_PLAN.md#established-implementations-and-the-bounded-choice),
 and [guaranteed tail calls](https://github.com/kablorp/blorp/blob/4b05ea3b431d9fbe4e906a0802bd41060b6f397f/blorp_2/TAIL_RECURSION_PLAN.md#established-precedents-and-deliberate-choices).
 
-The [scaffolding cleanup report](../benchmarks/results/blorp_2_cleanup_2026-10-12.md)
+The [scaffolding cleanup report](https://github.com/kablorp/blorp/blob/1e07c4dce85e51cd7ad911142e9bc96a5e0d91c7/benchmarks/results/blorp_2_cleanup_2026-10-12.md)
 records explicit unit inputs, reachable specialization, the slim target library,
 matched costs and validation limits. Its measurements supersede earlier cost
 examples for this implementation; older increment reports retain their history.
@@ -476,7 +476,7 @@ func main() -> Int:
 This exits 1. `original` is immutable; `current` is mutable, and reassignment
 does not change the earlier value. Local mutation is permitted in pure
 functions. Every initializer runs once in source order, including unused
-bindings. The [binding report](../benchmarks/results/blorp_2_bindings_2026-10-09.md) records phase validation;
+bindings. The [binding report](https://github.com/kablorp/blorp/blob/1e07c4dce85e51cd7ad911142e9bc96a5e0d91c7/benchmarks/results/blorp_2_bindings_2026-10-09.md) records phase validation;
 the [companion fixture](test/e2e/fixtures/binding/values.brp) instead returns
 the reassigned current value, 42. Separate small fixtures cover self-assignment,
 parameter initialization and union values. Phase tests check exact full-width values
@@ -773,7 +773,7 @@ The current matched minima are 39,210,111 → 39,359,584 (+0.381%), with candida
 maximum 39,382,264. This establishes marginal process-startup headroom rather
 than repeatable growth above 5%. The 4,000 allocation limit, all other fixture
 ceilings, and the separate 10% allocation/5% minimum-instruction investigation
-stops are unchanged. The [fixed-record report](../benchmarks/results/blorp_2_fixed_records_2026-10-10.md)
+stops are unchanged. The [fixed-record report](https://github.com/kablorp/blorp/blob/1e07c4dce85e51cd7ad911142e9bc96a5e0d91c7/benchmarks/results/blorp_2_fixed_records_2026-10-10.md)
 preserves the failed full gate and final rerun.
 
 Historical matched `-O2` measurements of ordered-value lowering increased
@@ -789,11 +789,11 @@ verification now raise the affected allocation ceilings deliberately: return zer
 measures 623 allocations, including 424 for prelude processing and 33 for ownership
 insertion/verification in a phase-prefix probe. All 43 frozen prior fixtures emit
 identical C; the final matched instruction sample grows by at most 13.00%. See the
-[managed String record](../benchmarks/results/blorp_2_managed_strings_2026-10-09.md)
+[managed String record](https://github.com/kablorp/blorp/blob/1e07c4dce85e51cd7ad911142e9bc96a5e0d91c7/benchmarks/results/blorp_2_managed_strings_2026-10-09.md)
 for the straight-line comparison and limitations, the
-[tail String record](../benchmarks/results/blorp_2_tail_strings_2026-10-09.md)
+[tail String record](https://github.com/kablorp/blorp/blob/1e07c4dce85e51cd7ad911142e9bc96a5e0d91c7/benchmarks/results/blorp_2_tail_strings_2026-10-09.md)
 for branch ownership costs and unchanged C, and the
-[binding increment record](../benchmarks/results/blorp_2_bindings_2026-10-09.md)
+[binding increment record](https://github.com/kablorp/blorp/blob/1e07c4dce85e51cd7ad911142e9bc96a5e0d91c7/benchmarks/results/blorp_2_bindings_2026-10-09.md)
 for matched workloads, provenance, samples and validation.
 
 Companion source fixtures expose individual behaviors through their real
@@ -828,7 +828,7 @@ retired-instruction counter. Missing or malformed required measurements fail
 the test. CI explicitly selects `BLORP_2_INSTRUCTION_CHECK=disabled` because hosted
 runners may lack this counter; that mode retains strict allocation reports and caps.
 The first limits were established on arm64 macOS with Apple Clang 21. See the
-[cost record](../benchmarks/results/blorp_2_costs_2026-10-08.md) for baselines,
+[cost record](https://github.com/kablorp/blorp/blob/1e07c4dce85e51cd7ad911142e9bc96a5e0d91c7/benchmarks/results/blorp_2_costs_2026-10-08.md) for baselines,
 commands, provenance, and measurement limits.
 
 The purity increment passed all 71 tests, both normally and with
@@ -930,7 +930,7 @@ through generic identity also survives replacement. Calls borrow arguments and
 return owned managed values; constructors explicitly transfer child obligations.
 Strict phase/full pilot tests, all twelve native examples, eight ownership fault
 checks and final-hash matched costs pass independent review. The
-[increment report](../benchmarks/results/blorp_2_managed_union_payloads_2026-10-11.md)
+[increment report](https://github.com/kablorp/blorp/blob/1e07c4dce85e51cd7ad911142e9bc96a5e0d91c7/benchmarks/results/blorp_2_managed_union_payloads_2026-10-11.md)
 records the evidence, current limits and separate host Core failures.
 
 
@@ -998,7 +998,7 @@ loop on every iteration. The emitted C guarantees bounded stack growth for
 these direct self edges at `-O0`; other calls and mutual recursion retain their
 ordinary stack behavior. The annotation does not bound heap use or prove
 termination. Unannotated C output is preserved. The
-[tail-recursion report](../benchmarks/results/blorp_2_tail_recursion_2026-10-10.md)
+[tail-recursion report](https://github.com/kablorp/blorp/blob/1e07c4dce85e51cd7ad911142e9bc96a5e0d91c7/benchmarks/results/blorp_2_tail_recursion_2026-10-10.md)
 records phase invariants, malformed-IR tests and the native stack-exhaustion
 mutation oracle. The [tail-loop roadmap](ROADMAP.md#m3-loops-and-tail-recursion)
 retains the deferred generic and managed annotated tail-recursion requirements.
@@ -1154,7 +1154,7 @@ it. A direct runtime test releases a 100,000-deep chain, built iteratively from
 completed children, on a 512 KiB thread stack. Source construction and traversal
 still use ordinary C call depth, and managed values remain outside
 `@tail_recursive` loops. See the
-[increment report](../benchmarks/results/blorp_2_recursive_unary_2026-10-15.md).
+[increment report](https://github.com/kablorp/blorp/blob/1e07c4dce85e51cd7ad911142e9bc96a5e0d91c7/benchmarks/results/blorp_2_recursive_unary_2026-10-15.md).
 
 
 Ordinary [List membership](standard_library/README.md#list-membership) accepts a
@@ -1205,7 +1205,7 @@ release. Releasing user data therefore has a depth limit: a self-linked record
 such as `record Node { value: Int, next: Option[Node] }` releases at most
 87,505 nodes on an 8 MiB stack and 5,584 on a 512 KiB thread stack when the
 generated C is built at `-O0` (262,520 and 16,760 at `-O2`). The
-[report](../benchmarks/results/blorp_2_recursive_mixed_2026-10-15.md) gives the
+[report](https://github.com/kablorp/blorp/blob/1e07c4dce85e51cd7ad911142e9bc96a5e0d91c7/benchmarks/results/blorp_2_recursive_mixed_2026-10-15.md) gives the
 full depth table and the nesting the pilot's own source reaches.
 
 
@@ -1288,7 +1288,7 @@ values have no physical storage. Tuples have value semantics and remain
 structurally typed, distinct from authored named records. Once concrete, they
 use the ordinary managed record storage and ownership machinery. Tuple
 equality, ordering and traits are outside this increment.
-The [tuple validation and cost report](../benchmarks/results/blorp_2_tuples_2026-10-21.md)
+The [tuple validation and cost report](https://github.com/kablorp/blorp/blob/1e07c4dce85e51cd7ad911142e9bc96a5e0d91c7/benchmarks/results/blorp_2_tuples_2026-10-21.md)
 records matched self-compilation costs, ownership checks and native coverage.
 
 ## Fresh record updates
@@ -1971,8 +1971,8 @@ Semantic rules:
   destination through the same ownership contract as concat; integer digits
   use a checked stack buffer and append through the same capacity machinery.
   Named and stored callable references retain their borrowed wrappers.
-  [Buffer-reuse measurements](../benchmarks/results/blorp2-string-buffer-reuse-2026-10-23.md) and
-  [integer-append measurements](../benchmarks/results/blorp2-string-append-int-2026-10-23.md)
+  [Buffer-reuse measurements](https://github.com/kablorp/blorp/blob/1e07c4dce85e51cd7ad911142e9bc96a5e0d91c7/benchmarks/results/blorp2-string-buffer-reuse-2026-10-23.md) and
+  [integer-append measurements](https://github.com/kablorp/blorp/blob/1e07c4dce85e51cd7ad911142e9bc96a5e0d91c7/benchmarks/results/blorp2-string-append-int-2026-10-23.md)
   record allocation/instruction results and the validation boundary.
 - Union-only recursive layouts, generic self-reinstantiation,
   guards, Char patterns, constructor UFCS,
@@ -2045,7 +2045,7 @@ appended.
 Every loaded module is checked, including unused declarations. Diagnostics
 retain the source file for primary errors and secondary notes independently.
 
-The [module validation report](../benchmarks/results/blorp_2_modules_2026-10-11.md)
+The [module validation report](https://github.com/kablorp/blorp/blob/1e07c4dce85e51cd7ad911142e9bc96a5e0d91c7/benchmarks/results/blorp_2_modules_2026-10-11.md)
 retains the independent reviews and measurements; the
 [module reference](#local-modules) defines the current visibility rules.
 
@@ -2088,7 +2088,7 @@ may declare these builtin bodies with the exact concrete runtime signature,
 without statement prefixes or tail annotations. List repeat, length, get, append, set and concat wrappers may also declare generic parameters; other builtin wrappers remain nongeneric. Unknown
 labels and signature mismatches are errors. There is no arbitrary foreign
 symbol binding. The base types module owns `Int`, `Float`, `String`, `Void` and unary `List`.
-The [validation report](../benchmarks/results/blorp_2_int_add_2026-10-11.md) records
+The [validation report](https://github.com/kablorp/blorp/blob/1e07c4dce85e51cd7ad911142e9bc96a5e0d91c7/benchmarks/results/blorp_2_int_add_2026-10-11.md) records
 strict tests, native fixtures, matched costs and the existing compiler's
 different trait-based `add` import surface.
 The [target API reference](standard_library/README.md) documents the current
@@ -2155,18 +2155,18 @@ handwritten left fold. No interpolation representation reaches the backend.
 
 Builtin declaration labels retain their exact raw spelling; String escape
 decoding does not create aliases for closed runtime operations. The
-[String report](../benchmarks/results/blorp_2_strings_2026-10-11.md) records construction and validation evidence.
+[String report](https://github.com/kablorp/blorp/blob/1e07c4dce85e51cd7ad911142e9bc96a5e0d91c7/benchmarks/results/blorp_2_strings_2026-10-11.md) records construction and validation evidence.
 Emission uses flat static byte arrays scoped to their function and named from
 existing value identities. Backing bytes require no stack initialization and
 avoid C string-token length limits; the runtime copies them into an ordinary
 owned String on each evaluation.
 
-[Retained validation and costs](../benchmarks/results/blorp_2_strings_2026-10-11.md)
+[Retained validation and costs](https://github.com/kablorp/blorp/blob/1e07c4dce85e51cd7ad911142e9bc96a5e0d91c7/benchmarks/results/blorp_2_strings_2026-10-11.md)
 cover the 15 new native fixtures, exact byte/lifetime tests, full suites and
 frozen existing-workload comparison. Long-literal probes also identify a
 bounded follow-up: the current host concat helper copies growing buffers in
 byte emission (`append_string_bytes`). Escape decoding no longer does; the
-[String decoding report](../benchmarks/results/blorp_2_string_decoding_2026-10-16.md)
+[String decoding report](https://github.com/kablorp/blorp/blob/1e07c4dce85e51cd7ad911142e9bc96a5e0d91c7/benchmarks/results/blorp_2_string_decoding_2026-10-16.md)
 has the measurements.
 
 ## Void, ordered statements and print
@@ -2252,7 +2252,7 @@ One ordered statement list carries evaluation order through parsing, checking
 and specialization. Discards create no synthetic binding; lowering retains
 their ordinary value definitions so unused Void results still execute calls.
 Emission selects a small print runtime fragment only when its typed operation
-is used. The [validation report](../benchmarks/results/blorp_2_void_print_2026-10-12.md)
+is used. The [validation report](https://github.com/kablorp/blorp/blob/1e07c4dce85e51cd7ad911142e9bc96a5e0d91c7/benchmarks/results/blorp_2_void_print_2026-10-12.md)
 records phase tests, native output, ownership checks and matched costs.
 
 ## Calculator input and results
@@ -2398,7 +2398,7 @@ Nested helper dependencies reuse their suffix keys rather than rewalking type
 ancestry. The finite concrete layouts remain the authority for element storage
 and destruction.
 
-The [argument validation report](../benchmarks/results/blorp_2_arguments_2026-10-12.md)
+The [argument validation report](https://github.com/kablorp/blorp/blob/1e07c4dce85e51cd7ad911142e9bc96a5e0d91c7/benchmarks/results/blorp_2_arguments_2026-10-12.md)
 records the entrypoint contract, ownership checks, native tests and matched costs.
 
 `string.equals(first, second) -> Bool` compares complete byte sequences.
@@ -2542,7 +2542,7 @@ errors take priority over close errors; every opened stream receives exactly
 one close attempt, including EINTR, without retry. Partial output is allowed;
 atomic replacement and durability are outside the contract. Nothing is printed.
 See the [complete program](test/e2e/fixtures/file_write/bytes.brp) and
-[acceptance report](../benchmarks/results/blorp_2_target_write_file_2026-10-18.md). The
+[acceptance report](https://github.com/kablorp/blorp/blob/1e07c4dce85e51cd7ad911142e9bc96a5e0d91c7/benchmarks/results/blorp_2_target_write_file_2026-10-18.md). The
 integrated compiler shell uses this interface; full compiler acceptance remains pending.
 
 ## Float64 calculator
@@ -2631,7 +2631,7 @@ The [calculator component tests](test/unit/test_lower/test_option_contracts.brp)
 fixtures protect different boundaries independently.
 
 All nine calculator increments are complete. The
-[validation report](../benchmarks/results/blorp_2_calculator_2026-10-12.md)
+[validation report](https://github.com/kablorp/blorp/blob/1e07c4dce85e51cd7ad911142e9bc96a5e0d91c7/benchmarks/results/blorp_2_calculator_2026-10-12.md)
 records 1,456 passing Blorp component checks, 40 native runtime cases, 299 native
 e2e executions, independent reviews and matched cost measurements.
 
@@ -3016,7 +3016,7 @@ Clang compilation/linking and native execution, with explicit source and toolcha
 identity; it is a goal, not a measured result. The current unit command still
 uses the existing compiler. Its measured 615 ms pipeline would become about
 123 ms at that target, saving about 492 ms once the pilot supports that workload.
-See the [timing record](../benchmarks/results/blorp_2_match_2026-10-09.md#unit-test-feedback-time).
+See the [timing record](https://github.com/kablorp/blorp/blob/1e07c4dce85e51cd7ad911142e9bc96a5e0d91c7/benchmarks/results/blorp_2_match_2026-10-09.md#unit-test-feedback-time).
 
 Compare both compilers through C emission on the unmodified e2e fixtures:
 

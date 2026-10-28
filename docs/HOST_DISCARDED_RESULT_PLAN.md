@@ -2,9 +2,9 @@
 
 Status: **implemented and validated.** The separate mixed-Drop Perceus
 prerequisite passed correctness, mutation, O2 fixpoint and matched costs. Its
-[acceptance report](../benchmarks/results/compiler_drop_mixed_alias_2026-10-16.md)
+[acceptance report](https://github.com/kablorp/blorp/blob/1e07c4dce85e51cd7ad911142e9bc96a5e0d91c7/benchmarks/results/compiler_drop_mixed_alias_2026-10-16.md)
 records +9 production / +164 tests. The
-[discarded-result acceptance report](../benchmarks/results/compiler_discarded_result_2026-10-16.md)
+[discarded-result acceptance report](https://github.com/kablorp/blorp/blob/1e07c4dce85e51cd7ad911142e9bc96a5e0d91c7/benchmarks/results/compiler_discarded_result_2026-10-16.md)
 records +30 production / +448 tests, granular mutation proofs, sanitizer/leak
 and broad compiler gates, a fresh O2 fixpoint and cumulative matched costs.
 The rejected backend candidate remains parked for comparison and must not be

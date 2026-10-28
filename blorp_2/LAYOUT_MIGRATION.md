@@ -1,8 +1,8 @@
 # Simplifying layout and ownership representation in place
 
 Status: M1, M2, E1 and E2 implemented and qualified, 2026-10-22. See the
-[binary ownership report](../benchmarks/results/blorp_2_binary_ownership_2026-10-21.md)
-and [flat union reader report](../benchmarks/results/blorp_2_flat_layout_readers_2026-10-21.md).
+[binary ownership report](https://github.com/kablorp/blorp/blob/1e07c4dce85e51cd7ad911142e9bc96a5e0d91c7/benchmarks/results/blorp_2_binary_ownership_2026-10-21.md)
+and [flat union reader report](https://github.com/kablorp/blorp/blob/1e07c4dce85e51cd7ad911142e9bc96a5e0d91c7/benchmarks/results/blorp_2_flat_layout_readers_2026-10-21.md).
 This simplified roadmap supersedes the uniform heap-catalogue proposal in
 commit `7237afb9a`. Design examples below retain their inspection snapshot
 `2ebbebf83c08b45cdf0c807453f89e12fb4b4ac9`; M1's matched measurements freeze source
@@ -76,12 +76,12 @@ three production lines. Allocations are unchanged from its immediate parent;
 retired instructions are effectively flat (+0.00303%). E1 is complete: the
 completed record sum removes 475 allocations on the fixed workload
 (0.001548% of Parent), with effectively flat instructions and net +13 production
-lines. See the [record-sum report](../benchmarks/results/blorp_2_record_layout_sum_2026-10-21.md).
+lines. See the [record-sum report](https://github.com/kablorp/blorp/blob/1e07c4dce85e51cd7ad911142e9bc96a5e0d91c7/benchmarks/results/blorp_2_record_layout_sum_2026-10-21.md).
 E2 has independently reproduced 885 fewer allocations (0.00288373% of Parent),
 minimum-of-three instructions +0.00283581% with overlapping ranges and
 net +19 production lines. Composed component/native/fixpoint and whole-source
 strict/sanitizer qualification passed. See the
-[union-sum report](../benchmarks/results/blorp_2_union_layout_sum_2026-10-22.md).
+[union-sum report](https://github.com/kablorp/blorp/blob/1e07c4dce85e51cd7ad911142e9bc96a5e0d91c7/benchmarks/results/blorp_2_union_layout_sum_2026-10-22.md).
 Each implementation brief follows [HANDOFF_SPEC](../docs/HANDOFF_SPEC.md), stays
 under its prose limit and references this design rather than duplicating it.
 
@@ -309,7 +309,7 @@ deletion hypothesis; completing M2 does not authorize E1/E2 implementation.
 ## E1: fuse the completed record row, only if it earns adoption
 
 Status: implemented and qualified, 2026-10-22. See the
-[record-sum report](../benchmarks/results/blorp_2_record_layout_sum_2026-10-21.md)
+[record-sum report](https://github.com/kablorp/blorp/blob/1e07c4dce85e51cd7ad911142e9bc96a5e0d91c7/benchmarks/results/blorp_2_record_layout_sum_2026-10-21.md)
 for matched measurements, preserved raw validation, complete component/native
 gates, fixpoint and strict/sanitizer results. The implementation is smaller
 than the earlier physical-slot
@@ -474,7 +474,7 @@ overlapping ranges) and passes the prospective +0.25% guard; fixed Original allo
 O/P/C allocation confirmation, with all roles' exact counts repeated, no second
 normal batch or third strict batch.
 
-The [union-sum report](../benchmarks/results/blorp_2_union_layout_sum_2026-10-22.md)
+The [union-sum report](https://github.com/kablorp/blorp/blob/1e07c4dce85e51cd7ad911142e9bc96a5e0d91c7/benchmarks/results/blorp_2_union_layout_sum_2026-10-22.md)
 records source02's three production and 54 test edits, corrected CheckedUnion
 census false positives, unchanged 57-owner, 917-callback selection plus 142 nested native
 assertions, local ordinary/fault/C/resource evidence and all limitations.
