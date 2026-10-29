@@ -13,7 +13,7 @@ import:
 	../namespace/namespace: Namespace, TypeHead(PrimitiveHead, ListHead, RecordHead, UnionHead, OpaqueHead), same_head, named_trait, implementation_trait
 	../parse/assemble: ParsedContents
 	../utils/ids: RecordRow, UnionRow, FunctionId, VariantId, TraitMethodId, TraitMethodDeclaration(RequiredMethod, DefaultMethod), trait_method_header, trait_method_number, trait_method_owner, TraitRow, TraitMethodRow, ImplRow, TraitId, inventory_traits, inventory_implementations, inventory_functions, inventory_records, inventory_unions, inventory_opaques, trait_number, impl_number, function_number, record_number, union_number, opaque_number, variant_owner, same_trait_method
-	../utils/names: contextual_words, foundation_words, same_name
+	../utils/names: NameId, contextual_words, foundation_words, same_name
 	../utils/source: ModuleId, compiler_source, same_module, module_number, ModuleKind(LibraryModule)
 	../utils/syntax: FunctionHeader, WrittenName, TypeSyntax(CallableTypeSyntax), Purity(Pure), type_span, same_purity, Span
 	list: List methods
@@ -93,6 +93,37 @@ private pure func canonical_header(row: TraitRow, method: TraitMethodId, parsed:
 	trait_method_header(written, parsed.declarations).to_result(checker_invariant(row.type_name.span, InvalidFunctionContract))
 
 
+-- A canonical member compares two Self values and answers Bool.
+private pure func self_predicate(method: AcceptedTraitMethod, self: TypeRef, boolean_type: TypeRef) -> Bool:
+	and(same_types(method.signature.parameters.map(pure func(parameter): parameter.value_type), [self, self]), same_type(method.signature.return_type.value_type, boolean_type))
+
+
+-- A reserved member found by its spelling, with the name span diagnostics cite.
+private fixed record CanonicalMember {
+	method: AcceptedTraitMethod,
+	span: Span
+}
+
+
+-- The namespace rejects two methods with one name in a trait, so the first
+-- match is the only one.
+private pure func named_member(row: TraitRow, accepted: AcceptedTrait, parsed: ParsedContents, word: NameId) -> Result[Option[CanonicalMember], CheckError]:
+	var found: Option[CanonicalMember] = None
+	var failure: Option[CheckError] = None
+	for method in accepted.methods:
+		match canonical_header(row, method.id, parsed):
+			Err(error):
+				failure = Some(error)
+				break
+			Ok(header):
+				if same_name(header.function_name.id, word):
+					found = Some({ method = method, span = header.function_name.span })
+					break
+	match failure:
+		Some(error): Err(error)
+		None: Ok(found)
+
+
 -- Ordinary method signatures have already succeeded. The sole abstract equals
 -- contract precedes validation of an optional reserved inequality default.
 private pure func accept_canonical(row: TraitRow, accepted: AcceptedTrait, parsed: ParsedContents, boolean: DesignatedBoolean[VariantId]) -> Result[CanonicalEquality, CheckError]:
@@ -103,28 +134,20 @@ private pure func accept_canonical(row: TraitRow, accepted: AcceptedTrait, parse
 		[method]:
 			match canonical_header(row, method.id, parsed):
 				Ok(header):
-					if and(same_name(header.function_name.id, foundation_words(parsed.names).equals_word), and(same_types(method.signature.parameters.map(pure func(parameter): parameter.value_type), [self, self]), same_type(method.signature.return_type.value_type, boolean_type))):
+					if and(same_name(header.function_name.id, foundation_words(parsed.names).equals_word), self_predicate(method, self, boolean_type)):
 						Ok(method.id)
 					else:
 						Err(trait_error(row.type_name.span, MalformedCanonicalTrait(row.id)))
 				Err(error): Err(error)
 		_: Err(trait_error(row.type_name.span, MalformedCanonicalTrait(row.id)))
-	var inequality: Option[TraitMethodId] = None
-	var failure: Option[CheckError] = None
-	for method in accepted.methods:
-		match canonical_header(row, method.id, parsed):
-			Err(error): failure = Some(error)
-			Ok(header):
-				if same_name(header.function_name.id, foundation_words(parsed.names).not_equals_word):
-					if and(method.default_body.is_some(), and(same_types(method.signature.parameters.map(pure func(parameter): parameter.value_type), [self, self]), same_type(method.signature.return_type.value_type, boolean_type))):
-						inequality = Some(method.id)
-					else:
-						failure = Some(trait_error(header.function_name.span, MalformedCanonicalInequality(method.id)))
-		if failure.is_some():
-			break
-	match failure:
-		Some(error): Err(error)
-		None: Ok(canonical_equality(equals, inequality))
+	inequality_member ?= named_member(row, accepted, parsed, foundation_words(parsed.names).not_equals_word)
+	match inequality_member:
+		None: Ok(canonical_equality(equals, None))
+		Some(member):
+			if and(member.method.default_body.is_some(), self_predicate(member.method, self, boolean_type)):
+				Ok(canonical_equality(equals, Some(member.method.id)))
+			else:
+				Err(trait_error(member.span, MalformedCanonicalInequality(member.method.id)))
 
 
 private pure func receiver_module(receiver: TypeHead, parsed: ParsedContents) -> Option[ModuleId]:
