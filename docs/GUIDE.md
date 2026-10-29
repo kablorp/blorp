@@ -9,9 +9,16 @@ The pilot supports fixed equality operators: `left == right` calls canonical
 including an implementation override. Operands evaluate once from left to right,
 with ordinary trait bounds and the same receiver type. These canonical calls
 need no method-name import; ordinary UFCS retains its visibility rules.
-Comparisons cannot chain. They bind below ranges/postfix calls and above prefix
-`not`; use parentheses for an intended nested comparison. Newlines after a
-symbol continue only inside brackets. See the [pilot operator rules](../blorp_2/README.md#equality-operators).
+Its ordering operators work the same way through canonical `Orderable`: `<`,
+`>`, `<=` and `>=` call `less_than`, `greater_than`, `less_than_or_equal` and
+`greater_than_or_equal` respectively, so `>=` is never a negated `<` and Float's
+NaN comparisons are all false. Orderable is never derived; an `Orderable` bound
+does not provide `==`.
+Comparisons cannot chain, including mixed forms such as `a < b == c`. They bind
+below ranges/postfix calls and above prefix `not`; use parentheses for an
+intended nested comparison. Newlines after a symbol continue only inside
+brackets. See the pilot [equality](../blorp_2/README.md#equality-operators) and
+[ordering](../blorp_2/README.md#ordering-operators) operator rules.
 
 The separate [Blorp 2 pilot](../blorp_2/README.md) implements a restricted
 subset. Its current examples include immutable bindings and local `var`

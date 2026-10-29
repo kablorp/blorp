@@ -27,6 +27,7 @@ TARGET_COMPONENT_SOURCES := \
 	blorp_2/test/unit/test_lex/test_float.brp \
 	blorp_2/test/unit/test_lex/test_keywords.brp \
 	blorp_2/test/unit/test_lex/test_lex.brp \
+	blorp_2/test/unit/test_lex/test_ordering_operators.brp \
 	blorp_2/test/unit/test_lex/test_pipe_strings.brp \
 	blorp_2/test/unit/test_lex/test_provenance.brp \
 	blorp_2/test/unit/test_lex/test_ranges.brp \
@@ -36,6 +37,7 @@ TARGET_COMPONENT_SOURCES := \
 	blorp_2/test/unit/test_parse/test_file_read.brp \
 	blorp_2/test/unit/test_parse/test_float_builtin_labels.brp \
 	blorp_2/test/unit/test_parse/test_int_comparisons.brp \
+	blorp_2/test/unit/test_parse/test_ordering_operators.brp \
 	blorp_2/test/unit/test_parse/test_provenance.brp \
 	blorp_2/test/unit/test_parse/test_string_concat.brp \
 	blorp_2/test/unit/test_parse/test_string_slice.brp \
@@ -46,6 +48,7 @@ TARGET_COMPONENT_SOURCES := \
 	blorp_2/test/unit/test_check/test_discard_propagation.brp \
 	blorp_2/test/unit/test_check/test_direct_list_updates.brp \
 	blorp_2/test/unit/test_check/test_nominal_types.brp \
+	blorp_2/test/unit/test_check/test_ordering_operators.brp \
 	blorp_2/test/unit/test_own/test_list_updates.brp \
 	blorp_2/test/unit/test_verify/test_list_updates.brp \
 	blorp_2/test/unit/test_emit/test_list_updates.brp \

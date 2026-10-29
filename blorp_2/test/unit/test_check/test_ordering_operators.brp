@@ -1,0 +1,326 @@
+import:
+    ../../../src/check/check: check, checked_functions
+    ../../../src/check/render: render_failure
+    ../../../src/check/model as Model
+    ../../../src/lex/lex: lex
+    ../../../src/parse/parse: parse_module
+    ../../../src/parse/assemble: ParsedAssembly, ParsedProgram, append_module, assembly_names, begin_program, parsed_contents
+    ../../../src/utils/ids: TraitMethodId, inventory_traits, trait_method_header, trait_method_number, trait_method_owner, trait_number, same_trait_method
+    ../../../src/utils/names: name_spelling
+    ../../../src/utils/source:
+        ModuleId, ModuleKind(UserModule, LibraryModule, FoundationTypesModule, FoundationPreludeModule),
+        SourceId, module_id, module_source, root_module_id, same_source,
+    ../../../src/utils/syntax: Diagnostic, diagnostic
+    ../module_input: FOUNDATION_TYPES, sealed
+    bool: and
+    int: Int methods
+    list: List methods
+    option: Option methods
+    result: Result methods
+    string: String methods
+    test: TestSuite
+
+
+-- Each fixture has four modules: the root at 0, an Int library at 1, the base at
+-- 2 declaring the canonical traits, and the prelude at 3 selecting from the base.
+private BASE_POSITION: Int = 2
+private BASE_SELECTIONS: String = "Int, Float, String, Void, List, Bool(True, False), Option(Some, None), Result(Ok, Err)"
+private TRAIT_HEADER: String = "trait Orderable:\n"
+private LESS_THAN: String = "    pure func less_than(left: Self, right: Self) -> Bool\n"
+private GREATER_THAN: String = "    pure func greater_than(left: Self, right: Self) -> Bool:\n        less_than(right, left)\n"
+private AT_MOST: String = "    pure func less_than_or_equal(left: Self, right: Self) -> Bool:\n        less_than(left, right)\n"
+private AT_LEAST: String = "    pure func greater_than_or_equal(left: Self, right: Self) -> Bool:\n        less_than(right, left)\n"
+private EQUATABLE: String =
+    |trait Equatable:
+    |    pure func equals(left: Self, right: Self) -> Bool
+    |
+private INT_ORDER: String =
+    |implements Orderable for Int:
+    |    pure func less_than(left: Self, right: Self) -> Bool:
+    |        builtin("int.less_than")
+    |
+private INT_EQUALITY: String =
+    |implements Equatable for Int:
+    |    pure func equals(left: Self, right: Self) -> Bool:
+    |        builtin("int.equals")
+    |
+private ENTRY: String = "func main() -> Int:\n    0\n"
+private MISSING_BOUND: String = "type does not satisfy the required trait bound"
+private MISSING_BOUND_HELP: String = "add the required trait to this function's type parameter bounds, or provide an implementation for the concrete receiver"
+private MISSING_IMPLEMENTATION_HELP: String = "declare a matching implementation; generic functions must declare their required trait bounds"
+
+
+-- Which canonical traits the base declares and the Int library implements.
+private fixed record Foundation {
+    traits: String,
+    implementations: String,
+    imported: String
+}
+
+
+private pure func ordering_contract() -> String:
+    TRAIT_HEADER.add(LESS_THAN).add(GREATER_THAN).add(AT_MOST).add(AT_LEAST)
+
+
+private pure func ordered() -> Foundation:
+    { traits = ordering_contract(), implementations = INT_ORDER, imported = ", Orderable" }
+
+
+private pure func equatable() -> Foundation:
+    { traits = EQUATABLE, implementations = INT_EQUALITY, imported = ", Equatable" }
+
+
+private pure func both() -> Foundation:
+    { traits = EQUATABLE.add(ordering_contract()), implementations = INT_EQUALITY.add(INT_ORDER), imported = ", Equatable, Orderable" }
+
+
+-- A contract the Int library does not implement, so only admission runs.
+private pure func contract_only(traits: String) -> Foundation:
+    { traits = traits, implementations = "", imported = "" }
+
+
+private pure func append_source(assembly: ParsedAssembly, position: Int, source: String, targets: List[ModuleId], role: ModuleKind) -> Result[ParsedAssembly, Diagnostic]:
+    invalid = diagnostic({ source = module_source(root_module_id()), start = 0, end = 0 }, "invalid ordering fixture module", "use the four fixture module positions")
+    module ?= module_id(position).to_result(invalid)
+    tokens ?= lex(module_source(module), source, assembly_names(assembly))
+    parsed ?= parse_module(tokens, module)
+    append_module(assembly, parsed, targets, role)
+
+
+-- `selections` follow the base selections in the prelude's one import.
+private pure func program(source: String, foundation: Foundation, selections: String) -> Result[ParsedProgram, Diagnostic]:
+    invalid = diagnostic({ source = module_source(root_module_id()), start = 0, end = 0 }, "invalid ordering fixture module", "use the four fixture module positions")
+    base ?= module_id(BASE_POSITION).to_result(invalid)
+    library = "import:\n    _base: Int, Bool".add(foundation.imported).add("\n").add(foundation.implementations)
+    root ?= append_source(begin_program(), 0, source, [], UserModule)
+    integer ?= append_source(root, 1, library, [base], LibraryModule)
+    types ?= append_source(integer, BASE_POSITION, FOUNDATION_TYPES.add(foundation.traits), [], FoundationTypesModule)
+    prelude ?= append_source(types, 3, "import:\n    _base: ".add(BASE_SELECTIONS).add(selections).add("\n"), [base], FoundationPreludeModule)
+    sealed(prelude)
+
+
+-- The single diagnostic, compared exactly.
+private pure func rejects_in(source: String, foundation: Foundation, selections: String, origin: SourceId, start: Int, end: Int, message: String, help: String) -> Bool:
+    match program(source, foundation, selections):
+        Err(_): False
+        Ok(parsed):
+            match check(parsed):
+                Ok(_): False
+                Err(failure):
+                    diagnostics = render_failure(failure)
+                    first = diagnostics.first
+                    same_source(first.span.source, origin).and(first.span.start.equals(start)).and(first.span.end.equals(end))
+                        .and(first.message == message).and(first.help == help)
+                        .and(first.note.is_none()).and(diagnostics.remaining.is_empty())
+
+
+private pure func rejects(source: String, foundation: Foundation, selections: String, start: Int, end: Int, message: String, help: String) -> Bool:
+    rejects_in(source, foundation, selections, module_source(root_module_id()), start, end, message, help)
+
+
+-- A malformed contract in the base, at offsets within `traits`.
+private pure func rejects_in_base(traits: String, selections: String, start: Int, end: Int, message: String, help: String) -> Bool:
+    match module_id(BASE_POSITION):
+        None: False
+        Some(base): rejects_in(ENTRY, contract_only(traits), selections, module_source(base), FOUNDATION_TYPES.length().add(start), FOUNDATION_TYPES.length().add(end), message, help)
+
+
+private pure func accepts(source: String, foundation: Foundation, selections: String) -> Bool:
+    match program(source, foundation, selections):
+        Ok(parsed): check(parsed).is_ok()
+        Err(_): False
+
+
+private pure func member_spelling(parsed: ParsedProgram, method: TraitMethodId) -> String:
+    contents = parsed_contents(parsed)
+    match inventory_traits(contents.declarations).get(trait_number(trait_method_owner(method))):
+        None: ""
+        Some(row):
+            match row.methods.get(trait_method_number(method)):
+                None: ""
+                Some(written):
+                    match trait_method_header(written, contents.declarations):
+                        None: ""
+                        Some(header): name_spelling(contents.names, header.function_name.id).get_or("")
+
+
+private pure func calls_member(call: Model.CheckedCall, expected: TraitMethodId) -> Bool:
+    match call.target:
+        Model.TraitMethod(method): same_trait_method(Model.method_identity(method), expected).and(Model.same_type(Model.method_receiver(method), Model.IntType))
+        _: False
+
+
+-- Admission maps each reserved word to its own field, and each operator selects
+-- its own field: a swap at either step names the wrong member here.
+pure func test_each_operator_calls_its_own_canonical_member() -> Bool:
+    source: String =
+        |pure func compare(left: Int, right: Int) -> List[Bool]:
+        |    [left < right, left > right, left <= right, left >= right]
+        |
+    match program(source.add(ENTRY), ordered(), ", Orderable"):
+        Err(_): False
+        Ok(parsed):
+            match check(parsed):
+                Err(_): False
+                Ok(checked):
+                    functions = checked_functions(checked)
+                    match (functions.traits.canonical.ordering, functions.traits.canonical.equality, functions.functions.get(0)):
+                        (Some(ordering), None, Some(compare)):
+                            less = Model.canonical_less_than(ordering)
+                            greater = Model.canonical_greater_than(ordering)
+                            at_most = Model.canonical_less_than_or_equal(ordering)
+                            at_least = Model.canonical_greater_than_or_equal(ordering)
+                            named = (member_spelling(parsed, less) == "less_than").and(member_spelling(parsed, greater) == "greater_than")
+                                .and(member_spelling(parsed, at_most) == "less_than_or_equal").and(member_spelling(parsed, at_least) == "greater_than_or_equal")
+                            match Model.function_calls(compare):
+                                [first, second, third, fourth]:
+                                    named.and(calls_member(first, less)).and(calls_member(second, greater))
+                                        .and(calls_member(third, at_most)).and(calls_member(fourth, at_least))
+                                _: False
+                        _: False
+
+
+-- Both canonical contracts are admitted together, each from its own trait.
+pure func test_equality_and_ordering_contracts_are_admitted_together() -> Bool:
+    match program("pure func compare(left: Int, right: Int) -> List[Bool]:\n    [left == right, left < right]\n".add(ENTRY), both(), ", Equatable, Orderable"):
+        Err(_): False
+        Ok(parsed):
+            match check(parsed):
+                Err(_): False
+                Ok(checked):
+                    canonical = checked_functions(checked).traits.canonical
+                    match (canonical.equality, canonical.ordering):
+                        (Some(equality), Some(ordering)):
+                            trait_number(Model.canonical_owner(equality)) != trait_number(trait_method_owner(Model.canonical_less_than(ordering)))
+                        _: False
+
+
+-- The prelude's binding selects the trait, not its spelling: a user trait named
+-- Orderable with an Int implementation cannot stand in for it.
+pure func test_operators_need_the_prelude_selected_orderable() -> Bool:
+    user_trait: String =
+        |trait Orderable:
+        |    pure func less_than(left: Self, right: Self) -> Bool
+        |implements Orderable for Int:
+        |    pure func less_than(left: Self, right: Self) -> Bool:
+        |        True
+        |
+    prefix = user_trait.add("pure func compare(left: Int, right: Int) -> Bool:\n    left ")
+    ["<", ">", "<=", ">="].all(pure func(operator):
+        rejects(prefix.add(operator).add(" right\n").add(ENTRY), ordered(), "", prefix.length(), prefix.length().add(operator.length()),
+            "ordering operators require the canonical Orderable trait", "select Orderable in the configured prelude")
+    )
+
+
+-- With the canonical Orderable selected, a same-spelled free function or an
+-- unrelated trait's member in the user module cannot redirect `<`. `ordinal`
+-- is main's position among the module's functions.
+private pure func calls_canonical_less_than(declarations: String, ordinal: Int) -> Bool:
+    source = declarations.add("func main() -> Int:\n    match 1 < 2:\n        True: 23\n        False: 0\n")
+    match program(source, ordered(), ", Orderable"):
+        Err(_): False
+        Ok(parsed):
+            match check(parsed):
+                Err(_): False
+                Ok(checked):
+                    functions = checked_functions(checked)
+                    match (functions.traits.canonical.ordering, functions.functions.get(ordinal)):
+                        (Some(ordering), Some(main)):
+                            match Model.function_calls(main):
+                                [call]: calls_member(call, Model.canonical_less_than(ordering))
+                                _: False
+                        _: False
+
+
+pure func test_unrelated_and_free_names_do_not_redirect_operators() -> Bool:
+    calls_canonical_less_than("trait Other:\n    pure func less_than(left: Self, right: Self) -> Int\n", 0)
+        .and(calls_canonical_less_than("pure func less_than(left: Int, right: Int) -> Int:\n    0\npure func greater_than(left: Int, right: Int) -> Int:\n    0\n", 2))
+
+
+pure func test_abstract_default_member_is_a_malformed_contract() -> Bool:
+    contract = TRAIT_HEADER.add(LESS_THAN).add("    pure func greater_than(left: Self, right: Self) -> Bool\n").add(AT_MOST).add(AT_LEAST)
+    rejects_in_base(contract, ", Orderable", 6, 15, "canonical Orderable requires pure less_than(Self, Self) -> Bool as its sole abstract method",
+        "keep less_than abstract; other pure methods require default bodies")
+
+
+pure func test_wrong_abstract_signature_is_a_malformed_contract() -> Bool:
+    contract = TRAIT_HEADER.add("    pure func less_than(left: Self, right: Self) -> Int\n").add(GREATER_THAN).add(AT_MOST).add(AT_LEAST)
+    rejects_in_base(contract, ", Orderable", 6, 15, "canonical Orderable requires pure less_than(Self, Self) -> Bool as its sole abstract method",
+        "keep less_than abstract; other pure methods require default bodies")
+
+
+-- Every operator calls its own member, so a missing default is reported at the
+-- trait and names the member.
+pure func test_missing_default_member_is_named_at_the_trait() -> Bool:
+    contract = TRAIT_HEADER.add(LESS_THAN).add(GREATER_THAN).add(AT_LEAST)
+    rejects_in_base(contract, ", Orderable", 6, 15, "canonical Orderable.less_than_or_equal requires pure (Self, Self) -> Bool with a default body",
+        "use that signature and provide a default body")
+
+
+pure func test_wrong_default_signature_is_reported_at_the_member() -> Bool:
+    prefix = TRAIT_HEADER.add(LESS_THAN).add(GREATER_THAN).add(AT_MOST).add("    pure func ")
+    contract = prefix.add("greater_than_or_equal(left: Self, right: Int) -> Bool:\n        less_than(left, left)\n")
+    rejects_in_base(contract, ", Orderable", prefix.length(), prefix.length().add(21), "canonical Orderable.greater_than_or_equal requires pure (Self, Self) -> Bool with a default body",
+        "use that signature and provide a default body")
+
+
+-- Ordering is never derived, so a record or union needs a written implementation.
+pure func test_aggregates_without_an_implementation_name_orderable() -> Bool:
+    record_prefix = "fixed record Box { value: Int }\npure func compare(left: Box, right: Box) -> Bool:\n    left "
+    union_prefix = "fixed union Size:\n    Small\n    Large\npure func compare(left: Size, right: Size) -> Bool:\n    left "
+    rejects(record_prefix.add("< right\n").add(ENTRY), ordered(), ", Orderable", record_prefix.length(), record_prefix.length().add(1),
+        "receiver does not implement Orderable", MISSING_IMPLEMENTATION_HELP)
+        .and(rejects(union_prefix.add(">= right\n").add(ENTRY), ordered(), ", Orderable", union_prefix.length(), union_prefix.length().add(2),
+            "receiver does not implement Orderable", MISSING_IMPLEMENTATION_HELP))
+
+
+-- An opaque type has no derived equality: ordering it does not make it Equatable.
+pure func test_orderable_only_type_rejects_equality() -> Bool:
+    declarations = "opaque type Rank = Int\nimplements Orderable for Rank:\n    pure func less_than(left: Self, right: Self) -> Bool:\n        from_opaque Rank(left) < from_opaque Rank(right)\n"
+    prefix = declarations.add("pure func compare(left: Rank, right: Rank) -> Bool:\n    left ")
+    accepts(prefix.add("<= right\n").add(ENTRY), both(), ", Equatable, Orderable")
+        .and(rejects(prefix.add("== right\n").add(ENTRY), both(), ", Equatable, Orderable", prefix.length(), prefix.length().add(2),
+        "receiver does not implement Equatable", MISSING_IMPLEMENTATION_HELP))
+
+
+pure func test_generic_operands_need_an_orderable_bound() -> Bool:
+    prefix = "pure func smaller[Value](left: Value, right: Value) -> Bool:\n    left "
+    rejects(prefix.add("< right\n").add(ENTRY), ordered(), ", Orderable", prefix.length(), prefix.length().add(1), MISSING_BOUND, MISSING_BOUND_HELP)
+
+
+-- Orderable does not imply Equatable: the bound must name the trait `==` uses.
+pure func test_orderable_bound_does_not_grant_equality() -> Bool:
+    prefix = "pure func same[Value: Orderable](left: Value, right: Value) -> Bool:\n    left "
+    accepts("pure func smaller[Value: Orderable](left: Value, right: Value) -> Bool:\n    left >= right\n".add(ENTRY), both(), ", Equatable, Orderable")
+        .and(rejects(prefix.add("== right\n").add(ENTRY), both(), ", Equatable, Orderable", prefix.length(), prefix.length().add(2), MISSING_BOUND, MISSING_BOUND_HELP))
+
+
+-- Equality's canonical texts are rendered from the shared family errors.
+pure func test_equality_canonical_texts_are_unchanged() -> Bool:
+    prefix = "pure func compare(left: Int, right: Int) -> Bool:\n    left "
+    malformed_prefix = "trait Equatable:\n    pure func equals(left: Self, right: Self) -> Bool\n    pure func "
+    malformed = malformed_prefix.add("not_equals(left: Self, right: Self) -> Int:\n        0\n")
+    rejects_in_base(malformed, ", Equatable", malformed_prefix.length(), malformed_prefix.length().add(10),
+        "canonical Equatable.not_equals requires pure (Self, Self) -> Bool with a default body", "use that signature and provide a default body, or rename this helper")
+        .and(rejects(prefix.add("!= right\n").add(ENTRY), equatable(), "", prefix.length(), prefix.length().add(2),
+        "equality operators require the canonical Equatable trait", "select Equatable in the configured prelude"))
+
+
+tests: TestSuite = {
+    description = "ordering operator checking",
+    tests = [
+        ("each operator calls its own canonical member", test_each_operator_calls_its_own_canonical_member),
+        ("equality and ordering contracts are admitted together", test_equality_and_ordering_contracts_are_admitted_together),
+        ("operators need the prelude-selected Orderable", test_operators_need_the_prelude_selected_orderable),
+        ("unrelated and free names do not redirect operators", test_unrelated_and_free_names_do_not_redirect_operators),
+        ("an abstract default member is a malformed contract", test_abstract_default_member_is_a_malformed_contract),
+        ("a wrong abstract signature is a malformed contract", test_wrong_abstract_signature_is_a_malformed_contract),
+        ("a missing default member is named at the trait", test_missing_default_member_is_named_at_the_trait),
+        ("a wrong default signature is reported at the member", test_wrong_default_signature_is_reported_at_the_member),
+        ("records and unions without an implementation name Orderable", test_aggregates_without_an_implementation_name_orderable),
+        ("an Orderable-only type rejects equality", test_orderable_only_type_rejects_equality),
+        ("generic operands need an Orderable bound", test_generic_operands_need_an_orderable_bound),
+        ("an Orderable bound does not grant equality", test_orderable_bound_does_not_grant_equality),
+        ("equality canonical texts are unchanged", test_equality_canonical_texts_are_unchanged),
+    ]
+}

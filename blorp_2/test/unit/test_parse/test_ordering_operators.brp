@@ -1,0 +1,161 @@
+import:
+    ../parse_function_inputs: free_functions
+    ../../../src/lex/lex: lex
+    ../../../src/parse/parse: ParsedModule, module_contents, parse_module
+    ../../../src/utils/names: program_names
+    ../../../src/utils/source: module_source, root_module_id
+    ../../../src/utils/syntax:
+        Diagnostic, Span, ValueExpression,
+        ComparisonOperator(EqualOperator, NotEqualOperator, LessOperator, GreaterOperator, LessEqualOperator, GreaterEqualOperator),
+        LogicalOperator(AndOperator, OrOperator),
+        ExpressionBase(ComparisonExpression, RangeExpression, NotExpression, LogicalExpression),
+        ParsedBody(ParsedValueBody),
+    bool: and
+    int: Int methods
+    list: List methods
+    option: Option methods
+    string: String methods
+    test: TestSuite
+
+
+private HEADER: String = "func main() -> Int:\n"
+private CHAINED: String = "comparisons cannot be chained"
+private CHAINED_HELP: String = "compare each pair separately, or parenthesize an intended nested comparison"
+private MISSING_OPERAND: String = "expected a return expression"
+private MISSING_OPERAND_HELP: String = "use a literal, a parameter or variant name, or a call as the entire body"
+
+
+private pure func parse_source(source: String) -> Result[ParsedModule, Diagnostic]:
+    tokens ?= lex(module_source(root_module_id()), source, program_names().names)
+    parse_module(tokens, root_module_id())
+
+
+-- The body of `main` after HEADER, which is 20 bytes, so a body written as
+-- "\t..." starts its expression at byte 21.
+private pure func value(source: String) -> Option[ValueExpression]:
+    match parse_source(HEADER.add(source)):
+        Err(_): None
+        Ok(parsed):
+            match free_functions(module_contents(parsed).functions).get(0).map(pure func(function): function.body):
+                Some(ParsedValueBody(body)): Some(body)
+                _: None
+
+
+private pure func rejects(source: String, start: Int, end: Int, message: String, help: String) -> Bool:
+    match parse_source(HEADER.add(source)):
+        Ok(_): False
+        Err(error):
+            error.span.start.equals(start).and(error.span.end.equals(end))
+                .and(error.message == message).and(error.help == help).and(error.note.is_none())
+
+
+private pure func spans(span: Span, start: Int, end: Int) -> Bool:
+    span.start.equals(start).and(span.end.equals(end))
+
+
+-- The operator, its token span and both operand spans, for a one-comparison body.
+private pure func compares(source: String, operator: ComparisonOperator, token_end: Int, right_start: Int) -> Bool:
+    match value(source):
+        Some(body):
+            match body.base:
+                ComparisonExpression(actual, token, left, right):
+                    (actual == operator).and(spans(token, 22, token_end)).and(spans(left.span, 21, 22))
+                        .and(spans(right.span, right_start, right_start.add(1))).and(spans(body.span, 21, right_start.add(1)))
+                        .and(body.applications.is_empty())
+                _: False
+        None: False
+
+
+pure func test_each_ordering_operator_keeps_its_token_and_operands() -> Bool:
+    compares("\ta<b\n", LessOperator, 23, 23)
+        .and(compares("\ta>b\n", GreaterOperator, 23, 23))
+        .and(compares("\ta<=b\n", LessEqualOperator, 24, 24))
+        .and(compares("\ta>=b\n", GreaterEqualOperator, 24, 24))
+
+
+pure func test_range_and_postfix_bind_above_ordering() -> Bool:
+    match value("\ta.f()..b < c..d.g()\n"):
+        Some(body):
+            match body.base:
+                ComparisonExpression(LessOperator, _, left, right):
+                    match (left.base, right.base):
+                        (RangeExpression(low, _), RangeExpression(_, high)):
+                            low.applications.length().equals(1).and(high.applications.length().equals(1)).and(body.applications.is_empty())
+                        _: False
+                _: False
+        None: False
+
+
+-- `not a < b` negates the comparison; `and` and `or` sit below both.
+pure func test_ordering_binds_above_not_and_boolean_operators() -> Bool:
+    match value("\tnot a < b and c >= d or e\n"):
+        Some(body):
+            match body.base:
+                LogicalExpression(OrOperator, conjunction, _):
+                    match conjunction.base:
+                        LogicalExpression(AndOperator, left, right):
+                            match (left.base, right.base):
+                                (NotExpression(inner), ComparisonExpression(GreaterEqualOperator, _, _, _)):
+                                    match inner.base:
+                                        ComparisonExpression(LessOperator, _, _, _): True
+                                        _: False
+                                _: False
+                        _: False
+                _: False
+        None: False
+
+
+-- A parenthesized first operand enters through the statement-line path.
+pure func test_both_entry_paths_parse_ordering() -> Bool:
+    match (value("\t(a) > b\n"), value("\t(a <= b) == c\n")):
+        (Some(first), Some(second)):
+            match (first.base, second.base):
+                (ComparisonExpression(GreaterOperator, token, _, _), ComparisonExpression(EqualOperator, _, nested, _)):
+                    match nested.base:
+                        ComparisonExpression(LessEqualOperator, _, _, _): spans(token, 25, 26).and(spans(first.span, 21, 28))
+                        _: False
+                _: False
+        _: False
+
+
+-- All six comparisons share one level, so any two in a row are a chain.
+pure func test_chains_reject_at_the_second_operator_on_both_paths() -> Bool:
+    rejects("\ta < b < c\n", 27, 28, CHAINED, CHAINED_HELP)
+        .and(rejects("\ta < b == c\n", 27, 29, CHAINED, CHAINED_HELP))
+        .and(rejects("\ta == b < c\n", 28, 29, CHAINED, CHAINED_HELP))
+        .and(rejects("\ta >= b != c\n", 28, 30, CHAINED, CHAINED_HELP))
+        .and(rejects("\t(a) < b < c\n", 29, 30, CHAINED, CHAINED_HELP))
+        .and(rejects("\t(a) < b == c\n", 29, 31, CHAINED, CHAINED_HELP))
+        .and(rejects("\t(a) == b > c\n", 30, 31, CHAINED, CHAINED_HELP))
+
+
+pure func test_prefix_not_requires_grouping_as_right_operand() -> Bool:
+    rejects("\ta < not b\n", 25, 28, "'not' cannot be a comparison operand", "write (not value) in parentheses; not binds below comparison")
+
+
+-- Outside brackets a newline ends the operand; inside them layout is suppressed.
+pure func test_newline_after_operator_does_not_continue() -> Bool:
+    value("\t(a <\n\t\tb)\n").is_some()
+        .and(rejects("\ta <\n\t\tb\n", 24, 25, MISSING_OPERAND, MISSING_OPERAND_HELP))
+        .and(rejects("\ta >=\n\t\tb\n", 25, 26, MISSING_OPERAND, MISSING_OPERAND_HELP))
+
+
+-- Doubled angles are two comparison tokens; the second has no left operand.
+pure func test_doubled_angles_reject_the_second_token() -> Bool:
+    rejects("\ta << b\n", 24, 25, MISSING_OPERAND, MISSING_OPERAND_HELP)
+        .and(rejects("\ta >> b\n", 24, 25, MISSING_OPERAND, MISSING_OPERAND_HELP))
+
+
+tests: TestSuite = {
+    description = "ordering operator parsing",
+    tests = [
+        ("each ordering operator keeps its token and operands", test_each_ordering_operator_keeps_its_token_and_operands),
+        ("range and postfix precede ordering", test_range_and_postfix_bind_above_ordering),
+        ("ordering precedes not and Boolean operators", test_ordering_binds_above_not_and_boolean_operators),
+        ("both entry paths parse ordering", test_both_entry_paths_parse_ordering),
+        ("chains reject the second operator on both paths", test_chains_reject_at_the_second_operator_on_both_paths),
+        ("prefix not needs right operand grouping", test_prefix_not_requires_grouping_as_right_operand),
+        ("newline after an operator does not continue", test_newline_after_operator_does_not_continue),
+        ("doubled angles reject the second token", test_doubled_angles_reject_the_second_token),
+    ]
+}

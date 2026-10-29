@@ -35,10 +35,15 @@ trait binding. Fixed `==` and `!=` expressions select that trait's `equals` and
 `not_equals` methods directly, without an ordinary method-name import. The
 adjacent symbols bind below ranges and above prefix `not`, and cannot chain;
 parenthesize nested comparisons. Their operands evaluate once, left then right.
-A newline after a symbol continues only inside brackets. The comparison layer is
-`range_expr [ spaces ("==" | "!=") spaces range_expr ]`; ordinary UFCS visibility
-and trait implementation rules remain unchanged. Other infix operators remain
-outside the pilot checker.
+A newline after a symbol continues only inside brackets. The prelude's canonical
+Orderable is selected the same way, and `<`, `>`, `<=` and `>=` call its
+`less_than`, `greater_than`, `less_than_or_equal` and `greater_than_or_equal`
+methods under the same rules; all six comparisons share one level and do not
+chain with one another. `=>`, `=<` and `<>` are rejected. The comparison layer is
+`range_expr [ spaces comparison_op spaces range_expr ]`, with `comparison_op`
+one of `==`, `!=`, `<`, `>`, `<=` and `>=`; ordinary UFCS visibility and trait
+implementation rules remain unchanged. Other infix operators remain outside the
+pilot checker.
 A default-only `implements Trait for Type` header ends at the newline, without a
 colon. Contextual unbound method references use ordinary expressions and need an
 expected callable type determining `Self`. See the [pilot trait rules](../blorp_2/README.md#concrete-traits)

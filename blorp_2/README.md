@@ -238,7 +238,8 @@ then `and`/`or`. Those Boolean operator forms remain unsupported by checking;
 use the eager Boolean helper calls. Comparisons cannot chain: `a == b == c` is
 an error, while `(a == b) == c` is explicit nesting subject to ordinary typing.
 Both symbol bytes must be adjacent; spaces around the whole symbol are optional.
-A newline after a comparison symbol continues only inside brackets.
+A newline after a comparison symbol continues only inside brackets. The
+[ordering operators](#ordering-operators) share this level and these rules.
 
 A custom canonical declaration may provide only abstract `equals`; `==` works
 there, while `!=` reports the absent `not_equals`. If present, canonical
@@ -248,6 +249,49 @@ that bypasses the override.
 
 Compiler and library implementation sources write equality with `==` and
 `!=`; the pinned bootstrap supports both.
+
+## Ordering operators
+
+Each ordering symbol calls its own member of the configured prelude's canonical
+`Orderable` trait, including an authored implementation override:
+
+| Syntax | Selected canonical member |
+| --- | --- |
+| `a < b` | `Orderable.less_than` |
+| `a > b` | `Orderable.greater_than` |
+| `a <= b` | `Orderable.less_than_or_equal` |
+| `a >= b` | `Orderable.greater_than_or_equal` |
+
+```blorp
+pure func smaller[Value: Orderable](left: Value, right: Value) -> Value:
+    if left <= right:
+        left
+    else:
+        right
+```
+
+The rules are those of the [equality operators](#equality-operators): the
+prelude's binding, not a spelling, selects the trait; both operands share
+`Self`, go through ordinary inference, purity and bounds, and evaluate once,
+left then right. `>=` is never rewritten as a negated `<`, so Float's
+NaN-correct members apply: every ordering comparison with NaN is false. The six
+comparisons share one precedence level and do not chain with one another, so
+`a < b < c`, `a < b == c` and `a == b < c` are errors; `not a < b` is
+`not (a < b)`. An `Orderable` bound does not provide `==`, which needs
+`Equatable`.
+
+Orderable is never derived. A record, union or opaque type is ordered only by a
+written implementation; without one, an operator reports
+`receiver does not implement Orderable`. The canonical declaration must keep
+`less_than` as its sole abstract method and give `greater_than`,
+`less_than_or_equal` and `greater_than_or_equal` pure `(Self, Self) -> Bool`
+default bodies; a missing or malformed member is rejected where the trait is
+admitted, even when no operator uses it.
+
+`->` is lexed before `>`, and `a<-1` compares with the literal `-1`. `=>`, `=<`
+and `<>` are rejected with help naming `>=` or a lambda, `<=`, and `!=`. The
+pinned seed predates these operators, so compiler and library source still
+write ordering as calls such as `less_than` until the seed is rotated.
 
 ## Automatic equality for named aggregates
 
@@ -1444,7 +1488,8 @@ indented chain every line starts with `.`, and an `if`, `while`, `for` or
 `match` header may not hold an indented chain.
 `low..high` is a range of two such operands; `not a`, `a and b` and `a or b`
 combine them with the precedence `or` below `and` below `not` below
-`==`/`!=` below `..`; `and`/`or` associate left and comparisons do not chain. A line break after `and` or `or` is
+the comparisons `==`, `!=`, `<`, `>`, `<=` and `>=` below `..`; `and`/`or`
+associate left and comparisons do not chain. A line break after `and` or `or` is
 accepted only inside brackets; the host also accepts it bare, which is a
 follow-up. `if condition:` opens an indented block, optionally followed by
 `else:` with a block or `else if condition:`, which nests the next
@@ -2448,8 +2493,8 @@ and `to_string`, plus `equals(Int, Int) -> Bool`. Equality uses the complete
 signed 64-bit values and ordinary explicitly bound Bool constructors.
 Int implements `Orderable`: `less_than` uses signed64 ordering, and
 `greater_than`, `less_than_or_equal` and `greater_than_or_equal` are the trait's
-defaults. `not_equals`, `min` and `max` are ordinary pure functions over that
-primitive or equality. Equal operands satisfy both inclusive relations.
+defaults; `<`, `>`, `<=` and `>=` call them. `not_equals`, `min` and `max`
+are ordinary pure functions over that primitive or equality. Equal operands satisfy both inclusive relations.
 `INT_MIN` and `INT_MAX` are ordinary imported scalar constants with values
 `-9223372036854775808` and `9223372036854775807`; comparisons never subtract.
 The first three arithmetic operations wrap at Int64 bounds. Division and remainder
@@ -3054,8 +3099,9 @@ Compiler source under `src/` stays within the agreed eventual subset: `String`, 
 purity, matching, loops, `var`, `?=`, imports, UFCS, anonymous functions
 (`func(...)` values and closures), and quoted and multiline String literals.
 Supporting every one of these in input programs is future work, not a claim
-about this increment. Equality is written with concrete functions such as
-`IntOps.equals` and pattern matching, never `==` or `!=`.
+about this increment. Equality is written with `==` and `!=`; ordering is
+written with calls such as `less_than`, never `<`, `>`, `<=` or `>=`, until the
+pinned seed supports them.
 
 The compiler accepts tuple input as described above, but its own source keeps
 avoiding tuple syntax until the pinned seed is rotated. Concurrency, parallelism,
@@ -3171,7 +3217,8 @@ or measurements produced by a phase are returned as data for the shell to presen
 
 Compiler source writes equality with the fixed `==` and `!=` operators, which
 call the canonical Equatable methods. Other operations use concrete arithmetic,
-ordering and concatenation functions. Checking does not yet accept the
+ordering and concatenation functions; the pinned seed predates `<`, `>`, `<=`
+and `>=`. Checking does not yet accept the
 `and`/`or`/`not` keywords, so Boolean logic calls the `bool` library module.
 Concrete input traits do not expand that compiler-source subset. The production
 library supplies ordinary Equatable implementations; input programs may call

@@ -5,8 +5,8 @@ the resolved requirement-to-body mapping consumed by checking and specialization
 ---
 import:
 	./declarations: TypeScope, type_access, previous_declaration, resolve_type, Substitution, substitute_type
-	./errors: CheckError, checker_invariant, CheckerInvariant(InvalidFunctionContract), TraitError(EqualityMemberUnsupported, DuplicateRequirementParameter, ImpureRequirement, GenericRequirement, FirstParameterMustBeSelf, CallableFormalDeferred, OrphanImplementation, DuplicateImplementation, MissingImplementationMethod, MissingTraitBound, UnknownImplementationMethod, DuplicateImplementationMethod, ImplementationSignatureMismatch, MalformedCanonicalTrait, MalformedCanonicalInequality), trait_error
-	./model: AggregateId(RecordAggregate, UnionAggregate), EqualityMember(EqualityField, EqualityPayload), CheckedRecord, CheckedUnion, AcceptedTraits, AcceptedTraitContracts, CanonicalEquality, canonical_equality, canonical_owner, AcceptedTrait, AcceptedTraitMethod, AcceptedImplementation, ImplementedMethod, ImplementedBody(AuthoredMethod, TraitDefault, StructuralEquality), TypeParameterId, LocatedTrait, TraitRequirement, aggregate_head, aggregate_owner, same_owner, receiver_arguments, receiver_type, type_head, parameter_owner, same_parameter, ImplementationHeader, FunctionSignature, TypeUse, TypeRef(ParameterType, VoidType, NominalType), TypeParameterOwner(TraitDeclaration), type_parameter_id, same_type, same_types
+	./errors: CheckError, checker_invariant, CheckerInvariant(InvalidFunctionContract), TraitError(EqualityMemberUnsupported, DuplicateRequirementParameter, ImpureRequirement, GenericRequirement, FirstParameterMustBeSelf, CallableFormalDeferred, OrphanImplementation, DuplicateImplementation, MissingImplementationMethod, MissingTraitBound, UnknownImplementationMethod, DuplicateImplementationMethod, ImplementationSignatureMismatch, MalformedCanonicalTrait, MalformedCanonicalMember), CanonicalFamily(EqualityFamily, OrderingFamily), trait_error
+	./model: AggregateId(RecordAggregate, UnionAggregate), EqualityMember(EqualityField, EqualityPayload), CheckedRecord, CheckedUnion, AcceptedTraits, AcceptedTraitContracts, CanonicalEquality, canonical_equality, canonical_owner, CanonicalOrdering, canonical_ordering, AcceptedTrait, AcceptedTraitMethod, AcceptedImplementation, ImplementedMethod, ImplementedBody(AuthoredMethod, TraitDefault, StructuralEquality), TypeParameterId, LocatedTrait, TraitRequirement, aggregate_head, aggregate_owner, same_owner, receiver_arguments, receiver_type, type_head, parameter_owner, same_parameter, ImplementationHeader, FunctionSignature, TypeUse, TypeRef(ParameterType, VoidType, NominalType), TypeParameterOwner(TraitDeclaration), type_parameter_id, same_type, same_types
 	./equality: equality_template
 	./signatures: AcceptedFunction
 	../namespace/builtins: DesignatedBoolean
@@ -124,30 +124,60 @@ private pure func named_member(row: TraitRow, accepted: AcceptedTrait, parsed: P
 		None: Ok(found)
 
 
--- Ordinary method signatures have already succeeded. The sole abstract equals
--- contract precedes validation of an optional reserved inequality default.
-private pure func accept_canonical(row: TraitRow, accepted: AcceptedTrait, parsed: ParsedContents, boolean: DesignatedBoolean[VariantId]) -> Result[CanonicalEquality, CheckError]:
-	self: TypeRef = ParameterType(type_parameter_id(TraitDeclaration(row.id), 0))
-	boolean_type: TypeRef = NominalType(UnionAggregate(variant_owner(boolean.true_variant)), [])
-	abstract_methods = accepted.methods.filter(pure func(method): method.default_body.is_none())
-	equals: TraitMethodId ?= match abstract_methods:
+-- Ordinary method signatures have already succeeded. A canonical trait's sole
+-- abstract method is its one required member.
+private pure func sole_abstract(row: TraitRow, accepted: AcceptedTrait, parsed: ParsedContents, family: CanonicalFamily, word: NameId, self: TypeRef, boolean_type: TypeRef) -> Result[TraitMethodId, CheckError]:
+	match accepted.methods.filter(pure func(method): method.default_body.is_none()):
 		[method]:
 			match canonical_header(row, method.id, parsed):
 				Ok(header):
-					if and(same_name(header.function_name.id, foundation_words(parsed.names).equals_word), self_predicate(method, self, boolean_type)):
+					if and(same_name(header.function_name.id, word), self_predicate(method, self, boolean_type)):
 						Ok(method.id)
 					else:
-						Err(trait_error(row.type_name.span, MalformedCanonicalTrait(row.id)))
+						Err(trait_error(row.type_name.span, MalformedCanonicalTrait(family, row.id)))
 				Err(error): Err(error)
-		_: Err(trait_error(row.type_name.span, MalformedCanonicalTrait(row.id)))
-	inequality_member ?= named_member(row, accepted, parsed, foundation_words(parsed.names).not_equals_word)
-	match inequality_member:
-		None: Ok(canonical_equality(equals, None))
+		_: Err(trait_error(row.type_name.span, MalformedCanonicalTrait(family, row.id)))
+
+
+-- A reserved member other than the abstract one is either absent or a default.
+private pure func default_member(row: TraitRow, accepted: AcceptedTrait, parsed: ParsedContents, family: CanonicalFamily, word: NameId, self: TypeRef, boolean_type: TypeRef) -> Result[Option[TraitMethodId], CheckError]:
+	found ?= named_member(row, accepted, parsed, word)
+	match found:
+		None: Ok(None)
 		Some(member):
 			if and(member.method.default_body.is_some(), self_predicate(member.method, self, boolean_type)):
-				Ok(canonical_equality(equals, Some(member.method.id)))
+				Ok(Some(member.method.id))
 			else:
-				Err(trait_error(member.span, MalformedCanonicalInequality(member.method.id)))
+				Err(trait_error(member.span, MalformedCanonicalMember(family, word)))
+
+
+-- The sole abstract equals contract precedes validation of an optional
+-- reserved inequality default.
+private pure func accept_equality(row: TraitRow, accepted: AcceptedTrait, parsed: ParsedContents, boolean: DesignatedBoolean[VariantId]) -> Result[CanonicalEquality, CheckError]:
+	self: TypeRef = ParameterType(type_parameter_id(TraitDeclaration(row.id), 0))
+	boolean_type: TypeRef = NominalType(UnionAggregate(variant_owner(boolean.true_variant)), [])
+	words = foundation_words(parsed.names)
+	equals ?= sole_abstract(row, accepted, parsed, EqualityFamily, words.equals_word, self, boolean_type)
+	not_equals ?= default_member(row, accepted, parsed, EqualityFamily, words.not_equals_word, self, boolean_type)
+	Ok(canonical_equality(equals, not_equals))
+
+
+-- Every ordering operator calls its own member, so all three defaults are
+-- required; a missing one is reported at the trait's name.
+private pure func required_default(row: TraitRow, accepted: AcceptedTrait, parsed: ParsedContents, word: NameId, self: TypeRef, boolean_type: TypeRef) -> Result[TraitMethodId, CheckError]:
+	found ?= default_member(row, accepted, parsed, OrderingFamily, word, self, boolean_type)
+	found.to_result(trait_error(row.type_name.span, MalformedCanonicalMember(OrderingFamily, word)))
+
+
+private pure func accept_ordering(row: TraitRow, accepted: AcceptedTrait, parsed: ParsedContents, boolean: DesignatedBoolean[VariantId]) -> Result[CanonicalOrdering, CheckError]:
+	self: TypeRef = ParameterType(type_parameter_id(TraitDeclaration(row.id), 0))
+	boolean_type: TypeRef = NominalType(UnionAggregate(variant_owner(boolean.true_variant)), [])
+	words = foundation_words(parsed.names)
+	less_than ?= sole_abstract(row, accepted, parsed, OrderingFamily, words.less_than_word, self, boolean_type)
+	greater_than ?= required_default(row, accepted, parsed, words.greater_than_word, self, boolean_type)
+	less_than_or_equal ?= required_default(row, accepted, parsed, words.less_than_or_equal_word, self, boolean_type)
+	greater_than_or_equal ?= required_default(row, accepted, parsed, words.greater_than_or_equal_word, self, boolean_type)
+	Ok(canonical_ordering(less_than, greater_than, less_than_or_equal, greater_than_or_equal))
 
 
 private pure func receiver_module(receiver: TypeHead, parsed: ParsedContents) -> Option[ModuleId]:
@@ -293,40 +323,49 @@ private pure func member_contract(
 		Err(trait_error(function.declaration.function_name.span, ImplementationSignatureMismatch(required.id, expected, function.signature)))
 
 
--- The configured prelude selects this semantic identity through its ordinary
--- binding. Later shape checking and dispatch compare the accepted TraitId.
-pure func designated_trait(parsed: ParsedContents, namespace: Namespace) -> Option[TraitId]:
-	named_trait(namespace, parsed.foundation.prelude, foundation_words(parsed.names).equatable_word)
+-- The configured prelude selects each canonical trait, named by a foundation
+-- word, through its ordinary binding. Later shape checking and dispatch compare
+-- the accepted TraitId.
+pure func designated_trait(parsed: ParsedContents, namespace: Namespace, word: NameId) -> Option[TraitId]:
+	named_trait(namespace, parsed.foundation.prelude, word)
 
 
+private pure func designates(designated: Option[TraitId], row: TraitRow) -> Bool:
+	match designated:
+		Some(owner): trait_number(owner) == trait_number(row.id)
+		None: False
+
+
+-- Each designated trait is admitted by its own contract.
 pure func accept_trait_contracts(
 	parsed: ParsedContents,
 	namespace: Namespace,
 	boolean: DesignatedBoolean[VariantId],
-	canonical: Option[TraitId],
+	equality: Option[TraitId],
+	ordering: Option[TraitId],
 ) -> Result[AcceptedTraitContracts, CheckError]:
-	var accepted_canonical: Option[CanonicalEquality] = None
+	var accepted_equality: Option[CanonicalEquality] = None
+	var accepted_ordering: Option[CanonicalOrdering] = None
 	var declarations: List[AcceptedTrait] = []
 	var failure: Option[CheckError] = None
 	for row in inventory_traits(parsed.declarations):
 		match accept_trait(row, parsed, namespace):
 			Ok(accepted):
 				declarations = declarations.append(accepted)
-				designated: Bool = match canonical:
-					Some(owner): trait_number(owner) == trait_number(row.id)
-					None: False
-				if designated:
-					match accept_canonical(row, accepted, parsed, boolean):
-						Ok(contract): accepted_canonical = Some(contract)
-						Err(error):
-							failure = Some(error)
-							break
-			Err(error):
-				failure = Some(error)
-				break
+				if designates(equality, row):
+					match accept_equality(row, accepted, parsed, boolean):
+						Ok(contract): accepted_equality = Some(contract)
+						Err(error): failure = Some(error)
+				if and(failure.is_none(), designates(ordering, row)):
+					match accept_ordering(row, accepted, parsed, boolean):
+						Ok(contract): accepted_ordering = Some(contract)
+						Err(error): failure = Some(error)
+			Err(error): failure = Some(error)
+		if failure.is_some():
+			break
 	match failure:
 		Some(error): Err(error)
-		None: Ok({ declarations = declarations, canonical = accepted_canonical })
+		None: Ok({ declarations = declarations, canonical = { equality = accepted_equality, ordering = accepted_ordering } })
 
 
 -- Method contracts are already accepted. Authored implementation signatures
@@ -338,7 +377,7 @@ pure func validate_implementations(
 	functions: List[AcceptedFunction],
 	contracts: AcceptedTraitContracts,
 ) -> Result[AcceptedTraits, CheckError]:
-	canonical: Option[TraitId] = match contracts.canonical:
+	canonical: Option[TraitId] = match contracts.canonical.equality:
 		Some(contract): Some(canonical_owner(contract))
 		None: None
 	var implementations: List[AcceptedImplementation] = []
@@ -564,7 +603,7 @@ private pure func summarize_family(
 						position = position.add(1)
 				None:
 					var provisional: Option[EqualityCandidate] = None
-					canonical: Bool = match traits.canonical:
+					canonical: Bool = match traits.canonical.equality:
 						Some(canonical): trait_number(canonical_owner(canonical)) == trait_number(required)
 						None: False
 					if canonical:
@@ -633,7 +672,7 @@ private pure func summarize_members(
 
 
 pure func prepare_equality_availability(parsed: ParsedContents, traits: AcceptedTraits, records: List[CheckedRecord], unions: List[CheckedUnion], boolean: DesignatedBoolean[VariantId]) -> Result[TraitAvailability, CheckError]:
-	match traits.canonical:
+	match traits.canonical.equality:
 		None: Ok(authored_traits(traits))
 		Some(canonical): complete_equality_availability(parsed, traits, records, unions, boolean, canonical_owner(canonical))
 
@@ -752,7 +791,7 @@ private pure func compiler_span() -> Span:
 -- aggregate-owned parameters under the actual receiver before following it.
 pure func equality_error(availability: TraitAvailability, required: TraitId, receiver: TypeRef, span: Span) -> Option[CheckError]:
 	contents = from_opaque TraitAvailability(availability)
-	canonical: Bool = match contents.accepted.canonical:
+	canonical: Bool = match contents.accepted.canonical.equality:
 		Some(owner): trait_number(canonical_owner(owner)) == trait_number(required)
 		None: False
 	var terminal: Option[EqualityUnavailable] = None

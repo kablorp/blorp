@@ -134,11 +134,11 @@ import:
 		ParsedRecordField,
 		PostfixOperation(TupleIndex, ReceiverInvocation, FieldAccess),
 		ReceiverApplication,
-		EqualityOperator(EqualOperator, NotEqualOperator),
+		ComparisonOperator(EqualOperator, NotEqualOperator, LessOperator, GreaterOperator, LessEqualOperator, GreaterEqualOperator),
 		ExpressionBase(
 			VoidExpression, IntegerExpression, FloatExpression, StringExpression, InterpolatedString, NameExpression, DirectApplication,
 			QualifiedName, QualifiedApplication, OpaqueWrap, OpaqueUnwrap, TupleExpression, ListExpression, RangeExpression, RecordExpression,
-			RecordUpdateExpression, EqualityExpression, LogicalExpression, NotExpression, IfExpression, MatchExpression, LambdaExpression,
+			RecordUpdateExpression, ComparisonExpression, LogicalExpression, NotExpression, IfExpression, MatchExpression, LambdaExpression,
 		),
 		Purity(Pure, Impure), same_purity, permits_purity,
 		same_span
@@ -631,18 +631,35 @@ private pure func plan_closed_qualified(
 		Err(reason): Err(qualified_error(qualified.name.span, QualifiedNotOffered(qualified.module.id, qualified.name.id, aliased.path, reason)))
 
 
-private pure func equality_contract(operator: EqualityOperator, span: Span, traits: Checked.AcceptedTraits) -> Result[FunctionContract, CheckError]:
-	canonical ?= traits.canonical.to_result(Errors.trait_error(span, Errors.EqualityRequiresCanonical))
+-- An operator needs the prelude-selected trait of its family.
+private pure func selected_contract[Contract](contract: Option[Contract], family: Errors.CanonicalFamily, span: Span) -> Result[Contract, CheckError]:
+	match contract:
+		Some(accepted): Ok(accepted)
+		None: Err(Errors.trait_error(span, Errors.OperatorRequiresCanonical(family)))
+
+
+-- Each operator invokes its own canonical member, so `!=`, `>` and `>=` never
+-- become a negation or a swap at the call site.
+private pure func comparison_contract(operator: ComparisonOperator, span: Span, traits: Checked.AcceptedTraits) -> Result[FunctionContract, CheckError]:
+	equality = traits.canonical.equality
+	ordering = traits.canonical.ordering
 	method: TraitMethodId ?= match operator:
-		EqualOperator: Ok(Checked.canonical_equals(canonical))
-		NotEqualOperator: Checked.canonical_not_equals(canonical).to_result(Errors.trait_error(span, Errors.MissingCanonicalInequality))
+		EqualOperator: selected_contract(equality, Errors.EqualityFamily, span).map(Checked.canonical_equals)
+		NotEqualOperator:
+			match selected_contract(equality, Errors.EqualityFamily, span):
+				Ok(contract): Checked.canonical_not_equals(contract).to_result(Errors.trait_error(span, Errors.MissingCanonicalInequality))
+				Err(error): Err(error)
+		LessOperator: selected_contract(ordering, Errors.OrderingFamily, span).map(Checked.canonical_less_than)
+		GreaterOperator: selected_contract(ordering, Errors.OrderingFamily, span).map(Checked.canonical_greater_than)
+		LessEqualOperator: selected_contract(ordering, Errors.OrderingFamily, span).map(Checked.canonical_less_than_or_equal)
+		GreaterEqualOperator: selected_contract(ordering, Errors.OrderingFamily, span).map(Checked.canonical_greater_than_or_equal)
 	method_id_contract(span, method, traits)
 
 
 private pure func plan_body_base(scope: List[ScopedValue], body: ValueExpression, expectation: Option[InferenceType], context: ResolutionContext, construction: ConstructionContext, slots: List[InferenceSlot]) -> Result[PlannedBase, CheckError]:
 	match body.base:
-		EqualityExpression(operator, span, left, right):
-			equality_contract(operator, span, accepted_traits(context.traits)).map(pure func(contract): PlannedCall(contract, [left, right], ReturnPlacement(body.base_span, body.span), expectation))
+		ComparisonExpression(operator, span, left, right):
+			comparison_contract(operator, span, accepted_traits(context.traits)).map(pure func(contract): PlannedCall(contract, [left, right], ReturnPlacement(body.base_span, body.span), expectation))
 		RecordUpdateExpression(base, fields): Ok(PlannedUpdate(base, fields, expectation))
 		DirectApplication(name, arguments):
 			match classify_direct_call(name, arguments, scope, context):
