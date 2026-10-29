@@ -31,9 +31,9 @@ import:
 		CheckedVariant,
 		TypeParameterId,
 		TypeParameterOwner(UnionDeclaration, RecordDeclaration),
-		TypeRef(TupleType, CallableType,
-			AppliedUnionType, AppliedRecordType, VoidType, FloatType, IntType, ListType, OpaqueType, ParameterType, RecordType, StringType, UnionType,
-		),
+		TypeRef(TupleType, CallableType, NominalType, VoidType, FloatType, IntType, ListType, OpaqueType, ParameterType, StringType),
+		AggregateId(RecordAggregate, UnionAggregate),
+		same_aggregate,
 		TypeUse,
 		UnionOccurrence,
 		field_id,
@@ -218,7 +218,7 @@ private pure func resolve_atomic_head(
 			match record_arity(scope, id, name.span):
 				Ok(arity):
 					if arity == 0:
-						Ok(RecordType(id))
+						Ok(NominalType(RecordAggregate(id), []))
 					else:
 						Err(type_term_error(name.span, MissingRecordTypeArguments(id, arity)))
 				Err(error): Err(error)
@@ -227,7 +227,7 @@ private pure func resolve_atomic_head(
 				Ok(arity):
 
 					if arity == 0:
-						Ok(UnionType(id))
+						Ok(NominalType(UnionAggregate(id), []))
 					else:
 						Err(type_term_error(name.span, MissingUnionTypeArguments(id, arity)))
 				Err(error): Err(error)
@@ -297,7 +297,7 @@ private pure func resolve_applied_head(
 						Err(type_term_error(span, OrdinaryRecordApplied(owner)))
 					else if arity == arguments.length():
 						match resolve_types(scope, arguments, []):
-							Ok(values): Ok(AppliedRecordType(owner, values))
+							Ok(values): Ok(NominalType(RecordAggregate(owner), values))
 							Err(error): Err(error)
 					else:
 						Err(type_term_error(span, RecordTypeArgumentCountMismatch(owner, arity, arguments.length())))
@@ -310,7 +310,7 @@ private pure func resolve_applied_head(
 						Err(type_term_error(span, OrdinaryUnionApplied(owner)))
 					else if arity == arguments.length():
 						match resolve_types(scope, arguments, []):
-							Ok(values): Ok(AppliedUnionType(owner, values))
+							Ok(values): Ok(NominalType(UnionAggregate(owner), values))
 							Err(error): Err(error)
 					else:
 						Err(
@@ -669,13 +669,9 @@ pure func substitute_type(
 						Err(error): Err(error)
 		ListType(element):
 			substitute_type(element, substitution, span).map(pure func(value): ListType(value))
-		AppliedRecordType(owner, values):
+		NominalType(owner, values):
 			match substitute_types(values, substitution, span, []):
-				Ok(arguments): Ok(AppliedRecordType(owner, arguments))
-				Err(error): Err(error)
-		AppliedUnionType(owner, values):
-			match substitute_types(values, substitution, span, []):
-				Ok(arguments): Ok(AppliedUnionType(owner, arguments))
+				Ok(arguments): Ok(NominalType(owner, arguments))
 				Err(error): Err(error)
 		ParameterType(id):
 			replacement = if same_owner(parameter_owner(id), substitution.owner):
@@ -813,28 +809,10 @@ private pure func contains_parameter(value_type: TypeRef) -> Bool:
 			True
 		ListType(element):
 			contains_parameter(element)
-		AppliedRecordType(_, arguments):
-			arguments.any(contains_parameter)
-		AppliedUnionType(_, arguments):
+		NominalType(_, arguments):
 			arguments.any(contains_parameter)
 		_:
 			False
-
-
--- The declaration a written type names, whether applied or bare.
-private fixed union NamedDeclaration:
-	NamedRecord(RecordId)
-	NamedUnion(UnionId)
-	NoNamedDeclaration
-
-
-private pure func named_declaration(value_type: TypeRef) -> NamedDeclaration:
-	match value_type:
-		RecordType(id): NamedRecord(id)
-		AppliedRecordType(id, _): NamedRecord(id)
-		UnionType(id): NamedUnion(id)
-		AppliedUnionType(id, _): NamedUnion(id)
-		_: NoNamedDeclaration
 
 
 private pure func unset_flags(count: Int) -> List[Bool]:
@@ -848,11 +826,6 @@ private pure func unset_flags(count: Int) -> List[Bool]:
 	result
 
 
-private fixed union GenericCycleRoot:
-	GenericUnionRoot(UnionId)
-	GenericRecordRoot(RecordId)
-
-
 -- The parameters of a declaration as the rigid arguments it is walked at.
 private pure func rigid_arguments(parameters: List[TypeParameterId]) -> List[TypeRef]:
 	var arguments: List[TypeRef] = []
@@ -864,11 +837,11 @@ private pure func rigid_arguments(parameters: List[TypeParameterId]) -> List[Typ
 
 
 -- The written field types of a generic root, with their own spans.
-private pure func root_fields(root: GenericCycleRoot, declarations: CheckedDeclarations) -> Result[List[TypeUse], CheckError]:
+private pure func root_fields(root: AggregateId, declarations: CheckedDeclarations) -> Result[List[TypeUse], CheckError]:
 	origin: Span = { source = compiler_source(), start = 0, end = 0 }
 
 	match root:
-		GenericUnionRoot(id):
+		UnionAggregate(id):
 			match declarations.unions.get(union_number(id)).to_result(checker_invariant(origin, InvalidUnionDeclaration(id))):
 				Ok(declaration):
 					var fields: List[TypeUse] = []
@@ -878,7 +851,7 @@ private pure func root_fields(root: GenericCycleRoot, declarations: CheckedDecla
 
 					Ok(fields)
 				Err(error): Err(error)
-		GenericRecordRoot(id):
+		RecordAggregate(id):
 			match declarations.records.get(record_number(id)).to_result(checker_invariant(origin, InvalidRecordDeclaration(id))):
 				Ok(declaration):
 					var fields: List[TypeUse] = []
@@ -891,40 +864,30 @@ private pure func root_fields(root: GenericCycleRoot, declarations: CheckedDecla
 
 
 -- Every generic declaration, each the root of one reinstantiation walk.
-private pure func generic_roots(declarations: CheckedDeclarations) -> List[GenericCycleRoot]:
-	var roots: List[GenericCycleRoot] = []
+private pure func generic_roots(declarations: CheckedDeclarations) -> List[AggregateId]:
+	var roots: List[AggregateId] = []
 
 	for declaration in declarations.unions:
 		if declaration.type_parameters.is_empty().not():
-			roots = roots.append(GenericUnionRoot(declaration.id))
+			roots = roots.append(UnionAggregate(declaration.id))
 
 	for declaration in declarations.records:
 		if declaration.type_parameters.is_empty().not():
-			roots = roots.append(GenericRecordRoot(declaration.id))
+			roots = roots.append(RecordAggregate(declaration.id))
 
 	roots
 
 
 -- Whether this written type applies the generic root to one of its own
 -- parameters again: the recursion that could instantiate without bound.
-private pure func reinstantiates_root(value_type: TypeRef, root: GenericCycleRoot) -> Bool:
-	match root:
-		GenericUnionRoot(id):
-			match value_type:
-				AppliedUnionType(other, arguments):
-					if union_number(other) == union_number(id):
-						arguments.any(contains_parameter)
-					else:
-						False
-				_: False
-		GenericRecordRoot(id):
-			match value_type:
-				AppliedRecordType(other, arguments):
-					if record_number(other) == record_number(id):
-						arguments.any(contains_parameter)
-					else:
-						False
-				_: False
+private pure func reinstantiates_root(value_type: TypeRef, root: AggregateId) -> Bool:
+	match value_type:
+		NominalType(owner, arguments):
+			if same_aggregate(owner, root):
+				arguments.any(contains_parameter)
+			else:
+				False
+		_: False
 
 
 -- Walks every edge (payloads, fields, List elements, applied heads and
@@ -933,7 +896,7 @@ private pure func reinstantiates_root(value_type: TypeRef, root: GenericCycleRoo
 -- parameter again. Pointer edges are followed: `Tree[T]` behind a List is
 -- still unbounded.
 private pure func generic_reinstantiation_edge(
-	root: GenericCycleRoot,
+	root: AggregateId,
 	declarations: CheckedDeclarations,
 ) -> Result[Option[TypeUse], CheckError]:
 	var union_expanded = unset_flags(declarations.unions.length())
@@ -948,9 +911,9 @@ private pure func generic_reinstantiation_edge(
 	-- declaration reached from them is expanded by the shared step below at
 	-- the span of the root's written type that reached it.
 	match root:
-		GenericUnionRoot(id):
+		UnionAggregate(id):
 			union_expanded = union_expanded.set(union_number(id), True)
-		GenericRecordRoot(id):
+		RecordAggregate(id):
 			record_expanded = record_expanded.set(record_number(id), True)
 
 	fields ?= root_fields(root, declarations)
@@ -982,19 +945,13 @@ private pure func generic_reinstantiation_edge(
 						ListType(element):
 							pending = push_type_use(pending, pending_count, { annotation | value_type = element })
 							pending_count = pending_count.add(1)
-						AppliedRecordType(_, arguments):
+						NominalType(_, arguments):
 							for argument in arguments:
 								pending = push_type_use(pending, pending_count, { annotation | value_type = argument })
 								pending_count = pending_count.add(1)
-						AppliedUnionType(_, arguments):
-							for argument in arguments:
-								pending = push_type_use(pending, pending_count, { annotation | value_type = argument })
-								pending_count = pending_count.add(1)
-						RecordType(_) | UnionType(_):
-							void
 
-					match named_declaration(annotation.value_type):
-						NamedRecord(id):
+					match annotation.value_type:
+						NominalType(RecordAggregate(id), _):
 							match record_expanded.get(record_number(id)):
 								Some(False):
 									record_expanded = record_expanded.set(record_number(id), True)
@@ -1009,7 +966,7 @@ private pure func generic_reinstantiation_edge(
 									void
 								None:
 									failure = Some(checker_invariant(annotation.span, InvalidRecordDeclaration(id)))
-						NamedUnion(id):
+						NominalType(UnionAggregate(id), _):
 							match union_expanded.get(union_number(id)):
 								Some(False):
 									union_expanded = union_expanded.set(union_number(id), True)
@@ -1025,7 +982,7 @@ private pure func generic_reinstantiation_edge(
 									void
 								None:
 									failure = Some(checker_invariant(annotation.span, InvalidUnionDeclaration(id)))
-						NoNamedDeclaration:
+						_:
 							void
 
 	match failure:
@@ -1067,7 +1024,7 @@ private pure func repeated_self_payload(owner: UnionId, fields: List[TypeUse]) -
 
 	for field in fields:
 		match field.value_type:
-			UnionType(id):
+			NominalType(UnionAggregate(id), []):
 				if union_number(id) == union_number(owner):
 					if seen:
 						repeated = Some(field)
@@ -1162,7 +1119,7 @@ pure func validate_finite_declarations(
 									failure = Some(checker_invariant(origin, InvalidUnionDeclaration(id)))
 								Some(declaration):
 									instance: UnionInstanceVisit = { declaration = id, arguments = rigid_arguments(declaration.type_parameters) }
-									match expand_union_instance(instance, { value_type = UnionType(id), span = origin }, WrittenSpan, declarations, visiting, completed, pending, pending_count):
+									match expand_union_instance(instance, { value_type = NominalType(UnionAggregate(id), instance.arguments), span = origin }, WrittenSpan, declarations, visiting, completed, pending, pending_count):
 										Err(error):
 											failure = Some(error)
 										Ok(expanded):
@@ -1173,7 +1130,7 @@ pure func validate_finite_declarations(
 							-- The admitted direct self-reference needs no visit; a bare
 							-- union name resolves only for a non-generic declaration.
 							admitted = match annotation.value_type:
-								UnionType(id): union_number(id) == union_number(owner)
+								NominalType(UnionAggregate(id), []): union_number(id) == union_number(owner)
 								_: False
 
 							if admitted.not():
@@ -1183,8 +1140,6 @@ pure func validate_finite_declarations(
 							match annotation.value_type:
 								VoidType | IntType | FloatType | StringType | OpaqueType(_) | ParameterType(_):
 									void
-								RecordType(_):
-									void
 								CallableType(purity, parameters, result):
 									for child in parameters.append(result):
 										roots = roots.append(VisitDeclaredType({ annotation | value_type = child }))
@@ -1193,19 +1148,16 @@ pure func validate_finite_declarations(
 										roots = roots.append(VisitDeclaredType({ annotation | value_type = child }))
 								ListType(element):
 									roots = roots.append(VisitDeclaredType({ annotation | value_type = element }))
-								AppliedRecordType(_, arguments):
+								NominalType(RecordAggregate(_), arguments):
 									for argument in arguments:
 										roots = roots.append(VisitDeclaredType({ annotation | value_type = argument }))
-								UnionType(id):
-									match expand_union_instance({ declaration = id, arguments = [] }, annotation, WrittenSpan, declarations, visiting, completed, pending, pending_count):
-										Err(error):
-											failure = Some(error)
-										Ok(expanded):
-											visiting = expanded.visiting
-											pending = expanded.pending
-											pending_count = expanded.pending_count
-								AppliedUnionType(id, arguments):
-									match expand_union_instance({ declaration = id, arguments = arguments }, annotation, ApplicationSpan(annotation.span), declarations, visiting, completed, pending, pending_count):
+								NominalType(UnionAggregate(id), arguments):
+									-- A substituted body reports at the application that substituted it.
+									reported: PayloadSpan = if arguments.is_empty():
+										WrittenSpan
+									else:
+										ApplicationSpan(annotation.span)
+									match expand_union_instance({ declaration = id, arguments = arguments }, annotation, reported, declarations, visiting, completed, pending, pending_count):
 										Err(error):
 											failure = Some(error)
 										Ok(expanded):
@@ -1256,10 +1208,8 @@ private pure func validate_opaque_representation(
 								match declarations.opaques.get(opaque_number(id)):
 									Some(declaration): Ok([declaration.underlying_type])
 									None: Err(checker_invariant(annotation.span, InvalidOpaqueDeclaration(id)))
-							RecordType(id): opaque_record_children(id, [], annotation.span, declarations.records)
-							AppliedRecordType(id, arguments): opaque_record_children(id, arguments, annotation.span, declarations.records)
-							UnionType(id): opaque_union_children(id, [], annotation.span, declarations.unions)
-							AppliedUnionType(id, arguments): opaque_union_children(id, arguments, annotation.span, declarations.unions)
+							NominalType(RecordAggregate(id), arguments): opaque_record_children(id, arguments, annotation.span, declarations.records)
+							NominalType(UnionAggregate(id), arguments): opaque_union_children(id, arguments, annotation.span, declarations.unions)
 							_: Ok([])
 						match children:
 							Err(error): failure = Some(error)

@@ -77,10 +77,9 @@ fixed union TypeRef:
 	StringType
 	ListType(TypeRef)
 	TupleType(List[TypeRef])
-	RecordType(RecordId)
-	AppliedRecordType(RecordId, List[TypeRef])
-	UnionType(UnionId)
-	AppliedUnionType(UnionId, List[TypeRef])
+	-- A record or union applied to its type arguments, which match the
+	-- declaration's arity; a nongeneric declaration has none.
+	NominalType(AggregateId, List[TypeRef])
 	OpaqueType(OpaqueId)
 	ParameterType(TypeParameterId)
 	CallableType(Purity, List[TypeRef], TypeRef)
@@ -171,6 +170,8 @@ fixed union EqualityMember:
 	EqualityPayload(VariantId, Int)
 
 
+-- A record or union declaration: the head of a nominal type, and the owner of
+-- a derived structural equality.
 fixed union AggregateId:
 	RecordAggregate(RecordId)
 	UnionAggregate(UnionId)
@@ -269,8 +270,7 @@ fixed record SelectedMethodBody {
 
 pure func receiver_arguments(receiver: TypeRef) -> List[TypeRef]:
 	match receiver:
-		AppliedRecordType(_, arguments): arguments
-		AppliedUnionType(_, arguments): arguments
+		NominalType(_, arguments): arguments
 		ListType(element): [element]
 		_: []
 
@@ -450,6 +450,12 @@ pure func same_aggregate(left: AggregateId, right: AggregateId) -> Bool:
 			match right:
 				UnionAggregate(second): union_number(first) == union_number(second)
 				_: False
+
+
+pure func aggregate_head(aggregate: AggregateId) -> TypeHead:
+	match aggregate:
+		RecordAggregate(record_row): RecordHead(record_row)
+		UnionAggregate(union_row): UnionHead(union_row)
 
 
 pure func aggregate_owner(aggregate: AggregateId) -> TypeParameterOwner:
@@ -798,14 +804,8 @@ pure func type_head(value_type: TypeRef) -> Option[TypeHead]:
 			Some(PrimitiveHead(BuiltinString))
 		ListType(_):
 			Some(ListHead)
-		RecordType(id):
-			Some(RecordHead(id))
-		AppliedRecordType(id, _):
-			Some(RecordHead(id))
-		UnionType(id):
-			Some(UnionHead(id))
-		AppliedUnionType(id, _):
-			Some(UnionHead(id))
+		NominalType(owner, _):
+			Some(aggregate_head(owner))
 		OpaqueType(id):
 			Some(OpaqueHead(id))
 		ParameterType(_) | CallableType(_, _, _) | TupleType(_):
@@ -817,16 +817,8 @@ pure func receiver_type(head: TypeHead, arguments: List[TypeRef]) -> Option[Type
 	match head:
 		PrimitiveHead(primitive): Some(primitive_ref(primitive))
 		OpaqueHead(owner): Some(OpaqueType(owner))
-		RecordHead(owner):
-			if arguments.is_empty():
-				Some(RecordType(owner))
-			else:
-				Some(AppliedRecordType(owner, arguments))
-		UnionHead(owner):
-			if arguments.is_empty():
-				Some(UnionType(owner))
-			else:
-				Some(AppliedUnionType(owner, arguments))
+		RecordHead(owner): Some(NominalType(RecordAggregate(owner), arguments))
+		UnionHead(owner): Some(NominalType(UnionAggregate(owner), arguments))
 		ListHead:
 			match arguments:
 				[element]: Some(ListType(element))
@@ -847,19 +839,10 @@ pure func same_type(left: TypeRef, right: TypeRef) -> Bool:
 					same_type(element, other)
 				_:
 					False
-		AppliedRecordType(owner, arguments):
+		NominalType(owner, arguments):
 			match right:
-				AppliedRecordType(other_owner, others):
-					if record_number(owner) == record_number(other_owner):
-						same_types(arguments, others)
-					else:
-						False
-				_:
-					False
-		AppliedUnionType(owner, arguments):
-			match right:
-				AppliedUnionType(other_owner, others):
-					if union_number(owner) == union_number(other_owner):
+				NominalType(other_owner, others):
+					if same_aggregate(owner, other_owner):
 						same_types(arguments, others)
 					else:
 						False
@@ -893,14 +876,6 @@ pure func same_type(left: TypeRef, right: TypeRef) -> Bool:
 		StringType:
 			match right:
 				StringType: True
-				_: False
-		RecordType(owner):
-			match right:
-				RecordType(other_owner): record_number(owner) == record_number(other_owner)
-				_: False
-		UnionType(owner):
-			match right:
-				UnionType(other_owner): union_number(owner) == union_number(other_owner)
 				_: False
 		OpaqueType(owner):
 			match right:
@@ -981,12 +956,7 @@ fixed record UnionOccurrence {
 
 pure func union_occurrence(value: TypeRef) -> Option[UnionOccurrence]:
 	match value:
-		UnionType(id):
-			Some({
-				owner = id,
-				arguments = [],
-			})
-		AppliedUnionType(id, arguments):
+		NominalType(UnionAggregate(id), arguments):
 			Some({
 				owner = id,
 				arguments = arguments,

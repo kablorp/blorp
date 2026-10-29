@@ -512,7 +512,7 @@ private pure func render_selection(span: Span, path: ModulePath, selection: Impo
 							message = "${name} is imported by ${module}, not declared there"
 							help: Result[String, Diagnostic] = match entity:
 								Constructor(id):
-									match type_spelling(Check.UnionType(variant_owner(id)), context, span):
+									match type_spelling(Check.NominalType(Check.UnionAggregate(variant_owner(id)), []), context, span):
 										Err(error): Err(error)
 										Ok(union_name): Ok("import the union from the module that declares it, selecting ${union_name}(${name})")
 								Trait(_) | Method(_) | Function(_) | Constant(_) | Type(_) | Alias(_):
@@ -535,7 +535,7 @@ private pure func render_selection(span: Span, path: ModulePath, selection: Impo
 						AmbiguousConstant:
 							ambiguous_selection(span, module, "constant")
 						BareConstructor(variant):
-							match type_spelling(Check.UnionType(variant_owner(variant)), context, span):
+							match type_spelling(Check.NominalType(Check.UnionAggregate(variant_owner(variant)), []), context, span):
 								Err(error): error
 								Ok(union_name):
 									rendered(span, "${name} is a constructor of the union ${union_name}", "write ${union_name}(${name}) to select the union with this constructor")
@@ -961,7 +961,7 @@ private pure func render_record_error(
 				span,
 			).and_then(
 				pure func(field): type_spelling(
-					Check.RecordType(owner),
+					Check.NominalType(Check.RecordAggregate(owner), []),
 					context,
 					span,
 				).map(pure func(record_name): rendered(
@@ -1426,10 +1426,25 @@ private pure func type_spelling(
 			match inventory_opaques(context.parsed.declarations).get(opaque_number(id)):
 				Some(declaration): parsed_spelling(declaration.declaration.type_name.id, context.parsed.names, span)
 				None: Err(render_fault(span, Errors.InvalidOpaqueDeclaration(id)))
-		Check.RecordType(id):
-			match inventory_records(context.parsed.declarations).get(record_number(id)):
-				Some(declaration): parsed_spelling(declaration.declaration.type_name.id, context.parsed.names, span)
-				None: Err(render_fault(span, Errors.InvalidRecordDeclaration(id)))
+		Check.NominalType(owner, arguments):
+			declared: Result[String, Diagnostic] = match owner:
+				Check.RecordAggregate(id):
+					match inventory_records(context.parsed.declarations).get(record_number(id)):
+						Some(declaration): parsed_spelling(declaration.declaration.type_name.id, context.parsed.names, span)
+						None: Err(render_fault(span, Errors.InvalidRecordDeclaration(id)))
+				Check.UnionAggregate(id):
+					match inventory_unions(context.parsed.declarations).get(union_number(id)):
+						Some(declaration): parsed_spelling(declaration.type_name.id, context.parsed.names, span)
+						None: Err(render_fault(span, Errors.InvalidResolvedUnion(id)))
+			match declared:
+				Err(error): Err(error)
+				Ok(name):
+					if arguments.is_empty():
+						Ok(name)
+					else:
+						match type_spellings(arguments, context, span, []):
+							Ok(spelled): Ok("${name}[${comma_separated(spelled)}]")
+							Err(error): Err(error)
 		Check.IntType | Check.FloatType | Check.VoidType | Check.StringType:
 			builtin_spelling(value, context, span)
 		Check.TupleType(elements):
@@ -1448,54 +1463,6 @@ private pure func type_spelling(
 				Err(error): Err(error)
 		Check.ParameterType(id):
 			parameter_spelling(id, context, span)
-		Check.UnionType(id):
-			match inventory_unions(context.parsed.declarations).get(union_number(id)):
-				Some(declaration): parsed_spelling(declaration.type_name.id, context.parsed.names, span)
-				None: Err(render_fault(span, Errors.InvalidResolvedUnion(id)))
-		Check.AppliedUnionType(id, arguments):
-			match type_spelling(
-				Check.UnionType(id),
-				context,
-				span,
-			):
-				Ok(name):
-					match type_spellings(arguments, context, span, []):
-						Ok(spelled):
-							Ok(
-								"${name}[${comma_separated(spelled)}]",
-							)
-						Err(error): Err(error)
-				Err(error): Err(error)
-		Check.AppliedRecordType(id, arguments):
-			match type_spelling(
-				Check.RecordType(id),
-				context,
-				span,
-			):
-				Ok(name):
-					var spelling = "${name}["
-					var failure: Option[Diagnostic] = None
-					var position: Int = 0
-
-					for argument in arguments:
-						match type_spelling(argument, context, span):
-							Ok(argument_type):
-								if position != 0:
-									spelling = "${spelling}, "
-
-								spelling = spelling.concat(argument_type)
-							Err(error):
-								failure = Some(error)
-								break
-
-						position = position.add(1)
-
-					match failure:
-						Some(error):
-							Err(error)
-						None:
-							Ok("${spelling}]")
-				Err(error): Err(error)
 
 
 -- The parts in order, separated by commas.
