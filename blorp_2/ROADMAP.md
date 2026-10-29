@@ -144,6 +144,7 @@ not a portable nesting threshold or a product-destruction proof.
 | [M7](#m7-lambdas) | Pure function types/lambdas | Historical pre-stored-callable checkpoint: pure lambdas, immutable captures, forwarding and direct-call specialization implemented in integration; acceptance was pending. Current callable behavior and evidence are linked below. |
 | [M8](#m8-the-fixpoint-gate) | Fixpoint gate | Own-source self-compilation, identical compiler C and all 556 A/B fixture comparisons pass. All 559 e2e functional callbacks pass with the approved initial cost-debt policy; resource FAILs remain recorded and platform qualification is pending. |
 | [M9](#m9-post-self-compilation-architecture-audit) | Complete architecture audit using the self-compiled compiler | Planned immediately after M8, before the next major feature expansion. |
+| [Cleanup](CLEANUP_ROADMAP.md) | Delete dead code, one internal-error and first-error authority, identity equality, local de-duplication, then single cross-phase authorities | Planned; awaiting approval. |
 
 Historical dependency order for the self-compilation integration (not a current
 work assignment):
