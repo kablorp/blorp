@@ -77,6 +77,11 @@ static void assert_bytes(const struct blorp_string *text, const char *bytes, int
     assert(blorp_utf8_is_valid(text->bytes, (size_t)length));
 }
 
+/* Every String owns at least BLORP_STRING_MINIMUM_CAPACITY bytes. */
+static size_t expected_capacity(int64_t length) {
+    return (size_t)length < BLORP_STRING_MINIMUM_CAPACITY ? BLORP_STRING_MINIMUM_CAPACITY : (size_t)length;
+}
+
 static void concat_case(const char *left_bytes, int64_t left_length,
                         const char *right_bytes, int64_t right_length,
                         const char *expected, int64_t expected_length) {
@@ -84,9 +89,9 @@ static void concat_case(const char *left_bytes, int64_t left_length,
     struct blorp_string *right = blorp_string_from_bytes(right_bytes, right_length);
     const size_t result_occurrence = allocation_count;
     struct blorp_string *result = blorp_string_concat(left, right);
-    assert(left->capacity == (size_t)left_length);
-    assert(right->capacity == (size_t)right_length);
-    assert(result->capacity == (size_t)expected_length);
+    assert(left->capacity == expected_capacity(left_length));
+    assert(right->capacity == expected_capacity(right_length));
+    assert(result->capacity == expected_capacity(expected_length));
     assert(allocation_count == result_occurrence + 1 && live_count == 3);
     assert_bytes(left, left_bytes, left_length);
     assert_bytes(right, right_bytes, right_length);
@@ -121,9 +126,10 @@ static void take_left_bytes(const char *prefix, int64_t prefix_length,
     struct blorp_string *left = blorp_string_from_bytes(prefix, prefix_length);
     struct blorp_string *right = blorp_string_from_bytes(suffix, suffix_length);
     const size_t calls = allocation_count, resizes = resize_count;
+    const int grows = (size_t)length > left->capacity;
     struct blorp_string *result = blorp_string_concat_take_left(left, right);
-    assert(resize_count == resizes + (suffix_length != 0));
-    assert(allocation_count == calls + (suffix_length != 0));
+    assert(resize_count == resizes + grows);
+    assert(allocation_count == calls + grows);
     assert_bytes(result, expected, length);
     assert_bytes(right, suffix, suffix_length);
     blorp_string_release(right);
@@ -161,7 +167,8 @@ static void take_left_shared(int same_root) {
 }
 
 static void take_left_geometric_growth(void) {
-    enum { APPENDS = 4096, MAX_RESIZES = 13 };
+    /* From the 32-byte minimum, doubling to 4096 bytes resizes 7 times. */
+    enum { APPENDS = 4096, MAX_RESIZES = 7 };
     struct blorp_string *value = blorp_string_from_bytes("", 0);
     struct blorp_string *suffix = blorp_string_from_bytes("x", 1);
     for (int64_t index = 0; index < APPENDS; index++) {
@@ -170,7 +177,7 @@ static void take_left_geometric_growth(void) {
         assert(value->length == index + 1);
         assert(value->bytes[index] == 'x' && value->bytes[index + 1] == '\0');
         if ((size_t)index < old_capacity) assert(allocation_count == calls);
-        else assert(value->capacity == (old_capacity == 0 ? 1 : 2 * old_capacity));
+        else assert(value->capacity == 2 * old_capacity);
     }
     assert(resize_count == MAX_RESIZES);
     /* Forced relocation copies each old allocation, including fixed metadata.
@@ -225,7 +232,7 @@ static void append_int_limits(void) {
         struct blorp_string *value = blorp_string_from_bytes("", 0);
         const size_t calls = allocation_count, resizes = resize_count;
         value = blorp_string_append_int_take_left(value, values[index]);
-        assert(allocation_count == calls + 1 && resize_count == resizes + 1);
+        assert(allocation_count == calls && resize_count == resizes);
         assert_bytes(value, expected[index], lengths[index]);
         blorp_string_release(value);
     }
@@ -249,7 +256,7 @@ static void append_int_utf8_nul(void) {
     struct blorp_string *value = blorp_string_from_bytes("\xc3\xa9\0", 3);
     const size_t calls = allocation_count, resizes = resize_count;
     value = blorp_string_append_int_take_left(value, -42);
-    assert(allocation_count == calls + 1 && resize_count == resizes + 1);
+    assert(allocation_count == calls && resize_count == resizes);
     assert_bytes(value, "\xc3\xa9\0-42", 6);
     blorp_string_release(value);
 }
@@ -268,7 +275,8 @@ static void append_int_spare_capacity(void) {
 }
 
 static void append_int_geometric_growth(void) {
-    enum { APPENDS = 4096, MAX_RESIZES = 13 };
+    /* From the 32-byte minimum, doubling to 4096 bytes resizes 7 times. */
+    enum { APPENDS = 4096, MAX_RESIZES = 7 };
     struct blorp_string *value = blorp_string_from_bytes("", 0);
     const size_t calls = allocation_count;
     for (int64_t index = 0; index < APPENDS; index++) {
@@ -316,6 +324,7 @@ int main(int argc, char **argv) {
     else if (strcmp(name, "take_left_empty") == 0) take_left_bytes("", 0, "right", 5, "right", 5);
     else if (strcmp(name, "take_right_empty") == 0) take_left_bytes("left", 4, "", 0, "left", 4);
     else if (strcmp(name, "take_utf8_nul") == 0) take_left_bytes("\xc3\xa9\0", 3, "\xf0\x9f\x98\x80", 4, "\xc3\xa9\0\xf0\x9f\x98\x80", 7);
+    else if (strcmp(name, "take_grows_past_minimum") == 0) take_left_bytes("0123456789012345678901234567890", 31, "abc", 3, "0123456789012345678901234567890abc", 34);
     else if (strcmp(name, "take_spare_capacity") == 0) take_left_spare_capacity();
     else if (strcmp(name, "take_shared") == 0) take_left_shared(0);
     else if (strcmp(name, "take_shared_alias") == 0) take_left_shared(1);
