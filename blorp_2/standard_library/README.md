@@ -126,17 +126,16 @@ Integrated correctness, self-compilation and resource acceptance remain separate
 
 ### List membership
 
-`contains_with[A](values: List[A], needle: A, comparison: pure (A, A) -> Bool) -> Bool`
-uses supplied equality in element/needle order and stops at the first match.
 `contains[Element: Equatable](values: List[Element], needle: Element) -> Bool`
-uses the selected equality implementation. String, named record and nested
-List elements work when they satisfy that bound; authored equality takes precedence.
-Both functions are pure and borrow their inputs; managed aliases remain valid.
-The supplied-comparison API needs no Equatable bound and preserves its comparator
-contract. List equality itself uses a single length/get index walk, without
-copying suffixes. Float NaN remains unequal to itself.
-Indexed `get` and ordinary recursion do O(n) work, with linear C stack at O0 and
-ordinary temporary ARC costs. No bounded-stack or zero-allocation claim is made.
+compares each element with the needle using `==`, in element/needle order, and
+stops at the first match. It uses the selected equality implementation. String,
+named record and nested List elements work when they satisfy that bound;
+authored equality takes precedence. A search by other criteria uses
+`any(values, predicate)`. The function is pure and borrows its inputs; managed
+aliases remain valid. List equality itself uses a single length/get index walk,
+without copying suffixes. Float NaN remains unequal to itself.
+It iterates the List once with a `for` loop, doing O(n) work with constant C
+stack and ordinary temporary ARC costs. No zero-allocation claim is made.
 Further helper optimization is deferred; these equality contracts are supported.
 
 The List update names match the unchanged host library because the same compiler source

@@ -3,7 +3,7 @@ import:
 	../../../src/utils/names: program_names, name_spelling
 	../../../src/check/model as Model
 	../../../src/utils/source: module_source, root_module_id, same_module, same_source
-	../../../src/utils/ids: inventory_functions, inventory_traits, function_number, trait_number, trait_method_owner, VariantId
+	../../../src/utils/ids: inventory_functions, inventory_traits, function_number, trait_number, trait_method_owner, same_trait_method, VariantId
 	../../../src/load/load: load_program
 	../../../src/parse/assemble: parsed_contents
 	../../../src/check/check: CheckedProgram, check, checked_functions, check_errors, failure_functions
@@ -783,44 +783,40 @@ func test_contains_library_preserves_its_rigid_parameter_and_designated_bool() -
 								name = name_spelling(parsed.names, row.declaration.function_name.id)
 								(
 									same_module(row.declaration.module, list_import.target)
-										and (name == Some("contains_with") or name == Some("contains"))
+										and (name == Some("any") or name == Some("contains"))
 								)
 							)
 							functions = checked_functions(checked).functions
 							match rows.map(pure func(row): functions.get(function_number(row.id))):
-								[Some(generic), Some(membership)]:
-									match (generic.signature.type_parameters, generic.signature.parameters, membership.signature.type_parameters, membership.signature.parameters):
-										([parameter], [values, needle, equality], [element], [items, wanted]):
+								-- Inventory order is source order: contains precedes any in list.brp.
+								[Some(membership), Some(predicate_api)]:
+									match (predicate_api.signature.type_parameters, predicate_api.signature.parameters, membership.signature.type_parameters, membership.signature.parameters):
+										([parameter], [values, predicate], [element], [items, wanted]):
 											match (membership.signature.requirements, checked_functions(checked).traits.canonical, Model.function_calls(membership)):
 												([requirement], Some(canonical), [call]):
 													match (Model.parameter_owner(parameter), Model.parameter_owner(element), call.target, call.operands):
 														(
 															Model.FunctionDeclaration(owner), Model.FunctionDeclaration(member_owner),
-															Model.UserFunction(target, [argument]),
-															[Model.ValueOperand(_), Model.ValueOperand(_), Model.CallableOperand(destination, Model.MethodCallable(method), _)],
+															Model.TraitMethod(method),
+															[Model.ValueOperand(_), Model.ValueOperand(_)],
 														):
 															bool_type = Model.UnionType(boolean.id)
 															(
-																function_number(owner) == function_number(generic.id)
+																function_number(owner) == function_number(predicate_api.id)
 																and function_number(member_owner) == function_number(membership.id)
-																and same_purity(generic.signature.purity, Pure)
+																and same_purity(predicate_api.signature.purity, Pure)
 																and same_purity(membership.signature.purity, Pure)
-																and generic.signature.requirements.is_empty()
+																and predicate_api.signature.requirements.is_empty()
 																and Model.same_type(values.value_type, Model.ListType(Model.ParameterType(parameter)))
-																and Model.same_type(needle.value_type, Model.ParameterType(parameter))
-																and Model.same_type(equality.value_type, Model.CallableType(Pure, [
-																	Model.ParameterType(parameter), Model.ParameterType(parameter),
-																], bool_type))
-																and Model.same_type(generic.signature.return_type.value_type, bool_type)
+																and Model.same_type(predicate.value_type, Model.CallableType(Pure, [Model.ParameterType(parameter)], bool_type))
+																and Model.same_type(predicate_api.signature.return_type.value_type, bool_type)
 																and Model.same_type(membership.signature.return_type.value_type, bool_type)
 																and Model.same_type(items.value_type, Model.ListType(Model.ParameterType(element)))
 																and Model.same_type(wanted.value_type, Model.ParameterType(element))
 																and Model.same_parameter(requirement.parameter, element)
 																and trait_number(requirement.required_trait) == trait_number(Model.canonical_owner(canonical))
-																and function_number(target) == function_number(generic.id)
-																and Model.same_type(argument, Model.ParameterType(element))
-																and Model.same_callable_parameter(destination, Model.callable_parameter(generic.id, 2))
-																and trait_number(trait_method_owner(Model.method_identity(method))) == trait_number(Model.canonical_owner(canonical))
+																-- The == in contains is one call on the canonical equals of its element type.
+																and same_trait_method(Model.method_identity(method), Model.canonical_equals(canonical))
 																and Model.same_type(Model.method_receiver(method), Model.ParameterType(element))
 															)
 														_: False
@@ -881,17 +877,17 @@ func test_contains_requires_a_declared_bound_even_without_callers() -> Bool:
 	)
 
 
-func test_contains_with_keeps_named_and_forwarded_callback_identities() -> Bool:
+func test_any_keeps_named_and_forwarded_callback_identities() -> Bool:
 	source: String =
 		|import:
-		|    list: contains_with
+		|    list: any
 		|    string as StringOps
-		|pure func same_text(left: String, right: String) -> Bool:
-		|    StringOps.equals(left, right)
-		|pure func forward[A](values: List[A], needle: A, equals: pure (A, A) -> Bool) -> Bool:
-		|    contains_with(values, needle, equals)
+		|pure func is_kept(value: String) -> Bool:
+		|    StringOps.equals(value, "kept")
+		|pure func forward[A](values: List[A], predicate: pure (A) -> Bool) -> Bool:
+		|    any(values, predicate)
 		|func main() -> Int:
-		|    found = forward(["kept"], "kept", same_text)
+		|    found = forward(["kept"], is_kept)
 		|    0
 		|
 	with_directory(func(directory: String):
@@ -904,25 +900,25 @@ func test_contains_with_keeps_named_and_forwarded_callback_identities() -> Bool:
 		root_functions = inventory_functions(parsed.declarations)
 			.filter(pure func(row): same_module(row.declaration.module, root_module_id()))
 		valid = match root_functions.map(pure func(row): functions.get(function_number(row.id))):
-			[Some(same_text), Some(forward), Some(main)]:
+			[Some(is_kept), Some(forward), Some(main)]:
 				match (forward.signature.type_parameters, Model.function_calls(forward), Model.function_calls(main)):
 					([parameter], [forwarded], [named]):
 						match (forwarded.target, named.target, forwarded.operands, named.operands):
 							(
 								Model.UserFunction(target, [Model.ParameterType(argument)]),
 								Model.UserFunction(called_forward, [Model.StringType]),
-								[Model.ValueOperand(_), Model.ValueOperand(_), Model.CallableOperand(forwarded_parameter, forwarded_choice, _)],
-								[Model.ValueOperand(_), Model.ValueOperand(_), Model.CallableOperand(named_parameter, named_choice, _)],
+								[Model.ValueOperand(_), Model.CallableOperand(forwarded_parameter, forwarded_choice, _)],
+								[Model.ValueOperand(_), Model.CallableOperand(named_parameter, named_choice, _)],
 							):
 								match (forwarded_choice, named_choice):
 									(Model.ForwardedCallable(original), Model.NamedCallable(chosen, [])):
 										(
 											Model.same_parameter(parameter, argument)
 											and function_number(called_forward) == function_number(forward.id)
-											and function_number(chosen) == function_number(same_text.id)
-											and Model.same_callable_parameter(original, Model.callable_parameter(forward.id, 2))
-											and Model.same_callable_parameter(forwarded_parameter, Model.callable_parameter(target, 2))
-											and Model.same_callable_parameter(named_parameter, Model.callable_parameter(forward.id, 2))
+											and function_number(chosen) == function_number(is_kept.id)
+											and Model.same_callable_parameter(original, Model.callable_parameter(forward.id, 1))
+											and Model.same_callable_parameter(forwarded_parameter, Model.callable_parameter(target, 1))
+											and Model.same_callable_parameter(named_parameter, Model.callable_parameter(forward.id, 1))
 										)
 									_: False
 							_: False
@@ -931,20 +927,20 @@ func test_contains_with_keeps_named_and_forwarded_callback_identities() -> Bool:
 		if valid:
 			Ok(void)
 		else:
-			Err("membership did not preserve the actual named/forwarded choices")
+			Err("callback API did not preserve the actual named/forwarded choices")
 	)
 
 
 private CONTAINS_CALL_SCOPE: String =
 	|import:
-	|    list: contains, contains_with
+	|    list: any, contains
 	|pure func same(left: Int, right: Int) -> Bool:
 	|    True
-	|pure func wrong_input(left: String, right: String) -> Bool:
+	|pure func wrong_input(value: String) -> Bool:
 	|    True
-	|pure func wrong_result(left: Int, right: Int) -> String:
+	|pure func wrong_result(value: Int) -> String:
 	|    "wrong"
-	|func side_effect(left: Int, right: Int) -> Bool:
+	|func side_effect(value: Int) -> Bool:
 	|    True
 	|func main() -> Int:
 	|
@@ -1011,20 +1007,20 @@ func test_int_membership_rejects_a_string_needle() -> Bool:
 	)
 
 
-func test_contains_with_requires_three_arguments() -> Bool:
-	rejects_contains_call("", "contains_with", "([1], 1)",
+func test_any_requires_two_arguments() -> Bool:
+	rejects_contains_call("", "any", "([1])",
 		"argument count does not match the function parameters",
 		"pass one expression for each declared parameter; UFCS supplies the receiver first",
 		pure func(kind):
 			match kind:
-				Errors.CallRejection(Errors.ArgumentCountMismatch(arity)): arity.expected == 3 and arity.actual == 2
+				Errors.CallRejection(Errors.ArgumentCountMismatch(arity)): arity.expected == 2 and arity.actual == 1
 				_: False
 	)
 
 
-func test_contains_with_rejects_a_comparator_for_another_element_type() -> Bool:
-	rejects_contains_call("contains_with([1], 1, ", "wrong_input", ")",
-		"argument type does not match the parameter type", "use an expression of type pure (Int, Int) -> Bool here",
+func test_any_rejects_a_predicate_for_another_element_type() -> Bool:
+	rejects_contains_call("any([1], ", "wrong_input", ")",
+		"argument type does not match the parameter type", "use an expression of type pure (Int) -> Bool here",
 		pure func(kind):
 			match kind:
 				Errors.CallRejection(Errors.GenericArgumentConflict(conflict)):
@@ -1035,14 +1031,14 @@ func test_contains_with_rejects_a_comparator_for_another_element_type() -> Bool:
 					):
 						(
 							Model.FunctionDeclaration(_),
-							Model.CallableType(Pure, [Model.IntType, Model.IntType], Model.UnionType(expected_bool)),
-							Model.CallableType(Pure, [Model.StringType, Model.StringType], Model.UnionType(actual_bool)),
+							Model.CallableType(Pure, [Model.IntType], Model.UnionType(expected_bool)),
+							Model.CallableType(Pure, [Model.StringType], Model.UnionType(actual_bool)),
 						):
 							(
 								Model.parameter_position(conflict.parameter) == 0
 								and Model.same_type(conflict.previous.value_type, Model.IntType)
 								and Model.same_type(conflict.current.value_type, Model.StringType)
-								and conflict.mismatch.argument_position == 2
+								and conflict.mismatch.argument_position == 1
 								and Model.same_type(Model.UnionType(expected_bool), Model.UnionType(actual_bool))
 							)
 						_: False
@@ -1050,24 +1046,24 @@ func test_contains_with_rejects_a_comparator_for_another_element_type() -> Bool:
 	)
 
 
-func test_contains_with_requires_a_boolean_comparator_result() -> Bool:
-	rejects_contains_call("contains_with([1], 1, ", "wrong_result", ")",
-		"argument type does not match the parameter type", "use an expression of type pure (Int, Int) -> Bool here",
+func test_any_requires_a_boolean_predicate_result() -> Bool:
+	rejects_contains_call("any([1], ", "wrong_result", ")",
+		"argument type does not match the parameter type", "use an expression of type pure (Int) -> Bool here",
 		pure func(kind):
 			match kind:
 				Errors.CallRejection(Errors.ArgumentTypeMismatch(mismatch)):
 					match (mismatch.expected, mismatch.actual.value_type):
 						(
-							Model.CallableType(Pure, [Model.IntType, Model.IntType], Model.UnionType(_)),
-							Model.CallableType(Pure, [Model.IntType, Model.IntType], Model.StringType),
-						): mismatch.argument_position == 2
+							Model.CallableType(Pure, [Model.IntType], Model.UnionType(_)),
+							Model.CallableType(Pure, [Model.IntType], Model.StringType),
+						): mismatch.argument_position == 1
 						_: False
 				_: False
 	)
 
 
-func test_contains_with_rejects_an_impure_comparator() -> Bool:
-	rejects_contains_call("contains_with([1], 1, ", "side_effect", ")",
+func test_any_rejects_an_impure_predicate() -> Bool:
+	rejects_contains_call("any([1], ", "side_effect", ")",
 		"pure callback requires a pure function",
 		"pass a pure named function; impure functions cannot satisfy a pure callable parameter",
 		pure func(kind):
@@ -1082,12 +1078,12 @@ tests: TestSuite = {
 	tests = [
 		("actual membership APIs retain their own rigid and designated Bool", test_contains_library_preserves_its_rigid_parameter_and_designated_bool),
 		("uncalled membership requires its actual declared bound", test_contains_requires_a_declared_bound_even_without_callers),
-		("actual membership API preserves named and forwarded callback identities", test_contains_with_keeps_named_and_forwarded_callback_identities),
+		("actual callback API preserves named and forwarded callback identities", test_any_keeps_named_and_forwarded_callback_identities),
 		("Int membership rejects a String needle", test_int_membership_rejects_a_string_needle),
-		("membership callback has the written three-argument contract", test_contains_with_requires_three_arguments),
-		("membership comparator input matches the actual element", test_contains_with_rejects_a_comparator_for_another_element_type),
-		("membership comparator returns Bool", test_contains_with_requires_a_boolean_comparator_result),
-		("membership comparator must be pure", test_contains_with_rejects_an_impure_comparator),
+		("predicate callback has the written two-argument contract", test_any_requires_two_arguments),
+		("predicate input matches the actual element", test_any_rejects_a_predicate_for_another_element_type),
+		("predicate returns Bool", test_any_requires_a_boolean_predicate_result),
+		("predicate must be pure", test_any_rejects_an_impure_predicate),
 		("library callback rejects impurity with exact diagnostic", test_library_callback_rejects_impurity),
 		("library callback rejects wrong input with exact diagnostic", test_library_callback_rejects_wrong_input),
 		("library chain rejects wrong Result error with exact diagnostic", test_library_chain_rejects_wrong_result_error),
