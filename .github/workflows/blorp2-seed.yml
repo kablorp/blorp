@@ -2,16 +2,14 @@ name: Blorp 2 seed
 
 # Production generations use the immutable B2 seed pinned by this checkout.
 # Only explicitly self-hosted suites run; unported hosted coverage is deferred.
+# blorp2.yml calls this after a push to main passes its tests; a manual run
+# publishes the head of the selected ref. The seed tag names the source commit.
 on:
-  push:
-    tags: ['blorp2-seed-*']
+  workflow_call:
+  workflow_dispatch:
 
 permissions:
   contents: read
-
-concurrency:
-  group: blorp2-seed
-  cancel-in-progress: false
 
 jobs:
   build:
@@ -40,22 +38,16 @@ jobs:
       - uses: actions/checkout@v5
         with:
           fetch-depth: 0
-          ref: ${{ github.ref }}
+          ref: ${{ github.sha }}
           persist-credentials: false
 
       - name: Validate source and native target
         id: source
         shell: bash
-        env:
-          SEED_TAG: ${{ github.ref_name }}
         run: |
           set -euo pipefail
           source_sha=$(git rev-parse HEAD)
-          if [[ ! "$SEED_TAG" =~ ^blorp2-seed-[0-9a-f]{12}$ ]] ||
-             [ "$SEED_TAG" != "blorp2-seed-${source_sha:0:12}" ]; then
-            echo "Seed tag must identify the checked-out source commit." >&2
-            exit 1
-          fi
+          test "$source_sha" = "$GITHUB_SHA"
           test -z "$(git status --porcelain)"
           test "$(scripts/target-triple)" = "$SEED_TARGET"
           test -r blorp_2/bootstrap.env
@@ -104,11 +96,6 @@ jobs:
             > "$work/provenance/a-emits.stdout" 2> "$work/provenance/a-emits.stderr"
           test ! -s "$work/provenance/a-emits.stdout"
           test ! -s "$work/provenance/a-emits.stderr"
-          # The reviewed join-transfer producer emits this C.
-          reviewed_compiler_c_sha256=2975e872a5f2bb0804ba6b6b5713003b03101b04c8abd8a52e203ebdcad08ec4
-          actual_compiler_c_sha256=$(shasum -a 256 "$work/compiler.c" | cut -d ' ' -f 1)
-          test "$actual_compiler_c_sha256" = "$reviewed_compiler_c_sha256"
-          printf '%s\n' "$reviewed_compiler_c_sha256" > "$work/provenance/reviewed-compiler-c.sha256"
           clang -O0 -DBLORP_MEMORY_DIAGNOSTICS=0 "$work/compiler.c" \
             -o "$work/compiler-b" -lm -lpthread > "$work/provenance/b-normal-link.log" 2>&1
           test ! -s "$work/provenance/b-normal-link.log"
@@ -328,12 +315,11 @@ jobs:
     env:
       GH_TOKEN: ${{ github.token }}
       GH_REPO: ${{ github.repository }}
-      SEED_TAG: ${{ github.ref_name }}
     steps:
       - uses: actions/checkout@v5
         with:
           fetch-depth: 0
-          ref: ${{ github.ref }}
+          ref: ${{ github.sha }}
           persist-credentials: false
       - uses: actions/download-artifact@v7
         with:
@@ -345,12 +331,18 @@ jobs:
         run: |
           set -euo pipefail
           source_sha=$(git rev-parse HEAD)
-          test "$SEED_TAG" = "blorp2-seed-${source_sha:0:12}"
-          git fetch --quiet --no-tags origin "refs/tags/$SEED_TAG"
-          test "$(git rev-parse 'FETCH_HEAD^{commit}')" = "$source_sha"
+          seed_tag="blorp2-seed-${source_sha:0:12}"
+          # GITHUB_TOKEN cannot create a ref at a commit whose workflow tree
+          # differs from the default branch, as release.yml also records. A
+          # later Blorp 2 push publishes its own seed.
+          git fetch --quiet --no-tags origin main
+          if ! git diff --quiet "$source_sha" FETCH_HEAD -- .github/workflows; then
+            echo "::warning title=Seed not published::Skipping $seed_tag because its workflows differ from current main."
+            exit 0
+          fi
           # Existing immutable releases remain available to pinned checkouts.
           gh api --paginate "repos/$GH_REPO/releases" --jq '.[].tag_name' > existing-release-tags.txt
-          if grep -Fxq "$SEED_TAG" existing-release-tags.txt; then
+          if grep -Fxq "$seed_tag" existing-release-tags.txt; then
             echo "This immutable B2 seed release already exists; never overwrite it." >&2
             exit 1
           fi
@@ -369,16 +361,12 @@ jobs:
             test "$(cat "proof/$target/provenance/source-commit.txt")" = "$source_sha"
             gzip -dc "dist/blorp2-compiler-$target.c.gz" > "proof/$target/compiler.c"
             expected_binary=$(awk '$2 == "build/blorp2-seed/compiler-b" {print $1}' "proof/$target/provenance/b.sha256")
-            reviewed_c=$(cat "proof/$target/provenance/reviewed-compiler-c.sha256")
             expected_c=$(awk '$2 == "build/blorp2-seed/compiler.c" {print $1}' "proof/$target/provenance/b.sha256")
             [[ "$expected_binary" =~ ^[0-9a-f]{64}$ ]]
             [[ "$expected_c" =~ ^[0-9a-f]{64}$ ]]
-            [[ "$reviewed_c" =~ ^[0-9a-f]{64}$ ]]
-            test "$expected_c" = "$reviewed_c"
             test "$(sha256sum "dist/blorp2-$target" | cut -d ' ' -f 1)" = "$expected_binary"
             test "$(sha256sum "proof/$target/compiler.c" | cut -d ' ' -f 1)" = "$expected_c"
             cmp "proof/$first/compiler.c" "proof/$target/compiler.c"
-            cmp "proof/$first/provenance/reviewed-compiler-c.sha256" "proof/$target/provenance/reviewed-compiler-c.sha256"
             for inventory in blorp_2-src blorp_2-standard_library standard_library-src; do
               cmp "proof/$first/provenance/$inventory.sha256" "proof/$target/provenance/$inventory.sha256"
             done
@@ -392,11 +380,11 @@ jobs:
           Every maintained accepted/rejected fixture was compared under A/B for exit status, stdout, stderr and emitted-C presence/bytes; per-fixture logs, hashes, inventory and actual counts are retained. Both B link logs were empty.
           A temporary ASan/UBSan diagnostic B built from the same approved C performed the existing whole-source strict accounting check and emitted identical C, with an empty link log and only the exact balanced accounting report. Its hash/flags are retained; only normal B is published.
           Full native/resource qualification is DEFERRED with its unported driver; no resource PASS or full M8 acceptance is claimed. Existing fixture caps remain in source.
-          Compiler C is locked to the reviewed join-transfer producer SHA-256 $reviewed_c, retained in reviewed-compiler-c.sha256 and checked again during publication.
+          All three platforms emitted identical compiler C, SHA-256 $expected_c.
           Hosted retired-instruction measurement is explicitly disabled and unmeasured on all three platforms; instruction costs are not qualified.
           Fixture parity compares compiler outputs only; it does not claim execution of those fixture mains. The explicit native smoke, self-hosted TestSuite mains and selected e2e fixture mains are executed; broader fixture execution remains deferred.
           The per-platform provenance archives retain inputs, compiler modes, toolchains, SDK/libc details and raw gates. Non-resource failures remain blocking.
           Keep this release and all assets while retained source history references them; never replace assets in place.
           NOTES
-          gh release create "$SEED_TAG" dist/* --verify-tag --prerelease --latest=false \
+          gh release create "$seed_tag" dist/* --target "$source_sha" --prerelease --latest=false \
             --title "Blorp 2 seed ${source_sha:0:12}" --notes-file release-notes.md

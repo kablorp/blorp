@@ -4,7 +4,9 @@ Blorp publishes binaries through GitHub Releases.
 
 ## Channels
 
-- `dev` is a moving prerelease produced after `CI` passes on `main`.
+- `dev` is a moving prerelease produced after `CI` passes on `main`. `CI` runs
+  only for pushes that change the legacy compiler's paths, so `dev` is the
+  latest such commit, not every `main` commit.
 - `dev-<short-sha>` is an immutable prerelease produced from the same successful
   `main` build as `dev`.
 - `vX.Y.Z...` tags produce immutable versioned releases.
@@ -14,7 +16,8 @@ versioned preview releases once a preview has been cut.
 
 ## Latest Dev Build
 
-The latest successful `main` build is published as a moving `dev` release.
+The latest `main` commit that passed legacy `CI` is published as a moving
+`dev` release.
 The installer detects the matching binary for your system and puts it at the
 requested path, usually `$HOME/.local/bin/blorp`.
 
@@ -98,8 +101,8 @@ Manual downloads need executable permission before use, for example
 ## Operational Notes
 
 - Do not treat dev builds as stable preview releases.
-- `dev` is intentionally mutable and always points at the latest successful
-  `main` build.
+- `dev` is intentionally mutable and always points at the latest `main` commit
+  that passed legacy `CI`.
 - Push `v*` release tags only after the target commit has passed the intended
   CI/premerge gate; tag releases build directly from the pushed tag.
 - Do not mutate `dev-*` or `v*` release assets after publishing; create a new
@@ -175,19 +178,17 @@ Test-artifact timeout defaults and overrides live in
 ## Blorp 2 bootstrap seeds
 
 Blorp 2 seeds use `.github/workflows/blorp2-seed.yml`, separately from legacy
-CLI releases. After the reviewed source/library integration is committed
-and its active self-hosted qualification has an accepted outcome with deferred
-coverage disclosed, Root can create
-and push an immutable tag with SSH credentials that trigger Actions:
+CLI releases. The Blorp 2 workflow, `.github/workflows/blorp2.yml`, calls it
+after a push to main passes `make -C blorp_2 test` on every platform, so each
+such commit publishes the immutable tag `blorp2-seed-<12hex>` naming it. A
+manual run of the seed workflow publishes the head of the selected branch or
+tag; to republish an older commit, first point a branch at it. Publication is
+skipped with a warning when the commit's `.github/workflows` tree differs from
+current main, because `GITHUB_TOKEN` cannot create a tag there; the next Blorp
+2 push publishes its own seed. Publishing does not pin: `blorp_2/bootstrap.env`
+changes only in a reviewed commit, as described below.
 
-```bash
-source_sha=$(git rev-parse HEAD)
-seed_tag="blorp2-seed-${source_sha:0:12}"
-git tag "$seed_tag" "$source_sha"
-git push origin "refs/tags/$seed_tag"
-```
-
-The workflow validates the tag against the actual source commit and the three
+The workflow checks the checked-out source commit and the three
 native targets: macOS ARM64 on macOS 15, Linux x64 and Linux ARM64 on Ubuntu 24.04.
 The workflow uses no legacy host. The pinned B2 seed generates reference A,
 then A emits compiler C,
@@ -219,20 +220,21 @@ while _base remains import-free. It also supports consuming String concatenation
 with checked capacity growth and unique-buffer reuse, plus the pure
 `string.append_int` builtin with stack-formatted decimal digits. The production
 library keeps its old integer-append body until this supporting seed is published,
-verified and pinned. The seed tag identifies the final approved source commit, retained in each archive's
-`source-commit.txt`; compiler and library inventories must match across platforms.
-The reviewed workflow and release documentation changes accompany compiler
-support before integer-append library activation. Compiler C is locked
-to SHA-256
-`2975e872a5f2bb0804ba6b6b5713003b03101b04c8abd8a52e203ebdcad08ec4`, the
-join- and loop-entry-transfer producer, checked
-immediately after A emits C and before B qualification. Each provenance archive
-retains `reviewed-compiler-c.sha256`; the publisher checks the emitted C against
-that digest and requires all platforms to agree. The earlier stored-callable/tuple
-bridge recorded source `9c12cc79e3b7b919af93debde139595b4288e42e` and compiler C
-`46c041be4c5be389cd5e6b6d288f5abd8e673ca78b003914849232ac456ee4e3`; the
-List-update-reuse seed recorded source `90f6842485219165d5d2b47937ce3d54103a9005`
-and compiler C `cdd5e9e7405e4fd9f14a4a128d2229d843073a1ce88d79b6cb87111f9666e6e6`.
+verified and pinned. The seed tag identifies the source commit, retained in each archive's
+`source-commit.txt`; compiler C and library inventories must match across
+platforms, and the release notes record the compiler C digest. Seeds published
+before automatic publication locked compiler C to a digest reviewed in the
+workflow:
+
+- join- and loop-entry-transfer seed: source
+  `50d3922f34495a33c09028a1c0d448672914f5de`, compiler C
+  `2975e872a5f2bb0804ba6b6b5713003b03101b04c8abd8a52e203ebdcad08ec4`
+- List-update-reuse seed: source `90f6842485219165d5d2b47937ce3d54103a9005`,
+  compiler C `cdd5e9e7405e4fd9f14a4a128d2229d843073a1ce88d79b6cb87111f9666e6e6`
+- stored-callable/tuple bridge: source
+  `9c12cc79e3b7b919af93debde139595b4288e42e`, compiler C
+  `46c041be4c5be389cd5e6b6d288f5abd8e673ca78b003914849232ac456ee4e3`
+
 Native fixture cost limits and original resource-policy oracles remain in source;
 they are not executed or relabelled as PASS while the driver is deferred.
 Hosted instruction measurement remains disabled and unmeasured on all three

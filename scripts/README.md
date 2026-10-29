@@ -27,9 +27,14 @@ not required before landing.
 Changes under `blorp_2/` are validated with `make -C blorp_2 test`;
 `scripts/compiler-check` selects nothing for that tree.
 
-CI's independent Blorp 2 job runs Linux x64 with Clang and GCC, Linux ARM64
-with Clang, and macOS ARM64 with Clang. Each checks out source and runs
-`make -C blorp_2 test` with the pinned B2 seed and selected C compiler.
+The Blorp 2 workflow (`.github/workflows/blorp2.yml`) runs when `blorp_2/`
+or its bootstrap and fixpoint scripts change. It runs Linux x64 with Clang
+and GCC, Linux ARM64 with Clang, and macOS ARM64 with Clang. Each checks out
+source and runs `make -C blorp_2 test` with the pinned B2 seed and selected C
+compiler. On a push to main that passes, it publishes that commit's seed (see
+[`docs/RELEASES.md`](../docs/RELEASES.md#blorp-2-bootstrap-seeds)). The legacy
+CI workflow runs only when `blorp/`, `examples/`, `pkg/`, `scripts/` or
+`standard_library/` change.
 No legacy build, artifact or FRESH-host check is involved. The Makefile's
 explicit `TARGET_COMPONENT_SOURCES` selection runs through ordinary target
 TestSuite entries, C11 `-O0` linking and strict native memory checks.
