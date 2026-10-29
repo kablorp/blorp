@@ -1,0 +1,108 @@
+import:
+    ../../../src/lex/lex: lex
+    ../../../src/parse/parse: ImportSelection(NamedSelection, MethodsSelection), ParsedModule, module_imports, module_names, parse_module
+    ../../../src/utils/names: name_spelling, program_names
+    ../../../src/utils/source: module_source, root_module_id, same_source
+    ../../../src/utils/syntax: Diagnostic
+    option: is_none
+    bool: and
+    string: String methods
+    int: Int methods
+    test: TestSuite
+
+
+private pure func parsed(source: String) -> Result[ParsedModule, Diagnostic]:
+    match lex(module_source(root_module_id()), source, program_names().names):
+        Err(error): Err(error)
+        Ok(tokens): parse_module(tokens, root_module_id())
+
+
+private pure func rejects(source: String, start: Int, end: Int, message: String, help: String) -> Bool:
+    match parsed(source):
+        Ok(_): False
+        Err(error):
+            and(
+                and(same_source(error.span.source, module_source(root_module_id())), and(error.span.start == start, error.span.end == end)),
+                and(and(error.message == message, error.help == help), error.note.is_none()),
+            )
+
+
+-- `Qux methods` selects Qux's receiver functions; its modifier span covers
+-- `methods`. A bare `methods` stays an ordinary selected name.
+private pure func selects_methods(source: String, modifier_start: Int, modifier_end: Int) -> Bool:
+    match parsed(source):
+        Err(_): False
+        Ok(module):
+            names = module_names(module)
+            match module_imports(module):
+                [request]:
+                    match request.symbols:
+                        [MethodsSelection(type_name, modifier), NamedSelection(contextual)]:
+                            and(
+                                and(name_spelling(names, type_name.id) == Some("Qux"), name_spelling(names, contextual.id) == Some("methods")),
+                                and(modifier.start == modifier_start, modifier.end == modifier_end),
+                            )
+                        _: False
+                _: False
+
+
+pure func test_methods_selects_receiver_functions() -> Bool:
+    selects_methods("import:\n    ./ops: Qux methods, methods\n", 23, 30)
+
+
+-- The pinned seed compiles the compiler source, which still writes the retired
+-- spelling; the parser reads it the same way until that seed reads `methods`.
+pure func test_retired_methods_only_spelling_is_read_as_methods() -> Bool:
+    match parsed("import:\n    ./ops: Qux methods_only\n"):
+        Err(_): False
+        Ok(module):
+            match module_imports(module):
+                [request]:
+                    match request.symbols:
+                        [MethodsSelection(_, modifier)]: and(modifier.start == 23, modifier.end == 35)
+                        _: False
+                _: False
+
+
+pure func test_constructor_selection_cannot_combine_with_methods() -> Bool:
+    rejects("import:\n    ops: Foo(First) methods\n", 28, 35,
+        "constructor selection cannot be combined with methods",
+        "write Foo(First) to import the type and constructors, or Foo methods to import only methods")
+
+
+pure func test_methods_cannot_repeat() -> Bool:
+    rejects("import:\n    ops: Foo methods methods\n", 29, 36,
+        "methods must appear once after a type name",
+        "write ops: Foo methods without constructors or another modifier")
+
+
+-- Until the retired spelling is deleted, either spelling counts as the
+-- modifier, so mixing them is still a repeat or a combination.
+pure func test_mixed_spellings_are_one_modifier() -> Bool:
+    and(
+        rejects("import:\n    ops: Foo methods methods_only\n", 29, 41,
+            "methods must appear once after a type name",
+            "write ops: Foo methods without constructors or another modifier"),
+        rejects("import:\n    ops: Foo(First) methods_only\n", 28, 40,
+            "constructor selection cannot be combined with methods",
+            "write Foo(First) to import the type and constructors, or Foo methods to import only methods"),
+    )
+
+
+pure func test_methods_cannot_precede_constructor_selection() -> Bool:
+    rejects("import:\n    ops: Foo methods(First)\n", 28, 29,
+        "methods cannot include constructor selection",
+        "write Foo(First) to import the type and constructors, or Foo methods to import only methods")
+
+
+tests: TestSuite = {
+    description = "Blorp 2 methods import selections",
+    tests = [
+        ("methods selects receiver functions", test_methods_selects_receiver_functions),
+        ("retired methods_only spelling is read as methods", test_retired_methods_only_spelling_is_read_as_methods),
+        ("constructor selection cannot combine with methods", test_constructor_selection_cannot_combine_with_methods),
+        ("methods cannot repeat", test_methods_cannot_repeat),
+        ("methods cannot precede a constructor selection", test_methods_cannot_precede_constructor_selection),
+        ("mixed spellings are one modifier", test_mixed_spellings_are_one_modifier),
+    ]
+}

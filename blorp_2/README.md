@@ -145,7 +145,7 @@ records; the import does not fix `Self` to Int. UFCS and module-qualified calls
 use the same family. Trait declarations also introduce their families, while
 implementation bodies are never independent free-function offers. Multiple
 routes to one family coalesce; different families or a free function with the
-same name need an alias or renamed declaration. A type's `methods_only` route
+same name need an alias or renamed declaration. A type's `methods` route
 requires the provider to own a written implementation for that receiver head.
 
 Function type parameters declare their required traits with `:` and combine
@@ -258,7 +258,7 @@ imports. Automatic capability does not publish operation names: importing an
 automatically supported type, including Bool through the prelude, does not
 implicitly import `equals`
 or its defaults. A written implementation may offer the family through the
-ordinary type/methods_only route. An unrelated trait spelled `Equatable` does
+ordinary type/methods route. An unrelated trait spelled `Equatable` does
 not enable automatic equality.
 
 ```blorp
@@ -1614,7 +1614,7 @@ Lexical and layout rules:
   `foreign`, `from`, `implements`, `resource`, `select`, `trait`, `try`,
   `where` and lone `_`. Writing one
   where a name is declared reports "`word` is a reserved keyword and cannot be
-  used as a name". `fixed`, `methods_only` and `tail_recursive` are names in
+  used as a name". `fixed`, `methods` and `tail_recursive` are names in
   the host too and remain valid names here. The optional `pure` qualifier precedes `func`
   with spaces between the two keywords. Function, parameter and type names are
   identifiers whose meaning is checked after parsing.
@@ -2024,7 +2024,7 @@ One Import Per Module), so an alias and selections of one module share a
 row. A bare selector selects a local function or a type the module declares;
 if both exist, the selection is ambiguous. `Option(Some, None)` selects a union and those
 constructors, while `Option()` selects the union without constructors. Both
-forms also enable local receiver functions. `Foo methods_only` adds receiver
+forms also enable local receiver functions. `Foo methods` adds receiver
 functions and requires the exact type independently visible in the caller.
 Imports precede declarations. Bare paths select target-library modules when
 the required explicit library root is supplied. Record type imports are
@@ -2940,7 +2940,7 @@ input or host-library fallback.
 ```blorp
 import:
     ./foo: Foo
-    ./foo_ops: Foo methods_only
+    ./foo_ops: Foo methods
     int: add
 
 func main() -> Int:
@@ -2948,7 +2948,7 @@ func main() -> Int:
 ```
 
 `module: Type` imports a type the module declares and enables its locally
-declared receiver functions through UFCS. `Type methods_only` enables those
+declared receiver functions through UFCS. `Type methods` enables those
 functions for a type the module declares or only imports, when the exact type
 is independently visible; it imports no type or constructors. Named function
 imports enable both direct and receiver calls. Imported and implicit types and

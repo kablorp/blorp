@@ -246,7 +246,7 @@ its report. Later milestones build on these and do not reopen them.
 - **Library cost.** Each generic library wrapper costs every compile about 340
   allocations (lexing 146, parsing 104, checking 90). Checking only referenced
   library declarations was measured and rejected, because loading must stay
-  complete for the prelude's `methods_only` imports; see the
+  complete for the prelude's `methods` imports; see the
   [referenced library check report](https://github.com/kablorp/blorp/blob/1e07c4dce85e51cd7ad911142e9bc96a5e0d91c7/benchmarks/results/blorp_2_referenced_library_check_2026-10-15.md).
 - **Not claimed.** No whole-compiler linearity. The pilot cannot self-compile.
 

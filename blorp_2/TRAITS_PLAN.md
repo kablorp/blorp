@@ -343,7 +343,7 @@ function and family sharing one spelling, retain explicit conflict/qualification
 rules. Keep module aliases; do not add arbitrary overload sets.
 
 Keep one namespace build. Within its existing dependency-order walk, enter a
-module's received prelude, imports/aliases, methods_only selections and ordinary
+module's received prelude, imports/aliases, methods selections and ordinary
 declarations in that existing order; trait headers and their method families
 join the declared entries. Then resolve own impl trait references in that same
 scope, publish their method families, and freeze one ModuleScope. This preserves
@@ -354,7 +354,7 @@ validates members, receiver types and ownership; this introduces no dependency
 from Namespace to Check. Coalescing an imported and declared family must retain
 the declared offer authority.
 
-For Type methods_only, the provider must have an accepted authored implementation
+For Type methods, the provider must have an accepted authored implementation
 for that receiver head. Its genuine written module is the method provider; an
 automatic structural implementation supplies capability without publishing names. Expose its family across Self after admission; merely
 importing Int into a provider must not expose an unrelated Foo implementation.
@@ -372,7 +372,7 @@ fixed union Mode:
 pure func same_mode(left: Mode, right: Mode) -> Bool:
     equals(left, right) -- Canonical family, derived Mode implementation.
 
--- int-as-alias qualified calls and methods_only exposure follow the same rule.
+-- int-as-alias qualified calls and methods exposure follow the same rule.
 -- An old free equals(Int, Int) remains Int-only until its declaration migrates.
 ```
 
@@ -684,7 +684,7 @@ semantics are attached to any other method spelling.
 | Inference | Typed sibling/literal in both orders; nested generic result; two same-shaped nominal records never guessed; no-context literal remains ambiguous; missing names and incompatible arguments retain specified first-error spans; once-only source-order effects |
 | Trait identity | Canonical versus unrelated same-spelled trait; malformed canonical header with extra abstract method rejects; Self scoped by identity; duplicate methods; trait used as value type rejects; unsupported syntax has exact help |
 | Contracts | Missing/extra/duplicate members; Self substitution; changed parameter names accepted; wrong arity/result/parameter/purity rejects; bodies checked even when unreachable |
-| Coherence/imports | Own trait/type and foundation-library allowance; user orphan rejection; bound-varying duplicate heads reject; same family import routes coalesce; different families/free-function clashes; qualified/methods_only/no-reexport behavior |
+| Coherence/imports | Own trait/type and foundation-library allowance; user orphan rejection; bound-varying duplicate heads reject; same family import routes coalesce; different families/free-function clashes; qualified/methods/no-reexport behavior |
 | Bounds | Concrete and generic calls; nested requirements and forwarding; distinct rigid A/B never unified; no-bound generic fails even with only Int callers; failing authored-family bounds never fall back |
 | Callable paths | Expected callable chooses Self; bare equals ambiguous; named callback, returned/stored reference and generic forwarding preserve method choice; pure/impure permissions and interleaved effects remain ordinary |
 | Derived data | Empty/nonempty/fixed/managed/generic records/unions; all union cases count for eligibility; logical Void fields; phantom callable argument succeeds but actual callable field fails; nested custom semantics; Float NaN |
