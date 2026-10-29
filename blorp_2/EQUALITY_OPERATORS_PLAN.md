@@ -23,8 +23,8 @@ declare symbols, change operator mappings, register operators, or change
 precedence. Arithmetic, ordering, compound assignment, logical-operator
 implementation, coercions and comparison chains are outside this increment.
 Legacy compiler production sources remain untouched; legacy serves only as
-the temporary TestSuite host. Do not migrate compiler/library comparisons
-before an operator-capable bootstrap has been published and pinned.
+the temporary TestSuite host. Compiler/library comparisons migrated once an
+operator-capable bootstrap was published and pinned.
 
 ## Current boundaries and reproduction
 

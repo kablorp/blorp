@@ -9,16 +9,17 @@ Supporting a feature in the existing compiler does not put it in scope here.
 
 The pinned Blorp 2 seed builds the current compiler. All active Blorp 2 tests
 are self-hosted. Unported suites remain in source and are explicitly deferred;
-never run them through the legacy compiler. Compiler source stays
-within the eventual bootstrap subset in the README: no
-concurrency, parallelism, tensors or dimension types, debug blocks,
-numeric widths other than Int64 and Float64, doctests, channels or FFI.
-Tuples and static traits are supported by the current seed; their use in compiler
-implementation remains bounded by each reviewed task. Production library trait
-activation does not authorize a general compiler-source comparison rewrite.
-Use concrete functions such as `add` and `concat`, and pattern matching,
-not trait-dispatched operators such as `==`. Dependencies on the old host library or TestSuite API mark deferred tests;
-port bounded suites incrementally without expanding the input language.
+never run them through the legacy compiler. Compiler source stays within the
+eventual bootstrap subset in the README: no concurrency, parallelism, tensors
+or dimension types, debug blocks, numeric widths other than Int64 and Float64,
+doctests, channels or FFI. Tuples and static traits are supported by the
+current seed; their use in compiler implementation remains bounded by each
+reviewed task. Compiler source writes equality with `==` and `!=`; other
+operations use concrete functions such as `add` and `concat`, and pattern
+matching. Checking does not yet accept the `and`/`or`/`not` keywords, so
+Boolean logic calls the `bool` library module. Dependencies on the old host
+library or TestSuite API mark deferred tests; port bounded suites
+incrementally without expanding the input language.
 
 Each increment starts from a small executable fixture and its expected
 behavior, including rejections. Define only the grammar and rules that

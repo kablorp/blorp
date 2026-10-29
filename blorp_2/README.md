@@ -246,8 +246,8 @@ there, while `!=` reports the absent `not_equals`. If present, canonical
 implementation can override that default; `!=` is never rewritten to a negation
 that bypasses the override.
 
-Compiler and library implementation sources retain their current call syntax
-until an operator-capable bootstrap is published and pinned.
+Compiler and library implementation sources write equality with `==` and
+`!=`; the pinned bootstrap supports both.
 
 ## Automatic equality for named aggregates
 
@@ -3121,11 +3121,13 @@ source inventory explicitly to the pure pipeline and diagnostic renderer. Compil
 consult the filesystem, environment, clock or shared mutable caches. Any reports
 or measurements produced by a phase are returned as data for the shell to present.
 
-Compiler source calls concrete arithmetic, comparison and concatenation functions;
-it does not use trait-dispatched operators. Concrete input traits do not expand
-that compiler-source subset. The production library supplies ordinary Equatable
-implementations; input programs may call their methods or use the fixed equality
-operators. Compiler-source operator migration awaits a capable bootstrap pin.
+Compiler source writes equality with the fixed `==` and `!=` operators, which
+call the canonical Equatable methods. Other operations use concrete arithmetic,
+ordering and concatenation functions. Checking does not yet accept the
+`and`/`or`/`not` keywords, so Boolean logic calls the `bool` library module.
+Concrete input traits do not expand that compiler-source subset. The production
+library supplies ordinary Equatable implementations; input programs may call
+their methods or use the fixed equality operators.
 The legacy host library's trait implementations do not expand the compiler-source
 subset.
 Exact String equality uses the ordinary `string.equals` API in both libraries;
