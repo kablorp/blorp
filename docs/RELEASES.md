@@ -224,12 +224,15 @@ verified and pinned. The seed tag identifies the final approved source commit, r
 The reviewed workflow and release documentation changes accompany compiler
 support before integer-append library activation. Compiler C is locked
 to SHA-256
-`cdd5e9e7405e4fd9f14a4a128d2229d843073a1ce88d79b6cb87111f9666e6e6`, checked
+`2975e872a5f2bb0804ba6b6b5713003b03101b04c8abd8a52e203ebdcad08ec4`, the
+join- and loop-entry-transfer producer, checked
 immediately after A emits C and before B qualification. Each provenance archive
 retains `reviewed-compiler-c.sha256`; the publisher checks the emitted C against
 that digest and requires all platforms to agree. The earlier stored-callable/tuple
 bridge recorded source `9c12cc79e3b7b919af93debde139595b4288e42e` and compiler C
-`46c041be4c5be389cd5e6b6d288f5abd8e673ca78b003914849232ac456ee4e3`.
+`46c041be4c5be389cd5e6b6d288f5abd8e673ca78b003914849232ac456ee4e3`; the
+List-update-reuse seed recorded source `90f6842485219165d5d2b47937ce3d54103a9005`
+and compiler C `cdd5e9e7405e4fd9f14a4a128d2229d843073a1ce88d79b6cb87111f9666e6e6`.
 Native fixture cost limits and original resource-policy oracles remain in source;
 they are not executed or relabelled as PASS while the driver is deferred.
 Hosted instruction measurement remains disabled and unmeasured on all three
