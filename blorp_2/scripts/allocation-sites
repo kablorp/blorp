@@ -1,0 +1,166 @@
+#!/usr/bin/env python3
+"""Attribute a Blorp 2 allocation-site report to the code that allocates.
+
+The report comes from a program built with -DBLORP_MEMORY_DIAGNOSTICS=1 and run
+with BLORP_ALLOCATION_SITES=REPORT (see blorp_2/README.md). Each line is
+`count bytes resizes resized_bytes frame...`, frames innermost first, as offsets
+from the executable's load base. This script symbolizes them with atos (macOS)
+or addr2line (Linux), names each allocation by the first compiled function
+`blorp_f_N` on its stack, and prints the busiest sites. Python 3 standard
+library only.
+"""
+
+import argparse
+import re
+import shutil
+import subprocess
+import sys
+from collections import Counter
+
+# Entry points of the allocator itself. A compiled function that calls one of
+# these allocates directly; any other callee of the site is a runtime helper
+# (string, list, record, process, ...), named as the site's helper.
+ALLOCATOR_PREFIX = "blorp_memory_"
+# Emitted Blorp functions; atos may append a clang local suffix after a dot.
+COMPILED_FUNCTION = re.compile(r"^(blorp_f_\d+)(?:\.|$)")
+# atos treats a load address of 0 as "addresses are absolute"; any other value
+# makes it subtract the load address, so offsets are rebased onto this one.
+ATOS_LOAD_ADDRESS = 0x100000000
+# Addresses per symbolizer process, to stay under the argument length limit.
+SYMBOLIZER_BATCH = 2000
+NO_COMPILED_CALLER = "(no compiled caller)"
+DIRECT_ALLOCATION = "(direct)"
+
+
+def fail(message):
+    sys.exit("error: allocation-sites: " + message)
+
+
+def read_report(path):
+    sites = []
+    try:
+        with open(path) as report:
+            for number, line in enumerate(report, 1):
+                fields = line.split()
+                try:
+                    if len(fields) < 4:
+                        raise ValueError("fewer than 4 fields")
+                    count, size, resizes, resized = (int(field) for field in fields[:4])
+                    frames = [int(field, 16) for field in fields[4:]]
+                except ValueError as problem:
+                    fail("%s:%d: malformed report line (%s)" % (path, number, problem))
+                sites.append((count, size, resizes, resized, frames))
+    except OSError as problem:
+        fail("cannot read report: %s" % problem)
+    return sites
+
+
+def symbolizer_command(binary, addresses):
+    # Return addresses point after the call; step back one byte to land in it.
+    if shutil.which("atos"):
+        return ["atos", "-o", binary, "-l", hex(ATOS_LOAD_ADDRESS)] + [
+            hex(ATOS_LOAD_ADDRESS + address - 1) for address in addresses
+        ], 1
+    if shutil.which("addr2line"):
+        return ["addr2line", "-f", "-e", binary] + [hex(address - 1) for address in addresses], 2
+    fail("needs atos (macOS) or addr2line (Linux binutils) on PATH")
+
+
+def function_name(lines):
+    first = lines[0].strip()
+    # atos prints `name (in binary) (file:line)`, or the bare address when unknown.
+    name = first.split(" (in ", 1)[0]
+    return "?" if name.startswith("0x") or name.startswith("??") else name
+
+
+def symbolize(binary, addresses):
+    names = {}
+    ordered = sorted(addresses)
+    for start in range(0, len(ordered), SYMBOLIZER_BATCH):
+        batch = ordered[start:start + SYMBOLIZER_BATCH]
+        command, lines_per_address = symbolizer_command(binary, batch)
+        tool = command[0]
+        try:
+            run = subprocess.run(command, capture_output=True, text=True)
+        except OSError as problem:
+            fail("cannot run %s: %s" % (tool, problem))
+        if run.returncode != 0:
+            fail("%s failed with status %d: %s" % (tool, run.returncode, run.stderr.strip()))
+        output = run.stdout.splitlines()
+        # One answer per address; extra lines (for example inlined frames) would shift every later name.
+        if len(output) != len(batch) * lines_per_address:
+            fail("%s printed %d lines for %d addresses, expected %d"
+                 % (tool, len(output), len(batch), len(batch) * lines_per_address))
+        for index, address in enumerate(batch):
+            names[address] = function_name(output[index * lines_per_address:(index + 1) * lines_per_address])
+    return names
+
+
+def read_function_comments(path):
+    """Map blorp_f_N to the `/* module.function */` comment before its definition."""
+    with open(path) as source:
+        text = source.read()
+    # The return type may be a pointer, so `*` may sit between the comment and the name.
+    comment_then_definition = re.compile(r"/\*\s*([^*]+?)\s*\*/[^;{}()/]*?\bblorp_f_(\d+)\s*\(")
+    return {"blorp_f_" + number: label for label, number in comment_then_definition.findall(text)}
+
+
+def classify(frames, names):
+    """Return (site function, helper) for one stack, frames innermost first.
+
+    The site is the first emitted blorp_f_N frame. The helper is the frame it
+    called, or DIRECT_ALLOCATION when that frame is the allocator itself.
+    """
+    for index, frame in enumerate(frames):
+        compiled = COMPILED_FUNCTION.match(names[frame])
+        if compiled:
+            callee = names[frames[index - 1]] if index > 0 else None
+            direct = callee is None or callee.startswith(ALLOCATOR_PREFIX)
+            return compiled.group(1), DIRECT_ALLOCATION if direct else callee
+    return NO_COMPILED_CALLER, DIRECT_ALLOCATION
+
+
+def print_table(title, totals, labels, limit, total_count):
+    print(title)
+    print("%12s %6s %14s %10s  %s" % ("allocs", "%", "bytes", "resizes", "site"))
+    ranked = sorted(totals.items(), key=lambda item: (-item[1][0], item[0]))
+    for key, (count, size, resizes) in ranked[:limit]:
+        print("%12d %5.1f%% %14d %10d  %s" % (count, 100.0 * count / max(total_count, 1), size, resizes, labels(key)))
+    print()
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Symbolize and aggregate a BLORP_ALLOCATION_SITES report.")
+    parser.add_argument("report")
+    parser.add_argument("binary", help="the executable that wrote the report (built with -g for best names)")
+    parser.add_argument("generated_c", nargs="?", help="its generated C, to name sites by module.function")
+    parser.add_argument("--top", type=int, default=15, help="rows per table (default 15)")
+    arguments = parser.parse_args()
+
+    sites = read_report(arguments.report)
+    names = symbolize(arguments.binary, {frame for site in sites for frame in site[4]})
+    try:
+        comments = read_function_comments(arguments.generated_c) if arguments.generated_c else {}
+    except OSError as problem:
+        fail("cannot read generated C: %s" % problem)
+    by_site, by_helper = {}, {}
+    totals = Counter()
+    for count, size, resizes, _resized, frames in sites:
+        site, helper = classify(frames, names)
+        for table, key in ((by_site, site), (by_helper, (site, helper))):
+            current = table.get(key, (0, 0, 0))
+            table[key] = (current[0] + count, current[1] + size, current[2] + resizes)
+        totals.update(allocations=count, bytes=size, resizes=resizes)
+    print("total: %d allocations, %d bytes requested, %d resizes, %d distinct stacks\n"
+          % (totals["allocations"], totals["bytes"], totals["resizes"], len(sites)))
+
+    def label(site):
+        return "%s (%s)" % (comments[site], site) if site in comments else site
+
+    print_table("By site", by_site, label, arguments.top, totals["allocations"])
+    print_table("By site and immediate helper", by_helper,
+                lambda key: "%s <- %s" % (label(key[0]), key[1]), arguments.top, totals["allocations"])
+
+
+if __name__ == "__main__":
+    main()

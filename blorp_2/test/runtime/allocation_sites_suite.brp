@@ -1,0 +1,209 @@
+import:
+    ../../src/runtime/memory: MEMORY_RUNTIME
+    process: run_to_files
+    system: read_file, write_file
+    io: print_error
+    test: TestSuite
+    int: Int methods
+    string: String methods
+    bool: and, or
+    result: Result methods
+
+
+fixed record ProbeRun { status: Int, stdout: String, stderr: String }
+
+
+private ENVIRONMENT_TOOL: String = "/usr/bin/env"
+private SYMBOLIZER: String = "blorp_2/scripts/allocation-sites"
+private COMPILE_TIMEOUT_MS: Int = 600000
+private CHILD_TIMEOUT_MS: Int = 30000
+
+-- The probe allocates 3 times in blorp_f_10 and 5 times in blorp_f_20 (through a
+-- runtime-helper stand-in), then resizes one block once.
+private STRICT_TOTAL: String = "blorp: leak check: 8 allocs, 8 releases, 0 leaked, 0 bytes\n"
+private TOTAL_LINE: String = "total: 8 allocations, 104 bytes requested, 1 resizes, 3 distinct stacks\n"
+private BAD_DIRECTORY_REPORT: String = "/blorp-allocation-sites-missing-directory/report.txt"
+private SYMBOLIZER_ERROR: String = "error: allocation-sites: "
+-- Any line after the first four count fields must be hexadecimal frames; this one is short.
+private MALFORMED_REPORT: String = "1 2 3\n"
+-- One well-formed stack, so the script reaches the symbolizer.
+private ONE_STACK_REPORT: String = "1 8 0 0 0x10\n"
+private BAD_PATH_MESSAGE: String =
+    |error: cannot write BLORP_ALLOCATION_SITES path '/blorp-allocation-sites-missing-directory/report.txt'
+    |help: pass a path in an existing writable directory
+    |
+
+
+private func quiet_run(program: String, arguments: List[String], prefix: String, timeout: Int) -> Result[Int, String]:
+    run_to_files(program, arguments, prefix.add(".out"), prefix.add(".err"), timeout)
+
+
+-- Builds the probe with frame pointers and debug info so the symbolizer can name frames.
+private func ready(c_compiler: String, directory: String) -> Result[String, String]:
+    _ ?= write_file(directory.add("/memory_runtime.c"), MEMORY_RUNTIME)
+    executable = directory.add("/allocation_sites_probe")
+    prefix = directory.add("/allocation-sites-build")
+    status ?= quiet_run(c_compiler, ["-std=c11", "-O0", "-Wall", "-Wextra", "-Werror", "-pedantic", "-fno-omit-frame-pointer", "-g", "-fsanitize=address,undefined", "-fno-sanitize-recover=all", "-DBLORP_MEMORY_DIAGNOSTICS=1", "-I", directory, "blorp_2/test/runtime/fixtures/allocation_sites_test.c", "-o", executable], prefix, COMPILE_TIMEOUT_MS)
+    err ?= read_file(prefix.add(".err"))
+    if status.equals(0).and(err.equals("")):
+        Ok(executable)
+    else:
+        Err("allocation sites native build: ".add(err))
+
+
+-- Runs the probe with strict accounting and, when `report` is given, the site report.
+private func run_probe(executable: String, directory: String, name: String, report: Option[String], mode: List[String]) -> Result[ProbeRun, String]:
+    prefix = directory.add("/allocation-sites-").add(name)
+    arguments = match report:
+        Some(path): ["-u", "BLORP_MEMORY_STATS", "BLORP_LEAK_CHECK=strict", "BLORP_ALLOCATION_SITES=".add(path), executable].concat(mode)
+        None: ["-u", "BLORP_MEMORY_STATS", "-u", "BLORP_ALLOCATION_SITES", "BLORP_LEAK_CHECK=strict", executable].concat(mode)
+    status ?= quiet_run(ENVIRONMENT_TOOL, arguments, prefix, CHILD_TIMEOUT_MS)
+    out ?= read_file(prefix.add(".out"))
+    err ?= read_file(prefix.add(".err"))
+    Ok({ status = status, stdout = out, stderr = err })
+
+
+private func expect(label: String, actual: String, expected: String) -> Result[Void, String]:
+    if actual.equals(expected):
+        Ok(void)
+    else:
+        Err(label.add(": expected [").add(expected).add("] got [").add(actual).add("]"))
+
+
+private func reported(result: Result[Void, String]) -> Bool:
+    match result:
+        Ok(_): True
+        Err(error):
+            print_error(error)
+            False
+
+
+-- With the variable set, every allocation lands in the report: the script's
+-- total must equal the allocations the strict leak check counted.
+private func counts_match_strict_total(executable: String, directory: String) -> Result[Void, String]:
+    report = directory.add("/counts.txt")
+    result ?= run_probe(executable, directory, "counts", Some(report), [])
+    _ ?= expect("exit status", result.status.to_string(), "0")
+    _ ?= expect("stdout", result.stdout, "")
+    _ ?= expect("strict stderr", result.stderr, STRICT_TOTAL)
+    prefix = directory.add("/allocation-sites-counts-script")
+    status ?= quiet_run(SYMBOLIZER, [report, executable], prefix, COMPILE_TIMEOUT_MS)
+    _ ?= expect("symbolizer status", status.to_string(), "0")
+    out ?= read_file(prefix.add(".out"))
+    if out.starts_with(TOTAL_LINE):
+        Ok(void)
+    else:
+        Err("symbolized total: expected prefix [".add(TOTAL_LINE).add("] got [").add(out).add("]"))
+
+
+private func expected_tables(first: String, second: String) -> String:
+    TOTAL_LINE.add("\n")
+        .add("By site\n")
+        .add("      allocs      %          bytes    resizes  site\n")
+        .add("           5  62.5%             80          1  ").add(second).add("\n")
+        .add("           3  37.5%             24          0  ").add(first).add("\n\n")
+        .add("By site and immediate helper\n")
+        .add("      allocs      %          bytes    resizes  site\n")
+        .add("           5  62.5%             80          0  ").add(second).add(" <- allocate_through_helper\n")
+        .add("           3  37.5%             24          0  ").add(first).add(" <- (direct)\n")
+        .add("           0   0.0%              0          1  ").add(second).add(" <- (direct)\n\n")
+
+
+-- The symbolizer skips the helper frames, so blorp_f_10 and blorp_f_20 are charged
+-- exactly their own 3 and 5 allocations, with the C comment names when given the C.
+private func attribution(executable: String, directory: String, with_names: Bool) -> Result[Void, String]:
+    name = if with_names:
+        "named"
+    else:
+        "bare"
+    report = directory.add("/").add(name).add(".txt")
+    result ?= run_probe(executable, directory, name, Some(report), [])
+    _ ?= expect("exit status", result.status.to_string(), "0")
+    prefix = directory.add("/allocation-sites-").add(name).add("-script")
+    arguments = if with_names:
+        [report, executable, "blorp_2/test/runtime/fixtures/allocation_sites_test.c"]
+    else:
+        [report, executable]
+    status ?= quiet_run(SYMBOLIZER, arguments, prefix, COMPILE_TIMEOUT_MS)
+    _ ?= expect("symbolizer status", status.to_string(), "0")
+    out ?= read_file(prefix.add(".out"))
+    if with_names:
+        expect("named attribution", out, expected_tables("fixture.first (blorp_f_10)", "fixture.second (blorp_f_20)"))
+    else:
+        expect("bare attribution", out, expected_tables("blorp_f_10", "blorp_f_20"))
+
+
+-- An empty value must mean "unset": taken as a path, fopen("") would fail and exit 1.
+private func unset_or_empty_changes_nothing(executable: String, directory: String) -> Result[Void, String]:
+    unset ?= run_probe(executable, directory, "unset", None, [])
+    _ ?= expect("unset exit status", unset.status.to_string(), "0")
+    _ ?= expect("unset stderr", unset.stderr, STRICT_TOTAL)
+    empty ?= run_probe(executable, directory, "empty", Some(""), [])
+    _ ?= expect("empty exit status", empty.status.to_string(), "0")
+    expect("empty stderr", empty.stderr, STRICT_TOTAL)
+
+
+-- Nothing allocates, so no table exists when the report is written (UBSan rejects qsort on NULL).
+private func nothing_allocated_writes_empty_report(executable: String, directory: String) -> Result[Void, String]:
+    report = directory.add("/idle.txt")
+    result ?= run_probe(executable, directory, "idle", Some(report), ["idle"])
+    _ ?= expect("exit status", result.status.to_string(), "0")
+    _ ?= expect("stderr", result.stderr, "blorp: leak check: 0 allocs, 0 releases, 0 leaked, 0 bytes\n")
+    contents ?= read_file(report)
+    expect("report", contents, "")
+
+
+private func bad_path_fails(executable: String, directory: String) -> Result[Void, String]:
+    result ?= run_probe(executable, directory, "bad-path", Some(BAD_DIRECTORY_REPORT), [])
+    _ ?= expect("exit status", result.status.to_string(), "1")
+    _ ?= expect("stdout", result.stdout, "")
+    expect("stderr", result.stderr, BAD_PATH_MESSAGE)
+
+
+-- Writes `contents` as a report, runs the symbolizer on it, expects exit 1 and returns its stderr.
+private func symbolizer_failure(directory: String, name: String, contents: String, binary: String) -> Result[String, String]:
+    report = directory.add("/").add(name).add(".txt")
+    _ ?= write_file(report, contents)
+    prefix = directory.add("/allocation-sites-").add(name).add("-script")
+    status ?= quiet_run(SYMBOLIZER, [report, binary], prefix, CHILD_TIMEOUT_MS)
+    _ ?= expect(name.add(" exit status"), status.to_string(), "1")
+    read_file(prefix.add(".err"))
+
+
+private func malformed_report_line_fails(executable: String, directory: String) -> Result[Void, String]:
+    err ?= symbolizer_failure(directory, "malformed", MALFORMED_REPORT, executable)
+    expected = SYMBOLIZER_ERROR.add(directory).add("/malformed.txt:1: malformed report line (fewer than 4 fields)\n")
+    expect("malformed stderr", err, expected)
+
+
+-- The fixture source is not an executable, so atos or addr2line exits non-zero. The
+-- tool's own explanation follows and differs by platform, so only our prefix is exact.
+private func symbolizer_tool_failure_fails(directory: String) -> Result[Void, String]:
+    err ?= symbolizer_failure(directory, "unsymbolizable", ONE_STACK_REPORT, "blorp_2/test/runtime/fixtures/allocation_sites_test.c")
+    named_tool = err.starts_with(SYMBOLIZER_ERROR.add("atos failed with status "))
+        .or(err.starts_with(SYMBOLIZER_ERROR.add("addr2line failed with status ")))
+    if named_tool:
+        Ok(void)
+    else:
+        Err("symbolizer failure stderr: got [".add(err).add("]"))
+
+
+func suite(c_compiler: String, directory: String) -> TestSuite:
+    match ready(c_compiler, directory):
+        Err(error):
+            print_error(error)
+            { description = "Allocation site report setup", tests = [("native probe builds", func(): False)] }
+        Ok(executable):
+            {
+                description = "Allocation site report",
+                tests = [
+                    ("report counts sum to the strict allocation total", func(): reported(counts_match_strict_total(executable, directory))),
+                    ("sites are charged to the compiled callers, skipping helpers", func(): reported(attribution(executable, directory, True))),
+                    ("without the generated C sites keep their blorp_f_N names", func(): reported(attribution(executable, directory, False))),
+                    ("unset or empty variable leaves the run unchanged", func(): reported(unset_or_empty_changes_nothing(executable, directory))),
+                    ("a run that allocates nothing writes an empty report", func(): reported(nothing_allocated_writes_empty_report(executable, directory))),
+                    ("unwritable path exits non-zero with a clear message", func(): reported(bad_path_fails(executable, directory))),
+                    ("a malformed report line names the file and line", func(): reported(malformed_report_line_fails(executable, directory))),
+                    ("a failing symbolizer is named in one error line", func(): reported(symbolizer_tool_failure_fails(directory))),
+                ]
+            }

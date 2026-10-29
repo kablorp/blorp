@@ -835,6 +835,40 @@ The first limits were established on arm64 macOS with Apple Clang 21. See the
 [cost record](https://github.com/kablorp/blorp/blob/1e07c4dce85e51cd7ad911142e9bc96a5e0d91c7/benchmarks/results/blorp_2_costs_2026-10-08.md) for baselines,
 commands, provenance, and measurement limits.
 
+### Allocation sites
+
+A `-DBLORP_MEMORY_DIAGNOSTICS=1` build can say which code allocates. With
+`BLORP_ALLOCATION_SITES=REPORT` set, every `blorp_memory_allocate` and
+`blorp_memory_resize` records a 16-frame `backtrace()` in a table keyed by that
+stack, and `blorp_memory_finish` writes the table to `REPORT` whether or not
+`BLORP_LEAK_CHECK` is set. Each line is
+`count bytes resizes resized_bytes frame...`, most frequent first, with frames
+innermost first as offsets from the executable's load base (`resizes` and
+`resized_bytes` count `blorp_memory_resize` calls and the sizes they requested).
+An unset or empty variable costs one flag test per allocation; `=0` builds are
+unchanged. An unwritable path exits 1 at start, and a platform without
+`<execinfo.h>` and an image-base API (macOS and Linux/glibc are supported)
+rejects the variable with an error naming that gap.
+
+```sh
+clang -O0 -g -fno-omit-frame-pointer -DBLORP_MEMORY_DIAGNOSTICS=1 program.c -o program -lm -lpthread
+BLORP_ALLOCATION_SITES=sites.txt BLORP_LEAK_CHECK=strict ./program ...
+blorp_2/scripts/allocation-sites sites.txt program [program.c] [--top N]
+```
+
+Offsets cannot be symbolized in process because static functions are not in
+the dynamic symbol table, so `blorp_2/scripts/allocation-sites` (Python 3
+standard library, `atos` on macOS or `addr2line` on Linux) does it afterwards.
+It charges each stack to the first emitted `blorp_f_N` frame, skipping the
+runtime frames inside it, and prints the top sites by allocation count and by
+(site, immediate helper), the function the site called, or `(direct)` when that
+is the allocator itself. Given the generated
+C it shows the `/* module.function */` comment before each definition, when the
+emitter writes one. The stack walk costs time (the `-O0` self-compile took about
+1.6 times as long; `-O2` about 3 times), so use it for attribution, not timing;
+inlining merges helper frames into their caller, and macOS `backtrace()` follows
+frame pointers, so build with `-fno-omit-frame-pointer`.
+
 The purity increment passed all 71 tests, both normally and with
 UBSan/leak checking. It measured **330 allocations** and **19,204,477 retired
 instructions** for `pure_calls`;

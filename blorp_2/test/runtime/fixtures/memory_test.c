@@ -4,6 +4,8 @@
 #include <string.h>
 
 enum { MAX_BACKING_OCCURRENCES = 4 };
+/* Diagnostics start reads BLORP_LEAK_CHECK and BLORP_ALLOCATION_SITES; normal mode reads neither. */
+enum { ENVIRONMENT_VARIABLES_READ_AT_START = 2 };
 static uintptr_t allocated[MAX_BACKING_OCCURRENCES], released[MAX_BACKING_OCCURRENCES];
 static size_t allocation_count, release_count, resize_count, environment_queries;
 static int fail_allocation, fail_resize;
@@ -41,7 +43,7 @@ char *observed_getenv(const char *name) {
 
 int main(int argc, char **argv) {
     blorp_memory_start();
-    assert(argc == 2 && environment_queries == (size_t)BLORP_MEMORY_DIAGNOSTICS);
+    assert(argc == 2 && environment_queries == (size_t)BLORP_MEMORY_DIAGNOSTICS * ENVIRONMENT_VARIABLES_READ_AT_START);
     const char *name = argv[1];
     if (strcmp(name, "effects") == 0) {
         puts("effect");

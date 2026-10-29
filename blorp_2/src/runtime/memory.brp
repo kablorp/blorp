@@ -34,6 +34,93 @@ MEMORY_RUNTIME: String =
 		|while(atomic_flag_test_and_set_explicit(&blorp_memory_lock,memory_order_acquire)){}
 		|}
 		|static void blorp_memory_leave(void){atomic_flag_clear_explicit(&blorp_memory_lock,memory_order_release);}
+		|#if defined(__APPLE__)&&defined(__has_include)
+		|#if __has_include(<execinfo.h>)&&__has_include(<mach-o/dyld.h>)
+		|#include <execinfo.h>
+		|#include <mach-o/dyld.h>
+		|#define BLORP_ALLOCATION_SITES_SUPPORTED 1
+		|#endif
+		|#elif defined(__linux__)&&defined(__has_include)
+		|#if __has_include(<execinfo.h>)&&__has_include(<link.h>)&&__has_include(<sys/auxv.h>)
+		|#include <execinfo.h>
+		|#include <link.h>
+		|#include <sys/auxv.h>
+		|#define BLORP_ALLOCATION_SITES_SUPPORTED 1
+		|#endif
+		|#endif
+		|#ifndef BLORP_ALLOCATION_SITES_SUPPORTED
+		|#define BLORP_ALLOCATION_SITES_SUPPORTED 0
+		|#endif
+		|/* Frames kept per allocation: deep enough to pass the recorder, the allocator and two runtime helpers and still reach the compiled caller. */
+		|enum {BLORP_ALLOCATION_SITE_DEPTH=16};
+		|/* First table size, a power of two so the hash can mask; the table doubles when half full to keep probes short. */
+		|enum {BLORP_ALLOCATION_SITE_INITIAL_CAPACITY=1024};
+		|/* A slot is occupied once it has counted an allocation or a resize; frames are offsets from the executable image base. */
+		|struct blorp_allocation_site {uintptr_t frames[BLORP_ALLOCATION_SITE_DEPTH];size_t depth,count,bytes,resizes,resized_bytes;};
+		|static FILE *blorp_allocation_sites_output; /* non-NULL only when BLORP_ALLOCATION_SITES is set */
+		|static struct blorp_allocation_site *blorp_allocation_sites;
+		|static size_t blorp_allocation_site_capacity,blorp_allocation_site_occupied;
+		|static uintptr_t blorp_allocation_image_base;
+		|#if BLORP_ALLOCATION_SITES_SUPPORTED
+		|#ifdef __APPLE__
+		|/* Image 0 is the main executable; its Mach-O header is the load base; the symbolizer rebases offsets from it onto an atos load address. */
+		|static uintptr_t blorp_allocation_find_image_base(void){return (uintptr_t)_dyld_get_image_header(0);}
+		|#else
+		|/* The load bias is where the kernel mapped the program headers minus where the file says they live (PT_PHDR), 0 for a non-PIE executable;
+		|   `addr2line` expects exactly pc minus that bias. dl_iterate_phdr would say the same but needs _GNU_SOURCE ahead of every other include. */
+		|static uintptr_t blorp_allocation_find_image_base(void){
+		|const ElfW(Phdr) *headers=(const ElfW(Phdr) *)getauxval(AT_PHDR);
+		|const unsigned long count=getauxval(AT_PHNUM);
+		|for(unsigned long index=0;index<count;index++)
+		|if(headers[index].p_type==PT_PHDR)return (uintptr_t)headers-(uintptr_t)headers[index].p_vaddr;
+		|return 0;
+		|}
+		|#endif
+		|static size_t blorp_allocation_capture(uintptr_t *frames){
+		|void *addresses[BLORP_ALLOCATION_SITE_DEPTH];
+		|const int depth=backtrace(addresses,BLORP_ALLOCATION_SITE_DEPTH);
+		|for(int index=0;index<depth;index++)frames[index]=(uintptr_t)addresses[index]-blorp_allocation_image_base;
+		|return depth<0?0:(size_t)depth;
+		|}
+		|#else
+		|static uintptr_t blorp_allocation_find_image_base(void){return 0;}
+		|static size_t blorp_allocation_capture(uintptr_t *frames){(void)frames;return 0;}
+		|#endif
+		|static int blorp_allocation_site_is_occupied(const struct blorp_allocation_site *site){return site->count!=0||site->resizes!=0;}
+		|static struct blorp_allocation_site *blorp_allocation_site_find(struct blorp_allocation_site *table,size_t capacity,const struct blorp_allocation_site *key){
+		|uint64_t hash=UINT64_C(14695981039346656037);
+		|for(size_t index=0;index<BLORP_ALLOCATION_SITE_DEPTH;index++)hash=(hash^key->frames[index])*UINT64_C(1099511628211);
+		|hash=(hash^key->depth)*UINT64_C(1099511628211);
+		|hash^=hash>>32; /* the multiply leaves the best-mixed bits on top and the mask keeps the bottom */
+		|size_t slot=(size_t)hash&(capacity-1);
+		|while(blorp_allocation_site_is_occupied(&table[slot])){
+		|if(table[slot].depth==key->depth&&memcmp(table[slot].frames,key->frames,sizeof key->frames)==0)break;
+		|slot=(slot+1)&(capacity-1);
+		|}
+		|return &table[slot];
+		|}
+		|static void blorp_allocation_site_grow(void){
+		|const size_t capacity=blorp_allocation_site_capacity==0?BLORP_ALLOCATION_SITE_INITIAL_CAPACITY:blorp_allocation_site_capacity*2;
+		|struct blorp_allocation_site *table=calloc(capacity,sizeof *table);
+		|if(table==NULL)blorp_memory_fail("error: allocation site table out of memory\n");
+		|for(size_t slot=0;slot<blorp_allocation_site_capacity;slot++)
+		|if(blorp_allocation_site_is_occupied(&blorp_allocation_sites[slot]))*blorp_allocation_site_find(table,capacity,&blorp_allocation_sites[slot])=blorp_allocation_sites[slot];
+		|free(blorp_allocation_sites);
+		|blorp_allocation_sites=table;
+		|blorp_allocation_site_capacity=capacity;
+		|}
+		|/* Called after the allocator lock is released: the stack walk must not run inside it, and the table is its own critical section. */
+		|static void blorp_memory_record_site(size_t requested,int is_resize){
+		|struct blorp_allocation_site key={{0},0,0,0,0,0};
+		|key.depth=blorp_allocation_capture(key.frames);
+		|blorp_memory_enter();
+		|if((blorp_allocation_site_occupied+1)*2>blorp_allocation_site_capacity)blorp_allocation_site_grow();
+		|struct blorp_allocation_site *site=blorp_allocation_site_find(blorp_allocation_sites,blorp_allocation_site_capacity,&key);
+		|if(!blorp_allocation_site_is_occupied(site)){*site=key;blorp_allocation_site_occupied++;}
+		|if(is_resize){site->resizes=blorp_memory_add(site->resizes,1);site->resized_bytes=blorp_memory_add(site->resized_bytes,requested);}
+		|else{site->count=blorp_memory_add(site->count,1);site->bytes=blorp_memory_add(site->bytes,requested);}
+		|blorp_memory_leave();
+		|}
 		|void *blorp_memory_allocate(size_t requested){
 		|const size_t storage=blorp_memory_add(sizeof(union blorp_memory_header),requested);
 		|blorp_memory_enter();
@@ -46,6 +133,7 @@ MEMORY_RUNTIME: String =
 		|blorp_memory_counts=(struct blorp_memory_counts){allocations,blorp_memory_counts.releases,live,bytes};
 		|}
 		|blorp_memory_leave();
+		|if(header!=NULL&&blorp_allocation_sites_output!=NULL)blorp_memory_record_site(requested,0);
 		|return header==NULL?NULL:header+1;
 		|}
 		|void *blorp_memory_resize(void *allocation,size_t requested){
@@ -58,6 +146,7 @@ MEMORY_RUNTIME: String =
 		|union blorp_memory_header *grown=realloc(header,storage);
 		|if(grown!=NULL){grown->requested=requested;blorp_memory_counts.bytes=bytes;}
 		|blorp_memory_leave();
+		|if(grown!=NULL&&blorp_allocation_sites_output!=NULL)blorp_memory_record_site(requested,1);
 		|return grown==NULL?NULL:grown+1;
 		|}
 		|void blorp_memory_release(void *allocation){
@@ -72,19 +161,65 @@ MEMORY_RUNTIME: String =
 		|free(header);
 		|blorp_memory_leave();
 		|}
+		|static int blorp_allocation_site_order(const void *left_pointer,const void *right_pointer){
+		|const struct blorp_allocation_site *left=left_pointer,*right=right_pointer;
+		|if(left->count!=right->count)return left->count>right->count?-1:1;
+		|if(left->bytes!=right->bytes)return left->bytes>right->bytes?-1:1;
+		|return 0;
+		|}
+		|static void blorp_allocation_sites_start(void){
+		|const char *path=getenv("BLORP_ALLOCATION_SITES");
+		|if(path==NULL||path[0]=='\0')return;
+		|if(!BLORP_ALLOCATION_SITES_SUPPORTED){
+		|fputs("error: BLORP_ALLOCATION_SITES needs backtrace() and an image base, available on macOS and Linux with glibc\nhelp: unset BLORP_ALLOCATION_SITES on this platform\n",stderr);
+		|exit(1);
+		|}
+		|blorp_allocation_sites_output=fopen(path,"w");
+		|if(blorp_allocation_sites_output==NULL){
+		|fprintf(stderr,"error: cannot write BLORP_ALLOCATION_SITES path '%s'\nhelp: pass a path in an existing writable directory\n",path);
+		|exit(1);
+		|}
+		|blorp_allocation_image_base=blorp_allocation_find_image_base();
+		|}
+		|/* One line per stack, most frequent first: count bytes resizes resized_bytes, then innermost-first frame offsets. Returns the exit status to report. */
+		|static int blorp_allocation_sites_finish(int requested_exit_status){
+		|if(blorp_allocation_sites_output==NULL)return requested_exit_status;
+		|blorp_memory_enter();
+		|/* qsort requires a non-NULL base; the table exists only once something was recorded. */
+		|if(blorp_allocation_site_capacity!=0)qsort(blorp_allocation_sites,blorp_allocation_site_capacity,sizeof *blorp_allocation_sites,blorp_allocation_site_order);
+		|int written=1;
+		|for(size_t slot=0;slot<blorp_allocation_site_capacity;slot++){
+		|const struct blorp_allocation_site *site=&blorp_allocation_sites[slot];
+		|if(!blorp_allocation_site_is_occupied(site))continue;
+		|written=written&&fprintf(blorp_allocation_sites_output,"%zu %zu %zu %zu",site->count,site->bytes,site->resizes,site->resized_bytes)>0;
+		|for(size_t index=0;index<site->depth;index++)written=written&&fprintf(blorp_allocation_sites_output," 0x%llx",(unsigned long long)site->frames[index])>0;
+		|written=written&&fputc('\n',blorp_allocation_sites_output)!=EOF;
+		|}
+		|blorp_memory_leave();
+		|written=fclose(blorp_allocation_sites_output)==0&&written;
+		|blorp_allocation_sites_output=NULL;
+		|free(blorp_allocation_sites);
+		|blorp_allocation_sites=NULL;
+		|if(written||requested_exit_status!=0)return requested_exit_status;
+		|fputs("error: cannot write the BLORP_ALLOCATION_SITES report\n",stderr);
+		|return 1;
+		|}
 		|void blorp_memory_start(void){
 		|const char *mode=getenv("BLORP_LEAK_CHECK");
-		|if(mode==NULL||mode[0]=='\0'){blorp_memory_strict=0;return;}
+		|if(mode!=NULL&&mode[0]!='\0'){
 		|if(strcmp(mode,"strict")!=0){fputs("error: BLORP_LEAK_CHECK must be 'strict' or unset\n",stderr);exit(1);}
 		|blorp_memory_strict=1;
 		|}
+		|blorp_allocation_sites_start();
+		|}
 		|int blorp_memory_finish(int requested_exit_status){
-		|if(!blorp_memory_strict)return requested_exit_status;
+		|const int report_status=blorp_allocation_sites_finish(requested_exit_status);
+		|if(!blorp_memory_strict)return report_status;
 		|blorp_memory_enter();
 		|const struct blorp_memory_counts counts=blorp_memory_counts;
 		|blorp_memory_leave();
 		|fprintf(stderr,"blorp: leak check: %zu allocs, %zu releases, %zu leaked, %zu bytes\n",counts.allocations,counts.releases,counts.live,counts.bytes);
-		|return counts.allocations==counts.releases&&counts.live==0&&counts.bytes==0?requested_exit_status:BLORP_STRICT_LEAK_EXIT_STATUS;
+		|return counts.allocations==counts.releases&&counts.live==0&&counts.bytes==0?report_status:BLORP_STRICT_LEAK_EXIT_STATUS;
 		|}
 		|#else
 		|#define blorp_memory_allocate malloc
