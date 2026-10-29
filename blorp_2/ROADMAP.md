@@ -133,7 +133,7 @@ not a portable nesting threshold or a product-destruction proof.
 | [M1a](#m1a-surface-syntax-parity) | Layout and parsed source syntax | Pure lambda and callback syntax is implemented; current source-frontier evidence remains separate. |
 | [ML](#ml-list-construction) | `append`, `set`, `concat`, list literal | Done. Checked `set_index` is an ordinary target-library wrapper. |
 | [List buffer reuse](#list-buffer-reuse-roadmap) | Ownership-aware updates, four-slot first growth, doubling and simpler library loops | L1 append (`85c1eabc3`) and L2 set/concat (`90f684248`) landed. L2b.1 (loop entry) and L2b.2 (joins) landed; L2b seed `blorp2-seed-50d3922f3449` pinned. L3/L4 next. |
-| [Ownership contracts](#ownership-contracts-roadmap) | Owned/borrowed parameter contracts inferred from in-place runtime operations; record update binds before rebuilding; cell reuse | Planned and approved 2026-10-28. O0 measured; the O1 step-0 spike is next. Cell reuse awaits a decision on the O0 evidence. |
+| [Ownership contracts](#ownership-contracts-roadmap) | Owned/borrowed parameter contracts inferred from in-place runtime operations; record update binds before rebuilding; cell reuse | Planned and approved 2026-10-28. O0 measured; the O1 step-0 spike measured and its ceilings accepted 2026-10-29, so O1 proper is next. Cell reuse awaits a decision on the O0 evidence. |
 | [M1b](#m1b-names-and-the-foundation) | Namespace: private, aliases, qualified names, designated `Bool`/`Option`/`Result` | Parts A and B done; control-flow consumers follow in M2/M3. |
 | [M5](#m5-constants) | Literal scalar/String constants | Implemented. Source construction functions replace the need for record/opaque constants and initializer dependencies. |
 | [M2](#m2-the-join) | Restricted control positions, outer-variable joins, ordinary Boolean calls, `?=` and annotations | Joins, Result propagation, annotations, ordinary Boolean calls and restricted value/statement `if` implemented in integration; acceptance pending. General operand controls remain deferred. |
@@ -1470,12 +1470,14 @@ entry and `foreign` as borrowed, with no tail-call owning use, provided that
 stays simpler than the alternatives; approved the test-only labelling
 parameter; and approved reordering record-update projections. Cell reuse (O3)
 is decided after the O0 measurement. O0 and O1 wait for L2b.2 and its seed
-pin; O2 touches only lowering and may land at any time.
+pin; O2 touches only lowering and may land at any time. On 2026-10-29 Keith
+accepted the step-0 spike's ceilings, keeping inference over insertion's own
+decisions ([step-0 results](#step-0-results)).
 
 | Step | Scope | Status |
 | --- | --- | --- |
 | [O0](#o0-re-measure-after-l2b) | Re-run the self-compile copy attribution and count atomic RC operations | Measured ([results](#o0-results)) |
-| [O1](#o1-owned-parameter-contracts) | Per-parameter owned/borrowed contracts, inferred from in-place runtime operations | Approved; step-0 spike first |
+| [O1](#o1-owned-parameter-contracts) | Per-parameter owned/borrowed contracts, inferred from in-place runtime operations | Approved; step 0 measured ([results](#step-0-results)), ceilings set |
 | [O2](#o2-record-update-binds-before-it-rebuilds) | Project the base fields an update reads before its replacements run | Approved; may land before O1 |
 | [O3](#o3-cell-reuse-for-records-and-union-nodes) | Reuse tokens for unique record cells and boxed union nodes | Undecided; O0 found no allocation witness |
 
@@ -1659,7 +1661,7 @@ largest caller count; strongly connected components need nothing special.
 ```text
 user call, owned position j, argument backed by owner o:
 	o dies at this step, no BorrowedArgument of the call depends on o,
-	and no later owned position of the call also receives o   -> ConsumedArgument(v, o)
+	and no earlier owned position of the call received o      -> ConsumedArgument(v, o)
 	otherwise                                                -> AcquireOwner(fresh) before the call;
 	                                                            ConsumedArgument(v, fresh)
 builtin operand 0 where reuses_first_operand                 -> move if o may move, else BorrowedArgument
@@ -1835,13 +1837,70 @@ definitions (`runtime/list.brp:268`, `282`, `302`; the literal C at
 `runtime/string_concat.brp:54` and `70`) and emit use it. A new fixture calls
 all five operations consumingly, so a missing helper fails to link.
 
-**Step 0: a bounded spike, reviewed before the main work.** Implement the
-contract and inference on a scratch branch that never lands. Confirm by
-diffing generated C that emit needs only the shared contract. Count
-transfers that needed an acquisition because the call was not the last use,
-statically and at run time. Report `own`'s share of self-compile instructions,
-the inference's added instructions and allocations, the pinned-instance count,
-and seed and re-analysis counts. The spike sets the binding ceilings below.
+**Step 0: a bounded spike, reviewed before the main work (done).** The
+contract and inference were implemented on a scratch branch that never lands.
+Diffing generated C confirmed that emit needs only the shared contract. The
+spike counted transfers that needed an acquisition because the call was not
+the last use, statically and at run time, and reported `own`'s share of
+self-compile instructions, the inference's added instructions and
+allocations, the pinned-instance count, and seed and re-analysis counts. It
+set the binding ceilings below.
+
+#### Step-0 results
+
+Measured 2026-10-28/29 on a scratch branch from d9ad15e35 that never lands.
+Self-compiles use the frozen d9ad15e35 source as input, `-O2`, minimum of
+three runs, serial:
+
+| | Instructions | Allocations |
+| --- | ---: | ---: |
+| Base B | 29,746 M | 25.17 M |
+| Spike B, seeds narrowed to parameter-fed operands | 31,718 M (+6.6%) | 27.60 M (+9.7%) |
+| Spike C | 29,391 M (−1.19%) | 26.32 M (+4.6%) |
+
+- **Correctness.** `make -C blorp_2 test` and `scripts/blorp2-fixpoint --prove`
+  passed. All 595 e2e fixtures behaved identically under `AllBorrowed`,
+  `InferredLabels` and `AllOwnedExceptPinned`, and the verifier accepted
+  every labelling. The spike also reported, without a retained log, that
+  dropping the verifier's post-discharge recheck, or moving an owner before
+  its last use, makes the verifier reject the result.
+- **Benefit.** `helper_accumulators` became linear with constant
+  allocations (raw instructions, not net of the `none` mode's 11.5 M):
+  - `list_helper`: 3,341 M to 14 M instructions at 65,536.
+  - `set_helper`: 10,805 M to 13 M at 32,768.
+  - `string_helper` is linear but, net of `none` as in O0, about 4.8×
+    legacy at 65,536.
+- **Where the cost goes.** Base `own` is 1.82 B instructions.
+  - Contracts with no inference (`AllBorrowed`) add 0.20 B (+0.66% of B) and
+    0.30 M allocations.
+  - The worklist adds 1.69 B and 2.0 M allocations. About 61% is analysis
+    insertions that are later discarded, 34% the reach walk, and at most 5%
+    label bookkeeping.
+- **Counts.**
+  - 2,767 functions and 4,829 managed parameters.
+  - 265 owned labels in 233 functions; 2 pinned instances.
+  - 274 seeds and 633 analyses, of which 245 flip a label.
+  - 719 owned calls move and 181 acquire.
+  - At run time, self-compiling the instrumented spike source (2,853
+    functions, not the frozen input), owned calls make 2.66 M moves and
+    0.91 M acquisitions. The acquisitions cost about 1.8 M atomic
+    operations, 0.15% of the 1.24 B O0 counted.
+  - No owned label went unconsumed.
+- **Rejected redesign.** A separate summary walk with a label solver and a
+  single insertion was reviewed three ways and rejected.
+  - Its facts depend on callee labels at calls that pass one owner twice.
+  - It could not share insertion's owner tracking, so it would be the
+    second copy of the move rules this plan excludes.
+  - Its estimated cost, +1.8% to +4.0%, did not clearly beat the cap.
+- **Decision.** Keith accepted the ceilings below and kept inference over
+  insertion's own decisions. The +0.5% B target is unreachable, because the
+  contracts alone cost +0.66%.
+- **What O1 proper must change from the spike.** The spike misses the B
+  ceilings and C's allocation ceiling (+4.6% against +2%). O1 proper meets
+  them by discarding fewer analysis insertions and re-analysing fewer
+  callers. Labels become rows on `OwnedFunction`; the spike kept them in
+  each parameter's definition. When one owner fills two owned positions, the
+  first moves and later ones acquire.
 
 **Then O1 proper**, test-first (see Testing). Production `own(program)` keeps
 its signature and calls an internal `insert_ownership(program, labelling)`
@@ -1915,17 +1974,18 @@ its design.
 
 ### Risks and unknowns
 
-- **B cost.** The seed-built B pays the inference without its benefit.
-  Interpolation lowers to `StringConcat` chains
-  (`check/expressions.brp:1950`), so many string-building functions are
-  seeded and may run insertion twice. If B breaches its cap, narrow the seed to
-  operands whose value flows from a parameter through headers, joins or
-  projections; that still over-approximates, so it stays safe.
+- **B cost.** The seed-built B pays for the inference and gets none of its
+  benefit. The spike's B was +6.6% even with seeds narrowed to operands fed
+  by parameters, above the +4.5% ceiling, and its C allocated 4.6% more,
+  above +2%. O1 proper has to recover the gap from discarded analysis
+  insertions and needless caller re-analysis; if it cannot, stop and ask.
 - **Atomic cost of acquisitions.** A labelled parameter whose callers are
-  rarely at a last use costs two atomics per call for no gain. Step 0 counts
-  these; the wasteful-label test catches labels never consumed.
-- **Pins.** Step 0 counts pinned instances. A large count means callbacks
-  dominate and the callable restriction should be revisited sooner.
+  rarely at a last use costs two atomics per call for no gain. Step 0 found
+  181 acquiring call sites and no label never consumed; the wasteful-label
+  test keeps it that way.
+- **Pins.** Step 0 found 2 pinned instances, because specialization already
+  turns known callable arguments into direct calls. A large count would mean
+  callbacks dominate and the callable restriction should be revisited.
 - **Bootstrap.** The old seed compiles O1, so the inference itself uses local
   loops and never threads an accumulator through a helper.
 
@@ -1940,7 +2000,8 @@ Failing tests first:
 
 - **Own units:** roots; propagation through a chain, a strongly connected
   component, a header take and a join entry; pins; generic instances; the
-  provisional-differs case above.
+  provisional-differs case above; one owner filling two owned positions,
+  where the first moves and the later acquires.
 - **Verify negatives:** `f(x, x)` with both positions owned (double
   discharge); `f(xs, xs)` with position 0 owned and position 1 borrowed (the
   borrow is backed by the moved owner); the same with position 1 a raw-IR
@@ -2009,9 +2070,9 @@ done
 
 ### Acceptance criteria
 
-Provisional until step 0 sets them:
+Binding since step 0 (accepted 2026-10-29):
 
-- **Benchmark:** at most 2.3× normal instructions per doubling in every mode,
+- **Benchmark:** at most 2.1× normal instructions per doubling in every mode,
   and equal logical allocations across sizes for `list_helper` and
   `set_helper`.
 - **Legacy parity:** in every List and String mode of `helper_accumulators`
@@ -2020,19 +2081,19 @@ Provisional until step 0 sets them:
   and its growth per doubling is no worse. Report `compiler_ast`,
   `binary_trees` and `compiler_emit` against O0 without a ceiling; they
   belong to O3.
-- **Self-compile B** (built by the seed): instructions and allocations grow
-  by at most the step-0 inference cost plus 0.5%; hard cap +3%.
-- **Self-compile C** (built by B): no increase in allocations or minimum
-  instructions; identical behaviour on all e2e fixtures.
+- **Self-compile B** (built by the seed): at most +4.5% instructions and
+  +7% allocations.
+- **Self-compile C** (built by B): at least −1% instructions, at most +2%
+  allocations; identical behaviour on all e2e fixtures.
 - **Peak RSS:** investigate above +5%, ceiling +10%. **Emitted C bytes:**
-  investigate above +3%, ceiling +5%.
+  investigate above +1%, ceiling +3%.
 - **Compile-time scaling:** generated chains of 16-128 helpers, 8-64 owned
   parameters and strongly connected rings of 8-64 functions each compile
-  within 1.10× of base B, with no near-quadratic doubling; report worklist
+  within 1.06× of base B, with no near-quadratic doubling; report worklist
   analyses.
-- **Size:** about +370 to +580 production code lines (own +320-470, verify
-  +60-100, builtins +10), tests separate; step 0 sets the
-  binding ceiling. Legacy needs about 41,400 lines for comparable reach
+- **Size:** at most +520 production code lines, tests reported separately.
+  The spike used own +464 (about 20 of them counters), verify +40 and
+  builtins +4. Legacy needs about 41,400 lines for comparable reach
   (`perceus.brp`, `perceus/`, `ownership.brp`, `ownership_contracts.brp`,
   `reuse.brp`, `consume_specialize.brp` and `record_update.brp` in
   `blorp/src/compiler/stage_09_core/`), with special-case rewrites such as destination
@@ -2049,7 +2110,7 @@ the default builder gains the savings. Back out O1 by switching production to
 
 ### Handback
 
-Return the branch and commits, the step-0 report before any O1 work, evidence
+Return the branch and commits, evidence
 for each criterion, the two review verdicts and remaining borrowed-call
 opportunities. Stop and ask on a premise that proves wrong, a ceiling breach,
 an ABI change beyond these contracts, or a result that looks like a compiler
