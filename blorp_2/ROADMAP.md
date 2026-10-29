@@ -132,8 +132,8 @@ not a portable nesting threshold or a product-destruction proof.
 | [M0](#m0-foundation-closeout) | Re-cut, perf fixes, parser statement loop, fixpoint script, parity table | Landed. M3 owns the recorded managed-value call limits. |
 | [M1a](#m1a-surface-syntax-parity) | Layout and parsed source syntax | Pure lambda and callback syntax is implemented; current source-frontier evidence remains separate. |
 | [ML](#ml-list-construction) | `append`, `set`, `concat`, list literal | Done. Checked `set_index` is an ordinary target-library wrapper. |
-| [List buffer reuse](#list-buffer-reuse-roadmap) | Ownership-aware updates, four-slot first growth, doubling and simpler library loops | L1 append (`85c1eabc3`) and L2 set/concat (`90f684248`) landed. L2 seed pinned. L2b.1 (loop entry) and L2b.2 (joins) landed; an L2b seed is next, then L3/L4. |
-| [Ownership contracts](#ownership-contracts-roadmap) | Owned/borrowed parameter contracts inferred from in-place runtime operations; record update binds before rebuilding; cell reuse | Planned and approved 2026-10-28; starts after the L2b seed with the O0 re-measure. Cell reuse is decided after O0. |
+| [List buffer reuse](#list-buffer-reuse-roadmap) | Ownership-aware updates, four-slot first growth, doubling and simpler library loops | L1 append (`85c1eabc3`) and L2 set/concat (`90f684248`) landed. L2b.1 (loop entry) and L2b.2 (joins) landed; L2b seed `blorp2-seed-50d3922f3449` pinned. L3/L4 next. |
+| [Ownership contracts](#ownership-contracts-roadmap) | Owned/borrowed parameter contracts inferred from in-place runtime operations; record update binds before rebuilding; cell reuse | Planned and approved 2026-10-28; the L2b seed is pinned, so the O0 re-measure is next. Cell reuse is decided after O0. |
 | [M1b](#m1b-names-and-the-foundation) | Namespace: private, aliases, qualified names, designated `Bool`/`Option`/`Result` | Parts A and B done; control-flow consumers follow in M2/M3. |
 | [M5](#m5-constants) | Literal scalar/String constants | Implemented. Source construction functions replace the need for record/opaque constants and initializer dependencies. |
 | [M2](#m2-the-join) | Restricted control positions, outer-variable joins, ordinary Boolean calls, `?=` and annotations | Joins, Result propagation, annotations, ordinary Boolean calls and restricted value/statement `if` implemented in integration; acceptance pending. General operand controls remain deferred. |
@@ -393,9 +393,9 @@ must update both libraries and all callers together.
 ### Problem and established boundaries
 
 Status: L1 landed as `85c1eabc3` with its seed pinned in `8d44d250b`; L2
-landed as `90f684248`, and its seed `blorp2-seed-90f684248521` is pinned.
-[L2b](#l2b-transfer-ownership-into-joins-and-loop-entry) is next, then a seed
-carrying L2b, before L3.
+landed as `90f684248` with seed `blorp2-seed-90f684248521`.
+[L2b](#l2b-transfer-ownership-into-joins-and-loop-entry) landed and its seed
+`blorp2-seed-50d3922f3449` is pinned; L3 is next.
 The earlier eager four-slot empty-literal variant passed
 functional gates but exceeded the RSS investigation threshold; its measurements
 remain recorded below. Implement in order, with code-reviewer and
@@ -735,10 +735,9 @@ activation. No implicit fallback or mixed library producer is permitted.
 
 ### L2b: transfer ownership into joins and loop entry
 
-Status: the L2 seed is pinned. L2b.1 (loop entry,
-[validation](#l2b1-validation)) and L2b.2 (joins,
-[validation](#l2b2-validation)) landed. A seed carrying L2b is published
-next; L3 follows that pin.
+Status: L2b.1 (loop entry, [validation](#l2b1-validation)) and L2b.2
+(joins, [validation](#l2b2-validation)) landed, and the seed carrying them,
+`blorp2-seed-50d3922f3449`, is pinned. L3 is next.
 
 #### Problem
 
@@ -1475,7 +1474,7 @@ pin; O2 touches only lowering and may land at any time.
 
 | Step | Scope | Status |
 | --- | --- | --- |
-| [O0](#o0-re-measure-after-l2b) | Re-run the self-compile copy attribution and count atomic RC operations | Gate; waits for the L2b seed |
+| [O0](#o0-re-measure-after-l2b) | Re-run the self-compile copy attribution and count atomic RC operations | Gate; the L2b seed is pinned |
 | [O1](#o1-owned-parameter-contracts) | Per-parameter owned/borrowed contracts, inferred from in-place runtime operations | Approved; step-0 spike first |
 | [O2](#o2-record-update-binds-before-it-rebuilds) | Project the base fields an update reads before its replacements run | Approved; may land before O1 |
 | [O3](#o3-cell-reuse-for-records-and-union-nodes) | Reuse tokens for unique record cells and boxed union nodes | Undecided until O0 |
