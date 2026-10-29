@@ -133,7 +133,7 @@ not a portable nesting threshold or a product-destruction proof.
 | [M1a](#m1a-surface-syntax-parity) | Layout and parsed source syntax | Pure lambda and callback syntax is implemented; current source-frontier evidence remains separate. |
 | [ML](#ml-list-construction) | `append`, `set`, `concat`, list literal | Done. Checked `set_index` is an ordinary target-library wrapper. |
 | [List buffer reuse](#list-buffer-reuse-roadmap) | Ownership-aware updates, four-slot first growth, doubling and simpler library loops | L1 append (`85c1eabc3`) and L2 set/concat (`90f684248`) landed. L2b.1 (loop entry) and L2b.2 (joins) landed; L2b seed `blorp2-seed-50d3922f3449` pinned. L3/L4 next. |
-| [Ownership contracts](#ownership-contracts-roadmap) | Owned/borrowed parameter contracts inferred from in-place runtime operations; record update binds before rebuilding; cell reuse | Planned and approved 2026-10-28; the L2b seed is pinned, so the O0 re-measure is next. Cell reuse is decided after O0. |
+| [Ownership contracts](#ownership-contracts-roadmap) | Owned/borrowed parameter contracts inferred from in-place runtime operations; record update binds before rebuilding; cell reuse | Planned and approved 2026-10-28. O0 measured; the O1 step-0 spike is next. Cell reuse awaits a decision on the O0 evidence. |
 | [M1b](#m1b-names-and-the-foundation) | Namespace: private, aliases, qualified names, designated `Bool`/`Option`/`Result` | Parts A and B done; control-flow consumers follow in M2/M3. |
 | [M5](#m5-constants) | Literal scalar/String constants | Implemented. Source construction functions replace the need for record/opaque constants and initializer dependencies. |
 | [M2](#m2-the-join) | Restricted control positions, outer-variable joins, ordinary Boolean calls, `?=` and annotations | Joins, Result propagation, annotations, ordinary Boolean calls and restricted value/statement `if` implemented in integration; acceptance pending. General operand controls remain deferred. |
@@ -1474,10 +1474,10 @@ pin; O2 touches only lowering and may land at any time.
 
 | Step | Scope | Status |
 | --- | --- | --- |
-| [O0](#o0-re-measure-after-l2b) | Re-run the self-compile copy attribution and count atomic RC operations | Gate; the L2b seed is pinned |
+| [O0](#o0-re-measure-after-l2b) | Re-run the self-compile copy attribution and count atomic RC operations | Measured ([results](#o0-results)) |
 | [O1](#o1-owned-parameter-contracts) | Per-parameter owned/borrowed contracts, inferred from in-place runtime operations | Approved; step-0 spike first |
 | [O2](#o2-record-update-binds-before-it-rebuilds) | Project the base fields an update reads before its replacements run | Approved; may land before O1 |
-| [O3](#o3-cell-reuse-for-records-and-union-nodes) | Reuse tokens for unique record cells and boxed union nodes | Undecided until O0 |
+| [O3](#o3-cell-reuse-for-records-and-union-nodes) | Reuse tokens for unique record cells and boxed union nodes | Undecided; O0 found no allocation witness |
 
 ### Problem
 
@@ -1522,17 +1522,18 @@ emits identical C, found:
 
 `lex`, `program_inventory` and `intern_names` hold 10.2 B of the 10.4 B
 slots; they are appends in join arms and loops inside arms, which L2b.2
-targets. That 98% is an upper bound until O0 measures it. What L2b leaves is
-the parameter case: at least 548 MB of String from `append_byte_array`,
-`append_owner_alias` and `append_selection`, whose `output` parameter borrows,
-and 65.5 M slots from `with_bucket_entry`. Four emit helpers
+targets; [O0](#o0-results) measured L2b closing 99% of the List copies and
+`append_byte_array`'s String copies. What L2b leaves is the parameter case:
+190 MB of String from `append_owner_alias`, `append_selection` and
+`append_loop`, whose `output` parameter borrows, and 65.6 M slots from
+`with_bucket_entry`. Four emit helpers
 (`emit/emit.brp:1827`, `1956`, `2860`, `2931`) work around it with a local
 `fragments` list.
 
-The reproduction is a scratch benchmark with modes `list_helper`,
+The reproduction is `helper_accumulators`, with modes `list_helper`,
 `string_helper`, `set_helper` and `none`, one helper call per update. Normal
-instructions minus the `none` control grow 3.1-4.0× per doubling from 4,096
-to 131,072 updates; linear is 2×.
+instructions minus the `none` control grow 2.7-4.1× per doubling between
+4,096 and 65,536 updates ([O0](#o0-results)); linear is 2×.
 
 ### Background
 
@@ -1725,6 +1726,105 @@ normal instructions and logical allocations per mode and size, and growth per
 doubling. The List and String modes set O1's legacy parity criterion;
 `compiler_ast` and `binary_trees` measure the record and union gap that
 decides O3.
+
+#### O0 results
+
+Measured at `a4ad3113e` (L2b seed `blorp2-seed-50d3922f3449`) on an Apple
+M4 with Apple clang 21, one sample per point. B is `make -C blorp_2
+compiler`; its self C is `2975e872a5f2`, as the seed workflow expects.
+
+**Copies in self-compilation**, by the gap-analysis attribution method
+(a marker-instrumented B, every update helper attributed to its Blorp
+caller), against the same method at `de2d4e4dd`:
+
+| Path | `de2d4e4dd` calls | Copied | `a4ad3113e` calls | Copied | Change |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| List borrowed update | 4,062,692 | 9,984,472,912 slots | 755,882 | 93,224,709 slots | −99.1% |
+| List shared fallback | 714,382 | 431,986,070 slots | 581,228 | 29,104,926 slots | −93.3% |
+| String borrowed update | 1,168,464 | 725,080,074 bytes | 617,542 | 285,267,151 bytes | −60.7% |
+| String shared fallback | 348,224 | 191,986,727 bytes | 223,398 | 85,934,248 bytes | −55.2% |
+
+Allocations fall from 28,413,897 to 25,168,207 (−11.4%), balanced under
+strict accounting. L2b closed the join and loop-entry copies (`lex`,
+`program_inventory`, `intern_names`). The largest remaining copies are the
+parameter cases O1 targets: `append_owner_alias` (105.6 MB) and
+`append_selection` (76.1 MB) append to a borrowed `output`, and
+`with_bucket_entry` copies 65.6 M slots. `emit` still copies its
+23 MB result three times (69.0 MB, cause not traced), and the library's
+`join_range` falls back on 60.4 MB of shared elements. Tail-position user calls: 146 with nothing before the
+return, 21 followed only by drops.
+
+**Atomic reference-count operations**, counted exactly at every
+`atomic_fetch_add`/`atomic_fetch_sub` on a `references` field in B's self C
+(1,480 sites), during one `-O2` self-compilation whose output is identical:
+
+| Kind | Increments | Decrements |
+| --- | ---: | ---: |
+| Record | 368,806,790 | 377,441,570 |
+| List | 162,715,026 | 169,213,920 |
+| Union (boxed) | 60,138,484 | 61,139,629 |
+| String | 17,716,259 | 26,749,527 |
+
+That is 1.24 B atomic operations, 60% of them on records. Their call sites
+are not attributed; own inserts `AcquireOwner` at `own/own.brp:1371`,
+`1376`, `1502`, `1553` and `1558`. The `-O2 -g` self-compilation retires 29.7 B instructions in 2.24 s
+with 278 MB peak RSS. A 1 ms `sample` profile of the same run took 1,717 samples. By top of
+stack, over all 1,717: allocator frames 29%, reference-count helper frames
+12%, `memmove`, `memset` and `bzero` 10%. Specialization instance lookup
+(`find_instance`, `slot_has_union_key`, `find_union_instance`,
+`slot_has_record_key`, `same_type`, `find_union_slot`,
+`find_record_instance`) holds 20%: the linear lookup already listed under
+[deferred work](#deferred-beyond-the-fixpoint).
+
+**Against the legacy compiler.** Each benchmark built by `bin/blorp compile`
+and by B from the same worktree, `clang -fwrapv -O2`. Instructions are normal
+retired instructions minus the `none` control at the same size; allocations
+are whole-process totals from a `-DBLORP_MEMORY_DIAGNOSTICS=1` build. Sizes
+run from 4,096 to 65,536; `set_helper` stops at 32,768, because its
+quadratic run would need about 4.3e10 instructions at 65,536 and 1.7e11 at
+131,072. Growth per doubling omits the 4,096 to 8,192 step, where startup
+jitter of about 1 M instructions exceeds the work:
+
+| Mode at 65,536 | Legacy | Blorp 2 | Legacy per doubling | Blorp 2 per doubling | Allocations, legacy / Blorp 2 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `list_helper` | 2.40 M | 3,330 M | 1.69-2.08× | 3.75-3.88× | 21 / 65,544 |
+| `string_helper` | 9.80 M | 523 M | 1.92-2.07× | 2.78-3.66× | 23 / 65,544 |
+| `set_helper` (32,768) | 1.69 M | 10,794 M | 1.71-2.05× | 3.96-3.98× | 7 / 32,776 |
+| `in_arms` | 2.63 M | 3.27 M | 1.79-1.89× | 1.90-1.99× | 21 / 8 |
+| `nested` | 2.52 M | 2.81 M | 1.81-1.97× | 1.80-1.95× | 21 / 8 |
+| `flat` | 2.49 M | 2.79 M | 1.64-1.93× | 1.92-1.99× | 21 / 8 |
+
+Blorp 2's helper modes allocate once per update at every size (count plus 8:
+4,104 at 4,096 to 65,544 at 65,536); the legacy compiler's stay between 7 and
+23 in every mode and size. The legacy compiler is
+linear in every mode. After L2b, Blorp 2 is linear inside one function but
+copies on every helper call, which is exactly O1's scope; O1's parity
+criterion is unmet today by one to three orders of magnitude (53× for
+`string_helper`, 1,387× for `list_helper`, 6,400× for `set_helper`).
+
+| Benchmark | Legacy instructions | Blorp 2 | Allocations, legacy / Blorp 2 |
+| --- | ---: | ---: | ---: |
+| `compiler_ast` | 177.5 M | 195.0 M | 310,316 / 310,315 |
+| `binary_trees 15` | 3,299 M | 3,529 M | 6,444,438 / 6,444,423 |
+| `compiler_emit` | 33.0 M | 69.9 M | 8 / 52,328 |
+
+Legacy cell reuse saves no allocations on `compiler_ast` or
+`binary_trees`, so neither is a witness for O3; Blorp 2 trails them by 7-15%
+of instructions after startup. In `compiler_emit`, a counter added to
+`blorp_string_from_bytes` in a scratch copy of the generated C counts 52,327
+calls, so all but one of Blorp 2's 52,328 allocations materialise String
+literals, which the legacy compiler emits as static data. The instruction gap
+(about 15 M against 58 M after startup) is not attributed.
+
+**Conclusions.** L2b closed about 99% of the List copying in
+self-compilation. O1 remains justified chiefly by user code: the helper
+benchmark is the legacy compiler's largest lead. Its self-compile gain is
+bounded by the remaining parameter copies (190 MB of String from
+`append_owner_alias`, `append_selection` and `append_loop`, and 66 M slots
+from `with_bucket_entry`) and `with_bucket_entry`'s 3% of samples. Neither
+record benchmark is an allocation witness for O3. Self-compilation allocations
+were not split by kind, and record reference counting (746 M atomic
+operations) was not attributed, so O0 does not settle O3 either way.
 
 ### O1: owned-parameter contracts
 

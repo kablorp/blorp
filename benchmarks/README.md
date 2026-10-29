@@ -116,6 +116,7 @@ included in `bench.sh all`.
 | `paradigms` | Functional dispatch, list destructuring, pattern matching, and coroutine-style control flow | blorp |
 | `virtual_threads` | Fiber spawn, join, park, and wake scaling | blorp |
 | `control_flow_accumulators` | List accumulators updated in join arms (`in_arms`), across inner-loop entry (`nested`) and in a flat loop (`flat`), with a `none` startup control; arguments are the mode and the append count | blorp, Blorp 2 |
+| `helper_accumulators` | Accumulators threaded through a helper parameter: List append (`list_helper`), String append (`string_helper`) and List `set` on a fixed table (`set_helper`), with a `none` startup control; arguments are the mode and the update count | blorp, Blorp 2 |
 
 ## Compiler Diagnostics
 

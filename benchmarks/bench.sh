@@ -64,7 +64,7 @@ GO_CONCURRENCY_THREADS="${GOMAXPROCS:-$BENCH_THREADS}"
 
 # Ordered benchmark list (determines display order)
 ALL_BENCHMARKS="numeric_loop fib string array_sum array_ops dict_ops list_ops set_ops threaded_cpu_map channel_pipeline sleep_fanout options simd nbody binary_trees fannkuch spectral_norm mandelbrot knucleotide reverse_complement compiler_ast compiler_symbols compiler_emit"
-EXTRA_BENCHMARKS="paradigms virtual_threads control_flow_accumulators"
+EXTRA_BENCHMARKS="paradigms virtual_threads control_flow_accumulators helper_accumulators"
 CONCURRENCY_BENCHMARKS="threaded_cpu_map channel_pipeline sleep_fanout"
 SPEEDUP_SUPPRESSED_BENCHMARKS="channel_pipeline"
 
