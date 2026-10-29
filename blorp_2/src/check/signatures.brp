@@ -43,8 +43,8 @@ import:
 		inventory_records,
 		inventory_unions,
 		variant_owner
-	../utils/source: root_module_id
-	../utils/names: NameId, contextual_words, same_name
+	../utils/source: FunctionLabel, declared_label, module_number, root_module_id
+	../utils/names: NameId, contextual_words, name_spelling, same_name
 	../utils/syntax:
 		TypeSyntax(CallableTypeSyntax, AtomicType, QualifiedType),
 		EntryResult(IntegerExitStatus, SuccessfulExit),
@@ -87,11 +87,20 @@ fixed union AcceptedBody:
 -- CheckedFunction publication discards that scope.
 fixed record AcceptedFunction {
 	id: FunctionId,
+	label: FunctionLabel,
 	declaration: ParsedFunction,
 	signature: FunctionSignature,
 	body_types: TypeScope,
 	body: AcceptedBody
 }
+
+
+private pure func function_label(row: FunctionRow, parsed: ParsedContents) -> Result[FunctionLabel, CheckError]:
+	name = row.declaration.function_name
+	invalid = checker_invariant(name.span, InvalidResolvedFunction(row.id))
+	module ?= parsed.modules.get(module_number(row.declaration.module)).to_result(invalid)
+	spelling ?= name_spelling(parsed.names, name.id).to_result(invalid)
+	Ok(declared_label(module.stem, spelling))
 
 
 fixed record CheckedSignatures {
@@ -189,6 +198,7 @@ private pure func accept_functions(
 private pure func resolve_signature(
 	function: ParsedFunction,
 	id: FunctionId,
+	label: FunctionLabel,
 	role: SignatureRole,
 	scope: TypeScope,
 	parameters: List[TypeParameterId],
@@ -248,6 +258,7 @@ private pure func resolve_signature(
 
 	Ok({
 		id = id,
+		label = label,
 		declaration = function,
 		signature = signature,
 		body_types = { scope | access = PrivateTypeUse },
@@ -543,7 +554,7 @@ private pure func implementation_headers(parsed: ParsedContents, namespace: Name
 		None: Ok(headers)
 
 
-private pure func resolve_implementation_function(row: FunctionRow, implementation: ImplRow, header: ImplementationHeader, parsed: ParsedContents, role: SignatureRole, scope: TypeScope, designated: DesignatedUnions) -> Result[AcceptedFunction, CheckError]:
+private pure func resolve_implementation_function(row: FunctionRow, label: FunctionLabel, implementation: ImplRow, header: ImplementationHeader, parsed: ParsedContents, role: SignatureRole, scope: TypeScope, designated: DesignatedUnions) -> Result[AcceptedFunction, CheckError]:
 	ordinary: Void ?= match row.declaration.type_parameters:
 		[first, ..._]: Err(trait_error(first.name.span, IndependentImplementationParameters))
 		[]: Ok(void)
@@ -555,7 +566,7 @@ private pure func resolve_implementation_function(row: FunctionRow, implementati
 	receiver ?= receiver_type(header.receiver_head, identities.map(pure func(id): ParameterType(id)))
 		.to_result(checker_invariant(implementation.header.span, InvalidFunctionContract))
 	normalized = { body_scope | self_binding = Some({ name = contextual_words(parsed.names).self_word, value_type = receiver }) }
-	resolve_signature(row.declaration, row.id, role, normalized, identities, body_requirements(header.parameter_bounds, row.id), designated)
+	resolve_signature(row.declaration, row.id, label, role, normalized, identities, body_requirements(header.parameter_bounds, row.id), designated)
 
 
 -- The default's written contract is accepted once in its trait domain.
@@ -563,6 +574,7 @@ private pure func resolve_implementation_function(row: FunctionRow, implementati
 -- annotations are neither reconstructed nor resolved a second time.
 private pure func resolve_default_function(
 	row: FunctionRow,
+	label: FunctionLabel,
 	owner: AcceptedTrait,
 	method: AcceptedTraitMethod,
 	parsed: ParsedContents,
@@ -591,23 +603,24 @@ private pure func resolve_default_function(
 	}
 	body ?= accept_body(row.declaration, signature, designated)
 	Ok({
-		id = row.id, declaration = row.declaration, signature = signature,
+		id = row.id, label = label, declaration = row.declaration, signature = signature,
 		body_types = { scope | access = PrivateTypeUse, self_binding = Some({ name = contextual_words(parsed.names).self_word, value_type = ParameterType(self) }) },
 		body = body
 	})
 
 
 private pure func resolve_function(row: FunctionRow, parsed: ParsedContents, headers: List[ImplementationHeader], contracts: List[AcceptedTrait], role: SignatureRole, scope: TypeScope, designated: DesignatedUnions) -> Result[AcceptedFunction, CheckError]:
+	label ?= function_label(row, parsed)
 	match row.role:
 		FreeFunctionBody:
-			resolve_free_function(row, role, scope, designated)
+			resolve_free_function(row, label, role, scope, designated)
 		ImplementationBody:
 			var accepted: Result[AcceptedFunction, CheckError] = Err(checker_invariant(row.declaration.function_name.span, InvalidResolvedFunction(row.id)))
 			for implementation in inventory_implementations(parsed.declarations):
 				for member in implementation.methods:
 					if function_number(member) == function_number(row.id):
 						match headers.get(impl_number(implementation.id)):
-							Some(header): accepted = resolve_implementation_function(row, implementation, header, parsed, role, scope, designated)
+							Some(header): accepted = resolve_implementation_function(row, label, implementation, header, parsed, role, scope, designated)
 							None: void
 			accepted
 		TraitDefaultBody:
@@ -617,13 +630,13 @@ private pure func resolve_function(row: FunctionRow, parsed: ParsedContents, hea
 					match method.default_body:
 						Some(function):
 							if function_number(function) == function_number(row.id):
-								accepted = resolve_default_function(row, owner, method, parsed, scope, designated)
+								accepted = resolve_default_function(row, label, owner, method, parsed, scope, designated)
 						None: void
 			accepted
 
 
 
-private pure func resolve_free_function(row: FunctionRow, role: SignatureRole, scope: TypeScope, designated: DesignatedUnions) -> Result[AcceptedFunction, CheckError]:
+private pure func resolve_free_function(row: FunctionRow, label: FunctionLabel, role: SignatureRole, scope: TypeScope, designated: DesignatedUnions) -> Result[AcceptedFunction, CheckError]:
 	generic_main: Void ?= match role:
 		EntryFunction:
 			match row.declaration.type_parameters.get(0):
@@ -641,4 +654,4 @@ private pure func resolve_free_function(row: FunctionRow, role: SignatureRole, s
 
 	parameters ?= local_type_parameters(row.declaration.type_parameters.map(pure func(parameter): parameter.name), FunctionDeclaration(row.id), scope)
 	bounds ?= resolve_bounds(row.declaration.type_parameters, parameters)
-	resolve_signature(row.declaration, row.id, role, parameters, declared_parameters(parameters), body_requirements(bounds, row.id), designated)
+	resolve_signature(row.declaration, row.id, label, role, parameters, declared_parameters(parameters), body_requirements(bounds, row.id), designated)

@@ -2914,6 +2914,18 @@ diagnostic rendering are pure. The pipeline publishes these complete results:
    internal lowered-reference error instead of silently choosing a C layout;
    source-language acceptance is already complete. Retains/releases project the
    explicit operations; emission does not invent owners or cleanup.
+   Functions are named `blorp_f_N` by instance. Each definition (not its
+   prototype) is preceded by a C comment naming its source, so profiles of a
+   generated program read directly: `/* module.function */` for a declared
+   function, `/* module.function lambda */` for a lambda in that function, and
+   `/* equality for Type */` for derived equality. Instances of a generic
+   function share its label. Checking issues the label from the module's file
+   stem (the loader derives it from the path; it never contains `/`, so the
+   comment cannot end early) and the written name. It is an opaque
+   `FunctionLabel` that only `declared_label`, `lambda_label` and
+   `equality_label` in `utils/source.brp` build, and it passes through
+   specialization, lowering and ownership as `label`: a debugging annotation
+   only.
 
 The names module owns the spelling table and its seed: the entrypoint's `main`
 identity and the parser's contextual words. Every module's lexing extends that

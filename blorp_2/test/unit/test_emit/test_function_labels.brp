@@ -1,0 +1,205 @@
+import:
+	../../../src/check/check: check
+	../../../src/check/render: render_failure
+	../../../src/emit/emit: emit
+	../../../src/lower/lower: lower
+	../../../src/own/own: own
+	../../../src/specialize/specialize: specialize
+	../../../src/utils/syntax: Diagnostic
+	../../../src/verify/verify: verify
+	../module_input: FOUNDATION_TYPES, TestFoundation, parse_modules_with_base
+	../text_search: ends_with, find_text
+	bool: Bool methods
+	int: Int methods
+	io: print_error
+	list: List methods
+	option: Option methods
+	result: Result methods
+	string: String methods
+	test: TestSuite
+
+
+-- The test base plus the canonical Equatable trait, so records derive equality.
+private pure func equatable_foundation() -> TestFoundation:
+	{
+		types = FOUNDATION_TYPES.add("trait Equatable:\n    pure func equals(left: Self, right: Self) -> Bool\n"),
+		prelude_selections = "Int, Float, String, Void, List, Bool(True, False), Option(Some, None), Result(Ok, Err), Equatable"
+	}
+
+
+-- The test loader names module N `module_N`, so every label of this one-module
+-- program starts with `module_0`. `Pair` derives equality from the authored
+-- `Handler` equality.
+private PROGRAM: String =
+	|fixed record Handler { tag: Int }
+	|implements Equatable for Handler:
+	|    pure func equals(left: Self, right: Self) -> Bool:
+	|        False
+	|fixed record Pair { first: Handler, second: Handler }
+	|pure func identity[Value](value: Value) -> Value:
+	|    value
+	|pure func apply(callback: pure (Int) -> Int, value: Int) -> Int:
+	|    callback(value)
+	|pure func same(left: Pair, right: Pair) -> Bool:
+	|    left == right
+	|func main() -> Int:
+	|    number = identity(7)
+	|    text = identity("seven")
+	|    mapped = apply(pure func(value: Int) -> Int: value, number)
+	|    match same({ first = { tag = 1 }, second = { tag = 2 } }, { first = { tag = 1 }, second = { tag = 2 } }):
+	|        True: mapped
+	|        False: 1
+	|
+
+
+private pure func stage_failure(stage: String, diagnostic: Diagnostic) -> String:
+	"${stage}: ${diagnostic.message}"
+
+
+-- The production phases in order, over the one in-memory module. The error
+-- names the stage that rejected the program.
+private pure func emitted() -> Result[String, String]:
+	parsed ?= parse_modules_with_base([{ source = PROGRAM, targets = [] }], equatable_foundation()).map_err(pure func(error: Diagnostic) -> String: stage_failure("parse", error))
+	checked ?= check(parsed).map_err(pure func(failure) -> String: stage_failure("check", render_failure(failure).first))
+	specialized ?= specialize(checked).map_err(pure func(error: Diagnostic) -> String: stage_failure("specialize", error))
+	lowered ?= lower(specialized).map_err(pure func(error: Diagnostic) -> String: stage_failure("lower", error))
+	owned ?= own(lowered).map_err(pure func(error: Diagnostic) -> String: stage_failure("own", error))
+	verified ?= verify(owned).map_err(pure func(error: Diagnostic) -> String: stage_failure("verify", error))
+	emit(verified).map_err(pure func(error: Diagnostic) -> String: stage_failure("emit", error))
+
+
+-- What follows each `/* label */ ` through the next `{` or `;`, whichever comes
+-- first. A definition's text ends in `{`; a labelled prototype would end in `;`.
+private pure func labelled_headers(code: String, label: String) -> List[String]:
+	comment = "/* ${label} */ "
+	var headers: List[String] = []
+	var cursor: Int = 0
+	while cursor.less_than(code.length()):
+		match find_text(code, comment, cursor):
+			None:
+				break
+			Some(at):
+				text_start = at.add(comment.length())
+				cursor = text_start
+				brace = find_text(code, "{", text_start)
+				semicolon = find_text(code, ";", text_start)
+				end: Option[Int] = match (brace, semicolon):
+					(Some(brace_at), Some(stop)): Some(brace_at.min(stop))
+					(Some(brace_at), None): Some(brace_at)
+					(None, Some(stop)): Some(stop)
+					(None, None): None
+				match end:
+					Some(last):
+						match code.slice(text_start, last.add(1)):
+							Some(header): headers = headers.append(header)
+							None: void
+					None: void
+	headers
+
+
+-- A definition header: the C return type (a prefix, since union types carry an
+-- id), a `blorp_f_` function name, parameters, then the opening brace.
+private pure func is_definition(header: String, return_type: String) -> Bool:
+	header.starts_with(return_type).and(find_text(header, " blorp_f_", 0).is_some()).and(ends_with(header, "){"))
+
+
+-- Exactly one labelled definition per expected return type, in any order.
+private pure func labels_definitions(code: String, label: String, return_types: List[String]) -> Bool:
+	headers = labelled_headers(code, label)
+	var matched: Bool = headers.length() == return_types.length()
+	for return_type in return_types:
+		var found: Bool = False
+		for header in headers:
+			found = found.or(is_definition(header, return_type))
+		matched = matched.and(found)
+	matched
+
+
+func with_code(check_code: pure (String) -> Bool) -> Bool:
+	match emitted():
+		Ok(code):
+			check_code(code)
+		Err(message):
+			print_error("the labelled program was rejected at ${message}")
+			False
+
+
+private pure func declared_labels_name_definitions(code: String) -> Bool:
+	labels_definitions(code, "module_0.main", ["int64_t"])
+		.and(labels_definitions(code, "module_0.apply", ["int64_t"]))
+		.and(labels_definitions(code, "module_0.same", ["enum blorp_u_"]))
+		.and(labels_definitions(code, "module_0.equals", ["enum blorp_u_"]))
+
+
+-- Each instance has its own `blorp_f_N`; both keep the generic function's name.
+private pure func generic_instances_share_a_label(code: String) -> Bool:
+	labels_definitions(code, "module_0.identity", ["int64_t", "struct blorp_string*"])
+
+
+private pure func lambda_label_names_its_function(code: String) -> Bool:
+	labels_definitions(code, "module_0.main lambda", ["int64_t"])
+
+
+private pure func equality_label_names_its_type(code: String) -> Bool:
+	labels_definitions(code, "equality for Pair", ["enum blorp_u_"])
+
+
+private fixed record ExpectedLabel {
+	label: String,
+	definitions: Int
+}
+
+
+private LABELS: List[ExpectedLabel] = [
+	{ label = "module_0.main", definitions = 1 },
+	{ label = "module_0.apply", definitions = 1 },
+	{ label = "module_0.same", definitions = 1 },
+	{ label = "module_0.equals", definitions = 1 },
+	{ label = "module_0.identity", definitions = 2 },
+	{ label = "module_0.main lambda", definitions = 1 },
+	{ label = "equality for Pair", definitions = 1 },
+]
+
+
+-- A labelled prototype would end in `;`, so every labelled text ends in `){`,
+-- and each label appears once per definition.
+private pure func no_prototype_is_labelled(code: String) -> Bool:
+	var matched: Bool = True
+	for expected in LABELS:
+		headers = labelled_headers(code, expected.label)
+		matched = matched.and(headers.length() == expected.definitions)
+		for header in headers:
+			matched = matched.and(ends_with(header, "){"))
+	matched
+
+
+func test_declared_function_names_its_module_and_function() -> Bool:
+	with_code(declared_labels_name_definitions)
+
+
+func test_generic_instances_share_the_generic_function_label() -> Bool:
+	with_code(generic_instances_share_a_label)
+
+
+func test_lambda_names_its_enclosing_function() -> Bool:
+	with_code(lambda_label_names_its_function)
+
+
+func test_derived_equality_names_its_type() -> Bool:
+	with_code(equality_label_names_its_type)
+
+
+func test_prototypes_carry_no_label() -> Bool:
+	with_code(no_prototype_is_labelled)
+
+
+tests: TestSuite = {
+	description = "Blorp 2 function labels in emitted C",
+	tests = [
+		("declared function names its module and function", test_declared_function_names_its_module_and_function),
+		("generic instances share the generic function label", test_generic_instances_share_the_generic_function_label),
+		("lambda names its enclosing function", test_lambda_names_its_enclosing_function),
+		("derived equality names its type", test_derived_equality_names_its_type),
+		("prototypes carry no label", test_prototypes_carry_no_label),
+	]
+}

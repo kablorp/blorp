@@ -24,7 +24,7 @@ import:
 	./indexed_list: IndexedList, append_entry, empty_indexed_list, find_position
 	int: Int methods
 	option: Option methods
-	../utils/source: compiler_source
+	../utils/source: compiler_source, FunctionLabel, lambda_label
 	../utils/syntax:
 		Diagnostic,
 		DiagnosticNote(UnionPayloadDeclaration),
@@ -371,6 +371,8 @@ fixed union ConcreteBody:
 
 
 fixed record ConcreteFunction {
+	-- A debugging annotation in generated C, never semantics.
+	label: FunctionLabel,
 	execution: FunctionExecution,
 	signature: FunctionSignature,
 	bindings: List[ConcreteBinding],
@@ -2232,7 +2234,9 @@ private pure func exit_types(exit: Checked.CheckedExit) -> List[Checked.TypeUse]
 
 -- The selected body owns these facts; only its genuine root owns rigid parameters.
 -- This view is local to preparation/translation, never a published function row.
+-- `base_label` is the root function's; a lambda adds its own in translation.
 private fixed record SelectedBody {
+	base_label: FunctionLabel,
 	captures: List[Checked.CheckedCapture],
 	parameter_owner: Checked.TypeParameterOwner,
 	type_parameters: List[Checked.TypeParameterId],
@@ -2255,6 +2259,7 @@ private pure func selected_body(
 			match checked.functions.get(Declaration.function_number(id)):
 				None: Err(missing_body(source, "unknown function declaration"))
 				Some(function): Ok({
+					base_label = function.label,
 					captures = [],
 					parameter_owner = Checked.FunctionDeclaration(function.id),
 					type_parameters = function.signature.type_parameters,
@@ -2272,6 +2277,7 @@ private pure func selected_body(
 					match checked.functions.get(Declaration.function_number(lambda.root)):
 						None: Err(invalid(lambda.return_type.span, "unknown lambda root"))
 						Some(root): Ok({
+							base_label = root.label,
 							captures = lambda.captures,
 							parameter_owner = Checked.FunctionDeclaration(root.id),
 							type_parameters = root.signature.type_parameters,
@@ -2287,7 +2293,7 @@ private pure func selected_body(
 			match Checked.equality_body(checked.traits, aggregate):
 				None: Err(missing_body(source, "unknown derived equality body"))
 				Some(template): Ok({
-					captures = [], parameter_owner = Checked.aggregate_owner(aggregate),
+					base_label = template.label, captures = [], parameter_owner = Checked.aggregate_owner(aggregate),
 					type_parameters = template.signature.type_parameters,
 					parameters = template.signature.parameters, return_type = template.signature.return_type,
 					bindings = template.bindings, statements = [], body = template.body,
@@ -4223,7 +4229,11 @@ private pure func translate_function(
 			translate_match(opaques, matched, substitution, translation, keys, unions, records, span).map(pure func(concrete): ConcreteMatchBody(concrete))
 
 	body ?= body_result
+	label = match key.body:
+		Checked.LambdaBody(_): lambda_label(function.base_label)
+		Checked.DeclaredBody(_) | Checked.DerivedEqualityBody(_): function.base_label
 	concrete: ConcreteFunction = {
+		label = label,
 		execution = function.execution,
 		signature = {
 			parameters = parameters,
