@@ -53,6 +53,7 @@ TARGET_COMPONENT_SOURCES := \
 	blorp_2/test/unit/test_verify/test_ownership_transfer.brp \
 	blorp_2/test/unit/test_parse/test_run_to_files.brp \
 	blorp_2/test/unit/test_check/test_run_to_files.brp \
+	blorp_2/test/unit/test_specialize/test_indexed_list.brp \
 	blorp_2/test/unit/test_specialize/test_run_to_files.brp \
 	blorp_2/test/unit/test_lower/test_run_to_files.brp \
 	blorp_2/test/unit/test_own/test_run_to_files.brp \
