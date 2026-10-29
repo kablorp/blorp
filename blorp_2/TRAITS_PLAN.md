@@ -851,6 +851,9 @@ rescoping. No efficiency improvement is claimed by this proposal.
 The current [bootstrap manifest](bootstrap.env) pins the qualified seed that
 recognizes the prelude-selected canonical identity and library ownership rule.
 The production declaration lives in `traits.brp`; _base stays import-free.
+The ordinary `Orderable` trait lives in `_base.brp`: a library module may
+implement a `_base` trait for a `_base` type, so `int.brp` and `float.brp`
+implement it without the canonical exemption.
 Keep compiler implementation source within the supported seed subset.
 
 Canonical Eq is optional: `None` means no ordinary Equatable binding in the

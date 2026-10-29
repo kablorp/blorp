@@ -2412,9 +2412,10 @@ records the entrypoint contract, ownership checks, native tests and matched cost
 `int` exposes concrete `add`, `subtract`, `multiply`, `divide`, `remainder`
 and `to_string`, plus `equals(Int, Int) -> Bool`. Equality uses the complete
 signed 64-bit values and ordinary explicitly bound Bool constructors.
-`less_than` uses signed64 ordering; `greater_than`, `less_than_or_equal`,
-`greater_than_or_equal`, `not_equals`, `min` and `max` are ordinary pure functions
-over that primitive or equality. Equal operands satisfy both inclusive relations.
+Int implements `Orderable`: `less_than` uses signed64 ordering, and
+`greater_than`, `less_than_or_equal` and `greater_than_or_equal` are the trait's
+defaults. `not_equals`, `min` and `max` are ordinary pure functions over that
+primitive or equality. Equal operands satisfy both inclusive relations.
 `INT_MIN` and `INT_MAX` are ordinary imported scalar constants with values
 `-9223372036854775808` and `9223372036854775807`; comparisons never subtract.
 The first three arithmetic operations wrap at Int64 bounds. Division and remainder
@@ -2572,8 +2573,9 @@ func main() -> Int:
 ```
 
 This prints `13\n`. The concrete Float module provides the same five arithmetic
-function names as Int, plus `to_string`, `copysign`, `equals`, `less_than`,
-`is_nan`, `is_finite`, `abs` and `greater_than_or_equal`. Named function imports permit direct
+function names as Int, plus `to_string`, `copysign`, `equals`, `is_nan`,
+`is_finite` and `abs`, and implements `Orderable` with every NaN comparison
+false. Named function imports permit direct
 calls and UFCS; type imports expose the module's associated functions through
 UFCS. Receiver types distinguish Int and Float methods. Importing both Int and
 Float `to_string` for direct calls is an error; neither declaration takes
@@ -2917,9 +2919,9 @@ before sealing the program.
 General pass infrastructure remains future work.
 
 The target library's [`_base.brp`](standard_library/_base.brp)
-owns the builtin Int, Float, String, Void and List identities, and the ordinary
-Bool, Option and Result unions. It is the only module that may declare builtin
-types, and any module may import it as `_base`.
+owns the builtin Int, Float, String, Void and List identities, the ordinary
+Bool, Option and Result unions, and the `Orderable` trait. It is the only module
+that may declare builtin types, and any module may import it as `_base`.
 
 The foundation check designates those three unions once, by name and only in
 `_base.brp`, and publishes their constructor identities for checking to read:
