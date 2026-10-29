@@ -1,72 +1,81 @@
+import:
+	../namespace/builtins: RuntimeOperation(StringConcat, StringAppendInt)
+	../specialize/specialize: TypeRef, VariantInstanceId
+	./list: consuming_helper_name
+	../utils/text: concat
+
+
 -- Both borrowed inputs are valid counted UTF-8; concatenation preserves it.
 -- Unrepresentable storage is infrastructure exhaustion, like failed malloc.
-STRING_CONCAT_RUNTIME: String =
-	raw
-		|static int64_t blorp_string_append_length(const struct blorp_string *left,int64_t suffix_length) {
-		|const uintmax_t maximum=(uintmax_t)blorp_string_maximum_capacity();
-		|if((uintmax_t)suffix_length>maximum||(uintmax_t)left->length>maximum-(uintmax_t)suffix_length){abort();}
-		|return left->length+suffix_length;
-		|}
-		|static struct blorp_string *blorp_string_append_bytes(const struct blorp_string *left,const char *suffix,int64_t suffix_length) {
-		|const int64_t length=blorp_string_append_length(left,suffix_length);
-		|struct blorp_string *result=blorp_string_allocate(length);
-		|memcpy(result->bytes,left->bytes,(size_t)left->length);
-		|memcpy(result->bytes+(size_t)left->length,suffix,(size_t)suffix_length);
-		|result->bytes[length]='\0';
-		|return result;
-		|}
-		|struct blorp_string *blorp_string_concat(const struct blorp_string *left,const struct blorp_string *right) {
-		|return blorp_string_append_bytes(left,right->bytes,right->length);
-		|}
-		|/* Only a transferred unique root reaches this helper. Growth is capped
-		| * before doubling so both the capacity and allocation size stay valid. */
-		|static struct blorp_string *blorp_string_reserve_unique(struct blorp_string *value,int64_t length) {
-		|if((size_t)length<=value->capacity){return value;}
-		|const size_t maximum=blorp_string_maximum_capacity();
-		|size_t capacity=value->capacity; /* Never zero: see BLORP_STRING_MINIMUM_CAPACITY. */
-		|while(capacity<(size_t)length){
-		|capacity=capacity>maximum/2?maximum:capacity*2;
-		|}
-		|struct blorp_string *result=blorp_memory_resize(value,sizeof *value+capacity+1);
-		|if(result==NULL){abort();}
-		|result->capacity=capacity;
-		|return result;
-		|}
-		|/* Transfer one left reference; suffix stays live independently of left.
-		| * Counted aliases force the shared copying branch before relocation. */
-		|static struct blorp_string *blorp_string_append_bytes_take_left(struct blorp_string *left,const char *suffix,int64_t suffix_length) {
-		|if(atomic_load_explicit(&left->references,memory_order_acquire)!=1){
-		|struct blorp_string *result=blorp_string_append_bytes(left,suffix,suffix_length);
-		|blorp_string_release(left);
-		|return result;
-		|}
-		|const int64_t length=blorp_string_append_length(left,suffix_length);
-		|left=blorp_string_reserve_unique(left,length);
-		|memcpy(left->bytes+(size_t)left->length,suffix,(size_t)suffix_length);
-		|left->length=length;
-		|left->bytes[length]='\0';
-		|return left;
-		|}
-		|struct blorp_string *blorp_string_concat_take_left(struct blorp_string *left,const struct blorp_string *right) {
-		|return blorp_string_append_bytes_take_left(left,right->bytes,right->length);
-		|}
-		|
+pure func string_concat_runtime() -> String:
+	shared: String =
+		raw
+			|static int64_t blorp_string_append_length(const struct blorp_string *left,int64_t suffix_length) {
+			|const uintmax_t maximum=(uintmax_t)blorp_string_maximum_capacity();
+			|if((uintmax_t)suffix_length>maximum||(uintmax_t)left->length>maximum-(uintmax_t)suffix_length){abort();}
+			|return left->length+suffix_length;
+			|}
+			|static struct blorp_string *blorp_string_append_bytes(const struct blorp_string *left,const char *suffix,int64_t suffix_length) {
+			|const int64_t length=blorp_string_append_length(left,suffix_length);
+			|struct blorp_string *result=blorp_string_allocate(length);
+			|memcpy(result->bytes,left->bytes,(size_t)left->length);
+			|memcpy(result->bytes+(size_t)left->length,suffix,(size_t)suffix_length);
+			|result->bytes[length]='\0';
+			|return result;
+			|}
+			|struct blorp_string *blorp_string_concat(const struct blorp_string *left,const struct blorp_string *right) {
+			|return blorp_string_append_bytes(left,right->bytes,right->length);
+			|}
+			|/* Only a transferred unique root reaches this helper. Growth is capped
+			| * before doubling so both the capacity and allocation size stay valid. */
+			|static struct blorp_string *blorp_string_reserve_unique(struct blorp_string *value,int64_t length) {
+			|if((size_t)length<=value->capacity){return value;}
+			|const size_t maximum=blorp_string_maximum_capacity();
+			|size_t capacity=value->capacity; /* Never zero: see BLORP_STRING_MINIMUM_CAPACITY. */
+			|while(capacity<(size_t)length){
+			|capacity=capacity>maximum/2?maximum:capacity*2;
+			|}
+			|struct blorp_string *result=blorp_memory_resize(value,sizeof *value+capacity+1);
+			|if(result==NULL){abort();}
+			|result->capacity=capacity;
+			|return result;
+			|}
+			|/* Transfer one left reference; suffix stays live independently of left.
+			| * Counted aliases force the shared copying branch before relocation. */
+			|static struct blorp_string *blorp_string_append_bytes_take_left(struct blorp_string *left,const char *suffix,int64_t suffix_length) {
+			|if(atomic_load_explicit(&left->references,memory_order_acquire)!=1){
+			|struct blorp_string *result=blorp_string_append_bytes(left,suffix,suffix_length);
+			|blorp_string_release(left);
+			|return result;
+			|}
+			|const int64_t length=blorp_string_append_length(left,suffix_length);
+			|left=blorp_string_reserve_unique(left,length);
+			|memcpy(left->bytes+(size_t)left->length,suffix,(size_t)suffix_length);
+			|left->length=length;
+			|left->bytes[length]='\0';
+			|return left;
+			|}
+			|
+	concatenation: RuntimeOperation[VariantInstanceId, TypeRef] = StringConcat
+	in_place: String = match consuming_helper_name(concatenation):
+		None: ""
+		Some(helper):
+			"struct blorp_string *${helper}(struct blorp_string *left,const struct blorp_string *right) {\n"
+				.concat("return blorp_string_append_bytes_take_left(left,right->bytes,right->length);\n}\n")
+	shared.concat(in_place)
 
 
--- Requires STRING_CONCAT_RUNTIME first for the shared counted-byte storage.
+-- Requires string_concat_runtime() first for the shared counted-byte storage.
 -- Decimal ASCII lives on the stack; no managed digit String is constructed.
-STRING_APPEND_INT_RUNTIME: String =
-	raw
-		|struct blorp_string *blorp_string_append_int(const struct blorp_string *left,int64_t value) {
-		|char digits[BLORP_INT64_DECIMAL_CAPACITY];
-		|const int length=snprintf(digits,sizeof digits,"%" PRId64,value);
-		|if(length<0||(size_t)length>=sizeof digits){abort();}
-		|return blorp_string_append_bytes(left,digits,(int64_t)length);
-		|}
-		|struct blorp_string *blorp_string_append_int_take_left(struct blorp_string *left,int64_t value) {
-		|char digits[BLORP_INT64_DECIMAL_CAPACITY];
-		|const int length=snprintf(digits,sizeof digits,"%" PRId64,value);
-		|if(length<0||(size_t)length>=sizeof digits){abort();}
-		|return blorp_string_append_bytes_take_left(left,digits,(int64_t)length);
-		|}
-		|
+pure func string_append_int_runtime() -> String:
+	digits = "char digits[BLORP_INT64_DECIMAL_CAPACITY];\nconst int length=snprintf(digits,sizeof digits,\"%\" PRId64,value);\n"
+		.concat("if(length<0||(size_t)length>=sizeof digits){abort();}\n")
+	appending: RuntimeOperation[VariantInstanceId, TypeRef] = StringAppendInt
+	in_place: String = match consuming_helper_name(appending):
+		None: ""
+		Some(helper):
+			"struct blorp_string *${helper}(struct blorp_string *left,int64_t value) {\n${digits}"
+				.concat("return blorp_string_append_bytes_take_left(left,digits,(int64_t)length);\n}\n")
+	"struct blorp_string *blorp_string_append_int(const struct blorp_string *left,int64_t value) {\n${digits}"
+		.concat("return blorp_string_append_bytes(left,digits,(int64_t)length);\n}\n")
+		.concat(in_place)

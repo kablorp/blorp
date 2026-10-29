@@ -1,11 +1,13 @@
 import:
 	bool: and
 	int: Int methods
+	../namespace/builtins: RuntimeOperation(StringConcat, StringAppendInt, ListAppend, ListSet, ListConcat), reuses_first_operand
 	../specialize/specialize:
 		RecordInstanceId,
 		TypeRef(VoidType, IntType, FloatType, StringType, ListType, CallableType, RecordType, UnionType),
 		same_type,
 		UnionInstanceId,
+		VariantInstanceId,
 		record_number,
 		union_number,
 	../utils/text: concat
@@ -284,6 +286,26 @@ pure func list_update_name(update: ListUpdate, key: ListElementKey) -> String:
 	prefix.concat(list_suffix(key))
 
 
+-- The symbol of the in-place helper a runtime operation calls when it
+-- receives operand 0's obligation. Only an operation that reuses its first
+-- operand has one, and a user call never does. The List and String runtime
+-- definitions and emission all name the helper through this function, so a
+-- definition and its call cannot disagree.
+pure func consuming_helper_name(operation: RuntimeOperation[VariantInstanceId, TypeRef]) -> Option[String]:
+	if reuses_first_operand(operation):
+		match operation:
+			StringConcat: Some("blorp_string_concat_take_left")
+			StringAppendInt: Some("blorp_string_append_int_take_left")
+			ListAppend(element): Some("blorp_list_append_take_left_${list_suffix(list_element_key(element))}")
+			ListSet(element): Some("blorp_list_set_take_left_${list_suffix(list_element_key(element))}")
+			ListConcat(element): Some("blorp_list_concat_take_left_${list_suffix(list_element_key(element))}")
+			-- An operation newly marked reusing has no helper yet; emission
+			-- rejects a consumed operand of it rather than calling a copy.
+			_: None
+	else:
+		None
+
+
 -- Borrowed updates copy live slots, acquiring every stored occurrence.
 -- Consumed updates check uniqueness before mutation, which the immortal empty
 -- root never passes. The test must stay `!=1` rather than, say, `>1`: the
@@ -292,11 +314,12 @@ pure func list_update_name(update: ListUpdate, key: ListElementKey) -> String:
 -- size_t storage before arithmetic.
 pure func list_update_runtime(
 	update: ListUpdate,
-	key: ListElementKey,
+	element: TypeRef,
 	element_type: String,
 	acquire: String,
 	destroy: String,
 ) -> String:
+	key = list_element_key(element)
 	suffix = list_suffix(key)
 	type_name = list_c_type(key)
 	name = list_update_name(update, key)
@@ -304,32 +327,40 @@ pure func list_update_runtime(
 	capacity = "(SIZE_MAX-sizeof(struct blorp_l_${suffix}))/sizeof(${element_type})"
 	match update:
 		AppendUpdate:
+			in_place: String = match consuming_helper_name(ListAppend(element)):
+				None: ""
+				Some(helper):
+					"${type_name} ${helper}(${type_name} values,${element_type} value){"
+						.concat("if(atomic_load_explicit(&values->references,memory_order_acquire)!=1){")
+						.concat("${type_name} result=${name}(values,value);blorp_list_drop_${suffix}(values);return result;}")
+						.concat("const size_t count=(size_t)values->length;if(count>=(uintmax_t)INT64_MAX||count>=${capacity})abort();")
+						.concat(reserve_unique(type_name, "count+1", capacity))
+						.concat("${element_type} element=value;${acquire}")
+						.concat(list_slot_store("values", "count", "element")).concat("return values;}")
 			"${type_name} ${name}(${borrowed}values,${element_type} value){const uint64_t count=(uint64_t)values->length;"
 				.concat("if(count>=(uint64_t)INT64_MAX||count>=${capacity})abort();")
 				.concat("${allocate_root(type_name, "(count+1)")}for(uint64_t index=0;index<count;index++){")
 				.concat("${element_type} element=values->values[index];${store_occurrence(acquire, "index")}}${element_type} element=value;")
 				.concat("${store_occurrence(acquire, "count")}return result;}")
-				.concat("${type_name} blorp_list_append_take_left_${suffix}(${type_name} values,${element_type} value){")
-				.concat("if(atomic_load_explicit(&values->references,memory_order_acquire)!=1){")
-				.concat("${type_name} result=${name}(values,value);blorp_list_drop_${suffix}(values);return result;}")
-				.concat("const size_t count=(size_t)values->length;if(count>=(uintmax_t)INT64_MAX||count>=${capacity})abort();")
-				.concat(reserve_unique(type_name, "count+1", capacity))
-				.concat("${element_type} element=value;${acquire}")
-				.concat(list_slot_store("values", "count", "element")).concat("return values;}")
+				.concat(in_place)
 		SetUpdate:
+			in_place: String = match consuming_helper_name(ListSet(element)):
+				None: ""
+				Some(helper):
+					"${type_name} ${helper}(${type_name} values,int64_t index,${element_type} value){"
+						.concat("if(atomic_load_explicit(&values->references,memory_order_acquire)!=1){")
+						.concat("${type_name} result=${name}(values,index,value);blorp_list_drop_${suffix}(values);return result;}")
+						.concat("if(index<0||index>=values->length)return values;")
+						.concat("{${element_type} element=value;(void)element;${acquire}}")
+						.concat("{${element_type} element=values->values[index];(void)element;${destroy}}")
+						.concat("values->values[index]=value;return values;}")
 			-- Acquiring first protects a replacement equal to the old occurrence.
 			"${type_name} ${name}(${borrowed}values,int64_t index,${element_type} value){"
 				.concat("const uint64_t count=(uint64_t)values->length;")
 				.concat("${allocate_root(type_name, "count")}for(uint64_t slot=0;slot<count;slot++){")
 				.concat("${element_type} element=(index>=0&&(uint64_t)index==slot)?value:values->values[slot];")
 				.concat("${store_occurrence(acquire, "slot")}}return result;}")
-				.concat("${type_name} blorp_list_set_take_left_${suffix}(${type_name} values,int64_t index,${element_type} value){")
-				.concat("if(atomic_load_explicit(&values->references,memory_order_acquire)!=1){")
-				.concat("${type_name} result=${name}(values,index,value);blorp_list_drop_${suffix}(values);return result;}")
-				.concat("if(index<0||index>=values->length)return values;")
-				.concat("{${element_type} element=value;(void)element;${acquire}}")
-				.concat("{${element_type} element=values->values[index];(void)element;${destroy}}")
-				.concat("values->values[index]=value;return values;}")
+				.concat(in_place)
 		SuffixUpdate:
 			-- Selection verification proves 0 <= start <= length. The new
 			-- root is no larger than its source, whose allocation succeeded.
@@ -337,20 +368,24 @@ pure func list_update_runtime(
 				.concat("${allocate_root(type_name, "count")}for(uint64_t index=0;index<count;index++){")
 				.concat("${element_type} element=values->values[(uint64_t)start+index];${store_occurrence(acquire, "index")}}return result;}")
 		ConcatUpdate:
+			in_place: String = match consuming_helper_name(ListConcat(element)):
+				None: ""
+				Some(helper):
+					"${type_name} ${helper}(${type_name} values,${borrowed}right){"
+						.concat("if(atomic_load_explicit(&values->references,memory_order_acquire)!=1){")
+						.concat("${type_name} result=${name}(values,right);blorp_list_drop_${suffix}(values);return result;}")
+						.concat("const uint64_t first=(uint64_t)values->length;const uint64_t second=(uint64_t)right->length;")
+						.concat("if(second>(uint64_t)INT64_MAX-first||second>${capacity}-first)abort();")
+						.concat(reserve_unique(type_name, "first+second", capacity))
+						.concat("for(uint64_t index=0;index<second;index++){${element_type} element=right->values[index];${acquire}")
+						.concat(list_slot_store("values", "first+index", "element")).concat("}return values;}")
 			"${type_name} ${name}(${borrowed}left,${borrowed}right){const uint64_t first=(uint64_t)left->length;"
 				.concat("const uint64_t second=(uint64_t)right->length;if(second>(uint64_t)INT64_MAX-first||first+second>${capacity})abort();")
 				.concat("${allocate_root(type_name, "(first+second)")}for(uint64_t index=0;index<first;index++){")
 				.concat("${element_type} element=left->values[index];${store_occurrence(acquire, "index")}}")
 				.concat("for(uint64_t index=0;index<second;index++){${element_type} element=right->values[index];")
 				.concat("${store_occurrence(acquire, "first+index")}}return result;}")
-				.concat("${type_name} blorp_list_concat_take_left_${suffix}(${type_name} values,${borrowed}right){")
-				.concat("if(atomic_load_explicit(&values->references,memory_order_acquire)!=1){")
-				.concat("${type_name} result=${name}(values,right);blorp_list_drop_${suffix}(values);return result;}")
-				.concat("const uint64_t first=(uint64_t)values->length;const uint64_t second=(uint64_t)right->length;")
-				.concat("if(second>(uint64_t)INT64_MAX-first||second>${capacity}-first)abort();")
-				.concat(reserve_unique(type_name, "first+second", capacity))
-				.concat("for(uint64_t index=0;index<second;index++){${element_type} element=right->values[index];${acquire}")
-				.concat(list_slot_store("values", "first+index", "element")).concat("}return values;}")
+				.concat(in_place)
 
 
 -- argv uses the same concrete String list root and destruction as source Lists.

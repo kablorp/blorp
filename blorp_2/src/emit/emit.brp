@@ -23,17 +23,17 @@ import:
 			MissingRuntimeArgument, MissingFunctionRow, MissingJoinTransfer, MissingSelectionArm, MissingEnclosingLoop,
 			StatementOnlyValue, InvalidOperationShape, MissingAggregateWorkItem,
 			MissingAggregateVisit, CyclicByValueAggregate, MissingAggregateLayout,
-			MissingAggregateMember, MissingUnionPayloadField,
+			MissingAggregateMember, MissingUnionPayloadField, MissingInPlaceHelper,
 		), render,
 	../runtime/float: float_parse_runtime, float_runtime, float_string_runtime
 	../runtime/system: SYSTEM_CURRENT_DIRECTORY_RUNTIME, SYSTEM_READ_FILE_RUNTIME, SYSTEM_WRITE_FILE_RUNTIME
-	../runtime/string_concat: STRING_CONCAT_RUNTIME, STRING_APPEND_INT_RUNTIME
+	../runtime/string_concat: string_concat_runtime, string_append_int_runtime
 	../runtime/memory: MEMORY_RUNTIME
 	../runtime/process: PROCESS_POSIX_PRELUDE, process_runtime
 	int: INT_MIN, Int methods
 	../runtime/list:
 		ListElementKey, ListUpdate(AppendUpdate, SetUpdate, ConcatUpdate, SuffixUpdate), arguments_runtime,
-		callable_suffix, list_c_type, list_child_key, list_element_key, list_key_depth, list_key_ordinal,
+		callable_suffix, consuming_helper_name, list_c_type, list_child_key, list_element_key, list_key_depth, list_key_ordinal,
 		list_key_rank, list_key_is_callable, list_empty_root, list_root_allocation, list_runtime, list_slot_store, list_suffix,
 		list_update_name, list_update_runtime, same_list_key, LIST_SHARED_RUNTIME
 	../lower/lower as Lower: ValueId, value_number
@@ -1039,31 +1039,14 @@ private pure func append_operation(
 				invocation = "${invocation},${c_value(argument_value(argument))}"
 			Ok("${invocation})")
 		CallDefinition(target, arguments):
-			match c_callable(target):
-				None: Err(render(span, StatementOnlyValue(id)))
-				Some(callable):
-					name = match target:
-						RuntimeFunction(StringConcat):
-							match arguments.get(0):
-								Some(ConsumedArgument(_, _)): "blorp_string_concat_take_left"
-								_: callable
-						RuntimeFunction(ListAppend(element)):
-							match arguments.get(0):
-								Some(ConsumedArgument(_, _)): "blorp_list_append_take_left_${list_suffix(list_element_key(element))}"
-								_: callable
-						RuntimeFunction(ListSet(element)):
-							match arguments.get(0):
-								Some(ConsumedArgument(_, _)): "blorp_list_set_take_left_${list_suffix(list_element_key(element))}"
-								_: callable
-						RuntimeFunction(ListConcat(element)):
-							match arguments.get(0):
-								Some(ConsumedArgument(_, _)): "blorp_list_concat_take_left_${list_suffix(list_element_key(element))}"
-								_: callable
-						RuntimeFunction(StringAppendInt):
-							match arguments.get(0):
-								Some(ConsumedArgument(_, _)): "blorp_string_append_int_take_left"
-								_: callable
-						_: callable
+			-- A runtime operand 0 that receives its obligation calls the
+			-- operation's in-place helper; verification admits no other.
+			named: Result[String, Diagnostic] = match (target, arguments.get(0)):
+				(RuntimeFunction(runtime), Some(ConsumedArgument(_, _))): consuming_helper_name(runtime).to_result(render(span, MissingInPlaceHelper(id)))
+				_: c_callable(target).to_result(render(span, StatementOnlyValue(id)))
+			match named:
+				Err(error): Err(error)
+				Ok(name):
 					var prefix = "${output}${name}("
 					var index: Int = 0
 
@@ -2917,7 +2900,7 @@ private pure func append_list_updates(
 					failure = Some(error)
 					break
 				Ok(element):
-					fragments = fragments.append(list_update_runtime(helper.update, helper.layout.key, element.type_name, element.acquire, element.destroy))
+					fragments = fragments.append(list_update_runtime(helper.update, helper.layout.element, element.type_name, element.acquire, element.destroy))
 		match failure:
 			Some(error): Err(error)
 			None: Ok(fragments.join("\n"))
@@ -3117,10 +3100,10 @@ pure func emit(program: VerifiedProgram) -> Result[String, Diagnostic]:
 		fragments = fragments.append(string_equals_runtime())
 
 	if requirements.string_concatenation.or(requirements.string_integer_appending):
-		fragments = fragments.append(STRING_CONCAT_RUNTIME)
+		fragments = fragments.append(string_concat_runtime())
 
 	if requirements.string_integer_appending:
-		fragments = fragments.append(STRING_APPEND_INT_RUNTIME)
+		fragments = fragments.append(string_append_int_runtime())
 
 	if requirements.string_slicing:
 		fragments = fragments.append(STRING_SLICE_RUNTIME)
