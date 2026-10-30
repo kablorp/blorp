@@ -420,17 +420,28 @@ private pure func construction_result_type(term: InferenceType, readiness: Infer
 		DeferredInference: Ok(term)
 
 
+private pure func is_deferred(value: PendingValue) -> Bool:
+	match value.readiness:
+		DeferredInference: True
+		ClosedInference: False
+
+
+-- A construction is closed only when every operand is closed and its own type
+-- is fully inferred.
+private pure func construction_readiness(operand_deferred: Bool, term: InferenceType, slots: List[InferenceSlot], span: Span) -> Result[InferenceReadiness, CheckError]:
+	complete ?= inference_complete(term, slots, span)
+	if and(complete, operand_deferred.not()):
+		Ok(ClosedInference)
+	else:
+		Ok(DeferredInference)
+
+
 pure func finish_pending_record(plan: PlannedRecordFields, fields: List[PendingRecordField], slots: List[InferenceSlot]) -> Result[PendingValue, CheckError]:
-	var readiness: InferenceReadiness = match plan.origin:
-		LiteralRecord(_): ClosedInference
-		UpdatedRecord(_, base, _, _): base.readiness
-	for field in fields:
-		match field.value.readiness:
-			DeferredInference: readiness = DeferredInference
-			ClosedInference: void
-	complete ?= inference_complete(plan.value_type, slots, plan.span)
-	if complete.not():
-		readiness = DeferredInference
+	field_deferred = fields.any(pure func(field: PendingRecordField) -> Bool: is_deferred(field.value))
+	operand_deferred = match plan.origin:
+		LiteralRecord(_): field_deferred
+		UpdatedRecord(_, base, _, _): or(field_deferred, is_deferred(base))
+	readiness ?= construction_readiness(operand_deferred, plan.value_type, slots, plan.span)
 	_: Void ?= match readiness:
 		ClosedInference: validate_record_fields(fields, slots)
 		DeferredInference: Ok(void)
@@ -481,11 +492,7 @@ private pure func instantiate_variant(
 	arguments: List[InferenceType],
 	name: WrittenName,
 ) -> Result[PendingVariantContract, CheckError]:
-	var hints: List[Option[InferenceType]] = []
-
-	for argument in arguments:
-		hints = hints.append(Some(argument))
-
+	hints = record_argument_hints(arguments)
 	var fields: List[InferenceUse] = []
 	var failure: Option[CheckError] = None
 	for annotation in variant.fields:
@@ -572,12 +579,7 @@ pure func plan_qualified_variant(
 
 private pure func plan_known_qualified_variant(declared: DeclaredVariantContract, name: WrittenName, arguments: List[ValueExpression], called: Bool, expected: Option[InferenceType]) -> Result[PlannedBase, CheckError]:
 	contract ?= pending_qualified_variant(declared, name, expected)
-	if and(contract.fields.is_empty(), called):
-		Err(constructor_error(name.span, PayloadFreeVariantCalled(contract.variant)))
-	else if contract.fields.length() != arguments.length():
-		Err(constructor_error(name.span, ConstructorFieldCountMismatch(contract.variant, contract.fields.length(), arguments.length())))
-	else:
-		Ok(PlannedVariant(contract, arguments))
+	plan_variant_arguments(contract, name, arguments, called)
 
 
 pure func plan_variant(
@@ -598,17 +600,16 @@ pure func plan_variant(
 
 private pure func plan_known_variant(variant: VariantId, name: WrittenName, arguments: List[ValueExpression], called: Bool, expected: InferenceType, slots: List[InferenceSlot], context: ConstructionContext) -> Result[PlannedBase, CheckError]:
 	contract ?= pending_variant(variant, name, Some(expected), slots, context)
+	plan_variant_arguments(contract, name, arguments, called)
+
+
+-- A payload-free variant takes no call, and a payload variant takes one
+-- argument per field.
+private pure func plan_variant_arguments(contract: PendingVariantContract, name: WrittenName, arguments: List[ValueExpression], called: Bool) -> Result[PlannedBase, CheckError]:
 	if and(contract.fields.is_empty(), called):
 		Err(constructor_error(name.span, PayloadFreeVariantCalled(contract.variant)))
 	else if contract.fields.length() != arguments.length():
-		Err(constructor_error(
-			name.span,
-			ConstructorFieldCountMismatch(
-				contract.variant,
-				contract.fields.length(),
-				arguments.length(),
-			),
-		))
+		Err(constructor_error(name.span, ConstructorFieldCountMismatch(contract.variant, contract.fields.length(), arguments.length())))
 	else:
 		Ok(PlannedVariant(contract, arguments))
 
@@ -664,14 +665,7 @@ pure func finish_pending_variant(
 	span: Span,
 	slots: List[InferenceSlot],
 ) -> Result[PendingValue, CheckError]:
-	var readiness: InferenceReadiness = ClosedInference
-	for value in values:
-		match value.readiness:
-			DeferredInference: readiness = DeferredInference
-			ClosedInference: void
-	complete ?= inference_complete(contract.result_type, slots, span)
-	if complete.not():
-		readiness = DeferredInference
+	readiness ?= construction_readiness(values.any(is_deferred), contract.result_type, slots, span)
 	_: Void ?= match readiness:
 		ClosedInference: validate_variant_fields(contract, values, slots)
 		DeferredInference: Ok(void)
@@ -762,14 +756,7 @@ pure func finish_pending_list(
 	slots: List[InferenceSlot],
 ) -> Result[PendingValue, CheckError]:
 	element ?= list_element_type(source, values, base_span)
-	var readiness: InferenceReadiness = ClosedInference
-	for value in values:
-		match value.readiness:
-			DeferredInference: readiness = DeferredInference
-			ClosedInference: void
-	complete ?= inference_complete(element, slots, base_span)
-	if complete.not():
-		readiness = DeferredInference
+	readiness ?= construction_readiness(values.any(is_deferred), element, slots, base_span)
 	value_type: InferenceType ?= match readiness:
 		ClosedInference: validate_list_elements(source, values, slots, base_span).map(pure func(accepted): AcceptedType(ListType(accepted)))
 		DeferredInference: Ok(list_inference_type(element))
