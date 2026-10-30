@@ -34,6 +34,7 @@ import:
 		compiler_span,
 		entry_function,
 		diagnostic,
+		internal_error,
 	../utils/text: concat
 
 
@@ -120,9 +121,9 @@ pure func variant_field(
 	unions: List[ConcreteUnion],
 	span: Span,
 ) -> Result[VariantFieldInstanceId, Diagnostic]:
-	layout ?= unions.get(union_number(variant_owner(id))).to_result(invalid(span, "unknown variant owner"))
-	fields ?= union_variants(layout).get(variant_number(id)).to_result(invalid(span, "unknown variant identity"))
-	valid ?= fields.get(position).to_result(invalid(span, "unknown variant field"))
+	layout ?= unions.get(union_number(variant_owner(id))).to_result(internal_error(span, "unknown variant owner"))
+	fields ?= union_variants(layout).get(variant_number(id)).to_result(internal_error(span, "unknown variant identity"))
+	valid ?= fields.get(position).to_result(internal_error(span, "unknown variant field"))
 	Ok(into_opaque VariantFieldInstanceId({ variant = id, position = position }))
 
 
@@ -518,30 +519,12 @@ private fixed record TypeSubstitution[T] {
 }
 
 
-private pure func invalid(span: Span, message: String) -> Diagnostic:
-	{
-		span = span,
-		note = None,
-		message = "internal specialization error: ${message}",
-		help = "report this compiler error with the input program"
-	}
-
-
 private pure func missing_body(source: RequestSource, message: String) -> Diagnostic:
 	span = match source:
 		ConcreteRequest(span): span
 		EntrypointRoot:
 			compiler_span()
-	invalid(span, message)
-
-
-private pure func ownership_error(message: String) -> Diagnostic:
-	{
-		span = compiler_span(),
-		note = None,
-		message = "internal compiler error: ${message}",
-		help = "report this compiler error with the input program"
-	}
+	internal_error(span, message)
 
 
 -- Project the published storage fact, without rediscovering managed children.
@@ -559,7 +542,7 @@ pure func value_needs_ownership(
 		RecordType(id):
 			match records.get(record_number(id)):
 				None:
-					Err(ownership_error("invalid record identity in ownership representation"))
+					Err(internal_error(compiler_span(), "invalid record identity in ownership representation"))
 				Some(declaration):
 					match declaration:
 						InlineFields(_): Ok(False)
@@ -567,7 +550,7 @@ pure func value_needs_ownership(
 		UnionType(id):
 			match unions.get(union_number(id)):
 				None:
-					Err(ownership_error("invalid union identity in ownership representation"))
+					Err(internal_error(compiler_span(), "invalid union identity in ownership representation"))
 				Some(declaration):
 					match declaration:
 						PlainCases(_): Ok(False)
@@ -640,7 +623,7 @@ private pure func indexed_position[T](
 ) -> Result[Option[Int], Diagnostic]:
 	match find_position(table, digest, matches):
 		Ok(found): Ok(found)
-		Err(_): Err(invalid(span, "specialization index names a missing instance"))
+		Err(_): Err(internal_error(span, "specialization index names a missing instance"))
 
 
 private pure func find_record_instance(
@@ -660,14 +643,14 @@ private pure func concrete_record_field_type(
 	records: IndexedList[RecordInstance],
 	span: Span,
 ) -> Result[TypeRef, Diagnostic]:
-	instance ?= records.entries.get(record_number(owner)).to_result(invalid(span, "unknown concrete record"))
+	instance ?= records.entries.get(record_number(owner)).to_result(internal_error(span, "unknown concrete record"))
 	_: Void ?= if same_record_origin(instance.key.origin, DeclaredRecord(Checked.field_owner(field))):
 		Ok(void)
 	else:
-		Err(invalid(span, "field declaration differs from concrete record"))
+		Err(internal_error(span, "field declaration differs from concrete record"))
 	record_fields(instance.layout)
 		.get(Checked.field_number(field))
-		.to_result(invalid(span, "unknown record field"))
+		.to_result(internal_error(span, "unknown record field"))
 
 
 private pure func translate_field(
@@ -702,7 +685,7 @@ private pure func lookup_record_instance(
 	span: Span,
 ) -> Result[RecordInstanceId, Diagnostic]:
 	found ?= find_record_instance(records, { origin = DeclaredRecord(declaration), arguments = arguments }, span)
-	found.to_result(invalid(span, "unprepared record instance"))
+	found.to_result(internal_error(span, "unprepared record instance"))
 
 
 -- A record construction's instance: the declaration its form names, at the type
@@ -719,7 +702,7 @@ private pure func record_instance(
 		Checked.NominalType(Checked.RecordAggregate(_), arguments):
 			concrete_record(opaques, declaration, arguments, substitution, unions, value.span, records)
 		_:
-			Err(invalid(value.span, "record construction has a non-record type"))
+			Err(internal_error(value.span, "record construction has a non-record type"))
 
 
 private pure func concrete_types(
@@ -760,7 +743,7 @@ private pure func concrete_type(
 		Checked.OpaqueType(id):
 			match opaques.get(Declaration.opaque_number(id)):
 				Some(declaration): concrete_type(opaques, declaration.underlying_type.value_type, { substitution | values = [] }, unions, span, records)
-				None: Err(invalid(span, "unknown opaque declaration"))
+				None: Err(internal_error(span, "unknown opaque declaration"))
 		Checked.CallableType(_, parameters, result):
 			match concrete_types(opaques, parameters, substitution, unions, span, records):
 				Err(error): Err(error)
@@ -799,7 +782,7 @@ private pure func concrete_type(
 						span,
 					):
 						Ok(Some(union_id)): Ok(UnionType(union_id))
-						Ok(None): Err(invalid(span, "unprepared union instance"))
+						Ok(None): Err(internal_error(span, "unprepared union instance"))
 						Err(error): Err(error)
 				Err(error): Err(error)
 		Checked.ParameterType(id):
@@ -815,7 +798,7 @@ private pure func concrete_tuple_type(
 ) -> Result[TypeRef, Diagnostic]:
 	arguments ?= concrete_types(opaques, elements, substitution, unions, span, records)
 	found ?= find_record_instance(records, { origin = StructuralTuple, arguments = arguments }, span)
-	owner ?= found.to_result(invalid(span, "unprepared structural tuple instance"))
+	owner ?= found.to_result(internal_error(span, "unprepared structural tuple instance"))
 	Ok(RecordType(owner))
 
 
@@ -916,7 +899,7 @@ private pure func callable_mode(
 		if Checked.same_callable_parameter(id, parameter):
 			found = Some(choice)
 			break
-	found.to_result(invalid(span, "missing concrete callable parameter mode"))
+	found.to_result(internal_error(span, "missing concrete callable parameter mode"))
 
 
 private pure func forward_callable(
@@ -936,7 +919,7 @@ private pure func validate_type_parameters(
 	var failure: Option[Diagnostic] = None
 	var position = 0
 	if parameters.length() != argument_count:
-		Err(invalid(span, "type argument count differs from the declaration"))
+		Err(internal_error(span, "type argument count differs from the declaration"))
 	else:
 		for parameter in parameters:
 			owner_matches = Checked.same_owner(Checked.parameter_owner(parameter), owner)
@@ -945,7 +928,7 @@ private pure func validate_type_parameters(
 				owner_matches.not(),
 				Checked.parameter_position(parameter) != position,
 			):
-				failure = Some(invalid(span, "invalid declaration type parameter"))
+				failure = Some(internal_error(span, "invalid declaration type parameter"))
 				break
 
 			position = position.add(1)
@@ -966,7 +949,7 @@ private pure func parameter_substitution[T](
 		match arguments.get(position):
 			Some(value): substitution = substitution.append({ parameter = parameter, value_type = value })
 			None:
-				failure = Some(invalid(span, "missing concrete type argument"))
+				failure = Some(internal_error(span, "missing concrete type argument"))
 				break
 		position = position.add(1)
 	match failure:
@@ -988,10 +971,10 @@ private pure func semantic_type(
 	value: Checked.TypeRef, substitution: Declarations.Substitution, span: Span,
 ) -> Result[Checked.TypeRef, Diagnostic]:
 	match Declarations.substitute_type(value, substitution, span):
-		Err(_): Err(invalid(span, "unresolved or foreign type parameter"))
+		Err(_): Err(internal_error(span, "unresolved or foreign type parameter"))
 		Ok(replaced):
 			if contains_parameter(replaced):
-				Err(invalid(span, "unresolved or foreign type parameter"))
+				Err(internal_error(span, "unresolved or foreign type parameter"))
 			else:
 				Ok(replaced)
 
@@ -1350,8 +1333,8 @@ private fixed record LeftLayout {
 -- Pops the innermost in-progress layout once its slot is published.
 private pure func leave_layout(layouts: List[InProgressLayout], span: Span) -> Result[LeftLayout, Diagnostic]:
 	last = layouts.length().subtract(1)
-	innermost ?= layouts.get(last).to_result(invalid(span, "layout completed outside its own preparation"))
-	remaining ?= layouts.remove(last).to_result(invalid(span, "layout completed outside its own preparation"))
+	innermost ?= layouts.get(last).to_result(internal_error(span, "layout completed outside its own preparation"))
+	remaining ?= layouts.remove(last).to_result(internal_error(span, "layout completed outside its own preparation"))
 	back_reference = match innermost:
 		InProgressUnion(_, marked): marked
 		InProgressRecord(_, marked): marked
@@ -1452,7 +1435,7 @@ private pure func resolve_partials(values: List[PartialType], completed: Complet
 private pure func known_type(value: PartialType, span: Span) -> Result[TypeRef, Diagnostic]:
 	match value:
 		KnownType(known): Ok(known)
-		_: Err(invalid(span, "layout reference left unresolved after its group completed"))
+		_: Err(internal_error(span, "layout reference left unresolved after its group completed"))
 
 
 private pure func known_types(values: List[PartialType], span: Span) -> Result[List[TypeRef], Diagnostic]:
@@ -1559,7 +1542,7 @@ private pure func resolve_union_slots(
 			Some(CompleteUnion(_)):
 				void
 			None:
-				failure = Some(invalid(span, "union slot left its builder"))
+				failure = Some(internal_error(span, "union slot left its builder"))
 
 		position = position.add(1)
 
@@ -1601,7 +1584,7 @@ private pure func resolve_record_slots(
 			Some(CompleteRecord(_)):
 				void
 			None:
-				failure = Some(invalid(span, "record slot left its builder"))
+				failure = Some(internal_error(span, "record slot left its builder"))
 
 		position = position.add(1)
 
@@ -1630,7 +1613,7 @@ private pure func payload_owns_children(
 				RecordType(child):
 					match records.entries.get(record_number(child)):
 						None:
-							Err(invalid(span, "missing concrete record child layout"))
+							Err(internal_error(span, "missing concrete record child layout"))
 						Some(slot):
 							owns_children: Bool = match slot_record_representation(slot):
 								ManagedRecord: True
@@ -1639,7 +1622,7 @@ private pure func payload_owns_children(
 				UnionType(child):
 					match unions.entries.get(union_number(child)):
 						None:
-							Err(invalid(span, "missing concrete child layout"))
+							Err(internal_error(span, "missing concrete child layout"))
 						Some(slot):
 							owns_children: Bool = match slot_union_representation(slot):
 								InlineOwningPayload | BoxedRecursive: True
@@ -1678,7 +1661,7 @@ private pure func prepare_union(
 ) -> Result[PreparedType, Diagnostic]:
 	declaration ?= checked.unions
 		.get(Declaration.union_number(key.declaration))
-		.to_result(invalid(span, "unknown union declaration"))
+		.to_result(internal_error(span, "unknown union declaration"))
 	substitution ?= parameter_substitution(
 		declaration.type_parameters,
 		key.arguments,
@@ -1771,7 +1754,7 @@ private pure func inline_record_field(field: PartialType, records: IndexedList[R
 		KnownType(RecordType(child)):
 			match records.entries.get(record_number(child)):
 				None:
-					Err(invalid(compiler_span(), "missing concrete record child layout"))
+					Err(internal_error(compiler_span(), "missing concrete record child layout"))
 				Some(slot):
 					is_inline: Bool = match slot_record_representation(slot):
 						InlineRecord: True
@@ -1834,7 +1817,7 @@ private pure func prepare_source_record(
 	key: PartialRecordKey, id: Declaration.RecordId, checked: Checked.CheckedFunctions,
 	unions: IndexedList[UnionSlot], span: Span, records: IndexedList[RecordSlot], in_progress: List[InProgressLayout],
 ) -> Result[PreparedType, Diagnostic]:
-	declaration ?= checked.records.get(Declaration.record_number(id)).to_result(invalid(span, "unknown record declaration"))
+	declaration ?= checked.records.get(Declaration.record_number(id)).to_result(internal_error(span, "unknown record declaration"))
 	selected: SelectedRecord = {
 		type_parameters = declaration.type_parameters,
 		parameter_owner = Checked.RecordDeclaration(id),
@@ -1848,8 +1831,8 @@ private pure func prepare_capture_record(
 	key: PartialRecordKey, id: Checked.LambdaId, checked: Checked.CheckedFunctions,
 	unions: IndexedList[UnionSlot], span: Span, records: IndexedList[RecordSlot], in_progress: List[InProgressLayout],
 ) -> Result[PreparedType, Diagnostic]:
-	lambda ?= checked.lambdas.get(Checked.lambda_number(id)).to_result(invalid(span, "unknown capture environment lambda"))
-	root ?= checked.functions.get(Declaration.function_number(lambda.root)).to_result(invalid(span, "unknown capture environment root"))
+	lambda ?= checked.lambdas.get(Checked.lambda_number(id)).to_result(internal_error(span, "unknown capture environment lambda"))
+	root ?= checked.functions.get(Declaration.function_number(lambda.root)).to_result(internal_error(span, "unknown capture environment root"))
 	selected: SelectedRecord = {
 		type_parameters = root.signature.type_parameters,
 		parameter_owner = Checked.FunctionDeclaration(lambda.root),
@@ -1989,7 +1972,7 @@ private pure func prepare_type(
 		Checked.OpaqueType(id):
 			match checked.opaques.get(Declaration.opaque_number(id)):
 				Some(declaration): prepare_type(declaration.underlying_type.value_type, [], checked, unions, span, records, in_progress)
-				None: Err(invalid(span, "unknown opaque declaration"))
+				None: Err(internal_error(span, "unknown opaque declaration"))
 		Checked.CallableType(_, parameters, result):
 			match prepare_arguments(parameters, substitution, checked, unions, span, records, in_progress):
 				Err(error): Err(error)
@@ -2019,7 +2002,7 @@ private pure func prepare_type(
 				Some(replaced):
 					Ok({ value_type = replaced, unions = unions, records = records, in_progress = in_progress })
 				None:
-					Err(invalid(span, "unresolved or foreign type parameter"))
+					Err(internal_error(span, "unresolved or foreign type parameter"))
 		Checked.TupleType(elements):
 			prepare_tuple_type(elements, substitution, checked, unions, span, records, in_progress)
 		Checked.ListType(element):
@@ -2058,7 +2041,7 @@ private pure func seal_unions(slots: IndexedList[UnionSlot]) -> Result[IndexedLi
 			CompleteUnion(instance):
 				instances = instances.append(instance)
 			PendingUnion(_):
-				failure = Some(invalid(compiler_span(), "union layout sealed while still pending"))
+				failure = Some(internal_error(compiler_span(), "union layout sealed while still pending"))
 				break
 
 	match failure:
@@ -2075,7 +2058,7 @@ private pure func seal_records(slots: IndexedList[RecordSlot]) -> Result[Indexed
 			CompleteRecord(instance):
 				instances = instances.append(instance)
 			PendingRecord(_):
-				failure = Some(invalid(compiler_span(), "record layout sealed while still pending"))
+				failure = Some(internal_error(compiler_span(), "record layout sealed while still pending"))
 				break
 
 	match failure:
@@ -2256,7 +2239,7 @@ private pure func selected_body(
 				None: Err(missing_body(source, "unknown lambda identity"))
 				Some(lambda):
 					match checked.functions.get(Declaration.function_number(lambda.root)):
-						None: Err(invalid(lambda.return_type.span, "unknown lambda root"))
+						None: Err(internal_error(lambda.return_type.span, "unknown lambda root"))
 						Some(root): Ok({
 							base_label = root.label,
 							captures = lambda.captures,
@@ -2355,7 +2338,7 @@ private pure func runtime_instance(
 			False
 	)
 	found.map(pure func(position: Int) -> FunctionInstanceId: into_opaque FunctionInstanceId(position))
-		.to_result(invalid(span, "missing runtime callable body instance"))
+		.to_result(internal_error(span, "missing runtime callable body instance"))
 
 
 private pure func request_instance(
@@ -2396,7 +2379,7 @@ private pure func prepare_callable_storage(
 						storage = EnvironmentCallable(owner),
 						prepared = { prepared | unions = layout.unions, records = layout.records }
 					})
-					Ok(_): Err(invalid(span, "capture environment has a non-record layout"))
+					Ok(_): Err(internal_error(span, "capture environment has a non-record layout"))
 
 
 -- Check has proved the obligation. Ground semantic Self before selecting the
@@ -2404,7 +2387,7 @@ private pure func prepare_callable_storage(
 private pure func selected_method_body(method: Checked.AcceptedMethodCall, substitution: Declarations.Substitution, traits: Checked.AcceptedTraits, span: Span) -> Result[Checked.SelectedMethodBody, Diagnostic]:
 	receiver ?= semantic_type(Checked.method_receiver(method), substitution, span)
 	Checked.method_body(traits, Checked.accepted_method(Checked.method_identity(method), receiver))
-		.to_result(invalid(span, "accepted method has no implementation body"))
+		.to_result(internal_error(span, "accepted method has no implementation body"))
 
 
 private pure func prepare_body_instance(body: Checked.BodyOwner, arguments: List[Checked.TypeRef], checked: Checked.CheckedFunctions, initial: PreparedInstances, span: Span) -> Result[PreparedInstances, Diagnostic]:
@@ -2668,7 +2651,7 @@ private pure func expand_instances(
 		match prepared.functions.entries.get(cursor):
 			None:
 				failure = Some(
-					invalid(
+					internal_error(
 						compiler_span(),
 						"missing instance request",
 					),
@@ -2760,7 +2743,7 @@ private fixed record TranslationBindings {
 private pure func translated_binding(
 	translation: TranslationBindings, id: Checked.BindingId, span: Span,
 ) -> Result[BindingTranslation, Diagnostic]:
-	translation.bindings.get(Checked.binding_number(id)).to_result(invalid(span, "missing checked binding translation"))
+	translation.bindings.get(Checked.binding_number(id)).to_result(internal_error(span, "missing checked binding translation"))
 
 
 private pure func runtime_binding(
@@ -2771,7 +2754,7 @@ private pure func runtime_binding(
 		RuntimeValueBinding(runtime, _): Ok(runtime)
 		RuntimeCallableBinding(_, runtime, _): Ok(runtime)
 		ErasedCallableBinding(_, _) | CapturedCallableBinding(_, _, _):
-			Err(invalid(span, "static callable used as an ordinary binding"))
+			Err(internal_error(span, "static callable used as an ordinary binding"))
 
 
 private pure func runtime_bindings(
@@ -2793,7 +2776,7 @@ private pure func translated_callable(
 		if matches:
 			found = Some(binding)
 			break
-	found.to_result(invalid(span, "missing callable formal binding translation"))
+	found.to_result(internal_error(span, "missing callable formal binding translation"))
 
 
 private pure func forward_translation(
@@ -2805,7 +2788,7 @@ private pure func forward_translation(
 		ErasedCallableBinding(known, _): Ok(StaticCallable({ known | parameter = destination_parameter }))
 		CapturedCallableBinding(known, _, _): Ok(StaticCallable({ known | parameter = destination_parameter }))
 		RuntimeCallableBinding(_, _, _): Ok(RuntimeCallable(destination_parameter))
-		RuntimeValueBinding(_, _): Err(invalid(span, "ordinary binding used as a callable formal"))
+		RuntimeValueBinding(_, _): Err(internal_error(span, "ordinary binding used as a callable formal"))
 
 
 private pure func lambda_storage(
@@ -2823,7 +2806,7 @@ private pure func lambda_storage(
 			Ok(physical):
 				match find_record_instance(records, { origin = CaptureEnvironment(id), arguments = physical }, span):
 					Err(error): Err(error)
-					Ok(None): Err(invalid(span, "unprepared capture environment"))
+					Ok(None): Err(internal_error(span, "unprepared capture environment"))
 					Ok(Some(owner)): Ok(EnvironmentCallable(owner))
 
 
@@ -2837,8 +2820,8 @@ private pure func callable_environment(
 		CapturedCallableBinding(known, runtime, _):
 			match known.storage:
 				EnvironmentCallable(owner): Ok({ form = ReadBinding(runtime), value_type = RecordType(owner), span = span })
-				ErasedCallable: Err(invalid(span, "environment binding has erased storage"))
-		_: Err(invalid(span, "callable has no separate environment parameter"))
+				ErasedCallable: Err(internal_error(span, "environment binding has erased storage"))
+		_: Err(internal_error(span, "callable has no separate environment parameter"))
 
 
 private pure func translate_call(
@@ -3007,7 +2990,7 @@ private pure func translate_call(
 			match concrete_result:
 				Ok(concrete): Ok(RuntimeFunction(concrete))
 				Err(error): Err(error)
-		Checked.ValueCall(_): Err(invalid(call.span, "stored call reached direct call translation"))
+		Checked.ValueCall(_): Err(internal_error(call.span, "stored call reached direct call translation"))
 		Checked.CallableParameter(parameter):
 			match translated_callable(callables, parameter, call.span):
 				Err(error): Err(error)
@@ -3015,7 +2998,7 @@ private pure func translate_call(
 					choice: Result[KnownCallable, Diagnostic] = match binding:
 						ErasedCallableBinding(known, _): Ok(known)
 						CapturedCallableBinding(known, _, _): Ok(known)
-						_: Err(invalid(call.span, "runtime callable reached direct call translation"))
+						_: Err(internal_error(call.span, "runtime callable reached direct call translation"))
 					match choice:
 						Err(error): Err(error)
 						Ok(known):
@@ -3064,7 +3047,7 @@ private pure func translate_call(
 								callables = choices
 							}, call.span):
 								Err(error): Err(error)
-								Ok(None): Err(invalid(call.span, "unexpanded function instance"))
+								Ok(None): Err(internal_error(call.span, "unexpanded function instance"))
 								Ok(Some(id)): Ok(UserFunction(id))
 
 	target ?= target_result
@@ -3082,7 +3065,7 @@ private pure func concrete_union_owner(
 		UnionType(id):
 			Ok(id)
 		_:
-			Err(invalid(span, "variant occurrence has no concrete union type"))
+			Err(internal_error(span, "variant occurrence has no concrete union type"))
 
 
 private pure func translate_variant(
@@ -3093,17 +3076,17 @@ private pure func translate_variant(
 ) -> Result[VariantInstanceId, Diagnostic]:
 	instance ?= unions.entries
 		.get(union_number(owner))
-		.to_result(invalid(span, "unknown concrete union"))
+		.to_result(internal_error(span, "unknown concrete union"))
 
 	_: Void ?= if Declaration.union_number(instance.key.declaration) == Declaration.union_number(Declaration.variant_owner(id)):
 		Ok(void)
 	else:
-		Err(invalid(span, "variant belongs to a different union declaration"))
+		Err(internal_error(span, "variant belongs to a different union declaration"))
 
 	position = Declaration.variant_number(id)
 	member ?= union_variants(instance.layout)
 		.get(position)
-		.to_result(invalid(span, "unknown union variant"))
+		.to_result(internal_error(span, "unknown union variant"))
 	Ok(into_opaque VariantInstanceId({
 				owner = owner,
 				position = position
@@ -3170,7 +3153,7 @@ private pure func callable_binding_value(
 				Err(error): Err(error)
 				Ok(id):
 					match known.storage:
-						ErasedCallable: Err(invalid(span, "captured callable has erased storage"))
+						ErasedCallable: Err(internal_error(span, "captured callable has erased storage"))
 						EnvironmentCallable(owner):
 							environment: ConcreteExpr = { form = ReadBinding(runtime), value_type = RecordType(owner), span = span }
 							Ok({ form = CapturedCallable(id, environment), value_type = value_type, span = span })
@@ -3260,7 +3243,7 @@ private pure func translate_tuple_element(
 		RecordType(owner):
 			field = into_opaque FieldInstanceId({ owner = owner, position = ordinal })
 			translate_leaf(opaques, ReadRecordField(source, field), value, substitution, unions, records)
-		_: Err(invalid(value.span, "tuple projection has a non-record concrete receiver"))
+		_: Err(internal_error(value.span, "tuple projection has a non-record concrete receiver"))
 
 
 private pure func translate_tuple(
@@ -3279,7 +3262,7 @@ private pure func translate_tuple(
 				fields = fields.append({ field = into_opaque FieldInstanceId({ owner = owner, position = ordinal }), value = child })
 				ordinal = ordinal.add(1)
 			Ok({ form = ConstructRecord(owner, fields), value_type = value_type, span = value.span })
-		_: Err(invalid(value.span, "tuple construction has a non-record concrete type"))
+		_: Err(internal_error(value.span, "tuple construction has a non-record concrete type"))
 
 
 -- A node's type and identity translate before its children, except a field read,
@@ -3321,7 +3304,7 @@ private pure func translate_expr(
 									translated_field = into_opaque FieldInstanceId({ owner = owner, position = Checked.field_number(field) })
 									Ok({ form = ReadRecordField(source, translated_field), value_type = value_type, span = value.span })
 								Err(error): Err(error)
-						_: Err(invalid(value.span, "record operation has a non-record receiver"))
+						_: Err(internal_error(value.span, "record operation has a non-record receiver"))
 				Err(error): Err(error)
 		Checked.InvokeFunction(call):
 			translate_invocation(opaques, value, call, substitution, callables, keys, unions, records)
@@ -3394,14 +3377,14 @@ private pure func translate_expr(
 			translate_leaf(opaques, LiteralFloat(number), value, substitution, unions, records)
 		Checked.ReadCapture(id):
 			match callables.capture:
-				NoCaptureBinding: Err(invalid(value.span, "capture read outside a capture environment"))
+				NoCaptureBinding: Err(internal_error(value.span, "capture read outside a capture environment"))
 				LambdaCaptureBinding(lambda, owner, binding):
 					if Checked.lambda_number(lambda) == Checked.lambda_number(Checked.capture_owner(id)):
 						receiver: ConcreteExpr = { form = ReadBinding(binding), value_type = RecordType(owner), span = value.span }
 						field = into_opaque FieldInstanceId({ owner = owner, position = Checked.capture_number(id) })
 						translate_leaf(opaques, ReadRecordField(receiver, field), value, substitution, unions, records)
 					else:
-						Err(invalid(value.span, "capture read belongs to another lambda"))
+						Err(internal_error(value.span, "capture read belongs to another lambda"))
 		Checked.ReadBinding(id):
 			match translated_binding(callables, id, value.span):
 				Err(error): Err(error)
@@ -3476,7 +3459,7 @@ private pure func translate_call_arguments(
 							match callable_environment(parameter, translation, call.span):
 								Err(error): Err(error)
 								Ok(environment): Ok([environment].concat(values))
-						_: Err(invalid(call.span, "runtime callable reached direct argument translation"))
+						_: Err(internal_error(call.span, "runtime callable reached direct argument translation"))
 		Checked.TraitMethod(_) | Checked.RuntimeFunction(_) | Checked.UserFunction(_, _) | Checked.ValueCall(_): Ok(values)
 
 
@@ -3501,7 +3484,7 @@ private pure func translate_callable_operand(
 						ErasedCallableBinding(_, _): Ok(None)
 						CapturedCallableBinding(_, _, _): callable_environment(parameter, translation, span).map(pure func(value): Some(value))
 						RuntimeCallableBinding(_, _, _): callable_binding_value(binding, keys, span).map(pure func(value): Some(value))
-						RuntimeValueBinding(_, _): Err(invalid(span, "ordinary binding used as a forwarded callable"))
+						RuntimeValueBinding(_, _): Err(internal_error(span, "ordinary binding used as a forwarded callable"))
 		Checked.LambdaCallable(id, captures):
 			translate_capture_environment(opaques, id, captures, substitution, translation, keys, unions, records, span)
 
@@ -3685,7 +3668,7 @@ private pure func translate_place(
 				Ok(concrete_parent):
 					match concrete_parent.value_type:
 						RecordType(owner): Ok(RecordField(concrete_parent, into_opaque FieldInstanceId({ owner = owner, position = ordinal })))
-						_: Err(invalid(span, "pattern record projection has a non-record parent"))
+						_: Err(internal_error(span, "pattern record projection has a non-record parent"))
 		Checked.ListElement(parent, index):
 			match translate_place(opaques, parent, substitution, unions, records, span):
 				Err(error): Err(error)
@@ -3834,7 +3817,7 @@ private pure func admit_scalar_binding(
 	unions: List[ConcreteUnion],
 	records: List[ConcreteRecord],
 ) -> Result[Void, Diagnostic]:
-	binding ?= bindings.get(Checked.binding_number(id)).to_result(ownership_error("invalid binding identity in scalar admission"))
+	binding ?= bindings.get(Checked.binding_number(id)).to_result(internal_error(compiler_span(), "invalid binding identity in scalar admission"))
 	admit_scalar_type(binding.value_type, binding.span, unions, records)
 
 
@@ -4270,7 +4253,7 @@ pure func specialize(program: CheckedProgram) -> Result[SpecializedProgram, Diag
 	)
 	entry_span: Span = compiler_span()
 	located ?= find_instance(prepared.functions, entry_key, entry_span)
-	entrypoint ?= located.to_result(invalid(entry_span, "missing entrypoint instance"))
+	entrypoint ?= located.to_result(internal_error(entry_span, "missing entrypoint instance"))
 
 	accepted: Entrypoint[FunctionInstanceId] = match checked.entrypoint:
 		NoArguments(_, result):

@@ -11,7 +11,7 @@ import:
 	path as Path
 	../utils/source:
 		ModuleId, ModuleKind(UserModule, LibraryModule, FoundationTypesModule, FoundationPreludeModule), foundation_prelude_module_id, foundation_types_module_id, module_id, module_number, module_source, root_module_id, same_module
-	../utils/syntax: Diagnostic, Span, compiler_span
+	../utils/syntax: Diagnostic, Span, compiler_span, diagnostic, internal_error
 	system: get_current_directory, read_file
 
 
@@ -43,20 +43,8 @@ fixed record LoadFailure {
 }
 
 
-private pure func failure(modules: List[SourceFile], diagnostic: Diagnostic) -> LoadFailure:
-	{ sources = { modules = modules }, diagnostic = diagnostic }
-
-
-private pure func rejection(span: Span, message: String, help: String) -> Diagnostic:
-	{ span = span, note = None, message = message, help = help }
-
-
-private pure func internal_error(message: String) -> Diagnostic:
-	rejection(
-		compiler_span(),
-		message,
-		"report this compiler error with the input program",
-	)
+private pure func failure(modules: List[SourceFile], error: Diagnostic) -> LoadFailure:
+	{ sources = { modules = modules }, diagnostic = error }
 
 
 private fixed record LibraryContents {
@@ -104,7 +92,7 @@ private pure func join_parts(directory: String, parts: List[NameId], position: I
 		None:
 			Ok(directory)
 		Some(part):
-			match name_spelling(names, part).to_result(internal_error("import path references an invalid spelling identity")):
+			match name_spelling(names, part).to_result(internal_error(compiler_span(), "import path references an invalid spelling identity")):
 				Ok(spelling): join_parts(Path.join(directory, spelling), parts, position.add(1), names)
 				Err(error): Err(error)
 
@@ -164,7 +152,7 @@ private func read_module(path: String, site: Option[Span]) -> Result[String, Dia
 		Ok(contents):
 			Ok(contents)
 		Err(error):
-			Err(rejection(
+			Err(diagnostic(
 				site.get_or(compiler_span()),
 				"could not read module ${path}: ${error}",
 				"check the import path and provide a readable .brp file under its source root",
@@ -197,10 +185,10 @@ private fixed record ImportCursor {
 -- User modules receive the prelude implicitly, so it is reserved, and a module
 -- under the library root importing a user module would close a cycle through it.
 -- Nested matches, not a tuple, so the host checks that every role is covered.
-private pure func import_rejection(importer: ModuleKind, target: ModuleKind, span: Span) -> Option[Diagnostic]:
+private pure func import_diagnostic(importer: ModuleKind, target: ModuleKind, span: Span) -> Option[Diagnostic]:
 	match target:
 		FoundationPreludeModule:
-			Some(rejection(span, "the prelude cannot be imported explicitly", "remove this import; user modules receive the prelude automatically"))
+			Some(diagnostic(span, "the prelude cannot be imported explicitly", "remove this import; user modules receive the prelude automatically"))
 		FoundationTypesModule | LibraryModule:
 			None
 		UserModule:
@@ -208,7 +196,7 @@ private pure func import_rejection(importer: ModuleKind, target: ModuleKind, spa
 				UserModule:
 					None
 				FoundationTypesModule | FoundationPreludeModule | LibraryModule:
-					Some(rejection(span, "a library module cannot import a user module", "library modules may import only other library modules and _base"))
+					Some(diagnostic(span, "a library module cannot import a user module", "library modules may import only other library modules and _base"))
 
 
 -- A permitted import yields its request: the queued one, or a new request with
@@ -217,7 +205,7 @@ private pure func import_allowed(cursor: ImportCursor, known: Option[RequestedMo
 	role = match known:
 		Some(queued): queued.role
 		None: module_role(cursor.layout, path)
-	match import_rejection(cursor.importer.role, role, span):
+	match import_diagnostic(cursor.importer.role, role, span):
 		Some(error):
 			Err(error)
 		None:
@@ -227,7 +215,7 @@ private pure func import_allowed(cursor: ImportCursor, known: Option[RequestedMo
 				None:
 					match module_id(cursor.requests.length()):
 						Some(id): Ok({ id = id, path = path, role = role, site = Some(span) })
-						None: Err(internal_error("module inventory is too large"))
+						None: Err(internal_error(compiler_span(), "module inventory is too large"))
 
 
 private pure func resolve_imports(cursor: ImportCursor) -> Result[ImportCursor, Diagnostic]:
@@ -301,7 +289,7 @@ private func load_test_entry(state: LoadState) -> Result[LoadState, LoadFailure]
 	known = known_module(state.requests, path)
 	id: ModuleId ?= match known:
 		Some(request): Ok(request.id)
-		None: module_id(state.requests.length()).to_result(failure(state.modules, internal_error("test library module identity exceeds the source inventory")))
+		None: module_id(state.requests.length()).to_result(failure(state.modules, internal_error(compiler_span(), "test library module identity exceeds the source inventory")))
 	pending: LoadState = match known:
 		Some(_): state
 		None: { state | requests = state.requests.append(designated(id, path, LibraryModule)) }
@@ -320,7 +308,7 @@ private pure func display_paths(sources: SourceInputs, cycle: List[ModuleId], pa
 		None:
 			Ok(paths)
 		Some(module):
-			match sources.modules.get(module_number(module)).to_result(internal_error("import cycle names a module without a source")):
+			match sources.modules.get(module_number(module)).to_result(internal_error(compiler_span(), "import cycle names a module without a source")):
 				Ok(file): display_paths(sources, cycle, paths.append(file.path))
 				Err(error): Err(error)
 
@@ -330,7 +318,7 @@ pure func working_directory_result(result: Result[String, String]) -> Result[Str
 	match result:
 		Ok(directory): Ok(directory)
 		Err(error):
-			Err(failure([], rejection(
+			Err(failure([], diagnostic(
 				compiler_span(),
 				"could not determine current directory: ${error}",
 				"run the compiler from an accessible working directory",
@@ -356,7 +344,7 @@ private func load_input(root_path: String, library_root: String, mode: LoadMode)
 		FoundationTypesModule | FoundationPreludeModule:
 			Err(failure(
 				[{ path = root_path, contents = "" }],
-				rejection({ source = module_source(root_module_id()), start = 0, end = 0 }, "foundation modules cannot be application roots", "choose an application module; foundation inputs are supplied by --library-root"),
+				diagnostic({ source = module_source(root_module_id()), start = 0, end = 0 }, "foundation modules cannot be application roots", "choose an application module; foundation inputs are supplied by --library-root"),
 			))
 		LibraryModule | UserModule:
 			Ok(void)
@@ -384,4 +372,4 @@ private func load_input(root_path: String, library_root: String, mode: LoadMode)
 		Err(ImportCycle(cycle, closing)):
 			match display_paths(sources, cycle, []):
 				Err(error): Err(failure(loaded.modules, error))
-				Ok(paths): Err(failure(loaded.modules, rejection(closing, "import cycle: ${paths.join(" -> ")}", IMPORT_CYCLE_HELP)))
+				Ok(paths): Err(failure(loaded.modules, diagnostic(closing, "import cycle: ${paths.join(" -> ")}", IMPORT_CYCLE_HELP)))
