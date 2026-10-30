@@ -92,7 +92,7 @@ under its prose limit and references this design rather than duplicating it.
 `src/specialize/specialize.brp:135–142` publishes:
 
 ```blorp
-fixed union ValueOwnership:
+union ValueOwnership:
     NoOwnership
     ManagedStringLeaf
     ManagedCallableEnvironment
@@ -322,11 +322,11 @@ The old completed row was a managed fixed record containing fields and a
 RecordRepresentation. The implementation replaces only that published row:
 
 ```blorp
-private fixed union RecordRepresentation:
+private union RecordRepresentation:
     InlineRecord
     ManagedRecord
 
-fixed union ConcreteRecord:
+union ConcreteRecord:
     InlineFields(List[TypeRef])
     CountedFields(List[TypeRef])
 

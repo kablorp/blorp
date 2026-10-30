@@ -1,0 +1,103 @@
+import:
+    ../../../src/lex/lex: lex
+    ../../../src/parse/parse: ParsedModule, module_contents, module_names, parse_module
+    ../../../src/utils/names: name_spelling, program_names
+    ../../../src/utils/source: module_source, root_module_id, same_source
+    ../../../src/utils/syntax: Diagnostic, ParsedUnion, Visibility(Public, Private)
+    option: is_none
+    bool: and, not
+    string: String methods
+    int: Int methods
+    test: TestSuite
+
+
+private pure func parsed(source: String) -> Result[ParsedModule, Diagnostic]:
+    match lex(module_source(root_module_id()), source, program_names().names):
+        Err(error): Err(error)
+        Ok(tokens): parse_module(tokens, root_module_id())
+
+
+private pure func rejects(source: String, start: Int, end: Int, message: String, help: String) -> Bool:
+    match parsed(source):
+        Ok(_): False
+        Err(error):
+            and(
+                and(same_source(error.span.source, module_source(root_module_id())), and(error.span.start == start, error.span.end == end)),
+                and(and(error.message == message, error.help == help), error.note.is_none()),
+            )
+
+
+private pure func is_private(declaration: ParsedUnion) -> Bool:
+    match declaration.visibility:
+        Public: False
+        Private(_): True
+
+
+-- `union` and `fixed union` both declare a union, public or private, in
+-- source order.
+pure func test_union_and_fixed_union_declare_unions() -> Bool:
+    source = "union First:\n    A\nprivate union Second:\n    B\nfixed union Third:\n    C\nprivate fixed union Fourth:\n    D\n"
+    match parsed(source):
+        Err(_): False
+        Ok(module):
+            names = module_names(module)
+            match module_contents(module).unions:
+                [first, second, third, fourth]:
+                    and(
+                        and(
+                            and(name_spelling(names, first.type_name.id) == Some("First"), first.is_private().not()),
+                            and(name_spelling(names, second.type_name.id) == Some("Second"), second.is_private()),
+                        ),
+                        and(
+                            and(name_spelling(names, third.type_name.id) == Some("Third"), third.is_private().not()),
+                            and(name_spelling(names, fourth.type_name.id) == Some("Fourth"), fourth.is_private()),
+                        ),
+                    )
+                _: False
+
+
+pure func test_fixed_union_declares_type_parameters() -> Bool:
+    match parsed("fixed union Box[T]:\n    Full(T)\n    Empty\n"):
+        Err(_): False
+        Ok(module):
+            match module_contents(module).unions:
+                [declaration]: declaration.type_parameters.length() == 1
+                _: False
+
+
+-- `fixed` is contextual, so a constant may still be named `fixed`.
+pure func test_fixed_remains_a_constant_name() -> Bool:
+    match parsed("fixed: Int = 1\n"):
+        Err(_): False
+        Ok(module): module_contents(module).constants.length() == 1
+
+
+pure func test_private_fixed_requires_record_or_union() -> Bool:
+    rejects("private fixed Choice:\n    First\n", 14, 20,
+        "expected 'record' or 'union' after 'fixed'",
+        "write fixed record Name { field: Int } or fixed union Choice:")
+
+
+pure func test_fixed_requires_record_or_union() -> Bool:
+    rejects("fixed Choice:\n    First\n", 6, 12,
+        "expected 'record' or 'union' after 'fixed'",
+        "write fixed record Name { field: Int } or fixed union Choice:")
+
+
+pure func test_union_header_requires_colon() -> Bool:
+    rejects("union Choice\n    First\n", 12, 13,
+        "expected ':' after the union type name",
+        "write union Choice: or union Box[T]:")
+
+
+tests: TestSuite = {
+    description = "Blorp 2 union declarations",
+    tests = [
+        ("union and fixed union declare unions", test_union_and_fixed_union_declare_unions),
+        ("fixed union declares type parameters", test_fixed_union_declares_type_parameters),
+        ("fixed remains a constant name", test_fixed_remains_a_constant_name),
+        ("private fixed requires record or union", test_private_fixed_requires_record_or_union),
+        ("fixed requires record or union", test_fixed_requires_record_or_union),
+        ("union header requires a colon", test_union_header_requires_colon),
+    ]
+}

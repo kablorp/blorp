@@ -314,7 +314,7 @@ fixed record CheckedMethodBody {
     body: BodyOwner,
     arguments: List[TypeRef] -- Map header parameters into the body's own domain.
 }
-fixed union ImplementationOrigin:
+union ImplementationOrigin:
     AuthoredImplementation(ImplId)
     StructuralEquality(AggregateId, CheckedEqualityBody)
 fixed record CheckedImplementation {
@@ -366,7 +366,7 @@ importing Int into a provider must not expose an unrelated Foo implementation.
 import:
     int: equals
 
-fixed union Mode:
+union Mode:
     Read
     Write
 
@@ -483,7 +483,7 @@ match left.x.equals(right.x):
 **Source-equivalent generated union body.**
 
 ```blorp
--- For fixed union Reply: Empty; Value(Int)
+-- For union Reply: Empty; Value(Int)
 match left:
     Empty:
         match right:
@@ -506,12 +506,12 @@ request/expansion graph.
 **Model sketch: derived body identity without forged declarations.**
 
 ```blorp
-fixed union AggregateId:
+union AggregateId:
     RecordAggregate(RecordId)
     UnionAggregate(UnionId)
 
 -- Existing BodyOwner becomes:
-fixed union BodyOwner:
+union BodyOwner:
     DeclaredBody(FunctionId)
     LambdaBody(LambdaId)
     DerivedEqualityBody(AggregateId)
@@ -533,7 +533,7 @@ only after every outgoing dependency succeeds. Discard failed provisional facts.
 **Source: positive and poisoned recursive cases.**
 
 ```blorp
-fixed union Tree:
+union Tree:
     Leaf(Int)
     Branch(List[Tree])
 -- Tree -> written List equality -> Tree can close once every other

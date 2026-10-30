@@ -41,10 +41,10 @@ starts with the following **unmodified real main**, expected exit7, empty
 streams; nested patterns, imports and arithmetic are unnecessary:
 
 ```blorp
-fixed union Left:
+union Left:
     Done(Int)
     IntoRight(Right)
-fixed union Right:
+union Right:
     Back(Left)
 
 pure func left_value(value: Left) -> Int:
@@ -67,7 +67,7 @@ typed/full-source-span behavioral red with the frozen host/pilot before edits;
 this planning session did not execute it. Also admit:
 
 ```blorp
-fixed union Tree:
+union Tree:
     Leaf(String)
     Fork(Tree, Tree)
 ```
@@ -133,7 +133,7 @@ One private policy distinguishes the question for the active root:
 
 ```blorp
 -- Proposed private local-query policy, not a published semantic authority.
-private fixed union StorageWalkPolicy:
+private union StorageWalkPolicy:
     IndependentStorage
     GenericDeclarationRoot(UnionId)
 ```

@@ -346,7 +346,7 @@ not enable automatic equality.
 
 ```blorp
 fixed record Point { x: Int, y: Int }
-fixed union Reply:
+union Reply:
     Empty
     Value(Point)
 ```
@@ -478,10 +478,10 @@ is equivalent to `identity(zero(one(identity(1))))`. The tests specify the exact
 generated C and parsed call order for this mixed expression.
 
 The [`union/values.brp`](test/e2e/fixtures/union/values.brp) example adds
-payload-free fixed unions:
+payload-free unions:
 
 ```blorp
-fixed union Choice:
+union Choice:
 	First
 	Second
 pure func identity(value: Choice) -> Choice:
@@ -502,7 +502,7 @@ The match example, [`match/value.brp`](test/e2e/fixtures/match/value.brp), adds
 an optional `Int` field and a match as the complete function body:
 
 ```blorp
-fixed union Value:
+union Value:
 	Empty
 	Number(Int)
 pure func unwrap(value: Value) -> Int:
@@ -585,7 +585,7 @@ Bindings also compose with match arms. The
 [arm-binding example](test/e2e/fixtures/match/binding_original.brp) returns 7:
 
 ```blorp
-fixed union Choice:
+union Choice:
     Empty
     Number(Int)
 pure func identity(value: Int) -> Int:
@@ -635,7 +635,7 @@ The [tail String example](test/e2e/fixtures/match/string_second.brp) returns a
 fresh String from its selected arm:
 
 ```blorp
-fixed union Choice:
+union Choice:
     First
     Second
 pure func choose(choice: Choice) -> String:
@@ -1011,7 +1011,7 @@ when its caller replaces the original String binding.
 [`generic/box.brp`](test/e2e/fixtures/generic/box.brp) wraps and matches an Int:
 
 ```blorp
-fixed union Box[T]:
+union Box[T]:
     Box(T)
 pure func box[T](value: T) -> Box[T]:
     Box(value)
@@ -1084,7 +1084,7 @@ The [function-recursion example](test/e2e/fixtures/recursion/self.brp) uses an
 existing union to terminate without adding arithmetic or conditional syntax:
 
 ```blorp
-fixed union Step:
+union Step:
     Stop
     Once
 pure func walk(step: Step) -> Int:
@@ -1109,7 +1109,7 @@ shapes and their ownership requirements.
 An explicit `@tail_recursive` function has a checked direct-self loop guarantee:
 
 ```blorp
-fixed union Step:
+union Step:
     Stop
     Once
 @tail_recursive
@@ -1131,7 +1131,7 @@ Name, arity, type and purity errors are checked first.
 
 Annotated functions must be nongeneric and contain a direct self call. Their
 concrete parameters, result and every evaluated intermediate must be unmanaged,
-even an unused String initializer. Int, supported fixed records and fixed unions
+even an unused String initializer. Int, supported fixed records and unions
 are allowed; an unmanaged phantom `Marker[String]` carries no String value.
 A helper's internal managed values are allowed when the annotated caller sees
 only unmanaged values. Zero-argument helpers and `main` may be annotated, with
@@ -1188,7 +1188,7 @@ declaration order. Repeated concrete instances are reused, while changing even
 an unused later parameter creates a distinct instance. Substitution preserves
 caller-owned rigid types during forwarding. A declared expected result can solve
 parameters represented in the result; unrelated phantom parameters remain
-ambiguous. Fixed unions also support ordered declaration parameters,
+ambiguous. Unions also support ordered declaration parameters,
 as in `Result[T, E]`.
 
 
@@ -1217,7 +1217,7 @@ The [two-parameter union example](test/e2e/fixtures/generic/union_parameters/ok.
 adds independently positioned payload types:
 
 ```blorp
-fixed union Result[T, E]:
+union Result[T, E]:
     Ok(T)
     Err(E)
 pure func success() -> Result[Int, Int]:
@@ -1254,7 +1254,7 @@ A union may name itself as one direct payload of a variant. The
 ```blorp
 import:
     int: add
-fixed union Nat:
+union Nat:
     Zero
     Succ(Nat)
 pure func make() -> Nat:
@@ -1322,7 +1322,7 @@ generic union such as `Maybe` applied to a recursive type. The
 
 ```blorp
 fixed record Expr { form: Form, span: Int }
-fixed union Form:
+union Form:
     Leaf(Int)
     Call(String, List[Expr])
     Field(Expr, Int)
@@ -1574,7 +1574,7 @@ generic instances. Purity is checked at calls; specialization does not inspect i
 
 This specification defines only the examples' language: functions with an optional
 return annotation (omission means `Void`), an ordered list of explicitly typed parameters, an optional ordered list of type
-parameters on functions, fixed unions and fixed records with
+parameters on functions, unions and fixed records with
 one or more finite fields after substitution. Union variants have zero or more ordered fields using ordinary type annotations; concrete fields
 specialize to Int, Float, String, Void, a List of any supported finite type, a finite record, or another finite inline union. A function
 body has zero or more ordered binding or Void expression statements followed
@@ -1807,11 +1807,13 @@ Lexical and layout rules:
   be distinct within a declaration. Explicit function type arguments at calls
   are unsupported; argument types and known expected results constrain the type
   parameters.
-- `fixed union Type:` introduces one or more variants on indented
-  lines. `fixed` is a contextual header word and remains a valid name
-  elsewhere; `union` is reserved. A variant is bare or declares an ordered list of field types, as in
+- `union Type:` introduces one or more variants on indented
+  lines. `fixed union Type:` will promise stack storage under the fixed-record
+  rules (no managed payloads, no recursion, no type parameters); those rules are
+  not checked yet, so it currently declares the same union. `fixed` is a
+  contextual header word and remains a valid name elsewhere; `union` is reserved. A variant is bare or declares an ordered list of field types, as in
   `Number(Int)`, `Box(T)` or `Pair(String, String)`. A union may declare ordered
-  parameters with `fixed union Result[T, E]:`. Every field annotation uses ordinary
+  parameters with `union Result[T, E]:`. Every field annotation uses ordinary
   type syntax in the union declaration's module and parameter scope, including
   recursive type arguments such as `Box[Box[Int]]` or `Result[T, Box[E]]`.
   Empty declaration parentheses remain unsupported. Concrete field layouts may
@@ -2176,7 +2178,7 @@ Semantic rules:
 - Union-only recursive layouts, generic self-reinstantiation,
   guards, Char patterns, constructor UFCS,
   and function
-  values are outside this increment. `Bool` is an ordinary fixed union declared
+  values are outside this increment. `Bool` is an ordinary union declared
   once in the base module, alongside Option and Result. Local functions and
   explicitly imported functions support both call notations; type selections
   expose receiver functions only through UFCS.
@@ -2460,7 +2462,7 @@ records phase tests, native output, ownership checks and matched costs.
 ## Calculator input and results
 
 `Option[T]`, `Result[Value, Error]` and `Bool` come from ordinary
-fixed unions in `standard_library/_base.brp`; none of them receives
+unions in `standard_library/_base.brp`; none of them receives
 a compiler-specific representation. The prelude supplies their types and
 constructors to user modules; library modules import them from `_base`:
 

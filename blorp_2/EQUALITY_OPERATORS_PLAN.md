@@ -155,7 +155,7 @@ Add two punctuation tokens and a closed parsed enum. The following is the
 proposed actual Blorp shape in `utils/syntax.brp`, beside `LogicalOperator`:
 
 ```blorp
-fixed union EqualityOperator:
+union EqualityOperator:
     EqualOperator
     NotEqualOperator
 

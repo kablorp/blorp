@@ -939,7 +939,7 @@ records one decision per header in `PendingOwnedLoop`:
 ```blorp
 -- A header takes its initial's obligation when this entry is the owner's last
 -- use and nothing else in the loop depends on it.
-private fixed union HeaderEntry:
+private union HeaderEntry:
 	AcquireAtEntry
 	TakeOwner(OwnerId)
 ```
@@ -1593,7 +1593,7 @@ fixed record ManagedPassing {
 	owned: Bool
 }
 
-fixed union OwnedParameter:
+union OwnedParameter:
 	UnmanagedParameter(TypeRef)
 	ManagedParameter(ManagedPassing)
 

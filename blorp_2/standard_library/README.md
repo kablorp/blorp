@@ -154,7 +154,7 @@ and all callers together.
 The base module provides the ordinary generic Result union with Ok/Err for
 pure calculator parsing and evaluation; it has no compiler-specific behavior.
 
-Bool, Option and Result are ordinary fixed unions owned by `_base.brp`; user
+Bool, Option and Result are ordinary unions owned by `_base.brp`; user
 modules receive their types and constructors through the prelude. Bool, Option
 and Result operations use explicit named imports. `option.brp` provides
 `is_some`, `is_none`, eager `get_or`, eager `to_result` and `map`; `result.brp`
