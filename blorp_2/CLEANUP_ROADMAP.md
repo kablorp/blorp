@@ -274,6 +274,12 @@ suite and the C0 check.
 | `runtime` | One error-message and size-cap helper in the C text. `read_file`/`write_file` pass `path->bytes`. | O1 |
 | `standard_library` | One parameter-naming rule: receiver `self`, pairs `left`/`right`, `default`. | L3 for `list.brp` |
 
+Status: the `parse` row landed at −217 lines. `consume_list_pattern` keeps
+its own loop (trailing-comma diagnostic and spread), 13 predicates were
+folded, and about 30 multi-caller `at_*` predicates could still use
+`at_keyword`/`at_symbol`. Self-compile allocations rose 21.9k (+0.09%), from
+the per-item list wrapper; instructions are unchanged within noise.
+
 Basis: the parse items remove about 300 lines, the de-duplicated pairs about
 150, and the verify blocks about 100. About −600.
 
