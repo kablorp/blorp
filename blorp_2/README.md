@@ -1818,9 +1818,16 @@ Lexical and layout rules:
   are unsupported; argument types and known expected results constrain the type
   parameters.
 - `union Type:` introduces one or more variants on indented
-  lines. `fixed union Type:` will promise stack storage under the `fixed`
-  rules in [grammar.ebnf](grammar.ebnf); those rules are not checked yet, so
-  it currently declares the same union. `fixed` is a
+  lines. `fixed union Type:` promises inline storage with no counted child, and
+  checking enforces it: no type parameters; every payload is Int, Float, Void,
+  another `fixed union`, a record of numbers (every field, at the record's
+  arguments, Int, Float or such a record) or an opaque type over one of these;
+  and no fixed union contains itself, directly or through other fixed unions.
+  The record rule is structural: it follows today's record layout and accepts
+  a plain `record`, so it must be reconciled with the fixed-record rules once
+  those are checked.
+  An ordinary union such as Bool is not a fixed payload, even though it is
+  stored inline today; the promise must be declared. `fixed` is a
   contextual header word and remains a valid name elsewhere; `union` is reserved. A variant is bare or declares an ordered list of field types, as in
   `Number(Int)`, `Box(T)` or `Pair(String, String)`. A union may declare ordered
   parameters with `union Result[T, E]:`. Every field annotation uses ordinary
