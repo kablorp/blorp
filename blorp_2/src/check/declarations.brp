@@ -15,8 +15,7 @@ import:
 		),
 		TypeTermError(
 			PrivateTypeInPublicDeclaration, TraitUsedAsType,
-			ListTypeArgumentCount, MissingUnionTypeArguments, NonApplicableType, MissingRecordTypeArguments, RecordTypeArgumentCountMismatch, OrdinaryRecordApplied,
-			OrdinaryUnionApplied, UnionTypeArgumentCountMismatch, UnknownType,
+			ListTypeArgumentCount, NonApplicableType, MissingTypeArguments, TypeArgumentCountMismatch, OrdinaryTypeApplied, UnknownType,
 		),
 		QualifiedError(UnknownModuleAlias, QualifiedNotOffered),
 		qualified_error,
@@ -30,10 +29,11 @@ import:
 		CheckedUnion,
 		CheckedVariant,
 		TypeParameterId,
-		TypeParameterOwner(UnionDeclaration, RecordDeclaration),
-		TypeRef(TupleType, CallableType, NominalType, VoidType, FloatType, IntType, ListType, OpaqueType, ParameterType, StringType),
+		TypeParameterOwner(UnionDeclaration, RecordDeclaration, OpaqueDeclaration),
+		TypeRef(TupleType, CallableType, NominalType, VoidType, FloatType, IntType, ListType, ParameterType, StringType),
 		AggregateId(RecordAggregate, UnionAggregate),
-		same_aggregate,
+		NominalId(AggregateNominal, OpaqueNominal),
+		same_nominal,
 		TypeUse,
 		UnionOccurrence,
 		field_id,
@@ -47,8 +47,10 @@ import:
 	../utils/ids:
 		RecordRow,
 		UnionRow,
+		OpaqueRow,
 		NominalRow(UnionDeclarationRow, RecordDeclarationRow, OpaqueDeclarationRow),
 		inventory_functions,
+		inventory_opaques,
 		inventory_records,
 		inventory_unions,
 		next_nominal,
@@ -100,6 +102,7 @@ fixed record TypeScope {
 	self_binding: Option[SelfBinding],
 	records: List[RecordRow],
 	unions: List[UnionRow],
+	opaques: List[OpaqueRow],
 	namespace: Namespace,
 	module: ModuleId,
 	access: TypeAccess,
@@ -187,20 +190,43 @@ pure func declared_parameters(scope: TypeScope) -> List[TypeParameterId]:
 	scope.parameters.map(pure func(parameter: LocalTypeParameter): parameter.id)
 
 
-private pure func union_arity(
-	scope: TypeScope,
-	owner: UnionId,
-	span: Span,
-) -> Result[Int, CheckError]:
-	declaration ?= scope.unions
-		.get(union_number(owner))
-		.to_result(checker_invariant(span, InvalidUnionDeclaration(owner)))
-	Ok(declaration.type_parameters.length())
+-- The number of type parameters a record, union or opaque type declares.
+private pure func nominal_arity(scope: TypeScope, owner: NominalId, span: Span) -> Result[Int, CheckError]:
+	match owner:
+		AggregateNominal(RecordAggregate(id)):
+			match scope.records.get(record_number(id)):
+				Some(row): Ok(row.declaration.type_parameters.length())
+				None: Err(checker_invariant(span, InvalidRecordDeclaration(id)))
+		AggregateNominal(UnionAggregate(id)):
+			match scope.unions.get(union_number(id)):
+				Some(row): Ok(row.type_parameters.length())
+				None: Err(checker_invariant(span, InvalidUnionDeclaration(id)))
+		OpaqueNominal(id):
+			match scope.opaques.get(opaque_number(id)):
+				Some(row): Ok(row.declaration.type_parameters.length())
+				None: Err(checker_invariant(span, InvalidOpaqueDeclaration(id)))
 
 
-private pure func record_arity(scope: TypeScope, owner: RecordId, span: Span) -> Result[Int, CheckError]:
-	declaration ?= scope.records.get(record_number(owner)).to_result(checker_invariant(span, InvalidRecordDeclaration(owner)))
-	Ok(declaration.declaration.type_parameters.length())
+-- A nominal head written alone, which its declaration must not need arguments for.
+private pure func unapplied_nominal(scope: TypeScope, owner: NominalId, span: Span) -> Result[TypeRef, CheckError]:
+	arity ?= nominal_arity(scope, owner, span)
+	if arity == 0:
+		Ok(NominalType(owner, []))
+	else:
+		Err(type_term_error(span, MissingTypeArguments(owner, arity)))
+
+
+-- A nominal head with written arguments, which must match its arity.
+private pure func resolve_nominal(scope: TypeScope, owner: NominalId, arguments: List[TypeSyntax], span: Span) -> Result[TypeRef, CheckError]:
+	arity ?= nominal_arity(scope, owner, span)
+	if arity == arguments.length():
+		match resolve_types(scope, arguments, []):
+			Ok(values): Ok(NominalType(owner, values))
+			Err(error): Err(error)
+	else if arity == 0:
+		Err(type_term_error(span, OrdinaryTypeApplied(owner)))
+	else:
+		Err(type_term_error(span, TypeArgumentCountMismatch(owner, arity, arguments.length())))
 
 
 private pure func resolve_atomic_head(
@@ -214,24 +240,11 @@ private pure func resolve_atomic_head(
 		ListHead:
 			Err(type_term_error(name.span, ListTypeArgumentCount))
 		OpaqueHead(id):
-			Ok(OpaqueType(id))
+			unapplied_nominal(scope, OpaqueNominal(id), name.span)
 		RecordHead(id):
-			match record_arity(scope, id, name.span):
-				Ok(arity):
-					if arity == 0:
-						Ok(NominalType(RecordAggregate(id), []))
-					else:
-						Err(type_term_error(name.span, MissingRecordTypeArguments(id, arity)))
-				Err(error): Err(error)
+			unapplied_nominal(scope, AggregateNominal(RecordAggregate(id)), name.span)
 		UnionHead(id):
-			match union_arity(scope, id, name.span):
-				Ok(arity):
-
-					if arity == 0:
-						Ok(NominalType(UnionAggregate(id), []))
-					else:
-						Err(type_term_error(name.span, MissingUnionTypeArguments(id, arity)))
-				Err(error): Err(error)
+			unapplied_nominal(scope, AggregateNominal(UnionAggregate(id)), name.span)
 
 
 -- One unqualified lookup validates access before publishing the head.
@@ -292,36 +305,12 @@ private pure func resolve_applied_head(
 				_:
 					Err(type_term_error(span, ListTypeArgumentCount))
 		RecordHead(owner):
-			match record_arity(scope, owner, span):
-				Ok(arity):
-					if arity == 0:
-						Err(type_term_error(span, OrdinaryRecordApplied(owner)))
-					else if arity == arguments.length():
-						match resolve_types(scope, arguments, []):
-							Ok(values): Ok(NominalType(RecordAggregate(owner), values))
-							Err(error): Err(error)
-					else:
-						Err(type_term_error(span, RecordTypeArgumentCountMismatch(owner, arity, arguments.length())))
-				Err(error): Err(error)
+			resolve_nominal(scope, AggregateNominal(RecordAggregate(owner)), arguments, span)
 		UnionHead(owner):
-			match union_arity(scope, owner, span):
-				Ok(arity):
-
-					if arity == 0:
-						Err(type_term_error(span, OrdinaryUnionApplied(owner)))
-					else if arity == arguments.length():
-						match resolve_types(scope, arguments, []):
-							Ok(values): Ok(NominalType(UnionAggregate(owner), values))
-							Err(error): Err(error)
-					else:
-						Err(
-							type_term_error(
-								span,
-								UnionTypeArgumentCountMismatch(owner, arity, arguments.length()),
-							),
-						)
-				Err(error): Err(error)
-		PrimitiveHead(_) | OpaqueHead(_):
+			resolve_nominal(scope, AggregateNominal(UnionAggregate(owner)), arguments, span)
+		OpaqueHead(owner):
+			resolve_nominal(scope, OpaqueNominal(owner), arguments, span)
+		PrimitiveHead(_):
 			Err(type_term_error(name.span, NonApplicableType(name.id)))
 
 
@@ -341,9 +330,10 @@ pure func resolve_receiver_head(scope: TypeScope, written: ParsedReceiverHead) -
 pure func receiver_arity(scope: TypeScope, head: TypeHead, span: Span) -> Result[Int, CheckError]:
 	match head:
 		ListHead: Ok(1)
-		RecordHead(owner): record_arity(scope, owner, span)
-		UnionHead(owner): union_arity(scope, owner, span)
-		PrimitiveHead(_) | OpaqueHead(_): Ok(0)
+		RecordHead(owner): nominal_arity(scope, AggregateNominal(RecordAggregate(owner)), span)
+		UnionHead(owner): nominal_arity(scope, AggregateNominal(UnionAggregate(owner)), span)
+		OpaqueHead(owner): nominal_arity(scope, OpaqueNominal(owner), span)
+		PrimitiveHead(_): Ok(0)
 
 
 -- The module `written` names as a module alias in `module`.
@@ -475,6 +465,7 @@ private pure func declare_types(
 				self_binding = None,
 				records = inventory_records(parsed.declarations),
 				unions = inventory_unions(parsed.declarations),
+				opaques = inventory_opaques(parsed.declarations),
 				namespace = namespace,
 				module = declared_module(declaration),
 				access = access,
@@ -514,16 +505,20 @@ private pure func declare_types(
 						Err(error): Err(error)
 
 				OpaqueDeclarationRow(parsed_opaque):
-					match resolve_type(scope, parsed_opaque.declaration.underlying):
-						Ok(underlying):
-							accepted: CheckedOpaque = {
-								id = parsed_opaque.id,
-								underlying_type = {
-									value_type = underlying,
-									span = type_span(parsed_opaque.declaration.underlying)
-								}
-							}
-							Ok({ checked | opaques = checked.opaques.append(accepted) })
+					match local_type_parameters(parsed_opaque.declaration.type_parameters, OpaqueDeclaration(parsed_opaque.id), scope):
+						Ok(parameters):
+							match resolve_type(parameters, parsed_opaque.declaration.underlying):
+								Ok(underlying):
+									accepted: CheckedOpaque = {
+										id = parsed_opaque.id,
+										type_parameters = declared_parameters(parameters),
+										underlying_type = {
+											value_type = underlying,
+											span = type_span(parsed_opaque.declaration.underlying)
+										}
+									}
+									Ok({ checked | opaques = checked.opaques.append(accepted) })
+								Err(error): Err(error)
 						Err(error): Err(error)
 
 			match declared:
@@ -837,7 +832,7 @@ private pure func rigid_arguments(parameters: List[TypeParameterId]) -> List[Typ
 	arguments
 
 
--- The written field types of a generic root, with their own spans.
+-- The written field and payload types of a record or union, with their own spans.
 private pure func root_fields(root: AggregateId, declarations: CheckedDeclarations) -> Result[List[TypeUse], CheckError]:
 	origin: Span = compiler_span()
 
@@ -884,7 +879,7 @@ private pure func generic_roots(declarations: CheckedDeclarations) -> List[Aggre
 private pure func reinstantiates_root(value_type: TypeRef, root: AggregateId) -> Bool:
 	match value_type:
 		NominalType(owner, arguments):
-			if same_aggregate(owner, root):
+			if same_nominal(owner, AggregateNominal(root)):
 				arguments.any(contains_parameter)
 			else:
 				False
@@ -933,7 +928,7 @@ private pure func generic_reinstantiation_edge(
 					closing = Some(annotation)
 				else:
 					match annotation.value_type:
-						VoidType | IntType | FloatType | StringType | OpaqueType(_) | ParameterType(_):
+						VoidType | IntType | FloatType | StringType | ParameterType(_):
 							void
 						CallableType(purity, parameters, result):
 							for child in parameters.append(result):
@@ -952,7 +947,7 @@ private pure func generic_reinstantiation_edge(
 								pending_count = pending_count.add(1)
 
 					match annotation.value_type:
-						NominalType(RecordAggregate(id), _):
+						NominalType(AggregateNominal(RecordAggregate(id)), _):
 							match record_expanded.get(record_number(id)):
 								Some(False):
 									record_expanded = record_expanded.set(record_number(id), True)
@@ -967,7 +962,7 @@ private pure func generic_reinstantiation_edge(
 									void
 								None:
 									failure = Some(checker_invariant(annotation.span, InvalidRecordDeclaration(id)))
-						NominalType(UnionAggregate(id), _):
+						NominalType(AggregateNominal(UnionAggregate(id)), _):
 							match union_expanded.get(union_number(id)):
 								Some(False):
 									union_expanded = union_expanded.set(union_number(id), True)
@@ -1025,7 +1020,7 @@ private pure func repeated_self_payload(owner: UnionId, fields: List[TypeUse]) -
 
 	for field in fields:
 		match field.value_type:
-			NominalType(UnionAggregate(id), []):
+			NominalType(AggregateNominal(UnionAggregate(id)), []):
 				if union_number(id) == union_number(owner):
 					if seen:
 						repeated = Some(field)
@@ -1044,12 +1039,15 @@ private pure func repeated_self_payload(owner: UnionId, fields: List[TypeUse]) -
 -- arguments; a record field, a List element and a non-generic union's one
 -- direct self payload (stored boxed later) are pointer edges a cycle may pass
 -- through. A record on a cycle is always managed, so records need no visit.
--- A union-only cycle, two self payloads in one variant, and a generic
--- declaration reinstantiating itself are rejected.
+-- An opaque type is erased to its underlying type at its arguments, which is
+-- stored where the opaque type is. A union-only cycle, two self payloads in
+-- one variant, and a generic declaration reinstantiating itself are rejected.
 pure func validate_finite_declarations(
 	declarations: CheckedDeclarations,
 ) -> Result[Void, CheckError]:
 	generic ?= validate_generic_cycles(declarations)
+	-- Expanding opaque types below terminates only once no opaque is on a cycle.
+	_: Void ?= validate_opaque_representations(declarations)
 	-- These vectors stay in one local builder. Passing them through a shared
 	-- record would retain their old roots and copy the entire vector on set.
 	var visiting: List[UnionInstanceVisit] = []
@@ -1120,7 +1118,7 @@ pure func validate_finite_declarations(
 									failure = Some(checker_invariant(origin, InvalidUnionDeclaration(id)))
 								Some(declaration):
 									instance: UnionInstanceVisit = { declaration = id, arguments = rigid_arguments(declaration.type_parameters) }
-									match expand_union_instance(instance, { value_type = NominalType(UnionAggregate(id), instance.arguments), span = origin }, WrittenSpan, declarations, visiting, completed, pending, pending_count):
+									match expand_union_instance(instance, { value_type = NominalType(AggregateNominal(UnionAggregate(id)), instance.arguments), span = origin }, WrittenSpan, declarations, visiting, completed, pending, pending_count):
 										Err(error):
 											failure = Some(error)
 										Ok(expanded):
@@ -1129,9 +1127,11 @@ pure func validate_finite_declarations(
 											pending_count = expanded.pending_count
 						VisitVariantPayload(owner, annotation):
 							-- The admitted direct self-reference needs no visit; a bare
-							-- union name resolves only for a non-generic declaration.
+							-- union name resolves only for a non-generic declaration. An
+							-- opaque type wrapping the owner is not admitted: it is expanded
+							-- by value like any other payload.
 							admitted = match annotation.value_type:
-								NominalType(UnionAggregate(id), []): union_number(id) == union_number(owner)
+								NominalType(AggregateNominal(UnionAggregate(id)), []): union_number(id) == union_number(owner)
 								_: False
 
 							if admitted.not():
@@ -1139,7 +1139,7 @@ pure func validate_finite_declarations(
 								pending_count = pending_count.add(1)
 						VisitDeclaredType(annotation):
 							match annotation.value_type:
-								VoidType | IntType | FloatType | StringType | OpaqueType(_) | ParameterType(_):
+								VoidType | IntType | FloatType | StringType | ParameterType(_):
 									void
 								CallableType(purity, parameters, result):
 									for child in parameters.append(result):
@@ -1149,10 +1149,7 @@ pure func validate_finite_declarations(
 										roots = roots.append(VisitDeclaredType({ annotation | value_type = child }))
 								ListType(element):
 									roots = roots.append(VisitDeclaredType({ annotation | value_type = element }))
-								NominalType(RecordAggregate(_), arguments):
-									for argument in arguments:
-										roots = roots.append(VisitDeclaredType({ annotation | value_type = argument }))
-								NominalType(UnionAggregate(id), arguments):
+								NominalType(AggregateNominal(UnionAggregate(id)), arguments):
 									-- A substituted body reports at the application that substituted it.
 									reported: PayloadSpan = if arguments.is_empty():
 										WrittenSpan
@@ -1165,17 +1162,31 @@ pure func validate_finite_declarations(
 											visiting = expanded.visiting
 											pending = expanded.pending
 											pending_count = expanded.pending_count
+								NominalType(OpaqueNominal(id), arguments):
+									match declarations.opaques.get(opaque_number(id)):
+										None:
+											failure = Some(checker_invariant(annotation.span, InvalidOpaqueDeclaration(id)))
+										Some(declaration):
+											match substitute_type(declaration.underlying_type.value_type, { owner = OpaqueDeclaration(id), values = arguments }, annotation.span):
+												Err(error):
+													failure = Some(error)
+												Ok(underlying):
+													pending = push_declaration_visit(pending, pending_count, VisitDeclaredType({ annotation | value_type = underlying }))
+													pending_count = pending_count.add(1)
+								-- A record stores its arguments behind a pointer.
+								NominalType(_, arguments):
+									for argument in arguments:
+										roots = roots.append(VisitDeclaredType({ annotation | value_type = argument }))
 
 	match failure:
-		Some(error):
-			Err(error)
-		None:
-			validate_opaque_representations(declarations)
+		Some(error): Err(error)
+		None: Ok(void)
 
 
 -- Fixed-target reachability is fresh for every opaque. Mark a type only when
 -- expanding it: all its children are then pending, so an aggregate revisit
--- needs no second expansion. Check target reentry before that shortcut.
+-- needs no second expansion. Check target reentry before that shortcut. Every
+-- opaque is walked as a target, so an opaque on any cycle is found by its own walk.
 private pure func validate_opaque_representation(
 	root: CheckedOpaque,
 	declarations: CheckedDeclarations,
@@ -1190,7 +1201,7 @@ private pure func validate_opaque_representation(
 			None: failure = Some(checker_invariant(root.underlying_type.span, InvalidDeclarationVisit))
 			Some(annotation):
 				reentry = match annotation.value_type:
-					OpaqueType(id): opaque_number(id) == opaque_number(root.id)
+					NominalType(OpaqueNominal(id), _): opaque_number(id) == opaque_number(root.id)
 					_: False
 				if reentry:
 					failure = Some(type_declaration_error(annotation.span, RecursiveOpaqueRepresentation(root.id)))
@@ -1205,12 +1216,8 @@ private pure func validate_opaque_representation(
 						children: Result[List[TypeUse], CheckError] = match annotation.value_type:
 							TupleType(elements): Ok(elements.map(pure func(element): { annotation | value_type = element }))
 							ListType(element): Ok([{ annotation | value_type = element }])
-							OpaqueType(id):
-								match declarations.opaques.get(opaque_number(id)):
-									Some(declaration): Ok([declaration.underlying_type])
-									None: Err(checker_invariant(annotation.span, InvalidOpaqueDeclaration(id)))
-							NominalType(RecordAggregate(id), arguments): opaque_record_children(id, arguments, annotation.span, declarations.records)
-							NominalType(UnionAggregate(id), arguments): opaque_union_children(id, arguments, annotation.span, declarations.unions)
+							CallableType(_, parameters, result): Ok(parameters.append(result).map(pure func(child): { annotation | value_type = child }))
+							NominalType(owner, arguments): representation_children(owner, arguments, annotation.span, declarations)
 							_: Ok([])
 						match children:
 							Err(error): failure = Some(error)
@@ -1241,55 +1248,21 @@ private pure func validate_opaque_representations(declarations: CheckedDeclarati
 		None: Ok(void)
 
 
--- Argument demands precede stored fields, including phantom arguments. Each
--- child keeps its complete written annotation; no child-provenance tree exists.
-private pure func opaque_record_children(
-	id: RecordId,
+-- Arguments, including phantom ones, precede the declaration's written body.
+-- The body is not substituted: its parameters are leaves, so the walk meets
+-- only written types and is finite however a cycle would grow its arguments.
+private pure func representation_children(
+	owner: NominalId,
 	arguments: List[TypeRef],
 	span: Span,
-	records: List[CheckedRecord],
+	declarations: CheckedDeclarations,
 ) -> Result[List[TypeUse], CheckError]:
-	declaration ?= records.get(record_number(id)).to_result(checker_invariant(span, InvalidRecordDeclaration(id)))
-	var children: List[TypeUse] = []
-	for argument in arguments:
-		children = children.append({ value_type = argument, span = span })
-	substitution: Substitution = { owner = RecordDeclaration(id), values = arguments }
-	var failure: Option[CheckError] = None
-	for field in declaration.fields:
-		match substitute_type(field.value_type.value_type, substitution, field.value_type.span):
-			Ok(value): children = children.append({ field.value_type | value_type = value })
-			Err(error):
-				failure = Some(error)
-				break
-	match failure:
-		Some(error): Err(error)
-		None: Ok(children)
-
-
-private pure func opaque_union_children(
-	id: UnionId,
-	arguments: List[TypeRef],
-	span: Span,
-	unions: List[CheckedUnion],
-) -> Result[List[TypeUse], CheckError]:
-	declaration ?= unions.get(union_number(id)).to_result(checker_invariant(span, InvalidUnionDeclaration(id)))
-	var children: List[TypeUse] = []
-	for argument in arguments:
-		children = children.append({ value_type = argument, span = span })
-	substitution: Substitution = { owner = UnionDeclaration(id), values = arguments }
-	var failure: Option[CheckError] = None
-	for variant in declaration.variants:
-		for field in variant.fields:
-			match substitute_type(field.value_type, substitution, field.span):
-				Ok(value): children = children.append({ field | value_type = value })
-				Err(error):
-					failure = Some(error)
-					break
-		if failure.is_some():
-			break
-	match failure:
-		Some(error): Err(error)
-		None: Ok(children)
+	body: List[TypeUse] ?= match owner:
+		AggregateNominal(aggregate): root_fields(aggregate, declarations)
+		OpaqueNominal(id):
+			declarations.opaques.get(opaque_number(id)).map(pure func(declaration): [declaration.underlying_type])
+				.to_result(checker_invariant(span, InvalidOpaqueDeclaration(id)))
+	Ok(arguments.map(pure func(argument): { value_type = argument, span = span }).concat(body))
 
 
 private fixed record ExpandedInstance {

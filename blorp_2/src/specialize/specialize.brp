@@ -699,7 +699,7 @@ private pure func record_instance(
 	records: IndexedList[RecordInstance],
 ) -> Result[RecordInstanceId, Diagnostic]:
 	match value.value_type:
-		Checked.NominalType(Checked.RecordAggregate(_), arguments):
+		Checked.NominalType(Checked.AggregateNominal(Checked.RecordAggregate(_)), arguments):
 			concrete_record(opaques, declaration, arguments, substitution, unions, value.span, records)
 		_:
 			Err(internal_error(value.span, "record construction has a non-record type"))
@@ -740,9 +740,15 @@ private pure func concrete_type(
 	records: IndexedList[RecordInstance],
 ) -> Result[TypeRef, Diagnostic]:
 	match value_type:
-		Checked.OpaqueType(id):
+		-- The arguments close in the enclosing substitution; the underlying type
+		-- then expands in the opaque declaration's own.
+		Checked.NominalType(Checked.OpaqueNominal(id), arguments):
 			match opaques.get(Declaration.opaque_number(id)):
-				Some(declaration): concrete_type(opaques, declaration.underlying_type.value_type, { substitution | values = [] }, unions, span, records)
+				Some(declaration):
+					match semantic_arguments(arguments, substitution, span):
+						Err(error): Err(error)
+						Ok(closed):
+							concrete_type(opaques, declaration.underlying_type.value_type, { owner = Checked.OpaqueDeclaration(id), values = closed }, unions, span, records)
 				None: Err(internal_error(span, "unknown opaque declaration"))
 		Checked.CallableType(_, parameters, result):
 			match concrete_types(opaques, parameters, substitution, unions, span, records):
@@ -766,11 +772,11 @@ private pure func concrete_type(
 			match concrete_type(opaques, element, substitution, unions, span, records):
 				Ok(concrete): Ok(ListType(concrete))
 				Err(error): Err(error)
-		Checked.NominalType(Checked.RecordAggregate(id), arguments):
+		Checked.NominalType(Checked.AggregateNominal(Checked.RecordAggregate(id)), arguments):
 			match concrete_record(opaques, id, arguments, substitution, unions, span, records):
 				Ok(owner): Ok(RecordType(owner))
 				Err(error): Err(error)
-		Checked.NominalType(Checked.UnionAggregate(id), arguments):
+		Checked.NominalType(Checked.AggregateNominal(Checked.UnionAggregate(id)), arguments):
 			match concrete_types(opaques, arguments, substitution, unions, span, records):
 				Ok(concrete_arguments):
 					match find_union_instance(
@@ -1969,9 +1975,9 @@ private pure func prepare_type(
 	in_progress: List[InProgressLayout],
 ) -> Result[PreparedType, Diagnostic]:
 	match value:
-		Checked.OpaqueType(id):
+		Checked.NominalType(Checked.OpaqueNominal(id), arguments):
 			match checked.opaques.get(Declaration.opaque_number(id)):
-				Some(declaration): prepare_type(declaration.underlying_type.value_type, [], checked, unions, span, records, in_progress)
+				Some(declaration): prepare_opaque(declaration, arguments, substitution, checked, unions, span, records, in_progress)
 				None: Err(internal_error(span, "unknown opaque declaration"))
 		Checked.CallableType(_, parameters, result):
 			match prepare_arguments(parameters, substitution, checked, unions, span, records, in_progress):
@@ -2009,14 +2015,26 @@ private pure func prepare_type(
 			match prepare_type(element, substitution, checked, unions, span, records, in_progress):
 				Ok(prepared): Ok({ prepared | value_type = partial_list(prepared.value_type) })
 				Err(error): Err(error)
-		Checked.NominalType(Checked.RecordAggregate(id), arguments):
+		Checked.NominalType(Checked.AggregateNominal(Checked.RecordAggregate(id)), arguments):
 			match prepare_arguments(arguments, substitution, checked, unions, span, records, in_progress):
 				Ok(prepared): ensure_record({ origin = DeclaredRecord(id), arguments = prepared.arguments }, checked, prepared.unions, span, prepared.records, prepared.in_progress)
 				Err(error): Err(error)
-		Checked.NominalType(Checked.UnionAggregate(id), arguments):
+		Checked.NominalType(Checked.AggregateNominal(Checked.UnionAggregate(id)), arguments):
 			match prepare_arguments(arguments, substitution, checked, unions, span, records, in_progress):
 				Ok(prepared): ensure_union({ declaration = id, arguments = prepared.arguments }, checked, prepared.unions, span, prepared.records, prepared.in_progress)
 				Err(error): Err(error)
+
+
+-- As for a record: prepare the arguments, then the underlying type under the
+-- declaration's parameters bound to them.
+private pure func prepare_opaque(
+	declaration: Checked.CheckedOpaque, arguments: List[Checked.TypeRef], substitution: List[TypeSubstitution[PartialType]],
+	checked: Checked.CheckedFunctions, unions: IndexedList[UnionSlot], span: Span,
+	records: IndexedList[RecordSlot], in_progress: List[InProgressLayout],
+) -> Result[PreparedType, Diagnostic]:
+	prepared ?= prepare_arguments(arguments, substitution, checked, unions, span, records, in_progress)
+	inner ?= parameter_substitution(declaration.type_parameters, prepared.arguments, Checked.OpaqueDeclaration(declaration.id), span)
+	prepare_type(declaration.underlying_type.value_type, inner, checked, prepared.unions, span, prepared.records, prepared.in_progress)
 
 
 private pure func prepare_tuple_type(
@@ -2170,12 +2188,12 @@ private pure func statement_types(
 				match loop.iteration:
 					Checked.ListIteration(iterable, element, option):
 						types = types.concat(value_types(iterable)).append({
-							value_type = Checked.NominalType(Checked.UnionAggregate(Declaration.variant_owner(option.some)), [element]),
+							value_type = Checked.NominalType(Checked.AggregateNominal(Checked.UnionAggregate(Declaration.variant_owner(option.some))), [element]),
 							span = loop.span,
 						})
 					Checked.AscendingIntRange(start, end, boolean):
 						types = types.concat(value_types(start)).concat(value_types(end)).append({
-							value_type = Checked.NominalType(Checked.UnionAggregate(Declaration.variant_owner(boolean.true_variant)), []),
+							value_type = Checked.NominalType(Checked.AggregateNominal(Checked.UnionAggregate(Declaration.variant_owner(boolean.true_variant))), []),
 							span = loop.span,
 						})
 				types = types.concat(statement_types(loop.body))
@@ -3605,7 +3623,7 @@ private pure func translate_statements(
 													Err(error): Err(error)
 													Ok(concrete_element):
 														match concrete_type(
-															opaques, Checked.NominalType(Checked.UnionAggregate(Declaration.variant_owner(option.some)), [element]),
+															opaques, Checked.NominalType(Checked.AggregateNominal(Checked.UnionAggregate(Declaration.variant_owner(option.some))), [element]),
 															substitution, unions, loop.span, records,
 														):
 															Err(error): Err(error)
@@ -3621,7 +3639,7 @@ private pure func translate_statements(
 													Err(error): Err(error)
 													Ok(concrete_end):
 														match concrete_type(
-															opaques, Checked.NominalType(Checked.UnionAggregate(Declaration.variant_owner(boolean.true_variant)), []),
+															opaques, Checked.NominalType(Checked.AggregateNominal(Checked.UnionAggregate(Declaration.variant_owner(boolean.true_variant))), []),
 															substitution, unions, loop.span, records,
 														):
 															Err(error): Err(error)

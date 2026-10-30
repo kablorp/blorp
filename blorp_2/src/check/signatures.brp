@@ -12,7 +12,7 @@ import:
 		CheckError,
 		CheckerInvariant(InvalidFunctionContract, InvalidResolvedFunction, RuntimeContractMismatch),
 		SignatureError(GenericMain, MainHasParameters, MainParameterType, MainReturnType, MissingMain),
-		checker_invariant, type_declaration_error, TypeDeclarationError(TypeParameterTypeNameConflict), trait_error, TraitError(InvalidTraitBound, DuplicateReceiverParameter, ReceiverParameterCount, IndependentImplementationParameters),
+		checker_invariant, type_declaration_error, TypeDeclarationError(TypeParameterTypeNameConflict), trait_error, TraitError(InvalidTraitBound, DuplicateReceiverParameter, ReceiverParameterCount, GenericOpaqueImplementation, IndependentImplementationParameters),
 		signature_error,
 		BuiltinError(BuiltinContractMismatch, BuiltinTailAnnotation),
 		builtin_error
@@ -21,6 +21,7 @@ import:
 		TypeParameterOwner(FunctionDeclaration, TraitDeclaration),
 		TypeRef(ParameterType, CallableType, IntType, ListType, StringType, VoidType, NominalType),
 		AggregateId(UnionAggregate),
+		NominalId(AggregateNominal),
 		TypeUse,
 		same_type,
 		type_parameter_id,
@@ -33,13 +34,14 @@ import:
 		RuntimeResult(ValueResult, OptionalResult, ResultResult, BooleanResult),
 		primitive_operation,
 		runtime_contract
-	../namespace/namespace: Namespace, resolve_trait, named_type, FunctionSource(DeclaredHere), NamedValue(NamedFunction), named_value
+	../namespace/namespace: Namespace, resolve_trait, named_type, FunctionSource(DeclaredHere), NamedValue(NamedFunction), TypeHead(OpaqueHead), named_value
 	../parse/assemble: ParsedContents
 	../utils/ids:
 		FunctionId, FunctionRow, ImplRow, FunctionRole(ImplementationBody, FreeFunctionBody, TraitDefaultBody), inventory_implementations, impl_number,
 		VariantId,
 		function_number,
 		inventory_functions,
+		inventory_opaques,
 		inventory_records,
 		inventory_unions,
 		variant_owner
@@ -176,6 +178,7 @@ private pure func accept_functions(
 				self_binding = None,
 				records = inventory_records(parsed.declarations),
 				unions = inventory_unions(parsed.declarations),
+				opaques = inventory_opaques(parsed.declarations),
 				namespace = namespace,
 				module = function.module,
 				access = type_access(function.visibility, function.function_name.id),
@@ -421,9 +424,9 @@ fixed record BuiltinSite {
 private pure func runtime_result_type(result: RuntimeResult[VariantId, TypeRef]) -> TypeRef:
 	match result:
 		ValueResult(value_type): runtime_type_ref(value_type)
-		OptionalResult(payload, option): NominalType(UnionAggregate(variant_owner(option.some)), [runtime_type_ref(payload)])
-		ResultResult(success, error, constructors): NominalType(UnionAggregate(variant_owner(constructors.ok)), [runtime_type_ref(success), runtime_type_ref(error)])
-		BooleanResult(boolean): NominalType(UnionAggregate(variant_owner(boolean.true_variant)), [])
+		OptionalResult(payload, option): NominalType(AggregateNominal(UnionAggregate(variant_owner(option.some))), [runtime_type_ref(payload)])
+		ResultResult(success, error, constructors): NominalType(AggregateNominal(UnionAggregate(variant_owner(constructors.ok))), [runtime_type_ref(success), runtime_type_ref(error)])
+		BooleanResult(boolean): NominalType(AggregateNominal(UnionAggregate(variant_owner(boolean.true_variant))), [])
 
 
 pure func validate_builtin_body(
@@ -526,6 +529,13 @@ private pure func receiver_parameters(parameters: List[ParsedTypeParameter], sco
 private pure func implementation_header(row: ImplRow, scope: TypeScope, parsed: ParsedContents) -> Result[ImplementationHeader, CheckError]:
 	head ?= resolve_receiver_head(scope, row.header.receiver)
 	arity ?= receiver_arity(scope, head, receiver_head_span(row.header.receiver))
+	_: Void ?= match head:
+		OpaqueHead(id):
+			if arity == 0:
+				Ok(void)
+			else:
+				Err(trait_error(receiver_head_span(row.header.receiver), GenericOpaqueImplementation(id)))
+		_: Ok(void)
 	_: Void ?= if arity == row.header.type_parameters.length():
 		Ok(void)
 	else:
@@ -541,7 +551,7 @@ private pure func implementation_headers(parsed: ParsedContents, namespace: Name
 	for row in inventory_implementations(parsed.declarations):
 		scope: TypeScope = {
 			records = inventory_records(parsed.declarations), unions = inventory_unions(parsed.declarations),
-			namespace = namespace, module = row.header.module, access = PrivateTypeUse,
+			opaques = inventory_opaques(parsed.declarations), namespace = namespace, module = row.header.module, access = PrivateTypeUse,
 			parameters = [], self_binding = None
 		}
 		match implementation_header(row, scope, parsed):

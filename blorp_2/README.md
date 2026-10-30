@@ -1173,7 +1173,9 @@ argument from left to right. Conflicts retain the earliest inferred occurrence.
 At a conflict, diagnostic expectations retain any uninferred callee parameters
 as rigid types. Accepted calls still require every parameter to be inferred.
 Constructors and patterns substitute the union's own parameter identities.
-Phantom arguments still distinguish instances even when layouts match.
+Phantom arguments still distinguish instances even when layouts match. An
+opaque type's arguments are erased with it in layout keys: `Id[User]` and
+`Id[Order]` both have Int's layout, while their function instances stay distinct.
 `Result[Int, String]` has an owning layout even when the program constructs only
 Ok: its complete variant inventory includes a String child. The Ok tag requires
 no child work, while Err dup/drop visits its String. Written applications and
@@ -1266,7 +1268,9 @@ The rule is that the by-value storage graph is acyclic: a union stores each
 direct payload by value, including the payloads of an applied generic union's
 body (`Maybe[Node]` is checked as `Just(Node)`), while a record field, a List
 element and a non-generic union's one direct self payload are pointer edges
-that a cycle may pass through. Union-only cycles (`A(B)`, `B(A)`;
+that a cycle may pass through. An applied opaque type is checked as its
+underlying type at its arguments, so a self-reference wrapped in one, such as
+`Next(Box[Node])`, is not the admitted direct self payload. Union-only cycles (`A(B)`, `B(A)`;
 `Node(Maybe[Node])`) and a generic declaration whose body applies itself to
 one of its parameters (`Tree[T]: Node(List[Tree[T]])`) are rejected at the
 written type that closes the cycle. A record on a cycle is managed and a union
@@ -1822,9 +1826,15 @@ Lexical and layout rules:
   private type, including inside nested type arguments. Make the type public or
   the enclosing declaration private. Private declarations and body-only uses
   of private types remain valid.
-- `opaque type Name = Underlying` declares a distinct, nongeneric type.
+- `opaque type Name = Underlying` declares a distinct type, and
+  `opaque type Name[T] = Underlying` a generic one, whose parameters follow
+  record rules; a phantom parameter need not appear in the underlying type.
   `into_opaque Name(value)` wraps its underlying value and
   `from_opaque Name(value)` projects it, only inside the declaring module.
+  Conversions take no written type arguments: like a generic call, unwrapping
+  takes them from the operand, and wrapping from the operand or, for a phantom
+  parameter, the expected type (`id: Id[User] = into_opaque Id(7)`). Traits may
+  be implemented only for nongeneric opaque types.
   Export ordinary constructor/accessor functions for other modules, as in the
   [two-file Int example](test/e2e/fixtures/opaque/int/main.brp). Two opaque types
   remain distinct during checking and function specialization even when they wrap
@@ -1837,8 +1847,10 @@ Lexical and layout rules:
   Conversions evaluate their operand once; afterward they use the underlying
   layout and ownership operations without a runtime wrapper. Opaque types do not
   inherit representation fields or methods.
-  Public opaques may hide private representations. Cyclic opaque representations
-  are rejected; wrapping an independently recursive aggregate remains valid.
+  Public opaques may hide private representations. An opaque type that its own
+  representation reaches again, through any argument, field, List element or
+  callable type, is rejected; wrapping an independently recursive aggregate
+  remains valid.
   The conversion words are reserved: `into_opaque(7)` is a syntax error.
 - `LIMIT: Int = 7` declares an explicitly annotated module constant; its
   initializer may stand alone on the next line. Closed initializers admit

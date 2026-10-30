@@ -500,7 +500,7 @@ private pure func render_selection(span: Span, path: ModulePath, selection: Impo
 							message = "${name} is imported by ${module}, not declared there"
 							help: Result[String, Diagnostic] = match entity:
 								Constructor(id):
-									match type_spelling(Check.NominalType(Check.UnionAggregate(variant_owner(id)), []), context, span):
+									match type_spelling(Check.NominalType(Check.AggregateNominal(Check.UnionAggregate(variant_owner(id))), []), context, span):
 										Err(error): Err(error)
 										Ok(union_name): Ok("import the union from the module that declares it, selecting ${union_name}(${name})")
 								Trait(_) | Method(_) | Function(_) | Constant(_) | Type(_) | Alias(_):
@@ -523,7 +523,7 @@ private pure func render_selection(span: Span, path: ModulePath, selection: Impo
 						AmbiguousConstant:
 							ambiguous_selection(span, module, "constant")
 						BareConstructor(variant):
-							match type_spelling(Check.NominalType(Check.UnionAggregate(variant_owner(variant)), []), context, span):
+							match type_spelling(Check.NominalType(Check.AggregateNominal(Check.UnionAggregate(variant_owner(variant))), []), context, span):
 								Err(error): error
 								Ok(union_name):
 									rendered(span, "${name} is a constructor of the union ${union_name}", "write ${union_name}(${name}) to select the union with this constructor")
@@ -591,42 +591,23 @@ private pure func render_type_term_error(span: Span, rejection: Errors.TypeTermE
 								"${private_name} is private but appears in public declaration ${public_name}",
 								"make ${private_name} public, or make ${public_name} private",
 							)
-		Errors.MissingRecordTypeArguments(_, count):
+		Errors.MissingTypeArguments(owner, count):
 			if count == 1:
 				rendered(
 					span,
-					"generic record requires one type argument",
+					"generic ${nominal_noun(owner)} requires one type argument",
 					"write a concrete or symbolic application, such as Box[Int] or Box[T]",
 				)
 			else:
 				rendered(
 					span,
-					"generic record requires type arguments",
+					"generic ${nominal_noun(owner)} requires type arguments",
 					"write ${count.to_string()} type arguments in declaration order",
 				)
-		Errors.RecordTypeArgumentCountMismatch(_, expected, actual):
+		Errors.TypeArgumentCountMismatch(owner, expected, actual):
 			rendered(
 				span,
-				"record type argument count does not match its declaration",
-				"expected ${expected.to_string()} type arguments, got ${actual.to_string()}; supply types in declaration order",
-			)
-		Errors.MissingUnionTypeArguments(_, count):
-			if count == 1:
-				rendered(
-					span,
-					"generic union requires one type argument",
-					"write a concrete or symbolic application, such as Box[Int] or Box[T]",
-				)
-			else:
-				rendered(
-					span,
-					"generic union requires type arguments",
-					"write ${count.to_string()} type arguments in declaration order",
-				)
-		Errors.UnionTypeArgumentCountMismatch(_, expected, actual):
-			rendered(
-				span,
-				"union type argument count does not match its declaration",
+				"${nominal_kind(owner)} type argument count does not match its declaration",
 				"expected ${expected.to_string()} type arguments, got ${actual.to_string()}; supply types in declaration order",
 			)
 		Errors.UnknownType(_):
@@ -639,19 +620,13 @@ private pure func render_type_term_error(span: Span, rejection: Errors.TypeTermE
 			rendered(
 				span,
 				"type does not accept a type argument",
-				"apply a declared generic union or record, such as Box[Int]",
+				"apply a declared generic union, record or opaque type, such as Box[Int]",
 			)
-		Errors.OrdinaryRecordApplied(_):
+		Errors.OrdinaryTypeApplied(owner):
 			rendered(
 				span,
-				"ordinary record does not accept a type argument",
-				"remove the type argument from this record type",
-			)
-		Errors.OrdinaryUnionApplied(_):
-			rendered(
-				span,
-				"ordinary union does not accept a type argument",
-				"remove the type argument from this union type",
+				"ordinary ${nominal_noun(owner)} does not accept a type argument",
+				"remove the type argument from this ${nominal_kind(owner)} type",
 			)
 		Errors.ListTypeArgumentCount:
 			rendered(
@@ -660,6 +635,21 @@ private pure func render_type_term_error(span: Span, rejection: Errors.TypeTermE
 				"write List[String] for a list of Strings",
 			)
 
+
+
+-- The declaration kind as a modifier, as in "record type" or "opaque type".
+private pure func nominal_kind(owner: Check.NominalId) -> String:
+	match owner:
+		Check.AggregateNominal(Check.RecordAggregate(_)): "record"
+		Check.AggregateNominal(Check.UnionAggregate(_)): "union"
+		Check.OpaqueNominal(_): "opaque"
+
+
+-- The declaration kind as a noun: a record, a union or an opaque type.
+private pure func nominal_noun(owner: Check.NominalId) -> String:
+	match owner:
+		Check.OpaqueNominal(_): "opaque type"
+		Check.AggregateNominal(_): nominal_kind(owner)
 
 
 private pure func render_signature_error(
@@ -805,12 +795,26 @@ private pure func render_call_error(
 			render_arity_mismatch(span, arity, context)
 		Errors.InfiniteTypeArgument(_):
 			rendered(span, "inferred type would contain itself", "pass a value with a finite type, or use a concrete helper")
-		Errors.UninferableTypeParameter(_):
-			rendered(
-				span,
-				"cannot infer the type parameter from the argument",
-				"pass a value whose type determines the declared type parameter; use a concrete helper when no argument can determine it",
-			)
+		Errors.UninferableTypeParameter(parameter):
+			match Check.parameter_owner(parameter):
+				Check.OpaqueDeclaration(owner):
+					match parameter_spelling(parameter, context, span):
+						Err(error): error
+						Ok(parameter_name):
+							match type_spelling(Check.NominalType(Check.OpaqueNominal(owner), []), context, span):
+								Err(error): error
+								Ok(opaque_name):
+									rendered(
+										span,
+										"cannot infer type parameter ${parameter_name} of opaque type ${opaque_name}",
+										"give into_opaque an expected type, as in value: ${opaque_name}[...] = into_opaque ${opaque_name}(...), or give from_opaque an operand whose ${opaque_name} type is known",
+									)
+				_:
+					rendered(
+						span,
+						"cannot infer the type parameter from the argument",
+						"pass a value whose type determines the declared type parameter; use a concrete helper when no argument can determine it",
+					)
 
 
 -- Arity wording teaches the direct versus receiver-call form when the callee is nullary.
@@ -949,7 +953,7 @@ private pure func render_record_error(
 				span,
 			).and_then(
 				pure func(field): type_spelling(
-					Check.NominalType(Check.RecordAggregate(owner), []),
+					Check.NominalType(Check.AggregateNominal(Check.RecordAggregate(owner)), []),
 					context,
 					span,
 				).map(pure func(record_name): rendered(
@@ -1370,6 +1374,10 @@ private pure func ordinary_parameter_spelling(
 			inventory_records(context.parsed.declarations)
 				.get(record_number(owner))
 				.map(pure func(row): row.declaration.type_parameters)
+		Check.OpaqueDeclaration(owner):
+			inventory_opaques(context.parsed.declarations)
+				.get(opaque_number(owner))
+				.map(pure func(row): row.declaration.type_parameters)
 
 	written: WrittenName ?= match found_parameters:
 		Some(parameters):
@@ -1406,20 +1414,20 @@ private pure func type_spelling(
 								Pure: "pure ("
 								Impure: "("
 							Ok("${prefix}${comma_separated(spelled)}) -> ${returned}")
-		Check.OpaqueType(id):
-			match inventory_opaques(context.parsed.declarations).get(opaque_number(id)):
-				Some(declaration): parsed_spelling(declaration.declaration.type_name.id, context.parsed.names, span)
-				None: Err(render_fault(span, Errors.InvalidOpaqueDeclaration(id)))
 		Check.NominalType(owner, arguments):
 			declared: Result[String, Diagnostic] = match owner:
-				Check.RecordAggregate(id):
+				Check.AggregateNominal(Check.RecordAggregate(id)):
 					match inventory_records(context.parsed.declarations).get(record_number(id)):
 						Some(declaration): parsed_spelling(declaration.declaration.type_name.id, context.parsed.names, span)
 						None: Err(render_fault(span, Errors.InvalidRecordDeclaration(id)))
-				Check.UnionAggregate(id):
+				Check.AggregateNominal(Check.UnionAggregate(id)):
 					match inventory_unions(context.parsed.declarations).get(union_number(id)):
 						Some(declaration): parsed_spelling(declaration.type_name.id, context.parsed.names, span)
 						None: Err(render_fault(span, Errors.InvalidResolvedUnion(id)))
+				Check.OpaqueNominal(id):
+					match inventory_opaques(context.parsed.declarations).get(opaque_number(id)):
+						Some(declaration): parsed_spelling(declaration.declaration.type_name.id, context.parsed.names, span)
+						None: Err(render_fault(span, Errors.InvalidOpaqueDeclaration(id)))
 			match declared:
 				Err(error): Err(error)
 				Ok(name):
@@ -1679,6 +1687,7 @@ private pure func render_trait_error(span: Span, rejection: Errors.TraitError, c
 		Errors.IndependentImplementationParameters: rendered(span, "implementation methods cannot introduce type parameters", "declare all parameters on the implementation receiver and use them in each method")
 		Errors.InvalidTraitBound: rendered(span, "type parameter bound requires a visible trait", "import a parameterless trait and name it after ':' or '+'")
 		Errors.DuplicateReceiverParameter(previous): noted(span, "implementation receiver repeats a type parameter", "introduce a distinct fresh parameter for every receiver argument", PreviousDeclaration(previous.span))
+		Errors.GenericOpaqueImplementation(_): rendered(span, "traits on generic opaque types are not supported yet", "implement the trait for a nongeneric opaque type, or export ordinary functions from the declaring module")
 		Errors.ReceiverParameterCount(_, _): rendered(span, "implementation receiver must introduce its complete type parameter family", "write one distinct fresh parameter for every receiver argument; specialized or nested receiver patterns are not supported")
 		Errors.MissingTraitBound(_, _): rendered(span, "type does not satisfy the required trait bound", "add the required trait to this function's type parameter bounds, or provide an implementation for the concrete receiver")
 		Errors.OrphanImplementation(_, _): rendered(span, "implementation belongs to neither the trait nor receiver module", "declare it beside the trait or receiver type; foundation types may be implemented by their library")

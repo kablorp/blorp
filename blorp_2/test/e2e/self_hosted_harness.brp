@@ -32,6 +32,14 @@ private fixed record Example {
 }
 
 
+-- A fixture the compiler must reject with exactly this diagnostic text.
+private fixed record Rejection {
+    name: String,
+    source: String,
+    diagnostic: String
+}
+
+
 private pure func expect(actual: String, expected: String, description: String) -> Result[Void, String]:
     if actual.equals(expected):
         Ok(void)
@@ -132,6 +140,29 @@ private func rejected_fixture(compiler: String, work_directory: String) -> Resul
     expect(unchanged, PRESERVED_OUTPUT, "rejected output sentinel")
 
 
+private func verify_rejection(compiler: String, work_directory: String, rejection: Rejection) -> Result[Void, String]:
+    prefix = work_directory.add("/").add(rejection.name)
+    _ ?= command(
+        ["-u", "BLORP_LEAK_CHECK", "-u", "BLORP_MEMORY_STATS", compiler,
+         "--library-root", LIBRARY_ROOT, rejection.source, prefix.add(".c")],
+        prefix.add(".compile"), 1, COMPILATION_TIMEOUT_MS,
+    )
+    stdout: String ?= read_file(prefix.add(".compile.stdout"))
+    _ ?= expect(stdout, "", "rejected compiler stdout")
+    stderr: String ?= read_file(prefix.add(".compile.stderr"))
+    expect(stderr, rejection.source.add(rejection.diagnostic), "rejected compiler diagnostic")
+
+
+private pure func generic_opaque(name: String, diagnostic: String) -> Rejection:
+    { name = "opaque_".add(name), source = "blorp_2/test/e2e/fixtures/opaque/generic/".add(name).add(".brp"), diagnostic = diagnostic }
+
+
+private RECURSIVE_AGGREGATE: String = " error: recursive aggregate types are not supported yet\nhelp: use finite record and union fields; recursion is supported through a record field, a List element or one direct self payload of a non-generic union, such as Next(Node)\n"
+
+
+private RECURSIVE_OPAQUE: String = " error: recursive opaque representations are not supported yet\nhelp: wrap an independently recursive aggregate instead of referring back to the opaque type\n"
+
+
 private func reported(result: Result[Void, String]) -> Bool:
     match result:
         Ok(_): True
@@ -150,6 +181,32 @@ func suite(compiler: String, c_compiler: String, work_directory: String) -> Test
     literal: Example = { name = "literal", source = "blorp_2/test/e2e/fixtures/list/literal_int.brp", status = 0, stdout = "3\n1\n3\n", allocations = 4 }
     loop_entry: Example = { name = "loop_entry_accumulator", source = "blorp_2/test/e2e/fixtures/list/loop_entry_accumulator.brp", status = 0, stdout = "20\n0\n19\n4\n0\n2\n4\n6\n3\n00\n21\n012012012\n", allocations = 29 }
     branch: Example = { name = "branch_accumulator", source = "blorp_2/test/e2e/fixtures/list/branch_accumulator.brp", status = 0, stdout = "20\n0\n190\n5\n0\n1\n2\n2\n5\n2\nodd\n0003006\n5\n7\n", allocations = 33 }
+    opaque_wrap: Example = { name = "opaque_wrap", source = "blorp_2/test/e2e/fixtures/opaque/generic/wrap.brp", status = 2, stdout = "", allocations = 4 }
+    opaque_phantom: Example = { name = "opaque_phantom", source = "blorp_2/test/e2e/fixtures/opaque/generic/phantom.brp", status = 7, stdout = "", allocations = 0 }
+    opaque_nesting: Example = { name = "opaque_nesting", source = "blorp_2/test/e2e/fixtures/opaque/generic/nesting.brp", status = 15, stdout = "", allocations = 21 }
+    opaque_empty: Example = { name = "opaque_empty", source = "blorp_2/test/e2e/fixtures/opaque/generic/empty.brp", status = 5, stdout = "", allocations = 2 }
+    phantom_mismatch = generic_opaque("phantom_mismatch", ":9:5: error: argument type does not match the parameter type\nhelp: use an expression of type Id[User] here\n")
+    empty_needs_type = generic_opaque("empty_needs_type", ":3:11: error: cannot infer type parameter V of opaque type Box\nhelp: give into_opaque an expected type, as in value: Box[...] = into_opaque Box(...), or give from_opaque an operand whose Box type is known\n")
+    field_access = generic_opaque("field_access", ":4:9: error: field access requires a record value\nhelp: read a declared record field, or use parentheses for a UFCS function call\n")
+    method_access = generic_opaque("method_access", ":5:9: error: argument type does not match the parameter type\nhelp: use an expression of type List[Int] here\n")
+    arity_missing = generic_opaque("arity_missing", ":2:18: error: generic opaque type requires one type argument\nhelp: write a concrete or symbolic application, such as Box[Int] or Box[T]\n")
+    arity_count = generic_opaque("arity_count", ":2:18: error: opaque type argument count does not match its declaration\nhelp: expected 1 type arguments, got 2; supply types in declaration order\n")
+    arity_nongeneric = generic_opaque("arity_nongeneric", ":2:19: error: ordinary opaque type does not accept a type argument\nhelp: remove the type argument from this opaque type\n")
+    explicit_arguments = generic_opaque("explicit_arguments", ":3:20: error: opaque conversions take no type arguments\nhelp: write into_opaque Name(value) or from_opaque Name(value); the value and the expected type supply the arguments\n")
+    foreign_wrap: Rejection = {
+        name = "opaque_foreign",
+        source = "blorp_2/test/e2e/fixtures/opaque/generic/foreign/main.brp",
+        diagnostic = ":4:33: error: opaque values can be constructed only in their declaring module\nhelp: call a public constructor from the declaring module\n"
+    }
+    cycle_growing = generic_opaque("cycle_growing", ":3:20:".add(RECURSIVE_OPAQUE))
+    cycle_record = generic_opaque("cycle_record", ":1:27:".add(RECURSIVE_OPAQUE))
+    cycle_list = generic_opaque("cycle_list", ":1:20:".add(RECURSIVE_OPAQUE))
+    cycle_phantom = generic_opaque("cycle_phantom", ":2:20:".add(RECURSIVE_OPAQUE))
+    cycle_callable = generic_opaque("cycle_callable", ":1:20:".add(RECURSIVE_OPAQUE))
+    cycle_by_value = generic_opaque("cycle_by_value", ":3:7:".add(RECURSIVE_AGGREGATE))
+    cycle_two_self_payloads = generic_opaque("cycle_two_self_payloads", ":3:7:".add(RECURSIVE_AGGREGATE))
+    growing_recursion = generic_opaque("growing_recursion", ":5:16: error: recursive calls grow type arguments without bound\nhelp: pass recursive type arguments unchanged, permute them, or reset them to concrete types\n")
+    opaque_trait = generic_opaque("trait", ":2:26: error: traits on generic opaque types are not supported yet\nhelp: implement the trait for a nongeneric opaque type, or export ordinary functions from the declaring module\n")
     orderable: Example = { name = "orderable", source = "blorp_2/test/e2e/fixtures/orderable/int_float.brp", status = 0, stdout = "1010\n0011\n0101\n1010\n0011\n0011\n1010\n0000\n0000\n0000\n0011\n", allocations = 44 }
     ordering_operators: Example = { name = "ordering_operators", source = "blorp_2/test/e2e/fixtures/ordering/operators.brp", status = 0, stdout = "1010\n0011\n0101\n1010\n0011\n0000\n0000\n0000\n1010\n0011\n0101\n0011\n0000\n1000\n0000\n1010\n0011\n", allocations = 68 }
     ordering_order: Example = { name = "ordering_order", source = "blorp_2/test/e2e/fixtures/ordering/order.brp", status = 23, stdout = "left\nright\nleft\nright\nleft\nright\nleft\nright\n", allocations = 9 }
@@ -176,6 +233,28 @@ func suite(compiler: String, c_compiler: String, work_directory: String) -> Test
             ("stable Int-key sorting preserves managed aliases and chained keys", func(): reported(verify_example(compiler, c_compiler, work_directory, sort_by))),
             ("stable sort preserves every reversed element and nested owned aliases", func(): reported(verify_example(compiler, c_compiler, work_directory, sort_by_nested))),
             ("Float and user Orderable keys sort stably, and NaN keys still permute", func(): reported(verify_example(compiler, c_compiler, work_directory, sort_by_orderable))),
+            ("generic opaque wrap and unwrap, the CF-030 shape", func(): reported(verify_example(compiler, c_compiler, work_directory, opaque_wrap))),
+            ("phantom opaque arguments are fixed by the expected type", func(): reported(verify_example(compiler, c_compiler, work_directory, opaque_phantom))),
+            ("Box[Box[V]] at two types and in a declaration", func(): reported(verify_example(compiler, c_compiler, work_directory, opaque_nesting))),
+            ("an empty generic opaque takes its argument from the result type", func(): reported(verify_example(compiler, c_compiler, work_directory, opaque_empty))),
+            ("Id[Order] is not Id[User]", func(): reported(verify_rejection(compiler, work_directory, phantom_mismatch))),
+            ("into_opaque Box([]) needs an expected type", func(): reported(verify_rejection(compiler, work_directory, empty_needs_type))),
+            ("Box[V] has no representation fields", func(): reported(verify_rejection(compiler, work_directory, field_access))),
+            ("Box[V] has no representation methods", func(): reported(verify_rejection(compiler, work_directory, method_access))),
+            ("a generic opaque type needs its arguments", func(): reported(verify_rejection(compiler, work_directory, arity_missing))),
+            ("a generic opaque type takes its declared argument count", func(): reported(verify_rejection(compiler, work_directory, arity_count))),
+            ("a nongeneric opaque type takes no arguments", func(): reported(verify_rejection(compiler, work_directory, arity_nongeneric))),
+            ("conversions take no written type arguments", func(): reported(verify_rejection(compiler, work_directory, explicit_arguments))),
+            ("another module cannot wrap a generic opaque", func(): reported(verify_rejection(compiler, work_directory, foreign_wrap))),
+            ("an opaque cycle with growing arguments is rejected", func(): reported(verify_rejection(compiler, work_directory, cycle_growing))),
+            ("an opaque cycle through a generic record is rejected", func(): reported(verify_rejection(compiler, work_directory, cycle_record))),
+            ("an opaque cycle through a List is rejected", func(): reported(verify_rejection(compiler, work_directory, cycle_list))),
+            ("an opaque cycle through a phantom argument is rejected", func(): reported(verify_rejection(compiler, work_directory, cycle_phantom))),
+            ("an opaque cycle through a callable type is rejected", func(): reported(verify_rejection(compiler, work_directory, cycle_callable))),
+            ("a union stored by value through an applied opaque is a cycle", func(): reported(verify_rejection(compiler, work_directory, cycle_by_value))),
+            ("each self payload through an applied opaque is by-value", func(): reported(verify_rejection(compiler, work_directory, cycle_two_self_payloads))),
+            ("recursion that grows Box[V] is rejected", func(): reported(verify_rejection(compiler, work_directory, growing_recursion))),
+            ("traits on generic opaque types are rejected", func(): reported(verify_rejection(compiler, work_directory, opaque_trait))),
             ("rejected compilation preserves an existing output", func(): reported(rejected_fixture(compiler, work_directory))),
         ]
     }

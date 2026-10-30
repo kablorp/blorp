@@ -58,6 +58,7 @@ fixed union TypeParameterOwner:
 	FunctionDeclaration(FunctionId)
 	UnionDeclaration(UnionId)
 	RecordDeclaration(RecordId)
+	OpaqueDeclaration(OpaqueId)
 
 
 -- Owner and declaration position identify a rigid parameter within this compilation.
@@ -77,10 +78,9 @@ fixed union TypeRef:
 	StringType
 	ListType(TypeRef)
 	TupleType(List[TypeRef])
-	-- A record or union applied to its type arguments, which match the
-	-- declaration's arity; a nongeneric declaration has none.
-	NominalType(AggregateId, List[TypeRef])
-	OpaqueType(OpaqueId)
+	-- A record, union or opaque type applied to its type arguments, which
+	-- match the declaration's arity; a nongeneric declaration has none.
+	NominalType(NominalId, List[TypeRef])
 	ParameterType(TypeParameterId)
 	CallableType(Purity, List[TypeRef], TypeRef)
 
@@ -102,6 +102,7 @@ fixed record CheckedUnion {
 
 fixed record CheckedOpaque {
 	id: OpaqueId,
+	type_parameters: List[TypeParameterId],
 	underlying_type: TypeUse
 }
 
@@ -175,6 +176,14 @@ fixed union EqualityMember:
 fixed union AggregateId:
 	RecordAggregate(RecordId)
 	UnionAggregate(UnionId)
+
+
+-- The declaration a nominal type names. Only an aggregate has fields or
+-- variants; an opaque type is distinct during checking and erased in
+-- specialization.
+fixed union NominalId:
+	AggregateNominal(AggregateId)
+	OpaqueNominal(OpaqueId)
 
 
 -- One ordinary template, owned by its canonical equals member.
@@ -494,6 +503,18 @@ pure func aggregate_head(aggregate: AggregateId) -> TypeHead:
 	match aggregate:
 		RecordAggregate(record_row): RecordHead(record_row)
 		UnionAggregate(union_row): UnionHead(union_row)
+
+
+pure func same_nominal(left: NominalId, right: NominalId) -> Bool:
+	match left:
+		AggregateNominal(first):
+			match right:
+				AggregateNominal(second): same_aggregate(first, second)
+				OpaqueNominal(_): False
+		OpaqueNominal(first):
+			match right:
+				OpaqueNominal(second): opaque_number(first) == opaque_number(second)
+				AggregateNominal(_): False
 
 
 pure func aggregate_owner(aggregate: AggregateId) -> TypeParameterOwner:
@@ -844,9 +865,9 @@ pure func type_head(value_type: TypeRef) -> Option[TypeHead]:
 			Some(PrimitiveHead(BuiltinString))
 		ListType(_):
 			Some(ListHead)
-		NominalType(owner, _):
-			Some(aggregate_head(owner))
-		OpaqueType(id):
+		NominalType(AggregateNominal(aggregate), _):
+			Some(aggregate_head(aggregate))
+		NominalType(OpaqueNominal(id), _):
 			Some(OpaqueHead(id))
 		ParameterType(_) | CallableType(_, _, _) | TupleType(_):
 			None
@@ -856,9 +877,9 @@ pure func type_head(value_type: TypeRef) -> Option[TypeHead]:
 pure func receiver_type(head: TypeHead, arguments: List[TypeRef]) -> Option[TypeRef]:
 	match head:
 		PrimitiveHead(primitive): Some(primitive_ref(primitive))
-		OpaqueHead(owner): Some(OpaqueType(owner))
-		RecordHead(owner): Some(NominalType(RecordAggregate(owner), arguments))
-		UnionHead(owner): Some(NominalType(UnionAggregate(owner), arguments))
+		OpaqueHead(owner): Some(NominalType(OpaqueNominal(owner), arguments))
+		RecordHead(owner): Some(NominalType(AggregateNominal(RecordAggregate(owner)), arguments))
+		UnionHead(owner): Some(NominalType(AggregateNominal(UnionAggregate(owner)), arguments))
 		ListHead:
 			match arguments:
 				[element]: Some(ListType(element))
@@ -882,7 +903,7 @@ pure func same_type(left: TypeRef, right: TypeRef) -> Bool:
 		NominalType(owner, arguments):
 			match right:
 				NominalType(other_owner, others):
-					if same_aggregate(owner, other_owner):
+					if same_nominal(owner, other_owner):
 						same_types(arguments, others)
 					else:
 						False
@@ -916,10 +937,6 @@ pure func same_type(left: TypeRef, right: TypeRef) -> Bool:
 		StringType:
 			match right:
 				StringType: True
-				_: False
-		OpaqueType(owner):
-			match right:
-				OpaqueType(other_owner): opaque_number(owner) == opaque_number(other_owner)
 				_: False
 
 
@@ -978,6 +995,10 @@ pure func same_owner(left: TypeParameterOwner, right: TypeParameterOwner) -> Boo
 					record_number(left_record) == record_number(right_record)
 				_:
 					False
+		OpaqueDeclaration(left_opaque):
+			match right:
+				OpaqueDeclaration(right_opaque): opaque_number(left_opaque) == opaque_number(right_opaque)
+				_: False
 
 pure func same_parameter(left: TypeParameterId, right: TypeParameterId) -> Bool:
 	and(
@@ -996,7 +1017,7 @@ fixed record UnionOccurrence {
 
 pure func union_occurrence(value: TypeRef) -> Option[UnionOccurrence]:
 	match value:
-		NominalType(UnionAggregate(id), arguments):
+		NominalType(AggregateNominal(UnionAggregate(id)), arguments):
 			Some({
 				owner = id,
 				arguments = arguments,

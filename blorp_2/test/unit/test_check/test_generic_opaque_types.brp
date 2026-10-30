@@ -1,0 +1,183 @@
+---
+A generic opaque type is a nominal application like a generic record: its
+declaration owns its type parameters, and each conversion infers the
+arguments as a call infers a generic function's.
+---
+import:
+	../../../src/check/check: check, checked_functions
+	../../../src/check/render: render_failure
+	../../../src/check/model as Model
+	../../../src/utils/source: module_source, root_module_id, same_source
+	../../../src/utils/ids: opaque_number
+	../module_input: parse_modules
+	bool: and, not
+	int: Int methods
+	result: Result methods
+	string: String methods
+	test: TestSuite
+
+
+private SOURCE: String =
+	|fixed record Rows[V] { entries: List[V] }
+	|fixed record User { name: String }
+	|fixed record Order { total: Int }
+	|opaque type Box[V] = Rows[V]
+	|opaque type Id[T] = Int
+	|opaque type Name = String
+	|pure func inspect(ints: Box[Int], texts: Box[String], user: Id[User], order: Id[Order], name: Name) -> Int:
+	|    0
+	|pure func wrap(value: Int) -> Box[Int]:
+	|    into_opaque Box({ entries = [value] })
+	|pure func unwrap(box: Box[String]) -> Rows[String]:
+	|    from_opaque Box(box)
+	|func main() -> Int:
+	|    0
+	|
+
+
+private pure func checked() -> Option[Model.CheckedFunctions]:
+	match parse_modules([{ source = SOURCE, targets = [] }]):
+		Err(_): None
+		Ok(parsed):
+			match check(parsed):
+				Err(_): None
+				Ok(accepted): Some(checked_functions(accepted))
+
+
+private pure func returned(functions: Model.CheckedFunctions, position: Int) -> Option[Model.CheckedExpr]:
+	match functions.functions.get(position):
+		Some(function):
+			match function.body:
+				Model.CheckedValueBody(Model.ReturnExpression(value)): Some(value)
+				_: None
+		None: None
+
+
+pure func test_opaque_declaration_owns_its_parameters() -> Bool:
+	match checked():
+		None: False
+		Some(functions):
+			match functions.opaques.get(0):
+				None: False
+				Some(box):
+					match (box.type_parameters, box.underlying_type.value_type):
+						([parameter], Model.NominalType(Model.AggregateNominal(Model.RecordAggregate(_)), [Model.ParameterType(used)])):
+							owned: Bool = match Model.parameter_owner(parameter):
+								Model.OpaqueDeclaration(owner): opaque_number(owner) == opaque_number(box.id)
+								_: False
+							and(owned, Model.same_parameter(parameter, used))
+						_: False
+
+
+pure func test_applied_opaque_types_are_nominal_applications() -> Bool:
+	match checked():
+		None: False
+		Some(functions):
+			match functions.functions.get(0):
+				None: False
+				Some(inspect):
+					match inspect.signature.parameters.map(pure func(parameter): parameter.value_type):
+						[ints, texts, user, order, name]:
+							shapes: Bool = match (ints, user, name):
+								(
+									Model.NominalType(Model.OpaqueNominal(_), [Model.IntType]),
+									Model.NominalType(Model.OpaqueNominal(_), [Model.NominalType(Model.AggregateNominal(_), [])]),
+									Model.NominalType(Model.OpaqueNominal(_), []),
+								): True
+								_: False
+							distinct = and(not(Model.same_type(ints, texts)), not(Model.same_type(user, order)))
+							and(shapes, and(distinct, Model.same_type(user, user)))
+						_: False
+
+
+pure func test_wrapping_infers_arguments_from_the_operand() -> Bool:
+	match checked():
+		None: False
+		Some(functions):
+			match returned(functions, 1):
+				None: False
+				Some(value):
+					match (value.form, value.value_type):
+						(Model.ConstructOpaque(_, operand), Model.NominalType(Model.OpaqueNominal(_), [Model.IntType])):
+							match operand.value_type:
+								Model.NominalType(Model.AggregateNominal(Model.RecordAggregate(_)), [Model.IntType]): True
+								_: False
+						_: False
+
+
+pure func test_unwrapping_substitutes_the_operand_arguments() -> Bool:
+	match checked():
+		None: False
+		Some(functions):
+			match returned(functions, 2):
+				None: False
+				Some(value):
+					match (value.form, value.value_type):
+						(Model.ProjectOpaque(_, _), Model.NominalType(Model.AggregateNominal(Model.RecordAggregate(_)), [Model.StringType])): True
+						_: False
+
+
+-- The rejection's first diagnostic covers exactly `marked`, which follows `prefix`.
+private pure func rejects(prefix: String, marked: String, rest: String, message: String, help: String) -> Bool:
+	match parse_modules([{ source = "${prefix}${marked}${rest}", targets = [] }]):
+		Err(_): False
+		Ok(parsed):
+			match check(parsed):
+				Ok(_): False
+				Err(failure):
+					errors = render_failure(failure)
+					error = errors.first
+					error.message.equals(message).and(error.help.equals(help))
+						.and(same_source(error.span.source, module_source(root_module_id())))
+						.and(error.span.start.equals(prefix.length()))
+						.and(error.span.end.equals(prefix.length().add(marked.length())))
+						.and(errors.remaining.is_empty())
+
+
+pure func test_an_unfixed_phantom_parameter_is_rejected_at_the_conversion() -> Bool:
+	rejects(
+		"opaque type Id[T] = Int\nfunc main() -> Int:\n    id = ",
+		"into_opaque Id(7)",
+		"\n    0\n",
+		"cannot infer type parameter T of opaque type Id",
+		"give into_opaque an expected type, as in value: Id[...] = into_opaque Id(...), or give from_opaque an operand whose Id type is known",
+	)
+
+
+pure func test_an_expected_type_fixes_a_phantom_parameter() -> Bool:
+	source = "fixed record User { name: String }\nopaque type Id[T] = Int\nfunc main() -> Int:\n    id: Id[User] = into_opaque Id(7)\n    0\n"
+	match parse_modules([{ source = source, targets = [] }]):
+		Err(_): False
+		Ok(parsed): check(parsed).is_ok()
+
+
+-- An applied opaque that holds its union behind a pointer, or not at all, is no
+-- by-value cycle: Id erases to Int and Rows to a List.
+pure func test_an_opaque_over_a_pointer_to_its_union_is_accepted() -> Bool:
+	source: String =
+		|opaque type Id[T] = Int
+		|opaque type Rows[V] = List[V]
+		|fixed union U:
+		|    Named(Id[U])
+		|    Nested(Rows[U])
+		|    Empty
+		|func main() -> Int:
+		|    0
+		|
+	match parse_modules([{ source = source, targets = [] }]):
+		Err(_): False
+		Ok(parsed): check(parsed).is_ok()
+
+
+tests: TestSuite = {
+	description = "Generic opaque types",
+	tests = [
+		("an opaque declaration owns its type parameters", test_opaque_declaration_owns_its_parameters),
+		("applied opaque types are nominal applications distinct by argument", test_applied_opaque_types_are_nominal_applications),
+		("wrapping infers the opaque arguments from the operand", test_wrapping_infers_arguments_from_the_operand),
+		("unwrapping substitutes the operand's arguments into the underlying type", test_unwrapping_substitutes_the_operand_arguments),
+		("an unfixed phantom parameter is rejected at the conversion", test_an_unfixed_phantom_parameter_is_rejected_at_the_conversion),
+		("an expected type fixes a phantom parameter", test_an_expected_type_fixes_a_phantom_parameter),
+		("an opaque over a pointer to its union is accepted", test_an_opaque_over_a_pointer_to_its_union_is_accepted),
+	],
+}

@@ -2499,7 +2499,8 @@ every host or build. M3's source loop migration addresses these flat walks;
 broader managed tail-call optimization remains deferred. Tree traversal and
 destruction depth still need their separate measured evidence.
 
-**Opaque types** are a checked `TypeRef.OpaqueType(id)`. Public opaque type
+**Opaque types** are a checked nominal application,
+`TypeRef.NominalType(OpaqueNominal(id), arguments)`. Public opaque type
 references may cross modules; only construction and projection are restricted
 to the declaring module, using namespace-owned declaration authority.
 Specialize projects the accepted underlying type before forming runtime keys,
