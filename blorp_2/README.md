@@ -1781,7 +1781,8 @@ Lexical and layout rules:
   A line indented between a bracketed block's base and its level closes the
   block. The parser reads blocks from those tokens and never compares depths.
 - Spaces may separate tokens and trail each line. They are required between
-  `func` and the function name, and between `fixed`, `union` and the type name.
+  `func` and the function name, between `fixed` and `record` or `union`, and
+  between `record` or `union` and the type name.
   Identifiers are scanned as whole words, so
   `funcmain` is one identifier. The two characters of `->` are adjacent.
   Spaces may surround a UFCS dot and its parentheses, as in `1 . one ( )`.
@@ -1817,9 +1818,9 @@ Lexical and layout rules:
   are unsupported; argument types and known expected results constrain the type
   parameters.
 - `union Type:` introduces one or more variants on indented
-  lines. `fixed union Type:` will promise stack storage under the fixed-record
-  rules (no managed payloads, no recursion, no type parameters); those rules are
-  not checked yet, so it currently declares the same union. `fixed` is a
+  lines. `fixed union Type:` will promise stack storage under the `fixed`
+  rules in [grammar.ebnf](grammar.ebnf); those rules are not checked yet, so
+  it currently declares the same union. `fixed` is a
   contextual header word and remains a valid name elsewhere; `union` is reserved. A variant is bare or declares an ordered list of field types, as in
   `Number(Int)`, `Box(T)` or `Pair(String, String)`. A union may declare ordered
   parameters with `union Result[T, E]:`. Every field annotation uses ordinary
@@ -1827,9 +1828,11 @@ Lexical and layout rules:
   recursive type arguments such as `Box[Box[Int]]` or `Result[T, Box[E]]`.
   Empty declaration parentheses remain unsupported. Concrete field layouts may
   contain Int, Float, String, Void, Lists of supported finite types, finite inline unions or records.
-- `fixed record Pair { first: Int, second: Int }` declares a nominal record;
-  its braces may span lines. Field names must be distinct and have supported finite concrete
-  types after specialization. `fixed record Box[T] { value: T }` declares ordered
+- `record Pair { first: Int, second: Int }` declares a nominal record;
+  its braces may span lines. `fixed record` will promise stack storage under
+  the `fixed` rules in [grammar.ebnf](grammar.ebnf); those rules are not
+  checked yet, so it currently declares the same record. Field names must be distinct and have supported finite concrete
+  types after specialization. `record Box[T] { value: T }` declares ordered
   type parameters; their identity belongs to this record. `record` is
   reserved. Empty and recursive records remain unsupported. Representation follows the
   inline-versus-managed field policy described above.

@@ -3690,17 +3690,19 @@ private fixed record ParsedRecordResult {
 }
 
 
+-- `start` is at the `record` keyword.
 private pure func consume_record(start: ParserState, module: ModuleId, visibility: Visibility) -> Result[ParsedRecordResult, Diagnostic]:
-	name ?= consume_name(shifted(start, 2), "expected a record type name")
+	name ?= consume_name(shifted(start, 1), "expected a record type name")
 	type_parameters ?= consume_type_parameter_names(name.next)
 	opened: ParserState ?= match current_symbol(type_parameters.next):
 		Some(LeftBrace):
 			Ok(shifted(type_parameters.next, 1))
 		_:
-			Err(unexpected(type_parameters.next, "expected '{' after the record type name", "write fixed record Name { field: Int }"))
+			Err(unexpected(type_parameters.next, "expected '{' after the record type name", "write record Name { field: Int }"))
 	fields ?= consume_parameter_list(opened, "expected a record field name", [])
 	closed ?= expect(fields.next, at_right_brace(fields.next), "expected '}' after the record declaration", "separate record fields with commas, then close the declaration with '}'")
-	Ok({ declaration = { module = module, visibility = visibility, type_name = name.name, type_parameters = type_parameters.names, fields = fields.parameters }, next = closed })
+	next ?= end_value_line(closed)
+	Ok({ declaration = { module = module, visibility = visibility, type_name = name.name, type_parameters = type_parameters.names, fields = fields.parameters }, next = next })
 
 
 private fixed record BuiltinTypeResult {
@@ -4141,7 +4143,7 @@ private fixed record DeclarationResult {
 -- `declared` says whether a non-import declaration precedes `state`.
 private pure func consume_declaration(state: ParserState, module: ModuleId, declared: Bool) -> Result[DeclarationResult, Diagnostic]:
 	if and(at_import(state), declared):
-		Err(expected_syntax(state, "imports must precede declarations", "move every import: block before the module's functions, unions, and fixed records"))
+		Err(expected_syntax(state, "imports must precede declarations", "move every import: block before the module's functions, unions, and records"))
 	else if at_import(state):
 		match consume_import_block(state):
 			Ok(block): Ok({ declaration = ImportBlock(block.imports), next = block.next })
@@ -4177,12 +4179,16 @@ private pure func consume_visible_declaration(state: ParserState, module: Module
 		match consume_implementation(state, module, visibility):
 			Ok(parsed): Ok({ declaration = FunctionDeclaration(ImplementationGroup(parsed.header, parsed.methods)), next = parsed.next })
 			Err(error): Err(error)
-	else if and(at_word(state, recognized_words(state).fixed_word), at_keyword(shifted(state, 1), RecordKeyword)):
+	else if at_keyword(state, RecordKeyword):
 		match consume_record(state, module, visibility):
-			Ok(parsed):
-				match end_value_line(parsed.next):
-					Ok(next): Ok({ declaration = RecordDeclaration(parsed.declaration), next = next })
-					Err(error): Err(error)
+			Ok(parsed): Ok({ declaration = RecordDeclaration(parsed.declaration), next = parsed.next })
+			Err(error): Err(error)
+	-- `fixed record` will promise stack storage under the `fixed` rules in
+	-- grammar.ebnf. Those rules are not checked yet, so it currently declares
+	-- the same record as `record`.
+	else if and(at_word(state, recognized_words(state).fixed_word), at_keyword(shifted(state, 1), RecordKeyword)):
+		match consume_record(shifted(state, 1), module, visibility):
+			Ok(parsed): Ok({ declaration = RecordDeclaration(parsed.declaration), next = parsed.next })
 			Err(error): Err(error)
 	else if at_keyword(state, OpaqueKeyword):
 		match consume_opaque(state, module, visibility):
@@ -4196,9 +4202,9 @@ private pure func consume_visible_declaration(state: ParserState, module: Module
 		match consume_union(state, module, visibility):
 			Ok(parsed): Ok({ declaration = UnionDeclaration(parsed.declaration), next = parsed.next })
 			Err(error): Err(error)
-	-- `fixed union` will promise stack storage (no managed payloads, no
-	-- recursion, no type parameters). Those rules are not checked yet, so it
-	-- currently declares the same union as `union`.
+	-- `fixed union` will promise stack storage under the `fixed` rules in
+	-- grammar.ebnf. Those rules are not checked yet, so it currently declares
+	-- the same union as `union`.
 	else if and(at_word(state, recognized_words(state).fixed_word), at_keyword(shifted(state, 1), UnionKeyword)):
 		match consume_union(shifted(state, 1), module, visibility):
 			Ok(parsed): Ok({ declaration = UnionDeclaration(parsed.declaration), next = parsed.next })
