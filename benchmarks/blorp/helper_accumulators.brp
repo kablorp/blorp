@@ -5,8 +5,10 @@ import:
 
 -- Accumulators threaded through helper functions; see the Blorp 2 port in
 -- benchmarks/blorp_2/. Each mode performs `count` updates through a helper
--- that receives the accumulator as a parameter; `none` is the process-startup
--- control. Usage: helper_accumulators <mode> <count>.
+-- that receives the accumulator as a parameter; the record modes update a List
+-- field of a record: directly in a loop, through a helper, through a helper
+-- replacing one field, and through a helper returning a `Result`. `none` is the
+-- process-startup control. Usage: helper_accumulators <mode> <count>.
 pure func push(values: List[Int], value: Int) -> List[Int]:
 	values.append(value)
 
@@ -51,6 +53,106 @@ pure func set_helper(count: Int) -> Int:
 	table.length()
 
 
+-- A record field accumulator. The unique seed `[0]` is not the immortal `[]`,
+-- which is never unique and always copies once.
+record State {
+	items: List[Int],
+	count: Int
+}
+
+
+-- One function's loop updates the field; needs no owned parameter.
+pure func record_loop(count: Int) -> Int:
+	var state: State = {
+		items = [0],
+		count = 0
+	}
+
+	for index in 0..count:
+		state = { state |
+			items = state.items.append(index),
+			count = state.count + 1
+		}
+
+	state.items.length() + state.count
+
+
+pure func push_state(state: State, item: Int) -> State:
+	{ state |
+		items = state.items.append(item),
+		count = state.count + 1
+	}
+
+
+-- The same update through a helper whose parameter is owned.
+pure func record_helper(count: Int) -> Int:
+	var state: State = {
+		items = [0],
+		count = 0
+	}
+
+	for index in 0..count:
+		state = push_state(state, index)
+
+	state.items.length() + state.count
+
+
+-- Only `items` is replaced; `count` is inherited, so the update reads it after
+-- the replacement unless the base is projected first.
+pure func push_items(state: State, item: Int) -> State:
+	{ state | items = state.items.append(item) }
+
+
+pure func record_inherited(count: Int) -> Int:
+	var state: State = {
+		items = [0],
+		count = 0
+	}
+
+	for index in 0..count:
+		state = push_items(state, index)
+
+	state.items.length() + state.count
+
+
+-- Threaded through a Result-returning helper by `?=` propagation.
+pure func push_checked(state: State, item: Int) -> Result[State, String]:
+	if item < 0:
+		Err("negative")
+	else:
+		Ok({ state |
+				items = state.items.append(item),
+				count = state.count + 1
+			})
+
+
+-- `?=` leaves the loop on `Err`, so no arm keeps the caller's value live.
+pure func thread_checked(state: State, index: Int, count: Int) -> Result[Int, String]:
+	next ?= push_checked(state, index)
+
+	if index + 1 == count:
+		Ok(next.items.length() + next.count)
+	else:
+		thread_checked(next, index + 1, count)
+
+
+pure func record_result(count: Int) -> Int:
+	match (
+		thread_checked(
+			{
+				items = [0],
+				count = 0
+			},
+			0,
+			count,
+		)
+	):
+		Ok(total):
+			total
+		Err(_):
+			0
+
+
 pure func run(mode: String, count: Int) -> Option[Int]:
 	match mode:
 		"list_helper":
@@ -59,6 +161,14 @@ pure func run(mode: String, count: Int) -> Option[Int]:
 			Some(string_helper(count))
 		"set_helper":
 			Some(set_helper(count))
+		"record_loop":
+			Some(record_loop(count))
+		"record_helper":
+			Some(record_helper(count))
+		"record_result":
+			Some(record_result(count))
+		"record_inherited":
+			Some(record_inherited(count))
 		"none":
 			Some(0)
 		_:
@@ -79,5 +189,8 @@ func main(args: List[String]) -> Int:
 			print(length.to_string())
 			0
 		None:
-			print("usage: helper_accumulators list_helper|string_helper|set_helper|none <count>")
+			print((
+					"usage: helper_accumulators list_helper|string_helper|set_helper|record_loop|reco"
+					+ "rd_helper|record_result|none <count>"
+				))
 			2
