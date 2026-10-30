@@ -6,7 +6,7 @@ import:
 	./errors as Errors
 	./model as Check
 	../utils/ids:
-		VariantId, trait_method_header, inventory_traits, trait_number, trait_method_owner, trait_method_number,
+		TraitId, VariantId, trait_method_header, inventory_traits, trait_number, trait_method_owner, trait_method_number,
 		constant_number,
 		inventory_constants,
 		inventory_functions,
@@ -46,7 +46,7 @@ import:
 		),
 		Diagnostics,
 		ParsedBuiltinType(IntegerBuiltin, FloatBuiltin, StringBuiltin, VoidBuiltin, ListBuiltin),
-		Span, type_span, NoteLine, WrittenName, internal_error, same_span,
+		Span, type_span, NoteLine, WrittenName, internal_error, same_span, ParsedReceiverHead(ReceiverName, QualifiedReceiverName),
 	../utils/text as Text: concat
 
 
@@ -1702,10 +1702,59 @@ private pure func render_trait_error(span: Span, rejection: Errors.TraitError, c
 					match parsed_spelling(owner.type_name.id, context.parsed.names, span):
 						Err(fault): fault
 						Ok(name): rendered(span, "receiver does not implement ${name}", "declare a matching implementation; generic functions must declare their required trait bounds")
-		Errors.EqualityMemberUnsupported(_, _, member): equality_member_diagnostic(span,
-			"automatic equality is unavailable for a field or payload",
-			"provide the member's required trait implementation, or write an Equatable implementation for the containing type", member, context)
+		Errors.EqualityMemberUnsupported(_, _, member): equality_member_diagnostic(span, "automatic equality is unavailable for a field or payload", EQUALITY_MEMBER_HELP, member, context)
 		Errors.MethodNeedsExpectedType(_): rendered(span, "trait method reference needs a callable type that determines Self", "add a callable type annotation or pass the method to a typed callable parameter")
+		Errors.SupertraitUnknown: rendered(span, "supertrait requires a visible trait", "import a parameterless trait and name it after ':' or '+'")
+		Errors.SupertraitCycle(path): cycle_diagnostic(span, path, context)
+		Errors.SupertraitNotImplemented(_, _, _, _) | Errors.SupertraitBoundNotEntailed(_, _, _, _) | Errors.SupertraitMethodInImplementation(_, _, _):
+			match supertrait_diagnostic(span, rejection, context):
+				Ok(diagnostic): diagnostic
+				Err(fault): fault
+		Errors.CanonicalEquatableSupertraits: rendered(span, "canonical Equatable cannot declare supertraits", "remove them; automatic equality requires no other trait")
+
+
+private EQUALITY_MEMBER_HELP: String = "provide the member's required trait implementation, or write an Equatable implementation for the containing type"
+
+
+private pure func trait_spelling(id: TraitId, context: RenderContext, span: Span) -> Result[String, Diagnostic]:
+	row ?= inventory_traits(context.parsed.declarations).get(trait_number(id)).to_result(render_fault(span, Errors.InvalidFunctionContract))
+	parsed_spelling(row.type_name.id, context.parsed.names, span)
+
+
+private pure func cycle_diagnostic(span: Span, path: List[TraitId], context: RenderContext) -> Diagnostic:
+	var names: List[String] = []
+	var fault: Option[Diagnostic] = None
+	for id in path:
+		match trait_spelling(id, context, span):
+			Ok(name): names = names.append(name)
+			Err(error): fault = Some(error)
+	fault.get_or(rendered(span, "trait inheritance cycle: ${names.join(" -> ")}", "remove one of these supertraits"))
+
+
+-- Each names two traits, or a misplaced method's supertrait twice, and the
+-- receiver by its written type name.
+private pure func supertrait_diagnostic(span: Span, rejection: Errors.TraitError, context: RenderContext) -> Result[Diagnostic, Diagnostic]:
+	named: (TraitId, TraitId, ParsedReceiverHead) ?= match rejection:
+		Errors.SupertraitNotImplemented(implemented, supertrait, receiver, _): Ok((implemented, supertrait, receiver))
+		Errors.SupertraitBoundNotEntailed(implemented, bound, _, receiver): Ok((implemented, bound, receiver))
+		Errors.SupertraitMethodInImplementation(_, owner, receiver): Ok((owner, owner, receiver))
+		_: Err(render_fault(span, Errors.InvalidFunctionContract))
+	(first_trait, second_trait, written) = named
+	first ?= trait_spelling(first_trait, context, span)
+	second ?= trait_spelling(second_trait, context, span)
+	receiver ?= match written:
+		ReceiverName(name): parsed_spelling(name.id, context.parsed.names, span)
+		QualifiedReceiverName(qualified): parsed_spelling(qualified.name.id, context.parsed.names, span)
+	absent = "implementing ${first} for ${receiver} requires an implementation of ${second}"
+	match rejection:
+		Errors.SupertraitNotImplemented(_, _, _, Errors.NeverImplemented): Ok(rendered(span, absent, "add implements ${second} for ${receiver}"))
+		Errors.SupertraitNotImplemented(_, _, _, Errors.AutomaticEqualityRejected(member)): Ok(equality_member_diagnostic(span, absent, EQUALITY_MEMBER_HELP, member, context))
+		Errors.SupertraitNotImplemented(_, _, _, Errors.AutomaticEqualityNotFinite): Ok(rendered(span, absent, "${receiver}'s automatic equality cannot be proved finite; write implements ${second} for ${receiver}"))
+		Errors.SupertraitBoundNotEntailed(_, _, parameter, _):
+			parsed_spelling(parameter.id, context.parsed.names, span).map(pure func(name): rendered(span, "implementing ${first} for ${receiver} requires ${name}: ${second}", "add ${second}, or a trait that requires it, to ${name}'s bounds"))
+		Errors.SupertraitMethodInImplementation(method, _, _):
+			parsed_spelling(method, context.parsed.names, span).map(pure func(name): rendered(span, "${name} belongs to supertrait ${second}", "define it in implements ${second} for ${receiver}"))
+		_: Err(render_fault(span, Errors.InvalidFunctionContract))
 
 
 private pure func equality_member_diagnostic(span: Span, message: String, help: String, member: Check.EqualityMember, context: RenderContext) -> Diagnostic:

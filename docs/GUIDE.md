@@ -128,7 +128,10 @@ payloads, including generic heads and deeply nested fields. A phantom parameter
 needs no equality bound; an authored child family propagates its actual conditions.
 These conditions constrain equality use, not ordinary construction, and authored
 implementations always win. Unavailable members or unproved finite automatic
-families reject at use. Trait parameters, independently generic methods and
+families reject at use. [Supertraits](../blorp_2/README.md#supertraits) and
+bodyless bundles are supported: a bound provides every trait above it, and
+implementing a trait requires an implementation of each direct supertrait.
+Trait parameters, independently generic methods and
 top-level callable trait formals remain deferred. See the linked
 pilot rules for use-site diagnostics and recursive eligibility. The production
 pilot library defines canonical Equatable in its traits module. Int/Float/String/List

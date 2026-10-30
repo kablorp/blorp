@@ -3419,6 +3419,28 @@ private fixed record TraitResult {
 }
 
 
+-- The method block after the header's last colon.
+private pure func consume_trait_block(after_colon: ParserState, module: ModuleId, visibility: Visibility) -> Result[ParsedTraitMethods, Diagnostic]:
+	newline ?= expect(after_colon, at_newline(after_colon), "expected a newline after the trait header", "put each method signature on its own indented line")
+	opened ?= expect(newline, at_indent(newline), "expected an indented trait method", "declare at least one pure method signature")
+	consume_trait_methods(opened, module, visibility, [])
+
+
+-- A bundle ends its line, or the file. An indented block below it means the
+-- second colon is missing, reported where it belongs.
+private pure func consume_bundle_end(state: ParserState) -> Result[ParsedTraitMethods, Diagnostic]:
+	if at_end(state):
+		Ok({ methods = [], next = state })
+	else if and(at_newline(state), at_indent(shifted(state, 1))):
+		Err(expected_syntax(state, "expected ':' before the trait's methods", "write trait A: B: and indent the methods below it"))
+	else:
+		match consume_line_end(state, "expected ':' or a newline after the supertraits", "add ':' before indented methods, or end the line for a trait without methods"):
+			Ok(next): Ok({ methods = [], next = next })
+			Err(error): Err(error)
+
+
+-- `trait Name:` opens a method block. Supertraits after the colon are read as
+-- bounds are, then a second colon opens the methods or the line ends a bundle.
 private pure func consume_trait(start: ParserState, module: ModuleId, visibility: Visibility) -> Result[TraitResult, Diagnostic]:
 	name ?= consume_name(shifted(start, 1), "expected a trait name")
 	_: Void ?= if at_left_bracket(name.next):
@@ -3426,13 +3448,22 @@ private pure func consume_trait(start: ParserState, module: ModuleId, visibility
 	else:
 		Ok(void)
 	colon ?= expect(name.next, at_colon(name.next), "expected ':' after the trait name", "write trait Equatable: followed by indented method signatures")
-	newline ?= expect(colon, at_newline(colon), "expected a newline after the trait header", "put each method signature on its own indented line")
-	opened ?= expect(newline, at_indent(newline), "expected an indented trait method", "declare at least one pure method signature")
-	methods ?= consume_trait_methods(opened, module, visibility, [])
+	plain = or(at_newline(colon), at_end(colon))
+	supertraits: ParsedTypes ?= if plain:
+		Ok({ types = [], next = colon })
+	else:
+		consume_parameter_bounds(colon, [])
+	after_supertraits = supertraits.next
+	methods: ParsedTraitMethods ?= if plain:
+		consume_trait_block(colon, module, visibility)
+	else if at_colon(after_supertraits):
+		consume_trait_block(shifted(after_supertraits, 1), module, visibility)
+	else:
+		consume_bundle_end(after_supertraits)
 	Ok({
 		declaration = {
-			module = module, visibility = visibility, type_name = name.name,
-			methods = methods.methods, span = { parser_span(start) | end = parser_span(colon).start }
+			module = module, visibility = visibility, type_name = name.name, supertraits = supertraits.types,
+			methods = methods.methods, span = { parser_span(start) | end = parser_span(name.next).end }
 		},
 		next = methods.next
 	})

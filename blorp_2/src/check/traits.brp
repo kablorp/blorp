@@ -5,17 +5,17 @@ the resolved requirement-to-body mapping consumed by checking and specialization
 ---
 import:
 	./declarations: TypeScope, type_access, previous_declaration, resolve_type, Substitution, substitute_type
-	./errors: CheckError, checker_invariant, CheckerInvariant(InvalidFunctionContract), TraitError(EqualityMemberUnsupported, DuplicateRequirementParameter, ImpureRequirement, GenericRequirement, FirstParameterMustBeSelf, CallableFormalDeferred, OrphanImplementation, DuplicateImplementation, MissingImplementationMethod, MissingTraitBound, UnknownImplementationMethod, DuplicateImplementationMethod, ImplementationSignatureMismatch, MalformedCanonicalTrait, MalformedCanonicalMember), CanonicalFamily(EqualityFamily, OrderingFamily), trait_error
+	./errors: CheckError, checker_invariant, type_term_error, TypeTermError(PrivateTypeInPublicDeclaration), CheckerInvariant(InvalidFunctionContract), TraitError(SupertraitUnknown, SupertraitCycle, SupertraitMethodInImplementation, CanonicalEquatableSupertraits, EqualityMemberUnsupported, DuplicateRequirementParameter, ImpureRequirement, GenericRequirement, FirstParameterMustBeSelf, CallableFormalDeferred, OrphanImplementation, DuplicateImplementation, MissingImplementationMethod, MissingTraitBound, UnknownImplementationMethod, DuplicateImplementationMethod, ImplementationSignatureMismatch, MalformedCanonicalTrait, MalformedCanonicalMember), CanonicalFamily(EqualityFamily, OrderingFamily), trait_error
 	./model: AggregateId(RecordAggregate, UnionAggregate), NominalId(AggregateNominal), EqualityMember(EqualityField, EqualityPayload), CheckedRecord, CheckedUnion, AcceptedTraits, AcceptedTraitContracts, CanonicalEquality, canonical_equality, canonical_owner, CanonicalOrdering, canonical_ordering, AcceptedTrait, AcceptedTraitMethod, AcceptedImplementation, ImplementedMethod, ImplementedBody(AuthoredMethod, TraitDefault, StructuralEquality), TypeParameterId, LocatedTrait, TraitRequirement, aggregate_head, aggregate_owner, same_owner, receiver_arguments, receiver_type, type_head, parameter_owner, same_parameter, ImplementationHeader, FunctionSignature, TypeUse, TypeRef(ParameterType, VoidType, NominalType), TypeParameterOwner(TraitDeclaration), type_parameter_id, same_type, same_types
 	./equality: equality_template
 	./signatures: AcceptedFunction
 	../namespace/builtins: DesignatedBoolean
-	../namespace/namespace: Namespace, TypeHead(PrimitiveHead, ListHead, RecordHead, UnionHead, OpaqueHead), same_head, named_trait, implementation_trait
+	../namespace/namespace: Namespace, TypeHead(PrimitiveHead, ListHead, RecordHead, UnionHead, OpaqueHead), same_head, named_trait, implementation_trait, resolve_trait
 	../parse/assemble: ParsedContents
-	../utils/ids: RecordRow, UnionRow, FunctionId, VariantId, TraitMethodId, TraitMethodDeclaration(RequiredMethod, DefaultMethod), trait_method_header, trait_method_number, trait_method_owner, TraitRow, TraitMethodRow, ImplRow, TraitId, inventory_traits, inventory_implementations, inventory_functions, inventory_records, inventory_unions, inventory_opaques, trait_number, impl_number, function_number, record_number, union_number, opaque_number, variant_owner, same_trait_method
+	../utils/ids: DeclarationInventory, RecordRow, UnionRow, FunctionId, VariantId, TraitMethodId, TraitMethodDeclaration(RequiredMethod, DefaultMethod), trait_method_header, trait_method_number, trait_method_owner, TraitRow, TraitMethodRow, ImplRow, TraitId, inventory_traits, inventory_implementations, inventory_functions, inventory_records, inventory_unions, inventory_opaques, trait_number, impl_number, function_number, record_number, union_number, opaque_number, variant_owner, same_trait_method
 	../utils/names: NameTable, contextual_words, foundation_words, name_spelling, same_name, NameId
 	../utils/source: ModuleId, equality_label, same_module, module_number, ModuleKind(LibraryModule)
-	../utils/syntax: FunctionHeader, WrittenName, TypeSyntax(CallableTypeSyntax), Purity(Pure), type_span, same_purity, Span, compiler_span
+	../utils/syntax: FunctionHeader, WrittenName, TypeSyntax(CallableTypeSyntax), Purity(Pure), Visibility(Public, Private), type_span, same_purity, Span, compiler_span
 	list: List methods
 	int: Int methods
 	option: Option methods
@@ -74,18 +74,73 @@ private pure func accept_trait(row: TraitRow, parsed: ParsedContents, namespace:
 		opaques = inventory_opaques(parsed.declarations), namespace = namespace, module = row.module, access = type_access(row.visibility, row.type_name.id), parameters = [],
 		self_binding = Some({ name = contextual_words(parsed.names).self_word, value_type = ParameterType(self) })
 	}
-	var methods: List[AcceptedTraitMethod] = []
+	var supertraits: List[LocatedTrait] = []
 	var failure: Option[CheckError] = None
-	for method in row.methods:
-		match requirement(method, scope, row.id, parsed):
-			Ok(accepted): methods = methods.append(accepted)
-			Err(error):
-				failure = Some(error)
-				break
+	for written in row.supertraits:
+		span = type_span(written)
+		match resolve_trait(namespace, row.module, written):
+			None: failure = Some(trait_error(span, SupertraitUnknown))
+			Some(id):
+				-- A public trait may not name a private supertrait, which code
+				-- outside its module could bound by but never implement.
+				hidden: Option[NameId] = match (row.visibility, inventory_traits(parsed.declarations).get(trait_number(id))):
+					(Public, Some(named)):
+						match named.visibility:
+							Private(_): Some(named.type_name.id)
+							Public: None
+					_: None
+				match hidden:
+					Some(name): failure = Some(type_term_error(span, PrivateTypeInPublicDeclaration(name, row.type_name.id)))
+					None: supertraits = supertraits.append({ required_trait = id, span = span })
+		if failure.is_some():
+			break
+	var methods: List[AcceptedTraitMethod] = []
+	if failure.is_none():
+		for method in row.methods:
+			match requirement(method, scope, row.id, parsed):
+				Ok(accepted): methods = methods.append(accepted)
+				Err(error):
+					failure = Some(error)
+					break
 	_: Void ?= match failure:
 		Some(error): Err(error)
 		None: Ok(void)
-	Ok({ id = row.id, methods = methods })
+	Ok({ id = row.id, supertraits = supertraits, methods = methods })
+
+
+-- Walks up from `root`; `walked` ends at `current`. An edge back to the root
+-- closes a cycle, reported at that edge with the walk. A trait already on the
+-- walk ends it: that cycle is reported from its own traits' walks.
+private pure func supertrait_cycle(traits: List[AcceptedTrait], root: TraitId, current: TraitId, walked: List[TraitId]) -> Result[Void, CheckError]:
+	var failure: Option[CheckError] = None
+	for supertrait in direct_supertraits(traits, current):
+		next = supertrait.required_trait
+		if failure.is_none():
+			if trait_number(next) == trait_number(root):
+				failure = Some(trait_error(supertrait.span, SupertraitCycle(walked.append(next))))
+			else if walked.any(pure func(earlier): trait_number(earlier) == trait_number(next)).not():
+				match supertrait_cycle(traits, root, next, walked.append(next)):
+					Ok(_): void
+					Err(error): failure = Some(error)
+	match failure:
+		Some(error): Err(error)
+		None: Ok(void)
+
+
+-- Every issued TraitId has its accepted row, so the `None` arm never runs.
+private pure func direct_supertraits(traits: List[AcceptedTrait], id: TraitId) -> List[LocatedTrait]:
+	match traits.get(trait_number(id)):
+		Some(accepted): accepted.supertraits
+		None: []
+
+
+-- A held bound proves itself and every trait above it. Acceptance rejects
+-- supertrait cycles before any proof runs, so the walk ends.
+pure func entails(traits: List[AcceptedTrait], held: TraitId, required: TraitId) -> Bool:
+	if trait_number(held) == trait_number(required):
+		True
+	else:
+		direct_supertraits(traits, held).any(pure func(supertrait): entails(traits, supertrait.required_trait, required))
 
 
 private pure func canonical_header(row: TraitRow, method: TraitMethodId, parsed: ParsedContents) -> Result[FunctionHeader, CheckError]:
@@ -154,6 +209,11 @@ private pure func default_member(row: TraitRow, accepted: AcceptedTrait, parsed:
 -- The sole abstract equals contract precedes validation of an optional
 -- reserved inequality default.
 private pure func accept_equality(row: TraitRow, accepted: AcceptedTrait, parsed: ParsedContents, boolean: DesignatedBoolean[VariantId]) -> Result[CanonicalEquality, CheckError]:
+	-- Automatic implementations require no other trait, so a supertrait would
+	-- make every derived equality fail its obligation.
+	_: Void ?= match accepted.supertraits:
+		[first, ..._]: Err(trait_error(first.span, CanonicalEquatableSupertraits))
+		[]: Ok(void)
 	self: TypeRef = ParameterType(type_parameter_id(TraitDeclaration(row.id), 0))
 	boolean_type: TypeRef = NominalType(AggregateNominal(UnionAggregate(variant_owner(boolean.true_variant))), [])
 	words = foundation_words(parsed.names)
@@ -259,7 +319,11 @@ private pure func accept_implementation(
 						failure = Some(trait_error(function.declaration.function_name.span, DuplicateImplementationMethod(function.declaration.function_name.id, earlier.declaration.function_name.span)))
 				if failure.is_none():
 					match method:
-						None: failure = Some(trait_error(function.declaration.function_name.span, UnknownImplementationMethod(function.declaration.function_name.id)))
+						None:
+							name = function.declaration.function_name
+							failure = match supertrait_declaring(traits, parsed.declarations, owner, name.id):
+								Some(supertrait): Some(trait_error(name.span, SupertraitMethodInImplementation(name.id, supertrait, row.header.receiver)))
+								None: Some(trait_error(name.span, UnknownImplementationMethod(name.id)))
 						Some(required):
 							match member_contract(required, header, function):
 								Err(error): failure = Some(error)
@@ -279,6 +343,19 @@ private pure func accept_implementation(
 	match failure:
 		Some(error): Err(error)
 		None: Ok({ trait_id = owner, receiver_head = header.receiver_head, parameter_bounds = header.parameter_bounds, methods = members, method_provider = Some(row.header.module), span = row.header.span })
+
+
+-- The supertrait, direct or further up, that declares a method named `name`.
+-- The implemented trait itself does not, or the method would have matched.
+private pure func supertrait_declaring(traits: List[AcceptedTrait], inventory: DeclarationInventory, owner: TraitId, name: NameId) -> Option[TraitId]:
+	inventory_traits(inventory).find(pure func(row) -> Bool:
+		declares = row.methods.any(pure func(method) -> Bool:
+			match trait_method_header(method, inventory):
+				Some(header): same_name(header.function_name.id, name)
+				None: False
+		)
+		and(declares, entails(traits, owner, row.id))
+	).map(pure func(row): row.id)
 
 
 private pure func member_contract(
@@ -339,7 +416,8 @@ private pure func designates(designated: Option[TraitId], row: TraitRow) -> Bool
 		None: False
 
 
--- Each designated trait is admitted by its own contract.
+-- Each designated trait is admitted by its own contract. Once every trait is
+-- accepted, supertrait cycles are rejected, before any proof walks them.
 pure func accept_trait_contracts(
 	parsed: ParsedContents,
 	namespace: Namespace,
@@ -366,6 +444,11 @@ pure func accept_trait_contracts(
 			Err(error): failure = Some(error)
 		if failure.is_some():
 			break
+	for accepted in declarations:
+		if failure.is_none():
+			match supertrait_cycle(declarations, accepted.id, accepted.id, [accepted.id]):
+				Ok(_): void
+				Err(error): failure = Some(error)
 	match failure:
 		Some(error): Err(error)
 		None: Ok({ declarations = declarations, canonical = { equality = accepted_equality, ordering = accepted_ordering } })
@@ -420,7 +503,8 @@ private pure func unique_requirement_parameters(method: TraitMethodId, header: F
 pure func prove_trait(availability: TraitAvailability, required: TraitId, receiver: TypeRef, assumptions: List[TraitRequirement], span: Span) -> Result[Void, CheckError]:
 	match receiver:
 		ParameterType(parameter):
-			known = assumptions.any(pure func(assumption): and(same_parameter(assumption.parameter, parameter), trait_number(assumption.required_trait) == trait_number(required)))
+			traits = accepted_traits(availability).declarations
+			known = assumptions.any(pure func(assumption): and(same_parameter(assumption.parameter, parameter), entails(traits, assumption.required_trait, required)))
 			if known:
 				Ok(void)
 			else:
@@ -506,6 +590,13 @@ pure func accepted_traits(availability: TraitAvailability) -> AcceptedTraits:
 -- Signature-only test observers may deliberately have no derivation candidates.
 pure func authored_traits(traits: AcceptedTraits) -> TraitAvailability:
 	into_opaque TraitAvailability({ accepted = traits, unavailable = [] })
+
+
+-- The member whose requirement made a head's automatic equality unavailable.
+pure func unavailable_equality_member(availability: TraitAvailability, head: TypeHead) -> Option[EqualityMember]:
+	from_opaque TraitAvailability(availability).unavailable
+		.find(pure func(failure): same_head(aggregate_head(failure.aggregate), head))
+		.map(pure func(failure): failure.member)
 
 
 pure func family_for(traits: AcceptedTraits, required: TraitId, head: TypeHead) -> Option[AcceptedImplementation]:

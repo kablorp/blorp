@@ -1,0 +1,131 @@
+import:
+    ../../../src/lex/lex: lex
+    ../../../src/parse/parse: ParsedModule, module_contents, parse_module
+    ../../../src/utils/names: program_names
+    ../../../src/utils/source: module_source, root_module_id
+    ../../../src/utils/syntax: Diagnostic, Span, ParsedTrait, TypeSyntax(AtomicType, QualifiedType), type_span
+    bool: and
+    int: Int methods
+    list: List methods
+    option: Option methods
+    string: String methods
+    test: TestSuite
+
+
+private METHOD: String = "    pure func less_than(left: Self, right: Self) -> Bool\n"
+private ENTRY: String = "func main() -> Int:\n    0\n"
+
+
+private pure func parse_source(source: String) -> Result[ParsedModule, Diagnostic]:
+    tokens ?= lex(module_source(root_module_id()), source, program_names().names)
+    parse_module(tokens, root_module_id())
+
+
+private pure func spans(span: Span, start: Int, end: Int) -> Bool:
+    span.start.equals(start).and(span.end.equals(end))
+
+
+-- The module's only trait, when it parses.
+private pure func only_trait(source: String) -> Option[ParsedTrait]:
+    match parse_source(source):
+        Err(_): None
+        Ok(parsed):
+            match module_contents(parsed).traits:
+                [declaration]: Some(declaration)
+                _: None
+
+
+-- Each supertrait is a bare name at the given start and end.
+private pure func bare_supertraits(declaration: ParsedTrait, expected: List[(Int, Int)]) -> Bool:
+    var matched = declaration.supertraits.length() == expected.length()
+    var position = 0
+    for supertrait in declaration.supertraits:
+        matched = match (supertrait, expected.get(position)):
+            (AtomicType(name), Some((start, end))): matched.and(spans(name.span, start, end))
+            _: False
+        position = position.add(1)
+    matched
+
+
+private pure func rejects(source: String, start: Int, end: Int, message: String, help: String) -> Bool:
+    match parse_source(source):
+        Ok(_): False
+        Err(error):
+            spans(error.span, start, end).and(error.message == message).and(error.help == help).and(error.note.is_none())
+
+
+-- The header span still ends at the first colon.
+pure func test_a_supertrait_precedes_the_method_block() -> Bool:
+    match only_trait("trait Ordered: Equatable:\n".add(METHOD)):
+        Some(declaration): bare_supertraits(declaration, [(15, 24)]).and(declaration.methods.length() == 1).and(spans(declaration.span, 0, 14))
+        None: False
+
+
+pure func test_supertraits_are_joined_with_plus() -> Bool:
+    match only_trait("trait Ring: Addable + Multipliable:\n".add(METHOD)):
+        Some(declaration): bare_supertraits(declaration, [(12, 19), (22, 34)]).and(declaration.methods.length() == 1).and(spans(declaration.span, 0, 11))
+        None: False
+
+
+pure func test_a_plain_trait_has_no_supertraits() -> Bool:
+    match only_trait("trait Ordered:\n".add(METHOD)):
+        Some(declaration): declaration.supertraits.is_empty().and(declaration.methods.length() == 1).and(spans(declaration.span, 0, 14))
+        None: False
+
+
+-- A bundle has no body, and the next declaration follows it.
+pure func test_a_bundle_ends_its_line() -> Bool:
+    match parse_source("trait Ring: Addable + Multipliable\n".add(ENTRY)):
+        Err(_): False
+        Ok(parsed):
+            contents = module_contents(parsed)
+            match contents.traits:
+                [declaration]: bare_supertraits(declaration, [(12, 19), (22, 34)]).and(declaration.methods.is_empty()).and(contents.functions.length() == 1)
+                _: False
+
+
+pure func test_a_bundle_may_be_the_last_line() -> Bool:
+    match only_trait("trait Ring: Addable + Multipliable"):
+        Some(declaration): bare_supertraits(declaration, [(12, 19), (22, 34)]).and(declaration.methods.is_empty())
+        None: False
+
+
+pure func test_a_qualified_supertrait_keeps_its_span() -> Bool:
+    match only_trait("trait Ordered: Base.Equatable:\n".add(METHOD)):
+        Some(declaration):
+            match declaration.supertraits:
+                [QualifiedType(name, [], span)]: spans(span, 15, 29).and(spans(name.module.span, 15, 19)).and(spans(name.name.span, 20, 29))
+                _: False
+        None: False
+
+
+-- The methods of a trait with supertraits follow a second colon; the error is
+-- at the line end where it belongs.
+pure func test_methods_after_supertraits_need_a_second_colon() -> Bool:
+    rejects("trait Ordered: Equatable\n".add(METHOD), 24, 25, "expected ':' before the trait's methods", "write trait A: B: and indent the methods below it")
+        .and(rejects("trait Ring: Addable + Multipliable\n".add(METHOD), 34, 35, "expected ':' before the trait's methods", "write trait A: B: and indent the methods below it"))
+
+
+pure func test_a_trait_needs_methods_or_supertraits() -> Bool:
+    rejects("trait Shape:\n".add(ENTRY), 13, 17, "expected an indented trait method", "declare at least one pure method signature")
+
+
+pure func test_supertraits_end_at_a_colon_or_the_line() -> Bool:
+    rejects("trait Ring: Addable Multipliable\n", 20, 32, "expected ':' or a newline after the supertraits", "add ':' before indented methods, or end the line for a trait without methods")
+        .and(rejects("trait Ring: Addable +\n", 21, 22, "expected a trait name after ':' or '+'", "use an ASCII identifier starting with a letter or underscore; keywords and lone '_' are reserved"))
+
+
+tests: TestSuite = {
+    description = "supertrait parsing",
+    tests = [
+        ("a supertrait precedes the method block", test_a_supertrait_precedes_the_method_block),
+        ("supertraits are joined with +", test_supertraits_are_joined_with_plus),
+        ("a plain trait has no supertraits", test_a_plain_trait_has_no_supertraits),
+        ("a bundle ends its line", test_a_bundle_ends_its_line),
+        ("a bundle may be the last line", test_a_bundle_may_be_the_last_line),
+        ("a qualified supertrait keeps its span", test_a_qualified_supertrait_keeps_its_span),
+        ("methods after supertraits need a second colon", test_methods_after_supertraits_need_a_second_colon),
+        ("a trait needs methods or supertraits", test_a_trait_needs_methods_or_supertraits),
+        ("supertraits end at a colon or the line", test_supertraits_end_at_a_colon_or_the_line),
+    ]
+}

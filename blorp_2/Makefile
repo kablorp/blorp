@@ -39,6 +39,7 @@ TARGET_COMPONENT_SOURCES := \
 	blorp_2/test/unit/test_parse/test_float_builtin_labels.brp \
 	blorp_2/test/unit/test_parse/test_int_comparisons.brp \
 	blorp_2/test/unit/test_parse/test_ordering_operators.brp \
+	blorp_2/test/unit/test_parse/test_supertraits.brp \
 	blorp_2/test/unit/test_parse/test_provenance.brp \
 	blorp_2/test/unit/test_parse/test_string_concat.brp \
 	blorp_2/test/unit/test_parse/test_string_slice.brp \
@@ -52,6 +53,7 @@ TARGET_COMPONENT_SOURCES := \
 	blorp_2/test/unit/test_check/test_direct_list_updates.brp \
 	blorp_2/test/unit/test_check/test_nominal_types.brp \
 	blorp_2/test/unit/test_check/test_ordering_operators.brp \
+	blorp_2/test/unit/test_check/test_supertraits.brp \
 	blorp_2/test/unit/test_parse/test_generic_opaque_types.brp \
 	blorp_2/test/unit/test_check/test_generic_opaque_types.brp \
 	blorp_2/test/unit/test_specialize/test_generic_opaque_types.brp \

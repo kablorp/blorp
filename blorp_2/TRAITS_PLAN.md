@@ -65,10 +65,11 @@ an implementation receiver. Record/union declaration bounds are deferred with
 an exact unsupported-form diagnostic; conditional automatic equality does not
 require them or restrict ordinary construction of Wrap[T].
 
-Reject trait parameters, supertraits, impure trait requirements,
+Reject trait parameters, impure trait requirements,
 independently generic methods, associated types/constants, trait objects,
 cross-type equality and implementation specialization with teaching diagnostics.
 They are outside this increment, not silently admitted partial features.
+Supertraits were deferred here and are added by [the supertraits plan](SUPERTRAITS_PLAN.md).
 
 For each `(TraitId, receiver head)` allow one authored implementation:
 `Box[T]` and `List[T: Equatable]` are complete generic families; `Box[Int]`,

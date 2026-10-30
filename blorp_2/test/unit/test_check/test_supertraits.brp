@@ -1,0 +1,423 @@
+import:
+    ../../../src/check/check: check
+    ../../../src/check/render: render_failure, render_check_error
+    ../../../src/check/model as Model
+    ../../../src/check/declarations: validate_declarations
+    ../../../src/check/constants: constant_annotations, validate_constants
+    ../../../src/check/bodies: resolve_functions
+    ../../../src/check/traits as Traits
+    ../../../src/check/recursion: finalize_trait_instances
+    ../../../src/check/supertraits: validate_supertrait_implementations
+    ../../../src/check/errors: CheckError, namespace_rejection
+    ../../../src/lex/lex: lex
+    ../../../src/namespace/namespace: build_namespace, namespace_problem_span
+    ../../../src/parse/parse: parse_module
+    ../../../src/parse/assemble: ParsedAssembly, ParsedProgram, append_module, assembly_names, begin_program, parsed_contents
+    ../../../src/utils/ids: inventory_records, inventory_opaques
+    ../../../src/utils/source:
+        ModuleId, ModuleKind(UserModule, LibraryModule, FoundationTypesModule, FoundationPreludeModule),
+        SourceId, module_id, module_source, root_module_id, same_source,
+    ../../../src/utils/syntax: Diagnostic, DiagnosticNote(RecordFieldDeclaration, PreviousDeclaration), Span, diagnostic
+    ../module_input: FOUNDATION_TYPES, sealed
+    ../input: prepare_signatures, accepted_traits
+    bool: and
+    int: Int methods
+    list: List methods
+    option: Option methods
+    result: Result methods
+    string: String methods
+    test: TestSuite
+
+
+-- Each fixture has five modules: the root at 0, a second user module at 1 that
+-- the root imports when it is not empty, an Int library at 2, the base at 3
+-- declaring the canonical traits, and the prelude at 4 selecting from the base.
+private SHAPES_POSITION: Int = 1
+private BASE_POSITION: Int = 3
+private BASE_SELECTIONS: String = "Int, Float, String, Void, List, Bool(True, False), Option(Some, None), Result(Ok, Err)"
+private EQUATABLE: String =
+    |trait Equatable:
+    |    pure func equals(left: Self, right: Self) -> Bool
+    |
+private INT_EQUALITY: String =
+    |implements Equatable for Int:
+    |    pure func equals(left: Self, right: Self) -> Bool:
+    |        builtin("int.equals")
+    |
+-- Canonical Orderable may declare supertraits; canonical Equatable may not.
+private ORDERABLE: String =
+    |trait Orderable: Equatable:
+    |    pure func less_than(left: Self, right: Self) -> Bool
+    |    pure func greater_than(left: Self, right: Self) -> Bool:
+    |        less_than(right, left)
+    |    pure func less_than_or_equal(left: Self, right: Self) -> Bool:
+    |        less_than(left, right)
+    |    pure func greater_than_or_equal(left: Self, right: Self) -> Bool:
+    |        less_than(right, left)
+    |
+private INT_ORDER: String =
+    |implements Orderable for Int:
+    |    pure func less_than(left: Self, right: Self) -> Bool:
+    |        builtin("int.less_than")
+    |
+private ORDERED: String =
+    |trait Ordered: Equatable:
+    |    pure func before(left: Self, right: Self) -> Bool
+    |
+private BEFORE: String =
+    |    pure func before(left: Self, right: Self) -> Bool:
+    |        True
+    |
+private NAMED: String =
+    |trait Named:
+    |    pure func name(value: Self) -> Int
+    |
+-- A default body calls its supertrait's method on Self.
+private TITLED: String =
+    |trait Titled: Named:
+    |    pure func title(value: Self) -> Int:
+    |        name(value)
+    |
+private BOX: String = "fixed record Box[Element] { value: Element }\n"
+private ENTRY: String = "func main() -> Int:\n    0\n"
+private MISSING_BOUND: String = "type does not satisfy the required trait bound"
+private MISSING_BOUND_HELP: String = "add the required trait to this function's type parameter bounds, or provide an implementation for the concrete receiver"
+private EQUALITY_MEMBER_HELP: String = "provide the member's required trait implementation, or write an Equatable implementation for the containing type"
+
+
+-- Which canonical traits the base declares and the Int library implements.
+private fixed record Foundation {
+    traits: String,
+    implementations: String,
+    imported: String
+}
+
+
+private pure func equatable() -> Foundation:
+    { traits = EQUATABLE, implementations = INT_EQUALITY, imported = ", Equatable" }
+
+
+private pure func orderable() -> Foundation:
+    { traits = EQUATABLE.add(ORDERABLE), implementations = INT_EQUALITY.add(INT_ORDER), imported = ", Equatable, Orderable" }
+
+
+private pure func append_source(assembly: ParsedAssembly, position: Int, source: String, targets: List[ModuleId], role: ModuleKind) -> Result[ParsedAssembly, Diagnostic]:
+    invalid = diagnostic({ source = module_source(root_module_id()), start = 0, end = 0 }, "invalid supertrait fixture module", "use the five fixture module positions")
+    module ?= module_id(position).to_result(invalid)
+    tokens ?= lex(module_source(module), source, assembly_names(assembly))
+    parsed ?= parse_module(tokens, module)
+    append_module(assembly, parsed, targets, role, "module_".append_int(position))
+
+
+private pure func program(root: String, shapes: String, foundation: Foundation) -> Result[ParsedProgram, Diagnostic]:
+    invalid = diagnostic({ source = module_source(root_module_id()), start = 0, end = 0 }, "invalid supertrait fixture module", "use the five fixture module positions")
+    base ?= module_id(BASE_POSITION).to_result(invalid)
+    second ?= module_id(SHAPES_POSITION).to_result(invalid)
+    var root_targets: List[ModuleId] = []
+    if shapes.length().greater_than(0):
+        root_targets = [second]
+    library = "import:\n    _base: Int, Bool".add(foundation.imported).add("\n").add(foundation.implementations)
+    with_root ?= append_source(begin_program(), 0, root, root_targets, UserModule)
+    with_shapes ?= append_source(with_root, SHAPES_POSITION, shapes, [], UserModule)
+    integer ?= append_source(with_shapes, 2, library, [base], LibraryModule)
+    types ?= append_source(integer, BASE_POSITION, FOUNDATION_TYPES.add(foundation.traits), [], FoundationTypesModule)
+    prelude ?= append_source(types, 4, "import:\n    _base: ".add(BASE_SELECTIONS).add(foundation.imported).add("\n"), [base], FoundationPreludeModule)
+    sealed(prelude)
+
+
+private pure func accepts_with(root: String, shapes: String, foundation: Foundation) -> Bool:
+    match program(root, shapes, foundation):
+        Ok(parsed): check(parsed).is_ok()
+        Err(_): False
+
+
+private pure func accepts(root: String) -> Bool:
+    accepts_with(root, "", equatable())
+
+
+-- The single diagnostic, compared exactly, with no note.
+private pure func rejects_with(root: String, shapes: String, foundation: Foundation, origin: SourceId, start: Int, end: Int, message: String, help: String) -> Bool:
+    match program(root, shapes, foundation):
+        Err(_): False
+        Ok(parsed):
+            match check(parsed):
+                Ok(_): False
+                Err(failure):
+                    diagnostics = render_failure(failure)
+                    first = diagnostics.first
+                    same_source(first.span.source, origin).and(first.span.start.equals(start)).and(first.span.end.equals(end))
+                        .and(first.message == message).and(first.help == help)
+                        .and(first.note.is_none()).and(diagnostics.remaining.is_empty())
+
+
+-- A rejection in the root, at `length` bytes after `prefix`.
+private pure func rejects(prefix: String, length: Int, suffix: String, message: String, help: String) -> Bool:
+    rejects_with(prefix.add(suffix), "", equatable(), module_source(root_module_id()), prefix.length(), prefix.length().add(length), message, help)
+
+
+-- An entailed bound proves an operator, a method call written either way, and
+-- a supertrait method in a default body.
+pure func test_a_subtrait_bound_provides_its_supertraits() -> Bool:
+    accepts(ORDERED.add("pure func same[T: Ordered](left: T, right: T) -> Bool:\n    left == right\n").add(ENTRY))
+        .and(accepts(NAMED.add(TITLED).add("pure func label[T: Titled](value: T) -> Int:\n    value.name()\n").add(ENTRY)))
+        .and(accepts(NAMED.add(TITLED).add("pure func label[T: Titled](value: T) -> Int:\n    name(value)\n").add(ENTRY)))
+
+
+-- The receiver bound `Element: Titled` proves `name` on the field, and entails
+-- the `Element: Named` that Box's Named implementation requires.
+pure func test_a_receiver_bound_provides_its_supertraits() -> Bool:
+    implementations: String =
+        |implements Named for Box[Element: Named]:
+        |    pure func name(value: Self) -> Int:
+        |        name(value.value)
+        |implements Titled for Box[Element: Titled]:
+        |    pure func title(value: Self) -> Int:
+        |        name(value.value)
+        |
+    accepts(NAMED.add(TITLED).add(BOX).add(implementations).add(ENTRY))
+
+
+pure func test_entailment_is_transitive() -> Bool:
+    declarations: String =
+        |trait First:
+        |    pure func first(value: Self) -> Int
+        |trait Second: First
+        |trait Third: Second
+        |pure func reach[T: Third](value: T) -> Int:
+        |    first(value)
+        |
+    accepts(declarations.add(ENTRY))
+
+
+-- Two supertraits sharing one, and a repeated supertrait, are accepted; a
+-- concrete call proves the bundle through its implementations.
+pure func test_a_diamond_and_a_repeated_supertrait_are_accepted() -> Bool:
+    declarations: String =
+        |trait Top:
+        |    pure func top(value: Self) -> Int
+        |trait Left: Top
+        |trait Right: Top
+        |trait Bottom: Left + Right
+        |trait Twice: Top + Top
+        |implements Top for Int:
+        |    pure func top(value: Self) -> Int:
+        |        value
+        |implements Left for Int
+        |implements Right for Int
+        |implements Bottom for Int
+        |implements Twice for Int
+        |pure func reach[T: Bottom](value: T) -> Int:
+        |    top(value)
+        |pure func again[T: Twice](value: T) -> Int:
+        |    top(value)
+        |func main() -> Int:
+        |    reach(again(8))
+        |
+    accepts(declarations)
+
+
+-- Entailment runs one way: an Equatable bound does not provide `<`, while an
+-- Orderable bound provides `==`.
+pure func test_entailment_runs_one_way() -> Bool:
+    prefix = "pure func smaller[T: Equatable](left: T, right: T) -> Bool:\n    left "
+    accepts_with("pure func same[T: Orderable](left: T, right: T) -> Bool:\n    left == right\n".add(ENTRY), "", orderable())
+        .and(rejects_with(prefix.add("< right\n").add(ENTRY), "", orderable(), module_source(root_module_id()), prefix.length(), prefix.length().add(1), MISSING_BOUND, MISSING_BOUND_HELP))
+
+
+-- A subtrait may reuse its supertrait's method name, but where both families
+-- are visible they clash, as any two families do. Importing Shape makes the
+-- other module's `name` family visible for it.
+pure func test_closure_traits_sharing_a_visible_name_are_different_families() -> Bool:
+    shapes: String =
+        |trait Named:
+        |    pure func name(value: Self) -> Int
+        |fixed record Shape { value: Int }
+        |implements Named for Shape:
+        |    pure func name(value: Self) -> Int:
+        |        value.value
+        |
+    import_prefix = "import:\n    ./shapes: Named, "
+    prefix = import_prefix.add("Shape\ntrait Titled: Named:\n    pure func ")
+    match program(prefix.add("name(value: Self) -> Int\n").add(ENTRY), shapes, equatable()):
+        Err(_): False
+        Ok(parsed):
+            match check(parsed):
+                Ok(_): False
+                Err(failure):
+                    first = render_failure(failure).first
+                    noted = match first.note:
+                        Some(PreviousDeclaration(previous)): previous.start.equals(import_prefix.length()).and(previous.end.equals(import_prefix.length().add(5)))
+                        _: False
+                    noted.and(first.span.start.equals(prefix.length())).and(first.span.end.equals(prefix.length().add(4)))
+                        .and(first.message == "different trait method families share this name").and(first.help == "select one family, or reach the other through a module alias")
+
+
+pure func test_an_unknown_supertrait_is_rejected() -> Bool:
+    method = ":\n    pure func before(left: Self, right: Self) -> Bool\n".add(ENTRY)
+    rejects("trait Ordered: ", 7, "Missing".add(method), "supertrait requires a visible trait", "import a parameterless trait and name it after ':' or '+'")
+        .and(rejects("trait Ordered: ", 3, "Int".add(method), "supertrait requires a visible trait", "import a parameterless trait and name it after ':' or '+'"))
+
+
+-- Another module's trait is named through its alias; its private trait is not
+-- offered, so naming it is an unknown supertrait.
+pure func test_a_supertrait_from_another_module_is_named_through_its_alias() -> Bool:
+    shapes = NAMED.add("private trait Hidden:\n    pure func hide(value: Self) -> Int\n")
+    prefix = "import:\n    ./shapes as Shapes\ntrait Shown: "
+    accepts_with(prefix.add("Shapes.Named\n").add(ENTRY), shapes, equatable())
+        .and(rejects_with(prefix.add("Shapes.Hidden\n").add(ENTRY), shapes, equatable(), module_source(root_module_id()), prefix.length(), prefix.length().add(13),
+            "supertrait requires a visible trait", "import a parameterless trait and name it after ':' or '+'"))
+
+
+pure func test_a_trait_cannot_be_its_own_supertrait() -> Bool:
+    rejects("trait Loop: ", 4, "Loop:\n    pure func spin(value: Self) -> Int\n".add(ENTRY), "trait inheritance cycle: Loop -> Loop", "remove one of these supertraits")
+
+
+-- The walk from First reaches Third, whose edge back to First closes the cycle.
+pure func test_a_longer_cycle_is_reported_at_its_closing_edge() -> Bool:
+    rejects("trait First: Second\ntrait Second: Third\ntrait Third: ", 5, "First\n".add(ENTRY), "trait inheritance cycle: First -> Second -> Third -> First", "remove one of these supertraits")
+
+
+pure func test_a_public_trait_cannot_name_a_private_supertrait() -> Bool:
+    prefix = "private trait Hidden:\n    pure func hide(value: Self) -> Int\ntrait Shown: "
+    rejects(prefix, 6, "Hidden\n".add(ENTRY), "Hidden is private but appears in public declaration Shown", "make Hidden public, or make Shown private")
+        .and(accepts("private trait Hidden:\n    pure func hide(value: Self) -> Int\nprivate trait Shown: Hidden\n".add(ENTRY)))
+
+
+pure func test_canonical_equatable_cannot_declare_supertraits() -> Bool:
+    marker = "trait Marker:\n    pure func mark(value: Self) -> Int\ntrait Equatable: "
+    contract = marker.add("Marker:\n    pure func equals(left: Self, right: Self) -> Bool\n")
+    foundation: Foundation = { traits = contract, implementations = "", imported = ", Equatable" }
+    match module_id(BASE_POSITION):
+        None: False
+        Some(base):
+            start = FOUNDATION_TYPES.length().add(marker.length())
+            rejects_with(ENTRY, "", foundation, module_source(base), start, start.add(6), "canonical Equatable cannot declare supertraits", "remove them; automatic equality requires no other trait")
+
+
+-- Automatic equality meets an Equatable supertrait, and a bundle's
+-- implementation has no body.
+pure func test_automatic_and_written_implementations_meet_obligations() -> Bool:
+    bundle: String =
+        |trait Ring: Named + Ordered
+        |implements Named for Int:
+        |    pure func name(value: Self) -> Int:
+        |        value
+        |implements Ordered for Int:
+        |
+    accepts(ORDERED.add("fixed record Version { major: Int, minor: Int }\nimplements Ordered for Version:\n").add(BEFORE).add(ENTRY))
+        .and(accepts(NAMED.add(ORDERED).add(bundle).add(BEFORE).add("implements Ring for Int\n").add(ENTRY)))
+
+
+pure func test_a_missing_supertrait_implementation_is_rejected() -> Bool:
+    prefix = ORDERED.add("opaque type Version = Int\nimplements ")
+    titled_prefix = NAMED.add(TITLED).add("implements ")
+    rejects(prefix, 7, "Ordered for Version:\n".add(BEFORE).add(ENTRY), "implementing Ordered for Version requires an implementation of Equatable", "add implements Equatable for Version")
+        .and(rejects(titled_prefix, 6, "Titled for Int\n".add(ENTRY), "implementing Titled for Int requires an implementation of Named", "add implements Named for Int"))
+
+
+-- A member without equality makes Holder's automatic equality unavailable;
+-- the help is automatic equality's own, with its note at the member's type.
+pure func test_rejected_automatic_equality_names_the_member() -> Bool:
+    declarations = ORDERED.add("opaque type Rank = Int\nfixed record Holder { rank: ")
+    prefix = declarations.add("Rank }\nimplements ")
+    source = prefix.add("Ordered for Holder:\n").add(BEFORE).add(ENTRY)
+    match program(source, "", equatable()):
+        Err(_): False
+        Ok(parsed):
+            match check(parsed):
+                Ok(_): False
+                Err(failure):
+                    first = render_failure(failure).first
+                    noted = match first.note:
+                        Some(RecordFieldDeclaration(member)): member.start.equals(declarations.length()).and(member.end.equals(declarations.length().add(4)))
+                        _: False
+                    noted.and(first.span.start.equals(prefix.length())).and(first.span.end.equals(prefix.length().add(7)))
+                        .and(first.message == "implementing Ordered for Holder requires an implementation of Equatable").and(first.help == EQUALITY_MEMBER_HELP)
+
+
+pure func test_a_receiver_bound_must_entail_the_supertrait_bounds() -> Bool:
+    hashable: String =
+        |trait Hashable:
+        |    pure func hash(value: Self) -> Int
+        |implements Equatable for Box[Element: Hashable]:
+        |    pure func equals(left: Self, right: Self) -> Bool:
+        |        True
+        |
+    unbounded = ORDERED.add(BOX).add("implements ")
+    hashed = ORDERED.add(BOX).add(hashable).add("implements ")
+    rejects(unbounded, 7, "Ordered for Box[Element]:\n".add(BEFORE).add(ENTRY), "implementing Ordered for Box requires Element: Equatable", "add Equatable, or a trait that requires it, to Element's bounds")
+        .and(rejects(hashed, 7, "Ordered for Box[Element: Ordered]:\n".add(BEFORE).add(ENTRY), "implementing Ordered for Box requires Element: Hashable", "add Hashable, or a trait that requires it, to Element's bounds"))
+        .and(accepts(ORDERED.add(BOX).add("implements Ordered for Box[Element: Ordered]:\n").add(BEFORE).add(ENTRY)))
+
+
+pure func test_a_supertrait_method_belongs_in_its_own_implementation() -> Bool:
+    prefix = ORDERED.add("fixed record Version { major: Int, minor: Int }\nimplements Ordered for Version:\n").add(BEFORE).add("    pure func ")
+    levels: String =
+        |trait First:
+        |    pure func first(value: Self) -> Int
+        |trait Second: First
+        |trait Third: Second:
+        |    pure func third(value: Self) -> Int
+        |implements Third for Int:
+        |
+    rejects(prefix, 6, "equals(left: Self, right: Self) -> Bool:\n        True\n".add(ENTRY), "equals belongs to supertrait Equatable", "define it in implements Equatable for Version")
+        .and(rejects(levels.add("    pure func "), 5, "first(value: Self) -> Int:\n        value\n".add(ENTRY), "first belongs to supertrait First", "define it in implements First for Int"))
+
+
+-- Check's phases up to finalization, with the finite classifier's result
+-- replaced by `removed`; everything else is the program's own.
+private pure func obligations_after_removal(parsed: ParsedProgram) -> Result[Void, CheckError]:
+    contents = parsed_contents(parsed)
+    namespace ?= build_namespace(parsed).map_err(pure func(problem): namespace_rejection(namespace_problem_span(problem), problem))
+    declarations ?= validate_declarations(contents, namespace)
+    prepared ?= prepare_signatures(parsed, namespace)
+    availability ?= accepted_traits(parsed, namespace, prepared, declarations)
+    annotations ?= constant_annotations(contents, namespace)
+    constants ?= validate_constants(contents, namespace, annotations, declarations.records, declarations.unions, prepared.signatures.functions, availability)
+    bodies ?= resolve_functions(prepared.signatures.functions, declarations, inventory_opaques(contents.declarations), namespace, constants, availability, prepared.designated.result, prepared.designated.boolean, prepared.designated.option)
+    removed: List[Model.AggregateId] = inventory_records(contents.declarations).map(pure func(row): Model.RecordAggregate(row.id))
+    final ?= finalize_trait_instances(constants, bodies.functions, bodies.lambdas, Traits.accepted_traits(availability), removed)
+    validate_supertrait_implementations(contents, namespace, prepared.signatures.implementation_headers, availability, final)
+
+
+-- No known program reaches the finalizer's removal, so the classifier's
+-- result is injected: Box's automatic equality is removed, and the obligation
+-- check, which reads only final implementations, must see that.
+pure func test_obligations_read_the_final_implementations() -> Bool:
+    prefix = ORDERED.add(BOX).add("implements ")
+    source = prefix.add("Ordered for Box[Element: Ordered]:\n").add(BEFORE).add(ENTRY)
+    match program(source, "", equatable()):
+        Err(_): False
+        Ok(parsed):
+            match obligations_after_removal(parsed):
+                Ok(_): False
+                Err(error):
+                    rendered = render_check_error(parsed, error)
+                    rendered.span.start.equals(prefix.length()).and(rendered.span.end.equals(prefix.length().add(7))).and(rendered.note.is_none())
+                        .and(rendered.message == "implementing Ordered for Box requires an implementation of Equatable")
+                        .and(rendered.help == "Box's automatic equality cannot be proved finite; write implements Equatable for Box")
+
+
+tests: TestSuite = {
+    description = "supertrait checking",
+    tests = [
+        ("a subtrait bound provides its supertraits", test_a_subtrait_bound_provides_its_supertraits),
+        ("a receiver bound provides its supertraits", test_a_receiver_bound_provides_its_supertraits),
+        ("entailment is transitive", test_entailment_is_transitive),
+        ("a diamond and a repeated supertrait are accepted", test_a_diamond_and_a_repeated_supertrait_are_accepted),
+        ("entailment runs one way", test_entailment_runs_one_way),
+        ("closure traits sharing a visible name are different families", test_closure_traits_sharing_a_visible_name_are_different_families),
+        ("an unknown supertrait is rejected", test_an_unknown_supertrait_is_rejected),
+        ("a supertrait from another module is named through its alias", test_a_supertrait_from_another_module_is_named_through_its_alias),
+        ("a trait cannot be its own supertrait", test_a_trait_cannot_be_its_own_supertrait),
+        ("a longer cycle is reported at its closing edge", test_a_longer_cycle_is_reported_at_its_closing_edge),
+        ("a public trait cannot name a private supertrait", test_a_public_trait_cannot_name_a_private_supertrait),
+        ("canonical Equatable cannot declare supertraits", test_canonical_equatable_cannot_declare_supertraits),
+        ("automatic and written implementations meet obligations", test_automatic_and_written_implementations_meet_obligations),
+        ("a missing supertrait implementation is rejected", test_a_missing_supertrait_implementation_is_rejected),
+        ("rejected automatic equality names the member", test_rejected_automatic_equality_names_the_member),
+        ("a receiver bound must entail the supertrait bounds", test_a_receiver_bound_must_entail_the_supertrait_bounds),
+        ("a supertrait method belongs in its own implementation", test_a_supertrait_method_belongs_in_its_own_implementation),
+        ("obligations read the final implementations", test_obligations_read_the_final_implementations),
+    ]
+}

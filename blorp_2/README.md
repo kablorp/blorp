@@ -36,8 +36,8 @@ The compiler-source subset is governed by [AGENTS.md](AGENTS.md); source
 convenience does not remove currently supported input features.
 
 Concrete, authored traits are supported as described in [concrete traits](#concrete-traits).
-Function bounds, full generic receiver families, default methods and contextual
-method references extend that surface. Automatic equality for named records and
+Function bounds, full generic receiver families, default methods, contextual
+method references and [supertraits](#supertraits) extend that surface. Automatic equality for named records and
 unions infers conditional bounds from their actual members, preserving authored
 implementations and semantic type arguments. The [generic equality report](https://github.com/kablorp/blorp/blob/1e07c4dce85e51cd7ad911142e9bc96a5e0d91c7/benchmarks/results/blorp2-generic-equality-2026-10-23.md)
 records qualification evidence and matched costs; the earlier
@@ -191,6 +191,45 @@ Box-to-Wrap relays. It remains a sufficient proof: an unproved family reports
 could establish finiteness. This proves a finite set of specialized instances,
 not runtime termination. Defaults retain complete Self, including phantom arguments;
 a true wrapping cycle is rejected before Specialize.
+
+### Supertraits
+
+A trait may name supertraits after its colon, joined with `+` as bounds are.
+Its methods then follow a second colon. A trait with supertraits and no
+methods ends its line and is a bundle; its implementations have no body. The
+example assumes `Addable` and `Multipliable` traits implemented for Int:
+
+```blorp
+trait Ordered: Equatable:
+    pure func before(left: Self, right: Self) -> Bool
+
+trait Ring: Addable + Multipliable
+
+fixed record Version { major: Int, minor: Int }
+
+implements Ordered for Version:
+    pure func before(left: Self, right: Self) -> Bool:
+        left.major < right.major
+
+implements Ring for Int
+```
+
+A bound provides every trait above it, so inside `[T: Ordered]` both `==`
+and a visible `equals` check, as they do in Ordered's default bodies and in an
+implementation whose receiver parameter is bounded by Ordered. Entailment runs
+upward only: `[T: Equatable]` does not provide `before`. Two visible traits
+above a bound that declare one method name are different families, as any two
+are. Implementing a trait requires an implementation of each direct supertrait
+for the same receiver, written or automatic; one is never implied. At each
+receiver position, the implementation's own bounds must entail every bound the
+supertrait's implementation requires, so `implements Ordered for
+Box[T: Ordered]` meets Box's automatic `T: Equatable`. An implementation
+defines only its own trait's methods; a supertrait's method there names the
+implementation it belongs in. A supertrait is a visible trait, written as a
+bound is; a cycle is reported along its path, a public trait cannot name a
+private supertrait, and canonical Equatable declares none. The pinned seed
+predates supertraits, so the library and compiler source declare none yet.
+An `Orderable` bound does not provide `==`.
 
 Traits remain parameterless, with no independently generic methods, impure
 requirements or top-level callable formals. Record/union

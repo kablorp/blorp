@@ -1,0 +1,93 @@
+---
+Supertrait obligations. Every implementation of a trait comes with an
+implementation of each direct supertrait for the same receiver head, and its
+own receiver bounds entail the bounds that implementation requires. Specialize
+relies on this when it selects a supertrait method for a grounded receiver.
+The check takes FinalTraits, so it reads the implementations that remain after
+finalization has removed any automatic equality it could not prove finite; a
+use through an entailed bound is invisible to that removal.
+---
+import:
+	./errors:
+		CheckError, checker_invariant, CheckerInvariant(InvalidFunctionContract), trait_error,
+		TraitError(SupertraitNotImplemented, SupertraitBoundNotEntailed),
+		AbsentSupertrait(NeverImplemented, AutomaticEqualityRejected, AutomaticEqualityNotFinite),
+	./model: AcceptedTraits, AggregateId, ImplementationHeader, aggregate_head, canonical_owner
+	./recursion: FinalTraits, final_traits, removed_equalities
+	./traits: TraitAvailability, entails, family_for, unavailable_equality_member
+	../namespace/namespace: Namespace, TypeHead, same_head, implementation_trait
+	../parse/assemble: ParsedContents
+	../utils/ids: TraitId, inventory_implementations, impl_number, trait_number
+	../utils/syntax: ParsedImplementationHeader, type_span
+	list: List methods
+	option: Option methods
+	bool: not, and
+
+
+-- Why `head` has no implementation of `supertrait`.
+private pure func absent_cause(traits: AcceptedTraits, availability: TraitAvailability, removed: List[AggregateId], supertrait: TraitId, head: TypeHead) -> AbsentSupertrait:
+	automatic = match traits.canonical.equality:
+		Some(contract): trait_number(canonical_owner(contract)) == trait_number(supertrait)
+		None: False
+	if automatic.not():
+		NeverImplemented
+	else if removed.any(pure func(aggregate): same_head(aggregate_head(aggregate), head)):
+		AutomaticEqualityNotFinite
+	else:
+		match unavailable_equality_member(availability, head):
+			Some(member): AutomaticEqualityRejected(member)
+			None: NeverImplemented
+
+
+-- Receivers are complete families of fresh parameters, so comparing bounds
+-- position by position decides what proving the supertrait on the receiver
+-- would, without minting parameter identities.
+private pure func implementation_obligations(written: ParsedImplementationHeader, header: ImplementationHeader, implemented: TraitId, final: FinalTraits, availability: TraitAvailability) -> Result[Void, CheckError]:
+	traits = final_traits(final)
+	span = type_span(written.trait_name)
+	declaration ?= traits.declarations.get(trait_number(implemented)).to_result(checker_invariant(span, InvalidFunctionContract))
+	var failure: Option[CheckError] = None
+	for supertrait in declaration.supertraits:
+		if failure.is_none():
+			match family_for(traits, supertrait.required_trait, header.receiver_head):
+				None:
+					cause = absent_cause(traits, availability, removed_equalities(final), supertrait.required_trait, header.receiver_head)
+					failure = Some(trait_error(span, SupertraitNotImplemented(implemented, supertrait.required_trait, written.receiver, cause)))
+				Some(family):
+					var position = 0
+					for required in family.parameter_bounds:
+						if failure.is_none():
+							match (header.parameter_bounds.get(position), written.type_parameters.get(position)):
+								(Some(held), Some(parameter)):
+									for bound in required:
+										entailed = held.any(pure func(declared): entails(traits.declarations, declared.required_trait, bound.required_trait))
+										if and(failure.is_none(), entailed.not()):
+											failure = Some(trait_error(span, SupertraitBoundNotEntailed(implemented, bound.required_trait, parameter.name, written.receiver)))
+								_: failure = Some(checker_invariant(span, InvalidFunctionContract))
+						position = position.add(1)
+	match failure:
+		Some(error): Err(error)
+		None: Ok(void)
+
+
+-- Automatic implementations are canonical Equatable's, which declares no
+-- supertraits, so the authored implementation rows are every subtrait one.
+pure func validate_supertrait_implementations(
+	parsed: ParsedContents,
+	namespace: Namespace,
+	headers: List[ImplementationHeader],
+	availability: TraitAvailability,
+	final: FinalTraits,
+) -> Result[Void, CheckError]:
+	var failure: Option[CheckError] = None
+	for row in inventory_implementations(parsed.declarations):
+		if failure.is_none():
+			match (implementation_trait(namespace, row.header.module, row.id), headers.get(impl_number(row.id))):
+				(Some(implemented), Some(header)):
+					match implementation_obligations(row.header, header, implemented, final, availability):
+						Ok(_): void
+						Err(error): failure = Some(error)
+				_: failure = Some(checker_invariant(row.header.span, InvalidFunctionContract))
+	match failure:
+		Some(error): Err(error)
+		None: Ok(void)
