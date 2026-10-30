@@ -56,6 +56,7 @@ TARGET_COMPONENT_SOURCES := \
 	blorp_2/test/unit/test_check/test_first_invariant.brp \
 	blorp_2/test/unit/test_check/test_direct_list_updates.brp \
 	blorp_2/test/unit/test_check/test_nominal_types.brp \
+	blorp_2/test/unit/test_check/test_arithmetic_traits.brp \
 	blorp_2/test/unit/test_check/test_ordering_operators.brp \
 	blorp_2/test/unit/test_check/test_supertraits.brp \
 	blorp_2/test/unit/test_check/test_implementation_table.brp \

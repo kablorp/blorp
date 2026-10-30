@@ -11,9 +11,11 @@ measurement provenance; current commands use `blorp_2/standard_library`.
 
 The library root contains two designated foundation modules:
 
-- `_base.brp` owns Int, Float, String, Void, List, Bool, Option, Result and the
-  `Orderable` and `Hashable` traits. It is the only module that may declare builtin types. Any
-  module may import it as `_base`.
+- `_base.brp` owns Int, Float, String, Void, List, Bool, Option, Result, the
+  `Orderable` and `Hashable` traits and the arithmetic traits `Addable`,
+  `Subtractable`, `Multipliable`, `Divisible`, `Modulable` and `Negatable`. It
+  is the only module that may declare builtin types. Any module may import it
+  as `_base`.
 - `prelude.brp` imports the base types and the operation modules' methods. It
   is the only implicit import: application roots and ordinary user helper
   modules receive its selections, and it cannot be imported explicitly.
@@ -28,8 +30,11 @@ so aliases and contextual callable references dispatch by the actual receiver.
 and `greater_than_or_equal` from it; the defaults assume a total order. A library
 module may implement a trait declared in `_base`, or the canonical Equatable, for
 a type declared in `_base`: `int.brp`
-and `float.brp` implement Equatable and Orderable, and `string.brp` and
-`list.brp` implement Equatable.
+and `float.brp` implement Equatable, Orderable and the six arithmetic traits,
+`string.brp` implements Equatable and Addable, and `list.brp` implements Equatable.
+Each arithmetic trait has one member: `add`, `subtract`, `multiply`, `divide` and
+`remainder` take `(left: Self, right: Self)`, `negate` takes `(value: Self)`, and
+each returns `Self`.
 
 `bool.brp` defines pure, ordinary `not`, `and` and `or`; select them explicitly
 with `bool: not, and, or` for direct calls and UFCS. Both binary arguments are eager;
@@ -38,7 +43,8 @@ for user helper declarations and selections of their own ordinary functions.
 They import only other library modules and `_base`, never user modules.
 
 For example, `42.add(1).to_string().length()` needs no imports. Direct calls
-still require named imports such as `int: add`. IO remains explicit.
+still require named imports such as `int: add`; `add` selected from both `int`
+and `string` names the one Addable family. IO remains explicit.
 Int implements `Orderable` with one signed64 `less_than` builtin and the trait's
 defaults; `min` and `max` are ordinary pure functions. `not_equals` uses the canonical
 trait default. Imported `INT_MIN`
@@ -51,12 +57,13 @@ an owned nonempty absolute UTF-8 path or an owned valid-text error.
 Neither branch prints. The native helper uses the target String ABI.
 
 `int.brp` records the upstream revision and SHA256 used for its adaptation of
-[`standard_library/src/int.brp`](../../standard_library/src/int.brp). Concrete
-`add`, `subtract`, `multiply`, `divide`, `remainder`, `equals` and `to_string` are
-active, lifted from trait implementations where needed. The Float adapter
-exposes concrete `add`, `subtract`, `multiply`, `divide`, `remainder` and
-`to_string` for Float64, plus concrete `copysign`, `equals`, `is_nan`, `is_finite`
-and `abs`. `is_nan` uses ordinary self-equality, and `is_finite` compares
+[`standard_library/src/int.brp`](../../standard_library/src/int.brp). Its
+arithmetic implementations have builtin bodies except `negate`, which is
+`subtract(0, value)` and so wraps `INT_MIN` to itself; `to_string` is concrete.
+The Float adapter implements the same six traits for Float64, with `negate` as
+`multiply(value, -1.0)` so that the sign of zero flips, plus concrete
+`to_string`, `copysign`, `equals`, `is_nan`, `is_finite` and `abs`. `is_nan`
+uses ordinary self-equality, and `is_finite` compares
 ordinary self-subtraction with zero; neither requires a builtin label.
 Float implements `Orderable`: every comparison with NaN is false, so
 it writes its own `less_than_or_equal` and `greater_than_or_equal`.

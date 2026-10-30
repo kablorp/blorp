@@ -205,8 +205,9 @@ a true wrapping cycle is rejected before Specialize.
 
 A trait may name supertraits after its colon, joined with `+` as bounds are.
 Its methods then follow a second colon. A trait with supertraits and no
-methods ends its line and is a bundle; its implementations have no body. The
-example assumes `Addable` and `Multipliable` traits implemented for Int:
+methods ends its line and is a bundle; its implementations have no body. In the
+example, `Addable` and `Multipliable` are the prelude's arithmetic traits, which
+Int implements:
 
 ```blorp
 trait Ordered: Equatable:
@@ -1760,9 +1761,9 @@ Calls evaluate every argument once, left to right; use `match` to skip an RHS.
 selections and called members; bindings, types and fields retain their reserved-name rules.
 A dotted type such as `Shared.Span[Int]` is a qualified type. A qualified
 name resolves through the import block's alias row to the target module's
-own public declarations: `IntOps.add(1, 2)` is a direct call to that
-module's function, `S.Circle(2)` and `S.On` build that union's variants, and
-`S.Span` names its record. Private declarations and the target's own imports
+own public declarations: `IntOps.add(1, 2)` calls the Addable member that
+module implements, as a selected `add` would, `S.Circle(2)` and `S.On` build
+that union's variants, and `S.Span` names its record. Private declarations and the target's own imports
 are not exported; a bare alias is not a value, and `Alias.function` without
 a call is rejected.
 Arguments use the same expression grammar, so direct and receiver calls may nest.
@@ -2209,10 +2210,11 @@ Semantic rules:
   are admitted before an ordinary terminating match. Each selected arm discharges
   prefix obligations after securing its result. Literal construction creates a
   fresh ordinary String owner. A join's arms follow the same rules and move a
-  managed result into the join, which owns it afterwards. Direct String `add`
-  calls and interpolation may instead transfer a last-used owner into
-  concatenation. The verifier checks that transfer independently; an owned
-  parameter receives its argument's obligation the same way. String buffers carry byte length and
+  managed result into the join, which owns it afterwards. String `add` and
+  interpolation may instead transfer a last-used owner into concatenation;
+  `add`'s builtin implementation infers an owned left parameter, so a caller
+  moves a dying left operand through it. The verifier checks that transfer
+  independently; an owned parameter receives its argument's obligation the same way. String buffers carry byte length and
   capacity: a transferred unique buffer appends in place when capacity suffices
   and otherwise grows geometrically. Shared buffers copy, preserving value
   semantics. Concat-only accumulation can transfer a nearest-loop-owned String
@@ -2307,7 +2309,7 @@ retains the independent reviews and measurements; the
 
 ## Temporary target library and Int addition
 
-[`int/add.brp`](test/e2e/fixtures/int/add.brp) imports a concrete function:
+[`int/add.brp`](test/e2e/fixtures/int/add.brp) imports Int's Addable member:
 
 ```blorp
 import:
@@ -2317,10 +2319,16 @@ func main() -> Int:
     add(20, 22)
 ```
 
-It exits 42. `20.add(22)` uses the same declaration through UFCS. Int addition
+It exits 42. `20.add(22)` uses the same member through UFCS. Int addition
 wraps at the signed 64-bit limits. Arithmetic operators remain unsupported.
 [Concrete authored traits](#concrete-traits) provide equality in the production
-library. Arithmetic helpers such as `add` remain ordinary functions.
+library. `_base` declares one single-method trait per arithmetic operation:
+`Addable.add`, `Subtractable.subtract`, `Multipliable.multiply`,
+`Divisible.divide` and `Modulable.remainder` take `(left: Self, right: Self)`,
+and `Negatable.negate` takes `(value: Self)`; each returns `Self`. The prelude
+selects all six, so `[T: Addable]` bounds generic code. Int and Float implement
+all six, and String implements Addable as concatenation. Selecting `add` from
+both `int` and `string` names one family, which dispatches on the receiver.
 
 Supply the target library explicitly:
 
@@ -2672,8 +2680,9 @@ The [argument validation report](https://github.com/kablorp/blorp/blob/1e07c4dce
 records the entrypoint contract, ownership checks, native tests and matched costs.
 
 `string.equals(first, second) -> Bool` compares complete byte sequences.
-`int` exposes concrete `add`, `subtract`, `multiply`, `divide`, `remainder`
-and `to_string`, plus `equals(Int, Int) -> Bool`. Equality uses the complete
+`int` implements the arithmetic traits with `add`, `subtract`, `multiply`,
+`divide`, `remainder` and `negate`, and exposes concrete `to_string`, plus
+`equals(Int, Int) -> Bool`. Equality uses the complete
 signed 64-bit values and ordinary explicitly bound Bool constructors.
 Int implements `Orderable`: `less_than` uses signed64 ordering, and
 `greater_than`, `less_than_or_equal` and `greater_than_or_equal` are the trait's
@@ -2681,7 +2690,8 @@ defaults; `<`, `>`, `<=` and `>=` call them. `not_equals`, `min` and `max`
 are ordinary pure functions over that primitive or equality. Equal operands satisfy both inclusive relations.
 `INT_MIN` and `INT_MAX` are ordinary imported scalar constants with values
 `-9223372036854775808` and `9223372036854775807`; comparisons never subtract.
-The first three arithmetic operations wrap at Int64 bounds. Division and remainder
+Add, subtract and multiply wrap at Int64 bounds. `negate` is `subtract(0, value)`,
+so the negation of `INT_MIN` is `INT_MIN`. Division and remainder
 return zero for a zero divisor; minimum Int divided by -1 wraps to minimum,
 with zero remainder. These operations avoid signed C overflow.
 
@@ -2730,10 +2740,11 @@ formats digits on the stack and can reuse a transferred unique destination.
 The [edge fixture](test/e2e/fixtures/string_operations/append_int_edges.brp)
 checks signed extrema, counted bytes and aliases; its owning suite retains the resource limits.
 
-The target `string.add(left: String, right: String) -> String` is pure and
-returns one fresh concatenation. It borrows both operands, including when they
-alias, and preserves exact counted bytes, including NUL and UTF-8. Empty
-operands follow the same ownership contract. The native helper copies each
+String implements Addable: `add(left: String, right: String) -> String` is pure
+and returns the concatenation, preserving exact counted bytes, including NUL and
+UTF-8. Its left parameter is owned: a dying unique left operand grows in place,
+and a shared or still-used one, including an operand aliasing the right, is
+copied. Empty operands follow the same ownership contract. A copy reads each
 operand once; the ordinary List join wrapper is documented separately.
 The [normal-main fixture](test/e2e/fixtures/string_operations/concat.brp)
 prints a doubled multilingual String with NUL and then its unchanged source.
@@ -2835,8 +2846,8 @@ func main() -> Int:
     0
 ```
 
-This prints `13\n`. The concrete Float module provides the same five arithmetic
-function names as Int, plus `to_string`, `copysign`, `equals`, `is_nan`,
+This prints `13\n`. The concrete Float module implements the same six arithmetic
+traits as Int, plus `to_string`, `copysign`, `equals`, `is_nan`,
 `is_finite` and `abs`, and implements `Orderable` with every NaN comparison
 false. `is_nan` is an ordinary function using self-equality; `is_finite`
 compares self-subtraction with zero. Their names remain ordinary library APIs;
@@ -2845,8 +2856,9 @@ calls and UFCS; type imports expose the module's associated functions through
 UFCS. Receiver types distinguish Int and Float methods. Importing both Int and
 Float `to_string` for direct calls is an error; neither declaration takes
 precedence.
-Following the pilot's infallible arithmetic rule, Float division and remainder
-by either signed zero return positive zero. Other arithmetic can produce
+Float `negate` is `multiply(value, -1.0)`, which is exact and flips the sign of
+zero. Following the pilot's infallible arithmetic rule, Float division and
+remainder by either signed zero return positive zero. Other arithmetic can produce
 infinity or NaN, with NaN sign and payload unspecified. Remainder uses a quotient
 truncated toward zero. The existing
 host Float library currently uses IEEE division by zero; the pilot's explicit
@@ -3198,7 +3210,8 @@ General pass infrastructure remains future work.
 
 The target library's [`_base.brp`](standard_library/_base.brp)
 owns the builtin Int, Float, String, Void and List identities, the fixed
-union Bool, the ordinary Option and Result unions, and the `Orderable` and `Hashable` traits. It is the only module
+union Bool, the ordinary Option and Result unions, the `Orderable` and
+`Hashable` traits and the six arithmetic traits. It is the only module
 that may declare builtin types, and any module may import it as `_base`.
 
 The foundation check designates those three unions once, by name and only in
@@ -3403,10 +3416,11 @@ consult the filesystem, environment, clock or shared mutable caches. Any reports
 or measurements produced by a phase are returned as data for the shell to present.
 
 Compiler source writes equality with the fixed `==` and `!=` operators, which
-call the canonical Equatable methods. Other operations use concrete arithmetic,
-ordering and concatenation functions; the pinned seed predates `<`, `>`, `<=`
-and `>=`. Checking does not yet accept the
-`and`/`or`/`not` keywords, so Boolean logic calls the `bool` library module.
+call the canonical Equatable methods. Arithmetic, ordering and String
+concatenation call the arithmetic and Orderable trait members, such as
+`count.add(1)` and `less_than(left, right)`, because the pinned seed predates
+their operators. Other operations use concrete functions. Checking does not
+yet accept the `and`/`or`/`not` keywords, so Boolean logic calls the `bool` library module.
 Concrete input traits do not expand that compiler-source subset. The production
 library supplies ordinary Equatable implementations; input programs may call
 their methods or use the fixed equality operators.

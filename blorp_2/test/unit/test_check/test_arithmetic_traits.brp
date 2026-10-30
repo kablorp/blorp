@@ -1,0 +1,152 @@
+import:
+    ../../../src/load/load: load_program
+    ../../../src/check/check: check, checked_functions
+    ../../../src/check/render: render_failure
+    ../../../src/check/model as Model
+    ../../../src/parse/assemble: ParsedProgram, parsed_contents
+    ../../../src/utils/ids: TraitMethodId, inventory_traits, trait_method_header, trait_method_number, trait_method_owner, trait_number
+    ../../../src/utils/names: name_spelling
+    ../../../src/utils/source: module_source, root_module_id, same_source
+    bool: and
+    int: Int methods
+    list: List methods
+    option: Option methods
+    string: String methods
+    test: TestSuite
+
+
+-- These fixtures check against the configured library, so they exercise the
+-- arithmetic traits as _base declares them and int, float and string implement them.
+private FIXTURES: String = "blorp_2/test/unit/test_check/fixtures/arithmetic_traits/"
+private LIBRARY_ROOT: String = "blorp_2/standard_library"
+private MISSING_BOUND: String = "type does not satisfy the required trait bound"
+private MISSING_BOUND_HELP: String = "add the required trait to this function's type parameter bounds, or provide an implementation for the concrete receiver"
+private SIGNATURE_MISMATCH: String = "implementation signature does not match the trait requirement"
+private SIGNATURE_MISMATCH_HELP: String = "match the requirement's purity, parameter types and return type, replacing Self with the receiver"
+
+
+private record CheckedFixture {
+    parsed: ParsedProgram,
+    functions: List[Model.CheckedFunction]
+}
+
+
+private func checked_fixture(name: String) -> Option[CheckedFixture]:
+    match load_program(FIXTURES.add(name).add(".brp"), LIBRARY_ROOT):
+        Err(_): None
+        Ok(loaded):
+            match check(loaded.program):
+                Err(_): None
+                Ok(checked): Some({ parsed = loaded.program, functions = checked_functions(checked).functions })
+
+
+-- The spelling of a trait member's declaration, if the id names one.
+private pure func member_spelling(parsed: ParsedProgram, method: TraitMethodId) -> Option[String]:
+    contents = parsed_contents(parsed)
+    match inventory_traits(contents.declarations).get(trait_number(trait_method_owner(method))):
+        None: None
+        Some(row):
+            match row.methods.get(trait_method_number(method)):
+                None: None
+                Some(written):
+                    match trait_method_header(written, contents.declarations):
+                        None: None
+                        Some(header): name_spelling(contents.names, header.function_name.id)
+
+
+private pure func selects_member(parsed: ParsedProgram, call: Model.CheckedCall, member: String, receiver: Model.TypeRef) -> Bool:
+    match call.target:
+        Model.TraitMethod(accepted):
+            spelled = match member_spelling(parsed, Model.method_identity(accepted)):
+                Some(spelling): spelling == member
+                None: False
+            spelled.and(Model.same_type(Model.method_receiver(accepted), receiver))
+        _: False
+
+
+-- The function's calls, in written order, select exactly these members on `receiver`.
+private pure func selects_members(fixture: CheckedFixture, ordinal: Int, members: List[String], receiver: Model.TypeRef) -> Bool:
+    match fixture.functions.get(ordinal):
+        None: False
+        Some(function):
+            calls = Model.function_calls(function)
+            var matched = calls.length() == members.length()
+            var position = 0
+            for call in calls:
+                matched = matched.and(selects_member(fixture.parsed, call, members.get(position).get_or(""), receiver))
+                position = position.add(1)
+            matched
+
+
+-- The single diagnostic, in the fixture itself, compared exactly. `noted` says
+-- whether it carries a note pointing at a previous declaration.
+private func rejects(name: String, start: Int, end: Int, message: String, help: String, noted: Bool) -> Bool:
+    match load_program(FIXTURES.add(name).add(".brp"), LIBRARY_ROOT):
+        Err(_): False
+        Ok(loaded):
+            match check(loaded.program):
+                Ok(_): False
+                Err(failure):
+                    diagnostics = render_failure(failure)
+                    first = diagnostics.first
+                    same_source(first.span.source, module_source(root_module_id())).and(first.span.start == start).and(first.span.end == end)
+                        .and(first.message == message).and(first.help == help)
+                        .and(first.note.is_some() == noted).and(diagnostics.remaining.is_empty())
+
+
+-- Selected names, UFCS and module aliases all reach the trait members, on Int,
+-- Float and String; `add` selected from both int and string is one family.
+func test_every_call_form_selects_a_trait_member() -> Bool:
+    match checked_fixture("call_forms"):
+        None: False
+        Some(fixture):
+            int_members = ["add", "add", "add", "subtract", "multiply", "divide", "remainder", "negate", "negate"]
+            float_members = ["add", "subtract", "multiply", "divide", "remainder", "negate"]
+            selects_members(fixture, 0, int_members, Model.IntType)
+                .and(selects_members(fixture, 1, float_members, Model.FloatType))
+                .and(selects_members(fixture, 2, ["add", "add", "add"], Model.StringType))
+
+
+-- A user record implements each trait with members written (Self, Self) -> Self,
+-- and negate (Self) -> Self, and one bound naming all six reaches every member
+-- on the record and on Int. The two rejections below show that a member of the
+-- other arity does not match.
+func test_members_have_the_declared_shapes() -> Bool:
+    checked_fixture("shapes").is_some()
+
+
+func test_add_is_binary() -> Bool:
+    rejects("unary_add", 81, 84, SIGNATURE_MISMATCH, SIGNATURE_MISMATCH_HELP, False)
+
+
+func test_negate_is_unary() -> Bool:
+    rejects("binary_negate", 83, 89, SIGNATURE_MISMATCH, SIGNATURE_MISMATCH_HELP, False)
+
+
+-- String implements Addable only.
+func test_string_is_not_subtractable() -> Bool:
+    rejects("string_subtract", 129, 139, MISSING_BOUND, MISSING_BOUND_HELP, False)
+
+
+func test_generic_arithmetic_needs_a_bound() -> Bool:
+    rejects("unbounded", 67, 70, MISSING_BOUND, MISSING_BOUND_HELP, False)
+
+
+-- The prelude selects the traits, so a user module cannot declare one again.
+func test_the_prelude_provides_the_traits() -> Bool:
+    rejects("redeclared", 6, 13, "Addable is provided by the prelude",
+        "give this trait another name; the prelude's trait Addable is always in scope", True)
+
+
+tests: TestSuite = {
+    description = "arithmetic traits in the configured library",
+    tests = [
+        ("every call form selects a trait member", test_every_call_form_selects_a_trait_member),
+        ("members have the declared shapes", test_members_have_the_declared_shapes),
+        ("add is binary", test_add_is_binary),
+        ("negate is unary", test_negate_is_unary),
+        ("String is not Subtractable", test_string_is_not_subtractable),
+        ("generic arithmetic needs a bound", test_generic_arithmetic_needs_a_bound),
+        ("the prelude provides the traits", test_the_prelude_provides_the_traits),
+    ]
+}
