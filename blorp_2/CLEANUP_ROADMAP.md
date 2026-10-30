@@ -250,6 +250,14 @@ Basis: the span swaps are line-neutral. The private copies, the 12
 hand-built messages and the duplicate help text save about 60 lines, and the
 new emit variants add about 15. Net about −45.
 
+Status: landed at −67 production lines. One exception to the O1 gate: the
+shared `internal_error` collides with `own.brp`'s identical private copy, so
+that copy was deleted. Left for O1: `own.brp`'s `internal_span`, `lower.brp`'s
+hand-built internal messages and `verify.brp`'s inline placeholder spans.
+The shared constructors are pinned in `test_syntax`; the four new emit
+variants have no rendering test, because the emit diagnostics suite is
+deferred.
+
 ### C5: local de-duplication, one module per commit
 
 Each commit is mechanical, behavior-preserving, and covered by its module's
