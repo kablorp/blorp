@@ -120,12 +120,11 @@ The combined library also supplies these ordinary pure helpers:
 | `reverse[T](values) -> List[T]` | Reverse element order. |
 | `find[T](values, predicate: pure (T) -> Bool) -> Option[T]` | Return the first match in input order and skip later elements. |
 | `all[T](values, predicate: pure (T) -> Bool) -> Bool` | Stop at the first False; empty input returns True. |
-| `sort_by[T](values, key: pure (T) -> Int) -> List[T]` | Stable ascending Int-key order; equal keys retain input order. |
+| `sort_by[T, Key: Orderable](values, key: pure (T) -> Key) -> List[T]` | Stable ascending key order; equal keys retain input order. A key order that is not total, such as Float NaN, still yields a permutation, in an unspecified order. |
 
 Inputs are borrowed; returned managed values retain independent ownership and
 older aliases remain valid. Predicate/key callbacks may capture immutable data.
-The sort key may run more than once per element; generic `K: Orderable` remains
-future work. Take/drop/remove/reverse temporarily copy O(n log n) List slots
+The sort key may run more than once per element. Take/drop/remove/reverse temporarily copy O(n log n) List slots
 with O(log(n + 1)) stack. Find/all visit at most n elements in input order,
 with logarithmic stack and short-circuiting. Sort uses a temporary merge
 implementation. No COW or constant-stack claim follows from availability.

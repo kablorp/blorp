@@ -4,7 +4,7 @@ import:
 	../../../src/check/check: check, checked_functions, check_errors
 	../../../src/check/model as Model
 	../../../src/check/errors as Errors
-	../../../src/utils/ids: inventory_functions, function_number
+	../../../src/utils/ids: inventory_functions, inventory_traits, function_number, trait_number
 	../../../src/utils/names: name_spelling
 	../../../src/utils/source: same_module, same_source, module_source, root_module_id
 	../../../src/utils/syntax: Visibility(Public, Private), Purity(Pure), same_purity
@@ -39,15 +39,18 @@ func test_sort_signature_owns_its_rigid_and_helpers_are_private() -> Bool:
 								([sorting], [first], [prefix], [interval]):
 									match (sorting.declaration.visibility, rows.functions.get(function_number(sorting.id))):
 										(Public, Some(function)):
-											match (function.signature.type_parameters, function.signature.parameters):
-												([parameter], [values, key]):
+											orderable = inventory_traits(parsed.declarations).filter(pure func(row): name_spelling(parsed.names, row.type_name.id) == Some("Orderable"))
+											match (function.signature.type_parameters, function.signature.requirements, function.signature.parameters, orderable):
+												([parameter, key_parameter], [requirement], [values, key], [ordering]):
 													owner_matches = match Model.parameter_owner(parameter):
 														Model.FunctionDeclaration(owner): function_number(owner) == function_number(function.id)
 														_: False
 													(
 														owner_matches and same_purity(function.signature.purity, Pure)
+														and Model.same_type(Model.ParameterType(requirement.parameter), Model.ParameterType(key_parameter))
+														and trait_number(requirement.required_trait) == trait_number(ordering.id)
 														and Model.same_type(values.value_type, Model.ListType(Model.ParameterType(parameter)))
-														and Model.same_type(key.value_type, Model.CallableType(Pure, [Model.ParameterType(parameter)], Model.IntType))
+														and Model.same_type(key.value_type, Model.CallableType(Pure, [Model.ParameterType(parameter)], Model.ParameterType(key_parameter)))
 														and Model.same_type(function.signature.return_type.value_type, Model.ListType(Model.ParameterType(parameter)))
 														and private_helper(first.declaration.visibility) and private_helper(prefix.declaration.visibility)
 														and private_helper(interval.declaration.visibility)
@@ -75,8 +78,12 @@ private IMPURE_KEY: String =
 	|    saved = sort_by([1],
 
 
+-- The rejected source is `prefix` followed by the key `bad`; the error must
+-- cover [start, end) in it.
 private func rejects_key(
 	prefix: String,
+	start: Int,
+	end: Int,
 	message_text: String,
 	help: String,
 	matches: pure (Errors.CheckErrorKind) -> Bool,
@@ -95,29 +102,28 @@ private func rejects_key(
 					Some(error):
 						Ok(
 							matches(error.kind) and same_source(error.span.source, module_source(root_module_id()))
-							and error.span.start == prefix.length() and error.span.end == prefix.length() + marked.length()
+							and error.span.start == start and error.span.end == end
 							and same_source(diagnostic.span.source, error.span.source)
 							and diagnostic.span.start == error.span.start and diagnostic.span.end == error.span.end
 							and diagnostic.message == message_text and diagnostic.help == help and diagnostic.note.is_none()
 						)
 
 
-func test_string_key_result_is_rejected_at_the_reference() -> Bool:
-	rejects_key(TEXT_KEY,
-		"argument type does not match the parameter type", "use an expression of type pure (Int) -> Int here",
+-- String does not implement Orderable, so the key's type fails sort_by's bound
+-- at the reference to sort_by.
+func test_string_key_fails_the_orderable_bound_at_the_reference() -> Bool:
+	reference = TEXT_KEY.length() - "sort_by([1],".length()
+	rejects_key(TEXT_KEY, reference, reference + "sort_by".length(), "type does not satisfy the required trait bound",
+		"add the required trait to this function's type parameter bounds, or provide an implementation for the concrete receiver",
 		pure func(kind):
 			match kind:
-				Errors.CallRejection(Errors.ArgumentTypeMismatch(mismatch)):
-					match (mismatch.expected, mismatch.actual.value_type):
-						(Model.CallableType(Pure, [Model.IntType], Model.IntType), Model.CallableType(Pure, [Model.IntType], Model.StringType)):
-							mismatch.argument_position == 1 and mismatch.actual.span.start == TEXT_KEY.length() and mismatch.actual.span.end == TEXT_KEY.length() + 3
-						_: False
+				Errors.MissingTraitBound(_, Model.StringType): True
 				_: False
 	).get_or(False)
 
 
 func test_impure_key_is_rejected_from_an_impure_caller() -> Bool:
-	rejects_key(IMPURE_KEY,
+	rejects_key(IMPURE_KEY, IMPURE_KEY.length(), IMPURE_KEY.length() + "bad".length(),
 		"pure callback requires a pure function", "pass a pure named function; impure functions cannot satisfy a pure callable parameter",
 		pure func(kind):
 			match kind:
@@ -137,7 +143,7 @@ tests: TestSuite = {
 	tests = [
 		("sort_by owns its generic rigid and exposes only the public API", test_sort_signature_owns_its_rigid_and_helpers_are_private),
 		("sort_by forwards callbacks through nested Lists and the 256-element fixture", test_nested_stress_fixture_checks),
-		("sort_by rejects String key results at the actual reference", test_string_key_result_is_rejected_at_the_reference),
+		("sort_by rejects a String key, which is not Orderable, at the reference", test_string_key_fails_the_orderable_bound_at_the_reference),
 		("sort_by rejects a compatible impure key from an impure caller", test_impure_key_is_rejected_from_an_impure_caller),
 	]
 }
