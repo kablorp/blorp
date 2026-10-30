@@ -52,6 +52,7 @@ TARGET_COMPONENT_SOURCES := \
 	blorp_2/test/unit/test_parse/test_record_declarations.brp \
 	blorp_2/test/unit/test_check/test_discard_propagation.brp \
 	blorp_2/test/unit/test_check/test_first_error.brp \
+	blorp_2/test/unit/test_check/test_fixed_unions.brp \
 	blorp_2/test/unit/test_check/test_first_invariant.brp \
 	blorp_2/test/unit/test_check/test_direct_list_updates.brp \
 	blorp_2/test/unit/test_check/test_nominal_types.brp \

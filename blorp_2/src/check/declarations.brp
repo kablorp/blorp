@@ -12,6 +12,7 @@ import:
 		),
 		TypeDeclarationError(
 			DuplicateRecordField, DuplicateTypeParameter, TypeParameterTypeNameConflict, RecursiveAggregateType, RecursiveOpaqueRepresentation,
+			NonFixedPayload, RecursiveFixedUnion,
 		),
 		TypeTermError(
 			PrivateTypeInPublicDeclaration, TraitUsedAsType,
@@ -488,6 +489,7 @@ private pure func declare_types(
 												id = owner,
 												type_parameters = declared_parameters(parameters),
 												variants = variants,
+												fixed = parsed_union.fixed,
 											}) })
 								Err(error): Err(error)
 						Err(error): Err(error)
@@ -1010,6 +1012,146 @@ private pure func repeated_self_payload(owner: UnionId, fields: List[TypeUse]) -
 	repeated
 
 
+-- An opaque type is stored as its underlying type at its arguments, as
+-- specialization erases it. Opaque representation cycles are rejected before
+-- this is used, so the chain of opaque types ends.
+private pure func stored_type(value_type: TypeRef, span: Span, declarations: CheckedDeclarations) -> Result[TypeRef, CheckError]:
+	match value_type:
+		NominalType(OpaqueNominal(id), arguments):
+			match declarations.opaques.get(opaque_number(id)):
+				None:
+					Err(checker_invariant(span, InvalidOpaqueDeclaration(id)))
+				Some(declaration):
+					match substitute_type(declaration.underlying_type.value_type, { owner = OpaqueDeclaration(id), values = arguments }, span):
+						Ok(underlying): stored_type(underlying, span, declarations)
+						Err(error): Err(error)
+		_:
+			Ok(value_type)
+
+
+-- Specialization's rule for a field that keeps its record inline: a number,
+-- or a record whose every field, at the record's arguments, is one. A record
+-- already on `path` is a layout still in progress there, which is managed.
+private pure func inline_record_field(
+	value_type: TypeRef,
+	path: List[TypeRef],
+	span: Span,
+	declarations: CheckedDeclarations,
+) -> Result[Bool, CheckError]:
+	stored ?= stored_type(value_type, span, declarations)
+	match stored:
+		IntType | FloatType:
+			Ok(True)
+		NominalType(AggregateNominal(RecordAggregate(id)), arguments):
+			if path.any(pure func(entered: TypeRef) -> Bool: same_type(entered, stored)):
+				Ok(False)
+			else:
+				match declarations.records.get(record_number(id)):
+					None:
+						Err(checker_invariant(span, InvalidRecordDeclaration(id)))
+					Some(declaration):
+						substitution: Substitution = { owner = RecordDeclaration(id), values = arguments }
+						var inline: Result[Bool, CheckError] = Ok(True)
+						for field in declaration.fields:
+							inline = match substitute_type(field.value_type.value_type, substitution, span):
+								Ok(field_type): inline_record_field(field_type, path.append(stored), span, declarations)
+								Err(error): Err(error)
+							match inline:
+								Ok(True): void
+								_: break
+						inline
+		_:
+			Ok(False)
+
+
+-- Whether a fixed union payload keeps the union inline with no counted child.
+-- An ordinary union is not accepted even when it is unmanaged today: the
+-- promise must be declared, so that editing that union cannot break this one.
+private pure func fixed_payload(payload: TypeUse, declarations: CheckedDeclarations) -> Result[Bool, CheckError]:
+	span = payload.span
+	stored ?= stored_type(payload.value_type, span, declarations)
+	match stored:
+		VoidType:
+			Ok(True)
+		NominalType(AggregateNominal(UnionAggregate(id)), _):
+			declarations.unions.get(union_number(id))
+				.map(pure func(declaration: CheckedUnion) -> Bool: declaration.fixed)
+				.to_result(checker_invariant(span, InvalidUnionDeclaration(id)))
+		_:
+			inline_record_field(stored, [], span, declarations)
+
+
+private pure func contains_union(unions: List[UnionId], id: UnionId) -> Bool:
+	unions.any(pure func(known: UnionId) -> Bool: union_number(known) == union_number(id))
+
+
+-- Walks the fixed unions `owner` stores by value, depth first, and returns
+-- the unions finished so far: those that reach no cycle. `path` holds the
+-- unions being walked, so a payload stored as one of them closes a cycle.
+-- Every payload has passed `fixed_payload`, so only fixed unions are walked.
+private pure func walk_fixed_union(
+	owner: CheckedUnion,
+	path: List[UnionId],
+	finished: List[UnionId],
+	declarations: CheckedDeclarations,
+) -> Result[List[UnionId], CheckError]:
+	var walked = finished
+	var failure: Option[CheckError] = None
+	for variant in owner.variants:
+		for payload in variant.fields:
+			if failure.is_none():
+				-- The Err and None arms are unreachable guards: every payload and
+				-- the union it names were validated before this walk.
+				match stored_type(payload.value_type, payload.span, declarations):
+					Err(error):
+						failure = Some(error)
+					Ok(NominalType(AggregateNominal(UnionAggregate(id)), _)):
+						if contains_union(path, id):
+							failure = Some(type_declaration_error(payload.span, RecursiveFixedUnion(payload.value_type)))
+						else if contains_union(walked, id).not():
+							match declarations.unions.get(union_number(id)):
+								None:
+									failure = Some(checker_invariant(payload.span, InvalidUnionDeclaration(id)))
+								Some(target):
+									match walk_fixed_union(target, path.append(id), walked, declarations):
+										Ok(next): walked = next
+										Err(error): failure = Some(error)
+					Ok(_):
+						void
+	match failure:
+		Some(error): Err(error)
+		None: Ok(walked.append(owner.id))
+
+
+-- A fixed union promises the storage specialization gives a union whose
+-- payloads are all unmanaged and none of which contains it: inline, with no
+-- counted child. Every payload is checked before any cycle, so a cycle can
+-- only pass through fixed unions. The by-value walk below rejects union-only
+-- cycles too, but only until mutual cycles and several self payloads are
+-- supported; containing itself stays wrong for a fixed union, so this check
+-- does not rely on that walk.
+private pure func validate_fixed_unions(declarations: CheckedDeclarations) -> Result[Void, CheckError]:
+	var failure: Option[CheckError] = None
+	for declaration in declarations.unions:
+		if declaration.fixed:
+			for variant in declaration.variants:
+				for payload in variant.fields:
+					if failure.is_none():
+						failure = match fixed_payload(payload, declarations):
+							Ok(True): None
+							Ok(False): Some(type_declaration_error(payload.span, NonFixedPayload(payload.value_type)))
+							Err(error): Some(error)
+	var finished: List[UnionId] = []
+	for declaration in declarations.unions:
+		if and(and(declaration.fixed, failure.is_none()), contains_union(finished, declaration.id).not()):
+			match walk_fixed_union(declaration, [declaration.id], finished, declarations):
+				Ok(walked): finished = walked
+				Err(error): failure = Some(error)
+	match failure:
+		Some(error): Err(error)
+		None: Ok(void)
+
+
 -- Every declared aggregate must have a finite layout: the by-value storage
 -- graph must be acyclic. A union instance stores each direct payload by
 -- value, including the payloads of an applied generic union's body at its
@@ -1019,12 +1161,17 @@ private pure func repeated_self_payload(owner: UnionId, fields: List[TypeUse]) -
 -- An opaque type is erased to its underlying type at its arguments, which is
 -- stored where the opaque type is. A union-only cycle, two self payloads in
 -- one variant, and a generic declaration reinstantiating itself are rejected.
+-- Fixed unions are checked before the by-value walk, so a fixed union that
+-- contains itself is reported by its own rule.
 pure func validate_finite_declarations(
 	declarations: CheckedDeclarations,
 ) -> Result[Void, CheckError]:
 	generic ?= validate_generic_cycles(declarations)
 	-- Expanding opaque types below terminates only once no opaque is on a cycle.
 	_: Void ?= validate_opaque_representations(declarations)
+	-- validate_fixed_unions expands records at their arguments, which
+	-- terminates once no generic declaration reinstantiates itself.
+	_: Void ?= validate_fixed_unions(declarations)
 	-- These vectors stay in one local builder. Passing them through a shared
 	-- record would retain their old roots and copy the entire vector on set.
 	var visiting: List[UnionInstanceVisit] = []
