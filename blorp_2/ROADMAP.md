@@ -1467,30 +1467,37 @@ layout/ownership contract, or a material regression.
 
 ## Ownership contracts roadmap
 
-Status: planned 2026-10-28; two design reviews approved the plan. Keith
+Status: O1 landed; planned 2026-10-28, when two design reviews approved the plan. Keith
 adopted owned-parameter contracts and the step-0 spike; pinned callables, the
 entry and `foreign` as borrowed, with no tail-call owning use, provided that
 stays simpler than the alternatives; approved the test-only labelling
 parameter; and approved reordering record-update projections. Cell reuse (O3)
-is decided after the O0 measurement. O0 and O1 wait for L2b.2 and its seed
-pin; O2 touches only lowering and may land at any time. On 2026-10-29 Keith
+is decided from the attribution after O1. O0 and O1 waited for L2b.2 and its
+seed pin; O2 touches only lowering. On 2026-10-29 Keith
 accepted the step-0 spike's ceilings, keeping inference over insertion's own
-decisions ([step-0 results](#step-0-results)).
+decisions ([step-0 results](#step-0-results)). O1 landed on 2026-10-30
+(`393438c00`). On 2026-10-30 Keith adopted the plan after O1, reviewed by
+a fact-check and a design review: the O1 follow-ups and the attribution come
+next, O2 proceeds alongside them, and the attribution decides borrowed field
+projections and O3.
 
 | Step | Scope | Status |
 | --- | --- | --- |
 | [O0](#o0-re-measure-after-l2b) | Re-run the self-compile copy attribution and count atomic RC operations | Measured ([results](#o0-results)) |
-| [O1](#o1-owned-parameter-contracts) | Per-parameter owned/borrowed contracts, inferred from in-place runtime operations | Implemented on `o1-owned-parameters` ([results](#o1-results)); size overage accepted |
-| [O2](#o2-record-update-binds-before-it-rebuilds) | Project the base fields an update reads before its replacements run | Approved; may land before O1 |
-| [O3](#o3-cell-reuse-for-records-and-union-nodes) | Reuse tokens for unique record cells and boxed union nodes | Undecided; O0 found no allocation witness |
+| [O1](#o1-owned-parameter-contracts) | Per-parameter owned/borrowed contracts, inferred from in-place runtime operations | Landed 2026-10-30 ([results](#o1-results)); size overage accepted |
+| [O1 follow-ups](#o1-follow-ups) | One passing rule in `pass_arguments`, an `append_int` digit loop, a seed containing O1 | Next |
+| [Attribution after O1](#attribution-after-o1) | Remaining copies, RC operations and allocations by kind, a fresh profile | Next, alongside O2 |
+| [O2](#o2-record-update-binds-before-it-rebuilds) | Project the base fields an update reads before its replacements run | Approved; benchmark first |
+| [Borrowed field projections](#borrowed-field-projections) | Read managed record fields borrowed, as union payloads already are | Proposed; decided from the attribution, needs approval |
+| [O3](#o3-specialised-reuse-for-records-and-union-nodes) | Specialised reuse of unique record cells and boxed union nodes | Undecided; decided from the attribution |
 
 ### Problem
 
 L1/L2 reuse a List or String buffer only when a consuming runtime call holds
-the value's last owner. Every user parameter borrows (`own/own.brp:754`
-publishes `BorrowedResult(ParameterBorrow(...))`), so a callee can never reuse
-its argument, and an accumulator threaded through a helper is copied on every
-call:
+the value's last owner. Before O1 every user parameter borrowed (`own`
+published `BorrowedResult(ParameterBorrow(...))` for each), so a callee could
+never reuse its argument, and an accumulator threaded through a helper was
+copied on every call:
 
 ```blorp
 pure func emit_line(output: String, line: String) -> String:
@@ -1504,7 +1511,7 @@ pure func render(lines: List[String]) -> String:
 ```
 
 The same shape copies the whole bucket table in `with_bucket_entry`
-(`utils/names.brp:154`) and the list in the library's `set_index`. A record
+(`utils/names.brp`) and the list in the library's `set_index`. A record
 update copies a field accumulator because the base is still alive when the
 replacement runs (`lower/lower.brp:538-557`):
 
@@ -1531,9 +1538,8 @@ targets; [O0](#o0-results) measured L2b closing 99% of the List copies and
 `append_byte_array`'s String copies. What L2b leaves is the parameter case:
 190 MB of String from `append_owner_alias`, `append_selection` and
 `append_loop`, whose `output` parameter borrows, and 65.6 M slots from
-`with_bucket_entry`. Four emit helpers
-(`emit/emit.brp:1827`, `1956`, `2860`, `2931`) work around it with a local
-`fragments` list.
+`with_bucket_entry`. Emit's local `fragments` lists predate in-place reuse
+(`20a89291c`), are linear since L2b, and are not an O1 target.
 
 The reproduction is `helper_accumulators`, with modes `list_helper`,
 `string_helper`, `set_helper` and `none`, one helper call per update. Normal
@@ -1913,8 +1919,8 @@ with `InferredLabels`; tests call it with `AllBorrowed` or
 `AllOwnedExceptPinned` to prove labels never change behaviour (approved
 2026-10-28 as a test-only mechanism).
 
-O1 deletes the four copies of the five-target set, `consuming_update_borrows`, the
-operand-0 restriction and its message, and replaces these statements:
+O1 deleted the four copies of the five-target set, `consuming_update_borrows`, the
+operand-0 restriction and its message, and replaced these statements:
 `README.md` "Parameters borrow" (1230, 1950, 1963, 2334) and "Parameters
 never transfer" (2843); in this roadmap L1's "List calls remain declared
 wrapper calls, whose parameters borrow", "No interprocedural consuming ABI" under
@@ -2022,13 +2028,29 @@ count1 = count0.add(1)
 
 Replacement expressions still run once in written order, and the order
 fixture's output is unchanged. It replaces the evaluation-order text at
-`README.md:1320-1322` and the order comment at `lower/lower.brp:536-537`. O2 touches only lowering and may land before O1, but
-`push` becomes linear only once O1 makes `state` owned.
+`README.md:1320-1322` and the order comment at `lower/lower.brp:536-537`. O2
+touches only lowering. Projecting first, then dropping the base, then
+replacing is also the order that
+[borrowed field projections](#borrowed-field-projections) and specialised
+reuse ([O3](#o3-specialised-reuse-for-records-and-union-nodes)) need to take
+a field out of a unique cell.
 
-### O3: cell reuse for records and union nodes
+**Benchmark first.** Add two modes to `helper_accumulators` in
+`benchmarks/blorp/` and `benchmarks/blorp_2/`, failing before O2:
 
-Undecided until O0. Every update and rebuild allocates a fresh root
-(`README.md:1326`):
+- `record_loop`: `state = { state | items = state.items.append(i), count =
+  state.count.add(1) }` in one function's loop. It needs no O1 and is
+  quadratic today.
+- `record_helper`: the same update through a `push(state, item)` helper,
+  which O1 makes owned, plus a variant threaded through a
+  `Result`-returning helper, whose `Err` arm keeps the caller's value live.
+
+O2 needs no attribution first and runs alongside it.
+
+### O3: specialised reuse for records and union nodes
+
+Undecided until the [attribution after O1](#attribution-after-o1). Every
+update and rebuild allocates a fresh root (`README.md:1326`):
 
 ```blorp
 pure func rename_all(path: Path, suffix: String) -> Path:
@@ -2039,19 +2061,98 @@ pure func rename_all(path: Path, suffix: String) -> Path:
 
 The design is a reuse-token obligation: drop-for-reuse of a unique cell yields
 a token, and construction of the same instance consumes it; the token joins
-`reuses_first_operand`'s root match, which stays sound. It is a constant
-factor, adds a verifier owner state and two runtime helpers per layout, and
-spreads parameter labels, so it proceeds only if O0 shows record and union
-allocation traffic worth it. Without O3, Blorp 2 stays behind the legacy
-compiler on record and union rebuilding; O0's `compiler_ast` and
-`binary_trees` comparison sizes that gap.
+`reuses_first_operand`'s root match, which stays sound. An unspecialised
+token saves only the allocation: drop-for-reuse still decrements every field,
+and the construction acquires the unchanged ones again. Specialised reuse, as
+in Perceus's drop and reuse specialisation and Lean's `ExpandResetReuse`,
+branches on the cell's uniqueness: on the unique path, the field acquisitions
+cancel the parent's field decrements and unchanged fields are not rewritten,
+so one uniqueness test replaces two atomic operations per field plus the
+free and allocation. O3 is that specialised form. It needs a
+branch-dependent obligation in the verifier, adds runtime helpers per layout
+and spreads parameter labels, so it proceeds only if the attribution shows
+record and union cascades or allocation traffic worth it. O0's
+`compiler_ast` and `binary_trees` comparison found no allocation witness, but
+self-compile allocations were not split by kind. Without O3, Blorp 2 stays
+behind the legacy compiler on record and union rebuilding.
+
+### O1 follow-ups
+
+Three steps, each landed green:
+
+1. **One passing rule.** `pass_arguments` takes `transfers: List[Bool]` and
+   `acquires: Bool`, which can disagree. A two-variant type (an in-place
+   operand, or owned positions) replaces them, as a preparatory commit before
+   any further `own` work.
+2. **`append_int` digit loop.** `string_helper` misses legacy parity (106 M
+   instructions against 37.5 M at 131,072) because the runtime formats with
+   `snprintf`, at `runtime/string_concat.brp` (`string_append_int_runtime`,
+   shared by the borrowed and in-place helpers) and `runtime/string.brp`. A
+   hand-written loop takes the magnitude as `0u - (uint64_t)value`, since
+   negating `INT64_MIN` is undefined; runtime tests cover 0, both extremes and
+   negative values. A probe ran `string_helper` in 20.0 M.
+3. **A seed containing O1 and the digit loop.** Until it is pinned, the
+   seed-built B pays the inference (about +1.3% instructions against the
+   pre-O1 compiler, net of the `known_owner` saving) and gets none of C's
+   −7.1%. Before the pin, re-run the four-labelling oracle over every e2e
+   fixture, as recorded under Testing.
+
+### Attribution after O1
+
+O1's handback asked for the remaining borrowed-call opportunities; O1 did not
+report them. This step does, on post-O1 main, and decides
+[borrowed field projections](#borrowed-field-projections) and
+[O3](#o3-specialised-reuse-for-records-and-union-nodes). Its scripts are
+committed under `blorp_2/scripts/` so another session can repeat it; O0's
+lived only in a session scratchpad. It reports:
+
+- **Copies:** which of O0's parameter copies O1 closed (`append_owner_alias`,
+  `append_selection*`, `append_loop*`, `with_bucket_entry`), and a trace of
+  `emit`'s triple copy of its 23 MB result, whose `output` is a local
+  (`emit/emit.brp`, the `emit` function).
+- **RC operations by kind:** a marker-instrumented B tags each atomic
+  increment and decrement with its source: projection acquisition, stored
+  field acquisition, borrowed-return acquisition, call transfer, explicit
+  drop, or cascade from a parent's free. This splits O0's 746 M record
+  operations between borrowed projections and specialised reuse, and counts
+  acquire-then-drop at stores and control edges, which the non-goal below
+  defers.
+- **Allocations by kind**, through `BLORP_ALLOCATION_SITES`.
+- **A fresh sample profile.** O0's 20% for specialization instance lookup
+  predates `ce8b1676c`.
+- **The upper bound of non-atomic counting:** a scratch copy of B's self C
+  with plain increments and decrements, measured in cycles, not retired
+  instructions, which cannot see the cost of an atomic.
+
+`with_bucket_entry`'s inner `listed.append(id)` copies because `get` hands
+out a second reference; it needs a take-or-update-at-index API, not
+inference, and is a separate item.
+
+### Borrowed field projections
+
+Proposed, decided from the attribution. `ReadRecordFieldDefinition` always
+acquires its managed result (`ProjectedAcquisition` in `own/own.brp`), while
+union payloads and List elements stay borrowed (`PayloadBorrow`). A record
+update with n inherited fields therefore costs n acquisitions, and n
+decrements when a unique base is freed. The proposal reads record fields
+borrowed and acquires only where the value escapes, is stored or consumed, or
+its parent dies or moves first. The verifier's projection-ancestry checks
+already cover borrowed children. A borrowed child can block an O1 move of its
+parent through `pass_arguments`' dependency rule; there the child is acquired,
+not the parent. This reverses "prefer immediate acquisition for a managed
+projection" under [construction and projection](#construction-and-projection),
+so it needs
+Keith's approval with the attribution's numbers.
 
 ### Scope and non-goals
 
 O1 touches `own`, `verify`, `namespace/builtins.brp`, the runtime helper names and their tests. Emit changes only through the
 shared contract. Not in this plan: moves at stores and control edges
-(acquire-then-drop costs two atomic operations each; revisit after O0
-counts), a report, LSP or `@in_place` (new surface, needs approval),
+(acquire-then-drop costs two atomic operations each; O0 did not attribute
+them and step 0 counted only owned-call acquisitions, so the
+[attribution after O1](#attribution-after-o1) counts them), non-atomic
+reference counts for thread-local values (deferred until Blorp 2 has a
+concurrency design), a report, LSP or `@in_place` (new surface, needs approval),
 Lean-style owning uses beyond reuse (only after O3), owned callable parameters
 and tail-call owning use (see Pins). Do not touch L2b's worktrees or reopen
 its design.
@@ -2076,7 +2177,8 @@ its design.
 ### Dependencies
 
 L2b.2 landed and its seed pinned; the O0 report. The preparation commit
-precedes O1. O2 is independent.
+precedes O1. O2 is independent. The passing-rule commit precedes any further
+`own` work; borrowed field projections and O3 wait for the attribution.
 
 ### Testing
 
@@ -2217,17 +2319,19 @@ Binding since step 0 (accepted 2026-10-29):
 
 ### Release strategy
 
-Separate landings, each green: the helper-name preparation, O1, O2 (any time),
-O3 if approved. O1 needs no seed for correctness; publish a seed after it so
-the default builder gains the savings. Back out O1 by switching production to
+Separate landings, each green: the helper-name preparation and O1 (landed),
+then the O1 follow-ups, the attribution, O2, and borrowed field projections
+and O3 if approved. O1 needs no seed for correctness; the follow-ups pin one
+so the default builder gains the savings. Back out O1 by switching production to
 `AllBorrowed`, which the unit oracle and the one-off fixture run found
 equivalent, then revert.
 
 ### Handback
 
 Return the branch and commits, evidence
-for each criterion, the two review verdicts and remaining borrowed-call
-opportunities. Stop and ask on a premise that proves wrong, a ceiling breach,
+for each criterion and the two review verdicts. O1 did not report the
+remaining borrowed-call opportunities; the
+[attribution after O1](#attribution-after-o1) does. Stop and ask on a premise that proves wrong, a ceiling breach,
 an ABI change beyond these contracts, or a result that looks like a compiler
 bug.
 
@@ -3278,8 +3382,8 @@ passes. Preserve reviewed future designs and held candidates. A retained stored
 payload witness can reopen the appropriate recursive-type prerequisite.
 
 Allocation reuse beyond unique-owner String and List buffers (record and union
-cell reuse is [O3](#o3-cell-reuse-for-records-and-union-nodes), pending its
-measurement), retain elimination, List removal, Set/Dict
+cell reuse is [O3](#o3-specialised-reuse-for-records-and-union-nodes), pending the
+[attribution after O1](#attribution-after-o1)), retain elimination, List removal, Set/Dict
 key semantics (storing a type does not make it a key), mutual tail calls,
 tail-modulo-constructor, closure escape and closure values, and the unit-test
 migration plan. When reuse is introduced, its enabled and always-fresh paths must
