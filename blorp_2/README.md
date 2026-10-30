@@ -1826,9 +1826,11 @@ Lexical and layout rules:
   The record rule is structural: it follows today's record layout and accepts
   a plain `record`, so it must be reconciled with the fixed-record rules once
   those are checked.
-  An ordinary union such as Bool is not a fixed payload, even though it is
-  stored inline today; the promise must be declared. `fixed` is a
-  contextual header word and remains a valid name elsewhere; `union` is reserved. A variant is bare or declares an ordered list of field types, as in
+  An ordinary payload-free union is not a fixed payload, even though it is
+  stored inline today; the promise must be declared, as the base declares
+  `fixed union Bool:`. `fixed` is a contextual header word and remains a valid
+  name elsewhere; `union` is reserved. A variant is bare or declares an ordered
+  list of field types, as in
   `Number(Int)`, `Box(T)` or `Pair(String, String)`. A union may declare ordered
   parameters with `union Result[T, E]:`. Every field annotation uses ordinary
   type syntax in the union declaration's module and parameter scope, including
@@ -2197,8 +2199,8 @@ Semantic rules:
 - Union-only recursive layouts, generic self-reinstantiation,
   guards, Char patterns, constructor UFCS,
   and function
-  values are outside this increment. `Bool` is an ordinary union declared
-  once in the base module, alongside Option and Result. Local functions and
+  values are outside this increment. `Bool` is a fixed union declared
+  once in the base module, alongside the ordinary unions Option and Result. Local functions and
   explicitly imported functions support both call notations; type selections
   expose receiver functions only through UFCS.
 - Syntax and semantic errors carry a source location, an explanation, and help.
@@ -2480,8 +2482,8 @@ records phase tests, native output, ownership checks and matched costs.
 
 ## Calculator input and results
 
-`Option[T]`, `Result[Value, Error]` and `Bool` come from ordinary
-unions in `standard_library/_base.brp`; none of them receives
+`Option[T]` and `Result[Value, Error]` come from ordinary unions and `Bool`
+from a fixed union in `standard_library/_base.brp`; none of them receives
 a compiler-specific representation. The prelude supplies their types and
 constructors to user modules; library modules import them from `_base`:
 
@@ -3161,8 +3163,8 @@ before sealing the program.
 General pass infrastructure remains future work.
 
 The target library's [`_base.brp`](standard_library/_base.brp)
-owns the builtin Int, Float, String, Void and List identities, the ordinary
-Bool, Option and Result unions, and the `Orderable` and `Hashable` traits. It is the only module
+owns the builtin Int, Float, String, Void and List identities, the fixed
+union Bool, the ordinary Option and Result unions, and the `Orderable` and `Hashable` traits. It is the only module
 that may declare builtin types, and any module may import it as `_base`.
 
 The foundation check designates those three unions once, by name and only in
