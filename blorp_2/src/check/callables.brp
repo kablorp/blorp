@@ -62,40 +62,22 @@ fixed record FunctionContract {
 }
 
 
+-- `arguments` excludes the receiver of a receiver call, which the arity adds.
 pure func function_contract(
 	caller: Caller,
 	name: WrittenName,
+	receiver_call: Bool,
 	arguments: List[ValueExpression],
 	callee: FunctionId,
 	signatures: List[AcceptedFunction],
 ) -> Result[FunctionContract, CheckError]:
 	accepted ?= accepted_function(name, callee, signatures)
 	signature = accepted.signature
-	arity ?= validate_arity(name, False, arguments.length(), DeclaredTarget(callee), signature)
-	pure_call ?= validate_purity(caller, name, callee, signature)
-	Ok({
-		target = declared_call_target(accepted),
-		signature = signature,
-		span = name.span,
-	})
-
-
-pure func receiver_contract(
-	caller: Caller,
-	name: WrittenName,
-	arguments: List[ValueExpression],
-	callee: FunctionId,
-	signatures: List[AcceptedFunction],
-) -> Result[FunctionContract, CheckError]:
-	accepted ?= accepted_function(name, callee, signatures)
-	signature = accepted.signature
-	arity ?= validate_arity(
-		name,
-		True,
-		arguments.length().add(1),
-		DeclaredTarget(callee),
-		signature,
-	)
+	count = if receiver_call:
+		arguments.length().add(1)
+	else:
+		arguments.length()
+	arity ?= validate_arity(name, receiver_call, count, DeclaredTarget(callee), signature)
 	pure_call ?= validate_purity(caller, name, callee, signature)
 	Ok({
 		target = declared_call_target(accepted),
@@ -150,10 +132,14 @@ private pure func validate_purity(
 	callee: FunctionId,
 	signature: FunctionSignature,
 ) -> Result[Void, CheckError]:
-	if and(same_purity(caller.purity, Pure), same_purity(signature.purity, Impure)):
+	if calls_impure_from_pure(caller, signature):
 		Err(call_error(name.span, ImpureCall(caller.body, callee)))
 	else:
 		Ok(void)
+
+
+private pure func calls_impure_from_pure(caller: Caller, signature: FunctionSignature) -> Bool:
+	and(same_purity(caller.purity, Pure), same_purity(signature.purity, Impure))
 
 
 fixed record ResolutionContext {
@@ -255,33 +241,41 @@ pure func method_site(candidate: ReceiverCandidate) -> MethodCandidateSite:
 	}
 
 
+-- Where the candidate entered the caller's module: its selection, else its own
+-- declaration.
+pure func candidate_span(candidate: ReceiverCandidate) -> Span:
+	match candidate.import_site:
+		Some(selection): selection
+		None: candidate.function.declaration.function_name.span
+
+
 pure func classify_receiver(
 	application: ReceiverApplication,
 	context: ResolutionContext,
 ) -> Result[ResolvedReceiver, CheckError]:
 	name = application.callee
 
-	method ?= visible_method(context.namespace, accepted_traits(context.traits), context.signatures, context.module, name)
-	match method:
-		Some(id):
+	lookup ?= visible_method(context.namespace, accepted_traits(context.traits), context.signatures, context.module, name)
+	match lookup:
+		VisibleMethod(id):
 			match method_contract(name, application.arguments.length().add(1), True, id, accepted_traits(context.traits)):
 				Ok(contract): Ok(UniqueReceiver(contract))
 				Err(error): Err(error)
-		None: classify_function_receiver(application, context)
+		VisibleFunctions(candidates): classify_function_receiver(application, context, candidates)
 
 
-private pure func classify_function_receiver(application: ReceiverApplication, context: ResolutionContext) -> Result[ResolvedReceiver, CheckError]:
+private pure func classify_function_receiver(application: ReceiverApplication, context: ResolutionContext, candidates: List[ReceiverCandidate]) -> Result[ResolvedReceiver, CheckError]:
 	name = application.callee
-	candidates ?= receiver_bindings(context.namespace, context.signatures, context.module, name)
 	match candidates:
 		[]:
 			match named_value(context.namespace, context.module, name.id):
 				Some(NamedConstructor(_)): Err(method_error(name.span, ConstructorUFCS(name.id)))
 				_: Err(call_error(name.span, UnknownFunction(name.id)))
 		[candidate]:
-			match receiver_contract(
+			match function_contract(
 				context.caller,
 				name,
+				True,
 				application.arguments,
 				candidate.function.id,
 				context.signatures,
@@ -299,18 +293,7 @@ pure func callable_contract(
 	binding: CallableBinding,
 ) -> Result[FunctionContract, CheckError]:
 	accepted ?= callable_parameter_contract(binding)
-	signature = accepted.signature
-	target: CallIdentity = ParameterTarget(accepted.parameter)
-	arity ?= validate_arity(name, False, arguments.length(), target, signature)
-	_: Void ?= if and(same_purity(caller.purity, Pure), same_purity(signature.purity, Impure)):
-		Err(call_error(name.span, ImpureCallableCall(caller.body)))
-	else:
-		Ok(void)
-	Ok({
-		target = target,
-		signature = signature,
-		span = name.span
-	})
+	value_callable_contract(caller, name, arguments, ParameterTarget(accepted.parameter), accepted.signature)
 
 
 -- The resolved binding, not its name, identifies an ordinary stored callable.
@@ -319,7 +302,7 @@ pure func value_callable_contract(
 	target: CallIdentity, signature: FunctionSignature,
 ) -> Result[FunctionContract, CheckError]:
 	arity ?= validate_arity(name, False, arguments.length(), target, signature)
-	_: Void ?= if and(same_purity(caller.purity, Pure), same_purity(signature.purity, Impure)):
+	_: Void ?= if calls_impure_from_pure(caller, signature):
 		Err(call_error(name.span, ImpureCallableCall(caller.body)))
 	else:
 		Ok(void)
@@ -390,7 +373,14 @@ private pure func add_family(previous: Option[MethodBinding], method: TraitMetho
 					Err(trait_error(held.span, DifferentMethodFamilies(held.method, method, span)))
 
 
-pure func visible_method(namespace: Namespace, traits: AcceptedTraits, signatures: List[AcceptedFunction], module: ModuleId, name: WrittenName) -> Result[Option[TraitMethodId], CheckError]:
+-- What a receiver call's name reaches: a trait method family, or else the
+-- receiver functions found while looking (possibly none).
+fixed union ReceiverLookup:
+	VisibleMethod(TraitMethodId)
+	VisibleFunctions(List[ReceiverCandidate])
+
+
+pure func visible_method(namespace: Namespace, traits: AcceptedTraits, signatures: List[AcceptedFunction], module: ModuleId, name: WrittenName) -> Result[ReceiverLookup, CheckError]:
 	var found: Option[MethodBinding] = match named_value(namespace, module, name.id):
 		Some(NamedMethod(id)):
 			match value_binding(namespace, module, name.id):
@@ -413,14 +403,12 @@ pure func visible_method(namespace: Namespace, traits: AcceptedTraits, signature
 		None: Ok(void)
 	functions ?= receiver_bindings(namespace, signatures, module, name)
 	match found:
-		None: Ok(None)
+		None: Ok(VisibleFunctions(functions))
 		Some(family):
 			match functions:
-				[]: Ok(Some(family.method))
+				[]: Ok(VisibleMethod(family.method))
 				[function, ..._]:
-					function_span = match function.import_site:
-						Some(span): span
-						None: function.function.declaration.function_name.span
+					function_span = candidate_span(function)
 					if incoming_diagnostic_site(family.span, function_span, module):
 						Err(trait_error(function_span, FamilyFunctionConflict(family.method, function.function.id, family.span)))
 					else:
