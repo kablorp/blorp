@@ -1,0 +1,135 @@
+---
+Trait and equality checking stop at the first internal failure. No source
+program reaches these failures, so each test hands a phase malformed input in
+which two iterations of one loop fail, and pins the failure of the first.
+---
+import:
+	../../../src/check/declarations: CheckedDeclarations, validate_declarations
+	../../../src/check/equality: equality_template
+	../../../src/check/errors as Errors
+	../../../src/check/model as Model
+	../../../src/check/render: render_check_error
+	../../../src/check/traits: prepare_equality_availability, validate_implementations
+	../../../src/namespace/namespace: Namespace, build_namespace
+	../../../src/parse/assemble: ParsedContents, ParsedProgram, parsed_contents
+	../../../src/utils/ids: inventory_records, trait_number
+	../../../src/utils/names: program_names
+	../../../src/utils/source: equality_label, module_source, root_module_id, same_source
+	../../../src/utils/syntax: Diagnostic, Span
+	../input: PreparedSignatures, prepare_signatures
+	../module_input: FOUNDATION_TYPES, TestFoundation, parse_modules_with_base, test_base
+	bool: and
+	int: Int methods
+	list: List methods
+	option: Option methods
+	result: Result methods
+	string: String methods
+	test: TestSuite
+
+
+-- Equality is the canonical trait only when the foundation declares it and the
+-- prelude selects it.
+private pure func equatable_foundation() -> TestFoundation:
+	{
+		types = FOUNDATION_TYPES.add("trait Equatable:\n    pure func equals(left: Self, right: Self) -> Bool\n"),
+		prelude_selections = test_base().prelude_selections.add(", Equatable")
+	}
+
+
+private SOURCE: String =
+	|trait Same:
+	|    pure func same(left: Self, right: Self) -> Bool
+	|implements Same for Int:
+	|    pure func same(left: Self, right: Self) -> Bool:
+	|        True
+	|fixed record Alpha { flag: Bool }
+	|fixed record Beta { flag: Bool }
+	|func main() -> Int:
+	|    0
+	|
+
+
+private fixed record Staged {
+	program: ParsedProgram,
+	parsed: ParsedContents,
+	namespace: Namespace,
+	declarations: CheckedDeclarations,
+	prepared: PreparedSignatures
+}
+
+
+private pure func stage() -> Result[Staged, Diagnostic]:
+	program ?= parse_modules_with_base([{ source = SOURCE, targets = [] }], equatable_foundation())
+	parsed = parsed_contents(program)
+	namespace ?= build_namespace(program).map_err(pure func(_): internal_setup_failure())
+	declarations ?= validate_declarations(parsed, namespace).map_err(pure func(error): render_check_error(program, error))
+	prepared ?= prepare_signatures(program, namespace).map_err(pure func(error): render_check_error(program, error))
+	Ok({ program = program, parsed = parsed, namespace = namespace, declarations = declarations, prepared = prepared })
+
+
+private pure func internal_setup_failure() -> Diagnostic:
+	{ span = at(0, 0), note = None, message = "namespace setup failed", help = "fix the fixture" }
+
+
+private pure func at(start: Int, end: Int) -> Span:
+	{ source = module_source(root_module_id()), start = start, end = end }
+
+
+-- A parameter no trait owns, so substituting a trait's `Self` cannot replace
+-- it. Each position gets its own span, so the failure names which parameter
+-- was reported.
+private pure func foreign_parameter(staged: Staged, position: Int) -> Option[Model.TypeUse]:
+	staged.declarations.unions.get(0).map(pure func(owner) -> Model.TypeUse:
+		{
+			value_type = Model.ParameterType(Model.type_parameter_id(Model.UnionDeclaration(owner.id), position)),
+			span = at(position.add(1), position.add(2))
+		}
+	)
+
+
+-- Every method of the contract takes two foreign parameters.
+private pure func malformed_contracts(staged: Staged) -> Option[List[Model.AcceptedTrait]]:
+	match (foreign_parameter(staged, 0), foreign_parameter(staged, 1)):
+		(Some(first), Some(second)):
+			Some(staged.prepared.contracts.declarations.map(pure func(contract) -> Model.AcceptedTrait:
+				{ contract | methods = contract.methods.map(pure func(method) -> Model.AcceptedTraitMethod:
+					{ method | signature = { method.signature | parameters = [first, second] } }
+				) }
+			))
+		_: None
+
+
+-- The first foreign parameter is reported, not the second.
+private pure func is_first_parameter_failure(program: ParsedProgram, error: Errors.CheckError) -> Bool:
+	rendered = render_check_error(program, error)
+	position_is_first = match error.kind:
+		Errors.InternalInvariant(Errors.InvalidParameterDeclaration(parameter)): Model.parameter_position(parameter) == 0
+		_: False
+	position_is_first
+		.and(same_source(error.span.source, module_source(root_module_id())))
+		.and(error.span.start == 1).and(error.span.end == 2)
+		.and(rendered.message == "invalid parameter declaration")
+		.and(rendered.help == "report this compiler error with the input program")
+
+
+pure func test_equality_template_reports_the_first_unsubstitutable_parameter() -> Bool:
+	match stage():
+		Err(_): False
+		Ok(staged):
+			match (staged.prepared.contracts.canonical.equality, staged.declarations.records, malformed_contracts(staged)):
+				(Some(canonical), [alpha, ..._], Some(contracts)):
+					match contracts.get(trait_number(Model.canonical_owner(canonical))).map(pure func(contract) -> List[Model.AcceptedTraitMethod]: contract.methods):
+						Some([method, ..._]):
+							match equality_template(Model.RecordAggregate(alpha.id), equality_label("Alpha"), [], [], staged.declarations.records, staged.declarations.unions, method, staged.prepared.designated.boolean, at(0, 0)):
+								Ok(_): False
+								Err(error): is_first_parameter_failure(staged.program, error)
+						_: False
+				_: False
+
+
+tests: TestSuite = {
+	description = "first internal failure wins",
+	tests = [
+		("an equality template reports its first unsubstitutable parameter", test_equality_template_reports_the_first_unsubstitutable_parameter),
+	],
+}
