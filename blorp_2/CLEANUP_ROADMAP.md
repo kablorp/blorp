@@ -143,14 +143,17 @@ No representation or output changes. Re-run each grep before deleting.
   `render_fault`, so they stay: `InvalidResolvedUnion`,
   `InvalidResolvedVariant`, `InvalidParameterName`,
   `ParameterOwnerWithoutParameter`, `InvalidParsedName` and `InvalidCallName`.
-- **Production records read only by tests:**
-  - `SpecialNames`/`InitialNames.special`. Keep the lookups that validate.
+- **Small type deletions:** `traits.brp`'s `EqualityOutcome` and its round
+  trip.
+- **Skipped after inspection:**
+  - `SpecialNames`/`InitialNames.special` has no production reader, but about
+    six tests use its ids as handles. Removing it is a test rewrite, not a
+    deletion.
   - `check.brp`'s `declaration_id`, `record_declaration_id` and
-    `union_declaration_id`, which move into test helpers.
-- **Small type deletions:**
-  - `traits.brp`'s `EqualityOutcome` and its round trip;
-  - `recursion.brp`'s `parameter_index` returns `Option[Int]`, not a length
-    sentinel.
+    `union_declaration_id` cannot move into tests, because they read the
+    opaque `CheckedProgram`.
+  - Making `recursion.brp`'s `parameter_index` return `Option[Int]` adds
+    lines for a miss the preceding loop rules out.
 - **Comments:**
   - Move doc comments to the declaration they describe. Today they sit above
     `PendingWhile` (`lower`), `callable_binding_value` (`specialize`),
