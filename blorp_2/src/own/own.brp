@@ -1118,19 +1118,30 @@ private fixed record PassedCall {
 }
 
 
--- The one move rule. A position `transfers` flags moves its argument's owner
+-- Which positions of a call may move their argument's owner, and what an
+-- unmovable owner gets: an in-place operand stays borrowed and its helper
+-- copies; an owned parameter receives a fresh acquisition.
+private union PassingRule:
+	InPlaceOperand              -- position 0 only; never acquires
+	OwnedPositions(List[Bool])  -- one row per argument; acquires when unmovable
+
+
+-- The one move rule. A position the `rule` marks moves its argument's owner
 -- when that owner may transfer at this step, no borrowed position of the call
 -- depends on it and no earlier position took it. Otherwise an owned parameter
--- (`acquires`) receives a fresh acquisition: a reference count cannot see the
--- caller's remaining borrow, so passing the bare value would let the callee
--- update a live value in place. An in-place operand instead stays borrowed,
--- and its helper copies. None when the call transfers nothing.
+-- receives a fresh acquisition: a reference count cannot see the caller's
+-- remaining borrow, so passing the bare value would let the callee update a
+-- live value in place. An in-place operand instead stays borrowed, and its
+-- helper copies. None when the call transfers nothing.
 private pure func pass_arguments(
-	definition: OwnedDefinition, target: CallTarget, arguments: List[OwnedArgument], transfers: List[Bool], acquires: Bool,
+	definition: OwnedDefinition, target: CallTarget, arguments: List[OwnedArgument], rule: PassingRule,
 	first_owner: Int, pre_step_drops: Option[List[ScheduledDrop]], loop_uses: List[ScheduledDrop], consumed: List[OwnerId],
 	position: Int, sources: List[ResultOwnership], enclosing: List[EnclosingBlock], first_value: Int,
 ) -> Result[Option[PassedCall], Diagnostic]:
 	step_drops ?= pre_step_drops.to_result(internal_error(definition.span, "missing drop schedule row"))
+	transfers = match rule:
+		InPlaceOperand: arguments.map(pure func(_: OwnedArgument) -> Bool: False).set(0, True)
+		OwnedPositions(rows): rows
 	counted: Void ?= if arguments.length() == transfers.length():
 		Ok(void)
 	else:
@@ -1166,16 +1177,16 @@ private pure func pass_arguments(
 								else:
 									None
 							_: None
-						match (movable, acquires):
+						match (movable, rule):
 							(Some(owner), _):
 								passed = passed.append(ConsumedArgument(borrow.value, owner))
 								taken = taken.append(owner)
-							(None, True):
+							(None, OwnedPositions(_)):
 								fresh = owner_id(next)
 								next = next.add(1)
 								acquisitions = acquisitions.append({ owner = fresh, borrow = borrow })
 								passed = passed.append(ConsumedArgument(borrow.value, fresh))
-							(None, False): passed = passed.append(argument)
+							(None, InPlaceOperand): passed = passed.append(argument)
 			-- An unmanaged value never fills an owned position; verify rejects one.
 			_: passed = passed.append(argument)
 		index = index.add(1)
@@ -1208,8 +1219,7 @@ private pure func pass_call(
 	match definition.operation:
 		CallDefinition(RuntimeFunction(operation), arguments):
 			if reuses_first_operand(operation):
-				operand = arguments.map(pure func(_: OwnedArgument) -> Bool: False).set(0, True)
-				pass_arguments(definition, RuntimeFunction(operation), arguments, operand, False, first_owner, pre_step_drops, loop_uses, consumed, position, sources, enclosing, first_value)
+				pass_arguments(definition, RuntimeFunction(operation), arguments, InPlaceOperand, first_owner, pre_step_drops, loop_uses, consumed, position, sources, enclosing, first_value)
 			else:
 				Ok(unchanged)
 		CallDefinition(UserFunction(callee), arguments):
@@ -1220,7 +1230,7 @@ private pure func pass_call(
 						None: Err(internal_error(definition.span, "call to an instance with no contract"))
 						Some(callee_rows):
 							if callee_rows.any(parameter_owned):
-								pass_arguments(definition, UserFunction(callee), arguments, callee_rows.map(parameter_owned), True, first_owner, pre_step_drops, loop_uses, consumed, position, sources, enclosing, first_value)
+								pass_arguments(definition, UserFunction(callee), arguments, OwnedPositions(callee_rows.map(parameter_owned)), first_owner, pre_step_drops, loop_uses, consumed, position, sources, enclosing, first_value)
 							else:
 								Ok(unchanged)
 		_: Ok(unchanged)
