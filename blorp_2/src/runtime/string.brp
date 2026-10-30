@@ -123,6 +123,55 @@ pure func string_runtime() -> String:
 		|blorp_memory_release(value);
 		|}
 		|}
+		|/* A literal's String is shared by every evaluation of its site and lives for
+		| * the whole run. Its count starts at this base and each live reference adds
+		| * one; no program holds half the address space in references, so the count
+		| * never reaches 1 (copy-on-write copies) or 0 (release frees) and never
+		| * overflows. Retain, release and uniqueness tests need no special case. */
+		|#define BLORP_STRING_LITERAL_REFERENCES (SIZE_MAX/2)
+		|/* One per emitted literal site, zero-initialized: no String yet. */
+		|struct blorp_string_literal_site {
+		|struct blorp_string *value;
+		|#if BLORP_MEMORY_DIAGNOSTICS
+		|struct blorp_string_literal_site *next; /* Registry link, set with value. */
+		|#endif
+		|};
+		|#if BLORP_MEMORY_DIAGNOSTICS
+		|static struct blorp_string_literal_site *blorp_string_literal_sites;
+		|#endif
+		|/* Single-threaded: Blorp 2 has no threads. Concurrency must publish value
+		| * with a compare-exchange whose loser frees its copy. */
+		|struct blorp_string *blorp_string_literal(struct blorp_string_literal_site *site,const char *bytes,int64_t length) {
+		|if(site->value==NULL){
+		|site->value=blorp_string_from_bytes(bytes,length);
+		|atomic_store_explicit(&site->value->references,BLORP_STRING_LITERAL_REFERENCES,memory_order_relaxed);
+		|#if BLORP_MEMORY_DIAGNOSTICS
+		|site->next=blorp_string_literal_sites;
+		|blorp_string_literal_sites=site;
+		|#endif
+		|}
+		|blorp_string_retain(site->value);
+		|return site->value;
+		|}
+		|#if BLORP_MEMORY_DIAGNOSTICS
+		|/* Every program value is dead at exit, so each literal must be back at its
+		| * base; drift is an ownership bug the base would otherwise hide. Frees every
+		| * literal so accounting balances. Returns the exit status to report. */
+		|int blorp_string_literals_finish(int requested_exit_status) {
+		|size_t unbalanced=0;
+		|for(struct blorp_string_literal_site *site=blorp_string_literal_sites;site!=NULL;site=site->next){
+		|if(atomic_load_explicit(&site->value->references,memory_order_relaxed)!=BLORP_STRING_LITERAL_REFERENCES){unbalanced++;}
+		|blorp_memory_release(site->value);
+		|site->value=NULL;
+		|}
+		|blorp_string_literal_sites=NULL;
+		|if(!blorp_memory_strict||unbalanced==0){return requested_exit_status;}
+		|fprintf(stderr,"blorp: leak check: unbalanced string literals: %zu\n",unbalanced);
+		|return BLORP_STRICT_LEAK_EXIT_STATUS;
+		|}
+		|#else
+		|#define blorp_string_literals_finish(requested_exit_status) (requested_exit_status)
+		|#endif
 		|
 
 

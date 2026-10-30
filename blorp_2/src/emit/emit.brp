@@ -216,13 +216,19 @@ private pure func append_integer(output: String, value: Int) -> String:
 
 -- Function-local static data has fixed syntactic depth and no C string-token
 -- length limit or automatic array storage. Existing ValueIds distinguish the
--- backing bytes; each evaluation still constructs an ordinary fresh String.
+-- backing bytes and the site, whose shared String the runtime creates on the
+-- site's first evaluation; each evaluation acquires one reference to it.
 private pure func c_literal_bytes(id: ValueId) -> String:
 	"blorp_bytes_".append_int(value_number(id))
 
 
-private pure func append_string_bytes(output: String, id: ValueId, bytes: String) -> String:
-	append_byte_array(output, c_literal_bytes(id), bytes)
+private pure func c_literal_site(id: ValueId) -> String:
+	"blorp_literal_".append_int(value_number(id))
+
+
+private pure func append_string_literal_site(output: String, id: ValueId, bytes: String) -> String:
+	data = append_byte_array(output, c_literal_bytes(id), bytes)
+	"${data}static struct blorp_string_literal_site ${c_literal_site(id)};"
 
 
 private pure func append_byte_array(output: String, name: String, bytes: String) -> String:
@@ -1007,7 +1013,7 @@ private pure func append_operation(
 		FloatDefinition(value):
 			Ok(output.concat(c_float_literal(value)))
 		StringDefinition(bytes):
-			constructor = "${output}blorp_string_from_bytes((const char *)${c_literal_bytes(id)}"
+			constructor = "${output}blorp_string_literal(&${c_literal_site(id)},(const char *)${c_literal_bytes(id)}"
 			length = append_integer(
 				"${constructor},",
 				bytes.length(),
@@ -1569,7 +1575,7 @@ private pure func append_regular_value(
 
 	prepared = match operation:
 		StringDefinition(bytes):
-			append_string_bytes(output, id, bytes)
+			append_string_literal_site(output, id, bytes)
 		_:
 			output
 
@@ -3042,6 +3048,17 @@ pure func aggregate_runtime(program: VerifiedProgram) -> Result[String, Diagnost
 	aggregate_runtime_contents(checked, list_layouts(inventory), list_update_helpers(inventory), callable_types(inventory.types))
 
 
+-- Every exit from main reports through this one function. A diagnostic build
+-- of a program with Strings first retires its shared literals, so strict
+-- accounting can check them and count each one's release.
+private pure func program_finish_definition(string_types: Bool) -> String:
+	finished_status = if string_types:
+		"blorp_string_literals_finish(status)"
+	else:
+		"status"
+	"static int blorp_program_finish(int status){return blorp_memory_finish(${finished_status});}\n"
+
+
 pure func emit(program: VerifiedProgram) -> Result[String, Diagnostic]:
 	checked = verified_contents(program)
 	records = checked.records
@@ -3171,26 +3188,26 @@ pure func emit(program: VerifiedProgram) -> Result[String, Diagnostic]:
 		Some(error):
 			Err(error)
 		None:
-			output = fragments.join("")
+			output = fragments.append(program_finish_definition(requirements.string_types)).join("")
 			name = c_name(function_number(entry_function(checked.entrypoint)))
 
 			wrapper = match checked.entrypoint:
 				NoArguments(_, IntegerExitStatus):
-					"${output}int main(void){blorp_memory_start();return blorp_memory_finish((int)${name}());}\n"
+					"${output}int main(void){blorp_memory_start();return blorp_program_finish((int)${name}());}\n"
 				NoArguments(_, SuccessfulExit):
-					"${output}int main(void){blorp_memory_start();(void)${name}();return blorp_memory_finish(0);}\n"
+					"${output}int main(void){blorp_memory_start();(void)${name}();return blorp_program_finish(0);}\n"
 				WithArguments(_, result):
 					prefix = output.concat(
 						"int main(int argc,char **argv){blorp_memory_start();struct blorp_l_0_s *const blorp_arguments=blorp_list_from_argv(argc,argv);",
 					).concat(
-						"if(blorp_arguments==NULL){fputs(\"error: command-line argument is not valid UTF-8\\nhelp: pass UTF-8 encoded arguments\\n\",stderr);return blorp_memory_finish(1);}",
+						"if(blorp_arguments==NULL){fputs(\"error: command-line argument is not valid UTF-8\\nhelp: pass UTF-8 encoded arguments\\n\",stderr);return blorp_program_finish(1);}",
 					)
 
 					match result:
 						IntegerExitStatus:
 							"${prefix}const int64_t blorp_result=${name}(blorp_arguments);blorp_list_drop_0_s(blorp_arguments);"
-								.concat("return blorp_memory_finish((int)blorp_result);}\n")
+								.concat("return blorp_program_finish((int)blorp_result);}\n")
 						SuccessfulExit:
-							"${prefix}(void)${name}(blorp_arguments);blorp_list_drop_0_s(blorp_arguments);return blorp_memory_finish(0);}\n"
+							"${prefix}(void)${name}(blorp_arguments);blorp_list_drop_0_s(blorp_arguments);return blorp_program_finish(0);}\n"
 
 			Ok(wrapper)

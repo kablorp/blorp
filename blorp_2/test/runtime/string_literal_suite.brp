@@ -1,0 +1,91 @@
+import:
+    ../../src/runtime/memory: MEMORY_RUNTIME
+    ../../src/runtime/string: string_runtime
+    process: run_to_files
+    system: read_file, write_file
+    io: print_error
+    test: TestSuite
+    int: Int methods
+    string: String methods
+    bool: and
+
+
+fixed record ProbeRun { status: Int, stdout: String, stderr: String }
+
+
+private ENVIRONMENT_TOOL: String = "/usr/bin/env"
+private COMPILE_TIMEOUT_MS: Int = 600000
+private CHILD_TIMEOUT_MS: Int = 10000
+-- The memory runtime's BLORP_STRICT_LEAK_EXIT_STATUS.
+private STRICT_LEAK_EXIT_STATUS: Int = 99
+-- The probe creates two literal Strings, one per site; teardown frees both.
+private STRICT_TOTAL: String = "blorp: leak check: 2 allocs, 2 releases, 0 leaked, 0 bytes\n"
+private UNBALANCED_LINE: String = "blorp: leak check: unbalanced string literals: 1\n"
+
+
+private func ready(c_compiler: String, directory: String) -> Result[String, String]:
+    _ ?= write_file(directory.add("/memory_runtime.c"), MEMORY_RUNTIME)
+    _ ?= write_file(directory.add("/string_runtime.c"), string_runtime())
+    executable = directory.add("/string_literal_probe")
+    prefix = directory.add("/string-literal-build")
+    status ?= run_to_files(c_compiler, ["-std=c11", "-O0", "-Wall", "-Wextra", "-Werror", "-pedantic", "-fsanitize=address,undefined", "-fno-sanitize-recover=all", "-DBLORP_MEMORY_DIAGNOSTICS=1", "-I", directory, "blorp_2/test/runtime/fixtures/string_literal_test.c", "-o", executable], prefix.add(".out"), prefix.add(".err"), COMPILE_TIMEOUT_MS)
+    err ?= read_file(prefix.add(".err"))
+    if status.equals(0).and(err.equals("")):
+        Ok(executable)
+    else:
+        Err("string literal native build: ".add(err))
+
+
+-- Strict runs set BLORP_LEAK_CHECK; the others are diagnostic builds without it.
+private func run_probe(executable: String, directory: String, mode: String, strict: Bool) -> Result[ProbeRun, String]:
+    (label, leak_check) = if strict:
+        ("-strict", ["BLORP_LEAK_CHECK=strict"])
+    else:
+        ("-plain", ["-u", "BLORP_LEAK_CHECK"])
+    prefix = directory.add("/string-literal-").add(mode).add(label)
+    arguments = ["-u", "BLORP_MEMORY_STATS", "-u", "BLORP_ALLOCATION_SITES"].concat(leak_check).concat([executable, mode])
+    status ?= run_to_files(ENVIRONMENT_TOOL, arguments, prefix.add(".out"), prefix.add(".err"), CHILD_TIMEOUT_MS)
+    out ?= read_file(prefix.add(".out"))
+    err ?= read_file(prefix.add(".err"))
+    Ok({ status = status, stdout = out, stderr = err })
+
+
+private func expect(label: String, actual: String, expected: String) -> Result[Void, String]:
+    if actual.equals(expected):
+        Ok(void)
+    else:
+        Err(label.add(": expected [").add(expected).add("] got [").add(actual).add("]"))
+
+
+private func outcome(executable: String, directory: String, mode: String, strict: Bool, status: Int, stderr: String) -> Bool:
+    checked: Result[Void, String] = match run_probe(executable, directory, mode, strict):
+        Err(error): Err(error)
+        Ok(run):
+            match expect(mode.add(" exit status"), run.status.to_string(), status.to_string()):
+                Err(error): Err(error)
+                Ok(_):
+                    match expect(mode.add(" stdout"), run.stdout, ""):
+                        Err(error): Err(error)
+                        Ok(_): expect(mode.add(" stderr"), run.stderr, stderr)
+    match checked:
+        Ok(_): True
+        Err(error):
+            print_error(error)
+            False
+
+
+func suite(c_compiler: String, directory: String) -> TestSuite:
+    match ready(c_compiler, directory):
+        Err(error):
+            print_error(error)
+            { description = "String literal setup", tests = [("native probe builds", func(): False)] }
+        Ok(executable):
+            {
+                description = "Shared String literals",
+                tests = [
+                    ("balanced literals are freed once at exit", func(): outcome(executable, directory, "balanced", True, 0, STRICT_TOTAL)),
+                    ("an over-released literal fails the strict check", func(): outcome(executable, directory, "over_release", True, STRICT_LEAK_EXIT_STATUS, UNBALANCED_LINE.add(STRICT_TOTAL))),
+                    ("an under-released literal fails the strict check", func(): outcome(executable, directory, "under_release", True, STRICT_LEAK_EXIT_STATUS, UNBALANCED_LINE.add(STRICT_TOTAL))),
+                    ("without the strict check an unbalanced literal still exits 0", func(): outcome(executable, directory, "under_release", False, 0, "")),
+                ]
+            }

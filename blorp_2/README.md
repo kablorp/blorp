@@ -921,6 +921,31 @@ ceilings. The native purity example exited 1 with empty stdout and stderr.
 Neither final run rebuilt the shared compiler binaries. The cost record retains
 the earlier measurements and final validation provenance.
 
+### Shared String literals
+
+A string literal allocates only on its site's first evaluation, which creates
+the site's String. Its reference count starts at
+`BLORP_STRING_LITERAL_REFERENCES` (`SIZE_MAX/2`); every evaluation retains it
+and every drop releases it, as for any String. No program holds half the
+address space in references, so the count never reaches 1, where an append
+would reuse the storage instead of copying, or 0, where a release would free
+it. A literal therefore stays intact and lives for the whole run. Appending to
+a literal copies it once, where a fresh literal used to grow in place.
+
+A literal that is never freed would hide its own ownership bugs, because a
+missing or extra release only moves a count far from 1 and 0. Diagnostic
+builds therefore list each created literal, and every `main` exits through
+`blorp_program_finish`, which in a program with Strings first runs
+`blorp_string_literals_finish`. Under
+`BLORP_LEAK_CHECK=strict` it requires every literal to be back at exactly the
+base, since every program value has been dropped by then; otherwise it prints
+`blorp: leak check: unbalanced string literals: N` and the run exits with the
+strict leak status. Every diagnostic run then frees each literal, so the strict
+report counts each used literal as one allocation and one release. `=0` builds
+keep only the per-site cache: no list, no exit check and no frees. Creation is
+not atomic, since Blorp 2 has no threads yet; concurrency will need a
+compare-exchange whose loser frees its copy.
+
 ## Generic function example
 
 [`generic/identity.brp`](test/e2e/fixtures/generic/identity.brp) uses one
@@ -2207,8 +2232,10 @@ func main() -> Int:
 
 It exits 5. A literal may also appear directly in calls, bindings, supported
 union payloads and match arms. Copies, returns, reassignment and unused values
-follow the existing ownership rules. Each evaluated literal creates one mortal
-String allocation; a borrowed result acquires its own ownership obligation.
+follow the existing ownership rules. Each evaluation of a literal owns one
+reference to that literal's shared String (see
+[Shared String literals](#shared-string-literals)); a borrowed result acquires
+its own ownership obligation.
 
 Quoted contents accept valid UTF-8. `length` counts UTF-8 bytes, matching the
 existing library: `"é".length()` is 2 and `"🙂".length()` is 4. Composed and
@@ -2256,14 +2283,15 @@ decoding does not create aliases for closed runtime operations. The
 [String report](https://github.com/kablorp/blorp/blob/1e07c4dce85e51cd7ad911142e9bc96a5e0d91c7/benchmarks/results/blorp_2_strings_2026-10-11.md) records construction and validation evidence.
 Emission uses flat static byte arrays scoped to their function and named from
 existing value identities. Backing bytes require no stack initialization and
-avoid C string-token length limits; the runtime copies them into an ordinary
-owned String on each evaluation.
+avoid C string-token length limits. Each site also declares a zero-initialized
+static `struct blorp_string_literal_site`, from which the runtime creates the
+site's shared String once.
 
 [Retained validation and costs](https://github.com/kablorp/blorp/blob/1e07c4dce85e51cd7ad911142e9bc96a5e0d91c7/benchmarks/results/blorp_2_strings_2026-10-11.md)
 cover the 15 new native fixtures, exact byte/lifetime tests, full suites and
 frozen existing-workload comparison. Long-literal probes also identify a
 bounded follow-up: the current host concat helper copies growing buffers in
-byte emission (`append_string_bytes`). Escape decoding no longer does; the
+byte emission (`append_byte_array`). Escape decoding no longer does; the
 [String decoding report](https://github.com/kablorp/blorp/blob/1e07c4dce85e51cd7ad911142e9bc96a5e0d91c7/benchmarks/results/blorp_2_string_decoding_2026-10-16.md)
 has the measurements.
 
