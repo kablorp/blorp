@@ -161,7 +161,8 @@ No representation or output changes. Re-run each grep before deleting.
     are "rejected until" a milestone.
   - Fix `errors.brp`'s reference to `check_render`.
   - Replace `declarations.brp`'s bare "step 2c" with the concept it names.
-- **Unread guard bindings:** `ready: Void ?= ...` becomes `_ ?= ...`. This is
+- **Unread guard bindings:** `ready: Void ?= ...` becomes `_: Void ?= ...`; the
+  annotation stays because a bare constructor needs an expected type. This is
   line-neutral but makes intent visible.
 - **Standard library README:** it says "Traits and FFI remain inactive" and
   states a trait-placement rule that `Equatable` does not follow.

@@ -26,8 +26,10 @@ Int/Float/String/List implementations. Equality imports name this one family,
 so aliases and contextual callable references dispatch by the actual receiver.
 `Orderable` requires `less_than` and defaults `greater_than`, `less_than_or_equal`
 and `greater_than_or_equal` from it; the defaults assume a total order. A library
-module may implement a trait declared in `_base` for a type declared in `_base`,
-so `int.brp` and `float.brp` implement Orderable for Int and Float.
+module may implement a trait declared in `_base`, or the canonical Equatable, for
+a type declared in `_base`: `int.brp`
+and `float.brp` implement Equatable and Orderable, and `string.brp` and
+`list.brp` implement Equatable.
 
 `bool.brp` defines pure, ordinary `not`, `and` and `or`; select them explicitly
 with `bool: not, and, or` for direct calls and UFCS. Both binary arguments are eager;
@@ -183,7 +185,7 @@ exposes strict counted-byte `parse_int`, `parse_float` and `equals` operations.
 Their builtin bodies name only the operation; results refer to the
 foundation's designated Bool and Option, found by name in `_base.brp`, and
 layout follows the unions' declaration order. Each adapter records its upstream
-provenance. Traits and FFI remain inactive.
+provenance. FFI remains inactive.
 
 `string.starts_with` is an ordinary pure counted-byte prefix helper.
 `string.slice(String, Int, Int) -> Option[String]` uses half-open UTF-8 byte
