@@ -726,6 +726,41 @@ private pure func list_separator(state: ParserState) -> ListSeparator:
 			ListContinues(after_comma)
 
 
+-- One parsed list item and the state after it.
+private fixed record ParsedItem[Item] {
+	item: Item,
+	next: ParserState
+}
+
+
+private fixed record ParsedList[Item] {
+	items: List[Item],
+	next: ParserState
+}
+
+
+-- The comma-separated items of a parenthesized list, after the items already
+-- read; an empty list or a trailing comma ends at the closing parenthesis,
+-- which the caller expects. `parse_item` receives how many items precede it,
+-- for a limit on the count, and its error ends the list.
+private pure func consume_parenthesized_items[Item](
+	state: ParserState,
+	items: List[Item],
+	parse_item: pure (Int, ParserState) -> Result[ParsedItem[Item], Diagnostic],
+) -> Result[ParsedList[Item], Diagnostic]:
+	if at_right_paren(state):
+		Ok({ items = items, next = state })
+	else:
+		match parse_item(items.length(), state):
+			Err(error): Err(error)
+			Ok(parsed):
+				gathered = items.append(parsed.item)
+
+				match list_separator(parsed.next):
+					ListContinues(next): consume_parenthesized_items(next, gathered, parse_item)
+					ListEnds(next): Ok({ items = gathered, next = next })
+
+
 -- Consumes the token at `state` when the caller's match found it `present`.
 private pure func expect(state: ParserState, present: Bool, message: String, help: String) -> Result[ParserState, Diagnostic]:
 	if present:
@@ -1778,14 +1813,14 @@ private pure func consume_lambda(start: ParserState) -> Result[ParsedValue, Diag
 		Impure:
 			Ok(shifted(start, 1))
 	opened ?= expect(after_function, at_left_paren(after_function), "expected `(` after lambda `func`", "write the parameters or arguments inside parentheses")
-	parameters ?= consume_lambda_parameters(opened)
+	parameters ?= consume_parenthesized_items(opened, [], consume_lambda_parameter)
 	closed ?= expect(parameters.next, at_right_paren(parameters.next), "expected `)` after lambda parameters", "close the parenthesis opened earlier with `)`")
 	returns ?= consume_optional_return_type(closed)
 	colon ?= expect(returns.next, at_colon(returns.next), "expected `:` before lambda body", BLOCK_HEADER_HELP)
 	body ?= consume_lambda_body(with_context(colon, InsideLambda))
 	lambda: ParsedLambda = {
 		purity = purity,
-		parameters = parameters.binders,
+		parameters = parameters.items,
 		return_type = returns.written,
 		body = body.body,
 		span = { keyword | end = body.end }
@@ -1799,57 +1834,14 @@ private pure func consume_lambda(start: ParserState) -> Result[ParsedValue, Diag
 	})
 
 
--- Named apart from ParsedParameters, whose literal shape it would share.
-private fixed record LambdaParameters {
-	binders: List[LambdaParameter],
-	next: ParserState
-}
-
-
--- `state` follows the opening parenthesis: zero or more `name [: Type]`
--- or `_ [: Type]`, comma-separated with an optional trailing comma; the
--- caller expects the closing parenthesis.
-private pure func consume_lambda_parameters(state: ParserState) -> Result[LambdaParameters, Diagnostic]:
-	var current = state
-	var binders: List[LambdaParameter] = []
-	var failure: Option[Diagnostic] = None
-
-	if at_right_paren(current).not():
-		while True:
-			match consume_lambda_parameter(current):
-				Err(error):
-					failure = Some(error)
-					break
-				Ok(parameter):
-					binders = binders.append(parameter.parameter)
-
-					match list_separator(parameter.next):
-						ListContinues(next):
-							current = next
-						ListEnds(next):
-							current = next
-							break
-
-	_: Void ?= match failure:
-		Some(error): Err(error)
-		None: Ok(void)
-	Ok({ binders = binders, next = current })
-
-
-private fixed record LambdaParameterResult {
-	parameter: LambdaParameter,
-	next: ParserState
-}
-
-
 private LAMBDA_PARAMETER_HELP: String = "write an identifier here; it starts with a letter or `_` and is not a reserved keyword"
 
 
 -- A name or `_`, then an optional annotation.
-private pure func consume_lambda_parameter(state: ParserState) -> Result[LambdaParameterResult, Diagnostic]:
+private pure func consume_lambda_parameter(_count: Int, state: ParserState) -> Result[ParsedItem[LambdaParameter], Diagnostic]:
 	binder ?= consume_lambda_binder(state)
 	annotation ?= consume_optional_annotation(binder.next, "expected a parameter type")
-	Ok({ parameter = { binder = binder.binder, annotation = annotation.written }, next = annotation.next })
+	Ok({ item = { binder = binder.binder, annotation = annotation.written }, next = annotation.next })
 
 
 -- A reserved word reports itself; any other non-name token gets the host's
@@ -2024,13 +2016,7 @@ private pure func enclosed_value(member: EnclosedMember) -> Result[ValueExpressi
 		ValueMember(value): Ok(value)
 
 
-private fixed record ParsedMember {
-	member: EnclosedMember,
-	next: ParserState
-}
-
-
-private pure func consume_enclosed_member(state: ParserState) -> Result[ParsedMember, Diagnostic]:
+private pure func consume_enclosed_member(state: ParserState) -> Result[ParsedItem[EnclosedMember], Diagnostic]:
 	after = shifted(state, 1)
 	bare = and(or(at_identifier(state), at_wildcard(state)), or(at_comma(after), at_right_paren(after)))
 	if and(or(at_identifier(state), at_wildcard(state)), at_colon(after)):
@@ -2039,13 +2025,13 @@ private pure func consume_enclosed_member(state: ParserState) -> Result[ParsedMe
 		consume_bare_member(state)
 	else:
 		match consume_value(state):
-			Ok(value): Ok({ member = ValueMember(value.body), next = value.next })
+			Ok(value): Ok({ item = ValueMember(value.body), next = value.next })
 			Err(error): Err(error)
 
 
-private pure func consume_bare_member(state: ParserState) -> Result[ParsedMember, Diagnostic]:
+private pure func consume_bare_member(state: ParserState) -> Result[ParsedItem[EnclosedMember], Diagnostic]:
 	binder ?= consume_binder(state, "expected a tuple element")
-	Ok({ member = BareMember(binder.binder), next = binder.next })
+	Ok({ item = BareMember(binder.binder), next = binder.next })
 
 
 private fixed union EnclosedContents:
@@ -2067,7 +2053,7 @@ private pure func consume_enclosed_values(start: ParserState, opening: Span) -> 
 	if at_comma(first.next).not():
 		match expect(first.next, at_right_paren(first.next), "expected ')' after the grouped expression", "close the parentheses after one expression; UFCS and field reads may follow ')'"):
 			Ok(closed):
-				match enclosed_value(first.member):
+				match enclosed_value(first.item):
 					Err(error): Err(error)
 					Ok(value): Ok({ contents = GroupedContents(value), span = { opening | end = parser_span(first.next).end }, next = with_enclosure(closed, start.enclosure) })
 			Err(error): Err(error)
@@ -2075,36 +2061,26 @@ private pure func consume_enclosed_values(start: ParserState, opening: Span) -> 
 		consume_tuple_values(start, opening, first)
 
 
-private pure func consume_tuple_values(start: ParserState, opening: Span, first: ParsedMember) -> Result[ParsedEnclosed, Diagnostic]:
-	var current = shifted(first.next, 1)
-	var members: List[EnclosedMember] = [first.member]
-	var failure: Option[Diagnostic] = None
-	while and(at_right_paren(current).not(), failure.is_none()):
-		match consume_enclosed_member(current):
-			Err(error): failure = Some(error)
-			Ok(member):
-				if members.length() == TUPLE_MAXIMUM_ELEMENTS:
-					span = match member.member:
-						BareMember(NamedBinder(name)): name.span
-						BareMember(DiscardBinder(span)): span
-						ValueMember(value): value.span
-					failure = Some(diagnostic(span, "tuples support two to four elements", TUPLE_SIZE_HELP))
-				else:
-					members = members.append(member.member)
-					match list_separator(member.next):
-						ListContinues(next): current = next
-						ListEnds(next):
-							current = next
-							break
-	_: Void ?= match failure:
-		Some(error): Err(error)
-		None: Ok(void)
-	closed ?= expect(current, at_right_paren(current), "expected ')' after the tuple elements", "separate complete expressions with commas, then close the tuple with ')'")
-	span = { opening | end = parser_span(current).end }
-	if members.length().less_than(TUPLE_MINIMUM_ELEMENTS):
+private pure func consume_tuple_values(start: ParserState, opening: Span, first: ParsedItem[EnclosedMember]) -> Result[ParsedEnclosed, Diagnostic]:
+	listed ?= consume_parenthesized_items(shifted(first.next, 1), [first.item], consume_tuple_element)
+	closed ?= expect(listed.next, at_right_paren(listed.next), "expected ')' after the tuple elements", "separate complete expressions with commas, then close the tuple with ')'")
+	span = { opening | end = parser_span(listed.next).end }
+	if listed.items.length().less_than(TUPLE_MINIMUM_ELEMENTS):
 		Err(diagnostic(span, "a tuple requires two to four elements", "write the value itself for one element, or [value] for a one-element List"))
 	else:
-		Ok({ contents = TupleContents(members), span = span, next = with_enclosure(closed, start.enclosure) })
+		Ok({ contents = TupleContents(listed.items), span = span, next = with_enclosure(closed, start.enclosure) })
+
+
+private pure func consume_tuple_element(count: Int, state: ParserState) -> Result[ParsedItem[EnclosedMember], Diagnostic]:
+	member ?= consume_enclosed_member(state)
+	if count == TUPLE_MAXIMUM_ELEMENTS:
+		span = match member.item:
+			BareMember(NamedBinder(name)): name.span
+			BareMember(DiscardBinder(span)): span
+			ValueMember(value): value.span
+		Err(diagnostic(span, "tuples support two to four elements", TUPLE_SIZE_HELP))
+	else:
+		Ok(member)
 
 
 private pure func finish_enclosed_value(enclosed: ParsedEnclosed) -> Result[ParsedValue, Diagnostic]:
@@ -2359,31 +2335,14 @@ private fixed record PatternFields {
 
 -- `state` follows the opening parenthesis.
 private pure func consume_pattern_fields(state: ParserState) -> Result[PatternFields, Diagnostic]:
-	var current = state
-	var fields: List[ParsedPattern] = []
-	var failure: Option[Diagnostic] = None
+	listed ?= consume_parenthesized_items(state, [], consume_pattern_field)
+	closed ?= expect(listed.next, at_right_paren(listed.next), "expected ')' after the constructor pattern", "write one pattern per field, such as Pair(left, _)")
+	Ok({ fields = listed.items, end = parser_span(listed.next).end, next = closed })
 
-	if at_right_paren(current).not():
-		while True:
-			match consume_pattern(current):
-				Err(error):
-					failure = Some(error)
-					break
-				Ok(field):
-					fields = fields.append(field.pattern)
 
-					match list_separator(field.next):
-						ListContinues(next):
-							current = next
-						ListEnds(next):
-							current = next
-							break
-
-	_: Void ?= match failure:
-		Some(error): Err(error)
-		None: Ok(void)
-	closed ?= expect(current, at_right_paren(current), "expected ')' after the constructor pattern", "write one pattern per field, such as Pair(left, _)")
-	Ok({ fields = fields, end = parser_span(current).end, next = closed })
+private pure func consume_pattern_field(_count: Int, state: ParserState) -> Result[ParsedItem[ParsedPattern], Diagnostic]:
+	field ?= consume_pattern(state)
+	Ok({ item = field.pattern, next = field.next })
 
 
 -- `opening` is at the '(' after a bare or qualified head; the pattern spans
@@ -2453,31 +2412,21 @@ private pure func consume_list_pattern(start: ParserState, opening: Span) -> Res
 
 
 private pure func consume_tuple_pattern(start: ParserState, opening: Span) -> Result[PatternResult, Diagnostic]:
-	var current = start
-	var fields: List[ParsedPattern] = []
-	var failure: Option[Diagnostic] = None
-	while and(at_right_paren(current).not(), failure.is_none()):
-		match consume_pattern(current):
-			Err(error): failure = Some(error)
-			Ok(field):
-				if fields.length() == TUPLE_MAXIMUM_ELEMENTS:
-					failure = Some(diagnostic(field.span, "tuple patterns support two to four elements", TUPLE_SIZE_HELP))
-				else:
-					fields = fields.append(field.pattern)
-					match list_separator(field.next):
-						ListContinues(next): current = next
-						ListEnds(next):
-							current = next
-							break
-	_: Void ?= match failure:
-		Some(error): Err(error)
-		None: Ok(void)
-	closed ?= expect(current, at_right_paren(current), "expected ')' after the tuple pattern", "separate two to four patterns with commas, such as (first, _)")
-	span = { opening | end = parser_span(current).end }
-	if fields.length().less_than(TUPLE_MINIMUM_ELEMENTS):
+	listed ?= consume_parenthesized_items(start, [], consume_tuple_pattern_field)
+	closed ?= expect(listed.next, at_right_paren(listed.next), "expected ')' after the tuple pattern", "separate two to four patterns with commas, such as (first, _)")
+	span = { opening | end = parser_span(listed.next).end }
+	if listed.items.length().less_than(TUPLE_MINIMUM_ELEMENTS):
 		Err(diagnostic(span, "a tuple pattern requires two to four elements", "write two to four comma-separated patterns, such as (first, _)"))
 	else:
-		Ok({ pattern = PatternTuple(fields, span), span = span, next = closed })
+		Ok({ pattern = PatternTuple(listed.items, span), span = span, next = closed })
+
+
+private pure func consume_tuple_pattern_field(count: Int, state: ParserState) -> Result[ParsedItem[ParsedPattern], Diagnostic]:
+	field ?= consume_pattern(state)
+	if count == TUPLE_MAXIMUM_ELEMENTS:
+		Err(diagnostic(field.span, "tuple patterns support two to four elements", TUPLE_SIZE_HELP))
+	else:
+		Ok({ item = field.pattern, next = field.next })
 
 
 -- A String or Char literal token at `state` as a pattern, or None when
@@ -2889,36 +2838,28 @@ private pure func consume_for_binder(state: ParserState) -> Result[ForBinderResu
 
 
 private pure func consume_tuple_for_binder(state: ParserState) -> Result[ForBinderResult, Diagnostic]:
-	var current = shifted(state, 1)
-	var binders: List[ParsedBinder] = []
-	var failure: Option[Diagnostic] = None
-	while and(at_right_paren(current).not(), failure.is_none()):
-		if at_left_paren(current):
-			failure = Some(expected_syntax(current, FLAT_TUPLE_MESSAGE, FLAT_TUPLE_HELP))
-		else:
-			match consume_binder(current, FLAT_TUPLE_MESSAGE):
-				Err(error): failure = Some(error)
-				Ok(binder):
-					if at_colon(binder.next):
-						failure = Some(expected_syntax(binder.next, TUPLE_BINDER_ANNOTATION_MESSAGE, TUPLE_BINDER_ANNOTATION_HELP))
-					else if binders.length() == TUPLE_MAXIMUM_ELEMENTS:
-						failure = Some(expected_syntax(current, "tuple binders support two to four elements", TUPLE_SIZE_HELP))
-					else:
-						binders = binders.append(binder.binder)
-						match list_separator(binder.next):
-							ListContinues(next): current = next
-							ListEnds(next):
-								current = next
-								break
-	_: Void ?= match failure:
-		Some(error): Err(error)
-		None: Ok(void)
-	closed ?= expect(current, at_right_paren(current), FLAT_TUPLE_MESSAGE, FLAT_TUPLE_HELP)
-	span = { parser_span(state) | end = parser_span(current).end }
-	if binders.length().less_than(TUPLE_MINIMUM_ELEMENTS):
+	listed ?= consume_parenthesized_items(shifted(state, 1), [], consume_tuple_binder)
+	closed ?= expect(listed.next, at_right_paren(listed.next), FLAT_TUPLE_MESSAGE, FLAT_TUPLE_HELP)
+	span = { parser_span(state) | end = parser_span(listed.next).end }
+	if listed.items.length().less_than(TUPLE_MINIMUM_ELEMENTS):
 		Err(diagnostic(span, "tuple destructuring requires two to four names", "write two to four comma-separated names or '_', such as (first, _)"))
 	else:
-		Ok({ binder = TupleForBinder(binders, span), next = closed })
+		Ok({ binder = TupleForBinder(listed.items, span), next = closed })
+
+
+private pure func consume_tuple_binder(count: Int, state: ParserState) -> Result[ParsedItem[ParsedBinder], Diagnostic]:
+	if at_left_paren(state):
+		Err(expected_syntax(state, FLAT_TUPLE_MESSAGE, FLAT_TUPLE_HELP))
+	else:
+		match consume_binder(state, FLAT_TUPLE_MESSAGE):
+			Err(error): Err(error)
+			Ok(binder):
+				if at_colon(binder.next):
+					Err(expected_syntax(binder.next, TUPLE_BINDER_ANNOTATION_MESSAGE, TUPLE_BINDER_ANNOTATION_HELP))
+				else if count == TUPLE_MAXIMUM_ELEMENTS:
+					Err(expected_syntax(state, "tuple binders support two to four elements", TUPLE_SIZE_HELP))
+				else:
+					Ok({ item = binder.binder, next = binder.next })
 
 
 -- `state` is at `break` or `continue`: a statement of its own line, valid
