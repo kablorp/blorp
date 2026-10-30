@@ -3326,28 +3326,7 @@ private pure func consume_type_parameter(state: ParserState) -> Result[ParsedNam
 			Err(expected_syntax(state, "expected a type parameter name", "declare type parameters separated by commas, such as [A, B]"))
 
 
-private pure func consume_type_parameter_list(state: ParserState, parameters: List[WrittenName]) -> Result[NameList, Diagnostic]:
-	name ?= consume_type_parameter(state)
-	gathered = parameters.append(name.name)
-
-	match list_separator(name.next):
-		ListContinues(next):
-			consume_type_parameter_list(next, gathered)
-		ListEnds(next):
-			if at_right_bracket(next):
-				Ok({ names = gathered, next = shifted(next, 1) })
-			else:
-				Err(expected_syntax(next, "expected ',' or ']' after a type parameter", "separate type parameters with commas and close the list with ']'"))
-
-
-private pure func consume_type_parameters(state: ParserState) -> Result[NameList, Diagnostic]:
-	if at_left_bracket(state):
-		consume_type_parameter_list(shifted(state, 1), [])
-	else:
-		Ok({ names = [], next = state })
-
-
-private fixed record BoundedParameters {
+private fixed record TypeParameterList {
 	parameters: List[ParsedTypeParameter],
 	next: ParserState
 }
@@ -3361,16 +3340,22 @@ private pure func consume_parameter_bounds(state: ParserState, bounds: List[Type
 		_: Ok({ types = gathered, next = bound.next })
 
 
-private pure func consume_bounded_parameter_list(state: ParserState, parameters: List[ParsedTypeParameter]) -> Result[BoundedParameters, Diagnostic]:
+-- A bound is read only where `allows_bounds` is set; otherwise its `:` is not
+-- a separator and ends the list with the closing-bracket diagnostic.
+private pure func consume_type_parameter_list(
+	state: ParserState,
+	parameters: List[ParsedTypeParameter],
+	allows_bounds: Bool,
+) -> Result[TypeParameterList, Diagnostic]:
 	name ?= consume_type_parameter(state)
-	bounds: ParsedTypes ?= if at_colon(name.next):
+	bounds: ParsedTypes ?= if and(allows_bounds, at_colon(name.next)):
 		consume_parameter_bounds(shifted(name.next, 1), [])
 	else:
 		Ok({ types = [], next = name.next })
 	parameter: ParsedTypeParameter = { name = name.name, bounds = bounds.types }
 	gathered = parameters.append(parameter)
 	match list_separator(bounds.next):
-		ListContinues(next): consume_bounded_parameter_list(next, gathered)
+		ListContinues(next): consume_type_parameter_list(next, gathered, allows_bounds)
 		ListEnds(next):
 			if at_right_bracket(next):
 				Ok({ parameters = gathered, next = shifted(next, 1) })
@@ -3378,11 +3363,17 @@ private pure func consume_bounded_parameter_list(state: ParserState, parameters:
 				Err(expected_syntax(next, "expected ',' or ']' after a type parameter", "separate type parameters with commas and close the list with ']'"))
 
 
-private pure func consume_bounded_parameters(state: ParserState) -> Result[BoundedParameters, Diagnostic]:
+private pure func consume_type_parameters(state: ParserState, allows_bounds: Bool) -> Result[TypeParameterList, Diagnostic]:
 	if at_left_bracket(state):
-		consume_bounded_parameter_list(shifted(state, 1), [])
+		consume_type_parameter_list(shifted(state, 1), [], allows_bounds)
 	else:
 		Ok({ parameters = [], next = state })
+
+
+-- Nominal declarations keep their unbounded parameters as bare names.
+private pure func consume_type_parameter_names(state: ParserState) -> Result[NameList, Diagnostic]:
+	declared ?= consume_type_parameters(state, False)
+	Ok({ names = declared.parameters.map(pure func(parameter): parameter.name), next = declared.next })
 
 
 private fixed record ParsedReturnAnnotation {
@@ -3423,7 +3414,7 @@ private pure func consume_signature(start: ParserState) -> Result[HeaderResult, 
 		Impure:
 			expect(start, at_func(start), "expected a function declaration at column 1", "start with func main() -> Int:")
 	function ?= consume_callable_name(after_func, "expected a function name")
-	type_parameters ?= consume_bounded_parameters(function.next)
+	type_parameters ?= consume_type_parameters(function.next, True)
 	after_open ?= expect(type_parameters.next, at_left_paren(type_parameters.next), "expected '(' after the function name", "write main() or helper(value: Int)")
 	parameters ?= consume_parameters(after_open)
 	return_type ?= consume_return_annotation(parameters.next)
@@ -3647,7 +3638,7 @@ private pure func consume_implementation(start: ParserState, module: ModuleId, v
 		consume_type(after_keyword, "expected the implemented trait name")
 	after_for ?= expect(requirement.next, at_for(requirement.next), "expected 'for' after the trait name", "write implements Equatable for Int:")
 	receiver ?= consume_receiver_head(after_for)
-	parameters ?= consume_bounded_parameters(receiver.next)
+	parameters ?= consume_type_parameters(receiver.next, True)
 	methods ?= consume_implementation_body(parameters.next, module, visibility)
 	header_end = if at_colon(parameters.next):
 		parser_span(shifted(parameters.next, 1)).start
@@ -3737,7 +3728,7 @@ private pure func consume_union(start: ParserState, module: ModuleId, visibility
 	else:
 		Err(expected_syntax(after_fixed, "expected 'union' after 'fixed'", "write fixed union Choice: followed by indented variant names"))
 	name ?= consume_name(word, "expected a union type name")
-	type_parameters ?= consume_type_parameters(name.next)
+	type_parameters ?= consume_type_parameter_names(name.next)
 	colon ?= expect(type_parameters.next, at_colon(type_parameters.next), "expected ':' after the union type name", "write fixed union Choice: or fixed union Box[T]:")
 	newline ?= expect(colon, at_newline(colon), "expected a newline after the union header", "put each variant name on its own indented line")
 	opened ?= expect(newline, at_indent(newline), "expected an indented union variant", "declare at least one variant on an indented line")
@@ -3810,7 +3801,7 @@ private fixed record ParsedRecordResult {
 
 private pure func consume_record(start: ParserState, module: ModuleId, visibility: Visibility) -> Result[ParsedRecordResult, Diagnostic]:
 	name ?= consume_name(shifted(start, 2), "expected a record type name")
-	type_parameters ?= consume_type_parameters(name.next)
+	type_parameters ?= consume_type_parameter_names(name.next)
 	opened: ParserState ?= match current_symbol(type_parameters.next):
 		Some(LeftBrace):
 			Ok(shifted(type_parameters.next, 1))
