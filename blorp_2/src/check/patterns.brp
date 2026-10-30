@@ -650,36 +650,19 @@ private pure func list_skip(cursor: PatternCursor) -> Int:
 private pure func child_columns(parent: Column, head: Head, context: ResolutionContext, span: Span) -> Result[List[Column], CheckError]:
 	place = root_place(parent.cursor)
 	match head:
-		UnionHead(id, fields): union_child_columns(place, id, fields, context, span)
-		TupleHead(fields): tuple_child_columns(place, fields, context, span)
+		UnionHead(id, fields): field_columns(fields, pure func(ordinal: Int) -> CheckedPatternRoute: UnionField(place, id, ordinal), context, span)
+		TupleHead(fields): field_columns(fields, pure func(ordinal: Int) -> CheckedPatternRoute: RecordField(place, ordinal), context, span)
 		ConsHead(element): list_child_columns(place, list_skip(parent.cursor), element, context, span)
 		NilHead | StringHead(_): Ok([])
 
 
-private pure func union_child_columns(parent: CheckedPatternPlace, id: VariantId, fields: List[TypeRef], context: ResolutionContext, span: Span) -> Result[List[Column], CheckError]:
+-- One column per field; `route` names where the field at an ordinal sits.
+private pure func field_columns(fields: List[TypeRef], route: pure (Int) -> CheckedPatternRoute, context: ResolutionContext, span: Span) -> Result[List[Column], CheckError]:
 	var columns: List[Column] = []
 	var ordinal = 0
 	var failure: Option[CheckError] = None
 	for value_type in fields:
-		place: CheckedPatternPlace = { value_type = value_type, route = UnionField(parent, id, ordinal) }
-		match column(place, ValueCursor(place), context, span):
-			Ok(child): columns = columns.append(child)
-			Err(error):
-				failure = Some(error)
-				break
-		ordinal = ordinal.add(1)
-	_: Void ?= match failure:
-		Some(error): Err(error)
-		None: Ok(void)
-	Ok(columns)
-
-
-private pure func tuple_child_columns(parent: CheckedPatternPlace, fields: List[TypeRef], context: ResolutionContext, span: Span) -> Result[List[Column], CheckError]:
-	var columns: List[Column] = []
-	var ordinal = 0
-	var failure: Option[CheckError] = None
-	for value_type in fields:
-		place: CheckedPatternPlace = { value_type = value_type, route = RecordField(parent, ordinal) }
+		place: CheckedPatternPlace = { value_type = value_type, route = route(ordinal) }
 		match column(place, ValueCursor(place), context, span):
 			Ok(child): columns = columns.append(child)
 			Err(error):
@@ -917,12 +900,6 @@ private pure func check_alternatives(checks: List[AlternativeCheck], reached: Li
 		None: Ok(void)
 
 
-private fixed record BuiltSelection {
-	nodes: List[CheckedDecisionNode],
-	entry: DecisionNodeId
-}
-
-
 private pure func is_any(pattern: Pattern) -> Bool:
 	match pattern:
 		Anything: True
@@ -975,7 +952,7 @@ private pure func exclude_head(current: Column, head: Head) -> Column:
 		StringDomain | ScalarDomain: current
 
 
-private pure func compile_rows(rows: List[PatternRow], columns: List[Column], nodes: List[CheckedDecisionNode], context: ResolutionContext, span: Span) -> Result[BuiltSelection, CheckError]:
+private pure func compile_rows(rows: List[PatternRow], columns: List[Column], nodes: List[CheckedDecisionNode], context: ResolutionContext, span: Span) -> Result[CheckedSelection, CheckError]:
 	first ?= rows.get(0).to_result(checker_invariant(span, JoinWithoutArms))
 	if first.patterns.all(is_any):
 		Ok({ nodes = nodes.append(EnterArm(first.arm, first.arguments)), entry = decision_node_id(nodes.length()) })
@@ -983,7 +960,7 @@ private pure func compile_rows(rows: List[PatternRow], columns: List[Column], no
 		compile_structural(rows, columns, nodes, first.patterns, context, span)
 
 
-private pure func compile_structural(rows: List[PatternRow], columns: List[Column], nodes: List[CheckedDecisionNode], patterns: List[Pattern], context: ResolutionContext, span: Span) -> Result[BuiltSelection, CheckError]:
+private pure func compile_structural(rows: List[PatternRow], columns: List[Column], nodes: List[CheckedDecisionNode], patterns: List[Pattern], context: ResolutionContext, span: Span) -> Result[CheckedSelection, CheckError]:
 	position = structural_column(patterns)
 	ordered = move_rows(rows, position)
 	columns_ordered = move_first(columns, position)
@@ -997,7 +974,7 @@ private pure func compile_structural(rows: List[PatternRow], columns: List[Colum
 		_: compile_split(ordered, current, following, fields, head, nodes, context, span)
 
 
-private pure func compile_split(rows: List[PatternRow], current: Column, following: List[Column], fields: List[Column], head: Head, nodes: List[CheckedDecisionNode], context: ResolutionContext, span: Span) -> Result[BuiltSelection, CheckError]:
+private pure func compile_split(rows: List[PatternRow], current: Column, following: List[Column], fields: List[Column], head: Head, nodes: List[CheckedDecisionNode], context: ResolutionContext, span: Span) -> Result[CheckedSelection, CheckError]:
 	-- False successors are issued first, preserving the established flat selector
 	-- numbering. Both submatrices describe inhabited, exhaustive domains.
 	no ?= compile_rows(excluding_rows(rows, head), [exclude_head(current, head)].concat(following), nodes, context, span)
@@ -1050,18 +1027,13 @@ pure func finish_selection(rows: List[PatternRow], subject: PatternSubject, span
 	missing ?= useful(rows, [Anything], [root], context, span)
 	match missing:
 		Some(witnesses): reject_missing(rows, root, witnesses, context, span)
-		None: complete_selection(rows, root, context, span)
+		None: compile_rows(rows, [root], [], context, span)
 
 
 private pure func reject_missing(rows: List[PatternRow], root: Column, witnesses: List[PatternWitness], context: ResolutionContext, span: Span) -> Result[CheckedSelection, CheckError]:
 	witness ?= witnesses.get(0).to_result(checker_invariant(span, UnsupportedPatternReachedResolution))
 	error ?= missing_error(rows, root, witness, context, span)
 	Err(error)
-
-
-private pure func complete_selection(rows: List[PatternRow], root: Column, context: ResolutionContext, span: Span) -> Result[CheckedSelection, CheckError]:
-	built ?= compile_rows(rows, [root], [], context, span)
-	Ok({ nodes = built.nodes, entry = built.entry })
 
 
 -- Synthetic Bool/Result joins already own their designation and payload types.
