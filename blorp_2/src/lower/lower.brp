@@ -1,6 +1,6 @@
 import:
 	result: Result methods
-	bool: or
+	bool: and, not, or
 	../check/model:
 		BindingId, BindingOrigin(ParameterBinding, BodyLocal, MatchCapture), binding_id, binding_number,
 		MatchArmId, DecisionNodeId, ListLengthTest, match_arm_id, decision_node_id,
@@ -32,7 +32,7 @@ import:
 		ConcreteWhile,
 		ConcreteFor, ConcreteIteration(ListIteration, AscendingIntRange),
 		ConcreteUnion, VariantFieldInstanceId,
-		FieldInstanceId,
+		FieldInstanceId, field_number,
 		FunctionInstanceId,
 		FunctionSignature,
 		RecordInstanceId,
@@ -469,6 +469,7 @@ private fixed record BuiltArguments {
 private pure func lower_arguments(
 	builder: ExpressionBuilder,
 	bindings: List[Option[ValueId]],
+	base_projections: List[BaseProjection],
 	arguments: List[ConcreteExpr],
 	binding_facts: List[ConcreteBinding],
 ) -> Result[BuiltArguments, Diagnostic]:
@@ -477,7 +478,7 @@ private pure func lower_arguments(
 	var failure: Option[Diagnostic] = None
 
 	for argument in arguments:
-		match lower_value(current, bindings, argument, binding_facts):
+		match lower_value(current, bindings, base_projections, argument, binding_facts):
 			Err(error):
 				failure = Some(error)
 				break
@@ -506,6 +507,7 @@ private fixed record BuiltFields {
 private pure func lower_record_fields(
 	builder: ExpressionBuilder,
 	bindings: List[Option[ValueId]],
+	base_projections: List[BaseProjection],
 	fields: List[ConcreteRecordField],
 	binding_facts: List[ConcreteBinding],
 ) -> Result[BuiltFields, Diagnostic]:
@@ -514,7 +516,7 @@ private pure func lower_record_fields(
 	var failure: Option[Diagnostic] = None
 
 	for field in fields:
-		match lower_value(current, bindings, field.value, binding_facts):
+		match lower_value(current, bindings, base_projections, field.value, binding_facts):
 			Err(error):
 				failure = Some(error)
 				break
@@ -535,33 +537,159 @@ private pure func lower_record_fields(
 			})
 
 
--- The base, then the replacements in written order, then reads of the
--- inherited fields; the checker guarantees the two lists partition the fields.
+-- A projection of one base field, made before the replacements run. Identified
+-- by the base's value and the field, so a replacement's read of that field of
+-- that value resolves to it without matching spellings.
+private fixed record BaseProjection {
+	base: ValueId,
+	field: FieldInstanceId,
+	value: ValueId
+}
+
+
+-- Equal field numbers name one field because the base value is compared too:
+-- one base `ValueId` has one record type, and a field number is its position
+-- in that record.
+private pure func find_projection(
+	projections: List[BaseProjection],
+	base: ValueId,
+	field: FieldInstanceId,
+) -> Option[ValueId]:
+	var found: Option[ValueId] = None
+	for projection in projections:
+		match value_number(projection.base).equals(value_number(base)).and(field_number(projection.field).equals(field_number(field))):
+			True:
+				found = Some(projection.value)
+				break
+			False: void
+	found
+
+
+private fixed record ProjectedField {
+	builder: ExpressionBuilder,
+	projections: List[BaseProjection],
+	value: ValueId
+}
+
+
+-- The projection of `field` of `base`, defined here unless one exists. Every
+-- field the update reads is projected through this, so it is read once.
+private pure func project_once(
+	builder: ExpressionBuilder,
+	projections: List[BaseProjection],
+	base: ValueId,
+	field: FieldInstanceId,
+	value_type: TypeRef,
+	span: Span,
+) -> ProjectedField:
+	match find_projection(projections, base, field):
+		Some(existing):
+			{ builder = builder, projections = projections, value = existing }
+		None:
+			read = define_value(builder, ReadRecordFieldValue(field, base), value_type, span)
+			{ builder = read.builder, projections = projections.append({ base = base, field = field, value = read.value }), value = read.value }
+
+
+-- A read of a base field by a replacement; the first read gives the projection
+-- its type and span.
+private fixed record BaseRead {
+	field: FieldInstanceId,
+	value_type: TypeRef,
+	span: Span
+}
+
+
+-- The reads of the base binding's fields in `expression`, in evaluation order,
+-- added to `found`; a field read twice is listed twice. A read is
+-- `ReadRecordField` of the base binding. The scan does not enter a `Match`,
+-- whose arms are blocks that may reassign the binding, or a captured callable,
+-- whose body is a separate function. The checker accepts neither inside a
+-- replacement yet, so these arms are not reachable today. A path base such as
+-- `s.inner` is not a binding, so it is never scanned or hoisted.
+private pure func collect_base_reads(
+	found: List[BaseRead],
+	expression: ConcreteExpr,
+	base: BindingId,
+) -> List[BaseRead]:
+	match expression.form:
+		ReadRecordField(receiver, field):
+			match receiver.form:
+				ReadBinding(read):
+					match binding_number(read).equals(binding_number(base)):
+						True: found.append({ field = field, value_type = expression.value_type, span = expression.span })
+						False: found
+				_: collect_base_reads(found, receiver, base)
+		ConstructVariant(_, elements) | ConstructList(elements) | InvokeFunction(_, elements):
+			collect_base_reads_in(found, elements, base)
+		ConstructRecord(_, fields):
+			collect_base_reads_in(found, field_values(fields), base)
+		UpdateRecord(_, update):
+			collect_base_reads_in(collect_base_reads(found, update.base, base), field_values(update.replacements), base)
+		InvokeCallable(callee, arguments):
+			collect_base_reads_in(collect_base_reads(found, callee, base), arguments, base)
+		LiteralVoid | LiteralInteger(_) | LiteralFloat(_) | LiteralString(_) | ReadBinding(_) | Match(_) | FreeCallable(_) | CapturedCallable(_, _):
+			found
+
+
+private pure func field_values(fields: List[ConcreteRecordField]) -> List[ConcreteExpr]:
+	fields.map(pure func(field: ConcreteRecordField) -> ConcreteExpr: field.value)
+
+
+private pure func collect_base_reads_in(
+	found: List[BaseRead],
+	expressions: List[ConcreteExpr],
+	base: BindingId,
+) -> List[BaseRead]:
+	var reads = found
+	for expression in expressions:
+		reads = collect_base_reads(reads, expression, base)
+	reads
+
+
+-- The base, then every base field the update reads, each projected once: first
+-- the fields the replacements read, then the inherited fields, which the
+-- update itself reads. Then the replacements in written order, whose reads of
+-- a projected field resolve to its projection. Projecting first lets ownership
+-- drop the base before the first replacement runs, so a field accumulator
+-- reaches its in-place operand uniquely. Sound because the base is immutable
+-- and a projection has no effect. A replacement can name only a base that is a
+-- binding read, so any other base, such as the path `s.inner` in
+-- `{ s.inner | x = s.inner.x }`, hoists nothing from the replacements: a
+-- limit of this design.
 private pure func lower_record_update(
 	builder: ExpressionBuilder,
 	bindings: List[Option[ValueId]],
+	base_projections: List[BaseProjection],
 	update: ConcreteRecordUpdate,
 	owner: RecordInstanceId,
 	value_type: TypeRef,
 	span: Span,
 	binding_facts: List[ConcreteBinding],
 ) -> Result[BuiltValue, Diagnostic]:
-	base ?= lower_value(builder, bindings, update.base, binding_facts)
-	replaced ?= lower_record_fields(base.builder, bindings, update.replacements, binding_facts)
-	var current = replaced.builder
-	var fields = replaced.values
-
+	base ?= lower_value(builder, bindings, base_projections, update.base, binding_facts)
+	replacement_reads = match update.base.form:
+		ReadBinding(base_binding): collect_base_reads_in([], field_values(update.replacements), base_binding)
+		_: []
+	var current = base.builder
+	var projections = base_projections
+	for read in replacement_reads:
+		projected = project_once(current, projections, base.value, read.field, read.value_type, read.span)
+		current = projected.builder
+		projections = projected.projections
+	var inherited: List[RecordFieldValue] = []
 	for field in update.inherited:
-		read = define_value(current, ReadRecordFieldValue(field.field, base.value), field.value_type, update.base_expression_span)
-		current = read.builder
-		fields = fields.append({ field = field.field, value = read.value })
-
-	Ok(define_value(current, ConstructRecordValue(owner, fields), value_type, span))
+		projected = project_once(current, projections, base.value, field.field, field.value_type, update.base_expression_span)
+		current = projected.builder
+		projections = projected.projections
+		inherited = inherited.append({ field = field.field, value = projected.value })
+	replaced ?= lower_record_fields(current, bindings, projections, update.replacements, binding_facts)
+	Ok(define_value(replaced.builder, ConstructRecordValue(owner, replaced.values.concat(inherited)), value_type, span))
 
 
 private pure func lower_value(
 	builder: ExpressionBuilder,
 	bindings: List[Option[ValueId]],
+	base_projections: List[BaseProjection],
 	value: ConcreteExpr,
 	binding_facts: List[ConcreteBinding],
 ) -> Result[BuiltValue, Diagnostic]:
@@ -579,36 +707,39 @@ private pure func lower_value(
 				Ok(bound): Ok({ builder = builder, value = bound })
 				Err(error): Err(error)
 		ConstructVariant(variant, values):
-			match lower_arguments(builder, bindings, values, binding_facts):
+			match lower_arguments(builder, bindings, base_projections, values, binding_facts):
 				Ok(children): Ok(define_value(children.builder, ConstructValue(variant, children.values), value.value_type, value.span))
 				Err(error): Err(error)
 		ConstructRecord(owner, fields):
-			match lower_record_fields(builder, bindings, fields, binding_facts):
+			match lower_record_fields(builder, bindings, base_projections, fields, binding_facts):
 				Ok(built): Ok(define_value(built.builder, ConstructRecordValue(owner, built.values), value.value_type, value.span))
 				Err(error): Err(error)
 		ConstructList(elements):
-			match lower_arguments(builder, bindings, elements, binding_facts):
+			match lower_arguments(builder, bindings, base_projections, elements, binding_facts):
 				Ok(children): Ok(define_value(children.builder, ConstructListValue(children.values), value.value_type, value.span))
 				Err(error): Err(error)
 		UpdateRecord(owner, update):
-			lower_record_update(builder, bindings, update, owner, value.value_type, value.span, binding_facts)
+			lower_record_update(builder, bindings, base_projections, update, owner, value.value_type, value.span, binding_facts)
 		FreeCallable(body): Ok(define_value(builder, FreeCallableValue(body), value.value_type, value.span))
 		CapturedCallable(body, environment):
-			match lower_value(builder, bindings, environment, binding_facts):
+			match lower_value(builder, bindings, base_projections, environment, binding_facts):
 				Err(error): Err(error)
 				Ok(read):
 					Ok(define_value(read.builder, CapturedCallableValue(body, read.value), value.value_type, value.span))
 		InvokeCallable(callee, arguments):
-			lower_invocation(builder, bindings, callee, arguments, binding_facts, value.value_type, value.span)
+			lower_invocation(builder, bindings, base_projections, callee, arguments, binding_facts, value.value_type, value.span)
 		InvokeFunction(call, arguments):
-			match lower_arguments(builder, bindings, arguments, binding_facts):
+			match lower_arguments(builder, bindings, base_projections, arguments, binding_facts):
 				Ok(children):
 					-- A call's definition is anchored at its callee, not at the whole occurrence.
 					Ok(define_value(children.builder, CallValue(call.target, children.values), value.value_type, call.span))
 				Err(error): Err(error)
 		ReadRecordField(receiver, field):
-			match lower_value(builder, bindings, receiver, binding_facts):
-				Ok(read): Ok(define_value(read.builder, ReadRecordFieldValue(field, read.value), value.value_type, value.span))
+			match lower_value(builder, bindings, base_projections, receiver, binding_facts):
+				Ok(read):
+					match find_projection(base_projections, read.value, field):
+						Some(projected): Ok({ builder = read.builder, value = projected })
+						None: Ok(define_value(read.builder, ReadRecordFieldValue(field, read.value), value.value_type, value.span))
 				Err(error): Err(error)
 		Match(join):
 			lower_join_value(builder, bindings, join, value.value_type, value.span, binding_facts, None)
@@ -618,14 +749,15 @@ private pure func lower_value(
 private pure func lower_invocation(
 	builder: ExpressionBuilder,
 	bindings: List[Option[ValueId]],
+	base_projections: List[BaseProjection],
 	callee: ConcreteExpr,
 	arguments: List[ConcreteExpr],
 	binding_facts: List[ConcreteBinding],
 	value_type: TypeRef,
 	span: Span,
 ) -> Result[BuiltValue, Diagnostic]:
-	read ?= lower_value(builder, bindings, callee, binding_facts)
-	children ?= lower_arguments(read.builder, bindings, arguments, binding_facts)
+	read ?= lower_value(builder, bindings, base_projections, callee, binding_facts)
+	children ?= lower_arguments(read.builder, bindings, base_projections, arguments, binding_facts)
 	Ok(define_value(children.builder, InvokeCallableValue(read.value, children.values), value_type, span))
 
 
@@ -701,7 +833,7 @@ private pure func lower_block_value(
 	match value.form:
 		Match(join): lower_join_value(builder, bindings, join, value.value_type, value.span, binding_facts, context)
 		_:
-			match lower_value(builder, bindings, value, binding_facts):
+			match lower_value(builder, bindings, [], value, binding_facts):
 				Ok(lowered):
 					Ok({ builder = lowered.builder, value = lowered.value, bindings = bindings })
 				Err(error): Err(error)
@@ -799,7 +931,7 @@ private pure func lower_exit(
 					})
 				Err(error): Err(error)
 		RecurWith(arguments, span):
-			match lower_arguments({ next_value = next_value, entries = [] }, bindings, arguments, binding_facts):
+			match lower_arguments({ next_value = next_value, entries = [] }, bindings, [], arguments, binding_facts):
 				Err(error): Err(error)
 				Ok(result):
 					Ok({
@@ -1844,7 +1976,7 @@ private pure func lower_match(
 	bindings: List[ConcreteBinding],
 	unions: List[ConcreteUnion],
 ) -> Result[BuiltMatch, Diagnostic]:
-	scrutinee ?= lower_value({ next_value = block.next_value, entries = [] }, block.bindings, matched.scrutinee, bindings)
+	scrutinee ?= lower_value({ next_value = block.next_value, entries = [] }, block.bindings, [], matched.scrutinee, bindings)
 	var entries = block.entries
 	for entry in scrutinee.builder.entries:
 		entries = entries.append(entry)

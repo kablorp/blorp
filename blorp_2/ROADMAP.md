@@ -1487,7 +1487,8 @@ projections and O3.
 | [O1](#o1-owned-parameter-contracts) | Per-parameter owned/borrowed contracts, inferred from in-place runtime operations | Landed 2026-10-30 ([results](#o1-results)); size overage accepted |
 | [O1 follow-ups](#o1-follow-ups) | One passing rule in `pass_arguments`, an `append_int` digit loop, a seed containing O1 | Rule and digit loop done; O1 is in the pinned seed, the digit loop awaits the next rotation |
 | [Attribution after O1](#attribution-after-o1) | Remaining copies, RC operations and allocations by kind, a fresh profile | Next, alongside O2 |
-| [O2](#o2-record-update-binds-before-it-rebuilds) | Project the base fields an update reads before its replacements run | Approved; benchmark first |
+| [O2](#o2-record-update-binds-before-it-rebuilds) | Project the base fields an update reads before its replacements run | Implemented 2026-10-30, pending review ([results](#o2-results)) |
+| [Loop-header last-read drops](#loop-header-last-read-drops) | A loop-header obligation that is not outgoing drops at its last read instead of being held to the edge batch | Decided 2026-10-30 as a separate step; after O2 |
 | [Borrowed field projections](#borrowed-field-projections) | Read managed record fields borrowed, as union payloads already are | Proposed; decided from the attribution, needs approval |
 | [O3](#o3-specialised-reuse-for-records-and-union-nodes) | Specialised reuse of unique record cells and boxed union nodes | Undecided; decided from the attribution |
 
@@ -2010,8 +2011,8 @@ reusing.
 
 ### O2: record update binds before it rebuilds
 
-Today lowering runs the base, the replacement expressions, then projections
-of unchanged fields, then a fresh construction. O2 projects the base fields
+Lowering ran the base, the replacement expressions, then projections of
+unchanged fields, then a fresh construction. O2 projects the base fields
 the update reads first, and points replacement reads of `base.field` at those
 projections through typed field and value identities. That is sound because
 the base is immutable and projections have no effects:
@@ -2026,25 +2027,104 @@ count1 = count0.add(1)
 ```
 
 Replacement expressions still run once in written order, and the order
-fixture's output is unchanged. It replaces the evaluation-order text at
-`README.md:1320-1322` and the order comment at `lower/lower.brp:536-537`. O2
-touches only lowering. Projecting first, then dropping the base, then
-replacing is also the order that
+fixture's output is unchanged. The inherited fields are fields the update
+reads too, so they project before the first replacement: with `count`
+inherited, `{ state | items = state.items.append(item) }` would otherwise read
+`count` from the base after the append and copy. It replaces the
+evaluation-order text in `README.md` and the order comment on
+`lower_record_update`. O2 touches only lowering. Projecting first, then
+dropping the base, then replacing is also the order that
 [borrowed field projections](#borrowed-field-projections) and specialised
 reuse ([O3](#o3-specialised-reuse-for-records-and-union-nodes)) need to take
 a field out of a unique cell.
 
-**Benchmark first.** Add two modes to `helper_accumulators` in
-`benchmarks/blorp/` and `benchmarks/blorp_2/`, failing before O2:
+Status: implemented 2026-10-30, pending review. Lowering finds the fields the
+replacements read with a typed scan (`collect_base_reads`) when the base is a
+binding read. Its identities are the `BindingId` and `FieldInstanceId`, and
+the scan does not enter a `match` or a captured callable, where a read may see
+another value of the binding. A repeated read is projected once, through
+`project_once`, which the inherited fields use too. Each projection is a `BaseProjection` (base
+`ValueId`, field, projected `ValueId`), threaded as a parameter through
+`lower_value` and its callers, so a replacement's read of that field of that
+value resolves to it. A parameter was chosen over an `ExpressionBuilder` field
+because arms and loops start fresh builders. Own and verify are unchanged.
 
-- `record_loop`: `state = { state | items = state.items.append(i), count =
-  state.count.add(1) }` in one function's loop. It needs no O1 and is
-  quadratic today.
-- `record_helper`: the same update through a `push(state, item)` helper,
-  which O1 makes owned, plus a variant threaded through a
-  `Result`-returning helper, whose `Err` arm keeps the caller's value live.
+**Known limits.**
 
-O2 needs no attribution first and runs alongside it.
+- `record_loop` stays quadratic: one function's loop updating a record field.
+  `own.brp`'s loop rule holds the loop header's old record to the edge batch
+  (`insert_loop_exit_block`: "Header obligations survive until the complete
+  edge batch"), so the append still sees two owners. O2 alone does not fix it;
+  see [loop-header last-read drops](#loop-header-last-read-drops).
+- A shape that keeps the caller's value live across the call, such as
+  `match push_checked(state, index): Ok(next): next  Err(_): state`, keeps the
+  old record live after the call, so the call acquires it and the append
+  copies, under both O1 and O2. No retained benchmark mode measures this
+  shape; it is unmeasured. Threading by `?=` propagation exits on `Err`, so
+  nothing keeps the old value live. Blorp 2 does not compile a `?=` self-tail
+  call to a loop, so `record_result` recurses once per step and overflows an
+  8 MB stack above about 131,072 steps; it is measured only to that size.
+  The legacy compiler is also quadratic on the `?=` `record_result` (13,518 M
+  instructions at 65,536 steps).
+- A path base such as `{ s.inner | x = s.inner.x }` is not a binding, so its
+  replacements' reads of `s.inner` are not hoisted. The scan also does not
+  enter a `match` or a captured callable; the checker accepts neither inside a
+  replacement yet.
+- Each update still allocates a fresh record root, so allocations are `n + 9`,
+  not constant, until [O3](#o3-specialised-reuse-for-records-and-union-nodes).
+
+#### O2 results
+
+Measured 2026-10-30 on an Apple M4 with Apple clang 21, `-O2`, with other
+sessions' test gates running on the same machine, so counts are retired
+instructions and allocations, not time. `helper_accumulators`, serial. Raw
+instructions include the `none` process-startup control (about 12.5 M for
+Blorp 2, 18.2 M for the legacy compiler). Base is `cf59a1e30`.
+
+| Mode (131,072 updates; `record_result` 65,536) | Base instructions | Base allocations | O2 instructions | O2 allocations | Legacy instructions | Legacy allocations |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `record_loop` | 13,240 M | 262,153 | 13,269 M | 262,153 | 27 M | 25 |
+| `record_helper` | 13,285 M | 262,153 | 89.7 M | 131,081 | 27 M | 25 |
+| `record_inherited` | 13,238 M | 262,153 | 89.2 M | 131,081 | 27 M | 25 |
+| `record_result` | 15,369 M | 131,081 | 54.0 M | 65,545 | 13,518 M | 131,080 |
+
+- `record_helper` and `record_inherited` are linear: at most 2.09x per
+  doubling from 262,144 to 2,097,152. Instructions at 2,097,152 are bimodal
+  between runs of the same binary (1,087 M or 1,240 M in seven runs each); the
+  minima are 1,088.7 M and 1,086.3 M against legacy's 161.0 M and 129.7 M.
+  Allocations are `n + 9`, one record root per update, against 29 for legacy.
+  Legacy parity is not met; the gap is the per-update record allocation and
+  its reference counting, which is O3's scope.
+- Self-compile against `cf59a1e30`, serial minima of three, `-O2`, frozen O2
+  source as input:
+
+| | Base | O2 | Change |
+| --- | ---: | ---: | ---: |
+| B instructions | 26,976.7 M | 26,988.2 M | +0.04% |
+| B allocations | 26.911 M | 26.941 M | +0.11% |
+| C instructions | 21,306.0 M | 21,233.2 M | -0.34% |
+| C allocations | 18.900 M | 18.838 M | -0.33% |
+| Emitted C bytes (B's output) | 24,048,614 | 24,052,147 | +0.015% |
+
+- Emitted C is byte-identical for 65 programs without a record update (five
+  benchmarks and sixty e2e fixtures).
+
+### Loop-header last-read drops
+
+`record_loop`, one function's loop updating a record's List field, stays
+quadratic after O2. The cause is `own.brp`'s loop rule. In
+`insert_loop_exit_block`, a comment says "Header obligations survive until the
+complete edge batch, including old values that are not outgoing. Arm inputs
+keep last-use scheduling", and the code holds each header slot to
+`steps.length()`. A List accumulator escapes because `append` consumes it. A
+record that projections only read is held to the edge, so the append still sees
+two owners and `record_loop` copies its field on every iteration, although O2
+has already moved every read of the old record before the append.
+
+The proposed change drops such an obligation at its last read, as arm inputs
+already do, with verifier coverage. It revisits L2b's edge-batch rule, so it is
+reviewed on its own and not folded into O2. Its failing witness is
+`helper_accumulators record_loop`, which stays in both benchmark directories.
 
 ### O3: specialised reuse for records and union nodes
 

@@ -65,6 +65,7 @@ TARGET_COMPONENT_SOURCES := \
 	blorp_2/test/unit/test_verify/test_list_updates.brp \
 	blorp_2/test/unit/test_emit/test_list_updates.brp \
 	blorp_2/test/unit/test_lower/test_loop_reads.brp \
+	blorp_2/test/unit/test_lower/test_record_update.brp \
 	blorp_2/test/unit/test_own/test_ownership_transfer.brp \
 	blorp_2/test/unit/test_verify/test_ownership_transfer.brp \
 	blorp_2/test/unit/test_own/test_owned_parameters.brp \

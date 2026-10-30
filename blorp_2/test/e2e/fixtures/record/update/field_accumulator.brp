@@ -1,0 +1,72 @@
+import:
+    list: List methods
+    int: Int methods
+    string: String methods
+    io: print
+
+fixed record State { items: List[Int], count: Int }
+
+-- Both replacements read `state`: the update projects `items` and `count`
+-- first, so the base retires before the append and a dying `state` grows in
+-- place when its parameter is owned.
+pure func push(state: State, item: Int) -> State:
+    { state | items = state.items.append(item), count = state.count.add(1) }
+
+-- `count` is inherited: it is projected before the append, so the base still
+-- retires first.
+pure func push_items(state: State, item: Int) -> State:
+    { state | items = state.items.append(item) }
+
+pure func parse(text: String) -> Result[Int, String]:
+    match text.parse_int():
+        Some(number): Ok(number)
+        None: Err("not a number: ${text}")
+
+-- The `?=` exit leaves while the owned `state` is live and must retire it. The
+-- match runs before the update, as the checker does not yet accept one inside
+-- a replacement; the update then projects and consumes `state` as usual.
+pure func push_text(state: State, text: String) -> Result[State, String]:
+    item ?= parse(text)
+    step = match item.equals(1):
+        True: 10
+        False: 1
+    Ok({ state | items = state.items.append(item), count = state.count.add(step) })
+
+pure func report(result: Result[State, String]) -> String:
+    match result:
+        Ok(next): describe(next)
+        Err(message): message
+
+pure func describe(state: State) -> String:
+    "${state.items.length().to_string()} items, count ${state.count.to_string()}"
+
+func main() -> Int:
+    -- A loop in one function updates the field accumulator. Its loop header
+    -- holds the old record to the loop edge, so this still copies each step.
+    var looped: State = { items = [0], count = 0 }
+    for index in 0..4:
+        looped = { looped | items = looped.items.append(index), count = looped.count.add(1) }
+    print(describe(looped))
+    -- The same update through a helper whose parameter is owned: no copy.
+    var helped: State = { items = [0], count = 0 }
+    for index in 0..4:
+        helped = push(helped, index)
+    print(describe(helped))
+    var inherited: State = { items = [0], count = 0 }
+    for index in 0..4:
+        inherited = push_items(inherited, index)
+    print(describe(inherited))
+    print(report(push_text({ items = [0], count = 0 }, "1")))
+    print(report(push_text({ items = [0], count = 0 }, "x")))
+    -- `kept` is used afterwards, so the call receives an acquisition and the
+    -- update copies instead of growing the caller's value.
+    kept: State = { items = [0], count = 0 }
+    grown = push(kept, 9)
+    print(describe(grown))
+    print(describe(kept))
+    -- A live caller value: the call acquires, the update copies, and the
+    -- failing parse leaves `kept` untouched.
+    print(report(push_text(kept, "1")))
+    print(report(push_text(kept, "x")))
+    print(describe(kept))
+    0

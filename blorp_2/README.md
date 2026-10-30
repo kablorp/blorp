@@ -1512,9 +1512,21 @@ func main() -> Void:
 ```
 
 The [alias fixture](test/e2e/fixtures/record/update/aliases.brp) prints exactly
-`42\n7\n` and exits 0. The base executes once. Replacement expressions execute
-once in written order, followed by unchanged-field projections in declaration
-order. Complete construction stores every field in declaration order. The
+`42\n7\n` and exits 0. An update runs in four steps. The base executes once.
+Then every base field the update reads is projected once: first the fields the
+replacements read, in the order they first read them, then the unchanged
+fields in declaration order. Then the replacement expressions execute once in
+written order, and a replacement's read of a projected field is that
+projection. Last, construction stores every field in declaration order.
+After the projections nothing reads the base, so ownership retires it before
+the first replacement runs, and a List or String field accumulator reaches its
+in-place operand uniquely. Projections have no effects and the base is
+immutable, so this does not change what a program prints. Only a base that is
+a binding has replacement reads to hoist; a path base such as `s.inner` hoists
+none, and the scan does not enter a `match` or a captured callable, whose
+reads project where they sit. A loop header may still hold the old record
+until the loop edge, so one function's loop over a record field still copies
+it ([loop-header last-read drops](ROADMAP.md#loop-header-last-read-drops)). The
 [order fixture](test/e2e/fixtures/record/update/order.brp) updates `text` before
 `number` and prints `base\ntext\nnumber\n7\n7\n`.
 
@@ -1525,7 +1537,7 @@ managed stored occurrence receives its own obligation through the existing
 acquire-then-drop protocol: a projection acquires an owned child, construction
 acquires its stored child, and the temporary owner retires after its last use.
 Unchanged fields do not keep their parent alive after their own obligations are
-established. Replaced fields are never projected unnecessarily. All current
+established. A replaced field is projected only when a replacement reads it. All current
 finite field types work, including Void, owning unions, records and nested Lists.
 The [escaped-child fixture](test/e2e/fixtures/record/update/escaped_children.brp)
 returns a List and a mortal String after their updated parents retire.
