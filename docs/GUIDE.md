@@ -104,6 +104,8 @@ values through the pilot pipeline. Strict `string.parse_float` returns ordinary
 Option[Float]; source literals require finite values, while arithmetic may
 produce canonical infinity/NaN output. The pilot reference specifies decimal
 input, rounding, formatting, signed zero and native execution requirements.
+Its `float.is_nan` and `float.is_finite` library functions use ordinary equality
+and subtraction; those names are not accepted builtin labels.
 The pilot accepts quoted Strings, LF-joined pipe Strings and raw blocks.
 Quoted and pipe Strings support `${expression}` with String-only holes; convert
 primitive values explicitly with `to_string`. Holes evaluate once in written

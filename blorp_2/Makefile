@@ -13,6 +13,7 @@ TEST_COMPILER_FLAGS := -O0
 TEST_COMPILER_LIBRARIES := -lm -lpthread
 # Explicitly ported suites: every active B2 test runs through Blorp 2.
 TARGET_COMPONENT_SOURCES := \
+	blorp_2/test/unit/test_library/test_float_classification.brp \
 	blorp_2/test/unit/test_utils/test_boolean.brp \
 	blorp_2/test/unit/test_utils/test_constant_ids.brp \
 	blorp_2/test/unit/test_utils/test_ids.brp \

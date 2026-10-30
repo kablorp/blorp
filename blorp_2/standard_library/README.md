@@ -56,7 +56,9 @@ Neither branch prints. The native helper uses the target String ABI.
 active, lifted from trait implementations where needed. The Float adapter
 exposes concrete `add`, `subtract`, `multiply`, `divide`, `remainder` and
 `to_string` for Float64, plus concrete `copysign`, `equals`, `is_nan`, `is_finite`
-and `abs`. Float implements `Orderable`: every comparison with NaN is false, so
+and `abs`. `is_nan` uses ordinary self-equality, and `is_finite` compares
+ordinary self-subtraction with zero; neither requires a builtin label.
+Float implements `Orderable`: every comparison with NaN is false, so
 it writes its own `less_than_or_equal` and `greater_than_or_equal`.
 `Int` and `Float` are declared once in `_base.brp`. Other
 declarations are enabled only as their features enter the supported subset.

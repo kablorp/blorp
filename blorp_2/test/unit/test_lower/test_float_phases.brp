@@ -12,7 +12,7 @@ import:
 	../../../src/specialize/specialize as Concrete
 	../../../src/utils/syntax:
 		Diagnostic, ExpressionBase(FloatExpression), ParsedBody(ParsedValueBody),
-		ParsedRuntimeOperation(FloatCopySignBuiltin, FloatEqualsBuiltin, FloatLessThanBuiltin, FloatIsNaNBuiltin, FloatIsFiniteBuiltin)
+		ParsedRuntimeOperation(FloatCopySignBuiltin, FloatEqualsBuiltin, FloatLessThanBuiltin)
 	../compilation: compile, compile_modules
 	float as FloatOps
 	../input: setup_diagnostic
@@ -711,21 +711,6 @@ private pure func emits_binary_predicate(label: String, condition: String) -> Bo
 		Err(_): False
 
 
-private pure func emits_unary_predicate(label: String, condition: String) -> Bool:
-	prefix: String =
-		|pure func predicate(value: Float) -> Bool:
-		|
-	suffix: String =
-		|func main() -> Int:
-		|    result = predicate(1.0)
-		|    0
-		|
-	source = prefix + "    builtin(\"" + label + "\")\n" + suffix
-	match compile_modules([{ source = source, targets = [] }], test_base()):
-		Ok(output): output.contains(condition) and output.contains("DBL_MANT_DIG==53")
-		Err(_): False
-
-
 pure func test_copy_sign_emits_the_direct_math_function() -> Bool:
 	source: String =
 		|pure func copy_sign(value: Float, sign: Float) -> Float:
@@ -747,14 +732,6 @@ pure func test_float_ordering_preserves_operand_order() -> Bool:
 	emits_binary_predicate("float.less_than", "=(blorp_vl_0<blorp_vl_1)?")
 
 
-pure func test_nan_classification_uses_one_operand() -> Bool:
-	emits_unary_predicate("float.is_nan", "=isnan(blorp_vl_0)?")
-
-
-pure func test_finite_classification_uses_one_operand() -> Bool:
-	emits_unary_predicate("float.is_finite", "=isfinite(blorp_vl_0)?")
-
-
 pure func test_float_predicate_rejects_an_int_parameter() -> Bool:
 	rejects_runtime(
 		"pure func predicate(first: Int, second: Float) -> Bool:",
@@ -771,19 +748,19 @@ pure func test_float_predicate_rejects_an_int_result() -> Bool:
 	)
 
 
-pure func test_float_classifier_rejects_impurity() -> Bool:
+pure func test_float_predicate_rejects_impurity() -> Bool:
 	rejects_runtime(
-		"func predicate(value: Float) -> Bool:",
-		"\"float.is_nan\"",
-		"declare a pure nongeneric function with one Float parameter returning Bool",
+		"func predicate(first: Float, second: Float) -> Bool:",
+		"\"float.equals\"",
+		"declare a pure nongeneric function with two Float parameters returning Bool",
 	)
 
 
-pure func test_float_classifier_rejects_a_second_parameter() -> Bool:
+pure func test_float_predicate_rejects_a_third_parameter() -> Bool:
 	rejects_runtime(
-		"pure func predicate(first: Float, second: Float) -> Bool:",
-		"\"float.is_finite\"",
-		"declare a pure nongeneric function with one Float parameter returning Bool",
+		"pure func predicate(first: Float, second: Float, third: Float) -> Bool:",
+		"\"float.less_than\"",
+		"declare a pure nongeneric function with two Float parameters returning Bool",
 	)
 
 
@@ -805,25 +782,11 @@ private pure func binary_float_source(label: String, result_type: String) -> Str
 	prefix + "    builtin(\"" + label + "\")\n" + main
 
 
-private pure func unary_float_source(label: String) -> String:
-	prefix: String =
-		|pure func probe(value: Float) -> Bool:
-		|
-	main: String =
-		|func main() -> Int:
-		|    result = probe(1.0)
-		|    0
-		|
-	prefix + "    builtin(\"" + label + "\")\n" + main
-
-
 private pure func is_float_operation(target: Concrete.CallTarget, expected: ParsedRuntimeOperation) -> Bool:
 	match (target, expected):
 		(Concrete.RuntimeFunction(Builtins.FloatCopySign), FloatCopySignBuiltin): True
 		(Concrete.RuntimeFunction(Builtins.FloatEquals(_)), FloatEqualsBuiltin): True
 		(Concrete.RuntimeFunction(Builtins.FloatLessThan(_)), FloatLessThanBuiltin): True
-		(Concrete.RuntimeFunction(Builtins.FloatIsNaN(_)), FloatIsNaNBuiltin): True
-		(Concrete.RuntimeFunction(Builtins.FloatIsFinite(_)), FloatIsFiniteBuiltin): True
 		_: False
 
 
@@ -850,15 +813,6 @@ private pure func lowered_float_operands(source: String, expected: ParsedRuntime
 									and Lower.value_number(first.id) == 0 and Lower.value_number(second.id) == 1
 									and Lower.value_number(left) == 0 and Lower.value_number(right) == 1
 									and Lower.value_number(result.id) == 2 and Lower.value_number(returned) == 2
-									and is_float_operation(target, expected))
-								_: False
-						([Lower.Define(first), Lower.Define(result)], returned):
-							match (first.operation, result.operation):
-								(Lower.ParameterValue(0), Lower.CallValue(target, [argument])):
-									(Concrete.same_type(first.value_type, Concrete.FloatType)
-									and Concrete.same_type(result.value_type, function.signature.return_type)
-									and Lower.value_number(first.id) == 0 and Lower.value_number(argument) == 0
-									and Lower.value_number(result.id) == 1 and Lower.value_number(returned) == 1
 									and is_float_operation(target, expected))
 								_: False
 						_: False
@@ -890,15 +844,6 @@ private pure func owned_float_operands(source: String, expected: ParsedRuntimeOp
 													and is_float_operation(target, expected))
 												_: False
 										_: False
-								([Own.DefineValue(first), Own.DefineValue(result)], Own.UnmanagedReturn(returned)):
-									match (first.operation, result.operation, first.result, result.result):
-										(Own.ParameterDefinition(0), Own.CallDefinition(target, [Own.UnmanagedArgument(argument)]), Own.UnmanagedResult, Own.UnmanagedResult):
-											(Concrete.same_type(first.value_type, Concrete.FloatType)
-											and Concrete.same_type(result.value_type, owned.signature.return_type)
-											and Lower.value_number(first.id) == 0 and Lower.value_number(argument) == 0
-											and Lower.value_number(result.id) == 1 and Lower.value_number(returned) == 1
-											and is_float_operation(target, expected))
-										_: False
 								_: False
 				_: False
 
@@ -927,22 +872,6 @@ pure func test_owned_ordering_preserves_float_operands_and_result() -> Bool:
 	owned_float_operands(binary_float_source("float.less_than", "Bool"), FloatLessThanBuiltin)
 
 
-pure func test_lowered_nan_preserves_float_operands_and_result() -> Bool:
-	lowered_float_operands(unary_float_source("float.is_nan"), FloatIsNaNBuiltin)
-
-
-pure func test_owned_nan_preserves_float_operands_and_result() -> Bool:
-	owned_float_operands(unary_float_source("float.is_nan"), FloatIsNaNBuiltin)
-
-
-pure func test_lowered_finite_preserves_float_operands_and_result() -> Bool:
-	lowered_float_operands(unary_float_source("float.is_finite"), FloatIsFiniteBuiltin)
-
-
-pure func test_owned_finite_preserves_float_operands_and_result() -> Bool:
-	owned_float_operands(unary_float_source("float.is_finite"), FloatIsFiniteBuiltin)
-
-
 tests: TestSuite = {
 	description = "Blorp 2 Float producer-to-consumer boundary",
 	tests = [
@@ -952,19 +881,13 @@ tests: TestSuite = {
 		("Float owned equality operands and result", test_owned_equality_preserves_float_operands_and_result),
 		("Float lowered ordering operands and result", test_lowered_ordering_preserves_float_operands_and_result),
 		("Float owned ordering operands and result", test_owned_ordering_preserves_float_operands_and_result),
-		("Float lowered nan operands and result", test_lowered_nan_preserves_float_operands_and_result),
-		("Float owned nan operands and result", test_owned_nan_preserves_float_operands_and_result),
-		("Float lowered finite operands and result", test_lowered_finite_preserves_float_operands_and_result),
-		("Float owned finite operands and result", test_owned_finite_preserves_float_operands_and_result),
 		("copy sign emits direct math function", test_copy_sign_emits_the_direct_math_function),
 		("Float equality emits scalar comparison", test_float_equality_emits_scalar_comparison),
 		("Float ordering preserves operand order", test_float_ordering_preserves_operand_order),
-		("NaN classification uses one operand", test_nan_classification_uses_one_operand),
-		("finite classification uses one operand", test_finite_classification_uses_one_operand),
 		("Float predicate rejects Int parameter", test_float_predicate_rejects_an_int_parameter),
 		("Float predicate rejects Int result", test_float_predicate_rejects_an_int_result),
-		("Float classifier rejects impurity", test_float_classifier_rejects_impurity),
-		("Float classifier rejects second parameter", test_float_classifier_rejects_a_second_parameter),
+		("Float predicate rejects impurity", test_float_predicate_rejects_impurity),
+		("Float predicate rejects third parameter", test_float_predicate_rejects_a_third_parameter),
 		("copy sign rejects generic header", test_copy_sign_rejects_a_generic_header),
 		(
 			"Float foundation role required without fallback",

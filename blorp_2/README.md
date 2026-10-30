@@ -2694,7 +2694,9 @@ func main() -> Int:
 This prints `13\n`. The concrete Float module provides the same five arithmetic
 function names as Int, plus `to_string`, `copysign`, `equals`, `is_nan`,
 `is_finite` and `abs`, and implements `Orderable` with every NaN comparison
-false. Named function imports permit direct
+false. `is_nan` is an ordinary function using self-equality; `is_finite`
+compares self-subtraction with zero. Their names remain ordinary library APIs;
+`float.is_nan` and `float.is_finite` are not builtin labels. Named function imports permit direct
 calls and UFCS; type imports expose the module's associated functions through
 UFCS. Receiver types distinguish Int and Float methods. Importing both Int and
 Float `to_string` for direct calls is an error; neither declaration takes

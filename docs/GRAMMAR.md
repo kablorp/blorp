@@ -16,7 +16,9 @@ loaded and parsed once, including the designated `_base.brp` and ordinary
 receive it. Import cycles, including self-imports, are rejected, and modules
 under the library root cannot import user modules. Concrete
 functions may use a sole closed builtin body, including `builtin("int.add")`,
-with an exact runtime signature. Explicitly imported Blorp 2
+with an exact runtime signature. The pilot library's `float.is_nan` and
+`float.is_finite` functions have ordinary bodies; their names are not builtin
+labels. Explicitly imported Blorp 2
 `process.run_to_files(String, List[String], String, String, Int) -> Result[Int, String]`
 uses that existing closed builtin form and ordinary calls; it adds no syntax.
 See the [target process contract](../blorp_2/standard_library/README.md#process-execution).
