@@ -32,6 +32,10 @@ The pilot accepts parameterless `trait` declarations with pure methods whose
 first formal is `Self`. A method without `:` is abstract; one with `:` has an
 ordinary default body. Function type parameters and complete implementation receiver
 families accept bounds such as `Value: Equatable + Visit` and `Box[Value: Visit]`.
+The pilot's ordinary foundation trait `Hashable` declares
+`pure func hash(value: Self) -> Int`; Int supplies a written identity hash.
+Hashable is available through the prelude without any new syntax or builtin
+label, has no supertraits, and is never derived.
 The configured prelude selects canonical Equatable through its ordinary imported
 trait binding. Fixed `==` and `!=` expressions select that trait's `equals` and
 `not_equals` methods directly, without an ordinary method-name import. The

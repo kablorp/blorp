@@ -136,6 +136,12 @@ top-level callable trait formals remain deferred. See the linked
 pilot rules for use-site diagnostics and recursive eligibility. The production
 pilot library defines canonical Equatable in its traits module. Int/Float/String/List
 supply written implementations, and generic List contains requires Element:Equatable.
+The pilot also supplies ordinary `Hashable` with `hash(value: Self) -> Int`.
+Int's written implementation returns the value unchanged. Hashable has no
+supertraits or automatic derivation; equal values must have equal hashes, while
+different values may collide. The prelude supplies the trait name and Int's UFCS
+route; direct calls require `int: hash`. Hashing and equality remain separate
+capabilities in this pilot.
 The compiler-source subset remains distinct from this input surface.
 
 ---

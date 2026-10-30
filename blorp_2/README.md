@@ -148,6 +148,15 @@ routes to one family coalesce; different families or a free function with the
 same name need an alias or renamed declaration. A type's `methods` route
 requires the provider to own a written implementation for that receiver head.
 
+The ordinary foundation trait `Hashable` requires `pure func hash(value: Self) -> Int`.
+Its name is available through the prelude; Int supplies a written identity hash,
+reached by UFCS or the explicit `int: hash` import. Hashes may be negative,
+including `INT_MIN`. Equal values must have equal hashes; unequal values may
+collide. Hashable is independent of Equatable and has no automatic derivation.
+A generic operation that both hashes and compares keys requires both traits.
+The compiler's `IntMap` remains Int-keyed and uses the hash for its home slot,
+then ordinary key equality to distinguish collisions.
+
 Function type parameters declare their required traits with `:` and combine
 bounds with `+`. Each generic body is checked once against those declarations;
 future callers never supply a missing bound. Receiver families introduce every
@@ -3143,7 +3152,7 @@ General pass infrastructure remains future work.
 
 The target library's [`_base.brp`](standard_library/_base.brp)
 owns the builtin Int, Float, String, Void and List identities, the ordinary
-Bool, Option and Result unions, and the `Orderable` trait. It is the only module
+Bool, Option and Result unions, and the `Orderable` and `Hashable` traits. It is the only module
 that may declare builtin types, and any module may import it as `_base`.
 
 The foundation check designates those three unions once, by name and only in

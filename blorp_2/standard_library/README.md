@@ -12,7 +12,7 @@ measurement provenance; current commands use `blorp_2/standard_library`.
 The library root contains two designated foundation modules:
 
 - `_base.brp` owns Int, Float, String, Void, List, Bool, Option, Result and the
-  `Orderable` trait. It is the only module that may declare builtin types. Any
+  `Orderable` and `Hashable` traits. It is the only module that may declare builtin types. Any
   module may import it as `_base`.
 - `prelude.brp` imports the base types and the operation modules' methods. It
   is the only implicit import: application roots and ordinary user helper
@@ -60,6 +60,15 @@ and `abs`. `is_nan` uses ordinary self-equality, and `is_finite` compares
 ordinary self-subtraction with zero; neither requires a builtin label.
 Float implements `Orderable`: every comparison with NaN is false, so
 it writes its own `less_than_or_equal` and `greater_than_or_equal`.
+`Hashable` is an ordinary foundation trait with the pure method
+`hash(value: Self) -> Int`. The prelude supplies the trait name and Int's method
+route; direct calls use `int: hash`. Int's written implementation returns its
+value unchanged, including negative values and `INT_MIN`. Hashes may be any
+signed Int. For values compared by equality, equal values must have equal hashes;
+distinct values may collide. Hashable has no supertraits and is never derived.
+The compiler's Int-keyed map uses this method for home slots and still compares
+keys by equality when probing collisions.
+
 `Int` and `Float` are declared once in `_base.brp`. Other
 declarations are enabled only as their features enter the supported subset.
 The original modules are maintained in [standard_library/src](../../standard_library/src/).
