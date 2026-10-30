@@ -280,6 +280,12 @@ folded, and about 30 multi-caller `at_*` predicates could still use
 `at_keyword`/`at_symbol`. Self-compile allocations rose 21.9k (+0.09%), from
 the per-item list wrapper; instructions are unchanged within noise.
 
+The `check` row landed at −103 lines. `find_variant` and
+`find_qualified_variant` had no arity check to merge (only the `plan_known_*`
+pair did), and `type_spelling` no longer has a record arm since records and
+unions share `NominalType`. Fixtures are identical; self-compile allocations
+rose 17.6k (+0.08%, route closures) and instructions fell 0.3%.
+
 Basis: the parse items remove about 300 lines, the de-duplicated pairs about
 150, and the verify blocks about 100. About −600.
 
