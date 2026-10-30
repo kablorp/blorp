@@ -19,6 +19,9 @@ import:
 
 -- Shared with the native probe's EXPECTED_CAPACITY_ABORT status.
 private EXPECTED_CAPACITY_ABORT: Int = 73
+-- The memory runtime's BLORP_STRICT_LEAK_EXIT_STATUS.
+private STRICT_LEAK_EXIT_STATUS: Int = 99
+private UNBALANCED_EMPTY_PREFIX: String = "blorp: leak check: unbalanced empty list owners: "
 
 
 -- Only the public phases establish the concrete aggregate helpers. The C probe
@@ -128,6 +131,31 @@ private func probe(executable: String, directory: String, name: String) -> Bool:
             False
 
 
+-- A strict run whose `[]` owners end at `owners` instead of 0 must report that
+-- balance before an otherwise balanced allocation report and fail.
+private func unbalanced_empty(executable: String, directory: String, name: String, owners: String) -> Bool:
+    prefix = directory.add("/list-reuse-").add(name)
+    line = UNBALANCED_EMPTY_PREFIX.add(owners).add("\n")
+    result: Result[Void, String] = match run_to_files("/usr/bin/env", ["-u", "BLORP_MEMORY_STATS", "BLORP_LEAK_CHECK=strict", executable, name], prefix.add(".out"), prefix.add(".err"), 10000):
+        Err(error): Err(error)
+        Ok(status):
+            match (read_file(prefix.add(".out")), read_file(prefix.add(".err"))):
+                (Ok(out), Ok(err)):
+                    if and(status.equals(STRICT_LEAK_EXIT_STATUS), and(out.equals(""), err.starts_with(line))):
+                        match err.slice(line.length(), err.length()):
+                            Some(accounting): verify_accounting(accounting, False)
+                            None: Err("list reuse ".add(name).add(": truncated report"))
+                    else:
+                        Err("list reuse ".add(name).add(": exit ").add(status.to_string()).add(": ").add(err))
+                (Err(error), _): Err(error)
+                (_, Err(error)): Err(error)
+    match result:
+        Ok(_): True
+        Err(error):
+            print_error(error)
+            False
+
+
 -- The C probe maps SIGABRT to this fixed status before invoking only the
 -- checked helper. A normal return and any other signal fail this oracle.
 private func rejected_capacity(executable: String, directory: String, mode: String) -> Bool:
@@ -164,6 +192,9 @@ func suite(c_compiler: String, directory: String) -> TestSuite:
                     ("unique concat acquires only right slots with at most one relocation", func(): probe(executable, directory, "concat-work")),
                     ("shared set and concat preserve counted aliases", func(): probe(executable, directory, "updates-shared")),
                     ("empty update operands preserve roots and obligations", func(): probe(executable, directory, "updates-empty")),
+                    ("the immortal empty root is never written, freed or resized", func(): probe(executable, directory, "static-empty")),
+                    ("an extra drop of an empty literal fails the strict check", func(): unbalanced_empty(executable, directory, "static-empty-extra-drop", "-1")),
+                    ("a missing drop of an empty literal fails the strict check", func(): unbalanced_empty(executable, directory, "static-empty-missing-drop", "1")),
                     ("concat Int64 bound aborts before storage access", func(): rejected_capacity(executable, directory, "concat-length-overflow")),
                     ("concat byte bound aborts before storage access", func(): rejected_capacity(executable, directory, "concat-byte-overflow")),
                     ("capacity clamps to byte and Int64 bounds", func(): probe(executable, directory, "bounds")),

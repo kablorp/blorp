@@ -2469,13 +2469,22 @@ be compiled by both compilers. A future coordinated rename to checked `set`
 and no-op `set_or_keep` must update both libraries and all callers together.
 
 A list literal `[a, b]` constructs one fresh root of exactly n slots inline at
-its site, including a header-only `[]` with zero element slots. First growth
-from zero reserves four slots when permitted, then buffers grow geometrically,
-capped by Int64 length and the concrete allocation limit. Known-size
-repeat/argv/copy results retain exact capacities, including zero. Only
-initialized slots are read or destroyed. Each element is stored
-once; `[x, x]` acquires `x` twice, as a
-variant payload would. Every element must have one type: the first element
+its site. An empty literal `[]` allocates nothing: it names its layout's one
+immortal root, a read-only header with zero length and capacity. Dup and drop
+skip that root by address, so its count stays at zero and never passes the
+uniqueness test of a consumed update, which therefore copies it, so a
+consumed append to `[]` allocates one exact slot. Nothing writes, frees or
+resizes the root, and allocation statistics never see it. So that a missing
+or extra dup or drop of `[]` is still caught, diagnostic builds count the
+roots' live owners in a separate counter; under `BLORP_LEAK_CHECK=strict`,
+`blorp_program_finish` requires it to be zero and otherwise prints
+`blorp: leak check: unbalanced empty list owners: N` and exits with the
+strict leak status. First growth from zero reserves four slots when
+permitted, then buffers grow geometrically, capped by Int64 length and the
+concrete allocation limit. Known-size repeat/argv/copy results retain exact
+capacities, including zero. Only initialized slots are read or destroyed.
+Each element is stored once; `[x, x]` acquires `x` twice, as a variant
+payload would. Every element must have one type: the first element
 decides it, and a later element of another type is rejected at that element
 (`list elements must have one type: element 2 is Float, element 1 is Int`).
 Once E is known, every later element is checked with E as its expected

@@ -153,10 +153,16 @@ pure func list_c_type(key: ListElementKey) -> String:
 	"struct blorp_l_${list_suffix(key)}*"
 
 
--- One shared slot policy; callers supply the concrete root/element byte limit.
--- Use the same ordinary linkage as other emitted List runtime utilities: a
--- program may need only exact-sized constructors, leaving growth unused.
-LIST_CAPACITY_RUNTIME: String =
+-- Emitted once for all List layouts. One shared slot policy; callers supply
+-- the concrete root/element byte limit. Use the same ordinary linkage as other
+-- emitted List runtime utilities: a program may need only exact-sized
+-- constructors, leaving growth unused. Diagnostic builds also count the live
+-- owners of every layout's immortal empty root, which dup and drop otherwise
+-- skip, so a missing or extra dup or drop of `[]` still fails strict leak
+-- checking at exit; normal builds keep only the address test. The count is one
+-- total across all layouts, so an extra drop on one layout can cancel a missing
+-- drop on another: a limit on precision, never a false failure.
+LIST_SHARED_RUNTIME: String =
 	raw
 		|enum {BLORP_LIST_DEFAULT_CAPACITY=4};
 		|size_t blorp_list_capacity(size_t current,size_t required,size_t maximum){
@@ -167,6 +173,21 @@ LIST_CAPACITY_RUNTIME: String =
 		|while(capacity<required)capacity=capacity>maximum/2?maximum:capacity*2;
 		|return capacity;
 		|}
+		|#if BLORP_MEMORY_DIAGNOSTICS
+		|static atomic_llong blorp_list_empty_owners;
+		|void *blorp_list_empty_acquire(const void *root){atomic_fetch_add_explicit(&blorp_list_empty_owners,1,memory_order_relaxed);return (void *)root;}
+		|void blorp_list_empty_release(void){atomic_fetch_sub_explicit(&blorp_list_empty_owners,1,memory_order_relaxed);}
+		|int blorp_list_empty_finish(int requested_exit_status){
+		|const long long owners=atomic_load_explicit(&blorp_list_empty_owners,memory_order_relaxed);
+		|if(!blorp_memory_strict||owners==0)return requested_exit_status;
+		|fprintf(stderr,"blorp: leak check: unbalanced empty list owners: %lld\n",owners);
+		|return BLORP_STRICT_LEAK_EXIT_STATUS;
+		|}
+		|#else
+		|#define blorp_list_empty_acquire(root) ((void *)(root))
+		|#define blorp_list_empty_release() ((void)0)
+		|#define blorp_list_empty_finish(requested_exit_status) (requested_exit_status)
+		|#endif
 		|
 
 
@@ -176,6 +197,24 @@ LIST_CAPACITY_RUNTIME: String =
 pure func list_root_allocation(declaration: String, name: String, count: String) -> String:
 	"${declaration} ${name}=blorp_memory_allocate(sizeof *${name}+(size_t)${count}*sizeof *${name}->values);"
 		.concat("if(!${name})abort();atomic_init(&${name}->references,1);${name}->length=0;${name}->capacity=(size_t)${count};")
+
+
+private pure func empty_root_name(suffix: String) -> String:
+	"blorp_list_empty_${suffix}"
+
+
+-- `[]` names its layout's one immortal root instead of allocating. The root's
+-- address is its marker: dup and drop, the only code that changes a List count
+-- after allocation, skip it. Its count therefore keeps its static zero
+-- initialization, never the 1 a consumed update needs to write in place, so
+-- every update copies the root and none writes, frees or resizes it. Every
+-- thread shares it; `const` storage turns a stray write into a fault. A large
+-- starting count would also never reach 0 or 1, but every dup and drop would
+-- then write one location shared by all threads, the root could not be
+-- read-only, and the argument that the count stays far from 1 weakens where
+-- size_t is 32 bits.
+pure func list_empty_root(key: ListElementKey) -> String:
+	"(${list_c_type(key)})blorp_list_empty_acquire(&${empty_root_name(list_suffix(key))})"
 
 
 private pure func allocate_root(type_name: String, count: String) -> String:
@@ -210,9 +249,12 @@ pure func list_runtime(
 ) -> String:
 	suffix = list_suffix(key)
 	type_name = list_c_type(key)
+	empty = empty_root_name(suffix)
 	"struct blorp_l_${suffix}{atomic_size_t references;int64_t length;size_t capacity;${element_type} values[];};"
-		.concat("void blorp_list_dup_${suffix}(${type_name} value){atomic_fetch_add_explicit(&value->references,1,memory_order_relaxed);}")
-		.concat("void blorp_list_drop_${suffix}(${type_name} value){")
+		.concat("static const struct blorp_l_${suffix} ${empty}={.length=0,.capacity=0};")
+		.concat("void blorp_list_dup_${suffix}(${type_name} value){if(value==&${empty})(void)blorp_list_empty_acquire(value);")
+		.concat("else atomic_fetch_add_explicit(&value->references,1,memory_order_relaxed);}")
+		.concat("void blorp_list_drop_${suffix}(${type_name} value){if(value==&${empty}){blorp_list_empty_release();return;}")
 		.concat("if(atomic_fetch_sub_explicit(&value->references,1,memory_order_acq_rel)!=1)return;")
 		.concat("for(int64_t index=0;index<value->length;index++){${element_type} element=value->values[index];(void)element;${destroy}}")
 		.concat("blorp_memory_release(value);}${type_name} blorp_list_repeat_${suffix}(${element_type} element,int64_t count){")
@@ -243,9 +285,11 @@ pure func list_update_name(update: ListUpdate, key: ListElementKey) -> String:
 
 
 -- Borrowed updates copy live slots, acquiring every stored occurrence.
--- Consumed updates check uniqueness before mutation; relocation preserves the
--- old slots' obligations. Invalid set preserves the original value. Growing
--- outputs check int64_t length and size_t storage before arithmetic.
+-- Consumed updates check uniqueness before mutation, which the immortal empty
+-- root never passes. The test must stay `!=1` rather than, say, `>1`: the
+-- root's count is 0. Relocation preserves the old slots' obligations. Invalid
+-- set preserves the original value. Growing outputs check int64_t length and
+-- size_t storage before arithmetic.
 pure func list_update_runtime(
 	update: ListUpdate,
 	key: ListElementKey,

@@ -400,6 +400,49 @@ static void updates_empty(void) {
     assert(atomic_load(&shared_empty->references) == 1 && atomic_load(&other_empty->references) == 1);
     blorp_list_drop_0_i(copy); blorp_list_drop_0_i(shared_empty); blorp_list_drop_0_i(other_empty);
 }
+/* `[]` names its layout's immortal root, spelled as the literal emits it;
+ * each evaluation is one counted owner. Dup and drop never touch the root,
+ * consumed updates copy it, and its untouched count proves no path wrote it. */
+#define EMPTY_INTS ((struct blorp_l_0_i *)blorp_list_empty_acquire(&blorp_list_empty_0_i))
+#define EMPTY_TEXTS ((struct blorp_l_0_s *)blorp_list_empty_acquire(&blorp_list_empty_0_s))
+static void static_empty(void) {
+    const size_t before = allocations, before_releases = releases, before_resizes = resizes;
+    struct blorp_l_0_i *empty = EMPTY_INTS;
+    for (int index = 0; index < 1000; index++) blorp_list_dup_0_i(empty);
+    for (int index = 0; index < 1001; index++) blorp_list_drop_0_i(empty);
+    assert(allocations == before && releases == before_releases);
+    struct blorp_l_0_i *appended = blorp_list_append_take_left_0_i(EMPTY_INTS, 11);
+    assert(appended != &blorp_list_empty_0_i && appended->length == 1 && appended->values[0] == 11);
+    struct blorp_l_0_i *replaced = blorp_list_set_take_left_0_i(EMPTY_INTS, 0, 5);
+    assert(replaced != &blorp_list_empty_0_i && replaced->length == 0);
+    struct blorp_l_0_i *joined = blorp_list_concat_take_left_0_i(EMPTY_INTS, appended);
+    assert(joined != &blorp_list_empty_0_i && joined != appended && joined->length == 1 && joined->values[0] == 11);
+    assert(allocations == before + 3 && resizes == before_resizes);
+    blorp_list_drop_0_i(appended); blorp_list_drop_0_i(replaced); blorp_list_drop_0_i(joined);
+
+    struct blorp_string *text = blorp_int_to_string(3);
+    struct blorp_l_0_s *texts = blorp_list_append_take_left_0_s(EMPTY_TEXTS, text);
+    assert(texts != &blorp_list_empty_0_s && texts->values[0] == text && atomic_load(&text->references) == 2);
+    struct blorp_l_0_s *joined_texts = blorp_list_concat_take_left_0_s(EMPTY_TEXTS, texts);
+    assert(joined_texts->length == 1 && atomic_load(&text->references) == 3);
+    blorp_list_drop_0_s(joined_texts); blorp_list_drop_0_s(texts);
+    assert(atomic_load(&text->references) == 1);
+    blorp_string_release(text);
+    assert(allocations == before + 6 && releases == before_releases + 6);
+    assert(blorp_list_empty_0_i.length == 0 && blorp_list_empty_0_i.capacity == 0);
+    assert(blorp_list_empty_0_s.length == 0 && blorp_list_empty_0_s.capacity == 0);
+    assert(atomic_load(&blorp_list_empty_0_i.references) == 0 && atomic_load(&blorp_list_empty_0_s.references) == 0);
+    assert(atomic_load(&blorp_list_empty_owners) == 0);
+}
+/* An ownership bug on `[]` must still fail the strict exit check. */
+static void static_empty_extra_drop(void) {
+    struct blorp_l_0_i *empty = EMPTY_INTS;
+    blorp_list_drop_0_i(empty); blorp_list_drop_0_i(empty);
+}
+static void static_empty_missing_drop(void) {
+    struct blorp_l_0_i *empty = EMPTY_INTS;
+    blorp_list_dup_0_i(empty); blorp_list_drop_0_i(empty);
+}
 /* Deliberately header-only roots establish overflow rejection before either
  * values[] access or allocation; they are never inspected or destroyed later. */
 static void concat_overflow(int length_limit) {
@@ -442,6 +485,9 @@ int main(int argc, char **argv) {
     else if (strcmp(argv[1], "concat-work") == 0) concat_work();
     else if (strcmp(argv[1], "updates-shared") == 0) updates_shared();
     else if (strcmp(argv[1], "updates-empty") == 0) updates_empty();
+    else if (strcmp(argv[1], "static-empty") == 0) static_empty();
+    else if (strcmp(argv[1], "static-empty-extra-drop") == 0) static_empty_extra_drop();
+    else if (strcmp(argv[1], "static-empty-missing-drop") == 0) static_empty_missing_drop();
     else if (strcmp(argv[1], "bounds") == 0) bounds();
     else if (strcmp(argv[1], "concat-length-overflow") == 0 || strcmp(argv[1], "concat-byte-overflow") == 0) {
         if (signal(SIGABRT, capacity_aborted) == SIG_ERR) return 1;
@@ -460,5 +506,5 @@ int main(int argc, char **argv) {
     }
     else abort();
     assert(allocations == releases);
-    return blorp_memory_finish(0);
+    return blorp_memory_finish(blorp_list_empty_finish(0));
 }
