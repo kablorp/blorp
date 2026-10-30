@@ -496,10 +496,12 @@ There are two independent permissions:
 2. The runtime checks the transferred root's reference count. Only count one
    permits in-place mutation; independently counted aliases require a copy.
 
-Reference count one alone does not make a borrowed parameter mutable. General
-function parameters, record fields and stored-callable wrappers continue to
-borrow. No interprocedural consuming ABI or record-update optimization is part
-of this roadmap. Record missed opportunities for later measured work.
+Reference count one alone does not make a borrowed parameter mutable. Record
+fields and stored-callable wrappers continue to borrow; since
+[O1](#o1-owned-parameter-contracts) a function parameter whose obligation
+reaches an in-place operand is owned and receives its caller's obligation.
+No record-update optimization is part of this roadmap. Record missed
+opportunities for later measured work.
 
 The superseded eager-four experiment passed 251 component checks, 43 native/
 runtime checks, 592-fixture parity and A/B/C source identity. Its measured
@@ -587,8 +589,8 @@ retired instructions, peak RSS and production/test line counts separately.
 Before broad implementation, inspect the lowered and owned form of `collect`.
 Locate its loop-header owner, last-use row, outgoing transfer and drop. Show
 that changing the intrinsic to consume that owner preserves the existing loop
-contract; do not assume the String selector covers every loop. Currently direct
-List calls remain declared wrapper calls, whose parameters borrow. Extend the
+contract; do not assume the String selector covers every loop. Direct List
+calls reach the runtime operation, whose operand 0 may take a transfer. Extend the
 existing typed `declared_call_target` match for the admitted List operation,
 then prove generic element substitution, UFCS and direct calls all reach the
 same runtime target. Callable values must retain their borrowed wrappers.
@@ -1478,7 +1480,7 @@ decisions ([step-0 results](#step-0-results)).
 | Step | Scope | Status |
 | --- | --- | --- |
 | [O0](#o0-re-measure-after-l2b) | Re-run the self-compile copy attribution and count atomic RC operations | Measured ([results](#o0-results)) |
-| [O1](#o1-owned-parameter-contracts) | Per-parameter owned/borrowed contracts, inferred from in-place runtime operations | Approved; step 0 measured ([results](#step-0-results)), ceilings set |
+| [O1](#o1-owned-parameter-contracts) | Per-parameter owned/borrowed contracts, inferred from in-place runtime operations | Implemented on `o1-owned-parameters` ([results](#o1-results)); size overage accepted |
 | [O2](#o2-record-update-binds-before-it-rebuilds) | Project the base fields an update reads before its replacements run | Approved; may land before O1 |
 | [O3](#o3-cell-reuse-for-records-and-union-nodes) | Reuse tokens for unique record cells and boxed union nodes | Undecided; O0 found no allocation witness |
 
@@ -1602,9 +1604,11 @@ result-shape rule (`verify/verify.brp:1485`) reads the row.
 
 **Pins.** Instances taken as callables (`FreeCallableDefinition`,
 `CapturedCallableDefinition` targets), the entrypoint and future `foreign`
-functions are pinned borrowed. One function, `pinned_instances(program)`, in
-`own/own.brp`, which defines the ownership IR, finds them; own and verify both
-call it. Invocation keeps today's borrowed callable ABI and needs no adapters. The
+functions are pinned borrowed. Own finds them in its scan of the lowered
+program, before any ownership IR exists, so it cannot share one
+`pinned_instances(program)` with verify; verify instead checks the rule where
+each pin arises, at every callable definition and at the entry ("pinned
+instance has an owned parameter"). Invocation keeps today's borrowed callable ABI and needs no adapters. The
 cost is that `rows.map(add_zero)` still copies each row, and so do direct calls
 of a pinned `add_zero`. Keith accepted the pins "so long as this is simpler
 than the alternative" and would like the callable restriction lifted in
@@ -1920,6 +1924,85 @@ statements that loop entry never retires the caller's obligation, and
 [required ownership invariants](#required-ownership-invariants).
 `README.md:547` (a returned borrowed parameter) stays true.
 
+#### O1 results
+
+Measured 2026-10-30 on an Apple M4 with Apple clang 21: serial paired runs
+(minimum of three) of B and C compilers built by seed `f426e3500` at `-O2`
+from the branch's own commits on `1d4f3c626`. The base is the `known_owner`
+commit, the O1 commit's parent, which builds the verifier's "owner is not
+defined" diagnostic only on failure; it had been built at every owner
+lookup, which owned parameters multiply. Against its own parent, the
+preparation commit, that commit is −2.58% B instructions and −3.71%
+allocations. Every self-compile uses the O1 commit's frozen `blorp_2/src` as
+input. Peak RSS varies by up to 50 MB between identical runs here, so its
+rows are coarse.
+
+| | Base | O1 | Change | Ceiling |
+| --- | ---: | ---: | ---: | ---: |
+| B instructions | 25,839 M | 26,865 M | +3.97% | +4.5% |
+| B allocations | 25.63 M | 26.84 M | +4.71% | +7% |
+| B peak RSS | 332 MB | 331 MB | −0.4% | +10% |
+| C instructions | 22,785 M | 21,167 M | −7.10% | −1% |
+| C allocations | 18.97 M | 18.84 M | −0.67% | +2% |
+| C peak RSS | 311 MB | 251 MB | −19% | +10% |
+| Emitted C bytes | 23,982,438 | 23,996,188 | +0.06% | +3% |
+
+Shared String literals and the immortal empty List, which `1d4f3c626` and
+its predecessors added, are never unique, so an in-place helper handed one
+copies it, as their uniqueness checks require. An owned parameter filled
+from a literal or `[]` therefore gains nothing from O1, so the
+owned-parameter fixtures pass unique non-empty Lists to reach in-place
+growth: under base and O1 the loop-accumulator fixture makes 17 and 15
+allocations, and the propagation-exit fixture 18 and 17.
+
+The inference makes 380 analyses (242 seeds), keeps 138 of them as final,
+and gives 241 of 2,953 functions an owned parameter. The design is the spike's with
+three changes. A breadth-first scan of each lowered body records which
+parameters each value may carry, so an analysis tries only parameters that
+may reach an in-place operand or an owned callee position, and a flip
+re-analyses only callers that pass a parameter into an owned position.
+Instances are visited from the highest number down, so callees mostly settle
+before their callers. Hot paths avoid tuple matches and eagerly built
+diagnostics, which allocate. Labels are solved directly as `OwnedParameter`
+rows; a pinned instance is one flag per instance. One function,
+`pass_arguments`, holds the move rule for in-place operands and owned
+parameters alike.
+
+`helper_accumulators` is linear: net of `none`, `list_helper` grows
+1.94-1.98×, `string_helper` 2.00× and `set_helper` 2.00-2.01× per doubling
+from 262,144 to 2,097,152, with a constant 8 allocations at every size (9
+for `string_helper`, whose first append copies a shared literal); the base
+was quadratic, with about 65,544 allocations at 65,536 (`list_helper` 3,342
+M against O1's 14.6 M, `set_helper` 43,076 M against 14.7 M). In the earlier
+measurement at 131,072, `list_helper` (17.9 M against legacy 23.1 M) and
+`set_helper` (18.3 M against 24.5 M) beat the legacy compiler with fewer
+allocations, and `control_flow_accumulators` stays ahead with no worse
+growth. `string_helper` misses legacy parity (106 M against 37.5 M):
+`blorp_string_append_int_take_left` formats with `snprintf`, about 650
+instructions per call; a probe with a hand-written digit loop runs it in
+20.0 M. That runtime change is outside O1. Generated chains, parameter lists
+and rings compile within 1.043× of the base's B (`chain_128`; `ring_64`
+1.042×), with overhead linear in size.
+
+**Size.** O1 adds 709 production code lines (own +653, verify +55, emit +1);
+the preparation adds 20 and the `known_owner` commit removes 3. The +520
+ceiling needs the spike's coarse scan, whose analyses breached B's ceiling.
+Keith accepted about +650 to +700 on 2026-10-29 ("cut and accept"); the +709
+includes extracting `requeue_callers` from the solver and is within that
+allowance. Recording consumed parameter owners during insertion instead of
+walking its output was assessed and not done. Join arms are inserted after
+their enclosing block, so a drop in the continuation is recorded before the
+arm's consumptions; telling whether a carrier died first would re-derive the
+drop schedule at each consumption, a second copy of the scheduling rules,
+and the carrier log would thread through about fourteen insertion records.
+
+`reuses_first_operand` is the one reuse authority: own, verify and
+`consuming_helper_name` read it. Emit's `call_list_update` stays, because it
+maps a List operation to the helper family whose borrowed copy every call
+needs, which is not a reuse fact; the family's in-place definition is named
+through `consuming_helper_name` and omitted for an operation that stops
+reusing.
+
 ### O2: record update binds before it rebuilds
 
 Today lowering runs the base, the replacement expressions, then projections
@@ -2006,7 +2089,9 @@ Failing tests first:
 - **Verify negatives:** `f(x, x)` with both positions owned (double
   discharge); `f(xs, xs)` with position 0 owned and position 1 borrowed (the
   borrow is backed by the moved owner); the same with position 1 a raw-IR
-  `ListElementDefinition` of `xs`, for projection ancestry; a consumed
+  `ListElementDefinition` of `xs`, for projection ancestry (a list element is
+  admitted only on a selection edge, so the test projects a record field
+  instead); a consumed
   argument at a borrowed position; a borrowed argument at an owned position;
   an owned parameter live at return; a pinned owned row; a row that disagrees
   with its type. Each checks its diagnostic text.
@@ -2016,9 +2101,28 @@ Failing tests first:
   on a return that lowers to `Break` (`lower_exit`, `lower/lower.brp:784-798`); on `?=`
   exits; and a `@tail_recursive` List accumulator whose header takes the owned
   parameter (the first managed tail-recursion fixture; stop and report if it
-  fails for unrelated reasons).
-- **Wasteful labels:** every owned label in self-compile and the fixtures is
-  consumed on some path; a violation fails the test gate, not compilation.
+  fails for unrelated reasons). Both tail-recursion items are unreachable:
+  specialization rejects managed values in `@tail_recursive` functions
+  (`specialize/specialize.brp:3852`), and only tail recursion lowers a
+  return to `Break`. `owned_parameters/loop_accumulator.brp`, a `while`
+  accumulator whose loop header takes the owned parameter and whose break
+  retires a live one, and `owned_parameters/propagation_exit.brp`, a `?=`
+  exit with a live owned parameter, substitute.
+- **Wasteful labels:** every owned label is consumed on some path; a
+  violation fails the test gate, not compilation. The gate
+  (`test_own/test_owned_label_use.brp`) covers the compiler's own source,
+  `helper_accumulators` and the two owned-parameter fixtures.
+- **Labelling oracles:** in the tree, the `AllBorrowed` and
+  `AllOwnedExceptPinned` labellings are unit oracles in
+  `test_own/test_owned_parameters.brp` ("both labelling oracles verify", and
+  the callable pin under `AllOwnedExceptPinned`). A one-off scratch run on
+  2026-10-30, on `e20b58cd2` before the last rebase (own and verify have not
+  changed since), compiled all 602 e2e fixtures under inferred,
+  all-borrowed, all-owned-except-pinned and base (`known_owner`) labellings:
+  507 ran and 95 are rejected at compile time, identically under all four;
+  exit status, output and stderr are identical once the working-directory
+  path the `current_directory` fixtures print is normalized, and every run
+  is balanced. Nothing in the tree repeats that run.
 
 | Mutation | Expected failures |
 | --- | --- |
@@ -2030,10 +2134,17 @@ Failing tests first:
 | verify: skip the post-discharge recheck | the two dependency negatives only |
 | verify: skip the contract check | consumed-at-borrowed and borrowed-at-owned |
 | inference: one round only | the chain and SCC unit cases |
+| own: ignore borrowed dependencies in `pass_arguments`, the one move rule | both the in-place dependency cases in `test_own/test_list_updates.brp` and the `f(xs, xs)` user call |
+| verify: skip the pin check | the entry and callable pin negatives |
 
 Test migration: 58 test files reference `OwnershipProgram`, 57 build
 `BorrowedArgument` and 39 build `ParameterDefinition`; each `OwnedFunction`
-literal states its rows with explicit `owned = False`.
+literal states its rows with explicit `owned = False`. The deferred suites
+among them are migrated in source: rows come from
+`ownership_inputs.borrowed_rows`, which follows each type's layout, and reads
+of an `OwnedFunction` use `parameters` and `return_type`. Neither Blorp 2 nor
+the legacy compiler can compile them on main, for unrelated reasons, so they
+stay deferred, outside the gates and unchecked.
 
 Commands, narrowest first. The own and verify suites are new files beside
 `test_ownership_transfer.brp`, registered in `blorp_2/Makefile`:
@@ -2093,6 +2204,8 @@ Binding since step 0 (accepted 2026-10-29):
   within 1.06× of base B, with no near-quadratic doubling; report worklist
   analyses.
 - **Size:** at most +520 production code lines, tests reported separately.
+  Keith accepted O1 at about +650 to +700 on 2026-10-29; it landed at +709
+  ([results](#o1-results)).
   The spike used own +464 (about 20 of them counters), verify +40 and
   builtins +4. Legacy needs about 41,400 lines for comparable reach
   (`perceus.brp`, `perceus/`, `ownership.brp`, `ownership_contracts.brp`,
@@ -2107,7 +2220,8 @@ Binding since step 0 (accepted 2026-10-29):
 Separate landings, each green: the helper-name preparation, O1, O2 (any time),
 O3 if approved. O1 needs no seed for correctness; publish a seed after it so
 the default builder gains the savings. Back out O1 by switching production to
-`AllBorrowed`, which the oracle proves equivalent, then revert.
+`AllBorrowed`, which the unit oracle and the one-off fixture run found
+equivalent, then revert.
 
 ### Handback
 
@@ -2393,7 +2507,9 @@ with an error accumulator/break; it does not introduce lambda workarounds.
 **Managed carried values** (179 loops carry a `List`/`String`, 173 an
 `Option`/`Result`) are the larger half. Keep the external borrowed ABI; internal
 carried obligations are explicit. Entry acquires internal loop owners from
-borrowed parameters and never retires the caller's obligation. A header instead
+borrowed parameters and never retires the caller's obligation; an owned
+parameter, since [O1](#o1-owned-parameter-contracts), is an ordinary local
+owner that a header may take. A header instead
 takes an owned initial's obligation when the loop step is that owner's last use,
 the owner holds the initial and backs no other header initial or body read
 ([L2b](#l2b-transfer-ownership-into-joins-and-loop-entry)); a join likewise
@@ -2969,10 +3085,12 @@ root deallocation. Test layout completeness against accepted declarations
 independently of cleanup generated from that layout. Balanced retain/release
 totals can conceal wrong-object releases, leaks and invalid ordering.
 
-Keep ordinary synchronous parameters borrowed and results owned initially. An
-owned result may alias its argument and need not be fresh. Runtime consuming
-operations, if introduced later, must carry explicit contracts across callers
-and callees. Conservative acquisition and copy are correct defaults.
+Results are owned. A synchronous parameter borrows unless its function's row
+owns it ([O1](#o1-owned-parameter-contracts)); then the caller transfers one
+obligation, moving its owner at a last use and otherwise acquiring a fresh one.
+Rows are explicit contracts on every published function, checked at each call.
+An owned result may alias its argument and need not be fresh. Conservative
+acquisition and copy are correct defaults.
 
 ### Construction and projection
 

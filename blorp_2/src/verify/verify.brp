@@ -4,6 +4,7 @@ import:
 	../namespace/builtins as Builtins:
 		RuntimeOperation,
 		RuntimeResult(ValueResult, OptionalResult, ResultResult, BooleanResult),
+		reuses_first_operand,
 		runtime_contract,
 	float: Float methods
 	int: Int methods
@@ -20,6 +21,9 @@ import:
 		OwnedLoopExit(Break, Recur),
 		OwnedLoopTail(ExitLoop, MatchLoop),
 		OwnedFunction,
+		OwnedParameter(UnmanagedParameter, ManagedParameter),
+		parameter_owned,
+		parameter_type,
 		OwnedJoin,
 		OwnedJoinArm, OwnedJoinOutputs, OwnedJoinExit(Yield, TransferLoop), OwnedSelection, OwnedDecisionNode(TestVariant, TestListLength, TestStringBytes, EnterArm), OwnedSelectionEdge,
 		OwnedJoinParameter(UnmanagedJoinParameter, ManagedJoinParameter),
@@ -350,8 +354,12 @@ private pure func verify_borrow(
 			Ok(void)
 
 	match borrow.source:
+		-- An owned parameter is an owner, never a parameter borrow.
 		ParameterBorrow(source):
-			borrows_parameter = if value_number(source) == value_number(borrow.value):
+			borrows_parameter = match borrowed.result:
+				BorrowedResult(ParameterBorrow(_)): value_number(source) == value_number(borrow.value)
+				_: False
+			parameter_defined = if borrows_parameter:
 				state.parameters.any(
 					pure func(
 						parameter: ValueId,
@@ -360,7 +368,7 @@ private pure func verify_borrow(
 			else:
 				False
 
-			if borrows_parameter:
+			if parameter_defined:
 				Ok(void)
 			else:
 				Err(verification_error(span, "parameter borrow does not refer to the borrowed parameter"))
@@ -423,7 +431,7 @@ private pure func call_signature(
 			verify_runtime_signature(operation, span, unions, records)
 		UserFunction(id):
 			match functions.get(function_number(id)):
-				Some(function): Ok(function.signature)
+				Some(function): Ok({ parameters = function.parameters.map(parameter_type), return_type = function.return_type })
 				None: Err(verification_error(span, "unknown called function"))
 
 
@@ -543,7 +551,7 @@ private pure func verify_argument(
 		Err(verification_error(span, "call argument type does not match its contract"))
 	else:
 		match argument:
-			ConsumedArgument(_, _): Err(verification_error(span, "consumed argument requires the first supported update operand"))
+			ConsumedArgument(_, _): Err(verification_error(span, "consumed argument requires an owned parameter or an in-place operand"))
 			UnmanagedArgument(_):
 				match value_needs_ownership(expected, unions, records):
 					Ok(needs_owner):
@@ -563,16 +571,40 @@ private pure func verify_argument(
 				verify_borrow(borrow, state, span, discharged, owners)
 
 
--- Borrow validation uses the complete pre-call state; only this typed target
--- and position may subsequently transfer the obligation.
-private pure func consuming_update_borrows(target: CallTarget, arguments: List[OwnedArgument]) -> List[OwnedArgument]:
+-- Borrow validation uses the complete pre-call state, in which each
+-- transferred operand is still a borrow of its owner. A reusing runtime
+-- operand 0 may receive a transfer and otherwise borrows; an owned row of the
+-- callee must receive one. verify_argument rejects a transfer anywhere else.
+private pure func transferred_borrows(
+	target: CallTarget, arguments: List[OwnedArgument], functions: List[OwnedFunction], span: Span,
+) -> Result[List[OwnedArgument], Diagnostic]:
 	match target:
-		RuntimeFunction(Builtins.StringConcat) | RuntimeFunction(Builtins.StringAppendInt) | RuntimeFunction(Builtins.ListAppend(_)) | RuntimeFunction(Builtins.ListSet(_)) | RuntimeFunction(Builtins.ListConcat(_)):
+		RuntimeFunction(operation):
 			match arguments.get(0):
 				Some(ConsumedArgument(value, owner)):
-					arguments.set(0, BorrowedArgument({ value = value, source = OwnerBorrow(owner) }))
-				_: arguments
-		_: arguments
+					if reuses_first_operand(operation):
+						Ok(arguments.set(0, BorrowedArgument({ value = value, source = OwnerBorrow(owner) })))
+					else:
+						Ok(arguments)
+				_: Ok(arguments)
+		UserFunction(id):
+			match functions.get(function_number(id)):
+				None: Err(verification_error(span, "unknown called function"))
+				Some(callee):
+					var borrows = arguments
+					var failure: Option[Diagnostic] = None
+					var index = 0
+					for row in callee.parameters:
+						if parameter_owned(row):
+							match arguments.get(index):
+								Some(ConsumedArgument(value, owner)):
+									borrows = borrows.set(index, BorrowedArgument({ value = value, source = OwnerBorrow(owner) }))
+								Some(_): failure = Some(verification_error(span, "owned parameter requires a transferred argument"))
+								None: void
+						index = index.add(1)
+					match failure:
+						Some(error): Err(error)
+						None: Ok(borrows)
 
 
 private pure func verify_arguments(
@@ -1116,7 +1148,7 @@ private pure func definition_value(
 private pure func operation_value(
 	definition: OwnedDefinition,
 	state: VerificationFacts,
-	signature: FunctionSignature,
+	rows: List[OwnedParameter],
 	functions: List[OwnedFunction],
 	unions: List[ConcreteUnion],
 	projection: ProjectionContext,
@@ -1198,7 +1230,7 @@ private pure func operation_value(
 					),
 				)
 			else:
-				match signature.parameters.get(index).to_result(
+				match rows.get(index).map(parameter_type).to_result(
 					verification_error(definition.span, "parameter value in a zero-argument function"),
 				):
 					Err(error): Err(error)
@@ -1215,10 +1247,10 @@ private pure func operation_value(
 			else:
 				Err(verification_error(definition.span, "Float literal must be finite"))
 		FreeCallableDefinition(id):
-			match functions.get(function_number(id)).to_result(verification_error(definition.span, "unknown callable body")):
+			match pinned_callable(id, functions, definition.span):
 				Err(error): Err(error)
 				Ok(function):
-					definition_value(definition, CallableType(function.signature.parameters, function.signature.return_type), None, None)
+					definition_value(definition, CallableType(function.parameters.map(parameter_type), function.return_type), None, None)
 		CapturedCallableDefinition(id, payload):
 			stored = match payload:
 				UnmanagedPayload(value): value
@@ -1226,12 +1258,12 @@ private pure func operation_value(
 			match known_value(state, stored, definition.span):
 				Err(error): Err(error)
 				Ok(environment):
-					match functions.get(function_number(id)).to_result(verification_error(definition.span, "unknown callable body")):
+					match pinned_callable(id, functions, definition.span):
 						Err(error): Err(error)
 						Ok(function):
 							match environment.value_type:
 								RecordType(owner):
-									match function.signature.parameters:
+									match function.parameters.map(parameter_type):
 										[]: Err(verification_error(definition.span, "captured callable requires an environment parameter"))
 										[parameter, ...parameters]:
 											match record_layout(owner, records, definition.span):
@@ -1241,7 +1273,7 @@ private pure func operation_value(
 														InlineFields(_): Err(verification_error(definition.span, "callable environment must be a managed record"))
 														CountedFields(_):
 															if same_type(parameter, environment.value_type):
-																definition_value(definition, CallableType(parameters, function.signature.return_type), None, None)
+																definition_value(definition, CallableType(parameters, function.return_type), None, None)
 															else:
 																Err(verification_error(definition.span, "callable body environment type does not match its stored environment"))
 								_: Err(verification_error(definition.span, "captured callable requires an environment parameter"))
@@ -1260,26 +1292,18 @@ private pure func operation_value(
 											definition_value(definition, result, None, None)
 								_: Err(verification_error(definition.span, "indirect call requires a callable value"))
 		CallDefinition(target, arguments):
-			borrows = consuming_update_borrows(target, arguments)
 			match call_signature(target, definition.span, functions, unions, records):
 				Ok(contract):
-					match verify_arguments(
-						borrows,
-						contract.parameters,
-						state,
-						unions,
-						definition.span,
-						records,
-						discharged,
-						owners,
-					):
-						Ok(valid):
-
-							if same_type(contract.return_type, definition.value_type):
-								definition_value(definition, contract.return_type, None, None)
-							else:
-								Err(verification_error(definition.span, "call result type does not match its contract"))
+					match transferred_borrows(target, arguments, functions, definition.span):
 						Err(error): Err(error)
+						Ok(borrows):
+							match verify_arguments(borrows, contract.parameters, state, unions, definition.span, records, discharged, owners):
+								Ok(valid):
+									if same_type(contract.return_type, definition.value_type):
+										definition_value(definition, contract.return_type, None, None)
+									else:
+										Err(verification_error(definition.span, "call result type does not match its contract"))
+								Err(error): Err(error)
 				Err(error): Err(error)
 		ConstructDefinition(id, payloads):
 			var types: List[TypeRef] = []
@@ -1365,37 +1389,47 @@ private pure func discharge_payloads(
 		None: Ok({ discharged = enclosing, owners = local })
 
 
--- Revalidate every remaining operand after discharging, so projection ancestry
--- and direct same-owner borrows cannot survive a consuming call. Distinct counted
--- owners remain valid even when they reference the same runtime allocation.
-private pure func discharge_update_argument(
+-- Consumed owners discharge in argument order, so one owner consumed at two
+-- positions fails at the second. Every remaining borrow is then revalidated
+-- against the post-discharge state, so projection ancestry and direct
+-- same-owner borrows cannot survive a consuming call. Distinct counted owners
+-- remain valid even when they reference the same runtime allocation.
+private pure func discharge_call_arguments(
 	arguments: List[OwnedArgument], state: VerificationFacts,
-	discharged: List[Bool], owners: List[OwnerState],
-	unions: List[ConcreteUnion], records: List[ConcreteRecord], span: Span,
+	discharged: List[Bool], owners: List[OwnerState], span: Span,
 ) -> Result[DischargedOwners, Diagnostic]:
-	match arguments.get(0):
-		Some(ConsumedArgument(value, owner)):
-			match discharge_payloads([OwnedPayload(value, owner)], state, discharged, owners, unions, records, span):
-				Err(error): Err(error)
-				Ok(moved):
-					var failure: Option[Diagnostic] = None
-					var index = 0
-					for argument in arguments:
-						if index.greater_than(0):
-							checked: Result[Void, Diagnostic] = match argument:
-								BorrowedArgument(borrow): verify_borrow(borrow, state, span, moved.discharged, moved.owners)
-								UnmanagedArgument(_): Ok(void)
-								ConsumedArgument(_, _): Err(verification_error(span, "consumed argument requires the first supported update operand"))
-							match checked:
-								Err(error):
-									failure = Some(error)
-									break
-								Ok(_): void
-						index = index.add(1)
-					match failure:
-						Some(error): Err(error)
-						None: Ok(moved)
-		_: Ok({ discharged = discharged, owners = owners })
+	var enclosing = discharged
+	var local = owners
+	var failure: Option[Diagnostic] = None
+	var transferred: Bool = False
+	for argument in arguments:
+		match argument:
+			ConsumedArgument(_, owner):
+				transferred = True
+				match known_owner(state, enclosing, local, owner, span):
+					Err(error): failure = Some(error)
+					Ok(DischargedOwner): failure = Some(verification_error(span, "owner ${owner_number(owner).to_string()} has already been discharged"))
+					Ok(ActiveOwner(_, _)):
+						match owner_slot(state, local.length(), owner, span):
+							Ok(EnclosingSlot(ordinal)): enclosing = discharge(enclosing, ordinal)
+							Ok(LocalSlot(index)): local = local.set(index, DischargedOwner)
+							Err(error): failure = Some(error)
+			_: void
+		if failure.is_some():
+			break
+	-- A call that transfers nothing leaves its pre-call borrows valid.
+	for argument in arguments:
+		if or(failure.is_some(), transferred.not()):
+			break
+		match argument:
+			BorrowedArgument(borrow):
+				match verify_borrow(borrow, state, span, enclosing, local):
+					Err(error): failure = Some(error)
+					Ok(_): void
+			_: void
+	match failure:
+		Some(error): Err(error)
+		None: Ok({ discharged = enclosing, owners = local })
 
 
 private pure func stored_payload_transfer(
@@ -1451,6 +1485,7 @@ private pure func stored_payload_transfer(
 
 private pure func verify_definition_result(
 	definition: OwnedDefinition,
+	rows: List[OwnedParameter],
 	unions: List[ConcreteUnion],
 	records: List[ConcreteRecord],
 ) -> Result[Option[OwnerId], Diagnostic]:
@@ -1465,10 +1500,18 @@ private pure func verify_definition_result(
 					Err(verification_error(definition.span, "unmanaged value carries an ownership obligation"))
 		True:
 			match definition.operation:
-				ParameterDefinition(_):
-					match definition.result:
-						BorrowedResult(ParameterBorrow(source)):
-							if value_number(source) == value_number(definition.id):
+				-- An owned parameter is an obligation the function must discharge.
+				ParameterDefinition(index):
+					match (rows.get(index), definition.result):
+						(Some(ManagedParameter(passing)), OwnedResult(owner)):
+							if passing.owned:
+								Ok(Some(owner))
+							else:
+								Err(verification_error(definition.span, "borrowed parameter cannot introduce an owner"))
+						(Some(ManagedParameter(passing)), BorrowedResult(ParameterBorrow(source))):
+							if passing.owned:
+								Err(verification_error(definition.span, "owned parameter must introduce its owner"))
+							else if value_number(source) == value_number(definition.id):
 								Ok(None)
 							else:
 								Err(
@@ -1478,7 +1521,7 @@ private pure func verify_definition_result(
 									),
 								)
 						_:
-							Err(verification_error(definition.span, "managed parameter must be borrowed"))
+							Err(verification_error(definition.span, "managed parameter must follow its row"))
 				PayloadDefinition(_, parent):
 					match definition.result:
 						BorrowedResult(PayloadBorrow(source)):
@@ -1755,7 +1798,7 @@ private pure func suffix_projection_type(
 private pure func verify_definition_type(
 	definition: OwnedDefinition,
 	state: VerificationFacts,
-	signature: FunctionSignature,
+	rows: List[OwnedParameter],
 	functions: List[OwnedFunction],
 	unions: List[ConcreteUnion],
 	projection: ProjectionContext,
@@ -1773,7 +1816,7 @@ private pure func verify_definition_type(
 	operation_value(
 		definition,
 		state,
-		signature,
+		rows,
 		functions,
 		unions,
 		projection,
@@ -1816,7 +1859,7 @@ private pure func takes_existing_owner(loop: OwnedLoop, owner: OwnerId) -> Bool:
 -- The loop and its continuation both start from that one post-transfer state,
 -- so a later drop or a body read of a taken owner uses a discharged owner.
 private pure func transfer_loop_entry(
-	loop: OwnedLoop, state: VerificationState, signature: FunctionSignature, functions: List[OwnedFunction],
+	loop: OwnedLoop, state: VerificationState, rows: List[OwnedParameter], functions: List[OwnedFunction],
 	unions: List[ConcreteUnion], projection: ProjectionContext, records: List[ConcreteRecord],
 ) -> Result[VerificationState, Diagnostic]:
 	var drops: List[OwnershipOperation] = []
@@ -1834,19 +1877,19 @@ private pure func transfer_loop_entry(
 			break
 	match failure:
 		Some(error): Err(error)
-		None: verify_operations(drops, state, signature, functions, unions, projection, records).map(pure func(transferred): transferred.state)
+		None: verify_operations(drops, state, rows, functions, unions, projection, records).map(pure func(transferred): transferred.state)
 
 
 -- Each entering owner is discharged at the join step, checked as a drop
 -- there. The arms start from the state before it and the continuation from
 -- the state after, so a later drop or read of an entering owner is rejected.
 private pure func transfer_join_entry(
-	join: OwnedJoin, state: VerificationState, signature: FunctionSignature, functions: List[OwnedFunction],
+	join: OwnedJoin, state: VerificationState, rows: List[OwnedParameter], functions: List[OwnedFunction],
 	unions: List[ConcreteUnion], projection: ProjectionContext, records: List[ConcreteRecord],
 ) -> Result[VerificationState, Diagnostic]:
 	span = join_parameter(join.result).span
 	drops = join.entering.map(pure func(owner: OwnerId) -> OwnershipOperation: DropOwner(owner, span))
-	verify_operations(drops, state, signature, functions, unions, projection, records).map(pure func(entered): entered.state)
+	verify_operations(drops, state, rows, functions, unions, projection, records).map(pure func(entered): entered.state)
 
 
 -- A join whose arms are verified after its block, as they are numbered:
@@ -1974,7 +2017,7 @@ private pure func introduce_outputs(
 private pure func verify_operations(
 	operations: List[OwnershipOperation],
 	initial: VerificationState,
-	signature: FunctionSignature,
+	rows: List[OwnedParameter],
 	functions: List[OwnedFunction],
 	unions: List[ConcreteUnion],
 	projection: ProjectionContext,
@@ -1993,7 +2036,7 @@ private pure func verify_operations(
 				match verify_definition_type(
 					definition,
 					state,
-					signature,
+					rows,
 					functions,
 					unions,
 					projection,
@@ -2006,7 +2049,7 @@ private pure func verify_operations(
 					Ok(candidate):
 						stored: Result[Void, Diagnostic] = match definition.operation:
 							CallDefinition(_, arguments):
-								match discharge_update_argument(arguments, state, discharged, owners, unions, records, definition.span):
+								match discharge_call_arguments(arguments, state, discharged, owners, definition.span):
 									Err(error): Err(error)
 									Ok(moved):
 										discharged = moved.discharged
@@ -2050,7 +2093,7 @@ private pure func verify_operations(
 							Err(error):
 								Err(error)
 							Ok(_):
-								match verify_definition_result(definition, unions, records):
+								match verify_definition_result(definition, rows, unions, records):
 									Err(error):
 										Err(error)
 									Ok(introduced):
@@ -2092,7 +2135,7 @@ private pure func verify_operations(
 				match verify_join_header(join, state, unions, records, discharged, owners):
 					Err(error): Err(error)
 					Ok(_):
-						match transfer_join_entry(join, start, signature, functions, unions, projection, records):
+						match transfer_join_entry(join, start, rows, functions, unions, projection, records):
 							Err(error): Err(error)
 							Ok(entered):
 								match introduce_outputs([join.result].concat(join.carried), entered, unions, records):
@@ -2105,7 +2148,7 @@ private pure func verify_operations(
 										Ok(void)
 
 			ExecuteLoop(loop):
-				match transfer_loop_entry(loop, { facts = state, discharged = discharged, owners = owners }, signature, functions, unions, projection, records):
+				match transfer_loop_entry(loop, { facts = state, discharged = discharged, owners = owners }, rows, functions, unions, projection, records):
 					Err(error): Err(error)
 					Ok(start):
 						match introduce_outputs([loop.result].concat(loop.carried), start, unions, records):
@@ -3015,7 +3058,7 @@ private pure func verify_selection_edge(
 	selection: OwnedSelection,
 	initial: VerificationState,
 	projection: ProjectionContext,
-	signature: FunctionSignature,
+	rows: List[OwnedParameter],
 	functions: List[OwnedFunction],
 	unions: List[ConcreteUnion],
 	records: List[ConcreteRecord],
@@ -3043,7 +3086,7 @@ private pure func verify_selection_edge(
 	restricted: Void ?= match failure:
 		Some(error): Err(error)
 		None: Ok(void)
-	verified ?= verify_operations(edge.operations, initial, signature, functions, unions, projection, records)
+	verified ?= verify_operations(edge.operations, initial, rows, functions, unions, projection, records)
 	arity: Void ?= if edge.transfers.length() == target.inputs.length():
 		Ok(void)
 	else:
@@ -3078,7 +3121,7 @@ private pure func verify_selection(
 	targets: List[SelectionTarget],
 	state: VerificationState,
 	end: BlockEnd,
-	signature: FunctionSignature,
+	rows: List[OwnedParameter],
 	functions: List[OwnedFunction],
 	unions: List[ConcreteUnion],
 	records: List[ConcreteRecord],
@@ -3118,7 +3161,7 @@ private pure func verify_selection(
 							Some(Some(facts)):
 								initial = enter(state, cursor.next_value, cursor.next_owner)
 								projection: ProjectionContext = SelectionProjection(selection.scrutinee, facts)
-								match verify_selection_edge(edge, target, selection, initial, projection, signature, functions, unions, records, scrutinee.span):
+								match verify_selection_edge(edge, target, selection, initial, projection, rows, functions, unions, records, scrutinee.span):
 									Err(error): failure = Some(error)
 									Ok(after):
 										cursor = after
@@ -3144,7 +3187,7 @@ private pure func verify_joins(
 	pending: List[PendingControl],
 	active: Option[ActiveLoop],
 	end: BlockEnd,
-	signature: FunctionSignature,
+	rows: List[OwnedParameter],
 	functions: List[OwnedFunction],
 	unions: List[ConcreteUnion],
 	records: List[ConcreteRecord],
@@ -3153,12 +3196,12 @@ private pure func verify_joins(
 	var invalid: Option[Diagnostic] = None
 	for control in pending:
 		checked: Result[BlockEnd, Diagnostic] = match control:
-			VerifyLoop(loop, start): verify_loop(loop, start, cursor, signature, functions, unions, records)
+			VerifyLoop(loop, start): verify_loop(loop, start, cursor, rows, functions, unions, records)
 			VerifyJoin(join):
 				var targets: List[SelectionTarget] = []
 				for arm in join.join.arms:
 					targets = targets.append({ id = arm.id, inputs = arm.inputs })
-				selected = verify_selection(join.join.selection, targets, join.start, cursor, signature, functions, unions, records)
+				selected = verify_selection(join.join.selection, targets, join.start, cursor, rows, functions, unions, records)
 				var after = cursor
 				match selected:
 					Err(error): invalid = Some(error)
@@ -3166,7 +3209,7 @@ private pure func verify_joins(
 				for arm in join.join.arms:
 					if invalid.is_some():
 						break
-					match verify_join_arm(arm, join, after, active, signature, functions, unions, records):
+					match verify_join_arm(arm, join, after, active, rows, functions, unions, records):
 						Err(error):
 							invalid = Some(error)
 							break
@@ -3189,7 +3232,7 @@ private pure func verify_join_arm(
 	join: PendingJoin,
 	cursor: BlockEnd,
 	active: Option[ActiveLoop],
-	signature: FunctionSignature,
+	rows: List[OwnedParameter],
 	functions: List[OwnedFunction],
 	unions: List[ConcreteUnion],
 	records: List[ConcreteRecord],
@@ -3198,14 +3241,14 @@ private pure func verify_join_arm(
 	start ?= introduce_outputs(arm.inputs, initial, unions, records)
 	match arm.exit:
 		Yield(outputs):
-			match verify_operations(arm.operations, start, signature, functions, unions, NoProjection, records):
+			match verify_operations(arm.operations, start, rows, functions, unions, NoProjection, records):
 				Err(error): Err(error)
 				Ok(verified):
 					match verify_join_transfers(outputs, join.join, join.start.discharged, verified.state, unions, records):
 						Err(error): Err(error)
-						Ok(_): verify_joins(verified.pending, active, block_end(verified.state), signature, functions, unions, records)
+						Ok(_): verify_joins(verified.pending, active, block_end(verified.state), rows, functions, unions, records)
 		TransferLoop(target, tail):
-			verify_abrupt_exit(target, { operations = arm.operations, tail = tail }, active, start, signature, functions, unions, records)
+			verify_abrupt_exit(target, { operations = arm.operations, tail = tail }, active, start, rows, functions, unions, records)
 
 
 private pure func verify_abrupt_exit(
@@ -3213,7 +3256,7 @@ private pure func verify_abrupt_exit(
 	body: OwnedLoopBlock,
 	active: Option[ActiveLoop],
 	state: VerificationState,
-	signature: FunctionSignature,
+	rows: List[OwnedParameter],
 	functions: List[OwnedFunction],
 	unions: List[ConcreteUnion],
 	records: List[ConcreteRecord],
@@ -3224,7 +3267,7 @@ private pure func verify_abrupt_exit(
 		Ok(void)
 	else:
 		Err(verification_error(span, "loop transfer does not target the nearest active loop"))
-	verify_loop_block(body, scope.loop, scope.pre, scope.first_owner, state, signature, functions, unions, records)
+	verify_loop_block(body, scope.loop, scope.pre, scope.first_owner, state, rows, functions, unions, records)
 
 
 private pure func loop_exit_span(exit: OwnedLoopExit) -> Span:
@@ -3370,7 +3413,7 @@ private pure func initialize_loop(
 	loop: OwnedLoop,
 	pre: VerificationState,
 	cursor: BlockEnd,
-	signature: FunctionSignature,
+	rows: List[OwnedParameter],
 	functions: List[OwnedFunction],
 	unions: List[ConcreteUnion],
 	records: List[ConcreteRecord],
@@ -3380,7 +3423,7 @@ private pure func initialize_loop(
 	var operations: List[OwnershipOperation] = []
 	for acquisition in loop.entry_acquisitions:
 		operations = operations.append(AcquireOwner(acquisition.owner, acquisition.borrow, span))
-	acquired ?= verify_operations(operations, start, signature, functions, unions, NoProjection, records)
+	acquired ?= verify_operations(operations, start, rows, functions, unions, NoProjection, records)
 	var current = acquired.state
 	var failure: Option[Diagnostic] = None
 	for header in loop.headers:
@@ -3430,13 +3473,13 @@ private pure func verify_loop(
 	loop: OwnedLoop,
 	pre: VerificationState,
 	cursor: BlockEnd,
-	signature: FunctionSignature,
+	rows: List[OwnedParameter],
 	functions: List[OwnedFunction],
 	unions: List[ConcreteUnion],
 	records: List[ConcreteRecord],
 ) -> Result[BlockEnd, Diagnostic]:
-	initial ?= initialize_loop(loop, pre, cursor, signature, functions, unions, records)
-	verify_loop_block(loop.body, loop, pre, cursor.next_owner, initial, signature, functions, unions, records)
+	initial ?= initialize_loop(loop, pre, cursor, rows, functions, unions, records)
+	verify_loop_block(loop.body, loop, pre, cursor.next_owner, initial, rows, functions, unions, records)
 
 
 private pure func verify_loop_match(
@@ -3446,7 +3489,7 @@ private pure func verify_loop_match(
 	first_owner: Int,
 	state: VerificationState,
 	end: BlockEnd,
-	signature: FunctionSignature,
+	rows: List[OwnedParameter],
 	functions: List[OwnedFunction],
 	unions: List[ConcreteUnion],
 	records: List[ConcreteRecord],
@@ -3454,7 +3497,7 @@ private pure func verify_loop_match(
 	var targets: List[SelectionTarget] = []
 	for arm in matched.arms:
 		targets = targets.append({ id = arm.id, inputs = arm.inputs })
-	selected ?= verify_selection(matched.selection, targets, state, end, signature, functions, unions, records)
+	selected ?= verify_selection(matched.selection, targets, state, end, rows, functions, unions, records)
 	var cursor = selected
 	var invalid: Option[Diagnostic] = None
 	for arm in matched.arms:
@@ -3462,7 +3505,7 @@ private pure func verify_loop_match(
 		match introduce_outputs(arm.inputs, initial, unions, records):
 			Err(error): invalid = Some(error)
 			Ok(branch_start):
-				match verify_loop_block(arm.body, loop, pre, first_owner, branch_start, signature, functions, unions, records):
+				match verify_loop_block(arm.body, loop, pre, first_owner, branch_start, rows, functions, unions, records):
 					Err(error): invalid = Some(error)
 					Ok(after): cursor = after
 		if invalid.is_some():
@@ -3478,22 +3521,22 @@ private pure func verify_loop_block(
 	pre: VerificationState,
 	first_owner: Int,
 	initial: VerificationState,
-	signature: FunctionSignature,
+	rows: List[OwnedParameter],
 	functions: List[OwnedFunction],
 	unions: List[ConcreteUnion],
 	records: List[ConcreteRecord],
 ) -> Result[BlockEnd, Diagnostic]:
 	active: Option[ActiveLoop] = Some({ loop = loop, pre = pre, first_owner = first_owner })
-	verified ?= verify_operations(body.operations, initial, signature, functions, unions, NoProjection, records)
+	verified ?= verify_operations(body.operations, initial, rows, functions, unions, NoProjection, records)
 	match body.tail:
 		ExitLoop(exit):
 			match verify_loop_exit(exit, loop, pre, first_owner, verified.state, unions, records):
 				Err(error): Err(error)
-				Ok(_): verify_joins(verified.pending, active, block_end(verified.state), signature, functions, unions, records)
+				Ok(_): verify_joins(verified.pending, active, block_end(verified.state), rows, functions, unions, records)
 		MatchLoop(matched):
-			match verify_joins(verified.pending, active, block_end(verified.state), signature, functions, unions, records):
+			match verify_joins(verified.pending, active, block_end(verified.state), rows, functions, unions, records):
 				Err(error): Err(error)
-				Ok(completed): verify_loop_match(matched, loop, pre, first_owner, verified.state, completed, signature, functions, unions, records)
+				Ok(completed): verify_loop_match(matched, loop, pre, first_owner, verified.state, completed, rows, functions, unions, records)
 
 
 private pure func verify_function(
@@ -3516,7 +3559,7 @@ private pure func verify_function(
 	verified ?= verify_operations(
 		function.operations,
 		initial,
-		function.signature,
+		function.parameters,
 		functions,
 		unions,
 		NoProjection,
@@ -3524,7 +3567,7 @@ private pure func verify_function(
 	)
 	state = verified.state
 
-	valid_parameter: Void ?= if state.facts.parameters.length() == function.signature.parameters.length():
+	valid_parameter: Void ?= if state.facts.parameters.length() == function.parameters.length():
 		Ok(void)
 	else:
 		Err(
@@ -3538,9 +3581,25 @@ private pure func verify_function(
 			),
 		)
 
-	returned ?= verify_transfer(function.result, state, function.signature.return_type, unions, records)
-	completed ?= verify_joins(verified.pending, None, block_end(state), function.signature, functions, unions, records)
+	returned ?= verify_transfer(function.result, state, function.return_type, unions, records)
+	completed ?= verify_joins(verified.pending, None, block_end(state), function.parameters, functions, unions, records)
 	Ok(void)
+
+
+-- A callable invocation and the entry wrapper pass every argument borrowed,
+-- so an instance taken as a callable, and the entry, are pinned: none of
+-- their parameters may own.
+private pure func borrowed_contract(function: OwnedFunction, span: Span) -> Result[Void, Diagnostic]:
+	if function.parameters.any(parameter_owned):
+		Err(verification_error(span, "pinned instance has an owned parameter"))
+	else:
+		Ok(void)
+
+
+private pure func pinned_callable(id: FunctionInstanceId, functions: List[OwnedFunction], span: Span) -> Result[OwnedFunction, Diagnostic]:
+	function ?= functions.get(function_number(id)).to_result(verification_error(span, "unknown callable body"))
+	pinned ?= borrowed_contract(function, span)
+	Ok(function)
 
 
 -- Independently check the accepted wrapper convention against its target signature.
@@ -3550,11 +3609,11 @@ private pure func verify_entry(
 ) -> Result[Void, Diagnostic]:
 	parameters_match = match convention:
 		NoArguments(_, _):
-			entry.signature.parameters.is_empty()
+			entry.parameters.is_empty()
 		WithArguments(_, _):
-			match entry.signature.parameters:
+			match entry.parameters:
 				[value]:
-					same_type(value, ListType(StringType))
+					same_type(parameter_type(value), ListType(StringType))
 				_:
 					False
 
@@ -3566,33 +3625,33 @@ private pure func verify_entry(
 
 	result_matches = match result:
 		IntegerExitStatus:
-			same_type(entry.signature.return_type, IntType)
+			same_type(entry.return_type, IntType)
 		SuccessfulExit:
-			same_type(entry.signature.return_type, VoidType)
+			same_type(entry.return_type, VoidType)
 
 	valid = and(parameters_match, result_matches)
+	span: Span = match entry.operations.get(0):
+		Some(operation):
+			match operation:
+				DefineValue(definition):
+					definition.span
+				ExecuteJoin(join): join_parameter(join.result).span
+				ExecuteLoop(loop): join_parameter(loop.result).span
+				AcquireOwner(_, _, occurrence):
+					occurrence
+				DropOwner(_, occurrence):
+					occurrence
+		None:
+			{
+				source = compiler_source(),
+				start = 0,
+				end = 0
+			}
 
+	-- The entry wrapper passes its arguments borrowed, so the entry is pinned.
 	if valid:
-		Ok(void)
+		borrowed_contract(entry, span)
 	else:
-		span: Span = match entry.operations.get(0):
-			Some(operation):
-				match operation:
-					DefineValue(definition):
-						definition.span
-					ExecuteJoin(join): join_parameter(join.result).span
-					ExecuteLoop(loop): join_parameter(loop.result).span
-					AcquireOwner(_, _, occurrence):
-						occurrence
-					DropOwner(_, occurrence):
-						occurrence
-			None:
-				{
-					source = compiler_source(),
-					start = 0,
-					end = 0
-				}
-
 		Err(
 			verification_error(
 				span,
@@ -3653,12 +3712,23 @@ pure func verify(program: OwnershipProgram) -> Result[VerifiedProgram, Diagnosti
 			verify_layout_graph(program.records, program.unions)
 
 	for function in program.functions:
-		for value_type in function.signature.parameters.append(function.signature.return_type):
-			match verify_type_membership(value_type, program.unions, program.records, { source = compiler_source(), start = 0, end = 0 }):
-				Ok(_):
-					void
-				Err(error):
-					invalid = Some(error)
+		match verify_type_membership(function.return_type, program.unions, program.records, { source = compiler_source(), start = 0, end = 0 }):
+			Ok(_): void
+			Err(error): invalid = Some(error)
+		-- Each row's type exists, and the row is managed exactly when its type
+		-- needs ownership.
+		for row in function.parameters:
+			match verify_type_membership(parameter_type(row), program.unions, program.records, { source = compiler_source(), start = 0, end = 0 }):
+				Err(error): invalid = Some(error)
+				Ok(_): void
+			match value_needs_ownership(parameter_type(row), program.unions, program.records):
+				Err(error): invalid = Some(error)
+				Ok(managed):
+					agrees: Bool = match row:
+						ManagedParameter(_): managed
+						UnmanagedParameter(_): managed.not()
+					if agrees.not():
+						invalid = Some(verification_error({ source = compiler_source(), start = 0, end = 0 }, "parameter row disagrees with its type's ownership"))
 
 		if invalid.is_some():
 			break

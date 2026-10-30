@@ -1,0 +1,336 @@
+import:
+	../../../src/own/own as Own
+	../../../src/specialize/specialize as Concrete
+	../../../src/utils/syntax: entry_function
+	../../../src/verify/verify: verify
+	../list_update_inputs: lowered, UPDATE_DECLARATIONS
+	int: Int methods
+	bool: Bool methods
+	list: List methods
+	string: String methods
+	result: Result methods
+	option: Option methods
+	test: TestSuite
+
+
+-- Scalar helpers beside the List ones `UPDATE_DECLARATIONS` supplies.
+INT_DECLARATIONS: String =
+	|pure func subtract(left: Int, right: Int) -> Int:
+	|    builtin("int.subtract")
+	|
+
+
+private pure func inserted(body: String, labelling: Own.Labelling) -> Option[Own.OwnershipProgram]:
+	match lowered(UPDATE_DECLARATIONS.add(INT_DECLARATIONS).add(body)):
+		Ok(program):
+			match Own.insert_ownership(program, labelling):
+				Ok(owned): Some(owned)
+				Err(_): None
+		Err(_): None
+
+
+-- How a function receives each parameter, read from its published rows.
+private pure func rows(function: Own.OwnedFunction) -> List[Bool]:
+	function.parameters.map(pure func(row: Own.OwnedParameter) -> Bool:
+		match row:
+			Own.ManagedParameter(passing): passing.owned
+			Own.UnmanagedParameter(_): False
+	)
+
+
+private pure func same_rows(left: List[Bool], right: List[Bool]) -> Bool:
+	var same: Bool = left.length().equals(right.length())
+	var index = 0
+	for row in left:
+		match right.get(index):
+			Some(other): same = same.and(row.equals(other))
+			None: same = False
+		index = index.add(1)
+	same
+
+
+-- Each function's rows, in instance order, without empty rows.
+private pure func function_rows(program: Own.OwnershipProgram) -> List[List[Bool]]:
+	program.functions.map(rows).filter(pure func(found): found.is_empty().not())
+
+
+private pure func has_rows(program: Own.OwnershipProgram, expected: List[Bool]) -> Bool:
+	function_rows(program).any(pure func(found): same_rows(found, expected))
+
+
+private pure func count_rows(program: Own.OwnershipProgram, expected: List[Bool]) -> Int:
+	function_rows(program).filter(pure func(found): same_rows(found, expected)).length()
+
+
+private pure func owns_nothing(program: Own.OwnershipProgram) -> Bool:
+	function_rows(program).all(pure func(found): found.all(pure func(owned): owned.not()))
+
+
+-- The entry's user calls that transfer an argument, in order, with the
+-- owners acquired just before each.
+private fixed record EntryCall {
+	arguments: List[Own.OwnedArgument],
+	acquired: List[Int]
+}
+
+
+private pure func entry_calls(program: Own.OwnershipProgram) -> List[EntryCall]:
+	var calls: List[EntryCall] = []
+	match program.functions.get(Concrete.function_number(entry_function(program.entrypoint))):
+		None: void
+		Some(entry):
+			var acquired: List[Int] = []
+			for operation in entry.operations:
+				match operation:
+					Own.AcquireOwner(owner, _, _): acquired = acquired.append(Own.owner_number(owner))
+					Own.DefineValue(definition):
+						match definition.operation:
+							Own.CallDefinition(_, arguments):
+								if arguments.any(pure func(argument):
+									match argument:
+										Own.ConsumedArgument(_, _): True
+										_: False
+								):
+									calls = calls.append({ arguments = arguments, acquired = acquired })
+								acquired = []
+							_: acquired = []
+					_: void
+	calls
+
+
+private pure func consumed_owner(argument: Option[Own.OwnedArgument]) -> Option[Int]:
+	match argument:
+		Some(Own.ConsumedArgument(_, owner)): Some(Own.owner_number(owner))
+		_: None
+
+
+PUSH: String =
+	|pure func push(values: List[Int], value: Int) -> List[Int]:
+	|    append(values, value)
+	|
+
+
+pure func test_a_reusing_update_makes_its_operand_parameter_owned() -> Bool:
+	body: String =
+		|func main() -> Int:
+		|    first: List[Int] = []
+		|    second = push(first, 1)
+		|    length(second)
+		|
+	match inserted(PUSH.add(body), Own.InferredLabels):
+		None: False
+		Some(program):
+			-- At its last use the caller moves its owner: nothing is acquired for the call.
+			moved = match entry_calls(program):
+				[call]: call.acquired.is_empty().and(consumed_owner(call.arguments.get(0)).is_some())
+				_: False
+			has_rows(program, [True, False]).and(moved).and(verify(program).is_ok())
+
+
+pure func test_a_caller_still_using_its_value_acquires_for_the_transfer() -> Bool:
+	body: String =
+		|func main() -> Int:
+		|    first: List[Int] = []
+		|    second = push(first, 1)
+		|    length(first)
+		|
+	match inserted(PUSH.add(body), Own.InferredLabels):
+		None: False
+		Some(program):
+			acquired = match entry_calls(program):
+				[call]:
+					match consumed_owner(call.arguments.get(0)):
+						Some(owner): call.acquired.contains(owner)
+						None: False
+				_: False
+			acquired.and(verify(program).is_ok())
+
+
+-- The provisional analysis owns both parameters; only `items` is consumed.
+pure func test_only_the_parameter_that_reaches_reuse_owns() -> Bool:
+	body: String =
+		|pure func grow(items: List[Int], other: List[Int]) -> List[Int]:
+		|    append(items, length(other))
+		|func main() -> Int:
+		|    first: List[Int] = []
+		|    second: List[Int] = [1]
+		|    length(grow(first, second))
+		|
+	match inserted(body, Own.InferredLabels):
+		None: False
+		Some(program): has_rows(program, [True, False]).and(verify(program).is_ok())
+
+
+pure func test_one_owner_filling_two_owned_positions_moves_once_and_acquires_once() -> Bool:
+	body: String =
+		|pure func both(left: List[Int], right: List[Int]) -> Int:
+		|    length(append(left, length(append(right, 1))))
+		|func main() -> Int:
+		|    first: List[Int] = []
+		|    both(first, first)
+		|
+	match inserted(body, Own.InferredLabels):
+		None: False
+		Some(program):
+			passed = match entry_calls(program):
+				[call]:
+					match (consumed_owner(call.arguments.get(0)), consumed_owner(call.arguments.get(1))):
+						(Some(moved), Some(acquired)): call.acquired.contains(moved).not().and(call.acquired.contains(acquired))
+						_: False
+				_: False
+			has_rows(program, [True, True]).and(passed).and(verify(program).is_ok())
+
+
+pure func test_ownership_propagates_along_a_call_chain() -> Bool:
+	body: String =
+		|pure func push_twice(values: List[Int]) -> List[Int]:
+		|    push(push(values, 1), 2)
+		|pure func outer(values: List[Int]) -> List[Int]:
+		|    push_twice(values)
+		|func main() -> Int:
+		|    first: List[Int] = []
+		|    length(outer(first))
+		|
+	match inserted(PUSH.add(body), Own.InferredLabels):
+		None: False
+		Some(program):
+			has_rows(program, [True, False]).and(count_rows(program, [True]).equals(2))
+				.and(verify(program).is_ok())
+
+
+pure func test_ownership_propagates_through_mutual_recursion() -> Bool:
+	body: String =
+		|pure func ping(values: List[Int], count: Int) -> List[Int]:
+		|    if less_than(count, 1):
+		|        values
+		|    else:
+		|        pong(values, subtract(count, 1))
+		|pure func pong(values: List[Int], count: Int) -> List[Int]:
+		|    ping(append(values, count), count)
+		|func main() -> Int:
+		|    first: List[Int] = []
+		|    length(ping(first, 3))
+		|
+	match inserted(body, Own.InferredLabels):
+		None: False
+		Some(program): count_rows(program, [True, False]).equals(2).and(verify(program).is_ok())
+
+
+pure func test_a_loop_header_take_makes_the_parameter_owned() -> Bool:
+	body: String =
+		|pure func fill(values: List[Int], count: Int) -> List[Int]:
+		|    var items = values
+		|    while less_than(length(items), count):
+		|        items = append(items, 1)
+		|    items
+		|func main() -> Int:
+		|    first: List[Int] = []
+		|    length(fill(first, 3))
+		|
+	match inserted(body, Own.InferredLabels):
+		None: False
+		Some(program): has_rows(program, [True, False]).and(verify(program).is_ok())
+
+
+pure func test_a_join_entry_makes_the_parameter_owned() -> Bool:
+	body: String =
+		|pure func choose(values: List[Int], flag: Int) -> List[Int]:
+		|    if less_than(flag, 1):
+		|        append(values, 1)
+		|    else:
+		|        values
+		|func main() -> Int:
+		|    first: List[Int] = []
+		|    length(choose(first, 0))
+		|
+	match inserted(body, Own.InferredLabels):
+		None: False
+		Some(program): has_rows(program, [True, False]).and(verify(program).is_ok())
+
+
+pure func test_a_parameter_only_returned_stays_borrowed() -> Bool:
+	body: String =
+		|pure func same(values: List[Int]) -> List[Int]:
+		|    values
+		|func main() -> Int:
+		|    first: List[Int] = []
+		|    length(same(first))
+		|
+	match inserted(body, Own.InferredLabels):
+		None: False
+		Some(program): owns_nothing(program).and(verify(program).is_ok())
+
+
+-- A body taken as a callable keeps the borrowed callable ABI even though it
+-- updates its parameter; the entry is pinned too. The callable is stored, so
+-- specialization cannot turn its invocation into a direct call.
+pure func test_an_instance_taken_as_a_callable_stays_borrowed() -> Bool:
+	body: String =
+		|pure func push_one(values: List[Int]) -> List[Int]:
+		|    append(values, 1)
+		|func main(arguments: List[String]) -> Int:
+		|    first: List[Int] = []
+		|    callbacks: List[pure (List[Int]) -> List[Int]] = [push_one]
+		|    match callbacks:
+		|        [callback]: length(callback(first))
+		|        _: length(arguments)
+		|
+	match (inserted(body, Own.InferredLabels), inserted(body, Own.AllOwnedExceptPinned)):
+		(Some(program), Some(oracle)):
+			-- Both pinned instances, `push_one` and the entry, keep one borrowed row.
+			owns_nothing(program).and(verify(program).is_ok()).and(count_rows(oracle, [False]).equals(2)).and(verify(oracle).is_ok())
+		_: False
+
+
+pure func test_each_generic_instance_has_its_own_rows() -> Bool:
+	body: String =
+		|pure func push_any[T](values: List[T], value: T) -> List[T]:
+		|    append(values, value)
+		|func main() -> Int:
+		|    numbers: List[Int] = []
+		|    words: List[String] = []
+		|    add_lengths(length(push_any(numbers, 1)), length(push_any(words, "a")))
+		|pure func add_lengths(left: Int, right: Int) -> Int:
+		|    subtract(left, subtract(0, right))
+		|
+	match inserted(body, Own.InferredLabels):
+		None: False
+		-- The String instance's second parameter is managed but only stored.
+		Some(program): count_rows(program, [True, False]).equals(2).and(verify(program).is_ok())
+
+
+-- The approved oracles: labels never change what verifies.
+pure func test_both_oracles_verify() -> Bool:
+	body: String =
+		|pure func grow(items: List[Int], other: List[Int]) -> List[Int]:
+		|    append(items, length(other))
+		|func main() -> Int:
+		|    first: List[Int] = [1]
+		|    second = grow(first, first)
+		|    third = grow(second, first)
+		|    length(third)
+		|
+	match (inserted(PUSH.add(body), Own.AllBorrowed), inserted(PUSH.add(body), Own.AllOwnedExceptPinned)):
+		(Some(borrowed), Some(owned)):
+			owns_nothing(borrowed).and(verify(borrowed).is_ok())
+				.and(has_rows(owned, [True, True])).and(verify(owned).is_ok())
+		_: False
+
+
+tests: TestSuite = {
+	description = "Owned-parameter contracts and their inference",
+	tests = [
+		("a reusing update makes its operand parameter owned", test_a_reusing_update_makes_its_operand_parameter_owned),
+		("a caller still using its value acquires for the transfer", test_a_caller_still_using_its_value_acquires_for_the_transfer),
+		("only the parameter that reaches reuse owns", test_only_the_parameter_that_reaches_reuse_owns),
+		("one owner filling two owned positions moves once and acquires once", test_one_owner_filling_two_owned_positions_moves_once_and_acquires_once),
+		("ownership propagates along a call chain", test_ownership_propagates_along_a_call_chain),
+		("ownership propagates through mutual recursion", test_ownership_propagates_through_mutual_recursion),
+		("a loop header take makes the parameter owned", test_a_loop_header_take_makes_the_parameter_owned),
+		("a join entry makes the parameter owned", test_a_join_entry_makes_the_parameter_owned),
+		("a parameter only returned stays borrowed", test_a_parameter_only_returned_stays_borrowed),
+		("an instance taken as a callable stays borrowed", test_an_instance_taken_as_a_callable_stays_borrowed),
+		("each generic instance has its own rows", test_each_generic_instance_has_its_own_rows),
+		("both labelling oracles verify", test_both_oracles_verify),
+	]
+}

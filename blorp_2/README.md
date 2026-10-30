@@ -1338,8 +1338,9 @@ func main() -> Int:
 The [mixed fixture](test/e2e/fixtures/record/mixed.brp) exits 2. The returned
 String has its own owner before the temporary Entry is destroyed. A repeated
 child stored in two fields contributes two independent ownership obligations.
-Parameters borrow; managed results return owned. Field expressions execute once
-in written order, independently of declaration order.
+A parameter borrows unless its function owns it (see
+[owned parameters](#owned-parameters)); managed results return owned. Field
+expressions execute once in written order, independently of declaration order.
 
 Fixed records whose fields are Int, Float or recursively eligible inline fixed
 records stay inline. Other fixed records use an ARC root, including a record
@@ -1401,6 +1402,41 @@ use the ordinary managed record storage and ownership machinery. Tuple
 equality, ordering and traits are outside this increment.
 The [tuple validation and cost report](https://github.com/kablorp/blorp/blob/1e07c4dce85e51cd7ad911142e9bc96a5e0d91c7/benchmarks/results/blorp_2_tuples_2026-10-21.md)
 records matched self-compilation costs, ownership checks and native coverage.
+
+## Owned parameters
+
+A function updates a List or String parameter in place when its caller hands
+over the value's obligation, so an accumulator threaded through a helper
+grows instead of being copied on every call. The
+[loop accumulator fixture](test/e2e/fixtures/owned_parameters/loop_accumulator.brp)
+prints `4 from 7`, `1 from 7` and `5 from 0`:
+
+```blorp
+pure func fill(items: List[Int], extra: List[Int], count: Int) -> List[Int]:
+    var values = items
+    var spare = extra
+    var remaining = count
+    while 0.less_than(remaining):
+        values = values.append(remaining)
+        spare = spare.append(remaining)
+        remaining = remaining.subtract(1)
+    values
+```
+
+There is no syntax. Ownership insertion labels each managed parameter of
+each function instance owned or borrowed. A parameter owns when its
+obligation can reach an in-place `append`, `set`, `concat`, String `add` or
+`append_int` operand, or another function's owned parameter, directly or
+through a loop header, a join, or a projection acquired from the parameter
+and consumed after the parameter is dropped. A generic instance has its own
+labels. Instances taken as callables and the entrypoint keep every parameter
+borrowed. At a call, an owned position moves the caller's owner when the
+call is that owner's last use and no borrowed position of the call depends
+on it; otherwise the caller acquires a fresh obligation, which leaves the
+root shared, so the callee copies, as before. When one owner fills two owned
+positions, the first moves it and the second acquires. Labels never change a
+program's behaviour, only where it copies; the verifier checks every call
+against its callee's labels.
 
 ## Fresh record updates
 
@@ -2067,9 +2103,10 @@ Semantic rules:
   `void`. No explicit `return` is needed.
 - `String` is an immutable managed leaf. The default prelude supplies UFCS
   operations such as `to_string(Int) -> String` and `length(String) -> Int`.
-  Direct calls require named function imports. Parameters borrow for the duration of a
-  synchronous call; managed results transfer an owner to the caller, including
-  results that alias a borrowed parameter. Unused mortal results are released.
+  Direct calls require named function imports. A borrowed parameter borrows for the
+  duration of a synchronous call, and an owned one receives an obligation (see
+  [owned parameters](#owned-parameters)); managed results transfer an owner to the
+  caller, including results that alias a borrowed parameter. Unused mortal results are released.
   String-bearing unions store their root inline and own their active children.
   A tail-match arm may create, borrow, alias and return arm-local managed values;
   unused and intermediate owners are dropped on that arm, and a managed result
@@ -2079,8 +2116,8 @@ Semantic rules:
   fresh ordinary String owner. A join's arms follow the same rules and move a
   managed result into the join, which owns it afterwards. Direct String `add`
   calls and interpolation may instead transfer a last-used owner into
-  concatenation. The verifier checks that transfer independently; ordinary
-  function parameters still borrow. String buffers carry byte length and
+  concatenation. The verifier checks that transfer independently; an owned
+  parameter receives its argument's obligation the same way. String buffers carry byte length and
   capacity: a transferred unique buffer appends in place when capacity suffices
   and otherwise grows geometrically. Shared buffers copy, preserving value
   semantics. Concat-only accumulation can transfer a nearest-loop-owned String
@@ -2455,8 +2492,10 @@ last-used List owner, verified independently before emission. A unique
 transferred root reuses its storage: append/concat reserve geometrically and
 acquire only the incoming occurrences; set acquires the replacement before
 destroying the old occurrence. Existing unchanged children are not acquired or
-dropped again. Shared roots copy. Ordinary parameters and named/stored callable
-wrappers still borrow. Every other operand must remain valid after the transfer.
+dropped again. Shared roots copy. An owned parameter receives a transferred
+owner the same way; parameters of instances taken as callables, and named or
+stored callable wrappers, still borrow. Every other operand must remain valid
+after the transfer.
 `set` with a
 negative or out-of-range index returns an unchanged value. `append` adds one
 element; `concat` preserves both input sequences. The runtime helper for an update
@@ -2977,7 +3016,8 @@ diagnostic rendering are pure. The pipeline publishes these complete results:
    from its initial, except that a header takes the obligation of an owner
    whose last use is the loop step, which holds the initial itself and backs
    no other header initial or body read; that obligation is then neither
-   acquired at entry nor dropped after the loop. Parameters never transfer.
+   acquired at entry nor dropped after the loop. A borrowed parameter never
+   transfers; an owned parameter is an ordinary local obligation of its function.
    Loop edges retain their acquire-before-retire batches, including repeated
    outgoing values. Tail-match
    arms publish the same ownership operations and typed return transfers as a

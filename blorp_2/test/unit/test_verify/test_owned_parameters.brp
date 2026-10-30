@@ -1,0 +1,292 @@
+import:
+	../../../src/own/own as Own
+	../../../src/specialize/specialize as Concrete
+	../../../src/utils/syntax: Entrypoint(WithArguments), EntryResult(IntegerExitStatus), entry_function
+	../../../src/verify/verify: verify
+	../list_update_inputs: lowered, UPDATE_DECLARATIONS
+	int: Int methods
+	bool: Bool methods
+	list: List methods
+	string: String methods
+	result: Result methods
+	option: Option methods
+	test: TestSuite
+
+
+-- Inferred labels, named explicitly so these negatives do not depend on
+-- which labelling production uses.
+private pure func owned_program(body: String) -> Option[Own.OwnershipProgram]:
+	match lowered(UPDATE_DECLARATIONS.add(body)).and_then(pure func(program): Own.insert_ownership(program, Own.InferredLabels)):
+		Ok(program): Some(program)
+		Err(_): None
+
+
+private pure func rewrite_operations(
+	function: Own.OwnedFunction, rewrite: pure (Own.OwnedDefinition) -> Own.OwnedDefinition,
+) -> Own.OwnedFunction:
+	operations = function.operations.map(pure func(operation: Own.OwnershipOperation) -> Own.OwnershipOperation:
+		match operation:
+			Own.DefineValue(definition): Own.DefineValue(rewrite(definition))
+			_: operation
+	)
+	{ function | operations = operations }
+
+
+-- Rewrites the arguments of every user call in the entry function.
+private pure func rewrite_entry_calls(
+	program: Own.OwnershipProgram, rewrite: pure (List[Own.OwnedArgument]) -> List[Own.OwnedArgument],
+) -> Own.OwnershipProgram:
+	index = Concrete.function_number(entry_function(program.entrypoint))
+	match program.functions.get(index):
+		None: program
+		Some(entry):
+			rewritten = rewrite_operations(entry, pure func(definition: Own.OwnedDefinition) -> Own.OwnedDefinition:
+				match definition.operation:
+					Own.CallDefinition(Concrete.UserFunction(callee), arguments):
+						{ definition | operation = Own.CallDefinition(Concrete.UserFunction(callee), rewrite(arguments)) }
+					_: definition
+			)
+			{ program | functions = program.functions.set(index, rewritten) }
+
+
+-- The instance the entry calls first.
+private pure func entry_callee(program: Own.OwnershipProgram) -> Option[Concrete.FunctionInstanceId]:
+	var found: Option[Concrete.FunctionInstanceId] = None
+	match program.functions.get(Concrete.function_number(entry_function(program.entrypoint))):
+		None: void
+		Some(entry):
+			for operation in entry.operations:
+				match operation:
+					Own.DefineValue(definition):
+						match definition.operation:
+							Own.CallDefinition(Concrete.UserFunction(callee), _):
+								if found.is_none():
+									found = Some(callee)
+							_: void
+					_: void
+	found
+
+
+private pure func rejects(program: Own.OwnershipProgram, message: String) -> Bool:
+	match verify(program):
+		Ok(_): False
+		Err(error): error.message.equals("ownership verification failed: ${message}")
+
+
+-- Both positions own; the call moves `first` into position 0 and acquires
+-- for position 1.
+BOTH_OWNED: String =
+	|pure func both(left: List[Int], right: List[Int]) -> Int:
+	|    length(append(left, length(append(right, 1))))
+	|func main() -> Int:
+	|    first: List[Int] = []
+	|    both(first, first)
+	|
+
+
+-- Position 0 owns and position 1 borrows; the borrow of `first` keeps the
+-- call from moving its owner, so position 0 acquires.
+OWNED_THEN_BORROWED: String =
+	|pure func grow(items: List[Int], other: List[Int]) -> List[Int]:
+	|    append(items, length(other))
+	|func main() -> Int:
+	|    first: List[Int] = []
+	|    length(grow(first, first))
+	|
+
+
+-- `box` owns: its projection is acquired after its last use, so the
+-- acquisition may be unique and is consumed. The entry passes `b.items`
+-- through its own acquired owner.
+PROJECTED: String =
+	|fixed record Box { items: List[Int] }
+	|pure func take(box: Box, other: List[Int]) -> Int:
+	|    length(append(box.items, length(other)))
+	|func main() -> Int:
+	|    b: Box = { items = [1] }
+	|    take(b, b.items)
+	|
+
+
+pure func test_inserted_owned_calls_verify() -> Bool:
+	match (owned_program(BOTH_OWNED), owned_program(OWNED_THEN_BORROWED), owned_program(PROJECTED)):
+		(Some(both), Some(grow), Some(projected)): verify(both).is_ok().and(verify(grow).is_ok()).and(verify(projected).is_ok())
+		_: False
+
+
+pure func test_one_owner_consumed_at_two_owned_positions_is_rejected() -> Bool:
+	match owned_program(BOTH_OWNED):
+		None: False
+		Some(program):
+			doubled = rewrite_entry_calls(program, pure func(arguments: List[Own.OwnedArgument]) -> List[Own.OwnedArgument]:
+				match arguments:
+					[Own.ConsumedArgument(first, owner), Own.ConsumedArgument(second, _)]:
+						[Own.ConsumedArgument(first, owner), Own.ConsumedArgument(second, owner)]
+					_: arguments
+			)
+			-- `first` is the entry's first owner.
+			rejects(doubled, "owner 0 has already been discharged")
+
+
+pure func test_a_borrow_backed_by_a_moved_owner_is_rejected() -> Bool:
+	match owned_program(OWNED_THEN_BORROWED):
+		None: False
+		Some(program):
+			moved = rewrite_entry_calls(program, pure func(arguments: List[Own.OwnedArgument]) -> List[Own.OwnedArgument]:
+				match arguments:
+					[Own.ConsumedArgument(first, _), Own.BorrowedArgument(borrow)]:
+						match borrow.source:
+							Own.OwnerBorrow(owner): [Own.ConsumedArgument(first, owner), Own.BorrowedArgument(borrow)]
+							_: arguments
+					_: arguments
+			)
+			rejects(moved, "borrow refers to discharged owner 0")
+
+
+-- The borrowed position names the projection through its parent rather
+-- than its acquired owner, so only projection ancestry reaches the moved box.
+pure func test_a_projection_of_a_moved_owner_is_rejected() -> Bool:
+	match owned_program(PROJECTED):
+		None: False
+		Some(program):
+			through_parent = rewrite_entry_calls(program, pure func(arguments: List[Own.OwnedArgument]) -> List[Own.OwnedArgument]:
+				match arguments:
+					[Own.ConsumedArgument(box, owner), Own.BorrowedArgument(items)]:
+						[Own.ConsumedArgument(box, owner), Own.BorrowedArgument({ value = items.value, source = Own.PayloadBorrow(box) })]
+					_: arguments
+			)
+			-- The box is the entry's third owner, after the List literal and its stored copy.
+			rejects(through_parent, "borrow refers to discharged owner 2")
+
+
+pure func test_a_borrowed_argument_at_an_owned_position_is_rejected() -> Bool:
+	match owned_program(OWNED_THEN_BORROWED):
+		None: False
+		Some(program):
+			borrowed = rewrite_entry_calls(program, pure func(arguments: List[Own.OwnedArgument]) -> List[Own.OwnedArgument]:
+				match arguments:
+					[Own.ConsumedArgument(first, owner), other]:
+						[Own.BorrowedArgument({ value = first, source = Own.OwnerBorrow(owner) }), other]
+					_: arguments
+			)
+			rejects(borrowed, "owned parameter requires a transferred argument")
+
+
+pure func test_a_consumed_argument_at_a_borrowed_position_is_rejected() -> Bool:
+	match owned_program(OWNED_THEN_BORROWED):
+		None: False
+		Some(program):
+			consumed = rewrite_entry_calls(program, pure func(arguments: List[Own.OwnedArgument]) -> List[Own.OwnedArgument]:
+				match arguments:
+					[first, Own.BorrowedArgument(borrow)]:
+						match borrow.source:
+							Own.OwnerBorrow(owner): [first, Own.ConsumedArgument(borrow.value, owner)]
+							_: arguments
+					_: arguments
+			)
+			rejects(consumed, "consumed argument requires an owned parameter or an in-place operand")
+
+
+-- The callee keeps its owned parameter's obligation instead of handing it
+-- to the in-place append.
+pure func test_an_owned_parameter_live_at_return_is_rejected() -> Bool:
+	match owned_program(OWNED_THEN_BORROWED):
+		None: False
+		Some(program):
+			match entry_callee(program):
+				None: False
+				Some(callee):
+					index = Concrete.function_number(callee)
+					match program.functions.get(index):
+						None: False
+						Some(grow):
+							kept = rewrite_operations(grow, pure func(definition: Own.OwnedDefinition) -> Own.OwnedDefinition:
+								match definition.operation:
+									Own.CallDefinition(target, [Own.ConsumedArgument(value, owner), ...rest]):
+										{ definition | operation = Own.CallDefinition(target, [Own.BorrowedArgument({ value = value, source = Own.OwnerBorrow(owner) })].concat(rest)) }
+									_: definition
+							)
+							rejects({ program | functions = program.functions.set(index, kept) }, "owner 0 remains live at return")
+
+
+-- The entry wrapper passes its arguments borrowed. `helper` owns its
+-- parameter and has the entry's signature, so only the pin rejects it.
+pure func test_a_pinned_instance_with_an_owned_row_is_rejected() -> Bool:
+	body: String =
+		|pure func helper(values: List[String]) -> Int:
+		|    length(append(values, "x"))
+		|func main(arguments: List[String]) -> Int:
+		|    helper(arguments)
+		|
+	match owned_program(body):
+		None: False
+		Some(program):
+			match entry_callee(program):
+				None: False
+				Some(helper):
+					verify(program).is_ok().and(rejects({ program | entrypoint = WithArguments(helper, IntegerExitStatus) }, "pinned instance has an owned parameter"))
+
+
+-- `push_one` owns its parameter because the entry calls it directly. Taking
+-- it as the entry's stored callable instead of the identically typed,
+-- pinned `push_two` leaves a callable instance with an owned row.
+pure func test_a_callable_instance_with_an_owned_row_is_rejected() -> Bool:
+	body: String =
+		|pure func push_one(values: List[Int]) -> List[Int]:
+		|    append(values, 1)
+		|pure func push_two(values: List[Int]) -> List[Int]:
+		|    append(values, 2)
+		|func main() -> Int:
+		|    first: List[Int] = []
+		|    second = push_one(first)
+		|    callbacks: List[pure (List[Int]) -> List[Int]] = [push_two]
+		|    match callbacks:
+		|        [callback]: length(callback(second))
+		|        _: 0
+		|
+	match owned_program(body):
+		None: False
+		Some(program):
+			match (entry_callee(program), program.functions.get(Concrete.function_number(entry_function(program.entrypoint)))):
+				(Some(push_one), Some(entry)):
+					taken = rewrite_operations(entry, pure func(definition: Own.OwnedDefinition) -> Own.OwnedDefinition:
+						match definition.operation:
+							Own.FreeCallableDefinition(_): { definition | operation = Own.FreeCallableDefinition(push_one) }
+							_: definition
+					)
+					entry_index = Concrete.function_number(entry_function(program.entrypoint))
+					verify(program).is_ok().and(rejects({ program | functions = program.functions.set(entry_index, taken) }, "pinned instance has an owned parameter"))
+				_: False
+
+
+pure func test_a_row_that_disagrees_with_its_type_is_rejected() -> Bool:
+	match owned_program(OWNED_THEN_BORROWED):
+		None: False
+		Some(program):
+			match entry_callee(program):
+				None: False
+				Some(callee):
+					index = Concrete.function_number(callee)
+					match program.functions.get(index):
+						None: False
+						Some(grow):
+							-- `other` is a managed List; claim it needs no ownership.
+							mislabelled = { grow | parameters = grow.parameters.set(1, Own.UnmanagedParameter(Concrete.ListType(Concrete.IntType))) }
+							rejects({ program | functions = program.functions.set(index, mislabelled) }, "parameter row disagrees with its type's ownership")
+
+
+tests: TestSuite = {
+	description = "Owned-parameter contract verification",
+	tests = [
+		("inserted owned calls verify", test_inserted_owned_calls_verify),
+		("one owner consumed at two owned positions is rejected", test_one_owner_consumed_at_two_owned_positions_is_rejected),
+		("a borrow backed by a moved owner is rejected", test_a_borrow_backed_by_a_moved_owner_is_rejected),
+		("a projection of a moved owner is rejected", test_a_projection_of_a_moved_owner_is_rejected),
+		("a borrowed argument at an owned position is rejected", test_a_borrowed_argument_at_an_owned_position_is_rejected),
+		("a consumed argument at a borrowed position is rejected", test_a_consumed_argument_at_a_borrowed_position_is_rejected),
+		("an owned parameter live at return is rejected", test_an_owned_parameter_live_at_return_is_rejected),
+		("a pinned instance with an owned row is rejected", test_a_pinned_instance_with_an_owned_row_is_rejected),
+		("a callable instance with an owned row is rejected", test_a_callable_instance_with_an_owned_row_is_rejected),
+		("a row that disagrees with its type is rejected", test_a_row_that_disagrees_with_its_type_is_rejected),
+	]
+}
