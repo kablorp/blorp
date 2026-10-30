@@ -205,6 +205,11 @@ carries a `prepared` list, so its fix is a `break`, not a helper.
 
 Basis: about +1 line per site, plus tests.
 
+Status: landed except verify's membership loop, which waits for O1, as does
+C2's `invalid_binding` item. The equality summary loop in `traits.brp` had
+the same defect and was fixed too. Sites whose failures are unreachable or
+indistinguishable from source carry their justification in the commit.
+
 ### C4: one internal-error authority
 
 `utils/syntax.brp` holds the only constructors. These lose their copies:
