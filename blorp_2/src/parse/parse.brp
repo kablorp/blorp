@@ -3616,10 +3616,17 @@ private fixed record UnionResult {
 }
 
 
--- `start` is at the `union` keyword.
-private pure func consume_union(start: ParserState, module: ModuleId, visibility: Visibility) -> Result[UnionResult, Diagnostic]:
+-- `start` is at the `union` keyword. A fixed union is stored inline at one
+-- known size, so it cannot declare type parameters; the whole written list is
+-- reported.
+private pure func consume_union(start: ParserState, module: ModuleId, visibility: Visibility, fixed: Bool) -> Result[UnionResult, Diagnostic]:
 	name ?= consume_name(shifted(start, 1), "expected a union type name")
 	type_parameters ?= consume_type_parameter_names(name.next)
+	_: Void ?= if and(fixed, type_parameters.names.is_empty().not()):
+		closing = parser_span(shifted(type_parameters.next, -1))
+		Err(diagnostic({ parser_span(name.next) | end = closing.end }, "a fixed union cannot declare type parameters", "remove fixed to declare an ordinary generic union, or remove the type parameters"))
+	else:
+		Ok(void)
 	colon ?= expect(type_parameters.next, at_colon(type_parameters.next), "expected ':' after the union type name", "write union Choice: or union Box[T]:")
 	newline ?= expect(colon, at_newline(colon), "expected a newline after the union header", "put each variant name on its own indented line")
 	opened ?= expect(newline, at_indent(newline), "expected an indented union variant", "declare at least one variant on an indented line")
@@ -3630,7 +3637,8 @@ private pure func consume_union(start: ParserState, module: ModuleId, visibility
 			visibility = visibility,
 			type_name = name.name,
 			type_parameters = type_parameters.names,
-			variants = variants.variants
+			variants = variants.variants,
+			fixed = fixed
 		},
 		next = variants.next,
 	})
@@ -4199,14 +4207,14 @@ private pure func consume_visible_declaration(state: ParserState, module: Module
 			Ok(parsed): Ok({ declaration = ConstantDeclaration(parsed.declaration), next = parsed.next })
 			Err(error): Err(error)
 	else if at_keyword(state, UnionKeyword):
-		match consume_union(state, module, visibility):
+		match consume_union(state, module, visibility, False):
 			Ok(parsed): Ok({ declaration = UnionDeclaration(parsed.declaration), next = parsed.next })
 			Err(error): Err(error)
-	-- `fixed union` will promise stack storage under the `fixed` rules in
-	-- grammar.ebnf. Those rules are not checked yet, so it currently declares
-	-- the same union as `union`.
+	-- `fixed union` promises inline storage with no counted child. The parser
+	-- rejects its type parameters; checking rejects managed payloads and
+	-- recursion.
 	else if and(at_word(state, recognized_words(state).fixed_word), at_keyword(shifted(state, 1), UnionKeyword)):
-		match consume_union(shifted(state, 1), module, visibility):
+		match consume_union(shifted(state, 1), module, visibility, True):
 			Ok(parsed): Ok({ declaration = UnionDeclaration(parsed.declaration), next = parsed.next })
 			Err(error): Err(error)
 	else if at_word(state, recognized_words(state).fixed_word):
