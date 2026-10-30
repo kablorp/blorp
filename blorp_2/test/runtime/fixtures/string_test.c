@@ -626,6 +626,14 @@ int main(int argc, char **argv) {
         assert_decimal(INT64_MIN, "-9223372036854775808", 20);
     } else if (strcmp(argv[1], "maximum") == 0) {
         assert_decimal(INT64_MAX, "9223372036854775807", 19);
+    } else if (strcmp(argv[1], "decimal_boundaries") == 0) {
+        assert_decimal(INT64_C(7), "7", 1);
+        assert_decimal(INT64_C(10), "10", 2);
+        assert_decimal(INT64_C(-10), "-10", 3);
+        assert_decimal(INT64_C(99), "99", 2);
+        assert_decimal(INT64_C(100), "100", 3);
+        assert_decimal(INT64_C(-100), "-100", 4);
+        assert_decimal(INT64_MIN + 1, "-9223372036854775807", 20);
     } else if (strcmp(argv[1], "initial_reference") == 0) {
         test_initial_reference();
     } else if (strcmp(argv[1], "retain") == 0) {

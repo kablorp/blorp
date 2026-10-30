@@ -224,9 +224,10 @@ static void append_int_borrowed(const char *prefix, int64_t prefix_length,
 }
 
 static void append_int_limits(void) {
-    const int64_t values[] = {0, -7, INT64_MIN, INT64_MAX};
-    const char *expected[] = {"0", "-7", "-9223372036854775808", "9223372036854775807"};
-    const int64_t lengths[] = {1, 2, 20, 19};
+    const int64_t values[] = {0, 7, -7, 10, -10, 99, 100, -100, INT64_MIN, INT64_MIN + 1, INT64_MAX};
+    const char *expected[] = {"0", "7", "-7", "10", "-10", "99", "100", "-100",
+                              "-9223372036854775808", "-9223372036854775807", "9223372036854775807"};
+    const int64_t lengths[] = {1, 1, 2, 2, 3, 2, 3, 4, 20, 20, 19};
     for (size_t index = 0; index < sizeof values / sizeof values[0]; index++) {
         append_int_borrowed("", 0, values[index], expected[index], lengths[index]);
         struct blorp_string *value = blorp_string_from_bytes("", 0);

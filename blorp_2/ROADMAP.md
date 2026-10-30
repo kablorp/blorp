@@ -1485,7 +1485,7 @@ projections and O3.
 | --- | --- | --- |
 | [O0](#o0-re-measure-after-l2b) | Re-run the self-compile copy attribution and count atomic RC operations | Measured ([results](#o0-results)) |
 | [O1](#o1-owned-parameter-contracts) | Per-parameter owned/borrowed contracts, inferred from in-place runtime operations | Landed 2026-10-30 ([results](#o1-results)); size overage accepted |
-| [O1 follow-ups](#o1-follow-ups) | One passing rule in `pass_arguments`, an `append_int` digit loop, a seed containing O1 | Next |
+| [O1 follow-ups](#o1-follow-ups) | One passing rule in `pass_arguments`, an `append_int` digit loop, a seed containing O1 | Rule and digit loop done; O1 is in the pinned seed, the digit loop awaits the next rotation |
 | [Attribution after O1](#attribution-after-o1) | Remaining copies, RC operations and allocations by kind, a fresh profile | Next, alongside O2 |
 | [O2](#o2-record-update-binds-before-it-rebuilds) | Project the base fields an update reads before its replacements run | Approved; benchmark first |
 | [Borrowed field projections](#borrowed-field-projections) | Read managed record fields borrowed, as union payloads already are | Proposed; decided from the attribution, needs approval |
@@ -1983,11 +1983,10 @@ M against O1's 14.6 M, `set_helper` 43,076 M against 14.7 M). In the earlier
 measurement at 131,072, `list_helper` (17.9 M against legacy 23.1 M) and
 `set_helper` (18.3 M against 24.5 M) beat the legacy compiler with fewer
 allocations, and `control_flow_accumulators` stays ahead with no worse
-growth. `string_helper` misses legacy parity (106 M against 37.5 M):
-`blorp_string_append_int_take_left` formats with `snprintf`, about 650
-instructions per call; a probe with a hand-written digit loop runs it in
-20.0 M. That runtime change is outside O1. Generated chains, parameter lists
-and rings compile within 1.043× of the base's B (`chain_128`; `ring_64`
+growth. `string_helper` missed legacy parity (106 M against 37.5 M):
+`blorp_string_append_int_take_left` formatted with `snprintf`, about 650
+instructions per call. The [digit loop](#o1-follow-ups) closed it.
+Generated chains, parameter lists and rings compile within 1.043× of the base's B (`chain_128`; `ring_64`
 1.042×), with overhead linear in size.
 
 **Size.** O1 adds 709 production code lines (own +653, verify +55, emit +1);
@@ -2083,19 +2082,24 @@ Three steps, each landed green:
 1. **One passing rule.** `pass_arguments` takes `transfers: List[Bool]` and
    `acquires: Bool`, which can disagree. A two-variant type (an in-place
    operand, or owned positions) replaces them, as a preparatory commit before
-   any further `own` work.
-2. **`append_int` digit loop.** `string_helper` misses legacy parity (106 M
-   instructions against 37.5 M at 131,072) because the runtime formats with
+   any further `own` work. Done: `PassingRule`, with emitted C byte-identical
+   and +5 production lines.
+2. **`append_int` digit loop.** `string_helper` missed legacy parity (106 M
+   instructions against 37.5 M at 131,072) because the runtime formatted with
    `snprintf`, at `runtime/string_concat.brp` (`string_append_int_runtime`,
    shared by the borrowed and in-place helpers) and `runtime/string.brp`. A
-   hand-written loop takes the magnitude as `0u - (uint64_t)value`, since
+   hand-written loop now takes the magnitude as `0u - (uint64_t)value`, since
    negating `INT64_MIN` is undefined; runtime tests cover 0, both extremes and
-   negative values. A probe ran `string_helper` in 20.0 M.
-3. **A seed containing O1 and the digit loop.** Until it is pinned, the
-   seed-built B pays the inference (about +1.3% instructions against the
-   pre-O1 compiler, net of the `known_owner` saving) and gets none of C's
-   −7.1%. Before the pin, re-run the four-labelling oracle over every e2e
-   fixture, as recorded under Testing.
+   negative values. Done: `string_helper` at 131,072 now runs 8.4 M
+   instructions net of `none` against legacy's 19.5 M (20.2 M and 37.5 M
+   gross), and self-compile C retires 5.0% fewer instructions, since the
+   compiler formats many Ints. `snprintf` remains in Float formatting and
+   the process and system runtimes.
+3. **A seed containing O1 and the digit loop.** The seed pinned in
+   `a5785d3fd` (`905b4e7d5`) contains O1, so the default B gains O1's −7.1%
+   of C instructions; the four-labelling oracle was not re-run before that
+   pin. The digit loop's further −5.0% reaches the default B with the next
+   seed rotation.
 
 ### Attribution after O1
 
