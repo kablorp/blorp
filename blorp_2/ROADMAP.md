@@ -3155,6 +3155,9 @@ target allocator overhead remains M8 work.
 
 ## M9: post-self-compilation architecture audit
 
+The [accepted-fact cleanup plan](ARCHITECTURE_FACTS_PLAN.md) scopes four
+findings from the 2026-10-31 source audit into independently reviewed changes.
+
 **Trigger.** Start immediately after the real M8 proof passes. M8 still defines
 self-compilation; M9 is the next required review, before major feature expansion.
 Earlier audits and passing fixtures inform this audit but do not replace it.
