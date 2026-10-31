@@ -57,10 +57,11 @@ private func command(arguments: List[String], prefix: String, expected_status: I
             Err(error): Err(error)
 
 
-private func compile_fixture(compiler: String, source: String, prefix: String) -> Result[Void, String]:
+-- `inputs` are the compiler arguments between the library root and the output.
+private func compile_fixture(compiler: String, inputs: List[String], prefix: String) -> Result[Void, String]:
     _ ?= command(
         ["-u", "BLORP_MEMORY_STATS", "BLORP_LEAK_CHECK=strict", compiler,
-         "--library-root", LIBRARY_ROOT, source, prefix.add(".c")],
+         "--library-root", LIBRARY_ROOT].concat(inputs).concat([prefix.add(".c")]),
         prefix.add(".compile"), 0, COMPILATION_TIMEOUT_MS,
     )
     output: String ?= read_file(prefix.add(".compile.stdout"))
@@ -115,7 +116,17 @@ private func run_fixture(prefix: String, example: Example) -> Result[Void, Strin
 
 private func verify_example(compiler: String, c_compiler: String, work_directory: String, example: Example) -> Result[Void, String]:
     prefix = work_directory.add("/").add(example.name)
-    _ ?= compile_fixture(compiler, example.source, prefix)
+    _ ?= compile_fixture(compiler, [example.source], prefix)
+    _ ?= link_fixture(c_compiler, prefix, NormalNative)
+    _ ?= link_fixture(c_compiler, prefix, StrictNative)
+    run_fixture(prefix, example)
+
+
+-- One `--test-suite` program: `example.source` is the first root, which owns
+-- the entry, and `grouped` are the later roots in command-line order.
+private func verify_suites(compiler: String, c_compiler: String, work_directory: String, example: Example, grouped: List[String]) -> Result[Void, String]:
+    prefix = work_directory.add("/").add(example.name)
+    _ ?= compile_fixture(compiler, ["--test-suite", example.source].concat(grouped), prefix)
     _ ?= link_fixture(c_compiler, prefix, NormalNative)
     _ ?= link_fixture(c_compiler, prefix, StrictNative)
     run_fixture(prefix, example)
@@ -189,6 +200,10 @@ func suite(compiler: String, c_compiler: String, work_directory: String) -> Test
     opaque_wrap: Example = { name = "opaque_wrap", source = "blorp_2/test/e2e/fixtures/opaque/generic/wrap.brp", status = 2, stdout = "", allocations = 4 }
     opaque_phantom: Example = { name = "opaque_phantom", source = "blorp_2/test/e2e/fixtures/opaque/generic/phantom.brp", status = 7, stdout = "", allocations = 0 }
     opaque_nesting: Example = { name = "opaque_nesting", source = "blorp_2/test/e2e/fixtures/opaque/generic/nesting.brp", status = 15, stdout = "", allocations = 21 }
+    passing_suite_output = "\n>> registration Tests\n  [PASS] pure\neffect\n  [PASS] effect\n\nAll 2 tests passed\n"
+    failing_suite_output = "\n>> continued registration Tests\nfirst\n  [FAIL] first case\nsecond\n  [PASS] second case\nthird\n  [FAIL] third case\n\n2 of 3 tests failed\n"
+    grouped_suites: Example = { name = "grouped_suites", source = "blorp_2/test/e2e/fixtures/test_entry/passing.brp", status = 1, stdout = passing_suite_output.add(failing_suite_output), allocations = 42 }
+    single_suite: Example = { grouped_suites | name = "single_suite", status = 0, stdout = passing_suite_output, allocations = 21 }
     opaque_empty: Example = { name = "opaque_empty", source = "blorp_2/test/e2e/fixtures/opaque/generic/empty.brp", status = 5, stdout = "", allocations = 0 }
     phantom_mismatch = generic_opaque("phantom_mismatch", ":9:5: error: argument type does not match the parameter type\nhelp: use an expression of type Id[User] here\n")
     empty_needs_type = generic_opaque("empty_needs_type", ":3:11: error: cannot infer type parameter V of opaque type Box\nhelp: give into_opaque an expected type, as in value: Box[...] = into_opaque Box(...), or give from_opaque an operand whose Box type is known\n")
@@ -283,6 +298,8 @@ func suite(compiler: String, c_compiler: String, work_directory: String) -> Test
             ("plain records declare, update and project like fixed records", func(): reported(verify_example(compiler, c_compiler, work_directory, plain_record))),
             ("private applies to plain records and unions", func(): reported(verify_example(compiler, c_compiler, work_directory, plain_private))),
             ("a record update projects before it rebuilds, so a dying base grows its field in place", func(): reported(verify_example(compiler, c_compiler, work_directory, record_accumulator))),
+            ("grouped suites run in order and a failed suite fails the program", func(): reported(verify_suites(compiler, c_compiler, work_directory, grouped_suites, ["blorp_2/test/e2e/fixtures/test_entry/failing.brp"]))),
+            ("the first suite alone passes", func(): reported(verify_suites(compiler, c_compiler, work_directory, single_suite, []))),
             ("rejected compilation preserves an existing output", func(): reported(rejected_fixture(compiler, work_directory))),
         ]
     }

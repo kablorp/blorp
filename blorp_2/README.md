@@ -719,7 +719,7 @@ make -C blorp_2 test-e2e         # Use the already-built diagnostic B2 compiler.
 
 `example` keeps its generated C and executable in `blorp_2/build/` for
 inspection. The self-hosted component gate keeps
-its C and executable in `blorp_2/build/self-hosted-tests/`. `BLORP_CC` selects a C
+its C and executables in `blorp_2/build/self-hosted-tests/`. `BLORP_CC` selects a C
 compiler executable (default `clang`).
 `make -C blorp_2 test-compiler test-components` runs the active component
 gate: Blorp 2 compiles the explicit `TARGET_COMPONENT_SOURCES` in the Makefile.
@@ -730,8 +730,12 @@ doc fences, ranges, lexical trivia, pipe Strings and runtime-text round trips.
 Parse coverage includes constant inventories, source provenance, and String,
 integer, Float and file builtin labels. The process increment adds exact builtin-contract, lowering, ownership,
 verification and C-emission suites, plus strict-report parser checks. Each selected suite uses its ordinary
-`tests: TestSuite` entry; generated C and executables mirror its source path
-under `blorp_2/build/self-hosted-tests/`.
+`tests: TestSuite` entry. The listed suites are grouped by directory, which is
+their phase owner, in first-appearance order and keeping list order within a
+group: each group compiles once into one program, so a phase's shared imports
+compile once, and a strict leak or crash is attributed to that phase. Its C and
+executable are `all_suites.c` and `all_suites` in the directory mirroring the
+group under `blorp_2/build/self-hosted-tests/`.
 
 Twelve Lexer cases are explicitly deferred in source comments: eleven bracketed
 block cases need `String.split`, and one pipe String case needs a byte-input
@@ -757,20 +761,29 @@ The explicit compile-only test entry is:
 
 ```sh
 blorp_2/build/compiler --library-root blorp_2/standard_library --test-suite \
-  blorp_2/test/unit/test_utils/test_text.brp blorp_2/build/test_text.c
+  blorp_2/test/unit/test_utils/test_text.brp [MORE_SUITES.brp ...] blorp_2/build/test_text.c
 ```
 
-The root scope's visible `tests: TestSuite` constant (including an explicit
-import) must have the configured library's `TestSuite` type. The
-compiler-owned entry calls the ordinary library runner and returns 0 when
-its actual `TestCounts.failed` is zero, otherwise 1. It follows normal
+Every input is a root module, and the same normalized path may appear only
+once; a module that several roots import is loaded once. Discovery finds only a
+`tests` constant declared in each root itself: a `tests` function, an imported
+`tests` or no declaration is rejected while assembling the entry. Each constant
+must have the configured library's `TestSuite` type. The compiler-owned entry
+belongs to the first root and imports each later root under an alias no source
+can write. It runs every root's suite with `run_suite_result`, in command-line
+order and continuing after failures, and returns `suites_exit_status` of the
+results: 0 when no suite failed, otherwise 1. A suite whose type is wrong is
+reported at its own root's end of file. Known limit: a `private tests` in a later
+root is rejected by checking as private to `<suite N>`, where N counts the
+inputs after the first; the first root's constant may be private. It follows normal
 checking, specialization, ownership insertion, independent verification and
 emission. This mode neither discovers directories nor links/runs C; the
 component gate links and runs that output with strict memory checking.
 The target `test` module defines
 `TestSuite { description: String, tests: List[(String, () -> Bool)] }` and
 `TestCounts { passed: Int, failed: Int }`. `run_suite_result` prints and returns
-counts; `run_suite` accepts the suite value and derives the exit status.
+counts; `run_suite` accepts the suite value and derives the exit status, and
+`suites_exit_status` derives one status from several suites' counts.
 Case callbacks may be pure or impure; execution follows registration order and
 continues after a failed callback. Empty suites succeed. Suite constants use
 ordinary closed initializers; inline lambda entries remain unsupported.
@@ -2007,8 +2020,8 @@ Lexical and layout rules:
   the read's span; aggregate children retain their initializer's source spans.
   Callable constants support ordinary direct and qualified calls; scalar constants
   cannot be called, and constants do not enter UFCS method selection.
-  Test-suite mode uses an ordinary `tests: TestSuite` constant with named
-  callbacks; inline lambda initializers remain unsupported.
+  Test-suite mode uses an ordinary `tests: TestSuite` constant declared in each
+  input file, with named callbacks; inline lambda initializers remain unsupported.
 
 - Every token must be consumed. Malformed declarations and statements are errors.
 

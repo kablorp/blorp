@@ -102,7 +102,8 @@ Every compiler source module has a unit suite under
 [test/unit/](test/unit/), in the `test_<stage>/` folder that mirrors the module's
 folder under `src/`. Grammar cases live under
 [test/test_grammar/](test/test_grammar/) and change with the EBNF.
-Target component suites export ordinary `tests: TestSuite` constants.
+Target component suites declare an ordinary `tests: TestSuite` constant in the
+suite file itself.
 `make -C blorp_2 test` builds Blorp 2, runs the explicit
 `TARGET_COMPONENT_SOURCES` selection through its ordinary TestSuite entries,
 and runs the first self-hosted native e2e selection.

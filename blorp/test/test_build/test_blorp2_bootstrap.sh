@@ -103,9 +103,10 @@ set -euo pipefail
 printf 'built\n' >>"$TEST_CC_LOG"
 if [ "${1:-}" = --library-root ]; then
 	if [ "${3:-}" = --test-suite ]; then
-		printf 'compile:%s\n' "$4" >>"$TEST_COMPONENT_LOG"
+		shift 3
+		while [ "$#" -gt 1 ]; do printf 'compile:%s\n' "$1" >>"$TEST_COMPONENT_LOG"; shift; done
 		if [ "${TEST_COMPONENT_COMPILE_STATUS:-0}" -ne 0 ]; then exit "$TEST_COMPONENT_COMPILE_STATUS"; fi
-		printf '/* fake component C */\n' >"$5"
+		printf '/* fake component C */\n' >"$1"
 	else
 		if [ "${TEST_E2E_COMPILE_STATUS:-0}" -ne 0 ]; then exit "$TEST_E2E_COMPILE_STATUS"; fi
 		printf '/* fake fixture C */\n' >"$4"
@@ -310,7 +311,8 @@ make -s -C "$fixture/blorp_2" example BLORP_CC="$tools/fake cc" >"$scratch/make.
 [ ! -e "$TEST_LEGACY_LOG" ] || fail 'example touched legacy'
 pass 'example uses newly built B2 executable'
 # Every public B2 test route must avoid the legacy tripwires above.
-component_sources='blorp_2/test/unit/test_utils/test_boolean.brp blorp_2/test/unit/test_lex/test_lex.brp'
+# Two test_utils sources around a test_lex source: groups follow first appearance.
+component_sources='blorp_2/test/unit/test_utils/test_boolean.brp blorp_2/test/unit/test_lex/test_lex.brp blorp_2/test/unit/test_utils/test_text.brp'
 for target in test test-components; do
 	: >"$TEST_COMPONENT_LOG"
 	: >"$TEST_E2E_LOG"
@@ -323,9 +325,10 @@ for target in test test-components; do
 		cat "$scratch/make.stderr" >&2
 		fail "$target must run the self-hosted selection"
 	fi
-	printf 'compile:%s\nnative:strict\ncompile:%s\nnative:strict\n' \
-		blorp_2/test/unit/test_utils/test_boolean.brp blorp_2/test/unit/test_lex/test_lex.brp >"$scratch/expected"
-	cmp -s "$TEST_COMPONENT_LOG" "$scratch/expected" || fail "$target selected sources, order or strict native entrypoint"
+	printf 'compile:%s\ncompile:%s\nnative:strict\ncompile:%s\nnative:strict\n' \
+		blorp_2/test/unit/test_utils/test_boolean.brp blorp_2/test/unit/test_utils/test_text.brp \
+		blorp_2/test/unit/test_lex/test_lex.brp >"$scratch/expected"
+	cmp -s "$TEST_COMPONENT_LOG" "$scratch/expected" || fail "$target selected sources, grouping, order or strict native entrypoint"
 	if [ "$target" = test ]; then
 		grep -Fxq 'e2e:strict' "$TEST_E2E_LOG" || fail 'default test did not run self-hosted e2e';
 	else
@@ -333,17 +336,16 @@ for target in test test-components; do
 	fi
 	if [ "$target" = test-components ]; then
 		: >"$scratch/expected"
-		for source in $component_sources; do
-			program="blorp_2/build/self-hosted-tests/${source#blorp_2/test/}"
-			program="${program%.brp}"
+		for group in unit/test_utils unit/test_lex; do
+			program="blorp_2/build/self-hosted-tests/$group/all_suites"
 			printf '%s\0' -std=c11 -Wall -Wextra -Werror -pedantic -O0 \
 				-DBLORP_MEMORY_DIAGNOSTICS=1 "$program.c" -o "$program" -lm -lpthread >>"$scratch/expected"
 		done
-		if ! cmp -s "$TEST_CC_ARGS" "$scratch/expected"; then fail 'selected C compiler flags or mirrored output paths'; fi
+		if ! cmp -s "$TEST_CC_ARGS" "$scratch/expected"; then fail 'selected C compiler flags or mirrored group output paths'; fi
 	fi
 	if ! grep -Fq 'DEFERRED:' "$scratch/make.stdout"; then fail "$target omitted unported coverage status"; fi
 	if [ -e "$TEST_LEGACY_LOG" ]; then fail "$target invoked a legacy host/build-status/bootstrap"; fi
-	pass "$target runs only the selected B2 suites with strict normal entrypoints"
+	pass "$target runs the selected B2 suites as one strict program per directory"
 done
 
 : >"$TEST_E2E_LOG"
@@ -392,7 +394,7 @@ for failure_kind in compile link native; do
 		>"$scratch/make.stdout" 2>"$scratch/make.stderr"; then
 		fail "$failure_kind failure was ignored"
 	fi
-	if grep -Fq 'compile:blorp_2/test/unit/test_lex/test_lex.brp' "$TEST_COMPONENT_LOG"; then fail "$failure_kind failure continued to the next source"; fi
+	if grep -Fq 'compile:blorp_2/test/unit/test_lex/test_lex.brp' "$TEST_COMPONENT_LOG"; then fail "$failure_kind failure continued to the next group"; fi
 	if [ "$failure_kind" != native ] && grep -Fq 'native:' "$TEST_COMPONENT_LOG"; then fail "$failure_kind failure executed stale native output"; fi
 	if [ -e "$TEST_LEGACY_LOG" ]; then fail "$failure_kind failure invoked legacy"; fi
 	pass "self-hosted $failure_kind failure blocks and stops the selection"

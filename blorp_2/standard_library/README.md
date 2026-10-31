@@ -265,12 +265,15 @@ made. See the [shell/path boundary](../ROADMAP.md#seven-shell-and-path-functions
 ### Test registration
 
 `test: TestSuite` holds `description: String` and
-`tests: List[(String, () -> Bool)]`. Export a `tests: TestSuite` constant with
-named callback entries. `--test-suite` passes that ordinary value to `run_suite`;
-a `tests()` factory is not the entry API. Both pure and impure callbacks run in
-registration order, including entries after a False result. Empty suites pass.
-`run_suite_result` prints results and returns `TestCounts { passed, failed }`;
-`run_suite` returns 0 for no failures and 1 otherwise. See the
+`tests: List[(String, () -> Bool)]`. Declare a `tests: TestSuite` constant with
+named callback entries in each suite file itself; a `tests()` function or an
+imported `tests` is rejected. `--test-suite` accepts one or more such files: its
+entry passes each file's constant to `run_suite_result` in command-line order
+and returns `suites_exit_status` of the counts. Both pure and impure callbacks
+run in registration order, including entries after a False result. Empty suites
+pass. `run_suite_result` prints results and returns `TestCounts { passed, failed }`;
+`suites_exit_status` returns 0 when no suite failed and 1 otherwise, and
+`run_suite` does the same for one suite. See the
 [text suite](../test/unit/test_utils/test_text.brp).
 
 ## Process execution

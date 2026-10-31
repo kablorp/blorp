@@ -80,7 +80,10 @@ TARGET_COMPONENT_SOURCES := \
 	blorp_2/test/unit/test_own/test_run_to_files.brp \
 	blorp_2/test/unit/test_verify/test_run_to_files.brp \
 	blorp_2/test/unit/test_emit/test_run_to_files.brp \
-	blorp_2/test/unit/test_emit/test_function_labels.brp
+	blorp_2/test/unit/test_emit/test_function_labels.brp \
+	blorp_2/test/unit/test_parse/test_grouped_suites.brp \
+	blorp_2/test/unit/test_load/test_grouped_suites.brp \
+	blorp_2/test/unit/test_check/test_grouped_suites.brp
 
 .PHONY: compiler generate-compiler link-compiler example test test-components test-target-components test-compiler link-test-compiler test-e2e
 
@@ -118,18 +121,28 @@ test-components:
 	@$(MAKE) --no-print-directory test-target-components
 	@printf '%s\n' 'DEFERRED: remaining unit/runtime/grammar/tooling and broader native e2e suites; only explicit self-hosted selections run.'
 
-# Each selected source keeps its own normal test entry and strict native run.
-# Mirror source paths so equally named suites never overwrite each other's C.
+# One program per phase directory: a source's directory is its phase owner, so
+# each phase's shared imports compile once and a strict leak or crash is
+# attributed to that phase. Directories run in order of first appearance and
+# keep list order within a group. The program lives in the directory that
+# mirrors its group, so equally named groups never overwrite each other's C.
 test-target-components:
 	@set -eu; cd ..; \
 		if [ -z "$(strip $(TARGET_COMPONENT_SOURCES))" ]; then \
 			printf '%s\n' 'no target component sources selected' >&2; exit 1; \
 		fi; \
+		directories=; \
 		for source in $(TARGET_COMPONENT_SOURCES); do \
-			program="blorp_2/build/self-hosted-tests/$${source#blorp_2/test/}"; \
-			program="$${program%.brp}"; \
+			case " $$directories " in *" $${source%/*} "*) ;; *) directories="$$directories $${source%/*}";; esac; \
+		done; \
+		for directory in $$directories; do \
+			sources=; \
+			for source in $(TARGET_COMPONENT_SOURCES); do \
+				if [ "$${source%/*}" = "$$directory" ]; then sources="$$sources $$source"; fi; \
+			done; \
+			program="blorp_2/build/self-hosted-tests/$${directory#blorp_2/test/}/all_suites"; \
 			mkdir -p "$$(dirname "$$program")"; \
-			"$(BLORP2_COMPILER)" --library-root blorp_2/standard_library --test-suite "$$source" "$$program.c"; \
+			"$(BLORP2_COMPILER)" --library-root blorp_2/standard_library --test-suite $$sources "$$program.c"; \
 			"$(BLORP_CC)" -std=c11 -Wall -Wextra -Werror -pedantic -O0 \
 				-DBLORP_MEMORY_DIAGNOSTICS=1 "$$program.c" -o "$$program" $(TEST_COMPILER_LIBRARIES); \
 			BLORP_LEAK_CHECK=strict "$$program"; \

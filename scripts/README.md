@@ -37,7 +37,8 @@ CI workflow runs only when `blorp/`, `examples/`, `pkg/`, `scripts/` or
 `standard_library/` change.
 No legacy build, artifact or FRESH-host check is involved. The Makefile's
 explicit `TARGET_COMPONENT_SOURCES` selection runs through ordinary target
-TestSuite entries, C11 `-O0` linking and strict native memory checks.
+TestSuite entries, one program per listed directory (its phase), with C11
+`-O0` linking and strict native memory checks.
 The first native e2e selection runs the selected real-main cases and process-runtime
 lifecycle checks through ordinary Blorp TestSuites, with exact output, strict
 accounting and ASan/UBSan checks. `test-e2e` uses an already-built diagnostic B2

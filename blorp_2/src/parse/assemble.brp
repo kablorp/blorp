@@ -1,14 +1,14 @@
 import:
-	bool: not, or
+	bool: and, not, or
 	../utils/ids: DeclarationInventory, issue_inventory
 	int: Int methods
-	../utils/names: NameId, NameTable, intern_names, program_names, same_name_table
+	../utils/names: NameId, NameTable, intern_names, program_names, same_name, same_name_table
 	option: Option methods
 	list: repeat, List methods
 	./parse: ImportSelection, ImportOrigin(LibraryImport), ModulePath, ParsedModule, ParsedModuleContents, module_contents
 	../utils/source: ModuleId, ModuleKind(FoundationTypesModule, FoundationPreludeModule, LibraryModule, UserModule), ModuleStem, module_stem, module_number, root_module_id, same_module
 	../utils/syntax:
-		Diagnostic, DiagnosticNote(PreviousDeclaration), ExpressionBase(NameExpression, QualifiedApplication),
+		Diagnostic, DiagnosticNote(PreviousDeclaration), ExpressionBase(ListExpression, NameExpression, QualifiedApplication, QualifiedName),
 		ParsedBody(ParsedValueBody), ParsedBuiltinType, ParsedConstant, ParsedFunction, ParsedOpaque,
 		ParsedRecord, ParsedUnion, ParsedTrait, ParsedFunctionGroup(FreeFunction, ImplementationGroup), function_group_module, Purity(Impure), Span, TypeSyntax(QualifiedType), ValueExpression,
 		Visibility(Private), WrittenName, compiler_span, diagnostic, source_bundle_error
@@ -107,10 +107,47 @@ pure func assembly_names(assembly: ParsedAssembly) -> NameTable:
 	from_opaque ParsedAssembly(assembly).names
 
 
+private SUITE_DECLARATION: String = "tests: TestSuite = { description = ..., tests = [...] }"
+
+
+-- Discovery accepts only a `tests` constant the root itself declares. Assembly
+-- holds every module's declarations, so a `tests` function, an imported name
+-- or no declaration is rejected here, before the entry names the suite.
+private pure func suite_discovery_failure(constants: List[ParsedConstant], functions: List[ParsedFunctionGroup], row: ParsedModuleRow, suite: NameId) -> Option[Diagnostic]:
+	if constants.any(pure func(constant): and(same_module(constant.module, row.module), same_name(constant.name.id, suite))):
+		None
+	else:
+		var problem = diagnostic(row.end, "test suite file declares no tests constant", "declare ${SUITE_DECLARATION} in this file")
+		for group in functions:
+			match group:
+				FreeFunction(function):
+					if and(same_module(function.module, row.module), same_name(function.function_name.id, suite)):
+						problem = diagnostic(function.function_name.span, "test suite must be a constant, not a function", "declare ${SUITE_DECLARATION} instead")
+				ImplementationGroup(_, _):
+					void
+		Some(problem)
+
+
+-- The root's alias for a module it already imports, so one import names that
+-- module; otherwise the entry's own alias, which no source can write.
+private pure func entry_alias(imports: List[ModuleImport], target: ModuleId, unwritable: WrittenName) -> WrittenName:
+	match imports.find(pure func(request): same_module(request.target, target)):
+		Some(request): request.module_alias.get_or(unwritable)
+		None: unwritable
+
+
+-- The CLI has no written call token: each implicit suite operand points to its
+-- own root's real EOF, so ordinary suite diagnostics name the declaring file.
+private pure func suite_run(library: WrittenName, runner: NameId, suite: ExpressionBase, end: Span) -> ValueExpression:
+	operand: ValueExpression = { base = suite, base_span = end, applications = [], span = end }
+	{ base = QualifiedApplication({ module = library, name = { id = runner, span = end } }, [operand]), base_span = end, applications = [], span = end }
+
+
 -- Test entry is ordinary syntax before the one declaration-ID publication.
 -- These display labels cannot be source identifiers; their issued IDs, never
--- their spelling or ordinal, select the entry and its private library alias.
-pure func prepare_test_entry(assembly: ParsedAssembly, library: ModuleId, types: ModuleId) -> Result[ParsedAssembly, Diagnostic]:
+-- their spelling or ordinal, select the entry and its private aliases. The
+-- root owns the entry; `grouped` are the later roots in command-line order.
+pure func prepare_test_entry(assembly: ParsedAssembly, grouped: List[ModuleId], library: ModuleId, types: ModuleId) -> Result[ParsedAssembly, Diagnostic]:
 	builder = from_opaque ParsedAssembly(assembly)
 	root ?= builder.modules.get(0).to_result(source_bundle_error("test entry requires a root module"))
 	library_row ?= builder.modules.get(module_number(library)).to_result(source_bundle_error("test entry requires the configured test library module"))
@@ -121,44 +158,48 @@ pure func prepare_test_entry(assembly: ParsedAssembly, library: ModuleId, types:
 	_: Void ?= match types_row.role:
 		FoundationTypesModule: Ok(void)
 		_: Err(source_bundle_error("test entry requires the foundation types module"))
-	words = intern_names(builder.names, ["<test entry>", "<test library>", "tests", "test", "run_suite", "Int", "<test types>", "_base"])
+	words = intern_names(builder.names, ["<test entry>", "<test library>", "tests", "test", "run_suite_result", "suites_exit_status", "Int", "<test types>", "_base"])
 	match words.ids:
-		[entry_id, alias_id, suite_id, library_name, runner_id, integer_id, types_alias_id, types_name]:
+		[entry_id, alias_id, suite_id, library_name, runner_id, status_id, integer_id, types_alias_id, types_name]:
 			internal: Span = compiler_span()
-			var library_alias: WrittenName = { id = alias_id, span = internal }
-			var types_alias: WrittenName = { id = types_alias_id, span = internal }
+			library_alias = entry_alias(root.imports, library, { id = alias_id, span = internal })
+			types_alias = entry_alias(root.imports, types, { id = types_alias_id, span = internal })
+			var named: List[ModuleImport] = [
+				{ target = library, path = { origin = LibraryImport, parts = [library_name] }, module_alias = Some(library_alias), symbols = [], span = internal },
+				{ target = types, path = { origin = LibraryImport, parts = [types_name] }, module_alias = Some(types_alias), symbols = [], span = internal },
+			]
+			-- List elements are evaluated in source order, so the suites run
+			-- and print in command-line order, the root's own first.
+			var runs: List[ValueExpression] = [suite_run(library_alias, runner_id, NameExpression({ id = suite_id, span = root.end }), root.end)]
+			var failure: Option[Diagnostic] = suite_discovery_failure(builder.constants, builder.functions, root, suite_id)
+			var names = words.names
+			for module in grouped:
+				interned = intern_names(names, ["<suite ${runs.length().to_string()}>"])
+				names = interned.names
+				match (builder.modules.get(module_number(module)), interned.ids):
+					(Some(row), [suite_alias_id]):
+						if failure.is_none():
+							failure = suite_discovery_failure(builder.constants, builder.functions, row, suite_id)
+						suite_alias = entry_alias(root.imports, module, { id = suite_alias_id, span = internal })
+						named = named.append({ target = module, path = { origin = LibraryImport, parts = [suite_alias_id] }, module_alias = Some(suite_alias), symbols = [], span = internal })
+						runs = runs.append(suite_run(library_alias, runner_id, QualifiedName({ module = suite_alias, name = { id = suite_id, span = row.end } }), row.end))
+					_:
+						if failure.is_none():
+							failure = Some(source_bundle_error("test entry requires each test suite root module"))
+			-- Root imports of named modules take the entry's alias; others are added.
 			var imports: List[ModuleImport] = []
-			var found: Bool = False
-			var found_types: Bool = False
 			for request in root.imports:
-				if same_module(request.target, library):
-					library_alias = request.module_alias.get_or(library_alias)
-					imports = imports.append({ request | module_alias = Some(library_alias) })
-					found = True
-				else if same_module(request.target, types):
-					types_alias = request.module_alias.get_or(types_alias)
-					imports = imports.append({ request | module_alias = Some(types_alias) })
-					found_types = True
-				else:
-					imports = imports.append(request)
-			if found.not():
-				imports = imports.append({
-					target = library, path = { origin = LibraryImport, parts = [library_name] },
-					module_alias = Some(library_alias), symbols = [], span = internal,
-				})
-			if found_types.not():
-				imports = imports.append({
-					target = types, path = { origin = LibraryImport, parts = [types_name] },
-					module_alias = Some(types_alias), symbols = [], span = internal,
-				})
-			-- The CLI has no written call token: its implicit operand points to
-			-- the real root EOF, so ordinary suite diagnostics name a real file.
-			suite: ValueExpression = {
-				base = NameExpression({ id = suite_id, span = root.end }),
-				base_span = root.end, applications = [], span = root.end,
-			}
+				var merged = request
+				for wanted in named:
+					if same_module(wanted.target, request.target):
+						merged = { request | module_alias = wanted.module_alias }
+				imports = imports.append(merged)
+			for wanted in named:
+				if root.imports.any(pure func(request): same_module(request.target, wanted.target)).not():
+					imports = imports.append(wanted)
+			results: ValueExpression = { base = ListExpression(runs), base_span = root.end, applications = [], span = root.end }
 			call: ValueExpression = {
-				base = QualifiedApplication({ module = library_alias, name = { id = runner_id, span = root.end } }, [suite]),
+				base = QualifiedApplication({ module = library_alias, name = { id = status_id, span = root.end } }, [results]),
 				base_span = root.end, applications = [], span = root.end,
 			}
 			entry: ParsedFunction = {
@@ -178,11 +219,15 @@ pure func prepare_test_entry(assembly: ParsedAssembly, library: ModuleId, types:
 			for function in builder.functions:
 				if same_module(function_group_module(function), root_module_id()).not():
 					functions = functions.append(function)
-			Ok(into_opaque ParsedAssembly({ builder |
-				names = words.names, entrypoint = entry_id,
-				modules = builder.modules.set(0, { root | imports = imports }),
-				functions = functions,
-			}))
+			match failure:
+				Some(error):
+					Err(error)
+				None:
+					Ok(into_opaque ParsedAssembly({ builder |
+						names = names, entrypoint = entry_id,
+						modules = builder.modules.set(0, { root | imports = imports }),
+						functions = functions,
+					}))
 		_:
 			Err(source_bundle_error("test entry names were not issued together"))
 

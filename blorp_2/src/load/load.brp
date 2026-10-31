@@ -279,12 +279,13 @@ private func load_queue(state: LoadState) -> Result[LoadState, LoadFailure]:
 
 private union LoadMode:
 	ApplicationInput
-	TestSuiteInput
+	-- The written paths of the test suite roots after the first, in order.
+	TestSuiteInput(List[String])
 
 
 -- Queue the exact configured-library path after ordinary loading, so existing
 -- source IDs never move. A local file or alias spelling cannot supply this role.
-private func load_test_entry(state: LoadState) -> Result[LoadState, LoadFailure]:
+private func load_test_entry(state: LoadState, grouped: List[RequestedModule]) -> Result[LoadState, LoadFailure]:
 	path = Path.join(from_opaque LibraryLayout(state.layout).root, "test.brp")
 	known = known_module(state.requests, path)
 	id: ModuleId ?= match known:
@@ -294,7 +295,7 @@ private func load_test_entry(state: LoadState) -> Result[LoadState, LoadFailure]
 		Some(_): state
 		None: { state | requests = state.requests.append(designated(id, path, LibraryModule)) }
 	loaded ?= load_queue(pending)
-	match prepare_test_entry(loaded.assembly, id, foundation_types_module_id()):
+	match prepare_test_entry(loaded.assembly, grouped.map(pure func(request): request.id), id, foundation_types_module_id()):
 		Err(error): Err(failure(loaded.modules, error))
 		Ok(assembly): Ok({ loaded | assembly = assembly })
 
@@ -330,8 +331,27 @@ func load_program(root_path: String, library_root: String) -> Result[LoadedProgr
 	load_input(root_path, library_root, ApplicationInput)
 
 
-func load_test_program(root_path: String, library_root: String) -> Result[LoadedProgram, LoadFailure]:
-	load_input(root_path, library_root, TestSuiteInput)
+func load_test_program(root_path: String, grouped_paths: List[String], library_root: String) -> Result[LoadedProgram, LoadFailure]:
+	load_input(root_path, library_root, TestSuiteInput(grouped_paths))
+
+
+-- The later test suite roots, queued after the foundation inputs in
+-- command-line order. They are user modules wherever they live, like the first;
+-- a path already queued, a foundation input included, would be one module twice.
+private pure func queue_roots(working_directory: String, paths: List[String], queued: List[RequestedModule], later: List[RequestedModule]) -> Result[List[RequestedModule], LoadFailure]:
+	match paths.get(later.length()):
+		None:
+			Ok(later)
+		Some(written):
+			path = Path.normalize(Path.join(working_directory, written))
+			requests = queued.concat(later)
+			match (known_module(requests, path), module_id(requests.length())):
+				(Some(_), _):
+					Err(failure([], diagnostic(compiler_span(), "test suite input ${written} is already part of this compilation", "list each test suite file once; foundation inputs are supplied by --library-root")))
+				(None, Some(id)):
+					queue_roots(working_directory, paths, queued, later.append(designated(id, path, UserModule)))
+				(None, None):
+					Err(failure([], internal_error(compiler_span(), "module inventory is too large")))
 
 
 private func load_input(root_path: String, library_root: String, mode: LoadMode) -> Result[LoadedProgram, LoadFailure]:
@@ -348,20 +368,24 @@ private func load_input(root_path: String, library_root: String, mode: LoadMode)
 			))
 		LibraryModule | UserModule:
 			Ok(void)
+	designated_inputs = [
+		designated(root_module_id(), root_file, UserModule),
+		designated(foundation_types_module_id(), foundation.types_path, FoundationTypesModule),
+		designated(foundation_prelude_module_id(), foundation.prelude_path, FoundationPreludeModule),
+	]
+	later: List[RequestedModule] ?= match mode:
+		ApplicationInput: Ok([])
+		TestSuiteInput(paths): queue_roots(working_directory, paths, designated_inputs, [])
 	initial ?= load_queue({
 		layout = layout,
 		root_path = root_path,
-		requests = [
-			designated(root_module_id(), root_file, UserModule),
-			designated(foundation_types_module_id(), foundation.types_path, FoundationTypesModule),
-			designated(foundation_prelude_module_id(), foundation.prelude_path, FoundationPreludeModule),
-		],
+		requests = designated_inputs.concat(later),
 		assembly = begin_program(),
 		modules = [],
 	})
 	loaded: LoadState ?= match mode:
 		ApplicationInput: Ok(initial)
-		TestSuiteInput: load_test_entry(initial)
+		TestSuiteInput(_): load_test_entry(initial, later)
 	sources: SourceInputs = { modules = loaded.modules }
 	match seal_program(loaded.assembly):
 		Ok(program):

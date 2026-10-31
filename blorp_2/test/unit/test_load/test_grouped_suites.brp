@@ -1,0 +1,101 @@
+import:
+    ../../../src/load/load: SourceFile, load_test_program
+    ../../../src/parse/assemble: parsed_contents
+    ../../../src/utils/source: ModuleKind(UserModule), compiler_source, same_module, same_source
+    bool: and
+    int: Int methods
+    list: List methods
+    option: Option methods
+    path as Path
+    string: String methods
+    system: get_current_directory
+    test: TestSuite
+
+
+private LIBRARY_ROOT: String = "blorp_2/standard_library"
+private FIXTURES: String = "blorp_2/test/e2e/fixtures/test_entry/"
+private REPEATED_HELP: String = "list each test suite file once; foundation inputs are supplied by --library-root"
+-- Later roots follow the first root, the base and the prelude.
+private FIRST_LATER_ROOT_ORDINAL: Int = 3
+
+
+private pure func fixture(name: String) -> String:
+    "${FIXTURES}${name}.brp"
+
+
+-- Source rows of modules other than the first root carry normalized paths. A
+-- missing working directory yields its error text, which matches no row.
+private func loaded_path(name: String) -> String:
+    match get_current_directory():
+        Ok(directory): Path.normalize(Path.join(directory, fixture(name)))
+        Err(error): error
+
+
+private pure func rows_with(rows: List[SourceFile], path: String) -> Int:
+    rows.filter(pure func(row): row.path == path).length()
+
+
+-- Two roots import one module: it is read and parsed once, both roots are user
+-- modules, and the first root imports the later one for the entry.
+func test_a_module_imported_by_two_roots_loads_once() -> Bool:
+    match load_test_program(fixture("shared_left"), [fixture("shared_right")], LIBRARY_ROOT):
+        Err(_): False
+        Ok(loaded):
+            modules = parsed_contents(loaded.program).modules
+            match (modules.get(0), modules.get(FIRST_LATER_ROOT_ORDINAL)):
+                (Some(left), Some(right)):
+                    and(
+                        and(rows_with(loaded.sources.modules, loaded_path("shared_case")) == 1, rows_with(loaded.sources.modules, loaded_path("shared_right")) == 1),
+                        and(
+                            and(left.role == UserModule, right.role == UserModule),
+                            left.imports.any(pure func(request): same_module(request.target, right.module)),
+                        ),
+                    )
+                _: False
+
+
+-- `grouped` is already queued: the first root or an earlier later root spelled
+-- differently, since the normalized path decides, or a foundation input.
+private func repeated(grouped: String) -> Bool:
+    match load_test_program(fixture("passing"), [fixture("shared_left"), grouped], LIBRARY_ROOT):
+        Ok(_): False
+        Err(failure):
+            error = failure.diagnostic
+            and(
+                and(failure.sources.modules.is_empty(), and(same_source(error.span.source, compiler_source()), error.note.is_none())),
+                and(error.message == "test suite input ${grouped} is already part of this compilation", error.help == REPEATED_HELP),
+            )
+
+
+func test_a_repeated_root_is_rejected() -> Bool:
+    repeated("${FIXTURES}../test_entry/passing.brp")
+
+
+func test_a_repeated_later_root_is_rejected() -> Bool:
+    repeated("./${FIXTURES}shared_left.brp")
+
+
+func test_a_foundation_file_is_not_a_later_root() -> Bool:
+    repeated("${LIBRARY_ROOT}/_base.brp")
+
+
+-- The last later root is queued after the earlier ones, in command-line order.
+func test_later_roots_keep_command_line_order() -> Bool:
+    match load_test_program(fixture("passing"), [fixture("shared_right"), fixture("shared_left")], LIBRARY_ROOT):
+        Err(_): False
+        Ok(loaded):
+            match (loaded.sources.modules.get(FIRST_LATER_ROOT_ORDINAL), loaded.sources.modules.get(FIRST_LATER_ROOT_ORDINAL.add(1))):
+                (Some(right), Some(left)): and(right.path == loaded_path("shared_right"), left.path == loaded_path("shared_left"))
+                _: False
+
+
+tests: TestSuite = {
+    description = "Blorp 2 grouped test suite loading",
+    tests = [
+        ("a module imported by two roots loads once", test_a_module_imported_by_two_roots_loads_once),
+        ("a repeated root is rejected", test_a_repeated_root_is_rejected),
+        ("a repeated later root is rejected", test_a_repeated_later_root_is_rejected),
+        ("a foundation file is not a later root", test_a_foundation_file_is_not_a_later_root),
+        ("later roots keep command-line order", test_later_roots_keep_command_line_order),
+    ]
+}
