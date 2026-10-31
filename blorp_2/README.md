@@ -962,6 +962,12 @@ BLORP_ALLOCATION_SITES=sites.txt BLORP_LEAK_CHECK=strict ./program ...
 blorp_2/scripts/allocation-sites sites.txt program [program.c] [--top N]
 ```
 
+`blorp_2/scripts/attribution/run` (about 5 to 9 minutes, macOS) uses this tool in a wider
+self-compile attribution: update copies by Blorp function and statement, atomic
+reference-count operations by data kind and source, a `sample` profile, and the cycle
+saving of plain over atomic counts at a fixed operation count. Its raw data goes to
+the ignored `build/blorp_2_attribution/`.
+
 Offsets cannot be symbolized in process because static functions are not in
 the dynamic symbol table, so `blorp_2/scripts/allocation-sites` (Python 3
 standard library, `atos` on macOS or `addr2line` on Linux) does it afterwards.

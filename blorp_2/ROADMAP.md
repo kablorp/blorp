@@ -1486,7 +1486,7 @@ projections and O3.
 | [O0](#o0-re-measure-after-l2b) | Re-run the self-compile copy attribution and count atomic RC operations | Measured ([results](#o0-results)) |
 | [O1](#o1-owned-parameter-contracts) | Per-parameter owned/borrowed contracts, inferred from in-place runtime operations | Landed 2026-10-30 ([results](#o1-results)); size overage accepted |
 | [O1 follow-ups](#o1-follow-ups) | One passing rule in `pass_arguments`, an `append_int` digit loop, a seed containing O1 | Rule and digit loop done; O1 is in the pinned seed, the digit loop awaits the next rotation |
-| [Attribution after O1](#attribution-after-o1) | Remaining copies, RC operations and allocations by kind, a fresh profile | Next, alongside O2 |
+| [Attribution after O1](#attribution-after-o1) | Remaining copies, RC operations and allocations by kind, a fresh profile | Measured 2026-10-30 ([report](../benchmarks/results/blorp_2_attribution_after_o1_2026-10-30.md)) |
 | [O2](#o2-record-update-binds-before-it-rebuilds) | Project the base fields an update reads before its replacements run | Implemented 2026-10-30, pending review ([results](#o2-results)) |
 | [Loop-header last-read drops](#loop-header-last-read-drops) | A loop-header obligation that is not outgoing drops at its last read instead of being held to the edge batch | Decided 2026-10-30 as a separate step; after O2 |
 | [Borrowed field projections](#borrowed-field-projections) | Read managed record fields borrowed, as union payloads already are | Proposed; decided from the attribution, needs approval |
@@ -2204,13 +2204,21 @@ lived only in a session scratchpad. It reports:
 - **Allocations by kind**, through `BLORP_ALLOCATION_SITES`.
 - **A fresh sample profile.** O0's 20% for specialization instance lookup
   predates `ce8b1676c`.
-- **The upper bound of non-atomic counting:** a scratch copy of B's self C
+- **The saving from removing atomicity at a fixed operation count:** a scratch copy of B's self C
   with plain increments and decrements, measured in cycles, not retired
   instructions, which cannot see the cost of an atomic.
 
 `with_bucket_entry`'s inner `listed.append(id)` copies because `get` hands
 out a second reference; it needs a take-or-update-at-index API, not
 inference, and is a separate item.
+
+**Status: measured 2026-10-30** at `ae4710afc`; the
+[report](../benchmarks/results/blorp_2_attribution_after_o1_2026-10-30.md) has the tables, and
+`blorp_2/scripts/attribution/run` repeats them (5 to 9 minutes). O1 closed `append_selection`, `append_loop*`,
+`emit`'s three `output.concat` copies and 99.6% of `with_bucket_entry`'s; `append_owner_alias` still copies
+109.7 MB. Of 733.5 M atomic operations (O0: 1,243.9 M), projection acquire-and-drop pairs are 32.6%,
+acquire-then-drop move candidates 18.8%, cascades 4.6%; plain instead of atomic counts at a fixed operation
+count saves about 8% of cycles on the M4 (an estimate; 5.9% to 8.5% per pair). Sample class shares are lower bounds.
 
 ### Borrowed field projections
 
