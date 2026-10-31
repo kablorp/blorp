@@ -537,22 +537,6 @@ pure func value_needs_ownership(
 						OwningCases(_) | BoxedCases(_): Ok(True)
 
 
-private pure func same_record_origin(left: RecordOrigin, right: RecordOrigin) -> Bool:
-	match left:
-		DeclaredRecord(id):
-			match right:
-				DeclaredRecord(other): id == other
-				_: False
-		StructuralTuple:
-			match right:
-				StructuralTuple: True
-				_: False
-		CaptureEnvironment(id):
-			match right:
-				CaptureEnvironment(other): id == other
-				_: False
-
-
 -- A structural tuple instantiates no declaration; its digest is this base less
 -- its arity, which equality compares. That is negative, so it never meets the
 -- non-negative number of a declaration.
@@ -725,7 +709,7 @@ private pure func find_record_instance(
 	span: Span,
 ) -> Result[Option[RecordInstanceId], Diagnostic]:
 	found ?= indexed_position(records, record_digest(key.origin, key.arguments.length()), span, pure func(instance: RecordInstance) -> Bool:
-		and(same_record_origin(instance.key.origin, key.origin), instance.key.arguments == key.arguments)
+		and(instance.key.origin == key.origin, instance.key.arguments == key.arguments)
 	)
 	Ok(found.map(pure func(position: Int) -> RecordInstanceId: into_opaque RecordInstanceId(position)))
 
@@ -737,7 +721,7 @@ private pure func concrete_record_field_type(
 	span: Span,
 ) -> Result[TypeRef, Diagnostic]:
 	instance ?= records.entries.get(record_number(owner)).to_result(internal_error(span, "unknown concrete record"))
-	_: Void ?= if same_record_origin(instance.key.origin, DeclaredRecord(Checked.field_owner(field))):
+	_: Void ?= if instance.key.origin == DeclaredRecord(Checked.field_owner(field)):
 		Ok(void)
 	else:
 		Err(internal_error(span, "field declaration differs from concrete record"))
@@ -932,40 +916,10 @@ private pure func find_instance(
 	found ?= indexed_position(keys, body_digest(key.body), span, pure func(known: FunctionRequest) -> Bool:
 		and(
 			known.key.body == key.body,
-			and(known.key.arguments == key.arguments, same_elements(known.key.callables, key.callables, same_callable_mode)),
+			and(known.key.arguments == key.arguments, known.key.callables == key.callables),
 		)
 	)
 	Ok(found.map(pure func(position: Int) -> FunctionInstanceId: into_opaque FunctionInstanceId(position)))
-
-
-private pure func same_callable_storage(left: CallableStorage, right: CallableStorage) -> Bool:
-	match left:
-		ErasedCallable:
-			match right:
-				ErasedCallable: True
-				_: False
-		EnvironmentCallable(id):
-			match right:
-				EnvironmentCallable(other): id == other
-				_: False
-
-
-private pure func same_callable_mode(left: CallableMode, right: CallableMode) -> Bool:
-	match left:
-		RuntimeCallable(parameter):
-			match right:
-				RuntimeCallable(other): parameter == other
-				_: False
-		StaticCallable(value):
-			match right:
-				RuntimeCallable(_): False
-				StaticCallable(other):
-					match and(value.parameter == other.parameter, value.body == other.body):
-						False: False
-						True:
-							match value.arguments == other.arguments:
-								True: same_callable_storage(value.storage, other.storage)
-								False: False
 
 
 private pure func callable_mode(
@@ -1208,46 +1162,6 @@ private pure func find_union_instance(
 	Ok(found.map(pure func(position: Int) -> UnionInstanceId: into_opaque UnionInstanceId(position)))
 
 
-private pure func same_partial_type(left: PartialType, right: PartialType) -> Bool:
-	match left:
-		KnownType(known):
-			match right:
-				KnownType(other): known == other
-				_: False
-		PendingUnionType(key):
-			match right:
-				PendingUnionType(other): same_partial_union_key(key, other)
-				_: False
-		PendingRecordType(key):
-			match right:
-				PendingRecordType(other): same_partial_record_key(key, other)
-				_: False
-		PendingCallable(parameters, result):
-			match right:
-				PendingCallable(others, other):
-					match same_elements(parameters, others, same_partial_type):
-						True: same_partial_type(result, other)
-						False: False
-				_: False
-		PendingListType(element):
-			match right:
-				PendingListType(other): same_partial_type(element, other)
-				_: False
-
-
-private pure func same_partial_union_key(left: PartialUnionKey, right: PartialUnionKey) -> Bool:
-	if left.declaration == right.declaration:
-		same_elements(left.arguments, right.arguments, same_partial_type)
-	else:
-		False
-
-
-private pure func same_partial_record_key(left: PartialRecordKey, right: PartialRecordKey) -> Bool:
-	match same_record_origin(left.origin, right.origin):
-		True: same_elements(left.arguments, right.arguments, same_partial_type)
-		False: False
-
-
 private pure func known_arguments(arguments: List[TypeRef]) -> List[PartialType]:
 	var partial: List[PartialType] = []
 
@@ -1273,17 +1187,17 @@ private pure func slot_has_union_key(slot: UnionSlot, key: PartialUnionKey) -> B
 			else:
 				False
 		PendingUnion(instance):
-			same_partial_union_key(instance.key, key)
+			instance.key == key
 
 
 private pure func slot_has_record_key(slot: RecordSlot, key: PartialRecordKey) -> Bool:
 	match slot:
 		CompleteRecord(instance):
-			match same_record_origin(instance.key.origin, key.origin):
+			match instance.key.origin == key.origin:
 				True: same_elements(instance.key.arguments, key.arguments, same_known_type)
 				False: False
 		PendingRecord(instance):
-			same_partial_record_key(instance.key, key)
+			instance.key == key
 
 
 private pure func slot_union_representation(slot: UnionSlot) -> UnionRepresentation:
@@ -1329,7 +1243,7 @@ private pure func refer_back_to_union(layouts: List[InProgressLayout], key: Part
 	for layout in layouts:
 		match layout:
 			InProgressUnion(other, _):
-				if same_partial_union_key(other, key):
+				if other == key:
 					found = Some(layouts.set(position, InProgressUnion(other, ReferencedBack)))
 					break
 			InProgressRecord(_, _):
@@ -1347,7 +1261,7 @@ private pure func refer_back_to_record(layouts: List[InProgressLayout], key: Par
 	for layout in layouts:
 		match layout:
 			InProgressRecord(other, _):
-				if same_partial_record_key(other, key):
+				if other == key:
 					found = Some(layouts.set(position, InProgressRecord(other, ReferencedBack)))
 					break
 			InProgressUnion(_, _):
@@ -1436,7 +1350,7 @@ private pure func resolve_partial(value: PartialType, completed: CompletedLayout
 		PendingUnionType(key):
 			match completed:
 				CompletedUnion(done, id):
-					if same_partial_union_key(key, done):
+					if key == done:
 						KnownType(UnionType(id))
 					else:
 						PendingUnionType({ key | arguments = resolve_partials(key.arguments, completed) })
@@ -1445,7 +1359,7 @@ private pure func resolve_partial(value: PartialType, completed: CompletedLayout
 		PendingRecordType(key):
 			match completed:
 				CompletedRecord(done, id):
-					if same_partial_record_key(key, done):
+					if key == done:
 						KnownType(RecordType(id))
 					else:
 						PendingRecordType({ key | arguments = resolve_partials(key.arguments, completed) })
@@ -1713,7 +1627,7 @@ private pure func prepare_union(
 					-- The union's own direct payload is the boxed unary shape.
 					match prepared.value_type:
 						PendingUnionType(other):
-							if same_partial_union_key(other, key):
+							if other == key:
 								self_referencing = True
 						_:
 							void
