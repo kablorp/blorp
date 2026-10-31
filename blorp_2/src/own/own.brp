@@ -588,6 +588,23 @@ private pure func value_source(
 	entry.to_result(internal_error(span, "value used before definition in ownership insertion"))
 
 
+-- The borrow through which a value is read, or None for an unmanaged value.
+-- Only call scheduling consumes an argument, so a stored payload or record
+-- field has no consumed case.
+private pure func argument_borrow(
+	value: ValueId,
+	sources: List[ResultOwnership],
+	enclosing: List[EnclosingBlock],
+	first_value: Int,
+	span: Span,
+) -> Result[Option[BorrowedValue], Diagnostic]:
+	source ?= value_source(value, sources, enclosing, first_value, span)
+	match source:
+		UnmanagedResult: Ok(None)
+		BorrowedResult(borrow_source): Ok(Some({ value = value, source = borrow_source }))
+		OwnedResult(owner): Ok(Some({ value = value, source = OwnerBorrow(owner) }))
+
+
 private pure func borrow_argument(
 	value: ValueId,
 	sources: List[ResultOwnership],
@@ -595,21 +612,10 @@ private pure func borrow_argument(
 	first_value: Int,
 	span: Span,
 ) -> Result[OwnedArgument, Diagnostic]:
-	source ?= value_source(value, sources, enclosing, first_value, span)
-	argument: OwnedArgument = match source:
-		UnmanagedResult:
-			UnmanagedArgument(value)
-		BorrowedResult(borrow_source):
-			BorrowedArgument({
-				value = value,
-				source = borrow_source,
-			})
-		OwnedResult(owner):
-			BorrowedArgument({
-				value = value,
-				source = OwnerBorrow(owner),
-			})
-	Ok(argument)
+	borrow ?= argument_borrow(value, sources, enclosing, first_value, span)
+	match borrow:
+		Some(borrowed): Ok(BorrowedArgument(borrowed))
+		None: Ok(UnmanagedArgument(value))
 
 
 -- Stored payloads of a variant or a list literal. Each stored occurrence
@@ -636,13 +642,12 @@ private pure func store_payloads(
 	var next = next_owner
 	var failure: Option[Diagnostic] = None
 	for value in values:
-		match borrow_argument(value, sources, enclosing, first_value, span):
+		match argument_borrow(value, sources, enclosing, first_value, span):
 			Err(error):
 				failure = Some(error)
 				break
-			Ok(ConsumedArgument(_, _)): failure = Some(internal_error(span, "stored payload cannot consume a call argument"))
-			Ok(UnmanagedArgument(unmanaged_value)): stored = stored.append(UnmanagedPayload(unmanaged_value))
-			Ok(BorrowedArgument(borrow)):
+			Ok(None): stored = stored.append(UnmanagedPayload(value))
+			Ok(Some(borrow)):
 				child_owner = owner_id(next)
 				next = next.add(1)
 				acquired = acquired.append({ owner = child_owner, borrow = borrow })
@@ -681,17 +686,16 @@ private pure func build_definition(
 			var failure: Option[Diagnostic] = None
 
 			for field in fields:
-				match borrow_argument(field.value, sources, enclosing, first_value, definition.span):
+				match argument_borrow(field.value, sources, enclosing, first_value, definition.span):
 					Err(error):
 						failure = Some(error)
 						break
-					Ok(UnmanagedArgument(value)):
+					Ok(None):
 						stored = stored.append({
 							field = field.field,
-							value = UnmanagedPayload(value),
+							value = UnmanagedPayload(field.value),
 						})
-					Ok(ConsumedArgument(_, _)): failure = Some(internal_error(definition.span, "record field cannot consume a call argument"))
-					Ok(BorrowedArgument(borrow)):
+					Ok(Some(borrow)):
 						child_owner = owner_id(next)
 						next = next.add(1)
 						acquisitions = acquisitions.append({
