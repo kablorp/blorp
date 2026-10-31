@@ -423,7 +423,7 @@ pure func same_type(left: TypeRef, right: TypeRef) -> Bool:
 		CallableType(parameters, result):
 			match right:
 				CallableType(others, other):
-					match same_arguments(parameters, others):
+					match same_elements(parameters, others, same_type):
 						True: same_type(result, other)
 						False: False
 				_: False
@@ -632,7 +632,7 @@ private pure func find_record_instance(
 	span: Span,
 ) -> Result[Option[RecordInstanceId], Diagnostic]:
 	found ?= indexed_position(records, record_digest(key.origin, key.arguments.length()), span, pure func(instance: RecordInstance) -> Bool:
-		and(same_record_origin(instance.key.origin, key.origin), same_arguments(instance.key.arguments, key.arguments))
+		and(same_record_origin(instance.key.origin, key.origin), same_elements(instance.key.arguments, key.arguments, same_type))
 	)
 	Ok(found.map(pure func(position: Int) -> RecordInstanceId: into_opaque RecordInstanceId(position)))
 
@@ -808,25 +808,29 @@ private pure func concrete_tuple_type(
 	Ok(RecordType(owner))
 
 
-private pure func same_arguments(left: List[TypeRef], right: List[TypeRef]) -> Bool:
-	var matches = left.length() == right.length()
-	var position: Int = 0
+-- True when both lists have the same length and every pair agrees. Compares in
+-- place and stops at the first mismatch.
+private pure func same_elements[T, U](
+	left: List[T], right: List[U], same: pure (T, U) -> Bool,
+) -> Bool:
+	if left.length() != right.length():
+		False
+	else:
+		var matches: Bool = True
+		var position: Int = 0
 
-	for value in left:
-		match right.get(position):
-			Some(other):
-				matches = match matches:
-					True: same_type(value, other)
-					False: False
-			None:
-				matches = False
+		for value in left:
+			match right.get(position):
+				Some(other): matches = same(value, other)
+				-- Unreachable after the length check; the match must be total.
+				None: matches = False
 
-		if matches.not():
-			break
+			if matches.not():
+				break
 
-		position = position.add(1)
+			position = position.add(1)
 
-	matches
+		matches
 
 
 -- Indexes a function instance by the number of the body it instantiates, which
@@ -846,7 +850,10 @@ private pure func find_instance(
 	span: Span,
 ) -> Result[Option[FunctionInstanceId], Diagnostic]:
 	found ?= indexed_position(keys, body_digest(key.body), span, pure func(known: FunctionRequest) -> Bool:
-		and(Checked.same_body(known.key.body, key.body), and(Checked.same_types(known.key.arguments, key.arguments), same_callables(known.key.callables, key.callables)))
+		and(
+			Checked.same_body(known.key.body, key.body),
+			and(Checked.same_types(known.key.arguments, key.arguments), same_elements(known.key.callables, key.callables, same_callable_mode)),
+		)
 	)
 	Ok(found.map(pure func(position: Int) -> FunctionInstanceId: into_opaque FunctionInstanceId(position)))
 
@@ -879,19 +886,6 @@ private pure func same_callable_mode(left: CallableMode, right: CallableMode) ->
 							match Checked.same_types(value.arguments, other.arguments):
 								True: same_callable_storage(value.storage, other.storage)
 								False: False
-
-
-private pure func same_callables(left: List[CallableMode], right: List[CallableMode]) -> Bool:
-	var matches = left.length() == right.length()
-	var position = 0
-	for value in left:
-		match right.get(position):
-			Some(other): matches = and(matches, same_callable_mode(value, other))
-			None: matches = False
-		if matches.not():
-			break
-		position = position.add(1)
-	matches
 
 
 private pure func callable_mode(
@@ -1152,7 +1146,7 @@ private pure func find_union_instance(
 	span: Span,
 ) -> Result[Option[UnionInstanceId], Diagnostic]:
 	found ?= indexed_position(keys, union_digest(key.declaration), span, pure func(known: UnionInstance) -> Bool:
-		and(union_digest(known.key.declaration) == union_digest(key.declaration), same_arguments(known.key.arguments, key.arguments))
+		and(union_digest(known.key.declaration) == union_digest(key.declaration), same_elements(known.key.arguments, key.arguments, same_type))
 	)
 	Ok(found.map(pure func(position: Int) -> UnionInstanceId: into_opaque UnionInstanceId(position)))
 
@@ -1174,7 +1168,7 @@ private pure func same_partial_type(left: PartialType, right: PartialType) -> Bo
 		PendingCallable(parameters, result):
 			match right:
 				PendingCallable(others, other):
-					match same_partial_arguments(parameters, others):
+					match same_elements(parameters, others, same_partial_type):
 						True: same_partial_type(result, other)
 						False: False
 				_: False
@@ -1184,31 +1178,16 @@ private pure func same_partial_type(left: PartialType, right: PartialType) -> Bo
 				_: False
 
 
-private pure func same_partial_arguments(left: List[PartialType], right: List[PartialType]) -> Bool:
-	var matches = left.length() == right.length()
-	var position: Int = 0
-
-	for value in left:
-		if matches:
-			match right.get(position):
-				Some(other): matches = same_partial_type(value, other)
-				None: matches = False
-
-		position = position.add(1)
-
-	matches
-
-
 private pure func same_partial_union_key(left: PartialUnionKey, right: PartialUnionKey) -> Bool:
 	if Declaration.union_number(left.declaration) == Declaration.union_number(right.declaration):
-		same_partial_arguments(left.arguments, right.arguments)
+		same_elements(left.arguments, right.arguments, same_partial_type)
 	else:
 		False
 
 
 private pure func same_partial_record_key(left: PartialRecordKey, right: PartialRecordKey) -> Bool:
 	match same_record_origin(left.origin, right.origin):
-		True: same_partial_arguments(left.arguments, right.arguments)
+		True: same_elements(left.arguments, right.arguments, same_partial_type)
 		False: False
 
 
@@ -1221,28 +1200,19 @@ private pure func known_arguments(arguments: List[TypeRef]) -> List[PartialType]
 	partial
 
 
--- A complete key's known arguments compared against a request's partial
--- ones in place, so a lookup allocates nothing.
-private pure func same_known_arguments(known: List[TypeRef], partial: List[PartialType]) -> Bool:
-	var matches = known.length() == partial.length()
-	var position: Int = 0
-
-	for value in known:
-		if matches:
-			match partial.get(position):
-				Some(KnownType(other)): matches = same_type(value, other)
-				_: matches = False
-
-		position = position.add(1)
-
-	matches
+-- A complete key's known argument against a request's partial one, so a
+-- lookup compares in place and allocates nothing.
+private pure func same_known_type(known: TypeRef, partial: PartialType) -> Bool:
+	match partial:
+		KnownType(other): same_type(known, other)
+		_: False
 
 
 private pure func slot_has_union_key(slot: UnionSlot, key: PartialUnionKey) -> Bool:
 	match slot:
 		CompleteUnion(instance):
 			if Declaration.union_number(instance.key.declaration) == Declaration.union_number(key.declaration):
-				same_known_arguments(instance.key.arguments, key.arguments)
+				same_elements(instance.key.arguments, key.arguments, same_known_type)
 			else:
 				False
 		PendingUnion(instance):
@@ -1253,7 +1223,7 @@ private pure func slot_has_record_key(slot: RecordSlot, key: PartialRecordKey) -
 	match slot:
 		CompleteRecord(instance):
 			match same_record_origin(instance.key.origin, key.origin):
-				True: same_known_arguments(instance.key.arguments, key.arguments)
+				True: same_elements(instance.key.arguments, key.arguments, same_known_type)
 				False: False
 		PendingRecord(instance):
 			same_partial_record_key(instance.key, key)
