@@ -381,14 +381,33 @@ and instructions 1.3%. An implementation's methods are module-level names,
 so the no-shadowing rule stops a module that implements `Equatable` from
 binding `equals` ("`equals` is already a trait method in this module"); model's
 `canonical_equality` renamed its parameters. A constructor call cannot be both
-operands of `==`; one side needs a type. Left for later, because they are
-whole-value comparisons that automatic equality would now cover:
-`same_span`, `same_purity`, `same_head` (two), `same_entity`,
-`same_record_origin`, `same_instance_visit`, `same_constructor_slot`,
-`same_list_update`, `same_role`, `same_place`, `same_callable_storage`,
-specialize's `same_partial_type`, `same_partial_union_key`,
-`same_partial_record_key` and `same_known_type`, and the remaining specialize
-`same_callable_*` helpers.
+operands of `==`; one side needs a type. When `same_x(a, b)` becomes `a == b`,
+a following `.and(...)` would bind to `b`, so parenthesize it.
+
+Follow-up (whole-value helpers, six commits, -258 production lines in `src/`):
+deleted `same_span`, `same_purity` and its `is_pure`, namespace's `same_head`,
+builtins' `same_role`, `same_constructor_slot`, `same_instance_visit`,
+`same_list_update`, `same_place` and, in specialize, `same_record_origin`,
+`same_callable_storage`, `same_callable_mode`, `same_partial_type`,
+`same_partial_union_key` and `same_partial_record_key`. No id needed a new
+`Equatable` implementation. `same_place`'s mutually recursive record and union
+and specialize's recursive `PartialType` derive `==` through the seed. Fixture
+output is identical. Matched against the same input, allocations are identical
+and minimum retired instructions fell 0.10%; each compiler on its own source,
+allocations fell 17k (0.09%) and instructions 0.22%. Kept, because each is
+not a whole-value comparison:
+
+- `same_entity` compares an alias by the module it names and ignores the path
+  as written;
+- patterns' `same_head` ignores the payload types of a union head and of a
+  tuple or cons head;
+- render's `same_kind` and runtime's `same_list_key` compare part of a value;
+- `same_name_table` compares the spellings, since the buckets derive from them,
+  and `NameTable` is opaque without a structural identity;
+- `same_indentation` compares source bytes, and `same_unbound_variable`
+  compares two variables' roots through the inference slots;
+- `same_known_type` compares a known type against a partial one, so
+  `same_elements`, which takes the comparison, stays for it.
 
 ### C7: first-error helpers (approval)
 
