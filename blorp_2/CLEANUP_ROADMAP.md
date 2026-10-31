@@ -350,8 +350,11 @@ known.declaration == key.declaration
   ceiling, the structural helpers stay.
   Basis: these helpers total about 250 lines.
 
-`specialize`'s `union_digest` is an alias of `union_number`. It is deleted:
-the index keys on `union_number`, and key equality compares declarations.
+`specialize`'s `type_digest` hashes exactly the fields TypeRef's derived `==`
+compares: the case, a List's element, a callable's parameters and result, and an
+instance's number. A new TypeRef case, or a change to what an instance id's
+`equals` compares, must change `type_digest` with it. Sealed union instances are
+indexed by `type_digest` of every argument.
 
 Fallback, if C6a's first commit exceeds the cost ceiling: named
 `same_union`-style helpers beside each `*_number`, with no C6b.

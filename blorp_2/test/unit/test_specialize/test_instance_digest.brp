@@ -1,0 +1,324 @@
+import:
+	../../../src/check/check: check
+	../../../src/specialize/indexed_list as Indexed
+	../../../src/specialize/specialize as Concrete
+	../module_input: parse_modules
+	../../../src/utils/text: concat
+	bool: and
+	int: Int methods
+	list: List methods
+	test: TestSuite
+
+
+-- A digest is a hint consistent with equality: equal keys must share one, or a
+-- lookup misses the instance it should find and prepares a second. So most of
+-- these tests count the instances a program prepares. `Maybe[T]` is the shape
+-- that matters: one declaration with many instances, told apart only by the
+-- digest of their arguments, whose union slots are indexed before an argument
+-- that names a layout still being built has resolved to an instance number.
+
+
+-- Where specialization of a source stopped, so a failing case names its stage.
+private union Specialization:
+	ParseRejected
+	CheckRejected
+	SpecializeRejected
+	Specialized(Concrete.SpecializedContents)
+
+
+private pure func specialization(source: String) -> Specialization:
+	match parse_modules([{ source = source, targets = [] }]):
+		Err(_): ParseRejected
+		Ok(parsed):
+			match check(parsed):
+				Err(_): CheckRejected
+				Ok(accepted):
+					match Concrete.specialize(accepted):
+						Err(_): SpecializeRejected
+						Ok(program): Specialized(Concrete.specialized_contents(program))
+
+
+private MAYBE: String =
+	|union Maybe[T]:
+	|    Just(T)
+	|    Nothing
+	|record First { value: Int }
+	|record Second { value: Int }
+	|
+
+
+-- Each case declares a Holder and a `make` that builds it; `main` calls `make`
+-- so that every layout is prepared.
+private MAIN: String =
+	|func main() -> Int:
+	|    unused = make()
+	|    0
+	|
+
+
+private pure func source_of(declarations: String) -> String:
+	concat(concat(MAYBE, declarations), MAIN)
+
+
+-- Maybe[First] and Maybe[Second] share a declaration: two instances.
+private DISTINCT_ARGUMENTS: String =
+	|record Holder { first: Maybe[First], second: Maybe[Second] }
+	|pure func make() -> Holder:
+	|    { first = Nothing, second = Nothing }
+	|
+
+-- The same instance requested twice is one instance.
+private REPEATED_ARGUMENT: String =
+	|record Holder { first: Maybe[First], second: Maybe[First] }
+	|pure func make() -> Holder:
+	|    { first = Nothing, second = Nothing }
+	|
+
+-- Nested generic arguments: Maybe[First], Maybe[Maybe[First]], Maybe[Second]
+-- and Maybe[Maybe[Second]], with the second requested twice.
+private NESTED_ARGUMENTS: String =
+	|record Holder { a: Maybe[Maybe[First]], b: Maybe[Maybe[First]], c: Maybe[Maybe[Second]] }
+	|pure func make() -> Holder:
+	|    { a = Nothing, b = Nothing, c = Nothing }
+	|
+
+-- Callable and List arguments, which a slot digests by their case alone: the
+-- full comparison tells Maybe[List[First]] from Maybe[List[Second]].
+private CALLABLE_AND_LIST_ARGUMENTS: String =
+	|record Holder {
+	|    a: Maybe[pure (Int) -> Int],
+	|    b: Maybe[pure (Int) -> String],
+	|    c: Maybe[pure (Int) -> Int],
+	|    d: Maybe[List[First]],
+	|    e: Maybe[List[Second]],
+	|    f: Maybe[List[First]],
+	|}
+	|pure func make() -> Holder:
+	|    { a = Nothing, b = Nothing, c = Nothing, d = Nothing, e = Nothing, f = Nothing }
+	|
+
+-- Maybe[A] is indexed while B is in progress, with a pending record argument.
+-- Holder then names Maybe[A] and Maybe[B] with both complete.
+private PENDING_RECORD_ARGUMENT: String =
+	|record A { next: Maybe[B] }
+	|record B { back: Maybe[A] }
+	|record Holder { a: Maybe[A], b: Maybe[B] }
+	|pure func make() -> Holder:
+	|    { a = Nothing, b = Nothing }
+	|
+
+-- Maybe[Tree] is indexed while Tree is in progress, with a pending union
+-- argument. A generic union may not recurse into itself directly, so Tree
+-- recurses through a record field.
+private PENDING_UNION_ARGUMENT: String =
+	|union Tree:
+	|    Leaf
+	|    Branch(Wrap)
+	|record Wrap { next: Maybe[Tree] }
+	|record Holder { first: Maybe[Tree], second: Maybe[Tree] }
+	|pure func make() -> Holder:
+	|    { first = Nothing, second = Nothing }
+	|
+
+-- Maybe[List[Node]] is indexed while Node is in progress, with a pending List argument.
+private PENDING_LIST_ARGUMENT: String =
+	|record Node { next: Maybe[List[Node]] }
+	|record Holder { first: Maybe[List[Node]] }
+	|pure func make() -> Holder:
+	|    { first = Nothing }
+	|
+
+-- Maybe[(Node) -> Int] is indexed while Node is in progress, with a pending callable argument.
+private PENDING_CALLABLE_ARGUMENT: String =
+	|record Node { next: Maybe[pure (Node) -> Int] }
+	|record Holder { first: Maybe[pure (Node) -> Int] }
+	|pure func make() -> Holder:
+	|    { first = Nothing }
+	|
+
+private pure func all_sources() -> List[String]:
+	[
+		DISTINCT_ARGUMENTS, REPEATED_ARGUMENT, NESTED_ARGUMENTS, CALLABLE_AND_LIST_ARGUMENTS,
+		PENDING_RECORD_ARGUMENT, PENDING_UNION_ARGUMENT, PENDING_LIST_ARGUMENT, PENDING_CALLABLE_ARGUMENT,
+	].map(source_of)
+
+
+-- Whether the case `declarations` prepares exactly this many union and record instances.
+private pure func prepares(declarations: String, unions: Int, records: Int) -> Bool:
+	match specialization(source_of(declarations)):
+		Specialized(contents): and(contents.unions.length() == unions, contents.records.length() == records)
+		_: False
+
+
+pure func test_every_source_parses() -> Bool:
+	all_sources().all(pure func(source: String) -> Bool:
+		match specialization(source):
+			ParseRejected: False
+			_: True
+	)
+
+
+pure func test_every_source_checks() -> Bool:
+	all_sources().all(pure func(source: String) -> Bool:
+		match specialization(source):
+			ParseRejected | CheckRejected: False
+			_: True
+	)
+
+
+pure func test_every_source_specializes() -> Bool:
+	all_sources().all(pure func(source: String) -> Bool:
+		match specialization(source):
+			Specialized(_): True
+			_: False
+	)
+
+
+pure func test_instances_of_one_declaration_with_distinct_records_stay_apart() -> Bool:
+	prepares(DISTINCT_ARGUMENTS, 2, 3)
+
+
+pure func test_a_repeated_argument_is_one_instance() -> Bool:
+	prepares(REPEATED_ARGUMENT, 1, 2)
+
+
+pure func test_nested_generic_arguments_are_found_again() -> Bool:
+	prepares(NESTED_ARGUMENTS, 4, 3)
+
+
+pure func test_callable_and_list_arguments_are_told_apart_by_comparison() -> Bool:
+	prepares(CALLABLE_AND_LIST_ARGUMENTS, 4, 3)
+
+
+pure func test_a_complete_record_argument_finds_the_slot_indexed_while_it_was_pending() -> Bool:
+	prepares(PENDING_RECORD_ARGUMENT, 2, 3)
+
+
+pure func test_a_complete_union_argument_finds_the_slot_indexed_while_it_was_pending() -> Bool:
+	prepares(PENDING_UNION_ARGUMENT, 2, 2)
+
+
+pure func test_a_complete_list_argument_finds_the_slot_indexed_while_it_was_pending() -> Bool:
+	prepares(PENDING_LIST_ARGUMENT, 1, 2)
+
+
+pure func test_a_complete_callable_argument_finds_the_slot_indexed_while_it_was_pending() -> Bool:
+	prepares(PENDING_CALLABLE_ARGUMENT, 1, 2)
+
+
+-- The instance types a function's signature names, whose numbers only the
+-- builder issues: Maybe[First] and Maybe[Second] are unions 0 and 1, First and
+-- Second records 0 and 1.
+private pure func instance_types() -> List[Concrete.TypeRef]:
+	match specialization(concat(MAYBE, TAKE_INSTANCES)):
+		Specialized(contents):
+			var found: List[Concrete.TypeRef] = []
+			for function in contents.functions:
+				if function.signature.parameters.length() == 4:
+					found = function.signature.parameters
+			found
+		_: []
+
+
+pure func test_instance_types_digest_by_case_and_number() -> Bool:
+	match instance_types():
+		[first_union, second_union, first_record, second_record]:
+			and(
+				and(differs(first_union, second_union), differs(first_record, second_record)),
+				-- The same number under UnionType and RecordType.
+				differs(first_union, first_record),
+			)
+		_: False
+
+
+-- Unions 0 and 1 are Maybe[First] and Maybe[Second]; records 0 and 1 are First and Second.
+private TAKE_INSTANCES: String =
+	|pure func take(a: Maybe[First], b: Maybe[Second], c: First, d: Second) -> Int:
+	|    0
+	|func main() -> Int:
+	|    take(Nothing, Nothing, { value = 1 }, { value = 2 })
+	|
+
+
+private pure func callable_of_lists() -> Concrete.TypeRef:
+	Concrete.CallableType(
+		[Concrete.ListType(Concrete.IntType), Concrete.StringType],
+		Concrete.ListType(Concrete.CallableType([Concrete.FloatType], Concrete.VoidType)),
+	)
+
+
+private pure func differs(left: Concrete.TypeRef, right: Concrete.TypeRef) -> Bool:
+	Concrete.type_digest(left) != Concrete.type_digest(right)
+
+
+-- `Maybe[Int]` and `Maybe[String]` share a declaration number, the seed.
+pure func test_instances_of_one_declaration_with_different_arguments_differ() -> Bool:
+	and(
+		Concrete.arguments_digest(1, [Concrete.IntType]) != Concrete.arguments_digest(1, [Concrete.StringType]),
+		Concrete.arguments_digest(1, [Concrete.ListType(Concrete.IntType)]) != Concrete.arguments_digest(1, [Concrete.ListType(Concrete.StringType)]),
+	)
+
+
+pure func test_argument_order_and_count_change_the_digest() -> Bool:
+	both = Concrete.arguments_digest(2, [Concrete.IntType, Concrete.StringType])
+	swapped = Concrete.arguments_digest(2, [Concrete.StringType, Concrete.IntType])
+	one = Concrete.arguments_digest(2, [Concrete.IntType])
+	and(both != swapped, and(both != one, one != Concrete.arguments_digest(2, [])))
+
+
+pure func test_scalar_list_and_callable_types_have_distinct_digests() -> Bool:
+	void_type = Concrete.type_digest(Concrete.VoidType)
+	int_type = Concrete.type_digest(Concrete.IntType)
+	float_type = Concrete.type_digest(Concrete.FloatType)
+	string_type = Concrete.type_digest(Concrete.StringType)
+	scalars_differ = and(
+		and(and(void_type != int_type, void_type != float_type), and(void_type != string_type, int_type != float_type)),
+		and(int_type != string_type, float_type != string_type),
+	)
+	and(
+		scalars_differ,
+		and(
+			differs(Concrete.ListType(Concrete.IntType), Concrete.ListType(Concrete.StringType)),
+			and(
+				differs(Concrete.ListType(Concrete.IntType), Concrete.IntType),
+				differs(
+					Concrete.CallableType([Concrete.IntType], Concrete.StringType),
+					Concrete.CallableType([Concrete.StringType], Concrete.IntType),
+				),
+			),
+		),
+	)
+
+
+-- Two different types forced under one digest are still told apart by `==`.
+pure func test_a_digest_collision_resolves_by_comparing_whole_types() -> Bool:
+	var table: Indexed.IndexedList[Concrete.TypeRef] = Indexed.empty_indexed_list()
+	table = Indexed.append_entry(table, Concrete.IntType, 0)
+	table = Indexed.append_entry(table, Concrete.StringType, 0)
+	table = Indexed.append_entry(table, callable_of_lists(), 0)
+	match Indexed.find_position(table, 0, pure func(known: Concrete.TypeRef) -> Bool: known == callable_of_lists()):
+		Ok(Some(position)): position == 2
+		_: False
+
+
+tests: TestSuite = {
+	description = "Blorp 2 specialization instance digests",
+	tests = [
+		("every source parses", test_every_source_parses),
+		("every source checks", test_every_source_checks),
+		("every source specializes", test_every_source_specializes),
+		("instances of one declaration with distinct records stay apart", test_instances_of_one_declaration_with_distinct_records_stay_apart),
+		("a repeated argument is one instance", test_a_repeated_argument_is_one_instance),
+		("nested generic arguments are found again", test_nested_generic_arguments_are_found_again),
+		("callable and list arguments are told apart by comparison", test_callable_and_list_arguments_are_told_apart_by_comparison),
+		("a complete record argument finds the slot indexed while it was pending", test_a_complete_record_argument_finds_the_slot_indexed_while_it_was_pending),
+		("a complete union argument finds the slot indexed while it was pending", test_a_complete_union_argument_finds_the_slot_indexed_while_it_was_pending),
+		("a complete list argument finds the slot indexed while it was pending", test_a_complete_list_argument_finds_the_slot_indexed_while_it_was_pending),
+		("a complete callable argument finds the slot indexed while it was pending", test_a_complete_callable_argument_finds_the_slot_indexed_while_it_was_pending),
+		("instance types digest by case and number", test_instance_types_digest_by_case_and_number),
+		("instances of one declaration with different arguments differ", test_instances_of_one_declaration_with_different_arguments_differ),
+		("argument order and count change the digest", test_argument_order_and_count_change_the_digest),
+		("scalar, list and callable types have distinct digests", test_scalar_list_and_callable_types_have_distinct_digests),
+		("a digest collision resolves by comparing whole types", test_a_digest_collision_resolves_by_comparing_whole_types),
+	]
+}

@@ -569,6 +569,146 @@ private pure func record_digest(origin: RecordOrigin, argument_count: Int) -> In
 		StructuralTuple: TUPLE_DIGEST_BASE.subtract(argument_count)
 
 
+-- A digest mixes the parts equality compares: each part is added to the digest
+-- so far times DIGEST_MULTIPLIER, modulo DIGEST_MODULUS. The modulus is the
+-- prime 2^31 - 1, which keeps a digest well below the point where the product
+-- wraps. The reduction also matters because an IntMap takes a digest modulo its
+-- power-of-two slot count: unreduced, the low bits of a product depend only on
+-- the low bits of its factors, so structured parts would crowd a few slots.
+private DIGEST_MULTIPLIER: Int = 1000003
+
+private DIGEST_MODULUS: Int = 2147483647
+
+
+-- What starts the digest of each TypeRef case. Distinct, so that equal numbers
+-- in different cases (RecordType(3) and UnionType(3)) give different digests.
+private VOID_TYPE_DIGEST: Int = 1
+
+private INT_TYPE_DIGEST: Int = 2
+
+private FLOAT_TYPE_DIGEST: Int = 3
+
+private STRING_TYPE_DIGEST: Int = 4
+
+private LIST_TYPE_DIGEST: Int = 5
+
+private CALLABLE_TYPE_DIGEST: Int = 6
+
+private RECORD_TYPE_DIGEST: Int = 7
+
+private UNION_TYPE_DIGEST: Int = 8
+
+
+private pure func mix_digest(digest: Int, part: Int) -> Int:
+	digest.multiply(DIGEST_MULTIPLIER).add(part).remainder(DIGEST_MODULUS)
+
+
+-- `seed` mixed with the digest of each argument in order. Public, with
+-- `type_digest`, for the digest tests.
+pure func arguments_digest(seed: Int, arguments: List[TypeRef]) -> Int:
+	var digest = seed
+
+	for argument in arguments:
+		digest = mix_digest(digest, type_digest(argument))
+
+	digest
+
+
+-- A digest of exactly what the derived `==` on TypeRef compares, so equal
+-- types give equal digests. Instance identities are the numbers their
+-- `Equatable` implementations compare.
+pure func type_digest(value: TypeRef) -> Int:
+	match value:
+		VoidType: VOID_TYPE_DIGEST
+		IntType: INT_TYPE_DIGEST
+		FloatType: FLOAT_TYPE_DIGEST
+		StringType: STRING_TYPE_DIGEST
+		ListType(element): mix_digest(LIST_TYPE_DIGEST, type_digest(element))
+		CallableType(parameters, result): mix_digest(arguments_digest(CALLABLE_TYPE_DIGEST, parameters), type_digest(result))
+		RecordType(id): mix_digest(RECORD_TYPE_DIGEST, record_number(id))
+		UnionType(id): mix_digest(UNION_TYPE_DIGEST, union_number(id))
+
+
+-- Indexes a sealed union instance by what key equality compares: the
+-- declaration number and every argument.
+private pure func union_instance_digest(key: UnionKey) -> Int:
+	arguments_digest(Declaration.union_number(key.declaration), key.arguments)
+
+
+-- Indexes a union slot by its declaration number and the head of each
+-- argument, which tells `Option[Int]` from `Option[String]` and `Option[A]`
+-- from `Option[B]`. It reads only a head, not the whole argument, because a slot
+-- is indexed once, while an argument may still be a pending reference to a
+-- layout on the path. `resolve_partial` later replaces that reference with the
+-- completed layout's instance number, unknown until then, and the index does not
+-- move. A pending reference and the layout it resolves to agree on the
+-- declaration they instantiate, so that is the head of a union or record
+-- argument, read from the argument's own slot once it is an instance. Both
+-- digests of a union argument start from UNION_TYPE_DIGEST, but one is of an
+-- instance number and indexes the sealed table, the other is of a declaration
+-- number and indexes the slots; the two tables' digests are never compared.
+private pure func slot_union_digest(
+	key: PartialUnionKey, unions: IndexedList[UnionSlot], records: IndexedList[RecordSlot], span: Span,
+) -> Result[Int, Diagnostic]:
+	var digest = Declaration.union_number(key.declaration)
+	var failure: Option[Diagnostic] = None
+
+	for argument in key.arguments:
+		match partial_head_digest(argument, unions, records, span):
+			Ok(head): digest = mix_digest(digest, head)
+			Err(error):
+				failure = Some(error)
+				break
+
+	match failure:
+		Some(error): Err(error)
+		None: Ok(digest)
+
+
+-- The head of a partial type: its case, and for a union or record the
+-- declaration it instantiates. A pending reference and the instance it
+-- resolves to give the same head.
+private pure func partial_head_digest(
+	value: PartialType, unions: IndexedList[UnionSlot], records: IndexedList[RecordSlot], span: Span,
+) -> Result[Int, Diagnostic]:
+	match value:
+		KnownType(known): known_head_digest(known, unions, records, span)
+		PendingUnionType(key): Ok(union_head_digest(key.declaration))
+		PendingRecordType(key): Ok(record_head_digest(key.origin, key.arguments.length()))
+		PendingListType(_): Ok(LIST_TYPE_DIGEST)
+		PendingCallable(_, _): Ok(CALLABLE_TYPE_DIGEST)
+
+
+private pure func known_head_digest(
+	value: TypeRef, unions: IndexedList[UnionSlot], records: IndexedList[RecordSlot], span: Span,
+) -> Result[Int, Diagnostic]:
+	match value:
+		VoidType: Ok(VOID_TYPE_DIGEST)
+		IntType: Ok(INT_TYPE_DIGEST)
+		FloatType: Ok(FLOAT_TYPE_DIGEST)
+		StringType: Ok(STRING_TYPE_DIGEST)
+		ListType(_): Ok(LIST_TYPE_DIGEST)
+		CallableType(_, _): Ok(CALLABLE_TYPE_DIGEST)
+		RecordType(id):
+			match records.entries.get(record_number(id)):
+				Some(CompleteRecord(instance)): Ok(record_head_digest(instance.key.origin, instance.key.arguments.length()))
+				Some(PendingRecord(instance)): Ok(record_head_digest(instance.key.origin, instance.key.arguments.length()))
+				None: Err(internal_error(span, "record argument names a missing slot"))
+		UnionType(id):
+			match unions.entries.get(union_number(id)):
+				Some(CompleteUnion(instance)): Ok(union_head_digest(instance.key.declaration))
+				Some(PendingUnion(instance)): Ok(union_head_digest(instance.key.declaration))
+				None: Err(internal_error(span, "union argument names a missing slot"))
+
+
+private pure func record_head_digest(origin: RecordOrigin, argument_count: Int) -> Int:
+	mix_digest(RECORD_TYPE_DIGEST, record_digest(origin, argument_count))
+
+
+private pure func union_head_digest(declaration: Declaration.UnionId) -> Int:
+	mix_digest(UNION_TYPE_DIGEST, Declaration.union_number(declaration))
+
+
 -- The position of the entry under `digest` that `matches`. An index naming a
 -- missing entry has diverged from its list: an internal error.
 private pure func indexed_position[T](
@@ -1062,7 +1202,7 @@ private pure func find_union_instance(
 	key: UnionKey,
 	span: Span,
 ) -> Result[Option[UnionInstanceId], Diagnostic]:
-	found ?= indexed_position(keys, Declaration.union_number(key.declaration), span, pure func(known: UnionInstance) -> Bool:
+	found ?= indexed_position(keys, union_instance_digest(key), span, pure func(known: UnionInstance) -> Bool:
 		and(known.key.declaration == key.declaration, known.key.arguments == key.arguments)
 	)
 	Ok(found.map(pure func(position: Int) -> UnionInstanceId: into_opaque UnionInstanceId(position)))
@@ -1166,9 +1306,10 @@ private pure func slot_record_representation(slot: RecordSlot) -> RecordRepresen
 
 
 private pure func find_union_slot(
-	slots: IndexedList[UnionSlot], key: PartialUnionKey, span: Span,
+	slots: IndexedList[UnionSlot], records: IndexedList[RecordSlot], key: PartialUnionKey, span: Span,
 ) -> Result[Option[UnionInstanceId], Diagnostic]:
-	found ?= indexed_position(slots, Declaration.union_number(key.declaration), span, pure func(slot: UnionSlot) -> Bool: slot_has_union_key(slot, key))
+	digest ?= slot_union_digest(key, slots, records, span)
+	found ?= indexed_position(slots, digest, span, pure func(slot: UnionSlot) -> Bool: slot_has_union_key(slot, key))
 	Ok(found.map(pure func(position: Int) -> UnionInstanceId: into_opaque UnionInstanceId(position)))
 
 
@@ -1519,7 +1660,7 @@ private pure func ensure_union(
 	records: IndexedList[RecordSlot],
 	in_progress: List[InProgressLayout],
 ) -> Result[PreparedType, Diagnostic]:
-	existing ?= find_union_slot(unions, key, span)
+	existing ?= find_union_slot(unions, records, key, span)
 	match existing:
 		Some(id):
 			Ok({ value_type = KnownType(UnionType(id)), unions = unions, records = records, in_progress = in_progress })
@@ -1615,7 +1756,8 @@ private pure func prepare_union(
 	-- path, including its own direct self payload, remain to fill.
 	id: UnionInstanceId = into_opaque UnionInstanceId(dependencies.entries.length())
 	slot ?= settle_union({ key = key, variants = variants, representation = representation }, span)
-	published = append_entry(dependencies, slot, Declaration.union_number(key.declaration))
+	digest ?= slot_union_digest(key, dependencies, record_dependencies, span)
+	published = append_entry(dependencies, slot, digest)
 	left ?= leave_layout(layouts, span)
 	match left.back_reference:
 		NotReferencedBack:
@@ -1970,23 +2112,27 @@ private pure func prepare_tuple_type(
 
 -- Every slot is complete once no layout is in progress; sealing projects the
 -- builder into the immutable instance list the translation phase reads. An
--- instance keeps its slot's position and every key field the digest reads, so
--- the builder's `positions` carry over. `seal_records` relies on the same.
+-- instance keeps its slot's position, so instance numbers do not change, but
+-- its digest is rebuilt: a slot may be indexed before its pending references
+-- resolve, when only a coarser digest is known (see `slot_union_digest`),
+-- whereas a sealed key holds instance numbers throughout. `seal_records`
+-- carries the record slots' positions over: a record digest reads the origin
+-- and argument count, which resolution never changes.
 private pure func seal_unions(slots: IndexedList[UnionSlot]) -> Result[IndexedList[UnionInstance], Diagnostic]:
-	var instances: List[UnionInstance] = []
+	var instances: IndexedList[UnionInstance] = empty_indexed_list()
 	var failure: Option[Diagnostic] = None
 
 	for slot in slots.entries:
 		match slot:
 			CompleteUnion(instance):
-				instances = instances.append(instance)
+				instances = append_entry(instances, instance, union_instance_digest(instance.key))
 			PendingUnion(_):
 				failure = Some(internal_error(compiler_span(), "union layout sealed while still pending"))
 				break
 
 	match failure:
 		Some(error): Err(error)
-		None: Ok({ entries = instances, positions = slots.positions })
+		None: Ok(instances)
 
 
 private pure func seal_records(slots: IndexedList[RecordSlot]) -> Result[IndexedList[RecordInstance], Diagnostic]:
