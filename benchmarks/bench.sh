@@ -32,6 +32,7 @@
 #   BENCH_RUNS=5                       bash benchmarks/bench.sh   # Timed runs per language (default: 1)
 #   BENCH_WARMUPS=1                    bash benchmarks/bench.sh   # Untimed warmup runs (default: 0)
 #   BENCH_ALLOC_STATS=1                bash benchmarks/bench.sh   # Separate allocation runs for both Blorp runtimes
+#   BENCH_RESOURCE_STATS=1             bash benchmarks/bench.sh   # Retired instructions and peak RSS (macOS /usr/bin/time -l)
 #   BENCH_VERBOSE=1                    bash benchmarks/bench.sh   # Print build logs on failures
 
 set -e
@@ -54,6 +55,7 @@ BENCH_THREADS="${BENCH_THREADS:-4}"
 BENCH_RUNS="${BENCH_RUNS:-1}"
 BENCH_WARMUPS="${BENCH_WARMUPS:-0}"
 BENCH_ALLOC_STATS="${BENCH_ALLOC_STATS:-0}"
+BENCH_RESOURCE_STATS="${BENCH_RESOURCE_STATS:-0}"
 BENCH_VERBOSE="${BENCH_VERBOSE:-0}"
 BENCH_FAILED=0
 TEMP_DIR=$(mktemp -d)
@@ -176,8 +178,25 @@ is_built() {
     [ -f "$status_file" ] && [ "$(cat "$status_file")" = "ok" ] && [ -x "$(compiled_out_for "$lang" "$name")" ]
 }
 
+resource_stats_for() {
+    local lang="$1" name="$2"
+    printf "%s/resource_%s_%s.txt" "$TEMP_DIR" "$lang" "$name"
+}
+
+resource_instructions_for() {
+    local lang="$1" name="$2"
+    sed -n 's/^instructions=\([0-9]*\) .*/\1/p' "$(resource_stats_for "$lang" "$name")"
+}
+
 run_and_read_seconds() {
-    "$PYTHON" "$SCRIPT_DIR/bench_run.py" "$BENCH_WARMUPS" "$BENCH_RUNS" "$@"
+    local lang="$1" name="$2"
+    # Keep name in "$@": bench_run.py takes it before the command.
+    shift
+    local resource_args=()
+    if [ "$BENCH_RESOURCE_STATS" = "1" ]; then
+        resource_args=(--resource-stats "$(resource_stats_for "$lang" "$name")")
+    fi
+    "$PYTHON" "$SCRIPT_DIR/bench_run.py" "${resource_args[@]}" "$BENCH_WARMUPS" "$BENCH_RUNS" "$@"
 }
 
 run_and_read_blorp_alloc_stats() {
@@ -528,16 +547,16 @@ run_built_lang() {
     if is_concurrency_benchmark "$name"; then
         case "$lang" in
             blorp)
-                run_and_read_seconds "$name" env "BLORP_THREADS=$BLORP_CONCURRENCY_THREADS" "$out" "${args[@]}"
+                run_and_read_seconds "$lang" "$name" env "BLORP_THREADS=$BLORP_CONCURRENCY_THREADS" "$out" "${args[@]}"
                 return
                 ;;
             go)
-                run_and_read_seconds "$name" env "GOMAXPROCS=$GO_CONCURRENCY_THREADS" "$out" "${args[@]}"
+                run_and_read_seconds "$lang" "$name" env "GOMAXPROCS=$GO_CONCURRENCY_THREADS" "$out" "${args[@]}"
                 return
                 ;;
         esac
     fi
-    run_and_read_seconds "$name" "$out" "${args[@]}"
+    run_and_read_seconds "$lang" "$name" "$out" "${args[@]}"
 }
 
 run_blorp_alloc_stats() {
@@ -591,7 +610,7 @@ if callable(is_gil_enabled) and is_gil_enabled():
 PY
     fi
 
-    run_and_read_seconds "$name" "$py" "${py_args[@]}" "$runner" "$name" "$src" "${args[@]}"
+    run_and_read_seconds python "$name" "$py" "${py_args[@]}" "$runner" "$name" "$src" "${args[@]}"
 }
 
 run_one() {
@@ -700,9 +719,20 @@ run_one() {
             [ -n "$notes" ] && notes="$notes, "
             notes="${notes}blorp2: $blorp2_alloc_stats"
         fi
+        local lang resource_stats
+        for lang in blorp blorp2 c go ocaml python; do
+            resource_stats="$(resource_stats_for "$lang" "$name")"
+            [ -f "$resource_stats" ] || continue
+            [ -n "$notes" ] && notes="$notes, "
+            notes="${notes}$lang: $(cat "$resource_stats")"
+        done
         if [ -n "$b2t" ]; then
             [ -n "$notes" ] && notes="$notes, "
             notes="${notes}blorp2/blorp time: $(fmt_speedup "$bt" "$b2t")"
+            if [ -f "$(resource_stats_for blorp "$name")" ] && [ -f "$(resource_stats_for blorp2 "$name")" ]; then
+                notes="$notes, blorp2/blorp instructions: $(fmt_speedup \
+                    "$(resource_instructions_for blorp "$name")" "$(resource_instructions_for blorp2 "$name")")"
+            fi
             case "$name" in
                 list_ops|compiler_emit) notes="$notes (provisional: current libraries)" ;;
                 compiler_ast|binary_trees) notes="$notes (provisional: representations differ)" ;;
@@ -747,6 +777,10 @@ if [ "$FILTER" = "--help" ] || [ "$FILTER" = "-h" ]; then
     exit 0
 fi
 
+if [ "$BENCH_RESOURCE_STATS" = "1" ] && ! /usr/bin/time -l true 2>&1 | grep -q "instructions retired"; then
+    die "BENCH_RESOURCE_STATS=1 needs a /usr/bin/time -l that reports instructions retired (macOS)"
+fi
+
 echo ""
 echo "blorp Benchmark Suite"
 echo "====================="
@@ -755,6 +789,9 @@ echo "blorp: $BLORP"
 echo "blorp2: $BLORP2_COMPILER"
 if [ "$BENCH_ALLOC_STATS" = "1" ]; then
     echo "Allocation runs: blorp counts managed objects; blorp2 counts allocator calls; bytes are live at exit."
+fi
+if [ "$BENCH_RESOURCE_STATS" = "1" ]; then
+    echo "Resource stats: whole-process /usr/bin/time -l; minimum instructions and maximum peak RSS over timed runs."
 fi
 echo "C:     $($CC --version 2>&1 | head -1)"
 has_cmd "$GO" && echo "Go:    $($GO version 2>&1 | sed 's/go version //')"

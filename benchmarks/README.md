@@ -61,7 +61,16 @@ The initial ports are `numeric_loop`, `fib`, `binary_trees`, `compiler_ast`,
 counts and result checksums. Both Blorp compilers' generated C uses the same
 native optimization flags and the same whole-main timing wrapper.
 The `blorp2/blorp time` note is Blorp 2 elapsed time divided by legacy elapsed
-time: a value above 1 means Blorp 2 took longer.
+time: a value above 1 means Blorp 2 took longer. The `blorp2/blorp
+instructions` note, shown with `BENCH_RESOURCE_STATS=1`, is the same ratio for
+retired instructions.
+
+The ports exist because Blorp 2 does not yet compile the legacy sources: as of
+2026-10-31 each one stops at its first infix arithmetic operator, compound
+assignment or tensor dimension. The
+[2026-10-31 comparison](results/blorp2-runtime-benchmarks-2026-10-31.md)
+lists each first diagnostic and measures the ports against the legacy
+compiler.
 
 The tree and AST ports use a managed record containing an inline union, matching
 the supported recursive-data idiom. Every logical node, including a leaf, has
@@ -339,6 +348,14 @@ diagnostic errors. The counts are labeled separately: legacy managed-object
 counts and Blorp 2 allocator-call counts have different accounting boundaries.
 The reported `bytes` field is live bytes at exit, not total bytes allocated.
 
+`BENCH_RESOURCE_STATS=1` runs every timed sample under macOS `/usr/bin/time -l`
+and appends each language's minimum retired instructions and maximum peak
+resident set size to the row, with a `blorp2/blorp instructions` ratio when both
+Blorp lanes ran. These counters cover the whole process, including startup, so
+a millisecond workload is dominated by process launch. Warmups run without the
+timer. Other platforms' `time` commands do not report retired instructions, so
+`bench.sh` refuses to start there rather than omit them.
+
 The current runners instrument the full benchmark `main` body. That means
 benchmark-specific setup and output are included unless the source factors them
 out before entering `main`. If a benchmark needs narrower hot-section timing,
@@ -360,6 +377,7 @@ GOMAXPROCS=4                    bash benchmarks/bench.sh   # Go runtime parallel
 BENCH_RUNS=5                    bash benchmarks/bench.sh   # Timed runs per language (default: 1)
 BENCH_WARMUPS=1                 bash benchmarks/bench.sh   # Untimed warmup runs (default: 0)
 BENCH_ALLOC_STATS=1             bash benchmarks/bench.sh   # Separate allocation runs for both Blorp runtimes
+BENCH_RESOURCE_STATS=1          bash benchmarks/bench.sh   # Retired instructions and peak RSS (macOS)
 BENCH_VERBOSE=1                 bash benchmarks/bench.sh   # Print build logs on failures
 ```
 
