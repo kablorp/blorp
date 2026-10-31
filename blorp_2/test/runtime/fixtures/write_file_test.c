@@ -186,7 +186,7 @@ static void stored_bytes(const char *expected, size_t length) {
 static void success_bytes(const char *bytes, size_t length) {
     struct blorp_string *path = blorp_string_from_bytes(output_path, (int64_t)strlen(output_path));
     struct blorp_string *contents = blorp_string_from_bytes(bytes, (int64_t)length);
-    drop_result(invoke(path, contents, BLORP_WRITE_FILE_OK, NULL));
+    drop_result(invoke(path, contents, BLORP_SYSTEM_SUCCEEDED, NULL));
     assert_bytes(path, output_path, strlen(output_path));
     assert_bytes(contents, bytes, length);
     stored_bytes(bytes, length);
@@ -197,7 +197,7 @@ static void success_bytes(const char *bytes, size_t length) {
 static void error_text(const char *path_bytes, size_t path_length, const char *expected) {
     struct blorp_string *path = blorp_string_from_bytes(path_bytes, (int64_t)path_length);
     struct blorp_string *contents = blorp_string_from_bytes("abc", 3);
-    drop_result(invoke(path, contents, BLORP_WRITE_FILE_ERROR, expected));
+    drop_result(invoke(path, contents, BLORP_SYSTEM_FAILED, expected));
     assert_bytes(path, path_bytes, path_length);
     assert_bytes(contents, "abc", 3);
     blorp_string_release(path);
@@ -243,7 +243,7 @@ int main(int argc, char **argv) {
         error_text(missing_path, strlen(missing_path), expected);
     } else if (strcmp(argv[1], "same_input") == 0) {
         struct blorp_string *both = blorp_string_from_bytes(output_path, (int64_t)strlen(output_path));
-        drop_result(invoke(both, both, BLORP_WRITE_FILE_OK, NULL));
+        drop_result(invoke(both, both, BLORP_SYSTEM_SUCCEEDED, NULL));
         assert_bytes(both, output_path, strlen(output_path));
         stored_bytes(output_path, strlen(output_path));
         blorp_string_release(both);
@@ -253,8 +253,8 @@ int main(int argc, char **argv) {
         failure = OPEN_EACCES;
         char expected[EXPECTED_ERROR_CAPACITY];
         assert(snprintf(expected, sizeof expected, "write_file: open failed; errno=%d", EACCES) > 0);
-        struct blorp_string *first = invoke(path, contents, BLORP_WRITE_FILE_ERROR, expected);
-        struct blorp_string *second = invoke(path, contents, BLORP_WRITE_FILE_ERROR, expected);
+        struct blorp_string *first = invoke(path, contents, BLORP_SYSTEM_FAILED, expected);
+        struct blorp_string *second = invoke(path, contents, BLORP_SYSTEM_FAILED, expected);
         assert(first != second);
         drop_result(first);
         assert_bytes(second, expected, strlen(expected));
