@@ -20,6 +20,7 @@ TARGET_COMPONENT_SOURCES := \
 	blorp_2/test/unit/test_utils/test_ids.brp \
 	blorp_2/test/unit/test_utils/test_int_map.brp \
 	blorp_2/test/unit/test_utils/test_names.brp \
+	blorp_2/test/unit/test_utils/test_results.brp \
 	blorp_2/test/unit/test_utils/test_source.brp \
 	blorp_2/test/unit/test_utils/test_syntax.brp \
 	blorp_2/test/unit/test_utils/test_text.brp \
