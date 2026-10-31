@@ -355,6 +355,37 @@ the index keys on `union_number`, and key equality compares declarations.
 Fallback, if C6a's first commit exceeds the cost ceiling: named
 `same_union`-style helpers beside each `*_number`, with no C6b.
 
+Status: C6a and C6b landed at +72 and -231 production lines in `src/`, so -159
+net (tests: -249, almost all call-site rewrites). The probe held: the first
+commit's `UnionId` comparison compiles to one direct call of `ids.equals`,
+with no allocation, and `scripts/blorp2-fixpoint --prove` passed through the
+pinned seed. All 27 identities that are compared now implement `Equatable`,
+and no module needed a `methods` import. `TypeRef`'s derived equality
+compiled through the seed, including its recursive, list-bearing shape. The
+raw `*_number(a) == *_number(b)` comparisons fell from 104 to 1 (`verify`
+compares two variants' positions inside one layout, not their identities),
+and `same_*` helpers from 39 to 23. Deleted: every id-only helper, model's
+`same_type`, `same_types`, `same_nominal`, `same_owner`, `same_parameter`,
+`same_body`, `same_aggregate`, `same_scoped_binding`, `same_variant` and
+`same_callable_parameter`, specialize's `same_type` and `union_digest`, and
+verify's `same_variant`. `same_list_key` stays: it compares rank, depth and
+ordinal, not the whole key. Fixtures are identical. Matched against the same
+input, minimum retired instructions rose 0.2% and allocations are identical.
+Each compiler on its own source (the larger candidate source adds the
+`implements` blocks and derived equality functions), allocations rose 0.35%
+and instructions 1.3%. An implementation's methods are module-level names,
+so the no-shadowing rule stops a module that implements `Equatable` from
+binding `equals` ("`equals` is already a trait method in this module"); model's
+`canonical_equality` renamed its parameters. A constructor call cannot be both
+operands of `==`; one side needs a type. Left for later, because they are
+whole-value comparisons that automatic equality would now cover:
+`same_span`, `same_purity`, `same_head` (two), `same_entity`,
+`same_record_origin`, `same_instance_visit`, `same_constructor_slot`,
+`same_list_update`, `same_role`, `same_place`, `same_callable_storage`,
+specialize's `same_partial_type`, `same_partial_union_key`,
+`same_partial_record_key` and `same_known_type`, and the remaining specialize
+`same_callable_*` helpers.
+
 ### C7: first-error helpers (approval)
 
 Move `translated_list` into a new `utils/results.brp`, generic over the error
