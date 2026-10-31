@@ -154,8 +154,8 @@ reached by UFCS or the explicit `int: hash` import. Hashes may be negative,
 including `INT_MIN`. Equal values must have equal hashes; unequal values may
 collide. Hashable is independent of Equatable and has no automatic derivation.
 A generic operation that both hashes and compares keys requires both traits.
-The compiler's `IntMap` remains Int-keyed and uses the hash for its home slot,
-then ordinary key equality to distinguish collisions.
+The compiler's `HashMap[K, V]` requires `K: Hashable + Equatable`: the key's hash
+picks its home slot, then ordinary key equality distinguishes collisions.
 
 Function type parameters declare their required traits with `:` and combine
 bounds with `+`. Each generic body is checked once against those declarations;
@@ -725,7 +725,7 @@ compiler executable (default `clang`).
 `make -C blorp_2 test-compiler test-components` runs the active component
 gate: Blorp 2 compiles the explicit `TARGET_COMPONENT_SOURCES` in the Makefile.
 The selection currently covers text, Boolean calls, constant/declaration IDs,
-IntMap, names, source identities and syntax publication, plus Lexer token traces,
+HashMap, names, source identities and syntax publication, plus Lexer token traces,
 float boundaries, keyword roles, source origins, character literals, continuation,
 doc fences, ranges, lexical trivia, pipe Strings and runtime-text round trips.
 Parse coverage includes constant inventories, source provenance, and String,

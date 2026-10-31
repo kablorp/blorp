@@ -18,7 +18,7 @@ TARGET_COMPONENT_SOURCES := \
 	blorp_2/test/unit/test_utils/test_boolean.brp \
 	blorp_2/test/unit/test_utils/test_constant_ids.brp \
 	blorp_2/test/unit/test_utils/test_ids.brp \
-	blorp_2/test/unit/test_utils/test_int_map.brp \
+	blorp_2/test/unit/test_utils/test_hash_map.brp \
 	blorp_2/test/unit/test_utils/test_names.brp \
 	blorp_2/test/unit/test_utils/test_results.brp \
 	blorp_2/test/unit/test_utils/test_stack.brp \

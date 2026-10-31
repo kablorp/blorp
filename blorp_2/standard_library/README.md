@@ -73,8 +73,8 @@ route; direct calls use `int: hash`. Int's written implementation returns its
 value unchanged, including negative values and `INT_MIN`. Hashes may be any
 signed Int. For values compared by equality, equal values must have equal hashes;
 distinct values may collide. Hashable has no supertraits and is never derived.
-The compiler's Int-keyed map uses this method for home slots and still compares
-keys by equality when probing collisions.
+The compiler's `HashMap[K, V]` (`K: Hashable + Equatable`) uses this method for
+home slots and still compares keys by equality when probing collisions.
 
 `Int` and `Float` are declared once in `_base.brp`. Other
 declarations are enabled only as their features enter the supported subset.

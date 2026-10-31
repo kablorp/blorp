@@ -194,7 +194,7 @@ The query follows actual fields through known inline union slots (complete or
 pending); matching PendingUnionType(key) is the witness. Other pending ancestor
 keys are not this witness. Stop at boxed unions, Lists, Strings and records;
 never traverse key arguments. Keep a query-local frontier and visited existing
-slot IDs using the existing IntMap, freeze nothing. This is needed to answer
+slot IDs using the existing HashMap, freeze nothing. This is needed to answer
 the new indirect-storage question, not a parallel graph authority. Frontier
 work is O(reached fields+slots) amortized, memory O(reached fields+slots), plus
 structural partial-key comparisons: the keys' derived `==` recursively compares

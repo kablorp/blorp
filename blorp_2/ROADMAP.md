@@ -3481,7 +3481,7 @@ tail-modulo-constructor, closure escape and closure values, and the unit-test
 migration plan. When reuse is introduced, its enabled and always-fresh paths must
 agree on observable values and safe destruction.
 
-`utils/int_map.brp` is a stopgap Int-keyed map for compiler tables; once Blorp
+`utils/hash_map.brp` is a stopgap map for compiler tables; once Blorp
 has a dict implementation it is deleted and its users move to it.
 
 Historical measurements also identify repeated generic-recursion reachability,
