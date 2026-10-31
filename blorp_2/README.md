@@ -168,7 +168,7 @@ trait Visit:
     pure func repeated(value: Self) -> Int:
         visit(value)
 
-fixed record Box[Element] { value: Element }
+record Box[Element] { value: Element }
 
 implements Visit for Box[Element: Visit]:
     pure func visit(value: Self) -> Int:
@@ -373,9 +373,9 @@ its declared conditions; failed conditions never fall back to structural equalit
 Actual members determine a generic head's conditions. For example:
 
 ```blorp
-fixed record Box[Element] { values: List[List[List[Element]]] }
-fixed record Phantom[Element] { tag: Int }
-fixed record Holder[Element] { child: Custom[Element] }
+record Box[Element] { values: List[List[List[Element]]] }
+record Phantom[Element] { tag: Int }
+record Holder[Element] { child: Custom[Element] }
 ```
 
 Box equality requires `Element: Equatable` when the visible ordinary List family
@@ -1575,7 +1575,7 @@ optimization follows separate evidence and review.
 ## Generic records
 
 ```blorp
-fixed record Box[T] { value: T }
+record Box[T] { value: T }
 pure func box[T](value: T) -> Box[T]:
     { value = value }
 pure func unbox[T](value: Box[T]) -> T:
