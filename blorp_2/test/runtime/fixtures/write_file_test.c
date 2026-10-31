@@ -16,9 +16,9 @@ enum Failure { NO_FAILURE, OPEN_EACCES, SHORT_EIO, SHORT_EINTR, SHORT_ZERO,
     CLOSE_ENOSPC, CLOSE_EINTR, WRITE_AND_CLOSE };
 struct Allocation { uintptr_t address; int live; };
 static struct Allocation allocations[MAX_ALLOCATIONS];
-static size_t allocation_count, live_count, free_count, path_frees;
+static size_t allocation_count, live_count, free_count;
 static size_t open_count, stream_count, write_count, close_count;
-static void *native_path;
+static const void *borrowed_path_bytes;
 static const void *contents_bytes;
 static size_t contents_length;
 static FILE *active_stream;
@@ -46,7 +46,6 @@ static void *observed_malloc(size_t bytes) {
 static void observed_free(void *pointer) {
     if (!pointer) return;
     allocations[allocation_slot(pointer)].live = 0;
-    if (pointer == native_path) { native_path = NULL; path_frees++; }
     live_count--;
     free_count++;
     free(pointer);
@@ -54,9 +53,8 @@ static void observed_free(void *pointer) {
 }
 
 static FILE *observed_fopen(const char *path, const char *mode) {
-    assert(native_path == NULL && active_stream == NULL);
-    (void)allocation_slot(path);
-    native_path = (void *)path;
+    /* The borrowed String's own bytes are the C path: no copy is made. */
+    assert(active_stream == NULL && path == borrowed_path_bytes);
     assert(strcmp(mode, "wb") == 0);
     open_count++;
     if (failure == OPEN_EACCES) { errno = EACCES; return NULL; }
@@ -66,7 +64,7 @@ static FILE *observed_fopen(const char *path, const char *mode) {
 }
 
 static size_t observed_fwrite(const void *bytes, size_t width, size_t count, FILE *stream) {
-    assert(stream == active_stream && stream != NULL && native_path == NULL);
+    assert(stream == active_stream && stream != NULL);
     assert(bytes == contents_bytes && width == 1 && count == contents_length && count > 0);
     write_count++;
     if (failure == SHORT_EIO || failure == SHORT_EINTR || failure == SHORT_ZERO || failure == WRITE_AND_CLOSE) {
@@ -134,26 +132,25 @@ static struct blorp_string *invoke(struct blorp_string *path, struct blorp_strin
     const size_t allocations_before = allocation_count, frees_before = free_count;
     const size_t opens_before = open_count, writes_before = write_count, closes_before = close_count;
     const size_t streams_before = stream_count;
-    const size_t path_frees_before = path_frees;
     const int nul_path = memchr(path->bytes, '\0', (size_t)path->length) != NULL;
     /* A non-NULL sentinel is a live borrowed input, so leaving it unchanged
      * fails the success oracle without inventing an invalid pointer. */
     struct blorp_string *error = path;
     borrowed_path = path;
+    borrowed_path_bytes = path->bytes;
     borrowed_contents = contents;
     contents_bytes = contents->bytes;
     contents_length = (size_t)contents->length;
     const uint8_t status = blorp_write_file(path, contents, &error);
-    assert(status == expected_status && native_path == NULL && active_stream == NULL);
+    assert(status == expected_status && active_stream == NULL);
     assert(atomic_load(&path->references) == 1 && atomic_load(&contents->references) == 1);
     const size_t attempted_open = nul_path ? 0 : 1;
     const size_t acquired_stream = stream_count - streams_before;
     assert(open_count == opens_before + attempted_open);
-    assert(path_frees == path_frees_before + attempted_open);
     assert(acquired_stream <= 1 && close_count == closes_before + acquired_stream);
     assert(write_count == writes_before + (acquired_stream != 0 && contents_length != 0 ? 1 : 0));
-    assert(allocation_count == allocations_before + attempted_open + (expected_error ? 1 : 0));
-    assert(free_count == frees_before + attempted_open);
+    assert(allocation_count == allocations_before + (expected_error ? 1 : 0));
+    assert(free_count == frees_before);
     if (expected_error) {
         assert(error && error != path && error != contents);
         assert_bytes(error, expected_error, strlen(expected_error));
@@ -161,6 +158,7 @@ static struct blorp_string *invoke(struct blorp_string *path, struct blorp_strin
     } else assert(error == NULL);
     contents_bytes = NULL;
     borrowed_path = borrowed_contents = NULL;
+    borrowed_path_bytes = NULL;
     return error;
 }
 
@@ -276,7 +274,7 @@ int main(int argc, char **argv) {
     else if (strcmp(argv[1], "close_eintr") == 0) { failure = CLOSE_EINTR; error_number("close failed", EINTR); }
     else if (strcmp(argv[1], "write_close") == 0) { failure = WRITE_AND_CLOSE; error_number("short write", EIO); }
     else abort();
-    assert(active_stream == NULL && native_path == NULL && live_count == 0);
+    assert(active_stream == NULL && live_count == 0);
     assert(allocation_count == free_count);
     if (strcmp(argv[1], "missing_parent") != 0) assert(unlink(output_path) == 0);
     return 0;

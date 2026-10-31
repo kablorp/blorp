@@ -18,9 +18,9 @@ enum Failure { NO_FAILURE, OPEN_FAILURE, SEEK_END_FAILURE, TELL_FAILURE,
 struct Allocation { void *pointer; int live; };
 static struct Allocation allocations[MAX_ALLOCATIONS];
 static size_t allocation_count, live_count, allocation_total, free_total;
-static size_t path_frees, staging_frees, output_frees;
+static size_t staging_frees, output_frees;
 static size_t open_count, close_count, read_count, error_count;
-static void *native_path, *staging, *output_root;
+static void *staging, *output_root;
 static const void *borrowed_bytes;
 static FILE *active_stream;
 static enum Failure failure;
@@ -37,8 +37,6 @@ static size_t allocation_slot(void *pointer) {
 
 static void *observed_malloc(size_t bytes) {
     assert(bytes != 0 && allocation_count < MAX_ALLOCATIONS);
-    if (failure == OPEN_FAILURE && open_count != 0)
-        assert(native_path == NULL && path_frees == open_count);
     void *pointer = malloc(bytes);
     assert(pointer);
     allocations[allocation_count++] = (struct Allocation){pointer, 1};
@@ -50,7 +48,6 @@ static void *observed_malloc(size_t bytes) {
 static void observed_free(void *pointer) {
     if (!pointer) return;
     const size_t slot = allocation_slot(pointer);
-    if (pointer == native_path) { native_path = NULL; path_frees++; }
     if (pointer == staging) { staging = NULL; staging_frees++; }
     if (pointer == output_root) { output_root = NULL; output_frees++; }
     allocations[slot].live = 0;
@@ -60,17 +57,9 @@ static void observed_free(void *pointer) {
     if (poison_free) errno = EDOM;
 }
 
-static void *observed_memcpy(void *destination, const void *source, size_t length) {
-    if (source == borrowed_bytes) {
-        assert(native_path == NULL);
-        (void)allocation_slot(destination);
-        native_path = destination;
-    }
-    return memcpy(destination, source, length);
-}
-
 static FILE *observed_fopen(const char *path, const char *mode) {
-    assert(path == native_path && active_stream == NULL);
+    /* The borrowed String's own bytes are the C path: no copy is made. */
+    assert(path == borrowed_bytes && active_stream == NULL);
     assert(strcmp(mode, "rb") == 0);
     open_count++;
     active_stream = fopen(path, mode);
@@ -142,7 +131,6 @@ static int observed_fclose(FILE *stream) {
 /* Only the unchanged production runtime and aggregate fragments see aliases. */
 #define malloc observed_malloc
 #define free observed_free
-#define memcpy observed_memcpy
 #define fopen observed_fopen
 #define fseek observed_fseek
 #define ftell observed_ftell
@@ -156,7 +144,6 @@ static int observed_fclose(FILE *stream) {
 #undef ftell
 #undef fseek
 #undef fopen
-#undef memcpy
 #undef free
 #undef malloc
 
@@ -171,7 +158,7 @@ static struct blorp_string *query(const char *path_bytes, size_t path_length,
     uint8_t expected_status, const char *expected, size_t expected_length) {
     struct blorp_string *path = blorp_string_from_bytes(path_bytes, (int64_t)path_length);
     borrowed_bytes = path->bytes;
-    const size_t previous_path_frees = path_frees, previous_staging_frees = staging_frees;
+    const size_t previous_staging_frees = staging_frees;
     const size_t previous_opens = open_count, previous_closes = close_count, previous_reads = read_count;
     struct blorp_string *payload = NULL;
     const uint8_t status = blorp_read_file(path, &payload);
@@ -181,11 +168,10 @@ static struct blorp_string *query(const char *path_bytes, size_t path_length,
     assert(payload->length == (int64_t)expected_length);
     assert(memcmp(payload->bytes, expected, expected_length) == 0 && payload->bytes[expected_length] == '\0');
     assert(blorp_utf8_is_valid(payload->bytes, expected_length));
-    assert(native_path == NULL && staging == NULL && active_stream == NULL);
+    assert(staging == NULL && active_stream == NULL);
     const int forbidden_path = memchr(path_bytes, '\0', path_length) != NULL;
     assert(open_count == previous_opens + (forbidden_path ? 0 : 1));
     assert(close_count == previous_closes + (forbidden_path || failure == OPEN_FAILURE ? 0 : 1));
-    assert(path_frees == previous_path_frees + (forbidden_path ? 0 : 1));
     assert(staging_frees == previous_staging_frees + read_count - previous_reads);
     assert(read_count - previous_reads <= 1);
     borrowed_bytes = NULL;
