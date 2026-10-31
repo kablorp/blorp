@@ -241,9 +241,45 @@ private supertrait, and canonical Equatable declares none. The pinned seed
 predates supertraits, so the library and compiler source declare none yet.
 An `Orderable` bound does not provide `==`.
 
+### Declaration bounds
+
+A record, union or opaque type may bound its type parameters as a function
+does. The bound is part of the type: every application of the type must meet
+it, under the bounds in scope where the application is written.
+
+```blorp
+private record MapContents[K: Hashable + Equatable, V] { keys: List[K], values: List[V] }
+opaque type HashMap[K: Hashable + Equatable, V] = MapContents[K, V]
+
+pure func values[K: Hashable + Equatable, V](map: HashMap[K, V]) -> List[V]:
+    from_opaque HashMap(map).values
+```
+
+Nothing is implied. A function, implementation receiver or declaration that
+names `HashMap[K, V]` with its own parameter `K` restates `K: Hashable +
+Equatable` (or bounds that entail it), and the opaque type restates the bound of
+the record it wraps. Dropping the bound from `values` is rejected at the `K`
+in `HashMap[K, V]`:
+
+```text
+error: HashMap[K, V] requires K: Hashable
+help: add Hashable to K's bounds
+```
+
+A concrete argument needs an implementation: `HashMap[(Int) -> Int, V]`
+reports `implement Hashable for (Int) -> Int, or use a type that implements
+it`. Check proves the bounds once implementations and automatic equality are
+accepted: declarations under their own bounds, trait methods under `Self`,
+signatures, implementation receivers and constants, then body annotations under
+the enclosing function's bounds. `into_opaque` takes its arguments from its
+operand, so it proves the opaque type's bounds at its expression; record
+literals and constructors take an expected type that is already proved. A
+bounded record or union's automatic equality keeps the declared bounds before
+the Equatable conditions its members add. A fixed record or union still takes
+no type parameters.
+
 Traits remain parameterless, with no independently generic methods, impure
-requirements or top-level callable formals. Record/union
-declaration bounds remain deferred. Traits are separate from value types, and
+requirements or top-level callable formals. Traits are separate from value types, and
 `Self[Int]` cannot apply scoped `Self`; qualified module type names retain their
 normal meaning. Check validates contracts and bound obligations once, then
 Specialize selects ordinary bodies through the existing instance graph. No

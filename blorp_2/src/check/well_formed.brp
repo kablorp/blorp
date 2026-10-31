@@ -1,0 +1,304 @@
+---
+Proves that every applied record, union and opaque type meets the bounds its
+declaration writes on its type parameters, under the bounds of the scope that
+names it. A written type is walked beside its resolution, so a failure points
+at the written argument. Only `into_opaque` builds a value whose type
+arguments are not already proved, so it is proved at its expression; record
+literals and constructors take an expected type. Nothing is implied: a
+function or implementation that names `Box[T]` for a bounded `Box` declares
+the bound on its own `T`.
+---
+import:
+	./declarations: CheckedDeclarations
+	./errors:
+		CheckError,
+		CheckErrorKind(TraitRejection),
+		CheckerInvariant(InvalidFunctionContract),
+		TraitError(MissingTraitBound, DeclaredBoundUnsatisfied, ReceiverBoundUndeclared),
+		checker_invariant,
+		trait_error,
+	./model:
+		AggregateId(RecordAggregate, UnionAggregate),
+		CheckedOpaque,
+		CheckedRecord,
+		CheckedUnion,
+		CheckedVariant,
+		FunctionSignature,
+		ImplementationHeader,
+		LocatedTrait,
+		NominalId(AggregateNominal, OpaqueNominal),
+		TraitRequirement,
+		TypeParameterOwner(TraitDeclaration),
+		TypeRef(CallableType, ListType, NominalType, TupleType),
+		TypeUse,
+		parameter_position,
+		type_parameter_id,
+	./signatures: AcceptedFunction
+	./traits: TraitAvailability, accepted_traits, declared_requirements, entails, prove_trait
+	../namespace/namespace: TypeHead(RecordHead, UnionHead, OpaqueHead)
+	../parse/assemble: ParsedContents
+	../utils/ids:
+		ImplRow,
+		TraitRow,
+		inventory_constants,
+		inventory_implementations,
+		inventory_opaques,
+		inventory_records,
+		inventory_traits,
+		inventory_unions,
+		opaque_number,
+		record_number,
+		trait_method_header,
+		trait_number,
+		union_number,
+		variant_number,
+	../utils/results: first_error
+	../utils/syntax: ParsedParameter, Span, compiler_span, TypeSyntax(AtomicType, AppliedType, QualifiedType, TupleTypeSyntax, CallableTypeSyntax), type_span
+	bool: not
+	int: Int methods
+	list: List methods
+	option: Option methods
+	result: Result methods
+
+
+private pure func invalid(span: Span) -> CheckError:
+	checker_invariant(span, InvalidFunctionContract)
+
+
+-- One declared bound on the argument it constrains, proved at `span`. A
+-- missing implementation anywhere in the proof is reported against the
+-- applied type, so `Table[Box[F], V]` names `Box[F]` even when Box's own
+-- implementation is what needs F; any other rejection, such as unavailable
+-- automatic equality, keeps its own cause.
+private pure func prove_bound(
+	traits: TraitAvailability,
+	applied: TypeRef,
+	arguments: List[TypeRef],
+	required: TraitRequirement,
+	assumptions: List[TraitRequirement],
+	span: Span,
+) -> Result[Void, CheckError]:
+	argument ?= arguments.get(parameter_position(required.parameter)).to_result(invalid(span))
+	match prove_trait(traits, required.required_trait, argument, assumptions, span):
+		Ok(_): Ok(void)
+		Err(error):
+			match error.kind:
+				TraitRejection(MissingTraitBound(_, _)): Err(trait_error(span, DeclaredBoundUnsatisfied(applied, argument, required.required_trait)))
+				_: Err(error)
+
+
+-- `written` holds the applied type's written arguments, or is empty when the
+-- type was inferred and every argument is located at `span`.
+private pure func prove_applied_bounds(
+	traits: TraitAvailability,
+	applied: TypeRef,
+	written: List[TypeSyntax],
+	assumptions: List[TraitRequirement],
+	span: Span,
+) -> Result[Void, CheckError]:
+	match applied:
+		NominalType(owner, arguments):
+			match declared_requirements(traits, owner):
+				None: Err(invalid(span))
+				Some(requirements):
+					first_error(requirements, pure func(required): prove_bound(traits, applied, arguments, required, assumptions, argument_span(written, required, span)))
+		_: Ok(void)
+
+
+private pure func argument_span(written: List[TypeSyntax], required: TraitRequirement, span: Span) -> Span:
+	match written.get(parameter_position(required.parameter)):
+		Some(argument): type_span(argument)
+		None: span
+
+
+-- An `into_opaque` value takes its type arguments from its operand, so it
+-- proves its type's declared bounds at its expression.
+pure func prove_declared_bounds(traits: TraitAvailability, applied: TypeRef, assumptions: List[TraitRequirement], span: Span) -> Result[Void, CheckError]:
+	prove_applied_bounds(traits, applied, [], assumptions, span)
+
+
+-- Walks `written` beside `resolved`, its resolution, proving the declared
+-- bounds of each applied type at its written argument. Arguments are proved
+-- before the type they apply, so the innermost failure is reported. An atomic
+-- name applies nothing; a bound `Self` is proved where its receiver is written.
+pure func prove_well_formed(traits: TraitAvailability, written: TypeSyntax, resolved: TypeRef, assumptions: List[TraitRequirement]) -> Result[Void, CheckError]:
+	match written:
+		AtomicType(_): Ok(void)
+		AppliedType(_, arguments, span): prove_applied(traits, arguments, resolved, assumptions, span)
+		QualifiedType(_, arguments, span): prove_applied(traits, arguments, resolved, assumptions, span)
+		TupleTypeSyntax(elements, span):
+			match resolved:
+				TupleType(values): prove_each(traits, elements, values, assumptions, span)
+				_: Err(invalid(span))
+		CallableTypeSyntax(_, parameters, result, span):
+			match resolved:
+				CallableType(_, values, returned):
+					match prove_each(traits, parameters, values, assumptions, span):
+						Ok(_): prove_well_formed(traits, result, returned, assumptions)
+						Err(error): Err(error)
+				_: Err(invalid(span))
+
+
+private pure func prove_applied(traits: TraitAvailability, written: List[TypeSyntax], resolved: TypeRef, assumptions: List[TraitRequirement], span: Span) -> Result[Void, CheckError]:
+	match resolved:
+		ListType(element):
+			match written:
+				[argument]: prove_well_formed(traits, argument, element, assumptions)
+				_: Err(invalid(span))
+		NominalType(_, arguments):
+			match prove_each(traits, written, arguments, assumptions, span):
+				Ok(_): prove_applied_bounds(traits, resolved, written, assumptions, span)
+				Err(error): Err(error)
+		_: Ok(void)
+
+
+-- Written types beside the types they resolved to, in order.
+private pure func prove_each(traits: TraitAvailability, written: List[TypeSyntax], resolved: List[TypeRef], assumptions: List[TraitRequirement], span: Span) -> Result[Void, CheckError]:
+	if written.length() != resolved.length():
+		Err(invalid(span))
+	else:
+		var position = 0
+		var failure: Option[CheckError] = None
+		for annotation in written:
+			match resolved.get(position):
+				Some(value):
+					match prove_well_formed(traits, annotation, value, assumptions):
+						Ok(_): void
+						Err(error): failure = Some(error)
+				None: failure = Some(invalid(type_span(annotation)))
+			if failure.is_some():
+				break
+			position = position.add(1)
+		match failure:
+			Some(error): Err(error)
+			None: Ok(void)
+
+
+-- Uses are located only by their own written types, so a length mismatch
+-- between two declared lists has no better location than the compiler's.
+private pure func prove_uses(traits: TraitAvailability, written: List[TypeSyntax], uses: List[TypeUse], assumptions: List[TraitRequirement]) -> Result[Void, CheckError]:
+	prove_each(traits, written, uses.map(pure func(resolved): resolved.value_type), assumptions, compiler_span())
+
+
+-- A declaration's written fields, payloads and underlying type are proved
+-- under its own bounds; its bounds are never inferred from them.
+private pure func prove_record(parsed: ParsedContents, traits: TraitAvailability, checked: CheckedRecord) -> Result[Void, CheckError]:
+	row ?= inventory_records(parsed.declarations).get(record_number(checked.id)).to_result(invalid(compiler_span()))
+	prove_uses(traits, row.declaration.fields.map(pure func(field): field.type_name), checked.fields.map(pure func(field): field.value_type), checked.requirements)
+
+
+private pure func prove_union(parsed: ParsedContents, traits: TraitAvailability, checked: CheckedUnion) -> Result[Void, CheckError]:
+	row ?= inventory_unions(parsed.declarations).get(union_number(checked.id)).to_result(invalid(compiler_span()))
+	first_error(checked.variants, pure func(variant): prove_variant(row.variants.get(variant_number(variant.id)).map(pure func(written): written.declaration.fields), traits, variant, checked.requirements))
+
+
+private pure func prove_variant(written: Option[List[TypeSyntax]], traits: TraitAvailability, variant: CheckedVariant, assumptions: List[TraitRequirement]) -> Result[Void, CheckError]:
+	match written:
+		Some(fields): prove_uses(traits, fields, variant.fields, assumptions)
+		None: Err(invalid(variant.name.span))
+
+
+private pure func prove_opaque(parsed: ParsedContents, traits: TraitAvailability, checked: CheckedOpaque) -> Result[Void, CheckError]:
+	row ?= inventory_opaques(parsed.declarations).get(opaque_number(checked.id)).to_result(invalid(checked.underlying_type.span))
+	prove_well_formed(traits, row.declaration.underlying, checked.underlying_type.value_type, checked.requirements)
+
+
+private pure func prove_signature(
+	traits: TraitAvailability,
+	parameters: List[ParsedParameter],
+	return_type: Option[TypeSyntax],
+	signature: FunctionSignature,
+	assumptions: List[TraitRequirement],
+) -> Result[Void, CheckError]:
+	_: Void ?= prove_uses(traits, parameters.map(pure func(parameter): parameter.type_name), signature.parameters, assumptions)
+	match return_type:
+		Some(written): prove_well_formed(traits, written, signature.return_type.value_type, assumptions)
+		None: Ok(void)
+
+
+-- A trait method's types are proved with only `Self: Trait`.
+private pure func prove_trait_methods(parsed: ParsedContents, traits: TraitAvailability, row: TraitRow) -> Result[Void, CheckError]:
+	self: TraitRequirement = { parameter = type_parameter_id(TraitDeclaration(row.id), 0), required_trait = row.id, span = row.type_name.span }
+	contract ?= accepted_traits(traits).declarations.get(trait_number(row.id)).to_result(invalid(row.span))
+	var position = 0
+	var failure: Option[CheckError] = None
+	for method in row.methods:
+		match (trait_method_header(method, parsed.declarations), contract.methods.get(position)):
+			(Some(header), Some(accepted)):
+				match prove_signature(traits, header.parameters, header.return_type, accepted.signature, [self]):
+					Ok(_): void
+					Err(error): failure = Some(error)
+			_: failure = Some(invalid(method.span))
+		if failure.is_some():
+			break
+		position = position.add(1)
+	match failure:
+		Some(error): Err(error)
+		None: Ok(void)
+
+
+-- A receiver family `Box[E]` bounds `E` by everything Box's declaration
+-- bounds it by, or by a trait that entails it.
+private pure func prove_receiver(traits: TraitAvailability, row: ImplRow, header: Option[ImplementationHeader]) -> Result[Void, CheckError]:
+	accepted ?= header.to_result(invalid(row.header.span))
+	owner: Option[NominalId] = match accepted.receiver_head:
+		RecordHead(id): Some(AggregateNominal(RecordAggregate(id)))
+		UnionHead(id): Some(AggregateNominal(UnionAggregate(id)))
+		OpaqueHead(id): Some(OpaqueNominal(id))
+		_: None
+	none_required: List[TraitRequirement] = []
+	required = match owner:
+		Some(nominal): declared_requirements(traits, nominal).get_or(none_required)
+		None: none_required
+	first_error(required, pure func(bound): prove_receiver_bound(traits, row, accepted, bound))
+
+
+-- Headers are in implementation inventory order.
+private pure func prove_receivers(parsed: ParsedContents, traits: TraitAvailability, headers: List[ImplementationHeader]) -> Result[Void, CheckError]:
+	var position = 0
+	var failure: Option[CheckError] = None
+	for row in inventory_implementations(parsed.declarations):
+		match prove_receiver(traits, row, headers.get(position)):
+			Ok(_): void
+			Err(error):
+				failure = Some(error)
+				break
+		position = position.add(1)
+	match failure:
+		Some(error): Err(error)
+		None: Ok(void)
+
+
+private pure func prove_receiver_bound(traits: TraitAvailability, row: ImplRow, header: ImplementationHeader, bound: TraitRequirement) -> Result[Void, CheckError]:
+	contracts = accepted_traits(traits).declarations
+	position = parameter_position(bound.parameter)
+	none_declared: List[LocatedTrait] = []
+	declared = header.parameter_bounds.get(position).get_or(none_declared)
+	if declared.any(pure func(written): entails(contracts, written.required_trait, bound.required_trait)):
+		Ok(void)
+	else:
+		span = match row.header.type_parameters.get(position):
+			Some(parameter): parameter.name.span
+			None: row.header.span
+		Err(trait_error(span, ReceiverBoundUndeclared(bound.required_trait, position, row.header)))
+
+
+-- Proves every type written outside a function body, once implementations
+-- and automatic equality are known: declarations under their own bounds,
+-- trait methods under `Self`, receiver headers against their declarations,
+-- signatures under their functions' bounds, and constants under none.
+pure func validate_written_bounds(
+	parsed: ParsedContents,
+	traits: TraitAvailability,
+	declarations: CheckedDeclarations,
+	functions: List[AcceptedFunction],
+	headers: List[ImplementationHeader],
+	constants: List[TypeUse],
+) -> Result[Void, CheckError]:
+	_: Void ?= first_error(declarations.records, pure func(checked): prove_record(parsed, traits, checked))
+	_: Void ?= first_error(declarations.unions, pure func(checked): prove_union(parsed, traits, checked))
+	_: Void ?= first_error(declarations.opaques, pure func(checked): prove_opaque(parsed, traits, checked))
+	_: Void ?= first_error(inventory_traits(parsed.declarations), pure func(row): prove_trait_methods(parsed, traits, row))
+	_: Void ?= prove_receivers(parsed, traits, headers)
+	_: Void ?= first_error(functions, pure func(function): prove_signature(traits, function.declaration.parameters, function.declaration.return_type, function.signature, function.signature.requirements))
+	prove_uses(traits, inventory_constants(parsed.declarations).map(pure func(row): row.declaration.type_name), constants, [])

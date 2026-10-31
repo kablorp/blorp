@@ -9,12 +9,14 @@ import:
 	result: Result methods
 	bool: not, and
 	./traits: TraitAvailability, accepted_traits, prove_requirements
+	./well_formed: prove_declared_bounds
 	./scope: CallableBinding, callable_local, callable_parameter_contract, ScopedValue(DataLocal, CallableLocal), LocalBinding, binding_site, binding_definition, local_binding_id, lookup_binding, bind_local
 	./signatures: AcceptedFunction
 	./callables:
 		FunctionContract, accept_method_call, method_contract, method_id_contract, callable_contract,
 		function_contract, value_callable_contract,
 		ResolutionContext,
+		resolve_body_type,
 		ResolvedReceiver(ReceiverCandidates, UniqueReceiver),
 		ReceiverCandidate,
 		classify_receiver,
@@ -122,7 +124,7 @@ import:
 		validate_record_fields,
 		validate_variant_fields
 	../utils/ids: TraitMethodId, trait_number, trait_method_owner, trait_method_number, FunctionId, VariantId, OpaqueRow, opaque_number, function_number, record_number, variant_owner
-	./declarations: aliased_module, resolve_type
+	./declarations: aliased_module
 	../namespace/namespace: NamedValue(NamedMethod, NamedFunction, NamedConstant, NamedConstructor, NamedAlias), OfferedValue(OfferedMethod, OfferedFunction, OfferedConstant, OfferedConstructor), TypeHead(OpaqueHead), named_type, named_value, offered_value
 	int: Int methods
 	option: Option methods
@@ -2037,6 +2039,12 @@ private pure func freeze_pending_value(value: PendingValue, slots: List[Inferenc
 			freeze_pending_call(call, arguments, None, slots, captures, constructions, assumptions, traits).map(pure func(resolved): InvokeFunction(resolved))
 	base ?= base_result
 	base_type ?= publish_inference_type(value.base_type, slots, CompleteInference, value.base_span)
+	-- `into_opaque` takes its arguments from its operand, not from a written
+	-- type, so it proves the opaque declaration's bounds here. A record literal
+	-- or constructor takes its type from an expected type that is already proved.
+	_: Void ?= match base:
+		ConstructOpaque(_, _): prove_declared_bounds(traits, base_type, assumptions, value.base_span)
+		_: Ok(void)
 	var current: CheckedExpr = { form = base, value_type = base_type, span = value.base_span }
 	var failure: Option[CheckError] = None
 
@@ -2400,7 +2408,7 @@ private pure func admit_contextual_lambda(
 		match parameter.annotation:
 			None: void
 			Some(annotation):
-				match resolve_type(context.body_types, annotation):
+				match resolve_body_type(context, annotation):
 					Err(error): failure = Some(error)
 					Ok(value_type):
 						match shape.parameters.get(position):
@@ -2418,7 +2426,7 @@ private pure func admit_contextual_lambda(
 		None: Ok(void)
 	result_annotation: Option[TypeRef] ?= match written.return_type:
 		None: Ok(None)
-		Some(annotation): resolve_type(context.body_types, annotation).map(pure func(value): Some(value))
+		Some(annotation): resolve_body_type(context, annotation).map(pure func(value): Some(value))
 	match result_annotation:
 		None: void
 		Some(value_type):
@@ -2439,7 +2447,7 @@ private pure func admit_standalone_lambda(
 		match parameter.annotation:
 			None: failure = Some(call_error(written.span, LambdaInputNeedsType))
 			Some(annotation):
-				match resolve_type(context.body_types, annotation):
+				match resolve_body_type(context, annotation):
 					Err(error): failure = Some(error)
 					Ok(value): parameters = parameters.append(AcceptedType(value))
 		if failure.is_some():
@@ -2448,7 +2456,7 @@ private pure func admit_standalone_lambda(
 		Some(error): Err(error)
 		None: Ok(void)
 	result: TypeRef ?= match written.return_type:
-		Some(annotation): resolve_type(context.body_types, annotation)
+		Some(annotation): resolve_body_type(context, annotation)
 		None:
 			missing: Result[TypeRef, CheckError] = match written.body:
 				InlineBody(_): Err(call_error(written.span, LambdaResultNeedsType))

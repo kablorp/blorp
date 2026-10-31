@@ -7,17 +7,17 @@ unions, which the operation carries by constructor identity.
 ---
 import:
 	bool: or, and
-	./declarations: TypeScope, LocalTypeParameter, Substitution, substitute_type, TypeAccess(PrivateTypeUse), type_access, declared_parameters, local_type_parameters, resolve_type, resolve_receiver_head, receiver_arity
+	./declarations: TypeScope, LocalTypeParameter, Substitution, substitute_type, TypeAccess(PrivateTypeUse), type_access, declared_parameters, local_type_parameters, parameter_requirements, resolve_bounds, resolve_type, resolve_receiver_head, receiver_arity
 	./errors:
 		CheckError,
 		CheckerInvariant(InvalidFunctionContract, InvalidResolvedFunction, RuntimeContractMismatch),
 		SignatureError(GenericMain, MainHasParameters, MainParameterType, MainReturnType, MissingMain),
-		checker_invariant, type_declaration_error, TypeDeclarationError(TypeParameterTypeNameConflict), trait_error, TraitError(InvalidTraitBound, DuplicateReceiverParameter, ReceiverParameterCount, GenericOpaqueImplementation, IndependentImplementationParameters),
+		checker_invariant, type_declaration_error, TypeDeclarationError(TypeParameterTypeNameConflict), trait_error, TraitError(DuplicateReceiverParameter, ReceiverParameterCount, GenericOpaqueImplementation, IndependentImplementationParameters),
 		signature_error,
 		BuiltinError(BuiltinContractMismatch, BuiltinTailAnnotation),
 		builtin_error
 	./model:
-		AcceptedTrait, AcceptedTraitMethod, FunctionSignature, ImplementationHeader, TraitRequirement, LocatedTrait, TypeParameterId, receiver_type,
+		AcceptedTrait, AcceptedTraitMethod, FunctionSignature, ImplementationHeader, TraitRequirement, TypeParameterId, receiver_type,
 		TypeParameterOwner(FunctionDeclaration, TraitDeclaration),
 		TypeRef(ParameterType, CallableType, IntType, ListType, StringType, VoidType, NominalType),
 		AggregateId(UnionAggregate),
@@ -32,7 +32,7 @@ import:
 		RuntimeResult(ValueResult, OptionalResult, ResultResult, BooleanResult),
 		primitive_operation,
 		runtime_contract
-	../namespace/namespace: Namespace, resolve_trait, named_type, FunctionSource(DeclaredHere), NamedValue(NamedFunction), TypeHead(OpaqueHead), named_value
+	../namespace/namespace: Namespace, named_type, FunctionSource(DeclaredHere), NamedValue(NamedFunction), TypeHead(OpaqueHead), named_value
 	../parse/assemble: ParsedContents
 	../utils/ids:
 		FunctionId, FunctionRow, ImplRow, FunctionRole(ImplementationBody, FreeFunctionBody, TraitDefaultBody), inventory_implementations, impl_number,
@@ -436,37 +436,6 @@ pure func validate_builtin_body(
 		Err(builtin_error(site.span, BuiltinContractMismatch(parsed)))
 
 
--- Bounds are resolved once at their written declaration. Body normalization
--- only attaches these accepted traits to the body's genuine parameter domain.
-private pure func resolve_bounds(parameters: List[ParsedTypeParameter], scope: TypeScope) -> Result[List[List[LocatedTrait]], CheckError]:
-	var resolved: List[List[LocatedTrait]] = []
-	var failure: Option[CheckError] = None
-	for parameter in parameters:
-		var bounds: List[LocatedTrait] = []
-		for written in parameter.bounds:
-			match resolve_trait(scope.namespace, scope.module, written):
-				Some(id): bounds = bounds.append({ required_trait = id, span = type_span(written) })
-				None:
-					failure = Some(trait_error(type_span(written), InvalidTraitBound))
-					break
-		resolved = resolved.append(bounds)
-		if failure.is_some():
-			break
-	match failure:
-		Some(error): Err(error)
-		None: Ok(resolved)
-
-
-private pure func body_requirements(bounds: List[List[LocatedTrait]], function: FunctionId) -> List[TraitRequirement]:
-	var requirements: List[TraitRequirement] = []
-	var position = 0
-	for parameter in bounds:
-		for bound in parameter:
-			requirements = requirements.append({ parameter = type_parameter_id(FunctionDeclaration(function), position), required_trait = bound.required_trait, span = bound.span })
-		position = position.add(1)
-	requirements
-
-
 -- Families have no parameter identity domain. Validate their source names here;
 -- each actual body receives its own identities only during normalization.
 private pure func receiver_parameters(parameters: List[ParsedTypeParameter], scope: TypeScope, self_name: NameId) -> Result[Void, CheckError]:
@@ -540,7 +509,7 @@ private pure func resolve_implementation_function(row: FunctionRow, label: Funct
 	receiver ?= receiver_type(header.receiver_head, identities.map(pure func(id): ParameterType(id)))
 		.to_result(checker_invariant(implementation.header.span, InvalidFunctionContract))
 	normalized = { body_scope | self_binding = Some({ name = contextual_words(parsed.names).self_word, value_type = receiver }) }
-	resolve_signature(row.declaration, row.id, label, is_entry, normalized, identities, body_requirements(header.parameter_bounds, row.id), designated)
+	resolve_signature(row.declaration, row.id, label, is_entry, normalized, identities, parameter_requirements(header.parameter_bounds, FunctionDeclaration(row.id)), designated)
 
 
 -- The default's written contract is accepted once in its trait domain.
@@ -620,6 +589,6 @@ private pure func resolve_free_function(row: FunctionRow, label: FunctionLabel, 
 		None:
 			Ok(void)
 
-	parameters ?= local_type_parameters(row.declaration.type_parameters.map(pure func(parameter): parameter.name), FunctionDeclaration(row.id), scope)
+	parameters ?= local_type_parameters(row.declaration.type_parameters, FunctionDeclaration(row.id), scope)
 	bounds ?= resolve_bounds(row.declaration.type_parameters, parameters)
-	resolve_signature(row.declaration, row.id, label, is_entry, parameters, declared_parameters(parameters), body_requirements(bounds, row.id), designated)
+	resolve_signature(row.declaration, row.id, label, is_entry, parameters, declared_parameters(parameters), parameter_requirements(bounds, FunctionDeclaration(row.id)), designated)

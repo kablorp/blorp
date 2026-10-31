@@ -14,6 +14,7 @@ import:
 			DuplicateRecordField, DuplicateTypeParameter, TypeParameterTypeNameConflict, RecursiveAggregateType, RecursiveOpaqueRepresentation,
 			NonFixedPayload, NonFixedField, RecursiveFixedType,
 		),
+		TraitError(InvalidTraitBound),
 		TypeTermError(
 			PrivateTypeInPublicDeclaration, TraitUsedAsType,
 			ListTypeArgumentCount, NonApplicableType, MissingTypeArguments, TypeArgumentCountMismatch, OrdinaryTypeApplied, UnknownType,
@@ -22,6 +23,7 @@ import:
 		qualified_error,
 		checker_invariant,
 		or_checker_invariant,
+		trait_error,
 		type_declaration_error,
 		type_term_error,
 	./model:
@@ -30,6 +32,8 @@ import:
 		CheckedOpaque,
 		CheckedUnion,
 		CheckedVariant,
+		LocatedTrait,
+		TraitRequirement,
 		TypeParameterId,
 		TypeParameterOwner(UnionDeclaration, RecordDeclaration, OpaqueDeclaration),
 		TypeRef(TupleType, CallableType, NominalType, VoidType, FloatType, IntType, ListType, ParameterType, StringType),
@@ -64,7 +68,7 @@ import:
 	../utils/names: NameId
 	../namespace/namespace:
 		AliasedModule, Unoffered, Namespace, NamedValue(NamedAlias), TypeHead(PrimitiveHead, ListHead, UnionHead, RecordHead, OpaqueHead),
-		Origin(Declared), named_trait, named_type, named_value, offered_type, offered_trait,
+		Origin(Declared), named_trait, named_type, named_value, offered_type, offered_trait, resolve_trait,
 	option: Option methods
 	../parse/assemble: ParsedContents
 	../utils/results: first_error
@@ -74,6 +78,7 @@ import:
 		ParsedReceiverHead(ReceiverName, QualifiedReceiverName),
 		ParsedQualified,
 		ParsedRecord,
+		ParsedTypeParameter,
 		Span,
 		compiler_span,
 		TypeSyntax(TupleTypeSyntax, AtomicType, AppliedType, QualifiedType, CallableTypeSyntax),
@@ -146,7 +151,7 @@ private pure func lookup_type_parameter(
 
 -- Declares a declaration's own type parameters in the scope of its module.
 pure func local_type_parameters(
-	written: List[WrittenName],
+	written: List[ParsedTypeParameter],
 	owner: TypeParameterOwner,
 	module_scope: TypeScope,
 ) -> Result[TypeScope, CheckError]:
@@ -156,14 +161,15 @@ pure func local_type_parameters(
 -- Declares the type parameters in order; each name is new and is not already
 -- a visible type.
 private pure func declare_type_parameters(
-	written: List[WrittenName],
+	written: List[ParsedTypeParameter],
 	owner: TypeParameterOwner,
 	scope: TypeScope,
 ) -> Result[TypeScope, CheckError]:
 	match written.get(scope.parameters.length()):
 		None:
 			Ok(scope)
-		Some(name):
+		Some(parameter):
+			name = parameter.name
 			id = type_parameter_id(owner, scope.parameters.length())
 
 			match lookup_type_parameter(scope.parameters, name.id):
@@ -191,6 +197,40 @@ private pure func declare_type_parameters(
 
 pure func declared_parameters(scope: TypeScope) -> List[TypeParameterId]:
 	scope.parameters.map(pure func(parameter: LocalTypeParameter): parameter.id)
+
+
+-- Bounds are resolved once at their written declaration, one list per
+-- parameter in order.
+pure func resolve_bounds(parameters: List[ParsedTypeParameter], scope: TypeScope) -> Result[List[List[LocatedTrait]], CheckError]:
+	var resolved: List[List[LocatedTrait]] = []
+	var failure: Option[CheckError] = None
+	for parameter in parameters:
+		var bounds: List[LocatedTrait] = []
+		for written in parameter.bounds:
+			match resolve_trait(scope.namespace, scope.module, written):
+				Some(id): bounds = bounds.append({ required_trait = id, span = type_span(written) })
+				None:
+					failure = Some(trait_error(type_span(written), InvalidTraitBound))
+					break
+		resolved = resolved.append(bounds)
+		if failure.is_some():
+			break
+	match failure:
+		Some(error): Err(error)
+		None: Ok(resolved)
+
+
+-- Attaches each parameter's resolved bounds to that parameter's identity in
+-- `owner`'s domain, in declaration order.
+pure func parameter_requirements(bounds: List[List[LocatedTrait]], owner: TypeParameterOwner) -> List[TraitRequirement]:
+	var requirements: List[TraitRequirement] = []
+	var position = 0
+	for parameter in bounds:
+		id = type_parameter_id(owner, position)
+		for bound in parameter:
+			requirements = requirements.append({ parameter = id, required_trait = bound.required_trait, span = bound.span })
+		position = position.add(1)
+	requirements
 
 
 -- The number of type parameters a record, union or opaque type declares.
@@ -477,54 +517,11 @@ private pure func declare_types(
 
 			declared: Result[CheckedDeclarations, CheckError] = match declaration:
 				UnionDeclarationRow(parsed_union):
-					owner = parsed_union.id
-					match local_type_parameters(
-						parsed_union.type_parameters,
-						UnionDeclaration(owner),
-						scope,
-					):
-						Ok(parameters):
-							match declared_variants(parsed_union, parameters, []):
-								Ok(variants):
-									Ok({ checked | unions = checked.unions.append({
-												id = owner,
-												type_parameters = declared_parameters(parameters),
-												variants = variants,
-												fixed = parsed_union.fixed,
-											}) })
-								Err(error): Err(error)
-						Err(error): Err(error)
+					checked_union(parsed_union, scope).map(pure func(accepted): { checked | unions = checked.unions.append(accepted) })
 				RecordDeclarationRow(parsed_record):
-					owner = parsed_record.id
-					match local_type_parameters(parsed_record.declaration.type_parameters, RecordDeclaration(owner), scope):
-						Ok(parameters):
-							match declared_fields(parsed_record.declaration, owner, parameters, []):
-								Ok(fields):
-									Ok({ checked | records = checked.records.append({
-										id = owner,
-										type_parameters = declared_parameters(parameters),
-										fields = fields,
-										fixed = parsed_record.declaration.fixed,
-									}) })
-								Err(error): Err(error)
-						Err(error): Err(error)
-
+					checked_record(parsed_record, scope).map(pure func(accepted): { checked | records = checked.records.append(accepted) })
 				OpaqueDeclarationRow(parsed_opaque):
-					match local_type_parameters(parsed_opaque.declaration.type_parameters, OpaqueDeclaration(parsed_opaque.id), scope):
-						Ok(parameters):
-							match resolve_type(parameters, parsed_opaque.declaration.underlying):
-								Ok(underlying):
-									accepted: CheckedOpaque = {
-										id = parsed_opaque.id,
-										type_parameters = declared_parameters(parameters),
-										underlying_type = {
-											value_type = underlying,
-											span = type_span(parsed_opaque.declaration.underlying)
-										}
-									}
-									Ok({ checked | opaques = checked.opaques.append(accepted) })
-								Err(error): Err(error)
-						Err(error): Err(error)
+					checked_opaque(parsed_opaque, scope).map(pure func(accepted): { checked | opaques = checked.opaques.append(accepted) })
 
 			match declared:
 				Ok(updated):
@@ -536,6 +533,33 @@ private pure func declare_types(
 				Err(error): Err(error)
 
 
+
+
+private pure func checked_union(row: UnionRow, module_scope: TypeScope) -> Result[CheckedUnion, CheckError]:
+	owner: TypeParameterOwner = UnionDeclaration(row.id)
+	scope ?= local_type_parameters(row.type_parameters, owner, module_scope)
+	bounds ?= resolve_bounds(row.type_parameters, scope)
+	variants ?= declared_variants(row, scope, [])
+	Ok({ id = row.id, type_parameters = declared_parameters(scope), requirements = parameter_requirements(bounds, owner), variants = variants, fixed = row.fixed })
+
+
+private pure func checked_record(row: RecordRow, module_scope: TypeScope) -> Result[CheckedRecord, CheckError]:
+	owner: TypeParameterOwner = RecordDeclaration(row.id)
+	scope ?= local_type_parameters(row.declaration.type_parameters, owner, module_scope)
+	bounds ?= resolve_bounds(row.declaration.type_parameters, scope)
+	fields ?= declared_fields(row.declaration, row.id, scope, [])
+	Ok({ id = row.id, type_parameters = declared_parameters(scope), requirements = parameter_requirements(bounds, owner), fields = fields, fixed = row.declaration.fixed })
+
+
+private pure func checked_opaque(row: OpaqueRow, module_scope: TypeScope) -> Result[CheckedOpaque, CheckError]:
+	owner: TypeParameterOwner = OpaqueDeclaration(row.id)
+	scope ?= local_type_parameters(row.declaration.type_parameters, owner, module_scope)
+	bounds ?= resolve_bounds(row.declaration.type_parameters, scope)
+	underlying ?= resolve_type(scope, row.declaration.underlying)
+	Ok({
+		id = row.id, type_parameters = declared_parameters(scope), requirements = parameter_requirements(bounds, owner),
+		underlying_type = { value_type = underlying, span = type_span(row.declaration.underlying) }
+	})
 
 
 -- Resolves each variant's payload annotation, in declaration order.

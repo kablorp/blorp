@@ -19,6 +19,12 @@ below ranges/postfix calls and above prefix `not`; use parentheses for an
 intended nested comparison. Newlines after a symbol continue only inside
 brackets. See the pilot [equality](../blorp_2/README.md#equality-operators) and
 [ordering](../blorp_2/README.md#ordering-operators) operator rules.
+A pilot record, union or opaque type may bound its type parameters, as in
+`opaque type HashMap[K: Hashable + Equatable, V] = MapContents[K, V]`. The pilot
+checks every application against those bounds: a function or declaration that
+names `HashMap[K, V]` restates `K: Hashable + Equatable`, and a concrete key type
+needs both implementations. See the pilot
+[declaration bounds](../blorp_2/README.md#declaration-bounds).
 
 The separate [Blorp 2 pilot](../blorp_2/README.md) implements a restricted
 subset. Its current examples include immutable bindings and local `var`

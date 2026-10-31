@@ -61,9 +61,10 @@ current CallableParameterId owns a FunctionId, which an abstract method lacks.
 Passing equals as an ordinary function value is a different, supported T3 path;
 it does not require generalizing callable formal ownership.
 Bounds are supported on function type parameters and parameters introduced by
-an implementation receiver. Record/union declaration bounds are deferred with
-an exact unsupported-form diagnostic; conditional automatic equality does not
-require them or restrict ordinary construction of Wrap[T].
+an implementation receiver. Record, union and opaque declaration bounds
+followed in a later increment ([declaration bounds](README.md#declaration-bounds));
+conditional automatic equality does not require them or restrict ordinary
+construction of an unbounded Wrap[T].
 
 Reject trait parameters, impure trait requirements,
 independently generic methods, associated types/constants, trait objects,
@@ -258,7 +259,7 @@ fixed record CheckedTrait {
 -- TraitDeclaration joins TypeParameterOwner for abstract Self.
 -- Authored/default body binders normalize to their genuine FunctionDeclaration.
 -- Implementation headers introduce no separate parameter-owner domain.
--- Record/union declaration bounds are outside this increment.
+-- Record/union declaration bounds were outside this increment (added later).
 ```
 
 Keep check_builtin_types before Namespace for primitive/Bool/Option/Result

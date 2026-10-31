@@ -4,9 +4,9 @@ any body can use them. Inventory owns member identities; this phase publishes
 the resolved requirement-to-body mapping consumed by checking and specialization.
 ---
 import:
-	./declarations: TypeScope, type_access, previous_declaration, resolve_type, Substitution, substitute_type
+	./declarations: CheckedDeclarations, TypeScope, type_access, previous_declaration, resolve_type, Substitution, substitute_type
 	./errors: CheckError, checker_invariant, type_term_error, TypeTermError(PrivateTypeInPublicDeclaration), CheckerInvariant(InvalidFunctionContract), TraitError(SupertraitUnknown, SupertraitCycle, SupertraitMethodInImplementation, CanonicalEquatableSupertraits, EqualityMemberUnsupported, DuplicateRequirementParameter, ImpureRequirement, GenericRequirement, FirstParameterMustBeSelf, CallableFormalDeferred, OrphanImplementation, DuplicateImplementation, MissingImplementationMethod, MissingTraitBound, UnknownImplementationMethod, DuplicateImplementationMethod, ImplementationSignatureMismatch, MalformedCanonicalTrait, MalformedCanonicalMember), CanonicalFamily(EqualityFamily, OrderingFamily), trait_error
-	./model: AggregateId(RecordAggregate, UnionAggregate), NominalId(AggregateNominal), EqualityMember(EqualityField, EqualityPayload), CheckedRecord, CheckedUnion, AcceptedTraits, AcceptedTraitContracts, ImplementationTable, family_for, implementation_rows, implementation_table, CanonicalEquality, canonical_equality, canonical_owner, CanonicalOrdering, canonical_ordering, AcceptedTrait, AcceptedTraitMethod, AcceptedImplementation, ImplementedMethod, ImplementedBody(AuthoredMethod, TraitDefault, StructuralEquality), TypeParameterId, LocatedTrait, TraitRequirement, aggregate_head, aggregate_owner, receiver_arguments, receiver_type, type_head, parameter_owner, ImplementationHeader, FunctionSignature, TypeUse, TypeRef(ParameterType, VoidType, NominalType), TypeParameterOwner(TraitDeclaration), type_parameter_id
+	./model: AggregateId(RecordAggregate, UnionAggregate), NominalId(AggregateNominal, OpaqueNominal), EqualityMember(EqualityField, EqualityPayload), CheckedRecord, CheckedUnion, AcceptedTraits, AcceptedTraitContracts, ImplementationTable, family_for, implementation_rows, implementation_table, CanonicalEquality, canonical_equality, canonical_owner, CanonicalOrdering, canonical_ordering, AcceptedTrait, AcceptedTraitMethod, AcceptedImplementation, ImplementedMethod, ImplementedBody(AuthoredMethod, TraitDefault, StructuralEquality), TypeParameterId, LocatedTrait, TraitRequirement, aggregate_head, aggregate_owner, receiver_arguments, receiver_type, type_head, parameter_owner, ImplementationHeader, FunctionSignature, TypeUse, TypeRef(ParameterType, VoidType, NominalType), TypeParameterOwner(TraitDeclaration), type_parameter_id
 	./equality: equality_template
 	./signatures: AcceptedFunction
 	../namespace/builtins: DesignatedBoolean
@@ -596,9 +596,14 @@ private record EqualityUnavailable {
 }
 
 
+-- `declarations` carries the written bounds that every application of a
+-- record, union or opaque type proves. It is borrowed, not copied, and lives
+-- here because proving those bounds is trait proof: body freezing, which
+-- proves an `into_opaque` value's bounds, receives only this availability.
 private record AvailabilityContents {
 	accepted: AcceptedTraits,
-	unavailable: List[EqualityUnavailable]
+	unavailable: List[EqualityUnavailable],
+	declarations: CheckedDeclarations
 }
 
 opaque type TraitAvailability = AvailabilityContents
@@ -608,9 +613,19 @@ pure func accepted_traits(availability: TraitAvailability) -> AcceptedTraits:
 	from_opaque TraitAvailability(availability).accepted
 
 
--- Signature-only test observers may deliberately have no derivation candidates.
+-- Signature-only test observers may deliberately have no derivation candidates
+-- and no declarations.
 pure func authored_traits(traits: AcceptedTraits) -> TraitAvailability:
-	into_opaque TraitAvailability({ accepted = traits, unavailable = [] })
+	into_opaque TraitAvailability({ accepted = traits, unavailable = [], declarations = { unions = [], records = [], opaques = [] } })
+
+
+-- The written bounds of the declaration a nominal type names.
+pure func declared_requirements(availability: TraitAvailability, owner: NominalId) -> Option[List[TraitRequirement]]:
+	declarations = from_opaque TraitAvailability(availability).declarations
+	match owner:
+		AggregateNominal(RecordAggregate(id)): declarations.records.get(record_number(id)).map(pure func(row): row.requirements)
+		AggregateNominal(UnionAggregate(id)): declarations.unions.get(union_number(id)).map(pure func(row): row.requirements)
+		OpaqueNominal(id): declarations.opaques.get(opaque_number(id)).map(pure func(row): row.requirements)
 
 
 -- The member whose requirement made a head's automatic equality unavailable.
@@ -777,20 +792,24 @@ private pure func summarize_members(
 		None: Ok(summary)
 
 
-pure func prepare_equality_availability(parsed: ParsedContents, traits: AcceptedTraits, records: List[CheckedRecord], unions: List[CheckedUnion], boolean: DesignatedBoolean[VariantId]) -> Result[TraitAvailability, CheckError]:
+pure func prepare_equality_availability(parsed: ParsedContents, traits: AcceptedTraits, declarations: CheckedDeclarations, boolean: DesignatedBoolean[VariantId]) -> Result[TraitAvailability, CheckError]:
 	match traits.canonical.equality:
-		None: Ok(authored_traits(traits))
-		Some(canonical): complete_equality_availability(parsed, traits, records, unions, boolean, canonical_owner(canonical))
+		None: Ok(into_opaque TraitAvailability({ accepted = traits, unavailable = [], declarations = declarations }))
+		Some(canonical): complete_equality_availability(parsed, traits, declarations, boolean, canonical_owner(canonical))
 
 
-private pure func complete_equality_availability(parsed: ParsedContents, traits: AcceptedTraits, records: List[CheckedRecord], unions: List[CheckedUnion], boolean: DesignatedBoolean[VariantId], canonical: TraitId) -> Result[TraitAvailability, CheckError]:
+-- A candidate starts from its declaration's written bounds, which its derived
+-- equality keeps, and adds what its members require.
+private pure func complete_equality_availability(parsed: ParsedContents, traits: AcceptedTraits, declarations: CheckedDeclarations, boolean: DesignatedBoolean[VariantId], canonical: TraitId) -> Result[TraitAvailability, CheckError]:
+	records = declarations.records
+	unions = declarations.unions
 	var possible: List[EqualityCandidate] = []
 	for record_row in records:
 		if family_for(traits, canonical, RecordHead(record_row.id)).is_none():
-			possible = possible.append({ aggregate = RecordAggregate(record_row.id), requirements = [] })
+			possible = possible.append({ aggregate = RecordAggregate(record_row.id), requirements = record_row.requirements })
 	for union_row in unions:
 		if family_for(traits, canonical, UnionHead(union_row.id)).is_none():
-			possible = possible.append({ aggregate = UnionAggregate(union_row.id), requirements = [] })
+			possible = possible.append({ aggregate = UnionAggregate(union_row.id), requirements = union_row.requirements })
 	var unavailable: List[EqualityUnavailable] = []
 	var invalid: Option[CheckError] = None
 	var changed: Bool = True
@@ -830,7 +849,7 @@ private pure func complete_equality_availability(parsed: ParsedContents, traits:
 		Some(failure): Err(failure)
 		None: Ok(void)
 	table ?= checked_implementation_table(implementations)
-	Ok(into_opaque TraitAvailability({ accepted = { traits | implementations = table }, unavailable = unavailable }))
+	Ok(into_opaque TraitAvailability({ accepted = { traits | implementations = table }, unavailable = unavailable, declarations = declarations }))
 
 
 private pure func supported_implementation(

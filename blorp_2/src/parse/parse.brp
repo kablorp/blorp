@@ -3204,22 +3204,16 @@ private pure func consume_parameter_bounds(state: ParserState, bounds: List[Type
 		_: Ok({ types = gathered, next = bound.next })
 
 
--- A bound is read only where `allows_bounds` is set; otherwise its `:` is not
--- a separator and ends the list with the closing-bracket diagnostic.
-private pure func consume_type_parameter_list(
-	state: ParserState,
-	parameters: List[ParsedTypeParameter],
-	allows_bounds: Bool,
-) -> Result[TypeParameterList, Diagnostic]:
+private pure func consume_type_parameter_list(state: ParserState, parameters: List[ParsedTypeParameter]) -> Result[TypeParameterList, Diagnostic]:
 	name ?= consume_type_parameter(state)
-	bounds: ParsedTypes ?= if and(allows_bounds, at_colon(name.next)):
+	bounds: ParsedTypes ?= if at_colon(name.next):
 		consume_parameter_bounds(shifted(name.next, 1), [])
 	else:
 		Ok({ types = [], next = name.next })
 	parameter: ParsedTypeParameter = { name = name.name, bounds = bounds.types }
 	gathered = parameters.append(parameter)
 	match list_separator(bounds.next):
-		ListContinues(next): consume_type_parameter_list(next, gathered, allows_bounds)
+		ListContinues(next): consume_type_parameter_list(next, gathered)
 		ListEnds(next):
 			if at_right_bracket(next):
 				Ok({ parameters = gathered, next = shifted(next, 1) })
@@ -3227,17 +3221,11 @@ private pure func consume_type_parameter_list(
 				Err(expected_syntax(next, "expected ',' or ']' after a type parameter", "separate type parameters with commas and close the list with ']'"))
 
 
-private pure func consume_type_parameters(state: ParserState, allows_bounds: Bool) -> Result[TypeParameterList, Diagnostic]:
+private pure func consume_type_parameters(state: ParserState) -> Result[TypeParameterList, Diagnostic]:
 	if at_left_bracket(state):
-		consume_type_parameter_list(shifted(state, 1), [], allows_bounds)
+		consume_type_parameter_list(shifted(state, 1), [])
 	else:
 		Ok({ parameters = [], next = state })
-
-
--- Nominal declarations keep their unbounded parameters as bare names.
-private pure func consume_type_parameter_names(state: ParserState) -> Result[NameList, Diagnostic]:
-	declared ?= consume_type_parameters(state, False)
-	Ok({ names = declared.parameters.map(pure func(parameter): parameter.name), next = declared.next })
 
 
 private record ParsedReturnAnnotation {
@@ -3278,7 +3266,7 @@ private pure func consume_signature(start: ParserState) -> Result[HeaderResult, 
 		Impure:
 			expect(start, at_func(start), "expected a function declaration at column 1", "start with func main() -> Int:")
 	function ?= consume_callable_name(after_func, "expected a function name")
-	type_parameters ?= consume_type_parameters(function.next, True)
+	type_parameters ?= consume_type_parameters(function.next)
 	after_open ?= expect(type_parameters.next, at_left_paren(type_parameters.next), "expected '(' after the function name", "write main() or helper(value: Int)")
 	parameters ?= consume_parameters(after_open)
 	return_type ?= consume_return_annotation(parameters.next)
@@ -3539,7 +3527,7 @@ private pure func consume_implementation(start: ParserState, module: ModuleId, v
 		consume_type(after_keyword, "expected the implemented trait name")
 	after_for ?= expect(requirement.next, at_for(requirement.next), "expected 'for' after the trait name", "write implements Equatable for Int:")
 	receiver ?= consume_receiver_head(after_for)
-	parameters ?= consume_type_parameters(receiver.next, True)
+	parameters ?= consume_type_parameters(receiver.next)
 	methods ?= consume_implementation_body(parameters.next, module, visibility)
 	header_end = if at_colon(parameters.next):
 		parser_span(shifted(parameters.next, 1)).start
@@ -3625,8 +3613,8 @@ private record UnionResult {
 -- A fixed record or union is stored inline at one known size, so it cannot
 -- declare type parameters. `opening` is at the list's `[`; the whole written
 -- list is reported. `noun` is the declaration's keyword, for the message.
-private pure func reject_fixed_type_parameters(opening: ParserState, parameters: NameList, fixed: Bool, noun: String) -> Result[Void, Diagnostic]:
-	if and(fixed, parameters.names.is_empty().not()):
+private pure func reject_fixed_type_parameters(opening: ParserState, parameters: TypeParameterList, fixed: Bool, noun: String) -> Result[Void, Diagnostic]:
+	if and(fixed, parameters.parameters.is_empty().not()):
 		closing = parser_span(shifted(parameters.next, -1))
 		Err(diagnostic(
 			{ parser_span(opening) | end = closing.end },
@@ -3640,7 +3628,7 @@ private pure func reject_fixed_type_parameters(opening: ParserState, parameters:
 -- `start` is at the `union` keyword.
 private pure func consume_union(start: ParserState, module: ModuleId, visibility: Visibility, fixed: Bool) -> Result[UnionResult, Diagnostic]:
 	name ?= consume_name(shifted(start, 1), "expected a union type name")
-	type_parameters ?= consume_type_parameter_names(name.next)
+	type_parameters ?= consume_type_parameters(name.next)
 	_: Void ?= reject_fixed_type_parameters(name.next, type_parameters, fixed, "union")
 	colon ?= expect(type_parameters.next, at_colon(type_parameters.next), "expected ':' after the union type name", "write union Choice: or union Box[T]:")
 	newline ?= expect(colon, at_newline(colon), "expected a newline after the union header", "put each variant name on its own indented line")
@@ -3651,7 +3639,7 @@ private pure func consume_union(start: ParserState, module: ModuleId, visibility
 			module = module,
 			visibility = visibility,
 			type_name = name.name,
-			type_parameters = type_parameters.names,
+			type_parameters = type_parameters.parameters,
 			variants = variants.variants,
 			fixed = fixed
 		},
@@ -3716,7 +3704,7 @@ private record ParsedRecordResult {
 -- `start` is at the `record` keyword.
 private pure func consume_record(start: ParserState, module: ModuleId, visibility: Visibility, fixed: Bool) -> Result[ParsedRecordResult, Diagnostic]:
 	name ?= consume_name(shifted(start, 1), "expected a record type name")
-	type_parameters ?= consume_type_parameter_names(name.next)
+	type_parameters ?= consume_type_parameters(name.next)
 	_: Void ?= reject_fixed_type_parameters(name.next, type_parameters, fixed, "record")
 	opened: ParserState ?= match current_symbol(type_parameters.next):
 		Some(LeftBrace):
@@ -3726,7 +3714,7 @@ private pure func consume_record(start: ParserState, module: ModuleId, visibilit
 	fields ?= consume_parameter_list(opened, "expected a record field name", [])
 	closed ?= expect(fields.next, at_right_brace(fields.next), "expected '}' after the record declaration", "separate record fields with commas, then close the declaration with '}'")
 	next ?= end_value_line(closed)
-	Ok({ declaration = { module = module, visibility = visibility, type_name = name.name, type_parameters = type_parameters.names, fields = fields.parameters, fixed = fixed }, next = next })
+	Ok({ declaration = { module = module, visibility = visibility, type_name = name.name, type_parameters = type_parameters.parameters, fields = fields.parameters, fixed = fixed }, next = next })
 
 
 private record BuiltinTypeResult {
@@ -4145,12 +4133,12 @@ private pure func consume_opaque(start: ParserState, module: ModuleId, visibilit
 	else:
 		Err(expected_syntax(after_opaque, "expected 'type' after 'opaque'", OPAQUE_DECLARATION_HELP))
 	name ?= consume_name(type_word, "expected an opaque type name")
-	type_parameters ?= consume_type_parameter_names(name.next)
+	type_parameters ?= consume_type_parameters(name.next)
 	equals ?= expect(type_parameters.next, at_equals(type_parameters.next), "expected '=' after the opaque type name", OPAQUE_DECLARATION_HELP)
 	underlying ?= consume_type(equals, "expected the underlying type after '='")
 	next ?= end_value_line(underlying.next)
 	Ok({
-		declaration = { module = module, visibility = visibility, type_name = name.name, type_parameters = type_parameters.names, underlying = underlying.written },
+		declaration = { module = module, visibility = visibility, type_name = name.name, type_parameters = type_parameters.parameters, underlying = underlying.written },
 		next = next,
 	})
 

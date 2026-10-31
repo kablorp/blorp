@@ -30,8 +30,12 @@ The pilot accepts `_` only in binder/pattern positions, never as a primary
 expression or as a Void alias, including grouped/tuple/List/argument values.
 The pilot accepts parameterless `trait` declarations with pure methods whose
 first formal is `Self`. A method without `:` is abstract; one with `:` has an
-ordinary default body. Function type parameters and complete implementation receiver
-families accept bounds such as `Value: Equatable + Visit` and `Box[Value: Visit]`.
+ordinary default body. Function type parameters, complete implementation receiver
+families and record, union and opaque type parameters accept bounds such as
+`Value: Equatable + Visit`, `Box[Value: Visit]` and
+`opaque type HashMap[K: Hashable + Equatable, V]`. Every application of a bounded
+declaration meets its bounds under the bounds in scope, which restate them; see the
+[pilot declaration bounds](../blorp_2/README.md#declaration-bounds).
 The pilot's ordinary foundation trait `Hashable` declares
 `pure func hash(value: Self) -> Int`; Int supplies a written identity hash.
 Hashable is available through the prelude without any new syntax or builtin
@@ -54,8 +58,8 @@ A default-only `implements Trait for Type` header ends at the newline, without a
 colon. Contextual unbound method references use ordinary expressions and need an
 expected callable type determining `Self`. See the [pilot trait rules](../blorp_2/README.md#concrete-traits)
 for conservative finite-dispatch limits and automatic equality for named records
-and unions. Generic equality conditions come from actual fields/payloads and use
-existing declaration and call syntax; no bounds are added to aggregate declarations.
+and unions. Generic equality conditions are a declaration's own bounds followed by
+those its actual fields/payloads add.
 Trait parameters, independently generic methods and top-level callable trait
 formals remain deferred. Empty aggregate declarations remain rejected; the host
 language grammar below does not broaden the pilot subset.

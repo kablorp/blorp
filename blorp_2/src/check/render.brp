@@ -6,7 +6,7 @@ import:
 	./errors as Errors
 	./model as Check
 	../utils/ids:
-		TraitId, VariantId, trait_method_header, inventory_traits, trait_number, trait_method_owner, trait_method_number,
+		FunctionRole(TraitDefaultBody), TraitId, VariantId, trait_method_header, inventory_traits, trait_number, trait_method_owner, trait_method_number,
 		constant_number,
 		inventory_constants,
 		inventory_functions,
@@ -46,7 +46,7 @@ import:
 		),
 		Diagnostics,
 		ParsedBuiltinType(IntegerBuiltin, FloatBuiltin, StringBuiltin, VoidBuiltin, ListBuiltin),
-		Span, type_span, NoteLine, WrittenName, internal_error, ParsedReceiverHead(ReceiverName, QualifiedReceiverName),
+		ParsedImplementationHeader, ParsedTypeParameter, Span, type_span, NoteLine, WrittenName, internal_error, ParsedReceiverHead(ReceiverName, QualifiedReceiverName),
 	../utils/text as Text: concat
 
 
@@ -1350,12 +1350,12 @@ private pure func ordinary_parameter_spelling(
 	context: RenderContext,
 	span: Span,
 ) -> Result[String, Diagnostic]:
-	found_parameters: Option[List[WrittenName]] = match Check.parameter_owner(id):
+	found_parameters: Option[List[ParsedTypeParameter]] = match Check.parameter_owner(id):
 		Check.TraitDeclaration(_): None
 		Check.FunctionDeclaration(owner):
 			inventory_functions(context.parsed.declarations)
 				.get(function_number(owner))
-				.map(pure func(row): row.declaration.type_parameters.map(pure func(parameter): parameter.name))
+				.map(pure func(row): row.declaration.type_parameters)
 		Check.UnionDeclaration(owner):
 			inventory_unions(context.parsed.declarations)
 				.get(union_number(owner))
@@ -1374,7 +1374,7 @@ private pure func ordinary_parameter_spelling(
 		Some(parameters):
 			match parameters.get(Check.parameter_position(id)):
 				Some(written):
-					Ok(written)
+					Ok(written.name)
 				None:
 					Err(render_fault(span, Errors.ParameterOwnerWithoutParameter(id)))
 		None:
@@ -1701,6 +1701,14 @@ private pure func render_trait_error(span: Span, rejection: Errors.TraitError, c
 				Ok(diagnostic): diagnostic
 				Err(fault): fault
 		Errors.CanonicalEquatableSupertraits: rendered(span, "canonical Equatable cannot declare supertraits", "remove them; automatic equality requires no other trait")
+		Errors.DeclaredBoundUnsatisfied(applied, argument, required):
+			match unsatisfied_bound_diagnostic(span, applied, argument, required, context):
+				Ok(diagnostic): diagnostic
+				Err(fault): fault
+		Errors.ReceiverBoundUndeclared(required, position, header):
+			match undeclared_receiver_bound_diagnostic(span, required, position, header, context):
+				Ok(diagnostic): diagnostic
+				Err(fault): fault
 
 
 private EQUALITY_MEMBER_HELP: String = "provide the member's required trait implementation, or write an Equatable implementation for the containing type"
@@ -1746,6 +1754,61 @@ private pure func supertrait_diagnostic(span: Span, rejection: Errors.TraitError
 		Errors.SupertraitMethodInImplementation(method, _, _):
 			parsed_spelling(method, context.parsed.names, span).map(pure func(name): rendered(span, "${name} belongs to supertrait ${second}", "define it in implements ${second} for ${receiver}"))
 		_: Err(render_fault(span, Errors.InvalidFunctionContract))
+
+
+-- `Box[K] requires K: Hashable`. A rigid parameter is bounded where it is
+-- declared, and a trait's Self through its supertraits; any other argument
+-- needs an implementation.
+private pure func unsatisfied_bound_diagnostic(span: Span, applied: Check.TypeRef, argument: Check.TypeRef, required: TraitId, context: RenderContext) -> Result[Diagnostic, Diagnostic]:
+	applied_spelling ?= type_spelling(applied, context, span)
+	argument_spelling ?= type_spelling(argument, context, span)
+	bound ?= trait_spelling(required, context, span)
+	help: Result[String, Diagnostic] = match argument:
+		Check.ParameterType(parameter):
+			match self_trait(parameter, context):
+				Some(owner): trait_spelling(owner, context, span).map(pure func(name): "declare ${bound} as a supertrait of ${name}")
+				None: Ok("add ${bound} to ${argument_spelling}'s bounds")
+		_: Ok("implement ${bound} for ${argument_spelling}, or use a type that implements it")
+	written_help ?= help
+	Ok(rendered(span, "${applied_spelling} requires ${argument_spelling}: ${bound}", written_help))
+
+
+-- The trait whose Self `parameter` is: a trait method's own Self, or a default
+-- body's, which `resolve_default_function` makes the body's parameter 0 and
+-- bounds by that trait in its first requirement. Either is bounded through
+-- the trait's supertraits.
+private pure func self_trait(parameter: Check.TypeParameterId, context: RenderContext) -> Option[TraitId]:
+	match Check.parameter_owner(parameter):
+		Check.TraitDeclaration(owner): Some(owner)
+		Check.FunctionDeclaration(function):
+			match (inventory_functions(context.parsed.declarations).get(function_number(function)), context.functions.get(function_number(function))):
+				(Some(row), Some(accepted)):
+					match (row.role, Check.parameter_position(parameter) == 0, accepted.signature.requirements):
+						(TraitDefaultBody, True, [required, ..._]): Some(required.required_trait)
+						_: None
+				_: None
+		_: None
+
+
+-- The receiver is spelled as written, with the header's own parameter names.
+private pure func undeclared_receiver_bound_diagnostic(span: Span, required: TraitId, position: Int, header: ParsedImplementationHeader, context: RenderContext) -> Result[Diagnostic, Diagnostic]:
+	bound ?= trait_spelling(required, context, span)
+	receiver ?= match header.receiver:
+		ReceiverName(name): parsed_spelling(name.id, context.parsed.names, span)
+		QualifiedReceiverName(qualified): parsed_spelling(qualified.name.id, context.parsed.names, span)
+	var names: List[String] = []
+	var fault: Option[Diagnostic] = None
+	for parameter in header.type_parameters:
+		match parsed_spelling(parameter.name.id, context.parsed.names, span):
+			Ok(spelled): names = names.append(spelled)
+			Err(error):
+				fault = Some(error)
+				break
+	_: Void ?= match fault:
+		Some(error): Err(error)
+		None: Ok(void)
+	parameter ?= names.get(position).to_result(render_fault(span, Errors.InvalidFunctionContract))
+	Ok(rendered(span, "${receiver}[${comma_separated(names)}] requires ${parameter}: ${bound}", "add ${bound} to ${parameter}'s bounds"))
 
 
 private pure func equality_member_diagnostic(span: Span, message: String, help: String, member: Check.EqualityMember, context: RenderContext) -> Diagnostic:

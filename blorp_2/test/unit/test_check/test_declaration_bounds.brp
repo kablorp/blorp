@@ -1,0 +1,304 @@
+import:
+    ../../../src/check/check: check, checked_functions
+    ../../../src/check/model: implementation_rows
+    ../../../src/namespace/namespace: TypeHead(RecordHead)
+    ../../../src/check/render: render_failure
+    ../../../src/lex/lex: lex
+    ../../../src/parse/parse: parse_module
+    ../../../src/parse/assemble: ParsedAssembly, ParsedProgram, append_module, assembly_names, begin_program
+    ../../../src/utils/source:
+        ModuleId, ModuleKind(UserModule, LibraryModule, FoundationTypesModule, FoundationPreludeModule),
+        module_id, module_source, root_module_id,
+    ../../../src/utils/syntax: Diagnostic, diagnostic
+    ../module_input: FOUNDATION_TYPES, sealed
+    bool: and
+    int: Int methods
+    list: List methods
+    option: Option methods
+    result: Result methods
+    string: String methods
+    test: TestSuite
+
+
+-- Each fixture has four modules: the root at 0, an Int library at 1, the base
+-- at 2 declaring canonical Equatable, and the prelude at 3 selecting from it.
+private BASE_POSITION: Int = 2
+private BASE_SELECTIONS: String = "Int, Float, String, Void, List, Bool(True, False), Option(Some, None), Result(Ok, Err), Equatable"
+private EQUATABLE: String =
+    |trait Equatable:
+    |    pure func equals(left: Self, right: Self) -> Bool
+    |
+private INT_EQUALITY: String =
+    |import:
+    |    _base: Int, Bool, Equatable
+    |implements Equatable for Int:
+    |    pure func equals(left: Self, right: Self) -> Bool:
+    |        builtin("int.equals")
+    |
+private NAMED: String =
+    |trait Named:
+    |    pure func name(value: Self) -> Int
+    |implements Named for Int:
+    |    pure func name(value: Self) -> Int:
+    |        value
+    |
+private OTHER: String =
+    |trait Other:
+    |    pure func other(value: Self) -> Int
+    |
+private BOX: String = "record Box[T: Named] { value: T }\n"
+private MISSING_BOUND: String = "type does not satisfy the required trait bound"
+private MISSING_BOUND_HELP: String = "add the required trait to this function's type parameter bounds, or provide an implementation for the concrete receiver"
+private TREE: String = "union Tree[T: Named]:\n    Leaf(T)\n    Empty\n"
+private ENTRY: String = "func main() -> Int:\n    0\n"
+
+
+private pure func append_source(assembly: ParsedAssembly, position: Int, source: String, targets: List[ModuleId], role: ModuleKind) -> Result[ParsedAssembly, Diagnostic]:
+    invalid = diagnostic({ source = module_source(root_module_id()), start = 0, end = 0 }, "invalid declaration bound fixture module", "use the four fixture module positions")
+    module ?= module_id(position).to_result(invalid)
+    tokens ?= lex(module_source(module), source, assembly_names(assembly))
+    parsed ?= parse_module(tokens, module)
+    append_module(assembly, parsed, targets, role, "module_".append_int(position))
+
+
+private pure func program(root: String) -> Result[ParsedProgram, Diagnostic]:
+    invalid = diagnostic({ source = module_source(root_module_id()), start = 0, end = 0 }, "invalid declaration bound fixture module", "use the four fixture module positions")
+    base ?= module_id(BASE_POSITION).to_result(invalid)
+    with_root ?= append_source(begin_program(), 0, root, [], UserModule)
+    integer ?= append_source(with_root, 1, INT_EQUALITY, [base], LibraryModule)
+    types ?= append_source(integer, BASE_POSITION, FOUNDATION_TYPES.add(EQUATABLE), [], FoundationTypesModule)
+    prelude ?= append_source(types, 3, "import:\n    _base: ".add(BASE_SELECTIONS).add("\n"), [base], FoundationPreludeModule)
+    sealed(prelude)
+
+
+private pure func accepts(root: String) -> Bool:
+    match program(root):
+        Ok(parsed): check(parsed).is_ok()
+        Err(_): False
+
+
+-- The single diagnostic in the root, at `length` bytes after `prefix`,
+-- compared exactly, with no note.
+private pure func rejects(prefix: String, length: Int, suffix: String, message: String, help: String) -> Bool:
+    match program(prefix.add(suffix)):
+        Err(_): False
+        Ok(parsed):
+            match check(parsed):
+                Ok(_): False
+                Err(failure):
+                    diagnostics = render_failure(failure)
+                    first = diagnostics.first
+                    (first.span.source == module_source(root_module_id())).and(first.span.start.equals(prefix.length())).and(first.span.end.equals(prefix.length().add(length)))
+                        .and(first.message == message).and(first.help == help)
+                        .and(first.note.is_none()).and(diagnostics.remaining.is_empty())
+
+
+-- A record, union and opaque type each declare a bound that every function
+-- naming them restates; an opaque type over a bounded record repeats its bound.
+pure func test_declared_bounds_are_accepted_where_they_are_restated() -> Bool:
+    uses: String =
+        |opaque type Boxed[T: Named] = Box[T]
+        |pure func peek[T: Named](box: Box[T]) -> Int:
+        |    name(box.value)
+        |pure func wrap[T: Named](box: Box[T]) -> Boxed[T]:
+        |    into_opaque Boxed(box)
+        |pure func leaf[T: Named](value: T) -> Tree[T]:
+        |    Leaf(value)
+        |func main() -> Int:
+        |    box: Box[Int] = { value = 4 }
+        |    tree = leaf(2)
+        |    peek(box)
+        |
+    accepts(NAMED.add(BOX).add(TREE).add(uses))
+
+
+-- A subtrait bound entails the bound it requires, in a signature and in an
+-- implementation's receiver.
+pure func test_a_subtrait_bound_entails_the_declared_bound() -> Bool:
+    uses: String =
+        |trait Titled: Named
+        |trait Shown:
+        |    pure func shown(value: Self) -> Int
+        |pure func peek[T: Titled](box: Box[T]) -> Int:
+        |    name(box.value)
+        |implements Shown for Box[T: Titled]:
+        |    pure func shown(value: Self) -> Int:
+        |        name(value.value)
+        |
+    accepts(NAMED.add(BOX).add(uses).add(ENTRY))
+
+
+-- Box's automatic equality bounds T by its declared Named, then by the
+-- Equatable its field requires.
+pure func test_automatic_equality_keeps_the_declared_bound() -> Bool:
+    prefix = NAMED.add("record Box[T: ")
+    match program(prefix.add("Named] { value: T }\n").add(ENTRY)):
+        Err(_): False
+        Ok(parsed):
+            match check(parsed):
+                Err(_): False
+                Ok(checked):
+                    published = checked_functions(checked)
+                    match published.records.get(0):
+                        None: False
+                        Some(box):
+                            head: TypeHead = RecordHead(box.id)
+                            var found: Bool = False
+                            for family in implementation_rows(published.traits.implementations):
+                                if family.receiver_head == head:
+                                    found = match family.parameter_bounds:
+                                        [bounds]:
+                                            match bounds:
+                                                [declared, field]:
+                                                    declared.span.start.equals(prefix.length()).and(declared.span.end.equals(prefix.length().add(5)))
+                                                        .and(field.required_trait != declared.required_trait)
+                                                _: False
+                                        _: False
+                            found
+
+
+pure func test_automatic_equality_of_a_bounded_record_is_usable() -> Bool:
+    uses: String =
+        |pure func same[T: Named + Equatable](left: Box[T], right: Box[T]) -> Bool:
+        |    left == right
+        |func main() -> Int:
+        |    left: Box[Int] = { value = 1 }
+        |    right: Box[Int] = { value = 1 }
+        |    matched = same(left, right)
+        |    0
+        |
+    accepts(NAMED.add(BOX).add(uses))
+
+
+pure func test_a_bound_must_name_a_visible_trait() -> Bool:
+    rejects("record Box[T: ", 7, "Missing] { value: T }\n".add(ENTRY), "type parameter bound requires a visible trait", "import a parameterless trait and name it after ':' or '+'")
+        .and(rejects("union Tree[T: ", 3, "Int]:\n    Leaf(T)\n".add(ENTRY), "type parameter bound requires a visible trait", "import a parameterless trait and name it after ':' or '+'"))
+        .and(rejects("opaque type Index[K: ", 7, "Missing] = List[K]\n".add(ENTRY), "type parameter bound requires a visible trait", "import a parameterless trait and name it after ':' or '+'"))
+
+
+-- A signature that names Box[T] restates T: Named; a different bound does not
+-- entail it.
+pure func test_a_signature_restates_the_declared_bound() -> Bool:
+    rejects(NAMED.add(BOX).add("pure func peek[T](box: Box["), 1, "T]) -> Int:\n    0\n".add(ENTRY), "Box[T] requires T: Named", "add Named to T's bounds")
+        .and(rejects(NAMED.add(OTHER).add(BOX).add("pure func peek[T: Other](box: Box["), 1, "T]) -> Int:\n    0\n".add(ENTRY), "Box[T] requires T: Named", "add Named to T's bounds"))
+        .and(rejects(NAMED.add(BOX).add("pure func make[T](value: T) -> Box["), 1, "T]:\n    { value = value }\n".add(ENTRY), "Box[T] requires T: Named", "add Named to T's bounds"))
+
+
+-- A concrete argument needs an implementation, wherever the application is
+-- nested.
+pure func test_a_concrete_argument_needs_an_implementation() -> Bool:
+    rejects(NAMED.add(OTHER).add("record Box[T: Other] { value: T }\npure func peek(box: Box["), 3, "Int]) -> Int:\n    0\n".add(ENTRY), "Box[Int] requires Int: Other", "implement Other for Int, or use a type that implements it")
+        .and(rejects(NAMED.add(OTHER).add("record Box[T: Other] { value: T }\npure func peek(boxes: List[(Int, Box["), 3, "Int])]) -> Int:\n    0\n".add(ENTRY), "Box[Int] requires Int: Other", "implement Other for Int, or use a type that implements it"))
+
+
+-- A declaration's own fields, payloads and underlying type are proved under its
+-- own bounds; nothing is inferred onto the declaration.
+pure func test_a_declaration_restates_the_bound_of_what_it_contains() -> Bool:
+    message = "Box[T] requires T: Named"
+    help = "add Named to T's bounds"
+    rejects(NAMED.add(BOX).add("record Outer[T] { inner: Box["), 1, "T] }\n".add(ENTRY), message, help)
+        .and(rejects(NAMED.add(BOX).add("union Choice[T]:\n    Held(Box["), 1, "T])\n".add(ENTRY), message, help))
+        .and(rejects(NAMED.add(BOX).add("opaque type Boxed[T] = Box["), 1, "T]\n".add(ENTRY), message, help))
+        .and(accepts(NAMED.add(BOX).add("record Outer[T: Named] { inner: Box[T] }\n").add(ENTRY)))
+
+
+-- Each written body type: a binding, a propagation, a standalone lambda's
+-- input and result, and a contextual lambda's input and result.
+pure func test_a_body_annotation_is_proved_under_the_function_bounds() -> Bool:
+    message = "Box[T] requires T: Named"
+    help = "add Named to T's bounds"
+    run = "pure func run(callback: pure (Int) -> Int) -> Int:\n    callback(1)\n"
+    make = NAMED.add(BOX).add(run).add("pure func make[T](value: T) -> Int:\n    ")
+    propagate = NAMED.add(BOX).add("pure func make[T](value: T) -> Result[Int, String]:\n    box: Box[")
+    rejects(propagate, 1, "T] ?= Ok({ value = value })\n    Ok(0)\n".add(ENTRY), message, help)
+        .and(rejects(make.add("unwrap = func(value: Int) -> Box["), 1, "T]: { value = value }\n    0\n".add(ENTRY), message, help))
+        .and(rejects(make.add("run(pure func(box: Box["), 1, "T]): 0)\n".add(ENTRY), message, help))
+        .and(rejects(make.add("run(pure func(value: Int) -> Box["), 1, "T]: value)\n".add(ENTRY), message, help))
+        .and(binding_annotations_are_proved())
+
+
+private pure func binding_annotations_are_proved() -> Bool:
+    rejects(NAMED.add(BOX).add("pure func make[T](value: T) -> Int:\n    box: Box["), 1, "T] = { value = value }\n    0\n".add(ENTRY), "Box[T] requires T: Named", "add Named to T's bounds")
+        .and(rejects(NAMED.add(BOX).add("pure func make[T](value: T) -> Int:\n    unwrap = func(box: Box["), 1, "T]) -> Int: 0\n    0\n".add(ENTRY), "Box[T] requires T: Named", "add Named to T's bounds"))
+
+
+-- `into_opaque` infers its type from its operand, so it proves the opaque
+-- declaration's bounds at its expression.
+pure func test_an_inferred_opaque_construction_proves_the_declared_bound() -> Bool:
+    rejects(NAMED.add(OTHER).add("opaque type OtherList[T: Other] = List[T]\npure func wrap(values: List[Int]) -> Int:\n    wrapped = "), 29, "into_opaque OtherList(values)\n    0\n".add(ENTRY), "OtherList[Int] requires Int: Other", "implement Other for Int, or use a type that implements it")
+        .and(rejects(NAMED.add("opaque type NamedList[T: Named] = List[T]\npure func wrap[T](values: List[T]) -> Int:\n    wrapped = "), 29, "into_opaque NamedList(values)\n    0\n".add(ENTRY), "NamedList[T] requires T: Named", "add Named to T's bounds"))
+
+
+-- A receiver family restates its declaration's bounds on the parameter.
+pure func test_an_implementation_receiver_restates_the_declared_bound() -> Bool:
+    shown = "trait Shown:\n    pure func shown(value: Self) -> Int\n"
+    body = "]:\n    pure func shown(value: Self) -> Int:\n        0\n".add(ENTRY)
+    rejects(NAMED.add(BOX).add(shown).add("implements Shown for Box["), 1, "T".add(body), "Box[T] requires T: Named", "add Named to T's bounds")
+        .and(rejects(NAMED.add(OTHER).add(BOX).add(shown).add("implements Shown for Box["), 1, "T: Other".add(body), "Box[T] requires T: Named", "add Named to T's bounds"))
+
+
+-- The span and message follow the bounded parameter's position.
+pure func test_a_later_parameter_bound_is_located_at_its_argument() -> Bool:
+    pair = NAMED.add("record Pair[A, B: Named] { first: A, second: B }\n")
+    shown = "trait Shown:\n    pure func shown(value: Self) -> Int\n"
+    body = "]:\n    pure func shown(value: Self) -> Int:\n        0\n".add(ENTRY)
+    rejects(pair.add("pure func peek[A, B](pair: Pair[A, "), 1, "B]) -> Int:\n    0\n".add(ENTRY), "Pair[A, B] requires B: Named", "add Named to B's bounds")
+        .and(rejects(pair.add(shown).add("implements Shown for Pair[A, "), 1, "B".add(body), "Pair[A, B] requires B: Named", "add Named to B's bounds"))
+
+
+-- A record literal or constructor takes its arguments from an expected type,
+-- here a generic parameter whose own bound the call proves.
+pure func test_constructions_take_proved_expected_types() -> Bool:
+    holder = NAMED.add(OTHER).add("record Holder[T: Other] { value: T }\nunion Tree[T: Other]:\n    Leaf(T)\n    Empty\n")
+    peek = "pure func peek[T: Other](holder: Holder[T]) -> Int:\n    0\n"
+    count = "pure func count[T: Other](tree: Tree[T]) -> Int:\n    0\n"
+    rejects(holder.add(peek).add("func main() -> Int:\n    "), 4, "peek({ value = 1 })\n", MISSING_BOUND, MISSING_BOUND_HELP)
+        .and(rejects(holder.add(count).add("func main() -> Int:\n    "), 5, "count(Leaf(2))\n", MISSING_BOUND, MISSING_BOUND_HELP))
+
+
+-- A failed bound other than a missing implementation keeps its own cause.
+pure func test_unavailable_automatic_equality_keeps_its_cause() -> Bool:
+    prefix = "record Box[T: Equatable] { value: T }\nrecord Holder { callback: (Int) -> Int }\npure func peek(box: Box["
+    match program(prefix.add("Holder]) -> Int:\n    0\n").add(ENTRY)):
+        Err(_): False
+        Ok(parsed):
+            match check(parsed):
+                Ok(_): False
+                Err(failure):
+                    first = render_failure(failure).first
+                    first.span.start.equals(prefix.length()).and(first.span.end.equals(prefix.length().add(6)))
+                        .and(first.message == "automatic equality is unavailable for a field or payload")
+                        .and(first.help == "provide the member's required trait implementation, or write an Equatable implementation for the containing type")
+
+
+-- A trait default body is proved with only `Self: Trait`.
+pure func test_a_trait_default_body_is_proved() -> Bool:
+    rejects(NAMED.add(BOX).add("trait Shown:\n    pure func shown(value: Self) -> Int:\n        box: Box["), 4, "Self] = { value = value }\n        0\n".add(ENTRY), "Box[Self] requires Self: Named", "declare Named as a supertrait of Shown")
+
+
+pure func test_trait_methods_and_constants_are_proved() -> Bool:
+    rejects(NAMED.add(BOX).add("trait Shown:\n    pure func shown(value: Self, box: Box["), 4, "Self]) -> Int\n".add(ENTRY), "Box[Self] requires Self: Named", "declare Named as a supertrait of Shown")
+        .and(rejects(NAMED.add(OTHER).add("record Box[T: Other] { value: T }\nNO_BOXES: List[Box["), 3, "Int]] = []\n".add(ENTRY), "Box[Int] requires Int: Other", "implement Other for Int, or use a type that implements it"))
+
+
+tests: TestSuite = {
+    description = "declaration bounds",
+    tests = [
+        ("declared bounds are accepted where they are restated", test_declared_bounds_are_accepted_where_they_are_restated),
+        ("a subtrait bound entails the declared bound", test_a_subtrait_bound_entails_the_declared_bound),
+        ("automatic equality keeps the declared bound", test_automatic_equality_keeps_the_declared_bound),
+        ("automatic equality of a bounded record is usable", test_automatic_equality_of_a_bounded_record_is_usable),
+        ("a bound must name a visible trait", test_a_bound_must_name_a_visible_trait),
+        ("a signature restates the declared bound", test_a_signature_restates_the_declared_bound),
+        ("a concrete argument needs an implementation", test_a_concrete_argument_needs_an_implementation),
+        ("a declaration restates the bound of what it contains", test_a_declaration_restates_the_bound_of_what_it_contains),
+        ("a body annotation is proved under the function bounds", test_a_body_annotation_is_proved_under_the_function_bounds),
+        ("an inferred opaque construction proves the declared bound", test_an_inferred_opaque_construction_proves_the_declared_bound),
+        ("an implementation receiver restates the declared bound", test_an_implementation_receiver_restates_the_declared_bound),
+        ("a later parameter bound is located at its argument", test_a_later_parameter_bound_is_located_at_its_argument),
+        ("constructions take proved expected types", test_constructions_take_proved_expected_types),
+        ("unavailable automatic equality keeps its cause", test_unavailable_automatic_equality_keeps_its_cause),
+        ("a trait default body is proved", test_a_trait_default_body_is_proved),
+        ("trait methods and constants are proved", test_trait_methods_and_constants_are_proved),
+    ]
+}
