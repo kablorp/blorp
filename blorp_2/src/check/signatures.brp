@@ -67,11 +67,6 @@ import:
 	option: Option methods
 
 
-private union SignatureRole:
-	EntryFunction
-	HelperFunction
-
-
 -- A function body after signature checking. A builtin body has been validated
 -- against its runtime contract; source bodies are checked with the others.
 union AcceptedBody:
@@ -163,14 +158,9 @@ private pure func accept_functions(
 
 			id = row.id
 
-			role: SignatureRole = match entrypoint:
-				Some(entry):
-					if id == entry:
-						EntryFunction
-					else:
-						HelperFunction
-				None:
-					HelperFunction
+			is_entry: Bool = match entrypoint:
+				Some(entry): id == entry
+				None: False
 
 			scope: TypeScope = {
 				self_binding = None,
@@ -182,7 +172,7 @@ private pure func accept_functions(
 				access = type_access(function.visibility, function.function_name.id),
 				parameters = []
 			}
-			match resolve_function(row, parsed, headers, contracts, role, scope, designated):
+			match resolve_function(row, parsed, headers, contracts, is_entry, scope, designated):
 				Ok(signature):
 					accept_functions(
 						parsed,
@@ -200,7 +190,7 @@ private pure func resolve_signature(
 	function: ParsedFunction,
 	id: FunctionId,
 	label: FunctionLabel,
-	role: SignatureRole,
+	is_entry: Bool,
 	scope: TypeScope,
 	parameters: List[TypeParameterId],
 	requirements: List[TraitRequirement],
@@ -220,31 +210,21 @@ private pure func resolve_signature(
 		None:
 			function.function_name.span
 
-	_: Void ?= match role:
-		EntryFunction:
-			if or(return_type == IntType, return_type == VoidType):
-				Ok(void)
+	_: Void ?= if and(is_entry, and(return_type != IntType, return_type != VoidType)):
+		Err(signature_error(return_span, MainReturnType(return_type)))
+	else:
+		Ok(void)
+
+	_: Void ?= match function.parameters:
+		[_, second, ..._]:
+			if is_entry:
+				Err(signature_error(second.name.span, MainHasParameters(function.parameters.length())))
 			else:
-				Err(signature_error(return_span, MainReturnType(return_type)))
-		HelperFunction:
+				Ok(void)
+		_:
 			Ok(void)
 
-	_: Void ?= match role:
-		EntryFunction:
-			match function.parameters:
-				[_, second, ..._]:
-					Err(
-						signature_error(
-							second.name.span,
-							MainHasParameters(function.parameters.length()),
-						),
-					)
-				_:
-					Ok(void)
-		HelperFunction:
-			Ok(void)
-
-	formal_parameters ?= resolve_parameters(function.parameters, role, scope, [])
+	formal_parameters ?= resolve_parameters(function.parameters, is_entry, scope, [])
 	signature: FunctionSignature = {
 		type_parameters = parameters,
 		requirements = requirements,
@@ -270,7 +250,7 @@ private pure func resolve_signature(
 -- Resolves parameter types; the body scope validates every parameter name.
 private pure func resolve_parameters(
 	parameters: List[ParsedParameter],
-	role: SignatureRole,
+	is_entry: Bool,
 	scope: TypeScope,
 	resolved: List[TypeUse],
 ) -> Result[List[TypeUse], CheckError]:
@@ -284,20 +264,16 @@ private pure func resolve_parameters(
 				Ok(value_type):
 					span = type_span(parameter.type_name)
 
-					entry_type_result: Result[Void, CheckError] = match role:
-						EntryFunction:
-							if value_type == ListType(StringType):
-								Ok(void)
-							else:
-								Err(signature_error(span, MainParameterType))
-						HelperFunction:
-							Ok(void)
+					entry_type_result: Result[Void, CheckError] = if and(is_entry, value_type != ListType(StringType)):
+						Err(signature_error(span, MainParameterType))
+					else:
+						Ok(void)
 
 					match entry_type_result:
 						Ok(_):
 							resolve_parameters(
 								parameters,
-								role,
+								is_entry,
 								scope,
 								resolved.append({
 									value_type = value_type,
@@ -553,7 +529,7 @@ private pure func implementation_headers(parsed: ParsedContents, namespace: Name
 		None: Ok(headers)
 
 
-private pure func resolve_implementation_function(row: FunctionRow, label: FunctionLabel, implementation: ImplRow, header: ImplementationHeader, parsed: ParsedContents, role: SignatureRole, scope: TypeScope, designated: DesignatedUnions) -> Result[AcceptedFunction, CheckError]:
+private pure func resolve_implementation_function(row: FunctionRow, label: FunctionLabel, implementation: ImplRow, header: ImplementationHeader, parsed: ParsedContents, is_entry: Bool, scope: TypeScope, designated: DesignatedUnions) -> Result[AcceptedFunction, CheckError]:
 	_: Void ?= match row.declaration.type_parameters:
 		[first, ..._]: Err(trait_error(first.name.span, IndependentImplementationParameters))
 		[]: Ok(void)
@@ -565,7 +541,7 @@ private pure func resolve_implementation_function(row: FunctionRow, label: Funct
 	receiver ?= receiver_type(header.receiver_head, identities.map(pure func(id): ParameterType(id)))
 		.to_result(checker_invariant(implementation.header.span, InvalidFunctionContract))
 	normalized = { body_scope | self_binding = Some({ name = contextual_words(parsed.names).self_word, value_type = receiver }) }
-	resolve_signature(row.declaration, row.id, label, role, normalized, identities, body_requirements(header.parameter_bounds, row.id), designated)
+	resolve_signature(row.declaration, row.id, label, is_entry, normalized, identities, body_requirements(header.parameter_bounds, row.id), designated)
 
 
 -- The default's written contract is accepted once in its trait domain.
@@ -608,18 +584,18 @@ private pure func resolve_default_function(
 	})
 
 
-private pure func resolve_function(row: FunctionRow, parsed: ParsedContents, headers: List[ImplementationHeader], contracts: List[AcceptedTrait], role: SignatureRole, scope: TypeScope, designated: DesignatedUnions) -> Result[AcceptedFunction, CheckError]:
+private pure func resolve_function(row: FunctionRow, parsed: ParsedContents, headers: List[ImplementationHeader], contracts: List[AcceptedTrait], is_entry: Bool, scope: TypeScope, designated: DesignatedUnions) -> Result[AcceptedFunction, CheckError]:
 	label ?= function_label(row, parsed)
 	match row.role:
 		FreeFunctionBody:
-			resolve_free_function(row, label, role, scope, designated)
+			resolve_free_function(row, label, is_entry, scope, designated)
 		ImplementationBody:
 			var accepted: Result[AcceptedFunction, CheckError] = Err(checker_invariant(row.declaration.function_name.span, InvalidResolvedFunction(row.id)))
 			for implementation in inventory_implementations(parsed.declarations):
 				for member in implementation.methods:
 					if member == row.id:
 						match headers.get(impl_number(implementation.id)):
-							Some(header): accepted = resolve_implementation_function(row, label, implementation, header, parsed, role, scope, designated)
+							Some(header): accepted = resolve_implementation_function(row, label, implementation, header, parsed, is_entry, scope, designated)
 							None: void
 			accepted
 		TraitDefaultBody:
@@ -635,22 +611,16 @@ private pure func resolve_function(row: FunctionRow, parsed: ParsedContents, hea
 
 
 
-private pure func resolve_free_function(row: FunctionRow, label: FunctionLabel, role: SignatureRole, scope: TypeScope, designated: DesignatedUnions) -> Result[AcceptedFunction, CheckError]:
-	_: Void ?= match role:
-		EntryFunction:
-			match row.declaration.type_parameters.get(0):
-				Some(name):
-					Err(
-						signature_error(
-							name.name.span,
-							GenericMain(type_parameter_id(FunctionDeclaration(row.id), 0)),
-						),
-					)
-				None:
-					Ok(void)
-		HelperFunction:
+private pure func resolve_free_function(row: FunctionRow, label: FunctionLabel, is_entry: Bool, scope: TypeScope, designated: DesignatedUnions) -> Result[AcceptedFunction, CheckError]:
+	_: Void ?= match row.declaration.type_parameters.get(0):
+		Some(name):
+			if is_entry:
+				Err(signature_error(name.name.span, GenericMain(type_parameter_id(FunctionDeclaration(row.id), 0))))
+			else:
+				Ok(void)
+		None:
 			Ok(void)
 
 	parameters ?= local_type_parameters(row.declaration.type_parameters.map(pure func(parameter): parameter.name), FunctionDeclaration(row.id), scope)
 	bounds ?= resolve_bounds(row.declaration.type_parameters, parameters)
-	resolve_signature(row.declaration, row.id, label, role, parameters, declared_parameters(parameters), body_requirements(bounds, row.id), designated)
+	resolve_signature(row.declaration, row.id, label, is_entry, parameters, declared_parameters(parameters), body_requirements(bounds, row.id), designated)
