@@ -7,7 +7,7 @@ rejected by the parser.
 import:
 	../../../src/check/check: check, checked_functions
 	../../../src/check/render: render_failure
-	../../../src/utils/source: module_source, root_module_id, same_source
+	../../../src/utils/source: module_id, module_source, root_module_id, same_source
 	../module_input: TestFoundation, parse_modules, parse_modules_with_base, test_base
 	bool: and
 	int: Int methods
@@ -23,14 +23,14 @@ private CONTAINS_ITSELF: String = "a fixed union cannot contain itself"
 private CONTAINS_ITSELF_HELP: String = "remove fixed so the union can be stored on the heap"
 
 
--- The target foundation declares Bool fixed, and designation accepts it.
-private FIXED_BOOL_TYPES: String =
+-- A foundation whose Bool is not declared fixed.
+private PLAIN_BOOL_TYPES: String =
 	|type Int = builtin
 	|type Float = builtin
 	|type String = builtin
 	|type Void = builtin
 	|type List[T] = builtin
-	|fixed union Bool:
+	|union Bool:
 	|    True
 	|    False
 	|union Option[A]:
@@ -42,17 +42,10 @@ private FIXED_BOOL_TYPES: String =
 	|
 
 
-private pure func fixed_bool_base() -> TestFoundation:
-	{ test_base() | types = FIXED_BOOL_TYPES }
-
-
--- How many checked unions were written `fixed`, when the program is accepted.
+-- How many checked unions were written `fixed`, counting the foundation's
+-- Bool, when the program is accepted.
 private pure func accepted_fixed_unions(declarations: String) -> Option[Int]:
-	accepted_with_base(declarations, test_base())
-
-
-private pure func accepted_with_base(declarations: String, foundation: TestFoundation) -> Option[Int]:
-	match parse_modules_with_base([{ source = declarations.add(ENTRY), targets = [] }], foundation):
+	match parse_modules([{ source = declarations.add(ENTRY), targets = [] }]):
 		Err(_): None
 		Ok(parsed):
 			match check(parsed):
@@ -79,15 +72,15 @@ private pure func rejects(declarations: String, start: Int, end: Int, message: S
 
 
 pure func test_payload_free_fixed_union_is_accepted() -> Bool:
-	accepted_fixed_unions("union Plain:\n    Only\nfixed union Light:\n    Red\n    Green\n") == Some(1)
+	accepted_fixed_unions("union Plain:\n    Only\nfixed union Light:\n    Red\n    Green\n") == Some(2)
 
 
 pure func test_number_and_void_payloads_are_accepted() -> Bool:
-	accepted_fixed_unions("fixed union Reading:\n    Level(Int)\n    Ratio(Float, Int)\n    Unit(Void)\n") == Some(1)
+	accepted_fixed_unions("fixed union Reading:\n    Level(Int)\n    Ratio(Float, Int)\n    Unit(Void)\n") == Some(2)
 
 
 pure func test_fixed_union_payload_is_accepted() -> Bool:
-	accepted_fixed_unions("fixed union Signal:\n    Off\n    Level(Int)\nfixed union Event:\n    Quiet\n    Pulse(Signal)\n") == Some(2)
+	accepted_fixed_unions("fixed union Signal:\n    Off\n    Level(Int)\nfixed union Event:\n    Quiet\n    Pulse(Signal)\n") == Some(3)
 
 
 -- `Cell[Int]` is inline because its field, at the argument Int, is a number;
@@ -105,7 +98,7 @@ private RECORDS_OF_NUMBERS: String =
 
 
 pure func test_record_of_numbers_payloads_are_accepted() -> Bool:
-	accepted_fixed_unions(RECORDS_OF_NUMBERS) == Some(1)
+	accepted_fixed_unions(RECORDS_OF_NUMBERS) == Some(2)
 
 
 -- An opaque type is stored as its underlying type.
@@ -125,7 +118,7 @@ private OPAQUE_PAYLOADS: String =
 
 
 pure func test_opaque_payloads_over_fixed_storage_are_accepted() -> Bool:
-	accepted_fixed_unions(OPAQUE_PAYLOADS) == Some(2)
+	accepted_fixed_unions(OPAQUE_PAYLOADS) == Some(3)
 
 
 pure func test_string_payload_is_rejected() -> Bool:
@@ -136,14 +129,29 @@ pure func test_list_payload_is_rejected() -> Bool:
 	rejects("fixed union Batch:\n    Items(List[Int])\n", 29, 38, INLINE_PAYLOAD, INLINE_PAYLOAD_HELP)
 
 
--- The foundation's fixed Bool is one of its two fixed unions.
-pure func test_fixed_bool_payload_is_accepted() -> Bool:
-	accepted_with_base("fixed union Switch:\n    Flag(Bool)\n", fixed_bool_base()) == Some(2)
+pure func test_bool_payload_is_accepted() -> Bool:
+	accepted_fixed_unions("fixed union Switch:\n    Flag(Bool)\n") == Some(2)
 
 
--- The default test foundation declares Bool as a plain union.
-pure func test_plain_bool_payload_is_rejected() -> Bool:
-	rejects("fixed union Switch:\n    Flag(Bool)\n", 29, 33, INLINE_PAYLOAD, INLINE_PAYLOAD_HELP)
+-- The foundation must declare Bool fixed; a plain Bool is not its designated shape.
+pure func test_plain_foundation_bool_is_rejected() -> Bool:
+	foundation: TestFoundation = { test_base() | types = PLAIN_BOOL_TYPES }
+	match parse_modules_with_base([{ source = ENTRY, targets = [] }], foundation):
+		Err(_): False
+		Ok(parsed):
+			match check(parsed):
+				Ok(_): False
+				Err(failure):
+					rendered = render_failure(failure).first
+					-- The foundation follows the one input, at position 1.
+					in_foundation = match module_id(1):
+						Some(module): same_source(rendered.span.source, module_source(module))
+						None: False
+					in_foundation
+						.and(rendered.span.start == 111).and(rendered.span.end == 115)
+						.and(rendered.message == "foundation union Bool does not have its designated shape")
+						.and(rendered.help == "declare it as fixed union Bool with exactly the variants True and False")
+						.and(rendered.note.is_none())
 
 
 -- Toggle is stored inline today, but it does not promise to stay that way.
@@ -199,7 +207,7 @@ private DIAMOND: String =
 
 
 pure func test_diamond_of_fixed_unions_is_accepted() -> Bool:
-	accepted_fixed_unions(DIAMOND) == Some(4)
+	accepted_fixed_unions(DIAMOND) == Some(5)
 
 
 -- A only reaches the cycle between B and C; C's payload closes it.
@@ -261,8 +269,8 @@ tests: TestSuite = {
 		("opaque types over fixed storage are accepted", test_opaque_payloads_over_fixed_storage_are_accepted),
 		("a String payload is rejected", test_string_payload_is_rejected),
 		("a List payload is rejected", test_list_payload_is_rejected),
-		("a fixed Bool payload is accepted", test_fixed_bool_payload_is_accepted),
-		("a plain Bool payload is rejected", test_plain_bool_payload_is_rejected),
+		("a Bool payload is accepted", test_bool_payload_is_accepted),
+		("a foundation Bool not declared fixed is rejected", test_plain_foundation_bool_is_rejected),
 		("an ordinary payload-free union payload is rejected", test_ordinary_union_payload_is_rejected),
 		("a record with a String field is rejected", test_managed_record_payload_is_rejected),
 		("a generic record at a managed argument is rejected", test_generic_record_at_a_managed_argument_is_rejected),

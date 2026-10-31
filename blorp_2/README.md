@@ -2199,8 +2199,9 @@ Semantic rules:
 - Union-only recursive layouts, generic self-reinstantiation,
   guards, Char patterns, constructor UFCS,
   and function
-  values are outside this increment. `Bool` is a fixed union declared
-  once in the base module, alongside the ordinary unions Option and Result. Local functions and
+  values are outside this increment. `Bool` is a fixed union, which the
+  foundation check requires, declared once in the base module, alongside the
+  ordinary unions Option and Result. Local functions and
   explicitly imported functions support both call notations; type selections
   expose receiver functions only through UFCS.
 - Syntax and semantic errors carry a source location, an explanation, and help.
