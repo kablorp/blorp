@@ -36,10 +36,12 @@ import:
 		NominalId(AggregateNominal, OpaqueNominal),
 		TypeUse,
 		UnionOccurrence,
+		contains_parameter,
 		field_id,
 		parameter_owner,
 		parameter_position,
 		primitive_ref,
+		type_children,
 		type_parameter_id,
 	../utils/ids:
 		RecordRow,
@@ -782,23 +784,6 @@ private pure func push_type_use(steps: List[TypeUse], depth: Int, step: TypeUse)
 		steps.append(step)
 
 
-private pure func contains_parameter(value_type: TypeRef) -> Bool:
-	match value_type:
-		TupleType(elements): elements.any(contains_parameter)
-		CallableType(purity, parameters, result):
-			match parameters.any(contains_parameter):
-				True: True
-				False: contains_parameter(result)
-		ParameterType(_):
-			True
-		ListType(element):
-			contains_parameter(element)
-		NominalType(_, arguments):
-			arguments.any(contains_parameter)
-		_:
-			False
-
-
 -- The parameters of a declaration as the rigid arguments it is walked at.
 private pure func rigid_arguments(parameters: List[TypeParameterId]) -> List[TypeRef]:
 	var arguments: List[TypeRef] = []
@@ -904,24 +889,9 @@ private pure func generic_reinstantiation_edge(
 				if reinstantiates_root(annotation.value_type, root):
 					closing = Some(annotation)
 				else:
-					match annotation.value_type:
-						VoidType | IntType | FloatType | StringType | ParameterType(_):
-							void
-						CallableType(purity, parameters, result):
-							for child in parameters.append(result):
-								pending = push_type_use(pending, pending_count, { annotation | value_type = child })
-								pending_count = pending_count.add(1)
-						TupleType(elements):
-							for child in elements:
-								pending = push_type_use(pending, pending_count, { annotation | value_type = child })
-								pending_count = pending_count.add(1)
-						ListType(element):
-							pending = push_type_use(pending, pending_count, { annotation | value_type = element })
-							pending_count = pending_count.add(1)
-						NominalType(_, arguments):
-							for argument in arguments:
-								pending = push_type_use(pending, pending_count, { annotation | value_type = argument })
-								pending_count = pending_count.add(1)
+					for child in type_children(annotation.value_type):
+						pending = push_type_use(pending, pending_count, { annotation | value_type = child })
+						pending_count = pending_count.add(1)
 
 					match annotation.value_type:
 						NominalType(AggregateNominal(RecordAggregate(id)), _):
@@ -1267,16 +1237,6 @@ pure func validate_finite_declarations(
 								pending_count = pending_count.add(1)
 						VisitDeclaredType(annotation):
 							match annotation.value_type:
-								VoidType | IntType | FloatType | StringType | ParameterType(_):
-									void
-								CallableType(purity, parameters, result):
-									for child in parameters.append(result):
-										roots = roots.append(VisitDeclaredType({ annotation | value_type = child }))
-								TupleType(elements):
-									for child in elements:
-										roots = roots.append(VisitDeclaredType({ annotation | value_type = child }))
-								ListType(element):
-									roots = roots.append(VisitDeclaredType({ annotation | value_type = element }))
 								NominalType(AggregateNominal(UnionAggregate(id)), arguments):
 									-- A substituted body reports at the application that substituted it.
 									reported: PayloadSpan = if arguments.is_empty():
@@ -1301,10 +1261,11 @@ pure func validate_finite_declarations(
 												Ok(underlying):
 													pending = push_declaration_visit(pending, pending_count, VisitDeclaredType({ annotation | value_type = underlying }))
 													pending_count = pending_count.add(1)
-								-- A record stores its arguments behind a pointer.
-								NominalType(_, arguments):
-									for argument in arguments:
-										roots = roots.append(VisitDeclaredType({ annotation | value_type = argument }))
+								-- Every other type visits its parts as roots: a record stores
+								-- its arguments, and a List its element, behind a pointer.
+								_:
+									for child in type_children(annotation.value_type):
+										roots = roots.append(VisitDeclaredType({ annotation | value_type = child }))
 
 	match failure:
 		Some(error): Err(error)
@@ -1342,11 +1303,8 @@ private pure func validate_opaque_representation(
 					if seen.not():
 						visited = visited.append(annotation.value_type)
 						children: Result[List[TypeUse], CheckError] = match annotation.value_type:
-							TupleType(elements): Ok(elements.map(pure func(element): { annotation | value_type = element }))
-							ListType(element): Ok([{ annotation | value_type = element }])
-							CallableType(_, parameters, result): Ok(parameters.append(result).map(pure func(child): { annotation | value_type = child }))
 							NominalType(owner, arguments): representation_children(owner, arguments, annotation.span, declarations)
-							_: Ok([])
+							_: Ok(type_children(annotation.value_type).map(pure func(child): { annotation | value_type = child }))
 						match children:
 							Err(error): failure = Some(error)
 							Ok(ordered):
