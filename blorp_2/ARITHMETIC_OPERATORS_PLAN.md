@@ -1,7 +1,7 @@
 # Arithmetic operators
 
 Status: approved 2026-10-30, with the owner decisions below accepted as
-recommended; milestone 1 implemented. This plan mirrors [the ordering
+recommended; milestones 1 and 2 implemented. This plan mirrors [the ordering
 operators plan](ORDERING_OPERATORS_PLAN.md), whose rules apply unless a
 section below says otherwise. It builds on [supertraits](SUPERTRAITS_PLAN.md) milestone 1.
 The legacy compiler is the precedent; the
@@ -238,13 +238,15 @@ does.
     six.
   - `CanonicalFamily` gains `ArithmeticFamily(ArithmeticTrait)`.
     `ArithmeticTrait` names the six traits once, and render spells each.
-  - `sole_abstract` and `default_member` take the expected member shape,
-    `(Self, Self) -> Bool`, `(Self, Self) -> Self` or `(Self) -> Self`, in
-    place of their Bool type.
+  - `sole_abstract`, `default_member` and `required_default` take the
+    expected member shape, `(Self, Self) -> Bool`, `(Self, Self) -> Self` or
+    `(Self) -> Self`, in place of their Self and Bool parameters.
   - `accept_trait_contracts` designates each canonical trait itself from
     `parsed` and `namespace`, rather than taking one positional option per
-    trait. Its test callers, `test/unit/input.brp` and
-    `test_check/test_trait_designation.brp`, change with it.
+    trait. Its one test caller, `test/unit/input.brp`, changes with it.
+  - Milestone 3 adds tests whose abstract member has the wrong parameters,
+    for Orderable and Equatable as well as the arithmetic traits, because
+    arity is what distinguishes the unary shape.
 - **Dispatch.** One `arithmetic_contract` selects the member and enters the
   existing checked trait-call path, as `comparison_contract` does; negation
   is a one-operand call. There is no new checked form, ownership rule or

@@ -148,9 +148,22 @@ private pure func canonical_header(row: TraitRow, method: TraitMethodId, parsed:
 	trait_method_header(written, parsed.declarations).to_result(checker_invariant(row.type_name.span, InvalidFunctionContract))
 
 
--- A canonical member compares two Self values and answers Bool.
-private pure func self_predicate(method: AcceptedTraitMethod, self: TypeRef, boolean_type: TypeRef) -> Bool:
-	and(method.signature.parameters.map(pure func(parameter): parameter.value_type) == [self, self], method.signature.return_type.value_type == boolean_type)
+-- The parameter and result types a canonical member must have. Each canonical
+-- trait builds its shapes from its own Self, so admission compares types and
+-- never a member's spelling.
+private record MemberShape {
+	parameters: List[TypeRef],
+	result: TypeRef
+}
+
+
+-- The shape of a member that compares two Self values and answers Bool.
+private pure func binary_predicate(self: TypeRef, boolean: DesignatedBoolean[VariantId]) -> MemberShape:
+	{ parameters = [self, self], result = NominalType(AggregateNominal(UnionAggregate(variant_owner(boolean.true_variant))), []) }
+
+
+private pure func has_shape(method: AcceptedTraitMethod, shape: MemberShape) -> Bool:
+	and(method.signature.parameters.map(pure func(parameter): parameter.value_type) == shape.parameters, method.signature.return_type.value_type == shape.result)
 
 
 -- A reserved member found by its spelling, with the name span diagnostics cite.
@@ -181,12 +194,12 @@ private pure func named_member(row: TraitRow, accepted: AcceptedTrait, parsed: P
 
 -- Ordinary method signatures have already succeeded. A canonical trait's sole
 -- abstract method is its one required member.
-private pure func sole_abstract(row: TraitRow, accepted: AcceptedTrait, parsed: ParsedContents, family: CanonicalFamily, word: NameId, self: TypeRef, boolean_type: TypeRef) -> Result[TraitMethodId, CheckError]:
+private pure func sole_abstract(row: TraitRow, accepted: AcceptedTrait, parsed: ParsedContents, family: CanonicalFamily, word: NameId, shape: MemberShape) -> Result[TraitMethodId, CheckError]:
 	match accepted.methods.filter(pure func(method): method.default_body.is_none()):
 		[method]:
 			match canonical_header(row, method.id, parsed):
 				Ok(header):
-					if and(header.function_name.id == word, self_predicate(method, self, boolean_type)):
+					if and(header.function_name.id == word, has_shape(method, shape)):
 						Ok(method.id)
 					else:
 						Err(trait_error(row.type_name.span, MalformedCanonicalTrait(family, row.id)))
@@ -195,12 +208,12 @@ private pure func sole_abstract(row: TraitRow, accepted: AcceptedTrait, parsed: 
 
 
 -- A reserved member other than the abstract one is either absent or a default.
-private pure func default_member(row: TraitRow, accepted: AcceptedTrait, parsed: ParsedContents, family: CanonicalFamily, word: NameId, self: TypeRef, boolean_type: TypeRef) -> Result[Option[TraitMethodId], CheckError]:
+private pure func default_member(row: TraitRow, accepted: AcceptedTrait, parsed: ParsedContents, family: CanonicalFamily, word: NameId, shape: MemberShape) -> Result[Option[TraitMethodId], CheckError]:
 	found ?= named_member(row, accepted, parsed, word)
 	match found:
 		None: Ok(None)
 		Some(member):
-			if and(member.method.default_body.is_some(), self_predicate(member.method, self, boolean_type)):
+			if and(member.method.default_body.is_some(), has_shape(member.method, shape)):
 				Ok(Some(member.method.id))
 			else:
 				Err(trait_error(member.span, MalformedCanonicalMember(family, word)))
@@ -215,28 +228,28 @@ private pure func accept_equality(row: TraitRow, accepted: AcceptedTrait, parsed
 		[first, ..._]: Err(trait_error(first.span, CanonicalEquatableSupertraits))
 		[]: Ok(void)
 	self: TypeRef = ParameterType(type_parameter_id(TraitDeclaration(row.id), 0))
-	boolean_type: TypeRef = NominalType(AggregateNominal(UnionAggregate(variant_owner(boolean.true_variant))), [])
+	shape = binary_predicate(self, boolean)
 	words = foundation_words(parsed.names)
-	equals ?= sole_abstract(row, accepted, parsed, EqualityFamily, words.equals_word, self, boolean_type)
-	not_equals ?= default_member(row, accepted, parsed, EqualityFamily, words.not_equals_word, self, boolean_type)
+	equals ?= sole_abstract(row, accepted, parsed, EqualityFamily, words.equals_word, shape)
+	not_equals ?= default_member(row, accepted, parsed, EqualityFamily, words.not_equals_word, shape)
 	Ok(canonical_equality(equals, not_equals))
 
 
 -- Every ordering operator calls its own member, so all three defaults are
 -- required; a missing one is reported at the trait's name.
-private pure func required_default(row: TraitRow, accepted: AcceptedTrait, parsed: ParsedContents, word: NameId, self: TypeRef, boolean_type: TypeRef) -> Result[TraitMethodId, CheckError]:
-	found ?= default_member(row, accepted, parsed, OrderingFamily, word, self, boolean_type)
+private pure func required_default(row: TraitRow, accepted: AcceptedTrait, parsed: ParsedContents, word: NameId, shape: MemberShape) -> Result[TraitMethodId, CheckError]:
+	found ?= default_member(row, accepted, parsed, OrderingFamily, word, shape)
 	found.to_result(trait_error(row.type_name.span, MalformedCanonicalMember(OrderingFamily, word)))
 
 
 private pure func accept_ordering(row: TraitRow, accepted: AcceptedTrait, parsed: ParsedContents, boolean: DesignatedBoolean[VariantId]) -> Result[CanonicalOrdering, CheckError]:
 	self: TypeRef = ParameterType(type_parameter_id(TraitDeclaration(row.id), 0))
-	boolean_type: TypeRef = NominalType(AggregateNominal(UnionAggregate(variant_owner(boolean.true_variant))), [])
+	shape = binary_predicate(self, boolean)
 	words = foundation_words(parsed.names)
-	less_than ?= sole_abstract(row, accepted, parsed, OrderingFamily, words.less_than_word, self, boolean_type)
-	greater_than ?= required_default(row, accepted, parsed, words.greater_than_word, self, boolean_type)
-	less_than_or_equal ?= required_default(row, accepted, parsed, words.less_than_or_equal_word, self, boolean_type)
-	greater_than_or_equal ?= required_default(row, accepted, parsed, words.greater_than_or_equal_word, self, boolean_type)
+	less_than ?= sole_abstract(row, accepted, parsed, OrderingFamily, words.less_than_word, shape)
+	greater_than ?= required_default(row, accepted, parsed, words.greater_than_word, shape)
+	less_than_or_equal ?= required_default(row, accepted, parsed, words.less_than_or_equal_word, shape)
+	greater_than_or_equal ?= required_default(row, accepted, parsed, words.greater_than_or_equal_word, shape)
 	Ok(canonical_ordering(less_than, greater_than, less_than_or_equal, greater_than_or_equal))
 
 
@@ -422,9 +435,10 @@ pure func accept_trait_contracts(
 	parsed: ParsedContents,
 	namespace: Namespace,
 	boolean: DesignatedBoolean[VariantId],
-	equality: Option[TraitId],
-	ordering: Option[TraitId],
 ) -> Result[AcceptedTraitContracts, CheckError]:
+	words = foundation_words(parsed.names)
+	equality = designated_trait(parsed, namespace, words.equatable_word)
+	ordering = designated_trait(parsed, namespace, words.orderable_word)
 	var accepted_equality: Option[CanonicalEquality] = None
 	var accepted_ordering: Option[CanonicalOrdering] = None
 	var declarations: List[AcceptedTrait] = []
