@@ -1,11 +1,18 @@
 #!/usr/bin/env python3
-"""Run benchmark samples and read the in-process BENCH timing marker."""
+"""Run benchmark samples and read the in-process BENCH timing marker.
+
+With --resource-stats PATH, every timed sample also runs under macOS
+`/usr/bin/time -l`, and PATH receives the minimum retired instructions and the
+maximum peak resident set size across those samples. Both cover the whole
+process, including startup, unlike the in-process BENCH time.
+"""
 
 from __future__ import annotations
 
 import re
 import subprocess
 import sys
+from dataclasses import dataclass
 
 
 EXPECTED_OUTPUTS = {
@@ -57,9 +64,29 @@ BENCH_RE = re.compile(
     r"^BENCH\s+.*(?:seconds=([0-9]+(?:\.[0-9]+)?)|microseconds=([0-9]+)|micros=([0-9]+))",
     re.M,
 )
+RESOURCE_TIMER = ["/usr/bin/time", "-l"]
+INSTRUCTIONS_RE = re.compile(r"^\s*(\d+)\s+instructions retired", re.M)
+PEAK_RSS_RE = re.compile(r"^\s*(\d+)\s+maximum resident set size", re.M)
 
 
-def run_once(name: str, command: list[str]) -> float:
+@dataclass(frozen=True)
+class ResourceUsage:
+    instructions: int
+    peak_rss_bytes: int
+
+
+def last_match(pattern: re.Pattern[str], text: str) -> re.Match[str] | None:
+    match = None
+    for candidate in pattern.finditer(text):
+        match = candidate
+    return match
+
+
+def run_once(
+    name: str, command: list[str], *, resource_stats: bool = False
+) -> tuple[float, ResourceUsage | None]:
+    if resource_stats:
+        command = [*RESOURCE_TIMER, *command]
     # Only capture rows with a small exact output contract; other rows can be large.
     expected_output = EXPECTED_OUTPUTS.get(name)
     proc = subprocess.run(
@@ -86,9 +113,7 @@ def run_once(name: str, command: list[str]) -> float:
         )
         raise SystemExit(125)
 
-    match = None
-    for candidate in BENCH_RE.finditer(proc.stderr):
-        match = candidate
+    match = last_match(BENCH_RE, proc.stderr)
     if match is None:
         sys.stderr.write("benchmark did not report a BENCH timing line\n")
         if proc.stderr:
@@ -97,13 +122,30 @@ def run_once(name: str, command: list[str]) -> float:
 
     seconds, microseconds, micros = match.groups()
     if seconds is not None:
-        return float(seconds)
-    if microseconds is not None:
-        return float(microseconds) / 1_000_000.0
-    return float(micros) / 1_000_000.0
+        elapsed = float(seconds)
+    elif microseconds is not None:
+        elapsed = float(microseconds) / 1_000_000.0
+    else:
+        elapsed = float(micros) / 1_000_000.0
+
+    if not resource_stats:
+        return elapsed, None
+    instructions = last_match(INSTRUCTIONS_RE, proc.stderr)
+    peak_rss = last_match(PEAK_RSS_RE, proc.stderr)
+    if instructions is None or peak_rss is None:
+        sys.stderr.write(
+            "resource stats need macOS /usr/bin/time -l to report "
+            "instructions retired and maximum resident set size\n"
+        )
+        raise SystemExit(125)
+    return elapsed, ResourceUsage(int(instructions.group(1)), int(peak_rss.group(1)))
 
 
 def main(arguments: list[str]) -> None:
+    resource_stats_path = None
+    if arguments[:1] == ["--resource-stats"]:
+        resource_stats_path = arguments[1]
+        arguments = arguments[2:]
     warmups = int(arguments[0])
     runs = int(arguments[1])
     name = arguments[2]
@@ -112,8 +154,19 @@ def main(arguments: list[str]) -> None:
     for _ in range(warmups):
         run_once(name, command)
 
-    samples = [run_once(name, command) for _ in range(runs)]
-    print(f"{min(samples):.4f}")
+    samples = [
+        run_once(name, command, resource_stats=resource_stats_path is not None)
+        for _ in range(runs)
+    ]
+    if resource_stats_path is not None:
+        # Retired instructions are nearly deterministic, so the minimum is the
+        # steadiest sample; peak RSS reports the largest footprint observed.
+        usages = [usage for _, usage in samples]
+        instructions = min(usage.instructions for usage in usages)
+        peak_rss_bytes = max(usage.peak_rss_bytes for usage in usages)
+        with open(resource_stats_path, "w", encoding="utf-8") as stats:
+            stats.write(f"instructions={instructions} peak_rss_bytes={peak_rss_bytes}\n")
+    print(f"{min(seconds for seconds, _ in samples):.4f}")
 
 
 if __name__ == "__main__":

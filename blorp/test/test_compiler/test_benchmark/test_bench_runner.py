@@ -96,11 +96,14 @@ class BenchmarkRunnerTests(unittest.TestCase):
         *,
         warmups: int = 0,
         runs: int = 1,
+        resource_stats: Path | None = None,
     ) -> subprocess.CompletedProcess[str]:
+        resource_arguments = [] if resource_stats is None else ["--resource-stats", str(resource_stats)]
         return subprocess.run(
             [
                 sys.executable,
                 str(RUNNER),
+                *resource_arguments,
                 str(warmups),
                 str(runs),
                 name,
@@ -231,6 +234,18 @@ class BenchmarkRunnerTests(unittest.TestCase):
             result = self.run_samples("binary_trees", script, counter)
             self.assertEqual(result.returncode, 125)
 
+    @unittest.skipUnless(sys.platform == "darwin", "resource stats read macOS /usr/bin/time -l")
+    def test_resource_stats_record_whole_process_counters_beside_bench_time(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_name:
+            script, counter = self.fake_benchmark(Path(temp_name), [FIB_OUTPUT] * 3)
+            stats = Path(temp_name) / "resource.txt"
+            result = self.run_samples("fib", script, counter, warmups=1, runs=2, resource_stats=stats)
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout, "0.1250\n")
+            self.assertEqual(counter.read_text(), "3")
+            self.assertRegex(stats.read_text(), r"^instructions=[1-9][0-9]* peak_rss_bytes=[1-9][0-9]*\n$")
+
     def test_compiler_checksums_keep_exact_whitespace(self) -> None:
         for name in ("compiler_ast", "compiler_emit"):
             output = EXPECTED_OUTPUTS[name].replace(" checksum:", "\tchecksum:")
@@ -290,7 +305,8 @@ else:
 ''')
         self.env = dict(os.environ, PYTHON=sys.executable, GO="missing-benchmark-go", OCAMLOPT="missing-benchmark-ocaml",
                         CC=str(self.cc), BLORP2_COMPILER=str(self.compiler), FAKE_LOG=str(self.log),
-                        BENCH_RUNS="1", BENCH_WARMUPS="0", BENCH_ALLOC_STATS="0", BENCH_VERBOSE="1")
+                        BENCH_RUNS="1", BENCH_WARMUPS="0", BENCH_ALLOC_STATS="0", BENCH_RESOURCE_STATS="0",
+                        BENCH_VERBOSE="1")
         self.env.pop("BLORP_LEAK_CHECK", None)
 
     def write_executable(self, path: Path, source: str) -> None:
@@ -406,6 +422,20 @@ output.write_text('/* fake generated C */\\n')
         self.assertEqual(len(self.calls("native")), 2)
         self.assertTrue(all(entry["diagnostics"] == 0 for entry in self.calls("native")))
         self.assertTrue(all("-DBLORP_MEMORY_DIAGNOSTICS=1" not in entry["args"] for entry in self.calls("cc")))
+
+    def test_resource_stats_are_opt_in(self) -> None:
+        result = self.run_benchmark()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertNotIn("instructions", result.stdout)
+
+    @unittest.skipUnless(sys.platform == "darwin", "resource stats read macOS /usr/bin/time -l")
+    def test_resource_stats_label_each_lane_and_compare_blorp_instructions(self) -> None:
+        result = self.run_benchmark(BENCH_RESOURCE_STATS="1")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        row = next(line for line in result.stdout.splitlines() if line.strip().startswith("fib "))
+        self.assertRegex(row, r"blorp: instructions=\d+ peak_rss_bytes=\d+, blorp2: instructions=\d+ peak_rss_bytes=\d+")
+        self.assertRegex(row, r"blorp2/blorp time: [0-9.]+x, blorp2/blorp instructions: [0-9.]+x")
+        self.assertEqual(len(self.calls("native")), 2)
 
     def test_provisional_blorp2_rows_label_the_comparison(self) -> None:
         for name in ("list_ops", "compiler_ast", "compiler_emit"):
