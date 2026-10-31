@@ -12,10 +12,8 @@ keys, before it is
 2/3 full, so a probe always ends at the key or at an empty slot. Like a List, a
 map is a value: updated in place when unique, copied on write when shared.
 
-`HashMap` is a plain record, so any importer can reach its fields: the host
-miscompiles unwrapping a generic opaque value (CF-030 in
-docs/COMPILER_FAULTS.md). Only this module builds or updates one. It becomes
-opaque once CF-030 is fixed, unless the dict replaces it first.
+`HashMap` is opaque: only this module builds, reads or updates one, so its
+keys, values and slots cannot disagree.
 ---
 import:
 	bool: not
@@ -37,15 +35,18 @@ private MINIMUM_SLOTS: Int = 8
 
 
 -- `values[i]` belongs to `keys[i]`. `slots[s]` is the position of the key whose
--- probe stops at s, or EMPTY_SLOT. A record declaration takes no bounds, so
--- the functions that create or search a map bound its key type. The
--- constructors' bound is the only check on what a map holds: importers can
--- still write this plain record directly (see CF-030 above).
-record HashMap[K, V] {
+-- probe stops at s, or EMPTY_SLOT.
+private record MapContents[K, V] {
 	keys: List[K],
 	values: List[V],
 	slots: List[Int]
 }
+
+
+-- A type declaration takes no bounds, so the functions that create or search
+-- a map bound its key type; the constructors' bound is the only check on what
+-- a map holds.
+opaque type HashMap[K, V] = MapContents[K, V]
 
 
 -- The fewest slots, doubling from MINIMUM_SLOTS, that hold `count` keys within
@@ -64,14 +65,14 @@ pure func empty_hash_map[K: Hashable + Equatable, V]() -> HashMap[K, V]:
 -- A map that holds `capacity` keys before its index grows.
 pure func hash_map_with_capacity[K: Hashable + Equatable, V](capacity: Int) -> HashMap[K, V]:
 	no_values: List[V] = []
-	{ keys = [], values = no_values, slots = repeat(EMPTY_SLOT, slot_count(capacity)) }
+	into_opaque HashMap({ keys = [], values = no_values, slots = repeat(EMPTY_SLOT, slot_count(capacity)) })
 
 
 -- The slot holding `key`, or the empty slot where it belongs. Host `get`
 -- returns an Option even in range: slots are remainders by the slot count and
 -- hold key positions, so the defaults are never read.
-private pure func probe[K: Hashable + Equatable, V](map: HashMap[K, V], key: K) -> Int:
-	size = map.slots.length()
+private pure func probe[K: Hashable + Equatable, V](contents: MapContents[K, V], key: K) -> Int:
+	size = contents.slots.length()
 	remainder = key.hash().remainder(size)
 	var slot = if remainder.less_than(0):
 		remainder.add(size)
@@ -79,7 +80,7 @@ private pure func probe[K: Hashable + Equatable, V](map: HashMap[K, V], key: K) 
 		remainder
 	var searching: Bool = True
 	while searching:
-		searching = match map.keys.get(map.slots.get_or(slot, EMPTY_SLOT)):
+		searching = match contents.keys.get(contents.slots.get_or(slot, EMPTY_SLOT)):
 			Some(found): found != key
 			None: False
 		if searching:
@@ -87,36 +88,39 @@ private pure func probe[K: Hashable + Equatable, V](map: HashMap[K, V], key: K) 
 	slot
 
 
--- `map` with a new index of `size` slots, filled in key order.
-private pure func reindexed[K: Hashable + Equatable, V](map: HashMap[K, V], size: Int) -> HashMap[K, V]:
-	var rebuilt: HashMap[K, V] = { map | slots = repeat(EMPTY_SLOT, size) }
+-- `contents` with a new index of `size` slots, filled in key order.
+private pure func reindexed[K: Hashable + Equatable, V](contents: MapContents[K, V], size: Int) -> MapContents[K, V]:
+	var rebuilt: MapContents[K, V] = { contents | slots = repeat(EMPTY_SLOT, size) }
 	var position = 0
-	for key in map.keys:
+	for key in contents.keys:
 		rebuilt = { rebuilt | slots = rebuilt.slots.set(probe(rebuilt, key), position) }
 		position = position.add(1)
 	rebuilt
 
 
 pure func get[K: Hashable + Equatable, V](map: HashMap[K, V], key: K) -> Option[V]:
-	map.values.get(map.slots.get_or(probe(map, key), EMPTY_SLOT))
+	contents: MapContents[K, V] = from_opaque HashMap(map)
+	contents.values.get(contents.slots.get_or(probe(contents, key), EMPTY_SLOT))
 
 
 -- Inserts `key` at the end of the order, or replaces its value in place. The
--- appending path builds a new record: one allocation, where an update of `map`
+-- appending path builds a new record: one allocation, where a record update
 -- there makes the host copy all three lists.
 pure func set[K: Hashable + Equatable, V](map: HashMap[K, V], key: K, value: V) -> HashMap[K, V]:
-	slot = probe(map, key)
-	position = map.slots.get_or(slot, EMPTY_SLOT)
-	count = map.keys.length().add(1)
-	size = map.slots.length()
-	if position != EMPTY_SLOT:
-		{ map | values = map.values.set(position, value) }
+	contents: MapContents[K, V] = from_opaque HashMap(map)
+	slot = probe(contents, key)
+	position = contents.slots.get_or(slot, EMPTY_SLOT)
+	count = contents.keys.length().add(1)
+	size = contents.slots.length()
+	updated: MapContents[K, V] = if position != EMPTY_SLOT:
+		{ contents | values = contents.values.set(position, value) }
 	else if count.multiply(LOAD_DENOMINATOR).greater_than(size.multiply(LOAD_NUMERATOR)):
-		reindexed({ map | keys = map.keys.append(key), values = map.values.append(value) }, size.multiply(2))
+		reindexed({ contents | keys = contents.keys.append(key), values = contents.values.append(value) }, size.multiply(2))
 	else:
-		{ keys = map.keys.append(key), values = map.values.append(value), slots = map.slots.set(slot, map.keys.length()) }
+		{ keys = contents.keys.append(key), values = contents.values.append(value), slots = contents.slots.set(slot, contents.keys.length()) }
+	into_opaque HashMap(updated)
 
 
 -- Every value, in its key's insertion order.
 pure func values[K, V](map: HashMap[K, V]) -> List[V]:
-	map.values
+	from_opaque HashMap(map).values
