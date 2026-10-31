@@ -341,11 +341,6 @@ pure func check_execution(
 				Err(recursion_error(annotation, GenericTailRecursionUnsupported))
 
 
-private union DependencyOrigin:
-	OrdinaryDependency
-	TraitDependency
-
-
 -- A slot identifies an actual semantic constructor and ordered child. These
 -- are never declaration-number-only symbols or physical layout identities.
 private union ConstructorSlot:
@@ -364,7 +359,7 @@ private record ParameterDependency {
 	source: TypeParameterId,
 	target: TypeParameterId,
 	operations: List[ConstructorOperation],
-	origin: DependencyOrigin,
+	trait_derived: Bool,
 	automatic: List[AggregateId],
 	span: Span
 }
@@ -373,12 +368,12 @@ private record ParameterDependency {
 private pure func append_dependencies(
 	dependencies: List[ParameterDependency], argument: TypeRef,
 	target: TypeParameterId, operations: List[ConstructorOperation],
-	origin: DependencyOrigin, automatic: List[AggregateId], span: Span,
+	trait_derived: Bool, automatic: List[AggregateId], span: Span,
 ) -> List[ParameterDependency]:
 	var collected = dependencies
 	match argument:
 		ParameterType(source):
-			collected = collected.append({ source = source, target = target, operations = operations, origin = origin, automatic = automatic, span = span })
+			collected = collected.append({ source = source, target = target, operations = operations, trait_derived = trait_derived, automatic = automatic, span = span })
 		_:
 			children: List[TypeRef] = match argument:
 				CallableType(_, parameters, result): parameters.append(result)
@@ -398,7 +393,7 @@ private pure func append_dependencies(
 					Some(constructor):
 						-- A top-first written path is pushed inside-out.
 						push: ConstructorOperation = PushConstructor(constructor)
-						collected = append_dependencies(collected, child, target, [push].concat(operations), origin, automatic, span)
+						collected = append_dependencies(collected, child, target, [push].concat(operations), trait_derived, automatic, span)
 					None: void
 				position = position.add(1)
 	collected
@@ -432,10 +427,7 @@ private pure func parameter_reaches(
 
 		for current in frontier:
 			for dependency in dependencies:
-				ordinary: Bool = match dependency.origin:
-					OrdinaryDependency: True
-					TraitDependency: False
-				unreached_dependency: Bool = match and(ordinary, dependency.source == current):
+				unreached_dependency: Bool = match and(dependency.trait_derived.not(), dependency.source == current):
 					True: contains_parameter_id(reached, dependency.target).not()
 					False: False
 
@@ -493,8 +485,8 @@ private pure func append_method_dependencies(
 			var position = 0
 			for argument in selected.arguments:
 				match selected.body:
-					DeclaredBody(function): dependencies = append_dependencies(dependencies, argument, type_parameter_id(FunctionDeclaration(function), position), [], TraitDependency, origins, span)
-					DerivedEqualityBody(aggregate): dependencies = append_dependencies(dependencies, argument, type_parameter_id(aggregate_owner(aggregate), position), [], TraitDependency, origins, span)
+					DeclaredBody(function): dependencies = append_dependencies(dependencies, argument, type_parameter_id(FunctionDeclaration(function), position), [], True, origins, span)
+					DerivedEqualityBody(aggregate): dependencies = append_dependencies(dependencies, argument, type_parameter_id(aggregate_owner(aggregate), position), [], True, origins, span)
 					LambdaBody(_): void
 				position = position.add(1)
 		None:
@@ -509,13 +501,13 @@ private pure func append_method_dependencies(
 										Some(slot):
 											pop: ConstructorOperation = PopConstructor(slot)
 											match member.body:
-												AuthoredMethod(function): dependencies = append_dependencies(dependencies, method_receiver(method), type_parameter_id(FunctionDeclaration(function), position), [pop], TraitDependency, origins, span)
-												StructuralEquality(aggregate, _): dependencies = append_dependencies(dependencies, method_receiver(method), type_parameter_id(aggregate_owner(aggregate), position), [pop], TraitDependency, origins, span)
+												AuthoredMethod(function): dependencies = append_dependencies(dependencies, method_receiver(method), type_parameter_id(FunctionDeclaration(function), position), [pop], True, origins, span)
+												StructuralEquality(aggregate, _): dependencies = append_dependencies(dependencies, method_receiver(method), type_parameter_id(aggregate_owner(aggregate), position), [pop], True, origins, span)
 												TraitDefault(function):
 													-- Keep the complete Self, including phantom arguments,
 													-- but only after matching this exact head/slot.
 													push: ConstructorOperation = PushConstructor(slot)
-													dependencies = append_dependencies(dependencies, method_receiver(method), type_parameter_id(FunctionDeclaration(function), 0), [pop, push], TraitDependency, origins, span)
+													dependencies = append_dependencies(dependencies, method_receiver(method), type_parameter_id(FunctionDeclaration(function), 0), [pop, push], True, origins, span)
 										None: void
 				_: void
 	dependencies
@@ -528,7 +520,7 @@ private pure func append_named_dependencies(
 	var dependencies = previous
 	var position = 0
 	for value in types:
-		dependencies = append_dependencies(dependencies, value, type_parameter_id(FunctionDeclaration(id), position), [], OrdinaryDependency, automatic, span)
+		dependencies = append_dependencies(dependencies, value, type_parameter_id(FunctionDeclaration(id), position), [], False, automatic, span)
 		position = position.add(1)
 	dependencies
 
@@ -595,7 +587,7 @@ private pure func same_constructor_slot(left: ConstructorSlot, right: Constructo
 
 private record IssuedDependency {
 	path: InstantiationPath,
-	origin: DependencyOrigin,
+	trait_derived: Bool,
 	automatic: List[AggregateId],
 	span: Span
 }
@@ -631,7 +623,7 @@ private pure func dependency_graph(dependencies: List[ParameterDependency]) -> D
 		var source = parameter_index(parameters, dependency.source)
 		target = parameter_index(parameters, dependency.target)
 		if dependency.operations.is_empty():
-			edges = edges.append({ path = { source = source, target = target, operation = KeepPath }, origin = dependency.origin, automatic = dependency.automatic, span = dependency.span })
+			edges = edges.append({ path = { source = source, target = target, operation = KeepPath }, trait_derived = dependency.trait_derived, automatic = dependency.automatic, span = dependency.span })
 		else:
 			var position = 0
 			for written in dependency.operations:
@@ -653,7 +645,7 @@ private pure func dependency_graph(dependencies: List[ParameterDependency]) -> D
 				if position.less_than(dependency.operations.length()):
 					next_control = controls
 					controls = controls.add(1)
-				edges = edges.append({ path = { source = source, target = next_control, operation = operation }, origin = dependency.origin, automatic = dependency.automatic, span = dependency.span })
+				edges = edges.append({ path = { source = source, target = next_control, operation = operation }, trait_derived = dependency.trait_derived, automatic = dependency.automatic, span = dependency.span })
 				source = next_control
 	{ controls = controls, edges = edges }
 
@@ -666,23 +658,16 @@ private pure func bound_dependencies(graph: DependencyGraph) -> Result[PathBound
 private pure func validate_base_dependencies(dependencies: List[ParameterDependency]) -> Result[Void, CheckError]:
 	var growing: Option[Span] = None
 	for dependency in dependencies:
-		match dependency.origin:
-			OrdinaryDependency:
-				-- Ordinary substitutions contain only pushes, so a nonempty
-				-- word is exactly the original positive-growth condition.
-				if and(dependency.operations.is_empty().not(), parameter_reaches(dependency.target, dependency.source, dependencies)):
-					growing = Some(dependency.span)
-					break
-			TraitDependency: void
+		-- Ordinary substitutions contain only pushes, so a nonempty
+		-- word is exactly the original positive-growth condition.
+		if and(dependency.trait_derived.not(), and(dependency.operations.is_empty().not(), parameter_reaches(dependency.target, dependency.source, dependencies))):
+			growing = Some(dependency.span)
+			break
 	_: Void ?= match growing:
 		Some(span): Err(recursion_error(span, GrowingRecursiveInstantiation))
 		None: Ok(void)
 	-- Trait-free inputs need only the existing ordinary check, not closure.
-	if dependencies.any(pure func(dependency) -> Bool:
-		match dependency.origin:
-			TraitDependency: True
-			OrdinaryDependency: False
-	):
+	if dependencies.any(pure func(dependency) -> Bool: dependency.trait_derived):
 		graph = dependency_graph(dependencies)
 		match bound_dependencies(graph):
 			Err(error): Err(error)
@@ -692,10 +677,7 @@ private pure func validate_base_dependencies(dependencies: List[ParameterDepende
 				var position = 0
 				for edge in graph.edges:
 					edge_position = position
-					trait_edge: Bool = match edge.origin:
-						TraitDependency: True
-						OrdinaryDependency: False
-					if and(trait_edge, marked.any(pure func(found): found == edge_position)):
+					if and(edge.trait_derived, marked.any(pure func(found): found == edge_position)):
 						failure = Some(edge.span)
 						break
 					position = position.add(1)
