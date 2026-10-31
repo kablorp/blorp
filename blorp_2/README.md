@@ -106,8 +106,8 @@ Point equality and define its own Tagged implementation, which compares only tag
 import:
     int as IntOps
 
-fixed record Point { value: Int }
-fixed record Tagged { tag: Int, detail: Int }
+record Point { value: Int }
+record Tagged { tag: Int, detail: Int }
 
 implements Equatable for Tagged:
     pure func equals(left: Self, right: Self) -> Bool:
@@ -214,7 +214,7 @@ trait Ordered: Equatable:
 
 trait Ring: Addable + Multipliable
 
-fixed record Version { major: Int, minor: Int }
+record Version { major: Int, minor: Int }
 
 implements Ordered for Version:
     pure func before(left: Self, right: Self) -> Bool:
@@ -354,7 +354,7 @@ ordinary type/methods route. An unrelated trait spelled `Equatable` does
 not enable automatic equality.
 
 ```blorp
-fixed record Point { x: Int, y: Int }
+record Point { x: Int, y: Int }
 union Reply:
     Empty
     Value(Point)
@@ -873,7 +873,8 @@ At that increment the 40-million instruction limit was unchanged. Removing redun
 type copies and temporary traversal lists reduced the initial overhead; further
 special cases to recover the remaining 41 allocations are not justified.
 
-The fixed-record validation deliberately raises only the `union_values`
+The 2026-10-10 validation of finite records, then spelled `fixed record`
+without checked rules, deliberately raises only the `union_values`
 instruction ceiling from 40M to 45M after coordinator and independent review.
 The first full gate used 40,111,881 instructions (3,668/4,000 allocations).
 Historical cleanup baseline/final measurements already used 40,031,543 and
@@ -1153,7 +1154,7 @@ Name, arity, type and purity errors are checked first.
 
 Annotated functions must be nongeneric and contain a direct self call. Their
 concrete parameters, result and every evaluated intermediate must be unmanaged,
-even an unused String initializer. Int, supported fixed records and unions
+even an unused String initializer. Int, inline records and unmanaged unions
 are allowed; an unmanaged phantom `Marker[String]` carries no String value.
 A helper's internal managed values are allowed when the annotated caller sees
 only unmanaged values. Zero-argument helpers and `main` may be annotated, with
@@ -1343,7 +1344,7 @@ generic union such as `Maybe` applied to a recursive type. The
 [tree example](test/e2e/fixtures/recursive/tree.brp) walks and releases one:
 
 ```blorp
-fixed record Expr { form: Form, span: Int }
+record Expr { form: Form, span: Int }
 union Form:
     Leaf(Int)
     Call(String, List[Expr])
@@ -1383,11 +1384,13 @@ full depth table and the nesting the pilot's own source reaches.
 
 ## Finite mixed records
 
-Fixed records can contain any currently supported finite concrete type, including
-Float, String, Void, List[E] for any supported finite E, other records and instantiated unions:
+A plain `record` can contain any currently supported finite concrete type,
+including Float, String, Void, List[E] for any supported finite E, other records
+and instantiated unions. A `fixed record` is limited to the fixed rules in
+[Grammar for this increment](#grammar-for-this-increment):
 
 ```blorp
-fixed record Entry { count: Int, ratio: Float, text: String }
+record Entry { count: Int, ratio: Float, text: String }
 pure func make_entry() -> Entry:
     { count = 7, ratio = 2.5, text = 42.to_string() }
 pure func escaped_text(value: Entry) -> String:
@@ -1403,9 +1406,9 @@ A parameter borrows unless its function owns it (see
 [owned parameters](#owned-parameters)); managed results return owned. Field
 expressions execute once in written order, independently of declaration order.
 
-Fixed records whose fields are Int, Float or recursively eligible inline fixed
-records stay inline. Other fixed records use an ARC root, including a record
-whose Void or unmanaged-union fields need no child cleanup. Root retention
+Records whose fields are Int, Float, inline records or fixed unions stay
+inline, and a fixed record always does. Other records use an ARC root,
+including a record whose Void or ordinary-union fields need no child cleanup. Root retention
 changes only the root count. Final root release destroys every owned stored
 occurrence; inline owning union fields drop their active payload paths.
 Acquired managed projections remain valid after their parent is destroyed.
@@ -1511,7 +1514,7 @@ import:
     list: repeat
     int: to_string
     io: print
-fixed record Entry { number: Int, text: String, values: List[Int] }
+record Entry { number: Int, text: String, values: List[Int] }
 pure func make_entry(number: Int) -> Entry:
     { number = number, text = number.to_string(), values = repeat(number, 2) }
 pure func replace_text(value: Entry) -> Entry:
@@ -1608,7 +1611,7 @@ generic instances. Purity is checked at calls; specialization does not inspect i
 
 This specification defines only the examples' language: functions with an optional
 return annotation (omission means `Void`), an ordered list of explicitly typed parameters, an optional ordered list of type
-parameters on functions, unions and fixed records with
+parameters on functions, unions and records with
 one or more finite fields after substitution. Union variants have zero or more ordered fields using ordinary type annotations; concrete fields
 specialize to Int, Float, String, Void, a List of any supported finite type, a finite record, or another finite inline union. A function
 body has zero or more ordered binding or Void expression statements followed
@@ -1699,7 +1702,7 @@ pure func offset(value: Int, amount: Int) -> Int:
 `offset(40, 2)` returns 42.
 
 ```blorp
-fixed record Operation {
+record Operation {
     run: () -> Int
 }
 
@@ -1843,17 +1846,8 @@ Lexical and layout rules:
   are unsupported; argument types and known expected results constrain the type
   parameters.
 - `union Type:` introduces one or more variants on indented
-  lines. `fixed union Type:` promises inline storage with no counted child, and
-  checking enforces it: no type parameters; every payload is Int, Float, Void,
-  another `fixed union`, a record of numbers (every field, at the record's
-  arguments, Int, Float or such a record) or an opaque type over one of these;
-  and no fixed union contains itself, directly or through other fixed unions.
-  The record rule is structural: it follows today's record layout and accepts
-  a plain `record`, so it must be reconciled with the fixed-record rules once
-  those are checked.
-  An ordinary payload-free union is not a fixed payload, even though it is
-  stored inline today; the promise must be declared, as the base declares
-  `fixed union Bool:`. `fixed` is a contextual header word and remains a valid
+  lines. `fixed union Type:` promises inline storage under the fixed rules
+  below. `fixed` is a contextual header word and remains a valid
   name elsewhere; `union` is reserved. A variant is bare or declares an ordered
   list of field types, as in
   `Number(Int)`, `Box(T)` or `Pair(String, String)`. A union may declare ordered
@@ -1863,13 +1857,21 @@ Lexical and layout rules:
   Empty declaration parentheses remain unsupported. Concrete field layouts may
   contain Int, Float, String, Void, Lists of supported finite types, finite inline unions or records.
 - `record Pair { first: Int, second: Int }` declares a nominal record;
-  its braces may span lines. `fixed record` will promise stack storage under
-  the `fixed` rules in [grammar.ebnf](grammar.ebnf); those rules are not
-  checked yet, so it currently declares the same record. Field names must be distinct and have supported finite concrete
+  its braces may span lines. `fixed record` promises inline storage under the
+  fixed rules below. Field names must be distinct and have supported finite concrete
   types after specialization. `record Box[T] { value: T }` declares ordered
   type parameters; their identity belongs to this record. `record` is
   reserved. Empty and recursive records remain unsupported. Representation follows the
   inline-versus-managed field policy described above.
+- `fixed record` and `fixed union` promise inline storage with no counted
+  child, and checking enforces the same rules for both. A fixed type declares
+  no type parameters; the parser rejects the list. Every field of a fixed
+  record is Int, Float, a `fixed record`, a `fixed union` or an opaque type
+  over one of these, and every payload of a fixed union is one of those or
+  Void. An ordinary record or union is not accepted even when it is stored
+  inline today: the promise must be declared, as the base declares
+  `fixed union Bool:`, so that editing one type cannot break another. No fixed
+  type contains itself, directly or through other fixed types.
 - `{ second = 9, first = 7 }` constructs the nominal record required by a
   helper return type, receiving parameter or existing binding reassignment.
   Every field appears exactly once. Expressions evaluate in written order;
@@ -2634,7 +2636,7 @@ For example, a managed record can escape after its containing List is retired:
 ```blorp
 import:
     list: repeat, get
-fixed record Entry { number: Int, text: String }
+record Entry { number: Int, text: String }
 pure func make_entry() -> Entry:
     { number = 7, text = "kept" }
 pure func selected_entry() -> Option[Entry]:
@@ -2882,7 +2884,7 @@ The native model is binary64 with subnormals, ordinary arithmetic without fast
 math or contraction, C startup locale and nearest/ties-even rounding. Generated code
 checks representation requirements; target programs cannot change locale or
 rounding in this subset. Float remains unmanaged in parameters, locals and
-ordinary union fields and fixed-record fields.
+union and record fields.
 
 Generated C disables contraction with GCC's `fp-contract=off` optimization
 pragma or Clang's standard `STDC FP_CONTRACT OFF` pragma. The policy remains
@@ -3264,10 +3266,10 @@ end-to-end cost. Self-compilation is a later milestone.
 
 The [roadmap](ROADMAP.md) records upcoming language and memory responsibilities,
 including the limits of current verification and required per-phase tests.
-Fixed records support finite mixed fields, construction and field reads. The
+Records support finite mixed fields, construction and field reads. The
 [Pair example](test/e2e/fixtures/record/basic.brp) returns 7 with empty streams;
-the generated record is a C struct passed by value without heap allocation or
-reference counting. The [aggregate composition roadmap](ROADMAP.md#status-and-order)
+its record holds only Ints, so the generated record is a C struct passed by
+value without heap allocation or reference counting. The [aggregate composition roadmap](ROADMAP.md#status-and-order)
 tracks accepted mixed/generic records and plans general collections and recursive
 data. Those later increments are not implemented here; correctness comes before
 memory optimization.
