@@ -15,6 +15,7 @@ import:
 		ConcreteBinding,
 		ConcreteBody(ConcreteValueBody, ConcreteMatchBody),
 		CallTarget,
+		ConcreteCall,
 		ConcreteExit(ReturnExpression, RecurWith),
 		ConcreteExpr,
 		ConcreteForm(
@@ -734,11 +735,9 @@ private pure func lower_value(
 		InvokeCallable(callee, arguments):
 			lower_invocation(builder, bindings, base_projections, callee, arguments, binding_facts, value.value_type, value.span)
 		InvokeFunction(call, arguments):
-			match lower_arguments(builder, bindings, base_projections, arguments, binding_facts):
-				Ok(children):
-					-- A call's definition is anchored at its callee, not at the whole occurrence.
-					Ok(define_value(children.builder, CallValue(call.target, children.values), value.value_type, call.span))
-				Err(error): Err(error)
+			match chained_argument(arguments):
+				Some(first): lower_call_chain(builder, bindings, base_projections, value, call, arguments, first, binding_facts)
+				None: lower_call(builder, bindings, base_projections, value, call, arguments, None, binding_facts)
 		ReadRecordField(receiver, field):
 			match lower_value(builder, bindings, base_projections, receiver, binding_facts):
 				Ok(read):
@@ -749,6 +748,86 @@ private pure func lower_value(
 		Match(join):
 			lower_join_value(builder, bindings, join, value.value_type, value.span, binding_facts, None)
 				.map(pure func(result) -> BuiltValue: { builder = result.builder, value = result.value })
+
+
+-- A call and the value it forms: one link of a left-nested chain of calls,
+-- such as a long `+` sum, which lowering walks in a loop rather than
+-- recursing once per link.
+private record CallLink {
+	value: ConcreteExpr,
+	call: ConcreteCall,
+	arguments: List[ConcreteExpr]
+}
+
+
+-- The link a call's first argument forms when that argument is itself a call.
+private pure func chained_argument(arguments: List[ConcreteExpr]) -> Option[CallLink]:
+	match arguments:
+		[first, ..._]:
+			match first.form:
+				InvokeFunction(call, inner): Some({ value = first, call = call, arguments = inner })
+				_: None
+		[]: None
+
+
+-- A chain lowers from its innermost link outward, each link taking the value
+-- the link below defined as its first argument, so lowering's stack does not
+-- grow with the chain. Definitions keep evaluation order: a first argument
+-- completes before the rest.
+private pure func lower_call_chain(
+	builder: ExpressionBuilder,
+	bindings: List[Option[ValueId]],
+	base_projections: List[BaseProjection],
+	value: ConcreteExpr,
+	call: ConcreteCall,
+	arguments: List[ConcreteExpr],
+	first: CallLink,
+	binding_facts: List[ConcreteBinding],
+) -> Result[BuiltValue, Diagnostic]:
+	-- The links between `value` and the innermost one, outermost first.
+	var links: List[CallLink] = []
+	var innermost = first
+	while True:
+		match chained_argument(innermost.arguments):
+			None: break
+			Some(next):
+				links = links.append(innermost)
+				innermost = next
+	var current = lower_call(builder, bindings, base_projections, innermost.value, innermost.call, innermost.arguments, None, binding_facts)
+	var position = links.length()
+	while and(position.greater_than(0), current.is_ok()):
+		position = position.subtract(1)
+		current = match links.get(position):
+			Some(link): current.and_then(pure func(below): lower_call(below.builder, bindings, base_projections, link.value, link.call, link.arguments, Some(below.value), binding_facts))
+			None: Err(internal_error(value.span, "call chain link is missing"))
+	match current:
+		Ok(below): lower_call(below.builder, bindings, base_projections, value, call, arguments, Some(below.value), binding_facts)
+		Err(error): Err(error)
+
+
+-- `first` is the value of the call's first argument when the chain loop has
+-- already lowered it.
+private pure func lower_call(
+	builder: ExpressionBuilder,
+	bindings: List[Option[ValueId]],
+	base_projections: List[BaseProjection],
+	value: ConcreteExpr,
+	call: ConcreteCall,
+	arguments: List[ConcreteExpr],
+	first: Option[ValueId],
+	binding_facts: List[ConcreteBinding],
+) -> Result[BuiltValue, Diagnostic]:
+	remaining = match first:
+		Some(_): arguments.drop(1)
+		None: arguments
+	match lower_arguments(builder, bindings, base_projections, remaining, binding_facts):
+		Ok(children):
+			values = match first:
+				Some(lowered): [lowered].concat(children.values)
+				None: children.values
+			-- A call's definition is anchored at its callee, not at the whole occurrence.
+			Ok(define_value(children.builder, CallValue(call.target, values), value.value_type, call.span))
+		Err(error): Err(error)
 
 
 private pure func lower_invocation(

@@ -373,10 +373,68 @@ written implementation; without one, an operator reports
 default bodies; a missing or malformed member is rejected where the trait is
 admitted, even when no operator uses it.
 
-`->` is lexed before `>`, and `a<-1` compares with the literal `-1`. `=>`, `=<`
-and `<>` are rejected with help naming `>=` or a lambda, `<=`, and `!=`. The
-pinned seed predates these operators, so compiler and library source still
-write ordering as calls such as `less_than` until the seed is rotated.
+`->` is lexed before `>`, and `a<-1` compares with `-1`, a minus folded into
+the literal. `=>`, `=<` and `<>` are rejected with help naming `>=` or a
+lambda, `<=`, and `!=`. The pinned seed predates these operators, so compiler
+and library source still write ordering as calls such as `less_than` until the
+seed is rotated.
+
+## Arithmetic operators
+
+Each arithmetic symbol calls the one member of its own trait, selected by the
+configured prelude:
+
+| Syntax | Trait | Selected member |
+| --- | --- | --- |
+| `a + b` | `Addable` | `add(left: Self, right: Self) -> Self` |
+| `a - b` | `Subtractable` | `subtract(left: Self, right: Self) -> Self` |
+| `a * b` | `Multipliable` | `multiply(left: Self, right: Self) -> Self` |
+| `a / b` | `Divisible` | `divide(left: Self, right: Self) -> Self` |
+| `a % b` | `Modulable` | `remainder(left: Self, right: Self) -> Self` |
+| `-a` | `Negatable` | `negate(value: Self) -> Self` |
+
+```blorp
+pure func average(total: Int, count: Int) -> Int:
+    total / count
+
+pure func sum[Value: Addable](left: Value, right: Value) -> Value:
+    left + right
+```
+
+The rules are those of the [ordering operators](#ordering-operators): the
+prelude's binding selects each trait, so a user trait or function spelled
+`Addable` or `add` cannot redirect `+`; each operator calls its own member, so
+`a - b` is never `a + -b`; both operands of a binary operator share `Self`, the
+result is `Self`, and operands evaluate once, left then right. There are no
+checked operators: Int `+`, `-`, `*` and negation wrap at the signed 64-bit
+limits, `/` truncates toward zero and `%` takes the dividend's sign, and
+division or remainder by zero gives 0 (`0.0` for Float). `INT_MIN / -1` is
+`INT_MIN` and `INT_MIN % -1` is 0. `"a" + "b"` concatenates through String's
+Addable implementation. Arithmetic is never derived and never converts: `1 + 2.0`
+is a type mismatch, and a String joined to another type with `+` teaches
+interpolation.
+
+`* / %` bind above `+ -`, both associate left, and prefix `-` binds below
+postfix calls and above `*`: `-x.abs()` is `-(x.abs())` and `-2 * 3` is
+`(-2) * 3`. All of them bind above ranges and comparisons, so `0..n-1` ends
+at `n - 1` and `a + b < c` compares the sum. `not` cannot be an operand of an
+arithmetic operator without parentheses. As for comparisons, a newline after
+an operator ends the expression; wrap a long expression in parentheses.
+
+Spacing never matters: `a-1`, `a -1` and `a - 1` are the same subtraction.
+A prefix minus applied directly to a numeric literal folds into one negative
+literal, so `-9223372036854775808` is in range and `-0.0` is negative zero; a
+constant initializer may be such a literal but rejects other operators. A
+folded literal followed by a postfix operation, such as `-2.abs()`, is rejected
+with help to write `(-2).abs()` or `-(2.abs())`. There is no prefix `+`.
+`a--1` is rejected rather than read as `a` and a comment; write `a - -1`.
+`+=`, `-=`, `*=`, `%=` and `/=` are not supported yet, and `**` and `//` are
+not operators; each is rejected with a teaching message.
+
+A canonical arithmetic trait must keep its member as its sole abstract method,
+pure and with its row's signature; defaults and supertraits beside it are
+admitted. The pinned seed predates these operators, so compiler and library
+source still write arithmetic as calls such as `add` until the seed is rotated.
 
 ## Automatic equality for named aggregates
 
@@ -1672,7 +1730,8 @@ indented chain every line starts with `.`, and an `if`, `while`, `for` or
 `match` header may not hold an indented chain.
 `low..high` is a range of two such operands; `not a`, `a and b` and `a or b`
 combine them with the precedence `or` below `and` below `not` below
-the comparisons `==`, `!=`, `<`, `>`, `<=` and `>=` below `..`; `and`/`or`
+the comparisons `==`, `!=`, `<`, `>`, `<=` and `>=` below `..` below
+`+ -` below `* / %` below prefix `-`; `and`/`or` and the arithmetic levels
 associate left and comparisons do not chain. A line break after `and` or `or` is
 accepted only inside brackets; the host also accepts it bare, which is a
 follow-up. `if condition:` opens an indented block, optionally followed by
@@ -1804,9 +1863,9 @@ are not exported; a bare alias is not a value, and `Alias.function` without
 a call is rejected.
 Arguments use the same expression grammar, so direct and receiver calls may nest.
 No other declarations, expressions, literals, or statements are supported.
-Single-line comments begin with `--`; a line holding only `---` at column 1
-opens a documentation block that the next such line closes, and the block is
-trivia.
+Single-line comments begin with `--`, except directly after a value; a line
+holding only `---` at column 1 opens a documentation block that the next such
+line closes, and the block is trivia.
 
 [`grammar.ebnf`](grammar.ebnf) defines the complete restricted source grammar
 and its EBNF dialect. Whitespace is explicit: LF is `"\n"`, TAB is `"\t"`, and
@@ -1835,7 +1894,9 @@ Lexical and layout rules:
   incidental indentation has no layout meaning. Real code lines require LF
   separation; the final line may end at EOF.
 - `--` begins a comment anywhere outside a quoted String or builtin label and consumes
-  bytes up to LF or EOF. Inline comments preserve the code line's newline;
+  bytes up to LF or EOF, except directly after a name, a literal, `void`, `)`,
+  `]` or `}`, where it is rejected so that `a--1` cannot silently read as `a`. After
+  `(`, `[`, `,`, an operator or a space it is a comment. Inline comments preserve the code line's newline;
   comments cannot continue expressions across lines, except inside an open
   bracket, where the comment and the line break are trivia. Comments permit
   ASCII bytes, including tabs; CR and non-ASCII bytes are rejected at their
@@ -2004,10 +2065,11 @@ Lexical and layout rules:
   arguments and annotations are unsupported. An arm block may end with a
   nested match, a join whose value the arm returns or yields.
 - Integer literals are decimal values from `-9223372036854775808` through
-  `9223372036854775807`, with an optional adjacent minus. `-0` is accepted
-  and has value zero. Leading zeros (`00`, `-01`), leading numeric plus,
-  separated minus signs and arithmetic operators are rejected. The `+` token
-  separates trait bounds; it does not enable arithmetic. The lexer preserves the whole
+  `9223372036854775807`. The lexer never attaches a sign: the parser folds a
+  prefix minus applied directly to a literal, with or without a space, into
+  one negative literal, so its range check sees the sign. `-0` is accepted
+  and has value zero. Leading zeros (`00`, `-01`) and a prefix `+` are
+  rejected. The `+` token also separates trait bounds. The lexer preserves the whole
   digit run; the parser validates spelling and range before converting it.
   A dot followed by a function name starts UFCS: `42.identity()` is a call;
   `42.5` is a Float literal.
@@ -2355,8 +2417,9 @@ func main() -> Int:
     add(20, 22)
 ```
 
-It exits 42. `20.add(22)` uses the same member through UFCS. Int addition
-wraps at the signed 64-bit limits. Arithmetic operators remain unsupported.
+It exits 42. `20.add(22)` and `20 + 22` use the same member, through UFCS and
+the [arithmetic operators](#arithmetic-operators). Int addition wraps at the
+signed 64-bit limits.
 [Concrete authored traits](#concrete-traits) provide equality in the production
 library. `_base` declares one single-method trait per arithmetic operation:
 `Addable.add`, `Subtractable.subtract`, `Multipliable.multiply`,
@@ -2867,7 +2930,8 @@ integrated compiler shell uses this interface; full compiler acceptance remains 
 
 The designated foundation `_base.brp` owns `Float`, a binary64 unmanaged value. Decimal source
 literals require a decimal point with digits on both sides, an exponent, or
-both: `6.5`, `1e2`, `-0.0`, `2.5e-3`. Leading plus, leading-zero integer parts,
+both: `6.5`, `1e2`, `-0.0`, `2.5e-3`, where a leading minus folds into the
+literal and the exponent's sign stays inside it. Prefix plus, leading-zero integer parts,
 `.5`, `1.`, hexadecimal literals and separators are rejected. Source literals
 must round to a finite Float; subnormals and underflow to signed zero are
 accepted. Integer literals retain Int type; there is no implicit Int-to-Float

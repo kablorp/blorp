@@ -27,16 +27,17 @@
      names in the host too: the syntax recognises them by identity where a
      declaration or annotation begins, and they remain valid names elsewhere.
      Lone `_` is a wildcard token; `_name` remains an identifier.
-   - Integer tokens use the longest consecutive digit run, with an optional
-     adjacent minus. Parsing rejects leading zeros and values outside
+   - Integer tokens use the longest consecutive digit run; a number never
+     starts with a sign. Parsing folds a prefix minus applied directly to a
+     numeric literal into one negative literal (see negative_literal), then
+     rejects leading zeros and values outside
      -9223372036854775808..9223372036854775807. `-0` has value zero.
    - Source Float uses decimal digits with a fraction or exponent, no leading
      zeros, separators, hexadecimal forms or suffixes. Fractions need digits on
      both sides of the dot; exponent digits follow optional +/- immediately.
      Source overflow is rejected; subnormals and underflow to signed zero are
-     accepted. Leading numeric plus, separated minus signs and arithmetic
-     operators are unsupported. The '+' token separates trait bounds; it does
-     not introduce arithmetic. A dot followed by a digit belongs to a Float token; other dots
+     accepted. The exponent's sign belongs to its number; every other `+` or
+     `-` is an operator token. The '+' token also separates trait bounds. A dot followed by a digit belongs to a Float token; other dots
      retain UFCS/field syntax, including `42.identity()` and `1.5.identity()`.
      A dot directly after an integer must be followed by fraction digits or,
      after optional spaces, a field or function name.
@@ -44,10 +45,15 @@
      before assignment `=`. Lone `!`, separated `! =`, `===` and `!==`
      are invalid.
    - Ordering symbols `<=` and `>=` are adjacent two-byte tokens, recognized
-     before `<` and `>`; `->` is recognized first, and `a<-1` is `<` before
-     the literal `-1`. `=>`, `=<` and `<>` are rejected with teaching
+     before `<` and `>`; `->` is recognized first, and `a<-1` is `<`, a minus
+     and the literal `1`. `=>`, `=<` and `<>` are rejected with teaching
      diagnostics. The six comparisons do not chain with one another; group an
      intended nested comparison explicitly.
+   - Arithmetic symbols `+`, `-`, `*`, `/` and `%` are one-byte tokens, and
+     spacing never changes them: `a-1`, `a -1` and `a - 1` are one
+     subtraction. `->` is recognized before `-`. The spellings `+=`, `-=`,
+     `*=`, `%=`, `/=`, `**` and `//` are rejected over both bytes with
+     teaching diagnostics.
    - Arrow bytes stay adjacent, as do the two dots of `..`; `0..n` is an
      integer, the range symbol and a name. Spaces occur only where these rules permit.
    - Identifiers and comments remain ASCII; quoted values admit valid UTF-8.
@@ -77,8 +83,11 @@
      Holes evaluate once in written order. Checking balances existing binary
      String concat operations, so allocation association differs from a left fold.
      Interpolation is not a String pattern, builtin label or closed initializer.
-   - `--` starts a single-line comment ending before LF or EOF. It takes
-     precedence over a signed integer; `->` still forms an arrow.
+   - `--` starts a single-line comment ending before LF or EOF; `->` still
+     forms an arrow. Directly after a value-ending token (a name, a literal, `void`,
+     `)`, `]` or `}`) `--` is rejected, so `a--1` cannot silently read as `a`;
+     write `a - -1`, or a space before the comment. After `(`, `[`, `,`, an
+     operator or a space it is a comment.
    - A line holding only `---` at column 1, with optional trailing spaces,
      opens a documentation block that the next such line closes. The block
      is trivia; its text admits any byte but CR. `----` and `--- x` are
@@ -340,11 +349,14 @@ spaces           = { space | bracket_break } ;
 required_spaces  = space spaces ;
 ascii_byte       = "\x00".."\x7F" ;
 comment_byte     = ascii_byte - ("\n" | "\r") ;
+(* A line_comment never directly follows a value-ending token on its line:
+   an identifier, a numeric, String or Char literal, "void", ")", "]" or "}". *)
 line_comment     = "--" { comment_byte } ;
 horizontal       = space | "\t" ;
 doc_fence        = "---" { space } ( "\n" | EOF ) ;
 doc_text_line    = { ascii_byte - ( "\n" | "\r" ) | utf8_scalar | "\x80".."\xFF" } "\n" ;
 doc_block        = doc_fence { doc_text_line - doc_fence } doc_fence ;
+(* A trivia line's comment starts its line, so no value precedes it. *)
 trivia_line      = { horizontal } [ line_comment ] ( "\n" | EOF ) | doc_block ;
 indentation      = { "\t" } | { "    " } ;
 
@@ -392,7 +404,7 @@ DEDENT           = indentation ;
    must have Void type. Void has the sole value void. A Void function evaluates
    and discards its final expression before returning void. *)
 nonzero_digit    = "1".."9" ;
-integer          = [ "-" ] ("0" | nonzero_digit { digit }) ;
+integer          = "0" | nonzero_digit { digit } ;
 exponent         = ("e" | "E") [ "+" | "-" ] digit { digit } ;
 float            = integer (("." digit { digit } [ exponent ]) | exponent) ;
 hex_digit        = digit | "A".."F" | "a".."f" ;
@@ -460,8 +472,13 @@ primary          = "void" | float | integer | string_literal | interpolated_stri
 receiver_call    = spaces "." spaces callable_name spaces "(" spaces [ arguments ] spaces ")" ;
 field_read       = spaces "." spaces identifier ;
 tuple_index      = spaces "[" spaces expression spaces "]" ;
-(* Precedence, lowest first, as in the host: "or", "and", "not", "..",
-   then postfix operations; "or" and "and" associate left. A range has no
+(* Precedence, lowest first, as in the host: "or", "and", "not", comparison,
+   "..", "+ -", "* / %", prefix "-", then postfix operations; "or", "and" and
+   both binary arithmetic levels associate left, so `a - b - c` is
+   `(a - b) - c` and `-x.abs()` is `-(x.abs())`. There is no prefix "+". A
+   `not` cannot be an arithmetic operand without parentheses. Outside
+   brackets a line break after an arithmetic operator ends the expression,
+   leaving its operand missing. A range has no
    postfix operations of its own. A `not` token followed by `(` always starts
    an ordinary call, including at a range end. Otherwise prefix not and infix
    and/or parse only to produce invalid-operator diagnostics. Checking admits
@@ -506,7 +523,18 @@ else_branch      = "else" spaces ":" NEWLINE INDENT block DEDENT | "else" requir
    there is an error. *)
 indented_chain   = NEWLINE INDENT "." ( receiver_call | field_read ) { receiver_call | field_read | NEWLINE "." ( receiver_call | field_read ) | indented_chain } [ NEWLINE ] DEDENT ;
 operand          = control | primary { receiver_call | field_read | tuple_index | NEWLINE "." ( receiver_call | field_read ) | indented_chain } ;
-range_expr       = operand [ spaces ".." spaces operand ] ;
+(* A prefix minus applied directly to a numeric literal token, whatever the
+   spacing, is one negative literal: the range check sees the sign and `-0.0`
+   is negative zero. A postfix operation after such a literal is rejected,
+   since `-2.abs()` would otherwise read as `(-2).abs()`; write `(-2).abs()`
+   or `-(2.abs())`. *)
+negative_literal = "-" spaces ( float | integer ) ;
+prefix_expr      = negative_literal | "-" spaces prefix_expr | operand ;
+multiplicative_op = "*" | "/" | "%" ;
+multiplicative_expr = prefix_expr { spaces multiplicative_op spaces prefix_expr } ;
+additive_op      = "+" | "-" ;
+additive_expr    = multiplicative_expr { spaces additive_op spaces multiplicative_expr } ;
+range_expr       = additive_expr [ spaces ".." spaces additive_expr ] ;
 comparison_expr  = range_expr [ spaces comparison_op spaces range_expr ] ;
 comparison_op    = "==" | "!=" | "<" | ">" | "<=" | ">=" ;
 not_expr         = "not" required_spaces not_expr | comparison_expr ;
@@ -633,8 +661,9 @@ record_decl      = [ "fixed" required_spaces ] "record" required_spaces identifi
 opaque_type      = "opaque" required_spaces "type" required_spaces identifier spaces [ bounded_parameters ] "=" spaces type_annotation NEWLINE ;
 (* Module constants require an explicit annotation. Checking admits closed
    scalar/Void literals, constructors, records, Lists, tuples and named function
-   references. Calls, other constant references, lambdas, postfix computation,
-   updates, opaque conversion and control expressions are rejected in initializers.
+   references, including a negative numeric literal. Calls, operators, other
+   constant references, lambdas, postfix computation, updates, opaque
+   conversion and control expressions are rejected in initializers.
    All constant annotations precede signatures/entrypoint diagnostics, then
    initializer checking and function bodies. Each read constructs an ordinary
    value; callable constants admit direct and qualified invocation. *)

@@ -34,7 +34,9 @@ and `float.brp` implement Equatable, Orderable and the six arithmetic traits,
 `string.brp` implements Equatable and Addable, and `list.brp` implements Equatable.
 Each arithmetic trait has one member: `add`, `subtract`, `multiply`, `divide` and
 `remainder` take `(left: Self, right: Self)`, `negate` takes `(value: Self)`, and
-each returns `Self`.
+each returns `Self`. The prelude's selection makes them the canonical traits of
+`+`, `-`, `*`, `/`, `%` and prefix `-`, so user code writes `a + b` or
+`a.add(b)` alike; library source keeps writing calls until the seed is rotated.
 
 `bool.brp` defines pure, ordinary `not`, `and` and `or`; select them explicitly
 with `bool: not, and, or` for direct calls and UFCS. Both binary arguments are eager;

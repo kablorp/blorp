@@ -25,6 +25,7 @@ TARGET_COMPONENT_SOURCES := \
 	blorp_2/test/unit/test_utils/test_source.brp \
 	blorp_2/test/unit/test_utils/test_syntax.brp \
 	blorp_2/test/unit/test_utils/test_text.brp \
+	blorp_2/test/unit/test_lex/test_arithmetic_operators.brp \
 	blorp_2/test/unit/test_lex/test_char_literals.brp \
 	blorp_2/test/unit/test_lex/test_continuation.brp \
 	blorp_2/test/unit/test_lex/test_doc_blocks.brp \
@@ -37,6 +38,7 @@ TARGET_COMPONENT_SOURCES := \
 	blorp_2/test/unit/test_lex/test_ranges.brp \
 	blorp_2/test/unit/test_lex/test_runtime_text.brp \
 	blorp_2/test/unit/test_lex/test_trivia.brp \
+	blorp_2/test/unit/test_parse/test_arithmetic_operators.brp \
 	blorp_2/test/unit/test_parse/test_constant_inventory.brp \
 	blorp_2/test/unit/test_parse/test_file_read.brp \
 	blorp_2/test/unit/test_parse/test_float_builtin_labels.brp \
@@ -61,6 +63,7 @@ TARGET_COMPONENT_SOURCES := \
 	blorp_2/test/unit/test_check/test_type_children.brp \
 	blorp_2/test/unit/test_check/test_child_expressions.brp \
 	blorp_2/test/unit/test_check/test_arithmetic_traits.brp \
+	blorp_2/test/unit/test_check/test_arithmetic_operators.brp \
 	blorp_2/test/unit/test_check/test_ordering_operators.brp \
 	blorp_2/test/unit/test_check/test_supertraits.brp \
 	blorp_2/test/unit/test_parse/test_declaration_bounds.brp \

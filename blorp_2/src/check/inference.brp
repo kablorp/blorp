@@ -17,7 +17,8 @@ import:
 		FieldId,
 		CheckedCall,
 		TypeParameterId,
-		TypeRef(TupleType, CallableType, ListType, NominalType, ParameterType),
+		TypeRef(StringType, TupleType, CallableType, ListType, NominalType, ParameterType),
+		CanonicalOperation, canonical_operation_member,
 		NominalId,
 		TypeUse,
 		CallTarget(RuntimeFunction, TraitMethod, UserFunction, CallableParameter, ValueCall),
@@ -25,11 +26,11 @@ import:
 		type_children,
 		type_head,
 	./errors:
-		CheckError,
+		CheckError, GenericConflict,
 		MethodError(AmbiguousMethod, NoApplicableMethod), method_error,
 		ExpectedTypeSite(SourceAnnotation),
 		ValueError(ExpressionTypeMismatch), value_error,
-		CallError(ArgumentTypeMismatch, GenericArgumentConflict, UninferableTypeParameter, InfiniteTypeArgument),
+		CallError(ArgumentTypeMismatch, GenericArgumentConflict, TextJoinConflict, UninferableTypeParameter, InfiniteTypeArgument),
 		CheckerInvariant(GenericConstructorContract, InvalidInferenceVariable, InvalidInferenceWorklist, InvalidFunctionContract, MissingCallParameter, MissingGenericParameter),
 		call_error,
 		checker_invariant,
@@ -1190,6 +1191,7 @@ private pure func inference_origin_span(origin: ConstraintOrigin) -> Span:
 private pure func inference_conflict(
 	equality: InferenceEquality,
 	slots: List[InferenceSlot],
+	addition: Option[CanonicalOperation],
 ) -> Result[CheckError, CheckError]:
 	span = inference_origin_span(equality.origin)
 
@@ -1203,11 +1205,12 @@ private pure func inference_conflict(
 		ListElementConstraint(_, _): Err(checker_invariant(span, InvalidInferenceWorklist))
 		ReceiverOverlapConstraint(_): Err(checker_invariant(span, InvalidInferenceWorklist))
 		ArgumentConstraint(call, position, occurrence, written):
-			generic_argument_conflict(call, position, occurrence, written, equality.parameter, slots)
+			generic_argument_conflict(call, position, occurrence, written, equality.parameter, slots, addition)
 
 
 -- A call's arguments gave one generic parameter different types: the error
--- names both and the position that disagreed.
+-- names both and the position that disagreed. At the canonical add, a String
+-- against another type is text joined with `+`, which interpolation replaces.
 private pure func generic_argument_conflict(
 	call: PendingCall,
 	position: Int,
@@ -1215,6 +1218,7 @@ private pure func generic_argument_conflict(
 	written: TypeUse,
 	parameter: Option[InferenceParameterConstraint],
 	slots: List[InferenceSlot],
+	addition: Option[CanonicalOperation],
 ) -> Result[CheckError, CheckError]:
 	constraint ?= parameter.to_result(checker_invariant(occurrence.span, InvalidInferenceWorklist))
 	id = constraint.variable
@@ -1226,7 +1230,7 @@ private pure func generic_argument_conflict(
 	first ?= publish_inference_type(previous.value_type, slots, DiagnosticInference, previous.span)
 	current ?= publish_inference_type(constraint.actual, slots, DiagnosticInference, occurrence.span)
 	actual_type ?= publish_inference_type(occurrence.value_type, slots, DiagnosticInference, occurrence.span)
-	Ok(call_error(occurrence.span, GenericArgumentConflict({
+	conflict: GenericConflict = {
 		parameter = slot.parameter,
 		previous = { value_type = first, span = previous.span },
 		current = { value_type = current, span = occurrence.span },
@@ -1236,7 +1240,14 @@ private pure func generic_argument_conflict(
 			argument_position = position,
 			expected_site = SourceAnnotation(written.span),
 		},
-	})))
+	}
+	joins_text: Bool = match (call.target, addition):
+		(PendingMethod(method), Some(canonical)): and(canonical_operation_member(canonical) == method, (first == StringType) != (current == StringType))
+		_: False
+	if joins_text:
+		Ok(call_error(occurrence.span, TextJoinConflict(conflict)))
+	else:
+		Ok(call_error(occurrence.span, GenericArgumentConflict(conflict)))
 
 
 private union InferenceAction:
@@ -1338,6 +1349,7 @@ union InferenceStep:
 pure func inspect_inference_equality(
 	equality: InferenceEquality,
 	slots: List[InferenceSlot],
+	addition: Option[CanonicalOperation],
 ) -> Result[InferenceStep, CheckError]:
 	span = inference_origin_span(equality.origin)
 	var origin = equality.parameter
@@ -1406,7 +1418,7 @@ pure func inspect_inference_equality(
 						ListElementConstraint(_, _): Ok(CompleteEquality)
 						ReceiverOverlapConstraint(_): Ok(IncompatibleResult)
 						ArgumentConstraint(_, _, _, _):
-							match inference_conflict(current, slots):
+							match inference_conflict(current, slots, addition):
 								Ok(error): Err(error)
 								Err(error): Err(error)
 				CollectArguments:
@@ -1528,7 +1540,8 @@ private pure func disjoint_heads(left: TypeRef, right: TypeRef) -> Bool:
 
 
 private pure func solve_overlap(equality: InferenceEquality, slots: List[InferenceSlot]) -> Result[Option[List[InferenceSlot]], CheckError]:
-	step ?= inspect_inference_equality(equality, slots)
+	-- Receiver overlap reports no argument conflicts, so it needs no addition.
+	step ?= inspect_inference_equality(equality, slots, None)
 	match step:
 		IncompatibleResult: Ok(None)
 		CompleteEquality: Ok(Some(slots))

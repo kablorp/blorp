@@ -1,7 +1,10 @@
 # Arithmetic operators
 
 Status: approved 2026-10-30, with the owner decisions below accepted as
-recommended; milestones 1 and 2 implemented. This plan mirrors [the ordering
+recommended; milestones 1, 2 and 3 implemented. On 2026-10-31 the owner raised
+milestone 3's instruction and line ceilings (see [Cost](#cost)); its
+[cost report](../benchmarks/results/blorp2-arithmetic-operators-2026-10-31.md)
+records the result. This plan mirrors [the ordering
 operators plan](ORDERING_OPERATORS_PLAN.md), whose rules apply unless a
 section below says otherwise. It builds on [supertraits](SUPERTRAITS_PLAN.md) milestone 1.
 The legacy compiler is the precedent; the
@@ -236,7 +239,9 @@ does.
     operator: an opaque record holding the member's `TraitMethodId`. Each
     arithmetic trait has one abstract member, so one record shape serves all
     six.
-  - `CanonicalFamily` gains `ArithmeticFamily(ArithmeticTrait)`.
+  - `CanonicalFamily` gains `ArithmeticFamily(ArithmeticTrait)`. As built,
+    Equatable and Orderable become `ComparisonFamily(ComparisonTrait)`, so a
+    malformed reserved default member can name only a comparison trait.
     `ArithmeticTrait` names the six traits once, and render spells each.
   - `sole_abstract`, `default_member` and `required_default` take the
     expected member shape, `(Self, Self) -> Bool`, `(Self, Self) -> Self` or
@@ -342,11 +347,21 @@ Ceilings, measured with the matched frozen-input recipe:
 | Milestone | Retired instructions | Allocations | Production lines |
 | --- | --- | --- | --- |
 | 1: library traits | +0.3% | +0.1% | 60 |
-| 3: operators | +0.8% | +0.1% | 450 |
+| 3: operators | +0.8%, raised to about +1.3% | +0.1% | 450, raised to about 700 |
 
 Milestone 1 includes any String specialization it needs. Milestone 3 touches
 every `-` in the lexer and adds two parser levels per operand. Ordering's one
 level cost +0.33%, so its instruction ceiling is set with that in mind.
+On 2026-10-31 the owner raised milestone 3's instruction ceiling to about +1.3%
+and its line ceiling to about 700, keeping the change whole. Two known costs
+drive the increase, each a separate follow-up:
+- **Hash clustering.** `HashMap` (`utils/hash_map.brp`, `probe`) hashes an Int
+  key to itself and probes linearly. The twelve new seed words put `add`,
+  `subtract` and the other members in the dense run of seed name IDs, which
+  lengthens the probe clusters that compiler source hits most.
+- **Depth.** The 2,000-term sum needs Check, Specialize and Lower to walk
+  left-nested call chains in a loop.
+
 Production lines count gross additions; net lines and test lines are reported
 separately.
 

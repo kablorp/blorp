@@ -52,8 +52,18 @@ methods under the same rules; all six comparisons share one level and do not
 chain with one another. `=>`, `=<` and `<>` are rejected. The comparison layer is
 `range_expr [ spaces comparison_op spaces range_expr ]`, with `comparison_op`
 one of `==`, `!=`, `<`, `>`, `<=` and `>=`; ordinary UFCS visibility and trait
-implementation rules remain unchanged. Other infix operators remain outside the
-pilot checker.
+implementation rules remain unchanged. The arithmetic operators `+`, `-`, `*`,
+`/`, `%` and prefix `-` each call the one member of their own prelude-selected
+trait (`Addable.add`, `Subtractable.subtract`, `Multipliable.multiply`,
+`Divisible.divide`, `Modulable.remainder`, `Negatable.negate`) under the same
+rules. They bind between ranges and postfix operations: `range_expr` takes
+`additive_expr` operands, `* / %` bind above `+ -`, both associate left, and
+prefix `-` binds below postfix calls. A prefix minus applied directly to a
+numeric literal folds into one negative literal, a folded literal followed by
+a postfix operation is rejected, and there is no prefix `+`. `--` directly
+after a value is rejected rather than read as a comment. `+=`, `-=`, `*=`,
+`%=`, `/=`, `**` and `//` are rejected with teaching diagnostics. Bitwise and
+power operators remain outside the pilot.
 A default-only `implements Trait for Type` header ends at the newline, without a
 colon. Contextual unbound method references use ordinary expressions and need an
 expected callable type determining `Self`. See the [pilot trait rules](../blorp_2/README.md#concrete-traits)
@@ -108,8 +118,8 @@ nongeneric `(String, Int) -> String` declaration. Ordering uses signed64 values.
 check designates Bool, Option and Result once, by name in `_base.brp`.
 Constructors of other imported types require explicit selection. Wildcards
 and function reexports remain unsupported.
-Decimal Float tokens carry an optional minus, a decimal fraction or exponent,
-or both. Parsing checks canonical source spelling and finite binary64 range;
+Decimal Float tokens carry a decimal fraction or exponent, or both; a leading
+minus is a separate token that the parser folds into the literal. Parsing checks canonical source spelling and finite binary64 range;
 `1.identity()` remains an Int receiver call. The restricted EBNF owns the exact
 Float syntax and runtime builtin label set. Quoted and LF-joined pipe Strings
 accept `${expression}` holes, each containing one expression on one physical

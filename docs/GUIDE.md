@@ -17,8 +17,17 @@ does not provide `==`.
 Comparisons cannot chain, including mixed forms such as `a < b == c`. They bind
 below ranges/postfix calls and above prefix `not`; use parentheses for an
 intended nested comparison. Newlines after a symbol continue only inside
-brackets. See the pilot [equality](../blorp_2/README.md#equality-operators) and
-[ordering](../blorp_2/README.md#ordering-operators) operator rules.
+brackets. Its arithmetic operators `+`, `-`, `*`, `/`, `%` and prefix `-` each
+call the one member of their own canonical trait (`Addable`, `Subtractable`,
+`Multipliable`, `Divisible`, `Modulable`, `Negatable`), with `* / %` above
+`+ -`, both left-associative, and prefix `-` below postfix calls, so
+`-x.abs()` is `-(x.abs())`. Int arithmetic wraps and division by zero gives 0.
+Spacing does not matter (`a-1` subtracts), a minus directly before a numeric
+literal folds into it, `-2.abs()` is rejected in favour of `(-2).abs()` or
+`-(2.abs())`, and there is no prefix `+`. See the pilot
+[equality](../blorp_2/README.md#equality-operators),
+[ordering](../blorp_2/README.md#ordering-operators) and
+[arithmetic](../blorp_2/README.md#arithmetic-operators) operator rules.
 A pilot record, union or opaque type may bound its type parameters, as in
 `opaque type HashMap[K: Hashable + Equatable, V] = MapContents[K, V]`. The pilot
 checks every application against those bounds: a function or declaration that
@@ -661,6 +670,11 @@ pattern: String = raw
 -- blorp only has single-line comments
 -- Use multiple lines like this
 ```
+
+In the [Blorp 2 pilot](../blorp_2/README.md#arithmetic-operators), `--`
+directly after a name, a literal, `void` or a closing bracket is rejected, because
+`a--1` would otherwise read as `a` followed by a comment. Write `a - -1`, or
+put a space before the comment.
 
 ### Method Call Syntax (UFCS)
 

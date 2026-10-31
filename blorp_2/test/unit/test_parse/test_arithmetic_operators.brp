@@ -1,0 +1,279 @@
+import:
+    ../parse_function_inputs: free_functions
+    ../../../src/lex/lex: lex
+    ../../../src/parse/parse: ParsedModule, module_contents, module_names, parse_module
+    ../../../src/utils/names: NameTable, name_spelling, program_names
+    ../../../src/utils/source: module_source, root_module_id
+    ../../../src/utils/syntax:
+        Diagnostic, Span, ValueExpression,
+        ArithmeticOperator(AddOperator, SubtractOperator, MultiplyOperator, DivideOperator, RemainderOperator),
+        ComparisonOperator(EqualOperator, NotEqualOperator, LessOperator, GreaterOperator, LessEqualOperator, GreaterEqualOperator),
+        LogicalOperator(AndOperator, OrOperator),
+        ExpressionBase(
+            NameExpression, IntegerExpression, FloatExpression, ArithmeticExpression, NegationExpression, ComparisonExpression, RangeExpression,
+            NotExpression, LogicalExpression,
+        ),
+        ParsedBody(ParsedValueBody),
+    bool: and
+    float: Float methods
+    int: Int methods
+    list: List methods
+    option: Option methods
+    string: String methods
+    test: TestSuite
+
+
+private HEADER: String = "func main() -> Int:\n"
+private MISSING_OPERAND: String = "expected a return expression"
+private MISSING_OPERAND_HELP: String = "use a literal, a parameter or variant name, or a call as the entire body"
+private NOT_OPERAND_HELP: String = "parenthesize the negation, or move it outside the arithmetic"
+private POSTFIX_HELP: String = "prefix '-' applies after method calls"
+
+
+private record ParsedValue {
+    body: ValueExpression,
+    names: NameTable
+}
+
+
+private pure func parse_source(source: String) -> Result[ParsedModule, Diagnostic]:
+    tokens ?= lex(module_source(root_module_id()), source, program_names().names)
+    parse_module(tokens, root_module_id())
+
+
+-- The body of `main` after HEADER, which is 20 bytes, so a body written as
+-- "\t..." starts its expression at byte 21.
+private pure func value(source: String) -> Option[ParsedValue]:
+    match parse_source(HEADER.add(source)):
+        Err(_): None
+        Ok(parsed):
+            match free_functions(module_contents(parsed).functions).get(0).map(pure func(function): function.body):
+                Some(ParsedValueBody(body)): Some({ body = body, names = module_names(parsed) })
+                _: None
+
+
+private pure func rejects(source: String, start: Int, end: Int, message: String, help: String) -> Bool:
+    match parse_source(HEADER.add(source)):
+        Ok(_): False
+        Err(error):
+            error.span.start.equals(start).and(error.span.end.equals(end))
+                .and(error.message == message).and(error.help == help).and(error.note.is_none())
+
+
+private pure func spans(span: Span, start: Int, end: Int) -> Bool:
+    span.start.equals(start).and(span.end.equals(end))
+
+
+private pure func arithmetic_symbol(operator: ArithmeticOperator) -> String:
+    match operator:
+        AddOperator: "+"
+        SubtractOperator: "-"
+        MultiplyOperator: "*"
+        DivideOperator: "/"
+        RemainderOperator: "%"
+
+
+private pure func comparison_symbol(operator: ComparisonOperator) -> String:
+    match operator:
+        EqualOperator: "=="
+        NotEqualOperator: "!="
+        LessOperator: "<"
+        GreaterOperator: ">"
+        LessEqualOperator: "<="
+        GreaterEqualOperator: ">="
+
+
+-- The tree as prefix notation: `(+ a (* b c))`. Each postfix operation adds
+-- `.()`, and prefix minus is `neg`, so a folded literal shows as a number.
+private pure func shape(expression: ValueExpression, names: NameTable) -> String:
+    base = match expression.base:
+        NameExpression(name): name_spelling(names, name.id).get_or("?")
+        IntegerExpression(number): number.to_string()
+        FloatExpression(number): number.to_string()
+        ArithmeticExpression(operator, _, left, right): "(${arithmetic_symbol(operator)} ${shape(left, names)} ${shape(right, names)})"
+        NegationExpression(_, operand): "(neg ${shape(operand, names)})"
+        ComparisonExpression(operator, _, left, right): "(${comparison_symbol(operator)} ${shape(left, names)} ${shape(right, names)})"
+        RangeExpression(low, high): "(.. ${shape(low, names)} ${shape(high, names)})"
+        NotExpression(operand): "(not ${shape(operand, names)})"
+        LogicalExpression(AndOperator, left, right): "(and ${shape(left, names)} ${shape(right, names)})"
+        LogicalExpression(OrOperator, left, right): "(or ${shape(left, names)} ${shape(right, names)})"
+        _: "?"
+    var shaped = base
+    for _ in expression.applications:
+        shaped = shaped.add(".()")
+    shaped
+
+
+private pure func parses_as(source: String, expected: String) -> Bool:
+    match value("\t".add(source).add("\n")):
+        Some(parsed): shape(parsed.body, parsed.names) == expected
+        None: False
+
+
+private pure func all_parse(cases: List[(String, String)]) -> Bool:
+    cases.all(pure func(case): parses_as(case[0], case[1]))
+
+
+-- The token span locates dispatch errors; the expression spans both operands.
+pure func test_each_operator_keeps_its_token_and_operands() -> Bool:
+    match value("\ta % bc\n"):
+        Some(parsed):
+            match parsed.body.base:
+                ArithmeticExpression(RemainderOperator, token, left, right):
+                    spans(token, 23, 24).and(spans(left.span, 21, 22)).and(spans(right.span, 25, 27)).and(spans(parsed.body.span, 21, 27))
+                _: False
+        None: False
+
+
+pure func test_multiplicative_binds_above_additive() -> Bool:
+    all_parse([
+        ("a + b * c", "(+ a (* b c))"),
+        ("a * b + c", "(+ (* a b) c)"),
+        ("a - b / c % d", "(- a (% (/ b c) d))"),
+        ("a % b - c * d", "(- (% a b) (* c d))"),
+    ])
+
+
+pure func test_binary_levels_associate_left() -> Bool:
+    all_parse([
+        ("a - b - c", "(- (- a b) c)"),
+        ("a - b + c", "(+ (- a b) c)"),
+        ("a / b / c", "(/ (/ a b) c)"),
+        ("a / b * c % d", "(% (* (/ a b) c) d)"),
+    ])
+
+
+-- Prefix minus binds below postfix operations and above `*`.
+pure func test_prefix_minus_binds_between_postfix_and_multiplication() -> Bool:
+    all_parse([
+        ("-x.abs()", "(neg x.())"),
+        ("-x * y", "(* (neg x) y)"),
+        ("x * -y", "(* x (neg y))"),
+        ("-2 * 3", "(* -2 3)"),
+        ("- -x", "(neg (neg x))"),
+        ("-(-x)", "(neg (neg x))"),
+        ("a.f() * b.g()", "(* a.() b.())"),
+    ])
+
+
+-- Arithmetic sits between ranges and postfix operations, so it binds above
+-- comparison, `not`, `and` and `or`.
+pure func test_arithmetic_binds_above_ranges_comparison_and_logic() -> Bool:
+    all_parse([
+        ("0..n-1", "(.. 0 (- n 1))"),
+        ("a+1..b*2", "(.. (+ a 1) (* b 2))"),
+        ("a + b < c * d", "(< (+ a b) (* c d))"),
+        ("a - b == -c", "(== (- a b) (neg c))"),
+        ("not a + b == c", "(not (== (+ a b) c))"),
+        ("a and b + c or d * e", "(or (and a (+ b c)) (* d e))"),
+    ])
+
+
+-- Spacing never matters: each form is the same subtraction or addition.
+pure func test_spacing_does_not_change_the_tree() -> Bool:
+    all_parse([
+        ("a-1", "(- a 1)"),
+        ("a -1", "(- a 1)"),
+        ("a - 1", "(- a 1)"),
+        ("a+1", "(+ a 1)"),
+        ("a +1", "(+ a 1)"),
+    ])
+
+
+-- A parenthesized first operand enters through the statement-line path, which
+-- reads both arithmetic levels before ranges and comparison.
+pure func test_both_entry_paths_parse_arithmetic() -> Bool:
+    spanned = match value("\t(a) + b\n"):
+        Some(parsed):
+            match parsed.body.base:
+                ArithmeticExpression(AddOperator, token, _, _): spans(token, 25, 26).and(spans(parsed.body.span, 21, 28))
+                _: False
+        None: False
+    spanned.and(all_parse([
+        ("(a) + b * c", "(+ a (* b c))"),
+        ("(a) * b - c", "(- (* a b) c)"),
+        ("(a) - b < c", "(< (- a b) c)"),
+        ("(a)..b+1", "(.. a (+ b 1))"),
+        ("(a - b) * c", "(* (- a b) c)"),
+    ]))
+
+
+-- A minus applied directly to a literal token is that literal, whatever the
+-- spacing, so the range check sees the sign. A grouped operand is negated.
+pure func test_minus_folds_into_a_directly_following_literal() -> Bool:
+    folded = match (value("\t-9223372036854775808\n"), value("\t- 1\n"), value("\t-0.0\n")):
+        (Some(minimum), Some(spaced), Some(zero)):
+            int_minimum = match minimum.body.base:
+                IntegerExpression(number): (number == -9223372036854775808).and(spans(minimum.body.span, 21, 41)).and(minimum.body.applications.is_empty())
+                _: False
+            int_spaced = match spaced.body.base:
+                IntegerExpression(number): (number == -1).and(spans(spaced.body.span, 21, 24))
+                _: False
+            -- Negative zero equals 0.0 and keeps its sign when spelled.
+            float_zero = match zero.body.base:
+                FloatExpression(number): (number == 0.0).and(number.to_string() == "-0")
+                _: False
+            int_minimum.and(int_spaced).and(float_zero)
+        _: False
+    folded.and(all_parse([("-(1)", "(neg 1)"), ("-1.5e2", "-150")]))
+
+
+-- The fold keeps the literal range check, with the sign inside it.
+pure func test_folded_literal_keeps_the_range_check() -> Bool:
+    rejects("\t9223372036854775808\n", 21, 40, "integer literal is outside the Int64 range", "use a value from -9223372036854775808 to 9223372036854775807")
+        .and(rejects("\t-9223372036854775809\n", 21, 41, "integer literal is outside the Int64 range", "use a value from -9223372036854775808 to 9223372036854775807"))
+
+
+-- `-2.abs()` would fold to `(-2).abs()`, but precedence reads `-(2.abs())`, so
+-- it is rejected at the minus sign with both explicit forms of the first
+-- postfix operation, arguments and index elided.
+pure func test_folded_literal_followed_by_a_postfix_is_rejected() -> Bool:
+    rejects("\t-2.abs()\n", 21, 22, "write (-2).abs() or -(2.abs()) to say which is meant", POSTFIX_HELP)
+        .and(rejects("\tx = - 7.to_string()\n", 25, 26, "write (-7).to_string() or -(7.to_string()) to say which is meant", POSTFIX_HELP))
+        .and(rejects("\t-1.5[0]\n", 21, 22, "write (-1.5)[...] or -(1.5[...]) to say which is meant", POSTFIX_HELP))
+        .and(rejects("\t-2.pow(3).abs()\n", 21, 22, "write (-2).pow(...) or -(2.pow(...)) to say which is meant", POSTFIX_HELP))
+        .and(rejects("\t-2.size\n", 21, 22, "write (-2).size or -(2.size) to say which is meant", POSTFIX_HELP))
+        .and(all_parse([("(-2).abs()", "-2.()"), ("-(2.abs())", "(neg 2.())")]))
+
+
+pure func test_prefix_plus_is_rejected() -> Bool:
+    rejects("\t+a\n", 21, 22, "Blorp has no prefix '+'", "remove the '+'; values are positive unless negated")
+        .and(rejects("\ta * +1\n", 25, 26, "Blorp has no prefix '+'", "remove the '+'; values are positive unless negated"))
+
+
+-- Outside brackets a newline ends the expression, so the operand is missing;
+-- inside them layout is suppressed.
+pure func test_newline_after_an_operator_ends_the_expression() -> Bool:
+    parses_as("(a +\n\t\tb)", "(+ a b)")
+        .and(rejects("\ta +\n\t\tb\n", 24, 25, MISSING_OPERAND, MISSING_OPERAND_HELP))
+        .and(rejects("\ta *\n\t\tb\n", 24, 25, MISSING_OPERAND, MISSING_OPERAND_HELP))
+        .and(rejects("\t-\n\t\tb\n", 22, 23, MISSING_OPERAND, MISSING_OPERAND_HELP))
+
+
+-- `not` binds below arithmetic, so a bare `not` operand names its operator.
+pure func test_not_cannot_be_an_arithmetic_operand() -> Bool:
+    rejects("\ta + not b\n", 25, 28, "'not' cannot be an operand of '+'", NOT_OPERAND_HELP)
+        .and(rejects("\ta % not b\n", 25, 28, "'not' cannot be an operand of '%'", NOT_OPERAND_HELP))
+        .and(rejects("\t-not b\n", 22, 25, "'not' cannot be an operand of '-'", NOT_OPERAND_HELP))
+        .and(rejects("\t(a) - not b\n", 27, 30, "'not' cannot be an operand of '-'", NOT_OPERAND_HELP))
+        .and(parses_as("a + (not b)", "(+ a (not b))"))
+
+
+tests: TestSuite = {
+    description = "arithmetic operator parsing",
+    tests = [
+        ("each operator keeps its token and operands", test_each_operator_keeps_its_token_and_operands),
+        ("multiplicative binds above additive", test_multiplicative_binds_above_additive),
+        ("binary levels associate left", test_binary_levels_associate_left),
+        ("prefix minus binds between postfix and multiplication", test_prefix_minus_binds_between_postfix_and_multiplication),
+        ("arithmetic binds above ranges, comparison and logic", test_arithmetic_binds_above_ranges_comparison_and_logic),
+        ("spacing does not change the tree", test_spacing_does_not_change_the_tree),
+        ("both entry paths parse arithmetic", test_both_entry_paths_parse_arithmetic),
+        ("minus folds into a directly following literal", test_minus_folds_into_a_directly_following_literal),
+        ("a folded literal keeps the range check", test_folded_literal_keeps_the_range_check),
+        ("a folded literal followed by a postfix is rejected", test_folded_literal_followed_by_a_postfix_is_rejected),
+        ("prefix plus is rejected", test_prefix_plus_is_rejected),
+        ("a newline after an operator ends the expression", test_newline_after_an_operator_ends_the_expression),
+        ("not cannot be an arithmetic operand", test_not_cannot_be_an_arithmetic_operand),
+    ]
+}

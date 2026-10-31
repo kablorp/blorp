@@ -141,10 +141,12 @@ import:
 		PostfixOperation(TupleIndex, ReceiverInvocation, FieldAccess),
 		ReceiverApplication,
 		ComparisonOperator(EqualOperator, NotEqualOperator, LessOperator, GreaterOperator, LessEqualOperator, GreaterEqualOperator),
+		ArithmeticOperator(AddOperator, SubtractOperator, MultiplyOperator, DivideOperator, RemainderOperator),
 		ExpressionBase(
 			VoidExpression, IntegerExpression, FloatExpression, StringExpression, InterpolatedString, NameExpression, DirectApplication,
 			QualifiedName, QualifiedApplication, OpaqueWrap, OpaqueUnwrap, TupleExpression, ListExpression, RangeExpression, RecordExpression,
-			RecordUpdateExpression, ComparisonExpression, LogicalExpression, NotExpression, IfExpression, MatchExpression, LambdaExpression,
+			RecordUpdateExpression, ComparisonExpression, ArithmeticExpression, NegationExpression, LogicalExpression, NotExpression, IfExpression,
+			MatchExpression, LambdaExpression,
 		),
 		Purity(Pure, Impure), permits_purity,
 
@@ -659,22 +661,47 @@ private pure func comparison_contract(operator: ComparisonOperator, span: Span, 
 	equality = traits.canonical.equality
 	ordering = traits.canonical.ordering
 	method: TraitMethodId ?= match operator:
-		EqualOperator: selected_contract(equality, Errors.EqualityFamily, span).map(Checked.canonical_equals)
+		EqualOperator: selected_contract(equality, Errors.ComparisonFamily(Errors.EquatableTrait), span).map(Checked.canonical_equals)
 		NotEqualOperator:
-			match selected_contract(equality, Errors.EqualityFamily, span):
+			match selected_contract(equality, Errors.ComparisonFamily(Errors.EquatableTrait), span):
 				Ok(contract): Checked.canonical_not_equals(contract).to_result(Errors.trait_error(span, Errors.MissingCanonicalInequality))
 				Err(error): Err(error)
-		LessOperator: selected_contract(ordering, Errors.OrderingFamily, span).map(Checked.canonical_less_than)
-		GreaterOperator: selected_contract(ordering, Errors.OrderingFamily, span).map(Checked.canonical_greater_than)
-		LessEqualOperator: selected_contract(ordering, Errors.OrderingFamily, span).map(Checked.canonical_less_than_or_equal)
-		GreaterEqualOperator: selected_contract(ordering, Errors.OrderingFamily, span).map(Checked.canonical_greater_than_or_equal)
+		LessOperator: selected_contract(ordering, Errors.ComparisonFamily(Errors.OrderableTrait), span).map(Checked.canonical_less_than)
+		GreaterOperator: selected_contract(ordering, Errors.ComparisonFamily(Errors.OrderableTrait), span).map(Checked.canonical_greater_than)
+		LessEqualOperator: selected_contract(ordering, Errors.ComparisonFamily(Errors.OrderableTrait), span).map(Checked.canonical_less_than_or_equal)
+		GreaterEqualOperator: selected_contract(ordering, Errors.ComparisonFamily(Errors.OrderableTrait), span).map(Checked.canonical_greater_than_or_equal)
 	method_id_contract(span, method, traits)
+
+
+-- Each arithmetic operator calls its own trait's one member, so `a - b` is
+-- never `a + -b`, and negation is a one-operand call.
+private pure func arithmetic_contract(arithmetic: Errors.ArithmeticTrait, span: Span, traits: Checked.AcceptedTraits) -> Result[FunctionContract, CheckError]:
+	canonical = traits.canonical
+	selected = match arithmetic:
+		Errors.AddableTrait: canonical.addition
+		Errors.SubtractableTrait: canonical.subtraction
+		Errors.MultipliableTrait: canonical.multiplication
+		Errors.DivisibleTrait: canonical.division
+		Errors.ModulableTrait: canonical.remainder
+		Errors.NegatableTrait: canonical.negation
+	contract ?= selected_contract(selected, Errors.ArithmeticFamily(arithmetic), span)
+	method_id_contract(span, Checked.canonical_operation_member(contract), traits)
 
 
 private pure func plan_body_base(scope: List[ScopedValue], body: ValueExpression, expectation: Option[InferenceType], context: ResolutionContext, construction: ConstructionContext, slots: List[InferenceSlot]) -> Result[PlannedBase, CheckError]:
 	match body.base:
 		ComparisonExpression(operator, span, left, right):
 			comparison_contract(operator, span, accepted_traits(context.traits)).map(pure func(contract): PlannedCall(contract, [left, right], ReturnPlacement(body.base_span, body.span), expectation))
+		ArithmeticExpression(operator, span, left, right):
+			arithmetic: Errors.ArithmeticTrait = match operator:
+				AddOperator: Errors.AddableTrait
+				SubtractOperator: Errors.SubtractableTrait
+				MultiplyOperator: Errors.MultipliableTrait
+				DivideOperator: Errors.DivisibleTrait
+				RemainderOperator: Errors.ModulableTrait
+			arithmetic_contract(arithmetic, span, accepted_traits(context.traits)).map(pure func(contract): PlannedCall(contract, [left, right], ReturnPlacement(body.base_span, body.span), expectation))
+		NegationExpression(span, operand):
+			arithmetic_contract(Errors.NegatableTrait, span, accepted_traits(context.traits)).map(pure func(contract): PlannedCall(contract, [operand], ReturnPlacement(body.base_span, body.span), expectation))
 		RecordUpdateExpression(base, fields): Ok(PlannedUpdate(base, fields, expectation))
 		DirectApplication(name, arguments):
 			match classify_direct_call(name, arguments, scope, context):
@@ -1007,6 +1034,9 @@ private pure func elaborate_value(
 	var scope = initial_scope
 	var site = initial_site
 	construction = site_construction(initial_site)
+	addition = match initial_site:
+		BodyExpression(context, _): accepted_traits(context.traits).canonical.addition
+		ConstantInitializer(_, _, availability): accepted_traits(availability).canonical.addition
 	var bindings: List[BindingDefinition] = []
 	var lambdas = initial_lambdas
 	var lambda_work: List[LambdaWork] = []
@@ -1570,7 +1600,7 @@ private pure func elaborate_value(
 								Ok(None): void
 
 							if failure.is_none():
-								match inspect_inference_equality(equality, slots):
+								match inspect_inference_equality(equality, slots, addition):
 									Err(error): failure = Some(error)
 									Ok(step):
 										match step:
@@ -1794,19 +1824,26 @@ private pure func freeze_pending_values(values: List[PendingValue], slots: List[
 	)
 
 
+-- The formal0 operand a caller has already frozen: a receiver, which `values`
+-- excludes, or a first written argument that the call-spine loop froze.
+private union FrozenOperand:
+	NoFrozenOperand
+	FrozenReceiver(CheckedExpr)
+	FrozenFirstArgument(CheckedExpr)
+
+
 -- A receiver is written formal0. Its declared formal decides value versus
 -- callable operand; both remain in actual typechecking at the same position.
-private pure func freeze_pending_call(call: PendingCall, values: List[PendingValue], receiver: Option[CheckedExpr], slots: List[InferenceSlot], captures: CaptureScope, constructions: List[ContextWork], assumptions: List[Checked.TraitRequirement], traits: TraitAvailability) -> Result[CheckedCall, CheckError]:
+private pure func freeze_pending_call(call: PendingCall, values: List[PendingValue], frozen_operand: FrozenOperand, slots: List[InferenceSlot], captures: CaptureScope, constructions: List[ContextWork], assumptions: List[Checked.TraitRequirement], traits: TraitAvailability) -> Result[CheckedCall, CheckError]:
 	var actual = pending_arguments(values)
 	var operands: List[CheckedCallOperand] = []
-	var written_position = if receiver.is_some():
-		1
-	else:
-		0
+	var written_position = match frozen_operand:
+		FrozenReceiver(_): 1
+		NoFrozenOperand | FrozenFirstArgument(_): 0
 	var failure: Option[CheckError] = None
 
-	match receiver:
-		Some(frozen_receiver):
+	match frozen_operand:
+		FrozenReceiver(frozen_receiver):
 			receiver_use: InferenceUse = { value_type = AcceptedType(frozen_receiver.value_type), span = call.span }
 			actual = [receiver_use].concat(actual)
 			match call.target:
@@ -1818,11 +1855,21 @@ private pure func freeze_pending_call(call: PendingCall, values: List[PendingVal
 								CallableType(_, _, _): operands = [CallableOperand(callable_parameter(owner, 0), StoredCallable(frozen_receiver), call.span)]
 								_: operands = [ValueOperand(frozen_receiver)]
 				PendingRuntime(_) | PendingMethod(_) | PendingParameter(_) | PendingStored(_): operands = [ValueOperand(frozen_receiver)]
-		None: void
+		NoFrozenOperand | FrozenFirstArgument(_): void
 
 	for value in values:
 		if failure.is_some():
 			break
+		-- The chain loop in freeze_pending_value has frozen a first argument
+		-- that is a direct call; a callable formal stores it, as
+		-- freeze_callable_choice would.
+		frozen_argument: Option[CheckedExpr] = match frozen_operand:
+			FrozenFirstArgument(first):
+				if written_position == 0:
+					Some(first)
+				else:
+					None
+			NoFrozenOperand | FrozenReceiver(_): None
 		match call.signature.parameters.get(written_position):
 			None:
 				failure = Some(checker_invariant(value.span, MissingCallParameter(written_position)))
@@ -1832,15 +1879,18 @@ private pure func freeze_pending_call(call: PendingCall, values: List[PendingVal
 					PendingDeclared(owner):
 						match parameter.value_type:
 							CallableType(_, _, _):
-								match freeze_callable_choice(value, slots, captures, constructions, assumptions, traits):
-									Ok(choice): operands = operands.append(CallableOperand(callable_parameter(owner, written_position), choice, value.span))
-									Err(error): failure = Some(error)
+								match frozen_argument:
+									Some(first): operands = operands.append(CallableOperand(callable_parameter(owner, written_position), StoredCallable(first), value.span))
+									None:
+										match freeze_callable_choice(value, slots, captures, constructions, assumptions, traits):
+											Ok(choice): operands = operands.append(CallableOperand(callable_parameter(owner, written_position), choice, value.span))
+											Err(error): failure = Some(error)
 							_:
-								match freeze_pending_value(value, slots, captures, constructions, assumptions, traits):
+								match argument_value(frozen_argument, value, slots, captures, constructions, assumptions, traits):
 									Ok(frozen): operands = operands.append(ValueOperand(frozen))
 									Err(error): failure = Some(error)
 					PendingRuntime(_) | PendingMethod(_) | PendingParameter(_) | PendingStored(_):
-						match freeze_pending_value(value, slots, captures, constructions, assumptions, traits):
+						match argument_value(frozen_argument, value, slots, captures, constructions, assumptions, traits):
 							Ok(frozen): operands = operands.append(ValueOperand(frozen))
 							Err(error): failure = Some(error)
 		written_position = written_position.add(1)
@@ -1853,6 +1903,13 @@ private pure func freeze_pending_call(call: PendingCall, values: List[PendingVal
 	return_type ?= admit_call_type(call.signature.return_type.value_type, call, slots, call.span)
 	valid ?= validate_complete_arguments(call, parameters, return_type, actual, slots)
 	Ok(checked_call)
+
+
+-- A first argument the chain loop froze, or this argument frozen now.
+private pure func argument_value(frozen: Option[CheckedExpr], value: PendingValue, slots: List[InferenceSlot], captures: CaptureScope, constructions: List[ContextWork], assumptions: List[Checked.TraitRequirement], traits: TraitAvailability) -> Result[CheckedExpr, CheckError]:
+	match frozen:
+		Some(first): Ok(first)
+		None: freeze_pending_value(value, slots, captures, constructions, assumptions, traits)
 
 
 private pure func freeze_retained_fields(fields: List[PendingRetainedField], slots: List[InferenceSlot], span: Span) -> Result[List[RetainedRecordField], CheckError]:
@@ -1983,8 +2040,79 @@ private pure func freeze_interpolated(parts: List[PendingValue], slots: List[Inf
 	concat_checked_parts(checked, 0, checked.length(), span)
 
 
+-- A direct call and the value it forms: one link of a left-nested chain of
+-- direct calls, such as a long `+` sum, which freezing walks in a loop rather
+-- than recursing once per link.
+private record PendingCallLink {
+	value: PendingValue,
+	call: PendingCall,
+	arguments: List[PendingValue]
+}
+
+
+-- The link a direct call's first argument forms when it is itself a direct call.
+private pure func chained_argument(arguments: List[PendingValue]) -> Option[PendingCallLink]:
+	match arguments:
+		[first, ..._]:
+			match first.base:
+				PendingDirectCall(call, inner): Some({ value = first, call = call, arguments = inner })
+				_: None
+		[]: None
+
+
 private pure func freeze_pending_value(value: PendingValue, slots: List[InferenceSlot], captures: CaptureScope, constructions: List[ContextWork], assumptions: List[Checked.TraitRequirement], traits: TraitAvailability) -> Result[CheckedExpr, CheckError]:
-	base_result: Result[CheckedForm, CheckError] = match value.base:
+	match value.base:
+		PendingDirectCall(call, arguments):
+			match chained_argument(arguments):
+				Some(first): freeze_call_chain(value, call, arguments, first, slots, captures, constructions, assumptions, traits)
+				None: freeze_whole_value(value, slots, captures, constructions, assumptions, traits)
+		_: freeze_whole_value(value, slots, captures, constructions, assumptions, traits)
+
+
+-- A value that is not a chain link.
+private pure func freeze_whole_value(value: PendingValue, slots: List[InferenceSlot], captures: CaptureScope, constructions: List[ContextWork], assumptions: List[Checked.TraitRequirement], traits: TraitAvailability) -> Result[CheckedExpr, CheckError]:
+	match freeze_pending_form(value, slots, captures, constructions, assumptions, traits):
+		Ok(form): finish_pending_value(value, form, slots, captures, constructions, assumptions, traits)
+		Err(error): Err(error)
+
+
+-- A chain freezes from its innermost link outward, each link taking the one
+-- below it as its first argument, so the checker's stack does not grow with
+-- the chain.
+private pure func freeze_call_chain(value: PendingValue, call: PendingCall, arguments: List[PendingValue], first: PendingCallLink, slots: List[InferenceSlot], captures: CaptureScope, constructions: List[ContextWork], assumptions: List[Checked.TraitRequirement], traits: TraitAvailability) -> Result[CheckedExpr, CheckError]:
+	-- The links between `value` and the innermost one, outermost first.
+	var links: List[PendingCallLink] = []
+	var innermost = first
+	while True:
+		match chained_argument(innermost.arguments):
+			None: break
+			Some(next):
+				links = links.append(innermost)
+				innermost = next
+	var current = freeze_call_link(innermost.value, innermost.call, innermost.arguments, None, slots, captures, constructions, assumptions, traits)
+	var position = links.length()
+	while and(position.greater_than(0), current.is_ok()):
+		position = position.subtract(1)
+		current = match links.get(position):
+			Some(link): current.and_then(pure func(below): freeze_call_link(link.value, link.call, link.arguments, Some(below), slots, captures, constructions, assumptions, traits))
+			None: Err(checker_invariant(value.span, InvalidInferenceWorklist))
+	match current:
+		Ok(below): freeze_call_link(value, call, arguments, Some(below), slots, captures, constructions, assumptions, traits)
+		Err(error): Err(error)
+
+
+-- `below` is the link's first argument when the chain loop has frozen it.
+private pure func freeze_call_link(value: PendingValue, call: PendingCall, arguments: List[PendingValue], below: Option[CheckedExpr], slots: List[InferenceSlot], captures: CaptureScope, constructions: List[ContextWork], assumptions: List[Checked.TraitRequirement], traits: TraitAvailability) -> Result[CheckedExpr, CheckError]:
+	frozen_operand: FrozenOperand = match below:
+		Some(first): FrozenFirstArgument(first)
+		None: NoFrozenOperand
+	form: CheckedForm ?= freeze_pending_call(call, arguments, frozen_operand, slots, captures, constructions, assumptions, traits).map(pure func(resolved): InvokeFunction(resolved))
+	finish_pending_value(value, form, slots, captures, constructions, assumptions, traits)
+
+
+-- A value's base form, before its type is published and its postfix steps fold.
+private pure func freeze_pending_form(value: PendingValue, slots: List[InferenceSlot], captures: CaptureScope, constructions: List[ContextWork], assumptions: List[Checked.TraitRequirement], traits: TraitAvailability) -> Result[CheckedForm, CheckError]:
+	match value.base:
 		PendingContext(id):
 			match constructions.get(construction_number(id)):
 				Some(CompletedContext(completed)):
@@ -2036,8 +2164,10 @@ private pure func freeze_pending_value(value: PendingValue, slots: List[Inferenc
 						Err(error): Err(error)
 				Err(error): Err(error)
 		PendingDirectCall(call, arguments):
-			freeze_pending_call(call, arguments, None, slots, captures, constructions, assumptions, traits).map(pure func(resolved): InvokeFunction(resolved))
-	base ?= base_result
+			freeze_pending_call(call, arguments, NoFrozenOperand, slots, captures, constructions, assumptions, traits).map(pure func(resolved): InvokeFunction(resolved))
+
+
+private pure func finish_pending_value(value: PendingValue, base: CheckedForm, slots: List[InferenceSlot], captures: CaptureScope, constructions: List[ContextWork], assumptions: List[Checked.TraitRequirement], traits: TraitAvailability) -> Result[CheckedExpr, CheckError]:
 	base_type ?= publish_inference_type(value.base_type, slots, CompleteInference, value.base_span)
 	-- `into_opaque` takes its arguments from its operand, not from a written
 	-- type, so it proves the opaque declaration's bounds here. A record literal
@@ -2087,7 +2217,7 @@ private pure func freeze_pending_step(step: PendingStep, receiver: CheckedExpr, 
 		AcceptedTupleElement(position): Ok(ReadTupleElement(receiver, position))
 		AcceptedField(field): Ok(ReadRecordField(receiver, field))
 		PendingInvocation(call, values):
-			match freeze_pending_call(call, values, Some(receiver), slots, captures, constructions, assumptions, traits):
+			match freeze_pending_call(call, values, FrozenReceiver(receiver), slots, captures, constructions, assumptions, traits):
 				Ok(resolved): Ok(InvokeFunction(resolved))
 				Err(error): Err(error)
 	form ?= form_result

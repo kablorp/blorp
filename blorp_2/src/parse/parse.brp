@@ -12,9 +12,11 @@ import:
 		ExpressionBase(
 			VoidExpression, IntegerExpression, FloatExpression, StringExpression, InterpolatedString, NameExpression, DirectApplication,
 			QualifiedName, QualifiedApplication, OpaqueWrap, OpaqueUnwrap, ListExpression, TupleExpression, RangeExpression, RecordExpression,
-			RecordUpdateExpression, ComparisonExpression, LogicalExpression, NotExpression, LambdaExpression, IfExpression, MatchExpression,
+			RecordUpdateExpression, ComparisonExpression, ArithmeticExpression, NegationExpression, LogicalExpression, NotExpression, LambdaExpression,
+			IfExpression, MatchExpression,
 		),
 		ComparisonOperator(EqualOperator, NotEqualOperator, LessOperator, GreaterOperator, LessEqualOperator, GreaterEqualOperator),
+		ArithmeticOperator(AddOperator, SubtractOperator, MultiplyOperator, DivideOperator, RemainderOperator),
 		LogicalOperator(AndOperator, OrOperator),
 		ElseBranch(ElseIf, ElseBlock),
 		ParsedIf,
@@ -72,7 +74,7 @@ import:
 		Symbol(
 			Wildcard, LeftParen, RightParen, Dot, Arrow, Colon, Newline, Indent, Dedent,
 			Equals, EqualsEquals, NotEquals, Less, Greater, LessEquals, GreaterEquals, QuestionEquals, LeftBracket, RightBracket, LeftBrace, RightBrace,
-			Bar, Comma, AtSign, Slash, Star, Plus, DotDot, Ellipsis,
+			Bar, Comma, AtSign, Slash, Star, Plus, Minus, Percent, DotDot, Ellipsis,
 		),
 		Token,
 		TokenKind(IdentifierToken, KeywordToken, SymbolToken, IntegerLiteral, FloatLiteral, QuotedString, PipeString, StringStart, StringSegment, InterpolationOpen, InterpolationClose, StringEnd, CharLiteral),
@@ -85,6 +87,7 @@ import:
 		Visibility(Public, Private),
 		WrittenName,
 		diagnostic,
+		internal_error,
 		source_bundle_error,
 
 
@@ -219,7 +222,6 @@ private HEX_RADIX: Int = 16
 -- ASCII codes used by literal decoding and type-parameter classification.
 private ZERO_BYTE: Int = 48
 private NINE_BYTE: Int = 57
-private MINUS_BYTE: Int = 45
 private UPPER_A_BYTE: Int = 65
 private UPPER_F_BYTE: Int = 70
 private UPPER_Z_BYTE: Int = 90
@@ -834,16 +836,12 @@ private pure func accumulate_digit(spelling: String, span: Span, limit: Int, sca
 				Ok({ position = scan.position.add(1), value = shifted_value.subtract(digit) })
 
 
-private pure func integer_value(spelling: String, span: Span) -> Result[Int, Diagnostic]:
-	negative: Bool = byte_is(spelling, 0, MINUS_BYTE)
-	digit_start: Int = if negative:
-		1
-	else:
-		0
-
-	if digit_start == spelling.length():
+-- `negative` is a folded prefix minus, so the range check sees the sign and
+-- `-9223372036854775808` is one literal.
+private pure func integer_value(spelling: String, negative: Bool, span: Span) -> Result[Int, Diagnostic]:
+	if spelling.length() == 0:
 		Err(invalid_integer(span))
-	else if and(digit_start.add(1).less_than(spelling.length()), byte_is(spelling, digit_start, ZERO_BYTE)):
+	else if and(spelling.length().greater_than(1), byte_is(spelling, 0, ZERO_BYTE)):
 		Err(diagnostic(span, "integer literals cannot have leading zeros", "write 0 or -0, or remove the leading zeros"))
 	else:
 		limit: Int = if negative:
@@ -851,7 +849,7 @@ private pure func integer_value(spelling: String, span: Span) -> Result[Int, Dia
 		else:
 			0.subtract(INT_MAX)
 		-- One Result carries the digits to the end of the spelling or to the first error.
-		var scan: Result[DigitScan, Diagnostic] = Ok({ position = digit_start, value = 0 })
+		var scan: Result[DigitScan, Diagnostic] = Ok({ position = 0, value = 0 })
 
 		while True:
 			match scan:
@@ -873,15 +871,11 @@ private pure func integer_value(spelling: String, span: Span) -> Result[Int, Dia
 			Err(error): Err(error)
 
 
-private pure func float_value(spelling: String, span: Span) -> Result[Float, Diagnostic]:
-	start = if byte_is(spelling, 0, MINUS_BYTE):
-		1
-	else:
-		0
-
+-- Negating keeps `-0.0` negative zero.
+private pure func float_value(spelling: String, negative: Bool, span: Span) -> Result[Float, Diagnostic]:
 	-- Only forged zero-only Float spellings treat an absent second byte as a digit.
-	leading_zero: Bool = if byte_is(spelling, start, ZERO_BYTE):
-		match spelling.byte_at(start.add(1)):
+	leading_zero: Bool = if byte_is(spelling, 0, ZERO_BYTE):
+		match spelling.byte_at(1):
 			Some(byte):
 				match decimal_digit(byte):
 					Some(_): True
@@ -894,7 +888,9 @@ private pure func float_value(spelling: String, span: Span) -> Result[Float, Dia
 	else:
 		match spelling.parse_float():
 			Some(value):
-				if value.is_finite():
+				if and(value.is_finite(), negative):
+					Ok(value.negate())
+				else if value.is_finite():
 					Ok(value)
 				else:
 					Err(diagnostic(span, "Float literal is outside the finite Float64 range", "use a smaller magnitude or exponent; infinities are produced by arithmetic, not literals"))
@@ -1326,11 +1322,11 @@ private pure func consume_base(start: ParserState, token: Token) -> Result[Parse
 		SymbolToken(LeftBracket):
 			consume_list_literal(after, token.span)
 		FloatLiteral(spelling):
-			match float_value(spelling, token.span):
+			match float_value(spelling, False, token.span):
 				Ok(value): Ok({ base = FloatExpression(value), span = token.span, next = after })
 				Err(error): Err(error)
 		IntegerLiteral(spelling):
-			match integer_value(spelling, token.span):
+			match integer_value(spelling, False, token.span):
 				Ok(value): Ok({ base = IntegerExpression(value), span = token.span, next = after })
 				Err(error): Err(error)
 		QuotedString(raw):
@@ -1472,9 +1468,7 @@ private pure func consume_tuple_index(state: ParserState) -> Result[ParsedPostfi
 private pure func consume_chain(state: ParserState, applications: List[PostfixOperation], end: Int, owned: Int) -> Result[ParsedPostfixes, Diagnostic]:
 	after_newline = shifted(state, 1)
 
-	if at_symbol(state, Plus):
-		Err(expected_syntax(state, "'+' is only supported between trait bounds", "use a named arithmetic function in expressions; write multiple bounds as T: First + Second"))
-	else if at_left_bracket(state):
+	if at_left_bracket(state):
 		match consume_tuple_index(state):
 			Ok(postfix): consume_chain(postfix.next, applications.append(postfix.operation), postfix.end, owned)
 			Err(error): Err(error)
@@ -1506,9 +1500,10 @@ private pure func close_chain_level(state: ParserState, applications: List[Postf
 		consume_chain(state, applications, end, remaining)
 
 
--- Precedence, lowest first: `or`, `and`, `not`, comparison, `..`, then
--- postfix operations. `or` and `and` associate left. A `not` binds below a
--- range, so `not a..b` negates the range and `a..not b` needs parentheses.
+-- Precedence, lowest first: `or`, `and`, `not`, comparison, `..`, `+ -`,
+-- `* / %`, prefix `-`, then postfix operations. `or`, `and` and the binary
+-- arithmetic levels associate left. A `not` binds below a range, so `not a..b`
+-- negates the range and `a..not b` needs parentheses.
 private pure func consume_value(start: ParserState) -> Result[ParsedValue, Diagnostic]:
 	first ?= consume_conjunction(start)
 	consume_disjunction_rest(first)
@@ -1616,7 +1611,7 @@ private pure func consume_comparison_right(left: ParsedValue, operator: Comparis
 -- One operand, or `low..high`: two operands around '..'. A range has no
 -- postfix operations of its own; group it to apply any.
 private pure func consume_range(start: ParserState) -> Result[ParsedValue, Diagnostic]:
-	low ?= consume_operand(start)
+	low ?= consume_additive(start)
 	consume_range_rest(low)
 
 
@@ -1631,12 +1626,158 @@ private pure func consume_range_rest(low: ParsedValue) -> Result[ParsedValue, Di
 		else if or(or(at_newline(after_dots), at_closing_bracket(after_dots)), at_end(after_dots)):
 			Err(expected_syntax(after_dots, "expected the range's end after '..'", "write low..high with a value on each side of '..'"))
 		else:
-			consume_operand(after_dots)
+			consume_additive(after_dots)
 		match high_result:
 			Ok(high):
 				span = { low.body.span | end = high.body.span.end }
 				Ok({ body = { base = RangeExpression(low.body, high.body), base_span = span, applications = [], span = span }, next = high.next, ending = high.ending, owed = low.owed.add(high.owed) })
 			Err(error): Err(error)
+
+
+private pure func additive_operator(state: ParserState) -> Option[ArithmeticOperator]:
+	match current_symbol(state):
+		Some(Plus): Some(AddOperator)
+		Some(Minus): Some(SubtractOperator)
+		_: None
+
+
+private pure func multiplicative_operator(state: ParserState) -> Option[ArithmeticOperator]:
+	match current_symbol(state):
+		Some(Star): Some(MultiplyOperator)
+		Some(Slash): Some(DivideOperator)
+		Some(Percent): Some(RemainderOperator)
+		_: None
+
+
+private pure func consume_additive(start: ParserState) -> Result[ParsedValue, Diagnostic]:
+	first ?= consume_multiplicative(start)
+	consume_additive_rest(first)
+
+
+private pure func consume_additive_rest(first: ParsedValue) -> Result[ParsedValue, Diagnostic]:
+	consume_arithmetic_rest(first, additive_operator, consume_multiplicative)
+
+
+private pure func consume_multiplicative(start: ParserState) -> Result[ParsedValue, Diagnostic]:
+	first ?= consume_prefix(start)
+	consume_multiplicative_rest(first)
+
+
+private pure func consume_multiplicative_rest(first: ParsedValue) -> Result[ParsedValue, Diagnostic]:
+	consume_arithmetic_rest(first, multiplicative_operator, consume_prefix)
+
+
+-- Left-associates `first op operand op operand ...` for one arithmetic level
+-- while each value ends inline; `parse_operand` is the next-tighter level. A
+-- loop, not recursion, so a long sum uses constant stack.
+private pure func consume_arithmetic_rest(
+	first: ParsedValue,
+	level_operator: pure (ParserState) -> Option[ArithmeticOperator],
+	parse_operand: pure (ParserState) -> Result[ParsedValue, Diagnostic],
+) -> Result[ParsedValue, Diagnostic]:
+	var current = first
+	var failure: Option[Diagnostic] = None
+	while and(inline(current), failure.is_none()):
+		match level_operator(current.next):
+			None: break
+			Some(operator):
+				match arithmetic_operand(current.next, arithmetic_spelling(operator), parse_operand):
+					Err(error): failure = Some(error)
+					Ok(right):
+						span = { current.body.span | end = right.body.span.end }
+						base: ExpressionBase = ArithmeticExpression(operator, parser_span(current.next), current.body, right.body)
+						current = { body = { base = base, base_span = span, applications = [], span = span }, next = right.next, ending = right.ending, owed = current.owed.add(right.owed) }
+	match failure:
+		Some(error): Err(error)
+		None: Ok(current)
+
+
+private pure func arithmetic_spelling(operator: ArithmeticOperator) -> String:
+	match operator:
+		AddOperator: "+"
+		SubtractOperator: "-"
+		MultiplyOperator: "*"
+		DivideOperator: "/"
+		RemainderOperator: "%"
+
+
+-- The operand after the arithmetic operator at `operator`, spelled `spelling`.
+-- `not` binds below arithmetic, so a bare `not` operand is rejected rather
+-- than reparsed.
+private pure func arithmetic_operand(operator: ParserState, spelling: String, parse_operand: pure (ParserState) -> Result[ParsedValue, Diagnostic]) -> Result[ParsedValue, Diagnostic]:
+	operand = shifted(operator, 1)
+	if and(at_not(operand), at_left_paren(shifted(operand, 1)).not()):
+		Err(expected_syntax(operand, "'not' cannot be an operand of '${spelling}'", "parenthesize the negation, or move it outside the arithmetic"))
+	else:
+		parse_operand(operand)
+
+
+-- Prefix `-` binds below postfix operations, so `-x.abs()` negates the call.
+-- Blorp has no prefix `+`.
+private pure func consume_prefix(start: ParserState) -> Result[ParsedValue, Diagnostic]:
+	match current_symbol(start):
+		Some(Minus): consume_minus(start)
+		Some(Plus): Err(expected_syntax(start, "Blorp has no prefix '+'", "remove the '+'; values are positive unless negated"))
+		_: consume_operand(start)
+
+
+-- `start` is at `-`. Applied directly to a numeric literal token, whatever the
+-- spacing, it folds into one negative literal, so the range check sees the
+-- sign and `-0.0` stays negative zero.
+private pure func consume_minus(start: ParserState) -> Result[ParsedValue, Diagnostic]:
+	minus = parser_span(start)
+	after = shifted(start, 1)
+	match current_token(after):
+		Some(token):
+			span = { minus | end = token.span.end }
+			match token.kind:
+				IntegerLiteral(digits):
+					match integer_value(digits, True, span):
+						Ok(value): fold_negative_literal(start, token.span, digits, IntegerExpression(value))
+						Err(error): Err(error)
+				FloatLiteral(digits):
+					match float_value(digits, True, span):
+						Ok(value): fold_negative_literal(start, token.span, digits, FloatExpression(value))
+						Err(error): Err(error)
+				_: consume_arithmetic_negation(start)
+		None: consume_arithmetic_negation(start)
+
+
+-- A postfix operation after a folded literal is rejected: the fold would read
+-- `-2.abs()` as `(-2).abs()`, but precedence reads it as `-(2.abs())`.
+private pure func fold_negative_literal(start: ParserState, literal: Span, digits: String, base: ExpressionBase) -> Result[ParsedValue, Diagnostic]:
+	minus = parser_span(start)
+	postfixes ?= consume_postfixes(shifted(start, 2), [], literal.end)
+	if postfixes.applications.is_empty():
+		span = { minus | end = literal.end }
+		Ok({ body = { base = base, base_span = span, applications = [], span = span }, next = postfixes.next, ending = postfixes.ending, owed = postfixes.owed })
+	else:
+		match first_postfix_spelling(postfixes.applications, start.input.names):
+			Some(applied): Err(diagnostic(minus, "write (-${digits})${applied} or -(${digits}${applied}) to say which is meant", "prefix '-' applies after method calls"))
+			None: Err(internal_error(minus, "a parsed postfix operation has no spelling"))
+
+
+-- The first postfix operation, which the sign would bind before or after, with
+-- any arguments or index elided. Every name came from the lexed table.
+private pure func first_postfix_spelling(applications: List[PostfixOperation], names: NameTable) -> Option[String]:
+	match applications:
+		[ReceiverInvocation(application), ..._]:
+			name_spelling(names, application.callee.id).map(pure func(name):
+				if application.arguments.is_empty():
+					".${name}()"
+				else:
+					".${name}(...)"
+			)
+		[FieldAccess(field), ..._]: name_spelling(names, field.id).map(pure func(name): ".${name}")
+		[TupleIndex(_, _), ..._]: Some("[...]")
+		[]: None
+
+
+private pure func consume_arithmetic_negation(start: ParserState) -> Result[ParsedValue, Diagnostic]:
+	minus = parser_span(start)
+	operand ?= arithmetic_operand(start, "-", consume_prefix)
+	span = { minus | end = operand.body.span.end }
+	Ok({ body = { base = NegationExpression(minus, operand.body), base_span = span, applications = [], span = span }, next = operand.next, ending = operand.ending, owed = operand.owed })
 
 
 -- A base and its postfix operations, or a control form, which takes none.
@@ -2607,7 +2748,9 @@ private pure func consume_parenthesized_line(state: ParserState) -> Result[LineF
 
 private pure func consume_parenthesized_line_value(enclosed: ParsedEnclosed) -> Result[LineForm, Diagnostic]:
 	operand ?= finish_enclosed_value(enclosed)
-	range ?= consume_range_rest(operand)
+	multiplicative ?= consume_multiplicative_rest(operand)
+	additive ?= consume_additive_rest(multiplicative)
+	range ?= consume_range_rest(additive)
 	comparison ?= consume_comparison_rest(range)
 	conjunction ?= consume_conjunction_rest(comparison)
 	value ?= consume_disjunction_rest(conjunction)

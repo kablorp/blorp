@@ -148,6 +148,26 @@ private pure func noted(
 	{ rendered(span, message, help) | note = Some(note) }
 
 
+-- How an arithmetic trait's diagnostics spell its operator, trait, member and
+-- the member's parameters.
+private record ArithmeticSpelling {
+	operator: String,
+	trait_name: String,
+	member: String,
+	parameters: String
+}
+
+
+private pure func arithmetic_spelling(arithmetic: Errors.ArithmeticTrait) -> ArithmeticSpelling:
+	match arithmetic:
+		Errors.AddableTrait: { operator = "+", trait_name = "Addable", member = "add", parameters = "Self, Self" }
+		Errors.SubtractableTrait: { operator = "-", trait_name = "Subtractable", member = "subtract", parameters = "Self, Self" }
+		Errors.MultipliableTrait: { operator = "*", trait_name = "Multipliable", member = "multiply", parameters = "Self, Self" }
+		Errors.DivisibleTrait: { operator = "/", trait_name = "Divisible", member = "divide", parameters = "Self, Self" }
+		Errors.ModulableTrait: { operator = "%", trait_name = "Modulable", member = "remainder", parameters = "Self, Self" }
+		Errors.NegatableTrait: { operator = "-", trait_name = "Negatable", member = "negate", parameters = "Self" }
+
+
 private pure func render_fault(span: Span, invariant: Errors.CheckerInvariant) -> Diagnostic:
 	rendered(
 		span,
@@ -212,7 +232,7 @@ private pure func render_context_error(context: RenderContext, error: Errors.Che
 private pure func render_constant_error(span: Span, rejection: Errors.ConstantError, context: RenderContext) -> Diagnostic:
 	match rejection:
 		Errors.NonClosedInitializer:
-			rendered(span, "constant initializer is not a closed value", "use literals, constructor data, or named function references; calls, constant references and lambdas are not allowed")
+			rendered(span, "constant initializer is not a closed value", "use literals, constructor data, or named function references; calls, operators, constant references and lambdas are not allowed")
 		Errors.ConstantCalled(id):
 			spelling = inventory_constants(context.parsed.declarations).get(constant_number(id))
 				.to_result(render_fault(span, Errors.InvalidConstantDeclaration(id)))
@@ -757,6 +777,8 @@ private pure func render_call_error(
 				conflict.mismatch.expected,
 				context,
 			)
+		Errors.TextJoinConflict(_):
+			rendered(span, "argument type does not match the parameter type", "use interpolation, such as \"n=$\{value}\", to join a value to text")
 		Errors.UncallableBinding(_, origin, value_type):
 			match origin:
 				Check.ParameterBinding(_) | Check.CallableParameterBinding(_):
@@ -1672,8 +1694,11 @@ private pure func render_trait_error(span: Span, rejection: Errors.TraitError, c
 		Errors.UnknownImplementationMethod(_): rendered(span, "implementation method is not declared by the trait", "remove this method or add a matching requirement to the trait")
 		Errors.DuplicateImplementationMethod(_, previous): noted(span, "implementation repeats a method", "provide each required method once", PreviousDeclaration(previous))
 		Errors.ImplementationSignatureMismatch(_, _, _): rendered(span, "implementation signature does not match the trait requirement", "match the requirement's purity, parameter types and return type, replacing Self with the receiver")
-		Errors.OperatorRequiresCanonical(Errors.EqualityFamily): rendered(span, "equality operators require the canonical Equatable trait", "select Equatable in the configured prelude")
-		Errors.OperatorRequiresCanonical(Errors.OrderingFamily): rendered(span, "ordering operators require the canonical Orderable trait", "select Orderable in the configured prelude")
+		Errors.OperatorRequiresCanonical(Errors.ComparisonFamily(Errors.EquatableTrait)): rendered(span, "equality operators require the canonical Equatable trait", "select Equatable in the configured prelude")
+		Errors.OperatorRequiresCanonical(Errors.ComparisonFamily(Errors.OrderableTrait)): rendered(span, "ordering operators require the canonical Orderable trait", "select Orderable in the configured prelude")
+		Errors.OperatorRequiresCanonical(Errors.ArithmeticFamily(arithmetic)):
+			spelled = arithmetic_spelling(arithmetic)
+			rendered(span, "arithmetic operator '${spelled.operator}' requires the canonical ${spelled.trait_name} trait", "select ${spelled.trait_name} in the configured prelude")
 		Errors.MissingCanonicalInequality: rendered(span, "canonical Equatable does not define not_equals", "add a pure not_equals(Self, Self) -> Bool default to the selected trait")
 		Errors.MalformedCanonicalMember(family, member):
 			match parsed_spelling(member, context.parsed.names, span):
@@ -1681,10 +1706,16 @@ private pure func render_trait_error(span: Span, rejection: Errors.TraitError, c
 				Ok(spelling):
 					-- Equatable's only reserved default is optional, so it may be renamed instead.
 					match family:
-						Errors.EqualityFamily: rendered(span, "canonical Equatable.${spelling} requires pure (Self, Self) -> Bool with a default body", "use that signature and provide a default body, or rename this helper")
-						Errors.OrderingFamily: rendered(span, "canonical Orderable.${spelling} requires pure (Self, Self) -> Bool with a default body", "use that signature and provide a default body")
-		Errors.MalformedCanonicalTrait(Errors.EqualityFamily, _): rendered(span, "canonical Equatable requires pure equals(Self, Self) -> Bool as its sole abstract method", "keep equals abstract; additional pure methods require default bodies")
-		Errors.MalformedCanonicalTrait(Errors.OrderingFamily, _): rendered(span, "canonical Orderable requires pure less_than(Self, Self) -> Bool as its sole abstract method", "keep less_than abstract; other pure methods require default bodies")
+						Errors.EquatableTrait: rendered(span, "canonical Equatable.${spelling} requires pure (Self, Self) -> Bool with a default body", "use that signature and provide a default body, or rename this helper")
+						Errors.OrderableTrait: rendered(span, "canonical Orderable.${spelling} requires pure (Self, Self) -> Bool with a default body", "use that signature and provide a default body")
+		Errors.MalformedCanonicalTrait(Errors.ComparisonFamily(Errors.EquatableTrait), _): rendered(span, "canonical Equatable requires pure equals(Self, Self) -> Bool as its sole abstract method", "keep equals abstract; additional pure methods require default bodies")
+		Errors.MalformedCanonicalTrait(Errors.ComparisonFamily(Errors.OrderableTrait), _): rendered(span, "canonical Orderable requires pure less_than(Self, Self) -> Bool as its sole abstract method", "keep less_than abstract; other pure methods require default bodies")
+		Errors.MalformedCanonicalTrait(Errors.ArithmeticFamily(arithmetic), _):
+			spelled = arithmetic_spelling(arithmetic)
+			rendered(
+				span, "canonical ${spelled.trait_name} requires pure ${spelled.member}(${spelled.parameters}) -> Self as its sole abstract method",
+				"keep ${spelled.member} abstract; other pure methods require default bodies",
+			)
 		Errors.MissingImplementation(method, _):
 			match inventory_traits(context.parsed.declarations).get(trait_number(trait_method_owner(method))):
 				None: render_fault(span, Errors.InvalidFunctionContract)
