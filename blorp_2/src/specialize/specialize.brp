@@ -46,7 +46,7 @@ opaque type UnionInstanceId = Int
 opaque type RecordInstanceId = Int
 
 
-private record FieldIdentity {
+private fixed record FieldIdentity {
 	owner: RecordInstanceId,
 	position: Int
 }
@@ -89,7 +89,7 @@ private record RecordInstance {
 }
 
 
-private record VariantIdentity {
+private fixed record VariantIdentity {
 	owner: UnionInstanceId,
 	position: Int
 }
@@ -98,7 +98,7 @@ private record VariantIdentity {
 opaque type VariantInstanceId = VariantIdentity
 
 
-private record VariantFieldIdentity {
+private fixed record VariantFieldIdentity {
 	variant: VariantInstanceId,
 	position: Int
 }
@@ -1818,8 +1818,12 @@ private pure func ensure_record(
 					prepare_record(key, checked, unions, span, records, in_progress)
 
 
+-- How a record's fields decide its storage. A fixed record has promised
+-- inline storage, which checking has verified, so any other layout is a
+-- disagreement between the two rules.
 private union RecordStoragePolicy:
 	InlineEligible
+	DeclaredInline
 	AlwaysManaged
 
 
@@ -1852,11 +1856,15 @@ private pure func prepare_source_record(
 	unions: IndexedList[UnionSlot], span: Span, records: IndexedList[RecordSlot], in_progress: List[InProgressLayout],
 ) -> Result[PreparedType, Diagnostic]:
 	declaration ?= checked.records.get(Declaration.record_number(id)).to_result(internal_error(span, "unknown record declaration"))
+	storage: RecordStoragePolicy = if declaration.fixed:
+		DeclaredInline
+	else:
+		InlineEligible
 	selected: SelectedRecord = {
 		type_parameters = declaration.type_parameters,
 		parameter_owner = Checked.RecordDeclaration(id),
 		fields = declaration.fields.map(pure func(field): field.value_type),
-		storage = InlineEligible,
+		storage = storage,
 	}
 	prepare_declared_record(key, selected, checked, unions, span, records, in_progress)
 
@@ -1886,7 +1894,7 @@ private pure func prepare_declared_record(
 	var record_dependencies = records
 	var layouts: List[InProgressLayout] = in_progress.append(InProgressRecord(key, NotReferencedBack))
 	var managed: Bool = match declaration.storage:
-		InlineEligible: False
+		InlineEligible | DeclaredInline: False
 		AlwaysManaged: True
 	var found_error: Option[Diagnostic] = None
 
@@ -1915,6 +1923,17 @@ private pure func prepare_declared_record(
 		Some(failure):
 			Err(failure)
 		None:
+			Ok(void)
+
+	-- Checking accepts a fixed record only when every field is a number, a
+	-- fixed record or a fixed union and none contains the record.
+	_: Void ?= match declaration.storage:
+		DeclaredInline:
+			if managed:
+				Err(internal_error(span, "a fixed record instance is not stored inline"))
+			else:
+				Ok(void)
+		InlineEligible | AlwaysManaged:
 			Ok(void)
 
 	representation: RecordRepresentation = if managed:

@@ -1,0 +1,360 @@
+---
+A `fixed record` or `fixed union` promises inline storage with no counted
+child: every record field is Int, Float, a fixed record, a fixed union or an
+opaque type over one of those, every union payload is one of those or Void,
+and no fixed type contains itself. Type parameters are rejected by the
+parser.
+---
+import:
+	../../../src/check/check: check, checked_functions
+	../../../src/check/render: render_failure
+	../../../src/utils/source: module_id, module_source, root_module_id, same_source
+	../module_input: TestFoundation, parse_modules, parse_modules_with_base, test_base
+	bool: and
+	int: Int methods
+	option: Option methods
+	string: String methods
+	test: TestSuite
+
+
+private ENTRY: String = "func main() -> Int:\n    0\n"
+private INLINE_PAYLOAD: String = "a fixed union payload must be stored inline"
+private INLINE_FIELD: String = "a fixed record field must be stored inline"
+private INLINE_HELP: String = "use Int, Float, a fixed record or a fixed union, or remove fixed"
+private CONTAINS_ITSELF: String = "a fixed type cannot contain itself"
+private CONTAINS_ITSELF_HELP: String = "remove fixed from the types on this cycle so they can be stored on the heap"
+
+
+-- A foundation whose Bool is not declared fixed.
+private PLAIN_BOOL_TYPES: String =
+	|type Int = builtin
+	|type Float = builtin
+	|type String = builtin
+	|type Void = builtin
+	|type List[T] = builtin
+	|union Bool:
+	|    True
+	|    False
+	|union Option[A]:
+	|    Some(A)
+	|    None
+	|union Result[Value, Error]:
+	|    Ok(Value)
+	|    Err(Error)
+	|
+
+
+-- How many checked unions and records were written `fixed`, counting the
+-- foundation's Bool, when the program is accepted.
+private pure func accepted_fixed_types(declarations: String) -> Option[Int]:
+	match parse_modules([{ source = declarations.add(ENTRY), targets = [] }]):
+		Err(_): None
+		Ok(parsed):
+			match check(parsed):
+				Err(_): None
+				Ok(accepted):
+					var count = 0
+					for declaration in checked_functions(accepted).unions:
+						if declaration.fixed:
+							count = count.add(1)
+					for declaration in checked_functions(accepted).records:
+						if declaration.fixed:
+							count = count.add(1)
+					Some(count)
+
+
+private pure func rejects(declarations: String, start: Int, end: Int, message: String, help: String) -> Bool:
+	match parse_modules([{ source = declarations.add(ENTRY), targets = [] }]):
+		Err(_): False
+		Ok(parsed):
+			match check(parsed):
+				Ok(_): False
+				Err(failure):
+					rendered = render_failure(failure).first
+					same_source(rendered.span.source, module_source(root_module_id()))
+						.and(rendered.span.start == start).and(rendered.span.end == end)
+						.and(rendered.message == message).and(rendered.help == help).and(rendered.note.is_none())
+
+
+pure func test_payload_free_fixed_union_is_accepted() -> Bool:
+	accepted_fixed_types("union Plain:\n    Only\nfixed union Light:\n    Red\n    Green\n") == Some(2)
+
+
+pure func test_number_and_void_payloads_are_accepted() -> Bool:
+	accepted_fixed_types("fixed union Reading:\n    Level(Int)\n    Ratio(Float, Int)\n    Unit(Void)\n") == Some(2)
+
+
+pure func test_fixed_union_payload_is_accepted() -> Bool:
+	accepted_fixed_types("fixed union Signal:\n    Off\n    Level(Int)\nfixed union Event:\n    Quiet\n    Pulse(Signal)\n") == Some(3)
+
+
+private FIXED_RECORD_PAYLOADS: String =
+	|fixed record Point { x: Int, y: Float }
+	|fixed record Line { start: Point, end: Point }
+	|fixed union Shape:
+	|    At(Point)
+	|    Segment(Line)
+	|
+
+
+pure func test_fixed_record_payloads_are_accepted() -> Bool:
+	accepted_fixed_types(FIXED_RECORD_PAYLOADS) == Some(4)
+
+
+-- An opaque type is stored as its underlying type.
+private OPAQUE_PAYLOADS: String =
+	|fixed record Point { x: Int, y: Int }
+	|opaque type Code = Int
+	|opaque type Spot = Point
+	|fixed union Signal:
+	|    Off
+	|    Level(Int)
+	|opaque type Mode = Signal
+	|fixed union Event:
+	|    Coded(Code)
+	|    Placed(Spot)
+	|    Switched(Mode)
+	|
+
+
+pure func test_opaque_payloads_over_fixed_storage_are_accepted() -> Bool:
+	accepted_fixed_types(OPAQUE_PAYLOADS) == Some(4)
+
+
+pure func test_string_payload_is_rejected() -> Bool:
+	rejects("fixed union Named:\n    Label(String)\n", 29, 35, INLINE_PAYLOAD, INLINE_HELP)
+
+
+pure func test_list_payload_is_rejected() -> Bool:
+	rejects("fixed union Batch:\n    Items(List[Int])\n", 29, 38, INLINE_PAYLOAD, INLINE_HELP)
+
+
+pure func test_bool_payload_is_accepted() -> Bool:
+	accepted_fixed_types("fixed union Switch:\n    Flag(Bool)\n") == Some(2)
+
+
+-- The foundation must declare Bool fixed; a plain Bool is not its designated shape.
+pure func test_plain_foundation_bool_is_rejected() -> Bool:
+	foundation: TestFoundation = { test_base() | types = PLAIN_BOOL_TYPES }
+	match parse_modules_with_base([{ source = ENTRY, targets = [] }], foundation):
+		Err(_): False
+		Ok(parsed):
+			match check(parsed):
+				Ok(_): False
+				Err(failure):
+					rendered = render_failure(failure).first
+					-- The foundation follows the one input, at position 1.
+					in_foundation = match module_id(1):
+						Some(module): same_source(rendered.span.source, module_source(module))
+						None: False
+					in_foundation
+						.and(rendered.span.start == 111).and(rendered.span.end == 115)
+						.and(rendered.message == "foundation union Bool does not have its designated shape")
+						.and(rendered.help == "declare it as fixed union Bool with exactly the variants True and False")
+						.and(rendered.note.is_none())
+
+
+-- Toggle is stored inline today, but it does not promise to stay that way.
+pure func test_ordinary_union_payload_is_rejected() -> Bool:
+	rejects("union Toggle:\n    On\n    Off\nfixed union Switch:\n    Flag(Toggle)\n", 58, 64, INLINE_PAYLOAD, INLINE_HELP)
+
+
+-- Point is stored inline today, but it does not promise to stay that way.
+pure func test_ordinary_record_payload_is_rejected() -> Bool:
+	rejects("record Point { x: Int }\nfixed union Holder:\n    Held(Point)\n", 53, 58, INLINE_PAYLOAD, INLINE_HELP)
+
+
+-- A generic record cannot be fixed, so no instance of one is a fixed payload.
+pure func test_generic_record_payload_is_rejected() -> Bool:
+	rejects("record Cell[T] { value: T }\nfixed union Holder:\n    Count(Cell[Int])\n", 58, 67, INLINE_PAYLOAD, INLINE_HELP)
+
+
+pure func test_opaque_over_managed_type_is_rejected() -> Bool:
+	rejects("opaque type Name = String\nfixed union Holder:\n    Named(Name)\n", 56, 60, INLINE_PAYLOAD, INLINE_HELP)
+
+
+-- A single self payload is admitted for an ordinary union, which is boxed.
+pure func test_direct_self_payload_is_rejected() -> Bool:
+	rejects("fixed union Tree:\n    Leaf\n    Node(Tree)\n", 36, 40, CONTAINS_ITSELF, CONTAINS_ITSELF_HELP)
+
+
+pure func test_repeated_self_payload_reports_the_first() -> Bool:
+	rejects("fixed union Tree:\n    Leaf\n    Node(Tree, Tree)\n", 36, 40, CONTAINS_ITSELF, CONTAINS_ITSELF_HELP)
+
+
+-- The walk starts at First, so Second's payload closes the cycle.
+pure func test_mutual_recursion_reports_the_closing_payload() -> Bool:
+	rejects(
+		"fixed union First:\n    Wrap(Second)\nfixed union Second:\n    Back(First)\n    Stop\n",
+		65, 70, CONTAINS_ITSELF, CONTAINS_ITSELF_HELP,
+	)
+
+
+-- A is walked first; C's payload meets D already finished through B.
+private DIAMOND: String =
+	|fixed union A:
+	|    Left(B)
+	|    Right(C)
+	|fixed union B:
+	|    HoldsD(D)
+	|fixed union C:
+	|    AlsoD(D)
+	|fixed union D:
+	|    Leaf(Int)
+	|
+
+
+pure func test_diamond_of_fixed_unions_is_accepted() -> Bool:
+	accepted_fixed_types(DIAMOND) == Some(5)
+
+
+-- A only reaches the cycle between B and C; C's payload closes it.
+pure func test_cycle_reached_from_another_union_is_rejected() -> Bool:
+	rejects(
+		"fixed union A:\n    ToB(B)\nfixed union B:\n    ToC(C)\nfixed union C:\n    Back(B)\n    Stop\n",
+		76, 77, CONTAINS_ITSELF, CONTAINS_ITSELF_HELP,
+	)
+
+
+-- A cycle through an opaque type never reaches the fixed union walk:
+-- validate_opaque_representations rejects it first, at the payload.
+pure func test_cycle_through_an_opaque_type_is_a_recursive_opaque() -> Bool:
+	rejects(
+		"opaque type Wrapped = Loop\nfixed union Loop:\n    Again(Wrapped)\n    Done\n",
+		55, 62,
+		"recursive opaque representations are not supported yet",
+		"wrap an independently recursive aggregate instead of referring back to the opaque type",
+	)
+
+
+pure func test_tuple_payload_is_rejected() -> Bool:
+	rejects("fixed union Holder:\n    Pair((Int, Int))\n", 29, 39, INLINE_PAYLOAD, INLINE_HELP)
+
+
+pure func test_callable_payload_is_rejected() -> Bool:
+	rejects("fixed union Holder:\n    Call(pure (Int) -> Int)\n", 29, 46, INLINE_PAYLOAD, INLINE_HELP)
+
+
+pure func test_number_and_bool_fields_are_accepted() -> Bool:
+	accepted_fixed_types("fixed record Sample { count: Int, ratio: Float, set: Bool }\n") == Some(2)
+
+
+pure func test_fixed_record_field_is_accepted() -> Bool:
+	accepted_fixed_types("fixed record Point { x: Int, y: Int }\nfixed record Line { start: Point, end: Point }\n") == Some(3)
+
+
+pure func test_fixed_union_field_is_accepted() -> Bool:
+	accepted_fixed_types("fixed union Signal:\n    Off\n    Level(Int)\nfixed record Reading { signal: Signal }\n") == Some(3)
+
+
+pure func test_opaque_field_over_int_is_accepted() -> Bool:
+	accepted_fixed_types("opaque type Code = Int\nfixed record Coded { code: Code }\n") == Some(2)
+
+
+pure func test_string_field_is_rejected() -> Bool:
+	rejects("fixed record Named { label: String }\n", 28, 34, INLINE_FIELD, INLINE_HELP)
+
+
+pure func test_list_field_is_rejected() -> Bool:
+	rejects("fixed record Batch { items: List[Int] }\n", 28, 37, INLINE_FIELD, INLINE_HELP)
+
+
+pure func test_void_field_is_rejected() -> Bool:
+	rejects("fixed record Marked { value: Int, unit: Void }\n", 40, 44, INLINE_FIELD, INLINE_HELP)
+
+
+pure func test_ordinary_record_field_is_rejected() -> Bool:
+	rejects("record Point { x: Int }\nfixed record Placed { at: Point }\n", 50, 55, INLINE_FIELD, INLINE_HELP)
+
+
+pure func test_ordinary_union_field_is_rejected() -> Bool:
+	rejects("union Toggle:\n    On\n    Off\nfixed record Switch { state: Toggle }\n", 58, 64, INLINE_FIELD, INLINE_HELP)
+
+
+pure func test_opaque_field_over_string_is_rejected() -> Bool:
+	rejects("opaque type Name = String\nfixed record Person { name: Name }\n", 54, 58, INLINE_FIELD, INLINE_HELP)
+
+
+pure func test_tuple_field_is_rejected() -> Bool:
+	rejects("fixed record Pair { both: (Int, Int) }\n", 26, 36, INLINE_FIELD, INLINE_HELP)
+
+
+pure func test_callable_field_is_rejected() -> Bool:
+	rejects("fixed record Handler { call: pure (Int) -> Int }\n", 29, 46, INLINE_FIELD, INLINE_HELP)
+
+
+-- The field rule accepts Chain, a fixed record; the walk finds the cycle.
+pure func test_self_containing_fixed_record_is_rejected() -> Bool:
+	rejects("fixed record Chain { value: Int, next: Chain }\n", 39, 44, CONTAINS_ITSELF, CONTAINS_ITSELF_HELP)
+
+
+-- Unions are walked first: Wrapper reaches Holder, whose field closes the cycle.
+pure func test_fixed_record_and_fixed_union_cycle_is_rejected() -> Bool:
+	rejects(
+		"fixed record Holder { inner: Wrapper }\nfixed union Wrapper:\n    Held(Holder)\n    Empty\n",
+		29, 36, CONTAINS_ITSELF, CONTAINS_ITSELF_HELP,
+	)
+
+
+-- First is walked first, so Second's field closes the cycle.
+pure func test_mutual_fixed_records_are_rejected() -> Bool:
+	rejects(
+		"fixed record First { next: Second }\nfixed record Second { back: First }\n",
+		64, 69, CONTAINS_ITSELF, CONTAINS_ITSELF_HELP,
+	)
+
+
+-- A cycle through an opaque type never reaches the fixed type walk, even
+-- with a fixed record on it: validate_opaque_representations rejects it
+-- first, at the record field that names the opaque type.
+pure func test_cycle_through_an_opaque_type_and_a_record_is_a_recursive_opaque() -> Bool:
+	rejects(
+		"opaque type Wrapped = Holder\nfixed record Holder { value: Int, inner: Wrapped }\n",
+		70, 77,
+		"recursive opaque representations are not supported yet",
+		"wrap an independently recursive aggregate instead of referring back to the opaque type",
+	)
+
+
+tests: TestSuite = {
+	description = "Fixed record and union declarations",
+	tests = [
+		("a payload-free fixed union is accepted", test_payload_free_fixed_union_is_accepted),
+		("Int, Float and Void payloads are accepted", test_number_and_void_payloads_are_accepted),
+		("a fixed union payload is accepted", test_fixed_union_payload_is_accepted),
+		("fixed record payloads are accepted", test_fixed_record_payloads_are_accepted),
+		("opaque types over fixed storage are accepted", test_opaque_payloads_over_fixed_storage_are_accepted),
+		("a String payload is rejected", test_string_payload_is_rejected),
+		("a List payload is rejected", test_list_payload_is_rejected),
+		("a Bool payload is accepted", test_bool_payload_is_accepted),
+		("a foundation Bool not declared fixed is rejected", test_plain_foundation_bool_is_rejected),
+		("an ordinary payload-free union payload is rejected", test_ordinary_union_payload_is_rejected),
+		("an ordinary record payload is rejected", test_ordinary_record_payload_is_rejected),
+		("a generic record payload is rejected", test_generic_record_payload_is_rejected),
+		("an opaque type over String is rejected", test_opaque_over_managed_type_is_rejected),
+		("a direct self payload is rejected", test_direct_self_payload_is_rejected),
+		("a repeated self payload reports the first", test_repeated_self_payload_reports_the_first),
+		("mutual recursion reports the payload that closes the cycle", test_mutual_recursion_reports_the_closing_payload),
+		("a diamond of fixed unions is accepted", test_diamond_of_fixed_unions_is_accepted),
+		("a cycle reached from another union is rejected", test_cycle_reached_from_another_union_is_rejected),
+		("a cycle through an opaque type is a recursive opaque", test_cycle_through_an_opaque_type_is_a_recursive_opaque),
+		("a tuple payload is rejected", test_tuple_payload_is_rejected),
+		("a callable payload is rejected", test_callable_payload_is_rejected),
+		("Int, Float and Bool fields are accepted", test_number_and_bool_fields_are_accepted),
+		("a fixed record field is accepted", test_fixed_record_field_is_accepted),
+		("a fixed union field is accepted", test_fixed_union_field_is_accepted),
+		("an opaque field over Int is accepted", test_opaque_field_over_int_is_accepted),
+		("a String field is rejected", test_string_field_is_rejected),
+		("a List field is rejected", test_list_field_is_rejected),
+		("a Void field is rejected", test_void_field_is_rejected),
+		("an ordinary record field is rejected", test_ordinary_record_field_is_rejected),
+		("an ordinary union field is rejected", test_ordinary_union_field_is_rejected),
+		("an opaque field over String is rejected", test_opaque_field_over_string_is_rejected),
+		("a tuple field is rejected", test_tuple_field_is_rejected),
+		("a callable field is rejected", test_callable_field_is_rejected),
+		("a fixed record containing itself is rejected", test_self_containing_fixed_record_is_rejected),
+		("a fixed record and fixed union cycle is rejected", test_fixed_record_and_fixed_union_cycle_is_rejected),
+		("mutual fixed records are rejected", test_mutual_fixed_records_are_rejected),
+		("a cycle through an opaque type and a record is a recursive opaque", test_cycle_through_an_opaque_type_and_a_record_is_a_recursive_opaque),
+	],
+}
