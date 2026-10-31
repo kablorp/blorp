@@ -97,6 +97,14 @@ private pure func verification_error(span: Span, message: String) -> Diagnostic:
 	}
 
 
+-- A fact earlier phases guarantee. The error is built here, only when the fact
+-- is missing, so the success path of a lookup allocates nothing.
+private pure func or_verification_error[T](value: Option[T], span: Span, message: String) -> Result[T, Diagnostic]:
+	match value:
+		Some(present): Ok(present)
+		None: Err(verification_error(span, message))
+
+
 -- List storage ownership is a root fact. Raw IR must also name a member of
 -- each supplied concrete catalogue; do not expand nominal fields per query.
 private pure func verify_type_membership(
@@ -183,10 +191,6 @@ private pure func known_value(
 	id: ValueId,
 	span: Span,
 ) -> Result[KnownValue, Diagnostic]:
-	error = verification_error(
-		span,
-		"value ${value_number(id).to_string()} is not defined before use",
-	)
 	ordinal = value_number(id)
 	var entry: Option[KnownValue] = None
 
@@ -201,7 +205,15 @@ private pure func known_value(
 				entry = scope.values.get(ordinal.subtract(scope.first_value))
 				break
 
-	entry.to_result(error)
+	match entry:
+		Some(known): Ok(known)
+		None:
+			Err(
+				verification_error(
+					span,
+					"value ${ordinal.to_string()} is not defined before use",
+				),
+			)
 
 
 -- An owner's slot: an enclosing owner by ordinal, or a local one by index.
@@ -405,11 +417,9 @@ private pure func verify_borrow(
 			match borrowed.result:
 				BorrowedResult(PayloadBorrow(expected)):
 					if parent == expected:
-						match borrowed.projection_parent.to_result(
-							verification_error(
-								span,
-								"projection has no parent lifetime",
-							),
+						match borrowed.projection_parent.or_verification_error(
+							span,
+							"projection has no parent lifetime",
 						):
 							Ok(ancestor):
 
@@ -656,8 +666,8 @@ private pure func verify_arguments(
 
 
 private pure func variant_shape(id: VariantInstanceId, unions: List[ConcreteUnion], span: Span) -> Result[List[TypeRef], Diagnostic]:
-	declaration ?= unions.get(union_number(variant_owner(id))).to_result(verification_error(span, "unknown variant owner"))
-	union_variants(declaration).get(variant_number(id)).to_result(verification_error(span, "unknown variant identity"))
+	declaration ?= unions.get(union_number(variant_owner(id))).or_verification_error(span, "unknown variant owner")
+	union_variants(declaration).get(variant_number(id)).or_verification_error(span, "unknown variant identity")
 
 
 private pure func variant_type(id: VariantInstanceId, expected: List[TypeRef], unions: List[ConcreteUnion], span: Span) -> Result[TypeRef, Diagnostic]:
@@ -1106,7 +1116,7 @@ private pure func record_layout(
 ) -> Result[ConcreteRecord, Diagnostic]:
 	layout ?= records
 		.get(record_number(owner))
-		.to_result(verification_error(span, "unknown record layout"))
+		.or_verification_error(span, "unknown record layout")
 	valid_record_layout(layout, span)
 
 
@@ -1121,7 +1131,7 @@ private pure func record_field_type(
 	else:
 		record_fields(layout)
 			.get(field_number(field))
-			.to_result(verification_error(span, "unknown record field"))
+			.or_verification_error(span, "unknown record field")
 
 
 private pure func definition_value(
@@ -2476,7 +2486,7 @@ private pure func selection_target(
 		if id == target.id:
 			found = Some(target)
 			break
-	found.to_result(verification_error(span, "selection enters an unknown arm"))
+	found.or_verification_error(span, "selection enters an unknown arm")
 
 
 private pure func merge_possible(existing: List[Bool], incoming: List[Bool]) -> List[Bool]:
@@ -2763,7 +2773,7 @@ private pure func refine_variants(place: ConcretePatternPlace, variant: VariantI
 	else:
 		Err(verification_error(span, "selection variant belongs to another union"))
 	possible ?= variant_possibilities(place, facts, unions, span)
-	declared ?= possible.get(variant_number(variant)).to_result(verification_error(span, "unknown variant identity"))
+	declared ?= possible.get(variant_number(variant)).or_verification_error(span, "unknown variant identity")
 	var refined: List[Bool] = []
 	var position = 0
 	for included in possible:
