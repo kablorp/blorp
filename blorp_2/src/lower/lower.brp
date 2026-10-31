@@ -41,7 +41,7 @@ import:
 		variant_owner,
 		VariantInstanceId,
 		specialized_contents,
-	../utils/syntax: Diagnostic, Entrypoint, FunctionExecution(OrdinaryCalls, SelfTailLoop), Span, diagnostic
+	../utils/syntax: Diagnostic, Entrypoint, FunctionExecution(OrdinaryCalls, SelfTailLoop), Span, diagnostic, internal_error
 
 
 -- A value identity belongs to one lowered function, including its branches.
@@ -1069,8 +1069,8 @@ private pure func lower_statement(
 		DiscardExpression(value): lower_block_value(builder, bindings, value, facts, context)
 		RunWhile(loop): prepare_while(builder, bindings, loop, facts)
 		RunFor(loop): prepare_for(builder, bindings, loop, facts)
-		BreakSourceLoop(span): Err(invalid_binding(span))
-		ContinueSourceLoop(span): Err(invalid_binding(span))
+		BreakSourceLoop(span): Err(internal_error(span, "source loop control was not normalized into a block tail"))
+		ContinueSourceLoop(span): Err(internal_error(span, "source loop control was not normalized into a block tail"))
 
 
 -- consume_loop_control in Parse rejects ValueInLoop: initializers,
@@ -1193,6 +1193,16 @@ private pure func source_edge(
 	match control:
 		BreakSource: Ok(Break({ value = context.result, carried = carried, span = span }))
 		ContinueSource: Ok(Recur(context.next.concat(carried), span))
+
+
+private pure func enclosing_loop(
+	context: Option[SourceLoopContext],
+	span: Span,
+	message: String,
+) -> Result[SourceLoopContext, Diagnostic]:
+	match context:
+		Some(loop): Ok(loop)
+		None: Err(internal_error(span, message))
 
 
 private pure func lower_control(
@@ -1917,7 +1927,7 @@ private pure func lower_yielding_arm(
 ) -> Result[BuiltJoinArm, Diagnostic]:
 	value: PreparedValue ?= match arm.body.tail:
 		ProducesValue(value): Ok(value)
-		_: Err(invalid_binding(arm.span))
+		_: Err(internal_error(arm.span, "join arm yields no value"))
 	result ?= lower_prepared_value({ next_value = prefix.next_value, entries = [] }, prefix.bindings, value, facts, context)
 	outgoing ?= carried_values(result.bindings, carried, arm.span)
 	completed ?= complete_joins(prefix.entries.concat(result.builder.entries), result.builder.next_value, facts, unions)
@@ -1938,7 +1948,7 @@ private pure func lower_abrupt_arm(
 	context: Option[SourceLoopContext],
 ) -> Result[BuiltJoinArm, Diagnostic]:
 	span = arm.span
-	loop ?= context.to_result(invalid_binding(span))
+	loop ?= enclosing_loop(context, span, "abrupt join arm has no enclosing loop")
 	completed ?= complete_abrupt_block(prefix, facts, unions, span)
 	exit: JoinExit = TransferLoop(loop.target, completed.body.tail)
 	Ok({
