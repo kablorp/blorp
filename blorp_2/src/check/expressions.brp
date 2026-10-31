@@ -125,6 +125,7 @@ import:
 	../namespace/namespace: NamedValue(NamedMethod, NamedFunction, NamedConstant, NamedConstructor, NamedAlias), OfferedValue(OfferedMethod, OfferedFunction, OfferedConstant, OfferedConstructor), TypeHead(OpaqueHead), named_type, named_value, offered_value
 	int: Int methods
 	option: Option methods
+	../utils/stack: push_at
 	../utils/results: translated_list
 	../utils/syntax:
 		ParsedLambda, ParsedBlock, LambdaBody(InlineBody, BlockBody), ParsedBinder(NamedBinder, DiscardBinder), type_span,
@@ -453,20 +454,6 @@ private pure func capture_operands(id: LambdaId, parent_body: BodyOwner, lambdas
 	match failure:
 		Some(error): Err(error)
 		None: Ok(operands)
-
-
-private pure func push_expression_work(work: List[Option[ExpressionWork]], depth: Int, action: ExpressionWork) -> List[Option[ExpressionWork]]:
-	if depth.less_than(work.length()):
-		work.set(depth, Some(action))
-	else:
-		work.append(Some(action))
-
-
-private pure func push_operand(values: List[Option[PendingValue]], depth: Int, value: PendingValue) -> List[Option[PendingValue]]:
-	if depth.less_than(values.length()):
-		values.set(depth, Some(value))
-	else:
-		values.append(Some(value))
 
 
 private pure func expression_operand(values: List[Option[PendingValue]], position: Int, span: Span) -> Result[PendingValue, CheckError]:
@@ -1055,7 +1042,7 @@ private pure func elaborate_value(
 												inference_revision = inference_revision.add(1)
 												value: PendingValue = { span = written.span, readiness = DeferredInference, base = PendingLambda(id),
 													base_type = admitted.value_type, base_span = written.base_span, operations = NoPendingOperations }
-												operands = push_operand(operands, operand_count, value)
+												operands = push_at(operands, operand_count, Some(value))
 												operand_count = operand_count.add(1)
 												var position = admitted.constraints.length()
 												while position.greater_than(0):
@@ -1063,14 +1050,14 @@ private pure func elaborate_value(
 													match admitted.constraints.get(position):
 														None: failure = Some(checker_invariant(written.span, InvalidInferenceWorklist))
 														Some(equality):
-															work = push_expression_work(work, work_count, SolveConstraint(equality))
+															work = push_at(work, work_count, Some(SolveConstraint(equality)))
 															work_count = work_count.add(1)
 
 							_:
 								match resolve_callable_operand(written, scope, site, slots.length()):
 									Err(error): failure = Some(error)
 									Ok(StoredCallableOperand):
-										work = push_expression_work(work, work_count, EnterExpression(written, hint))
+										work = push_at(work, work_count, Some(EnterExpression(written, hint)))
 										work_count = work_count.add(1)
 									Ok(KnownCallableOperand(value)):
 										match value.base:
@@ -1083,7 +1070,7 @@ private pure func elaborate_value(
 											_: void
 										match callable_permission(value, hint, slots):
 											Ok(viewed):
-												operands = push_operand(operands, operand_count, viewed)
+												operands = push_at(operands, operand_count, Some(viewed))
 												operand_count = operand_count.add(1)
 											Err(error): failure = Some(error)
 					EnterExpression(written, hint):
@@ -1110,7 +1097,7 @@ private pure func elaborate_value(
 								match plan_expression(scope, written, hint, site, construction, slots, postfixes):
 									Err(error): failure = Some(error)
 									Ok(plan):
-										work = push_expression_work(work, work_count, ContinuePostfix(plan.postfixes, plan.hints, 0, written.base_span, written.span, hint))
+										work = push_at(work, work_count, Some(ContinuePostfix(plan.postfixes, plan.hints, 0, written.base_span, written.span, hint)))
 										work_count = work_count.add(1)
 
 										match plan.base:
@@ -1119,11 +1106,11 @@ private pure func elaborate_value(
 												context_work = context_work.append(AwaitingContext(construct, expected, scope, site, written.base_span))
 												inference_revision = inference_revision.add(1)
 												value: PendingValue = { span = written.span, readiness = DeferredInference, base = PendingContext(id), base_type = expected, base_span = written.base_span, operations = NoPendingOperations }
-												operands = push_operand(operands, operand_count, value)
+												operands = push_at(operands, operand_count, Some(value))
 												operand_count = operand_count.add(1)
 
 											PlannedCallable(value, callable_hint):
-												work = push_expression_work(work, work_count, EnterCallable(value, callable_hint))
+												work = push_at(work, work_count, Some(EnterCallable(value, callable_hint)))
 												work_count = work_count.add(1)
 											PlannedLeaf(base, value_type):
 												accepted_base: Result[PendingBase, CheckError] = match base:
@@ -1145,45 +1132,45 @@ private pure func elaborate_value(
 													Err(error): failure = Some(error)
 													Ok(leaf):
 														value: PendingValue = { span = written.span, readiness = ClosedInference, base = leaf, base_type = inference_type(value_type, [], 0), base_span = written.base_span, operations = NoPendingOperations }
-														operands = push_operand(operands, operand_count, value)
+														operands = push_at(operands, operand_count, Some(value))
 														operand_count = operand_count.add(1)
 											PlannedConstructOpaque(declaration, operand):
 												conversion = opaque_conversion(declaration, slots.length())
 												for parameter in declaration.type_parameters:
 													slots = slots.append({ parameter = parameter, call_span = written.base_span, first_argument = None, state = UnboundVariable(0) })
-												work = push_expression_work(work, work_count, FinishConstructOpaque(conversion, written.base_span))
+												work = push_at(work, work_count, Some(FinishConstructOpaque(conversion, written.base_span)))
 												work_count = work_count.add(1)
-												work = push_expression_work(work, work_count, EnterExpression(operand, Some(conversion.underlying_type)))
+												work = push_at(work, work_count, Some(EnterExpression(operand, Some(conversion.underlying_type))))
 												work_count = work_count.add(1)
 											PlannedProjectOpaque(declaration, operand):
 												conversion = opaque_conversion(declaration, slots.length())
 												for parameter in declaration.type_parameters:
 													slots = slots.append({ parameter = parameter, call_span = written.base_span, first_argument = None, state = UnboundVariable(0) })
-												work = push_expression_work(work, work_count, FinishProjectOpaque(conversion, written.base_span))
+												work = push_at(work, work_count, Some(FinishProjectOpaque(conversion, written.base_span)))
 												work_count = work_count.add(1)
-												work = push_expression_work(work, work_count, EnterExpression(operand, Some(conversion.opaque_type)))
+												work = push_at(work, work_count, Some(EnterExpression(operand, Some(conversion.opaque_type))))
 												work_count = work_count.add(1)
 											PlannedRecord(literal):
-												work = push_expression_work(work, work_count, ScheduleRecord(literal))
+												work = push_at(work, work_count, Some(ScheduleRecord(literal)))
 												work_count = work_count.add(1)
 											PlannedUpdate(base, fields, update_hint):
-												work = push_expression_work(work, work_count, PlanRecordUpdate(fields, written.base_span, base.span))
+												work = push_at(work, work_count, Some(PlanRecordUpdate(fields, written.base_span, base.span)))
 												work_count = work_count.add(1)
-												work = push_expression_work(work, work_count, EnterExpression(base, update_hint))
+												work = push_at(work, work_count, Some(EnterExpression(base, update_hint)))
 												work_count = work_count.add(1)
 											PlannedVariant(contract, arguments):
-												work = push_expression_work(work, work_count, ScheduleVariant(contract, arguments, written.span))
+												work = push_at(work, work_count, Some(ScheduleVariant(contract, arguments, written.span)))
 												work_count = work_count.add(1)
 											PlannedStoredCall(callee, contract, arguments, placement, call_hint):
 												call: PendingCall = { target = PendingStored(callee), signature = contract.signature, span = contract.span, variable_start = slots.length() }
-												work = push_expression_work(work, work_count, StartCall(call, arguments, placement, call_hint))
+												work = push_at(work, work_count, Some(StartCall(call, arguments, placement, call_hint)))
 												work_count = work_count.add(1)
 											PlannedCall(contract, arguments, placement, call_hint):
-												work = push_expression_work(work, work_count, ScheduleCall(contract, arguments, placement, call_hint))
+												work = push_at(work, work_count, Some(ScheduleCall(contract, arguments, placement, call_hint)))
 												work_count = work_count.add(1)
 											PlannedInterpolation(parts):
 												range: OperandRange = { start = operand_count, count = parts.length() }
-												work = push_expression_work(work, work_count, FinishInterpolation(range, written.base_span, written.span))
+												work = push_at(work, work_count, Some(FinishInterpolation(range, written.base_span, written.span)))
 												work_count = work_count.add(1)
 												var position = parts.length()
 												while position.greater_than(0):
@@ -1191,26 +1178,26 @@ private pure func elaborate_value(
 													match parts.get(position):
 														None: failure = Some(checker_invariant(written.span, InvalidInferenceWorklist))
 														Some(part):
-															work = push_expression_work(work, work_count, EnterExpression(part, Some(AcceptedType(StringType))))
+															work = push_at(work, work_count, Some(EnterExpression(part, Some(AcceptedType(StringType)))))
 															work_count = work_count.add(1)
 											PlannedTuple(elements, hints):
 												range: OperandRange = { start = operand_count, count = elements.length() }
-												work = push_expression_work(work, work_count, FinishTuple(range, written.base_span, written.span))
+												work = push_at(work, work_count, Some(FinishTuple(range, written.base_span, written.span)))
 												work_count = work_count.add(1)
 												var position = elements.length()
 												while position.greater_than(0):
 													position = position.subtract(1)
 													match elements.get(position):
 														Some(element):
-															work = push_expression_work(work, work_count, EnterExpression(element, hints.get(position).get_or(None)))
+															work = push_at(work, work_count, Some(EnterExpression(element, hints.get(position).get_or(None))))
 															work_count = work_count.add(1)
 														None: failure = Some(checker_invariant(written.span, InvalidInferenceWorklist))
 											PlannedList(elements, source):
-												work = push_expression_work(work, work_count, ContinueList({ source = source, elements = elements, position = 0, start = operand_count, base_span = written.base_span, span = written.span }))
+												work = push_at(work, work_count, Some(ContinueList({ source = source, elements = elements, position = 0, start = operand_count, base_span = written.base_span, span = written.span })))
 												work_count = work_count.add(1)
 					ScheduleVariant(contract, arguments, span):
 						range: OperandRange = { start = operand_count, count = arguments.length() }
-						work = push_expression_work(work, work_count, FinishVariant(contract, range, span))
+						work = push_at(work, work_count, Some(FinishVariant(contract, range, span)))
 						work_count = work_count.add(1)
 						var position = arguments.length()
 						while position.greater_than(0):
@@ -1221,7 +1208,7 @@ private pure func elaborate_value(
 									match contract.fields.get(position):
 										None: failure = Some(checker_invariant(contract.span, GenericConstructorContract))
 										Some(field):
-											work = push_expression_work(work, work_count, EnterExpression(argument, Some(field.value_type)))
+											work = push_at(work, work_count, Some(EnterExpression(argument, Some(field.value_type))))
 											work_count = work_count.add(1)
 					FinishInterpolation(range, base_span, span):
 						match call_operands(operands, range, base_span):
@@ -1231,11 +1218,11 @@ private pure func elaborate_value(
 									operands = operands.set(position, None)
 								operand_count = range.start
 								value: PendingValue = { base = PendingInterpolatedString(parts), base_type = AcceptedType(StringType), readiness = DeferredInference, base_span = base_span, span = span, operations = NoPendingOperations }
-								operands = push_operand(operands, operand_count, value)
+								operands = push_at(operands, operand_count, Some(value))
 								operand_count = operand_count.add(1)
 								for part in parts:
 									equality: InferenceEquality = { expected = AcceptedType(StringType), actual = pending_type(part), origin = InterpolationConstraint(part.span), relation = RequireEquality, parameter = None }
-									work = push_expression_work(work, work_count, SolveConstraint(equality))
+									work = push_at(work, work_count, Some(SolveConstraint(equality)))
 									work_count = work_count.add(1)
 					FinishTuple(range, base_span, span):
 						match call_operands(operands, range, span):
@@ -1252,7 +1239,7 @@ private pure func elaborate_value(
 									span = span,
 									operations = NoPendingOperations,
 								}
-								operands = push_operand(operands, operand_count, value)
+								operands = push_at(operands, operand_count, Some(value))
 								operand_count = operand_count.add(1)
 					FinishConstructOpaque(conversion, span):
 						position = operand_count.subtract(1)
@@ -1262,7 +1249,7 @@ private pure func elaborate_value(
 								operands = operands.set(position, Some(opaque_value(PendingConstructOpaque(conversion, operand), conversion.opaque_type, span)))
 								match opaque_operand_constraint(operand, conversion.underlying_type, OpaqueConstruction(conversion.id)):
 									Some(equality):
-										work = push_expression_work(work, work_count, SolveConstraint(equality))
+										work = push_at(work, work_count, Some(SolveConstraint(equality)))
 										work_count = work_count.add(1)
 									None: void
 					FinishProjectOpaque(conversion, span):
@@ -1273,7 +1260,7 @@ private pure func elaborate_value(
 								operands = operands.set(position, Some(opaque_value(PendingProjectOpaque(conversion, operand), conversion.underlying_type, span)))
 								match opaque_operand_constraint(operand, conversion.opaque_type, OpaqueProjection(conversion.id)):
 									Some(equality):
-										work = push_expression_work(work, work_count, SolveConstraint(equality))
+										work = push_at(work, work_count, Some(SolveConstraint(equality)))
 										work_count = work_count.add(1)
 									None: void
 					PlanRecordUpdate(fields, span, expression_span):
@@ -1286,17 +1273,17 @@ private pure func elaborate_value(
 									Ok(plan):
 										operands = operands.set(position, None)
 										operand_count = position
-										work = push_expression_work(work, work_count, ScheduleRecord(plan))
+										work = push_at(work, work_count, Some(ScheduleRecord(plan)))
 										work_count = work_count.add(1)
 					ScheduleRecord(literal):
-						work = push_expression_work(work, work_count, FinishRecord(literal, { start = operand_count, count = literal.fields.length() }))
+						work = push_at(work, work_count, Some(FinishRecord(literal, { start = operand_count, count = literal.fields.length() })))
 						work_count = work_count.add(1)
 						var position = literal.fields.length()
 						while position.greater_than(0):
 							position = position.subtract(1)
 							match literal.fields.get(position):
 								Some(field):
-									work = push_expression_work(work, work_count, EnterExpression(field.written, Some(field.expected.value_type)))
+									work = push_at(work, work_count, Some(EnterExpression(field.written, Some(field.expected.value_type))))
 									work_count = work_count.add(1)
 								None: failure = Some(checker_invariant(literal.span, InvalidInferenceWorklist))
 					FinishRecord(literal, range):
@@ -1306,7 +1293,7 @@ private pure func elaborate_value(
 								for operand_position in range.start..operand_count:
 									operands = operands.set(operand_position, None)
 								operand_count = range.start
-								work = push_expression_work(work, work_count, CheckRecord(literal, fields))
+								work = push_at(work, work_count, Some(CheckRecord(literal, fields)))
 								work_count = work_count.add(1)
 								var position = fields.length()
 								while position.greater_than(0):
@@ -1323,14 +1310,14 @@ private pure func elaborate_value(
 												_: False
 											if settled.not():
 												equality: InferenceEquality = { expected = field.expected.value_type, actual = pending_type(field.value), origin = RecordFieldConstraint(field.field, field.expected, field.value.span), relation = CollectArguments, parameter = None }
-												work = push_expression_work(work, work_count, SolveConstraint(equality))
+												work = push_at(work, work_count, Some(SolveConstraint(equality)))
 												work_count = work_count.add(1)
 										None: failure = Some(checker_invariant(literal.span, InvalidInferenceWorklist))
 					CheckRecord(literal, fields):
 						match finish_pending_record(literal, fields, slots):
 							Err(error): failure = Some(error)
 							Ok(value):
-								operands = push_operand(operands, operand_count, value)
+								operands = push_at(operands, operand_count, Some(value))
 								operand_count = operand_count.add(1)
 					FinishVariant(contract, range, span):
 						match call_operands(operands, range, span):
@@ -1339,7 +1326,7 @@ private pure func elaborate_value(
 								for position in range.start..operand_count:
 									operands = operands.set(position, None)
 								operand_count = range.start
-								work = push_expression_work(work, work_count, CheckVariant(contract, values, span))
+								work = push_at(work, work_count, Some(CheckVariant(contract, values, span)))
 								work_count = work_count.add(1)
 								var position = values.length()
 								while position.greater_than(0):
@@ -1358,20 +1345,20 @@ private pure func elaborate_value(
 														_: False
 													if settled.not():
 														equality: InferenceEquality = { expected = expected.value_type, actual = pending_type(actual), origin = VariantConstraint(contract, position), relation = CollectArguments, parameter = None }
-														work = push_expression_work(work, work_count, SolveConstraint(equality))
+														work = push_at(work, work_count, Some(SolveConstraint(equality)))
 														work_count = work_count.add(1)
 					CheckVariant(contract, values, span):
 						match finish_pending_variant(contract, values, span, slots):
 							Err(error): failure = Some(error)
 							Ok(value):
-								operands = push_operand(operands, operand_count, value)
+								operands = push_at(operands, operand_count, Some(value))
 								operand_count = operand_count.add(1)
 					-- Elements enter one at a time so that, once E is known, every later
 					-- element is checked under E as its expected type: a nested `[]`
 					-- after a sibling receives its element type from E = List[T].
 					ContinueList(progress):
 						if progress.position == progress.elements.length():
-							work = push_expression_work(work, work_count, FinishList(progress.source, { start = progress.start, count = progress.position }, progress.base_span, progress.span))
+							work = push_at(work, work_count, Some(FinishList(progress.source, { start = progress.start, count = progress.position }, progress.base_span, progress.span)))
 							work_count = work_count.add(1)
 						else:
 							hint_result: Result[Option[InferenceType], CheckError] = match progress.source:
@@ -1389,9 +1376,9 @@ private pure func elaborate_value(
 									match progress.elements.get(progress.position):
 										None: failure = Some(checker_invariant(progress.base_span, InvalidInferenceWorklist))
 										Some(element):
-											work = push_expression_work(work, work_count, ContinueList({ progress | position = progress.position.add(1) }))
+											work = push_at(work, work_count, Some(ContinueList({ progress | position = progress.position.add(1) })))
 											work_count = work_count.add(1)
-											work = push_expression_work(work, work_count, EnterExpression(element, hint))
+											work = push_at(work, work_count, Some(EnterExpression(element, hint)))
 											work_count = work_count.add(1)
 					FinishList(source, range, base_span, span):
 						match call_operands(operands, range, base_span):
@@ -1400,7 +1387,7 @@ private pure func elaborate_value(
 								for position in range.start..operand_count:
 									operands = operands.set(position, None)
 								operand_count = range.start
-								work = push_expression_work(work, work_count, CheckList(source, values, base_span, span))
+								work = push_at(work, work_count, Some(CheckList(source, values, base_span, span)))
 								work_count = work_count.add(1)
 								match list_element_type(source, values, base_span):
 									Err(error): failure = Some(error)
@@ -1423,13 +1410,13 @@ private pure func elaborate_value(
 														_: False
 													if settled.not():
 														equality: InferenceEquality = { expected = element, actual = pending_type(actual), origin = ListElementConstraint(position.add(1), actual.span), relation = CollectArguments, parameter = None }
-														work = push_expression_work(work, work_count, SolveConstraint(equality))
+														work = push_at(work, work_count, Some(SolveConstraint(equality)))
 														work_count = work_count.add(1)
 					CheckList(source, values, base_span, span):
 						match finish_pending_list(source, values, span, base_span, slots):
 							Err(error): failure = Some(error)
 							Ok(value):
-								operands = push_operand(operands, operand_count, value)
+								operands = push_at(operands, operand_count, Some(value))
 								operand_count = operand_count.add(1)
 					ScheduleCall(contract, arguments, placement, hint):
 						match body_context(site, contract.span):
@@ -1460,7 +1447,7 @@ private pure func elaborate_value(
 										call: PendingCall = { target = target, signature = contract.signature, span = contract.span, variable_start = slots.length() }
 										for parameter in contract.signature.type_parameters:
 											slots = slots.append({ parameter = parameter, call_span = contract.span, first_argument = None, state = UnboundVariable(0) })
-										work = push_expression_work(work, work_count, StartCall(call, arguments, placement, hint))
+										work = push_at(work, work_count, Some(StartCall(call, arguments, placement, hint)))
 										work_count = work_count.add(1)
 
 					StartCall(call, arguments, placement, hint):
@@ -1474,7 +1461,7 @@ private pure func elaborate_value(
 								match permitted:
 									Err(error): failure = Some(error)
 									Ok(viewed_placement):
-										work = push_expression_work(work, work_count, FinishCall(call, { start = operand_count, count = arguments.length() }, viewed_placement))
+										work = push_at(work, work_count, Some(FinishCall(call, { start = operand_count, count = arguments.length() }, viewed_placement)))
 										work_count = work_count.add(1)
 										var position = arguments.length()
 
@@ -1486,7 +1473,7 @@ private pure func elaborate_value(
 													failure = Some(error)
 													break
 												Ok(argument):
-													work = push_expression_work(work, work_count, argument)
+													work = push_at(work, work_count, Some(argument))
 													work_count = work_count.add(1)
 					FinishCall(call, range, placement):
 						match call_operands(operands, range, call.span):
@@ -1496,7 +1483,7 @@ private pure func elaborate_value(
 									operands = operands.set(position, None)
 
 								operand_count = range.start
-								work = push_expression_work(work, work_count, CheckCall(call, arguments, placement))
+								work = push_at(work, work_count, Some(CheckCall(call, arguments, placement)))
 								work_count = work_count.add(1)
 								actual = placed_arguments(arguments, placement, call.span)
 								var position = actual.length()
@@ -1509,13 +1496,13 @@ private pure func elaborate_value(
 											failure = Some(error)
 											break
 										Ok(equality):
-											work = push_expression_work(work, work_count, SolveConstraint(equality))
+											work = push_at(work, work_count, Some(SolveConstraint(equality)))
 											work_count = work_count.add(1)
 					CheckCall(call, arguments, placement):
 						match finish_pending_call(call, arguments, placement, slots):
 							Err(error): failure = Some(error)
 							Ok(value):
-								operands = push_operand(operands, operand_count, value)
+								operands = push_at(operands, operand_count, Some(value))
 								operand_count = operand_count.add(1)
 					ContinuePostfix(postfixes, hints, position, base_span, span, expected):
 						operand_count = operand_count.subtract(1)
@@ -1528,11 +1515,11 @@ private pure func elaborate_value(
 								if position == postfixes.length():
 									match callable_permission(current, expected, slots):
 										Ok(viewed):
-											operands = push_operand(operands, operand_count, { viewed | span = span })
+											operands = push_at(operands, operand_count, Some({ viewed | span = span }))
 											operand_count = operand_count.add(1)
 										Err(error): failure = Some(error)
 								else:
-									work = push_expression_work(work, work_count, ContinuePostfix(postfixes, hints, position.add(1), base_span, span, expected))
+									work = push_at(work, work_count, Some(ContinuePostfix(postfixes, hints, position.add(1), base_span, span, expected)))
 									work_count = work_count.add(1)
 
 									match postfixes.get(position):
@@ -1540,22 +1527,22 @@ private pure func elaborate_value(
 											match pending_tuple_index(index, { source = base_span.source, start = base_span.start, end = index_span.end }, current, slots):
 												Err(error): failure = Some(error)
 												Ok(value):
-													operands = push_operand(operands, operand_count, value)
+													operands = push_at(operands, operand_count, Some(value))
 													operand_count = operand_count.add(1)
 										Some(PendingField(name)):
 											match pending_field(name, current, slots, construction):
 												Err(error): failure = Some(error)
 												Ok(value):
-													operands = push_operand(operands, operand_count, value)
+													operands = push_at(operands, operand_count, Some(value))
 													operand_count = operand_count.add(1)
 										Some(PendingReceiverInvocation(application, call)):
-											work = push_expression_work(work, work_count, StartCall(call, application.arguments, ReceiverPlacement(current, { source = base_span.source, start = base_span.start, end = application.span.end }), hints.get(position).get_or(None)))
+											work = push_at(work, work_count, Some(StartCall(call, application.arguments, ReceiverPlacement(current, { source = base_span.source, start = base_span.start, end = application.span.end }), hints.get(position).get_or(None))))
 											work_count = work_count.add(1)
 										Some(PendingOverloadInvocation(application, candidates)):
 											match pending_receiver_contract(current, application, ReceiverCandidates(candidates), site, slots):
 												Err(error): failure = Some(error)
 												Ok(contract):
-													work = push_expression_work(work, work_count, ScheduleCall(contract, application.arguments, ReceiverPlacement(current, { source = base_span.source, start = base_span.start, end = application.span.end }), hints.get(position).get_or(None)))
+													work = push_at(work, work_count, Some(ScheduleCall(contract, application.arguments, ReceiverPlacement(current, { source = base_span.source, start = base_span.start, end = application.span.end }), hints.get(position).get_or(None))))
 													work_count = work_count.add(1)
 										None: failure = Some(checker_invariant(span, InvalidInferenceWorklist))
 					SolveConstraint(equality):
@@ -1592,7 +1579,7 @@ private pure func elaborate_value(
 												for update in updates:
 													slots = slots.set(update.position, update.slot)
 											ExpandInferenceList(child):
-												work = push_expression_work(work, work_count, SolveConstraint(child))
+												work = push_at(work, work_count, Some(SolveConstraint(child)))
 												work_count = work_count.add(1)
 											ExpandInferenceArguments(current, left, right):
 												var position = left.length()
@@ -1605,15 +1592,15 @@ private pure func elaborate_value(
 															failure = Some(error)
 															break
 														Ok(child):
-															work = push_expression_work(work, work_count, SolveConstraint(child))
+															work = push_at(work, work_count, Some(SolveConstraint(child)))
 															work_count = work_count.add(1)
 					ResolveContexts(position, revision):
 						match context_work.get(position):
 							None:
-								work = push_expression_work(work, work_count, ResolveLambdas(0, revision))
+								work = push_at(work, work_count, Some(ResolveLambdas(0, revision)))
 								work_count = work_count.add(1)
 							Some(item):
-								work = push_expression_work(work, work_count, ResolveContexts(position.add(1), revision))
+								work = push_at(work, work_count, Some(ResolveContexts(position.add(1), revision)))
 								work_count = work_count.add(1)
 								match item:
 									CompletedContext(_): void
@@ -1625,16 +1612,16 @@ private pure func elaborate_value(
 												match resume_construction(construct, head, site_construction(local_site), slots):
 													Err(error): failure = Some(error)
 													Ok(plan):
-														work = push_expression_work(work, work_count, FinishContext(position, scope, site, operand_count))
+														work = push_at(work, work_count, Some(FinishContext(position, scope, site, operand_count)))
 														work_count = work_count.add(1)
 														scope = local_scope
 														site = local_site
 														match plan:
 															PlannedRecord(literal):
-																work = push_expression_work(work, work_count, ScheduleRecord(literal))
+																work = push_at(work, work_count, Some(ScheduleRecord(literal)))
 																work_count = work_count.add(1)
 															PlannedVariant(contract, arguments):
-																work = push_expression_work(work, work_count, ScheduleVariant(contract, arguments, span))
+																work = push_at(work, work_count, Some(ScheduleVariant(contract, arguments, span)))
 																work_count = work_count.add(1)
 															_: failure = Some(checker_invariant(span, InvalidInferenceWorklist))
 					FinishContext(position, parent_scope, parent_site, start):
@@ -1658,7 +1645,7 @@ private pure func elaborate_value(
 												ResolveLambdas(0, inference_revision)
 											else:
 												ResolveContexts(0, inference_revision)
-											work = push_expression_work(work, work_count, next_resolution)
+											work = push_at(work, work_count, Some(next_resolution))
 											work_count = work_count.add(1)
 										else:
 											for pending in context_work:
@@ -1689,7 +1676,7 @@ private pure func elaborate_value(
 																	failure = Some(error)
 													Ok(_): void
 									Some(item):
-										work = push_expression_work(work, work_count, ResolveLambdas(position.add(1), revision))
+										work = push_at(work, work_count, Some(ResolveLambdas(position.add(1), revision)))
 										work_count = work_count.add(1)
 										match item:
 											AwaitingLambda(admission):
@@ -1704,9 +1691,9 @@ private pure func elaborate_value(
 																match admission.written.body:
 																	InlineBody(value):
 																		finish: LambdaFinish = { position = position, scope = scope, context = context, bindings = bindings, operand_start = operand_count }
-																		work = push_expression_work(work, work_count, FinishLambda(finish))
+																		work = push_at(work, work_count, Some(FinishLambda(finish)))
 																		work_count = work_count.add(1)
-																		work = push_expression_work(work, work_count, EnterExpression(value, Some(admission.result)))
+																		work = push_at(work, work_count, Some(EnterExpression(value, Some(admission.result))))
 																		work_count = work_count.add(1)
 																		scope = local.scope
 																		site = BodyExpression(lambda_context, resolve_block)
@@ -1751,7 +1738,7 @@ private pure func elaborate_value(
 											Ok(AcceptedType(VoidType)): void
 											Ok(_):
 												equality: InferenceEquality = { expected = admission.result, actual = pending_type(value), origin = LambdaConstraint(value.span), relation = RequireEquality, parameter = None }
-												work = push_expression_work(work, work_count, SolveConstraint(equality))
+												work = push_at(work, work_count, Some(SolveConstraint(equality)))
 												work_count = work_count.add(1)
 							_: failure = Some(checker_invariant(body.span, InvalidInferenceWorklist))
 					FinishRoot:
@@ -1762,20 +1749,20 @@ private pure func elaborate_value(
 						match value_result:
 							Err(error): failure = Some(error)
 							Ok(value):
-								work = push_expression_work(work, work_count, FreezeRoot(value))
+								work = push_at(work, work_count, Some(FreezeRoot(value)))
 								work_count = work_count.add(1)
 								progress: ExpressionWork = if context_work.is_empty():
 									ResolveLambdas(0, inference_revision)
 								else:
 									ResolveContexts(0, inference_revision)
-								work = push_expression_work(work, work_count, progress)
+								work = push_at(work, work_count, Some(progress))
 								work_count = work_count.add(1)
 
 								match result_context:
 									Some(result):
 										if slots.is_empty().not():
 											equality: InferenceEquality = { expected = pending_type(value), actual = inference_type(result.expected.value_type, [], 0), origin = ResultConstraint(result), relation = RequireEquality, parameter = None }
-											work = push_expression_work(work, work_count, SolveConstraint(equality))
+											work = push_at(work, work_count, Some(SolveConstraint(equality)))
 											work_count = work_count.add(1)
 									None: void
 					FreezeRoot(value):
