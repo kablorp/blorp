@@ -167,8 +167,9 @@ No representation or output changes. Re-run each grep before deleting.
   line-neutral but makes intent visible.
 - **Standard library README:** it says "Traits and FFI remain inactive" and
   states a trait-placement rule that `Equatable` does not follow.
-- **Gated on O1:** the `own.brp` `borrowed_result` comment, verify's "PRE",
-  "old-H", "fresh H" and "P", and `own`'s unread `TerminalArguments` span.
+- **Left for O1, now done:** the `own.brp` `borrowed_result` comment, verify's
+  "PRE", "old-H", "fresh H" and "P" (now plain words), and `own`'s unread
+  `TerminalArguments` span.
 
 Basis: about 7 variants with their render arms, the test-only records,
 `EqualityOutcome`, imports and constants, about −150 lines.
@@ -185,8 +186,7 @@ Each correction is one commit with an exact message, help and span test.
 - The "report this compiler error" help is unified on "input program".
 - `lower`'s `invalid_binding` ("invalid checked binding identity") is also
   raised for a break outside a loop, an arm without a value and a missing
-  loop context. Each gets its own message. These are internal errors. This
-  item is gated on O1.
+  loop context. Each gets its own message. These are internal errors.
 
 Basis: lines roughly unchanged.
 
@@ -203,8 +203,9 @@ carries a `prepared` list, so its fix is a `break`, not a helper.
 
 Basis: about +1 line per site, plus tests.
 
-Status: landed except verify's membership loop, which waits for O1, as does
-C2's `invalid_binding` item. The equality summary loop in `traits.brp` had
+Status: landed, including verify's signature loop and C2's `invalid_binding`
+item after O1. The unreachable internal errors are pinned by reading, except
+verify's loop, which has a hand-built test. The equality summary loop in `traits.brp` had
 the same defect and was fixed too. Sites whose failures are unreachable or
 indistinguishable from source carry their justification in the commit.
 
@@ -212,7 +213,7 @@ indistinguishable from source carry their justification in the commit.
 
 `utils/syntax.brp` holds the only constructors. These lose their copies:
 `own.brp` and `emit.brp` (private copies), `traits.brp` (`compiler_span()`)
-and `load.brp` (`rejection`). The `own.brp` part is gated on O1.
+and `load.brp` (`rejection`).
 
 ```blorp
 -- Before (own.brp; emit.brp and traits.brp have copies; 20 sites write the
@@ -250,8 +251,9 @@ new emit variants add about 15. Net about −45.
 
 Status: landed at −67 production lines. One exception to the O1 gate: the
 shared `internal_error` collides with `own.brp`'s identical private copy, so
-that copy was deleted. Left for O1: `own.brp`'s `internal_span`, `lower.brp`'s
-hand-built internal messages and `verify.brp`'s inline placeholder spans.
+that copy was deleted. After O1, `own.brp`'s `internal_span`, `lower.brp`'s
+hand-built internal messages and `verify.brp`'s inline placeholder spans also
+use the shared constructors; none had a real span in reach.
 The shared constructors are pinned in `test_syntax`; the four new emit
 variants have no rendering test, because the emit diagnostics suite is
 deferred.
@@ -267,9 +269,9 @@ suite and the C0 check.
 | `check` | Merge the conflict check in `scope` `bind_local`/`bind_callable`. Merge `callables` `function_contract`/`receiver_contract`, with one purity check and `receiver_bindings` computed once. In `constructors`, one arity check (`find_variant`, `find_qualified_variant`, `plan_known_*`) and one readiness fold (`finish_pending_*`). In `patterns`, one column builder and `CheckedSelection` instead of `BuiltSelection`. In `render`, `type_spelling`'s record arm uses `type_spellings`. In `bodies`, one `Break`/`Continue` arm. Hand loops become `repeat`/`join`. | |
 | `specialize` | One list-equality helper for `same_arguments`, `same_callables`, `same_partial_arguments` and `same_known_arguments`. `contains_parameter` uses `any`. One forwarding step for `callable_mode`/`translated_callable`. | |
 | `emit`/`lex` | A lookup helper for the 16 `MissingRuntimeArgument` sites. `callable_types` computed once into `ProgramInventory`. Rename `quoted_token` to `hole_quoted_token`. An `append_scanned` helper for `lex`'s three copies. | |
-| `lower` | `project_place`/`project_argument` share one id-allocating step (`lower.brp:1225`). | O1 |
-| `verify` | `payload_value`/`transfer_value` helpers. One borrow-parent check for the three in `verify_definition_result`. One `discharge_payloads` match. One successor helper in `selection_possibilities`. | O1 |
-| `runtime` | One error-message and size-cap helper in the C text. `read_file`/`write_file` pass `path->bytes`. | O1 |
+| `lower` | `project_place`/`project_argument` share one id-allocating step. | |
+| `verify` | `payload_value`/`transfer_value` helpers. One borrow-parent check for the three in `verify_definition_result`. One `discharge_payloads` match. One successor helper in `selection_possibilities`. | |
+| `runtime` | One error-message and size-cap helper in the C text. `read_file`/`write_file` pass `path->bytes`. | |
 | `standard_library` | One parameter-naming rule: receiver `self`, pairs `left`/`right`, `default`. | L3 for `list.brp` |
 
 Status: the `parse` row landed at −217 lines. `consume_list_pattern` keeps
@@ -297,6 +299,16 @@ failure. `callable_types` is computed once into `ProgramInventory`. Instead of
 an `append_scanned` helper, `lex` drops its parallel spellings list and reads
 word spellings off the tokens once. `quoted_token` is now `hole_quoted_token`.
 Fixtures and self-compile output are identical; allocations fell 13k (−0.07%).
+
+The `lower`, `verify` and `runtime` rows landed after O1 at -19, -79 and -33
+production lines. In `verify`, the successor helper is one or-pattern arm, and
+`discharge_payloads` has a `stored_payloads` helper. In `runtime`, a shared
+`SYSTEM_FAILURE_RUNTIME` fragment replaces three failure/errno helper pairs and
+sizes the message exactly, and the size checks use
+`blorp_string_maximum_capacity`; the C of the eight file and directory
+fixtures changes, all other fixtures are identical. The native C fixtures
+under `test/runtime/`, which remain deferred, were updated and run by hand. Self-compile
+allocations fell 105.7k (-0.55%) and instructions 0.2%.
 
 Basis: the parse items remove about 300 lines, the de-duplicated pairs about
 150, and the verify blocks about 100. About −600.
