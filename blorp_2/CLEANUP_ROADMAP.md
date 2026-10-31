@@ -530,6 +530,70 @@ gets the [scaling series](ROADMAP.md#cost-and-evidence-rules).
 Basis: the five type walks and three form walks save about 300 lines, and
 the stack helpers about 150. About −450.
 
+Status: C9 came in at -256 production lines in `src/`, against the -450
+estimate (tests +245), and two of the five items did not land.
+
+- **`type_children`** (-56). `declarations` had four hand walks, not five: the
+  finiteness walk, the reinstantiation walk, the opaque-representation walk and
+  `contains_parameter`. All four use it. `contains_parameter` now lives once in
+  `check/model.brp`, beside `type_children`, for `declarations` and
+  `specialize`; `inference`'s `parameter_in_type`, a walk the roadmap did not count, uses it
+  too. `recursion`'s dependency walk still builds its own child list because it
+  also needs each child's slot.
+- **`child_expressions`** (-153). One list of a form's evaluated operands, plus
+  `statement_expressions` for the statement lists the three walks also each
+  repeated, replaces `append_value_calls`, `callable_creations` and
+  `self_call_in` with their statement helpers. Capture decision: all three
+  walks now visit lambda captures. `capture_operands` is the only place that
+  builds a capture, and it builds `ReadBinding` or `ReadCapture`, so a capture
+  holds no call and no self call, and no walk's result changes. The new suite
+  pins the premise: a lambda's captures are children, and `expression_calls`
+  of a call with a capturing lambda operand still finds one call.
+- **`push_at`** (-47, including its 14-line module `utils/stack.brp`). The eight
+  helpers and `own`'s inline copy are one function; the two `Option`-slot
+  stacks in `elaborate_value` wrap the item in `Some` at the call.
+- **`WorkStack[T]` not adopted.** A record of the slot list and the count
+  cannot update in place through the field read: `stack.slots.set(..)` inside
+  a rebuilt record copies the whole list on every push (a 100,000-push probe
+  took 135 G instructions against 25.6 M for list plus count). The record
+  update `{ stack | slots = ..., count = ... }` avoids the copy, but record
+  cells are not reused before O3, so every push and pop allocates one cell:
+  300,000 allocations for the same 100,000 rounds, against one. Converting
+  `elaborate_value`'s `work` stack alone (59 push pairs, net -23 lines
+  including the module) raised self-compile allocations by 601,483 (+3.13%)
+  and instructions by 1.57%, past the +3% ceiling, before the `operands` stack
+  or `declarations`. Reverted. Revisit after O3.
+- **`own` `insert_steps` not changed.** `schedule_drop`, with one rule that a
+  scheduled drop carries the span of the step it follows, replaces four
+  scheduling sites, but its `Result` makes the change +3 lines and +46,226
+  allocations (+0.24%; a first version that matched a tuple of the two lookups
+  cost +0.48%), because every call allocates its `Result`. The join, loop and
+  define arms share `consumed`, `entries`, `next_owner`, `sources`, `enclosing`
+  and `first_value`, so splitting them needs the threaded-parameter bundle the
+  roadmap leaves for Keith, and each arm function would take about a dozen
+  parameters. Neither part landed.
+
+Fixtures are identical at every commit: all 643 e2e fixtures give the same exit
+status, stdout, stderr and emitted C under the origin/main compiler and each
+candidate, and the origin/main compiler and each candidate emit byte-identical C when
+they compile the branch source. Matched against the same input (the branch source), final against
+origin/main: allocations +913 (+0.005%), minimum retired instructions +0.43%.
+`type_children` alone cost +0.03% and +0.02%, `child_expressions` -0.03% and
++0.44%, `push_at` nothing. Each compiler on its own source: allocations
+-0.78%, instructions -0.15%, emitted C 24,607,744 to 24,443,520 bytes (-0.67%).
+
+Scaling series (16/32/64/128 over ten generated families: deep and wide
+types, opaque and generic-union chains, nested and wide calls, wide matches,
+long statement lists and many capturing lambdas) shows the same doubling
+ratios before and after for `type_children` and `child_expressions`, within
+0.1 on allocations. Exceptions: the opaque-chain family allocates 13% more at
+128 (129,160 to 145,688), two more cells per `List` node of its quadratic
+representation walk (`.map` with a closure plus the `type_children` list); the
+generated-union chain (about x5 per doubling on allocations, x9 on
+instructions at 128), the opaque chain (x3.6) and the nested `Box` chain
+(x3.5) were already super-linear and are inherited. The compiler has few
+opaque types, and the self-compile cost above includes them.
+
 ### Later: single cross-phase authorities
 
 Each item is a producer-to-consumer migration that removes the old
