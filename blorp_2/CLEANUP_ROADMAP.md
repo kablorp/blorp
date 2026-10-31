@@ -45,7 +45,8 @@ Some facts have several authorities:
   which children they visit.
 - **Owner types.** Emit rebuilds owner types by position from `own`'s
   numbering.
-- **Entrypoint list type.** The entrypoint hard-codes the C name `blorp_l_0_s`.
+- **Entrypoint list type.** The entrypoint hard-coded the C name `blorp_l_0_s`
+  (fixed in C8).
 
 Each of these breaks [principle 1 or 2](AGENTS.md#principles): a change needs
 edits in several places, and a missed edit still compiles.
@@ -493,6 +494,21 @@ Each commit states its design in its description.
   the literal `blorp_l_0_s`.
 
 Basis: about −120.
+
+Status: C8 came in at -43 production lines, short of the -120 estimate.
+`DependencyOrigin` became `trait_derived`, `SignatureRole` became `is_entry`,
+and `ResultInferenceState` became `result_incompatible` (its third state,
+`SolvingResultInference`, was written but never read). `LoadMode` stays: its
+test-suite case carries the suite paths, so it is not a two-tag switch. In
+`own`, `argument_borrow` returns an `Option[BorrowedValue]`, so the two paths
+that store or project a borrowed argument can no longer hold a consumed one;
+narrowing `OwnedArgument` itself, which would also remove `verify`'s "match
+or projection cannot consume" error, touches emit and about 75 test files and
+is left for a separate change. Trait method parsing returns one method. The
+argv list type comes from `list_suffix(list_element_key(StringType))`;
+`list_c_type` would have changed the `*const` spelling. Fixtures and
+self-compile output are identical; allocations rose 0.08% (the `Option` in
+`argument_borrow`) and instructions about 0.1%.
 
 ### C9: shared traversals and stacks (approval for new types)
 
