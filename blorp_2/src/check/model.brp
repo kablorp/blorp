@@ -987,111 +987,89 @@ pure func union_occurrence(value: TypeRef) -> Option[UnionOccurrence]:
 			None
 
 
-private pure func append_exit_calls(
-	collected: List[CheckedCall],
-	exit: CheckedExit,
-) -> List[CheckedCall]:
-	match exit:
-		ReturnExpression(value):
-			append_value_calls(collected, value)
-		RecurWith(arguments, _):
-			var calls = collected
+-- The expressions a callable choice evaluates when it is created or passed: a
+-- stored value, or a lambda's capture reads. Its body is a separate request.
+private pure func choice_expressions(choice: CallableChoice) -> List[CheckedExpr]:
+	match choice:
+		StoredCallable(child): [child]
+		LambdaCallable(_, captures): captures
+		MethodCallable(_) | NamedCallable(_, _) | ForwardedCallable(_): []
 
-			for argument in arguments:
-				calls = append_value_calls(calls, argument)
 
-			calls
+-- The expressions a form evaluates directly, in evaluation order: a call's
+-- callee then its operands, a match's scrutinee then each arm's statements and
+-- value. Every walk of checked bodies steps through these. A lambda's captures
+-- are children; each is a variable read, so visiting them finds no call.
+pure func child_expressions(form: CheckedForm) -> List[CheckedExpr]:
+	match form:
+		ConstructOpaque(_, child): [child]
+		ProjectOpaque(_, child): [child]
+		ReadTupleElement(child, _): [child]
+		ReadRecordField(child, _): [child]
+		ConstructTuple(elements): elements
+		ConstructList(elements): elements
+		ConstructVariant(_, elements): elements
+		ConstructRecord(_, fields): fields.map(pure func(field): field.value)
+		UpdateRecord(_, update): [update.base].concat(update.replacements.map(pure func(field): field.value))
+		MakeCallable(choice): choice_expressions(choice)
+		Match(join):
+			var children = [join.scrutinee]
+			for arm in join.arms:
+				children = children.concat(statement_expressions(arm.statements)).append(arm.value)
+			children
+		InvokeFunction(call):
+			var children: List[CheckedExpr] = match call.target:
+				ValueCall(callee): [callee]
+				TraitMethod(_) | UserFunction(_, _) | CallableParameter(_) | RuntimeFunction(_): []
+			for operand in call.operands:
+				match operand:
+					ValueOperand(argument): children = children.append(argument)
+					CallableOperand(_, choice, _): children = children.concat(choice_expressions(choice))
+			children
+		LiteralVoid | LiteralInteger(_) | LiteralFloat(_) | LiteralString(_) | ReadBinding(_) | ReadCapture(_): []
+
+
+-- The expressions a statement list evaluates, in order; a loop's body follows
+-- its header expressions.
+pure func statement_expressions(statements: List[CheckedStatement]) -> List[CheckedExpr]:
+	var values: List[CheckedExpr] = []
+	for statement in statements:
+		match statement:
+			InitializeBinding(_, value): values = values.append(value)
+			ReassignBinding(_, value): values = values.append(value)
+			DiscardExpression(value): values = values.append(value)
+			RunWhile(loop): values = values.append(loop.condition).concat(statement_expressions(loop.body))
+			RunFor(loop):
+				match loop.iteration:
+					ListIteration(iterable, _, _): values = values.append(iterable)
+					AscendingIntRange(start, end, _): values = values.append(start).append(end)
+				values = values.concat(statement_expressions(loop.body))
+			BreakSourceLoop(_) | ContinueSourceLoop(_): void
+	values
 
 
 -- Calls in evaluation order: a node's children left to right, then the node.
-private pure func append_value_calls(
-	collected: List[CheckedCall],
-	value: CheckedExpr,
-) -> List[CheckedCall]:
+private pure func append_calls(collected: List[CheckedCall], values: List[CheckedExpr]) -> List[CheckedCall]:
 	var calls = collected
 
-	match value.form:
-		ConstructOpaque(_, child):
-			calls = append_value_calls(calls, child)
-		ProjectOpaque(_, child):
-			calls = append_value_calls(calls, child)
-		UpdateRecord(_, update):
-			calls = append_value_calls(calls, update.base)
-			for field in update.replacements:
-				calls = append_value_calls(calls, field.value)
-		ConstructRecord(_, fields):
-			for field in fields:
-				calls = append_value_calls(calls, field.value)
-		ConstructVariant(_, fields):
-			for field in fields:
-				calls = append_value_calls(calls, field)
-		ConstructTuple(elements):
-			for element in elements:
-				calls = append_value_calls(calls, element)
-		ConstructList(elements):
-			for element in elements:
-				calls = append_value_calls(calls, element)
-		Match(join):
-			calls = append_value_calls(calls, join.scrutinee)
-			for arm in join.arms:
-				calls = append_statement_calls(calls, arm.statements)
-				calls = append_value_calls(calls, arm.value)
-		InvokeFunction(call):
-			match call.target:
-				ValueCall(callee): calls = append_value_calls(calls, callee)
-				TraitMethod(_) | UserFunction(_, _) | CallableParameter(_) | RuntimeFunction(_): void
-			for operand in call.operands:
-				match operand:
-					ValueOperand(argument): calls = append_value_calls(calls, argument)
-					CallableOperand(_, choice, _):
-						match choice:
-							StoredCallable(child): calls = append_value_calls(calls, child)
-							MethodCallable(_) | NamedCallable(_, _) | ForwardedCallable(_) | LambdaCallable(_, _): void
+	for value in values:
+		calls = append_calls(calls, child_expressions(value.form))
 
-			calls = calls.append(call)
-		ReadTupleElement(receiver, _):
-			calls = append_value_calls(calls, receiver)
-		ReadRecordField(receiver, _):
-			calls = append_value_calls(calls, receiver)
-		MakeCallable(choice):
-			match choice:
-				StoredCallable(child): calls = append_value_calls(calls, child)
-				MethodCallable(_) | NamedCallable(_, _) | ForwardedCallable(_) | LambdaCallable(_, _): void
-		LiteralVoid | LiteralInteger(_) | LiteralFloat(_) | LiteralString(_) | ReadBinding(_) | ReadCapture(_):
-			void
+		match value.form:
+			InvokeFunction(call): calls = calls.append(call)
+			_: void
 
 	calls
 
 
-private pure func append_statement_calls(
-	collected: List[CheckedCall],
-	statements: List[CheckedStatement],
-) -> List[CheckedCall]:
-	var calls = collected
-
-	for statement in statements:
-		match statement:
-			InitializeBinding(_, value):
-				calls = append_value_calls(calls, value)
-			DiscardExpression(value):
-				calls = append_value_calls(calls, value)
-			ReassignBinding(_, value):
-				calls = append_value_calls(calls, value)
-			RunWhile(loop):
-				calls = append_statement_calls(append_value_calls(calls, loop.condition), loop.body)
-			BreakSourceLoop(_) | ContinueSourceLoop(_): void
-			RunFor(loop):
-				match loop.iteration:
-					ListIteration(iterable, _, _): calls = append_value_calls(calls, iterable)
-					AscendingIntRange(start, end, _):
-						calls = append_value_calls(append_value_calls(calls, start), end)
-				calls = append_statement_calls(calls, loop.body)
-
-	calls
+private pure func exit_expressions(exit: CheckedExit) -> List[CheckedExpr]:
+	match exit:
+		ReturnExpression(value): [value]
+		RecurWith(arguments, _): arguments
 
 
 pure func expression_calls(value: CheckedExpr) -> List[CheckedCall]:
-	append_value_calls([], value)
+	append_calls([], [value])
 
 
 pure func function_calls(function: CheckedFunction) -> List[CheckedCall]:
@@ -1103,19 +1081,24 @@ pure func lambda_calls(lambda: CheckedLambda) -> List[CheckedCall]:
 
 
 pure func body_calls(statements: List[CheckedStatement], body: CheckedBody) -> List[CheckedCall]:
-	var calls = append_statement_calls([], statements)
+	append_calls([], body_expressions(statements, body))
+
+
+-- Every expression a body evaluates, in order: its statements, then its value
+-- or its scrutinee with each arm's statements and exit.
+private pure func body_expressions(statements: List[CheckedStatement], body: CheckedBody) -> List[CheckedExpr]:
+	var values = statement_expressions(statements)
 
 	match body:
-		CheckedValueBody(value):
-			append_exit_calls(calls, value)
+		CheckedValueBody(exit):
+			values.concat(exit_expressions(exit))
 		CheckedMatchBody(matched):
-			calls = append_value_calls(calls, matched.scrutinee)
+			values = values.append(matched.scrutinee)
 
 			for arm in matched.arms:
-				calls = append_statement_calls(calls, arm.statements)
-				calls = append_exit_calls(calls, arm.body)
+				values = values.concat(statement_expressions(arm.statements)).concat(exit_expressions(arm.body))
 
-			calls
+			values
 
 
 pure func field_id(owner: RecordId, position: Int) -> FieldId:
@@ -1148,77 +1131,19 @@ pure func has_callable_parameters(signature: FunctionSignature) -> Bool:
 -- follows only evaluated operands; each lambda's body is a separate request.
 private pure func callable_creations(values: List[CheckedExpr]) -> List[CheckedExpr]:
 	var found: List[CheckedExpr] = []
+
 	for value in values:
-		var children: List[CheckedExpr] = []
 		match value.form:
-			MakeCallable(choice):
-				found = found.append(value)
-				match choice:
-					LambdaCallable(_, captures): children = captures
-					StoredCallable(child): children = [child]
-					MethodCallable(_) | NamedCallable(_, _) | ForwardedCallable(_): void
-			InvokeFunction(call):
-				match call.target:
-					ValueCall(callee): children = [callee]
-					TraitMethod(_) | UserFunction(_, _) | CallableParameter(_) | RuntimeFunction(_): void
-				for operand in call.operands:
-					match operand:
-						ValueOperand(argument): children = children.append(argument)
-						CallableOperand(_, choice, _):
-							match choice:
-								StoredCallable(child): children = children.append(child)
-								LambdaCallable(_, captures): children = children.concat(captures)
-								MethodCallable(_) | NamedCallable(_, _) | ForwardedCallable(_): void
-			ConstructTuple(elements): children = elements
-			ConstructList(elements): children = elements
-			ConstructVariant(_, elements): children = elements
-			ConstructRecord(_, fields): children = fields.map(pure func(field): field.value)
-			UpdateRecord(_, update): children = [update.base].concat(update.replacements.map(pure func(field): field.value))
-			ConstructOpaque(_, child): children = [child]
-			ProjectOpaque(_, child): children = [child]
-			ReadTupleElement(child, _): children = [child]
-			ReadRecordField(child, _): children = [child]
-			Match(join):
-				found = found.concat(callable_creations([join.scrutinee]))
-				for arm in join.arms:
-					found = found.concat(statement_creations(arm.statements)).concat(callable_creations([arm.value]))
-			LiteralVoid | LiteralInteger(_) | LiteralFloat(_) | LiteralString(_) | ReadBinding(_) | ReadCapture(_): void
-		found = found.concat(callable_creations(children))
+			MakeCallable(_): found = found.append(value)
+			_: void
+
+		found = found.concat(callable_creations(child_expressions(value.form)))
+
 	found
-
-
-private pure func statement_creations(statements: List[CheckedStatement]) -> List[CheckedExpr]:
-	var found: List[CheckedExpr] = []
-	for statement in statements:
-		match statement:
-			InitializeBinding(_, value): found = found.concat(callable_creations([value]))
-			ReassignBinding(_, value): found = found.concat(callable_creations([value]))
-			DiscardExpression(value): found = found.concat(callable_creations([value]))
-			RunWhile(loop): found = found.concat(callable_creations([loop.condition])).concat(statement_creations(loop.body))
-			RunFor(loop):
-				match loop.iteration:
-					ListIteration(value, _, _): found = found.concat(callable_creations([value]))
-					AscendingIntRange(start, end, _): found = found.concat(callable_creations([start, end]))
-				found = found.concat(statement_creations(loop.body))
-			BreakSourceLoop(_) | ContinueSourceLoop(_): void
-	found
-
-
-private pure func exit_creations(exit: CheckedExit) -> List[CheckedExpr]:
-	match exit:
-		ReturnExpression(value): callable_creations([value])
-		RecurWith(arguments, _): callable_creations(arguments)
 
 
 pure func body_callable_creations(statements: List[CheckedStatement], body: CheckedBody) -> List[CheckedExpr]:
-	var found = statement_creations(statements)
-	match body:
-		CheckedValueBody(exit): found = found.concat(exit_creations(exit))
-		CheckedMatchBody(matched):
-			found = found.concat(callable_creations([matched.scrutinee]))
-			for arm in matched.arms:
-				found = found.concat(statement_creations(arm.statements)).concat(exit_creations(arm.body))
-	found
+	callable_creations(body_expressions(statements, body))
 
 
 pure func expression_callable_creations(value: CheckedExpr) -> List[CheckedExpr]:

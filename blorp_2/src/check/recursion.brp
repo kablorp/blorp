@@ -21,19 +21,13 @@ import:
 		CheckedCall, CallableChoice(MethodCallable, NamedCallable, ForwardedCallable, LambdaCallable, StoredCallable),
 		CheckedExit(RecurWith, ReturnExpression),
 		CheckedExpr,
-		CheckedForm(
-			MakeCallable,
-			ConstructOpaque, ProjectOpaque,
-			ConstructTuple, ReadTupleElement, ConstructRecord, ConstructVariant, ConstructList, InvokeFunction, LiteralFloat, LiteralInteger,
-			LiteralString, LiteralVoid, Match, ReadBinding, ReadCapture, ReadRecordField, UpdateRecord,
-		),
+		CheckedForm(MakeCallable, InvokeFunction, Match),
 		CheckedFunction, CheckedLambda, CheckedConstant,
-		CheckedStatement(DiscardExpression, InitializeBinding, ReassignBinding, RunWhile, RunFor, BreakSourceLoop, ContinueSourceLoop),
-		CheckedIteration(ListIteration, AscendingIntRange),
+		CheckedStatement,
 		TypeParameterId,
 		TypeParameterOwner(FunctionDeclaration),
 		TypeRef(TupleType, CallableType, NominalType, ListType, ParameterType),
-		function_calls, lambda_calls, body_callable_creations, expression_calls, expression_callable_creations, receiver_arguments, parameter_owner,
+		child_expressions, statement_expressions, function_calls, lambda_calls, body_callable_creations, expression_calls, expression_callable_creations, receiver_arguments, parameter_owner,
 		type_parameter_id,
 	../utils/ids: FunctionId, function_number, TraitId, trait_method_owner
 	../namespace/namespace: TypeHead(PrimitiveHead, ListHead, RecordHead, UnionHead, OpaqueHead), same_head
@@ -75,72 +69,21 @@ private pure func first_self_call(values: List[CheckedExpr], current: FunctionId
 
 
 -- A node's children are evaluated before the node, so a call's arguments,
--- receiver first, are searched before the call itself.
+-- receiver first, are searched before the call itself. A self call anywhere in
+-- a non-tail match is a non-tail call, so its arms are children too.
 private pure func self_call_in(value: CheckedExpr, current: FunctionId, traits: AcceptedTraits) -> Option[Span]:
-	match value.form:
-		ConstructOpaque(_, child):
-			self_call_in(child, current, traits)
-		ProjectOpaque(_, child):
-			self_call_in(child, current, traits)
-		InvokeFunction(call):
-			var found: Option[Span] = match call.target:
-				ValueCall(callee): self_call_in(callee, current, traits)
-				TraitMethod(_) | UserFunction(_, _) | RuntimeFunction(_) | CallableParameter(_): None
-			for operand in call.operands:
-				if found.is_some():
-					break
-				match operand:
-					ValueOperand(argument): found = self_call_in(argument, current, traits)
-					CallableOperand(_, choice, _):
-						match choice:
-							StoredCallable(child): found = self_call_in(child, current, traits)
-							MethodCallable(_) | NamedCallable(_, _) | ForwardedCallable(_) | LambdaCallable(_, _): void
-			match found:
-				Some(span):
-					Some(span)
-				None:
+	match first_self_call(child_expressions(value.form), current, traits):
+		Some(span):
+			Some(span)
+		None:
+			match value.form:
+				InvokeFunction(call):
 					if is_self_call(call, current, traits):
 						Some(value.span)
 					else:
 						None
-		ConstructVariant(_, fields):
-			first_self_call(fields, current, traits)
-		ConstructTuple(elements):
-			first_self_call(elements, current, traits)
-		ConstructList(elements):
-			first_self_call(elements, current, traits)
-		Match(join):
-			-- A self call anywhere in a non-tail match is a non-tail call.
-			var found = self_call_in(join.scrutinee, current, traits)
-			for arm in join.arms:
-				if found.is_some():
-					break
-				found = first_self_call(statement_values(arm.statements).append(arm.value), current, traits)
-			found
-		ConstructRecord(_, fields):
-			var found: Option[Span] = None
-			for field in fields:
-				if found.is_some():
-					break
-				found = self_call_in(field.value, current, traits)
-			found
-		UpdateRecord(_, update):
-			var found = self_call_in(update.base, current, traits)
-			for field in update.replacements:
-				if found.is_some():
-					break
-				found = self_call_in(field.value, current, traits)
-			found
-		ReadTupleElement(receiver, _):
-			self_call_in(receiver, current, traits)
-		ReadRecordField(receiver, _):
-			self_call_in(receiver, current, traits)
-		MakeCallable(choice):
-			match choice:
-				StoredCallable(operand): self_call_in(operand, current, traits)
-				MethodCallable(_) | NamedCallable(_, _) | ForwardedCallable(_) | LambdaCallable(_, _): None
-		LiteralVoid | LiteralInteger(_) | LiteralFloat(_) | LiteralString(_) | ReadBinding(_) | ReadCapture(_):
-			None
+				_:
+					None
 
 
 private pure func reject_self_calls(
@@ -152,27 +95,6 @@ private pure func reject_self_calls(
 			Err(recursion_error(span, NonTailSelfCall(current)))
 		None:
 			Ok(void)
-
-
-private pure func statement_values(statements: List[CheckedStatement]) -> List[CheckedExpr]:
-	var values: List[CheckedExpr] = []
-	for statement in statements:
-		match statement:
-			InitializeBinding(_, value):
-				values = values.append(value)
-			ReassignBinding(_, value):
-				values = values.append(value)
-			DiscardExpression(value):
-				values = values.append(value)
-			RunWhile(loop):
-				values = values.append(loop.condition).concat(statement_values(loop.body))
-			BreakSourceLoop(_) | ContinueSourceLoop(_): void
-			RunFor(loop):
-				match loop.iteration:
-					ListIteration(iterable, _, _): values = values.append(iterable)
-					AscendingIntRange(start, end, _): values = values.append(start).append(end)
-				values = values.concat(statement_values(loop.body))
-	values
 
 
 -- A returned value that is a direct self call; its receiver, if written as one,
@@ -235,7 +157,7 @@ private pure func nested_tail(value: CheckedExpr, current: FunctionId, traits: A
 					var checked = reject_self_calls([join.scrutinee], current, traits)
 					for arm in join.arms:
 						if checked.is_ok():
-							checked = reject_self_calls(statement_values(arm.statements), current, traits)
+							checked = reject_self_calls(statement_expressions(arm.statements), current, traits)
 						if checked.is_ok():
 							checked = nested_tail(arm.value, current, traits)
 					checked
@@ -252,7 +174,7 @@ private pure func tail_arms(
 		None:
 			Ok(checked)
 		Some(arm):
-			match reject_self_calls(statement_values(arm.statements), current, traits):
+			match reject_self_calls(statement_expressions(arm.statements), current, traits):
 				Ok(prefix):
 					match tail_exit(arm.body, current, traits):
 						Ok(exit):
@@ -309,7 +231,7 @@ pure func check_execution(
 			})
 		Some(annotation):
 			if parameters.is_empty():
-				match reject_self_calls(statement_values(statements), current, traits):
+				match reject_self_calls(statement_expressions(statements), current, traits):
 					Ok(prefix):
 
 						tail_body: Result[CheckedBody, CheckError] = match body:
