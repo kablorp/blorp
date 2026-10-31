@@ -291,6 +291,13 @@ the two scan different lists and match different variants, and a shared
 helper came out 12 lines larger. Fixtures are identical; self-compile
 allocations are unchanged and instructions fell about 0.5%.
 
+The `emit`/`lex` row landed at −11 lines. One `runtime_argument` helper
+covers the 14 `MissingRuntimeArgument` lookups and builds the error only on
+failure. `callable_types` is computed once into `ProgramInventory`. Instead of
+an `append_scanned` helper, `lex` drops its parallel spellings list and reads
+word spellings off the tokens once. `quoted_token` is now `hole_quoted_token`.
+Fixtures and self-compile output are identical; allocations fell 13k (−0.07%).
+
 Basis: the parse items remove about 300 lines, the de-duplicated pairs about
 150, and the verify blocks about 100. About −600.
 
