@@ -435,6 +435,45 @@ its loops, and the result is recorded.
 Basis: fewer than half of the 228 sites qualify, at 5 to 8 lines each. About
 −600 to −900.
 
+Status: C7 came in at -145 production lines in `src/`, missing the -600 to
+-900 estimate (+22 for the module and
+its first site, then -48 in `check`, -41 in `lower`, `own` and `verify`, -67
+in `specialize` and -11 for one more `check` site; tests +104). The probe
+held: the pinned seed compiles `translated_list[T, U, E]` and
+`first_error[T, E]` with a function-typed argument, and `scripts/blorp2-fixpoint
+--prove` passed. Each lambda becomes its own function (`verify.verify_type_membership
+lambda`) that `first_error`'s instance calls directly, not through an ops
+table; a capturing lambda allocates one environment record per call of the
+enclosing function.
+
+Only 16 of the 160 loops that stop on a first error qualified, far below the
+estimate; 144 remain. Of those, 64 have the single-match shape. About 36 of
+the 64 transform the Ok value (`{ value_type = value, span = ... }`) and would
+need a second lambda through `Result.map`. The other 28 map or check a call
+directly but sit inside an `if` or `match` block (`?=` is rejected there, and
+the result is not the block's value, as in `inference` `publish_inference_type`
+and `parse` `TupleContents`), iterate a `Range` (`call_operands`), or call
+something whose Ok value `first_error` would have to discard
+(`reject_module_families`). The other 80 loops carry a counter or a threaded
+accumulator (`position`, `cursor`, `current`, `next_owner`) or break for
+another reason, and stay hand loops.
+
+Fixtures are identical: all 643 e2e fixtures give the same exit status,
+stdout, stderr and emitted C under the origin/main compiler and this one.
+Matched against the same input, minimum retired instructions rose 0.61% and
+allocations 1.17%; each compiler on its own source, instructions rose 0.78%
+and allocations 1.27%, under the +3% ceiling. By phase against origin/main
+(same input): the probe +7 allocations and -0.02% instructions; `check`
++0.11% allocations and +0.07% instructions; `lower`, `own` and `verify` bring
+that to +0.34% and +0.21%; `specialize` (five sites, whose lambdas capture six
+or seven values and run once per statement list or type argument list) brings
+it to +1.17% and +0.61%. `specialize` is the costly phase: 0.8% of allocations
+for 67 lines. The compiler's emitted C grew 0.23% (24,548,083 to 24,605,055
+bytes). Every phase stays: the cost is the compiler's environment record per
+capturing lambda, recorded here for later compiler work rather than designed
+around. `translate_exprs` and `translate_record_fields` are the hottest
+converted sites if `specialize` ever needs to give some back.
+
 ### C8: make impossible states unrepresentable
 
 Each commit states its design in its description.
