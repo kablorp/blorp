@@ -197,7 +197,7 @@ never traverse key arguments. Keep a query-local frontier and visited existing
 slot IDs using the existing IntMap, freeze nothing. This is needed to answer
 the new indirect-storage question, not a parallel graph authority. Frontier
 work is O(reached fields+slots) amortized, memory O(reached fields+slots), plus
-structural partial-key comparisons: same_partial_union_key recursively compares
+structural partial-key comparisons: the keys' derived `==` recursively compares
 arguments. Across R queried roots, frontier work sums their reachable closures,
 worst O(R(V+E)); report key-comparison work separately. Shared branches must be visited once per query. Profile repeatable
 near-quadratic scaling; do not silently add an index/optimizer.

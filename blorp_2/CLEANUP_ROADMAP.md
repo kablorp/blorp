@@ -372,8 +372,8 @@ and `same_*` helpers from 39 to 23. Deleted: every id-only helper, model's
 `same_type`, `same_types`, `same_nominal`, `same_owner`, `same_parameter`,
 `same_body`, `same_aggregate`, `same_scoped_binding`, `same_variant` and
 `same_callable_parameter`, specialize's `same_type` and `union_digest`, and
-verify's `same_variant`. `same_list_key` stays: it compares rank, depth and
-ordinal, not the whole key. Fixtures are identical. Matched against the same
+verify's `same_variant`. `same_list_key` stays because `ListElementKey` is opaque
+without `Equatable`; it compares the whole key. Fixtures are identical. Matched against the same
 input, minimum retired instructions rose 0.2% and allocations are identical.
 Each compiler on its own source (the larger candidate source adds the
 `implements` blocks and derived equality functions), allocations rose 0.35%
@@ -401,7 +401,8 @@ not a whole-value comparison:
   as written;
 - patterns' `same_head` ignores the payload types of a union head and of a
   tuple or cons head;
-- render's `same_kind` and runtime's `same_list_key` compare part of a value;
+- render's `same_kind` compares part of a value, and runtime's `same_list_key`
+  compares the whole key of an opaque type without `Equatable`;
 - `same_name_table` compares the spellings, since the buckets derive from them,
   and `NameTable` is opaque without a structural identity;
 - `same_indentation` compares source bytes, and `same_unbound_variable`
