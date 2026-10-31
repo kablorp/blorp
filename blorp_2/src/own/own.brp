@@ -28,7 +28,7 @@ import:
 		block_value_count, step_reads, step_span, step_value_count, value_span,
 		value_number,
 	option: Option methods
-	../utils/source: compiler_source, FunctionLabel
+	../utils/source: FunctionLabel
 	../specialize/specialize:
 		CallTarget(RuntimeFunction, UserFunction),
 		ConcretePatternPlace,
@@ -41,7 +41,7 @@ import:
 		VariantInstanceId, VariantFieldInstanceId,
 		function_number,
 		value_needs_ownership,
-	../utils/syntax: Diagnostic, Entrypoint, Span, entry_function, internal_error
+	../utils/syntax: Diagnostic, Entrypoint, Span, compiler_span, entry_function, internal_error
 	../utils/text: concat
 
 
@@ -301,15 +301,6 @@ record OwnershipProgram {
 }
 
 
--- Insertion errors with no source occurrence carry this compiler span.
-private pure func internal_span() -> Span:
-	{
-		source = compiler_source(),
-		start = 0,
-		end = 0
-	}
-
-
 -- Values of enclosing blocks that a block may read: each a consecutive
 -- interval of one enclosing block's values before the nested arm.
 private fixed record ValueInterval {
@@ -365,11 +356,11 @@ private pure func terminal_span(
 	outer: List[ValueInterval],
 ) -> Result[Span, Diagnostic]:
 	if visible_outside(value_number(result), outer):
-		Ok(internal_span())
+		Ok(compiler_span())
 	else:
 		match value_span(steps, result):
 			Some(span): Ok(span)
-			None: Err(internal_error(internal_span(), "invalid return value in ownership use analysis"))
+			None: Err(internal_error(compiler_span(), "invalid return value in ownership use analysis"))
 
 
 -- A terminal reads one returned value, a loop edge's arguments, or a
@@ -1692,7 +1683,7 @@ private pure func insert_selection_edge(
 	for value in edge.arguments:
 		if failure.is_some():
 			break
-		match value_source(value, sources, enclosing, first_value, internal_span()):
+		match value_source(value, sources, enclosing, first_value, compiler_span()):
 			Err(error): failure = Some(error)
 			Ok(source):
 				transferred_source = match source:
@@ -1706,11 +1697,11 @@ private pure func insert_selection_edge(
 						else:
 							borrowed_result(source)
 					_: source
-				leaving = leave_with(value, transferred_source, [], next_owner, internal_span())
+				leaving = leave_with(value, transferred_source, [], next_owner, compiler_span())
 				for entry in leaving.entries:
 					match entry:
 						Inserted(operation): operations = operations.append(operation)
-						_: failure = Some(internal_error(internal_span(), "selection edge contains control flow"))
+						_: failure = Some(internal_error(compiler_span(), "selection edge contains control flow"))
 				transfers = transfers.append(leaving.transfer)
 				next_owner = leaving.next_owner
 	-- Fresh suffix roots and acquired record projections that are not transferred
@@ -1721,7 +1712,7 @@ private pure func insert_selection_edge(
 				if moved.contains(owner_number(owner)):
 					void
 				else:
-					operations = operations.append(DropOwner(owner, internal_span()))
+					operations = operations.append(DropOwner(owner, compiler_span()))
 			_: void
 	match failure:
 		Some(error): Err(error)
@@ -2413,7 +2404,7 @@ private pure func arm_work(
 private pure func row_at[T](rows: List[T], index: Int) -> Result[T, Diagnostic]:
 	match rows.get(index):
 		Some(row): Ok(row)
-		None: Err(internal_error(internal_span(), "ownership inference row is missing"))
+		None: Err(internal_error(compiler_span(), "ownership inference row is missing"))
 
 
 -- Parameter p reaches reuse when its owner, or an owner carrying its
@@ -2442,7 +2433,7 @@ private pure func reached_parameters(inserted: InsertedFunction) -> Result[List[
 		-- A list literal allocates, so an item that pushes nothing leaves this None.
 		var nested: Option[List[ReachWork]] = None
 		match work.get(depth):
-			None: failure = Some(internal_error(internal_span(), "ownership reach work is missing"))
+			None: failure = Some(internal_error(compiler_span(), "ownership reach work is missing"))
 			Some(ReachInputs(transfers, parameters)):
 				var position = 0
 				for parameter in parameters:
@@ -2486,7 +2477,7 @@ private pure func reached_parameters(inserted: InsertedFunction) -> Result[List[
 					operation_at = operations.get(index)
 					index = index.add(1)
 					match operation_at:
-						None: failure = Some(internal_error(internal_span(), "ownership reach operation is missing"))
+						None: failure = Some(internal_error(compiler_span(), "ownership reach operation is missing"))
 						Some(DefineValue(definition)):
 							backed: Result[Option[Int], Diagnostic] = match definition.result:
 								OwnedResult(owner): Ok(Some(owner_number(owner)))
@@ -2584,7 +2575,7 @@ private pure func reached_parameters(inserted: InsertedFunction) -> Result[List[
 							else:
 								work = work.append(item)
 							depth = depth.add(1)
-						None: failure = Some(internal_error(internal_span(), "ownership reach work is missing"))
+						None: failure = Some(internal_error(compiler_span(), "ownership reach work is missing"))
 	match failure:
 		Some(error): Err(error)
 		None: Ok(reached)
@@ -2683,7 +2674,7 @@ private pure func call_facts(function: LoweredFunction, caller: Int) -> Result[C
 		var block: Option[ScannedBlock] = blocks.get(next)
 		next = next.add(1)
 		match block:
-			None: failure = Some(internal_error(internal_span(), "ownership scan block is missing"))
+			None: failure = Some(internal_error(compiler_span(), "ownership scan block is missing"))
 			Some(scanned):
 				for step in scanned.steps:
 					match step:
@@ -2915,7 +2906,7 @@ private pure func solve_labels(
 		for call in instance.facts.calls:
 			match callers.get(call.callee):
 				Some(found): callers = callers.set(call.callee, found.append(call))
-				None: failure = Some(internal_error(internal_span(), "call to an unknown instance"))
+				None: failure = Some(internal_error(compiler_span(), "call to an unknown instance"))
 		if and(instance.pinned.not(), instance.facts.reusing.any(pure func(row): row)):
 			queued = queued.set(index, True)
 		index = index.add(1)
@@ -2963,7 +2954,7 @@ private pure func solve_labels(
 												queued = requeued.queued
 												kept = requeued.kept
 												cursor = requeued.cursor
-			_: failure = Some(internal_error(internal_span(), "analysed instance is missing a row"))
+			_: failure = Some(internal_error(compiler_span(), "analysed instance is missing a row"))
 	match failure:
 		Some(error): Err(error)
 		None: Ok({ labels = labels, kept = kept })
