@@ -23,6 +23,7 @@ import:
 		variant_number,
 		variant_owner,
 	int: Int methods
+	../utils/int_map as IntMaps
 	../utils/source: FunctionLabel, ModuleId
 	../namespace/namespace:
 		TypeHead(ListHead, PrimitiveHead, RecordHead, UnionHead, OpaqueHead), same_head,
@@ -218,6 +219,84 @@ fixed record AcceptedImplementation {
 }
 
 
+-- Accepted implementations in acceptance order, with an index by receiver
+-- head derived from them in the same step. Only `implementation_table` builds
+-- one, so the index cannot disagree with the rows.
+private fixed record ImplementationRows {
+	ordered: List[AcceptedImplementation],
+	-- Under each head hint, the rows whose receiver head has that hint.
+	by_head: IntMaps.IntMap[List[AcceptedImplementation]]
+}
+opaque type ImplementationTable = ImplementationRows
+
+
+-- Declaration numbers are non-negative, so each built-in head, which carries
+-- most implementations, takes its own negative hint.
+private INT_HINT: Int = -1
+private FLOAT_HINT: Int = -2
+private STRING_HINT: Int = -3
+private VOID_HINT: Int = -4
+private LIST_HINT: Int = -5
+
+
+-- An index hint, never an identity: equal heads share one, and the lookup
+-- then compares whole heads, so a shared hint costs only speed.
+private pure func head_hint(head: TypeHead) -> Int:
+	match head:
+		PrimitiveHead(BuiltinInt): INT_HINT
+		PrimitiveHead(BuiltinFloat): FLOAT_HINT
+		PrimitiveHead(BuiltinString): STRING_HINT
+		PrimitiveHead(BuiltinVoid): VOID_HINT
+		ListHead: LIST_HINT
+		UnionHead(id): union_number(id)
+		RecordHead(id): record_number(id)
+		OpaqueHead(id): opaque_number(id)
+
+
+private pure func hinted_rows(by_head: IntMaps.IntMap[List[AcceptedImplementation]], hint: Int) -> List[AcceptedImplementation]:
+	match IntMaps.get(by_head, hint):
+		Some(rows): rows
+		None: []
+
+
+-- `rows` indexed, or None if two rows implement one trait for one head or a
+-- row holds another trait's member. A method's body is then found in the one
+-- family of its own trait for the receiver head.
+pure func implementation_table(rows: List[AcceptedImplementation]) -> Option[ImplementationTable]:
+	var by_head: IntMaps.IntMap[List[AcceptedImplementation]] = IntMaps.empty_int_map()
+	var valid: Bool = True
+	for row in rows:
+		hint = head_hint(row.receiver_head)
+		bucket = hinted_rows(by_head, hint)
+		duplicate = bucket.any(pure func(existing): and(trait_number(existing.trait_id) == trait_number(row.trait_id), same_head(existing.receiver_head, row.receiver_head)))
+		other_trait_member = row.methods.any(pure func(member): trait_number(trait_method_owner(member.method)) != trait_number(row.trait_id))
+		if and(duplicate.not(), other_trait_member.not()):
+			by_head = IntMaps.set(by_head, hint, bucket.append(row))
+		else:
+			valid = False
+			break
+	if valid:
+		Some(into_opaque ImplementationTable({ ordered = rows, by_head = by_head }))
+	else:
+		None
+
+
+-- The rows in acceptance order.
+pure func implementation_rows(table: ImplementationTable) -> List[AcceptedImplementation]:
+	from_opaque ImplementationTable(table).ordered
+
+
+-- The one accepted implementation of `required` for `head`.
+pure func family_for(traits: AcceptedTraits, required: TraitId, head: TypeHead) -> Option[AcceptedImplementation]:
+	var family: Option[AcceptedImplementation] = None
+	for row in hinted_rows(from_opaque ImplementationTable(traits.implementations).by_head, head_hint(head)):
+		if trait_number(row.trait_id) == trait_number(required):
+			if same_head(row.receiver_head, head):
+				family = Some(row)
+				break
+	family
+
+
 private fixed record CanonicalEqualityContents {
 	equals: TraitMethodId,
 	not_equals: Option[TraitMethodId]
@@ -288,7 +367,7 @@ fixed record AcceptedTraitContracts {
 
 fixed record AcceptedTraits {
 	declarations: List[AcceptedTrait],
-	implementations: List[AcceptedImplementation],
+	implementations: ImplementationTable,
 	canonical: CanonicalContracts
 }
 
@@ -330,21 +409,20 @@ pure func receiver_arguments(receiver: TypeRef) -> List[TypeRef]:
 pure func method_body(traits: AcceptedTraits, call: AcceptedMethodCall) -> Option[SelectedMethodBody]:
 	var found: Option[SelectedMethodBody] = None
 	receiver = method_receiver(call)
-	match type_head(receiver):
+	method = method_identity(call)
+	family: Option[AcceptedImplementation] = match type_head(receiver):
+		Some(head): family_for(traits, trait_method_owner(method), head)
+		None: None
+	match family:
 		None: void
-		Some(head):
-			for implementation in traits.implementations:
-				if same_head(implementation.receiver_head, head):
-					for member in implementation.methods:
-						if same_trait_method(member.method, method_identity(call)):
-							match member.body:
-								AuthoredMethod(function): found = Some({ body = DeclaredBody(function), arguments = receiver_arguments(receiver) })
-								TraitDefault(function): found = Some({ body = DeclaredBody(function), arguments = [receiver] })
-								StructuralEquality(aggregate, _): found = Some({ body = DerivedEqualityBody(aggregate), arguments = receiver_arguments(receiver) })
-							break
-					match found:
-						Some(_): break
-						None: void
+		Some(implementation):
+			for member in implementation.methods:
+				if same_trait_method(member.method, method):
+					found = match member.body:
+						AuthoredMethod(function): Some({ body = DeclaredBody(function), arguments = receiver_arguments(receiver) })
+						TraitDefault(function): Some({ body = DeclaredBody(function), arguments = [receiver] })
+						StructuralEquality(aggregate, _): Some({ body = DerivedEqualityBody(aggregate), arguments = receiver_arguments(receiver) })
+					break
 	found
 
 
@@ -530,7 +608,7 @@ pure func aggregate_owner(aggregate: AggregateId) -> TypeParameterOwner:
 
 pure func equality_body(traits: AcceptedTraits, aggregate: AggregateId) -> Option[CheckedEqualityBody]:
 	var found: Option[CheckedEqualityBody] = None
-	for implementation in traits.implementations:
+	for implementation in implementation_rows(traits.implementations):
 		for member in implementation.methods:
 			match member.body:
 				StructuralEquality(owner, body):

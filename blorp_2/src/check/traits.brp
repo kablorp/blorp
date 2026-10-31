@@ -6,7 +6,7 @@ the resolved requirement-to-body mapping consumed by checking and specialization
 import:
 	./declarations: TypeScope, type_access, previous_declaration, resolve_type, Substitution, substitute_type
 	./errors: CheckError, checker_invariant, type_term_error, TypeTermError(PrivateTypeInPublicDeclaration), CheckerInvariant(InvalidFunctionContract), TraitError(SupertraitUnknown, SupertraitCycle, SupertraitMethodInImplementation, CanonicalEquatableSupertraits, EqualityMemberUnsupported, DuplicateRequirementParameter, ImpureRequirement, GenericRequirement, FirstParameterMustBeSelf, CallableFormalDeferred, OrphanImplementation, DuplicateImplementation, MissingImplementationMethod, MissingTraitBound, UnknownImplementationMethod, DuplicateImplementationMethod, ImplementationSignatureMismatch, MalformedCanonicalTrait, MalformedCanonicalMember), CanonicalFamily(EqualityFamily, OrderingFamily), trait_error
-	./model: AggregateId(RecordAggregate, UnionAggregate), NominalId(AggregateNominal), EqualityMember(EqualityField, EqualityPayload), CheckedRecord, CheckedUnion, AcceptedTraits, AcceptedTraitContracts, CanonicalEquality, canonical_equality, canonical_owner, CanonicalOrdering, canonical_ordering, AcceptedTrait, AcceptedTraitMethod, AcceptedImplementation, ImplementedMethod, ImplementedBody(AuthoredMethod, TraitDefault, StructuralEquality), TypeParameterId, LocatedTrait, TraitRequirement, aggregate_head, aggregate_owner, same_owner, receiver_arguments, receiver_type, type_head, parameter_owner, same_parameter, ImplementationHeader, FunctionSignature, TypeUse, TypeRef(ParameterType, VoidType, NominalType), TypeParameterOwner(TraitDeclaration), type_parameter_id, same_type, same_types
+	./model: AggregateId(RecordAggregate, UnionAggregate), NominalId(AggregateNominal), EqualityMember(EqualityField, EqualityPayload), CheckedRecord, CheckedUnion, AcceptedTraits, AcceptedTraitContracts, ImplementationTable, family_for, implementation_rows, implementation_table, CanonicalEquality, canonical_equality, canonical_owner, CanonicalOrdering, canonical_ordering, AcceptedTrait, AcceptedTraitMethod, AcceptedImplementation, ImplementedMethod, ImplementedBody(AuthoredMethod, TraitDefault, StructuralEquality), TypeParameterId, LocatedTrait, TraitRequirement, aggregate_head, aggregate_owner, same_owner, receiver_arguments, receiver_type, type_head, parameter_owner, same_parameter, ImplementationHeader, FunctionSignature, TypeUse, TypeRef(ParameterType, VoidType, NominalType), TypeParameterOwner(TraitDeclaration), type_parameter_id, same_type, same_types
 	./equality: equality_template
 	./signatures: AcceptedFunction
 	../namespace/builtins: DesignatedBoolean
@@ -454,6 +454,12 @@ pure func accept_trait_contracts(
 		None: Ok({ declarations = declarations, canonical = { equality = accepted_equality, ordering = accepted_ordering } })
 
 
+-- Accepted rows always satisfy the table's invariants; a rejection is a
+-- checker fault.
+pure func checked_implementation_table(rows: List[AcceptedImplementation]) -> Result[ImplementationTable, CheckError]:
+	implementation_table(rows).to_result(checker_invariant(compiler_span(), InvalidFunctionContract))
+
+
 -- Method contracts are already accepted. Authored implementation signatures
 -- and default identities now complete this same authority without reacceptance.
 pure func validate_implementations(
@@ -477,9 +483,10 @@ pure func validate_implementations(
 			None: failure = Some(checker_invariant(row.header.span, InvalidFunctionContract))
 		if failure.is_some():
 			break
-	match failure:
+	table: ImplementationTable ?= match failure:
 		Some(error): Err(error)
-		None: Ok({ declarations = contracts.declarations, implementations = implementations, canonical = contracts.canonical })
+		None: checked_implementation_table(implementations)
+	Ok({ declarations = contracts.declarations, implementations = table, canonical = contracts.canonical })
 
 
 -- Abstract signatures have no body owner. Check their formal names only after
@@ -597,14 +604,6 @@ pure func unavailable_equality_member(availability: TraitAvailability, head: Typ
 	from_opaque TraitAvailability(availability).unavailable
 		.find(pure func(failure): same_head(aggregate_head(failure.aggregate), head))
 		.map(pure func(failure): failure.member)
-
-
-pure func family_for(traits: AcceptedTraits, required: TraitId, head: TypeHead) -> Option[AcceptedImplementation]:
-	var family: Option[AcceptedImplementation] = None
-	for implementation in traits.implementations:
-		if and(trait_number(implementation.trait_id) == trait_number(required), same_head(implementation.receiver_head, head)):
-			family = Some(implementation)
-	family
 
 
 -- Each candidate owns only its actual member requirements. Recursive goals
@@ -801,7 +800,7 @@ private pure func complete_equality_availability(parsed: ParsedContents, traits:
 	contract ?= traits.declarations.get(trait_number(canonical)).to_result(checker_invariant(compiler_span(), InvalidFunctionContract))
 	written_records = inventory_records(parsed.declarations)
 	written_unions = inventory_unions(parsed.declarations)
-	var implementations = traits.implementations
+	var implementations = implementation_rows(traits.implementations)
 	var error: Option[CheckError] = None
 	for candidate in possible:
 		match supported_implementation(parsed.names, written_records, written_unions, candidate, records, unions, contract, boolean, canonical):
@@ -812,7 +811,8 @@ private pure func complete_equality_availability(parsed: ParsedContents, traits:
 	_: Void ?= match error:
 		Some(failure): Err(failure)
 		None: Ok(void)
-	Ok(into_opaque TraitAvailability({ accepted = { traits | implementations = implementations }, unavailable = unavailable }))
+	table ?= checked_implementation_table(implementations)
+	Ok(into_opaque TraitAvailability({ accepted = { traits | implementations = table }, unavailable = unavailable }))
 
 
 private pure func supported_implementation(

@@ -13,7 +13,7 @@ import:
 		),
 		recursion_error,
 	./model:
-		BodyOwner(DeclaredBody, LambdaBody, DerivedEqualityBody), AggregateId(RecordAggregate, UnionAggregate), NominalId(AggregateNominal, OpaqueNominal), aggregate_head, aggregate_owner, same_aggregate, same_nominal, type_head, body_calls, canonical_owner, AcceptedTraits, AcceptedImplementation, AcceptedMethodCall, method_body, method_receiver, method_identity, ImplementedBody(AuthoredMethod, TraitDefault, StructuralEquality),
+		BodyOwner(DeclaredBody, LambdaBody, DerivedEqualityBody), AggregateId(RecordAggregate, UnionAggregate), NominalId(AggregateNominal, OpaqueNominal), aggregate_head, aggregate_owner, same_aggregate, same_nominal, type_head, body_calls, canonical_owner, AcceptedTraits, AcceptedImplementation, ImplementationTable, AcceptedMethodCall, method_body, family_for, implementation_rows, method_receiver, method_identity, ImplementedBody(AuthoredMethod, TraitDefault, StructuralEquality),
 		CallTarget(TraitMethod, RuntimeFunction, UserFunction, CallableParameter, ValueCall),
 		CheckedArm,
 		CheckedBody(CheckedMatchBody, CheckedValueBody),
@@ -39,8 +39,8 @@ import:
 	../utils/source: same_source
 	../utils/ids: FunctionId, function_number, same_trait_method, TraitId, trait_number, trait_method_owner
 	../namespace/namespace: TypeHead(PrimitiveHead, ListHead, RecordHead, UnionHead, OpaqueHead), same_head
-	./traits: family_for
 	./declarations: Substitution, substitute_type
+	./traits: checked_implementation_table
 	./instantiation_paths: InstantiationPath, PathOperation(KeepPath, PushPath, PopPath), PathBoundedness(BoundedPaths, UnboundedPaths), bound_instantiation_paths
 	int: Int methods
 	option: Option methods
@@ -488,9 +488,9 @@ private pure func append_method_dependencies(
 			var origins = automatic
 			match type_head(method_receiver(method)):
 				Some(head):
-					for implementation in traits.implementations:
-						if and(same_head(head, implementation.receiver_head), implementation.methods.any(pure func(member): same_trait_method(member.method, method_identity(method)))):
-							origins = with_origins(origins, automatic_origin(implementation))
+					match family_for(traits, trait_method_owner(method_identity(method)), head):
+						Some(family): origins = with_origins(origins, automatic_origin(family))
+						None: void
 				None: void
 			var position = 0
 			for argument in selected.arguments:
@@ -502,7 +502,7 @@ private pure func append_method_dependencies(
 		None:
 			match method_receiver(method):
 				ParameterType(_):
-					for implementation in traits.implementations:
+					for implementation in implementation_rows(traits.implementations):
 						origins = with_origins(automatic, automatic_origin(implementation))
 						for member in implementation.methods:
 							if same_trait_method(member.method, method_identity(method)):
@@ -720,7 +720,7 @@ pure func validate_recursive_instantiation(
 	for lambda in lambdas:
 		dependencies = append_call_dependencies(dependencies, lambda_calls(lambda), traits, [])
 		dependencies = append_creation_dependencies(dependencies, body_callable_creations(lambda.statements, lambda.body), traits, [])
-	for implementation in traits.implementations:
+	for implementation in implementation_rows(traits.implementations):
 		for member in implementation.methods:
 			match member.body:
 				StructuralEquality(_, template):
@@ -884,6 +884,14 @@ pure func removed_equalities(final: FinalTraits) -> List[AggregateId]:
 	from_opaque FinalTraits(final).removed
 
 
+private pure func blocked_by_unavailable_equality(implementation: AcceptedImplementation, unavailable: List[AggregateId]) -> Bool:
+	implementation.methods.any(pure func(member) -> Bool:
+		match member.body:
+			StructuralEquality(aggregate, _): unavailable.any(pure func(existing): same_aggregate(existing, aggregate))
+			_: False
+	)
+
+
 -- Complete the new-auto availability once, then validate source uses before
 -- sealing. Generated templates propagate failure privately; authored/default
 -- bodies, constants and lambdas remain checked even without a reachable caller.
@@ -897,7 +905,7 @@ pure func finalize_trait_instances(
 	var changed: Bool = initially_unavailable.is_empty().not()
 	while and(changed, invalid.is_none()):
 		changed = False
-		for implementation in traits.implementations:
+		for implementation in implementation_rows(traits.implementations):
 			for member in implementation.methods:
 				match member.body:
 					StructuralEquality(aggregate, template):
@@ -936,15 +944,8 @@ pure func finalize_trait_instances(
 				Some(error): Err(error)
 				None: Ok(void)
 	final_unavailable = unavailable
-	var implementations = traits.implementations
-	if unavailable.is_empty().not():
-		implementations = []
-		for implementation in traits.implementations:
-			blocked = implementation.methods.any(pure func(member) -> Bool:
-				match member.body:
-					StructuralEquality(aggregate, _): final_unavailable.any(pure func(existing): same_aggregate(existing, aggregate))
-					_: False
-			)
-			if blocked.not():
-				implementations = implementations.append(implementation)
+	implementations: ImplementationTable ?= if final_unavailable.is_empty():
+		Ok(traits.implementations)
+	else:
+		checked_implementation_table(implementation_rows(traits.implementations).filter(pure func(implementation): blocked_by_unavailable_equality(implementation, final_unavailable).not()))
 	Ok(into_opaque FinalTraits({ traits = { traits | implementations = implementations }, removed = final_unavailable }))

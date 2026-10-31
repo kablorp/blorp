@@ -1,0 +1,179 @@
+import:
+	../../../src/check/check: check, checked_functions
+	../../../src/check/model as Model
+	../../../src/lex/lex: lex
+	../../../src/namespace/builtins: PrimitiveType(BuiltinInt)
+	../../../src/namespace/namespace: TypeHead(ListHead, PrimitiveHead, RecordHead, UnionHead), same_head
+	../../../src/parse/assemble: ParsedAssembly, append_module, assembly_names, begin_program
+	../../../src/parse/parse: parse_module
+	../../../src/utils/source: ModuleId, ModuleKind(UserModule, LibraryModule, FoundationTypesModule, FoundationPreludeModule), compiler_source, module_id, module_source
+	../../../src/utils/syntax: Diagnostic, diagnostic, same_span
+	../module_input: FOUNDATION_TYPES, sealed
+	../input: setup_diagnostic
+	bool: and, not
+	int: Int methods
+	list: List methods
+	option: Option methods
+	result: Result methods
+	string: String methods
+	test: TestSuite
+
+
+-- The root at 0, an Int library at 1, the base at 2 and the prelude at 3. The
+-- library implements both traits for Int. The root implements Named for Point
+-- and receives Point's automatic equality. Point and Bool are the first record
+-- and union, which may give their rows one index hint; no test relies on it.
+private BASE_POSITION: Int = 2
+private TRAITS: String =
+	|trait Equatable:
+	|    pure func equals(left: Self, right: Self) -> Bool
+	|trait Named:
+	|    pure func name(value: Self) -> Int
+	|
+private LIBRARY: String =
+	|import:
+	|    _base: Int, Bool, Equatable, Named
+	|implements Equatable for Int:
+	|    pure func equals(left: Self, right: Self) -> Bool:
+	|        builtin("int.equals")
+	|implements Named for Int:
+	|    pure func name(value: Self) -> Int:
+	|        value
+	|
+private ROOT: String =
+	|fixed record Point { x: Int }
+	|implements Named for Point:
+	|    pure func name(value: Self) -> Int:
+	|        value.x
+	|func main() -> Int:
+	|    0
+	|
+private PRELUDE: String =
+	|import:
+	|    _base: Int, Float, String, Void, List, Bool(True, False), Option(Some, None), Result(Ok, Err), Equatable, Named
+	|
+
+
+private pure func append_source(assembly: ParsedAssembly, position: Int, source: String, targets: List[ModuleId], role: ModuleKind) -> Result[ParsedAssembly, Diagnostic]:
+	module ?= module_id(position).to_result(diagnostic({ source = compiler_source(), start = 0, end = 0 }, "invalid implementation table fixture module", "use the four fixture module positions"))
+	tokens ?= lex(module_source(module), source, assembly_names(assembly))
+	parsed ?= parse_module(tokens, module)
+	append_module(assembly, parsed, targets, role, "module_".append_int(position))
+
+
+private pure func checked_traits() -> Result[Model.AcceptedTraits, Diagnostic]:
+	base ?= module_id(BASE_POSITION).to_result(diagnostic({ source = compiler_source(), start = 0, end = 0 }, "invalid implementation table fixture base", "use the four fixture module positions"))
+	root ?= append_source(begin_program(), 0, ROOT, [], UserModule)
+	library ?= append_source(root, 1, LIBRARY, [base], LibraryModule)
+	types ?= append_source(library, BASE_POSITION, FOUNDATION_TYPES.add(TRAITS), [], FoundationTypesModule)
+	prelude ?= append_source(types, 3, PRELUDE, [base], FoundationPreludeModule)
+	parsed ?= sealed(prelude)
+	program ?= check(parsed).map_err(setup_diagnostic)
+	Ok(checked_functions(program).traits)
+
+
+private pure func is_record_row(row: Model.AcceptedImplementation) -> Bool:
+	match row.receiver_head:
+		RecordHead(_): True
+		_: False
+
+
+-- Point's written Named implementation and its automatic equality.
+private pure func point_rows(rows: List[Model.AcceptedImplementation]) -> Option[(Model.AcceptedImplementation, Model.AcceptedImplementation)]:
+	named = rows.find(pure func(row): is_record_row(row).and(row.method_provider.is_some()))
+	equality = rows.find(pure func(row): is_record_row(row).and(row.method_provider.is_none()))
+	match (named, equality):
+		(Some(written), Some(automatic)): Some((written, automatic))
+		_: None
+
+
+private pure func same_rows(left: List[Model.AcceptedImplementation], right: List[Model.AcceptedImplementation]) -> Bool:
+	var same = left.length() == right.length()
+	var position = 0
+	for row in left:
+		match right.get(position):
+			Some(other): same = same.and(same_span(row.span, other.span))
+			None: same = False
+		position = position.add(1)
+	same
+
+
+pure func test_each_row_is_the_family_of_its_trait_and_head() -> Bool:
+	match checked_traits():
+		Err(_): False
+		Ok(traits):
+			rows = Model.implementation_rows(traits.implementations)
+			covered = rows.any(pure func(row): same_head(row.receiver_head, PrimitiveHead(BuiltinInt)))
+				.and(rows.any(pure func(row): is_record_row(row)))
+				.and(rows.any(pure func(row) -> Bool:
+					match row.receiver_head:
+						UnionHead(_): True
+						_: False
+				))
+			found = rows.all(pure func(row) -> Bool:
+				match Model.family_for(traits, row.trait_id, row.receiver_head):
+					Some(family): same_span(family.span, row.span)
+					None: False
+			)
+			covered.and(found)
+
+
+-- Named has a row for Point, but none for Bool or List.
+pure func test_a_head_without_the_trait_has_no_family() -> Bool:
+	match checked_traits():
+		Err(_): False
+		Ok(traits):
+			rows = Model.implementation_rows(traits.implementations)
+			union_row = rows.find(pure func(row) -> Bool:
+				match row.receiver_head:
+					UnionHead(_): True
+					_: False
+			)
+			match (point_rows(rows), union_row):
+				(Some((named, _)), Some(automatic)):
+					Model.family_for(traits, named.trait_id, automatic.receiver_head).is_none()
+						.and(Model.family_for(traits, named.trait_id, ListHead).is_none())
+				_: False
+
+
+pure func test_rebuilding_the_rows_keeps_their_order() -> Bool:
+	match checked_traits():
+		Err(_): False
+		Ok(traits):
+			rows = Model.implementation_rows(traits.implementations)
+			match Model.implementation_table(rows):
+				Some(table): same_rows(Model.implementation_rows(table), rows)
+				None: False
+
+
+pure func test_a_second_family_for_one_trait_and_head_is_rejected() -> Bool:
+	match checked_traits():
+		Err(_): False
+		Ok(traits):
+			rows = Model.implementation_rows(traits.implementations)
+			match rows:
+				[first, ..._]: Model.implementation_table(rows.append(first)).is_none()
+				[]: False
+
+
+pure func test_a_member_of_another_trait_is_rejected() -> Bool:
+	match checked_traits():
+		Err(_): False
+		Ok(traits):
+			match point_rows(Model.implementation_rows(traits.implementations)):
+				Some((named, automatic)):
+					Model.implementation_table([named]).is_some()
+						.and(Model.implementation_table([{ named | methods = automatic.methods }]).is_none())
+				None: False
+
+
+tests: TestSuite = {
+	description = "accepted implementation table",
+	tests = [
+		("each row is the family of its trait and head", test_each_row_is_the_family_of_its_trait_and_head),
+		("a head without the trait has no family", test_a_head_without_the_trait_has_no_family),
+		("rebuilding the rows keeps their order", test_rebuilding_the_rows_keeps_their_order),
+		("a second family for one trait and head is rejected", test_a_second_family_for_one_trait_and_head_is_rejected),
+		("a member of another trait is rejected", test_a_member_of_another_trait_is_rejected),
+	]
+}
