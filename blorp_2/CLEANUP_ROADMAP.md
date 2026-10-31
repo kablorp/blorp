@@ -62,13 +62,11 @@ The rules come from four documents:
 - [M9](ROADMAP.md#m9-post-self-compilation-architecture-audit) remains the
   full architecture audit. This roadmap is the narrower cleanup queue.
 
-Two pieces of work are in flight that this plan must not collide with:
+Two pieces of work were in flight when this plan was written:
 
-- **O1, [ownership contracts](ROADMAP.md#ownership-contracts-roadmap),** comes
-  next. Its preparation adds `consuming_helper_name` and
-  `reuses_first_operand`, which the runtime C text (`runtime/list.brp`,
-  `runtime/string_concat.brp`) and emit use. It then writes `own/own.brp`,
-  `lower/lower.brp` and `verify/verify.brp`.
+- **O1, [ownership contracts](ROADMAP.md#ownership-contracts-roadmap),** which
+  wrote `own/own.brp`, `lower/lower.brp`, `verify/verify.brp` and the runtime
+  C text. O1 landed on 2026-10-30 (`393438c00`), so its gate below is lifted.
 - **L3/L4, [list buffer reuse](ROADMAP.md#list-buffer-reuse-roadmap),**
   rewrites `standard_library/list.brp`.
 
@@ -285,6 +283,13 @@ The `check` row landed at −103 lines. `find_variant` and
 pair did), and `type_spelling` no longer has a record arm since records and
 unions share `NominalType`. Fixtures are identical; self-compile allocations
 rose 17.6k (+0.08%, route closures) and instructions fell 0.3%.
+
+The `specialize` row landed at −41 lines: one `same_elements` loop replaces
+the four `same_*` list loops, and `contains_parameter`'s nominal arm uses
+`any`. The `callable_mode`/`translated_callable` forwarding step was skipped:
+the two scan different lists and match different variants, and a shared
+helper came out 12 lines larger. Fixtures are identical; self-compile
+allocations are unchanged and instructions fell about 0.5%.
 
 Basis: the parse items remove about 300 lines, the de-duplicated pairs about
 150, and the verify blocks about 100. About −600.
