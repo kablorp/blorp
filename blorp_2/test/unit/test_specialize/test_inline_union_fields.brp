@@ -1,0 +1,117 @@
+---
+A record stays inline when every field is a number, an inline record or a
+union declared fixed. An ordinary union field makes the record managed even
+when that union is unmanaged today, because only `fixed` is a promise.
+---
+import:
+	../../../src/check/check: check
+	../../../src/specialize/specialize as Concrete
+	../module_input: parse_modules
+	bool: and
+	int: Int methods
+	test: TestSuite
+
+
+-- Each record has its own field shape, so its layout is found by shape.
+private SOURCE: String =
+	|fixed union Signal:
+	|    Quiet
+	|    Level(Int)
+	|union Toggle:
+	|    On
+	|    Off
+	|union Text:
+	|    Blank
+	|    Words(String)
+	|record Flagged { signal: Signal }
+	|record Switched { set: Bool, value: Int }
+	|record Toggled { value: Int, toggle: Toggle }
+	|record Labelled { text: Text, value: Int, count: Int }
+	|pure func flagged(item: Flagged) -> Int:
+	|    0
+	|pure func switched(item: Switched) -> Int:
+	|    item.value
+	|pure func toggled(item: Toggled) -> Int:
+	|    item.value
+	|pure func labelled(item: Labelled) -> Int:
+	|    item.value
+	|func main() -> Int:
+	|    first = flagged({ signal = Level(1) })
+	|    second = switched({ set = True, value = 2 })
+	|    third = toggled({ value = 3, toggle = On })
+	|    fourth = labelled({ text = Words("four"), value = 4, count = 4 })
+	|    0
+	|
+
+
+private pure func specialized_records() -> List[Concrete.ConcreteRecord]:
+	match parse_modules([{ source = SOURCE, targets = [] }]):
+		Err(_): []
+		Ok(parsed):
+			match check(parsed):
+				Err(_): []
+				Ok(accepted):
+					match Concrete.specialize(accepted):
+						Err(_): []
+						Ok(program): Concrete.specialized_contents(program).records
+
+
+-- Whether the one record whose fields have this shape has inline storage;
+-- None when no record, or more than one, has the shape.
+private pure func inline_with_shape(shape: pure (List[Concrete.TypeRef]) -> Bool) -> Option[Bool]:
+	var found: Option[Bool] = None
+	var matches = 0
+	for layout in specialized_records():
+		if shape(Concrete.record_fields(layout)):
+			matches = matches.add(1)
+			found = match layout:
+				Concrete.InlineFields(_): Some(True)
+				Concrete.CountedFields(_): Some(False)
+	if matches == 1:
+		found
+	else:
+		None
+
+
+pure func test_fixed_union_field_keeps_a_record_inline() -> Bool:
+	inline_with_shape(pure func(fields: List[Concrete.TypeRef]) -> Bool:
+		match fields:
+			[Concrete.UnionType(_)]: True
+			_: False
+	) == Some(True)
+
+
+pure func test_bool_field_keeps_a_record_inline() -> Bool:
+	inline_with_shape(pure func(fields: List[Concrete.TypeRef]) -> Bool:
+		match fields:
+			[Concrete.UnionType(_), Concrete.IntType]: True
+			_: False
+	) == Some(True)
+
+
+-- Toggle has no payload and is unmanaged, but it is not declared fixed.
+pure func test_ordinary_union_field_makes_a_record_managed() -> Bool:
+	inline_with_shape(pure func(fields: List[Concrete.TypeRef]) -> Bool:
+		match fields:
+			[Concrete.IntType, Concrete.UnionType(_)]: True
+			_: False
+	) == Some(False)
+
+
+pure func test_owning_union_field_makes_a_record_managed() -> Bool:
+	inline_with_shape(pure func(fields: List[Concrete.TypeRef]) -> Bool:
+		match fields:
+			[Concrete.UnionType(_), Concrete.IntType, Concrete.IntType]: True
+			_: False
+	) == Some(False)
+
+
+tests: TestSuite = {
+	description = "Inline records with union fields",
+	tests = [
+		("a fixed union field keeps a record inline", test_fixed_union_field_keeps_a_record_inline),
+		("a Bool field keeps a record inline", test_bool_field_keeps_a_record_inline),
+		("an ordinary union field makes a record managed", test_ordinary_union_field_makes_a_record_managed),
+		("an owning union field makes a record managed", test_owning_union_field_makes_a_record_managed),
+	],
+}

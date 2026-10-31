@@ -1761,12 +1761,30 @@ private pure func prepare_union(
 				Err(error): Err(error)
 
 
--- Whether a prepared field keeps its record inline: a number, or a record
--- whose own layout is inline.
-private pure func inline_record_field(field: PartialType, records: IndexedList[RecordSlot], span: Span) -> Result[Bool, Diagnostic]:
+-- Whether a prepared field keeps its record inline: a number, a record whose
+-- own layout is inline, or a union declared fixed. A fixed union is always
+-- InlineUnmanaged, which prepare_union asserts; an ordinary union is not
+-- inline here even when it is unmanaged, so that a record's layout follows
+-- declared promises rather than another union's current payloads.
+private pure func inline_record_field(
+	field: PartialType, checked: Checked.CheckedFunctions,
+	unions: IndexedList[UnionSlot], records: IndexedList[RecordSlot], span: Span,
+) -> Result[Bool, Diagnostic]:
 	match field:
 		KnownType(IntType) | KnownType(FloatType):
 			Ok(True)
+		KnownType(UnionType(child)):
+			match unions.entries.get(union_number(child)):
+				None:
+					Err(internal_error(span, "missing concrete child layout"))
+				Some(slot):
+					declaration: Declaration.UnionId = match slot:
+						CompleteUnion(instance): instance.key.declaration
+						PendingUnion(instance): instance.key.declaration
+					checked.unions
+						.get(Declaration.union_number(declaration))
+						.map(pure func(union_declaration: Checked.CheckedUnion) -> Bool: union_declaration.fixed)
+						.to_result(internal_error(span, "unknown union declaration"))
 		KnownType(RecordType(child)):
 			match records.entries.get(record_number(child)):
 				None:
@@ -1882,10 +1900,10 @@ private pure func prepare_declared_record(
 				record_dependencies = prepared.records
 				layouts = prepared.in_progress
 				fields = fields.append(prepared.value_type)
-				-- Only numbers and inline records keep a record inline;
-				-- every other field, including a layout still in
+				-- Only numbers, inline records and fixed unions keep a record
+				-- inline; every other field, including a layout still in
 				-- progress, needs a counted root.
-				match inline_record_field(prepared.value_type, record_dependencies, field.span):
+				match inline_record_field(prepared.value_type, checked, dependencies, record_dependencies, field.span):
 					Ok(inline):
 						if inline.not():
 							managed = True
