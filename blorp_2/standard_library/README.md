@@ -36,7 +36,9 @@ Each arithmetic trait has one member: `add`, `subtract`, `multiply`, `divide` an
 `remainder` take `(left: Self, right: Self)`, `negate` takes `(value: Self)`, and
 each returns `Self`. The prelude's selection makes them the canonical traits of
 `+`, `-`, `*`, `/`, `%` and prefix `-`, so user code writes `a + b` or
-`a.add(b)` alike; library source keeps writing calls until the seed is rotated.
+`a.add(b)` alike. Library implementation code uses operators for ordinary
+arithmetic and ordering; trait definitions and direct member delegation retain
+explicit calls.
 
 `bool.brp` defines pure, ordinary `not`, `and` and `or`; select them explicitly
 with `bool: not, and, or` for direct calls and UFCS. Both binary arguments are eager;
@@ -44,7 +46,7 @@ use an explicit `match` to skip evaluation. The prelude leaves these names avail
 for user helper declarations and selections of their own ordinary functions.
 They import only other library modules and `_base`, never user modules.
 
-For example, `42.add(1).to_string().length()` needs no imports. Direct calls
+For example, `(42 + 1).to_string().length()` needs no imports. Direct calls
 still require named imports such as `int: add`; `add` selected from both `int`
 and `string` names the one Addable family. IO remains explicit.
 Int implements `Orderable` with one signed64 `less_than` builtin and the trait's

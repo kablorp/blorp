@@ -14,9 +14,10 @@ eventual bootstrap subset in the README: no concurrency, parallelism, tensors
 or dimension types, debug blocks, numeric widths other than Int64 and Float64,
 doctests, channels or FFI. Tuples and static traits are supported by the
 current seed; their use in compiler implementation remains bounded by each
-reviewed task. Compiler source writes equality with `==` and `!=`; other
-operations use concrete functions such as `add` and `concat`, and pattern
-matching. Checking does not yet accept the `and`/`or`/`not` keywords, so
+reviewed task. Compiler source writes arithmetic, ordering and equality with
+their operators; String `+` calls Addable. Other operations use concrete
+functions such as `concat`, and pattern matching. Checking does not yet accept
+the `and`/`or`/`not` keywords, so
 Boolean logic calls the `bool` library module. Dependencies on the old host
 library or TestSuite API mark deferred tests; port bounded suites
 incrementally without expanding the input language.

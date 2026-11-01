@@ -375,9 +375,7 @@ admitted, even when no operator uses it.
 
 `->` is lexed before `>`, and `a<-1` compares with `-1`, a minus folded into
 the literal. `=>`, `=<` and `<>` are rejected with help naming `>=` or a
-lambda, `<=`, and `!=`. The pinned seed predates these operators, so compiler
-and library source still write ordering as calls such as `less_than` until the
-seed is rotated.
+lambda, `<=`, and `!=`. Compiler and library source use ordering operators.
 
 ## Arithmetic operators
 
@@ -433,8 +431,7 @@ not operators; each is rejected with a teaching message.
 
 A canonical arithmetic trait must keep its member as its sole abstract method,
 pure and with its row's signature; defaults and supertraits beside it are
-admitted. The pinned seed predates these operators, so compiler and library
-source still write arithmetic as calls such as `add` until the seed is rotated.
+admitted. Compiler and library source use arithmetic operators.
 
 ## Automatic equality for named aggregates
 
@@ -3532,15 +3529,16 @@ source inventory explicitly to the pure pipeline and diagnostic renderer. Compil
 consult the filesystem, environment, clock or shared mutable caches. Any reports
 or measurements produced by a phase are returned as data for the shell to present.
 
-Compiler source writes equality with the fixed `==` and `!=` operators, which
-call the canonical Equatable methods. Arithmetic, ordering and String
-concatenation call the arithmetic and Orderable trait members, such as
-`count.add(1)` and `less_than(left, right)`, because the pinned seed predates
-their operators. Other operations use concrete functions. Checking does not
-yet accept the `and`/`or`/`not` keywords, so Boolean logic calls the `bool` library module.
+Compiler source writes arithmetic, ordering and equality with their fixed
+operators, which call the canonical trait members. For example, `count + 1`
+calls Addable and `left < right` calls Orderable; String `+` concatenates.
+Explicit calls remain where tests exercise method dispatch and where library
+trait implementations call another member directly. Other operations use
+concrete functions. Checking does not yet accept the `and`/`or`/`not` keywords,
+so Boolean logic calls the `bool` library module.
 Concrete input traits do not expand that compiler-source subset. The production
-library supplies ordinary Equatable implementations; input programs may call
-their methods or use the fixed equality operators.
+library supplies ordinary implementations of these traits; input programs may
+call their methods or use the fixed operators.
 The legacy host library's trait implementations do not expand the compiler-source
 subset.
 Exact String equality uses the ordinary `string.equals` API in both libraries;
