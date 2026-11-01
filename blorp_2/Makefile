@@ -15,6 +15,11 @@ TEST_COMPILER_LIBRARIES := -lm -lpthread
 TARGET_COMPONENT_SOURCES := \
 	blorp_2/test/unit/test_library/test_hashable.brp \
 	blorp_2/test/unit/test_library/test_float_classification.brp \
+	blorp_2/test/unit/test_library/test_int_comparisons.brp \
+	blorp_2/test/unit/test_library/test_path_join.brp \
+	blorp_2/test/unit/test_library/test_path_dirname.brp \
+	blorp_2/test/unit/test_library/test_path_normalize.brp \
+	blorp_2/test/unit/test_library/test_string_starts_with.brp \
 	blorp_2/test/unit/test_utils/test_boolean.brp \
 	blorp_2/test/unit/test_utils/test_constant_ids.brp \
 	blorp_2/test/unit/test_utils/test_ids.brp \
@@ -31,6 +36,8 @@ TARGET_COMPONENT_SOURCES := \
 	blorp_2/test/unit/test_lex/test_doc_blocks.brp \
 	blorp_2/test/unit/test_lex/test_float.brp \
 	blorp_2/test/unit/test_lex/test_keywords.brp \
+	blorp_2/test/unit/test_lex/test_interpolation.brp \
+	blorp_2/test/unit/test_lex/test_equality_operators.brp \
 	blorp_2/test/unit/test_lex/test_lex.brp \
 	blorp_2/test/unit/test_lex/test_ordering_operators.brp \
 	blorp_2/test/unit/test_lex/test_pipe_strings.brp \
@@ -55,6 +62,8 @@ TARGET_COMPONENT_SOURCES := \
 	blorp_2/test/unit/test_parse/test_union_declarations.brp \
 	blorp_2/test/unit/test_parse/test_record_declarations.brp \
 	blorp_2/test/unit/test_check/test_discard_propagation.brp \
+	blorp_2/test/unit/test_check/test_declarations.brp \
+	blorp_2/test/unit/test_check/test_instantiation_paths.brp \
 	blorp_2/test/unit/test_check/test_first_error.brp \
 	blorp_2/test/unit/test_check/test_fixed_types.brp \
 	blorp_2/test/unit/test_check/test_first_invariant.brp \
@@ -74,6 +83,7 @@ TARGET_COMPONENT_SOURCES := \
 	blorp_2/test/unit/test_check/test_generic_opaque_types.brp \
 	blorp_2/test/unit/test_specialize/test_generic_opaque_types.brp \
 	blorp_2/test/unit/test_specialize/test_inline_union_fields.brp \
+	blorp_2/test/unit/test_namespace/test_string_append_int.brp \
 	blorp_2/test/unit/test_verify/test_inline_union_fields.brp \
 	blorp_2/test/unit/test_own/test_list_updates.brp \
 	blorp_2/test/unit/test_verify/test_list_updates.brp \

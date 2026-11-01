@@ -835,6 +835,20 @@ group under `blorp_2/build/self-hosted-tests/`.
 The active receiver-scope suite checks admitted function/method identities,
 complete inherited visibility, exact conflict ordering and call-site diagnostics.
 
+The restored selection also runs interpolation and equality-token boundaries,
+written-type diagnostics, instantiation-path boundedness and the integer-append
+runtime contract. Target Int comparisons, path join/dirname/normalize and String
+prefix suites load their actual library fixtures and check admission; these
+checks do not replace native execution of those fixtures.
+
+Restore further suites by compiling their ordinary `tests: TestSuite` roots
+with `--test-suite`, then linking and running them through `test-target-components`
+before adding them to `TARGET_COMPONENT_SOURCES`. Preserve embedded source and
+assertions when migrating test implementation syntax. An empty suite is not
+restored coverage. Shared input helpers currently block many omitted suites;
+after fixing a helper, re-probe its dependents because compilation reports only
+the first incompatibility. Larger language/library requirements remain deferred.
+
 Twelve Lexer cases are explicitly deferred in source comments: eleven bracketed
 block cases need `String.split`, and one pipe String case needs a byte-input
 boundary for invalid UTF-8. Their original inputs and assertions remain beside
