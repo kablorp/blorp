@@ -1,6 +1,5 @@
 import:
 	../../../src/check/check: check
-	../../../src/specialize/indexed_list as Indexed
 	../../../src/specialize/specialize as Concrete
 	../module_input: parse_modules
 	../../../src/utils/text: concat
@@ -120,6 +119,20 @@ private PENDING_UNION_ARGUMENT: String =
 	|    { first = Nothing, second = Nothing }
 	|
 
+-- Wrap's direct field is still pending when its record slot is published.
+-- In PENDING_UNION_ARGUMENT the indirection through Maybe already gives Wrap
+-- a known union identity, so only that union's key and payload need filling.
+private PENDING_RECORD_FIELD: String =
+	|union Tree:
+	|    Leaf
+	|    Branch(Wrap)
+	|record Wrap { next: Tree }
+	|record Holder { first: Tree, second: Tree }
+	|pure func make() -> Holder:
+	|    { first = Leaf, second = Leaf }
+	|
+
+
 -- Maybe[List[Node]] is indexed while Node is in progress, with a pending List argument.
 private PENDING_LIST_ARGUMENT: String =
 	|record Node { next: Maybe[List[Node]] }
@@ -139,7 +152,7 @@ private PENDING_CALLABLE_ARGUMENT: String =
 private pure func all_sources() -> List[String]:
 	[
 		DISTINCT_ARGUMENTS, REPEATED_ARGUMENT, NESTED_ARGUMENTS, CALLABLE_AND_LIST_ARGUMENTS,
-		PENDING_RECORD_ARGUMENT, PENDING_UNION_ARGUMENT, PENDING_LIST_ARGUMENT, PENDING_CALLABLE_ARGUMENT,
+		PENDING_RECORD_ARGUMENT, PENDING_UNION_ARGUMENT, PENDING_RECORD_FIELD, PENDING_LIST_ARGUMENT, PENDING_CALLABLE_ARGUMENT,
 	].map(source_of)
 
 
@@ -194,8 +207,75 @@ pure func test_a_complete_record_argument_finds_the_slot_indexed_while_it_was_pe
 	prepares(PENDING_RECORD_ARGUMENT, 2, 3)
 
 
+-- The two Holder fields must reuse the same published union identity.
+private pure func repeated_holder_union(contents: Concrete.SpecializedContents) -> Option[Concrete.UnionInstanceId]:
+	match contents.functions:
+		[_, make]:
+			match make.signature.return_type:
+				Concrete.RecordType(holder):
+					match contents.records.get(Concrete.record_number(holder)):
+						Some(layout):
+							match Concrete.record_fields(layout):
+								[Concrete.UnionType(first), Concrete.UnionType(second)]:
+									if first == second:
+										Some(first)
+									else:
+										None
+								_: None
+						_: None
+				_: None
+		_: None
+
+
+-- Follow Holder -> Maybe[Tree] -> Tree.Branch(Wrap) -> Wrap.next after
+-- sealing; counts alone cannot detect a stale reference to a different slot.
 pure func test_a_complete_union_argument_finds_the_slot_indexed_while_it_was_pending() -> Bool:
-	prepares(PENDING_UNION_ARGUMENT, 2, 2)
+	match specialization(source_of(PENDING_UNION_ARGUMENT)):
+		Specialized(contents):
+			match repeated_holder_union(contents):
+				Some(maybe): sealed_union_cycle(contents, maybe)
+				None: False
+		_: False
+
+
+private pure func sealed_union_cycle(contents: Concrete.SpecializedContents, maybe: Concrete.UnionInstanceId) -> Bool:
+	match contents.unions.get(Concrete.union_number(maybe)):
+		Some(layout):
+			match Concrete.union_variants(layout):
+				[[Concrete.UnionType(tree)], []]:
+					match tree_record_field(contents, tree):
+						Some(back): and(back == Concrete.UnionType(maybe), and(contents.unions.length() == 2, contents.records.length() == 2))
+						None: False
+				_: False
+		_: False
+
+
+-- Tree's Branch payload names Wrap; return Wrap.next's published field type.
+private pure func tree_record_field(contents: Concrete.SpecializedContents, tree: Concrete.UnionInstanceId) -> Option[Concrete.TypeRef]:
+	match contents.unions.get(Concrete.union_number(tree)):
+		Some(tree_layout):
+			match Concrete.union_variants(tree_layout):
+				[[], [Concrete.RecordType(wrap)]]:
+					match contents.records.get(Concrete.record_number(wrap)):
+						Some(wrap_layout):
+							match Concrete.record_fields(wrap_layout):
+								[back]: Some(back)
+								_: None
+						_: None
+				_: None
+		_: None
+
+
+pure func test_a_pending_record_field_resolves_to_the_completed_union() -> Bool:
+	match specialization(source_of(PENDING_RECORD_FIELD)):
+		Specialized(contents):
+			match repeated_holder_union(contents):
+				Some(tree):
+					match tree_record_field(contents, tree):
+						Some(back): and(back == Concrete.UnionType(tree), and(contents.unions.length() == 1, contents.records.length() == 2))
+						None: False
+				None: False
+		_: False
 
 
 pure func test_a_complete_list_argument_finds_the_slot_indexed_while_it_was_pending() -> Bool:
@@ -238,13 +318,6 @@ private TAKE_INSTANCES: String =
 	|func main() -> Int:
 	|    take(Nothing, Nothing, { value = 1 }, { value = 2 })
 	|
-
-
-private pure func callable_of_lists() -> Concrete.TypeRef:
-	Concrete.CallableType(
-		[Concrete.ListType(Concrete.IntType), Concrete.StringType],
-		Concrete.ListType(Concrete.CallableType([Concrete.FloatType], Concrete.VoidType)),
-	)
 
 
 private pure func differs(left: Concrete.TypeRef, right: Concrete.TypeRef) -> Bool:
@@ -290,14 +363,91 @@ pure func test_scalar_list_and_callable_types_have_distinct_digests() -> Bool:
 	)
 
 
--- Two different types forced under one digest are still told apart by `==`.
-pure func test_a_digest_collision_resolves_by_comparing_whole_types() -> Bool:
-	var table: Indexed.IndexedList[Concrete.TypeRef] = Indexed.empty_indexed_list()
-	table = Indexed.append_entry(table, Concrete.IntType, 0)
-	table = Indexed.append_entry(table, Concrete.StringType, 0)
-	table = Indexed.append_entry(table, callable_of_lists(), 0)
-	match Indexed.find_position(table, 0, pure func(known: Concrete.TypeRef) -> Bool: known == callable_of_lists()):
-		Ok(Some(position)): position == 2
+-- Record slots digest the declaration origin and argument count, so these
+-- different concrete arguments exercise one real production bucket.
+private BOX: String =
+	|record Box[T] { value: T }
+	|pure func box[T](value: T) -> Box[T]:
+	|    { value = value }
+	|
+
+
+private BOX_REQUESTS: String =
+	|func main() -> Int:
+	|    first = box(7)
+	|    second = box("text")
+	|    repeated = box(8)
+	|    first.value
+	|
+
+
+-- Resolve the published constructor's identity through its return type and
+-- check its actual field references against the sealed layout.
+private pure func constructs_box(contents: Concrete.SpecializedContents, function: Concrete.ConcreteFunction, element: Concrete.TypeRef) -> Bool:
+	match (function.signature.parameters, function.signature.return_type, function.body):
+		([parameter], Concrete.RecordType(returned), Concrete.ConcreteValueBody(Concrete.ReturnExpression(value))):
+			match (value.form, contents.records.get(Concrete.record_number(returned))):
+				(Concrete.ConstructRecord(owner, [field]), Some(layout)):
+					and(
+						and(parameter == element, Concrete.record_fields(layout) == [element]),
+						and(
+							and(owner == returned, value.value_type == Concrete.RecordType(returned)),
+							and(Concrete.field_owner(field.field) == returned, and(Concrete.field_number(field.field) == 0, field.value.value_type == element)),
+						),
+					)
+				_: False
+		_: False
+
+
+pure func test_the_first_record_request_populates_an_empty_index() -> Bool:
+	main: String =
+		|func main() -> Int:
+		|    first = box(7)
+		|    first.value
+		|
+	match specialization(concat(BOX, main)):
+		Specialized(contents):
+			match (contents.records, contents.functions):
+				([_], [_, constructor]): constructs_box(contents, constructor, Concrete.IntType)
+				_: False
+		_: False
+
+
+pure func test_a_missing_record_key_in_an_occupied_bucket_gets_its_own_layout() -> Bool:
+	match specialization(concat(BOX, BOX_REQUESTS)):
+		Specialized(contents):
+			match (contents.records, contents.functions):
+				([integer, text], [_, integer_constructor, text_constructor]):
+					and(
+						and(Concrete.record_fields(integer) == [Concrete.IntType], Concrete.record_fields(text) == [Concrete.StringType]),
+						and(constructs_box(contents, integer_constructor, Concrete.IntType), constructs_box(contents, text_constructor, Concrete.StringType)),
+					)
+				_: False
+		_: False
+
+
+pure func test_repeated_record_requests_reuse_the_constructor_and_sealed_layout() -> Bool:
+	match specialization(concat(BOX, BOX_REQUESTS)):
+		Specialized(contents):
+			match contents.functions:
+				[main, integer_constructor, text_constructor]:
+					match main.statements:
+						[Concrete.InitializeBinding(_, first), Concrete.InitializeBinding(_, second), Concrete.InitializeBinding(_, repeated)]:
+							match (first.form, second.form, repeated.form):
+								(Concrete.InvokeFunction(first_call, [_]), Concrete.InvokeFunction(second_call, [_]), Concrete.InvokeFunction(repeated_call, [_])):
+									match (first_call.target, second_call.target, repeated_call.target):
+										(Concrete.UserFunction(first_id), Concrete.UserFunction(second_id), Concrete.UserFunction(repeated_id)):
+											and(
+												and(first_id == repeated_id, and(Concrete.function_number(first_id) == 1, Concrete.function_number(second_id) == 2)),
+												and(
+													and(first.value_type == repeated.value_type, first.value_type != second.value_type),
+													and(first.value_type == integer_constructor.signature.return_type, second.value_type == text_constructor.signature.return_type),
+												),
+											)
+										_: False
+								_: False
+						_: False
+				_: False
 		_: False
 
 
@@ -313,12 +463,15 @@ tests: TestSuite = {
 		("callable and list arguments are told apart by comparison", test_callable_and_list_arguments_are_told_apart_by_comparison),
 		("a complete record argument finds the slot indexed while it was pending", test_a_complete_record_argument_finds_the_slot_indexed_while_it_was_pending),
 		("a complete union argument finds the slot indexed while it was pending", test_a_complete_union_argument_finds_the_slot_indexed_while_it_was_pending),
+		("a pending record field resolves to the completed union", test_a_pending_record_field_resolves_to_the_completed_union),
 		("a complete list argument finds the slot indexed while it was pending", test_a_complete_list_argument_finds_the_slot_indexed_while_it_was_pending),
 		("a complete callable argument finds the slot indexed while it was pending", test_a_complete_callable_argument_finds_the_slot_indexed_while_it_was_pending),
 		("instance types digest by case and number", test_instance_types_digest_by_case_and_number),
 		("instances of one declaration with different arguments differ", test_instances_of_one_declaration_with_different_arguments_differ),
 		("argument order and count change the digest", test_argument_order_and_count_change_the_digest),
 		("scalar, list and callable types have distinct digests", test_scalar_list_and_callable_types_have_distinct_digests),
-		("a digest collision resolves by comparing whole types", test_a_digest_collision_resolves_by_comparing_whole_types),
+		("the first record request populates an empty index", test_the_first_record_request_populates_an_empty_index),
+		("a missing record key in an occupied bucket gets its own layout", test_a_missing_record_key_in_an_occupied_bucket_gets_its_own_layout),
+		("repeated record requests reuse the constructor and sealed layout", test_repeated_record_requests_reuse_the_constructor_and_sealed_layout),
 	]
 }

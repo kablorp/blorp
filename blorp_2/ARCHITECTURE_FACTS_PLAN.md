@@ -83,7 +83,7 @@ one written-header proof path per default. Expected production growth is
 Implementation and validation evidence is retained in the
 [F1 results](../benchmarks/results/blorp2-architecture-facts-2026-10-31.md).
 F1 is complete: independent code-reviewer and test-runner approvals, the
-self-hosted fixpoint gate and matched-cost checks pass. F2–F4 remain pending.
+self-hosted fixpoint gate and matched-cost checks pass.
 
 ## F2: make the specialization index phase-private
 
@@ -152,6 +152,13 @@ container; no generic transformation escape hatch; same instance identities
 and fixture C. Remove the old module/import and obsolete suite registration
 only with the coverage mapping complete. Expected net production change:
 approximately −20 to −25 lines, including the move.
+
+F2 is complete: the index is phase-private with unchanged helpers/storage,
+production is 18 lines smaller, and independent code-reviewer/test-runner
+approvals cover the migrated tests, four mutation proofs, self-hosted fixpoint,
+fixture identity and matched costs. The [F2 results](../benchmarks/results/blorp2-architecture-facts-2026-10-31.md#f2-private-specialization-index)
+record the additional field-resolution witness, deliberately lost internal
+corruption coverage and gate-status bookkeeping limitation. F3/F4 remain pending.
 
 ## F3: publish complete admitted receiver scopes
 

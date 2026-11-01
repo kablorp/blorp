@@ -21,7 +21,7 @@ import:
 	../check/model as Checked
 	../check/declarations as Declarations
 	../utils/ids as Declaration
-	./indexed_list: IndexedList, append_entry, empty_indexed_list, find_position
+	../utils/hash_map as HashMaps
 	int: Int methods
 	option: Option methods
 	../utils/source: FunctionLabel, lambda_label
@@ -536,6 +536,59 @@ pure func value_needs_ownership(
 					match declaration:
 						PlainCases(_): Ok(False)
 						OwningCases(_) | BoxedCases(_): Ok(True)
+
+
+-- Private builder state: entries never move, and the digest only narrows
+-- full-key comparison. Settlement preserves slot digests; sealing either
+-- preserves the index or rebuilds it for complete keys, as documented below.
+-- `positions` maps a digest to the positions in `entries` of the entries
+-- appended under it, in append order.
+private record IndexedList[T] {
+	entries: List[T],
+	positions: HashMaps.HashMap[Int, List[Int]]
+}
+
+
+private pure func empty_indexed_list[T]() -> IndexedList[T]:
+	no_entries: List[T] = []
+	{ entries = no_entries, positions = HashMaps.empty_hash_map() }
+
+
+-- `table` with `entry` at the next position, indexed under `digest`.
+private pure func append_entry[T](table: IndexedList[T], entry: T, digest: Int) -> IndexedList[T]:
+	{
+		entries = table.entries.append(entry),
+		positions = HashMaps.set(table.positions, digest, candidate_positions(table, digest).append(table.entries.length())),
+	}
+
+
+-- The positions of every entry appended under `digest`: the only entries a
+-- key with this digest can equal.
+private pure func candidate_positions[T](table: IndexedList[T], digest: Int) -> List[Int]:
+	match HashMaps.get(table.positions, digest):
+		Some(bucket): bucket
+		None: []
+
+
+-- The first position under `digest` whose entry satisfies `matches`: the
+-- whole-key comparison the digest only narrows. `Err` is an indexed position
+-- with no entry, which `append_entry` cannot produce.
+private pure func find_position[T](
+	table: IndexedList[T], digest: Int, matches: pure (T) -> Bool,
+) -> Result[Option[Int], Int]:
+	var outcome: Result[Option[Int], Int] = Ok(None)
+
+	for position in candidate_positions(table, digest):
+		match table.entries.get(position):
+			Some(entry):
+				if matches(entry):
+					outcome = Ok(Some(position))
+					break
+			None:
+				outcome = Err(position)
+				break
+
+	outcome
 
 
 -- A structural tuple instantiates no declaration; its digest is this base less
@@ -1455,6 +1508,7 @@ private pure func settle_record(instance: PendingRecordInstance, span: Span) -> 
 -- Fills every reference to a completed layout that a child referred back
 -- to. Only slots published while it was in progress, from `first` on, can
 -- hold such a reference, so earlier slots are not revisited.
+-- Resolving partial arguments preserves the slot digest, so the index stays valid.
 private pure func resolve_union_slots(
 	slots: IndexedList[UnionSlot],
 	first: Int,

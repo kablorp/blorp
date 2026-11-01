@@ -1,4 +1,6 @@
-# Accepted-fact cleanup: F1
+# Accepted-fact cleanup
+
+## F1: default header bounds
 
 F1 removes the second proof of trait-default written header bounds. Trait
 contracts remain the proof authority; ordinary free/implementation headers
@@ -9,9 +11,9 @@ Implementation follows [F1 in the reviewed plan](../../blorp_2/ARCHITECTURE_FACT
 The role dispatch is inline in the existing callback, avoiding a single-use
 helper. Production: **16 added / 1 deleted / +15 net lines**. Tests:
 **28 added / 0 deleted / +28 net lines**. Documentation is separate.
-F2–F4 are not implemented by this change.
+The F1 landing did not implement F2–F4; later milestone results follow below.
 
-## Provenance and measurement boundary
+### Provenance and measurement boundary
 
 Baseline: `395731510` (current main after arithmetic operators), not the
 earlier `51d98be37` audit snapshot. The initial build at the older snapshot
@@ -40,7 +42,7 @@ execution is inside the measured boundary. The ordinary compiler argv is:
 build/architecture-facts/f1-current/frozen/blorp_2/src/main.brp OUTPUT.c
 ```
 
-## Results
+### Results
 
 | Metric | Baseline | Candidate | Change |
 | --- | ---: | ---: | ---: |
@@ -66,7 +68,7 @@ instructions in one normal observation. Its own-source normal/diagnostic C
 matches baseline B's emission for that same changed source. Own-source counts
 are a different workload, not the matched improvement row above.
 
-## Correctness and oracle evidence
+### Correctness and oracle evidence
 
 - Baseline and candidate each pass all **19 declaration-bound callbacks**;
   both strict runs report zero leaks. Positive behavior is preserved rather
@@ -85,7 +87,7 @@ are a different workload, not the matched improvement row above.
   the unchanged signature proof, with an invariant error for a missing row.
   A readable inspection excerpt is retained as `header-lambda-readable.txt`.
 
-## Final gate and review
+### Final gate and review
 
 The independent test runner's single `scripts/blorp2-fixpoint --prove` run
 passes: B/C compiler-source identity, all **649** candidate A/B fixture
@@ -104,3 +106,132 @@ Code-reviewer and independent test-runner both approve F1 with no blockers.
 No resource limits, deferred-suite policy or bootstrap pin change is included.
 The previous fixpoint evidence was preserved by move with matching before/after
 manifests (4,856 entries, 141,936,550 bytes); it was not used as this baseline.
+
+## F2: private specialization index
+
+`IndexedList` and its four helpers now belong privately to Specialize, their
+only production consumer. The old module is deleted. Helper bodies and
+storage are unchanged; record settlement/sealing preserves its existing
+digest policy, while union sealing still rebuilds its index. There is no new
+opaque facade, unchecked transformation API, cache or runtime membership check.
+
+Production: **55 added / 73 deleted / −18 net lines**. Tests, including the
+four-line privacy fixture: **178 added / 108 deleted / +70 net lines**.
+The Makefile drops one obsolete suite-selection line, counted separately.
+
+### Provenance and costs
+
+Baseline: F1 landing `9f4a9870d`. The baseline binaries are reused only after
+verifying all 71 recorded production/library/control hashes against that
+revision and matching both executable hashes. Copies, provenance, the frozen
+input graph and raw evidence live under `build/architecture-facts/f2/`.
+The frozen source retains the old indexed-list module: both compilers process
+exactly the same input graph. Normal/diagnostic pairs share generated compiler
+C and the F1 Clang/toolchain/flags, differing only in accounting configuration.
+
+As in F1, three normal samples run serially in alternating order through the
+ordinary compiler CLI; strict diagnostic runs count allocations/releases.
+
+| Metric | F1 baseline | F2 candidate | Change |
+| --- | ---: | ---: | ---: |
+| Allocations | 17,281,571 | 17,281,571 | 0 |
+| Normal retired instructions, minimum of 3 | 49,639,582,742 | 49,640,024,919 | +0.000891% |
+| Normal peak RSS, maximum of 3, bytes | 289,685,504 | 293,076,992 | +1.17% |
+
+All instruction samples:
+
+| Variant | Sample 1 | Sample 2 | Sample 3 |
+| --- | ---: | ---: | ---: |
+| F1 baseline | 49,690,856,534 | 49,639,582,742 | 49,649,497,663 |
+| F2 candidate | 49,668,776,849 | 49,651,750,616 | 49,640,024,919 |
+
+Instructions are unchanged within noise; no speed or memory saving is claimed.
+Strict runs balance allocations/releases with zero live allocations/bytes.
+All eight common-input C outputs are byte-identical.
+
+Cumulative measurement uses the same initial frozen `395731510` compiler and
+library input as F1. Initial baseline versus F2: **17,277,990 → 17,277,974
+allocations**, **49,625,222,134 → 49,623,576,261 minimum normal instructions**
+(−0.00332%, noise). The F2 normal samples are 49,649,983,057;
+49,624,676,611; 49,623,576,261. All three outputs and its diagnostic output
+match the initial baseline C. Incremental and cumulative allocation/instruction
+results meet the unchanged +1% ceilings; no limits were amended.
+
+Compiling F2's own changed source observes **17,281,109 allocations**, zero
+leaks, and **49,943,374,422 instructions** in one normal observation. The
+historical F1 own-source observation was 49,628,988,959 instructions: the
+changed-input observation is approximately 0.63% higher. This is separate from
+the matched-input comparison and does not establish a runtime improvement.
+Baseline-host, candidate normal and candidate diagnostic C for the same F2
+source are identical.
+
+### Coverage migration and mutation evidence
+
+The old direct-container suite is removed only after migrating observable
+coverage through ordinary `specialize(CheckedProgram)` calls:
+
+| Former direct assertion | Current phase witness |
+| --- | --- |
+| Repeated key keeps its first position | Repeated `Box[Int]` shares constructor/layout identities |
+| Different keys collide without merging | `Box[Int]` and `Box[String]` share the production origin/arity digest but retain distinct fields and constructors |
+| New key in an occupied bucket is absent, then appended | The second concrete `Box` layout is created and referenced correctly |
+| No bucket gives no candidate | First `Box` request starts with an empty index; existing multi-origin cases remain |
+| Index points at a missing entry | Internal-corruption assertion deliberately lost; no longer externally constructible |
+
+The active native harness checks that importing `IndexedList` from the actual
+Specialize module produces the exact private-selection message/help at
+`:2:44`. This covers the new external boundary; it does not replace malformed
+internal-storage coverage. Existing digest case/id/order/count and pending
+record/union/List/callable tests remain.
+
+Baseline and candidate both pass **19/19** focused phase callbacks with strict
+zero leaks. Tests follow published record/union identities and constructor
+field owners after sealing, beyond counting rows.
+
+An initial 18-case suite did **not** catch bypassed record-field resolution or
+discarded record-settlement publication. Its recursive fixture stored an
+already-known `Maybe` identity in the record; pending references lived inside
+that union. Those surviving runs remain under each mutant's `initial-18/`.
+A direct `Tree.Branch(Wrap)` / `Wrap.next: Tree` witness was added, requiring
+the record's pending field to resolve to the exact completed union identity.
+It also checks repeated requests and is included in existing stage checks.
+
+The final 19-case suite detects each scratch-source mutation:
+
+| Mutation | Result |
+| --- | --- |
+| Record lookup ignores key arguments | 2 failures: occupied-bucket separation and constructor/layout reuse |
+| Record fields skip pending-reference resolution | 2 failures: stage acceptance and the direct pending-field witness |
+| Record settlement discards its updated entries | Same 2 failures |
+| Record sealing drops the preserved index | 14 failures, including constructor and recursive-layout witnesses |
+
+Every mutant exits 1 with strict zero leaks. Mutants change only scratch Blorp
+sources, compiled into ordinary TestSuites; production source was not mutated,
+and no generated internal function is called directly.
+
+### Final gate and reviews
+
+Independent code-reviewer and test-runner approvals report no findings. The
+single final `scripts/blorp2-fixpoint --prove` run reaches its complete
+`FIXPOINT` marker and final artifact line: compiler C identity, **691** active
+component callbacks across 84 suites, **123** runtime/native callbacks across
+five suites, and **650/650** candidate A/B fixture comparisons pass.
+
+Separately, baseline-F1 versus retained candidate-B outputs match on all
+**650 fixtures**, exactly comparing exit/stdout/stderr/C without normalization.
+This adds one baseline compilation per fixture and reuses existing candidate
+outputs, rather than rerunning component or native gates. All 1,366
+source/test/control hashes and 716 source/library/fixture hashes remain
+unchanged during their respective checks. The prior F1 fixpoint tree was
+preserved by move with verified hashes before replacement.
+
+One evidence-collection limitation is explicit: after the gate completed, its
+zsh wrapper attempted to assign to the reserved variable `status`, so the
+numeric gate-exit-status file was not captured. The full success output,
+individual stage results and final artifact line are retained; the script ends
+immediately after that line with no cleanup trap. No numeric exit status was
+invented, and no second broad gate was run. `test-runner-review.json` records
+this distinction alongside the independent counters/hash checks.
+
+F3/F4 remain outside this implementation. No resource limit, test-deferral
+policy or bootstrap pin changes.
