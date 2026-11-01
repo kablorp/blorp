@@ -158,11 +158,11 @@ production is 18 lines smaller, and independent code-reviewer/test-runner
 approvals cover the migrated tests, four mutation proofs, self-hosted fixpoint,
 fixture identity and matched costs. The [F2 results](../benchmarks/results/blorp2-architecture-facts-2026-10-31.md#f2-private-specialization-index)
 record the additional field-resolution witness, deliberately lost internal
-corruption coverage and gate-status bookkeeping limitation. F3/F4 remain pending.
+corruption coverage and gate-status bookkeeping limitation. F4 remains pending.
 
 ## F3: publish complete admitted receiver scopes
 
-**Current boundary.** `src/check/receiver_clashes.brp:240` computes
+**Audited boundary.** `src/check/receiver_clashes.brp:240` computes
 `visible_method` results and discards them. `src/check/callables.brp:268`
 computes them again per receiver expression. However, the former enumerates
 trait-method names only. Retaining that subset alone would leave a fallback
@@ -229,6 +229,24 @@ diagnostic-order inventory before implementation. Estimated net production
 growth: 60–140 lines; ceiling 150. Measure receiver-heavy checking as well as
 whole compilation. Stop and simplify if retaining the complete domain costs
 more than the gates below; do not introduce lazy misses or a general cache.
+
+**Implementation.** F3 is complete with one bulk candidate collection per
+module, the original family/overlap validation inventories, and a shared
+canonical namespace-entry projection. Calls read the admitted table only;
+scope owners retire after body checking. Production grows by 95 lines.
+The [F3 results](../benchmarks/results/blorp2-architecture-facts-2026-10-31.md#f3-admitted-receiver-scopes)
+retain the rejected per-name draft, final measurements and independent approvals.
+
+**Scoped resource amendment, reviewed 2026-11-01.** For F3's frozen
+128-provider/256-call receiver-heavy control only, allocation growth up to 3%
+is accepted: baseline 136,964; absolute limit 141,072; observed 140,633.
+The original 1% interpretation fails and remains recorded. Both independent
+reviewers approved this minor allocation exception under the owner's standing
+authorization for small budget adjustments without another prompt. Target
+instructions remain bounded by +1%; all whole-compiler/cumulative ceilings,
+fixture limits, strict accounting and output identity requirements are unchanged.
+This exception does not cover the earlier rejected whole-instruction regression
+or any other workload/milestone. F4 remains pending.
 
 ## F4: emit aggregates in verification's completion order
 

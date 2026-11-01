@@ -1,0 +1,495 @@
+import:
+	../../../src/check/check: check, check_errors, checked_functions
+	../../../src/check/model as Model
+	../../../src/check/declarations: validate_declarations
+	../../../src/check/errors as Errors
+	../../../src/check/receiver_clashes: admit_receivers
+	../../../src/check/traits: accepted_traits
+	../../../src/namespace/namespace: Namespace, build_namespace
+	../../../src/check/render: render_failure, render_check_error
+	../../../src/parse/assemble: ParsedProgram, parsed_contents
+	../../../src/utils/ids: inventory_traits
+	../../../src/utils/source: module_id, module_source, root_module_id
+	../../../src/utils/syntax: Diagnostic, DiagnosticNote(PreviousDeclaration, NoteLines), Span, diagnostic, compiler_span
+	../input as Inputs: prepare_signatures
+	../module_input: ModuleInput, parse_modules, parse_modules_with_prelude
+	bool: and
+	int: Int methods
+	list: List methods
+	option: Option methods
+	string: String methods
+	result: Result methods
+	test: TestSuite
+
+
+private MEASURE: String =
+	|pure func measure(value: Int) -> Int:
+	|    value
+	|
+private OBSERVE: String =
+	|trait Observe:
+	|    pure func observe(value: Self) -> Int
+	|implements Observe for Int:
+	|    pure func observe(value: Self) -> Int:
+	|        value
+	|
+private EMPTY_MAIN: String =
+	|func main() -> Int:
+	|    0
+	|
+private RECEIVER_MAIN: String =
+	|func main() -> Int:
+	|    7.measure()
+	|
+private ZERO: String =
+	|pure func zero() -> Int:
+	|    0
+	|
+private FOO: String =
+	|union Foo:
+	|    Only
+	|
+private UNKNOWN_HELP: String = "declare the function locally or import it by name; type selections enable receiver calls only"
+private ZERO_HELP: String = "call zero() directly, or choose a function with one parameter"
+private FAMILY_HELP: String = "rename the free function, or import one declaration through a module alias"
+private OVERLAP_HELP: String = "rename one of them, or change a first parameter so that no value fits both receivers, Int and Int"
+
+
+private pure func site(module: Int, prefix: String, marked: String) -> Span:
+	{ source = module_source(module_id(module).get_or(root_module_id())), start = prefix.length(), end = prefix.length().add(marked.length()) }
+
+
+private pure func rejects(parsed: Result[ParsedProgram, Diagnostic], expected: Diagnostic) -> Bool:
+	match parsed:
+		Err(_): False
+		Ok(program):
+			match check(program):
+				Ok(_): False
+				Err(failure):
+					actual = render_failure(failure).first
+					(actual.message == expected.message).and(actual.help == expected.help)
+						.and(actual.span == expected.span).and(actual.note == expected.note)
+						.and(check_errors(failure).first.span == expected.span)
+						.and(check_errors(failure).remaining.is_empty()).and(render_failure(failure).remaining.is_empty())
+
+
+private pure func calls_are(parsed: Result[ParsedProgram, Diagnostic], caller: Int, expected: List[Int]) -> Bool:
+	match parsed:
+		Err(_): False
+		Ok(input):
+			match check(input):
+				Err(_): False
+				Ok(program):
+					match checked_functions(program).functions.get(caller):
+						None: False
+						Some(function):
+							calls = Model.function_calls(function)
+							var matches = calls.length() == expected.length()
+							var position: Int = 0
+							for call in calls:
+								selected = match (call.target, expected.get(position)):
+									(Model.UserFunction(id, _), Some(ordinal)):
+										match checked_functions(program).functions.get(ordinal):
+											Some(declaration): id == declaration.id
+											None: False
+									_: False
+								matches = matches.and(selected)
+								position = position.add(1)
+							matches
+
+
+private pure func ordinary(source: String, targets: List[Int]) -> Result[ParsedProgram, Diagnostic]:
+	parse_modules([{ source = source, targets = targets }, { source = MEASURE, targets = [] }])
+
+
+private pure func missing(prefix: String, name: String, suffix: String, targets: List[Int]) -> Bool:
+	rejects(ordinary(prefix.add(name).add(suffix), targets), {
+		span = site(0, prefix, name), note = None, message = "unknown function", help = UNKNOWN_HELP
+	})
+
+
+private pure func trait_target_is_selected() -> Bool:
+	root: String =
+		|import:
+		|    ./provider: Int methods
+		|func main() -> Int:
+		|    7.observe()
+		|
+	match parse_modules([{ source = root, targets = [1] }, { source = OBSERVE, targets = [] }]):
+		Err(_): False
+		Ok(parsed):
+			match (inventory_traits(parsed_contents(parsed).declarations), check(parsed)):
+				([owner], Ok(program)):
+					match (owner.methods, checked_functions(program).functions.get(0)):
+						([method], Some(main)):
+							match Model.function_calls(main):
+								[call]:
+									match call.target:
+										Model.TraitMethod(accepted): (Model.method_identity(accepted) == method.id).and(Model.method_receiver(accepted) == Model.IntType)
+										_: False
+								_: False
+						_: False
+				_: False
+
+
+private RECEIVER_LIBRARY: String =
+	|import:
+	|    ./types: Foo
+	|pure func measure(value: Foo) -> Foo:
+	|    value
+	|
+private RECEIVER_PRELUDE: String =
+	|import:
+	|    _base: Int, Float, String, Void, List, Bool(True, False), Option(Some, None), Result(Ok, Err)
+	|    ./types: Foo(Only)
+	|    ./left: Foo methods
+	|
+
+
+private pure func prelude(root: String, targets: List[Int]) -> Result[ParsedProgram, Diagnostic]:
+	parse_modules_with_prelude([
+		{ source = root, targets = targets },
+		{ source = FOO, targets = [] },
+		{ source = RECEIVER_LIBRARY, targets = [1] },
+		{ source = RECEIVER_LIBRARY, targets = [1] },
+	], 1, { source = RECEIVER_PRELUDE, targets = [4, 1, 2] })
+
+
+private pure func overlap(inputs: List[ModuleInput], primary: Span, left: Int, right: Int, first_import: Span) -> Bool:
+	rejects(parse_modules(inputs), {
+		span = primary,
+		message = "two functions named measure can accept the same receiver", help = OVERLAP_HELP,
+		note = Some(NoteLines([
+			{ span = site(right, "pure func ", "measure"), text = "receiver Int is declared here" },
+			{ span = site(left, "pure func ", "measure"), text = "receiver Int is declared here" },
+			{ span = first_import, text = "receiver Int is imported here" },
+		]))
+	})
+
+
+private pure func family_before_overlap() -> Bool:
+	prefix =
+		|import:
+		|    ./left: Int methods
+		|    ./right: Int methods
+		|    ./family: Int methods
+		|pure func 
+	root = prefix.add("observe(value: Int) -> Int:\n    value\nfunc main() -> Int:\n    0\n")
+	rejects(parse_modules([
+		{ source = root, targets = [1, 2, 3] },
+		{ source = MEASURE, targets = [] }, { source = MEASURE, targets = [] }, { source = OBSERVE, targets = [] },
+	]), {
+		span = site(0, prefix, "observe"), message = "trait method family conflicts with a free function", help = FAMILY_HELP,
+		note = Some(PreviousDeclaration(site(0, "import:\n    ./left: Int methods\n    ./right: Int methods\n    ./family: ", "Int")))
+	})
+
+
+private pure func earliest_dependency_error() -> Bool:
+	-- Module 2 is visited before module 1. Its overlap must precede module 1's
+	-- family conflict; checking every family's scope first changes this error.
+	root =
+		|import:
+		|    ./early as Early
+		|    ./late as Late
+		|func main() -> Int:
+		|    0
+		|
+	early =
+		|import:
+		|    ./left: Int methods
+		|    ./right: Int methods
+		|
+	late =
+		|import:
+		|    ./family: Int methods
+		|pure func observe(value: Int) -> Int:
+		|    value
+		|
+	overlap([
+		{ source = root, targets = [2, 1] },
+		{ source = late, targets = [5] }, { source = early, targets = [3, 4] },
+		{ source = MEASURE, targets = [] }, { source = MEASURE, targets = [] }, { source = OBSERVE, targets = [] },
+	], site(2, "import:\n    ./left: Int methods\n    ./right: ", "Int"), 3, 4, site(2, "import:\n    ./left: ", "Int"))
+
+
+private pure func local_overlap_precedes_import_only_group() -> Bool:
+	imports: String =
+		|import:
+		|    ./left: Int methods
+		|    ./right: Int methods
+		|
+	local: String =
+		|pure func local(value: Int) -> Int:
+		|    value
+		|
+	root = imports.add(local).add(EMPTY_MAIN)
+	rejects(parse_modules([
+		{ source = root, targets = [1, 2] },
+		{ source = MEASURE.add(local), targets = [] }, { source = MEASURE, targets = [] },
+	]), {
+		span = site(0, "import:\n    ./left: ", "Int"),
+		message = "two functions named local can accept the same receiver", help = OVERLAP_HELP,
+		note = Some(NoteLines([
+			{ span = site(1, MEASURE.add("pure func "), "local"), text = "receiver Int is declared here" },
+			{ span = site(0, imports.add("pure func "), "local"), text = "receiver Int is declared here" },
+		]))
+	})
+
+
+private pure func inherited_overlap_is_rejected() -> Bool:
+	root: String =
+		|import:
+		|    ./right: Foo methods
+		|func main() -> Int:
+		|    0
+		|
+	declaration = "import:\n    ./types: Foo\npure func "
+	rejects(prelude(root, [3]), {
+		span = site(0, "import:\n    ./right: ", "Foo"),
+		message = "two functions named measure can accept the same receiver",
+		help = "rename one of them, or change a first parameter so that no value fits both receivers, Foo and Foo",
+		note = Some(NoteLines([
+			{ span = site(3, declaration, "measure"), text = "receiver Foo is declared here" },
+			{ span = site(2, declaration, "measure"), text = "receiver Foo is declared here" },
+			{ span = site(5, "import:\n    _base: Int, Float, String, Void, List, Bool(True, False), Option(Some, None), Result(Ok, Err)\n    ./types: Foo(Only)\n    ./left: ", "Foo"), text = "receiver Foo is imported here" },
+		]))
+	})
+
+
+private pure func unused_families_conflict() -> Bool:
+	root: String =
+		|import:
+		|    ./left: Int methods
+		|    ./right: Int methods
+		|func main() -> Int:
+		|    0
+		|
+	rejects(parse_modules([{ source = root, targets = [1, 2] }, { source = OBSERVE, targets = [] }, { source = OBSERVE, targets = [] }]), {
+		span = site(0, "import:\n    ./left: Int methods\n    ./right: ", "Int"),
+		message = "different trait method families share this name", help = "select one family, or reach the other through a module alias",
+		note = Some(PreviousDeclaration(site(0, "import:\n    ./left: ", "Int")))
+	})
+
+
+-- Real predecessor products; only the dependency-row inventory handed to the
+-- admission boundary is malformed. Each test names its own invariant case.
+private pure func malformed_modules(duplicate: Bool) -> Result[Bool, Diagnostic]:
+	program ?= parse_modules([{ source = EMPTY_MAIN, targets = [] }])
+	parsed = parsed_contents(program)
+	namespace: Namespace ?= match build_namespace(program):
+		Ok(accepted): Ok(accepted)
+		Err(_): Err(diagnostic(compiler_span(), "receiver test namespace setup failed", "fix the test input"))
+	declarations ?= validate_declarations(parsed, namespace).map_err(pure func(error): render_check_error(program, error))
+	prepared ?= prepare_signatures(program, namespace).map_err(pure func(error): render_check_error(program, error))
+	availability ?= Inputs.accepted_traits(program, namespace, prepared, declarations).map_err(pure func(error): render_check_error(program, error))
+	match parsed.dependency_order.get(0):
+		None: Ok(False)
+		Some(first):
+			rows = if duplicate:
+				[first, first]
+			else:
+				[]
+			span = if duplicate:
+				first.end
+			else:
+				compiler_span()
+			match admit_receivers(namespace, prepared.signatures.functions, parsed.modules.length(), rows, accepted_traits(availability)):
+				Ok(_): Ok(False)
+				Err(error):
+					actual = render_check_error(program, error)
+					match error.kind:
+						Errors.InternalInvariant(Errors.InvalidReceiverScope):
+							Ok((error.span == span).and(actual.span == span)
+								.and(actual.message == "invalid admitted receiver scope")
+								.and(actual.help == "report this compiler error with the input program").and(actual.note.is_none()))
+						_: Ok(False)
+
+
+private pure func test_missing_module_rows_fail_admission_as_an_invariant() -> Bool:
+	match malformed_modules(False):
+		Ok(matches): matches
+		Err(_): False
+
+
+private pure func test_duplicate_module_rows_fail_admission_as_an_invariant() -> Bool:
+	match malformed_modules(True):
+		Ok(matches): matches
+		Err(_): False
+
+
+private pure func test_ordinary_local_name_resolves_without_a_trait_family() -> Bool:
+	calls_are(ordinary(MEASURE.add(RECEIVER_MAIN), []), 1, [0])
+
+
+private pure func test_ordinary_explicit_selection_resolves_without_a_method_import() -> Bool:
+	source: String =
+		|import:
+		|    ./ops: measure
+		|func main() -> Int:
+		|    7.measure()
+		|
+	calls_are(ordinary(source, [1]), 0, [1])
+
+
+private pure func test_named_selection_admits_a_bare_generic_receiver() -> Bool:
+	root: String =
+		|import:
+		|    ./ops: identity
+		|func main() -> Int:
+		|    7.identity()
+		|
+	provider: String =
+		|pure func identity[Element](value: Element) -> Element:
+		|    value
+		|
+	calls_are(parse_modules([{ source = root, targets = [1] }, { source = provider, targets = [] }]), 0, [1])
+
+
+private pure func test_duplicate_method_and_named_routes_preserve_one_identity() -> Bool:
+	source: String =
+		|import:
+		|    ./ops: Int methods, measure
+		|func main() -> Int:
+		|    7.measure()
+		|
+	calls_are(ordinary(source, [1]), 0, [1])
+
+
+private pure func test_missing_name_is_a_semantic_lookup_miss() -> Bool:
+	missing("func main() -> Int:\n    7.", "absent", "()\n", [])
+
+
+private pure func test_constructor_miss_retains_its_ufcs_diagnostic() -> Bool:
+	prefix =
+		|union Token:
+		|    Payload(Int)
+		|func main() -> Int:
+		|    7.
+	rejects(ordinary(prefix.add("Payload()\n"), []), {
+		span = site(0, prefix, "Payload"), note = None,
+		message = "constructors do not support UFCS in this increment", help = "write the constructor directly, such as Number(value)"
+	})
+
+
+private pure func test_zero_parameter_local_function_remains_an_arity_rejection() -> Bool:
+	prefix =
+		|pure func zero() -> Int:
+		|    0
+		|func main() -> Int:
+		|    7.
+	rejects(ordinary(prefix.add("zero()\n"), []), {
+		span = site(0, prefix, "zero"), note = None, message = "function takes no arguments", help = ZERO_HELP
+	})
+
+
+private pure func test_zero_parameter_named_import_remains_an_arity_rejection() -> Bool:
+	prefix =
+		|import:
+		|    ./ops: zero
+		|func main() -> Int:
+		|    7.
+	rejects(parse_modules([{ source = prefix.add("zero()\n"), targets = [1] }, { source = ZERO, targets = [] }]), {
+		span = site(0, prefix, "zero"), note = None, message = "function takes no arguments", help = ZERO_HELP
+	})
+
+
+private pure func test_method_only_import_excludes_zero_parameter_provider() -> Bool:
+	prefix =
+		|import:
+		|    ./ops: Int methods
+		|func main() -> Int:
+		|    7.
+	rejects(parse_modules([{ source = prefix.add("zero()\n"), targets = [1] }, { source = ZERO, targets = [] }]), {
+		span = site(0, prefix, "zero"), note = None, message = "unknown function", help = UNKNOWN_HELP
+	})
+
+
+private pure func test_private_provider_is_excluded_from_method_import() -> Bool:
+	prefix =
+		|import:
+		|    ./ops: Int methods
+		|func main() -> Int:
+		|    7.
+	rejects(parse_modules([{ source = prefix.add("measure()\n"), targets = [1] }, { source = "private ".add(MEASURE), targets = [] }]), {
+		span = site(0, prefix, "measure"), note = None, message = "unknown function", help = UNKNOWN_HELP
+	})
+
+
+private pure func test_private_local_receiver_remains_available() -> Bool:
+	calls_are(ordinary("private ".add(MEASURE).add(RECEIVER_MAIN), []), 1, [0])
+
+
+private pure func test_prelude_receiver_reuse_and_local_additions_keep_their_identities() -> Bool:
+	root =
+		|import:
+		|    ./left: Foo methods
+		|pure func local(value: Foo) -> Int:
+		|    1
+		|func main() -> Int:
+		|    first = Only.measure()
+		|    first.local()
+		|
+	calls_are(prelude(root, [2]), 1, [2, 0])
+
+
+private pure func test_inherited_method_prefix_resolves_without_a_root_import() -> Bool:
+	root: String =
+		|func main() -> Int:
+		|    unused = Only.measure()
+		|    0
+		|
+	calls_are(prelude(root, []), 0, [1])
+
+
+private pure func test_repeated_calls_retain_their_own_occurrence_spans() -> Bool:
+	prefix =
+		|import:
+		|    ./ops: measure
+		|func main() -> Int:
+		|    first = 7.measure()
+		|    8.
+	rejects(ordinary(prefix.add("measure(9)\n"), [1]), {
+		span = site(0, prefix, "measure"), note = None, message = "function requires one argument", help = "pass one expression of the declared parameter type"
+	})
+
+
+private pure func test_unused_overlaps_keep_the_first_qualifying_duplicate_import_anchor() -> Bool:
+	root =
+		|import:
+		|    ./left: Int methods, measure
+		|    ./right: Int methods
+		|func main() -> Int:
+		|    0
+		|
+	overlap([{ source = root, targets = [1, 2] }, { source = MEASURE, targets = [] }, { source = MEASURE, targets = [] }],
+		site(0, "import:\n    ./left: Int methods, measure\n    ./right: ", "Int"), 1, 2, site(0, "import:\n    ./left: Int methods, ", "measure"))
+
+
+tests: TestSuite = {
+	description = "Complete admitted receiver scopes",
+	tests = [
+		("missing module rows fail admission as an invariant", test_missing_module_rows_fail_admission_as_an_invariant),
+		("duplicate module rows fail admission as an invariant", test_duplicate_module_rows_fail_admission_as_an_invariant),
+		("ordinary local name resolves without a trait family", test_ordinary_local_name_resolves_without_a_trait_family),
+		("ordinary explicit selection resolves without a method import", test_ordinary_explicit_selection_resolves_without_a_method_import),
+		("named selection admits a bare generic receiver", test_named_selection_admits_a_bare_generic_receiver),
+		("duplicate method and named routes preserve one identity", test_duplicate_method_and_named_routes_preserve_one_identity),
+		("missing name is a semantic lookup miss", test_missing_name_is_a_semantic_lookup_miss),
+		("constructor miss retains its UFCS diagnostic", test_constructor_miss_retains_its_ufcs_diagnostic),
+		("zero-parameter local function remains an arity rejection", test_zero_parameter_local_function_remains_an_arity_rejection),
+		("zero-parameter named import remains an arity rejection", test_zero_parameter_named_import_remains_an_arity_rejection),
+		("method-only import excludes zero-parameter provider", test_method_only_import_excludes_zero_parameter_provider),
+		("private provider is excluded from method import", test_private_provider_is_excluded_from_method_import),
+		("private local receiver remains available", test_private_local_receiver_remains_available),
+		("public provider publishes the accepted method identity", trait_target_is_selected),
+		("prelude receiver reuse and local additions keep their identities", test_prelude_receiver_reuse_and_local_additions_keep_their_identities),
+		("inherited method prefix resolves without a root import", test_inherited_method_prefix_resolves_without_a_root_import),
+		("repeated calls retain their own occurrence spans", test_repeated_calls_retain_their_own_occurrence_spans),
+		("unused overlaps keep the first qualifying duplicate import anchor", test_unused_overlaps_keep_the_first_qualifying_duplicate_import_anchor),
+		("new receiver checks the inherited prelude subset", inherited_overlap_is_rejected),
+		("unused different method families conflict", unused_families_conflict),
+		("local overlap precedes an import-only overlapping name", local_overlap_precedes_import_only_group),
+		("unused family conflict precedes overlap within its module", family_before_overlap),
+		("earliest dependency module precedes a later family conflict", earliest_dependency_error),
+	]
+}

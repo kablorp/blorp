@@ -832,6 +832,9 @@ compile once, and a strict leak or crash is attributed to that phase. Its C and
 executable are `all_suites.c` and `all_suites` in the directory mirroring the
 group under `blorp_2/build/self-hosted-tests/`.
 
+The active receiver-scope suite checks admitted function/method identities,
+complete inherited visibility, exact conflict ordering and call-site diagnostics.
+
 Twelve Lexer cases are explicitly deferred in source comments: eleven bracketed
 block cases need `String.split`, and one pipe String case needs a byte-input
 boundary for invalid UTF-8. Their original inputs and assertions remain beside

@@ -13,7 +13,7 @@ import:
 		),
 		recursion_error,
 		ValueError(ExpressionTypeMismatch, MissingIfElse, IfBranchWithoutValue), value_error,
-		CheckerInvariant(InvalidInferenceWorklist, InvalidCheckedUnion, InvalidResolvedParameter, UnsupportedPatternReachedResolution, LoopControlOutsideLoop, NestedPropagation, JoinWithoutArms),
+		CheckerInvariant(InvalidReceiverScope, InvalidInferenceWorklist, InvalidCheckedUnion, InvalidResolvedParameter, UnsupportedPatternReachedResolution, LoopControlOutsideLoop, NestedPropagation, JoinWithoutArms),
 		ExpectedTypeSite(FirstArmValue, FirstIfBranchValue, InferredBindingDeclaration, SourceAnnotation, ForRangeBound),
 		MatchError(
 			ArmWithoutValue, InvalidMatchScrutinee, NonExhaustiveMatch, PatternFieldCountMismatch, BarePatternName,
@@ -34,7 +34,7 @@ import:
 		unsupported_form,
 	./callables: ResolutionContext, resolve_body_type
 	./model:
-		BodyOwner(DeclaredBody),
+		BodyOwner(DeclaredBody), AdmittedReceiverScope,
 		CheckedBodies, CheckedLambda, LambdaRow(CollectingLambda, CheckedLambdaRow), CheckedValueResult, ResolvedBody,
 		CheckedConstant,
 		BindingDefinition,
@@ -78,6 +78,7 @@ import:
 	../namespace/builtins: DesignatedResult, DesignatedBoolean, DesignatedOption, RuntimeOperation
 	int: Int methods
 	list: repeat, List methods
+	../utils/source: module_number
 	../namespace/namespace: Namespace
 	option: Option methods
 	../utils/syntax:
@@ -1458,6 +1459,7 @@ pure func resolve_functions(
 	declarations: CheckedDeclarations,
 	opaque_declarations: List[OpaqueRow],
 	namespace: Namespace,
+	receivers: List[AdmittedReceiverScope],
 	constants: List[CheckedConstant],
 	traits: TraitAvailability,
 	result: DesignatedResult[VariantId],
@@ -1471,52 +1473,56 @@ pure func resolve_functions(
 		match functions.get(checked.length()):
 			None: break
 			Some(accepted):
-				id = accepted.id
-				context: ResolutionContext = {
-					traits = traits,
-					caller = {
-						body = DeclaredBody(id),
-						purity = accepted.signature.purity
-					},
-					root_function = id,
-					module = accepted.body_types.module,
-					namespace = accepted.body_types.namespace,
-					body_types = accepted.body_types,
-					signatures = functions,
-					unions = declarations.unions,
-					records = declarations.records,
-					opaque_declarations = opaque_declarations,
-					opaques = declarations.opaques,
-					constants = constants,
-					boolean = boolean,
-					option = option,
-					in_source_loop = False,
-				}
-				signature = accepted.signature
-				match resolve_body(accepted, result, context, lambdas):
-					Ok(body):
-						match check_execution(accepted.declaration, accepted.signature.type_parameters, body.statements, body.body, id, accepted_traits(traits)):
-							Ok(execution):
+				match receivers.get(module_number(accepted.body_types.module)):
+					None: failure = Some(checker_invariant(accepted.declaration.function_name.span, InvalidReceiverScope))
+					Some(receiver_scope):
+						id = accepted.id
+						context: ResolutionContext = {
+							traits = traits,
+							caller = {
+								body = DeclaredBody(id),
+								purity = accepted.signature.purity
+							},
+							root_function = id,
+							module = accepted.body_types.module,
+							namespace = accepted.body_types.namespace,
+							receiver_scope = receiver_scope,
+							body_types = accepted.body_types,
+							signatures = functions,
+							unions = declarations.unions,
+							records = declarations.records,
+							opaque_declarations = opaque_declarations,
+							opaques = declarations.opaques,
+							constants = constants,
+							boolean = boolean,
+							option = option,
+							in_source_loop = False,
+						}
+						signature = accepted.signature
+						match resolve_body(accepted, result, context, lambdas):
+							Ok(body):
+								match check_execution(accepted.declaration, accepted.signature.type_parameters, body.statements, body.body, id, accepted_traits(traits)):
+									Ok(execution):
 
-								executed: ResolvedBody = { body | body = execution.body }
+										executed: ResolvedBody = { body | body = execution.body }
 
-								published = if signature.return_type.value_type == VoidType:
-									normalize_void_body(executed)
-								else:
-									executed
+										published = if signature.return_type.value_type == VoidType:
+											normalize_void_body(executed)
+										else:
+											executed
 
-								checked = checked.append({
-									id = id,
-									label = accepted.label,
-									execution = execution.execution,
-									signature = signature,
-									bindings = published.bindings,
-									statements = published.statements,
-									body = published.body,
-								})
-								lambdas = published.lambdas
+										checked = checked.append({
+											id = id,
+											label = accepted.label,
+											execution = execution.execution,
+											signature = signature,
+											bindings = published.bindings,
+											statements = published.statements,
+											body = published.body,
+										})
+										lambdas = published.lambdas
+									Err(error): failure = Some(error)
 							Err(error): failure = Some(error)
-					Err(error): failure = Some(error)
 	match failure:
 		Some(error): Err(error)
 		None:

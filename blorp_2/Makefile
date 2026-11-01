@@ -66,6 +66,7 @@ TARGET_COMPONENT_SOURCES := \
 	blorp_2/test/unit/test_check/test_arithmetic_operators.brp \
 	blorp_2/test/unit/test_check/test_ordering_operators.brp \
 	blorp_2/test/unit/test_check/test_supertraits.brp \
+	blorp_2/test/unit/test_check/test_receiver_scopes.brp \
 	blorp_2/test/unit/test_parse/test_declaration_bounds.brp \
 	blorp_2/test/unit/test_check/test_declaration_bounds.brp \
 	blorp_2/test/unit/test_check/test_implementation_table.brp \
