@@ -141,13 +141,6 @@ private pure func rc_marked(operations: List[OwnershipOperation], position: Int,
 		_: emitted
 
 
--- A join output, loop header or loop or arm input owner is created without a definition.
-private pure func rc_control_alias(output: String, owner: OwnerId, value: ValueId, value_type: TypeRef, unions: List[ConcreteUnion], span: Span, kind: String) -> Result[String, Diagnostic]:
-	match append_owner_alias(output, owner, value, value_type, unions, span):
-		Ok(aliased): Ok("${aliased}/*RC:K ${owner_number(owner).to_string()} ${kind}*/")
-		Err(error): Err(error)
-
-
 private pure func rc_definition_kind(operation: OwnedValueOperation) -> String:
 	match operation:
 		ParameterDefinition(_): "parameter"
@@ -204,22 +197,19 @@ EDITS = [
     ),
     # Say what kind of definition created each owner it owns.
     (
-        '''		OwnedResult(owner):
-			append_owner_alias(value, owner, definition.id, definition.value_type, unions, definition.span)
+        '''				Ok(binding): Ok("${value}${binding}")
 ''',
-        '''		OwnedResult(owner):
-			match append_owner_alias(value, owner, definition.id, definition.value_type, unions, definition.span):
-				Ok(aliased): Ok("${aliased}/*RC:K ${owner_number(owner).to_string()} ${rc_definition_kind(definition.operation)}*/")
-				Err(error): Err(error)
+        '''				Ok(binding): Ok("${value}${binding}/*RC:K ${owner_number(owner).to_string()} ${rc_definition_kind(definition.operation)}*/")
 ''',
     ),
-    # Mark the owners that control edges create (they have no definition).
-    ("match append_owner_alias(result, owner, fact.id, fact.value_type, unions, fact.span):",
-     "match rc_control_alias(result, owner, fact.id, fact.value_type, unions, fact.span, \"input_owner\"):"),
-    ("match append_owner_alias(snapshots, owner, fact.id, fact.value_type, unions, fact.span):",
-     "match rc_control_alias(snapshots, owner, fact.id, fact.value_type, unions, fact.span, \"loop_header\"):"),
-    ("match append_owner_alias(joined, owner, fact.id, fact.value_type, unions, fact.span):",
-     "match rc_control_alias(joined, owner, fact.id, fact.value_type, unions, fact.span, \"join_output\"):"),
+    # Mark the owners that control edges create (they have no definition): a
+    # loop or arm input owner, a loop header and a join output.
+    ('Ok(binding): result = "${result}${binding}"',
+     'Ok(binding): result = "${result}${binding}/*RC:K ${owner_number(owner).to_string()} input_owner*/"'),
+    ('Ok(binding): snapshots = "${snapshots}${binding}"',
+     'Ok(binding): snapshots = "${snapshots}${binding}/*RC:K ${owner_number(owner).to_string()} loop_header*/"'),
+    ('Ok(binding): joined = "${joined}${binding}"',
+     'Ok(binding): joined = "${joined}${binding}/*RC:K ${owner_number(owner).to_string()} join_output*/"'),
     # The helper functions sit before their first use.
     (
         "private pure func append_ownership_operation(\n",

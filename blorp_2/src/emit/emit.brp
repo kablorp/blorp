@@ -1536,19 +1536,21 @@ private pure func append_regular_value(
 	)
 
 
-private pure func append_owner_alias(
-	output: String,
+-- The C that binds `owner` to `value`. Callers append it themselves: passing
+-- in an accumulator that is still read after the call would keep a second
+-- reference live across it, so the append would copy the whole accumulator.
+private pure func owner_alias(
 	owner: OwnerId,
 	value: ValueId,
 	value_type: TypeRef,
 	unions: List[ConcreteUnion],
 	span: Span,
 ) -> Result[String, Diagnostic]:
-	name = c_owner(owner)
 	declaration ?= c_local_declaration(value_type, InitializedLocal, unions, span)
+	name = c_owner(owner)
 
 	Ok(
-		"${output}${declaration}${name}=${c_value(value)};(void)${name};",
+		"${declaration}${name}=${c_value(value)};(void)${name};",
 	)
 
 
@@ -1572,7 +1574,9 @@ private pure func append_owned_definition(
 		UnmanagedResult | BorrowedResult(_):
 			Ok(value)
 		OwnedResult(owner):
-			append_owner_alias(value, owner, definition.id, definition.value_type, unions, definition.span)
+			match owner_alias(owner, definition.id, definition.value_type, unions, definition.span):
+				Ok(binding): Ok("${value}${binding}")
+				Err(error): Err(error)
 
 
 -- Disposable owner-type projection of accepted IR; value types stay local.
@@ -1879,7 +1883,10 @@ private pure func append_ownership_operation(
 						unions,
 						span,
 					):
-						Ok(retained): append_owner_alias(retained, owner, borrowed.value, value_type, unions, span)
+						Ok(retained):
+							match owner_alias(owner, borrowed.value, value_type, unions, span):
+								Ok(binding): Ok("${retained}${binding}")
+								Err(error): Err(error)
 						Err(error): Err(error)
 				None: Err(render(span, MissingOwnerType(owner)))
 		DropOwner(owner, span):
@@ -2029,8 +2036,8 @@ private pure func append_input_owners(
 		match input:
 			UnmanagedJoinParameter(_): void
 			ManagedJoinParameter(_, owner):
-				match append_owner_alias(result, owner, fact.id, fact.value_type, unions, fact.span):
-					Ok(aliased): result = aliased
+				match owner_alias(owner, fact.id, fact.value_type, unions, fact.span):
+					Ok(binding): result = "${result}${binding}"
 					Err(error):
 						failure = Some(error)
 						break
@@ -2266,8 +2273,8 @@ private pure func append_loop(
 				match header.parameter:
 					UnmanagedJoinParameter(_): void
 					ManagedJoinParameter(_, owner):
-						match append_owner_alias(snapshots, owner, fact.id, fact.value_type, unions, fact.span):
-							Ok(aliased): snapshots = aliased
+						match owner_alias(owner, fact.id, fact.value_type, unions, fact.span):
+							Ok(binding): snapshots = "${snapshots}${binding}"
 							Err(error):
 								failure = Some(error)
 								break
@@ -2364,8 +2371,8 @@ private pure func append_join(
 		match output_parameter:
 			UnmanagedJoinParameter(_): void
 			ManagedJoinParameter(_, owner):
-				match append_owner_alias(joined, owner, fact.id, fact.value_type, unions, fact.span):
-					Ok(aliased): joined = aliased
+				match owner_alias(owner, fact.id, fact.value_type, unions, fact.span):
+					Ok(binding): joined = "${joined}${binding}"
 					Err(error): failure = Some(error)
 		if failure.is_some():
 			break
