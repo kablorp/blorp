@@ -53,9 +53,17 @@ private pure func flatten_loop_tail(tail: Own.OwnedLoopTail) -> List[Own.Ownersh
 	all
 
 
-private pure func is_list_append(target: Concrete.CallTarget) -> Bool:
-	match target:
-		Concrete.RuntimeFunction(Builtins.ListAppend(_)): True
+private pure func is_list_append(definition: Own.OwnedDefinition) -> Bool:
+	match definition.operation:
+		Own.CallDefinition(Concrete.RuntimeFunction(Builtins.ListAppend(_)), _): True
+		_: False
+
+
+-- `joined + separator` and `+ value` call String `add`; no other call in
+-- `join` produces a String.
+private pure func is_string_call(definition: Own.OwnedDefinition) -> Bool:
+	match (definition.operation, definition.value_type):
+		(Own.CallDefinition(_, _), Concrete.StringType): True
 		_: False
 
 
@@ -64,7 +72,7 @@ private pure func is_list_append(target: Concrete.CallTarget) -> Bool:
 -- that occurrence, but the accumulator keeps its own, so the update copies.
 private pure func first_argument_consumed(
 	operations: List[Own.OwnershipOperation],
-	selected: pure (Concrete.CallTarget) -> Bool,
+	selected: pure (Own.OwnedDefinition) -> Bool,
 ) -> List[Bool]:
 	all = flatten(operations)
 	var acquired: List[Int] = []
@@ -77,8 +85,8 @@ private pure func first_argument_consumed(
 		match operation:
 			Own.DefineValue(definition):
 				match definition.operation:
-					Own.CallDefinition(target, arguments):
-						if selected(target):
+					Own.CallDefinition(_, arguments):
+						if selected(definition):
 							match arguments:
 								[Own.ConsumedArgument(_, owner), ..._]: consumed = consumed.append(acquired.contains(Own.owner_number(owner)).not())
 								_: consumed = consumed.append(False)
@@ -111,7 +119,7 @@ private func library_function_appends(name: String, expected: Int) -> Bool:
 			var seen = 0
 			var consumed: Bool = True
 			for function in program.functions:
-				if label_text(function.label).starts_with("list." + name):
+				if label_text(function.label) == "list." + name:
 					seen = seen + 1
 					consumed = consumed.and(all_consumed(first_argument_consumed(function.operations, is_list_append), expected))
 			found = (seen > 0).and(consumed)
@@ -136,8 +144,11 @@ func test_reverse_match_arm_append_consumes_its_accumulator() -> Bool:
 	library_function_appends("reverse", 1)
 
 
--- `joined + separator` and `+ value` call String `add` with the accumulator or
--- its fresh result; every other call in `join` reads Ints or borrows the List.
+func test_merge_appends_consume_their_accumulator() -> Bool:
+	library_function_appends("merge", 4)
+
+
+-- The separator and value concatenations: the accumulator, then its fresh result.
 func test_join_concatenations_consume_their_accumulator() -> Bool:
 	match library_program():
 		Err(message):
@@ -145,15 +156,14 @@ func test_join_concatenations_consume_their_accumulator() -> Bool:
 			False
 		Ok(program):
 			var seen = 0
-			var concatenations = 0
+			var consumed: Bool = True
 			for function in program.functions:
-				if label_text(function.label).starts_with("list.join"):
+				if label_text(function.label) == "list.join":
 					seen = seen + 1
-					consumed = first_argument_consumed(function.operations, pure func(_): True)
-					concatenations = concatenations + consumed.filter(pure func(taken: Bool): taken).length()
-			found = (seen > 0).and(concatenations >= 2 * seen)
+					consumed = consumed.and(all_consumed(first_argument_consumed(function.operations, is_string_call), 2))
+			found = (seen > 0).and(consumed)
 			if found.not():
-				print_error("list.join: " + seen.to_string() + " instances take " + concatenations.to_string() + " accumulators")
+				print_error("list.join: " + seen.to_string() + " instances, a concatenation borrows its accumulator or too few concatenations")
 			found
 
 
@@ -188,6 +198,7 @@ tests: TestSuite = {
 		("filter appends in an if branch and consumes the accumulator", test_filter_branch_append_consumes_its_accumulator),
 		("copy_range appends in a match arm and consumes the accumulator", test_copy_range_match_arm_append_consumes_its_accumulator),
 		("reverse appends in a match arm and consumes the accumulator", test_reverse_match_arm_append_consumes_its_accumulator),
+		("merge appends in nested match arms and consumes the accumulator", test_merge_appends_consume_their_accumulator),
 		("join concatenates onto a consumed String accumulator", test_join_concatenations_consume_their_accumulator),
 		("a snapshot read after an append keeps the accumulator borrowed", test_snapshot_read_after_append_is_not_consumed),
 	]

@@ -4,17 +4,17 @@ import:
 	../../../src/check/check: check, checked_functions, check_errors
 	../../../src/check/model as Model
 	../../../src/check/errors as Errors
-	../../../src/utils/ids: inventory_functions, inventory_unions, function_number, union_number, variant_owner, VariantId
+	../../../src/utils/ids: inventory_functions, inventory_unions, function_number, union_number
 	../../../src/utils/names: name_spelling, foundation_words
 	../../../src/utils/source: module_source, root_module_id
 	../../../src/utils/syntax: Purity(Pure)
-	../input: setup_diagnostic, singleton_check_error, checked_tail_join
+	../input: setup_diagnostic, singleton_check_error
 	fs: temporary_directory, resource_path, message
 	system: temp_dir, write_file
 	test: TestSuite
 
 
-private func with_helpers(assertions: pure (Model.CheckedFunction, Model.CheckedFunction, Model.CheckedFunction, Model.CheckedFunction, Model.CheckedUnion) -> Bool) -> Bool:
+private func with_helpers(assertions: pure (Model.CheckedFunction, Model.CheckedFunction, Model.CheckedFunction, Model.CheckedUnion) -> Bool) -> Bool:
 	match load_program("blorp_2/test/e2e/fixtures/generic/managed/list_callbacks.brp", "blorp_2/standard_library"):
 		Err(_): False
 		Ok(loaded):
@@ -29,7 +29,7 @@ private func with_helpers(assertions: pure (Model.CheckedFunction, Model.Checked
 					match (list_imports, booleans):
 						([list_import], [boolean]):
 							-- Literal API names select issued IDs only within this loaded List module.
-							helpers = ["any", "any_range", "map", "filter"].map(pure func(name):
+							helpers = ["any", "map", "filter"].map(pure func(name):
 								declarations = inventory_functions(parsed.declarations).filter(pure func(row):
 									row.declaration.module == list_import.target and name_spelling(parsed.names, row.declaration.function_name.id) == Some(name)
 								)
@@ -38,8 +38,8 @@ private func with_helpers(assertions: pure (Model.CheckedFunction, Model.Checked
 									_: None
 							)
 							match (helpers, rows.unions.get(union_number(boolean.id))):
-								([Some(any), Some(range), Some(mapped), Some(filtered)], Some(owner)):
-									assertions(any, range, mapped, filtered, owner)
+								([Some(any), Some(mapped), Some(filtered)], Some(owner)):
+									assertions(any, mapped, filtered, owner)
 								_: False
 						_: False
 				_: False
@@ -54,13 +54,13 @@ private pure func owns_rigids(function: Model.CheckedFunction) -> Bool:
 
 
 func test_public_signatures_preserve_independent_function_owned_types() -> Bool:
-	with_helpers(pure func(any, range, mapped, filtered, boolean):
+	with_helpers(pure func(any, mapped, filtered, boolean):
 		match (any.signature.type_parameters, mapped.signature.type_parameters, filtered.signature.type_parameters):
 			([t], [input, output], [element]):
 				match (any.signature.parameters, mapped.signature.parameters, filtered.signature.parameters):
 					([values, predicate], [source, callback], [candidates, keep]):
 						(
-							[any, range, mapped, filtered].all(owns_rigids)
+							[any, mapped, filtered].all(owns_rigids)
 							and not (input == output) and not (t == element)
 							and values.value_type == Model.ListType(Model.ParameterType(t))
 							and predicate.value_type == Model.CallableType(Pure, [Model.ParameterType(t)], Model.NominalType(Model.AggregateNominal(Model.UnionAggregate(boolean.id)), []))
@@ -76,66 +76,6 @@ func test_public_signatures_preserve_independent_function_owned_types() -> Bool:
 			_: False
 	)
 
-
-
-private pure func forwarded_choice(call: Model.CheckedCall, caller: Model.CheckedFunction, target: Model.CheckedFunction) -> Bool:
-	match (call.target, call.operands):
-		(Model.UserFunction(callee, [Model.ParameterType(element)]), [Model.ValueOperand(_), Model.CallableOperand(_, choice, _), Model.ValueOperand(_), Model.ValueOperand(_)]):
-			match (caller.signature.type_parameters, choice):
-				([parameter], Model.ForwardedCallable(forwarded)):
-					(
-						function_number(callee) == function_number(target.id) and parameter == element
-						and forwarded == Model.callable_parameter(caller.id, 1)
-					)
-				_: False
-		_: False
-
-
-private pure func short_circuit_selection(selected: Model.CheckedJoin, range: Model.CheckedFunction, boolean: Model.CheckedUnion) -> Bool:
-	match (selected.scrutinee.form, selected.arms, boolean.variants):
-		(Model.InvokeFunction(left), [yes, no], [truth, falsehood]):
-			match selected.selection.nodes.get(Model.decision_node_number(selected.selection.entry)):
-				Some(Model.TestVariant(place, first, when_true, when_false)):
-					match (place.route, yes.value.form, no.value.form):
-						(Model.MatchRoot, Model.ConstructVariant(returned, []), Model.InvokeFunction(right)):
-							match (selected.selection.nodes.get(Model.decision_node_number(when_true)), selected.selection.nodes.get(Model.decision_node_number(when_false))):
-								(Some(Model.EnterArm(true_arm, [])), Some(Model.EnterArm(false_arm, []))):
-									(
-										yes.statements.is_empty() and no.statements.is_empty()
-										and first == truth.id and returned == truth.id
-										-- Exhaustive Bool selects False by failing the True tag test.
-										and place.value_type == Model.NominalType(Model.AggregateNominal(Model.UnionAggregate(variant_owner(falsehood.id))), [])
-										and Model.match_arm_number(true_arm) == Model.match_arm_number(yes.id)
-										and Model.match_arm_number(false_arm) == Model.match_arm_number(no.id)
-										and forwarded_choice(left, range, range) and forwarded_choice(right, range, range)
-									)
-								_: False
-						_: False
-				_: False
-		_: False
-
-
-func test_any_true_left_branch_returns_without_the_right_call() -> Bool:
-	with_helpers(pure func(any, range, mapped, filtered, boolean):
-		forwarded = match Model.function_calls(any):
-			[_, call]: forwarded_choice(call, any, range)
-			_: False
-		match checked_tail_join(range.body):
-			Some(empty_test):
-				match empty_test.arms:
-					[_, nonempty]:
-						match nonempty.value.form:
-							Model.Match(singleton):
-								match singleton.arms:
-									[_, split]:
-										match split.value.form:
-											Model.Match(selected): forwarded and short_circuit_selection(selected, range, boolean)
-											_: False
-									_: False
-							_: False
-					_: False
-			_: False
-	)
 
 
 private NEGATIVE_MAIN: String =
@@ -243,7 +183,6 @@ tests: TestSuite = {
 	description = "Blorp 2 loaded List callback contracts",
 	tests = [
 		("List callback signatures preserve independent function-owned types", test_public_signatures_preserve_independent_function_owned_types),
-		("List any True left arm excludes the right recursive call", test_any_true_left_branch_returns_without_the_right_call),
 		("List any rejects a non-List argument", test_wrong_list_is_rejected_at_the_argument),
 		("List any callback input agrees with the List element", test_callback_input_conflicts_with_the_list_element),
 		("List any predicate returns Bool", test_predicate_result_must_be_bool),

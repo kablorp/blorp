@@ -30,7 +30,7 @@ private func with_helpers(assertions: pure (List[Model.CheckedFunction], Model.C
 					match (list_imports, booleans, optionals):
 						([list_import], [boolean], [optional]):
 							-- Literal API names select issued IDs only within this loaded List module.
-							helpers = ["take", "drop", "remove", "reverse", "find", "all", "find_range", "all_range"].map(pure func(name):
+							helpers = ["take", "drop", "remove", "reverse", "find", "all"].map(pure func(name):
 								declarations = inventory_functions(parsed.declarations).filter(pure func(row):
 									row.declaration.module == list_import.target and name_spelling(parsed.names, row.declaration.function_name.id) == Some(name)
 								)
@@ -39,8 +39,8 @@ private func with_helpers(assertions: pure (List[Model.CheckedFunction], Model.C
 									_: None
 							)
 							match (helpers, rows.unions.get(union_number(boolean.id)), rows.unions.get(union_number(optional.id))):
-								([Some(taken), Some(dropped), Some(removed), Some(reversed), Some(found), Some(every), Some(find_range), Some(all_range)], Some(owner), Some(optional)):
-									assertions([taken, dropped, removed, reversed, found, every, find_range, all_range], owner, optional)
+								([Some(taken), Some(dropped), Some(removed), Some(reversed), Some(found), Some(every)], Some(owner), Some(optional)):
+									assertions([taken, dropped, removed, reversed, found, every], owner, optional)
 								_: False
 						_: False
 				_: False
@@ -57,7 +57,7 @@ private pure func owns_rigids(function: Model.CheckedFunction) -> Bool:
 func test_supplement_signatures_keep_owned_rigids_and_foundation_types() -> Bool:
 	with_helpers(pure func(functions, boolean, optional):
 		match functions:
-			[taken, dropped, removed, reversed, found, every, _, _]:
+			[taken, dropped, removed, reversed, found, every]:
 				functions.all(owns_rigids) and [taken, dropped, removed, reversed, found, every].all(pure func(function):
 					match function.signature.type_parameters:
 						[element]:
@@ -91,153 +91,6 @@ func test_supplement_signatures_keep_owned_rigids_and_foundation_types() -> Bool
 	)
 
 
-
-private pure func forwarded_choice(call: Model.CheckedCall, caller: Model.CheckedFunction, target: Model.CheckedFunction) -> Bool:
-	match (call.target, call.operands):
-		(Model.UserFunction(callee, [Model.ParameterType(element)]), [Model.ValueOperand(_), Model.CallableOperand(_, choice, _), Model.ValueOperand(_), Model.ValueOperand(_)]):
-			match (caller.signature.type_parameters, choice):
-				([parameter], Model.ForwardedCallable(forwarded)):
-					(
-						function_number(callee) == function_number(target.id) and parameter == element
-						and forwarded == Model.callable_parameter(caller.id, 1)
-					)
-				_: False
-		_: False
-
-
--- Count all recursive calls, including any accidentally hoisted before the match.
-private pure func only_two_recursive_calls(range: Model.CheckedFunction) -> Bool:
-	Model.function_calls(range).filter(pure func(call):
-		match call.target:
-			Model.UserFunction(callee, _): function_number(callee) == function_number(range.id)
-			_: False
-	).length() == 2
-
-
-private pure func selected_branch(range: Model.CheckedFunction) -> Option[Model.CheckedJoin]:
-	match checked_tail_join(range.body):
-		Some(empty_test):
-			match empty_test.arms:
-				[_, nonempty]:
-					match nonempty.value.form:
-						Model.Match(singleton):
-							match singleton.arms:
-								[_, split]:
-									match split.value.form:
-										Model.Match(selected): Some(selected)
-										_: None
-								_: None
-						_: None
-				_: None
-		None: None
-
-
--- Retain the typed get projection: nested List/Option patterns misread an
--- opaque ID in the retained host. Canonical arm inputs no longer wrap each ID.
-private pure func single_capture(inputs: List[Model.BindingId]) -> Option[Model.BindingId]:
-	if inputs.length() == 1:
-		inputs.get(0)
-	else:
-		None
-
-
--- Check the issued routes and arm identities, including the final nullary
--- arm selected by excluding the tested variant from its two-variant union.
-private pure func variant_split(selected: Model.CheckedJoin, first: VariantId, yes: Model.CheckedJoinArm, no: Model.CheckedJoinArm) -> Bool:
-	match selected.selection.nodes.get(Model.decision_node_number(selected.selection.entry)):
-		Some(Model.TestVariant(root, tested, when_yes, when_no)):
-			match (root.route, selected.selection.nodes.get(Model.decision_node_number(when_yes)), selected.selection.nodes.get(Model.decision_node_number(when_no))):
-				(Model.MatchRoot, Some(Model.EnterArm(first_arm, arguments)), Some(Model.EnterArm(second_arm, []))):
-					projection = match arguments:
-						[]: yes.inputs.is_empty()
-						[Model.BorrowPlace(field)]:
-							match (field.route, yes.inputs):
-								(Model.UnionField(parent, variant, 0), [_]):
-									match parent.route:
-										Model.MatchRoot: variant == first and parent.value_type == root.value_type
-										_: False
-								_: False
-						_: False
-					(
-						projection and no.inputs.is_empty() and tested == first
-						and root.value_type == selected.scrutinee.value_type
-						and Model.match_arm_number(first_arm) == Model.match_arm_number(yes.id)
-						and Model.match_arm_number(second_arm) == Model.match_arm_number(no.id)
-					)
-				_: False
-		_: False
-
-func test_find_some_left_arm_returns_its_payload_without_right_recursion() -> Bool:
-	with_helpers(pure func(functions, boolean, optional):
-		match functions:
-			[_, _, _, _, found, _, range, _]:
-				forwarded = match Model.function_calls(found):
-					[_, call]: forwarded_choice(call, found, range)
-					_: False
-				match selected_branch(range):
-					Some(selected):
-						match (selected.scrutinee.form, selected.arms, optional.variants):
-							(Model.InvokeFunction(left), [yes, no], [some, none]):
-								match (yes.value.form, no.value.form):
-									(Model.ConstructVariant(returned, [payload]), Model.InvokeFunction(right)):
-										match single_capture(yes.inputs):
-											Some(captured):
-												match payload.form:
-													Model.ReadBinding(binding):
-														(
-															forwarded
-															and only_two_recursive_calls(range)
-															and yes.statements.is_empty()
-															and no.statements.is_empty()
-															and Model.binding_number(captured) == Model.binding_number(binding)
-															and variant_split(selected, some.id, yes, no)
-															and returned == some.id
-															and some.fields.length() == 1 and none.fields.is_empty()
-															and some.id != none.id
-															and selected.scrutinee.value_type == Model.NominalType(Model.AggregateNominal(Model.UnionAggregate(optional.id)), [payload.value_type])
-															and forwarded_choice(left, range, range)
-															and forwarded_choice(right, range, range)
-														)
-													_: False
-											None: False
-									_: False
-							_: False
-					_: False
-			_: False
-	)
-
-
-func test_all_false_left_arm_returns_without_right_recursion() -> Bool:
-	with_helpers(pure func(functions, boolean, optional):
-		match functions:
-			[_, _, _, _, _, every, _, range]:
-				forwarded = match Model.function_calls(every):
-					[_, call]: forwarded_choice(call, every, range)
-					_: False
-				match selected_branch(range):
-					Some(selected):
-						match (selected.scrutinee.form, selected.arms, boolean.variants):
-							(Model.InvokeFunction(left), [yes, no], [truth, falsehood]):
-								match (yes.value.form, no.value.form):
-									(Model.InvokeFunction(right), Model.ConstructVariant(returned, [])):
-										(
-											forwarded
-											and only_two_recursive_calls(range)
-											and yes.statements.is_empty()
-											and no.statements.is_empty()
-											and variant_split(selected, truth.id, yes, no)
-											and returned == falsehood.id
-											and truth.fields.is_empty() and falsehood.fields.is_empty()
-											and truth.id != falsehood.id
-											and selected.scrutinee.value_type == Model.NominalType(Model.AggregateNominal(Model.UnionAggregate(boolean.id)), [])
-											and forwarded_choice(left, range, range)
-											and forwarded_choice(right, range, range)
-										)
-									_: False
-							_: False
-					_: False
-			_: False
-	)
 
 private NEGATIVE_MAIN: String =
 	|import:
@@ -357,8 +210,6 @@ tests: TestSuite = {
 	description = "Target List supplement typed contracts",
 	tests = [
 		("List supplement signatures preserve function-owned rigids", test_supplement_signatures_keep_owned_rigids_and_foundation_types),
-		("List find returns left Some payload without evaluating the right", test_find_some_left_arm_returns_its_payload_without_right_recursion),
-		("List all returns left False without evaluating the right", test_all_false_left_arm_returns_without_right_recursion),
 		("List find predicate input agrees with the List", test_find_predicate_input_agrees_with_the_list),
 		("List find predicate result is Bool", test_find_predicate_result_is_bool),
 		("List find predicate rejects impure callbacks", test_find_predicate_must_be_pure),

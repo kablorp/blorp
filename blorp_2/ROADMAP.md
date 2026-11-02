@@ -132,7 +132,7 @@ not a portable nesting threshold or a product-destruction proof.
 | [M0](#m0-foundation-closeout) | Re-cut, perf fixes, parser statement loop, fixpoint script, parity table | Landed. M3 owns the recorded managed-value call limits. |
 | [M1a](#m1a-surface-syntax-parity) | Layout and parsed source syntax | Pure lambda and callback syntax is implemented; current source-frontier evidence remains separate. |
 | [ML](#ml-list-construction) | `append`, `set`, `concat`, list literal | Done. Checked `set_index` is an ordinary target-library wrapper. |
-| [List buffer reuse](#list-buffer-reuse-roadmap) | Ownership-aware updates, four-slot first growth, doubling and simpler library loops | L1 append (`85c1eabc3`) and L2 set/concat (`90f684248`) landed. L2b.1 (loop entry) and L2b.2 (joins) landed; L2b seed `blorp2-seed-50d3922f3449` pinned. L3/L4 next. |
+| [List buffer reuse](#list-buffer-reuse-roadmap) | Ownership-aware updates, four-slot first growth, doubling and simpler library loops | L1 append (`85c1eabc3`) and L2 set/concat (`90f684248`) landed. L2b.1 (loop entry) and L2b.2 (joins) landed; L2b seed `blorp2-seed-50d3922f3449` pinned. L3 (library loops) and L4 (linear merge) landed; see their sections. |
 | [Ownership contracts](#ownership-contracts-roadmap) | Owned/borrowed parameter contracts inferred from in-place runtime operations; record update binds before rebuilding; cell reuse | Planned and approved 2026-10-28. O0 measured; the O1 step-0 spike measured and its ceilings accepted 2026-10-29, so O1 proper is next. Cell reuse awaits a decision on the O0 evidence. |
 | [M1b](#m1b-names-and-the-foundation) | Namespace: private, aliases, qualified names, designated `Bool`/`Option`/`Result` | Parts A and B done; control-flow consumers follow in M2/M3. |
 | [M5](#m5-constants) | Literal scalar/String constants | Implemented. Source construction functions replace the need for record/opaque constants and initializer dependencies. |
@@ -396,7 +396,7 @@ must update both libraries and all callers together.
 Status: L1 landed as `85c1eabc3` with its seed pinned in `8d44d250b`; L2
 landed as `90f684248` with seed `blorp2-seed-90f684248521`.
 [L2b](#l2b-transfer-ownership-into-joins-and-loop-entry) landed and its seed
-`blorp2-seed-50d3922f3449` is pinned; L3 is next.
+`blorp2-seed-50d3922f3449` is pinned; L3 and L4 have landed.
 The earlier eager four-slot empty-literal variant passed
 functional gates but exceeded the RSS investigation threshold; its measurements
 remain recorded below. Implement in order, with code-reviewer and
@@ -740,7 +740,7 @@ activation. No implicit fallback or mixed library producer is permitted.
 
 Status: L2b.1 (loop entry, [validation](#l2b1-validation)) and L2b.2
 (joins, [validation](#l2b2-validation)) landed, and the seed carrying them,
-`blorp2-seed-50d3922f3449`, is pinned. L3 is next.
+`blorp2-seed-50d3922f3449`, is pinned. L3 and L4 have landed.
 
 #### Problem
 
@@ -1393,6 +1393,23 @@ path. Acceptance: linear element visits/output construction, constant traversal
 stack and fewer production lines; retain exact callback order and all boundary
 cases. Check the resulting owned calls actually consume the accumulator.
 
+**Status.** Landed. `map`, `filter`, `copy_range` (so `take`, `drop` and `remove`),
+`reverse`, `join`, `any`, `all` and `find` are loops, and the `*_range` helpers
+are gone. `join` appends to a dying String accumulator. The deferred List fixtures
+(`take_*`, `remove_int`, `supplement/*`, `list_callbacks`, `list_queries`,
+`list_join`) now run in the active e2e selection, with exact stdout and strict
+counts, beside `library_loops` (lengths 0 to 9) and `library_linear` (4,096
+elements). `test_own/test_library_loops.brp` loads the real library and requires
+that each `map`, `filter`, `copy_range`, `reverse` and `merge` append, and each
+`join` concatenation, takes its accumulator's last owner. Mutating each function
+to read the old accumulator after the append fails its test. A copy of k elements
+used to allocate k Lists and now allocates one (`take_remove_moderate` 783 -> 22
+allocations); `list.brp` shrank by 119 lines. Against `a9120b4b1` (stage-2
+self-compile, warmup and three alternating runs): strict allocations 17,364,890
+to 16,593,787 (-4.4%), -O0 retired instructions 47.65 G to 45.77 G (-3.9%), -O2
+17.03 G to 16.11 G (-5.4%), peak heap requested 190.5 MB to 149.3 MB (malloc-rounded
+210.6 MB to 169.0 MB).
+
 ### L4: simplify stable sorting
 
 Separately replace `MergedPrefix`, `merge_first` and recursive `merge_prefix`
@@ -1402,6 +1419,31 @@ The outer merge sort may keep its bounded recursion. Delete superseded state
 and helpers. Acceptance: O(n) work per merge and O(n log n) total sorting work
 for constant-cost keys, stable duplicates, bounded stack, and fewer production
 lines. Do not add a new sorting algorithm or mutable public builder.
+
+**Status.** Landed. One `merge` loop replaces `MergedPrefix`, `merge_first` and
+`merge_prefix`; each step appends the smaller head, a tie taking the left. Sorting
+1,024 Ints allocates 2,047 Lists (2n - 1: one singleton per element and one result
+per merge), down from 30,721, and `library_linear` (4,096 elements through `map`,
+`filter`, `reverse`, `sort_by` and `join`) allocates 12,306, down from 169,998.
+`list.brp` shrank by 52 more lines (171 in total). Against `a9120b4b1` (the same
+method): strict allocations 17,364,890 to 15,112,051 (-13.0%), -O0 retired
+instructions 47.64 G to 44.39 G (-6.8%), -O2 17.03 G to 15.05 G (-11.6%), peak heap
+requested 190.5 MB to 149.2 MB (rounded 210.6 MB to 169.0 MB). `list_ops` (one
+warmup, three runs) retires 77.6 G to 7.56 G instructions (5.7 times the legacy
+compiler's 1.32 G) and makes 94.1 M to 4.0 M allocations. The sort builds a List
+per merge, 20,000 allocations per 10,000-element sort and 4.0 M for the benchmark's
+200 sorts, and the sorts retire 6.8 G of the 7.6 G (about 255 instructions per merge
+step, with `blorp_list_append_take_left` the top sampled frame). A lower count needs a
+sort that does not build a List per merge, such as two buffers updated with `set`,
+which is a different algorithm and outside L4.
+The other ports (`numeric_loop`, `fib`, `binary_trees`, `compiler_ast`,
+`compiler_emit`, `control_flow_accumulators`, `helper_accumulators`) keep their
+allocations and move by at most 0.2% in retired instructions.
+
+Follow-up, the sort's constant cost: about 255 retired instructions per merge step,
+and 2n - 1 allocations per sort, half of them the singleton leaves. A two-element
+base case, or merging the leaves straight from `values` without singleton Lists,
+would roughly halve that.
 
 ### Tests, measurements and landing
 
