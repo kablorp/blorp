@@ -12,8 +12,8 @@ import:
 		ExpressionBase(
 			VoidExpression, IntegerExpression, FloatExpression, StringExpression, InterpolatedString, NameExpression, DirectApplication,
 			QualifiedName, QualifiedApplication, OpaqueWrap, OpaqueUnwrap, ListExpression, TupleExpression, RangeExpression, RecordExpression,
-			RecordUpdateExpression, ComparisonExpression, ArithmeticExpression, NegationExpression, LogicalExpression, NotExpression, LambdaExpression,
-			IfExpression, MatchExpression,
+			RecordUpdateExpression, DictExpression, ComparisonExpression, ArithmeticExpression, NegationExpression, LogicalExpression, NotExpression,
+			LambdaExpression, IfExpression, MatchExpression,
 		),
 		ComparisonOperator(EqualOperator, NotEqualOperator, LessOperator, GreaterOperator, LessEqualOperator, GreaterEqualOperator),
 		ArithmeticOperator(AddOperator, SubtractOperator, MultiplyOperator, DivideOperator, RemainderOperator),
@@ -51,6 +51,7 @@ import:
 		PatternHead(BareHead, QualifiedHead),
 		ParsedRecord,
 		ParsedRecordField,
+		ParsedDictEntry,
 		SpreadTarget(SpreadName, SpreadWildcard),
 		ParsedRuntimeOperation(
 			FloatCopySignBuiltin, FloatEqualsBuiltin, FloatLessThanBuiltin,
@@ -72,7 +73,7 @@ import:
 		Spacing(Adjacent, Spaced),
 		Span,
 		Symbol(
-			Wildcard, LeftParen, RightParen, Dot, Arrow, Colon, Newline, Indent, Dedent,
+			Wildcard, LeftParen, RightParen, Dot, Arrow, FatArrow, Colon, Newline, Indent, Dedent,
 			Equals, EqualsEquals, NotEquals, Less, Greater, LessEquals, GreaterEquals, QuestionEquals, LeftBracket, RightBracket, LeftBrace, RightBrace,
 			Bar, Comma, AtSign, Slash, Star, Plus, Minus, Percent, DotDot, Ellipsis,
 		),
@@ -259,8 +260,13 @@ private pure func parser_span(state: ParserState) -> Span:
 			state.input.end
 
 
+-- `=>` belongs only between a Dict entry's key and value, so wherever else
+-- the parser stops at one, the likelier intent is a comparison or a lambda.
 private pure func expected_syntax(state: ParserState, message: String, help: String) -> Diagnostic:
-	diagnostic(parser_span(state), message, help)
+	if at_symbol(state, FatArrow):
+		diagnostic(parser_span(state), "'=>' is not an operator", "write '>=' to compare, or 'func(x): expr' for a lambda")
+	else:
+		diagnostic(parser_span(state), message, help)
 
 
 private pure func misplaced_annotation(state: ParserState) -> Diagnostic:
@@ -1318,7 +1324,7 @@ private pure func consume_base(start: ParserState, token: Token) -> Result[Parse
 			else:
 				Err(expected_syntax(start, "expected a return expression", EXPRESSION_HELP))
 		SymbolToken(LeftBrace):
-			consume_braced_record(after, token.span)
+			consume_braced(after, token.span)
 		SymbolToken(LeftBracket):
 			consume_list_literal(after, token.span)
 		FloatLiteral(spelling):
@@ -3809,33 +3815,86 @@ private pure func consume_literal_fields(state: ParserState, fields: List[Parsed
 			Ok({ fields = gathered, next = next })
 
 
--- `start` follows the opening brace.
+-- `start` is at the first field name.
 private pure func consume_record_literal(start: ParserState, opening: Span) -> Result[ParsedBase, Diagnostic]:
-	listed: ParsedLiteralFields ?= if at_right_brace(start):
-		Ok({ fields = [], next = start })
-	else:
-		consume_literal_fields(start, [])
+	listed ?= consume_literal_fields(start, [])
 	closed ?= expect(listed.next, at_right_brace(listed.next), "expected '}' after the record fields", "separate record fields with commas, then close the literal with '}'")
 	Ok({ base = RecordExpression(listed.fields), span = { opening | end = parser_span(listed.next).end }, next = closed })
 
 
-private pure func consume_braced_record(start: ParserState, opening: Span) -> Result[ParsedBase, Diagnostic]:
+-- `start` follows the opening brace, as in legacy `braced`: `}` closes an
+-- empty Dict and a name then `=` starts a record literal; otherwise the first
+-- expression decides.
+private pure func consume_braced(start: ParserState, opening: Span) -> Result[ParsedBase, Diagnostic]:
 	inside = with_enclosure(start, Bracketed)
-	literal = and(at_identifier(inside), at_equals(shifted(inside, 1)))
-	braced ?= if or(at_right_brace(inside), literal):
+	braced: ParsedBase ?= if at_right_brace(inside):
+		Ok({ base = DictExpression([]), span = { opening | end = parser_span(inside).end }, next = shifted(inside, 1) })
+	else if and(at_identifier(inside), at_equals(shifted(inside, 1))):
 		consume_record_literal(inside, opening)
 	else:
-		consume_record_update(inside, opening)
+		consume_dict_or_update(inside, opening)
 	Ok({ braced | next = with_enclosure(braced.next, start.enclosure) })
 
 
--- `start` follows the opening brace of `{ base | field = value, ... }`.
-private pure func consume_record_update(start: ParserState, opening: Span) -> Result[ParsedBase, Diagnostic]:
-	base ?= consume_value(start)
-	bar ?= expect(base.next, at_bar(base.next), "expected '|' after the record update base", "write { existing_record | field = expression }")
-	fields ?= consume_literal_fields(bar, [])
+-- `|` after the first expression makes a record update and `=>` a Dict.
+private pure func consume_dict_or_update(start: ParserState, opening: Span) -> Result[ParsedBase, Diagnostic]:
+	first ?= consume_dict_key(start)
+	if at_symbol(first.next, FatArrow):
+		consume_dict_literal(first.body, shifted(first.next, 1), opening)
+	else if at_bar(first.next):
+		consume_record_update(first.body, shifted(first.next, 1), opening)
+	else:
+		Err(unexpected(first.next, "expected '|' or '=>' after the first expression in braces", "write { record | field = value } to update a record, or { key => value } for a Dict"))
+
+
+-- `fields_start` follows the `|` after `base`.
+private pure func consume_record_update(base: ValueExpression, fields_start: ParserState, opening: Span) -> Result[ParsedBase, Diagnostic]:
+	fields ?= consume_literal_fields(fields_start, [])
 	closed ?= expect(fields.next, at_right_brace(fields.next), "expected '}' after the record update fields", "separate replacement fields with commas, then close the update with '}'")
-	Ok({ base = RecordUpdateExpression(base.body, fields.fields), span = { opening | end = parser_span(fields.next).end }, next = closed })
+	Ok({ base = RecordUpdateExpression(base, fields.fields), span = { opening | end = parser_span(fields.next).end }, next = closed })
+
+
+private record ParsedDictEntries {
+	entries: List[ParsedDictEntry],
+	next: ParserState
+}
+
+
+-- Inside braces a `=>` with nothing before it is a missing key, not a
+-- comparison or a lambda arrow.
+private pure func consume_dict_key(start: ParserState) -> Result[ParsedValue, Diagnostic]:
+	if at_symbol(start, FatArrow):
+		Err(diagnostic(parser_span(start), "expected a key before '=>'", "write { key => value }; every Dict entry starts with its key"))
+	else:
+		consume_value(start)
+
+
+-- `value_start` follows the `=>` after `key`.
+private pure func consume_dict_entries(key: ValueExpression, value_start: ParserState, entries: List[ParsedDictEntry]) -> Result[ParsedDictEntries, Diagnostic]:
+	value ?= consume_value(value_start)
+	gathered = entries.append({ key = key, value = value.body })
+
+	match list_separator(value.next):
+		ListEnds(next): Ok({ entries = gathered, next = next })
+		ListContinues(next): consume_dict_entry(next, gathered)
+
+
+-- `start` is at the key of an entry after the first.
+private pure func consume_dict_entry(start: ParserState, entries: List[ParsedDictEntry]) -> Result[ParsedDictEntries, Diagnostic]:
+	key ?= consume_dict_key(start)
+	value_start ?= expect(key.next, at_symbol(key.next, FatArrow), "expected '=>' after the Dict key", "write key => value; every Dict entry needs a value")
+	consume_dict_entries(key.body, value_start, entries)
+
+
+-- A second `=>` in one entry is reported here as Dict syntax, not by the
+-- comparison and lambda hint `expected_syntax` gives a stray `=>`.
+private pure func consume_dict_literal(key: ValueExpression, value_start: ParserState, opening: Span) -> Result[ParsedBase, Diagnostic]:
+	listed ?= consume_dict_entries(key, value_start, [])
+	closed: ParserState ?= if at_right_brace(listed.next):
+		Ok(shifted(listed.next, 1))
+	else:
+		Err(diagnostic(parser_span(listed.next), "expected ',' or '}' after the Dict entry", "separate Dict entries with commas, then close the literal with '}'"))
+	Ok({ base = DictExpression(listed.entries), span = { opening | end = parser_span(listed.next).end }, next = closed })
 
 
 private record ParsedRecordResult {

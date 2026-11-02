@@ -13,7 +13,7 @@ import:
 	./scope: CallableBinding, callable_local, callable_parameter_contract, ScopedValue(DataLocal, CallableLocal), LocalBinding, binding_site, binding_definition, local_binding_id, lookup_binding, bind_local
 	./signatures: AcceptedFunction
 	./callables:
-		FunctionContract, accept_method_call, method_contract, method_id_contract, callable_contract,
+		FunctionContract, accept_method_call, method_contract, method_id_contract, declared_id_contract, callable_contract,
 		function_contract, value_callable_contract,
 		ResolutionContext,
 		resolve_body_type,
@@ -45,7 +45,7 @@ import:
 		ConstantError(ConstantCalled, NonClosedInitializer), constant_error,
 		ConstructorError(ConstructorNeedsExpectedType),
 		RecordError(RecordNeedsExpectedType, FieldRequiresRecord),
-		ValueError(InterpolationRequiresString, TupleIndexRequiresTuple, TupleIndexMustBeLiteral, TupleIndexOutOfRange, MutableCapture, UnknownValue, ExpressionTypeMismatch, UnknownOpaqueType, NonOpaqueConversionType, ForeignOpaqueConstruction, ForeignOpaqueProjection),
+		ValueError(InterpolationRequiresString, TupleIndexRequiresTuple, TupleIndexMustBeLiteral, TupleIndexOutOfRange, MutableCapture, UnknownValue, ExpressionTypeMismatch, UnknownOpaqueType, NonOpaqueConversionType, ForeignOpaqueConstruction, ForeignOpaqueProjection, EmptyDictNeedsType, DictLiteralRequiresDict),
 		MethodError(MethodReceiverNeedsType),
 		CheckerInvariant(InvalidFunctionContract, InvalidConstantDeclaration, InvalidOpaqueDeclaration, InvalidRecordDeclaration, InvalidRecordField, GenericConstructorContract, InvalidInferenceWorklist, MissingCallParameter),
 		call_error,
@@ -104,7 +104,7 @@ import:
 		ConstructionContext, construction_context,
 		SuspendedConstruction, resume_construction, construction_context_error,
 		CallPlacement(ReceiverPlacement, ReturnPlacement),
-		PlannedBase(PlannedContext, PlannedInterpolation, PlannedTuple, PlannedCallable, PlannedCall, PlannedStoredCall, PlannedLeaf, PlannedRecord, PlannedUpdate, PlannedVariant, PlannedList, PlannedConstructOpaque, PlannedProjectOpaque),
+		PlannedBase(PlannedContext, PlannedInterpolation, PlannedTuple, PlannedCallable, PlannedCall, PlannedDict, PlannedStoredCall, PlannedLeaf, PlannedRecord, PlannedUpdate, PlannedVariant, PlannedList, PlannedConstructOpaque, PlannedProjectOpaque),
 		finish_pending_list,
 		list_element_type,
 		plan_list_literal,
@@ -137,6 +137,7 @@ import:
 		ValueExpression,
 		WrittenName,
 		ParsedRecordField,
+		ParsedDictEntry,
 		PostfixOperation(TupleIndex, ReceiverInvocation, FieldAccess),
 		ReceiverApplication,
 		ComparisonOperator(EqualOperator, NotEqualOperator, LessOperator, GreaterOperator, LessEqualOperator, GreaterEqualOperator),
@@ -144,8 +145,8 @@ import:
 		ExpressionBase(
 			VoidExpression, IntegerExpression, FloatExpression, StringExpression, InterpolatedString, NameExpression, DirectApplication,
 			QualifiedName, QualifiedApplication, OpaqueWrap, OpaqueUnwrap, TupleExpression, ListExpression, RangeExpression, RecordExpression,
-			RecordUpdateExpression, ComparisonExpression, ArithmeticExpression, NegationExpression, LogicalExpression, NotExpression, IfExpression,
-			MatchExpression, LambdaExpression,
+			RecordUpdateExpression, DictExpression, ComparisonExpression, ArithmeticExpression, NegationExpression, LogicalExpression, NotExpression,
+			IfExpression, MatchExpression, LambdaExpression,
 		),
 		Purity(Pure, Impure), permits_purity,
 
@@ -303,6 +304,7 @@ private union ExpressionWork:
 	FinishRecord(PlannedRecordFields, OperandRange)
 	CheckRecord(PlannedRecordFields, List[PendingRecordField])
 	ContinueList(ListProgress)
+	ContinueDict(DictProgress)
 	FinishTuple(OperandRange, Span, Span)
 	FinishInterpolation(OperandRange, Span, Span)
 	FinishList(ListElementSource, OperandRange, Span, Span)
@@ -322,6 +324,18 @@ private record ListProgress {
 	start: Int,
 	base_span: Span,
 	span: Span
+}
+
+
+-- A Dict literal's `set` calls: the Dict built so far is the top operand and
+-- entry `position` is next. `set` returns its receiver's type, so every call
+-- expects the literal's own expected type.
+private record DictProgress {
+	set: FunctionContract,
+	entries: List[ParsedDictEntry],
+	position: Int,
+	expectation: Option[InferenceType],
+	base_span: Span
 }
 
 
@@ -687,6 +701,24 @@ private pure func arithmetic_contract(arithmetic: Errors.ArithmeticTrait, span: 
 	method_id_contract(span, Checked.canonical_operation_member(contract), traits)
 
 
+-- A Dict literal calls the functions the prelude's Dict's own module
+-- declares: `{}` is `empty()`, and n entries are `with_capacity(n)` then one
+-- `set` per entry, so later phases see only calls. `{}` takes K and V from
+-- its expected type; entries supply them otherwise.
+private pure func plan_dict_literal(entries: List[ParsedDictEntry], expectation: Option[InferenceType], body: ValueExpression, context: ResolutionContext) -> Result[PlannedBase, CheckError]:
+	span = body.base_span
+	functions ?= accepted_traits(context.traits).canonical.dict_literal.to_result(value_error(span, DictLiteralRequiresDict))
+	empty ?= declared_id_contract(span, functions.empty, context.signatures)
+	reserve ?= declared_id_contract(span, functions.with_capacity, context.signatures)
+	set ?= declared_id_contract(span, functions.set, context.signatures)
+	if entries.is_empty().not():
+		Ok(PlannedDict(reserve, set, entries, expectation))
+	else if expectation.is_none():
+		Err(value_error(span, EmptyDictNeedsType))
+	else:
+		Ok(PlannedCall(empty, [], ReturnPlacement(span, body.span), expectation))
+
+
 private pure func plan_body_base(scope: List[ScopedValue], body: ValueExpression, expectation: Option[InferenceType], context: ResolutionContext, construction: ConstructionContext, slots: List[InferenceSlot]) -> Result[PlannedBase, CheckError]:
 	match body.base:
 		ComparisonExpression(operator, span, left, right):
@@ -702,6 +734,7 @@ private pure func plan_body_base(scope: List[ScopedValue], body: ValueExpression
 		NegationExpression(span, operand):
 			arithmetic_contract(Errors.NegatableTrait, span, accepted_traits(context.traits)).map(pure func(contract): PlannedCall(contract, [operand], ReturnPlacement(body.base_span, body.span), expectation))
 		RecordUpdateExpression(base, fields): Ok(PlannedUpdate(base, fields, expectation))
+		DictExpression(entries): plan_dict_literal(entries, expectation, body, context)
 		DirectApplication(name, arguments):
 			match classify_direct_call(name, arguments, scope, context):
 				Ok(classified):
@@ -1200,6 +1233,14 @@ private pure func elaborate_value(
 											PlannedCall(contract, arguments, placement, call_hint):
 												work = push_at(work, work_count, Some(ScheduleCall(contract, arguments, placement, call_hint)))
 												work_count = work_count + 1
+											PlannedDict(reserve, set, entries, dict_hint):
+												-- The capacity is the entry count, an Int at the literal; a
+												-- repeated key only over-reserves.
+												count: ValueExpression = { base = IntegerExpression(entries.length()), base_span = written.base_span, applications = [], span = written.base_span }
+												work = push_at(work, work_count, Some(ContinueDict({ set = set, entries = entries, position = 0, expectation = dict_hint, base_span = written.base_span })))
+												work_count = work_count + 1
+												work = push_at(work, work_count, Some(ScheduleCall(reserve, [count], ReturnPlacement(written.base_span, written.span), dict_hint)))
+												work_count = work_count + 1
 											PlannedInterpolation(parts):
 												range: OperandRange = { start = operand_count, count = parts.length() }
 												work = push_at(work, work_count, Some(FinishInterpolation(range, written.base_span, written.span)))
@@ -1412,6 +1453,25 @@ private pure func elaborate_value(
 											work_count = work_count + 1
 											work = push_at(work, work_count, Some(EnterExpression(element, hint)))
 											work_count = work_count + 1
+					-- Each `set` takes the Dict built so far as its receiver, as in
+					-- `set(with_capacity(n), k, v)`, and enters its key before its value.
+					ContinueDict(progress):
+						operand_count = operand_count - 1
+						current_result = expression_operand(operands, operand_count, progress.base_span)
+						operands = operands.set(operand_count, None)
+
+						match current_result:
+							Err(error): failure = Some(error)
+							Ok(current):
+								match progress.entries.get(progress.position):
+									None: failure = Some(checker_invariant(progress.base_span, InvalidInferenceWorklist))
+									Some(entry):
+										if progress.position + 1 < progress.entries.length():
+											work = push_at(work, work_count, Some(ContinueDict({ progress | position = progress.position + 1 })))
+											work_count = work_count + 1
+										receiver_span: Span = { progress.base_span | end = entry.value.span.end }
+										work = push_at(work, work_count, Some(ScheduleCall(progress.set, [entry.key, entry.value], ReceiverPlacement(current, receiver_span), progress.expectation)))
+										work_count = work_count + 1
 					FinishList(source, range, base_span, span):
 						match call_operands(operands, range, base_span):
 							Err(error): failure = Some(error)
@@ -1806,7 +1866,7 @@ private pure func elaborate_value(
 									BodyExpression(context, _): BodyCaptures(context.caller.body, lambdas)
 									ConstantInitializer(_, _, _): NoCaptures
 								match freeze_pending_value(value, slots, captures, context_work, assumptions, site_traits(site)):
-									Err(error): failure = Some(error)
+									Err(error): failure = Some(incompatible_result_error(error, result_incompatible, result_context, value, slots))
 									Ok(frozen_value): accepted = Some(frozen_value)
 			_: failure = Some(checker_invariant(body.span, InvalidInferenceWorklist))
 
@@ -1816,6 +1876,18 @@ private pure func elaborate_value(
 			match accepted:
 				Some(value): Ok({ value = value, lambdas = lambdas })
 				None: Err(checker_invariant(body.span, InvalidInferenceWorklist))
+
+
+-- An expected type of another head leaves unsolved the type parameters only
+-- it could have supplied, as `p: Point = {}` leaves the Dict's K and V; the
+-- mismatch, not those parameters, is the error to report.
+private pure func incompatible_result_error(error: CheckError, incompatible: Bool, result_context: Option[CallResultContext], value: PendingValue, slots: List[InferenceSlot]) -> CheckError:
+	match (error.kind, result_context, incompatible):
+		(Errors.CallRejection(Errors.UninferableTypeParameter(_)), Some(result), True):
+			match publish_inference_type(pending_type(value), slots, DiagnosticInference, result.span):
+				Ok(actual): value_error(result.span, ExpressionTypeMismatch({ expected = result.expected.value_type, actual = { value_type = actual, span = result.span }, expected_site = result.expected.site }))
+				Err(_): error
+		_: error
 
 
 private pure func freeze_pending_values(values: List[PendingValue], slots: List[InferenceSlot], captures: CaptureScope, constructions: List[ContextWork], assumptions: List[Checked.TraitRequirement], traits: TraitAvailability) -> Result[List[CheckedExpr], CheckError]:

@@ -1,6 +1,6 @@
 # Blorp 2 Dict
 
-Status: approved 2026-11-02, with the decisions below. Phase 0 is done and phase 1 is done ([spike report](../benchmarks/results/blorp2-dict-spike-2026-11-02.md), [phase 1 results](../benchmarks/results/blorp2-dict-phase1-2026-11-02.md)); their findings are folded in below, and phase 2 (literals) is next. Each phase gets its own implementation brief.
+Status: approved 2026-11-02, with the decisions below. Phases 0, 1 and 2 are done ([spike report](../benchmarks/results/blorp2-dict-spike-2026-11-02.md), [phase 1 results](../benchmarks/results/blorp2-dict-phase1-2026-11-02.md), [phase 2 results](../benchmarks/results/blorp2-dict-phase2-2026-11-02.md)); their findings are folded in below, and phase 3 (HashMap) is next, after a seed rotation that carries the literals. Each phase gets its own implementation brief.
 
 ## Problem
 
@@ -102,6 +102,12 @@ All of these are pure. `n` is the number of live entries.
   - Rejected alternatives:
     - the test-entry route (a special load of the library file, a synthetic import under an alias nobody can write, and a rewrite at assembly): the prelude already loads `dict.brp`;
     - new designation machinery for library functions.
+  - **As built in phase 2:**
+    - `CanonicalContracts.dict_literal` holds the three `FunctionId`s, found in `accept_trait_contracts` (`check/traits.brp`) through the foundation words `Dict`, `empty`, `with_capacity` and `set`, the route the operator traits already take. It is `None` when the prelude's `Dict` is not an opaque type whose module declares all three as pure functions (a literal is pure, so this is the one purity check), and a literal then gets "Dict literals require the prelude's Dict".
+    - A literal's calls check exactly like the nested calls `set(set(with_capacity(2), k1, v1), k2, v2)`, which emit the same C. The receiver chain `D.with_capacity(2).set(k1, v1)` does not check today: `set` is an overloaded receiver method, and its selection fails on a receiver whose K and V are still unsolved. A literal avoids that because its `set` is known by identity.
+    - A key type without `DictKey` gets the declaration-bound error where `Dict[Point, Int]` is written. In an unannotated literal no Dict type is written, so it gets the existing call-bound error, "type does not satisfy the required trait bound".
+    - **Owner-visible diagnostic change.** `{}` where a record is expected became an ordinary type mismatch through one general checking change: when the expected type of a whole value has another head, its unsolved type parameters are reported as that mismatch. This changes calls too: `p: Point = D.empty()` now reports "expression does not match the expected type" instead of "cannot infer the type parameter from the argument". Argument positions such as `takes_point({})` are unchanged.
+    - After the first expression in braces, anything but `|` or `=>` is "expected '|' or '=>' after the first expression in braces", naming both forms. Inside a Dict, a missing key or a second `=>` in an entry gets a Dict message; a stray `=>` elsewhere keeps the lexer's former comparison and lambda message.
 - **Parser and lexer changes:**
   - A braced form currently decides by two-token lookahead (`consume_braced_record`, `parse/parse.brp`), so `{x => 1}` would fall into record update today, if the lexer did not reject `=>` first. The rule becomes: after `{`, a name then `=` is a record literal. Otherwise read one expression; then `|` means a record update and `=>` a Dict. This matches legacy `braced` in `docs/GRAMMAR.md`.
   - The changes:
@@ -210,7 +216,7 @@ Each phase lands green on its own, with self-compile allocations, `-O0`/`-O2` in
 | --- | --- | --- |
 | 0, spike (done) | A prototype `dict.brp`, a `dict_ops` port and measurements: [report](../benchmarks/results/blorp2-dict-spike-2026-11-02.md). The prototype, the port and the unit suite are on branch `blorp2-dict-spike` (`f342a8039`), the starting point for phase 1. | The phase 1 ceilings below |
 | 1, Dict (done) | `dict.brp` with `DictKey`, the operations, equality; `DictKey` for `Int`, and `Hashable`/`DictKey` for `String` and `Bool`; and the probing, churn, compaction, linearity and ownership tests: [results](../benchmarks/results/blorp2-dict-phase1-2026-11-02.md). Equality needed trait implementations on generic opaque types (83bc73dac) and so a seed that has them. | Dict usable through calls |
-| 2, literals | Lexer, parser, AST, checking rewrite, grammar and tests, as in Literals | `{}` and `{k => v}` work |
+| 2, literals (done) | Lexer, parser, AST, checking rewrite, grammar and tests, as in Literals: [results](../benchmarks/results/blorp2-dict-phase2-2026-11-02.md) | `{}` and `{k => v}` work |
 | 3, HashMap | Move the six `HashMap` users to `Dict`, keeping their Int keys, and delete `utils/hash_map.brp`. Update the docs that describe it: `blorp_2/README.md`'s HashMap sections (around lines 157 and 251-265), `_base.brp`'s comment, and `ROADMAP.md`'s "once Blorp has a dict" note and its Set/Dict key-semantics deferral, which should link this plan | No stopgap map |
 | 4, names | `utils/names.brp` becomes a `Dict[String, NameId]`. An id is its spelling's position in `keys()`, since names are never removed, so the separate `spellings` List and the bucket functions are deleted | No bucket table |
 | 5, record keys | Written `Hashable`/`DictKey` for `TypeHead` and the opaque ids. `model.brp`'s `implementation_table` becomes a Dict keyed by `TypeHead`. Specialize's **sealed** instance tables become Dicts keyed by their full keys. Its **slot** tables keep `IndexedList`, because their digests deliberately hash only the head while `resolve_partial` rewrites pending references inside the stored key. Replace the squashed pair keys where a written hash is cheap. | Fewer digests and hints |

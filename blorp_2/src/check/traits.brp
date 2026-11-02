@@ -6,11 +6,11 @@ the resolved requirement-to-body mapping consumed by checking and specialization
 import:
 	./declarations: CheckedDeclarations, TypeScope, type_access, previous_declaration, resolve_type, Substitution, substitute_type
 	./errors: CheckError, checker_invariant, type_term_error, TypeTermError(PrivateTypeInPublicDeclaration), CheckerInvariant(InvalidFunctionContract), TraitError(SupertraitUnknown, SupertraitCycle, SupertraitMethodInImplementation, CanonicalEquatableSupertraits, EqualityMemberUnsupported, DuplicateRequirementParameter, ImpureRequirement, GenericRequirement, FirstParameterMustBeSelf, CallableFormalDeferred, OrphanImplementation, DuplicateImplementation, MissingImplementationMethod, MissingTraitBound, UnknownImplementationMethod, DuplicateImplementationMethod, ImplementationSignatureMismatch, MalformedCanonicalTrait, MalformedCanonicalMember), ArithmeticTrait(AddableTrait, SubtractableTrait, MultipliableTrait, DivisibleTrait, ModulableTrait, NegatableTrait), ComparisonTrait(EquatableTrait, OrderableTrait), CanonicalFamily(ComparisonFamily, ArithmeticFamily), trait_error
-	./model: AggregateId(RecordAggregate, UnionAggregate), NominalId(AggregateNominal, OpaqueNominal), EqualityMember(EqualityField, EqualityPayload), CheckedRecord, CheckedUnion, AcceptedTraits, AcceptedTraitContracts, CanonicalContracts, ImplementationTable, family_for, implementation_rows, implementation_table, CanonicalEquality, canonical_equality, canonical_owner, CanonicalOrdering, canonical_ordering, CanonicalOperation, canonical_operation, AcceptedTrait, AcceptedTraitMethod, AcceptedImplementation, ImplementedMethod, ImplementedBody(AuthoredMethod, TraitDefault, StructuralEquality), TypeParameterId, LocatedTrait, TraitRequirement, aggregate_head, aggregate_owner, receiver_arguments, receiver_type, type_head, parameter_owner, ImplementationHeader, FunctionSignature, TypeUse, TypeRef(ParameterType, VoidType, NominalType), TypeParameterOwner(TraitDeclaration), type_parameter_id
+	./model: AggregateId(RecordAggregate, UnionAggregate), NominalId(AggregateNominal, OpaqueNominal), EqualityMember(EqualityField, EqualityPayload), CheckedRecord, CheckedUnion, AcceptedTraits, AcceptedTraitContracts, CanonicalContracts, DictLiteralFunctions, ImplementationTable, family_for, implementation_rows, implementation_table, CanonicalEquality, canonical_equality, canonical_owner, CanonicalOrdering, canonical_ordering, CanonicalOperation, canonical_operation, AcceptedTrait, AcceptedTraitMethod, AcceptedImplementation, ImplementedMethod, ImplementedBody(AuthoredMethod, TraitDefault, StructuralEquality), TypeParameterId, LocatedTrait, TraitRequirement, aggregate_head, aggregate_owner, receiver_arguments, receiver_type, type_head, parameter_owner, ImplementationHeader, FunctionSignature, TypeUse, TypeRef(ParameterType, VoidType, NominalType), TypeParameterOwner(TraitDeclaration), type_parameter_id
 	./equality: equality_template
 	./signatures: AcceptedFunction
 	../namespace/builtins: DesignatedBoolean
-	../namespace/namespace: Namespace, TypeHead(PrimitiveHead, ListHead, RecordHead, UnionHead, OpaqueHead), named_trait, implementation_trait, resolve_trait
+	../namespace/namespace: Namespace, FunctionSource(DeclaredHere), NamedValue(NamedFunction), TypeHead(PrimitiveHead, ListHead, RecordHead, UnionHead, OpaqueHead), named_trait, named_type, named_value, implementation_trait, resolve_trait
 	../parse/assemble: ParsedContents
 	../utils/ids: DeclarationInventory, RecordRow, UnionRow, FunctionId, VariantId, TraitMethodId, TraitMethodDeclaration(RequiredMethod, DefaultMethod), trait_method_header, trait_method_number, trait_method_owner, TraitRow, TraitMethodRow, ImplRow, TraitId, inventory_traits, inventory_implementations, inventory_functions, inventory_records, inventory_unions, inventory_opaques, trait_number, impl_number, function_number, record_number, union_number, opaque_number, variant_owner
 	../utils/names: NameTable, contextual_words, foundation_words, name_spelling, NameId
@@ -452,6 +452,37 @@ pure func designated_trait(parsed: ParsedContents, namespace: Namespace, word: N
 	named_trait(namespace, parsed.foundation.prelude, word)
 
 
+-- A pure function `module` itself declares, public or not; an import never
+-- counts. A literal is pure, so pure code may write one.
+private pure func declared_function(parsed: ParsedContents, namespace: Namespace, module: ModuleId, word: NameId) -> Option[FunctionId]:
+	match named_value(namespace, module, word):
+		Some(NamedFunction(id, DeclaredHere)):
+			match inventory_functions(parsed.declarations).get(function_number(id)):
+				Some(row):
+					if row.declaration.purity == Pure:
+						Some(id)
+					else:
+						None
+				None: None
+		_: None
+
+
+-- The prelude selects Dict through its ordinary binding, and a literal calls
+-- the functions Dict's own module declares, so no name in the literal's
+-- scope can stand in. A prelude without an opaque Dict offers no literals.
+private pure func dict_literal_functions(parsed: ParsedContents, namespace: Namespace) -> Option[DictLiteralFunctions]:
+	words = foundation_words(parsed.names)
+	declaring: Option[ModuleId] = match named_type(namespace, parsed.foundation.prelude, words.dict_word).map(pure func(named): named.head):
+		Some(OpaqueHead(id)): inventory_opaques(parsed.declarations).get(opaque_number(id)).map(pure func(row): row.declaration.module)
+		_: None
+	match declaring:
+		None: None
+		Some(module):
+			match (declared_function(parsed, namespace, module, words.empty_word), declared_function(parsed, namespace, module, words.with_capacity_word), declared_function(parsed, namespace, module, words.set_word)):
+				(Some(empty), Some(with_capacity), Some(set)): Some({ empty = empty, with_capacity = with_capacity, set = set })
+				_: None
+
+
 private pure func designates(designated: Option[TraitId], row: TraitRow) -> Bool:
 	match designated:
 		Some(owner): owner == row.id
@@ -477,7 +508,8 @@ pure func accept_trait_contracts(
 		{ arithmetic = NegatableTrait, designated = designated_trait(parsed, namespace, words.negatable_word), member = words.negate_word },
 	]
 	var canonical: CanonicalContracts = {
-		equality = None, ordering = None, addition = None, subtraction = None, multiplication = None, division = None, remainder = None, negation = None
+		equality = None, ordering = None, addition = None, subtraction = None, multiplication = None, division = None, remainder = None, negation = None,
+		dict_literal = dict_literal_functions(parsed, namespace)
 	}
 	var declarations: List[AcceptedTrait] = []
 	var failure: Option[CheckError] = None

@@ -139,6 +139,15 @@ open-addressing index. Int, String and Bool implement `DictKey` with a bodyless
 methods are implicit; `empty` and `with_capacity` are reached as
 `import: dict as D`. All functions are pure.
 
+Literals need no import. `{}` is `empty()` and takes its key and value types from
+the expected type; without one it is rejected with "an empty Dict needs its
+type", so write `name: Dict[K, V] = {}`. `{k1 => v1, k2 => v2}`, with an optional
+trailing comma, is `with_capacity(2)` then `set(k1, v1)` and `set(k2, v2)`, left
+to right and each key before its value, so a repeated key keeps its first
+position and its last value. Checking calls these functions of this module by
+identity, so no other `set` can stand in, and a literal costs what those calls
+cost.
+
 | Function | Contract |
 | --- | --- |
 | `empty[K: DictKey, V]() -> Dict[K, V]` | No entries. |

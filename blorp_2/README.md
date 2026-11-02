@@ -186,8 +186,31 @@ order of the rest; a removed key set again goes last. `keys`, `values` and
 `entries` list in that order. A missing key is `None` from `get`, the default from
 `get_or`, and no change from `remove`. Two Dicts are equal when their lengths match
 and every key of one has an equal value in the other, whatever the order. Updating
-a uniquely owned Dict reuses its Lists; updating a shared one copies. There are no
-literals, no `for` over a Dict and no Float keys yet.
+a uniquely owned Dict reuses its Lists; updating a shared one copies. There is no
+`for` over a Dict and there are no Float keys yet.
+
+Literals build a Dict without an import. `{}` is an empty Dict, never an empty
+record, and takes its key and value types from the expected type: without one it
+is rejected with "an empty Dict needs its type", so write
+`name: Dict[K, V] = {}`, and against a record type it is an ordinary type mismatch.
+`{k1 => v1, k2 => v2}` takes its types from its entries, unified as a List
+literal's elements are, or from the expected type, and admits a trailing comma.
+
+```blorp
+func main() -> Int:
+    none: Dict[String, Int] = {}
+    scores = {"alice" => 95, "bob" => 80, "alice" => 99}
+    scores.get_or("alice", 0) + scores.length() + none.length()
+```
+
+Checking rewrites a literal as calls to the functions of the module that declares
+the prelude's `Dict`, found by identity when the program is admitted, so a user's
+own `set` or `with_capacity` cannot change its meaning: `{}` is `empty()`, and n
+entries are `with_capacity(n)` then one `set` per entry, left to right, each key
+before its value. A repeated key therefore keeps its first position and its last
+value, as `scores` does above with `alice` first at 99. Later phases see only those
+calls, so a literal costs what the written calls cost. Outside a Dict entry, `=>`
+is rejected with a hint to write `>=` or a lambda.
 
 Function type parameters declare their required traits with `:` and combine
 bounds with `+`. Each generic body is checked once against those declarations;
@@ -406,8 +429,9 @@ default bodies; a missing or malformed member is rejected where the trait is
 admitted, even when no operator uses it.
 
 `->` is lexed before `>`, and `a<-1` compares with `-1`, a minus folded into
-the literal. `=>`, `=<` and `<>` are rejected with help naming `>=` or a
-lambda, `<=`, and `!=`. Compiler and library source use ordering operators.
+the literal. `=<` and `<>` are rejected with help naming `<=` and `!=`, and so
+is `=>` outside a Dict entry, with help naming `>=` or a lambda. Compiler and
+library source use ordering operators.
 
 ## Arithmetic operators
 
@@ -1763,7 +1787,7 @@ one or more finite fields after substitution. Union variants have zero or more o
 specialize to Int, Float, String, Void, a List of any supported finite type, a finite record, or another finite inline union. A function
 body has zero or more ordered binding or Void expression statements followed
 by a final expression or a tail match with inline arm results or statement blocks. Expressions
-start with `void`, a signed Int64 or decimal Float64 literal, a quoted UTF-8 String literal, a pipe String or raw block, a binding or variant name, a record literal or update,
+start with `void`, a signed Int64 or decimal Float64 literal, a quoted UTF-8 String literal, a pipe String or raw block, a binding or variant name, a record literal or update, a Dict literal such as `{"a" => 1}` or `{}`,
 an application with an ordered list of arguments, a list literal such as
 `[1, 2]` or `[]`, a qualified name or call
 such as `IntOps.add(1, 2)` where `IntOps` is a module alias of the import
@@ -2026,8 +2050,9 @@ Lexical and layout rules:
   helper return type, receiving parameter or existing binding reassignment.
   Every field appears exactly once. Expressions evaluate in written order;
   field order in the literal may differ from declaration order. A new inferred
-  binding alone supplies no record context. `{}` parses and reports the first
-  missing field. Declarations and literals may span lines inside their
+  binding alone supplies no record context. A literal names at least one
+  field: `{}` is an empty Dict, so a record expected there is a type
+  mismatch. Declarations and literals may span lines inside their
   braces and allow a trailing comma; field assignments are unsupported.
 - `{ pair | second = 9, first = 7 }` preserves the base's nominal type and
   type arguments. The base executes once, replacements execute in written
