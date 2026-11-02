@@ -1,13 +1,23 @@
 # Arithmetic operators
 
-Status: approved 2026-10-30, with the owner decisions below accepted as
-recommended; milestones 1, 2 and 3 implemented. On 2026-10-31 the owner raised
-milestone 3's instruction and line ceilings (see [Cost](#cost)); its
-[cost report](../benchmarks/results/blorp2-arithmetic-operators-2026-10-31.md)
-records the result. This plan mirrors [the ordering
-operators plan](ORDERING_OPERATORS_PLAN.md), whose rules apply unless a
-section below says otherwise. It builds on [supertraits](SUPERTRAITS_PLAN.md) milestone 1.
-The legacy compiler is the precedent; the
+Status: complete. Approved 2026-10-30 with the owner decisions below accepted
+as recommended. The milestones landed as follows:
+1. library traits, `d355cdb70`;
+2. contract shapes, `326770d01`;
+3. operators, `395731510`, after the owner raised its instruction and line
+   ceilings on 2026-10-31 (see [Cost](#cost) and the
+   [cost report](../benchmarks/results/blorp2-arithmetic-operators-2026-10-31.md));
+4. seed, `c1de434f4`;
+5. migration, `3ce36c8dd` and `a9120b4b1`, together with the ordering
+   migration.
+
+Mixing bits into the `HashMap` home-slot hash (`probe` in
+`src/utils/hash_map.brp`) remains a follow-up.
+
+This plan mirrors [the ordering operators plan](ORDERING_OPERATORS_PLAN.md),
+whose rules apply unless a section below says otherwise. It builds on
+[supertraits](SUPERTRAITS_PLAN.md) milestone 1. The legacy compiler is the
+precedent; the
 [deviations](#deviations-from-the-legacy-compiler) section lists where this
 plan differs and why.
 

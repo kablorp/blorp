@@ -1,9 +1,11 @@
 # Built-in ordering operators
 
-Status: step 2 adds the operators. Step 0 made ordering the ordinary trait
-`Orderable` in `_base.brp` (`8eb7777c5`), and step 1 extracted the shared
-canonical member checks (`c45796a03`). The seed rotation and the source
-migration follow as separate steps. This document
+Status: complete. Step 0 made ordering the ordinary trait `Orderable` in
+`_base.brp` (`8eb7777c5`), and step 1 extracted the shared canonical member
+checks (`c45796a03`). Step 2 added the operators (`49f77bb05`), and the seed
+rotation followed (`bdb9aeef2`). The source migration landed with the
+arithmetic one (`a9120b4b1`; see
+[the arithmetic operators plan](ARITHMETIC_OPERATORS_PLAN.md)). This document
 mirrors [the equality operators plan](EQUALITY_OPERATORS_PLAN.md), whose rules
 apply unless a section below says otherwise.
 
