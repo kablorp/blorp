@@ -1,6 +1,6 @@
 # Blorp 2 Dict
 
-Status: approved 2026-11-02, with the decisions below; no phase started. Each phase gets its own implementation brief.
+Status: approved 2026-11-02, with the decisions below. Phase 0 is done ([spike report](../benchmarks/results/blorp2-dict-spike-2026-11-02.md)), and its findings are folded in below; phase 1 is next. Each phase gets its own implementation brief.
 
 ## Problem
 
@@ -94,7 +94,11 @@ All of these are pure. `n` is the number of live entries.
 - **How checking finds `empty`, `with_capacity` and `set` (D6, resolved): by identity, not by name lookup.**
   - The prelude fixes which declaration is `Dict`. After names resolve, checking rewrites a literal as calls to the functions declared in the module that declares that `Dict`.
   - A user's own `set`, a local `dict.brp` or an alias can't stand in, because user code can't add declarations to that module. Visibility doesn't matter either: the free functions aren't imported, and they don't need to be.
-  - Checking needs a small path that builds a call to a known function rather than to a resolved name. Phase 2 confirms its size first.
+  - Checking needs a path that builds calls to known functions rather than to resolved names. Phase 0 estimated it at about 140 to 190 production lines in `check/`, following the operator precedent (`method_id_contract`, `CanonicalContracts`):
+    - a `declared_id_contract` helper;
+    - the Dict function ids, located once at admission;
+    - a planned Dict-literal base with a worklist step. A nested `set` chain can't be written as parsed-expression arguments, so this needs its own base;
+    - the empty-literal error.
   - Rejected alternatives:
     - the test-entry route (a special load of the library file, a synthetic import under an alias nobody can write, and a rewrite at assembly): the prelude already loads `dict.brp`;
     - new designation machinery for library functions.
@@ -137,8 +141,8 @@ The design follows CPython's compact dict: a dense, ordered entry array plus a s
 ```blorp
 -- Entry i is keys[i] with values[i]; live[i] is False once it is removed.
 -- slots[s] is EMPTY, DELETED, or the position of the entry whose probe passes s.
--- Every rebuild compacts, so a DELETED slot always belongs to a dead entry; set
--- can reuse a DELETED slot, so there may be fewer DELETED slots than dead entries.
+-- Every entry, live or dead, owns exactly one non-EMPTY slot until the next
+-- rebuild, which compacts: DELETED slots and dead entries are the same count.
 private record DictContents[K: DictKey, V] {
     keys: List[K],
     values: List[V],
@@ -155,12 +159,14 @@ opaque type Dict[K: DictKey, V] = DictContents[K, V]
 
 ### Probing
 
-- **Home slot:** the key's hash as a non-negative remainder by the slot count. Hashes may be any signed Int, including `INT_MIN`.
+- **Home slot:** `(key.hash() * HASH_SPREAD)` as a non-negative remainder by the slot count. `HASH_SPREAD` is a named odd 64-bit constant, and the multiply wraps. Hashes may be any signed Int, including `INT_MIN`.
+  - The spread is required. With identity hashing, sequential Int keys fill one contiguous run of slots, so a lookup that starts inside the run walks to its end. Phase 0 measured 125.0 G instructions on `dict_ops` without the spread against 3.84 G with it; today's `HashMap` pays 133 k instructions per missed lookup for the same reason.
+  - `Hashable for Int` stays identity; the spread belongs to the table.
 - **Slot counts are 2^k − 1:** 7, 15, 31 and so on.
-  - A power-of-two count would keep only the low bits, so power-of-two strides, like the compiler's `2 * name + kind`, would pile into a few slots. 2^k − 1 shares no factor with 2, so those strides spread, and sequential ids land in distinct slots.
+  - A power-of-two count would keep only the low bits, so power-of-two strides, like the compiler's `2 * name + kind`, would pile into a few slots. 2^k − 1 shares no factor with 2, so those strides spread.
   - Composite counts (63 = 7·9, 255 = 3·5·17 …) still cluster strides that share their factors, a weakness identity hashing accepts, as the arithmetic plan notes. The constant-hash and stride tests pin correctness, not performance.
-- **Linear probing:** step +1, wrapping. A lookup stops at `EMPTY` (absent) or at an entry with an equal key, probing past `DELETED`. `set` of a new key reuses the first `DELETED` slot on its path, otherwise the `EMPTY` slot.
-- **Termination:** an `EMPTY` slot always exists. Each occupied or `DELETED` slot belongs to a distinct entry, live or dead, so they number at most `keys.length()`, which the rebuild trigger keeps within 2/3 of the slots.
+- **Linear probing:** step +1, wrapping. A lookup stops at `EMPTY` (absent) or at an entry with an equal key, probing past `DELETED`. `set` of a new key takes the `EMPTY` slot where its probe stops. `DELETED` slots are not reused: the rebuild trigger counts entries, dead ones included, so reuse would never delay a rebuild, and dropping it keeps one slot per entry.
+- **Termination:** an `EMPTY` slot always exists. The non-`EMPTY` slots number exactly `keys.length()`, which the rebuild trigger keeps within 2/3 of the slots.
 
 ### Rebuild
 
@@ -183,7 +189,11 @@ With `dead_count == 0`, they return the stored List: an O(1) shared reference, c
 
 ### Ownership
 
-This is ordinary library code; lower, own, verify and emit need nothing new. `set` on a unique Dict projects its fields first (O2), and `append` or `set` on each field List reuses its buffer (L1/L2). The record itself is reallocated on each update until O3 cell reuse lands, which is the same as `hash_map.brp` today.
+This is ordinary library code; lower, own, verify and emit need nothing new. Two shapes are required, both measured in phase 0:
+- **Updates use record-update syntax,** `{ contents | keys = contents.keys.append(key), ... }`. O2 then projects the fields before the replacements run, so each field List stays unique and `append` or `set` reuses its buffer (L1/L2): 1 allocation per `set`, linear. A fresh literal built from the old record's fields, `{ keys = contents.keys.append(key), ... }`, keeps the old record alive while its Lists are appended. That costs 5 allocations per `set` and is quadratic.
+- **Rebuild fills local `var` Lists and builds the record once** (above). Today's `HashMap` updates `slots` in its record inside `reindexed`'s loop, and is quadratic for that reason: it grows about 15× for each 4× of keys.
+
+The record itself is reallocated on each update until O3 cell reuse lands. That costs 527 instructions per update, about 45% of a `set` or `remove`.
 
 ### Why not a C runtime table like legacy's Swiss table
 
@@ -198,7 +208,7 @@ Each phase lands green on its own, with self-compile allocations, `-O0`/`-O2` in
 
 | Phase | Content | Ends with |
 | --- | --- | --- |
-| 0, spike | Prototype `dict.brp` with Int and String keys. Port `benchmarks/blorp/dict_ops.brp` to the current Blorp 2 surface: it uses `0..iters` and `+=`. Measure the prototype, the current `HashMap` and legacy on it, plus a 100,000-operation mixed workload: set, get, remove half, set again. Measure String hashing allocations. | The phase 1 ceilings, set from those numbers |
+| 0, spike (done) | A prototype `dict.brp`, a `dict_ops` port and measurements: [report](../benchmarks/results/blorp2-dict-spike-2026-11-02.md). The prototype, the port and the unit suite are on branch `blorp2-dict-spike` (`f342a8039`), the starting point for phase 1. | The phase 1 ceilings below |
 | 1, Dict | `dict.brp` with `DictKey`, the operations, equality; `DictKey` for `Int`, and `Hashable`/`DictKey` for `String` and `Bool`; and the probing, churn, compaction, linearity and ownership tests | Dict usable through calls |
 | 2, literals | Lexer, parser, AST, checking rewrite, grammar and tests, as in Literals | `{}` and `{k => v}` work |
 | 3, HashMap | Move the six `HashMap` users to `Dict`, keeping their Int keys, and delete `utils/hash_map.brp`. Update the docs that describe it: `blorp_2/README.md`'s HashMap sections (around lines 157 and 251-265), `_base.brp`'s comment, and `ROADMAP.md`'s "once Blorp has a dict" note and its Set/Dict key-semantics deferral, which should link this plan | No stopgap map |
@@ -214,10 +224,21 @@ Also fix in phase 1, where stale:
 
 These are set before implementation. A miss means stop and rescope.
 
-- **Phase 1:** set from phase 0's numbers. Provisionally:
-  - no slower than the current `HashMap` (±5%) on the Int-key workload;
-  - within 4× legacy instructions on the ported `dict_ops`;
-  - `dict.brp` at most about 300 lines.
+- **Phase 1,** from phase 0's numbers (the prototype is the baseline; derivations are in the report). Instructions are per operation, net of process start:
+
+  | Measure | Ceiling | Measured in phase 0 |
+  | --- | --- | --- |
+  | Build linearity | instructions per key at 65,536 keys at most 1.15× that at 4,096; at most 1.02 allocations per key | 1.01×; 1.013 |
+  | `set`, `remove` | at most 1,400 instructions and 1.02 allocations each | 1,182 and 1,166 |
+  | Lookup hit, miss | at most 230 and 185 instructions, no allocations; a hit at most 2× today's `HashMap` hit (113, so 226) | 196 and 154 |
+  | Slot spread | sequential keys and strides of 7 and 1,024 average fewer than 8 probes per miss | identity hashing: 133 k instructions per miss |
+  | String keys | at most 1.2× the Int cost per mixed operation; hashing allocates nothing | 1.11×; 0 |
+  | Churn | rebuilds at most 3 × cycles / live + 1 for live above 24, at most cycles / 8 below; at most 3,100 instructions per remove-then-set cycle; at most 2.1 allocations per cycle for live of 1,000 or more, 2.6 below | 273 at live 1,000; 2,904 instructions and 2.5 allocations at live 10; 2.02 at live 1,000 |
+  | `dict_ops` | at most 4,300 M instructions, 3.1 M allocations, 1.5 MB peak heap | 3,843 M; 3,017,317; 1.34 MB |
+  | Against legacy | at most 7× on every `dict_ops` section except iterate | about 5.9× |
+  | `dict.brp` | at most 300 lines, including equality, `entries` and `is_empty` | 258 without them, so the margin is small |
+
+  The provisional "within 4× legacy" passed only because legacy's iterate allocates a tuple per entry. "No slower than `HashMap`" compared against the no-collision case of a map whose build and misses are 100× to 1,000× slower, so the table above replaces both.
 - **Phases 3 to 5, per step:**
   - self-compile `-O2` instructions rise by at most 0.5%;
   - strict allocations rise by at most 1%;
@@ -234,6 +255,7 @@ These are set before implementation. A miss means stop and rescope.
 - **Probing and rebuild:**
   - a constant `Hashable`;
   - strides of 1,024 and of 7;
+  - absent sequential Int keys looked up within a step or instruction budget, which fails with `HASH_SPREAD` set to 1;
   - removing every key, then reuse;
   - the compaction boundary;
   - a churn loop of remove and set that stays within an allocation bound.
