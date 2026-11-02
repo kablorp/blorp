@@ -1,6 +1,6 @@
 # Blorp 2 Dict
 
-Status: approved 2026-11-02, with the decisions below. Phase 0 is done ([spike report](../benchmarks/results/blorp2-dict-spike-2026-11-02.md)), and its findings are folded in below; phase 1 is next. Each phase gets its own implementation brief.
+Status: approved 2026-11-02, with the decisions below. Phase 0 is done and phase 1 is done ([spike report](../benchmarks/results/blorp2-dict-spike-2026-11-02.md), [phase 1 results](../benchmarks/results/blorp2-dict-phase1-2026-11-02.md)); their findings are folded in below, and phase 2 (literals) is next. Each phase gets its own implementation brief.
 
 ## Problem
 
@@ -90,7 +90,7 @@ All of these are pure. `n` is the number of live entries.
   - Evaluation is left to right, each key then its value.
   - The meaning is successive `set` calls, so a repeated key keeps its first position and the last value.
 - **Lowering:** checking rewrites a literal as ordinary calls, `{}` as `empty()` and `{k1 => v1, k2 => v2}` as `with_capacity(2).set(k1, v1).set(k2, v2)`. Lower, own, verify, specialize and emit see only calls. The `set` chain on a fresh unique Dict updates in place, with no tuples or pair List.
-- **Prelude:** it imports `dict: Dict, Dict methods`, the type and its UFCS receiver methods, exactly as it imports `list: List methods`. Free functions such as `empty` and `with_capacity` are not imported. Code reaches them through `import: dict as D`, or uses literals.
+- **Prelude:** it imports `dict: Dict`, the type and its UFCS receiver methods. (`Type methods` is for a type declared elsewhere, as `list: List methods` is, because `List` comes from `_base`; `module: Type` already enables the module's receiver functions for its own type.) Free functions such as `empty` and `with_capacity` are not imported. Code reaches them through `import: dict as D`, or uses literals.
 - **How checking finds `empty`, `with_capacity` and `set` (D6, resolved): by identity, not by name lookup.**
   - The prelude fixes which declaration is `Dict`. After names resolve, checking rewrites a literal as calls to the functions declared in the module that declares that `Dict`.
   - A user's own `set`, a local `dict.brp` or an alias can't stand in, because user code can't add declarations to that module. Visibility doesn't matter either: the free functions aren't imported, and they don't need to be.
@@ -209,16 +209,12 @@ Each phase lands green on its own, with self-compile allocations, `-O0`/`-O2` in
 | Phase | Content | Ends with |
 | --- | --- | --- |
 | 0, spike (done) | A prototype `dict.brp`, a `dict_ops` port and measurements: [report](../benchmarks/results/blorp2-dict-spike-2026-11-02.md). The prototype, the port and the unit suite are on branch `blorp2-dict-spike` (`f342a8039`), the starting point for phase 1. | The phase 1 ceilings below |
-| 1, Dict | `dict.brp` with `DictKey`, the operations, equality; `DictKey` for `Int`, and `Hashable`/`DictKey` for `String` and `Bool`; and the probing, churn, compaction, linearity and ownership tests | Dict usable through calls |
+| 1, Dict (done) | `dict.brp` with `DictKey`, the operations, equality; `DictKey` for `Int`, and `Hashable`/`DictKey` for `String` and `Bool`; and the probing, churn, compaction, linearity and ownership tests: [results](../benchmarks/results/blorp2-dict-phase1-2026-11-02.md). Equality needed trait implementations on generic opaque types (83bc73dac) and so a seed that has them. | Dict usable through calls |
 | 2, literals | Lexer, parser, AST, checking rewrite, grammar and tests, as in Literals | `{}` and `{k => v}` work |
 | 3, HashMap | Move the six `HashMap` users to `Dict`, keeping their Int keys, and delete `utils/hash_map.brp`. Update the docs that describe it: `blorp_2/README.md`'s HashMap sections (around lines 157 and 251-265), `_base.brp`'s comment, and `ROADMAP.md`'s "once Blorp has a dict" note and its Set/Dict key-semantics deferral, which should link this plan | No stopgap map |
 | 4, names | `utils/names.brp` becomes a `Dict[String, NameId]`. An id is its spelling's position in `keys()`, since names are never removed, so the separate `spellings` List and the bucket functions are deleted | No bucket table |
 | 5, record keys | Written `Hashable`/`DictKey` for `TypeHead` and the opaque ids. `model.brp`'s `implementation_table` becomes a Dict keyed by `TypeHead`. Specialize's **sealed** instance tables become Dicts keyed by their full keys. Its **slot** tables keep `IndexedList`, because their digests deliberately hash only the head while `resolve_partial` rewrites pending references inside the stored key. Replace the squashed pair keys where a written hash is cheap. | Fewer digests and hints |
 | later | `Set`; `update`/`update_or` once a List take-or-update builtin exists; set-shaped scans moved where measured or where the change deletes code | |
-
-Also fix in phase 1, where stale:
-- ROADMAP.md's O2 section still says "pending review", though O2 is on main;
-- the README says the pinned seed predates supertraits.
 
 ## Ceilings
 
@@ -235,7 +231,8 @@ These are set before implementation. A miss means stop and rescope.
   | String keys | at most 1.2× the Int cost per mixed operation; hashing allocates nothing | 1.11×; 0 |
   | Churn | rebuilds at most 3 × cycles / live + 1 for live above 24, at most cycles / 8 below; at most 3,100 instructions per remove-then-set cycle; at most 2.1 allocations per cycle for live of 1,000 or more, 2.6 below | 273 at live 1,000; 2,904 instructions and 2.5 allocations at live 10; 2.02 at live 1,000 |
   | `dict_ops` | at most 4,300 M instructions, 3.1 M allocations, 1.5 MB peak heap | 3,843 M; 3,017,317; 1.34 MB |
-  | Against legacy | at most 7× on every `dict_ops` section except iterate | about 5.9× |
+  | Against legacy | at most 7× on the `dict_ops` sections other than iterate, taken together | about 5.9× (the remove section alone is 8.0×) |
+  | Prelude | accepted 2026-11-02 at +0.82% `-O2` and +1.84% `-O0` self-compile instructions, +0.36% strict allocations, against a 0.5% instruction ceiling: checking `dict.brp` in every compilation costs about what any 295 lines does, and phases 3 to 5 import it into the compiler anyway | — |
   | `dict.brp` | at most 300 lines, including equality, `entries` and `is_empty` | 258 without them, so the margin is small |
 
   The provisional "within 4× legacy" passed only because legacy's iterate allocates a tuple per entry. "No slower than `HashMap`" compared against the no-collision case of a map whose build and misses are 100× to 1,000× slower, so the table above replaces both.
@@ -271,7 +268,7 @@ These are set before implementation. A miss means stop and rescope.
 - **D3, resolved:** a `DictKey` bundle trait over `Hashable + Equatable`. Hashable stays independent.
 - **D4, resolved:** no `for` over a Dict for now.
 - **D5, resolved:** unseeded, deterministic hashes.
-- **D6, resolved:** the prelude imports `Dict` and its methods only. Literal lowering finds `empty`, `with_capacity` and `set` by identity, in the module that declares the prelude's `Dict`.
+- **D6, resolved:** the prelude imports `dict: Dict`, the type and its receiver methods only. Literal lowering finds `empty`, `with_capacity` and `set` by identity, in the module that declares the prelude's `Dict`.
 
 **D2: Float keys elsewhere.** These are the standard semantics of each language:
 

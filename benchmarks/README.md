@@ -57,9 +57,10 @@ an error when the selected workload has a Blorp 2 port; unsupported rows show
 `-`. Listing the workloads needs neither compiler.
 
 The initial ports are `numeric_loop`, `fib`, `binary_trees`, `compiler_ast`,
-`list_ops`, and `compiler_emit`. They preserve the existing inputs, iteration
-counts and result checksums. Both Blorp compilers' generated C uses the same
-native optimization flags and the same whole-main timing wrapper.
+`list_ops`, `compiler_emit`, and `dict_ops` (over the `dict` module, iterating
+`D.values` because a Dict has no `for` loop yet). They preserve the existing
+inputs, iteration counts and result checksums. Both Blorp compilers' generated C
+uses the same native optimization flags and the same whole-main timing wrapper.
 The `blorp2/blorp time` note is Blorp 2 elapsed time divided by legacy elapsed
 time: a value above 1 means Blorp 2 took longer. The `blorp2/blorp
 instructions` note, shown with `BENCH_RESOURCE_STATS=1`, is the same ratio for
@@ -96,7 +97,7 @@ These run when the filter is omitted or set to `all`.
 | `string` | Checksum-based search, replace, substring, case conversion, split, trim, and reverse | blorp, C, Go, OCaml, Python |
 | `array_sum` | Explicit integer vector sum (10k iterations, 1000 elements) | blorp, C, Go, OCaml, Python |
 | `array_ops` | Integer vector add + scale + sum (10k iterations) | blorp, C, Go, OCaml, Python |
-| `dict_ops` | Hash map build/lookup/remove/iterate | blorp, Go, OCaml, Python |
+| `dict_ops` | Hash map build/lookup/remove/iterate | blorp, Blorp 2, Go, OCaml, Python |
 | `list_ops` | List append/sort/filter/fold/reverse/concat | blorp, Blorp 2, Go, OCaml, Python |
 | `set_ops` | Hash set build/contains/union/intersect/diff | blorp, Go, OCaml, Python |
 | `threaded_cpu_map` | Fixed-width CPU-bound worker partitioning | blorp, C, Go, OCaml, Python |

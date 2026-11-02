@@ -1,0 +1,298 @@
+-- An insertion-ordered map from DictKey keys to values.
+--
+-- Entries live in parallel Lists in first-insertion order and never move; an
+-- open-addressing index of slots finds one. Removal marks an entry dead and its
+-- slot DELETED; a rebuild copies the live entries, in order, into fresh Lists
+-- and a fresh index at 1/2 load. Like a List, a Dict is a value: updated in
+-- place when unique, copied on write when shared.
+import:
+    _base: Int, String, List, Bool(True, False), Option(Some, None), Hashable
+    bool: and
+    traits: Equatable
+    int: max, min, Int methods
+    list: repeat, List methods
+
+
+-- A Dict key is hashed to find its slot and compared to tell collisions apart.
+trait DictKey: Hashable + Equatable
+
+implements DictKey for Int
+
+implements DictKey for String
+
+implements DictKey for Bool
+
+
+-- Slots are plain Ints because an `Option[Int]` per slot boxes every position.
+private EMPTY_SLOT: Int = -1
+
+private DELETED_SLOT: Int = -2
+
+-- Slot counts are 2^k - 1, so power-of-two strides still spread.
+private MINIMUM_SLOTS: Int = 7
+
+-- `with_capacity` reserves at most this many entries (2^20, a 16 MB index); a
+-- larger request is a hint and the Dict grows when it fills. The clamp also keeps
+-- `count * 3` and the slot doubling from wrapping, which would loop `slot_count`.
+private MAXIMUM_RESERVED_ENTRIES: Int = 1048576
+
+-- Multiplying the hash by an odd constant before taking the remainder spreads
+-- sequential hashes, such as Int ids. Without it linear probing turns the keys
+-- 0..n into one run of occupied slots, and a lookup that starts inside the run
+-- walks to its end. This is the 64-bit golden-ratio constant, as a signed Int.
+private HASH_SPREAD: Int = -7046029254386353131
+
+-- A new entry may not push the entries, dead ones included, past 2/3 of the slots.
+private GROWTH_LOAD_NUMERATOR: Int = 2
+
+private GROWTH_LOAD_DENOMINATOR: Int = 3
+
+-- A rebuild leaves the live entries at 1/2 of the slots, so a churn of remove
+-- and set cannot trip another rebuild within a few operations.
+private REBUILT_LOAD_NUMERATOR: Int = 1
+
+private REBUILT_LOAD_DENOMINATOR: Int = 2
+
+-- Removal compacts once the dead entries outnumber the live ones, but never for
+-- fewer than this many.
+private MINIMUM_COMPACTION: Int = 8
+
+
+-- `values[i]` and `live[i]` belong to `keys[i]`. `slots[s]` is EMPTY_SLOT,
+-- DELETED_SLOT, or the position of the entry whose probe passes s.
+private record DictContents[K: DictKey, V] {
+    keys: List[K],
+    values: List[V],
+    live: List[Bool],
+    slots: List[Int],
+    dead_count: Int
+}
+
+
+opaque type Dict[K: DictKey, V] = DictContents[K, V]
+
+
+-- The fewest slots, from MINIMUM_SLOTS in steps of 2^k - 1, that hold `count`
+-- entries within the load.
+private pure func slot_count(count: Int, numerator: Int, denominator: Int) -> Int:
+    var slots = MINIMUM_SLOTS
+    while count * denominator > slots * numerator:
+        slots = slots * 2 + 1
+    slots
+
+
+pure func empty[K: DictKey, V]() -> Dict[K, V]:
+    with_capacity(0)
+
+
+-- A Dict that holds `count` entries (at most MAXIMUM_RESERVED_ENTRIES) before it grows.
+pure func with_capacity[K: DictKey, V](count: Int) -> Dict[K, V]:
+    no_keys: List[K] = []
+    no_values: List[V] = []
+    no_live: List[Bool] = []
+    size = slot_count(max(0, min(count, MAXIMUM_RESERVED_ENTRIES)), GROWTH_LOAD_NUMERATOR, GROWTH_LOAD_DENOMINATOR)
+    into_opaque Dict({ keys = no_keys, values = no_values, live = no_live, slots = repeat(EMPTY_SLOT, size), dead_count = 0 })
+
+
+-- The key's hash as a non-negative remainder; hashes may be any signed Int.
+private pure func home_slot[K: DictKey](key: K, size: Int) -> Int:
+    remainder = (key.hash() * HASH_SPREAD) % size
+    if remainder < 0:
+        remainder + size
+    else:
+        remainder
+
+
+-- Linear probing steps to the next slot, wrapping at the end of the index.
+private pure func next_slot(slot: Int, size: Int) -> Int:
+    if slot + 1 == size:
+        0
+    else:
+        slot + 1
+
+
+-- The first EMPTY slot on `key`'s probe path in an index with no DELETED slots.
+-- An EMPTY slot always exists: at most 2/3 of the slots are occupied.
+private pure func free_slot[K: DictKey](slots: List[Int], key: K) -> Int:
+    size = slots.length()
+    var slot = home_slot(key, size)
+    while slots.get_or(slot, EMPTY_SLOT) != EMPTY_SLOT:
+        slot = next_slot(slot, size)
+    slot
+
+
+-- The slot holding `key`, or the EMPTY slot that ends its probe path, probing
+-- past DELETED slots. A new key never takes a DELETED slot: every entry, live or
+-- dead, owns exactly one non-EMPTY slot until the next rebuild, so an EMPTY
+-- slot always exists. `List.get_or` and `get` take defaults even in range: a slot
+-- is a remainder by the slot count and an entry position is below keys.length(),
+-- so the defaults are never read.
+private pure func probe[K: DictKey, V](contents: DictContents[K, V], key: K) -> Int:
+    size = contents.slots.length()
+    var slot = home_slot(key, size)
+    var searching: Bool = True
+    while searching:
+        position = contents.slots.get_or(slot, EMPTY_SLOT)
+        searching = if position == EMPTY_SLOT:
+            False
+        else if position == DELETED_SLOT:
+            True
+        else:
+            match contents.keys.get(position):
+                Some(candidate): candidate != key
+                None: False
+        if searching:
+            slot = next_slot(slot, size)
+    slot
+
+
+-- The live entries in order, in fresh Lists and a fresh index with room for one
+-- more entry. Nothing here updates a record field inside a loop: that stays
+-- quadratic (ROADMAP, O2 known limits), so it fills locals and builds the record
+-- once. The None arm is unreachable: `index` is below keys.length().
+private pure func rebuilt[K: DictKey, V](old: DictContents[K, V]) -> DictContents[K, V]:
+    live_count = old.keys.length() - old.dead_count
+    var kept_keys: List[K] = []
+    var kept_values: List[V] = []
+    var slots = repeat(EMPTY_SLOT, slot_count(live_count + 1, REBUILT_LOAD_NUMERATOR, REBUILT_LOAD_DENOMINATOR))
+    var index = 0
+    for key in old.keys:
+        if old.live.get_or(index, False):
+            match old.values.get(index):
+                Some(value):
+                    slots = slots.set(free_slot(slots, key), kept_keys.length())
+                    kept_keys = kept_keys.append(key)
+                    kept_values = kept_values.append(value)
+                None: void
+        index = index + 1
+    { keys = kept_keys, values = kept_values, live = repeat(True, kept_keys.length()), slots = slots, dead_count = 0 }
+
+
+-- `contents` with a new entry in `slot`, the EMPTY slot probe ended at for an absent key.
+private pure func appended[K: DictKey, V](contents: DictContents[K, V], slot: Int, key: K, value: V) -> DictContents[K, V]:
+    position = contents.keys.length()
+    { contents | keys = contents.keys.append(key), values = contents.values.append(value), live = contents.live.append(True), slots = contents.slots.set(slot, position) }
+
+
+pure func get[K: DictKey, V](dict: Dict[K, V], key: K) -> Option[V]:
+    contents: DictContents[K, V] = from_opaque Dict(dict)
+    position = contents.slots.get_or(probe(contents, key), EMPTY_SLOT)
+    -- A negative position is EMPTY_SLOT: the probe ended without the key.
+    if position < 0:
+        None
+    else:
+        contents.values.get(position)
+
+
+pure func get_or[K: DictKey, V](dict: Dict[K, V], key: K, default: V) -> V:
+    match get(dict, key):
+        Some(value): value
+        None: default
+
+
+pure func contains[K: DictKey, V](dict: Dict[K, V], key: K) -> Bool:
+    contents: DictContents[K, V] = from_opaque Dict(dict)
+    contents.slots.get_or(probe(contents, key), EMPTY_SLOT) >= 0
+
+
+-- Inserts `key` at the end of the order, or replaces its value in place.
+pure func set[K: DictKey, V](dict: Dict[K, V], key: K, value: V) -> Dict[K, V]:
+    contents: DictContents[K, V] = from_opaque Dict(dict)
+    slot = probe(contents, key)
+    position = contents.slots.get_or(slot, EMPTY_SLOT)
+    count = contents.keys.length() + 1
+    updated: DictContents[K, V] = if position >= 0:
+        { contents | values = contents.values.set(position, value) }
+    else if count * GROWTH_LOAD_DENOMINATOR > contents.slots.length() * GROWTH_LOAD_NUMERATOR:
+        compact = rebuilt(contents)
+        appended(compact, free_slot(compact.slots, key), key, value)
+    else:
+        appended(contents, slot, key, value)
+    into_opaque Dict(updated)
+
+
+pure func remove[K: DictKey, V](dict: Dict[K, V], key: K) -> Dict[K, V]:
+    contents: DictContents[K, V] = from_opaque Dict(dict)
+    slot = probe(contents, key)
+    position = contents.slots.get_or(slot, EMPTY_SLOT)
+    dead_count = contents.dead_count + 1
+    live_count = contents.keys.length() - dead_count
+    updated: DictContents[K, V] = if position < 0:
+        contents
+    else if and(dead_count >= MINIMUM_COMPACTION, dead_count > live_count):
+        rebuilt({ contents | live = contents.live.set(position, False), slots = contents.slots.set(slot, DELETED_SLOT), dead_count = dead_count })
+    else:
+        { contents | live = contents.live.set(position, False), slots = contents.slots.set(slot, DELETED_SLOT), dead_count = dead_count }
+    into_opaque Dict(updated)
+
+
+pure func length[K: DictKey, V](dict: Dict[K, V]) -> Int:
+    contents: DictContents[K, V] = from_opaque Dict(dict)
+    contents.keys.length() - contents.dead_count
+
+
+-- The live keys in insertion order: the stored List when nothing is pending removal.
+pure func keys[K: DictKey, V](dict: Dict[K, V]) -> List[K]:
+    contents: DictContents[K, V] = from_opaque Dict(dict)
+    if contents.dead_count == 0:
+        contents.keys
+    else:
+        var listed: List[K] = []
+        var index = 0
+        for key in contents.keys:
+            if contents.live.get_or(index, False):
+                listed = listed.append(key)
+            index = index + 1
+        listed
+
+
+pure func values[K: DictKey, V](dict: Dict[K, V]) -> List[V]:
+    contents: DictContents[K, V] = from_opaque Dict(dict)
+    if contents.dead_count == 0:
+        contents.values
+    else:
+        var listed: List[V] = []
+        var index = 0
+        for value in contents.values:
+            if contents.live.get_or(index, False):
+                listed = listed.append(value)
+            index = index + 1
+        listed
+
+
+pure func is_empty[K: DictKey, V](dict: Dict[K, V]) -> Bool:
+    length(dict) == 0
+
+
+-- The (key, value) pairs in insertion order.
+pure func entries[K: DictKey, V](dict: Dict[K, V]) -> List[(K, V)]:
+    listed = values(dict)
+    var pairs: List[(K, V)] = []
+    var index = 0
+    for key in keys(dict):
+        match listed.get(index):
+            Some(value): pairs = pairs.append((key, value))
+            None: void
+        index = index + 1
+    pairs
+
+
+-- Same keys with equal values; order is irrelevant. Lengths first, then each key
+-- of one is looked up in the other, stopping at a difference: O(n) on average.
+implements Equatable for Dict[K: DictKey, V: Equatable]:
+    pure func equals(left: Self, right: Self) -> Bool:
+        left_values = values(left)
+        var same: Bool = length(left) == length(right)
+        var index = 0
+        for key in keys(left):
+            if same:
+                same = match left_values.get(index):
+                    None: False
+                    Some(value):
+                        match get(right, key):
+                            None: False
+                            Some(found): found == value
+                index = index + 1
+            else:
+                break
+        same

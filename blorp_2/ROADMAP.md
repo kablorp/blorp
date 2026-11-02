@@ -1529,7 +1529,7 @@ projections and O3.
 | [O1](#o1-owned-parameter-contracts) | Per-parameter owned/borrowed contracts, inferred from in-place runtime operations | Landed 2026-10-30 ([results](#o1-results)); size overage accepted |
 | [O1 follow-ups](#o1-follow-ups) | One passing rule in `pass_arguments`, an `append_int` digit loop, a seed containing O1 | Rule and digit loop done; O1 is in the pinned seed, the digit loop awaits the next rotation |
 | [Attribution after O1](#attribution-after-o1) | Remaining copies, RC operations and allocations by kind, a fresh profile | Measured 2026-10-30 ([report](../benchmarks/results/blorp_2_attribution_after_o1_2026-10-30.md)) |
-| [O2](#o2-record-update-binds-before-it-rebuilds) | Project the base fields an update reads before its replacements run | Implemented 2026-10-30, pending review ([results](#o2-results)) |
+| [O2](#o2-record-update-binds-before-it-rebuilds) | Project the base fields an update reads before its replacements run | Landed 2026-10-30, b32b1a82d ([results](#o2-results)) |
 | [Loop-header last-read drops](#loop-header-last-read-drops) | A loop-header obligation that is not outgoing drops at its last read instead of being held to the edge batch | Decided 2026-10-30 as a separate step; after O2 |
 | [Borrowed field projections](#borrowed-field-projections) | Read managed record fields borrowed, as union payloads already are | Proposed; decided from the attribution, needs approval |
 | [O3](#o3-specialised-reuse-for-records-and-union-nodes) | Specialised reuse of unique record cells and boxed union nodes | Undecided; decided from the attribution |
@@ -2080,7 +2080,7 @@ dropping the base, then replacing is also the order that
 reuse ([O3](#o3-specialised-reuse-for-records-and-union-nodes)) need to take
 a field out of a unique cell.
 
-Status: implemented 2026-10-30, pending review. Lowering finds the fields the
+Status: landed 2026-10-30, b32b1a82d. Lowering finds the fields the
 replacements read with a typed scan (`collect_base_reads`) when the base is a
 binding read. Its identities are the `BindingId` and `FieldInstanceId`, and
 the scan does not enter a `match` or a captured callable, where a read may see

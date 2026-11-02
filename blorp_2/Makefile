@@ -14,6 +14,7 @@ TEST_COMPILER_LIBRARIES := -lm -lpthread
 # Explicitly ported suites: every active B2 test runs through Blorp 2.
 TARGET_COMPONENT_SOURCES := \
 	blorp_2/test/unit/test_library/test_hashable.brp \
+	blorp_2/test/unit/test_library/test_dict.brp \
 	blorp_2/test/unit/test_library/test_float_classification.brp \
 	blorp_2/test/unit/test_library/test_int_comparisons.brp \
 	blorp_2/test/unit/test_library/test_path_join.brp \
@@ -87,6 +88,7 @@ TARGET_COMPONENT_SOURCES := \
 	blorp_2/test/unit/test_verify/test_inline_union_fields.brp \
 	blorp_2/test/unit/test_own/test_list_updates.brp \
 	blorp_2/test/unit/test_own/test_library_loops.brp \
+	blorp_2/test/unit/test_own/test_dict_updates.brp \
 	blorp_2/test/unit/test_verify/test_list_updates.brp \
 	blorp_2/test/unit/test_emit/test_list_updates.brp \
 	blorp_2/test/unit/test_lower/test_loop_reads.brp \

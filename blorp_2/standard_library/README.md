@@ -77,8 +77,10 @@ route; direct calls use `int: hash`. Int's written implementation returns its
 value unchanged, including negative values and `INT_MIN`. Hashes may be any
 signed Int. For values compared by equality, equal values must have equal hashes;
 distinct values may collide. Hashable has no supertraits and is never derived.
-The compiler's `HashMap[K, V]` (`K: Hashable + Equatable`) uses this method for
-home slots and still compares keys by equality when probing collisions.
+String writes its hash in `string.brp` (a fold of its bytes from a fixed basis,
+unseeded) and Bool in `bool.brp` (`False` 0, `True` 1). The compiler's
+`HashMap[K, V]` (`K: Hashable + Equatable`) uses this method for home slots and
+still compares keys by equality when probing collisions.
 
 `Int` and `Float` are declared once in `_base.brp`. Other
 declarations are enabled only as their features enter the supported subset.
@@ -126,6 +128,34 @@ input returns empty String and separators appear only between elements. The
 result owns its content independently of temporary inputs and surviving aliases.
 A loop appends each separator and element to a dying String accumulator, so the
 work is linear in the output bytes and the C stack is constant.
+
+### Dict
+
+`dict.brp` declares `trait DictKey: Hashable + Equatable` and the opaque
+`Dict[K: DictKey, V]`, an insertion-ordered map over parallel Lists and an
+open-addressing index. Int, String and Bool implement `DictKey` with a bodyless
+`implements DictKey for T`; a record or opaque key writes its own `Hashable` and
+`Equatable` first. The prelude imports `dict: Dict`, so the type and its receiver
+methods are implicit; `empty` and `with_capacity` are reached as
+`import: dict as D`. All functions are pure.
+
+| Function | Contract |
+| --- | --- |
+| `empty[K: DictKey, V]() -> Dict[K, V]` | No entries. |
+| `with_capacity[K: DictKey, V](count) -> Dict[K, V]` | Room for `count` entries before the index grows; at most 1,048,576 are reserved, a larger or negative count is only a hint. |
+| `get(dict, key) -> Option[V]`, `get_or(dict, key, default) -> V`, `contains(dict, key) -> Bool` | O(1) average lookups; a missing key is `None` or the eagerly evaluated default. |
+| `set(dict, key, value) -> Dict[K, V]` | Insert, or replace the value and keep the key's position. O(1) amortized. |
+| `remove(dict, key) -> Dict[K, V]` | Without the key, order of the rest kept; unchanged when absent. O(1) amortized. |
+| `keys(dict) -> List[K]`, `values(dict) -> List[V]`, `entries(dict) -> List[(K, V)]` | Live entries in first-insertion order; a key removed and set again goes last. |
+| `length(dict) -> Int`, `is_empty(dict) -> Bool` | The live entry count, in O(1). |
+
+`Equatable` for `Dict[K: DictKey, V: Equatable]` compares lengths, then looks up
+each key of one Dict in the other, whatever the order. A Dict is neither
+`Hashable` nor a `DictKey`, and Float is not a key. An update to a uniquely owned
+Dict appends to or sets its field Lists in place; a shared Dict copies on write.
+Home slots multiply the hash by an odd constant first, so sequential Int hashes
+do not form one long run; slot counts are 2^k - 1, and a rebuild at half load
+compacts removed entries. [DICT_PLAN](../DICT_PLAN.md) has the design and ceilings.
 
 ### List queries and copies
 

@@ -154,8 +154,40 @@ reached by UFCS or the explicit `int: hash` import. Hashes may be negative,
 including `INT_MIN`. Equal values must have equal hashes; unequal values may
 collide. Hashable is independent of Equatable and has no automatic derivation.
 A generic operation that both hashes and compares keys requires both traits.
-The compiler's `HashMap[K, V]` requires `K: Hashable + Equatable`: the key's hash
-picks its home slot, then ordinary key equality distinguishes collisions.
+Int, String and Bool supply written hashes (`False` 0, `True` 1; String folds its
+bytes with a fixed basis, unseeded). The compiler's `HashMap[K, V]` requires
+`K: Hashable + Equatable`: the key's hash picks its home slot, then ordinary key
+equality distinguishes collisions.
+
+### Dict
+
+`dict.brp` declares `Dict[K: DictKey, V]`, an insertion-ordered map written in
+Blorp over Lists ([plan](DICT_PLAN.md)). `DictKey` is a bundle trait,
+`trait DictKey: Hashable + Equatable`; a key type opts in with a bodyless
+`implements DictKey for Point` after writing its `Hashable` and `Equatable`.
+Int, String and Bool are keys; Float is not, and a type without `DictKey` is
+rejected where `Dict[Point, Int]` is written. The prelude imports `dict: Dict`,
+so the type and its receiver methods are always available; `empty` and
+`with_capacity` come from `import: dict as D`.
+
+```blorp
+import:
+    dict as D
+
+func main() -> Int:
+    var scores: D.Dict[String, Int] = D.empty()
+    scores = scores.set("alice", 95).set("bob", 80)
+    scores = scores.remove("bob").set("bob", 81)
+    scores.get_or("alice", 0) + scores.length()
+```
+
+`set` keeps an existing key's position and replaces its value; `remove` keeps the
+order of the rest; a removed key set again goes last. `keys`, `values` and
+`entries` list in that order. A missing key is `None` from `get`, the default from
+`get_or`, and no change from `remove`. Two Dicts are equal when their lengths match
+and every key of one has an equal value in the other, whatever the order. Updating
+a uniquely owned Dict reuses its Lists; updating a shared one copies. There are no
+literals, no `for` over a Dict and no Float keys yet.
 
 Function type parameters declare their required traits with `:` and combine
 bounds with `+`. Each generic body is checked once against those declarations;
@@ -237,8 +269,8 @@ Box[T: Ordered]` meets Box's automatic `T: Equatable`. An implementation
 defines only its own trait's methods; a supertrait's method there names the
 implementation it belongs in. A supertrait is a visible trait, written as a
 bound is; a cycle is reported along its path, a public trait cannot name a
-private supertrait, and canonical Equatable declares none. The pinned seed
-predates supertraits, so the library and compiler source declare none yet.
+private supertrait, and canonical Equatable declares none. The library declares
+the `DictKey` bundle; compiler source declares no supertraits yet.
 An `Orderable` bound does not provide `==`.
 
 ### Declaration bounds
