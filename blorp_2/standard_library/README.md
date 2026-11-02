@@ -107,9 +107,9 @@ slot once.
 Generic `any`, `map` and `filter` accept pure named functions, pure lambdas
 (including immutable data captures) and unchanged forwarded callback parameters. `map` permits distinct input/result types;
 `filter` keeps input order, and `any` skips later elements after its first True.
-These ordinary source helpers use balanced recursion: logarithmic C stack,
-with O(n log n) copied List slots for map/filter as a temporary bootstrap cost.
-No constant-stack or COW claim is implied.
+These ordinary source helpers are loops. `map` and `filter` append to a local
+accumulator that each append consumes, so they visit every element once, grow
+the result in place and use constant C stack.
 
 List literals are supported. `set_index(values, index, value)` returns
 `Option[List[T]]`: `Some(updated)` for a valid index, or `None` for a negative
@@ -124,8 +124,8 @@ alias, and returned managed values remain independently owned. `append` and
 through UFCS. It preserves element order and counted UTF-8/NUL bytes; empty
 input returns empty String and separators appear only between elements. The
 result owns its content independently of temporary inputs and surviving aliases.
-This temporary balanced implementation copies O(n + bytes * log(n + 1)) work
-and uses O(log(n + 1)) stack, pending a separately reviewed linear String builder.
+A loop appends each separator and element to a dying String accumulator, so the
+work is linear in the output bytes and the C stack is constant.
 
 ### List queries and copies
 
@@ -146,10 +146,11 @@ The combined library also supplies these ordinary pure helpers:
 
 Inputs are borrowed; returned managed values retain independent ownership and
 older aliases remain valid. Predicate/key callbacks may capture immutable data.
-The sort key may run more than once per element. Take/drop/remove/reverse temporarily copy O(n log n) List slots
-with O(log(n + 1)) stack. Find/all visit at most n elements in input order,
-with logarithmic stack and short-circuiting. Sort uses a temporary merge
-implementation. No COW or constant-stack claim follows from availability.
+The sort key may run more than once per element. Take/drop/remove/reverse copy
+each kept element once into an accumulator that grows in place; remove joins its
+two copies with one `concat`. Find/all visit at most n elements in input order
+with constant stack and short-circuiting. Sort uses a temporary merge
+implementation.
 Integrated correctness, self-compilation and resource acceptance remain separate.
 
 ### List membership
@@ -269,9 +270,8 @@ cannot move above root. Empty relative output becomes `.`, root becomes `/`, and
 trailing separators disappear. Other component bytes, including UTF-8 and NUL,
 are preserved. OS operations independently reject NUL paths.
 
-The byte scan/materialization is linear, but temporary List append/take and
-balanced String joining still copy data; no linear total-cost or COW claim is
-made. See the [shell/path boundary](../ROADMAP.md#seven-shell-and-path-functions).
+The byte scan/materialization is linear, and List take and String joining build
+their results in one pass. See the [shell/path boundary](../ROADMAP.md#seven-shell-and-path-functions).
 
 ### Test registration
 

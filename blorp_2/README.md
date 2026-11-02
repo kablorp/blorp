@@ -2691,8 +2691,8 @@ The target List module also provides ordinary generic callback helpers:
 `filter[T](List[T], pure (T) -> Bool) -> List[T]`.
 Pass pure named functions or forward callable parameters. `any` stops at the
 first True result; `map` and `filter` preserve input order. Empty inputs return
-False or an empty List. The temporary balanced implementation uses logarithmic
-C stack and copies O(n log n) List slots for map/filter; it has no COW fast path.
+False or an empty List. Each is a loop: `map` and `filter` append to a consumed
+accumulator, visit every element once and use constant C stack.
 The [target API reference](standard_library/README.md) records these limits.
 
 `repeat` evaluates its element and count once. A nonpositive count produces an
