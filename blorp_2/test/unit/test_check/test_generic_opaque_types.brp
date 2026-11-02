@@ -134,6 +134,12 @@ private pure func rejects(prefix: String, marked: String, rest: String, message:
 						.and(errors.remaining.is_empty())
 
 
+private pure func accepts(source: String) -> Bool:
+	match parse_modules([{ source = source, targets = [] }]):
+		Err(_): False
+		Ok(parsed): check(parsed).is_ok()
+
+
 pure func test_an_unfixed_phantom_parameter_is_rejected_at_the_conversion() -> Bool:
 	rejects(
 		"opaque type Id[T] = Int\nfunc main() -> Int:\n    id = ",
@@ -146,9 +152,7 @@ pure func test_an_unfixed_phantom_parameter_is_rejected_at_the_conversion() -> B
 
 pure func test_an_expected_type_fixes_a_phantom_parameter() -> Bool:
 	source = "record User { name: String }\nopaque type Id[T] = Int\nfunc main() -> Int:\n    id: Id[User] = into_opaque Id(7)\n    0\n"
-	match parse_modules([{ source = source, targets = [] }]):
-		Err(_): False
-		Ok(parsed): check(parsed).is_ok()
+	accepts(source)
 
 
 -- An applied opaque that holds its union behind a pointer, or not at all, is no
@@ -164,9 +168,58 @@ pure func test_an_opaque_over_a_pointer_to_its_union_is_accepted() -> Bool:
 		|func main() -> Int:
 		|    0
 		|
-	match parse_modules([{ source = source, targets = [] }]):
-		Err(_): False
-		Ok(parsed): check(parsed).is_ok()
+	accepts(source)
+
+
+private NAMED_BOX: String =
+	|trait Named:
+	|    pure func name(value: Self) -> Int
+	|opaque type Box[V] = List[V]
+	|pure func wrap[V](value: V) -> Box[V]:
+	|    into_opaque Box([value])
+	|
+
+
+-- Box's implementation is conditional on V: Named, so it serves Box[Int] once
+-- Int is Named and is unavailable for Box[String].
+pure func test_a_generic_opaque_implementation_is_conditional_on_its_bounds() -> Bool:
+	declarations: String =
+		|implements Named for Int:
+		|    pure func name(value: Self) -> Int:
+		|        value
+		|implements Named for Box[V: Named]:
+		|    pure func name(value: Self) -> Int:
+		|        1
+		|func main() -> Int:
+		|
+	accepts(NAMED_BOX + declarations + "    wrap(7).name()\n")
+		.and(rejects(
+			NAMED_BOX + declarations + "    wrap(\"seven\").",
+			"name",
+			"()\n",
+			"type does not satisfy the required trait bound",
+			"add the required trait to this function's type parameter bounds, or provide an implementation for the concrete receiver",
+		))
+
+
+pure func test_a_generic_opaque_receiver_introduces_every_parameter() -> Bool:
+	rejects(
+		NAMED_BOX + "implements Named for ",
+		"Box",
+		":\n    pure func name(value: Self) -> Int:\n        0\nfunc main() -> Int:\n    0\n",
+		"implementation receiver must introduce its complete type parameter family",
+		"write one distinct fresh parameter for every receiver argument; specialized or nested receiver patterns are not supported",
+	)
+
+
+pure func test_a_generic_opaque_implementation_meets_its_supertrait_obligations() -> Bool:
+	rejects(
+		NAMED_BOX + "trait Keyed: Named\nimplements ",
+		"Keyed",
+		" for Box[V: Keyed]\nfunc main() -> Int:\n    0\n",
+		"implementing Keyed for Box requires an implementation of Named",
+		"add implements Named for Box",
+	)
 
 
 tests: TestSuite = {
@@ -179,5 +232,8 @@ tests: TestSuite = {
 		("an unfixed phantom parameter is rejected at the conversion", test_an_unfixed_phantom_parameter_is_rejected_at_the_conversion),
 		("an expected type fixes a phantom parameter", test_an_expected_type_fixes_a_phantom_parameter),
 		("an opaque over a pointer to its union is accepted", test_an_opaque_over_a_pointer_to_its_union_is_accepted),
+		("a generic opaque implementation is conditional on its bounds", test_a_generic_opaque_implementation_is_conditional_on_its_bounds),
+		("a generic opaque receiver introduces every parameter", test_a_generic_opaque_receiver_introduces_every_parameter),
+		("a generic opaque implementation meets its supertrait obligations", test_a_generic_opaque_implementation_meets_its_supertrait_obligations),
 	],
 }

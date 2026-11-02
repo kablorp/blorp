@@ -2102,8 +2102,11 @@ Lexical and layout rules:
   `from_opaque Name(value)` projects it, only inside the declaring module.
   Conversions take no written type arguments: like a generic call, unwrapping
   takes them from the operand, and wrapping from the operand or, for a phantom
-  parameter, the expected type (`id: Id[User] = into_opaque Id(7)`). Traits may
-  be implemented only for nongeneric opaque types.
+  parameter, the expected type (`id: Id[User] = into_opaque Id(7)`). A trait
+  implementation for an opaque type follows the receiver rules for records,
+  as in `implements Equatable for Box[T: Equatable]`. Its bodies may use
+  `into_opaque` and `from_opaque` only when the implementation is written in
+  the declaring module.
   Export ordinary constructor/accessor functions for other modules, as in the
   [two-file Int example](test/e2e/fixtures/opaque/int/main.brp). Two opaque types
   remain distinct during checking and function specialization even when they wrap
