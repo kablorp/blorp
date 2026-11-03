@@ -52,6 +52,7 @@ TARGET_COMPONENT_SOURCES := \
 	blorp_2/test/unit/test_parse/test_float_builtin_labels.brp \
 	blorp_2/test/unit/test_parse/test_int_comparisons.brp \
 	blorp_2/test/unit/test_parse/test_ordering_operators.brp \
+	blorp_2/test/unit/test_parse/test_boolean_function_names.brp \
 	blorp_2/test/unit/test_parse/test_dict_literals.brp \
 	blorp_2/test/unit/test_parse/test_supertraits.brp \
 	blorp_2/test/unit/test_parse/test_provenance.brp \

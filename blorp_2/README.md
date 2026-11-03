@@ -373,9 +373,9 @@ still needs element-type evidence. Unconstrained union constructors such as
 are the same inference restrictions as ordinary explicit calls. Closed module
 constants retain their existing restrictions on calls.
 
-Comparisons bind below ranges and postfix operations, above prefix `not` and
-then `and`/`or`. Those Boolean operator forms remain unsupported by checking;
-use the eager Boolean helper calls. Comparisons cannot chain: `a == b == c` is
+Comparisons bind below ranges and postfix operations and are the lowest
+precedence level; Boolean logic calls the `bool` functions `and`, `or` and
+`not`. Comparisons cannot chain: `a == b == c` is
 an error, while `(a == b) == c` is explicit nesting subject to ordinary typing.
 Both symbol bytes must be adjacent; spaces around the whole symbol are optional.
 A newline after a comparison symbol continues only inside brackets. The
@@ -471,8 +471,7 @@ interpolation.
 `* / %` bind above `+ -`, both associate left, and prefix `-` binds below
 postfix calls and above `*`: `-x.abs()` is `-(x.abs())` and `-2 * 3` is
 `(-2) * 3`. All of them bind above ranges and comparisons, so `0..n-1` ends
-at `n - 1` and `a + b < c` compares the sum. `not` cannot be an operand of an
-arithmetic operator without parentheses. As for comparisons, a newline after
+at `n - 1` and `a + b < c` compares the sum. As for comparisons, a newline after
 an operator ends the expression; wrap a long expression in parentheses.
 
 Spacing never matters: `a-1`, `a -1` and `a - 1` are the same subtraction.
@@ -735,8 +734,7 @@ The [value-if fixture](test/e2e/fixtures/value_if/answer.brp) initializes an
 annotated Void bindings are permitted. A Void function's final if with both
 branches discards each selected result, as a final match does. Controls nested
 in call arguments, record fields or list elements remain unsupported; bind the
-control's result first. Boolean keyword operators and nested `?=` remain
-unsupported.
+control's result first. Nested `?=` remains unsupported.
 
 Bindings also compose with match arms. The
 [arm-binding example](test/e2e/fixtures/match/binding_original.brp) returns 7:
@@ -1798,13 +1796,12 @@ and may continue on following lines that start with `.`, at the same
 indentation or one level deeper (a method chain, as in the host); inside an
 indented chain every line starts with `.`, and an `if`, `while`, `for` or
 `match` header may not hold an indented chain.
-`low..high` is a range of two such operands; `not a`, `a and b` and `a or b`
-combine them with the precedence `or` below `and` below `not` below
-the comparisons `==`, `!=`, `<`, `>`, `<=` and `>=` below `..` below
-`+ -` below `* / %` below prefix `-`; `and`/`or` and the arithmetic levels
-associate left and comparisons do not chain. A line break after `and` or `or` is
-accepted only inside brackets; the host also accepts it bare, which is a
-follow-up. `if condition:` opens an indented block, optionally followed by
+`low..high` is a range of two such operands. The precedence is the
+comparisons `==`, `!=`, `<`, `>`, `<=` and `>=` below `..` below `+ -` below
+`* / %` below prefix `-`; the arithmetic levels associate left and comparisons
+do not chain. There are no Boolean operators: `and`, `or` and `not` are
+ordinary functions of the `bool` module, called as `and(a, b)` or
+`a.and(b)`. `if condition:` opens an indented block, optionally followed by
 `else:` with a block or `else if condition:`, which nests the next
 if-expression; the form is one expression in value and statement positions
 alike. It ends at its last block's dedent: no operator, range or UFCS
@@ -1916,14 +1913,13 @@ or branch value. An absent `else` produces only Void; statement branches must
 also produce Void. Conditions require the designated Bool type. Bind an `if`
 or `match` before using it inside a larger expression. Ascending, end-exclusive
 Int ranges are supported as `for` iterables; general Range values remain unsupported.
-Prefix `not value` and infix `and`/`or` are invalid; diagnostics teach ordinary calls.
 A bound or statement match is a join.
 
 Select pure Bool functions with `bool: not, and, or`: `not(value)` / `value.not()`,
 `and(left, right)` / `left.and(right)` and `or(left, right)` / `left.or(right)`.
 Calls evaluate every argument once, left to right; use `match` to skip an RHS.
-`not (value)` is also a call. These three keywords may name functions, imported
-selections and called members; bindings, types and fields retain their reserved-name rules.
+`and`, `or` and `not` are ordinary identifiers, so they may also name bindings,
+types and fields.
 A dotted type such as `Shared.Span[Int]` is a qualified type. A qualified
 name resolves through the import block's alias row to the target module's
 own public declarations: `IntOps.add(1, 2)` calls the Addable member that
@@ -2002,15 +1998,15 @@ Lexical and layout rules:
 - `'a'` and `'\n'` are Char literal tokens: one character or escape pair in
   single quotes. The parser rejects them with a teaching message until the
   Char type exists.
-- Every word GRAMMAR 1.4 reserves is reserved here: `func`, `pure`, `match`,
+- Every word GRAMMAR 1.4 reserves except `and`, `or` and `not`, which are
+  ordinary `bool` function names here, is reserved: `func`, `pure`, `match`,
   `var`, `void`, `import`, `type`, `private`, `record`, `union`, `builtin`,
-  `as`, `opaque`, `into_opaque`, `from_opaque`, `if`, `else`, `and`, `or`,
-  `not`, `while`, `for`, `in`, `break`, `continue`, `alias`, `debug`, `detach`,
-  `foreign`, `from`, `implements`, `resource`, `select`, `trait`, `try`,
-  `where` and lone `_`. Writing one
-  where a name is declared reports "`word` is a reserved keyword and cannot be
-  used as a name". `fixed`, `methods` and `tail_recursive` are names in
-  the host too and remain valid names here. The optional `pure` qualifier precedes `func`
+  `as`, `opaque`, `into_opaque`, `from_opaque`, `if`, `else`, `while`, `for`,
+  `in`, `break`, `continue`, `alias`, `debug`, `detach`, `foreign`, `from`,
+  `implements`, `resource`, `select`, `trait`, `try`, `where` and lone `_`.
+  Writing one where a name is declared reports "`word` is a reserved keyword
+  and cannot be used as a name". `fixed`, `methods` and `tail_recursive` are
+  names in the host too and remain valid names here. The optional `pure` qualifier precedes `func`
   with spaces between the two keywords. Function, parameter and type names are
   identifiers whose meaning is checked after parsing.
 - A function may declare ordered type parameters, as in
@@ -3594,8 +3590,8 @@ operators, which call the canonical trait members. For example, `count + 1`
 calls Addable and `left < right` calls Orderable; String `+` concatenates.
 Explicit calls remain where tests exercise method dispatch and where library
 trait implementations call another member directly. Other operations use
-concrete functions. Checking does not yet accept the `and`/`or`/`not` keywords,
-so Boolean logic calls the `bool` library module.
+concrete functions. Boolean logic calls the `and`, `or` and `not` functions of
+the `bool` library module.
 Concrete input traits do not expand that compiler-source subset. The production
 library supplies ordinary implementations of these traits; input programs may
 call their methods or use the fixed operators.

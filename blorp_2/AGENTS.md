@@ -16,10 +16,9 @@ doctests, channels or FFI. Tuples and static traits are supported by the
 current seed; their use in compiler implementation remains bounded by each
 reviewed task. Compiler source writes arithmetic, ordering and equality with
 their operators; String `+` calls Addable. Other operations use concrete
-functions such as `concat`, and pattern matching. Checking does not yet accept
-the `and`/`or`/`not` keywords, so
-Boolean logic calls the `bool` library module. Dependencies on the old host
-library or TestSuite API mark deferred tests; port bounded suites
+functions such as `concat`, and pattern matching. Boolean logic calls the
+`and`, `or` and `not` functions of the `bool` library module. Dependencies on
+the old host library or TestSuite API mark deferred tests; port bounded suites
 incrementally without expanding the input language.
 
 Each increment starts from a small executable fixture and its expected
