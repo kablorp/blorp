@@ -68,7 +68,8 @@ Out of scope, each a separate later change:
 - `+` on List;
 - power, floor division and bitwise operators;
 - mixed-type arithmetic;
-- checked arithmetic, which would stay ordinary methods if it is ever added.
+- checked arithmetic, which stays ordinary functions. It was added on
+  2026-11-03 as the `_checked` functions in `int.brp`.
 
 ## Language rules
 

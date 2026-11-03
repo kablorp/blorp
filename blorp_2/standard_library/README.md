@@ -13,9 +13,9 @@ The library root contains two designated foundation modules:
 
 - `_base.brp` owns Int, Float, String, Void, List, Bool, Option, Result, the
   `Orderable` and `Hashable` traits and the arithmetic traits `Addable`,
-  `Subtractable`, `Multipliable`, `Divisible`, `Modulable` and `Negatable`. It
-  is the only module that may declare builtin types. Any module may import it
-  as `_base`.
+  `Subtractable`, `Multipliable`, `Divisible`, `Modulable` and `Negatable`,
+  plus the checked-arithmetic error `MathError`. It is the only module that may
+  declare builtin types. Any module may import it as `_base`.
 - `prelude.brp` imports the base types and the operation modules' methods. It
   is the only implicit import: application roots and ordinary user helper
   modules receive its selections, and it cannot be imported explicitly.
@@ -64,6 +64,14 @@ Neither branch prints. The native helper uses the target String ABI.
 [`standard_library/src/int.brp`](../../standard_library/src/int.brp). Its
 arithmetic implementations have builtin bodies except `negate`, which is
 `subtract(0, value)` and so wraps `INT_MIN` to itself; `to_string` is concrete.
+Its six `_checked` functions are ordinary pure functions returning
+`Result[Int, MathError]`. `add_checked` and `subtract_checked` compare the
+operands with `INT_MIN` and `INT_MAX` without wrapping; `multiply_checked`
+detects a wrapped product by dividing it back; `divide_checked`,
+`remainder_checked` and `negate_checked` test for 0, -1 and `INT_MIN`. The
+prelude selects neither MathError nor its cases, so `Overflow` and
+`DivisionByZero` stay free for user declarations; naming the type or a case
+requires `_base: MathError(DivisionByZero, Overflow)`.
 The Float adapter implements the same six traits for Float64, with `negate` as
 `multiply(value, -1.0)` so that the sign of zero flips, plus concrete
 `to_string`, `copysign`, `equals`, `is_nan`, `is_finite` and `abs`. `is_nan`

@@ -490,6 +490,16 @@ A canonical arithmetic trait must keep its member as its sole abstract method,
 pure and with its row's signature; defaults and supertraits beside it are
 admitted. Compiler and library source use arithmetic operators.
 
+When a wrapped or zero result would be wrong, call an ordinary checked
+function instead. `int.brp`'s `add_checked`, `subtract_checked`,
+`multiply_checked`, `divide_checked`, `remainder_checked` and `negate_checked`
+return `Result[Int, MathError]`, where `_base`'s `MathError` is `Overflow` or
+`DivisionByZero`. The prelude's Int methods make `a.add_checked(b)` available
+without an import, but naming the type or its cases needs
+`_base: MathError(DivisionByZero, Overflow)`. `divide_checked(INT_MIN, -1)` is
+`Overflow`, while `remainder_checked(INT_MIN, -1)` is `Ok(0)`. The
+[checked fixture](test/e2e/fixtures/arithmetic/checked.brp) covers each boundary.
+
 ## Automatic equality for named aggregates
 
 With the configured prelude's canonical `Equatable`, a named record or union
