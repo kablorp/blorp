@@ -1527,7 +1527,7 @@ projections and O3.
 | --- | --- | --- |
 | [O0](#o0-re-measure-after-l2b) | Re-run the self-compile copy attribution and count atomic RC operations | Measured ([results](#o0-results)) |
 | [O1](#o1-owned-parameter-contracts) | Per-parameter owned/borrowed contracts, inferred from in-place runtime operations | Landed 2026-10-30 ([results](#o1-results)); size overage accepted |
-| [O1 follow-ups](#o1-follow-ups) | One passing rule in `pass_arguments`, an `append_int` digit loop, a seed containing O1 | Rule and digit loop done; O1 is in the pinned seed, the digit loop awaits the next rotation |
+| [O1 follow-ups](#o1-follow-ups) | One passing rule in `pass_arguments`, an `append_int` digit loop, a seed containing O1 | Done; the pinned seed contains O1 and the digit loop |
 | [Attribution after O1](#attribution-after-o1) | Remaining copies, RC operations and allocations by kind, a fresh profile | Measured 2026-10-30 ([report](../benchmarks/results/blorp_2_attribution_after_o1_2026-10-30.md)) |
 | [O2](#o2-record-update-binds-before-it-rebuilds) | Project the base fields an update reads before its replacements run | Landed 2026-10-30, b32b1a82d ([results](#o2-results)) |
 | [Loop-header last-read drops](#loop-header-last-read-drops) | A loop-header obligation that is not outgoing drops at its last read instead of being held to the edge batch | Decided 2026-10-30 as a separate step; after O2 |
@@ -2220,8 +2220,8 @@ Three steps, each landed green:
 3. **A seed containing O1 and the digit loop.** The seed pinned in
    `a5785d3fd` (`905b4e7d5`) contains O1, so the default B gains O1's −7.1%
    of C instructions; the four-labelling oracle was not re-run before that
-   pin. The digit loop's further −5.0% reaches the default B with the next
-   seed rotation.
+   pin. The seed pinned in `7f82c7125` (`51d98be37`) also contains the digit
+   loop, so the default B gains its further −5.0%.
 
 ### Attribution after O1
 
