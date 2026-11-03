@@ -15,9 +15,10 @@ import:
 			FloatAddBuiltin, FloatSubtractBuiltin, FloatMultiplyBuiltin, FloatDivideBuiltin,
 			FloatRemainderBuiltin, FloatToStringBuiltin, StringParseFloatBuiltin,
 			StringPrintBuiltin, StringPrintErrorBuiltin, StringParseIntBuiltin, ListRepeatBuiltin, ListLengthBuiltin, ListGetBuiltin,
-			StringByteAtBuiltin, StringFromCodepointBuiltin, StringSliceBuiltin, GetCurrentDirectoryBuiltin, ReadFileBuiltin, WriteFileBuiltin, RunToFilesBuiltin,
+			StringByteAtBuiltin, StringFromCodepointBuiltin, StringSliceBuiltin, SystemBuiltin,
 			ListAppendBuiltin, ListSetBuiltin, ListConcatBuiltin, StringEqualsBuiltin, IntegerEqualsBuiltin, IntegerLessThanBuiltin,
 		),
+		SystemOperation(GetCurrentDirectory, ReadFile, WriteFile, RunToFiles),
 		Purity(Pure, Impure),
 		Span,
 		TypeSyntax(AtomicType),
@@ -81,10 +82,7 @@ union RuntimeOperation[Variant, Element]:
 	StringByteAt(DesignatedOption[Variant])
 	StringFromCodepoint(DesignatedOption[Variant])
 	StringSlice(DesignatedOption[Variant])
-	GetCurrentDirectory(DesignatedResult[Variant])
-	ReadFile(DesignatedResult[Variant])
-	WriteFile(DesignatedResult[Variant])
-	RunToFiles(DesignatedResult[Variant])
+	SystemCall(SystemOperation, DesignatedResult[Variant])
 	ListRepeat(Element)
 	ListLength(Element)
 	ListGet(Element, DesignatedOption[Variant])
@@ -158,14 +156,10 @@ pure func runtime_contract[Variant, Element](
 			{ purity = Pure, parameters = [PrimitiveRuntimeType(BuiltinInt)], return_type = OptionalResult(PrimitiveRuntimeType(BuiltinString), option) }
 		StringSlice(option):
 			{ purity = Pure, parameters = [PrimitiveRuntimeType(BuiltinString), PrimitiveRuntimeType(BuiltinInt), PrimitiveRuntimeType(BuiltinInt)], return_type = OptionalResult(PrimitiveRuntimeType(BuiltinString), option) }
-		ReadFile(result):
-			{ purity = Impure, parameters = [PrimitiveRuntimeType(BuiltinString)], return_type = ResultResult(PrimitiveRuntimeType(BuiltinString), PrimitiveRuntimeType(BuiltinString), result) }
-		RunToFiles(result):
-			{ purity = Impure, parameters = [PrimitiveRuntimeType(BuiltinString), StringListRuntimeType, PrimitiveRuntimeType(BuiltinString), PrimitiveRuntimeType(BuiltinString), PrimitiveRuntimeType(BuiltinInt)], return_type = ResultResult(PrimitiveRuntimeType(BuiltinInt), PrimitiveRuntimeType(BuiltinString), result) }
-		WriteFile(result):
-			{ purity = Impure, parameters = [PrimitiveRuntimeType(BuiltinString), PrimitiveRuntimeType(BuiltinString)], return_type = ResultResult(PrimitiveRuntimeType(BuiltinVoid), PrimitiveRuntimeType(BuiltinString), result) }
-		GetCurrentDirectory(result):
-			{ purity = Impure, parameters = [], return_type = ResultResult(PrimitiveRuntimeType(BuiltinString), PrimitiveRuntimeType(BuiltinString), result) }
+		SystemCall(system, result):
+			signature = system_signature(system)
+			parameters = signature.parameters.map(pure func(parameter: SystemParameter) -> RuntimeType[Element]: parameter_runtime_type(parameter))
+			{ purity = Impure, parameters = parameters, return_type = ResultResult(payload_runtime_type(signature.success), payload_runtime_type(signature.error), result) }
 		ListRepeat(element):
 			{ purity = Pure, parameters = [ElementRuntimeType(element), PrimitiveRuntimeType(BuiltinInt)], return_type = ValueResult(ListRuntimeType(element)) }
 		ListLength(element):
@@ -188,6 +182,51 @@ pure func runtime_contract[Variant, Element](
 			{ purity = Pure, parameters = [PrimitiveRuntimeType(BuiltinFloat), PrimitiveRuntimeType(BuiltinFloat)], return_type = BooleanResult(boolean) }
 		FloatLessThan(boolean):
 			{ purity = Pure, parameters = [PrimitiveRuntimeType(BuiltinFloat), PrimitiveRuntimeType(BuiltinFloat)], return_type = BooleanResult(boolean) }
+
+
+-- A system call's parameter, always borrowed.
+union SystemParameter:
+	IntParameter
+	StringParameter
+	StringListParameter
+
+
+-- One branch of a system call's Result, which takes one fresh payload.
+union SystemPayload:
+	IntPayload
+	StringPayload
+	VoidPayload
+
+
+-- A system operation's row. Every system call is impure and returns the
+-- designated Result, so only its parameters and payloads vary.
+record SystemSignature {
+	parameters: List[SystemParameter],
+	success: SystemPayload,
+	error: SystemPayload
+}
+
+
+pure func system_signature(operation: SystemOperation) -> SystemSignature:
+	match operation:
+		GetCurrentDirectory: { parameters = [], success = StringPayload, error = StringPayload }
+		ReadFile: { parameters = [StringParameter], success = StringPayload, error = StringPayload }
+		WriteFile: { parameters = [StringParameter, StringParameter], success = VoidPayload, error = StringPayload }
+		RunToFiles: { parameters = [StringParameter, StringListParameter, StringParameter, StringParameter, IntParameter], success = IntPayload, error = StringPayload }
+
+
+private pure func parameter_runtime_type[Element](parameter: SystemParameter) -> RuntimeType[Element]:
+	match parameter:
+		IntParameter: PrimitiveRuntimeType(BuiltinInt)
+		StringParameter: PrimitiveRuntimeType(BuiltinString)
+		StringListParameter: StringListRuntimeType
+
+
+private pure func payload_runtime_type[Element](payload: SystemPayload) -> RuntimeType[Element]:
+	match payload:
+		IntPayload: PrimitiveRuntimeType(BuiltinInt)
+		StringPayload: PrimitiveRuntimeType(BuiltinString)
+		VoidPayload: PrimitiveRuntimeType(BuiltinVoid)
 
 
 -- Whether a runtime operation may reuse operand 0's buffer in place when it
@@ -219,7 +258,7 @@ pure func primitive_operation[Variant, Element](parsed: ParsedRuntimeOperation) 
 		StringAppendIntBuiltin: Some(StringAppendInt)
 		StringPrintBuiltin: Some(StringPrint)
 		StringPrintErrorBuiltin: Some(StringPrintError)
-		ListRepeatBuiltin | ListLengthBuiltin | ListAppendBuiltin | ListSetBuiltin | ListConcatBuiltin | StringParseIntBuiltin | StringParseFloatBuiltin | StringByteAtBuiltin | StringFromCodepointBuiltin | StringSliceBuiltin | GetCurrentDirectoryBuiltin | ReadFileBuiltin | WriteFileBuiltin | RunToFilesBuiltin | ListGetBuiltin | StringEqualsBuiltin | IntegerEqualsBuiltin | IntegerLessThanBuiltin: None
+		ListRepeatBuiltin | ListLengthBuiltin | ListAppendBuiltin | ListSetBuiltin | ListConcatBuiltin | StringParseIntBuiltin | StringParseFloatBuiltin | StringByteAtBuiltin | StringFromCodepointBuiltin | StringSliceBuiltin | SystemBuiltin(_) | ListGetBuiltin | StringEqualsBuiltin | IntegerEqualsBuiltin | IntegerLessThanBuiltin: None
 
 
 pure func runtime_declaration_help(operation: ParsedRuntimeOperation) -> String:
@@ -238,10 +277,7 @@ pure func runtime_declaration_help(operation: ParsedRuntimeOperation) -> String:
 		StringByteAtBuiltin: "declare a pure nongeneric function with String and Int parameters returning Option[Int]"
 		StringFromCodepointBuiltin: "declare a pure nongeneric function with one Int parameter returning Option[String]"
 		StringSliceBuiltin: "declare a pure nongeneric function with String, Int and Int parameters returning Option[String]"
-		ReadFileBuiltin: "declare an impure nongeneric function with one String parameter returning Result[String, String]"
-		RunToFilesBuiltin: "declare an impure nongeneric function with String, List[String], String, String, Int parameters returning Result[Int, String]"
-		WriteFileBuiltin: "declare an impure nongeneric function with two String parameters returning Result[Void, String]"
-		GetCurrentDirectoryBuiltin: "declare an impure nongeneric function with no parameters returning Result[String, String]"
+		SystemBuiltin(system): system_declaration_help(system)
 		ListRepeatBuiltin: "declare a pure function with E and Int parameters returning List[E]"
 		ListLengthBuiltin: "declare a pure function with one List[E] parameter returning Int"
 		ListGetBuiltin: "declare a pure function with List[E] and Int parameters returning Option[E]"
@@ -251,6 +287,36 @@ pure func runtime_declaration_help(operation: ParsedRuntimeOperation) -> String:
 		IntegerEqualsBuiltin | IntegerLessThanBuiltin: "declare a pure nongeneric function with two Int parameters returning Bool"
 		FloatEqualsBuiltin | FloatLessThanBuiltin: "declare a pure nongeneric function with two Float parameters returning Bool"
 		StringEqualsBuiltin: "declare a pure nongeneric function with two String parameters returning Bool"
+
+
+private pure func parameter_spelling(parameter: SystemParameter) -> String:
+	match parameter:
+		IntParameter: "Int"
+		StringParameter: "String"
+		StringListParameter: "List[String]"
+
+
+private pure func payload_spelling(payload: SystemPayload) -> String:
+	match payload:
+		IntPayload: "Int"
+		StringPayload: "String"
+		VoidPayload: "Void"
+
+
+-- Rendered from the signature row, so the help cannot disagree with it.
+private pure func system_declaration_help(operation: SystemOperation) -> String:
+	signature = system_signature(operation)
+	spelled = signature.parameters.map(pure func(parameter: SystemParameter) -> String: parameter_spelling(parameter))
+	parameters = match spelled:
+		[]: "no parameters"
+		[only]: "one ${only} parameter"
+		[first, second]:
+			if first == second:
+				"two ${first} parameters"
+			else:
+				"${first}, ${second} parameters"
+		_: "${spelled.join(", ")} parameters"
+	"declare an impure nongeneric function with ${parameters} returning Result[${payload_spelling(signature.success)}, ${payload_spelling(signature.error)}]"
 
 
 union BuiltinTypeRole:

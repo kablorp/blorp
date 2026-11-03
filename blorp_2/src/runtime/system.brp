@@ -1,5 +1,10 @@
+import:
+	./process: process_runtime
+	../utils/syntax: SystemOperation(GetCurrentDirectory, ReadFile, WriteFile, RunToFiles)
+
+
 -- The failure helpers the system fragments share. A failure publishes one
--- fresh counted String, so the error branch always owns `*result`.
+-- fresh counted String into the error out-parameter, which its branch owns.
 SYSTEM_FAILURE_RUNTIME: String =
 	raw
 		|enum {BLORP_SYSTEM_FAILED=0,BLORP_SYSTEM_SUCCEEDED=1};
@@ -18,15 +23,15 @@ SYSTEM_FAILURE_RUNTIME: String =
 		|}
 		|
 
--- Private native staging becomes exactly one owned String on either branch.
--- The caller wraps it in the already designated ordinary Result.
+-- Private native staging becomes exactly one owned String on either branch,
+-- in the out-parameter of that branch.
 SYSTEM_CURRENT_DIRECTORY_RUNTIME: String =
 	raw
 		|#include <errno.h>
 		|#include <limits.h>
 		|#include <unistd.h>
 		|enum {BLORP_CURRENT_DIRECTORY_INITIAL_CAPACITY=256};
-		|uint8_t blorp_get_current_directory(struct blorp_string **result){
+		|uint8_t blorp_get_current_directory(struct blorp_string **directory,struct blorp_string **error){
 		|const size_t maximum_capacity=blorp_string_maximum_capacity()+1;
 		|size_t capacity=BLORP_CURRENT_DIRECTORY_INITIAL_CAPACITY;
 		|char *buffer=blorp_memory_allocate(capacity);
@@ -37,24 +42,24 @@ SYSTEM_CURRENT_DIRECTORY_RUNTIME: String =
 		|const size_t length=strlen(buffer);
 		|if(length==0||buffer[0]!='/'){
 		|blorp_memory_release(buffer);
-		|return blorp_system_failure(result,"get_current_directory: native path must be nonempty and absolute");
+		|return blorp_system_failure(error,"get_current_directory: native path must be nonempty and absolute");
 		|}
 		|if(!blorp_utf8_is_valid(buffer,length)){
 		|blorp_memory_release(buffer);
-		|return blorp_system_failure(result,"get_current_directory: invalid UTF-8; use a working directory with a UTF-8 path");
+		|return blorp_system_failure(error,"get_current_directory: invalid UTF-8; use a working directory with a UTF-8 path");
 		|}
-		|*result=blorp_string_from_bytes(buffer,(int64_t)length);
+		|*directory=blorp_string_from_bytes(buffer,(int64_t)length);
 		|blorp_memory_release(buffer);
 		|return BLORP_SYSTEM_SUCCEEDED;
 		|}
 		|const int saved_errno=errno;
 		|if(saved_errno!=ERANGE){
 		|blorp_memory_release(buffer);
-		|return blorp_system_error(result,"get_current_directory: failed; errno=",saved_errno);
+		|return blorp_system_error(error,"get_current_directory: failed; errno=",saved_errno);
 		|}
 		|if(capacity==maximum_capacity){
 		|blorp_memory_release(buffer);
-		|return blorp_system_error(result,"get_current_directory: failed; errno=",EOVERFLOW);
+		|return blorp_system_error(error,"get_current_directory: failed; errno=",EOVERFLOW);
 		|}
 		|const size_t grown_capacity=capacity>maximum_capacity/2?maximum_capacity:capacity*2;
 		|char *grown=blorp_memory_resize(buffer,grown_capacity);
@@ -73,33 +78,33 @@ SYSTEM_READ_FILE_RUNTIME: String =
 		|#include <limits.h>
 		|/* On supported LP64, positive ftell cannot reach the String size guard. */
 		|_Static_assert(LONG_MAX==INT64_MAX&&(uintmax_t)LONG_MAX<(uintmax_t)(SIZE_MAX-sizeof(struct blorp_string)-1),"read_file requires supported LP64 bounds");
-		|uint8_t blorp_read_file(const struct blorp_string *path,struct blorp_string **result){
+		|uint8_t blorp_read_file(const struct blorp_string *path,struct blorp_string **text,struct blorp_string **error){
 		|/* Every String ends in a NUL, so once no NUL is embedded its bytes are the C path. */
 		|if(memchr(path->bytes,'\0',(size_t)path->length)!=NULL){
-		|return blorp_system_failure(result,"read_file: path contains embedded NUL; use a path without NUL");
+		|return blorp_system_failure(error,"read_file: path contains embedded NUL; use a path without NUL");
 		|}
 		|FILE *stream=fopen(path->bytes,"rb");
 		|const int open_errno=errno;
-		|if(stream==NULL){return blorp_system_error(result,"read_file: open failed; errno=",open_errno);}
+		|if(stream==NULL){return blorp_system_error(error,"read_file: open failed; errno=",open_errno);}
 		|if(fseek(stream,0,SEEK_END)!=0){
 		|const int saved_errno=errno;
 		|(void)fclose(stream);
-		|return blorp_system_error(result,"read_file: seek end failed; errno=",saved_errno);
+		|return blorp_system_error(error,"read_file: seek end failed; errno=",saved_errno);
 		|}
 		|const long measured_length=ftell(stream);
 		|if(measured_length<0){
 		|const int saved_errno=errno;
 		|(void)fclose(stream);
-		|return blorp_system_error(result,"read_file: tell failed; errno=",saved_errno);
+		|return blorp_system_error(error,"read_file: tell failed; errno=",saved_errno);
 		|}
 		|if((uintmax_t)measured_length>(uintmax_t)blorp_string_maximum_capacity()){
 		|(void)fclose(stream);
-		|return blorp_system_error(result,"read_file: size failed; errno=",EOVERFLOW);
+		|return blorp_system_error(error,"read_file: size failed; errno=",EOVERFLOW);
 		|}
 		|if(fseek(stream,0,SEEK_SET)!=0){
 		|const int saved_errno=errno;
 		|(void)fclose(stream);
-		|return blorp_system_error(result,"read_file: seek start failed; errno=",saved_errno);
+		|return blorp_system_error(error,"read_file: seek start failed; errno=",saved_errno);
 		|}
 		|const size_t length=(size_t)measured_length;
 		|char *contents=NULL;
@@ -112,20 +117,20 @@ SYSTEM_READ_FILE_RUNTIME: String =
 		|const int read_failed=ferror(stream);
 		|(void)fclose(stream);
 		|blorp_memory_release(contents);
-		|if(read_failed){return blorp_system_error(result,"read_file: read failed; errno=",saved_errno);}
-		|return blorp_system_failure(result,"read_file: short read");
+		|if(read_failed){return blorp_system_error(error,"read_file: read failed; errno=",saved_errno);}
+		|return blorp_system_failure(error,"read_file: short read");
 		|}
 		|}
 		|if(fclose(stream)!=0){
 		|const int saved_errno=errno;
 		|blorp_memory_release(contents);
-		|return blorp_system_error(result,"read_file: close failed; errno=",saved_errno);
+		|return blorp_system_error(error,"read_file: close failed; errno=",saved_errno);
 		|}
 		|if(length!=0&&!blorp_utf8_is_valid(contents,length)){
 		|blorp_memory_release(contents);
-		|return blorp_system_failure(result,"read_file: invalid UTF-8; save the file as UTF-8");
+		|return blorp_system_failure(error,"read_file: invalid UTF-8; save the file as UTF-8");
 		|}
-		|*result=blorp_string_from_bytes(length==0?"":contents,(int64_t)length);
+		|*text=blorp_string_from_bytes(length==0?"":contents,(int64_t)length);
 		|blorp_memory_release(contents);
 		|return BLORP_SYSTEM_SUCCEEDED;
 		|}
@@ -165,3 +170,32 @@ SYSTEM_WRITE_FILE_RUNTIME: String =
 		|return BLORP_SYSTEM_SUCCEEDED;
 		|}
 		|
+
+
+-- The C symbol each system operation calls. Its fragment defines it with the
+-- emitter's one shape: borrowed arguments, then one out-parameter per non-Void
+-- Result payload, success first, returning whether the call succeeded.
+pure func system_symbol(operation: SystemOperation) -> String:
+	match operation:
+		GetCurrentDirectory: "blorp_get_current_directory"
+		ReadFile: "blorp_read_file"
+		WriteFile: "blorp_write_file"
+		RunToFiles: "blorp_process_run_to_files"
+
+
+-- `posix_declarations` requests POSIX.1-2008 before any header;
+-- `failure_helpers` needs SYSTEM_FAILURE_RUNTIME emitted before the fragment.
+record SystemRuntime {
+	fragment: String,
+	posix_declarations: Bool,
+	failure_helpers: Bool
+}
+
+
+-- The emitter supplies the String-list C type from its existing typed key.
+pure func system_runtime(operation: SystemOperation, string_list_type: String) -> SystemRuntime:
+	match operation:
+		GetCurrentDirectory: { fragment = SYSTEM_CURRENT_DIRECTORY_RUNTIME, posix_declarations = False, failure_helpers = True }
+		ReadFile: { fragment = SYSTEM_READ_FILE_RUNTIME, posix_declarations = False, failure_helpers = True }
+		WriteFile: { fragment = SYSTEM_WRITE_FILE_RUNTIME, posix_declarations = False, failure_helpers = True }
+		RunToFiles: { fragment = process_runtime(string_list_type), posix_declarations = True, failure_helpers = False }

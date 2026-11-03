@@ -10,11 +10,13 @@ import:
 			FloatCopySign, FloatEquals, FloatLessThan,
 			IntAdd, IntSubtract, IntMultiply, IntDivide, IntRemainder, IntToString, StringLength, StringConcat, StringAppendInt,
 			StringPrint, StringPrintError, StringParseInt, StringParseFloat, ListRepeat, ListLength, ListGet, ListAppend, ListSet,
-			StringByteAt, StringFromCodepoint, StringSlice, GetCurrentDirectory, ReadFile, WriteFile, RunToFiles,
+			StringByteAt, StringFromCodepoint, StringSlice, SystemCall,
 			ListConcat, StringEquals,
 			IntEquals, IntLessThan, FloatAdd, FloatSubtract, FloatMultiply, FloatDivide, FloatRemainder,
 			FloatToString,
 		),
+		SystemPayload(IntPayload, StringPayload, VoidPayload),
+		system_signature,
 	./float_literal: c_float_literal
 	./diagnostics:
 		AggregateKind(RecordAggregate, UnionAggregate),
@@ -26,10 +28,10 @@ import:
 			MissingAggregateMember, MissingUnionPayloadField, MissingInPlaceHelper,
 		), render,
 	../runtime/float: float_parse_runtime, float_runtime, float_string_runtime
-	../runtime/system: SYSTEM_CURRENT_DIRECTORY_RUNTIME, SYSTEM_FAILURE_RUNTIME, SYSTEM_READ_FILE_RUNTIME, SYSTEM_WRITE_FILE_RUNTIME
+	../runtime/system: SYSTEM_FAILURE_RUNTIME, SystemRuntime, system_runtime, system_symbol
 	../runtime/string_concat: string_concat_runtime, string_append_int_runtime
 	../runtime/memory: MEMORY_RUNTIME
-	../runtime/process: PROCESS_POSIX_PRELUDE, process_runtime
+	../runtime/process: PROCESS_POSIX_PRELUDE
 	int: INT_MIN, Int methods
 	../runtime/list:
 		ListElementKey, ListUpdate(AppendUpdate, SetUpdate, ConcatUpdate, SuffixUpdate), arguments_runtime,
@@ -93,6 +95,7 @@ import:
 		Span,
 		compiler_span,
 		entry_function,
+		SystemOperation,
 	../utils/text: concat
 	../verify/verify: VerifiedProgram, verified_contents
 
@@ -129,8 +132,8 @@ private pure func c_owner(id: OwnerId) -> String:
 	"blorp_owner_".append_int(owner_number(id))
 
 
--- Designated-Bool operations use statement dispatch and constructor publication,
--- not the ordinary expression-callable symbol path.
+-- Designated-Bool operations and system calls use statement dispatch and
+-- constructor publication, not the ordinary expression-callable symbol path.
 private pure func c_callable(target: CallTarget) -> Option[String]:
 	match target:
 		UserFunction(id):
@@ -183,14 +186,6 @@ private pure func c_callable(target: CallTarget) -> Option[String]:
 					Some("blorp_string_from_codepoint")
 				StringSlice(_):
 					Some("blorp_string_slice")
-				RunToFiles(_):
-					Some("blorp_process_run_to_files")
-				ReadFile(_):
-					Some("blorp_read_file")
-				WriteFile(_):
-					Some("blorp_write_file")
-				GetCurrentDirectory(_):
-					Some("blorp_get_current_directory")
 				ListRepeat(element):
 					Some("blorp_list_repeat_${list_suffix(list_element_key(element))}")
 				ListLength(element):
@@ -203,7 +198,7 @@ private pure func c_callable(target: CallTarget) -> Option[String]:
 					Some(list_update_name(SetUpdate, list_element_key(element)))
 				ListConcat(element):
 					Some(list_update_name(ConcatUpdate, list_element_key(element)))
-				StringEquals(_) | IntEquals(_) | IntLessThan(_) | FloatEquals(_) | FloatLessThan(_):
+				StringEquals(_) | IntEquals(_) | IntLessThan(_) | FloatEquals(_) | FloatLessThan(_) | SystemCall(_, _):
 					None
 
 
@@ -1256,73 +1251,46 @@ private pure func append_string_slice(
 	append_optional_value(prefix, id, option, "${scratch}_some", scratch, unions, span)
 
 
-private pure func append_current_directory(
-	output: String,
-	id: ValueId,
-	result: DesignatedResult[VariantInstanceId],
-	unions: List[ConcreteUnion],
-	span: Span,
-) -> Result[String, Diagnostic]:
-	declaration ?= c_local_declaration(UnionType(variant_owner(result.ok)), InitializedLocal, unions, span)
-	scratch = "blorp_runtime_".append_int(value_number(id))
-	ok ?= c_union_value(result.ok, [scratch], unions, span)
-	error ?= c_union_value(result.err, [scratch], unions, span)
-	-- Both branches take the one fresh String. Scratch has no separate obligation.
-	Ok("${output}struct blorp_string *${scratch}=NULL;const uint8_t ${scratch}_ok=blorp_get_current_directory(&${scratch});"
-		.concat("${declaration}${c_value(id)}=${scratch}_ok?${ok}:${error};(void)${c_value(id)};"))
+-- The declaration of the C local a system call fills with one Result payload.
+-- A Void payload has none; its constructor takes the unmanaged unit.
+private pure func system_payload_local(payload: SystemPayload, name: String) -> Option[String]:
+	match payload:
+		IntPayload: Some("int64_t ${name}=0;")
+		StringPayload: Some("struct blorp_string *${name}=NULL;")
+		VoidPayload: None
 
 
-private pure func append_read_file(
-	output: String,
-	id: ValueId,
-	result: DesignatedResult[VariantInstanceId],
-	arguments: List[OwnedArgument],
-	unions: List[ConcreteUnion],
-	span: Span,
-) -> Result[String, Diagnostic]:
-	path ?= runtime_argument(arguments, 0, id, span)
-	declaration ?= c_local_declaration(UnionType(variant_owner(result.ok)), InitializedLocal, unions, span)
-	scratch = "blorp_runtime_".append_int(value_number(id))
-	ok ?= c_union_value(result.ok, [scratch], unions, span)
-	error ?= c_union_value(result.err, [scratch], unions, span)
-	-- The path is borrowed; either constructor takes the one fresh String.
-	Ok("${output}struct blorp_string *${scratch}=NULL;"
-		.concat("const uint8_t ${scratch}_ok=blorp_read_file(${c_value(argument_value(path))},&${scratch});")
-		.concat("${declaration}${c_value(id)}=${scratch}_ok?${ok}:${error};(void)${c_value(id)};"))
+-- The call's argument and the constructor's payload for one Result branch.
+private record PayloadUse {
+	addresses: List[String],
+	declarations: String,
+	value: String
+}
 
 
--- Native outputs stay private; only the designated ordinary Result escapes.
-private pure func append_run_to_files(
-	output: String, id: ValueId, result: DesignatedResult[VariantInstanceId],
+private pure func payload_use(payload: SystemPayload, name: String, previous: PayloadUse) -> PayloadUse:
+	match system_payload_local(payload, name):
+		Some(declaration): { addresses = previous.addresses.append("&${name}"), declarations = previous.declarations.concat(declaration), value = name }
+		None: { previous | value = "(uint8_t)0" }
+
+
+-- Every system call has one C shape: its borrowed arguments, then the address
+-- of one local per non-Void payload, success first, and a status choosing the
+-- constructor. Each constructor takes its own fresh payload, and the other
+-- local stays unowned.
+private pure func append_system_call(
+	output: String, id: ValueId, operation: SystemOperation, result: DesignatedResult[VariantInstanceId],
 	arguments: List[OwnedArgument], unions: List[ConcreteUnion], span: Span,
 ) -> Result[String, Diagnostic]:
-	values = arguments.map(pure func(argument: OwnedArgument) -> String: c_value(argument_value(argument))).join(",")
-	declaration ?= c_local_declaration(UnionType(variant_owner(result.ok)), InitializedLocal, unions, span)
+	signature = system_signature(operation)
 	scratch = "blorp_runtime_".append_int(value_number(id))
-	ok ?= c_union_value(result.ok, ["${scratch}_status"], unions, span)
-	error ?= c_union_value(result.err, ["${scratch}_error"], unions, span)
-	Ok("${output}int64_t ${scratch}_status=0;struct blorp_string *${scratch}_error=NULL;"
-		.concat("const uint8_t ${scratch}_ok=blorp_process_run_to_files(${values},&${scratch}_status,&${scratch}_error);")
-		.concat("${declaration}${c_value(id)}=${scratch}_ok?${ok}:${error};(void)${c_value(id)};"))
-
-
-private pure func append_write_file(
-	output: String,
-	id: ValueId,
-	result: DesignatedResult[VariantInstanceId],
-	arguments: List[OwnedArgument],
-	unions: List[ConcreteUnion],
-	span: Span,
-) -> Result[String, Diagnostic]:
-	path ?= runtime_argument(arguments, 0, id, span)
-	contents ?= runtime_argument(arguments, 1, id, span)
+	values = arguments.map(pure func(argument: OwnedArgument) -> String: c_value(argument_value(argument)))
+	success = payload_use(signature.success, "${scratch}_value", { addresses = values, declarations = "", value = "" })
+	failure = payload_use(signature.error, "${scratch}_error", success)
 	declaration ?= c_local_declaration(UnionType(variant_owner(result.ok)), InitializedLocal, unions, span)
-	scratch = "blorp_runtime_".append_int(value_number(id))
-	ok ?= c_union_value(result.ok, ["(uint8_t)0"], unions, span)
-	error ?= c_union_value(result.err, [scratch], unions, span)
-	-- Only Err takes a String root; Ok stores the actual unmanaged Void payload.
-	Ok("${output}struct blorp_string *${scratch}=NULL;"
-		.concat("const uint8_t ${scratch}_ok=blorp_write_file(${c_value(argument_value(path))},${c_value(argument_value(contents))},&${scratch});")
+	ok ?= c_union_value(result.ok, [success.value], unions, span)
+	error ?= c_union_value(result.err, [failure.value], unions, span)
+	Ok("${output}${failure.declarations}const uint8_t ${scratch}_ok=${system_symbol(operation)}(${failure.addresses.join(",")});"
 		.concat("${declaration}${c_value(id)}=${scratch}_ok?${ok}:${error};(void)${c_value(id)};"))
 
 
@@ -1394,14 +1362,8 @@ private pure func append_value(
 					append_string_from_codepoint(output, id, option, arguments, unions, span)
 				RuntimeFunction(StringSlice(option)):
 					append_string_slice(output, id, option, arguments, unions, span)
-				RuntimeFunction(RunToFiles(result)):
-					append_run_to_files(output, id, result, arguments, unions, span)
-				RuntimeFunction(ReadFile(result)):
-					append_read_file(output, id, result, arguments, unions, span)
-				RuntimeFunction(WriteFile(result)):
-					append_write_file(output, id, result, arguments, unions, span)
-				RuntimeFunction(GetCurrentDirectory(result)):
-					append_current_directory(output, id, result, unions, span)
+				RuntimeFunction(SystemCall(system, result)):
+					append_system_call(output, id, system, result, arguments, unions, span)
 				RuntimeFunction(StringEquals(boolean)):
 					append_comparison(output, id, boolean, arguments, unions, StringEquality, span)
 				RuntimeFunction(IntEquals(boolean)):
@@ -2449,10 +2411,6 @@ private pure func innermost_element(value_type: TypeRef) -> TypeRef:
 -- selects its own helper. Allocation headers follow from the layouts and the
 -- argument vector from the entrypoint, which already own those facts.
 private fixed record RuntimeRequirements {
-	process: Bool,
-	current_directory: Bool,
-	file_read: Bool,
-	file_write: Bool,
 	string_types: Bool,
 	float_types: Bool,
 	integer_addition: Bool,
@@ -2471,10 +2429,6 @@ private fixed record RuntimeRequirements {
 
 private pure func runtime_requirements(inventory: ProgramInventory) -> RuntimeRequirements:
 	var requirements: RuntimeRequirements = {
-		process = False,
-		current_directory = False,
-		file_read = False,
-		file_write = False,
 		string_types = False,
 		float_types = False,
 		integer_addition = False,
@@ -2498,10 +2452,6 @@ private pure func runtime_requirements(inventory: ProgramInventory) -> RuntimeRe
 
 	for operation in inventory.runtime_calls:
 		match operation:
-			RunToFiles(_): requirements = { requirements | process = True }
-			ReadFile(_): requirements = { requirements | file_read = True }
-			WriteFile(_): requirements = { requirements | file_write = True }
-			GetCurrentDirectory(_): requirements = { requirements | current_directory = True }
 			IntAdd: requirements = { requirements | integer_addition = True }
 			IntSubtract | IntMultiply | IntDivide | IntRemainder:
 				requirements = { requirements | integer_arithmetic = True }
@@ -2520,8 +2470,24 @@ private pure func runtime_requirements(inventory: ProgramInventory) -> RuntimeRe
 				void
 			FloatCopySign | FloatEquals(_) | FloatLessThan(_):
 				void
+			-- system_calls selects each system operation's own fragment.
+			SystemCall(_, _):
+				void
 
 	requirements
+
+
+-- Each system operation the program calls, once, in first-call order; each
+-- selects its own runtime fragment.
+private pure func system_calls(inventory: ProgramInventory) -> List[SystemOperation]:
+	var calls: List[SystemOperation] = []
+	for operation in inventory.runtime_calls:
+		match operation:
+			SystemCall(system, _):
+				if calls.contains(system).not():
+					calls = calls.append(system)
+			_: void
+	calls
 
 
 -- This table lives for one emission only. Its complete key is a projection
@@ -3015,7 +2981,9 @@ pure func emit(program: VerifiedProgram) -> Result[String, Diagnostic]:
 		string_runtime()
 	else:
 		"#include <stdint.h>\n"
-	var fragments: List[String] = if requirements.process:
+	string_list_type = list_c_type(list_element_key(StringType))
+	system = system_calls(inventory).map(pure func(operation: SystemOperation) -> SystemRuntime: system_runtime(operation, string_list_type))
+	var fragments: List[String] = if system.any(pure func(runtime: SystemRuntime) -> Bool: runtime.posix_declarations):
 		[PROCESS_POSIX_PRELUDE, MEMORY_RUNTIME, prelude]
 	else:
 		[MEMORY_RUNTIME, prelude]
@@ -3056,18 +3024,6 @@ pure func emit(program: VerifiedProgram) -> Result[String, Diagnostic]:
 	if requirements.string_error_output:
 		fragments = fragments.append(STRING_PRINT_ERROR_RUNTIME)
 
-	if requirements.file_read.or(requirements.file_write).or(requirements.current_directory):
-		fragments = fragments.append(SYSTEM_FAILURE_RUNTIME)
-
-	if requirements.file_read:
-		fragments = fragments.append(SYSTEM_READ_FILE_RUNTIME)
-
-	if requirements.file_write:
-		fragments = fragments.append(SYSTEM_WRITE_FILE_RUNTIME)
-
-	if requirements.current_directory:
-		fragments = fragments.append(SYSTEM_CURRENT_DIRECTORY_RUNTIME)
-
 	if requirements.integer_parsing:
 		fragments = fragments.append(string_parse_int_runtime())
 
@@ -3084,8 +3040,11 @@ pure func emit(program: VerifiedProgram) -> Result[String, Diagnostic]:
 		fragments = fragments.append(STRING_SLICE_RUNTIME)
 
 	fragments = fragments.append(aggregates)
-	if requirements.process:
-		fragments = fragments.append(process_runtime(list_c_type(list_element_key(StringType))))
+	-- System fragments follow the aggregates, whose String-list type they use.
+	if system.any(pure func(runtime: SystemRuntime) -> Bool: runtime.failure_helpers):
+		fragments = fragments.append(SYSTEM_FAILURE_RUNTIME)
+	for runtime in system:
+		fragments = fragments.append(runtime.fragment)
 	var index: Int = 0
 	var failure: Option[Diagnostic] = None
 

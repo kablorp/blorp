@@ -79,9 +79,12 @@ static char *observed_getcwd(char *buffer, size_t capacity) {
 #undef malloc
 
 static struct blorp_string *query(uint8_t expected_status, const char *expected) {
-    struct blorp_string *payload = NULL;
+    struct blorp_string *directory = NULL, *error = NULL;
     const size_t before_allocations = allocation_count, before_frees = staging_frees;
-    const uint8_t status = blorp_get_current_directory(&payload);
+    const uint8_t status = blorp_get_current_directory(&directory, &error);
+    /* Exactly one out-parameter receives a fresh String. */
+    assert((directory == NULL) != (error == NULL));
+    struct blorp_string *payload = status ? directory : error;
     assert(status == expected_status && payload);
     assert(atomic_load(&payload->references) == 1);
     assert(payload->length == (int64_t)strlen(expected));

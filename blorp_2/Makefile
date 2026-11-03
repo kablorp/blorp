@@ -48,6 +48,7 @@ TARGET_COMPONENT_SOURCES := \
 	blorp_2/test/unit/test_parse/test_arithmetic_operators.brp \
 	blorp_2/test/unit/test_parse/test_constant_inventory.brp \
 	blorp_2/test/unit/test_parse/test_file_read.brp \
+	blorp_2/test/unit/test_parse/test_system_labels.brp \
 	blorp_2/test/unit/test_parse/test_float_builtin_labels.brp \
 	blorp_2/test/unit/test_parse/test_int_comparisons.brp \
 	blorp_2/test/unit/test_parse/test_ordering_operators.brp \

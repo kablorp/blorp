@@ -160,8 +160,11 @@ static struct blorp_string *query(const char *path_bytes, size_t path_length,
     borrowed_bytes = path->bytes;
     const size_t previous_staging_frees = staging_frees;
     const size_t previous_opens = open_count, previous_closes = close_count, previous_reads = read_count;
-    struct blorp_string *payload = NULL;
-    const uint8_t status = blorp_read_file(path, &payload);
+    struct blorp_string *text = NULL, *error = NULL;
+    const uint8_t status = blorp_read_file(path, &text, &error);
+    /* Exactly one out-parameter receives a fresh String. */
+    assert((text == NULL) != (error == NULL));
+    struct blorp_string *payload = status ? text : error;
     assert(status == expected_status && payload && payload != path);
     assert(atomic_load(&path->references) == 1 && atomic_load(&payload->references) == 1);
     assert(path->length == (int64_t)path_length && memcmp(path->bytes, path_bytes, path_length) == 0);
