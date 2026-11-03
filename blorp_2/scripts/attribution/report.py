@@ -30,7 +30,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 # Functions the roadmap names as O1's targets, the loops that append owner
 # aliases, and `text.concat`, which `emit` calls.
 COPY_TARGETS = ("emit.append_input_owners", "emit.append_join", "emit.append_selection", "emit.append_selection_body",
-                "emit.append_loop", "emit.append_loop_exit", "names.with_bucket_entry", "emit.emit",
+                "emit.append_loop", "emit.append_loop_exit", "emit.emit",
                 "text.concat")
 NAMED_ROWS_PER_FUNCTION = 6
 

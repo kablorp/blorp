@@ -1,6 +1,6 @@
 # Blorp 2 Dict
 
-Status: approved 2026-11-02, with the decisions below. Phases 0 to 3 are done ([spike report](../benchmarks/results/blorp2-dict-spike-2026-11-02.md), [phase 1 results](../benchmarks/results/blorp2-dict-phase1-2026-11-02.md), [phase 2 results](../benchmarks/results/blorp2-dict-phase2-2026-11-02.md), [phase 3 results](../benchmarks/results/blorp2-dict-phase3-2026-11-02.md)); their findings are folded in below, and phase 4 (names) is next. Each phase gets its own implementation brief.
+Status: approved 2026-11-02, with the decisions below. Phases 0 to 4 are done ([spike report](../benchmarks/results/blorp2-dict-spike-2026-11-02.md), [phase 1 results](../benchmarks/results/blorp2-dict-phase1-2026-11-02.md), [phase 2 results](../benchmarks/results/blorp2-dict-phase2-2026-11-02.md), [phase 3 results](../benchmarks/results/blorp2-dict-phase3-2026-11-02.md), [phase 4 results](../benchmarks/results/blorp2-dict-phase4-2026-11-02.md)); their findings are folded in below, and phase 5 (record keys) is next. Each phase gets its own implementation brief.
 
 ## Problem
 
@@ -129,7 +129,7 @@ All of these are pure. `n` is the number of live entries.
 ## Hashing
 
 - **`Int`:** identity, as today.
-- **`String`:** the byte formula `utils/names.brp` uses, `hash = (hash + byte) * PRIME`, wrapping, from a named basis. It moves to `string.brp` as `implements Hashable for String`.
+- **`String`:** the byte formula `utils/names.brp`'s bucket index used, `hash = (hash + byte) * PRIME`, wrapping, from a named basis. It moves to `string.brp` as `implements Hashable for String`.
 - **`Bool`:** `False` is 0 and `True` is 1.
 - **Records and unions get written implementations, never derived.** `_base.brp` ("never derived"), both READMEs and the 2026-10-30 Hashable report record that owner decision, and this spec keeps it. Compiler key types migrated in phase 5 get written `Hashable` and `DictKey` implementations:
   - `TypeHead`, the sealed instance keys, and the opaque ids in `utils/ids.brp`.
@@ -218,7 +218,7 @@ Each phase lands green on its own, with self-compile allocations, `-O0`/`-O2` in
 | 1, Dict (done) | `dict.brp` with `DictKey`, the operations, equality; `DictKey` for `Int`, and `Hashable`/`DictKey` for `String` and `Bool`; and the probing, churn, compaction, linearity and ownership tests: [results](../benchmarks/results/blorp2-dict-phase1-2026-11-02.md). Equality needed trait implementations on generic opaque types (83bc73dac) and so a seed that has them. | Dict usable through calls |
 | 2, literals (done) | Lexer, parser, AST, checking rewrite, grammar and tests, as in Literals: [results](../benchmarks/results/blorp2-dict-phase2-2026-11-02.md) | `{}` and `{k => v}` work |
 | 3, HashMap (done) | The six `HashMap` users moved to `Dict`, keeping their Int keys, and `utils/hash_map.brp` and its suite were deleted. The README, `ROADMAP.md` and standard library README no longer describe it: [results](../benchmarks/results/blorp2-dict-phase3-2026-11-02.md) | No stopgap map |
-| 4, names | `utils/names.brp` becomes a `Dict[String, NameId]`. An id is its spelling's position in `keys()`, since names are never removed, so the separate `spellings` List and the bucket functions are deleted | No bucket table |
+| 4, names (done) | `utils/names.brp` becomes a `Dict[String, NameId]`. An id is its spelling's position in `keys()`, since names are never removed, so the separate `spellings` List and the bucket functions are deleted: [results](../benchmarks/results/blorp2-dict-phase4-2026-11-02.md) | No bucket table |
 | 5, record keys | Written `Hashable`/`DictKey` for `TypeHead` and the opaque ids. `model.brp`'s `implementation_table` becomes a Dict keyed by `TypeHead`. Specialize's **sealed** instance tables become Dicts keyed by their full keys. Its **slot** tables keep `IndexedList`, because their digests deliberately hash only the head while `resolve_partial` rewrites pending references inside the stored key. Replace the squashed pair keys where a written hash is cheap. | Fewer digests and hints |
 | later | `Set`; `update`/`update_or` once a List take-or-update builtin exists; set-shaped scans moved where measured or where the change deletes code | |
 
@@ -291,7 +291,7 @@ Each language that allows Float keys either loses NaN keys or uses a key equalit
 
 ## Risks
 
-- **Updating a value in place.** A value read with `get` is a second reference, so changing a `Dict[K, List[V]]` value copies that List. The ROADMAP's O1 follow-ups record the same problem for `with_bucket_entry`. Making it in place needs a List take-or-update-at-index builtin, which needs a bootstrap rotation. Until then, multimap callers pay the copy, as they do now.
+- **Updating a value in place.** A value read with `get` is a second reference, so changing a `Dict[K, List[V]]` value copies that List. Making it in place needs a List take-or-update-at-index builtin, which needs a bootstrap rotation. Until then, multimap callers pay the copy, as they do now.
 - **String hashing goes byte by byte through `byte_at`,** which returns an `Option[Int]`. Phase 0 measures whether that allocates. If it does, String keys may need a `string.hash` builtin, which needs a rotation, before the ceilings hold.
 - **One record allocation per update until O3.** This is measured in phase 0.
 - **`{}` and empty records:** if empty records are ever added, `{}` stays a Dict, as legacy Blorp decided, and they need another spelling.

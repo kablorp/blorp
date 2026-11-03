@@ -1,8 +1,3 @@
-import:
-	int: Int methods
-	string: String methods
-
-
 -- IDs are scoped to one table and its extensions, never to another parse.
 opaque type NameId = Int
 
@@ -82,15 +77,14 @@ fixed record FoundationWords {
 }
 
 
--- `spellings` is the authority: an ID is its spelling's position. `buckets` is
--- an index derived only from `spellings` and written only while extending: a
--- spelling's bucket lists the IDs whose spellings hash there, and a lookup
--- compares complete spellings within that one bucket, so a collision costs a
--- comparison and never a wrong ID. Both live as long as the compilation, and
--- so do the seed's `words`.
+-- An ID is its spelling's position among `by_spelling`'s keys, and the
+-- spelling's value is that same ID. Only `seed_word` and `intern_names` add
+-- keys, each taking the ID from the length before its `set`; the seed's
+-- spellings are distinct and `intern_names` sets only absent ones. Never
+-- remove a name: positions would shift and `keys()` would copy. The table and
+-- the seed's `words` live as long as the compilation.
 private record NameRows {
-	spellings: List[String],
-	buckets: List[List[NameId]],
+	by_spelling: Dict[String, NameId],
 	words: ContextualWords,
 	foundation: FoundationWords
 }
@@ -118,146 +112,63 @@ record EntrypointNames {
 }
 
 
--- Extending grows the bucket count from n to 2n+1 whenever names outnumber
--- buckets, so a bucket holds fewer than two IDs on average. Counts stay odd
--- because a remainder by a power of two would read only the hash's low bits,
--- which the multiplication below leaves poorly mixed.
-private MINIMUM_BUCKETS: Int = 31
-
--- The 64-bit FNV offset basis and prime, adding each byte where FNV uses xor
--- (the subset has no bit operations). Int multiplication wraps.
-private SPELLING_HASH_BASIS: Int = -3750763034362895579
-
-private SPELLING_HASH_PRIME: Int = 1099511628211
-
-
--- Byte and List reads return Option even where the index is known to be in range.
--- Every `None` arm in `spelling_bucket`, `lookup` and `with_bucket_entry` is
--- unreachable: byte positions stay below the spelling's length, bucket
--- positions are remainders by the bucket count, and IDs are positions in
--- `spellings`.
-private pure func spelling_bucket(spelling: String, bucket_count: Int) -> Int:
-	var hash = SPELLING_HASH_BASIS
-	var position: Int = 0
-
-	while position < spelling.length():
-		match spelling.byte_at(position):
-			Some(byte):
-				hash = (hash + byte) * SPELLING_HASH_PRIME
-			None:
-				void
-
-		position = position + 1
-
-	bucket = hash % bucket_count
-
-	if bucket < 0:
-		bucket + bucket_count
-	else:
-		bucket
-
-
-private pure func lookup(spellings: List[String], buckets: List[List[NameId]], spelling: String) -> Option[NameId]:
-	var found: Option[NameId] = None
-
-	match buckets.get(spelling_bucket(spelling, buckets.length())):
-		Some(bucket):
-			for id in bucket:
-				match spellings.get(from_opaque NameId(id)):
-					Some(known):
-						if known == spelling:
-							found = Some(id)
-							break
-					None:
-						void
-		None:
-			void
-
-	found
-
-
-private pure func with_bucket_entry(buckets: List[List[NameId]], spelling: String, id: NameId) -> List[List[NameId]]:
-	bucket = spelling_bucket(spelling, buckets.length())
-	empty: List[NameId] = []
-	listed = match buckets.get(bucket):
-		Some(ids): ids
-		None: empty
-	buckets.set(bucket, listed.append(id))
-
-
-private pure func index_spellings(spellings: List[String], bucket_count: Int) -> List[List[NameId]]:
-	var buckets: List[List[NameId]] = []
-
-	while buckets.length() < bucket_count:
-		buckets = buckets.append([])
-
-	var position: Int = 0
-
-	for spelling in spellings:
-		buckets = with_bucket_entry(buckets, spelling, into_opaque NameId(position))
-		position = position + 1
-
-	buckets
-
-
 private record SeededWord {
-	spellings: List[String],
+	by_spelling: Dict[String, NameId],
 	id: NameId
 }
 
 
--- Appends `spelling` to the seed and returns the ID it receives there.
-private pure func seed_word(spellings: List[String], spelling: String) -> SeededWord:
-	id = into_opaque NameId(spellings.length())
-	{ spellings = spellings.append(spelling), id = id }
+-- Adds `spelling` to the seed and returns the ID it receives there.
+private pure func seed_word(by_spelling: Dict[String, NameId], spelling: String) -> SeededWord:
+	id = into_opaque NameId(by_spelling.length())
+	{ by_spelling = by_spelling.set(spelling, id), id = id }
 
 
 pure func program_names() -> EntrypointNames:
 	-- The executable entrypoint is an ABI spelling. Types come from the designated foundation module.
-	main = seed_word([], "main")
-	fixed_word = seed_word(main.spellings, "fixed")
-	methods_word = seed_word(fixed_word.spellings, "methods")
-	int_word = seed_word(methods_word.spellings, "Int")
-	float_word = seed_word(int_word.spellings, "Float")
-	string_word = seed_word(float_word.spellings, "String")
-	void_word = seed_word(string_word.spellings, "Void")
-	list_word = seed_word(void_word.spellings, "List")
-	tail_recursive_word = seed_word(list_word.spellings, "tail_recursive")
-	bool_word = seed_word(tail_recursive_word.spellings, "Bool")
-	true_word = seed_word(bool_word.spellings, "True")
-	false_word = seed_word(true_word.spellings, "False")
-	option_word = seed_word(false_word.spellings, "Option")
-	some_word = seed_word(option_word.spellings, "Some")
-	none_word = seed_word(some_word.spellings, "None")
-	result_word = seed_word(none_word.spellings, "Result")
-	ok_word = seed_word(result_word.spellings, "Ok")
-	err_word = seed_word(ok_word.spellings, "Err")
-	self_word = seed_word(err_word.spellings, "Self")
-	equatable_word = seed_word(self_word.spellings, "Equatable")
-	equals_word = seed_word(equatable_word.spellings, "equals")
-	not_equals_word = seed_word(equals_word.spellings, "not_equals")
-	orderable_word = seed_word(not_equals_word.spellings, "Orderable")
-	less_than_word = seed_word(orderable_word.spellings, "less_than")
-	greater_than_word = seed_word(less_than_word.spellings, "greater_than")
-	less_than_or_equal_word = seed_word(greater_than_word.spellings, "less_than_or_equal")
-	greater_than_or_equal_word = seed_word(less_than_or_equal_word.spellings, "greater_than_or_equal")
-	addable_word = seed_word(greater_than_or_equal_word.spellings, "Addable")
-	add_word = seed_word(addable_word.spellings, "add")
-	subtractable_word = seed_word(add_word.spellings, "Subtractable")
-	subtract_word = seed_word(subtractable_word.spellings, "subtract")
-	multipliable_word = seed_word(subtract_word.spellings, "Multipliable")
-	multiply_word = seed_word(multipliable_word.spellings, "multiply")
-	divisible_word = seed_word(multiply_word.spellings, "Divisible")
-	divide_word = seed_word(divisible_word.spellings, "divide")
-	modulable_word = seed_word(divide_word.spellings, "Modulable")
-	remainder_word = seed_word(modulable_word.spellings, "remainder")
-	negatable_word = seed_word(remainder_word.spellings, "Negatable")
-	negate_word = seed_word(negatable_word.spellings, "negate")
-	dict_word = seed_word(negate_word.spellings, "Dict")
-	empty_word = seed_word(dict_word.spellings, "empty")
-	with_capacity_word = seed_word(empty_word.spellings, "with_capacity")
-	set_word = seed_word(with_capacity_word.spellings, "set")
-	spellings = set_word.spellings
+	main = seed_word({}, "main")
+	fixed_word = seed_word(main.by_spelling, "fixed")
+	methods_word = seed_word(fixed_word.by_spelling, "methods")
+	int_word = seed_word(methods_word.by_spelling, "Int")
+	float_word = seed_word(int_word.by_spelling, "Float")
+	string_word = seed_word(float_word.by_spelling, "String")
+	void_word = seed_word(string_word.by_spelling, "Void")
+	list_word = seed_word(void_word.by_spelling, "List")
+	tail_recursive_word = seed_word(list_word.by_spelling, "tail_recursive")
+	bool_word = seed_word(tail_recursive_word.by_spelling, "Bool")
+	true_word = seed_word(bool_word.by_spelling, "True")
+	false_word = seed_word(true_word.by_spelling, "False")
+	option_word = seed_word(false_word.by_spelling, "Option")
+	some_word = seed_word(option_word.by_spelling, "Some")
+	none_word = seed_word(some_word.by_spelling, "None")
+	result_word = seed_word(none_word.by_spelling, "Result")
+	ok_word = seed_word(result_word.by_spelling, "Ok")
+	err_word = seed_word(ok_word.by_spelling, "Err")
+	self_word = seed_word(err_word.by_spelling, "Self")
+	equatable_word = seed_word(self_word.by_spelling, "Equatable")
+	equals_word = seed_word(equatable_word.by_spelling, "equals")
+	not_equals_word = seed_word(equals_word.by_spelling, "not_equals")
+	orderable_word = seed_word(not_equals_word.by_spelling, "Orderable")
+	less_than_word = seed_word(orderable_word.by_spelling, "less_than")
+	greater_than_word = seed_word(less_than_word.by_spelling, "greater_than")
+	less_than_or_equal_word = seed_word(greater_than_word.by_spelling, "less_than_or_equal")
+	greater_than_or_equal_word = seed_word(less_than_or_equal_word.by_spelling, "greater_than_or_equal")
+	addable_word = seed_word(greater_than_or_equal_word.by_spelling, "Addable")
+	add_word = seed_word(addable_word.by_spelling, "add")
+	subtractable_word = seed_word(add_word.by_spelling, "Subtractable")
+	subtract_word = seed_word(subtractable_word.by_spelling, "subtract")
+	multipliable_word = seed_word(subtract_word.by_spelling, "Multipliable")
+	multiply_word = seed_word(multipliable_word.by_spelling, "multiply")
+	divisible_word = seed_word(multiply_word.by_spelling, "Divisible")
+	divide_word = seed_word(divisible_word.by_spelling, "divide")
+	modulable_word = seed_word(divide_word.by_spelling, "Modulable")
+	remainder_word = seed_word(modulable_word.by_spelling, "remainder")
+	negatable_word = seed_word(remainder_word.by_spelling, "Negatable")
+	negate_word = seed_word(negatable_word.by_spelling, "negate")
+	dict_word = seed_word(negate_word.by_spelling, "Dict")
+	empty_word = seed_word(dict_word.by_spelling, "empty")
+	with_capacity_word = seed_word(empty_word.by_spelling, "with_capacity")
+	set_word = seed_word(with_capacity_word.by_spelling, "set")
 	words: ContextualWords = {
 		self_word = self_word.id,
 		fixed_word = fixed_word.id,
@@ -282,7 +193,7 @@ pure func program_names() -> EntrypointNames:
 		dict_word = dict_word.id, empty_word = empty_word.id, with_capacity_word = with_capacity_word.id, set_word = set_word.id
 	}
 	{
-		names = into_opaque NameTable({ spellings = spellings, buckets = index_spellings(spellings, MINIMUM_BUCKETS), words = words, foundation = foundation }),
+		names = into_opaque NameTable({ by_spelling = set_word.by_spelling, words = words, foundation = foundation }),
 		main = main.id
 	}
 
@@ -302,50 +213,29 @@ pure func name_number(id: NameId) -> Int:
 
 -- Assembly checks the complete spelling-to-ID mapping before accepting a
 -- lexer extension. Independent or stale extensions cannot silently mix IDs.
--- The buckets are derived from the spellings, so the spellings decide.
+-- IDs are key positions, so equal key lists are equal mappings.
 pure func same_name_table(left: NameTable, right: NameTable) -> Bool:
-	left_names = from_opaque NameTable(left).spellings
-	right_names = from_opaque NameTable(right).spellings
-	var equal = left_names.length() == right_names.length()
-	var position: Int = 0
-	for spelling in left_names:
-		match right_names.get(position):
-			Some(other):
-				equal = match equal:
-					True: spelling == other
-					False: False
-			None:
-				equal = False
-		position = position + 1
-	equal
+	from_opaque NameTable(left).by_spelling.keys() == from_opaque NameTable(right).by_spelling.keys()
 
 
 pure func name_spelling(names: NameTable, id: NameId) -> Option[String]:
-	from_opaque NameTable(names).spellings.get(from_opaque NameId(id))
+	from_opaque NameTable(names).by_spelling.keys().get(from_opaque NameId(id))
 
 
--- Builds one extension locally: after the first change copies the shared
--- input, the private lists grow in place, and the index is rebuilt only when
--- the bucket count grows.
+-- Builds one extension locally: the first new spelling copies the shared
+-- input table, and later ones grow the private copy in place.
 pure func intern_names(names: NameTable, spellings: List[String]) -> InternedNames:
 	rows = from_opaque NameTable(names)
-	var known = rows.spellings
-	var buckets = rows.buckets
+	var known = rows.by_spelling
 	var ids: List[NameId] = []
 
 	for spelling in spellings:
-		match lookup(known, buckets, spelling):
+		match known.get(spelling):
 			Some(id):
 				ids = ids.append(id)
 			None:
 				id = into_opaque NameId(known.length())
 				ids = ids.append(id)
-				known = known.append(spelling)
+				known = known.set(spelling, id)
 
-				if known.length() > buckets.length():
-					grown_count = buckets.length() * 2 + 1
-					buckets = index_spellings(known, grown_count)
-				else:
-					buckets = with_bucket_entry(buckets, spelling, id)
-
-	{ names = into_opaque NameTable({ rows | spellings = known, buckets = buckets }), ids = ids }
+	{ names = into_opaque NameTable({ rows | by_spelling = known }), ids = ids }

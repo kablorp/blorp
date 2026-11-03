@@ -2252,7 +2252,7 @@ lived only in a session scratchpad. It reports:
 
 `with_bucket_entry`'s inner `listed.append(id)` copies because `get` hands
 out a second reference; it needs a take-or-update-at-index API, not
-inference, and is a separate item.
+inference, and is a separate item. Dict phase 4 deleted the function.
 
 **Status: measured 2026-10-30** at `ae4710afc`; the
 [report](../benchmarks/results/blorp_2_attribution_after_o1_2026-10-30.md) has the tables, and
