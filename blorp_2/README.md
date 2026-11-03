@@ -155,9 +155,9 @@ including `INT_MIN`. Equal values must have equal hashes; unequal values may
 collide. Hashable is independent of Equatable and has no automatic derivation.
 A generic operation that both hashes and compares keys requires both traits.
 Int, String and Bool supply written hashes (`False` 0, `True` 1; String folds its
-bytes with a fixed basis, unseeded). The compiler's `HashMap[K, V]` requires
-`K: Hashable + Equatable`: the key's hash picks its home slot, then ordinary key
-equality distinguishes collisions.
+bytes with a fixed basis, unseeded). `Dict[K, V]` requires `K: DictKey`, which
+bundles `Hashable + Equatable`: the key's hash picks its home slot, then ordinary
+key equality distinguishes collisions.
 
 ### Dict
 
@@ -303,30 +303,30 @@ does. The bound is part of the type: every application of the type must meet
 it, under the bounds in scope where the application is written.
 
 ```blorp
-private record MapContents[K: Hashable + Equatable, V] { keys: List[K], values: List[V] }
-opaque type HashMap[K: Hashable + Equatable, V] = MapContents[K, V]
+private record DictContents[K: DictKey, V] { keys: List[K], values: List[V] }
+opaque type Dict[K: DictKey, V] = DictContents[K, V]
 
-pure func values[K: Hashable + Equatable, V](map: HashMap[K, V]) -> List[V]:
-    from_opaque HashMap(map).values
+pure func values[K: DictKey, V](dict: Dict[K, V]) -> List[V]:
+    from_opaque Dict(dict).values
 ```
 
 Nothing is implied. A function, implementation receiver or declaration that
-names `HashMap[K, V]` with its own parameter `K` restates `K: Hashable +
-Equatable` (or bounds that entail it), and the opaque type restates the bound of
-the record it wraps. Dropping the bound from `values` is rejected at the `K`
-in `HashMap[K, V]`:
+names `Dict[K, V]` with its own parameter `K` restates `K: DictKey` (or bounds
+that entail it), and the opaque type restates the bound of the record it wraps.
+Dropping the bound from `values` is rejected at the `K` in `Dict[K, V]`:
 
 ```text
-error: HashMap[K, V] requires K: Hashable
-help: add Hashable to K's bounds
+error: Dict[K, V] requires K: DictKey
+help: add DictKey to K's bounds
 ```
 
-A concrete argument needs an implementation: `HashMap[(Int) -> Int, V]`
-reports `implement Hashable for (Int) -> Int, or use a type that implements
-it`. Check proves the bounds once implementations and automatic equality are
-accepted: declarations under their own bounds, trait methods under `Self`,
-signatures, implementation receivers and constants, then body annotations under
-the enclosing function's bounds. `into_opaque` takes its arguments from its
+A concrete argument needs an implementation: `Dict[(Int) -> Int, V]`
+reports `Dict[(Int) -> Int, V] requires (Int) -> Int: DictKey`, with the help
+`implement DictKey for (Int) -> Int, or use a type that implements it`. Check
+proves the bounds once implementations and automatic equality are accepted:
+declarations under their own bounds, trait methods under `Self`, signatures,
+implementation receivers and constants, then body annotations under the
+enclosing function's bounds. `into_opaque` takes its arguments from its
 operand, so it proves the opaque type's bounds at its expression; record
 literals and constructors take an expected type that is already proved. A
 bounded record or union's automatic equality keeps the declared bounds before
@@ -870,7 +870,7 @@ compiler executable (default `clang`).
 `make -C blorp_2 test-compiler test-components` runs the active component
 gate: Blorp 2 compiles the explicit `TARGET_COMPONENT_SOURCES` in the Makefile.
 The selection currently covers text, Boolean calls, constant/declaration IDs,
-HashMap, names, source identities and syntax publication, plus Lexer token traces,
+names, source identities and syntax publication, plus Lexer token traces,
 float boundaries, keyword roles, source origins, character literals, continuation,
 doc fences, ranges, lexical trivia, pipe Strings and runtime-text round trips.
 Parse coverage includes constant inventories, source provenance, and String,

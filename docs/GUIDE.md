@@ -29,10 +29,10 @@ literal folds into it, `-2.abs()` is rejected in favour of `(-2).abs()` or
 [ordering](../blorp_2/README.md#ordering-operators) and
 [arithmetic](../blorp_2/README.md#arithmetic-operators) operator rules.
 A pilot record, union or opaque type may bound its type parameters, as in
-`opaque type HashMap[K: Hashable + Equatable, V] = MapContents[K, V]`. The pilot
+`opaque type Dict[K: DictKey, V] = DictContents[K, V]`. The pilot
 checks every application against those bounds: a function or declaration that
-names `HashMap[K, V]` restates `K: Hashable + Equatable`, and a concrete key type
-needs both implementations. See the pilot
+names `Dict[K, V]` restates `K: DictKey`, and a concrete key type
+needs an implementation. See the pilot
 [declaration bounds](../blorp_2/README.md#declaration-bounds).
 
 The separate [Blorp 2 pilot](../blorp_2/README.md) implements a restricted

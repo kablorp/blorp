@@ -33,7 +33,7 @@ first formal is `Self`. A method without `:` is abstract; one with `:` has an
 ordinary default body. Function type parameters, complete implementation receiver
 families and record, union and opaque type parameters accept bounds such as
 `Value: Equatable + Visit`, `Box[Value: Visit]` and
-`opaque type HashMap[K: Hashable + Equatable, V]`. Every application of a bounded
+`opaque type Dict[K: DictKey, V]`. Every application of a bounded
 declaration meets its bounds under the bounds in scope, which restate them; see the
 [pilot declaration bounds](../blorp_2/README.md#declaration-bounds).
 The pilot's ordinary foundation trait `Hashable` declares

@@ -79,8 +79,8 @@ signed Int. For values compared by equality, equal values must have equal hashes
 distinct values may collide. Hashable has no supertraits and is never derived.
 String writes its hash in `string.brp` (a fold of its bytes from a fixed basis,
 unseeded) and Bool in `bool.brp` (`False` 0, `True` 1). The compiler's
-`HashMap[K, V]` (`K: Hashable + Equatable`) uses this method for home slots and
-still compares keys by equality when probing collisions.
+`Dict[K, V]` (`K: DictKey`, a bundle of `Hashable + Equatable`) uses this method
+for home slots and still compares keys by equality when probing collisions.
 
 `Int` and `Float` are declared once in `_base.brp`. Other
 declarations are enabled only as their features enter the supported subset.

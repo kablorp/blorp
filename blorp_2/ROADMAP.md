@@ -3520,14 +3520,14 @@ payload witness can reopen the appropriate recursive-type prerequisite.
 
 Allocation reuse beyond unique-owner String and List buffers (record and union
 cell reuse is [O3](#o3-specialised-reuse-for-records-and-union-nodes), pending the
-[attribution after O1](#attribution-after-o1)), retain elimination, List removal, Set/Dict
-key semantics (storing a type does not make it a key), mutual tail calls,
-tail-modulo-constructor, closure escape and closure values, and the unit-test
+[attribution after O1](#attribution-after-o1)), retain elimination, List removal, `Set` (after
+Dict; [DICT_PLAN](DICT_PLAN.md) settles the key semantics: storing a type does not
+make it a key), mutual tail calls, tail-modulo-constructor, closure escape and closure values, and the unit-test
 migration plan. When reuse is introduced, its enabled and always-fresh paths must
 agree on observable values and safe destruction.
 
-`utils/hash_map.brp` is a stopgap map for compiler tables; once Blorp
-has a dict implementation it is deleted and its users move to it.
+The prelude `Dict` ([plan](DICT_PLAN.md)) replaced the compiler's stopgap
+`utils/hash_map.brp`.
 
 Historical measurements also identify repeated generic-recursion reachability,
 linear specialization-instance lookup inside repeated requests, module-path
