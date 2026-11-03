@@ -1,0 +1,109 @@
+import:
+	../../../src/emit/emit: emit
+	../../../src/own/own: own
+	../../../src/verify/verify: verify
+	../../../src/check/check: check
+	../../../src/specialize/specialize: specialize
+	../../../src/lower/lower: lower
+	../../../src/runtime/fs: FS_HELPERS_RUNTIME, FS_READ_TEXT_RUNTIME, FS_ENTRY_KIND_RUNTIME
+	../../../src/runtime/process: PROCESS_POSIX_PRELUDE
+	../module_input: parse_modules
+	string: String methods
+	int: Int methods
+	bool: Bool methods
+	option: Option methods
+	result: Result methods
+	test: TestSuite
+
+
+private READ_TEXT_DECLARATION: String = "func read(path: String) -> Result[String, Int]:\n    builtin(\"fs.read_text\")\n"
+private ENTRY_KIND_DECLARATION: String = "func kind(path: String) -> Result[Int, Int]:\n    builtin(\"fs.entry_kind\")\n"
+
+
+-- How many times `pattern` occurs in `text`.
+private pure func occurrences(text: String, pattern: String) -> Int:
+	var position: Int = 0
+	var count: Int = 0
+	while position + (pattern.length()) <= (text.length()):
+		var matches: Bool = True
+		for index in 0..pattern.length():
+			match (text.byte_at(position + index), pattern.byte_at(index)):
+				(Some(actual), Some(expected)): matches = matches.and(actual.equals(expected))
+				_: matches = False
+		if matches:
+			count = count + 1
+			position = position + pattern.length()
+		else:
+			position = position + 1
+	count
+
+
+private pure func emitted(source: String) -> Result[String, Int]:
+	match parse_modules([{ source = source, targets = [] }]):
+		Err(_): Err(1)
+		Ok(parsed):
+			match check(parsed):
+				Err(_): Err(2)
+				Ok(checked):
+					match specialize(checked).and_then(lower).and_then(own).and_then(verify).and_then(emit):
+						Err(_): Err(3)
+						Ok(code): Ok(code)
+
+
+private pure func both_called() -> String:
+	"${READ_TEXT_DECLARATION}${ENTRY_KIND_DECLARATION}func main() -> Int:\n    first = read(\"x\")\n    second = kind(\"x\")\n    0\n"
+
+
+pure func test_helpers_are_emitted_once_for_two_operations() -> Bool:
+	match emitted(both_called()):
+		Err(_): False
+		Ok(code):
+			occurrences(code, FS_HELPERS_RUNTIME).equals(1)
+				.and(occurrences(code, FS_READ_TEXT_RUNTIME).equals(1))
+				.and(occurrences(code, FS_ENTRY_KIND_RUNTIME).equals(1))
+				.and(code.starts_with(PROCESS_POSIX_PRELUDE))
+
+
+pure func test_helpers_are_emitted_once_for_one_operation() -> Bool:
+	read_only = "${READ_TEXT_DECLARATION}func main() -> Int:\n    first = read(\"x\")\n    0\n"
+	kind_only = "${ENTRY_KIND_DECLARATION}func main() -> Int:\n    first = kind(\"x\")\n    0\n"
+	match (emitted(read_only), emitted(kind_only)):
+		(Ok(read_code), Ok(kind_code)):
+			occurrences(read_code, FS_HELPERS_RUNTIME).equals(1)
+				.and(occurrences(read_code, FS_READ_TEXT_RUNTIME).equals(1))
+				.and(occurrences(read_code, FS_ENTRY_KIND_RUNTIME).equals(0))
+				.and(occurrences(kind_code, FS_HELPERS_RUNTIME).equals(1))
+				.and(occurrences(kind_code, FS_ENTRY_KIND_RUNTIME).equals(1))
+				.and(occurrences(kind_code, FS_READ_TEXT_RUNTIME).equals(0))
+		_: False
+
+
+pure func test_unused_declarations_select_no_fs_fragments() -> Bool:
+	source = "${READ_TEXT_DECLARATION}${ENTRY_KIND_DECLARATION}func main() -> Int:\n    0\n"
+	match emitted(source):
+		Err(_): False
+		Ok(code):
+			occurrences(code, "blorp_fs_").equals(0).and(occurrences(code, "_POSIX_C_SOURCE").equals(0))
+
+
+-- Each result is the ordinary Result: the String or Int success and the Int
+-- code are fresh out-parameters, and neither is released by the call.
+pure func test_result_takes_primitive_payloads() -> Bool:
+	match emitted(both_called()):
+		Err(_): False
+		Ok(code):
+			occurrences(code, "struct blorp_string *blorp_runtime_1_value=NULL;int64_t blorp_runtime_1_error=0;").equals(1)
+				.and(occurrences(code, "int64_t blorp_runtime_1_value=0;int64_t blorp_runtime_1_error=0;").equals(1))
+				.and(occurrences(code, "blorp_fs_read_text(blorp_vl_0,&blorp_runtime_1_value,&blorp_runtime_1_error)").equals(1))
+				.and(occurrences(code, "blorp_fs_entry_kind(blorp_vl_0,&blorp_runtime_1_value,&blorp_runtime_1_error)").equals(1))
+
+
+tests: TestSuite = {
+	description = "fs builtin C emission",
+	tests = [
+		("two fs operations share one helper fragment", test_helpers_are_emitted_once_for_two_operations),
+		("one fs operation emits the helpers once and not the other operation", test_helpers_are_emitted_once_for_one_operation),
+		("unused fs declarations select no fragments or POSIX prelude", test_unused_declarations_select_no_fs_fragments),
+		("results carry primitive payloads through out-parameters", test_result_takes_primitive_payloads),
+	]
+}

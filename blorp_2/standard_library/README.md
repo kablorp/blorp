@@ -302,6 +302,15 @@ The system adapter publishes impure `write_file(String, String) -> Result[Void, 
 Ok carries Void; Err owns a fresh String. See [File writing](../README.md#file-writing)
 for counted bytes, one-close error priority and target NUL-path teaching text.
 
+### The fs module
+
+`fs.brp` is the typed filesystem library; import it explicitly. It declares
+`IOErrorKind`, `IOError`, the fixed union `EntryKind`, the pure `describe` and
+`default_if_not_found`, and the impure `read_text` and `entry_kind`. The two
+natives return Int codes that private decoders turn into kinds; the codes are
+named in `src/runtime/fs.brp`. See [The fs library](../README.md#the-fs-library)
+for the contract and its limits.
+
 ### Logical paths
 
 `path` supplies pure String functions `join`, `dirname` and `normalize`.

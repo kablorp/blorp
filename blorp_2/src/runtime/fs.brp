@@ -1,0 +1,152 @@
+-- The C half of the fs library (standard_library/fs.brp). A native reports a
+-- failure as an Int code that fs.brp decodes: a named kind has the positive
+-- code below, and any other errno is sent negated, so OtherOs keeps the
+-- platform's own number. The two tables agree only by the tests that name
+-- each code as a literal, in test/runtime/fs_suite.brp and the fs e2e example.
+-- Paths are never reported; the library pairs each code with the caller's path.
+
+
+-- Emitted once for the whole program, however many fs operations it calls.
+-- Every helper is `static inline`, so a program that calls only one operation
+-- still builds under -Werror. It opens with a blank line because the fragment
+-- before it, the aggregates, does not end with one, and an #include must start
+-- its line.
+FS_HELPERS_RUNTIME: String =
+	raw
+		|
+		|#include <errno.h>
+		|#include <fcntl.h>
+		|#include <sys/stat.h>
+		|#include <unistd.h>
+		|enum {BLORP_FS_FAILED=0,BLORP_FS_SUCCEEDED=1};
+		|enum {
+		|BLORP_FS_NOT_FOUND=1,BLORP_FS_PERMISSION_DENIED=2,BLORP_FS_ALREADY_EXISTS=3,
+		|BLORP_FS_NOT_A_DIRECTORY=4,BLORP_FS_IS_A_DIRECTORY=5,BLORP_FS_DIRECTORY_NOT_EMPTY=6,
+		|BLORP_FS_NOT_A_REGULAR_FILE=7,BLORP_FS_READ_ONLY_FILESYSTEM=8,BLORP_FS_NO_SPACE=9,
+		|BLORP_FS_FILE_TOO_LARGE=10,BLORP_FS_CROSSES_DEVICES=11,BLORP_FS_PATH_CONTAINS_NUL=12,
+		|BLORP_FS_INVALID_UTF8=13
+		|};
+		|enum {
+		|BLORP_FS_ENTRY_ABSENT=0,BLORP_FS_ENTRY_FILE=1,BLORP_FS_ENTRY_DIRECTORY=2,
+		|BLORP_FS_ENTRY_SYMLINK=3,BLORP_FS_ENTRY_OTHER=4
+		|};
+		|/* Repeats a call that a signal interrupted. Never used for close: Linux has already
+		| * released the descriptor, and on XNU a retry could close another one. */
+		|#define BLORP_FS_RETRY(result,call) do{(result)=(call);}while((result)<0&&errno==EINTR)
+		|/* Every String ends in a NUL, so once no NUL is embedded its bytes are the C path. */
+		|static inline int blorp_fs_has_nul(const struct blorp_string *path){
+		|return memchr(path->bytes,'\0',(size_t)path->length)!=NULL;
+		|}
+		|/* The code of a named kind, or any other errno negated. An operation whose errno
+		| * means something else (EEXIST from rmdir) maps that errno itself first. */
+		|static inline int64_t blorp_fs_errno_code(int number){
+		|switch(number){
+		|case ENOENT:return BLORP_FS_NOT_FOUND;
+		|case EACCES:case EPERM:return BLORP_FS_PERMISSION_DENIED;
+		|case EEXIST:return BLORP_FS_ALREADY_EXISTS;
+		|case ENOTDIR:return BLORP_FS_NOT_A_DIRECTORY;
+		|case EISDIR:return BLORP_FS_IS_A_DIRECTORY;
+		|case ENOTEMPTY:return BLORP_FS_DIRECTORY_NOT_EMPTY;
+		|case EROFS:return BLORP_FS_READ_ONLY_FILESYSTEM;
+		|case ENOSPC:case EDQUOT:return BLORP_FS_NO_SPACE;
+		|case EFBIG:case EOVERFLOW:return BLORP_FS_FILE_TOO_LARGE;
+		|case EXDEV:return BLORP_FS_CROSSES_DEVICES;
+		|default:return -(int64_t)number;
+		|}
+		|}
+		|
+
+
+-- Reads to end of file, so a file that changes size is read as it is, and a
+-- FIFO or device is read as far as its writer goes.
+FS_READ_TEXT_RUNTIME: String =
+	raw
+		|enum {BLORP_FS_READ_INITIAL_CAPACITY=4096};
+		|/* macOS fails a single read of more than INT_MAX bytes with EINVAL. */
+		|enum {BLORP_FS_READ_REQUEST_MAXIMUM=1<<30};
+		|/* The next buffer capacity, or 0 once the buffer holds the largest String. */
+		|static inline size_t blorp_fs_grown_capacity(size_t capacity,size_t maximum){
+		|if(capacity>=maximum){return 0;}
+		|return capacity>maximum/2?maximum:capacity*2;
+		|}
+		|/* Reads the open descriptor to end of file into a fresh buffer. Returns 0, or the
+		| * failure code with nothing allocated. A file of exactly the largest String's
+		| * length is also refused: no allocation could hold it. The caller closes. */
+		|static int64_t blorp_fs_read_descriptor(int descriptor,char **contents,size_t *length){
+		|struct stat status;
+		|int examined;
+		|BLORP_FS_RETRY(examined,fstat(descriptor,&status));
+		|if(examined<0){return blorp_fs_errno_code(errno);}
+		|if(S_ISDIR(status.st_mode)){return BLORP_FS_IS_A_DIRECTORY;}
+		|size_t capacity=BLORP_FS_READ_INITIAL_CAPACITY,used=0;
+		|char *buffer=blorp_memory_allocate(capacity);
+		|if(buffer==NULL){abort();}
+		|for(;;){
+		|if(used==capacity){
+		|const size_t grown_capacity=blorp_fs_grown_capacity(capacity,blorp_string_maximum_capacity());
+		|if(grown_capacity==0){blorp_memory_release(buffer);return BLORP_FS_FILE_TOO_LARGE;}
+		|char *grown=blorp_memory_resize(buffer,grown_capacity);
+		|if(grown==NULL){abort();}
+		|buffer=grown;
+		|capacity=grown_capacity;
+		|}
+		|size_t request=capacity-used;
+		|if(request>BLORP_FS_READ_REQUEST_MAXIMUM){request=BLORP_FS_READ_REQUEST_MAXIMUM;}
+		|ssize_t received;
+		|BLORP_FS_RETRY(received,read(descriptor,buffer+used,request));
+		|if(received<0){
+		|const int64_t failure=blorp_fs_errno_code(errno);
+		|blorp_memory_release(buffer);
+		|return failure;
+		|}
+		|if(received==0){break;}
+		|used+=(size_t)received;
+		|}
+		|*contents=buffer;
+		|*length=used;
+		|return 0;
+		|}
+		|uint8_t blorp_fs_read_text(const struct blorp_string *path,struct blorp_string **text,int64_t *error){
+		|if(blorp_fs_has_nul(path)){*error=BLORP_FS_PATH_CONTAINS_NUL;return BLORP_FS_FAILED;}
+		|int descriptor;
+		|BLORP_FS_RETRY(descriptor,open(path->bytes,O_RDONLY|O_CLOEXEC));
+		|if(descriptor<0){*error=blorp_fs_errno_code(errno);return BLORP_FS_FAILED;}
+		|char *contents=NULL;
+		|size_t length=0;
+		|const int64_t failure=blorp_fs_read_descriptor(descriptor,&contents,&length);
+		|(void)close(descriptor);
+		|if(failure!=0){*error=failure;return BLORP_FS_FAILED;}
+		|if(!blorp_utf8_is_valid(contents,length)){
+		|blorp_memory_release(contents);
+		|*error=BLORP_FS_INVALID_UTF8;
+		|return BLORP_FS_FAILED;
+		|}
+		|*text=blorp_string_from_bytes(contents,(int64_t)length);
+		|blorp_memory_release(contents);
+		|return BLORP_FS_SUCCEEDED;
+		|}
+		|
+
+
+-- lstat: a link is not followed. A missing path, or a file used as a
+-- directory, is the absent kind rather than a failure.
+FS_ENTRY_KIND_RUNTIME: String =
+	raw
+		|uint8_t blorp_fs_entry_kind(const struct blorp_string *path,int64_t *kind,int64_t *error){
+		|if(blorp_fs_has_nul(path)){*error=BLORP_FS_PATH_CONTAINS_NUL;return BLORP_FS_FAILED;}
+		|struct stat status;
+		|int examined;
+		|BLORP_FS_RETRY(examined,lstat(path->bytes,&status));
+		|if(examined<0){
+		|const int saved=errno;
+		|if(saved==ENOENT||saved==ENOTDIR){*kind=BLORP_FS_ENTRY_ABSENT;return BLORP_FS_SUCCEEDED;}
+		|*error=blorp_fs_errno_code(saved);
+		|return BLORP_FS_FAILED;
+		|}
+		|if(S_ISREG(status.st_mode)){*kind=BLORP_FS_ENTRY_FILE;}
+		|else if(S_ISDIR(status.st_mode)){*kind=BLORP_FS_ENTRY_DIRECTORY;}
+		|else if(S_ISLNK(status.st_mode)){*kind=BLORP_FS_ENTRY_SYMLINK;}
+		|else{*kind=BLORP_FS_ENTRY_OTHER;}
+		|return BLORP_FS_SUCCEEDED;
+		|}
+		|

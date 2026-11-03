@@ -3008,6 +3008,46 @@ See the [complete program](test/e2e/fixtures/file_write/bytes.brp) and
 [acceptance report](https://github.com/kablorp/blorp/blob/1e07c4dce85e51cd7ad911142e9bc96a5e0d91c7/benchmarks/results/blorp_2_target_write_file_2026-10-18.md). The
 integrated compiler shell uses this interface; full compiler acceptance remains pending.
 
+## The fs library
+
+`fs` is an explicit import with typed errors, built on two builtin labels,
+`fs.read_text` and `fs.entry_kind`. Each returns an Int code that `fs.brp`
+decodes, so the compiler knows no `fs` type.
+
+```blorp
+import:
+    fs: IOError, read_text, entry_kind, describe, default_if_not_found
+
+func load_settings(path: String) -> Result[String, IOError]:
+    default_if_not_found(read_text(path), "")
+```
+
+- `read_text(path) -> Result[String, IOError]` reads to end of file, so a file
+  that changes size is read as it is, and validates UTF-8. A directory is
+  `IsADirectory`; a NUL in the path is `PathContainsNul` before any operating
+  system call; interrupted `open` and `read` calls are retried. A FIFO blocks
+  until its writer closes. There is no size limit: reading `/dev/zero` exhausts
+  memory and the allocation aborts, an infrastructure exception.
+- `entry_kind(path) -> Result[Option[EntryKind], IOError]` uses `lstat`, so a
+  link is never followed. A missing path, or a file used as a directory, is
+  `Ok(None)`; there is no `exists` that returns a Bool.
+- `IOError` holds the caller's `path`, an optional `destination` for
+  two-path operations, and an `IOErrorKind`: `NotFound`, `PermissionDenied`,
+  `AlreadyExists`, `NotADirectory`, `IsADirectory`, `DirectoryNotEmpty`,
+  `NotARegularFile`, `ReadOnlyFilesystem`, `NoSpace`, `FileTooLarge`,
+  `CrossesDevices`, `PathContainsNul`, `InvalidUtf8` and `OtherOs(Int)`, which
+  keeps the platform's errno. The path is always the one the caller passed, so
+  `x: permission denied` does not say whether `x` or a parent refused.
+- `describe(error)` gives `"<path>: <phrase>"` with fixed text per kind, never
+  `strerror` text. `default_if_not_found(result, fallback)` turns `NotFound`
+  into `Ok(fallback)` and leaves every other result alone.
+
+The runtime C is tested by `test/runtime/fs_suite.brp` and the example
+`test/e2e/fixtures/fs/read.brp`, which reads a tree that `prepare.sh` builds,
+since no `fs` operation can create a non-UTF-8 file, a symlink loop, a mode-000
+file or a FIFO. Run as root, the script exits with status 77 and the harness
+reports the example "not run", with no PASS credit.
+
 ## Float64 calculator
 
 The designated foundation `_base.brp` owns `Float`, a binary64 unmanaged value. Decimal source

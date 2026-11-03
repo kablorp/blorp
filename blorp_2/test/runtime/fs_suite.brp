@@ -1,0 +1,80 @@
+import:
+    ../../src/runtime/fs: FS_HELPERS_RUNTIME, FS_READ_TEXT_RUNTIME, FS_ENTRY_KIND_RUNTIME
+    ../../src/runtime/process: PROCESS_POSIX_PRELUDE
+    ../../src/runtime/memory: MEMORY_RUNTIME
+    ../../src/runtime/string: string_runtime
+    ../e2e/self_hosted_reports: verify_accounting
+    process: run_to_files
+    system: read_file, write_file
+    io: print_error
+    test: TestSuite
+    int: Int methods
+    result: Result methods
+    string: String methods
+    bool: not, and
+
+
+private ENVIRONMENT_TOOL: String = "/usr/bin/env"
+private COMPILE_TIMEOUT_MS: Int = 600000
+private CASE_TIMEOUT_MS: Int = 30000
+
+
+-- The same fragments, in the same order, as a program that calls both
+-- operations; the fixture includes them and calls their C functions directly.
+private func ready(c_compiler: String, directory: String) -> Result[String, String]:
+    fragments = PROCESS_POSIX_PRELUDE + MEMORY_RUNTIME + string_runtime() + "\n" + FS_HELPERS_RUNTIME + FS_READ_TEXT_RUNTIME + FS_ENTRY_KIND_RUNTIME
+    _ ?= write_file(directory + "/fs_runtime.c", fragments)
+    executable = directory + "/fs_test"
+    prefix = directory + "/fs-build"
+    status ?= run_to_files(c_compiler, ["-std=c11", "-O0", "-Wall", "-Wextra", "-Werror", "-pedantic", "-fsanitize=address,undefined", "-fno-sanitize-recover=all", "-DBLORP_MEMORY_DIAGNOSTICS=1", "-I", directory, "blorp_2/test/runtime/fixtures/fs_test.c", "-o", executable, "-lm", "-lpthread"], prefix + ".out", prefix + ".err", COMPILE_TIMEOUT_MS)
+    err ?= read_file(prefix + ".err")
+    if status.equals(0).and(err.equals("")):
+        Ok(executable)
+    else:
+        Err("fs native build: " + err)
+
+
+-- A case passes with exit 0, nothing on stdout, and one balanced strict
+-- allocation report on stderr.
+private func native_case(executable: String, directory: String, name: String) -> Result[Void, String]:
+    prefix = directory + "/fs-case-" + name
+    arguments = ["-u", "BLORP_MEMORY_STATS", "BLORP_LEAK_CHECK=strict", executable, name, directory]
+    status ?= run_to_files(ENVIRONMENT_TOOL, arguments, prefix + ".out", prefix + ".err", CASE_TIMEOUT_MS)
+    out ?= read_file(prefix + ".out")
+    err ?= read_file(prefix + ".err")
+    if status.equals(0).not():
+        Err(name + ": exit " + status.to_string() + ": " + err)
+    else if out.equals("").not():
+        Err(name + ": wrote stdout: " + out)
+    else:
+        verify_accounting(err, True).map_err(pure func(message: String): name + ": " + message + ": " + err)
+
+
+private func reported(result: Result[Void, String]) -> Bool:
+    match result:
+        Ok(_): True
+        Err(error):
+            print_error(error)
+            False
+
+
+func suite(c_compiler: String, directory: String) -> TestSuite:
+    match ready(c_compiler, directory):
+        Err(error):
+            print_error(error)
+            { description = "fs runtime setup", tests = [("native probe builds", func(): False)] }
+        Ok(executable):
+            {
+                description = "fs runtime",
+                tests = [
+                    ("each errno maps to its literal code and no named errno becomes OtherOs", func(): reported(native_case(executable, directory, "codes"))),
+                    ("the read buffer's growth stops at the largest String without overflow", func(): reported(native_case(executable, directory, "growth"))),
+                    ("a NUL in the path is refused before any open", func(): reported(native_case(executable, directory, "nul"))),
+                    ("every file size around the buffer boundaries reads whole and closes once", func(): reported(native_case(executable, directory, "sizes"))),
+                    ("a missing path, a directory and invalid UTF-8 each report their code and close at most once", func(): reported(native_case(executable, directory, "failures"))),
+                    ("a failed read reports its errno and frees its buffer", func(): reported(native_case(executable, directory, "read_error"))),
+                    ("entry kinds never follow a link, and absent paths are not failures", func(): reported(native_case(executable, directory, "entry_kinds"))),
+                    ("an interrupted open of a FIFO is retried", func(): reported(native_case(executable, directory, "interrupted_open"))),
+                    ("interrupted reads are retried while a writer appends to a FIFO", func(): reported(native_case(executable, directory, "appending_writer"))),
+                ]
+            }

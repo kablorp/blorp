@@ -49,6 +49,7 @@ TARGET_COMPONENT_SOURCES := \
 	blorp_2/test/unit/test_parse/test_constant_inventory.brp \
 	blorp_2/test/unit/test_parse/test_file_read.brp \
 	blorp_2/test/unit/test_parse/test_system_labels.brp \
+	blorp_2/test/unit/test_parse/test_fs_read.brp \
 	blorp_2/test/unit/test_parse/test_float_builtin_labels.brp \
 	blorp_2/test/unit/test_parse/test_int_comparisons.brp \
 	blorp_2/test/unit/test_parse/test_ordering_operators.brp \
@@ -104,12 +105,14 @@ TARGET_COMPONENT_SOURCES := \
 	blorp_2/test/unit/test_parse/test_run_to_files.brp \
 	blorp_2/test/unit/test_parse/test_module_stems.brp \
 	blorp_2/test/unit/test_check/test_run_to_files.brp \
+	blorp_2/test/unit/test_check/test_fs_read.brp \
 	blorp_2/test/unit/test_specialize/test_instance_digest.brp \
 	blorp_2/test/unit/test_specialize/test_run_to_files.brp \
 	blorp_2/test/unit/test_lower/test_run_to_files.brp \
 	blorp_2/test/unit/test_own/test_run_to_files.brp \
 	blorp_2/test/unit/test_verify/test_run_to_files.brp \
 	blorp_2/test/unit/test_emit/test_run_to_files.brp \
+	blorp_2/test/unit/test_emit/test_fs_read.brp \
 	blorp_2/test/unit/test_emit/test_function_labels.brp \
 	blorp_2/test/unit/test_parse/test_grouped_suites.brp \
 	blorp_2/test/unit/test_load/test_grouped_suites.brp \
