@@ -1,6 +1,6 @@
 # Blorp 2 Dict
 
-Status: approved 2026-11-02, with the decisions below. Phases 0 to 4 are done ([spike report](../benchmarks/results/blorp2-dict-spike-2026-11-02.md), [phase 1 results](../benchmarks/results/blorp2-dict-phase1-2026-11-02.md), [phase 2 results](../benchmarks/results/blorp2-dict-phase2-2026-11-02.md), [phase 3 results](../benchmarks/results/blorp2-dict-phase3-2026-11-02.md), [phase 4 results](../benchmarks/results/blorp2-dict-phase4-2026-11-02.md)); their findings are folded in below, and phase 5 (record keys) is next. Each phase gets its own implementation brief.
+Status: approved 2026-11-02, with the decisions below. Phases 0 to 4 and 5a are done ([spike report](../benchmarks/results/blorp2-dict-spike-2026-11-02.md), [phase 1 results](../benchmarks/results/blorp2-dict-phase1-2026-11-02.md), [phase 2 results](../benchmarks/results/blorp2-dict-phase2-2026-11-02.md), [phase 3 results](../benchmarks/results/blorp2-dict-phase3-2026-11-02.md), [phase 4 results](../benchmarks/results/blorp2-dict-phase4-2026-11-02.md), [phase 5a results](../benchmarks/results/blorp2-dict-phase5a-2026-11-02.md)); their findings are folded in below, and phase 5b (specialize's sealed tables) is next. Each phase gets its own implementation brief.
 
 ## Problem
 
@@ -135,7 +135,7 @@ All of these are pure. `n` is the number of live entries.
   - `TypeHead`, the sealed instance keys, and the opaque ids in `utils/ids.brp`.
   - Those ids already have written `Equatable`, so derivation couldn't reach them anyway.
   - If a key needs a List, for example the argument lists in instance keys, add written `implements Hashable for List[T: Hashable]` and `implements DictKey for List[T: DictKey]`.
-- **Combining:** one named library function, `combine_hash(seed, value) = (seed + value) * PRIME`, wrapping. Blorp 2 has no xor or shift operators, and this needs neither.
+- **Combining:** one named library function, `combine_hash(seed, value) = (seed + value) * PRIME`, wrapping. Blorp 2 has no xor or shift operators, and this needs neither. A key hashes by starting from 0 and combining every part in order, the first included: combining two parts directly would be symmetric, since `(a + b) * PRIME` is `(b + a) * PRIME`.
 - **No Float keys (D2).** Float doesn't implement `DictKey`. A program that needs one wraps the Float in an opaque type with written implementations, for example over its bits or a canonicalized value.
 
 ## Implementation
@@ -219,8 +219,9 @@ Each phase lands green on its own, with self-compile allocations, `-O0`/`-O2` in
 | 2, literals (done) | Lexer, parser, AST, checking rewrite, grammar and tests, as in Literals: [results](../benchmarks/results/blorp2-dict-phase2-2026-11-02.md) | `{}` and `{k => v}` work |
 | 3, HashMap (done) | The six `HashMap` users moved to `Dict`, keeping their Int keys, and `utils/hash_map.brp` and its suite were deleted. The README, `ROADMAP.md` and standard library README no longer describe it: [results](../benchmarks/results/blorp2-dict-phase3-2026-11-02.md) | No stopgap map |
 | 4, names (done) | `utils/names.brp` becomes a `Dict[String, NameId]`. An id is its spelling's position in `keys()`, since names are never removed, so the separate `spellings` List and the bucket functions are deleted: [results](../benchmarks/results/blorp2-dict-phase4-2026-11-02.md) | No bucket table |
-| 5, record keys | Written `Hashable`/`DictKey` for `TypeHead` and the opaque ids. `model.brp`'s `implementation_table` becomes a Dict keyed by `TypeHead`. Specialize's **sealed** instance tables become Dicts keyed by their full keys. Its **slot** tables keep `IndexedList`, because their digests deliberately hash only the head while `resolve_partial` rewrites pending references inside the stored key. Replace the squashed pair keys where a written hash is cheap. | Fewer digests and hints |
-| later | `Set`; `update`/`update_or` once a List take-or-update builtin exists; set-shaped scans moved where measured or where the change deletes code | |
+| 5a, checker keys (done) | `combine_hash` in `dict.brp`. Written `Hashable`/`DictKey` for `TypeHead` (with `head_hint` moved there as its hash) and for `NameId`. `model.brp`'s `implementation_table` becomes a `Dict[ImplementationKey, AcceptedImplementation]` keyed by (trait, head) rather than by head alone: both of its questions, whether a trait has two rows for one head and which row implements a trait for a head, are about that pair, so the multimap bucket and its copy-on-update go away. The checker's `name_number`-keyed Dicts become `Dict[NameId, …]`: [results](../benchmarks/results/blorp2-dict-phase5a-2026-11-02.md) | No head hints; no checker `name_number` keys |
+| 5b, sealed tables | Specialize's **sealed** instance tables become Dicts keyed by their full keys, with written `Hashable` for its `TypeRef` and instance keys and their digest functions deleted. Its **slot** tables keep `IndexedList`, because their digests deliberately hash only the head while `resolve_partial` rewrites pending references inside the stored key. | Fewer digests |
+| later | `Set`; namespace's `space_key` (`2 * name_number + kind`), kept as an Int because a `{ space, name }` key would be built for every name lookup, its per-lookup cost is unmeasured and `Space` is not a `fixed union`; `instantiation_paths`' `pair_key`, whose `Dict[Int, PathPair]` stores its own key as the value and so is a set, which waits for `Set`; `update`/`update_or` once a List take-or-update builtin exists; set-shaped scans moved where measured or where the change deletes code | |
 
 ## Ceilings
 
@@ -245,7 +246,7 @@ These are set before implementation. A miss means stop and rescope.
 - **Phases 3 to 5, per step:**
   - self-compile `-O2` instructions rise by at most 0.5%;
   - strict allocations rise by at most 1%;
-  - phases 3 and 4 remove more production lines than they add. Phase 5's sealed-table and implementation-table steps should too; the written `Hashable` implementations are counted.
+  - phases 3 and 4 remove more production lines than they add. Phase 5's sealed-table and implementation-table steps should too; the written `Hashable` implementations are counted. Keith waived this for 5a on 2026-11-03 at +16: the growth is the written implementations for `TypeHead`, `NameId` and `ImplementationKey`, which 5b reuses, and the only cut would put the name-keyed Dicts back on Int keys.
 
 ## Testing
 

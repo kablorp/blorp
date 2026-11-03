@@ -164,7 +164,9 @@ key equality distinguishes collisions.
 `dict.brp` declares `Dict[K: DictKey, V]`, an insertion-ordered map written in
 Blorp over Lists ([plan](DICT_PLAN.md)). `DictKey` is a bundle trait,
 `trait DictKey: Hashable + Equatable`; a key type opts in with a bodyless
-`implements DictKey for Point` after writing its `Hashable` and `Equatable`.
+`implements DictKey for Point` after writing its `Hashable` and, unless every
+field is Equatable and so gives it `==` already, its `Equatable`. A key with
+several parts hashes them with `dict: combine_hash`, starting from 0.
 Int, String and Bool are keys; Float is not, and a type without `DictKey` is
 rejected where `Dict[Point, Int]` is written. The prelude imports `dict: Dict`,
 so the type and its receiver methods are always available; `empty` and

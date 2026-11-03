@@ -9,18 +9,17 @@ import:
 		RuntimeOperation,
 		DesignatedBoolean, DesignatedOption,
 	../utils/ids:
-		TraitId, TraitMethodId, trait_method_owner,
+		TraitId, TraitMethodId, trait_method_owner, trait_number,
 		ConstantId, constant_number,
 		FunctionId,
 		OpaqueId,
 		RecordId,
 		UnionId,
 		VariantId,
-		opaque_number,
-		record_number,
-		union_number,
 		variant_owner,
+	dict: combine_hash, DictKey
 	int: Int methods
+	../utils/names: NameId
 	../utils/source: FunctionLabel, ModuleId
 	../namespace/namespace:
 		TypeHead(ListHead, PrimitiveHead, RecordHead, UnionHead, OpaqueHead),
@@ -42,7 +41,7 @@ union ReceiverLookup:
 
 
 record AdmittedReceiverScope {
-	names: Dict[Int, ReceiverLookup]
+	names: Dict[NameId, ReceiverLookup]
 }
 
 
@@ -268,64 +267,47 @@ record AcceptedImplementation {
 }
 
 
--- Accepted implementations in acceptance order, with an index by receiver
--- head derived from them in the same step. Only `implementation_table` builds
--- one, so the index cannot disagree with the rows.
+-- One trait implemented for one receiver head: at most one accepted row.
+record ImplementationKey {
+	trait_id: TraitId,
+	head: TypeHead
+}
+
+
+implements Hashable for ImplementationKey:
+	pure func hash(value: Self) -> Int:
+		combine_hash(combine_hash(0, trait_number(value.trait_id)), value.head.hash())
+
+
+implements DictKey for ImplementationKey
+
+
+-- Accepted implementations in acceptance order, with an index by trait and
+-- receiver head derived from them in the same step. Only `implementation_table`
+-- builds one, so the index cannot disagree with the rows.
 private record ImplementationRows {
 	ordered: List[AcceptedImplementation],
-	-- Under each head hint, the rows whose receiver head has that hint.
-	by_head: Dict[Int, List[AcceptedImplementation]]
+	by_key: Dict[ImplementationKey, AcceptedImplementation]
 }
 opaque type ImplementationTable = ImplementationRows
-
-
--- Declaration numbers are non-negative, so each built-in head, which carries
--- most implementations, takes its own negative hint.
-private INT_HINT: Int = -1
-private FLOAT_HINT: Int = -2
-private STRING_HINT: Int = -3
-private VOID_HINT: Int = -4
-private LIST_HINT: Int = -5
-
-
--- An index hint, never an identity: equal heads share one, and the lookup
--- then compares whole heads, so a shared hint costs only speed.
-private pure func head_hint(head: TypeHead) -> Int:
-	match head:
-		PrimitiveHead(BuiltinInt): INT_HINT
-		PrimitiveHead(BuiltinFloat): FLOAT_HINT
-		PrimitiveHead(BuiltinString): STRING_HINT
-		PrimitiveHead(BuiltinVoid): VOID_HINT
-		ListHead: LIST_HINT
-		UnionHead(id): union_number(id)
-		RecordHead(id): record_number(id)
-		OpaqueHead(id): opaque_number(id)
-
-
-private pure func hinted_rows(by_head: Dict[Int, List[AcceptedImplementation]], hint: Int) -> List[AcceptedImplementation]:
-	match by_head.get(hint):
-		Some(rows): rows
-		None: []
 
 
 -- `rows` indexed, or None if two rows implement one trait for one head or a
 -- row holds another trait's member. A method's body is then found in the one
 -- family of its own trait for the receiver head.
 pure func implementation_table(rows: List[AcceptedImplementation]) -> Option[ImplementationTable]:
-	var by_head: Dict[Int, List[AcceptedImplementation]] = {}
+	var by_key: Dict[ImplementationKey, AcceptedImplementation] = {}
 	var valid: Bool = True
 	for row in rows:
-		hint = head_hint(row.receiver_head)
-		bucket = hinted_rows(by_head, hint)
-		duplicate = bucket.any(pure func(existing): and(existing.trait_id == row.trait_id, existing.receiver_head == row.receiver_head))
+		key: ImplementationKey = { trait_id = row.trait_id, head = row.receiver_head }
 		other_trait_member = row.methods.any(pure func(member): trait_method_owner(member.method) != row.trait_id)
-		if and(duplicate.not(), other_trait_member.not()):
-			by_head = by_head.set(hint, bucket.append(row))
+		if and(by_key.contains(key).not(), other_trait_member.not()):
+			by_key = by_key.set(key, row)
 		else:
 			valid = False
 			break
 	if valid:
-		Some(into_opaque ImplementationTable({ ordered = rows, by_head = by_head }))
+		Some(into_opaque ImplementationTable({ ordered = rows, by_key = by_key }))
 	else:
 		None
 
@@ -337,13 +319,8 @@ pure func implementation_rows(table: ImplementationTable) -> List[AcceptedImplem
 
 -- The one accepted implementation of `required` for `head`.
 pure func family_for(traits: AcceptedTraits, required: TraitId, head: TypeHead) -> Option[AcceptedImplementation]:
-	var family: Option[AcceptedImplementation] = None
-	for row in hinted_rows(from_opaque ImplementationTable(traits.implementations).by_head, head_hint(head)):
-		if row.trait_id == required:
-			if row.receiver_head == head:
-				family = Some(row)
-				break
-	family
+	key: ImplementationKey = { trait_id = required, head = head }
+	from_opaque ImplementationTable(traits.implementations).by_key.get(key)
 
 
 private record CanonicalEqualityContents {

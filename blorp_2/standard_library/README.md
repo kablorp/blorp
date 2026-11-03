@@ -135,9 +135,13 @@ work is linear in the output bytes and the C stack is constant.
 `Dict[K: DictKey, V]`, an insertion-ordered map over parallel Lists and an
 open-addressing index. Int, String and Bool implement `DictKey` with a bodyless
 `implements DictKey for T`; a record or opaque key writes its own `Hashable` and
-`Equatable` first. The prelude imports `dict: Dict`, so the type and its receiver
-methods are implicit; `empty` and `with_capacity` are reached as
-`import: dict as D`. All functions are pure.
+`Equatable` first, except that a record or union whose fields are all Equatable
+already has `==` and writes only `Hashable`. A key with several parts hashes them
+with `combine_hash(seed, value) = (seed + value) * 1099511628211`, wrapping:
+start from 0 and combine every part in order, the first included, because
+combining two parts directly is symmetric. The prelude imports `dict: Dict`, so
+the type and its receiver methods are implicit; `empty` and `with_capacity` are
+reached as `import: dict as D`. All functions are pure.
 
 Literals need no import. `{}` is `empty()` and takes its key and value types from
 the expected type; without one it is rejected with "an empty Dict needs its
