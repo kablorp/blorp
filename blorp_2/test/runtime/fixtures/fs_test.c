@@ -7,24 +7,39 @@
 #endif
 #include <fcntl.h>
 #include <signal.h>
+#include <stdarg.h>
 #include <sys/stat.h>
 #include <sys/time.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
 /* The production close is counted, so that each path can be shown to close the
- * descriptor it opened exactly once. The call itself is the real one. */
+ * descriptor it opened exactly once, and the production open's interrupted
+ * calls are counted, so that a retry can be shown to have run. Both calls are
+ * the real ones. */
 static int close_calls = 0;
 static int last_closed = -1;
+static int interrupted_opens = 0;
 static int counting_close(int descriptor);
+static int counting_open(const char *path, int flags, ...);
 #define close counting_close
+#define open counting_open
 #include "fs_runtime.c"
 #undef close
+#undef open
 
 static int counting_close(int descriptor) {
     close_calls++;
     last_closed = descriptor;
     return close(descriptor);
+}
+
+/* The read fragment never creates a file, so open takes no mode here. */
+static int counting_open(const char *path, int flags, ...) {
+    assert((flags & O_CREAT) == 0);
+    const int descriptor = open(path, flags);
+    if (descriptor < 0 && errno == EINTR) interrupted_opens++;
+    return descriptor;
 }
 
 /* The number the next open would return, without disturbing the counts. */
@@ -361,7 +376,8 @@ static const char *make_fifo(const char *directory, const char *name) {
 }
 
 /* open blocks until a writer exists. The writer waits for the first tick, so
- * the reader's open is interrupted and must be retried, not failed. */
+ * the reader's open returns EINTR at least once, which the counting open sees,
+ * and must be retried, not failed. */
 static int case_interrupted_open(const char *directory) {
     const char *fifo = make_fifo(directory, "interrupted_open.fifo");
     assert(pipe(go_pipe) == 0);
@@ -380,6 +396,7 @@ static int case_interrupted_open(const char *directory) {
     expect_text(read_path(fifo), "after the tick", 14);
     stop_ticks();
     assert(ticks >= 1);
+    assert(interrupted_opens >= 1);
     assert(close_calls == before + 1);
     expect_child_exit(child);
     return 0;

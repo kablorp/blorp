@@ -18,8 +18,9 @@ private COMPILATION_TIMEOUT_MS: Int = 600000
 private NATIVE_TIMEOUT_MS: Int = 10000
 private PRESERVED_OUTPUT: String = "preserve this rejected output"
 private FS_PREPARE_SCRIPT: String = "blorp_2/test/e2e/fixtures/fs/prepare.sh"
--- prepare.sh's exit status when it runs as root, which can read a mode-000
--- file, so the example could not provoke PermissionDenied.
+private FS_WRITE_PREPARE_SCRIPT: String = "blorp_2/test/e2e/fixtures/fs/prepare_write.sh"
+-- prepare.sh's exit status when it runs as root, which file permissions do
+-- not refuse, so neither fs example could provoke PermissionDenied.
 private FS_NOT_RUN_STATUS: Int = 77
 private FS_READ_OUTPUT: String =
     |read_text settings.conf: ok 6 bytes
@@ -63,6 +64,29 @@ private FS_READ_OUTPUT: String =
     |settings.conf: contents are not valid UTF-8
     |settings.conf: operating system error 40
     |a -> b: crosses devices
+    |
+
+
+private FS_WRITE_OUTPUT: String =
+    |write_text new.txt: ok
+    |  new.txt holds "created"
+    |write_text existing.txt: ok
+    |  existing.txt holds "replaced"
+    |write_text link: ok
+    |  real/target.txt holds "through the link"
+    |  link is symlink
+    |write_text dangling: dangling: no such file
+    |  missing_target is absent
+    |write_text read_only.txt: read_only.txt: permission denied
+    |  read_only.txt holds "kept"
+    |write_text pipe: pipe: not a regular file
+    |write_text folder: folder: is a directory
+    |write_text folder/: folder/: is a directory
+    |  folder is directory
+    |write_text existing.txt/child: existing.txt/child: not a directory
+    |write_text missing/child.txt: missing/child.txt: no such file
+    |write_text loop: OtherOs
+    |write_text nul: nul: path contains a NUL byte
     |
 
 
@@ -144,7 +168,7 @@ private func link_fixture(c_compiler: String, prefix: String, mode: NativeMode) 
     expect(stderr, "", "C compiler stderr")
 
 
-private func run_fixture(prefix: String, example: Example) -> Result[Void, String]:
+private func run_normal(prefix: String, example: Example) -> Result[Void, String]:
     _ ?= command(
         ["-u", "BLORP_LEAK_CHECK", "-u", "BLORP_MEMORY_STATS", prefix + ".normal"].concat(example.arguments),
         prefix + ".normal.run", example.status, NATIVE_TIMEOUT_MS,
@@ -152,7 +176,10 @@ private func run_fixture(prefix: String, example: Example) -> Result[Void, Strin
     output: String ?= read_file(prefix + ".normal.run.stdout")
     _ ?= expect(output, example.stdout, "native stdout")
     errors: String ?= read_file(prefix + ".normal.run.stderr")
-    _ ?= expect(errors, "", "native stderr")
+    expect(errors, "", "native stderr")
+
+
+private func run_strict(prefix: String, example: Example) -> Result[Void, String]:
     _ ?= command(
         ["-u", "BLORP_MEMORY_STATS", "BLORP_LEAK_CHECK=strict", prefix + ".strict"].concat(example.arguments),
         prefix + ".strict.run", example.status, NATIVE_TIMEOUT_MS,
@@ -162,6 +189,11 @@ private func run_fixture(prefix: String, example: Example) -> Result[Void, Strin
     accounting: String ?= read_file(prefix + ".strict.run.stderr")
     expected = ("blorp: leak check: " + example.allocations.to_string() + " allocs, ") + example.allocations.to_string() + " releases, 0 leaked, 0 bytes\n"
     expect(accounting, expected, "strict native accounting")
+
+
+private func run_fixture(prefix: String, example: Example) -> Result[Void, String]:
+    _ ?= run_normal(prefix, example)
+    run_strict(prefix, example)
 
 
 private func verify_example(compiler: String, c_compiler: String, work_directory: String, example: Example) -> Result[Void, String]:
@@ -232,24 +264,53 @@ private func reported(result: Result[Void, String]) -> Bool:
             False
 
 
--- The fs example reads a tree that prepare.sh builds, because no fs operation
--- can create a file that is not UTF-8, a symlink loop, a mode-000 file or a
--- FIFO. Where the script cannot build it the example is reported as not run
--- and left out, so that it earns no PASS credit.
-private func fs_read_tests(compiler: String, c_compiler: String, work_directory: String) -> List[(String, () -> Bool)]:
+-- The fs examples read and write trees that the prepare scripts build,
+-- because no fs operation can create a file that is not UTF-8, a symlink, a
+-- read-only file or a FIFO. Where prepare.sh cannot build its tree, as root,
+-- both examples are reported as not run and left out, so that they earn no
+-- PASS credit: each needs a user that file permissions refuse.
+private func fs_tree_tests(compiler: String, c_compiler: String, work_directory: String) -> List[(String, () -> Bool)]:
     tree = work_directory + "/fs_tree"
+    write_tree = work_directory + "/fs_write_tree"
     prefix = work_directory + "/fs_prepare"
-    example: Example = { name = "fs_read", source = "blorp_2/test/e2e/fixtures/fs/read.brp", status = 0, stdout = FS_READ_OUTPUT, allocations = 256, arguments = [tree] }
+    read: Example = { name = "fs_read", source = "blorp_2/test/e2e/fixtures/fs/read.brp", status = 0, stdout = FS_READ_OUTPUT, allocations = 256, arguments = [tree] }
+    write: Example = { name = "fs_write", source = "blorp_2/test/e2e/fixtures/fs/write.brp", status = 0, stdout = FS_WRITE_OUTPUT, allocations = 168, arguments = [write_tree] }
     match run_to_files(SHELL, [FS_PREPARE_SCRIPT, tree], prefix + ".stdout", prefix + ".stderr", NATIVE_TIMEOUT_MS):
         Err(error): [("the fs example tree is prepared", func(): reported(Err(error)))]
         Ok(status):
             if status.equals(FS_NOT_RUN_STATUS):
-                print_error("fs example not run: its tree needs a user that cannot read a mode-000 file")
+                print_error("fs examples not run: their trees need a user that file permissions refuse")
                 []
             else if status.equals(0):
-                [("fs read_text and entry_kind return each kind, and describe words each one", func(): reported(verify_example(compiler, c_compiler, work_directory, example)))]
+                [
+                    ("fs read_text and entry_kind return each kind, and describe words each one", func(): reported(verify_example(compiler, c_compiler, work_directory, read))),
+                    ("fs write_text replaces, creates and writes through a link, and returns each kind it can", func(): reported(verify_fs_write(compiler, c_compiler, work_directory, write, write_tree))),
+                ]
             else:
                 [("the fs example tree is prepared", func(): reported(Err(FS_PREPARE_SCRIPT + " exited " + status.to_string())))]
+
+
+-- Rebuilds the directory the write example is given, from nothing.
+private func prepared_write_tree(directory: String, prefix: String) -> Result[Void, String]:
+    status ?= run_to_files(SHELL, [FS_WRITE_PREPARE_SCRIPT, directory], prefix + ".stdout", prefix + ".stderr", NATIVE_TIMEOUT_MS)
+    if status.equals(0):
+        Ok(void)
+    else:
+        Err(FS_WRITE_PREPARE_SCRIPT + " exited " + status.to_string())
+
+
+-- The write example changes the directory it is given, so each of its two
+-- runs gets the directory, which is also its argument, just rebuilt by
+-- prepare_write.sh, and neither run sees the other's files.
+private func verify_fs_write(compiler: String, c_compiler: String, work_directory: String, example: Example, directory: String) -> Result[Void, String]:
+    prefix = work_directory + "/" + example.name
+    _ ?= compile_fixture(compiler, [example.source], prefix)
+    _ ?= link_fixture(c_compiler, prefix, NormalNative)
+    _ ?= link_fixture(c_compiler, prefix, StrictNative)
+    _ ?= prepared_write_tree(directory, prefix + ".normal.prepare")
+    _ ?= run_normal(prefix, example)
+    _ ?= prepared_write_tree(directory, prefix + ".strict.prepare")
+    run_strict(prefix, example)
 
 
 func suite(compiler: String, c_compiler: String, work_directory: String) -> TestSuite:
@@ -360,6 +421,7 @@ func suite(compiler: String, c_compiler: String, work_directory: String) -> Test
     fs_native_read_text: Example = { name = "fs_native_read_text", source = "blorp_2/test/e2e/fixtures/fs/natives_read_text.brp", status = 0, stdout = "1\n", allocations = 2, arguments = [] }
     fs_native_entry_kind: Example = { name = "fs_native_entry_kind", source = "blorp_2/test/e2e/fixtures/fs/natives_entry_kind.brp", status = 0, stdout = "2\n", allocations = 2, arguments = [] }
     fs_native_both: Example = { name = "fs_native_both", source = "blorp_2/test/e2e/fixtures/fs/natives_both.brp", status = 0, stdout = "1\n2\n", allocations = 4, arguments = [] }
+    fs_native_write_text: Example = { name = "fs_native_write_text", source = "blorp_2/test/e2e/fixtures/fs/natives_write_text.brp", status = 0, stdout = "1\n", allocations = 3, arguments = [] }
     {
         description = "Self-hosted native e2e",
         tests = [
@@ -464,5 +526,6 @@ func suite(compiler: String, c_compiler: String, work_directory: String) -> Test
             ("a program that calls only fs.read_text is valid C under -Werror", func(): reported(verify_example(compiler, c_compiler, work_directory, fs_native_read_text))),
             ("a program that calls only fs.entry_kind is valid C under -Werror", func(): reported(verify_example(compiler, c_compiler, work_directory, fs_native_entry_kind))),
             ("a program that calls both fs natives emits their shared helpers once", func(): reported(verify_example(compiler, c_compiler, work_directory, fs_native_both))),
-        ].concat(fs_read_tests(compiler, c_compiler, work_directory))
+            ("a program that calls only fs.write_text is valid C under -Werror", func(): reported(verify_example(compiler, c_compiler, work_directory, fs_native_write_text))),
+        ].concat(fs_tree_tests(compiler, c_compiler, work_directory))
     }

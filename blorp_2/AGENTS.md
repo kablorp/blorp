@@ -133,7 +133,9 @@ String and generated concrete aggregate helpers for supported records, unions
 and collections, as explicitly approved on 2026-10-13. Tests use the same pure
 production runtime/emission fragments as normal compilation and test-local
 allocator wrappers that delegate to actual allocation/free. Observe allocation
-occurrences independently; never dereference freed objects. This permits
+occurrences independently; never dereference freed objects. Tests may also
+rename system calls around the included runtime text, with wrappers that
+record each call and pass it through or return an injected failure. This permits
 runtime-helper tests, not calls to generated language functions or a language
 fixture's alternate main, and authorizes no production tracing.
 

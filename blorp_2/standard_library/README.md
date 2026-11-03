@@ -309,8 +309,9 @@ for counted bytes, one-close error priority and target NUL-path teaching text.
 
 `fs.brp` is the typed filesystem library; import it explicitly. It declares
 `IOErrorKind`, `IOError`, the fixed union `EntryKind`, the pure `describe` and
-`default_if_not_found`, and the impure `read_text` and `entry_kind`. The two
-natives return Int codes that private decoders turn into kinds; the codes are
+`default_if_not_found`, and the impure `read_text`, `write_text` and
+`entry_kind`; `write_text` replaces a file atomically. The three natives
+return Int codes that private decoders turn into kinds; the codes are
 named in `src/runtime/fs.brp`. See [The fs library](../README.md#the-fs-library)
 for the contract and its limits.
 

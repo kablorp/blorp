@@ -33,9 +33,15 @@ FS_HELPERS_RUNTIME: String =
 		|/* Repeats a call that a signal interrupted. Never used for close: Linux has already
 		| * released the descriptor, and on XNU a retry could close another one. */
 		|#define BLORP_FS_RETRY(result,call) do{(result)=(call);}while((result)<0&&errno==EINTR)
+		|/* macOS fails a single read or write of more than INT_MAX bytes with EINVAL. */
+		|enum {BLORP_FS_REQUEST_MAXIMUM=1<<30};
 		|/* Every String ends in a NUL, so once no NUL is embedded its bytes are the C path. */
 		|static inline int blorp_fs_has_nul(const struct blorp_string *path){
 		|return memchr(path->bytes,'\0',(size_t)path->length)!=NULL;
+		|}
+		|/* OtherOs: an errno with no named kind, sent negated so that it keeps its number. */
+		|static inline int64_t blorp_fs_other_os_code(int number){
+		|return -(int64_t)number;
 		|}
 		|/* The code of a named kind, or any other errno negated. An operation whose errno
 		| * means something else (EEXIST from rmdir) maps that errno itself first. */
@@ -51,7 +57,7 @@ FS_HELPERS_RUNTIME: String =
 		|case ENOSPC:case EDQUOT:return BLORP_FS_NO_SPACE;
 		|case EFBIG:case EOVERFLOW:return BLORP_FS_FILE_TOO_LARGE;
 		|case EXDEV:return BLORP_FS_CROSSES_DEVICES;
-		|default:return -(int64_t)number;
+		|default:return blorp_fs_other_os_code(number);
 		|}
 		|}
 		|
@@ -62,8 +68,6 @@ FS_HELPERS_RUNTIME: String =
 FS_READ_TEXT_RUNTIME: String =
 	raw
 		|enum {BLORP_FS_READ_INITIAL_CAPACITY=4096};
-		|/* macOS fails a single read of more than INT_MAX bytes with EINVAL. */
-		|enum {BLORP_FS_READ_REQUEST_MAXIMUM=1<<30};
 		|/* The next buffer capacity, or 0 once the buffer holds the largest String. */
 		|static inline size_t blorp_fs_grown_capacity(size_t capacity,size_t maximum){
 		|if(capacity>=maximum){return 0;}
@@ -91,7 +95,7 @@ FS_READ_TEXT_RUNTIME: String =
 		|capacity=grown_capacity;
 		|}
 		|size_t request=capacity-used;
-		|if(request>BLORP_FS_READ_REQUEST_MAXIMUM){request=BLORP_FS_READ_REQUEST_MAXIMUM;}
+		|if(request>BLORP_FS_REQUEST_MAXIMUM){request=BLORP_FS_REQUEST_MAXIMUM;}
 		|ssize_t received;
 		|BLORP_FS_RETRY(received,read(descriptor,buffer+used,request));
 		|if(received<0){
@@ -123,6 +127,236 @@ FS_READ_TEXT_RUNTIME: String =
 		|}
 		|*text=blorp_string_from_bytes(contents,(int64_t)length);
 		|blorp_memory_release(contents);
+		|return BLORP_FS_SUCCEEDED;
+		|}
+		|
+
+
+-- Replaces the file atomically: the text goes into a new file beside the
+-- target, which is flushed and then renamed over it, so a reader sees the old
+-- contents or the new. A link is followed to its final target, which is
+-- replaced in its own directory, so the link survives (D4). The flush orders
+-- the contents before the rename without forcing them to stable storage (D5).
+-- Every failure before the rename removes the new file and leaves the target
+-- as it was; only the directory flush can fail after it.
+FS_WRITE_TEXT_RUNTIME: String =
+	raw
+		|/* The prelude's _DARWIN_C_SOURCE reveals F_BARRIERFSYNC. Without it the flush would
+		| * have no barrier to call, so a hidden declaration stops the build here. */
+		|#if defined(__APPLE__) && !defined(F_BARRIERFSYNC)
+		|#error fs.write_text needs F_BARRIERFSYNC: define _DARWIN_C_SOURCE before any header
+		|#endif
+		|/* A temporary name is taken only by a file that an earlier process with the same pid
+		| * left when it crashed, one for each write it had in flight, and every attempt takes
+		| * the next counter value. 100 attempts outlast any such run of leftovers and still
+		| * bound the work in a directory where every exclusive create fails. */
+		|enum {BLORP_FS_TEMPORARY_ATTEMPTS=100};
+		|/* ".blorp-tmp-", a pid, '-', a 64-bit counter and the NUL: at most 53 bytes, so the
+		| * name never holds the base name and always fits NAME_MAX. */
+		|enum {BLORP_FS_TEMPORARY_NAME_BYTES=64};
+		|/* One counter for every thread, so two writes never try the same name. */
+		|static _Atomic uint64_t blorp_fs_temporary_counter;
+		|/* The file a write replaces or creates, and the directory that holds it, both
+		| * allocated. `replaces` is set when the file exists; `status` then holds the owner
+		| * and mode the new file takes. */
+		|struct blorp_fs_write_target{char *directory;char *path;uint8_t replaces;struct stat status;};
+		|static char *blorp_fs_copy_path(const char *bytes,size_t length){
+		|char *copy=blorp_memory_allocate(length+1);
+		|if(copy==NULL){abort();}
+		|memcpy(copy,bytes,length);
+		|copy[length]='\0';
+		|return copy;
+		|}
+		|/* `directory` and `name` joined by one '/', unless the directory already ends in one. */
+		|static char *blorp_fs_join_path(const char *directory,const char *name){
+		|const size_t directory_length=strlen(directory),name_length=strlen(name);
+		|const size_t separator=directory_length>0&&directory[directory_length-1]=='/'?0:1;
+		|char *joined=blorp_memory_allocate(directory_length+separator+name_length+1);
+		|if(joined==NULL){abort();}
+		|memcpy(joined,directory,directory_length);
+		|if(separator==1){joined[directory_length]='/';}
+		|memcpy(joined+directory_length+separator,name,name_length+1);
+		|return joined;
+		|}
+		|/* Where a path's last component starts: just after its last '/', or at 0. */
+		|static size_t blorp_fs_base_start(const char *path,size_t length){
+		|while(length>0&&path[length-1]!='/'){length--;}
+		|return length;
+		|}
+		|/* The text before the last '/': "/" when that slash is the first byte, and "." when
+		| * there is none. */
+		|static char *blorp_fs_directory_part(const char *path,size_t base_start){
+		|if(base_start==0){return blorp_fs_copy_path(".",1);}
+		|return blorp_fs_copy_path(path,base_start==1?1:base_start-1);
+		|}
+		|/* realpath's answer, copied so that every path here is released the same way. */
+		|static int64_t blorp_fs_real_path(const char *path,char **resolved){
+		|char *answer=realpath(path,NULL);
+		|if(answer==NULL){return blorp_fs_errno_code(errno);}
+		|*resolved=blorp_fs_copy_path(answer,strlen(answer));
+		|free(answer);
+		|return 0;
+		|}
+		|/* A path that names nothing yet: the file is created in its parent's real directory. */
+		|static int64_t blorp_fs_new_target(const char *path,size_t length,struct blorp_fs_write_target *target){
+		|const size_t base_start=blorp_fs_base_start(path,length);
+		|char *parent=blorp_fs_directory_part(path,base_start);
+		|const int64_t failure=blorp_fs_real_path(parent,&target->directory);
+		|blorp_memory_release(parent);
+		|if(failure!=0){return failure;}
+		|target->path=blorp_fs_join_path(target->directory,path+base_start);
+		|target->replaces=0;
+		|return 0;
+		|}
+		|/* A file being replaced must be a regular file this process may open for writing,
+		| * although rename alone would replace a read-only one. There is no O_TRUNC, so the
+		| * check changes nothing, and O_NONBLOCK keeps a FIFO swapped in since the lstat from
+		| * blocking. The owner and mode come from the opened descriptor. */
+		|static int64_t blorp_fs_check_replaced(const char *path,struct stat *status){
+		|if(S_ISDIR(status->st_mode)){return BLORP_FS_IS_A_DIRECTORY;}
+		|if(!S_ISREG(status->st_mode)){return BLORP_FS_NOT_A_REGULAR_FILE;}
+		|int descriptor;
+		|BLORP_FS_RETRY(descriptor,open(path,O_WRONLY|O_NONBLOCK|O_CLOEXEC));
+		|if(descriptor<0){return blorp_fs_errno_code(errno);}
+		|int examined;
+		|BLORP_FS_RETRY(examined,fstat(descriptor,status));
+		|const int64_t failure=examined<0?blorp_fs_errno_code(errno):0;
+		|(void)close(descriptor);
+		|return failure;
+		|}
+		|/* Which file the write replaces or creates. A link is followed with realpath, so a
+		| * dangling link is NotFound and a loop is OtherOs(ELOOP). */
+		|static int64_t blorp_fs_resolve_target(const char *path,size_t length,struct blorp_fs_write_target *target){
+		|if(length==0){return BLORP_FS_NOT_FOUND;}
+		|if(path[length-1]=='/'){return BLORP_FS_IS_A_DIRECTORY;}
+		|int examined;
+		|BLORP_FS_RETRY(examined,lstat(path,&target->status));
+		|if(examined<0){return errno==ENOENT?blorp_fs_new_target(path,length,target):blorp_fs_errno_code(errno);}
+		|int64_t failure=0;
+		|if(S_ISLNK(target->status.st_mode)){
+		|failure=blorp_fs_real_path(path,&target->path);
+		|if(failure!=0){return failure;}
+		|BLORP_FS_RETRY(examined,lstat(target->path,&target->status));
+		|if(examined<0){failure=blorp_fs_errno_code(errno);}
+		|}else{
+		|target->path=blorp_fs_copy_path(path,length);
+		|}
+		|if(failure==0){failure=blorp_fs_check_replaced(target->path,&target->status);}
+		|if(failure!=0){blorp_memory_release(target->path);return failure;}
+		|const size_t resolved_length=strlen(target->path);
+		|target->directory=blorp_fs_directory_part(target->path,blorp_fs_base_start(target->path,resolved_length));
+		|target->replaces=1;
+		|return 0;
+		|}
+		|/* An empty file under a fresh name in `directory`. When every attempt finds the name
+		| * taken, the failure is OtherOs(EEXIST): AlreadyExists would describe the caller's
+		| * path, which a write is allowed to replace. */
+		|static int64_t blorp_fs_create_temporary(const char *directory,mode_t mode,char **temporary,int *descriptor){
+		|for(int attempt=0;attempt<BLORP_FS_TEMPORARY_ATTEMPTS;attempt++){
+		|const unsigned long long counter=(unsigned long long)atomic_fetch_add(&blorp_fs_temporary_counter,1);
+		|char name[BLORP_FS_TEMPORARY_NAME_BYTES];
+		|(void)snprintf(name,sizeof name,".blorp-tmp-%ld-%llu",(long)getpid(),counter);
+		|char *path=blorp_fs_join_path(directory,name);
+		|int opened;
+		|BLORP_FS_RETRY(opened,open(path,O_WRONLY|O_CREAT|O_EXCL|O_CLOEXEC,mode));
+		|if(opened>=0){*temporary=path;*descriptor=opened;return 0;}
+		|const int saved=errno;
+		|blorp_memory_release(path);
+		|if(saved!=EEXIST){return blorp_fs_errno_code(saved);}
+		|}
+		|return blorp_fs_other_os_code(EEXIST);
+		|}
+		|/* The owner first, because chown may clear the set-id bits that the mode restores.
+		| * Both come before any byte, so a private file's contents never sit in a file others
+		| * can read. Only the owner may give a file away, so on EPERM the group alone is
+		| * copied, which a member of that group may do; otherwise a shared 0660 file would
+		| * take this process's group with the old group's bits. EPERM from that too leaves
+		| * this process's owner and group. */
+		|static int64_t blorp_fs_copy_owner_and_mode(int descriptor,const struct stat *status){
+		|int changed;
+		|BLORP_FS_RETRY(changed,fchown(descriptor,status->st_uid,status->st_gid));
+		|if(changed<0&&errno==EPERM){BLORP_FS_RETRY(changed,fchown(descriptor,(uid_t)-1,status->st_gid));}
+		|if(changed<0&&errno!=EPERM){return blorp_fs_errno_code(errno);}
+		|BLORP_FS_RETRY(changed,fchmod(descriptor,(mode_t)(status->st_mode&07777)));
+		|return changed<0?blorp_fs_errno_code(errno):0;
+		|}
+		|/* POSIX lets a write of a regular file return 0 only for an empty request, so a
+		| * write that makes no progress is reported as EIO rather than repeated forever. */
+		|static int64_t blorp_fs_write_all(int descriptor,const char *bytes,size_t length){
+		|size_t done=0;
+		|while(done<length){
+		|size_t request=length-done;
+		|if(request>BLORP_FS_REQUEST_MAXIMUM){request=BLORP_FS_REQUEST_MAXIMUM;}
+		|ssize_t written;
+		|BLORP_FS_RETRY(written,write(descriptor,bytes+done,request));
+		|if(written<0){return blorp_fs_errno_code(errno);}
+		|if(written==0){return blorp_fs_other_os_code(EIO);}
+		|done+=(size_t)written;
+		|}
+		|return 0;
+		|}
+		|/* Orders the contents before the rename that publishes them. macOS's fsync does not
+		| * order the drive's writes, and F_BARRIERFSYNC adds the barrier that does, without
+		| * F_FULLFSYNC's cache flush; a file system without it gets fsync. A failed flush is
+		| * final: the kernel may already have dropped the pages it could not write. */
+		|static int blorp_fs_flush_file(int descriptor){
+		|int flushed;
+		|#ifdef __APPLE__
+		|BLORP_FS_RETRY(flushed,fcntl(descriptor,F_BARRIERFSYNC));
+		|if(flushed!=-1||errno!=ENOTSUP){return flushed;}
+		|#endif
+		|BLORP_FS_RETRY(flushed,fsync(descriptor));
+		|return flushed;
+		|}
+		|/* Everything between creating the new file and renaming it. Its descriptor is closed
+		| * exactly once, and a failed close fails the write. */
+		|static int64_t blorp_fs_fill_temporary(int descriptor,const struct blorp_fs_write_target *target,const struct blorp_string *text){
+		|int64_t failure=target->replaces?blorp_fs_copy_owner_and_mode(descriptor,&target->status):0;
+		|if(failure==0){failure=blorp_fs_write_all(descriptor,text->bytes,(size_t)text->length);}
+		|if(failure==0&&blorp_fs_flush_file(descriptor)<0){failure=blorp_fs_errno_code(errno);}
+		|if(close(descriptor)<0&&failure==0){failure=blorp_fs_errno_code(errno);}
+		|return failure;
+		|}
+		|/* Orders the rename before later writes. A file system that cannot flush a directory
+		| * (EINVAL, ENOTSUP) has nothing to order. Any other failure is reported, although the
+		| * target already holds the new contents. */
+		|static int64_t blorp_fs_flush_directory(const char *directory){
+		|int descriptor;
+		|BLORP_FS_RETRY(descriptor,open(directory,O_RDONLY|O_DIRECTORY|O_CLOEXEC));
+		|if(descriptor<0){return blorp_fs_errno_code(errno);}
+		|int flushed;
+		|BLORP_FS_RETRY(flushed,fsync(descriptor));
+		|const int64_t failure=flushed<0&&errno!=EINVAL&&errno!=ENOTSUP?blorp_fs_errno_code(errno):0;
+		|(void)close(descriptor);
+		|return failure;
+		|}
+		|/* Creates, fills and renames the new file. Until the rename succeeds, a failure
+		| * removes it, ignoring the unlink's own error, and the target is unchanged. */
+		|static int64_t blorp_fs_replace(const struct blorp_fs_write_target *target,const struct blorp_string *text){
+		|char *temporary=NULL;
+		|int descriptor=-1;
+		|int64_t failure=blorp_fs_create_temporary(target->directory,target->replaces?0600:0666,&temporary,&descriptor);
+		|if(failure!=0){return failure;}
+		|failure=blorp_fs_fill_temporary(descriptor,target,text);
+		|if(failure==0){
+		|int renamed;
+		|BLORP_FS_RETRY(renamed,rename(temporary,target->path));
+		|if(renamed<0){failure=blorp_fs_errno_code(errno);}
+		|}
+		|if(failure!=0){(void)unlink(temporary);}
+		|blorp_memory_release(temporary);
+		|return failure!=0?failure:blorp_fs_flush_directory(target->directory);
+		|}
+		|uint8_t blorp_fs_write_text(const struct blorp_string *path,const struct blorp_string *text,int64_t *error){
+		|if(blorp_fs_has_nul(path)){*error=BLORP_FS_PATH_CONTAINS_NUL;return BLORP_FS_FAILED;}
+		|struct blorp_fs_write_target target={.directory=NULL,.path=NULL};
+		|int64_t failure=blorp_fs_resolve_target(path->bytes,(size_t)path->length,&target);
+		|if(failure==0){
+		|failure=blorp_fs_replace(&target,text);
+		|blorp_memory_release(target.directory);
+		|blorp_memory_release(target.path);
+		|}
+		|if(failure!=0){*error=failure;return BLORP_FS_FAILED;}
 		|return BLORP_FS_SUCCEEDED;
 		|}
 		|

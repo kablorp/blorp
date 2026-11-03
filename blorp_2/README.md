@@ -3013,9 +3013,9 @@ integrated compiler shell uses this interface; full compiler acceptance remains 
 
 ## The fs library
 
-`fs` is an explicit import with typed errors, built on two builtin labels,
-`fs.read_text` and `fs.entry_kind`. Each returns an Int code that `fs.brp`
-decodes, so the compiler knows no `fs` type.
+`fs` is an explicit import with typed errors, built on three builtin labels,
+`fs.read_text`, `fs.write_text` and `fs.entry_kind`. Each returns an Int code
+that `fs.brp` decodes, so the compiler knows no `fs` type.
 
 ```blorp
 import:
@@ -3031,6 +3031,36 @@ func load_settings(path: String) -> Result[String, IOError]:
   system call; interrupted `open` and `read` calls are retried. A FIFO blocks
   until its writer closes. There is no size limit: reading `/dev/zero` exhausts
   memory and the allocation aborts, an infrastructure exception.
+- `write_text(path, text) -> Result[Void, IOError]` replaces the file
+  atomically: the text goes into a new file beside the target, named
+  `.blorp-tmp-<pid>-<counter>`, which is flushed and then renamed over the
+  target, so readers see the old contents or the new, never a mix, even after
+  a crash. The flush orders the contents before the rename (`fsync` on Linux,
+  `F_BARRIERFSYNC` on macOS, falling back to `fsync` where the file system
+  lacks it); it does not force them to stable storage, and a failed flush is
+  never retried. An `Err` before the rename leaves the target unchanged and
+  removes the new file; an `Err` after it, which only the directory flush can
+  give, means the target holds the old contents or the new. A symlink is
+  written through: its final target is replaced in that target's own
+  directory and the link stays a link. A dangling link is `NotFound` and
+  creates nothing; a loop is `OtherOs`. A replaced file keeps its mode and,
+  where permitted, its owner and group, or its group alone; a new file gets
+  0666 narrowed by the umask. A read-only file is `PermissionDenied`, though
+  `rename` alone would replace it, and a directory or `dir/` is
+  `IsADirectory`. Limits:
+  - a hard link to the old file keeps the old contents;
+  - extended attributes and ACLs are not copied;
+  - a link re-pointed between resolving it and the rename is not detected;
+  - a writable file in a directory this process cannot write is
+    `PermissionDenied`, because the new file is created in that directory;
+  - a crash can leave a hidden `.blorp-tmp-*` file beside the target;
+  - a busy executable (ETXTBSY) or a bind-mounted target (EBUSY) is
+    `OtherOs`;
+  - a directory without read permission gives an `Err` after a rename that
+    succeeded;
+  - writing past `RLIMIT_FSIZE` raises SIGXFSZ, which ends the process unless
+    the program ignores that signal; a library does not change signal
+    dispositions.
 - `entry_kind(path) -> Result[Option[EntryKind], IOError]` uses `lstat`, so a
   link is never followed. A missing path, or a file used as a directory, is
   `Ok(None)`; there is no `exists` that returns a Bool.
@@ -3045,11 +3075,17 @@ func load_settings(path: String) -> Result[String, IOError]:
   `strerror` text. `default_if_not_found(result, fallback)` turns `NotFound`
   into `Ok(fallback)` and leaves every other result alone.
 
-The runtime C is tested by `test/runtime/fs_suite.brp` and the example
-`test/e2e/fixtures/fs/read.brp`, which reads a tree that `prepare.sh` builds,
-since no `fs` operation can create a non-UTF-8 file, a symlink loop, a mode-000
-file or a FIFO. Run as root, the script exits with status 77 and the harness
-reports the example "not run", with no PASS credit.
+The runtime C is tested by `test/runtime/fs_suite.brp` and the examples
+`test/e2e/fixtures/fs/read.brp` and `write.brp`. The read example reads a tree
+that `prepare.sh` builds, since no `fs` operation can create a non-UTF-8 file,
+a symlink loop, a mode-000 file or a FIFO. The write example writes into a
+directory that `prepare_write.sh` rebuilds before each of its two runs, so
+neither run sees the other's files. Run as root, `prepare.sh` exits with
+status 77 and the harness reports both examples "not run", with no PASS credit;
+the runtime suite likewise leaves out its permission case. The write probe,
+`fixtures/fs_write_test.c`, renames each system call in the included runtime
+text to a recording wrapper, which can also inject a failure, so its cases
+check the order of the calls, every retry and every failure path.
 
 ## Float64 calculator
 
