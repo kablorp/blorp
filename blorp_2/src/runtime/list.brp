@@ -151,6 +151,14 @@ pure func list_c_type(key: ListElementKey) -> String:
 -- checking at exit; normal builds keep only the address test. The count is one
 -- total across all layouts, so an extra drop on one layout can cancel a missing
 -- drop on another: a limit on precision, never a false failure.
+--
+-- `blorp_list_copy_capacity` is the capacity of a copying append or concat,
+-- whose result is about to be appended to again. Sized exactly, it would resize
+-- at once, and `[]` is immortal, so every List built up from `[]` starts as
+-- such a copy. A copy floors at the first growth's capacity, clamped to
+-- `maximum` for elements too large for four slots. An empty join
+-- stays empty: it implies no later append. `required` is at most `maximum`;
+-- callers check it first.
 LIST_SHARED_RUNTIME: String =
 	raw
 		|enum {BLORP_LIST_DEFAULT_CAPACITY=4};
@@ -161,6 +169,10 @@ LIST_SHARED_RUNTIME: String =
 		|if(capacity<BLORP_LIST_DEFAULT_CAPACITY)capacity=maximum<BLORP_LIST_DEFAULT_CAPACITY?maximum:BLORP_LIST_DEFAULT_CAPACITY;
 		|while(capacity<required)capacity=capacity>maximum/2?maximum:capacity*2;
 		|return capacity;
+		|}
+		|size_t blorp_list_copy_capacity(size_t required,size_t maximum){
+		|const size_t first_growth=maximum<BLORP_LIST_DEFAULT_CAPACITY?maximum:BLORP_LIST_DEFAULT_CAPACITY;
+		|return required==0||required>=first_growth?required:first_growth;
 		|}
 		|#if BLORP_MEMORY_DIAGNOSTICS
 		|static atomic_llong blorp_list_empty_owners;
@@ -208,6 +220,11 @@ pure func list_empty_root(key: ListElementKey) -> String:
 
 private pure func allocate_root(type_name: String, count: String) -> String:
 	list_root_allocation(type_name, "result", count)
+
+
+-- A copying append or concat's root, sized by `blorp_list_copy_capacity`.
+private pure func allocate_growing_root(type_name: String, required: String, maximum: String) -> String:
+	"const size_t capacity=blorp_list_copy_capacity(${required},${maximum});${list_root_allocation(type_name, "result", "capacity")}"
 
 
 -- Stores one occurrence the caller already owns into `name`'s next slot.
@@ -326,7 +343,7 @@ pure func list_update_runtime(
 						.concat(list_slot_store("values", "count", "element")).concat("return values;}")
 			"${type_name} ${name}(${borrowed}values,${element_type} value){const uint64_t count=(uint64_t)values->length;"
 				.concat("if(count>=(uint64_t)INT64_MAX||count>=${capacity})abort();")
-				.concat("${allocate_root(type_name, "(count+1)")}for(uint64_t index=0;index<count;index++){")
+				.concat("${allocate_growing_root(type_name, "(size_t)(count+1)", capacity)}for(uint64_t index=0;index<count;index++){")
 				.concat("${element_type} element=values->values[index];${store_occurrence(acquire, "index")}}${element_type} element=value;")
 				.concat("${store_occurrence(acquire, "count")}return result;}")
 				.concat(in_place)
@@ -368,7 +385,7 @@ pure func list_update_runtime(
 						.concat(list_slot_store("values", "first+index", "element")).concat("}return values;}")
 			"${type_name} ${name}(${borrowed}left,${borrowed}right){const uint64_t first=(uint64_t)left->length;"
 				.concat("const uint64_t second=(uint64_t)right->length;if(second>(uint64_t)INT64_MAX-first||first+second>${capacity})abort();")
-				.concat("${allocate_root(type_name, "(first+second)")}for(uint64_t index=0;index<first;index++){")
+				.concat("${allocate_growing_root(type_name, "(size_t)(first+second)", capacity)}for(uint64_t index=0;index<first;index++){")
 				.concat("${element_type} element=left->values[index];${store_occurrence(acquire, "index")}}")
 				.concat("for(uint64_t index=0;index<second;index++){${element_type} element=right->values[index];")
 				.concat("${store_occurrence(acquire, "first+index")}}return result;}")

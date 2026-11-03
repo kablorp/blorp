@@ -459,9 +459,14 @@ element slots. Growth from zero starts at `min(4, maximum)`; growth from an
 exact-sized nonempty root starts at `max(current, min(4, maximum))` and doubles
 until sufficient. Thus an append-built buffer grows `4, 8, 16, 32, ...` after
 its first append. Reserve enough for a whole concat in one growth operation.
-`repeat`, argv and borrowed-copy results also allocate their known size directly,
-including zero. This avoids reserving large inline elements for retained empty
-values. No public reservation API is needed. This explicitly revises the initial
+`repeat`, argv and the borrowed `set` and suffix copies also allocate their known
+size directly, including zero. This avoids reserving large inline elements for
+retained empty values. A borrowed append or concat copy is different: its result
+is about to be appended to again, and `[]` is immortal, so every List built up
+from `[]` starts as such a copy. Sized exactly, the next in-place append would
+resize it at once. These two copies therefore allocate
+`max(length, min(4, maximum))` slots, with an empty concat result still exactly zero.
+No public reservation API is needed. This explicitly revises the initial
 proposal that `[]` eagerly reserve four slots.
 Emit the shared constant once, not once per concrete element helper.
 

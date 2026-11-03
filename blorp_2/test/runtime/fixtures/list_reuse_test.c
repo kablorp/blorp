@@ -454,6 +454,84 @@ static void concat_overflow(int length_limit) {
     forbid_storage_operations = 1;
     (void)blorp_list_concat_take_left_0_i(&left, &right);
 }
+/* A copying append or concat result is about to be appended to again, so it
+ * starts at the first-growth capacity instead of its exact length; a result
+ * longer than that stays exact, and results that cannot grow by copying
+ * (`[]` joins, set, suffix) keep their exact size. */
+static void copy_floor(void) {
+    const size_t before_allocations = allocations, before_resizes = resizes;
+    struct blorp_l_0_i *grown = blorp_list_append_0_i(&blorp_list_empty_0_i, 1);
+    assert(allocations == before_allocations + 1 && grown->length == 1 && grown->capacity == 4);
+    struct blorp_l_0_i *alias = grown;
+    for (int64_t value = 2; value <= 4; value++) grown = blorp_list_append_take_left_0_i(grown, value);
+    assert(grown == alias && resizes == before_resizes && grown->length == 4 && grown->capacity == 4);
+    grown = blorp_list_append_take_left_0_i(grown, 5);
+    assert(resizes == before_resizes + 1 && grown->length == 5 && grown->capacity == 8);
+    for (int64_t index = 0; index < 5; index++) assert(grown->values[index] == index + 1);
+    blorp_list_drop_0_i(grown);
+
+    struct blorp_l_0_i *two = blorp_list_repeat_0_i(7, 2);
+    struct blorp_l_0_i *three = blorp_list_append_0_i(two, 8);
+    assert(three->length == 3 && three->capacity == 4);
+    blorp_list_drop_0_i(three); blorp_list_drop_0_i(two);
+    struct blorp_l_0_i *four = blorp_list_repeat_0_i(7, 4);
+    struct blorp_l_0_i *five = blorp_list_append_0_i(four, 8);
+    assert(five->length == 5 && five->capacity == 5);
+    blorp_list_drop_0_i(five); blorp_list_drop_0_i(four);
+
+    struct blorp_l_0_i *one = blorp_list_repeat_0_i(7, 1);
+    const size_t before_joins = resizes;
+    struct blorp_l_0_i *pair = blorp_list_concat_0_i(one, one);
+    assert(pair->length == 2 && pair->capacity == 4);
+    pair = blorp_list_append_take_left_0_i(pair, 8);
+    pair = blorp_list_append_take_left_0_i(pair, 9);
+    assert(resizes == before_joins && pair->length == 4 && pair->capacity == 4);
+    blorp_list_drop_0_i(pair);
+    struct blorp_l_0_i *spare = blorp_list_concat_0_i(one, one);
+    spare = blorp_list_concat_take_left_0_i(spare, one);
+    assert(resizes == before_joins && spare->length == 3 && spare->capacity == 4);
+    blorp_list_drop_0_i(spare);
+    /* A consumed append on a shared root falls back to the floored copy. */
+    struct blorp_l_0_i *shared = blorp_list_repeat_0_i(7, 1);
+    blorp_list_dup_0_i(shared);
+    struct blorp_l_0_i *forked = blorp_list_append_take_left_0_i(shared, 8);
+    assert(forked != shared && forked->length == 2 && forked->capacity == 4 && shared->capacity == 1);
+    blorp_list_drop_0_i(forked); blorp_list_drop_0_i(shared);
+    struct blorp_l_0_i *from_empty = blorp_list_concat_0_i(&blorp_list_empty_0_i, one);
+    assert(from_empty->length == 1 && from_empty->capacity == 4);
+    blorp_list_drop_0_i(from_empty);
+    struct blorp_l_0_i *to_empty = blorp_list_concat_0_i(one, &blorp_list_empty_0_i);
+    assert(to_empty->length == 1 && to_empty->capacity == 4);
+    blorp_list_drop_0_i(to_empty);
+    struct blorp_l_0_i *left = blorp_list_repeat_0_i(7, 3), *right = blorp_list_repeat_0_i(9, 4);
+    struct blorp_l_0_i *seven = blorp_list_concat_0_i(left, right);
+    assert(seven->length == 7 && seven->capacity == 7);
+    blorp_list_drop_0_i(seven); blorp_list_drop_0_i(left); blorp_list_drop_0_i(right);
+
+    const size_t before_empty = allocations;
+    struct blorp_l_0_i *nothing = blorp_list_concat_0_i(&blorp_list_empty_0_i, &blorp_list_empty_0_i);
+    assert(allocations == before_empty + 1 && nothing->length == 0 && nothing->capacity == 0);
+    blorp_list_drop_0_i(nothing);
+
+    struct blorp_l_0_i *replaced = blorp_list_set_0_i(one, 0, 3);
+    assert(replaced->length == 1 && replaced->capacity == 1);
+    blorp_list_drop_0_i(replaced);
+    blorp_list_drop_0_i(one);
+
+    /* Spare capacity holds no owner: destruction stops at length. */
+    struct blorp_string *text = blorp_int_to_string(5);
+    struct blorp_l_0_s *texts = blorp_list_append_0_s(&blorp_list_empty_0_s, text);
+    assert(texts->capacity == 4 && atomic_load(&text->references) == 2);
+    struct blorp_l_0_s *joined = blorp_list_concat_0_s(texts, texts);
+    assert(joined->capacity == 4 && atomic_load(&text->references) == 4);
+    blorp_list_drop_0_s(joined);
+    struct blorp_l_0_s *source = blorp_list_repeat_0_s(text, 3);
+    struct blorp_l_0_s *suffix = blorp_list_suffix_0_s(source, 1);
+    assert(suffix->length == 2 && suffix->capacity == 2);
+    blorp_list_drop_0_s(suffix); blorp_list_drop_0_s(source); blorp_list_drop_0_s(texts);
+    assert(atomic_load(&text->references) == 1);
+    blorp_string_release(text);
+}
 static void bounds(void) {
     assert(BLORP_LIST_DEFAULT_CAPACITY == 4);
     assert(blorp_list_capacity(0, 1, 1) == 1);
@@ -464,6 +542,13 @@ static void bounds(void) {
     assert(blorp_list_capacity(8, 9, 9) == 9);
     const size_t maximum = SIZE_MAX < (uintmax_t)INT64_MAX ? SIZE_MAX : (size_t)INT64_MAX;
     assert(blorp_list_capacity(maximum / 2 + 1, maximum, maximum) == maximum);
+    /* A copy floors at the first-growth capacity, clamped to the byte bound
+     * for an element so large that fewer than four fit; zero stays zero. */
+    assert(blorp_list_copy_capacity(0, 9) == 0 && blorp_list_copy_capacity(0, 0) == 0);
+    assert(blorp_list_copy_capacity(1, 9) == 4 && blorp_list_copy_capacity(3, 9) == 4);
+    assert(blorp_list_copy_capacity(4, 9) == 4 && blorp_list_copy_capacity(5, 9) == 5);
+    assert(blorp_list_copy_capacity(1, 1) == 1 && blorp_list_copy_capacity(1, 3) == 3);
+    assert(blorp_list_copy_capacity(3, 3) == 3 && blorp_list_copy_capacity(maximum, maximum) == maximum);
 }
 enum { EXPECTED_CAPACITY_ABORT = 73 };
 static void capacity_aborted(int signal_number) {
@@ -488,6 +573,7 @@ int main(int argc, char **argv) {
     else if (strcmp(argv[1], "static-empty") == 0) static_empty();
     else if (strcmp(argv[1], "static-empty-extra-drop") == 0) static_empty_extra_drop();
     else if (strcmp(argv[1], "static-empty-missing-drop") == 0) static_empty_missing_drop();
+    else if (strcmp(argv[1], "copy-floor") == 0) copy_floor();
     else if (strcmp(argv[1], "bounds") == 0) bounds();
     else if (strcmp(argv[1], "concat-length-overflow") == 0 || strcmp(argv[1], "concat-byte-overflow") == 0) {
         if (signal(SIGABRT, capacity_aborted) == SIG_ERR) return 1;
