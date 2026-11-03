@@ -542,8 +542,10 @@ record OwnerAcquisition {
 }
 
 
+-- Stored payloads acquire before their definition, or take an owner whose
+-- last use is the definition; a projection's acquisition follows its read.
 private union AcquisitionPlan:
-	StoredAcquisitions(List[OwnerAcquisition])
+	StoredAcquisitions(List[OwnerAcquisition], List[OwnerId])
 	ProjectedAcquisition(OwnerAcquisition)
 
 
@@ -589,23 +591,6 @@ private pure func value_source(
 	entry.or_internal_error(span, "value used before definition in ownership insertion")
 
 
--- The borrow through which a value is read, or None for an unmanaged value.
--- Only call scheduling consumes an argument, so a stored payload or record
--- field has no consumed case.
-private pure func argument_borrow(
-	value: ValueId,
-	sources: List[ResultOwnership],
-	enclosing: List[EnclosingBlock],
-	first_value: Int,
-	span: Span,
-) -> Result[Option[BorrowedValue], Diagnostic]:
-	source ?= value_source(value, sources, enclosing, first_value, span)
-	match source:
-		UnmanagedResult: Ok(None)
-		BorrowedResult(borrow_source): Ok(Some({ value = value, source = borrow_source }))
-		OwnedResult(owner): Ok(Some({ value = value, source = OwnerBorrow(owner) }))
-
-
 private pure func borrow_argument(
 	value: ValueId,
 	sources: List[ResultOwnership],
@@ -613,18 +598,21 @@ private pure func borrow_argument(
 	first_value: Int,
 	span: Span,
 ) -> Result[OwnedArgument, Diagnostic]:
-	borrow ?= argument_borrow(value, sources, enclosing, first_value, span)
-	match borrow:
-		Some(borrowed): Ok(BorrowedArgument(borrowed))
-		None: Ok(UnmanagedArgument(value))
+	source ?= value_source(value, sources, enclosing, first_value, span)
+	match source:
+		UnmanagedResult: Ok(UnmanagedArgument(value))
+		BorrowedResult(borrow_source): Ok(BorrowedArgument({ value = value, source = borrow_source }))
+		OwnedResult(owner): Ok(BorrowedArgument({ value = value, source = OwnerBorrow(owner) }))
 
 
--- Stored payloads of a variant or a list literal. Each stored occurrence
--- acquires independently, including Pair(x, x) and [x, x]: a unary last-use
--- transfer cannot safely generalize to repeated values.
+-- Stored payloads of a record, a variant, a list literal or a callable
+-- environment. Each payload asks `transfer`: one moves its owner into its
+-- slot, and every other acquires before the definition, including the second
+-- of Pair(x, x) and [x, x], since one obligation fills one slot.
 private record StoredPayloads {
 	stored: List[StoredPayload],
 	acquisitions: List[OwnerAcquisition],
+	taken: List[OwnerId],
 	next: Int
 }
 
@@ -635,27 +623,42 @@ private pure func store_payloads(
 	enclosing: List[EnclosingBlock],
 	first_value: Int,
 	span: Span,
-	acquisitions: List[OwnerAcquisition],
+	pre_step_drops: Option[List[ScheduledDrop]],
+	loop_uses: List[ScheduledDrop],
+	consumed: List[OwnerId],
+	position: Int,
 	next_owner: Int,
 ) -> Result[StoredPayloads, Diagnostic]:
+	step_drops ?= pre_step_drops.or_internal_error(span, "missing drop schedule row")
 	var stored: List[StoredPayload] = []
-	var acquired = acquisitions
+	var acquired: List[OwnerAcquisition] = []
+	var taken: List[OwnerId] = []
 	var next = next_owner
 	var failure: Option[Diagnostic] = None
 	for value in values:
-		match argument_borrow(value, sources, enclosing, first_value, span):
+		var acquire_from: Option[BorrowSource] = None
+		match value_source(value, sources, enclosing, first_value, span):
 			Err(error):
 				failure = Some(error)
 				break
-			Ok(None): stored = stored.append(UnmanagedPayload(value))
-			Ok(Some(borrow)):
+			Ok(UnmanagedResult): stored = stored.append(UnmanagedPayload(value))
+			Ok(BorrowedResult(borrowed)): acquire_from = Some(borrowed)
+			Ok(OwnedResult(owner)):
+				match transfer(OwnedResult(owner), step_drops, loop_uses, consumed, position, taken):
+					Moves(moved):
+						taken = taken.append(moved)
+						stored = stored.append(OwnedPayload(value, moved))
+					Acquires: acquire_from = Some(OwnerBorrow(owner))
+		match acquire_from:
+			Some(borrow):
 				child_owner = owner_id(next)
 				next = next + 1
-				acquired = acquired.append({ owner = child_owner, borrow = borrow })
+				acquired = acquired.append({ owner = child_owner, borrow = { value = value, source = borrow } })
 				stored = stored.append(OwnedPayload(value, child_owner))
+			None: void
 	match failure:
 		Some(error): Err(error)
-		None: Ok({ stored = stored, acquisitions = acquired, next = next })
+		None: Ok({ stored = stored, acquisitions = acquired, taken = taken, next = next })
 
 
 private pure func borrowed_arguments(
@@ -673,6 +676,10 @@ private pure func build_definition(
 	enclosing: List[EnclosingBlock],
 	first_value: Int,
 	next_owner: Int,
+	pre_step_drops: Option[List[ScheduledDrop]],
+	loop_uses: List[ScheduledDrop],
+	consumed: List[OwnerId],
+	position: Int,
 	parameters: List[OwnedParameter],
 	unions: List[ConcreteUnion],
 	records: List[ConcreteRecord],
@@ -680,39 +687,26 @@ private pure func build_definition(
 	needs_owner ?= value_needs_ownership(definition.value_type, unions, records)
 	var next = next_owner
 	var acquisitions: List[OwnerAcquisition] = []
+	var taken: List[OwnerId] = []
 
 	operation_result: Result[OwnedValueOperation, Diagnostic] = match definition.operation:
 		ConstructRecordValue(owner, fields):
-			var stored: List[OwnedRecordField] = []
-			var failure: Option[Diagnostic] = None
-
-			for field in fields:
-				match argument_borrow(field.value, sources, enclosing, first_value, definition.span):
-					Err(error):
-						failure = Some(error)
-						break
-					Ok(None):
-						stored = stored.append({
-							field = field.field,
-							value = UnmanagedPayload(field.value),
-						})
-					Ok(Some(borrow)):
-						child_owner = owner_id(next)
-						next = next + 1
-						acquisitions = acquisitions.append({
-							owner = child_owner,
-							borrow = borrow,
-						})
-						stored = stored.append({
-							field = field.field,
-							value = OwnedPayload(field.value, child_owner),
-						})
-
-			match failure:
-				Some(error):
-					Err(error)
-				None:
-					Ok(ConstructRecordDefinition(owner, stored))
+			values = fields.map(pure func(field) -> ValueId: field.value)
+			match store_payloads(values, sources, enclosing, first_value, definition.span, pre_step_drops, loop_uses, consumed, position, next):
+				Err(error): Err(error)
+				Ok(payloads):
+					acquisitions = payloads.acquisitions
+					taken = payloads.taken
+					next = payloads.next
+					var stored: List[OwnedRecordField] = []
+					for field in fields:
+						match payloads.stored.get(stored.length()):
+							Some(payload): stored = stored.append({ field = field.field, value = payload })
+							None: break
+					if stored.length() == fields.length():
+						Ok(ConstructRecordDefinition(owner, stored))
+					else:
+						Err(internal_error(definition.span, "record field has no stored payload"))
 		ReadRecordFieldValue(field, value):
 			borrow_argument(
 				value,
@@ -734,17 +728,19 @@ private pure func build_definition(
 		FloatValue(value):
 			Ok(FloatDefinition(value))
 		ConstructValue(id, values):
-			match store_payloads(values, sources, enclosing, first_value, definition.span, acquisitions, next):
+			match store_payloads(values, sources, enclosing, first_value, definition.span, pre_step_drops, loop_uses, consumed, position, next):
 				Err(error): Err(error)
 				Ok(payloads):
 					acquisitions = payloads.acquisitions
+					taken = payloads.taken
 					next = payloads.next
 					Ok(ConstructDefinition(id, payloads.stored))
 		ConstructListValue(values):
-			match store_payloads(values, sources, enclosing, first_value, definition.span, acquisitions, next):
+			match store_payloads(values, sources, enclosing, first_value, definition.span, pre_step_drops, loop_uses, consumed, position, next):
 				Err(error): Err(error)
 				Ok(payloads):
 					acquisitions = payloads.acquisitions
+					taken = payloads.taken
 					next = payloads.next
 					Ok(ConstructListDefinition(payloads.stored))
 		PayloadValue(variant, value):
@@ -757,10 +753,11 @@ private pure func build_definition(
 			)
 		FreeCallableValue(body): Ok(FreeCallableDefinition(body))
 		CapturedCallableValue(body, environment):
-			match store_payloads([environment], sources, enclosing, first_value, definition.span, acquisitions, next):
+			match store_payloads([environment], sources, enclosing, first_value, definition.span, pre_step_drops, loop_uses, consumed, position, next):
 				Err(error): Err(error)
 				Ok(payloads):
 					acquisitions = payloads.acquisitions
+					taken = payloads.taken
 					next = payloads.next
 					match payloads.stored.get(0).to_result(internal_error(definition.span, "missing callable environment payload")):
 						Err(error): Err(error)
@@ -834,9 +831,9 @@ private pure func build_definition(
 						},
 					})
 				_:
-					StoredAcquisitions(acquisitions)
+					StoredAcquisitions(acquisitions, taken)
 		_:
-			StoredAcquisitions(acquisitions)
+			StoredAcquisitions(acquisitions, taken)
 
 	Ok({
 		definition = {
@@ -1081,13 +1078,47 @@ private pure func matches_last_use(rows: List[ScheduledDrop], owner: OwnerId, po
 	last
 
 
--- An obligation may transfer at this step when the step is its last use, in
--- this block's drop bucket or an enclosing loop row, and it is not consumed.
+-- An obligation ends at a point of a block when `ending` holds it, or it is a
+-- row of the nearest loop whose last use is `position`, and nothing at an
+-- earlier point consumed it. After a step, `ending` is the step's drop bucket,
+-- whose rows all have that step as their last use; at an edge, it is the rows
+-- the edge retires, and there are no loop rows.
 private pure func transferable_here(
-	step_drops: List[ScheduledDrop], loop_uses: List[ScheduledDrop], consumed: List[OwnerId], owner: OwnerId, position: Int,
+	ending: List[ScheduledDrop], loop_uses: List[ScheduledDrop], consumed: List[OwnerId], owner: OwnerId, position: Int,
 ) -> Bool:
-	last_use_here = matches_last_use(step_drops, owner, position).or(matches_last_use(loop_uses, owner, position))
-	and(last_use_here, has_consumed(consumed, owner).not())
+	var listed: Bool = False
+	for row in ending:
+		if row.owner == owner:
+			listed = True
+			break
+	and(listed.or(matches_last_use(loop_uses, owner, position)), has_consumed(consumed, owner).not())
+
+
+-- How one occurrence of a value fills an owned slot: a call's owned position,
+-- a stored payload, a loop header's entry or an edge's output.
+private union Transfer:
+	Moves(OwnerId)
+	Acquires
+
+
+-- The one move rule, which every owned slot asks. An occurrence moves its
+-- value's owner when that owner holds the value itself, the owner's
+-- obligation ends at this point (`transferable_here`), and no earlier
+-- occurrence at the point took it; any other occurrence acquires. A move ends
+-- an obligation only where `own` already ends it: at its drop row, at an
+-- edge that retires it, or at a loop row's last use, which any transfer may
+-- consume. Callers add their own reasons an owner must stay: a call's
+-- borrowed position or another read of a loop step that it backs.
+private pure func transfer(
+	source: ResultOwnership, ending: List[ScheduledDrop], loop_uses: List[ScheduledDrop], consumed: List[OwnerId], position: Int, taken: List[OwnerId],
+) -> Transfer:
+	match source:
+		OwnedResult(owner):
+			if and(transferable_here(ending, loop_uses, consumed, owner, position), has_consumed(taken, owner).not()):
+				Moves(owner)
+			else:
+				Acquires
+		_: Acquires
 
 
 -- A join takes every obligation that may transfer at its step: the step's
@@ -1163,24 +1194,23 @@ private pure func pass_arguments(
 				match value_source(borrow.value, sources, enclosing, first_value, definition.span):
 					Err(error): failure = Some(error)
 					Ok(source):
-						movable: Option[OwnerId] = match source:
-							OwnedResult(owner):
-								independent = and(borrowed_backers.contains(owner_number(owner)).not(), has_consumed(taken, owner).not())
-								if and(independent, transferable_here(step_drops, loop_uses, consumed, owner, position)):
-									Some(owner)
-								else:
-									None
-							_: None
-						match (movable, rule):
-							(Some(owner), _):
+						backs_borrow = match source:
+							OwnedResult(owner): borrowed_backers.contains(owner_number(owner))
+							_: False
+						decided: Transfer = if backs_borrow:
+							Acquires
+						else:
+							transfer(source, step_drops, loop_uses, consumed, position, taken)
+						match (decided, rule):
+							(Moves(owner), _):
 								passed = passed.append(ConsumedArgument(borrow.value, owner))
 								taken = taken.append(owner)
-							(None, OwnedPositions(_)):
+							(Acquires, OwnedPositions(_)):
 								fresh = owner_id(next)
 								next = next + 1
 								acquisitions = acquisitions.append({ owner = fresh, borrow = borrow })
 								passed = passed.append(ConsumedArgument(borrow.value, fresh))
-							(None, InPlaceOperand): passed = passed.append(argument)
+							(Acquires, InPlaceOperand): passed = passed.append(argument)
 			-- An unmanaged value never fills an owned position; verify rejects one.
 			_: passed = passed.append(argument)
 		index = index + 1
@@ -1318,13 +1348,10 @@ private pure func header_entry(
 	consumed: List[OwnerId], position: Int, sources: List[ResultOwnership], enclosing: List[EnclosingBlock], first_value: Int,
 ) -> Result[HeaderEntry, Diagnostic]:
 	source ?= value_source(header.initial, sources, enclosing, first_value, header.parameter.span)
-	match source:
-		OwnedResult(owner):
-			if transferable_here(step_drops, loop_uses, consumed, owner, position):
-				sole_backer_entry(owner, reads, sources, enclosing, first_value, header.parameter.span)
-			else:
-				Ok(AcquireAtEntry)
-		_: Ok(AcquireAtEntry)
+	-- Sole backing already keeps a second header from taking the same owner.
+	match transfer(source, step_drops, loop_uses, consumed, position, []):
+		Moves(owner): sole_backer_entry(owner, reads, sources, enclosing, first_value, header.parameter.span)
+		Acquires: Ok(AcquireAtEntry)
 
 
 private pure func entering_headers(
@@ -1463,7 +1490,7 @@ private pure func insert_steps(
 								carried = built.carried
 								Ok(join_ownership(built.result))
 			Define(definition):
-				match build_definition(definition, sources, enclosing, first_value, next_owner, contracts.parameters, unions, records):
+				match build_definition(definition, sources, enclosing, first_value, next_owner, pre_step_drops, loop_uses, consumed, step_position, contracts.parameters, unions, records):
 					Err(error): Err(error)
 					Ok(built):
 						match pass_call(built.definition, contracts.callees, next_owner, pre_step_drops, loop_uses, consumed, step_position, sources, enclosing, first_value):
@@ -1471,11 +1498,8 @@ private pure func insert_steps(
 							-- A call stores no payloads: transfers are its only acquisitions.
 							Ok(Some(passed)):
 								match built.acquisitions:
-									StoredAcquisitions([]):
+									StoredAcquisitions([], []):
 										taken_here = passed.taken
-										for owner in passed.taken:
-											if matches_last_use(loop_uses, owner, step_position):
-												consumed = consumed.append(owner)
 										next_owner = passed.next_owner
 										for acquisition in passed.acquisitions:
 											entries = entries.append(Inserted(AcquireOwner(acquisition.owner, acquisition.borrow, span)))
@@ -1484,10 +1508,12 @@ private pure func insert_steps(
 									_: Err(internal_error(span, "a call that transfers an obligation cannot store payloads"))
 							Ok(None):
 								next_owner = built.next_owner
-								-- Stored payloads are acquired before the definition; a
-								-- projection's own acquisition follows it and owns its value.
+								-- Stored payloads are acquired before the definition, or take an
+								-- owner last used here; a projection's own acquisition follows
+								-- its read and owns its value.
 								match built.acquisitions:
-									StoredAcquisitions(acquired):
+									StoredAcquisitions(acquired, taken):
+										taken_here = taken
 										for acquisition in acquired:
 											entries = entries.append(Inserted(AcquireOwner(acquisition.owner, acquisition.borrow, span)))
 										entries = entries.append(Inserted(DefineValue(built.definition)))
@@ -1503,6 +1529,11 @@ private pure func insert_steps(
 				break
 			Ok(available):
 				sources = sources.append(available)
+				-- A loop row this step took is consumed: no later step or edge
+				-- of the loop may take or retire it.
+				for owner in taken_here:
+					if matches_last_use(loop_uses, owner, step_position):
+						consumed = consumed.append(owner)
 
 				match available:
 					OwnedResult(owner):
@@ -1597,14 +1628,30 @@ private record LeavingValue {
 
 
 -- An owned result read as a borrow of its owner, so the edge acquires a fresh
--- owner instead of moving the existing one. Selection edges and join results
--- use it only when the owner cannot move: it was already moved or belongs to
--- an enclosing block. Join carriers, loop exits and loop entries that acquire
--- at entry always use it, because the owner must stay live after the edge.
+-- owner instead of moving the existing one: every edge output that acquires,
+-- and loop entries that acquire because the owner stays live after the entry.
 private pure func borrowed_result(source: ResultOwnership) -> ResultOwnership:
 	match source:
 		OwnedResult(owner): BorrowedResult(OwnerBorrow(owner))
 		_: source
+
+
+-- An outgoing occurrence of a selection edge, yield or loop exit asks
+-- `transfer` against the rows its edge retires: one that moves leaves with
+-- its owner, any other with a borrow that `leave_with` acquires. Every
+-- acquisition precedes the edge's drops, so a value borrowed from a retiring
+-- owner is acquired while that owner is live.
+private pure func leaving_source(source: ResultOwnership, decided: Transfer) -> ResultOwnership:
+	match decided:
+		Moves(owner): OwnedResult(owner)
+		Acquires: borrowed_result(source)
+
+
+-- The owners moved at one point, after one more occurrence.
+private pure func after_transfer(moved: List[OwnerId], decided: Transfer) -> List[OwnerId]:
+	match decided:
+		Moves(owner): moved.append(owner)
+		Acquires: moved
 
 
 private pure func leave_with(
@@ -1665,13 +1712,15 @@ private pure func insert_selection_edge(
 	var failure: Option[Diagnostic] = None
 	for definition in edge.definitions:
 		lowered = selection_value(definition)
-		match build_definition(lowered, sources, enclosing, first_value, next_owner, [], unions, records):
+		-- An edge's projections store nothing, and no obligation ends before its
+		-- outputs: an empty drop row and no loop rows.
+		match build_definition(lowered, sources, enclosing, first_value, next_owner, Some([]), [], [], 0, [], unions, records):
 			Err(error):
 				failure = Some(error)
 				break
 			Ok(built):
 				match built.acquisitions:
-					StoredAcquisitions(acquisitions):
+					StoredAcquisitions(acquisitions, _):
 						for acquired in acquisitions:
 							operations = operations.append(AcquireOwner(acquired.owner, acquired.borrow, lowered.span))
 						operations = operations.append(DefineValue(built.definition))
@@ -1681,42 +1730,34 @@ private pure func insert_selection_edge(
 						operations = operations.append(AcquireOwner(acquired.owner, acquired.borrow, lowered.span))
 						sources = sources.append(OwnedResult(acquired.owner))
 				next_owner = built.next_owner
+	-- Fresh suffix roots and acquired record projections retire at the edge.
+	-- Source wildcards never create a projection or acquisition.
+	position = sources.length()
+	var ending: List[ScheduledDrop] = []
+	for source in sources:
+		match source:
+			OwnedResult(owner): ending = ending.append({ owner = owner, span = compiler_span(), last = position })
+			_: void
 	var transfers: List[ReturnTransfer] = []
-	var moved: List[Int] = []
+	var moved: List[OwnerId] = []
 	for value in edge.arguments:
 		if failure.is_some():
 			break
 		match value_source(value, sources, enclosing, first_value, compiler_span()):
 			Err(error): failure = Some(error)
 			Ok(source):
-				transferred_source = match source:
-					OwnedResult(owner):
-						if in_interval(value_number(value), first_value, sources.length()):
-							if moved.contains(owner_number(owner)):
-								borrowed_result(source)
-							else:
-								moved = moved.append(owner_number(owner))
-								source
-						else:
-							borrowed_result(source)
-					_: source
-				leaving = leave_with(value, transferred_source, [], next_owner, compiler_span())
+				decided = transfer(source, ending, [], [], position, moved)
+				moved = after_transfer(moved, decided)
+				leaving = leave_with(value, leaving_source(source, decided), [], next_owner, compiler_span())
 				for entry in leaving.entries:
 					match entry:
 						Inserted(operation): operations = operations.append(operation)
 						_: failure = Some(internal_error(compiler_span(), "selection edge contains control flow"))
 				transfers = transfers.append(leaving.transfer)
 				next_owner = leaving.next_owner
-	-- Fresh suffix roots and acquired record projections that are not transferred
-	-- retire locally. Source wildcards never create a projection or acquisition.
-	for source in sources:
-		match source:
-			OwnedResult(owner):
-				if moved.contains(owner_number(owner)):
-					void
-				else:
-					operations = operations.append(DropOwner(owner, compiler_span()))
-			_: void
+	for row in ending:
+		if has_consumed(moved, row.owner).not():
+			operations = operations.append(DropOwner(row.owner, row.span))
 	match failure:
 		Some(error): Err(error)
 		None: Ok({
@@ -1786,17 +1827,16 @@ private record LeavingJoin {
 }
 
 
--- Multiple outgoing occurrences each acquire an independent obligation. Only
--- after every acquisition may terminal-live arm-local sources retire. Sources
--- already dropped by insert_steps, and all enclosing owners, remain untouched.
-private pure func retire_terminal_sources(
-	entries: List[InsertedEntry],
+-- The owners a yield retires: the arm's own sources still live at its end.
+-- Sources already dropped by insert_steps, and all enclosing owners, remain
+-- untouched.
+private pure func terminal_owners(
 	sources: List[ResultOwnership],
 	uses: List[Option[Int]],
 	position: Int,
 	span: Span,
-) -> Result[List[InsertedEntry], Diagnostic]:
-	var retired = entries
+) -> Result[List[ScheduledDrop], Diagnostic]:
+	var rows: List[ScheduledDrop] = []
 	var slot = 0
 	var failure: Option[Diagnostic] = None
 	for source in sources:
@@ -1810,13 +1850,13 @@ private pure func retire_terminal_sources(
 						match last_use:
 							Some(last):
 								if last == position:
-									retired = retired.append(Inserted(DropOwner(owner, span)))
+									rows = rows.append({ owner = owner, span = span, last = position })
 							_: void
 					_: void
 		slot = slot + 1
 	match failure:
 		Some(error): Err(error)
-		None: Ok(retired)
+		None: Ok(rows)
 
 
 private pure func leave_join(
@@ -1830,19 +1870,11 @@ private pure func leave_join(
 	first_value: Int,
 	span: Span,
 ) -> Result[LeavingJoin, Diagnostic]:
+	ending ?= terminal_owners(inserted.sources, uses, step_count, span)
 	result_source ?= value_source(outputs.value, inserted.sources, enclosing, first_value, span)
-	moved = match result_source:
-		OwnedResult(owner):
-			movable = if outputs.carried.is_empty():
-				in_interval(value_number(outputs.value), first_value, inserted.sources.length())
-			else:
-				False
-			if movable:
-				result_source
-			else:
-				borrowed_result(result_source)
-		_: result_source
-	leaving = leave_with(outputs.value, moved, inserted.entries, inserted.next_owner, span)
+	result_transfer = transfer(result_source, ending, [], [], step_count, [])
+	var moved = after_transfer([], result_transfer)
+	leaving = leave_with(outputs.value, leaving_source(result_source, result_transfer), inserted.entries, inserted.next_owner, span)
 	var entries = leaving.entries
 	var next_owner = leaving.next_owner
 	var carried: List[ReturnTransfer] = []
@@ -1855,8 +1887,9 @@ private pure func leave_join(
 				match value_source(value, inserted.sources, enclosing, first_value, parameter.span):
 					Err(error): failure = Some(error)
 					Ok(carrier_source):
-						borrowed = borrowed_result(carrier_source)
-						left = leave_with(value, borrowed, entries, next_owner, parameter.span)
+						decided = transfer(carrier_source, ending, [], [], step_count, moved)
+						moved = after_transfer(moved, decided)
+						left = leave_with(value, leaving_source(carrier_source, decided), entries, next_owner, parameter.span)
 						entries = left.entries
 						next_owner = left.next_owner
 						carried = carried.append(left.transfer)
@@ -1866,13 +1899,13 @@ private pure func leave_join(
 	ready: Void ?= match failure:
 		Some(error): Err(error)
 		None: Ok(void)
-	retired: List[InsertedEntry] ?= if outputs.carried.is_empty():
-		Ok(entries)
-	else:
-		retire_terminal_sources(entries, inserted.sources, uses, step_count, span)
-	-- An entering obligation the yield reads has no slot in this arm; it
-	-- retires here, after the yield's acquisitions.
-	var completed = retired
+	-- Only after every acquisition of the yield may the owners it did not move
+	-- retire. An entering obligation the yield reads has no slot in this arm;
+	-- it retires here too.
+	var completed = entries
+	for row in ending:
+		if has_consumed(moved, row.owner).not():
+			completed = completed.append(Inserted(DropOwner(row.owner, row.span)))
 	for discharge in discharges:
 		match discharge:
 			LastReadInArm(row):
@@ -2123,18 +2156,26 @@ private pure func require_loop_scope(scope: Option[LoopScope], target: Lower.Loo
 				Err(internal_error(span, "loop transfer does not target the nearest loop"))
 
 
--- Scheduling records are frozen at the exact occurrence. Earlier drops are
--- excluded without walking or reconstructing the enclosing source body.
-private pure func retire_live(
-	entries: List[InsertedEntry], owners: List[ScheduledDrop], position: Int, consumed: List[OwnerId],
-) -> List[InsertedEntry]:
-	var retired = entries
-	for owner in owners:
-		if and(owner.last >= position, has_consumed(consumed, owner.owner).not()):
-			retired = retired.append(Inserted(DropOwner(owner.owner, owner.span)))
-	retired
+-- The owners a loop edge retires: this block's and the loop scope's enclosing
+-- owners still live at the edge. Scheduling records are frozen at the exact
+-- occurrence. Earlier drops are excluded without walking or reconstructing
+-- the enclosing source body.
+private pure func edge_live_owners(
+	inserted: InsertedSteps, enclosing: List[EnclosingBlock], scope: LoopScope, position: Int,
+) -> List[ScheduledDrop]:
+	live = pure func(owners: List[ScheduledDrop], at: Int) -> List[ScheduledDrop]:
+		owners.filter(pure func(row): and(row.last >= at, has_consumed(inserted.consumed, row.owner).not()))
+	var rows = live(inserted.owners, position)
+	var ordinal = 0
+	for block in enclosing:
+		if ordinal >= scope.pre_blocks:
+			rows = rows.concat(live(block.owners, block.position))
+		ordinal = ordinal + 1
+	rows
 
 
+-- Each outgoing occurrence asks `transfer` against the owners the edge
+-- retires; the edge drops the rest after every acquisition.
 private pure func leave_loop(
 	exit: LoopExit,
 	inserted: InsertedSteps,
@@ -2144,9 +2185,11 @@ private pure func leave_loop(
 	position: Int,
 ) -> Result[LoopEdgeEntries, Diagnostic]:
 	span = loop_exit_span(exit)
+	retiring = edge_live_owners(inserted, enclosing, scope, position)
 	var entries = inserted.entries
 	var next_owner = inserted.next_owner
 	var transfers: List[ReturnTransfer] = []
+	var moved: List[OwnerId] = []
 	var failure: Option[Diagnostic] = None
 	for value in loop_exit_values(exit):
 		match value_source(value, inserted.sources, enclosing, first_value, span):
@@ -2154,19 +2197,18 @@ private pure func leave_loop(
 				failure = Some(error)
 				break
 			Ok(source):
-				leaving = leave_with(value, borrowed_result(source), entries, next_owner, span)
+				decided = transfer(source, retiring, [], [], position, moved)
+				moved = after_transfer(moved, decided)
+				leaving = leave_with(value, leaving_source(source, decided), entries, next_owner, span)
 				entries = leaving.entries
 				next_owner = leaving.next_owner
 				transfers = transfers.append(leaving.transfer)
 	ready: Void ?= match failure:
 		Some(error): Err(error)
 		None: Ok(void)
-	entries = retire_live(entries, inserted.owners, position, inserted.consumed)
-	var ordinal = 0
-	for block in enclosing:
-		if ordinal >= scope.pre_blocks:
-			entries = retire_live(entries, block.owners, block.position, inserted.consumed)
-		ordinal = ordinal + 1
+	for row in retiring:
+		if has_consumed(moved, row.owner).not():
+			entries = entries.append(Inserted(DropOwner(row.owner, row.span)))
 	owned_exit: OwnedLoopExit ?= match exit:
 		Lower.Recur(_, occurrence): Ok(Recur(transfers, occurrence))
 		Lower.Break(outputs):
@@ -2462,8 +2504,8 @@ private pure func reached_parameters(inserted: InsertedFunction) -> Result[List[
 				match tail:
 					ExitLoop(Break(outputs)):
 						match loop_result:
-							-- Only the result is linked: break outputs are acquisitions, and
-							-- missing a carried one can only leave a label borrowed.
+							-- Only the result is linked: missing a carried output can only
+							-- leave a label borrowed.
 							Some(result): nested = Some([ReachInputs([outputs.value], [result])])
 							None: void
 					ExitLoop(Recur(_, _)): void

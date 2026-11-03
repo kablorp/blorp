@@ -963,7 +963,10 @@ that initial, and is marked discharged. `VerifyLoop` receives that one
 post-transfer state: under the exactly-one rule no entry acquisition borrows a
 transferred owner, and the body inherits its flags, so a body read or drop of
 a transferred initial is rejected as a use of a discharged owner. Back edges
-keep requiring fresh acquisitions.
+keep requiring fresh acquisitions. *Reversed 2026-11-03, when Keith approved
+[moves at last use](#moves-at-last-use):* loop entries and exits now use the
+join yield rule, so an edge may move an owner instead of acquiring a fresh
+one, and `consume_loop_transfer` and `OwnerOrigin` are gone.
 
 **L2b.2, own.** `OwnedJoin` (`own.brp:177`) gains the contract:
 
@@ -1535,6 +1538,7 @@ projections and O3.
 | [O1 follow-ups](#o1-follow-ups) | One passing rule in `pass_arguments`, an `append_int` digit loop, a seed containing O1 | Done; the pinned seed contains O1 and the digit loop |
 | [Attribution after O1](#attribution-after-o1) | Remaining copies, RC operations and allocations by kind, a fresh profile | Measured 2026-10-30 ([report](../benchmarks/results/blorp_2_attribution_after_o1_2026-10-30.md)) |
 | [O2](#o2-record-update-binds-before-it-rebuilds) | Project the base fields an update reads before its replacements run | Landed 2026-10-30, b32b1a82d ([results](#o2-results)) |
+| [Moves at last use](#moves-at-last-use) | A store, yield, selection edge or loop exit moves an owner whose obligation ends there instead of acquiring a new one and dropping the old | Approved 2026-11-03 ([results](../benchmarks/results/blorp_2_ownership_moves_2026-11-03.md)) |
 | [Loop-header last-read drops](#loop-header-last-read-drops) | A loop-header obligation that is not outgoing drops at its last read instead of being held to the edge batch | Decided 2026-10-30 as a separate step; after O2 |
 | [Borrowed field projections](#borrowed-field-projections) | Read managed record fields borrowed, as union payloads already are | Proposed; decided from the attribution, needs approval |
 | [O3](#o3-specialised-reuse-for-records-and-union-nodes) | Specialised reuse of unique record cells and boxed union nodes | Undecided; decided from the attribution |
@@ -1740,8 +1744,8 @@ fails with "owner N has already been discharged"; a consumed argument appears
 only at an owned position or a reusing operand, and an owned position must
 receive one), then recheck every borrow against the post-discharge state
 through projection ancestry, as `discharge_update_argument` does today. An
-owned parameter introduces `ActiveOwner(DefinedOwner)`, which the existing exit
-checks must discharge.
+owned parameter introduces an `ActiveOwner`, which the existing exit checks
+must discharge.
 
 **Emitted C** keeps its types; only who drops changes, and a transferring call
 becomes eligible for a C sibling call:
@@ -2156,6 +2160,42 @@ Blorp 2, 18.2 M for the legacy compiler). Base is `cf59a1e30`.
 - Emitted C is byte-identical for 65 programs without a record update (five
   benchmarks and sixty e2e fixtures).
 
+### Moves at last use
+
+Approved by Keith on 2026-11-03 from the
+[pilot](../benchmarks/results/blorp_2_ownership_moves_2026-11-03.md), reversing
+L2b.1's "back edges keep requiring fresh acquisitions" and the
+[non-goal](#scope-and-non-goals-1) below. An acquisition whose source owner is
+dropped straight after it is a dup/drop pair, as in Perceus and Swift's
+OSSA; a move replaces the pair.
+
+**Rule.** One function in `own`, `transfer`, decides every owned slot: a
+call's owned position, a stored record, variant, list or environment
+payload, a loop header's entry, and each output of a selection edge, a yield
+and a loop exit. An occurrence moves its value's owner when that owner holds
+the value itself, the owner's obligation ends at this point, and no earlier
+occurrence at the point took it; any other occurrence acquires. The callers
+differ only in which obligations end at the point: after a step, its drop
+bucket and the nearest loop's rows last used there; at a selection edge, the
+edge's own owners; at a yield, the arm's owners live at its end; at a loop
+exit, the owners the edge retires, including loop-local owners of the
+enclosing blocks. A move ends an obligation only where `own` already ends
+it, so retirement positions do not depend on moves.
+
+**Verify.** `consume_loop_transfer` and its owner origins are gone. Loop
+entries and exits use the yield rule, `consume_yield`, which lets an edge
+move an owner made in its block, once. One permission is added: a loop exit
+may also move an enclosing owner whose ordinal is at least the loop's first
+owner, that is, one made inside the loop, which `complete_loop_owners`
+already required the edge to discharge. A stored payload uses the existing
+`stored_payload_transfer` check.
+
+**Results.** On a fixed workload (main's compiler built by each B, compiling
+main's source, identical output), atomic RC operations fell 28.5% and -O2
+retired instructions 6.9%, with allocations unchanged; B's own C shrank 9.2%,
+and production code grew by 16 lines net
+([results](../benchmarks/results/blorp_2_ownership_moves_2026-11-03.md)).
+
 ### Loop-header last-read drops
 
 `record_loop`, one function's loop updating a record's List field, stays
@@ -2289,7 +2329,8 @@ O1 touches `own`, `verify`, `namespace/builtins.brp`, the runtime helper names a
 shared contract. Not in this plan: moves at stores and control edges
 (acquire-then-drop costs two atomic operations each; O0 did not attribute
 them and step 0 counted only owned-call acquisitions, so the
-[attribution after O1](#attribution-after-o1) counts them), non-atomic
+[attribution after O1](#attribution-after-o1) counts them; since approved as
+[moves at last use](#moves-at-last-use)), non-atomic
 reference counts for thread-local values (deferred until Blorp 2 has a
 concurrency design), a report, LSP or `@in_place` (new surface, needs approval),
 Lean-style owning uses beyond reuse (only after O3), owned callable parameters

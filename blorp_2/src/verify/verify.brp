@@ -131,13 +131,8 @@ private record KnownValue {
 }
 
 
-private union OwnerOrigin:
-	DefinedOwner
-	AcquiredOwner
-
-
 private union OwnerState:
-	ActiveOwner(ValueId, OwnerOrigin)
+	ActiveOwner(ValueId)
 	DischargedOwner
 
 
@@ -402,7 +397,7 @@ private pure func verify_borrow(
 									"borrow refers to discharged owner ".append_int(owner_number(id)),
 								),
 							)
-						ActiveOwner(owned, _):
+						ActiveOwner(owned):
 							if owned == borrow.value:
 								Ok(void)
 							else:
@@ -1420,7 +1415,7 @@ private pure func discharge_call_arguments(
 				match known_owner(state, enclosing, local, owner, span):
 					Err(error): failure = Some(error)
 					Ok(DischargedOwner): failure = Some(verification_error(span, "owner ${owner_number(owner).to_string()} has already been discharged"))
-					Ok(ActiveOwner(_, _)):
+					Ok(ActiveOwner(_)):
 						match owner_slot(state, local.length(), owner, span):
 							Ok(EnclosingSlot(ordinal)): enclosing = discharge(enclosing, ordinal)
 							Ok(LocalSlot(index)): local = local.set(index, DischargedOwner)
@@ -1475,7 +1470,7 @@ private pure func stored_payload_transfer(
 							match entry:
 								DischargedOwner:
 									Err(verification_error(span, "payload owner has already been discharged"))
-								ActiveOwner(owned, _):
+								ActiveOwner(owned):
 									if value == owned:
 										owner_slot(
 											state,
@@ -1800,7 +1795,7 @@ private pure func verified_drop(
 					"owner ${owner_number(id).to_string()} has already been discharged",
 				),
 			)
-		ActiveOwner(_, _):
+		ActiveOwner(_):
 			owner_slot(state, owners.length(), id, span)
 
 
@@ -1918,7 +1913,7 @@ private pure func introduce_join_parameter(
 				ManagedJoinParameter(_, owner):
 					match validate_next_owner(state.first_owner, owners, owner, parameter.span):
 						Ok(_):
-							owners = owners.append(ActiveOwner(parameter.id, DefinedOwner))
+							owners = owners.append(ActiveOwner(parameter.id))
 							Ok(void)
 						Err(error): Err(error)
 	classified ?= classification
@@ -2046,7 +2041,7 @@ private pure func verify_operations(
 														Err(error)
 													Ok(_):
 														owners = owners.append(
-															ActiveOwner(definition.id, DefinedOwner),
+															ActiveOwner(definition.id),
 														)
 														Ok(void)
 
@@ -2104,7 +2099,7 @@ private pure func verify_operations(
 							Err(error):
 								Err(error)
 							Ok(_):
-								owners = owners.append(ActiveOwner(borrow.value, AcquiredOwner))
+								owners = owners.append(ActiveOwner(borrow.value))
 								Ok(void)
 			DropOwner(id, span):
 				match verified_drop(id, span, state, discharged, owners):
@@ -2156,7 +2151,7 @@ private pure func complete_owners(
 
 	for owner in owners:
 		match owner:
-			ActiveOwner(_, _):
+			ActiveOwner(_):
 				transferred = match excluded:
 					Some(id):
 						owner_number(id) == position
@@ -2194,7 +2189,7 @@ private pure func complete_enclosing(
 		var ordinal = scope.first_owner
 		for entry in scope.owners:
 			match entry:
-				ActiveOwner(_, _):
+				ActiveOwner(_):
 					transferred = match excluded:
 						Some(id): owner_number(id) == ordinal
 						None: False
@@ -2261,7 +2256,7 @@ private pure func verify_return(
 														),
 													),
 												)
-											ActiveOwner(owned, _):
+											ActiveOwner(owned):
 												if owned == returned:
 													Ok(void)
 												else:
@@ -2337,14 +2332,19 @@ private pure func block_end(state: VerificationState) -> BlockEnd:
 	}
 
 
--- A yield moves the joined value into the join's own definition. It may
--- move only an owner made in its arm, and must have discharged the arm's
--- other owners. Its enclosing discharges are checked against the join's
--- entering owners, so all edges into the join agree.
+-- A yield moves the joined value into the join's own definition, and a loop
+-- entry or exit moves each value into its header or output. Each may move
+-- only an owner made in its own block, once, and a join arm must have
+-- discharged its other owners. A loop exit may also move a loop-local owner
+-- of an enclosing block, which the edge would otherwise retire: `loop_floor`
+-- is the loop's first owner ordinal on a loop exit and None elsewhere. A
+-- join's enclosing discharges are checked against its entering owners, so
+-- all edges into the join agree.
 private pure func consume_yield(
 	transfer: ReturnTransfer,
 	state: VerificationState,
 	join_type: TypeRef,
+	loop_floor: Option[Int],
 	unions: List[ConcreteUnion],
 	records: List[ConcreteRecord],
 	span: Span,
@@ -2359,38 +2359,36 @@ private pure func consume_yield(
 	else:
 		Err(verification_error(span, "yield type does not match its join"))
 	needs_owner ?= value_needs_ownership(join_type, unions, records)
-	transferred: Result[Option[Int], Diagnostic] = match needs_owner:
-		False:
-			match moved:
-				None: Ok(None)
-				Some(_): Err(verification_error(span, "unmanaged yield cannot transfer an owner"))
-		True:
-			match moved:
-				None:
-					Err(verification_error(span, "managed yield requires an owner transfer"))
-				Some(id):
-					match owner_slot(state.facts, state.owners.length(), id, span):
-						Ok(slot):
-							match slot:
-								EnclosingSlot(_):
-									Err(verification_error(span, "yield must transfer an owner made in its arm, not owner ".append_int(owner_number(id))))
-								LocalSlot(position):
-									match known_owner(state.facts, state.discharged, state.owners, id, span):
-										Ok(entry):
-											match entry:
-												ActiveOwner(owned, _):
-													if owned == yielded:
-														Ok(Some(position))
-													else:
-														Err(verification_error(span, "yielded owner does not own the yielded value"))
-												DischargedOwner:
-													Err(verification_error(span, "yield refers to discharged owner ".append_int(owner_number(id))))
-										Err(error): Err(error)
-						Err(error): Err(error)
+	transferred: Result[Option[OwnerSlot], Diagnostic] = match (needs_owner, moved):
+		(False, None): Ok(None)
+		(False, Some(_)): Err(verification_error(span, "unmanaged yield cannot transfer an owner"))
+		(True, None): Err(verification_error(span, "managed yield requires an owner transfer"))
+		(True, Some(id)):
+			match owner_slot(state.facts, state.owners.length(), id, span):
+				Err(error): Err(error)
+				Ok(slot):
+					movable: Bool = match slot:
+						LocalSlot(_): True
+						EnclosingSlot(ordinal):
+							match loop_floor:
+								Some(first): ordinal >= first
+								None: False
+					if movable:
+						match known_owner(state.facts, state.discharged, state.owners, id, span):
+							Ok(ActiveOwner(owned)):
+								if owned == yielded:
+									Ok(Some(slot))
+								else:
+									Err(verification_error(span, "yielded owner does not own the yielded value"))
+							Ok(DischargedOwner): Err(verification_error(span, "yield refers to discharged owner ".append_int(owner_number(id))))
+							Err(error): Err(error)
+					else:
+						Err(verification_error(span, "yield must transfer an owner made in its arm, not owner ".append_int(owner_number(id))))
 	consumed ?= transferred
 	match consumed:
 		None: Ok(state)
-		Some(position): Ok({ state | owners = state.owners.set(position, DischargedOwner) })
+		Some(LocalSlot(position)): Ok({ state | owners = state.owners.set(position, DischargedOwner) })
+		Some(EnclosingSlot(ordinal)): Ok({ state | discharged = discharge(state.discharged, ordinal) })
 
 
 private pure func verify_yield(
@@ -2401,7 +2399,7 @@ private pure func verify_yield(
 	records: List[ConcreteRecord],
 	span: Span,
 ) -> Result[Void, Diagnostic]:
-	consumed ?= consume_yield(transfer, state, join_type, unions, records, span)
+	consumed ?= consume_yield(transfer, state, join_type, None, unions, records, span)
 	complete_owners(consumed.owners, state.facts.first_owner, None, YieldEdge, span)
 
 
@@ -2417,7 +2415,7 @@ private pure func verify_entering_discharges(entering: List[OwnerId], entry: Lis
 			newly = discharged_already(state.discharged, current).and(discharged_already(entry, current).not())
 			enters = entering.any(pure func(id): owner_number(id) == current)
 			match owner:
-				ActiveOwner(_, _):
+				ActiveOwner(_):
 					if failure.is_none():
 						if and(enters, newly.not()):
 							failure = Some(verification_error(span, "join arm leaves entering owner ${current.to_string()} live"))
@@ -2446,7 +2444,7 @@ private pure func verify_join_transfers(
 	yielded: Void ?= if join.carried.is_empty():
 		verify_yield(outputs.transfer, state, result.value_type, unions, records, result.span)
 	else:
-		match consume_yield(outputs.transfer, state, result.value_type, unions, records, result.span):
+		match consume_yield(outputs.transfer, state, result.value_type, None, unions, records, result.span):
 			Err(error): Err(error)
 			Ok(first):
 				var current = first
@@ -2457,7 +2455,7 @@ private pure func verify_join_transfers(
 					match outputs.carried.get(position):
 						None: invalid = Some(verification_error(result.span, "join arm carries the wrong number of values"))
 						Some(transfer):
-							match consume_yield(transfer, current, parameter.value_type, unions, records, parameter.span):
+							match consume_yield(transfer, current, parameter.value_type, None, unions, records, parameter.span):
 								Ok(consumed): current = consumed
 								Err(error): invalid = Some(error)
 					if invalid.is_some():
@@ -2966,7 +2964,7 @@ private pure func verify_selection_edge(
 			match target.inputs.get(position):
 				None: failure = Some(verification_error(span, "selection edge has no corresponding arm input"))
 				Some(input):
-					match consume_yield(transfer, current, join_parameter(input).value_type, unions, records, span):
+					match consume_yield(transfer, current, join_parameter(input).value_type, None, unions, records, span):
 						Err(error): failure = Some(error)
 						Ok(consumed): current = consumed
 		else:
@@ -3166,7 +3164,7 @@ private pure func complete_loop_owners(
 		var ordinal = scope.first_owner
 		for owner in scope.owners:
 			match owner:
-				ActiveOwner(_, _):
+				ActiveOwner(_):
 					newly_discharged: Bool = match discharged_already(pre.discharged, ordinal):
 						True: False
 						False: discharged_already(state.discharged, ordinal)
@@ -3184,7 +3182,7 @@ private pure func complete_loop_owners(
 		var ordinal = scope.first_owner
 		for owner in scope.owners:
 			match owner:
-				ActiveOwner(_, _):
+				ActiveOwner(_):
 					missing_discharge = match ordinal >= first_owner:
 						True: discharged_already(state.discharged, ordinal).not()
 						False: False
@@ -3235,7 +3233,7 @@ private pure func verify_loop_exit(
 				failure = Some(verification_error(span, "missing loop edge transfer"))
 				break
 			Some(transfer):
-				match consume_loop_transfer(transfer, current, parameter.value_type, unions, records, span):
+				match consume_yield(transfer, current, parameter.value_type, Some(first_owner), unions, records, span):
 					Err(error):
 						failure = Some(error)
 						break
@@ -3245,31 +3243,6 @@ private pure func verify_loop_exit(
 		Some(error): Err(error)
 		None: Ok(void)
 	complete_loop_owners(pre, current, first_owner, span)
-
-
--- Loop transfers consume acquisition occurrences, independently of the source's
--- own obligation. This rejects moving an owner defined before the loop, and
--- repeated owner occurrences.
-private pure func consume_loop_transfer(
-	transfer: ReturnTransfer,
-	state: VerificationState,
-	value_type: TypeRef,
-	unions: List[ConcreteUnion],
-	records: List[ConcreteRecord],
-	span: Span,
-) -> Result[VerificationState, Diagnostic]:
-	fresh: Result[Void, Diagnostic] = match transfer:
-		UnmanagedReturn(_): Ok(void)
-		OwnedReturn(_, owner):
-			match known_owner(state.facts, state.discharged, state.owners, owner, span):
-				Err(error): Err(error)
-				Ok(DischargedOwner): Err(verification_error(span, "loop transfer refers to a discharged owner"))
-				Ok(ActiveOwner(_, origin)):
-					match origin:
-						AcquiredOwner: Ok(void)
-						DefinedOwner: Err(verification_error(span, "loop transfer must use a fresh acquisition"))
-	ready ?= fresh
-	consume_yield(transfer, state, value_type, unions, records, span)
 
 
 -- `pre` follows the loop step's header transfers and precedes the entry
@@ -3307,7 +3280,7 @@ private pure func initialize_loop(
 					if taken:
 						void
 					else:
-						match consume_loop_transfer(header.initial, current, parameter.value_type, unions, records, parameter.span):
+						match consume_yield(header.initial, current, parameter.value_type, None, unions, records, parameter.span):
 							Err(error): failure = Some(error)
 							Ok(consumed): current = consumed
 				else:

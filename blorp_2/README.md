@@ -858,9 +858,10 @@ join stays live through every arm and is dropped after it at its last use. An
 owner whose last use is the join enters it instead: each yielding arm
 discharges it exactly once, on entry when the arm never reads it, else after
 its last read there, which may be an update consuming it, and an abrupt arm
-retires it at its edge. With carried variables, every managed outgoing
-occurrence acquires its own obligation before arm-local sources and entering
-owners retire.
+moves it out through its edge or retires it there. Each managed outgoing
+occurrence moves an owner whose obligation ends at the edge, once, and any
+other occurrence acquires its own obligation before the owners nobody moved
+retire.
 In C the join's outputs are locals declared before selection and assigned in each
 shared arm body. The [join examples](test/e2e/test_join.brp) include sixteen
 nested bound matches.
@@ -1732,9 +1733,9 @@ it ([loop-header last-read drops](ROADMAP.md#loop-header-last-read-drops)). The
 Managed updates always allocate a fresh root. There is no uniqueness test or
 COW reuse yet, including when a replacement has the same value as the old field.
 Inline numeric records use ordinary complete construction without ARC. Each
-managed stored occurrence receives its own obligation through the existing
-acquire-then-drop protocol: a projection acquires an owned child, construction
-acquires its stored child, and the temporary owner retires after its last use.
+managed stored occurrence receives its own obligation: a projection acquires an
+owned child, and construction moves in a stored child whose owner's last use it
+is, or else acquires one.
 Unchanged fields do not keep their parent alive after their own obligations are
 established. A replaced field is projected only when a replacement reads it. All current
 finite field types work, including Void, owning unions, records and nested Lists.
