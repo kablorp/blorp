@@ -166,7 +166,9 @@ Blorp over Lists ([plan](DICT_PLAN.md)). `DictKey` is a bundle trait,
 `trait DictKey: Hashable + Equatable`; a key type opts in with a bodyless
 `implements DictKey for Point` after writing its `Hashable` and, unless every
 field is Equatable and so gives it `==` already, its `Equatable`. A key with
-several parts hashes them with `dict: combine_hash`, starting from 0.
+several parts hashes them with `dict: combine_hash`, starting from 0. A List of
+Hashable elements is Hashable, and a List of keys a key, so a key can hold an
+argument list.
 Int, String and Bool are keys; Float is not, and a type without `DictKey` is
 rejected where `Dict[Point, Int]` is written. The prelude imports `dict: Dict`,
 so the type and its receiver methods are always available; `empty` and

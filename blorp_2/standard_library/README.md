@@ -147,7 +147,10 @@ open-addressing index. Int, String and Bool implement `DictKey` with a bodyless
 already has `==` and writes only `Hashable`. A key with several parts hashes them
 with `combine_hash(seed, value) = (seed + value) * 1099511628211`, wrapping:
 start from 0 and combine every part in order, the first included, because
-combining two parts directly is symmetric. The prelude imports `dict: Dict`, so
+combining two parts directly is symmetric. A List of Hashable elements is
+Hashable, combining its length and then each element in order, and a List of keys is a
+key; both live in `dict.brp` beside `combine_hash`, since `list.brp` is imported
+by `dict.brp`. The prelude imports `dict: Dict`, so
 the type and its receiver methods are implicit; `empty` and `with_capacity` are
 reached as `import: dict as D`. All functions are pure.
 
