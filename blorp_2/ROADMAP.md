@@ -1540,7 +1540,7 @@ projections and O3.
 | [O2](#o2-record-update-binds-before-it-rebuilds) | Project the base fields an update reads before its replacements run | Landed 2026-10-30, b32b1a82d ([results](#o2-results)) |
 | [Moves at last use](#moves-at-last-use) | A store, yield, selection edge or loop exit moves an owner whose obligation ends there instead of acquiring a new one and dropping the old | Approved 2026-11-03 ([results](../benchmarks/results/blorp_2_ownership_moves_2026-11-03.md)) |
 | [Loop-header last-read drops](#loop-header-last-read-drops) | A loop-header obligation that is not outgoing drops at its last read instead of being held to the edge batch | Decided 2026-10-30 as a separate step; after O2 |
-| [Borrowed field projections](#borrowed-field-projections) | Read managed record fields borrowed, as union payloads already are | Proposed; decided from the attribution, needs approval |
+| [Borrowed field projections](#borrowed-field-projections) | Read managed record fields borrowed, as union payloads already are | Approved 2026-11-03 ([results](../benchmarks/results/blorp_2_borrowed_projections_2026-11-03.md)) |
 | [O3](#o3-specialised-reuse-for-records-and-union-nodes) | Specialised reuse of unique record cells and boxed union nodes | Undecided; decided from the attribution |
 
 ### Problem
@@ -2309,19 +2309,37 @@ count saves about 8% of cycles on the M4 (an estimate; 5.9% to 8.5% per pair). S
 
 ### Borrowed field projections
 
-Proposed, decided from the attribution. `ReadRecordFieldDefinition` always
-acquires its managed result (`ProjectedAcquisition` in `own/own.brp`), while
-union payloads and List elements stay borrowed (`PayloadBorrow`). A record
-update with n inherited fields therefore costs n acquisitions, and n
-decrements when a unique base is freed. The proposal reads record fields
-borrowed and acquires only where the value escapes, is stored or consumed, or
-its parent dies or moves first. The verifier's projection-ancestry checks
-already cover borrowed children. A borrowed child can block an O1 move of its
-parent through `pass_arguments`' dependency rule; there the child is acquired,
-not the parent. This reverses "prefer immediate acquisition for a managed
-projection" under [construction and projection](#construction-and-projection),
-so it needs
-Keith's approval with the attribution's numbers.
+Approved by Keith on 2026-11-03 from the pilot (spike `25287b208` on
+`73102b901`), reversing "prefer immediate acquisition for a managed
+projection" under [construction and projection](#construction-and-projection).
+`ReadRecordFieldDefinition` used to acquire its managed result straight after
+the read, even when the parent outlived every use of the field, so the pair
+was an acquisition and a later drop, while union payloads and List elements
+already stayed borrowed (`PayloadBorrow`).
+
+**Rule.** A record field read stays a borrow of its parent when the parent's
+obligation outlives the field's last read in its block, extended through the
+fields read from it. Where that obligation ends is asked of `transfer`'s own
+predicate, `transferable_here`, over the block's drop buckets and loop rows,
+so every way `own` drops or moves an owner is seen by both. A field read at
+the block's end also borrows, since edges acquire their outputs before they
+move or drop what they retire. Any other read at or after the point where the
+obligation ends acquires, as before: that step or its arms may move the
+parent, and a borrowed child would hold the parent back from moving
+(`pass_arguments`' borrowed-backer rule), turning an in-place update into a
+copy. A loop block whose tail is a match, such as a `while` condition, hands
+its owners to the arms, so only a field of a borrowed parameter borrows there. Selection edges read fields borrowed from
+their scrutinee. `verify` and `emit` are unchanged: `verify_borrow` already
+follows a `PayloadBorrow` to its root owner at every use.
+
+**Results.** On the fixed workload (main's compiler built by each B,
+compiling main's source, identical output), atomic RC operations fell
+23.8% and -O2 retired instructions 5.6%, with allocations and
+copies unchanged ([results](../benchmarks/results/blorp_2_borrowed_projections_2026-11-03.md)).
+A parent whose last read is a sibling field read stored a step later, as in
+`{ prepared | unions = value.unions, records = value.records }`, still makes
+the earlier field acquire; extending the parent's drop over such reads is a
+separate step, measured later.
 
 ### Scope and non-goals
 
@@ -3384,9 +3402,12 @@ acquisition and copy are correct defaults.
 Acquire independently for each owning slot; a direct last-use transfer is
 optional where already sound, and a definition-position last-use test never
 authorizes transferring one obligation twice. StoredPayload is the common
-stored-slot contract for records, unions and Lists. Prefer immediate acquisition
-for a managed projection: acquire the child, backed by its parent, before the
-parent drops, and make later uses select the acquired owner. Unmanaged fields are
+stored-slot contract for records, unions and Lists. A managed projection stays
+a borrow of its parent while the parent's obligation outlives every read of it
+([borrowed field projections](#borrowed-field-projections), which reversed
+"prefer immediate acquisition" on 2026-11-03); otherwise acquire the child,
+backed by its parent, before the parent drops, and make later uses select the
+acquired owner. Unmanaged fields are
 copied while the parent is live. The independent verifier validates a managed
 receiver's live backing even when the projected result is unmanaged. Test a call
 after the parent drops, a nested projection after the intermediate parent drops,

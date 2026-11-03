@@ -1,0 +1,413 @@
+import:
+	../../../src/own/own as Own
+	../../../src/lower/lower as Lower
+	../../../src/utils/source: label_text
+	../../../src/verify/verify: verify
+	../list_update_inputs: lowered, UPDATE_DECLARATIONS
+	int: Int methods
+	bool: Bool methods
+	list: List methods
+	string: String methods
+	result: Result methods
+	option: Option methods
+	test: TestSuite
+
+
+-- Two managed fields, so a function can read one while the other keeps the
+-- parent in use.
+BAG_DECLARATIONS: String =
+	|pure func add(left: Int, right: Int) -> Int:
+	|    builtin("int.add")
+	|record Bag { items: List[Int], extra: List[Int] }
+	|record Holder { bag: Bag }
+	|record Both { bag: Bag, items: List[Int] }
+	|pure func grow(bag: Bag, extra: List[Int]) -> Bag:
+	|    { bag | items = append(bag.items, length(extra)) }
+	|pure func make() -> Bag:
+	|    { items = [1], extra = [2] }
+	|
+
+
+-- Every operation of a block and the blocks nested in it, outer first.
+private pure func flatten(operations: List[Own.OwnershipOperation]) -> List[Own.OwnershipOperation]:
+	var all: List[Own.OwnershipOperation] = []
+	for operation in operations:
+		all = all.append(operation)
+		match operation:
+			Own.ExecuteLoop(loop): all = all.concat(flatten_loop_block(loop.body))
+			Own.ExecuteJoin(join):
+				for arm in join.arms:
+					all = all.concat(flatten(arm.operations))
+					match arm.exit:
+						Own.TransferLoop(_, tail): all = all.concat(flatten_loop_tail(tail))
+						Own.Yield(_): void
+			_: void
+	all
+
+
+private pure func flatten_loop_block(block: Own.OwnedLoopBlock) -> List[Own.OwnershipOperation]:
+	flatten(block.operations).concat(flatten_loop_tail(block.tail))
+
+
+private pure func flatten_loop_tail(tail: Own.OwnedLoopTail) -> List[Own.OwnershipOperation]:
+	var all: List[Own.OwnershipOperation] = []
+	match tail:
+		Own.ExitLoop(_): void
+		Own.MatchLoop(matched):
+			for arm in matched.arms:
+				all = all.concat(flatten_loop_block(arm.body))
+	all
+
+
+-- How insertion treated each managed record projection of one function: the
+-- projections it acquired, and those it left borrowing their parent.
+private record ProjectionCounts {
+	acquired: Int,
+	borrowed: Int
+}
+
+
+private pure func counted(operations: List[Own.OwnershipOperation]) -> ProjectionCounts:
+	var acquired = 0
+	var borrowed = 0
+	var pending: Option[Lower.ValueId] = None
+	for operation in operations:
+		match operation:
+			Own.AcquireOwner(_, borrow, _):
+				match pending:
+					Some(projected):
+						if Lower.value_number(borrow.value) == Lower.value_number(projected):
+							acquired = acquired + 1
+							borrowed = borrowed - 1
+					None: void
+				pending = None
+			Own.DefineValue(definition):
+				pending = None
+				match (definition.operation, definition.result):
+					(Own.ReadRecordFieldDefinition(_, _), Own.BorrowedResult(_)):
+						borrowed = borrowed + 1
+						pending = Some(definition.id)
+					_: void
+			_: pending = None
+	{ acquired = acquired, borrowed = borrowed }
+
+
+-- The verified insertion of `body` and the projection counts of its function
+-- `name`, or None when insertion or verification fails.
+private pure func projections(body: String, name: String) -> Option[ProjectionCounts]:
+	match lowered(UPDATE_DECLARATIONS + BAG_DECLARATIONS + body).and_then(Own.own):
+		Err(_): None
+		Ok(program):
+			match verify(program):
+				Err(_): None
+				Ok(_):
+					program.functions.find(pure func(function): label_text(function.label) == "module_0." + name).map(pure func(function): counted(flatten(function.operations)))
+
+
+-- Acquisitions of record field reads anywhere in function `name`, at their
+-- read or at a later edge or store, once insertion and verification succeed.
+private pure func field_acquisitions(body: String, name: String) -> Option[Int]:
+	match lowered(UPDATE_DECLARATIONS + BAG_DECLARATIONS + body).and_then(Own.own):
+		Err(_): None
+		Ok(program):
+			match (verify(program), program.functions.find(pure func(function): label_text(function.label) == "module_0." + name)):
+				(Ok(_), Some(function)):
+					operations = flatten(function.operations)
+					var fields: List[Int] = []
+					var acquired = 0
+					for operation in operations:
+						match operation:
+							Own.DefineValue(definition):
+								match definition.operation:
+									Own.ReadRecordFieldDefinition(_, _): fields = fields.append(Lower.value_number(definition.id))
+									_: void
+							Own.AcquireOwner(_, borrow, _):
+								if fields.contains(Lower.value_number(borrow.value)):
+									acquired = acquired + 1
+							_: void
+					Some(acquired)
+				_: None
+
+
+-- How function `name` passes its owned values on: acquisitions of a value
+-- through its owner, and call arguments that take an obligation. A parent
+-- that moves into a call or store is never acquired through its owner.
+private record OwnerTransfers {
+	acquired: Int,
+	consumed: Int
+}
+
+
+private pure func owner_transfers(body: String, name: String) -> Option[OwnerTransfers]:
+	match lowered(UPDATE_DECLARATIONS + BAG_DECLARATIONS + body).and_then(Own.own):
+		Err(_): None
+		Ok(program):
+			match (verify(program), program.functions.find(pure func(function): label_text(function.label) == "module_0." + name)):
+				(Ok(_), Some(function)):
+					var acquired = 0
+					var consumed = 0
+					for operation in flatten(function.operations):
+						match operation:
+							Own.AcquireOwner(_, borrow, _):
+								match borrow.source:
+									Own.OwnerBorrow(_): acquired = acquired + 1
+									_: void
+							Own.DefineValue(definition):
+								match definition.operation:
+									Own.CallDefinition(_, arguments):
+										for argument in arguments:
+											match argument:
+												Own.ConsumedArgument(_, _): consumed = consumed + 1
+												_: void
+									_: void
+							_: void
+					Some({ acquired = acquired, consumed = consumed })
+				_: None
+
+
+private pure func expects(body: String, name: String, acquired: Int, borrowed: Int) -> Bool:
+	match projections(body, name):
+		Some(counts): (counts.acquired == acquired).and(counts.borrowed == borrowed)
+		None: False
+
+
+pure func test_a_borrowed_parameter_lends_its_fields() -> Bool:
+	body: String =
+		|pure func total(bag: Bag) -> Int:
+		|    add(length(bag.items), length(bag.extra))
+		|func main() -> Int:
+		|    total(make())
+		|
+	expects(body, "total", 0, 2)
+
+
+pure func test_an_unread_projection_neither_acquires_nor_drops() -> Bool:
+	body: String =
+		|func main() -> Int:
+		|    unused = make().items
+		|    0
+		|
+	expects(body, "main", 0, 1)
+
+
+-- `bag.items` is read before the parent's last read and borrows; `bag.extra`
+-- is that last read, so the parent dies first and the projection acquires.
+pure func test_only_the_projection_outliving_its_parent_acquires() -> Bool:
+	body: String =
+		|func main() -> Int:
+		|    bag = make()
+		|    first = length(bag.items)
+		|    add(first, length(bag.extra))
+		|
+	expects(body, "main", 1, 1)
+
+
+pure func test_a_projection_outliving_its_dying_parent_acquires() -> Bool:
+	body: String =
+		|func main() -> Int:
+		|    items = make().items
+		|    length(items)
+		|
+	expects(body, "main", 1, 0)
+
+
+pure func test_a_nested_projection_borrows_through_its_borrowed_parent() -> Bool:
+	body: String =
+		|pure func nested(holder: Holder) -> Int:
+		|    length(holder.bag.items)
+		|func main() -> Int:
+		|    nested({ bag = make() })
+		|
+	expects(body, "nested", 0, 2)
+
+
+-- The update reads `extra` from the parameter and stores it: the store
+-- acquires, and the projection itself stays a borrow.
+pure func test_a_record_update_stores_borrowed_fields() -> Bool:
+	body: String =
+		|pure func refill(bag: Bag) -> Bag:
+		|    { bag | items = [] }
+		|func main() -> Int:
+		|    length(refill(make()).extra)
+		|
+	expects(body, "refill", 0, 1)
+
+
+-- The holder's store is the parent's last use and moves it: the projection's
+-- last read precedes the move, so it stays a borrow. Both reads through the
+-- holder outlive their dying parents and acquire.
+pure func test_a_projection_read_before_its_parent_moves_into_a_store_borrows() -> Bool:
+	body: String =
+		|func main() -> Int:
+		|    bag = make()
+		|    count = length(bag.items)
+		|    holder: Holder = { bag = bag }
+		|    add(count, length(holder.bag.extra))
+		|
+	moved = match owner_transfers(body, "main"):
+		Some(transfers): transfers.acquired == 0
+		None: False
+	moved.and(expects(body, "main", 2, 1))
+
+
+-- `grow` owns its Bag, since it appends to the Bag's items in place, and its
+-- call is the parent's last use: `bag.items`, read before it, borrows, and
+-- `bag` moves into the call.
+pure func test_a_projection_read_before_its_parent_moves_into_a_call_borrows() -> Bool:
+	body: String =
+		|func main() -> Int:
+		|    bag = make()
+		|    count = length(bag.items)
+		|    add(count, length(grow(bag, []).items))
+		|
+	moved = match owner_transfers(body, "main"):
+		Some(transfers): (transfers.acquired == 0).and(transfers.consumed == 1)
+		None: False
+	moved.and(expects(body, "main", 1, 1))
+
+
+-- The join is the parent's last use and an arm moves it into `grow` beside
+-- the projection. A borrowed projection would make `bag` back a borrowed
+-- argument there, so `bag` would be acquired and `grow` would copy; the
+-- projection acquires instead and `bag` moves.
+pure func test_a_projection_read_in_an_arm_that_moves_its_parent_acquires() -> Bool:
+	body: String =
+		|func main() -> Int:
+		|    bag = make()
+		|    extra = bag.extra
+		|    total = if less_than(length(extra), 5):
+		|        length(grow(bag, extra).items)
+		|    else:
+		|        0
+		|    total
+		|
+	moved = match owner_transfers(body, "main"):
+		Some(transfers): (transfers.acquired == 0).and(transfers.consumed == 1)
+		None: False
+	moved.and(expects(body, "main", 2, 0))
+
+
+-- A loop condition's block retires its owners in each arm, so it has no
+-- last-use rows: a field of the loop's Bag acquires, and the body still moves
+-- the Bag into `grow`. `bag.extra` outlives the dying loop result and acquires.
+pure func test_a_loop_condition_field_of_a_local_acquires() -> Bool:
+	body: String =
+		|func main() -> Int:
+		|    var bag = make()
+		|    while less_than(length(bag.items), 3):
+		|        bag = grow(bag, [])
+		|    length(bag.extra)
+		|
+	moved = match owner_transfers(body, "main"):
+		Some(transfers): (transfers.acquired == 0).and(transfers.consumed == 1)
+		None: False
+	moved.and(expects(body, "main", 2, 0))
+
+
+-- A borrowed parameter outlives the body, so a loop condition's field of it
+-- borrows.
+pure func test_a_loop_condition_field_of_a_parameter_borrows() -> Bool:
+	body: String =
+		|pure func count_up(bag: Bag) -> Int:
+		|    var total = 0
+		|    while less_than(total, length(bag.items)):
+		|        total = add(total, 1)
+		|    total
+		|func main() -> Int:
+		|    count_up(make())
+		|
+	expects(body, "count_up", 0, 1)
+
+
+-- The store that moves the parent also stores the projection, so the
+-- projection acquires rather than hold the parent back from moving.
+pure func test_a_projection_stored_beside_its_moving_parent_acquires() -> Bool:
+	body: String =
+		|func main() -> Int:
+		|    bag = make()
+		|    both: Both = { bag = bag, items = bag.items }
+		|    length(both.items)
+		|
+	expects(body, "main", 2, 0)
+
+
+-- The recurring edge moves `bag` into its header and leaves with `bag.items`,
+-- which borrows to the edge and acquires there, before the move: one
+-- acquisition, as when the read itself acquired and the edge moved it.
+pure func test_a_loop_edge_acquires_a_projection_of_the_parent_it_moves() -> Bool:
+	body: String =
+		|func main() -> Int:
+		|    var bag = make()
+		|    var items: List[Int] = []
+		|    var total = 0
+		|    while less_than(total, 3):
+		|        if less_than(total, 1):
+		|            bag = make()
+		|        total = add(total, 1)
+		|        items = bag.items
+		|    add(total, length(items))
+		|
+	field_acquisitions(body, "main") == Some(1)
+
+
+-- The arm yields the entering `bag` and a projection of it: the yield acquires
+-- the projection, then moves `bag`. `bag.extra` is read before the join and
+-- borrows; the last one outlives its dying parent and acquires.
+pure func test_a_yield_acquires_a_projection_of_the_parent_it_moves() -> Bool:
+	body: String =
+		|func main() -> Int:
+		|    var bag = make()
+		|    var items: List[Int] = []
+		|    if less_than(length(bag.extra), 1):
+		|        items = bag.items
+		|    else:
+		|        bag = make()
+		|    add(length(items), length(bag.extra))
+		|
+	field_acquisitions(body, "main") == Some(2)
+
+
+-- The field is returned while the parameter that lends it stays live: the
+-- return edge acquires it, and nothing else does.
+pure func test_a_returned_projection_acquires_at_the_return() -> Bool:
+	body: String =
+		|pure func first_items(bag: Bag) -> List[Int]:
+		|    bag.items
+		|func main() -> Int:
+		|    length(first_items(make()))
+		|
+	match lowered(UPDATE_DECLARATIONS + BAG_DECLARATIONS + body).and_then(Own.own):
+		Err(_): False
+		Ok(program):
+			match program.functions.find(pure func(function): label_text(function.label) == "module_0.first_items"):
+				None: False
+				Some(function):
+					match (function.operations, function.result):
+						([Own.DefineValue(_), Own.DefineValue(projected), Own.AcquireOwner(owner, borrow, _)], Own.OwnedReturn(returned, moved)):
+							(Lower.value_number(borrow.value) == Lower.value_number(projected.id))
+								.and(Lower.value_number(returned) == Lower.value_number(projected.id))
+								.and(Own.owner_number(owner) == Own.owner_number(moved))
+								.and(verify(program).is_ok())
+						_: False
+
+
+tests: TestSuite = {
+	description = "Borrowed record projections",
+	tests = [
+		("a borrowed parameter lends its fields", test_a_borrowed_parameter_lends_its_fields),
+		("an unread projection neither acquires nor drops", test_an_unread_projection_neither_acquires_nor_drops),
+		("only the projection outliving its parent acquires", test_only_the_projection_outliving_its_parent_acquires),
+		("a projection outliving its dying parent acquires", test_a_projection_outliving_its_dying_parent_acquires),
+		("a nested projection borrows through its borrowed parent", test_a_nested_projection_borrows_through_its_borrowed_parent),
+		("a record update stores borrowed fields", test_a_record_update_stores_borrowed_fields),
+		("a projection read before its parent moves into a store borrows", test_a_projection_read_before_its_parent_moves_into_a_store_borrows),
+		("a projection read before its parent moves into a call borrows", test_a_projection_read_before_its_parent_moves_into_a_call_borrows),
+		("a projection read in an arm that moves its parent acquires", test_a_projection_read_in_an_arm_that_moves_its_parent_acquires),
+		("a loop condition field of a local acquires", test_a_loop_condition_field_of_a_local_acquires),
+		("a loop condition field of a parameter borrows", test_a_loop_condition_field_of_a_parameter_borrows),
+		("a projection stored beside its moving parent acquires", test_a_projection_stored_beside_its_moving_parent_acquires),
+		("a loop edge acquires a projection of the parent it moves", test_a_loop_edge_acquires_a_projection_of_the_parent_it_moves),
+		("a yield acquires a projection of the parent it moves", test_a_yield_acquires_a_projection_of_the_parent_it_moves),
+		("a returned projection acquires at the return", test_a_returned_projection_acquires_at_the_return),
+	]
+}

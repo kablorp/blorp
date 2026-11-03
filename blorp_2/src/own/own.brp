@@ -543,10 +543,12 @@ record OwnerAcquisition {
 
 
 -- Stored payloads acquire before their definition, or take an owner whose
--- last use is the definition; a projection's acquisition follows its read.
+-- last use is the definition. A managed record projection borrows its parent,
+-- and insertion decides at its step whether that borrow lasts or the
+-- projection acquires its own owner.
 private union AcquisitionPlan:
 	StoredAcquisitions(List[OwnerAcquisition], List[OwnerId])
-	ProjectedAcquisition(OwnerAcquisition)
+	Projection(BorrowedValue)
 
 
 private record BuiltDefinition {
@@ -811,7 +813,7 @@ private pure func build_definition(
 
 	result ?= ownership_result
 
-	var updated_owner = match result:
+	updated_owner = match result:
 		OwnedResult(_):
 			next + 1
 		_:
@@ -820,18 +822,8 @@ private pure func build_definition(
 	acquisition_plan: AcquisitionPlan = match operation:
 		ReadRecordFieldDefinition(_, _):
 			match result:
-				BorrowedResult(source):
-					owner = owner_id(updated_owner)
-					updated_owner = updated_owner + 1
-					ProjectedAcquisition({
-						owner = owner,
-						borrow = {
-							value = definition.id,
-							source = source
-						},
-					})
-				_:
-					StoredAcquisitions(acquisitions, taken)
+				BorrowedResult(source): Projection({ value = definition.id, source = source })
+				_: StoredAcquisitions(acquisitions, taken)
 		_:
 			StoredAcquisitions(acquisitions, taken)
 
@@ -1373,6 +1365,83 @@ private pure func entering_headers(
 		None: Ok(entering)
 
 
+-- Each value's last read in this block, extended through the record
+-- projections read from it: a projection that borrows keeps its parent in use.
+-- Every projection counts, even one that later acquires, so an extent may only
+-- overstate a parent's use.
+private pure func borrowed_extents(steps: List[LoweredStep], uses: List[Option[Int]], first_value: Int) -> List[Option[Int]]:
+	var extents = uses
+	var position = steps.length()
+	while position > 0:
+		position = position - 1
+		match steps.get(position):
+			Some(Define(definition)):
+				match definition.operation:
+					ReadRecordFieldValue(_, parent):
+						parent_slot = value_number(parent) - first_value
+						match extents.get(value_number(definition.id) - first_value):
+							Some(Some(read)):
+								if parent_slot >= 0:
+									match extents.get(parent_slot):
+										Some(Some(known)):
+											if read > known:
+												extents = extents.set(parent_slot, Some(read))
+										Some(None): extents = extents.set(parent_slot, Some(read))
+										None: void
+							_: void
+					_: void
+			_: void
+	extents
+
+
+-- The first point of this block, from `position` on, where `owner`'s
+-- obligation may end, asked of `transfer`'s own predicate: a step whose drop
+-- bucket or loop row ends it, where it drops or moves, or else the block's
+-- end, where an edge retires or moves it.
+private pure func retirement(
+	owner: OwnerId, drops: List[List[ScheduledDrop]], loop_uses: List[ScheduledDrop], consumed: List[OwnerId], position: Int,
+) -> Int:
+	var retired = drops.length()
+	var at = position
+	while at < drops.length():
+		match drops.get(at):
+			Some(bucket):
+				if transferable_here(bucket, loop_uses, consumed, owner, at):
+					retired = at
+					break
+			None: void
+		at = at + 1
+	retired
+
+
+-- Whether a record projection may stay a borrow of `parent`: the obligation
+-- behind the parent outlives the projection's extended last read, or both end
+-- at the block's end, whose edges acquire their outputs before they move or
+-- drop what they retire. At a step where the obligation ends, that step or
+-- its arms may move the parent while they read the projection; a borrow there
+-- would hold the parent back from moving and turn its in-place update into a
+-- copy, so the projection acquires. A loop block whose tail is a match has no
+-- extents: its arms take its owners, so only a projection of a borrowed
+-- parameter borrows there.
+private pure func projection_lasts(
+	parent: ValueId, extents: Option[List[Option[Int]]], slot: Int, drops: List[List[ScheduledDrop]],
+	loop_uses: List[ScheduledDrop], consumed: List[OwnerId], position: Int, sources: List[ResultOwnership],
+	enclosing: List[EnclosingBlock], first_value: Int, span: Span,
+) -> Result[Bool, Diagnostic]:
+	backing ?= dependency_owner(parent, sources, enclosing, first_value, span)
+	match (backing, extents):
+		(None, _): Ok(True)
+		(Some(_), None): Ok(False)
+		(Some(owner), Some(rows)):
+			match rows.get(slot):
+				None: Err(internal_error(span, "missing value-use row"))
+				-- An unread projection has no read after its parent's.
+				Some(None): Ok(True)
+				Some(Some(last)):
+					retired = retirement(owner, drops, loop_uses, consumed, position)
+					Ok((last < retired).or(retired == drops.length()))
+
+
 private pure func insert_steps(
 	steps: List[LoweredStep],
 	schedule: DropSchedule,
@@ -1388,6 +1457,9 @@ private pure func insert_steps(
 	records: List[ConcreteRecord],
 ) -> Result[InsertedSteps, Diagnostic]:
 	count = steps.length()
+	extents: Option[List[Option[Int]]] = match schedule:
+		DropAtLastUse(uses): Some(borrowed_extents(steps, uses, first_value))
+		DropInEachArm: None
 	var drops = steps.map(pure func(_: LoweredStep) -> List[ScheduledDrop]: [])
 	var consumed: List[OwnerId] = match enclosing.get(enclosing.length() - 1):
 		Some(block): block.consumed
@@ -1509,8 +1581,8 @@ private pure func insert_steps(
 							Ok(None):
 								next_owner = built.next_owner
 								-- Stored payloads are acquired before the definition, or take an
-								-- owner last used here; a projection's own acquisition follows
-								-- its read and owns its value.
+								-- owner last used here; a projection that cannot borrow acquires
+								-- after its read and owns its value.
 								match built.acquisitions:
 									StoredAcquisitions(acquired, taken):
 										taken_here = taken
@@ -1518,10 +1590,20 @@ private pure func insert_steps(
 											entries = entries.append(Inserted(AcquireOwner(acquisition.owner, acquisition.borrow, span)))
 										entries = entries.append(Inserted(DefineValue(built.definition)))
 										Ok(built.definition.result)
-									ProjectedAcquisition(acquired):
+									Projection(borrow):
 										entries = entries.append(Inserted(DefineValue(built.definition)))
-										entries = entries.append(Inserted(AcquireOwner(acquired.owner, acquired.borrow, span)))
-										Ok(OwnedResult(acquired.owner))
+										lasts: Result[Bool, Diagnostic] = match borrow.source:
+											PayloadBorrow(parent):
+												projection_lasts(parent, extents, value_slot, drops, loop_uses, consumed, step_position, sources, enclosing, first_value, span)
+											_: Err(internal_error(span, "record projection has no parent borrow"))
+										match lasts:
+											Err(error): Err(error)
+											Ok(True): Ok(built.definition.result)
+											Ok(False):
+												owner = owner_id(next_owner)
+												next_owner = next_owner + 1
+												entries = entries.append(Inserted(AcquireOwner(owner, borrow, span)))
+												Ok(OwnedResult(owner))
 
 		match available_result:
 			Err(error):
@@ -1725,12 +1807,13 @@ private pure func insert_selection_edge(
 							operations = operations.append(AcquireOwner(acquired.owner, acquired.borrow, lowered.span))
 						operations = operations.append(DefineValue(built.definition))
 						sources = sources.append(built.definition.result)
-					ProjectedAcquisition(acquired):
+					-- The scrutinee outlives its selection edges, so a record field
+					-- stays borrowed; one that crosses the edge acquires there.
+					Projection(_):
 						operations = operations.append(DefineValue(built.definition))
-						operations = operations.append(AcquireOwner(acquired.owner, acquired.borrow, lowered.span))
-						sources = sources.append(OwnedResult(acquired.owner))
+						sources = sources.append(built.definition.result)
 				next_owner = built.next_owner
-	-- Fresh suffix roots and acquired record projections retire at the edge.
+	-- Fresh suffix roots retire at the edge.
 	-- Source wildcards never create a projection or acquisition.
 	position = sources.length()
 	var ending: List[ScheduledDrop] = []

@@ -103,6 +103,8 @@ TARGET_COMPONENT_SOURCES := \
 	blorp_2/test/unit/test_own/test_owned_parameters.brp \
 	blorp_2/test/unit/test_verify/test_owned_parameters.brp \
 	blorp_2/test/unit/test_own/test_owned_label_use.brp \
+	blorp_2/test/unit/test_own/test_borrowed_projections.brp \
+	blorp_2/test/unit/test_verify/test_borrowed_projections.brp \
 	blorp_2/test/unit/test_parse/test_run_to_files.brp \
 	blorp_2/test/unit/test_parse/test_module_stems.brp \
 	blorp_2/test/unit/test_check/test_run_to_files.brp \

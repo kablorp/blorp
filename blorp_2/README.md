@@ -1733,11 +1733,12 @@ it ([loop-header last-read drops](ROADMAP.md#loop-header-last-read-drops)). The
 Managed updates always allocate a fresh root. There is no uniqueness test or
 COW reuse yet, including when a replacement has the same value as the old field.
 Inline numeric records use ordinary complete construction without ARC. Each
-managed stored occurrence receives its own obligation: a projection acquires an
-owned child, and construction moves in a stored child whose owner's last use it
-is, or else acquires one.
-Unchanged fields do not keep their parent alive after their own obligations are
-established. A replaced field is projected only when a replacement reads it. All current
+managed stored occurrence receives its own obligation: construction moves in a
+stored child whose owner's last use it is, or else acquires one. A field read
+stays a borrow of its parent while the parent's obligation outlives every read
+of the field, and otherwise acquires an owned child, so unchanged fields never
+keep their parent alive: the base still retires at its last projection. A
+replaced field is projected only when a replacement reads it. All current
 finite field types work, including Void, owning unions, records and nested Lists.
 The [escaped-child fixture](test/e2e/fixtures/record/update/escaped_children.brp)
 returns a List and a mortal String after their updated parents retire.
