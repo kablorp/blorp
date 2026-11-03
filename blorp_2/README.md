@@ -172,7 +172,7 @@ argument list.
 Int, String and Bool are keys; Float is not, and a type without `DictKey` is
 rejected where `Dict[Point, Int]` is written. The prelude imports `dict: Dict`,
 so the type and its receiver methods are always available; `empty` and
-`with_capacity` come from `import: dict as D`.
+`dict` come from `import: dict as D`.
 
 ```blorp
 import:
@@ -209,8 +209,8 @@ func main() -> Int:
 
 Checking rewrites a literal as calls to the functions of the module that declares
 the prelude's `Dict`, found by identity when the program is admitted, so a user's
-own `set` or `with_capacity` cannot change its meaning: `{}` is `empty()`, and n
-entries are `with_capacity(n)` then one `set` per entry, left to right, each key
+own `set` or `dict` cannot change its meaning: `{}` is `empty()`, and n
+entries are `dict(n)` then one `set` per entry, left to right, each key
 before its value. A repeated key therefore keeps its first position and its last
 value, as `scores` does above with `alice` first at 99. Later phases see only those
 calls, so a literal costs what the written calls cost. Outside a Dict entry, `=>`

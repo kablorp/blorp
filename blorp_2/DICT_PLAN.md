@@ -61,16 +61,20 @@ All of these are pure. `n` is the number of live entries.
 | Function | Result | Meaning | Cost |
 | --- | --- | --- | --- |
 | `empty()` | `Dict[K, V]` | no entries | small constant (a `MINIMUM_SLOTS` = 7 index) |
-| `with_capacity(count)` | `Dict[K, V]` | holds `count` entries before the index grows: the smallest 2^k − 1 slot count, at least 7, with `count` at most 2/3 of it | O(count) |
-| `get(dict, key)` | `Option[V]` | the value, or `None` | O(1) average |
-| `get_or(dict, key, default)` | `V` | the value, or `default` | O(1) average |
-| `contains(dict, key)` | `Bool` | whether the key is present | O(1) average |
-| `set(dict, key, value)` | `Dict[K, V]` | insert, or replace the value and keep the key's position | O(1) amortized |
-| `remove(dict, key)` | `Dict[K, V]` | without the key; unchanged if absent | O(1) amortized |
-| `keys(dict)` | `List[K]` | live keys in insertion order | O(1) with no removed entries pending, else O(n) |
-| `values(dict)` | `List[V]` | values in the same order | same as `keys` |
-| `entries(dict)` | `List[(K, V)]` | pairs in order; each pair is a managed tuple | O(n) |
-| `length(dict)`, `is_empty(dict)` | `Int`, `Bool` | live entry count | O(1) |
+| `dict(initial_capacity)` | `Dict[K, V]` | holds `initial_capacity` entries before the index grows: the smallest 2^k − 1 slot count, at least 7, with `initial_capacity` at most 2/3 of it | O(initial_capacity) |
+| `get(self, key)` | `Option[V]` | the value, or `None` | O(1) average |
+| `get_or(self, key, default)` | `V` | the value, or `default` | O(1) average |
+| `contains(self, key)` | `Bool` | whether the key is present | O(1) average |
+| `set(self, key, value)` | `Dict[K, V]` | insert, or replace the value and keep the key's position | O(1) amortized |
+| `remove(self, key)` | `Dict[K, V]` | without the key; unchanged if absent | O(1) amortized |
+| `keys(self)` | `List[K]` | live keys in insertion order | O(1) with no removed entries pending, else O(n) |
+| `values(self)` | `List[V]` | values in the same order | same as `keys` |
+| `entries(self)` | `List[(K, V)]` | pairs in order; each pair is a managed tuple | O(n) |
+| `length(self)`, `is_empty(self)` | `Int`, `Bool` | live entry count | O(1) |
+
+Renamed 2026-11-03 (owner decision): `with_capacity(count)` became `dict(initial_capacity)`, the receiver parameter of the other functions became `self` so it does not clash with the function `dict`, and the checker finds the function by the foundation word `dict_function_word`.
+
+Staging: the pinned seed finds `with_capacity` by spelling for any Dict literal, `{}` included, so `blorp_2/src` writes `D.empty()` instead of `{}` until the seed is rotated past this commit; the next step restores `{}`.
 
 **Left out:**
 - `insert` (D1);
@@ -89,9 +93,9 @@ All of these are pure. `n` is the number of live entries.
   - Its types come from the entries, unified as for a List literal, or from the expected type.
   - Evaluation is left to right, each key then its value.
   - The meaning is successive `set` calls, so a repeated key keeps its first position and the last value.
-- **Lowering:** checking rewrites a literal as ordinary calls, `{}` as `empty()` and `{k1 => v1, k2 => v2}` as `with_capacity(2).set(k1, v1).set(k2, v2)`. Lower, own, verify, specialize and emit see only calls. The `set` chain on a fresh unique Dict updates in place, with no tuples or pair List.
-- **Prelude:** it imports `dict: Dict`, the type and its UFCS receiver methods. (`Type methods` is for a type declared elsewhere, as `list: List methods` is, because `List` comes from `_base`; `module: Type` already enables the module's receiver functions for its own type.) Free functions such as `empty` and `with_capacity` are not imported. Code reaches them through `import: dict as D`, or uses literals.
-- **How checking finds `empty`, `with_capacity` and `set` (D6, resolved): by identity, not by name lookup.**
+- **Lowering:** checking rewrites a literal as ordinary calls, `{}` as `empty()` and `{k1 => v1, k2 => v2}` as `set(set(dict(2), k1, v1), k2, v2)`. Lower, own, verify, specialize and emit see only calls. The `set` chain on a fresh unique Dict updates in place, with no tuples or pair List.
+- **Prelude:** it imports `dict: Dict`, the type and its UFCS receiver methods. (`Type methods` is for a type declared elsewhere, as `list: List methods` is, because `List` comes from `_base`; `module: Type` already enables the module's receiver functions for its own type.) Free functions such as `empty` and `dict` are not imported. Code reaches them through `import: dict as D`, or uses literals.
+- **How checking finds `empty`, `dict` and `set` (D6, resolved): by identity, not by name lookup.**
   - The prelude fixes which declaration is `Dict`. After names resolve, checking rewrites a literal as calls to the functions declared in the module that declares that `Dict`.
   - A user's own `set`, a local `dict.brp` or an alias can't stand in, because user code can't add declarations to that module. Visibility doesn't matter either: the free functions aren't imported, and they don't need to be.
   - Checking needs a path that builds calls to known functions rather than to resolved names. Phase 0 estimated it at about 140 to 190 production lines in `check/`, following the operator precedent (`method_id_contract`, `CanonicalContracts`):
@@ -103,8 +107,8 @@ All of these are pure. `n` is the number of live entries.
     - the test-entry route (a special load of the library file, a synthetic import under an alias nobody can write, and a rewrite at assembly): the prelude already loads `dict.brp`;
     - new designation machinery for library functions.
   - **As built in phase 2:**
-    - `CanonicalContracts.dict_literal` holds the three `FunctionId`s, found in `accept_trait_contracts` (`check/traits.brp`) through the foundation words `Dict`, `empty`, `with_capacity` and `set`, the route the operator traits already take. It is `None` when the prelude's `Dict` is not an opaque type whose module declares all three as pure functions (a literal is pure, so this is the one purity check), and a literal then gets "Dict literals require the prelude's Dict".
-    - A literal's calls check exactly like the nested calls `set(set(with_capacity(2), k1, v1), k2, v2)`, which emit the same C. The receiver chain `D.with_capacity(2).set(k1, v1)` does not check today: `set` is an overloaded receiver method, and its selection fails on a receiver whose K and V are still unsolved. A literal avoids that because its `set` is known by identity.
+    - `CanonicalContracts.dict_literal` holds the three `FunctionId`s, found in `accept_trait_contracts` (`check/traits.brp`) through the foundation words `Dict`, `empty`, `dict` and `set`, the route the operator traits already take. It is `None` when the prelude's `Dict` is not an opaque type whose module declares all three as pure functions (a literal is pure, so this is the one purity check), and a literal then gets "Dict literals require the prelude's Dict".
+    - A literal's calls check exactly like the nested calls `set(set(dict(2), k1, v1), k2, v2)`, which emit the same C. The receiver chain `D.dict(2).set(k1, v1)` does not check today: `set` is an overloaded receiver method, and its selection fails on a receiver whose K and V are still unsolved. A literal avoids that because its `set` is known by identity.
     - A key type without `DictKey` gets the declaration-bound error where `Dict[Point, Int]` is written. In an unannotated literal no Dict type is written, so it gets the existing call-bound error, "type does not satisfy the required trait bound".
     - **Owner-visible diagnostic change.** `{}` where a record is expected became an ordinary type mismatch through one general checking change: when the expected type of a whole value has another head, its unsolved type parameters are reported as that mismatch. This changes calls too: `p: Point = D.empty()` now reports "expression does not match the expected type" instead of "cannot infer the type parameter from the argument". Argument positions such as `takes_point({})` are unchanged.
     - After the first expression in braces, anything but `|` or `=>` is "expected '|' or '=>' after the first expression in braces", naming both forms. Inside a Dict, a missing key or a second `=>` in an entry gets a Dict message; a stray `=>` elsewhere keeps the lexer's former comparison and lambda message.
@@ -275,7 +279,7 @@ These are set before implementation. A miss means stop and rescope.
 - **D3, resolved:** a `DictKey` bundle trait over `Hashable + Equatable`. Hashable stays independent.
 - **D4, resolved:** no `for` over a Dict for now.
 - **D5, resolved:** unseeded, deterministic hashes.
-- **D6, resolved:** the prelude imports `dict: Dict`, the type and its receiver methods only. Literal lowering finds `empty`, `with_capacity` and `set` by identity, in the module that declares the prelude's `Dict`.
+- **D6, resolved:** the prelude imports `dict: Dict`, the type and its receiver methods only. Literal lowering finds `empty`, `dict` and `set` by identity, in the module that declares the prelude's `Dict`.
 
 **D2: Float keys elsewhere.** These are the standard semantics of each language:
 

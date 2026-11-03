@@ -151,13 +151,13 @@ combining two parts directly is symmetric. A List of Hashable elements is
 Hashable, combining its length and then each element in order, and a List of keys is a
 key; both live in `dict.brp` beside `combine_hash`, since `list.brp` is imported
 by `dict.brp`. The prelude imports `dict: Dict`, so
-the type and its receiver methods are implicit; `empty` and `with_capacity` are
+the type and its receiver methods are implicit; `empty` and `dict` are
 reached as `import: dict as D`. All functions are pure.
 
 Literals need no import. `{}` is `empty()` and takes its key and value types from
 the expected type; without one it is rejected with "an empty Dict needs its
 type", so write `name: Dict[K, V] = {}`. `{k1 => v1, k2 => v2}`, with an optional
-trailing comma, is `with_capacity(2)` then `set(k1, v1)` and `set(k2, v2)`, left
+trailing comma, is `dict(2)` then `set(k1, v1)` and `set(k2, v2)`, left
 to right and each key before its value, so a repeated key keeps its first
 position and its last value. Checking calls these functions of this module by
 identity, so no other `set` can stand in, and a literal costs what those calls
@@ -166,12 +166,12 @@ cost.
 | Function | Contract |
 | --- | --- |
 | `empty[K: DictKey, V]() -> Dict[K, V]` | No entries. |
-| `with_capacity[K: DictKey, V](count) -> Dict[K, V]` | Room for `count` entries before the index grows; at most 1,048,576 are reserved, a larger or negative count is only a hint. |
-| `get(dict, key) -> Option[V]`, `get_or(dict, key, default) -> V`, `contains(dict, key) -> Bool` | O(1) average lookups; a missing key is `None` or the eagerly evaluated default. |
-| `set(dict, key, value) -> Dict[K, V]` | Insert, or replace the value and keep the key's position. O(1) amortized. |
-| `remove(dict, key) -> Dict[K, V]` | Without the key, order of the rest kept; unchanged when absent. O(1) amortized. |
-| `keys(dict) -> List[K]`, `values(dict) -> List[V]`, `entries(dict) -> List[(K, V)]` | Live entries in first-insertion order; a key removed and set again goes last. |
-| `length(dict) -> Int`, `is_empty(dict) -> Bool` | The live entry count, in O(1). |
+| `dict[K: DictKey, V](initial_capacity) -> Dict[K, V]` | Room for `initial_capacity` entries before the index grows; at most 1,048,576 are reserved, a larger or negative count is only a hint. |
+| `get(self, key) -> Option[V]`, `get_or(self, key, default) -> V`, `contains(self, key) -> Bool` | O(1) average lookups; a missing key is `None` or the eagerly evaluated default. |
+| `set(self, key, value) -> Dict[K, V]` | Insert, or replace the value and keep the key's position. O(1) amortized. |
+| `remove(self, key) -> Dict[K, V]` | Without the key, order of the rest kept; unchanged when absent. O(1) amortized. |
+| `keys(self) -> List[K]`, `values(self) -> List[V]`, `entries(self) -> List[(K, V)]` | Live entries in first-insertion order; a key removed and set again goes last. |
+| `length(self) -> Int`, `is_empty(self) -> Bool` | The live entry count, in O(1). |
 
 `Equatable` for `Dict[K: DictKey, V: Equatable]` compares lengths, then looks up
 each key of one Dict in the other, whatever the order. A Dict is neither
