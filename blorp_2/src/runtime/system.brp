@@ -1,7 +1,7 @@
 import:
 	./fs: FS_ENTRY_KIND_RUNTIME, FS_READ_TEXT_RUNTIME, FS_WRITE_TEXT_RUNTIME
 	./process: process_runtime
-	../utils/syntax: SystemOperation(GetCurrentDirectory, ReadFile, WriteFile, RunToFiles, FsReadText, FsWriteText, FsEntryKind)
+	../utils/syntax: SystemOperation(GetCurrentDirectory, RunToFiles, FsReadText, FsWriteText, FsEntryKind)
 
 
 -- The failure helpers the system fragments share. A failure publishes one
@@ -71,107 +71,6 @@ SYSTEM_CURRENT_DIRECTORY_RUNTIME: String =
 		|}
 		|
 
--- One stable regular-file snapshot. Every normal return publishes one fresh
--- counted UTF-8 String; private native storage never escapes this boundary.
-SYSTEM_READ_FILE_RUNTIME: String =
-	raw
-		|#include <errno.h>
-		|#include <limits.h>
-		|/* On supported LP64, positive ftell cannot reach the String size guard. */
-		|_Static_assert(LONG_MAX==INT64_MAX&&(uintmax_t)LONG_MAX<(uintmax_t)(SIZE_MAX-sizeof(struct blorp_string)-1),"read_file requires supported LP64 bounds");
-		|uint8_t blorp_read_file(const struct blorp_string *path,struct blorp_string **text,struct blorp_string **error){
-		|/* Every String ends in a NUL, so once no NUL is embedded its bytes are the C path. */
-		|if(memchr(path->bytes,'\0',(size_t)path->length)!=NULL){
-		|return blorp_system_failure(error,"read_file: path contains embedded NUL; use a path without NUL");
-		|}
-		|FILE *stream=fopen(path->bytes,"rb");
-		|const int open_errno=errno;
-		|if(stream==NULL){return blorp_system_error(error,"read_file: open failed; errno=",open_errno);}
-		|if(fseek(stream,0,SEEK_END)!=0){
-		|const int saved_errno=errno;
-		|(void)fclose(stream);
-		|return blorp_system_error(error,"read_file: seek end failed; errno=",saved_errno);
-		|}
-		|const long measured_length=ftell(stream);
-		|if(measured_length<0){
-		|const int saved_errno=errno;
-		|(void)fclose(stream);
-		|return blorp_system_error(error,"read_file: tell failed; errno=",saved_errno);
-		|}
-		|if((uintmax_t)measured_length>(uintmax_t)blorp_string_maximum_capacity()){
-		|(void)fclose(stream);
-		|return blorp_system_error(error,"read_file: size failed; errno=",EOVERFLOW);
-		|}
-		|if(fseek(stream,0,SEEK_SET)!=0){
-		|const int saved_errno=errno;
-		|(void)fclose(stream);
-		|return blorp_system_error(error,"read_file: seek start failed; errno=",saved_errno);
-		|}
-		|const size_t length=(size_t)measured_length;
-		|char *contents=NULL;
-		|if(length!=0){
-		|contents=blorp_memory_allocate(length);
-		|if(contents==NULL){abort();}
-		|const size_t received=fread(contents,1,length,stream);
-		|if(received!=length){
-		|const int saved_errno=errno;
-		|const int read_failed=ferror(stream);
-		|(void)fclose(stream);
-		|blorp_memory_release(contents);
-		|if(read_failed){return blorp_system_error(error,"read_file: read failed; errno=",saved_errno);}
-		|return blorp_system_failure(error,"read_file: short read");
-		|}
-		|}
-		|if(fclose(stream)!=0){
-		|const int saved_errno=errno;
-		|blorp_memory_release(contents);
-		|return blorp_system_error(error,"read_file: close failed; errno=",saved_errno);
-		|}
-		|if(length!=0&&!blorp_utf8_is_valid(contents,length)){
-		|blorp_memory_release(contents);
-		|return blorp_system_failure(error,"read_file: invalid UTF-8; save the file as UTF-8");
-		|}
-		|*text=blorp_string_from_bytes(length==0?"":contents,(int64_t)length);
-		|blorp_memory_release(contents);
-		|return BLORP_SYSTEM_SUCCEEDED;
-		|}
-		|
-
-
--- Both inputs remain borrowed. Only failure publishes a fresh owned String;
--- success has no child payload for the caller's ordinary Result[Void, String].
-SYSTEM_WRITE_FILE_RUNTIME: String =
-	raw
-		|#include <errno.h>
-		|#include <limits.h>
-		|/* Valid String lengths fit size_t, so the length casts below are exact. */
-		|_Static_assert(LONG_MAX==INT64_MAX&&(uintmax_t)INT64_MAX<(uintmax_t)(SIZE_MAX-sizeof(struct blorp_string)-1),"write_file requires supported LP64 bounds");
-		|uint8_t blorp_write_file(const struct blorp_string *path,const struct blorp_string *contents,struct blorp_string **error){
-		|*error=NULL;
-		|/* Every String ends in a NUL, so once no NUL is embedded its bytes are the C path. */
-		|if(memchr(path->bytes,'\0',(size_t)path->length)!=NULL){
-		|return blorp_system_failure(error,"write_file: path contains embedded NUL; use a path without NUL");
-		|}
-		|FILE *stream=fopen(path->bytes,"wb");
-		|const int open_errno=errno;
-		|if(stream==NULL){return blorp_system_error(error,"write_file: open failed; errno=",open_errno);}
-		|const size_t contents_length=(size_t)contents->length;
-		|if(contents_length!=0){
-		|const size_t written=fwrite(contents->bytes,1,contents_length,stream);
-		|if(written!=contents_length){
-		|const int write_errno=errno;
-		|(void)fclose(stream);
-		|return blorp_system_error(error,"write_file: short write; errno=",write_errno);
-		|}
-		|}
-		|if(fclose(stream)!=0){
-		|const int close_errno=errno;
-		|return blorp_system_error(error,"write_file: close failed; errno=",close_errno);
-		|}
-		|return BLORP_SYSTEM_SUCCEEDED;
-		|}
-		|
-
 
 -- The C symbol each system operation calls. Its fragment defines it with the
 -- emitter's one shape: borrowed arguments, then one out-parameter per non-Void
@@ -179,8 +78,6 @@ SYSTEM_WRITE_FILE_RUNTIME: String =
 pure func system_symbol(operation: SystemOperation) -> String:
 	match operation:
 		GetCurrentDirectory: "blorp_get_current_directory"
-		ReadFile: "blorp_read_file"
-		WriteFile: "blorp_write_file"
 		RunToFiles: "blorp_process_run_to_files"
 		FsReadText: "blorp_fs_read_text"
 		FsWriteText: "blorp_fs_write_text"
@@ -203,8 +100,6 @@ record SystemRuntime {
 pure func system_runtime(operation: SystemOperation, string_list_type: String) -> SystemRuntime:
 	match operation:
 		GetCurrentDirectory: { fragment = SYSTEM_CURRENT_DIRECTORY_RUNTIME, posix_declarations = False, failure_helpers = True, fs_helpers = False }
-		ReadFile: { fragment = SYSTEM_READ_FILE_RUNTIME, posix_declarations = False, failure_helpers = True, fs_helpers = False }
-		WriteFile: { fragment = SYSTEM_WRITE_FILE_RUNTIME, posix_declarations = False, failure_helpers = True, fs_helpers = False }
 		RunToFiles: { fragment = process_runtime(string_list_type), posix_declarations = True, failure_helpers = False, fs_helpers = False }
 		FsReadText: { fragment = FS_READ_TEXT_RUNTIME, posix_declarations = True, failure_helpers = False, fs_helpers = True }
 		FsWriteText: { fragment = FS_WRITE_TEXT_RUNTIME, posix_declarations = True, failure_helpers = False, fs_helpers = True }

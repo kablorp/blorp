@@ -2978,40 +2978,6 @@ existing union ownership rules. The integrated loader obtains this runtime path
 explicitly before normalizing module identities; full M6 and self-compilation
 acceptance remain pending.
 
-## File reading
-
-Import `system: read_file` for impure
-`read_file(path: String) -> Result[String, String]`; see the
-[complete program](test/e2e/fixtures/file_read/basic.brp).
-Success owns exact counted UTF-8 contents, preserving empty files, CRLF, BOM
-and embedded NUL. Stable regular files are supported; streams and concurrent
-snapshots are outside this contract. NUL paths reject before opening.
-IO failures return saved numeric errno text; short reads and malformed UTF-8
-return useful fixed text. The target advises saving malformed files as UTF-8;
-`read_bytes` is unavailable. Read errors take precedence over close errors,
-and close errors over encoding errors. Every opened stream receives one close
-attempt, including EINTR, without retry. Nothing is printed. Both Result branches own
-one fresh String under ordinary union ownership. The integrated loader uses
-this interface; full compiler acceptance remains pending.
-
-## File writing
-
-Import `system: write_file` for impure
-`write_file(path: String, contents: String) -> Result[Void, String]`.
-It creates or truncates a file and writes exact counted UTF-8 bytes, including
-BOM, CRLF and embedded NUL contents. Empty contents still create/truncate.
-Ok contains Void and follows successful write and close; Err owns one fresh
-String. Both inputs stay borrowed, including when they alias.
-NUL paths reject before opening, with `write_file: path contains embedded NUL;
-use a path without NUL`. The host uses `string contains embedded NUL` instead.
-Open, short-write and close errors report their saved numeric errno. Write
-errors take priority over close errors; every opened stream receives exactly
-one close attempt, including EINTR, without retry. Partial output is allowed;
-atomic replacement and durability are outside the contract. Nothing is printed.
-See the [complete program](test/e2e/fixtures/file_write/bytes.brp) and
-[acceptance report](https://github.com/kablorp/blorp/blob/1e07c4dce85e51cd7ad911142e9bc96a5e0d91c7/benchmarks/results/blorp_2_target_write_file_2026-10-18.md). The
-integrated compiler shell uses this interface; full compiler acceptance remains pending.
-
 ## The fs library
 
 `fs` is an explicit import with typed errors, built on three builtin labels,
@@ -3192,8 +3158,18 @@ prelude, and their dependencies once per normalized path, then writes C:
 bin/blorp run --no-format blorp_2/src/main.brp -- --library-root blorp_2/standard_library input.brp output.c
 ```
 
-The impure command shell owns file I/O and printing. Compilation and
-diagnostic rendering are pure. The pipeline publishes these complete results:
+The impure command shell owns file I/O and printing. It reads each module
+with `fs.read_text` and publishes the C with `fs.write_text`. The output is an
+atomic replacement: a symlinked output keeps the link and replaces its target,
+the mode is preserved, a hard link to the old output keeps the old contents,
+and a device or FIFO path is refused. The output's directory must be writable,
+because the temporary file lives there. Each compile flushes the new file
+before the rename (`F_BARRIERFSYNC` on macOS, `fsync` elsewhere), which orders
+it but does not force it to stable storage, and then `fsync`s the directory. A
+failed directory flush still reports "could not write", although the output
+may already be the new C; see [The fs library](#the-fs-library). Compilation
+and diagnostic rendering are pure. The pipeline publishes these complete
+results:
 
 1. Lexing produces tokens with source spans and an explicit end-of-source span.
    It receives the name table so far, mints one opaque `NameId` per identifier

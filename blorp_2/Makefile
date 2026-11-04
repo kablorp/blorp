@@ -47,7 +47,6 @@ TARGET_COMPONENT_SOURCES := \
 	blorp_2/test/unit/test_lex/test_trivia.brp \
 	blorp_2/test/unit/test_parse/test_arithmetic_operators.brp \
 	blorp_2/test/unit/test_parse/test_constant_inventory.brp \
-	blorp_2/test/unit/test_parse/test_file_read.brp \
 	blorp_2/test/unit/test_parse/test_system_labels.brp \
 	blorp_2/test/unit/test_parse/test_fs_read.brp \
 	blorp_2/test/unit/test_parse/test_fs_write.brp \
@@ -60,7 +59,6 @@ TARGET_COMPONENT_SOURCES := \
 	blorp_2/test/unit/test_parse/test_provenance.brp \
 	blorp_2/test/unit/test_parse/test_string_concat.brp \
 	blorp_2/test/unit/test_parse/test_string_slice.brp \
-	blorp_2/test/unit/test_parse/test_write_file.brp \
 	blorp_2/test/unit/test_harness/test_self_hosted_reports.brp \
 	blorp_2/test/unit/test_parse/test_discard_propagation.brp \
 	blorp_2/test/unit/test_parse/test_methods_selection.brp \

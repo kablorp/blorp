@@ -1,6 +1,6 @@
 import:
     process: run_to_files
-    system: read_file, write_file
+    fs: describe, read_text, write_text
     io: print_error
     test: TestSuite
     ./self_hosted_reports: verify_accounting
@@ -126,7 +126,7 @@ private func command(arguments: List[String], prefix: String, expected_status: I
     if actual.equals(expected_status):
         Ok(void)
     else:
-        match read_file(prefix + ".stderr"):
+        match read_text(prefix + ".stderr").map_err(describe):
             Ok(captured): Err(prefix + ": expected exit " + expected_status.to_string() + ", got " + actual.to_string() + ": " + captured)
             Err(error): Err(error)
 
@@ -138,11 +138,11 @@ private func compile_fixture(compiler: String, inputs: List[String], prefix: Str
          "--library-root", LIBRARY_ROOT].concat(inputs).concat([prefix + ".c"]),
         prefix + ".compile", 0, COMPILATION_TIMEOUT_MS,
     )
-    output: String ?= read_file(prefix + ".compile.stdout")
+    output: String ?= read_text(prefix + ".compile.stdout").map_err(describe)
     _ ?= expect(output, "", "compiler stdout")
-    report: String ?= read_file(prefix + ".compile.stderr")
+    report: String ?= read_text(prefix + ".compile.stderr").map_err(describe)
     _ ?= verify_accounting(report, True)
-    generated: String ?= read_file(prefix + ".c")
+    generated: String ?= read_text(prefix + ".c").map_err(describe)
     if generated.length().equals(0):
         Err("successful compilation emitted empty C")
     else:
@@ -162,9 +162,9 @@ private func link_fixture(c_compiler: String, prefix: String, mode: NativeMode) 
          prefix + ".c", "-o", binary, "-lm", "-lpthread"],
         binary + ".link", 0, COMPILATION_TIMEOUT_MS,
     )
-    stdout: String ?= read_file(binary + ".link.stdout")
+    stdout: String ?= read_text(binary + ".link.stdout").map_err(describe)
     _ ?= expect(stdout, "", "C compiler stdout")
-    stderr: String ?= read_file(binary + ".link.stderr")
+    stderr: String ?= read_text(binary + ".link.stderr").map_err(describe)
     expect(stderr, "", "C compiler stderr")
 
 
@@ -173,9 +173,9 @@ private func run_normal(prefix: String, example: Example) -> Result[Void, String
         ["-u", "BLORP_LEAK_CHECK", "-u", "BLORP_MEMORY_STATS", prefix + ".normal"].concat(example.arguments),
         prefix + ".normal.run", example.status, NATIVE_TIMEOUT_MS,
     )
-    output: String ?= read_file(prefix + ".normal.run.stdout")
+    output: String ?= read_text(prefix + ".normal.run.stdout").map_err(describe)
     _ ?= expect(output, example.stdout, "native stdout")
-    errors: String ?= read_file(prefix + ".normal.run.stderr")
+    errors: String ?= read_text(prefix + ".normal.run.stderr").map_err(describe)
     expect(errors, "", "native stderr")
 
 
@@ -184,9 +184,9 @@ private func run_strict(prefix: String, example: Example) -> Result[Void, String
         ["-u", "BLORP_MEMORY_STATS", "BLORP_LEAK_CHECK=strict", prefix + ".strict"].concat(example.arguments),
         prefix + ".strict.run", example.status, NATIVE_TIMEOUT_MS,
     )
-    strict_output: String ?= read_file(prefix + ".strict.run.stdout")
+    strict_output: String ?= read_text(prefix + ".strict.run.stdout").map_err(describe)
     _ ?= expect(strict_output, example.stdout, "strict native stdout")
-    accounting: String ?= read_file(prefix + ".strict.run.stderr")
+    accounting: String ?= read_text(prefix + ".strict.run.stderr").map_err(describe)
     expected = ("blorp: leak check: " + example.allocations.to_string() + " allocs, ") + example.allocations.to_string() + " releases, 0 leaked, 0 bytes\n"
     expect(accounting, expected, "strict native accounting")
 
@@ -217,20 +217,53 @@ private func verify_suites(compiler: String, c_compiler: String, work_directory:
 private func rejected_fixture(compiler: String, work_directory: String) -> Result[Void, String]:
     source = work_directory + "/rejected.brp"
     output = work_directory + "/rejected.c"
-    _ ?= write_file(source, "func start() -> Int:\n    0\n")
-    _ ?= write_file(output, PRESERVED_OUTPUT)
+    _ ?= write_text(source, "func start() -> Int:\n    0\n").map_err(describe)
+    _ ?= write_text(output, PRESERVED_OUTPUT).map_err(describe)
     _ ?= command(
         ["-u", "BLORP_LEAK_CHECK", "-u", "BLORP_MEMORY_STATS", compiler,
          "--library-root", LIBRARY_ROOT, source, output],
         work_directory + "/rejected.compile", 1, COMPILATION_TIMEOUT_MS,
     )
-    stdout: String ?= read_file(work_directory + "/rejected.compile.stdout")
+    stdout: String ?= read_text(work_directory + "/rejected.compile.stdout").map_err(describe)
     _ ?= expect(stdout, "", "rejected compiler stdout")
-    stderr: String ?= read_file(work_directory + "/rejected.compile.stderr")
+    stderr: String ?= read_text(work_directory + "/rejected.compile.stderr").map_err(describe)
     diagnostic = source + ":3:1: error: expected a main function\nhelp: declare func main() -> Int: as the entrypoint\n"
     _ ?= expect(stderr, diagnostic, "rejected compiler diagnostic")
-    unchanged: String ?= read_file(output)
+    unchanged: String ?= read_text(output).map_err(describe)
     expect(unchanged, PRESERVED_OUTPUT, "rejected output sentinel")
+
+
+-- The compiler exits 1 with nothing on stdout and exactly this stderr.
+private func expect_failure(compiler: String, source: String, output: String, prefix: String, expected_stderr: String) -> Result[Void, String]:
+    _ ?= command(
+        ["-u", "BLORP_LEAK_CHECK", "-u", "BLORP_MEMORY_STATS", compiler,
+         "--library-root", LIBRARY_ROOT, source, output],
+        prefix + ".compile", 1, COMPILATION_TIMEOUT_MS,
+    )
+    stdout: String ?= read_text(prefix + ".compile.stdout").map_err(describe)
+    _ ?= expect(stdout, "", "failed compiler stdout")
+    stderr: String ?= read_text(prefix + ".compile.stderr").map_err(describe)
+    expect(stderr, expected_stderr, "failed compiler diagnostic")
+
+
+-- fs words the failure, naming the output path the compiler was given.
+private func directory_output_fixture(compiler: String, work_directory: String) -> Result[Void, String]:
+    source = work_directory + "/directory_output.brp"
+    _ ?= write_text(source, "func main() -> Int:\n    0\n").map_err(describe)
+    expect_failure(
+        compiler, source, work_directory, work_directory + "/directory_output",
+        "blorp_2: error: could not write " + work_directory + ": is a directory\nhelp: provide a writable output path\n",
+    )
+
+
+-- fs words the failure, naming the module path the loader resolved.
+private func missing_module_fixture(compiler: String, work_directory: String) -> Result[Void, String]:
+    source = work_directory + "/missing_module.brp"
+    _ ?= write_text(source, "import:\n    ./missing: thing\nfunc main() -> Int:\n    0\n").map_err(describe)
+    expect_failure(
+        compiler, source, work_directory + "/missing_module.c", work_directory + "/missing_module",
+        source + ":2:5: error: could not read module " + work_directory + "/missing.brp: no such file\nhelp: check the import path and provide a readable .brp file under its source root\n",
+    )
 
 
 private func verify_rejection(compiler: String, work_directory: String, rejection: Rejection) -> Result[Void, String]:
@@ -240,9 +273,9 @@ private func verify_rejection(compiler: String, work_directory: String, rejectio
          "--library-root", LIBRARY_ROOT, rejection.source, prefix + ".c"],
         prefix + ".compile", 1, COMPILATION_TIMEOUT_MS,
     )
-    stdout: String ?= read_file(prefix + ".compile.stdout")
+    stdout: String ?= read_text(prefix + ".compile.stdout").map_err(describe)
     _ ?= expect(stdout, "", "rejected compiler stdout")
-    stderr: String ?= read_file(prefix + ".compile.stderr")
+    stderr: String ?= read_text(prefix + ".compile.stderr").map_err(describe)
     expect(stderr, rejection.source + rejection.diagnostic, "rejected compiler diagnostic")
 
 
@@ -523,6 +556,8 @@ func suite(compiler: String, c_compiler: String, work_directory: String) -> Test
             ("grouped suites run in order and a failed suite fails the program", func(): reported(verify_suites(compiler, c_compiler, work_directory, grouped_suites, ["blorp_2/test/e2e/fixtures/test_entry/failing.brp"]))),
             ("the first suite alone passes", func(): reported(verify_suites(compiler, c_compiler, work_directory, single_suite, []))),
             ("rejected compilation preserves an existing output", func(): reported(rejected_fixture(compiler, work_directory))),
+            ("a compile whose output path is a directory fails with 'is a directory'", func(): reported(directory_output_fixture(compiler, work_directory))),
+            ("an import of a missing module fails with its resolved path and 'no such file'", func(): reported(missing_module_fixture(compiler, work_directory))),
             ("a program that calls only fs.read_text is valid C under -Werror", func(): reported(verify_example(compiler, c_compiler, work_directory, fs_native_read_text))),
             ("a program that calls only fs.entry_kind is valid C under -Werror", func(): reported(verify_example(compiler, c_compiler, work_directory, fs_native_entry_kind))),
             ("a program that calls both fs natives emits their shared helpers once", func(): reported(verify_example(compiler, c_compiler, work_directory, fs_native_both))),

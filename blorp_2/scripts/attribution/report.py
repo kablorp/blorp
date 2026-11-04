@@ -380,7 +380,7 @@ ALLOCATION_KINDS = [
     ("record", re.compile(r"blorp_record_make_")),
     ("boxed union", re.compile(r"blorp_union_make_")),
     ("List", re.compile(r"blorp_list_")),
-    ("String", re.compile(r"blorp_string_|blorp_int_to_string|blorp_float_|blorp_read_file")),
+    ("String", re.compile(r"blorp_string_|blorp_int_to_string|blorp_float_|blorp_fs_read_text")),
 ]
 SITE_LINE = re.compile(r"\s*(\d+)\s+([\d.]+)%\s+(\d+)\s+(\d+)\s+(.*)$")
 

@@ -291,19 +291,10 @@ rejected and `int: Int methods` uses `int`'s functions on Int; no module
 reexports another module's types or methods. The prelude is a compiler input and
 cannot be imported explicitly.
 
-The system adapter also publishes impure `read_file(String) -> Result[String, String]`.
-Its counted UTF-8 contract and target-only encoding help are documented in
-[File reading](../README.md#file-reading). The integrated source loader uses
-this target interface; whole-compiler self-compilation remains unproved.
-
 `io.print_error(String) -> Void` concretely adapts the host Stringable API.
 It borrows its input, writes counted bytes to stderr once, and attempts LF only
 following a full transfer; short writes (including EINTR) stop without retry.
 The host attempts LF after short writes as well. Neither API reports delivery.
-
-The system adapter publishes impure `write_file(String, String) -> Result[Void, String]`.
-Ok carries Void; Err owns a fresh String. See [File writing](../README.md#file-writing)
-for counted bytes, one-close error priority and target NUL-path teaching text.
 
 ### The fs module
 
