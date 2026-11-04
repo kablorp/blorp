@@ -404,9 +404,10 @@ calling producer logic to validate producer output. Retain these obligations:
   occurrences and full callable signatures. Same-shaped nominal rows stay distinct.
 - Retain logical Void fields and effects while Emit omits their record members.
   Stored List[Void] and union Void payloads retain their existing unit storage.
-- Keep counted capture environments and tuples with a Void or other non-inline
-  element, including all-Void ones, and the typed callable ops/environment ABI
-  with possibly empty free-entry env.
+- Keep counted runtime-closure capture environments (since 2026-11-04, other
+  environments are by-value `ValueFields`) and tuples with a Void or other
+  non-inline element, including all-Void ones, and the typed callable
+  ops/environment ABI with possibly empty free-entry env.
 - Preserve recursive counted cuts and existing union policies: direct Chain
   references use UnionType(chain); inline U through List[U] remains finite via
   the existing List root and nominal UnionType edge. Cross-kind references use

@@ -65,7 +65,7 @@ import:
 	../utils/source: label_text
 	../specialize/specialize as Concrete:
 		CallTarget(UserFunction, RuntimeFunction),
-		ConcreteRecord(InlineFields, CountedFields), ConcretePatternPlace,
+		ConcreteRecord(InlineFields, ValueFields, CountedFields), ConcretePatternPlace,
 		ConcreteUnion(PlainCases, OwningCases, BoxedCases),
 		FieldInstanceId,
 		RecordInstanceId,
@@ -346,7 +346,7 @@ private pure func append_record(
 	match layout:
 		CountedFields(_):
 			result = "${result}_Atomic uint64_t references;"
-		InlineFields(_):
+		InlineFields(_) | ValueFields(_):
 			void
 
 	var position = 0
@@ -684,7 +684,7 @@ private pure func stored_by_value(value_type: TypeRef, records: List[ConcreteRec
 			match records.get(record_number(id)):
 				Some(layout):
 					match layout:
-						InlineFields(_): Some(RecordDefinition(record_number(id)))
+						InlineFields(_) | ValueFields(_): Some(RecordDefinition(record_number(id)))
 						CountedFields(_): None
 				None: None
 		UnionType(id):
@@ -869,6 +869,38 @@ private pure func append_record_prototypes(output: String, index: Int) -> String
 		.concat("void blorp_record_drop_${index.to_string()}(blorp_r_${index.to_string()});")
 
 
+-- No cell and no count: a by-value record's references are its fields'.
+private pure func append_value_record_ownership(
+	prefix: String, fields: List[TypeRef], index: Int, unions: List[ConcreteUnion],
+) -> Result[String, Diagnostic]:
+	duplicated ?= append_value_field_actions(prefix.concat("(void)value;"), fields, index, unions, DuplicateValue)
+	destroyed ?= append_value_field_actions(
+		duplicated.concat("}void blorp_record_drop_").append_int(index).concat("(blorp_r_").append_int(index).concat(" value){(void)value;"),
+		fields, index, unions, DestroyValue,
+	)
+	Ok(destroyed.concat("}"))
+
+
+-- Each field's ownership action on a by-value record named `value`.
+private pure func append_value_field_actions(
+	output: String, fields: List[TypeRef], index: Int, unions: List[ConcreteUnion], action: OwnershipAction,
+) -> Result[String, Diagnostic]:
+	var result = output
+	var position = 0
+	var invalid: Option[Diagnostic] = None
+	for field in fields:
+		selector = "value.blorp_rf_".append_int(index).concat("_").append_int(position)
+		match append_storage_operation(result, field, action, selector, unions, compiler_span()):
+			Ok(updated): result = updated
+			Err(error):
+				invalid = Some(error)
+				break
+		position = position + 1
+	match invalid:
+		Some(error): Err(error)
+		None: Ok(result)
+
+
 private pure func append_record_ownership(
 	output: String,
 	layout: ConcreteRecord,
@@ -883,6 +915,7 @@ private pure func append_record_ownership(
 				"${prefix}(void)value;}void blorp_record_drop_${index.to_string()}(blorp_r_${index.to_string()} value){"
 					.concat("(void)value;}"),
 			)
+		ValueFields(fields): append_value_record_ownership(prefix, fields, index, unions)
 		CountedFields(fields):
 			var result = "${prefix}(void)atomic_fetch_add_explicit(&value->references,UINT64_C(1),memory_order_relaxed);}"
 				.concat("void blorp_record_drop_${index.to_string()}(blorp_r_${index.to_string()} value){")
@@ -947,7 +980,7 @@ private pure func append_operation(
 				Some(layout):
 
 					var result = match layout:
-						InlineFields(_):
+						InlineFields(_) | ValueFields(_):
 							"${output}(("
 						CountedFields(_):
 							"${output}blorp_record_make_${record_number(owner).to_string()}(("
@@ -992,7 +1025,7 @@ private pure func append_operation(
 									borrow.value
 
 							selector = match layout:
-								InlineFields(_):
+								InlineFields(_) | ValueFields(_):
 									"."
 								CountedFields(_):
 									"->"
@@ -1928,7 +1961,7 @@ private pure func c_pattern_record_field(
 		VoidType: Ok("0")
 		_:
 			selector = match layout:
-				InlineFields(_): "."
+				InlineFields(_) | ValueFields(_): "."
 				CountedFields(_): "->"
 			Ok("(${base})${selector}".append_field_name(field))
 
@@ -2879,7 +2912,7 @@ private pure func aggregate_runtime_contents(
 		typedef_prefix: String = "typedef struct blorp_r_"
 			.append_int(index)
 		pointer_marker: String = match layout:
-			InlineFields(_):
+			InlineFields(_) | ValueFields(_):
 				" "
 			CountedFields(_):
 				"* "
@@ -2985,7 +3018,7 @@ pure func emit(program: VerifiedProgram) -> Result[String, Diagnostic]:
 					match layout:
 						CountedFields(_):
 							True
-						InlineFields(_):
+						InlineFields(_) | ValueFields(_):
 							False
 				):
 				True: True

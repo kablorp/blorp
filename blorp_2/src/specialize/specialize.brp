@@ -62,14 +62,20 @@ private union RecordRepresentation:
 	ManagedRecord
 
 
+-- InlineFields: a C struct by value with no managed field. ValueFields: a C
+-- struct by value with no cell or count of its own; copying or dropping it
+-- acquires or drops each managed field, so nothing can hold it by address.
+-- CountedFields: a counted heap cell, which a runtime closure's `void*` needs.
 union ConcreteRecord:
 	InlineFields(List[TypeRef])
+	ValueFields(List[TypeRef])
 	CountedFields(List[TypeRef])
 
 
 pure func record_fields(layout: ConcreteRecord) -> List[TypeRef]:
 	match layout:
 		InlineFields(fields): fields
+		ValueFields(fields): fields
 		CountedFields(fields): fields
 
 
@@ -527,7 +533,7 @@ pure func value_needs_ownership(
 				Some(declaration):
 					match declaration:
 						InlineFields(_): Ok(False)
-						CountedFields(_): Ok(True)
+						ValueFields(_) | CountedFields(_): Ok(True)
 		UnionType(id):
 			match unions.get(union_number(id)):
 				None:
@@ -1156,7 +1162,9 @@ private record PreparedType {
 private record PreparedInstances {
 	functions: IndexedList[FunctionRequest],
 	unions: IndexedList[UnionSlot],
-	records: IndexedList[RecordSlot]
+	records: IndexedList[RecordSlot],
+	-- Each capture environment some instance turns into a runtime closure, once.
+	converted_environments: List[RecordInstanceId]
 }
 
 
@@ -1253,7 +1261,8 @@ private pure func slot_record_representation(slot: RecordSlot) -> RecordRepresen
 		CompleteRecord(instance):
 			match instance.layout:
 				InlineFields(_): InlineRecord
-				CountedFields(_): ManagedRecord
+				-- A by-value record owns its fields and is not inline storage.
+				ValueFields(_) | CountedFields(_): ManagedRecord
 		PendingRecord(instance): instance.representation
 
 
@@ -2109,7 +2118,28 @@ private pure func seal_unions(slots: IndexedList[UnionSlot]) -> Result[SealedUni
 		None: Ok({ ids = ids, layouts = layouts })
 
 
-private pure func seal_records(slots: IndexedList[RecordSlot]) -> Result[SealedRecords, Diagnostic]:
+-- A capture environment that no instance turns into a runtime closure is only
+-- ever passed to its lambda's static callees, so it seals by value, keeping its
+-- identity. No layout embeds an environment type (runtime closures hold
+-- `void*`), so no settled layout depends on this choice.
+private pure func sealed_record_layout(
+	instance: RecordInstance, id: RecordInstanceId, converted: List[RecordInstanceId],
+) -> Result[ConcreteRecord, Diagnostic]:
+	match instance.key.origin:
+		DeclaredRecord(_) | StructuralTuple: Ok(instance.layout)
+		CaptureEnvironment(_):
+			-- prepare_capture_record requests AlwaysManaged storage.
+			match instance.layout:
+				CountedFields(fields):
+					if converted.any(pure func(closure): closure == id):
+						Ok(instance.layout)
+					else:
+						Ok(ValueFields(fields))
+				InlineFields(_) | ValueFields(_):
+					Err(internal_error(compiler_span(), "capture environment sealed without a counted layout"))
+
+
+private pure func seal_records(slots: IndexedList[RecordSlot], converted: List[RecordInstanceId]) -> Result[SealedRecords, Diagnostic]:
 	var ids: Dict[RecordKey, RecordInstanceId] = D.dict(slots.entries.length())
 	var layouts: List[ConcreteRecord] = []
 	var failure: Option[Diagnostic] = None
@@ -2117,8 +2147,13 @@ private pure func seal_records(slots: IndexedList[RecordSlot]) -> Result[SealedR
 	for slot in slots.entries:
 		match slot:
 			CompleteRecord(instance):
-				ids = ids.set(instance.key, into_opaque RecordInstanceId(layouts.length()))
-				layouts = layouts.append(instance.layout)
+				id: RecordInstanceId = into_opaque RecordInstanceId(layouts.length())
+				ids = ids.set(instance.key, id)
+				match sealed_record_layout(instance, id, converted):
+					Ok(layout): layouts = layouts.append(layout)
+					Err(error):
+						failure = Some(error)
+						break
 				if ids.length() != layouts.length():
 					failure = Some(internal_error(compiler_span(), "two record slots sealed to one key"))
 					break
@@ -2543,7 +2578,46 @@ private pure func prepare_lambda_creation(
 ) -> Result[PreparedInstances, Diagnostic]:
 	storage ?= prepare_callable_storage(id, captures, storage_arguments, checked, initial, span)
 	key ?= runtime_key(Checked.LambdaBody(id), arguments, checked, span)
-	request_instance(storage.prepared, key, ConcreteRequest(span), span)
+	-- A created lambda value is a runtime closure that holds its environment.
+	prepared = match storage.storage:
+		EnvironmentCallable(owner): mark_closure_environment(storage.prepared, owner)
+		ErasedCallable: storage.prepared
+	request_instance(prepared, key, ConcreteRequest(span), span)
+
+
+private pure func mark_closure_environment(prepared: PreparedInstances, owner: RecordInstanceId) -> PreparedInstances:
+	if prepared.converted_environments.any(pure func(id): id == owner):
+		prepared
+	else:
+		{ prepared | converted_environments = prepared.converted_environments.append(owner) }
+
+
+-- A static callable parameter the body uses as a value becomes a runtime
+-- closure there (`callable_binding_value`), so its environment keeps the cell.
+private pure func converted_parameter_environments(
+	function: SelectedBody, key: InstanceKey, prepared: PreparedInstances,
+) -> PreparedInstances:
+	var environments: List[KnownCallable] = []
+	for mode in key.callables:
+		match mode:
+			StaticCallable(known):
+				match known.storage:
+					EnvironmentCallable(_): environments = environments.append(known)
+					ErasedCallable: void
+			RuntimeCallable(_): void
+	-- Most instances carry no environment; only those scan their body.
+	if environments.is_empty():
+		prepared
+	else:
+		used = Checked.body_callable_parameter_values(function.bindings, function.statements, function.body)
+		var result = prepared
+		for known in environments:
+			match known.storage:
+				EnvironmentCallable(owner):
+					if used.any(pure func(parameter): parameter == known.parameter):
+						result = mark_closure_environment(result, owner)
+				ErasedCallable: void
+		result
 
 
 private pure func prepare_creation(
@@ -2614,6 +2688,9 @@ private pure func prepare_function(
 				Err(error):
 					failure = Some(error)
 					break
+
+	if failure.is_some().not():
+		prepared = converted_parameter_environments(function, request.key, prepared)
 
 	if failure.is_some().not():
 		for call in Checked.body_calls(function.statements, function.body):
@@ -4338,11 +4415,12 @@ pure func specialize(program: CheckedProgram) -> Result[SpecializedProgram, Diag
 	initial: PreparedInstances = {
 		functions = append_entry(empty_indexed_list(), { key = entry_key, source = EntrypointRoot }, body_digest(entry_key.body)),
 		unions = empty_indexed_list(),
-		records = empty_indexed_list()
+		records = empty_indexed_list(),
+		converted_environments = []
 	}
 	expanded ?= expand_instances(checked, initial)
 	sealed_unions ?= seal_unions(expanded.unions)
-	sealed_records ?= seal_records(expanded.records)
+	sealed_records ?= seal_records(expanded.records, expanded.converted_environments)
 	prepared: SealedInstances = { functions = expanded.functions, unions = sealed_unions, records = sealed_records }
 	functions ?= translated_list(prepared.functions.entries, pure func(
 		request: FunctionRequest,

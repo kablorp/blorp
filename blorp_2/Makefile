@@ -66,6 +66,7 @@ TARGET_COMPONENT_SOURCES := \
 	blorp_2/test/unit/test_parse/test_union_declarations.brp \
 	blorp_2/test/unit/test_parse/test_record_declarations.brp \
 	blorp_2/test/unit/test_check/test_discard_propagation.brp \
+	blorp_2/test/unit/test_check/test_callable_parameter_values.brp \
 	blorp_2/test/unit/test_check/test_declarations.brp \
 	blorp_2/test/unit/test_check/test_instantiation_paths.brp \
 	blorp_2/test/unit/test_check/test_first_error.brp \
@@ -89,8 +90,10 @@ TARGET_COMPONENT_SOURCES := \
 	blorp_2/test/unit/test_specialize/test_generic_opaque_types.brp \
 	blorp_2/test/unit/test_specialize/test_inline_union_fields.brp \
 	blorp_2/test/unit/test_specialize/test_tuple_storage.brp \
+	blorp_2/test/unit/test_specialize/test_static_environments.brp \
 	blorp_2/test/unit/test_namespace/test_string_append_int.brp \
 	blorp_2/test/unit/test_verify/test_inline_union_fields.brp \
+	blorp_2/test/unit/test_verify/test_static_environments.brp \
 	blorp_2/test/unit/test_own/test_list_updates.brp \
 	blorp_2/test/unit/test_own/test_library_loops.brp \
 	blorp_2/test/unit/test_own/test_dict_updates.brp \
@@ -119,6 +122,7 @@ TARGET_COMPONENT_SOURCES := \
 	blorp_2/test/unit/test_emit/test_run_to_files.brp \
 	blorp_2/test/unit/test_emit/test_fs_operations.brp \
 	blorp_2/test/unit/test_emit/test_function_labels.brp \
+	blorp_2/test/unit/test_emit/test_static_environments.brp \
 	blorp_2/test/unit/test_parse/test_grouped_suites.brp \
 	blorp_2/test/unit/test_load/test_grouped_suites.brp \
 	blorp_2/test/unit/test_check/test_grouped_suites.brp \

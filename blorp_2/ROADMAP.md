@@ -3352,6 +3352,10 @@ Storage and child ownership are independent:
   owned fields without releasing a nonexistent root.
 - Managed values retain/release their root. Nonfinal release touches no children;
   final release destroys each owned stored occurrence and frees the root once.
+- By-value products (`ValueFields`) have no root: copying one acquires each
+  owned field and dropping it drops each one. A capture environment takes this
+  layout when no instance turns it into a runtime closure; runtime closures hold
+  `void*` and need the counted cell, which verify enforces.
 
 Preserve the parent storage rule: ordinary record is always managed. Fixed record
 is inline only for recursively eligible numeric/Char fixed-record fields;

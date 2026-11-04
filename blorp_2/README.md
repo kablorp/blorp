@@ -1923,7 +1923,8 @@ function, and a loop inside it does not inherit the enclosing loop context.
 
 Statically selected callbacks keep the existing ordinary direct-call path:
 named and noncapturing callbacks need no runtime data slot, while a statically
-selected capturing callback passes its managed environment. Stored values use
+selected capturing callback passes its environment by value, or as a counted
+cell when some instance stores it as a runtime closure. Stored values use
 their concrete callable signature and keep that environment through ordinary
 copies, returns and aggregate storage. Data arguments retain written evaluation
 order, and data-receiver UFCS still works for declared helpers. Creating a
