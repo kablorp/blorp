@@ -924,7 +924,7 @@ Rejected alternatives:
 
 Phases: lower publishes body reads; own decides; verify checks. Check,
 specialize, emit and the runtime do not change: emit writes drops where they
-occur and initializes headers from `transfer_value(header.initial)`
+occur and initializes headers from `append_transfer_name(output, header.initial)`
 (`src/emit/emit.brp:2318`) whatever the owner. Parameters stay borrowed and
 never transfer.
 

@@ -36,6 +36,7 @@ import:
 	int: INT_MIN, Int methods
 	../runtime/list:
 		ListElementKey, ListUpdate(AppendUpdate, SetUpdate, ConcatUpdate, SuffixUpdate), arguments_runtime,
+		append_callable_suffix, append_list_c_type, append_list_suffix, append_list_update_name,
 		callable_suffix, consuming_helper_name, list_c_type, list_child_key, list_element_key, list_key_depth, list_key_ordinal,
 		list_key_rank, list_key_is_callable, list_empty_root, list_root_allocation, list_runtime, list_slot_store, list_suffix,
 		list_update_name, list_update_runtime, LIST_SHARED_RUNTIME
@@ -101,16 +102,19 @@ import:
 	../verify/verify: VerifiedProgram, verified_contents
 
 
-private pure func c_parameter(index: Int) -> String:
-	"blorp_p_".append_int(index)
+private pure func append_parameter_name(output: String, index: Int) -> String:
+	output.concat("blorp_p_").append_int(index)
 
 
 private pure func c_name(index: Int) -> String:
 	"blorp_f_".append_int(index)
 
 
-private pure func c_value(id: ValueId) -> String:
-	"blorp_vl_".append_int(value_number(id))
+-- The `append_*` name writers below add a C identifier to `output` in place.
+-- Returning the name as a String would allocate one fragment per reference.
+-- A fragment that must be a String starts from `""`, as in `"".append_local_name(id)`.
+private pure func append_local_name(output: String, id: ValueId) -> String:
+	output.concat("blorp_vl_").append_int(value_number(id))
 
 
 private pure func c_header(id: ValueId) -> String:
@@ -125,12 +129,12 @@ private pure func c_loop_break(target: Lower.LoopTarget) -> String:
 	"blorp_loop_${value_number(Lower.loop_target_value(target)).to_string()}_break"
 
 
-private pure func c_loop_transfer(target: Lower.LoopTarget, position: Int) -> String:
-	"blorp_loop_${value_number(Lower.loop_target_value(target)).to_string()}_transfer_${position.to_string()}"
+private pure func append_loop_transfer_name(output: String, target: Lower.LoopTarget, position: Int) -> String:
+	output.concat("blorp_loop_").append_int(value_number(Lower.loop_target_value(target))).concat("_transfer_").append_int(position)
 
 
-private pure func c_owner(id: OwnerId) -> String:
-	"blorp_owner_".append_int(owner_number(id))
+private pure func append_owner_name(output: String, id: OwnerId) -> String:
+	output.concat("blorp_owner_").append_int(owner_number(id))
 
 
 -- Designated-Bool operations and system calls use statement dispatch and
@@ -255,8 +259,8 @@ private pure func has_payload(declaration: ConcreteUnion) -> Bool:
 	union_variants(declaration).any(pure func(fields): fields.is_empty().not())
 
 
-private pure func boxed_union_struct(index: Int) -> String:
-	"struct blorp_u_".append_int(index)
+private pure func append_boxed_union_struct(output: String, index: Int) -> String:
+	output.concat("struct blorp_u_").append_int(index)
 
 
 private pure func union_is_boxed(layout: ConcreteUnion) -> Bool:
@@ -266,17 +270,17 @@ private pure func union_is_boxed(layout: ConcreteUnion) -> Bool:
 
 
 -- A boxed union value is a pointer to its counted node.
-private pure func union_c_type(id: UnionInstanceId, declaration: ConcreteUnion) -> String:
+private pure func append_union_type_name(output: String, id: UnionInstanceId, declaration: ConcreteUnion) -> String:
 	match union_is_boxed(declaration):
 		True:
-			"${boxed_union_struct(union_number(id))}*"
+			output.append_boxed_union_struct(union_number(id)).concat("*")
 		False:
 			prefix = if has_payload(declaration):
 				"struct blorp_u_"
 			else:
 				"enum blorp_u_"
 
-			prefix.append_int(union_number(id))
+			output.concat(prefix).append_int(union_number(id))
 
 
 -- Every value local is const except a join's, which its arms assign.
@@ -287,13 +291,13 @@ private union LocalAssignment:
 
 -- A local holding a pointer is itself const, so const follows a pointer type.
 -- String, List and boxed union carriers spell their pointer in the C type.
-private pure func c_local_declaration(
+private pure func append_local_declaration(
+	output: String,
 	value_type: TypeRef,
 	assignment: LocalAssignment,
 	unions: List[ConcreteUnion],
 	span: Span,
 ) -> Result[String, Diagnostic]:
-	type_name ?= c_type(value_type, unions, span)
 	pointer_carrier: Bool ?= match value_type:
 		StringType | ListType(_):
 			Ok(True)
@@ -305,23 +309,30 @@ private pure func c_local_declaration(
 					Ok(union_is_boxed(layout))
 		_:
 			Ok(False)
-	declaration: String = match assignment:
-		JoinLocal:
-			"${type_name} "
+	prefix = match assignment:
 		InitializedLocal:
 			if pointer_carrier:
-				"${type_name} const "
+				""
 			else:
-				"const ${type_name} "
-	Ok(declaration)
+				"const "
+		JoinLocal: ""
+	suffix = match assignment:
+		InitializedLocal:
+			if pointer_carrier:
+				" const "
+			else:
+				" "
+		JoinLocal: " "
+	typed ?= append_type_name(output.concat(prefix), value_type, unions, span)
+	Ok(typed.concat(suffix))
 
 
-private pure func record_c_type(id: RecordInstanceId) -> String:
-	"blorp_r_".append_int(record_number(id))
+private pure func append_record_type_name(output: String, id: RecordInstanceId) -> String:
+	output.concat("blorp_r_").append_int(record_number(id))
 
 
-private pure func c_field(id: FieldInstanceId) -> String:
-	"blorp_rf_${record_number(field_owner(id)).to_string()}_${field_number(id).to_string()}"
+private pure func append_field_name(output: String, id: FieldInstanceId) -> String:
+	output.concat("blorp_rf_").append_int(record_number(field_owner(id))).concat("_").append_int(field_number(id))
 
 
 private pure func append_record(
@@ -347,7 +358,7 @@ private pure func append_record(
 				position = position + 1
 				continue
 			_: void
-		match c_type(field, unions, compiler_span()):
+		match append_type_name("", field, unions, compiler_span()):
 			Ok(name):
 				result = "${result}${name} blorp_rf_${index.to_string()}_${position.to_string()};"
 			Err(error):
@@ -365,12 +376,12 @@ private pure func append_record(
 
 -- These names serialize already sealed concrete types. Equality and catalogue
 -- deduplication use TypeRefs, never the generated C spelling.
-private pure func callable_c_type(parameters: List[TypeRef], result: TypeRef) -> String:
-	"struct blorp_c_${callable_suffix(parameters, result)}"
+private pure func append_callable_type_name(output: String, parameters: List[TypeRef], result: TypeRef) -> String:
+	output.concat("struct blorp_c_").append_callable_suffix(parameters, result)
 
 
-private pure func callable_entry_name(body: Concrete.FunctionInstanceId, value_type: TypeRef) -> String:
-	"blorp_ce_${function_number(body).to_string()}_${list_suffix(list_element_key(value_type))}"
+private pure func append_callable_entry_name(output: String, body: Concrete.FunctionInstanceId, value_type: TypeRef) -> String:
+	output.concat("blorp_ce_").append_int(function_number(body)).concat("_").append_list_suffix(list_element_key(value_type))
 
 
 private pure func callable_types(values: List[TypeRef]) -> List[TypeRef]:
@@ -396,8 +407,8 @@ private pure func callable_parameters(parameters: List[TypeRef], unions: List[Co
 	var failure: Option[Diagnostic] = None
 	var ordinal = 0
 	for parameter in parameters:
-		match c_type(parameter, unions, compiler_span()):
-			Ok(name): output = "${output},${name} ${c_parameter(ordinal)}"
+		match append_type_name(output.concat(","), parameter, unions, compiler_span()):
+			Ok(typed): output = typed.concat(" ").append_parameter_name(ordinal)
 			Err(error):
 				failure = Some(error)
 				break
@@ -415,7 +426,7 @@ private pure func callable_declarations(types: List[TypeRef]) -> String:
 		match value:
 			CallableType(parameters, result):
 				suffix = callable_suffix(parameters, result)
-				name = callable_c_type(parameters, result)
+				name = "".append_callable_type_name(parameters, result)
 				ops_forward = "struct blorp_co_${suffix};"
 				pair_definition = "${name}{const struct blorp_co_${suffix}* ops;void* environment;};"
 				retain_declaration = "void blorp_callable_dup_${suffix}(${name});"
@@ -431,10 +442,10 @@ private pure func callable_ops(types: List[TypeRef], unions: List[ConcreteUnion]
 	for value in types:
 		match value:
 			CallableType(parameters, result):
-				signature: Result[String, Diagnostic] = c_type(result, unions, compiler_span()).and_then(pure func(returned):
+				signature: Result[String, Diagnostic] = append_type_name("", result, unions, compiler_span()).and_then(pure func(returned):
 					callable_parameters(parameters, unions).map(pure func(arguments):
 						suffix = callable_suffix(parameters, result)
-						name = callable_c_type(parameters, result)
+						name = "".append_callable_type_name(parameters, result)
 						ops_definition = "struct blorp_co_${suffix}{${returned} (*invoke)${arguments};void (*retain)(void*);void (*drop)(void*);};"
 						retain_definition = "void blorp_callable_dup_${suffix}(${name} value){value.ops->retain(value.environment);}"
 						drop_definition = "void blorp_callable_drop_${suffix}(${name} value){value.ops->drop(value.environment);}\n"
@@ -463,8 +474,8 @@ private pure func append_callable_entry(
 	function ?= program.functions.get(function_number(body)).to_result(render(definition.span, MissingFunctionRow(definition.id)))
 	match definition.value_type:
 		CallableType(parameters, result):
-			name = callable_entry_name(body, definition.value_type)
-			match c_type(result, program.unions, definition.span):
+			name = "".append_callable_entry_name(body, definition.value_type)
+			match append_type_name("", result, program.unions, definition.span):
 				Err(error): Err(error)
 				Ok(returned):
 					match callable_parameters(parameters, program.unions):
@@ -478,7 +489,7 @@ private pure func append_callable_entry(
 								CapturedCallableDefinition(_, _):
 									match function.parameters.get(0).map(parameter_type):
 										Some(RecordType(owner)):
-											cast = "(${record_c_type(owner)})environment"
+											cast = "".concat("(").append_record_type_name(owner).concat(")environment")
 											invocation = invocation.concat(cast)
 											retain = "blorp_record_dup_${record_number(owner).to_string()}(${cast});"
 											drop = "blorp_record_drop_${record_number(owner).to_string()}(${cast});"
@@ -492,7 +503,7 @@ private pure func append_callable_entry(
 							for _ in parameters:
 								if separator:
 									invocation = "${invocation},"
-								invocation = invocation.concat(c_parameter(ordinal))
+								invocation = invocation.append_parameter_name(ordinal)
 								separator = True
 								ordinal = ordinal + 1
 							invoke_adapter = "${returned} ${name}_invoke${arguments}{${prefix}return ${invocation});}"
@@ -504,33 +515,34 @@ private pure func append_callable_entry(
 		_: Err(render(definition.span, InvalidOperationShape(definition.id)))
 
 
-private pure func c_type(
+private pure func append_type_name(
+	output: String,
 	type_ref: TypeRef,
 	unions: List[ConcreteUnion],
 	span: Span,
 ) -> Result[String, Diagnostic]:
 	match type_ref:
 		RecordType(id):
-			Ok(record_c_type(id))
+			Ok(output.append_record_type_name(id))
 		VoidType:
-			Ok("uint8_t")
+			Ok(output.concat("uint8_t"))
 		IntType:
-			Ok("int64_t")
+			Ok(output.concat("int64_t"))
 		FloatType:
-			Ok("double")
+			Ok(output.concat("double"))
 		StringType:
-			Ok("struct blorp_string*")
-		CallableType(parameters, result): Ok(callable_c_type(parameters, result))
+			Ok(output.concat("struct blorp_string*"))
+		CallableType(parameters, result): Ok(output.append_callable_type_name(parameters, result))
 		ListType(element):
-			Ok(list_c_type(list_element_key(element)))
+			Ok(output.append_list_c_type(list_element_key(element)))
 		UnionType(id):
 			match unions.get(union_number(id)):
-				Some(declaration): Ok(union_c_type(id, declaration))
+				Some(declaration): Ok(output.append_union_type_name(id, declaration))
 				None: Err(render(span, MissingUnionLayout(id)))
 
 
-private pure func c_variant(id: VariantInstanceId) -> String:
-	"blorp_v_${union_number(variant_owner(id)).to_string()}_${variant_number(id).to_string()}"
+private pure func append_variant_name(output: String, id: VariantInstanceId) -> String:
+	output.concat("blorp_v_").append_int(union_number(variant_owner(id))).concat("_").append_int(variant_number(id))
 
 
 private pure func c_parameters(
@@ -545,15 +557,16 @@ private pure func c_parameters(
 		var invalid: Option[Diagnostic] = None
 
 		for parameter in parameters:
-			match c_type(parameter, unions, compiler_span()):
+			-- `output` is one parameter list, so the copy its error path forces is small.
+			if index > 0:
+				output = output.concat(",")
+
+			match append_type_name(output, parameter, unions, compiler_span()):
 				Err(error):
 					invalid = Some(error)
 					break
-				Ok(name):
-					if index > 0:
-						output = "${output},"
-
-					output = "${output}${name} ${c_parameter(index)}"
+				Ok(typed):
+					output = typed.concat(" ").append_parameter_name(index)
 
 			index = index + 1
 
@@ -571,12 +584,12 @@ private pure func union_member_selector(declaration: ConcreteUnion) -> String:
 		False: "."
 
 
-private pure func c_payload(id: VariantInstanceId) -> String:
-	"blorp_up_".append_int(variant_number(id))
+private pure func append_payload_member_name(output: String, id: VariantInstanceId) -> String:
+	output.concat("blorp_up_").append_int(variant_number(id))
 
 
-private pure func c_payload_field(variant: VariantInstanceId, position: Int) -> String:
-	"${c_payload(variant)}.blorp_uf_${position.to_string()}"
+private pure func append_payload_field_name(output: String, variant: VariantInstanceId, position: Int) -> String:
+	output.append_payload_member_name(variant).concat(".blorp_uf_").append_int(position)
 
 
 private pure func append_union(
@@ -619,7 +632,7 @@ private pure func append_union(
 				result = "${result}struct{"
 				var field_position = 0
 				for value_type in fields:
-					match c_type(value_type, unions, compiler_span()):
+					match append_type_name("", value_type, unions, compiler_span()):
 						Err(error):
 							failure = Some(error)
 							break
@@ -956,7 +969,7 @@ private pure func append_operation(
 							OwnedPayload(value, _):
 								value
 
-						result = "${result}.${c_field(field.field)}=${c_value(stored)}"
+						result = result.concat(".").append_field_name(field.field).concat("=").append_local_name(stored)
 						position = position + 1
 
 					if position == 0:
@@ -984,15 +997,10 @@ private pure func append_operation(
 								CountedFields(_):
 									"->"
 
-							Ok(
-								output
-									.concat(c_value(value))
-									.concat(selector)
-									.concat(c_field(field)),
-							)
+							Ok(output.append_local_name(value).concat(selector).append_field_name(field))
 				None: Err(render(span, MissingRecordLayout(field_owner(field))))
 		ParameterDefinition(index):
-			Ok(output.concat(c_parameter(index)))
+			Ok(output.append_parameter_name(index))
 		VoidDefinition:
 			Ok("${output}((uint8_t)0)")
 		IntegerDefinition(value):
@@ -1007,24 +1015,24 @@ private pure func append_operation(
 			)
 			Ok("${length})")
 		FreeCallableDefinition(body):
-			match c_type(value_type, unions, span):
+			match append_type_name(output.concat("(("), value_type, unions, span):
 				Err(error): Err(error)
-				Ok(name):
-					Ok("${output}((${name}){&${callable_entry_name(body, value_type)},(void*)0})")
+				Ok(typed):
+					Ok(typed.concat("){&").append_callable_entry_name(body, value_type).concat(",(void*)0})"))
 		CapturedCallableDefinition(body, payload):
-			match c_type(value_type, unions, span):
+			match append_type_name(output.concat("(("), value_type, unions, span):
 				Err(error): Err(error)
-				Ok(name):
+				Ok(typed):
 					value = match payload:
 						UnmanagedPayload(stored): stored
 						OwnedPayload(stored, _): stored
-					Ok("${output}((${name}){&${callable_entry_name(body, value_type)},${c_value(value)}})")
+					Ok(typed.concat("){&").append_callable_entry_name(body, value_type).concat(",").append_local_name(value).concat("})"))
 		InvokeCallableDefinition(callee, arguments):
-			value = c_value(argument_value(callee))
-			var invocation = "${output}${value}.ops->invoke(${value}.environment"
+			callee_value = argument_value(callee)
+			var invocation = output.append_local_name(callee_value).concat(".ops->invoke(").append_local_name(callee_value).concat(".environment")
 			for argument in arguments:
-				invocation = "${invocation},${c_value(argument_value(argument))}"
-			Ok("${invocation})")
+				invocation = invocation.concat(",").append_local_name(argument_value(argument))
+			Ok(invocation.concat(")"))
 		CallDefinition(target, arguments):
 			-- A runtime operand 0 that receives its obligation calls the
 			-- operation's in-place helper; verification admits no other.
@@ -1055,37 +1063,30 @@ private pure func append_operation(
 							BorrowedArgument(borrow):
 								borrow.value
 
-						prefix = prefix.concat(c_value(value))
+						prefix = prefix.append_local_name(value)
 						index = index + 1
 
 					Ok("${prefix})")
 		ConstructDefinition(variant_id, fields):
 			var operands: List[String] = []
 			for field in fields:
-				operand = match field:
-					UnmanagedPayload(value): c_value(value)
-					OwnedPayload(_, owner): c_owner(owner)
-				operands = operands.append(operand)
-			match c_union_value(variant_id, operands, unions, span):
-				Ok(value): Ok(output.concat(value))
-				Err(error): Err(error)
+				operands = operands.append("".append_stored_name(field))
+			append_union_value(output, variant_id, operands, unions, span)
 		ConstructListDefinition(_):
 			-- List construction and joins are written as statements, by
 			-- append_list_construction and append_join; never as expressions.
 			Err(render(span, StatementOnlyValue(id)))
 		ListElementDefinition(index, parent):
-			Ok("${output}${c_value(parent)}->values[${index.to_string()}]")
+			Ok(output.append_local_name(parent).concat("->values[").append_int(index).concat("]"))
 		ListSuffixDefinition(parent, skipped):
 			match value_type:
 				ListType(element):
-					Ok("${output}${list_update_name(SuffixUpdate, list_element_key(element))}(${c_value(argument_value(parent))},INT64_C(${skipped.to_string()}))")
+					Ok(output.append_list_update_name(SuffixUpdate, list_element_key(element)).concat("(").append_local_name(argument_value(parent)).concat(",INT64_C(").append_int(skipped).concat("))"))
 				_: Err(render(span, InvalidOperationShape(id)))
 		PayloadDefinition(field, source_id):
 			match unions.get(union_number(variant_owner(variant_field_variant(field)))):
 				Some(declaration):
-					Ok(
-						"${output}${c_value(source_id)}${union_member_selector(declaration)}payload.${c_payload_field( variant_field_variant(field), variant_field_number(field), )}",
-					)
+					Ok(output.append_local_name(source_id).concat(union_member_selector(declaration)).concat("payload.").append_payload_field_name(variant_field_variant(field), variant_field_number(field)))
 				None: Err(render(span, MissingUnionLayout(variant_owner(variant_field_variant(field)))))
 
 
@@ -1094,7 +1095,8 @@ private pure func append_operation(
 -- no payload anywhere is a bare C enum and a variant is its tag; any other
 -- value is a compound literal, from which a boxed union allocates its counted
 -- node. Each operand is an occurrence the new value owns.
-private pure func c_union_value(
+private pure func append_union_value(
+	output: String,
 	variant: VariantInstanceId,
 	operands: List[String],
 	unions: List[ConcreteUnion],
@@ -1108,17 +1110,17 @@ private pure func c_union_value(
 	if has_payload(declaration):
 		opening = match union_is_boxed(declaration):
 			True:
-				"blorp_union_make_${index.to_string()}((${boxed_union_struct(index)}"
+				output.concat("blorp_union_make_").append_int(index).concat("((").append_boxed_union_struct(index)
 			False:
-				"((${union_c_type(variant_owner(variant), declaration)}"
-		tagged = "${opening}){.tag=${c_variant(variant)}"
+				output.concat("((").append_union_type_name(variant_owner(variant), declaration)
+		tagged = opening.concat("){.tag=").append_variant_name(variant)
 		-- A variant without fields omits the payload initializer.
 		if operands.is_empty():
-			Ok("${tagged}})")
+			Ok(tagged.concat("})"))
 		else:
-			Ok("${append_payload_initializer(tagged, variant, operands)}})")
+			Ok(append_payload_initializer(tagged, variant, operands).concat("})"))
 	else:
-		Ok(c_variant(variant))
+		Ok(output.append_variant_name(variant))
 
 
 private pure func append_payload_initializer(
@@ -1126,14 +1128,14 @@ private pure func append_payload_initializer(
 	id: VariantInstanceId,
 	operands: List[String],
 ) -> String:
-	var result = "${output},.payload.${c_payload(id)}={"
+	var result = output.concat(",.payload.").append_payload_member_name(id).concat("={")
 	var position = 0
 	for operand in operands:
 		if position > 0:
-			result = "${result},"
-		result = "${result}.blorp_uf_${position.to_string()}=${operand}"
+			result = result.concat(",")
+		result = result.concat(".blorp_uf_").append_int(position).concat("=").concat(operand)
 		position = position + 1
-	"${result}}"
+	result.concat("}")
 
 
 private pure func argument_value(argument: OwnedArgument) -> ValueId:
@@ -1155,13 +1157,10 @@ private pure func append_optional_value(
 	unions: List[ConcreteUnion],
 	span: Span,
 ) -> Result[String, Diagnostic]:
-	declaration ?= c_local_declaration(UnionType(variant_owner(option.some)), InitializedLocal, unions, span)
-	some ?= c_union_value(option.some, [payload], unions, span)
-	none ?= c_union_value(option.none, [], unions, span)
-	name = c_value(id)
-	Ok(
-		"${output}${declaration}${name}=${condition}?${some}:${none};(void)${name};",
-	)
+	declared ?= append_local_declaration(output, UnionType(variant_owner(option.some)), InitializedLocal, unions, span)
+	with_some ?= append_union_value(declared.append_local_name(id).concat("=").concat(condition).concat("?"), option.some, [payload], unions, span)
+	with_none ?= append_union_value(with_some.concat(":"), option.none, [], unions, span)
+	Ok(with_none.concat(";(void)").append_local_name(id).concat(";"))
 
 
 -- The error is built only when the argument is missing: callers sit on the success path.
@@ -1189,7 +1188,7 @@ private pure func append_parse_number(
 	argument ?= runtime_argument(arguments, 0, id, span)
 	scratch = "blorp_runtime_".append_int(value_number(id))
 	prefix = "${output}${scalar_type} ${scratch}=0;"
-		.concat("const uint8_t ${scratch}_some=${runtime}(${c_value(argument_value(argument))},&${scratch});")
+		.concat("const uint8_t ${scratch}_some=${runtime}(").append_local_name(argument_value(argument)).concat(",&${scratch});")
 	append_optional_value(
 		prefix,
 		id,
@@ -1213,7 +1212,7 @@ private pure func append_string_byte_at(
 	index ?= runtime_argument(arguments, 1, id, span)
 	scratch = "blorp_runtime_".append_int(value_number(id))
 	prefix = "${output}int64_t ${scratch}=0;"
-		.concat("const uint8_t ${scratch}_some=blorp_string_byte_at(${c_value(argument_value(text))},${c_value(argument_value(index))},&${scratch});")
+		.concat("const uint8_t ${scratch}_some=blorp_string_byte_at(").append_local_name(argument_value(text)).concat(",").append_local_name(argument_value(index)).concat(",&${scratch});")
 	append_optional_value(prefix, id, option, "${scratch}_some", scratch, unions, span)
 
 
@@ -1228,7 +1227,7 @@ private pure func append_string_from_codepoint(
 	scalar ?= runtime_argument(arguments, 0, id, span)
 	scratch = "blorp_runtime_".append_int(value_number(id))
 	prefix = "${output}struct blorp_string *${scratch}=NULL;"
-		.concat("const uint8_t ${scratch}_some=blorp_string_from_codepoint(${c_value(argument_value(scalar))},&${scratch});")
+		.concat("const uint8_t ${scratch}_some=blorp_string_from_codepoint(").append_local_name(argument_value(scalar)).concat(",&${scratch});")
 	-- Some takes the fresh root. Scratch is neither retained nor released here.
 	append_optional_value(prefix, id, option, "${scratch}_some", scratch, unions, span)
 
@@ -1247,7 +1246,7 @@ private pure func append_string_slice(
 
 	scratch = "blorp_runtime_".append_int(value_number(id))
 	prefix = "${output}struct blorp_string *${scratch}=NULL;"
-		.concat("const uint8_t ${scratch}_some=blorp_string_slice(${c_value(argument_value(text))},${c_value(argument_value(start))},${c_value(argument_value(end))},&${scratch});")
+		.concat("const uint8_t ${scratch}_some=blorp_string_slice(").append_local_name(argument_value(text)).concat(",").append_local_name(argument_value(start)).concat(",").append_local_name(argument_value(end)).concat(",&${scratch});")
 	-- Some takes the fresh root. Scratch has no separate ownership obligation.
 	append_optional_value(prefix, id, option, "${scratch}_some", scratch, unions, span)
 
@@ -1286,14 +1285,14 @@ private pure func append_system_call(
 ) -> Result[String, Diagnostic]:
 	signature = system_signature(operation)
 	scratch = "blorp_runtime_".append_int(value_number(id))
-	values = arguments.map(pure func(argument: OwnedArgument) -> String: c_value(argument_value(argument)))
+	values = arguments.map(pure func(argument: OwnedArgument) -> String: "".append_local_name(argument_value(argument)))
 	success = payload_use(signature.success, "${scratch}_value", { addresses = values, declarations = "", value = "" })
 	failure = payload_use(signature.error, "${scratch}_error", success)
-	declaration ?= c_local_declaration(UnionType(variant_owner(result.ok)), InitializedLocal, unions, span)
-	ok ?= c_union_value(result.ok, [success.value], unions, span)
-	error ?= c_union_value(result.err, [failure.value], unions, span)
-	Ok("${output}${failure.declarations}const uint8_t ${scratch}_ok=${system_symbol(operation)}(${failure.addresses.join(",")});"
-		.concat("${declaration}${c_value(id)}=${scratch}_ok?${ok}:${error};(void)${c_value(id)};"))
+	call = "${output}${failure.declarations}const uint8_t ${scratch}_ok=${system_symbol(operation)}(${failure.addresses.join(",")});"
+	declared ?= append_local_declaration(call, UnionType(variant_owner(result.ok)), InitializedLocal, unions, span)
+	with_ok ?= append_union_value(declared.append_local_name(id).concat("=${scratch}_ok?"), result.ok, [success.value], unions, span)
+	with_error ?= append_union_value(with_ok.concat(":"), result.err, [failure.value], unions, span)
+	Ok(with_error.concat(";(void)").append_local_name(id).concat(";"))
 
 
 private pure func append_list_get(
@@ -1308,9 +1307,9 @@ private pure func append_list_get(
 	values ?= runtime_argument(arguments, 0, id, span)
 	index ?= runtime_argument(arguments, 1, id, span)
 	scratch = "blorp_runtime_".append_int(value_number(id))
-	element_type ?= c_type(element, unions, span)
-	prefix = "${output}${element_type} ${scratch}={0};"
-		.concat("const uint8_t ${scratch}_some=blorp_list_get_${list_suffix(list_element_key(element))}(${c_value(argument_value(values))},${c_value(argument_value(index))},&${scratch});")
+	typed ?= append_type_name(output, element, unions, span)
+	prefix = typed.concat(" ${scratch}={0};")
+		.concat("const uint8_t ${scratch}_some=blorp_list_get_").append_list_suffix(list_element_key(element)).concat("(").append_local_name(argument_value(values)).concat(",").append_local_name(argument_value(index)).concat(",&${scratch});")
 	append_optional_value(
 		prefix,
 		id,
@@ -1400,7 +1399,7 @@ private pure func append_list_construction(
 		ListType(element): Ok(list_element_key(element))
 		_: Err(render(span, InvalidOperationShape(id)))
 	type_name = list_c_type(key)
-	name = c_value(id)
+	name = "".append_local_name(id)
 	var result = if payloads.is_empty():
 		"${output}${type_name} const ${name}=${list_empty_root(key)};"
 	else:
@@ -1411,10 +1410,7 @@ private pure func append_list_construction(
 			.concat(list_root_allocation(type_name.concat(" const"), name, checked_capacity))
 	var slot = 0
 	for payload in payloads:
-		stored = match payload:
-			UnmanagedPayload(value): c_value(value)
-			OwnedPayload(_, owner): c_owner(owner)
-		result = result.concat(list_slot_store(name, "".append_int(slot), stored))
+		result = result.concat(list_slot_store(name, "".append_int(slot), "".append_stored_name(payload)))
 		slot = slot + 1
 	Ok("${result}(void)${name};")
 
@@ -1436,8 +1432,8 @@ private pure func append_comparison(
 ) -> Result[String, Diagnostic]:
 	left ?= runtime_argument(arguments, 0, id, span)
 	right ?= runtime_argument(arguments, 1, id, span)
-	left_value = c_value(argument_value(left))
-	right_value = c_value(argument_value(right))
+	left_value = "".append_local_name(argument_value(left))
+	right_value = "".append_local_name(argument_value(right))
 
 	condition = match comparison:
 		StringEquality:
@@ -1458,14 +1454,10 @@ private pure func append_boolean(
 	unions: List[ConcreteUnion],
 	span: Span,
 ) -> Result[String, Diagnostic]:
-	declaration ?= c_local_declaration(UnionType(variant_owner(boolean.true_variant)), InitializedLocal, unions, span)
-	true_value ?= c_union_value(boolean.true_variant, [], unions, span)
-	false_value ?= c_union_value(boolean.false_variant, [], unions, span)
-	name = c_value(id)
-
-	Ok(
-		"${output}${declaration}${name}=${condition}?${true_value}:${false_value};(void)${name};",
-	)
+	declared ?= append_local_declaration(output, UnionType(variant_owner(boolean.true_variant)), InitializedLocal, unions, span)
+	with_true ?= append_union_value(declared.append_local_name(id).concat("=").concat(condition).concat("?"), boolean.true_variant, [], unions, span)
+	with_false ?= append_union_value(with_true.concat(":"), boolean.false_variant, [], unions, span)
+	Ok(with_false.concat(";(void)").append_local_name(id).concat(";"))
 
 
 private pure func append_regular_value(
@@ -1477,17 +1469,15 @@ private pure func append_regular_value(
 	records: List[ConcreteRecord],
 	span: Span,
 ) -> Result[String, Diagnostic]:
-	declaration ?= c_local_declaration(value_type, InitializedLocal, unions, span)
-	name = c_value(id)
-
 	prepared = match operation:
 		StringDefinition(bytes):
 			append_string_literal_site(output, id, bytes)
 		_:
 			output
 
+	declared ?= append_local_declaration(prepared, value_type, InitializedLocal, unions, span)
 	value ?= append_operation(
-		"${prepared}${declaration}${name}=",
+		declared.append_local_name(id).concat("="),
 		id,
 		value_type,
 		operation,
@@ -1495,9 +1485,7 @@ private pure func append_regular_value(
 		records,
 		span,
 	)
-	Ok(
-		"${value};(void)${name};",
-	)
+	Ok(value.concat(";(void)").append_local_name(id).concat(";"))
 
 
 -- The C that binds `owner` to `value`. Callers append it themselves: passing
@@ -1510,12 +1498,8 @@ private pure func owner_alias(
 	unions: List[ConcreteUnion],
 	span: Span,
 ) -> Result[String, Diagnostic]:
-	declaration ?= c_local_declaration(value_type, InitializedLocal, unions, span)
-	name = c_owner(owner)
-
-	Ok(
-		"${declaration}${name}=${c_value(value)};(void)${name};",
-	)
+	declaration ?= append_local_declaration("", value_type, InitializedLocal, unions, span)
+	Ok(declaration.append_owner_name(owner).concat("=").append_local_name(value).concat(";(void)").append_owner_name(owner).concat(";"))
 
 
 private pure func append_owned_definition(
@@ -1719,14 +1703,15 @@ private pure func append_union_action(
 -- One counted node per constructed value: the compound literal's payload
 -- already holds acquired children, so the node takes them without retains.
 private pure func append_boxed_union_constructor(output: String, index: Int) -> String:
-	node = boxed_union_struct(index)
+	node = "".append_boxed_union_struct(index)
 	"${output}${node}* blorp_union_make_${index.to_string()}(${node} fields){"
 		.concat("${node}* value=blorp_memory_allocate(sizeof *value);if(!value)abort();atomic_init(&value->references,UINT64_C(1));")
 		.concat("value->tag=fields.tag;value->payload=fields.payload;return value;}")
 
 
 private pure func append_boxed_union_retain(output: String, index: Int) -> String:
-	"${output}void blorp_union_dup_${index.to_string()}(${boxed_union_struct(index)}* value){"
+	node = "".append_boxed_union_struct(index)
+	"${output}void blorp_union_dup_${index.to_string()}(${node}* value){"
 		.concat("(void)atomic_fetch_add_explicit(&value->references,UINT64_C(1),memory_order_relaxed);}")
 
 
@@ -1739,7 +1724,7 @@ private pure func append_boxed_union_prototypes(output: String, unions: List[Con
 
 	for layout in unions:
 		if union_is_boxed(layout):
-			node = boxed_union_struct(index)
+			node = "".append_boxed_union_struct(index)
 			fragments = fragments.append(
 				"${node};void blorp_union_dup_${index.to_string()}(${node}*);"
 					.concat("void blorp_union_drop_${index.to_string()}(${node}*);"),
@@ -1760,7 +1745,7 @@ private pure func append_boxed_union_release(
 	index: Int,
 	unions: List[ConcreteUnion],
 ) -> Result[String, Diagnostic]:
-	node = boxed_union_struct(index)
+	node = "".append_boxed_union_struct(index)
 	var result = "${output}void blorp_union_drop_${index.to_string()}(${node}* value){${node}* node=value;while(node!=NULL){"
 		.concat("if(atomic_fetch_sub_explicit(&node->references,UINT64_C(1),memory_order_acq_rel)!=UINT64_C(1))return;")
 		.concat("${node}* child=NULL;switch(node->tag){")
@@ -1843,7 +1828,7 @@ private pure func append_ownership_operation(
 						output,
 						value_type,
 						DuplicateValue,
-						c_value(borrowed.value),
+						"".append_local_name(borrowed.value),
 						unions,
 						span,
 					):
@@ -1855,7 +1840,7 @@ private pure func append_ownership_operation(
 				None: Err(render(span, MissingOwnerType(owner)))
 		DropOwner(owner, span):
 			match types.get(owner_number(owner)):
-				Some(value_type): append_storage_operation(output, value_type, DestroyValue, c_owner(owner), unions, span)
+				Some(value_type): append_storage_operation(output, value_type, DestroyValue, "".append_owner_name(owner), unions, span)
 				None: Err(render(span, MissingOwnerType(owner)))
 
 
@@ -1892,19 +1877,19 @@ private record SelectionEmissionScope {
 }
 
 
-private pure func c_selection_scope(scope: SelectionEmissionScope) -> String:
-	var name = "blorp_selection_".append_int(value_number(scope.root))
+private pure func append_selection_scope_name(output: String, scope: SelectionEmissionScope) -> String:
+	var name = output.concat("blorp_selection_").append_int(value_number(scope.root))
 	for arm in scope.path:
-		name = "${name}_in_${match_arm_number(arm).to_string()}"
+		name = name.concat("_in_").append_int(match_arm_number(arm))
 	name
 
 
-private pure func c_decision(scope: SelectionEmissionScope, node: DecisionNodeId) -> String:
-	"${c_selection_scope(scope)}_node_${decision_node_number(node).to_string()}"
+private pure func append_decision_name(output: String, scope: SelectionEmissionScope, node: DecisionNodeId) -> String:
+	output.append_selection_scope_name(scope).concat("_node_").append_int(decision_node_number(node))
 
 
-private pure func c_selection_arm(scope: SelectionEmissionScope, arm: MatchArmId) -> String:
-	"${c_selection_scope(scope)}_arm_${match_arm_number(arm).to_string()}"
+private pure func append_selection_arm_name(output: String, scope: SelectionEmissionScope, arm: MatchArmId) -> String:
+	output.append_selection_scope_name(scope).concat("_arm_").append_int(match_arm_number(arm))
 
 
 private pure func c_pattern_field(
@@ -1916,7 +1901,7 @@ private pure func c_pattern_field(
 	layout: ConcreteUnion ?= match unions.get(union_number(owner)):
 		Some(found): Ok(found)
 		None: Err(render(span, MissingUnionLayout(owner)))
-	Ok("(${base})${union_member_selector(layout)}payload.${c_payload_field(variant_field_variant(field), variant_field_number(field))}")
+	Ok("(${base})${union_member_selector(layout)}payload.".append_payload_field_name(variant_field_variant(field), variant_field_number(field)))
 
 
 private pure func c_pattern_place(
@@ -1924,7 +1909,7 @@ private pure func c_pattern_place(
 	unions: List[ConcreteUnion], records: List[ConcreteRecord], span: Span,
 ) -> Result[String, Diagnostic]:
 	match place.route:
-		Concrete.MatchRoot: Ok(c_value(scrutinee))
+		Concrete.MatchRoot: Ok("".append_local_name(scrutinee))
 		Concrete.UnionField(parent, field): c_pattern_field(parent, field, scrutinee, unions, records, span)
 		Concrete.RecordField(parent, field): c_pattern_record_field(place, parent, field, scrutinee, unions, records, span)
 		Concrete.ListElement(parent, index):
@@ -1945,7 +1930,7 @@ private pure func c_pattern_record_field(
 			selector = match layout:
 				InlineFields(_): "."
 				CountedFields(_): "->"
-			Ok("(${base})${selector}${c_field(field)}")
+			Ok("(${base})${selector}".append_field_name(field))
 
 
 private pure func c_variant_test(
@@ -1961,7 +1946,7 @@ private pure func c_variant_test(
 		"(${base})${union_member_selector(layout)}tag"
 	else:
 		base
-	Ok("${tag}==${c_variant(variant)}")
+	Ok(tag.concat("==").append_variant_name(variant))
 
 
 private record SelectionEmissionArm {
@@ -1979,8 +1964,8 @@ private pure func append_input_declarations(
 	var failure: Option[Diagnostic] = None
 	for input in inputs:
 		fact = join_parameter(input)
-		match c_local_declaration(fact.value_type, JoinLocal, unions, fact.span):
-			Ok(declaration): result = "${result}${declaration}${c_value(fact.id)};"
+		match append_local_declaration("", fact.value_type, JoinLocal, unions, fact.span):
+			Ok(declaration): result = result.concat(declaration).append_local_name(fact.id).concat(";")
 			Err(error):
 				failure = Some(error)
 				break
@@ -1996,7 +1981,7 @@ private pure func append_input_owners(
 	var failure: Option[Diagnostic] = None
 	for input in inputs:
 		fact = join_parameter(input)
-		result = "${result}(void)${c_value(fact.id)};"
+		result = result.concat("(void)").append_local_name(fact.id).concat(";")
 		match input:
 			UnmanagedJoinParameter(_): void
 			ManagedJoinParameter(_, owner):
@@ -2025,21 +2010,21 @@ private pure func append_selection_edge(
 	for input in arm.inputs:
 		fact = join_parameter(input)
 		match edge.transfers.get(position):
-			Some(transfer): result = "${result}${c_value(fact.id)}=${transfer_value(transfer)};"
+			Some(transfer): result = result.append_local_name(fact.id).concat("=").append_transfer_name(transfer).concat(";")
 			None:
 				failure = Some(render(fact.span, MissingJoinTransfer(fact.id)))
 				break
 		position = position + 1
 	match failure:
 		Some(error): Err(error)
-		None: Ok("${result}goto ${c_selection_arm(scope, edge.arm)};")
+		None: Ok(result.concat("goto ").append_selection_arm_name(scope, edge.arm).concat(";"))
 
 
 private pure func c_selection_branch(
 	scope: SelectionEmissionScope, test: String,
 	yes: DecisionNodeId, no: DecisionNodeId,
 ) -> String:
-	"if(${test})goto ${c_decision(scope, yes)};goto ${c_decision(scope, no)};"
+	"if(".concat(test).concat(")goto ").append_decision_name(scope, yes).concat(";goto ").append_decision_name(scope, no).concat(";")
 
 
 private pure func append_selection_node(
@@ -2089,13 +2074,12 @@ private pure func append_selection(
 	_: Void ?= match failure:
 		Some(error): Err(error)
 		None: Ok(void)
-	result = "${result}goto ${c_decision(scope, selection.entry)};"
+	result = result.concat("goto ").append_decision_name(scope, selection.entry).concat(";")
 	var position = 0
 	for node in selection.nodes:
 		match append_selection_node(scope, selection, node, arms, unions, types, records, nearest):
 			Ok(emitted):
-				label = "${c_selection_scope(scope)}_node_${position.to_string()}"
-				result = "${result}${label}:{${emitted}}"
+				result = result.append_selection_scope_name(scope).concat("_node_").append_int(position).concat(":{").concat(emitted).concat("}")
 			Err(error):
 				failure = Some(error)
 				break
@@ -2118,7 +2102,7 @@ private pure func append_selection_body(
 	scope: SelectionEmissionScope, arm: SelectionEmissionArm,
 	unions: List[ConcreteUnion], types: List[TypeRef], records: List[ConcreteRecord], nearest: Option[LoopEmissionContext],
 ) -> Result[String, Diagnostic]:
-	opening = "${c_selection_arm(scope, arm.id)}:{"
+	opening = "".append_selection_arm_name(scope, arm.id).concat(":{")
 	inputs ?= append_input_owners(opening, arm.inputs, unions)
 	body ?= append_ownership_operations(inputs, arm.operations, unions, types, records, nearest)
 	Ok("${body}${arm.ending}}")
@@ -2147,12 +2131,12 @@ private pure func append_loop_exit(
 				failure = Some(render(fact.span, MissingJoinTransfer(fact.id)))
 				break
 			Some(transfer):
-				match c_local_declaration(fact.value_type, InitializedLocal, unions, fact.span):
+				match append_local_declaration("", fact.value_type, InitializedLocal, unions, fact.span):
 					Err(error):
 						failure = Some(error)
 						break
 					Ok(declaration):
-						result = "${result}${declaration}${c_loop_transfer(context.target, position)}=${transfer_value(transfer)};"
+						result = result.concat(declaration).append_loop_transfer_name(context.target, position).concat("=").append_transfer_name(transfer).concat(";")
 		position = position + 1
 	_: Void ?= match failure:
 		Some(error): Err(error)
@@ -2160,10 +2144,10 @@ private pure func append_loop_exit(
 	position = 0
 	for parameter in parameters:
 		fact = join_parameter(parameter)
-		name = match exit:
-			Own.Break(_): c_value(fact.id)
-			Own.Recur(_, _): c_header(fact.id)
-		result = "${result}${name}=${c_loop_transfer(context.target, position)};"
+		named = match exit:
+			Own.Break(_): result.append_local_name(fact.id)
+			Own.Recur(_, _): result.concat(c_header(fact.id))
+		result = named.concat("=").append_loop_transfer_name(context.target, position).concat(";")
 		position = position + 1
 	label = match exit:
 		Own.Break(_): c_loop_break(context.target)
@@ -2224,17 +2208,17 @@ private pure func append_loop(
 	var failure: Option[Diagnostic] = None
 	for header in loop.headers:
 		fact = join_parameter(header.parameter)
-		match c_local_declaration(fact.value_type, JoinLocal, unions, fact.span):
+		match append_local_declaration("", fact.value_type, JoinLocal, unions, fact.span):
 			Err(error):
 				failure = Some(error)
 				break
 			Ok(declaration):
-				declarations = "${declarations}${declaration}${c_header(fact.id)}=${transfer_value(header.initial)};"
-				match c_local_declaration(fact.value_type, InitializedLocal, unions, fact.span):
+				declarations = declarations.concat(declaration).concat(c_header(fact.id)).concat("=").append_transfer_name(header.initial).concat(";")
+				match append_local_declaration("", fact.value_type, InitializedLocal, unions, fact.span):
 					Err(error):
 						failure = Some(error)
 						break
-					Ok(snapshot): snapshots = "${snapshots}${snapshot}${c_value(fact.id)}=${c_header(fact.id)};(void)${c_value(fact.id)};"
+					Ok(snapshot): snapshots = snapshots.concat(snapshot).append_local_name(fact.id).concat("=").concat(c_header(fact.id)).concat(";(void)").append_local_name(fact.id).concat(";")
 				match header.parameter:
 					UnmanagedJoinParameter(_): void
 					ManagedJoinParameter(_, owner):
@@ -2281,22 +2265,21 @@ private pure func append_join(
 	records: List[ConcreteRecord], nearest: Option[LoopEmissionContext],
 ) -> Result[String, Diagnostic]:
 	parameter = join_parameter(matched_join.result)
-	name = c_value(parameter.id)
 	parameters = [matched_join.result].concat(matched_join.carried)
 	var declarations = output
 	var failure: Option[Diagnostic] = None
 	for output_parameter in parameters:
 		fact = join_parameter(output_parameter)
-		match c_local_declaration(fact.value_type, JoinLocal, unions, fact.span):
+		match append_local_declaration("", fact.value_type, JoinLocal, unions, fact.span):
 			Err(error):
 				failure = Some(error)
 				break
-			Ok(declaration): declarations = "${declarations}${declaration}${c_value(fact.id)};"
+			Ok(declaration): declarations = declarations.concat(declaration).append_local_name(fact.id).concat(";")
 	_: Void ?= match failure:
 		Some(error): Err(error)
 		None: Ok(void)
 	scope: SelectionEmissionScope = { root = parameter.id, path = [] }
-	done = "${c_selection_scope(scope)}_done"
+	done = "".append_selection_scope_name(scope).concat("_done")
 	var arms: List[SelectionEmissionArm] = []
 	for arm in matched_join.arms:
 		ending: Result[String, Diagnostic] = match arm.exit:
@@ -2305,7 +2288,7 @@ private pure func append_join(
 					None: Err(render(parameter.span, MissingEnclosingLoop(Lower.loop_target_value(target))))
 					Some(context): append_loop_tail("", exit, context, { root = scope.root, path = scope.path.append(arm.id) }, unions, types, records)
 			Own.Yield(outputs):
-				var transferred = "${name}=${transfer_value(outputs.transfer)};"
+				var transferred = "".append_local_name(parameter.id).concat("=").append_transfer_name(outputs.transfer).concat(";")
 				var position = 0
 				for output_parameter in matched_join.carried:
 					fact = join_parameter(output_parameter)
@@ -2313,7 +2296,7 @@ private pure func append_join(
 						None:
 							failure = Some(render(fact.span, MissingJoinTransfer(fact.id)))
 							break
-						Some(transfer): transferred = "${transferred}${c_value(fact.id)}=${transfer_value(transfer)};"
+						Some(transfer): transferred = transferred.append_local_name(fact.id).concat("=").append_transfer_name(transfer).concat(";")
 					position = position + 1
 				match failure:
 					Some(error): Err(error)
@@ -2332,7 +2315,7 @@ private pure func append_join(
 	for output_parameter in parameters:
 		fact = join_parameter(output_parameter)
 		-- Include Void and unused outputs, exactly as for ordinary value locals.
-		joined = "${joined}(void)${c_value(fact.id)};"
+		joined = joined.concat("(void)").append_local_name(fact.id).concat(";")
 		match output_parameter:
 			UnmanagedJoinParameter(_): void
 			ManagedJoinParameter(_, owner):
@@ -2352,21 +2335,25 @@ private pure func append_signature(
 	index: Int,
 	unions: List[ConcreteUnion],
 ) -> Result[String, Diagnostic]:
-	type_name ?= c_type(function.return_type, unions, compiler_span())
+	typed ?= append_type_name(output, function.return_type, unions, compiler_span())
 	parameters ?= c_parameters(function.parameters.map(parameter_type), unions)
-	Ok(
-		"${output}${type_name} ${c_name(index)}${parameters}",
-	)
+	Ok(typed.concat(" ").concat(c_name(index)).concat(parameters))
 
 
-private pure func transfer_value(result: ReturnTransfer) -> String:
+private pure func append_transfer_name(output: String, result: ReturnTransfer) -> String:
 	match result:
-		UnmanagedReturn(id): c_value(id)
-		OwnedReturn(_, owner): c_owner(owner)
+		UnmanagedReturn(id): output.append_local_name(id)
+		OwnedReturn(_, owner): output.append_owner_name(owner)
+
+
+private pure func append_stored_name(output: String, payload: StoredPayload) -> String:
+	match payload:
+		UnmanagedPayload(value): output.append_local_name(value)
+		OwnedPayload(_, owner): output.append_owner_name(owner)
 
 
 private pure func append_return(output: String, result: ReturnTransfer) -> String:
-	"${output}return ${transfer_value(result)};"
+	output.concat("return ").append_transfer_name(result).concat(";")
 
 
 private pure func append_function(
@@ -2802,7 +2789,7 @@ private pure func terminal_element_fragments(
 	unions: List[ConcreteUnion],
 	records: List[ConcreteRecord],
 ) -> Result[ElementFragments, Diagnostic]:
-	type_name ?= c_type(element, unions, compiler_span())
+	type_name ?= append_type_name("", element, unions, compiler_span())
 	needs_owner ?= value_needs_ownership(element, unions, records)
 	acquire: String ?= match needs_owner:
 		False: Ok("")
