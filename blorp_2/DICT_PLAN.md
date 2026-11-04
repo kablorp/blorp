@@ -74,7 +74,7 @@ All of these are pure. `n` is the number of live entries.
 
 Renamed 2026-11-03 (owner decision): `with_capacity(count)` became `dict(initial_capacity)`, the receiver parameter of the other functions became `self` so it does not clash with the function `dict`, and the checker finds the function by the foundation word `dict_function_word`.
 
-Staging: the pinned seed finds `with_capacity` by spelling for any Dict literal, `{}` included, so `blorp_2/src` writes `D.empty()` instead of `{}` until the seed is rotated past this commit; the next step restores `{}`.
+The pinned seed of the time found `with_capacity` by spelling for every Dict literal, `{}` included, so `blorp_2/src` wrote `D.empty()` for `{}` until `blorp2-seed-3a275339e3b5` was pinned.
 
 **Left out:**
 - `insert` (D1);
