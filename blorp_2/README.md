@@ -1658,10 +1658,9 @@ may have tuple type annotations.
 Tuple elements evaluate once from left to right, including Void elements whose
 values have no physical storage. Tuples have value semantics and remain
 structurally typed, distinct from authored named records. Once concrete, they
-use the ordinary managed record storage and ownership machinery. Tuple
-equality, ordering and traits are outside this increment.
-The [tuple validation and cost report](https://github.com/kablorp/blorp/blob/1e07c4dce85e51cd7ad911142e9bc96a5e0d91c7/benchmarks/results/blorp_2_tuples_2026-10-21.md)
-records matched self-compilation costs, ownership checks and native coverage.
+follow the ordinary record storage rule: inline when every element is a number,
+an inline record or a fixed union, otherwise counted. Tuple equality, ordering
+and traits are outside this increment.
 
 ## Owned parameters
 

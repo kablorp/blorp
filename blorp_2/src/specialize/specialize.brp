@@ -1768,6 +1768,47 @@ private pure func inline_record_field(
 			Ok(False)
 
 
+-- Whether a record keeps its fields inline: every field must be a number, an
+-- inline record or a fixed union. A layout still in progress is not a
+-- KnownType, so a field that closes a cycle keeps the record counted.
+private pure func record_representation(
+	fields: List[PartialType], storage: RecordStoragePolicy, checked: Checked.CheckedFunctions,
+	unions: IndexedList[UnionSlot], records: IndexedList[RecordSlot], span: Span,
+) -> Result[RecordRepresentation, Diagnostic]:
+	var managed: Bool = match storage:
+		InlineEligible | DeclaredInline: False
+		AlwaysManaged: True
+	var found_error: Option[Diagnostic] = None
+	for field in fields:
+		match inline_record_field(field, checked, unions, records, span):
+			Ok(inline):
+				if inline.not():
+					managed = True
+			Err(failure):
+				found_error = Some(failure)
+				break
+
+	_: Void ?= match found_error:
+		Some(failure):
+			Err(failure)
+		None:
+			Ok(void)
+
+	-- Checking accepts a fixed record only when every field is a number, a
+	-- fixed record or a fixed union and none contains the record.
+	match storage:
+		DeclaredInline:
+			if managed:
+				Err(internal_error(span, "a fixed record instance is not stored inline"))
+			else:
+				Ok(InlineRecord)
+		InlineEligible | AlwaysManaged:
+			if managed:
+				Ok(ManagedRecord)
+			else:
+				Ok(InlineRecord)
+
+
 private pure func ensure_record(
 	key: PartialRecordKey,
 	checked: Checked.CheckedFunctions,
@@ -1813,7 +1854,7 @@ private pure func prepare_record(
 	match key.origin:
 		StructuralTuple:
 			publish_record(
-				key, key.arguments, ManagedRecord, unions, span, records,
+				key, key.arguments, InlineEligible, checked, unions, span, records,
 				in_progress.append(InProgressRecord(key, NotReferencedBack)),
 				unions.entries.length(), records.entries.length(),
 			)
@@ -1863,9 +1904,6 @@ private pure func prepare_declared_record(
 	var dependencies = unions
 	var record_dependencies = records
 	var layouts: List[InProgressLayout] = in_progress.append(InProgressRecord(key, NotReferencedBack))
-	var managed: Bool = match declaration.storage:
-		InlineEligible | DeclaredInline: False
-		AlwaysManaged: True
 	var found_error: Option[Diagnostic] = None
 
 	for field in declaration.fields:
@@ -1878,16 +1916,6 @@ private pure func prepare_declared_record(
 				record_dependencies = prepared.records
 				layouts = prepared.in_progress
 				fields = fields.append(prepared.value_type)
-				-- Only numbers, inline records and fixed unions keep a record
-				-- inline; every other field, including a layout still in
-				-- progress, needs a counted root.
-				match inline_record_field(prepared.value_type, checked, dependencies, record_dependencies, field.span):
-					Ok(inline):
-						if inline.not():
-							managed = True
-					Err(failure):
-						found_error = Some(failure)
-						break
 
 	_: Void ?= match found_error:
 		Some(failure):
@@ -1895,31 +1923,17 @@ private pure func prepare_declared_record(
 		None:
 			Ok(void)
 
-	-- Checking accepts a fixed record only when every field is a number, a
-	-- fixed record or a fixed union and none contains the record.
-	_: Void ?= match declaration.storage:
-		DeclaredInline:
-			if managed:
-				Err(internal_error(span, "a fixed record instance is not stored inline"))
-			else:
-				Ok(void)
-		InlineEligible | AlwaysManaged:
-			Ok(void)
-
-	representation: RecordRepresentation = if managed:
-		ManagedRecord
-	else:
-		InlineRecord
-	publish_record(key, fields, representation, dependencies, span, record_dependencies, layouts, unions.entries.length(), records.entries.length())
+	publish_record(key, fields, declaration.storage, checked, dependencies, span, record_dependencies, layouts, unions.entries.length(), records.entries.length())
 
 
 -- Both source-owned products and structural tuples settle through one record inventory.
 private pure func publish_record(
-	key: PartialRecordKey, fields: List[PartialType], representation: RecordRepresentation,
+	key: PartialRecordKey, fields: List[PartialType], storage: RecordStoragePolicy, checked: Checked.CheckedFunctions,
 	dependencies: IndexedList[UnionSlot], span: Span,
 	record_dependencies: IndexedList[RecordSlot], layouts: List[InProgressLayout],
 	first_union: Int, first_record: Int,
 ) -> Result[PreparedType, Diagnostic]:
+	representation ?= record_representation(fields, storage, checked, dependencies, record_dependencies, span)
 	instance: RecordInstanceId = into_opaque RecordInstanceId(record_dependencies.entries.length())
 	slot ?= settle_record({ key = key, fields = fields, representation = representation }, span)
 	published = append_entry(record_dependencies, slot, record_digest(key.origin, key.arguments.length()))

@@ -47,7 +47,7 @@ nonregression decide acceptance.
 | TypeRef and genuine record/union/field/variant identities | Semantic equality, complete generic keys, selectors and C names |
 | Existing concrete record/union tables | Already own complete nominal bodies and finite references |
 | PartialType, pending slots, backreferences and settlement | Already resolve supported recursive groups without a new builder |
-| Current source storage policy and union owning accumulation | Still select representation once, including counted tuples/captures |
+| Current source storage policy and union owning accumulation | Still select representation once; tuples follow the record rule, captures stay counted |
 | Independent Verify membership, layout graph and actual ownership checks | Construction and use-specific ownership have different proof obligations |
 | Existing List helper inventory and naming | Already selects concrete helper work without registering every List type |
 
@@ -354,7 +354,9 @@ A completed-slot query projects the constructor back into the private pending
 choice when the existing builder needs it. It stores no second completed tag,
 Bool, descriptor list or ownership fact. There is no new instance issuance,
 all-functions walk, global List discovery, admission carrier or sealing phase.
-Declared-record, tuple and capture-environment storage policies are unchanged.
+Declared-record and capture-environment storage policies are unchanged. Tuples
+follow the record rule: inline when every element is a number, an inline record
+or a fixed union, otherwise counted.
 
 ### Complete reader migration
 
@@ -402,8 +404,9 @@ calling producer logic to validate producer output. Retain these obligations:
   occurrences and full callable signatures. Same-shaped nominal rows stay distinct.
 - Retain logical Void fields and effects while Emit omits their record members.
   Stored List[Void] and union Void payloads retain their existing unit storage.
-- Keep counted tuples/capture environments, including numeric/all-Void cases,
-  and the typed callable ops/environment ABI with possibly empty free-entry env.
+- Keep counted capture environments and tuples with a Void or other non-inline
+  element, including all-Void ones, and the typed callable ops/environment ABI
+  with possibly empty free-entry env.
 - Preserve recursive counted cuts and existing union policies: direct Chain
   references use UnionType(chain); inline U through List[U] remains finite via
   the existing List root and nominal UnionType edge. Cross-kind references use

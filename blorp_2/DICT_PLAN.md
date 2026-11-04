@@ -69,7 +69,7 @@ All of these are pure. `n` is the number of live entries.
 | `remove(self, key)` | `Dict[K, V]` | without the key; unchanged if absent | O(1) amortized |
 | `keys(self)` | `List[K]` | live keys in insertion order | O(1) with no removed entries pending, else O(n) |
 | `values(self)` | `List[V]` | values in the same order | same as `keys` |
-| `entries(self)` | `List[(K, V)]` | pairs in order; each pair is a managed tuple | O(n) |
+| `entries(self)` | `List[(K, V)]` | pairs in order; each pair is a tuple (counted when K or V is managed) | O(n) |
 | `length(self)`, `is_empty(self)` | `Int`, `Bool` | live entry count | O(1) |
 
 Renamed 2026-11-03 (owner decision): `with_capacity(count)` became `dict(initial_capacity)`, the receiver parameter of the other functions became `self` so it does not clash with the function `dict`, and the checker finds the function by the foundation word `dict_function_word`.
