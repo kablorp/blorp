@@ -1,0 +1,120 @@
+import:
+	../../../src/check/check: check
+	../../../src/check/render: render_failure
+	../../../src/utils/source: module_source, root_module_id
+	../module_input: parse_modules
+	string: String methods
+	int: Int methods
+	list: List methods
+	bool: Bool methods
+	option: Option methods
+	test: TestSuite
+
+
+private HELP_LIST_DIRECTORY: String = "declare an impure nongeneric function with one String parameter returning Result[List[String], Int]"
+private HELP_ONE_PATH: String = "declare an impure nongeneric function with one String parameter returning Result[Void, Int]"
+private HELP_RENAME: String = "declare an impure nongeneric function with two String parameters returning Result[Void, Int]"
+
+
+private pure func body_for(label: String) -> String:
+	"\n    builtin(\"${label}\")\nfunc main() -> Int:\n    0\n"
+
+
+private pure func accepts(header: String, label: String) -> Bool:
+	match parse_modules([{ source = "${header}${body_for(label)}", targets = [] }]):
+		Err(_): False
+		Ok(parsed):
+			match check(parsed):
+				Ok(_): True
+				Err(_): False
+
+
+-- The declaration must be refused where the label is written, with the help
+-- rendered from the operation's contract row.
+private pure func rejects(header: String, label: String, help: String) -> Bool:
+	match parse_modules([{ source = "${header}${body_for(label)}", targets = [] }]):
+		Err(_): False
+		Ok(parsed):
+			match check(parsed):
+				Ok(_): False
+				Err(failure):
+					errors = render_failure(failure)
+					actual = errors.first
+					start = header.length() + ("\n    builtin(".length())
+					actual.message.equals("builtin declaration does not match its runtime contract")
+						.and(actual.help.equals(help))
+						.and(actual.span.start.equals(start))
+						.and(actual.span.end.equals(start + ("\"${label}\"".length())))
+						.and(actual.span.source == module_source(root_module_id()))
+						.and(errors.remaining.is_empty())
+						.and(actual.note.is_none())
+
+
+private pure func list_directory_rejects(header: String) -> Bool:
+	rejects(header, "fs.list_directory", HELP_LIST_DIRECTORY)
+
+
+private pure func rename_rejects(header: String) -> Bool:
+	rejects(header, "fs.rename", HELP_RENAME)
+
+
+private ONE_PATH_LABELS: List[String] = ["fs.create_directory", "fs.create_directories", "fs.remove_file", "fs.remove_directory"]
+
+
+pure func test_exact_contracts_are_accepted() -> Bool:
+	accepts("func listing(path: String) -> Result[List[String], Int]:", "fs.list_directory")
+		.and(ONE_PATH_LABELS.all(pure func(label: String) -> Bool: accepts("func operate(path: String) -> Result[Void, Int]:", label)))
+		.and(accepts("func move(source: String, destination: String) -> Result[Void, Int]:", "fs.rename"))
+
+
+-- The listing's success is the new List[String] payload: no other List and no
+-- single String takes its place.
+pure func test_list_directory_success_is_a_string_list() -> Bool:
+	[
+		"func listing(path: String) -> Result[String, Int]:",
+		"func listing(path: String) -> Result[List[Int], Int]:",
+		"func listing(path: String) -> Result[List[List[String]], Int]:",
+		"func listing(path: String) -> Result[Void, Int]:",
+		"func listing(path: String) -> Result[List[String], String]:",
+	].all(list_directory_rejects)
+
+
+pure func test_list_directory_parameter_purity_and_generics_are_closed() -> Bool:
+	[
+		"func listing() -> Result[List[String], Int]:",
+		"func listing(paths: List[String]) -> Result[List[String], Int]:",
+		"pure func listing(path: String) -> Result[List[String], Int]:",
+		"func listing[Element](path: String) -> Result[List[String], Int]:",
+	].all(list_directory_rejects)
+
+
+-- Each of the four takes one path and succeeds with Void.
+pure func test_one_path_operations_are_closed() -> Bool:
+	headers = [
+		"func operate(path: String) -> Result[List[String], Int]:",
+		"func operate(path: String) -> Result[Void, String]:",
+		"func operate(path: String, other: String) -> Result[Void, Int]:",
+		"pure func operate(path: String) -> Result[Void, Int]:",
+	]
+	ONE_PATH_LABELS.all(pure func(label: String) -> Bool: headers.all(pure func(header: String) -> Bool: rejects(header, label, HELP_ONE_PATH)))
+
+
+pure func test_rename_takes_two_paths() -> Bool:
+	[
+		"func move(source: String) -> Result[Void, Int]:",
+		"func move(source: String, destination: Int) -> Result[Void, Int]:",
+		"func move(source: String, destination: String) -> Result[Int, Int]:",
+		"pure func move(source: String, destination: String) -> Result[Void, Int]:",
+	].all(rename_rejects)
+
+
+tests: TestSuite = {
+	description = "fs directory builtin contracts",
+	tests = [
+		("each exact contract is accepted", test_exact_contracts_are_accepted),
+		("fs.list_directory succeeds with a List[String] and nothing else", test_list_directory_success_is_a_string_list),
+		("fs.list_directory takes one String and is impure and nongeneric", test_list_directory_parameter_purity_and_generics_are_closed),
+		("the create and remove operations take one String and succeed with Void", test_one_path_operations_are_closed),
+		("fs.rename takes two Strings and succeeds with Void", test_rename_takes_two_paths),
+	]
+}

@@ -1,5 +1,9 @@
 import:
-    ../../src/runtime/fs: FS_HELPERS_RUNTIME, FS_READ_TEXT_RUNTIME, FS_WRITE_TEXT_RUNTIME, FS_ENTRY_KIND_RUNTIME
+    ../../src/runtime/fs:
+        FS_HELPERS_RUNTIME, FS_READ_TEXT_RUNTIME, FS_WRITE_TEXT_RUNTIME, FS_ENTRY_KIND_RUNTIME, FS_CREATE_DIRECTORY_RUNTIME,
+        FS_CREATE_DIRECTORIES_RUNTIME, FS_REMOVE_FILE_RUNTIME, FS_REMOVE_DIRECTORY_RUNTIME, FS_RENAME_RUNTIME, fs_list_directory_runtime,
+    ../../src/runtime/list: list_runtime, list_element_key, list_c_type, LIST_SHARED_RUNTIME
+    ../../src/specialize/specialize: TypeRef(StringType)
     ../../src/runtime/process: PROCESS_POSIX_PRELUDE
     ../../src/runtime/memory: MEMORY_RUNTIME
     ../../src/runtime/string: string_runtime
@@ -24,9 +28,9 @@ private CASE_TIMEOUT_MS: Int = 30000
 -- Builds blorp_2/test/runtime/fixtures/<name>_test.c, which includes the
 -- fragments as <name>_runtime.c and calls their C functions directly. Each
 -- probe gets the fragments in the order a program calling its operations
--- emits them.
-private func ready(c_compiler: String, directory: String, name: String, operations: String) -> Result[String, String]:
-    fragments = PROCESS_POSIX_PRELUDE + MEMORY_RUNTIME + string_runtime() + "\n" + FS_HELPERS_RUNTIME + operations
+-- emits them: `aggregates` are the layouts those operations use.
+private func ready(c_compiler: String, directory: String, name: String, aggregates: String, operations: String) -> Result[String, String]:
+    fragments = PROCESS_POSIX_PRELUDE + MEMORY_RUNTIME + string_runtime() + "\n" + aggregates + FS_HELPERS_RUNTIME + operations
     _ ?= write_text(directory + "/" + name + "_runtime.c", fragments).map_err(describe)
     executable = directory + "/" + name + "_test"
     prefix = directory + "/" + name + "-build"
@@ -111,8 +115,8 @@ private func write_tests(executable: String, directory: String) -> List[(String,
 
 
 -- Left out as root, like the fs example, so that it earns no PASS credit.
-private func permission_tests(executable: String, directory: String) -> List[(String, () -> Bool)]:
-    match running_as_root(directory):
+private func permission_tests(root: Result[Bool, String], executable: String, directory: String) -> List[(String, () -> Bool)]:
+    match root:
         Err(error): [("the user running the fs write probe is known", func(): reported(Err(error)))]
         Ok(True):
             print_error("fs write permission case not run: root can write a read-only file")
@@ -120,13 +124,65 @@ private func permission_tests(executable: String, directory: String) -> List[(St
         Ok(False): [("a read-only file and a file in a read-only directory are PermissionDenied", func(): reported(native_case(executable, directory, "permission_kinds")))]
 
 
+private func directory_tests(executable: String, directory: String) -> List[(String, () -> Bool)]:
+    [
+        ("an empty directory lists nothing through one descriptor that closedir closes once", func(): reported(native_case(executable, directory, "list_empty"))),
+        ("errno left set by a readdir that returned an entry does not end the listing as a failure", func(): reported(native_case(executable, directory, "list_errno_left_set"))),
+        ("more entries than the initial capacity all list, in order", func(): reported(native_case(executable, directory, "list_many"))),
+        ("names sort by their bytes, a prefix before what extends it", func(): reported(native_case(executable, directory, "list_order"))),
+        ("files, directories and FIFOs list as their kinds, and every link as Symlink", func(): reported(native_case(executable, directory, "list_kinds"))),
+        ("a link to a directory and a path ending in a slash list the directory", func(): reported(native_case(executable, directory, "list_paths"))),
+        ("a missing path, a file, a file with a slash, a loop, an empty path and a NUL fail with their codes", func(): reported(native_case(executable, directory, "list_failures"))),
+        ("an unknown d_type is examined with fstatat on the open directory without following links", func(): reported(native_case(executable, directory, "list_unknown_types"))),
+        ("an entry gone before fstatat is left out, and another fstatat failure fails the listing", func(): reported(native_case(executable, directory, "list_vanished"))),
+        ("a readdir failure part way fails the listing and frees the names", func(): reported(native_case(executable, directory, "list_read_failure"))),
+        ("one name that is not UTF-8 fails the whole listing", func(): reported(native_case(executable, directory, "list_invalid_utf8"))),
+        ("a failed fdopendir closes the descriptor once and never calls closedir", func(): reported(native_case(executable, directory, "list_fdopendir_failure"))),
+        ("EINTR from open, readdir, fstatat, mkdir, rename, rmdir and unlink is each retried once", func(): reported(native_case(executable, directory, "interrupted"))),
+        ("create_directory makes one directory, and an existing path of any kind is AlreadyExists", func(): reported(native_case(executable, directory, "create_kinds"))),
+        ("create_directories makes each missing component and passes existing directories and links to them", func(): reported(native_case(executable, directory, "create_all"))),
+        ("create_directories: a file within is NotADirectory, a file or dangling link last is AlreadyExists", func(): reported(native_case(executable, directory, "create_all_conflicts"))),
+        ("create_directories succeeds when another process makes a component first", func(): reported(native_case(executable, directory, "create_all_race"))),
+        ("remove_file removes files and links, and a directory refused with EPERM or EISDIR is IsADirectory", func(): reported(native_case(executable, directory, "remove_file_kinds"))),
+        ("remove_directory removes an empty directory, and EEXIST or ENOTEMPTY is DirectoryNotEmpty", func(): reported(native_case(executable, directory, "remove_directory_kinds"))),
+        ("rename replaces a file or an empty directory and returns each kind it can", func(): reported(native_case(executable, directory, "rename_kinds"))),
+    ]
+
+
+-- Left out as root, like the write probe's permission case.
+private func directory_permission_tests(root: Result[Bool, String], executable: String, directory: String) -> List[(String, () -> Bool)]:
+    match root:
+        Err(error): [("the user running the fs directory probe is known", func(): reported(Err(error)))]
+        Ok(True):
+            print_error("fs directory permission case not run: root may list, create and remove anywhere")
+            []
+        Ok(False): [("each operation refused by permissions is PermissionDenied, and a real directory given to remove_file is IsADirectory", func(): reported(native_case(executable, directory, "permission_kinds")))]
+
+
+-- The listing builds the List[String] layout, so its probe gets that layout
+-- as a program that lists a directory does.
+private pure func string_list_layout() -> String:
+    key = list_element_key(StringType)
+    LIST_SHARED_RUNTIME + list_runtime(key, "struct blorp_string*", "blorp_string_retain(element);", "blorp_string_release(element);")
+
+
+private pure func directory_operations() -> String:
+    listing = fs_list_directory_runtime(list_c_type(list_element_key(StringType)))
+    listing + FS_CREATE_DIRECTORY_RUNTIME + FS_CREATE_DIRECTORIES_RUNTIME + FS_REMOVE_FILE_RUNTIME + FS_REMOVE_DIRECTORY_RUNTIME + FS_RENAME_RUNTIME
+
+
 func suite(c_compiler: String, directory: String) -> TestSuite:
     -- A probe that does not build is one failing test, and the other probe's
-    -- cases still run.
-    read: List[(String, () -> Bool)] = match ready(c_compiler, directory, "fs", FS_READ_TEXT_RUNTIME + FS_ENTRY_KIND_RUNTIME):
+    -- cases still run. The user is asked once: its capture files are created
+    -- exclusively.
+    root = running_as_root(directory)
+    read: List[(String, () -> Bool)] = match ready(c_compiler, directory, "fs", "", FS_READ_TEXT_RUNTIME + FS_ENTRY_KIND_RUNTIME):
         Err(error): [("the fs read probe builds", func(): reported(Err(error)))]
         Ok(executable): read_tests(executable, directory)
-    write: List[(String, () -> Bool)] = match ready(c_compiler, directory, "fs_write", FS_WRITE_TEXT_RUNTIME):
+    write: List[(String, () -> Bool)] = match ready(c_compiler, directory, "fs_write", "", FS_WRITE_TEXT_RUNTIME):
         Err(error): [("the fs write probe builds", func(): reported(Err(error)))]
-        Ok(executable): write_tests(executable, directory).concat(permission_tests(executable, directory))
-    { description = "fs runtime", tests = read.concat(write) }
+        Ok(executable): write_tests(executable, directory).concat(permission_tests(root, executable, directory))
+    directories: List[(String, () -> Bool)] = match ready(c_compiler, directory, "fs_directory", string_list_layout(), directory_operations()):
+        Err(error): [("the fs directory probe builds", func(): reported(Err(error)))]
+        Ok(executable): directory_tests(executable, directory).concat(directory_permission_tests(root, executable, directory))
+    { description = "fs runtime", tests = read.concat(write).concat(directories) }

@@ -3,12 +3,16 @@ import:
 	../../../src/own/own: own
 	../../../src/verify/verify: verify
 	../../../src/check/check: check
-	../../../src/specialize/specialize: specialize
+	../../../src/specialize/specialize: specialize, TypeRef(StringType)
 	../../../src/lower/lower: lower
-	../../../src/runtime/fs: FS_HELPERS_RUNTIME, FS_READ_TEXT_RUNTIME, FS_WRITE_TEXT_RUNTIME, FS_ENTRY_KIND_RUNTIME
+	../../../src/runtime/fs:
+		FS_HELPERS_RUNTIME, FS_READ_TEXT_RUNTIME, FS_WRITE_TEXT_RUNTIME, FS_ENTRY_KIND_RUNTIME, FS_CREATE_DIRECTORY_RUNTIME,
+		FS_CREATE_DIRECTORIES_RUNTIME, FS_REMOVE_FILE_RUNTIME, FS_REMOVE_DIRECTORY_RUNTIME, FS_RENAME_RUNTIME, fs_list_directory_runtime,
+	../../../src/runtime/list: list_c_type, list_element_key
 	../../../src/runtime/process: PROCESS_POSIX_PRELUDE
 	../module_input: parse_modules
 	string: String methods
+	list: List methods
 	int: Int methods
 	bool: Bool methods
 	option: Option methods
@@ -19,6 +23,7 @@ import:
 private READ_TEXT_DECLARATION: String = "func read(path: String) -> Result[String, Int]:\n    builtin(\"fs.read_text\")\n"
 private ENTRY_KIND_DECLARATION: String = "func kind(path: String) -> Result[Int, Int]:\n    builtin(\"fs.entry_kind\")\n"
 private WRITE_TEXT_DECLARATION: String = "func store(path: String, text: String) -> Result[Void, Int]:\n    builtin(\"fs.write_text\")\n"
+private LIST_DIRECTORY_DECLARATION: String = "func listing(path: String) -> Result[List[String], Int]:\n    builtin(\"fs.list_directory\")\n"
 
 
 -- How many times `pattern` occurs in `text`.
@@ -123,6 +128,65 @@ pure func test_result_takes_primitive_payloads() -> Bool:
 				.and(occurrences(code, "blorp_fs_entry_kind(blorp_vl_0,&blorp_runtime_1_value,&blorp_runtime_1_error)").equals(1))
 
 
+private pure func listing_called() -> String:
+	"${LIST_DIRECTORY_DECLARATION}func main() -> Int:\n    first = listing(\"x\")\n    0\n"
+
+
+private pure func string_list_type() -> String:
+	list_c_type(list_element_key(StringType))
+
+
+-- The success is a fresh List[String] in its own out-parameter, which the Ok
+-- constructor takes; main then drops the whole Result.
+pure func test_listing_takes_a_fresh_string_list_and_drops_it() -> Bool:
+	match emitted(listing_called()):
+		Err(_): False
+		Ok(code):
+			occurrences(code, "${string_list_type()} blorp_runtime_1_value=NULL;int64_t blorp_runtime_1_error=0;").equals(1)
+				.and(occurrences(code, "blorp_fs_list_directory(blorp_vl_0,&blorp_runtime_1_value,&blorp_runtime_1_error)").equals(1))
+				.and(occurrences(code, ".payload.blorp_up_0={.blorp_uf_0=blorp_runtime_1_value}").equals(1))
+				.and(occurrences(code, "blorp_union_drop_0(blorp_owner_1);").equals(1))
+
+
+-- The listing's fragment is built for the program's own List[String] type.
+pure func test_listing_alone_emits_its_fragment_for_the_string_list_type() -> Bool:
+	match emitted(listing_called()):
+		Err(_): False
+		Ok(code):
+			occurrences(code, FS_HELPERS_RUNTIME).equals(1)
+				.and(occurrences(code, fs_list_directory_runtime(string_list_type())).equals(1))
+				.and(occurrences(code, FS_CREATE_DIRECTORY_RUNTIME).equals(0))
+				.and(occurrences(code, FS_ENTRY_KIND_RUNTIME).equals(0))
+				.and(code.starts_with(PROCESS_POSIX_PRELUDE))
+
+
+private pure func directories_called() -> String:
+	declarations = [
+		LIST_DIRECTORY_DECLARATION,
+		"func create(path: String) -> Result[Void, Int]:\n    builtin(\"fs.create_directory\")\n",
+		"func create_all(path: String) -> Result[Void, Int]:\n    builtin(\"fs.create_directories\")\n",
+		"func remove_file(path: String) -> Result[Void, Int]:\n    builtin(\"fs.remove_file\")\n",
+		"func remove_directory(path: String) -> Result[Void, Int]:\n    builtin(\"fs.remove_directory\")\n",
+		"func move(source: String, destination: String) -> Result[Void, Int]:\n    builtin(\"fs.rename\")\n",
+	]
+	calls = "    a = listing(\"x\")\n    b = create(\"x\")\n    c = create_all(\"x\")\n    d = remove_file(\"x\")\n    e = remove_directory(\"x\")\n    f = move(\"x\", \"y\")\n"
+	"${declarations.join("")}func main() -> Int:\n${calls}    0\n"
+
+
+pure func test_six_directory_operations_share_one_helper_fragment() -> Bool:
+	match emitted(directories_called()):
+		Err(_): False
+		Ok(code):
+			occurrences(code, FS_HELPERS_RUNTIME).equals(1)
+				.and(occurrences(code, fs_list_directory_runtime(string_list_type())).equals(1))
+				.and(occurrences(code, FS_CREATE_DIRECTORY_RUNTIME).equals(1))
+				.and(occurrences(code, FS_CREATE_DIRECTORIES_RUNTIME).equals(1))
+				.and(occurrences(code, FS_REMOVE_FILE_RUNTIME).equals(1))
+				.and(occurrences(code, FS_REMOVE_DIRECTORY_RUNTIME).equals(1))
+				.and(occurrences(code, FS_RENAME_RUNTIME).equals(1))
+				.and(occurrences(code, "blorp_fs_rename(blorp_vl_0,blorp_vl_1,&blorp_runtime_2_error)").equals(1))
+
+
 tests: TestSuite = {
 	description = "fs builtin C emission",
 	tests = [
@@ -132,5 +196,8 @@ tests: TestSuite = {
 		("one fs operation emits the helpers once and not the other operation", test_helpers_are_emitted_once_for_one_operation),
 		("unused fs declarations select no fragments or POSIX prelude", test_unused_declarations_select_no_fs_fragments),
 		("results carry primitive payloads through out-parameters", test_result_takes_primitive_payloads),
+		("a listing's Ok takes a fresh List[String] out-parameter and the Result is dropped", test_listing_takes_a_fresh_string_list_and_drops_it),
+		("a listing alone emits the helpers and its fragment for the program's List[String]", test_listing_alone_emits_its_fragment_for_the_string_list_type),
+		("six directory operations share one helper fragment and emit each fragment once", test_six_directory_operations_share_one_helper_fragment),
 	]
 }
