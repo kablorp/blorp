@@ -2,6 +2,7 @@ import:
     ../../src/runtime/fs:
         FS_HELPERS_RUNTIME, FS_READ_TEXT_RUNTIME, FS_WRITE_TEXT_RUNTIME, FS_ENTRY_KIND_RUNTIME, FS_CREATE_DIRECTORY_RUNTIME,
         FS_CREATE_DIRECTORIES_RUNTIME, FS_REMOVE_FILE_RUNTIME, FS_REMOVE_DIRECTORY_RUNTIME, FS_RENAME_RUNTIME, fs_list_directory_runtime,
+        FS_REMOVE_DIRECTORY_TREE_RUNTIME, FS_CREATE_TEMPORARY_DIRECTORY_RUNTIME,
     ../../src/runtime/list: list_runtime, list_element_key, list_c_type, LIST_SHARED_RUNTIME
     ../../src/specialize/specialize: TypeRef(StringType)
     ../../src/runtime/process: PROCESS_POSIX_PRELUDE
@@ -159,6 +160,52 @@ private func directory_permission_tests(root: Result[Bool, String], executable: 
         Ok(False): [("each operation refused by permissions is PermissionDenied, and a real directory given to remove_file is IsADirectory", func(): reported(native_case(executable, directory, "permission_kinds")))]
 
 
+private func tree_tests(executable: String, directory: String) -> List[(String, () -> Bool)]:
+    [
+        ("remove_directory_tree: a missing path, the empty path and a NUL fail with their codes", func(): reported(native_case(executable, directory, "tree_missing"))),
+        ("remove_directory_tree: a file and a link to anything are NotADirectory and nothing is removed", func(): reported(native_case(executable, directory, "tree_not_directories"))),
+        ("remove_directory_tree: trailing slashes are stripped, so link/ is the link and a/./ names .", func(): reported(native_case(executable, directory, "tree_trailing_slashes"))),
+        ("remove_directory_tree: a final . or .. is refused before any system call", func(): reported(native_case(executable, directory, "tree_dot_refusals"))),
+        ("remove_directory_tree: / and // are CrossesDevices and nothing is read or removed", func(): reported(native_case(executable, directory, "tree_slash_root"))),
+        ("remove_directory_tree: a root whose .. is on another device is CrossesDevices and nothing is removed", func(): reported(native_case(executable, directory, "tree_root_mount_point"))),
+        ("remove_directory_tree removes an empty directory and a tree of files, links, FIFOs and directories", func(): reported(native_case(executable, directory, "tree_removed"))),
+        ("remove_directory_tree removes an empty child that can be read but not searched without entering it", func(): reported(native_case(executable, directory, "tree_unsearchable_child"))),
+        ("remove_directory_tree removes a link out of the tree and keeps its target's contents", func(): reported(native_case(executable, directory, "tree_link_out"))),
+        ("remove_directory_tree removes a chain deeper than 300 levels and longer than PATH_MAX under 32 descriptors, holding at most 3", func(): reported(native_case(executable, directory, "tree_deep_chain"))),
+        ("remove_directory_tree reads each directory's names before removing any of them", func(): reported(native_case(executable, directory, "tree_read_order"))),
+        ("remove_directory_tree enters a directory that unlinkat refuses with EPERM, as on macOS", func(): reported(native_case(executable, directory, "tree_directory_eperm"))),
+        ("remove_directory_tree: EBUSY leads to the device check, which stops at a mount point", func(): reported(native_case(executable, directory, "tree_mount_point_ebusy"))),
+        ("remove_directory_tree: EPERM for a file keeps its own failure, PermissionDenied", func(): reported(native_case(executable, directory, "tree_file_eperm"))),
+        ("remove_directory_tree: an entry removed by another process first is no failure", func(): reported(native_case(executable, directory, "tree_vanished_entry"))),
+        ("remove_directory_tree: a child on another device is CrossesDevices and nothing under it is removed", func(): reported(native_case(executable, directory, "tree_child_device"))),
+        ("remove_directory_tree: a directory moved during the walk is ChangedDuringRemoval and the walk stops", func(): reported(native_case(executable, directory, "tree_moved_directory"))),
+        ("remove_directory_tree: an entry the walk never saw makes the rmdir DirectoryNotEmpty", func(): reported(native_case(executable, directory, "tree_hidden_entry"))),
+        ("remove_directory_tree: failed readdir, fdopendir, fcntl and fstat report their codes and release everything", func(): reported(native_case(executable, directory, "tree_read_failures"))),
+        ("remove_directory_tree retries EINTR from open, openat, unlinkat, fstat, readdir and fcntl", func(): reported(native_case(executable, directory, "tree_interrupted"))),
+        ("remove_directory_tree removes a name that is not UTF-8 by its bytes", func(): reported(native_case(executable, directory, "tree_invalid_utf8_name"))),
+        ("create_temporary_directory makes distinct 0700 directories directly in the parent, relative or absolute", func(): reported(native_case(executable, directory, "temporary_created"))),
+        ("create_temporary_directory adds no second slash after a parent ending in one", func(): reported(native_case(executable, directory, "temporary_trailing_slash"))),
+        ("create_temporary_directory retries mkdtemp after EINTR", func(): reported(native_case(executable, directory, "temporary_interrupted"))),
+        ("create_temporary_directory refuses a prefix holding a slash before any system call", func(): reported(native_case(executable, directory, "temporary_prefix_slash"))),
+        ("create_temporary_directory: a missing, file or empty parent, a NUL and EEXIST fail with their codes", func(): reported(native_case(executable, directory, "temporary_failures"))),
+    ]
+
+
+-- Left out as root, like the other probes' permission cases.
+private func tree_permission_tests(root: Result[Bool, String], executable: String, directory: String) -> List[(String, () -> Bool)]:
+    match root:
+        Err(error): [("the user running the fs tree probe is known", func(): reported(Err(error)))]
+        Ok(True):
+            print_error("fs tree permission cases not run: root may remove and create anywhere")
+            []
+        Ok(False):
+            [
+                ("remove_directory_tree in a parent without write permission is PermissionDenied, with each platform's shape", func(): reported(native_case(executable, directory, "tree_permission"))),
+                ("remove_directory_tree removes an empty child that cannot be opened, and one that is not empty is PermissionDenied", func(): reported(native_case(executable, directory, "tree_unopenable_child"))),
+                ("create_temporary_directory in a parent without write permission is PermissionDenied", func(): reported(native_case(executable, directory, "temporary_permission"))),
+            ]
+
+
 -- The listing builds the List[String] layout, so its probe gets that layout
 -- as a program that lists a directory does.
 private pure func string_list_layout() -> String:
@@ -185,4 +232,7 @@ func suite(c_compiler: String, directory: String) -> TestSuite:
     directories: List[(String, () -> Bool)] = match ready(c_compiler, directory, "fs_directory", string_list_layout(), directory_operations()):
         Err(error): [("the fs directory probe builds", func(): reported(Err(error)))]
         Ok(executable): directory_tests(executable, directory).concat(directory_permission_tests(root, executable, directory))
-    { description = "fs runtime", tests = read.concat(write).concat(directories) }
+    tree: List[(String, () -> Bool)] = match ready(c_compiler, directory, "fs_tree", "", FS_REMOVE_DIRECTORY_TREE_RUNTIME + FS_CREATE_TEMPORARY_DIRECTORY_RUNTIME):
+        Err(error): [("the fs tree probe builds", func(): reported(Err(error)))]
+        Ok(executable): tree_tests(executable, directory).concat(tree_permission_tests(root, executable, directory))
+    { description = "fs runtime", tests = read.concat(write).concat(directories).concat(tree) }

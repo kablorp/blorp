@@ -30,7 +30,7 @@ FS_HELPERS_RUNTIME: String =
 		|BLORP_FS_NOT_A_DIRECTORY=4,BLORP_FS_IS_A_DIRECTORY=5,BLORP_FS_DIRECTORY_NOT_EMPTY=6,
 		|BLORP_FS_NOT_A_REGULAR_FILE=7,BLORP_FS_READ_ONLY_FILESYSTEM=8,BLORP_FS_NO_SPACE=9,
 		|BLORP_FS_FILE_TOO_LARGE=10,BLORP_FS_CROSSES_DEVICES=11,BLORP_FS_PATH_CONTAINS_NUL=12,
-		|BLORP_FS_INVALID_UTF8=13
+		|BLORP_FS_INVALID_UTF8=13,BLORP_FS_CHANGED_DURING_REMOVAL=14
 		|};
 		|enum {
 		|BLORP_FS_ENTRY_ABSENT=0,BLORP_FS_ENTRY_FILE=1,BLORP_FS_ENTRY_DIRECTORY=2,
@@ -73,6 +73,26 @@ FS_HELPERS_RUNTIME: String =
 		|if(S_ISDIR(mode)){return BLORP_FS_ENTRY_DIRECTORY;}
 		|if(S_ISLNK(mode)){return BLORP_FS_ENTRY_SYMLINK;}
 		|return BLORP_FS_ENTRY_OTHER;
+		|}
+		|/* A NUL-terminated copy of `length` bytes. Only some operations call this and the
+		| * next helper, so both have external linkage. */
+		|char *blorp_fs_copy_path(const char *bytes,size_t length){
+		|char *copy=blorp_memory_allocate(length+1);
+		|if(copy==NULL){abort();}
+		|memcpy(copy,bytes,length);
+		|copy[length]='\0';
+		|return copy;
+		|}
+		|/* `directory` and `name` joined by one '/', unless the directory already ends in one. */
+		|char *blorp_fs_join_path(const char *directory,const char *name){
+		|const size_t directory_length=strlen(directory),name_length=strlen(name);
+		|const size_t separator=directory_length>0&&directory[directory_length-1]=='/'?0:1;
+		|char *joined=blorp_memory_allocate(directory_length+separator+name_length+1);
+		|if(joined==NULL){abort();}
+		|memcpy(joined,directory,directory_length);
+		|if(separator==1){joined[directory_length]='/';}
+		|memcpy(joined+directory_length+separator,name,name_length+1);
+		|return joined;
 		|}
 		|
 
@@ -174,24 +194,6 @@ FS_WRITE_TEXT_RUNTIME: String =
 		| * allocated. `replaces` is set when the file exists; `status` then holds the owner
 		| * and mode the new file takes. */
 		|struct blorp_fs_write_target{char *directory;char *path;uint8_t replaces;struct stat status;};
-		|static char *blorp_fs_copy_path(const char *bytes,size_t length){
-		|char *copy=blorp_memory_allocate(length+1);
-		|if(copy==NULL){abort();}
-		|memcpy(copy,bytes,length);
-		|copy[length]='\0';
-		|return copy;
-		|}
-		|/* `directory` and `name` joined by one '/', unless the directory already ends in one. */
-		|static char *blorp_fs_join_path(const char *directory,const char *name){
-		|const size_t directory_length=strlen(directory),name_length=strlen(name);
-		|const size_t separator=directory_length>0&&directory[directory_length-1]=='/'?0:1;
-		|char *joined=blorp_memory_allocate(directory_length+separator+name_length+1);
-		|if(joined==NULL){abort();}
-		|memcpy(joined,directory,directory_length);
-		|if(separator==1){joined[directory_length]='/';}
-		|memcpy(joined+directory_length+separator,name,name_length+1);
-		|return joined;
-		|}
 		|/* Where a path's last component starts: just after its last '/', or at 0. */
 		|static size_t blorp_fs_base_start(const char *path,size_t length){
 		|while(length>0&&path[length-1]!='/'){length--;}
@@ -630,5 +632,272 @@ FS_RENAME_RUNTIME: String =
 		|if(renamed==0){return BLORP_FS_SUCCEEDED;}
 		|*error=errno==EEXIST?BLORP_FS_DIRECTORY_NOT_EMPTY:blorp_fs_errno_code(errno);
 		|return BLORP_FS_FAILED;
+		|}
+		|
+
+
+-- Removes a directory and everything in it, never through a link and never
+-- past the device it starts on. Only a real directory is a root: a file, or a
+-- link to anything, is NotADirectory (D20). A final `.` or `..`, which rmdir
+-- could never remove as named, is refused before any system call (D21). A
+-- mount point, inside the tree or as the root, is CrossesDevices, and a
+-- directory moved elsewhere while the walk is inside it is ChangedDuringRemoval
+-- (D22). The first failure stops the walk, and what it removed stays removed.
+-- A bind mount of the same file system has the same device, so it is entered.
+FS_REMOVE_DIRECTORY_TREE_RUNTIME: String =
+	raw
+		|#include <dirent.h>
+		|enum {BLORP_FS_TREE_INITIAL_CAPACITY=8};
+		|/* One directory being emptied: its names, read in full before any is removed,
+		| * because macOS readdir can skip entries during deletion, and the identity the
+		| * walk checks when it climbs back to it. */
+		|struct blorp_fs_tree_level{char **names;size_t count;size_t next;dev_t device;ino_t inode;};
+		|/* The levels from the root down to the directory being emptied. They live on the
+		| * heap, so the C stack is the same at any depth. */
+		|struct blorp_fs_tree{struct blorp_fs_tree_level *levels;size_t depth;size_t capacity;};
+		|static void blorp_fs_release_tree_level(struct blorp_fs_tree_level *level){
+		|for(size_t index=0;index<level->count;index++){blorp_memory_release(level->names[index]);}
+		|blorp_memory_release(level->names);
+		|}
+		|static void blorp_fs_push_tree_level(struct blorp_fs_tree *tree,const struct stat *status){
+		|if(tree->depth==tree->capacity){
+		|const size_t capacity=tree->capacity==0?BLORP_FS_TREE_INITIAL_CAPACITY:tree->capacity*2;
+		|struct blorp_fs_tree_level *grown=blorp_memory_resize(tree->levels,capacity*sizeof *grown);
+		|if(grown==NULL){abort();}
+		|tree->levels=grown;
+		|tree->capacity=capacity;
+		|}
+		|tree->levels[tree->depth++]=(struct blorp_fs_tree_level){.names=NULL,.count=0,.next=0,.device=status->st_dev,.inode=status->st_ino};
+		|}
+		|/* Every name in the open directory but `.` and `..`, as bytes, so a name that is
+		| * not UTF-8 is still removed. The stream reads a copy of the descriptor, which is
+		| * never inherited and which closedir alone closes. readdir's NULL is a failure
+		| * only when errno is set, so errno is cleared before each call. */
+		|static int64_t blorp_fs_read_tree_level(int descriptor,struct blorp_fs_tree_level *level){
+		|int copy;
+		|BLORP_FS_RETRY(copy,fcntl(descriptor,F_DUPFD_CLOEXEC,0));
+		|if(copy<0){return blorp_fs_errno_code(errno);}
+		|DIR *stream=fdopendir(copy);
+		|if(stream==NULL){
+		|const int saved=errno;
+		|(void)close(copy);
+		|return blorp_fs_errno_code(saved);
+		|}
+		|int64_t failure=0;
+		|size_t capacity=0;
+		|for(;;){
+		|struct dirent *entry;
+		|do{errno=0;entry=readdir(stream);}while(entry==NULL&&errno==EINTR);
+		|if(entry==NULL){
+		|if(errno!=0){failure=blorp_fs_errno_code(errno);}
+		|break;
+		|}
+		|const char *name=entry->d_name;
+		|if(strcmp(name,".")==0||strcmp(name,"..")==0){continue;}
+		|if(level->count==capacity){
+		|capacity=capacity==0?BLORP_FS_TREE_INITIAL_CAPACITY:capacity*2;
+		|char **grown=blorp_memory_resize(level->names,capacity*sizeof *grown);
+		|if(grown==NULL){abort();}
+		|level->names=grown;
+		|}
+		|level->names[level->count++]=blorp_fs_copy_path(name,strlen(name));
+		|}
+		|(void)closedir(stream);
+		|return failure;
+		|}
+		|/* Removes a directory the walk has emptied, by its name in the open parent. One
+		| * already gone is no failure, and POSIX lets one that is not empty give EEXIST. */
+		|static int64_t blorp_fs_remove_emptied(int parent,const char *name){
+		|int removed;
+		|BLORP_FS_RETRY(removed,unlinkat(parent,name,AT_REMOVEDIR));
+		|if(removed==0||errno==ENOENT){return 0;}
+		|return errno==EEXIST?BLORP_FS_DIRECTORY_NOT_EMPTY:blorp_fs_errno_code(errno);
+		|}
+		|/* The current directory's entry `name`, which unlinkat refused with `refused`, as it
+		| * refuses a directory. O_NOFOLLOW with O_DIRECTORY refuses a link, so the walk
+		| * never enters one; ENOTDIR means the entry is no directory, and the unlink's own
+		| * failure stands. A child on another device is a mount point. A child that can be
+		| * read but not searched (mode 0400) is read like any other, and with no names it
+		| * is removed without entering it. One that cannot be opened at all (mode 000) is
+		| * removed only if it is empty: AT_REMOVEDIR removes nothing but an empty real
+		| * directory, as a link gives ENOTDIR and a mount point EBUSY, so nothing outside
+		| * the tree is reached. One that is not empty stays PermissionDenied, since the walk
+		| * cannot see inside it. A child with names becomes the current directory, its level
+		| * pushed; every other return leaves the levels as they were. */
+		|static int64_t blorp_fs_enter_tree_child(struct blorp_fs_tree *tree,int *current,const char *name,int refused){
+		|int child;
+		|BLORP_FS_RETRY(child,openat(*current,name,O_RDONLY|O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC));
+		|int64_t failure=0;
+		|if(child<0){
+		|const int failed=errno;
+		|if(failed!=ENOENT&&failed!=EACCES){return blorp_fs_errno_code(failed==ENOTDIR?refused:failed);}
+		|if(failed==EACCES){
+		|failure=blorp_fs_remove_emptied(*current,name);
+		|if(failure==BLORP_FS_DIRECTORY_NOT_EMPTY){failure=BLORP_FS_PERMISSION_DENIED;}
+		|}
+		|}else{
+		|struct stat status;
+		|int examined;
+		|BLORP_FS_RETRY(examined,fstat(child,&status));
+		|failure=examined<0?blorp_fs_errno_code(errno):0;
+		|if(failure==0&&status.st_dev!=tree->levels[tree->depth-1].device){failure=BLORP_FS_CROSSES_DEVICES;}
+		|if(failure==0){
+		|blorp_fs_push_tree_level(tree,&status);
+		|failure=blorp_fs_read_tree_level(child,&tree->levels[tree->depth-1]);
+		|if(failure==0&&tree->levels[tree->depth-1].count>0){
+		|(void)close(*current);
+		|*current=child;
+		|return 0;
+		|}
+		|blorp_fs_release_tree_level(&tree->levels[--tree->depth]);
+		|}
+		|(void)close(child);
+		|if(failure==0){failure=blorp_fs_remove_emptied(*current,name);}
+		|}
+		|if(failure==0){tree->levels[tree->depth-1].next++;}
+		|return failure;
+		|}
+		|/* Climbs from the emptied current directory through `..`, which is followed only
+		| * while it is the directory the walk came down from: another process may have
+		| * moved the current directory, and `..` would then leave the tree. The emptied
+		| * directory is then removed by its name in its parent. */
+		|static int64_t blorp_fs_leave_tree_level(struct blorp_fs_tree *tree,int *current){
+		|int parent;
+		|BLORP_FS_RETRY(parent,openat(*current,"..",O_RDONLY|O_DIRECTORY|O_CLOEXEC));
+		|if(parent<0){return blorp_fs_errno_code(errno);}
+		|struct blorp_fs_tree_level *above=&tree->levels[tree->depth-2];
+		|struct stat status;
+		|int examined;
+		|BLORP_FS_RETRY(examined,fstat(parent,&status));
+		|int64_t failure=examined<0?blorp_fs_errno_code(errno):0;
+		|if(failure==0&&(status.st_dev!=above->device||status.st_ino!=above->inode)){failure=BLORP_FS_CHANGED_DURING_REMOVAL;}
+		|if(failure!=0){(void)close(parent);return failure;}
+		|(void)close(*current);
+		|*current=parent;
+		|blorp_fs_release_tree_level(&tree->levels[--tree->depth]);
+		|failure=blorp_fs_remove_emptied(parent,above->names[above->next]);
+		|if(failure==0){above->next++;}
+		|return failure;
+		|}
+		|/* Empties the root, whose names are read and whose descriptor is `*current`. Only
+		| * the current directory stays open between steps. unlinkat comes first for every
+		| * name, so nothing is classified and then acted on as something else: it removes
+		| * a file or a link itself, and only the refusals a directory gives (EISDIR on
+		| * Linux, EPERM on macOS or in a sticky directory, EBUSY at a macOS mount point)
+		| * lead to opening the entry. */
+		|static int64_t blorp_fs_empty_tree(struct blorp_fs_tree *tree,int *current){
+		|for(;;){
+		|struct blorp_fs_tree_level *level=&tree->levels[tree->depth-1];
+		|int64_t failure=0;
+		|if(level->next==level->count){
+		|if(tree->depth==1){return 0;}
+		|failure=blorp_fs_leave_tree_level(tree,current);
+		|}else{
+		|const char *name=level->names[level->next];
+		|int removed;
+		|BLORP_FS_RETRY(removed,unlinkat(*current,name,0));
+		|if(removed==0||errno==ENOENT){level->next++;continue;}
+		|const int refused=errno;
+		|if(refused!=EISDIR&&refused!=EPERM&&refused!=EBUSY){return blorp_fs_errno_code(refused);}
+		|failure=blorp_fs_enter_tree_child(tree,current,name,refused);
+		|}
+		|if(failure!=0){return failure;}
+		|}
+		|}
+		|/* The root's `..` must be another directory on the root's device. Otherwise the
+		| * root is a mount point, whose whole file system the walk would empty before its
+		| * rmdir failed with EBUSY, or it is `/`, whose `..` is itself. Opening `..` needs
+		| * search permission on the root, so a root that cannot be searched (mode 0400) is
+		| * PermissionDenied even when it is empty, a known gap. */
+		|static int64_t blorp_fs_enter_tree_root(int root,struct blorp_fs_tree *tree){
+		|struct stat status,parent_status;
+		|int examined;
+		|BLORP_FS_RETRY(examined,fstat(root,&status));
+		|if(examined<0){return blorp_fs_errno_code(errno);}
+		|int parent;
+		|BLORP_FS_RETRY(parent,openat(root,"..",O_RDONLY|O_DIRECTORY|O_CLOEXEC));
+		|if(parent<0){return blorp_fs_errno_code(errno);}
+		|BLORP_FS_RETRY(examined,fstat(parent,&parent_status));
+		|const int64_t failure=examined<0?blorp_fs_errno_code(errno):0;
+		|(void)close(parent);
+		|if(failure!=0){return failure;}
+		|if(parent_status.st_dev!=status.st_dev||parent_status.st_ino==status.st_ino){return BLORP_FS_CROSSES_DEVICES;}
+		|blorp_fs_push_tree_level(tree,&status);
+		|return blorp_fs_read_tree_level(root,&tree->levels[0]);
+		|}
+		|/* `root`, already stripped of trailing slashes, ends in the name `.` or `..`. */
+		|static int blorp_fs_names_dot_entry(const char *root,size_t length){
+		|size_t start=length;
+		|while(start>0&&root[start-1]!='/'){start--;}
+		|return strcmp(root+start,".")==0||strcmp(root+start,"..")==0;
+		|}
+		|/* The root is opened without following a link: with O_DIRECTORY, both platforms
+		| * refuse a link to anything with ENOTDIR. */
+		|static int64_t blorp_fs_remove_tree_root(const char *root,size_t length){
+		|if(blorp_fs_names_dot_entry(root,length)){return blorp_fs_other_os_code(EINVAL);}
+		|int current;
+		|BLORP_FS_RETRY(current,open(root,O_RDONLY|O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC));
+		|if(current<0){return blorp_fs_errno_code(errno);}
+		|struct blorp_fs_tree tree={.levels=NULL,.depth=0,.capacity=0};
+		|int64_t failure=blorp_fs_enter_tree_root(current,&tree);
+		|if(failure==0){failure=blorp_fs_empty_tree(&tree,&current);}
+		|(void)close(current);
+		|/* The levels left are the directories the walk was inside when it stopped. */
+		|for(size_t index=0;index<tree.depth;index++){blorp_fs_release_tree_level(&tree.levels[index]);}
+		|blorp_memory_release(tree.levels);
+		|if(failure!=0){return failure;}
+		|int removed;
+		|BLORP_FS_RETRY(removed,rmdir(root));
+		|if(removed==0){return 0;}
+		|return errno==EEXIST?BLORP_FS_DIRECTORY_NOT_EMPTY:blorp_fs_errno_code(errno);
+		|}
+		|/* Trailing slashes are stripped, keeping one that is the whole path, because POSIX
+		| * resolves `link/` to the link's target, which the walk would then empty. */
+		|uint8_t blorp_fs_remove_directory_tree(const struct blorp_string *path,int64_t *error){
+		|if(blorp_fs_has_nul(path)){*error=BLORP_FS_PATH_CONTAINS_NUL;return BLORP_FS_FAILED;}
+		|size_t length=(size_t)path->length;
+		|if(length==0){*error=BLORP_FS_NOT_FOUND;return BLORP_FS_FAILED;}
+		|while(length>1&&path->bytes[length-1]=='/'){length--;}
+		|char *root=blorp_fs_copy_path(path->bytes,length);
+		|const int64_t failure=blorp_fs_remove_tree_root(root,length);
+		|blorp_memory_release(root);
+		|if(failure!=0){*error=failure;return BLORP_FS_FAILED;}
+		|return BLORP_FS_SUCCEEDED;
+		|}
+		|
+
+
+-- mkdtemp makes a fresh directory directly in `parent`, exclusively, with mode
+-- 0700 and a name no other process can predict, which matters in a shared
+-- parent such as /tmp. A '/' in the prefix is refused before any system call
+-- (D21). The six replaced bytes are ASCII letters and digits, so the path is
+-- valid UTF-8. macOS replaces every trailing X, so a prefix that ends in X
+-- loses those letters there.
+FS_CREATE_TEMPORARY_DIRECTORY_RUNTIME: String =
+	raw
+		|#include <stdlib.h>
+		|/* The bytes mkdtemp replaces, then the NUL. */
+		|static const char blorp_fs_temporary_suffix[]="XXXXXX";
+		|/* mkdtemp gives up on any errno but EEXIST, so EINTR is retried here, from a fresh
+		| * template. EEXIST is OtherOs: AlreadyExists would describe the parent. */
+		|uint8_t blorp_fs_create_temporary_directory(const struct blorp_string *parent,const struct blorp_string *prefix,struct blorp_string **directory,int64_t *error){
+		|if(blorp_fs_has_nul(parent)||blorp_fs_has_nul(prefix)){*error=BLORP_FS_PATH_CONTAINS_NUL;return BLORP_FS_FAILED;}
+		|if(memchr(prefix->bytes,'/',(size_t)prefix->length)!=NULL){*error=blorp_fs_other_os_code(EINVAL);return BLORP_FS_FAILED;}
+		|if(parent->length==0){*error=BLORP_FS_NOT_FOUND;return BLORP_FS_FAILED;}
+		|char *joined=blorp_fs_join_path(parent->bytes,prefix->bytes);
+		|const size_t length=strlen(joined);
+		|char *template=blorp_memory_resize(joined,length+sizeof blorp_fs_temporary_suffix);
+		|if(template==NULL){abort();}
+		|for(;;){
+		|memcpy(template+length,blorp_fs_temporary_suffix,sizeof blorp_fs_temporary_suffix);
+		|if(mkdtemp(template)!=NULL){break;}
+		|if(errno==EINTR){continue;}
+		|*error=errno==EEXIST?blorp_fs_other_os_code(EEXIST):blorp_fs_errno_code(errno);
+		|blorp_memory_release(template);
+		|return BLORP_FS_FAILED;
+		|}
+		|*directory=blorp_string_from_bytes(template,(int64_t)(length+sizeof blorp_fs_temporary_suffix-1));
+		|blorp_memory_release(template);
+		|return BLORP_FS_SUCCEEDED;
 		|}
 		|
