@@ -5,6 +5,7 @@ import:
 	../../src/lower/lower:
 		LoweredStep(Define),
 		LoweredFunction,
+		LoweredFunctions,
 		LoweredDecisionNode(TestVariant),
 		ValueDefinition,
 		ValueId,
@@ -29,6 +30,7 @@ import:
 	./input: check, setup_diagnostic
 	./managed_union_inputs: lowered_tail_join
 	option: to_result
+	result: and_then, map_err
 	./module_input: primitive_base, parse_modules_with_base
 
 
@@ -78,9 +80,9 @@ private pure func seed_function_id(
 			})
 
 
-private pure func seed_variant(function: LoweredFunction) -> Result[VariantInstanceId, Diagnostic]:
+private pure func seed_variant(seed_function: LoweredFunction) -> Result[VariantInstanceId, Diagnostic]:
 	var variant: Option[VariantInstanceId] = None
-	match lowered_tail_join(function):
+	match lowered_tail_join(seed_function):
 		Some(matched):
 			for node in matched.selection.nodes:
 				match node:
@@ -118,13 +120,29 @@ pure func input_ids() -> Result[InputIds, Diagnostic]:
 	program = lowered_functions(lowered)
 
 	match program.functions:
-		[function, seed]:
-			second_variant ?= seed_variant(seed)
+		[main_function, seed]: input_ids_of(program, main_function, seed)
+		_:
+			Err({
+				span = {
+					source = module_source(root_module_id()),
+					start = 0,
+					end = 0
+				},
+				note = None,
+				message = "expected one seed function",
+				help = "fix the ownership test seed",
+			})
 
-			match function.steps:
-				[Define(first), Define(second), Define(third), Define(fourth), Define(fifth), Define(sixth), Define(seventh), Define(eighth), Define(ninth)]:
-					second_function ?= seed_function_id(second)
 
+-- The checker's nesting limit and the ban on `?=` inside match arms mean each arm that needs a Result binding lives in its own function.
+private pure func input_ids_of(program: LoweredFunctions, main_function: LoweredFunction, seed: LoweredFunction) -> Result[InputIds, Diagnostic]:
+	second_variant ?= seed_variant(seed)
+
+	match main_function.steps:
+		[Define(first), Define(second), Define(third), Define(fourth), Define(fifth), Define(sixth), Define(seventh), Define(eighth), Define(ninth)]:
+			match seed_function_id(second):
+				Err(error): Err(error)
+				Ok(second_function):
 					match first.value_type:
 						UnionType(id):
 							Ok({
@@ -151,17 +169,6 @@ pure func input_ids() -> Result[InputIds, Diagnostic]:
 								message = "expected union seed",
 								help = "fix the ownership test seed",
 							})
-				_:
-					Err({
-						span = {
-							source = module_source(root_module_id()),
-							start = 0,
-							end = 0
-						},
-						note = None,
-						message = "expected nine seed values",
-						help = "fix the ownership test seed",
-					})
 		_:
 			Err({
 				span = {
@@ -170,7 +177,7 @@ pure func input_ids() -> Result[InputIds, Diagnostic]:
 					end = 0
 				},
 				note = None,
-				message = "expected one seed function",
+				message = "expected nine seed values",
 				help = "fix the ownership test seed",
 			})
 
@@ -289,39 +296,40 @@ pure func record_ids() -> Result[RecordIds, Diagnostic]:
 		[main_function, pair, other]:
 			match main_function.steps:
 				[Define(first), Define(second), Define(third), Define(fourth), Define(fifth), Define(_), Define(_)]:
-					helper ?= seed_function_id(fifth)
-
-					match pair.steps:
-						[Define(_), Define(_), Define(constructed)]:
-							match other.steps:
-								[Define(_), Define(_), Define(other_constructed)]:
-									match constructed.operation:
-										ConstructRecordValue(owner, [left, right]):
-											match other_constructed.operation:
-												ConstructRecordValue(other_owner, [other_field, _]):
-													Ok({
-														first = first.id,
-														second = second.id,
-														third = third.id,
-														fourth = fourth.id,
-														fifth = fifth.id,
-														entrypoint = entry_function(program.entrypoint),
-														helper = helper,
-														record_id = owner,
-														other_record = other_owner,
-														first_field = left.field,
-														second_field = right.field,
-														other_field = other_field.field,
-														records = program.records,
-													})
+					match seed_function_id(fifth):
+						Err(error): Err(error)
+						Ok(helper):
+							match pair.steps:
+								[Define(_), Define(_), Define(constructed)]:
+									match other.steps:
+										[Define(_), Define(_), Define(other_constructed)]:
+											match constructed.operation:
+												ConstructRecordValue(owner, [left, right]):
+													match other_constructed.operation:
+														ConstructRecordValue(other_owner, [other_field, _]):
+															Ok({
+																first = first.id,
+																second = second.id,
+																third = third.id,
+																fourth = fourth.id,
+																fifth = fifth.id,
+																entrypoint = entry_function(program.entrypoint),
+																helper = helper,
+																record_id = owner,
+																other_record = other_owner,
+																first_field = left.field,
+																second_field = right.field,
+																other_field = other_field.field,
+																records = program.records,
+															})
+														_:
+															Err(record_seed_error())
 												_:
 													Err(record_seed_error())
 										_:
 											Err(record_seed_error())
 								_:
 									Err(record_seed_error())
-						_:
-							Err(record_seed_error())
 				_:
 					Err(record_seed_error())
 		_:

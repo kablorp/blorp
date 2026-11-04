@@ -168,32 +168,76 @@ private func link_fixture(c_compiler: String, prefix: String, mode: NativeMode) 
     expect(stderr, "", "C compiler stderr")
 
 
-private func run_normal(prefix: String, example: Example) -> Result[Void, String]:
+-- One native invocation. A run that shares its fixture with others has a
+-- `label` naming its capture files and error text; `directory` is where the
+-- program starts (None keeps the runner's own).
+record NativeRun {
+    label: Option[String],
+    arguments: List[String],
+    directory: Option[String],
+    status: Int,
+    stdout: String,
+    allocations: Int
+}
+
+
+-- The shell only changes directory and then replaces itself with the program.
+private CHANGE_DIRECTORY: String = "cd \"$1\" && shift && exec \"$@\""
+
+
+private pure func launch(binary: String, run: NativeRun) -> List[String]:
+    match run.directory:
+        None: [binary].concat(run.arguments)
+        Some(directory): [SHELL, "-c", CHANGE_DIRECTORY, "sh", directory, binary].concat(run.arguments)
+
+
+private pure func label_suffix(run: NativeRun) -> String:
+    match run.label:
+        None: ""
+        Some(label): "." + label
+
+
+private func run_normal(prefix: String, run: NativeRun) -> Result[Void, String]:
+    capture = prefix + label_suffix(run)
     _ ?= command(
-        ["-u", "BLORP_LEAK_CHECK", "-u", "BLORP_MEMORY_STATS", prefix + ".normal"].concat(example.arguments),
-        prefix + ".normal.run", example.status, NATIVE_TIMEOUT_MS,
+        ["-u", "BLORP_LEAK_CHECK", "-u", "BLORP_MEMORY_STATS"].concat(launch(prefix + ".normal", run)),
+        capture + ".normal.run", run.status, NATIVE_TIMEOUT_MS,
     )
-    output: String ?= read_text(prefix + ".normal.run.stdout").map_err(describe)
-    _ ?= expect(output, example.stdout, "native stdout")
-    errors: String ?= read_text(prefix + ".normal.run.stderr").map_err(describe)
-    expect(errors, "", "native stderr")
+    output: String ?= read_text(capture + ".normal.run.stdout").map_err(describe)
+    _ ?= expect(output, run.stdout, "native stdout" + label_suffix(run))
+    errors: String ?= read_text(capture + ".normal.run.stderr").map_err(describe)
+    expect(errors, "", "native stderr" + label_suffix(run))
 
 
-private func run_strict(prefix: String, example: Example) -> Result[Void, String]:
+private func run_strict(prefix: String, run: NativeRun) -> Result[Void, String]:
+    capture = prefix + label_suffix(run)
     _ ?= command(
-        ["-u", "BLORP_MEMORY_STATS", "BLORP_LEAK_CHECK=strict", prefix + ".strict"].concat(example.arguments),
-        prefix + ".strict.run", example.status, NATIVE_TIMEOUT_MS,
+        ["-u", "BLORP_MEMORY_STATS", "BLORP_LEAK_CHECK=strict"].concat(launch(prefix + ".strict", run)),
+        capture + ".strict.run", run.status, NATIVE_TIMEOUT_MS,
     )
-    strict_output: String ?= read_text(prefix + ".strict.run.stdout").map_err(describe)
-    _ ?= expect(strict_output, example.stdout, "strict native stdout")
-    accounting: String ?= read_text(prefix + ".strict.run.stderr").map_err(describe)
-    expected = ("blorp: leak check: " + example.allocations.to_string() + " allocs, ") + example.allocations.to_string() + " releases, 0 leaked, 0 bytes\n"
-    expect(accounting, expected, "strict native accounting")
+    strict_output: String ?= read_text(capture + ".strict.run.stdout").map_err(describe)
+    _ ?= expect(strict_output, run.stdout, "strict native stdout" + label_suffix(run))
+    accounting: String ?= read_text(capture + ".strict.run.stderr").map_err(describe)
+    expected = ("blorp: leak check: " + run.allocations.to_string() + " allocs, ") + run.allocations.to_string() + " releases, 0 leaked, 0 bytes\n"
+    expect(accounting, expected, "strict native accounting" + label_suffix(run))
 
 
-private func run_fixture(prefix: String, example: Example) -> Result[Void, String]:
-    _ ?= run_normal(prefix, example)
-    run_strict(prefix, example)
+private func run_fixture(prefix: String, run: NativeRun) -> Result[Void, String]:
+    _ ?= run_normal(prefix, run)
+    run_strict(prefix, run)
+
+
+private pure func example_run(example: Example) -> NativeRun:
+    { label = None, arguments = example.arguments, directory = None, status = example.status, stdout = example.stdout, allocations = example.allocations }
+
+
+private func run_all(prefix: String, runs: List[NativeRun]) -> Result[Void, String]:
+    var outcome: Result[Void, String] = Ok(void)
+    for run in runs:
+        match outcome:
+            Ok(_): outcome = run_fixture(prefix, run)
+            Err(_): void
+    outcome
 
 
 private func verify_example(compiler: String, c_compiler: String, work_directory: String, example: Example) -> Result[Void, String]:
@@ -201,7 +245,7 @@ private func verify_example(compiler: String, c_compiler: String, work_directory
     _ ?= compile_fixture(compiler, [example.source], prefix)
     _ ?= link_fixture(c_compiler, prefix, NormalNative)
     _ ?= link_fixture(c_compiler, prefix, StrictNative)
-    run_fixture(prefix, example)
+    run_fixture(prefix, example_run(example))
 
 
 -- One `--test-suite` program: `example.source` is the first root, which owns
@@ -211,7 +255,16 @@ private func verify_suites(compiler: String, c_compiler: String, work_directory:
     _ ?= compile_fixture(compiler, ["--test-suite", example.source].concat(grouped), prefix)
     _ ?= link_fixture(c_compiler, prefix, NormalNative)
     _ ?= link_fixture(c_compiler, prefix, StrictNative)
-    run_fixture(prefix, example)
+    run_fixture(prefix, example_run(example))
+
+
+-- Compiles `source` once and runs it as every entry of `runs`, in order.
+func verify_runs(compiler: String, c_compiler: String, work_directory: String, name: String, source: String, runs: List[NativeRun]) -> Result[Void, String]:
+    prefix = work_directory + "/" + name
+    _ ?= compile_fixture(compiler, [source], prefix)
+    _ ?= link_fixture(c_compiler, prefix, NormalNative)
+    _ ?= link_fixture(c_compiler, prefix, StrictNative)
+    run_all(prefix, runs)
 
 
 private func rejected_fixture(compiler: String, work_directory: String) -> Result[Void, String]:
@@ -289,7 +342,7 @@ private RECURSIVE_AGGREGATE: String = " error: recursive aggregate types are not
 private RECURSIVE_OPAQUE: String = " error: recursive opaque representations are not supported yet\nhelp: wrap an independently recursive aggregate instead of referring back to the opaque type\n"
 
 
-private func reported(result: Result[Void, String]) -> Bool:
+func reported(result: Result[Void, String]) -> Bool:
     match result:
         Ok(_): True
         Err(error):
@@ -341,9 +394,9 @@ private func verify_fs_write(compiler: String, c_compiler: String, work_director
     _ ?= link_fixture(c_compiler, prefix, NormalNative)
     _ ?= link_fixture(c_compiler, prefix, StrictNative)
     _ ?= prepared_write_tree(directory, prefix + ".normal.prepare")
-    _ ?= run_normal(prefix, example)
+    _ ?= run_normal(prefix, example_run(example))
     _ ?= prepared_write_tree(directory, prefix + ".strict.prepare")
-    run_strict(prefix, example)
+    run_strict(prefix, example_run(example))
 
 
 func suite(compiler: String, c_compiler: String, work_directory: String) -> TestSuite:

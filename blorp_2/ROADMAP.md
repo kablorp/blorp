@@ -1363,13 +1363,12 @@ parent, and so still encode the old rule. They cannot compile under Blorp 2;
 when ported, each expects the owner to enter its join instead, so their
 failures are not regressions: `test_emit/test_owned_prefix.brp:70`, `:118`
 and `:190`; `test_own/test_source_loop_control.brp:184`;
-`test_own/test_generic_list_phases.brp:458`; `test_own/test_write_file.brp:44`
-and `:63`; `test_own/test_managed_union.brp:314`;
+`test_own/test_generic_list_phases.brp:458`;
+`test_own/test_managed_union.brp:314`;
 `test_own/test_string_from_codepoint.brp:17`; `test_own/test_join.brp:146`
-and `:413`; `test_own/test_file_read.brp:36`;
-`test_own/test_selection_inputs.brp:274`; `test_own/test_list_join.brp:58`;
-`test_own/test_string_slice.brp:71`; and
-`test_own/test_current_directory.brp:35`. The deferred verify cases in
+and `:413`; `test_own/test_selection_inputs.brp:274`; `test_own/test_list_join.brp:58`;
+and `test_own/test_string_slice.brp:71`. The current-directory ownership
+suite is ported and now expects the owner to enter its join. The deferred verify cases in
 `test_join.brp`, `test_carried_join.brp` and `test_string_concat.brp` were
 restated for the new contract by reasoning, and are equally unverified. Raw samples, commands and logs are
 local, under ignored `build/l2b2/` in the implementing worktree.

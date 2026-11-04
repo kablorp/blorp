@@ -118,7 +118,21 @@ TARGET_COMPONENT_SOURCES := \
 	blorp_2/test/unit/test_emit/test_function_labels.brp \
 	blorp_2/test/unit/test_parse/test_grouped_suites.brp \
 	blorp_2/test/unit/test_load/test_grouped_suites.brp \
-	blorp_2/test/unit/test_check/test_grouped_suites.brp
+	blorp_2/test/unit/test_check/test_grouped_suites.brp \
+	blorp_2/test/unit/test_check/test_current_directory.brp \
+	blorp_2/test/unit/test_emit/test_builtin_functions.brp \
+	blorp_2/test/unit/test_emit/test_current_directory.brp \
+	blorp_2/test/unit/test_lower/test_fs_write.brp \
+	blorp_2/test/unit/test_lower/test_result_contracts.brp \
+	blorp_2/test/unit/test_own/test_current_directory.brp \
+	blorp_2/test/unit/test_own/test_fs_write.brp \
+	blorp_2/test/unit/test_specialize/test_current_directory.brp \
+	blorp_2/test/unit/test_specialize/test_fs_write.brp \
+	blorp_2/test/unit/test_verify/test_fs_write.brp \
+	blorp_2/test/unit/test_verify/test_result_ownership.brp \
+	blorp_2/test/unit/test_runtime/test_system.brp \
+	blorp_2/test/unit/test_parse/test_string_literals_syntax.brp \
+	blorp_2/test/test_grammar/test_conformance.brp
 
 .PHONY: compiler generate-compiler link-compiler example test test-components test-target-components test-compiler link-test-compiler test-e2e
 

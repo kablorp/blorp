@@ -977,6 +977,18 @@ emitted C links into separate normal and strict-memory executables with C11,
 compiler calls require positive balanced strict accounting. The rejected call
 checks the complete diagnostic and help text with accounting disabled.
 
+The driver also runs the current-directory native checks: a C-fixture runtime
+suite (`test/runtime/system_suite.brp`) and the fixture mains, run from two
+working directories under strict accounting (`test/e2e/self_hosted_system.brp`).
+The e2e runs compare the program's output with `pwd -P`, not with the call under
+test. The matching contract, lowering, specialization, ownership, verification
+and emission suites, and the `fs.write_text` lowering, specialization,
+ownership and verification suites, are ordinary `TARGET_COMPONENT_SOURCES`.
+Rejection of invalid UTF-8 in String literals has no test: no library
+boundary builds a String from invalid bytes (`fs.read_text` rejects them and
+`string.slice` refuses to cut inside a scalar), so the lexer's check can no
+longer be reached and is a candidate for removal.
+
 The same driver runs the process-runtime lifecycle tests. Make resolves
 `BLORP2_COMPILER` and `BLORP_CC` to explicit executable paths, supplies a private
 temporary directory and removes it on completion. All test assertions are Blorp
