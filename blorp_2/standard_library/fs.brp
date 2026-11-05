@@ -1,13 +1,17 @@
 -- The filesystem library. A native reports a failure as an Int code, and the
 -- pure functions here decode it into an IOError that names the caller's path.
 import:
-    _base: Int, String, Void, Bool(True, False), Option(Some, None), Result(Ok, Err)
+    _base: Int, String, Void, List, Bool(True, False), Option(Some, None), Result(Ok, Err)
     int: Int methods
+    string: String methods
+    list: List methods
+    option: Option methods
+    result: Result methods
 
 -- What went wrong. Every kind but OtherOs is a fact about the world that a
 -- caller can act on; OtherOs keeps the operating system's own number, which
 -- differs between macOS and Linux.
-union IOErrorKind:
+fixed union IOErrorKind:
     NotFound
     PermissionDenied
     AlreadyExists
@@ -20,19 +24,25 @@ union IOErrorKind:
     NoSpace
     -- EFBIG and EOVERFLOW, or contents beyond the String capacity.
     FileTooLarge
-    -- EXDEV from rename; the caller can fall back to copying.
+    -- EXDEV from rename, so the caller can fall back to copying, and a mount
+    -- point or another device met by remove_directory_tree.
     CrossesDevices
     -- Found before any operating system call.
     PathContainsNul
     -- Found after reading bytes.
     InvalidUtf8
+    -- Another process moved a directory while remove_directory_tree walked it.
+    ChangedDuringRemoval
     -- Any other errno, such as ELOOP, ENAMETOOLONG or EMFILE.
     OtherOs(Int)
 
 -- `path` is always the path the caller passed, even when the operating system
 -- refused a parent directory, so "x: permission denied" does not say whether x
--- or one of its parents refused. `destination` is the second path of a
--- two-path operation, and is None for every operation that has one path.
+-- or one of its parents refused. The one exception is with_temporary_directory
+-- failing to remove its directory, which names that directory: the body was
+-- given the path, and nothing else says what was left behind. `destination` is
+-- the second path of a two-path operation, and is None for every operation that
+-- has one path.
 record IOError {
     path: String,
     destination: Option[String],
@@ -45,6 +55,13 @@ fixed union EntryKind:
     Directory
     Symlink
     Other
+
+-- One entry of a directory: its name, and its own kind, so a link is Symlink
+-- whatever it points at.
+record Entry {
+    name: String,
+    kind: EntryKind
+}
 
 -- Codes from src/runtime/fs.brp's FS_HELPERS_RUNTIME enum. A named kind has a
 -- positive code; any other errno arrives negated, so OtherOs keeps the
@@ -63,6 +80,10 @@ private FILE_TOO_LARGE_CODE: Int = 10
 private CROSSES_DEVICES_CODE: Int = 11
 private PATH_CONTAINS_NUL_CODE: Int = 12
 private INVALID_UTF8_CODE: Int = 13
+-- Nothing deterministic produces this code: it needs another process to move a
+-- directory during a walk. The C test of remove_directory_tree proves the
+-- runtime sends it; that this file decodes it is checked by review alone.
+private CHANGED_DURING_REMOVAL_CODE: Int = 14
 
 -- The entry codes of FS_HELPERS_RUNTIME's second enum.
 private ABSENT_ENTRY_CODE: Int = 0
@@ -97,6 +118,8 @@ private pure func decode_error(code: Int) -> IOErrorKind:
         PathContainsNul
     else if code == INVALID_UTF8_CODE:
         InvalidUtf8
+    else if code == CHANGED_DURING_REMOVAL_CODE:
+        ChangedDuringRemoval
     else:
         -- A positive code that no constant names is a disagreement between the
         -- two tables. It stays visible as a negative OtherOs number, which no
@@ -122,6 +145,26 @@ private pure func at_path[T](result: Result[T, Int], path: String) -> Result[T, 
         Ok(value): Ok(value)
         Err(code): Err({ path = path, destination = None, kind = code.decode_error() })
 
+-- A two-path operation reports both paths the caller passed.
+private pure func between_paths[T](result: Result[T, Int], source: String, destination: String) -> Result[T, IOError]:
+    match result:
+        Ok(value): Ok(value)
+        Err(code): Err({ path = source, destination = Some(destination), kind = code.decode_error() })
+
+-- Each listing element is one entry code byte followed by the name (D17). A
+-- mismatch between the two sides stays visible: an unknown code is Other, and
+-- an element with no byte at all becomes an entry named by the whole element,
+-- of kind Other. ABSENT_ENTRY_CODE is never sent for an entry, so it too reads
+-- as Other. Every code is below 0x80, so the name starts on a character
+-- boundary; the slice fallback only keeps a malformed element visible.
+private ENTRY_CODE_BYTES: Int = 1
+
+private pure func decoded_entry(element: String) -> Entry:
+    match element.byte_at(0):
+        Some(code):
+            { name = element.slice(ENTRY_CODE_BYTES, element.length()).get_or(element), kind = code.decode_entry_kind().get_or(Other) }
+        None: { name = element, kind = Other }
+
 private func native_read_text(path: String) -> Result[String, Int]:
     builtin("fs.read_text")
 
@@ -130,6 +173,30 @@ private func native_write_text(path: String, text: String) -> Result[Void, Int]:
 
 private func native_entry_kind(path: String) -> Result[Int, Int]:
     builtin("fs.entry_kind")
+
+private func native_list_directory(path: String) -> Result[List[String], Int]:
+    builtin("fs.list_directory")
+
+private func native_create_directory(path: String) -> Result[Void, Int]:
+    builtin("fs.create_directory")
+
+private func native_create_directories(path: String) -> Result[Void, Int]:
+    builtin("fs.create_directories")
+
+private func native_remove_file(path: String) -> Result[Void, Int]:
+    builtin("fs.remove_file")
+
+private func native_remove_directory(path: String) -> Result[Void, Int]:
+    builtin("fs.remove_directory")
+
+private func native_remove_directory_tree(path: String) -> Result[Void, Int]:
+    builtin("fs.remove_directory_tree")
+
+private func native_rename(source: String, destination: String) -> Result[Void, Int]:
+    builtin("fs.rename")
+
+private func native_create_temporary_directory(parent: String, prefix: String) -> Result[String, Int]:
+    builtin("fs.create_temporary_directory")
 
 private pure func phrase(kind: IOErrorKind) -> String:
     match kind:
@@ -146,6 +213,7 @@ private pure func phrase(kind: IOErrorKind) -> String:
         CrossesDevices: "crosses devices"
         PathContainsNul: "path contains a NUL byte"
         InvalidUtf8: "contents are not valid UTF-8"
+        ChangedDuringRemoval: "changed during removal"
         OtherOs(number): "operating system error ${number.to_string()}"
 
 -- "settings.conf: no such file"; "a -> b: crosses devices". The text is fixed
@@ -198,3 +266,99 @@ func write_text(path: String, text: String) -> Result[Void, IOError]:
 func entry_kind(path: String) -> Result[Option[EntryKind], IOError]:
     code ?= path.native_entry_kind().at_path(path)
     Ok(code.decode_entry_kind())
+
+-- Lists a directory, sorted by name bytes, so the order does not depend on the
+-- file system. `.` and `..` are omitted. A link given as the path is followed
+-- and its target is listed, while each entry's kind is its own: a link in the
+-- listing is Symlink, not followed. A name that is not valid UTF-8 fails the
+-- whole listing with InvalidUtf8, since a String cannot hold it (D8). An entry
+-- removed while the directory is read is left out. ELOOP, ENAMETOOLONG and
+-- EMFILE are OtherOs.
+func list_directory(path: String) -> Result[List[Entry], IOError]:
+    elements ?= path.native_list_directory().at_path(path)
+    Ok(elements.map(decoded_entry))
+
+-- Creates one directory whose parent exists. A path that already exists, of any
+-- kind, is AlreadyExists; a missing parent is NotFound. A trailing slash is
+-- accepted: `missing/` creates `missing`. `file/` for an existing file is
+-- NotADirectory on macOS and AlreadyExists on Linux. ELOOP and ENAMETOOLONG are
+-- OtherOs.
+func create_directory(path: String) -> Result[Void, IOError]:
+    path.native_create_directory().at_path(path)
+
+-- Creates each missing directory along the path. It succeeds when the path is
+-- already a directory, or a link to one, and `/` succeeds. The empty path is
+-- NotFound. A file where a directory is needed is NotADirectory; a file, or a
+-- dangling link, at the end is AlreadyExists. Another process creating a
+-- component first is no failure. Every failure is reported against the path
+-- the caller passed, not the component that failed (D14).
+func create_directories(path: String) -> Result[Void, IOError]:
+    path.native_create_directories().at_path(path)
+
+-- Removes a file or a link, never what the link names. A directory is
+-- IsADirectory on both platforms. EBUSY is OtherOs.
+func remove_file(path: String) -> Result[Void, IOError]:
+    path.native_remove_file().at_path(path)
+
+-- Removes an empty directory. One with entries is DirectoryNotEmpty, whether
+-- the operating system says EEXIST or ENOTEMPTY. EINVAL (the path `.`) and EBUSY
+-- are OtherOs.
+func remove_directory(path: String) -> Result[Void, IOError]:
+    path.native_remove_directory().at_path(path)
+
+-- Removes a directory and everything in it, never through a link and never
+-- past the device it starts on.
+--
+-- * Only a real directory is a root: a file or a link, even to a directory, is
+--   NotADirectory, and trailing slashes are stripped first (D20).
+-- * A final `.` or `..` is OtherOs, refused before any system call (D21).
+-- * A missing path is NotFound, although Go returns success (D9).
+-- * A mount point inside the tree, a root that is a mount point, and `/` are
+--   all CrossesDevices (D22). A bind mount of the same file system has the
+--   same device, so it is entered and emptied, as `rm -rf` does.
+-- * ChangedDuringRemoval means another process moved a directory while the walk
+--   was inside it.
+-- * The first failure stops the walk, and what it removed stays removed.
+-- * An empty root that cannot be searched (mode 0400) is PermissionDenied,
+--   because the mount-point check opens the root's `..`, where `rm -rf`
+--   succeeds. A child that cannot be opened (mode 000) is removed only when it
+--   is empty, and is otherwise PermissionDenied, since the walk cannot see
+--   inside it.
+func remove_directory_tree(path: String) -> Result[Void, IOError]:
+    path.native_remove_directory_tree().at_path(path)
+
+-- Renames a file or directory. It replaces an existing file, or an empty
+-- directory, at the destination; a destination directory with entries is
+-- DirectoryNotEmpty. Both paths are in the error. A different device is
+-- CrossesDevices. EINVAL (a directory moved into itself), EBUSY, ELOOP and
+-- ENAMETOOLONG are OtherOs.
+func rename(source: String, destination: String) -> Result[Void, IOError]:
+    source.native_rename(destination).between_paths(source, destination)
+
+-- Makes a fresh, empty directory directly in `parent` (mode 0700, a name no
+-- other process can predict), runs `body` with its path, and removes the
+-- directory and everything in it before returning. `prefix` starts the name; a
+-- `/` in it is OtherOs, and macOS replaces every trailing `X` of a prefix.
+-- `io_error` turns this library's own failures into the body's error type E;
+-- a program that keeps IOError passes `pure func(error: IOError) -> IOError: error`.
+--
+-- The result, in order of priority: the body's Err; otherwise the removal's
+-- Err; otherwise the body's Ok. So a body Err hides a failed removal: the
+-- directory may be left behind with nothing said. A failure to create the
+-- directory names `parent`. A failure to remove it names the directory itself,
+-- the one exception to the rule that an IOError carries the caller's path
+-- (D34), because the body was given that path and nothing else says what was
+-- left behind. A body that removes its own directory makes the removal NotFound.
+--
+-- Removal runs on every path the program controls, since Blorp has no return or
+-- exception that could skip it. A signal, `abort()` or a stack overflow can
+-- still leave the directory.
+func with_temporary_directory[T, E](
+    parent: String, prefix: String, body: (String) -> Result[T, E], io_error: pure (IOError) -> E,
+) -> Result[T, E]:
+    directory ?= parent.native_create_temporary_directory(prefix).at_path(parent).map_err(io_error)
+    outcome = body(directory)
+    removed = directory.remove_directory_tree()
+    value ?= outcome
+    _ ?= removed.map_err(io_error)
+    Ok(value)

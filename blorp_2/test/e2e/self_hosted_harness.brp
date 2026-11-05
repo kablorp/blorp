@@ -19,8 +19,9 @@ private NATIVE_TIMEOUT_MS: Int = 10000
 private PRESERVED_OUTPUT: String = "preserve this rejected output"
 private FS_PREPARE_SCRIPT: String = "blorp_2/test/e2e/fixtures/fs/prepare.sh"
 private FS_WRITE_PREPARE_SCRIPT: String = "blorp_2/test/e2e/fixtures/fs/prepare_write.sh"
+private FS_DIRECTORIES_PREPARE_SCRIPT: String = "blorp_2/test/e2e/fixtures/fs/prepare_directories.sh"
 -- prepare.sh's exit status when it runs as root, which file permissions do
--- not refuse, so neither fs example could provoke PermissionDenied.
+-- not refuse, so no fs example could provoke PermissionDenied.
 private FS_NOT_RUN_STATUS: Int = 77
 private FS_READ_OUTPUT: String =
     |read_text settings.conf: ok 6 bytes
@@ -62,6 +63,7 @@ private FS_READ_OUTPUT: String =
     |settings.conf: crosses devices
     |settings.conf: path contains a NUL byte
     |settings.conf: contents are not valid UTF-8
+    |settings.conf: changed during removal
     |settings.conf: operating system error 40
     |a -> b: crosses devices
     |
@@ -87,6 +89,82 @@ private FS_WRITE_OUTPUT: String =
     |write_text missing/child.txt: missing/child.txt: no such file
     |write_text loop: OtherOs
     |write_text nul: nul: path contains a NUL byte
+    |
+
+
+-- The directory operations' kinds, in the order directories.brp provokes them.
+private FS_DIRECTORIES_OUTPUT: String =
+    |list_directory listing: 7 entries
+    |  B file
+    |  _ file
+    |  a file
+    |  ab file
+    |  dir directory
+    |  link symlink
+    |  e-acute file
+    |list_directory listing_link: 7 entries
+    |  B file
+    |  _ file
+    |  a file
+    |  ab file
+    |  dir directory
+    |  link symlink
+    |  e-acute file
+    |list_directory empty: 0 entries
+    |list_directory missing: missing: no such file
+    |list_directory file.txt: file.txt: not a directory
+    |list_directory locked: locked: permission denied
+    |remove_directory locked: ok
+    |create_directory fresh: ok
+    |create_directory fresh: fresh: already exists
+    |create_directory absent/child: absent/child: no such file
+    |create_directory slashed/: ok
+    |  slashed is directory
+    |create_directories deep/a/b/c: ok
+    |create_directories deep/a/b/c: ok
+    |  deep/a/b/c is directory
+    |create_directories file.txt/x/y: file.txt/x/y: not a directory
+    |create_directories file.txt: file.txt: already exists
+    |create_directories dangling: dangling: already exists
+    |remove_file to_remove.txt: ok
+    |remove_file to_remove.txt: to_remove.txt: no such file
+    |remove_file listing/dir: listing/dir: is a directory
+    |remove_directory removable: ok
+    |remove_directory nonempty: nonempty: directory not empty
+    |remove_directory removable: removable: no such file
+    |remove_directory file.txt: file.txt: not a directory
+    |rename old.txt -> new.txt: ok
+    |  old.txt is absent
+    |  new.txt holds "moved"
+    |rename old.txt -> again.txt: old.txt -> again.txt: no such file
+    |rename source_dir -> nonempty: source_dir -> nonempty: directory not empty
+    |remove_directory_tree tree: ok
+    |  tree is absent
+    |  outside is directory
+    |  outside/precious.txt holds "precious"
+    |remove_directory_tree tree: tree: no such file
+    |remove_directory_tree file.txt: file.txt: not a directory
+    |remove_directory_tree listing_link: listing_link: not a directory
+    |remove_directory_tree listing_link/: listing_link/: not a directory
+    |remove_directory_tree listing/.: OtherOs
+    |list_directory listing: 7 entries
+    |  B file
+    |  _ file
+    |  a file
+    |  ab file
+    |  dir directory
+    |  link symlink
+    |  e-acute file
+    |with_temporary_directory ok: 7
+    |  scratch holds 0 entries
+    |with_temporary_directory text error: body failed
+    |  scratch holds 0 entries
+    |with_temporary_directory removed by body: directory: no such file
+    |  path is the directory the body was given
+    |  scratch holds 0 entries
+    |with_temporary_directory body error: body: permission denied
+    |  scratch holds 0 entries
+    |with_temporary_directory missing parent: missing: no such file
     |
 
 
@@ -370,17 +448,20 @@ func reported(result: Result[Void, String]) -> Bool:
             False
 
 
--- The fs examples read and write trees that the prepare scripts build,
+-- The fs examples read, write and change trees that the prepare scripts build,
 -- because no fs operation can create a file that is not UTF-8, a symlink, a
--- read-only file or a FIFO. Where prepare.sh cannot build its tree, as root,
--- both examples are reported as not run and left out, so that they earn no
--- PASS credit: each needs a user that file permissions refuse.
+-- read-only file, a mode 000 directory or a FIFO. Where prepare.sh cannot build
+-- its tree, as root, all three examples are reported as not run and left out,
+-- so that they earn no PASS credit: each needs a user that file permissions
+-- refuse.
 private func fs_tree_tests(compiler: String, c_compiler: String, work_directory: String) -> List[(String, () -> Bool)]:
     tree = work_directory + "/fs_tree"
     write_tree = work_directory + "/fs_write_tree"
+    directories_tree = work_directory + "/fs_directories_tree"
     prefix = work_directory + "/fs_prepare"
-    read: Example = { name = "fs_read", source = "blorp_2/test/e2e/fixtures/fs/read.brp", status = 0, stdout = FS_READ_OUTPUT, allocations = 256, arguments = [tree] }
+    read: Example = { name = "fs_read", source = "blorp_2/test/e2e/fixtures/fs/read.brp", status = 0, stdout = FS_READ_OUTPUT, allocations = 260, arguments = [tree] }
     write: Example = { name = "fs_write", source = "blorp_2/test/e2e/fixtures/fs/write.brp", status = 0, stdout = FS_WRITE_OUTPUT, allocations = 168, arguments = [write_tree] }
+    directories: Example = { name = "fs_directories", source = "blorp_2/test/e2e/fixtures/fs/directories.brp", status = 0, stdout = FS_DIRECTORIES_OUTPUT, allocations = 574, arguments = [directories_tree] }
     match run_to_files(SHELL, [FS_PREPARE_SCRIPT, tree], prefix + ".stdout", prefix + ".stderr", NATIVE_TIMEOUT_MS):
         Err(error): [("the fs example tree is prepared", func(): reported(Err(error)))]
         Ok(status):
@@ -390,32 +471,34 @@ private func fs_tree_tests(compiler: String, c_compiler: String, work_directory:
             else if status.equals(0):
                 [
                     ("fs read_text and entry_kind return each kind, and describe words each one", func(): reported(verify_example(compiler, c_compiler, work_directory, read))),
-                    ("fs write_text replaces, creates and writes through a link, and returns each kind it can", func(): reported(verify_fs_write(compiler, c_compiler, work_directory, write, write_tree))),
+                    ("fs write_text replaces, creates and writes through a link, and returns each kind it can", func(): reported(verify_on_rebuilt_tree(compiler, c_compiler, work_directory, write, write_tree, FS_WRITE_PREPARE_SCRIPT))),
+                    ("fs directory operations list, create, remove and rename, and return each kind they can", func(): reported(verify_on_rebuilt_tree(compiler, c_compiler, work_directory, directories, directories_tree, FS_DIRECTORIES_PREPARE_SCRIPT))),
                 ]
             else:
                 [("the fs example tree is prepared", func(): reported(Err(FS_PREPARE_SCRIPT + " exited " + status.to_string())))]
 
 
--- Rebuilds the directory the write example is given, from nothing.
-private func prepared_write_tree(directory: String, prefix: String) -> Result[Void, String]:
-    status ?= run_to_files(SHELL, [FS_WRITE_PREPARE_SCRIPT, directory], prefix + ".stdout", prefix + ".stderr", NATIVE_TIMEOUT_MS)
+-- Rebuilds the directory an example that changes it is given, from nothing.
+private func rebuilt_tree(script: String, directory: String, prefix: String) -> Result[Void, String]:
+    status ?= run_to_files(SHELL, [script, directory], prefix + ".stdout", prefix + ".stderr", NATIVE_TIMEOUT_MS)
     if status.equals(0):
         Ok(void)
     else:
-        Err(FS_WRITE_PREPARE_SCRIPT + " exited " + status.to_string())
+        Err(script + " exited " + status.to_string())
 
 
--- The write example changes the directory it is given, so each of its two
--- runs gets the directory, which is also its argument, just rebuilt by
--- prepare_write.sh, and neither run sees the other's files.
-private func verify_fs_write(compiler: String, c_compiler: String, work_directory: String, example: Example, directory: String) -> Result[Void, String]:
+-- The write and directories examples change the directory they are given, so
+-- each of their two runs gets the directory, which is also the example's
+-- argument, just rebuilt by its prepare script, and neither run sees the
+-- other's changes.
+private func verify_on_rebuilt_tree(compiler: String, c_compiler: String, work_directory: String, example: Example, directory: String, script: String) -> Result[Void, String]:
     prefix = work_directory + "/" + example.name
     _ ?= compile_fixture(compiler, [example.source], prefix)
     _ ?= link_fixture(c_compiler, prefix, NormalNative)
     _ ?= link_fixture(c_compiler, prefix, StrictNative)
-    _ ?= prepared_write_tree(directory, prefix + ".normal.prepare")
+    _ ?= rebuilt_tree(script, directory, prefix + ".normal.prepare")
     _ ?= run_normal(prefix, example_run(example))
-    _ ?= prepared_write_tree(directory, prefix + ".strict.prepare")
+    _ ?= rebuilt_tree(script, directory, prefix + ".strict.prepare")
     run_strict(prefix, example_run(example))
 
 

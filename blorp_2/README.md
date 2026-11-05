@@ -2993,9 +2993,13 @@ acceptance remain pending.
 
 ## The fs library
 
-`fs` is an explicit import with typed errors, built on three builtin labels,
-`fs.read_text`, `fs.write_text` and `fs.entry_kind`. Each returns an Int code
-that `fs.brp` decodes, so the compiler knows no `fs` type.
+`fs` is an explicit import with typed errors, built on these builtin labels:
+`fs.read_text`, `fs.write_text`, `fs.entry_kind`, `fs.list_directory`,
+`fs.create_directory`, `fs.create_directories`, `fs.remove_file`,
+`fs.remove_directory`, `fs.remove_directory_tree`, `fs.rename` and
+`fs.create_temporary_directory`. Each fails with an Int code and succeeds with
+Void, an Int code, a list or a String, which `fs.brp` decodes, so the compiler
+knows no `fs` type.
 
 ```blorp
 import:
@@ -3044,25 +3048,73 @@ func load_settings(path: String) -> Result[String, IOError]:
 - `entry_kind(path) -> Result[Option[EntryKind], IOError]` uses `lstat`, so a
   link is never followed. A missing path, or a file used as a directory, is
   `Ok(None)`; there is no `exists` that returns a Bool.
+- `list_directory(path) -> Result[List[Entry], IOError]` lists a directory,
+  sorted by name bytes, with `.` and `..` omitted. An `Entry` is a `name` and
+  its own `EntryKind`, so a link in the listing is `Symlink`; a link given as
+  the path is followed. A name that is not UTF-8 makes the whole listing
+  `InvalidUtf8`, and an entry removed while the directory is read is left out.
+- `create_directory(path)` makes one directory (`missing/` creates `missing`;
+  `file/` is `NotADirectory` on macOS and `AlreadyExists` on Linux), and
+  `create_directories(path)` makes each missing component. The latter succeeds
+  on an existing directory or `/`, and fails with `NotFound` for the empty
+  path, `NotADirectory` for a file in the middle and `AlreadyExists` for a file
+  or dangling link at the end. Every failure names the caller's path.
+- `remove_file(path)` removes a file or link, never what a link names; a
+  directory is `IsADirectory` on both platforms. `remove_directory(path)`
+  removes an empty directory; one with entries is `DirectoryNotEmpty`.
+  `rename(source, destination)` replaces a file, or an empty directory, at the
+  destination, and its error carries both paths in `path` and `destination`.
+- `remove_directory_tree(path)` removes a directory and everything in it,
+  never through a link and never past the device it starts on. Only a real
+  directory is a root: a file or a link, even to a directory, is
+  `NotADirectory`, after trailing slashes are stripped. A final `.` or `..` is
+  `OtherOs` before any system call, and a missing path is `NotFound`. A mount
+  point inside the tree, a root that is a mount point and `/` are
+  `CrossesDevices`; a bind mount of the same file system is entered and emptied,
+  as by `rm -rf`. `ChangedDuringRemoval` means another process moved a
+  directory during the walk. The first failure stops the walk and what was
+  removed stays removed. An empty root that cannot be searched (mode 0400) is
+  `PermissionDenied`, and so is a child that cannot be opened (mode 000)
+  unless it is empty.
+- `with_temporary_directory(parent, prefix, body, io_error)` makes a fresh
+  directory directly in `parent`, runs `body(directory)` and removes the
+  directory before returning. It is generic in the body's error type: `io_error`
+  turns its own `IOError` into that type (`describe` for a `String` error,
+  `pure func(error: IOError) -> IOError: error` for `IOError`; the converter must
+  be pure, so a plain `func` lambda is rejected). The result is the body's
+  `Err`, else the removal's `Err`, else the body's `Ok`, so a body error hides a
+  failed removal. A failed removal names the directory itself rather than
+  `parent`, the one exception to the rule below; a failure to create it names
+  `parent`. A signal, `abort()` or a stack overflow can still leave the
+  directory behind.
 - `IOError` holds the caller's `path`, an optional `destination` for
-  two-path operations, and an `IOErrorKind`: `NotFound`, `PermissionDenied`,
-  `AlreadyExists`, `NotADirectory`, `IsADirectory`, `DirectoryNotEmpty`,
-  `NotARegularFile`, `ReadOnlyFilesystem`, `NoSpace`, `FileTooLarge`,
-  `CrossesDevices`, `PathContainsNul`, `InvalidUtf8` and `OtherOs(Int)`, which
-  keeps the platform's errno. The path is always the one the caller passed, so
-  `x: permission denied` does not say whether `x` or a parent refused.
+  two-path operations, and an `IOErrorKind`, a fixed union: `NotFound`,
+  `PermissionDenied`, `AlreadyExists`, `NotADirectory`, `IsADirectory`,
+  `DirectoryNotEmpty`, `NotARegularFile`, `ReadOnlyFilesystem`, `NoSpace`,
+  `FileTooLarge`, `CrossesDevices`, `PathContainsNul`, `InvalidUtf8`,
+  `ChangedDuringRemoval` and `OtherOs(Int)`, which keeps the platform's errno.
+  The path is the one the caller passed, so `x: permission denied` does not say
+  whether `x` or a parent refused, except for the cleanup failure above.
 - `describe(error)` gives `"<path>: <phrase>"` with fixed text per kind, never
   `strerror` text. `default_if_not_found(result, fallback)` turns `NotFound`
   into `Ok(fallback)` and leaves every other result alone.
 
 The runtime C is tested by `test/runtime/fs_suite.brp` and the examples
-`test/e2e/fixtures/fs/read.brp` and `write.brp`. The read example reads a tree
-that `prepare.sh` builds, since no `fs` operation can create a non-UTF-8 file,
-a symlink loop, a mode-000 file or a FIFO. The write example writes into a
-directory that `prepare_write.sh` rebuilds before each of its two runs, so
-neither run sees the other's files. Run as root, `prepare.sh` exits with
-status 77 and the harness reports both examples "not run", with no PASS credit;
-the runtime suite likewise leaves out its permission case. The write probe,
+`test/e2e/fixtures/fs/read.brp`, `write.brp` and `directories.brp`. The read
+example reads a tree that `prepare.sh` builds, since no `fs` operation can
+create a non-UTF-8 file, a symlink loop, a mode-000 file or a FIFO. The write
+and directories examples change the directory they are given, so
+`prepare_write.sh` and `prepare_directories.sh` rebuild it before each of
+their two runs. The latter builds a link out of a tree to a file that must
+survive, a mode-000 directory and names whose byte order differs from a naive
+order. Run as root, `prepare.sh` exits with status 77 and the harness reports
+all three examples "not run", with no PASS credit; the runtime suite likewise
+leaves out its permission case. The directories example leaves out
+`CrossesDevices` and the mount-point rules (a second device),
+`ChangedDuringRemoval` (a race), `InvalidUtf8` in a name (APFS refuses to
+create one) and `create_directory("file/")` (the kind differs by platform);
+the runtime suite covers them, except that `fs.brp` decoding code 14 as
+`ChangedDuringRemoval` is checked by review alone. The write probe,
 `fixtures/fs_write_test.c`, renames each system call in the included runtime
 text to a recording wrapper, which can also inject a failure, so its cases
 check the order of the calls, every retry and every failure path.
