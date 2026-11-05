@@ -2,7 +2,7 @@ import:
 	../namespace/builtins: reuses_first_operand
 	result: Result methods
 	../check/model: MatchArmId, DecisionNodeId, ListLengthTest
-	bool: not, and, or
+	bool: Bool methods
 	int: Int methods
 	list: repeat, List methods
 	../lower/lower as Lower:
@@ -24,9 +24,7 @@ import:
 			ParameterValue, VoidValue, IntegerValue, FloatValue, StringValue,
 			CallValue, InvokeCallableValue, FreeCallableValue, CapturedCallableValue, ConstructValue, ConstructListValue, PayloadValue, ListElementValue, ListSuffixValue, ConstructRecordValue, ReadRecordFieldValue,
 		),
-		lowered_functions,
-		block_value_count, step_reads, step_span, step_value_count, value_span,
-		value_number,
+		block_value_count, step_reads, value_span,
 	option: Option methods
 	../utils/results: translated_list
 	../utils/source: FunctionLabel
@@ -40,10 +38,8 @@ import:
 		RecordInstanceId,
 		TypeRef,
 		VariantInstanceId, VariantFieldInstanceId,
-		function_number,
-		value_needs_ownership,
 	../utils/stack: push_at
-	../utils/syntax: Diagnostic, Entrypoint, Span, compiler_span, entry_function, internal_error, or_internal_error
+	../utils/syntax: Diagnostic, Entrypoint, Span, compiler_span, internal_error, or_internal_error
 	../utils/text: concat
 
 
@@ -325,7 +321,7 @@ private pure func in_interval(ordinal: Int, first: Int, count: Int) -> Bool:
 private pure func visible_outside(ordinal: Int, outer: List[ValueInterval]) -> Bool:
 	var visible: Bool = False
 	for interval in outer:
-		if in_interval(ordinal, interval.first, interval.count):
+		if ordinal.in_interval(interval.first, interval.count):
 			visible = True
 			break
 	visible
@@ -341,14 +337,14 @@ private pure func use_slot(
 	slot_count: Int,
 	span: Span,
 ) -> Result[Option[Int], Diagnostic]:
-	ordinal = value_number(value)
+	ordinal = value.value_number()
 
-	if visible_outside(ordinal, outer):
+	if ordinal.visible_outside(outer):
 		Ok(None)
-	else if in_interval(ordinal, first_value, introduced_count):
+	else if ordinal.in_interval(first_value, introduced_count):
 		index = ordinal - first_value
 
-		if in_interval(index, 0, slot_count):
+		if index.in_interval(0, slot_count):
 			Ok(Some(index))
 		else:
 			Err(internal_error(span, "invalid value identity in ownership use analysis"))
@@ -362,10 +358,10 @@ private pure func terminal_span(
 	result: ValueId,
 	outer: List[ValueInterval],
 ) -> Result[Span, Diagnostic]:
-	if visible_outside(value_number(result), outer):
+	if result.value_number().visible_outside(outer):
 		Ok(compiler_span())
 	else:
-		match value_span(steps, result):
+		match steps.value_span(result):
 			Some(span): Ok(span)
 			None: Err(internal_error(compiler_span(), "invalid return value in ownership use analysis"))
 
@@ -390,18 +386,18 @@ private pure func block_uses(
 	span_result: Result[Span, Diagnostic],
 ) -> Result[List[Option[Int]], Diagnostic]:
 	unused: Option[Int] = None
-	var uses = repeat(unused, seed_count + block_value_count(steps))
+	var uses = repeat(unused, seed_count + steps.block_value_count())
 	var step_position: Int = 0
 	var introduced_count: Int = seed_count
 	var failure: Option[Diagnostic] = None
 
 	for step in steps:
-		span = step_span(step)
+		span = step.step_span()
 		first = match step:
 			Define(definition): definition.id
 			Join(join): join.result.id
 			Loop(loop): loop.result.id
-		if value_number(first) != first_value + introduced_count:
+		if first.value_number() != first_value + introduced_count:
 			failure = Some(internal_error(span, "nonconsecutive value identity in ownership use analysis"))
 		else:
 			carried: List[ValueParameter] = match step:
@@ -410,7 +406,7 @@ private pure func block_uses(
 				Loop(loop): loop.carried
 			var ordinal = first_value + introduced_count + 1
 			for parameter in carried:
-				if value_number(parameter.id) != ordinal:
+				if parameter.id.value_number() != ordinal:
 					failure = Some(internal_error(parameter.span, "nonconsecutive value identity in ownership use analysis"))
 					break
 				ordinal = ordinal + 1
@@ -419,9 +415,8 @@ private pure func block_uses(
 
 		-- Slot validation borrows only scalar bounds, so each write keeps the
 		-- same local vector owner rather than sharing it through Result[List].
-		for operand in step_reads(step):
-			match use_slot(
-				operand,
+		for operand in step.step_reads():
+			match operand.use_slot(
 				introduced_count,
 				outer,
 				first_value,
@@ -439,7 +434,7 @@ private pure func block_uses(
 		if failure.is_some():
 			break
 
-		introduced_count = introduced_count + step_value_count(step)
+		introduced_count = introduced_count + step.step_value_count()
 		step_position = step_position + 1
 
 	ready: Void ?= match failure:
@@ -461,8 +456,7 @@ private pure func block_uses(
 	var invalid: Option[Diagnostic] = None
 
 	for operand in operands:
-		match use_slot(
-			operand,
+		match operand.use_slot(
 			introduced_count,
 			outer,
 			first_value,
@@ -487,7 +481,7 @@ private pure func block_uses(
 				match arguments.get(position):
 					None: invalid = Some(internal_error(span, "join arm carries the wrong number of values"))
 					Some(operand):
-						match use_slot(operand, introduced_count, outer, first_value, terminal_uses.length(), parameter.span):
+						match operand.use_slot(introduced_count, outer, first_value, terminal_uses.length(), parameter.span):
 							Ok(slot):
 								match slot:
 									Some(index): terminal_uses = terminal_uses.set(index, Some(step_position))
@@ -516,7 +510,7 @@ pure func exit_last_uses(
 	span = match exit:
 		Lower.Recur(_, span): span
 		Lower.Break(outputs): outputs.span
-	block_uses(steps, terminal, outer, first_value, 0, Ok(span))
+	steps.block_uses(terminal, outer, first_value, 0, Ok(span))
 
 
 pure func block_last_uses(
@@ -526,14 +520,14 @@ pure func block_last_uses(
 	first_value: Int,
 ) -> Result[List[Option[Int]], Diagnostic]:
 	outer: List[ValueInterval] = [{ first = 0, count = prefix_count }]
-	block_uses(steps, TerminalValue(result), outer, first_value, 0, terminal_span(steps, result, outer))
+	steps.block_uses(TerminalValue(result), outer, first_value, 0, steps.terminal_span(result, outer))
 
 
 pure func last_uses(
 	steps: List[LoweredStep],
 	result: ValueId,
 ) -> Result[List[Option[Int]], Diagnostic]:
-	block_last_uses(steps, result, 0, 0)
+	steps.block_last_uses(result, 0, 0)
 
 
 record OwnerAcquisition {
@@ -579,14 +573,14 @@ private pure func value_source(
 	first_value: Int,
 	span: Span,
 ) -> Result[ResultOwnership, Diagnostic]:
-	ordinal = value_number(value)
+	ordinal = value.value_number()
 	var entry: Option[ResultOwnership] = None
 
-	if in_interval(ordinal, first_value, sources.length()):
+	if ordinal.in_interval(first_value, sources.length()):
 		entry = sources.get(ordinal - first_value)
 	else:
 		for block in enclosing:
-			if in_interval(ordinal, block.first_value, block.sources.length()):
+			if ordinal.in_interval(block.first_value, block.sources.length()):
 				entry = block.sources.get(ordinal - block.first_value)
 				break
 
@@ -600,7 +594,7 @@ private pure func borrow_argument(
 	first_value: Int,
 	span: Span,
 ) -> Result[OwnedArgument, Diagnostic]:
-	source ?= value_source(value, sources, enclosing, first_value, span)
+	source ?= value.value_source(sources, enclosing, first_value, span)
 	match source:
 		UnmanagedResult: Ok(UnmanagedArgument(value))
 		BorrowedResult(borrow_source): Ok(BorrowedArgument({ value = value, source = borrow_source }))
@@ -639,14 +633,14 @@ private pure func store_payloads(
 	var failure: Option[Diagnostic] = None
 	for value in values:
 		var acquire_from: Option[BorrowSource] = None
-		match value_source(value, sources, enclosing, first_value, span):
+		match value.value_source(sources, enclosing, first_value, span):
 			Err(error):
 				failure = Some(error)
 				break
 			Ok(UnmanagedResult): stored = stored.append(UnmanagedPayload(value))
 			Ok(BorrowedResult(borrowed)): acquire_from = Some(borrowed)
 			Ok(OwnedResult(owner)):
-				match transfer(OwnedResult(owner), step_drops, loop_uses, consumed, position, taken):
+				match OwnedResult(owner).transfer(step_drops, loop_uses, consumed, position, taken):
 					Moves(moved):
 						taken = taken.append(moved)
 						stored = stored.append(OwnedPayload(value, moved))
@@ -667,8 +661,8 @@ private pure func borrowed_arguments(
 	values: List[ValueId], sources: List[ResultOwnership], enclosing: List[EnclosingBlock],
 	first_value: Int, span: Span,
 ) -> Result[List[OwnedArgument], Diagnostic]:
-	translated_list(values, pure func(value: ValueId) -> Result[OwnedArgument, Diagnostic]:
-		borrow_argument(value, sources, enclosing, first_value, span)
+	values.translated_list(pure func(value: ValueId) -> Result[OwnedArgument, Diagnostic]:
+		value.borrow_argument(sources, enclosing, first_value, span)
 	)
 
 
@@ -686,7 +680,7 @@ private pure func build_definition(
 	unions: List[ConcreteUnion],
 	records: List[ConcreteRecord],
 ) -> Result[BuiltDefinition, Diagnostic]:
-	needs_owner ?= value_needs_ownership(definition.value_type, unions, records)
+	needs_owner ?= definition.value_type.value_needs_ownership(unions, records)
 	var next = next_owner
 	var acquisitions: List[OwnerAcquisition] = []
 	var taken: List[OwnerId] = []
@@ -694,7 +688,7 @@ private pure func build_definition(
 	operation_result: Result[OwnedValueOperation, Diagnostic] = match definition.operation:
 		ConstructRecordValue(owner, fields):
 			values = fields.map(pure func(field) -> ValueId: field.value)
-			match store_payloads(values, sources, enclosing, first_value, definition.span, pre_step_drops, loop_uses, consumed, position, next):
+			match values.store_payloads(sources, enclosing, first_value, definition.span, pre_step_drops, loop_uses, consumed, position, next):
 				Err(error): Err(error)
 				Ok(payloads):
 					acquisitions = payloads.acquisitions
@@ -710,8 +704,7 @@ private pure func build_definition(
 					else:
 						Err(internal_error(definition.span, "record field has no stored payload"))
 		ReadRecordFieldValue(field, value):
-			borrow_argument(
-				value,
+			value.borrow_argument(
 				sources,
 				enclosing,
 				first_value,
@@ -730,7 +723,7 @@ private pure func build_definition(
 		FloatValue(value):
 			Ok(FloatDefinition(value))
 		ConstructValue(id, values):
-			match store_payloads(values, sources, enclosing, first_value, definition.span, pre_step_drops, loop_uses, consumed, position, next):
+			match values.store_payloads(sources, enclosing, first_value, definition.span, pre_step_drops, loop_uses, consumed, position, next):
 				Err(error): Err(error)
 				Ok(payloads):
 					acquisitions = payloads.acquisitions
@@ -738,7 +731,7 @@ private pure func build_definition(
 					next = payloads.next
 					Ok(ConstructDefinition(id, payloads.stored))
 		ConstructListValue(values):
-			match store_payloads(values, sources, enclosing, first_value, definition.span, pre_step_drops, loop_uses, consumed, position, next):
+			match values.store_payloads(sources, enclosing, first_value, definition.span, pre_step_drops, loop_uses, consumed, position, next):
 				Err(error): Err(error)
 				Ok(payloads):
 					acquisitions = payloads.acquisitions
@@ -750,12 +743,12 @@ private pure func build_definition(
 		ListElementValue(index, value):
 			Ok(ListElementDefinition(index, value))
 		ListSuffixValue(value, skipped):
-			borrow_argument(value, sources, enclosing, first_value, definition.span).map(
+			value.borrow_argument(sources, enclosing, first_value, definition.span).map(
 				pure func(argument): ListSuffixDefinition(argument, skipped),
 			)
 		FreeCallableValue(body): Ok(FreeCallableDefinition(body))
 		CapturedCallableValue(body, environment):
-			match store_payloads([environment], sources, enclosing, first_value, definition.span, pre_step_drops, loop_uses, consumed, position, next):
+			match [environment].store_payloads(sources, enclosing, first_value, definition.span, pre_step_drops, loop_uses, consumed, position, next):
 				Err(error): Err(error)
 				Ok(payloads):
 					acquisitions = payloads.acquisitions
@@ -766,15 +759,15 @@ private pure func build_definition(
 						Ok(payload):
 							Ok(CapturedCallableDefinition(body, payload))
 		InvokeCallableValue(callee, written):
-			match borrow_argument(callee, sources, enclosing, first_value, definition.span):
+			match callee.borrow_argument(sources, enclosing, first_value, definition.span):
 				Err(error): Err(error)
 				Ok(callable):
-					match borrowed_arguments(written, sources, enclosing, first_value, definition.span):
+					match written.borrowed_arguments(sources, enclosing, first_value, definition.span):
 						Err(error): Err(error)
 						Ok(arguments):
 							Ok(InvokeCallableDefinition(callable, arguments))
 		CallValue(target, written):
-			borrowed_arguments(written, sources, enclosing, first_value, definition.span).map(pure func(arguments): CallDefinition(target, arguments))
+			written.borrowed_arguments(sources, enclosing, first_value, definition.span).map(pure func(arguments): CallDefinition(target, arguments))
 
 	operation ?= operation_result
 
@@ -973,7 +966,7 @@ private pure func owned_join_parameter(
 	unions: List[ConcreteUnion],
 	records: List[ConcreteRecord],
 ) -> Result[OwnedJoinParameter, Diagnostic]:
-	needs_owner ?= value_needs_ownership(parameter.value_type, unions, records)
+	needs_owner ?= parameter.value_type.value_needs_ownership(unions, records)
 	match needs_owner:
 		False: Ok(UnmanagedJoinParameter(parameter))
 		True: Ok(ManagedJoinParameter(parameter, owner_id(next_owner)))
@@ -986,14 +979,14 @@ private pure func build_outputs(
 	unions: List[ConcreteUnion],
 	records: List[ConcreteRecord],
 ) -> Result[BuiltOutputs, Diagnostic]:
-	result ?= owned_join_parameter(result_parameter, next_owner, unions, records)
+	result ?= result_parameter.owned_join_parameter(next_owner, unions, records)
 	var cursor = match result:
 		UnmanagedJoinParameter(_): next_owner
 		ManagedJoinParameter(_, _): next_owner + 1
 	var carried: List[OwnedJoinParameter] = []
 	var failure: Option[Diagnostic] = None
 	for parameter in parameters:
-		match owned_join_parameter(parameter, cursor, unions, records):
+		match parameter.owned_join_parameter(cursor, unions, records):
 			Err(error):
 				failure = Some(error)
 				break
@@ -1025,7 +1018,7 @@ private pure func build_inputs(
 	var next_owner = initial_owner
 	var failure: Option[Diagnostic] = None
 	for parameter in parameters:
-		match owned_join_parameter(parameter, next_owner, unions, records):
+		match parameter.owned_join_parameter(next_owner, unions, records):
 			Err(error):
 				failure = Some(error)
 				break
@@ -1044,11 +1037,11 @@ private pure func dependency_owner(
 	value: ValueId, sources: List[ResultOwnership], enclosing: List[EnclosingBlock],
 	first_value: Int, span: Span,
 ) -> Result[Option[OwnerId], Diagnostic]:
-	source ?= value_source(value, sources, enclosing, first_value, span)
+	source ?= value.value_source(sources, enclosing, first_value, span)
 	match source:
 		OwnedResult(owner): Ok(Some(owner))
 		BorrowedResult(OwnerBorrow(owner)): Ok(Some(owner))
-		BorrowedResult(PayloadBorrow(parent)): dependency_owner(parent, sources, enclosing, first_value, span)
+		BorrowedResult(PayloadBorrow(parent)): parent.dependency_owner(sources, enclosing, first_value, span)
 		_: Ok(None)
 
 
@@ -1064,7 +1057,7 @@ private pure func has_consumed(consumed: List[OwnerId], owner: OwnerId) -> Bool:
 private pure func matches_last_use(rows: List[ScheduledDrop], owner: OwnerId, position: Int) -> Bool:
 	var last: Bool = False
 	for row in rows:
-		if and(row.owner == owner, row.last == position):
+		if (row.owner == owner).and(row.last == position):
 			last = True
 			break
 	last
@@ -1083,7 +1076,7 @@ private pure func transferable_here(
 		if row.owner == owner:
 			listed = True
 			break
-	and(listed.or(matches_last_use(loop_uses, owner, position)), has_consumed(consumed, owner).not())
+	listed.or(loop_uses.matches_last_use(owner, position)).and(consumed.has_consumed(owner).not())
 
 
 -- How one occurrence of a value fills an owned slot: a call's owned position,
@@ -1106,7 +1099,7 @@ private pure func transfer(
 ) -> Transfer:
 	match source:
 		OwnedResult(owner):
-			if and(transferable_here(ending, loop_uses, consumed, owner, position), has_consumed(taken, owner).not()):
+			if ending.transferable_here(loop_uses, consumed, owner, position).and(taken.has_consumed(owner).not()):
 				Moves(owner)
 			else:
 				Acquires
@@ -1120,7 +1113,7 @@ private pure func join_entering(
 ) -> Result[List[ScheduledDrop], Diagnostic]:
 	step_drops ?= pre_step_drops.or_internal_error(span, "missing drop schedule row")
 	candidates = step_drops.concat(loop_uses)
-	Ok(candidates.filter(pure func(row): transferable_here(step_drops, loop_uses, consumed, row.owner, position)))
+	Ok(candidates.filter(pure func(row): step_drops.transferable_here(loop_uses, consumed, row.owner, position)))
 
 
 -- How a call passes its operands, decided at its step: the owners it moves
@@ -1169,8 +1162,8 @@ private pure func pass_arguments(
 	for argument in arguments:
 		match (argument, transfers.get(index)):
 			(BorrowedArgument(borrow), Some(False)):
-				match dependency_owner(borrow.value, sources, enclosing, first_value, definition.span):
-					Ok(Some(owner)): borrowed_backers = borrowed_backers.append(owner_number(owner))
+				match borrow.value.dependency_owner(sources, enclosing, first_value, definition.span):
+					Ok(Some(owner)): borrowed_backers = borrowed_backers.append(owner.owner_number())
 					Ok(None): void
 					Err(error): failure = Some(error)
 			_: void
@@ -1183,16 +1176,16 @@ private pure func pass_arguments(
 	for argument in arguments:
 		match (argument, transfers.get(index)):
 			(BorrowedArgument(borrow), Some(True)):
-				match value_source(borrow.value, sources, enclosing, first_value, definition.span):
+				match borrow.value.value_source(sources, enclosing, first_value, definition.span):
 					Err(error): failure = Some(error)
 					Ok(source):
 						backs_borrow = match source:
-							OwnedResult(owner): borrowed_backers.contains(owner_number(owner))
+							OwnedResult(owner): borrowed_backers.contains(owner.owner_number())
 							_: False
 						decided: Transfer = if backs_borrow:
 							Acquires
 						else:
-							transfer(source, step_drops, loop_uses, consumed, position, taken)
+							source.transfer(step_drops, loop_uses, consumed, position, taken)
 						match (decided, rule):
 							(Moves(owner), _):
 								passed = passed.append(ConsumedArgument(borrow.value, owner))
@@ -1209,7 +1202,7 @@ private pure func pass_arguments(
 	match failure:
 		Some(error): Err(error)
 		None:
-			if and(taken.is_empty(), acquisitions.is_empty()):
+			if taken.is_empty().and(acquisitions.is_empty()):
 				Ok(None)
 			else:
 				-- The result's owner follows the acquisitions made before the call.
@@ -1235,19 +1228,19 @@ private pure func pass_call(
 	unchanged: Option[PassedCall] = None
 	match definition.operation:
 		CallDefinition(RuntimeFunction(operation), arguments):
-			if reuses_first_operand(operation):
-				pass_arguments(definition, RuntimeFunction(operation), arguments, InPlaceOperand, first_owner, pre_step_drops, loop_uses, consumed, position, sources, enclosing, first_value)
+			if operation.reuses_first_operand():
+				definition.pass_arguments(RuntimeFunction(operation), arguments, InPlaceOperand, first_owner, pre_step_drops, loop_uses, consumed, position, sources, enclosing, first_value)
 			else:
 				Ok(unchanged)
 		CallDefinition(UserFunction(callee), arguments):
 			match callees:
 				EveryCallBorrows: Ok(unchanged)
 				InstanceRows(rows):
-					match rows.get(function_number(callee)):
+					match rows.get(callee.function_number()):
 						None: Err(internal_error(definition.span, "call to an instance with no contract"))
 						Some(callee_rows):
 							if callee_rows.any(parameter_owned):
-								pass_arguments(definition, UserFunction(callee), arguments, OwnedPositions(callee_rows.map(parameter_owned)), first_owner, pre_step_drops, loop_uses, consumed, position, sources, enclosing, first_value)
+								definition.pass_arguments(UserFunction(callee), arguments, OwnedPositions(callee_rows.map(parameter_owned)), first_owner, pre_step_drops, loop_uses, consumed, position, sources, enclosing, first_value)
 							else:
 								Ok(unchanged)
 		_: Ok(unchanged)
@@ -1260,14 +1253,14 @@ private pure func enclosing_owner_uses(
 	steps: List[LoweredStep], terminal: List[ValueId], candidates: List[ScheduledDrop],
 	enclosing: List[EnclosingBlock], span: Span,
 ) -> Result[List[ScheduledDrop], Diagnostic]:
-	outer = enclosing_intervals(enclosing)
+	outer = enclosing.enclosing_intervals()
 	var uses: List[ScheduledDrop] = []
 	var failure: Option[Diagnostic] = None
 	var position = 0
 	for reads in steps.map(step_reads).append(terminal):
 		for value in reads:
-			if visible_outside(value_number(value), outer):
-				match dependency_owner(value, [], enclosing, 0, span):
+			if value.value_number().visible_outside(outer):
+				match value.dependency_owner([], enclosing, 0, span):
 					Err(error): failure = Some(error)
 					Ok(None): void
 					Ok(Some(owner)):
@@ -1301,10 +1294,10 @@ private pure func loop_consumption_uses(
 	for block in enclosing:
 		if block_position >= scope.pre_blocks:
 			for owner in block.owners:
-				if and(owner.last >= block.position, has_consumed(block.consumed, owner.owner).not()):
+				if (owner.last >= block.position).and(block.consumed.has_consumed(owner.owner).not()):
 					candidates = candidates.append(owner)
 		block_position = block_position + 1
-	enclosing_owner_uses(steps, loop_exit_values(exit), candidates, enclosing, loop_exit_span(exit))
+	steps.enclosing_owner_uses(exit.loop_exit_values(), candidates, enclosing, exit.loop_exit_span())
 
 
 -- A transferable owner moves into its header only when its own initial is
@@ -1317,7 +1310,7 @@ private pure func sole_backer_entry(
 	var backed = 0
 	var failure: Option[Diagnostic] = None
 	for value in reads:
-		match dependency_owner(value, sources, enclosing, first_value, span):
+		match value.dependency_owner(sources, enclosing, first_value, span):
 			Ok(Some(other)):
 				if other == owner:
 					backed = backed + 1
@@ -1340,10 +1333,10 @@ private pure func header_entry(
 	header: Lower.LoopHeader, reads: List[ValueId], step_drops: List[ScheduledDrop], loop_uses: List[ScheduledDrop],
 	consumed: List[OwnerId], position: Int, sources: List[ResultOwnership], enclosing: List[EnclosingBlock], first_value: Int,
 ) -> Result[HeaderEntry, Diagnostic]:
-	source ?= value_source(header.initial, sources, enclosing, first_value, header.parameter.span)
+	source ?= header.initial.value_source(sources, enclosing, first_value, header.parameter.span)
 	-- Sole backing already keeps a second header from taking the same owner.
-	match transfer(source, step_drops, loop_uses, consumed, position, []):
-		Moves(owner): sole_backer_entry(owner, reads, sources, enclosing, first_value, header.parameter.span)
+	match source.transfer(step_drops, loop_uses, consumed, position, []):
+		Moves(owner): owner.sole_backer_entry(reads, sources, enclosing, first_value, header.parameter.span)
 		Acquires: Ok(AcquireAtEntry)
 
 
@@ -1356,7 +1349,7 @@ private pure func entering_headers(
 	var entering: List[EnteringHeader] = []
 	var failure: Option[Diagnostic] = None
 	for header in loop.headers:
-		match header_entry(header, reads, step_drops, loop_uses, consumed, position, sources, enclosing, first_value):
+		match header.header_entry(reads, step_drops, loop_uses, consumed, position, sources, enclosing, first_value):
 			Ok(entry): entering = entering.append({ header = header, entry = entry })
 			Err(error):
 				failure = Some(error)
@@ -1379,8 +1372,8 @@ private pure func borrowed_extents(steps: List[LoweredStep], uses: List[Option[I
 			Some(Define(definition)):
 				match definition.operation:
 					ReadRecordFieldValue(_, parent):
-						parent_slot = value_number(parent) - first_value
-						match extents.get(value_number(definition.id) - first_value):
+						parent_slot = parent.value_number() - first_value
+						match extents.get(definition.id.value_number() - first_value):
 							Some(Some(read)):
 								if parent_slot >= 0:
 									match extents.get(parent_slot):
@@ -1407,7 +1400,7 @@ private pure func retirement(
 	while at < drops.length():
 		match drops.get(at):
 			Some(bucket):
-				if transferable_here(bucket, loop_uses, consumed, owner, at):
+				if bucket.transferable_here(loop_uses, consumed, owner, at):
 					retired = at
 					break
 			None: void
@@ -1429,7 +1422,7 @@ private pure func projection_lasts(
 	loop_uses: List[ScheduledDrop], consumed: List[OwnerId], position: Int, sources: List[ResultOwnership],
 	enclosing: List[EnclosingBlock], first_value: Int, span: Span,
 ) -> Result[Bool, Diagnostic]:
-	backing ?= dependency_owner(parent, sources, enclosing, first_value, span)
+	backing ?= parent.dependency_owner(sources, enclosing, first_value, span)
 	match (backing, extents):
 		(None, _): Ok(True)
 		(Some(_), None): Ok(False)
@@ -1439,7 +1432,7 @@ private pure func projection_lasts(
 				-- An unread projection has no read after its parent's.
 				Some(None): Ok(True)
 				Some(Some(last)):
-					retired = retirement(owner, drops, loop_uses, consumed, position)
+					retired = owner.retirement(drops, loop_uses, consumed, position)
 					Ok((last < retired).or(retired == drops.length()))
 
 
@@ -1459,7 +1452,7 @@ private pure func insert_steps(
 ) -> Result[InsertedSteps, Diagnostic]:
 	count = steps.length()
 	extents: Option[List[Option[Int]]] = match schedule:
-		DropAtLastUse(uses): Some(borrowed_extents(steps, uses, first_value))
+		DropAtLastUse(uses): Some(steps.borrowed_extents(uses, first_value))
 		DropInEachArm: None
 	var drops = steps.map(pure func(_: LoweredStep) -> List[ScheduledDrop]: [])
 	var consumed: List[OwnerId] = match enclosing.get(enclosing.length() - 1):
@@ -1474,9 +1467,9 @@ private pure func insert_steps(
 
 	var input_slot = 0
 	for input in seed_inputs:
-		match join_ownership(input):
+		match input.join_ownership():
 			OwnedResult(owner):
-				span = join_parameter(input).span
+				span = input.join_parameter().span
 				match schedule:
 					DropInEachArm: owners = owners.append({ owner = owner, span = span, last = count })
 					DropAtLastUse(uses):
@@ -1510,7 +1503,7 @@ private pure func insert_steps(
 		if failure.is_some():
 			break
 		value_slot = sources.length()
-		span = step_span(step)
+		span = step.step_span()
 		var carried: List[OwnedJoinParameter] = []
 		var taken_here: List[OwnerId] = []
 		-- Candidates use the pre-call bucket; current-result scheduling below may
@@ -1518,13 +1511,13 @@ private pure func insert_steps(
 		pre_step_drops = drops.get(step_position)
 		available_result: Result[ResultOwnership, Diagnostic] = match step:
 			Join(join):
-				match build_outputs(join.result, join.carried, next_owner, unions, records):
+				match join.result.build_outputs(join.carried, next_owner, unions, records):
 					Err(error): Err(error)
 					Ok(built):
-						match borrow_argument(join.selection.scrutinee, sources, enclosing, first_value, join.result.span):
+						match join.selection.scrutinee.borrow_argument(sources, enclosing, first_value, join.result.span):
 							Err(error): Err(error)
 							Ok(scrutinee):
-								match join_entering(pre_step_drops, loop_uses, consumed, step_position, span):
+								match pre_step_drops.join_entering(loop_uses, consumed, step_position, span):
 									Err(error): Err(error)
 									Ok(taken):
 										-- The arms' snapshot precedes the transfer, so they can discharge
@@ -1541,12 +1534,12 @@ private pure func insert_steps(
 										consumed = consumed.concat(taken.map(pure func(row): row.owner))
 										next_owner = built.next_owner
 										carried = built.carried
-										Ok(join_ownership(built.result))
+										Ok(built.result.join_ownership())
 			Loop(loop):
-				match build_outputs(loop.result, loop.carried, next_owner, unions, records):
+				match loop.result.build_outputs(loop.carried, next_owner, unions, records):
 					Err(error): Err(error)
 					Ok(built):
-						match entering_headers(loop, step_reads(step), pre_step_drops, loop_uses, consumed, step_position, sources, enclosing, first_value):
+						match loop.entering_headers(step.step_reads(), pre_step_drops, loop_uses, consumed, step_position, sources, enclosing, first_value):
 							Err(error): Err(error)
 							Ok(entering):
 								-- Taken owners belong to their headers: no drop after this step,
@@ -1561,12 +1554,12 @@ private pure func insert_steps(
 								}))
 								next_owner = built.next_owner
 								carried = built.carried
-								Ok(join_ownership(built.result))
+								Ok(built.result.join_ownership())
 			Define(definition):
-				match build_definition(definition, sources, enclosing, first_value, next_owner, pre_step_drops, loop_uses, consumed, step_position, contracts.parameters, unions, records):
+				match definition.build_definition(sources, enclosing, first_value, next_owner, pre_step_drops, loop_uses, consumed, step_position, contracts.parameters, unions, records):
 					Err(error): Err(error)
 					Ok(built):
-						match pass_call(built.definition, contracts.callees, next_owner, pre_step_drops, loop_uses, consumed, step_position, sources, enclosing, first_value):
+						match built.definition.pass_call(contracts.callees, next_owner, pre_step_drops, loop_uses, consumed, step_position, sources, enclosing, first_value):
 							Err(error): Err(error)
 							-- A call stores no payloads: transfers are its only acquisitions.
 							Ok(Some(passed)):
@@ -1595,7 +1588,7 @@ private pure func insert_steps(
 										entries = entries.append(Inserted(DefineValue(built.definition)))
 										lasts: Result[Bool, Diagnostic] = match borrow.source:
 											PayloadBorrow(parent):
-												projection_lasts(parent, extents, value_slot, drops, loop_uses, consumed, step_position, sources, enclosing, first_value, span)
+												parent.projection_lasts(extents, value_slot, drops, loop_uses, consumed, step_position, sources, enclosing, first_value, span)
 											_: Err(internal_error(span, "record projection has no parent borrow"))
 										match lasts:
 											Err(error): Err(error)
@@ -1615,12 +1608,12 @@ private pure func insert_steps(
 				-- A loop row this step took is consumed: no later step or edge
 				-- of the loop may take or retire it.
 				for owner in taken_here:
-					if matches_last_use(loop_uses, owner, step_position):
+					if loop_uses.matches_last_use(owner, step_position):
 						consumed = consumed.append(owner)
 
 				match available:
 					OwnedResult(owner):
-						match drop_position(schedule, value_slot, step_position, count, span):
+						match schedule.drop_position(value_slot, step_position, count, span):
 							Err(error):
 								failure = Some(error)
 								break
@@ -1638,20 +1631,20 @@ private pure func insert_steps(
 													failure = Some(internal_error(span, "invalid last-use position"))
 													break
 												Some(last):
-													drops = drops.set(until, bucket.append({ owner = owner, span = step_span(last), last = until }))
+													drops = drops.set(until, bucket.append({ owner = owner, span = last.step_span(), last = until }))
 					_:
 						void
 
 		-- Several outputs share one execution position, but each owns a value
 		-- slot and, when managed, an independently scheduled obligation.
 		for output in carried:
-			parameter = join_parameter(output)
+			parameter = output.join_parameter()
 			slot = sources.length()
-			sources = sources.append(join_ownership(output))
+			sources = sources.append(output.join_ownership())
 			match output:
 				UnmanagedJoinParameter(_): void
 				ManagedJoinParameter(_, owner):
-					match drop_position(schedule, slot, step_position, count, parameter.span):
+					match schedule.drop_position(slot, step_position, count, parameter.span):
 						Err(error): failure = Some(error)
 						Ok(until):
 							owners = owners.append({ owner = owner, span = parameter.span, last = until })
@@ -1660,7 +1653,7 @@ private pure func insert_steps(
 									None: failure = Some(internal_error(parameter.span, "missing drop schedule row"))
 									Some(bucket):
 										match steps.get(until):
-											Some(last): drops = drops.set(until, bucket.append({ owner = owner, span = step_span(last), last = until }))
+											Some(last): drops = drops.set(until, bucket.append({ owner = owner, span = last.step_span(), last = until }))
 											None: failure = Some(internal_error(parameter.span, "invalid last-use position"))
 			if failure.is_some():
 				break
@@ -1670,14 +1663,14 @@ private pure func insert_steps(
 		match drops.get(step_position):
 			Some(bucket):
 				for dropped in bucket:
-					transferred_here = has_consumed(taken_here, dropped.owner)
+					transferred_here = taken_here.has_consumed(dropped.owner)
 					-- An entering obligation read here leaves the arm at this step.
 					entering_here: Bool = discharges.any(pure func(discharge):
 						match discharge:
 							LastReadInArm(row): row.owner == dropped.owner
 							DropOnEntry(_, _): False
 					)
-					if has_consumed(consumed, dropped.owner).not():
+					if consumed.has_consumed(dropped.owner).not():
 						if transferred_here.not():
 							entries = entries.append(Inserted(DropOwner(dropped.owner, dropped.span)))
 						if entering_here:
@@ -1727,7 +1720,7 @@ private pure func borrowed_result(source: ResultOwnership) -> ResultOwnership:
 private pure func leaving_source(source: ResultOwnership, decided: Transfer) -> ResultOwnership:
 	match decided:
 		Moves(owner): OwnedResult(owner)
-		Acquires: borrowed_result(source)
+		Acquires: source.borrowed_result()
 
 
 -- The owners moved at one point, after one more occurrence.
@@ -1794,10 +1787,10 @@ private pure func insert_selection_edge(
 	var next_owner = initial_owner
 	var failure: Option[Diagnostic] = None
 	for definition in edge.definitions:
-		lowered = selection_value(definition)
+		lowered = definition.selection_value()
 		-- An edge's projections store nothing, and no obligation ends before its
 		-- outputs: an empty drop row and no loop rows.
-		match build_definition(lowered, sources, enclosing, first_value, next_owner, Some([]), [], [], 0, [], unions, records):
+		match lowered.build_definition(sources, enclosing, first_value, next_owner, Some([]), [], [], 0, [], unions, records):
 			Err(error):
 				failure = Some(error)
 				break
@@ -1827,12 +1820,12 @@ private pure func insert_selection_edge(
 	for value in edge.arguments:
 		if failure.is_some():
 			break
-		match value_source(value, sources, enclosing, first_value, compiler_span()):
+		match value.value_source(sources, enclosing, first_value, compiler_span()):
 			Err(error): failure = Some(error)
 			Ok(source):
-				decided = transfer(source, ending, [], [], position, moved)
-				moved = after_transfer(moved, decided)
-				leaving = leave_with(value, leaving_source(source, decided), [], next_owner, compiler_span())
+				decided = source.transfer(ending, [], [], position, moved)
+				moved = moved.after_transfer(decided)
+				leaving = value.leave_with(source.leaving_source(decided), [], next_owner, compiler_span())
 				for entry in leaving.entries:
 					match entry:
 						Inserted(operation): operations = operations.append(operation)
@@ -1840,7 +1833,7 @@ private pure func insert_selection_edge(
 				transfers = transfers.append(leaving.transfer)
 				next_owner = leaving.next_owner
 	for row in ending:
-		if has_consumed(moved, row.owner).not():
+		if moved.has_consumed(row.owner).not():
 			operations = operations.append(DropOwner(row.owner, row.span))
 	match failure:
 		Some(error): Err(error)
@@ -1880,7 +1873,7 @@ private pure func insert_selection(
 			Lower.TestStringBytes(place, bytes, yes, no):
 				nodes = nodes.append(TestStringBytes(place, bytes, yes, no))
 			Lower.EnterArm(edge):
-				match insert_selection_edge(edge, enclosing, next_value, next_owner, unions, records):
+				match edge.insert_selection_edge(enclosing, next_value, next_owner, unions, records):
 					Err(error):
 						failure = Some(error)
 						break
@@ -1954,11 +1947,11 @@ private pure func leave_join(
 	first_value: Int,
 	span: Span,
 ) -> Result[LeavingJoin, Diagnostic]:
-	ending ?= terminal_owners(inserted.sources, uses, step_count, span)
-	result_source ?= value_source(outputs.value, inserted.sources, enclosing, first_value, span)
-	result_transfer = transfer(result_source, ending, [], [], step_count, [])
-	var moved = after_transfer([], result_transfer)
-	leaving = leave_with(outputs.value, leaving_source(result_source, result_transfer), inserted.entries, inserted.next_owner, span)
+	ending ?= inserted.sources.terminal_owners(uses, step_count, span)
+	result_source ?= outputs.value.value_source(inserted.sources, enclosing, first_value, span)
+	result_transfer = result_source.transfer(ending, [], [], step_count, [])
+	var moved = [].after_transfer(result_transfer)
+	leaving = outputs.value.leave_with(result_source.leaving_source(result_transfer), inserted.entries, inserted.next_owner, span)
 	var entries = leaving.entries
 	var next_owner = leaving.next_owner
 	var carried: List[ReturnTransfer] = []
@@ -1968,12 +1961,12 @@ private pure func leave_join(
 		match outputs.carried.get(position):
 			None: failure = Some(internal_error(span, "join arm carries the wrong number of values"))
 			Some(value):
-				match value_source(value, inserted.sources, enclosing, first_value, parameter.span):
+				match value.value_source(inserted.sources, enclosing, first_value, parameter.span):
 					Err(error): failure = Some(error)
 					Ok(carrier_source):
-						decided = transfer(carrier_source, ending, [], [], step_count, moved)
-						moved = after_transfer(moved, decided)
-						left = leave_with(value, leaving_source(carrier_source, decided), entries, next_owner, parameter.span)
+						decided = carrier_source.transfer(ending, [], [], step_count, moved)
+						moved = moved.after_transfer(decided)
+						left = value.leave_with(carrier_source.leaving_source(decided), entries, next_owner, parameter.span)
 						entries = left.entries
 						next_owner = left.next_owner
 						carried = carried.append(left.transfer)
@@ -1988,7 +1981,7 @@ private pure func leave_join(
 	-- it retires here too.
 	var completed = entries
 	for row in ending:
-		if has_consumed(moved, row.owner).not():
+		if moved.has_consumed(row.owner).not():
 			completed = completed.append(Inserted(DropOwner(row.owner, row.span)))
 	for discharge in discharges:
 		match discharge:
@@ -2016,14 +2009,14 @@ private pure func join_terminal_span(arm: JoinArm, result: ValueId, outer: List[
 			break
 	match input_span:
 		Some(span): Ok(span)
-		None: terminal_span(arm.steps, result, outer)
+		None: arm.steps.terminal_span(result, outer)
 
 
 -- Where one yielding arm discharges each obligation entering its join.
 private pure func entering_discharges(
 	arm: JoinArm, outputs: Lower.JoinOutputs, entering: List[ScheduledDrop], enclosing: List[EnclosingBlock], span: Span,
 ) -> Result[List[EnteringDischarge], Diagnostic]:
-	reads ?= enclosing_owner_uses(arm.steps, [outputs.value].concat(outputs.carried), entering, enclosing, span)
+	reads ?= arm.steps.enclosing_owner_uses([outputs.value].concat(outputs.carried), entering, enclosing, span)
 	var discharges: List[EnteringDischarge] = []
 	for row in entering:
 		match reads.find(pure func(read): read.owner == row.owner):
@@ -2050,14 +2043,14 @@ private pure func insert_yielding_arm(
 		Ok(void)
 	else:
 		Err(internal_error(result_span, "join arm carries the wrong number of values"))
-	outer = enclosing_intervals(enclosing)
-	span ?= join_terminal_span(arm, outputs.value, outer)
+	outer = enclosing.enclosing_intervals()
+	span ?= arm.join_terminal_span(outputs.value, outer)
 	terminal: BlockTerminal = TerminalJoin(outputs.value, outputs.carried, parameters)
-	uses ?= block_uses(arm.steps, terminal, outer, first_value, arm.inputs.length(), Ok(span))
-	discharges ?= entering_discharges(arm, outputs, entering, enclosing, span)
-	inserted ?= insert_steps(arm.steps, DropAtLastUse(uses), enclosing, first_value, inputs.next_owner, inputs.parameters, loop_scope, [], discharges, contracts, unions, records)
-	leaving ?= leave_join(outputs, arm.steps.length(), parameters, inserted, uses, discharges, enclosing, first_value, span)
-	completed ?= complete_joins(leaving.entries, first_value + inserted.sources.length(), leaving.next_owner, contracts, unions, records)
+	uses ?= arm.steps.block_uses(terminal, outer, first_value, arm.inputs.length(), Ok(span))
+	discharges ?= arm.entering_discharges(outputs, entering, enclosing, span)
+	inserted ?= arm.steps.insert_steps(DropAtLastUse(uses), enclosing, first_value, inputs.next_owner, inputs.parameters, loop_scope, [], discharges, contracts, unions, records)
+	leaving ?= outputs.leave_join(arm.steps.length(), parameters, inserted, uses, discharges, enclosing, first_value, span)
+	completed ?= leaving.entries.complete_joins(first_value + inserted.sources.length(), leaving.next_owner, contracts, unions, records)
 	Ok({
 		arm = { id = arm.id, inputs = inputs.parameters, operations = completed.operations, exit = Yield({ transfer = leaving.transfer, carried = leaving.carried }) },
 		next_owner = completed.next_owner, next_value = completed.next_value,
@@ -2077,7 +2070,7 @@ private pure func insert_abrupt_arm(
 	unions: List[ConcreteUnion],
 	records: List[ConcreteRecord],
 ) -> Result[InsertedJoinArm, Diagnostic]:
-	scope ?= require_loop_scope(loop_scope, target, result_span)
+	scope ?= loop_scope.require_loop_scope(target, result_span)
 	body ?= insert_loop_block({ steps = arm.steps, tail = tail }, inputs.parameters, 0, enclosing, scope, first_value, inputs.next_owner, result_span, contracts, unions, records)
 	Ok({
 		arm = { id = arm.id, inputs = inputs.parameters, operations = body.body.operations, exit = TransferLoop(target, body.body.tail) },
@@ -2100,10 +2093,10 @@ private pure func insert_join_arm(
 	unions: List[ConcreteUnion],
 	records: List[ConcreteRecord],
 ) -> Result[InsertedJoinArm, Diagnostic]:
-	inputs ?= build_inputs(arm.inputs, initial_owner, unions, records)
+	inputs ?= arm.inputs.build_inputs(initial_owner, unions, records)
 	match arm.exit:
-		Lower.Yield(outputs): insert_yielding_arm(arm, outputs, parameters, result_span, entering, enclosing, loop_scope, first_value, inputs, contracts, unions, records)
-		Lower.TransferLoop(target, tail): insert_abrupt_arm(arm, target, tail, result_span, enclosing, loop_scope, first_value, inputs, contracts, unions, records)
+		Lower.Yield(outputs): arm.insert_yielding_arm(outputs, parameters, result_span, entering, enclosing, loop_scope, first_value, inputs, contracts, unions, records)
+		Lower.TransferLoop(target, tail): arm.insert_abrupt_arm(target, tail, result_span, enclosing, loop_scope, first_value, inputs, contracts, unions, records)
 
 
 private record CompletedOwnedJoin {
@@ -2121,13 +2114,13 @@ private pure func complete_pending_join(
 	unions: List[ConcreteUnion],
 	records: List[ConcreteRecord],
 ) -> Result[CompletedOwnedJoin, Diagnostic]:
-	selected ?= insert_selection(pending.join.selection, pending.scrutinee, pending.enclosing, first_value, initial_owner, unions, records)
+	selected ?= pending.join.selection.insert_selection(pending.scrutinee, pending.enclosing, first_value, initial_owner, unions, records)
 	var next_value = selected.next_value
 	var next_owner = selected.next_owner
 	var arms: List[OwnedJoinArm] = []
 	var failure: Option[Diagnostic] = None
 	for arm in pending.join.arms:
-		match insert_join_arm(arm, pending.join.carried, pending.join.result.span, pending.entering, pending.enclosing, pending.loop_scope, next_value, next_owner, contracts, unions, records):
+		match arm.insert_join_arm(pending.join.carried, pending.join.result.span, pending.entering, pending.enclosing, pending.loop_scope, next_value, next_owner, contracts, unions, records):
 			Err(error):
 				failure = Some(error)
 				break
@@ -2173,7 +2166,7 @@ private pure func complete_joins(
 			Inserted(operation):
 				operations = operations.append(operation)
 			AwaitingLoop(pending):
-				match insert_loop(pending.loop, pending.headers, pending.enclosing, next_value, next_owner, contracts, unions, records):
+				match pending.loop.insert_loop(pending.headers, pending.enclosing, next_value, next_owner, contracts, unions, records):
 					Err(error):
 						failure = Some(error)
 						break
@@ -2182,7 +2175,7 @@ private pure func complete_joins(
 						next_value = built.next_value
 						next_owner = built.next_owner
 			AwaitingArms(join):
-				match complete_pending_join(join, next_value, next_owner, contracts, unions, records):
+				match join.complete_pending_join(next_value, next_owner, contracts, unions, records):
 					Err(error):
 						failure = Some(error)
 						break
@@ -2248,7 +2241,7 @@ private pure func edge_live_owners(
 	inserted: InsertedSteps, enclosing: List[EnclosingBlock], scope: LoopScope, position: Int,
 ) -> List[ScheduledDrop]:
 	live = pure func(owners: List[ScheduledDrop], at: Int) -> List[ScheduledDrop]:
-		owners.filter(pure func(row): and(row.last >= at, has_consumed(inserted.consumed, row.owner).not()))
+		owners.filter(pure func(row): (row.last >= at).and(inserted.consumed.has_consumed(row.owner).not()))
 	var rows = live(inserted.owners, position)
 	var ordinal = 0
 	for block in enclosing:
@@ -2268,22 +2261,22 @@ private pure func leave_loop(
 	first_value: Int,
 	position: Int,
 ) -> Result[LoopEdgeEntries, Diagnostic]:
-	span = loop_exit_span(exit)
-	retiring = edge_live_owners(inserted, enclosing, scope, position)
+	span = exit.loop_exit_span()
+	retiring = inserted.edge_live_owners(enclosing, scope, position)
 	var entries = inserted.entries
 	var next_owner = inserted.next_owner
 	var transfers: List[ReturnTransfer] = []
 	var moved: List[OwnerId] = []
 	var failure: Option[Diagnostic] = None
-	for value in loop_exit_values(exit):
-		match value_source(value, inserted.sources, enclosing, first_value, span):
+	for value in exit.loop_exit_values():
+		match value.value_source(inserted.sources, enclosing, first_value, span):
 			Err(error):
 				failure = Some(error)
 				break
 			Ok(source):
-				decided = transfer(source, retiring, [], [], position, moved)
-				moved = after_transfer(moved, decided)
-				leaving = leave_with(value, leaving_source(source, decided), entries, next_owner, span)
+				decided = source.transfer(retiring, [], [], position, moved)
+				moved = moved.after_transfer(decided)
+				leaving = value.leave_with(source.leaving_source(decided), entries, next_owner, span)
 				entries = leaving.entries
 				next_owner = leaving.next_owner
 				transfers = transfers.append(leaving.transfer)
@@ -2291,7 +2284,7 @@ private pure func leave_loop(
 		Some(error): Err(error)
 		None: Ok(void)
 	for row in retiring:
-		if has_consumed(moved, row.owner).not():
+		if moved.has_consumed(row.owner).not():
 			entries = entries.append(Inserted(DropOwner(row.owner, row.span)))
 	owned_exit: OwnedLoopExit ?= match exit:
 		Lower.Recur(_, occurrence): Ok(Recur(transfers, occurrence))
@@ -2316,11 +2309,11 @@ private pure func insert_loop_exit_block(
 	unions: List[ConcreteUnion],
 	records: List[ConcreteRecord],
 ) -> Result[InsertedLoopBlock, Diagnostic]:
-	uses ?= block_uses(steps, TerminalArguments(loop_exit_values(exit)), enclosing_intervals(enclosing), first_value, seed_inputs.length(), Ok(span))
+	uses ?= steps.block_uses(TerminalArguments(exit.loop_exit_values()), enclosing.enclosing_intervals(), first_value, seed_inputs.length(), Ok(span))
 	-- Header obligations survive until the complete edge batch, including
 	-- old values that are not outgoing. Arm inputs keep last-use scheduling.
 	var held_uses = uses
-	enclosing_uses ?= loop_consumption_uses(steps, exit, enclosing, scope)
+	enclosing_uses ?= steps.loop_consumption_uses(exit, enclosing, scope)
 	var loop_uses = enclosing_uses
 	var input_slot = 0
 	while input_slot < held_headers:
@@ -2332,9 +2325,9 @@ private pure func insert_loop_exit_block(
 			_: void
 		held_uses = held_uses.set(input_slot, Some(steps.length()))
 		input_slot = input_slot + 1
-	inserted ?= insert_steps(steps, DropAtLastUse(held_uses), enclosing, first_value, initial_owner, seed_inputs, Some(scope), loop_uses, [], contracts, unions, records)
-	leaving ?= leave_loop(exit, inserted, enclosing, scope, first_value, steps.length())
-	completed ?= complete_joins(leaving.entries, first_value + inserted.sources.length(), leaving.next_owner, contracts, unions, records)
+	inserted ?= steps.insert_steps(DropAtLastUse(held_uses), enclosing, first_value, initial_owner, seed_inputs, Some(scope), loop_uses, [], contracts, unions, records)
+	leaving ?= exit.leave_loop(inserted, enclosing, scope, first_value, steps.length())
+	completed ?= leaving.entries.complete_joins(first_value + inserted.sources.length(), leaving.next_owner, contracts, unions, records)
 	Ok({ body = { operations = completed.operations, tail = ExitLoop(leaving.exit) }, next_value = completed.next_value, next_owner = completed.next_owner })
 
 
@@ -2351,20 +2344,20 @@ private pure func insert_loop_match_block(
 	unions: List[ConcreteUnion],
 	records: List[ConcreteRecord],
 ) -> Result[InsertedLoopBlock, Diagnostic]:
-	prefix ?= insert_steps(steps, DropInEachArm, enclosing, first_value, initial_owner, seed_inputs, Some(scope), [], [], contracts, unions, records)
-	scrutinee ?= borrow_argument(matched.selection.scrutinee, prefix.sources, enclosing, first_value, span)
-	completed ?= complete_joins(prefix.entries, first_value + prefix.sources.length(), prefix.next_owner, contracts, unions, records)
+	prefix ?= steps.insert_steps(DropInEachArm, enclosing, first_value, initial_owner, seed_inputs, Some(scope), [], [], contracts, unions, records)
+	scrutinee ?= matched.selection.scrutinee.borrow_argument(prefix.sources, enclosing, first_value, span)
+	completed ?= prefix.entries.complete_joins(first_value + prefix.sources.length(), prefix.next_owner, contracts, unions, records)
 	outer: List[EnclosingBlock] = enclosing.append({ first_value = first_value, sources = prefix.sources, owners = prefix.owners, position = steps.length(), consumed = prefix.consumed })
-	selected ?= insert_selection(matched.selection, scrutinee, outer, completed.next_value, completed.next_owner, unions, records)
+	selected ?= matched.selection.insert_selection(scrutinee, outer, completed.next_value, completed.next_owner, unions, records)
 	var next_value = selected.next_value
 	var next_owner = selected.next_owner
 	var arms: List[OwnedLoopArm] = []
 	var failure: Option[Diagnostic] = None
 	for arm in matched.arms:
-		match build_inputs(arm.inputs, next_owner, unions, records):
+		match arm.inputs.build_inputs(next_owner, unions, records):
 			Err(error): failure = Some(error)
 			Ok(inputs):
-				match insert_loop_block(arm.body, inputs.parameters, 0, outer, scope, next_value, inputs.next_owner, span, contracts, unions, records):
+				match arm.body.insert_loop_block(inputs.parameters, 0, outer, scope, next_value, inputs.next_owner, span, contracts, unions, records):
 					Err(error): failure = Some(error)
 					Ok(built):
 						arms = arms.append({ id = arm.id, inputs = inputs.parameters, body = built.body })
@@ -2391,8 +2384,8 @@ private pure func insert_loop_block(
 	records: List[ConcreteRecord],
 ) -> Result[InsertedLoopBlock, Diagnostic]:
 	match block.tail:
-		Lower.ExitLoop(exit): insert_loop_exit_block(block.steps, exit, seed_inputs, held_headers, enclosing, scope, first_value, initial_owner, span, contracts, unions, records)
-		Lower.MatchLoop(matched): insert_loop_match_block(block.steps, matched, seed_inputs, enclosing, scope, first_value, initial_owner, span, contracts, unions, records)
+		Lower.ExitLoop(exit): block.steps.insert_loop_exit_block(exit, seed_inputs, held_headers, enclosing, scope, first_value, initial_owner, span, contracts, unions, records)
+		Lower.MatchLoop(matched): block.steps.insert_loop_match_block(matched, seed_inputs, enclosing, scope, first_value, initial_owner, span, contracts, unions, records)
 
 
 private pure func insert_loop(
@@ -2413,10 +2406,10 @@ private pure func insert_loop(
 		match decided.entry:
 			TakeOwner(owner): initials = initials.append(OwnedReturn(decided.header.initial, owner))
 			AcquireAtEntry:
-				match value_source(decided.header.initial, [], enclosing, first_value, decided.header.parameter.span):
+				match decided.header.initial.value_source([], enclosing, first_value, decided.header.parameter.span):
 					Err(error): failure = Some(error)
 					Ok(source):
-						left = leave_with(decided.header.initial, borrowed_result(source), [], next_owner, decided.header.parameter.span)
+						left = decided.header.initial.leave_with(source.borrowed_result(), [], next_owner, decided.header.parameter.span)
 						for entry in left.entries:
 							match entry:
 								Inserted(AcquireOwner(owner, borrow, _)): acquisitions = acquisitions.append({ owner = owner, borrow = borrow })
@@ -2428,19 +2421,19 @@ private pure func insert_loop(
 	ready: Void ?= match failure:
 		Some(error): Err(error)
 		None: Ok(void)
-	inputs ?= build_inputs(entering.map(pure func(decided): decided.header.parameter), next_owner, unions, records)
+	inputs ?= entering.map(pure func(decided): decided.header.parameter).build_inputs(next_owner, unions, records)
 	var headers: List[OwnedLoopHeader] = []
 	var position = 0
 	for parameter in inputs.parameters:
 		match initials.get(position):
-			None: failure = Some(internal_error(join_parameter(parameter).span, "missing loop initial transfer"))
+			None: failure = Some(internal_error(parameter.join_parameter().span, "missing loop initial transfer"))
 			Some(initial): headers = headers.append({ parameter = parameter, initial = initial })
 		position = position + 1
 	headers_ready: Void ?= match failure:
 		Some(error): Err(error)
 		None: Ok(void)
 	scope: LoopScope = { target = Lower.loop_target(loop.result.id), pre_blocks = enclosing.length() }
-	body ?= insert_loop_block(loop.body, inputs.parameters, entering.length(), enclosing, scope, first_value, inputs.next_owner, loop.result.span, contracts, unions, records)
+	body ?= loop.body.insert_loop_block(inputs.parameters, entering.length(), enclosing, scope, first_value, inputs.next_owner, loop.result.span, contracts, unions, records)
 	Ok({ acquisitions = acquisitions, headers = headers, body = body.body, next_value = body.next_value, next_owner = body.next_owner })
 
 
@@ -2459,12 +2452,12 @@ private pure func insert_contracted_function(
 	unions: List[ConcreteUnion],
 	records: List[ConcreteRecord],
 ) -> Result[InsertedFunction, Diagnostic]:
-	span ?= terminal_span(function.steps, function.result, [])
-	uses ?= block_uses(function.steps, TerminalValue(function.result), [], 0, 0, Ok(span))
-	inserted ?= insert_steps(function.steps, DropAtLastUse(uses), [], 0, 0, [], None, [], [], contracts, unions, records)
-	source ?= value_source(function.result, inserted.sources, [], 0, span)
-	leaving = leave_with(function.result, source, inserted.entries, inserted.next_owner, span)
-	completed ?= complete_joins(leaving.entries, inserted.sources.length(), leaving.next_owner, contracts, unions, records)
+	span ?= function.steps.terminal_span(function.result, [])
+	uses ?= function.steps.block_uses(TerminalValue(function.result), [], 0, 0, Ok(span))
+	inserted ?= function.steps.insert_steps(DropAtLastUse(uses), [], 0, 0, [], None, [], [], contracts, unions, records)
+	source ?= function.result.value_source(inserted.sources, [], 0, span)
+	leaving = function.result.leave_with(source, inserted.entries, inserted.next_owner, span)
+	completed ?= leaving.entries.complete_joins(inserted.sources.length(), leaving.next_owner, contracts, unions, records)
 	Ok({
 		function = {
 			label = function.label, parameters = contracts.parameters, return_type = function.signature.return_type,
@@ -2480,7 +2473,7 @@ private pure func borrowed_rows(parameters: List[TypeRef], unions: List[Concrete
 	var rows: List[OwnedParameter] = []
 	var failure: Option[Diagnostic] = None
 	for value_type in parameters:
-		match value_needs_ownership(value_type, unions, records):
+		match value_type.value_needs_ownership(unions, records):
 			Ok(True): rows = rows.append(ManagedParameter({ value_type = value_type, owned = False }))
 			Ok(False): rows = rows.append(UnmanagedParameter(value_type))
 			Err(error):
@@ -2498,8 +2491,8 @@ pure func insert_function(
 	unions: List[ConcreteUnion],
 	records: List[ConcreteRecord],
 ) -> Result[OwnedFunction, Diagnostic]:
-	rows ?= borrowed_rows(function.signature.parameters, unions, records)
-	inserted ?= insert_contracted_function(function, { parameters = rows, callees = EveryCallBorrows }, unions, records)
+	rows ?= function.signature.parameters.borrowed_rows(unions, records)
+	inserted ?= function.insert_contracted_function({ parameters = rows, callees = EveryCallBorrows }, unions, records)
 	Ok(inserted.function)
 
 
@@ -2557,7 +2550,7 @@ private pure func reached_parameters(inserted: InsertedFunction) -> Result[List[
 	start: ReachWork = ReachOperations(inserted.function.operations, 0, None)
 	var work: List[ReachWork] = [start]
 	var depth = 1
-	while and(depth > 0, failure.is_none()):
+	while (depth > 0).and(failure.is_none()):
 		depth = depth - 1
 		-- A list literal allocates, so an item that pushes nothing leaves this None.
 		var nested: Option[List[ReachWork]] = None
@@ -2570,14 +2563,14 @@ private pure func reached_parameters(inserted: InsertedFunction) -> Result[List[
 						ManagedJoinParameter(value, owner):
 							match transfers.get(position):
 								Some(OwnedReturn(_, source)):
-									backing = backing.set(value_number(value.id), Some(owner_number(owner)))
-									match row_at(carrier, owner_number(source)):
-										Ok(Some(origin)): carrier = carrier.set(owner_number(owner), Some(origin))
+									backing = backing.set(value.id.value_number(), Some(owner.owner_number()))
+									match carrier.row_at(source.owner_number()):
+										Ok(Some(origin)): carrier = carrier.set(owner.owner_number(), Some(origin))
 										Ok(None): void
 										Err(error): failure = Some(error)
-									match row_at(pending, owner_number(source)):
+									match pending.row_at(source.owner_number()):
 										Ok(Some(acquired_from)):
-											pending = pending.set(owner_number(owner), Some(acquired_from))
+											pending = pending.set(owner.owner_number(), Some(acquired_from))
 											pending_count = pending_count + 1
 										Ok(None): void
 										Err(error): failure = Some(error)
@@ -2596,36 +2589,36 @@ private pure func reached_parameters(inserted: InsertedFunction) -> Result[List[
 					MatchLoop(matched):
 						var arms: List[ReachWork] = []
 						for arm in matched.arms:
-							arms = arms.concat(arm_work(matched.selection, arm.id, arm.inputs, loop_result))
+							arms = arms.concat(matched.selection.arm_work(arm.id, arm.inputs, loop_result))
 							arms = arms.append(ReachOperations(arm.body.operations, 0, loop_result))
 							arms = arms.append(ReachTail(arm.body.tail, loop_result))
 						nested = Some(arms)
 			Some(ReachOperations(operations, first, loop_result)):
 				var index = first
-				while and(and(index < operations.length(), nested.is_none()), failure.is_none()):
+				while (index < operations.length()).and(nested.is_none()).and(failure.is_none()):
 					operation_at = operations.get(index)
 					index = index + 1
 					match operation_at:
 						None: failure = Some(internal_error(compiler_span(), "ownership reach operation is missing"))
 						Some(DefineValue(definition)):
 							backed: Result[Option[Int], Diagnostic] = match definition.result:
-								OwnedResult(owner): Ok(Some(owner_number(owner)))
-								BorrowedResult(OwnerBorrow(owner)): Ok(Some(owner_number(owner)))
-								BorrowedResult(PayloadBorrow(parent)): row_at(backing, value_number(parent))
+								OwnedResult(owner): Ok(Some(owner.owner_number()))
+								BorrowedResult(OwnerBorrow(owner)): Ok(Some(owner.owner_number()))
+								BorrowedResult(PayloadBorrow(parent)): backing.row_at(parent.value_number())
 								_: Ok(None)
 							match backed:
 								Err(error): failure = Some(error)
-								Ok(backer): backing = backing.set(value_number(definition.id), backer)
+								Ok(backer): backing = backing.set(definition.id.value_number(), backer)
 							match definition.operation:
 								ParameterDefinition(position):
 									match definition.result:
-										OwnedResult(owner): carrier = carrier.set(owner_number(owner), Some(position))
+										OwnedResult(owner): carrier = carrier.set(owner.owner_number(), Some(position))
 										_: void
 								CallDefinition(_, arguments):
 									for argument in arguments:
 										match argument:
 											ConsumedArgument(_, owner):
-												match row_at(carrier, owner_number(owner)):
+												match carrier.row_at(owner.owner_number()):
 													Ok(Some(origin)): reached = reached.set(origin, True)
 													Ok(None): void
 													Err(error): failure = Some(error)
@@ -2633,23 +2626,23 @@ private pure func reached_parameters(inserted: InsertedFunction) -> Result[List[
 								_: void
 						Some(AcquireOwner(owner, borrow, _)):
 							backer: Result[Option[Int], Diagnostic] = match borrow.source:
-								OwnerBorrow(source): Ok(Some(owner_number(source)))
-								PayloadBorrow(parent): row_at(backing, value_number(parent))
+								OwnerBorrow(source): Ok(Some(source.owner_number()))
+								PayloadBorrow(parent): backing.row_at(parent.value_number())
 								ParameterBorrow(_): Ok(None)
 							match backer:
 								Err(error): failure = Some(error)
 								Ok(None): void
 								Ok(Some(source)):
-									match row_at(carrier, source):
+									match carrier.row_at(source):
 										Ok(Some(_)):
-											pending = pending.set(owner_number(owner), Some(source))
+											pending = pending.set(owner.owner_number(), Some(source))
 											pending_count = pending_count + 1
 										Ok(None): void
 										Err(error): failure = Some(error)
 						-- Dropping a carrier leaves the acquisitions still pending
 						-- on it as possibly the only reference to its value.
 						Some(DropOwner(owner, _)):
-							match row_at(carrier, owner_number(owner)):
+							match carrier.row_at(owner.owner_number()):
 								Err(error): failure = Some(error)
 								Ok(None): void
 								Ok(Some(origin)):
@@ -2658,7 +2651,7 @@ private pure func reached_parameters(inserted: InsertedFunction) -> Result[List[
 										for acquired_from in pending:
 											match acquired_from:
 												Some(source):
-													if source == owner_number(owner):
+													if source == owner.owner_number():
 														carrier = carrier.set(acquired, Some(origin))
 														pending = pending.set(acquired, None)
 														pending_count = pending_count - 1
@@ -2667,11 +2660,11 @@ private pure func reached_parameters(inserted: InsertedFunction) -> Result[List[
 						Some(ExecuteJoin(join)):
 							for output in [join.result].concat(join.carried):
 								match output:
-									ManagedJoinParameter(value, owner): backing = backing.set(value_number(value.id), Some(owner_number(owner)))
+									ManagedJoinParameter(value, owner): backing = backing.set(value.id.value_number(), Some(owner.owner_number()))
 									UnmanagedJoinParameter(_): void
 							var arms: List[ReachWork] = []
 							for arm in join.arms:
-								arms = arms.concat(arm_work(join.selection, arm.id, arm.inputs, loop_result))
+								arms = arms.concat(join.selection.arm_work(arm.id, arm.inputs, loop_result))
 								arms = arms.append(ReachOperations(arm.operations, 0, loop_result))
 								match arm.exit:
 									Yield(outputs): arms = arms.append(ReachInputs([outputs.transfer].concat(outputs.carried), [join.result].concat(join.carried)))
@@ -2680,11 +2673,11 @@ private pure func reached_parameters(inserted: InsertedFunction) -> Result[List[
 						Some(ExecuteLoop(loop)):
 							for output in [loop.result].concat(loop.carried):
 								match output:
-									ManagedJoinParameter(value, owner): backing = backing.set(value_number(value.id), Some(owner_number(owner)))
+									ManagedJoinParameter(value, owner): backing = backing.set(value.id.value_number(), Some(owner.owner_number()))
 									UnmanagedJoinParameter(_): void
 							nested = Some([
 								-- Entry acquisitions precede the headers, as acquisitions do.
-								ReachOperations(loop.entry_acquisitions.map(pure func(entry: OwnerAcquisition) -> OwnershipOperation: AcquireOwner(entry.owner, entry.borrow, join_parameter(loop.result).span)), 0, loop_result),
+								ReachOperations(loop.entry_acquisitions.map(pure func(entry: OwnerAcquisition) -> OwnershipOperation: AcquireOwner(entry.owner, entry.borrow, loop.result.join_parameter().span)), 0, loop_result),
 								ReachInputs(loop.headers.map(pure func(header): header.initial), loop.headers.map(pure func(header): header.parameter)),
 								ReachOperations(loop.body.operations, 0, Some(loop.result)),
 								ReachTail(loop.body.tail, Some(loop.result)),
@@ -2699,7 +2692,7 @@ private pure func reached_parameters(inserted: InsertedFunction) -> Result[List[
 					remaining = remaining - 1
 					match items.get(remaining):
 						Some(item):
-							work = push_at(work, depth, item)
+							work = work.push_at(depth, item)
 							depth = depth + 1
 						None: failure = Some(internal_error(compiler_span(), "ownership reach work is missing"))
 	match failure:
@@ -2774,8 +2767,8 @@ private pure func carried_by(table: List[Carried], values: List[ValueId]) -> Res
 	var carried: Carried = CarriesNothing
 	var failure: Option[Diagnostic] = None
 	for value in values:
-		match row_at(table, value_number(value)):
-			Ok(found): carried = carried_union(carried, found)
+		match table.row_at(value.value_number()):
+			Ok(found): carried = carried.carried_union(found)
 			Err(error): failure = Some(error)
 	match failure:
 		Some(error): Err(error)
@@ -2796,7 +2789,7 @@ private pure func call_facts(function: LoweredFunction, caller: Int) -> Result[C
 	start: ScannedBlock = { steps = function.steps, tail = None }
 	var blocks: List[ScannedBlock] = [start]
 	var next = 0
-	while and(next < blocks.length(), failure.is_none()):
+	while (next < blocks.length()).and(failure.is_none()):
 		var block: Option[ScannedBlock] = blocks.get(next)
 		next = next + 1
 		match block:
@@ -2807,14 +2800,14 @@ private pure func call_facts(function: LoweredFunction, caller: Int) -> Result[C
 						Define(definition):
 							produced: Result[Carried, Diagnostic] = match definition.operation:
 								ParameterValue(position): Ok(CarriesParameter(position))
-								ReadRecordFieldValue(_, parent) | PayloadValue(_, parent) | ListElementValue(_, parent): row_at(table, value_number(parent))
+								ReadRecordFieldValue(_, parent) | PayloadValue(_, parent) | ListElementValue(_, parent): table.row_at(parent.value_number())
 								CallValue(RuntimeFunction(operation), arguments):
-									if reuses_first_operand(operation):
+									if operation.reuses_first_operand():
 										match arguments.get(0):
 											Some(operand):
-												match row_at(table, value_number(operand)):
+												match table.row_at(operand.value_number()):
 													Ok(carried):
-														reusing = mark_carried(reusing, carried)
+														reusing = reusing.mark_carried(carried)
 														Ok(CarriesNothing)
 													Err(error): Err(error)
 											None: Ok(CarriesNothing)
@@ -2824,25 +2817,25 @@ private pure func call_facts(function: LoweredFunction, caller: Int) -> Result[C
 									var carried: List[Carried] = []
 									var missing: Option[Diagnostic] = None
 									for argument in arguments:
-										match row_at(table, value_number(argument)):
+										match table.row_at(argument.value_number()):
 											Ok(found): carried = carried.append(found)
 											Err(error): missing = Some(error)
-									calls = calls.append({ caller = caller, callee = function_number(callee), arguments = carried })
+									calls = calls.append({ caller = caller, callee = callee.function_number(), arguments = carried })
 									match missing:
 										Some(error): Err(error)
 										None: Ok(CarriesNothing)
 								FreeCallableValue(body) | CapturedCallableValue(body, _):
-									taken = taken.append(function_number(body))
+									taken = taken.append(body.function_number())
 									Ok(CarriesNothing)
 								_: Ok(CarriesNothing)
 							match produced:
 								Ok(carried):
-									while table.length() <= value_number(definition.id):
+									while table.length() <= definition.id.value_number():
 										table = table.append(CarriesNothing)
-									table = table.set(value_number(definition.id), carried)
+									table = table.set(definition.id.value_number(), carried)
 								Err(error): failure = Some(error)
 						Join(join):
-							match (carried_by(table, join.reads), row_at(table, value_number(join.selection.scrutinee))):
+							match (table.carried_by(join.reads), table.row_at(join.selection.scrutinee.value_number())):
 								(Ok(read), Ok(matched)):
 									var introduced: List[CarriedValue] = [join.result].concat(join.carried).map(pure func(output: ValueParameter) -> CarriedValue: { value = output.id, carried = read })
 									for arm in join.arms:
@@ -2852,35 +2845,35 @@ private pure func call_facts(function: LoweredFunction, caller: Int) -> Result[C
 											Lower.TransferLoop(_, tail): Some(tail)
 										blocks = blocks.append({ steps = arm.steps, tail = exit_tail })
 									for written in introduced:
-										while table.length() <= value_number(written.value):
+										while table.length() <= written.value.value_number():
 											table = table.append(CarriesNothing)
-										table = table.set(value_number(written.value), written.carried)
+										table = table.set(written.value.value_number(), written.carried)
 								(Err(error), _): failure = Some(error)
 								(_, Err(error)): failure = Some(error)
 						Loop(loop):
-							match carried_by(table, loop.headers.map(pure func(header: Lower.LoopHeader) -> ValueId: header.initial).concat(loop.body_reads)):
+							match table.carried_by(loop.headers.map(pure func(header: Lower.LoopHeader) -> ValueId: header.initial).concat(loop.body_reads)):
 								Err(error): failure = Some(error)
 								Ok(read):
 									var introduced: List[CarriedValue] = [loop.result].concat(loop.carried).map(pure func(output: ValueParameter) -> CarriedValue: { value = output.id, carried = read })
 									for header in loop.headers:
-										match row_at(table, value_number(header.initial)):
+										match table.row_at(header.initial.value_number()):
 											Ok(carried): introduced = introduced.append({ value = header.parameter.id, carried = carried })
 											Err(error): failure = Some(error)
 									for written in introduced:
-										while table.length() <= value_number(written.value):
+										while table.length() <= written.value.value_number():
 											table = table.append(CarriesNothing)
-										table = table.set(value_number(written.value), written.carried)
+										table = table.set(written.value.value_number(), written.carried)
 									blocks = blocks.append({ steps = loop.body.steps, tail = Some(loop.body.tail) })
 				match scanned.tail:
 					Some(Lower.MatchLoop(matched)):
-						match row_at(table, value_number(matched.selection.scrutinee)):
+						match table.row_at(matched.selection.scrutinee.value_number()):
 							Err(error): failure = Some(error)
 							Ok(carried):
 								for arm in matched.arms:
 									for input in arm.inputs:
-										while table.length() <= value_number(input.id):
+										while table.length() <= input.id.value_number():
 											table = table.append(CarriesNothing)
-										table = table.set(value_number(input.id), carried)
+										table = table.set(input.id.value_number(), carried)
 									blocks = blocks.append({ steps = arm.body.steps, tail = Some(arm.body.tail) })
 					_: void
 	match failure:
@@ -2893,7 +2886,7 @@ private pure func call_facts(function: LoweredFunction, caller: Int) -> Result[C
 private pure func owned_count(rows: List[OwnedParameter]) -> Int:
 	var count = 0
 	for row in rows:
-		if parameter_owned(row):
+		if row.parameter_owned():
 			count = count + 1
 	count
 
@@ -2905,8 +2898,8 @@ private pure func mark_owned_positions(rows: List[Bool], arguments: List[Carried
 	var failure: Option[Diagnostic] = None
 	var position = 0
 	for argument in arguments:
-		match row_at(owned, position):
-			Ok(True): marked = mark_carried(marked, argument)
+		match owned.row_at(position):
+			Ok(True): marked = marked.mark_carried(argument)
 			Ok(False): void
 			Err(error): failure = Some(error)
 		position = position + 1
@@ -2921,7 +2914,7 @@ private pure func owning_rows(rows: List[OwnedParameter], owning: List[Bool]) ->
 	var failure: Option[Diagnostic] = None
 	var position = 0
 	for row in rows:
-		match (row, row_at(owning, position)):
+		match (row, owning.row_at(position)):
 			(ManagedParameter(passing), Ok(True)): owned = owned.set(position, ManagedParameter({ passing | owned = True }))
 			(_, Err(error)): failure = Some(error)
 			_: void
@@ -2944,9 +2937,9 @@ private pure func analyse(
 	function: LoweredFunction, tried: List[OwnedParameter], current: List[OwnedParameter], labels: List[List[OwnedParameter]],
 	unions: List[ConcreteUnion], records: List[ConcreteRecord],
 ) -> Result[Analysis, Diagnostic]:
-	inserted ?= insert_contracted_function(function, { parameters = tried, callees = InstanceRows(labels) }, unions, records)
-	reached ?= reached_parameters(inserted)
-	merged ?= owning_rows(current, reached)
+	inserted ?= function.insert_contracted_function({ parameters = tried, callees = InstanceRows(labels) }, unions, records)
+	reached ?= inserted.reached_parameters()
+	merged ?= current.owning_rows(reached)
 	Ok({ inserted = inserted, merged = merged })
 
 
@@ -2985,10 +2978,10 @@ private record LabelQueue {
 
 -- Whether `call` passes one of its caller's parameters into an `owned` position.
 private pure func passes_a_parameter(call: CallEdge, instances: List[Instance], owned: List[Bool]) -> Result[Bool, Diagnostic]:
-	caller ?= row_at(instances, call.caller)
+	caller ?= instances.row_at(call.caller)
 	reaches_nothing: Bool = False
 	no_parameters = repeat(reaches_nothing, caller.facts.reusing.length())
-	fed ?= mark_owned_positions(no_parameters, call.arguments, owned)
+	fed ?= no_parameters.mark_owned_positions(call.arguments, owned)
 	Ok(fed.any(pure func(row): row))
 
 
@@ -3003,7 +2996,7 @@ private pure func requeue_callers(queue: LabelQueue, incoming: List[CallEdge], i
 	var failure: Option[Diagnostic] = None
 	for call in incoming:
 		kept = kept.set(call.caller, None)
-		match passes_a_parameter(call, instances, owned):
+		match call.passes_a_parameter(instances, owned):
 			Err(error): failure = Some(error)
 			Ok(False): void
 			Ok(True):
@@ -3033,7 +3026,7 @@ private pure func solve_labels(
 			match callers.get(call.callee):
 				Some(found): callers = callers.set(call.callee, found.append(call))
 				None: failure = Some(internal_error(compiler_span(), "call to an unknown instance"))
-		if and(instance.pinned.not(), instance.facts.reusing.any(pure func(row): row)):
+		if instance.pinned.not().and(instance.facts.reusing.any(pure func(row): row)):
 			queued = queued.set(index, True)
 		index = index + 1
 
@@ -3042,7 +3035,7 @@ private pure func solve_labels(
 	-- number first settles callees before their callers more often; the order
 	-- changes only the work, never the fixpoint.
 	var cursor = count - 1
-	while and(cursor >= 0, failure.is_none()):
+	while (cursor >= 0).and(failure.is_none()):
 		analysed = cursor
 		match (queued.get(analysed), instances.get(analysed), labels.get(analysed), callers.get(analysed)):
 			(Some(False), _, _, _): cursor = analysed - 1
@@ -3052,27 +3045,27 @@ private pure func solve_labels(
 				-- through an owned callee position.
 				var reaching = instance.facts.reusing
 				for call in instance.facts.calls:
-					match row_at(labels, call.callee):
+					match labels.row_at(call.callee):
 						Err(error): failure = Some(error)
 						Ok(callee):
-							match mark_owned_positions(reaching, call.arguments, callee.map(parameter_owned)):
+							match reaching.mark_owned_positions(call.arguments, callee.map(parameter_owned)):
 								Ok(marked): reaching = marked
 								Err(error): failure = Some(error)
-				match owning_rows(current, reaching):
+				match current.owning_rows(reaching):
 					Err(error): failure = Some(error)
 					Ok(tried):
 						-- A pinned caller re-queued by a flip tries nothing.
-						if and(and(failure.is_none(), instance.pinned.not()), owned_count(tried) > owned_count(current)):
-							match analyse(instance.function, tried, current, labels, unions, records):
+						if failure.is_none().and(instance.pinned.not()).and(tried.owned_count() > current.owned_count()):
+							match instance.function.analyse(tried, current, labels, unions, records):
 								Err(error): failure = Some(error)
 								Ok(analysis):
 									merged = analysis.merged
 									-- Keep the insertion only when its rows are final.
-									if owned_count(merged) == owned_count(tried):
+									if merged.owned_count() == tried.owned_count():
 										kept = kept.set(analysed, Some(analysis.inserted))
 									else:
 										kept = kept.set(analysed, no_insertion)
-									if owned_count(merged) > owned_count(current):
+									if merged.owned_count() > current.owned_count():
 										labels = labels.set(analysed, merged)
 										match requeue_callers({ queued = queued, kept = kept, cursor = cursor }, incoming, instances, merged.map(parameter_owned)):
 											Err(error): failure = Some(error)
@@ -3098,12 +3091,12 @@ union Labelling:
 private pure func inserted_instances(contents: LoweredFunctions, labelling: Labelling) -> Result[List[InsertedFunction], Diagnostic]:
 	count = contents.functions.length()
 	unpinned: Bool = False
-	var pinned = repeat(unpinned, count).set(function_number(entry_function(contents.entrypoint)), True)
+	var pinned = repeat(unpinned, count).set(contents.entrypoint.entry_function().function_number(), True)
 	var scanned: List[CallFacts] = []
 	var borrowed: List[List[OwnedParameter]] = []
 	var failure: Option[Diagnostic] = None
 	for function in contents.functions:
-		match (call_facts(function, scanned.length()), borrowed_rows(function.signature.parameters, contents.unions, contents.records)):
+		match (function.call_facts(scanned.length()), function.signature.parameters.borrowed_rows(contents.unions, contents.records)):
 			(Ok(found), Ok(rows)):
 				for body in found.taken:
 					pinned = pinned.set(body, True)
@@ -3115,7 +3108,7 @@ private pure func inserted_instances(contents: LoweredFunctions, labelling: Labe
 	var instances: List[Instance] = []
 	var index = 0
 	for function in contents.functions:
-		match (row_at(scanned, index), row_at(pinned, index)):
+		match (scanned.row_at(index), pinned.row_at(index)):
 			(Ok(found), Ok(is_pinned)): instances = instances.append({ function = function, facts = found, pinned = is_pinned })
 			(Err(error), _) | (_, Err(error)): failure = Some(error)
 		index = index + 1
@@ -3125,17 +3118,17 @@ private pure func inserted_instances(contents: LoweredFunctions, labelling: Labe
 
 	no_insertion: Option[InsertedFunction] = None
 	solved: SolvedLabels ?= match labelling:
-		InferredLabels: solve_labels(instances, borrowed, contents.unions, contents.records)
+		InferredLabels: instances.solve_labels(borrowed, contents.unions, contents.records)
 		AllBorrowed: Ok({ labels = borrowed, kept = repeat(no_insertion, count) })
 		AllOwnedExceptPinned:
 			var owned: List[List[OwnedParameter]] = []
 			for instance in instances:
 				pin = instance.pinned
-				match row_at(borrowed, owned.length()):
+				match borrowed.row_at(owned.length()):
 					Err(error): failure = Some(error)
 					Ok(rows):
 						keep = rows.map(pure func(_: OwnedParameter) -> Bool: pin.not())
-						match owning_rows(rows, keep):
+						match rows.owning_rows(keep):
 							Ok(all_owned): owned = owned.append(all_owned)
 							Err(error): failure = Some(error)
 			Ok({ labels = owned, kept = repeat(no_insertion, count) })
@@ -3143,10 +3136,10 @@ private pure func inserted_instances(contents: LoweredFunctions, labelling: Labe
 	var functions: List[InsertedFunction] = []
 	index = 0
 	for instance in instances:
-		match (row_at(solved.kept, index), row_at(solved.labels, index)):
+		match (solved.kept.row_at(index), solved.labels.row_at(index)):
 			(Ok(Some(kept)), _): functions = functions.append(kept)
 			(Ok(None), Ok(rows)):
-				match insert_contracted_function(instance.function, { parameters = rows, callees = InstanceRows(solved.labels) }, contents.unions, contents.records):
+				match instance.function.insert_contracted_function({ parameters = rows, callees = InstanceRows(solved.labels) }, contents.unions, contents.records):
 					Ok(inserted): functions = functions.append(inserted)
 					Err(error): failure = Some(error)
 			(Err(error), _) | (_, Err(error)): failure = Some(error)
@@ -3159,8 +3152,8 @@ private pure func inserted_instances(contents: LoweredFunctions, labelling: Labe
 
 
 pure func insert_ownership(program: LoweredProgram, labelling: Labelling) -> Result[OwnershipProgram, Diagnostic]:
-	contents = lowered_functions(program)
-	inserted ?= inserted_instances(contents, labelling)
+	contents = program.lowered_functions()
+	inserted ?= contents.inserted_instances(labelling)
 	Ok({
 		records = contents.records,
 		unions = contents.unions,
@@ -3172,18 +3165,18 @@ pure func insert_ownership(program: LoweredProgram, labelling: Labelling) -> Res
 -- For tests: how many owned labels of the inferred program its final
 -- insertion never consumes. Each would cost every caller an acquisition.
 pure func unconsumed_owned_labels(program: LoweredProgram) -> Result[Int, Diagnostic]:
-	inserted ?= inserted_instances(lowered_functions(program), InferredLabels)
+	inserted ?= program.lowered_functions().inserted_instances(InferredLabels)
 	var unconsumed = 0
 	var failure: Option[Diagnostic] = None
 	for function in inserted:
-		match reached_parameters(function):
+		match function.reached_parameters():
 			Err(error): failure = Some(error)
 			-- Only owned parameters have carriers, so reached ones are owned.
-			Ok(reached): unconsumed = unconsumed + owned_count(function.function.parameters) - reached.filter(pure func(row): row).length()
+			Ok(reached): unconsumed = unconsumed + function.function.parameters.owned_count() - reached.filter(pure func(row): row).length()
 	match failure:
 		Some(error): Err(error)
 		None: Ok(unconsumed)
 
 
 pure func own(program: LoweredProgram) -> Result[OwnershipProgram, Diagnostic]:
-	insert_ownership(program, InferredLabels)
+	program.insert_ownership(InferredLabels)

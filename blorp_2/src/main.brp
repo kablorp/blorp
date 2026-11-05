@@ -13,8 +13,7 @@ import:
 	result: Result methods
 	string: String methods
 	./utils/source:
-		SourceRole(CompilerRole, ModuleRole, InvalidRole), module_number, source_module,
-		source_role
+		SourceRole(CompilerRole, ModuleRole, InvalidRole), ModuleId, SourceId
 	./specialize/specialize: specialize
 	./utils/syntax:
 		Diagnostic,
@@ -29,12 +28,12 @@ import:
 
 -- Source loading publishes complete syntax and identities. Every stage here is pure.
 pure func compile(program: ParsedProgram) -> Result[String, Diagnostics]:
-	checked ?= check(program).map_err(render_failure)
-	specialized ?= specialize(checked).map_err(singleton_diagnostic)
-	lowered ?= lower(specialized).map_err(singleton_diagnostic)
-	owned ?= own(lowered).map_err(singleton_diagnostic)
-	verified ?= verify(owned).map_err(singleton_diagnostic)
-	emit(verified).map_err(singleton_diagnostic)
+	checked ?= program.check().map_err(render_failure)
+	specialized ?= checked.specialize().map_err(singleton_diagnostic)
+	lowered ?= specialized.lower().map_err(singleton_diagnostic)
+	owned ?= lowered.own().map_err(singleton_diagnostic)
+	verified ?= owned.verify().map_err(singleton_diagnostic)
+	verified.emit().map_err(singleton_diagnostic)
 
 
 private LINE_FEED_BYTE: Int = 10
@@ -61,14 +60,14 @@ private pure func render_file_location(file: SourceFile, span: Span) -> String:
 
 
 private pure func render_location(inputs: SourceInputs, span: Span) -> Result[String, String]:
-	match source_role(span.source):
+	match span.source.source_role():
 		CompilerRole:
 			Ok("blorp_2")
 		ModuleRole:
-			match source_module(span.source).to_result("invalid module source identity in diagnostic"):
+			match span.source.source_module().to_result("invalid module source identity in diagnostic"):
 				Ok(id):
-					match inputs.modules.get(module_number(id)).to_result("diagnostic references a missing module source"):
-						Ok(file): Ok(render_file_location(file, span))
+					match inputs.modules.get(id.module_number()).to_result("diagnostic references a missing module source"):
+						Ok(file): Ok(file.render_file_location(span))
 						Err(error): Err(error)
 				Err(error): Err(error)
 		InvalidRole:
@@ -100,7 +99,7 @@ private pure func located_texts(diagnostic: Diagnostic) -> List[LocatedText]:
 	match diagnostic.note:
 		None: void
 		Some(note):
-			for note_line in note_lines(note):
+			for note_line in note.note_lines():
 				lines = lines.append({ span = note_line.span, text = ": note: ${note_line.text}" })
 	lines
 
@@ -113,16 +112,16 @@ private pure func render_lines(inputs: SourceInputs, lines: List[LocatedText], r
 		None:
 			Ok(rendered)
 		Some(line):
-			match render_location(inputs, line.span):
-				Ok(location): render_lines(inputs, lines, rendered.append(location.concat(line.text)))
+			match inputs.render_location(line.span):
+				Ok(location): inputs.render_lines(lines, rendered.append(location.concat(line.text)))
 				Err(error): Err(error)
 
 
 pure func render_diagnostics(inputs: SourceInputs, errors: Diagnostics) -> String:
 	var lines: List[LocatedText] = []
 	for error in [errors.first].concat(errors.remaining):
-		lines = lines.concat(located_texts(error))
-	match render_lines(inputs, lines, []):
+		lines = lines.concat(error.located_texts())
+	match inputs.render_lines(lines, []):
 		Ok(rendered):
 			rendered.join("\n")
 		Err(error):
@@ -135,9 +134,9 @@ func main(args: List[String]) -> Int:
 		[_, "--library-root", library_root, "--test-suite", root_path, ...later_and_output]:
 			match later_and_output.last():
 				None: usage_error()
-				Some(output_path): compile_loaded(load_test_program(root_path, later_and_output.take(later_and_output.length() - 1), library_root), output_path)
+				Some(output_path): root_path.load_test_program(later_and_output.take(later_and_output.length() - 1), library_root).compile_loaded(output_path)
 		[_, "--library-root", library_root, input_path, output_path]:
-			compile_loaded(load_program(input_path, library_root), output_path)
+			input_path.load_program(library_root).compile_loaded(output_path)
 		_:
 			usage_error()
 
@@ -150,9 +149,9 @@ private func usage_error() -> Int:
 -- write_text replaces the output atomically, so a failed or interrupted
 -- compile never leaves a truncated C file behind.
 private func publish(path: String, generated_c: String) -> Int:
-	match write_text(path, generated_c):
+	match path.write_text(generated_c):
 		Err(error):
-			print_error("blorp_2: error: could not write ${describe(error)}\nhelp: provide a writable output path")
+			print_error("blorp_2: error: could not write ${error.describe()}\nhelp: provide a writable output path")
 			1
 		Ok(_):
 			0
@@ -161,12 +160,12 @@ private func publish(path: String, generated_c: String) -> Int:
 private func compile_loaded(input: Result[LoadedProgram, LoadFailure], output_path: String) -> Int:
 	match input:
 		Err(failure):
-			print_error(render_diagnostics(failure.sources, singleton_diagnostic(failure.diagnostic)))
+			failure.sources.render_diagnostics(failure.diagnostic.singleton_diagnostic()).print_error()
 			1
 		Ok(loaded):
-			match compile(loaded.program):
+			match loaded.program.compile():
 				Err(errors):
-					print_error(render_diagnostics(loaded.sources, errors))
+					loaded.sources.render_diagnostics(errors).print_error()
 					1
 				Ok(generated_c):
-					publish(output_path, generated_c)
+					output_path.publish(generated_c)

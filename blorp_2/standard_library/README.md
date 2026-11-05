@@ -37,12 +37,13 @@ Each arithmetic trait has one member: `add`, `subtract`, `multiply`, `divide` an
 each returns `Self`. The prelude's selection makes them the canonical traits of
 `+`, `-`, `*`, `/`, `%` and prefix `-`, so user code writes `a + b` or
 `a.add(b)` alike. Library implementation code uses operators for ordinary
-arithmetic and ordering; trait definitions and direct member delegation retain
-explicit calls.
+arithmetic and ordering; trait definitions and direct member delegation call
+members through UFCS, as in `left.equals(right)`.
 
-`bool.brp` defines pure, ordinary `not`, `and` and `or`; select them explicitly
-with `bool: not, and, or` for direct calls and UFCS. Both binary arguments are eager;
-use an explicit `match` to skip evaluation. The prelude leaves these names available
+`bool.brp` defines pure, ordinary `not`, `and` and `or`. Select them by name,
+as in `bool: not, and, or`, for direct calls, or use `bool: Bool methods` for
+UFCS (`done.not()`, `left.and(right)`), as the compiler source does. Both
+binary arguments are eager; use an explicit `match` to skip evaluation. The prelude leaves these names available
 for user helper declarations and selections of their own ordinary functions.
 They import only other library modules and `_base`, never user modules.
 

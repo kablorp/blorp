@@ -3,22 +3,22 @@ Checking's public boundary: composes the phases in order and seals either a
 CheckedProgram or a CheckFailure carrying the first error.
 ---
 import:
-	../namespace/builtins: CheckedFoundation, check_builtin_types
+	../namespace/builtins: CheckedFoundation, ParsedProgram methods
 	./bodies: resolve_functions
 	./constants: constant_annotations, validate_constants
 	./errors: BuiltinError(BuiltinTypesRejected), CheckError, CheckErrors, builtin_error, namespace_rejection
-	./traits: prepare_equality_availability, accepted_traits, accept_trait_contracts, validate_implementations
+	./traits: prepare_equality_availability, accept_trait_contracts, validate_implementations, TraitAvailability
 	./well_formed: validate_written_bounds
 	./model: CheckedFunctions
-	./recursion: validate_recursive_instantiation, finalize_trait_instances, final_traits
+	./recursion: validate_recursive_instantiation, finalize_trait_instances, FinalTraits
 	./supertraits: validate_supertrait_implementations
-	./receiver_clashes: admit_receivers
+	./receiver_clashes: Namespace methods
 	./signatures: AcceptedFunction, validate_signatures
 	result: Result methods
-	./declarations: validate_declarations, validate_finite_declarations
-	../utils/ids: FunctionId, RecordId, UnionId, inventory_opaques
-	../namespace/namespace: Namespace, build_namespace, namespace_problem_span
-	../parse/assemble: ParsedProgram, parsed_contents
+	./declarations: validate_declarations, CheckedDeclarations
+	../utils/ids: FunctionId, RecordId, UnionId, DeclarationInventory
+	../namespace/namespace: Namespace, NamespaceProblem, ParsedProgram methods
+	../parse/assemble: ParsedProgram
 
 
 opaque type CheckedProgram = CheckedFunctions
@@ -64,39 +64,39 @@ opaque type CheckFailure = FailureContents
 
 
 private pure func check_program(program: ParsedProgram) -> Result[CheckedProgram, CheckFailure]:
-	parsed = parsed_contents(program)
+	parsed = program.parsed_contents()
 
-	foundation_result: Result[CheckedFoundation, CheckError] = match check_builtin_types(program):
+	foundation_result: Result[CheckedFoundation, CheckError] = match program.check_builtin_types():
 		Ok(accepted):
 			Ok(accepted)
 		Err(error):
 			Err(builtin_error(error.span, BuiltinTypesRejected(error)))
 
 	foundation ?= foundation_result.map_err(pure func(error): failed(program, error, []))
-	namespace_result: Result[Namespace, CheckError] = match build_namespace(program):
+	namespace_result: Result[Namespace, CheckError] = match program.build_namespace():
 		Ok(accepted): Ok(accepted)
-		Err(problem): Err(namespace_rejection(namespace_problem_span(problem), problem))
+		Err(problem): Err(namespace_rejection(problem.namespace_problem_span(), problem))
 	namespace ?= namespace_result.map_err(pure func(error): failed(program, error, []))
-	declarations ?= validate_declarations(parsed, namespace).map_err(pure func(error): failed(program, error, []))
-	declarations_finite ?= validate_finite_declarations(declarations).map_err(pure func(error): failed(program, error, []))
-	annotations ?= constant_annotations(parsed, namespace).map_err(pure func(error): failed(program, error, []))
-	contracts ?= accept_trait_contracts(parsed, namespace, foundation.designated.boolean).map_err(pure func(error): failed(program, error, []))
-	signatures ?= validate_signatures(parsed, namespace, foundation.designated, contracts.declarations).map_err(pure func(error): failed(program, error, []))
-	authored ?= validate_implementations(parsed, namespace, signatures.implementation_headers, signatures.functions, contracts).map_err(pure func(error): failed(program, error, signatures.functions))
-	availability ?= prepare_equality_availability(parsed, authored, declarations, foundation.designated.boolean).map_err(pure func(error): failed(program, error, signatures.functions))
-	_: Void ?= validate_written_bounds(parsed, availability, declarations, signatures.functions, signatures.implementation_headers, annotations).map_err(pure func(error): failed(program, error, signatures.functions))
-	traits = accepted_traits(availability)
-	receivers ?= admit_receivers(namespace, signatures.functions, parsed.modules.length(), parsed.dependency_order, traits).map_err(pure func(error): failed(program, error, signatures.functions))
-	constants ?= validate_constants(parsed, namespace, annotations, declarations.records, declarations.unions, signatures.functions, availability).map_err(pure func(error): failed(program, error, signatures.functions))
-	functions ?= resolve_functions(
-		signatures.functions, declarations, inventory_opaques(parsed.declarations),
+	declarations ?= parsed.validate_declarations(namespace).map_err(pure func(error): failed(program, error, []))
+	declarations_finite ?= declarations.validate_finite_declarations().map_err(pure func(error): failed(program, error, []))
+	annotations ?= parsed.constant_annotations(namespace).map_err(pure func(error): failed(program, error, []))
+	contracts ?= parsed.accept_trait_contracts(namespace, foundation.designated.boolean).map_err(pure func(error): failed(program, error, []))
+	signatures ?= parsed.validate_signatures(namespace, foundation.designated, contracts.declarations).map_err(pure func(error): failed(program, error, []))
+	authored ?= parsed.validate_implementations(namespace, signatures.implementation_headers, signatures.functions, contracts).map_err(pure func(error): failed(program, error, signatures.functions))
+	availability ?= parsed.prepare_equality_availability(authored, declarations, foundation.designated.boolean).map_err(pure func(error): failed(program, error, signatures.functions))
+	_: Void ?= parsed.validate_written_bounds(availability, declarations, signatures.functions, signatures.implementation_headers, annotations).map_err(pure func(error): failed(program, error, signatures.functions))
+	traits = availability.accepted_traits()
+	receivers ?= namespace.admit_receivers(signatures.functions, parsed.modules.length(), parsed.dependency_order, traits).map_err(pure func(error): failed(program, error, signatures.functions))
+	constants ?= parsed.validate_constants(namespace, annotations, declarations.records, declarations.unions, signatures.functions, availability).map_err(pure func(error): failed(program, error, signatures.functions))
+	functions ?= signatures.functions.resolve_functions(
+		declarations, parsed.declarations.inventory_opaques(),
 		namespace, receivers, constants, availability, foundation.designated.result, foundation.designated.boolean, foundation.designated.option,
 	).map_err(pure func(error): failed(program, error, signatures.functions))
-	unavailable ?= validate_recursive_instantiation(functions.functions, functions.lambdas, traits).map_err(pure func(error): failed(program, error, signatures.functions))
-	final ?= finalize_trait_instances(constants, functions.functions, functions.lambdas, traits, unavailable).map_err(pure func(error): failed(program, error, signatures.functions))
-	_: Void ?= validate_supertrait_implementations(parsed, namespace, signatures.implementation_headers, availability, final).map_err(pure func(error): failed(program, error, signatures.functions))
+	unavailable ?= functions.functions.validate_recursive_instantiation(functions.lambdas, traits).map_err(pure func(error): failed(program, error, signatures.functions))
+	final ?= constants.finalize_trait_instances(functions.functions, functions.lambdas, traits, unavailable).map_err(pure func(error): failed(program, error, signatures.functions))
+	_: Void ?= parsed.validate_supertrait_implementations(namespace, signatures.implementation_headers, availability, final).map_err(pure func(error): failed(program, error, signatures.functions))
 	Ok(into_opaque CheckedProgram({
-				traits = final_traits(final),
+				traits = final.final_traits(),
 				unions = declarations.unions,
 				records = declarations.records,
 				opaques = declarations.opaques,
@@ -111,7 +111,7 @@ private pure func failed(program: ParsedProgram, error: CheckError, functions: L
 
 
 pure func check(program: ParsedProgram) -> Result[CheckedProgram, CheckFailure]:
-	check_program(program)
+	program.check_program()
 
 
 -- Only failed post-signature checking keeps this borrowed accepted view for

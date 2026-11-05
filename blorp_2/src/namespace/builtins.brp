@@ -1,10 +1,10 @@
 import:
-	bool: not, and, or
-	../utils/ids: UnionRow, VariantId, FunctionRow, FunctionRole(TraitDefaultBody), TraitMethodDeclaration(DefaultMethod), inventory_traits, inventory_functions, inventory_unions
-	../utils/names: FoundationWords, InitialNames, NameId, foundation_words
+	bool: Bool methods
+	../utils/ids: UnionRow, VariantId, FunctionRow, FunctionRole(TraitDefaultBody), TraitMethodDeclaration(DefaultMethod), DeclarationInventory
+	../utils/names: FoundationWords, InitialNames, NameId, NameTable
 	int: Int methods
 	option: Option methods
-	../parse/assemble: ParsedContents, ParsedProgram, ParsedBuiltinDeclaration, parsed_contents
+	../parse/assemble: ParsedContents, ParsedProgram, ParsedBuiltinDeclaration
 	../utils/syntax:
 		Diagnostic,
 		ParsedBuiltinType(IntegerBuiltin, FloatBuiltin, StringBuiltin, VoidBuiltin, ListBuiltin),
@@ -161,9 +161,9 @@ pure func runtime_contract[Variant, Element](
 		StringSlice(option):
 			{ purity = Pure, parameters = [PrimitiveRuntimeType(BuiltinString), PrimitiveRuntimeType(BuiltinInt), PrimitiveRuntimeType(BuiltinInt)], return_type = OptionalResult(PrimitiveRuntimeType(BuiltinString), option) }
 		SystemCall(system, result):
-			signature = system_signature(system)
-			parameters = signature.parameters.map(pure func(parameter: SystemParameter) -> RuntimeType[Element]: parameter_runtime_type(parameter))
-			{ purity = Impure, parameters = parameters, return_type = ResultResult(payload_runtime_type(signature.success), payload_runtime_type(signature.error), result) }
+			signature = system.system_signature()
+			parameters = signature.parameters.map(pure func(parameter: SystemParameter) -> RuntimeType[Element]: parameter.parameter_runtime_type())
+			{ purity = Impure, parameters = parameters, return_type = ResultResult(signature.success.payload_runtime_type(), signature.error.payload_runtime_type(), result) }
 		ListRepeat(element):
 			{ purity = Pure, parameters = [ElementRuntimeType(element), PrimitiveRuntimeType(BuiltinInt)], return_type = ValueResult(ListRuntimeType(element)) }
 		ListLength(element):
@@ -288,7 +288,7 @@ pure func runtime_declaration_help(operation: ParsedRuntimeOperation) -> String:
 		StringByteAtBuiltin: "declare a pure nongeneric function with String and Int parameters returning Option[Int]"
 		StringFromCodepointBuiltin: "declare a pure nongeneric function with one Int parameter returning Option[String]"
 		StringSliceBuiltin: "declare a pure nongeneric function with String, Int and Int parameters returning Option[String]"
-		SystemBuiltin(system): system_declaration_help(system)
+		SystemBuiltin(system): system.system_declaration_help()
 		ListRepeatBuiltin: "declare a pure function with E and Int parameters returning List[E]"
 		ListLengthBuiltin: "declare a pure function with one List[E] parameter returning Int"
 		ListGetBuiltin: "declare a pure function with List[E] and Int parameters returning Option[E]"
@@ -317,8 +317,8 @@ private pure func payload_spelling(payload: SystemPayload) -> String:
 
 -- Rendered from the signature row, so the help cannot disagree with it.
 private pure func system_declaration_help(operation: SystemOperation) -> String:
-	signature = system_signature(operation)
-	spelled = signature.parameters.map(pure func(parameter: SystemParameter) -> String: parameter_spelling(parameter))
+	signature = operation.system_signature()
+	spelled = signature.parameters.map(pure func(parameter: SystemParameter) -> String: parameter.parameter_spelling())
 	parameters = match spelled:
 		[]: "no parameters"
 		[only]: "one ${only} parameter"
@@ -328,7 +328,7 @@ private pure func system_declaration_help(operation: SystemOperation) -> String:
 			else:
 				"${first}, ${second} parameters"
 		_: "${spelled.join(", ")} parameters"
-	"declare an impure nongeneric function with ${parameters} returning Result[${payload_spelling(signature.success)}, ${payload_spelling(signature.error)}]"
+	"declare an impure nongeneric function with ${parameters} returning Result[${signature.success.payload_spelling()}, ${signature.error.payload_spelling()}]"
 
 
 union BuiltinTypeRole:
@@ -394,7 +394,7 @@ private pure func foundation_default(row: FunctionRow, parsed: ParsedContents) -
 	match row.role:
 		TraitDefaultBody:
 			var owned: Bool = False
-			for declaration in inventory_traits(parsed.declarations):
+			for declaration in parsed.declarations.inventory_traits():
 				if declaration.module == parsed.foundation.types:
 					for method in declaration.methods:
 						match method.declaration:
@@ -409,10 +409,10 @@ private pure func foundation_default(row: FunctionRow, parsed: ParsedContents) -
 -- The foundation types module only declares types.
 private pure func check_foundation_shape(parsed: ParsedContents) -> Result[Void, BuiltinTypeError]:
 	var function_span: Option[Span] = None
-	for row in inventory_functions(parsed.declarations):
+	for row in parsed.declarations.inventory_functions():
 		function = row.declaration
-		if and(function_span.is_none(), function.module == parsed.foundation.types):
-			if foundation_default(row, parsed).not():
+		if function_span.is_none().and(function.module == parsed.foundation.types):
+			if row.foundation_default(parsed).not():
 				function_span = Some(function.function_name.span)
 	functionless ?= reject_at(function_span, FoundationFunctions)
 	var import_span: Option[Span] = None
@@ -430,25 +430,25 @@ private pure func accept_builtins(parsed: ParsedContents, accepted: List[ParsedB
 		None:
 			Ok(accepted)
 		Some(row):
-			role = builtin_type_role(row.declaration)
-			span = builtin_type_name(row.declaration).span
+			role = row.declaration.builtin_type_role()
+			span = row.declaration.builtin_type_name().span
 			var repeated: Bool = False
 			for earlier in accepted:
-				repeated = or(repeated, builtin_type_role(earlier.declaration) == role)
+				repeated = repeated.or(earlier.declaration.builtin_type_role() == role)
 			if row.module != parsed.foundation.types:
 				Err(builtin_type_error(span, BuiltinOutsideFoundation))
 			else if repeated:
 				Err(builtin_type_error(span, DuplicateBuiltinType(role)))
 			else:
-				accept_builtins(parsed, accepted.append(row))
+				parsed.accept_builtins(accepted.append(row))
 
 
 -- Accepted declarations name each role at most once; a missing one ends the foundation module.
 private pure func builtin_head(accepted: List[ParsedBuiltinDeclaration], role: BuiltinTypeRole, end: Span) -> Result[NameId, BuiltinTypeError]:
 	var head: Option[NameId] = None
 	for row in accepted:
-		if builtin_type_role(row.declaration) == role:
-			head = Some(builtin_type_name(row.declaration).id)
+		if row.declaration.builtin_type_role() == role:
+			head = Some(row.declaration.builtin_type_name().id)
 	match head:
 		Some(present): Ok(present)
 		None: Err(builtin_type_error(end, MissingBuiltinType(role)))
@@ -504,7 +504,7 @@ private pure func carries(row: UnionRow, fields: List[TypeSyntax], payload: Opti
 private pure func shaped_variant(row: UnionRow, shape: ConstructorShape) -> Option[VariantId]:
 	var found: Option[VariantId] = None
 	for variant in row.variants:
-		if and(variant.declaration.name.id == shape.name, carries(row, variant.declaration.fields, shape.payload)):
+		if (variant.declaration.name.id == shape.name).and(row.carries(variant.declaration.fields, shape.payload)):
 			found = Some(variant.id)
 			break
 	found
@@ -519,22 +519,16 @@ private fixed record DesignatedPair {
 
 
 private pure func designated_pair(parsed: ParsedContents, role: DesignatedUnionRole, end: Span) -> Result[DesignatedPair, BuiltinTypeError]:
-	shape = designated_shape(role, foundation_words(parsed.names))
+	shape = role.designated_shape(parsed.names.foundation_words())
 	var declaration: Option[UnionRow] = None
-	for row in inventory_unions(parsed.declarations):
-		if and(
-			and(
-				declaration.is_none(),
-				row.module == parsed.foundation.types,
-			),
-			row.type_name.id == shape.name,
-		):
+	for row in parsed.declarations.inventory_unions():
+		if declaration.is_none().and(row.module == parsed.foundation.types).and(row.type_name.id == shape.name):
 			declaration = Some(row)
 	row: UnionRow ?= match declaration:
 		None: Err(builtin_type_error(end, MissingDesignatedUnion(role)))
 		Some(found): Ok(found)
-	has_designated_shape = and(and(row.type_parameters.length() == shape.parameters, row.variants.length() == 2), row.fixed == shape.fixed)
-	match (shaped_variant(row, shape.first), shaped_variant(row, shape.second), has_designated_shape):
+	has_designated_shape = (row.type_parameters.length() == shape.parameters).and(row.variants.length() == 2).and(row.fixed == shape.fixed)
+	match (row.shaped_variant(shape.first), row.shaped_variant(shape.second), has_designated_shape):
 		(Some(first), Some(second), True): Ok({ first = first, second = second })
 		_: Err(builtin_type_error(row.type_name.span, MalformedDesignatedUnion(role)))
 
@@ -543,9 +537,9 @@ private pure func designated_pair(parsed: ParsedContents, role: DesignatedUnionR
 -- fact only, decided here once from the foundation module by wired-in name.
 -- A same-named union elsewhere is an ordinary declaration.
 private pure func designate_unions(parsed: ParsedContents, end: Span) -> Result[DesignatedUnions, BuiltinTypeError]:
-	boolean ?= designated_pair(parsed, BoolUnion, end)
-	option ?= designated_pair(parsed, OptionUnion, end)
-	result ?= designated_pair(parsed, ResultUnion, end)
+	boolean ?= parsed.designated_pair(BoolUnion, end)
+	option ?= parsed.designated_pair(OptionUnion, end)
+	result ?= parsed.designated_pair(ResultUnion, end)
 	Ok({
 		boolean = { true_variant = boolean.first, false_variant = boolean.second },
 		option = { some = option.first, none = option.second },
@@ -567,20 +561,20 @@ record CheckedFoundation {
 -- spelling and append_module rejects a foreign name table, so every name id here
 -- has a spelling and the five role names and the entrypoint are distinct.
 pure func check_builtin_types(program: ParsedProgram) -> Result[CheckedFoundation, BuiltinTypeError]:
-	parsed = parsed_contents(program)
+	parsed = program.parsed_contents()
 	-- A missing builtin declaration is reported at the end of the foundation types module.
 	var end = parsed.end
 	for row in parsed.modules:
 		if row.module == parsed.foundation.types:
 			end = row.end
-	shaped ?= check_foundation_shape(parsed)
-	accepted ?= accept_builtins(parsed, [])
-	integer_id ?= builtin_head(accepted, IntegerType, end)
-	string_id ?= builtin_head(accepted, StringType, end)
-	unit_id ?= builtin_head(accepted, VoidType, end)
-	float_id ?= builtin_head(accepted, FloatType, end)
-	list_id ?= builtin_head(accepted, ListType, end)
-	designated ?= designate_unions(parsed, end)
+	shaped ?= parsed.check_foundation_shape()
+	accepted ?= parsed.accept_builtins([])
+	integer_id ?= accepted.builtin_head(IntegerType, end)
+	string_id ?= accepted.builtin_head(StringType, end)
+	unit_id ?= accepted.builtin_head(VoidType, end)
+	float_id ?= accepted.builtin_head(FloatType, end)
+	list_id ?= accepted.builtin_head(ListType, end)
+	designated ?= parsed.designate_unions(end)
 	initial: InitialNames = { names = parsed.names, special = {
 		main = parsed.entrypoint, integer = integer_id, float = float_id, string = string_id,
 		unit = unit_id, list = list_id,
@@ -600,7 +594,7 @@ private pure func builtin_type_spelling(role: BuiltinTypeRole) -> String:
 private pure func builtin_type_declaration(role: BuiltinTypeRole) -> String:
 	match role:
 		ListType: "type List[T] = builtin"
-		_: "type ${builtin_type_spelling(role)} = builtin"
+		_: "type ${role.builtin_type_spelling()} = builtin"
 
 
 private pure func designated_union_spelling(role: DesignatedUnionRole) -> String:
@@ -620,17 +614,17 @@ private pure func designated_union_declaration(role: DesignatedUnionRole) -> Str
 pure func render_builtin_type_error(error: BuiltinTypeError) -> Diagnostic:
 	message = match error.kind:
 		DuplicateBuiltinType(_): "duplicate builtin type declaration"
-		MissingBuiltinType(role): "missing ${builtin_type_spelling(role)} builtin declaration"
-		MissingDesignatedUnion(role): "missing ${designated_union_spelling(role)} union declaration"
-		MalformedDesignatedUnion(role): "foundation union ${designated_union_spelling(role)} does not have its designated shape"
+		MissingBuiltinType(role): "missing ${role.builtin_type_spelling()} builtin declaration"
+		MissingDesignatedUnion(role): "missing ${role.designated_union_spelling()} union declaration"
+		MalformedDesignatedUnion(role): "foundation union ${role.designated_union_spelling()} does not have its designated shape"
 		BuiltinOutsideFoundation: "builtin type declarations belong in the configured foundation module"
 		FoundationImports: "foundation types cannot import modules"
 		FoundationFunctions: "foundation types cannot declare functions"
 	help = match error.kind:
-		DuplicateBuiltinType(role): "declare ${builtin_type_declaration(role)} exactly once"
-		MissingBuiltinType(role): "add ${builtin_type_declaration(role)} to _base.brp"
-		MissingDesignatedUnion(role): "add ${designated_union_declaration(role)} to _base.brp"
-		MalformedDesignatedUnion(role): "declare it as ${designated_union_declaration(role)}"
+		DuplicateBuiltinType(role): "declare ${role.builtin_type_declaration()} exactly once"
+		MissingBuiltinType(role): "add ${role.builtin_type_declaration()} to _base.brp"
+		MissingDesignatedUnion(role): "add ${role.designated_union_declaration()} to _base.brp"
+		MalformedDesignatedUnion(role): "declare it as ${role.designated_union_declaration()}"
 		BuiltinOutsideFoundation: "remove this declaration; builtin types are supplied by _base.brp under --library-root"
 		FoundationImports: "keep _base.brp independent; put operation imports in prelude.brp"
 		FoundationFunctions: "move functions to a library operation module and select its methods in prelude.brp"

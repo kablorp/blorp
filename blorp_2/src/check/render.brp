@@ -1,28 +1,22 @@
 import:
-	bool: not
+	bool: Bool methods
 	../namespace/builtins: builtin_type_name, render_builtin_type_error, runtime_declaration_help
-	./check: CheckFailure, check_errors, failure_program, failure_functions
+	./check: CheckFailure
 	./signatures: AcceptedFunction
 	./errors as Errors
-	./model as Check
+	./model as Check: FieldId, TypeParameterId
 	../utils/ids:
-		FunctionRole(TraitDefaultBody), TraitId, VariantId, trait_method_header, inventory_traits, trait_number, trait_method_owner, trait_method_number,
-		constant_number,
-		inventory_constants,
-		inventory_functions,
-		inventory_opaques,
-		inventory_records,
-		inventory_unions,
-		function_number,
-		opaque_number,
-		record_number,
-		union_number,
-		variant_number,
-		variant_owner,
+		FunctionRole(TraitDefaultBody), TraitId, VariantId, TraitMethodRow, TraitMethodId,
+		ConstantId,
+		DeclarationInventory,
+		FunctionId,
+		OpaqueId,
+		RecordId,
+		UnionId,
 	int: Int methods
 	list: repeat
-	../parse/parse: ImportOrigin(RelativeImport, LibraryImport), ImportSelection(NamedSelection, ConstructorSelection, MethodsSelection), ModulePath, selection_name
-	../utils/names: NameId, NameTable, name_spelling
+	../parse/parse: ImportOrigin(RelativeImport, LibraryImport), ImportSelection(NamedSelection, ConstructorSelection, MethodsSelection), ModulePath
+	../utils/names: NameId, NameTable
 	../namespace/namespace:
 		builtin_head,
 		Conflict,
@@ -35,7 +29,7 @@ import:
 		Unoffered(UnknownName, PrivateName, ImportedThere, ProvidedThere),
 	option: Option methods
 	result: Result methods
-	../parse/assemble: ParsedContents, ParsedProgram, parsed_contents
+	../parse/assemble: ParsedContents, ParsedProgram
 	../utils/results: translated_list
 	../utils/syntax:
 		Purity(Pure, Impure),
@@ -46,7 +40,7 @@ import:
 		),
 		Diagnostics,
 		ParsedBuiltinType(IntegerBuiltin, FloatBuiltin, StringBuiltin, VoidBuiltin, ListBuiltin),
-		ParsedImplementationHeader, ParsedTypeParameter, Span, type_span, NoteLine, WrittenName, internal_error, ParsedReceiverHead(ReceiverName, QualifiedReceiverName),
+		ParsedImplementationHeader, ParsedTypeParameter, Span, TypeSyntax, NoteLine, WrittenName, internal_error, ParsedReceiverHead(ReceiverName, QualifiedReceiverName),
 	../utils/text as Text: concat
 
 
@@ -57,19 +51,19 @@ private record RenderContext {
 
 
 pure func render_failure(failure: CheckFailure) -> Diagnostics:
-	render_errors(failure_program(failure), check_errors(failure), failure_functions(failure))
+	render_errors(failure.failure_program(), failure.check_errors(), failure.failure_functions())
 
 
 pure func render_check_errors(program: ParsedProgram, errors: Errors.CheckErrors) -> Diagnostics:
-	render_errors(program, errors, [])
+	program.render_errors(errors, [])
 
 
 private pure func render_errors(program: ParsedProgram, errors: Errors.CheckErrors, functions: List[AcceptedFunction]) -> Diagnostics:
-	context: RenderContext = { parsed = parsed_contents(program), functions = functions }
+	context: RenderContext = { parsed = program.parsed_contents(), functions = functions }
 	var remaining: List[Diagnostic] = []
 	for error in errors.remaining:
-		remaining = remaining.append(render_context_error(context, error))
-	{ first = render_context_error(context, errors.first), remaining = remaining }
+		remaining = remaining.append(context.render_context_error(error))
+	{ first = context.render_context_error(errors.first), remaining = remaining }
 
 
 private pure func invariant_message(invariant: Errors.CheckerInvariant) -> String:
@@ -173,7 +167,7 @@ private pure func arithmetic_spelling(arithmetic: Errors.ArithmeticTrait) -> Ari
 private pure func render_fault(span: Span, invariant: Errors.CheckerInvariant) -> Diagnostic:
 	rendered(
 		span,
-		invariant_message(invariant),
+		invariant.invariant_message(),
 		"report this compiler error with the input program",
 	)
 
@@ -191,11 +185,11 @@ private pure func parsed_spelling(
 	names: NameTable,
 	span: Span,
 ) -> Result[String, Diagnostic]:
-	name_spelling(names, name).or_render_fault(span, Errors.InvalidParsedName(name))
+	names.name_spelling(name).or_render_fault(span, Errors.InvalidParsedName(name))
 
 
 pure func render_check_error(program: ParsedProgram, error: Errors.CheckError) -> Diagnostic:
-	render_context_error({ parsed = parsed_contents(program), functions = [] }, error)
+	render_context_error({ parsed = program.parsed_contents(), functions = [] }, error)
 
 
 private pure func render_context_error(context: RenderContext, error: Errors.CheckError) -> Diagnostic:
@@ -244,9 +238,9 @@ private pure func render_constant_error(span: Span, rejection: Errors.ConstantEr
 		Errors.NonClosedInitializer:
 			rendered(span, "constant initializer is not a closed value", "use literals, constructor data, or named function references; calls, operators, constant references and lambdas are not allowed")
 		Errors.ConstantCalled(id):
-			spelling = inventory_constants(context.parsed.declarations).get(constant_number(id))
+			spelling = context.parsed.declarations.inventory_constants().get(id.constant_number())
 				.or_render_fault(span, Errors.InvalidConstantDeclaration(id))
-				.and_then(pure func(row): parsed_spelling(row.declaration.name.id, context.parsed.names, span))
+				.and_then(pure func(row): row.declaration.name.id.parsed_spelling(context.parsed.names, span))
 			match spelling:
 				Err(error): error
 				Ok(name): rendered(span, "constant '${name}' cannot be called",
@@ -275,8 +269,8 @@ private pure func module_path_spelling(path: ModulePath, context: RenderContext,
 				"./"
 			else:
 				repeat("../", parents).join("")
-	spelled ?= translated_list(path.parts, pure func(part: NameId) -> Result[String, Diagnostic]:
-		parsed_spelling(part, context.parsed.names, span)
+	spelled ?= path.parts.translated_list(pure func(part: NameId) -> Result[String, Diagnostic]:
+		part.parsed_spelling(context.parsed.names, span)
 	)
 	Ok(prefix.concat(spelled.join("/")))
 
@@ -284,23 +278,23 @@ private pure func module_path_spelling(path: ModulePath, context: RenderContext,
 private pure func render_qualified_error(span: Span, rejection: Errors.QualifiedError, context: RenderContext) -> Diagnostic:
 	match rejection:
 		Errors.UnknownModuleAlias(aliased):
-			match parsed_spelling(aliased, context.parsed.names, span):
+			match aliased.parsed_spelling(context.parsed.names, span):
 				Err(error): error
 				Ok(spelling):
 					rendered(span, "unknown module alias ${spelling}", "add path as ${spelling} to the import block")
 		Errors.BareModuleAlias(aliased):
-			match parsed_spelling(aliased, context.parsed.names, span):
+			match aliased.parsed_spelling(context.parsed.names, span):
 				Err(error): error
 				Ok(spelling):
 					rendered(span, "${spelling} is a module alias", "write ${spelling}.name to use a declaration of that module")
 		Errors.QualifiedNotOffered(aliased, name, path, reason):
-			match parsed_spelling(aliased, context.parsed.names, span):
+			match aliased.parsed_spelling(context.parsed.names, span):
 				Err(error): error
 				Ok(alias_spelling):
-					match parsed_spelling(name, context.parsed.names, span):
+					match name.parsed_spelling(context.parsed.names, span):
 						Err(error): error
 						Ok(selected_spelling):
-							match module_path_spelling(path, context, span):
+							match path.module_path_spelling(context, span):
 								Err(error): error
 								Ok(module):
 									match reason:
@@ -368,12 +362,12 @@ private pure func same_kind(left: Entity, right: Entity) -> Bool:
 -- name; the help says how to change the incoming one. The note marks the
 -- earlier name: a declaration, an import, or the prelude's selection.
 private pure func render_conflict(span: Span, conflict: Conflict, context: RenderContext) -> Diagnostic:
-	match parsed_spelling(conflict.incoming.name.id, context.parsed.names, span):
+	match conflict.incoming.name.id.parsed_spelling(context.parsed.names, span):
 		Err(error):
 			error
 		Ok(name):
-			incoming = entity_noun(conflict.incoming.entity)
-			previous = entity_noun(conflict.previous.entity)
+			incoming = conflict.incoming.entity.entity_noun()
+			previous = conflict.previous.entity.entity_noun()
 			alias_previous: Bool = match conflict.previous.entity:
 				Alias(_): True
 				Trait(_) | Method(_) | Function(_) | Constant(_) | Constructor(_) | Type(_): False
@@ -386,7 +380,7 @@ private pure func render_conflict(span: Span, conflict: Conflict, context: Rende
 					else:
 						"${name} is already imported"
 				Declared(_):
-					if same_kind(conflict.incoming.entity, conflict.previous.entity):
+					if conflict.incoming.entity.same_kind(conflict.previous.entity):
 						"duplicate ${incoming} name"
 					else:
 						"${incoming} name conflicts with a ${previous}"
@@ -404,7 +398,7 @@ private pure func render_conflict(span: Span, conflict: Conflict, context: Rende
 							else:
 								"rename this ${incoming}, or remove ${name} from the import"
 						Declared(_):
-							if same_kind(conflict.incoming.entity, conflict.previous.entity):
+							if conflict.incoming.entity.same_kind(conflict.previous.entity):
 								"give each ${incoming} in a module a distinct name"
 							else:
 								"functions and constructors share one name space; give them distinct names"
@@ -428,50 +422,50 @@ private pure func declaration_span(entity: Entity, context: RenderContext) -> Re
 	var failure: Option[Diagnostic] = None
 	match entity:
 		Trait(id):
-			match inventory_traits(context.parsed.declarations).get(trait_number(id)):
+			match context.parsed.declarations.inventory_traits().get(id.trait_number()):
 				Some(row): found = Some(row.type_name.span)
 				None: void
 		Method(id):
-			match inventory_traits(context.parsed.declarations).get(trait_number(trait_method_owner(id))):
+			match context.parsed.declarations.inventory_traits().get(id.trait_method_owner().trait_number()):
 				Some(row):
-					match row.methods.get(trait_method_number(id)):
+					match row.methods.get(id.trait_method_number()):
 						Some(method):
-							match trait_method_header(method, context.parsed.declarations):
+							match method.trait_method_header(context.parsed.declarations):
 								Some(header): found = Some(header.function_name.span)
 								None: failure = Some(render_fault(method.span, Errors.InvalidFunctionContract))
 						None: void
 				None: void
 		Function(id):
-			match inventory_functions(context.parsed.declarations).get(function_number(id)):
+			match context.parsed.declarations.inventory_functions().get(id.function_number()):
 				Some(row): found = Some(row.declaration.function_name.span)
 				None: void
 		Constant(id):
-			match inventory_constants(context.parsed.declarations).get(constant_number(id)):
+			match context.parsed.declarations.inventory_constants().get(id.constant_number()):
 				Some(row): found = Some(row.declaration.name.span)
 				None: void
 		Constructor(id):
-			match inventory_unions(context.parsed.declarations).get(union_number(variant_owner(id))):
+			match context.parsed.declarations.inventory_unions().get(id.variant_owner().union_number()):
 				Some(row):
-					match row.variants.get(variant_number(id)):
+					match row.variants.get(id.variant_number()):
 						Some(variant): found = Some(variant.declaration.name.span)
 						None: void
 				None: void
 		Type(UnionHead(id)):
-			match inventory_unions(context.parsed.declarations).get(union_number(id)):
+			match context.parsed.declarations.inventory_unions().get(id.union_number()):
 				Some(row): found = Some(row.type_name.span)
 				None: void
 		Type(RecordHead(id)):
-			match inventory_records(context.parsed.declarations).get(record_number(id)):
+			match context.parsed.declarations.inventory_records().get(id.record_number()):
 				Some(row): found = Some(row.declaration.type_name.span)
 				None: void
 		Type(OpaqueHead(id)):
-			match inventory_opaques(context.parsed.declarations).get(opaque_number(id)):
+			match context.parsed.declarations.inventory_opaques().get(id.opaque_number()):
 				Some(row): found = Some(row.declaration.type_name.span)
 				None: void
 		Type(candidate):
 			for row in context.parsed.builtin_types:
 				if builtin_head(row.declaration) == candidate:
-					found = Some(builtin_type_name(row.declaration).span)
+					found = Some(row.declaration.builtin_type_name().span)
 		Alias(_):
 			void
 	match failure:
@@ -488,11 +482,11 @@ private pure func methods_hint(entity: Entity, name: String, module: String) -> 
 
 -- A selection that binds nothing, named by the target's written path.
 private pure func render_selection(span: Span, path: ModulePath, selection: ImportSelection, problem: SelectionProblem, context: RenderContext) -> Diagnostic:
-	match parsed_spelling(selection_name(selection).id, context.parsed.names, span):
+	match selection.selection_name().id.parsed_spelling(context.parsed.names, span):
 		Err(error):
 			error
 		Ok(name):
-			match module_path_spelling(path, context, span):
+			match path.module_path_spelling(context, span):
 				Err(error):
 					error
 				Ok(module):
@@ -511,30 +505,30 @@ private pure func render_selection(span: Span, path: ModulePath, selection: Impo
 							message = "${name} is imported by ${module}, not declared there"
 							help: Result[String, Diagnostic] = match entity:
 								Constructor(id):
-									match type_spelling(Check.NominalType(Check.AggregateNominal(Check.UnionAggregate(variant_owner(id))), []), context, span):
+									match type_spelling(Check.NominalType(Check.AggregateNominal(Check.UnionAggregate(id.variant_owner())), []), context, span):
 										Err(error): Err(error)
 										Ok(union_name): Ok("import the union from the module that declares it, selecting ${union_name}(${name})")
 								Trait(_) | Method(_) | Function(_) | Constant(_) | Type(_) | Alias(_):
-									Ok("import ${name} from the module that declares it${methods_hint(entity, name, module)}")
+									Ok("import ${name} from the module that declares it${entity.methods_hint(name, module)}")
 							match help:
 								Err(error): error
 								Ok(text):
-									match declaration_span(entity, context):
+									match entity.declaration_span(context):
 										Ok(Some(declared)): noted(span, message, text, Declaration(declared))
 										Ok(None): rendered(span, message, text)
 										Err(error): error
 						NotOffered(ProvidedThere(entity)):
-							rendered(span, "${module} receives ${name} from the prelude and does not declare it", "${name} is already in scope through the prelude; remove it from this selection${methods_hint(entity, name, module)}")
+							rendered(span, "${module} receives ${name} from the prelude and does not declare it", "${name} is already in scope through the prelude; remove it from this selection${entity.methods_hint(name, module)}")
 						AlreadyFromPrelude(entity):
-							rendered(span, "${name} is already in scope through the prelude", "remove ${name} from this selection${methods_hint(entity, name, module)}")
+							rendered(span, "${name} is already in scope through the prelude", "remove ${name} from this selection${entity.methods_hint(name, module)}")
 						AlreadyImported(entity):
-							rendered(span, "${name} is already imported, and ${module} does not declare it", "remove ${name} from this selection${methods_hint(entity, name, module)}")
+							rendered(span, "${name} is already imported, and ${module} does not declare it", "remove ${name} from this selection${entity.methods_hint(name, module)}")
 						AmbiguousFunction:
 							ambiguous_selection(span, module, "function")
 						AmbiguousConstant:
 							ambiguous_selection(span, module, "constant")
 						BareConstructor(variant):
-							match type_spelling(Check.NominalType(Check.AggregateNominal(Check.UnionAggregate(variant_owner(variant))), []), context, span):
+							match type_spelling(Check.NominalType(Check.AggregateNominal(Check.UnionAggregate(variant.variant_owner())), []), context, span):
 								Err(error): error
 								Ok(union_name):
 									rendered(span, "${name} is a constructor of the union ${union_name}", "write ${union_name}(${name}) to select the union with this constructor")
@@ -598,10 +592,10 @@ private pure func render_type_term_error(span: Span, rejection: Errors.TypeTermE
 	match rejection:
 		Errors.TraitUsedAsType(_): rendered(span, "a trait is not a value type", "use a concrete value type, or constrain a type parameter as T: TraitName")
 		Errors.PrivateTypeInPublicDeclaration(private_type, declaration):
-			match parsed_spelling(private_type, context.parsed.names, span):
+			match private_type.parsed_spelling(context.parsed.names, span):
 				Err(error): error
 				Ok(private_name):
-					match parsed_spelling(declaration, context.parsed.names, span):
+					match declaration.parsed_spelling(context.parsed.names, span):
 						Err(error): error
 						Ok(public_name):
 							rendered(span,
@@ -612,19 +606,19 @@ private pure func render_type_term_error(span: Span, rejection: Errors.TypeTermE
 			if count == 1:
 				rendered(
 					span,
-					"generic ${nominal_noun(owner)} requires one type argument",
+					"generic ${owner.nominal_noun()} requires one type argument",
 					"write a concrete or symbolic application, such as Box[Int] or Box[T]",
 				)
 			else:
 				rendered(
 					span,
-					"generic ${nominal_noun(owner)} requires type arguments",
+					"generic ${owner.nominal_noun()} requires type arguments",
 					"write ${count.to_string()} type arguments in declaration order",
 				)
 		Errors.TypeArgumentCountMismatch(owner, expected, actual):
 			rendered(
 				span,
-				"${nominal_kind(owner)} type argument count does not match its declaration",
+				"${owner.nominal_kind()} type argument count does not match its declaration",
 				"expected ${expected.to_string()} type arguments, got ${actual.to_string()}; supply types in declaration order",
 			)
 		Errors.UnknownType(_):
@@ -642,8 +636,8 @@ private pure func render_type_term_error(span: Span, rejection: Errors.TypeTermE
 		Errors.OrdinaryTypeApplied(owner):
 			rendered(
 				span,
-				"ordinary ${nominal_noun(owner)} does not accept a type argument",
-				"remove the type argument from this ${nominal_kind(owner)} type",
+				"ordinary ${owner.nominal_noun()} does not accept a type argument",
+				"remove the type argument from this ${owner.nominal_kind()} type",
 			)
 		Errors.ListTypeArgumentCount:
 			rendered(
@@ -666,7 +660,7 @@ private pure func nominal_kind(owner: Check.NominalId) -> String:
 private pure func nominal_noun(owner: Check.NominalId) -> String:
 	match owner:
 		Check.OpaqueNominal(_): "opaque type"
-		Check.AggregateNominal(_): nominal_kind(owner)
+		Check.AggregateNominal(_): owner.nominal_kind()
 
 
 private pure func render_signature_error(
@@ -709,12 +703,12 @@ private pure func render_signature_error(
 private pure func render_builtin_error(span: Span, rejection: Errors.BuiltinError) -> Diagnostic:
 	match rejection:
 		Errors.BuiltinTypesRejected(error):
-			render_builtin_type_error(error)
+			error.render_builtin_type_error()
 		Errors.BuiltinContractMismatch(operation):
 			rendered(
 				span,
 				"builtin declaration does not match its runtime contract",
-				runtime_declaration_help(operation),
+				operation.runtime_declaration_help(),
 			)
 		Errors.BuiltinTailAnnotation:
 			rendered(
@@ -815,9 +809,9 @@ private pure func render_call_error(
 		Errors.InfiniteTypeArgument(_):
 			rendered(span, "inferred type would contain itself", "pass a value with a finite type, or use a concrete helper")
 		Errors.UninferableTypeParameter(parameter):
-			match Check.parameter_owner(parameter):
+			match parameter.parameter_owner():
 				Check.OpaqueDeclaration(owner):
-					match parameter_spelling(parameter, context, span):
+					match parameter.parameter_spelling(context, span):
 						Err(error): error
 						Ok(parameter_name):
 							match type_spelling(Check.NominalType(Check.OpaqueNominal(owner), []), context, span):
@@ -844,7 +838,7 @@ private pure func render_arity_mismatch(
 ) -> Diagnostic:
 	if arity.expected == 0:
 		if arity.receiver_call:
-			match name_spelling(context.parsed.names, arity.callee):
+			match context.parsed.names.name_spelling(arity.callee):
 				Some(name):
 					rendered(
 						span,
@@ -913,7 +907,7 @@ private pure func render_method_error(span: Span, rejection: Errors.MethodError,
 				span,
 				sites,
 				"method argument count does not match any receiver-compatible function",
-				"pass one of these total argument counts, including the receiver: ${comma_separated(expected)}",
+				"pass one of these total argument counts, including the receiver: ${expected.comma_separated()}",
 			)
 		Errors.ConstructorUFCS(_):
 			rendered(
@@ -966,8 +960,7 @@ private pure func render_record_error(
 				"pass the literal to a concrete record parameter or return it from a helper declaring that record",
 			)
 		Errors.UnknownRecordField(name, owner):
-			result: Result[Diagnostic, Diagnostic] = parsed_spelling(
-				name,
+			result: Result[Diagnostic, Diagnostic] = name.parsed_spelling(
 				context.parsed.names,
 				span,
 			).and_then(
@@ -1004,7 +997,7 @@ private pure func render_record_error(
 				RecordFieldDeclaration(declaration),
 			)
 		Errors.RecordFieldTypeMismatch(_, _, annotation):
-			match type_spelling(annotation.value_type, context, span):
+			match annotation.value_type.type_spelling(context, span):
 				Ok(expected):
 					{ rendered(
 						span,
@@ -1058,7 +1051,7 @@ private pure func render_value_error(
 		Errors.ExpressionTypeMismatch(mismatch):
 			match mismatch.expected_site:
 				Errors.FirstIfBranchValue:
-					match type_spelling(mismatch.expected, context, span):
+					match mismatch.expected.type_spelling(context, span):
 						Err(error): error
 						Ok(expected):
 							rendered(span, "expression does not match the expected type",
@@ -1070,7 +1063,7 @@ private pure func render_value_error(
 				Errors.ForRangeBound:
 					rendered(span, "range bound must have type Int", "use an Int expression for each bound in start..end")
 				Errors.FirstArmValue:
-					match type_spelling(mismatch.expected, context, span):
+					match mismatch.expected.type_spelling(context, span):
 						Err(error): error
 						Ok(expected):
 							rendered(
@@ -1086,7 +1079,7 @@ private pure func render_value_error(
 						context,
 					)
 		Errors.InterpolationRequiresString(actual):
-			match type_spelling(actual, context, span):
+			match actual.type_spelling(context, span):
 				Err(error): error
 				Ok(spelling):
 					rendered(span, "interpolation hole has type ${spelling}; expected String", "convert Int or Float explicitly with to_string; every hole must produce a String")
@@ -1100,10 +1093,10 @@ private pure func render_value_error(
 		Errors.DictLiteralRequiresDict:
 			rendered(span, "Dict literals require the prelude's Dict", "select a Dict whose module declares pure empty, dict and set functions in the configured prelude")
 		Errors.ListElementTypeMismatch(mismatch):
-			match type_spelling(mismatch.actual, context, span):
+			match mismatch.actual.type_spelling(context, span):
 				Err(error): error
 				Ok(actual):
-					match type_spelling(mismatch.expected, context, span):
+					match mismatch.expected.type_spelling(context, span):
 						Err(error): error
 						Ok(expected):
 							reference = match mismatch.reference:
@@ -1117,7 +1110,7 @@ private pure func render_value_error(
 
 
 private pure func binding_conflict(span: Span, name: NameId, kind: String, location: String, previous: Span, context: RenderContext) -> Diagnostic:
-	match parsed_spelling(name, context.parsed.names, span):
+	match name.parsed_spelling(context.parsed.names, span):
 		Err(error): error
 		Ok(spelling):
 			noted(span, "`${spelling}` is already a ${kind} in this ${location}",
@@ -1213,16 +1206,16 @@ private pure func render_match_error(
 		Errors.BarePatternName(_, _):
 			rendered(span, "a bare name in a match arm is a constructor; use `_` to match anything", "use a visible constructor of the matched union, or write `_` and use the match's scrutinee in the arm")
 		Errors.UnimportedConstructorPattern(id):
-			match inventory_unions(context.parsed.declarations).get(union_number(variant_owner(id))):
-				None: render_fault(span, Errors.InvalidResolvedUnion(variant_owner(id)))
+			match context.parsed.declarations.inventory_unions().get(id.variant_owner().union_number()):
+				None: render_fault(span, Errors.InvalidResolvedUnion(id.variant_owner()))
 				Some(declaration):
-					match declaration.variants.get(variant_number(id)):
+					match declaration.variants.get(id.variant_number()):
 						None: render_fault(span, Errors.InvalidResolvedVariant(id))
 						Some(variant):
-							match parsed_spelling(variant.declaration.name.id, context.parsed.names, span):
+							match variant.declaration.name.id.parsed_spelling(context.parsed.names, span):
 								Err(error): error
 								Ok(name):
-									match parsed_spelling(declaration.type_name.id, context.parsed.names, span):
+									match declaration.type_name.id.parsed_spelling(context.parsed.names, span):
 										Err(error): error
 										Ok(owner):
 											noted(span,
@@ -1258,11 +1251,11 @@ private pure func render_match_error(
 		Errors.PatternTypeMismatch(_):
 			rendered(span, "pattern does not match the value's type", "use a constructor of that union, a List pattern for a List, or a String literal for a String")
 		Errors.NonExhaustiveStructuralMatch(witness):
-			match render_pattern_witness(witness, span, context):
+			match witness.render_pattern_witness(span, context):
 				Ok(pattern): rendered(span, "non-exhaustive match", "add an arm for the missing pattern: ${pattern}")
 				Err(error): error
 		Errors.NonExhaustiveMatch(missing):
-			missing_coverage(missing, span, context)
+			missing.missing_coverage(span, context)
 
 
 private pure func render_recursion_error(
@@ -1364,12 +1357,12 @@ private pure func builtin_spelling(
 						False
 
 		if selected:
-			found_name = Some(builtin_type_name(declaration.declaration).id)
+			found_name = Some(declaration.declaration.builtin_type_name().id)
 			break
 
 	match found_name:
 		Some(name):
-			parsed_spelling(name, context.parsed.names, span)
+			name.parsed_spelling(context.parsed.names, span)
 		None:
 			Err(
 				internal_error(span, "missing builtin type declaration"),
@@ -1381,29 +1374,29 @@ private pure func ordinary_parameter_spelling(
 	context: RenderContext,
 	span: Span,
 ) -> Result[String, Diagnostic]:
-	found_parameters: Option[List[ParsedTypeParameter]] = match Check.parameter_owner(id):
+	found_parameters: Option[List[ParsedTypeParameter]] = match id.parameter_owner():
 		Check.TraitDeclaration(_): None
 		Check.FunctionDeclaration(owner):
-			inventory_functions(context.parsed.declarations)
-				.get(function_number(owner))
+			context.parsed.declarations.inventory_functions()
+				.get(owner.function_number())
 				.map(pure func(row): row.declaration.type_parameters)
 		Check.UnionDeclaration(owner):
-			inventory_unions(context.parsed.declarations)
-				.get(union_number(owner))
+			context.parsed.declarations.inventory_unions()
+				.get(owner.union_number())
 				.map(pure func(declaration): declaration.type_parameters)
 
 		Check.RecordDeclaration(owner):
-			inventory_records(context.parsed.declarations)
-				.get(record_number(owner))
+			context.parsed.declarations.inventory_records()
+				.get(owner.record_number())
 				.map(pure func(row): row.declaration.type_parameters)
 		Check.OpaqueDeclaration(owner):
-			inventory_opaques(context.parsed.declarations)
-				.get(opaque_number(owner))
+			context.parsed.declarations.inventory_opaques()
+				.get(owner.opaque_number())
 				.map(pure func(row): row.declaration.type_parameters)
 
 	written: WrittenName ?= match found_parameters:
 		Some(parameters):
-			match parameters.get(Check.parameter_position(id)):
+			match parameters.get(id.parameter_position()):
 				Some(written):
 					Ok(written.name)
 				None:
@@ -1411,7 +1404,7 @@ private pure func ordinary_parameter_spelling(
 		None:
 			Err(render_fault(span, Errors.InvalidParameterDeclaration(id)))
 
-	match name_spelling(context.parsed.names, written.id):
+	match context.parsed.names.name_spelling(written.id):
 		Some(spelling):
 			Ok(spelling)
 		None:
@@ -1426,29 +1419,29 @@ private pure func type_spelling(
 ) -> Result[String, Diagnostic]:
 	match value:
 		Check.CallableType(purity, parameters, result):
-			match type_spellings(parameters, context, span, []):
+			match parameters.type_spellings(context, span, []):
 				Err(error): Err(error)
 				Ok(spelled):
-					match type_spelling(result, context, span):
+					match result.type_spelling(context, span):
 						Err(error): Err(error)
 						Ok(returned):
 							prefix: String = match purity:
 								Pure: "pure ("
 								Impure: "("
-							Ok("${prefix}${comma_separated(spelled)}) -> ${returned}")
+							Ok("${prefix}${spelled.comma_separated()}) -> ${returned}")
 		Check.NominalType(owner, arguments):
 			declared: Result[String, Diagnostic] = match owner:
 				Check.AggregateNominal(Check.RecordAggregate(id)):
-					match inventory_records(context.parsed.declarations).get(record_number(id)):
-						Some(declaration): parsed_spelling(declaration.declaration.type_name.id, context.parsed.names, span)
+					match context.parsed.declarations.inventory_records().get(id.record_number()):
+						Some(declaration): declaration.declaration.type_name.id.parsed_spelling(context.parsed.names, span)
 						None: Err(render_fault(span, Errors.InvalidRecordDeclaration(id)))
 				Check.AggregateNominal(Check.UnionAggregate(id)):
-					match inventory_unions(context.parsed.declarations).get(union_number(id)):
-						Some(declaration): parsed_spelling(declaration.type_name.id, context.parsed.names, span)
+					match context.parsed.declarations.inventory_unions().get(id.union_number()):
+						Some(declaration): declaration.type_name.id.parsed_spelling(context.parsed.names, span)
 						None: Err(render_fault(span, Errors.InvalidResolvedUnion(id)))
 				Check.OpaqueNominal(id):
-					match inventory_opaques(context.parsed.declarations).get(opaque_number(id)):
-						Some(declaration): parsed_spelling(declaration.declaration.type_name.id, context.parsed.names, span)
+					match context.parsed.declarations.inventory_opaques().get(id.opaque_number()):
+						Some(declaration): declaration.declaration.type_name.id.parsed_spelling(context.parsed.names, span)
 						None: Err(render_fault(span, Errors.InvalidOpaqueDeclaration(id)))
 			match declared:
 				Err(error): Err(error)
@@ -1456,19 +1449,19 @@ private pure func type_spelling(
 					if arguments.is_empty():
 						Ok(name)
 					else:
-						match type_spellings(arguments, context, span, []):
-							Ok(spelled): Ok("${name}[${comma_separated(spelled)}]")
+						match arguments.type_spellings(context, span, []):
+							Ok(spelled): Ok("${name}[${spelled.comma_separated()}]")
 							Err(error): Err(error)
 		Check.IntType | Check.FloatType | Check.VoidType | Check.StringType:
-			builtin_spelling(value, context, span)
+			value.builtin_spelling(context, span)
 		Check.TupleType(elements):
-			match type_spellings(elements, context, span, []):
-				Ok(spelled): Ok("(${comma_separated(spelled)})")
+			match elements.type_spellings(context, span, []):
+				Ok(spelled): Ok("(${spelled.comma_separated()})")
 				Err(error): Err(error)
 		Check.ListType(element):
-			match builtin_spelling(value, context, span):
+			match value.builtin_spelling(context, span):
 				Ok(name):
-					match type_spelling(element, context, span):
+					match element.type_spelling(context, span):
 						Ok(child):
 							Ok(
 								"${name}[${child}]",
@@ -1476,7 +1469,7 @@ private pure func type_spelling(
 						Err(error): Err(error)
 				Err(error): Err(error)
 		Check.ParameterType(id):
-			parameter_spelling(id, context, span)
+			id.parameter_spelling(context, span)
 
 
 -- The parts in order, separated by commas.
@@ -1503,10 +1496,9 @@ private pure func type_spellings(
 		[]:
 			Ok(spelled)
 		[value, ...rest]:
-			match type_spelling(value, context, span):
+			match value.type_spelling(context, span):
 				Ok(spelling):
-					type_spellings(
-						rest,
+					rest.type_spellings(
 						context,
 						span,
 						spelled.append(spelling),
@@ -1518,28 +1510,28 @@ private pure func render_pattern_witness(witness: Errors.PatternWitness, span: S
 	match witness:
 		Errors.AnyWitness | Errors.OtherStringWitness: Ok("_")
 		Errors.EmptyListWitness: Ok("[]")
-		Errors.ConsListWitness(_): render_list_witness(witness, span, context)
-		Errors.VariantWitness(id, fields): render_variant_witness(id, fields, span, context)
+		Errors.ConsListWitness(_): witness.render_list_witness(span, context)
+		Errors.VariantWitness(id, fields): id.render_variant_witness(fields, span, context)
 		Errors.TupleWitness(fields):
-			match witness_field_names(fields, span, context):
-				Ok(parts): Ok("(${comma_separated(parts)})")
+			match fields.witness_field_names(span, context):
+				Ok(parts): Ok("(${parts.comma_separated()})")
 				Err(error): Err(error)
 
 
 private pure func render_variant_witness(id: VariantId, fields: List[Errors.PatternWitness], span: Span, context: RenderContext) -> Result[String, Diagnostic]:
-	declaration ?= inventory_unions(context.parsed.declarations).get(union_number(variant_owner(id))).or_render_fault(span, Errors.InvalidResolvedUnion(variant_owner(id)))
-	variant ?= declaration.variants.get(variant_number(id)).or_render_fault(span, Errors.InvalidResolvedVariant(id))
-	name ?= parsed_spelling(variant.declaration.name.id, context.parsed.names, span)
-	parts ?= witness_field_names(fields, span, context)
+	declaration ?= context.parsed.declarations.inventory_unions().get(id.variant_owner().union_number()).or_render_fault(span, Errors.InvalidResolvedUnion(id.variant_owner()))
+	variant ?= declaration.variants.get(id.variant_number()).or_render_fault(span, Errors.InvalidResolvedVariant(id))
+	name ?= variant.declaration.name.id.parsed_spelling(context.parsed.names, span)
+	parts ?= fields.witness_field_names(span, context)
 	if fields.is_empty():
 		Ok(name)
 	else:
-		Ok("${name}(${comma_separated(parts)})")
+		Ok("${name}(${parts.comma_separated()})")
 
 
 private pure func witness_field_names(fields: List[Errors.PatternWitness], span: Span, context: RenderContext) -> Result[List[String], Diagnostic]:
-	translated_list(fields, pure func(field: Errors.PatternWitness) -> Result[String, Diagnostic]:
-		render_pattern_witness(field, span, context)
+	fields.translated_list(pure func(field: Errors.PatternWitness) -> Result[String, Diagnostic]:
+		field.render_pattern_witness(span, context)
 	)
 
 
@@ -1551,7 +1543,7 @@ private pure func render_list_witness(witness: Errors.PatternWitness, span: Span
 	while complete.not():
 		match cursor:
 			Errors.ConsListWitness(parts):
-				match render_pattern_witness(parts.head, span, context):
+				match parts.head.render_pattern_witness(span, context):
 					Ok(name): names = names.append(name)
 					Err(error):
 						failure = Some(error)
@@ -1564,7 +1556,7 @@ private pure func render_list_witness(witness: Errors.PatternWitness, span: Span
 	_: Void ?= match failure:
 		Some(error): Err(error)
 		None: Ok(void)
-	Ok("[${comma_separated(names)}]")
+	Ok("[${names.comma_separated()}]")
 
 
 private pure func missing_variant_name(
@@ -1572,13 +1564,13 @@ private pure func missing_variant_name(
 	span: Span,
 	context: RenderContext,
 ) -> Result[String, Diagnostic]:
-	declaration ?= inventory_unions(context.parsed.declarations)
-		.get(union_number(variant_owner(id)))
-		.or_render_fault(span, Errors.InvalidResolvedUnion(variant_owner(id)))
+	declaration ?= context.parsed.declarations.inventory_unions()
+		.get(id.variant_owner().union_number())
+		.or_render_fault(span, Errors.InvalidResolvedUnion(id.variant_owner()))
 	variant ?= declaration.variants
-		.get(variant_number(id))
+		.get(id.variant_number())
 		.or_render_fault(span, Errors.InvalidResolvedVariant(id))
-	name ?= parsed_spelling(variant.declaration.name.id, context.parsed.names, span)
+	name ?= variant.declaration.name.id.parsed_spelling(context.parsed.names, span)
 
 	if variant.declaration.fields.is_empty():
 		Ok(name)
@@ -1588,7 +1580,7 @@ private pure func missing_variant_name(
 		for field in variant.declaration.fields:
 			positions = positions.append("_")
 
-		Ok("${name}(${comma_separated(positions)})")
+		Ok("${name}(${positions.comma_separated()})")
 
 
 private pure func variant_spellings(
@@ -1601,10 +1593,9 @@ private pure func variant_spellings(
 		[]:
 			Ok(spelled)
 		[id, ...rest]:
-			match missing_variant_name(id, span, context):
+			match id.missing_variant_name(span, context):
 				Ok(name):
-					variant_spellings(
-						rest,
+					rest.variant_spellings(
 						context,
 						span,
 						spelled.append(name),
@@ -1617,7 +1608,7 @@ private pure func missing_coverage(
 	span: Span,
 	context: RenderContext,
 ) -> Diagnostic:
-	match variant_spellings(remaining, context, span, []):
+	match remaining.variant_spellings(context, span, []):
 		Err(error):
 			error
 		Ok(names):
@@ -1629,7 +1620,7 @@ private pure func missing_coverage(
 			rendered(
 				span,
 				"non-exhaustive match",
-				Text.concat(prefix, comma_separated(names)),
+				Text.concat(prefix, names.comma_separated()),
 			)
 
 
@@ -1647,7 +1638,7 @@ private pure func type_diagnostic(
 				"use a value already typed as this declaration's type parameter",
 			)
 		_:
-			match type_spelling(expected_type, context, span):
+			match expected_type.type_spelling(context, span):
 				Err(error):
 					error
 				Ok(spelling):
@@ -1671,9 +1662,9 @@ private pure func overlap_notes(primary: Span, site: Errors.MethodCandidateSite,
 
 
 private pure func render_receiver_overlap(span: Span, name: NameId, overlap: Errors.ReceiverOverlap, context: RenderContext) -> Result[Diagnostic, Diagnostic]:
-	spelling ?= parsed_spelling(name, context.parsed.names, span)
-	introduced ?= type_spelling(overlap.introduced_receiver, context, span)
-	other ?= type_spelling(overlap.other_receiver, context, span)
+	spelling ?= name.parsed_spelling(context.parsed.names, span)
+	introduced ?= overlap.introduced_receiver.type_spelling(context, span)
+	other ?= overlap.other_receiver.type_spelling(context, span)
 	Ok(noted(
 		span,
 		"two functions named ${spelling} can accept the same receiver",
@@ -1705,11 +1696,11 @@ private pure func render_trait_error(span: Span, rejection: Errors.TraitError, c
 		Errors.OperatorRequiresCanonical(Errors.ComparisonFamily(Errors.EquatableTrait)): rendered(span, "equality operators require the canonical Equatable trait", "select Equatable in the configured prelude")
 		Errors.OperatorRequiresCanonical(Errors.ComparisonFamily(Errors.OrderableTrait)): rendered(span, "ordering operators require the canonical Orderable trait", "select Orderable in the configured prelude")
 		Errors.OperatorRequiresCanonical(Errors.ArithmeticFamily(arithmetic)):
-			spelled = arithmetic_spelling(arithmetic)
+			spelled = arithmetic.arithmetic_spelling()
 			rendered(span, "arithmetic operator '${spelled.operator}' requires the canonical ${spelled.trait_name} trait", "select ${spelled.trait_name} in the configured prelude")
 		Errors.MissingCanonicalInequality: rendered(span, "canonical Equatable does not define not_equals", "add a pure not_equals(Self, Self) -> Bool default to the selected trait")
 		Errors.MalformedCanonicalMember(family, member):
-			match parsed_spelling(member, context.parsed.names, span):
+			match member.parsed_spelling(context.parsed.names, span):
 				Err(fault): fault
 				Ok(spelling):
 					-- Equatable's only reserved default is optional, so it may be renamed instead.
@@ -1719,16 +1710,16 @@ private pure func render_trait_error(span: Span, rejection: Errors.TraitError, c
 		Errors.MalformedCanonicalTrait(Errors.ComparisonFamily(Errors.EquatableTrait), _): rendered(span, "canonical Equatable requires pure equals(Self, Self) -> Bool as its sole abstract method", "keep equals abstract; additional pure methods require default bodies")
 		Errors.MalformedCanonicalTrait(Errors.ComparisonFamily(Errors.OrderableTrait), _): rendered(span, "canonical Orderable requires pure less_than(Self, Self) -> Bool as its sole abstract method", "keep less_than abstract; other pure methods require default bodies")
 		Errors.MalformedCanonicalTrait(Errors.ArithmeticFamily(arithmetic), _):
-			spelled = arithmetic_spelling(arithmetic)
+			spelled = arithmetic.arithmetic_spelling()
 			rendered(
 				span, "canonical ${spelled.trait_name} requires pure ${spelled.member}(${spelled.parameters}) -> Self as its sole abstract method",
 				"keep ${spelled.member} abstract; other pure methods require default bodies",
 			)
 		Errors.MissingImplementation(method, _):
-			match inventory_traits(context.parsed.declarations).get(trait_number(trait_method_owner(method))):
+			match context.parsed.declarations.inventory_traits().get(method.trait_method_owner().trait_number()):
 				None: render_fault(span, Errors.InvalidFunctionContract)
 				Some(owner):
-					match parsed_spelling(owner.type_name.id, context.parsed.names, span):
+					match owner.type_name.id.parsed_spelling(context.parsed.names, span):
 						Err(fault): fault
 						Ok(name): rendered(span, "receiver does not implement ${name}", "declare a matching implementation; generic functions must declare their required trait bounds")
 		Errors.EqualityMemberUnsupported(_, _, member): equality_member_diagnostic(span, "automatic equality is unavailable for a field or payload", EQUALITY_MEMBER_HELP, member, context)
@@ -1755,15 +1746,15 @@ private FIXED_STORAGE_HELP: String = "use Int, Float, a fixed record or a fixed 
 
 
 private pure func trait_spelling(id: TraitId, context: RenderContext, span: Span) -> Result[String, Diagnostic]:
-	row ?= inventory_traits(context.parsed.declarations).get(trait_number(id)).or_render_fault(span, Errors.InvalidFunctionContract)
-	parsed_spelling(row.type_name.id, context.parsed.names, span)
+	row ?= context.parsed.declarations.inventory_traits().get(id.trait_number()).or_render_fault(span, Errors.InvalidFunctionContract)
+	row.type_name.id.parsed_spelling(context.parsed.names, span)
 
 
 private pure func cycle_diagnostic(span: Span, path: List[TraitId], context: RenderContext) -> Diagnostic:
 	var names: List[String] = []
 	var fault: Option[Diagnostic] = None
 	for id in path:
-		match trait_spelling(id, context, span):
+		match id.trait_spelling(context, span):
 			Ok(name): names = names.append(name)
 			Err(error): fault = Some(error)
 	fault.get_or(rendered(span, "trait inheritance cycle: ${names.join(" -> ")}", "remove one of these supertraits"))
@@ -1778,20 +1769,20 @@ private pure func supertrait_diagnostic(span: Span, rejection: Errors.TraitError
 		Errors.SupertraitMethodInImplementation(_, owner, receiver): Ok((owner, owner, receiver))
 		_: Err(render_fault(span, Errors.InvalidFunctionContract))
 	(first_trait, second_trait, written) = named
-	first ?= trait_spelling(first_trait, context, span)
-	second ?= trait_spelling(second_trait, context, span)
+	first ?= first_trait.trait_spelling(context, span)
+	second ?= second_trait.trait_spelling(context, span)
 	receiver ?= match written:
-		ReceiverName(name): parsed_spelling(name.id, context.parsed.names, span)
-		QualifiedReceiverName(qualified): parsed_spelling(qualified.name.id, context.parsed.names, span)
+		ReceiverName(name): name.id.parsed_spelling(context.parsed.names, span)
+		QualifiedReceiverName(qualified): qualified.name.id.parsed_spelling(context.parsed.names, span)
 	absent = "implementing ${first} for ${receiver} requires an implementation of ${second}"
 	match rejection:
 		Errors.SupertraitNotImplemented(_, _, _, Errors.NeverImplemented): Ok(rendered(span, absent, "add implements ${second} for ${receiver}"))
 		Errors.SupertraitNotImplemented(_, _, _, Errors.AutomaticEqualityRejected(member)): Ok(equality_member_diagnostic(span, absent, EQUALITY_MEMBER_HELP, member, context))
 		Errors.SupertraitNotImplemented(_, _, _, Errors.AutomaticEqualityNotFinite): Ok(rendered(span, absent, "${receiver}'s automatic equality cannot be proved finite; write implements ${second} for ${receiver}"))
 		Errors.SupertraitBoundNotEntailed(_, _, parameter, _):
-			parsed_spelling(parameter.id, context.parsed.names, span).map(pure func(name): rendered(span, "implementing ${first} for ${receiver} requires ${name}: ${second}", "add ${second}, or a trait that requires it, to ${name}'s bounds"))
+			parameter.id.parsed_spelling(context.parsed.names, span).map(pure func(name): rendered(span, "implementing ${first} for ${receiver} requires ${name}: ${second}", "add ${second}, or a trait that requires it, to ${name}'s bounds"))
 		Errors.SupertraitMethodInImplementation(method, _, _):
-			parsed_spelling(method, context.parsed.names, span).map(pure func(name): rendered(span, "${name} belongs to supertrait ${second}", "define it in implements ${second} for ${receiver}"))
+			method.parsed_spelling(context.parsed.names, span).map(pure func(name): rendered(span, "${name} belongs to supertrait ${second}", "define it in implements ${second} for ${receiver}"))
 		_: Err(render_fault(span, Errors.InvalidFunctionContract))
 
 
@@ -1799,13 +1790,13 @@ private pure func supertrait_diagnostic(span: Span, rejection: Errors.TraitError
 -- declared, and a trait's Self through its supertraits; any other argument
 -- needs an implementation.
 private pure func unsatisfied_bound_diagnostic(span: Span, applied: Check.TypeRef, argument: Check.TypeRef, required: TraitId, context: RenderContext) -> Result[Diagnostic, Diagnostic]:
-	applied_spelling ?= type_spelling(applied, context, span)
-	argument_spelling ?= type_spelling(argument, context, span)
-	bound ?= trait_spelling(required, context, span)
+	applied_spelling ?= applied.type_spelling(context, span)
+	argument_spelling ?= argument.type_spelling(context, span)
+	bound ?= required.trait_spelling(context, span)
 	help: Result[String, Diagnostic] = match argument:
 		Check.ParameterType(parameter):
-			match self_trait(parameter, context):
-				Some(owner): trait_spelling(owner, context, span).map(pure func(name): "declare ${bound} as a supertrait of ${name}")
+			match parameter.self_trait(context):
+				Some(owner): owner.trait_spelling(context, span).map(pure func(name): "declare ${bound} as a supertrait of ${name}")
 				None: Ok("add ${bound} to ${argument_spelling}'s bounds")
 		_: Ok("implement ${bound} for ${argument_spelling}, or use a type that implements it")
 	written_help ?= help
@@ -1817,12 +1808,12 @@ private pure func unsatisfied_bound_diagnostic(span: Span, applied: Check.TypeRe
 -- bounds by that trait in its first requirement. Either is bounded through
 -- the trait's supertraits.
 private pure func self_trait(parameter: Check.TypeParameterId, context: RenderContext) -> Option[TraitId]:
-	match Check.parameter_owner(parameter):
+	match parameter.parameter_owner():
 		Check.TraitDeclaration(owner): Some(owner)
 		Check.FunctionDeclaration(function):
-			match (inventory_functions(context.parsed.declarations).get(function_number(function)), context.functions.get(function_number(function))):
+			match (context.parsed.declarations.inventory_functions().get(function.function_number()), context.functions.get(function.function_number())):
 				(Some(row), Some(accepted)):
-					match (row.role, Check.parameter_position(parameter) == 0, accepted.signature.requirements):
+					match (row.role, parameter.parameter_position() == 0, accepted.signature.requirements):
 						(TraitDefaultBody, True, [required, ..._]): Some(required.required_trait)
 						_: None
 				_: None
@@ -1831,14 +1822,14 @@ private pure func self_trait(parameter: Check.TypeParameterId, context: RenderCo
 
 -- The receiver is spelled as written, with the header's own parameter names.
 private pure func undeclared_receiver_bound_diagnostic(span: Span, required: TraitId, position: Int, header: ParsedImplementationHeader, context: RenderContext) -> Result[Diagnostic, Diagnostic]:
-	bound ?= trait_spelling(required, context, span)
+	bound ?= required.trait_spelling(context, span)
 	receiver ?= match header.receiver:
-		ReceiverName(name): parsed_spelling(name.id, context.parsed.names, span)
-		QualifiedReceiverName(qualified): parsed_spelling(qualified.name.id, context.parsed.names, span)
+		ReceiverName(name): name.id.parsed_spelling(context.parsed.names, span)
+		QualifiedReceiverName(qualified): qualified.name.id.parsed_spelling(context.parsed.names, span)
 	var names: List[String] = []
 	var fault: Option[Diagnostic] = None
 	for parameter in header.type_parameters:
-		match parsed_spelling(parameter.name.id, context.parsed.names, span):
+		match parameter.name.id.parsed_spelling(context.parsed.names, span):
 			Ok(spelled): names = names.append(spelled)
 			Err(error):
 				fault = Some(error)
@@ -1847,28 +1838,28 @@ private pure func undeclared_receiver_bound_diagnostic(span: Span, required: Tra
 		Some(error): Err(error)
 		None: Ok(void)
 	parameter ?= names.get(position).or_render_fault(span, Errors.InvalidFunctionContract)
-	Ok(rendered(span, "${receiver}[${comma_separated(names)}] requires ${parameter}: ${bound}", "add ${bound} to ${parameter}'s bounds"))
+	Ok(rendered(span, "${receiver}[${names.comma_separated()}] requires ${parameter}: ${bound}", "add ${bound} to ${parameter}'s bounds"))
 
 
 private pure func equality_member_diagnostic(span: Span, message: String, help: String, member: Check.EqualityMember, context: RenderContext) -> Diagnostic:
 	match member:
 		Check.EqualityField(field):
-			match inventory_records(context.parsed.declarations).get(record_number(Check.field_owner(field))):
+			match context.parsed.declarations.inventory_records().get(field.field_owner().record_number()):
 				Some(record_row):
-					match record_row.declaration.fields.get(Check.field_number(field)):
-						Some(declaration): noted(span, message, help, RecordFieldDeclaration(type_span(declaration.type_name)))
+					match record_row.declaration.fields.get(field.field_number()):
+						Some(declaration): noted(span, message, help, RecordFieldDeclaration(declaration.type_name.type_span()))
 						None: render_fault(span, Errors.InvalidFunctionContract)
 				None: render_fault(span, Errors.InvalidFunctionContract)
 		Check.EqualityPayload(variant, position):
-			match inventory_unions(context.parsed.declarations).get(union_number(variant_owner(variant))):
+			match context.parsed.declarations.inventory_unions().get(variant.variant_owner().union_number()):
 				Some(union_row):
-					match union_row.variants.get(variant_number(variant)):
+					match union_row.variants.get(variant.variant_number()):
 						Some(row):
 							match row.declaration.fields.get(position):
-								Some(declaration): noted(span, message, help, UnionPayloadDeclaration(type_span(declaration)))
+								Some(declaration): noted(span, message, help, UnionPayloadDeclaration(declaration.type_span()))
 								None: render_fault(span, Errors.InvalidFunctionContract)
 						None: render_fault(span, Errors.InvalidResolvedVariant(variant))
-				None: render_fault(span, Errors.InvalidResolvedUnion(variant_owner(variant)))
+				None: render_fault(span, Errors.InvalidResolvedUnion(variant.variant_owner()))
 
 
 -- A normalized Self alias spells only its exact bare parameter. Self=Box[T]
@@ -1879,7 +1870,7 @@ private pure func accepted_parameter_spelling(id: Check.TypeParameterId, functio
 		if parameter.id == id:
 			written = Some(parameter.name)
 	match written:
-		Some(name): parsed_spelling(name.id, context.parsed.names, span)
+		Some(name): name.id.parsed_spelling(context.parsed.names, span)
 		None:
 			match function.body_types.self_binding:
 				Some(binding):
@@ -1891,13 +1882,13 @@ private pure func accepted_parameter_spelling(id: Check.TypeParameterId, functio
 
 
 private pure func parameter_spelling(id: Check.TypeParameterId, context: RenderContext, span: Span) -> Result[String, Diagnostic]:
-	match Check.parameter_owner(id):
+	match id.parameter_owner():
 		Check.TraitDeclaration(_): Ok("Self")
 		Check.FunctionDeclaration(owner):
 			if context.functions.is_empty():
-				ordinary_parameter_spelling(id, context, span)
+				id.ordinary_parameter_spelling(context, span)
 			else:
-				match context.functions.get(function_number(owner)):
-					Some(function): accepted_parameter_spelling(id, function, context, span)
+				match context.functions.get(owner.function_number()):
+					Some(function): id.accepted_parameter_spelling(function, context, span)
 					None: Err(render_fault(span, Errors.InvalidParameterDeclaration(id)))
-		_: ordinary_parameter_spelling(id, context, span)
+		_: id.ordinary_parameter_spelling(context, span)

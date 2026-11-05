@@ -6,8 +6,8 @@ runtime operation. Bool and Option results are the foundation's designated
 unions, which the operation carries by constructor identity.
 ---
 import:
-	bool: or, and
-	./declarations: TypeScope, LocalTypeParameter, Substitution, substitute_type, TypeAccess(PrivateTypeUse), type_access, declared_parameters, local_type_parameters, parameter_requirements, resolve_bounds, resolve_type, resolve_receiver_head, receiver_arity
+	bool: Bool methods
+	./declarations: TypeScope, LocalTypeParameter, Substitution, TypeRef methods, TypeAccess(PrivateTypeUse), type_access, local_type_parameters, parameter_requirements, resolve_bounds
 	./errors:
 		CheckError,
 		CheckerInvariant(InvalidFunctionContract, InvalidResolvedFunction, RuntimeContractMismatch),
@@ -30,32 +30,24 @@ import:
 		RuntimeOperation,
 		RuntimeType(PrimitiveRuntimeType, ElementRuntimeType, ListRuntimeType, StringListRuntimeType),
 		RuntimeResult(ValueResult, OptionalResult, ResultResult, BooleanResult),
-		primitive_operation,
-		runtime_contract
-	../namespace/namespace: Namespace, named_type, FunctionSource(DeclaredHere), NamedValue(NamedFunction), named_value
+		ParsedRuntimeOperation methods
+	../namespace/namespace: Namespace, FunctionSource(DeclaredHere), NamedValue(NamedFunction)
 	../parse/assemble: ParsedContents
 	../utils/ids:
-		FunctionId, FunctionRow, ImplRow, FunctionRole(ImplementationBody, FreeFunctionBody, TraitDefaultBody), inventory_implementations, impl_number,
-		VariantId,
-		function_number,
-		inventory_functions,
-		inventory_opaques,
-		inventory_records,
-		inventory_unions,
-		variant_owner
-	../utils/source: FunctionLabel, declared_label, module_number, root_module_id
-	../utils/names: NameId, contextual_words, name_spelling
+		DeclarationInventory, FunctionId, FunctionRow, ImplId, ImplRow, FunctionRole(ImplementationBody, FreeFunctionBody, TraitDefaultBody),
+		VariantId
+	../utils/source: FunctionLabel, ModuleId, declared_label, root_module_id
+	../utils/names: NameId, NameTable
 	../utils/syntax:
 		TypeSyntax(CallableTypeSyntax, AtomicType, QualifiedType),
 		EntryResult(IntegerExitStatus, SuccessfulExit),
 		Entrypoint(NoArguments, WithArguments),
 		ParsedBody(ParsedBuiltinBody, ParsedMatchBody, ParsedValueBody),
-		ParsedFunction, ParsedTypeParameter, receiver_head_span, WrittenName,
+		ParsedFunction, ParsedReceiverHead, ParsedTypeParameter, WrittenName,
 		ParsedMatch,
 		ParsedParameter,
 		Span,
 		ValueExpression,
-		type_span,
 		ParsedRuntimeOperation(
 			FloatEqualsBuiltin, FloatLessThanBuiltin,
 			StringParseIntBuiltin, StringParseFloatBuiltin, ListRepeatBuiltin, ListLengthBuiltin, ListGetBuiltin,
@@ -91,8 +83,8 @@ record AcceptedFunction {
 
 private pure func function_label(row: FunctionRow, parsed: ParsedContents) -> Result[FunctionLabel, CheckError]:
 	name = row.declaration.function_name
-	module ?= parsed.modules.get(module_number(row.declaration.module)).or_checker_invariant(name.span, InvalidResolvedFunction(row.id))
-	spelling ?= name_spelling(parsed.names, name.id).or_checker_invariant(name.span, InvalidResolvedFunction(row.id))
+	module ?= parsed.modules.get(row.declaration.module.module_number()).or_checker_invariant(name.span, InvalidResolvedFunction(row.id))
+	spelling ?= parsed.names.name_spelling(name.id).or_checker_invariant(name.span, InvalidResolvedFunction(row.id))
 	Ok(declared_label(module.stem, spelling))
 
 
@@ -111,16 +103,16 @@ pure func validate_signatures(
 ) -> Result[CheckedSignatures, CheckError]:
 	-- Assembly selects the entry name: application main or the compiler-owned
 	-- test wrapper. Only a function declared by the root has the process ABI.
-	entrypoint: Option[FunctionId] = match named_value(namespace, root_module_id(), parsed.entrypoint):
+	entrypoint: Option[FunctionId] = match namespace.named_value(root_module_id(), parsed.entrypoint):
 		Some(NamedFunction(id, DeclaredHere)): Some(id)
 		_: None
-	headers ?= implementation_headers(parsed, namespace)
-	functions ?= accept_functions(parsed, namespace, designated, entrypoint, headers, contracts, [])
+	headers ?= parsed.implementation_headers(namespace)
+	functions ?= parsed.accept_functions(namespace, designated, entrypoint, headers, contracts, [])
 	id: FunctionId ?= match entrypoint:
 		Some(present): Ok(present)
 		None: Err(signature_error(parsed.end, MissingMain))
 	main ?= functions
-		.get(function_number(id))
+		.get(id.function_number())
 		.or_checker_invariant(parsed.end, InvalidResolvedFunction(id))
 
 	result: EntryResult = if main.signature.return_type.value_type == VoidType:
@@ -150,7 +142,7 @@ private pure func accept_functions(
 	contracts: List[AcceptedTrait],
 	accepted: List[AcceptedFunction],
 ) -> Result[List[AcceptedFunction], CheckError]:
-	match inventory_functions(parsed.declarations).get(accepted.length()):
+	match parsed.declarations.inventory_functions().get(accepted.length()):
 		None:
 			Ok(accepted)
 		Some(row):
@@ -164,18 +156,17 @@ private pure func accept_functions(
 
 			scope: TypeScope = {
 				self_binding = None,
-				records = inventory_records(parsed.declarations),
-				unions = inventory_unions(parsed.declarations),
-				opaques = inventory_opaques(parsed.declarations),
+				records = parsed.declarations.inventory_records(),
+				unions = parsed.declarations.inventory_unions(),
+				opaques = parsed.declarations.inventory_opaques(),
 				namespace = namespace,
 				module = function.module,
 				access = type_access(function.visibility, function.function_name.id),
 				parameters = []
 			}
-			match resolve_function(row, parsed, headers, contracts, is_entry, scope, designated):
+			match row.resolve_function(parsed, headers, contracts, is_entry, scope, designated):
 				Ok(signature):
-					accept_functions(
-						parsed,
+					parsed.accept_functions(
 						namespace,
 						designated,
 						entrypoint,
@@ -200,17 +191,17 @@ private pure func resolve_signature(
 
 	return_type ?= match function.return_type:
 		Some(written):
-			resolve_type(scope, written)
+			scope.resolve_type(written)
 		None:
 			Ok(VoidType)
 
 	return_span = match function.return_type:
 		Some(written):
-			type_span(written)
+			written.type_span()
 		None:
 			function.function_name.span
 
-	_: Void ?= if and(is_entry, and(return_type != IntType, return_type != VoidType)):
+	_: Void ?= if is_entry.and((return_type != IntType).and(return_type != VoidType)):
 		Err(signature_error(return_span, MainReturnType(return_type)))
 	else:
 		Ok(void)
@@ -224,7 +215,7 @@ private pure func resolve_signature(
 		_:
 			Ok(void)
 
-	formal_parameters ?= resolve_parameters(function.parameters, is_entry, scope, [])
+	formal_parameters ?= function.parameters.resolve_parameters(is_entry, scope, [])
 	signature: FunctionSignature = {
 		type_parameters = parameters,
 		requirements = requirements,
@@ -235,7 +226,7 @@ private pure func resolve_signature(
 			span = return_span
 		}
 	}
-	body ?= accept_body(function, signature, designated)
+	body ?= function.accept_body(signature, designated)
 
 	Ok({
 		id = id,
@@ -260,19 +251,18 @@ private pure func resolve_parameters(
 		None:
 			Ok(resolved)
 		Some(parameter):
-			match resolve_type(scope, parameter.type_name):
+			match scope.resolve_type(parameter.type_name):
 				Ok(value_type):
-					span = type_span(parameter.type_name)
+					span = parameter.type_name.type_span()
 
-					entry_type_result: Result[Void, CheckError] = if and(is_entry, value_type != ListType(StringType)):
+					entry_type_result: Result[Void, CheckError] = if is_entry.and(value_type != ListType(StringType)):
 						Err(signature_error(span, MainParameterType))
 					else:
 						Ok(void)
 
 					match entry_type_result:
 						Ok(_):
-							resolve_parameters(
-								parameters,
+							parameters.resolve_parameters(
 								is_entry,
 								scope,
 								resolved.append({
@@ -293,8 +283,7 @@ private pure func accept_body(
 ) -> Result[AcceptedBody, CheckError]:
 	match function.body:
 		ParsedBuiltinBody(operation, span):
-			match validate_builtin_body(
-				operation,
+			match operation.validate_builtin_body(
 				{
 					function = function,
 					signature = signature,
@@ -312,7 +301,7 @@ private pure func accept_body(
 
 private pure func runtime_type_ref(value_type: Builtins.RuntimeType[TypeRef]) -> TypeRef:
 	match value_type:
-		PrimitiveRuntimeType(primitive): primitive_ref(primitive)
+		PrimitiveRuntimeType(primitive): primitive.primitive_ref()
 		ElementRuntimeType(element): element
 		ListRuntimeType(element): ListType(element)
 		StringListRuntimeType: ListType(StringType)
@@ -340,23 +329,23 @@ private pure func accepted_operation(parsed: ParsedRuntimeOperation, site: Built
 				Some(parameter): Ok(Builtins.ListRepeat(parameter.value_type))
 				None: Err(builtin_error(site.span, BuiltinContractMismatch(parsed)))
 		ListLengthBuiltin:
-			match first_list_element(site):
+			match site.first_list_element():
 				Some(element): Ok(Builtins.ListLength(element))
 				None: Err(builtin_error(site.span, BuiltinContractMismatch(parsed)))
 		ListGetBuiltin:
-			match first_list_element(site):
+			match site.first_list_element():
 				Some(element): Ok(Builtins.ListGet(element, option))
 				None: Err(builtin_error(site.span, BuiltinContractMismatch(parsed)))
 		ListAppendBuiltin:
-			match first_list_element(site):
+			match site.first_list_element():
 				Some(element): Ok(Builtins.ListAppend(element))
 				None: Err(builtin_error(site.span, BuiltinContractMismatch(parsed)))
 		ListSetBuiltin:
-			match first_list_element(site):
+			match site.first_list_element():
 				Some(element): Ok(Builtins.ListSet(element))
 				None: Err(builtin_error(site.span, BuiltinContractMismatch(parsed)))
 		ListConcatBuiltin:
-			match first_list_element(site):
+			match site.first_list_element():
 				Some(element): Ok(Builtins.ListConcat(element))
 				None: Err(builtin_error(site.span, BuiltinContractMismatch(parsed)))
 		StringParseIntBuiltin: Ok(Builtins.StringParseInt(option))
@@ -371,7 +360,7 @@ private pure func accepted_operation(parsed: ParsedRuntimeOperation, site: Built
 		FloatEqualsBuiltin: Ok(Builtins.FloatEquals(boolean))
 		FloatLessThanBuiltin: Ok(Builtins.FloatLessThan(boolean))
 		_:
-			primitive: Option[RuntimeOperation[VariantId, TypeRef]] = primitive_operation(parsed)
+			primitive: Option[RuntimeOperation[VariantId, TypeRef]] = parsed.primitive_operation()
 			match primitive:
 				Some(operation): Ok(operation)
 				None: Err(checker_invariant(site.span, RuntimeContractMismatch))
@@ -392,10 +381,10 @@ record BuiltinSite {
 -- in its one payload and Bool as nongeneric.
 private pure func runtime_result_type(result: RuntimeResult[VariantId, TypeRef]) -> TypeRef:
 	match result:
-		ValueResult(value_type): runtime_type_ref(value_type)
-		OptionalResult(payload, option): NominalType(AggregateNominal(UnionAggregate(variant_owner(option.some))), [runtime_type_ref(payload)])
-		ResultResult(success, error, constructors): NominalType(AggregateNominal(UnionAggregate(variant_owner(constructors.ok))), [runtime_type_ref(success), runtime_type_ref(error)])
-		BooleanResult(boolean): NominalType(AggregateNominal(UnionAggregate(variant_owner(boolean.true_variant))), [])
+		ValueResult(value_type): value_type.runtime_type_ref()
+		OptionalResult(payload, option): NominalType(AggregateNominal(UnionAggregate(option.some.variant_owner())), [payload.runtime_type_ref()])
+		ResultResult(success, error, constructors): NominalType(AggregateNominal(UnionAggregate(constructors.ok.variant_owner())), [success.runtime_type_ref(), error.runtime_type_ref()])
+		BooleanResult(boolean): NominalType(AggregateNominal(UnionAggregate(boolean.true_variant.variant_owner())), [])
 
 
 pure func validate_builtin_body(
@@ -408,8 +397,8 @@ pure func validate_builtin_body(
 		None:
 			Ok(void)
 
-	operation ?= accepted_operation(parsed, site)
-	contract = runtime_contract(operation)
+	operation ?= parsed.accepted_operation(site)
+	contract = operation.runtime_contract()
 	signature = site.signature
 
 	generic_header: Bool = match parsed:
@@ -421,9 +410,9 @@ pure func validate_builtin_body(
 			match signature.purity == contract.purity:
 				True:
 					declared = signature.parameters.map(pure func(parameter: TypeUse) -> TypeRef: parameter.value_type)
-					required = contract.parameters.map(pure func(parameter: Builtins.RuntimeType[TypeRef]) -> TypeRef: runtime_type_ref(parameter))
+					required = contract.parameters.map(pure func(parameter: Builtins.RuntimeType[TypeRef]) -> TypeRef: parameter.runtime_type_ref())
 					match declared == required:
-						True: signature.return_type.value_type == runtime_result_type(contract.return_type)
+						True: signature.return_type.value_type == contract.return_type.runtime_result_type()
 						False: False
 				False: False
 		False: False
@@ -447,7 +436,7 @@ private pure func receiver_parameters(parameters: List[ParsedTypeParameter], sco
 			if parameter.name.id == self_name:
 				failure = Some(type_declaration_error(parameter.name.span, TypeParameterTypeNameConflict(parameter.name.id)))
 			else:
-				match named_type(scope.namespace, scope.module, parameter.name.id):
+				match scope.namespace.named_type(scope.module, parameter.name.id):
 					Some(_): failure = Some(type_declaration_error(parameter.name.span, TypeParameterTypeNameConflict(parameter.name.id)))
 					None: seen = seen.append(parameter.name)
 		if failure.is_some():
@@ -458,27 +447,27 @@ private pure func receiver_parameters(parameters: List[ParsedTypeParameter], sco
 
 
 private pure func implementation_header(row: ImplRow, scope: TypeScope, parsed: ParsedContents) -> Result[ImplementationHeader, CheckError]:
-	head ?= resolve_receiver_head(scope, row.header.receiver)
-	arity ?= receiver_arity(scope, head, receiver_head_span(row.header.receiver))
+	head ?= scope.resolve_receiver_head(row.header.receiver)
+	arity ?= scope.receiver_arity(head, row.header.receiver.receiver_head_span())
 	_: Void ?= if arity == row.header.type_parameters.length():
 		Ok(void)
 	else:
-		Err(trait_error(receiver_head_span(row.header.receiver), ReceiverParameterCount(arity, row.header.type_parameters.length())))
-	fresh ?= receiver_parameters(row.header.type_parameters, scope, contextual_words(parsed.names).self_word)
-	bounds ?= resolve_bounds(row.header.type_parameters, scope)
+		Err(trait_error(row.header.receiver.receiver_head_span(), ReceiverParameterCount(arity, row.header.type_parameters.length())))
+	fresh ?= row.header.type_parameters.receiver_parameters(scope, parsed.names.contextual_words().self_word)
+	bounds ?= row.header.type_parameters.resolve_bounds(scope)
 	Ok({ receiver_head = head, parameter_bounds = bounds })
 
 
 private pure func implementation_headers(parsed: ParsedContents, namespace: Namespace) -> Result[List[ImplementationHeader], CheckError]:
 	var headers: List[ImplementationHeader] = []
 	var failure: Option[CheckError] = None
-	for row in inventory_implementations(parsed.declarations):
+	for row in parsed.declarations.inventory_implementations():
 		scope: TypeScope = {
-			records = inventory_records(parsed.declarations), unions = inventory_unions(parsed.declarations),
-			opaques = inventory_opaques(parsed.declarations), namespace = namespace, module = row.header.module, access = PrivateTypeUse,
+			records = parsed.declarations.inventory_records(), unions = parsed.declarations.inventory_unions(),
+			opaques = parsed.declarations.inventory_opaques(), namespace = namespace, module = row.header.module, access = PrivateTypeUse,
 			parameters = [], self_binding = None
 		}
-		match implementation_header(row, scope, parsed):
+		match row.implementation_header(scope, parsed):
 			Ok(header): headers = headers.append(header)
 			Err(error):
 				failure = Some(error)
@@ -496,11 +485,11 @@ private pure func resolve_implementation_function(row: FunctionRow, label: Funct
 	for parameter in implementation.header.type_parameters:
 		parameters = parameters.append({ name = parameter.name, id = type_parameter_id(FunctionDeclaration(row.id), parameters.length()) })
 	body_scope = { scope | parameters = parameters }
-	identities = declared_parameters(body_scope)
+	identities = body_scope.declared_parameters()
 	receiver ?= receiver_type(header.receiver_head, identities.map(pure func(id): ParameterType(id)))
 		.or_checker_invariant(implementation.header.span, InvalidFunctionContract)
-	normalized = { body_scope | self_binding = Some({ name = contextual_words(parsed.names).self_word, value_type = receiver }) }
-	resolve_signature(row.declaration, row.id, label, is_entry, normalized, identities, parameter_requirements(header.parameter_bounds, FunctionDeclaration(row.id)), designated)
+	normalized = { body_scope | self_binding = Some({ name = parsed.names.contextual_words().self_word, value_type = receiver }) }
+	row.declaration.resolve_signature(row.id, label, is_entry, normalized, identities, header.parameter_bounds.parameter_requirements(FunctionDeclaration(row.id)), designated)
 
 
 -- The default's written contract is accepted once in its trait domain.
@@ -520,7 +509,7 @@ private pure func resolve_default_function(
 	var parameters: List[TypeUse] = []
 	var failure: Option[CheckError] = None
 	for parameter in method.signature.parameters:
-		match substitute_type(parameter.value_type, substitution, parameter.span):
+		match parameter.value_type.substitute_type(substitution, parameter.span):
 			Ok(value_type): parameters = parameters.append({ parameter | value_type = value_type })
 			Err(error):
 				failure = Some(error)
@@ -528,33 +517,33 @@ private pure func resolve_default_function(
 	_: Void ?= match failure:
 		Some(error): Err(error)
 		None: Ok(void)
-	result ?= substitute_type(method.signature.return_type.value_type, substitution, method.signature.return_type.span)
+	result ?= method.signature.return_type.value_type.substitute_type(substitution, method.signature.return_type.span)
 	requirement: TraitRequirement = { parameter = self, required_trait = owner.id, span = row.declaration.function_name.span }
 	signature: FunctionSignature = {
 		type_parameters = [self], requirements = [requirement],
 		purity = method.signature.purity, parameters = parameters,
 		return_type = { method.signature.return_type | value_type = result }
 	}
-	body ?= accept_body(row.declaration, signature, designated)
+	body ?= row.declaration.accept_body(signature, designated)
 	Ok({
 		id = row.id, label = label, declaration = row.declaration, signature = signature,
-		body_types = { scope | access = PrivateTypeUse, self_binding = Some({ name = contextual_words(parsed.names).self_word, value_type = ParameterType(self) }) },
+		body_types = { scope | access = PrivateTypeUse, self_binding = Some({ name = parsed.names.contextual_words().self_word, value_type = ParameterType(self) }) },
 		body = body
 	})
 
 
 private pure func resolve_function(row: FunctionRow, parsed: ParsedContents, headers: List[ImplementationHeader], contracts: List[AcceptedTrait], is_entry: Bool, scope: TypeScope, designated: DesignatedUnions) -> Result[AcceptedFunction, CheckError]:
-	label ?= function_label(row, parsed)
+	label ?= row.function_label(parsed)
 	match row.role:
 		FreeFunctionBody:
-			resolve_free_function(row, label, is_entry, scope, designated)
+			row.resolve_free_function(label, is_entry, scope, designated)
 		ImplementationBody:
 			var accepted: Result[AcceptedFunction, CheckError] = Err(checker_invariant(row.declaration.function_name.span, InvalidResolvedFunction(row.id)))
-			for implementation in inventory_implementations(parsed.declarations):
+			for implementation in parsed.declarations.inventory_implementations():
 				for member in implementation.methods:
 					if member == row.id:
-						match headers.get(impl_number(implementation.id)):
-							Some(header): accepted = resolve_implementation_function(row, label, implementation, header, parsed, is_entry, scope, designated)
+						match headers.get(implementation.id.impl_number()):
+							Some(header): accepted = row.resolve_implementation_function(label, implementation, header, parsed, is_entry, scope, designated)
 							None: void
 			accepted
 		TraitDefaultBody:
@@ -564,7 +553,7 @@ private pure func resolve_function(row: FunctionRow, parsed: ParsedContents, hea
 					match method.default_body:
 						Some(function):
 							if function == row.id:
-								accepted = resolve_default_function(row, label, owner, method, parsed, scope, designated)
+								accepted = row.resolve_default_function(label, owner, method, parsed, scope, designated)
 						None: void
 			accepted
 
@@ -580,6 +569,6 @@ private pure func resolve_free_function(row: FunctionRow, label: FunctionLabel, 
 		None:
 			Ok(void)
 
-	parameters ?= local_type_parameters(row.declaration.type_parameters, FunctionDeclaration(row.id), scope)
-	bounds ?= resolve_bounds(row.declaration.type_parameters, parameters)
-	resolve_signature(row.declaration, row.id, label, is_entry, parameters, declared_parameters(parameters), parameter_requirements(bounds, FunctionDeclaration(row.id)), designated)
+	parameters ?= row.declaration.type_parameters.local_type_parameters(FunctionDeclaration(row.id), scope)
+	bounds ?= row.declaration.type_parameters.resolve_bounds(parameters)
+	row.declaration.resolve_signature(row.id, label, is_entry, parameters, parameters.declared_parameters(), bounds.parameter_requirements(FunctionDeclaration(row.id)), designated)

@@ -4,7 +4,7 @@ rejection of recursive calls that grow type arguments without bound.
 ---
 import:
 	result: Result methods
-	bool: not, and, or
+	bool: Bool methods
 	./errors:
 		CheckError, checker_invariant, or_checker_invariant, CheckerInvariant(InvalidFunctionContract),
 		RecursionError(
@@ -13,7 +13,7 @@ import:
 		),
 		recursion_error,
 	./model:
-		BodyOwner(DeclaredBody, LambdaBody, DerivedEqualityBody), AggregateId(RecordAggregate, UnionAggregate), NominalId(AggregateNominal, OpaqueNominal), aggregate_head, aggregate_owner, type_head, body_calls, canonical_owner, AcceptedTraits, AcceptedImplementation, ImplementationTable, AcceptedMethodCall, method_body, family_for, implementation_rows, method_receiver, method_identity, ImplementedBody(AuthoredMethod, TraitDefault, StructuralEquality),
+		BodyOwner(DeclaredBody, LambdaBody, DerivedEqualityBody), AggregateId(RecordAggregate, UnionAggregate), NominalId(AggregateNominal, OpaqueNominal), body_calls, CanonicalEquality, AcceptedTraits, AcceptedImplementation, ImplementationTable, AcceptedMethodCall, ImplementedBody(AuthoredMethod, TraitDefault, StructuralEquality),
 		CallTarget(TraitMethod, RuntimeFunction, UserFunction, CallableParameter, ValueCall),
 		CheckedArm,
 		CheckedBody(CheckedMatchBody, CheckedValueBody),
@@ -27,9 +27,9 @@ import:
 		TypeParameterId,
 		TypeParameterOwner(FunctionDeclaration),
 		TypeRef(TupleType, CallableType, NominalType, ListType, ParameterType),
-		child_expressions, statement_expressions, function_calls, lambda_calls, body_callable_creations, expression_calls, expression_callable_creations, receiver_arguments, parameter_owner,
+		statement_expressions, body_callable_creations,
 		type_parameter_id,
-	../utils/ids: FunctionId, function_number, TraitId, trait_method_owner
+	../utils/ids: FunctionId, TraitId, TraitMethodId
 	../namespace/namespace: TypeHead(PrimitiveHead, ListHead, RecordHead, UnionHead, OpaqueHead)
 	./declarations: Substitution, substitute_type
 	./traits: checked_implementation_table
@@ -42,7 +42,7 @@ import:
 private pure func is_self_call(call: CheckedCall, current: FunctionId, traits: AcceptedTraits) -> Bool:
 	match call.target:
 		TraitMethod(method):
-			match method_body(traits, method):
+			match traits.method_body(method):
 				Some(selected):
 					match selected.body:
 						DeclaredBody(function): function == current
@@ -60,7 +60,7 @@ private pure func first_self_call(values: List[CheckedExpr], current: FunctionId
 	var found: Option[Span] = None
 
 	for value in values:
-		found = self_call_in(value, current, traits)
+		found = value.self_call_in(current, traits)
 
 		if found.is_some():
 			break
@@ -72,13 +72,13 @@ private pure func first_self_call(values: List[CheckedExpr], current: FunctionId
 -- receiver first, are searched before the call itself. A self call anywhere in
 -- a non-tail match is a non-tail call, so its arms are children too.
 private pure func self_call_in(value: CheckedExpr, current: FunctionId, traits: AcceptedTraits) -> Option[Span]:
-	match first_self_call(child_expressions(value.form), current, traits):
+	match value.form.child_expressions().first_self_call(current, traits):
 		Some(span):
 			Some(span)
 		None:
 			match value.form:
 				InvokeFunction(call):
-					if is_self_call(call, current, traits):
+					if call.is_self_call(current, traits):
 						Some(value.span)
 					else:
 						None
@@ -90,7 +90,7 @@ private pure func reject_self_calls(
 	values: List[CheckedExpr],
 	current: FunctionId, traits: AcceptedTraits,
 ) -> Result[Void, CheckError]:
-	match first_self_call(values, current, traits):
+	match values.first_self_call(current, traits):
 		Some(span):
 			Err(recursion_error(span, NonTailSelfCall(current)))
 		None:
@@ -108,7 +108,7 @@ private record TailCall {
 private pure func tail_call(value: CheckedExpr, current: FunctionId, traits: AcceptedTraits) -> Option[TailCall]:
 	match value.form:
 		InvokeFunction(call):
-			if is_self_call(call, current, traits):
+			if call.is_self_call(current, traits):
 				var arguments: List[CheckedExpr] = []
 				for operand in call.operands:
 					match operand:
@@ -132,13 +132,13 @@ private pure func tail_exit(
 		RecurWith(_, _):
 			Ok(exit)
 		ReturnExpression(value):
-			match tail_call(value, current, traits):
+			match value.tail_call(current, traits):
 				Some(call):
-					match reject_self_calls(call.arguments, current, traits):
+					match call.arguments.reject_self_calls(current, traits):
 						Ok(valid): Ok(RecurWith(call.arguments, call.span))
 						Err(error): Err(error)
 				None:
-					match nested_tail(value, current, traits):
+					match value.nested_tail(current, traits):
 						Ok(valid): Ok(exit)
 						Err(error): Err(error)
 
@@ -148,7 +148,7 @@ private pure func tail_exit(
 -- of a join, which does not exist yet; a self call anywhere else is an
 -- ordinary non-tail call.
 private pure func nested_tail(value: CheckedExpr, current: FunctionId, traits: AcceptedTraits) -> Result[Void, CheckError]:
-	match tail_call(value, current, traits):
+	match value.tail_call(current, traits):
 		Some(call):
 			Err(recursion_error(call.span, TailCallInNestedMatch))
 		None:
@@ -157,9 +157,9 @@ private pure func nested_tail(value: CheckedExpr, current: FunctionId, traits: A
 					var checked = reject_self_calls([join.scrutinee], current, traits)
 					for arm in join.arms:
 						if checked.is_ok():
-							checked = reject_self_calls(statement_expressions(arm.statements), current, traits)
+							checked = arm.statements.statement_expressions().reject_self_calls(current, traits)
 						if checked.is_ok():
-							checked = nested_tail(arm.value, current, traits)
+							checked = arm.value.nested_tail(current, traits)
 					checked
 				_:
 					reject_self_calls([value], current, traits)
@@ -174,12 +174,11 @@ private pure func tail_arms(
 		None:
 			Ok(checked)
 		Some(arm):
-			match reject_self_calls(statement_expressions(arm.statements), current, traits):
+			match arm.statements.statement_expressions().reject_self_calls(current, traits):
 				Ok(prefix):
-					match tail_exit(arm.body, current, traits):
+					match arm.body.tail_exit(current, traits):
 						Ok(exit):
-							tail_arms(
-								arms,
+							arms.tail_arms(
 								current, traits,
 								checked.append({ arm | body = exit }),
 							)
@@ -198,14 +197,14 @@ private pure func recurs(exit: CheckedExit) -> Bool:
 private pure func body_recurs(body: CheckedBody) -> Bool:
 	match body:
 		CheckedValueBody(exit):
-			recurs(exit)
+			exit.recurs()
 		CheckedMatchBody(matched):
 			var found: Bool = False
 
 			for arm in matched.arms:
 				found = match found:
 					True: True
-					False: recurs(arm.body)
+					False: arm.body.recurs()
 
 			found
 
@@ -231,18 +230,18 @@ pure func check_execution(
 			})
 		Some(annotation):
 			if parameters.is_empty():
-				match reject_self_calls(statement_expressions(statements), current, traits):
+				match statements.statement_expressions().reject_self_calls(current, traits):
 					Ok(prefix):
 
 						tail_body: Result[CheckedBody, CheckError] = match body:
 							CheckedValueBody(value):
-								match tail_exit(value, current, traits):
+								match value.tail_exit(current, traits):
 									Ok(exit): Ok(CheckedValueBody(exit))
 									Err(error): Err(error)
 							CheckedMatchBody(matched):
 								match reject_self_calls([matched.scrutinee], current, traits):
 									Ok(scrutinee):
-										match tail_arms(matched.arms, current, traits, []):
+										match matched.arms.tail_arms(current, traits, []):
 											Ok(arms): Ok(CheckedMatchBody({ matched | arms = arms }))
 											Err(error): Err(error)
 									Err(error): Err(error)
@@ -250,7 +249,7 @@ pure func check_execution(
 						match tail_body:
 							Ok(loop_body):
 
-								if body_recurs(loop_body):
+								if loop_body.body_recurs():
 									Ok({
 										execution = SelfTailLoop(annotation),
 										body = loop_body,
@@ -315,7 +314,7 @@ private pure func append_dependencies(
 					Some(constructor):
 						-- A top-first written path is pushed inside-out.
 						push: ConstructorOperation = PushConstructor(constructor)
-						collected = append_dependencies(collected, child, target, [push].concat(operations), trait_derived, automatic, span)
+						collected = collected.append_dependencies(child, target, [push].concat(operations), trait_derived, automatic, span)
 					None: void
 				position = position + 1
 	collected
@@ -349,8 +348,8 @@ private pure func parameter_reaches(
 
 		for current in frontier:
 			for dependency in dependencies:
-				unreached_dependency: Bool = match and(dependency.trait_derived.not(), dependency.source == current):
-					True: contains_parameter_id(reached, dependency.target).not()
+				unreached_dependency: Bool = match dependency.trait_derived.not().and(dependency.source == current):
+					True: reached.contains_parameter_id(dependency.target).not()
 					False: False
 
 				if unreached_dependency:
@@ -359,7 +358,7 @@ private pure func parameter_reaches(
 
 		frontier = next
 
-	contains_parameter_id(reached, target)
+	reached.contains_parameter_id(target)
 
 
 private pure func automatic_origin(implementation: AcceptedImplementation) -> List[AggregateId]:
@@ -395,41 +394,41 @@ private pure func append_method_dependencies(
 	traits: AcceptedTraits, automatic: List[AggregateId], span: Span,
 ) -> List[ParameterDependency]:
 	var dependencies = previous
-	match method_body(traits, method):
+	match traits.method_body(method):
 		Some(selected):
 			var origins = automatic
-			match type_head(method_receiver(method)):
+			match method.method_receiver().type_head():
 				Some(head):
-					match family_for(traits, trait_method_owner(method_identity(method)), head):
-						Some(family): origins = with_origins(origins, automatic_origin(family))
+					match traits.family_for(method.method_identity().trait_method_owner(), head):
+						Some(family): origins = origins.with_origins(family.automatic_origin())
 						None: void
 				None: void
 			var position = 0
 			for argument in selected.arguments:
 				match selected.body:
-					DeclaredBody(function): dependencies = append_dependencies(dependencies, argument, type_parameter_id(FunctionDeclaration(function), position), [], True, origins, span)
-					DerivedEqualityBody(aggregate): dependencies = append_dependencies(dependencies, argument, type_parameter_id(aggregate_owner(aggregate), position), [], True, origins, span)
+					DeclaredBody(function): dependencies = dependencies.append_dependencies(argument, type_parameter_id(FunctionDeclaration(function), position), [], True, origins, span)
+					DerivedEqualityBody(aggregate): dependencies = dependencies.append_dependencies(argument, type_parameter_id(aggregate.aggregate_owner(), position), [], True, origins, span)
 					LambdaBody(_): void
 				position = position + 1
 		None:
-			match method_receiver(method):
+			match method.method_receiver():
 				ParameterType(_):
-					for implementation in implementation_rows(traits.implementations):
-						origins = with_origins(automatic, automatic_origin(implementation))
+					for implementation in traits.implementations.implementation_rows():
+						origins = automatic.with_origins(implementation.automatic_origin())
 						for member in implementation.methods:
-							if member.method == method_identity(method):
+							if member.method == method.method_identity():
 								for position in 0..implementation.parameter_bounds.length():
-									match receiver_slot(implementation.receiver_head, position):
+									match implementation.receiver_head.receiver_slot(position):
 										Some(slot):
 											pop: ConstructorOperation = PopConstructor(slot)
 											match member.body:
-												AuthoredMethod(function): dependencies = append_dependencies(dependencies, method_receiver(method), type_parameter_id(FunctionDeclaration(function), position), [pop], True, origins, span)
-												StructuralEquality(aggregate, _): dependencies = append_dependencies(dependencies, method_receiver(method), type_parameter_id(aggregate_owner(aggregate), position), [pop], True, origins, span)
+												AuthoredMethod(function): dependencies = dependencies.append_dependencies(method.method_receiver(), type_parameter_id(FunctionDeclaration(function), position), [pop], True, origins, span)
+												StructuralEquality(aggregate, _): dependencies = dependencies.append_dependencies(method.method_receiver(), type_parameter_id(aggregate.aggregate_owner(), position), [pop], True, origins, span)
 												TraitDefault(function):
 													-- Keep the complete Self, including phantom arguments,
 													-- but only after matching this exact head/slot.
 													push: ConstructorOperation = PushConstructor(slot)
-													dependencies = append_dependencies(dependencies, method_receiver(method), type_parameter_id(FunctionDeclaration(function), 0), [pop, push], True, origins, span)
+													dependencies = dependencies.append_dependencies(method.method_receiver(), type_parameter_id(FunctionDeclaration(function), 0), [pop, push], True, origins, span)
 										None: void
 				_: void
 	dependencies
@@ -442,7 +441,7 @@ private pure func append_named_dependencies(
 	var dependencies = previous
 	var position = 0
 	for value in types:
-		dependencies = append_dependencies(dependencies, value, type_parameter_id(FunctionDeclaration(id), position), [], False, automatic, span)
+		dependencies = dependencies.append_dependencies(value, type_parameter_id(FunctionDeclaration(id), position), [], False, automatic, span)
 		position = position + 1
 	dependencies
 
@@ -452,8 +451,8 @@ private pure func append_choice_dependencies(
 	automatic: List[AggregateId], span: Span,
 ) -> List[ParameterDependency]:
 	match choice:
-		MethodCallable(method): append_method_dependencies(previous, method, traits, automatic, span)
-		NamedCallable(id, types): append_named_dependencies(previous, id, types, automatic, span)
+		MethodCallable(method): previous.append_method_dependencies(method, traits, automatic, span)
+		NamedCallable(id, types): previous.append_named_dependencies(id, types, automatic, span)
 		ForwardedCallable(_) | StoredCallable(_) | LambdaCallable(_, _): previous
 
 
@@ -464,13 +463,13 @@ private pure func append_call_dependencies(
 	var dependencies = previous
 	for call in calls:
 		match call.target:
-			TraitMethod(method): dependencies = append_method_dependencies(dependencies, method, traits, automatic, call.span)
-			UserFunction(declaration, arguments): dependencies = append_named_dependencies(dependencies, declaration, arguments, automatic, call.span)
+			TraitMethod(method): dependencies = dependencies.append_method_dependencies(method, traits, automatic, call.span)
+			UserFunction(declaration, arguments): dependencies = dependencies.append_named_dependencies(declaration, arguments, automatic, call.span)
 			RuntimeFunction(_) | CallableParameter(_) | ValueCall(_): void
 		-- Callable creation is independent of the target accepting the callback.
 		for operand in call.operands:
 			match operand:
-				CallableOperand(_, choice, span): dependencies = append_choice_dependencies(dependencies, choice, traits, automatic, span)
+				CallableOperand(_, choice, span): dependencies = dependencies.append_choice_dependencies(choice, traits, automatic, span)
 				ValueOperand(_): void
 	dependencies
 
@@ -482,7 +481,7 @@ private pure func append_creation_dependencies(
 	var dependencies = previous
 	for value in creations:
 		match value.form:
-			MakeCallable(choice): dependencies = append_choice_dependencies(dependencies, choice, traits, automatic, value.span)
+			MakeCallable(choice): dependencies = dependencies.append_choice_dependencies(choice, traits, automatic, value.span)
 			_: void
 	dependencies
 
@@ -516,14 +515,14 @@ private pure func dependency_graph(dependencies: List[ParameterDependency]) -> D
 	var parameters: List[TypeParameterId] = []
 	for dependency in dependencies:
 		for parameter in [dependency.source, dependency.target]:
-			if contains_parameter_id(parameters, parameter).not():
+			if parameters.contains_parameter_id(parameter).not():
 				parameters = parameters.append(parameter)
 	var symbols: List[ConstructorSlot] = []
 	var controls = parameters.length()
 	var edges: List[IssuedDependency] = []
 	for dependency in dependencies:
-		var source = parameter_index(parameters, dependency.source)
-		target = parameter_index(parameters, dependency.target)
+		var source = parameters.parameter_index(dependency.source)
+		target = parameters.parameter_index(dependency.target)
 		if dependency.operations.is_empty():
 			edges = edges.append({ path = { source = source, target = target, operation = KeepPath }, trait_derived = dependency.trait_derived, automatic = dependency.automatic, span = dependency.span })
 		else:
@@ -562,7 +561,7 @@ private pure func validate_base_dependencies(dependencies: List[ParameterDepende
 	for dependency in dependencies:
 		-- Ordinary substitutions contain only pushes, so a nonempty
 		-- word is exactly the original positive-growth condition.
-		if and(dependency.trait_derived.not(), and(dependency.operations.is_empty().not(), parameter_reaches(dependency.target, dependency.source, dependencies))):
+		if dependency.trait_derived.not().and(dependency.operations.is_empty().not().and(dependency.target.parameter_reaches(dependency.source, dependencies))):
 			growing = Some(dependency.span)
 			break
 	_: Void ?= match growing:
@@ -570,8 +569,8 @@ private pure func validate_base_dependencies(dependencies: List[ParameterDepende
 		None: Ok(void)
 	-- Trait-free inputs need only the existing ordinary check, not closure.
 	if dependencies.any(pure func(dependency) -> Bool: dependency.trait_derived):
-		graph = dependency_graph(dependencies)
-		match bound_dependencies(graph):
+		graph = dependencies.dependency_graph()
+		match graph.bound_dependencies():
 			Err(error): Err(error)
 			Ok(BoundedPaths): Ok(void)
 			Ok(UnboundedPaths(marked)):
@@ -579,7 +578,7 @@ private pure func validate_base_dependencies(dependencies: List[ParameterDepende
 				var position = 0
 				for edge in graph.edges:
 					edge_position = position
-					if and(edge.trait_derived, marked.any(pure func(found): found == edge_position)):
+					if edge.trait_derived.and(marked.any(pure func(found): found == edge_position)):
 						failure = Some(edge.span)
 						break
 					position = position + 1
@@ -597,24 +596,24 @@ pure func validate_recursive_instantiation(
 ) -> Result[List[AggregateId], CheckError]:
 	var dependencies: List[ParameterDependency] = []
 	for function in functions:
-		dependencies = append_call_dependencies(dependencies, function_calls(function), traits, [])
-		dependencies = append_creation_dependencies(dependencies, body_callable_creations(function.statements, function.body), traits, [])
+		dependencies = dependencies.append_call_dependencies(function.function_calls(), traits, [])
+		dependencies = dependencies.append_creation_dependencies(function.statements.body_callable_creations(function.body), traits, [])
 	for lambda in lambdas:
-		dependencies = append_call_dependencies(dependencies, lambda_calls(lambda), traits, [])
-		dependencies = append_creation_dependencies(dependencies, body_callable_creations(lambda.statements, lambda.body), traits, [])
-	for implementation in implementation_rows(traits.implementations):
+		dependencies = dependencies.append_call_dependencies(lambda.lambda_calls(), traits, [])
+		dependencies = dependencies.append_creation_dependencies(lambda.statements.body_callable_creations(lambda.body), traits, [])
+	for implementation in traits.implementations.implementation_rows():
 		for member in implementation.methods:
 			match member.body:
 				StructuralEquality(_, template):
-					origins = automatic_origin(implementation)
-					dependencies = append_call_dependencies(dependencies, body_calls([], template.body), traits, origins)
-					dependencies = append_creation_dependencies(dependencies, body_callable_creations([], template.body), traits, origins)
+					origins = implementation.automatic_origin()
+					dependencies = dependencies.append_call_dependencies(body_calls([], template.body), traits, origins)
+					dependencies = dependencies.append_creation_dependencies(body_callable_creations([], template.body), traits, origins)
 				_: void
 	base = dependencies.filter(pure func(dependency): dependency.automatic.is_empty())
-	_: Void ?= validate_base_dependencies(base)
+	_: Void ?= base.validate_base_dependencies()
 	if dependencies.any(pure func(dependency): dependency.automatic.is_empty().not()):
-		graph = dependency_graph(dependencies)
-		match bound_dependencies(graph):
+		graph = dependencies.dependency_graph()
+		match graph.bound_dependencies():
 			Err(error): Err(error)
 			Ok(BoundedPaths): Ok([])
 			Ok(UnboundedPaths(marked)):
@@ -622,7 +621,7 @@ pure func validate_recursive_instantiation(
 				var invalid: Option[CheckError] = None
 				for position in marked:
 					match graph.edges.get(position):
-						Some(edge): unavailable = with_origins(unavailable, edge.automatic)
+						Some(edge): unavailable = unavailable.with_origins(edge.automatic)
 						None: invalid = Some(checker_invariant(compiler_span(), InvalidFunctionContract))
 				match invalid:
 					Some(error): Err(error)
@@ -640,30 +639,30 @@ private pure func unavailable_goal(
 ) -> Result[Bool, CheckError]:
 	var blocked: Bool = False
 	var invalid: Option[CheckError] = None
-	match type_head(receiver):
+	match receiver.type_head():
 		None: void
 		Some(head):
 			canonical: Bool = match traits.canonical.equality:
-				Some(owner): canonical_owner(owner) == required
+				Some(owner): owner.canonical_owner() == required
 				None: False
-			blocked = and(canonical, unavailable.any(pure func(aggregate): head == aggregate_head(aggregate)))
+			blocked = canonical.and(unavailable.any(pure func(aggregate): head == aggregate.aggregate_head()))
 			if blocked.not():
-				match family_for(traits, required, head):
+				match traits.family_for(required, head):
 					None: void
 					Some(family):
-						arguments = receiver_arguments(receiver)
+						arguments = receiver.receiver_arguments()
 						var position = 0
 						for bounds in family.parameter_bounds:
 							match arguments.get(position):
 								None: invalid = Some(checker_invariant(span, InvalidFunctionContract))
 								Some(argument):
 									for bound in bounds:
-										match unavailable_goal(traits, unavailable, bound.required_trait, argument, span):
+										match traits.unavailable_goal(unavailable, bound.required_trait, argument, span):
 											Ok(value): blocked = value
 											Err(error): invalid = Some(error)
-										if or(blocked, invalid.is_some()):
+										if blocked.or(invalid.is_some()):
 											break
-							if or(blocked, invalid.is_some()):
+							if blocked.or(invalid.is_some()):
 								break
 							position = position + 1
 	match invalid:
@@ -675,18 +674,18 @@ private pure func unavailable_named(
 	functions: List[CheckedFunction], traits: AcceptedTraits, unavailable: List[AggregateId],
 	id: FunctionId, arguments: List[TypeRef], span: Span,
 ) -> Result[Bool, CheckError]:
-	function ?= functions.get(function_number(id)).or_checker_invariant(span, InvalidFunctionContract)
+	function ?= functions.get(id.function_number()).or_checker_invariant(span, InvalidFunctionContract)
 	var blocked: Bool = False
 	var invalid: Option[CheckError] = None
 	for required in function.signature.requirements:
-		substitution: Substitution = { owner = parameter_owner(required.parameter), values = arguments }
+		substitution: Substitution = { owner = required.parameter.parameter_owner(), values = arguments }
 		match substitute_type(ParameterType(required.parameter), substitution, span):
 			Err(error): invalid = Some(error)
 			Ok(receiver):
-				match unavailable_goal(traits, unavailable, required.required_trait, receiver, span):
+				match traits.unavailable_goal(unavailable, required.required_trait, receiver, span):
 					Ok(value): blocked = value
 					Err(error): invalid = Some(error)
-		if or(blocked, invalid.is_some()):
+		if blocked.or(invalid.is_some()):
 			break
 	match invalid:
 		Some(error): Err(error)
@@ -698,8 +697,8 @@ private pure func unavailable_choice(
 	choice: CallableChoice, span: Span,
 ) -> Result[Bool, CheckError]:
 	match choice:
-		MethodCallable(method): unavailable_goal(traits, unavailable, trait_method_owner(method_identity(method)), method_receiver(method), span)
-		NamedCallable(id, arguments): unavailable_named(functions, traits, unavailable, id, arguments, span)
+		MethodCallable(method): traits.unavailable_goal(unavailable, method.method_identity().trait_method_owner(), method.method_receiver(), span)
+		NamedCallable(id, arguments): functions.unavailable_named(traits, unavailable, id, arguments, span)
 		ForwardedCallable(_) | StoredCallable(_) | LambdaCallable(_, _): Ok(False)
 
 
@@ -707,7 +706,7 @@ private pure func earlier_unproven(previous: Option[CheckError], span: Span) -> 
 	match previous:
 		None: Some(recursion_error(span, UnprovenTraitInstantiation))
 		Some(error):
-			if and(error.span.source == span.source, span.start < error.span.start):
+			if (error.span.source == span.source).and(span.start < error.span.start):
 				Some(recursion_error(span, UnprovenTraitInstantiation))
 			else:
 				previous
@@ -721,27 +720,27 @@ private pure func unavailable_uses(
 	var invalid: Option[CheckError] = None
 	for call in calls:
 		blocked: Result[Bool, CheckError] = match call.target:
-			UserFunction(id, arguments): unavailable_named(functions, traits, unavailable, id, arguments, call.span)
-			TraitMethod(method): unavailable_goal(traits, unavailable, trait_method_owner(method_identity(method)), method_receiver(method), call.span)
+			UserFunction(id, arguments): functions.unavailable_named(traits, unavailable, id, arguments, call.span)
+			TraitMethod(method): traits.unavailable_goal(unavailable, method.method_identity().trait_method_owner(), method.method_receiver(), call.span)
 			RuntimeFunction(_) | CallableParameter(_) | ValueCall(_): Ok(False)
 		match blocked:
 			Err(error): invalid = Some(error)
-			Ok(True): first = earlier_unproven(first, call.span)
+			Ok(True): first = first.earlier_unproven(call.span)
 			Ok(False): void
 		for operand in call.operands:
 			match operand:
 				ValueOperand(_): void
 				CallableOperand(_, choice, span):
-					match unavailable_choice(functions, traits, unavailable, choice, span):
+					match functions.unavailable_choice(traits, unavailable, choice, span):
 						Err(error): invalid = Some(error)
-						Ok(True): first = earlier_unproven(first, span)
+						Ok(True): first = first.earlier_unproven(span)
 						Ok(False): void
 	for value in creations:
 		match value.form:
 			MakeCallable(choice):
-				match unavailable_choice(functions, traits, unavailable, choice, value.span):
+				match functions.unavailable_choice(traits, unavailable, choice, value.span):
 					Err(error): invalid = Some(error)
-					Ok(True): first = earlier_unproven(first, value.span)
+					Ok(True): first = first.earlier_unproven(value.span)
 					Ok(False): void
 			_: void
 	match invalid:
@@ -785,14 +784,14 @@ pure func finalize_trait_instances(
 	var unavailable = initially_unavailable
 	var invalid: Option[CheckError] = None
 	var changed: Bool = initially_unavailable.is_empty().not()
-	while and(changed, invalid.is_none()):
+	while changed.and(invalid.is_none()):
 		changed = False
-		for implementation in implementation_rows(traits.implementations):
+		for implementation in traits.implementations.implementation_rows():
 			for member in implementation.methods:
 				match member.body:
 					StructuralEquality(aggregate, template):
 						if unavailable.any(pure func(existing): existing == aggregate).not():
-							match unavailable_uses(functions, traits, unavailable, body_calls([], template.body), body_callable_creations([], template.body)):
+							match functions.unavailable_uses(traits, unavailable, body_calls([], template.body), body_callable_creations([], template.body)):
 								Err(error): invalid = Some(error)
 								Ok(Some(_)):
 									unavailable = unavailable.append(aggregate)
@@ -806,17 +805,17 @@ pure func finalize_trait_instances(
 	if unavailable.is_empty().not():
 		for constant in constants:
 			if first.is_none():
-				match unavailable_uses(functions, traits, unavailable, expression_calls(constant.value), expression_callable_creations(constant.value)):
+				match functions.unavailable_uses(traits, unavailable, constant.value.expression_calls(), constant.value.expression_callable_creations()):
 					Err(error): invalid = Some(error)
 					Ok(error): first = error
 		for function in functions:
 			if first.is_none():
-				match unavailable_uses(functions, traits, unavailable, function_calls(function), body_callable_creations(function.statements, function.body)):
+				match functions.unavailable_uses(traits, unavailable, function.function_calls(), function.statements.body_callable_creations(function.body)):
 					Err(error): invalid = Some(error)
 					Ok(error): first = error
 		for lambda in lambdas:
 			if first.is_none():
-				match unavailable_uses(functions, traits, unavailable, lambda_calls(lambda), body_callable_creations(lambda.statements, lambda.body)):
+				match functions.unavailable_uses(traits, unavailable, lambda.lambda_calls(), lambda.statements.body_callable_creations(lambda.body)):
 					Err(error): invalid = Some(error)
 					Ok(error): first = error
 	_: Void ?= match invalid:
@@ -829,5 +828,5 @@ pure func finalize_trait_instances(
 	implementations: ImplementationTable ?= if final_unavailable.is_empty():
 		Ok(traits.implementations)
 	else:
-		checked_implementation_table(implementation_rows(traits.implementations).filter(pure func(implementation): blocked_by_unavailable_equality(implementation, final_unavailable).not()))
+		checked_implementation_table(traits.implementations.implementation_rows().filter(pure func(implementation): implementation.blocked_by_unavailable_equality(final_unavailable).not()))
 	Ok(into_opaque FinalTraits({ traits = { traits | implementations = implementations }, removed = final_unavailable }))

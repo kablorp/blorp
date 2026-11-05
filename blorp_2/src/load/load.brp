@@ -3,15 +3,15 @@ import:
 	int: Int methods
 	string: String methods
 	../lex/lex: lex
-	../utils/names: NameId, NameTable, name_spelling
+	../utils/names: NameId, NameTable
 	option: Option methods
 	../parse/assemble:
-		ParsedAssembly, ParsedProgram, SealFailure(MalformedBundle, ImportCycle), append_module, assembly_names, begin_program, prepare_test_entry, seal_program
+		ParsedAssembly, ParsedProgram, SealFailure(MalformedBundle, ImportCycle), begin_program
 	../parse/parse:
-		ParsedModule, ParsedImport, ImportOrigin(RelativeImport, LibraryImport), module_imports, module_names, parse_module
+		ParsedModule, ParsedImport, ImportOrigin(RelativeImport, LibraryImport), parse_module
 	path as Path
 	../utils/source:
-		ModuleId, ModuleKind(UserModule, LibraryModule, FoundationTypesModule, FoundationPreludeModule), foundation_prelude_module_id, foundation_types_module_id, module_id, module_number, module_source, root_module_id
+		ModuleId, ModuleKind(UserModule, LibraryModule, FoundationTypesModule, FoundationPreludeModule), foundation_prelude_module_id, foundation_types_module_id, module_id, root_module_id
 	../utils/syntax: Diagnostic, Span, compiler_span, diagnostic, internal_error, or_internal_error
 	system: get_current_directory
 
@@ -93,8 +93,8 @@ private pure func join_parts(directory: String, parts: List[NameId], position: I
 		None:
 			Ok(directory)
 		Some(part):
-			match name_spelling(names, part).or_internal_error(compiler_span(), "import path references an invalid spelling identity"):
-				Ok(spelling): join_parts(Path.join(directory, spelling), parts, position + 1, names)
+			match names.name_spelling(part).or_internal_error(compiler_span(), "import path references an invalid spelling identity"):
+				Ok(spelling): Path.join(directory, spelling).join_parts(parts, position + 1, names)
 				Err(error): Err(error)
 
 
@@ -116,7 +116,7 @@ pure func import_path(
 				directory = Path.dirname(directory)
 				remaining = remaining - 1
 			directory
-	directory ?= join_parts(base, request.path.parts, 0, names)
+	directory ?= base.join_parts(request.path.parts, 0, names)
 	-- Already normal: the importer and library root are normalized, relative parents
 	-- are resolved with dirname on that normal path, and the parser admits only
 	-- identifier parts ("interior dot segments are rejected" in
@@ -149,14 +149,14 @@ private pure func known_module(requests: List[RequestedModule], path: String) ->
 
 
 private func read_module(path: String, site: Option[Span]) -> Result[String, Diagnostic]:
-	match read_text(path):
+	match path.read_text():
 		Ok(contents):
 			Ok(contents)
 		Err(error):
 			-- describe names the path: "missing.brp: no such file".
 			Err(diagnostic(
 				site.get_or(compiler_span()),
-				"could not read module ${describe(error)}",
+				"could not read module ${error.describe()}",
 				"check the import path and provide a readable .brp file under its source root",
 			))
 
@@ -206,8 +206,8 @@ private pure func import_diagnostic(importer: ModuleKind, target: ModuleKind, sp
 private pure func import_allowed(cursor: ImportCursor, known: Option[RequestedModule], path: String, span: Span) -> Result[RequestedModule, Diagnostic]:
 	role = match known:
 		Some(queued): queued.role
-		None: module_role(cursor.layout, path)
-	match import_diagnostic(cursor.importer.role, role, span):
+		None: cursor.layout.module_role(path)
+	match cursor.importer.role.import_diagnostic(role, span):
 		Some(error):
 			Err(error)
 		None:
@@ -225,10 +225,10 @@ private pure func resolve_imports(cursor: ImportCursor) -> Result[ImportCursor, 
 		None:
 			Ok(cursor)
 		Some(request):
-			match import_path(cursor.importer.path, request, cursor.names, cursor.layout):
+			match cursor.importer.path.import_path(request, cursor.names, cursor.layout):
 				Ok(path):
-					known = known_module(cursor.requests, path)
-					match import_allowed(cursor, known, path, request.span):
+					known = cursor.requests.known_module(path)
+					match cursor.import_allowed(known, path, request.span):
 						Ok(target):
 							requests = match known:
 								Some(_): cursor.requests
@@ -240,20 +240,20 @@ private pure func resolve_imports(cursor: ImportCursor) -> Result[ImportCursor, 
 
 -- Parse one file, resolve its imports, and add it to the assembly.
 private pure func link_module(state: LoadState, current: RequestedModule, contents: String) -> Result[LoadState, Diagnostic]:
-	lexed ?= lex(module_source(current.id), contents, assembly_names(state.assembly))
-	parsed ?= parse_module(lexed, current.id)
+	lexed ?= lex(current.id.module_source(), contents, state.assembly.assembly_names())
+	parsed ?= lexed.parse_module(current.id)
 	resolved ?= resolve_imports({
-		layout = state.layout, importer = current, names = module_names(parsed),
-		imports = module_imports(parsed), requests = state.requests, targets = [],
+		layout = state.layout, importer = current, names = parsed.module_names(),
+		imports = parsed.module_imports(), requests = state.requests, targets = [],
 	})
-	assembly ?= append_module(state.assembly, parsed, resolved.targets, current.role, current.path)
+	assembly ?= state.assembly.append_module(parsed, resolved.targets, current.role, current.path)
 	Ok({ state | requests = resolved.requests, assembly = assembly })
 
 
 -- Readable bytes stay in the failure's sources even when parsing fails, so the
 -- diagnostic has a source to render against.
 private func load_module(state: LoadState, current: RequestedModule) -> Result[LoadState, LoadFailure]:
-	match read_module(current.path, current.site):
+	match current.path.read_module(current.site):
 		Err(error):
 			Err(failure(state.modules, error))
 		Ok(contents):
@@ -262,7 +262,7 @@ private func load_module(state: LoadState, current: RequestedModule) -> Result[L
 			else:
 				current.path
 			with_source = { state | modules = state.modules.append({ path = display_path, contents = contents }) }
-			match link_module(with_source, current, contents):
+			match with_source.link_module(current, contents):
 				Err(error): Err(failure(with_source.modules, error))
 				Ok(linked): Ok(linked)
 
@@ -274,8 +274,8 @@ private func load_queue(state: LoadState) -> Result[LoadState, LoadFailure]:
 		None:
 			Ok(state)
 		Some(current):
-			match load_module(state, current):
-				Ok(next): load_queue(next)
+			match state.load_module(current):
+				Ok(next): next.load_queue()
 				Err(error): Err(error)
 
 
@@ -289,7 +289,7 @@ private union LoadMode:
 -- source IDs never move. A local file or alias spelling cannot supply this role.
 private func load_test_entry(state: LoadState, grouped: List[RequestedModule]) -> Result[LoadState, LoadFailure]:
 	path = Path.join(from_opaque LibraryLayout(state.layout).root, "test.brp")
-	known = known_module(state.requests, path)
+	known = state.requests.known_module(path)
 	id: ModuleId ?= match known:
 		Some(request): Ok(request.id)
 		None:
@@ -299,8 +299,8 @@ private func load_test_entry(state: LoadState, grouped: List[RequestedModule]) -
 	pending: LoadState = match known:
 		Some(_): state
 		None: { state | requests = state.requests.append(designated(id, path, LibraryModule)) }
-	loaded ?= load_queue(pending)
-	match prepare_test_entry(loaded.assembly, grouped.map(pure func(request): request.id), id, foundation_types_module_id()):
+	loaded ?= pending.load_queue()
+	match loaded.assembly.prepare_test_entry(grouped.map(pure func(request): request.id), id, foundation_types_module_id()):
 		Err(error): Err(failure(loaded.modules, error))
 		Ok(assembly): Ok({ loaded | assembly = assembly })
 
@@ -314,8 +314,8 @@ private pure func display_paths(sources: SourceInputs, cycle: List[ModuleId], pa
 		None:
 			Ok(paths)
 		Some(module):
-			match sources.modules.get(module_number(module)).or_internal_error(compiler_span(), "import cycle names a module without a source"):
-				Ok(file): display_paths(sources, cycle, paths.append(file.path))
+			match sources.modules.get(module.module_number()).or_internal_error(compiler_span(), "import cycle names a module without a source"):
+				Ok(file): sources.display_paths(cycle, paths.append(file.path))
 				Err(error): Err(error)
 
 
@@ -333,11 +333,11 @@ pure func working_directory_result(result: Result[String, String]) -> Result[Str
 
 -- Every queued path has one identity, role, read, and parse in this invocation.
 func load_program(root_path: String, library_root: String) -> Result[LoadedProgram, LoadFailure]:
-	load_input(root_path, library_root, ApplicationInput)
+	root_path.load_input(library_root, ApplicationInput)
 
 
 func load_test_program(root_path: String, grouped_paths: List[String], library_root: String) -> Result[LoadedProgram, LoadFailure]:
-	load_input(root_path, library_root, TestSuiteInput(grouped_paths))
+	root_path.load_input(library_root, TestSuiteInput(grouped_paths))
 
 
 -- The later test suite roots, queued after the foundation inputs in
@@ -350,26 +350,26 @@ private pure func queue_roots(working_directory: String, paths: List[String], qu
 		Some(written):
 			path = Path.normalize(Path.join(working_directory, written))
 			requests = queued.concat(later)
-			match (known_module(requests, path), module_id(requests.length())):
+			match (requests.known_module(path), module_id(requests.length())):
 				(Some(_), _):
 					Err(failure([], diagnostic(compiler_span(), "test suite input ${written} is already part of this compilation", "list each test suite file once; foundation inputs are supplied by --library-root")))
 				(None, Some(id)):
-					queue_roots(working_directory, paths, queued, later.append(designated(id, path, UserModule)))
+					working_directory.queue_roots(paths, queued, later.append(designated(id, path, UserModule)))
 				(None, None):
 					Err(failure([], internal_error(compiler_span(), "module inventory is too large")))
 
 
 private func load_input(root_path: String, library_root: String, mode: LoadMode) -> Result[LoadedProgram, LoadFailure]:
-	working_directory ?= working_directory_result(get_current_directory())
-	layout = library_layout(Path.join(working_directory, library_root))
+	working_directory ?= get_current_directory().working_directory_result()
+	layout = Path.join(working_directory, library_root).library_layout()
 	foundation = from_opaque LibraryLayout(layout)
 	root_file = Path.normalize(Path.join(working_directory, root_path))
 	-- Only the foundation inputs are barred from being the application root.
-	_: Void ?= match module_role(layout, root_file):
+	_: Void ?= match layout.module_role(root_file):
 		FoundationTypesModule | FoundationPreludeModule:
 			Err(failure(
 				[{ path = root_path, contents = "" }],
-				diagnostic({ source = module_source(root_module_id()), start = 0, end = 0 }, "foundation modules cannot be application roots", "choose an application module; foundation inputs are supplied by --library-root"),
+				diagnostic({ source = root_module_id().module_source(), start = 0, end = 0 }, "foundation modules cannot be application roots", "choose an application module; foundation inputs are supplied by --library-root"),
 			))
 		LibraryModule | UserModule:
 			Ok(void)
@@ -380,7 +380,7 @@ private func load_input(root_path: String, library_root: String, mode: LoadMode)
 	]
 	later: List[RequestedModule] ?= match mode:
 		ApplicationInput: Ok([])
-		TestSuiteInput(paths): queue_roots(working_directory, paths, designated_inputs, [])
+		TestSuiteInput(paths): working_directory.queue_roots(paths, designated_inputs, [])
 	initial ?= load_queue({
 		layout = layout,
 		root_path = root_path,
@@ -390,15 +390,15 @@ private func load_input(root_path: String, library_root: String, mode: LoadMode)
 	})
 	loaded: LoadState ?= match mode:
 		ApplicationInput: Ok(initial)
-		TestSuiteInput(_): load_test_entry(initial, later)
+		TestSuiteInput(_): initial.load_test_entry(later)
 	sources: SourceInputs = { modules = loaded.modules }
-	match seal_program(loaded.assembly):
+	match loaded.assembly.seal_program():
 		Ok(program):
 			Ok({ sources = sources, program = program })
 		Err(MalformedBundle(error)):
 			Err(failure(loaded.modules, error))
 		-- Import cycles are banned; sealing reports the first at the import that closes it.
 		Err(ImportCycle(cycle, closing)):
-			match display_paths(sources, cycle, []):
+			match sources.display_paths(cycle, []):
 				Err(error): Err(failure(loaded.modules, error))
 				Ok(paths): Err(failure(loaded.modules, diagnostic(closing, "import cycle: ${paths.join(" -> ")}", IMPORT_CYCLE_HELP)))

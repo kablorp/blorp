@@ -4,7 +4,7 @@ against the frozen namespace, including declared type parameters.
 ---
 import:
 	result: Result methods
-	bool: not, and, or
+	bool: Bool methods
 	./errors:
 		CheckError,
 		CheckerInvariant(
@@ -43,32 +43,23 @@ import:
 		UnionOccurrence,
 		contains_parameter,
 		field_id,
-		parameter_owner,
-		parameter_position,
 		primitive_ref,
-		type_children,
 		type_parameter_id,
 	../utils/ids:
 		RecordRow,
 		UnionRow,
 		OpaqueRow,
 		NominalRow(UnionDeclarationRow, RecordDeclarationRow, OpaqueDeclarationRow),
-		inventory_functions,
-		inventory_opaques,
-		inventory_records,
-		inventory_unions,
-		next_nominal,
+		DeclarationInventory,
 		RecordId,
-		opaque_number,
+		OpaqueId,
 		UnionId,
-		record_number,
-		union_number,
 	int: Int methods
 	list: repeat
 	../utils/names: NameId
 	../namespace/namespace:
 		AliasedModule, Unoffered, Namespace, NamedValue(NamedAlias), TypeHead(PrimitiveHead, ListHead, UnionHead, RecordHead, OpaqueHead),
-		Origin(Declared), named_trait, named_type, named_value, offered_type, offered_trait, resolve_trait,
+		Origin(Declared),
 	option: Option methods
 	../parse/assemble: ParsedContents
 	../utils/results: first_error
@@ -84,7 +75,6 @@ import:
 		TypeSyntax(TupleTypeSyntax, AtomicType, AppliedType, QualifiedType, CallableTypeSyntax),
 		WrittenName,
 		Visibility(Private, Public),
-		type_span,
 
 
 pure func previous_declaration(previous: List[WrittenName], name: NameId) -> Option[WrittenName]:
@@ -155,7 +145,7 @@ pure func local_type_parameters(
 	owner: TypeParameterOwner,
 	module_scope: TypeScope,
 ) -> Result[TypeScope, CheckError]:
-	declare_type_parameters(written, owner, { module_scope | parameters = [] })
+	written.declare_type_parameters(owner, { module_scope | parameters = [] })
 
 
 -- Declares the type parameters in order; each name is new and is not already
@@ -172,7 +162,7 @@ private pure func declare_type_parameters(
 			name = parameter.name
 			id = type_parameter_id(owner, scope.parameters.length())
 
-			match lookup_type_parameter(scope.parameters, name.id):
+			match scope.parameters.lookup_type_parameter(name.id):
 				Some(previous):
 					Err(
 						type_declaration_error(
@@ -181,8 +171,8 @@ private pure func declare_type_parameters(
 						),
 					)
 				None:
-					if named_type(scope.namespace, scope.module, name.id).is_none():
-						declare_type_parameters(written, owner, { scope | parameters = scope.parameters.append({
+					if scope.namespace.named_type(scope.module, name.id).is_none():
+						written.declare_type_parameters(owner, { scope | parameters = scope.parameters.append({
 									name = name,
 									id = id,
 								}) })
@@ -207,10 +197,10 @@ pure func resolve_bounds(parameters: List[ParsedTypeParameter], scope: TypeScope
 	for parameter in parameters:
 		var bounds: List[LocatedTrait] = []
 		for written in parameter.bounds:
-			match resolve_trait(scope.namespace, scope.module, written):
-				Some(id): bounds = bounds.append({ required_trait = id, span = type_span(written) })
+			match scope.namespace.resolve_trait(scope.module, written):
+				Some(id): bounds = bounds.append({ required_trait = id, span = written.type_span() })
 				None:
-					failure = Some(trait_error(type_span(written), InvalidTraitBound))
+					failure = Some(trait_error(written.type_span(), InvalidTraitBound))
 					break
 		resolved = resolved.append(bounds)
 		if failure.is_some():
@@ -237,22 +227,22 @@ pure func parameter_requirements(bounds: List[List[LocatedTrait]], owner: TypePa
 private pure func nominal_arity(scope: TypeScope, owner: NominalId, span: Span) -> Result[Int, CheckError]:
 	match owner:
 		AggregateNominal(RecordAggregate(id)):
-			match scope.records.get(record_number(id)):
+			match scope.records.get(id.record_number()):
 				Some(row): Ok(row.declaration.type_parameters.length())
 				None: Err(checker_invariant(span, InvalidRecordDeclaration(id)))
 		AggregateNominal(UnionAggregate(id)):
-			match scope.unions.get(union_number(id)):
+			match scope.unions.get(id.union_number()):
 				Some(row): Ok(row.type_parameters.length())
 				None: Err(checker_invariant(span, InvalidUnionDeclaration(id)))
 		OpaqueNominal(id):
-			match scope.opaques.get(opaque_number(id)):
+			match scope.opaques.get(id.opaque_number()):
 				Some(row): Ok(row.declaration.type_parameters.length())
 				None: Err(checker_invariant(span, InvalidOpaqueDeclaration(id)))
 
 
 -- A nominal head written alone, which its declaration must not need arguments for.
 private pure func unapplied_nominal(scope: TypeScope, owner: NominalId, span: Span) -> Result[TypeRef, CheckError]:
-	arity ?= nominal_arity(scope, owner, span)
+	arity ?= scope.nominal_arity(owner, span)
 	if arity == 0:
 		Ok(NominalType(owner, []))
 	else:
@@ -261,9 +251,9 @@ private pure func unapplied_nominal(scope: TypeScope, owner: NominalId, span: Sp
 
 -- A nominal head with written arguments, which must match its arity.
 private pure func resolve_nominal(scope: TypeScope, owner: NominalId, arguments: List[TypeSyntax], span: Span) -> Result[TypeRef, CheckError]:
-	arity ?= nominal_arity(scope, owner, span)
+	arity ?= scope.nominal_arity(owner, span)
 	if arity == arguments.length():
-		match resolve_types(scope, arguments, []):
+		match scope.resolve_types(arguments, []):
 			Ok(values): Ok(NominalType(owner, values))
 			Err(error): Err(error)
 	else if arity == 0:
@@ -279,22 +269,22 @@ private pure func resolve_atomic_head(
 ) -> Result[TypeRef, CheckError]:
 	match head:
 		PrimitiveHead(primitive):
-			Ok(primitive_ref(primitive))
+			Ok(primitive.primitive_ref())
 		ListHead:
 			Err(type_term_error(name.span, ListTypeArgumentCount))
 		OpaqueHead(id):
-			unapplied_nominal(scope, OpaqueNominal(id), name.span)
+			scope.unapplied_nominal(OpaqueNominal(id), name.span)
 		RecordHead(id):
-			unapplied_nominal(scope, AggregateNominal(RecordAggregate(id)), name.span)
+			scope.unapplied_nominal(AggregateNominal(RecordAggregate(id)), name.span)
 		UnionHead(id):
-			unapplied_nominal(scope, AggregateNominal(UnionAggregate(id)), name.span)
+			scope.unapplied_nominal(AggregateNominal(UnionAggregate(id)), name.span)
 
 
 -- One unqualified lookup validates access before publishing the head.
 private pure func resolve_head(scope: TypeScope, name: WrittenName, missing: TypeTermError) -> Result[TypeHead, CheckError]:
-	match named_type(scope.namespace, scope.module, name.id):
+	match scope.namespace.named_type(scope.module, name.id):
 		None:
-			match named_trait(scope.namespace, scope.module, name.id):
+			match scope.namespace.named_trait(scope.module, name.id):
 				Some(id): Err(type_term_error(name.span, TraitUsedAsType(id)))
 				None: Err(type_term_error(name.span, missing))
 		Some(found):
@@ -320,14 +310,14 @@ private pure func resolve_atomic_type(
 	scope: TypeScope,
 	name: WrittenName,
 ) -> Result[TypeRef, CheckError]:
-	match scoped_type(scope, name):
+	match scope.scoped_type(name):
 		Some(value_type): Ok(value_type)
 		None:
-			match lookup_type_parameter(scope.parameters, name.id):
+			match scope.parameters.lookup_type_parameter(name.id):
 				Some(parameter): Ok(ParameterType(parameter.id))
 				None:
-					match resolve_head(scope, name, UnknownType(name.id)):
-						Ok(head): resolve_atomic_head(scope, head, name)
+					match scope.resolve_head(name, UnknownType(name.id)):
+						Ok(head): scope.resolve_atomic_head(head, name)
 						Err(error): Err(error)
 
 -- A head applied to written arguments; the head's own arity rules.
@@ -342,17 +332,17 @@ private pure func resolve_applied_head(
 		ListHead:
 			match arguments:
 				[element]:
-					match resolve_type(scope, element):
+					match scope.resolve_type(element):
 						Ok(value): Ok(ListType(value))
 						Err(error): Err(error)
 				_:
 					Err(type_term_error(span, ListTypeArgumentCount))
 		RecordHead(owner):
-			resolve_nominal(scope, AggregateNominal(RecordAggregate(owner)), arguments, span)
+			scope.resolve_nominal(AggregateNominal(RecordAggregate(owner)), arguments, span)
 		UnionHead(owner):
-			resolve_nominal(scope, AggregateNominal(UnionAggregate(owner)), arguments, span)
+			scope.resolve_nominal(AggregateNominal(UnionAggregate(owner)), arguments, span)
 		OpaqueHead(owner):
-			resolve_nominal(scope, OpaqueNominal(owner), arguments, span)
+			scope.resolve_nominal(OpaqueNominal(owner), arguments, span)
 		PrimitiveHead(_):
 			Err(type_term_error(name.span, NonApplicableType(name.id)))
 
@@ -360,28 +350,28 @@ private pure func resolve_applied_head(
 -- Receiver families name one head; their binders are accepted separately.
 pure func resolve_receiver_head(scope: TypeScope, written: ParsedReceiverHead) -> Result[TypeHead, CheckError]:
 	match written:
-		ReceiverName(name): resolve_head(scope, name, UnknownType(name.id))
+		ReceiverName(name): scope.resolve_head(name, UnknownType(name.id))
 		QualifiedReceiverName(qualified):
-			match aliased_module(scope.namespace, scope.module, qualified.module):
+			match scope.namespace.aliased_module(scope.module, qualified.module):
 				Err(error): Err(error)
 				Ok(aliased):
-					match offered_type(scope.namespace, aliased.target, qualified.name.id):
+					match scope.namespace.offered_type(aliased.target, qualified.name.id):
 						Ok(head): Ok(head)
-						Err(reason): Err(qualified_type_rejection(scope, aliased, qualified, reason))
+						Err(reason): Err(scope.qualified_type_rejection(aliased, qualified, reason))
 
 
 pure func receiver_arity(scope: TypeScope, head: TypeHead, span: Span) -> Result[Int, CheckError]:
 	match head:
 		ListHead: Ok(1)
-		RecordHead(owner): nominal_arity(scope, AggregateNominal(RecordAggregate(owner)), span)
-		UnionHead(owner): nominal_arity(scope, AggregateNominal(UnionAggregate(owner)), span)
-		OpaqueHead(owner): nominal_arity(scope, OpaqueNominal(owner), span)
+		RecordHead(owner): scope.nominal_arity(AggregateNominal(RecordAggregate(owner)), span)
+		UnionHead(owner): scope.nominal_arity(AggregateNominal(UnionAggregate(owner)), span)
+		OpaqueHead(owner): scope.nominal_arity(OpaqueNominal(owner), span)
 		PrimitiveHead(_): Ok(0)
 
 
 -- The module `written` names as a module alias in `module`.
 pure func aliased_module(namespace: Namespace, module: ModuleId, written: WrittenName) -> Result[AliasedModule, CheckError]:
-	match named_value(namespace, module, written.id):
+	match namespace.named_value(module, written.id):
 		Some(NamedAlias(aliased)): Ok(aliased)
 		_: Err(qualified_error(written.span, UnknownModuleAlias(written.id)))
 
@@ -393,20 +383,20 @@ private pure func resolve_qualified_type(
 	arguments: List[TypeSyntax],
 	span: Span,
 ) -> Result[TypeRef, CheckError]:
-	aliased ?= aliased_module(scope.namespace, scope.module, qualified.module)
-	head: TypeHead ?= match offered_type(scope.namespace, aliased.target, qualified.name.id):
+	aliased ?= scope.namespace.aliased_module(scope.module, qualified.module)
+	head: TypeHead ?= match scope.namespace.offered_type(aliased.target, qualified.name.id):
 		Ok(head): Ok(head)
-		Err(reason): Err(qualified_type_rejection(scope, aliased, qualified, reason))
+		Err(reason): Err(scope.qualified_type_rejection(aliased, qualified, reason))
 	if arguments.is_empty():
-		resolve_atomic_head(scope, head, qualified.name)
+		scope.resolve_atomic_head(head, qualified.name)
 	else:
-		resolve_applied_head(scope, head, qualified.name, arguments, span)
+		scope.resolve_applied_head(head, qualified.name, arguments, span)
 
 
 -- Produce the rejection fact before wrapping it in the caller's Result. This
 -- keeps the two failed lookup cases on one ordinary publication boundary.
 private pure func qualified_type_rejection(scope: TypeScope, aliased: AliasedModule, qualified: ParsedQualified, reason: Unoffered) -> CheckError:
-	match offered_trait(scope.namespace, aliased.target, qualified.name.id):
+	match scope.namespace.offered_trait(aliased.target, qualified.name.id):
 		Ok(id): type_term_error(qualified.name.span, TraitUsedAsType(id))
 		Err(_): qualified_error(qualified.name.span, QualifiedNotOffered(qualified.module.id, qualified.name.id, aliased.path, reason))
 
@@ -414,25 +404,25 @@ private pure func qualified_type_rejection(scope: TypeScope, aliased: AliasedMod
 pure func resolve_type(scope: TypeScope, written: TypeSyntax) -> Result[TypeRef, CheckError]:
 	match written:
 		TupleTypeSyntax(elements, _):
-			resolve_types(scope, elements, []).map(pure func(values): TupleType(values))
+			scope.resolve_types(elements, []).map(pure func(values): TupleType(values))
 		CallableTypeSyntax(purity, parameters, result, _):
-			match resolve_types(scope, parameters, []):
+			match scope.resolve_types(parameters, []):
 				Err(error): Err(error)
 				Ok(values):
-					match resolve_type(scope, result):
+					match scope.resolve_type(result):
 						Err(error): Err(error)
 						Ok(returned):
 							Ok(CallableType(purity, values, returned))
 		QualifiedType(qualified, arguments, span):
-			resolve_qualified_type(scope, qualified, arguments, span)
+			scope.resolve_qualified_type(qualified, arguments, span)
 		AtomicType(name):
-			resolve_atomic_type(scope, name)
+			scope.resolve_atomic_type(name)
 		AppliedType(name, arguments, span):
-			match scoped_type(scope, name):
+			match scope.scoped_type(name):
 				Some(_): Err(type_term_error(name.span, NonApplicableType(name.id)))
 				None:
-					match resolve_head(scope, name, NonApplicableType(name.id)):
-						Ok(head): resolve_applied_head(scope, head, name, arguments, span)
+					match scope.resolve_head(name, NonApplicableType(name.id)):
+						Ok(head): scope.resolve_applied_head(head, name, arguments, span)
 						Err(error): Err(error)
 
 
@@ -445,10 +435,9 @@ private pure func resolve_types(
 		None:
 			Ok(resolved)
 		Some(argument):
-			match resolve_type(scope, argument):
+			match scope.resolve_type(argument):
 				Ok(value):
-					resolve_types(
-						scope,
+					scope.resolve_types(
 						written,
 						resolved.append(value),
 					)
@@ -480,8 +469,7 @@ pure func validate_declarations(
 	parsed: ParsedContents,
 	namespace: Namespace,
 ) -> Result[CheckedDeclarations, CheckError]:
-	declare_types(
-		parsed,
+	parsed.declare_types(
 		namespace,
 		{
 			unions = [],
@@ -496,7 +484,7 @@ private pure func declare_types(
 	namespace: Namespace,
 	checked: CheckedDeclarations,
 ) -> Result[CheckedDeclarations, CheckError]:
-	match next_nominal(parsed.declarations, checked.records.length(), checked.unions.length(), checked.opaques.length()):
+	match parsed.declarations.next_nominal(checked.records.length(), checked.unions.length(), checked.opaques.length()):
 		None:
 			Ok(checked)
 		Some(declaration):
@@ -506,27 +494,26 @@ private pure func declare_types(
 				OpaqueDeclarationRow(_): PrivateTypeUse
 			scope: TypeScope = {
 				self_binding = None,
-				records = inventory_records(parsed.declarations),
-				unions = inventory_unions(parsed.declarations),
-				opaques = inventory_opaques(parsed.declarations),
+				records = parsed.declarations.inventory_records(),
+				unions = parsed.declarations.inventory_unions(),
+				opaques = parsed.declarations.inventory_opaques(),
 				namespace = namespace,
-				module = declared_module(declaration),
+				module = declaration.declared_module(),
 				access = access,
 				parameters = []
 			}
 
 			declared: Result[CheckedDeclarations, CheckError] = match declaration:
 				UnionDeclarationRow(parsed_union):
-					checked_union(parsed_union, scope).map(pure func(accepted): { checked | unions = checked.unions.append(accepted) })
+					parsed_union.checked_union(scope).map(pure func(accepted): { checked | unions = checked.unions.append(accepted) })
 				RecordDeclarationRow(parsed_record):
-					checked_record(parsed_record, scope).map(pure func(accepted): { checked | records = checked.records.append(accepted) })
+					parsed_record.checked_record(scope).map(pure func(accepted): { checked | records = checked.records.append(accepted) })
 				OpaqueDeclarationRow(parsed_opaque):
-					checked_opaque(parsed_opaque, scope).map(pure func(accepted): { checked | opaques = checked.opaques.append(accepted) })
+					parsed_opaque.checked_opaque(scope).map(pure func(accepted): { checked | opaques = checked.opaques.append(accepted) })
 
 			match declared:
 				Ok(updated):
-					declare_types(
-						parsed,
+					parsed.declare_types(
 						namespace,
 						updated,
 					)
@@ -537,28 +524,28 @@ private pure func declare_types(
 
 private pure func checked_union(row: UnionRow, module_scope: TypeScope) -> Result[CheckedUnion, CheckError]:
 	owner: TypeParameterOwner = UnionDeclaration(row.id)
-	scope ?= local_type_parameters(row.type_parameters, owner, module_scope)
-	bounds ?= resolve_bounds(row.type_parameters, scope)
-	variants ?= declared_variants(row, scope, [])
-	Ok({ id = row.id, type_parameters = declared_parameters(scope), requirements = parameter_requirements(bounds, owner), variants = variants, fixed = row.fixed })
+	scope ?= row.type_parameters.local_type_parameters(owner, module_scope)
+	bounds ?= row.type_parameters.resolve_bounds(scope)
+	variants ?= row.declared_variants(scope, [])
+	Ok({ id = row.id, type_parameters = scope.declared_parameters(), requirements = bounds.parameter_requirements(owner), variants = variants, fixed = row.fixed })
 
 
 private pure func checked_record(row: RecordRow, module_scope: TypeScope) -> Result[CheckedRecord, CheckError]:
 	owner: TypeParameterOwner = RecordDeclaration(row.id)
-	scope ?= local_type_parameters(row.declaration.type_parameters, owner, module_scope)
-	bounds ?= resolve_bounds(row.declaration.type_parameters, scope)
-	fields ?= declared_fields(row.declaration, row.id, scope, [])
-	Ok({ id = row.id, type_parameters = declared_parameters(scope), requirements = parameter_requirements(bounds, owner), fields = fields, fixed = row.declaration.fixed })
+	scope ?= row.declaration.type_parameters.local_type_parameters(owner, module_scope)
+	bounds ?= row.declaration.type_parameters.resolve_bounds(scope)
+	fields ?= row.declaration.declared_fields(row.id, scope, [])
+	Ok({ id = row.id, type_parameters = scope.declared_parameters(), requirements = bounds.parameter_requirements(owner), fields = fields, fixed = row.declaration.fixed })
 
 
 private pure func checked_opaque(row: OpaqueRow, module_scope: TypeScope) -> Result[CheckedOpaque, CheckError]:
 	owner: TypeParameterOwner = OpaqueDeclaration(row.id)
-	scope ?= local_type_parameters(row.declaration.type_parameters, owner, module_scope)
-	bounds ?= resolve_bounds(row.declaration.type_parameters, scope)
-	underlying ?= resolve_type(scope, row.declaration.underlying)
+	scope ?= row.declaration.type_parameters.local_type_parameters(owner, module_scope)
+	bounds ?= row.declaration.type_parameters.resolve_bounds(scope)
+	underlying ?= scope.resolve_type(row.declaration.underlying)
 	Ok({
-		id = row.id, type_parameters = declared_parameters(scope), requirements = parameter_requirements(bounds, owner),
-		underlying_type = { value_type = underlying, span = type_span(row.declaration.underlying) }
+		id = row.id, type_parameters = scope.declared_parameters(), requirements = bounds.parameter_requirements(owner),
+		underlying_type = { value_type = underlying, span = row.declaration.underlying.type_span() }
 	})
 
 
@@ -572,11 +559,10 @@ private pure func declared_variants(
 		None:
 			Ok(declared)
 		Some(variant):
-			match declared_variant_fields(scope, variant.declaration.fields):
+			match scope.declared_variant_fields(variant.declaration.fields):
 				Ok(fields):
 
-					declared_variants(
-						declaration,
+					declaration.declared_variants(
 						scope,
 						declared.append({
 							id = variant.id,
@@ -591,8 +577,8 @@ private pure func declared_variant_fields(scope: TypeScope, written: List[TypeSy
 	var fields: List[TypeUse] = []
 	var failure: Option[CheckError] = None
 	for annotation in written:
-		match resolve_type(scope, annotation):
-			Ok(value): fields = fields.append({ value_type = value, span = type_span(annotation) })
+		match scope.resolve_type(annotation):
+			Ok(value): fields = fields.append({ value_type = value, span = annotation.type_span() })
 			Err(error):
 				failure = Some(error)
 				break
@@ -612,7 +598,7 @@ private pure func declared_fields(
 		None:
 			Ok(declared)
 		Some(field):
-			match find_field(declared, field.name.id):
+			match declared.find_field(field.name.id):
 				Some(first):
 					Err(
 						type_declaration_error(
@@ -621,12 +607,11 @@ private pure func declared_fields(
 						),
 					)
 				None:
-					match resolve_type(scope, field.type_name):
+					match scope.resolve_type(field.type_name):
 						Ok(value_type):
-							span = type_span(field.type_name)
+							span = field.type_name.type_span()
 
-							declared_fields(
-								declaration,
+							declaration.declared_fields(
 								owner,
 								scope,
 								declared.append({
@@ -658,7 +643,7 @@ pure func occurrence_fields(fields: List[TypeUse], occurrence: UnionOccurrence) 
 	var resolved: List[TypeUse] = []
 	var failure: Option[CheckError] = None
 	for written in fields:
-		match substitute_type(written.value_type, substitution, written.span):
+		match written.value_type.substitute_type(substitution, written.span):
 			Ok(value): resolved = resolved.append({ written | value_type = value })
 			Err(error):
 				failure = Some(error)
@@ -684,23 +669,23 @@ pure func substitute_type(
 ) -> Result[TypeRef, CheckError]:
 	match value_type:
 		TupleType(elements):
-			substitute_types(elements, substitution, span, []).map(pure func(values): TupleType(values))
+			elements.substitute_types(substitution, span, []).map(pure func(values): TupleType(values))
 		CallableType(purity, parameters, result):
-			match substitute_types(parameters, substitution, span, []):
+			match parameters.substitute_types(substitution, span, []):
 				Err(error): Err(error)
 				Ok(values):
-					match substitute_type(result, substitution, span):
+					match result.substitute_type(substitution, span):
 						Ok(value): Ok(CallableType(purity, values, value))
 						Err(error): Err(error)
 		ListType(element):
-			substitute_type(element, substitution, span).map(pure func(value): ListType(value))
+			element.substitute_type(substitution, span).map(pure func(value): ListType(value))
 		NominalType(owner, values):
-			match substitute_types(values, substitution, span, []):
+			match values.substitute_types(substitution, span, []):
 				Ok(arguments): Ok(NominalType(owner, arguments))
 				Err(error): Err(error)
 		ParameterType(id):
-			replacement = if parameter_owner(id) == substitution.owner:
-				substitution.values.get(parameter_position(id))
+			replacement = if id.parameter_owner() == substitution.owner:
+				substitution.values.get(id.parameter_position())
 			else:
 				None
 
@@ -719,10 +704,9 @@ private pure func substitute_types(
 		None:
 			Ok(substituted)
 		Some(value):
-			match substitute_type(value, substitution, span):
+			match value.substitute_type(substitution, span):
 				Ok(replaced):
-					substitute_types(
-						values,
+					values.substitute_types(
 						substitution,
 						span,
 						substituted.append(replaced),
@@ -753,7 +737,7 @@ private pure func contains_instance_visit(visits: List[UnionInstanceVisit], visi
 private pure func completed_instance(completed: List[List[List[TypeRef]]], instance: UnionInstanceVisit) -> Bool:
 	var found: Bool = False
 
-	match completed.get(union_number(instance.declaration)):
+	match completed.get(instance.declaration.union_number()):
 		Some(instances):
 			for arguments in instances:
 				if arguments == instance.arguments:
@@ -801,7 +785,7 @@ private pure func root_fields(root: AggregateId, declarations: CheckedDeclaratio
 
 	match root:
 		UnionAggregate(id):
-			match declarations.unions.get(union_number(id)).or_checker_invariant(origin, InvalidUnionDeclaration(id)):
+			match declarations.unions.get(id.union_number()).or_checker_invariant(origin, InvalidUnionDeclaration(id)):
 				Ok(declaration):
 					var fields: List[TypeUse] = []
 
@@ -811,7 +795,7 @@ private pure func root_fields(root: AggregateId, declarations: CheckedDeclaratio
 					Ok(fields)
 				Err(error): Err(error)
 		RecordAggregate(id):
-			match declarations.records.get(record_number(id)).or_checker_invariant(origin, InvalidRecordDeclaration(id)):
+			match declarations.records.get(id.record_number()).or_checker_invariant(origin, InvalidRecordDeclaration(id)):
 				Ok(declaration):
 					var fields: List[TypeUse] = []
 
@@ -871,56 +855,56 @@ private pure func generic_reinstantiation_edge(
 	-- the span of the root's written type that reached it.
 	match root:
 		UnionAggregate(id):
-			union_expanded = union_expanded.set(union_number(id), True)
+			union_expanded = union_expanded.set(id.union_number(), True)
 		RecordAggregate(id):
-			record_expanded = record_expanded.set(record_number(id), True)
+			record_expanded = record_expanded.set(id.record_number(), True)
 
-	fields ?= root_fields(root, declarations)
+	fields ?= root.root_fields(declarations)
 	for field in fields:
-		pending = push_at(pending, pending_count, field)
+		pending = pending.push_at(pending_count, field)
 		pending_count = pending_count + 1
 
-	while and(and(pending_count > 0, failure.is_some().not()), closing.is_some().not()):
+	while (pending_count > 0).and(failure.is_some().not()).and(closing.is_some().not()):
 		pending_count = pending_count - 1
 
 		match pending.get(pending_count):
 			None:
 				failure = Some(checker_invariant(origin, InvalidDeclarationVisit))
 			Some(annotation):
-				if reinstantiates_root(annotation.value_type, root):
+				if annotation.value_type.reinstantiates_root(root):
 					closing = Some(annotation)
 				else:
-					for child in type_children(annotation.value_type):
-						pending = push_at(pending, pending_count, { annotation | value_type = child })
+					for child in annotation.value_type.type_children():
+						pending = pending.push_at(pending_count, { annotation | value_type = child })
 						pending_count = pending_count + 1
 
 					match annotation.value_type:
 						NominalType(AggregateNominal(RecordAggregate(id)), _):
-							match record_expanded.get(record_number(id)):
+							match record_expanded.get(id.record_number()):
 								Some(False):
-									record_expanded = record_expanded.set(record_number(id), True)
-									match declarations.records.get(record_number(id)):
+									record_expanded = record_expanded.set(id.record_number(), True)
+									match declarations.records.get(id.record_number()):
 										None:
 											failure = Some(checker_invariant(annotation.span, InvalidRecordDeclaration(id)))
 										Some(declaration):
 											for field in declaration.fields:
-												pending = push_at(pending, pending_count, { annotation | value_type = field.value_type.value_type })
+												pending = pending.push_at(pending_count, { annotation | value_type = field.value_type.value_type })
 												pending_count = pending_count + 1
 								Some(True):
 									void
 								None:
 									failure = Some(checker_invariant(annotation.span, InvalidRecordDeclaration(id)))
 						NominalType(AggregateNominal(UnionAggregate(id)), _):
-							match union_expanded.get(union_number(id)):
+							match union_expanded.get(id.union_number()):
 								Some(False):
-									union_expanded = union_expanded.set(union_number(id), True)
-									match declarations.unions.get(union_number(id)):
+									union_expanded = union_expanded.set(id.union_number(), True)
+									match declarations.unions.get(id.union_number()):
 										None:
 											failure = Some(checker_invariant(annotation.span, InvalidUnionDeclaration(id)))
 										Some(declaration):
 											for variant in declaration.variants:
 												for field in variant.fields:
-													pending = push_at(pending, pending_count, { annotation | value_type = field.value_type })
+													pending = pending.push_at(pending_count, { annotation | value_type = field.value_type })
 													pending_count = pending_count + 1
 								Some(True):
 									void
@@ -942,8 +926,8 @@ private pure func generic_reinstantiation_edge(
 private pure func validate_generic_cycles(declarations: CheckedDeclarations) -> Result[Void, CheckError]:
 	var failure: Option[CheckError] = None
 
-	for root in generic_roots(declarations):
-		match generic_reinstantiation_edge(root, declarations):
+	for root in declarations.generic_roots():
+		match root.generic_reinstantiation_edge(declarations):
 			Err(error):
 				failure = Some(error)
 			Ok(Some(closing)):
@@ -987,12 +971,12 @@ private pure func repeated_self_payload(owner: UnionId, fields: List[TypeUse]) -
 private pure func stored_type(value_type: TypeRef, span: Span, declarations: CheckedDeclarations) -> Result[TypeRef, CheckError]:
 	match value_type:
 		NominalType(OpaqueNominal(id), arguments):
-			match declarations.opaques.get(opaque_number(id)):
+			match declarations.opaques.get(id.opaque_number()):
 				None:
 					Err(checker_invariant(span, InvalidOpaqueDeclaration(id)))
 				Some(declaration):
-					match substitute_type(declaration.underlying_type.value_type, { owner = OpaqueDeclaration(id), values = arguments }, span):
-						Ok(underlying): stored_type(underlying, span, declarations)
+					match declaration.underlying_type.value_type.substitute_type({ owner = OpaqueDeclaration(id), values = arguments }, span):
+						Ok(underlying): underlying.stored_type(span, declarations)
 						Err(error): Err(error)
 		_:
 			Ok(value_type)
@@ -1007,11 +991,11 @@ private pure func fixed_storage(stored: TypeRef, span: Span, declarations: Check
 		IntType | FloatType:
 			Ok(True)
 		NominalType(AggregateNominal(UnionAggregate(id)), _):
-			declarations.unions.get(union_number(id))
+			declarations.unions.get(id.union_number())
 				.map(pure func(declaration: CheckedUnion) -> Bool: declaration.fixed)
 				.or_checker_invariant(span, InvalidUnionDeclaration(id))
 		NominalType(AggregateNominal(RecordAggregate(id)), _):
-			declarations.records.get(record_number(id))
+			declarations.records.get(id.record_number())
 				.map(pure func(declaration: CheckedRecord) -> Bool: declaration.fixed)
 				.or_checker_invariant(span, InvalidRecordDeclaration(id))
 		_:
@@ -1033,17 +1017,17 @@ private pure func fixed_roots(declarations: CheckedDeclarations) -> List[Aggrega
 -- The first field or payload of a fixed declaration that is not stored
 -- inline, as its error.
 private pure func unfixed_field(root: AggregateId, declarations: CheckedDeclarations) -> Result[Option[CheckError], CheckError]:
-	fields ?= root_fields(root, declarations)
+	fields ?= root.root_fields(declarations)
 	-- A union payload may also be Void, which stores nothing.
 	payloads: Bool = match root:
 		UnionAggregate(_): True
 		RecordAggregate(_): False
 	var found: Result[Option[CheckError], CheckError] = Ok(None)
 	for field in fields:
-		accepted: Result[Bool, CheckError] = match stored_type(field.value_type, field.span, declarations):
+		accepted: Result[Bool, CheckError] = match field.value_type.stored_type(field.span, declarations):
 			Err(error): Err(error)
 			Ok(VoidType): Ok(payloads)
-			Ok(stored): fixed_storage(stored, field.span, declarations)
+			Ok(stored): stored.fixed_storage(field.span, declarations)
 		found = match accepted:
 			Ok(True): Ok(None)
 			Ok(False):
@@ -1074,21 +1058,21 @@ private pure func walk_fixed_type(
 	finished: List[AggregateId],
 	declarations: CheckedDeclarations,
 ) -> Result[List[AggregateId], CheckError]:
-	fields ?= root_fields(owner, declarations)
+	fields ?= owner.root_fields(declarations)
 	var walked = finished
 	var failure: Option[CheckError] = None
 	for field in fields:
 		if failure.is_none():
 			-- The Err arm is an unreachable guard: every field was resolved
 			-- before this walk.
-			match stored_type(field.value_type, field.span, declarations):
+			match field.value_type.stored_type(field.span, declarations):
 				Err(error):
 					failure = Some(error)
 				Ok(NominalType(AggregateNominal(target), _)):
-					if contains_aggregate(path, target):
+					if path.contains_aggregate(target):
 						failure = Some(type_declaration_error(field.span, RecursiveFixedType(field.value_type)))
-					else if contains_aggregate(walked, target).not():
-						match walk_fixed_type(target, path.append(target), walked, declarations):
+					else if walked.contains_aggregate(target).not():
+						match target.walk_fixed_type(path.append(target), walked, declarations):
 							Ok(next): walked = next
 							Err(error): failure = Some(error)
 				Ok(_):
@@ -1107,17 +1091,17 @@ private pure func walk_fixed_type(
 -- containing itself stays wrong for a fixed type, so this check does not rely
 -- on that walk.
 private pure func validate_fixed_types(declarations: CheckedDeclarations) -> Result[Void, CheckError]:
-	roots = fixed_roots(declarations)
+	roots = declarations.fixed_roots()
 	var failure: Option[CheckError] = None
 	for root in roots:
 		if failure.is_none():
-			failure = match unfixed_field(root, declarations):
+			failure = match root.unfixed_field(declarations):
 				Ok(found): found
 				Err(error): Some(error)
 	var finished: List[AggregateId] = []
 	for root in roots:
-		if and(failure.is_none(), contains_aggregate(finished, root).not()):
-			match walk_fixed_type(root, [root], finished, declarations):
+		if failure.is_none().and(finished.contains_aggregate(root).not()):
+			match root.walk_fixed_type([root], finished, declarations):
 				Ok(walked): finished = walked
 				Err(error): failure = Some(error)
 	match failure:
@@ -1139,12 +1123,12 @@ private pure func validate_fixed_types(declarations: CheckedDeclarations) -> Res
 pure func validate_finite_declarations(
 	declarations: CheckedDeclarations,
 ) -> Result[Void, CheckError]:
-	generic ?= validate_generic_cycles(declarations)
+	generic ?= declarations.validate_generic_cycles()
 	-- Expanding opaque types below terminates only once no opaque is on a cycle.
-	_: Void ?= validate_opaque_representations(declarations)
+	_: Void ?= declarations.validate_opaque_representations()
 	-- validate_fixed_types expands opaque types, which terminates once no
 	-- opaque is on a cycle.
-	_: Void ?= validate_fixed_types(declarations)
+	_: Void ?= declarations.validate_fixed_types()
 	-- These vectors stay in one local builder. Passing them through a shared
 	-- record would retain their old roots and copy the entire vector on set.
 	var visiting: List[UnionInstanceVisit] = []
@@ -1173,18 +1157,18 @@ pure func validate_finite_declarations(
 
 	var next_root = 0
 
-	while and((or(next_root < roots.length(), pending_count > 0)), failure.is_some().not()):
+	while (next_root < roots.length()).or(pending_count > 0).and(failure.is_some().not()):
 		if pending_count == 0:
 			match roots.get(next_root):
 				None:
 					failure = Some(checker_invariant(origin, InvalidDeclarationVisit))
 				Some(root):
-					pending = push_at(pending, pending_count, root)
+					pending = pending.push_at(pending_count, root)
 					pending_count = pending_count + 1
 
 			next_root = next_root + 1
 
-		while and(pending_count > 0, failure.is_some().not()):
+		while (pending_count > 0).and(failure.is_some().not()):
 			pending_count = pending_count - 1
 
 			match pending.get(pending_count):
@@ -1196,7 +1180,7 @@ pure func validate_finite_declarations(
 							last = visiting.length() - 1
 							match visiting.get(last):
 								Some(instance):
-									number = union_number(instance.declaration)
+									number = instance.declaration.union_number()
 									match completed.get(number):
 										Some(instances):
 											completed = completed.set(number, instances.append(instance.arguments))
@@ -1212,12 +1196,12 @@ pure func validate_finite_declarations(
 						VisitUnionRoot(id):
 							-- The root starts an empty path, so its own annotation is never
 							-- reported; its payloads are reported at their written spans.
-							match declarations.unions.get(union_number(id)):
+							match declarations.unions.get(id.union_number()):
 								None:
 									failure = Some(checker_invariant(origin, InvalidUnionDeclaration(id)))
 								Some(declaration):
-									instance: UnionInstanceVisit = { declaration = id, arguments = rigid_arguments(declaration.type_parameters) }
-									match expand_union_instance(instance, { value_type = NominalType(AggregateNominal(UnionAggregate(id)), instance.arguments), span = origin }, WrittenSpan, declarations, visiting, completed, pending, pending_count):
+									instance: UnionInstanceVisit = { declaration = id, arguments = declaration.type_parameters.rigid_arguments() }
+									match instance.expand_union_instance({ value_type = NominalType(AggregateNominal(UnionAggregate(id)), instance.arguments), span = origin }, WrittenSpan, declarations, visiting, completed, pending, pending_count):
 										Err(error):
 											failure = Some(error)
 										Ok(expanded):
@@ -1234,7 +1218,7 @@ pure func validate_finite_declarations(
 								_: False
 
 							if admitted.not():
-								pending = push_at(pending, pending_count, VisitDeclaredType(annotation))
+								pending = pending.push_at(pending_count, VisitDeclaredType(annotation))
 								pending_count = pending_count + 1
 						VisitDeclaredType(annotation):
 							match annotation.value_type:
@@ -1252,20 +1236,20 @@ pure func validate_finite_declarations(
 											pending = expanded.pending
 											pending_count = expanded.pending_count
 								NominalType(OpaqueNominal(id), arguments):
-									match declarations.opaques.get(opaque_number(id)):
+									match declarations.opaques.get(id.opaque_number()):
 										None:
 											failure = Some(checker_invariant(annotation.span, InvalidOpaqueDeclaration(id)))
 										Some(declaration):
-											match substitute_type(declaration.underlying_type.value_type, { owner = OpaqueDeclaration(id), values = arguments }, annotation.span):
+											match declaration.underlying_type.value_type.substitute_type({ owner = OpaqueDeclaration(id), values = arguments }, annotation.span):
 												Err(error):
 													failure = Some(error)
 												Ok(underlying):
-													pending = push_at(pending, pending_count, VisitDeclaredType({ annotation | value_type = underlying }))
+													pending = pending.push_at(pending_count, VisitDeclaredType({ annotation | value_type = underlying }))
 													pending_count = pending_count + 1
 								-- Every other type visits its parts as roots: a record stores
 								-- its arguments, and a List its element, behind a pointer.
 								_:
-									for child in type_children(annotation.value_type):
+									for child in annotation.value_type.type_children():
 										roots = roots.append(VisitDeclaredType({ annotation | value_type = child }))
 
 	match failure:
@@ -1285,7 +1269,7 @@ private pure func validate_opaque_representation(
 	var depth = 1
 	var visited: List[TypeRef] = []
 	var failure: Option[CheckError] = None
-	while and(depth > 0, failure.is_none()):
+	while (depth > 0).and(failure.is_none()):
 		depth = depth - 1
 		match pending.get(depth):
 			None: failure = Some(checker_invariant(root.underlying_type.span, InvalidDeclarationVisit))
@@ -1304,8 +1288,8 @@ private pure func validate_opaque_representation(
 					if seen.not():
 						visited = visited.append(annotation.value_type)
 						children: Result[List[TypeUse], CheckError] = match annotation.value_type:
-							NominalType(owner, arguments): representation_children(owner, arguments, annotation.span, declarations)
-							_: Ok(type_children(annotation.value_type).map(pure func(child): { annotation | value_type = child }))
+							NominalType(owner, arguments): owner.representation_children(arguments, annotation.span, declarations)
+							_: Ok(annotation.value_type.type_children().map(pure func(child): { annotation | value_type = child }))
 						match children:
 							Err(error): failure = Some(error)
 							Ok(ordered):
@@ -1314,7 +1298,7 @@ private pure func validate_opaque_representation(
 									position = position - 1
 									match ordered.get(position):
 										Some(child):
-											pending = push_at(pending, depth, child)
+											pending = pending.push_at(depth, child)
 											depth = depth + 1
 										None: failure = Some(checker_invariant(annotation.span, InvalidDeclarationVisit))
 	match failure:
@@ -1323,8 +1307,8 @@ private pure func validate_opaque_representation(
 
 
 private pure func validate_opaque_representations(declarations: CheckedDeclarations) -> Result[Void, CheckError]:
-	first_error(declarations.opaques, pure func(declaration: CheckedOpaque) -> Result[Void, CheckError]:
-		validate_opaque_representation(declaration, declarations)
+	declarations.opaques.first_error(pure func(declaration: CheckedOpaque) -> Result[Void, CheckError]:
+		declaration.validate_opaque_representation(declarations)
 	)
 
 
@@ -1338,9 +1322,9 @@ private pure func representation_children(
 	declarations: CheckedDeclarations,
 ) -> Result[List[TypeUse], CheckError]:
 	body: List[TypeUse] ?= match owner:
-		AggregateNominal(aggregate): root_fields(aggregate, declarations)
+		AggregateNominal(aggregate): aggregate.root_fields(declarations)
 		OpaqueNominal(id):
-			declarations.opaques.get(opaque_number(id)).map(pure func(declaration): [declaration.underlying_type])
+			declarations.opaques.get(id.opaque_number()).map(pure func(declaration): [declaration.underlying_type])
 				.or_checker_invariant(span, InvalidOpaqueDeclaration(id))
 	Ok(arguments.map(pure func(argument): { value_type = argument, span = span }).concat(body))
 
@@ -1364,15 +1348,15 @@ private pure func expand_union_instance(
 	pending: List[DeclarationVisitStep],
 	pending_count: Int,
 ) -> Result[ExpandedInstance, CheckError]:
-	if contains_instance_visit(visiting, instance):
+	if visiting.contains_instance_visit(instance):
 		Err(type_declaration_error(annotation.span, RecursiveAggregateType(annotation.value_type)))
-	else if completed_instance(completed, instance):
+	else if completed.completed_instance(instance):
 		Ok({ visiting = visiting, pending = pending, pending_count = pending_count })
 	else:
-		match declarations.unions.get(union_number(instance.declaration)):
+		match declarations.unions.get(instance.declaration.union_number()):
 			Some(declaration):
 				substitution: Substitution = { owner = UnionDeclaration(instance.declaration), values = instance.arguments }
-				var steps = push_at(pending, pending_count, FinishUnionInstance)
+				var steps = pending.push_at(pending_count, FinishUnionInstance)
 				var count = pending_count + 1
 				var failure: Option[CheckError] = None
 				var index = declaration.variants.length()
@@ -1382,7 +1366,7 @@ private pure func expand_union_instance(
 
 					match declaration.variants.get(index):
 						Some(variant):
-							match repeated_self_payload(instance.declaration, variant.fields):
+							match instance.declaration.repeated_self_payload(variant.fields):
 								Some(repeated):
 									failure = Some(type_declaration_error(repeated.span, RecursiveAggregateType(repeated.value_type)))
 									break
@@ -1396,7 +1380,7 @@ private pure func expand_union_instance(
 
 								match variant.fields.get(field_position):
 									Some(field):
-										match substitute_type(field.value_type, substitution, field.span):
+										match field.value_type.substitute_type(substitution, field.span):
 											Err(error):
 												failure = Some(error)
 												break
@@ -1404,7 +1388,7 @@ private pure func expand_union_instance(
 												payload: TypeUse = match reported:
 													WrittenSpan: { field | value_type = substituted }
 													ApplicationSpan(span): { value_type = substituted, span = span }
-												steps = push_at(steps, count, VisitVariantPayload(instance.declaration, payload))
+												steps = steps.push_at(count, VisitVariantPayload(instance.declaration, payload))
 												count = count + 1
 									None:
 										failure = Some(checker_invariant(annotation.span, InvalidDeclarationVisit))

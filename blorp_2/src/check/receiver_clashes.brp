@@ -5,19 +5,19 @@ unordered pair is checked once; only the exact inherited prelude subset reuses a
 ---
 import:
 	option: Option methods
-	bool: not, and
-	./callables: accepted_function, candidate_span, method_site, receiver_functions, admit_method_family
+	bool: Bool methods
+	./callables: accepted_function, Namespace methods, ReceiverFunction methods
 	./errors: CheckError, CheckerInvariant(InvalidResolvedFunction, InvalidReceiverScope), MethodError(OverlappingReceivers), checker_invariant, method_error
-	./inference: types_overlap
-	./model: AcceptedTraits, ReceiverFunction, ReceiverLookup(VisibleMethod, VisibleFunctions), AdmittedReceiverScope, type_head
+	./inference: TypeRef methods
+	./model: AcceptedTraits, ReceiverFunction, ReceiverLookup(VisibleMethod, VisibleFunctions), AdmittedReceiverScope, TypeRef
 	./signatures: AcceptedFunction
-	../namespace/namespace: Namespace, MethodImport, declared_function, method_imports, module_entries, offered_function, Entity(Method)
+	../namespace/namespace: Namespace, MethodImport, Entry, Entity(Method)
 	../parse/assemble: ModuleImport, ParsedModuleRow
 	../parse/parse: ImportSelection(NamedSelection)
-	../utils/ids: FunctionId, function_number
+	../utils/ids: FunctionId
 	dict as D
 	../utils/names: NameId
-	../utils/source: module_number, ModuleKind(UserModule, FoundationPreludeModule)
+	../utils/source: ModuleId, ModuleKind(UserModule, FoundationPreludeModule)
 	../utils/syntax: Span, WrittenName, compiler_span
 	list: repeat, List methods
 	int: Int methods
@@ -58,13 +58,13 @@ private pure func selected_receiver(request: ModuleImport, accepted: AcceptedFun
 	match accepted.signature.parameters.get(0):
 		None: void
 		Some(parameter):
-			match type_head(parameter.value_type):
+			match parameter.value_type.type_head():
 				None: void
 				Some(head):
 					for position in first_method..methods.length():
 						match methods.get(position):
 							Some(edge):
-								if and(edge.target == request.target, edge.receiver == head):
+								if (edge.target == request.target).and(edge.receiver == head):
 									selected = True
 							None: void
 	selected
@@ -74,34 +74,34 @@ private pure func introduced_names(namespace: Namespace, signatures: List[Accept
 	var names: Dict[NameId, IntroducedName] = {}
 	none: List[FunctionId] = []
 	var failure: Option[CheckError] = None
-	for own_entry in module_entries(namespace, row.module):
-		match declared_function(own_entry):
+	for own_entry in namespace.module_entries(row.module):
+		match own_entry.declared_function():
 			None: void
 			Some(own_id):
-				match signatures.get(function_number(own_id)):
+				match signatures.get(own_id.function_number()):
 					None: failure = Some(checker_invariant(row.end, InvalidResolvedFunction(own_id)))
 					Some(accepted):
 						key = accepted.declaration.function_name.id
-						if and(accepted.signature.parameters.is_empty().not(), counts.get(key).get_or(0) > 1):
-							names = count_introduction(names, accepted.declaration.function_name, inherited.get(key).get_or(none).length())
-	methods = method_imports(namespace, row.module)
+						if accepted.signature.parameters.is_empty().not().and(counts.get(key).get_or(0) > 1):
+							names = names.count_introduction(accepted.declaration.function_name, inherited.get(key).get_or(none).length())
+	methods = namespace.method_imports(row.module)
 	for request in row.imports:
-		for provider_entry in module_entries(namespace, request.target):
-			match offered_function(provider_entry):
+		for provider_entry in namespace.module_entries(request.target):
+			match provider_entry.offered_function():
 				None: void
 				Some(offered_id):
-					match signatures.get(function_number(offered_id)):
+					match signatures.get(offered_id.function_number()):
 						None: failure = Some(checker_invariant(request.span, InvalidResolvedFunction(offered_id)))
 						Some(accepted):
 							key = accepted.declaration.function_name.id
-							if and(accepted.signature.parameters.is_empty().not(), counts.get(key).get_or(0) > 1):
+							if accepted.signature.parameters.is_empty().not().and(counts.get(key).get_or(0) > 1):
 								provided_ids = inherited.get(key).get_or(none)
-								receiver_selected = match is_inherited(accepted.id, provided_ids).not():
-									True: selected_receiver(request, accepted, methods, first_method)
+								receiver_selected = match accepted.id.is_inherited(provided_ids).not():
+									True: request.selected_receiver(accepted, methods, first_method)
 									False: False
 
 								if receiver_selected:
-									names = count_introduction(names, accepted.declaration.function_name, provided_ids.length())
+									names = names.count_introduction(accepted.declaration.function_name, provided_ids.length())
 	match failure:
 		Some(invariant): Err(invariant)
 		None: Ok(names)
@@ -119,9 +119,9 @@ private pure func is_inherited(id: FunctionId, inherited: List[FunctionId]) -> B
 private pure func reject_pair(name: WrittenName, left: ReceiverFunction, right: ReceiverFunction, inherited: List[FunctionId], signatures: List[AcceptedFunction]) -> Result[Void, CheckError]:
 	left_function ?= accepted_function(name.span, left.id, signatures)
 	right_function ?= accepted_function(name.span, right.id, signatures)
-	left_inherited = and(inherited.is_empty().not(), is_inherited(left.id, inherited))
-	right_inherited = and(inherited.is_empty().not(), is_inherited(right.id, inherited))
-	if and(left_inherited, right_inherited):
+	left_inherited = inherited.is_empty().not().and(left.id.is_inherited(inherited))
+	right_inherited = inherited.is_empty().not().and(right.id.is_inherited(inherited))
+	if left_inherited.and(right_inherited):
 		Ok(void)
 	else:
 		introduced = if right_inherited:
@@ -140,19 +140,19 @@ private pure func reject_pair(name: WrittenName, left: ReceiverFunction, right: 
 			right_function
 		else:
 			left_function
-		span = candidate_span(introduced, introduced_function.declaration.function_name.span)
+		span = introduced.candidate_span(introduced_function.declaration.function_name.span)
 		match introduced_function.signature.parameters.get(0):
 			None: Ok(void)
 			Some(introduced_parameter):
 				match other_function.signature.parameters.get(0):
 					None: Ok(void)
 					Some(other_parameter):
-						match types_overlap(other_parameter.value_type, other_function.signature.type_parameters, introduced_parameter.value_type, introduced_function.signature.type_parameters, span):
+						match other_parameter.value_type.types_overlap(other_function.signature.type_parameters, introduced_parameter.value_type, introduced_function.signature.type_parameters, span):
 							Err(invariant): Err(invariant)
 							Ok(False): Ok(void)
 							Ok(True): Err(method_error(span, OverlappingReceivers(name.id, {
-								introduced = method_site(introduced, introduced_function.declaration.function_name.span), introduced_receiver = introduced_parameter.value_type,
-								other = method_site(other, other_function.declaration.function_name.span), other_receiver = other_parameter.value_type
+								introduced = introduced.method_site(introduced_function.declaration.function_name.span), introduced_receiver = introduced_parameter.value_type,
+								other = other.method_site(other_function.declaration.function_name.span), other_receiver = other_parameter.value_type
 							})))
 
 
@@ -181,28 +181,28 @@ private pure func reject_group(name: WrittenName, candidates: List[ReceiverFunct
 -- Dependency order proves inherited overlap pairs first; the published table
 -- uses module ordinals, which need not follow that order.
 pure func admit_receivers(namespace: Namespace, signatures: List[AcceptedFunction], module_count: Int, modules: List[ParsedModuleRow], traits: AcceptedTraits) -> Result[List[AdmittedReceiverScope], CheckError]:
-	counts = name_counts(signatures)
+	counts = signatures.name_counts()
 	unprovided: Dict[NameId, List[FunctionId]] = {}
 	var supplied = unprovided
 	var supplied_methods = 0
 	var pending: List[Option[AdmittedReceiverScope]] = repeat(None, module_count)
 	var failure: Option[CheckError] = None
 	for row in modules:
-		position = module_number(row.module)
+		position = row.module.module_number()
 		match pending.get(position):
 			Some(None): void
 			_:
 				failure = Some(checker_invariant(row.end, InvalidReceiverScope))
 				break
 		var admitted: Dict[NameId, ReceiverLookup] = {}
-		match receiver_functions(namespace, signatures, row.module):
+		match namespace.receiver_functions(signatures, row.module):
 			Err(error): failure = Some(error)
 			Ok(names): admitted = names
 		if failure.is_some():
 			break
 		-- Preserve the existing family-before-overlap order and both name orders.
 		if traits.declarations.is_empty().not():
-			match admit_module_families(namespace, traits, signatures, row, admitted):
+			match namespace.admit_module_families(traits, signatures, row, admitted):
 				Err(error): failure = Some(error)
 				Ok(names): admitted = names
 			if failure.is_some():
@@ -213,14 +213,14 @@ pure func admit_receivers(namespace: Namespace, signatures: List[AcceptedFunctio
 		inherited_names = match row.role:
 			UserModule: supplied
 			_: unprovided
-		match introduced_names(namespace, signatures, counts, row, first_method, inherited_names):
+		match namespace.introduced_names(signatures, counts, row, first_method, inherited_names):
 			Err(invariant): failure = Some(invariant)
 			Ok(names):
 				for introduction in names.values():
 					publishes_prelude: Bool = match row.role:
 						FoundationPreludeModule: True
 						_: False
-					if and(publishes_prelude.not(), introduction.candidate_bound == 1):
+					if publishes_prelude.not().and(introduction.candidate_bound == 1):
 						continue
 					written = introduction.written
 					key = written.id
@@ -246,7 +246,7 @@ pure func admit_receivers(namespace: Namespace, signatures: List[AcceptedFunctio
 			break
 		pending = pending.set(position, Some({ names = admitted }))
 		match row.role:
-			FoundationPreludeModule: supplied_methods = method_imports(namespace, row.module).length()
+			FoundationPreludeModule: supplied_methods = namespace.method_imports(row.module).length()
 			_: void
 		if failure.is_some():
 			break
@@ -276,14 +276,14 @@ private pure func with_receiver_name(names: Dict[NameId, WrittenName], name: Wri
 -- method edge to one target lists that target's names again.
 private pure func admit_module_families(namespace: Namespace, traits: AcceptedTraits, signatures: List[AcceptedFunction], row: ParsedModuleRow, functions: Dict[NameId, ReceiverLookup]) -> Result[Dict[NameId, ReceiverLookup], CheckError]:
 	var names: Dict[NameId, WrittenName] = {}
-	for entry in module_entries(namespace, row.module):
+	for entry in namespace.module_entries(row.module):
 		match entry.entity:
-			Method(_): names = with_receiver_name(names, entry.name)
+			Method(_): names = names.with_receiver_name(entry.name)
 			_: void
-	for imported in method_imports(namespace, row.module):
-		for entry in module_entries(namespace, imported.target):
+	for imported in namespace.method_imports(row.module):
+		for entry in namespace.module_entries(imported.target):
 			match entry.entity:
-				Method(_): names = with_receiver_name(names, entry.name)
+				Method(_): names = names.with_receiver_name(entry.name)
 				_: void
 	var admitted = functions
 	var failure: Option[CheckError] = None
@@ -295,7 +295,7 @@ private pure func admit_module_families(namespace: Namespace, traits: AcceptedTr
 		match ordinary:
 			Err(error): failure = Some(error)
 			Ok(candidates):
-				match admit_method_family(namespace, traits, signatures, row.module, name, candidates):
+				match namespace.admit_method_family(traits, signatures, row.module, name, candidates):
 					Err(error): failure = Some(error)
 					Ok(VisibleFunctions(_)): void
 					Ok(lookup): admitted = admitted.set(name.id, lookup)

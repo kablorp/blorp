@@ -7,9 +7,9 @@
 -- place when unique, copied on write when shared.
 import:
     _base: Int, String, List, Bool(True, False), Option(Some, None), Hashable
-    bool: and
+    bool: Bool methods
     traits: Equatable
-    int: max, min, Int methods
+    int: Int methods
     list: repeat, List methods
 
 
@@ -115,7 +115,7 @@ pure func dict[K: DictKey, V](initial_capacity: Int) -> Dict[K, V]:
     no_keys: List[K] = []
     no_values: List[V] = []
     no_live: List[Bool] = []
-    size = slot_count(max(0, min(initial_capacity, MAXIMUM_RESERVED_ENTRIES)), GROWTH_LOAD_NUMERATOR, GROWTH_LOAD_DENOMINATOR)
+    size = slot_count(initial_capacity.min(MAXIMUM_RESERVED_ENTRIES).max(0), GROWTH_LOAD_NUMERATOR, GROWTH_LOAD_DENOMINATOR)
     into_opaque Dict({ keys = no_keys, values = no_values, live = no_live, slots = repeat(EMPTY_SLOT, size), dead_count = 0 })
 
 
@@ -140,9 +140,9 @@ private pure func next_slot(slot: Int, size: Int) -> Int:
 -- An EMPTY slot always exists: at most 2/3 of the slots are occupied.
 private pure func free_slot[K: DictKey](slots: List[Int], key: K) -> Int:
     size = slots.length()
-    var slot = home_slot(key, size)
+    var slot = key.home_slot(size)
     while slots.get_or(slot, EMPTY_SLOT) != EMPTY_SLOT:
-        slot = next_slot(slot, size)
+        slot = slot.next_slot(size)
     slot
 
 
@@ -154,7 +154,7 @@ private pure func free_slot[K: DictKey](slots: List[Int], key: K) -> Int:
 -- so the defaults are never read.
 private pure func probe[K: DictKey, V](contents: DictContents[K, V], key: K) -> Int:
     size = contents.slots.length()
-    var slot = home_slot(key, size)
+    var slot = key.home_slot(size)
     var searching: Bool = True
     while searching:
         position = contents.slots.get_or(slot, EMPTY_SLOT)
@@ -167,7 +167,7 @@ private pure func probe[K: DictKey, V](contents: DictContents[K, V], key: K) -> 
                 Some(candidate): candidate != key
                 None: False
         if searching:
-            slot = next_slot(slot, size)
+            slot = slot.next_slot(size)
     slot
 
 
@@ -179,13 +179,13 @@ private pure func rebuilt[K: DictKey, V](old: DictContents[K, V]) -> DictContent
     live_count = old.keys.length() - old.dead_count
     var kept_keys: List[K] = []
     var kept_values: List[V] = []
-    var slots = repeat(EMPTY_SLOT, slot_count(live_count + 1, REBUILT_LOAD_NUMERATOR, REBUILT_LOAD_DENOMINATOR))
+    var slots = repeat(EMPTY_SLOT, (live_count + 1).slot_count(REBUILT_LOAD_NUMERATOR, REBUILT_LOAD_DENOMINATOR))
     var index = 0
     for key in old.keys:
         if old.live.get_or(index, False):
             match old.values.get(index):
                 Some(value):
-                    slots = slots.set(free_slot(slots, key), kept_keys.length())
+                    slots = slots.set(slots.free_slot(key), kept_keys.length())
                     kept_keys = kept_keys.append(key)
                     kept_values = kept_values.append(value)
                 None: void
@@ -201,7 +201,7 @@ private pure func appended[K: DictKey, V](contents: DictContents[K, V], slot: In
 
 pure func get[K: DictKey, V](self: Dict[K, V], key: K) -> Option[V]:
     contents: DictContents[K, V] = from_opaque Dict(self)
-    position = contents.slots.get_or(probe(contents, key), EMPTY_SLOT)
+    position = contents.slots.get_or(contents.probe(key), EMPTY_SLOT)
     -- A negative position is EMPTY_SLOT: the probe ended without the key.
     if position < 0:
         None
@@ -210,41 +210,41 @@ pure func get[K: DictKey, V](self: Dict[K, V], key: K) -> Option[V]:
 
 
 pure func get_or[K: DictKey, V](self: Dict[K, V], key: K, default: V) -> V:
-    match get(self, key):
+    match self.get(key):
         Some(value): value
         None: default
 
 
 pure func contains[K: DictKey, V](self: Dict[K, V], key: K) -> Bool:
     contents: DictContents[K, V] = from_opaque Dict(self)
-    contents.slots.get_or(probe(contents, key), EMPTY_SLOT) >= 0
+    contents.slots.get_or(contents.probe(key), EMPTY_SLOT) >= 0
 
 
 -- Inserts `key` at the end of the order, or replaces its value in place.
 pure func set[K: DictKey, V](self: Dict[K, V], key: K, value: V) -> Dict[K, V]:
     contents: DictContents[K, V] = from_opaque Dict(self)
-    slot = probe(contents, key)
+    slot = contents.probe(key)
     position = contents.slots.get_or(slot, EMPTY_SLOT)
     count = contents.keys.length() + 1
     updated: DictContents[K, V] = if position >= 0:
         { contents | values = contents.values.set(position, value) }
     else if count * GROWTH_LOAD_DENOMINATOR > contents.slots.length() * GROWTH_LOAD_NUMERATOR:
-        compact = rebuilt(contents)
-        appended(compact, free_slot(compact.slots, key), key, value)
+        compact = contents.rebuilt()
+        compact.appended(compact.slots.free_slot(key), key, value)
     else:
-        appended(contents, slot, key, value)
+        contents.appended(slot, key, value)
     into_opaque Dict(updated)
 
 
 pure func remove[K: DictKey, V](self: Dict[K, V], key: K) -> Dict[K, V]:
     contents: DictContents[K, V] = from_opaque Dict(self)
-    slot = probe(contents, key)
+    slot = contents.probe(key)
     position = contents.slots.get_or(slot, EMPTY_SLOT)
     dead_count = contents.dead_count + 1
     live_count = contents.keys.length() - dead_count
     updated: DictContents[K, V] = if position < 0:
         contents
-    else if and(dead_count >= MINIMUM_COMPACTION, dead_count > live_count):
+    else if (dead_count >= MINIMUM_COMPACTION).and(dead_count > live_count):
         rebuilt({ contents | live = contents.live.set(position, False), slots = contents.slots.set(slot, DELETED_SLOT), dead_count = dead_count })
     else:
         { contents | live = contents.live.set(position, False), slots = contents.slots.set(slot, DELETED_SLOT), dead_count = dead_count }
@@ -286,15 +286,15 @@ pure func values[K: DictKey, V](self: Dict[K, V]) -> List[V]:
 
 
 pure func is_empty[K: DictKey, V](self: Dict[K, V]) -> Bool:
-    length(self) == 0
+    self.length() == 0
 
 
 -- The (key, value) pairs in insertion order.
 pure func entries[K: DictKey, V](self: Dict[K, V]) -> List[(K, V)]:
-    listed = values(self)
+    listed = self.values()
     var pairs: List[(K, V)] = []
     var index = 0
-    for key in keys(self):
+    for key in self.keys():
         match listed.get(index):
             Some(value): pairs = pairs.append((key, value))
             None: void
@@ -306,15 +306,15 @@ pure func entries[K: DictKey, V](self: Dict[K, V]) -> List[(K, V)]:
 -- of one is looked up in the other, stopping at a difference: O(n) on average.
 implements Equatable for Dict[K: DictKey, V: Equatable]:
     pure func equals(left: Self, right: Self) -> Bool:
-        left_values = values(left)
-        var same: Bool = length(left) == length(right)
+        left_values = left.values()
+        var same: Bool = left.length() == right.length()
         var index = 0
-        for key in keys(left):
+        for key in left.keys():
             if same:
                 same = match left_values.get(index):
                     None: False
                     Some(value):
-                        match get(right, key):
+                        match right.get(key):
                             None: False
                             Some(found): found == value
                 index = index + 1

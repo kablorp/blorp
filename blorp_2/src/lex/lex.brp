@@ -1,8 +1,8 @@
 import:
 	option: Option methods
-	bool: not, and, or
+	bool: Bool methods
 	int: Int methods
-	../utils/names: NameTable, intern_names
+	../utils/names: NameTable
 	../utils/source: SourceId
 	string: String methods
 	../utils/text as Text
@@ -333,7 +333,7 @@ private fixed record CodeLine {
 
 
 private pure func within(value: Int, first: Int, last: Int) -> Bool:
-	and(value >= first, value <= last)
+	(value >= first).and(value <= last)
 
 
 private pure func in_class(code: Int, class: ByteClass) -> Bool:
@@ -343,19 +343,13 @@ private pure func in_class(code: Int, class: ByteClass) -> Bool:
 		TabByte:
 			code == ASCII_TAB
 		IndentationByte:
-			or(code == ASCII_SPACE, code == ASCII_TAB)
+			(code == ASCII_SPACE).or(code == ASCII_TAB)
 		DecimalDigit:
-			within(code, ASCII_ZERO, ASCII_NINE)
+			code.within(ASCII_ZERO, ASCII_NINE)
 		IdentifierStart:
-			or(
-				or(
-					within(code, ASCII_LOWER_A, ASCII_LOWER_Z),
-					within(code, ASCII_UPPER_A, ASCII_UPPER_Z),
-				),
-				code == ASCII_UNDERSCORE,
-			)
+			code.within(ASCII_LOWER_A, ASCII_LOWER_Z).or(code.within(ASCII_UPPER_A, ASCII_UPPER_Z)).or(code == ASCII_UNDERSCORE)
 		IdentifierByte:
-			or(in_class(code, IdentifierStart), in_class(code, DecimalDigit))
+			code.in_class(IdentifierStart).or(code.in_class(DecimalDigit))
 
 
 -- Byte reads compare codes: a one-byte substring would allocate a String.
@@ -371,7 +365,7 @@ private pure func byte_is(text: SourceText, position: Int, expected: Int) -> Boo
 private pure func byte_in(text: SourceText, position: Int, class: ByteClass) -> Bool:
 	match text.bytes.byte_at(position):
 		Some(byte):
-			in_class(byte, class)
+			byte.in_class(class)
 		None:
 			False
 
@@ -380,7 +374,7 @@ private pure func byte_in(text: SourceText, position: Int, class: ByteClass) -> 
 private pure func run_end(text: SourceText, start: Int, class: ByteClass) -> Int:
 	var end: Int = start
 
-	while byte_in(text, end, class):
+	while text.byte_in(end, class):
 		end = end + 1
 
 	end
@@ -397,7 +391,7 @@ private pure func byte_error(text: SourceText, position: Int, error: ErrorText) 
 -- Layout tokens get spacing too; no syntax reads it there.
 private pure func token(text: SourceText, kind: TokenKind, start: Int, end: Int) -> Token:
 	previous = start - 1
-	spacing: Spacing = if byte_in(text, previous, IndentationByte):
+	spacing: Spacing = if text.byte_in(previous, IndentationByte):
 		Spaced
 	else:
 		Adjacent
@@ -415,15 +409,15 @@ private pure func symbol(text: SourceText, value: Symbol, start: Int, end: Int) 
 
 private pure func utf8_form(lead: Int) -> Option[Utf8Form]:
 	two_bytes = utf8_two_bytes()
-	if within(lead, two_bytes.first_lead, two_bytes.last_lead):
+	if lead.within(two_bytes.first_lead, two_bytes.last_lead):
 		Some(two_bytes)
 	else:
 		three_bytes = utf8_three_bytes()
-		if within(lead, three_bytes.first_lead, three_bytes.last_lead):
+		if lead.within(three_bytes.first_lead, three_bytes.last_lead):
 			Some(three_bytes)
 		else:
 			four_bytes = utf8_four_bytes()
-			if within(lead, four_bytes.first_lead, four_bytes.last_lead):
+			if lead.within(four_bytes.first_lead, four_bytes.last_lead):
 				Some(four_bytes)
 			else:
 				None
@@ -447,11 +441,11 @@ private pure func utf8_scalar(text: SourceText, partial: Utf8Scalar) -> Result[I
 			None:
 				Err(error_at(text, partial.start, text.bytes.length(), invalid_utf8()))
 			Some(byte):
-				if within(byte, UTF8_CONTINUATION_START, UTF8_CONTINUATION_END):
+				if byte.within(UTF8_CONTINUATION_START, UTF8_CONTINUATION_END):
 					payload = byte - UTF8_CONTINUATION_START
 					shifted = partial.scalar * UTF8_CONTINUATION_RADIX
 					next = partial.cursor + 1
-					utf8_scalar(text, { partial | cursor = next, scalar = shifted + payload })
+					text.utf8_scalar({ partial | cursor = next, scalar = shifted + payload })
 				else:
 					Err(byte_error(text, partial.cursor, invalid_utf8()))
 
@@ -459,22 +453,16 @@ private pure func utf8_scalar(text: SourceText, partial: Utf8Scalar) -> Result[I
 -- Validates the scalar whose lead byte is at `start` and returns its end.
 -- Byte access does not decode or re-encode the source; the token retains it.
 private pure func utf8_end(text: SourceText, start: Int, lead: Int) -> Result[Int, Diagnostic]:
-	match utf8_form(lead):
+	match lead.utf8_form():
 		None:
 			Err(byte_error(text, start, invalid_utf8()))
 		Some(form):
 			end = start + form.width
 			payload = lead - form.lead_marker
-			match utf8_scalar(text, { start = start, cursor = start + 1, end = end, scalar = payload }):
+			match text.utf8_scalar({ start = start, cursor = start + 1, end = end, scalar = payload }):
 				Ok(scalar):
 					if (
-						or(
-							or(
-								scalar < form.minimum,
-								scalar > UNICODE_MAX,
-							),
-							within(scalar, UNICODE_SURROGATE_START, UNICODE_SURROGATE_END),
-						)
+						(scalar < form.minimum).or(scalar > UNICODE_MAX).or(scalar.within(UNICODE_SURROGATE_START, UNICODE_SURROGATE_END))
 					):
 						Err(error_at(text, start, end, invalid_utf8()))
 					else:
@@ -486,10 +474,10 @@ private pure func utf8_end(text: SourceText, start: Int, lead: Int) -> Result[In
 private pure func raw_character_end(text: SourceText, position: Int, byte: Int) -> Result[Int, Diagnostic]:
 	if byte == ASCII_LF:
 		Err(byte_error(text, position, string_line_break()))
-	else if or(byte < ASCII_SPACE, byte == ASCII_DEL):
+	else if (byte < ASCII_SPACE).or(byte == ASCII_DEL):
 		Err(byte_error(text, position, raw_control_byte()))
 	else if byte > ASCII_DEL:
-		utf8_end(text, position, byte)
+		text.utf8_end(position, byte)
 	else:
 		Ok(position + 1)
 
@@ -505,13 +493,13 @@ private pure func quoted_character_end(text: SourceText, start: Int, cursor: Int
 			Err(error_at(text, start, cursor, unterminated_string()))
 		Some(byte):
 			if byte != ASCII_BACKSLASH:
-				raw_character_end(text, cursor, byte)
+				text.raw_character_end(cursor, byte)
 			else:
 				match text.bytes.byte_at(escaped):
 					None:
 						Err(byte_error(text, cursor, unterminated_escape()))
 					Some(escaped_byte):
-						raw_character_end(text, escaped, escaped_byte)
+						text.raw_character_end(escaped, escaped_byte)
 
 
 -- A String literal inside an interpolation hole: a single line without nested
@@ -524,16 +512,16 @@ private pure func hole_quoted_token(text: SourceText, start: Int) -> Result[Toke
 	while True:
 		match scan:
 			Ok(cursor):
-				if byte_is(text, cursor, ASCII_DOUBLE_QUOTE):
+				if text.byte_is(cursor, ASCII_DOUBLE_QUOTE):
 					break
-				if or(cursor == text.bytes.length(), byte_is(text, cursor, ASCII_LF)):
+				if (cursor == text.bytes.length()).or(text.byte_is(cursor, ASCII_LF)):
 					scan = Err(error_at(text, start, cursor, unclosed_hole_string()))
 					break
-				if and(byte_is(text, cursor, ASCII_DOLLAR), byte_is(text, cursor + 1, ASCII_LEFT_BRACE)):
+				if text.byte_is(cursor, ASCII_DOLLAR).and(text.byte_is(cursor + 1, ASCII_LEFT_BRACE)):
 					scan = Err(error_at(text, cursor, cursor + 2, nested_interpolation()))
 					break
 
-				scan = quoted_character_end(text, start, cursor)
+				scan = text.quoted_character_end(start, cursor)
 			Err(_):
 				break
 
@@ -559,14 +547,14 @@ private pure func char_content_end(text: SourceText, start: Int, cursor: Int) ->
 			else if byte == ASCII_SINGLE_QUOTE:
 				Err(error_at(text, start, escaped, char_width()))
 			else if byte == ASCII_BACKSLASH:
-				if or(escaped == text.bytes.length(), byte_is(text, escaped, ASCII_LF)):
+				if (escaped == text.bytes.length()).or(text.byte_is(escaped, ASCII_LF)):
 					Err(error_at(text, start, escaped, unterminated_char()))
 				else:
 					Ok(escaped + 1)
-			else if or(byte < ASCII_SPACE, byte == ASCII_DEL):
+			else if (byte < ASCII_SPACE).or(byte == ASCII_DEL):
 				Err(byte_error(text, cursor, char_control_byte()))
 			else if byte > ASCII_DEL:
-				utf8_end(text, cursor, byte)
+				text.utf8_end(cursor, byte)
 			else:
 				Ok(escaped)
 
@@ -574,20 +562,20 @@ private pure func char_content_end(text: SourceText, start: Int, cursor: Int) ->
 -- A Char literal: a quote, one character or escape pair, and the closing quote.
 private pure func char_token(text: SourceText, start: Int) -> Result[Token, Diagnostic]:
 	contents_start = start + 1
-	contents_end ?= char_content_end(text, start, contents_start)
+	contents_end ?= text.char_content_end(start, contents_start)
 	after = contents_end + 1
 
-	if byte_is(text, contents_end, ASCII_SINGLE_QUOTE):
+	if text.byte_is(contents_end, ASCII_SINGLE_QUOTE):
 		Ok(token(text, CharLiteral, start, after))
-	else if or(contents_end == text.bytes.length(), byte_is(text, contents_end, ASCII_LF)):
+	else if (contents_end == text.bytes.length()).or(text.byte_is(contents_end, ASCII_LF)):
 		Err(error_at(text, start, contents_end, unterminated_char()))
 	else:
 		Err(error_at(text, start, after, char_width()))
 
 
 private pure func numeric_token_end(text: SourceText, start: Int, end: Int, is_float: Bool) -> Result[Token, Diagnostic]:
-	if byte_in(text, end, IdentifierStart):
-		Err(error_at(text, start, run_end(text, end, IdentifierByte), numeric_suffix()))
+	if text.byte_in(end, IdentifierStart):
+		Err(error_at(text, start, text.run_end(end, IdentifierByte), numeric_suffix()))
 	else:
 		-- The numeric scan stays within its ASCII run, so neither end splits a scalar.
 		spelling = text.bytes.slice(start, end).get_or("")
@@ -600,18 +588,18 @@ private pure func numeric_token_end(text: SourceText, start: Int, end: Int, is_f
 
 -- Whether a field or function name follows `position` on its line.
 private pure func name_follows(text: SourceText, position: Int) -> Bool:
-	byte_in(text, run_end(text, position, SpaceByte), IdentifierStart)
+	text.byte_in(text.run_end(position, SpaceByte), IdentifierStart)
 
 
 private pure func exponent_token(text: SourceText, start: Int, marker: Int) -> Result[Token, Diagnostic]:
 	sign = marker + 1
-	digits = if or(byte_is(text, sign, ASCII_PLUS), byte_is(text, sign, ASCII_MINUS)):
+	digits = if text.byte_is(sign, ASCII_PLUS).or(text.byte_is(sign, ASCII_MINUS)):
 		sign + 1
 	else:
 		sign
 
-	if byte_in(text, digits, DecimalDigit):
-		numeric_token_end(text, start, run_end(text, digits, DecimalDigit), True)
+	if text.byte_in(digits, DecimalDigit):
+		text.numeric_token_end(start, text.run_end(digits, DecimalDigit), True)
 	else:
 		Err(error_at(text, start, digits, missing_exponent()))
 
@@ -620,30 +608,30 @@ private pure func exponent_token(text: SourceText, start: Int, marker: Int) -> R
 -- receiver's UFCS dot remains an ordinary symbol token when a name follows it;
 -- any other dot directly after an integer is a Float missing its fraction.
 private pure func numeric_token(text: SourceText, start: Int) -> Result[Token, Diagnostic]:
-	integer_end = run_end(text, start, DecimalDigit)
+	integer_end = text.run_end(start, DecimalDigit)
 	after_dot = integer_end + 1
 	-- `0..n` is an integer and a range symbol, not a Float missing its fraction.
-	dotted = and(byte_is(text, integer_end, ASCII_DOT), byte_is(text, after_dot, ASCII_DOT).not())
-	fraction = and(dotted, byte_in(text, after_dot, DecimalDigit))
+	dotted = text.byte_is(integer_end, ASCII_DOT).and(text.byte_is(after_dot, ASCII_DOT).not())
+	fraction = dotted.and(text.byte_in(after_dot, DecimalDigit))
 	mantissa_end = if fraction:
-		run_end(text, after_dot, DecimalDigit)
+		text.run_end(after_dot, DecimalDigit)
 	else:
 		integer_end
 
-	if or(byte_is(text, mantissa_end, ASCII_LOWER_E), byte_is(text, mantissa_end, ASCII_UPPER_E)):
-		exponent_token(text, start, mantissa_end)
+	if text.byte_is(mantissa_end, ASCII_LOWER_E).or(text.byte_is(mantissa_end, ASCII_UPPER_E)):
+		text.exponent_token(start, mantissa_end)
 	else:
 		missing_fraction_digits = match dotted:
 			True:
 				match fraction.not():
-					True: name_follows(text, after_dot).not()
+					True: text.name_follows(after_dot).not()
 					False: False
 			False: False
 
 		if missing_fraction_digits:
 			Err(error_at(text, start, after_dot, missing_fraction()))
 		else:
-			numeric_token_end(text, start, mantissa_end, fraction)
+			text.numeric_token_end(start, mantissa_end, fraction)
 
 
 -- Every reserved word stays a keyword token, including unsupported forms.
@@ -770,18 +758,18 @@ private pure func punctuation(byte: Int) -> Option[Symbol]:
 
 -- Scans the code token at `cursor`; the caller handles spaces, comments and LF.
 private pure func code_token(text: SourceText, cursor: Int) -> Result[ScannedToken, Diagnostic]:
-	if byte_in(text, cursor, IdentifierStart):
-		end = run_end(text, cursor + 1, IdentifierByte)
+	if text.byte_in(cursor, IdentifierStart):
+		end = text.run_end(cursor + 1, IdentifierByte)
 		-- IdentifierByte accepts ASCII only; run_end cannot cross a scalar boundary.
 		spelling = text.bytes.slice(cursor, end).get_or("")
 
-		match word_kind(spelling):
+		match spelling.word_kind():
 			Some(kind):
 				Ok(ReadyToken(token(text, kind, cursor, end)))
 			None:
 				Ok(WordToken(spelling, cursor, end))
 	else:
-		match literal_or_symbol(text, cursor):
+		match text.literal_or_symbol(cursor):
 			Ok(scanned):
 				Ok(ReadyToken(scanned))
 			Err(error):
@@ -791,89 +779,83 @@ private pure func code_token(text: SourceText, cursor: Int) -> Result[ScannedTok
 private pure func literal_or_symbol(text: SourceText, cursor: Int) -> Result[Token, Diagnostic]:
 	next = cursor + 1
 
-	if byte_is(text, cursor, ASCII_DOUBLE_QUOTE):
-		hole_quoted_token(text, cursor)
-	else if byte_is(text, cursor, ASCII_SINGLE_QUOTE):
-		char_token(text, cursor)
-	else if and(
-		and(
-			byte_is(text, cursor, ASCII_DOT),
-			byte_is(text, next, ASCII_DOT),
-		),
-		byte_is(text, cursor + 2, ASCII_DOT),
-	):
+	if text.byte_is(cursor, ASCII_DOUBLE_QUOTE):
+		text.hole_quoted_token(cursor)
+	else if text.byte_is(cursor, ASCII_SINGLE_QUOTE):
+		text.char_token(cursor)
+	else if text.byte_is(cursor, ASCII_DOT).and(text.byte_is(next, ASCII_DOT)).and(text.byte_is(cursor + 2, ASCII_DOT)):
 		Ok(symbol(text, Ellipsis, cursor, cursor + 3))
-	else if and(byte_is(text, cursor, ASCII_DOT), byte_is(text, next, ASCII_DOT)):
+	else if text.byte_is(cursor, ASCII_DOT).and(text.byte_is(next, ASCII_DOT)):
 		Ok(symbol(text, DotDot, cursor, cursor + 2))
 	-- A token starting with `=`, `<`, `>` or an arithmetic operator is told
 	-- apart by its second byte here, so other tokens pay one test per first
 	-- byte, not one per spelling. The caller has already taken `--` as a comment.
-	else if byte_is(text, cursor, ASCII_MINUS):
-		if byte_is(text, next, ASCII_GREATER):
+	else if text.byte_is(cursor, ASCII_MINUS):
+		if text.byte_is(next, ASCII_GREATER):
 			Ok(symbol(text, Arrow, cursor, cursor + 2))
-		else if byte_is(text, next, ASCII_EQUALS):
+		else if text.byte_is(next, ASCII_EQUALS):
 			Err(error_at(text, cursor, cursor + 2, compound_assignment("-=", "write x = x - 1")))
 		else:
 			Ok(symbol(text, Minus, cursor, next))
-	else if byte_is(text, cursor, ASCII_PLUS):
-		if byte_is(text, next, ASCII_EQUALS):
+	else if text.byte_is(cursor, ASCII_PLUS):
+		if text.byte_is(next, ASCII_EQUALS):
 			Err(error_at(text, cursor, cursor + 2, compound_assignment("+=", "write x = x + 1")))
 		else:
 			Ok(symbol(text, Plus, cursor, next))
-	else if byte_is(text, cursor, ASCII_STAR):
-		if byte_is(text, next, ASCII_EQUALS):
+	else if text.byte_is(cursor, ASCII_STAR):
+		if text.byte_is(next, ASCII_EQUALS):
 			Err(error_at(text, cursor, cursor + 2, compound_assignment("*=", "write x = x * 2")))
-		else if byte_is(text, next, ASCII_STAR):
+		else if text.byte_is(next, ASCII_STAR):
 			Err(error_at(text, cursor, cursor + 2, foreign_operator("**", "multiply, or call a power function")))
 		else:
 			Ok(symbol(text, Star, cursor, next))
-	else if byte_is(text, cursor, ASCII_SLASH):
-		if byte_is(text, next, ASCII_EQUALS):
+	else if text.byte_is(cursor, ASCII_SLASH):
+		if text.byte_is(next, ASCII_EQUALS):
 			Err(error_at(text, cursor, cursor + 2, compound_assignment("/=", "write x = x / 2, or write != for inequality")))
-		else if byte_is(text, next, ASCII_SLASH):
+		else if text.byte_is(next, ASCII_SLASH):
 			Err(error_at(text, cursor, cursor + 2, foreign_operator("//", "comments start with --; write a / b to divide")))
 		else:
 			Ok(symbol(text, Slash, cursor, next))
-	else if byte_is(text, cursor, ASCII_PERCENT):
-		if byte_is(text, next, ASCII_EQUALS):
+	else if text.byte_is(cursor, ASCII_PERCENT):
+		if text.byte_is(next, ASCII_EQUALS):
 			Err(error_at(text, cursor, cursor + 2, compound_assignment("%=", "write x = x % 2")))
 		else:
 			Ok(symbol(text, Percent, cursor, next))
-	else if byte_is(text, cursor, ASCII_EQUALS):
-		if byte_is(text, next, ASCII_EQUALS):
+	else if text.byte_is(cursor, ASCII_EQUALS):
+		if text.byte_is(next, ASCII_EQUALS):
 			Ok(symbol(text, EqualsEquals, cursor, cursor + 2))
-		else if byte_is(text, next, ASCII_GREATER):
+		else if text.byte_is(next, ASCII_GREATER):
 			Ok(symbol(text, FatArrow, cursor, cursor + 2))
-		else if byte_is(text, next, ASCII_LESS):
+		else if text.byte_is(next, ASCII_LESS):
 			Err(error_at(text, cursor, cursor + 2, foreign_operator("=<", "write '<='")))
 		else:
 			Ok(symbol(text, Equals, cursor, next))
-	else if byte_is(text, cursor, ASCII_LESS):
-		if byte_is(text, next, ASCII_EQUALS):
+	else if text.byte_is(cursor, ASCII_LESS):
+		if text.byte_is(next, ASCII_EQUALS):
 			Ok(symbol(text, LessEquals, cursor, cursor + 2))
-		else if byte_is(text, next, ASCII_GREATER):
+		else if text.byte_is(next, ASCII_GREATER):
 			Err(error_at(text, cursor, cursor + 2, foreign_operator("<>", "write '!=' for inequality")))
 		else:
 			Ok(symbol(text, Less, cursor, next))
-	else if byte_is(text, cursor, ASCII_GREATER):
-		if byte_is(text, next, ASCII_EQUALS):
+	else if text.byte_is(cursor, ASCII_GREATER):
+		if text.byte_is(next, ASCII_EQUALS):
 			Ok(symbol(text, GreaterEquals, cursor, cursor + 2))
 		else:
 			Ok(symbol(text, Greater, cursor, next))
-	else if and(byte_is(text, cursor, ASCII_EXCLAMATION), byte_is(text, next, ASCII_EQUALS)):
+	else if text.byte_is(cursor, ASCII_EXCLAMATION).and(text.byte_is(next, ASCII_EQUALS)):
 		Ok(symbol(text, NotEquals, cursor, cursor + 2))
-	else if and(byte_is(text, cursor, ASCII_QUESTION), byte_is(text, next, ASCII_EQUALS)):
+	else if text.byte_is(cursor, ASCII_QUESTION).and(text.byte_is(next, ASCII_EQUALS)):
 		Ok(symbol(text, QuestionEquals, cursor, cursor + 2))
-	else if byte_in(text, cursor, DecimalDigit):
-		numeric_token(text, cursor)
-	else if byte_is(text, cursor, ASCII_CR):
+	else if text.byte_in(cursor, DecimalDigit):
+		text.numeric_token(cursor)
+	else if text.byte_is(cursor, ASCII_CR):
 		Err(byte_error(text, cursor, line_ending()))
-	else if byte_is(text, cursor, ASCII_TAB):
+	else if text.byte_is(cursor, ASCII_TAB):
 		Err(byte_error(text, cursor, separating_tab()))
 	else:
 		punctuator = match text.bytes.byte_at(cursor):
 			Some(byte):
-				punctuation(byte)
+				byte.punctuation()
 			None:
 				None
 
@@ -894,19 +876,19 @@ private pure func interpolation_tokens(text: SourceText, opening: Int) -> Result
 		match scan:
 			Err(_): break
 			Ok(cursor):
-				if or(cursor == text.bytes.length(), byte_is(text, cursor, ASCII_LF)):
+				if (cursor == text.bytes.length()).or(text.byte_is(cursor, ASCII_LF)):
 					scan = Err(error_at(text, opening, opening + 2, unclosed_interpolation()))
-				else if byte_is(text, cursor, ASCII_SPACE):
+				else if text.byte_is(cursor, ASCII_SPACE):
 					scan = Ok(cursor + 1)
-				else if comment_starts(text, cursor):
-					scan = code_comment_end(text, tokens.last(), cursor)
-				else if and(byte_is(text, cursor, ASCII_RIGHT_BRACE), braces == 0):
+				else if text.comment_starts(cursor):
+					scan = text.code_comment_end(tokens.last(), cursor)
+				else if text.byte_is(cursor, ASCII_RIGHT_BRACE).and(braces == 0):
 					end = cursor + 1
 					tokens = tokens.append(ReadyToken(token(text, InterpolationClose, cursor, end)))
 					scan = Ok(end)
 					break
 				else:
-					scan = match code_token(text, cursor):
+					scan = match text.code_token(cursor):
 						Err(error): Err(error)
 						Ok(scanned):
 							tokens = tokens.append(scanned)
@@ -931,7 +913,7 @@ private pure func quoted_tokens(text: SourceText, opening: Int) -> Result[Scanne
 		match scan:
 			Err(_): break
 			Ok(cursor):
-				if byte_is(text, cursor, ASCII_DOUBLE_QUOTE):
+				if text.byte_is(cursor, ASCII_DOUBLE_QUOTE):
 					end = cursor + 1
 					if tokens.is_empty():
 						bytes = text.bytes.slice(contents, cursor).get_or("")
@@ -943,13 +925,13 @@ private pure func quoted_tokens(text: SourceText, opening: Int) -> Result[Scanne
 						tokens = tokens.append(ReadyToken(token(text, StringEnd, cursor, end)))
 					scan = Ok(end)
 					break
-				else if and(byte_is(text, cursor, ASCII_DOLLAR), byte_is(text, cursor + 1, ASCII_LEFT_BRACE)):
+				else if text.byte_is(cursor, ASCII_DOLLAR).and(text.byte_is(cursor + 1, ASCII_LEFT_BRACE)):
 					if tokens.is_empty():
 						tokens = tokens.append(ReadyToken(token(text, StringStart(QuotedStringForm), opening, contents)))
 					if start < cursor:
 						bytes = text.bytes.slice(start, cursor).get_or("")
 						tokens = tokens.append(ReadyToken(token(text, StringSegment(bytes), start, cursor)))
-					scan = match interpolation_tokens(text, cursor):
+					scan = match text.interpolation_tokens(cursor):
 						Err(error): Err(error)
 						Ok(hole):
 							for item in hole.tokens:
@@ -957,7 +939,7 @@ private pure func quoted_tokens(text: SourceText, opening: Int) -> Result[Scanne
 							start = hole.end
 							Ok(hole.end)
 				else:
-					scan = quoted_character_end(text, opening, cursor)
+					scan = text.quoted_character_end(opening, cursor)
 	end ?= scan
 	Ok({ tokens = tokens, end = end })
 
@@ -966,12 +948,12 @@ private pure func quoted_tokens(text: SourceText, opening: Int) -> Result[Scanne
 private pure func comment_end(text: SourceText, start: Int) -> Result[Int, Diagnostic]:
 	var end: Int = start + 2
 
-	while and(end < text.bytes.length(), comment_continues(text, end)):
+	while (end < text.bytes.length()).and(text.comment_continues(end)):
 		end = end + 1
 
-	if or(end == text.bytes.length(), byte_is(text, end, ASCII_LF)):
+	if (end == text.bytes.length()).or(text.byte_is(end, ASCII_LF)):
 		Ok(end)
-	else if byte_is(text, end, ASCII_CR):
+	else if text.byte_is(end, ASCII_CR):
 		Err(byte_error(text, end, line_ending()))
 	else:
 		Err(byte_error(text, end, comment_byte()))
@@ -991,40 +973,27 @@ private pure func code_comment_end(text: SourceText, previous: Option[ScannedTok
 	if after_value:
 		Err(error_at(text, cursor, cursor + 2, comment_after_value()))
 	else:
-		comment_end(text, cursor)
+		text.comment_end(cursor)
 
 
 private pure func comment_continues(text: SourceText, position: Int) -> Bool:
 	match text.bytes.byte_at(position):
 		Some(code):
-			and(
-				and(
-					code <= ASCII_DEL,
-					code != ASCII_LF,
-				),
-				code != ASCII_CR,
-			)
+			(code <= ASCII_DEL).and(code != ASCII_LF).and(code != ASCII_CR)
 		None:
 			False
 
 
 private pure func comment_starts(text: SourceText, cursor: Int) -> Bool:
-	and(byte_is(text, cursor, ASCII_MINUS), byte_is(text, cursor + 1, ASCII_MINUS))
+	text.byte_is(cursor, ASCII_MINUS).and(text.byte_is(cursor + 1, ASCII_MINUS))
 
 
 -- Whether a fence line starts at `start`: DOC_FENCE, spaces, then LF or EOF.
 private pure func fence_at(text: SourceText, start: Int) -> Bool:
 	after_fence = start + DOC_FENCE_WIDTH
-	after_spaces = run_end(text, after_fence, SpaceByte)
-	and(
-		and(
-			and(
-				byte_is(text, start, ASCII_MINUS),
-				byte_is(text, start + 1, ASCII_MINUS),
-			),
-			byte_is(text, start + 2, ASCII_MINUS),
-		),
-		(or(after_spaces == text.bytes.length(), byte_is(text, after_spaces, ASCII_LF))),
+	after_spaces = text.run_end(after_fence, SpaceByte)
+	text.byte_is(start, ASCII_MINUS).and(text.byte_is(start + 1, ASCII_MINUS)).and(text.byte_is(start + 2, ASCII_MINUS)).and(
+		(after_spaces == text.bytes.length()).or(text.byte_is(after_spaces, ASCII_LF)),
 	)
 
 
@@ -1033,16 +1002,10 @@ private pure func fence_at(text: SourceText, start: Int) -> Bool:
 private pure func next_line_start(text: SourceText, start: Int) -> Result[Int, Diagnostic]:
 	var end: Int = start
 
-	while and(
-		and(
-			end < text.bytes.length(),
-			byte_is(text, end, ASCII_LF).not(),
-		),
-		byte_is(text, end, ASCII_CR).not(),
-	):
+	while (end < text.bytes.length()).and(text.byte_is(end, ASCII_LF).not()).and(text.byte_is(end, ASCII_CR).not()):
 		end = end + 1
 
-	if byte_is(text, end, ASCII_CR):
+	if text.byte_is(end, ASCII_CR):
 		Err(byte_error(text, end, line_ending()))
 	else:
 		Ok((end + 1).min(text.bytes.length()))
@@ -1052,15 +1015,15 @@ private pure func next_line_start(text: SourceText, start: Int) -> Result[Int, D
 -- next fence line at column 1; the lines between are trivia.
 private pure func doc_block_end(text: SourceText, fence: Int) -> Result[Int, Diagnostic]:
 	-- One Result carries each line start inside the block, or the first error.
-	var scan: Result[Int, Diagnostic] = next_line_start(text, fence)
+	var scan: Result[Int, Diagnostic] = text.next_line_start(fence)
 
 	while True:
 		match scan:
 			Ok(line):
-				if or(line == text.bytes.length(), fence_at(text, line)):
+				if (line == text.bytes.length()).or(text.fence_at(line)):
 					break
 
-				scan = next_line_start(text, line)
+				scan = text.next_line_start(line)
 			Err(_):
 				break
 
@@ -1069,14 +1032,14 @@ private pure func doc_block_end(text: SourceText, fence: Int) -> Result[Int, Dia
 	if closing == text.bytes.length():
 		Err(error_at(text, fence, fence + DOC_FENCE_WIDTH, unterminated_doc_block()))
 	else:
-		next_line_start(text, closing)
+		text.next_line_start(closing)
 
 
 -- Returns where the trivia at `start`, which is an LF, EOF or comment, ends:
 -- `start` itself at LF or EOF, or the LF or EOF ending the comment there.
 private pure func trivia_end(text: SourceText, start: Int) -> Result[Int, Diagnostic]:
-	if byte_is(text, start, ASCII_MINUS):
-		comment_end(text, start)
+	if text.byte_is(start, ASCII_MINUS):
+		text.comment_end(start)
 	else:
 		Ok(start)
 
@@ -1086,47 +1049,44 @@ private pure func indentation_level(text: SourceText, prefix: LinePrefix) -> Res
 	width = prefix.end - prefix.start
 	whole_groups = width % SPACE_INDENT_WIDTH == 0
 
-	if run_end(text, prefix.start, TabByte) == prefix.end:
+	if text.run_end(prefix.start, TabByte) == prefix.end:
 		Ok(width)
-	else if and(run_end(text, prefix.start, SpaceByte) == prefix.end, whole_groups):
+	else if (text.run_end(prefix.start, SpaceByte) == prefix.end).and(whole_groups):
 		Ok(width / SPACE_INDENT_WIDTH)
 	else:
 		Err(error_at(text, prefix.start, prefix.end, invalid_indentation()))
 
 
 private pure func line_prefix(text: SourceText, start: Int) -> LinePrefix:
-	{ start = start, end = run_end(text, start, IndentationByte) }
+	{ start = start, end = text.run_end(start, IndentationByte) }
 
 
 -- Skips blank, whitespace-only and comment-only lines from the line at `start`
 -- to the next code line, with its indentation level.
 private pure func next_code_line(text: SourceText, start: Int) -> Result[CodeLine, Diagnostic]:
 	-- One Result carries the line past trivia lines, or the first error.
-	var scan: Result[LinePrefix, Diagnostic] = Ok(line_prefix(text, start))
+	var scan: Result[LinePrefix, Diagnostic] = Ok(text.line_prefix(start))
 
 	while True:
 		match scan:
 			Ok(line):
-				if or(
-					line.end == text.bytes.length(),
-					(or(byte_is(text, line.end, ASCII_LF), comment_starts(text, line.end))).not(),
-				):
+				if (line.end == text.bytes.length()).or(text.byte_is(line.end, ASCII_LF).or(text.comment_starts(line.end)).not()):
 					break
 
 				starts_doc_block = if line.start == line.end:
-					fence_at(text, line.end)
+					text.fence_at(line.end)
 				else:
 					False
 				scan = if starts_doc_block:
-					match doc_block_end(text, line.end):
+					match text.doc_block_end(line.end):
 						Ok(after_block):
-							Ok(line_prefix(text, after_block))
+							Ok(text.line_prefix(after_block))
 						Err(error):
 							Err(error)
 				else:
-					match trivia_end(text, line.end):
+					match text.trivia_end(line.end):
 						Ok(end):
-							Ok(line_prefix(text, (end + 1).min(text.bytes.length())))
+							Ok(text.line_prefix((end + 1).min(text.bytes.length())))
 						Err(error):
 							Err(error)
 			Err(_):
@@ -1138,7 +1098,7 @@ private pure func next_code_line(text: SourceText, start: Int) -> Result[CodeLin
 	if prefix.end == end:
 		Ok({ prefix = { start = end, end = end }, level = 0 })
 	else:
-		match indentation_level(text, prefix):
+		match text.indentation_level(prefix):
 			Ok(level): Ok({ prefix = prefix, level = level })
 			Err(error): Err(error)
 
@@ -1163,7 +1123,7 @@ private pure func pipe_byte_end(text: SourceText, position: Int, byte: Int) -> R
 	if byte == ASCII_TAB:
 		Ok(position + 1)
 	else:
-		raw_character_end(text, position, byte)
+		text.raw_character_end(position, byte)
 
 
 -- The end of the pipe line text starting at `start`: its LF or the end of
@@ -1184,11 +1144,11 @@ private pure func pipe_line_end(text: SourceText, start: Int, form: PipeForm) ->
 
 						opens_hole = match form:
 							PipeMarkers:
-								and(byte == ASCII_DOLLAR, byte_is(text, cursor + 1, ASCII_LEFT_BRACE))
+								(byte == ASCII_DOLLAR).and(text.byte_is(cursor + 1, ASCII_LEFT_BRACE))
 							RawText: False
 						if opens_hole:
 							break
-						scan = pipe_byte_end(text, cursor, byte)
+						scan = text.pipe_byte_end(cursor, byte)
 			Err(_):
 				break
 
@@ -1202,10 +1162,10 @@ private pure func same_indentation(text: SourceText, first: LinePrefix, line_sta
 	var offset: Int = 0
 	var same: Bool = True
 
-	while and(same, offset < first.end - first.start):
+	while same.and(offset < first.end - first.start):
 		same = match text.bytes.byte_at(first.start + offset):
 			Some(expected):
-				byte_is(text, line_start + offset, expected)
+				text.byte_is(line_start + offset, expected)
 			None:
 				False
 		offset = offset + 1
@@ -1220,10 +1180,10 @@ private pure func continuing_marker(text: SourceText, line_end: Int, first: Line
 	line_start = line_end + 1
 	marker = line_start + (first.end - first.start)
 
-	continues_block = match byte_is(text, line_end, ASCII_LF):
+	continues_block = match text.byte_is(line_end, ASCII_LF):
 		True:
-			match same_indentation(text, first, line_start):
-				True: byte_is(text, marker, ASCII_BAR)
+			match text.same_indentation(first, line_start):
+				True: text.byte_is(marker, ASCII_BAR)
 				False: False
 		False: False
 
@@ -1246,7 +1206,7 @@ private pure func pipe_block(text: SourceText, first: LinePrefix, form: PipeForm
 			Ok(marker):
 				text_start = marker + 1
 
-				match pipe_line_end(text, text_start, form):
+				match text.pipe_line_end(text_start, form):
 					Err(error):
 						lines = Err(error)
 					Ok(line_end):
@@ -1256,7 +1216,7 @@ private pure func pipe_block(text: SourceText, first: LinePrefix, form: PipeForm
 						value = Text.concat(value, line_text)
 						end = line_end
 
-						match continuing_marker(text, line_end, first):
+						match text.continuing_marker(line_end, first):
 							Some(next_marker):
 								value = "${value}\n"
 								lines = Ok(next_marker)
@@ -1281,7 +1241,7 @@ private pure func pipe_tokens(text: SourceText, first: LinePrefix) -> Result[Sca
 		match scan:
 			Err(_): break
 			Ok(start):
-				match pipe_line_end(text, start, PipeMarkers):
+				match text.pipe_line_end(start, PipeMarkers):
 					Err(error): scan = Err(error)
 					Ok(stop):
 						bytes = text.bytes.slice(start, stop).get_or("")
@@ -1289,13 +1249,13 @@ private pure func pipe_tokens(text: SourceText, first: LinePrefix) -> Result[Sca
 							prefix = prefix.append(bytes)
 						else if start < stop:
 							tokens = tokens.append(ReadyToken(token(text, StringSegment(bytes), start, stop)))
-						if byte_is(text, stop, ASCII_DOLLAR):
+						if text.byte_is(stop, ASCII_DOLLAR):
 							if tokens.is_empty():
 								tokens = tokens.append(ReadyToken(token(text, StringStart(PipeStringForm), first.end, contents)))
 								if prefix.is_empty().not():
 									tokens = tokens.append(ReadyToken(token(text, StringSegment(prefix.join("")), contents, stop)))
 								prefix = []
-							scan = match interpolation_tokens(text, stop):
+							scan = match text.interpolation_tokens(stop):
 								Err(error): Err(error)
 								Ok(hole):
 									for item in hole.tokens:
@@ -1303,7 +1263,7 @@ private pure func pipe_tokens(text: SourceText, first: LinePrefix) -> Result[Sca
 									Ok(hole.end)
 						else:
 							end = stop
-							match continuing_marker(text, stop, first):
+							match text.continuing_marker(stop, first):
 								None: break
 								Some(marker):
 									if tokens.is_empty():
@@ -1326,23 +1286,12 @@ private RAW_WORD_WIDTH: Int = 3
 -- code at `start` is the word `raw`, trailing spaces, a LF and then that
 -- indented marker line.
 private pure func raw_block_marker_line(text: SourceText, start: Int) -> Option[LinePrefix]:
-	word_end = run_end(text, start, IdentifierByte)
-	line_end = run_end(text, word_end, SpaceByte)
-	marker_line = line_prefix(text, line_end + 1)
-	is_raw_word = (
-		and(
-			and(
-				and(
-					word_end == start + RAW_WORD_WIDTH,
-					byte_is(text, start, ASCII_LOWER_R),
-				),
-				byte_is(text, start + 1, ASCII_LOWER_A),
-			),
-			byte_is(text, start + 2, ASCII_LOWER_W),
-		)
-	)
+	word_end = text.run_end(start, IdentifierByte)
+	line_end = text.run_end(word_end, SpaceByte)
+	marker_line = text.line_prefix(line_end + 1)
+	is_raw_word = (word_end == start + RAW_WORD_WIDTH).and(text.byte_is(start, ASCII_LOWER_R)).and(text.byte_is(start + 1, ASCII_LOWER_A)).and(text.byte_is(start + 2, ASCII_LOWER_W))
 
-	if and(and(is_raw_word, byte_is(text, line_end, ASCII_LF)), byte_is(text, marker_line.end, ASCII_BAR)):
+	if is_raw_word.and(text.byte_is(line_end, ASCII_LF)).and(text.byte_is(marker_line.end, ASCII_BAR)):
 		Some(marker_line)
 	else:
 		None
@@ -1358,14 +1307,14 @@ private union LineCode:
 -- The code of the line with `prefix`: a pipe String starts at a `|` first on
 -- the line, on any line including a continuation line inside brackets.
 private pure func line_code(text: SourceText, prefix: LinePrefix) -> Result[LineCode, Diagnostic]:
-	if byte_is(text, prefix.end, ASCII_BAR):
-		match pipe_tokens(text, prefix):
+	if text.byte_is(prefix.end, ASCII_BAR):
+		match text.pipe_tokens(prefix):
 			Ok(block): Ok(PipeLine(block))
 			Err(error): Err(error)
 	else:
-		match raw_block_marker_line(text, prefix.end):
+		match text.raw_block_marker_line(prefix.end):
 			Some(marker_line):
-				match pipe_block(text, marker_line, RawText):
+				match text.pipe_block(marker_line, RawText):
 					Ok(block): Ok(PipeLine({ tokens = [ReadyToken(token(text, PipeString(block.value), prefix.end, block.end))], end = block.end }))
 					Err(error): Err(error)
 			None:
@@ -1388,7 +1337,7 @@ private pure func innermost_block(bodies: List[BracketedBlock]) -> Option[Bracke
 -- Host 2.2 `insignificant(depth)`: a line break inside brackets is trivia
 -- unless a bracketed block is open at exactly this depth.
 private pure func insignificant_break(brackets: Int, bodies: List[BracketedBlock]) -> Bool:
-	match innermost_block(bodies):
+	match bodies.innermost_block():
 		None:
 			True
 		Some(block):
@@ -1398,12 +1347,12 @@ private pure func insignificant_break(brackets: Int, bodies: List[BracketedBlock
 -- Host 2.2 `opens_block(depth)`: a `:` ending a line inside brackets opens
 -- a bracketed block, unless one is already open at this depth or deeper.
 private pure func opens_bracketed_block(brackets: Int, last_colon: Bool, bodies: List[BracketedBlock]) -> Bool:
-	open_deeper: Bool = match innermost_block(bodies):
+	open_deeper: Bool = match bodies.innermost_block():
 		None:
 			True
 		Some(block):
 			brackets > block.group
-	and(last_colon, open_deeper)
+	last_colon.and(open_deeper)
 
 
 -- Host 2.3 DEDENT-TO: a line dedented to `level` closes every bracketed
@@ -1433,11 +1382,11 @@ private pure func top_level(levels: List[Int]) -> Int:
 -- enclosing brackets). `level` is then no open level: case 6 would report
 -- it as inconsistent.
 private pure func closes_bracketed_block(bodies: List[BracketedBlock], brackets: Int, level: Int, levels: List[Int]) -> Option[Int]:
-	match innermost_block(bodies):
+	match bodies.innermost_block():
 		None:
 			None
 		Some(block):
-			between = and(block.base < level, level < top_level(levels))
+			between = (block.base < level).and(level < levels.top_level())
 
 			closes_between_levels = if brackets == block.group:
 				match between:
@@ -1504,38 +1453,38 @@ pure func lex(origin: SourceId, source: String, names: NameTable) -> Result[Lexe
 	var brackets: Int = 0
 	var bodies: List[BracketedBlock] = []
 	-- One Result carries each code line to lay out, or the first error.
-	var lines: Result[CodeLine, Diagnostic] = next_code_line(text, 0)
+	var lines: Result[CodeLine, Diagnostic] = text.next_code_line(0)
 
 	while True:
 		match lines:
 			Ok(line):
-				if line.level > top_level(levels):
+				if line.level > levels.top_level():
 					tokens = tokens.append(ReadyToken(symbol(text, Indent, line.prefix.start, line.prefix.end)))
 					levels = levels.append(line.level)
-				else if line.level < top_level(levels):
+				else if line.level < levels.top_level():
 					-- Host DEDENT-TO: to the line's level, or to the base of the
 					-- bracketed block the line closes (L2 case 3).
-					target = match closes_bracketed_block(bodies, brackets, line.level, levels):
+					target = match bodies.closes_bracketed_block(brackets, line.level, levels):
 						Some(base):
 							base
 						None:
 							line.level
 
-					while top_level(levels) > target:
+					while levels.top_level() > target:
 						tokens = tokens.append(ReadyToken(symbol(text, Dedent, line.prefix.start, line.prefix.end)))
 						levels = levels.take(levels.length() - 1)
 
-					if top_level(levels) != target:
+					if levels.top_level() != target:
 						lines = Err(error_at(text, line.prefix.start, line.prefix.end, inconsistent_indentation()))
 						break
 
-					bodies = blocks_open_below(bodies, target)
+					bodies = bodies.blocks_open_below(target)
 
 				if line.prefix.end == source.length():
 					break
 
 				-- One Result carries the cursor across the line to its LF or EOF, or the first error.
-				var code: Result[Int, Diagnostic] = match line_code(text, line.prefix):
+				var code: Result[Int, Diagnostic] = match text.line_code(line.prefix):
 					Ok(PipeLine(pipe)):
 						for item in pipe.tokens:
 							tokens = tokens.append(item)
@@ -1556,34 +1505,34 @@ pure func lex(origin: SourceId, source: String, names: NameTable) -> Result[Lexe
 							-- A LF ends the code line at depth zero, when it opens a
 							-- bracketed block, or when it is inside the one open at
 							-- this depth; any other LF inside brackets is trivia.
-							line_ends: Bool = if byte_is(text, cursor, ASCII_LF).not():
+							line_ends: Bool = if text.byte_is(cursor, ASCII_LF).not():
 								False
 							else if brackets == 0:
 								True
-							else if opens_bracketed_block(brackets, last_colon, bodies):
-								bodies = bodies.append({ group = brackets, base = top_level(levels) })
+							else if brackets.opens_bracketed_block(last_colon, bodies):
+								bodies = bodies.append({ group = brackets, base = levels.top_level() })
 								True
 							else:
-								insignificant_break(brackets, bodies).not()
+								brackets.insignificant_break(bodies).not()
 
 							if line_ends:
 								break
 
-							code = if byte_is(text, cursor, ASCII_LF):
+							code = if text.byte_is(cursor, ASCII_LF):
 								-- A continuation line inside brackets: its indentation is
 								-- trivia, a column-1 fence is an error, and its code may be
 								-- a pipe String as on any line.
-								continued = line_prefix(text, cursor + 1)
+								continued = text.line_prefix(cursor + 1)
 
 								bracketed_doc_block = if continued.start == continued.end:
-									fence_at(text, continued.end)
+									text.fence_at(continued.end)
 								else:
 									False
 
 								if bracketed_doc_block:
 									Err(error_at(text, continued.end, continued.end + DOC_FENCE_WIDTH, doc_block_in_brackets()))
 								else:
-									match line_code(text, continued):
+									match text.line_code(continued):
 										Ok(PipeLine(pipe)):
 											for item in pipe.tokens:
 												tokens = tokens.append(item)
@@ -1593,12 +1542,12 @@ pure func lex(origin: SourceId, source: String, names: NameTable) -> Result[Lexe
 											Ok(continued.end)
 										Err(error):
 											Err(error)
-							else if byte_is(text, cursor, ASCII_SPACE):
+							else if text.byte_is(cursor, ASCII_SPACE):
 								Ok(cursor + 1)
-							else if comment_starts(text, cursor):
-								code_comment_end(text, tokens.last(), cursor)
-							else if byte_is(text, cursor, ASCII_DOUBLE_QUOTE):
-								match quoted_tokens(text, cursor):
+							else if text.comment_starts(cursor):
+								text.code_comment_end(tokens.last(), cursor)
+							else if text.byte_is(cursor, ASCII_DOUBLE_QUOTE):
+								match text.quoted_tokens(cursor):
 									Err(error): Err(error)
 									Ok(quoted):
 										for item in quoted.tokens:
@@ -1606,7 +1555,7 @@ pure func lex(origin: SourceId, source: String, names: NameTable) -> Result[Lexe
 										last_colon = False
 										Ok(quoted.end)
 							else:
-								match code_token(text, cursor):
+								match text.code_token(cursor):
 									Ok(scanned):
 										tokens = tokens.append(scanned)
 
@@ -1615,8 +1564,8 @@ pure func lex(origin: SourceId, source: String, names: NameTable) -> Result[Lexe
 												last_colon = False
 												Ok(end)
 											ReadyToken(ready):
-												brackets = bracket_depth(brackets, ready.kind)
-												last_colon = is_colon(ready.kind)
+												brackets = brackets.bracket_depth(ready.kind)
+												last_colon = ready.kind.is_colon()
 												Ok(ready.span.end)
 									Err(error):
 										Err(error)
@@ -1627,7 +1576,7 @@ pure func lex(origin: SourceId, source: String, names: NameTable) -> Result[Lexe
 					Ok(line_end):
 						next = (line_end + 1).min(source.length())
 						tokens = tokens.append(ReadyToken(symbol(text, Newline, line_end, next)))
-						next_code_line(text, next)
+						text.next_code_line(next)
 					Err(error):
 						Err(error)
 			Err(_):
@@ -1638,7 +1587,7 @@ pure func lex(origin: SourceId, source: String, names: NameTable) -> Result[Lexe
 	-- which the host copies for each new spelling, so one `intern_names` call
 	-- mints the IDs of all the scanned spellings. Its `ids` hold one ID per
 	-- WordToken in order, so the `None` arm never runs.
-	interned = intern_names(names, word_spellings(tokens))
+	interned = names.intern_names(tokens.word_spellings())
 	var lexed: List[Token] = []
 	var word_position: Int = 0
 	var missing: Option[Diagnostic] = None

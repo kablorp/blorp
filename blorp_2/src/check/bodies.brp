@@ -3,9 +3,9 @@ Checks function bodies: parameter scope, ordered statements, match arms
 and patterns, and the canonical Void tail.
 ---
 import:
-	./traits: TraitAvailability, accepted_traits
+	./traits: TraitAvailability
 	result: Result methods
-	bool: not
+	bool: Bool methods
 	./errors:
 		CheckError,
 		RecursionError(
@@ -32,7 +32,7 @@ import:
 			IfValue,
 		),
 		unsupported_form,
-	./callables: ResolutionContext, resolve_body_type
+	./callables: ResolutionContext
 	./model:
 		BodyOwner(DeclaredBody), AdmittedReceiverScope,
 		CheckedBodies, CheckedLambda, LambdaRow(CollectingLambda, CheckedLambdaRow), CheckedValueResult, ResolvedBody,
@@ -64,21 +64,18 @@ import:
 		UnionOccurrence,
 		callable_parameter,
 		binding_id,
-		binding_number,
-		has_callable_parameters,
-		union_occurrence,
-	./patterns as Patterns
+	./patterns as Patterns: ParsedPattern methods, TypeRef methods
 	./recursion: check_execution
 	./signatures: AcceptedBody(BuiltinBody, MatchBody, ValueBody), AcceptedFunction
 	./declarations: CheckedDeclarations
-	./constructors: VariantContract, find_qualified_variant, find_variant
+	./constructors: VariantContract, ConstructionContext
 	./expressions: check_value, synthesize_value
-	./scope: ScopedValue(DataLocal, CallableLocal), LocalBinding, bind_callable, callable_local, callable_parameter_contract, bind_local, binding_site, binding_definition, local_binding_id, lookup_binding
-	../utils/ids: OpaqueRow, VariantId, variant_owner
+	./scope: ScopedValue(DataLocal, CallableLocal), LocalBinding, bind_callable, bind_local, lookup_binding, CallableBinding
+	../utils/ids: OpaqueRow, VariantId
 	../namespace/builtins: DesignatedResult, DesignatedBoolean, DesignatedOption, RuntimeOperation
 	int: Int methods
 	list: repeat, List methods
-	../utils/source: module_number
+	../utils/source: ModuleId
 	../namespace/namespace: Namespace
 	option: Option methods
 	../utils/syntax:
@@ -91,12 +88,10 @@ import:
 		ParsedParameter,
 		ParsedPattern(PatternName, PatternWildcard, PatternConstructor, PatternOr, PatternList, PatternString, PatternChar),
 		PatternHead(BareHead, QualifiedHead),
-		pattern_span,
 		ParsedStatement(TupleBinding, BindingStatement, PropagatingBinding, ExpressionStatement, WhileLoop, ForLoop, Break, Continue),
-		type_span,
 		Span,
 		ValueExpression,
-		WrittenName,
+		WrittenName, TypeSyntax,
 
 
 private record MatchContext {
@@ -128,15 +123,15 @@ private pure func start_match(
 	var unsupported: Option[CheckError] = None
 	for arm in body.arms:
 		if unsupported.is_none():
-			unsupported = Patterns.unsupported_pattern_form(arm.pattern)
+			unsupported = arm.pattern.unsupported_pattern_form()
 	_: Void ?= match unsupported:
 		Some(error): Err(error)
 		None: Ok(void)
-	scrutinee ?= synthesize_value(scope, body.scrutinee, None, context, lambdas, resolve_lambda_block)
-	_: Void ?= match Patterns.supports_root(scrutinee.value.value_type):
+	scrutinee ?= scope.synthesize_value(body.scrutinee, None, context, lambdas, resolve_lambda_block)
+	_: Void ?= match scrutinee.value.value_type.supports_root():
 		True: Ok(void)
 		False: Err(match_error(body.scrutinee.span, InvalidMatchScrutinee(scrutinee.value.value_type)))
-	subject ?= Patterns.prepare_subject(scrutinee.value.value_type, context, body.scrutinee.span)
+	subject ?= scrutinee.value.value_type.prepare_subject(context, body.scrutinee.span)
 	Ok({ lambdas = scrutinee.lambdas, scrutinee = scrutinee.value, match_context = { subject = subject, scope = scope } })
 
 
@@ -156,8 +151,8 @@ private pure func resolve_arm_prefix(
 	context: ResolutionContext,
 	lambdas: List[LambdaRow],
 ) -> Result[ResolvedArmPrefix, CheckError]:
-	pattern ?= Patterns.resolve_arm(arm.pattern, match_context.subject, match_context.scope, bindings.length(), id, previous, context)
-	block ?= resolve_statements(arm.block.statements, {
+	pattern ?= arm.pattern.resolve_arm(match_context.subject, match_context.scope, bindings.length(), id, previous, context)
+	block ?= arm.block.statements.resolve_statements({
 		lambdas = lambdas,
 		bindings = bindings.concat(pattern.bindings),
 		scope = pattern.scope,
@@ -175,16 +170,15 @@ private pure func resolve_match(
 	context: ResolutionContext,
 	lambdas: List[LambdaRow],
 ) -> Result[ResolvedMatch, CheckError]:
-	started ?= start_match(scope, body, context, lambdas)
-	resolved ?= resolve_join_arms(
-		body.arms,
+	started ?= scope.start_match(body, context, lambdas)
+	resolved ?= body.arms.resolve_join_arms(
 		started.match_context,
 		{
 			lambdas = started.lambdas,
 			arms = [],
 			cases = [],
 			bindings = bindings,
-			expectation = return_expectation(return_type),
+			expectation = return_type.return_expectation(),
 			reassigned = []
 		},
 		context,
@@ -283,19 +277,19 @@ private pure func resolve_value(
 	match written.base:
 		IfExpression(branch):
 			if written.applications.is_empty():
-				resolve_if(branch, block, expectation, context)
+				branch.resolve_if(block, expectation, context)
 			else:
 				Err(unsupported_form(written.base_span, IfValue))
 		_:
-			match bare_match(written):
+			match written.bare_match():
 				Some(matched):
-					resolve_join(block, matched, expectation, context)
+					block.resolve_join(matched, expectation, context)
 				None:
 					value_result: Result[CheckedValueResult, CheckError] = match expectation:
 						UntypedValue | VoidTail:
-							synthesize_value(block.scope, written, None, context, block.lambdas, resolve_lambda_block)
+							block.scope.synthesize_value(written, None, context, block.lambdas, resolve_lambda_block)
 						ConditionValue(expected):
-							match synthesize_value(block.scope, written, Some(expected), context, block.lambdas, resolve_lambda_block):
+							match block.scope.synthesize_value(written, Some(expected), context, block.lambdas, resolve_lambda_block):
 								Err(error): Err(error)
 								Ok(value):
 									if value.value.value_type == expected:
@@ -303,13 +297,13 @@ private pure func resolve_value(
 									else:
 										Err(statement_error(written.span, NonBooleanCondition(value.value.value_type)))
 						CheckedAgainst(expected, site):
-							check_value(block.scope, written, expected, site, context, block.lambdas, resolve_lambda_block)
+							block.scope.check_value(written, expected, site, context, block.lambdas, resolve_lambda_block)
 						StatementValue:
-							statement_value(block.scope, written, ExpressionStatementValue, context, block.lambdas)
+							block.scope.statement_value(written, ExpressionStatementValue, context, block.lambdas)
 						AbsentElseBranch(origin):
-							statement_value(block.scope, written, IfThenWithoutElse(origin), context, block.lambdas)
+							block.scope.statement_value(written, IfThenWithoutElse(origin), context, block.lambdas)
 						StatementArm:
-							statement_value(block.scope, written, StatementMatchArmValue, context, block.lambdas)
+							block.scope.statement_value(written, StatementMatchArmValue, context, block.lambdas)
 					match value_result:
 						Ok(value): Ok({ value = value.value, lambdas = value.lambdas, bindings = block.bindings, reassigned = block.reassigned })
 						Err(error): Err(error)
@@ -331,7 +325,7 @@ private pure func statement_value(
 	context: ResolutionContext,
 	lambdas: List[LambdaRow],
 ) -> Result[CheckedValueResult, CheckError]:
-	value ?= synthesize_value(scope, written, None, context, lambdas, resolve_lambda_block)
+	value ?= scope.synthesize_value(written, None, context, lambdas, resolve_lambda_block)
 	if value.value.value_type == VoidType:
 		Ok(value)
 	else:
@@ -350,14 +344,13 @@ private pure func resolve_join(
 	expectation: ValueExpectation,
 	context: ResolutionContext,
 ) -> Result[ResolvedValue, CheckError]:
-	started ?= start_match(block.scope, body, context, block.lambdas)
+	started ?= block.scope.start_match(body, context, block.lambdas)
 	-- A statement match's arms, and those of matches nested as their values,
 	-- are statement arms.
 	arm_expectation: ValueExpectation = match expectation:
 		StatementValue | StatementArm | AbsentElseBranch(_): StatementArm
 		UntypedValue | ConditionValue(_) | CheckedAgainst(_, _) | VoidTail: expectation
-	resolved ?= resolve_join_arms(
-		body.arms,
+	resolved ?= body.arms.resolve_join_arms(
 		started.match_context,
 		{
 			lambdas = started.lambdas,
@@ -380,7 +373,7 @@ private pure func resolve_join(
 	carried: List[BindingId] = if resolved.reassigned.is_empty():
 		[]
 	else:
-		carried_bindings(block, resolved.reassigned)
+		block.carried_bindings(resolved.reassigned)
 	Ok({
 		value = {
 			form = Match({
@@ -408,8 +401,7 @@ private pure func resolve_join_arms(
 		None:
 			Ok(progress)
 		Some(arm):
-			match resolve_arm_prefix(
-				arm,
+			match arm.resolve_arm_prefix(
 				match_context,
 				progress.cases,
 				match_arm_id(progress.arms.length()),
@@ -420,7 +412,7 @@ private pure func resolve_join_arms(
 				Ok(prefix):
 					resolved: Result[ResolvedValue, CheckError] = match arm.block.value:
 						Some(body):
-							resolve_value(prefix.block, body, progress.expectation, context)
+							prefix.block.resolve_value(body, progress.expectation, context)
 						None:
 							match progress.expectation:
 								-- An arm of a statement match may end with a statement.
@@ -440,8 +432,7 @@ private pure func resolve_join_arms(
 									CheckedAgainst(value.value.value_type, FirstArmValue)
 								ConditionValue(_) | CheckedAgainst(_, _) | StatementValue | StatementArm | AbsentElseBranch(_) | VoidTail:
 									progress.expectation
-							resolve_join_arms(
-								written,
+							written.resolve_join_arms(
 								match_context,
 								{
 									arms = progress.arms.append({
@@ -479,8 +470,8 @@ private pure func parameter_scope(
 			Some(value_type):
 				binding_result = match value_type.value_type:
 					CallableType(_, _, _):
-						accepted = bind_callable(
-							resolved, context.namespace, context.module,
+						accepted = resolved.bind_callable(
+							context.namespace, context.module,
 							parameter.name, callable_parameter(context.root_function, position),
 							value_type, context.caller.body, binding_id(data_ordinal),
 						)
@@ -494,8 +485,8 @@ private pure func parameter_scope(
 							span = parameter.name.span
 						}
 						data_ordinal = data_ordinal + 1
-						bind_local(
-							resolved, context.namespace, context.module, context.caller.body,
+						resolved.bind_local(
+							context.namespace, context.module, context.caller.body,
 							parameter.name, binding_id(data_ordinal - 1), definition,
 						)
 				match binding_result:
@@ -533,10 +524,10 @@ private pure func carried_bindings(entry: ResolvedStatements, written: List[Bind
 	var states: List[JoinBindingState] = repeat(OutsideJoinScope, entry.bindings.length())
 	for binding in entry.scope:
 		match binding:
-			DataLocal(data): states = states.set(binding_number(local_binding_id(data)), UntouchedJoinBinding)
+			DataLocal(data): states = states.set(data.local_binding_id().binding_number(), UntouchedJoinBinding)
 			CallableLocal(_): void
 	for id in written:
-		position = binding_number(id)
+		position = id.binding_number()
 		match states.get(position):
 			Some(state):
 				match state:
@@ -560,7 +551,7 @@ private pure func resolve_statements(
 	block: ResolvedStatements,
 	context: ResolutionContext,
 ) -> Result[ResolvedStatements, CheckError]:
-	resolve_statement_prefix(written, 0, block, context)
+	written.resolve_statement_prefix(0, block, context)
 
 
 -- One source destructuring statement expands to several ordinary bindings.
@@ -572,8 +563,8 @@ private pure func resolve_statement_prefix(
 	match written.get(position):
 		None: Ok(block)
 		Some(statement):
-			match resolve_statement(statement, block, context):
-				Ok(next): resolve_statement_prefix(written, position + 1, next, context)
+			match statement.resolve_statement(block, context):
+				Ok(next): written.resolve_statement_prefix(position + 1, next, context)
 				Err(error): Err(error)
 
 
@@ -590,15 +581,15 @@ private pure func resolve_statement(
 	context: ResolutionContext,
 ) -> Result[ResolvedStatements, CheckError]:
 	match statement:
-		TupleBinding(binders, initializer, span): resolve_tuple_binding(binders, initializer, span, block, context)
-		BindingStatement(binding): resolve_assignment(binding, block, context)
+		TupleBinding(binders, initializer, span): binders.resolve_tuple_binding(initializer, span, block, context)
+		BindingStatement(binding): binding.resolve_assignment(block, context)
 		PropagatingBinding(propagation): Err(checker_invariant(propagation.span, NestedPropagation))
-		WhileLoop(loop): resolve_while(loop, block, context)
-		ForLoop(loop): resolve_for(loop, block, context)
+		WhileLoop(loop): loop.resolve_while(block, context)
+		ForLoop(loop): loop.resolve_for(block, context)
 		Break(span): resolve_loop_control(BreakSourceLoop(span), span, block, context)
 		Continue(span): resolve_loop_control(ContinueSourceLoop(span), span, block, context)
 		ExpressionStatement(expression):
-			match resolve_value(block, expression, StatementValue, context):
+			match block.resolve_value(expression, StatementValue, context):
 				Ok(resolved):
 					Ok({ block |
 						lambdas = resolved.lambdas,
@@ -614,8 +605,8 @@ private pure func resolve_condition(
 	block: ResolvedStatements,
 	context: ResolutionContext,
 ) -> Result[ResolvedValue, CheckError]:
-	expected: TypeRef = NominalType(AggregateNominal(UnionAggregate(variant_owner(context.boolean.true_variant))), [])
-	resolve_value({ block | reassigned = [] }, written, ConditionValue(expected), context)
+	expected: TypeRef = NominalType(AggregateNominal(UnionAggregate(context.boolean.true_variant.variant_owner())), [])
+	{ block | reassigned = [] }.resolve_value(written, ConditionValue(expected), context)
 
 
 -- Statement blocks may finish without a value. A written final expression
@@ -625,7 +616,7 @@ private pure func resolve_statement_block(
 	block: ResolvedStatements,
 	context: ResolutionContext,
 ) -> Result[ResolvedStatements, CheckError]:
-	prefix ?= resolve_statements(written.statements, block, context)
+	prefix ?= written.statements.resolve_statements(block, context)
 	match written.value:
 		Some(value): resolve_statement(ExpressionStatement(value), prefix, context)
 		None: Ok(prefix)
@@ -644,8 +635,8 @@ private pure func resolve_if_branch(
 	context: ResolutionContext,
 ) -> Result[ResolvedIfBranch, CheckError]:
 	prefix ?= match expectation:
-		StatementValue | StatementArm: resolve_statement_block(written, block, context)
-		_: resolve_statements(written.statements, block, context)
+		StatementValue | StatementArm: written.resolve_statement_block(block, context)
+		_: written.statements.resolve_statements(block, context)
 	resolved: ResolvedValue ?= match expectation:
 		StatementValue | StatementArm:
 			Ok({
@@ -655,7 +646,7 @@ private pure func resolve_if_branch(
 			})
 		_:
 			match written.value:
-				Some(body): resolve_value(prefix, body, expectation, context)
+				Some(body): prefix.resolve_value(body, expectation, context)
 				None:
 					match expectation:
 						AbsentElseBranch(_):
@@ -680,7 +671,7 @@ private pure func resolve_if(
 	expectation: ValueExpectation,
 	context: ResolutionContext,
 ) -> Result[ResolvedValue, CheckError]:
-	condition ?= resolve_condition(written.condition, block, context)
+	condition ?= written.condition.resolve_condition(block, context)
 	entry: ResolvedStatements = {
 		lambdas = condition.lambdas,
 		bindings = condition.bindings, scope = block.scope,
@@ -689,7 +680,7 @@ private pure func resolve_if(
 	arm_expectation = match written.else_branch:
 		Some(_): expectation
 		None: AbsentElseBranch(written.span)
-	selected ?= resolve_if_branch(written.then_block, entry, arm_expectation, context)
+	selected ?= written.then_block.resolve_if_branch(entry, arm_expectation, context)
 	next_expectation: ValueExpectation = match expectation:
 		UntypedValue: CheckedAgainst(selected.value.value_type, FirstIfBranchValue)
 		_: expectation
@@ -699,9 +690,9 @@ private pure func resolve_if(
 			Ok({ block = other_entry, value = { form = LiteralVoid, value_type = VoidType, span = written.span } })
 		Some(branch):
 			match branch:
-				ElseBlock(body): resolve_if_branch(body, other_entry, next_expectation, context)
+				ElseBlock(body): body.resolve_if_branch(other_entry, next_expectation, context)
 				ElseIf(body):
-					match resolve_if(body, other_entry, next_expectation, context):
+					match body.resolve_if(other_entry, next_expectation, context):
 						Err(error): Err(error)
 						Ok(resolved):
 							Ok({
@@ -729,7 +720,7 @@ private pure func resolve_if(
 						Err(value_error(written.span, ExpressionTypeMismatch({ expected = expected, actual = { value_type = VoidType, span = written.span }, expected_site = site })))
 				ConditionValue(_): Err(statement_error(written.span, NonBooleanCondition(VoidType)))
 				_: Ok(void)
-	carried = carried_bindings(block, condition.reassigned.concat(selected.block.reassigned).concat(other.block.reassigned))
+	carried = block.carried_bindings(condition.reassigned.concat(selected.block.reassigned).concat(other.block.reassigned))
 	matched_selection ?= Patterns.union_selection([
 		{ arm = match_arm_id(0), variant = context.boolean.true_variant, fields = [], arguments = [] },
 		{ arm = match_arm_id(1), variant = context.boolean.false_variant, fields = [], arguments = [] },
@@ -768,13 +759,13 @@ private pure func resolve_while(
 	context: ResolutionContext,
 ) -> Result[ResolvedStatements, CheckError]:
 	inside = { context | in_source_loop = True }
-	condition ?= resolve_condition(written.condition, block, inside)
-	body ?= resolve_statement_block(written.body, {
+	condition ?= written.condition.resolve_condition(block, inside)
+	body ?= written.body.resolve_statement_block({
 		lambdas = condition.lambdas,
 		bindings = condition.bindings, scope = block.scope,
 		statements = [], reassigned = [],
 	}, inside)
-	carried = carried_bindings(block, condition.reassigned.concat(body.reassigned))
+	carried = block.carried_bindings(condition.reassigned.concat(body.reassigned))
 	Ok({ block |
 		lambdas = body.lambdas,
 		bindings = body.bindings,
@@ -806,10 +797,10 @@ private pure func resolve_iteration(
 	match written.base:
 		RangeExpression(start, end):
 			if written.applications.is_empty():
-				resolve_range_iteration(start, end, block, context)
+				start.resolve_range_iteration(end, block, context)
 			else:
-				resolve_list_iteration(written, block, context)
-		_: resolve_list_iteration(written, block, context)
+				written.resolve_list_iteration(block, context)
+		_: written.resolve_list_iteration(block, context)
 
 
 private pure func resolve_range_iteration(
@@ -818,9 +809,9 @@ private pure func resolve_range_iteration(
 	block: ResolvedStatements,
 	context: ResolutionContext,
 ) -> Result[ResolvedIteration, CheckError]:
-	first ?= resolve_value(block, start, CheckedAgainst(IntType, ForRangeBound), context)
+	first ?= block.resolve_value(start, CheckedAgainst(IntType, ForRangeBound), context)
 	previous = { block | lambdas = first.lambdas, bindings = first.bindings, reassigned = first.reassigned }
-	last ?= resolve_value(previous, end, CheckedAgainst(IntType, ForRangeBound), context)
+	last ?= previous.resolve_value(end, CheckedAgainst(IntType, ForRangeBound), context)
 	Ok({
 		iteration = AscendingIntRange(first.value, last.value, context.boolean),
 		element = IntType,
@@ -833,7 +824,7 @@ private pure func resolve_list_iteration(
 	block: ResolvedStatements,
 	context: ResolutionContext,
 ) -> Result[ResolvedIteration, CheckError]:
-	resolved ?= resolve_value(block, written, UntypedValue, context)
+	resolved ?= block.resolve_value(written, UntypedValue, context)
 	match resolved.value.value_type:
 		ListType(element):
 			Ok({
@@ -870,7 +861,7 @@ private pure func bind_for_item(
 				value_type = element,
 				span = name.span,
 			}
-			match bind_local(block.scope, context.namespace, context.module, context.caller.body, name, id, definition):
+			match block.scope.bind_local(context.namespace, context.module, context.caller.body, name, id, definition):
 				Err(error): Err(error)
 				Ok(binding):
 					Ok({
@@ -908,7 +899,7 @@ private pure func bind_tuple_elements(
 					Some(value_type):
 						id = binding_id(resolved.bindings.length())
 						definition: BindingDefinition = { origin = BodyLocal, mutable = False, value_type = value_type, span = name.span }
-						match bind_local(resolved.scope, context.namespace, context.module, context.caller.body, name, id, definition):
+						match resolved.scope.bind_local(context.namespace, context.module, context.caller.body, name, id, definition):
 							Err(error): failure = Some(error)
 							Ok(binding):
 								projection: CheckedExpr = { form = ReadTupleElement(subject, position), value_type = value_type, span = name.span }
@@ -929,12 +920,12 @@ private pure func resolve_tuple_binding(
 	binders: List[ParsedBinder], initializer: ValueExpression, span: Span,
 	block: ResolvedStatements, context: ResolutionContext,
 ) -> Result[ResolvedStatements, CheckError]:
-	resolved ?= resolve_value(block, initializer, UntypedValue, context)
-	fields ?= tuple_binder_types(binders, resolved.value.value_type, span)
+	resolved ?= block.resolve_value(initializer, UntypedValue, context)
+	fields ?= binders.tuple_binder_types(resolved.value.value_type, span)
 	id = binding_id(resolved.bindings.length())
 	definition: BindingDefinition = { origin = BodyLocal, mutable = False, value_type = resolved.value.value_type, span = initializer.span }
 	subject: CheckedExpr = { form = ReadBinding(id), value_type = resolved.value.value_type, span = initializer.span }
-	bind_tuple_elements(binders, fields, subject, {
+	binders.bind_tuple_elements(fields, subject, {
 		lambdas = resolved.lambdas,
 		bindings = resolved.bindings.append(definition), scope = block.scope,
 		statements = block.statements.append(InitializeBinding(id, resolved.value)),
@@ -947,19 +938,19 @@ private pure func bind_for_binder(
 	block: ResolvedStatements, context: ResolutionContext,
 ) -> Result[ForItemScope, CheckError]:
 	match binder:
-		SingleForBinder(single): bind_for_item(single, element, block, context)
-		TupleForBinder(binders, span): bind_tuple_for_item(binders, span, element, block, context)
+		SingleForBinder(single): single.bind_for_item(element, block, context)
+		TupleForBinder(binders, span): binders.bind_tuple_for_item(span, element, block, context)
 
 
 private pure func bind_tuple_for_item(
 	binders: List[ParsedBinder], span: Span, element: TypeRef,
 	block: ResolvedStatements, context: ResolutionContext,
 ) -> Result[ForItemScope, CheckError]:
-	fields ?= tuple_binder_types(binders, element, span)
+	fields ?= binders.tuple_binder_types(element, span)
 	id = binding_id(block.bindings.length())
 	definition: BindingDefinition = { origin = BodyLocal, mutable = False, value_type = element, span = span }
 	subject: CheckedExpr = { form = ReadBinding(id), value_type = element, span = span }
-	resolved ?= bind_tuple_elements(binders, fields, subject, { block | bindings = block.bindings.append(definition) }, context)
+	resolved ?= binders.bind_tuple_elements(fields, subject, { block | bindings = block.bindings.append(definition) }, context)
 	Ok({ item = Some(id), block = resolved })
 
 
@@ -968,12 +959,12 @@ private pure func resolve_for(
 	block: ResolvedStatements,
 	context: ResolutionContext,
 ) -> Result[ResolvedStatements, CheckError]:
-	iterated ?= resolve_iteration(written.iterable, block, context)
-	item ?= bind_for_binder(written.binder, iterated.element, {
+	iterated ?= written.iterable.resolve_iteration(block, context)
+	item ?= written.binder.bind_for_binder(iterated.element, {
 		iterated.block | statements = [], reassigned = [],
 	}, context)
-	body ?= resolve_statement_block(written.body, item.block, { context | in_source_loop = True })
-	carried = carried_bindings(iterated.block, body.reassigned)
+	body ?= written.body.resolve_statement_block(item.block, { context | in_source_loop = True })
+	carried = iterated.block.carried_bindings(body.reassigned)
 	Ok({ block |
 		lambdas = body.lambdas,
 		bindings = body.bindings,
@@ -998,10 +989,10 @@ private pure func resolve_initializer(
 	expectation: ValueExpectation ?= match written.annotation:
 		None: Ok(UntypedValue)
 		Some(annotation):
-			match resolve_body_type(context, annotation):
-				Ok(value_type): Ok(CheckedAgainst(value_type, SourceAnnotation(type_span(annotation))))
+			match context.resolve_body_type(annotation):
+				Ok(value_type): Ok(CheckedAgainst(value_type, SourceAnnotation(annotation.type_span())))
 				Err(error): Err(error)
-	resolve_value(block, written.initializer, expectation, context)
+	block.resolve_value(written.initializer, expectation, context)
 
 
 private pure func resolve_assignment(
@@ -1017,39 +1008,39 @@ private pure func resolve_assignment(
 			if written.mutable:
 				Ok(None)
 			else:
-				match lookup_binding(block.scope, written.name.id):
+				match block.scope.lookup_binding(written.name.id):
 					None: Ok(None)
 					Some(CallableLocal(binding)):
-						match callable_parameter_contract(binding):
+						match binding.callable_parameter_contract():
 							Err(error): Err(error)
 							Ok(accepted): Err(statement_error(written.name.span, CallableAssignment(accepted.parameter)))
 					Some(DataLocal(binding)):
-						if binding_site(binding).binding.owner != context.caller.body:
-							Err(statement_error(written.name.span, CapturedAssignment(binding_site(binding).binding)))
+						if binding.binding_site().binding.owner != context.caller.body:
+							Err(statement_error(written.name.span, CapturedAssignment(binding.binding_site().binding)))
 						else:
-							if binding_definition(binding).mutable:
+							if binding.binding_definition().mutable:
 								Ok(Some(binding))
 							else:
-								Err(statement_error(written.name.span, ImmutableAssignment(binding_site(binding))))
+								Err(statement_error(written.name.span, ImmutableAssignment(binding.binding_site())))
 
 	reassign ?= decision
 
 	match reassign:
 		Some(binding):
-			site: ExpectedTypeSite = InferredBindingDeclaration(binding_site(binding))
-			match resolve_value(block, written.initializer, CheckedAgainst(binding_definition(binding).value_type, site), context):
+			site: ExpectedTypeSite = InferredBindingDeclaration(binding.binding_site())
+			match block.resolve_value(written.initializer, CheckedAgainst(binding.binding_definition().value_type, site), context):
 				Ok(resolved):
 					Ok(
 						{ block |
 							lambdas = resolved.lambdas,
 							bindings = resolved.bindings,
-							statements = block.statements.append(ReassignBinding(local_binding_id(binding), resolved.value)),
-							reassigned = resolved.reassigned.append(local_binding_id(binding))
+							statements = block.statements.append(ReassignBinding(binding.local_binding_id(), resolved.value)),
+							reassigned = resolved.reassigned.append(binding.local_binding_id())
 						},
 					)
 				Err(error): Err(error)
 		None:
-			match resolve_initializer(written, block, context):
+			match written.resolve_initializer(block, context):
 				Ok(resolved):
 					value = resolved.value
 
@@ -1061,7 +1052,7 @@ private pure func resolve_assignment(
 					}
 					-- A match's arm captures and locals precede this binding's ordinal.
 					id = binding_id(resolved.bindings.length())
-					match bind_local(block.scope, context.namespace, context.module, context.caller.body, written.name, id, definition):
+					match block.scope.bind_local(context.namespace, context.module, context.caller.body, written.name, id, definition):
 						Err(error): Err(error)
 						Ok(binding):
 							Ok({
@@ -1084,7 +1075,7 @@ private pure func resolve_body(
 	tail_decision: Result[Void, CheckError] = match accepted.declaration.tail_annotation:
 		None: Ok(void)
 		Some(annotation):
-			if has_callable_parameters(signature):
+			if signature.has_callable_parameters():
 				if signature.type_parameters.is_empty():
 					Err(recursion_error(annotation, CallableTailRecursionUnsupported))
 				else:
@@ -1092,14 +1083,14 @@ private pure func resolve_body(
 			else:
 				Ok(void)
 	tail_contract ?= tail_decision
-	initial ?= parameter_scope(accepted.declaration.parameters, signature.parameters, [], context)
+	initial ?= accepted.declaration.parameters.parameter_scope(signature.parameters, [], context)
 	var parameter_bindings: List[BindingDefinition] = []
 	for binding in initial:
 		match binding:
 			DataLocal(data):
-				definition = binding_definition(data)
+				definition = data.binding_definition()
 				parameter_bindings = parameter_bindings.append(definition)
-			CallableLocal(callable): parameter_bindings = parameter_bindings.append(binding_definition(callable_local(callable)))
+			CallableLocal(callable): parameter_bindings = parameter_bindings.append(callable.callable_local().binding_definition())
 	block: ResolvedStatements = {
 		lambdas = lambdas,
 		bindings = parameter_bindings,
@@ -1107,7 +1098,7 @@ private pure func resolve_body(
 		statements = [],
 		reassigned = []
 	}
-	resolve_function_prefix(accepted, 0, block, initial, result, context)
+	accepted.resolve_function_prefix(0, block, initial, result, context)
 
 
 -- Ordinary functions keep their existing tail-body form. Only a propagation
@@ -1121,11 +1112,11 @@ private pure func resolve_function_prefix(
 	context: ResolutionContext,
 ) -> Result[ResolvedBody, CheckError]:
 	match accepted.declaration.statements.get(position):
-		None: finish_body(accepted, block, initial, context)
+		None: accepted.finish_body(block, initial, context)
 		Some(statement):
 			match statement:
 				PropagatingBinding(written):
-					match resolve_propagation(accepted, position, block, initial, written, result, context):
+					match accepted.resolve_propagation(position, block, initial, written, result, context):
 						Err(error): Err(error)
 						Ok(value):
 							match accepted.declaration.tail_annotation:
@@ -1142,9 +1133,9 @@ private pure func resolve_function_prefix(
 										body = CheckedValueBody(ReturnExpression(value.value))
 									})
 				_:
-					match resolve_statement(statement, block, context):
+					match statement.resolve_statement(block, context):
 						Ok(next):
-							resolve_function_prefix(accepted, position + 1, next, initial, result, context)
+							accepted.resolve_function_prefix(position + 1, next, initial, result, context)
 						Err(error): Err(error)
 
 
@@ -1162,10 +1153,10 @@ private pure func finish_body(
 				lambdas = prefix.lambdas,
 				bindings = prefix.bindings,
 				statements = prefix.statements,
-				body = CheckedValueBody(ReturnExpression(builtin_value(signature, initial, operation, span))),
+				body = CheckedValueBody(ReturnExpression(signature.builtin_value(initial, operation, span))),
 			})
 		ValueBody(body):
-			match resolve_value(prefix, body, return_expectation(signature.return_type), context):
+			match prefix.resolve_value(body, signature.return_type.return_expectation(), context):
 				Ok(value):
 					Ok({
 						lambdas = value.lambdas,
@@ -1175,8 +1166,7 @@ private pure func finish_body(
 					})
 				Err(error): Err(error)
 		MatchBody(body):
-			match resolve_match(
-				signature.return_type,
+			match signature.return_type.resolve_match(
 				prefix.scope,
 				body,
 				prefix.bindings,
@@ -1224,9 +1214,9 @@ private pure func builtin_value(
 	for binding in initial:
 		match binding:
 			DataLocal(data):
-				definition = binding_definition(data)
+				definition = data.binding_definition()
 				operands = operands.append(ValueOperand({
-					form = ReadBinding(local_binding_id(data)),
+					form = ReadBinding(data.local_binding_id()),
 					value_type = definition.value_type,
 					span = definition.span
 				}))
@@ -1259,21 +1249,21 @@ private pure func resolve_result_prefix(
 		Some(statement):
 			match statement:
 				PropagatingBinding(written):
-					resolve_propagation(accepted, position, block, initial, written, result, context)
+					accepted.resolve_propagation(position, block, initial, written, result, context)
 				_:
-					match resolve_statement(statement, block, context):
+					match statement.resolve_statement(block, context):
 						Ok(next):
-							resolve_result_prefix(accepted, position + 1, next, initial, result, context)
+							accepted.resolve_result_prefix(position + 1, next, initial, result, context)
 						Err(error): Err(error)
 		None:
 			value: Result[ResolvedValue, CheckError] = match accepted.body:
 				ValueBody(body):
-					resolve_value(block, body, return_expectation(accepted.signature.return_type), context)
+					block.resolve_value(body, accepted.signature.return_type.return_expectation(), context)
 				MatchBody(body):
-					resolve_join(block, body, return_expectation(accepted.signature.return_type), context)
+					block.resolve_join(body, accepted.signature.return_type.return_expectation(), context)
 				BuiltinBody(operation, span):
 					Ok({
-						value = builtin_value(accepted.signature, initial, operation, span),
+						value = accepted.signature.builtin_value(initial, operation, span),
 						lambdas = block.lambdas,
 						bindings = block.bindings,
 						reassigned = block.reassigned
@@ -1300,9 +1290,9 @@ private pure func result_payloads(
 	value: TypeRef,
 	result: DesignatedResult[VariantId],
 ) -> Option[ResultPayloads]:
-	match union_occurrence(value):
+	match value.union_occurrence():
 		Some(occurrence):
-			if occurrence.owner == variant_owner(result.ok):
+			if occurrence.owner == result.ok.variant_owner():
 				match occurrence.arguments.get(0):
 					Some(success_type):
 						match occurrence.arguments.get(1):
@@ -1324,14 +1314,14 @@ private pure func propagation_source(
 	expectation: ValueExpectation ?= match written.annotation:
 		None: Ok(UntypedValue)
 		Some(annotation):
-			match resolve_body_type(context, annotation):
+			match context.resolve_body_type(annotation):
 				Ok(value):
 					Ok(CheckedAgainst(
-						NominalType(AggregateNominal(UnionAggregate(variant_owner(result.ok))), [value, error_type]),
-						SourceAnnotation(type_span(annotation)),
+						NominalType(AggregateNominal(UnionAggregate(result.ok.variant_owner())), [value, error_type]),
+						SourceAnnotation(annotation.type_span()),
 					))
 				Err(error): Err(error)
-	resolve_value(block, written.value, expectation, context)
+	block.resolve_value(written.value, expectation, context)
 
 
 private pure func resolve_propagation(
@@ -1344,17 +1334,17 @@ private pure func resolve_propagation(
 	context: ResolutionContext,
 ) -> Result[ResolvedFunctionValue, CheckError]:
 	returned = accepted.signature.return_type
-	error_type: TypeRef ?= match result_payloads(returned.value_type, result):
+	error_type: TypeRef ?= match returned.value_type.result_payloads(result):
 		Some(payloads): Ok(payloads.error)
 		_: Err(statement_error(written.span, PropagationNeedsResultReturn(returned.value_type)))
-	source ?= propagation_source(written, block, error_type, result, context)
-	success_type: TypeRef ?= match result_payloads(source.value.value_type, result):
+	source ?= written.propagation_source(block, error_type, result, context)
+	success_type: TypeRef ?= match source.value.value_type.result_payloads(result):
 		Some(payloads):
 			if payloads.error == error_type:
 				Ok(payloads.value)
 			else:
 				Err(value_error(written.value.span, ExpressionTypeMismatch({
-					expected = NominalType(AggregateNominal(UnionAggregate(variant_owner(result.ok))), [payloads.value, error_type]),
+					expected = NominalType(AggregateNominal(UnionAggregate(result.ok.variant_owner())), [payloads.value, error_type]),
 					actual = { value_type = source.value.value_type, span = source.value.span },
 					expected_site = SourceAnnotation(returned.span)
 				})))
@@ -1383,11 +1373,10 @@ private pure func resolve_propagation(
 	scope: List[ScopedValue] ?= match written.binder:
 		DiscardBinder(_): Ok(block.scope)
 		NamedBinder(name):
-			match bind_local(block.scope, context.namespace, context.module, context.caller.body, name, success, definition):
+			match block.scope.bind_local(context.namespace, context.module, context.caller.body, name, success, definition):
 				Ok(binding): Ok([binding].concat(block.scope))
 				Err(error): Err(error)
-	continuation ?= resolve_result_prefix(
-		accepted,
+	continuation ?= accepted.resolve_result_prefix(
 		position + 1,
 		{
 			lambdas = source.lambdas,
@@ -1473,7 +1462,7 @@ pure func resolve_functions(
 		match functions.get(checked.length()):
 			None: break
 			Some(accepted):
-				match receivers.get(module_number(accepted.body_types.module)):
+				match receivers.get(accepted.body_types.module.module_number()):
 					None: failure = Some(checker_invariant(accepted.declaration.function_name.span, InvalidReceiverScope))
 					Some(receiver_scope):
 						id = accepted.id
@@ -1499,15 +1488,15 @@ pure func resolve_functions(
 							in_source_loop = False,
 						}
 						signature = accepted.signature
-						match resolve_body(accepted, result, context, lambdas):
+						match accepted.resolve_body(result, context, lambdas):
 							Ok(body):
-								match check_execution(accepted.declaration, accepted.signature.type_parameters, body.statements, body.body, id, accepted_traits(traits)):
+								match accepted.declaration.check_execution(accepted.signature.type_parameters, body.statements, body.body, id, traits.accepted_traits()):
 									Ok(execution):
 
 										executed: ResolvedBody = { body | body = execution.body }
 
 										published = if signature.return_type.value_type == VoidType:
-											normalize_void_body(executed)
+											executed.normalize_void_body()
 										else:
 											executed
 
@@ -1526,7 +1515,7 @@ pure func resolve_functions(
 	match failure:
 		Some(error): Err(error)
 		None:
-			match seal_lambda_rows(lambdas):
+			match lambdas.seal_lambda_rows():
 				Ok(rows): Ok({ functions = checked, lambdas = rows })
 				Err(error): Err(error)
 
@@ -1548,7 +1537,7 @@ private pure func normalize_void_exit(
 				exit = exit
 			}
 		ReturnExpression(value):
-			discarded = discard_tail_value(statements, value)
+			discarded = statements.discard_tail_value(value)
 			{
 				statements = discarded.statements,
 				exit = ReturnExpression(discarded.value)
@@ -1570,7 +1559,7 @@ private pure func discard_tail_value(statements: List[CheckedStatement], value: 
 			{ statements = statements, value = value }
 		_:
 			{
-				statements = statements.append(DiscardExpression(discard_arm_values(value))),
+				statements = statements.append(DiscardExpression(value.discard_arm_values())),
 				value = { form = LiteralVoid, value_type = VoidType, span = value.span }
 			}
 
@@ -1580,7 +1569,7 @@ private pure func discard_arm_values(value: CheckedExpr) -> CheckedExpr:
 		Match(join):
 			var arms: List[CheckedJoinArm] = []
 			for arm in join.arms:
-				discarded = discard_tail_value(arm.statements, arm.value)
+				discarded = arm.statements.discard_tail_value(arm.value)
 				arms = arms.append({ arm | statements = discarded.statements, value = discarded.value })
 			{ value | form = Match({ join | arms = arms }) }
 		_:
@@ -1591,14 +1580,14 @@ private pure func discard_arm_values(value: CheckedExpr) -> CheckedExpr:
 private pure func normalize_void_body(resolved: ResolvedBody) -> ResolvedBody:
 	match resolved.body:
 		CheckedValueBody(exit):
-			normalized = normalize_void_exit(resolved.statements, exit)
+			normalized = resolved.statements.normalize_void_exit(exit)
 			{ resolved |
 				statements = normalized.statements,
 				body = CheckedValueBody(normalized.exit)
 			}
 		CheckedMatchBody(matched):
 			arms = matched.arms.map(pure func(arm: CheckedArm) -> CheckedArm:
-				normalized = normalize_void_exit(arm.statements, arm.body)
+				normalized = arm.statements.normalize_void_exit(arm.body)
 				{ arm |
 					statements = normalized.statements,
 					body = normalized.exit
@@ -1628,16 +1617,16 @@ pure func resolve_lambda_block(
 	scope: List[ScopedValue], parameters: List[BindingDefinition], block: ParsedBlock,
 	result: TypeUse, context: ResolutionContext, lambdas: List[LambdaRow],
 ) -> Result[ResolvedBody, CheckError]:
-	prefix ?= resolve_statements(block.statements, {
+	prefix ?= block.statements.resolve_statements({
 		bindings = parameters, scope = scope, statements = [], reassigned = [], lambdas = lambdas
 	}, context)
 	written: ValueExpression = block.value.get_or({ base = VoidExpression, base_span = block.span, applications = [], span = block.span })
-	value ?= resolve_value(prefix, written, return_expectation(result), context)
+	value ?= prefix.resolve_value(written, result.return_expectation(), context)
 	resolved: ResolvedBody = {
 		bindings = value.bindings, statements = prefix.statements,
 		body = CheckedValueBody(ReturnExpression(value.value)), lambdas = value.lambdas
 	}
 	if result.value_type == VoidType:
-		Ok(normalize_void_body(resolved))
+		Ok(resolved.normalize_void_body())
 	else:
 		Ok(resolved)

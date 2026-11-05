@@ -1,6 +1,6 @@
 import:
 	result: Result methods
-	bool: not, and, or
+	bool: Bool methods
 	../namespace/builtins as Builtins:
 		DesignatedBoolean,
 		DesignatedOption,
@@ -16,15 +16,14 @@ import:
 		),
 		RuntimeType(PrimitiveRuntimeType, ElementRuntimeType, ListRuntimeType, StringListRuntimeType),
 		RuntimeResult(ValueResult, OptionalResult, ResultResult, BooleanResult),
-		runtime_contract,
-	../check/check: CheckedProgram, checked_functions
-	../check/model as Checked
+	../check/check: CheckedProgram
+	../check/model as Checked: AcceptedMethodCall, AcceptedTraits, AggregateId, BindingId, CaptureId, FieldId, LambdaId, TypeParameterId
 	../check/declarations as Declarations
-	../utils/ids as Declaration
+	../utils/ids as Declaration: FunctionId, OpaqueId, RecordId, UnionId, VariantId
 	dict as D
 	int: Int methods
 	option: Option methods
-	../utils/source: FunctionLabel, lambda_label
+	../utils/source: FunctionLabel
 	../utils/syntax:
 		Diagnostic,
 		DiagnosticNote(UnionPayloadDeclaration),
@@ -32,7 +31,6 @@ import:
 		FunctionExecution(OrdinaryCalls, SelfTailLoop),
 		Span,
 		compiler_span,
-		entry_function,
 		diagnostic,
 		internal_error,
 		or_internal_error,
@@ -80,8 +78,8 @@ pure func record_fields(layout: ConcreteRecord) -> List[TypeRef]:
 
 
 private union RecordOrigin:
-	DeclaredRecord(Declaration.RecordId)
-	CaptureEnvironment(Checked.LambdaId)
+	DeclaredRecord(RecordId)
+	CaptureEnvironment(LambdaId)
 	StructuralTuple
 
 
@@ -161,8 +159,8 @@ pure func variant_field(
 	unions: List[ConcreteUnion],
 	span: Span,
 ) -> Result[VariantFieldInstanceId, Diagnostic]:
-	layout ?= unions.get(union_number(variant_owner(id))).or_internal_error(span, "unknown variant owner")
-	fields ?= union_variants(layout).get(variant_number(id)).or_internal_error(span, "unknown variant identity")
+	layout ?= unions.get(id.variant_owner().union_number()).or_internal_error(span, "unknown variant owner")
+	fields ?= layout.union_variants().get(id.variant_number()).or_internal_error(span, "unknown variant identity")
 	valid ?= fields.get(position).or_internal_error(span, "unknown variant field")
 	Ok(into_opaque VariantFieldInstanceId({ variant = id, position = position }))
 
@@ -232,28 +230,28 @@ private pure func primitive_ref(value_type: PrimitiveType) -> TypeRef:
 
 pure func runtime_type_ref(value_type: Builtins.RuntimeType[TypeRef]) -> TypeRef:
 	match value_type:
-		PrimitiveRuntimeType(primitive): primitive_ref(primitive)
+		PrimitiveRuntimeType(primitive): primitive.primitive_ref()
 		ElementRuntimeType(element): element
 		ListRuntimeType(element): ListType(element)
 		StringListRuntimeType: ListType(StringType)
 
 
 pure func runtime_signature(operation: RuntimeOperation[VariantInstanceId, TypeRef]) -> FunctionSignature:
-	contract = runtime_contract(operation)
+	contract = operation.runtime_contract()
 
 	result = match contract.return_type:
 		ValueResult(value_type):
-			runtime_type_ref(value_type)
+			value_type.runtime_type_ref()
 		OptionalResult(_, option):
-			UnionType(variant_owner(option.some))
+			UnionType(option.some.variant_owner())
 		ResultResult(_, _, constructors):
-			UnionType(variant_owner(constructors.ok))
+			UnionType(constructors.ok.variant_owner())
 		BooleanResult(boolean):
-			UnionType(variant_owner(boolean.true_variant))
+			UnionType(boolean.true_variant.variant_owner())
 
 	{
 		parameters = contract.parameters.map(
-			pure func(parameter: Builtins.RuntimeType[TypeRef]) -> TypeRef: runtime_type_ref(parameter),
+			pure func(parameter: Builtins.RuntimeType[TypeRef]) -> TypeRef: parameter.runtime_type_ref(),
 		),
 		return_type = result
 	}
@@ -283,7 +281,7 @@ union ConcreteForm:
 	LiteralInteger(Int)
 	LiteralFloat(Float)
 	LiteralString(String)
-	ReadBinding(Checked.BindingId)
+	ReadBinding(BindingId)
 	ConstructVariant(VariantInstanceId, List[ConcreteExpr])
 	ConstructRecord(RecordInstanceId, List[ConcreteRecordField])
 	ConstructList(List[ConcreteExpr])
@@ -307,8 +305,8 @@ record ConcreteExpr {
 
 
 union ConcreteStatement:
-	InitializeBinding(Checked.BindingId, ConcreteExpr)
-	ReassignBinding(Checked.BindingId, ConcreteExpr)
+	InitializeBinding(BindingId, ConcreteExpr)
+	ReassignBinding(BindingId, ConcreteExpr)
 	DiscardExpression(ConcreteExpr)
 	RunWhile(ConcreteWhile)
 	RunFor(ConcreteFor)
@@ -319,7 +317,7 @@ union ConcreteStatement:
 record ConcreteWhile {
 	condition: ConcreteExpr,
 	body: List[ConcreteStatement],
-	carried: List[Checked.BindingId],
+	carried: List[BindingId],
 	boolean: DesignatedBoolean[VariantInstanceId],
 	span: Span
 }
@@ -332,9 +330,9 @@ union ConcreteIteration:
 
 record ConcreteFor {
 	iteration: ConcreteIteration,
-	item: Option[Checked.BindingId],
+	item: Option[BindingId],
 	body: List[ConcreteStatement],
-	carried: List[Checked.BindingId],
+	carried: List[BindingId],
 	span: Span
 }
 
@@ -372,7 +370,7 @@ record ConcreteSelection {
 
 record ConcreteArm {
 	id: Checked.MatchArmId,
-	inputs: List[Checked.BindingId],
+	inputs: List[BindingId],
 	statements: List[ConcreteStatement],
 	body: ConcreteExit
 }
@@ -393,7 +391,7 @@ union ConcreteExit:
 -- An arm of a bound or statement match, yielding `value` to the join.
 record ConcreteJoinArm {
 	id: Checked.MatchArmId,
-	inputs: List[Checked.BindingId],
+	inputs: List[BindingId],
 	statements: List[ConcreteStatement],
 	value: ConcreteExpr
 }
@@ -403,7 +401,7 @@ record ConcreteJoin {
 	scrutinee: ConcreteExpr,
 	selection: ConcreteSelection,
 	arms: List[ConcreteJoinArm],
-	carried: List[Checked.BindingId]
+	carried: List[BindingId]
 }
 
 
@@ -501,7 +499,7 @@ private record InstanceKey {
 
 -- A declaration parameter and its physical replacement while layouts are prepared.
 private record TypeSubstitution[T] {
-	parameter: Checked.TypeParameterId,
+	parameter: TypeParameterId,
 	value_type: T
 }
 
@@ -527,7 +525,7 @@ pure func value_needs_ownership(
 		StringType | ListType(_) | CallableType(_, _):
 			Ok(True)
 		RecordType(id):
-			match records.get(record_number(id)):
+			match records.get(id.record_number()):
 				None:
 					Err(internal_error(compiler_span(), "invalid record identity in ownership representation"))
 				Some(declaration):
@@ -535,7 +533,7 @@ pure func value_needs_ownership(
 						InlineFields(_): Ok(False)
 						ValueFields(_) | CountedFields(_): Ok(True)
 		UnionType(id):
-			match unions.get(union_number(id)):
+			match unions.get(id.union_number()):
 				None:
 					Err(internal_error(compiler_span(), "invalid union identity in ownership representation"))
 				Some(declaration):
@@ -564,7 +562,7 @@ private pure func empty_indexed_list[T]() -> IndexedList[T]:
 private pure func append_entry[T](table: IndexedList[T], entry: T, digest: Int) -> IndexedList[T]:
 	{
 		entries = table.entries.append(entry),
-		positions = table.positions.set(digest, candidate_positions(table, digest).append(table.entries.length())),
+		positions = table.positions.set(digest, table.candidate_positions(digest).append(table.entries.length())),
 	}
 
 
@@ -584,7 +582,7 @@ private pure func find_position[T](
 ) -> Result[Option[Int], Int]:
 	var outcome: Result[Option[Int], Int] = Ok(None)
 
-	for position in candidate_positions(table, digest):
+	for position in table.candidate_positions(digest):
 		match table.entries.get(position):
 			Some(entry):
 				if matches(entry):
@@ -608,8 +606,8 @@ private TUPLE_DIGEST_BASE: Int = -1
 -- the full key then decides. Equality also compares the argument count.
 private pure func record_digest(origin: RecordOrigin, argument_count: Int) -> Int:
 	match origin:
-		DeclaredRecord(id): Declaration.record_number(id)
-		CaptureEnvironment(id): Checked.lambda_number(id)
+		DeclaredRecord(id): id.record_number()
+		CaptureEnvironment(id): id.lambda_number()
 		StructuralTuple: TUPLE_DIGEST_BASE - argument_count
 
 
@@ -658,21 +656,21 @@ implements Hashable for TypeRef:
 			StringType: STRING_TYPE_HASH
 			ListType(element): tagged_hash(LIST_TYPE_HASH, element.hash())
 			CallableType(parameters, result): D.combine_hash(tagged_hash(CALLABLE_TYPE_HASH, parameters.hash()), result.hash())
-			RecordType(id): tagged_hash(RECORD_TYPE_HASH, record_number(id))
-			UnionType(id): tagged_hash(UNION_TYPE_HASH, union_number(id))
+			RecordType(id): tagged_hash(RECORD_TYPE_HASH, id.record_number())
+			UnionType(id): tagged_hash(UNION_TYPE_HASH, id.union_number())
 
 
 implements Hashable for RecordOrigin:
 	pure func hash(value: Self) -> Int:
 		match value:
-			DeclaredRecord(id): tagged_hash(DECLARED_RECORD_HASH, Declaration.record_number(id))
-			CaptureEnvironment(id): tagged_hash(CAPTURE_ENVIRONMENT_HASH, Checked.lambda_number(id))
+			DeclaredRecord(id): tagged_hash(DECLARED_RECORD_HASH, id.record_number())
+			CaptureEnvironment(id): tagged_hash(CAPTURE_ENVIRONMENT_HASH, id.lambda_number())
 			StructuralTuple: STRUCTURAL_TUPLE_HASH
 
 
 implements Hashable for UnionKey:
 	pure func hash(value: Self) -> Int:
-		tagged_hash(Declaration.union_number(value.declaration), value.arguments.hash())
+		tagged_hash(value.declaration.union_number(), value.arguments.hash())
 
 
 implements D.DictKey for UnionKey
@@ -701,11 +699,11 @@ implements D.DictKey for RecordKey
 private pure func slot_union_digest(
 	key: PartialUnionKey, unions: IndexedList[UnionSlot], records: IndexedList[RecordSlot], span: Span,
 ) -> Result[Int, Diagnostic]:
-	var digest = D.combine_hash(0, Declaration.union_number(key.declaration))
+	var digest = D.combine_hash(0, key.declaration.union_number())
 	var failure: Option[Diagnostic] = None
 
 	for argument in key.arguments:
-		match partial_head_digest(argument, unions, records, span):
+		match argument.partial_head_digest(unions, records, span):
 			Ok(head): digest = D.combine_hash(digest, head)
 			Err(error):
 				failure = Some(error)
@@ -723,9 +721,9 @@ private pure func partial_head_digest(
 	value: PartialType, unions: IndexedList[UnionSlot], records: IndexedList[RecordSlot], span: Span,
 ) -> Result[Int, Diagnostic]:
 	match value:
-		KnownType(known): known_head_digest(known, unions, records, span)
-		PendingUnionType(key): Ok(union_head_digest(key.declaration))
-		PendingRecordType(key): Ok(record_head_digest(key.origin, key.arguments.length()))
+		KnownType(known): known.known_head_digest(unions, records, span)
+		PendingUnionType(key): Ok(key.declaration.union_head_digest())
+		PendingRecordType(key): Ok(key.origin.record_head_digest(key.arguments.length()))
 		PendingListType(_): Ok(LIST_TYPE_HASH)
 		PendingCallable(_, _): Ok(CALLABLE_TYPE_HASH)
 
@@ -741,23 +739,23 @@ private pure func known_head_digest(
 		ListType(_): Ok(LIST_TYPE_HASH)
 		CallableType(_, _): Ok(CALLABLE_TYPE_HASH)
 		RecordType(id):
-			match records.entries.get(record_number(id)):
-				Some(CompleteRecord(instance)): Ok(record_head_digest(instance.key.origin, instance.key.arguments.length()))
-				Some(PendingRecord(instance)): Ok(record_head_digest(instance.key.origin, instance.key.arguments.length()))
+			match records.entries.get(id.record_number()):
+				Some(CompleteRecord(instance)): Ok(instance.key.origin.record_head_digest(instance.key.arguments.length()))
+				Some(PendingRecord(instance)): Ok(instance.key.origin.record_head_digest(instance.key.arguments.length()))
 				None: Err(internal_error(span, "record argument names a missing slot"))
 		UnionType(id):
-			match unions.entries.get(union_number(id)):
-				Some(CompleteUnion(instance)): Ok(union_head_digest(instance.key.declaration))
-				Some(PendingUnion(instance)): Ok(union_head_digest(instance.key.declaration))
+			match unions.entries.get(id.union_number()):
+				Some(CompleteUnion(instance)): Ok(instance.key.declaration.union_head_digest())
+				Some(PendingUnion(instance)): Ok(instance.key.declaration.union_head_digest())
 				None: Err(internal_error(span, "union argument names a missing slot"))
 
 
 private pure func record_head_digest(origin: RecordOrigin, argument_count: Int) -> Int:
-	tagged_hash(RECORD_TYPE_HASH, record_digest(origin, argument_count))
+	tagged_hash(RECORD_TYPE_HASH, origin.record_digest(argument_count))
 
 
-private pure func union_head_digest(declaration: Declaration.UnionId) -> Int:
-	tagged_hash(UNION_TYPE_HASH, Declaration.union_number(declaration))
+private pure func union_head_digest(declaration: UnionId) -> Int:
+	tagged_hash(UNION_TYPE_HASH, declaration.union_number())
 
 
 -- The position of the entry under `digest` that `matches`. An index naming a
@@ -765,42 +763,42 @@ private pure func union_head_digest(declaration: Declaration.UnionId) -> Int:
 private pure func indexed_position[T](
 	table: IndexedList[T], digest: Int, span: Span, matches: pure (T) -> Bool,
 ) -> Result[Option[Int], Diagnostic]:
-	match find_position(table, digest, matches):
+	match table.find_position(digest, matches):
 		Ok(found): Ok(found)
 		Err(_): Err(internal_error(span, "specialization index names a missing instance"))
 
 
 private pure func concrete_record_field_type(
-	field: Checked.FieldId,
+	field: FieldId,
 	owner: RecordInstanceId,
 	records: SealedRecords,
 	span: Span,
 ) -> Result[TypeRef, Diagnostic]:
-	key ?= records.ids.keys().get(record_number(owner)).or_internal_error(span, "unknown concrete record")
-	layout ?= records.layouts.get(record_number(owner)).or_internal_error(span, "unknown concrete record")
-	_: Void ?= if key.origin == DeclaredRecord(Checked.field_owner(field)):
+	key ?= records.ids.keys().get(owner.record_number()).or_internal_error(span, "unknown concrete record")
+	layout ?= records.layouts.get(owner.record_number()).or_internal_error(span, "unknown concrete record")
+	_: Void ?= if key.origin == DeclaredRecord(field.field_owner()):
 		Ok(void)
 	else:
 		Err(internal_error(span, "field declaration differs from concrete record"))
-	record_fields(layout)
-		.get(Checked.field_number(field))
+	layout.record_fields()
+		.get(field.field_number())
 		.or_internal_error(span, "unknown record field")
 
 
 private pure func translate_field(
-	field: Checked.FieldId,
+	field: FieldId,
 	owner: RecordInstanceId,
 	records: SealedRecords,
 	span: Span,
 ) -> Result[FieldInstanceId, Diagnostic]:
-	valid ?= concrete_record_field_type(field, owner, records, span)
-	Ok(into_opaque FieldInstanceId({ owner = owner, position = Checked.field_number(field) }))
+	valid ?= field.concrete_record_field_type(owner, records, span)
+	Ok(into_opaque FieldInstanceId({ owner = owner, position = field.field_number() }))
 
 
 -- The prepared instance of a record declaration at these checked type arguments.
 private pure func concrete_record(
 	opaques: List[Checked.CheckedOpaque],
-	declaration: Declaration.RecordId,
+	declaration: RecordId,
 	arguments: List[Checked.TypeRef],
 	substitution: Declarations.Substitution,
 	unions: SealedUnions,
@@ -816,7 +814,7 @@ private pure func concrete_record(
 -- arguments of its checked type, which checking derived from that declaration.
 private pure func record_instance(
 	opaques: List[Checked.CheckedOpaque],
-	declaration: Declaration.RecordId,
+	declaration: RecordId,
 	value: Checked.CheckedExpr,
 	substitution: Declarations.Substitution,
 	unions: SealedUnions,
@@ -837,7 +835,7 @@ private pure func concrete_types(
 	span: Span,
 	records: SealedRecords,
 ) -> Result[List[TypeRef], Diagnostic]:
-	translated_list(arguments, pure func(argument: Checked.TypeRef) -> Result[TypeRef, Diagnostic]:
+	arguments.translated_list(pure func(argument: Checked.TypeRef) -> Result[TypeRef, Diagnostic]:
 		concrete_type(opaques, argument, substitution, unions, span, records)
 	)
 
@@ -854,9 +852,9 @@ private pure func concrete_type(
 		-- The arguments close in the enclosing substitution; the underlying type
 		-- then expands in the opaque declaration's own.
 		Checked.NominalType(Checked.OpaqueNominal(id), arguments):
-			match opaques.get(Declaration.opaque_number(id)):
+			match opaques.get(id.opaque_number()):
 				Some(declaration):
-					match semantic_arguments(arguments, substitution, span):
+					match arguments.semantic_arguments(substitution, span):
 						Err(error): Err(error)
 						Ok(closed):
 							concrete_type(opaques, declaration.underlying_type.value_type, { owner = Checked.OpaqueDeclaration(id), values = closed }, unions, span, records)
@@ -941,10 +939,10 @@ private pure func same_elements[T, U](
 -- then decides.
 private pure func body_digest(body: Checked.BodyOwner) -> Int:
 	match body:
-		Checked.DeclaredBody(id): Declaration.function_number(id)
-		Checked.LambdaBody(id): Checked.lambda_number(id)
-		Checked.DerivedEqualityBody(Checked.RecordAggregate(id)): Declaration.record_number(id)
-		Checked.DerivedEqualityBody(Checked.UnionAggregate(id)): Declaration.union_number(id)
+		Checked.DeclaredBody(id): id.function_number()
+		Checked.LambdaBody(id): id.lambda_number()
+		Checked.DerivedEqualityBody(Checked.RecordAggregate(id)): id.record_number()
+		Checked.DerivedEqualityBody(Checked.UnionAggregate(id)): id.union_number()
 
 
 private pure func find_instance(
@@ -952,10 +950,9 @@ private pure func find_instance(
 	key: InstanceKey,
 	span: Span,
 ) -> Result[Option[FunctionInstanceId], Diagnostic]:
-	found ?= indexed_position(keys, body_digest(key.body), span, pure func(known: FunctionRequest) -> Bool:
-		and(
-			known.key.body == key.body,
-			and(known.key.arguments == key.arguments, known.key.callables == key.callables),
+	found ?= keys.indexed_position(key.body.body_digest(), span, pure func(known: FunctionRequest) -> Bool:
+		(known.key.body == key.body).and(
+			(known.key.arguments == key.arguments).and(known.key.callables == key.callables),
 		)
 	)
 	Ok(found.map(pure func(position: Int) -> FunctionInstanceId: into_opaque FunctionInstanceId(position)))
@@ -979,14 +976,14 @@ private pure func forward_callable(
 	choices: List[CallableMode], source_parameter: Checked.CallableParameterId,
 	destination_parameter: Checked.CallableParameterId, span: Span,
 ) -> Result[CallableMode, Diagnostic]:
-	mode ?= callable_mode(choices, source_parameter, span)
+	mode ?= choices.callable_mode(source_parameter, span)
 	match mode:
 		StaticCallable(known): Ok(StaticCallable({ known | parameter = destination_parameter }))
 		RuntimeCallable(_): Ok(RuntimeCallable(destination_parameter))
 
 
 private pure func validate_type_parameters(
-	parameters: List[Checked.TypeParameterId], argument_count: Int,
+	parameters: List[TypeParameterId], argument_count: Int,
 	owner: Checked.TypeParameterOwner, span: Span,
 ) -> Result[Void, Diagnostic]:
 	var failure: Option[Diagnostic] = None
@@ -995,11 +992,10 @@ private pure func validate_type_parameters(
 		Err(internal_error(span, "type argument count differs from the declaration"))
 	else:
 		for parameter in parameters:
-			owner_matches = Checked.parameter_owner(parameter) == owner
+			owner_matches = parameter.parameter_owner() == owner
 
-			if or(
-				owner_matches.not(),
-				Checked.parameter_position(parameter) != position,
+			if owner_matches.not().or(
+				parameter.parameter_position() != position,
 			):
 				failure = Some(internal_error(span, "invalid declaration type parameter"))
 				break
@@ -1011,10 +1007,10 @@ private pure func validate_type_parameters(
 
 
 private pure func parameter_substitution[T](
-	parameters: List[Checked.TypeParameterId], arguments: List[T],
+	parameters: List[TypeParameterId], arguments: List[T],
 	owner: Checked.TypeParameterOwner, span: Span,
 ) -> Result[List[TypeSubstitution[T]], Diagnostic]:
-	valid ?= validate_type_parameters(parameters, arguments.length(), owner, span)
+	valid ?= parameters.validate_type_parameters(arguments.length(), owner, span)
 	var substitution: List[TypeSubstitution[T]] = []
 	var failure: Option[Diagnostic] = None
 	var position = 0
@@ -1036,7 +1032,7 @@ private pure func function_substitution(
 	function: SelectedBody, arguments: List[Checked.TypeRef], span: Span,
 ) -> Result[Declarations.Substitution, Diagnostic]:
 	owner: Checked.TypeParameterOwner = function.parameter_owner
-	valid ?= validate_type_parameters(function.type_parameters, arguments.length(), owner, span)
+	valid ?= function.type_parameters.validate_type_parameters(arguments.length(), owner, span)
 	Ok({ owner = owner, values = arguments })
 
 
@@ -1055,13 +1051,13 @@ private pure func semantic_type(
 private pure func semantic_arguments(
 	arguments: List[Checked.TypeRef], substitution: Declarations.Substitution, span: Span,
 ) -> Result[List[Checked.TypeRef], Diagnostic]:
-	translated_list(arguments, pure func(value: Checked.TypeRef) -> Result[Checked.TypeRef, Diagnostic]:
-		semantic_type(value, substitution, span)
+	arguments.translated_list(pure func(value: Checked.TypeRef) -> Result[Checked.TypeRef, Diagnostic]:
+		value.semantic_type(substitution, span)
 	)
 
 
 private record UnionKey {
-	declaration: Declaration.UnionId,
+	declaration: UnionId,
 	arguments: List[TypeRef]
 }
 
@@ -1086,7 +1082,7 @@ private union PartialType:
 
 
 private record PartialUnionKey {
-	declaration: Declaration.UnionId,
+	declaration: UnionId,
 	arguments: List[PartialType]
 }
 
@@ -1229,7 +1225,7 @@ private pure func slot_has_union_key(slot: UnionSlot, key: PartialUnionKey) -> B
 	match slot:
 		CompleteUnion(instance):
 			if instance.key.declaration == key.declaration:
-				same_elements(instance.key.arguments, key.arguments, same_known_type)
+				instance.key.arguments.same_elements(key.arguments, same_known_type)
 			else:
 				False
 		PendingUnion(instance):
@@ -1240,7 +1236,7 @@ private pure func slot_has_record_key(slot: RecordSlot, key: PartialRecordKey) -
 	match slot:
 		CompleteRecord(instance):
 			match instance.key.origin == key.origin:
-				True: same_elements(instance.key.arguments, key.arguments, same_known_type)
+				True: instance.key.arguments.same_elements(key.arguments, same_known_type)
 				False: False
 		PendingRecord(instance):
 			instance.key == key
@@ -1269,15 +1265,15 @@ private pure func slot_record_representation(slot: RecordSlot) -> RecordRepresen
 private pure func find_union_slot(
 	slots: IndexedList[UnionSlot], records: IndexedList[RecordSlot], key: PartialUnionKey, span: Span,
 ) -> Result[Option[UnionInstanceId], Diagnostic]:
-	digest ?= slot_union_digest(key, slots, records, span)
-	found ?= indexed_position(slots, digest, span, pure func(slot: UnionSlot) -> Bool: slot_has_union_key(slot, key))
+	digest ?= key.slot_union_digest(slots, records, span)
+	found ?= slots.indexed_position(digest, span, pure func(slot: UnionSlot) -> Bool: slot.slot_has_union_key(key))
 	Ok(found.map(pure func(position: Int) -> UnionInstanceId: into_opaque UnionInstanceId(position)))
 
 
 private pure func find_record_slot(
 	slots: IndexedList[RecordSlot], key: PartialRecordKey, span: Span,
 ) -> Result[Option[RecordInstanceId], Diagnostic]:
-	found ?= indexed_position(slots, record_digest(key.origin, key.arguments.length()), span, pure func(slot: RecordSlot) -> Bool: slot_has_record_key(slot, key))
+	found ?= slots.indexed_position(key.origin.record_digest(key.arguments.length()), span, pure func(slot: RecordSlot) -> Bool: slot.slot_has_record_key(key))
 	Ok(found.map(pure func(position: Int) -> RecordInstanceId: into_opaque RecordInstanceId(position)))
 
 
@@ -1366,18 +1362,18 @@ private pure func has_pending(value: PartialType) -> Bool:
 		KnownType(_): False
 		PendingUnionType(key): True
 		PendingRecordType(key): True
-		PendingListType(element): has_pending(element)
+		PendingListType(element): element.has_pending()
 		PendingCallable(parameters, result):
-			match any_pending(parameters):
+			match parameters.any_pending():
 				True: True
-				False: has_pending(result)
+				False: result.has_pending()
 
 
 private pure func any_pending(values: List[PartialType]) -> Bool:
 	var found: Bool = False
 
 	for value in values:
-		if has_pending(value):
+		if value.has_pending():
 			found = True
 			break
 
@@ -1400,29 +1396,29 @@ private pure func resolve_partial(value: PartialType, completed: CompletedLayout
 					if key == done:
 						KnownType(UnionType(id))
 					else:
-						PendingUnionType({ key | arguments = resolve_partials(key.arguments, completed) })
+						PendingUnionType({ key | arguments = key.arguments.resolve_partials(completed) })
 				CompletedRecord(_, _):
-					PendingUnionType({ key | arguments = resolve_partials(key.arguments, completed) })
+					PendingUnionType({ key | arguments = key.arguments.resolve_partials(completed) })
 		PendingRecordType(key):
 			match completed:
 				CompletedRecord(done, id):
 					if key == done:
 						KnownType(RecordType(id))
 					else:
-						PendingRecordType({ key | arguments = resolve_partials(key.arguments, completed) })
+						PendingRecordType({ key | arguments = key.arguments.resolve_partials(completed) })
 				CompletedUnion(_, _):
-					PendingRecordType({ key | arguments = resolve_partials(key.arguments, completed) })
+					PendingRecordType({ key | arguments = key.arguments.resolve_partials(completed) })
 		PendingListType(element):
-			partial_list(resolve_partial(element, completed))
+			partial_list(element.resolve_partial(completed))
 		PendingCallable(parameters, result):
-			partial_callable(resolve_partials(parameters, completed), resolve_partial(result, completed))
+			partial_callable(parameters.resolve_partials(completed), result.resolve_partial(completed))
 
 
 private pure func resolve_partials(values: List[PartialType], completed: CompletedLayout) -> List[PartialType]:
 	var resolved: List[PartialType] = []
 
 	for value in values:
-		resolved = resolved.append(resolve_partial(value, completed))
+		resolved = resolved.append(value.resolve_partial(completed))
 
 	resolved
 
@@ -1434,28 +1430,28 @@ private pure func known_type(value: PartialType, span: Span) -> Result[TypeRef, 
 
 
 private pure func known_types(values: List[PartialType], span: Span) -> Result[List[TypeRef], Diagnostic]:
-	translated_list(values, pure func(value: PartialType) -> Result[TypeRef, Diagnostic]: known_type(value, span))
+	values.translated_list(pure func(value: PartialType) -> Result[TypeRef, Diagnostic]: value.known_type(span))
 
 
 -- A pending union instance with no reference left becomes complete.
 private pure func settle_union(instance: PendingUnionInstance, span: Span) -> Result[UnionSlot, Diagnostic]:
-	var pending = any_pending(instance.key.arguments)
+	var pending = instance.key.arguments.any_pending()
 
 	for fields in instance.variants:
 		pending = match pending:
 			True: True
-			False: any_pending(fields)
+			False: fields.any_pending()
 
 	if pending:
 		Ok(PendingUnion(instance))
 	else:
-		match known_types(instance.key.arguments, span):
+		match instance.key.arguments.known_types(span):
 			Ok(arguments):
 				var variants: List[List[TypeRef]] = []
 				var failure: Option[Diagnostic] = None
 
 				for fields in instance.variants:
-					match known_types(fields, span):
+					match fields.known_types(span):
 						Ok(known): variants = variants.append(known)
 						Err(error):
 							failure = Some(error)
@@ -1477,15 +1473,15 @@ private pure func settle_union(instance: PendingUnionInstance, span: Span) -> Re
 
 
 private pure func settle_record(instance: PendingRecordInstance, span: Span) -> Result[RecordSlot, Diagnostic]:
-	pending: Bool = match any_pending(instance.key.arguments):
+	pending: Bool = match instance.key.arguments.any_pending():
 		True: True
-		False: any_pending(instance.fields)
+		False: instance.fields.any_pending()
 	if pending:
 		Ok(PendingRecord(instance))
 	else:
-		match known_types(instance.key.arguments, span):
+		match instance.key.arguments.known_types(span):
 			Ok(arguments):
-				match known_types(instance.fields, span):
+				match instance.fields.known_types(span):
 					Ok(fields):
 						layout: ConcreteRecord = match instance.representation:
 							InlineRecord: InlineFields(fields)
@@ -1512,15 +1508,15 @@ private pure func resolve_union_slots(
 	var position = first
 	var failure: Option[Diagnostic] = None
 
-	while and(position < resolved.length(), failure.is_some().not()):
+	while (position < resolved.length()).and(failure.is_some().not()):
 		match resolved.get(position):
 			Some(PendingUnion(instance)):
 				filled: PendingUnionInstance = {
-					key = { instance.key | arguments = resolve_partials(instance.key.arguments, completed) },
-					variants = resolve_variants(instance.variants, completed),
+					key = { instance.key | arguments = instance.key.arguments.resolve_partials(completed) },
+					variants = instance.variants.resolve_variants(completed),
 					representation = instance.representation,
 				}
-				match settle_union(filled, span):
+				match filled.settle_union(span):
 					Ok(slot): resolved = resolved.set(position, slot)
 					Err(error): failure = Some(error)
 			Some(CompleteUnion(_)):
@@ -1539,7 +1535,7 @@ private pure func resolve_variants(variants: List[List[PartialType]], completed:
 	var resolved: List[List[PartialType]] = []
 
 	for fields in variants:
-		resolved = resolved.append(resolve_partials(fields, completed))
+		resolved = resolved.append(fields.resolve_partials(completed))
 
 	resolved
 
@@ -1554,15 +1550,15 @@ private pure func resolve_record_slots(
 	var position = first
 	var failure: Option[Diagnostic] = None
 
-	while and(position < resolved.length(), failure.is_some().not()):
+	while (position < resolved.length()).and(failure.is_some().not()):
 		match resolved.get(position):
 			Some(PendingRecord(instance)):
 				filled: PendingRecordInstance = {
-					key = { instance.key | arguments = resolve_partials(instance.key.arguments, completed) },
-					fields = resolve_partials(instance.fields, completed),
+					key = { instance.key | arguments = instance.key.arguments.resolve_partials(completed) },
+					fields = instance.fields.resolve_partials(completed),
 					representation = instance.representation,
 				}
-				match settle_record(filled, span):
+				match filled.settle_record(span):
 					Ok(slot): resolved = resolved.set(position, slot)
 					Err(error): failure = Some(error)
 			Some(CompleteRecord(_)):
@@ -1595,20 +1591,20 @@ private pure func payload_owns_children(
 				StringType | ListType(_) | CallableType(_, _):
 					Ok(True)
 				RecordType(child):
-					match records.entries.get(record_number(child)):
+					match records.entries.get(child.record_number()):
 						None:
 							Err(internal_error(span, "missing concrete record child layout"))
 						Some(slot):
-							owns_children: Bool = match slot_record_representation(slot):
+							owns_children: Bool = match slot.slot_record_representation():
 								ManagedRecord: True
 								InlineRecord: False
 							Ok(owns_children)
 				UnionType(child):
-					match unions.entries.get(union_number(child)):
+					match unions.entries.get(child.union_number()):
 						None:
 							Err(internal_error(span, "missing concrete child layout"))
 						Some(slot):
-							owns_children: Bool = match slot_union_representation(slot):
+							owns_children: Bool = match slot.slot_union_representation():
 								InlineOwningPayload | BoxedRecursive: True
 								InlineUnmanaged: False
 							Ok(owns_children)
@@ -1622,17 +1618,17 @@ private pure func ensure_union(
 	records: IndexedList[RecordSlot],
 	in_progress: List[InProgressLayout],
 ) -> Result[PreparedType, Diagnostic]:
-	existing ?= find_union_slot(unions, records, key, span)
+	existing ?= unions.find_union_slot(records, key, span)
 	match existing:
 		Some(id):
 			Ok({ value_type = KnownType(UnionType(id)), unions = unions, records = records, in_progress = in_progress })
 		None:
-			match refer_back_to_union(in_progress, key):
+			match in_progress.refer_back_to_union(key):
 				Some(marked):
 					-- A reference back into a layout on the current path.
 					Ok({ value_type = PendingUnionType(key), unions = unions, records = records, in_progress = marked })
 				None:
-					prepare_union(key, checked, unions, span, records, in_progress)
+					key.prepare_union(checked, unions, span, records, in_progress)
 
 
 private pure func prepare_union(
@@ -1644,10 +1640,9 @@ private pure func prepare_union(
 	in_progress: List[InProgressLayout],
 ) -> Result[PreparedType, Diagnostic]:
 	declaration ?= checked.unions
-		.get(Declaration.union_number(key.declaration))
+		.get(key.declaration.union_number())
 		.or_internal_error(span, "unknown union declaration")
-	substitution ?= parameter_substitution(
-		declaration.type_parameters,
+	substitution ?= declaration.type_parameters.parameter_substitution(
 		key.arguments,
 		Checked.UnionDeclaration(key.declaration),
 		span,
@@ -1663,7 +1658,7 @@ private pure func prepare_union(
 	for variant in declaration.variants:
 		var fields: List[PartialType] = []
 		for written in variant.fields:
-			match prepare_type(written.value_type, substitution, checked, dependencies, written.span, record_dependencies, layouts):
+			match written.value_type.prepare_type(substitution, checked, dependencies, written.span, record_dependencies, layouts):
 				Err(error):
 					failure = Some(error)
 					break
@@ -1679,8 +1674,8 @@ private pure func prepare_union(
 								self_referencing = True
 						_:
 							void
-					match payload_owns_children(prepared.value_type, dependencies, record_dependencies, span):
-						Ok(owns): owning = or(owning, owns)
+					match prepared.value_type.payload_owns_children(dependencies, record_dependencies, span):
+						Ok(owns): owning = owning.or(owns)
 						Err(error):
 							failure = Some(error)
 							break
@@ -1708,7 +1703,7 @@ private pure func prepare_union(
 	unmanaged: Bool = match representation:
 		InlineUnmanaged: True
 		InlineOwningPayload | BoxedRecursive: False
-	_: Void ?= if and(declaration.fixed, unmanaged.not()):
+	_: Void ?= if declaration.fixed.and(unmanaged.not()):
 		Err(internal_error(span, "a fixed union instance is not stored inline"))
 	else:
 		Ok(void)
@@ -1718,17 +1713,17 @@ private pure func prepare_union(
 	-- path, including its own direct self payload, remain to fill.
 	id: UnionInstanceId = into_opaque UnionInstanceId(dependencies.entries.length())
 	slot ?= settle_union({ key = key, variants = variants, representation = representation }, span)
-	digest ?= slot_union_digest(key, dependencies, record_dependencies, span)
-	published = append_entry(dependencies, slot, digest)
-	left ?= leave_layout(layouts, span)
+	digest ?= key.slot_union_digest(dependencies, record_dependencies, span)
+	published = dependencies.append_entry(slot, digest)
+	left ?= layouts.leave_layout(span)
 	match left.back_reference:
 		NotReferencedBack:
 			Ok({ value_type = KnownType(UnionType(id)), unions = published, records = record_dependencies, in_progress = left.remaining })
 		ReferencedBack:
 			completed: CompletedLayout = CompletedUnion(key, id)
-			match resolve_union_slots(published, unions.entries.length(), completed, span):
+			match published.resolve_union_slots(unions.entries.length(), completed, span):
 				Ok(resolved_unions):
-					match resolve_record_slots(record_dependencies, records.entries.length(), completed, span):
+					match record_dependencies.resolve_record_slots(records.entries.length(), completed, span):
 						Ok(resolved_records):
 							Ok({
 								value_type = KnownType(UnionType(id)),
@@ -1753,23 +1748,23 @@ private pure func inline_record_field(
 		KnownType(IntType) | KnownType(FloatType):
 			Ok(True)
 		KnownType(UnionType(child)):
-			match unions.entries.get(union_number(child)):
+			match unions.entries.get(child.union_number()):
 				None:
 					Err(internal_error(span, "missing concrete child layout"))
 				Some(slot):
-					declaration: Declaration.UnionId = match slot:
+					declaration: UnionId = match slot:
 						CompleteUnion(instance): instance.key.declaration
 						PendingUnion(instance): instance.key.declaration
 					checked.unions
-						.get(Declaration.union_number(declaration))
+						.get(declaration.union_number())
 						.map(pure func(union_declaration: Checked.CheckedUnion) -> Bool: union_declaration.fixed)
 						.or_internal_error(span, "unknown union declaration")
 		KnownType(RecordType(child)):
-			match records.entries.get(record_number(child)):
+			match records.entries.get(child.record_number()):
 				None:
 					Err(internal_error(span, "missing concrete record child layout"))
 				Some(slot):
-					is_inline: Bool = match slot_record_representation(slot):
+					is_inline: Bool = match slot.slot_record_representation():
 						InlineRecord: True
 						ManagedRecord: False
 					Ok(is_inline)
@@ -1789,7 +1784,7 @@ private pure func record_representation(
 		AlwaysManaged: True
 	var found_error: Option[Diagnostic] = None
 	for field in fields:
-		match inline_record_field(field, checked, unions, records, span):
+		match field.inline_record_field(checked, unions, records, span):
 			Ok(inline):
 				if inline.not():
 					managed = True
@@ -1826,16 +1821,16 @@ private pure func ensure_record(
 	records: IndexedList[RecordSlot],
 	in_progress: List[InProgressLayout],
 ) -> Result[PreparedType, Diagnostic]:
-	existing ?= find_record_slot(records, key, span)
+	existing ?= records.find_record_slot(key, span)
 	match existing:
 		Some(instance):
 			Ok({ value_type = KnownType(RecordType(instance)), unions = unions, records = records, in_progress = in_progress })
 		None:
-			match refer_back_to_record(in_progress, key):
+			match in_progress.refer_back_to_record(key):
 				Some(marked):
 					Ok({ value_type = PendingRecordType(key), unions = unions, records = records, in_progress = marked })
 				None:
-					prepare_record(key, checked, unions, span, records, in_progress)
+					key.prepare_record(checked, unions, span, records, in_progress)
 
 
 -- How a record's fields decide its storage. A fixed record has promised
@@ -1848,7 +1843,7 @@ private union RecordStoragePolicy:
 
 
 private record SelectedRecord {
-	type_parameters: List[Checked.TypeParameterId],
+	type_parameters: List[TypeParameterId],
 	parameter_owner: Checked.TypeParameterOwner,
 	fields: List[Checked.TypeUse],
 	storage: RecordStoragePolicy
@@ -1862,20 +1857,20 @@ private pure func prepare_record(
 ) -> Result[PreparedType, Diagnostic]:
 	match key.origin:
 		StructuralTuple:
-			publish_record(
-				key, key.arguments, InlineEligible, checked, unions, span, records,
+			key.publish_record(
+				key.arguments, InlineEligible, checked, unions, span, records,
 				in_progress.append(InProgressRecord(key, NotReferencedBack)),
 				unions.entries.length(), records.entries.length(),
 			)
-		DeclaredRecord(id): prepare_source_record(key, id, checked, unions, span, records, in_progress)
-		CaptureEnvironment(id): prepare_capture_record(key, id, checked, unions, span, records, in_progress)
+		DeclaredRecord(id): key.prepare_source_record(id, checked, unions, span, records, in_progress)
+		CaptureEnvironment(id): key.prepare_capture_record(id, checked, unions, span, records, in_progress)
 
 
 private pure func prepare_source_record(
-	key: PartialRecordKey, id: Declaration.RecordId, checked: Checked.CheckedFunctions,
+	key: PartialRecordKey, id: RecordId, checked: Checked.CheckedFunctions,
 	unions: IndexedList[UnionSlot], span: Span, records: IndexedList[RecordSlot], in_progress: List[InProgressLayout],
 ) -> Result[PreparedType, Diagnostic]:
-	declaration ?= checked.records.get(Declaration.record_number(id)).or_internal_error(span, "unknown record declaration")
+	declaration ?= checked.records.get(id.record_number()).or_internal_error(span, "unknown record declaration")
 	storage: RecordStoragePolicy = if declaration.fixed:
 		DeclaredInline
 	else:
@@ -1886,29 +1881,29 @@ private pure func prepare_source_record(
 		fields = declaration.fields.map(pure func(field): field.value_type),
 		storage = storage,
 	}
-	prepare_declared_record(key, selected, checked, unions, span, records, in_progress)
+	key.prepare_declared_record(selected, checked, unions, span, records, in_progress)
 
 
 private pure func prepare_capture_record(
-	key: PartialRecordKey, id: Checked.LambdaId, checked: Checked.CheckedFunctions,
+	key: PartialRecordKey, id: LambdaId, checked: Checked.CheckedFunctions,
 	unions: IndexedList[UnionSlot], span: Span, records: IndexedList[RecordSlot], in_progress: List[InProgressLayout],
 ) -> Result[PreparedType, Diagnostic]:
-	lambda ?= checked.lambdas.get(Checked.lambda_number(id)).or_internal_error(span, "unknown capture environment lambda")
-	root ?= checked.functions.get(Declaration.function_number(lambda.root)).or_internal_error(span, "unknown capture environment root")
+	lambda ?= checked.lambdas.get(id.lambda_number()).or_internal_error(span, "unknown capture environment lambda")
+	root ?= checked.functions.get(lambda.root.function_number()).or_internal_error(span, "unknown capture environment root")
 	selected: SelectedRecord = {
 		type_parameters = root.signature.type_parameters,
 		parameter_owner = Checked.FunctionDeclaration(lambda.root),
 		fields = lambda.captures.map(pure func(capture): capture.value_type),
 		storage = AlwaysManaged,
 	}
-	prepare_declared_record(key, selected, checked, unions, span, records, in_progress)
+	key.prepare_declared_record(selected, checked, unions, span, records, in_progress)
 
 
 private pure func prepare_declared_record(
 	key: PartialRecordKey, declaration: SelectedRecord, checked: Checked.CheckedFunctions,
 	unions: IndexedList[UnionSlot], span: Span, records: IndexedList[RecordSlot], in_progress: List[InProgressLayout],
 ) -> Result[PreparedType, Diagnostic]:
-	substitution ?= parameter_substitution(declaration.type_parameters, key.arguments, declaration.parameter_owner, span)
+	substitution ?= declaration.type_parameters.parameter_substitution(key.arguments, declaration.parameter_owner, span)
 	var fields: List[PartialType] = []
 	var dependencies = unions
 	var record_dependencies = records
@@ -1916,7 +1911,7 @@ private pure func prepare_declared_record(
 	var found_error: Option[Diagnostic] = None
 
 	for field in declaration.fields:
-		match prepare_type(field.value_type, substitution, checked, dependencies, field.span, record_dependencies, layouts):
+		match field.value_type.prepare_type(substitution, checked, dependencies, field.span, record_dependencies, layouts):
 			Err(failure):
 				found_error = Some(failure)
 				break
@@ -1932,7 +1927,7 @@ private pure func prepare_declared_record(
 		None:
 			Ok(void)
 
-	publish_record(key, fields, declaration.storage, checked, dependencies, span, record_dependencies, layouts, unions.entries.length(), records.entries.length())
+	key.publish_record(fields, declaration.storage, checked, dependencies, span, record_dependencies, layouts, unions.entries.length(), records.entries.length())
 
 
 -- Both source-owned products and structural tuples settle through one record inventory.
@@ -1942,19 +1937,19 @@ private pure func publish_record(
 	record_dependencies: IndexedList[RecordSlot], layouts: List[InProgressLayout],
 	first_union: Int, first_record: Int,
 ) -> Result[PreparedType, Diagnostic]:
-	representation ?= record_representation(fields, storage, checked, dependencies, record_dependencies, span)
+	representation ?= fields.record_representation(storage, checked, dependencies, record_dependencies, span)
 	instance: RecordInstanceId = into_opaque RecordInstanceId(record_dependencies.entries.length())
 	slot ?= settle_record({ key = key, fields = fields, representation = representation }, span)
-	published = append_entry(record_dependencies, slot, record_digest(key.origin, key.arguments.length()))
-	left ?= leave_layout(layouts, span)
+	published = record_dependencies.append_entry(slot, key.origin.record_digest(key.arguments.length()))
+	left ?= layouts.leave_layout(span)
 	match left.back_reference:
 		NotReferencedBack:
 			Ok({ value_type = KnownType(RecordType(instance)), unions = dependencies, records = published, in_progress = left.remaining })
 		ReferencedBack:
 			completed: CompletedLayout = CompletedRecord(key, instance)
-			match resolve_union_slots(dependencies, first_union, completed, span):
+			match dependencies.resolve_union_slots(first_union, completed, span):
 				Ok(resolved_unions):
-					match resolve_record_slots(published, first_record, completed, span):
+					match published.resolve_record_slots(first_record, completed, span):
 						Ok(resolved_records):
 							Ok({
 								value_type = KnownType(RecordType(instance)),
@@ -1982,7 +1977,7 @@ private pure func prepare_arguments(
 	var failure: Option[Diagnostic] = None
 
 	for argument in arguments:
-		match prepare_type(argument, substitution, checked, dependencies, span, record_dependencies, layouts):
+		match argument.prepare_type(substitution, checked, dependencies, span, record_dependencies, layouts):
 			Ok(prepared):
 				types = types.append(prepared.value_type)
 				dependencies = prepared.unions
@@ -2016,14 +2011,14 @@ private pure func prepare_type(
 ) -> Result[PreparedType, Diagnostic]:
 	match value:
 		Checked.NominalType(Checked.OpaqueNominal(id), arguments):
-			match checked.opaques.get(Declaration.opaque_number(id)):
-				Some(declaration): prepare_opaque(declaration, arguments, substitution, checked, unions, span, records, in_progress)
+			match checked.opaques.get(id.opaque_number()):
+				Some(declaration): declaration.prepare_opaque(arguments, substitution, checked, unions, span, records, in_progress)
 				None: Err(internal_error(span, "unknown opaque declaration"))
 		Checked.CallableType(_, parameters, result):
-			match prepare_arguments(parameters, substitution, checked, unions, span, records, in_progress):
+			match parameters.prepare_arguments(substitution, checked, unions, span, records, in_progress):
 				Err(error): Err(error)
 				Ok(inputs):
-					match prepare_type(result, substitution, checked, inputs.unions, span, inputs.records, inputs.in_progress):
+					match result.prepare_type(substitution, checked, inputs.unions, span, inputs.records, inputs.in_progress):
 						Err(error): Err(error)
 						Ok(output):
 							Ok({ output | value_type = partial_callable(inputs.arguments, output.value_type) })
@@ -2050,17 +2045,17 @@ private pure func prepare_type(
 				None:
 					Err(internal_error(span, "unresolved or foreign type parameter"))
 		Checked.TupleType(elements):
-			prepare_tuple_type(elements, substitution, checked, unions, span, records, in_progress)
+			elements.prepare_tuple_type(substitution, checked, unions, span, records, in_progress)
 		Checked.ListType(element):
-			match prepare_type(element, substitution, checked, unions, span, records, in_progress):
+			match element.prepare_type(substitution, checked, unions, span, records, in_progress):
 				Ok(prepared): Ok({ prepared | value_type = partial_list(prepared.value_type) })
 				Err(error): Err(error)
 		Checked.NominalType(Checked.AggregateNominal(Checked.RecordAggregate(id)), arguments):
-			match prepare_arguments(arguments, substitution, checked, unions, span, records, in_progress):
+			match arguments.prepare_arguments(substitution, checked, unions, span, records, in_progress):
 				Ok(prepared): ensure_record({ origin = DeclaredRecord(id), arguments = prepared.arguments }, checked, prepared.unions, span, prepared.records, prepared.in_progress)
 				Err(error): Err(error)
 		Checked.NominalType(Checked.AggregateNominal(Checked.UnionAggregate(id)), arguments):
-			match prepare_arguments(arguments, substitution, checked, unions, span, records, in_progress):
+			match arguments.prepare_arguments(substitution, checked, unions, span, records, in_progress):
 				Ok(prepared): ensure_union({ declaration = id, arguments = prepared.arguments }, checked, prepared.unions, span, prepared.records, prepared.in_progress)
 				Err(error): Err(error)
 
@@ -2072,9 +2067,9 @@ private pure func prepare_opaque(
 	checked: Checked.CheckedFunctions, unions: IndexedList[UnionSlot], span: Span,
 	records: IndexedList[RecordSlot], in_progress: List[InProgressLayout],
 ) -> Result[PreparedType, Diagnostic]:
-	prepared ?= prepare_arguments(arguments, substitution, checked, unions, span, records, in_progress)
-	inner ?= parameter_substitution(declaration.type_parameters, prepared.arguments, Checked.OpaqueDeclaration(declaration.id), span)
-	prepare_type(declaration.underlying_type.value_type, inner, checked, prepared.unions, span, prepared.records, prepared.in_progress)
+	prepared ?= arguments.prepare_arguments(substitution, checked, unions, span, records, in_progress)
+	inner ?= declaration.type_parameters.parameter_substitution(prepared.arguments, Checked.OpaqueDeclaration(declaration.id), span)
+	declaration.underlying_type.value_type.prepare_type(inner, checked, prepared.unions, span, prepared.records, prepared.in_progress)
 
 
 private pure func prepare_tuple_type(
@@ -2082,7 +2077,7 @@ private pure func prepare_tuple_type(
 	checked: Checked.CheckedFunctions, unions: IndexedList[UnionSlot], span: Span,
 	records: IndexedList[RecordSlot], in_progress: List[InProgressLayout],
 ) -> Result[PreparedType, Diagnostic]:
-	prepared ?= prepare_arguments(elements, substitution, checked, unions, span, records, in_progress)
+	prepared ?= elements.prepare_arguments(substitution, checked, unions, span, records, in_progress)
 	ensure_record({ origin = StructuralTuple, arguments = prepared.arguments }, checked, prepared.unions, span, prepared.records, prepared.in_progress)
 
 
@@ -2149,7 +2144,7 @@ private pure func seal_records(slots: IndexedList[RecordSlot], converted: List[R
 			CompleteRecord(instance):
 				id: RecordInstanceId = into_opaque RecordInstanceId(layouts.length())
 				ids = ids.set(instance.key, id)
-				match sealed_record_layout(instance, id, converted):
+				match instance.sealed_record_layout(id, converted):
 					Ok(layout): layouts = layouts.append(layout)
 					Err(error):
 						failure = Some(error)
@@ -2210,43 +2205,43 @@ private pure func append_value_types(
 ) -> List[Checked.TypeUse]:
 	match value.form:
 		Checked.InvokeFunction(call):
-			match chained_operand(call):
-				Some(first): append_chain_types(collected, value, call, first)
-				None: append_node_types(collected, value)
-		_: append_node_types(collected, value)
+			match call.chained_operand():
+				Some(first): collected.append_chain_types(value, call, first)
+				None: collected.append_node_types(value)
+		_: collected.append_node_types(value)
 
 
 -- A chain descends in a loop: each link's type precedes its first operand's,
 -- and its other operands follow once that operand is complete.
 private pure func append_chain_types(collected: List[Checked.TypeUse], value: Checked.CheckedExpr, call: Checked.CheckedCall, first: CallLink) -> List[Checked.TypeUse]:
-	var types = collected.append({ value_type = value.value_type, span = anchor(value) })
+	var types = collected.append({ value_type = value.value_type, span = value.anchor() })
 	-- The links between `value` and the innermost one, outermost first.
 	var links: List[CallLink] = []
 	var innermost = first
 	while True:
-		match chained_operand(innermost.call):
+		match innermost.call.chained_operand():
 			None: break
 			Some(next):
-				types = types.append({ value_type = innermost.value.value_type, span = anchor(innermost.value) })
+				types = types.append({ value_type = innermost.value.value_type, span = innermost.value.anchor() })
 				links = links.append(innermost)
 				innermost = next
-	types = append_node_types(types, innermost.value)
+	types = types.append_node_types(innermost.value)
 	for link in links.reverse():
-		types = append_operand_types(types, link.call.operands.drop(1))
-	append_operand_types(types, call.operands.drop(1))
+		types = types.append_operand_types(link.call.operands.drop(1))
+	types.append_operand_types(call.operands.drop(1))
 
 
 private pure func append_operand_types(collected: List[Checked.TypeUse], operands: List[Checked.CheckedCallOperand]) -> List[Checked.TypeUse]:
 	var types = collected
 	for operand in operands:
 		match operand:
-			Checked.ValueOperand(argument): types = append_value_types(types, argument)
+			Checked.ValueOperand(argument): types = types.append_value_types(argument)
 			Checked.CallableOperand(_, choice, _):
 				match choice:
 					Checked.LambdaCallable(_, captures):
 						for capture in captures:
-							types = append_value_types(types, capture)
-					Checked.StoredCallable(child): types = append_value_types(types, child)
+							types = types.append_value_types(capture)
+					Checked.StoredCallable(child): types = types.append_value_types(child)
 					Checked.MethodCallable(_) | Checked.NamedCallable(_, _) | Checked.ForwardedCallable(_): void
 	types
 
@@ -2257,54 +2252,54 @@ private pure func append_node_types(
 ) -> List[Checked.TypeUse]:
 	var types: List[Checked.TypeUse] = collected.append({
 		value_type = value.value_type,
-		span = anchor(value),
+		span = value.anchor(),
 	})
 
 	match value.form:
 		Checked.UpdateRecord(_, update):
-			types = append_value_types(types, update.base)
+			types = types.append_value_types(update.base)
 			for field in update.replacements:
-				types = append_value_types(types, field.value)
+				types = types.append_value_types(field.value)
 			for field in update.inherited:
 				types = types.append({ value_type = field.value_type, span = update.base_expression_span })
 		Checked.ConstructVariant(_, children):
 			for child in children:
-				types = append_value_types(types, child)
+				types = types.append_value_types(child)
 		Checked.ConstructRecord(_, fields):
 			for field in fields:
-				types = append_value_types(types, field.value)
+				types = types.append_value_types(field.value)
 		Checked.ConstructOpaque(_, child):
-			types = append_value_types(types, child)
+			types = types.append_value_types(child)
 		Checked.ProjectOpaque(_, child):
-			types = append_value_types(types, child)
+			types = types.append_value_types(child)
 		Checked.ConstructTuple(elements):
 			for element in elements:
-				types = append_value_types(types, element)
+				types = types.append_value_types(element)
 		Checked.ConstructList(elements):
 			for element in elements:
-				types = append_value_types(types, element)
+				types = types.append_value_types(element)
 		Checked.Match(join):
-			types = append_value_types(types, join.scrutinee)
-			types = types.concat(selection_types(join.selection, join.scrutinee.span))
+			types = types.append_value_types(join.scrutinee)
+			types = types.concat(join.selection.selection_types(join.scrutinee.span))
 			for arm in join.arms:
-				types = types.concat(statement_types(arm.statements))
-				types = append_value_types(types, arm.value)
+				types = types.concat(arm.statements.statement_types())
+				types = types.append_value_types(arm.value)
 		Checked.InvokeFunction(call):
 			match call.target:
-				Checked.ValueCall(callee): types = append_value_types(types, callee)
+				Checked.ValueCall(callee): types = types.append_value_types(callee)
 				_: void
-			types = append_operand_types(types, call.operands)
+			types = types.append_operand_types(call.operands)
 		Checked.MakeCallable(choice):
 			match choice:
 				Checked.LambdaCallable(_, captures):
 					for capture in captures:
-						types = append_value_types(types, capture)
-				Checked.StoredCallable(child): types = append_value_types(types, child)
+						types = types.append_value_types(capture)
+				Checked.StoredCallable(child): types = types.append_value_types(child)
 				Checked.MethodCallable(_) | Checked.NamedCallable(_, _) | Checked.ForwardedCallable(_): void
 		Checked.ReadTupleElement(receiver, _):
-			types = append_value_types(types, receiver)
+			types = types.append_value_types(receiver)
 		Checked.ReadRecordField(receiver, _):
-			types = append_value_types(types, receiver)
+			types = types.append_value_types(receiver)
 		Checked.LiteralVoid | Checked.LiteralInteger(_) | Checked.LiteralFloat(_) | Checked.LiteralString(_) | Checked.ReadBinding(_) | Checked.ReadCapture(_):
 			void
 
@@ -2319,27 +2314,27 @@ private pure func statement_types(
 	for statement in statements:
 		match statement:
 			Checked.InitializeBinding(_, value):
-				types = types.concat(value_types(value))
+				types = types.concat(value.value_types())
 			Checked.DiscardExpression(value):
-				types = types.concat(value_types(value))
+				types = types.concat(value.value_types())
 			Checked.ReassignBinding(_, value):
-				types = types.concat(value_types(value))
+				types = types.concat(value.value_types())
 			Checked.RunWhile(loop):
-				types = types.concat(value_types(loop.condition)).concat(statement_types(loop.body))
+				types = types.concat(loop.condition.value_types()).concat(loop.body.statement_types())
 			Checked.BreakSourceLoop(_) | Checked.ContinueSourceLoop(_): void
 			Checked.RunFor(loop):
 				match loop.iteration:
 					Checked.ListIteration(iterable, element, option):
-						types = types.concat(value_types(iterable)).append({
-							value_type = Checked.NominalType(Checked.AggregateNominal(Checked.UnionAggregate(Declaration.variant_owner(option.some))), [element]),
+						types = types.concat(iterable.value_types()).append({
+							value_type = Checked.NominalType(Checked.AggregateNominal(Checked.UnionAggregate(option.some.variant_owner())), [element]),
 							span = loop.span,
 						})
 					Checked.AscendingIntRange(start, end, boolean):
-						types = types.concat(value_types(start)).concat(value_types(end)).append({
-							value_type = Checked.NominalType(Checked.AggregateNominal(Checked.UnionAggregate(Declaration.variant_owner(boolean.true_variant))), []),
+						types = types.concat(start.value_types()).concat(end.value_types()).append({
+							value_type = Checked.NominalType(Checked.AggregateNominal(Checked.UnionAggregate(boolean.true_variant.variant_owner())), []),
 							span = loop.span,
 						})
-				types = types.concat(statement_types(loop.body))
+				types = types.concat(loop.body.statement_types())
 
 	types
 
@@ -2347,12 +2342,12 @@ private pure func statement_types(
 private pure func exit_types(exit: Checked.CheckedExit) -> List[Checked.TypeUse]:
 	match exit:
 		Checked.ReturnExpression(value):
-			value_types(value)
+			value.value_types()
 		Checked.RecurWith(arguments, _):
 			var types: List[Checked.TypeUse] = []
 
 			for argument in arguments:
-				types = types.concat(value_types(argument))
+				types = types.concat(argument.value_types())
 
 			types
 
@@ -2364,7 +2359,7 @@ private record SelectedBody {
 	base_label: FunctionLabel,
 	captures: List[Checked.CheckedCapture],
 	parameter_owner: Checked.TypeParameterOwner,
-	type_parameters: List[Checked.TypeParameterId],
+	type_parameters: List[TypeParameterId],
 	parameters: List[Checked.TypeUse],
 	return_type: Checked.TypeUse,
 	bindings: List[Checked.BindingDefinition],
@@ -2381,7 +2376,7 @@ private pure func selected_body(
 ) -> Result[SelectedBody, Diagnostic]:
 	match owner:
 		Checked.DeclaredBody(id):
-			match checked.functions.get(Declaration.function_number(id)):
+			match checked.functions.get(id.function_number()):
 				None: Err(missing_body(source, "unknown function declaration"))
 				Some(function): Ok({
 					base_label = function.label,
@@ -2396,10 +2391,10 @@ private pure func selected_body(
 					execution = function.execution
 				})
 		Checked.LambdaBody(id):
-			match checked.lambdas.get(Checked.lambda_number(id)):
+			match checked.lambdas.get(id.lambda_number()):
 				None: Err(missing_body(source, "unknown lambda identity"))
 				Some(lambda):
-					match checked.functions.get(Declaration.function_number(lambda.root)):
+					match checked.functions.get(lambda.root.function_number()):
 						None: Err(internal_error(lambda.return_type.span, "unknown lambda root"))
 						Some(root): Ok({
 							base_label = root.label,
@@ -2415,10 +2410,10 @@ private pure func selected_body(
 						})
 
 		Checked.DerivedEqualityBody(aggregate):
-			match Checked.equality_body(checked.traits, aggregate):
+			match checked.traits.equality_body(aggregate):
 				None: Err(missing_body(source, "unknown derived equality body"))
 				Some(template): Ok({
-					base_label = template.label, captures = [], parameter_owner = Checked.aggregate_owner(aggregate),
+					base_label = template.label, captures = [], parameter_owner = aggregate.aggregate_owner(),
 					type_parameters = template.signature.type_parameters,
 					parameters = template.signature.parameters, return_type = template.signature.return_type,
 					bindings = template.bindings, statements = [], body = template.body,
@@ -2430,23 +2425,23 @@ private pure func place_types(place: Checked.CheckedPatternPlace, span: Span) ->
 	own: Checked.TypeUse = { value_type = place.value_type, span = span }
 	match place.route:
 		Checked.MatchRoot: [own]
-		Checked.UnionField(parent, _, _): [own].concat(place_types(parent, span))
-		Checked.ListElement(parent, _): [own].concat(place_types(parent, span))
-		Checked.RecordField(parent, _): [own].concat(place_types(parent, span))
+		Checked.UnionField(parent, _, _): [own].concat(parent.place_types(span))
+		Checked.ListElement(parent, _): [own].concat(parent.place_types(span))
+		Checked.RecordField(parent, _): [own].concat(parent.place_types(span))
 
 
 private pure func selection_types(selection: Checked.CheckedSelection, span: Span) -> List[Checked.TypeUse]:
 	var types: List[Checked.TypeUse] = []
 	for node in selection.nodes:
 		match node:
-			Checked.TestVariant(place, _, _, _): types = types.concat(place_types(place, span))
-			Checked.TestListLength(place, _, _, _): types = types.concat(place_types(place, span))
-			Checked.TestStringBytes(place, _, _, _): types = types.concat(place_types(place, span))
+			Checked.TestVariant(place, _, _, _): types = types.concat(place.place_types(span))
+			Checked.TestListLength(place, _, _, _): types = types.concat(place.place_types(span))
+			Checked.TestStringBytes(place, _, _, _): types = types.concat(place.place_types(span))
 			Checked.EnterArm(_, arguments):
 				for argument in arguments:
 					match argument:
-						Checked.BorrowPlace(place): types = types.concat(place_types(place, span))
-						Checked.CopyListSuffix(place, _): types = types.concat(place_types(place, span))
+						Checked.BorrowPlace(place): types = types.concat(place.place_types(span))
+						Checked.CopyListSuffix(place, _): types = types.concat(place.place_types(span))
 	types
 
 
@@ -2456,18 +2451,18 @@ private pure func function_types(function: SelectedBody) -> List[Checked.TypeUse
 
 	types = types
 		.append(function.return_type)
-		.concat(statement_types(function.statements))
+		.concat(function.statements.statement_types())
 
 	match function.body:
 		Checked.CheckedValueBody(value):
-			types.concat(exit_types(value))
+			types.concat(value.exit_types())
 		Checked.CheckedMatchBody(matched):
-			types = types.concat(value_types(matched.scrutinee)).concat(selection_types(matched.selection, matched.scrutinee.span))
+			types = types.concat(matched.scrutinee.value_types()).concat(matched.selection.selection_types(matched.scrutinee.span))
 
 			for arm in matched.arms:
 				types = types
-					.concat(statement_types(arm.statements))
-					.concat(exit_types(arm.body))
+					.concat(arm.statements.statement_types())
+					.concat(arm.body.exit_types())
 
 			types
 
@@ -2475,7 +2470,7 @@ private pure func function_types(function: SelectedBody) -> List[Checked.TypeUse
 private pure func runtime_key(
 	body: Checked.BodyOwner, arguments: List[Checked.TypeRef], checked: Checked.CheckedFunctions, span: Span,
 ) -> Result[InstanceKey, Diagnostic]:
-	function ?= selected_body(checked, body, ConcreteRequest(span))
+	function ?= checked.selected_body(body, ConcreteRequest(span))
 	var modes: List[CallableMode] = []
 	for binding in function.bindings:
 		match binding.origin:
@@ -2487,8 +2482,8 @@ private pure func runtime_key(
 private pure func runtime_instance(
 	keys: IndexedList[FunctionRequest], body: Checked.BodyOwner, arguments: List[Checked.TypeRef], span: Span,
 ) -> Result[FunctionInstanceId, Diagnostic]:
-	found ?= indexed_position(keys, body_digest(body), span, pure func(request: FunctionRequest) -> Bool:
-		if and(request.key.body == body, request.key.arguments == arguments):
+	found ?= keys.indexed_position(body.body_digest(), span, pure func(request: FunctionRequest) -> Bool:
+		if (request.key.body == body).and(request.key.arguments == arguments):
 			var all_runtime: Bool = True
 			for mode in request.key.callables:
 				match mode:
@@ -2508,10 +2503,10 @@ private pure func request_instance(
 	source: RequestSource,
 	span: Span,
 ) -> Result[PreparedInstances, Diagnostic]:
-	existing ?= find_instance(prepared.functions, key, span)
+	existing ?= prepared.functions.find_instance(key, span)
 	match existing:
 		Some(_): Ok(prepared)
-		None: Ok({ prepared | functions = append_entry(prepared.functions, { key = key, source = source }, body_digest(key.body)) })
+		None: Ok({ prepared | functions = prepared.functions.append_entry({ key = key, source = source }, key.body.body_digest()) })
 
 
 private record PreparedCallableStorage {
@@ -2521,7 +2516,7 @@ private record PreparedCallableStorage {
 
 
 private pure func prepare_callable_storage(
-	id: Checked.LambdaId,
+	id: LambdaId,
 	captures: List[Checked.CheckedExpr],
 	arguments: List[TypeRef],
 	checked: Checked.CheckedFunctions,
@@ -2531,10 +2526,10 @@ private pure func prepare_callable_storage(
 	if captures.is_empty():
 		Ok({ storage = ErasedCallable, prepared = prepared })
 	else:
-		match ensure_record({ origin = CaptureEnvironment(id), arguments = known_arguments(arguments) }, checked, prepared.unions, span, prepared.records, []):
+		match ensure_record({ origin = CaptureEnvironment(id), arguments = arguments.known_arguments() }, checked, prepared.unions, span, prepared.records, []):
 			Err(error): Err(error)
 			Ok(layout):
-				match known_type(layout.value_type, span):
+				match layout.value_type.known_type(span):
 					Err(error): Err(error)
 					Ok(RecordType(owner)): Ok({
 						storage = EnvironmentCallable(owner),
@@ -2545,44 +2540,44 @@ private pure func prepare_callable_storage(
 
 -- Check has proved the obligation. Ground semantic Self before selecting the
 -- ordinary body request; opaque receiver identity never comes from its layout.
-private pure func selected_method_body(method: Checked.AcceptedMethodCall, substitution: Declarations.Substitution, traits: Checked.AcceptedTraits, span: Span) -> Result[Checked.SelectedMethodBody, Diagnostic]:
-	receiver ?= semantic_type(Checked.method_receiver(method), substitution, span)
-	Checked.method_body(traits, Checked.accepted_method(Checked.method_identity(method), receiver))
+private pure func selected_method_body(method: AcceptedMethodCall, substitution: Declarations.Substitution, traits: AcceptedTraits, span: Span) -> Result[Checked.SelectedMethodBody, Diagnostic]:
+	receiver ?= semantic_type(method.method_receiver(), substitution, span)
+	traits.method_body(Checked.accepted_method(method.method_identity(), receiver))
 		.or_internal_error(span, "accepted method has no implementation body")
 
 
 private pure func prepare_body_instance(body: Checked.BodyOwner, arguments: List[Checked.TypeRef], checked: Checked.CheckedFunctions, initial: PreparedInstances, span: Span) -> Result[PreparedInstances, Diagnostic]:
-	types ?= prepare_arguments(arguments, [], checked, initial.unions, span, initial.records, [])
-	concrete ?= known_types(types.arguments, span)
-	key ?= runtime_key(body, arguments, checked, span)
+	types ?= arguments.prepare_arguments([], checked, initial.unions, span, initial.records, [])
+	concrete ?= types.arguments.known_types(span)
+	key ?= body.runtime_key(arguments, checked, span)
 	request_instance({ initial | unions = types.unions, records = types.records }, key, ConcreteRequest(span), span)
 
 
-private pure func prepare_named_instance(id: Declaration.FunctionId, arguments: List[Checked.TypeRef], checked: Checked.CheckedFunctions, initial: PreparedInstances, span: Span) -> Result[PreparedInstances, Diagnostic]:
+private pure func prepare_named_instance(id: FunctionId, arguments: List[Checked.TypeRef], checked: Checked.CheckedFunctions, initial: PreparedInstances, span: Span) -> Result[PreparedInstances, Diagnostic]:
 	prepare_body_instance(Checked.DeclaredBody(id), arguments, checked, initial, span)
 
 
 private pure func prepare_named_creation(
-	id: Declaration.FunctionId, arguments: List[Checked.TypeRef],
+	id: FunctionId, arguments: List[Checked.TypeRef],
 	substitution: Declarations.Substitution, checked: Checked.CheckedFunctions,
 	initial: PreparedInstances, span: Span,
 ) -> Result[PreparedInstances, Diagnostic]:
-	semantic ?= semantic_arguments(arguments, substitution, span)
-	prepare_named_instance(id, semantic, checked, initial, span)
+	semantic ?= arguments.semantic_arguments(substitution, span)
+	id.prepare_named_instance(semantic, checked, initial, span)
 
 
 private pure func prepare_lambda_creation(
-	id: Checked.LambdaId, captures: List[Checked.CheckedExpr],
+	id: LambdaId, captures: List[Checked.CheckedExpr],
 	arguments: List[Checked.TypeRef], storage_arguments: List[TypeRef],
 	checked: Checked.CheckedFunctions, initial: PreparedInstances, span: Span,
 ) -> Result[PreparedInstances, Diagnostic]:
-	storage ?= prepare_callable_storage(id, captures, storage_arguments, checked, initial, span)
+	storage ?= id.prepare_callable_storage(captures, storage_arguments, checked, initial, span)
 	key ?= runtime_key(Checked.LambdaBody(id), arguments, checked, span)
 	-- A created lambda value is a runtime closure that holds its environment.
 	prepared = match storage.storage:
-		EnvironmentCallable(owner): mark_closure_environment(storage.prepared, owner)
+		EnvironmentCallable(owner): storage.prepared.mark_closure_environment(owner)
 		ErasedCallable: storage.prepared
-	request_instance(prepared, key, ConcreteRequest(span), span)
+	prepared.request_instance(key, ConcreteRequest(span), span)
 
 
 private pure func mark_closure_environment(prepared: PreparedInstances, owner: RecordInstanceId) -> PreparedInstances:
@@ -2615,7 +2610,7 @@ private pure func converted_parameter_environments(
 			match known.storage:
 				EnvironmentCallable(owner):
 					if used.any(pure func(parameter): parameter == known.parameter):
-						result = mark_closure_environment(result, owner)
+						result = result.mark_closure_environment(owner)
 				ErasedCallable: void
 		result
 
@@ -2627,18 +2622,18 @@ private pure func prepare_creation(
 ) -> Result[PreparedInstances, Diagnostic]:
 	match value.form:
 		Checked.MakeCallable(Checked.MethodCallable(method)):
-			match selected_method_body(method, substitution, checked.traits, value.span):
-				Ok(selected): prepare_body_instance(selected.body, selected.arguments, checked, initial, value.span)
+			match method.selected_method_body(substitution, checked.traits, value.span):
+				Ok(selected): selected.body.prepare_body_instance(selected.arguments, checked, initial, value.span)
 				Err(error): Err(error)
 		Checked.MakeCallable(Checked.NamedCallable(id, arguments)):
-			prepare_named_creation(id, arguments, substitution, checked, initial, value.span)
+			id.prepare_named_creation(arguments, substitution, checked, initial, value.span)
 		Checked.MakeCallable(Checked.LambdaCallable(id, captures)):
-			prepare_lambda_creation(id, captures, request.key.arguments, storage_arguments, checked, initial, value.span)
+			id.prepare_lambda_creation(captures, request.key.arguments, storage_arguments, checked, initial, value.span)
 		_: Ok(initial)
 
 
-private pure func method_callable(method: Checked.AcceptedMethodCall, parameter: Checked.CallableParameterId, substitution: Declarations.Substitution, traits: Checked.AcceptedTraits, span: Span) -> Result[CallableMode, Diagnostic]:
-	selected ?= selected_method_body(method, substitution, traits, span)
+private pure func method_callable(method: AcceptedMethodCall, parameter: Checked.CallableParameterId, substitution: Declarations.Substitution, traits: AcceptedTraits, span: Span) -> Result[CallableMode, Diagnostic]:
+	selected ?= method.selected_method_body(substitution, traits, span)
 	Ok(StaticCallable({ parameter = parameter, body = selected.body, arguments = selected.arguments, storage = ErasedCallable }))
 
 
@@ -2648,23 +2643,22 @@ private pure func prepare_function(
 	checked: Checked.CheckedFunctions,
 	initial: PreparedInstances,
 ) -> Result[PreparedInstances, Diagnostic]:
-	semantic ?= function_substitution(function, request.key.arguments, function.return_type.span)
-	argument_layouts ?= prepare_arguments(request.key.arguments, [], checked, initial.unions, function.return_type.span, initial.records, [])
-	storage_arguments ?= known_types(argument_layouts.arguments, function.return_type.span)
-	substitution ?= parameter_substitution(
-		function.type_parameters, argument_layouts.arguments,
+	semantic ?= function.function_substitution(request.key.arguments, function.return_type.span)
+	argument_layouts ?= request.key.arguments.prepare_arguments([], checked, initial.unions, function.return_type.span, initial.records, [])
+	storage_arguments ?= argument_layouts.arguments.known_types(function.return_type.span)
+	substitution ?= function.type_parameters.parameter_substitution(
+		argument_layouts.arguments,
 		function.parameter_owner, function.return_type.span,
 	)
 	var prepared = { initial | unions = argument_layouts.unions, records = argument_layouts.records }
 	var failure: Option[Diagnostic] = None
 	has_type_parameters = function.type_parameters.is_empty().not()
 
-	for written in function_types(function):
+	for written in function.function_types():
 		depends_on_caller = match has_type_parameters:
 			True: Checked.contains_parameter(written.value_type)
 			False: False
-		match prepare_type(
-			written.value_type,
+		match written.value_type.prepare_type(
 			substitution,
 			checked,
 			prepared.unions,
@@ -2683,35 +2677,35 @@ private pure func prepare_function(
 
 	if failure.is_some().not():
 		for value in Checked.body_callable_creations(function.statements, function.body):
-			match prepare_creation(value, request, semantic, storage_arguments, checked, prepared):
+			match value.prepare_creation(request, semantic, storage_arguments, checked, prepared):
 				Ok(next): prepared = next
 				Err(error):
 					failure = Some(error)
 					break
 
 	if failure.is_some().not():
-		prepared = converted_parameter_environments(function, request.key, prepared)
+		prepared = function.converted_parameter_environments(request.key, prepared)
 
 	if failure.is_some().not():
 		for call in Checked.body_calls(function.statements, function.body):
 			match call.target:
 				Checked.TraitMethod(method):
-					match selected_method_body(method, semantic, checked.traits, call.span):
+					match method.selected_method_body(semantic, checked.traits, call.span):
 						Err(error): failure = Some(error)
 						Ok(selected):
-							match prepare_body_instance(selected.body, selected.arguments, checked, prepared, call.span):
+							match selected.body.prepare_body_instance(selected.arguments, checked, prepared, call.span):
 								Err(error): failure = Some(error)
 								Ok(next): prepared = next
 				Checked.RuntimeFunction(_): void
 				Checked.ValueCall(_): void
 				Checked.CallableParameter(parameter):
-					match callable_mode(request.key.callables, parameter, call.span):
+					match request.key.callables.callable_mode(parameter, call.span):
 						Err(error): failure = Some(error)
 						Ok(RuntimeCallable(_)): void
 						Ok(StaticCallable(choice)):
-							match runtime_key(choice.body, choice.arguments, checked, call.span):
+							match choice.body.runtime_key(choice.arguments, checked, call.span):
 								Ok(key):
-									match request_instance(prepared, key, request.source, call.span):
+									match prepared.request_instance(key, request.source, call.span):
 										Ok(next): prepared = next
 										Err(error): failure = Some(error)
 								Err(error): failure = Some(error)
@@ -2725,21 +2719,21 @@ private pure func prepare_function(
 						argument_depends_on_caller = match has_type_parameters:
 							True: Checked.contains_parameter(argument)
 							False: False
-						depends_on_caller = or(depends_on_caller, argument_depends_on_caller)
+						depends_on_caller = depends_on_caller.or(argument_depends_on_caller)
 						argument_span = request_span(argument_depends_on_caller, request.source, call.span)
-						match semantic_type(argument, semantic, argument_span):
+						match argument.semantic_type(semantic, argument_span):
 							Err(error):
 								failure = Some(error)
 								break
 							Ok(replaced):
-								match prepare_type(replaced, [], checked, prepared.unions, argument_span, prepared.records, []):
+								match replaced.prepare_type([], checked, prepared.unions, argument_span, prepared.records, []):
 									Err(error):
 										failure = Some(error)
 										break
 									Ok(value):
 										prepared = { prepared | unions = value.unions, records = value.records }
 										-- No layout is in progress at a function boundary.
-										match known_type(value.value_type, call.span):
+										match value.value_type.known_type(call.span):
 											Ok(_): concrete = concrete.append(replaced)
 											Err(error):
 												failure = Some(error)
@@ -2758,10 +2752,10 @@ private pure func prepare_function(
 									Checked.ForwardedCallable(parameter):
 										-- A forwarded selection depends on the current caller's key.
 										choice_depends_on_caller = True
-										forward_callable(request.key.callables, parameter, written_parameter, written_span)
+										request.key.callables.forward_callable(parameter, written_parameter, written_span)
 									Checked.LambdaCallable(id, captures):
 										choice_depends_on_caller = has_type_parameters
-										match prepare_callable_storage(id, captures, storage_arguments, checked, prepared, written_span):
+										match id.prepare_callable_storage(captures, storage_arguments, checked, prepared, written_span):
 											Err(error): Err(error)
 											Ok(storage):
 												prepared = storage.prepared
@@ -2773,34 +2767,34 @@ private pure func prepare_function(
 												}))
 									Checked.MethodCallable(method):
 										choice_depends_on_caller = has_type_parameters
-										match selected_method_body(method, semantic, checked.traits, written_span):
+										match method.selected_method_body(semantic, checked.traits, written_span):
 											Err(error): Err(error)
 											Ok(selected):
-												match prepare_arguments(selected.arguments, [], checked, prepared.unions, written_span, prepared.records, []):
+												match selected.arguments.prepare_arguments([], checked, prepared.unions, written_span, prepared.records, []):
 													Err(error): Err(error)
 													Ok(layouts):
 														prepared = { prepared | unions = layouts.unions, records = layouts.records }
-														known_types(layouts.arguments, written_span).map(pure func(_): StaticCallable({ parameter = written_parameter, body = selected.body, arguments = selected.arguments, storage = ErasedCallable }))
+														layouts.arguments.known_types(written_span).map(pure func(_): StaticCallable({ parameter = written_parameter, body = selected.body, arguments = selected.arguments, storage = ErasedCallable }))
 									Checked.NamedCallable(id, named_arguments):
 										choice_depends_on_caller = match has_type_parameters:
 											True: named_arguments.any(Checked.contains_parameter)
 											False: False
 										span = request_span(choice_depends_on_caller, request.source, written_span)
-										match semantic_arguments(named_arguments, semantic, span):
+										match named_arguments.semantic_arguments(semantic, span):
 											Err(error): Err(error)
 											Ok(callable_arguments):
-												match prepare_arguments(callable_arguments, [], checked, prepared.unions, span, prepared.records, []):
+												match callable_arguments.prepare_arguments([], checked, prepared.unions, span, prepared.records, []):
 													Err(error): Err(error)
 													Ok(callable_layouts):
 														prepared = { prepared | unions = callable_layouts.unions, records = callable_layouts.records }
-														known_types(callable_layouts.arguments, written_span).map(pure func(_): StaticCallable({
+														callable_layouts.arguments.known_types(written_span).map(pure func(_): StaticCallable({
 															parameter = written_parameter,
 															body = Checked.DeclaredBody(id),
 															arguments = callable_arguments,
 															storage = ErasedCallable
 														}))
 									Checked.StoredCallable(_): Ok(RuntimeCallable(written_parameter))
-								depends_on_caller = or(depends_on_caller, choice_depends_on_caller)
+								depends_on_caller = depends_on_caller.or(choice_depends_on_caller)
 								match choice_result:
 									Err(error):
 										failure = Some(error)
@@ -2811,9 +2805,9 @@ private pure func prepare_function(
 											RuntimeCallable(_): void
 											StaticCallable(known):
 												span = request_span(choice_depends_on_caller, request.source, written_span)
-												match runtime_key(known.body, known.arguments, checked, span):
+												match known.body.runtime_key(known.arguments, checked, span):
 													Ok(key):
-														match request_instance(prepared, key, ConcreteRequest(span), span):
+														match prepared.request_instance(key, ConcreteRequest(span), span):
 															Ok(next): prepared = next
 															Err(error):
 																failure = Some(error)
@@ -2823,7 +2817,7 @@ private pure func prepare_function(
 														break
 					if failure.is_some().not():
 						callee_span = request_span(depends_on_caller, request.source, call.span)
-						match request_instance(prepared, {
+						match prepared.request_instance({
 							body = Checked.DeclaredBody(declaration),
 							arguments = concrete,
 							callables = choices
@@ -2860,10 +2854,10 @@ private pure func expand_instances(
 					),
 				)
 			Some(request):
-				match selected_body(checked, request.key.body, request.source):
+				match checked.selected_body(request.key.body, request.source):
 					Err(error): failure = Some(error)
 					Ok(function):
-						match prepare_function(function, request, checked, prepared):
+						match function.prepare_function(request, checked, prepared):
 							Ok(value): prepared = value
 							Err(error): failure = Some(error)
 
@@ -2881,14 +2875,14 @@ private pure func expand_instances(
 
 -- A call's concrete result instance names the designated union's constructors.
 private pure func translate_option(
-	option: DesignatedOption[Declaration.VariantId],
+	option: DesignatedOption[VariantId],
 	result_type: TypeRef,
 	unions: SealedUnions,
 	span: Span,
 ) -> Result[DesignatedOption[VariantInstanceId], Diagnostic]:
-	owner ?= concrete_union_owner(result_type, span)
-	some ?= translate_variant(option.some, owner, unions, span)
-	none ?= translate_variant(option.none, owner, unions, span)
+	owner ?= result_type.concrete_union_owner(span)
+	some ?= option.some.translate_variant(owner, unions, span)
+	none ?= option.none.translate_variant(owner, unions, span)
 	Ok({
 		some = some,
 		none = none,
@@ -2896,26 +2890,26 @@ private pure func translate_option(
 
 
 private pure func translate_result(
-	result: DesignatedResult[Declaration.VariantId],
+	result: DesignatedResult[VariantId],
 	result_type: TypeRef,
 	unions: SealedUnions,
 	span: Span,
 ) -> Result[DesignatedResult[VariantInstanceId], Diagnostic]:
-	owner ?= concrete_union_owner(result_type, span)
-	ok ?= translate_variant(result.ok, owner, unions, span)
-	error ?= translate_variant(result.err, owner, unions, span)
+	owner ?= result_type.concrete_union_owner(span)
+	ok ?= result.ok.translate_variant(owner, unions, span)
+	error ?= result.err.translate_variant(owner, unions, span)
 	Ok({ ok = ok, err = error })
 
 
 private pure func translate_boolean(
-	boolean: DesignatedBoolean[Declaration.VariantId],
+	boolean: DesignatedBoolean[VariantId],
 	result_type: TypeRef,
 	unions: SealedUnions,
 	span: Span,
 ) -> Result[DesignatedBoolean[VariantInstanceId], Diagnostic]:
-	owner ?= concrete_union_owner(result_type, span)
-	true_variant ?= translate_variant(boolean.true_variant, owner, unions, span)
-	false_variant ?= translate_variant(boolean.false_variant, owner, unions, span)
+	owner ?= result_type.concrete_union_owner(span)
+	true_variant ?= boolean.true_variant.translate_variant(owner, unions, span)
+	false_variant ?= boolean.false_variant.translate_variant(owner, unions, span)
 	Ok({
 		true_variant = true_variant,
 		false_variant = false_variant,
@@ -2924,35 +2918,35 @@ private pure func translate_boolean(
 
 private union CaptureBinding:
 	NoCaptureBinding
-	LambdaCaptureBinding(Checked.LambdaId, RecordInstanceId, Checked.BindingId)
+	LambdaCaptureBinding(LambdaId, RecordInstanceId, BindingId)
 
 
 -- Each checked binding has exactly one physical translation. A static callable
 -- has no data slot; an environment or stored value has one issued runtime slot.
 private union BindingTranslation:
 	ErasedCallableBinding(KnownCallable, TypeRef)
-	CapturedCallableBinding(KnownCallable, Checked.BindingId, TypeRef)
-	RuntimeCallableBinding(Checked.CallableParameterId, Checked.BindingId, TypeRef)
-	RuntimeValueBinding(Checked.BindingId, TypeRef)
+	CapturedCallableBinding(KnownCallable, BindingId, TypeRef)
+	RuntimeCallableBinding(Checked.CallableParameterId, BindingId, TypeRef)
+	RuntimeValueBinding(BindingId, TypeRef)
 
 
 private record TranslationBindings {
-	traits: Checked.AcceptedTraits,
+	traits: AcceptedTraits,
 	bindings: List[BindingTranslation],
 	capture: CaptureBinding
 }
 
 
 private pure func translated_binding(
-	translation: TranslationBindings, id: Checked.BindingId, span: Span,
+	translation: TranslationBindings, id: BindingId, span: Span,
 ) -> Result[BindingTranslation, Diagnostic]:
-	translation.bindings.get(Checked.binding_number(id)).or_internal_error(span, "missing checked binding translation")
+	translation.bindings.get(id.binding_number()).or_internal_error(span, "missing checked binding translation")
 
 
 private pure func runtime_binding(
-	translation: TranslationBindings, id: Checked.BindingId, span: Span,
-) -> Result[Checked.BindingId, Diagnostic]:
-	binding ?= translated_binding(translation, id, span)
+	translation: TranslationBindings, id: BindingId, span: Span,
+) -> Result[BindingId, Diagnostic]:
+	binding ?= translation.translated_binding(id, span)
 	match binding:
 		RuntimeValueBinding(runtime, _): Ok(runtime)
 		RuntimeCallableBinding(_, runtime, _): Ok(runtime)
@@ -2961,9 +2955,9 @@ private pure func runtime_binding(
 
 
 private pure func runtime_bindings(
-	translation: TranslationBindings, ids: List[Checked.BindingId], span: Span,
-) -> Result[List[Checked.BindingId], Diagnostic]:
-	translated_list(ids, pure func(id: Checked.BindingId) -> Result[Checked.BindingId, Diagnostic]: runtime_binding(translation, id, span))
+	translation: TranslationBindings, ids: List[BindingId], span: Span,
+) -> Result[List[BindingId], Diagnostic]:
+	ids.translated_list(pure func(id: BindingId) -> Result[BindingId, Diagnostic]: translation.runtime_binding(id, span))
 
 
 private pure func translated_callable(
@@ -2986,7 +2980,7 @@ private pure func forward_translation(
 	translation: TranslationBindings, source_parameter: Checked.CallableParameterId,
 	destination_parameter: Checked.CallableParameterId, span: Span,
 ) -> Result[CallableMode, Diagnostic]:
-	binding ?= translated_callable(translation, source_parameter, span)
+	binding ?= translation.translated_callable(source_parameter, span)
 	match binding:
 		ErasedCallableBinding(known, _): Ok(StaticCallable({ known | parameter = destination_parameter }))
 		CapturedCallableBinding(known, _, _): Ok(StaticCallable({ known | parameter = destination_parameter }))
@@ -2995,7 +2989,7 @@ private pure func forward_translation(
 
 
 private pure func lambda_storage(
-	id: Checked.LambdaId,
+	id: LambdaId,
 	capture_count: Int,
 	arguments: List[Checked.TypeRef], opaques: List[Checked.CheckedOpaque],
 	substitution: Declarations.Substitution, unions: SealedUnions,
@@ -3017,7 +3011,7 @@ private pure func callable_environment(
 	translation: TranslationBindings,
 	span: Span,
 ) -> Result[ConcreteExpr, Diagnostic]:
-	binding ?= translated_callable(translation, parameter, span)
+	binding ?= translation.translated_callable(parameter, span)
 	match binding:
 		CapturedCallableBinding(known, runtime, _):
 			match known.storage:
@@ -3038,9 +3032,9 @@ private pure func translate_call(
 ) -> Result[ConcreteCall, Diagnostic]:
 	target_result: Result[CallTarget, Diagnostic] = match call.target:
 		Checked.TraitMethod(method):
-			match selected_method_body(method, substitution, callables.traits, call.span):
+			match method.selected_method_body(substitution, callables.traits, call.span):
 				Err(error): Err(error)
-				Ok(selected): runtime_instance(keys, selected.body, selected.arguments, call.span).map(pure func(id): UserFunction(id))
+				Ok(selected): keys.runtime_instance(selected.body, selected.arguments, call.span).map(pure func(id): UserFunction(id))
 		Checked.RuntimeFunction(operation):
 			concrete_result: Result[RuntimeOperation[VariantInstanceId, TypeRef], Diagnostic] = match operation:
 				IntAdd:
@@ -3118,54 +3112,54 @@ private pure func translate_call(
 					accepted: RuntimeOperation[VariantInstanceId, TypeRef] = Builtins.StringPrintError
 					Ok(accepted)
 				StringParseInt(option):
-					match translate_option(option, result_type, unions, call.span):
+					match option.translate_option(result_type, unions, call.span):
 						Ok(translated): Ok(Builtins.StringParseInt(translated))
 						Err(error): Err(error)
 				StringParseFloat(option):
-					match translate_option(option, result_type, unions, call.span):
+					match option.translate_option(result_type, unions, call.span):
 						Ok(translated): Ok(Builtins.StringParseFloat(translated))
 						Err(error): Err(error)
 				StringByteAt(option):
-					match translate_option(option, result_type, unions, call.span):
+					match option.translate_option(result_type, unions, call.span):
 						Ok(translated): Ok(Builtins.StringByteAt(translated))
 						Err(error): Err(error)
 				SystemCall(system, result):
-					match translate_result(result, result_type, unions, call.span):
+					match result.translate_result(result_type, unions, call.span):
 						Ok(translated): Ok(Builtins.SystemCall(system, translated))
 						Err(error): Err(error)
 				StringFromCodepoint(option):
-					match translate_option(option, result_type, unions, call.span):
+					match option.translate_option(result_type, unions, call.span):
 						Ok(translated): Ok(Builtins.StringFromCodepoint(translated))
 						Err(error): Err(error)
 				StringSlice(option):
-					match translate_option(option, result_type, unions, call.span):
+					match option.translate_option(result_type, unions, call.span):
 						Ok(translated): Ok(Builtins.StringSlice(translated))
 						Err(error): Err(error)
 				ListGet(element, option):
 					match concrete_type(opaques, element, substitution, unions, call.span, records):
 						Ok(concrete):
-							match translate_option(option, result_type, unions, call.span):
+							match option.translate_option(result_type, unions, call.span):
 								Ok(translated): Ok(Builtins.ListGet(concrete, translated))
 								Err(error): Err(error)
 						Err(error): Err(error)
 				IntEquals(boolean):
-					match translate_boolean(boolean, result_type, unions, call.span):
+					match boolean.translate_boolean(result_type, unions, call.span):
 						Ok(translated): Ok(Builtins.IntEquals(translated))
 						Err(error): Err(error)
 				IntLessThan(boolean):
-					match translate_boolean(boolean, result_type, unions, call.span):
+					match boolean.translate_boolean(result_type, unions, call.span):
 						Ok(translated): Ok(Builtins.IntLessThan(translated))
 						Err(error): Err(error)
 				FloatEquals(boolean):
-					match translate_boolean(boolean, result_type, unions, call.span):
+					match boolean.translate_boolean(result_type, unions, call.span):
 						Ok(translated): Ok(Builtins.FloatEquals(translated))
 						Err(error): Err(error)
 				FloatLessThan(boolean):
-					match translate_boolean(boolean, result_type, unions, call.span):
+					match boolean.translate_boolean(result_type, unions, call.span):
 						Ok(translated): Ok(Builtins.FloatLessThan(translated))
 						Err(error): Err(error)
 				StringEquals(boolean):
-					match translate_boolean(boolean, result_type, unions, call.span):
+					match boolean.translate_boolean(result_type, unions, call.span):
 						Ok(translated): Ok(Builtins.StringEquals(translated))
 						Err(error): Err(error)
 
@@ -3174,7 +3168,7 @@ private pure func translate_call(
 				Err(error): Err(error)
 		Checked.ValueCall(_): Err(internal_error(call.span, "stored call reached direct call translation"))
 		Checked.CallableParameter(parameter):
-			match translated_callable(callables, parameter, call.span):
+			match callables.translated_callable(parameter, call.span):
 				Err(error): Err(error)
 				Ok(binding):
 					choice: Result[KnownCallable, Diagnostic] = match binding:
@@ -3184,9 +3178,9 @@ private pure func translate_call(
 					match choice:
 						Err(error): Err(error)
 						Ok(known):
-							runtime_instance(keys, known.body, known.arguments, call.span).map(pure func(id): UserFunction(id))
+							keys.runtime_instance(known.body, known.arguments, call.span).map(pure func(id): UserFunction(id))
 		Checked.UserFunction(declaration, arguments):
-			match semantic_arguments(arguments, substitution, call.span):
+			match arguments.semantic_arguments(substitution, call.span):
 				Err(error): Err(error)
 				Ok(concrete):
 					var choices: List[CallableMode] = []
@@ -3197,18 +3191,18 @@ private pure func translate_call(
 							Checked.CallableOperand(written_parameter, written_choice, written_span):
 								choice_result: Result[CallableMode, Diagnostic] = match written_choice:
 									Checked.ForwardedCallable(parameter):
-										forward_translation(callables, parameter, written_parameter, written_span)
+										callables.forward_translation(parameter, written_parameter, written_span)
 									Checked.LambdaCallable(id, captures):
 										root_arguments = substitution.values
-										lambda_storage(id, captures.length(), root_arguments, opaques, substitution, unions, records, written_span).map(pure func(storage): StaticCallable({
+										id.lambda_storage(captures.length(), root_arguments, opaques, substitution, unions, records, written_span).map(pure func(storage): StaticCallable({
 											parameter = written_parameter,
 											body = Checked.LambdaBody(id),
 											arguments = root_arguments,
 											storage = storage
 										}))
-									Checked.MethodCallable(method): method_callable(method, written_parameter, substitution, callables.traits, written_span)
+									Checked.MethodCallable(method): method.method_callable(written_parameter, substitution, callables.traits, written_span)
 									Checked.NamedCallable(id, named_arguments):
-										semantic_arguments(named_arguments, substitution, written_span).map(pure func(values): StaticCallable({
+										named_arguments.semantic_arguments(substitution, written_span).map(pure func(values): StaticCallable({
 											parameter = written_parameter,
 											body = Checked.DeclaredBody(id),
 											arguments = values,
@@ -3223,7 +3217,7 @@ private pure func translate_call(
 					match failure:
 						Some(error): Err(error)
 						None:
-							match find_instance(keys, {
+							match keys.find_instance({
 								body = Checked.DeclaredBody(declaration),
 								arguments = concrete,
 								callables = choices
@@ -3251,21 +3245,21 @@ private pure func concrete_union_owner(
 
 
 private pure func translate_variant(
-	id: Declaration.VariantId,
+	id: VariantId,
 	owner: UnionInstanceId,
 	unions: SealedUnions,
 	span: Span,
 ) -> Result[VariantInstanceId, Diagnostic]:
-	key ?= unions.ids.keys().get(union_number(owner)).or_internal_error(span, "unknown concrete union")
-	layout ?= unions.layouts.get(union_number(owner)).or_internal_error(span, "unknown concrete union")
+	key ?= unions.ids.keys().get(owner.union_number()).or_internal_error(span, "unknown concrete union")
+	layout ?= unions.layouts.get(owner.union_number()).or_internal_error(span, "unknown concrete union")
 
-	_: Void ?= if key.declaration == Declaration.variant_owner(id):
+	_: Void ?= if key.declaration == id.variant_owner():
 		Ok(void)
 	else:
 		Err(internal_error(span, "variant belongs to a different union declaration"))
 
-	position = Declaration.variant_number(id)
-	member ?= union_variants(layout)
+	position = id.variant_number()
+	member ?= layout.union_variants()
 		.get(position)
 		.or_internal_error(span, "unknown union variant")
 	Ok(into_opaque VariantInstanceId({
@@ -3285,7 +3279,7 @@ private pure func translate_record_field(
 	unions: SealedUnions,
 	records: SealedRecords,
 ) -> Result[ConcreteRecordField, Diagnostic]:
-	id ?= translate_field(field.field, owner, records, field.span)
+	id ?= field.field.translate_field(owner, records, field.span)
 	child ?= translate_expr(opaques, field.value, substitution, callables, keys, unions, records)
 	Ok({ field = id, value = child })
 
@@ -3300,7 +3294,7 @@ private pure func translate_record_fields(
 	unions: SealedUnions,
 	records: SealedRecords,
 ) -> Result[List[ConcreteRecordField], Diagnostic]:
-	translated_list(fields, pure func(field: Checked.CheckedRecordField) -> Result[ConcreteRecordField, Diagnostic]:
+	fields.translated_list(pure func(field: Checked.CheckedRecordField) -> Result[ConcreteRecordField, Diagnostic]:
 		translate_record_field(opaques, field, owner, substitution, callables, keys, unions, records)
 	)
 
@@ -3312,12 +3306,12 @@ private pure func callable_binding_value(
 		RuntimeValueBinding(runtime, value_type): Ok({ form = ReadBinding(runtime), value_type = value_type, span = span })
 		RuntimeCallableBinding(_, runtime, value_type): Ok({ form = ReadBinding(runtime), value_type = value_type, span = span })
 		ErasedCallableBinding(known, value_type):
-			match runtime_instance(keys, known.body, known.arguments, span):
+			match keys.runtime_instance(known.body, known.arguments, span):
 				Err(error): Err(error)
 				Ok(id):
 					Ok({ form = FreeCallable(id), value_type = value_type, span = span })
 		CapturedCallableBinding(known, runtime, value_type):
-			match runtime_instance(keys, known.body, known.arguments, span):
+			match keys.runtime_instance(known.body, known.arguments, span):
 				Err(error): Err(error)
 				Ok(id):
 					match known.storage:
@@ -3335,26 +3329,26 @@ private pure func translate_callable_value(
 	match choice:
 		Checked.StoredCallable(value): translate_expr(opaques, value, substitution, translation, keys, unions, records)
 		Checked.ForwardedCallable(parameter):
-			match translated_callable(translation, parameter, span):
+			match translation.translated_callable(parameter, span):
 				Err(error): Err(error)
 				Ok(binding):
-					callable_binding_value(binding, keys, span)
+					binding.callable_binding_value(keys, span)
 		Checked.MethodCallable(method):
-			match selected_method_body(method, substitution, translation.traits, span):
+			match method.selected_method_body(substitution, translation.traits, span):
 				Err(error): Err(error)
 				Ok(selected):
-					runtime_instance(keys, selected.body, selected.arguments, span).map(pure func(body) -> ConcreteExpr: { form = FreeCallable(body), value_type = value_type, span = span })
+					keys.runtime_instance(selected.body, selected.arguments, span).map(pure func(body) -> ConcreteExpr: { form = FreeCallable(body), value_type = value_type, span = span })
 		Checked.NamedCallable(id, arguments):
-			match semantic_arguments(arguments, substitution, span):
+			match arguments.semantic_arguments(substitution, span):
 				Err(error): Err(error)
 				Ok(concrete):
-					match runtime_instance(keys, Checked.DeclaredBody(id), concrete, span):
+					match keys.runtime_instance(Checked.DeclaredBody(id), concrete, span):
 						Err(error): Err(error)
 						Ok(body):
 							Ok({ form = FreeCallable(body), value_type = value_type, span = span })
 		Checked.LambdaCallable(id, captures):
 			arguments = substitution.values
-			match runtime_instance(keys, Checked.LambdaBody(id), arguments, span):
+			match keys.runtime_instance(Checked.LambdaBody(id), arguments, span):
 				Err(error): Err(error)
 				Ok(body):
 					match translate_capture_environment(opaques, id, captures, substitution, translation, keys, unions, records, span):
@@ -3378,14 +3372,14 @@ private pure func translate_call_chain(
 	var links: List[CallLink] = []
 	var innermost = first
 	while True:
-		match chained_operand(innermost.call):
+		match innermost.call.chained_operand():
 			None: break
 			Some(next):
 				links = links.append(innermost)
 				innermost = next
 	var current = translate_invocation(opaques, innermost.value, innermost.call, None, substitution, translation, keys, unions, records)
 	var position = links.length()
-	while and(position > 0, current.is_ok()):
+	while (position > 0).and(current.is_ok()):
 		position = position - 1
 		current = match links.get(position):
 			Some(link): current.and_then(pure func(below): translate_invocation(opaques, link.value, link.call, Some(below), substitution, translation, keys, unions, records))
@@ -3405,11 +3399,11 @@ private pure func translate_invocation(
 	callee: Result[Option[ConcreteExpr], Diagnostic] = match call.target:
 		Checked.ValueCall(operand): translate_expr(opaques, operand, substitution, translation, keys, unions, records).map(pure func(callee_value): Some(callee_value))
 		Checked.CallableParameter(parameter):
-			match translated_callable(translation, parameter, call.span):
+			match translation.translated_callable(parameter, call.span):
 				Err(error): Err(error)
 				Ok(binding):
 					match binding:
-						RuntimeCallableBinding(_, _, _): callable_binding_value(binding, keys, call.span).map(pure func(callee_value): Some(callee_value))
+						RuntimeCallableBinding(_, _, _): binding.callable_binding_value(keys, call.span).map(pure func(callee_value): Some(callee_value))
 						_: Ok(None)
 		_: Ok(None)
 	selected ?= callee
@@ -3497,15 +3491,15 @@ private pure func translate_expr(
 					match source.value_type:
 						RecordType(owner):
 							-- The prepared receiver row already owns this exact concrete field type.
-							match concrete_record_field_type(field, owner, records, value.span):
+							match field.concrete_record_field_type(owner, records, value.span):
 								Ok(value_type):
-									translated_field = into_opaque FieldInstanceId({ owner = owner, position = Checked.field_number(field) })
+									translated_field = into_opaque FieldInstanceId({ owner = owner, position = field.field_number() })
 									Ok({ form = ReadRecordField(source, translated_field), value_type = value_type, span = value.span })
 								Err(error): Err(error)
 						_: Err(internal_error(value.span, "record operation has a non-record receiver"))
 				Err(error): Err(error)
 		Checked.InvokeFunction(call):
-			match chained_operand(call):
+			match call.chained_operand():
 				Some(first): translate_call_chain(opaques, value, call, first, substitution, callables, keys, unions, records)
 				None: translate_invocation(opaques, value, call, None, substitution, callables, keys, unions, records)
 		Checked.UpdateRecord(declaration, update):
@@ -3515,8 +3509,8 @@ private pure func translate_expr(
 						Ok(base):
 							match translate_record_fields(opaques, update.replacements, owner, substitution, callables, keys, unions, records):
 								Ok(replacements):
-									inherited_result: Result[List[RetainedRecordField], Diagnostic] = translated_list(update.inherited, pure func(field: Checked.RetainedRecordField) -> Result[RetainedRecordField, Diagnostic]:
-										match translate_field(field.field, owner, records, update.base_expression_span):
+									inherited_result: Result[List[RetainedRecordField], Diagnostic] = update.inherited.translated_list(pure func(field: Checked.RetainedRecordField) -> Result[RetainedRecordField, Diagnostic]:
+										match field.field.translate_field(owner, records, update.base_expression_span):
 											Ok(id):
 												match concrete_type(opaques, field.value_type, substitution, unions, update.base_expression_span, records):
 													Ok(value_type): Ok({ field = id, value_type = value_type })
@@ -3534,9 +3528,9 @@ private pure func translate_expr(
 		Checked.ConstructVariant(id, children):
 			match concrete_type(opaques, value.value_type, substitution, unions, value.span, records):
 				Ok(value_type):
-					match concrete_union_owner(value_type, value.span):
+					match value_type.concrete_union_owner(value.span):
 						Ok(owner):
-							match translate_variant(id, owner, unions, value.span):
+							match id.translate_variant(owner, unions, value.span):
 								Ok(variant):
 									match translate_exprs(opaques, children, substitution, callables, keys, unions, records):
 										Ok(values): Ok({ form = ConstructVariant(variant, values), value_type = value_type, span = value.span })
@@ -3579,17 +3573,17 @@ private pure func translate_expr(
 			match callables.capture:
 				NoCaptureBinding: Err(internal_error(value.span, "capture read outside a capture environment"))
 				LambdaCaptureBinding(lambda, owner, binding):
-					if lambda == Checked.capture_owner(id):
+					if lambda == id.capture_owner():
 						receiver: ConcreteExpr = { form = ReadBinding(binding), value_type = RecordType(owner), span = value.span }
-						field = into_opaque FieldInstanceId({ owner = owner, position = Checked.capture_number(id) })
+						field = into_opaque FieldInstanceId({ owner = owner, position = id.capture_number() })
 						translate_leaf(opaques, ReadRecordField(receiver, field), value, substitution, unions, records)
 					else:
 						Err(internal_error(value.span, "capture read belongs to another lambda"))
 		Checked.ReadBinding(id):
-			match translated_binding(callables, id, value.span):
+			match callables.translated_binding(id, value.span):
 				Err(error): Err(error)
 				Ok(binding):
-					callable_binding_value(binding, keys, value.span)
+					binding.callable_binding_value(keys, value.span)
 
 
 -- A leaf keeps its checked form; only its type is made concrete.
@@ -3661,13 +3655,13 @@ private pure func translate_call_arguments(
 	values ?= translate_call_operands(opaques, call, first, substitution, translation, keys, unions, records)
 	match call.target:
 		Checked.CallableParameter(parameter):
-			match translated_callable(translation, parameter, call.span):
+			match translation.translated_callable(parameter, call.span):
 				Err(error): Err(error)
 				Ok(binding):
 					match binding:
 						ErasedCallableBinding(_, _): Ok(values)
 						CapturedCallableBinding(_, _, _):
-							match callable_environment(parameter, translation, call.span):
+							match parameter.callable_environment(translation, call.span):
 								Err(error): Err(error)
 								Ok(environment): Ok([environment].concat(values))
 						_: Err(internal_error(call.span, "runtime callable reached direct argument translation"))
@@ -3688,24 +3682,24 @@ private pure func translate_callable_operand(
 		Checked.MethodCallable(_) | Checked.NamedCallable(_, _): Ok(None)
 		Checked.StoredCallable(value): translate_expr(opaques, value, substitution, translation, keys, unions, records).map(pure func(concrete): Some(concrete))
 		Checked.ForwardedCallable(parameter):
-			match translated_callable(translation, parameter, span):
+			match translation.translated_callable(parameter, span):
 				Err(error): Err(error)
 				Ok(binding):
 					match binding:
 						ErasedCallableBinding(_, _): Ok(None)
-						CapturedCallableBinding(_, _, _): callable_environment(parameter, translation, span).map(pure func(value): Some(value))
-						RuntimeCallableBinding(_, _, _): callable_binding_value(binding, keys, span).map(pure func(value): Some(value))
+						CapturedCallableBinding(_, _, _): parameter.callable_environment(translation, span).map(pure func(value): Some(value))
+						RuntimeCallableBinding(_, _, _): binding.callable_binding_value(keys, span).map(pure func(value): Some(value))
 						RuntimeValueBinding(_, _): Err(internal_error(span, "ordinary binding used as a forwarded callable"))
 		Checked.LambdaCallable(id, captures):
 			translate_capture_environment(opaques, id, captures, substitution, translation, keys, unions, records, span)
 
 
 private pure func translate_capture_environment(
-	opaques: List[Checked.CheckedOpaque], id: Checked.LambdaId, captures: List[Checked.CheckedExpr],
+	opaques: List[Checked.CheckedOpaque], id: LambdaId, captures: List[Checked.CheckedExpr],
 	substitution: Declarations.Substitution, translation: TranslationBindings,
 	keys: IndexedList[FunctionRequest], unions: SealedUnions, records: SealedRecords, span: Span,
 ) -> Result[Option[ConcreteExpr], Diagnostic]:
-	match lambda_storage(id, captures.length(), substitution.values, opaques, substitution, unions, records, span):
+	match id.lambda_storage(captures.length(), substitution.values, opaques, substitution, unions, records, span):
 		Err(error): Err(error)
 		Ok(ErasedCallable): Ok(None)
 		Ok(EnvironmentCallable(owner)):
@@ -3729,7 +3723,7 @@ private pure func translate_exprs(
 	unions: SealedUnions,
 	records: SealedRecords,
 ) -> Result[List[ConcreteExpr], Diagnostic]:
-	translated_list(values, pure func(value: Checked.CheckedExpr) -> Result[ConcreteExpr, Diagnostic]:
+	values.translated_list(pure func(value: Checked.CheckedExpr) -> Result[ConcreteExpr, Diagnostic]:
 		translate_expr(opaques, value, substitution, callables, keys, unions, records)
 	)
 
@@ -3743,14 +3737,14 @@ private pure func translate_statements(
 	unions: SealedUnions,
 	records: SealedRecords,
 ) -> Result[List[ConcreteStatement], Diagnostic]:
-	translated_list(statements, pure func(
+	statements.translated_list(pure func(
 		statement: Checked.CheckedStatement,
 	) -> Result[ConcreteStatement, Diagnostic]:
 		match statement:
 			Checked.InitializeBinding(id, value):
 				match translate_expr(opaques, value, substitution, callables, keys, unions, records):
 					Ok(translated_value):
-						match runtime_binding(callables, id, value.span):
+						match callables.runtime_binding(id, value.span):
 							Ok(runtime): Ok(InitializeBinding(runtime, translated_value))
 							Err(error): Err(error)
 					Err(error): Err(error)
@@ -3761,12 +3755,12 @@ private pure func translate_statements(
 			Checked.ReassignBinding(id, value):
 				match translate_expr(opaques, value, substitution, callables, keys, unions, records):
 					Ok(translated_value):
-						match runtime_binding(callables, id, value.span):
+						match callables.runtime_binding(id, value.span):
 							Ok(runtime): Ok(ReassignBinding(runtime, translated_value))
 							Err(error): Err(error)
 					Err(error): Err(error)
 			Checked.RunWhile(loop):
-				match runtime_bindings(callables, loop.carried, loop.span):
+				match callables.runtime_bindings(loop.carried, loop.span):
 					Err(error): Err(error)
 					Ok(carried):
 						match translate_expr(opaques, loop.condition, substitution, callables, keys, unions, records):
@@ -3775,7 +3769,7 @@ private pure func translate_statements(
 								match translate_statements(opaques, loop.body, substitution, callables, keys, unions, records):
 									Err(error): Err(error)
 									Ok(body):
-										match translate_boolean(loop.boolean, condition.value_type, unions, loop.span):
+										match loop.boolean.translate_boolean(condition.value_type, unions, loop.span):
 											Err(error): Err(error)
 											Ok(boolean):
 												Ok(RunWhile({
@@ -3785,12 +3779,12 @@ private pure func translate_statements(
 			Checked.BreakSourceLoop(span): Ok(BreakSourceLoop(span))
 			Checked.ContinueSourceLoop(span): Ok(ContinueSourceLoop(span))
 			Checked.RunFor(loop):
-				match runtime_bindings(callables, loop.carried, loop.span):
+				match callables.runtime_bindings(loop.carried, loop.span):
 					Err(error): Err(error)
 					Ok(carried):
-						item_result: Result[Option[Checked.BindingId], Diagnostic] = match loop.item:
+						item_result: Result[Option[BindingId], Diagnostic] = match loop.item:
 							None: Ok(None)
-							Some(id): runtime_binding(callables, id, loop.span).map(pure func(runtime): Some(runtime))
+							Some(id): callables.runtime_binding(id, loop.span).map(pure func(runtime): Some(runtime))
 						match item_result:
 							Err(error): Err(error)
 							Ok(item):
@@ -3803,12 +3797,12 @@ private pure func translate_statements(
 													Err(error): Err(error)
 													Ok(concrete_element):
 														match concrete_type(
-															opaques, Checked.NominalType(Checked.AggregateNominal(Checked.UnionAggregate(Declaration.variant_owner(option.some))), [element]),
+															opaques, Checked.NominalType(Checked.AggregateNominal(Checked.UnionAggregate(option.some.variant_owner())), [element]),
 															substitution, unions, loop.span, records,
 														):
 															Err(error): Err(error)
 															Ok(option_type):
-																match translate_option(option, option_type, unions, loop.span):
+																match option.translate_option(option_type, unions, loop.span):
 																	Err(error): Err(error)
 																	Ok(concrete_option): Ok(ListIteration(value, concrete_element, concrete_option))
 									Checked.AscendingIntRange(start, end, boolean):
@@ -3819,12 +3813,12 @@ private pure func translate_statements(
 													Err(error): Err(error)
 													Ok(concrete_end):
 														match concrete_type(
-															opaques, Checked.NominalType(Checked.AggregateNominal(Checked.UnionAggregate(Declaration.variant_owner(boolean.true_variant))), []),
+															opaques, Checked.NominalType(Checked.AggregateNominal(Checked.UnionAggregate(boolean.true_variant.variant_owner())), []),
 															substitution, unions, loop.span, records,
 														):
 															Err(error): Err(error)
 															Ok(boolean_type):
-																match translate_boolean(boolean, boolean_type, unions, loop.span):
+																match boolean.translate_boolean(boolean_type, unions, loop.span):
 																	Err(error): Err(error)
 																	Ok(concrete_boolean): Ok(AscendingIntRange(concrete_start, concrete_end, concrete_boolean))
 								match iteration:
@@ -3841,12 +3835,12 @@ private pure func translate_statements(
 
 private pure func translate_place_variant(
 	value_type: TypeRef,
-	id: Declaration.VariantId,
+	id: VariantId,
 	unions: SealedUnions,
 	span: Span,
 ) -> Result[VariantInstanceId, Diagnostic]:
-	owner ?= concrete_union_owner(value_type, span)
-	translate_variant(id, owner, unions, span)
+	owner ?= value_type.concrete_union_owner(span)
+	id.translate_variant(owner, unions, span)
 
 
 private pure func translate_place(
@@ -3875,7 +3869,7 @@ private pure func translate_place(
 			match translate_place(opaques, parent, substitution, unions, records, span):
 				Err(error): Err(error)
 				Ok(concrete_parent):
-					match translate_place_variant(concrete_parent.value_type, id, unions, span):
+					match concrete_parent.value_type.translate_place_variant(id, unions, span):
 						Err(error): Err(error)
 						Ok(variant):
 							Ok(UnionField(concrete_parent, into_opaque VariantFieldInstanceId({ variant = variant, position = ordinal })))
@@ -3908,10 +3902,10 @@ private pure func translate_selection(
 	records: SealedRecords,
 	span: Span,
 ) -> Result[ConcreteSelection, Diagnostic]:
-	nodes ?= translated_list(selection.nodes, pure func(node: Checked.CheckedDecisionNode) -> Result[ConcreteDecisionNode, Diagnostic]:
+	nodes ?= selection.nodes.translated_list(pure func(node: Checked.CheckedDecisionNode) -> Result[ConcreteDecisionNode, Diagnostic]:
 		match node:
 			Checked.EnterArm(id, arguments):
-				match translated_list(arguments, pure func(argument: Checked.CheckedPatternArgument) -> Result[ConcretePatternArgument, Diagnostic]:
+				match arguments.translated_list(pure func(argument: Checked.CheckedPatternArgument) -> Result[ConcretePatternArgument, Diagnostic]:
 					translate_pattern_argument(opaques, argument, substitution, unions, records, span)
 				):
 					Ok(values): Ok(EnterArm(id, values))
@@ -3928,7 +3922,7 @@ private pure func translate_selection(
 				match translate_place(opaques, place, substitution, unions, records, span):
 					Err(error): Err(error)
 					Ok(concrete_place):
-						match translate_place_variant(concrete_place.value_type, id, unions, span):
+						match concrete_place.value_type.translate_place_variant(id, unions, span):
 							Ok(variant): Ok(TestVariant(concrete_place, variant, yes, no))
 							Err(error): Err(error)
 	)
@@ -3946,10 +3940,10 @@ private pure func translate_join(
 	records: SealedRecords,
 	span: Span,
 ) -> Result[ConcreteJoin, Diagnostic]:
-	carried ?= runtime_bindings(callables, join.carried, span)
+	carried ?= callables.runtime_bindings(join.carried, span)
 	scrutinee ?= translate_expr(opaques, join.scrutinee, substitution, callables, keys, unions, records)
 	selected ?= translate_selection(opaques, join.selection, substitution, unions, records, span)
-	arms ?= translated_list(join.arms, pure func(arm: Checked.CheckedJoinArm) -> Result[ConcreteJoinArm, Diagnostic]:
+	arms ?= join.arms.translated_list(pure func(arm: Checked.CheckedJoinArm) -> Result[ConcreteJoinArm, Diagnostic]:
 		translate_join_arm(opaques, arm, substitution, callables, keys, unions, records, span)
 	)
 	Ok({ scrutinee = scrutinee, selection = selected, arms = arms, carried = carried })
@@ -3967,7 +3961,7 @@ private pure func translate_join_arm(
 ) -> Result[ConcreteJoinArm, Diagnostic]:
 	statements ?= translate_statements(opaques, arm.statements, substitution, callables, keys, unions, records)
 	value ?= translate_expr(opaques, arm.value, substitution, callables, keys, unions, records)
-	inputs ?= runtime_bindings(callables, arm.inputs, span)
+	inputs ?= callables.runtime_bindings(arm.inputs, span)
 	Ok({ id = arm.id, inputs = inputs, statements = statements, value = value })
 
 
@@ -3997,20 +3991,20 @@ private pure func admit_scalar_type(
 	unions: List[ConcreteUnion],
 	records: List[ConcreteRecord],
 ) -> Result[Void, Diagnostic]:
-	needs_owner ?= value_needs_ownership(value_type, unions, records)
+	needs_owner ?= value_type.value_needs_ownership(unions, records)
 	match needs_owner:
 		False: Ok(void)
 		True: Err(diagnostic(span, "managed values in @tail_recursive functions are not supported yet", "use an unmanaged helper, or remove @tail_recursive"))
 
 
 private pure func admit_scalar_binding(
-	id: Checked.BindingId,
+	id: BindingId,
 	bindings: List[ConcreteBinding],
 	unions: List[ConcreteUnion],
 	records: List[ConcreteRecord],
 ) -> Result[Void, Diagnostic]:
-	binding ?= bindings.get(Checked.binding_number(id)).or_internal_error(compiler_span(), "invalid binding identity in scalar admission")
-	admit_scalar_type(binding.value_type, binding.span, unions, records)
+	binding ?= bindings.get(id.binding_number()).or_internal_error(compiler_span(), "invalid binding identity in scalar admission")
+	binding.value_type.admit_scalar_type(binding.span, unions, records)
 
 
 private pure func admit_scalar_values(
@@ -4021,7 +4015,7 @@ private pure func admit_scalar_values(
 ) -> Result[Void, Diagnostic]:
 	var admitted: Result[Void, Diagnostic] = Ok(void)
 	for value in values:
-		admitted = admit_scalar_value(value, bindings, unions, records)
+		admitted = value.admit_scalar_value(bindings, unions, records)
 		match admitted:
 			Err(_): break
 			Ok(_): void
@@ -4036,7 +4030,7 @@ private pure func admit_scalar_fields(
 ) -> Result[Void, Diagnostic]:
 	var admitted: Result[Void, Diagnostic] = Ok(void)
 	for field in fields:
-		admitted = admit_scalar_value(field.value, bindings, unions, records)
+		admitted = field.value.admit_scalar_value(bindings, unions, records)
 		match admitted:
 			Err(_): break
 			Ok(_): void
@@ -4050,16 +4044,16 @@ private pure func admit_scalar_value(
 	records: List[ConcreteRecord],
 ) -> Result[Void, Diagnostic]:
 	children ?= match value.form:
-		ConstructVariant(_, values): admit_scalar_values(values, bindings, unions, records)
-		ConstructList(values): admit_scalar_values(values, bindings, unions, records)
-		ConstructRecord(_, fields): admit_scalar_fields(fields, bindings, unions, records)
-		UpdateRecord(_, update): admit_scalar_update(update, bindings, unions, records)
-		InvokeFunction(_, arguments): admit_scalar_values(arguments, bindings, unions, records)
+		ConstructVariant(_, values): values.admit_scalar_values(bindings, unions, records)
+		ConstructList(values): values.admit_scalar_values(bindings, unions, records)
+		ConstructRecord(_, fields): fields.admit_scalar_fields(bindings, unions, records)
+		UpdateRecord(_, update): update.admit_scalar_update(bindings, unions, records)
+		InvokeFunction(_, arguments): arguments.admit_scalar_values(bindings, unions, records)
 		InvokeCallable(callee, arguments): admit_scalar_values([callee].concat(arguments), bindings, unions, records)
 		FreeCallable(_): Ok(void)
-		CapturedCallable(_, environment): admit_scalar_value(environment, bindings, unions, records)
-		ReadRecordField(receiver, _): admit_scalar_value(receiver, bindings, unions, records)
-		Match(join): admit_scalar_value(join.scrutinee, bindings, unions, records)
+		CapturedCallable(_, environment): environment.admit_scalar_value(bindings, unions, records)
+		ReadRecordField(receiver, _): receiver.admit_scalar_value(bindings, unions, records)
+		Match(join): join.scrutinee.admit_scalar_value(bindings, unions, records)
 		LiteralVoid | LiteralInteger(_) | LiteralFloat(_) | LiteralString(_) | ReadBinding(_): Ok(void)
 	span = match value.form:
 		InvokeFunction(call, _): call.span
@@ -4068,9 +4062,9 @@ private pure func admit_scalar_value(
 		-- Binding aliases do not define a value in Lower. Parameters and captures
 		-- have already been admitted at their actual defining origins.
 		ReadBinding(_): Ok(void)
-		_: admit_scalar_type(value.value_type, span, unions, records)
+		_: value.value_type.admit_scalar_type(span, unions, records)
 	match value.form:
-		Match(join): admit_scalar_join(join, bindings, unions, records)
+		Match(join): join.admit_scalar_join(bindings, unions, records)
 		_: Ok(void)
 
 
@@ -4080,11 +4074,11 @@ private pure func admit_scalar_update(
 	unions: List[ConcreteUnion],
 	records: List[ConcreteRecord],
 ) -> Result[Void, Diagnostic]:
-	base ?= admit_scalar_value(update.base, bindings, unions, records)
-	replaced ?= admit_scalar_fields(update.replacements, bindings, unions, records)
+	base ?= update.base.admit_scalar_value(bindings, unions, records)
+	replaced ?= update.replacements.admit_scalar_fields(bindings, unions, records)
 	var admitted: Result[Void, Diagnostic] = Ok(void)
 	for field in update.inherited:
-		admitted = admit_scalar_type(field.value_type, update.base_expression_span, unions, records)
+		admitted = field.value_type.admit_scalar_type(update.base_expression_span, unions, records)
 		match admitted:
 			Err(_): break
 			Ok(_): void
@@ -4100,29 +4094,29 @@ private pure func admit_scalar_statements(
 	var admitted: Result[Void, Diagnostic] = Ok(void)
 	for statement in statements:
 		admitted = match statement:
-			InitializeBinding(_, value): admit_scalar_value(value, bindings, unions, records)
-			ReassignBinding(_, value): admit_scalar_value(value, bindings, unions, records)
-			DiscardExpression(value): admit_scalar_value(value, bindings, unions, records)
+			InitializeBinding(_, value): value.admit_scalar_value(bindings, unions, records)
+			ReassignBinding(_, value): value.admit_scalar_value(bindings, unions, records)
+			DiscardExpression(value): value.admit_scalar_value(bindings, unions, records)
 			RunWhile(loop):
-				match admit_scalar_value(loop.condition, bindings, unions, records):
+				match loop.condition.admit_scalar_value(bindings, unions, records):
 					Err(error): Err(error)
-					Ok(_): admit_scalar_statements(loop.body, bindings, unions, records)
+					Ok(_): loop.body.admit_scalar_statements(bindings, unions, records)
 			BreakSourceLoop(_) | ContinueSourceLoop(_): Ok(void)
 			RunFor(loop):
 				iteration: Result[Void, Diagnostic] = match loop.iteration:
 					ListIteration(iterable, _, _):
 						-- The iteration cursor owns list storage even when its source is
 						-- a binding alias, so scalar TCO cannot admit that hidden root.
-						match admit_scalar_value(iterable, bindings, unions, records):
+						match iterable.admit_scalar_value(bindings, unions, records):
 							Err(error): Err(error)
-							Ok(_): admit_scalar_type(iterable.value_type, iterable.span, unions, records)
+							Ok(_): iterable.value_type.admit_scalar_type(iterable.span, unions, records)
 					AscendingIntRange(start, end, _):
-						match admit_scalar_value(start, bindings, unions, records):
+						match start.admit_scalar_value(bindings, unions, records):
 							Err(error): Err(error)
-							Ok(_): admit_scalar_value(end, bindings, unions, records)
+							Ok(_): end.admit_scalar_value(bindings, unions, records)
 				match iteration:
 					Err(error): Err(error)
-					Ok(_): admit_scalar_statements(loop.body, bindings, unions, records)
+					Ok(_): loop.body.admit_scalar_statements(bindings, unions, records)
 		match admitted:
 			Err(_): break
 			Ok(_): void
@@ -4136,12 +4130,12 @@ private pure func admit_scalar_exit(
 	records: List[ConcreteRecord],
 ) -> Result[Void, Diagnostic]:
 	match exit:
-		ReturnExpression(value): admit_scalar_value(value, bindings, unions, records)
-		RecurWith(arguments, _): admit_scalar_values(arguments, bindings, unions, records)
+		ReturnExpression(value): value.admit_scalar_value(bindings, unions, records)
+		RecurWith(arguments, _): arguments.admit_scalar_values(bindings, unions, records)
 
 
 private pure func admit_scalar_arm(
-	inputs: List[Checked.BindingId],
+	inputs: List[BindingId],
 	statements: List[ConcreteStatement],
 	exit: ConcreteExit,
 	bindings: List[ConcreteBinding],
@@ -4150,13 +4144,13 @@ private pure func admit_scalar_arm(
 ) -> Result[Void, Diagnostic]:
 	var admitted: Result[Void, Diagnostic] = Ok(void)
 	for id in inputs:
-		admitted = admit_scalar_binding(id, bindings, unions, records)
+		admitted = id.admit_scalar_binding(bindings, unions, records)
 		match admitted:
 			Err(_): break
 			Ok(_): void
 	captures ?= admitted
-	prefix ?= admit_scalar_statements(statements, bindings, unions, records)
-	admit_scalar_exit(exit, bindings, unions, records)
+	prefix ?= statements.admit_scalar_statements(bindings, unions, records)
+	exit.admit_scalar_exit(bindings, unions, records)
 
 
 private pure func admit_scalar_join(
@@ -4167,14 +4161,14 @@ private pure func admit_scalar_join(
 ) -> Result[Void, Diagnostic]:
 	var admitted: Result[Void, Diagnostic] = Ok(void)
 	for binding in join.carried:
-		admitted = admit_scalar_binding(binding, bindings, unions, records)
+		admitted = binding.admit_scalar_binding(bindings, unions, records)
 		match admitted:
 			Err(_): break
 			Ok(_): void
 	carriers ?= admitted
 	var checked_arms: Result[Void, Diagnostic] = Ok(void)
 	for arm in join.arms:
-		checked_arms = admit_scalar_arm(arm.inputs, arm.statements, ReturnExpression(arm.value), bindings, unions, records)
+		checked_arms = arm.inputs.admit_scalar_arm(arm.statements, ReturnExpression(arm.value), bindings, unions, records)
 		match checked_arms:
 			Err(_): break
 			Ok(_): void
@@ -4189,15 +4183,15 @@ private pure func admit_scalar_function(
 ) -> Result[Void, Diagnostic]:
 	var admitted: Result[Void, Diagnostic] = Ok(void)
 	for value_type in function.signature.parameters.append(function.signature.return_type):
-		admitted = admit_scalar_type(value_type, annotation, unions, records)
+		admitted = value_type.admit_scalar_type(annotation, unions, records)
 		match admitted:
 			Err(_): break
 			Ok(_): void
 	signature ?= admitted
-	prefix ?= admit_scalar_statements(function.statements, function.bindings, unions, records)
+	prefix ?= function.statements.admit_scalar_statements(function.bindings, unions, records)
 	match function.body:
-		ConcreteValueBody(exit): admit_scalar_exit(exit, function.bindings, unions, records)
-		ConcreteMatchBody(matched): admit_scalar_match(matched, function.bindings, unions, records)
+		ConcreteValueBody(exit): exit.admit_scalar_exit(function.bindings, unions, records)
+		ConcreteMatchBody(matched): matched.admit_scalar_match(function.bindings, unions, records)
 
 
 private pure func admit_scalar_match(
@@ -4206,10 +4200,10 @@ private pure func admit_scalar_match(
 	unions: List[ConcreteUnion],
 	records: List[ConcreteRecord],
 ) -> Result[Void, Diagnostic]:
-	scrutinee ?= admit_scalar_value(matched.scrutinee, bindings, unions, records)
+	scrutinee ?= matched.scrutinee.admit_scalar_value(bindings, unions, records)
 	var admitted: Result[Void, Diagnostic] = Ok(void)
 	for arm in matched.arms:
-		admitted = admit_scalar_arm(arm.inputs, arm.statements, arm.body, bindings, unions, records)
+		admitted = arm.inputs.admit_scalar_arm(arm.statements, arm.body, bindings, unions, records)
 		match admitted:
 			Err(_): break
 			Ok(_): void
@@ -4226,7 +4220,7 @@ pure func admit_scalar_loop(
 ) -> Result[Void, Diagnostic]:
 	match function.execution:
 		OrdinaryCalls: Ok(void)
-		SelfTailLoop(annotation): admit_scalar_function(function, annotation, unions, records)
+		SelfTailLoop(annotation): function.admit_scalar_function(annotation, unions, records)
 
 private record TranslatedParameters {
 	parameters: List[TypeRef],
@@ -4242,7 +4236,7 @@ private pure func translate_parameters(
 	substitution: Declarations.Substitution,
 	unions: SealedUnions,
 	records: SealedRecords,
-	traits: Checked.AcceptedTraits,
+	traits: AcceptedTraits,
 ) -> Result[TranslatedParameters, Diagnostic]:
 	span = function.return_type.span
 	var parameters: List[TypeRef] = []
@@ -4253,7 +4247,7 @@ private pure func translate_parameters(
 	match key.body:
 		Checked.DeclaredBody(_) | Checked.DerivedEqualityBody(_): void
 		Checked.LambdaBody(id):
-			match lambda_storage(id, function.captures.length(), key.arguments, opaques, substitution, unions, records, span):
+			match id.lambda_storage(function.captures.length(), key.arguments, opaques, substitution, unions, records, span):
 				Err(error): failure = Some(error)
 				Ok(ErasedCallable): void
 				Ok(EnvironmentCallable(owner)):
@@ -4268,7 +4262,7 @@ private pure func translate_parameters(
 		runtime = Checked.binding_id(bindings.length())
 		match written.origin:
 			Checked.CallableParameterBinding(parameter):
-				match callable_mode(key.callables, parameter, written.span):
+				match key.callables.callable_mode(parameter, written.span):
 					Err(error): failure = Some(error)
 					Ok(StaticCallable(known)):
 						match concrete_type(opaques, written.value_type, substitution, unions, written.span, records):
@@ -4327,7 +4321,7 @@ private pure func translate_match_arm(
 ) -> Result[ConcreteArm, Diagnostic]:
 	statements ?= translate_statements(opaques, arm.statements, substitution, callables, keys, unions, records)
 	body ?= translate_exit(opaques, arm.body, substitution, callables, keys, unions, records)
-	inputs ?= runtime_bindings(callables, arm.inputs, span)
+	inputs ?= callables.runtime_bindings(arm.inputs, span)
 	Ok({ id = arm.id, inputs = inputs, statements = statements, body = body })
 
 
@@ -4343,7 +4337,7 @@ private pure func translate_match(
 ) -> Result[ConcreteMatch, Diagnostic]:
 	scrutinee ?= translate_expr(opaques, matched.scrutinee, substitution, callables, keys, unions, records)
 	selected ?= translate_selection(opaques, matched.selection, substitution, unions, records, span)
-	arms ?= translated_list(matched.arms, pure func(arm: Checked.CheckedArm) -> Result[ConcreteArm, Diagnostic]:
+	arms ?= matched.arms.translated_list(pure func(arm: Checked.CheckedArm) -> Result[ConcreteArm, Diagnostic]:
 		translate_match_arm(opaques, arm, substitution, callables, keys, unions, records, span)
 	)
 	Ok({ scrutinee = scrutinee, selection = selected, arms = arms })
@@ -4356,10 +4350,10 @@ private pure func translate_function(
 	keys: IndexedList[FunctionRequest],
 	unions: SealedUnions,
 	records: SealedRecords,
-	traits: Checked.AcceptedTraits,
+	traits: AcceptedTraits,
 ) -> Result[ConcreteFunction, Diagnostic]:
 	span = function.return_type.span
-	substitution ?= function_substitution(function, key.arguments, span)
+	substitution ?= function.function_substitution(key.arguments, span)
 
 	runtime ?= translate_parameters(opaques, function, key, substitution, unions, records, traits)
 	parameters = runtime.parameters
@@ -4385,7 +4379,7 @@ private pure func translate_function(
 
 	body ?= body_result
 	label = match key.body:
-		Checked.LambdaBody(_): lambda_label(function.base_label)
+		Checked.LambdaBody(_): function.base_label.lambda_label()
 		Checked.DeclaredBody(_) | Checked.DerivedEqualityBody(_): function.base_label
 	concrete: ConcreteFunction = {
 		label = label,
@@ -4398,34 +4392,34 @@ private pure func translate_function(
 		statements = statements,
 		body = body,
 	}
-	admitted ?= admit_scalar_loop(concrete, unions.layouts, records.layouts)
+	admitted ?= concrete.admit_scalar_loop(unions.layouts, records.layouts)
 
 	Ok(concrete)
 
 
 pure func specialize(program: CheckedProgram) -> Result[SpecializedProgram, Diagnostic]:
-	checked = checked_functions(program)
+	checked = program.checked_functions()
 	-- Checked entrypoint identity is the only root. Requests discover complete
 	-- callees and layouts before this local builder freezes into the concrete program.
 	entry_key: InstanceKey = {
-		body = Checked.DeclaredBody(entry_function(checked.entrypoint)),
+		body = Checked.DeclaredBody(checked.entrypoint.entry_function()),
 		arguments = [],
 		callables = []
 	}
 	initial: PreparedInstances = {
-		functions = append_entry(empty_indexed_list(), { key = entry_key, source = EntrypointRoot }, body_digest(entry_key.body)),
+		functions = empty_indexed_list().append_entry({ key = entry_key, source = EntrypointRoot }, entry_key.body.body_digest()),
 		unions = empty_indexed_list(),
 		records = empty_indexed_list(),
 		converted_environments = []
 	}
-	expanded ?= expand_instances(checked, initial)
-	sealed_unions ?= seal_unions(expanded.unions)
-	sealed_records ?= seal_records(expanded.records, expanded.converted_environments)
+	expanded ?= checked.expand_instances(initial)
+	sealed_unions ?= expanded.unions.seal_unions()
+	sealed_records ?= expanded.records.seal_records(expanded.converted_environments)
 	prepared: SealedInstances = { functions = expanded.functions, unions = sealed_unions, records = sealed_records }
-	functions ?= translated_list(prepared.functions.entries, pure func(
+	functions ?= prepared.functions.entries.translated_list(pure func(
 		request: FunctionRequest,
 	) -> Result[ConcreteFunction, Diagnostic]:
-		match selected_body(checked, request.key.body, request.source):
+		match checked.selected_body(request.key.body, request.source):
 			Err(error): Err(error)
 			Ok(function):
 				translate_function(
@@ -4439,7 +4433,7 @@ pure func specialize(program: CheckedProgram) -> Result[SpecializedProgram, Diag
 				)
 	)
 	entry_span: Span = compiler_span()
-	located ?= find_instance(prepared.functions, entry_key, entry_span)
+	located ?= prepared.functions.find_instance(entry_key, entry_span)
 	entrypoint ?= located.or_internal_error(entry_span, "missing entrypoint instance")
 
 	accepted: Entrypoint[FunctionInstanceId] = match checked.entrypoint:
