@@ -150,61 +150,76 @@ pure func all[T](values: List[T], predicate: pure (T) -> Bool) -> Bool:
                 break
     every
 
--- Stable: a tie takes the left element. Each step appends one element, so a
--- merge is linear in its output; key may run more than once per element. The
--- loop runs length(left) + length(right) steps, one per element, so a step
--- always finds an element on one side and the final None arm is unreachable.
-private pure func merge[T, Key: Orderable](left: List[T], right: List[T], key: pure (T) -> Key) -> List[T]:
-    var merged: List[T] = []
-    var left_position = 0
-    var right_position = 0
-    for _ in 0..(left.length() + right.length()):
-        match left.get(left_position):
-            Some(left_value):
-                match right.get(right_position):
-                    Some(right_value):
-                        if key(right_value) < key(left_value):
-                            merged = merged.append(right_value)
-                            right_position = right_position + 1
-                        else:
-                            merged = merged.append(left_value)
-                            left_position = left_position + 1
-                    None:
-                        merged = merged.append(left_value)
-                        left_position = left_position + 1
-            None:
-                match right.get(right_position):
-                    Some(right_value):
-                        merged = merged.append(right_value)
-                        right_position = right_position + 1
-                    None: void
-    merged
+-- Whether the element at right sorts before the one at left. Equal keys keep
+-- the left element first, which makes the sort stable. Callers pass indexes
+-- below length(source), so the None arms are unreachable.
+private pure func right_first[T, Key: Orderable](source: List[T], left: Int, right: Int, key: pure (T) -> Key) -> Bool:
+    match source.get(left):
+        None: False
+        Some(left_value):
+            match source.get(right):
+                None: False
+                Some(right_value): key(right_value) < key(left_value)
 
-private pure func sort_range[T, Key: Orderable](
-    values: List[T],
+-- Merges the sorted runs source[start..middle] and source[middle..end] into the
+-- same positions of target. target is the caller's dying buffer, so each set
+-- writes it in place once it is uniquely owned. Every index read is below end,
+-- so the None arm is unreachable.
+private pure func merge_runs[T, Key: Orderable](
+    source: List[T],
+    target: List[T],
     start: Int,
-    count: Int,
+    middle: Int,
+    end: Int,
     key: pure (T) -> Key,
 ) -> List[T]:
-    match count.equals(0):
-        True: []
-        False:
-            match count.equals(1):
-                True:
-                    match values.get(start):
-                        Some(value): [value]
-                        None: []
-                False:
-                    left_count = count / 2
-                    left = values.sort_range(start, left_count, key)
-                    right = values.sort_range(start + left_count, count - left_count, key)
-                    left.merge(right, key)
+    var merged = target
+    var left = start
+    var right = middle
+    for position in start..end:
+        -- The right run supplies the element when the left run is spent, never
+        -- when the right run is spent, and otherwise only when strictly less.
+        from_right: Bool = match right < end:
+            False: False
+            True:
+                match left < middle:
+                    False: True
+                    True: source.right_first(left, right, key)
+        index = match from_right:
+            True: right
+            False: left
+        match source.get(index):
+            Some(value): merged = merged.set(position, value)
+            None: void
+        match from_right:
+            True: right = right + 1
+            False: left = left + 1
+    merged
 
 -- Stable ascending sort by each element's Orderable key. Equal keys, those
 -- where neither is less than the other, keep input order; key is pure and may
 -- run more than once per element. A key order that is not total, such as Float
 -- NaN, still yields a permutation of the input, in an unspecified order.
+--
+-- Bottom-up merge sort: each pass merges adjacent runs of width elements from
+-- source into target, then the two buffers swap. Both start as values, so the
+-- first write to each copies it while it is still shared; every later write
+-- updates a uniquely owned buffer in place, and a sort allocates at most two
+-- Lists whatever its length.
 pure func sort_by[T, Key: Orderable](values: List[T], key: pure (T) -> Key) -> List[T]:
-    match values.length() < 2:
-        True: values
-        False: values.sort_range(0, values.length(), key)
+    count = values.length()
+    var source = values
+    var target = values
+    var width = 1
+    while width < count:
+        var start = 0
+        while start < count:
+            middle = (start + width).min(count)
+            end = (middle + width).min(count)
+            target = source.merge_runs(target, start, middle, end, key)
+            start = end
+        written = target
+        target = source
+        source = written
+        width = width * 2
+    source

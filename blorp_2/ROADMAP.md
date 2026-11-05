@@ -1448,9 +1448,14 @@ The other ports (`numeric_loop`, `fib`, `binary_trees`, `compiler_ast`,
 allocations and move by at most 0.2% in retired instructions.
 
 Follow-up, the sort's constant cost: about 255 retired instructions per merge step,
-and 2n - 1 allocations per sort, half of them the singleton leaves. A two-element
-base case, or merging the leaves straight from `values` without singleton Lists,
-would roughly halve that.
+and 2n - 1 allocations per sort, half of them the singleton leaves.
+
+**Status (2026-11-04).** `sort_by` is now a bottom-up merge over two buffers updated
+with `set`, so a sort allocates at most two Lists whatever its length; `library_linear`
+allocates 4,117, down from 12,306. `list_ops` sorts retire 1.66 G instructions,
+down from 4.55 G, and the benchmark 2.38 G against the legacy compiler's 1.72 G
+(1.39 times, down from 3.07). Report:
+[blorp_2_bottom_up_sort](../benchmarks/results/blorp_2_bottom_up_sort_2026-11-04.md).
 
 ### Tests, measurements and landing
 

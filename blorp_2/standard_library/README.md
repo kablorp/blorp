@@ -204,9 +204,11 @@ older aliases remain valid. Predicate/key callbacks may capture immutable data.
 The sort key may run more than once per element. Take/drop/remove/reverse copy
 each kept element once into an accumulator that grows in place; remove joins its
 two copies with one `concat`. Find/all visit at most n elements in input order
-with constant stack and short-circuiting. Sort is a top-down merge sort whose
-recursion is log n deep; each merge is one pass that appends to a consumed
-accumulator, so a sort does O(n log n) key comparisons and copies.
+with constant stack and short-circuiting. Sort is a bottom-up merge sort over
+two buffers: each of its log n passes merges adjacent runs from one buffer into
+the other with `set`, so a sort does O(n log n) key comparisons and copies with
+constant stack, and allocates at most two Lists, each buffer's first copy of a
+shared input.
 Integrated correctness, self-compilation and resource acceptance remain separate.
 
 ### List membership
