@@ -324,9 +324,12 @@ static int64_t next(int64_t descriptor, const char *carried, lines_t **lines) {
     return next_bytes(descriptor, carried, strlen(carried), lines);
 }
 
+/* The call is its own statement: C leaves the order of a call's arguments
+ * unspecified, and GCC reads `error` before the close that sets it. */
 static int64_t close_descriptor(int64_t descriptor) {
     int64_t error = 0;
-    return outcome(blorp_fs_close(descriptor, &error), error);
+    const uint8_t succeeded = blorp_fs_close(descriptor, &error);
+    return outcome(succeeded, error);
 }
 
 /* The batch a call should return. */
