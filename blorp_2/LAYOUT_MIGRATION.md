@@ -544,7 +544,6 @@ One serial compiled CPU lane; no parallel compiler or native measurements.
 From repository root, after fixing any seed/host freshness problem:
 
 ```bash
-scripts/compiler-build-status
 scripts/blorp2-compiler-bootstrap --print-id
 packet="$PWD/build/layout-simplification/M1"
 mkdir -p "$packet/artifacts"
@@ -555,17 +554,13 @@ make -C blorp_2 link-compiler \
   BLORP2_COMPILER_C="$packet/artifacts/compiler.c" \
   BLORP2_COMPILER="$packet/artifacts/compiler-normal"
 
-bin/blorp test --std-dir standard_library/src --suite --timeout 180 \
-  blorp_2/test/unit/test_specialize/test_recursive_unions.brp \
-  blorp_2/test/unit/test_own/test_stored_callables.brp \
-  blorp_2/test/unit/test_verify/test_record.brp \
-  blorp_2/test/unit/test_emit/test_record.brp
+make -C blorp_2 test-target-components TARGET_COMPONENT_SOURCES="<changed target suites>"
 ```
 
 The normal/diagnostic compiler roles link the same C at -O0, diagnostics macro0/1.
-The legacy executable above is only the identified maintained TestSuite observer;
-it never replaces pinned B2 compiler generation. Include other actually changed
-owners in the frozen brief. Inspect query/caller C for descriptor construction,
+Suites that are still deferred (for example `test_specialize/test_recursive_unions.brp`
+and `test_emit/test_record.brp`) have no runner until they are ported. Include other
+actually changed owners in the frozen brief. Inspect query/caller C for descriptor construction,
 retain/drop, child walks and unchanged actual ownership operations.
 
 Use the existing strict/sanitizer real-main helpers for affected native families.

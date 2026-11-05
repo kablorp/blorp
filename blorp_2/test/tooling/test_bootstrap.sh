@@ -7,7 +7,7 @@ scratch=$(mktemp -d "${TMPDIR:-/tmp}/blorp2 bootstrap.XXXXXX")
 trap 'chmod -R u+w "$scratch"; rm -rf "$scratch"' EXIT
 fixture="$scratch/repo with spaces"
 tools="$scratch/fake tools"
-mkdir -p "$fixture/scripts" "$fixture/blorp_2/src" "$fixture/bin" "$tools"
+mkdir -p "$fixture/scripts" "$fixture/blorp_2/src" "$tools"
 fixture=$(cd "$fixture" && pwd -P)
 cp "$repo_root/blorp_2/Makefile" "$fixture/blorp_2/Makefile"
 if [ -f "$repo_root/scripts/blorp2-compiler-bootstrap" ]; then
@@ -28,7 +28,7 @@ sha256_file() {
 export TEST_SEED_LOG="$scratch/seed.log" TEST_CC_LOG="$scratch/cc.log"
 export TEST_DRIVER_LOG="$scratch/driver.log" TEST_DRIVER_ARGS="$scratch/driver.args"
 export TEST_CC_ARGS="$scratch/cc-args" TEST_COMPILER_ARGS="$scratch/compiler.args"
-export TEST_DOWNLOAD_LOG="$scratch/download.log" TEST_LEGACY_LOG="$scratch/legacy.log"
+export TEST_DOWNLOAD_LOG="$scratch/download.log" TEST_BAD_EXEC_LOG="$scratch/bad-exec.log"
 export TEST_SEED="$scratch/seed payload" TEST_DOWNLOAD_MODE=good
 export TEST_OS=Linux TEST_ARCH=x86_64
 export BLORP2_COMPILER_BOOTSTRAP_CACHE_DIR="$scratch/cache with spaces"
@@ -54,7 +54,7 @@ printf '%s\n' "$2" >>"$TEST_DOWNLOAD_LOG"
 [ "$TEST_DOWNLOAD_MODE" != offline ] || exit 22
 [ "$1" = -fsSL ] && [ "$3" = -o ] || exit 23
 if [ "$TEST_DOWNLOAD_MODE" = bad ]; then
-	printf '#!/usr/bin/env bash\necho BAD_EXEC >>"$TEST_LEGACY_LOG"\n' >"$4"
+	printf '#!/usr/bin/env bash\necho BAD_EXEC >>"$TEST_BAD_EXEC_LOG"\n' >"$4"
 else
 	cp "$TEST_SEED" "$4"
 fi
@@ -104,14 +104,6 @@ esac
 chmod +x "$output"
 SH
 chmod +x "$tools/"*
-for path in bin/blorp scripts/blorp-compiler-bootstrap scripts/compiler-build-status; do
-	cat >"$fixture/$path" <<'SH'
-#!/usr/bin/env bash
-echo legacy >>"$TEST_LEGACY_LOG"
-exit 97
-SH
-	chmod +x "$fixture/$path"
-done
 export PATH="$tools:$PATH"
 commit=0123456789abcdef0123456789abcdef01234567
 tag=blorp2-seed-0123456789ab
@@ -163,7 +155,7 @@ pass 'corrupt cached bytes are replaced by verified download'
 
 rm "$resolved"
 TEST_DOWNLOAD_MODE=bad expect_failure 'checksum' "$resolver" argument
-[ ! -e "$resolved" ] && [ ! -e "$TEST_SEED_LOG" ] && [ ! -e "$TEST_LEGACY_LOG" ] || fail 'unverified execution or install'
+[ ! -e "$resolved" ] && [ ! -e "$TEST_SEED_LOG" ] && [ ! -e "$TEST_BAD_EXEC_LOG" ] || fail 'unverified execution or install'
 pass 'bad downloaded bytes never install or execute'
 "$resolver" --print-path >"$scratch/path"
 
@@ -273,7 +265,6 @@ cmp -s "$TEST_SEED_LOG" "$scratch/expected" || fail 'make seed CLI or generation
 printf '%s\0' -O0 -DBLORP_MEMORY_DIAGNOSTICS=0 blorp_2/build/compiler.c -o blorp_2/build/compiler -lm -lpthread \
 	-O0 -DBLORP_MEMORY_DIAGNOSTICS=1 blorp_2/build/compiler.c -o blorp_2/build/compiler -lm -lpthread >"$scratch/expected"
 cmp -s "$TEST_CC_ARGS" "$scratch/expected" || fail 'link flags or operand argv'
-[ ! -e "$TEST_LEGACY_LOG" ] || fail 'build touched legacy'
 pass 'parallel requested normal/diagnostic builds generate once and link serially'
 
 : >"$TEST_CC_LOG"
@@ -294,7 +285,6 @@ pass 'standalone link-test-compiler preserves fixpoint boundary'
 : >"$TEST_CC_LOG"
 make -s -C "$fixture/blorp_2" example BLORP_CC="$tools/fake cc" >"$scratch/make.stdout" 2>"$scratch/make.stderr" || { cat "$scratch/make.stderr" >&2; fail 'seed-built example'; }
 [ "$(grep -c '^built$' "$TEST_CC_LOG")" = 2 ] || fail 'example did not use new compiler and real main'
-[ ! -e "$TEST_LEGACY_LOG" ] || fail 'example touched legacy'
 pass 'example uses newly built B2 executable'
 # The test targets build one Blorp driver with the compiler under test and run
 # it once per mode. Only the fake driver executes here: what each mode does is
@@ -371,7 +361,6 @@ fi
 [ "$(grep -c '^compiler:strict$' "$TEST_COMPILER_ARGS")" = 1 ] || fail 'test did not build the driver exactly once'
 printf 'driver:components:strict:%s\ndriver:deferred:strict:%s\ndriver:e2e:strict:%s\n' "$fixture" "$fixture" "$fixture" >"$scratch/expected"
 cmp -s "$TEST_DRIVER_LOG" "$scratch/expected" || fail 'test did not run components, deferrals and e2e in that order'
-[ ! -e "$TEST_LEGACY_LOG" ] || fail 'test invoked a legacy host/build-status/bootstrap'
 pass 'test builds the driver once and runs components, deferrals and e2e in order'
 
 for failure_kind in driver-compile driver-link driver-run; do

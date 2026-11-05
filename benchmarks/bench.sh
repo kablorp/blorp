@@ -19,6 +19,13 @@
 #   bash benchmarks/bench.sh fib          # Run a single benchmark
 #   bash benchmarks/bench.sh --list       # List available benchmarks
 #
+# Prerequisites:
+#   make -C blorp_2 compiler           # the blorp2 column (or set BLORP2_COMPILER)
+#   The blorp column is the pinned legacy release named in
+#   benchmarks/legacy-compiler.env. A run that builds a benchmark downloads it
+#   once into $XDG_CACHE_HOME/blorp/legacy (default ~/.cache/blorp/legacy) and
+#   verifies its SHA-256; --list and --help download nothing.
+#
 # Environment:
 #   PYTHON=python3.11                  bash benchmarks/bench.sh   # Use specific Python
 #   PYTHON_CONCURRENCY=python3.14t     bash benchmarks/bench.sh   # Free-threaded Python for concurrency rows
@@ -26,6 +33,7 @@
 #   OCAMLOPT=ocamlopt                  bash benchmarks/bench.sh   # Use specific OCaml native compiler
 #   CC=gcc                             bash benchmarks/bench.sh   # Use specific C compiler
 #   BLORP2_COMPILER=/path/compiler      bash benchmarks/bench.sh fib # Select Blorp 2 compiler
+#   XDG_CACHE_HOME=/path/cache         bash benchmarks/bench.sh   # Where the pinned legacy compiler is cached
 #   BENCH_THREADS=4                    bash benchmarks/bench.sh   # Worker/task width for concurrency rows
 #   BLORP_THREADS=4                    bash benchmarks/bench.sh   # Blorp runtime thread width for concurrency rows
 #   GOMAXPROCS=4                       bash benchmarks/bench.sh   # Go runtime parallelism for concurrency rows
@@ -39,7 +47,8 @@ set -e
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
-BLORP="$PROJECT_DIR/bin/blorp"
+# shellcheck source=legacy-compiler.env
+. "$SCRIPT_DIR/legacy-compiler.env"
 BLORP2_COMPILER="${BLORP2_COMPILER:-$PROJECT_DIR/blorp_2/build/compiler}"
 PYTHON="${PYTHON:-python3}"
 if [ "${PYTHON_CONCURRENCY+x}" ]; then
@@ -71,6 +80,53 @@ CONCURRENCY_BENCHMARKS="threaded_cpu_map channel_pipeline sleep_fanout"
 SPEEDUP_SUPPRESSED_BENCHMARKS="channel_pipeline"
 
 die() { echo "error: $1" >&2; exit 1; }
+
+sha256_file() {
+    if has_cmd shasum; then
+        shasum -a 256 "$1" | awk '{print $1}'
+    elif has_cmd sha256sum; then
+        sha256sum "$1" | awk '{print $1}'
+    else
+        die "verifying the legacy compiler needs shasum or sha256sum"
+    fi
+}
+
+# Print the path of the pinned legacy compiler that builds the "blorp" column,
+# downloading it into the cache and verifying its SHA-256 on first use. The pin
+# lives in benchmarks/legacy-compiler.env; the release embeds its own standard
+# library, so callers must compile away from any checkout that has a blorp.toml.
+# Only the benchmarks that build a "blorp" row call this, so --list and --help
+# never download.
+legacy_compiler() {
+    local target digest_name digest cache_dir binary stage url
+    target="$("$PROJECT_DIR/scripts/target-triple")" || die "no pinned legacy compiler for this platform"
+    digest_name="LEGACY_COMPILER_SHA256_$(echo "$target" | tr 'a-z-' 'A-Z_')"
+    digest="${!digest_name:-}"
+    [ -n "$digest" ] || die "no pinned legacy compiler for $target"
+    cache_dir="${XDG_CACHE_HOME:-$HOME/.cache}/blorp/legacy/$LEGACY_COMPILER_REPO/$LEGACY_COMPILER_TAG/$target/$digest"
+    binary="$cache_dir/blorp"
+    if [ ! -x "$binary" ] || [ "$(sha256_file "$binary")" != "$digest" ]; then
+        local failure=""
+        mkdir -p "$cache_dir" || die "cannot create $cache_dir"
+        stage="$(mktemp -d "$cache_dir/.stage.XXXXXX")" || die "cannot create a staging directory in $cache_dir"
+        url="https://github.com/$LEGACY_COMPILER_REPO/releases/download/$LEGACY_COMPILER_TAG/blorp-$target"
+        echo "Downloading pinned legacy compiler $LEGACY_COMPILER_TAG ($target)" >&2
+        # Every failure sets `failure`, so the staging directory is removed once, below.
+        if has_cmd curl; then
+            curl -fsSL "$url" -o "$stage/blorp" || failure="could not download $url"
+        elif has_cmd wget; then
+            wget -q "$url" -O "$stage/blorp" || failure="could not download $url"
+        else
+            failure="downloading the legacy compiler needs curl or wget"
+        fi
+        [ -n "$failure" ] || [ "$(sha256_file "$stage/blorp")" = "$digest" ] || failure="legacy compiler from $url failed SHA-256 verification"
+        [ -n "$failure" ] || chmod 0755 "$stage/blorp" || failure="cannot make the legacy compiler executable"
+        [ -n "$failure" ] || mv -f "$stage/blorp" "$binary" || failure="cannot install the legacy compiler at $binary"
+        rm -rf "$stage"
+        [ -z "$failure" ] || die "$failure"
+    fi
+    echo "$binary"
+}
 
 has_cmd() { command -v "$1" >/dev/null 2>&1; }
 
@@ -287,9 +343,11 @@ compile_blorp() {
         if [ -d "$helper_src" ]; then
             cp -R "$helper_src" "$TEMP_DIR/support" || return 1
         fi
+        # Compile from the temporary directory so the release's embedded library
+        # is used, not the checkout's blorp.toml.
         (
-            cd "$PROJECT_DIR"
-            "$BLORP" compile "$bench_src" >/dev/null
+            cd "$TEMP_DIR"
+            "$LEGACY_COMPILER" compile "$bench_src" >/dev/null
         ) || return 1
     fi
     [ -f "$bench_c" ] || return 1
@@ -711,7 +769,7 @@ run_one() {
     fi
 
     if is_speedup_suppressed_benchmark "$name"; then
-        printf "   speedups suppressed (see benchmarks/AUDIT.md)"
+        printf "   speedups suppressed (the Blorp source is not a channel pipeline)"
     elif [ -n "$bt" ]; then
         local notes=""
         [ -n "$blorp_alloc_stats" ] && notes="blorp: $blorp_alloc_stats"
@@ -785,7 +843,7 @@ echo ""
 echo "blorp Benchmark Suite"
 echo "====================="
 echo "Timing: in-process BENCH markers from language-specific runners"
-echo "blorp: $BLORP"
+echo "blorp: pinned legacy release $LEGACY_COMPILER_TAG (benchmarks/legacy-compiler.env)"
 echo "blorp2: $BLORP2_COMPILER"
 if [ "$BENCH_ALLOC_STATS" = "1" ]; then
     echo "Allocation runs: blorp counts managed objects; blorp2 counts allocator calls; bytes are live at exit."
@@ -805,12 +863,12 @@ else
     RUN_BENCHMARKS="$FILTER"
 fi
 
-[ -x "$BLORP" ] || die "blorp binary not found. Run 'make' first."
 for name in $RUN_BENCHMARKS; do
     if has_bench blorp2 "$name" && [ ! -x "$BLORP2_COMPILER" ]; then
         die "BLORP2_COMPILER is not executable: $BLORP2_COMPILER; run 'make -C blorp_2 compiler' or set BLORP2_COMPILER"
     fi
 done
+LEGACY_COMPILER="$(legacy_compiler)" || exit 1
 
 if contains_concurrency_benchmark $RUN_BENCHMARKS; then
     resolve_default_python_concurrency || true

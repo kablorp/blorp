@@ -1,7 +1,8 @@
 # Blorp 2 standard library
 
 These modules are compiled by Blorp 2 for input programs. They are separate
-from the legacy library at `standard_library/src/`. All active Blorp 2 tests
+from the legacy library, preserved at
+[`standard_library/src/`](https://github.com/kablorp/blorp/blob/ee9e001c6de8911ee486fd992419bef5bc628e8b/standard_library/src/). All active Blorp 2 tests
 use this target library. The
 pinned Blorp2 compiler uses this target library when compiling compiler source.
 
@@ -56,13 +57,12 @@ trait default. Imported `INT_MIN`
 and `INT_MAX` are closed scalar literals, with no runtime global storage.
 The [imports design](../README.md#local-modules) defines the full rules.
 
-`system.brp` records its accepted upstream revision and source SHA256.
-Its explicit `get_current_directory()` import returns `Result[String, String]`:
+`system.brp`'s explicit `get_current_directory()` import returns `Result[String, String]`:
 an owned nonempty absolute UTF-8 path or an owned valid-text error.
 Neither branch prints. The native helper uses the target String ABI.
 
-`int.brp` records the upstream revision and SHA256 used for its adaptation of
-[`standard_library/src/int.brp`](../../standard_library/src/int.brp). Its
+`int.brp` adapts the legacy
+[`standard_library/src/int.brp`](https://github.com/kablorp/blorp/blob/ee9e001c6de8911ee486fd992419bef5bc628e8b/standard_library/src/int.brp). Its
 arithmetic implementations have builtin bodies except `negate`, which is
 `subtract(0, value)` and so wraps `INT_MIN` to itself; `to_string` is concrete.
 Its six `_checked` functions are ordinary pure functions returning
@@ -93,13 +93,14 @@ for home slots and still compares keys by equality when probing collisions.
 
 `Int` and `Float` are declared once in `_base.brp`. Other
 declarations are enabled only as their features enter the supported subset.
-The original modules are maintained in [standard_library/src](../../standard_library/src/).
+The original modules are preserved in the legacy
+[standard_library/src](https://github.com/kablorp/blorp/blob/ee9e001c6de8911ee486fd992419bef5bc628e8b/standard_library/src/).
 
 Pass `blorp_2/standard_library` explicitly as the argument to `--library-root`. Bare `int: add` imports resolve here; relative
 imports still resolve beside their importer. There is no host-library fallback.
 
-`io.brp` retains the upstream revision and SHA256 used for its adaptation of
-[`standard_library/src/io.brp`](../../standard_library/src/io.brp). Its active
+`io.brp` adapts the legacy
+[`standard_library/src/io.brp`](https://github.com/kablorp/blorp/blob/ee9e001c6de8911ee486fd992419bef5bc628e8b/standard_library/src/io.brp). Its active
 `print(String) -> Void` is concrete and impure, mapped to the closed
 `string.print` operation. It borrows the String,
 writes every byte and appends LF. Program input arrives explicitly through
@@ -225,10 +226,10 @@ It iterates the List once with a `for` loop, doing O(n) work with constant C
 stack and ordinary temporary ARC costs. No zero-allocation claim is made.
 Further helper optimization is deferred; these equality contracts are supported.
 
-The List update names match the unchanged host library because the same compiler source
-must build against both libraries. The internal `list.set` builtin implements the
+The List update names matched the legacy library, so one compiler source could be
+built against both; that constraint is gone. The internal `list.set` builtin implements the
 no-op-on-invalid update; checked `set_index` is an ordinary function. The desired
-later rename to checked `set` and no-op `set_or_keep` must update both libraries
+later rename to checked `set` and no-op `set_or_keep` updates this library
 and all callers together.
 The base module provides the ordinary generic Result union with Ok/Err for
 pure calculator parsing and evaluation; it has no compiler-specific behavior.
@@ -265,8 +266,7 @@ The String adapter
 exposes strict counted-byte `parse_int`, `parse_float` and `equals` operations.
 Their builtin bodies name only the operation; results refer to the
 foundation's designated Bool and Option, found by name in `_base.brp`, and
-layout follows the unions' declaration order. Each adapter records its upstream
-provenance. FFI remains inactive.
+layout follows the unions' declaration order. FFI remains inactive.
 
 `string.starts_with` is an ordinary pure counted-byte prefix helper.
 `string.slice(String, Int, Int) -> Option[String]` uses half-open UTF-8 byte
@@ -277,7 +277,8 @@ NUL bytes and source aliases. See the
 
 The current [calculator](../README.md#calculator-input-and-results) and
 [Float contracts](../README.md#float64-calculator) define deliberate conversion and arithmetic
-adaptations. The host library provides reference implementations for these adaptations.
+adaptations. The legacy library, preserved at
+[`standard_library/src/`](https://github.com/kablorp/blorp/blob/ee9e001c6de8911ee486fd992419bef5bc628e8b/standard_library/src/), has reference implementations for these adaptations.
 
 A type selection also supplies only that module's local receiver functions:
 

@@ -73,7 +73,7 @@ discard them during Void normalization. Without else, the then block must be
 Void, with an explicit generated False→Void arm; it cannot supply a non-Void
 value. A Void use is legal; IfNeedsElse applies when the consumer requires a
 non-Void result, while an untyped no-else expression synthesizes Void. This matches
-`docs/GUIDE.md` Control Flow and the existing compiler's
+[`docs/GUIDE.md`](https://github.com/kablorp/blorp/blob/ee9e001c6de8911ee486fd992419bef5bc628e8b/docs/GUIDE.md) Control Flow and the existing compiler's
 `infer_if_expr`/`test_if_without_else_requires_void_then_branch` precedent.
 
 ## Existing boundary and smallest recut

@@ -341,7 +341,7 @@ ceilings in its own summary.
      forms;
    - `TRAITS_PLAN.md:68`;
    - `grammar.ebnf`;
-   - the deferred-trait-forms sentence in `docs/GUIDE.md:129`.
+   - the deferred-trait-forms sentence in [`docs/GUIDE.md:129`](https://github.com/kablorp/blorp/blob/ee9e001c6de8911ee486fd992419bef5bc628e8b/docs/GUIDE.md#L129).
 2. **Seed.** CI publishes a seed from the passing push, then the pin moves to
    it. The seed compiles the standard library, so the library cannot declare
    a supertrait before this.
@@ -356,7 +356,7 @@ ceilings in its own summary.
    - Give the Orderable-only opaque type in
      `test/e2e/fixtures/ordering/operators.brp` a written Equatable.
    - Remove "An `Orderable` bound does not provide `==`" from the README, the
-     ordering plan and `docs/GUIDE.md:16`.
+     ordering plan and [`docs/GUIDE.md:16`](https://github.com/kablorp/blorp/blob/ee9e001c6de8911ee486fd992419bef5bc628e8b/docs/GUIDE.md#L16).
 
    NaN still compares unequal to itself and unordered with everything. The
    supertrait requires an Equatable implementation, not agreement between the

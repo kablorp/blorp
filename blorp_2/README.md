@@ -1122,7 +1122,7 @@ phase-test observations; process exit codes alone do not establish them.
 
 These measure one execution of the new compiler on the example, including
 process startup, argument handling, input/output, and the compile pipeline.
-Building the compiler with the existing compiler, compiling the emitted C,
+Building the compiler from the pinned seed, compiling the emitted C,
 and running the generated program happen outside the cost measurements.
 Allocation counts cover Blorp-managed ARC objects and require zero leaks.
 The `-O0` pilot runs once per fixture with strict allocation diagnostics enabled;
@@ -1995,7 +1995,8 @@ exact diagnostic, help, and span. These are handwritten conformance cases;
 the test runner does not interpret EBNF or generate cases from it.
 
 ```sh
-bin/blorp test --suite --timeout 180 blorp_2/test/test_grammar
+TARGET_COMPONENT_SOURCES=blorp_2/test/test_grammar/test_conformance.brp \
+  make -C blorp_2 test-target-components
 ```
 
 Lexical and layout rules:
@@ -2560,8 +2561,8 @@ produce diagnostics; there is no local-file or host-library fallback. Library
 modules use the ordinary module pipeline and preserve declaration identities.
 
 The [temporary library](standard_library/README.md) adapts modules from
-the [standard library](../standard_library/src/), with original source revisions
-and hashes retained in its adapter headers. Its active declarations provide
+the legacy [standard library](https://github.com/kablorp/blorp/blob/ee9e001c6de8911ee486fd992419bef5bc628e8b/standard_library/src/) (see
+[its README](standard_library/README.md)). Its active declarations provide
 the calculator's ordinary unions and concrete numeric, conversion and IO functions.
 Their explicit builtin bodies select closed compiler-known operations. Module functions
 may declare these builtin bodies with the exact concrete runtime signature,
@@ -2569,7 +2570,7 @@ without statement prefixes or tail annotations. List repeat, length, get, append
 labels and signature mismatches are errors. There is no arbitrary foreign
 symbol binding. The base types module owns `Int`, `Float`, `String`, `Void` and unary `List`.
 The [validation report](https://github.com/kablorp/blorp/blob/1e07c4dce85e51cd7ad911142e9bc96a5e0d91c7/benchmarks/results/blorp_2_int_add_2026-10-11.md) records
-strict tests, native fixtures, matched costs and the existing compiler's
+strict tests, native fixtures, matched costs and the legacy compiler's
 different trait-based `add` import surface.
 The [target API reference](standard_library/README.md) documents the current
 library contracts and temporary implementation limits.
@@ -2823,9 +2824,9 @@ exists only where its operation is called.
 
 Checked `set_index` returns `Some(updated)` for a valid index and `None` otherwise.
 Both update APIs evaluate their replacement argument eagerly, including invalid
-indices. These names match the host library so the same compiler source can
-be compiled by both compilers. A future coordinated rename to checked `set`
-and no-op `set_or_keep` must update both libraries and all callers together.
+indices. These names matched the legacy library, so one compiler source could be
+built by both compilers; that constraint is gone. A future rename to checked `set`
+and no-op `set_or_keep` updates this library and all callers together.
 
 A list literal `[a, b]` constructs one fresh root of exactly n slots inline at
 its site. An empty literal `[]` allocates nothing: it names its layout's one
@@ -3241,7 +3242,7 @@ The command reads the root program, the configured foundation and ordinary
 prelude, and their dependencies once per normalized path, then writes C:
 
 ```sh
-bin/blorp run --no-format blorp_2/src/main.brp -- --library-root blorp_2/standard_library input.brp output.c
+blorp_2/build/compiler --library-root blorp_2/standard_library input.brp output.c
 ```
 
 The impure command shell owns file I/O and printing. It reads each module
@@ -3634,18 +3635,18 @@ numeric widths, traits, doctests, channels, and FFI are excluded. Compiler tests
 are written in Blorp; the target runtime has explicitly approved C unit tests
 run by Blorp `TestSuite`. Build commands may use Make and the C toolchain.
 
-The current build uses the existing compiler and its standard library,
-including host I/O and process APIs. That library contains excluded features;
-it is a temporary host dependency, not a subset-compatible bootstrap library.
-Self-hosting requires a library/runtime with explicit primitive contracts and
-source dependencies that fit the subset.
+The compiler builds itself: the pinned seed compiles `blorp_2/src` against the
+target library at `blorp_2/standard_library`, whose primitives have explicit
+contracts and whose source dependencies fit the subset. The earlier plan to build
+against the legacy compiler's library, a temporary host dependency, is retired.
 
-The performance goal is roughly five times faster compilation through C emission
-than the existing compiler on matched workloads. Measure this separately from
+The performance goal was roughly five times faster compilation through C emission
+than the legacy compiler on matched workloads, measured separately from
 Clang compilation/linking and native execution, with explicit source and toolchain
-identity; it is a goal, not a measured result. The current unit command still
-uses the existing compiler. Its measured 615 ms pipeline would become about
-123 ms at that target, saving about 492 ms once the pilot supports that workload.
+identity; it was a goal, not a measured result. The unit command then still used
+the legacy compiler: its measured 615 ms pipeline would have become about
+123 ms at that target. The self-compile measurements and the fixpoint now track
+Blorp 2's own compile cost.
 See the [timing record](https://github.com/kablorp/blorp/blob/1e07c4dce85e51cd7ad911142e9bc96a5e0d91c7/benchmarks/results/blorp_2_match_2026-10-09.md#unit-test-feedback-time).
 
 Compare both compilers through C emission on the unmodified e2e fixtures:
@@ -3707,10 +3708,13 @@ reports. If stage A (the host building the pilot) fails, or in `--frontier`
 that suite fails or prints no count, the script exits 2: that is a setup error,
 not a measurement.
 
-The macOS command-behavior suite is separate from portable compiler unit tests:
+The bootstrap resolver and the Makefile recipes are shell tooling, so their
+tests are shell too: `test/tooling/test_bootstrap.sh` drives them with fake
+transport, seed and C compiler tools and is the repository's one sanctioned
+shell test. It is separate from the portable compiler unit tests:
 
 ```bash
-bin/blorp test --suite --timeout 180 blorp_2/test/tooling
+bash blorp_2/test/tooling/test_bootstrap.sh
 ```
 
 Each next increment adds an example, the exact grammar and semantic rules it
@@ -3725,7 +3729,7 @@ publication. Each checked function retains its validated signature beside its
 resolved body. Emission reads only validated
 facts and does not recheck purity or name scope. C function and parameter names are
 synthetic, and unused parameters are explicitly discarded to keep warning checks
-clean. Existing compiler internals are not pilot dependencies.
+clean. Legacy compiler internals are not dependencies.
 
 The compilation pipeline is entirely pure once its source inputs have been
 loaded. `load_program` reads dependencies and invokes pure lexing and parsing to
@@ -3749,7 +3753,5 @@ the `bool` library module.
 Concrete input traits do not expand that compiler-source subset. The production
 library supplies ordinary implementations of these traits; input programs may
 call their methods or use the fixed operators.
-The legacy host library's trait implementations do not expand the compiler-source
-subset.
-Exact String equality uses the ordinary `string.equals` API in both libraries;
+Exact String equality uses the ordinary `string.equals` API;
 `src/utils/text.brp` retains only its concatenation bridge.

@@ -60,7 +60,7 @@ Delivery order:
 
 ## Language contract and first executable example
 
-The names are existing APIs: `standard_library/src/char.brp:20` supplies
+The names are existing APIs: [`standard_library/src/char.brp:20`](https://github.com/kablorp/blorp/blob/ee9e001c6de8911ee486fd992419bef5bc628e8b/standard_library/src/char.brp#L20) supplies
 `to_int(Char)->Int`; there is no proposed `to_code`. Host trait implementation
 syntax is not copied into the target library. The historical parity audit
 established qualified `CharOps.to_int` as host-compatible at the planning base.
@@ -88,7 +88,7 @@ Char denotes exactly one Unicode scalar: 0..10FFFF excluding D800..DFFF. All
 unassigned/noncharacter scalars remain valid; no Unicode character database,
 normalization, grapheme segmentation or locale dependency. `'é'` is one value;
 `'é'` contains two and rejects. This matches upstream
-formal grammar 1.8 (`docs/GRAMMAR.md`),
+formal grammar 1.8 ([`docs/GRAMMAR.md`](https://github.com/kablorp/blorp/blob/ee9e001c6de8911ee486fd992419bef5bc628e8b/docs/GRAMMAR.md)),
 [Unicode's definition](https://www.unicode.org/glossary/#unicode_scalar_value)
 and the scalar model documented by
 [Rust](https://doc.rust-lang.org/std/primitive.char.html#validity-and-layout).
@@ -324,9 +324,9 @@ grammar.ebnf, library parity and roadmap with actual scope; main GUIDE/GRAMMAR
 already specify scalar syntax, so alter them only for an actual contract change.
 
 Narrow commands after root grants the serialized lane, then final owning gate:
-`bin/blorp test --suite --timeout 180 blorp_2/test/unit/test_lex/test_char_literals.brp`;
-`bin/blorp test --suite --timeout 180 blorp_2/test/test_grammar/test_strings.brp`;
-`make -C blorp_2 test`. Freeze/check the approved host first; no host rebuild here.
+`make -C blorp_2 test-target-components TARGET_COMPONENT_SOURCES=blorp_2/test/unit/test_lex/test_char_literals.brp`;
+`make -C blorp_2 test`. The `test_grammar/test_strings.brp` suite is deferred and
+has no runner until it is ported.
 
 Stop on ambiguity about invalid runtime Int→Char policy, ownership/layout,
 decoder diagnostic parity, host faults, cost/source caps or accepted-base

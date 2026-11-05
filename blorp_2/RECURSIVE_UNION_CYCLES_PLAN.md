@@ -384,27 +384,20 @@ Concrete first feedback, after test preparation and exclusive grant (proposed
 new suite/fixture paths; do not execute a nonexistent test and call that red):
 
 ```bash
-m4_host=/Users/keithphilpott/.codex/worktrees/blorp-2-compiler-comparison/blorp/bin/blorp
-"$m4_host" test --suite --timeout 180 \
+make -C blorp_2 test-target-components TARGET_COMPONENT_SOURCES="\
   blorp_2/test/unit/test_check/test_recursive_union_cycles.brp \
   blorp_2/test/unit/test_specialize/test_recursive_union_cycles.brp \
-  blorp_2/test/unit/test_verify/test_recursive_union_cycles.brp
+  blorp_2/test/unit/test_verify/test_recursive_union_cycles.brp"
 
 # After the focused production fixes, expand to lower/uses/own/emit/runtime.
-"$m4_host" test --suite --timeout 180 \
+make -C blorp_2 test-target-components TARGET_COMPONENT_SOURCES="\
   blorp_2/test/unit/test_lower/test_recursive_union_cycles.brp \
   blorp_2/test/unit/test_own/test_recursive_union_cycles.brp \
   blorp_2/test/unit/test_emit/test_recursive_union_cycles.brp \
-  blorp_2/test/runtime/test_recursive_union_cycles.brp
+  blorp_2/test/runtime/test_recursive_union_cycles.brp"
 
 # Build once; e2e receives this exact binary, never builds per fixture.
-"$m4_host" compile --no-format blorp_2/src/main.brp \
-  -o blorp_2/build/roadmap-union-cycles/compiler.c
-clang -O0 -DBLORP_MEMORY_DIAGNOSTICS=1 \
-  blorp_2/build/roadmap-union-cycles/compiler.c \
-  -o blorp_2/build/roadmap-union-cycles/compiler -lm -lpthread
-BLORP2_COMPILER=blorp_2/build/roadmap-union-cycles/compiler \
-  "$m4_host" test --suite --timeout 0 blorp_2/test/e2e
+make -C blorp_2 test-e2e
 ```
 
 First real-main input will be `test/e2e/fixtures/recursive/union_cycles/mutual.brp`.
@@ -412,6 +405,6 @@ Its baseline CLI is the frozen baseline pilot followed by
 `--library-root blorp_2/standard_library INPUT.brp OUTPUT.c`; require the
 specific closing-Left failure/no C before changes and exact exit7 after native
 compilation. Each suite runs callbacks and checks typed products; a parser or
-host setup error is never an expected failing assertion. Final literal Make
-uses the accepted destination's own verified FRESH host; the frozen host above
-does not silently substitute for that destination gate.
+setup error is never an expected failing assertion. Final literal Make uses
+the accepted destination's own pinned seed; a frozen compiler does not
+silently substitute for that destination gate.

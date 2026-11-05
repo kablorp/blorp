@@ -5,8 +5,8 @@ Performance benchmarks comparing blorp, Blorp 2, C, Go, OCaml, and Python.
 ## Quick Start
 
 ```bash
-# Build both compilers first
-make
+# Build the Blorp 2 compiler first. The blorp column needs no build: it uses a
+# pinned legacy release that the first run downloads and verifies.
 make -C blorp_2 compiler
 
 # Run the default benchmark suite
@@ -45,14 +45,25 @@ they drive. `results/` holds markdown summaries only
 The benchmark name is the filename without the extension. A benchmark must have
 a blorp source file; C, Go, OCaml, and Python counterparts are optional.
 Blorp benchmark sources can import harness helpers from `./support/benchmark`.
-Reusable low-level timing and optimizer-barrier primitives live in the standard
-`instrumentation` module.
+
+### The blorp column
+
+The `blorp` column is the legacy compiler, pinned to a published release built
+from the last legacy sources (`ee9e001c6de8`). `bench.sh` does not build it. It
+downloads the release that `benchmarks/legacy-compiler.env` names (repository,
+tag and one SHA-256 per target) into `$XDG_CACHE_HOME/blorp/legacy` (default
+`~/.cache/blorp/legacy`), verifies the digest before first use, and compiles
+each benchmark from a temporary directory so the release's embedded standard
+library is used, never a checkout's. Only a run that builds a benchmark
+downloads it; `--list` and `--help` never do. The release provides macOS arm64,
+Linux x64 and Linux arm64. The standard `instrumentation` module that the
+timing helpers use comes from that release's embedded library.
 
 ### Blorp 2
 
 The `blorp2` column uses `blorp_2/build/compiler` and the explicit
 `blorp_2/standard_library` root. Set `BLORP2_COMPILER` to select another compiler
-executable. There is no fallback to the legacy compiler. A missing compiler is
+executable. The column never falls back to the legacy compiler. A missing compiler is
 an error when the selected workload has a Blorp 2 port; unsupported rows show
 `-`. Listing the workloads needs neither compiler.
 
@@ -372,6 +383,7 @@ GO=go1.22                       bash benchmarks/bench.sh   # Use specific Go
 OCAMLOPT=ocamlopt               bash benchmarks/bench.sh   # Use specific OCaml native compiler
 CC=gcc                          bash benchmarks/bench.sh   # Use specific C compiler
 BLORP2_COMPILER=/path/compiler  bash benchmarks/bench.sh fib # Select Blorp 2 compiler
+XDG_CACHE_HOME=/path/cache      bash benchmarks/bench.sh   # Where the pinned legacy compiler is cached
 BENCH_THREADS=4                 bash benchmarks/bench.sh   # Worker/task width for concurrency rows
 BLORP_THREADS=4                 bash benchmarks/bench.sh   # Blorp runtime thread width for concurrency rows
 GOMAXPROCS=4                    bash benchmarks/bench.sh   # Go runtime parallelism for concurrency rows

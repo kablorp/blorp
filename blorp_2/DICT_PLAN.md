@@ -8,7 +8,7 @@ Blorp 2 has no dictionary.
 
 **What the compiler uses instead:**
 - **One stopgap map,** `blorp_2/src/utils/hash_map.brp`. Its header says it is deleted "once Blorp has a dict implementation". It offers `get`, `set` and `values`, with no `remove`, no key listing and no literal syntax.
-- **Hand-made Int keys.** Only `Int` implements `Hashable` (`standard_library/int.brp:15`), so the map's six users squash their real keys into an Int:
+- **Hand-made Int keys.** Only `Int` implements `Hashable` (`standard_library/int.brp:12`), so the map's six users squash their real keys into an Int:
   - `namespace.brp`: `2 * name_number + kind`;
   - `instantiation_paths.brp`: `source * count + target`;
   - `model.brp`: `head_hint(TypeHead)`.
@@ -113,7 +113,7 @@ The pinned seed of the time found `with_capacity` by spelling for every Dict lit
     - **Owner-visible diagnostic change.** `{}` where a record is expected became an ordinary type mismatch through one general checking change: when the expected type of a whole value has another head, its unsolved type parameters are reported as that mismatch. This changes calls too: `p: Point = D.empty()` now reports "expression does not match the expected type" instead of "cannot infer the type parameter from the argument". Argument positions such as `takes_point({})` are unchanged.
     - After the first expression in braces, anything but `|` or `=>` is "expected '|' or '=>' after the first expression in braces", naming both forms. Inside a Dict, a missing key or a second `=>` in an entry gets a Dict message; a stray `=>` elsewhere keeps the lexer's former comparison and lambda message.
 - **Parser and lexer changes:**
-  - A braced form currently decides by two-token lookahead (`consume_braced_record`, `parse/parse.brp`), so `{x => 1}` would fall into record update today, if the lexer did not reject `=>` first. The rule becomes: after `{`, a name then `=` is a record literal. Otherwise read one expression; then `|` means a record update and `=>` a Dict. This matches legacy `braced` in `docs/GRAMMAR.md`.
+  - A braced form currently decides by two-token lookahead (`consume_braced_record`, `parse/parse.brp`), so `{x => 1}` would fall into record update today, if the lexer did not reject `=>` first. The rule becomes: after `{`, a name then `=` is a record literal. Otherwise read one expression; then `|` means a record update and `=>` a Dict. This matches legacy `braced` in [`docs/GRAMMAR.md`](https://github.com/kablorp/blorp/blob/ee9e001c6de8911ee486fd992419bef5bc628e8b/docs/GRAMMAR.md).
   - The changes:
     - a new AST variant for a Dict literal;
     - `{}` becomes an empty Dict rather than an empty record literal. Today it parses at `parse.brp:3822` and is rejected by `constructors.brp:283` with `RecordNeedsExpectedType`;

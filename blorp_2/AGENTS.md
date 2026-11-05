@@ -98,6 +98,12 @@ a requirement, report the limitation instead of adding one.
 ## Validation
 
 **Tests.** Compiler tests are Blorp `TestSuite`s, not a test `main` or Python.
+The one sanctioned shell test is
+[test/tooling/test_bootstrap.sh](test/tooling/test_bootstrap.sh): it tests the
+download, verify and cache failure modes of `scripts/blorp2-compiler-bootstrap`
+and the Makefile recipes with fixture releases, which is shell tooling tested
+in shell. CI runs it after `make -C blorp_2 test`; porting it to a Blorp 2
+program is a separate change.
 Every compiler source module has a unit suite under
 [test/unit/](test/unit/), in the `test_<stage>/` folder that mirrors the module's
 folder under `src/`. Grammar cases live under

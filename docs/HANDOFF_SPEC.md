@@ -46,8 +46,7 @@ not apply rather than filling it.
    it answers, where the throwaway code lives (a scratch directory or a
    branch that never lands), how long to spend, and the result that decides
    between continuing and reporting back. For traps, name them: language or
-   bootstrap gotchas, pass ordering, flaky or slow gates, checks that fail
-   late (such as `make artifact-scan` for new files under test roots).
+   bootstrap gotchas, pass ordering, and flaky or slow gates.
 7. **Dependencies.** *Include when* something must land or be decided first:
    another issue, a bootstrap rotation, an owner decision.
 8. **Testing.** *Include when* the change needs new or changed tests, which
@@ -82,42 +81,36 @@ not apply rather than filling it.
 ## Code example
 
 A literate example quotes the current code with its location, shows the
-change, and explains it. This one is from the leak gate's timeout loop in
-`scripts/test`.
+change, and explains it. This one is from the List runtime's copying append
+in `blorp_2/src/runtime/list.brp`, as it stood at `20e530021`. The strings
+are fragments of the C that the compiler emits.
 
-Current code (`scripts/test`, `run_with_timeout_seconds`):
+Current code (`list_update_runtime`, the borrowed append, line 329):
 
-```bash
-    while kill -0 "$pid" 2>/dev/null; do
-        if [ "$waited" -ge "$timeout_seconds" ]; then
-            ...
-        fi
-        sleep 1
-        waited=$((waited + 1))
-    done
+```blorp
+.concat("${allocate_root(type_name, "(count+1)")}for(uint64_t index=0;index<count;index++){")
 ```
 
-The loop sleeps a whole second before it notices that the process has
-exited, so a case that finishes at once still costs one second; the gate runs
-30 such cases.
+A copying append allocates exactly `count + 1` slots, and the caller usually
+appends again at once, so the next append resizes. Every List built up from
+`[]` pays that resize, because `[]` is immortal and the first append copies.
 
-After the change:
+After the change (commit `66adb09af`):
 
-```bash
-    local timeout_polls=$((timeout_seconds * TERMINATION_POLLS_PER_SECOND))
-    while kill -0 "$pid" 2>/dev/null; do
-        if [ "$waited_polls" -ge "$timeout_polls" ]; then
-            ...
-        fi
-        sleep "$TERMINATION_POLL_SECONDS"
-        waited_polls=$((waited_polls + 1))
-    done
+```blorp
+.concat("${allocate_growing_root(type_name, "(size_t)(count+1)", capacity)}for(uint64_t index=0;index<count;index++){")
 ```
 
-Polling at the existing 0.1 s termination interval makes an instant case cost
-a tenth of a second. Bash has only integer arithmetic, so the budget is
-counted in polls rather than seconds, and `TERMINATION_POLLS_PER_SECOND` is a
-named constant kept equal to `1 / TERMINATION_POLL_SECONDS`.
+```blorp
+-- A copying append or concat's root, sized by `blorp_list_copy_capacity`.
+private pure func allocate_growing_root(type_name: String, required: String, maximum: String) -> String:
+	"const size_t capacity=blorp_list_copy_capacity(${required},${maximum});${list_root_allocation(type_name, "result", "capacity")}"
+```
+
+The new runtime function floors the copy at the first-growth capacity, four
+slots clamped to `maximum` for large elements, and leaves an empty result
+empty. `allocate_root` stays for the copies that are not about to grow, so the
+exact-size path is not touched.
 
 ## Template
 

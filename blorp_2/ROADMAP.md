@@ -75,10 +75,9 @@ their own inventory and plan after M8.
 
 ## Rules for every milestone
 
-- **Dual-compile.** Until the fixpoint the host keeps building A, so the source
-  stays host-compilable: only syntax the host already accepts enters `src`, and
-  every library function `src` imports exists in both the host library and
-  `standard_library` with the same module, name and signature.
+- **Dual-compile (retired).** Until the fixpoint the legacy compiler kept building
+  A, so `src` stayed compilable by it. The fixpoint and the removal of the legacy
+  tree ended that rule: `src` needs only the pinned seed and `standard_library`.
   The [target API reference](standard_library/README.md) records the contracts.
 - **Fixture first.** Each increment starts with a small real-main e2e fixture
   shaped like the source's own use, failing granular tests, runnable acceptance
@@ -291,14 +290,14 @@ literals (160 lines, the C runtime text), pattern syntax (or-, nested, list,
 String/Char literal, qualified) parsed into the AST and rejected by the checker
 until M2b with an exact message, `opaque type` / `into_opaque` / `from_opaque`,
 `a..b` ranges and `Char` literals as tokens. The language reserves every word
-GRAMMAR [§1.4](../docs/GRAMMAR.md#14-keywords) reserves, and indentation follows
+GRAMMAR [§1.4](https://github.com/kablorp/blorp/blob/ee9e001c6de8911ee486fd992419bef5bc628e8b/docs/GRAMMAR.md#14-keywords) reserves, and indentation follows
 the host's levels stack: a deeper line opens a level whatever the step, a
 dedent must land on an open level, and a bracketed block closes at its base.
 
 **Decision.** `?=` is allowed only among a function body's own top-level
 statements, and the parser enforces this from its statement context. Every
 `if`/`match` block, loop body and lambda body rejects it. The host agrees for
-loops ([GUIDE](../docs/GUIDE.md)); it remains more permissive in the other
+loops ([GUIDE](https://github.com/kablorp/blorp/blob/ee9e001c6de8911ee486fd992419bef5bc628e8b/docs/GUIDE.md)); it remains more permissive in the other
 contexts. The compiler-source rewrite removes those nested uses while keeping
 the host unchanged. Keeping loop exits at two variants (M3) and propagation
 out of join arms (M2.3) depends on this rule.
@@ -435,7 +434,7 @@ in `src/lex/lex.brp` is a real consumer of the same pattern. Assignment shares
 a counted root; updates, rather than assignment, cause these element copies.
 
 The legacy runtime confirms the intended precedent:
-`blorp/src/lib/runtime/native/runtime.c:8004` defines default capacity four;
+[`blorp/src/lib/runtime/native/runtime.c:8004`](https://github.com/kablorp/blorp/blob/ee9e001c6de8911ee486fd992419bef5bc628e8b/blorp/src/lib/runtime/native/runtime.c#L8004) defines default capacity four;
 `blorp_list_append` doubles full buffers, and `blorp_list_move_to_capacity`
 relocates unique slots without retaining/dropping their children. Read these
 as reference, not code to port: legacy storage modes and ownership ABI differ.
@@ -1784,7 +1783,7 @@ L2b closed and the record, union and String RC traffic. O1 does not start
 before this report; O3 is decided from it.
 
 O0 also compares Blorp 2 against the legacy compiler. Its Core passes in
-`blorp/src/compiler/stage_09_core/` already infer consumed user-call arguments
+[`blorp/src/compiler/stage_09_core/`](https://github.com/kablorp/blorp/blob/ee9e001c6de8911ee486fd992419bef5bc628e8b/blorp/src/compiler/stage_09_core/) already infer consumed user-call arguments
 (`ownership_contracts.brp`), clone consuming record callees
 (`consume_specialize.brp`) and reuse record and union cells (`reuse.brp`, `record_update.brp`). The plan must match that
 reach with independent verification and far less code. Land `helper_accumulators` (modes `list_helper`,
@@ -1848,7 +1847,7 @@ stack, over all 1,717: allocator frames 29%, reference-count helper frames
 `find_record_instance`) holds 20%: the linear lookup already listed under
 [deferred work](#deferred-beyond-the-fixpoint).
 
-**Against the legacy compiler.** Each benchmark built by `bin/blorp compile`
+**Against the legacy compiler.** Each benchmark built by the legacy compiler's `compile`
 and by B from the same worktree, `clang -fwrapv -O2`. Instructions are normal
 retired instructions minus the `none` control at the same size; allocations
 are whole-process totals from a `-DBLORP_MEMORY_DIAGNOSTICS=1` build. Sizes
@@ -2472,10 +2471,16 @@ Benchmarks, for both compilers at one commit, with `side` set to `base` or
 `benchmarks/bench.sh`. Run every binary serially:
 
 ```bash
-make && make -C blorp_2 compiler
-out=build/ownership/$side && mkdir -p $out
+make -C blorp_2 compiler
+# The legacy compiler is the pinned release that benchmarks/legacy-compiler.env
+# names. Any bench.sh run that builds a benchmark (for example
+# `bash benchmarks/bench.sh fib`) downloads and verifies it into this cache.
+legacy=$(ls "${XDG_CACHE_HOME:-$HOME/.cache}"/blorp/legacy/kablorp/blorp/dev-ee9e001c6de8/$(scripts/target-triple)/*/blorp)
+root=$PWD
+out=$root/build/ownership/$side && mkdir -p $out
 for name in helper_accumulators control_flow_accumulators compiler_ast binary_trees compiler_emit; do
-  bin/blorp compile benchmarks/blorp/$name.brp -o $out/${name}_legacy.c
+  # Run it outside the checkout so the release's embedded library is used.
+  (cd "$(mktemp -d)" && "$legacy" compile "$root/benchmarks/blorp/$name.brp" -o $out/${name}_legacy.c)
   blorp_2/build/compiler --library-root blorp_2/standard_library \
     benchmarks/blorp_2/$name.brp $out/${name}_blorp2.c
   for compiler in legacy blorp2; do
@@ -2517,7 +2522,7 @@ Binding since step 0 (accepted 2026-10-29):
   builtins +4. Legacy needs about 41,400 lines for comparable reach
   (`perceus.brp`, `perceus/`, `ownership.brp`, `ownership_contracts.brp`,
   `reuse.brp`, `consume_specialize.brp` and `record_update.brp` in
-  `blorp/src/compiler/stage_09_core/`), with special-case rewrites such as destination
+  [`blorp/src/compiler/stage_09_core/`](https://github.com/kablorp/blorp/blob/ee9e001c6de8911ee486fd992419bef5bc628e8b/blorp/src/compiler/stage_09_core/)), with special-case rewrites such as destination
   forwarding and clone classification. If O1 needs a rewrite that the
   contracts and the call-site rule cannot express, stop and ask instead of
   adding one.
@@ -3568,18 +3573,16 @@ remaining limits. Stop and report host defects, unapproved mechanisms, missing
 destruction oracles and incomplete representation; never work around them with
 partial publication or unchecked emission.
 
-From the repository root, check host freshness and use focused suites first:
+From the repository root, use focused suites first:
 
 ```sh
-scripts/compiler-build-status
-bin/blorp test --suite --timeout 180 blorp_2/test/unit/test_own/test_own.brp
-bin/blorp test --suite --timeout 180 blorp_2/test/unit/test_verify/test_verify.brp
-bin/blorp test --suite --sanitize --leak-check --timeout 180 blorp_2/test/unit
+make -C blorp_2 test-target-components TARGET_COMPONENT_SOURCES=blorp_2/test/unit/test_own/test_own.brp
+make -C blorp_2 test-target-components TARGET_COMPONENT_SOURCES=blorp_2/test/unit/test_verify/test_verify.brp
 make -C blorp_2 test
 git diff --check
 ```
 
-If the host is not FRESH, run `make` then recheck before direct tests. E2e builds
+E2e builds
 the pilot once at O0, compiles unmodified fixture C at O0 and uses timeout 0; no
 persistent compiler cache.
 
@@ -3633,10 +3636,10 @@ no full borrow checker, GC, ownership lattice or optimization pass is implied.
 | [OCaml tail-modulo-constructor](https://ocaml.org/manual/5.5/tail_mod_cons.html) | Constant-stack traversal needs an explicit qualifying transformation. Our direct-self guarantee does not imply mutual or constructor-tail guarantees. |
 
 The first compiler remains a source of bounded precedents:
-[ownership contracts](../docs/OWNERSHIP_MODEL.md),
-[concrete record representation](../blorp/src/compiler/stage_09_core/record_representation.brp),
-[managed record layouts](../blorp/src/compiler/stage_09_core/managed_record_layout.brp)
-and [cleanup preparation](../blorp/src/compiler/stage_09_core/prepare.brp).
+[ownership contracts](https://github.com/kablorp/blorp/blob/ee9e001c6de8911ee486fd992419bef5bc628e8b/docs/OWNERSHIP_MODEL.md),
+[concrete record representation](https://github.com/kablorp/blorp/blob/ee9e001c6de8911ee486fd992419bef5bc628e8b/blorp/src/compiler/stage_09_core/record_representation.brp),
+[managed record layouts](https://github.com/kablorp/blorp/blob/ee9e001c6de8911ee486fd992419bef5bc628e8b/blorp/src/compiler/stage_09_core/managed_record_layout.brp)
+and [cleanup preparation](https://github.com/kablorp/blorp/blob/ee9e001c6de8911ee486fd992419bef5bc628e8b/blorp/src/compiler/stage_09_core/prepare.brp).
 Carry useful contracts forward, not broad mutable environments or string-keyed
 semantic rediscovery. Historical aggregate-child protection and builder-COW
 failures supply regression ideas, not claims about current bugs.

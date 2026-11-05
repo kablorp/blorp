@@ -399,7 +399,7 @@ The `example` target uses the newly built B2 compiler. `test` builds B2 and
 runs its explicit self-hosted component and first native e2e selections; `test-components` uses an
 already-built B2 compiler. Unported suites are deferred without a host fallback.
 Run the isolated behavioral shell tests with
-`bash blorp/test/test_build/test_blorp2_bootstrap.sh`; they use fake transport,
+`bash blorp_2/test/tooling/test_bootstrap.sh`; they use fake transport,
 seed and C compiler tools, including quoted paths and parallel target requests.
 Cold/warm clean-checkout qualification uses the actual published seed assets.
 
