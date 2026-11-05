@@ -1,62 +1,51 @@
 # Blorp
 
 Blorp is a compiled language for writing safe, understandable code that is easy
-to generate, review, debug, and trust.
+to generate, review, debug, and trust. Its compiler is written in Blorp and
+emits C.
 
-Blorp is in early preview. For the language tour, examples, documentation, and
-current project status, start here:
+Blorp is in early preview. For the language tour, examples, and current project
+status, start here:
 
 **https://blorp-lang.org**
 
-## Hello, World
+## Where Blorp lives
 
-```blorp
-func main(args: List[String]):
-	print("Hello, world!")
-```
+The compiler, its standard library, tests and tooling live in
+[`blorp_2/`](blorp_2/):
 
-The root `main` may also return `Int`, `Void`, or a locally defined type that
-implements the prelude's `ExitStatusAble` trait. `Int` is the process exit
-code; `Void` exits with 0. Custom status types can provide an optional message
-for nonzero exits. Functions named `main` in imported modules remain ordinary
-functions.
+- [`blorp_2/README.md`](blorp_2/README.md) defines the supported language and
+  the compiler's design.
+- [`blorp_2/grammar.ebnf`](blorp_2/grammar.ebnf) is the formal grammar.
+- [`blorp_2/AGENTS.md`](blorp_2/AGENTS.md) holds the build, test and review
+  rules for contributors.
 
-## Try It Out
+The earlier compiler (a larger language with tensors, concurrency, a formatter,
+a language server and a package manager) was retired from this tree. It stays
+in git history; commit
+[`ee9e001c6de8`](https://github.com/kablorp/blorp/tree/ee9e001c6de8911ee486fd992419bef5bc628e8b)
+is its last revision.
 
-The easiest way to try Blorp is to install the latest dev release. This
-downloads the matching binary for your system and installs a single binary to `~/.local/bin/blorp`.
+## Build and test
 
-```bash
-curl -fsSL https://raw.githubusercontent.com/kablorp/blorp/main/scripts/install-dev | bash
-
-~/.local/bin/blorp --version
-```
-
-Set `BLORP_INSTALL_TAG=dev-<short-sha>` to install an immutable dev snapshot
-instead of the moving latest `dev` build.
-
-To remove the dev binary:
+Install a C compiler such as Clang or GCC, plus `curl`. `BLORP_CC=gcc` selects
+GCC instead of the default Clang.
 
 ```bash
-rm -f "$HOME/.local/bin/blorp"
+git clone https://github.com/kablorp/blorp.git
+cd blorp
+make -C blorp_2 compiler    # downloads the pinned, SHA-256-verified seed, then builds
+make -C blorp_2 example     # compiles and runs a small program through the new compiler
+make -C blorp_2 test        # self-hosted component suites and native end-to-end tests
 ```
 
-A C compiler such as Clang or GCC is still required to compile and run Blorp
-programs. Both are supported and exercised in CI; the host compiler is chosen
-through `BLORP_CC`, which defaults to Clang.
+The compiler's command line is
+`blorp_2/build/compiler --library-root blorp_2/standard_library INPUT.brp OUTPUT.c`;
+compile the C with your C compiler.
 
-Building from source is mainly useful for compiler development. To do that,
-install a C compiler such as Clang or GCC and `curl`, then run:
-
-```bash
-make
-bin/blorp run examples/hello.brp
-```
-
-`BLORP_CC=gcc make` selects GCC instead of the default Clang.
-
-For more examples and setup notes, see https://blorp-lang.org.
-Repository documentation starts at [docs/README.md](docs/README.md).
+`scripts/blorp2-fixpoint --prove` proves that the compiler reproduces its own C
+from its own source. `benchmarks/bench.sh` compares Blorp with C, Go, OCaml and
+Python on small programs; see [benchmarks/README.md](benchmarks/README.md).
 
 ## In Brief
 
@@ -66,46 +55,9 @@ Blorp focuses on:
 - Explicit purity tracking with `pure func`.
 - Value semantics with deterministic ARC/COW memory management.
 - Pattern matching, algebraic data types, traits, and method-style function calls.
-- Structured concurrency and native compilation through C.
+- Native compilation through C.
 - Syntax and tooling that are predictable for both humans and code-generation tools.
 
-## Local Development
+## License
 
-The [Developer Guide](docs/DEVELOPMENT.md) covers compiler workflows,
-diagnostics, profiling, test placement, CI reproduction, and validation in
-detail.
-
-```bash
-git clone https://github.com/kablorp/blorp.git
-cd blorp
-make
-scripts/test
-```
-
-Local builds write the compiler executable to `bin/blorp` in the repository root.
-Use that binary for development commands instead of an installed dev release.
-
-The pinned bootstrap compiler builds the deterministic Blorp source generator
-under `blorp/tool/`, then that tool generates build metadata, embedded
-runtime C, and the embedded standard library.
-
-The main test runner is quiet by default and prints a gate summary plus failure
-details. Use `scripts/test --verbose` for pass-by-pass output, or
-`scripts/test --log-dir logs` to keep complete gate logs while preserving
-compact console output.
-
-Useful targeted commands:
-
-```bash
-scripts/compiler-check --changed
-scripts/compiler-check --stage typecheck
-bin/blorp check path/to/file.brp
-bin/blorp run path/to/file.brp
-bin/blorp test blorp/test/test_runtime/test_types/test_bool.brp
-bin/blorp format --check path/to/file.brp
-bin/blorp lint path/to/file.brp
-```
-
-`scripts/compiler-check` resolves compiler source changes through the checked
-ownership manifest and runs focused checks. It complements rather than replaces
-the broad `scripts/test compiler-blorp` integration gate.
+See [LICENSE](LICENSE).

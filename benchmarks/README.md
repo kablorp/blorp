@@ -36,11 +36,7 @@ benchmarks/
   args/<name>.txt        # optional shared CLI args
 ```
 
-Compiler measurement tools live beside these suites: `self_compile_measure`,
-`build_stage2_compiler`, `c_emission_bytes`, `normalize_generated_c_symbols`,
-and the record-update allocation guards with the `blorp/profiles/` programs
-they drive. `results/` holds markdown summaries only
-(see [Recording Results](#recording-results)).
+`results/` holds markdown summaries only (see [Recording Results](#recording-results)).
 
 The benchmark name is the filename without the extension. A benchmark must have
 a blorp source file; C, Go, OCaml, and Python counterparts are optional.
@@ -95,7 +91,7 @@ generation. Blorp 2 List updates copy, its filter/reverse/sort helpers use
 temporary immutable algorithms, and the fold port uses an explicit summing loop
 instead of `fold_left`. Its String emitter has no capacity reservation and uses
 fresh concatenations and temporary integer strings. These comparisons are
-provisional; see [the audit](AUDIT.md). They do not isolate compiler quality.
+provisional; see [the audit](https://github.com/kablorp/blorp/blob/ee9e001c6de8911ee486fd992419bef5bc628e8b/benchmarks/AUDIT.md). They do not isolate compiler quality.
 
 ## Default Benchmark Suite
 
@@ -138,190 +134,6 @@ included in `bench.sh all`.
 | `virtual_threads` | Fiber spawn, join, park, and wake scaling | blorp |
 | `control_flow_accumulators` | List accumulators updated in join arms (`in_arms`), across inner-loop entry (`nested`) and in a flat loop (`flat`), with a `none` startup control; arguments are the mode and the append count | blorp, Blorp 2 |
 | `helper_accumulators` | Accumulators threaded through a helper parameter: List append (`list_helper`), String append (`string_helper`) and List `set` on a fixed table (`set_helper`), with a `none` startup control; arguments are the mode and the update count | blorp, Blorp 2 |
-
-## Compiler Diagnostics
-
-These opt-in compiler tools compile bounded fixtures through the production
-compiler. They are not runtime language comparisons and are deliberately
-excluded from `bench.sh all`.
-
-### Record Update Allocations
-
-`compiler_record_update_match_allocations` runs a bounded loop of alternating
-self-updates selected by an exhaustive Boolean `match` through the production
-compiler and asserts the runtime allocation counters. Reuse is valid only when
-every returning literal branch transfers the same mutable owner:
-
-```bash
-benchmarks/compiler_record_update_match_allocations
-BLORP_RECORD_UPDATE_SKIP_BUILD=1 \
-  benchmarks/compiler_record_update_match_allocations
-```
-
-`compiler_record_update_nested_match_allocations` exercises the projected
-decision tree for nested constructor and literal patterns. Every nested leaf
-must transfer the same mutable owner before the compiler can reuse it. The
-record includes static `String` literal fields so the probe also checks that
-field aliases do not force fresh record allocations or dynamic string storage.
-
-```bash
-benchmarks/compiler_record_update_nested_match_allocations
-BLORP_RECORD_UPDATE_SKIP_BUILD=1 \
-  benchmarks/compiler_record_update_nested_match_allocations
-```
-
-The normal invocation asserts the optimized one-allocation baseline. Override
-`BLORP_RECORD_UPDATE_EXPECT_ALLOCATIONS` to lock in a new expected count. Set
-`BLORP_RECORD_UPDATE_MEASURE_ONLY=1` while intentionally measuring an
-optimization that is expected to change the count. Both probes always assert
-their release and live-object baselines; use
-`BLORP_RECORD_UPDATE_EXPECT_RELEASES` and
-`BLORP_RECORD_UPDATE_EXPECT_CURRENT_OBJECTS` only when intentionally changing
-those lifecycle counts.
-
-## Self-Compile Measurement Protocol
-
-`benchmarks/self_compile_measure` is the one standard measurement for
-compiler-performance work. Every worker, baseline, and acceptance decision
-uses it so numbers are comparable across branches, worktrees, and people.
-
-It compiles a **frozen input snapshot** (the compiler's own `blorp/src` and
-`standard_library/src` at one recorded revision) with paired compiler
-executables. The diagnostic binary supplies allocation checkpoints; the
-normal binary supplies instructions, time, and RSS. Their generated C must
-match byte for byte. The harness reports:
-
-- allocations per compiler phase, from the runtime's memory checkpoints
-  (deterministic; the primary signal while iterating);
-- retired instructions per run, from `/usr/bin/time -l` (stable to about
-  0.1% on Apple Silicon; the primary acceptance signal);
-- per-phase wall time, total wall time, and peak RSS (secondary; host noise);
-- the SHA-256 of the generated C (semantics-preserving source refactors must
-  produce **identical** C).
-
-```bash
-# One-time per checkout: build at the acceptance optimization level.
-export BLORP_CLI_C_OPTIMIZATION=-O2
-make
-scripts/compiler-build-status
-
-# On the untouched parent, record one input revision for both checkouts.
-frozen_input_rev=$(git rev-parse HEAD)
-# Establish both paired baselines on the untouched parent.
-benchmarks/self_compile_measure --stage2 \
-  --label baseline --input-rev "$frozen_input_rev" \
-  --output /tmp/paired-baseline.json
-shasum -a 256 benchmarks/self_compile/small.brp \
-  > /tmp/paired-small-baseline.sha256
-benchmarks/self_compile_measure --stage2 --program small \
-  --label baseline-small --input-rev "$frozen_input_rev" \
-  --output /tmp/paired-small-baseline.json
-
-# In the candidate checkout, rebuild at -O2 and confirm FRESH before comparing.
-export BLORP_CLI_C_OPTIMIZATION=-O2
-make
-scripts/compiler-build-status
-benchmarks/self_compile_measure --stage2 \
-  --label candidate --input-rev "$frozen_input_rev" \
-  --baseline /tmp/paired-baseline.json \
-  --output /tmp/candidate.json --require-identical
-# Small-program guard (must not regress materially).
-shasum -a 256 -c /tmp/paired-small-baseline.sha256 && \
-  benchmarks/self_compile_measure --stage2 --program small \
-  --label candidate-small --input-rev "$frozen_input_rev" \
-  --baseline /tmp/paired-small-baseline.json \
-  --output /tmp/candidate-small.json --require-identical
-
-# Run a multi-process gate.
-scripts/compiler-check --changed
-```
-
-Rules:
-
-1. The `--input-rev` must equal the baseline's `input_rev`. The harness
-   freezes that revision under `$TMPDIR/blorp-perf-input/<sha>` once and
-   reuses it; workers never compile their own changed sources as the input.
-2. The compiler under test must be `FRESH` per `scripts/compiler-build-status`;
-   the harness refuses a stale executable.
-3. Compare like with like: a `-O0` build (the `make` default) against the
-   `-O0` baseline while iterating; the coordinator's acceptance run uses the
-   `-O2` build against the `-O2` baseline. For an `-O2` build export
-   `BLORP_CLI_C_OPTIMIZATION=-O2` for `make`, `scripts/compiler-build-status`,
-   and the harness alike, since the build identity includes that level. The
-   JSON records the level as `c_optimization`. Report which one you used.
-4. Measurements are single-process and their primary metrics tolerate
-   concurrency; run commands directly. Do not spawn many compiled test
-   binaries in parallel yourself (`scripts/compiler-check`, `scripts/test`
-   can overwhelm macOS `syspolicyd`). Measurement noise from concurrent work
-   is accepted; use the harness's min-of-runs, never wall time, as evidence.
-5. Report the comparison table verbatim: allocations per phase, total
-   allocations, minimum retired instructions, and the IDENTICAL/DIFFERENT
-   output line. Wall time and per-phase `phases_ms` are host-clock noise, not
-   acceptance evidence; the table omits them by default (they are still
-   recorded in the JSON) and only prints them with `--show-wall`.
-6. Every measurement records a toolchain fingerprint (`cc_version`, the full
-   `<compiler> --version` output, and the `compiled_by` / `optimization` /
-   `commit` fields parsed from it). `compare()` prints a `toolchain mismatch:`
-   line for each of `cc_version`, `compiled_by`, or `optimization` that
-   differs and exits nonzero unless `--allow-toolchain-mismatch` is passed —
-   an Xcode clang update or a bootstrap-pin change moves instruction counts on
-   byte-identical C, so a baseline and candidate built with different
-   toolchains are not comparable by default. A `commit` difference alone is
-   expected and informational only. If the compiler under test is
-   bootstrap-built (`compiled_by` starts with `dev-`) and the worktree
-   touches `blorp/src/compiler/stage_10_backend/` or
-   `blorp/src/lib/runtime/native/`, the harness also prints a loud warning
-   that the measurement cannot observe those changes and points at
-   `benchmarks/build_stage2_compiler` (see the stage-2 rule below).
-7. `--input-rev` freezes the self-compile source, but `--program small` reads
-   `benchmarks/self_compile/small.brp` from each checkout. Before comparing
-   small-program results, require that file to have the same SHA-256 in the
-   baseline and candidate checkouts, as verified in the example above. A
-   changed small program is a different workload even if `--input-rev` matches.
-
-Baseline JSON is raw data: keep it under the ignored `build/` directory and
-commit only a markdown summary of the comparison. A baseline recorded without
-a toolchain fingerprint has no `toolchain` key; comparing against one prints a
-warning ("baseline predates fingerprint recording") instead of a hard refusal,
-so read its instruction-count deltas with that in mind.
-
-For intentional code-generation changes, omit `--require-identical` when
-comparing baseline with candidate; use generated-C review, behavioral and
-ownership gates, and the stage-2/stage-3 fixpoint oracle instead. The normal
-and diagnostic binaries must still emit identical C within each measured
-pair. Record changes in C size alongside instructions and allocations.
-
-### The Stage-2 Rule
-
-`bin/blorp` is linked by the pinned bootstrap compiler, so a change to the
-backend or the runtime in this worktree never shows up in what `bin/blorp`
-itself runs. Any task that touches codegen or the runtime must instead
-measure a **stage-2 compiler**: `blorp/src/main.brp` compiled by `bin/blorp`
-and linked with the Makefile's own "Compiling Blorp CLI" recipe, so it
-carries this checkout's codegen and runtime.
-
-```bash
-# Build both modes directly from one generated C and body object.
-benchmarks/build_stage2_compiler --diagnostic-output bin/blorp-stage2-diagnostic \
-  bin/blorp-stage2
-
-# Or let the harness build and measure it in one step.
-benchmarks/self_compile_measure --stage2 \
-  --label candidate --input-rev <input_rev> \
-  --baseline /tmp/paired-stage2-baseline.json \
-  --output /tmp/candidate.json --require-identical
-```
-
-`--stage2` builds both `bin/blorp-stage2` and
-`bin/blorp-stage2-diagnostic` via `benchmarks/build_stage2_compiler`, records
-their hashes and the `bin/blorp` hash that generated their shared C, and
-measures them as a pair. External binaries require both `--compiler` and
-`--diagnostic-compiler`. The comparison
-table prints `output bytes` next to the instructions-retired row, since the
-compiler's own generated-C size is a tracked metric for codegen work. Both
-scripts respect `BLORP_CLI_C_OPTIMIZATION` the same way `make` does; export it
-before building, checking freshness, and measuring so all three agree on the
-optimization level.
 
 ## Timing Model
 

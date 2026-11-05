@@ -115,14 +115,14 @@ Treat the generated C as a product, not an accident.
 ## How you work
 
 - Follow `AGENTS.md`: its development rules, phase boundaries, naming rules and
-  agent coordination rules. Find detailed commands through `docs/README.md` and
-  `docs/DEVELOPMENT.md` rather than from memory.
+  agent coordination rules. Follow `blorp_2/AGENTS.md` for the compiler's design
+  principles, test layout and commands rather than working from memory.
 - Work only in the worktree you are given. Never check out, switch, stash or reset
   in another checkout, and do not push unless asked.
 - Start with a failing test. Keep each change to one purpose, and use small,
   self-describing commits.
 - Before designing, read how the surrounding code already solves similar problems,
-  and the architecture document for the area (`docs/ARCHITECTURE.md`).
+  and the section of `blorp_2/README.md` for the area.
 - Measure before claiming a performance effect, using the repository's documented
   tools.
 - When a task would need a wider change than it describes, or a correct design

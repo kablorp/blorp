@@ -26,8 +26,9 @@ Start from the repository's own standards, not from memory:
 
 - `AGENTS.md`: the language principles, the tie-break rules "For Agents", the naming
   rules and the development rules.
-- The architecture and design documents for the area the change touches, found
-  through `docs/README.md`; for `blorp_2/`, its `AGENTS.md` principles.
+- `blorp_2/AGENTS.md` for its design principles and validation rules, and
+  `blorp_2/README.md` for the language and compiler design the change touches.
+- `docs/CODE_STYLE.md` for function, parameter and binding shape.
 - Existing precedent in the surrounding code for naming, error style and structure.
 
 When the documents and the code disagree, say so as a finding.

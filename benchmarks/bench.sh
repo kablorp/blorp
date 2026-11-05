@@ -94,7 +94,7 @@ sha256_file() {
 # Print the path of the pinned legacy compiler that builds the "blorp" column,
 # downloading it into the cache and verifying its SHA-256 on first use. The pin
 # lives in benchmarks/legacy-compiler.env; the release embeds its own standard
-# library, so callers must compile away from any checkout that has a blorp.toml.
+# library, so callers compile from a directory with no project configuration.
 # Only the benchmarks that build a "blorp" row call this, so --list and --help
 # never download.
 legacy_compiler() {
@@ -344,7 +344,7 @@ compile_blorp() {
             cp -R "$helper_src" "$TEMP_DIR/support" || return 1
         fi
         # Compile from the temporary directory so the release's embedded library
-        # is used, not the checkout's blorp.toml.
+        # is used, not a project's configuration.
         (
             cd "$TEMP_DIR"
             "$LEGACY_COMPILER" compile "$bench_src" >/dev/null

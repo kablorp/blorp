@@ -2,73 +2,24 @@
 
 A compiler for a functional programming language with pure/impure function tracking, algebraic data types, and pattern matching.
 
-## Find The Right Boundary First
+## Where Things Live
 
-This file contains binding principles and development rules. Read the
-task-specific reference below rather than loading every guide, roadmap, source
-file, or test log. [`docs/DEVELOPMENT.md`](docs/DEVELOPMENT.md) owns detailed
-commands and efficient investigation/handoff examples; [`docs/README.md`](docs/README.md)
-routes the maintained references. Performance and other compiler tasks should
-start with [`docs/WORKER_CHECKLIST.md`](docs/WORKER_CHECKLIST.md) for the
-setup/measure/land loop. `blorp_2/` holds the successor compiler; read
-[`blorp_2/AGENTS.md`](blorp_2/AGENTS.md) before working there.
-
-| Task | Start with | First feedback |
-| --- | --- | --- |
-| Syntax or diagnostic | `blorp/src/compiler_new/stage_01_discovery/parse/` (lexer in `lex/`, message text in `diagnostics/render.brp`; also `blorp/src/compiler/stage_03_parse/`, since a syntax change lands in both parsers), matching fixture under `blorp/test/test_compiler_new/test_stage_01_discovery/test_parse/fixtures/`, [`GRAMMAR`](docs/GRAMMAR.md) | `parse/test_parser_fixtures.brp`; then `scripts/compiler-check --changed --plan` names the hand-back gates |
-| Inference or typecheck | `blorp/src/compiler/stage_06_typecheck/`, matching compiler fixture | Exact suite; then `scripts/compiler-check --stage typecheck` |
-| Core/ownership | [`pipeline.brp`](blorp/src/compiler/stage_09_core/pipeline.brp), [`ARCHITECTURE`](docs/ARCHITECTURE.md), owning Core suite | Before/after Core, focused suite, relevant sanitizer |
-| Backend/runtime | `blorp/src/compiler/stage_10_backend/`, `blorp/src/lib/runtime/native/`, codegen audit | Focused emitter/runtime test and generated C |
-| Standard library/package | `standard_library/src/` or `pkg/`, matching tests | Exact module test; `std-check` or runtime/package gate |
-| CLI/LSP | `blorp/src/main.brp` or `blorp/src/lsp/` | `scripts/test cli` or `scripts/test lsp` |
-| Build/bootstrap/release | `blorp/build/bootstrap.env`, [`RELEASES`](docs/RELEASES.md), [`scripts`](scripts/README.md) | `make` and focused build checks; not `compiler-check --changed` |
-| Performance | Production function, [`profiling guide`](docs/DEVELOPMENT.md#function-profiling-and-flame-graphs), retained benchmark | Direct same-boundary baseline/candidate measurement; output identity |
-| Docs-only | Owning reference document | Link/path examples and `git diff --check`; no automatic full gate |
-
-These are starting points, not substitute gates. `scripts/compiler-check`
-selects manifest-owned compiler checks, builds once when checks are selected,
-and does not cover a docs-only or bootstrap-manifest edit. Run broader gates
-proportionate to the change before review.
-
-For common requests, the first command and final gate are concrete:
-
-```bash
-# Parser diagnostic: run the discovery stage's parser fixtures, then its gates.
-bin/blorp test --timeout 180 \
-  blorp/test/test_compiler_new/test_stage_01_discovery/test_parse/test_parser_fixtures.brp
-scripts/test compiler-new
-scripts/test compiler-blorp compiler-new-parity
-
-# Core ownership: run the owning suite, then ownership-sensitive gates.
-bin/blorp test --timeout 180 \
-  blorp/test/test_compiler/test_stage_09_core/test_core_match.brp
-scripts/compiler-check --changed
-scripts/test compiler-core-sanitize leak
-
-# Bootstrap pin: verify release tag and all target digests before changing the
-# manifest; compiler-check --changed does not select this build input.
-scripts/blorp-compiler-bootstrap --print-id
-make
-bash blorp/test/test_build/test_build_configuration.sh
-bash blorp/test/test_build/test_release_toolchain.sh
-scripts/test package
-```
-
-A `should_fail` parser fixture pins its first diagnostic in an
-`-- EXPECT-DISCOVERY:` line; compare the text, not the exit status alone. The
-old parser (`blorp/src/compiler/stage_03_parse`) still serves `compile --ast`,
-test discovery and the LSP, and the formatter has its own copy, so a syntax
-change lands in both parsers and `compiler-new-parity` keeps them in agreement. For Core
-codegen changes also inspect generated C and run the codegen audit. For a
-preview/bootstrap release, use the full gate in
-[`docs/RELEASES.md`](docs/RELEASES.md#preview-validation).
+The compiler, standard library, tests and tooling live in [`blorp_2/`](blorp_2/).
+Read [`blorp_2/AGENTS.md`](blorp_2/AGENTS.md) next: it owns the build, test and
+validation commands, the test layout and the compiler's design principles.
+[`blorp_2/README.md`](blorp_2/README.md) defines the supported language and
+[`blorp_2/grammar.ebnf`](blorp_2/grammar.ebnf) its grammar. The rest of this
+file holds the language principles and development rules that apply to every
+change. [`docs/CODE_STYLE.md`](docs/CODE_STYLE.md) owns code style and
+[`docs/HANDOFF_SPEC.md`](docs/HANDOFF_SPEC.md) owns the shape of a brief.
+`scripts/README.md` describes the remaining repository scripts.
 
 ## Language Principles
 
 The priorities of the language, in order: **safe, understandable, expressive, simple, fast, easy to learn,
 predictable for tools to generate and humans to debug.**
 
-All work on the compiler, standard library, documentation, and examples should uphold these principles.
+All work on the compiler, standard library, and documentation should uphold these principles.
 
 ### Safety
 
@@ -166,8 +117,6 @@ as a tiebreaker:
 When documentation, tests, and implementation disagree:
 
 - Trust the relevant tests and current implementation first, then update the stale docs in the same change.
-- For pipeline questions, start with `blorp/src/compiler/stage_09_core/pipeline.brp`, `blorp/src/compiler/stage_09_core/pipeline_stage.brp`, `docs/ARCHITECTURE.md`, and `blorp/src/main.brp`.
-- For tensor questions, start with `standard_library/src/tensor.brp`, `standard_library/src/vector.brp`, `standard_library/src/matrix.brp`, `blorp/src/compiler/stage_06_typecheck/type_system/dim_solver.brp`, `blorp/src/compiler/stage_06_typecheck/frontend_graph_typecheck.brp`, `blorp/src/compiler/stage_09_core/tensor_specialize.brp`, `blorp/src/lib/runtime/native/runtime.c`, and the matching `blorp/test/test_compiler` / `blorp/test/test_runtime` cases.
 
 When choosing implementation strategies:
 
@@ -200,7 +149,7 @@ under the ignored `build/` directory, and a report is deleted when the decision
 it supports is superseded. A change still stays within any cost ceiling its
 spec sets.
 
-Any compiler data-model refactor, in `blorp/src` or `blorp_2/`, requires matched
+Any compiler data-model refactor in `blorp_2/` requires matched
 before/after self-compile allocations and retired instructions, with
 production and test line counts reported separately. Significant regressions
 in allocations, retired instructions, or production line count are not
@@ -227,16 +176,14 @@ meaningful, clear, and proportional to their scope.
   misleading; if you introduce a new convention, document it near the boundary where it matters.
 - Tests should name the behavior or regression they protect, not just the API they call.
 - Internal compiler names should expose phase and ownership of responsibility when that prevents
-  confusion, for example distinguishing parser, typed AST, Core, specialization, and emission data.
+  confusion, for example distinguishing parsed, checked, specialized, lowered IR, and emission data.
 
 ### Before you write code
 
 **1. Write a failing test first.** We strongly prefer TDD. Define what success looks like
-before writing implementation. Compiler implementation tests and public parser,
-inference, and typechecking fixtures belong in `blorp/test/test_compiler/`; format,
-purify, and lint fixtures live under their matching owners in `blorp/test/`.
-Runtime behavior belongs in `blorp/test/test_runtime/`. For bug fixes, add a regression test that fails before
-the fix and passes after.
+before writing implementation. Where each kind of test lives, and how to run it,
+is in [`blorp_2/AGENTS.md`](blorp_2/AGENTS.md). For bug fixes, add a regression
+test that fails before the fix and passes after.
 
 **2. One change per change.** Fix the bug, add the feature, or refactor — not all three.
 If you discover adjacent work, note it separately. If you can't describe your change in one
@@ -271,21 +218,26 @@ Type errors in type-checking. Never add semantic checks in codegen unless monomo
 forces it. Every compile error should include a help suggestion that teaches the user what
 to do instead.
 
-**7. Optimize for the first-time user.** If a feature requires reading the GUIDE to use correctly,
+**7. Optimize for the first-time user.** If a feature requires reading the README to use correctly,
 it needs a better error message. If an error says "unexpected token" with no hint, it's incomplete.
 Think about what a programmer coming from Python, JS, or Rust would try first, and make that
 either work or produce a helpful message.
 
-**8. Respect phase boundaries.** Lexing/parsing, module loading, inference and
-typechecking, Core lowering/passes, ownership/resource preparation, and backend
-emission have different responsibilities. The exact current order is owned by
-`docs/ARCHITECTURE.md` and `stage_09_core/pipeline.brp`; do not duplicate it
-here. Don't put type-checking logic in Core passes or parsing constraints in
-typechecking. If a check belongs earlier, move it there. If it must stay late
-(for example because monomorphization provides the needed facts), document why.
+**8. Respect phase boundaries.** Lexing and parsing (`lex`, `parse`), module loading
+(`load`, `namespace`), checking (`check`), specialization (`specialize`), lowering
+(`lower`), ownership insertion (`own`), verification (`verify`) and C emission (`emit`)
+have different responsibilities. The exact current order is owned by
+[`blorp_2/README.md`](blorp_2/README.md) and `blorp_2/src/main.brp`; do not duplicate it
+here. Don't put type-checking logic in lowering or ownership passes, or parsing
+constraints in checking. If a check belongs earlier, move it there. If it must stay late
+(for example because specialization provides the needed facts), document why.
 
-**9. Measure, don't guess.** If there's any doubt about efficiency, use `--profile` for runtime
-cost and `--leak-check` for memory. Claims like "this is faster" require before/after evidence.
+**9. Measure, don't guess.** If there's any doubt about efficiency, use Blorp 2's measurement
+tools: `BLORP_ALLOCATION_SITES` with `blorp_2/scripts/allocation-sites` for where allocations
+come from, `blorp_2/scripts/attribution/run` for reference-count and copy attribution, and a
+`-DBLORP_MEMORY_DIAGNOSTICS=1` build with `BLORP_LEAK_CHECK=strict` for memory;
+`blorp_2/README.md` documents them. Claims like "this is
+faster" require before/after evidence.
 Elapsed latency matters, but it is often noisy and can hide the mechanism. During investigation,
 also prefer direct and repeatable signals such as allocation and release counts, retired
 instructions, peak and retained memory, deterministic work counters, and native samples. Use the
@@ -308,14 +260,14 @@ in `benchmarks/results/` and the plan documents.
 test-runner agents. No exceptions for "trivial" changes — trivial changes have trivial reviews.
 
 **13. Update docs with the code.** If your change is user-facing (syntax, API, error message),
-update `docs/GUIDE.md` and `docs/GRAMMAR.md` in the same commit. Documentation drift is a bug.
+update `blorp_2/README.md` and `blorp_2/grammar.ebnf` in the same commit. Documentation drift is a bug.
 The formal grammar must stay in sync with the parser.
 
 **14. Prefer coherent pre-0.1 behavior over backwards compatibility.** Blorp is pre-0.1.0, so
 do not preserve old syntax, APIs, or compatibility shims merely to avoid breaking users. If the
 new behavior is clearer, safer, or simpler, remove the old form and make the current language
-coherent. Breaking changes still require updating all call sites in standard_library/, tests/, examples/, docs,
-and formatter expectations in the same change. Add migration-style error messages only when they
+coherent. Breaking changes still require updating all call sites in
+`blorp_2/standard_library/`, tests and docs in the same change. Add migration-style error messages only when they
 meaningfully improve first-time user experience or prevent confusing parser/typechecker failures.
 
 **15. Focus on quality.** If your code is not ready to pass a review for production, then your
@@ -332,81 +284,13 @@ building a workaround without reassessing the task with the user.
 
 ---
 
-## Daily Commands And Validation
+## Commands, Validation And Repository Boundaries
 
-Use the repository's `bin/blorp`, not a separately installed release, for
-source-checkout validation. `make` rebuilds it from the immutable bootstrap;
-a direct `bin/blorp` test can otherwise exercise an older executable.
-[`docs/DEVELOPMENT.md`](docs/DEVELOPMENT.md) has the full build, focused-test,
-profiling, CI, cleanup, and diagnostic recipes. [`scripts/README.md`](scripts/README.md)
-defines test gates and timeouts; `bin/blorp <command> --help` defines current CLI
-flags.
-
-```bash
-scripts/compiler-check --changed --plan  # Read-only selection and next-gate guidance
-scripts/compiler-build-status     # Verify bin/blorp matches current build inputs
-make                              # Build/install when inputs changed or status is uncertain
-scripts/compiler-check --changed  # Build once and run manifest-owned checks
-bin/blorp test path/to/test.brp    # Narrow behavior loop after a known build
-scripts/test                      # Default compiler/runtime/leak/doctest/CLI gates
-scripts/test compiler-core-sanitize
-scripts/test --no-build --log-dir /tmp/blorp-gates compiler-blorp
-```
-
-An empty `--plan` is a no-op explanation, not validation. Build status reports
-`FRESH`, `STALE`, or `UNKNOWN` without rebuilding; check it before direct
-`bin/blorp` tests, and run `make` then recheck if not fresh. Use the Developer
-Guide for details.
-
-Use the smallest test or production-pass benchmark while iterating, then the
-relevant broad gates. `--no-build` is only for a toolchain already built from
-the intended sources. `bin/blorp test --warmup-only` must succeed before
-parallel gates; a failed warmup is not an acceptable warning. For preview and release work,
-follow [`docs/RELEASES.md`](docs/RELEASES.md#preview-validation) and
-`scripts/premerge-gate`; do not substitute the default local gate for those
-broader checks.
-
-Search for a symbol and read bounded source regions before loading a very
-large module. Keep full Core/C dumps and gate logs on disk; share the relevant
-excerpt, artifact path, and hashes with reviewers. The precise examples and
-handoff format live in
-[`docs/DEVELOPMENT.md`](docs/DEVELOPMENT.md#efficient-agent-investigation-and-handoff).
-This reduces repeated context, not the required tests or review.
-
-## Language And Repository Boundaries
-
-[`docs/GUIDE.md`](docs/GUIDE.md) is the current language reference and
-[`docs/GRAMMAR.md`](docs/GRAMMAR.md) is the formal syntax. The Developer Guide
-maps production sources and tests. In particular:
-
-- Pure functions may mutate local `var` state but cannot call impure functions
-  or capture mutable variables in closures. Lambdas use `func`; use explicit
-  state threading for pure lazy iterators.
-- `record` and `fixed record` have the same value semantics. A `record` is
-  always managed (ARC/COW). A `fixed record` whose fields are all numbers,
-  `Char` or other such fixed records is stored inline, decided after
-  monomorphization in `stage_09_core/record_representation.brp`; any other
-  `fixed record` is silently managed, and neither spelling promises a native
-  by-value ABI. Verify current behavior in tests before changing layout or
-  ownership.
-- `standard_library/src/` is portable and always available. Do not add new
-  explicit `foreign` declarations or native `_ffi.h` headers there. Optional
-  native bindings, link flags, and third-party packages belong in `pkg/`.
-  Bare imports resolve local or standard-library modules, not `pkg/`.
-- Tensor work must cover dimension solving/inference, runtime behavior, and
-  generated Core or C; use the source route above for the first files.
-  `#Ds...` denotes caller-supplied concrete dimensions, not dynamic length;
-  `assert_shape` checks the first dimension and refines without copying.
-- New compiler implementation and public parser/inference/typecheck fixtures
-  live under `blorp/test/test_compiler/` and are registered in
-  `blorp/test/test_compiler/compiler_test_ownership.json`. Format, purify, and lint
-  fixtures retain their matching owners; runtime behavior belongs in
-  `blorp/test/test_runtime/`. Tests use `TestSuite` from `test`; see the Developer
-  Guide for placement and the Guide for syntax.
-- `bin/blorp test` and `run` use temporary artifacts. A bare
-  `bin/blorp compile file.brp` may write `file.c` beside its input. Prefer
-  `-o` with a temporary path and clean up generated files you created; do not
-  delete unrelated user files. Read generated C for codegen changes.
+[`blorp_2/AGENTS.md`](blorp_2/AGENTS.md) owns them: the build and test commands,
+which gates a change runs, and the test layout. `make -C blorp_2 test` is the
+default gate. Iterate with the narrowest test that exercises the change, then run
+the broader gates before review. Keep large dumps and gate logs on disk and share
+the relevant excerpt and the path.
 
 ## Agent Coordination
 
@@ -422,8 +306,8 @@ implementation and documenter review after; API/user-facing design needs
 ergonomics-expert and data-engineer validation; performance work needs a
 code-optimizer hypothesis and measured
 verification. One worker may carry several roles when qualified; do not spawn
-separate agents merely to reproduce a fixed chain. Run a quick `make` directly
-rather than spawning an agent for build status.
+separate agents merely to reproduce a fixed chain. Run a quick `make -C blorp_2`
+directly rather than spawning an agent for build status.
 
 Subagent definitions live in `.claude/agents/`. Use `compiler-expert` as the
 default implementer for compiler, runtime and code-generation work; the

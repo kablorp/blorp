@@ -23,33 +23,30 @@ need. You report results; you do not fix anything.
 
 ## Choose the gates from the repository
 
-The default is the focused suites that own the change, not the long gates. Do not
-rely on a remembered list. Each time:
+The default is the focused suites that own the change, then the Blorp 2 gates. Do
+not rely on a remembered list. Each time:
 
-1. Read the task table in `AGENTS.md`, `scripts/README.md` ("Validating a change")
-   and `docs/DEVELOPMENT.md` to find which checks own the files the change
-   touches.
-2. Run `scripts/compiler-check --changed --plan` and read its plan; it names the
-   owning suites, special checks and recommended `scripts/test` gates. An empty
-   plan is not a validation: pick the checks the task table gives for that kind of
-   change (docs, build, release, scripts).
-3. Run the narrow owning suites first, then only the `scripts/test` gates the plan
-   or the task table recommends.
-4. For a change under `blorp_2/`, run `make -C blorp_2 test`; no script gate covers
-   that tree.
-5. Do not run the Docker premerge gate (`scripts/docker-gate --premerge-gate`),
-   `scripts/premerge-gate` or a full `scripts/compiler-check` unless the caller
-   asks for it. They are optional, for preview and release validation or on
-   request.
-6. If the documents and the scripts disagree, say so rather than guess.
+1. Read `blorp_2/AGENTS.md` ("Validation") and `scripts/README.md` ("Validating a
+   change") to find which checks own the files the change touches.
+2. Run the narrow owning suite first: `make -C blorp_2 test-target-components
+   TARGET_COMPONENT_SOURCES=<paths>` for a component suite.
+3. For a change under `blorp_2/`, run `make -C blorp_2 test`.
+4. Run `scripts/blorp2-fixpoint --prove` when the change alters emitted C, and
+   `bash blorp_2/test/tooling/test_bootstrap.sh` when it touches
+   `scripts/blorp2-compiler-bootstrap`, `blorp_2/Makefile` or `blorp_2/bootstrap.env`.
+5. For a change to `benchmarks/`, run `bash benchmarks/bench.sh <name>` for a
+   benchmark the change touches. For a docs-only change, check links and paths
+   and run the whitespace check on the diff.
+6. Do not run a long gate the caller did not ask for.
+7. If the documents and the scripts disagree, say so rather than guess.
 
 Record which gates you ran, which you skipped, and why.
 
 ## Test what you think you are testing
 
-Build first. Confirm the tools under test were built from the current sources
-before trusting any result, using the repository's own freshness check where one
-exists.
+Build first. Run `make -C blorp_2 compiler` and confirm the compiler under test was
+built from the current sources before trusting any result; the Makefile always
+regenerates it from the pinned seed.
 
 ## Triage failures
 

@@ -3649,49 +3649,6 @@ the legacy compiler: its measured 615 ms pipeline would have become about
 Blorp 2's own compile cost.
 See the [timing record](https://github.com/kablorp/blorp/blob/1e07c4dce85e51cd7ad911142e9bc96a5e0d91c7/benchmarks/results/blorp_2_match_2026-10-09.md#unit-test-feedback-time).
 
-Compare both compilers through C emission on the unmodified e2e fixtures:
-
-```bash
-blorp_2/scripts/compare-compilers --samples 3 --output blorp_2/build/comparison
-# Narrow feedback loop; every output directory must be new.
-blorp_2/scripts/compare-compilers --samples 1 \
-  --fixture blorp_2/test/e2e/fixtures/return/zero.brp \
-  --output blorp_2/build/comparison-zero
-```
-
-The macOS script checks host build freshness, builds the pilot once outside the
-measurement, and runs both compilers serially on every selected `.brp` file.
-Sample order alternates. It never edits fixtures, compiles their generated C,
-or executes their programs. `--fixture` also accepts a directory. Explicit
-`--existing-compiler` and `--pilot-compiler` paths select supplied executables;
-the latter skips the pilot build. Supplied executables' source correspondence
-and optimization settings are unverified unless provided by their version
-output.
-
-Pilot samples receive `standard_library` as an explicit library root,
-recorded with its source snapshot.
-
-`summary.tsv` reports minimum elapsed seconds and retired instructions across
-samples, with existing/pilot ratios; values above one favor the pilot.
-`samples.tsv` retains every sample, exit status, metric, C hash and size.
-`fixtures.tsv`, `inputs/`, `sources.tar`, `provenance.txt` and `setup/` retain
-input/source snapshots, binary hashes, optimization settings and build commands.
-`raw/` holds exact command arguments, stdout, stderr, macOS time reports and C
-outputs. Compiler/input/source/script changes detected during the run invalidate
-all ratios. Failed or empty-output compilations are recorded, comparisons for
-that fixture are withheld, and the command exits 1. Argument/setup errors exit 2;
-existing output directories are preserved.
-
-These are whole-process measurements, including startup, input reading and each
-compiler's own prelude/library loading. The high-resolution wall clock also
-includes the time/env wrapper overhead; retired instructions come from macOS
-`time -l` and are explicitly unavailable if absent. Allocation instrumentation
-is disabled, so allocations are unavailable. The default pilot and its runtime
-are built at `-O0` without memory diagnostics. The host keeps its current build
-settings, currently CLI `-O0` and runtime `-O2`; read its recorded version before
-interpreting ratios. These fixture measurements do not establish self-compile
-performance or isolate an individual compiler phase.
-
 Self-compilation has one measurement and one gate, both in
 `scripts/blorp2-fixpoint` (details in [scripts/README.md](../scripts/README.md#blorp-2-fixpoint)):
 

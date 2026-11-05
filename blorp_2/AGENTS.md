@@ -3,14 +3,13 @@
 Read the repository's parent [AGENTS.md](../AGENTS.md) in full, then this
 file; both apply. [README.md](README.md) defines the supported increment and
 owns runnable commands; [grammar.ebnf](grammar.ebnf) is its grammar.
-Supporting a feature in the existing compiler does not put it in scope here.
 
 ## Scope
 
 The pinned Blorp 2 seed builds the current compiler. All active Blorp 2 tests
-are self-hosted. Unported suites remain in source and are explicitly deferred;
-never run them through the legacy compiler. Compiler source stays within the
-eventual bootstrap subset in the README: no concurrency, parallelism, tensors
+are self-hosted. Unported suites remain in source and are explicitly
+deferred. Compiler source stays within the eventual bootstrap subset in the
+README: no concurrency, parallelism, tensors
 or dimension types, debug blocks, numeric widths other than Int64 and Float64,
 doctests, channels or FFI. Tuples and static traits are supported by the
 current seed; their use in compiler implementation remains bounded by each
@@ -18,7 +17,7 @@ reviewed task. Compiler source writes arithmetic, ordering and equality with
 their operators; String `+` calls Addable. Other operations use concrete
 functions such as `concat`, and pattern matching. Boolean logic calls the
 `and`, `or` and `not` functions of the `bool` library module. Dependencies on
-the old host library or TestSuite API mark deferred tests; port bounded suites
+the old TestSuite API mark deferred tests; port bounded suites
 incrementally without expanding the input language.
 
 Each increment starts from a small executable fixture and its expected
@@ -97,6 +96,17 @@ a requirement, report the limitation instead of adding one.
 
 ## Validation
 
+Commands, from the repository root:
+
+```bash
+make -C blorp_2 compiler                  # build the compiler from the pinned seed
+make -C blorp_2 test                      # components, deferrals report and first native e2e
+make -C blorp_2 test-target-components TARGET_COMPONENT_SOURCES=<paths>   # one suite
+scripts/blorp2-fixpoint --prove           # A builds B, B builds C, B == C
+bash blorp_2/test/tooling/test_bootstrap.sh   # bootstrap resolver and Makefile recipes
+bash benchmarks/bench.sh <name>           # cross-language speed table (see benchmarks/README.md)
+```
+
 **Tests.** Compiler tests are Blorp `TestSuite`s, not a test `main` or Python.
 The one sanctioned shell test is
 [test/tooling/test_bootstrap.sh](test/tooling/test_bootstrap.sh): it tests the
@@ -134,7 +144,7 @@ component modes, the link libraries as argv; the driver makes its own e2e work
 directory with `fs.with_temporary_directory`. This narrow entry exception
 does not authorize alternate fixture mains or assertion frameworks.
 The older driver depends on additional process/filesystem/bytes APIs; its
-remaining cases are DEFERRED. Do not substitute the legacy host.
+remaining cases are DEFERRED.
 Port bounded suites incrementally through ordinary target TestSuites and real
 fixture mains. Existing fixture parity checks compare compiler outputs only;
 they do not establish native execution. Keep artifacts under ignored `build/`.

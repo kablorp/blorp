@@ -121,7 +121,7 @@ The legacy count covers managed objects; the Blorp 2 count covers allocator
 calls. Both runtimes reported balanced releases and no leaks. Where the
 counts nearly match (`binary_trees`, `compiler_ast`), the logical node count
 is the same, but the representation differs: Blorp 2 uses a managed record
-root with an inline union ([audit](../AUDIT.md)).
+root with an inline union ([audit](https://github.com/kablorp/blorp/blob/ee9e001c6de8911ee486fd992419bef5bc628e8b/benchmarks/AUDIT.md)).
 
 ## Results: accumulator modes
 
@@ -226,7 +226,7 @@ after the first error was checked.
   so that figure is approximate.
 - **`list_ops` and `compiler_emit` compare current libraries, not code
   generation.** `binary_trees` and `compiler_ast` use different recursive
-  representations ([audit](../AUDIT.md), [README](../README.md#blorp-2)).
+  representations ([audit](https://github.com/kablorp/blorp/blob/ee9e001c6de8911ee486fd992419bef5bc628e8b/benchmarks/AUDIT.md), [README](../README.md#blorp-2)).
 - **The legacy compiler was built at `-O0`**, the `make` default. That
   affects only the compiler itself, not the benchmark binaries: both lanes'
   generated C is compiled at `-O2`.
