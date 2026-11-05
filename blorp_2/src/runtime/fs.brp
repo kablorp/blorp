@@ -22,6 +22,7 @@ FS_HELPERS_RUNTIME: String =
 		|
 		|#include <errno.h>
 		|#include <fcntl.h>
+		|#include <limits.h>
 		|#include <sys/stat.h>
 		|#include <unistd.h>
 		|enum {BLORP_FS_FAILED=0,BLORP_FS_SUCCEEDED=1};
@@ -41,8 +42,9 @@ FS_HELPERS_RUNTIME: String =
 		|#define BLORP_FS_RETRY(result,call) do{(result)=(call);}while((result)<0&&errno==EINTR)
 		|/* macOS fails a single read or write of more than INT_MAX bytes with EINVAL. */
 		|enum {BLORP_FS_REQUEST_MAXIMUM=1<<30};
-		|/* Every String ends in a NUL, so once no NUL is embedded its bytes are the C path. */
-		|static inline int blorp_fs_has_nul(const struct blorp_string *path){
+		|/* Every String ends in a NUL, so once no NUL is embedded its bytes are the C path.
+		| * next_lines and close take no path, so this has external linkage. */
+		|int blorp_fs_has_nul(const struct blorp_string *path){
 		|return memchr(path->bytes,'\0',(size_t)path->length)!=NULL;
 		|}
 		|/* OtherOs: an errno with no named kind, sent negated so that it keeps its number. */
@@ -94,6 +96,28 @@ FS_HELPERS_RUNTIME: String =
 		|memcpy(joined+directory_length+separator,name,name_length+1);
 		|return joined;
 		|}
+		|/* The next buffer capacity, or 0 once the buffer holds the largest String. Only
+		| * read_text and next_lines call this and the next helper, so both have external
+		| * linkage. */
+		|size_t blorp_fs_grown_capacity(size_t capacity,size_t maximum){
+		|if(capacity>=maximum){return 0;}
+		|return capacity>maximum/2?maximum:capacity*2;
+		|}
+		|/* IsADirectory for an open directory, which no read can take, and otherwise 0, or
+		| * the fstat's failure code. */
+		|int64_t blorp_fs_refuse_directory(int descriptor){
+		|struct stat status;
+		|int examined;
+		|BLORP_FS_RETRY(examined,fstat(descriptor,&status));
+		|if(examined<0){return blorp_fs_errno_code(errno);}
+		|return S_ISDIR(status.st_mode)?BLORP_FS_IS_A_DIRECTORY:0;
+		|}
+		|/* A descriptor arrives as an Int. One outside int's range names no open file, so
+		| * it is refused as EBADF without a system call, and the cast never truncates.
+		| * Only next_lines and close call this. */
+		|int blorp_fs_is_descriptor(int64_t descriptor){
+		|return descriptor>=0&&descriptor<=INT_MAX;
+		|}
 		|
 
 
@@ -102,20 +126,12 @@ FS_HELPERS_RUNTIME: String =
 FS_READ_TEXT_RUNTIME: String =
 	raw
 		|enum {BLORP_FS_READ_INITIAL_CAPACITY=4096};
-		|/* The next buffer capacity, or 0 once the buffer holds the largest String. */
-		|static inline size_t blorp_fs_grown_capacity(size_t capacity,size_t maximum){
-		|if(capacity>=maximum){return 0;}
-		|return capacity>maximum/2?maximum:capacity*2;
-		|}
 		|/* Reads the open descriptor to end of file into a fresh buffer. Returns 0, or the
 		| * failure code with nothing allocated. A file of exactly the largest String's
 		| * length is also refused: no allocation could hold it. The caller closes. */
 		|static int64_t blorp_fs_read_descriptor(int descriptor,char **contents,size_t *length){
-		|struct stat status;
-		|int examined;
-		|BLORP_FS_RETRY(examined,fstat(descriptor,&status));
-		|if(examined<0){return blorp_fs_errno_code(errno);}
-		|if(S_ISDIR(status.st_mode)){return BLORP_FS_IS_A_DIRECTORY;}
+		|const int64_t refused=blorp_fs_refuse_directory(descriptor);
+		|if(refused!=0){return refused;}
 		|size_t capacity=BLORP_FS_READ_INITIAL_CAPACITY,used=0;
 		|char *buffer=blorp_memory_allocate(capacity);
 		|if(buffer==NULL){abort();}
@@ -910,6 +926,189 @@ FS_CREATE_TEMPORARY_DIRECTORY_RUNTIME: String =
 		|}
 		|*directory=blorp_string_from_bytes(template,(int64_t)(length+sizeof blorp_fs_temporary_suffix-1));
 		|blorp_memory_release(template);
+		|return BLORP_FS_SUCCEEDED;
+		|}
+		|
+
+
+-- Opens a file for reading as read_text does, and gives the caller its
+-- descriptor, which only fs.close closes. A directory opens on POSIX but no
+-- read can take it, so it is refused and closed here. Nothing here is about
+-- lines, so a later reader of bytes can open with it too.
+FS_OPEN_READ_RUNTIME: String =
+	raw
+		|uint8_t blorp_fs_open_read(const struct blorp_string *path,int64_t *descriptor,int64_t *error){
+		|if(blorp_fs_has_nul(path)){*error=BLORP_FS_PATH_CONTAINS_NUL;return BLORP_FS_FAILED;}
+		|int opened;
+		|BLORP_FS_RETRY(opened,open(path->bytes,O_RDONLY|O_CLOEXEC));
+		|if(opened<0){*error=blorp_fs_errno_code(errno);return BLORP_FS_FAILED;}
+		|const int64_t refused=blorp_fs_refuse_directory(opened);
+		|if(refused!=0){(void)close(opened);*error=refused;return BLORP_FS_FAILED;}
+		|*descriptor=opened;
+		|return BLORP_FS_SUCCEEDED;
+		|}
+		|
+
+
+-- The natives keep no state between calls (D37): the kernel holds the file
+-- offset, and the caller holds the unfinished line and passes it back. Each
+-- call reads into one buffer that starts with that line, then checks every
+-- element before it allocates any, so a failure has nothing to release but
+-- the buffer.
+private FS_NEXT_LINES_SUPPORT: String =
+	raw
+		|/* A call reads this many bytes past what it was given, and more only while one line
+		| * is longer. 64 KiB is the default pipe capacity on Linux and macOS, so one read
+		| * empties a full pipe, and a batch of short lines stays far below a file's size. */
+		|enum {BLORP_FS_LINE_BLOCK=1<<16};
+		|/* What one call holds: the line it was given, then the bytes it read. `ended` is set
+		| * once a read has returned end of file. */
+		|struct blorp_fs_line_buffer{char *bytes;size_t used;size_t capacity;uint8_t ended;};
+		|/* Doubles the buffer until `needed` more bytes fit, so a long line costs linear
+		| * time. Returns 0, or FileTooLarge once the buffer holds the largest String. */
+		|static int64_t blorp_fs_line_room(struct blorp_fs_line_buffer *buffer,size_t needed){
+		|while(buffer->capacity-buffer->used<needed){
+		|const size_t grown=blorp_fs_grown_capacity(buffer->capacity,blorp_string_maximum_capacity());
+		|if(grown==0){return BLORP_FS_FILE_TOO_LARGE;}
+		|char *resized=blorp_memory_resize(buffer->bytes,grown);
+		|if(resized==NULL){abort();}
+		|buffer->bytes=resized;
+		|buffer->capacity=grown;
+		|}
+		|return 0;
+		|}
+		|/* Reads until a read brings an LF or the file ends. Only the new bytes are searched,
+		| * so a long line is scanned once. */
+		|static int64_t blorp_fs_read_line_blocks(int descriptor,struct blorp_fs_line_buffer *buffer){
+		|for(;;){
+		|const int64_t room=blorp_fs_line_room(buffer,1);
+		|if(room!=0){return room;}
+		|size_t request=buffer->capacity-buffer->used;
+		|if(request>BLORP_FS_REQUEST_MAXIMUM){request=BLORP_FS_REQUEST_MAXIMUM;}
+		|ssize_t received;
+		|BLORP_FS_RETRY(received,read(descriptor,buffer->bytes+buffer->used,request));
+		|if(received<0){return blorp_fs_errno_code(errno);}
+		|if(received==0){buffer->ended=1;return 0;}
+		|const int newline=memchr(buffer->bytes+buffer->used,'\n',(size_t)received)!=NULL;
+		|buffer->used+=(size_t)received;
+		|if(newline){return 0;}
+		|}
+		|}
+		|/* The bytes still missing from a UTF-8 sequence that `bytes` ends partway
+		| * through. It returns 0 when the last sequence is complete, or when its lead
+		| * byte can start no sequence; validation then reports the line. */
+		|static size_t blorp_fs_utf8_missing(const char *bytes,size_t length){
+		|for(size_t back=1;back<=3&&back<=length;back++){
+		|const unsigned char byte=(unsigned char)bytes[length-back];
+		|if((byte&0xC0)==0x80){continue;}
+		|const size_t needed=byte>=0xC2&&byte<=0xDF?2:byte>=0xE0&&byte<=0xEF?3:byte>=0xF0&&byte<=0xF4?4:1;
+		|return needed>back?needed-back:0;
+		|}
+		|return 0;
+		|}
+		|/* Reads exactly the bytes still missing from the unfinished line's last character,
+		| * at most three, so that line is a whole String. A FIFO may hold them back, which
+		| * delays the batch's complete lines until the character finishes. An LF is no
+		| * continuation byte, so the search never passes the last LF. End of file first, or
+		| * a byte that cannot continue the character, is InvalidUtf8. */
+		|static int64_t blorp_fs_complete_character(int descriptor,struct blorp_fs_line_buffer *buffer){
+		|size_t missing=blorp_fs_utf8_missing(buffer->bytes,buffer->used);
+		|const int64_t room=blorp_fs_line_room(buffer,missing);
+		|if(room!=0){return room;}
+		|while(missing>0){
+		|ssize_t received;
+		|BLORP_FS_RETRY(received,read(descriptor,buffer->bytes+buffer->used,missing));
+		|if(received<0){return blorp_fs_errno_code(errno);}
+		|if(received==0){return BLORP_FS_INVALID_UTF8;}
+		|for(size_t index=0;index<(size_t)received;index++){
+		|if(((unsigned char)buffer->bytes[buffer->used+index]&0xC0)!=0x80){return BLORP_FS_INVALID_UTF8;}
+		|}
+		|buffer->used+=(size_t)received;
+		|missing-=(size_t)received;
+		|}
+		|return 0;
+		|}
+		|/* Where the line that starts at `start` ends: at its LF, or at `used` for the line
+		| * that no LF has ended. */
+		|static size_t blorp_fs_line_end(const char *bytes,size_t start,size_t used){
+		|const char *newline=memchr(bytes+start,'\n',used-start);
+		|return newline==NULL?used:(size_t)(newline-bytes);
+		|}
+		|/* The line's length without its LF, or one CR just before that LF. A line that no LF
+		| * has ended keeps a last CR, which an LF in the next read may still follow. */
+		|static size_t blorp_fs_line_length(const char *bytes,size_t start,size_t end,size_t used){
+		|return end<used&&end>start&&bytes[end-1]=='\r'?end-start-1:end-start;
+		|}
+		|/* Checks each element as UTF-8 and counts them: every line an LF ended, then the
+		| * unfinished line, even when empty, or at end of file the final line, only when it
+		| * is not empty. */
+		|static int64_t blorp_fs_count_lines(const struct blorp_fs_line_buffer *buffer,size_t *count){
+		|size_t start=0;
+		|for(;;){
+		|const size_t end=blorp_fs_line_end(buffer->bytes,start,buffer->used);
+		|const size_t length=blorp_fs_line_length(buffer->bytes,start,end,buffer->used);
+		|if(end==buffer->used&&buffer->ended&&length==0){return 0;}
+		|if(!blorp_utf8_is_valid(buffer->bytes+start,length)){return BLORP_FS_INVALID_UTF8;}
+		|(*count)++;
+		|if(end==buffer->used){return 0;}
+		|start=end+1;
+		|}
+		|}
+		|/* Fills a fresh buffer, from `carried` on, and counts its elements. On a failure the
+		| * buffer is released and its code returned. */
+		|static int64_t blorp_fs_read_lines(int descriptor,const struct blorp_string *carried,struct blorp_fs_line_buffer *buffer,size_t *count){
+		|const size_t carried_length=(size_t)carried->length;
+		|const size_t maximum=blorp_string_maximum_capacity();
+		|buffer->capacity=carried_length>maximum-BLORP_FS_LINE_BLOCK?maximum:carried_length+BLORP_FS_LINE_BLOCK;
+		|buffer->bytes=blorp_memory_allocate(buffer->capacity);
+		|if(buffer->bytes==NULL){abort();}
+		|memcpy(buffer->bytes,carried->bytes,carried_length);
+		|buffer->used=carried_length;
+		|buffer->ended=0;
+		|int64_t failure=blorp_fs_read_line_blocks(descriptor,buffer);
+		|if(failure==0&&!buffer->ended){failure=blorp_fs_complete_character(descriptor,buffer);}
+		|if(failure==0){failure=blorp_fs_count_lines(buffer,count);}
+		|if(failure!=0){blorp_memory_release(buffer->bytes);}
+		|return failure;
+		|}
+		|/* Reads past `carried`, the unfinished line the previous call returned (empty
+		| * on the first call). The result is one of three:
+		| *   []                      end of file, with nothing left;
+		| *   [final]                 end of file; `final` is the last line, which had no LF;
+		| *   [line, ..., unfinished] at least one complete line, then the new unfinished
+		| *                           line, which may be empty.
+		| * A call reads until an LF arrives or the file ends, so a fold stops at a batch
+		| * of fewer than two elements and never reads past the end twice. A line ends at
+		| * LF, and one CR just before the LF is removed, even when the CR came in
+		| * `carried`. Every element is checked as UTF-8 (InvalidUtf8). Reads are
+		| * BLORP_FS_LINE_BLOCK bytes, growing only while a line is longer than that, so
+		| * memory follows the block and the longest line, never the file. */
+		|
+
+
+-- The line reader's entry point, for the emitter's List[String] C type. It
+-- never closes the descriptor: fs.close alone does.
+pure func fs_next_lines_runtime(string_list_type: String) -> String:
+	FS_NEXT_LINES_SUPPORT
+		.concat("uint8_t blorp_fs_next_lines(int64_t descriptor,const struct blorp_string *carried,${string_list_type} *lines,int64_t *error){\n")
+		.concat("if(!blorp_fs_is_descriptor(descriptor)){*error=blorp_fs_errno_code(EBADF);return BLORP_FS_FAILED;}\n")
+		.concat("struct blorp_fs_line_buffer buffer;\nsize_t count=0;\n")
+		.concat("const int64_t failure=blorp_fs_read_lines((int)descriptor,carried,&buffer,&count);\n")
+		.concat("if(failure!=0){*error=failure;return BLORP_FS_FAILED;}\n")
+		.concat(list_root_allocation(string_list_type, "result", "count"))
+		.concat("\nsize_t start=0;\nfor(size_t index=0;index<count;index++){\n")
+		.concat("const size_t end=blorp_fs_line_end(buffer.bytes,start,buffer.used);\n")
+		.concat("const size_t length=blorp_fs_line_length(buffer.bytes,start,end,buffer.used);\n")
+		.concat("${list_slot_store("result", "index", "blorp_string_from_bytes(buffer.bytes+start,(int64_t)length)")}\nstart=end+1;\n}\n")
+		.concat("blorp_memory_release(buffer.bytes);\n*lines=result;\nreturn BLORP_FS_SUCCEEDED;\n}\n")
+
+
+-- close, called once and never retried, as BLORP_FS_RETRY's comment says.
+FS_CLOSE_RUNTIME: String =
+	raw
+		|uint8_t blorp_fs_close(int64_t descriptor,int64_t *error){
+		|if(!blorp_fs_is_descriptor(descriptor)){*error=blorp_fs_errno_code(EBADF);return BLORP_FS_FAILED;}
+		|if(close((int)descriptor)<0){*error=blorp_fs_errno_code(errno);return BLORP_FS_FAILED;}
 		|return BLORP_FS_SUCCEEDED;
 		|}
 		|
