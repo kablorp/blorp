@@ -56,6 +56,7 @@ static int recording_unlink(const char *path);
 static int recording_fchown(int descriptor, uid_t owner, gid_t group);
 static int recording_fchmod(int descriptor, mode_t mode);
 static int recording_lstat(const char *path, struct stat *status);
+static int recording_stat(const char *path, struct stat *status);
 static int recording_fstat(int descriptor, struct stat *status);
 static char *recording_realpath(const char *path, char *resolved);
 #define open recording_open
@@ -67,6 +68,8 @@ static char *recording_realpath(const char *path, char *resolved);
 #define fchown recording_fchown
 #define fchmod recording_fchmod
 #define lstat recording_lstat
+/* Function-like, so struct stat keeps its name. */
+#define stat(path, status) recording_stat(path, status)
 #define fstat recording_fstat
 #define realpath recording_realpath
 /* Only macOS issues the barrier, so only there is fcntl called at all. */
@@ -84,6 +87,7 @@ static int recording_fcntl(int descriptor, int command, ...);
 #undef fchown
 #undef fchmod
 #undef lstat
+#undef stat
 #undef fstat
 #undef realpath
 #ifdef __APPLE__
@@ -92,8 +96,8 @@ static int recording_fcntl(int descriptor, int command, ...);
 
 enum call {
     OPEN_CALL, CLOSE_CALL, WRITE_CALL, FSYNC_CALL, FCNTL_CALL, RENAME_CALL,
-    UNLINK_CALL, FCHOWN_CALL, FCHMOD_CALL, LSTAT_CALL, FSTAT_CALL, REALPATH_CALL,
-    CALL_KINDS
+    UNLINK_CALL, FCHOWN_CALL, FCHMOD_CALL, LSTAT_CALL, STAT_CALL, FSTAT_CALL,
+    REALPATH_CALL, CALL_KINDS
 };
 
 /* The call that orders the new file's contents before the rename (D5). */
@@ -310,6 +314,21 @@ static int recording_lstat(const char *path, struct stat *status) {
     return result;
 }
 
+/* A mode a successful stat reports instead of the real one, or 0 for the real
+ * one: it stands in for a platform that resolves a slashed path to a file
+ * without ENOTDIR, as macOS 15 does for a slashed link to a file. */
+static mode_t stat_reported_mode;
+
+static int recording_stat(const char *path, struct stat *status) {
+    const int injected = injected_error(STAT_CALL, 0);
+    const int result = injected != 0 ? -1 : stat(path, status);
+    const int error = outcome_error(injected, result < 0);
+    if (result == 0 && stat_reported_mode != 0) status->st_mode = stat_reported_mode;
+    record(STAT_CALL, -1, 0, path, NULL, result, error);
+    if (result < 0) errno = error;
+    return result;
+}
+
 static int recording_fstat(int descriptor, struct stat *status) {
     const int flags = flags_of(descriptor);
     const int injected = injected_error(FSTAT_CALL, flags);
@@ -334,6 +353,7 @@ static void begin(void) {
     event_count = 0;
     memset(injections, 0, sizeof injections);
     short_writes = 0;
+    stat_reported_mode = 0;
 }
 
 static int count_events(enum call call, int required_flags) {
@@ -493,7 +513,8 @@ static void expect_steps(const struct step *expected, int length) {
     int position = 0;
     for (int index = first + 1; index < event_count; index++) {
         const enum call call = events[index].call;
-        if (call == OPEN_CALL || call == LSTAT_CALL || call == FSTAT_CALL || call == REALPATH_CALL) continue;
+        if (call == OPEN_CALL || call == LSTAT_CALL || call == STAT_CALL || call == FSTAT_CALL
+            || call == REALPATH_CALL) continue;
         assert(position < length);
         assert(call == expected[position].call);
         assert((events[index].flags & expected[position].required_flags) == expected[position].required_flags);
@@ -878,8 +899,9 @@ static int case_path_kinds(const char *root) {
     return 0;
 }
 
-/* A path ending in a slash names a directory, which is never written. One lstat
- * with the slash kept says what is there, and nothing is opened or created. */
+/* A path ending in a slash names a directory, which is never written. One stat
+ * with the slash kept says what is there, its mode decides the kind, and nothing
+ * is opened or created. */
 static int case_slashed_paths(const char *root) {
     char directory[PATH_BYTES], folder[PATH_BYTES], file[PATH_BYTES], link[PATH_BYTES];
     case_directory(directory, root, "slashed_paths");
@@ -909,7 +931,8 @@ static int case_slashed_paths(const char *root) {
         join(path, directory, expected[index].name);
         begin();
         assert(write_text_to(path, "text") == expected[index].code);
-        assert(count_events(LSTAT_CALL, 0) == 1);
+        assert(count_events(STAT_CALL, 0) == 1);
+        assert(count_events(LSTAT_CALL, 0) == 0);
         assert(count_events(OPEN_CALL, 0) == 0);
         assert(count_entries(directory) == directory_entries);
         assert(count_entries(folder) == folder_entries);
@@ -919,9 +942,18 @@ static int case_slashed_paths(const char *root) {
     char path[PATH_BYTES];
     join(path, directory, "folder/");
     begin();
-    inject(LSTAT_CALL, 0, 0, 1, EINTR);
+    inject(STAT_CALL, 0, 0, 1, EINTR);
     assert(write_text_to(path, "text") == 5);
-    assert(count_events(LSTAT_CALL, 0) == 2);
+    assert(count_events(STAT_CALL, 0) == 2);
+    assert(count_events(OPEN_CALL, 0) == 0);
+    assert(count_entries(directory) == directory_entries);
+    expect_clean(free_before, directory);
+
+    /* Success alone never means a directory: the mode decides. */
+    begin();
+    stat_reported_mode = S_IFREG | 0644;
+    assert(write_text_to(path, "text") == 4);
+    assert(count_events(STAT_CALL, 0) == 1);
     assert(count_events(OPEN_CALL, 0) == 0);
     assert(count_entries(directory) == directory_entries);
     expect_clean(free_before, directory);
@@ -1010,7 +1042,7 @@ static int case_permission_kinds(const char *root) {
     assert(chmod(unsearchable, 0600) == 0);
     begin();
     assert(write_text_to(inner, "denied") == 2);
-    assert(count_events(LSTAT_CALL, 0) == 1);
+    assert(count_events(STAT_CALL, 0) == 1);
     assert(count_events(OPEN_CALL, 0) == 0);
     expect_clean(free_before, directory);
     assert(chmod(unsearchable, 0755) == 0);
