@@ -104,12 +104,15 @@ folder under `src/`. Grammar cases live under
 [test/test_grammar/](test/test_grammar/) and change with the EBNF.
 Target component suites declare an ordinary `tests: TestSuite` constant in the
 suite file itself.
-`make -C blorp_2 test` builds Blorp 2, runs the explicit
-`TARGET_COMPONENT_SOURCES` selection through its ordinary TestSuite entries,
-and runs the first self-hosted native e2e selection.
-`test-components` and `test-target-components` run that selection with an
-already-built B2 compiler. Unported unit/runtime/grammar/tooling suites are
-DEFERRED, preserved for incremental migration, and receive no PASS credit.
+`make -C blorp_2 test` builds Blorp 2, runs the explicit component selection
+(`COMPONENT_SOURCES` in [test/e2e/self_hosted.brp](test/e2e/self_hosted.brp))
+through its ordinary TestSuite entries, and runs the first self-hosted native
+e2e selection. `test-components` and `test-target-components` run that selection
+with an already-built B2 compiler; `TARGET_COMPONENT_SOURCES=<paths>` makes
+`test-target-components` run exactly those suites instead. Unported
+unit/runtime/grammar/tooling suites are DEFERRED, preserved for incremental
+migration, and receive no PASS credit; `test-components` prints how many
+`test_*.brp` files each top directory leaves out.
 Rejections check exact message, help and span. Embedded programs use aligned
 multiline strings with exact contents; keep quoted escapes where they make
 the bytes clearer, such as CRLF or malformed indentation. Using multiline
@@ -118,9 +121,12 @@ literals in tests does not add them to the pilot's input grammar.
 **End-to-end.** Sources remain under [test/e2e/](test/e2e/), with programs in
 [test/e2e/fixtures/](test/e2e/fixtures/). `make -C blorp_2 test-e2e` runs the first selected native cases and process-runtime
 checks. Its approved orchestration entry is an ordinary `main(args)` that
-constructs Blorp `TestSuite`s and calls `test.run_suite`; Make passes the exact
-compiler, C compiler and private work-directory paths as argv. This narrow entry
-exception does not authorize alternate fixture mains or assertion frameworks.
+constructs Blorp `TestSuite`s and calls `test.run_suite`. Make builds it once per
+invocation with the compiler under test and passes a mode (`components`,
+`deferred` or `e2e`), the exact compiler and C compiler paths and, for the
+component modes, the link libraries as argv; the driver makes its own e2e work
+directory with `fs.with_temporary_directory`. This narrow entry exception
+does not authorize alternate fixture mains or assertion frameworks.
 The older driver depends on additional process/filesystem/bytes APIs; its
 remaining cases are DEFERRED. Do not substitute the legacy host.
 Port bounded suites incrementally through ordinary target TestSuites and real

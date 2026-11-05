@@ -26,8 +26,8 @@ sha256_file() {
 }
 
 export TEST_SEED_LOG="$scratch/seed.log" TEST_CC_LOG="$scratch/cc.log"
-export TEST_E2E_LOG="$scratch/e2e.log" TEST_E2E_ARGS="$scratch/e2e.args"
-export TEST_CC_ARGS="$scratch/cc-args" TEST_COMPONENT_LOG="$scratch/components.log"
+export TEST_DRIVER_LOG="$scratch/driver.log" TEST_DRIVER_ARGS="$scratch/driver.args"
+export TEST_CC_ARGS="$scratch/cc-args" TEST_COMPILER_ARGS="$scratch/compiler.args"
 export TEST_DOWNLOAD_LOG="$scratch/download.log" TEST_LEGACY_LOG="$scratch/legacy.log"
 export TEST_SEED="$scratch/seed payload" TEST_DOWNLOAD_MODE=good
 export TEST_OS=Linux TEST_ARCH=x86_64
@@ -78,22 +78,13 @@ done
 printf 'link:%s\n' "$mode" >>"$TEST_CC_LOG"
 if [ "${TEST_CC_STATUS:-0}" -ne 0 ]; then exit "$TEST_CC_STATUS"; fi
 case "$input" in
-	*/runner.c)
+	*/self-hosted-tests/driver/driver.c)
 		cat >"$output" <<'SEED'
 #!/usr/bin/env bash
 set -euo pipefail
-printf 'e2e:%s\n' "${BLORP_LEAK_CHECK:-unset}" >>"$TEST_E2E_LOG"
-printf '%s\0' "$@" >>"$TEST_E2E_ARGS"
-[ "$#" = 3 ] && [ -x "$1" ] && [ -x "$2" ] && [ -d "$3" ] || exit 94
-exit "${TEST_E2E_STATUS:-0}"
-SEED
-		;;
-	*/self-hosted-tests/*)
-		cat >"$output" <<'SEED'
-#!/usr/bin/env bash
-set -euo pipefail
-printf 'native:%s\n' "${BLORP_LEAK_CHECK:-unset}" >>"$TEST_COMPONENT_LOG"
-exit "${TEST_COMPONENT_NATIVE_STATUS:-0}"
+printf 'driver:%s:%s:%s\n' "$1" "${BLORP_LEAK_CHECK:-unset}" "$PWD" >>"$TEST_DRIVER_LOG"
+(IFS='|'; printf '%s\n' "$*") >>"$TEST_DRIVER_ARGS"
+exit "${TEST_DRIVER_STATUS:-0}"
 SEED
 		;;
 	*)
@@ -102,15 +93,10 @@ SEED
 set -euo pipefail
 printf 'built\n' >>"$TEST_CC_LOG"
 if [ "${1:-}" = --library-root ]; then
-	if [ "${3:-}" = --test-suite ]; then
-		shift 3
-		while [ "$#" -gt 1 ]; do printf 'compile:%s\n' "$1" >>"$TEST_COMPONENT_LOG"; shift; done
-		if [ "${TEST_COMPONENT_COMPILE_STATUS:-0}" -ne 0 ]; then exit "$TEST_COMPONENT_COMPILE_STATUS"; fi
-		printf '/* fake component C */\n' >"$1"
-	else
-		if [ "${TEST_E2E_COMPILE_STATUS:-0}" -ne 0 ]; then exit "$TEST_E2E_COMPILE_STATUS"; fi
-		printf '/* fake fixture C */\n' >"$4"
-	fi
+	printf 'compiler:%s\n' "${BLORP_LEAK_CHECK:-unset}" >>"$TEST_COMPILER_ARGS"
+	printf '%s\n' "$*" >>"$TEST_COMPILER_ARGS"
+	if [ "${TEST_DRIVER_COMPILE_STATUS:-0}" -ne 0 ]; then exit "$TEST_DRIVER_COMPILE_STATUS"; fi
+	printf '/* fake fixture C */\n' >"$4"
 fi
 SEED
 		;;
@@ -310,94 +296,104 @@ make -s -C "$fixture/blorp_2" example BLORP_CC="$tools/fake cc" >"$scratch/make.
 [ "$(grep -c '^built$' "$TEST_CC_LOG")" = 2 ] || fail 'example did not use new compiler and real main'
 [ ! -e "$TEST_LEGACY_LOG" ] || fail 'example touched legacy'
 pass 'example uses newly built B2 executable'
-# Every public B2 test route must avoid the legacy tripwires above.
-# Two test_utils sources around a test_lex source: groups follow first appearance.
-component_sources='blorp_2/test/unit/test_utils/test_boolean.brp blorp_2/test/unit/test_lex/test_lex.brp blorp_2/test/unit/test_utils/test_text.brp'
-for target in test test-components; do
-	: >"$TEST_COMPONENT_LOG"
-	: >"$TEST_E2E_LOG"
-	: >"$TEST_E2E_ARGS"
+# The test targets build one Blorp driver with the compiler under test and run
+# it once per mode. Only the fake driver executes here: what each mode does is
+# proven by the driver's unit suite and by running `make test` itself.
+real_parent="$scratch/real parent"
+link_parent="$scratch/link parent"
+mkdir "$real_parent"
+ln -s "$real_parent" "$link_parent"
+real_parent=$(cd "$real_parent" && pwd -P)
+expected_compiler="$fixture/blorp_2/build/output compiler"
+expected_cc="$tools/fake cc"
+reset_driver_logs() {
+	: >"$TEST_DRIVER_LOG"
+	: >"$TEST_DRIVER_ARGS"
+	: >"$TEST_COMPILER_ARGS"
 	: >"$TEST_CC_ARGS"
-	if ! make -s -C "$fixture/blorp_2" "$target" BLORP_CC="$tools/fake cc" \
+}
+run_test_target() {
+	local target
+	target="$1"
+	shift
+	TMPDIR="$link_parent" make -s -C "$fixture/blorp_2" "$target" BLORP_CC="$tools/fake cc" \
 		BLORP2_COMPILER='blorp_2/build/output compiler' \
-		BLORP2_COMPILER_C='blorp_2/build/output compiler.c' \
-		TARGET_COMPONENT_SOURCES="$component_sources" >"$scratch/make.stdout" 2>"$scratch/make.stderr"; then
-		cat "$scratch/make.stderr" >&2
-		fail "$target must run the self-hosted selection"
-	fi
-	printf 'compile:%s\ncompile:%s\nnative:strict\ncompile:%s\nnative:strict\n' \
-		blorp_2/test/unit/test_utils/test_boolean.brp blorp_2/test/unit/test_utils/test_text.brp \
-		blorp_2/test/unit/test_lex/test_lex.brp >"$scratch/expected"
-	cmp -s "$TEST_COMPONENT_LOG" "$scratch/expected" || fail "$target selected sources, grouping, order or strict native entrypoint"
-	if [ "$target" = test ]; then
-		grep -Fxq 'e2e:strict' "$TEST_E2E_LOG" || fail 'default test did not run self-hosted e2e';
-	else
-		[ ! -s "$TEST_E2E_LOG" ] || fail 'component target ran e2e';
-	fi
-	if [ "$target" = test-components ]; then
-		: >"$scratch/expected"
-		for group in unit/test_utils unit/test_lex; do
-			program="blorp_2/build/self-hosted-tests/$group/all_suites"
-			printf '%s\0' -std=c11 -Wall -Wextra -Werror -pedantic -O0 \
-				-DBLORP_MEMORY_DIAGNOSTICS=1 "$program.c" -o "$program" -lm -lpthread >>"$scratch/expected"
-		done
-		if ! cmp -s "$TEST_CC_ARGS" "$scratch/expected"; then fail 'selected C compiler flags or mirrored group output paths'; fi
-	fi
-	if ! grep -Fq 'DEFERRED:' "$scratch/make.stdout"; then fail "$target omitted unported coverage status"; fi
-	if [ -e "$TEST_LEGACY_LOG" ]; then fail "$target invoked a legacy host/build-status/bootstrap"; fi
-	pass "$target runs the selected B2 suites as one strict program per directory"
+		BLORP2_COMPILER_C='blorp_2/build/output compiler.c' "$@" >"$scratch/make.stdout" 2>"$scratch/make.stderr"
+}
+
+reset_driver_logs
+if ! run_test_target test-e2e; then cat "$scratch/make.stderr" >&2; fail 'test-e2e must run the driver'; fi
+printf 'driver:e2e:strict:%s\n' "$fixture" >"$scratch/expected"
+cmp -s "$TEST_DRIVER_LOG" "$scratch/expected" || fail 'test-e2e did not run exactly the e2e mode strictly from the repository root'
+printf 'e2e|%s|%s|%s\n' "$expected_compiler" "$expected_cc" "$real_parent" >"$scratch/expected"
+cmp -s "$TEST_DRIVER_ARGS" "$scratch/expected" || fail 'e2e arguments are not the absolute tools and the physical temporary parent'
+pass 'test-e2e runs the e2e mode with absolute tools and the symlink-resolved temporary parent'
+
+printf 'compiler:strict\n--library-root blorp_2/standard_library blorp_2/test/e2e/self_hosted.brp blorp_2/build/self-hosted-tests/driver/driver.c\n' >"$scratch/expected"
+cmp -s "$TEST_COMPILER_ARGS" "$scratch/expected" || fail 'the driver was not compiled strictly from the driver entry'
+printf '%s\0' -std=c11 -Wall -Wextra -Werror -pedantic -O0 -fsanitize=address,undefined -fno-sanitize-recover=all \
+	-DBLORP_MEMORY_DIAGNOSTICS=1 blorp_2/build/self-hosted-tests/driver/driver.c -o blorp_2/build/self-hosted-tests/driver/driver \
+	-lm -lpthread >"$scratch/expected"
+cmp -s "$TEST_CC_ARGS" "$scratch/expected" || fail 'driver link flags or operand argv'
+pass 'the driver is built by the compiler under test, strictly, with sanitizers'
+
+reset_driver_logs
+if ! run_test_target test-target-components TARGET_COMPONENT_SOURCES='a b/test_one.brp c.brp'; then cat "$scratch/make.stderr" >&2; fail 'test-target-components must run the driver'; fi
+printf 'components|%s|%s|-lm|-lpthread|--|a|b/test_one.brp|c.brp\n' "$expected_compiler" "$expected_cc" >"$scratch/expected"
+cmp -s "$TEST_DRIVER_ARGS" "$scratch/expected" || fail 'the narrow selection is not passed to the components mode'
+pass 'test-target-components passes TARGET_COMPONENT_SOURCES to the driver, and only that'
+
+for target in test-target-components test-components; do
+	reset_driver_logs
+	if ! run_test_target "$target"; then cat "$scratch/make.stderr" >&2; fail "$target must run the driver"; fi
+	printf 'components|%s|%s|-lm|-lpthread|--\n' "$expected_compiler" "$expected_cc" >"$scratch/expected"
+	[ "$target" = test-target-components ] || printf 'deferred\n' >>"$scratch/expected"
+	cmp -s "$TEST_DRIVER_ARGS" "$scratch/expected" || fail "$target did not leave the selection to the driver or report deferrals only for test-components"
+	if grep -Fq 'driver:e2e' "$TEST_DRIVER_LOG"; then fail "$target ran e2e"; fi
+	grep -Fxq "driver:components:strict:$fixture" "$TEST_DRIVER_LOG" || fail "$target did not run the components mode strictly from the repository root"
+	pass "$target leaves an empty selection to the driver's built-in list"
 done
 
-: >"$TEST_E2E_LOG"
-: >"$TEST_E2E_ARGS"
-make -s -C "$fixture/blorp_2" test-e2e BLORP_CC="$tools/fake cc" \
-	BLORP2_COMPILER='blorp_2/build/output compiler' >"$scratch/e2e.stdout" 2>"$scratch/e2e.stderr" || { cat "$scratch/e2e.stderr" >&2; fail 'self-hosted e2e route'; }
-grep -Fxq 'e2e:strict' "$TEST_E2E_LOG" || fail 'e2e did not run the strict ordinary driver main'
-[ ! -e "$TEST_LEGACY_LOG" ] || fail 'e2e invoked legacy'
-pass 'test-e2e runs its new B2 driver with explicit executable and temporary paths'
+reset_driver_logs
+if ! run_test_target test-components TARGET_COMPONENT_SOURCES='a.brp'; then cat "$scratch/make.stderr" >&2; fail 'test-components with a selection'; fi
+printf 'components|%s|%s|-lm|-lpthread|--|a.brp\ndeferred|a.brp\n' "$expected_compiler" "$expected_cc" >"$scratch/expected"
+cmp -s "$TEST_DRIVER_ARGS" "$scratch/expected" || fail 'the deferral report does not use the same selection'
+pass 'test-components reports deferrals against the selection it ran'
 
-for failure_kind in compile link native; do
-	: >"$TEST_E2E_LOG"
-	export TEST_E2E_COMPILE_STATUS=0 TEST_CC_STATUS=0 TEST_E2E_STATUS=0
+# `test` builds the driver once, then runs components, the deferral report and e2e.
+reset_driver_logs
+if ! TMPDIR="$link_parent" make -s -C "$fixture/blorp_2" test BLORP_CC="$tools/fake cc" \
+	BLORP2_COMPILER='blorp_2/build/output compiler' \
+	BLORP2_COMPILER_C='blorp_2/build/output compiler.c' >"$scratch/make.stdout" 2>"$scratch/make.stderr"; then
+	cat "$scratch/make.stderr" >&2
+	fail 'test must run the self-hosted driver'
+fi
+[ "$(grep -c '^compiler:strict$' "$TEST_COMPILER_ARGS")" = 1 ] || fail 'test did not build the driver exactly once'
+printf 'driver:components:strict:%s\ndriver:deferred:strict:%s\ndriver:e2e:strict:%s\n' "$fixture" "$fixture" "$fixture" >"$scratch/expected"
+cmp -s "$TEST_DRIVER_LOG" "$scratch/expected" || fail 'test did not run components, deferrals and e2e in that order'
+[ ! -e "$TEST_LEGACY_LOG" ] || fail 'test invoked a legacy host/build-status/bootstrap'
+pass 'test builds the driver once and runs components, deferrals and e2e in order'
+
+for failure_kind in driver-compile driver-link driver-run; do
+	reset_driver_logs
+	export TEST_DRIVER_COMPILE_STATUS=0 TEST_CC_STATUS=0 TEST_DRIVER_STATUS=0
 	case "$failure_kind" in
-		compile) TEST_E2E_COMPILE_STATUS=41 ;;
-		link) TEST_CC_STATUS=42 ;;
-		native) TEST_E2E_STATUS=43 ;;
+		driver-compile) TEST_DRIVER_COMPILE_STATUS=41 ;;
+		driver-link) TEST_CC_STATUS=42 ;;
+		driver-run) TEST_DRIVER_STATUS=43 ;;
 	esac
-	if make -s -C "$fixture/blorp_2" test-e2e BLORP_CC="$tools/fake cc" \
-		BLORP2_COMPILER='blorp_2/build/output compiler' >"$scratch/e2e.stdout" 2>"$scratch/e2e.stderr"; then
-		fail "e2e $failure_kind failure was ignored"
-	fi
-	if [ "$failure_kind" != native ] && [ -s "$TEST_E2E_LOG" ]; then fail 'failed compile/link ran a stale e2e driver'; fi
-	pass "self-hosted e2e $failure_kind failure stops and fails the target"
+	for target in test-target-components test-components test-e2e; do
+		: >"$TEST_DRIVER_LOG"
+		if run_test_target "$target"; then fail "$target ignored a $failure_kind failure"; fi
+		if [ "$failure_kind" != driver-run ] && [ -s "$TEST_DRIVER_LOG" ]; then fail "$target ran a driver after a $failure_kind failure"; fi
+		if [ "$failure_kind" = driver-run ] && [ "$target" = test-components ] && [ "$(wc -l <"$TEST_DRIVER_LOG" | tr -d ' ')" != 1 ]; then fail 'a failed component run still reported deferrals'; fi
+	done
+	pass "a $failure_kind failure stops every test target and fails it"
 done
-unset TEST_E2E_COMPILE_STATUS TEST_CC_STATUS TEST_E2E_STATUS
+unset TEST_DRIVER_COMPILE_STATUS TEST_CC_STATUS TEST_DRIVER_STATUS
 
-expect_failure 'missing Blorp 2 test compiler' make -s -C "$fixture/blorp_2" test-e2e BLORP2_COMPILER=missing-compiler
-pass 'e2e missing compiler fails with actionable build help'
-
-: >"$TEST_COMPONENT_LOG"
-expect_failure 'no target component sources selected' make -s -C "$fixture/blorp_2" test-components TARGET_COMPONENT_SOURCES=
-if [ -s "$TEST_COMPONENT_LOG" ]; then fail 'empty selection executed components'; fi
-pass 'empty self-hosted selection fails closed'
-
-for failure_kind in compile link native; do
-	: >"$TEST_COMPONENT_LOG"
-	export TEST_COMPONENT_COMPILE_STATUS=0 TEST_CC_STATUS=0 TEST_COMPONENT_NATIVE_STATUS=0
-	case "$failure_kind" in
-		compile) TEST_COMPONENT_COMPILE_STATUS=31 ;;
-		link) TEST_CC_STATUS=32 ;;
-		native) TEST_COMPONENT_NATIVE_STATUS=33 ;;
-	esac
-	if make -s -C "$fixture/blorp_2" test-components BLORP_CC="$tools/fake cc" \
-		BLORP2_COMPILER='blorp_2/build/output compiler' TARGET_COMPONENT_SOURCES="$component_sources" \
-		>"$scratch/make.stdout" 2>"$scratch/make.stderr"; then
-		fail "$failure_kind failure was ignored"
-	fi
-	if grep -Fq 'compile:blorp_2/test/unit/test_lex/test_lex.brp' "$TEST_COMPONENT_LOG"; then fail "$failure_kind failure continued to the next group"; fi
-	if [ "$failure_kind" != native ] && grep -Fq 'native:' "$TEST_COMPONENT_LOG"; then fail "$failure_kind failure executed stale native output"; fi
-	if [ -e "$TEST_LEGACY_LOG" ]; then fail "$failure_kind failure invoked legacy"; fi
-	pass "self-hosted $failure_kind failure blocks and stops the selection"
+for target in test-target-components test-components test-e2e; do
+	expect_failure 'missing Blorp 2 test compiler' make -s -C "$fixture/blorp_2" "$target" BLORP2_COMPILER=missing-compiler
 done
-unset TEST_COMPONENT_COMPILE_STATUS TEST_CC_STATUS TEST_COMPONENT_NATIVE_STATUS
+pass 'every test target fails with actionable build help when the compiler is missing'
 printf '%s tests passed\n' "$passed"

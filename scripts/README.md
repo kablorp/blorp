@@ -36,14 +36,17 @@ compiler. On a push to main that passes, it publishes that commit's seed (see
 CI workflow runs only when `blorp/`, `examples/`, `pkg/`, `scripts/` or
 `standard_library/` change.
 No legacy build, artifact or FRESH-host check is involved. The Makefile's
-explicit `TARGET_COMPONENT_SOURCES` selection runs through ordinary target
-TestSuite entries, one program per listed directory (its phase), with C11
-`-O0` linking and strict native memory checks.
+explicit component selection (`COMPONENT_SOURCES` in
+`blorp_2/test/e2e/self_hosted.brp`; `TARGET_COMPONENT_SOURCES=<paths>` overrides
+it) runs through ordinary target TestSuite entries, one program per listed
+directory (its phase), with C11 `-O0` linking and strict native memory checks.
+The Blorp test driver that `make` builds runs it and the e2e selection.
 The first native e2e selection runs the selected real-main cases and process-runtime
 lifecycle checks through ordinary Blorp TestSuites, with exact output, strict
 accounting and ASan/UBSan checks. `test-e2e` uses an already-built diagnostic B2
 compiler. Unported unit/runtime/grammar/tooling and remaining native e2e cases
-are DEFERRED, with their sources preserved; they receive no PASS credit.
+are DEFERRED, with their sources preserved; they receive no PASS credit, and
+`test-components` prints how many each top directory holds.
 Logs retain active results and deferral status. Other project CI lanes remain
 on their existing compiler/test routes.
 The shared workflow selects `BLORP_CC` through its `c_compiler` input (default

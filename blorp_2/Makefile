@@ -11,138 +11,16 @@ BLORP2_COMPILER := blorp_2/build/compiler
 BLORP2_COMPILER_C := blorp_2/build/compiler.c
 TEST_COMPILER_FLAGS := -O0
 TEST_COMPILER_LIBRARIES := -lm -lpthread
-# Explicitly ported suites: every active B2 test runs through Blorp 2.
-TARGET_COMPONENT_SOURCES := \
-	blorp_2/test/unit/test_library/test_hashable.brp \
-	blorp_2/test/unit/test_library/test_dict.brp \
-	blorp_2/test/unit/test_library/test_float_classification.brp \
-	blorp_2/test/unit/test_library/test_int_comparisons.brp \
-	blorp_2/test/unit/test_library/test_path_join.brp \
-	blorp_2/test/unit/test_library/test_path_dirname.brp \
-	blorp_2/test/unit/test_library/test_path_normalize.brp \
-	blorp_2/test/unit/test_library/test_string_starts_with.brp \
-	blorp_2/test/unit/test_utils/test_boolean.brp \
-	blorp_2/test/unit/test_utils/test_constant_ids.brp \
-	blorp_2/test/unit/test_utils/test_ids.brp \
-	blorp_2/test/unit/test_utils/test_names.brp \
-	blorp_2/test/unit/test_utils/test_results.brp \
-	blorp_2/test/unit/test_utils/test_stack.brp \
-	blorp_2/test/unit/test_utils/test_source.brp \
-	blorp_2/test/unit/test_utils/test_syntax.brp \
-	blorp_2/test/unit/test_utils/test_text.brp \
-	blorp_2/test/unit/test_lex/test_arithmetic_operators.brp \
-	blorp_2/test/unit/test_lex/test_char_literals.brp \
-	blorp_2/test/unit/test_lex/test_continuation.brp \
-	blorp_2/test/unit/test_lex/test_doc_blocks.brp \
-	blorp_2/test/unit/test_lex/test_float.brp \
-	blorp_2/test/unit/test_lex/test_keywords.brp \
-	blorp_2/test/unit/test_lex/test_interpolation.brp \
-	blorp_2/test/unit/test_lex/test_equality_operators.brp \
-	blorp_2/test/unit/test_lex/test_lex.brp \
-	blorp_2/test/unit/test_lex/test_ordering_operators.brp \
-	blorp_2/test/unit/test_lex/test_pipe_strings.brp \
-	blorp_2/test/unit/test_lex/test_provenance.brp \
-	blorp_2/test/unit/test_lex/test_ranges.brp \
-	blorp_2/test/unit/test_lex/test_runtime_text.brp \
-	blorp_2/test/unit/test_lex/test_trivia.brp \
-	blorp_2/test/unit/test_parse/test_arithmetic_operators.brp \
-	blorp_2/test/unit/test_parse/test_constant_inventory.brp \
-	blorp_2/test/unit/test_parse/test_system_labels.brp \
-	blorp_2/test/unit/test_parse/test_fs_read.brp \
-	blorp_2/test/unit/test_parse/test_fs_write.brp \
-	blorp_2/test/unit/test_parse/test_fs_directories.brp \
-	blorp_2/test/unit/test_parse/test_float_builtin_labels.brp \
-	blorp_2/test/unit/test_parse/test_int_comparisons.brp \
-	blorp_2/test/unit/test_parse/test_ordering_operators.brp \
-	blorp_2/test/unit/test_parse/test_boolean_function_names.brp \
-	blorp_2/test/unit/test_parse/test_dict_literals.brp \
-	blorp_2/test/unit/test_parse/test_supertraits.brp \
-	blorp_2/test/unit/test_parse/test_provenance.brp \
-	blorp_2/test/unit/test_parse/test_string_concat.brp \
-	blorp_2/test/unit/test_parse/test_string_slice.brp \
-	blorp_2/test/unit/test_harness/test_self_hosted_reports.brp \
-	blorp_2/test/unit/test_parse/test_discard_propagation.brp \
-	blorp_2/test/unit/test_parse/test_methods_selection.brp \
-	blorp_2/test/unit/test_parse/test_union_declarations.brp \
-	blorp_2/test/unit/test_parse/test_record_declarations.brp \
-	blorp_2/test/unit/test_check/test_discard_propagation.brp \
-	blorp_2/test/unit/test_check/test_callable_parameter_values.brp \
-	blorp_2/test/unit/test_check/test_declarations.brp \
-	blorp_2/test/unit/test_check/test_instantiation_paths.brp \
-	blorp_2/test/unit/test_check/test_first_error.brp \
-	blorp_2/test/unit/test_check/test_fixed_types.brp \
-	blorp_2/test/unit/test_check/test_first_invariant.brp \
-	blorp_2/test/unit/test_check/test_direct_list_updates.brp \
-	blorp_2/test/unit/test_check/test_nominal_types.brp \
-	blorp_2/test/unit/test_check/test_type_children.brp \
-	blorp_2/test/unit/test_check/test_child_expressions.brp \
-	blorp_2/test/unit/test_check/test_arithmetic_traits.brp \
-	blorp_2/test/unit/test_check/test_arithmetic_operators.brp \
-	blorp_2/test/unit/test_check/test_ordering_operators.brp \
-	blorp_2/test/unit/test_check/test_dict_literals.brp \
-	blorp_2/test/unit/test_check/test_supertraits.brp \
-	blorp_2/test/unit/test_check/test_receiver_scopes.brp \
-	blorp_2/test/unit/test_parse/test_declaration_bounds.brp \
-	blorp_2/test/unit/test_check/test_declaration_bounds.brp \
-	blorp_2/test/unit/test_check/test_implementation_table.brp \
-	blorp_2/test/unit/test_parse/test_generic_opaque_types.brp \
-	blorp_2/test/unit/test_check/test_generic_opaque_types.brp \
-	blorp_2/test/unit/test_specialize/test_generic_opaque_types.brp \
-	blorp_2/test/unit/test_specialize/test_inline_union_fields.brp \
-	blorp_2/test/unit/test_specialize/test_tuple_storage.brp \
-	blorp_2/test/unit/test_specialize/test_static_environments.brp \
-	blorp_2/test/unit/test_namespace/test_string_append_int.brp \
-	blorp_2/test/unit/test_verify/test_inline_union_fields.brp \
-	blorp_2/test/unit/test_verify/test_static_environments.brp \
-	blorp_2/test/unit/test_own/test_list_updates.brp \
-	blorp_2/test/unit/test_own/test_library_loops.brp \
-	blorp_2/test/unit/test_own/test_dict_updates.brp \
-	blorp_2/test/unit/test_verify/test_list_updates.brp \
-	blorp_2/test/unit/test_emit/test_list_updates.brp \
-	blorp_2/test/unit/test_lower/test_loop_reads.brp \
-	blorp_2/test/unit/test_lower/test_record_update.brp \
-	blorp_2/test/unit/test_own/test_ownership_transfer.brp \
-	blorp_2/test/unit/test_verify/test_ownership_transfer.brp \
-	blorp_2/test/unit/test_own/test_owned_parameters.brp \
-	blorp_2/test/unit/test_verify/test_owned_parameters.brp \
-	blorp_2/test/unit/test_own/test_owned_label_use.brp \
-	blorp_2/test/unit/test_own/test_borrowed_projections.brp \
-	blorp_2/test/unit/test_verify/test_borrowed_projections.brp \
-	blorp_2/test/unit/test_parse/test_run_to_files.brp \
-	blorp_2/test/unit/test_parse/test_module_stems.brp \
-	blorp_2/test/unit/test_check/test_run_to_files.brp \
-	blorp_2/test/unit/test_check/test_fs_read.brp \
-	blorp_2/test/unit/test_check/test_fs_write.brp \
-	blorp_2/test/unit/test_check/test_fs_directories.brp \
-	blorp_2/test/unit/test_specialize/test_instance_digest.brp \
-	blorp_2/test/unit/test_specialize/test_run_to_files.brp \
-	blorp_2/test/unit/test_lower/test_run_to_files.brp \
-	blorp_2/test/unit/test_own/test_run_to_files.brp \
-	blorp_2/test/unit/test_verify/test_run_to_files.brp \
-	blorp_2/test/unit/test_emit/test_run_to_files.brp \
-	blorp_2/test/unit/test_emit/test_fs_operations.brp \
-	blorp_2/test/unit/test_emit/test_function_labels.brp \
-	blorp_2/test/unit/test_emit/test_static_environments.brp \
-	blorp_2/test/unit/test_parse/test_grouped_suites.brp \
-	blorp_2/test/unit/test_load/test_grouped_suites.brp \
-	blorp_2/test/unit/test_check/test_grouped_suites.brp \
-	blorp_2/test/unit/test_check/test_current_directory.brp \
-	blorp_2/test/unit/test_check/test_lookup_rejections.brp \
-	blorp_2/test/unit/test_emit/test_builtin_functions.brp \
-	blorp_2/test/unit/test_emit/test_current_directory.brp \
-	blorp_2/test/unit/test_lower/test_fs_write.brp \
-	blorp_2/test/unit/test_lower/test_result_contracts.brp \
-	blorp_2/test/unit/test_own/test_current_directory.brp \
-	blorp_2/test/unit/test_own/test_fs_write.brp \
-	blorp_2/test/unit/test_specialize/test_current_directory.brp \
-	blorp_2/test/unit/test_specialize/test_fs_write.brp \
-	blorp_2/test/unit/test_verify/test_fs_write.brp \
-	blorp_2/test/unit/test_verify/test_result_ownership.brp \
-	blorp_2/test/unit/test_runtime/test_system.brp \
-	blorp_2/test/unit/test_parse/test_string_literals_syntax.brp \
-	blorp_2/test/test_grammar/test_conformance.brp
+# The component programs are listed in test/e2e/self_hosted.brp. Setting this
+# to source paths runs exactly those instead, for the narrow loop.
+TARGET_COMPONENT_SOURCES :=
+# Beside the component programs, whose root is BUILD_ROOT in
+# test/e2e/self_hosted_selection.brp. No test directory is named `driver`, so
+# no component program overwrites it.
+TEST_DRIVER_DIRECTORY := blorp_2/build/self-hosted-tests/driver
+TEST_DRIVER := $(TEST_DRIVER_DIRECTORY)/driver
 
-.PHONY: compiler generate-compiler link-compiler example test test-components test-target-components test-compiler link-test-compiler test-e2e
+.PHONY: compiler generate-compiler link-compiler example test test-components test-target-components test-compiler link-test-compiler test-e2e build-test-driver
 
 compiler: generate-compiler
 	@$(MAKE) --no-print-directory link-compiler
@@ -167,43 +45,50 @@ example: compiler
 		build/return_zero.c -o build/return_zero
 	@build/return_zero
 
+# Straight-line shell that gives the test recipes absolute tool paths.
+define RESOLVE_TEST_TOOLS
+cd ..; \
+	compiler_path="$(BLORP2_COMPILER)"; \
+	case "$$compiler_path" in /*) ;; *) compiler_path="$$PWD/$$compiler_path";; esac; \
+	if [ ! -x "$$compiler_path" ]; then \
+		printf '%s\n' 'missing Blorp 2 test compiler; run make -C blorp_2 test-compiler first' >&2; exit 1; \
+	fi; \
+	cc_path=$$(command -v "$(BLORP_CC)") || { printf '%s\n' 'C compiler executable not found' >&2; exit 1; }; \
+	case "$$cc_path" in /*) ;; *) cc_path="$$PWD/$$cc_path";; esac; \
+	if [ ! -x "$$cc_path" ]; then printf '%s\n' 'C compiler must resolve to an executable file' >&2; exit 1; fi
+endef
+
+# One make invocation builds the driver once: test-components and test-e2e name
+# it as a prerequisite, so they share one build when given together.
 test:
 	@$(MAKE) --no-print-directory test-compiler
-	@$(MAKE) --no-print-directory test-components
-	@$(MAKE) --no-print-directory test-e2e
+	@$(MAKE) --no-print-directory test-components test-e2e
 
-# Other suites remain in source for incremental self-hosted migration.
-# Callers build once or supply the exact B2 compiler under test.
-test-components:
-	@$(MAKE) --no-print-directory test-target-components
-	@printf '%s\n' 'DEFERRED: remaining unit/runtime/grammar/tooling and broader native e2e suites; only explicit self-hosted selections run.'
+# Other suites remain in source for incremental self-hosted migration; the
+# driver prints how many it leaves out, per top directory. That report is its own
+# invocation so test-target-components, the narrow loop, prints only its suites.
+test-components: test-target-components
+	@set -eu; cd ..; BLORP_LEAK_CHECK=strict "$(TEST_DRIVER)" deferred $(TARGET_COMPONENT_SOURCES)
 
-# One program per phase directory: a source's directory is its phase owner, so
-# each phase's shared imports compile once and a strict leak or crash is
-# attributed to that phase. Directories run in order of first appearance and
-# keep list order within a group. The program lives in the directory that
-# mirrors its group, so equally named groups never overwrite each other's C.
-test-target-components:
-	@set -eu; cd ..; \
-		if [ -z "$(strip $(TARGET_COMPONENT_SOURCES))" ]; then \
-			printf '%s\n' 'no target component sources selected' >&2; exit 1; \
-		fi; \
-		directories=; \
-		for source in $(TARGET_COMPONENT_SOURCES); do \
-			case " $$directories " in *" $${source%/*} "*) ;; *) directories="$$directories $${source%/*}";; esac; \
-		done; \
-		for directory in $$directories; do \
-			sources=; \
-			for source in $(TARGET_COMPONENT_SOURCES); do \
-				if [ "$${source%/*}" = "$$directory" ]; then sources="$$sources $$source"; fi; \
-			done; \
-			program="blorp_2/build/self-hosted-tests/$${directory#blorp_2/test/}/all_suites"; \
-			mkdir -p "$$(dirname "$$program")"; \
-			"$(BLORP2_COMPILER)" --library-root blorp_2/standard_library --test-suite $$sources "$$program.c"; \
-			"$(BLORP_CC)" -std=c11 -Wall -Wextra -Werror -pedantic -O0 \
-				-DBLORP_MEMORY_DIAGNOSTICS=1 "$$program.c" -o "$$program" $(TEST_COMPILER_LIBRARIES); \
-			BLORP_LEAK_CHECK=strict "$$program"; \
-		done
+# The driver is an ordinary B2 main(args) running TestSuites; fixtures retain
+# their own real mains. It receives all configuration explicitly from Make, and
+# is built by the compiler under test, so a compiler defect cannot hide behind
+# a driver built by another one.
+build-test-driver:
+	@set -eu; $(RESOLVE_TEST_TOOLS); \
+		mkdir -p "$(TEST_DRIVER_DIRECTORY)"; rm -f "$(TEST_DRIVER)"; \
+		BLORP_LEAK_CHECK=strict "$$compiler_path" --library-root blorp_2/standard_library \
+			blorp_2/test/e2e/self_hosted.brp "$(TEST_DRIVER).c"; \
+		"$$cc_path" -std=c11 -Wall -Wextra -Werror -pedantic -O0 \
+			-fsanitize=address,undefined -fno-sanitize-recover=all \
+			-DBLORP_MEMORY_DIAGNOSTICS=1 "$(TEST_DRIVER).c" -o "$(TEST_DRIVER)" $(TEST_COMPILER_LIBRARIES)
+
+# One program per phase directory, built and run under strict leak checking in
+# blorp_2/build/self-hosted-tests/, where a failure can be inspected.
+test-target-components: build-test-driver
+	@set -eu; $(RESOLVE_TEST_TOOLS); \
+		BLORP_LEAK_CHECK=strict "$(TEST_DRIVER)" components "$$compiler_path" "$$cc_path" \
+			$(TEST_COMPILER_LIBRARIES) -- $(TARGET_COMPONENT_SOURCES)
 
 # Each e2e run builds once and passes its binary to its fixture groups.
 test-compiler: generate-compiler
@@ -215,26 +100,7 @@ link-test-compiler:
 		&& "$(BLORP_CC)" $(TEST_COMPILER_FLAGS) -DBLORP_MEMORY_DIAGNOSTICS=1 \
 			"$(BLORP2_COMPILER_C)" -o "$(BLORP2_COMPILER)" $(TEST_COMPILER_LIBRARIES)
 
-# The driver is an ordinary B2 main(args) running TestSuites; fixtures retain
-# their own real mains. It receives all configuration explicitly from Make.
-test-e2e:
-	@set -eu; cd ..; \
-		compiler_path="$(BLORP2_COMPILER)"; \
-		case "$$compiler_path" in /*) ;; *) compiler_path="$$PWD/$$compiler_path";; esac; \
-		if [ ! -x "$$compiler_path" ]; then \
-			printf '%s\n' 'missing Blorp 2 test compiler; run make -C blorp_2 test-compiler first' >&2; exit 1; \
-		fi; \
-		cc_path=$$(command -v "$(BLORP_CC)") || { printf '%s\n' 'C compiler executable not found' >&2; exit 1; }; \
-		case "$$cc_path" in /*) ;; *) cc_path="$$PWD/$$cc_path";; esac; \
-		if [ ! -x "$$cc_path" ]; then printf '%s\n' 'C compiler must resolve to an executable file' >&2; exit 1; fi; \
-		runner_directory=$$(mktemp -d "$${TMPDIR:-/tmp}/blorp2-e2e.XXXXXX"); \
-		runner_directory=$$(cd "$$runner_directory" && pwd -P); \
-		trap 'rm -rf "$$runner_directory"' EXIT; \
-		trap 'exit 1' HUP INT TERM; \
-		BLORP_LEAK_CHECK=strict "$$compiler_path" --library-root blorp_2/standard_library \
-			blorp_2/test/e2e/self_hosted.brp "$$runner_directory/runner.c"; \
-		"$$cc_path" -std=c11 -Wall -Wextra -Werror -pedantic -O0 \
-			-fsanitize=address,undefined -fno-sanitize-recover=all \
-			-DBLORP_MEMORY_DIAGNOSTICS=1 "$$runner_directory/runner.c" \
-			-o "$$runner_directory/runner" $(TEST_COMPILER_LIBRARIES); \
-		BLORP_LEAK_CHECK=strict "$$runner_directory/runner" "$$compiler_path" "$$cc_path" "$$runner_directory"
+test-e2e: build-test-driver
+	@set -eu; $(RESOLVE_TEST_TOOLS); \
+		temporary_parent=$$(cd "$${TMPDIR:-/tmp}" && pwd -P); \
+		BLORP_LEAK_CHECK=strict "$(TEST_DRIVER)" e2e "$$compiler_path" "$$cc_path" "$$temporary_parent"

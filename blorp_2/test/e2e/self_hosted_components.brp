@@ -1,0 +1,87 @@
+import:
+    ./self_hosted_harness: command, reported, ENVIRONMENT_TOOL, COMPILATION_TIMEOUT_MS
+    ./self_hosted_selection: ComponentGroup, Tools, program_directory, compile_arguments, link_arguments, run_arguments, without_final_newline
+    process: run_to_files
+    fs: EntryKind(File), describe, entry_kind, create_directories, remove_directory_tree, read_text
+    io: print, print_error
+    test: TestSuite
+    int: Int methods
+    list: List methods
+    result: Result methods
+    string: String methods
+
+
+-- A component program runs every suite of one phase directory under strict
+-- leak checking. Ten minutes is far above any observed run, and bounds a hang.
+private COMPONENT_TIMEOUT_MS: Int = 600000
+private PROGRAM_NAME: String = "all_suites"
+
+
+private func require_source(source: String) -> Result[Void, String]:
+    kind ?= entry_kind(source).map_err(describe)
+    match kind:
+        Some(File): Ok(void)
+        Some(_): Err("component source is not a file: " + source)
+        None: Err("component source does not exist: " + source)
+
+
+private func require_sources(sources: List[String]) -> Result[Void, String]:
+    var outcome: Result[Void, String] = Ok(void)
+    for source in sources:
+        match outcome:
+            Ok(_): outcome = require_source(source)
+            Err(_): void
+    outcome
+
+
+-- Capture files must be new, so a rerun starts from an empty directory. The
+-- previous run's C and binary stay until then, for inspection.
+private func empty_directory(directory: String) -> Result[Void, String]:
+    existing ?= entry_kind(directory).map_err(describe)
+    _ ?= match existing:
+        Some(_): remove_directory_tree(directory).map_err(describe)
+        None: Ok(void)
+    create_directories(directory).map_err(describe)
+
+
+-- Prints what the program wrote, however it ended, so a crash or a timeout
+-- keeps the output that explains it.
+private func relay(prefix: String) -> Result[Void, String]:
+    output ?= read_text(prefix + ".stdout").map_err(describe)
+    errors ?= read_text(prefix + ".stderr").map_err(describe)
+    if output.length() > 0:
+        print(without_final_newline(output))
+    if errors.length() > 0:
+        print_error(without_final_newline(errors))
+    Ok(void)
+
+
+-- Not `command`: it quotes the program's stderr in its error, and relay has
+-- already printed it.
+private func run_program(program: String) -> Result[Void, String]:
+    prefix = program + ".run"
+    outcome = run_to_files(ENVIRONMENT_TOOL, run_arguments(program), prefix + ".stdout", prefix + ".stderr", COMPONENT_TIMEOUT_MS)
+    relayed = relay(prefix)
+    status ?= outcome.map_err(pure func(error: String): program + ": " + error)
+    if status.equals(0):
+        relayed
+    else:
+        Err(program + ": exit " + status.to_string())
+
+
+private func run_component(tools: Tools, group: ComponentGroup) -> Result[Void, String]:
+    directory ?= program_directory(group)
+    _ ?= require_sources(group.sources)
+    _ ?= empty_directory(directory)
+    program = directory + "/" + PROGRAM_NAME
+    _ ?= command(compile_arguments(tools, group, program), program + ".compile", 0, COMPILATION_TIMEOUT_MS)
+    _ ?= command(link_arguments(tools, program), program + ".link", 0, COMPILATION_TIMEOUT_MS)
+    run_program(program)
+
+
+-- One case per group, so a failure names the phase that owns it.
+func suite(tools: Tools, groups: List[ComponentGroup]) -> TestSuite:
+    {
+        description = "Blorp 2 component programs",
+        tests = groups.map(pure func(group: ComponentGroup): (group.directory, func(): reported(run_component(tools, group))))
+    }

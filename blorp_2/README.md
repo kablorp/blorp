@@ -884,7 +884,9 @@ inspection. The self-hosted component gate keeps
 its C and executables in `blorp_2/build/self-hosted-tests/`. `BLORP_CC` selects a C
 compiler executable (default `clang`).
 `make -C blorp_2 test-compiler test-components` runs the active component
-gate: Blorp 2 compiles the explicit `TARGET_COMPONENT_SOURCES` in the Makefile.
+gate: Blorp 2 compiles the explicit `COMPONENT_SOURCES` list in
+`test/e2e/self_hosted.brp`, the test driver that `make` builds with the
+compiler under test (`build/self-hosted-tests/driver/`).
 The selection currently covers text, Boolean calls, constant/declaration IDs,
 names, source identities and syntax publication, plus Lexer token traces,
 float boundaries, keyword roles, source origins, character literals, continuation,
@@ -910,7 +912,7 @@ checks do not replace native execution of those fixtures.
 
 Restore further suites by compiling their ordinary `tests: TestSuite` roots
 with `--test-suite`, then linking and running them through `test-target-components`
-before adding them to `TARGET_COMPONENT_SOURCES`. Preserve embedded source and
+before adding them to `COMPONENT_SOURCES`. Preserve embedded source and
 assertions when migrating test implementation syntax. An empty suite is not
 restored coverage. Shared input helpers currently block many omitted suites;
 after fixing a helper, re-probe its dependents because compilation reports only
@@ -925,16 +927,30 @@ native e2e cases are DEFERRED. Their sources stay intact for bounded incremental
 no legacy host or replacement test framework runs them.
 
 `test-components BLORP2_COMPILER=PATH` uses an already-built compiler without a
-fallback. To run just the target selection, use:
+fallback. To run the whole selection without the deferral report, or just one
+suite, use:
 
 ```sh
 make -C blorp_2 test-target-components BLORP2_COMPILER=PATH
+make -C blorp_2 test-target-components BLORP2_COMPILER=PATH \
+  TARGET_COMPONENT_SOURCES=blorp_2/test/unit/test_utils/test_text.brp
 ```
 
-This target does not build or use the legacy host. Compilation, native linking,
-failed callbacks and strict leak failures all fail the target; an empty source
-selection is an error. Active coverage is only this explicit selection; deferred
-coverage receives no PASS credit.
+`TARGET_COMPONENT_SOURCES` is empty by default, which runs the driver's own list;
+set, it runs exactly those paths, grouped by directory like the list. These
+targets do not build or use the legacy host. A missing source, a compile or
+link failure, a failed callback, a crash, a strict leak failure and a program
+that runs past ten minutes each fail the target. Every group runs even when an
+earlier one failed, and each program's output prints when it ends. The group's
+C, binary and captured output stay in `build/self-hosted-tests/` for
+inspection until the next run of that group. Active coverage is only the
+selection; deferred coverage receives no PASS credit. `test-components` ends with
+one line per top directory (`unit`, `runtime`, `test_grammar`, `e2e`) naming how
+many of its `test_*.brp` files the selection does not run:
+
+```text
+DEFERRED: <directory>: <deferred> of <total> test_*.brp files are not run
+```
 
 The explicit compile-only test entry is:
 
@@ -984,17 +1000,19 @@ working directories under strict accounting (`test/e2e/self_hosted_system.brp`).
 The e2e runs compare the program's output with `pwd -P`, not with the call under
 test. The matching contract, lowering, specialization, ownership, verification
 and emission suites, and the `fs.write_text` lowering, specialization,
-ownership and verification suites, are ordinary `TARGET_COMPONENT_SOURCES`.
+ownership and verification suites, are in `COMPONENT_SOURCES`.
 Rejection of invalid UTF-8 in String literals has no test: no library
 boundary builds a String from invalid bytes (`fs.read_text` rejects them and
 `string.slice` refuses to cut inside a scalar), so the lexer's check can no
 longer be reached and is a candidate for removal.
 
 The same driver runs the process-runtime lifecycle tests. Make resolves
-`BLORP2_COMPILER` and `BLORP_CC` to explicit executable paths, supplies a private
-temporary directory and removes it on completion. All test assertions are Blorp
-TestSuite callbacks; its ordinary `main(args)` exists only to receive those three
-paths. No legacy compiler, alternate fixture main or replacement test framework
+`BLORP2_COMPILER` and `BLORP_CC` to explicit executable paths and passes the
+physical `TMPDIR` (or `/tmp`); the driver makes a private `blorp2-test.*` work
+directory in it with `fs.with_temporary_directory`, which removes it on
+completion (a signal can still leave one behind). All test assertions are Blorp
+TestSuite callbacks; its ordinary `main(args)` only selects a mode and receives
+those paths. No legacy compiler, alternate fixture main or replacement test framework
 is involved. Remaining cases in the older driver need additional APIs and remain
 **DEFERRED**, including full native resource qualification.
 
