@@ -321,7 +321,7 @@ pass 'test-e2e runs the e2e mode with absolute tools and the symlink-resolved te
 
 printf 'compiler:strict\n--library-root blorp_2/standard_library blorp_2/test/e2e/self_hosted.brp blorp_2/build/self-hosted-tests/driver/driver.c\n' >"$scratch/expected"
 cmp -s "$TEST_COMPILER_ARGS" "$scratch/expected" || fail 'the driver was not compiled strictly from the driver entry'
-printf '%s\0' -std=c11 -Wall -Wextra -Werror -pedantic -O0 -fsanitize=address,undefined -fno-sanitize-recover=all \
+printf '%s\0' -std=c11 -Wall -Wextra -Werror -pedantic -O0 -fsanitize=undefined -fno-sanitize-recover=all \
 	-DBLORP_MEMORY_DIAGNOSTICS=1 blorp_2/build/self-hosted-tests/driver/driver.c -o blorp_2/build/self-hosted-tests/driver/driver \
 	-lm -lpthread >"$scratch/expected"
 cmp -s "$TEST_CC_ARGS" "$scratch/expected" || fail 'driver link flags or operand argv'

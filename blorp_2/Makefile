@@ -74,13 +74,20 @@ test-components: test-target-components
 # their own real mains. It receives all configuration explicitly from Make, and
 # is built by the compiler under test, so a compiler defect cannot hide behind
 # a driver built by another one.
+# It is built without AddressSanitizer, on every platform, for now; a follow-up
+# will try starting children with posix_spawn, which may let ASan return.
+# Observed on macOS: in any long e2e run with an ASan driver, one forked child
+# was killed by SIGKILL before exec ("child terminated by signal") at an
+# arbitrary case; `log show` named it "[driver: killed] exiting with signal 9"
+# (system log, not retained).
+# The same runs pass without ASan. UBSan and the strict leak check still apply.
 build-test-driver:
 	@set -eu; $(RESOLVE_TEST_TOOLS); \
 		mkdir -p "$(TEST_DRIVER_DIRECTORY)"; rm -f "$(TEST_DRIVER)"; \
 		BLORP_LEAK_CHECK=strict "$$compiler_path" --library-root blorp_2/standard_library \
 			blorp_2/test/e2e/self_hosted.brp "$(TEST_DRIVER).c"; \
 		"$$cc_path" -std=c11 -Wall -Wextra -Werror -pedantic -O0 \
-			-fsanitize=address,undefined -fno-sanitize-recover=all \
+			-fsanitize=undefined -fno-sanitize-recover=all \
 			-DBLORP_MEMORY_DIAGNOSTICS=1 "$(TEST_DRIVER).c" -o "$(TEST_DRIVER)" $(TEST_COMPILER_LIBRARIES)
 
 # One program per phase directory, built and run under strict leak checking in
