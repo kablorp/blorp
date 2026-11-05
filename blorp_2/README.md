@@ -3030,8 +3030,11 @@ func load_settings(path: String) -> Result[String, IOError]:
   creates nothing; a loop is `OtherOs`. A replaced file keeps its mode and,
   where permitted, its owner and group, or its group alone; a new file gets
   0666 narrowed by the umask. A read-only file is `PermissionDenied`, though
-  `rename` alone would replace it, and a directory or `dir/` is
-  `IsADirectory`. Limits:
+  `rename` alone would replace it, and a directory is `IsADirectory`. A path
+  ending in `/` names a directory, which is never written: it is `IsADirectory`
+  when it names one or a link to one, `NotADirectory` when it names a file, and
+  `NotFound` when nothing is there; any other failure to look it up is
+  reported as for any path. Limits:
   - a hard link to the old file keeps the old contents;
   - extended attributes and ACLs are not copied;
   - a link re-pointed between resolving it and the rename is not detected;

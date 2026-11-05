@@ -853,23 +853,16 @@ static int case_file_too_large(const char *root) {
     return 0;
 }
 
-/* Failures found from the path alone, before any system call. */
+/* Failures found from the path alone, before any system call: the empty path
+ * and an embedded NUL. */
 static int case_path_kinds(const char *root) {
-    char directory[PATH_BYTES], folder[PATH_BYTES], slashed[PATH_BYTES];
+    char directory[PATH_BYTES];
     case_directory(directory, root, "path_kinds");
-    join(folder, directory, "folder");
-    assert(mkdir(folder, 0755) == 0);
     const int free_before = lowest_free_descriptor();
 
     begin();
     assert(write_text_to("", "text") == 1);
     assert(event_count == 0);
-
-    join(slashed, folder, "");
-    begin();
-    assert(write_text_to(slashed, "text") == 5);
-    assert(event_count == 0);
-    assert(count_entries(folder) == 0);
 
     char bytes[PATH_BYTES];
     char target[PATH_BYTES];
@@ -880,8 +873,59 @@ static int case_path_kinds(const char *root) {
     begin();
     assert(write_bytes_path(bytes, prefix + 7, "text") == 12);
     assert(event_count == 0);
-    assert(count_entries(directory) == 1);
+    assert(count_entries(directory) == 0);
     expect_clean(free_before, directory);
+    return 0;
+}
+
+/* A path ending in a slash names a directory, which is never written. One lstat
+ * with the slash kept says what is there, and nothing is opened or created. */
+static int case_slashed_paths(const char *root) {
+    char directory[PATH_BYTES], folder[PATH_BYTES], file[PATH_BYTES], link[PATH_BYTES];
+    case_directory(directory, root, "slashed_paths");
+    join(folder, directory, "folder");
+    assert(mkdir(folder, 0755) == 0);
+    join(file, directory, "file.txt");
+    make_file(file, "file", 0644);
+    join(link, directory, "link_to_folder");
+    assert(symlink("folder", link) == 0);
+    join(link, directory, "link_to_file");
+    assert(symlink("file.txt", link) == 0);
+    join(link, directory, "dangling");
+    assert(symlink("nowhere", link) == 0);
+    join(link, directory, "loop");
+    assert(symlink("loop", link) == 0);
+    const int free_before = lowest_free_descriptor();
+    const int directory_entries = count_entries(directory);
+    const int folder_entries = count_entries(folder);
+    static const struct { const char *name; int64_t code; } expected[] = {
+        {"folder/", 5}, {"folder//", 5}, {"link_to_folder/", 5},
+        {"file.txt/", 4}, {"link_to_file/", 4},
+        {"missing/", 1}, {"dangling/", 1},
+        {"loop/", -(int64_t)ELOOP},
+    };
+    for (size_t index = 0; index < sizeof expected / sizeof expected[0]; index++) {
+        char path[PATH_BYTES];
+        join(path, directory, expected[index].name);
+        begin();
+        assert(write_text_to(path, "text") == expected[index].code);
+        assert(count_events(LSTAT_CALL, 0) == 1);
+        assert(count_events(OPEN_CALL, 0) == 0);
+        assert(count_entries(directory) == directory_entries);
+        assert(count_entries(folder) == folder_entries);
+        expect_clean(free_before, directory);
+    }
+
+    char path[PATH_BYTES];
+    join(path, directory, "folder/");
+    begin();
+    inject(LSTAT_CALL, 0, 0, 1, EINTR);
+    assert(write_text_to(path, "text") == 5);
+    assert(count_events(LSTAT_CALL, 0) == 2);
+    assert(count_events(OPEN_CALL, 0) == 0);
+    assert(count_entries(directory) == directory_entries);
+    expect_clean(free_before, directory);
+    expect_contents(file, "file");
     return 0;
 }
 
@@ -922,11 +966,13 @@ static int case_entry_kinds(const char *root) {
 
 /* A read-only file is refused although rename alone would replace it, and a
  * writable file in a directory this process cannot write is refused because
- * the new file is created beside it. Root may write both. */
+ * the new file is created beside it. A slashed path through a directory it
+ * cannot search is refused too. Root may write both. */
 static int case_permission_kinds(const char *root) {
     /* The suite leaves this case out as root. */
     assert(geteuid() != 0);
     char directory[PATH_BYTES], read_only[PATH_BYTES], locked[PATH_BYTES], inside[PATH_BYTES], created[PATH_BYTES];
+    char unsearchable[PATH_BYTES], inner[PATH_BYTES];
     case_directory(directory, root, "permission_kinds");
     join(read_only, directory, "read_only.txt");
     make_file(read_only, "kept", 0444);
@@ -955,6 +1001,21 @@ static int case_permission_kinds(const char *root) {
     expect_clean(free_before, locked);
     assert(chmod(locked, 0755) == 0);
     assert(count_entries(locked) == 1);
+
+    /* A slashed path through a directory this process may not search. */
+    join(unsearchable, directory, "unsearchable");
+    assert(mkdir(unsearchable, 0755) == 0);
+    join(inner, unsearchable, "inner/");
+    assert(mkdir(inner, 0755) == 0);
+    assert(chmod(unsearchable, 0600) == 0);
+    begin();
+    assert(write_text_to(inner, "denied") == 2);
+    assert(count_events(LSTAT_CALL, 0) == 1);
+    assert(count_events(OPEN_CALL, 0) == 0);
+    expect_clean(free_before, directory);
+    assert(chmod(unsearchable, 0755) == 0);
+    assert(count_entries(unsearchable) == 1);
+    assert(count_entries(inner) == 0);
     return 0;
 }
 
@@ -1040,6 +1101,7 @@ static int child_case(int argc, char **argv) {
     if (strcmp(name, "owner") == 0) return case_owner(directory);
     if (strcmp(name, "file_too_large") == 0) return case_file_too_large(directory);
     if (strcmp(name, "path_kinds") == 0) return case_path_kinds(directory);
+    if (strcmp(name, "slashed_paths") == 0) return case_slashed_paths(directory);
     if (strcmp(name, "entry_kinds") == 0) return case_entry_kinds(directory);
     if (strcmp(name, "permission_kinds") == 0) return case_permission_kinds(directory);
     if (strcmp(name, "symlinks") == 0) return case_symlinks(directory);
