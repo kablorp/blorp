@@ -319,6 +319,16 @@ printf 'e2e|%s|%s|%s\n' "$expected_compiler" "$expected_cc" "$real_parent" >"$sc
 cmp -s "$TEST_DRIVER_ARGS" "$scratch/expected" || fail 'e2e arguments are not the absolute tools and the physical temporary parent'
 pass 'test-e2e runs the e2e mode with absolute tools and the symlink-resolved temporary parent'
 
+reset_driver_logs
+if ! run_test_target test-e2e INSTRUCTION_CHECK=on; then cat "$scratch/make.stderr" >&2; fail 'test-e2e with INSTRUCTION_CHECK must run the driver'; fi
+printf 'e2e|%s|%s|%s|--check-instructions\n' "$expected_compiler" "$expected_cc" "$real_parent" >"$scratch/expected"
+cmp -s "$TEST_DRIVER_ARGS" "$scratch/expected" || fail 'INSTRUCTION_CHECK did not pass --check-instructions to the e2e mode'
+reset_driver_logs
+if run_test_target test-e2e INSTRUCTION_CHECK=off; then fail 'INSTRUCTION_CHECK=off must not run e2e'; fi
+grep -Fq 'INSTRUCTION_CHECK must be empty or on, not off' "$scratch/make.stderr" || fail 'INSTRUCTION_CHECK=off was not rejected with its reason'
+[ ! -s "$TEST_DRIVER_ARGS" ] || fail 'INSTRUCTION_CHECK=off still ran the driver'
+pass 'INSTRUCTION_CHECK passes the instruction flag only for on, and rejects other values'
+
 printf 'compiler:strict\n--library-root blorp_2/standard_library blorp_2/test/e2e/self_hosted.brp blorp_2/build/self-hosted-tests/driver/driver.c\n' >"$scratch/expected"
 cmp -s "$TEST_COMPILER_ARGS" "$scratch/expected" || fail 'the driver was not compiled strictly from the driver entry'
 printf '%s\0' -std=c11 -Wall -Wextra -Werror -pedantic -O0 -fsanitize=undefined -fno-sanitize-recover=all \

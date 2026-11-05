@@ -1,4 +1,5 @@
 import:
+    ../unit/text_search: find_text
     bool: not, and
     option: Option methods
     string: String methods
@@ -11,7 +12,13 @@ private ASCII_ZERO: Int = 48
 private ASCII_AFTER_NINE: Int = 58
 
 
-pure func verify_accounting(report: String, require_positive: Bool) -> Result[Void, String]:
+private pure func is_digit(byte: Int) -> Bool:
+    (byte < ASCII_ZERO).not().and(byte < ASCII_AFTER_NINE)
+
+
+-- The allocation count of one complete balanced strict report: every
+-- allocation released, nothing leaked, nothing else on stderr.
+pure func report_allocations(report: String) -> Result[Int, String]:
     prefix: Void ?= if report.starts_with(ACCOUNTING_PREFIX):
         Ok(void)
     else:
@@ -21,7 +28,7 @@ pure func verify_accounting(report: String, require_positive: Bool) -> Result[Vo
     while reading:
         match report.byte_at(end):
             Some(byte):
-                if (byte < ASCII_ZERO).not().and(byte < ASCII_AFTER_NINE):
+                if is_digit(byte):
                     end = end + 1
                 else:
                     reading = False
@@ -29,12 +36,72 @@ pure func verify_accounting(report: String, require_positive: Bool) -> Result[Vo
                 reading = False
     digits: String ?= report.slice(ACCOUNTING_PREFIX.length(), end).to_result("invalid allocation counter")
     count: Int ?= digits.parse_int().to_result("invalid allocation counter")
-    positive: Void ?= if require_positive.and(count.equals(0)):
-        Err("expected positive allocation accounting")
-    else:
-        Ok(void)
     expected = (ACCOUNTING_PREFIX + count.to_string() + " allocs, ") + count.to_string() + " releases, 0 leaked, 0 bytes\n"
     if report.equals(expected):
-        Ok(void)
+        Ok(count)
     else:
         Err("expected one complete balanced allocation report with no leaks or extra stderr")
+
+
+private NOT_POSITIVE: String = "expected positive allocation accounting"
+
+
+pure func verify_accounting(report: String, require_positive: Bool) -> Result[Void, String]:
+    count: Int ?= report_allocations(report)
+    if require_positive.and(count.equals(0)):
+        Err(NOT_POSITIVE)
+    else:
+        Ok(void)
+
+
+-- The count of a compile's report, which always allocates.
+pure func positive_allocations(report: String) -> Result[Int, String]:
+    count: Int ?= report_allocations(report)
+    if count.equals(0):
+        Err(NOT_POSITIVE)
+    else:
+        Ok(count)
+
+
+-- macOS `/usr/bin/time -l` prints its retired-instruction counter on one line:
+-- "<count>  instructions retired".
+private INSTRUCTIONS_MARKER: String = "instructions retired"
+private ASCII_SPACE: Int = 32
+
+
+-- Where the run of bytes that `keeps` accepts, ending just before `end`, begins.
+private pure func start_of_run(text: String, end: Int, keeps: pure (Int) -> Bool) -> Int:
+    var start = end
+    while start > 0:
+        match text.byte_at(start - 1):
+            Some(byte):
+                if keeps(byte):
+                    start = start - 1
+                else:
+                    break
+            None:
+                break
+    start
+
+
+pure func parse_instructions(timing: String) -> Result[Int, String]:
+    marker: Int ?= find_text(timing, INSTRUCTIONS_MARKER, 0).to_result("missing the instructions retired line of /usr/bin/time -l")
+    single: Void ?= if find_text(timing, INSTRUCTIONS_MARKER, marker + 1).is_some():
+        Err("expected exactly one instructions retired line from /usr/bin/time -l")
+    else:
+        Ok(void)
+    spaces_start = start_of_run(timing, marker, pure func(byte: Int): byte.equals(ASCII_SPACE))
+    digits: String ?= timing.slice(start_of_run(timing, spaces_start, is_digit), spaces_start).to_result("invalid instruction counter")
+    count: Int ?= digits.parse_int().to_result("the instruction counter is not a number")
+    if count > 0:
+        Ok(count)
+    else:
+        Err("expected a positive instruction counter")
+
+
+-- A measured compile cost within its ceiling; a failure names both numbers.
+pure func within_ceiling(label: String, measured: Int, ceiling: Int) -> Result[Void, String]:
+    if measured > ceiling:
+        Err(label + " " + measured.to_string() + " exceed the ceiling " + ceiling.to_string())
+    else:
+        Ok(void)

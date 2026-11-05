@@ -1,9 +1,9 @@
 import:
     process: run_to_files
-    fs: describe, read_text, write_text
+    fs: EntryKind, describe, entry_kind, read_text, write_text
     io: print_error
     test: TestSuite
-    ./self_hosted_reports: verify_accounting
+    ./self_hosted_reports: parse_instructions, positive_allocations, verify_accounting, within_ceiling
     bool: not, and
     result: Result methods
     int: Int methods
@@ -13,6 +13,7 @@ import:
 ENVIRONMENT_TOOL: String = "/usr/bin/env"
 private SHELL: String = "/bin/sh"
 LIBRARY_ROOT: String = "blorp_2/standard_library"
+FIXTURES: String = "blorp_2/test/e2e/fixtures/"
 -- Children that must not inherit a leak-check or statistics setting run with
 -- these removed (through ENVIRONMENT_TOOL), so their output is the same
 -- wherever the driver runs.
@@ -20,6 +21,9 @@ WITHOUT_DIAGNOSTICS: List[String] = ["-u", "BLORP_LEAK_CHECK", "-u", "BLORP_MEMO
 -- Compilation includes C sanitizer linking; native fixtures should finish quickly.
 COMPILATION_TIMEOUT_MS: Int = 600000
 private NATIVE_TIMEOUT_MS: Int = 10000
+-- macOS reports a child's retired instructions with `-l`, into the `-o` file so
+-- that the compiler's own stderr stays its strict allocation report.
+private PROCESS_TIMER: String = "/usr/bin/time"
 private PRESERVED_OUTPUT: String = "preserve this rejected output"
 private FS_PREPARE_SCRIPT: String = "blorp_2/test/e2e/fixtures/fs/prepare.sh"
 private FS_WRITE_PREPARE_SCRIPT: String = "blorp_2/test/e2e/fixtures/fs/prepare_write.sh"
@@ -236,7 +240,7 @@ private record Example {
 
 
 -- A fixture the compiler must reject with exactly this diagnostic text.
-private record Rejection {
+record Rejection {
     name: String,
     source: String,
     diagnostic: String
@@ -260,22 +264,34 @@ func command(arguments: List[String], prefix: String, expected_status: Int, time
             Err(error): Err(error)
 
 
--- `inputs` are the compiler arguments between the library root and the output.
-private func compile_fixture(compiler: String, inputs: List[String], prefix: String) -> Result[Void, String]:
+-- Returns the compile's allocations, from its strict report. With
+-- `check_instructions` the compiler runs under the process timer, which writes
+-- what it cost to `prefix.instructions`. `inputs` are the compiler arguments
+-- between the library root and the output.
+private func compile_timed(check_instructions: Bool, compiler: String, inputs: List[String], prefix: String) -> Result[Int, String]:
+    timer = if check_instructions:
+        [PROCESS_TIMER, "-l", "-o", prefix + ".instructions"]
+    else:
+        []
     _ ?= command(
-        ["-u", "BLORP_MEMORY_STATS", "BLORP_LEAK_CHECK=strict", compiler,
-         "--library-root", LIBRARY_ROOT].concat(inputs).concat([prefix + ".c"]),
+        ["-u", "BLORP_MEMORY_STATS", "BLORP_LEAK_CHECK=strict"].concat(timer).concat([compiler,
+         "--library-root", LIBRARY_ROOT]).concat(inputs).concat([prefix + ".c"]),
         prefix + ".compile", 0, COMPILATION_TIMEOUT_MS,
     )
     output: String ?= read_text(prefix + ".compile.stdout").map_err(describe)
     _ ?= expect(output, "", "compiler stdout")
     report: String ?= read_text(prefix + ".compile.stderr").map_err(describe)
-    _ ?= verify_accounting(report, True)
+    allocations: Int ?= positive_allocations(report)
     generated: String ?= read_text(prefix + ".c").map_err(describe)
     if generated.length().equals(0):
         Err("successful compilation emitted empty C")
     else:
-        Ok(void)
+        Ok(allocations)
+
+
+private func compile_fixture(compiler: String, inputs: List[String], prefix: String) -> Result[Void, String]:
+    _ ?= compile_timed(False, compiler, inputs, prefix)
+    Ok(void)
 
 
 private func link_fixture(c_compiler: String, prefix: String, mode: NativeMode) -> Result[Void, String]:
@@ -369,12 +385,18 @@ private func run_all(prefix: String, runs: List[NativeRun]) -> Result[Void, Stri
     outcome
 
 
+-- Links the compiled C without and with diagnostics, then runs both binaries
+-- as every entry of `runs`, in order.
+private func link_and_run(c_compiler: String, prefix: String, runs: List[NativeRun]) -> Result[Void, String]:
+    _ ?= link_fixture(c_compiler, prefix, NormalNative)
+    _ ?= link_fixture(c_compiler, prefix, StrictNative)
+    run_all(prefix, runs)
+
+
 private func verify_example(compiler: String, c_compiler: String, work_directory: String, example: Example) -> Result[Void, String]:
     prefix = work_directory + "/" + example.name
     _ ?= compile_fixture(compiler, [example.source], prefix)
-    _ ?= link_fixture(c_compiler, prefix, NormalNative)
-    _ ?= link_fixture(c_compiler, prefix, StrictNative)
-    run_fixture(prefix, example_run(example))
+    link_and_run(c_compiler, prefix, [example_run(example)])
 
 
 -- One `--test-suite` program: `example.source` is the first root, which owns
@@ -382,44 +404,111 @@ private func verify_example(compiler: String, c_compiler: String, work_directory
 private func verify_suites(compiler: String, c_compiler: String, work_directory: String, example: Example, grouped: List[String]) -> Result[Void, String]:
     prefix = work_directory + "/" + example.name
     _ ?= compile_fixture(compiler, ["--test-suite", example.source].concat(grouped), prefix)
-    _ ?= link_fixture(c_compiler, prefix, NormalNative)
-    _ ?= link_fixture(c_compiler, prefix, StrictNative)
-    run_fixture(prefix, example_run(example))
+    link_and_run(c_compiler, prefix, [example_run(example)])
 
 
 -- Compiles `source` once and runs it as every entry of `runs`, in order.
 func verify_runs(compiler: String, c_compiler: String, work_directory: String, name: String, source: String, runs: List[NativeRun]) -> Result[Void, String]:
     prefix = work_directory + "/" + name
     _ ?= compile_fixture(compiler, [source], prefix)
-    _ ?= link_fixture(c_compiler, prefix, NormalNative)
-    _ ?= link_fixture(c_compiler, prefix, StrictNative)
-    run_all(prefix, runs)
+    link_and_run(c_compiler, prefix, runs)
 
 
-private func rejected_fixture(compiler: String, work_directory: String) -> Result[Void, String]:
-    source = work_directory + "/rejected.brp"
-    output = work_directory + "/rejected.c"
-    _ ?= write_text(source, "func start() -> Int:\n    0\n").map_err(describe)
+-- What one compilation may cost the compiler under test. The allocations come
+-- from its strict report and are always held; the retired instructions come from
+-- the process timer and are held only when the run asks for them.
+record CompileCeiling {
+    allocations: Int,
+    instructions: Int
+}
+
+
+-- A program that compiles once, within `ceiling`, and then runs as every entry
+-- of `runs`, in order.
+record Program {
+    name: String,
+    source: String,
+    ceiling: CompileCeiling,
+    runs: List[NativeRun]
+}
+
+
+private func instructions_within(prefix: String, ceiling: CompileCeiling) -> Result[Void, String]:
+    timing: String ?= read_text(prefix + ".instructions").map_err(describe)
+    instructions: Int ?= parse_instructions(timing)
+    within_ceiling("compile retired instructions", instructions, ceiling.instructions)
+
+
+private func compile_within(compiler: String, check_instructions: Bool, inputs: List[String], prefix: String, ceiling: CompileCeiling) -> Result[Void, String]:
+    allocations: Int ?= compile_timed(check_instructions, compiler, inputs, prefix)
+    _ ?= within_ceiling("compile allocations", allocations, ceiling.allocations)
+    if check_instructions:
+        instructions_within(prefix, ceiling)
+    else:
+        Ok(void)
+
+
+func verify_program(compiler: String, c_compiler: String, work_directory: String, check_instructions: Bool, program: Program) -> Result[Void, String]:
+    prefix = work_directory + "/" + program.name
+    _ ?= compile_within(compiler, check_instructions, [program.source], prefix, program.ceiling)
+    link_and_run(c_compiler, prefix, program.runs)
+
+
+-- The ways to declare a program's runs. `once` is a program with one run and
+-- no arguments; `with_arguments` is one of several runs, and `label` names its
+-- captures. `exits_with` prints nothing; `prints` exits 0.
+pure func once(status: Int, stdout: String, allocations: Int) -> List[NativeRun]:
+    [{ label = None, arguments = [], directory = None, status = status, stdout = stdout, allocations = allocations }]
+
+
+pure func with_arguments(label: String, arguments: List[String], status: Int, stdout: String, allocations: Int) -> NativeRun:
+    { label = Some(label), arguments = arguments, directory = None, status = status, stdout = stdout, allocations = allocations }
+
+
+-- `fixture` is a path under FIXTURES, without the extension.
+pure func fixture_program(name: String, fixture: String, ceiling: CompileCeiling, runs: List[NativeRun]) -> Program:
+    { name = name, source = FIXTURES + fixture + ".brp", ceiling = ceiling, runs = runs }
+
+
+pure func exits_with(name: String, fixture: String, ceiling: CompileCeiling, status: Int, allocations: Int) -> Program:
+    fixture_program(name, fixture, ceiling, once(status, "", allocations))
+
+
+pure func prints(name: String, fixture: String, ceiling: CompileCeiling, stdout: String, allocations: Int) -> Program:
+    fixture_program(name, fixture, ceiling, once(0, stdout, allocations))
+
+
+-- A rejected compilation publishes nothing: it creates no C file where there
+-- was none, and leaves an existing one as it was. `diagnostic` follows the
+-- source path in the compiler's message.
+func verify_unpublished_rejection(compiler: String, work_directory: String, name: String, text: String, diagnostic: String) -> Result[Void, String]:
+    prefix = work_directory + "/" + name
+    source = prefix + ".brp"
+    output = prefix + ".c"
+    _ ?= write_text(source, text).map_err(describe)
+    _ ?= expect_failure(compiler, compile_arguments(source, output), prefix, source + diagnostic)
+    created: Option[EntryKind] ?= entry_kind(output).map_err(describe)
+    unpublished: Void ?= match created:
+        None: Ok(void)
+        Some(_): Err("a rejected compilation created " + output)
     _ ?= write_text(output, PRESERVED_OUTPUT).map_err(describe)
-    _ ?= command(
-        WITHOUT_DIAGNOSTICS.concat([compiler,
-         "--library-root", LIBRARY_ROOT, source, output]),
-        work_directory + "/rejected.compile", 1, COMPILATION_TIMEOUT_MS,
-    )
-    stdout: String ?= read_text(work_directory + "/rejected.compile.stdout").map_err(describe)
-    _ ?= expect(stdout, "", "rejected compiler stdout")
-    stderr: String ?= read_text(work_directory + "/rejected.compile.stderr").map_err(describe)
-    diagnostic = source + ":3:1: error: expected a main function\nhelp: declare func main() -> Int: as the entrypoint\n"
-    _ ?= expect(stderr, diagnostic, "rejected compiler diagnostic")
+    _ ?= expect_failure(compiler, compile_arguments(source, output), prefix + ".existing", source + diagnostic)
     unchanged: String ?= read_text(output).map_err(describe)
     expect(unchanged, PRESERVED_OUTPUT, "rejected output sentinel")
 
 
--- The compiler exits 1 with nothing on stdout and exactly this stderr.
-private func expect_failure(compiler: String, source: String, output: String, prefix: String, expected_stderr: String) -> Result[Void, String]:
+private func rejected_fixture(compiler: String, work_directory: String) -> Result[Void, String]:
+    verify_unpublished_rejection(
+        compiler, work_directory, "rejected", "func start() -> Int:\n    0\n",
+        ":3:1: error: expected a main function\nhelp: declare func main() -> Int: as the entrypoint\n",
+    )
+
+
+-- The compiler, given exactly `arguments`, exits 1 with nothing on stdout and
+-- exactly this stderr.
+func expect_failure(compiler: String, arguments: List[String], prefix: String, expected_stderr: String) -> Result[Void, String]:
     _ ?= command(
-        WITHOUT_DIAGNOSTICS.concat([compiler,
-         "--library-root", LIBRARY_ROOT, source, output]),
+        WITHOUT_DIAGNOSTICS.concat([compiler]).concat(arguments),
         prefix + ".compile", 1, COMPILATION_TIMEOUT_MS,
     )
     stdout: String ?= read_text(prefix + ".compile.stdout").map_err(describe)
@@ -428,12 +517,17 @@ private func expect_failure(compiler: String, source: String, output: String, pr
     expect(stderr, expected_stderr, "failed compiler diagnostic")
 
 
+-- The arguments of an ordinary compilation of `source` to `output`.
+private pure func compile_arguments(source: String, output: String) -> List[String]:
+    ["--library-root", LIBRARY_ROOT, source, output]
+
+
 -- fs words the failure, naming the output path the compiler was given.
 private func directory_output_fixture(compiler: String, work_directory: String) -> Result[Void, String]:
     source = work_directory + "/directory_output.brp"
     _ ?= write_text(source, "func main() -> Int:\n    0\n").map_err(describe)
     expect_failure(
-        compiler, source, work_directory, work_directory + "/directory_output",
+        compiler, compile_arguments(source, work_directory), work_directory + "/directory_output",
         "blorp_2: error: could not write " + work_directory + ": is a directory\nhelp: provide a writable output path\n",
     )
 
@@ -443,22 +537,14 @@ private func missing_module_fixture(compiler: String, work_directory: String) ->
     source = work_directory + "/missing_module.brp"
     _ ?= write_text(source, "import:\n    ./missing: thing\nfunc main() -> Int:\n    0\n").map_err(describe)
     expect_failure(
-        compiler, source, work_directory + "/missing_module.c", work_directory + "/missing_module",
+        compiler, compile_arguments(source, work_directory + "/missing_module.c"), work_directory + "/missing_module",
         source + ":2:5: error: could not read module " + work_directory + "/missing.brp: no such file\nhelp: check the import path and provide a readable .brp file under its source root\n",
     )
 
 
-private func verify_rejection(compiler: String, work_directory: String, rejection: Rejection) -> Result[Void, String]:
+func verify_rejection(compiler: String, work_directory: String, rejection: Rejection) -> Result[Void, String]:
     prefix = work_directory + "/" + rejection.name
-    _ ?= command(
-        WITHOUT_DIAGNOSTICS.concat([compiler,
-         "--library-root", LIBRARY_ROOT, rejection.source, prefix + ".c"]),
-        prefix + ".compile", 1, COMPILATION_TIMEOUT_MS,
-    )
-    stdout: String ?= read_text(prefix + ".compile.stdout").map_err(describe)
-    _ ?= expect(stdout, "", "rejected compiler stdout")
-    stderr: String ?= read_text(prefix + ".compile.stderr").map_err(describe)
-    expect(stderr, rejection.source + rejection.diagnostic, "rejected compiler diagnostic")
+    expect_failure(compiler, compile_arguments(rejection.source, prefix + ".c"), prefix, rejection.source + rejection.diagnostic)
 
 
 private pure func generic_opaque(name: String, diagnostic: String) -> Rejection:
@@ -534,7 +620,6 @@ private func verify_on_rebuilt_tree(compiler: String, c_compiler: String, work_d
 
 
 func suite(compiler: String, c_compiler: String, work_directory: String) -> TestSuite:
-    zero: Example = { name = "zero", source = "blorp_2/test/e2e/fixtures/return/zero.brp", status = 0, stdout = "", allocations = 0, arguments = [] }
     nonzero: Example = { name = "nonzero", source = "blorp_2/test/e2e/fixtures/return/23.brp", status = 23, stdout = "", allocations = 0, arguments = [] }
     text: Example = { name = "text", source = "blorp_2/test/e2e/fixtures/effects/hello.brp", status = 0, stdout = "Hello, World!\n", allocations = 1, arguments = [] }
     discard: Example = { name = "discard", source = "blorp_2/test/e2e/fixtures/result_propagation/discard.brp", status = 0, stdout = "once\nshared-value\n7\nerror-once\nkept-error\n", allocations = 12, arguments = [] }
@@ -664,7 +749,6 @@ func suite(compiler: String, c_compiler: String, work_directory: String) -> Test
     {
         description = "Self-hosted native e2e",
         tests = [
-            ("zero exit and empty output", func(): reported(verify_example(compiler, c_compiler, work_directory, zero))),
             ("nonzero native exit is preserved", func(): reported(verify_example(compiler, c_compiler, work_directory, nonzero))),
             ("managed text stdout and strict accounting", func(): reported(verify_example(compiler, c_compiler, work_directory, text))),
             ("discard propagation preserves effects aliases and failures", func(): reported(verify_example(compiler, c_compiler, work_directory, discard))),
@@ -765,7 +849,7 @@ func suite(compiler: String, c_compiler: String, work_directory: String) -> Test
             ("a record update projects before it rebuilds, so a dying base grows its field in place", func(): reported(verify_example(compiler, c_compiler, work_directory, record_accumulator))),
             ("grouped suites run in order and a failed suite fails the program", func(): reported(verify_suites(compiler, c_compiler, work_directory, grouped_suites, ["blorp_2/test/e2e/fixtures/test_entry/failing.brp"]))),
             ("the first suite alone passes", func(): reported(verify_suites(compiler, c_compiler, work_directory, single_suite, []))),
-            ("rejected compilation preserves an existing output", func(): reported(rejected_fixture(compiler, work_directory))),
+            ("rejected compilation creates no output and preserves an existing one", func(): reported(rejected_fixture(compiler, work_directory))),
             ("a compile whose output path is a directory fails with 'is a directory'", func(): reported(directory_output_fixture(compiler, work_directory))),
             ("an import of a missing module fails with its resolved path and 'no such file'", func(): reported(missing_module_fixture(compiler, work_directory))),
             ("a program that calls only fs.read_text is valid C under -Werror", func(): reported(verify_example(compiler, c_compiler, work_directory, fs_native_read_text))),

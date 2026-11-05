@@ -877,6 +877,7 @@ outside this pilot's restricted grammar.
 make -C blorp_2 example          # Compile the example to C, build it, run it.
 make -C blorp_2 test             # Build B2; run components and first native e2e cases.
 make -C blorp_2 test-e2e         # Use the already-built diagnostic B2 compiler.
+make -C blorp_2 test INSTRUCTION_CHECK=on   # macOS: also hold ported compiles to their instruction ceilings.
 ```
 
 `example` keeps its generated C and executable in `blorp_2/build/` for
@@ -993,6 +994,14 @@ emitted C links into separate normal and strict-memory executables with C11,
 `-O0`, ASan and UBSan; both executions check exact exit/stdout/stderr. Successful
 compiler calls require positive balanced strict accounting. The rejected call
 checks the complete diagnostic and help text with accounting disabled.
+
+The calls, recursion, constants and Int programs (`test/e2e/self_hosted_calls.brp`)
+are the first ported group. Each is a `Program` in `test/e2e/self_hosted_harness.brp`:
+one compile within its `CompileCeiling`, then every listed run with its exact
+status, stdout and strict allocation count. The compile's allocations come from the
+compiler's strict report and are always held to the ceiling. A failure names
+the measured value and the ceiling. Each ceiling is its program's measured cost plus 15%
+(see the [ceiling record](../benchmarks/results/blorp_2_e2e_ceilings_2026-11-05.md)).
 
 The driver also runs the current-directory native checks: a C-fixture runtime
 suite (`test/runtime/system_suite.brp`) and the fixture mains, run from two
@@ -1126,7 +1135,7 @@ Building the compiler from the pinned seed, compiling the emitted C,
 and running the generated program happen outside the cost measurements.
 Allocation counts cover Blorp-managed ARC objects and require zero leaks.
 The `-O0` pilot runs once per fixture with strict allocation diagnostics enabled;
-in the default `required` mode, macOS `/usr/bin/time -l` collects instructions
+when `INSTRUCTION_CHECK` is set, macOS `/usr/bin/time -l` collects instructions
 for that same run. Instruction counts include allocation bookkeeping and reporting. They are development-test
 ceilings, and are not directly comparable to the historical minimum of three
 uninstrumented `-O2` runs in the binding increment record.
@@ -1142,10 +1151,13 @@ intentionally replaces legacy `process.run`'s inherited stdin and implicit
 30-second or `BLORP_PROCESS_TIMEOUT_MS` deadline. The enclosing TestSuite timeout
 is separate; output capture retains its existing default limit and environment override.
 
-The default instruction check requires macOS `/usr/bin/time -l` and its
-retired-instruction counter. Missing or malformed required measurements fail
-the test. CI explicitly selects `BLORP_2_INSTRUCTION_CHECK=disabled` because hosted
-runners may lack this counter; that mode retains strict allocation reports and caps.
+The instruction check is off unless `make` is given `INSTRUCTION_CHECK` (any
+value), which the driver receives as `--check-instructions`. It requires macOS
+`/usr/bin/time -l` and its retired-instruction counter; a missing or malformed
+counter fails the test. Hosted CI runners may lack the counter, so CI leaves it
+off and keeps the strict allocation reports and caps. The deferred legacy harness
+alone still reads `BLORP_2_INSTRUCTION_CHECK`, and the resource-policy modes of
+`BLORP_2_RESOURCE_POLICY` are not ported: a ceiling that fails is a failure.
 The first limits were established on arm64 macOS with Apple Clang 21. See the
 [cost record](https://github.com/kablorp/blorp/blob/1e07c4dce85e51cd7ad911142e9bc96a5e0d91c7/benchmarks/results/blorp_2_costs_2026-10-08.md) for baselines,
 commands, provenance, and measurement limits.

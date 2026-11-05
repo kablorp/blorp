@@ -14,6 +14,11 @@ TEST_COMPILER_LIBRARIES := -lm -lpthread
 # The component programs are listed in test/e2e/self_hosted.brp. Setting this
 # to source paths runs exactly those instead, for the narrow loop.
 TARGET_COMPONENT_SOURCES :=
+# Set to `on` on macOS (`make test INSTRUCTION_CHECK=on`) to also hold each
+# ported e2e compile to its retired-instruction ceiling, measured with
+# /usr/bin/time -l. Empty by default: only the allocation ceilings are held.
+# Any other value is an error, so `INSTRUCTION_CHECK=off` cannot enable it.
+INSTRUCTION_CHECK :=
 # Beside the component programs, whose root is BUILD_ROOT in
 # test/e2e/self_hosted_selection.brp. No test directory is named `driver`, so
 # no component program overwrites it.
@@ -110,4 +115,5 @@ link-test-compiler:
 test-e2e: build-test-driver
 	@set -eu; $(RESOLVE_TEST_TOOLS); \
 		temporary_parent=$$(cd "$${TMPDIR:-/tmp}" && pwd -P); \
-		BLORP_LEAK_CHECK=strict "$(TEST_DRIVER)" e2e "$$compiler_path" "$$cc_path" "$$temporary_parent"
+		BLORP_LEAK_CHECK=strict "$(TEST_DRIVER)" e2e "$$compiler_path" "$$cc_path" "$$temporary_parent" \
+			$(if $(INSTRUCTION_CHECK),$(if $(filter on,$(INSTRUCTION_CHECK)),--check-instructions,$(error INSTRUCTION_CHECK must be empty or on, not $(INSTRUCTION_CHECK))))
