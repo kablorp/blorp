@@ -127,6 +127,7 @@ TARGET_COMPONENT_SOURCES := \
 	blorp_2/test/unit/test_load/test_grouped_suites.brp \
 	blorp_2/test/unit/test_check/test_grouped_suites.brp \
 	blorp_2/test/unit/test_check/test_current_directory.brp \
+	blorp_2/test/unit/test_check/test_lookup_rejections.brp \
 	blorp_2/test/unit/test_emit/test_builtin_functions.brp \
 	blorp_2/test/unit/test_emit/test_current_directory.brp \
 	blorp_2/test/unit/test_lower/test_fs_write.brp \

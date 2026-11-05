@@ -410,7 +410,7 @@ private pure func capture_position(captures: List[CheckedCapture], binding: Scop
 private pure func register_capture(
 	lambdas: List[LambdaRow], owner: LambdaId, binding: ScopedBindingId, value_type: TypeUse,
 ) -> Result[CaptureRegistration, CheckError]:
-	row ?= lambdas.get(lambda_number(owner)).to_result(checker_invariant(value_type.span, InvalidInferenceWorklist))
+	row ?= lambdas.get(lambda_number(owner)).or_checker_invariant(value_type.span, InvalidInferenceWorklist)
 	match row:
 		CheckedLambdaRow(_): Err(checker_invariant(value_type.span, InvalidInferenceWorklist))
 		CollectingLambda(pending):
@@ -437,7 +437,7 @@ private pure func register_capture(
 
 
 private pure func lambda_captures(lambdas: List[LambdaRow], owner: LambdaId, span: Span) -> Result[List[CheckedCapture], CheckError]:
-	row ?= lambdas.get(lambda_number(owner)).to_result(checker_invariant(span, InvalidInferenceWorklist))
+	row ?= lambdas.get(lambda_number(owner)).or_checker_invariant(span, InvalidInferenceWorklist)
 	match row:
 		CollectingLambda(pending): Ok(pending.captures)
 		CheckedLambdaRow(checked): Ok(checked.captures)
@@ -593,7 +593,7 @@ private pure func conversion_declaration(name: WrittenName, context: ResolutionC
 		None: Err(value_error(name.span, UnknownOpaqueType(name.id)))
 		Some(named):
 			match named.head:
-				OpaqueHead(id): context.opaque_declarations.get(opaque_number(id)).to_result(checker_invariant(name.span, InvalidOpaqueDeclaration(id)))
+				OpaqueHead(id): context.opaque_declarations.get(opaque_number(id)).or_checker_invariant(name.span, InvalidOpaqueDeclaration(id))
 				_: Err(value_error(name.span, NonOpaqueConversionType(name.id)))
 
 
@@ -677,7 +677,10 @@ private pure func comparison_contract(operator: ComparisonOperator, span: Span, 
 		EqualOperator: selected_contract(equality, Errors.ComparisonFamily(Errors.EquatableTrait), span).map(Checked.canonical_equals)
 		NotEqualOperator:
 			match selected_contract(equality, Errors.ComparisonFamily(Errors.EquatableTrait), span):
-				Ok(contract): Checked.canonical_not_equals(contract).to_result(Errors.trait_error(span, Errors.MissingCanonicalInequality))
+				Ok(contract):
+					match Checked.canonical_not_equals(contract):
+						Some(present): Ok(present)
+						None: Err(Errors.trait_error(span, Errors.MissingCanonicalInequality))
 				Err(error): Err(error)
 		LessOperator: selected_contract(ordering, Errors.ComparisonFamily(Errors.OrderableTrait), span).map(Checked.canonical_less_than)
 		GreaterOperator: selected_contract(ordering, Errors.ComparisonFamily(Errors.OrderableTrait), span).map(Checked.canonical_greater_than)
@@ -707,7 +710,9 @@ private pure func arithmetic_contract(arithmetic: Errors.ArithmeticTrait, span: 
 -- its expected type; entries supply them otherwise.
 private pure func plan_dict_literal(entries: List[ParsedDictEntry], expectation: Option[InferenceType], body: ValueExpression, context: ResolutionContext) -> Result[PlannedBase, CheckError]:
 	span = body.base_span
-	functions ?= accepted_traits(context.traits).canonical.dict_literal.to_result(value_error(span, DictLiteralRequiresDict))
+	functions: Checked.DictLiteralFunctions ?= match accepted_traits(context.traits).canonical.dict_literal:
+		Some(present): Ok(present)
+		None: Err(value_error(span, DictLiteralRequiresDict))
 	empty ?= declared_id_contract(span, functions.empty, context.signatures)
 	reserve ?= declared_id_contract(span, functions.dict, context.signatures)
 	set ?= declared_id_contract(span, functions.set, context.signatures)
@@ -765,7 +770,7 @@ private pure func plan_body_base(scope: List[ScopedValue], body: ValueExpression
 						Some(NamedMethod(_)): Ok(PlannedCallable(body, expectation))
 						Some(NamedFunction(_, _)): Ok(PlannedCallable(body, expectation))
 						Some(NamedConstant(id)):
-							constant_row(context.constants, id).to_result(checker_invariant(name.span, InvalidConstantDeclaration(id))).map(
+							constant_row(context.constants, id).or_checker_invariant(name.span, InvalidConstantDeclaration(id)).map(
 								pure func(row): PlannedLeaf(AcceptedConstant(row.value), row.value.value_type),
 							)
 						Some(NamedConstructor(variant)): plan_variant(variant, name, [], False, expectation, slots, construction)
@@ -820,7 +825,7 @@ private pure func plan_qualified(
 	name = qualified.name
 	match offered_value(context.namespace, aliased.target, name.id):
 		Ok(OfferedConstant(id)):
-			match constant_row(context.constants, id).to_result(checker_invariant(name.span, InvalidConstantDeclaration(id))):
+			match constant_row(context.constants, id).or_checker_invariant(name.span, InvalidConstantDeclaration(id)):
 				Err(error): Err(error)
 				Ok(row):
 					if called:
@@ -972,7 +977,9 @@ private pure func pending_tuple_index(index: ValueExpression, span: Span, curren
 				Err(value_error(index.span, TupleIndexMustBeLiteral))
 		_: Err(value_error(index.span, TupleIndexMustBeLiteral))
 	position ?= position_result
-	selected ?= elements.get(position).to_result(value_error(index.span, TupleIndexOutOfRange(position, elements.length())))
+	selected: InferenceType ?= match elements.get(position):
+		Some(present): Ok(present)
+		None: Err(value_error(index.span, TupleIndexOutOfRange(position, elements.length())))
 	Ok({ current | operations = PendingOperationLink({ operation = AcceptedTupleElement(position), value_type = selected, span = span }, current.operations) })
 
 
@@ -986,9 +993,9 @@ private pure func pending_field(name: WrittenName, current: PendingValue, slots:
 				Err(error): Err(error)
 	occurrence ?= occurrence_result
 	field ?= resolve_record_field(name, occurrence.owner, context)
-	accepted ?= context.records.get(record_number(occurrence.owner)).to_result(checker_invariant(name.span, InvalidRecordDeclaration(occurrence.owner)))
+	accepted ?= context.records.get(record_number(occurrence.owner)).or_checker_invariant(name.span, InvalidRecordDeclaration(occurrence.owner))
 	annotation = field.value_type
-	value_type ?= apply_type_hint(annotation.value_type, accepted.type_parameters, record_argument_hints(occurrence.arguments)).to_result(checker_invariant(name.span, InvalidRecordField(field.id)))
+	value_type ?= apply_type_hint(annotation.value_type, accepted.type_parameters, record_argument_hints(occurrence.arguments)).or_checker_invariant(name.span, InvalidRecordField(field.id))
 	Ok({ current | operations = PendingOperationLink({ operation = AcceptedField(field.id), value_type = value_type, span = name.span }, current.operations) })
 
 
@@ -2041,7 +2048,7 @@ private pure func freeze_callable_choice(
 
 
 private pure func freeze_method_callable(method: TraitMethodId, signature: FunctionSignature, start: Int, span: Span, slots: List[InferenceSlot], assumptions: List[Checked.TraitRequirement], traits: TraitAvailability) -> Result[Checked.CallableChoice, CheckError]:
-	parameter ?= signature.type_parameters.get(0).to_result(checker_invariant(span, InvalidFunctionContract))
+	parameter ?= signature.type_parameters.get(0).or_checker_invariant(span, InvalidFunctionContract)
 	published = publish_inference_type(inference_type(ParameterType(parameter), signature.type_parameters, start), slots, CompleteInference, span)
 	receiver: TypeRef ?= match published:
 		Ok(value_type): Ok(value_type)
@@ -2398,7 +2405,7 @@ private pure func classify_direct_call(
 
 			match named_value(context.namespace, context.module, name.id):
 				Some(NamedConstant(id)):
-					match constant_row(context.constants, id).to_result(checker_invariant(name.span, InvalidConstantDeclaration(id))):
+					match constant_row(context.constants, id).or_checker_invariant(name.span, InvalidConstantDeclaration(id)):
 						Err(error): Err(error)
 						Ok(row): constant_application(row, name, arguments, name.span, context)
 				Some(NamedMethod(method)):
@@ -2441,7 +2448,7 @@ private pure func named_callable_operand(
 	start: Int,
 ) -> Result[PendingValue, CheckError]:
 	span = written.base_span
-	accepted ?= site_signatures(site).get(function_number(id)).to_result(checker_invariant(span, InvalidInferenceWorklist))
+	accepted ?= site_signatures(site).get(function_number(id)).or_checker_invariant(span, InvalidInferenceWorklist)
 	_: Void ?= match site:
 		ConstantInitializer(_, _, _): Ok(void)
 		BodyExpression(context, _):
@@ -2477,8 +2484,8 @@ private pure func named_callable_value(accepted: AcceptedFunction, written: Valu
 
 private pure func method_callable_operand(method: TraitMethodId, written: ValueExpression, site: ExpressionSite, start: Int) -> Result[PendingValue, CheckError]:
 	traits = site_traits(site)
-	owner ?= accepted_traits(traits).declarations.get(trait_number(trait_method_owner(method))).to_result(checker_invariant(written.base_span, InvalidFunctionContract))
-	accepted ?= owner.methods.get(trait_method_number(method)).to_result(checker_invariant(written.base_span, InvalidFunctionContract))
+	owner ?= accepted_traits(traits).declarations.get(trait_number(trait_method_owner(method))).or_checker_invariant(written.base_span, InvalidFunctionContract)
+	accepted ?= owner.methods.get(trait_method_number(method)).or_checker_invariant(written.base_span, InvalidFunctionContract)
 	Ok({
 		span = written.span, readiness = DeferredInference,
 		base = PendingMethodCallable(method, accepted.signature, start),

@@ -35,7 +35,8 @@ import:
 		constructor_error,
 		record_error,
 		value_error,
-		checker_invariant
+		checker_invariant,
+		or_checker_invariant
 	./inference:
 		PendingBase(PendingConstructRecord, PendingConstructVariant, PendingUpdateRecord, PendingConstructList),
 		ListElementSource(ExpectedElementType, FirstElementType),
@@ -96,7 +97,7 @@ record DeclaredVariantContract {
 -- The one reader of a variant's declaration: its fields and the union's
 -- parameters, for a variant identity the caller has already established.
 private pure func declared_variant_contract(context: ConstructionContext, owner: UnionId, variant: VariantId, span: Span) -> Result[Option[DeclaredVariantContract], CheckError]:
-	declaration ?= context.unions.get(union_number(owner)).to_result(checker_invariant(span, InvalidCheckedUnion(owner)))
+	declaration ?= context.unions.get(union_number(owner)).or_checker_invariant(span, InvalidCheckedUnion(owner))
 	found: Option[DeclaredVariantContract] = match declaration.variants.get(variant_number(variant)):
 		Some(declared):
 			if variant == declared.id:
@@ -166,11 +167,10 @@ pure func resolve_record_field(
 ) -> Result[CheckedField, CheckError]:
 	declaration ?= context.records
 		.get(record_number(owner))
-		.to_result(checker_invariant(name.span, InvalidRecordDeclaration(owner)))
-	find_field(
-		declaration.fields,
-		name.id,
-	).to_result(record_error(name.span, UnknownRecordField(name.id, owner)))
+		.or_checker_invariant(name.span, InvalidRecordDeclaration(owner))
+	match find_field(declaration.fields, name.id):
+		Some(present): Ok(present)
+		None: Err(record_error(name.span, UnknownRecordField(name.id, owner)))
 
 
 record PlannedRecordField {
@@ -287,7 +287,9 @@ pure func plan_record_literal(
 	context: ConstructionContext,
 	slots: List[InferenceSlot],
 ) -> Result[PlannedBase, CheckError]:
-	written_term ?= expectation.to_result(record_error(span, RecordNeedsExpectedType))
+	written_term: InferenceType ?= match expectation:
+		Some(present): Ok(present)
+		None: Err(record_error(span, RecordNeedsExpectedType))
 	term ?= inference_head(written_term, slots, span)
 	match term:
 		CallVariable(_):
@@ -296,11 +298,13 @@ pure func plan_record_literal(
 
 
 private pure func plan_known_record(written: List[ParsedRecordField], span: Span, term: InferenceType, context: ConstructionContext) -> Result[PlannedBase, CheckError]:
-	occurrence ?= record_occurrence(term).to_result(record_error(span, RecordNeedsExpectedType))
+	occurrence: RecordOccurrence ?= match record_occurrence(term):
+		Some(present): Ok(present)
+		None: Err(record_error(span, RecordNeedsExpectedType))
 	owner = occurrence.owner
 	declaration ?= context.records
 		.get(record_number(owner))
-		.to_result(checker_invariant(span, InvalidRecordDeclaration(owner)))
+		.or_checker_invariant(span, InvalidRecordDeclaration(owner))
 	resolved ?= admit_record_fields(written, span, declaration)
 
 	accepted = declaration
@@ -334,7 +338,7 @@ pure func plan_record_update(base: PendingValue, written: List[ParsedRecordField
 				Ok(actual): Err(record_error(expression_span, UpdateRequiresRecord(actual)))
 				Err(error): Err(error)
 	occurrence ?= occurrence_result
-	declaration ?= context.records.get(record_number(occurrence.owner)).to_result(checker_invariant(span, InvalidRecordDeclaration(occurrence.owner)))
+	declaration ?= context.records.get(record_number(occurrence.owner)).or_checker_invariant(span, InvalidRecordDeclaration(occurrence.owner))
 	hints = record_argument_hints(occurrence.arguments)
 	var replaced: List[Option[Span]] = []
 	for _ in declaration.fields:
@@ -381,7 +385,7 @@ pure func plan_record_update(base: PendingValue, written: List[ParsedRecordField
 
 private pure func plan_record_field(field: ResolvedLiteralField, accepted: CheckedRecord, hints: List[Option[InferenceType]]) -> Result[PlannedRecordField, CheckError]:
 	annotation = field.field.value_type
-	value_type ?= apply_type_hint(annotation.value_type, accepted.type_parameters, hints).to_result(checker_invariant(annotation.span, InvalidRecordField(field.field.id)))
+	value_type ?= apply_type_hint(annotation.value_type, accepted.type_parameters, hints).or_checker_invariant(annotation.span, InvalidRecordField(field.field.id))
 	Ok({ field = field.field.id, written = field.written.value, expected = { value_type = value_type, span = annotation.span } })
 
 
@@ -445,7 +449,9 @@ private pure func pending_variant(
 	slots: List[InferenceSlot],
 	context: ConstructionContext,
 ) -> Result[PendingVariantContract, CheckError]:
-	term ?= expected.to_result(constructor_error(name.span, ConstructorNeedsExpectedType(name.id)))
+	term: InferenceType ?= match expected:
+		Some(present): Ok(present)
+		None: Err(constructor_error(name.span, ConstructorNeedsExpectedType(name.id)))
 	head ?= inference_head(term, slots, name.span)
 	shape = inference_shape(head)
 	owner_result: Result[UnionId, CheckError] = match shape:
@@ -543,7 +549,7 @@ pure func plan_qualified_variant(
 	slots: List[InferenceSlot],
 ) -> Result[PlannedBase, CheckError]:
 	contract ?= declared_variant_contract(context, owner, variant, name.span)
-	declared ?= contract.to_result(checker_invariant(name.span, InvalidCheckedUnion(owner)))
+	declared ?= contract.or_checker_invariant(name.span, InvalidCheckedUnion(owner))
 	normalized: Result[Option[InferenceType], CheckError] = match expected:
 		Some(term):
 			match inference_head(term, slots, name.span):
@@ -577,7 +583,9 @@ pure func plan_variant(
 	slots: List[InferenceSlot],
 	context: ConstructionContext,
 ) -> Result[PlannedBase, CheckError]:
-	term ?= expected.to_result(constructor_error(name.span, ConstructorNeedsExpectedType(name.id)))
+	term: InferenceType ?= match expected:
+		Some(present): Ok(present)
+		None: Err(constructor_error(name.span, ConstructorNeedsExpectedType(name.id)))
 	head ?= inference_head(term, slots, name.span)
 	match head:
 		CallVariable(_): Ok(PlannedContext(SuspendedVariant(variant, name, arguments, called), head))
@@ -697,7 +705,7 @@ pure func list_element_type(
 	match source:
 		ExpectedElementType(element): Ok(element)
 		FirstElementType:
-			match values.get(0).to_result(checker_invariant(span, InvalidInferenceWorklist)):
+			match values.get(0).or_checker_invariant(span, InvalidInferenceWorklist):
 				Ok(first): Ok(pending_type(first))
 				Err(error): Err(error)
 
