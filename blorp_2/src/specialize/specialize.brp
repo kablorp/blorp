@@ -558,12 +558,13 @@ private pure func empty_indexed_list[T]() -> IndexedList[T]:
 	{ entries = no_entries, positions = {} }
 
 
--- `table` with `entry` at the next position, indexed under `digest`.
+-- `table` with `entry` at the next position, indexed under `digest`. The
+-- position and the bucket are read before anything grows: reading `entries`
+-- after appending to it would make the append copy.
 private pure func append_entry[T](table: IndexedList[T], entry: T, digest: Int) -> IndexedList[T]:
-	{
-		entries = table.entries.append(entry),
-		positions = table.positions.set(digest, table.candidate_positions(digest).append(table.entries.length())),
-	}
+	position = table.entries.length()
+	bucket = table.candidate_positions(digest)
+	{ table | entries = table.entries.append(entry), positions = table.positions.set(digest, bucket.append(position)) }
 
 
 -- The positions of every entry appended under `digest`: the only entries a
@@ -2616,10 +2617,12 @@ private pure func converted_parameter_environments(
 
 
 private pure func prepare_creation(
+	outcome: Result[PreparedInstances, Diagnostic],
 	value: Checked.CheckedExpr, request: FunctionRequest,
 	substitution: Declarations.Substitution, storage_arguments: List[TypeRef],
-	checked: Checked.CheckedFunctions, initial: PreparedInstances,
+	checked: Checked.CheckedFunctions,
 ) -> Result[PreparedInstances, Diagnostic]:
+	initial ?= outcome
 	match value.form:
 		Checked.MakeCallable(Checked.MethodCallable(method)):
 			match method.selected_method_body(substitution, checked.traits, value.span):
@@ -2650,227 +2653,278 @@ private pure func prepare_function(
 		argument_layouts.arguments,
 		function.parameter_owner, function.return_type.span,
 	)
-	var prepared = { initial | unions = argument_layouts.unions, records = argument_layouts.records }
-	var failure: Option[Diagnostic] = None
 	has_type_parameters = function.type_parameters.is_empty().not()
+	-- Each loop carries the Result into its step, so the step is the only owner
+	-- of the tables it grows. A failed step ends each later loop at its first.
+	var outcome: Result[PreparedInstances, Diagnostic] = Ok({ initial | unions = argument_layouts.unions, records = argument_layouts.records })
 
 	for written in function.function_types():
-		depends_on_caller = match has_type_parameters:
-			True: Checked.contains_parameter(written.value_type)
+		outcome = outcome.prepare_written_type(written, substitution, has_type_parameters, request.source, checked)
+		match outcome:
+			Ok(_): void
+			Err(_): break
+
+	for value in Checked.body_callable_creations(function.statements, function.body):
+		outcome = outcome.prepare_creation(value, request, semantic, storage_arguments, checked)
+		match outcome:
+			Ok(_): void
+			Err(_): break
+
+	outcome = outcome.converted_environments(function, request.key)
+
+	for call in Checked.body_calls(function.statements, function.body):
+		outcome = outcome.prepare_call(call, request, semantic, storage_arguments, has_type_parameters, checked)
+		match outcome:
+			Ok(_): void
+			Err(_): break
+
+	outcome
+
+
+-- `converted_parameter_environments` after the earlier steps, unless one failed.
+private pure func converted_environments(
+	outcome: Result[PreparedInstances, Diagnostic], function: SelectedBody, key: InstanceKey,
+) -> Result[PreparedInstances, Diagnostic]:
+	prepared ?= outcome
+	Ok(function.converted_parameter_environments(key, prepared))
+
+
+-- One written type's layouts, unless an earlier step failed.
+private pure func prepare_written_type(
+	outcome: Result[PreparedInstances, Diagnostic],
+	written: Checked.TypeUse,
+	substitution: List[TypeSubstitution[PartialType]],
+	has_type_parameters: Bool,
+	source: RequestSource,
+	checked: Checked.CheckedFunctions,
+) -> Result[PreparedInstances, Diagnostic]:
+	prepared ?= outcome
+	depends_on_caller = match has_type_parameters:
+		True: Checked.contains_parameter(written.value_type)
+		False: False
+	value ?= written.value_type.prepare_type(substitution, checked, prepared.unions, request_span(depends_on_caller, source, written.span), prepared.records, [])
+	Ok({ prepared | unions = value.unions, records = value.records })
+
+
+-- One body call's layouts and instance requests, unless an earlier step failed.
+private pure func prepare_call(
+	outcome: Result[PreparedInstances, Diagnostic],
+	call: Checked.CheckedCall,
+	request: FunctionRequest,
+	semantic: Declarations.Substitution,
+	storage_arguments: List[TypeRef],
+	has_type_parameters: Bool,
+	checked: Checked.CheckedFunctions,
+) -> Result[PreparedInstances, Diagnostic]:
+	prepared ?= outcome
+	match call.target:
+		Checked.TraitMethod(method):
+			match method.selected_method_body(semantic, checked.traits, call.span):
+				Err(error): Err(error)
+				Ok(selected): selected.body.prepare_body_instance(selected.arguments, checked, prepared, call.span)
+		Checked.RuntimeFunction(_): Ok(prepared)
+		Checked.ValueCall(_): Ok(prepared)
+		Checked.CallableParameter(parameter):
+			match request.key.callables.callable_mode(parameter, call.span):
+				Err(error): Err(error)
+				Ok(RuntimeCallable(_)): Ok(prepared)
+				Ok(StaticCallable(choice)):
+					match choice.body.runtime_key(choice.arguments, checked, call.span):
+						Ok(key): prepared.request_instance(key, request.source, call.span)
+						Err(error): Err(error)
+		Checked.UserFunction(declaration, arguments):
+			prepared.prepare_user_call(declaration, arguments, call, request, semantic, storage_arguments, has_type_parameters, checked)
+
+
+-- A static callable operand's instance request, made concrete at `span`.
+private record CallRequest {
+	key: InstanceKey,
+	span: Span
+}
+
+
+-- A user function call's argument and callable-operand layouts, then its
+-- requests: each static operand's body, then the callee. The requests wait
+-- for the layouts, so the function table grows only in `request_calls`.
+-- Deferring them changes nothing else: a request touches only `functions`,
+-- and fails only on an index inconsistency, never on user input.
+private pure func prepare_user_call(
+	initial: PreparedInstances,
+	declaration: Declaration.FunctionId,
+	arguments: List[Checked.TypeRef],
+	call: Checked.CheckedCall,
+	request: FunctionRequest,
+	semantic: Declarations.Substitution,
+	storage_arguments: List[TypeRef],
+	has_type_parameters: Bool,
+	checked: Checked.CheckedFunctions,
+) -> Result[PreparedInstances, Diagnostic]:
+	var prepared = initial
+	var failure: Option[Diagnostic] = None
+	var concrete: List[Checked.TypeRef] = []
+	var depends_on_caller: Bool = False
+
+	for argument in arguments:
+		-- One dependency fact serves both this argument's diagnostic
+		-- and the request chain. Nongeneric callers need no tree scan.
+		argument_depends_on_caller = match has_type_parameters:
+			True: Checked.contains_parameter(argument)
 			False: False
-		match written.value_type.prepare_type(
-			substitution,
-			checked,
-			prepared.unions,
-			request_span(depends_on_caller, request.source, written.span),
-			prepared.records,
-			[],
-		):
-			Ok(value):
-				prepared = { prepared |
-					unions = value.unions,
-					records = value.records
-				}
+		depends_on_caller = depends_on_caller.or(argument_depends_on_caller)
+		argument_span = request_span(argument_depends_on_caller, request.source, call.span)
+		match argument.semantic_type(semantic, argument_span):
 			Err(error):
 				failure = Some(error)
 				break
-
-	if failure.is_some().not():
-		for value in Checked.body_callable_creations(function.statements, function.body):
-			match value.prepare_creation(request, semantic, storage_arguments, checked, prepared):
-				Ok(next): prepared = next
-				Err(error):
-					failure = Some(error)
-					break
-
-	if failure.is_some().not():
-		prepared = function.converted_parameter_environments(request.key, prepared)
-
-	if failure.is_some().not():
-		for call in Checked.body_calls(function.statements, function.body):
-			match call.target:
-				Checked.TraitMethod(method):
-					match method.selected_method_body(semantic, checked.traits, call.span):
-						Err(error): failure = Some(error)
-						Ok(selected):
-							match selected.body.prepare_body_instance(selected.arguments, checked, prepared, call.span):
-								Err(error): failure = Some(error)
-								Ok(next): prepared = next
-				Checked.RuntimeFunction(_): void
-				Checked.ValueCall(_): void
-				Checked.CallableParameter(parameter):
-					match request.key.callables.callable_mode(parameter, call.span):
-						Err(error): failure = Some(error)
-						Ok(RuntimeCallable(_)): void
-						Ok(StaticCallable(choice)):
-							match choice.body.runtime_key(choice.arguments, checked, call.span):
-								Ok(key):
-									match prepared.request_instance(key, request.source, call.span):
-										Ok(next): prepared = next
-										Err(error): failure = Some(error)
-								Err(error): failure = Some(error)
-				Checked.UserFunction(declaration, arguments):
-					var concrete: List[Checked.TypeRef] = []
-					var depends_on_caller: Bool = False
-
-					for argument in arguments:
-						-- One dependency fact serves both this argument's diagnostic
-						-- and the request chain. Nongeneric callers need no tree scan.
-						argument_depends_on_caller = match has_type_parameters:
-							True: Checked.contains_parameter(argument)
-							False: False
-						depends_on_caller = depends_on_caller.or(argument_depends_on_caller)
-						argument_span = request_span(argument_depends_on_caller, request.source, call.span)
-						match argument.semantic_type(semantic, argument_span):
+			Ok(replaced):
+				match replaced.prepare_type([], checked, prepared.unions, argument_span, prepared.records, []):
+					Err(error):
+						failure = Some(error)
+						break
+					Ok(value):
+						prepared = { prepared | unions = value.unions, records = value.records }
+						-- No layout is in progress at a function boundary.
+						match value.value_type.known_type(call.span):
+							Ok(_): concrete = concrete.append(replaced)
 							Err(error):
 								failure = Some(error)
 								break
-							Ok(replaced):
-								match replaced.prepare_type([], checked, prepared.unions, argument_span, prepared.records, []):
-									Err(error):
-										failure = Some(error)
-										break
-									Ok(value):
-										prepared = { prepared | unions = value.unions, records = value.records }
-										-- No layout is in progress at a function boundary.
-										match value.value_type.known_type(call.span):
-											Ok(_): concrete = concrete.append(replaced)
-											Err(error):
-												failure = Some(error)
-												break
 
-					if failure.is_some():
-						break
-
-					var choices: List[CallableMode] = []
-					for operand in call.operands:
-						match operand:
-							Checked.ValueOperand(_): void
-							Checked.CallableOperand(written_parameter, written_choice, written_span):
-								var choice_depends_on_caller: Bool = False
-								choice_result: Result[CallableMode, Diagnostic] = match written_choice:
-									Checked.ForwardedCallable(parameter):
-										-- A forwarded selection depends on the current caller's key.
-										choice_depends_on_caller = True
-										request.key.callables.forward_callable(parameter, written_parameter, written_span)
-									Checked.LambdaCallable(id, captures):
-										choice_depends_on_caller = has_type_parameters
-										match id.prepare_callable_storage(captures, storage_arguments, checked, prepared, written_span):
-											Err(error): Err(error)
-											Ok(storage):
-												prepared = storage.prepared
-												Ok(StaticCallable({
-													parameter = written_parameter,
-													body = Checked.LambdaBody(id),
-													arguments = request.key.arguments,
-													storage = storage.storage
-												}))
-									Checked.MethodCallable(method):
-										choice_depends_on_caller = has_type_parameters
-										match method.selected_method_body(semantic, checked.traits, written_span):
-											Err(error): Err(error)
-											Ok(selected):
-												match selected.arguments.prepare_arguments([], checked, prepared.unions, written_span, prepared.records, []):
-													Err(error): Err(error)
-													Ok(layouts):
-														prepared = { prepared | unions = layouts.unions, records = layouts.records }
-														layouts.arguments.known_types(written_span).map(pure func(_): StaticCallable({ parameter = written_parameter, body = selected.body, arguments = selected.arguments, storage = ErasedCallable }))
-									Checked.NamedCallable(id, named_arguments):
-										choice_depends_on_caller = match has_type_parameters:
-											True: named_arguments.any(Checked.contains_parameter)
-											False: False
-										span = request_span(choice_depends_on_caller, request.source, written_span)
-										match named_arguments.semantic_arguments(semantic, span):
-											Err(error): Err(error)
-											Ok(callable_arguments):
-												match callable_arguments.prepare_arguments([], checked, prepared.unions, span, prepared.records, []):
-													Err(error): Err(error)
-													Ok(callable_layouts):
-														prepared = { prepared | unions = callable_layouts.unions, records = callable_layouts.records }
-														callable_layouts.arguments.known_types(written_span).map(pure func(_): StaticCallable({
-															parameter = written_parameter,
-															body = Checked.DeclaredBody(id),
-															arguments = callable_arguments,
-															storage = ErasedCallable
-														}))
-									Checked.StoredCallable(_): Ok(RuntimeCallable(written_parameter))
-								depends_on_caller = depends_on_caller.or(choice_depends_on_caller)
-								match choice_result:
-									Err(error):
-										failure = Some(error)
-										break
-									Ok(choice):
-										choices = choices.append(choice)
-										match choice:
-											RuntimeCallable(_): void
-											StaticCallable(known):
-												span = request_span(choice_depends_on_caller, request.source, written_span)
-												match known.body.runtime_key(known.arguments, checked, span):
-													Ok(key):
-														match prepared.request_instance(key, ConcreteRequest(span), span):
-															Ok(next): prepared = next
-															Err(error):
-																failure = Some(error)
-																break
-													Err(error):
-														failure = Some(error)
-														break
-					if failure.is_some().not():
-						callee_span = request_span(depends_on_caller, request.source, call.span)
-						match prepared.request_instance({
-							body = Checked.DeclaredBody(declaration),
-							arguments = concrete,
-							callables = choices
-						}, ConcreteRequest(callee_span), callee_span):
-							Ok(next): prepared = next
-							Err(error): failure = Some(error)
-			if failure.is_some():
-				break
+	var choices: List[CallableMode] = []
+	var operand_requests: List[CallRequest] = []
+	if failure.is_some().not():
+		for operand in call.operands:
+			match operand:
+				Checked.ValueOperand(_): void
+				Checked.CallableOperand(written_parameter, written_choice, written_span):
+					var choice_depends_on_caller: Bool = False
+					choice_result: Result[CallableMode, Diagnostic] = match written_choice:
+						Checked.ForwardedCallable(parameter):
+							-- A forwarded selection depends on the current caller's key.
+							choice_depends_on_caller = True
+							request.key.callables.forward_callable(parameter, written_parameter, written_span)
+						Checked.LambdaCallable(id, captures):
+							choice_depends_on_caller = has_type_parameters
+							match id.prepare_callable_storage(captures, storage_arguments, checked, prepared, written_span):
+								Err(error): Err(error)
+								Ok(storage):
+									prepared = storage.prepared
+									Ok(StaticCallable({
+										parameter = written_parameter,
+										body = Checked.LambdaBody(id),
+										arguments = request.key.arguments,
+										storage = storage.storage
+									}))
+						Checked.MethodCallable(method):
+							choice_depends_on_caller = has_type_parameters
+							match method.selected_method_body(semantic, checked.traits, written_span):
+								Err(error): Err(error)
+								Ok(selected):
+									match selected.arguments.prepare_arguments([], checked, prepared.unions, written_span, prepared.records, []):
+										Err(error): Err(error)
+										Ok(layouts):
+											prepared = { prepared | unions = layouts.unions, records = layouts.records }
+											layouts.arguments.known_types(written_span).map(pure func(_): StaticCallable({ parameter = written_parameter, body = selected.body, arguments = selected.arguments, storage = ErasedCallable }))
+						Checked.NamedCallable(id, named_arguments):
+							choice_depends_on_caller = match has_type_parameters:
+								True: named_arguments.any(Checked.contains_parameter)
+								False: False
+							span = request_span(choice_depends_on_caller, request.source, written_span)
+							match named_arguments.semantic_arguments(semantic, span):
+								Err(error): Err(error)
+								Ok(callable_arguments):
+									match callable_arguments.prepare_arguments([], checked, prepared.unions, span, prepared.records, []):
+										Err(error): Err(error)
+										Ok(callable_layouts):
+											prepared = { prepared | unions = callable_layouts.unions, records = callable_layouts.records }
+											callable_layouts.arguments.known_types(written_span).map(pure func(_): StaticCallable({
+												parameter = written_parameter,
+												body = Checked.DeclaredBody(id),
+												arguments = callable_arguments,
+												storage = ErasedCallable
+											}))
+						Checked.StoredCallable(_): Ok(RuntimeCallable(written_parameter))
+					depends_on_caller = depends_on_caller.or(choice_depends_on_caller)
+					match choice_result:
+						Err(error):
+							failure = Some(error)
+							break
+						Ok(choice):
+							choices = choices.append(choice)
+							match choice:
+								RuntimeCallable(_): void
+								StaticCallable(known):
+									span = request_span(choice_depends_on_caller, request.source, written_span)
+									match known.body.runtime_key(known.arguments, checked, span):
+										Ok(key): operand_requests = operand_requests.append({ key = key, span = span })
+										Err(error):
+											failure = Some(error)
+											break
 
 	match failure:
-		Some(error):
-			Err(error)
+		Some(error): Err(error)
 		None:
-			Ok(prepared)
+			callee: InstanceKey = { body = Checked.DeclaredBody(declaration), arguments = concrete, callables = choices }
+			prepared.request_calls(operand_requests, callee, request_span(depends_on_caller, request.source, call.span))
+
+
+-- `initial` with a call's static operand requests, in order, then its callee's.
+private pure func request_calls(
+	initial: PreparedInstances, operand_requests: List[CallRequest], callee: InstanceKey, callee_span: Span,
+) -> Result[PreparedInstances, Diagnostic]:
+	var outcome: Result[PreparedInstances, Diagnostic] = Ok(initial)
+	for pending in operand_requests:
+		outcome = outcome.request_call(pending.key, pending.span)
+		match outcome:
+			Ok(_): void
+			Err(_): break
+	outcome.request_call(callee, callee_span)
+
+
+-- `outcome` with `key` requested at `span`, unless an earlier step failed.
+private pure func request_call(outcome: Result[PreparedInstances, Diagnostic], key: InstanceKey, span: Span) -> Result[PreparedInstances, Diagnostic]:
+	prepared ?= outcome
+	prepared.request_instance(key, ConcreteRequest(span), span)
 
 
 private pure func expand_instances(
 	checked: Checked.CheckedFunctions,
 	initial: PreparedInstances,
 ) -> Result[PreparedInstances, Diagnostic]:
-	var prepared = initial
+	var outcome: Result[PreparedInstances, Diagnostic] = Ok(initial)
 	var cursor: Int = 0
-	var failure: Option[Diagnostic] = None
 
 	-- Checking rejects growing recursive substitutions. Finite concrete keys are
 	-- requested once, so regular self/mutual recursion reuses an existing identity.
-	while cursor < prepared.functions.entries.length():
-		match prepared.functions.entries.get(cursor):
-			None:
-				failure = Some(
-					internal_error(
-						compiler_span(),
-						"missing instance request",
-					),
-				)
-			Some(request):
-				match checked.selected_body(request.key.body, request.source):
-					Err(error): failure = Some(error)
-					Ok(function):
-						match function.prepare_function(request, checked, prepared):
-							Ok(value): prepared = value
-							Err(error): failure = Some(error)
-
-		if failure.is_some():
-			break
-
+	-- The loop carries the Result, and its condition reads it through a borrowed
+	-- parameter, so each step is the tables' only owner when they grow.
+	while outcome.has_pending_request(cursor):
+		outcome = outcome.expand_request(cursor, checked)
 		cursor = cursor + 1
 
-	match failure:
-		Some(error):
-			Err(error)
-		None:
-			Ok(prepared)
+	outcome
+
+
+-- Whether no step has failed and `cursor` names a requested instance.
+private pure func has_pending_request(outcome: Result[PreparedInstances, Diagnostic], cursor: Int) -> Bool:
+	match outcome:
+		Ok(prepared): cursor < prepared.functions.entries.length()
+		Err(_): False
+
+
+-- The instance at `cursor`, prepared, unless an earlier step failed.
+private pure func expand_request(
+	outcome: Result[PreparedInstances, Diagnostic],
+	cursor: Int,
+	checked: Checked.CheckedFunctions,
+) -> Result[PreparedInstances, Diagnostic]:
+	prepared ?= outcome
+	match prepared.functions.entries.get(cursor):
+		None: Err(internal_error(compiler_span(), "missing instance request"))
+		Some(request):
+			match checked.selected_body(request.key.body, request.source):
+				Err(error): Err(error)
+				Ok(function): function.prepare_function(request, checked, prepared)
 
 
 -- A call's concrete result instance names the designated union's constructors.

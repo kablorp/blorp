@@ -1540,6 +1540,7 @@ projections and O3.
 | [Moves at last use](#moves-at-last-use) | A store, yield, selection edge or loop exit moves an owner whose obligation ends there instead of acquiring a new one and dropping the old | Approved 2026-11-03 ([results](../benchmarks/results/blorp_2_ownership_moves_2026-11-03.md)) |
 | [Loop-header last-read drops](#loop-header-last-read-drops) | A loop-header obligation that is not outgoing drops at its last read instead of being held to the edge batch | Decided 2026-10-30 as a separate step; after O2 |
 | [Borrowed field projections](#borrowed-field-projections) | Read managed record fields borrowed, as union payloads already are | Approved 2026-11-03 ([results](../benchmarks/results/blorp_2_borrowed_projections_2026-11-03.md)) |
+| Constructor carriers | Inference follows a parameter stored into a construction, and (rule B) a loop's carried outputs, to an owned position | Approved 2026-11-04; lands only with the specialize table restructure ([results](../benchmarks/results/blorp_2_append_entry_tables_2026-11-04.md)) |
 | [O3](#o3-specialised-reuse-for-records-and-union-nodes) | Specialised reuse of unique record cells and boxed union nodes | Undecided; decided from the attribution |
 
 ### Problem
@@ -1700,7 +1701,9 @@ contracts and with every managed parameter of the analysed function
 provisionally owned, giving each an owner o_p. Parameter p is labelled owned
 only if o_p itself reaches a `ConsumedArgument` at a reusing builtin operand
 or an owned user position, directly or through an L2b.1 header take, an L2b.2
-join entry, or a projection acquired after o_p is discharged. A fresh
+join entry, a loop exit's result or carried output, a projection acquired
+after o_p is discharged, or a construction (record, variant, list or closure
+environment) storing an owner that carries o_p's obligation. A fresh
 acquisition at a non-last-use call does not count, nor does a take that is
 only dropped or returned. For
 `pure func f(a: List[Int], b: List[Int]) -> List[Int]: a.append(b.length())`
@@ -2044,7 +2047,7 @@ Generated chains, parameter lists and rings compile within 1.043× of the base's
 the preparation adds 20 and the `known_owner` commit removes 3. The +520
 ceiling needs the spike's coarse scan, whose analyses breached B's ceiling.
 Keith accepted about +650 to +700 on 2026-10-29 ("cut and accept"); the +709
-includes extracting `requeue_callers` from the solver and is within that
+includes extracting `requeue_callers` (since inlined) from the solver and is within that
 allowance. Recording consumed parameter owners during insertion instead of
 walking its output was assessed and not done. Join arms are inserted after
 their enclosing block, so a drop in the continuation is recorded before the

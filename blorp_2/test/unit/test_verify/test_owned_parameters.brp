@@ -304,6 +304,57 @@ pure func test_the_first_invalid_signature_fact_is_reported() -> Bool:
 		_: False
 
 
+-- `values` moves into `Done`, which the call to `extend` consumes.
+STORED: String =
+	|union Outcome:
+	|    Done(List[Int])
+	|    Failed(Int)
+	|pure func extend(outcome: Outcome) -> Outcome:
+	|    match outcome:
+	|        Done(values): Done(append(values, 1))
+	|        Failed(code): Failed(code)
+	|pure func start(values: List[Int]) -> Outcome:
+	|    extend(Done(values))
+	|func main() -> Int:
+	|    first: List[Int] = []
+	|    match start(first):
+	|        Done(values): length(values)
+	|        Failed(code): code
+	|
+
+
+-- A mutation oracle independent of inference: every label owned, then the
+-- owner `start` moves into `Done` dropped again straight after.
+pure func test_an_owner_dropped_after_a_construction_moves_it_is_rejected() -> Bool:
+	match lowered(UPDATE_DECLARATIONS + STORED).and_then(pure func(program): Own.insert_ownership(program, Own.AllOwnedExceptPinned)):
+		Err(_): False
+		Ok(program):
+			match entry_callee(program):
+				None: False
+				Some(callee):
+					index = Concrete.function_number(callee)
+					match program.functions.get(index):
+						None: False
+						Some(start):
+							var operations: List[Own.OwnershipOperation] = []
+							var moved: Option[Own.OwnerId] = None
+							for operation in start.operations:
+								operations = operations.append(operation)
+								match operation:
+									Own.DefineValue(definition):
+										match definition.operation:
+											Own.ConstructDefinition(_, [Own.OwnedPayload(_, owner)]):
+												moved = Some(owner)
+												operations = operations.append(Own.DropOwner(owner, definition.span))
+											_: void
+									_: void
+							match moved:
+								None: False
+								Some(owner):
+									dropped_twice = { program | functions = program.functions.set(index, { start | operations = operations }) }
+									verify(program).is_ok().and(rejects(dropped_twice, "owner ${Own.owner_number(owner).to_string()} has already been discharged"))
+
+
 tests: TestSuite = {
 	description = "Owned-parameter contract verification",
 	tests = [
@@ -318,5 +369,6 @@ tests: TestSuite = {
 		("a callable instance with an owned row is rejected", test_a_callable_instance_with_an_owned_row_is_rejected),
 		("a row that disagrees with its type is rejected", test_a_row_that_disagrees_with_its_type_is_rejected),
 		("the first invalid signature fact is reported", test_the_first_invalid_signature_fact_is_reported),
+		("an owner dropped after a construction moves it is rejected", test_an_owner_dropped_after_a_construction_moves_it_is_rejected),
 	]
 }
