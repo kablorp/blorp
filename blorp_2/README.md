@@ -42,8 +42,9 @@ unions infers conditional bounds from their actual members, preserving authored
 implementations and semantic type arguments. The [generic equality report](https://github.com/kablorp/blorp/blob/1e07c4dce85e51cd7ad911142e9bc96a5e0d91c7/benchmarks/results/blorp2-generic-equality-2026-10-23.md)
 records qualification evidence and matched costs; the earlier
 [nongeneric report](https://github.com/kablorp/blorp/blob/1e07c4dce85e51cd7ad911142e9bc96a5e0d91c7/benchmarks/results/blorp2-derived-equality-2026-10-23.md)
-retains its original proof and costs. The [Equatable-first trait plan](TRAITS_PLAN.md)
-owns production-library contracts and the retained acceptance criteria.
+retains its original proof and costs. The completed
+[Equatable-first trait plan](https://github.com/kablorp/blorp/blob/51d98be37bf467db383c91f3a541d14c54885b08/blorp_2/TRAITS_PLAN.md)
+records the original design and acceptance criteria.
 
 The [incremental layout migration](LAYOUT_MIGRATION.md) defines the proposed
 physical-layout model, staged replacements, code examples and cost gates.

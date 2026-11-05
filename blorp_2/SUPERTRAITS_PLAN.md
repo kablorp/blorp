@@ -2,7 +2,7 @@
 
 Status: approved 2026-10-30, with the owner decisions below accepted as
 recommended. Milestone 1 is implemented; milestones 2 and 3 are not started.
-[The traits plan](TRAITS_PLAN.md) deferred supertraits from its first
+[The traits plan](https://github.com/kablorp/blorp/blob/51d98be37bf467db383c91f3a541d14c54885b08/blorp_2/TRAITS_PLAN.md) deferred supertraits from its first
 increment. This plan adds them so that the arithmetic traits can be
 small single-operator traits composed into named bundles, and so that an
 `Orderable` bound can provide `==`. The legacy compiler is the precedent; the

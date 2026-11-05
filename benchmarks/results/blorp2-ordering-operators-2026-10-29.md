@@ -1,6 +1,6 @@
 # Blorp 2 ordering operators: frozen-input cost
 
-Step 2 of the [ordering operators plan](../../blorp_2/ORDERING_OPERATORS_PLAN.md).
+Step 2 of the [ordering operators plan](https://github.com/kablorp/blorp/blob/58cf46ddcae0a29d7f5289ca19faca1d1df6a1ec/blorp_2/ORDERING_OPERATORS_PLAN.md).
 The ceilings were +0.5% retired instructions and +0.5% allocations on a frozen
 input, with byte-identical output C. Both are met, and the output C is identical.
 

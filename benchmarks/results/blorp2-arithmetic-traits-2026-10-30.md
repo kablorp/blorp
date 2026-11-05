@@ -1,6 +1,6 @@
 # Blorp 2 arithmetic traits: cost and String reuse
 
-Milestone 1 of the [arithmetic operators plan](../../blorp_2/ARITHMETIC_OPERATORS_PLAN.md):
+Milestone 1 of the [arithmetic operators plan](https://github.com/kablorp/blorp/blob/9829b166ba73f1d14540971abefdd143e0c52d19/blorp_2/ARITHMETIC_OPERATORS_PLAN.md):
 `_base` declares Addable, Subtractable, Multipliable, Divisible, Modulable and
 Negatable, and Int, Float and String implement them in place of free functions.
 The plan's ceilings, on the matched frozen-input recipe, are +0.3% retired

@@ -11,7 +11,7 @@ Blorp 2 can compile today.
 - **Blorp 2 compiles none of the 29 legacy sources in `benchmarks/blorp/`.** All
   fail at lexing or parsing. In 23 sources the first error is an infix
   arithmetic operator (`-`, `%`, `*`, `/`), which is milestone 3 of the
-  [arithmetic operators plan](../../blorp_2/ARITHMETIC_OPERATORS_PLAN.md). In
+  [arithmetic operators plan](https://github.com/kablorp/blorp/blob/9829b166ba73f1d14540971abefdd143e0c52d19/blorp_2/ARITHMETIC_OPERATORS_PLAN.md). In
   3 it is a compound assignment (`+=`, `-=`), which that plan rejects. In 3 it
   is a tensor dimension type (`Int[#1000]`), which is outside the bootstrap
   subset. See [compile failures](#compile-failures).
@@ -201,11 +201,11 @@ after the first error was checked.
 | `virtual_threads` | 25:14 expected decimal digits immediately after '-' | `checksum -= 1` | Compound assignment | concurrency, `instrumentation`, `./support/benchmark` |
 
 - **Infix operators (23 sources).** The `-` and `%` diagnostics match the
-  rejections listed in the plan's [problem statement](../../blorp_2/ARITHMETIC_OPERATORS_PLAN.md#problem-and-scope).
+  rejections listed in the plan's [problem statement](https://github.com/kablorp/blorp/blob/9829b166ba73f1d14540971abefdd143e0c52d19/blorp_2/ARITHMETIC_OPERATORS_PLAN.md#problem-and-scope).
   The `*` (`dict_ops`) and `/` (`spectral_norm`) cases surface as generic
   parse errors at the operator. Milestone 3 adds all four operators.
 - **Compound assignment (3 sources).** The plan
-  [rejects](../../blorp_2/ARITHMETIC_OPERATORS_PLAN.md#deviations-from-the-legacy-compiler)
+  [rejects](https://github.com/kablorp/blorp/blob/9829b166ba73f1d14540971abefdd143e0c52d19/blorp_2/ARITHMETIC_OPERATORS_PLAN.md#deviations-from-the-legacy-compiler)
   compound assignment with a teaching message, so these sources need
   rewriting even after milestone 3.
 - **Tensor dimensions, concurrency and the missing library modules.** These

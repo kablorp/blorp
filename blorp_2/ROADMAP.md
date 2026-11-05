@@ -144,7 +144,7 @@ not a portable nesting threshold or a product-destruction proof.
 | [M7](#m7-lambdas) | Pure function types/lambdas | Historical pre-stored-callable checkpoint: pure lambdas, immutable captures, forwarding and direct-call specialization implemented in integration; acceptance was pending. Current callable behavior and evidence are linked below. |
 | [M8](#m8-the-fixpoint-gate) | Fixpoint gate | Own-source self-compilation, identical compiler C and all 556 A/B fixture comparisons pass. All 559 e2e functional callbacks pass with the approved initial cost-debt policy; resource FAILs remain recorded and platform qualification is pending. |
 | [M9](#m9-post-self-compilation-architecture-audit) | Complete architecture audit using the self-compiled compiler | Planned immediately after M8, before the next major feature expansion. |
-| [Cleanup](CLEANUP_ROADMAP.md) | Delete dead code, one internal-error and first-error authority, identity equality, local de-duplication, then single cross-phase authorities | Planned; awaiting approval. |
+| [Cleanup](https://github.com/kablorp/blorp/blob/b63c5e6debfa2e4bc6b533c3d298817a990a123a/blorp_2/CLEANUP_ROADMAP.md) | Delete dead code, one internal-error and first-error authority, identity equality, local de-duplication, then single cross-phase authorities | Landed: C0–C9, finishing at `906919cf0`. |
 
 Historical dependency order for the self-compilation integration (not a current
 work assignment):
@@ -3508,9 +3508,6 @@ and separately from target lifetime evidence, with source, binary, flags, inputs
 raw samples and output identity retained in one report and raw artifacts under
 ignored `build/`. Report production and test lines separately. Owned-input
 costs are proxies for self-compilation until M8 gives the self-compile cost row.
-
-Supporting-host compile-time leaks follow the
-[documented bootstrap limitation](HOST_BOOTSTRAP_LIMITATIONS.md).
 
 - **Preparatory refactors** freeze a matched same-toolchain baseline, emit
   identical existing target C and stay within +3% allocations and minimum

@@ -1,6 +1,6 @@
 # Blorp 2 arithmetic operators: cost
 
-Milestone 3 of the [arithmetic operators plan](../../blorp_2/ARITHMETIC_OPERATORS_PLAN.md):
+Milestone 3 of the [arithmetic operators plan](https://github.com/kablorp/blorp/blob/9829b166ba73f1d14540971abefdd143e0c52d19/blorp_2/ARITHMETIC_OPERATORS_PLAN.md):
 `+`, `-`, `*`, `/`, `%` and prefix `-`, each dispatched through its own
 prelude-selected trait. The plan set ceilings of +0.8% retired instructions,
 +0.1% allocations and 450 gross added production lines. On 2026-10-31 the owner
