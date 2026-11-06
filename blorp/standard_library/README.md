@@ -309,7 +309,9 @@ operations below, each returning a `Result` whose error is an `IOError`. Its
 natives return Int codes (or a list or String) that private decoders turn
 into kinds and entries; the codes are named in `src/runtime/fs.brp`. The
 language README's [I/O overview](../README.md#effects-and-io) shows where it
-fits beside `print` and the other effects.
+fits beside `print` and the other effects, and
+[FILESYSTEM_DECISIONS.md](../FILESYSTEM_DECISIONS.md) records why the library
+is shaped this way and what is still open.
 
 - `read_text(path) -> Result[String, IOError]` reads to end of file, so a file
   that changes size is read as it is, and validates UTF-8. A directory is
