@@ -1,11 +1,11 @@
 # blorp Benchmarks
 
-Performance benchmarks comparing blorp, Blorp 2, C, Go, OCaml, and Python.
+Performance benchmarks comparing the legacy compiler, Blorp, C, Go, OCaml, and Python.
 
 ## Quick Start
 
 ```bash
-# Build the Blorp 2 compiler first. The blorp column needs no build: it uses a
+# Build the Blorp compiler first. The legacy column needs no build: it uses a
 # pinned legacy release that the first run downloads and verifies.
 make -C blorp compiler
 
@@ -26,9 +26,9 @@ and build setup:
 
 ```text
 benchmarks/
-  blorp/support/benchmark.brp  # shared helper module for Blorp benchmarks
-  blorp/<name>.brp
-  blorp_2/<name>.brp      # supported Blorp 2 ports; separate table column
+  legacy/support/benchmark.brp  # shared helper module for the legacy programs
+  legacy/<name>.brp     # programs for the pinned legacy compiler
+  blorp/<name>.brp      # supported Blorp ports; separate table column
   c/<name>.c
   go/<name>.go
   ocaml/<name>.ml
@@ -39,12 +39,12 @@ benchmarks/
 `results/` holds markdown summaries only (see [Recording Results](#recording-results)).
 
 The benchmark name is the filename without the extension. A benchmark must have
-a blorp source file; C, Go, OCaml, and Python counterparts are optional.
-Blorp benchmark sources can import harness helpers from `./support/benchmark`.
+a legacy source file; Blorp, C, Go, OCaml, and Python counterparts are optional.
+Legacy benchmark sources can import harness helpers from `./support/benchmark`.
 
-### The blorp column
+### The legacy column
 
-The `blorp` column is the legacy compiler, pinned to a published release built
+The `legacy` column is the legacy compiler, pinned to a published release built
 from the last legacy sources (`ee9e001c6de8`). `bench.sh` does not build it. It
 downloads the release that `benchmarks/legacy-compiler.env` names (repository,
 tag and one SHA-256 per target) into `$XDG_CACHE_HOME/blorp/legacy` (default
@@ -55,12 +55,12 @@ downloads it; `--list` and `--help` never do. The release provides macOS arm64,
 Linux x64 and Linux arm64. The standard `instrumentation` module that the
 timing helpers use comes from that release's embedded library.
 
-### Blorp 2
+### The blorp column
 
-The `blorp2` column uses `blorp/build/compiler` and the explicit
-`blorp/standard_library` root. Set `BLORP2_COMPILER` to select another compiler
+The `blorp` column uses `blorp/build/compiler` and the explicit
+`blorp/standard_library` root. Set `BLORP_COMPILER` to select another compiler
 executable. The column never falls back to the legacy compiler. A missing compiler is
-an error when the selected workload has a Blorp 2 port; unsupported rows show
+an error when the selected workload has a Blorp port; unsupported rows show
 `-`. Listing the workloads needs neither compiler.
 
 The initial ports are `numeric_loop`, `fib`, `binary_trees`, `compiler_ast`,
@@ -68,12 +68,12 @@ The initial ports are `numeric_loop`, `fib`, `binary_trees`, `compiler_ast`,
 `D.values` because a Dict has no `for` loop yet). They preserve the existing
 inputs, iteration counts and result checksums. Both Blorp compilers' generated C
 uses the same native optimization flags and the same whole-main timing wrapper.
-The `blorp2/blorp time` note is Blorp 2 elapsed time divided by legacy elapsed
-time: a value above 1 means Blorp 2 took longer. The `blorp2/blorp
+The `blorp/legacy time` note is Blorp elapsed time divided by legacy elapsed
+time: a value above 1 means Blorp took longer. The `blorp/legacy
 instructions` note, shown with `BENCH_RESOURCE_STATS=1`, is the same ratio for
 retired instructions.
 
-The ports exist because Blorp 2 does not yet compile the legacy sources: as of
+The ports exist because Blorp does not yet compile the legacy sources: as of
 2026-10-31 each one stops at its first infix arithmetic operator, compound
 assignment or tensor dimension. The
 [2026-10-31 comparison](results/blorp2-runtime-benchmarks-2026-10-31.md)
@@ -84,10 +84,10 @@ The tree and AST ports use a managed record containing an inline union, matching
 the supported recursive-data idiom. Every logical node, including a leaf, has
 one managed record root; there is no additional union box. The logical trees,
 construction counts and child evaluation order stay the same, but the storage
-representation differs. Their Blorp 2 comparisons are marked provisional.
+representation differs. Their Blorp comparisons are marked provisional.
 
 `list_ops` and `compiler_emit` compare the current libraries as well as code
-generation. Blorp 2 List updates copy, its filter/reverse/sort helpers use
+generation. Blorp List updates copy, its filter/reverse/sort helpers use
 temporary immutable algorithms, and the fold port uses an explicit summing loop
 instead of `fold_left`. Its String emitter has no capacity reservation and uses
 fresh concatenations and temporary integer strings. These comparisons are
@@ -99,29 +99,29 @@ These run when the filter is omitted or set to `all`.
 
 | Benchmark | What it tests | Languages |
 |-----------|--------------|-----------|
-| `numeric_loop` | Collatz sequence (1M numbers), arithmetic loops | blorp, Blorp 2, C, Go, OCaml, Python |
-| `fib` | Recursive fib(40), function call overhead | blorp, Blorp 2, C, Go, OCaml, Python |
-| `string` | Checksum-based search, replace, substring, case conversion, split, trim, and reverse | blorp, C, Go, OCaml, Python |
-| `array_sum` | Explicit integer vector sum (10k iterations, 1000 elements) | blorp, C, Go, OCaml, Python |
-| `array_ops` | Integer vector add + scale + sum (10k iterations) | blorp, C, Go, OCaml, Python |
-| `dict_ops` | Hash map build/lookup/remove/iterate | blorp, Blorp 2, Go, OCaml, Python |
-| `list_ops` | List append/sort/filter/fold/reverse/concat | blorp, Blorp 2, Go, OCaml, Python |
-| `set_ops` | Hash set build/contains/union/intersect/diff | blorp, Go, OCaml, Python |
-| `threaded_cpu_map` | Fixed-width CPU-bound worker partitioning | blorp, C, Go, OCaml, Python |
-| `channel_pipeline` | Producer/worker/consumer channel pipeline; Blorp currently uses structured concurrent list processing | blorp, C, Go, OCaml, Python |
-| `sleep_fanout` | Many sleeping tasks/threads spawned and joined together | blorp, C, Go, OCaml, Python |
-| `options` | `Option` representation and layout costs | blorp |
-| `simd` | 16-element numeric tensor add, multiply, sum, and dot kernels | blorp, C |
-| `nbody` | Struct-of-arrays N-body planetary simulation; Blorp currently uses list-backed storage | blorp, C, Go, OCaml, Python |
-| `binary_trees` | Allocation-heavy binary tree construction/checking | blorp, Blorp 2, C, Go, OCaml, Python |
-| `fannkuch` | Permutation-heavy integer workload | blorp, C, Go, OCaml, Python |
-| `spectral_norm` | Floating-point matrix/vector kernel with fresh intermediates | blorp, C, Go, OCaml, Python |
-| `mandelbrot` | Complex-number style nested numeric loops | blorp, C, Go, OCaml, Python |
-| `knucleotide` | String slicing and frequency maps | blorp, Go, OCaml, Python |
-| `reverse_complement` | Shared FASTA reverse-complement transforms | blorp, Go, OCaml, Python |
-| `compiler_ast` | Recursive AST construction, immutable tree rewrites, and pattern matching | blorp, Blorp 2, Go, OCaml |
-| `compiler_symbols` | Persistent symbol tables, nested scope walks, and repeated lookups | blorp, Go, OCaml |
-| `compiler_emit` | C-like code emission and generated-text checksumming | blorp, Blorp 2, Go, OCaml |
+| `numeric_loop` | Collatz sequence (1M numbers), arithmetic loops | legacy, blorp, C, Go, OCaml, Python |
+| `fib` | Recursive fib(40), function call overhead | legacy, blorp, C, Go, OCaml, Python |
+| `string` | Checksum-based search, replace, substring, case conversion, split, trim, and reverse | legacy, C, Go, OCaml, Python |
+| `array_sum` | Explicit integer vector sum (10k iterations, 1000 elements) | legacy, C, Go, OCaml, Python |
+| `array_ops` | Integer vector add + scale + sum (10k iterations) | legacy, C, Go, OCaml, Python |
+| `dict_ops` | Hash map build/lookup/remove/iterate | legacy, blorp, Go, OCaml, Python |
+| `list_ops` | List append/sort/filter/fold/reverse/concat | legacy, blorp, Go, OCaml, Python |
+| `set_ops` | Hash set build/contains/union/intersect/diff | legacy, Go, OCaml, Python |
+| `threaded_cpu_map` | Fixed-width CPU-bound worker partitioning | legacy, C, Go, OCaml, Python |
+| `channel_pipeline` | Producer/worker/consumer channel pipeline; Blorp currently uses structured concurrent list processing | legacy, C, Go, OCaml, Python |
+| `sleep_fanout` | Many sleeping tasks/threads spawned and joined together | legacy, C, Go, OCaml, Python |
+| `options` | `Option` representation and layout costs | legacy |
+| `simd` | 16-element numeric tensor add, multiply, sum, and dot kernels | legacy, C |
+| `nbody` | Struct-of-arrays N-body planetary simulation; Blorp currently uses list-backed storage | legacy, C, Go, OCaml, Python |
+| `binary_trees` | Allocation-heavy binary tree construction/checking | legacy, blorp, C, Go, OCaml, Python |
+| `fannkuch` | Permutation-heavy integer workload | legacy, C, Go, OCaml, Python |
+| `spectral_norm` | Floating-point matrix/vector kernel with fresh intermediates | legacy, C, Go, OCaml, Python |
+| `mandelbrot` | Complex-number style nested numeric loops | legacy, C, Go, OCaml, Python |
+| `knucleotide` | String slicing and frequency maps | legacy, Go, OCaml, Python |
+| `reverse_complement` | Shared FASTA reverse-complement transforms | legacy, Go, OCaml, Python |
+| `compiler_ast` | Recursive AST construction, immutable tree rewrites, and pattern matching | legacy, blorp, Go, OCaml |
+| `compiler_symbols` | Persistent symbol tables, nested scope walks, and repeated lookups | legacy, Go, OCaml |
+| `compiler_emit` | C-like code emission and generated-text checksumming | legacy, blorp, Go, OCaml |
 
 ## Extra Benchmarks
 
@@ -130,17 +130,17 @@ included in `bench.sh all`.
 
 | Benchmark | What it tests | Languages |
 |-----------|--------------|-----------|
-| `paradigms` | Functional dispatch, list destructuring, pattern matching, and coroutine-style control flow | blorp |
-| `virtual_threads` | Fiber spawn, join, park, and wake scaling | blorp |
-| `control_flow_accumulators` | List accumulators updated in join arms (`in_arms`), across inner-loop entry (`nested`) and in a flat loop (`flat`), with a `none` startup control; arguments are the mode and the append count | blorp, Blorp 2 |
-| `helper_accumulators` | Accumulators threaded through a helper parameter: List append (`list_helper`), String append (`string_helper`) and List `set` on a fixed table (`set_helper`), with a `none` startup control; arguments are the mode and the update count | blorp, Blorp 2 |
+| `paradigms` | Functional dispatch, list destructuring, pattern matching, and coroutine-style control flow | legacy |
+| `virtual_threads` | Fiber spawn, join, park, and wake scaling | legacy |
+| `control_flow_accumulators` | List accumulators updated in join arms (`in_arms`), across inner-loop entry (`nested`) and in a flat loop (`flat`), with a `none` startup control; arguments are the mode and the append count | legacy, blorp |
+| `helper_accumulators` | Accumulators threaded through a helper parameter: List append (`list_helper`), String append (`string_helper`) and List `set` on a fixed table (`set_helper`), with a `none` startup control; arguments are the mode and the update count | legacy, blorp |
 
 ## Timing Model
 
 `bench.sh` first compiles all compiled-language binaries for the selected
 benchmark set into a temporary directory. Timed execution remains
 benchmark-major, so the comparison table still runs `fib` across
-blorp/blorp2/C/Go/OCaml/Python before moving to the next benchmark.
+legacy/blorp/C/Go/OCaml/Python before moving to the next benchmark.
 Blorp-generated C and the C comparison programs are compiled and linked at
 `-O2`; this is a benchmark setting, not a substitute for output validation.
 
@@ -149,7 +149,7 @@ language-specific instrumented entry point, and that entry point prints a
 machine-readable line to stderr:
 
 ```text
-BENCH name=fib lang=blorp seconds=0.123456789
+BENCH name=fib lang=legacy seconds=0.123456789
 ```
 
 The harness parses those `BENCH` lines. By default each benchmark runs once;
@@ -165,16 +165,16 @@ the existing spaces-versus-tabs formatting difference. Its contract uses the
 shared depth-15 argument. Other rows do not yet have an output contract in the
 sample runner.
 
-`BENCH_ALLOC_STATS=1` builds separate diagnostic binaries for blorp and Blorp 2.
+`BENCH_ALLOC_STATS=1` builds separate diagnostic binaries for legacy and Blorp.
 Timed samples always use normal binaries with memory diagnostics disabled.
 Allocation runs use each runtime's leak-check mode and fail the benchmark on
 diagnostic errors. The counts are labeled separately: legacy managed-object
-counts and Blorp 2 allocator-call counts have different accounting boundaries.
+counts and Blorp allocator-call counts have different accounting boundaries.
 The reported `bytes` field is live bytes at exit, not total bytes allocated.
 
 `BENCH_RESOURCE_STATS=1` runs every timed sample under macOS `/usr/bin/time -l`
 and appends each language's minimum retired instructions and maximum peak
-resident set size to the row, with a `blorp2/blorp instructions` ratio when both
+resident set size to the row, with a `blorp/legacy instructions` ratio when both
 Blorp lanes ran. These counters cover the whole process, including startup, so
 a millisecond workload is dominated by process launch. Warmups run without the
 timer. Other platforms' `time` commands do not report retired instructions, so
@@ -194,7 +194,7 @@ PYTHON_CONCURRENCY=python3.14t  bash benchmarks/bench.sh   # Free-threaded Pytho
 GO=go1.22                       bash benchmarks/bench.sh   # Use specific Go
 OCAMLOPT=ocamlopt               bash benchmarks/bench.sh   # Use specific OCaml native compiler
 CC=gcc                          bash benchmarks/bench.sh   # Use specific C compiler
-BLORP2_COMPILER=/path/compiler  bash benchmarks/bench.sh fib # Select Blorp 2 compiler
+BLORP_COMPILER=/path/compiler   bash benchmarks/bench.sh fib # Select the Blorp compiler
 XDG_CACHE_HOME=/path/cache      bash benchmarks/bench.sh   # Where the pinned legacy compiler is cached
 BENCH_THREADS=4                 bash benchmarks/bench.sh   # Worker/task width for concurrency rows
 BLORP_THREADS=4                 bash benchmarks/bench.sh   # Blorp runtime thread width for concurrency rows
@@ -213,12 +213,12 @@ that the GIL is disabled.
 
 ## Adding a New Benchmark
 
-1. Add `benchmarks/blorp/<name>.brp`.
-2. Optionally add `benchmarks/blorp_2/<name>.brp`, `benchmarks/c/<name>.c`, `benchmarks/go/<name>.go`,
+1. Add `benchmarks/legacy/<name>.brp`.
+2. Optionally add `benchmarks/blorp/<name>.brp`, `benchmarks/c/<name>.c`, `benchmarks/go/<name>.go`,
    `benchmarks/ocaml/<name>.ml`, and `benchmarks/python/<name>.py`.
 3. If every language should receive the same CLI args, add
    `benchmarks/args/<name>.txt`.
-4. Import `./support/benchmark` from Blorp benchmark sources when you need the
+4. Import `./support/benchmark` from legacy benchmark sources when you need the
    shared timing/checksum helpers.
 5. Add `<name>` to `ALL_BENCHMARKS` in `benchmarks/bench.sh`, or to
    `EXTRA_BENCHMARKS` if it should be runnable and listed but excluded from

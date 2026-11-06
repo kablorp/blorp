@@ -232,7 +232,7 @@ here. Don't put type-checking logic in lowering or ownership passes, or parsing
 constraints in checking. If a check belongs earlier, move it there. If it must stay late
 (for example because specialization provides the needed facts), document why.
 
-**9. Measure, don't guess.** If there's any doubt about efficiency, use Blorp 2's measurement
+**9. Measure, don't guess.** If there's any doubt about efficiency, use Blorp's measurement
 tools: `BLORP_ALLOCATION_SITES` with `blorp/scripts/allocation-sites` for where allocations
 come from, `blorp/scripts/attribution/run` for reference-count and copy attribution, and a
 `-DBLORP_MEMORY_DIAGNOSTICS=1` build with `BLORP_LEAK_CHECK=strict` for memory;

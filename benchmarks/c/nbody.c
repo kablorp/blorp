@@ -1,6 +1,6 @@
 /* N-body planetary simulation benchmark.
  *
- * Uses the same struct-of-arrays layout as benchmarks/blorp/nbody.brp so the
+ * Uses the same struct-of-arrays layout as benchmarks/legacy/nbody.brp so the
  * cross-language row compares the same source-level data movement.
  */
 #include <math.h>

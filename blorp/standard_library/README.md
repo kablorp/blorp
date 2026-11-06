@@ -1,8 +1,8 @@
-# Blorp 2 standard library
+# Blorp standard library
 
-These modules are compiled by Blorp 2 for input programs. They are separate
+These modules are compiled by Blorp for input programs. They are separate
 from the legacy library, preserved at
-[`standard_library/src/`](https://github.com/kablorp/blorp/blob/ee9e001c6de8911ee486fd992419bef5bc628e8b/standard_library/src/). All active Blorp 2 tests
+[`standard_library/src/`](https://github.com/kablorp/blorp/blob/ee9e001c6de8911ee486fd992419bef5bc628e8b/standard_library/src/). All active Blorp tests
 use this target library. The
 pinned Blorp2 compiler uses this target library when compiling compiler source.
 

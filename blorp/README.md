@@ -1,9 +1,9 @@
-# Blorp 2
+# Blorp
 
-A new compiler written in Blorp that emits C. Each increment starts with a
+The compiler is written in Blorp and emits C. Each increment starts with a
 small program, defines the grammar it needs, and tests that program through
 native execution. It can compile itself. `make -C blorp` uses the verified,
-digest-pinned Blorp 2 seed as its production builder. All active tests are
+digest-pinned Blorp seed as its production builder. All active tests are
 self-hosted; unported unit/runtime/grammar/e2e/tooling suites are DEFERRED.
 
 The combined integration implements pure lambdas with immutable captures,
@@ -875,8 +875,8 @@ outside this pilot's restricted grammar.
 
 ```sh
 make -C blorp example          # Compile the example to C, build it, run it.
-make -C blorp test             # Build B2; run components and first native e2e cases.
-make -C blorp test-e2e         # Use the already-built diagnostic B2 compiler.
+make -C blorp test             # Build Blorp; run components and first native e2e cases.
+make -C blorp test-e2e         # Use the already-built diagnostic Blorp compiler.
 make -C blorp test INSTRUCTION_CHECK=on   # macOS: also hold ported compiles to their instruction ceilings.
 ```
 
@@ -885,7 +885,7 @@ inspection. The self-hosted component gate keeps
 its C and executables in `blorp/build/self-hosted-tests/`. `BLORP_CC` selects a C
 compiler executable (default `clang`).
 `make -C blorp test-compiler test-components` runs the active component
-gate: Blorp 2 compiles the explicit `COMPONENT_SOURCES` list in
+gate: Blorp compiles the explicit `COMPONENT_SOURCES` list in
 `test/e2e/self_hosted.brp`, the test driver that `make` builds with the
 compiler under test (`build/self-hosted-tests/driver/`).
 The selection currently covers text, Boolean calls, constant/declaration IDs,
@@ -927,13 +927,13 @@ is not in the target selection. Other untranslated unit/runtime/grammar/tooling 
 native e2e cases are DEFERRED. Their sources stay intact for bounded incremental ports;
 no legacy host or replacement test framework runs them.
 
-`test-components BLORP2_COMPILER=PATH` uses an already-built compiler without a
+`test-components BLORP_COMPILER=PATH` uses an already-built compiler without a
 fallback. To run the whole selection without the deferral report, or just one
 suite, use:
 
 ```sh
-make -C blorp test-target-components BLORP2_COMPILER=PATH
-make -C blorp test-target-components BLORP2_COMPILER=PATH \
+make -C blorp test-target-components BLORP_COMPILER=PATH
+make -C blorp test-target-components BLORP_COMPILER=PATH \
   TARGET_COMPONENT_SOURCES=blorp/test/unit/test_utils/test_text.brp
 ```
 
@@ -1018,8 +1018,8 @@ boundary builds a String from invalid bytes (`fs.read_text` rejects them and
 longer be reached and is a candidate for removal.
 
 The same driver runs the process-runtime lifecycle tests. Make resolves
-`BLORP2_COMPILER` and `BLORP_CC` to explicit executable paths and passes the
-physical `TMPDIR` (or `/tmp`); the driver makes a private `blorp2-test.*` work
+`BLORP_COMPILER` and `BLORP_CC` to explicit executable paths and passes the
+physical `TMPDIR` (or `/tmp`); the driver makes a private `blorp-test.*` work
 directory in it with `fs.with_temporary_directory`, which removes it on
 completion (a signal can still leave one behind). All test assertions are Blorp
 TestSuite callbacks; its ordinary `main(args)` only selects a mode and receives
@@ -1030,9 +1030,9 @@ is involved. Remaining cases in the older driver need additional APIs and remain
 CI has four independent self-hosted lanes: Linux x64 with Clang and GCC,
 Linux ARM64 with Clang, and macOS ARM64 with Clang. Each checks out source,
 installs its C compiler when needed, and runs `make -C blorp test` using the
-pinned B2 seed. No legacy toolchain artifact or FRESH host is required.
+pinned seed. No legacy toolchain artifact or FRESH host is required.
 
-The seed workflow and `scripts/blorp2-fixpoint --prove` retain real compiler
+The seed workflow and `scripts/blorp-fixpoint --prove` retain real compiler
 self-compilation, B/C output identity, A/B accepted/rejected fixture parity,
 self-hosted components and the first native e2e selection. Seed publication additionally retains its existing
 whole-source strict accounting/sanitizer checks and ordinary-main native smoke.
@@ -1042,7 +1042,7 @@ existing e2e inputs, oracles and cost ceilings stay in source for future ports.
 
 The discard-propagation increment (2026-10-25) passed 213 component checks,
 26 process-runtime checks, five native cases and 591-fixture parity through
-`scripts/blorp2-fixpoint --prove`; seed/A/B/C emitted identical compiler C.
+`scripts/blorp-fixpoint --prove`; seed/A/B/C emitted identical compiler C.
 Its seven parser and four checker callbacks also passed ASan/UBSan and strict
 accounting. The candidate discard and unused-named controls, plus the baseline
 unused-named control, emitted byte-identical C, preserving ordinary cleanup.
@@ -1158,8 +1158,8 @@ value), which the driver receives as `--check-instructions`. It requires macOS
 `/usr/bin/time -l` and its retired-instruction counter; a missing or malformed
 counter fails the test. Hosted CI runners may lack the counter, so CI leaves it
 off and keeps the strict allocation reports and caps. The deferred legacy harness
-alone still reads `BLORP_2_INSTRUCTION_CHECK`, and the resource-policy modes of
-`BLORP_2_RESOURCE_POLICY` are not ported: a ceiling that fails is a failure.
+alone still reads `BLORP_INSTRUCTION_CHECK`, and the resource-policy modes of
+`BLORP_RESOURCE_POLICY` are not ported: a ceiling that fails is a failure.
 The first limits were established on arm64 macOS with Apple Clang 21. See the
 [cost record](https://github.com/kablorp/blorp/blob/1e07c4dce85e51cd7ad911142e9bc96a5e0d91c7/benchmarks/results/blorp_2_costs_2026-10-08.md) for baselines,
 commands, provenance, and measurement limits.
@@ -1189,7 +1189,7 @@ blorp/scripts/allocation-sites sites.txt program [program.c] [--top N]
 self-compile attribution: update copies by Blorp function and statement, atomic
 reference-count operations by data kind and source, a `sample` profile, and the cycle
 saving of plain over atomic counts at a fixed operation count. Its raw data goes to
-the ignored `build/blorp_2_attribution/`.
+the ignored `build/attribution/`.
 
 Offsets cannot be symbolized in process because static functions are not in
 the dynamic symbol table, so `blorp/scripts/allocation-sites` (Python 3
@@ -1234,7 +1234,7 @@ base, since every program value has been dropped by then; otherwise it prints
 strict leak status. Every diagnostic run then frees each literal, so the strict
 report counts each used literal as one allocation and one release. `=0` builds
 keep only the per-site cache: no list, no exit check and no frees. Creation is
-not atomic, since Blorp 2 has no threads yet; concurrency will need a
+not atomic, since Blorp has no threads yet; concurrency will need a
 compare-exchange whose loser frees its copy.
 
 ## Generic function example
@@ -3660,15 +3660,15 @@ Clang compilation/linking and native execution, with explicit source and toolcha
 identity; it was a goal, not a measured result. The unit command then still used
 the legacy compiler: its measured 615 ms pipeline would have become about
 123 ms at that target. The self-compile measurements and the fixpoint now track
-Blorp 2's own compile cost.
+Blorp's own compile cost.
 See the [timing record](https://github.com/kablorp/blorp/blob/1e07c4dce85e51cd7ad911142e9bc96a5e0d91c7/benchmarks/results/blorp_2_match_2026-10-09.md#unit-test-feedback-time).
 
 Self-compilation has one measurement and one gate, both in
-`scripts/blorp2-fixpoint` (details in [scripts/README.md](../scripts/README.md#blorp-2-fixpoint)):
+`scripts/blorp-fixpoint` (details in [scripts/README.md](../scripts/README.md#blorp-2-fixpoint)):
 
 ```bash
-scripts/blorp2-fixpoint --frontier   # files of src that parse, then the first failing stage; exits 0
-scripts/blorp2-fixpoint --prove      # A builds B, B builds C, all at -O0; B == C, A == B on every fixture, e2e under B
+scripts/blorp-fixpoint --frontier   # files of src that parse, then the first failing stage; exits 0
+scripts/blorp-fixpoint --prove      # A builds B, B builds C, all at -O0; B == C, A == B on every fixture, e2e under B
 ```
 
 Both link every stage through this Makefile's `test-compiler` and

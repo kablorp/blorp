@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Instrument Blorp 2 generated C to attribute List and String update copies to call sites.
+"""Instrument Blorp generated C to attribute List and String update copies to call sites.
 
 Scratch measurement only: it rewrites a copy of the generated C and never touches the
 repository. macOS only (it reads `_mh_execute_header` for the load address).

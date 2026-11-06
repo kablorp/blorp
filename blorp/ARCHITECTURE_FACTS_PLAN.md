@@ -321,7 +321,7 @@ active suites for each milestone):
 make -C blorp test-compiler
 make -C blorp test-target-components \
   TARGET_COMPONENT_SOURCES='blorp/test/unit/test_check/test_declaration_bounds.brp'
-scripts/blorp2-fixpoint --prove
+scripts/blorp-fixpoint --prove
 ```
 
 Register new suites in `TARGET_COMPONENT_SOURCES`; deferred suites receive

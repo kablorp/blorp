@@ -23,7 +23,7 @@ need. You report results; you do not fix anything.
 
 ## Choose the gates from the repository
 
-The default is the focused suites that own the change, then the Blorp 2 gates. Do
+The default is the focused suites that own the change, then the Blorp gates. Do
 not rely on a remembered list. Each time:
 
 1. Read `blorp/AGENTS.md` ("Validation") and `scripts/README.md` ("Validating a
@@ -31,9 +31,9 @@ not rely on a remembered list. Each time:
 2. Run the narrow owning suite first: `make -C blorp test-target-components
    TARGET_COMPONENT_SOURCES=<paths>` for a component suite.
 3. For a change under `blorp/`, run `make -C blorp test`.
-4. Run `scripts/blorp2-fixpoint --prove` when the change alters emitted C, and
+4. Run `scripts/blorp-fixpoint --prove` when the change alters emitted C, and
    `bash blorp/test/tooling/test_bootstrap.sh` when it touches
-   `scripts/blorp2-compiler-bootstrap`, `blorp/Makefile` or `blorp/bootstrap.env`.
+   `scripts/blorp-compiler-bootstrap`, `blorp/Makefile` or `blorp/bootstrap.env`.
 5. For a change to `benchmarks/`, run `bash benchmarks/bench.sh <name>` for a
    benchmark the change touches. For a docs-only change, check links and paths
    and run the whitespace check on the diff.

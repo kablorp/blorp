@@ -153,10 +153,10 @@ Obligations.
 | Legacy | This plan | Reason |
 | --- | --- | --- |
 | The missing-supertrait error has no help line | The help names the implementation or bound to add | Rule 6: every error teaches the fix. |
-| An implementation's methods that its trait does not declare are ignored; the library adds `__numeric_marker` methods to give bundle implementations a body | Blorp 2 already rejects them; the bundle form is a bodyless `implements Ring for Int` | Blorp 2 already supports implementations made only of defaults. |
+| An implementation's methods that its trait does not declare are ignored; the library adds `__numeric_marker` methods to give bundle implementations a body | Blorp already rejects them; the bundle form is a bodyless `implements Ring for Int` | Blorp already supports implementations made only of defaults. |
 | Builtin trait topology is written twice, in `traits.brp` and in `builtins.brp` | The library declaration is the only source | One fact, one owner. |
 | Builtin facts supply `Integer` and `FloatingPoint`, with no `implements` | Every implementation is written | No compiler-owned implementations are needed. |
-| Method lookup takes the first match in the trait, then its supertraits in written order | Blorp 2 already rejects a use when two visible families share the name (`DifferentMethodFamilies`) | Existing Blorp 2 rule; the choice never depends on declaration order. |
+| Method lookup takes the first match in the trait, then its supertraits in written order | Blorp already rejects a use when two visible families share the name (`DifferentMethodFamilies`) | Existing Blorp rule; the choice never depends on declaration order. |
 | A cycle or duplicate supertrait is reported in a separate header phase | Cycles are rejected in trait acceptance; duplicates are accepted, as they are in bounds | No phase is added, and no rule is added that bounds do not have. |
 
 The legacy grammar, transitive entailment, explicit supertrait implementations,

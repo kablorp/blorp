@@ -35,7 +35,7 @@ GCC instead of the default Clang.
 git clone https://github.com/kablorp/blorp.git
 cd blorp
 make -C blorp compiler    # downloads the pinned, SHA-256-verified seed, then builds
-make -C blorp example     # compiles and runs a small program through the new compiler
+make -C blorp example     # compiles and runs a small program through the compiler
 make -C blorp test        # self-hosted component suites and native end-to-end tests
 ```
 
@@ -43,7 +43,7 @@ The compiler's command line is
 `blorp/build/compiler --library-root blorp/standard_library INPUT.brp OUTPUT.c`;
 compile the C with your C compiler.
 
-`scripts/blorp2-fixpoint --prove` proves that the compiler reproduces its own C
+`scripts/blorp-fixpoint --prove` proves that the compiler reproduces its own C
 from its own source. `benchmarks/bench.sh` compares Blorp with C, Go, OCaml and
 Python on small programs; see [benchmarks/README.md](benchmarks/README.md).
 

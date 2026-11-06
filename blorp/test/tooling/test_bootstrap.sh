@@ -3,17 +3,17 @@
 set -euo pipefail
 
 repo_root=$(cd "$(dirname "$0")/../../.." && pwd -P)
-scratch=$(mktemp -d "${TMPDIR:-/tmp}/blorp2 bootstrap.XXXXXX")
+scratch=$(mktemp -d "${TMPDIR:-/tmp}/blorp bootstrap.XXXXXX")
 trap 'chmod -R u+w "$scratch"; rm -rf "$scratch"' EXIT
 fixture="$scratch/repo with spaces"
 tools="$scratch/fake tools"
 mkdir -p "$fixture/scripts" "$fixture/blorp/src" "$tools"
 fixture=$(cd "$fixture" && pwd -P)
 cp "$repo_root/blorp/Makefile" "$fixture/blorp/Makefile"
-if [ -f "$repo_root/scripts/blorp2-compiler-bootstrap" ]; then
-	cp "$repo_root/scripts/blorp2-compiler-bootstrap" "$fixture/scripts/"
+if [ -f "$repo_root/scripts/blorp-compiler-bootstrap" ]; then
+	cp "$repo_root/scripts/blorp-compiler-bootstrap" "$fixture/scripts/"
 fi
-resolver="$fixture/scripts/blorp2-compiler-bootstrap"
+resolver="$fixture/scripts/blorp-compiler-bootstrap"
 passed=0
 fail() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
 pass() { passed=$((passed + 1)); printf 'PASS: %s\n' "$*"; }
@@ -31,7 +31,7 @@ export TEST_CC_ARGS="$scratch/cc-args" TEST_COMPILER_ARGS="$scratch/compiler.arg
 export TEST_DOWNLOAD_LOG="$scratch/download.log" TEST_BAD_EXEC_LOG="$scratch/bad-exec.log"
 export TEST_SEED="$scratch/seed payload" TEST_DOWNLOAD_MODE=good
 export TEST_OS=Linux TEST_ARCH=x86_64
-export BLORP2_COMPILER_BOOTSTRAP_CACHE_DIR="$scratch/cache with spaces"
+export BLORP_COMPILER_BOOTSTRAP_CACHE_DIR="$scratch/cache with spaces"
 cat >"$TEST_SEED" <<'SH'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -106,18 +106,21 @@ SH
 chmod +x "$tools/"*
 export PATH="$tools:$PATH"
 commit=0123456789abcdef0123456789abcdef01234567
-tag=blorp2-seed-0123456789ab
+# The release family the resolver accepts, its seed_release_family. The next seed
+# rotation switches this one line, together with the resolver and the pin, to blorp.
+family=blorp2
+tag=$family-seed-0123456789ab
 digest=$(sha256_file "$TEST_SEED")
 manifest="$fixture/blorp/bootstrap.env"
 write_manifest() {
 	cat >"$manifest" <<EOF
-BLORP2_BOOTSTRAP_FORMAT=1
-BLORP2_BOOTSTRAP_REPO=kablorp/blorp
-BLORP2_BOOTSTRAP_TAG=$tag
-BLORP2_BOOTSTRAP_SOURCE_COMMIT=$commit
-BLORP2_BOOTSTRAP_SHA256_AARCH64_APPLE_DARWIN=$digest
-BLORP2_BOOTSTRAP_SHA256_X86_64_UNKNOWN_LINUX_GNU=$digest
-BLORP2_BOOTSTRAP_SHA256_AARCH64_UNKNOWN_LINUX_GNU=$digest
+BLORP_BOOTSTRAP_FORMAT=1
+BLORP_BOOTSTRAP_REPO=kablorp/blorp
+BLORP_BOOTSTRAP_TAG=$tag
+BLORP_BOOTSTRAP_SOURCE_COMMIT=$commit
+BLORP_BOOTSTRAP_SHA256_AARCH64_APPLE_DARWIN=$digest
+BLORP_BOOTSTRAP_SHA256_X86_64_UNKNOWN_LINUX_GNU=$digest
+BLORP_BOOTSTRAP_SHA256_AARCH64_UNKNOWN_LINUX_GNU=$digest
 EOF
 }
 write_manifest
@@ -139,7 +142,7 @@ fi
 resolved=$(cat "$scratch/path")
 [ -x "$resolved" ] && cmp -s "$resolved" "$TEST_SEED" || fail 'resolved seed bytes'
 [ "$(downloads)" = 1 ] || fail 'one cold download'
-grep -Fxq "https://github.com/kablorp/blorp/releases/download/$tag/blorp2-x86_64-unknown-linux-gnu" "$TEST_DOWNLOAD_LOG" || fail 'asset URL'
+grep -Fxq "https://github.com/kablorp/blorp/releases/download/$tag/$family-x86_64-unknown-linux-gnu" "$TEST_DOWNLOAD_LOG" || fail 'asset URL'
 [ ! -e "$TEST_SEED_LOG" ] || fail 'print-path ran seed'
 pass 'cold verified seed resolves without execution'
 
@@ -159,9 +162,9 @@ TEST_DOWNLOAD_MODE=bad expect_failure 'checksum' "$resolver" argument
 pass 'bad downloaded bytes never install or execute'
 "$resolver" --print-path >"$scratch/path"
 
-chmod -R a-w "$BLORP2_COMPILER_BOOTSTRAP_CACHE_DIR"
+chmod -R a-w "$BLORP_COMPILER_BOOTSTRAP_CACHE_DIR"
 TEST_DOWNLOAD_MODE=offline "$resolver" --print-path >"$scratch/path"
-chmod -R u+w "$BLORP2_COMPILER_BOOTSTRAP_CACHE_DIR"
+chmod -R u+w "$BLORP_COMPILER_BOOTSTRAP_CACHE_DIR"
 cmp -s "$scratch/path" <(printf '%s\n' "$resolved") || fail 'readonly cache path changed'
 pass 'read-only offline valid cache remains usable'
 
@@ -185,16 +188,16 @@ for target in 'Darwin arm64 aarch64-apple-darwin' 'Linux aarch64 aarch64-unknown
 	export TEST_OS TEST_ARCH
 	"$resolver" --print-path >"$scratch/path"
 	case "$(cat "$scratch/path")" in *"/$triple/"*) ;; *) fail 'target-specific cache';; esac
-	grep -Fq "/blorp2-$triple" "$TEST_DOWNLOAD_LOG" || fail 'platform asset'
+	grep -Fq "/$family-$triple" "$TEST_DOWNLOAD_LOG" || fail 'platform asset'
 done
 export TEST_OS=Darwin TEST_ARCH=x86_64
-expect_failure 'Unsupported Blorp 2 bootstrap target' "$resolver" --print-path
+expect_failure 'Unsupported Blorp bootstrap target' "$resolver" --print-path
 export TEST_OS=Linux TEST_ARCH=x86_64
 pass 'three supported platform assets and unsupported platform rejection'
 
 # Manifest values are authoritative even when similarly named env vars exist.
-BLORP2_BOOTSTRAP_TAG=latest BLORP2_BOOTSTRAP_REPO=hostile/repo \
-	BLORP2_COMPILER_BOOTSTRAP_REPO=hostile/repo "$resolver" --print-id >"$scratch/id"
+BLORP_BOOTSTRAP_TAG=latest BLORP_BOOTSTRAP_REPO=hostile/repo \
+	BLORP_COMPILER_BOOTSTRAP_REPO=hostile/repo "$resolver" --print-id >"$scratch/id"
 [ "$(cat "$scratch/id")" = "kablorp/blorp $tag $commit" ] || fail 'ambient release override'
 pass 'ambient release variables cannot override the manifest'
 
@@ -207,6 +210,14 @@ sed "s/$tag/latest/" "$manifest" >"$scratch/invalid"
 cp "$scratch/invalid" "$manifest"
 expect_failure 'immutable' "$resolver" --print-id
 pass 'mutable release tag rejects'
+write_manifest
+# The resolver accepts one release family, never both: the other spelling rejects.
+other_family=blorp
+[ "$family" != blorp ] || other_family=blorp2
+sed "s/$tag/$other_family-seed-0123456789ab/" "$manifest" >"$scratch/invalid"
+cp "$scratch/invalid" "$manifest"
+expect_failure "tag must be immutable $family-seed-<12hex>" "$resolver" --print-id
+pass 'only the resolver release family is accepted'
 write_manifest
 sed "s/$commit/ffffffffffffffffffffffffffffffffffffffff/" "$manifest" >"$scratch/invalid"
 cp "$scratch/invalid" "$manifest"
@@ -230,18 +241,18 @@ pass 'malformed digests reject before any transport'
 write_manifest
 grep -v 'AARCH64_UNKNOWN_LINUX_GNU' "$manifest" >"$scratch/invalid"
 cp "$scratch/invalid" "$manifest"
-expect_failure 'missing BLORP2_BOOTSTRAP_SHA256_AARCH64_UNKNOWN_LINUX_GNU' "$resolver" --print-id
+expect_failure 'missing BLORP_BOOTSTRAP_SHA256_AARCH64_UNKNOWN_LINUX_GNU' "$resolver" --print-id
 pass 'every platform digest is required'
 write_manifest
 printf 'UNKNOWN_FIELD=1\n' >>"$manifest"
 expect_failure 'unknown field' "$resolver" --print-id
 pass 'unknown manifest field rejects'
 write_manifest
-printf 'BLORP2_BOOTSTRAP_FORMAT=1\n' >>"$manifest"
+printf 'BLORP_BOOTSTRAP_FORMAT=1\n' >>"$manifest"
 expect_failure 'duplicate field' "$resolver" --print-id
 pass 'duplicate manifest field rejects'
 write_manifest
-printf 'BLORP2_BOOTSTRAP_FORMAT =1\n' >>"$manifest"
+printf 'BLORP_BOOTSTRAP_FORMAT =1\n' >>"$manifest"
 expect_failure 'invalid field' "$resolver" --print-id
 pass 'malformed assignment rejects'
 write_manifest
@@ -269,8 +280,8 @@ pass 'parallel requested normal/diagnostic builds generate once and link seriall
 
 : >"$TEST_CC_LOG"
 make -s -C "$fixture/blorp" BLORP_CC="$tools/fake cc" \
-	BLORP2_COMPILER='blorp/build/output compiler' \
-	BLORP2_COMPILER_C='blorp/build/output compiler.c' >"$scratch/make.stdout" 2>"$scratch/make.stderr" || { cat "$scratch/make.stderr" >&2; fail 'default compiler with quoted outputs'; }
+	BLORP_COMPILER='blorp/build/output compiler' \
+	BLORP_COMPILER_C='blorp/build/output compiler.c' >"$scratch/make.stdout" 2>"$scratch/make.stderr" || { cat "$scratch/make.stderr" >&2; fail 'default compiler with quoted outputs'; }
 printf 'seed\nlink:0\n' >"$scratch/expected"
 cmp -s "$TEST_CC_LOG" "$scratch/expected" || fail 'default target normal mode'
 [ -x "$fixture/blorp/build/output compiler" ] || fail 'explicit binary override'
@@ -285,7 +296,7 @@ pass 'standalone link-test-compiler preserves fixpoint boundary'
 : >"$TEST_CC_LOG"
 make -s -C "$fixture/blorp" example BLORP_CC="$tools/fake cc" >"$scratch/make.stdout" 2>"$scratch/make.stderr" || { cat "$scratch/make.stderr" >&2; fail 'seed-built example'; }
 [ "$(grep -c '^built$' "$TEST_CC_LOG")" = 2 ] || fail 'example did not use new compiler and real main'
-pass 'example uses newly built B2 executable'
+pass 'example uses newly built executable'
 # The test targets build one Blorp driver with the compiler under test and run
 # it once per mode. Only the fake driver executes here: what each mode does is
 # proven by the driver's unit suite and by running `make test` itself.
@@ -307,8 +318,8 @@ run_test_target() {
 	target="$1"
 	shift
 	TMPDIR="$link_parent" make -s -C "$fixture/blorp" "$target" BLORP_CC="$tools/fake cc" \
-		BLORP2_COMPILER='blorp/build/output compiler' \
-		BLORP2_COMPILER_C='blorp/build/output compiler.c' "$@" >"$scratch/make.stdout" 2>"$scratch/make.stderr"
+		BLORP_COMPILER='blorp/build/output compiler' \
+		BLORP_COMPILER_C='blorp/build/output compiler.c' "$@" >"$scratch/make.stdout" 2>"$scratch/make.stderr"
 }
 
 reset_driver_logs
@@ -363,8 +374,8 @@ pass 'test-components reports deferrals against the selection it ran'
 # `test` builds the driver once, then runs components, the deferral report and e2e.
 reset_driver_logs
 if ! TMPDIR="$link_parent" make -s -C "$fixture/blorp" test BLORP_CC="$tools/fake cc" \
-	BLORP2_COMPILER='blorp/build/output compiler' \
-	BLORP2_COMPILER_C='blorp/build/output compiler.c' >"$scratch/make.stdout" 2>"$scratch/make.stderr"; then
+	BLORP_COMPILER='blorp/build/output compiler' \
+	BLORP_COMPILER_C='blorp/build/output compiler.c' >"$scratch/make.stdout" 2>"$scratch/make.stderr"; then
 	cat "$scratch/make.stderr" >&2
 	fail 'test must run the self-hosted driver'
 fi
@@ -392,7 +403,7 @@ done
 unset TEST_DRIVER_COMPILE_STATUS TEST_CC_STATUS TEST_DRIVER_STATUS
 
 for target in test-target-components test-components test-e2e; do
-	expect_failure 'missing Blorp 2 test compiler' make -s -C "$fixture/blorp" "$target" BLORP2_COMPILER=missing-compiler
+	expect_failure 'missing Blorp test compiler' make -s -C "$fixture/blorp" "$target" BLORP_COMPILER=missing-compiler
 done
 pass 'every test target fails with actionable build help when the compiler is missing'
 printf '%s tests passed\n' "$passed"

@@ -4,11 +4,11 @@ BLORP_CC ?= clang
 # Makefile so `make -j compiler test-compiler` cannot race competing links.
 .NOTPARALLEL:
 # Paths are relative to the repository root, where every recipe runs.
-# test-compiler links BLORP2_COMPILER from BLORP2_COMPILER_C;
-# scripts/blorp2-fixpoint sets both per stage and links at -O0. A command-line
+# test-compiler links BLORP_COMPILER from BLORP_COMPILER_C;
+# scripts/blorp-fixpoint sets both per stage and links at -O0. A command-line
 # VAR=value overrides these; the environment does not (hence := and not ?=).
-BLORP2_COMPILER := blorp/build/compiler
-BLORP2_COMPILER_C := blorp/build/compiler.c
+BLORP_COMPILER := blorp/build/compiler
+BLORP_COMPILER_C := blorp/build/compiler.c
 TEST_COMPILER_FLAGS := -O0
 TEST_COMPILER_LIBRARIES := -lm -lpthread
 # The component programs are listed in test/e2e/self_hosted.brp. Setting this
@@ -31,20 +31,20 @@ compiler: generate-compiler
 	@$(MAKE) --no-print-directory link-compiler
 
 generate-compiler:
-	@echo 'Generate $(BLORP2_COMPILER_C)'
-	@cd .. && mkdir -p "$$(dirname "$(BLORP2_COMPILER_C)")" \
-		&& scripts/blorp2-compiler-bootstrap --library-root blorp/standard_library \
-			blorp/src/main.brp "$(BLORP2_COMPILER_C)"
+	@echo 'Generate $(BLORP_COMPILER_C)'
+	@cd .. && mkdir -p "$$(dirname "$(BLORP_COMPILER_C)")" \
+		&& scripts/blorp-compiler-bootstrap --library-root blorp/standard_library \
+			blorp/src/main.brp "$(BLORP_COMPILER_C)"
 
 link-compiler:
-	@echo 'Link $(BLORP2_COMPILER)'
-	@cd .. && mkdir -p "$$(dirname "$(BLORP2_COMPILER)")" \
+	@echo 'Link $(BLORP_COMPILER)'
+	@cd .. && mkdir -p "$$(dirname "$(BLORP_COMPILER)")" \
 		&& "$(BLORP_CC)" $(TEST_COMPILER_FLAGS) -DBLORP_MEMORY_DIAGNOSTICS=0 \
-			"$(BLORP2_COMPILER_C)" -o "$(BLORP2_COMPILER)" $(TEST_COMPILER_LIBRARIES)
+			"$(BLORP_COMPILER_C)" -o "$(BLORP_COMPILER)" $(TEST_COMPILER_LIBRARIES)
 
 example: compiler
 	@mkdir -p build
-	@cd .. && "$(BLORP2_COMPILER)" \
+	@cd .. && "$(BLORP_COMPILER)" \
 		--library-root blorp/standard_library blorp/test/e2e/fixtures/return/zero.brp blorp/build/return_zero.c
 	@"$(BLORP_CC)" -std=c11 -Wall -Wextra -Werror -pedantic -O0 \
 		build/return_zero.c -o build/return_zero
@@ -53,10 +53,10 @@ example: compiler
 # Straight-line shell that gives the test recipes absolute tool paths.
 define RESOLVE_TEST_TOOLS
 cd ..; \
-	compiler_path="$(BLORP2_COMPILER)"; \
+	compiler_path="$(BLORP_COMPILER)"; \
 	case "$$compiler_path" in /*) ;; *) compiler_path="$$PWD/$$compiler_path";; esac; \
 	if [ ! -x "$$compiler_path" ]; then \
-		printf '%s\n' 'missing Blorp 2 test compiler; run make -C blorp test-compiler first' >&2; exit 1; \
+		printf '%s\n' 'missing Blorp test compiler; run make -C blorp test-compiler first' >&2; exit 1; \
 	fi; \
 	cc_path=$$(command -v "$(BLORP_CC)") || { printf '%s\n' 'C compiler executable not found' >&2; exit 1; }; \
 	case "$$cc_path" in /*) ;; *) cc_path="$$PWD/$$cc_path";; esac; \
@@ -75,7 +75,7 @@ test:
 test-components: test-target-components
 	@set -eu; cd ..; BLORP_LEAK_CHECK=strict "$(TEST_DRIVER)" deferred $(TARGET_COMPONENT_SOURCES)
 
-# The driver is an ordinary B2 main(args) running TestSuites; fixtures retain
+# The driver is an ordinary Blorp main(args) running TestSuites; fixtures retain
 # their own real mains. It receives all configuration explicitly from Make, and
 # is built by the compiler under test, so a compiler defect cannot hide behind
 # a driver built by another one.
@@ -107,10 +107,10 @@ test-compiler: generate-compiler
 	@$(MAKE) --no-print-directory link-test-compiler
 
 link-test-compiler:
-	@echo 'Link $(BLORP2_COMPILER)'
-	@cd .. && mkdir -p "$$(dirname "$(BLORP2_COMPILER)")" \
+	@echo 'Link $(BLORP_COMPILER)'
+	@cd .. && mkdir -p "$$(dirname "$(BLORP_COMPILER)")" \
 		&& "$(BLORP_CC)" $(TEST_COMPILER_FLAGS) -DBLORP_MEMORY_DIAGNOSTICS=1 \
-			"$(BLORP2_COMPILER_C)" -o "$(BLORP2_COMPILER)" $(TEST_COMPILER_LIBRARIES)
+			"$(BLORP_COMPILER_C)" -o "$(BLORP_COMPILER)" $(TEST_COMPILER_LIBRARIES)
 
 test-e2e: build-test-driver
 	@set -eu; $(RESOLVE_TEST_TOOLS); \

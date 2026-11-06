@@ -1,10 +1,10 @@
-# Blorp 2 Dict
+# Blorp Dict
 
 Status: approved 2026-11-02, with the decisions below. Phases 0 to 4, 5a and 5b are done ([spike report](../benchmarks/results/blorp2-dict-spike-2026-11-02.md), [phase 1 results](../benchmarks/results/blorp2-dict-phase1-2026-11-02.md), [phase 2 results](../benchmarks/results/blorp2-dict-phase2-2026-11-02.md), [phase 3 results](../benchmarks/results/blorp2-dict-phase3-2026-11-02.md), [phase 4 results](../benchmarks/results/blorp2-dict-phase4-2026-11-02.md), [phase 5a results](../benchmarks/results/blorp2-dict-phase5a-2026-11-02.md), [phase 5b results](../benchmarks/results/blorp2-dict-phase5b-2026-11-03.md)); their findings are folded in below. Each phase gets its own implementation brief.
 
 ## Problem
 
-Blorp 2 has no dictionary.
+Blorp has no dictionary.
 
 **What the compiler uses instead:**
 - **One stopgap map,** `blorp/src/utils/hash_map.brp`. Its header says it is deleted "once Blorp has a dict implementation". It offers `get`, `set` and `values`, with no `remove`, no key listing and no literal syntax.
@@ -21,7 +21,7 @@ Blorp 2 has no dictionary.
 - A one-off self-compile sample at `8ac29e78e` (2026-11-02, not retained) put the hashed and bucketed lookups at about 6% of the run (`specialize.find_position` 2.8% inclusive, `hash_map.probe`/`set` 2.7%), with no linear lookup above 3%.
 - The retained 2026-10-30 attribution (`benchmarks/results/blorp_2_attribution_after_o1_2026-10-30.md`) showed `indexed_list.find_position` at 19.4% inclusive. Phase 0 re-measures both.
 
-**Goal:** an ordinary, insertion-ordered `Dict[K, V]` value in the Blorp 2 standard library, with the legacy literal syntax. Then remove the stopgap map and the bespoke structures. Sets follow after Dict.
+**Goal:** an ordinary, insertion-ordered `Dict[K, V]` value in the Blorp standard library, with the legacy literal syntax. Then remove the stopgap map and the bespoke structures. Sets follow after Dict.
 
 ## Requirements
 
@@ -50,7 +50,7 @@ Blorp 2 has no dictionary.
 trait DictKey: Hashable + Equatable
 ```
 
-- **Each key type opts in with one bodyless line:** `implements DictKey for String`. Blorp 2 writes every implementation; SUPERTRAITS_PLAN's deviations table says so ("Every implementation is written") and shows the bodyless bundle form. The library supplies `DictKey` for `Int`, `String` and `Bool`.
+- **Each key type opts in with one bodyless line:** `implements DictKey for String`. Blorp writes every implementation; SUPERTRAITS_PLAN's deviations table says so ("Every implementation is written") and shows the bodyless bundle form. The library supplies `DictKey` for `Int`, `String` and `Bool`.
 - **Hashable stays independent of Equatable,** as `blorp/README.md` records today. `DictKey` is the one place that combines them, which matches Rust: `Hash` and `Eq` are separate traits, and `HashMap` requires both.
 - **The type declares the bound:** `opaque type Dict[K: DictKey, V]`. The existing declaration-bound diagnostics (commits 51d98be37 and 2972ae0ce) then reject `Dict[Point, Int]` at every written type, with "implement DictKey for Point, or use a type that implements it". No Dict-specific error is needed, and an invalid Dict can't be represented. Functions repeat `K: DictKey`.
 
@@ -128,7 +128,7 @@ The pinned seed of the time found `with_capacity` by spelling for every Dict lit
     - `test_lex/test_ordering_operators.brp:40-41`.
 
     `test_parse/test_record_syntax.brp:18` only lexes `{}` and checks brace spans, so it stays.
-  - Blorp 2 rejects empty record declarations, so no program loses meaning.
+  - Blorp rejects empty record declarations, so no program loses meaning.
 
 ## Hashing
 
@@ -139,7 +139,7 @@ The pinned seed of the time found `with_capacity` by spelling for every Dict lit
   - `TypeHead`, the sealed instance keys, and the opaque ids in `utils/ids.brp`.
   - Those ids already have written `Equatable`, so derivation couldn't reach them anyway.
   - If a key needs a List, for example the argument lists in instance keys, add written `implements Hashable for List[T: Hashable]` and `implements DictKey for List[T: DictKey]`.
-- **Combining:** one named library function, `combine_hash(seed, value) = (seed + value) * PRIME`, wrapping. Blorp 2 has no xor or shift operators, and this needs neither. A key hashes by starting from 0 and combining every part in order, the first included: combining two parts directly would be symmetric, since `(a + b) * PRIME` is `(b + a) * PRIME`.
+- **Combining:** one named library function, `combine_hash(seed, value) = (seed + value) * PRIME`, wrapping. Blorp has no xor or shift operators, and this needs neither. A key hashes by starting from 0 and combining every part in order, the first included: combining two parts directly would be symmetric, since `(a + b) * PRIME` is `(b + a) * PRIME`.
 - **No Float keys (D2).** Float doesn't implement `DictKey`. A program that needs one wraps the Float in an opaque type with written implementations, for example over its bits or a canonicalized value.
 
 ## Implementation
@@ -292,7 +292,7 @@ These are set before implementation. A miss means stop and rescope.
 | Java (`HashMap<Double, V>`) | Allowed | One key: `Double.equals` compares canonical bits | **Different** keys |
 | JavaScript (`Map`) | Allowed | One key: SameValueZero | Same key |
 
-Each language that allows Float keys either loses NaN keys or uses a key equality that differs from its `==`. Blorp 2's Float `==` makes NaN unequal to itself, and a second equality just for keys would be a new concept. Excluding Float keys, as Rust does, is the safe and predictable choice. An opaque wrapper gives any of the other behaviours explicitly.
+Each language that allows Float keys either loses NaN keys or uses a key equality that differs from its `==`. Blorp's Float `==` makes NaN unequal to itself, and a second equality just for keys would be a new concept. Excluding Float keys, as Rust does, is the safe and predictable choice. An opaque wrapper gives any of the other behaviours explicitly.
 
 ## Risks
 

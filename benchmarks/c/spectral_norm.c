@@ -2,7 +2,7 @@
    https://benchmarksgame-team.pages.debian.net/benchmarksgame/
    contributed by Sebastien Loisel
 
-   Allocation contract intentionally mirrors benchmarks/blorp/spectral_norm.brp:
+   Allocation contract intentionally mirrors benchmarks/legacy/spectral_norm.brp:
    every matrix-vector multiply returns a fresh vector. */
 #include <math.h>
 #include <stdio.h>

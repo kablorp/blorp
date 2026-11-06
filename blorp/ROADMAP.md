@@ -1,6 +1,6 @@
-# Blorp 2 roadmap
+# Blorp roadmap
 
-This is the single plan for getting Blorp 2 to compile itself, and for the
+This is the single plan for getting Blorp to compile itself, and for the
 aggregate, ownership, generics and recursion contracts that path depends on. It
 replaces MEMORY_PLAN, MANAGED_RECORDS_PLAN, GENERICS_PLAN and RECURSION_PLAN;
 completed evidence stays in Git, with reports at
@@ -61,7 +61,7 @@ It does not mark the complete M8 resource gate green.
 
 The fixpoint the old compiler already uses, strengthened:
 
-1. The pinned B2 seed builds `blorp/src` and the target library into compiler **A**.
+1. The pinned seed builds `blorp/src` and the target library into compiler **A**.
 2. **A** compiles the same source into **B**; **B** compiles it into **C**.
 3. **B** and **C** emit byte-identical C. **B** passes the full e2e suite. For
    every e2e fixture, **A** and **B** emit byte-identical C. A self-consistent
@@ -107,7 +107,7 @@ their own inventory and plan after M8.
   its managed worktrees and verify the copies. Chat archival may remove those
   worktrees; their Git recovery snapshots omit ignored build files.
 - **The frontier.** One number across the path, reported by
-  `scripts/blorp2-fixpoint --frontier`: files of `src` that parse (report the
+  `scripts/blorp-fixpoint --frontier`: files of `src` that parse (report the
   discovered numerator and denominator, 35/37 at the final quality gate),
   then the phase reached on `main.brp` (load, check, specialize, lower, own,
   verify, emit, C compiles, B passes e2e, B == C).
@@ -259,7 +259,7 @@ its report. Later milestones build on these and do not reopen them.
   input under `ulimit -s 512` exits 0. The declaration and function walks
   retain their direct recursive form; M3 owns their managed-value tail-call
   limits rather than promising separate loop rewrites here.
-- **[scripts/blorp2-fixpoint](../scripts/blorp2-fixpoint)**: the three stages, a
+- **[scripts/blorp-fixpoint](../scripts/blorp-fixpoint)**: the three stages, a
   SHA-256 per stage with the first differing line, A == B over fixtures, e2e
   under B, `-O0`, and `--frontier`.
 - **Library dependencies:** check actual source imports against the
@@ -269,8 +269,8 @@ its report. Later milestones build on these and do not reopen them.
   corrections: 61 lambdas, 64 constants, sibling imports already relative.
 
 **Decision (harness).** The e2e harness takes the compiler under test from a
-required `BLORP2_COMPILER` environment variable, set by
-`make -C blorp test-e2e` ([Makefile](Makefile)). This is expected to be temporary: once blorp_2 is
+required `BLORP_COMPILER` environment variable, set by
+`make -C blorp test-e2e` ([Makefile](Makefile)). This is expected to be temporary: once the compiler is
 mature the test code will likely be rewritten (M8).
 
 **Exit proof.** The 4K-statement input compiles under `ulimit -s 512`; the
@@ -278,7 +278,7 @@ fixpoint script reports frontier 0.
 
 **Status.** The checker re-cut by phase ([check/](src/check/)), the emit and
 name-interning fixes, the parity table, the parser's statement loop, the
-fixpoint script and the `BLORP2_COMPILER` harness have landed.
+fixpoint script and the `BLORP_COMPILER` harness have landed.
 
 ## M1a: surface syntax parity
 
@@ -416,13 +416,13 @@ pure func collect(count: Int) -> List[Int]:
     values
 ```
 
-The retained workload is `benchmarks/blorp_2/list_ops.brp`; reproduce with the
-Blorp 2 compiler directly (same native flags for baseline and candidate):
+The retained workload is `benchmarks/blorp/list_ops.brp`; reproduce with the
+Blorp compiler directly (same native flags for baseline and candidate):
 
 ```bash
 mkdir -p build/list-buffer-reuse
 blorp/build/compiler --library-root blorp/standard_library \
-  benchmarks/blorp_2/list_ops.brp build/list-buffer-reuse/list_ops.c
+  benchmarks/blorp/list_ops.brp build/list-buffer-reuse/list_ops.c
 clang -O2 build/list-buffer-reuse/list_ops.c -lm -lpthread \
   -o build/list-buffer-reuse/list_ops
 build/list-buffer-reuse/list_ops
@@ -439,7 +439,7 @@ The legacy runtime confirms the intended precedent:
 relocates unique slots without retaining/dropping their children. Read these
 as reference, not code to port: legacy storage modes and ownership ABI differ.
 
-Blorp 2 already has the required architecture for Strings:
+Blorp already has the required architecture for Strings:
 `check/callables.brp:118` maps an accepted String builtin declaration's direct
 calls to `RuntimeTarget`, while callable values retain the borrowed wrapper;
 `own/own.brp:1015` selects a safe last-use transfer;
@@ -761,8 +761,8 @@ control flow, and each copies the whole accumulator:
    the join, once per iteration.
 
 Both are quadratic for an accumulator. L2b.1 retains the reproduction as
-`benchmarks/blorp/control_flow_accumulators.brp` with its Blorp 2 port in
-`benchmarks/blorp_2/`, an `args` file and an `EXTRA_BENCHMARKS` entry, per
+`benchmarks/legacy/control_flow_accumulators.brp` with its Blorp port in
+`benchmarks/blorp/`, an `args` file and an `EXTRA_BENCHMARKS` entry, per
 `benchmarks/README.md`. Acceptance runs invoke the built native program
 directly with each mode and size. Its ordinary `main(args)` reads a mode and
 a total append count:
@@ -898,7 +898,7 @@ blocks are checked against it.
 Rejected alternatives:
 
 1. **Rewrite `lex`, `program_inventory` and L3's `filter`** around the limit.
-   That fixes one site at a time, distorts source (Blorp 2 principle 6) and
+   That fixes one site at a time, distorts source (Blorp principle 6) and
    leaves every other accumulator quadratic.
 2. **Infer the entering set in the verifier.** Verification checks the
    continuation before the arms, so it needs the set first; inferring it from
@@ -1125,7 +1125,7 @@ make -C blorp test-target-components \
 make -C blorp test-target-components \
   TARGET_COMPONENT_SOURCES=blorp/test/unit/test_verify/test_ownership_transfer.brp
 make -C blorp test
-scripts/blorp2-fixpoint --prove
+scripts/blorp-fixpoint --prove
 git diff --check
 ```
 
@@ -1137,7 +1137,7 @@ copy each run's artifacts first:
 ```bash
 side=base   # or candidate
 mkdir -p build/l2b/$side
-scripts/blorp2-fixpoint --prove
+scripts/blorp-fixpoint --prove
 cp blorp/build/fixpoint/b.c build/l2b/$side/b.c
 clang -O2 -g -fno-omit-frame-pointer -DBLORP_MEMORY_DIAGNOSTICS=0 \
   build/l2b/$side/b.c -o build/l2b/$side/b_profile -lm -lpthread
@@ -1163,7 +1163,7 @@ For each stage:
    under `build/l2b/` that is not retained: candidate whole-compile
    instructions are within 1.10× of base B at every size, and no repeatable
    near-quadratic doubling appears that base lacks.
-4. `scripts/blorp2-fixpoint --prove` passes; every strict report balances.
+4. `scripts/blorp-fixpoint --prove` passes; every strict report balances.
 5. **Fixtures.** No e2e allocation count increases. Every differing emitted
    fixture C (A, base versus candidate) is classified as drops moved into
    arms, a borrowed update becoming consuming, or a removed entry
@@ -1201,7 +1201,7 @@ the shared scan shows in the profile, or a premise above proves wrong.
 
 L2b.1 as landed includes its review follow-up. With the follow-up, `make -C
 blorp test` reports 47 suites and 375 tests with no failures, native e2e 9
-of 9; `scripts/blorp2-fixpoint --prove` reaches the fixpoint: A, B and C emit
+of 9; `scripts/blorp-fixpoint --prove` reaches the fixpoint: A, B and C emit
 identical compiler C (`af1ca68e54d1`), all 594 fixtures match under A and B,
 and B passes the components (322 tests, every strict report balanced) and the
 native e2e selection. The new loop-entry fixture prints identical output and
@@ -1271,7 +1271,7 @@ now transfer). Raw samples, commands and logs are local, under ignored
 ### L2b.2 validation
 
 Measured against `de2d4e4dd` (L2b.1 on main). With the review follow-up,
-`scripts/blorp2-fixpoint --prove` reaches the fixpoint: A, B and C emit
+`scripts/blorp-fixpoint --prove` reaches the fixpoint: A, B and C emit
 identical compiler C (`2975e872a5f2`), all 595 fixtures match under A and B,
 and B passes the components (347 tests, every strict report balanced) and
 the native e2e selection. `make -C blorp test` passes 401 tests. The new `branch_accumulator` fixture prints
@@ -1358,7 +1358,7 @@ for the frozen input; its instructions rise 0.04% and its allocations 0.21%,
 from a closure that replaced a duplicated list of entering rows.
 
 These deferred suites pin a drop after a join, mostly of a selection's
-parent, and so still encode the old rule. They cannot compile under Blorp 2;
+parent, and so still encode the old rule. They cannot compile under Blorp;
 when ported, each expects the owner to enter its join instead, so their
 failures are not regressions: `test_emit/test_owned_prefix.brp:70`, `:118`
 and `:190`; `test_own/test_source_loop_control.brp:184`;
@@ -1482,7 +1482,7 @@ Run one narrow suite before the broad gates, for example:
 make -C blorp test-compiler
 make -C blorp test-target-components \
   TARGET_COMPONENT_SOURCES=blorp/test/unit/test_own/test_list_reuse.brp
-scripts/blorp2-fixpoint --prove
+scripts/blorp-fixpoint --prove
 ```
 
 `test_list_reuse.brp` is a proposed new suite, not an existing test. Wire the
@@ -1782,13 +1782,13 @@ no-op visits, so they are not atomic-operation counts. Report which copies
 L2b closed and the record, union and String RC traffic. O1 does not start
 before this report; O3 is decided from it.
 
-O0 also compares Blorp 2 against the legacy compiler. Its Core passes in
+O0 also compares Blorp against the legacy compiler. Its Core passes in
 [`blorp/src/compiler/stage_09_core/`](https://github.com/kablorp/blorp/blob/ee9e001c6de8911ee486fd992419bef5bc628e8b/blorp/src/compiler/stage_09_core/) already infer consumed user-call arguments
 (`ownership_contracts.brp`), clone consuming record callees
 (`consume_specialize.brp`) and reuse record and union cells (`reuse.brp`, `record_update.brp`). The plan must match that
 reach with independent verification and far less code. Land `helper_accumulators` (modes `list_helper`,
-`string_helper`, `set_helper`, `none`) in `benchmarks/blorp/` and
-`benchmarks/blorp_2/` with an `args` file and an `EXTRA_BENCHMARKS` entry,
+`string_helper`, `set_helper`, `none`) in `benchmarks/legacy/` and
+`benchmarks/blorp/` with an `args` file and an `EXTRA_BENCHMARKS` entry,
 like `control_flow_accumulators`. Build `helper_accumulators`,
 `control_flow_accumulators`, `compiler_ast`, `binary_trees` and
 `compiler_emit` with both compilers from the same commit, with the same C
@@ -1856,7 +1856,7 @@ quadratic run would need about 4.3e10 instructions at 65,536 and 1.7e11 at
 131,072. Growth per doubling omits the 4,096 to 8,192 step, where startup
 jitter of about 1 M instructions exceeds the work:
 
-| Mode at 65,536 | Legacy | Blorp 2 | Legacy per doubling | Blorp 2 per doubling | Allocations, legacy / Blorp 2 |
+| Mode at 65,536 | Legacy | Blorp | Legacy per doubling | Blorp per doubling | Allocations, legacy / Blorp |
 | --- | ---: | ---: | ---: | ---: | ---: |
 | `list_helper` | 2.40 M | 3,330 M | 1.69-2.08× | 3.75-3.88× | 21 / 65,544 |
 | `string_helper` | 9.80 M | 523 M | 1.92-2.07× | 2.78-3.66× | 23 / 65,544 |
@@ -1865,25 +1865,25 @@ jitter of about 1 M instructions exceeds the work:
 | `nested` | 2.52 M | 2.81 M | 1.81-1.97× | 1.80-1.95× | 21 / 8 |
 | `flat` | 2.49 M | 2.79 M | 1.64-1.93× | 1.92-1.99× | 21 / 8 |
 
-Blorp 2's helper modes allocate once per update at every size (count plus 8:
+Blorp's helper modes allocate once per update at every size (count plus 8:
 4,104 at 4,096 to 65,544 at 65,536); the legacy compiler's stay between 7 and
 23 in every mode and size. The legacy compiler is
-linear in every mode. After L2b, Blorp 2 is linear inside one function but
+linear in every mode. After L2b, Blorp is linear inside one function but
 copies on every helper call, which is exactly O1's scope; O1's parity
 criterion is unmet today by one to three orders of magnitude (53× for
 `string_helper`, 1,387× for `list_helper`, 6,400× for `set_helper`).
 
-| Benchmark | Legacy instructions | Blorp 2 | Allocations, legacy / Blorp 2 |
+| Benchmark | Legacy instructions | Blorp | Allocations, legacy / Blorp |
 | --- | ---: | ---: | ---: |
 | `compiler_ast` | 177.5 M | 195.0 M | 310,316 / 310,315 |
 | `binary_trees 15` | 3,299 M | 3,529 M | 6,444,438 / 6,444,423 |
 | `compiler_emit` | 33.0 M | 69.9 M | 8 / 52,328 |
 
 Legacy cell reuse saves no allocations on `compiler_ast` or
-`binary_trees`, so neither is a witness for O3; Blorp 2 trails them by 7-15%
+`binary_trees`, so neither is a witness for O3; Blorp trails them by 7-15%
 of instructions after startup. In `compiler_emit`, a counter added to
 `blorp_string_from_bytes` in a scratch copy of the generated C counts 52,327
-calls, so all but one of Blorp 2's 52,328 allocations materialise String
+calls, so all but one of Blorp's 52,328 allocations materialise String
 literals, which the legacy compiler emits as static data. The instruction gap
 (about 15 M against 58 M after startup) is not attributed.
 
@@ -1927,7 +1927,7 @@ three runs, serial:
 | Spike B, seeds narrowed to parameter-fed operands | 31,718 M (+6.6%) | 27.60 M (+9.7%) |
 | Spike C | 29,391 M (−1.19%) | 26.32 M (+4.6%) |
 
-- **Correctness.** `make -C blorp test` and `scripts/blorp2-fixpoint --prove`
+- **Correctness.** `make -C blorp test` and `scripts/blorp-fixpoint --prove`
   passed. All 595 e2e fixtures behaved identically under `AllBorrowed`,
   `InferredLabels` and `AllOwnedExceptPinned`, and the verifier accepted
   every labelling. The spike also reported, without a retained log, that
@@ -2118,7 +2118,7 @@ because arms and loops start fresh builders. Own and verify are unchanged.
   old record live after the call, so the call acquires it and the append
   copies, under both O1 and O2. No retained benchmark mode measures this
   shape; it is unmeasured. Threading by `?=` propagation exits on `Err`, so
-  nothing keeps the old value live. Blorp 2 does not compile a `?=` self-tail
+  nothing keeps the old value live. Blorp does not compile a `?=` self-tail
   call to a loop, so `record_result` recurses once per step and overflows an
   8 MB stack above about 131,072 steps; it is measured only to that size.
   The legacy compiler is also quadratic on the `?=` `record_result` (13,518 M
@@ -2136,7 +2136,7 @@ Measured 2026-10-30 on an Apple M4 with Apple clang 21, `-O2`, with other
 sessions' test gates running on the same machine, so counts are retired
 instructions and allocations, not time. `helper_accumulators`, serial. Raw
 instructions include the `none` process-startup control (about 12.5 M for
-Blorp 2, 18.2 M for the legacy compiler). Base is `cf59a1e30`.
+Blorp, 18.2 M for the legacy compiler). Base is `cf59a1e30`.
 
 | Mode (131,072 updates; `record_result` 65,536) | Base instructions | Base allocations | O2 instructions | O2 allocations | Legacy instructions | Legacy allocations |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
@@ -2245,7 +2245,7 @@ branch-dependent obligation in the verifier, adds runtime helpers per layout
 and spreads parameter labels, so it proceeds only if the attribution shows
 record and union cascades or allocation traffic worth it. O0's
 `compiler_ast` and `binary_trees` comparison found no allocation witness, but
-self-compile allocations were not split by kind. Without O3, Blorp 2 stays
+self-compile allocations were not split by kind. Without O3, Blorp stays
 behind the legacy compiler on record and union rebuilding.
 
 ### O1 follow-ups
@@ -2355,7 +2355,7 @@ shared contract. Not in this plan: moves at stores and control edges
 them and step 0 counted only owned-call acquisitions, so the
 [attribution after O1](#attribution-after-o1) counts them; since approved as
 [moves at last use](#moves-at-last-use)), non-atomic
-reference counts for thread-local values (deferred until Blorp 2 has a
+reference counts for thread-local values (deferred until Blorp has a
 concurrency design), a report, LSP or `@in_place` (new surface, needs approval),
 Lean-style owning uses beyond reuse (only after O3), owned callable parameters
 and tail-call owning use (see Pins). Do not touch L2b's worktrees or reopen
@@ -2448,7 +2448,7 @@ Test migration: 58 test files reference `OwnershipProgram`, 57 build
 literal states its rows with explicit `owned = False`. The deferred suites
 among them are migrated in source: rows come from
 `ownership_inputs.borrowed_rows`, which follows each type's layout, and reads
-of an `OwnedFunction` use `parameters` and `return_type`. Neither Blorp 2 nor
+of an `OwnedFunction` use `parameters` and `return_type`. Neither Blorp nor
 the legacy compiler can compile them on main, for unrelated reasons, so they
 stay deferred, outside the gates and unchecked.
 
@@ -2461,7 +2461,7 @@ make -C blorp test-target-components \
 make -C blorp test-target-components \
   TARGET_COMPONENT_SOURCES=blorp/test/unit/test_verify/test_owned_parameters.brp
 make -C blorp test
-scripts/blorp2-fixpoint --prove
+scripts/blorp-fixpoint --prove
 git diff --check
 ```
 
@@ -2480,16 +2480,16 @@ root=$PWD
 out=$root/build/ownership/$side && mkdir -p $out
 for name in helper_accumulators control_flow_accumulators compiler_ast binary_trees compiler_emit; do
   # Run it outside the checkout so the release's embedded library is used.
-  (cd "$(mktemp -d)" && "$legacy" compile "$root/benchmarks/blorp/$name.brp" -o $out/${name}_legacy.c)
+  (cd "$(mktemp -d)" && "$legacy" compile "$root/benchmarks/legacy/$name.brp" -o $out/${name}_legacy.c)
   blorp/build/compiler --library-root blorp/standard_library \
-    benchmarks/blorp_2/$name.brp $out/${name}_blorp2.c
-  for compiler in legacy blorp2; do
+    benchmarks/blorp/$name.brp $out/${name}_blorp.c
+  for compiler in legacy blorp; do
     clang -fwrapv -O2 -DBLORP_MEMORY_DIAGNOSTICS=0 $out/${name}_$compiler.c \
       -o $out/${name}_$compiler -lm -lpthread
   done
 done
 # Each mode at 4,096 doubling to 131,072; subtract the `none` control.
-/usr/bin/time -l $out/helper_accumulators_blorp2 list_helper 4096
+/usr/bin/time -l $out/helper_accumulators_blorp list_helper 4096
 ```
 
 ### Acceptance criteria
@@ -2500,7 +2500,7 @@ Binding since step 0 (accepted 2026-10-29):
   and equal logical allocations across sizes for `list_helper` and
   `set_helper`.
 - **Legacy parity:** in every List and String mode of `helper_accumulators`
-  and `control_flow_accumulators`, at the largest size, Blorp 2's normal
+  and `control_flow_accumulators`, at the largest size, Blorp's normal
   instructions and logical allocations are at most the legacy compiler's,
   and its growth per doubling is no worse. Report `compiler_ast`,
   `binary_trees` and `compiler_emit` against O0 without a ceiling; they
@@ -3237,15 +3237,15 @@ Historical resource failures retain their original verdicts.
 
 ## M8: the fixpoint gate
 
-**Goal.** The definition of done. **Scope.** `scripts/blorp2-fixpoint` exits 0:
+**Goal.** The definition of done. **Scope.** `scripts/blorp-fixpoint` exits 0:
 B == C, A == B on every fixture, e2e under B, all at `-O0`. Measure the
 self-compile cost row (allocations and instructions per phase) under
 always-fresh `append`; if quadratic, unique-root reuse is the first post-fixpoint
 optimization candidate for M9 to assess before implementation.
 **Decision (harness).** The e2e harness has no closure values: tests
 are dispatched by name. It does not add a lambda prerequisite to bootstrap.
-The `BLORP2_COMPILER` harness is expected to
-be rewritten once blorp_2 is mature. The unit-test migration is a separate plan.
+The `BLORP_COMPILER` harness is expected to
+be rewritten once the compiler is mature. The unit-test migration is a separate plan.
 
 **Exit proof.** The fixpoint script exits 0.
 
@@ -3259,7 +3259,7 @@ the self-built compiler passes all 559 e2e functional callbacks under the explic
 initial-bootstrap cost-debt policy. Whole-source `-O0` ASan/UBSan compilation reproduces the same C and balances
 27,373,418 allocations/releases with no tracked leaks after replacing flat
 declaration recursion with an ordinary source loop. The final native run also
-passes from a fresh working directory. The verified three-platform seed is pinned and the default B2 build uses it.
+passes from a fresh working directory. The verified three-platform seed is pinned and the default build uses it.
 Legacy TestSuite hosting remains separate. The remaining cost obligations above
 are still pending; this checkpoint does
 not mark the complete M8 resource gate green.

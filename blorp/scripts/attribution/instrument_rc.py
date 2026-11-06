@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Count every atomic reference-count operation in Blorp 2 generated C, by kind and by source.
+"""Count every atomic reference-count operation in Blorp generated C, by kind and by source.
 
 Scratch measurement only: it rewrites a copy of the generated C and never touches
 the repository. The instrumented program counts operations in plain integers, so

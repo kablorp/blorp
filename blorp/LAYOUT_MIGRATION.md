@@ -544,15 +544,15 @@ One serial compiled CPU lane; no parallel compiler or native measurements.
 From repository root, after fixing any seed/host freshness problem:
 
 ```bash
-scripts/blorp2-compiler-bootstrap --print-id
+scripts/blorp-compiler-bootstrap --print-id
 packet="$PWD/build/layout-simplification/M1"
 mkdir -p "$packet/artifacts"
 make -C blorp test-compiler \
-  BLORP2_COMPILER_C="$packet/artifacts/compiler.c" \
-  BLORP2_COMPILER="$packet/artifacts/compiler-diagnostic"
+  BLORP_COMPILER_C="$packet/artifacts/compiler.c" \
+  BLORP_COMPILER="$packet/artifacts/compiler-diagnostic"
 make -C blorp link-compiler \
-  BLORP2_COMPILER_C="$packet/artifacts/compiler.c" \
-  BLORP2_COMPILER="$packet/artifacts/compiler-normal"
+  BLORP_COMPILER_C="$packet/artifacts/compiler.c" \
+  BLORP_COMPILER="$packet/artifacts/compiler-normal"
 
 make -C blorp test-target-components TARGET_COMPONENT_SOURCES="<changed target suites>"
 ```
@@ -569,9 +569,9 @@ and the actual self-compiled compiler's full e2e/fixpoint once:
 
 ```bash
 make -C blorp test-components \
-  BLORP2_COMPILER="$packet/artifacts/compiler-diagnostic"
-BLORP_2_INSTRUCTION_CHECK=disabled BLORP_2_RESOURCE_POLICY=record-allocation-debt \
-  scripts/blorp2-fixpoint --prove
+  BLORP_COMPILER="$packet/artifacts/compiler-diagnostic"
+BLORP_INSTRUCTION_CHECK=disabled BLORP_RESOURCE_POLICY=record-allocation-debt \
+  scripts/blorp-fixpoint --prove
 cmp blorp/build/fixpoint/a.c blorp/build/fixpoint/b.c
 cmp blorp/build/fixpoint/b.c blorp/build/fixpoint/c.c
 ```

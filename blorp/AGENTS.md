@@ -1,4 +1,4 @@
-# Blorp 2
+# Blorp
 
 Read the repository's parent [AGENTS.md](../AGENTS.md) in full, then this
 file; both apply. [README.md](README.md) defines the supported increment and
@@ -6,7 +6,7 @@ owns runnable commands; [grammar.ebnf](grammar.ebnf) is its grammar.
 
 ## Scope
 
-The pinned Blorp 2 seed builds the current compiler. All active Blorp 2 tests
+The pinned Blorp seed builds the current compiler. All active Blorp tests
 are self-hosted. Unported suites remain in source and are explicitly
 deferred. Compiler source stays within the eventual bootstrap subset in the
 README: no concurrency, parallelism, tensors
@@ -102,7 +102,7 @@ Commands, from the repository root:
 make -C blorp compiler                  # build the compiler from the pinned seed
 make -C blorp test                      # components, deferrals report and first native e2e
 make -C blorp test-target-components TARGET_COMPONENT_SOURCES=<paths>   # one suite
-scripts/blorp2-fixpoint --prove           # A builds B, B builds C, B == C
+scripts/blorp-fixpoint --prove          # A builds B, B builds C, B == C
 bash blorp/test/tooling/test_bootstrap.sh   # bootstrap resolver and Makefile recipes
 bash benchmarks/bench.sh <name>           # cross-language speed table (see benchmarks/README.md)
 ```
@@ -110,9 +110,9 @@ bash benchmarks/bench.sh <name>           # cross-language speed table (see benc
 **Tests.** Compiler tests are Blorp `TestSuite`s, not a test `main` or Python.
 The one sanctioned shell test is
 [test/tooling/test_bootstrap.sh](test/tooling/test_bootstrap.sh): it tests the
-download, verify and cache failure modes of `scripts/blorp2-compiler-bootstrap`
+download, verify and cache failure modes of `scripts/blorp-compiler-bootstrap`
 and the Makefile recipes with fixture releases, which is shell tooling tested
-in shell. CI runs it after `make -C blorp test`; porting it to a Blorp 2
+in shell. CI runs it after `make -C blorp test`; porting it to a Blorp
 program is a separate change.
 Every compiler source module has a unit suite under
 [test/unit/](test/unit/), in the `test_<stage>/` folder that mirrors the module's
@@ -120,11 +120,11 @@ folder under `src/`. Grammar cases live under
 [test/test_grammar/](test/test_grammar/) and change with the EBNF.
 Target component suites declare an ordinary `tests: TestSuite` constant in the
 suite file itself.
-`make -C blorp test` builds Blorp 2, runs the explicit component selection
+`make -C blorp test` builds Blorp, runs the explicit component selection
 (`COMPONENT_SOURCES` in [test/e2e/self_hosted.brp](test/e2e/self_hosted.brp))
 through its ordinary TestSuite entries, and runs the first self-hosted native
 e2e selection. `test-components` and `test-target-components` run that selection
-with an already-built B2 compiler; `TARGET_COMPONENT_SOURCES=<paths>` makes
+with an already-built Blorp compiler; `TARGET_COMPONENT_SOURCES=<paths>` makes
 `test-target-components` run exactly those suites instead. Unported
 unit/runtime/grammar/tooling suites are DEFERRED, preserved for incremental
 migration, and receive no PASS credit; `test-components` prints how many
