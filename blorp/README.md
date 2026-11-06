@@ -3020,10 +3020,10 @@ acceptance remain pending.
 `fs` is an explicit import with typed errors, built on these builtin labels:
 `fs.read_text`, `fs.write_text`, `fs.entry_kind`, `fs.list_directory`,
 `fs.create_directory`, `fs.create_directories`, `fs.remove_file`,
-`fs.remove_directory`, `fs.remove_directory_tree`, `fs.rename` and
-`fs.create_temporary_directory`. Each fails with an Int code and succeeds with
-Void, an Int code, a list or a String, which `fs.brp` decodes, so the compiler
-knows no `fs` type.
+`fs.remove_directory`, `fs.remove_directory_tree`, `fs.rename`,
+`fs.create_temporary_directory`, `fs.open_read`, `fs.next_lines` and
+`fs.close`. Each fails with an Int code and succeeds with Void, an Int code, a
+list or a String, which `fs.brp` decodes, so the compiler knows no `fs` type.
 
 ```blorp
 import:
@@ -3114,6 +3114,42 @@ func load_settings(path: String) -> Result[String, IOError]:
   `parent`, the one exception to the rule below; a failure to create it names
   `parent`. A signal, `abort()` or a stack overflow can still leave the
   directory behind.
+- `fold_lines(path, initial, step, io_error)` folds `step` over a file's lines
+  in order, reading a block at a time, so memory follows the longest line and
+  never the file. It is generic in the fold's accumulator `T` and error `E`:
+  `step: (T, String) -> Result[T, E]` takes the accumulator and the next line,
+  and `io_error` converts this library's own `IOError`, as in
+  `with_temporary_directory`. A line ends at LF and one CR just before it is
+  removed; a last line without LF counts and an empty file has no lines. The
+  first `Err` from `step` stops reading and is the result. A failure to open or
+  read is the result too: a directory is `IsADirectory`, a line that is not
+  UTF-8 is `InvalidUtf8`, and a failed read returns none of its block's lines,
+  though the steps already taken stay taken. The file is opened as `read_text`
+  opens it and closed before `fold_lines` returns on every path the program
+  controls; no descriptor reaches the caller, so none can be closed twice or
+  read after its close. A FIFO blocks until a line arrives or its writer
+  closes. `step` borrows its accumulator, so appending to a List in `step`
+  copies it on every line; to collect every line, use `read_text`.
+
+  ```blorp
+  import:
+      fs: IOError, fold_lines
+      string: String methods
+
+  union ScoreError:
+      Unreadable(IOError)
+      NotANumber(String)
+
+  pure func add_score(total: Int, line: String) -> Result[Int, ScoreError]:
+      match line.parse_int():
+          Some(score): Ok(total + score)
+          None: Err(NotANumber(line))
+
+  -- "3\r\n4\n5" gives Ok(12). "3\nx\n5" gives Err(NotANumber("x")), and the
+  -- fold stops reading at "x". A missing file gives Err(Unreadable(...NotFound)).
+  func total_score(path: String) -> Result[Int, ScoreError]:
+      fold_lines(path, 0, add_score, pure func(error: IOError) -> ScoreError: Unreadable(error))
+  ```
 - `IOError` holds the caller's `path`, an optional `destination` for
   two-path operations, and an `IOErrorKind`, a fixed union: `NotFound`,
   `PermissionDenied`, `AlreadyExists`, `NotADirectory`, `IsADirectory`,
@@ -3127,15 +3163,18 @@ func load_settings(path: String) -> Result[String, IOError]:
   into `Ok(fallback)` and leaves every other result alone.
 
 The runtime C is tested by `test/runtime/fs_suite.brp` and the examples
-`test/e2e/fixtures/fs/read.brp`, `write.brp` and `directories.brp`. The read
-example reads a tree that `prepare.sh` builds, since no `fs` operation can
-create a non-UTF-8 file, a symlink loop, a mode-000 file or a FIFO. The write
+`test/e2e/fixtures/fs/read.brp`, `lines.brp`, `write.brp` and `directories.brp`.
+The read and lines examples read a tree that `prepare.sh` builds, since no `fs`
+operation can create a non-UTF-8 file, a symlink loop, a mode-000 file or a
+FIFO; the lines example writes its own text files in a temporary directory made
+in that tree. Its 1,000 early stops and 300 failed reads each close their file;
+that shows only where the limit is macOS's default of 256 descriptors. The write
 and directories examples change the directory they are given, so
 `prepare_write.sh` and `prepare_directories.sh` rebuild it before each of
 their two runs. The latter builds a link out of a tree to a file that must
 survive, a mode-000 directory and names whose byte order differs from a naive
 order. Run as root, `prepare.sh` exits with status 77 and the harness reports
-all three examples "not run", with no PASS credit; the runtime suite likewise
+all four examples "not run", with no PASS credit; the runtime suite likewise
 leaves out its permission case. The directories example leaves out
 `CrossesDevices` and the mount-point rules (a second device),
 `ChangedDuringRemoval` (a race), `InvalidUtf8` in a name (APFS refuses to
