@@ -395,6 +395,42 @@ fits beside `print` and the other effects.
   failed removal. A failure to create the directory names `parent`; a failed
   removal names the directory itself, the one exception to the rule below. A
   signal, `abort()` or a stack overflow can still leave the directory behind.
+- `fold_lines(path, initial, step, io_error)` folds `step` over a file's lines
+  in order, reading a block at a time, so memory follows the longest line and
+  never the file. It is generic in the fold's accumulator `T` and error `E`:
+  `step: (T, String) -> Result[T, E]` takes the accumulator and the next line,
+  and `io_error` converts this library's own `IOError`, as in
+  `with_temporary_directory`. A line ends at LF and one CR just before it is
+  removed; a last line without LF counts and an empty file has no lines. The
+  first `Err` from `step` stops reading and is the result. A failure to open or
+  read is the result too: a directory is `IsADirectory`, a line that is not
+  UTF-8 is `InvalidUtf8`, and a failed read returns none of its block's lines,
+  though the steps already taken stay taken. The file is opened as `read_text`
+  opens it and closed before `fold_lines` returns on every path the program
+  controls; no descriptor reaches the caller, so none can be closed twice or
+  read after its close. A FIFO blocks until a line arrives or its writer
+  closes. `step` borrows its accumulator, so appending to a List in `step`
+  copies it on every line; to collect every line, use `read_text`.
+
+  ```blorp
+  import:
+      fs: IOError, fold_lines
+      string: String methods
+
+  union ScoreError:
+      Unreadable(IOError)
+      NotANumber(String)
+
+  pure func add_score(total: Int, line: String) -> Result[Int, ScoreError]:
+      match line.parse_int():
+          Some(score): Ok(total + score)
+          None: Err(NotANumber(line))
+
+  -- "3\r\n4\n5" gives Ok(12). "3\nx\n5" gives Err(NotANumber("x")), and the
+  -- fold stops reading at "x". A missing file gives Err(Unreadable(...NotFound)).
+  func total_score(path: String) -> Result[Int, ScoreError]:
+      fold_lines(path, 0, add_score, pure func(error: IOError) -> ScoreError: Unreadable(error))
+  ```
 - `IOError` holds the caller's `path`, an optional `destination` for
   two-path operations, and an `IOErrorKind`: `NotFound`, `PermissionDenied`,
   `AlreadyExists`, `NotADirectory`, `IsADirectory`, `DirectoryNotEmpty`,
@@ -408,8 +444,10 @@ fits beside `print` and the other effects.
   into `Ok(fallback)` and leaves every other result alone.
 
 The runtime C is tested by `test/runtime/fs_suite.brp`, and the examples
-`test/e2e/fixtures/fs/read.brp`, `write.brp` and `directories.brp` run the
-library through ordinary mains.
+`test/e2e/fixtures/fs/read.brp`, `lines.brp`, `write.brp` and `directories.brp`
+run the library through ordinary mains. The harness runs `lines.brp` with at
+most 256 open descriptors, so a fold that left its file open would fail its
+1,000 early stops and 300 failed reads on every machine.
 
 ### Logical paths
 
