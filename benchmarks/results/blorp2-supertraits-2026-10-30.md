@@ -1,6 +1,6 @@
 # Blorp 2 supertraits: frozen-input cost
 
-Milestone 1 of the [supertraits plan](../../blorp_2/SUPERTRAITS_PLAN.md). The
+Milestone 1 of the [supertraits plan](../../blorp/SUPERTRAITS_PLAN.md). The
 plan set three ceilings: retired instructions at most +0.3%, allocations at
 most +0.05%, and at most 300 production lines. The instruction and allocation
 ceilings are met with byte-identical output C. `blorp_2/src` grows by 308 net

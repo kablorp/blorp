@@ -1,0 +1,112 @@
+import:
+	../../../src/check/check: check
+	../../../src/load/load: load_program
+	../../../src/lower/lower: lower
+	../../../src/namespace/builtins as Builtins
+	../../../src/own/own as Own
+	../../../src/specialize/specialize as Concrete
+	../../../src/utils/source: label_text
+	../consumed_calls: all_consumed, first_argument_consumed, first_argument_owned
+	bool: and, Bool methods
+	int: Int methods
+	io: print_error
+	list: List methods
+	result: Result methods
+	string: String methods
+	test: TestSuite
+
+
+private LIBRARY_ROOT: String = "blorp/standard_library"
+
+-- Instantiates Dict[Int, String] and calls set, remove, get_or and equality.
+private DICT_FIXTURE: String = "blorp/test/e2e/fixtures/dict/int_keys.brp"
+
+
+-- A List append or a List set: the two calls that update a field List in place.
+private pure func is_list_update(definition: Own.OwnedDefinition) -> Bool:
+	match definition.operation:
+		Own.CallDefinition(Concrete.RuntimeFunction(Builtins.ListAppend(_)), _): True
+		Own.CallDefinition(Concrete.RuntimeFunction(Builtins.ListSet(_)), _): True
+		_: False
+
+
+private func dict_program() -> Result[Own.OwnershipProgram, String]:
+	loaded ?= load_program(DICT_FIXTURE, LIBRARY_ROOT).map_err(pure func(failure): failure.diagnostic.message)
+	checked ?= check(loaded.program).map_err(pure func(_): DICT_FIXTURE + " does not check")
+	lowered ?= Concrete.specialize(checked).and_then(lower).map_err(pure func(error): error.message)
+	Own.own(lowered).map_err(pure func(error): error.message)
+
+
+-- Every instance of `dict.<name>` takes its Dict parameter owned, and each of
+-- its at least `expected` List updates receives its List as an owned occurrence.
+-- A record update projects each field and releases the old record before its
+-- replacements run, so the field Lists are unique when they are updated. A record
+-- literal built from the old record's fields keeps that record borrowed from the
+-- caller, and each update then copies its List. The strict allocation count of
+-- fixtures/dict/linear_build.brp pins the same property from the other end.
+private func dict_function_updates(name: String, expected: Int) -> Bool:
+	match dict_program():
+		Err(message):
+			print_error(message)
+			False
+		Ok(program):
+			var seen = 0
+			var consumed: Bool = True
+			for function in program.functions:
+				if label_text(function.label) == "dict." + name:
+					seen = seen + 1
+					owns_record = match function.parameters:
+						[first, ..._]: Own.parameter_owned(first)
+						_: False
+					consumed = and(consumed, and(owns_record, all_consumed(first_argument_owned(function.operations, is_list_update), expected)))
+			found = and(seen > 0, consumed)
+			if found.not():
+				print_error("dict." + name + ": " + seen.to_string() + " instances, a Dict parameter is borrowed, a List update borrows its List, or fewer than " + expected.to_string() + " updates")
+			found
+
+
+-- The rebuild fills local Lists in a loop: the accumulator rule of the List
+-- library loops, since its Dict parameter is only read.
+private func rebuild_updates() -> Bool:
+	match dict_program():
+		Err(message):
+			print_error(message)
+			False
+		Ok(program):
+			var seen = 0
+			var consumed: Bool = True
+			for function in program.functions:
+				if label_text(function.label) == "dict.rebuilt":
+					seen = seen + 1
+					consumed = and(consumed, all_consumed(first_argument_consumed(function.operations, is_list_update), 3))
+			found = and(seen > 0, consumed)
+			if found.not():
+				print_error("dict.rebuilt: " + seen.to_string() + " instances, an update borrows its accumulator or fewer than 3 updates")
+			found
+
+
+func test_appended_entry_takes_the_last_owner_of_each_field_list() -> Bool:
+	dict_function_updates("appended", 4)
+
+
+func test_set_of_an_existing_key_takes_the_last_owner_of_the_values() -> Bool:
+	dict_function_updates("set", 1)
+
+
+func test_remove_takes_the_last_owner_of_the_live_flags_and_slots() -> Bool:
+	dict_function_updates("remove", 4)
+
+
+func test_rebuild_takes_the_last_owner_of_its_local_lists() -> Bool:
+	rebuild_updates()
+
+
+tests: TestSuite = {
+	description = "Dict updates take the last owner of each field List",
+	tests = [
+		("a new entry appends to the keys, values and live flags and sets its slot in place", test_appended_entry_takes_the_last_owner_of_each_field_list),
+		("replacing a value sets it in place", test_set_of_an_existing_key_takes_the_last_owner_of_the_values),
+		("remove marks the entry dead and its slot deleted in place", test_remove_takes_the_last_owner_of_the_live_flags_and_slots),
+		("a rebuild fills local Lists in place", test_rebuild_takes_the_last_owner_of_its_local_lists),
+	]
+}

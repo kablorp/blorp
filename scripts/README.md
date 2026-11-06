@@ -10,16 +10,16 @@ This directory holds the shell entrypoints for building and proving Blorp 2:
 
 ## Validating a change
 
-Changes under `blorp_2/` are validated with `make -C blorp_2 test`, plus
+Changes under `blorp/` are validated with `make -C blorp test`, plus
 `scripts/blorp2-fixpoint --prove` when the change alters emitted C and
-`bash blorp_2/test/tooling/test_bootstrap.sh` when it touches the bootstrap
-resolver or the Makefile recipes. [`blorp_2/AGENTS.md`](../blorp_2/AGENTS.md)
+`bash blorp/test/tooling/test_bootstrap.sh` when it touches the bootstrap
+resolver or the Makefile recipes. [`blorp/AGENTS.md`](../blorp/AGENTS.md)
 owns the rest of the validation rules.
 
-The Blorp 2 workflow (`.github/workflows/blorp2.yml`) runs when `blorp_2/` or
+The Blorp 2 workflow (`.github/workflows/blorp2.yml`) runs when `blorp/` or
 its bootstrap and fixpoint scripts change. It runs Linux x64 with Clang and
 GCC, Linux ARM64 with Clang, and macOS ARM64 with Clang. Each checks out
-source, runs `make -C blorp_2 test` with the pinned seed and selected C
+source, runs `make -C blorp test` with the pinned seed and selected C
 compiler, then runs the bootstrap shell test. On a push to main that passes,
 `.github/workflows/blorp2-seed.yml` builds the compiler with itself on all
 three native targets, verifies that the three emit identical C, runs the
@@ -27,7 +27,7 @@ fixtures under both generations, and publishes that commit's seed as the
 immutable release `blorp2-seed-<12hex>`.
 
 The Makefile's explicit component selection (`COMPONENT_SOURCES` in
-`blorp_2/test/e2e/self_hosted.brp`; `TARGET_COMPONENT_SOURCES=<paths>` overrides
+`blorp/test/e2e/self_hosted.brp`; `TARGET_COMPONENT_SOURCES=<paths>` overrides
 it) runs through ordinary target TestSuite entries, one program per listed
 directory (its phase), with C11 `-O0` linking and strict native memory checks.
 The Blorp test driver that `make` builds runs it and the e2e selection.
@@ -40,7 +40,7 @@ are DEFERRED, with their sources preserved; they receive no PASS credit, and
 
 ## Blorp 2 seed build
 
-`make -C blorp_2` (or the explicit `compiler` target) uses
+`make -C blorp` (or the explicit `compiler` target) uses
 `scripts/blorp2-compiler-bootstrap` to generate compiler C through a pinned
 Blorp 2 seed's direct CLI, then links normal mode at `-O0` with memory
 diagnostics disabled. `test-compiler` generates once and links diagnostic
@@ -49,7 +49,7 @@ for fixpoint stages. Output paths, `BLORP_CC`, `TEST_COMPILER_FLAGS` and
 `TEST_COMPILER_LIBRARIES` accept Make command-line overrides. Build targets
 are serialized because normal and diagnostic modes share the output path.
 
-The resolver uses the real `blorp_2/bootstrap.env` pin, recorded after all
+The resolver uses the real `blorp/bootstrap.env` pin, recorded after all
 three native seed assets were qualified. It validates the full source commit, matching
 immutable `blorp2-seed-<12hex>` tag and all three SHA-256 values. It downloads
 `blorp2-<target>` from that release and rehashes cached bytes before every use.
@@ -65,7 +65,7 @@ The `example` target uses the newly built B2 compiler. `test` builds B2 and
 runs its explicit self-hosted component and first native e2e selections; `test-components` uses an
 already-built B2 compiler. Unported suites are deferred.
 Run the isolated behavioral shell tests with
-`bash blorp_2/test/tooling/test_bootstrap.sh`; they use fake transport,
+`bash blorp/test/tooling/test_bootstrap.sh`; they use fake transport,
 seed and C compiler tools, including quoted paths and parallel target requests.
 It is the one sanctioned shell test: the resolver and recipes it covers are
 shell tooling. Cold/warm clean-checkout qualification uses the actual
@@ -86,12 +86,12 @@ and exits 0 except for setup failures. The old per-file parse inventory is
 DEFERRED because its filesystem driver is unported; the actual seed/A loader
 still parses the compiler source.
 Artifacts, hashes and explicit coverage status stay under
-`blorp_2/build/fixpoint/`. See `--help` for the current rungs.
+`blorp/build/fixpoint/`. See `--help` for the current rungs.
 
 ## Rotating the seed pin
 
-`blorp_2/bootstrap.env` names the seed release and its three SHA-256 values.
+`blorp/bootstrap.env` names the seed release and its three SHA-256 values.
 Rotate the tag, source commit and all three digests together, and only after
 `blorp2-seed.yml` has published and qualified the release for every target.
-Run `make -C blorp_2 test`, the fixpoint and the bootstrap test against the new
+Run `make -C blorp test`, the fixpoint and the bootstrap test against the new
 pin before landing it.

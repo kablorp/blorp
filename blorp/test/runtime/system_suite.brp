@@ -1,0 +1,91 @@
+import:
+    ../../src/emit/emit: aggregate_runtime
+    ../../src/own/own: own
+    ../../src/runtime/memory: MEMORY_RUNTIME
+    ../../src/runtime/string: string_runtime
+    ../../src/runtime/system: SYSTEM_CURRENT_DIRECTORY_RUNTIME, SYSTEM_FAILURE_RUNTIME
+    ../../src/lower/lower as Lower
+    ../../src/verify/verify: verify
+    ../unit/current_directory_inputs: current_directory_seed
+    ../unit/module_input: test_base
+    process: run_to_files
+    fs: describe, read_text, write_text
+    io: print_error
+    test: TestSuite
+    int: Int methods
+    string: String methods
+    bool: and
+    result: Result methods
+
+
+private COMPILE_TIMEOUT_MS: Int = 600000
+private CASE_TIMEOUT_MS: Int = 10000
+
+
+-- Each native fixture includes the runtime fragments written beside it and
+-- drives them through its own fakes; a case passes by exiting 0 silently.
+-- Only the public phases establish the concrete aggregate helpers.
+private func aggregates_of(lowered: Lower.LoweredProgram) -> Result[String, String]:
+    own(lowered).and_then(verify).and_then(aggregate_runtime).map_err(pure func(error): error.message + "; " + error.help)
+
+
+-- Writes the runtime fragment, then builds the fixture with it on the include path.
+private func build(c_compiler: String, directory: String, name: String) -> Result[String, String]:
+    seed ?= current_directory_seed(test_base()).map_err(pure func(error): error.message)
+    aggregates ?= aggregates_of(seed.lowered)
+    fragment = MEMORY_RUNTIME + string_runtime() + SYSTEM_FAILURE_RUNTIME + SYSTEM_CURRENT_DIRECTORY_RUNTIME + aggregates + "\n"
+    _ ?= write_text(directory + "/" + name + "_runtime.c", fragment).map_err(describe)
+    executable = directory + "/" + name + "_test"
+    prefix = directory + "/" + name + "-build"
+    fixture = "blorp/test/runtime/fixtures/" + name + "_test.c"
+    status ?= run_to_files(c_compiler, ["-std=c11", "-O0", "-Wall", "-Wextra", "-Werror", "-pedantic", "-fsanitize=address,undefined", "-fno-sanitize-recover=all", "-I", directory, fixture, "-lm", "-o", executable], prefix + ".out", prefix + ".err", COMPILE_TIMEOUT_MS)
+    out ?= read_text(prefix + ".out").map_err(describe)
+    err ?= read_text(prefix + ".err").map_err(describe)
+    if status.equals(0).and(out.equals("")).and(err.equals("")):
+        Ok(executable)
+    else:
+        Err(name + " native build failed: " + err)
+
+
+private func native_case(executable: String, directory: String, name: String, mode: String) -> Bool:
+    prefix = directory + "/" + name + "-" + mode
+    match run_to_files(executable, [mode], prefix + ".out", prefix + ".err", CASE_TIMEOUT_MS):
+        Err(error):
+            print_error(error)
+            False
+        Ok(status):
+            match (read_text(prefix + ".out"), read_text(prefix + ".err")):
+                (Ok(out), Ok(err)):
+                    if status.equals(0).and(out.equals("")).and(err.equals("")):
+                        True
+                    else:
+                        print_error(name + " " + mode + ": exit " + status.to_string() + ": " + err)
+                        False
+                _: False
+
+
+private func native_suite(description: String, directory: String, name: String, executable_built: Result[String, String], cases: List[(String, String)]) -> TestSuite:
+    match executable_built:
+        Err(error):
+            print_error(error)
+            { description = description + " setup", tests = [("native fixture builds", func(): False)] }
+        Ok(executable):
+            { description = description, tests = cases.map(pure func(item): (item[0], func(): native_case(executable, directory, name, item[1]))) }
+
+
+func current_directory_suite(c_compiler: String, directory: String) -> TestSuite:
+    native_suite("Blorp 2 current-directory native runtime", directory, "current_directory", build(c_compiler, directory, "current_directory"), [
+        ("real OS success", "real"),
+        ("ERANGE grows beyond 4096", "growth"),
+        ("growth then failure frees staging", "growth_error"),
+        ("EINTR returns without retry", "eintr"),
+        ("cleanup preserves saved errno", "saved_errno"),
+        ("root and UTF-8 whitespace stay exact", "utf8"),
+        ("terminator excludes spare bytes", "after_terminator"),
+        ("malformed UTF-8 precedes String publication", "malformed"),
+        ("empty native success rejects", "empty"),
+        ("relative native success rejects", "relative"),
+        ("live calls have distinct fresh roots", "fresh"),
+        ("Ok active slot releases its String", "owned_ok"),
+        ("Err active slot releases its String", "owned_error"),
+    ])

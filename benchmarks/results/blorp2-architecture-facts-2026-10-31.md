@@ -7,7 +7,7 @@ contracts remain the proof authority; ordinary free/implementation headers
 still validate under their own requirements. Default body annotations and
 signature normalization are unchanged. No new representation is retained.
 
-Implementation follows [F1 in the reviewed plan](../../blorp_2/ARCHITECTURE_FACTS_PLAN.md#f1-prove-a-defaults-written-header-once).
+Implementation follows [F1 in the reviewed plan](../../blorp/ARCHITECTURE_FACTS_PLAN.md#f1-prove-a-defaults-written-header-once).
 The role dispatch is inline in the existing callback, avoiding a single-use
 helper. Production: **16 added / 1 deleted / +15 net lines**. Tests:
 **28 added / 0 deleted / +28 net lines**. Documentation is separate.

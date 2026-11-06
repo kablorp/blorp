@@ -1,0 +1,91 @@
+import:
+	../../../src/load/load: load_program
+	../../../src/parse/assemble: parsed_contents
+	../../../src/check/check: check, checked_functions, check_errors
+	../../../src/check/model as Model
+	../../../src/check/errors as Errors
+	../../../src/specialize/specialize as Concrete
+	../../../src/utils/ids: inventory_functions, function_number
+	../../../src/utils/names: name_spelling
+	../../../src/utils/source: module_source, root_module_id
+	../../../src/utils/syntax: Purity(Pure), Visibility(Public, Private)
+	../input: setup_diagnostic, singleton_check_error
+	fs: temporary_directory, resource_path, message
+	system: temp_dir, write_file
+	test: TestSuite
+
+
+private JOIN_MAIN: String =
+	|import:
+	|    list: join
+	|func main() -> Int:
+	|
+
+
+func test_join_has_one_public_concrete_signature() -> Bool:
+	match load_program("blorp/test/e2e/fixtures/generic/managed/list_join.brp", "blorp/standard_library"):
+		Err(_): False
+		Ok(loaded):
+			parsed = parsed_contents(loaded.program)
+			match (parsed.modules.get(0), check(loaded.program)):
+				(Some(root), Ok(program)):
+					rows = checked_functions(program)
+					match root.imports:
+						[list_import, _, _, _]:
+							functions = inventory_functions(parsed.declarations).filter(pure func(row): row.declaration.module == list_import.target)
+							join_functions = functions.filter(pure func(row): name_spelling(parsed.names, row.declaration.function_name.id) == Some("join"))
+							match join_functions:
+								[join]:
+									match (join.declaration.visibility, rows.functions.get(function_number(join.id))):
+										(Public, Some(public)):
+											matches = public.signature.type_parameters.is_empty() and public.signature.purity == Pure and public.signature.return_type.value_type == Model.StringType
+											match public.signature.parameters:
+												[values, separator]:
+													matches and values.value_type == Model.ListType(Model.StringType) and separator.value_type == Model.StringType
+												_: False
+										_: False
+								_: False
+						_: False
+				_: False
+
+
+private func rejects_argument(prefix: String, marked: String, suffix: String, position: Int, expected: Model.TypeRef, actual: Model.TypeRef, help: String) -> Result[Bool, String]:
+	with directory ?= temporary_directory(temp_dir(), "blorp-2-list-join-negative-") on error => message(error):
+		path = directory.resource_path() + "/main.brp"
+		written ?= write_file(path, JOIN_MAIN + prefix + marked + suffix)
+		loaded ?= load_program(path, "blorp/standard_library").map_err(func(failure): failure.diagnostic.message)
+		match check(loaded.program):
+			Ok(_): Ok(False)
+			Err(failure):
+				diagnostic = setup_diagnostic(failure)
+				match singleton_check_error(check_errors(failure)):
+					Some(error):
+						match error.kind:
+							Errors.CallRejection(Errors.ArgumentTypeMismatch(mismatch)):
+								Ok(
+									mismatch.argument_position == position and mismatch.expected == expected and mismatch.actual.value_type == actual
+									and error.span.source == module_source(root_module_id()) and error.span.source == mismatch.actual.span.source
+									and error.span.start == JOIN_MAIN.length() + prefix.length() and error.span.end == error.span.start + marked.length()
+									and mismatch.actual.span.start == error.span.start and mismatch.actual.span.end == error.span.end
+									and diagnostic.message == "argument type does not match the parameter type" and diagnostic.help == help and diagnostic.note.is_none()
+								)
+							_: Ok(False)
+					None: Ok(False)
+
+
+func test_join_rejects_integer_elements() -> Bool:
+	rejects_argument("    numbers = [1]\n    result = join(", "numbers", ", \"/\")\n    0\n", 0, Model.ListType(Model.StringType), Model.ListType(Model.IntType), "use an expression of type List[String] here").get_or(False)
+
+
+func test_join_rejects_integer_separator() -> Bool:
+	rejects_argument("    result = join([\"x\"], ", "1", ")\n    0\n", 1, Model.StringType, Model.IntType, "use an expression of type String here").get_or(False)
+
+
+tests: TestSuite = {
+	description = "Blorp 2 target List String join checking",
+	tests = [
+		("List join publishes a pure String signature", test_join_has_one_public_concrete_signature),
+		("List join rejects integer elements at the actual List", test_join_rejects_integer_elements),
+		("List join rejects an integer separator at the actual argument", test_join_rejects_integer_separator),
+	]
+}

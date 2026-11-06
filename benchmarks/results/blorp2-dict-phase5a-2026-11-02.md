@@ -1,6 +1,6 @@
 # Blorp 2 Dict phase 5a, 2026-11-02
 
-Phase 5a of [DICT_PLAN](../../blorp_2/DICT_PLAN.md): the checker's tables are keyed by
+Phase 5a of [DICT_PLAN](../../blorp/DICT_PLAN.md): the checker's tables are keyed by
 what they mean. `implementation_table` indexes accepted implementations in a
 `Dict[ImplementationKey, AcceptedImplementation]` keyed by (trait, receiver head), so the
 head hints, the hint constants and the bucket multimap are deleted. The checker's

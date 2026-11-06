@@ -1,0 +1,3118 @@
+import:
+	option: Option methods
+	result: Result methods
+	bool: Bool methods
+	../namespace/builtins:
+		DesignatedBoolean,
+		DesignatedOption,
+		DesignatedResult,
+		RuntimeOperation(
+			FloatCopySign, FloatEquals, FloatLessThan,
+			IntAdd, IntSubtract, IntMultiply, IntDivide, IntRemainder, IntToString, StringLength, StringConcat, StringAppendInt,
+			StringPrint, StringPrintError, StringParseInt, StringParseFloat, ListRepeat, ListLength, ListGet, ListAppend, ListSet,
+			StringByteAt, StringFromCodepoint, StringSlice, SystemCall,
+			ListConcat, StringEquals,
+			IntEquals, IntLessThan, FloatAdd, FloatSubtract, FloatMultiply, FloatDivide, FloatRemainder,
+			FloatToString,
+		),
+		SystemPayload(IntPayload, StringPayload, StringListPayload, VoidPayload),
+		system_signature,
+	./float_literal: c_float_literal
+	./diagnostics:
+		AggregateKind(RecordAggregate, UnionAggregate),
+		EmissionFailure(
+			MissingUnionLayout, MissingRecordLayout, MissingOwnerType, MissingValueType,
+			MissingRuntimeArgument, MissingFunctionRow, MissingJoinTransfer, MissingSelectionArm, MissingEnclosingLoop,
+			StatementOnlyValue, InvalidOperationShape, MissingAggregateWorkItem,
+			MissingAggregateVisit, CyclicByValueAggregate, MissingAggregateLayout,
+			MissingAggregateMember, MissingUnionPayloadField, MissingInPlaceHelper,
+		), render,
+	../runtime/float: float_parse_runtime, float_runtime, float_string_runtime
+	../runtime/system: SYSTEM_FAILURE_RUNTIME, SystemRuntime, system_runtime, system_symbol
+	../runtime/string_concat: string_concat_runtime, string_append_int_runtime
+	../runtime/memory: MEMORY_RUNTIME
+	../runtime/fs: FS_HELPERS_RUNTIME
+	../runtime/process: PROCESS_POSIX_PRELUDE
+	int: INT_MIN, Int methods
+	../runtime/list:
+		ListElementKey, ListUpdate(AppendUpdate, SetUpdate, ConcatUpdate, SuffixUpdate),
+		append_callable_suffix, append_list_c_type, append_list_suffix, append_list_update_name,
+		callable_suffix, consuming_helper_name, list_element_key,
+		list_root_allocation, list_slot_store,
+		LIST_SHARED_RUNTIME
+	../lower/lower as Lower: ValueId, LoopTarget
+	../check/model: MatchArmId, DecisionNodeId, ListLengthTest(ExactLength, MinimumLength)
+	../own/own as Own:
+		OwnedArgument(UnmanagedArgument, BorrowedArgument, ConsumedArgument),
+		OwnedDefinition,
+		OwnedFunction,
+		OwnedJoin,
+		OwnedJoinParameter(UnmanagedJoinParameter, ManagedJoinParameter),
+		OwnedValueOperation(
+			ParameterDefinition, VoidDefinition, IntegerDefinition, FloatDefinition,
+			StringDefinition, CallDefinition, InvokeCallableDefinition, FreeCallableDefinition, CapturedCallableDefinition, ConstructDefinition, ConstructListDefinition,
+			PayloadDefinition, ListElementDefinition, ListSuffixDefinition, ConstructRecordDefinition, ReadRecordFieldDefinition,
+		),
+		OwnerId,
+		OwnershipOperation(DefineValue, ExecuteJoin, ExecuteLoop, AcquireOwner, DropOwner),
+		OwnershipProgram,
+		ResultOwnership(UnmanagedResult, BorrowedResult, OwnedResult),
+		ReturnTransfer(UnmanagedReturn, OwnedReturn),
+		StoredPayload(UnmanagedPayload, OwnedPayload),
+		parameter_type,
+	../utils/source: label_text
+	../specialize/specialize as Concrete:
+		CallTarget(UserFunction, RuntimeFunction),
+		ConcreteRecord(InlineFields, ValueFields, CountedFields), ConcretePatternPlace,
+		ConcreteUnion(PlainCases, OwningCases, BoxedCases),
+		FieldInstanceId,
+		RecordInstanceId,
+		TypeRef(VoidType, IntType, FloatType, StringType, ListType, CallableType, UnionType, RecordType),
+		UnionInstanceId,
+		VariantFieldInstanceId, VariantInstanceId,
+		function_number,
+	string: String methods
+	../runtime/string:
+		string_equals_runtime,
+		STRING_SLICE_RUNTIME,
+		string_parse_int_runtime,
+		string_print_runtime, STRING_PRINT_ERROR_RUNTIME,
+		string_runtime,
+	../utils/stack: push_at
+	../utils/syntax:
+		Diagnostic,
+		EntryResult(IntegerExitStatus, SuccessfulExit),
+		Entrypoint(NoArguments, WithArguments),
+		Span,
+		compiler_span,
+		SystemOperation,
+	../utils/text: concat
+	../verify/verify: VerifiedProgram
+
+
+private pure func append_parameter_name(output: String, index: Int) -> String:
+	output.concat("blorp_p_").append_int(index)
+
+
+private pure func c_name(index: Int) -> String:
+	"blorp_f_".append_int(index)
+
+
+-- The `append_*` name writers below add a C identifier to `output` in place.
+-- Returning the name as a String would allocate one fragment per reference.
+-- A fragment that must be a String starts from `""`, as in `"".append_local_name(id)`.
+private pure func append_local_name(output: String, id: ValueId) -> String:
+	output.concat("blorp_vl_").append_int(id.value_number())
+
+
+private pure func c_header(id: ValueId) -> String:
+	"blorp_h_".append_int(id.value_number())
+
+
+private pure func c_loop_header(target: Lower.LoopTarget) -> String:
+	"blorp_loop_${target.loop_target_value().value_number().to_string()}_header"
+
+
+private pure func c_loop_break(target: Lower.LoopTarget) -> String:
+	"blorp_loop_${target.loop_target_value().value_number().to_string()}_break"
+
+
+private pure func append_loop_transfer_name(output: String, target: Lower.LoopTarget, position: Int) -> String:
+	output.concat("blorp_loop_").append_int(target.loop_target_value().value_number()).concat("_transfer_").append_int(position)
+
+
+private pure func append_owner_name(output: String, id: OwnerId) -> String:
+	output.concat("blorp_owner_").append_int(id.owner_number())
+
+
+-- Designated-Bool operations and system calls use statement dispatch and
+-- constructor publication, not the ordinary expression-callable symbol path.
+private pure func c_callable(target: CallTarget) -> Option[String]:
+	match target:
+		UserFunction(id):
+			Some(id.function_number().c_name())
+		RuntimeFunction(operation):
+			match operation:
+				StringPrint:
+					Some("blorp_string_print")
+				StringPrintError:
+					Some("blorp_string_print_error")
+				IntAdd:
+					Some("blorp_int_add")
+				IntSubtract:
+					Some("blorp_int_subtract")
+				IntMultiply:
+					Some("blorp_int_multiply")
+				IntDivide:
+					Some("blorp_int_divide")
+				IntRemainder:
+					Some("blorp_int_remainder")
+				IntToString:
+					Some("blorp_int_to_string")
+				FloatAdd:
+					Some("blorp_float_add")
+				FloatSubtract:
+					Some("blorp_float_subtract")
+				FloatMultiply:
+					Some("blorp_float_multiply")
+				FloatDivide:
+					Some("blorp_float_divide")
+				FloatRemainder:
+					Some("blorp_float_remainder")
+				FloatToString:
+					Some("blorp_float_to_string")
+				FloatCopySign:
+					Some("copysign")
+				StringLength:
+					Some("blorp_string_length")
+				StringConcat:
+					Some("blorp_string_concat")
+				StringAppendInt:
+					Some("blorp_string_append_int")
+				StringParseInt(_):
+					Some("blorp_string_parse_int")
+				StringParseFloat(_):
+					Some("blorp_string_parse_float")
+				StringByteAt(_):
+					Some("blorp_string_byte_at")
+				StringFromCodepoint(_):
+					Some("blorp_string_from_codepoint")
+				StringSlice(_):
+					Some("blorp_string_slice")
+				ListRepeat(element):
+					Some("blorp_list_repeat_${element.list_element_key().list_suffix()}")
+				ListLength(element):
+					Some("blorp_list_length_${element.list_element_key().list_suffix()}")
+				ListGet(element, _):
+					Some("blorp_list_get_${element.list_element_key().list_suffix()}")
+				ListAppend(element):
+					Some(AppendUpdate.list_update_name(element.list_element_key()))
+				ListSet(element):
+					Some(SetUpdate.list_update_name(element.list_element_key()))
+				ListConcat(element):
+					Some(ConcatUpdate.list_update_name(element.list_element_key()))
+				StringEquals(_) | IntEquals(_) | IntLessThan(_) | FloatEquals(_) | FloatLessThan(_) | SystemCall(_, _):
+					None
+
+
+private pure func append_integer(output: String, value: Int) -> String:
+	if value == INT_MIN:
+		"${output}INT64_MIN"
+	else if value < 0:
+		"${output}(-INT64_C(${(0 - value).to_string()}))"
+	else:
+		"${output}INT64_C(${value.to_string()})"
+
+
+-- Function-local static data has fixed syntactic depth and no C string-token
+-- length limit or automatic array storage. Existing ValueIds distinguish the
+-- backing bytes and the site, whose shared String the runtime creates on the
+-- site's first evaluation; each evaluation acquires one reference to it.
+private pure func c_literal_bytes(id: ValueId) -> String:
+	"blorp_bytes_".append_int(id.value_number())
+
+
+private pure func c_literal_site(id: ValueId) -> String:
+	"blorp_literal_".append_int(id.value_number())
+
+
+private pure func append_string_literal_site(output: String, id: ValueId, bytes: String) -> String:
+	data = output.append_byte_array(id.c_literal_bytes(), bytes)
+	"${data}static struct blorp_string_literal_site ${id.c_literal_site()};"
+
+
+private pure func append_byte_array(output: String, name: String, bytes: String) -> String:
+	var projected = "${output}static const unsigned char ${name}[]={"
+	var position = 0
+
+	while True:
+		match bytes.byte_at(position):
+			Some(byte):
+				if position > 0:
+					projected = "${projected},"
+
+				projected = projected.append_int(byte)
+				position = position + 1
+			None:
+				break
+
+	if position == 0:
+		-- ISO C forbids an empty initializer; logical length remains zero.
+		projected = "${projected}0"
+
+	"${projected}};"
+
+
+private pure func has_payload(declaration: ConcreteUnion) -> Bool:
+	declaration.union_variants().any(pure func(fields): fields.is_empty().not())
+
+
+private pure func append_boxed_union_struct(output: String, index: Int) -> String:
+	output.concat("struct blorp_u_").append_int(index)
+
+
+private pure func union_is_boxed(layout: ConcreteUnion) -> Bool:
+	match layout:
+		BoxedCases(_): True
+		PlainCases(_) | OwningCases(_): False
+
+
+-- A boxed union value is a pointer to its counted node.
+private pure func append_union_type_name(output: String, id: UnionInstanceId, declaration: ConcreteUnion) -> String:
+	match declaration.union_is_boxed():
+		True:
+			output.append_boxed_union_struct(id.union_number()).concat("*")
+		False:
+			prefix = if declaration.has_payload():
+				"struct blorp_u_"
+			else:
+				"enum blorp_u_"
+
+			output.concat(prefix).append_int(id.union_number())
+
+
+-- Every value local is const except a join's, which its arms assign.
+private union LocalAssignment:
+	InitializedLocal
+	JoinLocal
+
+
+-- A local holding a pointer is itself const, so const follows a pointer type.
+-- String, List and boxed union carriers spell their pointer in the C type.
+private pure func append_local_declaration(
+	output: String,
+	value_type: TypeRef,
+	assignment: LocalAssignment,
+	unions: List[ConcreteUnion],
+	span: Span,
+) -> Result[String, Diagnostic]:
+	pointer_carrier: Bool ?= match value_type:
+		StringType | ListType(_):
+			Ok(True)
+		UnionType(id):
+			match unions.get(id.union_number()):
+				None:
+					Err(render(span, MissingUnionLayout(id)))
+				Some(layout):
+					Ok(layout.union_is_boxed())
+		_:
+			Ok(False)
+	prefix = match assignment:
+		InitializedLocal:
+			if pointer_carrier:
+				""
+			else:
+				"const "
+		JoinLocal: ""
+	suffix = match assignment:
+		InitializedLocal:
+			if pointer_carrier:
+				" const "
+			else:
+				" "
+		JoinLocal: " "
+	typed ?= output.concat(prefix).append_type_name(value_type, unions, span)
+	Ok(typed.concat(suffix))
+
+
+private pure func append_record_type_name(output: String, id: RecordInstanceId) -> String:
+	output.concat("blorp_r_").append_int(id.record_number())
+
+
+private pure func append_field_name(output: String, id: FieldInstanceId) -> String:
+	output.concat("blorp_rf_").append_int(id.field_owner().record_number()).concat("_").append_int(id.field_number())
+
+
+private pure func append_record(
+	output: String,
+	layout: ConcreteRecord,
+	index: Int,
+	unions: List[ConcreteUnion],
+) -> Result[String, Diagnostic]:
+	var result = "${output}struct blorp_r_${index.to_string()}{"
+
+	match layout:
+		CountedFields(_):
+			result = "${result}_Atomic uint64_t references;"
+		InlineFields(_) | ValueFields(_):
+			void
+
+	var position = 0
+	var invalid: Option[Diagnostic] = None
+
+	for field in layout.record_fields():
+		match field:
+			VoidType:
+				position = position + 1
+				continue
+			_: void
+		match "".append_type_name(field, unions, compiler_span()):
+			Ok(name):
+				result = "${result}${name} blorp_rf_${index.to_string()}_${position.to_string()};"
+			Err(error):
+				invalid = Some(error)
+				break
+
+		position = position + 1
+
+	match invalid:
+		Some(error):
+			Err(error)
+		None:
+			Ok("${result}};")
+
+
+-- These names serialize already sealed concrete types. Equality and catalogue
+-- deduplication use TypeRefs, never the generated C spelling.
+private pure func append_callable_type_name(output: String, parameters: List[TypeRef], result: TypeRef) -> String:
+	output.concat("struct blorp_c_").append_callable_suffix(parameters, result)
+
+
+private pure func append_callable_entry_name(output: String, body: Concrete.FunctionInstanceId, value_type: TypeRef) -> String:
+	output.concat("blorp_ce_").append_int(body.function_number()).concat("_").append_list_suffix(value_type.list_element_key())
+
+
+private pure func callable_types(values: List[TypeRef]) -> List[TypeRef]:
+	var found: List[TypeRef] = []
+	for value in values:
+		match value:
+			ListType(element):
+				for child in [element].callable_types():
+					if found.any(pure func(other): child == other).not():
+						found = found.append(child)
+			CallableType(parameters, result):
+				if found.any(pure func(other): value == other).not():
+					found = found.append(value)
+				for child in parameters.append(result).callable_types():
+					if found.any(pure func(other): child == other).not():
+						found = found.append(child)
+			_: void
+	found
+
+
+private pure func callable_parameters(parameters: List[TypeRef], unions: List[ConcreteUnion]) -> Result[String, Diagnostic]:
+	var output = "(void* environment"
+	var failure: Option[Diagnostic] = None
+	var ordinal = 0
+	for parameter in parameters:
+		match output.concat(",").append_type_name(parameter, unions, compiler_span()):
+			Ok(typed): output = typed.concat(" ").append_parameter_name(ordinal)
+			Err(error):
+				failure = Some(error)
+				break
+		ordinal = ordinal + 1
+	match failure:
+		Some(error): Err(error)
+		None: Ok("${output})")
+
+
+-- Complete every pair before any aggregate or function ABI mentions it. Ops
+-- tags may be incomplete here; their function members follow aggregate bodies.
+private pure func callable_declarations(types: List[TypeRef]) -> String:
+	var fragments: List[String] = []
+	for value in types:
+		match value:
+			CallableType(parameters, result):
+				suffix = parameters.callable_suffix(result)
+				name = "".append_callable_type_name(parameters, result)
+				ops_forward = "struct blorp_co_${suffix};"
+				pair_definition = "${name}{const struct blorp_co_${suffix}* ops;void* environment;};"
+				retain_declaration = "void blorp_callable_dup_${suffix}(${name});"
+				drop_declaration = "void blorp_callable_drop_${suffix}(${name});\n"
+				fragments = fragments.append(ops_forward.concat(pair_definition).concat(retain_declaration).concat(drop_declaration))
+			_: void
+	fragments.join("")
+
+
+private pure func callable_ops(types: List[TypeRef], unions: List[ConcreteUnion]) -> Result[String, Diagnostic]:
+	var fragments: List[String] = []
+	var failure: Option[Diagnostic] = None
+	for value in types:
+		match value:
+			CallableType(parameters, result):
+				signature: Result[String, Diagnostic] = "".append_type_name(result, unions, compiler_span()).and_then(pure func(returned):
+					parameters.callable_parameters(unions).map(pure func(arguments):
+						suffix = parameters.callable_suffix(result)
+						name = "".append_callable_type_name(parameters, result)
+						ops_definition = "struct blorp_co_${suffix}{${returned} (*invoke)${arguments};void (*retain)(void*);void (*drop)(void*);};"
+						retain_definition = "void blorp_callable_dup_${suffix}(${name} value){value.ops->retain(value.environment);}"
+						drop_definition = "void blorp_callable_drop_${suffix}(${name} value){value.ops->drop(value.environment);}\n"
+						ops_definition.concat(retain_definition).concat(drop_definition)
+					)
+				)
+				match signature:
+					Ok(text): fragments = fragments.append(text)
+					Err(error): failure = Some(error)
+			_: void
+		if failure.is_some():
+			break
+	match failure:
+		Some(error): Err(error)
+		None: Ok(fragments.join(""))
+
+
+private pure func append_callable_entry(
+	definition: OwnedDefinition, program: OwnershipProgram,
+) -> Result[String, Diagnostic]:
+	selected: Result[Concrete.FunctionInstanceId, Diagnostic] = match definition.operation:
+		FreeCallableDefinition(id): Ok(id)
+		CapturedCallableDefinition(id, _): Ok(id)
+		_: Err(render(definition.span, InvalidOperationShape(definition.id)))
+	body ?= selected
+	function: OwnedFunction ?= match program.functions.get(body.function_number()):
+		Some(present): Ok(present)
+		None: Err(render(definition.span, MissingFunctionRow(definition.id)))
+	match definition.value_type:
+		CallableType(parameters, result):
+			name = "".append_callable_entry_name(body, definition.value_type)
+			match "".append_type_name(result, program.unions, definition.span):
+				Err(error): Err(error)
+				Ok(returned):
+					match parameters.callable_parameters(program.unions):
+						Err(error): Err(error)
+						Ok(arguments):
+							var invocation = "${body.function_number().c_name()}("
+							var retain = "(void)environment;"
+							var drop = retain
+							var prefix = "(void)environment;"
+							match definition.operation:
+								CapturedCallableDefinition(_, _):
+									match function.parameters.get(0).map(parameter_type):
+										Some(RecordType(owner)):
+											cast = "".concat("(").append_record_type_name(owner).concat(")environment")
+											invocation = invocation.concat(cast)
+											retain = "blorp_record_dup_${owner.record_number().to_string()}(${cast});"
+											drop = "blorp_record_drop_${owner.record_number().to_string()}(${cast});"
+											prefix = ""
+										_: void
+								_: void
+							var separator: Bool = match definition.operation:
+								CapturedCallableDefinition(_, _): True
+								_: False
+							var ordinal = 0
+							for _ in parameters:
+								if separator:
+									invocation = "${invocation},"
+								invocation = invocation.append_parameter_name(ordinal)
+								separator = True
+								ordinal = ordinal + 1
+							invoke_adapter = "${returned} ${name}_invoke${arguments}{${prefix}return ${invocation});}"
+							retain_adapter = "void ${name}_retain(void* environment){${retain}}"
+							drop_adapter = "void ${name}_drop(void* environment){${drop}}"
+							ops_type = "const struct blorp_co_${parameters.callable_suffix(result)} ${name}"
+							ops_initializer = "${ops_type}={${name}_invoke,${name}_retain,${name}_drop};\n"
+							Ok(invoke_adapter.concat(retain_adapter).concat(drop_adapter).concat(ops_initializer))
+		_: Err(render(definition.span, InvalidOperationShape(definition.id)))
+
+
+private pure func append_type_name(
+	output: String,
+	type_ref: TypeRef,
+	unions: List[ConcreteUnion],
+	span: Span,
+) -> Result[String, Diagnostic]:
+	match type_ref:
+		RecordType(id):
+			Ok(output.append_record_type_name(id))
+		VoidType:
+			Ok(output.concat("uint8_t"))
+		IntType:
+			Ok(output.concat("int64_t"))
+		FloatType:
+			Ok(output.concat("double"))
+		StringType:
+			Ok(output.concat("struct blorp_string*"))
+		CallableType(parameters, result): Ok(output.append_callable_type_name(parameters, result))
+		ListType(element):
+			Ok(output.append_list_c_type(element.list_element_key()))
+		UnionType(id):
+			match unions.get(id.union_number()):
+				Some(declaration): Ok(output.append_union_type_name(id, declaration))
+				None: Err(render(span, MissingUnionLayout(id)))
+
+
+private pure func append_variant_name(output: String, id: VariantInstanceId) -> String:
+	output.concat("blorp_v_").append_int(id.variant_owner().union_number()).concat("_").append_int(id.variant_number())
+
+
+private pure func c_parameters(
+	parameters: List[TypeRef],
+	unions: List[ConcreteUnion],
+) -> Result[String, Diagnostic]:
+	if parameters.length() == 0:
+		Ok("(void)")
+	else:
+		var output: String = "("
+		var index: Int = 0
+		var invalid: Option[Diagnostic] = None
+
+		for parameter in parameters:
+			-- `output` is one parameter list, so the copy its error path forces is small.
+			if index > 0:
+				output = output.concat(",")
+
+			match output.append_type_name(parameter, unions, compiler_span()):
+				Err(error):
+					invalid = Some(error)
+					break
+				Ok(typed):
+					output = typed.concat(" ").append_parameter_name(index)
+
+			index = index + 1
+
+		match invalid:
+			Some(error):
+				Err(error)
+			None:
+				Ok("${output})")
+
+
+-- Inline unions are read by value; boxed unions through their node pointer.
+private pure func union_member_selector(declaration: ConcreteUnion) -> String:
+	match declaration.union_is_boxed():
+		True: "->"
+		False: "."
+
+
+private pure func append_payload_member_name(output: String, id: VariantInstanceId) -> String:
+	output.concat("blorp_up_").append_int(id.variant_number())
+
+
+private pure func append_payload_field_name(output: String, variant: VariantInstanceId, position: Int) -> String:
+	output.append_payload_member_name(variant).concat(".blorp_uf_").append_int(position)
+
+
+private pure func append_union(
+	output: String,
+	declaration: ConcreteUnion,
+	index: Int,
+	unions: List[ConcreteUnion],
+) -> Result[String, Diagnostic]:
+	variants = declaration.union_variants()
+	payload = declaration.has_payload()
+
+	prefix = if payload:
+		"enum blorp_tag_"
+	else:
+		"enum blorp_u_"
+
+	var result = "${output}${prefix}${index.to_string()}{"
+	var position: Int = 0
+
+	for shape in variants:
+		if position != 0:
+			result = "${result},"
+
+		result = "${result}blorp_v_${index.to_string()}_${position.to_string()}"
+		position = position + 1
+
+	result = "${result}};"
+
+	if payload:
+		struct_prefix: String = "${result}struct blorp_u_${index.to_string()}{"
+		reference_header: String = match declaration.union_is_boxed():
+			True: "_Atomic uint64_t references;"
+			False: ""
+		result = "${struct_prefix}${reference_header}enum blorp_tag_${index.to_string()} tag;union{"
+		position = 0
+		var failure: Option[Diagnostic] = None
+
+		for fields in variants:
+			if fields.is_empty().not():
+				result = "${result}struct{"
+				var field_position = 0
+				for value_type in fields:
+					match "".append_type_name(value_type, unions, compiler_span()):
+						Err(error):
+							failure = Some(error)
+							break
+						Ok(name):
+							result = "${result}${name} blorp_uf_${field_position.to_string()};"
+					field_position = field_position + 1
+				if failure.is_some():
+					break
+				result = "${result}} blorp_up_${position.to_string()};"
+			position = position + 1
+
+		match failure:
+			Some(error):
+				Err(error)
+			None:
+				"${result}}payload;};".append_union_ownership(
+					declaration,
+					index,
+					unions,
+				)
+	else:
+		Ok(result)
+
+
+private union AggregateDefinition:
+	RecordDefinition(Int)
+	UnionDefinition(Int)
+
+
+private union AggregateVisit:
+	UnvisitedAggregate
+	VisitingAggregate
+	EmittedAggregate
+
+
+private union AggregateVisitStep:
+	PrepareAggregate(AggregateDefinition)
+	EmitAggregate(AggregateDefinition)
+
+
+-- Whether a stored type must be defined before its parent: only storage by
+-- value (an inline record or inline union) is a definition dependency. A
+-- managed record, a boxed union and a List are pointers to forward-declared
+-- types, which is what lets a layout group refer back to itself.
+private pure func stored_by_value(value_type: TypeRef, records: List[ConcreteRecord], unions: List[ConcreteUnion]) -> Option[AggregateDefinition]:
+	match value_type:
+		RecordType(id):
+			match records.get(id.record_number()):
+				Some(layout):
+					match layout:
+						InlineFields(_) | ValueFields(_): Some(RecordDefinition(id.record_number()))
+						CountedFields(_): None
+				None: None
+		UnionType(id):
+			match unions.get(id.union_number()):
+				Some(layout):
+					match layout.union_is_boxed():
+						False: Some(UnionDefinition(id.union_number()))
+						True: None
+				None: None
+		_:
+			None
+
+
+private pure func append_aggregate_definitions(
+	records: List[ConcreteRecord],
+	unions: List[ConcreteUnion],
+) -> Result[String, Diagnostic]:
+	-- State vectors and fragments remain local owners while dependencies are
+	-- visited. No recursive carrier retains their previous roots.
+	var record_visits = records.map(pure func(_) -> AggregateVisit: UnvisitedAggregate)
+	var union_visits = unions.map(pure func(_) -> AggregateVisit: UnvisitedAggregate)
+	var fragments: List[String] = []
+	var pending: List[AggregateVisitStep] = []
+	var pending_count = 0
+	var position = unions.length()
+
+	while position > 0:
+		position = position - 1
+		pending = pending.push_at(
+			pending_count,
+			PrepareAggregate(UnionDefinition(position)),
+		)
+		pending_count = pending_count + 1
+
+	position = records.length()
+
+	while position > 0:
+		position = position - 1
+		pending = pending.push_at(
+			pending_count,
+			PrepareAggregate(RecordDefinition(position)),
+		)
+		pending_count = pending_count + 1
+
+	var invalid: Option[Diagnostic] = None
+
+	while (pending_count > 0).and(invalid.is_some().not()):
+		pending_count = pending_count - 1
+
+		match pending.get(pending_count):
+			None:
+				invalid = Some(render(compiler_span(), MissingAggregateWorkItem(pending_count)))
+			Some(step):
+				match step:
+					PrepareAggregate(definition):
+						status = match definition:
+							RecordDefinition(index):
+								record_visits.get(index)
+							UnionDefinition(index):
+								union_visits.get(index)
+
+						match status:
+							None:
+								missing: EmissionFailure = match definition:
+									RecordDefinition(index): MissingAggregateVisit(RecordAggregate, index)
+									UnionDefinition(index): MissingAggregateVisit(UnionAggregate, index)
+								invalid = Some(render(compiler_span(), missing))
+							Some(EmittedAggregate):
+								void
+							Some(VisitingAggregate):
+								cycle: EmissionFailure = match definition:
+									RecordDefinition(index): CyclicByValueAggregate(RecordAggregate, index)
+									UnionDefinition(index): CyclicByValueAggregate(UnionAggregate, index)
+								invalid = Some(render(compiler_span(), cycle))
+							Some(UnvisitedAggregate):
+								pending = pending.push_at(
+									pending_count,
+									EmitAggregate(definition),
+								)
+								pending_count = pending_count + 1
+
+								match definition:
+									RecordDefinition(index):
+										record_visits = record_visits.set(index, VisitingAggregate)
+
+										match records.get(index):
+											None:
+												invalid = Some(render(compiler_span(), MissingAggregateLayout(RecordAggregate, index)))
+											Some(layout):
+												fields = layout.record_fields()
+												var child = fields.length()
+
+												while child > 0:
+													child = child - 1
+
+													match fields.get(child):
+														Some(field):
+															match field.stored_by_value(records, unions):
+																Some(dependency):
+																	pending = pending.push_at(pending_count, PrepareAggregate(dependency))
+																	pending_count = pending_count + 1
+																None:
+																	void
+														None:
+															invalid = Some(render(compiler_span(), MissingAggregateMember(RecordAggregate, index, child)))
+															break
+									UnionDefinition(index):
+										union_visits = union_visits.set(index, VisitingAggregate)
+
+										match unions.get(index):
+											None:
+												invalid = Some(render(compiler_span(), MissingAggregateLayout(UnionAggregate, index)))
+											Some(layout):
+												variants = layout.union_variants()
+												var child = variants.length()
+
+												while child > 0:
+													child = child - 1
+
+													match variants.get(child):
+														Some(fields):
+															var field_position = fields.length()
+															while field_position > 0:
+																field_position = field_position - 1
+																match fields.get(field_position):
+																	Some(field):
+																		match field.stored_by_value(records, unions):
+																			Some(dependency):
+																				pending = pending.push_at(pending_count, PrepareAggregate(dependency))
+																				pending_count = pending_count + 1
+																			None:
+																				void
+																	None:
+																		invalid = Some(render(compiler_span(), MissingUnionPayloadField(index, child, field_position)))
+																		break
+														None:
+															invalid = Some(render(compiler_span(), MissingAggregateMember(UnionAggregate, index, child)))
+															break
+					EmitAggregate(definition):
+						match definition:
+							RecordDefinition(index):
+								match records.get(index):
+									None:
+										invalid = Some(render(compiler_span(), MissingAggregateLayout(RecordAggregate, index)))
+									Some(layout):
+										match "".append_record(layout, index, unions):
+											Ok(record_definition):
+												fragments = fragments.append(record_definition)
+												record_visits = record_visits.set(
+													index,
+													EmittedAggregate,
+												)
+											Err(error):
+												invalid = Some(error)
+							UnionDefinition(index):
+								match unions.get(index):
+									None:
+										invalid = Some(render(compiler_span(), MissingAggregateLayout(UnionAggregate, index)))
+									Some(layout):
+										match "".append_union(layout, index, unions):
+											Ok(union_definition):
+												fragments = fragments.append(union_definition)
+												union_visits = union_visits.set(
+													index,
+													EmittedAggregate,
+												)
+											Err(error):
+												invalid = Some(error)
+
+	match invalid:
+		Some(error):
+			Err(error)
+		None:
+			Ok(fragments.join("\n"))
+
+
+private pure func append_record_prototypes(output: String, index: Int) -> String:
+	"${output}void blorp_record_dup_${index.to_string()}(blorp_r_${index.to_string()});"
+		.concat("void blorp_record_drop_${index.to_string()}(blorp_r_${index.to_string()});")
+
+
+-- No cell and no count: a by-value record's references are its fields'.
+private pure func append_value_record_ownership(
+	prefix: String, fields: List[TypeRef], index: Int, unions: List[ConcreteUnion],
+) -> Result[String, Diagnostic]:
+	duplicated ?= prefix.concat("(void)value;").append_value_field_actions(fields, index, unions, DuplicateValue)
+	destroyed ?= duplicated.concat("}void blorp_record_drop_").append_int(index).concat("(blorp_r_").append_int(index).concat(" value){(void)value;").append_value_field_actions(
+		fields, index, unions, DestroyValue,
+	)
+	Ok(destroyed.concat("}"))
+
+
+-- Each field's ownership action on a by-value record named `value`.
+private pure func append_value_field_actions(
+	output: String, fields: List[TypeRef], index: Int, unions: List[ConcreteUnion], action: OwnershipAction,
+) -> Result[String, Diagnostic]:
+	var result = output
+	var position = 0
+	var invalid: Option[Diagnostic] = None
+	for field in fields:
+		selector = "value.blorp_rf_".append_int(index).concat("_").append_int(position)
+		match result.append_storage_operation(field, action, selector, unions, compiler_span()):
+			Ok(updated): result = updated
+			Err(error):
+				invalid = Some(error)
+				break
+		position = position + 1
+	match invalid:
+		Some(error): Err(error)
+		None: Ok(result)
+
+
+private pure func append_record_ownership(
+	output: String,
+	layout: ConcreteRecord,
+	index: Int,
+	unions: List[ConcreteUnion],
+) -> Result[String, Diagnostic]:
+	prefix = "${output}void blorp_record_dup_${index.to_string()}(blorp_r_${index.to_string()} value){"
+
+	match layout:
+		InlineFields(_):
+			Ok(
+				"${prefix}(void)value;}void blorp_record_drop_${index.to_string()}(blorp_r_${index.to_string()} value){"
+					.concat("(void)value;}"),
+			)
+		ValueFields(fields): prefix.append_value_record_ownership(fields, index, unions)
+		CountedFields(fields):
+			var result = "${prefix}(void)atomic_fetch_add_explicit(&value->references,UINT64_C(1),memory_order_relaxed);}"
+				.concat("void blorp_record_drop_${index.to_string()}(blorp_r_${index.to_string()} value){")
+				.concat("if(atomic_fetch_sub_explicit(&value->references,UINT64_C(1),memory_order_acq_rel)!=UINT64_C(1))return;")
+			var position = 0
+			var invalid: Option[Diagnostic] = None
+
+			for field in fields:
+				match (
+					result.append_storage_operation(
+						field,
+						DestroyValue,
+						"value->blorp_rf_${index.to_string()}_${position.to_string()}",
+						unions,
+						compiler_span(),
+					)
+				):
+					Ok(updated):
+						result = updated
+					Err(error):
+						invalid = Some(error)
+						break
+
+				position = position + 1
+
+			match invalid:
+				Some(error):
+					Err(error)
+				None:
+					result = "${result}blorp_memory_release(value);}"
+						.concat("blorp_r_${index.to_string()} blorp_record_make_${index.to_string()}(struct blorp_r_${index.to_string()} fields){")
+						.concat("(void)fields;blorp_r_${index.to_string()} value=blorp_memory_allocate(sizeof *value);if(!value)abort();")
+						.concat("atomic_init(&value->references,UINT64_C(1));")
+					position = 0
+
+					for value_type in fields:
+						match value_type:
+							VoidType:
+								position = position + 1
+								continue
+							_: void
+						field = "blorp_rf_${index.to_string()}_${position.to_string()}"
+						result = "${result}value->${field}=fields.${field};"
+						position = position + 1
+
+					Ok("${result}return value;}")
+
+
+private pure func append_operation(
+	output: String,
+	id: ValueId,
+	value_type: TypeRef,
+	operation: OwnedValueOperation,
+	unions: List[ConcreteUnion],
+	records: List[ConcreteRecord],
+	span: Span,
+) -> Result[String, Diagnostic]:
+	match operation:
+		ConstructRecordDefinition(owner, fields):
+			match records.get(owner.record_number()):
+				Some(layout):
+
+					var result = match layout:
+						InlineFields(_) | ValueFields(_):
+							"${output}(("
+						CountedFields(_):
+							"${output}blorp_record_make_${owner.record_number().to_string()}(("
+
+					result = "${result}struct blorp_r_${owner.record_number().to_string()}){"
+					var position = 0
+					layout_fields = layout.record_fields()
+
+					for field in fields:
+						match layout_fields.get(field.field.field_number()):
+							Some(VoidType): continue
+							_: void
+						if position > 0:
+							result = "${result},"
+
+						stored = match field.value:
+							UnmanagedPayload(value):
+								value
+							OwnedPayload(value, _):
+								value
+
+						result = result.concat(".").append_field_name(field.field).concat("=").append_local_name(stored)
+						position = position + 1
+
+					if position == 0:
+						result = "${result}0"
+					Ok("${result}})")
+				None: Err(render(span, MissingRecordLayout(owner)))
+		ReadRecordFieldDefinition(field, argument):
+			match records.get(field.field_owner().record_number()):
+				Some(layout):
+
+					match value_type:
+						VoidType: Ok("${output}0")
+						_:
+							value = match argument:
+								UnmanagedArgument(value):
+									value
+								ConsumedArgument(value, _):
+									value
+								BorrowedArgument(borrow):
+									borrow.value
+
+							selector = match layout:
+								InlineFields(_) | ValueFields(_):
+									"."
+								CountedFields(_):
+									"->"
+
+							Ok(output.append_local_name(value).concat(selector).append_field_name(field))
+				None: Err(render(span, MissingRecordLayout(field.field_owner())))
+		ParameterDefinition(index):
+			Ok(output.append_parameter_name(index))
+		VoidDefinition:
+			Ok("${output}((uint8_t)0)")
+		IntegerDefinition(value):
+			Ok(output.append_integer(value))
+		FloatDefinition(value):
+			Ok(output.concat(value.c_float_literal()))
+		StringDefinition(bytes):
+			constructor = "${output}blorp_string_literal(&${id.c_literal_site()},(const char *)${id.c_literal_bytes()}"
+			length = "${constructor},".append_integer(
+				bytes.length(),
+			)
+			Ok("${length})")
+		FreeCallableDefinition(body):
+			match output.concat("((").append_type_name(value_type, unions, span):
+				Err(error): Err(error)
+				Ok(typed):
+					Ok(typed.concat("){&").append_callable_entry_name(body, value_type).concat(",(void*)0})"))
+		CapturedCallableDefinition(body, payload):
+			match output.concat("((").append_type_name(value_type, unions, span):
+				Err(error): Err(error)
+				Ok(typed):
+					value = match payload:
+						UnmanagedPayload(stored): stored
+						OwnedPayload(stored, _): stored
+					Ok(typed.concat("){&").append_callable_entry_name(body, value_type).concat(",").append_local_name(value).concat("})"))
+		InvokeCallableDefinition(callee, arguments):
+			callee_value = callee.argument_value()
+			var invocation = output.append_local_name(callee_value).concat(".ops->invoke(").append_local_name(callee_value).concat(".environment")
+			for argument in arguments:
+				invocation = invocation.concat(",").append_local_name(argument.argument_value())
+			Ok(invocation.concat(")"))
+		CallDefinition(target, arguments):
+			-- A runtime operand 0 that receives its obligation calls the
+			-- operation's in-place helper; verification admits no other.
+			named: Result[String, Diagnostic] = match (target, arguments.get(0)):
+				(RuntimeFunction(runtime), Some(ConsumedArgument(_, _))):
+					match runtime.consuming_helper_name():
+						Some(helper): Ok(helper)
+						None: Err(render(span, MissingInPlaceHelper(id)))
+				_:
+					match target.c_callable():
+						Some(callable): Ok(callable)
+						None: Err(render(span, StatementOnlyValue(id)))
+			match named:
+				Err(error): Err(error)
+				Ok(name):
+					var prefix = "${output}${name}("
+					var index: Int = 0
+
+					for argument in arguments:
+						if index > 0:
+							prefix = "${prefix},"
+
+						value = match argument:
+							UnmanagedArgument(argument_id):
+								argument_id
+							ConsumedArgument(argument_id, _):
+								argument_id
+							BorrowedArgument(borrow):
+								borrow.value
+
+						prefix = prefix.append_local_name(value)
+						index = index + 1
+
+					Ok("${prefix})")
+		ConstructDefinition(variant_id, fields):
+			var operands: List[String] = []
+			for field in fields:
+				operands = operands.append("".append_stored_name(field))
+			output.append_union_value(variant_id, operands, unions, span)
+		ConstructListDefinition(_):
+			-- List construction and joins are written as statements, by
+			-- append_list_construction and append_join; never as expressions.
+			Err(render(span, StatementOnlyValue(id)))
+		ListElementDefinition(index, parent):
+			Ok(output.append_local_name(parent).concat("->values[").append_int(index).concat("]"))
+		ListSuffixDefinition(parent, skipped):
+			match value_type:
+				ListType(element):
+					Ok(output.append_list_update_name(SuffixUpdate, element.list_element_key()).concat("(").append_local_name(parent.argument_value()).concat(",INT64_C(").append_int(skipped).concat("))"))
+				_: Err(render(span, InvalidOperationShape(id)))
+		PayloadDefinition(field, source_id):
+			match unions.get(field.variant_field_variant().variant_owner().union_number()):
+				Some(declaration):
+					Ok(output.append_local_name(source_id).concat(declaration.union_member_selector()).concat("payload.").append_payload_field_name(field.variant_field_variant(), field.variant_field_number()))
+				None: Err(render(span, MissingUnionLayout(field.variant_field_variant().variant_owner())))
+
+
+-- The one C rendering of a union value, for source constructions and runtime
+-- results alike, so every union value local follows its layout. A union with
+-- no payload anywhere is a bare C enum and a variant is its tag; any other
+-- value is a compound literal, from which a boxed union allocates its counted
+-- node. Each operand is an occurrence the new value owns.
+private pure func append_union_value(
+	output: String,
+	variant: VariantInstanceId,
+	operands: List[String],
+	unions: List[ConcreteUnion],
+	span: Span,
+) -> Result[String, Diagnostic]:
+	index = variant.variant_owner().union_number()
+	declaration: ConcreteUnion ?= match unions.get(index):
+		Some(found): Ok(found)
+		None: Err(render(span, MissingUnionLayout(variant.variant_owner())))
+
+	if declaration.has_payload():
+		opening = match declaration.union_is_boxed():
+			True:
+				output.concat("blorp_union_make_").append_int(index).concat("((").append_boxed_union_struct(index)
+			False:
+				output.concat("((").append_union_type_name(variant.variant_owner(), declaration)
+		tagged = opening.concat("){.tag=").append_variant_name(variant)
+		-- A variant without fields omits the payload initializer.
+		if operands.is_empty():
+			Ok(tagged.concat("})"))
+		else:
+			Ok(tagged.append_payload_initializer(variant, operands).concat("})"))
+	else:
+		Ok(output.append_variant_name(variant))
+
+
+private pure func append_payload_initializer(
+	output: String,
+	id: VariantInstanceId,
+	operands: List[String],
+) -> String:
+	var result = output.concat(",.payload.").append_payload_member_name(id).concat("={")
+	var position = 0
+	for operand in operands:
+		if position > 0:
+			result = result.concat(",")
+		result = result.concat(".blorp_uf_").append_int(position).concat("=").concat(operand)
+		position = position + 1
+	result.concat("}")
+
+
+private pure func argument_value(argument: OwnedArgument) -> ValueId:
+	match argument:
+		UnmanagedArgument(id):
+			id
+		ConsumedArgument(id, _):
+			id
+		BorrowedArgument(borrow):
+			borrow.value
+
+
+private pure func append_optional_value(
+	output: String,
+	id: ValueId,
+	option: DesignatedOption[VariantInstanceId],
+	condition: String,
+	payload: String,
+	unions: List[ConcreteUnion],
+	span: Span,
+) -> Result[String, Diagnostic]:
+	declared ?= output.append_local_declaration(UnionType(option.some.variant_owner()), InitializedLocal, unions, span)
+	with_some ?= declared.append_local_name(id).concat("=").concat(condition).concat("?").append_union_value(option.some, [payload], unions, span)
+	with_none ?= with_some.concat(":").append_union_value(option.none, [], unions, span)
+	Ok(with_none.concat(";(void)").append_local_name(id).concat(";"))
+
+
+-- The error is built only when the argument is missing: callers sit on the success path.
+private pure func runtime_argument(
+	arguments: List[OwnedArgument],
+	position: Int,
+	id: ValueId,
+	span: Span,
+) -> Result[OwnedArgument, Diagnostic]:
+	match arguments.get(position):
+		Some(found): Ok(found)
+		None: Err(render(span, MissingRuntimeArgument(id, position)))
+
+
+private pure func append_parse_number(
+	output: String,
+	id: ValueId,
+	option: DesignatedOption[VariantInstanceId],
+	arguments: List[OwnedArgument],
+	unions: List[ConcreteUnion],
+	scalar_type: String,
+	runtime: String,
+	span: Span,
+) -> Result[String, Diagnostic]:
+	argument ?= arguments.runtime_argument(0, id, span)
+	scratch = "blorp_runtime_".append_int(id.value_number())
+	prefix = "${output}${scalar_type} ${scratch}=0;"
+		.concat("const uint8_t ${scratch}_some=${runtime}(").append_local_name(argument.argument_value()).concat(",&${scratch});")
+	prefix.append_optional_value(
+		id,
+		option,
+		"${scratch}_some",
+		scratch,
+		unions,
+		span,
+	)
+
+
+private pure func append_string_byte_at(
+	output: String,
+	id: ValueId,
+	option: DesignatedOption[VariantInstanceId],
+	arguments: List[OwnedArgument],
+	unions: List[ConcreteUnion],
+	span: Span,
+) -> Result[String, Diagnostic]:
+	text ?= arguments.runtime_argument(0, id, span)
+	index ?= arguments.runtime_argument(1, id, span)
+	scratch = "blorp_runtime_".append_int(id.value_number())
+	prefix = "${output}int64_t ${scratch}=0;"
+		.concat("const uint8_t ${scratch}_some=blorp_string_byte_at(").append_local_name(text.argument_value()).concat(",").append_local_name(index.argument_value()).concat(",&${scratch});")
+	prefix.append_optional_value(id, option, "${scratch}_some", scratch, unions, span)
+
+
+private pure func append_string_from_codepoint(
+	output: String,
+	id: ValueId,
+	option: DesignatedOption[VariantInstanceId],
+	arguments: List[OwnedArgument],
+	unions: List[ConcreteUnion],
+	span: Span,
+) -> Result[String, Diagnostic]:
+	scalar ?= arguments.runtime_argument(0, id, span)
+	scratch = "blorp_runtime_".append_int(id.value_number())
+	prefix = "${output}struct blorp_string *${scratch}=NULL;"
+		.concat("const uint8_t ${scratch}_some=blorp_string_from_codepoint(").append_local_name(scalar.argument_value()).concat(",&${scratch});")
+	-- Some takes the fresh root. Scratch is neither retained nor released here.
+	prefix.append_optional_value(id, option, "${scratch}_some", scratch, unions, span)
+
+
+private pure func append_string_slice(
+	output: String,
+	id: ValueId,
+	option: DesignatedOption[VariantInstanceId],
+	arguments: List[OwnedArgument],
+	unions: List[ConcreteUnion],
+	span: Span,
+) -> Result[String, Diagnostic]:
+	text ?= arguments.runtime_argument(0, id, span)
+	start ?= arguments.runtime_argument(1, id, span)
+	end ?= arguments.runtime_argument(2, id, span)
+
+	scratch = "blorp_runtime_".append_int(id.value_number())
+	prefix = "${output}struct blorp_string *${scratch}=NULL;"
+		.concat("const uint8_t ${scratch}_some=blorp_string_slice(").append_local_name(text.argument_value()).concat(",").append_local_name(start.argument_value()).concat(",").append_local_name(end.argument_value()).concat(",&${scratch});")
+	-- Some takes the fresh root. Scratch has no separate ownership obligation.
+	prefix.append_optional_value(id, option, "${scratch}_some", scratch, unions, span)
+
+
+-- The declaration of the C local a system call fills with one Result payload.
+-- A Void payload has none; its constructor takes the unmanaged unit.
+private pure func system_payload_local(payload: SystemPayload, name: String) -> Option[String]:
+	match payload:
+		IntPayload: Some("int64_t ${name}=0;")
+		StringPayload: Some("struct blorp_string *${name}=NULL;")
+		StringListPayload: Some("${StringType.list_element_key().list_c_type()} ${name}=NULL;")
+		VoidPayload: None
+
+
+-- The call's argument and the constructor's payload for one Result branch.
+private record PayloadUse {
+	addresses: List[String],
+	declarations: String,
+	value: String
+}
+
+
+private pure func payload_use(payload: SystemPayload, name: String, previous: PayloadUse) -> PayloadUse:
+	match payload.system_payload_local(name):
+		Some(declaration): { addresses = previous.addresses.append("&${name}"), declarations = previous.declarations.concat(declaration), value = name }
+		None: { previous | value = "(uint8_t)0" }
+
+
+-- Every system call has one C shape: its borrowed arguments, then the address
+-- of one local per non-Void payload, success first, and a status choosing the
+-- constructor. Each constructor takes its own fresh payload, and the other
+-- local stays unowned.
+private pure func append_system_call(
+	output: String, id: ValueId, operation: SystemOperation, result: DesignatedResult[VariantInstanceId],
+	arguments: List[OwnedArgument], unions: List[ConcreteUnion], span: Span,
+) -> Result[String, Diagnostic]:
+	signature = operation.system_signature()
+	scratch = "blorp_runtime_".append_int(id.value_number())
+	values = arguments.map(pure func(argument: OwnedArgument) -> String: "".append_local_name(argument.argument_value()))
+	success = signature.success.payload_use("${scratch}_value", { addresses = values, declarations = "", value = "" })
+	failure = signature.error.payload_use("${scratch}_error", success)
+	call = "${output}${failure.declarations}const uint8_t ${scratch}_ok=${operation.system_symbol()}(${failure.addresses.join(",")});"
+	declared ?= call.append_local_declaration(UnionType(result.ok.variant_owner()), InitializedLocal, unions, span)
+	with_ok ?= declared.append_local_name(id).concat("=${scratch}_ok?").append_union_value(result.ok, [success.value], unions, span)
+	with_error ?= with_ok.concat(":").append_union_value(result.err, [failure.value], unions, span)
+	Ok(with_error.concat(";(void)").append_local_name(id).concat(";"))
+
+
+private pure func append_list_get(
+	output: String,
+	id: ValueId,
+	option: DesignatedOption[VariantInstanceId],
+	element: TypeRef,
+	arguments: List[OwnedArgument],
+	unions: List[ConcreteUnion],
+	span: Span,
+) -> Result[String, Diagnostic]:
+	values ?= arguments.runtime_argument(0, id, span)
+	index ?= arguments.runtime_argument(1, id, span)
+	scratch = "blorp_runtime_".append_int(id.value_number())
+	typed ?= output.append_type_name(element, unions, span)
+	prefix = typed.concat(" ${scratch}={0};")
+		.concat("const uint8_t ${scratch}_some=blorp_list_get_").append_list_suffix(element.list_element_key()).concat("(").append_local_name(values.argument_value()).concat(",").append_local_name(index.argument_value()).concat(",&${scratch});")
+	prefix.append_optional_value(
+		id,
+		option,
+		"${scratch}_some",
+		scratch,
+		unions,
+		span,
+	)
+
+
+private pure func append_value(
+	output: String,
+	id: ValueId,
+	value_type: TypeRef,
+	operation: OwnedValueOperation,
+	unions: List[ConcreteUnion],
+	records: List[ConcreteRecord],
+	span: Span,
+) -> Result[String, Diagnostic]:
+	match operation:
+		CallDefinition(target, arguments):
+			match target:
+				RuntimeFunction(StringParseInt(option)):
+					output.append_parse_number(
+						id,
+						option,
+						arguments,
+						unions,
+						"int64_t",
+						"blorp_string_parse_int",
+						span,
+					)
+				RuntimeFunction(StringParseFloat(option)):
+					output.append_parse_number(
+						id,
+						option,
+						arguments,
+						unions,
+						"double",
+						"blorp_string_parse_float",
+						span,
+					)
+				RuntimeFunction(ListGet(element, option)):
+					output.append_list_get(id, option, element, arguments, unions, span)
+				RuntimeFunction(StringByteAt(option)):
+					output.append_string_byte_at(id, option, arguments, unions, span)
+				RuntimeFunction(StringFromCodepoint(option)):
+					output.append_string_from_codepoint(id, option, arguments, unions, span)
+				RuntimeFunction(StringSlice(option)):
+					output.append_string_slice(id, option, arguments, unions, span)
+				RuntimeFunction(SystemCall(system, result)):
+					output.append_system_call(id, system, result, arguments, unions, span)
+				RuntimeFunction(StringEquals(boolean)):
+					output.append_comparison(id, boolean, arguments, unions, StringEquality, span)
+				RuntimeFunction(IntEquals(boolean)):
+					output.append_comparison(id, boolean, arguments, unions, ScalarEquality, span)
+				RuntimeFunction(IntLessThan(boolean)):
+					output.append_comparison(id, boolean, arguments, unions, ScalarLessThan, span)
+				RuntimeFunction(FloatEquals(boolean)):
+					output.append_comparison(id, boolean, arguments, unions, ScalarEquality, span)
+				RuntimeFunction(FloatLessThan(boolean)):
+					output.append_comparison(id, boolean, arguments, unions, ScalarLessThan, span)
+				_:
+					output.append_regular_value(id, value_type, operation, unions, records, span)
+		ConstructListDefinition(payloads):
+			output.append_list_construction(id, value_type, payloads, span)
+		_:
+			output.append_regular_value(id, value_type, operation, unions, records, span)
+
+
+-- Literals reserve exactly their known number of element slots; `[]` instead
+-- names its layout's immortal root, an owner whose dup and drop do nothing in
+-- normal builds and only count its owners in diagnostic builds.
+-- Elements' acquisitions precede the inline construction, so each store
+-- moves an owner or copies an unmanaged value, publishing length per slot.
+private pure func append_list_construction(
+	output: String,
+	id: ValueId,
+	value_type: TypeRef,
+	payloads: List[StoredPayload],
+	span: Span,
+) -> Result[String, Diagnostic]:
+	key: ListElementKey ?= match value_type:
+		ListType(element): Ok(element.list_element_key())
+		_: Err(render(span, InvalidOperationShape(id)))
+	type_name = key.list_c_type()
+	name = "".append_local_name(id)
+	var result = if payloads.is_empty():
+		"${output}${type_name} const ${name}=${key.list_empty_root()};"
+	else:
+		capacity = "".append_int(payloads.length())
+		checked_capacity = "${name}_capacity"
+		"${output}const size_t ${checked_capacity}=${capacity};"
+			.concat("if((uintmax_t)${checked_capacity}>(uintmax_t)INT64_MAX||${checked_capacity}>(SIZE_MAX-sizeof *((${type_name})0))/sizeof ((${type_name})0)->values[0])abort();")
+			.concat(type_name.concat(" const").list_root_allocation(name, checked_capacity))
+	var slot = 0
+	for payload in payloads:
+		result = result.concat(name.list_slot_store("".append_int(slot), "".append_stored_name(payload)))
+		slot = slot + 1
+	Ok("${result}(void)${name};")
+
+
+private union Comparison:
+	StringEquality
+	ScalarEquality
+	ScalarLessThan
+
+
+private pure func append_comparison(
+	output: String,
+	id: ValueId,
+	boolean: DesignatedBoolean[VariantInstanceId],
+	arguments: List[OwnedArgument],
+	unions: List[ConcreteUnion],
+	comparison: Comparison,
+	span: Span,
+) -> Result[String, Diagnostic]:
+	left ?= arguments.runtime_argument(0, id, span)
+	right ?= arguments.runtime_argument(1, id, span)
+	left_value = "".append_local_name(left.argument_value())
+	right_value = "".append_local_name(right.argument_value())
+
+	condition = match comparison:
+		StringEquality:
+			"blorp_string_equals(${left_value},${right_value})"
+		ScalarEquality:
+			"(${left_value}==${right_value})"
+		ScalarLessThan:
+			"(${left_value}<${right_value})"
+
+	output.append_boolean(id, boolean, condition, unions, span)
+
+
+private pure func append_boolean(
+	output: String,
+	id: ValueId,
+	boolean: DesignatedBoolean[VariantInstanceId],
+	condition: String,
+	unions: List[ConcreteUnion],
+	span: Span,
+) -> Result[String, Diagnostic]:
+	declared ?= output.append_local_declaration(UnionType(boolean.true_variant.variant_owner()), InitializedLocal, unions, span)
+	with_true ?= declared.append_local_name(id).concat("=").concat(condition).concat("?").append_union_value(boolean.true_variant, [], unions, span)
+	with_false ?= with_true.concat(":").append_union_value(boolean.false_variant, [], unions, span)
+	Ok(with_false.concat(";(void)").append_local_name(id).concat(";"))
+
+
+private pure func append_regular_value(
+	output: String,
+	id: ValueId,
+	value_type: TypeRef,
+	operation: OwnedValueOperation,
+	unions: List[ConcreteUnion],
+	records: List[ConcreteRecord],
+	span: Span,
+) -> Result[String, Diagnostic]:
+	prepared = match operation:
+		StringDefinition(bytes):
+			output.append_string_literal_site(id, bytes)
+		_:
+			output
+
+	declared ?= prepared.append_local_declaration(value_type, InitializedLocal, unions, span)
+	value ?= declared.append_local_name(id).concat("=").append_operation(
+		id,
+		value_type,
+		operation,
+		unions,
+		records,
+		span,
+	)
+	Ok(value.concat(";(void)").append_local_name(id).concat(";"))
+
+
+-- The C that binds `owner` to `value`. Callers append it themselves: passing
+-- in an accumulator that is still read after the call would keep a second
+-- reference live across it, so the append would copy the whole accumulator.
+private pure func owner_alias(
+	owner: OwnerId,
+	value: ValueId,
+	value_type: TypeRef,
+	unions: List[ConcreteUnion],
+	span: Span,
+) -> Result[String, Diagnostic]:
+	declaration ?= "".append_local_declaration(value_type, InitializedLocal, unions, span)
+	Ok(declaration.append_owner_name(owner).concat("=").append_local_name(value).concat(";(void)").append_owner_name(owner).concat(";"))
+
+
+private pure func append_owned_definition(
+	output: String,
+	definition: OwnedDefinition,
+	unions: List[ConcreteUnion],
+	records: List[ConcreteRecord],
+) -> Result[String, Diagnostic]:
+	value ?= output.append_value(
+		definition.id,
+		definition.value_type,
+		definition.operation,
+		unions,
+		records,
+		definition.span,
+	)
+
+	match definition.result:
+		UnmanagedResult | BorrowedResult(_):
+			Ok(value)
+		OwnedResult(owner):
+			match owner.owner_alias(definition.id, definition.value_type, unions, definition.span):
+				Ok(binding): Ok("${value}${binding}")
+				Err(error): Err(error)
+
+
+-- Disposable owner-type projection of accepted IR; value types stay local.
+private pure func owner_types(function: OwnedFunction) -> Result[List[TypeRef], Diagnostic]:
+	blocks = function.function_blocks()
+	var values: List[TypeRef] = []
+	var owners: List[TypeRef] = []
+	var failure: Option[Diagnostic] = None
+
+	for block in blocks:
+		for header in block.headers:
+			fact = header.parameter.join_parameter()
+			values = values.append(fact.value_type)
+			match header.parameter:
+				UnmanagedJoinParameter(_): void
+				ManagedJoinParameter(_, _): owners = owners.append(fact.value_type)
+		for input in block.inputs:
+			fact = input.join_parameter()
+			values = values.append(fact.value_type)
+			match input:
+				UnmanagedJoinParameter(_): void
+				ManagedJoinParameter(_, _): owners = owners.append(fact.value_type)
+		for operation in block.operations:
+			match operation:
+				DefineValue(definition):
+					values = values.append(definition.value_type)
+
+					match definition.result:
+						OwnedResult(_):
+							owners = owners.append(definition.value_type)
+						_:
+							void
+				ExecuteJoin(join):
+					for output in [join.result].concat(join.carried):
+						parameter = output.join_parameter()
+						values = values.append(parameter.value_type)
+						match output:
+							UnmanagedJoinParameter(_): void
+							ManagedJoinParameter(_, _): owners = owners.append(parameter.value_type)
+
+				ExecuteLoop(loop):
+					for output in [loop.result].concat(loop.carried):
+						parameter = output.join_parameter()
+						values = values.append(parameter.value_type)
+						match output:
+							UnmanagedJoinParameter(_): void
+							ManagedJoinParameter(_, _): owners = owners.append(parameter.value_type)
+
+				AcquireOwner(_, borrowed, span):
+					match values.get(borrowed.value.value_number()):
+						Some(value_type):
+							owners = owners.append(value_type)
+						None:
+							failure = Some(render(span, MissingValueType(borrowed.value)))
+							break
+				DropOwner(_, _):
+					void
+
+		if failure.is_some():
+			break
+
+	match failure:
+		Some(error):
+			Err(error)
+		None:
+			Ok(owners)
+
+
+private union OwnershipAction:
+	DuplicateValue
+	DestroyValue
+
+
+private pure func append_storage_operation(
+	output: String,
+	value_type: TypeRef,
+	action: OwnershipAction,
+	expression: String,
+	unions: List[ConcreteUnion],
+	span: Span,
+) -> Result[String, Diagnostic]:
+	name_result: Result[Option[String], Diagnostic] = match value_type:
+		CallableType(parameters, result):
+			prefix = match action:
+				DuplicateValue: "blorp_callable_dup_"
+				DestroyValue: "blorp_callable_drop_"
+			Ok(Some(prefix.concat(parameters.callable_suffix(result))))
+		RecordType(id):
+			prefix = match action:
+				DuplicateValue:
+					"blorp_record_dup_"
+				DestroyValue:
+					"blorp_record_drop_"
+
+			Ok(Some(prefix.append_int(id.record_number())))
+		ListType(element):
+			prefix = match action:
+				DuplicateValue: "blorp_list_dup_"
+				DestroyValue: "blorp_list_drop_"
+			Ok(Some(prefix.concat(element.list_element_key().list_suffix())))
+		StringType:
+			storage_helper: String = match action:
+				DuplicateValue:
+					"blorp_string_retain"
+				DestroyValue:
+					"blorp_string_release"
+			Ok(Some(storage_helper))
+		UnionType(id):
+			match unions.get(id.union_number()):
+				Some(layout):
+					union_helper: Option[String] = match layout:
+						PlainCases(_):
+							None
+						OwningCases(_) | BoxedCases(_):
+							prefix = match action:
+								DuplicateValue:
+									"blorp_union_dup_"
+								DestroyValue:
+									"blorp_union_drop_"
+
+							Some(prefix.append_int(id.union_number()))
+					Ok(union_helper)
+				None: Err(render(span, MissingUnionLayout(id)))
+		_:
+			Ok(None)
+
+	found_name ?= name_result
+	operation: String = match found_name:
+		Some(name):
+			"${output}${name}(${expression});"
+		None:
+			output
+	Ok(operation)
+
+
+private pure func append_union_action(
+	output: String,
+	layout: ConcreteUnion,
+	index: Int,
+	unions: List[ConcreteUnion],
+	action: OwnershipAction,
+) -> Result[String, Diagnostic]:
+	prefix = match action:
+		DuplicateValue:
+			"void blorp_union_dup_"
+		DestroyValue:
+			"void blorp_union_drop_"
+
+	var result = "${output}${prefix}${index.to_string()}(struct blorp_u_${index.to_string()} value){switch(value.tag){"
+	var position = 0
+	var failure: Option[Diagnostic] = None
+
+	for fields in layout.union_variants():
+		result = "${result}case blorp_v_${index.to_string()}_${position.to_string()}:"
+		var field_position = 0
+		for value_type in fields:
+			path = "value.payload.blorp_up_${position.to_string()}.blorp_uf_${field_position.to_string()}"
+			match result.append_storage_operation(value_type, action, path, unions, compiler_span()):
+				Ok(updated): result = updated
+				Err(error):
+					failure = Some(error)
+					break
+			field_position = field_position + 1
+		if failure.is_some():
+			break
+		result = "${result}break;"
+		position = position + 1
+
+	match failure:
+		Some(error):
+			Err(error)
+		None:
+			Ok("${result}}}")
+
+
+-- One counted node per constructed value: the compound literal's payload
+-- already holds acquired children, so the node takes them without retains.
+private pure func append_boxed_union_constructor(output: String, index: Int) -> String:
+	node = "".append_boxed_union_struct(index)
+	"${output}${node}* blorp_union_make_${index.to_string()}(${node} fields){"
+		.concat("${node}* value=blorp_memory_allocate(sizeof *value);if(!value)abort();atomic_init(&value->references,UINT64_C(1));")
+		.concat("value->tag=fields.tag;value->payload=fields.payload;return value;}")
+
+
+private pure func append_boxed_union_retain(output: String, index: Int) -> String:
+	node = "".append_boxed_union_struct(index)
+	"${output}void blorp_union_dup_${index.to_string()}(${node}* value){"
+		.concat("(void)atomic_fetch_add_explicit(&value->references,UINT64_C(1),memory_order_relaxed);}")
+
+
+-- A boxed union is stored by pointer, so any layout may retain and release
+-- it before its definition; its tag and helpers are declared up front with
+-- the record and List prototypes.
+private pure func append_boxed_union_prototypes(output: String, unions: List[ConcreteUnion]) -> String:
+	var fragments: List[String] = [output]
+	var index = 0
+
+	for layout in unions:
+		if layout.union_is_boxed():
+			node = "".append_boxed_union_struct(index)
+			fragments = fragments.append(
+				"${node};void blorp_union_dup_${index.to_string()}(${node}*);"
+					.concat("void blorp_union_drop_${index.to_string()}(${node}*);"),
+			)
+
+		index = index + 1
+
+	fragments.join("")
+
+
+-- Final release walks the chain instead of recursing: a node whose count
+-- reaches zero releases its other payloads, saves its one self child, is
+-- freed, and the walk continues with that child while it also dies. C stack
+-- use is therefore constant however deep the chain is.
+private pure func append_boxed_union_release(
+	output: String,
+	layout: ConcreteUnion,
+	index: Int,
+	unions: List[ConcreteUnion],
+) -> Result[String, Diagnostic]:
+	node = "".append_boxed_union_struct(index)
+	var result = "${output}void blorp_union_drop_${index.to_string()}(${node}* value){${node}* node=value;while(node!=NULL){"
+		.concat("if(atomic_fetch_sub_explicit(&node->references,UINT64_C(1),memory_order_acq_rel)!=UINT64_C(1))return;")
+		.concat("${node}* child=NULL;switch(node->tag){")
+	var position = 0
+	var failure: Option[Diagnostic] = None
+
+	for fields in layout.union_variants():
+		result = "${result}case blorp_v_${index.to_string()}_${position.to_string()}:"
+		var field_position = 0
+		for value_type in fields:
+			path = "node->payload.blorp_up_${position.to_string()}.blorp_uf_${field_position.to_string()}"
+			self_child = match value_type:
+				UnionType(id): id.union_number() == index
+				_: False
+			if self_child:
+				result = "${result}child=${path};"
+			else:
+				match result.append_storage_operation(value_type, DestroyValue, path, unions, compiler_span()):
+					Ok(updated): result = updated
+					Err(error):
+						failure = Some(error)
+						break
+			field_position = field_position + 1
+		if failure.is_some():
+			break
+		result = "${result}break;"
+		position = position + 1
+
+	match failure:
+		Some(error):
+			Err(error)
+		None:
+			Ok("${result}}blorp_memory_release(node);node=child;}}")
+
+
+private pure func append_union_ownership(
+	output: String,
+	layout: ConcreteUnion,
+	index: Int,
+	unions: List[ConcreteUnion],
+) -> Result[String, Diagnostic]:
+	match layout:
+		PlainCases(_):
+			Ok(output)
+		OwningCases(_):
+			match output.append_union_action(layout, index, unions, DuplicateValue):
+				Ok(duplicated): duplicated.append_union_action(layout, index, unions, DestroyValue)
+				Err(error): Err(error)
+		BoxedCases(_):
+			constructed = output.append_boxed_union_constructor(index)
+			constructed.append_boxed_union_retain(index).append_boxed_union_release(layout, index, unions)
+
+
+-- Exit destinations are prepared once; nested emission does not need the body.
+private record LoopEmissionContext {
+	break_parameters: List[Own.OwnedJoinParameter],
+	recur_parameters: List[Own.OwnedJoinParameter],
+	target: Lower.LoopTarget
+}
+
+
+private pure func append_ownership_operation(
+	output: String,
+	operation: OwnershipOperation,
+	unions: List[ConcreteUnion],
+	types: List[TypeRef],
+	records: List[ConcreteRecord], nearest: Option[LoopEmissionContext],
+) -> Result[String, Diagnostic]:
+	match operation:
+		DefineValue(definition):
+			output.append_owned_definition(definition, unions, records)
+		ExecuteJoin(matched_join):
+			output.append_join(matched_join, unions, types, records, nearest)
+		ExecuteLoop(loop):
+			output.append_loop(loop, unions, types, records)
+		AcquireOwner(owner, borrowed, span):
+			match types.get(owner.owner_number()):
+				Some(value_type):
+					match output.append_storage_operation(
+						value_type,
+						DuplicateValue,
+						"".append_local_name(borrowed.value),
+						unions,
+						span,
+					):
+						Ok(retained):
+							match owner.owner_alias(borrowed.value, value_type, unions, span):
+								Ok(binding): Ok("${retained}${binding}")
+								Err(error): Err(error)
+						Err(error): Err(error)
+				None: Err(render(span, MissingOwnerType(owner)))
+		DropOwner(owner, span):
+			match types.get(owner.owner_number()):
+				Some(value_type): output.append_storage_operation(value_type, DestroyValue, "".append_owner_name(owner), unions, span)
+				None: Err(render(span, MissingOwnerType(owner)))
+
+
+private pure func append_ownership_operations(
+	output: String,
+	operations: List[OwnershipOperation],
+	unions: List[ConcreteUnion],
+	types: List[TypeRef],
+	records: List[ConcreteRecord], nearest: Option[LoopEmissionContext],
+) -> Result[String, Diagnostic]:
+	var fragments: List[String] = [output]
+	var failure: Option[Diagnostic] = None
+
+	for operation in operations:
+		match "".append_ownership_operation(operation, unions, types, records, nearest):
+			Err(error):
+				failure = Some(error)
+				break
+			Ok(emitted):
+				fragments = fragments.append(emitted)
+
+	match failure:
+		Some(error):
+			Err(error)
+		None:
+			Ok(fragments.join(""))
+
+
+-- Selection labels project existing value and arm identities. A terminal
+-- selector's arm path distinguishes nested blocks that introduce no values.
+private record SelectionEmissionScope {
+	root: ValueId,
+	path: List[MatchArmId]
+}
+
+
+private pure func append_selection_scope_name(output: String, scope: SelectionEmissionScope) -> String:
+	var name = output.concat("blorp_selection_").append_int(scope.root.value_number())
+	for arm in scope.path:
+		name = name.concat("_in_").append_int(arm.match_arm_number())
+	name
+
+
+private pure func append_decision_name(output: String, scope: SelectionEmissionScope, node: DecisionNodeId) -> String:
+	output.append_selection_scope_name(scope).concat("_node_").append_int(node.decision_node_number())
+
+
+private pure func append_selection_arm_name(output: String, scope: SelectionEmissionScope, arm: MatchArmId) -> String:
+	output.append_selection_scope_name(scope).concat("_arm_").append_int(arm.match_arm_number())
+
+
+private pure func c_pattern_field(
+	parent: ConcretePatternPlace, field: Concrete.VariantFieldInstanceId,
+	scrutinee: ValueId, unions: List[ConcreteUnion], records: List[ConcreteRecord], span: Span,
+) -> Result[String, Diagnostic]:
+	base ?= parent.c_pattern_place(scrutinee, unions, records, span)
+	owner = field.variant_field_variant().variant_owner()
+	layout: ConcreteUnion ?= match unions.get(owner.union_number()):
+		Some(found): Ok(found)
+		None: Err(render(span, MissingUnionLayout(owner)))
+	Ok("(${base})${layout.union_member_selector()}payload.".append_payload_field_name(field.variant_field_variant(), field.variant_field_number()))
+
+
+private pure func c_pattern_place(
+	place: ConcretePatternPlace, scrutinee: ValueId,
+	unions: List[ConcreteUnion], records: List[ConcreteRecord], span: Span,
+) -> Result[String, Diagnostic]:
+	match place.route:
+		Concrete.MatchRoot: Ok("".append_local_name(scrutinee))
+		Concrete.UnionField(parent, field): parent.c_pattern_field(field, scrutinee, unions, records, span)
+		Concrete.RecordField(parent, field): place.c_pattern_record_field(parent, field, scrutinee, unions, records, span)
+		Concrete.ListElement(parent, index):
+			match parent.c_pattern_place(scrutinee, unions, records, span):
+				Err(error): Err(error)
+				Ok(base): Ok("(${base})->values[${index.to_string()}]")
+
+
+private pure func c_pattern_record_field(
+	place: ConcretePatternPlace, parent: ConcretePatternPlace, field: FieldInstanceId,
+	scrutinee: ValueId, unions: List[ConcreteUnion], records: List[ConcreteRecord], span: Span,
+) -> Result[String, Diagnostic]:
+	base ?= parent.c_pattern_place(scrutinee, unions, records, span)
+	layout: ConcreteRecord ?= match records.get(field.field_owner().record_number()):
+		Some(present): Ok(present)
+		None: Err(render(span, MissingRecordLayout(field.field_owner())))
+	match place.value_type:
+		VoidType: Ok("0")
+		_:
+			selector = match layout:
+				InlineFields(_) | ValueFields(_): "."
+				CountedFields(_): "->"
+			Ok("(${base})${selector}".append_field_name(field))
+
+
+private pure func c_variant_test(
+	place: ConcretePatternPlace, scrutinee: ValueId, variant: VariantInstanceId,
+	unions: List[ConcreteUnion], records: List[ConcreteRecord], span: Span,
+) -> Result[String, Diagnostic]:
+	base ?= place.c_pattern_place(scrutinee, unions, records, span)
+	owner = variant.variant_owner()
+	layout: ConcreteUnion ?= match unions.get(owner.union_number()):
+		Some(found): Ok(found)
+		None: Err(render(span, MissingUnionLayout(owner)))
+	tag = if layout.has_payload():
+		"(${base})${layout.union_member_selector()}tag"
+	else:
+		base
+	Ok(tag.concat("==").append_variant_name(variant))
+
+
+private record SelectionEmissionArm {
+	id: MatchArmId,
+	inputs: List[Own.OwnedJoinParameter],
+	operations: List[OwnershipOperation],
+	ending: String
+}
+
+
+private pure func append_input_declarations(
+	output: String, inputs: List[Own.OwnedJoinParameter], unions: List[ConcreteUnion],
+) -> Result[String, Diagnostic]:
+	var result = output
+	var failure: Option[Diagnostic] = None
+	for input in inputs:
+		fact = input.join_parameter()
+		match "".append_local_declaration(fact.value_type, JoinLocal, unions, fact.span):
+			Ok(declaration): result = result.concat(declaration).append_local_name(fact.id).concat(";")
+			Err(error):
+				failure = Some(error)
+				break
+	match failure:
+		Some(error): Err(error)
+		None: Ok(result)
+
+
+private pure func append_input_owners(
+	output: String, inputs: List[Own.OwnedJoinParameter], unions: List[ConcreteUnion],
+) -> Result[String, Diagnostic]:
+	var result = output
+	var failure: Option[Diagnostic] = None
+	for input in inputs:
+		fact = input.join_parameter()
+		result = result.concat("(void)").append_local_name(fact.id).concat(";")
+		match input:
+			UnmanagedJoinParameter(_): void
+			ManagedJoinParameter(_, owner):
+				match owner.owner_alias(fact.id, fact.value_type, unions, fact.span):
+					Ok(binding): result = "${result}${binding}"
+					Err(error):
+						failure = Some(error)
+						break
+	match failure:
+		Some(error): Err(error)
+		None: Ok(result)
+
+
+private pure func append_selection_edge(
+	output: String, scope: SelectionEmissionScope, edge: Own.OwnedSelectionEdge,
+	arms: List[SelectionEmissionArm], unions: List[ConcreteUnion],
+	types: List[TypeRef], records: List[ConcreteRecord], nearest: Option[LoopEmissionContext],
+) -> Result[String, Diagnostic]:
+	arm: SelectionEmissionArm ?= match arms.get(edge.arm.match_arm_number()):
+		Some(found): Ok(found)
+		None: Err(render(compiler_span(), MissingSelectionArm(scope.root)))
+	operations ?= output.append_ownership_operations(edge.operations, unions, types, records, nearest)
+	var result = operations
+	var position = 0
+	var failure: Option[Diagnostic] = None
+	for input in arm.inputs:
+		fact = input.join_parameter()
+		match edge.transfers.get(position):
+			Some(transfer): result = result.append_local_name(fact.id).concat("=").append_transfer_name(transfer).concat(";")
+			None:
+				failure = Some(render(fact.span, MissingJoinTransfer(fact.id)))
+				break
+		position = position + 1
+	match failure:
+		Some(error): Err(error)
+		None: Ok(result.concat("goto ").append_selection_arm_name(scope, edge.arm).concat(";"))
+
+
+private pure func c_selection_branch(
+	scope: SelectionEmissionScope, test: String,
+	yes: DecisionNodeId, no: DecisionNodeId,
+) -> String:
+	"if(".concat(test).concat(")goto ").append_decision_name(scope, yes).concat(";goto ").append_decision_name(scope, no).concat(";")
+
+
+private pure func append_selection_node(
+	scope: SelectionEmissionScope, selection: Own.OwnedSelection,
+	node: Own.OwnedDecisionNode, arms: List[SelectionEmissionArm],
+	unions: List[ConcreteUnion], types: List[TypeRef], records: List[ConcreteRecord], nearest: Option[LoopEmissionContext],
+) -> Result[String, Diagnostic]:
+	match node:
+		Own.TestVariant(place, variant, yes, no):
+			match place.c_variant_test(selection.scrutinee.argument_value(), variant, unions, records, compiler_span()):
+				Err(error): Err(error)
+				Ok(test): Ok(scope.c_selection_branch(test, yes, no))
+		Own.TestListLength(place, length, yes, no):
+			match place.c_pattern_place(selection.scrutinee.argument_value(), unions, records, compiler_span()):
+				Err(error): Err(error)
+				Ok(base):
+					test = match length:
+						ExactLength(count): "(${base})->length==INT64_C(${count.to_string()})"
+						MinimumLength(count): "(${base})->length>=INT64_C(${count.to_string()})"
+					Ok(scope.c_selection_branch(test, yes, no))
+		Own.TestStringBytes(place, bytes, yes, no):
+			match place.c_pattern_place(selection.scrutinee.argument_value(), unions, records, compiler_span()):
+				Err(error): Err(error)
+				Ok(base):
+					-- Each node has its own C scope. Static bytes preserve embedded
+					-- NUL and UTF8, with no String construction during testing.
+					name = "blorp_pattern_bytes"
+					data = "".append_byte_array(name, bytes)
+					test = "(${base})->length==INT64_C(${bytes.length().to_string()})&&memcmp((${base})->bytes,${name},(size_t)${bytes.length().to_string()})==0"
+					Ok(data.concat(scope.c_selection_branch(test, yes, no)))
+		Own.EnterArm(edge): "".append_selection_edge(scope, edge, arms, unions, types, records, nearest)
+
+
+private pure func append_selection(
+	output: String, scope: SelectionEmissionScope, selection: Own.OwnedSelection,
+	arms: List[SelectionEmissionArm], unions: List[ConcreteUnion],
+	types: List[TypeRef], records: List[ConcreteRecord], nearest: Option[LoopEmissionContext],
+) -> Result[String, Diagnostic]:
+	var result = output
+	var failure: Option[Diagnostic] = None
+	for arm in arms:
+		match result.append_input_declarations(arm.inputs, unions):
+			Ok(declared): result = declared
+			Err(error):
+				failure = Some(error)
+				break
+	_: Void ?= match failure:
+		Some(error): Err(error)
+		None: Ok(void)
+	result = result.concat("goto ").append_decision_name(scope, selection.entry).concat(";")
+	var position = 0
+	for node in selection.nodes:
+		match scope.append_selection_node(selection, node, arms, unions, types, records, nearest):
+			Ok(emitted):
+				result = result.append_selection_scope_name(scope).concat("_node_").append_int(position).concat(":{").concat(emitted).concat("}")
+			Err(error):
+				failure = Some(error)
+				break
+		position = position + 1
+	_: Void ?= match failure:
+		Some(error): Err(error)
+		None: Ok(void)
+	for arm in arms:
+		match scope.append_selection_body(arm, unions, types, records, nearest):
+			Ok(body): result = result.concat(body)
+			Err(error):
+				failure = Some(error)
+				break
+	match failure:
+		Some(error): Err(error)
+		None: Ok(result)
+
+
+private pure func append_selection_body(
+	scope: SelectionEmissionScope, arm: SelectionEmissionArm,
+	unions: List[ConcreteUnion], types: List[TypeRef], records: List[ConcreteRecord], nearest: Option[LoopEmissionContext],
+) -> Result[String, Diagnostic]:
+	opening = "".append_selection_arm_name(scope, arm.id).concat(":{")
+	inputs ?= opening.append_input_owners(arm.inputs, unions)
+	body ?= inputs.append_ownership_operations(arm.operations, unions, types, records, nearest)
+	Ok("${body}${arm.ending}}")
+
+
+-- Capture the complete outgoing batch before assigning any destination. The
+-- producer has already acquired or moved every owned occurrence and retired
+-- old owners.
+private pure func append_loop_exit(
+	output: String, exit: Own.OwnedLoopExit, context: LoopEmissionContext,
+	unions: List[ConcreteUnion],
+) -> Result[String, Diagnostic]:
+	parameters = match exit:
+		Own.Break(_): context.break_parameters
+		Own.Recur(_, _): context.recur_parameters
+	transfers = match exit:
+		Own.Break(outputs): [outputs.value].concat(outputs.carried)
+		Own.Recur(arguments, _): arguments
+	var result = output
+	var position = 0
+	var failure: Option[Diagnostic] = None
+	for parameter in parameters:
+		fact = parameter.join_parameter()
+		match transfers.get(position):
+			None:
+				failure = Some(render(fact.span, MissingJoinTransfer(fact.id)))
+				break
+			Some(transfer):
+				match "".append_local_declaration(fact.value_type, InitializedLocal, unions, fact.span):
+					Err(error):
+						failure = Some(error)
+						break
+					Ok(declaration):
+						result = result.concat(declaration).append_loop_transfer_name(context.target, position).concat("=").append_transfer_name(transfer).concat(";")
+		position = position + 1
+	_: Void ?= match failure:
+		Some(error): Err(error)
+		None: Ok(void)
+	position = 0
+	for parameter in parameters:
+		fact = parameter.join_parameter()
+		named = match exit:
+			Own.Break(_): result.append_local_name(fact.id)
+			Own.Recur(_, _): result.concat(fact.id.c_header())
+		result = named.concat("=").append_loop_transfer_name(context.target, position).concat(";")
+		position = position + 1
+	label = match exit:
+		Own.Break(_): context.target.c_loop_break()
+		Own.Recur(_, _): context.target.c_loop_header()
+	Ok("${result}goto ${label};")
+
+
+private pure func append_loop_block(
+	output: String, block: Own.OwnedLoopBlock, context: LoopEmissionContext,
+	scope: SelectionEmissionScope, unions: List[ConcreteUnion],
+	types: List[TypeRef], records: List[ConcreteRecord],
+) -> Result[String, Diagnostic]:
+	body ?= output.append_ownership_operations(block.operations, unions, types, records, Some(context))
+	body.append_loop_tail(block.tail, context, scope, unions, types, records)
+
+
+private pure func append_loop_tail(
+	output: String, tail: Own.OwnedLoopTail, context: LoopEmissionContext,
+	scope: SelectionEmissionScope,
+	unions: List[ConcreteUnion], types: List[TypeRef], records: List[ConcreteRecord],
+) -> Result[String, Diagnostic]:
+	match tail:
+		Own.ExitLoop(exit): output.append_loop_exit(exit, context, unions)
+		Own.MatchLoop(matched): output.append_loop_match(matched, context, scope, unions, types, records)
+
+
+private pure func append_loop_match(
+	output: String, matched: Own.OwnedLoopMatch, context: LoopEmissionContext,
+	scope: SelectionEmissionScope, unions: List[ConcreteUnion],
+	types: List[TypeRef], records: List[ConcreteRecord],
+) -> Result[String, Diagnostic]:
+	var arms: List[SelectionEmissionArm] = []
+	var failure: Option[Diagnostic] = None
+	for arm in matched.arms:
+		child = { scope | path = scope.path.append(arm.id) }
+		match "".append_loop_block(arm.body, context, child, unions, types, records):
+			Err(error):
+				failure = Some(error)
+				break
+			Ok(ending): arms = arms.append({ id = arm.id, inputs = arm.inputs, operations = [], ending = ending })
+	_: Void ?= match failure:
+		Some(error): Err(error)
+		None: Ok(void)
+	output.append_selection(scope, matched.selection, arms, unions, types, records, Some(context))
+
+
+private pure func append_loop(
+	output: String,
+	loop: Own.OwnedLoop,
+	unions: List[ConcreteUnion],
+	types: List[TypeRef],
+	records: List[ConcreteRecord],
+) -> Result[String, Diagnostic]:
+	parameters = [loop.result].concat(loop.carried)
+	output_declarations ?= "".append_input_declarations(parameters, unions)
+	var declarations = output_declarations
+	var snapshots = ""
+	var failure: Option[Diagnostic] = None
+	for header in loop.headers:
+		fact = header.parameter.join_parameter()
+		match "".append_local_declaration(fact.value_type, JoinLocal, unions, fact.span):
+			Err(error):
+				failure = Some(error)
+				break
+			Ok(declaration):
+				declarations = declarations.concat(declaration).concat(fact.id.c_header()).concat("=").append_transfer_name(header.initial).concat(";")
+				match "".append_local_declaration(fact.value_type, InitializedLocal, unions, fact.span):
+					Err(error):
+						failure = Some(error)
+						break
+					Ok(snapshot): snapshots = snapshots.concat(snapshot).append_local_name(fact.id).concat("=").concat(fact.id.c_header()).concat(";(void)").append_local_name(fact.id).concat(";")
+				match header.parameter:
+					UnmanagedJoinParameter(_): void
+					ManagedJoinParameter(_, owner):
+						match owner.owner_alias(fact.id, fact.value_type, unions, fact.span):
+							Ok(binding): snapshots = "${snapshots}${binding}"
+							Err(error):
+								failure = Some(error)
+								break
+	_: Void ?= match failure:
+		Some(error): Err(error)
+		None: Ok(void)
+	scope: SelectionEmissionScope = { root = loop.result.join_parameter().id, path = [] }
+	context: LoopEmissionContext = {
+		break_parameters = parameters,
+		recur_parameters = loop.headers.map(pure func(header): header.parameter),
+		target = Lower.loop_target(scope.root)
+	}
+	var entered = output
+	for acquisition in loop.entry_acquisitions:
+		match entered.append_ownership_operation(AcquireOwner(acquisition.owner, acquisition.borrow, loop.result.join_parameter().span), unions, types, records, None):
+			Ok(acquired): entered = acquired
+			Err(error):
+				failure = Some(error)
+				break
+	_: Void ?= match failure:
+		Some(error): Err(error)
+		None: Ok(void)
+	-- Acquisitions precede header initialization, which may move their aliases.
+	declared = entered.concat(declarations)
+	body ?= snapshots.append_loop_block(loop.body, context, scope, unions, types, records)
+	-- Both labels have lexical uses even for a loop with only one exit kind.
+	-- A sealed body always transfers before the final, unreachable goto.
+	completed = "${declared}goto ${context.target.c_loop_header()};${context.target.c_loop_header()}:{${body}}"
+		.concat("goto ${context.target.c_loop_break()};${context.target.c_loop_break()}:;")
+	completed.append_input_owners(parameters, unions)
+
+-- Verified ordinary joins have a yielding continuation. Abrupt arms transfer
+-- directly to their typed loop target through the same selection emitter.
+private pure func append_join(
+	output: String,
+	matched_join: OwnedJoin,
+	unions: List[ConcreteUnion],
+	types: List[TypeRef],
+	records: List[ConcreteRecord], nearest: Option[LoopEmissionContext],
+) -> Result[String, Diagnostic]:
+	parameter = matched_join.result.join_parameter()
+	parameters = [matched_join.result].concat(matched_join.carried)
+	var declarations = output
+	var failure: Option[Diagnostic] = None
+	for output_parameter in parameters:
+		fact = output_parameter.join_parameter()
+		match "".append_local_declaration(fact.value_type, JoinLocal, unions, fact.span):
+			Err(error):
+				failure = Some(error)
+				break
+			Ok(declaration): declarations = declarations.concat(declaration).append_local_name(fact.id).concat(";")
+	_: Void ?= match failure:
+		Some(error): Err(error)
+		None: Ok(void)
+	scope: SelectionEmissionScope = { root = parameter.id, path = [] }
+	done = "".append_selection_scope_name(scope).concat("_done")
+	var arms: List[SelectionEmissionArm] = []
+	for arm in matched_join.arms:
+		ending: Result[String, Diagnostic] = match arm.exit:
+			Own.TransferLoop(target, exit):
+				match nearest:
+					None: Err(render(parameter.span, MissingEnclosingLoop(target.loop_target_value())))
+					Some(context): "".append_loop_tail(exit, context, { root = scope.root, path = scope.path.append(arm.id) }, unions, types, records)
+			Own.Yield(outputs):
+				var transferred = "".append_local_name(parameter.id).concat("=").append_transfer_name(outputs.transfer).concat(";")
+				var position = 0
+				for output_parameter in matched_join.carried:
+					fact = output_parameter.join_parameter()
+					match outputs.carried.get(position):
+						None:
+							failure = Some(render(fact.span, MissingJoinTransfer(fact.id)))
+							break
+						Some(transfer): transferred = transferred.append_local_name(fact.id).concat("=").append_transfer_name(transfer).concat(";")
+					position = position + 1
+				match failure:
+					Some(error): Err(error)
+					None: Ok("${transferred}goto ${done};")
+		match ending:
+			Err(error):
+				failure = Some(error)
+				break
+			Ok(exit): arms = arms.append({ id = arm.id, inputs = arm.inputs, operations = arm.operations, ending = exit })
+
+	_: Void ?= match failure:
+		Some(error): Err(error)
+		None: Ok(void)
+	selected ?= declarations.append_selection(scope, matched_join.selection, arms, unions, types, records, nearest)
+	var joined = "${selected}${done}:;"
+	for output_parameter in parameters:
+		fact = output_parameter.join_parameter()
+		-- Include Void and unused outputs, exactly as for ordinary value locals.
+		joined = joined.concat("(void)").append_local_name(fact.id).concat(";")
+		match output_parameter:
+			UnmanagedJoinParameter(_): void
+			ManagedJoinParameter(_, owner):
+				match owner.owner_alias(fact.id, fact.value_type, unions, fact.span):
+					Ok(binding): joined = "${joined}${binding}"
+					Err(error): failure = Some(error)
+		if failure.is_some():
+			break
+	match failure:
+		Some(error): Err(error)
+		None: Ok(joined)
+
+
+private pure func append_signature(
+	output: String,
+	function: OwnedFunction,
+	index: Int,
+	unions: List[ConcreteUnion],
+) -> Result[String, Diagnostic]:
+	typed ?= output.append_type_name(function.return_type, unions, compiler_span())
+	parameters ?= function.parameters.map(parameter_type).c_parameters(unions)
+	Ok(typed.concat(" ").concat(index.c_name()).concat(parameters))
+
+
+private pure func append_transfer_name(output: String, result: ReturnTransfer) -> String:
+	match result:
+		UnmanagedReturn(id): output.append_local_name(id)
+		OwnedReturn(_, owner): output.append_owner_name(owner)
+
+
+private pure func append_stored_name(output: String, payload: StoredPayload) -> String:
+	match payload:
+		UnmanagedPayload(value): output.append_local_name(value)
+		OwnedPayload(_, owner): output.append_owner_name(owner)
+
+
+private pure func append_return(output: String, result: ReturnTransfer) -> String:
+	output.concat("return ").append_transfer_name(result).concat(";")
+
+
+private pure func append_function(
+	function: OwnedFunction,
+	index: Int,
+	unions: List[ConcreteUnion],
+	records: List[ConcreteRecord],
+) -> Result[String, Diagnostic]:
+	header ?= "".append_signature(function, index, unions)
+	types ?= function.owner_types()
+	body ?= "".append_ownership_operations(function.operations, unions, types, records, None)
+	-- The comment names the source function in profiles of the generated program.
+	Ok(["/* ", function.label.label_text(), " */ ", header, "{", body, "".append_return(function.result), "}"].join(""))
+
+
+-- Unsigned addition wraps. Both signed casts below receive representable values;
+-- the negative branch also stays within Int64 at UINT64_MAX - sum == INT64_MAX.
+INTEGER_ADD_RUNTIME: String =
+	|static int64_t blorp_int_add(int64_t first,int64_t second){uint64_t sum=(uint64_t)first+(uint64_t)second;return sum<=INT64_MAX?(int64_t)sum:-INT64_C(1)-(int64_t)(UINT64_MAX-sum);}
+	|
+
+-- Convert wrapped unsigned bits using only representable signed casts. Division
+-- and remainder guard both zero and the sole overflowing signed quotient.
+INTEGER_ARITHMETIC_RUNTIME: String =
+	|int64_t blorp_int_signed(uint64_t value){return value<=INT64_MAX?(int64_t)value:-INT64_C(1)-(int64_t)(UINT64_MAX-value);}
+	|int64_t blorp_int_subtract(int64_t first,int64_t second){return blorp_int_signed((uint64_t)first-(uint64_t)second);}
+	|int64_t blorp_int_multiply(int64_t first,int64_t second){return blorp_int_signed((uint64_t)first*(uint64_t)second);}
+	|int64_t blorp_int_divide(int64_t first,int64_t second){if(second==0)return 0;if(first==INT64_MIN&&second==-1)return INT64_MIN;return first/second;}
+	|int64_t blorp_int_remainder(int64_t first,int64_t second){if(second==0||(first==INT64_MIN&&second==-1))return 0;return first%second;}
+	|
+
+
+-- The type under any List layers. A String or Float there, anywhere in a record,
+-- union or function that specialization kept, selects its ABI prelude even when
+-- no value of it is ever built: a phantom type argument keeps its record
+-- (blorp/test/e2e/fixtures/record/phantom_union_fields.brp).
+private pure func innermost_element(value_type: TypeRef) -> TypeRef:
+	match value_type:
+		ListType(element): element.innermost_element()
+		_: value_type
+
+
+-- The scalar helper preludes a program selects, read from its inventory: a
+-- String or Float type selects its ABI prelude, and each runtime operation called
+-- selects its own helper. Allocation headers follow from the layouts and the
+-- argument vector from the entrypoint, which already own those facts.
+private fixed record RuntimeRequirements {
+	string_types: Bool,
+	float_types: Bool,
+	integer_addition: Bool,
+	integer_arithmetic: Bool,
+	string_output: Bool,
+	string_error_output: Bool,
+	integer_parsing: Bool,
+	string_equality: Bool,
+	string_concatenation: Bool,
+	string_integer_appending: Bool,
+	string_slicing: Bool,
+	float_formatting: Bool,
+	float_parsing: Bool
+}
+
+
+private pure func runtime_requirements(inventory: ProgramInventory) -> RuntimeRequirements:
+	var requirements: RuntimeRequirements = {
+		string_types = False,
+		float_types = False,
+		integer_addition = False,
+		integer_arithmetic = False,
+		string_output = False,
+		string_error_output = False,
+		integer_parsing = False,
+		string_equality = False,
+		string_concatenation = False,
+		string_integer_appending = False,
+		string_slicing = False,
+		float_formatting = False,
+		float_parsing = False,
+	}
+
+	for value_type in inventory.types:
+		match value_type.innermost_element():
+			StringType: requirements = { requirements | string_types = True }
+			FloatType: requirements = { requirements | float_types = True }
+			_: void
+
+	for operation in inventory.runtime_calls:
+		match operation:
+			IntAdd: requirements = { requirements | integer_addition = True }
+			IntSubtract | IntMultiply | IntDivide | IntRemainder:
+				requirements = { requirements | integer_arithmetic = True }
+			StringPrint: requirements = { requirements | string_output = True }
+			StringPrintError: requirements = { requirements | string_error_output = True }
+			StringParseInt(_): requirements = { requirements | integer_parsing = True }
+			StringEquals(_): requirements = { requirements | string_equality = True }
+			StringConcat: requirements = { requirements | string_concatenation = True }
+			StringAppendInt: requirements = { requirements | string_integer_appending = True }
+			StringSlice(_): requirements = { requirements | string_slicing = True }
+			FloatToString: requirements = { requirements | float_formatting = True }
+			StringParseFloat(_): requirements = { requirements | float_parsing = True }
+			ListRepeat(_) | ListLength(_) | ListGet(_, _) | ListAppend(_) | ListSet(_) | ListConcat(_):
+				void
+			IntEquals(_) | IntLessThan(_) | FloatAdd | FloatSubtract | FloatMultiply | FloatDivide | FloatRemainder | IntToString | StringLength | StringByteAt(_) | StringFromCodepoint(_):
+				void
+			FloatCopySign | FloatEquals(_) | FloatLessThan(_):
+				void
+			-- system_calls selects each system operation's own fragment.
+			SystemCall(_, _):
+				void
+
+	requirements
+
+
+-- Each system operation the program calls, once, in first-call order; each
+-- selects its own runtime fragment.
+private pure func system_calls(inventory: ProgramInventory) -> List[SystemOperation]:
+	var calls: List[SystemOperation] = []
+	for operation in inventory.runtime_calls:
+		match operation:
+			SystemCall(system, _):
+				if calls.contains(system).not():
+					calls = calls.append(system)
+			_: void
+	calls
+
+
+-- This table lives for one emission only. Its complete key is a projection
+-- of concrete TypeRefs, not an ownership or layout authority. Stable sorting
+-- and adjacent key equality avoid scanning existing helpers at each occurrence.
+private record ListLayout {
+	element: TypeRef,
+	key: ListElementKey
+}
+
+
+private pure func strip_list_layer(value_type: TypeRef) -> TypeRef:
+	match value_type:
+		ListType(element): element
+		_: value_type
+
+
+private pure func element_list_layouts(element: TypeRef) -> List[ListLayout]:
+	var current = element
+	var key = element.list_element_key()
+	var remaining = key.list_key_depth()
+	var layouts: List[ListLayout] = []
+	layouts = layouts.append({ element = current, key = key })
+
+	while remaining > 0:
+		current = current.strip_list_layer()
+		key = key.list_child_key()
+		remaining = remaining - 1
+		layouts = layouts.append({ element = current, key = key })
+
+	layouts
+
+
+private pure func type_list_layouts(value_type: TypeRef) -> List[ListLayout]:
+	match value_type:
+		ListType(element): element.element_list_layouts()
+		_: []
+
+
+-- One transient traversal item. H has no synthetic value definition, so its
+-- types enter the value projection when this child interval is visited.
+private record EmissionBlock {
+	headers: List[Own.OwnedLoopHeader],
+	inputs: List[Own.OwnedJoinParameter],
+	operations: List[OwnershipOperation]
+}
+
+
+private pure func function_blocks(function: OwnedFunction) -> List[EmissionBlock]:
+	append_block([], function.operations, [], [])
+
+
+private pure func append_selection_blocks(
+	blocks: List[EmissionBlock], selection: Own.OwnedSelection,
+) -> List[EmissionBlock]:
+	var collected = blocks
+	for node in selection.nodes:
+		match node:
+			Own.TestVariant(_, _, _, _) | Own.TestListLength(_, _, _, _) | Own.TestStringBytes(_, _, _, _): void
+			Own.EnterArm(edge): collected = collected.append_block(edge.operations, [], [])
+	collected
+
+
+private pure func append_loop_blocks(
+	blocks: List[EmissionBlock], block: Own.OwnedLoopBlock,
+	headers: List[Own.OwnedLoopHeader], inputs: List[Own.OwnedJoinParameter],
+) -> List[EmissionBlock]:
+	blocks.append_block(block.operations, headers, inputs).append_loop_tail_blocks(block.tail)
+
+
+private pure func append_loop_tail_blocks(
+	blocks: List[EmissionBlock], tail: Own.OwnedLoopTail,
+) -> List[EmissionBlock]:
+	var collected = blocks
+	match tail:
+		Own.ExitLoop(_): void
+		Own.MatchLoop(matched):
+			collected = collected.append_selection_blocks(matched.selection)
+			for arm in matched.arms:
+				collected = collected.append_loop_blocks(arm.body, [], arm.inputs)
+	collected
+
+
+private pure func append_block(
+	blocks: List[EmissionBlock], operations: List[OwnershipOperation],
+	headers: List[Own.OwnedLoopHeader], inputs: List[Own.OwnedJoinParameter],
+) -> List[EmissionBlock]:
+	var collected: List[EmissionBlock] = blocks.append({ headers = headers, inputs = inputs, operations = operations })
+	for operation in operations:
+		match operation:
+			ExecuteJoin(join):
+				collected = collected.append_selection_blocks(join.selection)
+				for arm in join.arms:
+					collected = collected.append_block(arm.operations, [], arm.inputs)
+					match arm.exit:
+						Own.Yield(_): void
+						Own.TransferLoop(_, tail): collected = collected.append_loop_tail_blocks(tail)
+			ExecuteLoop(loop):
+				acquisitions: List[OwnershipOperation] = loop.entry_acquisitions.map(pure func(acquisition):
+					AcquireOwner(acquisition.owner, acquisition.borrow, loop.result.join_parameter().span)
+				)
+				collected = collected.append_block(acquisitions, [], [])
+				collected = collected.append_loop_blocks(loop.body, loop.headers, [])
+			DefineValue(_) | AcquireOwner(_, _, _) | DropOwner(_, _): void
+	collected
+
+
+-- What emission inventories, found in one walk of the verified program: the
+-- type of every declared field and payload and of every defined value, and
+-- every runtime operation called. The list layouts read the types, the list
+-- update helpers read the calls and the runtime requirements read both, so none
+-- of them walks the program again. A signature type needs no entry of its own
+-- because the verifier ties it to a defined value: a parameter's definition
+-- takes its type from the signature, a call result must match the callee's
+-- return type, and the returned value must match the function's. The callable
+-- types are found once here: the callables the extended `types` adds are
+-- parameters and results of ones already found, so they add no new entry.
+private record ProgramInventory {
+	types: List[TypeRef],
+	callable_types: List[TypeRef],
+	runtime_calls: List[RuntimeOperation[VariantInstanceId, TypeRef]],
+	list_updates: List[ListUpdateHelper],
+	callable_entries: List[OwnedDefinition]
+}
+
+
+private pure func program_inventory(program: OwnershipProgram) -> ProgramInventory:
+	var types: List[TypeRef] = []
+	var runtime_calls: List[RuntimeOperation[VariantInstanceId, TypeRef]] = []
+	var list_updates: List[ListUpdateHelper] = []
+	var callable_entries: List[OwnedDefinition] = []
+
+	for layout in program.records:
+		for field in layout.record_fields():
+			types = types.append(field)
+
+	for layout in program.unions:
+		for fields in layout.union_variants():
+			for value_type in fields:
+				types = types.append(value_type)
+
+	for function in program.functions:
+		for block in function.function_blocks():
+			for header in block.headers:
+				types = types.append(header.parameter.join_parameter().value_type)
+			for input in block.inputs:
+				types = types.append(input.join_parameter().value_type)
+			for operation in block.operations:
+				match operation:
+					DefineValue(definition):
+						types = types.append(definition.value_type)
+						body: Option[Concrete.FunctionInstanceId] = match definition.operation:
+							FreeCallableDefinition(id): Some(id)
+							CapturedCallableDefinition(id, _): Some(id)
+							_: None
+						match body:
+							None: void
+							Some(id):
+								-- These verified definitions are disposable emission entries,
+								-- keyed by their code entry and full concrete signature.
+								duplicate = callable_entries.any(pure func(previous):
+									match previous.operation:
+										FreeCallableDefinition(other): (id == other).and(definition.value_type == previous.value_type)
+										CapturedCallableDefinition(other, _): (id == other).and(definition.value_type == previous.value_type)
+										_: False
+								)
+								if duplicate.not():
+									callable_entries = callable_entries.append(definition)
+						match definition.operation:
+							CallDefinition(target, _):
+								match target:
+									RuntimeFunction(runtime):
+										runtime_calls = runtime_calls.append(runtime)
+										match runtime.call_list_update():
+											Some(helper): list_updates = list_updates.append(helper)
+											None: void
+									_: void
+							ListSuffixDefinition(_, _):
+								match definition.value_type:
+									ListType(element): list_updates = list_updates.append(SuffixUpdate.update_helper(element))
+									_: void
+							_: void
+					ExecuteJoin(join):
+						for output in [join.result].concat(join.carried):
+							types = types.append(output.join_parameter().value_type)
+					ExecuteLoop(loop):
+						for output in [loop.result].concat(loop.carried):
+							types = types.append(output.join_parameter().value_type)
+					AcquireOwner(_, _, _) | DropOwner(_, _):
+						void
+
+	callables = types.callable_types()
+	for value in callables:
+		match value:
+			CallableType(parameters, result): types = types.concat(parameters).append(result)
+			_: void
+	{ types = types, callable_types = callables, runtime_calls = runtime_calls, list_updates = list_updates, callable_entries = callable_entries }
+
+
+private pure func list_layouts(inventory: ProgramInventory) -> List[ListLayout]:
+	var layouts: List[ListLayout] = []
+
+	for value_type in inventory.types:
+		for layout in value_type.type_list_layouts():
+			layouts = layouts.append(layout)
+
+	ordered = layouts
+		.sort_by(pure func(layout): layout.key.list_key_ordinal())
+		.sort_by(pure func(layout): layout.key.list_key_rank())
+		.sort_by(pure func(layout): layout.key.list_key_depth())
+	var unique: List[ListLayout] = []
+	var previous: Option[ListElementKey] = None
+	for layout in ordered:
+		duplicate = if layout.key.list_key_is_callable():
+			-- Structural signatures share the non-nominal sort ordinal; use the
+			-- complete typed key, including nonadjacent equal signatures.
+			unique.any(pure func(other): other.key == layout.key)
+		else:
+			match previous:
+				Some(key): key == layout.key
+				None: False
+		if duplicate.not():
+			unique = unique.append(layout)
+			previous = Some(layout.key)
+	unique
+
+
+-- An update helper is emitted only where its operation is called. The
+-- helper list is deduplicated by scanning its own entries: there are at most
+-- four per element layout, so the scan stays small for any call count.
+private record ListUpdateHelper {
+	update: ListUpdate,
+	layout: ListLayout
+}
+
+
+private pure func update_helper(update: ListUpdate, element: TypeRef) -> ListUpdateHelper:
+	{ update = update, layout = { element = element, key = element.list_element_key() } }
+
+
+private pure func call_list_update(operation: RuntimeOperation[VariantInstanceId, TypeRef]) -> Option[ListUpdateHelper]:
+	match operation:
+		ListAppend(element): Some(AppendUpdate.update_helper(element))
+		ListSet(element): Some(SetUpdate.update_helper(element))
+		ListConcat(element): Some(ConcatUpdate.update_helper(element))
+		_: None
+
+
+private pure func list_update_helpers(inventory: ProgramInventory) -> List[ListUpdateHelper]:
+	var unique: List[ListUpdateHelper] = []
+	for helper in inventory.list_updates:
+		var known: Bool = False
+		for existing in unique:
+			match existing.update == helper.update:
+				False: void
+				True:
+					if existing.layout.key == helper.layout.key:
+						known = True
+						break
+		match known:
+			True: void
+			False: unique = unique.append(helper)
+	unique
+
+
+private pure func append_list_prototypes(output: String, layouts: List[ListLayout]) -> String:
+	if layouts.is_empty():
+		output
+	else:
+		var fragments: List[String] = [output]
+		for layout in layouts:
+			suffix = layout.key.list_suffix()
+			type_name = layout.key.list_c_type()
+			fragment = "struct blorp_l_${suffix};void blorp_list_dup_${suffix}(${type_name});void blorp_list_drop_${suffix}(${type_name});"
+			fragments = fragments.append(fragment)
+		fragments.join("")
+
+
+-- The element C type and the stored-occurrence fragments every helper of one
+-- List layout stores and destroys through.
+private record ElementFragments {
+	type_name: String,
+	acquire: String,
+	destroy: String
+}
+
+
+private pure func element_fragments(
+	layout: ListLayout,
+	unions: List[ConcreteUnion],
+	records: List[ConcreteRecord],
+) -> Result[ElementFragments, Diagnostic]:
+	-- Nested helpers use the precomputed suffix key. Rewalking the TypeRef at
+	-- every suffix would make a single deeply nested List require quadratic work.
+	if layout.key.list_key_depth() > 0:
+		child = layout.key.list_child_key()
+		suffix = child.list_suffix()
+		Ok({
+			type_name = child.list_c_type(),
+			acquire = "blorp_list_dup_${suffix}(element);",
+			destroy = "blorp_list_drop_${suffix}(element);",
+		})
+	else:
+		layout.element.terminal_element_fragments(unions, records)
+
+
+private pure func terminal_element_fragments(
+	element: TypeRef,
+	unions: List[ConcreteUnion],
+	records: List[ConcreteRecord],
+) -> Result[ElementFragments, Diagnostic]:
+	type_name ?= "".append_type_name(element, unions, compiler_span())
+	needs_owner ?= element.value_needs_ownership(unions, records)
+	acquire: String ?= match needs_owner:
+		False: Ok("")
+		True: "".append_storage_operation(element, DuplicateValue, "element", unions, compiler_span())
+	destroy: String ?= match needs_owner:
+		False: Ok("")
+		True: "".append_storage_operation(element, DestroyValue, "element", unions, compiler_span())
+	Ok({ type_name = type_name, acquire = acquire, destroy = destroy })
+
+
+private pure func list_runtime_fragment(
+	layout: ListLayout,
+	unions: List[ConcreteUnion],
+	records: List[ConcreteRecord],
+) -> Result[String, Diagnostic]:
+	element ?= layout.element_fragments(unions, records)
+	Ok(layout.key.list_runtime(element.type_name, element.acquire, element.destroy))
+
+
+private pure func append_list_updates(
+	output: String,
+	helpers: List[ListUpdateHelper],
+	unions: List[ConcreteUnion],
+	records: List[ConcreteRecord],
+) -> Result[String, Diagnostic]:
+	if helpers.is_empty():
+		Ok(output)
+	else:
+		var fragments: List[String] = [output]
+		var failure: Option[Diagnostic] = None
+		-- At most four helpers share one layout, so recomputing its few
+		-- fragments costs less than keying them from the layout table.
+		for helper in helpers:
+			match helper.layout.element_fragments(unions, records):
+				Err(error):
+					failure = Some(error)
+					break
+				Ok(element):
+					fragments = fragments.append(helper.update.list_update_runtime(helper.layout.element, element.type_name, element.acquire, element.destroy))
+		match failure:
+			Some(error): Err(error)
+			None: Ok(fragments.join("\n"))
+
+
+private pure func append_list_runtime(
+	output: String,
+	layouts: List[ListLayout],
+	unions: List[ConcreteUnion],
+	records: List[ConcreteRecord],
+) -> Result[String, Diagnostic]:
+	if layouts.is_empty():
+		Ok(output)
+	else:
+		var fragments: List[String] = [output, LIST_SHARED_RUNTIME]
+		var failure: Option[Diagnostic] = None
+		for layout in layouts:
+			fragment = layout.list_runtime_fragment(unions, records)
+			match fragment:
+				Err(error):
+					failure = Some(error)
+					break
+				Ok(completed):
+					fragments = fragments.append(completed)
+		match failure:
+			Some(error): Err(error)
+			None: Ok(fragments.join("\n"))
+
+
+private pure func aggregate_runtime_contents(
+	checked: OwnershipProgram,
+	lists: List[ListLayout],
+	helpers: List[ListUpdateHelper],
+	callables: List[TypeRef],
+) -> Result[String, Diagnostic]:
+	-- The host copies a `var` list on each append after a `?=` that follows its declaration.
+	-- Both `?=` therefore precede `fragments`; `ready ?=` follows the loops and costs one copy.
+	ordered ?= checked.records.append_aggregate_definitions(checked.unions)
+	completed ?= "".append_list_runtime(lists, checked.unions, checked.records)
+	updates ?= "".append_list_updates(helpers, checked.unions, checked.records)
+	ops ?= callables.callable_ops(checked.unions)
+	var fragments: List[String] = [callables.callable_declarations(), "".append_list_prototypes(lists)]
+	var index: Int = 0
+
+	-- Complete declarations and helper groups end physical C lines so GCC can
+	-- retain column tracking and its diagnostics for the generated runtime.
+	for layout in checked.records:
+		typedef_prefix: String = "typedef struct blorp_r_"
+			.append_int(index)
+		pointer_marker: String = match layout:
+			InlineFields(_) | ValueFields(_):
+				" "
+			CountedFields(_):
+				"* "
+		fragments = fragments.append("${typedef_prefix}${pointer_marker}blorp_r_${index.to_string()};\n")
+		index = index + 1
+
+	index = 0
+
+	for _ in checked.records:
+		fragments = fragments.append("${"".append_record_prototypes(index)}\n")
+		index = index + 1
+
+	fragments = fragments.append("".append_boxed_union_prototypes(checked.unions))
+	fragments = fragments.append(ordered)
+	index = 0
+	var failure: Option[Diagnostic] = None
+
+	for layout in checked.records:
+		match "".append_record_ownership(layout, index, checked.unions):
+			Ok(ownership):
+				fragments = fragments.append("${ownership}\n")
+			Err(error):
+				failure = Some(error)
+				break
+
+		index = index + 1
+
+	_: Void ?= match failure:
+		Some(error):
+			Err(error)
+		None:
+			Ok(void)
+
+	arguments = match checked.entrypoint:
+		WithArguments(_, _): StringType.list_element_key().arguments_runtime()
+		NoArguments(_, _): ""
+	fragments = fragments.concat([completed, updates, arguments, ops])
+	Ok(fragments.join(""))
+
+
+-- Boxed union nodes need the allocation and atomic headers like managed records.
+private pure func has_boxed_union(unions: List[ConcreteUnion]) -> Bool:
+	var boxed: Bool = False
+
+	for layout in unions:
+		if layout.union_is_boxed():
+			boxed = True
+			break
+
+	boxed
+
+
+pure func aggregate_runtime(program: VerifiedProgram) -> Result[String, Diagnostic]:
+	checked = program.verified_contents()
+	inventory = checked.program_inventory()
+	checked.aggregate_runtime_contents(inventory.list_layouts(), inventory.list_update_helpers(), inventory.callable_types)
+
+
+-- Every exit from main reports through this one function. A diagnostic build
+-- of a program with Strings first retires its shared literals, so strict
+-- accounting can check them and count each one's release; one with Lists
+-- checks that every owner of an immortal empty root was dropped.
+private pure func program_finish_definition(string_types: Bool, list_types: Bool) -> String:
+	strings = if string_types:
+		"blorp_string_literals_finish(status)"
+	else:
+		"status"
+	finished_status = if list_types:
+		"blorp_list_empty_finish(${strings})"
+	else:
+		strings
+	"static int blorp_program_finish(int status){return blorp_memory_finish(${finished_status});}\n"
+
+
+pure func emit(program: VerifiedProgram) -> Result[String, Diagnostic]:
+	checked = program.verified_contents()
+	records = checked.records
+	inventory = checked.program_inventory()
+	requirements = inventory.runtime_requirements()
+	lists = inventory.list_layouts()
+	aggregates ?= checked.aggregate_runtime_contents(lists, inventory.list_update_helpers(), inventory.callable_types)
+
+	-- C is collected as fragments and joined once; appending each one to the
+	-- whole output would copy everything emitted so far at every step. The host
+	-- compiler copies a `var` list on every append that comes after a `?=`
+	-- placed between the list's declaration and that append, so no `?=` may sit
+	-- between this declaration and the loops below.
+	prelude = if requirements.string_types:
+		string_runtime()
+	else:
+		"#include <stdint.h>\n"
+	string_list_type = StringType.list_element_key().list_c_type()
+	system = inventory.system_calls().map(pure func(operation: SystemOperation) -> SystemRuntime: operation.system_runtime(string_list_type))
+	var fragments: List[String] = if system.any(pure func(runtime: SystemRuntime) -> Bool: runtime.posix_declarations):
+		[PROCESS_POSIX_PRELUDE, MEMORY_RUNTIME, prelude]
+	else:
+		[MEMORY_RUNTIME, prelude]
+
+	needs_allocation_headers: Bool = match lists.is_empty().not():
+		True: True
+		False:
+			match checked.records.any(pure func(layout):
+					match layout:
+						CountedFields(_):
+							True
+						InlineFields(_) | ValueFields(_):
+							False
+				):
+				True: True
+				False: checked.unions.has_boxed_union()
+	if needs_allocation_headers:
+		fragments = fragments.append("#include <stdlib.h>\n#include <stdatomic.h>\n")
+
+	if requirements.float_types:
+		fragments = fragments.append(float_runtime())
+
+	if requirements.float_formatting:
+		fragments = fragments.append(float_string_runtime())
+
+	if requirements.float_parsing:
+		fragments = fragments.append(float_parse_runtime())
+
+	if requirements.integer_addition:
+		fragments = fragments.append(INTEGER_ADD_RUNTIME)
+
+	if requirements.integer_arithmetic:
+		fragments = fragments.append(INTEGER_ARITHMETIC_RUNTIME)
+
+	if requirements.string_output:
+		fragments = fragments.append(string_print_runtime())
+
+	if requirements.string_error_output:
+		fragments = fragments.append(STRING_PRINT_ERROR_RUNTIME)
+
+	if requirements.integer_parsing:
+		fragments = fragments.append(string_parse_int_runtime())
+
+	if requirements.string_equality:
+		fragments = fragments.append(string_equals_runtime())
+
+	if requirements.string_concatenation.or(requirements.string_integer_appending):
+		fragments = fragments.append(string_concat_runtime())
+
+	if requirements.string_integer_appending:
+		fragments = fragments.append(string_append_int_runtime())
+
+	if requirements.string_slicing:
+		fragments = fragments.append(STRING_SLICE_RUNTIME)
+
+	fragments = fragments.append(aggregates)
+	-- System fragments follow the aggregates, whose String-list type they use.
+	if system.any(pure func(runtime: SystemRuntime) -> Bool: runtime.failure_helpers):
+		fragments = fragments.append(SYSTEM_FAILURE_RUNTIME)
+	if system.any(pure func(runtime: SystemRuntime) -> Bool: runtime.fs_helpers):
+		fragments = fragments.append(FS_HELPERS_RUNTIME)
+	for runtime in system:
+		fragments = fragments.append(runtime.fragment)
+	var index: Int = 0
+	var failure: Option[Diagnostic] = None
+
+	index = 0
+
+	for function in checked.functions:
+		match "".append_signature(function, index, checked.unions):
+			Err(error):
+				failure = Some(error)
+				break
+			Ok(signature):
+				fragments = fragments.append("${signature};")
+
+		index = index + 1
+
+	if failure.is_some().not():
+		for entry in inventory.callable_entries:
+			match entry.append_callable_entry(checked):
+				Ok(adapter): fragments = fragments.append(adapter)
+				Err(error):
+					failure = Some(error)
+					break
+
+	if failure.is_some().not():
+		index = 0
+
+		for function in checked.functions:
+			match function.append_function(index, checked.unions, records):
+				Err(error):
+					failure = Some(error)
+					break
+				Ok(function_code):
+					-- Each definition ends its line. Clang's -Wmisleading-indentation
+					-- slows sharply with line length, and one line of every body
+					-- dominated test compile time. GCC skips that check on very
+					-- long lines, so it now runs it and compiles somewhat slower.
+					fragments = fragments.append("${function_code}\n")
+
+			index = index + 1
+
+	match failure:
+		Some(error):
+			Err(error)
+		None:
+			output = fragments.append(requirements.string_types.program_finish_definition(lists.is_empty().not())).join("")
+			name = checked.entrypoint.entry_function().function_number().c_name()
+
+			wrapper = match checked.entrypoint:
+				NoArguments(_, IntegerExitStatus):
+					"${output}int main(void){blorp_memory_start();return blorp_program_finish((int)${name}());}\n"
+				NoArguments(_, SuccessfulExit):
+					"${output}int main(void){blorp_memory_start();(void)${name}();return blorp_program_finish(0);}\n"
+				WithArguments(_, result):
+					suffix = StringType.list_element_key().list_suffix()
+					prefix = output.concat(
+						"int main(int argc,char **argv){blorp_memory_start();struct blorp_l_${suffix} *const blorp_arguments=blorp_list_from_argv(argc,argv);",
+					).concat(
+						"if(blorp_arguments==NULL){fputs(\"error: command-line argument is not valid UTF-8\\nhelp: pass UTF-8 encoded arguments\\n\",stderr);return blorp_program_finish(1);}",
+					)
+
+					match result:
+						IntegerExitStatus:
+							"${prefix}const int64_t blorp_result=${name}(blorp_arguments);blorp_list_drop_${suffix}(blorp_arguments);"
+								.concat("return blorp_program_finish((int)blorp_result);}\n")
+						SuccessfulExit:
+							"${prefix}(void)${name}(blorp_arguments);blorp_list_drop_${suffix}(blorp_arguments);return blorp_program_finish(0);}\n"
+
+			Ok(wrapper)

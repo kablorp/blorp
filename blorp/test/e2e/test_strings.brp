@@ -1,0 +1,149 @@
+import:
+	./cost: CostLimits
+	./harness: native_case, run_example, run_isolated, run_output_example, run_source_example, with_directory
+	process: ProcessOutput
+	system: read_file, write_file
+	test: TestSuite
+
+
+private LIMITS: CostLimits = {
+	allocations = 150000,
+	instructions = 600000000
+}
+
+
+private func verify_foundation_diagnostic(compiler: String, directory: String) -> Result[Void, String]:
+	invalid_types: String =
+		|type Int = builtin
+		|type Float = builtin
+		|
+	source: String =
+		|func main() -> Int:
+		|	0
+		|
+	types = directory + "/_base.brp"
+	input = directory + "/main.brp"
+	output = directory + "/program.c"
+	written_types ?= write_file(types, invalid_types)
+	written_prelude ?= write_file(directory + "/prelude.brp", "")
+	written_input ?= write_file(input, source)
+	written_output ?= write_file(output, "preserve output")
+	result ?= run_isolated(
+		compiler,
+		["--library-root", directory, input, output],
+	)
+	retained ?= read_file(output)
+
+	if (
+		result.exit_code() == 1
+		and result.stdout() == ""
+		and result.stderr() == types + ":3:1: error: missing String builtin declaration\nhelp: add type String = builtin to _base.brp\n"
+		and retained == "preserve output"
+	):
+		Ok(void)
+	else:
+		Err("foundation errors must retain their source and preserve existing output")
+
+
+func suite(compiler: String) -> TestSuite:
+	{
+		description = "Blorp 2 mortal Strings",
+		tests = [
+			("append_int preserves UTF-8 and NUL bytes", func():
+				run_example(compiler, {
+					name = "append_int UTF-8 and NUL",
+					library_root = "blorp/standard_library",
+					fixture = "blorp/test/e2e/fixtures/string_operations/append_int.brp",
+					expected_c = None,
+					first_case = native_case("real main", "", 23, "é\0-42\n"),
+					remaining_cases = [],
+					limits = { allocations = 43000, instructions = 150000000 }
+				})
+			),
+			("append_int preserves extrema aliases and unused cleanup", func():
+				run_output_example(
+					compiler,
+					"blorp/test/e2e/fixtures/string_operations/append_int_edges.brp",
+					"é\0-9223372036854775808\né\0\n0\nx9223372036854775807\n",
+					{ allocations = 45000, instructions = 200000000 },
+				)
+			),
+			("arm aliases survive replacement and unused cleanup", func():
+				run_source_example(
+					compiler,
+					"blorp/test/e2e/fixtures/match/string_cleanup.brp",
+					1,
+					LIMITS,
+				)
+			),
+			("first tail arm returns fresh String", func():
+				run_source_example(
+					compiler,
+					"blorp/test/e2e/fixtures/match/string_first.brp",
+					1,
+					LIMITS,
+				)
+			),
+			("second tail arm returns fresh String", func():
+				run_source_example(
+					compiler,
+					"blorp/test/e2e/fixtures/match/string_second.brp",
+					2,
+					LIMITS,
+				)
+			),
+			("foundation diagnostic retains source and output", func():
+				with_directory(
+					func(directory: String): verify_foundation_diagnostic(compiler, directory),
+				)
+			),
+			("conversion and borrowed length", func():
+				run_source_example(
+					compiler,
+					"blorp/test/e2e/fixtures/mortal_string/basic.brp",
+					1,
+					LIMITS,
+				)
+			),
+			("unused String result returns zero", func():
+				run_source_example(
+					compiler,
+					"blorp/test/e2e/fixtures/mortal_string/unused.brp",
+					0,
+					LIMITS,
+				)
+			),
+			("owned return may alias borrowed argument", func():
+				run_source_example(
+					compiler,
+					"blorp/test/e2e/fixtures/mortal_string/identity.brp",
+					1,
+					LIMITS,
+				)
+			),
+			("reassignment preserves live original", func():
+				run_source_example(
+					compiler,
+					"blorp/test/e2e/fixtures/mortal_string/alias.brp",
+					2,
+					LIMITS,
+				)
+			),
+			("Int64 minimum conversion length", func():
+				run_source_example(
+					compiler,
+					"blorp/test/e2e/fixtures/mortal_string/minimum.brp",
+					20,
+					LIMITS,
+				)
+			),
+			("Int64 maximum conversion length", func():
+				run_source_example(
+					compiler,
+					"blorp/test/e2e/fixtures/mortal_string/maximum.brp",
+					19,
+					LIMITS,
+				)
+			),
+		]
+	}

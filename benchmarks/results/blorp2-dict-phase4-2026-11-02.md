@@ -1,6 +1,6 @@
 # Blorp 2 Dict phase 4, 2026-11-02
 
-Phase 4 of [DICT_PLAN](../../blorp_2/DICT_PLAN.md): `utils/names.brp` interns names
+Phase 4 of [DICT_PLAN](../../blorp/DICT_PLAN.md): `utils/names.brp` interns names
 through one `Dict[String, NameId]` (`by_spelling`) instead of a `spellings` List plus a
 derived bucket index. An ID is still its spelling's position, now the position among the
 Dict's keys, and the Dict's value is that same ID, written by the one `set` that adds the

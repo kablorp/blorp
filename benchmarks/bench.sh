@@ -20,7 +20,7 @@
 #   bash benchmarks/bench.sh --list       # List available benchmarks
 #
 # Prerequisites:
-#   make -C blorp_2 compiler           # the blorp2 column (or set BLORP2_COMPILER)
+#   make -C blorp compiler             # the blorp2 column (or set BLORP2_COMPILER)
 #   The blorp column is the pinned legacy release named in
 #   benchmarks/legacy-compiler.env. A run that builds a benchmark downloads it
 #   once into $XDG_CACHE_HOME/blorp/legacy (default ~/.cache/blorp/legacy) and
@@ -49,7 +49,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 # shellcheck source=legacy-compiler.env
 . "$SCRIPT_DIR/legacy-compiler.env"
-BLORP2_COMPILER="${BLORP2_COMPILER:-$PROJECT_DIR/blorp_2/build/compiler}"
+BLORP2_COMPILER="${BLORP2_COMPILER:-$PROJECT_DIR/blorp/build/compiler}"
 PYTHON="${PYTHON:-python3}"
 if [ "${PYTHON_CONCURRENCY+x}" ]; then
     PYTHON_CONCURRENCY_DEFAULTED=0
@@ -337,7 +337,7 @@ compile_blorp() {
 
     cp "$src" "$bench_src" || return 1
     if [ "$lang" = "blorp2" ]; then
-        "$BLORP2_COMPILER" --library-root "$PROJECT_DIR/blorp_2/standard_library" \
+        "$BLORP2_COMPILER" --library-root "$PROJECT_DIR/blorp/standard_library" \
             "$bench_src" "$bench_c" >/dev/null || return 1
     else
         if [ -d "$helper_src" ]; then
@@ -865,7 +865,7 @@ fi
 
 for name in $RUN_BENCHMARKS; do
     if has_bench blorp2 "$name" && [ ! -x "$BLORP2_COMPILER" ]; then
-        die "BLORP2_COMPILER is not executable: $BLORP2_COMPILER; run 'make -C blorp_2 compiler' or set BLORP2_COMPILER"
+        die "BLORP2_COMPILER is not executable: $BLORP2_COMPILER; run 'make -C blorp compiler' or set BLORP2_COMPILER"
     fi
 done
 LEGACY_COMPILER="$(legacy_compiler)" || exit 1

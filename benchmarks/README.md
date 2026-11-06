@@ -7,7 +7,7 @@ Performance benchmarks comparing blorp, Blorp 2, C, Go, OCaml, and Python.
 ```bash
 # Build the Blorp 2 compiler first. The blorp column needs no build: it uses a
 # pinned legacy release that the first run downloads and verifies.
-make -C blorp_2 compiler
+make -C blorp compiler
 
 # Run the default benchmark suite
 bash benchmarks/bench.sh
@@ -57,8 +57,8 @@ timing helpers use comes from that release's embedded library.
 
 ### Blorp 2
 
-The `blorp2` column uses `blorp_2/build/compiler` and the explicit
-`blorp_2/standard_library` root. Set `BLORP2_COMPILER` to select another compiler
+The `blorp2` column uses `blorp/build/compiler` and the explicit
+`blorp/standard_library` root. Set `BLORP2_COMPILER` to select another compiler
 executable. The column never falls back to the legacy compiler. A missing compiler is
 an error when the selected workload has a Blorp 2 port; unsupported rows show
 `-`. Listing the workloads needs neither compiler.

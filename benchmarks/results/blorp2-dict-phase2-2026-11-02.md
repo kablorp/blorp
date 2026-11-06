@@ -1,6 +1,6 @@
 # Blorp 2 Dict phase 2, 2026-11-02
 
-Phase 2 of [DICT_PLAN](../../blorp_2/DICT_PLAN.md): the `{}` and `{k => v}` literals.
+Phase 2 of [DICT_PLAN](../../blorp/DICT_PLAN.md): the `{}` and `{k => v}` literals.
 `=>` is a token, the parser reads a `DictExpression`, and checking rewrites each
 literal as calls to `empty`, `with_capacity` and `set` of the module that declares
 the prelude's `Dict`, found once at admission (`CanonicalContracts.dict_literal`).

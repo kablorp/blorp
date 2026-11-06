@@ -28,7 +28,7 @@ Blorp 2 can compile today.
   because its `filter`, `reverse` and `sort_by` are temporary immutable
   divide-and-conquer algorithms. On `helper_accumulators record_loop`, it
   does 775× the legacy work, net of startup: a known quadratic case listed
-  in the ROADMAP's [O2 known limits](../../blorp_2/ROADMAP.md#o2-record-update-binds-before-it-rebuilds).
+  in the ROADMAP's [O2 known limits](../../blorp/ROADMAP.md#o2-record-update-binds-before-it-rebuilds).
   The legacy compiler has the reverse problem on `record_result`: 14,646 M
   instructions and 6.1 GiB peak RSS at 65,536 steps, against Blorp 2's 53 M
   instructions and 5.9 MiB.
@@ -211,7 +211,7 @@ after the first error was checked.
 - **Tensor dimensions, concurrency and the missing library modules.** These
   (`dict`, `set`, `vector`, `instrumentation`, `units`, and the local
   `./support/benchmark` helper) are outside the
-  [Blorp 2 scope](../../blorp_2/AGENTS.md#scope) today. Blorp 2's library has
+  [Blorp 2 scope](../../blorp/AGENTS.md#scope) today. Blorp 2's library has
   only `bool`, `float`, `int`, `io`, `list`, `option`, `path`, `process`,
   `result`, `string`, `system`, `test` and `traits`.
 

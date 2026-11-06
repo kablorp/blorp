@@ -12,12 +12,12 @@ status, start here:
 ## Where Blorp lives
 
 The compiler, its standard library, tests and tooling live in
-[`blorp_2/`](blorp_2/):
+[`blorp/`](blorp/):
 
-- [`blorp_2/README.md`](blorp_2/README.md) defines the supported language and
+- [`blorp/README.md`](blorp/README.md) defines the supported language and
   the compiler's design.
-- [`blorp_2/grammar.ebnf`](blorp_2/grammar.ebnf) is the formal grammar.
-- [`blorp_2/AGENTS.md`](blorp_2/AGENTS.md) holds the build, test and review
+- [`blorp/grammar.ebnf`](blorp/grammar.ebnf) is the formal grammar.
+- [`blorp/AGENTS.md`](blorp/AGENTS.md) holds the build, test and review
   rules for contributors.
 
 The earlier compiler (a larger language with tensors, concurrency, a formatter,
@@ -34,13 +34,13 @@ GCC instead of the default Clang.
 ```bash
 git clone https://github.com/kablorp/blorp.git
 cd blorp
-make -C blorp_2 compiler    # downloads the pinned, SHA-256-verified seed, then builds
-make -C blorp_2 example     # compiles and runs a small program through the new compiler
-make -C blorp_2 test        # self-hosted component suites and native end-to-end tests
+make -C blorp compiler    # downloads the pinned, SHA-256-verified seed, then builds
+make -C blorp example     # compiles and runs a small program through the new compiler
+make -C blorp test        # self-hosted component suites and native end-to-end tests
 ```
 
 The compiler's command line is
-`blorp_2/build/compiler --library-root blorp_2/standard_library INPUT.brp OUTPUT.c`;
+`blorp/build/compiler --library-root blorp/standard_library INPUT.brp OUTPUT.c`;
 compile the C with your C compiler.
 
 `scripts/blorp2-fixpoint --prove` proves that the compiler reproduces its own C

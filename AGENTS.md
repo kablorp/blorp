@@ -4,11 +4,11 @@ A compiler for a functional programming language with pure/impure function track
 
 ## Where Things Live
 
-The compiler, standard library, tests and tooling live in [`blorp_2/`](blorp_2/).
-Read [`blorp_2/AGENTS.md`](blorp_2/AGENTS.md) next: it owns the build, test and
+The compiler, standard library, tests and tooling live in [`blorp/`](blorp/).
+Read [`blorp/AGENTS.md`](blorp/AGENTS.md) next: it owns the build, test and
 validation commands, the test layout and the compiler's design principles.
-[`blorp_2/README.md`](blorp_2/README.md) defines the supported language and
-[`blorp_2/grammar.ebnf`](blorp_2/grammar.ebnf) its grammar. The rest of this
+[`blorp/README.md`](blorp/README.md) defines the supported language and
+[`blorp/grammar.ebnf`](blorp/grammar.ebnf) its grammar. The rest of this
 file holds the language principles and development rules that apply to every
 change. [`docs/CODE_STYLE.md`](docs/CODE_STYLE.md) owns code style and
 [`docs/HANDOFF_SPEC.md`](docs/HANDOFF_SPEC.md) owns the shape of a brief.
@@ -149,7 +149,7 @@ under the ignored `build/` directory, and a report is deleted when the decision
 it supports is superseded. A change still stays within any cost ceiling its
 spec sets.
 
-Any compiler data-model refactor in `blorp_2/` requires matched
+Any compiler data-model refactor in `blorp/` requires matched
 before/after self-compile allocations and retired instructions, with
 production and test line counts reported separately. Significant regressions
 in allocations, retired instructions, or production line count are not
@@ -182,7 +182,7 @@ meaningful, clear, and proportional to their scope.
 
 **1. Write a failing test first.** We strongly prefer TDD. Define what success looks like
 before writing implementation. Where each kind of test lives, and how to run it,
-is in [`blorp_2/AGENTS.md`](blorp_2/AGENTS.md). For bug fixes, add a regression
+is in [`blorp/AGENTS.md`](blorp/AGENTS.md). For bug fixes, add a regression
 test that fails before the fix and passes after.
 
 **2. One change per change.** Fix the bug, add the feature, or refactor — not all three.
@@ -227,16 +227,16 @@ either work or produce a helpful message.
 (`load`, `namespace`), checking (`check`), specialization (`specialize`), lowering
 (`lower`), ownership insertion (`own`), verification (`verify`) and C emission (`emit`)
 have different responsibilities. The exact current order is owned by
-[`blorp_2/README.md`](blorp_2/README.md) and `blorp_2/src/main.brp`; do not duplicate it
+[`blorp/README.md`](blorp/README.md) and `blorp/src/main.brp`; do not duplicate it
 here. Don't put type-checking logic in lowering or ownership passes, or parsing
 constraints in checking. If a check belongs earlier, move it there. If it must stay late
 (for example because specialization provides the needed facts), document why.
 
 **9. Measure, don't guess.** If there's any doubt about efficiency, use Blorp 2's measurement
-tools: `BLORP_ALLOCATION_SITES` with `blorp_2/scripts/allocation-sites` for where allocations
-come from, `blorp_2/scripts/attribution/run` for reference-count and copy attribution, and a
+tools: `BLORP_ALLOCATION_SITES` with `blorp/scripts/allocation-sites` for where allocations
+come from, `blorp/scripts/attribution/run` for reference-count and copy attribution, and a
 `-DBLORP_MEMORY_DIAGNOSTICS=1` build with `BLORP_LEAK_CHECK=strict` for memory;
-`blorp_2/README.md` documents them. Claims like "this is
+`blorp/README.md` documents them. Claims like "this is
 faster" require before/after evidence.
 Elapsed latency matters, but it is often noisy and can hide the mechanism. During investigation,
 also prefer direct and repeatable signals such as allocation and release counts, retired
@@ -260,14 +260,14 @@ in `benchmarks/results/` and the plan documents.
 test-runner agents. No exceptions for "trivial" changes — trivial changes have trivial reviews.
 
 **13. Update docs with the code.** If your change is user-facing (syntax, API, error message),
-update `blorp_2/README.md` and `blorp_2/grammar.ebnf` in the same commit. Documentation drift is a bug.
+update `blorp/README.md` and `blorp/grammar.ebnf` in the same commit. Documentation drift is a bug.
 The formal grammar must stay in sync with the parser.
 
 **14. Prefer coherent pre-0.1 behavior over backwards compatibility.** Blorp is pre-0.1.0, so
 do not preserve old syntax, APIs, or compatibility shims merely to avoid breaking users. If the
 new behavior is clearer, safer, or simpler, remove the old form and make the current language
 coherent. Breaking changes still require updating all call sites in
-`blorp_2/standard_library/`, tests and docs in the same change. Add migration-style error messages only when they
+`blorp/standard_library/`, tests and docs in the same change. Add migration-style error messages only when they
 meaningfully improve first-time user experience or prevent confusing parser/typechecker failures.
 
 **15. Focus on quality.** If your code is not ready to pass a review for production, then your
@@ -286,8 +286,8 @@ building a workaround without reassessing the task with the user.
 
 ## Commands, Validation And Repository Boundaries
 
-[`blorp_2/AGENTS.md`](blorp_2/AGENTS.md) owns them: the build and test commands,
-which gates a change runs, and the test layout. `make -C blorp_2 test` is the
+[`blorp/AGENTS.md`](blorp/AGENTS.md) owns them: the build and test commands,
+which gates a change runs, and the test layout. `make -C blorp test` is the
 default gate. Iterate with the narrowest test that exercises the change, then run
 the broader gates before review. Keep large dumps and gate logs on disk and share
 the relevant excerpt and the path.
@@ -306,7 +306,7 @@ implementation and documenter review after; API/user-facing design needs
 ergonomics-expert and data-engineer validation; performance work needs a
 code-optimizer hypothesis and measured
 verification. One worker may carry several roles when qualified; do not spawn
-separate agents merely to reproduce a fixed chain. Run a quick `make -C blorp_2`
+separate agents merely to reproduce a fixed chain. Run a quick `make -C blorp`
 directly rather than spawning an agent for build status.
 
 Subagent definitions live in `.claude/agents/`. Use `compiler-expert` as the

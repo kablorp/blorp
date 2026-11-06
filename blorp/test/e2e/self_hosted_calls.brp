@@ -1,0 +1,246 @@
+-- Native cases for calls, recursion, constants and Int: each program compiles
+-- once within its ceiling, then runs with exact stdout, status and strict
+-- allocation counts.
+import:
+    ./self_hosted_harness:
+        CompileCeiling, CompileInput(SingleSource), FIXTURES, NativeRun, Program, Rejection, exits_with, expect_failure, fixture_program, once, prints, reported, verify_program, verify_rejection, verify_unpublished_rejection, with_arguments
+    fs: describe, read_text, write_text
+    test: TestSuite
+    list: List methods, repeat
+    result: Result methods
+    string: String methods
+
+
+-- Every program's compile ceiling is its measured cost plus 15%, rounded up to
+-- a whole count: allocations from the compiler's strict report, retired
+-- instructions (the larger of two serial runs) from /usr/bin/time -l, both for
+-- the -O0 compiler under test. Measurements, commit and commands:
+-- benchmarks/results/blorp_2_e2e_ceilings_2026-11-05.md. A ceiling changes only
+-- with a new record there.
+
+
+private pure func repeated(text: String, count: Int) -> String:
+    repeat(text, count).join("")
+
+
+private pure func nines(count: Int) -> String:
+    repeated("9", count)
+
+
+private pure func constant_rejection(name: String, fixture: String, location: String, message: String, help: String) -> Rejection:
+    { name = name, source = FIXTURES + "constant/" + fixture + ".brp", diagnostic = ":" + location + ": error: " + message + "\nhelp: " + help + "\n" }
+
+
+-- User-written function names, even ones a C compiler reserves or the emitter
+-- numbers, are not C symbols: the program links and returns what it calls.
+private WRITTEN_NAMES: String = "func main() -> Int:\n    int()\nfunc int() -> Int:\n    blorp_f_0()\nfunc blorp_f_0() -> Int:\n    1\n"
+
+
+private func verify_written_names(compiler: String, c_compiler: String, work_directory: String, check_instructions: Bool) -> Result[Void, String]:
+    source = work_directory + "/written_names.brp"
+    _ ?= write_text(source, WRITTEN_NAMES).map_err(describe)
+    verify_program(compiler, c_compiler, work_directory, check_instructions, { name = "written_names", input = SingleSource(source), ceiling = { allocations = 103488, instructions = 587951330 }, runs = once(1, "", 0) })
+
+
+-- An integer literal one past the Int64 maximum.
+private func verify_out_of_range_literal(compiler: String, work_directory: String) -> Result[Void, String]:
+    verify_unpublished_rejection(
+        compiler, work_directory, "overflow", "func main() -> Int:\n\t9223372036854775808\n",
+        ":2:2: error: integer literal is outside the Int64 range\nhelp: use a value from -9223372036854775808 to 9223372036854775807\n",
+    )
+
+
+private USAGE_ERROR: String = "blorp_2: error: expected a library root, input and output paths\nhelp: run blorp_2 --library-root DIRECTORY INPUT.brp OUTPUT.c, or --library-root DIRECTORY --test-suite SUITE.brp [SUITE.brp ...] OUTPUT.c\n"
+private PRESERVED_C: String = "preserve this output"
+
+
+-- Without a library root the compiler teaches its usage and leaves the output.
+private func verify_missing_library_root(compiler: String, work_directory: String) -> Result[Void, String]:
+    output = work_directory + "/preserved.c"
+    _ ?= write_text(output, PRESERVED_C).map_err(describe)
+    _ ?= expect_failure(compiler, [FIXTURES + "int/add.brp", output], work_directory + "/missing_root", USAGE_ERROR)
+    actual: String ?= read_text(output).map_err(describe)
+    if actual.equals(PRESERVED_C):
+        Ok(void)
+    else:
+        Err("missing library root overwrote existing C output")
+
+
+private func verify_usage_error(compiler: String, work_directory: String, name: String, arguments: List[String]) -> Result[Void, String]:
+    expect_failure(compiler, arguments, work_directory + "/" + name, USAGE_ERROR)
+
+
+func suite(compiler: String, c_compiler: String, work_directory: String, check_instructions: Bool) -> TestSuite:
+    run_program = func(program: Program) -> Bool: reported(verify_program(compiler, c_compiler, work_directory, check_instructions, program))
+    reject = func(rejection: Rejection) -> Bool: reported(verify_rejection(compiler, work_directory, rejection))
+    {
+        description = "Blorp 2 calls, recursion, constants and Int",
+        tests = [
+            ("return zero", func(): run_program(exits_with("return_zero", "return/zero", { allocations = 102938, instructions = 589180003 }, 0, 0))),
+            ("blank lines and comments", func(): run_program(exits_with("lexical_trivia", "syntax/trivia", { allocations = 102938, instructions = 587099274 }, 0, 0))),
+            ("call one native execution and compilation cost", func(): run_program(exits_with("call_one", "call/one", { allocations = 103221, instructions = 587565155 }, 1, 0))),
+            ("written names do not become C symbols", func(): reported(verify_written_names(compiler, c_compiler, work_directory, check_instructions))),
+            ("wrapper order and unused parameters execute natively", func(): run_program(exits_with("nested_order", "nested/order", { allocations = 103774, instructions = 588990699 }, 0, 0))),
+            ("nested calls native execution and cost", func(): run_program(exits_with("nested_calls", "nested/calls", { allocations = 103634, instructions = 588749221 }, 1, 0))),
+            ("pure calls native execution and cost", func(): run_program(exits_with("pure_calls", "pure/calls", { allocations = 103504, instructions = 590197250 }, 1, 0))),
+            ("self call", func(): run_program(exits_with("recursion_self", "recursion/self", { allocations = 104322, instructions = 592882656 }, 7, 0))),
+            ("mutual calls", func(): run_program(exits_with("recursion_mutual", "recursion/mutual", { allocations = 105305, instructions = 593167424 }, 7, 0))),
+            ("UFCS self call", func(): run_program(exits_with("recursion_ufcs", "recursion/ufcs", { allocations = 104326, instructions = 590549999 }, 7, 0))),
+            ("argument self call", func(): run_program(exits_with("recursion_argument", "recursion/argument", { allocations = 104724, instructions = 596532276 }, 7, 0))),
+            ("binding self call", func(): run_program(exits_with("recursion_binding", "recursion/binding", { allocations = 104572, instructions = 592474239 }, 7, 0))),
+            ("record field self call", func(): run_program(exits_with("recursion_record", "recursion/record", { allocations = 105267, instructions = 593412040 }, 7, 0))),
+            ("generic self call", func(): run_program(exits_with("recursion_generic", "recursion/generic", { allocations = 104573, instructions = 502382306 }, 7, 0))),
+            ("managed recursive result", func(): run_program(exits_with("recursion_string_result", "recursion/string_result", { allocations = 104986, instructions = 591778180 }, 1, 1))),
+            ("managed local across recursive call", func(): run_program(exits_with("recursion_string_live_local", "recursion/string_live_local", { allocations = 105430, instructions = 593224469 }, 1, 2))),
+            ("Int equality preserves signed 64-bit values", func(): run_program(prints("int_equals", "int/equals", { allocations = 110766, instructions = 609793546 }, "7\n", 1))),
+            ("numeric accumulator checks every tail iteration", func(): run_program(fixture_program("tail_accumulator", "tail_recursion/accumulator", { allocations = 111189, instructions = 545008160 }, [
+                with_arguments("one million exact iterations", [], 0, "1000000\n", 3),
+                with_arguments("zero iterations", ["0"], 0, "0\n", 4),
+                with_arguments("one iteration", ["1"], 0, "1\n", 4),
+                with_arguments("seventeen iterations", ["17"], 0, "17\n", 4),
+            ]))),
+            ("direct backedge", func(): run_program(exits_with("tail_direct", "tail_recursion/direct", { allocations = 104418, instructions = 590843120 }, 7, 0))),
+            ("base arm", func(): run_program(exits_with("tail_base", "tail_recursion/base", { allocations = 104577, instructions = 591749555 }, 9, 0))),
+            ("swap preserves old left", func(): run_program(exits_with("tail_swap_right", "tail_recursion/swap_right", { allocations = 104731, instructions = 593204713 }, 7, 0))),
+            ("swap preserves old right", func(): run_program(exits_with("tail_swap_left", "tail_recursion/swap_left", { allocations = 104731, instructions = 591966429 }, 9, 0))),
+            ("duplicate operand", func(): run_program(exits_with("tail_duplicates", "tail_recursion/duplicates", { allocations = 104731, instructions = 592587609 }, 9, 0))),
+            ("duplicate second operand", func(): run_program(exits_with("tail_duplicates_right", "tail_recursion/duplicates_right", { allocations = 104715, instructions = 592294204 }, 9, 0))),
+            ("UFCS receiver chain", func(): run_program(exits_with("tail_ufcs", "tail_recursion/ufcs", { allocations = 106320, instructions = 596852438 }, 7, 0))),
+            ("prefix recomputed each iteration", func(): run_program(exits_with("tail_prefix", "tail_recursion/prefix", { allocations = 105064, instructions = 593424439 }, 7, 0))),
+            ("arm aliases and var versions", func(): run_program(exits_with("tail_arm_bindings", "tail_recursion/arm_bindings", { allocations = 104968, instructions = 593013645 }, 7, 0))),
+            ("updated arm variable", func(): run_program(exits_with("tail_arm_current", "tail_recursion/arm_current", { allocations = 104960, instructions = 594890235 }, 9, 0))),
+            ("record argument", func(): run_program(exits_with("tail_record", "tail_recursion/record", { allocations = 105388, instructions = 593889731 }, 9, 0))),
+            ("union payload", func(): run_program(exits_with("tail_payload", "tail_recursion/payload", { allocations = 104943, instructions = 591858550 }, 42, 0))),
+            ("helper may manage its own values", func(): run_program(exits_with("tail_managed_helper", "tail_recursion/managed_helper", { allocations = 105717, instructions = 594062929 }, 1, 2))),
+            ("borrow across two digit boundaries", func(): run_program(exits_with("tail_carry_boundary", "tail_recursion/carry_boundary", { allocations = 112458, instructions = 612106588 }, 7, 0))),
+            ("65535 backedges without stack growth", func(): run_program(exits_with("tail_countdown", "tail_recursion/countdown", { allocations = 117041, instructions = 622990522 }, 7, 0))),
+            ("an Expr tree through a record, a union and a List is walked and released", func(): run_program(prints("recursive_tree", "recursive/tree", { allocations = 113723, instructions = 551678448 }, "17\n5\n", 9))),
+            ("a union-record-union group with a by-value back-reference runs", func(): run_program(prints("recursive_group", "recursive/group", { allocations = 110682, instructions = 606086174 }, "10\n", 5))),
+            ("a boxed self payload inside a record cycle is walked and released", func(): run_program(prints("recursive_links", "recursive/links", { allocations = 108679, instructions = 602547352 }, "8\n", 11))),
+            ("a record holding an Option of a union holding the record runs", func(): run_program(prints("recursive_branches", "recursive/branches", { allocations = 109744, instructions = 603682946 }, "7\n", 4))),
+            ("a record linked through an Option of itself runs", func(): run_program(prints("recursive_linked", "recursive/linked", { allocations = 107850, instructions = 599398481 }, "6\n", 4))),
+            ("an inline union storing a later boxed union of its group runs", func(): run_program(prints("recursive_kinds", "recursive/kinds", { allocations = 110060, instructions = 604823707 }, "5\n", 9))),
+            ("Int constant returns 23", func(): run_program(exits_with("constant_integer", "constant/integer", { allocations = 103014, instructions = 587714532 }, 23, 0))),
+            ("former unsupported constant returns seven", func(): run_program(exits_with("constant_seven", "constant/seven", { allocations = 103014, instructions = 587815799 }, 7, 0))),
+            ("former unsupported import returns seven", func(): run_program(exits_with("constant_imported", "constant/imported/main", { allocations = 103591, instructions = 590565858 }, 7, 0))),
+            ("Float constant retains exact value", func(): run_program(prints("constant_float", "constant/float", { allocations = 104317, instructions = 591181872 }, "1.25\n", 1))),
+            ("String constant retains Unicode bytes", func(): run_program(prints("constant_string", "constant/string", { allocations = 103998, instructions = 590042043 }, "hello λ\n", 1))),
+            ("pipe String constant retains line breaks", func(): run_program(prints("constant_pipe", "constant/pipe", { allocations = 104025, instructions = 589943681 }, "hello λ\nsecond line\n", 1))),
+            ("materialized aliases survive reassignment", func(): run_program(prints("constant_aliases", "constant/aliases", { allocations = 104657, instructions = 592466575 }, "old λ\nnew λ\nold λ\n", 3))),
+            ("generic constant reads preserve NUL bytes and negative zero", func(): run_program(prints("constant_managed_generic", "constant/managed_generic", { allocations = 106469, instructions = 596858914 }, "kept λ\0kept λ\0\nkept λ\0kept λ\0\n-0\n", 7))),
+            ("record tuple List and named callback materialize twice", func(): run_program(prints("constant_aggregate", "constant/aggregate", { allocations = 109192, instructions = 539953680 }, "seven\nright\n7\n", 14))),
+            ("forty nested managed constants materialize independently", func(): run_program(prints("constant_nested", "constant/nested", { allocations = 124081, instructions = 654466377 }, "40\n40\nnode λ\n", 162))),
+            ("selected and qualified callable constants invoke private generic code", func(): run_program(exits_with("constant_callable", "constant/callable/main", { allocations = 105021, instructions = 594450872 }, 15, 0))),
+            ("constant call rejects with teaching help", func(): reject(constant_rejection("constant_called", "called", "4:5", "constant 'ANSWER' cannot be called", "read the constant without parentheses, such as ANSWER"))),
+            ("initializer call rejects without resolution", func(): reject(constant_rejection("constant_nonclosed", "nonclosed", "1:12", "constant initializer is not a closed value", "use literals, constructor data, or named function references; calls, operators, constant references and lambdas are not allowed"))),
+            -- Exit status observes only the platform's low byte; phase tests pin Int64.
+            ("minimum source executes under UBSan", func(): run_program(exits_with("integer_minimum", "integer/minimum", { allocations = 103222, instructions = 587545149 }, 0, 0))),
+            ("maximum source executes under UBSan", func(): run_program(exits_with("integer_maximum", "integer/maximum", { allocations = 103224, instructions = 587843988 }, 255, 0))),
+            ("literal returns42", func(): run_program(exits_with("return_42", "return/42", { allocations = 102938, instructions = 587388028 }, 42, 0))),
+            ("rejected integer range preserves output", func(): reported(verify_out_of_range_literal(compiler, work_directory))),
+            ("signed relations, bounds and extrema reach ordinary main", func(): run_program(fixture_program("int_comparisons", "int/comparisons", { allocations = 116494, instructions = 560158905 }, [
+                    with_arguments("MIN equals MIN", ["-9223372036854775808", "-9223372036854775808"], 0, "0\n0\n1\n1\n0\n-9223372036854775808\n-9223372036854775808\n-9223372036854775808\n9223372036854775807\n", 10),
+                    with_arguments("missing operands", [], 2, "", 2),
+                    with_arguments("invalid first operand", ["bad", "0"], 2, "", 4),
+                    with_arguments("invalid second operand", ["0", "bad"], 2, "", 4),
+                    with_arguments("MIN before negative", ["-9223372036854775808", "-1"], 0, "1\n0\n1\n0\n1\n-9223372036854775808\n-1\n-9223372036854775808\n9223372036854775807\n", 10),
+                    with_arguments("MIN before zero", ["-9223372036854775808", "0"], 0, "1\n0\n1\n0\n1\n-9223372036854775808\n0\n-9223372036854775808\n9223372036854775807\n", 10),
+                    with_arguments("MIN before positive", ["-9223372036854775808", "1"], 0, "1\n0\n1\n0\n1\n-9223372036854775808\n1\n-9223372036854775808\n9223372036854775807\n", 10),
+                    with_arguments("MIN before MAX", ["-9223372036854775808", "9223372036854775807"], 0, "1\n0\n1\n0\n1\n-9223372036854775808\n9223372036854775807\n-9223372036854775808\n9223372036854775807\n", 10),
+                    with_arguments("negative after MIN", ["-1", "-9223372036854775808"], 0, "0\n1\n0\n1\n1\n-9223372036854775808\n-1\n-9223372036854775808\n9223372036854775807\n", 10),
+                    with_arguments("negative equals negative", ["-1", "-1"], 0, "0\n0\n1\n1\n0\n-1\n-1\n-9223372036854775808\n9223372036854775807\n", 10),
+                    with_arguments("negative before zero", ["-1", "0"], 0, "1\n0\n1\n0\n1\n-1\n0\n-9223372036854775808\n9223372036854775807\n", 10),
+                    with_arguments("negative before positive", ["-1", "1"], 0, "1\n0\n1\n0\n1\n-1\n1\n-9223372036854775808\n9223372036854775807\n", 10),
+                    with_arguments("negative before MAX", ["-1", "9223372036854775807"], 0, "1\n0\n1\n0\n1\n-1\n9223372036854775807\n-9223372036854775808\n9223372036854775807\n", 10),
+                    with_arguments("zero after MIN", ["0", "-9223372036854775808"], 0, "0\n1\n0\n1\n1\n-9223372036854775808\n0\n-9223372036854775808\n9223372036854775807\n", 10),
+                    with_arguments("zero after negative", ["0", "-1"], 0, "0\n1\n0\n1\n1\n-1\n0\n-9223372036854775808\n9223372036854775807\n", 10),
+                    with_arguments("zero equals zero", ["0", "0"], 0, "0\n0\n1\n1\n0\n0\n0\n-9223372036854775808\n9223372036854775807\n", 10),
+                    with_arguments("zero before positive", ["0", "1"], 0, "1\n0\n1\n0\n1\n0\n1\n-9223372036854775808\n9223372036854775807\n", 10),
+                    with_arguments("zero before MAX", ["0", "9223372036854775807"], 0, "1\n0\n1\n0\n1\n0\n9223372036854775807\n-9223372036854775808\n9223372036854775807\n", 10),
+                    with_arguments("positive after MIN", ["1", "-9223372036854775808"], 0, "0\n1\n0\n1\n1\n-9223372036854775808\n1\n-9223372036854775808\n9223372036854775807\n", 10),
+                    with_arguments("positive after negative", ["1", "-1"], 0, "0\n1\n0\n1\n1\n-1\n1\n-9223372036854775808\n9223372036854775807\n", 10),
+                    with_arguments("positive after zero", ["1", "0"], 0, "0\n1\n0\n1\n1\n0\n1\n-9223372036854775808\n9223372036854775807\n", 10),
+                    with_arguments("positive equals positive", ["1", "1"], 0, "0\n0\n1\n1\n0\n1\n1\n-9223372036854775808\n9223372036854775807\n", 10),
+                    with_arguments("positive before MAX", ["1", "9223372036854775807"], 0, "1\n0\n1\n0\n1\n1\n9223372036854775807\n-9223372036854775808\n9223372036854775807\n", 10),
+                    with_arguments("MAX after MIN", ["9223372036854775807", "-9223372036854775808"], 0, "0\n1\n0\n1\n1\n-9223372036854775808\n9223372036854775807\n-9223372036854775808\n9223372036854775807\n", 10),
+                    with_arguments("MAX after negative", ["9223372036854775807", "-1"], 0, "0\n1\n0\n1\n1\n-1\n9223372036854775807\n-9223372036854775808\n9223372036854775807\n", 10),
+                    with_arguments("MAX after zero", ["9223372036854775807", "0"], 0, "0\n1\n0\n1\n1\n0\n9223372036854775807\n-9223372036854775808\n9223372036854775807\n", 10),
+                    with_arguments("MAX after positive", ["9223372036854775807", "1"], 0, "0\n1\n0\n1\n1\n1\n9223372036854775807\n-9223372036854775808\n9223372036854775807\n", 10),
+                    with_arguments("MAX equals MAX", ["9223372036854775807", "9223372036854775807"], 0, "0\n0\n1\n1\n0\n9223372036854775807\n9223372036854775807\n-9223372036854775808\n9223372036854775807\n", 10),
+                    with_arguments("zero before wide positive", ["0", "4294967296"], 0, "1\n0\n1\n0\n1\n0\n4294967296\n-9223372036854775808\n9223372036854775807\n", 10),
+                    with_arguments("wide positive after zero", ["4294967296", "0"], 0, "0\n1\n0\n1\n1\n0\n4294967296\n-9223372036854775808\n9223372036854775807\n", 10),
+                ]))),
+            ("integer conversion inputs", func(): run_program(fixture_program("conversion_integer", "conversion/integer", { allocations = 110745, instructions = 542757530 }, [
+                    with_arguments("minimum", ["-9223372036854775808"], 0, "-9223372036854775808\n", 4),
+                    with_arguments("maximum", ["9223372036854775807"], 0, "9223372036854775807\n", 4),
+                    with_arguments("zero", ["0"], 0, "0\n", 4),
+                    with_arguments("positive sign and leading zeros", ["+00042"], 0, "42\n", 4),
+                    with_arguments("negative zero", ["-0"], 0, "0\n", 4),
+                    with_arguments("positive overflow", ["9223372036854775808"], 1, "invalid integer\n", 4),
+                    with_arguments("negative overflow", ["-9223372036854775809"], 1, "invalid integer\n", 4),
+                    with_arguments("sign without digits", ["+"], 1, "invalid integer\n", 4),
+                    with_arguments("minus without digits", ["-"], 1, "invalid integer\n", 4),
+                    with_arguments("leading space", [" 42"], 1, "invalid integer\n", 4),
+                    with_arguments("trailing space", ["42 "], 1, "invalid integer\n", 4),
+                    with_arguments("CR is not stripped", ["42\r"], 1, "invalid integer\n", 4),
+                    with_arguments("suffix", ["42x"], 1, "invalid integer\n", 4),
+                    with_arguments("hexadecimal", ["0x2a"], 1, "invalid integer\n", 4),
+                    with_arguments("digit separator", ["4_2"], 1, "invalid integer\n", 4),
+                    with_arguments("non ASCII digits", ["٤٢"], 1, "invalid integer\n", 4),
+                    with_arguments("empty argument", [""], 1, "invalid integer\n", 4),
+                    with_arguments("missing argument", [], 1, "missing input\n", 3),
+                    with_arguments("newline inside numeric argument is rejected", ["42\n"], 1, "invalid integer\n", 4),
+                    with_arguments("extra arguments ignored", ["42", "99"], 0, "42\n", 5),
+                    with_arguments("long overflow does not overflow accumulator", [nines(65536)], 1, "invalid integer\n", 4),
+                ]))),
+            ("Float conversion inputs", func(): run_program(fixture_program("conversion_float", "conversion/float", { allocations = 110749, instructions = 542581067 }, [
+                    with_arguments("integer only mantissa", ["42"], 0, "42\n", 4),
+                    with_arguments("negative zero", ["-0.0"], 0, "-0\n", 4),
+                    with_arguments("sign leading zeros and exponent", ["+001.25e1"], 0, "12.5\n", 4),
+                    with_arguments("decimal mantissa", ["6.5"], 0, "6.5\n", 4),
+                    with_arguments("signed exponent", ["1e+2"], 0, "100\n", 4),
+                    with_arguments("seventeen digit precision", ["1.2345678901234567"], 0, "1.2345678901234567\n", 4),
+                    with_arguments("integer halfway rounds to even", ["9007199254740993"], 0, "9007199254740992\n", 4),
+                    with_arguments("decimal halfway at one rounds to even", ["1.00000000000000011102230246251565404236316680908203125"], 0, "1\n", 4),
+                    with_arguments("decimal above halfway rounds to adjacent value", ["1.00000000000000011102230246251565404236316680908203126"], 0, "1.0000000000000002\n", 4),
+                    with_arguments("maximum finite", ["1.7976931348623157e308"], 0, "1.7976931348623157e+308\n", 4),
+                    with_arguments("minimum normal", ["2.2250738585072014e-308"], 0, "2.2250738585072014e-308\n", 4),
+                    with_arguments("minimum subnormal", ["5e-324"], 0, "4.94066e-324\n", 4),
+                    with_arguments("positive underflow", ["1e-9999"], 0, "0\n", 4),
+                    with_arguments("negative underflow", ["-1e-9999"], 0, "-0\n", 4),
+                    with_arguments("overflow", ["1e309"], 1, "invalid float\n", 4),
+                    with_arguments("NaN spelling", ["nan"], 1, "invalid float\n", 4),
+                    with_arguments("infinity spelling", ["inf"], 1, "invalid float\n", 4),
+                    with_arguments("hexadecimal mantissa", ["0x1p2"], 1, "invalid float\n", 4),
+                    with_arguments("digit separator", ["1_0.0"], 1, "invalid float\n", 4),
+                    with_arguments("missing integer digits", [".5"], 1, "invalid float\n", 4),
+                    with_arguments("missing fractional digits", ["1."], 1, "invalid float\n", 4),
+                    with_arguments("missing exponent digits", ["1e+"], 1, "invalid float\n", 4),
+                    with_arguments("sign without digits", ["+"], 1, "invalid float\n", 4),
+                    with_arguments("leading whitespace", [" 6.5"], 1, "invalid float\n", 4),
+                    with_arguments("trailing whitespace", ["6.5 "], 1, "invalid float\n", 4),
+                    with_arguments("CR is not stripped", ["6.5\r"], 1, "invalid float\n", 4),
+                    with_arguments("non ASCII digits", ["٦.٥"], 1, "invalid float\n", 4),
+                    with_arguments("suffix", ["6.5x"], 1, "invalid float\n", 4),
+                    with_arguments("empty argument", [""], 1, "invalid float\n", 4),
+                    with_arguments("missing argument", [], 1, "missing input\n", 3),
+                    with_arguments("newline inside numeric argument is rejected", ["6.5\n"], 1, "invalid float\n", 4),
+                    with_arguments("long mantissa remains bounded", [nines(65536)], 1, "invalid float\n", 4),
+                    with_arguments("extra arguments ignored", ["6.5", "invalid"], 0, "6.5\n", 5),
+                ]))),
+            ("source literals retain numeric and equality NUL regressions", func(): run_program(prints("conversion_nul_bytes", "conversion/nul_bytes", { allocations = 110008, instructions = 608394961 }, "invalid integer\ninvalid float\nsame\ndifferent\n", 10))),
+            ("64 ADT result projections preserve output and cleanup", func(): run_program(prints("conversion_projection_stress", "conversion/projection_stress", { allocations = 124905, instructions = 652043394 }, repeated("42\n", 64), 128))),
+            ("imported addition", func(): run_program(exits_with("int_add", "int/add", { allocations = 103428, instructions = 588702492 }, 42, 0))),
+            ("imported UFCS addition", func(): run_program(exits_with("int_ufcs", "int/ufcs", { allocations = 103437, instructions = 588287359 }, 42, 0))),
+            ("nested imported addition", func(): run_program(exits_with("int_nested", "int/nested", { allocations = 103833, instructions = 593073168 }, 42, 0))),
+            ("negative addition", func(): run_program(exits_with("int_negative", "int/negative", { allocations = 104008, instructions = 589295391 }, 3, 1))),
+            ("opposite signs cancel", func(): run_program(exits_with("int_cancel", "int/cancel", { allocations = 103430, instructions = 589439228 }, 0, 0))),
+            ("maximum wraps to negative signed limit", func(): run_program(exits_with("int_wrap_max", "int/wrap_max", { allocations = 104008, instructions = 589561185 }, 20, 1))),
+            ("minimum wraps to positive signed limit", func(): run_program(exits_with("int_wrap_min", "int/wrap_min", { allocations = 104008, instructions = 589074515 }, 19, 1))),
+            ("two minimum values wrap to one digit", func(): run_program(exits_with("int_wrap_twice", "int/wrap_twice", { allocations = 104004, instructions = 589138118 }, 1, 1))),
+            ("missing library root preserves existing output", func(): reported(verify_missing_library_root(compiler, work_directory))),
+            ("malformed library root option teaches usage", func(): reported(verify_usage_error(compiler, work_directory, "malformed_root", ["--library-root", "blorp/standard_library"]))),
+            ("incomplete library root option does not read the flag as a file", func(): reported(verify_usage_error(compiler, work_directory, "incomplete_root", ["--library-root", "blorp/standard_library", "output.c"]))),
+            ("incomplete test-suite option does not read the flag as a file", func(): reported(verify_usage_error(compiler, work_directory, "incomplete_suite", ["--library-root", "blorp/standard_library", "--test-suite", "output.c"]))),
+        ]
+    }

@@ -1,6 +1,6 @@
 # Blorp 2 Dict phase 1, 2026-11-02
 
-Phase 1 of [DICT_PLAN](../../blorp_2/DICT_PLAN.md): `dict.brp` with `entries`,
+Phase 1 of [DICT_PLAN](../../blorp/DICT_PLAN.md): `dict.brp` with `entries`,
 `is_empty` and order-ignoring `Equatable`; `Hashable` for Bool; `DictKey` for Int,
 String and Bool; the prelude entry `dict: Dict`; tests; the `dict_ops` port. The
 ceilings are the phase 1 table in the plan, measured as in the

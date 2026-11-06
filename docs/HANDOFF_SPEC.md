@@ -82,7 +82,7 @@ not apply rather than filling it.
 
 A literate example quotes the current code with its location, shows the
 change, and explains it. This one is from the List runtime's copying append
-in `blorp_2/src/runtime/list.brp`, as it stood at `20e530021`. The strings
+in `blorp/src/runtime/list.brp`, as it stood at `20e530021`. The strings
 are fragments of the C that the compiler emits.
 
 Current code (`list_update_runtime`, the borrowed append, line 329):

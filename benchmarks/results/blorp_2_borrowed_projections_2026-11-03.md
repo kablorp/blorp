@@ -7,7 +7,7 @@ obligation ends is asked of `transfer`'s own predicate, so the decision sees
 every drop and move of [moves at last use](blorp_2_ownership_moves_2026-11-03.md).
 `verify` and `emit` are unchanged. Keith approved this on 2026-11-03 from the
 pilot (spike `25287b208` on `73102b901`). The rule is in
-[the ROADMAP](../../blorp_2/ROADMAP.md#borrowed-field-projections).
+[the ROADMAP](../../blorp/ROADMAP.md#borrowed-field-projections).
 
 ## Provenance
 

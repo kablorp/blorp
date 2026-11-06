@@ -1,6 +1,6 @@
 # Blorp 2 Dict phase 3, 2026-11-02
 
-Phase 3 of [DICT_PLAN](../../blorp_2/DICT_PLAN.md): the compiler's six
+Phase 3 of [DICT_PLAN](../../blorp/DICT_PLAN.md): the compiler's six
 `utils/hash_map.brp` users move to the prelude `Dict`, and the stopgap and its suite
 are deleted. Keys stay the same Int keys (`name_number`, `space_key`, `pair_key`,
 digests, head hints).

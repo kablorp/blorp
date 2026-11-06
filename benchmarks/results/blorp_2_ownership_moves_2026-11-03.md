@@ -6,7 +6,7 @@ one. One rule, `transfer` in `own/own.brp`, decides every owned slot.
 `verify` loses its fresh-acquisition rule for loop edges, which now use the
 yield rule. Keith approved this on 2026-11-03 from the spike
 (`claude/pilot-moves-37493b`, `f8bc24db1` and `c94ba339b`, on `73102b901`).
-The design is in [the ROADMAP](../../blorp_2/ROADMAP.md#moves-at-last-use).
+The design is in [the ROADMAP](../../blorp/ROADMAP.md#moves-at-last-use).
 
 ## Provenance
 

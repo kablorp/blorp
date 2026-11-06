@@ -2,7 +2,7 @@
 
 Measured 2026-10-30 at `ae4710afc` (seed `blorp2-seed-9df029bac05b`; the scripts added with this report are the only
 other change) on an Apple M4, Apple clang 21.0.0, macOS 26.7.1, for the
-["Attribution after O1"](../../blorp_2/ROADMAP.md#attribution-after-o1) step. It changes no production code.
+["Attribution after O1"](../../blorp/ROADMAP.md#attribution-after-o1) step. It changes no production code.
 
 ```sh
 blorp_2/scripts/attribution/run          # 3 min 59 s at load 2.5 to 3.7; 5 to 9 minutes under heavier load

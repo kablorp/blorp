@@ -1,6 +1,6 @@
 # Blorp 2 Dict phase 5b, 2026-11-03
 
-Phase 5b of [DICT_PLAN](../../blorp_2/DICT_PLAN.md): specialize's two **sealed** instance
+Phase 5b of [DICT_PLAN](../../blorp/DICT_PLAN.md): specialize's two **sealed** instance
 tables are `Dict[UnionKey, UnionInstanceId]` and `Dict[RecordKey, RecordInstanceId]`, keyed by
 their full keys, in place of two `IndexedList`s with a hand-written digest, a bucket walk and a
 comparison closure. Each id is its key's position among the keys, which is also the position of
