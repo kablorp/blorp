@@ -995,12 +995,14 @@ emitted C links into separate normal and strict-memory executables with C11,
 compiler calls require positive balanced strict accounting. The rejected call
 checks the complete diagnostic and help text with accounting disabled.
 
-The calls, recursion, constants and Int programs (`test/e2e/self_hosted_calls.brp`)
-are the first ported group. Each is a `Program` in `test/e2e/self_hosted_harness.brp`:
-one compile within its `CompileCeiling`, then every listed run with its exact
-status, stdout and strict allocation count. The compile's allocations come from the
-compiler's strict report and are always held to the ceiling. A failure names
-the measured value and the ceiling. Each ceiling is its program's measured cost plus 15%
+Every native example of the driver is a `Program` declared with the constructors in
+`test/e2e/self_hosted_harness.brp` (`test/e2e/self_hosted_calls.brp` holds the
+calls, recursion, constants and Int group): one compile of a source or of
+`--test-suite` roots within its `CompileCeiling`, then every listed run with its
+exact status, stdout and strict allocation count. The compile's allocations come
+from the compiler's strict report and are always held to the ceiling; with
+`INSTRUCTION_CHECK=on` so are its retired instructions. A failure names the
+measured value and the ceiling. Each ceiling is its program's measured cost plus 15%
 (see the [ceiling record](../benchmarks/results/blorp_2_e2e_ceilings_2026-11-05.md)).
 
 The driver also runs the current-directory native checks: a C-fixture runtime
