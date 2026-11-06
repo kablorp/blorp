@@ -307,9 +307,10 @@ the fixed unions `IOErrorKind` and `EntryKind`, the records `IOError` and
 `Entry`, the pure `describe` and `default_if_not_found`, and the impure
 `read_text`, `write_text`, `entry_kind`, `list_directory`, `create_directory`,
 `create_directories`, `remove_file`, `remove_directory`,
-`remove_directory_tree`, `rename` and `with_temporary_directory`;
-`write_text` replaces a file atomically, and `with_temporary_directory` is
-generic in its body's error type and takes a converter from `IOError`. Its
+`remove_directory_tree`, `rename`, `with_temporary_directory` and
+`fold_lines`; `write_text` replaces a file atomically, and
+`with_temporary_directory` and `fold_lines` are generic in their callback's
+error type and take a converter from `IOError`. Its
 natives return Int codes (or a list or String) that private decoders
 turn into kinds and entries; the codes are named in `src/runtime/fs.brp`. See
 [The fs library](../README.md#the-fs-library) for the contract and its limits.

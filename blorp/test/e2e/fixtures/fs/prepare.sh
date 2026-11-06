@@ -1,7 +1,7 @@
 #!/bin/sh
 # Builds the tree that read.brp inspects, under the directory in $1. It holds
 # the paths that no fs operation can create: a file that is not UTF-8, a
-# symlink loop, a file with mode 000 and a FIFO.
+# symlink loop, a file with mode 000, a FIFO and long_not_utf8.txt.
 #
 # A file with mode 000 is still readable by root, so as root the example
 # cannot provoke PermissionDenied. The script then builds nothing and exits
@@ -27,3 +27,9 @@ ln -s loop "$root/loop"
 printf 'secret' > "$root/locked.txt"
 chmod 000 "$root/locked.txt"
 mkfifo "$root/pipe"
+
+# Valid short lines of well over 100 KiB, so that the bad line falls in a later
+# read, then a line holding byte 0377, which a Blorp String cannot hold, then
+# one more line. The line before the bad one is the example's LAST_VALID_LINE.
+awk 'BEGIN { for (number = 0; number < 20000; number++) print "short line " number }' > "$root/long_not_utf8.txt"
+printf 'last valid line\nbad \377 line\nafter\n' >> "$root/long_not_utf8.txt"
