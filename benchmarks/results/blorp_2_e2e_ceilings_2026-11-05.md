@@ -307,3 +307,123 @@ patch used before the fold.
 | `take_remove_void` | 101,496 | 116,721 | 486,194,211 | 559,123,343 | 3 |
 | `text` | 90,409 | 103,971 | 513,117,103 | 590,084,669 | 3 |
 | `update_reuse` | 109,548 | 125,981 | 511,237,863 | 587,923,543 | 3 |
+
+## T3 batch 2: strings and paths, 2026-11-05
+
+The 63 programs ported in batch 2 (`blorp_2/test/e2e/self_hosted_strings.brp`, from
+11 legacy files) carry ceilings set by the same rule: measured cost plus 15%,
+rounded up to a whole count, except the two `*_unreached` programs at plus 5%
+(below). "Old" is the ceiling in the deleted
+`test_*.brp` file; `interpolation_*` were held to 600,000 and 2,000,000,000 by
+`run_accounted_example`. The foundation-diagnostic rejection in
+`test_strings` compiles nothing that is run, so it has no ceiling.
+
+- **Compiler:** built from the tree of `6c973b3cd032` (the last commit touching
+  `blorp_2/src` and `blorp_2/standard_library`; this branch changes neither),
+  `make -C blorp_2 test-compiler`, `-O0 -DBLORP_MEMORY_DIAGNOSTICS=1`. Host: Apple
+  M4, macOS 26.7.1, Apple clang 21.0.0, strictly serial; 1-minute load average 3.6
+  to 4.6 around the sweeps, other sessions shared the machine.
+- **Samples:** three `make -C blorp_2 test-e2e INSTRUCTION_CHECK=on` runs with the
+  driver temporarily restricted to this suite and printing each compile
+  measurement and each strict native report instead of failing on it
+  (`batch2_measure.patch`). All three completed; no sample was interrupted or
+  interleaved, so every program has three. Allocations, for the compile and for
+  all 183 native runs, agree exactly across the three. Instructions differ by
+  0.004% to 1.7% (`join_tail_arm`: 520.0M, 520.0M, 528.8M); the table takes the
+  largest.
+- **Ranking:** the two lowest instruction counts, `string_slice_bounds` (470M) and
+  `string_starts_with_arguments` (473M), belong to the lower instruction cluster the
+  batch 1 section describes. The highest allocation counts are the path programs
+  (`path_normalize_edges` 122,933, `path_dirname_edges` 114,135), which import
+  `path`; the highest instruction counts are `path_join_*` (562M to 565M).
+- **Legacy ceilings:** 24 of 63 programs exceed their legacy allocation ceilings
+  and 38 of 63 their legacy instruction ceilings, for the reason given above (the
+  prelude's `Dict` is about 37 thousand allocations of every compile).
+- **Two programs keep a tight bound at measured + 5%, approved by Keith
+  2026-11-05.** `string_literal_long_unreached` and
+  `string_literal_many_escapes_unreached` were held to 41,000 and 43,000
+  allocations so that a decoder allocating per byte would fail: before the fix
+  they measured 12,000 and 10,639 allocations more than after it
+  (`blorp_2_string_decoding_2026-10-16.md`). Their literal sits in a function
+  nothing calls and `main` returns 0, so the compile ceiling is their only
+  check. At + 15% (103,135 and 106,202) that regression (89,682 + 12,000 =
+  101,682 and 92,349 + 10,639 = 102,988) would pass, so both columns use + 5%
+  instead: 94,167 and 96,967 allocations, 540,944,094 and 544,669,648
+  instructions (sample spread at most 1.7%).
+- **Samples are kept out of the repository** in the ignored directory
+  `/Users/keithphilpott/CLionProjects/blorp/build/blorp2-e2e-ceilings-2026-11-05/`:
+
+| File | sha256 |
+| --- | --- |
+| `batch2_measure1.log` | `0da39f7a928d49d2015b5e370db51a6d3ca263547cef80c252c0cb7f231c09e1` |
+| `batch2_measure2.log` | `6d586c79e189a9e8def3893c6d1d71b2023887a0a85928b52b231a837bbac78c` |
+| `batch2_measure3.log` | `ff005ddecaf66ab55e6f86be9f2406302db27b402ce86d2b2245d5ade25ebada` |
+| `batch2_measure.patch` (the temporary driver change) | `a12ee7aba13c18912da4c3015deec060b663ccd8806d81599aa2f301c3ec6b6a` |
+| `batch2_samples.json` (all three instruction samples per program) | `af1bde10413a353c868651a977b3f5d772b6605d7aed47ab25fa6f4d0d0b57da` |
+| `batch2_ceilings.json` (the ceiling literals in program order, then each run's strict allocations) | `5333eb2302822f95aedbb029d49f9303ecf6eab1097ca6d89e16e940a2ad545c` |
+
+| Program | Old allocs | Measured allocs | New allocs | Old instr | Measured instr | New instr |
+| --- | --- | --- | --- | --- | --- | --- |
+| `interpolation_eight` | 600,000 | 91,251 | 104,939 | 2,000,000,000 | 514,723,058 | 591,931,517 |
+| `interpolation_one_hundred_twenty_eight` | 600,000 | 103,851 | 119,429 | 2,000,000,000 | 549,381,938 | 631,789,229 |
+| `interpolation_ordered` | 600,000 | 96,194 | 110,624 | 2,000,000,000 | 529,971,547 | 609,467,280 |
+| `interpolation_thirty_two` | 600,000 | 93,771 | 107,837 | 2,000,000,000 | 521,885,623 | 600,168,467 |
+| `join_bound_int` | 46,000 | 93,737 | 107,798 | 97,842,731 | 519,808,618 | 597,779,911 |
+| `join_bound_managed` | 45,000 | 92,846 | 106,773 | 89,000,000 | 518,316,332 | 596,063,782 |
+| `join_carried_duplicate` | 46,000 | 93,292 | 107,286 | 150,000,000 | 520,517,814 | 598,595,487 |
+| `join_carried_existing` | 42,000 | 90,689 | 104,293 | 150,000,000 | 513,629,220 | 590,673,603 |
+| `join_carried_int` | 44,000 | 92,106 | 105,922 | 150,000,000 | 518,690,829 | 596,494,454 |
+| `join_carried_nested` | 60,000 | 101,244 | 116,431 | 300,000,000 | 541,655,395 | 622,903,705 |
+| `join_carried_order` | 46,000 | 93,425 | 107,439 | 150,000,000 | 520,632,005 | 598,726,806 |
+| `join_carried_projected` | 47,000 | 93,942 | 108,034 | 150,000,000 | 522,151,720 | 600,474,478 |
+| `join_carried_rhs` | 44,000 | 92,168 | 105,994 | 150,000,000 | 518,809,501 | 596,630,927 |
+| `join_carried_string_alias` | 46,000 | 93,275 | 107,267 | 150,000,000 | 521,614,478 | 599,856,650 |
+| `join_carried_swap` | 47,000 | 93,468 | 107,489 | 150,000,000 | 520,872,252 | 599,003,090 |
+| `join_carried_unused` | 45,000 | 92,321 | 106,170 | 150,000,000 | 517,727,524 | 595,386,653 |
+| `join_deep` | 57,000 | 103,060 | 118,519 | 117,896,899 | 542,729,883 | 624,139,366 |
+| `join_nested` | 48,000 | 95,736 | 110,097 | 96,043,217 | 524,383,783 | 603,041,351 |
+| `join_statement` | 45,000 | 92,882 | 106,815 | 89,000,000 | 518,172,253 | 595,898,091 |
+| `join_tail_arm` | 46,000 | 93,665 | 107,715 | 90,000,000 | 528,773,338 | 608,089,339 |
+| `join_void_tail` | 45,000 | 93,326 | 107,325 | 90,331,263 | 519,083,859 | 596,946,438 |
+| `mortal_string_alias` | 150,000 | 90,339 | 103,890 | 600,000,000 | 512,533,331 | 589,413,331 |
+| `mortal_string_basic` | 150,000 | 90,092 | 103,606 | 600,000,000 | 511,997,298 | 588,796,893 |
+| `mortal_string_identity` | 150,000 | 90,520 | 104,098 | 600,000,000 | 513,158,625 | 590,132,419 |
+| `mortal_string_maximum` | 150,000 | 90,016 | 103,519 | 600,000,000 | 511,709,803 | 588,466,274 |
+| `mortal_string_minimum` | 150,000 | 90,028 | 103,533 | 600,000,000 | 511,771,137 | 588,536,808 |
+| `mortal_string_unused` | 150,000 | 89,862 | 103,342 | 600,000,000 | 511,466,184 | 588,186,112 |
+| `path_dirname_edges` | 200,000 | 114,135 | 131,256 | 600,000,000 | 519,495,198 | 597,419,478 |
+| `path_join_arguments` | 205,000 | 109,700 | 126,155 | 600,000,000 | 562,489,827 | 646,863,302 |
+| `path_join_counted_aliases` | 205,000 | 109,419 | 125,832 | 600,000,000 | 565,049,632 | 649,807,077 |
+| `path_normalize_edges` | 200,000 | 122,933 | 141,373 | 600,000,000 | 541,818,591 | 623,091,380 |
+| `stderr_alias` | 205,000 | 92,243 | 106,080 | 600,000,000 | 517,572,560 | 595,208,444 |
+| `stderr_bytes` | 205,000 | 90,565 | 104,150 | 600,000,000 | 513,162,195 | 590,136,525 |
+| `string_append_int` | 43,000 | 90,589 | 104,178 | 150,000,000 | 514,792,443 | 592,011,310 |
+| `string_append_int_builtin` | 205,000 | 96,365 | 110,820 | 1,800,000,000 | 530,074,666 | 609,585,866 |
+| `string_append_int_edges` | 45,000 | 91,622 | 105,366 | 200,000,000 | 518,037,825 | 595,743,499 |
+| `string_concat` | 205,000 | 91,897 | 105,682 | 600,000,000 | 517,415,433 | 595,027,748 |
+| `string_concat_reuse` | 205,000 | 93,952 | 108,045 | 600,000,000 | 522,602,477 | 600,992,849 |
+| `string_literal_basic` | 134,000 | 89,805 | 103,276 | 450,000,000 | 510,814,934 | 587,437,175 |
+| `string_literal_comment_text` | 134,000 | 89,805 | 103,276 | 450,000,000 | 511,902,650 | 588,688,048 |
+| `string_literal_copy_return` | 134,000 | 90,631 | 104,226 | 450,000,000 | 512,814,805 | 589,737,026 |
+| `string_literal_empty` | 134,000 | 89,805 | 103,276 | 450,000,000 | 511,525,040 | 588,253,796 |
+| `string_literal_escapes` | 134,000 | 89,832 | 103,307 | 450,000,000 | 511,617,275 | 588,359,867 |
+| `string_literal_generic` | 134,000 | 90,218 | 103,751 | 450,000,000 | 512,742,965 | 589,654,410 |
+| `string_literal_long` | 170,000 | 90,284 | 103,827 | 540,000,000 | 521,034,198 | 599,189,328 |
+| `string_literal_long_unreached` | 41,000 | 89,682 | 94,167 | 82,000,000 | 515,184,851 | 540,944,094 |
+| `string_literal_many_escapes_unreached` | 43,000 | 92,349 | 96,967 | 86,000,000 | 518,732,998 | 544,669,648 |
+| `string_literal_normalization` | 134,000 | 90,381 | 103,939 | 450,000,000 | 513,468,499 | 590,488,774 |
+| `string_literal_nul_digits` | 134,000 | 89,808 | 103,280 | 450,000,000 | 510,198,981 | 586,728,829 |
+| `string_literal_tail_arms` | 156,000 | 91,524 | 105,253 | 500,000,000 | 515,550,258 | 592,882,797 |
+| `string_literal_trigraphs` | 134,000 | 89,805 | 103,276 | 450,000,000 | 511,678,066 | 588,429,776 |
+| `string_literal_unicode` | 134,000 | 89,805 | 103,276 | 450,000,000 | 511,740,294 | 588,501,339 |
+| `string_literal_unicode_escapes` | 134,000 | 89,811 | 103,283 | 450,000,000 | 511,900,535 | 588,685,616 |
+| `string_literal_union` | 134,000 | 91,628 | 105,373 | 450,000,000 | 519,854,464 | 597,832,634 |
+| `string_literal_unused` | 134,000 | 89,816 | 103,289 | 450,000,000 | 510,525,493 | 587,104,317 |
+| `string_match_cleanup` | 150,000 | 91,685 | 105,438 | 600,000,000 | 516,844,757 | 594,371,471 |
+| `string_match_first` | 150,000 | 91,227 | 104,912 | 600,000,000 | 514,805,473 | 592,026,294 |
+| `string_match_second` | 150,000 | 91,227 | 104,912 | 600,000,000 | 514,572,485 | 591,758,358 |
+| `string_slice_bounds` | 25,000 | 95,667 | 110,018 | 90,000,000 | 470,161,241 | 540,685,428 |
+| `string_slice_bytes` | 35,000 | 94,395 | 108,555 | 120,000,000 | 524,165,999 | 602,790,899 |
+| `string_slice_ownership` | 45,000 | 95,482 | 109,805 | 150,000,000 | 527,387,581 | 606,495,719 |
+| `string_starts_with_arguments` | 150,000 | 96,915 | 111,453 | 600,000,000 | 473,318,437 | 544,316,203 |
+| `string_starts_with_counted` | 150,000 | 97,393 | 112,002 | 600,000,000 | 530,698,665 | 610,303,465 |

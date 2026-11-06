@@ -2,6 +2,7 @@ import:
     process: run_to_files
     fs: EntryKind, describe, entry_kind, read_text, write_text
     io: print_error
+    list: List methods, repeat
     test: TestSuite
     ./self_hosted_reports: parse_instructions, positive_allocations, within_ceiling
     bool: not, and
@@ -276,6 +277,11 @@ record Rejection {
 }
 
 
+-- `text` written `count` times, for expected output too long to type.
+pure func repeated(text: String, count: Int) -> String:
+    repeat(text, count).join("")
+
+
 private pure func expect(actual: String, expected: String, description: String) -> Result[Void, String]:
     if actual.equals(expected):
         Ok(void)
@@ -339,13 +345,15 @@ private func link_fixture(c_compiler: String, prefix: String, mode: NativeMode) 
 
 -- One native invocation. A run that shares its fixture with others has a
 -- `label` naming its capture files and error text; `directory` is where the
--- program starts (None keeps the runner's own).
+-- program starts (None keeps the runner's own). `stderr` is everything the
+-- program itself writes to stderr, byte for byte.
 record NativeRun {
     label: Option[String],
     arguments: List[String],
     directory: Option[String],
     status: Int,
     stdout: String,
+    stderr: String,
     allocations: Int
 }
 
@@ -375,7 +383,7 @@ private func run_normal(prefix: String, run: NativeRun) -> Result[Void, String]:
     output: String ?= read_text(capture + ".normal.run.stdout").map_err(describe)
     _ ?= expect(output, run.stdout, "native stdout" + label_suffix(run))
     errors: String ?= read_text(capture + ".normal.run.stderr").map_err(describe)
-    expect(errors, "", "native stderr" + label_suffix(run))
+    expect(errors, run.stderr, "native stderr" + label_suffix(run))
 
 
 private func run_strict(prefix: String, run: NativeRun) -> Result[Void, String]:
@@ -387,8 +395,10 @@ private func run_strict(prefix: String, run: NativeRun) -> Result[Void, String]:
     strict_output: String ?= read_text(capture + ".strict.run.stdout").map_err(describe)
     _ ?= expect(strict_output, run.stdout, "strict native stdout" + label_suffix(run))
     accounting: String ?= read_text(capture + ".strict.run.stderr").map_err(describe)
-    expected = ("blorp: leak check: " + run.allocations.to_string() + " allocs, ") + run.allocations.to_string() + " releases, 0 leaked, 0 bytes\n"
-    expect(accounting, expected, "strict native accounting" + label_suffix(run))
+    -- The runtime writes its report as the program's last act, after everything
+    -- the program wrote to the same stream.
+    report = ("blorp: leak check: " + run.allocations.to_string() + " allocs, ") + run.allocations.to_string() + " releases, 0 leaked, 0 bytes\n"
+    expect(accounting, run.stderr + report, "strict native stderr and accounting" + label_suffix(run))
 
 
 private func run_fixture(prefix: String, run: NativeRun) -> Result[Void, String]:
@@ -476,7 +486,7 @@ func verify_program(compiler: String, c_compiler: String, work_directory: String
 -- `with_arguments` is one of several runs, and `label` names its captures.
 -- `exits_with` prints nothing; `prints` exits 0.
 pure func once_given(arguments: List[String], status: Int, stdout: String, allocations: Int) -> List[NativeRun]:
-    [{ label = None, arguments = arguments, directory = None, status = status, stdout = stdout, allocations = allocations }]
+    [{ label = None, arguments = arguments, directory = None, status = status, stdout = stdout, stderr = "", allocations = allocations }]
 
 
 pure func once(status: Int, stdout: String, allocations: Int) -> List[NativeRun]:
@@ -484,7 +494,7 @@ pure func once(status: Int, stdout: String, allocations: Int) -> List[NativeRun]
 
 
 pure func with_arguments(label: String, arguments: List[String], status: Int, stdout: String, allocations: Int) -> NativeRun:
-    { label = Some(label), arguments = arguments, directory = None, status = status, stdout = stdout, allocations = allocations }
+    { label = Some(label), arguments = arguments, directory = None, status = status, stdout = stdout, stderr = "", allocations = allocations }
 
 
 private pure func fixture_path(fixture: String) -> String:
@@ -508,6 +518,11 @@ pure func exits_with(name: String, fixture: String, ceiling: CompileCeiling, sta
 
 pure func prints(name: String, fixture: String, ceiling: CompileCeiling, stdout: String, allocations: Int) -> Program:
     fixture_program(name, fixture, ceiling, once(0, stdout, allocations))
+
+
+-- A program that prints nothing to stdout and `stderr` to stderr.
+pure func writes_errors(name: String, fixture: String, ceiling: CompileCeiling, status: Int, stderr: String, allocations: Int) -> Program:
+    fixture_program(name, fixture, ceiling, [{ label = None, arguments = [], directory = None, status = status, stdout = "", stderr = stderr, allocations = allocations }])
 
 
 -- A rejected compilation publishes nothing: it creates no C file where there
