@@ -6,9 +6,24 @@
 static int stall_exec = 0;
 static int exec_ready_writer = -1;
 static int probe_execve(const char *path, char *const arguments[], char *const environment[]);
+/* The group-race probe fails the parent's form of setpgid (another process's
+ * pid) with the EPERM Darwin returns to the call that loses a race to create
+ * the same group. */
+static int lose_group_race = 0;
+static int probe_setpgid(pid_t process, pid_t group);
 #define execve probe_execve
+#define setpgid probe_setpgid
 #include "process_runtime.c"
+#undef setpgid
 #undef execve
+
+static int probe_setpgid(pid_t process, pid_t group) {
+    if (lose_group_race && process != 0) {
+        errno = EPERM;
+        return -1;
+    }
+    return setpgid(process, group);
+}
 
 static int probe_execve(const char *path, char *const arguments[], char *const environment[]) {
     if (stall_exec) {
@@ -140,6 +155,28 @@ static int direct_reaping(const char *program, const char *out, const char *err,
     return correct && no_child && acknowledged ? 0 : 1;
 }
 
+/* A lost group race leaves the spawn intact, and the child leads its own group. */
+static int group_race(const char *program, const char *out, const char *err) {
+    struct blorp_string *program_value = blorp_string_from_bytes(program, (int64_t)strlen(program));
+    struct blorp_string *output = blorp_string_from_bytes(out, (int64_t)strlen(out));
+    struct blorp_string *errors = blorp_string_from_bytes(err, (int64_t)strlen(err));
+    struct blorp_string *argument = blorp_string_from_bytes("group-leader", 12);
+    struct blorp_l_0_s *arguments = blorp_list_repeat_0_s(argument, 1);
+    blorp_string_release(argument);
+    int64_t code = 0;
+    struct blorp_string *error = NULL;
+    lose_group_race = 1;
+    const uint8_t succeeded = blorp_process_run_to_files(program_value, arguments, output, errors,
+                                                       INT64_C(10000), &code, &error);
+    lose_group_race = 0;
+    blorp_list_drop_0_s(arguments);
+    blorp_string_release(program_value);
+    blorp_string_release(output);
+    blorp_string_release(errors);
+    if (error != NULL) blorp_string_release(error);
+    return succeeded && code == 0 ? 0 : 1;
+}
+
 static int child_case(int argc, char **argv) {
     if (argc < 2) return 0;
     if (strcmp(argv[1], "exit") == 0 && argc == 3) return (int)strtol(argv[2], NULL, 10);
@@ -154,6 +191,7 @@ static int child_case(int argc, char **argv) {
         return 0;
     }
     if (strcmp(argv[1], "pause") == 0) { for (;;) pause(); }
+    if (strcmp(argv[1], "group-leader") == 0) return getpgrp() == getpid() ? 0 : 1;
     if (strcmp(argv[1], "stdin") == 0) return getchar() == EOF ? 0 : 1;
     if (strcmp(argv[1], "signal") == 0) {
         if (raise(SIGTERM) != 0) return 1;
@@ -175,6 +213,7 @@ static int child_case(int argc, char **argv) {
     if (argc == 5 && (strcmp(argv[1], "reap-exit") == 0 || strcmp(argv[1], "reap-signal") == 0 ||
                       strcmp(argv[1], "reap-timeout") == 0 || strcmp(argv[1], "reap-startup") == 0))
         return direct_reaping(argv[2], argv[3], argv[4], argv[1]);
+    if (strcmp(argv[1], "group-race") == 0 && argc == 5) return group_race(argv[2], argv[3], argv[4]);
     if (strcmp(argv[1], "sigchld") == 0 && argc == 5) return unsupported_sigchld(argv[2], argv[3], argv[4]);
     return 1;
 }
