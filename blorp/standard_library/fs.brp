@@ -7,6 +7,7 @@ import:
     list: List methods
     option: Option methods
     result: Result methods
+    bool: Bool methods
 
 -- What went wrong. Every kind but OtherOs is a fact about the world that a
 -- caller can act on; OtherOs keeps the operating system's own number, which
@@ -140,10 +141,13 @@ private pure func decode_entry_kind(code: Int) -> Option[EntryKind]:
     else:
         Some(Other)
 
+private pure func error_at(code: Int, path: String) -> IOError:
+    { path = path, destination = None, kind = code.decode_error() }
+
 private pure func at_path[T](result: Result[T, Int], path: String) -> Result[T, IOError]:
     match result:
         Ok(value): Ok(value)
-        Err(code): Err({ path = path, destination = None, kind = code.decode_error() })
+        Err(code): Err(code.error_at(path))
 
 -- A two-path operation reports both paths the caller passed.
 private pure func between_paths[T](result: Result[T, Int], source: String, destination: String) -> Result[T, IOError]:
@@ -197,6 +201,19 @@ private func native_rename(source: String, destination: String) -> Result[Void, 
 
 private func native_create_temporary_directory(parent: String, prefix: String) -> Result[String, Int]:
     builtin("fs.create_temporary_directory")
+
+-- Private: no code outside this file can name or hold one, so no caller can
+-- close one twice, read one after it is closed, or share its file offset.
+private opaque type Descriptor = Int
+
+private func native_open_read(path: String) -> Result[Int, Int]:
+    builtin("fs.open_read")
+
+private func native_next_lines(descriptor: Int, carried: String) -> Result[List[String], Int]:
+    builtin("fs.next_lines")
+
+private func native_close(descriptor: Int) -> Result[Void, Int]:
+    builtin("fs.close")
 
 private pure func phrase(kind: IOErrorKind) -> String:
     match kind:
@@ -365,3 +382,75 @@ func with_temporary_directory[T, E](
     value ?= outcome
     _ ?= removed.map_err(io_error)
     Ok(value)
+
+-- The only place a descriptor is opened and closed. Once the open succeeds,
+-- nothing can leave before the close: Blorp has no return or exception, and
+-- `use` cannot run this function's `?=`. A failed close is ignored (D38): the
+-- descriptor was only read, so nothing is lost.
+private func with_descriptor[T, E](
+    path: String, use: (Descriptor) -> Result[T, E], io_error: pure (IOError) -> E,
+) -> Result[T, E]:
+    opened ?= path.native_open_read().at_path(path).map_err(io_error)
+    outcome = use(into_opaque Descriptor(opened))
+    -- Bound because only a Void call can stand alone as a statement.
+    closed = native_close(opened)
+    outcome
+
+-- How many of a batch's elements are complete lines (D37): with two or more,
+-- every element but the last, which is the line still unfinished; with fewer,
+-- the file has ended, and the one element, if any, is its last line.
+private pure func complete_lines(batch_length: Int) -> Int:
+    if batch_length > 1:
+        batch_length - 1
+    else:
+        batch_length
+
+private func fold_descriptor[T, E](
+    descriptor: Descriptor, path: String, initial: T,
+    step: (T, String) -> Result[T, E], io_error: pure (IOError) -> E,
+) -> Result[T, E]:
+    var folded: Result[T, E] = Ok(initial)
+    var carried = ""
+    var reading: Bool = True
+    while reading:
+        match native_next_lines(from_opaque Descriptor(descriptor), carried):
+            Ok(batch):
+                batch_length = batch.length()
+                -- At end of file the last element is the last line, and the
+                -- loop ends before `carried` is read again.
+                carried = batch.last().get_or("")
+                for line in batch.take(batch_length.complete_lines()):
+                    match folded:
+                        Ok(state): folded = step(state, line)
+                        Err(_): break
+                -- A step's Err stops the reading here; the break only skips the
+                -- rest of this batch, and another read could replace that Err.
+                -- Two or more elements mean the file has not ended (D37).
+                reading = folded.is_ok().and(batch_length > 1)
+            Err(code):
+                folded = Err(io_error(code.error_at(path)))
+                reading = False
+    folded
+
+-- Folds `step` over the file's lines in order, a block at a time, so memory
+-- follows the longest line, never the file. A line ends at LF, and a CR just
+-- before the LF is removed; a last line without LF counts, and an empty file
+-- has no lines. The file is opened as read_text opens it, and is closed before
+-- fold_lines returns on every path the program controls.
+--
+-- The first Err from `step` stops reading and is the result, so a fold that
+-- needs only the start of a file reads only that much. A failure to open or
+-- read is the result, converted by `io_error` as in with_temporary_directory.
+-- A line that is not UTF-8 is InvalidUtf8, and a directory is IsADirectory. A
+-- failed read returns none of its block's lines, but the steps already taken
+-- stay taken: an impure `step` that printed has printed. A FIFO blocks until a
+-- line arrives or its writer closes.
+--
+-- `step` borrows its accumulator, so appending to a List in `step` copies that
+-- List on every line, which is quadratic overall. To collect every line, read
+-- the file with read_text.
+func fold_lines[T, E](
+    path: String, initial: T, step: (T, String) -> Result[T, E], io_error: pure (IOError) -> E,
+) -> Result[T, E]:
+    fold = func(descriptor: Descriptor) -> Result[T, E]: descriptor.fold_descriptor(path, initial, step, io_error)
+    path.with_descriptor(fold, io_error)

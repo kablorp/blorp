@@ -906,8 +906,9 @@ func load_settings(path: String) -> Result[String, IOError]:
 It reads and atomically writes UTF-8 text files (`read_text`, `write_text`),
 inspects and lists directories (`entry_kind`, `list_directory`), creates,
 removes and renames entries (`create_directory`, `create_directories`,
-`remove_file`, `remove_directory`, `remove_directory_tree`, `rename`), and
-scopes a temporary directory to a callback (`with_temporary_directory`). The
+`remove_file`, `remove_directory`, `remove_directory_tree`, `rename`), folds
+over a file's lines a block at a time (`fold_lines`), and scopes a temporary
+directory to a callback (`with_temporary_directory`). The
 [library README](standard_library/README.md#the-fs-module) owns every
 operation's contract, edge cases and limits.
 
