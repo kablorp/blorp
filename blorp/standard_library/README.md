@@ -55,7 +55,7 @@ Int implements `Orderable` with one signed64 `less_than` builtin and the trait's
 defaults; `min` and `max` are ordinary pure functions. `not_equals` uses the canonical
 trait default. Imported `INT_MIN`
 and `INT_MAX` are closed scalar literals, with no runtime global storage.
-The [imports design](../README.md#local-modules) defines the full rules.
+The [imports design](../README.md#modules-imports-and-the-prelude) defines the full rules.
 
 `system.brp`'s explicit `get_current_directory()` import returns `Result[String, String]`:
 an owned nonempty absolute UTF-8 path or an owned valid-text error.
@@ -273,10 +273,10 @@ layout follows the unions' declaration order. FFI remains inactive.
 offsets: invalid bounds or an endpoint inside a scalar return None. A valid
 empty or full slice returns Some with an independently owned String, preserving
 NUL bytes and source aliases. See the
-[String contracts](../README.md#counted-string-operations).
+[String contracts](../README.md#string-operations).
 
-The current [calculator](../README.md#calculator-input-and-results) and
-[Float contracts](../README.md#float64-calculator) define deliberate conversion and arithmetic
+The current [calculator](../README.md#command-line-input) and
+[Float contracts](../README.md#numbers-and-operators) define deliberate conversion and arithmetic
 adaptations. The legacy library, preserved at
 [`standard_library/src/`](https://github.com/kablorp/blorp/blob/ee9e001c6de8911ee486fd992419bef5bc628e8b/standard_library/src/), has reference implementations for these adaptations.
 
@@ -305,14 +305,111 @@ The host attempts LF after short writes as well. Neither API reports delivery.
 `fs.brp` is the typed filesystem library; import it explicitly. It declares
 the fixed unions `IOErrorKind` and `EntryKind`, the records `IOError` and
 `Entry`, the pure `describe` and `default_if_not_found`, and the impure
-`read_text`, `write_text`, `entry_kind`, `list_directory`, `create_directory`,
-`create_directories`, `remove_file`, `remove_directory`,
-`remove_directory_tree`, `rename` and `with_temporary_directory`;
-`write_text` replaces a file atomically, and `with_temporary_directory` is
-generic in its body's error type and takes a converter from `IOError`. Its
-natives return Int codes (or a list or String) that private decoders
-turn into kinds and entries; the codes are named in `src/runtime/fs.brp`. See
-[The fs library](../README.md#the-fs-library) for the contract and its limits.
+operations below, each returning a `Result` whose error is an `IOError`. Its
+natives return Int codes (or a list or String) that private decoders turn
+into kinds and entries; the codes are named in `src/runtime/fs.brp`. The
+language README's [I/O overview](../README.md#effects-and-io) shows where it
+fits beside `print` and the other effects.
+
+- `read_text(path) -> Result[String, IOError]` reads to end of file, so a file
+  that changes size is read as it is, and validates UTF-8. A directory is
+  `IsADirectory`; a NUL in the path is `PathContainsNul` before any system
+  call; interrupted `open` and `read` calls are retried. A FIFO blocks until
+  its writer closes. There is no size limit: reading `/dev/zero` exhausts
+  memory and the allocation aborts, an infrastructure exception.
+- `write_text(path, text) -> Result[Void, IOError]` replaces the file
+  atomically: the text goes into a new file beside the target, named
+  `.blorp-tmp-<pid>-<counter>`, which is flushed and then renamed over the
+  target, so readers see the old contents or the new, never a mix, even after
+  a crash. The flush orders the contents before the rename (`fsync` on Linux,
+  `F_BARRIERFSYNC` on macOS, falling back to `fsync` where the file system
+  lacks it); it does not force them to stable storage, and a failed flush is
+  never retried. An `Err` before the rename leaves the target unchanged and
+  removes the new file; an `Err` after it, which only the directory flush can
+  give, means the target holds the old contents or the new. A symlink is
+  written through: its final target is replaced in that target's own
+  directory and the link stays a link. A dangling link is `NotFound` and
+  creates nothing; a loop is `OtherOs`. A replaced file keeps its mode and,
+  where permitted, its owner and group, or its group alone; a new file gets
+  0666 narrowed by the umask. A read-only file is `PermissionDenied`, though
+  `rename` alone would replace it. A path ending in `/` names a directory,
+  which is never written: it is `IsADirectory` when it names one or a link to
+  one, `NotADirectory` when it names anything else, and `NotFound` when
+  nothing is there; any other failure to look it up is reported as for any
+  path. Limits:
+  - a hard link to the old file keeps the old contents;
+  - extended attributes and ACLs are not copied;
+  - a link re-pointed between resolving it and the rename is not detected;
+  - a writable file in a directory this process cannot write is
+    `PermissionDenied`, because the new file is created in that directory;
+  - a crash can leave a hidden `.blorp-tmp-*` file beside the target;
+  - a busy executable (ETXTBSY) or a bind-mounted target (EBUSY) is
+    `OtherOs`;
+  - a directory without read permission gives an `Err` after a rename that
+    succeeded, because the directory flush opens it for reading;
+  - writing past `RLIMIT_FSIZE` raises SIGXFSZ, which ends the process unless
+    the program ignores that signal; a library does not change signal
+    dispositions.
+- `entry_kind(path) -> Result[Option[EntryKind], IOError]` uses `lstat`, so a
+  link is never followed. A missing path, or a file used as a directory, is
+  `Ok(None)`; there is no `exists` that returns a Bool.
+- `list_directory(path) -> Result[List[Entry], IOError]` lists a directory,
+  sorted by name bytes, with `.` and `..` omitted. An `Entry` is a `name` and
+  its own `EntryKind`, so a link in the listing is `Symlink`; a link given as
+  the path is followed. A name that is not UTF-8 makes the whole listing
+  `InvalidUtf8`, and an entry removed while the directory is read is left out.
+- `create_directory(path)` makes one directory whose parent exists. An existing
+  path of any kind is `AlreadyExists` and a missing parent `NotFound`;
+  `missing/` creates `missing`, while `file/` for an existing file is
+  `NotADirectory` on macOS and `AlreadyExists` on Linux.
+  `create_directories(path)` makes each missing component. It succeeds on an
+  existing directory, a link to one, or `/`, and when another process creates
+  a component first. It fails with `NotFound` for the empty path,
+  `NotADirectory` for a file in the middle and `AlreadyExists` for a file or
+  dangling link at the end. Every failure names the caller's path.
+- `remove_file(path)` removes a file or link, never what a link names; a
+  directory is `IsADirectory` on both platforms. `remove_directory(path)`
+  removes an empty directory; one with entries is `DirectoryNotEmpty`.
+  `rename(source, destination)` replaces a file, or an empty directory, at the
+  destination, and its error carries both paths in `path` and `destination`.
+- `remove_directory_tree(path)` removes a directory and everything in it,
+  never through a link and never past the device it starts on. Only a real
+  directory is a root: a file or a link, even to a directory, is
+  `NotADirectory`, after trailing slashes are stripped. A final `.` or `..` is
+  `OtherOs` before any system call, and a missing path is `NotFound`. A mount
+  point inside the tree, a root that is a mount point and `/` are
+  `CrossesDevices`; a bind mount of the same file system is entered and
+  emptied, as by `rm -rf`. `ChangedDuringRemoval` means another process moved
+  a directory during the walk. The first failure stops the walk and what was
+  removed stays removed. An empty root that cannot be searched (mode 0400) is
+  `PermissionDenied`, and so is a child that cannot be opened (mode 000)
+  unless it is empty.
+- `with_temporary_directory(parent, prefix, body, io_error)` makes a fresh
+  directory (mode 0700) directly in `parent`, runs `body(directory)` and
+  removes the directory and its contents before returning. It is generic in
+  the body's error type: `io_error` turns its own `IOError` into that type
+  (`describe` for a `String` error,
+  `pure func(error: IOError) -> IOError: error` for `IOError`). The converter
+  must be pure, so a plain `func` lambda is rejected. The result is the body's
+  `Err`, else the removal's `Err`, else the body's `Ok`, so a body error hides a
+  failed removal. A failure to create the directory names `parent`; a failed
+  removal names the directory itself, the one exception to the rule below. A
+  signal, `abort()` or a stack overflow can still leave the directory behind.
+- `IOError` holds the caller's `path`, an optional `destination` for
+  two-path operations, and an `IOErrorKind`: `NotFound`, `PermissionDenied`,
+  `AlreadyExists`, `NotADirectory`, `IsADirectory`, `DirectoryNotEmpty`,
+  `NotARegularFile`, `ReadOnlyFilesystem`, `NoSpace`, `FileTooLarge`,
+  `CrossesDevices`, `PathContainsNul`, `InvalidUtf8`, `ChangedDuringRemoval`
+  and `OtherOs(Int)`, which keeps the platform's errno. The path is the one
+  the caller passed, so `x: permission denied` does not say whether `x` or a
+  parent refused, except for the cleanup failure above.
+- `describe(error)` gives `"<path>: <phrase>"` with fixed text per kind, never
+  `strerror` text. `default_if_not_found(result, fallback)` turns `NotFound`
+  into `Ok(fallback)` and leaves every other result alone.
+
+The runtime C is tested by `test/runtime/fs_suite.brp`, and the examples
+`test/e2e/fixtures/fs/read.brp`, `write.brp` and `directories.brp` run the
+library through ordinary mains.
 
 ### Logical paths
 

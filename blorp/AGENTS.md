@@ -1,15 +1,15 @@
 # Blorp
 
 Read the repository's parent [AGENTS.md](../AGENTS.md) in full, then this
-file; both apply. [README.md](README.md) defines the supported increment and
+file; both apply. [README.md](README.md) defines the supported language and
 owns runnable commands; [grammar.ebnf](grammar.ebnf) is its grammar.
 
 ## Scope
 
 The pinned Blorp seed builds the current compiler. All active Blorp tests
 are self-hosted. Unported suites remain in source and are explicitly
-deferred. Compiler source stays within the eventual bootstrap subset in the
-README: no concurrency, parallelism, tensors
+deferred. Compiler source stays within the eventual bootstrap subset: no
+concurrency, parallelism, tensors
 or dimension types, debug blocks, numeric widths other than Int64 and Float64,
 doctests, channels or FFI. Tuples and static traits are supported by the
 current seed; their use in compiler implementation remains bounded by each
