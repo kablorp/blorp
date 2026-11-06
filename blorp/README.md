@@ -29,9 +29,7 @@ owned. See the [API contracts](standard_library/README.md); compiler-source impo
 remain separately tracked from callable admission and capture conversion.
 
 Current language examples and limits are below; [grammar.ebnf](grammar.ebnf)
-owns the formal syntax. The [roadmap](ROADMAP.md) owns planned increments,
-immutable-fact and ownership contracts, and required validation. It consolidates
-the earlier memory, aggregate, generics and recursion plans.
+owns the formal syntax.
 The compiler-source subset is governed by [AGENTS.md](AGENTS.md); source
 convenience does not remove currently supported input features.
 
@@ -45,10 +43,6 @@ records qualification evidence and matched costs; the earlier
 retains its original proof and costs. The completed
 [Equatable-first trait plan](https://github.com/kablorp/blorp/blob/51d98be37bf467db383c91f3a541d14c54885b08/blorp_2/TRAITS_PLAN.md)
 records the original design and acceptance criteria.
-
-The [incremental layout migration](LAYOUT_MIGRATION.md) defines the proposed
-physical-layout model, staged replacements, code examples and cost gates.
-Implementation starts after CI/bootstrap repair and the bounded test migration.
 
 Completed increment plans and handoffs are retained in Git; validation reports
 are retained at [their last revision](https://github.com/kablorp/blorp/tree/1e07c4dce85e51cd7ad911142e9bc96a5e0d91c7/benchmarks/results). Historical research
@@ -163,7 +157,7 @@ key equality distinguishes collisions.
 ### Dict
 
 `dict.brp` declares `Dict[K: DictKey, V]`, an insertion-ordered map written in
-Blorp over Lists ([plan](DICT_PLAN.md)). `DictKey` is a bundle trait,
+Blorp over Lists. `DictKey` is a bundle trait,
 `trait DictKey: Hashable + Equatable`; a key type opts in with a bodyless
 `implements DictKey for Point` after writing its `Hashable` and, unless every
 field is Equatable and so gives it `==` already, its `Equatable`. A key with
@@ -1358,9 +1352,7 @@ an arm-local owner across a recursive call. Each fixture runs through its real
 fixture has limits of 10,000 allocations and 100,000,000 instructions. Calls
 use the C stack; automatic tail-call optimization and constant-stack recursion are not
 part of this increment. Cyclic runtime data is forbidden. The first recursive
-data shape, a [unary recursive union](#unary-recursive-unions), is supported;
-the [M4 recursive-types roadmap](ROADMAP.md#m4-recursive-types) defines the remaining
-shapes and their ownership requirements.
+data shape, a [unary recursive union](#unary-recursive-unions), is supported.
 An explicit `@tail_recursive` function has a checked direct-self loop guarantee:
 
 ```blorp
@@ -1401,8 +1393,7 @@ ordinary stack behavior. The annotation does not bound heap use or prove
 termination. Unannotated C output is preserved. The
 [tail-recursion report](https://github.com/kablorp/blorp/blob/1e07c4dce85e51cd7ad911142e9bc96a5e0d91c7/benchmarks/results/blorp_2_tail_recursion_2026-10-10.md)
 records phase invariants, malformed-IR tests and the native stack-exhaustion
-mutation oracle. The [tail-loop roadmap](ROADMAP.md#m3-loops-and-tail-recursion)
-retains the deferred generic and managed annotated tail-recursion requirements.
+mutation oracle. Generic and managed annotated tail recursion are deferred.
 
 The [numeric accumulator](test/e2e/fixtures/tail_recursion/accumulator.brp)
 decrements an Int while adding one to a second Int. The regular suite checks
@@ -1649,8 +1640,6 @@ Whole-variable reassignment preserves old aliases. Empty record
 declarations, recursive records and field assignment remain unsupported.
 Recursive declaration references other than a union's direct self payload
 reject before layout expansion.
-The [roadmap](ROADMAP.md#delivered-foundation) tracks final
-integrated acceptance and later aggregate extensions.
 
 ## Structural tuples
 
@@ -1773,9 +1762,8 @@ a binding has replacement reads to hoist; a path base such as `s.inner` hoists
 none, and the scan does not enter a `match` or a captured callable, whose
 reads project where they sit. A loop header may still hold the old record
 until the loop edge, so one function's loop over a record field still copies
-it ([loop-header last-read drops](ROADMAP.md#loop-header-last-read-drops)). The
-[order fixture](test/e2e/fixtures/record/update/order.brp) updates `text` before
-`number` and prints `base\ntext\nnumber\n7\n7\n`.
+it. The [order fixture](test/e2e/fixtures/record/update/order.brp) updates
+`text` before `number` and prints `base\ntext\nnumber\n7\n7\n`.
 
 Managed updates always allocate a fresh root. There is no uniqueness test or
 COW reuse yet, including when a replacement has the same value as the old field.
@@ -3625,15 +3613,10 @@ end-to-end cost. Self-compilation is a later milestone.
 
 ## Bootstrap direction and process
 
-The [roadmap](ROADMAP.md) records upcoming language and memory responsibilities,
-including the limits of current verification and required per-phase tests.
 Records support finite mixed fields, construction and field reads. The
 [Pair example](test/e2e/fixtures/record/basic.brp) returns 7 with empty streams;
 its record holds only Ints, so the generated record is a C struct passed by
-value without heap allocation or reference counting. The [aggregate composition roadmap](ROADMAP.md#status-and-order)
-tracks accepted mixed/generic records and plans general collections and recursive
-data. Those later increments are not implemented here; correctness comes before
-memory optimization.
+value without heap allocation or reference counting.
 
 Compiler source under `src/` stays within the agreed eventual subset: `String`, `Int`
 (64-bit), `Float` (64-bit), `Bool`, `Char`, `Void`, `List`, `Option`, `Result`, `Dict`,

@@ -163,8 +163,7 @@ fixture's alternate main, and authorizes no production tracing.
 
 **Memory management.** Each memory increment adds granular unit tests at
 every affected phase boundary, including intermediate analyses, plus
-separate runtime tests, per the
-[memory test matrix](ROADMAP.md#phase-level-test-contract). Test
+separate runtime tests, without weakening production APIs for tests. Test
 ownership insertion and independent verification separately, including
 malformed ownership IR the verifier must reject. Test each invariant in a
 named `TestSuite` callback with small typed inputs and observable outputs;

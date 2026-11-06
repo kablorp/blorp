@@ -181,7 +181,7 @@ each key of one Dict in the other, whatever the order. A Dict is neither
 Dict appends to or sets its field Lists in place; a shared Dict copies on write.
 Home slots multiply the hash by an odd constant first, so sequential Int hashes
 do not form one long run; slot counts are 2^k - 1, and a rebuild at half load
-compacts removed entries. [DICT_PLAN](../DICT_PLAN.md) has the design and ceilings.
+compacts removed entries.
 
 ### List queries and copies
 
@@ -335,7 +335,7 @@ trailing separators disappear. Other component bytes, including UTF-8 and NUL,
 are preserved. OS operations independently reject NUL paths.
 
 The byte scan/materialization is linear, and List take and String joining build
-their results in one pass. See the [shell/path boundary](../ROADMAP.md#seven-shell-and-path-functions).
+their results in one pass.
 
 ### Test registration
 
