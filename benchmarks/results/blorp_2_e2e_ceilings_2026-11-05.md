@@ -428,3 +428,177 @@ rounded up to a whole count, except the two `*_unreached` programs at plus 5%
 | `string_slice_ownership` | 45,000 | 95,482 | 109,805 | 150,000,000 | 527,387,581 | 606,495,719 |
 | `string_starts_with_arguments` | 150,000 | 96,915 | 111,453 | 600,000,000 | 473,318,437 | 544,316,203 |
 | `string_starts_with_counted` | 150,000 | 97,393 | 112,002 | 600,000,000 | 530,698,665 | 610,303,465 |
+
+## T3 batch 3: records, unions, tuples, opaque types and equality, 2026-11-05
+
+The 112 programs ported in batch 3 (`blorp/test/e2e/self_hosted_data.brp`, from
+12 legacy files) carry ceilings set by the same rule: measured cost plus 15%,
+rounded up to a whole count. "Old" is the ceiling in the deleted `test_*.brp`
+file, or `none` for the two accepted-only derived-equality compiles, which the
+legacy file only compiled and ran. The legacy ceilings were feature limits or
+older measurements ("about 30% headroom" at 17,838 allocations, "first direct
+compiler samples", "operators 236,887 / 1,914,654,836"); none of them guards a
+named regression, so every program takes the plain +15%. The suite has 138 tests: these 112 programs and 26 rejection checks, which
+compile nothing that is run and so have no ceiling.
+
+One ported expectation changed: "public record field rejects private type" expected
+`2:32`, but `Secret` in `record Envelope { value: Secret }` starts at column 26, where the
+compiler reports it and where the five sibling cases point. The legacy file never ran, so
+`2:32` was stale; the driver checks `2:26`.
+
+- **Compiler:** the tree of `d49241001` (the last commit touching `blorp/src`
+  and `blorp/standard_library`, a rename; this branch changes neither),
+  `make -C blorp test-compiler`: `-O0 -DBLORP_MEMORY_DIAGNOSTICS=1`. Host: Apple
+  M4, macOS 26.7.1, Apple clang 21.0.0, strictly serial; 1-minute load average
+  3.3 to 4.5 at the start of the three sweeps, other sessions shared the machine.
+- **Samples:** three `make -C blorp test-e2e INSTRUCTION_CHECK=on` runs with the
+  driver temporarily restricted to this suite and printing each compile
+  measurement and each strict native report instead of failing on it
+  (`batch3_measure.patch`). Compile allocations, and the allocations of all 117
+  native runs, agree exactly across the samples. Instructions differ by at most
+  1.0% (`derived_recursive`); the table takes the largest. Two spawn flakes
+  (`process.run_to_files: create child group; errno=1`) cost one native run
+  sample each, `record_reordered` in the first sweep and `tuple_patterns` in the
+  third; their compiles completed, so every program has three compile samples and
+  those two have two native samples.
+- **Reduced library:** the seven `derived_*` programs compile against
+  `blorp/test/e2e/trait_inputs/derived/library`, which has no `Dict`, so their
+  compiles cost 4,073 to 45,137 allocations and 30M to 141M instructions, 20 to
+  50 times less than a standard-library compile. Their old ceilings
+  (55,000 to 150,000 allocations) were loose for the same reason.
+- **Ranking:** the highest allocation and instruction counts are
+  `equality_operators` (132,778 and 604,051,308), then `equality_nesting`
+  (116,322) and `tuple_moderate_nested` (110,886). The lower instruction
+  cluster from batch 1 (460M to 480M) reappears in `generic_record_union_field`,
+  `union_direct_symbolic_list_admission`, the four `record_update_*`
+  programs and `opaque_list`/`opaque_recursive`. No program is far from its
+  siblings.
+- **Legacy ceilings:** 16 of the 110 programs with an old ceiling exceed their
+  old allocation ceiling and 99 their old instruction ceiling (the `Dict` base
+  cost described above).
+- **Samples are kept out of the repository** in the ignored directory
+  `/Users/keithphilpott/CLionProjects/blorp/build/blorp2-e2e-ceilings-2026-11-05/`:
+
+| File | sha256 |
+| --- | --- |
+| `batch3_measure1.log` | `ae0b7db15ad330950202555c7b9b4bf90381c86eb9dfaa5c7c17a5331eaf11c2` |
+| `batch3_measure2.log` | `a4effb269d4907527942cfd1f23f64254e472a63e2ebca87e092df7e911dd5ad` |
+| `batch3_measure3.log` | `9d8c7e1ae2a0fd69bc218cf149191309490806179633dbec263017f7b371923b` |
+| `batch3_measure.patch` (the temporary driver change) | `fd1a39b3becfcdb8eca2a906907ac3eaa754954137b52a6c9acc8dbd84313ad0` |
+| `batch3_samples.json` (every sample per program) | `30e2a524e7cd6ef4a8f2fce6f2313a68425f69c413a4c02ecf1a64686395d58b` |
+| `batch3_ceilings.json` (the ceiling literals, then each run's strict allocations) | `8137cd3eaf4919354d4a7dfab7b12ad0eb86b18b9fe693f36bfa5df407e2c210` |
+
+| Program | Old allocs | Measured allocs | New allocs | Old instr | Measured instr | New instr |
+| --- | --- | --- | --- | --- | --- | --- |
+| `derived_accepted_generic_head` | none | 4,073 | 4,684 | none | 29,680,025 | 34,132,029 |
+| `derived_accepted_nested_generic_head` | none | 4,183 | 4,811 | none | 29,921,757 | 34,410,021 |
+| `derived_callables` | 62,000 | 20,805 | 23,926 | 170,000,000 | 74,846,108 | 86,073,025 |
+| `derived_generic` | 150,000 | 45,137 | 51,908 | 400,000,000 | 141,384,805 | 162,592,526 |
+| `derived_recursive` | 150,000 | 40,704 | 46,810 | 315,000,000 | 124,122,533 | 142,740,913 |
+| `derived_semantics` | 65,000 | 23,221 | 26,705 | 175,000,000 | 80,185,667 | 92,213,518 |
+| `derived_values` | 100,000 | 33,642 | 38,689 | 260,000,000 | 109,533,381 | 125,963,389 |
+| `equality_dispatch` | 150,000 | 94,654 | 108,853 | 1,900,000,000 | 522,921,871 | 601,360,152 |
+| `equality_nesting` | 205,000 | 116,322 | 133,771 | 2,200,000,000 | 596,922,287 | 686,460,631 |
+| `equality_operators` | 275,000 | 132,778 | 152,695 | 2,250,000,000 | 604,051,308 | 694,659,005 |
+| `equality_order` | 145,000 | 93,473 | 107,494 | 1,850,000,000 | 520,564,832 | 598,649,557 |
+| `generic_record_box_float` | 140,000 | 92,036 | 105,842 | 500,000,000 | 523,374,313 | 601,880,460 |
+| `generic_record_box_int` | 140,000 | 90,949 | 104,592 | 500,000,000 | 518,486,132 | 596,259,052 |
+| `generic_record_box_list` | 140,000 | 95,152 | 109,425 | 500,000,000 | 530,097,141 | 609,611,713 |
+| `generic_record_box_string` | 140,000 | 92,113 | 105,930 | 500,000,000 | 522,908,867 | 601,345,198 |
+| `generic_record_box_void` | 140,000 | 92,257 | 106,096 | 500,000,000 | 522,644,665 | 601,041,365 |
+| `generic_record_managed_alias_reassignment` | 140,000 | 93,185 | 107,163 | 500,000,000 | 527,252,534 | 606,340,415 |
+| `generic_record_nested_managed_escape` | 140,000 | 92,930 | 106,870 | 500,000,000 | 526,773,301 | 605,789,297 |
+| `generic_record_nested_projection` | 140,000 | 92,245 | 106,082 | 500,000,000 | 523,279,696 | 601,771,651 |
+| `generic_record_nested_string_list` | 140,000 | 94,672 | 108,873 | 500,000,000 | 538,346,174 | 619,098,101 |
+| `generic_record_partial_direct_int` | 140,000 | 90,572 | 104,158 | 500,000,000 | 520,333,152 | 598,383,125 |
+| `generic_record_partial_direct_string` | 140,000 | 91,704 | 105,460 | 500,000,000 | 522,646,902 | 601,043,938 |
+| `generic_record_partial_nested` | 140,000 | 91,087 | 104,751 | 500,000,000 | 525,408,647 | 604,219,945 |
+| `generic_record_partial_pair_order` | 140,000 | 92,928 | 106,868 | 500,000,000 | 529,419,401 | 608,832,312 |
+| `generic_record_partial_ufcs` | 140,000 | 90,576 | 104,163 | 500,000,000 | 519,860,230 | 597,839,265 |
+| `generic_record_partial_union_child` | 140,000 | 91,959 | 105,753 | 500,000,000 | 525,466,213 | 604,286,145 |
+| `generic_record_phantom_arguments` | 140,000 | 92,947 | 106,890 | 500,000,000 | 529,257,159 | 608,645,733 |
+| `generic_record_result_context` | 140,000 | 91,046 | 104,703 | 500,000,000 | 519,266,699 | 597,156,704 |
+| `generic_record_rigid_owner_positions` | 140,000 | 91,723 | 105,482 | 500,000,000 | 526,058,736 | 604,967,547 |
+| `generic_record_same_reader_twice` | 140,000 | 93,092 | 107,056 | 500,000,000 | 524,325,397 | 602,974,207 |
+| `generic_record_swapped_pair` | 140,000 | 95,114 | 109,382 | 500,000,000 | 534,256,993 | 614,395,542 |
+| `generic_record_union_field` | 140,000 | 93,552 | 107,585 | 500,000,000 | 462,209,620 | 531,541,063 |
+| `generic_record_unused_generic_and_passthrough` | 140,000 | 90,964 | 104,609 | 500,000,000 | 519,734,289 | 597,694,433 |
+| `generic_record_unused_list_int` | 140,000 | 89,943 | 103,435 | 500,000,000 | 518,742,153 | 596,553,476 |
+| `generic_record_void_argument` | 140,000 | 91,717 | 105,475 | 500,000,000 | 521,451,283 | 599,668,976 |
+| `opaque_inline` | 48,000 | 95,123 | 109,392 | 180,000,000 | 530,955,799 | 610,599,169 |
+| `opaque_int` | 42,000 | 90,877 | 104,509 | 140,000,000 | 516,071,681 | 593,482,434 |
+| `opaque_keys` | 50,000 | 96,835 | 111,361 | 140,000,000 | 534,562,296 | 614,746,641 |
+| `opaque_list` | 60,000 | 96,934 | 111,475 | 240,000,000 | 475,950,801 | 547,343,422 |
+| `opaque_managed` | 58,000 | 101,225 | 116,409 | 220,000,000 | 549,794,170 | 632,263,296 |
+| `opaque_recursive` | 75,000 | 99,142 | 114,014 | 300,000,000 | 480,159,702 | 552,183,658 |
+| `opaque_scalar` | 44,000 | 91,943 | 105,735 | 140,000,000 | 517,995,843 | 595,695,220 |
+| `record_aliases` | 140,000 | 90,599 | 104,189 | 500,000,000 | 513,328,276 | 590,327,518 |
+| `record_basic` | 140,000 | 90,671 | 104,272 | 500,000,000 | 514,416,263 | 591,578,703 |
+| `record_context` | 140,000 | 90,574 | 104,161 | 500,000,000 | 512,792,391 | 589,711,250 |
+| `record_extrema` | 140,000 | 90,276 | 103,818 | 500,000,000 | 513,497,579 | 590,522,216 |
+| `record_field_order` | 140,000 | 92,878 | 106,810 | 500,000,000 | 519,340,713 | 597,241,820 |
+| `record_generic` | 140,000 | 91,494 | 105,219 | 500,000,000 | 514,792,055 | 592,010,864 |
+| `record_identity_escape` | 140,000 | 91,063 | 104,723 | 500,000,000 | 515,673,869 | 593,024,950 |
+| `record_identity_reassignment` | 140,000 | 92,679 | 106,581 | 500,000,000 | 521,803,780 | 600,074,347 |
+| `record_list_field` | 140,000 | 95,185 | 109,463 | 500,000,000 | 525,901,517 | 604,786,745 |
+| `record_managed_aliases` | 140,000 | 93,295 | 107,290 | 500,000,000 | 521,888,974 | 600,172,321 |
+| `record_managed_self_assignment` | 140,000 | 90,828 | 104,453 | 500,000,000 | 513,829,675 | 590,904,127 |
+| `record_mixed` | 140,000 | 91,334 | 105,035 | 500,000,000 | 516,431,543 | 593,896,275 |
+| `record_mixed_fields` | 140,000 | 92,290 | 106,134 | 500,000,000 | 518,686,282 | 596,489,225 |
+| `record_nested_escape` | 140,000 | 92,490 | 106,364 | 500,000,000 | 518,682,520 | 596,484,898 |
+| `record_nested_projection` | 140,000 | 91,359 | 105,063 | 500,000,000 | 516,288,420 | 593,731,683 |
+| `record_nested_union_field` | 140,000 | 93,613 | 107,655 | 500,000,000 | 525,066,941 | 603,826,983 |
+| `record_owning_union_field` | 140,000 | 93,144 | 107,116 | 500,000,000 | 524,321,783 | 602,970,051 |
+| `record_phantom_union_fields` | 140,000 | 92,557 | 106,441 | 500,000,000 | 522,506,121 | 600,882,040 |
+| `record_reassigned` | 140,000 | 90,637 | 104,233 | 500,000,000 | 513,235,748 | 590,221,111 |
+| `record_recursive_direct` | 140,000 | 89,640 | 103,086 | 500,000,000 | 510,242,209 | 586,778,541 |
+| `record_recursive_mutual` | 140,000 | 89,906 | 103,392 | 500,000,000 | 514,384,368 | 591,542,024 |
+| `record_recursive_union` | 140,000 | 90,148 | 103,671 | 500,000,000 | 518,638,873 | 596,434,704 |
+| `record_reordered` | 140,000 | 90,777 | 104,394 | 500,000,000 | 513,154,162 | 590,127,287 |
+| `record_scalar_nested_field` | 140,000 | 92,540 | 106,421 | 500,000,000 | 519,285,413 | 597,178,225 |
+| `record_shared_record` | 140,000 | 92,208 | 106,040 | 500,000,000 | 517,471,964 | 595,092,759 |
+| `record_shared_string` | 140,000 | 91,448 | 105,166 | 500,000,000 | 515,674,827 | 593,026,052 |
+| `record_union_aliases` | 140,000 | 93,627 | 107,672 | 500,000,000 | 526,311,161 | 605,257,836 |
+| `record_union_payload` | 140,000 | 92,711 | 106,618 | 500,000,000 | 526,180,064 | 605,107,074 |
+| `record_unmanaged_union_field` | 140,000 | 92,303 | 106,149 | 500,000,000 | 516,910,925 | 594,447,564 |
+| `record_unused_managed` | 140,000 | 90,468 | 104,039 | 500,000,000 | 513,677,421 | 590,729,035 |
+| `record_update_aliases` | 47,000 | 93,325 | 107,324 | 150,000,000 | 467,573,427 | 537,709,442 |
+| `record_update_escaped_children` | 51,000 | 96,251 | 110,689 | 150,000,000 | 474,231,068 | 545,365,729 |
+| `record_update_managed_reorder` | 51,000 | 96,218 | 110,651 | 100,000,000 | 474,118,621 | 545,236,415 |
+| `record_update_order` | 48,000 | 94,141 | 108,263 | 180,000,000 | 469,535,288 | 539,965,582 |
+| `record_void_field` | 140,000 | 90,122 | 103,641 | 500,000,000 | 512,769,491 | 589,684,915 |
+| `record_wide` | 140,000 | 93,748 | 107,811 | 500,000,000 | 522,750,072 | 601,162,583 |
+| `recursive_union_deep` | 47,000 | 94,435 | 108,601 | 91,000,000 | 523,103,243 | 601,568,730 |
+| `recursive_union_depth` | 44,000 | 92,053 | 105,861 | 87,000,000 | 516,557,432 | 594,041,047 |
+| `recursive_union_list_payload` | 44,000 | 89,743 | 103,205 | 87,000,000 | 510,830,095 | 587,454,610 |
+| `recursive_union_shared` | 46,000 | 93,294 | 107,289 | 90,000,000 | 519,927,669 | 597,916,820 |
+| `recursive_union_trail` | 46,000 | 93,979 | 108,076 | 90,000,000 | 521,840,155 | 600,116,179 |
+| `tuple_callable_members` | 140,000 | 95,271 | 109,562 | 500,000,000 | 524,966,053 | 603,710,961 |
+| `tuple_loops_capture` | 140,000 | 98,364 | 113,119 | 500,000,000 | 532,535,766 | 612,416,131 |
+| `tuple_moderate_nested` | 140,000 | 110,886 | 127,519 | 500,000,000 | 575,355,546 | 661,658,878 |
+| `tuple_patterns` | 140,000 | 99,756 | 114,720 | 500,000,000 | 539,491,481 | 620,415,204 |
+| `tuple_triple` | 140,000 | 89,939 | 103,430 | 500,000,000 | 511,861,986 | 588,641,284 |
+| `tuple_values` | 140,000 | 94,951 | 109,194 | 500,000,000 | 525,109,151 | 603,875,524 |
+| `tuple_void_order` | 140,000 | 94,191 | 108,320 | 500,000,000 | 525,553,465 | 604,386,485 |
+| `union_direct` | 140,000 | 90,860 | 104,489 | 500,000,000 | 513,197,660 | 590,177,309 |
+| `union_direct_float_output` | 140,000 | 92,579 | 106,466 | 500,000,000 | 518,251,969 | 595,989,765 |
+| `union_direct_forward_finite` | 140,000 | 92,245 | 106,082 | 500,000,000 | 516,779,173 | 594,296,049 |
+| `union_direct_managed_record_escape` | 140,000 | 93,353 | 107,356 | 500,000,000 | 520,512,311 | 598,589,158 |
+| `union_direct_nested_nominal_escape` | 140,000 | 94,424 | 108,588 | 500,000,000 | 526,928,414 | 605,967,677 |
+| `union_direct_parent_alias_reassignment` | 140,000 | 93,236 | 107,222 | 500,000,000 | 520,361,677 | 598,415,929 |
+| `union_direct_string_escape` | 140,000 | 91,737 | 105,498 | 500,000,000 | 515,656,077 | 593,004,489 |
+| `union_direct_symbolic_list_admission` | 140,000 | 91,480 | 105,202 | 500,000,000 | 467,659,615 | 537,808,558 |
+| `union_direct_void_empty` | 140,000 | 90,713 | 104,320 | 500,000,000 | 513,138,896 | 590,109,731 |
+| `union_direct_void_tag` | 140,000 | 90,778 | 104,395 | 500,000,000 | 514,870,663 | 592,101,263 |
+| `union_first` | 140,000 | 90,493 | 104,067 | 500,000,000 | 513,370,295 | 590,375,840 |
+| `union_identity` | 140,000 | 90,862 | 104,492 | 500,000,000 | 514,662,494 | 591,861,869 |
+| `union_multiple_alias_whole_reassignment` | 140,000 | 95,307 | 109,604 | 500,000,000 | 526,290,993 | 605,234,642 |
+| `union_multiple_distinct_second_escape` | 140,000 | 92,523 | 106,402 | 500,000,000 | 518,086,897 | 595,799,932 |
+| `union_multiple_generic_swapped` | 140,000 | 94,708 | 108,915 | 500,000,000 | 533,438,484 | 613,454,257 |
+| `union_multiple_mixed_positions` | 140,000 | 93,392 | 107,401 | 500,000,000 | 519,996,965 | 597,996,510 |
+| `union_multiple_pair_duplicate_escape` | 140,000 | 92,039 | 105,845 | 500,000,000 | 516,032,265 | 593,437,105 |
+| `union_multiple_phantom_instances` | 140,000 | 94,629 | 108,824 | 500,000,000 | 527,764,464 | 606,929,134 |
+| `union_multiple_written_argument_effects` | 140,000 | 93,016 | 106,969 | 500,000,000 | 519,697,689 | 597,652,343 |
+| `union_receiver` | 140,000 | 90,863 | 104,493 | 500,000,000 | 513,365,105 | 590,369,871 |
+| `union_second` | 140,000 | 90,493 | 104,067 | 500,000,000 | 513,372,122 | 590,377,941 |
+| `union_values` | 135,000 | 92,166 | 105,991 | 445,000,000 | 517,355,767 | 594,959,133 |

@@ -948,8 +948,9 @@ The component gate compiles each phase directory's suites into one program,
 leak checking; `test-components` then prints a `DEFERRED:` line per top test
 directory, counting the `test_*.brp` files it does not run. Each native e2e
 case is a `Program` built with the constructors in
-[`self_hosted_harness.brp`](test/e2e/self_hosted_harness.brp): one compile
-within its allocation ceiling, then each run with its exact status, stdout,
+[`self_hosted_harness.brp`](test/e2e/self_hosted_harness.brp): one compile,
+against its `library_root` (the standard library unless the program names
+another), within its allocation ceiling, then each run with its exact status, stdout,
 stderr and strict allocation count. `INSTRUCTION_CHECK=on` also holds the
 compile to its retired-instruction ceiling, read from macOS `/usr/bin/time -l`.
 
