@@ -46,6 +46,26 @@ make -C blorp test INSTRUCTION_CHECK=on   # macOS: also hold retired-instruction
 component suites and native end-to-end cases. [`AGENTS.md`](AGENTS.md) owns
 the test layout and gates; [Tests](#tests) describes `TestSuite`.
 
+### Formatting
+
+The compiler also formats source files to the one canonical layout:
+
+```sh
+blorp/build/compiler --format blorp/src/main.brp        # rewrite in place
+blorp/build/compiler --check blorp/src/main.brp         # report, change nothing
+```
+
+Each argument is one `.brp` file; directories are not searched. `--format`
+rewrites only the files whose layout changes. `--check` prints
+`path:line: would reformat` for each file that would change, at its first
+changed line, and exits 1 if any would. A file that does not parse gets the
+parser's diagnostic and is left as it was, and the command exits 1; the other
+files are still processed. Formatting reads a file on its own, so it need not
+type-check. Patterns, types and declaration header lines never break, so
+a comment inside one stops the formatter, which says where and leaves that
+file unchanged; move the comment above the line.
+[FORMATTER_PLAN.md](FORMATTER_PLAN.md) records the layout rules.
+
 ## The language
 
 ### Programs and main
@@ -992,6 +1012,11 @@ prints diagnostics and writes the output with `fs.write_text`. Everything in
 between, diagnostic rendering included, is pure and reads no filesystem,
 environment or clock. Each phase consumes its predecessor's sealed product and
 returns a new one or its first error.
+
+[`src/format`](src/format/format.brp) is not a phase: the
+[formatter](#formatting) lexes and parses one file with the front end and
+prints its tree, taking comments, blank lines and literal spellings from the
+source between tokens. It imports only `lex`, `parse` and `utils`.
 
 The output is replaced atomically, as by
 [`write_text`](standard_library/README.md#the-fs-module): a symlinked output

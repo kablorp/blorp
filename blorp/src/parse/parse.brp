@@ -3833,10 +3833,12 @@ private record BuiltinTypeResult {
 private BUILTIN_TYPE_HELP: String = "declare type Int = builtin, type Float = builtin, type String = builtin, type Void = builtin or type List[T] = builtin"
 
 
-private pure func consume_list_parameter(state: ParserState) -> Result[ParserState, Diagnostic]:
+-- The element parameter in `[T]`; `next` follows the closing bracket.
+private pure func consume_list_parameter(state: ParserState) -> Result[ParsedName, Diagnostic]:
 	opened ?= state.expect(state.at_left_bracket(), "List requires one type parameter", "write type List[T] = builtin")
 	parameter ?= opened.consume_name("expected the List type parameter")
-	parameter.next.expect(parameter.next.at_right_bracket(), "List requires exactly one type parameter", "write type List[T] = builtin")
+	closed ?= parameter.next.expect(parameter.next.at_right_bracket(), "List requires exactly one type parameter", "write type List[T] = builtin")
+	Ok({ parameter | next = closed })
 
 
 -- `state` is at the declared type name.
@@ -3849,8 +3851,6 @@ private pure func builtin_type(state: ParserState, name: WrittenName) -> Option[
 		Some(StringBuiltin(name))
 	else if state.at_word(state.recognized_words().void_word):
 		Some(VoidBuiltin(name))
-	else if state.at_word(state.recognized_words().list_word):
-		Some(ListBuiltin(name))
 	else:
 		None
 
@@ -3865,19 +3865,24 @@ private pure func consume_builtin_type(start: ParserState) -> Result[BuiltinType
 		after_type.consume_name("expected a builtin type name")
 	else:
 		Err(unknown_builtin_type(after_type))
-	declaration: ParsedBuiltinType ?= match after_type.builtin_type(name.name):
-		Some(declared):
-			Ok(declared)
-		None:
-			Err(unknown_builtin_type(after_type))
-	after_name ?= match declaration:
-		ListBuiltin(_):
-			name.next.consume_list_parameter()
-		_:
-			Ok(name.next)
+	head ?= after_type.consume_builtin_head(name)
+	after_name = head.next
 	equals ?= after_name.expect(after_name.at_equals(), "expected '=' after the builtin type name", "write type Int = builtin, type Float = builtin, type String = builtin, type Void = builtin or type List[T] = builtin")
 	end ?= equals.expect(equals.at_builtin(), "expected 'builtin'", DECLARATION_WORD_HELP)
-	Ok({ declaration = declaration, next = end })
+	Ok({ declaration = head.declaration, next = end })
+
+
+-- The declared builtin, and the state after its name, or after a List's
+-- bracketed element parameter. `state` is at the declared name.
+private pure func consume_builtin_head(state: ParserState, name: ParsedName) -> Result[BuiltinTypeResult, Diagnostic]:
+	if state.at_word(state.recognized_words().list_word):
+		match name.next.consume_list_parameter():
+			Ok(parameter): Ok({ declaration = ListBuiltin(name.name, parameter.name), next = parameter.next })
+			Err(error): Err(error)
+	else:
+		match state.builtin_type(name.name):
+			Some(declared): Ok({ declaration = declared, next = name.next })
+			None: Err(unknown_builtin_type(state))
 
 
 private record ParsedPath {

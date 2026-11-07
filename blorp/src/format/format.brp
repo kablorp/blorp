@@ -1,0 +1,778 @@
+import:
+    ../lex/lex: lex
+    ../parse/parse:
+        ImportOrigin(RelativeImport, LibraryImport),
+        ImportSelection(NamedSelection, ConstructorSelection, MethodsSelection),
+        ParsedImport,
+        ParsedModuleContents,
+        module_contents,
+        parse_module,
+        selection_name,
+    ../utils/names: NameTable, name_spelling, program_names
+    ../utils/source: SourceId, module_source, root_module_id
+    ../utils/syntax:
+        Diagnostic,
+        ParsedBody(ParsedBuiltinBody, ParsedValueBody, ParsedMatchBody),
+        ParsedBuiltinTypeDeclaration,
+        ParsedBuiltinType(IntegerBuiltin, FloatBuiltin, StringBuiltin, VoidBuiltin, ListBuiltin),
+        ParsedConstant,
+        ParsedFunction,
+        ParsedFunctionGroup(FreeFunction, ImplementationGroup),
+        ParsedImplementationHeader,
+        ParsedOpaque,
+        ParsedParameter,
+        ParsedReceiverHead(ReceiverName, QualifiedReceiverName),
+        ParsedRecord,
+        ParsedTrait,
+        ParsedTraitMethod(AbstractTraitMethod, DefaultTraitMethod),
+        ParsedTypeParameter,
+        ParsedUnion,
+        ParsedVariant,
+        Purity,
+        TypeSyntax,
+        Visibility(Public, Private),
+        WrittenName,
+        diagnostic,
+        internal_error,
+        type_span,
+    ./flat: Placement(WholeValue), name_text, purity_text, qualified_text, returned_text, type_parameters_text, type_text, value_text
+    ./layout:
+        ListItem(TextItem),
+        ListShape,
+        block_level,
+        emit_initializer,
+        operator_before,
+        emit_list,
+        emit_match,
+        emit_statement,
+        emit_value,
+        LineContext(StatementLine),
+        starts_with_pipe,
+        statement_start,
+    ./printer:
+        BODY_BLANK_LINES,
+        FormatFault(CodeAfterComment, CommentInUnbreakable, PipeStringAfterCode),
+        UnbreakableConstruct(PatternConstruct, TypeConstruct, HeaderConstruct),
+        LINE_WIDTH,
+        Printer,
+        SourceView,
+        TOP_LEVEL_BLANK_LINES,
+        blank_lines_before,
+        close_block,
+        closer_after,
+        display_width,
+        finished,
+        flush,
+        flush_block_end,
+        flush_top_level,
+        has_comment,
+        new_printer,
+        newline,
+        next_code_start,
+        open_block,
+        refusing_comments,
+        text,
+        with_source,
+        with_trivia,
+        written,
+    ./trivia: LINE_FEED_BYTE, Trivia(TrailingComment, OwnLineComment, BlankLine, DocumentationBlock), source_level, source_trivia, trivia_start
+    bool: and, not, or
+    int: Int methods
+    list: List methods
+    option: Option methods
+    result: Result methods
+    string: String methods
+
+
+-- One top-level declaration of any kind, so the per-kind lists the parser
+-- publishes can be merged back into written order.
+private union Declaration:
+    BuiltinTypeEntry(ParsedBuiltinTypeDeclaration)
+    FunctionEntry(ParsedFunctionGroup)
+    TraitEntry(ParsedTrait)
+    UnionEntry(ParsedUnion)
+    RecordEntry(ParsedRecord)
+    OpaqueEntry(ParsedOpaque)
+    ConstantEntry(ParsedConstant)
+
+
+private pure func declaration_start(declaration: Declaration) -> Int:
+    match declaration:
+        BuiltinTypeEntry(entry): entry.start.start
+        FunctionEntry(FreeFunction(function)): function.start.start
+        FunctionEntry(ImplementationGroup(header, _)): header.start.start
+        TraitEntry(entry): entry.start.start
+        UnionEntry(entry): entry.start.start
+        RecordEntry(entry): entry.start.start
+        OpaqueEntry(entry): entry.start.start
+        ConstantEntry(entry): entry.start.start
+
+
+-- Two lists already in written order, merged into one.
+private pure func merged(left: List[Declaration], right: List[Declaration]) -> List[Declaration]:
+    var result: List[Declaration] = []
+    var left_position = 0
+    var right_position = 0
+    while or(left_position < left.length(), right_position < right.length()):
+        match (left.get(left_position), right.get(right_position)):
+            (Some(first), Some(second)):
+                if first.declaration_start() <= second.declaration_start():
+                    result = result.append(first)
+                    left_position = left_position + 1
+                else:
+                    result = result.append(second)
+                    right_position = right_position + 1
+            (Some(first), None):
+                result = result.append(first)
+                left_position = left_position + 1
+            (None, Some(second)):
+                result = result.append(second)
+                right_position = right_position + 1
+            (None, None): break
+    result
+
+
+-- The declarations in written order: the parser keeps each kind in its own
+-- list, and each declaration's `start` places it.
+private pure func written_declarations(contents: ParsedModuleContents) -> List[Declaration]:
+    contents.builtin_types.map(pure func(entry: ParsedBuiltinTypeDeclaration) -> Declaration: BuiltinTypeEntry(entry))
+        .merged(contents.functions.map(pure func(entry: ParsedFunctionGroup) -> Declaration: FunctionEntry(entry)))
+        .merged(contents.traits.map(pure func(entry: ParsedTrait) -> Declaration: TraitEntry(entry)))
+        .merged(contents.unions.map(pure func(entry: ParsedUnion) -> Declaration: UnionEntry(entry)))
+        .merged(contents.records.map(pure func(entry: ParsedRecord) -> Declaration: RecordEntry(entry)))
+        .merged(contents.opaques.map(pure func(entry: ParsedOpaque) -> Declaration: OpaqueEntry(entry)))
+        .merged(contents.constants.map(pure func(entry: ParsedConstant) -> Declaration: ConstantEntry(entry)))
+
+
+private pure func visibility_text(visibility: Visibility) -> String:
+    match visibility:
+        Public: ""
+        Private(_): "private "
+
+
+private pure func parameter_items(source: SourceView, parameters: List[ParsedParameter]) -> List[ListItem]:
+    parameters.map(pure func(parameter: ParsedParameter) -> ListItem:
+        TextItem("${source.name_text(parameter.name)}: ${source.type_text(parameter.type_name)}", { parameter.name.span | end = parameter.type_name.type_span().end })
+    )
+
+
+-- Where a declaration's name and its type parameters end: after the `]` that
+-- closes them, or after the name. Types never break, so the header refuses a
+-- comment before this point.
+private pure func type_parameters_end(source: SourceView, name: WrittenName, parameters: List[ParsedTypeParameter]) -> Int:
+    match parameters.last():
+        None: name.span.end
+        Some(parameter):
+            last_end = match parameter.bounds.last():
+                Some(bound): bound.type_span().end
+                None: parameter.name.span.end
+            source.closer_after(last_end) + 1
+
+
+-- A parameter list's or field list's closing bracket, found after its last
+-- item; an empty list has no comments to place, so its opening is enough.
+private pure func parameters_closer(source: SourceView, parameters: List[ParsedParameter], opening: Int) -> Int:
+    match parameters.last():
+        Some(parameter): source.closer_after(parameter.type_name.type_span().end)
+        None: opening
+
+
+-- `[pure ]func name[T](parameters)`, with `after` written once the parameters
+-- close; the parameters break one per line when the header does not fit.
+private pure func emit_signature(
+    printer: Printer,
+    purity: Purity,
+    name: WrittenName,
+    type_parameters: List[ParsedTypeParameter],
+    parameters: List[ParsedParameter],
+    return_type: Option[TypeSyntax],
+    after: String,
+    indent: Int,
+) -> Printer:
+    source = printer.source
+    returned = source.returned_text(return_type)
+    shape: ListShape = {
+        open = "(",
+        close = ")",
+        padded = False,
+        start = name.span.end,
+        closer = source.parameters_closer(parameters, name.span.end),
+        hug = False,
+        trailing_comma = True
+    }
+    listed = printer.refusing_comments(HeaderConstruct, name.span.start, source.type_parameters_end(name, type_parameters))
+        .text("${purity.purity_text()}func ${source.name_text(name)}${source.type_parameters_text(type_parameters)}")
+        .emit_list(shape, source.parameter_items(parameters), indent, display_width("${returned}${after}"))
+    typed = match return_type:
+        Some(written_type): listed.refusing_comments(TypeConstruct, shape.closer, written_type.type_span().end)
+        None: listed
+    typed.text("${returned}${after}")
+
+
+private pure func body_start(statements_start: Option[Int], body: ParsedBody) -> Int:
+    match statements_start:
+        Some(start): start
+        None:
+            match body:
+                ParsedBuiltinBody(_, label): label.start
+                ParsedValueBody(value): value.span.start
+                ParsedMatchBody(form): form.span.start
+
+
+private pure func body_end(body: ParsedBody) -> Int:
+    match body:
+        ParsedBuiltinBody(_, label): label.end
+        ParsedValueBody(value): value.span.end
+        ParsedMatchBody(form): form.span.end
+
+
+-- A function or method. `prefix` is `private ` for a private free function;
+-- a method's visibility is its implementation's or trait's, never written on
+-- the method. `@tail_recursive` takes a line of its own, so the header line
+-- holds the keyword, the name and the opening bracket (decision 9).
+private pure func emit_function(printer: Printer, function: ParsedFunction, indent: Int, prefix: String) -> Printer:
+    source = printer.source
+    annotated = match function.tail_annotation:
+        Some(_): printer.text("${prefix}@tail_recursive").flush(function.function_name.span.start).newline(indent)
+        None: printer.text(prefix)
+    headed = annotated.emit_signature(function.purity, function.function_name, function.type_parameters, function.parameters, function.return_type, ":", indent)
+    first = body_start(function.statements.get(0).map(pure func(statement) -> Int: statement.statement_start()), function.body)
+    var lines = headed.open_block(source.text.source_level(first), indent + 1, BODY_BLANK_LINES)
+    for statement in function.statements:
+        lines = lines.flush(statement.statement_start()).newline(indent + 1).emit_statement(statement, indent + 1)
+    lines = match function.body:
+        ParsedBuiltinBody(_, label):
+            lines.flush(label.start).newline(indent + 1).text("builtin(${source.written(label)})")
+        ParsedValueBody(value):
+            lines.flush(value.span.start).newline(indent + 1).emit_value(value, WholeValue, StatementLine, indent + 1, 0)
+        ParsedMatchBody(form):
+            lines.flush(form.span.start).newline(indent + 1).emit_match(form, indent + 1)
+    lines.flush_block_end(source.next_code_start(function.body.body_end())).close_block()
+
+
+private pure func method_start(method: ParsedTraitMethod) -> Int:
+    match method:
+        AbstractTraitMethod(_, span): span.start
+        DefaultTraitMethod(function, _): function.start.start
+
+
+private pure func method_end(method: ParsedTraitMethod) -> Int:
+    match method:
+        AbstractTraitMethod(_, span): span.end
+        DefaultTraitMethod(function, _): function.body.body_end()
+
+
+private pure func emit_trait(printer: Printer, declaration: ParsedTrait) -> Printer:
+    source = printer.source
+    supertraits = if declaration.supertraits.is_empty():
+        ""
+    else:
+        ": ${declaration.supertraits.map(pure func(bound: TypeSyntax) -> String: source.type_text(bound)).join(" + ")}"
+    header_end = match declaration.supertraits.last():
+        Some(bound): bound.type_span().end
+        None: declaration.type_name.span.end
+    headed = printer.refusing_comments(HeaderConstruct, declaration.start.start, header_end)
+        .text("${declaration.visibility.visibility_text()}trait ${source.name_text(declaration.type_name)}${supertraits}")
+    match (declaration.methods.get(0), declaration.methods.last()):
+        (Some(first), Some(last)):
+            var methods = headed.text(":").open_block(source.text.source_level(first.method_start()), 1, BODY_BLANK_LINES)
+            for method in declaration.methods:
+                started = methods.flush(method.method_start()).newline(1)
+                methods = match method:
+                    AbstractTraitMethod(header, _):
+                        started.emit_signature(header.purity, header.function_name, header.type_parameters, header.parameters, header.return_type, "", 1)
+                    DefaultTraitMethod(function, _): started.emit_function(function, 1, "")
+            methods.flush_block_end(source.next_code_start(last.method_end())).close_block()
+        _: headed
+
+
+private pure func receiver_text(source: SourceView, receiver: ParsedReceiverHead) -> String:
+    match receiver:
+        ReceiverName(name): source.name_text(name)
+        QualifiedReceiverName(qualified): source.qualified_text(qualified)
+
+
+private pure func emit_implementation(printer: Printer, header: ParsedImplementationHeader, methods: List[ParsedFunction]) -> Printer:
+    source = printer.source
+    trait_name = source.type_text(header.trait_name)
+    receiver = "${source.receiver_text(header.receiver)}${source.type_parameters_text(header.type_parameters)}"
+    headed = printer.refusing_comments(HeaderConstruct, header.start.start, header.span.end)
+        .text("${header.visibility.visibility_text()}implements ${trait_name} for ${receiver}")
+    match (methods.get(0), methods.last()):
+        (Some(first), Some(last)):
+            var written_methods = headed.text(":").open_block(source.text.source_level(first.start.start), 1, BODY_BLANK_LINES)
+            for method in methods:
+                written_methods = written_methods.flush(method.start.start).newline(1).emit_function(method, 1, "")
+            written_methods.flush_block_end(source.next_code_start(last.body.body_end())).close_block()
+        _: headed
+
+
+private pure func fixed_text(fixed: Bool) -> String:
+    if fixed:
+        "fixed "
+    else:
+        ""
+
+
+private pure func variant_end(variant: ParsedVariant) -> Int:
+    match variant.fields.last():
+        Some(field): field.type_span().end
+        None: variant.name.span.end
+
+
+private pure func emit_union(printer: Printer, declaration: ParsedUnion) -> Printer:
+    source = printer.source
+    name = "${source.name_text(declaration.type_name)}${source.type_parameters_text(declaration.type_parameters)}"
+    headed = printer.refusing_comments(HeaderConstruct, declaration.start.start, source.type_parameters_end(declaration.type_name, declaration.type_parameters))
+        .text("${declaration.visibility.visibility_text()}${declaration.fixed.fixed_text()}union ${name}:")
+    first_start = match declaration.variants.get(0):
+        Some(variant): variant.name.span.start
+        None: declaration.type_name.span.end
+    var variants = headed.open_block(source.text.source_level(first_start), 1, BODY_BLANK_LINES)
+    var last_end = declaration.type_name.span.end
+    for variant in declaration.variants:
+        started = variants.flush(variant.name.span.start).newline(1).text(source.name_text(variant.name))
+        variants = if variant.fields.is_empty():
+            started
+        else:
+            fields = variant.fields.map(pure func(field: TypeSyntax) -> ListItem: TextItem(source.type_text(field), field.type_span()))
+            shape: ListShape = {
+                open = "(",
+                close = ")",
+                padded = False,
+                start = variant.name.span.end,
+                closer = source.closer_after(variant.variant_end()),
+                hug = False,
+                trailing_comma = True
+            }
+            started.emit_list(shape, fields, 1, 0)
+        last_end = variant.variant_end()
+    variants.flush_block_end(source.next_code_start(last_end)).close_block()
+
+
+private pure func emit_record(printer: Printer, declaration: ParsedRecord) -> Printer:
+    source = printer.source
+    name = "${source.name_text(declaration.type_name)}${source.type_parameters_text(declaration.type_parameters)}"
+    shape: ListShape = {
+        open = "{",
+        close = "}",
+        padded = True,
+        start = declaration.type_name.span.end,
+        closer = source.parameters_closer(declaration.fields, declaration.type_name.span.end),
+        hug = False,
+        trailing_comma = True
+    }
+    printer.refusing_comments(HeaderConstruct, declaration.start.start, source.type_parameters_end(declaration.type_name, declaration.type_parameters))
+        .text("${declaration.visibility.visibility_text()}${declaration.fixed.fixed_text()}record ${name} ")
+        .emit_list(shape, source.parameter_items(declaration.fields), 0, 0)
+
+
+private pure func constant_head(source: SourceView, declaration: ParsedConstant) -> String:
+    "${declaration.visibility.visibility_text()}${source.name_text(declaration.name)}: ${source.type_text(declaration.type_name)} ="
+
+
+-- Whether a constant prints on one line, which lets a run of them keep the
+-- blank lines it was written with (decision 7). It is the same decision the
+-- layout makes for the constant's value.
+private pure func one_line_constant(source: SourceView, declaration: ParsedConstant) -> Bool:
+    if or(source.starts_with_pipe(declaration.value, WholeValue), source.has_comment(declaration.value.span.start, declaration.value.span.end)):
+        False
+    else:
+        match source.value_text(declaration.value, WholeValue):
+            Ok(value): display_width("${source.constant_head(declaration)} ${value}") <= LINE_WIDTH
+            Err(_): False
+
+
+-- `type Name = builtin`, or `type List[T] = builtin`.
+private pure func builtin_type_text(source: SourceView, declaration: ParsedBuiltinTypeDeclaration) -> String:
+    match declaration.kind:
+        IntegerBuiltin(name) | FloatBuiltin(name) | StringBuiltin(name) | VoidBuiltin(name):
+            "type ${source.name_text(name)} = builtin"
+        ListBuiltin(name, parameter):
+            "type ${source.name_text(name)}[${source.name_text(parameter)}] = builtin"
+
+
+private pure func emit_declaration(printer: Printer, declaration: Declaration) -> Printer:
+    source = printer.source
+    match declaration:
+        BuiltinTypeEntry(entry):
+            last_name = match entry.kind:
+                IntegerBuiltin(name) | FloatBuiltin(name) | StringBuiltin(name) | VoidBuiltin(name): name
+                ListBuiltin(_, parameter): parameter
+            printer.refusing_comments(HeaderConstruct, entry.start.start, last_name.span.end).text(source.builtin_type_text(entry))
+        FunctionEntry(FreeFunction(function)): printer.emit_function(function, 0, function.visibility.visibility_text())
+        FunctionEntry(ImplementationGroup(header, methods)): printer.emit_implementation(header, methods)
+        TraitEntry(entry): printer.emit_trait(entry)
+        UnionEntry(entry): printer.emit_union(entry)
+        RecordEntry(entry): printer.emit_record(entry)
+        OpaqueEntry(entry):
+            name = "${source.name_text(entry.type_name)}${source.type_parameters_text(entry.type_parameters)}"
+            printer.refusing_comments(HeaderConstruct, entry.start.start, entry.underlying.type_span().end)
+                .text("${entry.visibility.visibility_text()}opaque type ${name} = ${source.type_text(entry.underlying)}")
+        ConstantEntry(entry):
+            printer.refusing_comments(HeaderConstruct, entry.start.start, source.operator_before(entry.value)).text(source.constant_head(entry)).emit_initializer(entry.value, 0)
+
+
+-- An import row and the comments that move with it when the rows sort.
+private record ImportRow {
+    row: ParsedImport,
+    path: String,
+    above: List[Trivia],
+    inside: List[Trivia]
+}
+
+
+-- The path as written: `./`, one `../` per parent, or nothing for a library
+-- module, then its parts. The parts are interned without spans, so they are
+-- spelled from the name table, which a missing spelling means is corrupt.
+private pure func import_path(names: NameTable, row: ParsedImport) -> Result[String, Diagnostic]:
+    var parts: List[String] = []
+    var missing: Bool = False
+    for part in row.path.parts:
+        match names.name_spelling(part):
+            Some(spelling): parts = parts.append(spelling)
+            None: missing = True
+    prefix = match row.path.origin:
+        LibraryImport: ""
+        RelativeImport(parents):
+            if parents == 0:
+                "./"
+            else:
+                var written_prefix = ""
+                for _ in 0..parents:
+                    written_prefix = written_prefix + "../"
+                written_prefix
+    if missing:
+        Err(internal_error(row.span, "an import path part has no spelling in the module's name table"))
+    else:
+        Ok(prefix + parts.join("/"))
+
+
+-- Each import row with its spelled path, in written order.
+private pure func import_rows(contents: ParsedModuleContents) -> Result[List[ImportRow], Diagnostic]:
+    var rows: List[ImportRow] = []
+    var failure: Option[Diagnostic] = None
+    for row in contents.imports:
+        match contents.names.import_path(row):
+            Ok(path): rows = rows.append({ row = row, path = path, above = [], inside = [] })
+            Err(error):
+                failure = Some(error)
+                break
+    match failure:
+        Some(error): Err(error)
+        None: Ok(rows)
+
+
+private pure func is_library(row: ParsedImport) -> Bool:
+    match row.path.origin:
+        LibraryImport: True
+        RelativeImport(_): False
+
+
+private pure func byte_order_before(left: String, right: String) -> Bool:
+    var position = 0
+    var decided: Option[Bool] = None
+    while decided.is_none():
+        decided = match (left.byte_at(position), right.byte_at(position)):
+            (Some(first), Some(second)):
+                if first == second:
+                    None
+                else:
+                    Some(first < second)
+            (None, Some(_)): Some(True)
+            (_, None): Some(False)
+        position = position + 1
+    decided.get_or(False)
+
+
+-- Library modules, then relative paths, each in byte order (decision 3).
+private pure func sorts_before(left: ImportRow, right: ImportRow) -> Bool:
+    if left.row.is_library() != right.row.is_library():
+        left.row.is_library()
+    else:
+        byte_order_before(left.path, right.path)
+
+
+-- Insertion sort: an import block has tens of rows, and the sort is stable.
+private pure func sorted_rows(rows: List[ImportRow]) -> List[ImportRow]:
+    var sorted: List[ImportRow] = []
+    for row in rows:
+        var position = sorted.length()
+        var moving: Bool = True
+        while and(moving, position > 0):
+            moving = match sorted.get(position - 1):
+                Some(previous): row.sorts_before(previous)
+                None: False
+            if moving:
+                position = position - 1
+        sorted = sorted.take(position).append(row).concat(sorted.drop(position))
+    sorted
+
+
+-- The trivia of the import block, from the block's first row to the first
+-- comment at column 1 after its last row, or the first declaration.
+private pure func import_region_end(source: SourceView, region_start: Int, last_row_end: Int, first_declaration: Int) -> Int:
+    var position = region_start
+    var end: Option[Int] = None
+    while end.is_none():
+        match source.trivia.get(position):
+            Some(item):
+                start = item.trivia_start()
+                leaves: Bool = match item:
+                    OwnLineComment(_, level): and(level == 0, start >= last_row_end)
+                    DocumentationBlock(_): start >= last_row_end
+                    TrailingComment(_) | BlankLine(_): False
+                if or(start >= first_declaration, leaves):
+                    end = Some(position)
+                else:
+                    position = position + 1
+            None: end = Some(position)
+    end.get_or(region_start)
+
+
+-- The index of the row, in written order, that holds or precedes `offset`.
+private pure func row_at(rows: List[ImportRow], offset: Int) -> Option[Int]:
+    var found: Option[Int] = None
+    var position = 0
+    for entry in rows:
+        if entry.row.span.start <= offset:
+            found = Some(position)
+        position = position + 1
+    found
+
+
+private pure func with_moved(rows: List[ImportRow], index: Int, item: Trivia, above: Bool) -> List[ImportRow]:
+    match rows.get(index):
+        Some(entry):
+            moved = if above:
+                { entry | above = entry.above.append(item) }
+            else:
+                { entry | inside = entry.inside.append(item) }
+            rows.set(index, moved)
+        None: rows
+
+
+-- The import block's rows with their comments (FORMATTER_PLAN.md, "Imports"):
+-- a comment on a row's line, inside the row, or directly above it with no
+-- blank line between moves with the row; every other comment stays at the
+-- top of the block, and blank lines inside the block go.
+private record ImportBlock {
+    header_comment: List[Trivia],
+    top: List[Trivia],
+    rows: List[ImportRow]
+}
+
+
+private pure func import_block(rows: List[ImportRow], items: List[Trivia]) -> ImportBlock:
+    var block: ImportBlock = { header_comment = [], top = [], rows = rows }
+    var position = 0
+    for item in items:
+        start = item.trivia_start()
+        containing = rows.row_at(start)
+        block = match item:
+            BlankLine(_): block
+            TrailingComment(_):
+                match containing:
+                    Some(index): { block | rows = block.rows.with_moved(index, item, False) }
+                    None: { block | header_comment = block.header_comment.append(item) }
+            OwnLineComment(_, _) | DocumentationBlock(_):
+                inside_row: Option[Int] = match containing:
+                    Some(index):
+                        match rows.get(index):
+                            Some(entry):
+                                if start < entry.row.span.end:
+                                    Some(index)
+                                else:
+                                    None
+                            None: None
+                    None: None
+                match inside_row:
+                    Some(index): { block | rows = block.rows.with_moved(index, item, False) }
+                    None:
+                        match items.drop(position + 1).directly_above(rows, start):
+                            Some(index): { block | rows = block.rows.with_moved(index, item, True) }
+                            None: { block | top = block.top.append(item) }
+        position = position + 1
+    block
+
+
+-- The row a comment at `offset` sits directly above: the next row, when only
+-- comments lie between them.
+private pure func directly_above(following: List[Trivia], rows: List[ImportRow], offset: Int) -> Option[Int]:
+    var next_row: Option[Int] = None
+    var position = 0
+    for entry in rows:
+        if and(next_row.is_none(), entry.row.span.start > offset):
+            next_row = Some(position)
+        position = position + 1
+    match next_row:
+        None: None
+        Some(index):
+            row_start = match rows.get(index):
+                Some(entry): entry.row.span.start
+                None: offset
+            var only_comments: Bool = True
+            for item in following:
+                if item.trivia_start() < row_start:
+                    match item:
+                        OwnLineComment(_, _): void
+                        _: only_comments = False
+            if only_comments:
+                Some(index)
+            else:
+                None
+
+
+private pure func selection_text(source: SourceView, selection: ImportSelection) -> String:
+    match selection:
+        NamedSelection(name): source.name_text(name)
+        MethodsSelection(name, _): "${source.name_text(name)} methods"
+        ConstructorSelection(name, constructors):
+            "${source.name_text(name)}(${constructors.map(pure func(constructor: WrittenName) -> String: source.name_text(constructor)).join(", ")})"
+
+
+private pure func emit_selection(printer: Printer, selection: ImportSelection, indent: Int) -> Printer:
+    source = printer.source
+    match selection:
+        ConstructorSelection(name, constructors):
+            closer = match constructors.last():
+                Some(constructor): source.closer_after(constructor.span.end)
+                None: name.span.end
+            shape: ListShape = { open = "(", close = ")", padded = False, start = name.span.end, closer = closer, hug = False, trailing_comma = True }
+            items = constructors.map(pure func(constructor: WrittenName) -> ListItem: TextItem(source.name_text(constructor), constructor.span))
+            printer.text(source.name_text(name)).emit_list(shape, items, indent, 1)
+        _: printer.text(source.selection_text(selection))
+
+
+-- `path: selections` on one line when it fits and holds no comment;
+-- otherwise one selection per line below the path, each with a trailing
+-- comma, as `selection_line` allows.
+private pure func emit_import_row(printer: Printer, entry: ImportRow) -> Printer:
+    source = printer.source
+    alias_text = match entry.row.module_alias:
+        Some(name): " as ${source.name_text(name)}"
+        None: ""
+    head = "${entry.path}${alias_text}"
+    if entry.row.symbols.is_empty():
+        printer.text(head)
+    else:
+        one_line = "${head}: ${entry.row.symbols.map(pure func(selection: ImportSelection) -> String: source.selection_text(selection)).join(", ")}"
+        if and(source.has_comment(entry.row.span.start, entry.row.span.end).not(), printer.fits(one_line, 0)):
+            printer.text(one_line)
+        else:
+            first_start = match entry.row.symbols.get(0):
+                Some(selection): selection.selection_name().span.start
+                None: entry.row.span.end
+            var lines = printer.text("${head}:").open_block(source.block_level(first_start), 2, 0)
+            for selection in entry.row.symbols:
+                lines = lines.flush(selection.selection_name().span.start).newline(2).emit_selection(selection, 2).text(",")
+            lines.close_block()
+
+
+-- The import blocks as one block of sorted rows. Leading comments above the
+-- `import:` line stay above it.
+private pure func emit_imports(printer: Printer, rows: List[ImportRow], first_declaration: Int) -> Printer:
+    source = printer.source
+    var last_row_end = 0
+    for entry in rows:
+        last_row_end = last_row_end.max(entry.row.span.end)
+    keyword = source.next_code_start(0)
+    leading = printer.flush_top_level(keyword, 0, TOP_LEVEL_BLANK_LINES)
+    region_start = leading.next_trivia
+    region_end = source.import_region_end(region_start, last_row_end, first_declaration)
+    block = rows.import_block(source.trivia.drop(region_start).take(region_end - region_start))
+    end_of_source = source.text.length() + 1
+    var written_block = leading.newline(0).text("import:")
+        .with_trivia(block.header_comment).flush(end_of_source)
+        .open_block(1, 1, 0)
+        .with_trivia(block.top).flush(end_of_source)
+    for entry in block.rows.sorted_rows():
+        above = written_block.with_trivia(entry.above).flush(end_of_source)
+        written_block = above.newline(1).with_trivia(entry.inside).emit_import_row(entry).flush(end_of_source)
+    written_block.close_block().with_source(source, region_end)
+
+
+private pure func emit_module(printer: Printer, contents: ParsedModuleContents, rows: List[ImportRow]) -> Printer:
+    source = printer.source
+    declarations = contents.written_declarations()
+    first_declaration = match declarations.get(0):
+        Some(declaration): declaration.declaration_start()
+        None: source.text.length()
+    var written_module = if rows.is_empty():
+        printer
+    else:
+        printer.emit_imports(rows, first_declaration)
+    -- The first declaration sits two blank lines below the imports, or at the
+    -- top of the file.
+    first_separation = if rows.is_empty():
+        0
+    else:
+        TOP_LEVEL_BLANK_LINES
+    var previous: Option[Declaration] = None
+    for declaration in declarations:
+        start = declaration.declaration_start()
+        spaced = match previous:
+            None: written_module.flush_top_level(start, first_separation, TOP_LEVEL_BLANK_LINES)
+            Some(earlier):
+                written_blank_lines = written_module.blank_lines_before(start)
+                in_constant_run: Bool = match (earlier, declaration):
+                    (ConstantEntry(first), ConstantEntry(second)):
+                        and(written_blank_lines <= BODY_BLANK_LINES, and(source.one_line_constant(first), source.one_line_constant(second)))
+                    _: False
+                if in_constant_run:
+                    written_module.flush_top_level(start, written_blank_lines, BODY_BLANK_LINES)
+                else:
+                    written_module.flush_top_level(start, TOP_LEVEL_BLANK_LINES, TOP_LEVEL_BLANK_LINES)
+        written_module = spaced.newline(0).emit_declaration(declaration)
+        previous = Some(declaration)
+    written_module
+
+
+-- The 1-based number of the first line where `formatted` differs from
+-- `original`, which `--check` reports.
+pure func first_changed_line(original: String, formatted: String) -> Int:
+    var line = 1
+    var cursor = 0
+    while and(cursor < original.length(), original.byte_at(cursor) == formatted.byte_at(cursor)):
+        if original.byte_at(cursor) == Some(LINE_FEED_BYTE):
+            line = line + 1
+        cursor = cursor + 1
+    line
+
+
+-- The canonical layout of one source file, or the parser's diagnostic. The
+-- file is lexed and parsed alone, so it need not type-check; every fact the
+-- tree lacks comes from the source by position (FORMATTER_PLAN.md,
+-- "Architecture").
+pure func format_source(source: String) -> Result[String, Diagnostic]:
+    origin = module_source(root_module_id())
+    lexed ?= lex(origin, source, program_names().names)
+    parsed ?= parse_module(lexed, root_module_id())
+    trivia ?= source_trivia(origin, source, lexed.tokens)
+    contents = module_contents(parsed)
+    rows ?= contents.import_rows()
+    view: SourceView = { text = source, tokens = lexed.tokens, trivia = trivia }
+    match new_printer(view).emit_module(contents, rows).finished():
+        Ok(formatted): Ok(formatted)
+        Err(fault): Err(fault.fault_diagnostic(origin))
+
+
+-- What stopped the layout. A comment inside a construct that never breaks is
+-- a limit of the formatter, reported to the user at the comment; anything
+-- else breaks one of its own invariants, an internal error. Either way the
+-- file is left unchanged.
+private pure func fault_diagnostic(fault: FormatFault, origin: SourceId) -> Diagnostic:
+    match fault:
+        CommentInUnbreakable(construct, span):
+            what = match construct:
+                PatternConstruct: "a pattern"
+                TypeConstruct: "a type"
+                HeaderConstruct: "a declaration's header line"
+            diagnostic(span, "the formatter cannot keep a comment inside ${what}", UNBREAKABLE_HELP)
+        CodeAfterComment(at):
+            internal_error({ source = origin, start = at, end = at + 1 }, "the formatter cannot keep this comment where it is written; the file was left unchanged")
+        PipeStringAfterCode(at):
+            internal_error({ source = origin, start = at, end = at + 1 }, "the formatter would start this pipe String after other code on its line; the file was left unchanged")
+
+
+private UNBREAKABLE_HELP: String = "move this comment above the line; the formatter keeps comments only between items it can break, and left the file unchanged"

@@ -2,9 +2,11 @@ import:
 	./check/check: check
 	./check/render: render_failure
 	./emit/emit: emit
-	fs: describe, write_text
+	./format/format: first_changed_line, format_source
+	fs: describe, read_text, write_text
 	int: Int methods
-	io: print_error
+	io: print, print_error
+	list: List methods
 	./load/load: LoadedProgram, LoadFailure, SourceFile, SourceInputs, load_program, load_test_program
 	./lower/lower: lower
 	./own/own: own
@@ -137,13 +139,65 @@ func main(args: List[String]) -> Int:
 				Some(output_path): root_path.load_test_program(later_and_output.take(later_and_output.length() - 1), library_root).compile_loaded(output_path)
 		[_, "--library-root", library_root, input_path, output_path]:
 			input_path.load_program(library_root).compile_loaded(output_path)
+		[_, "--format", ...paths]: paths.format_files(FormatInPlace)
+		[_, "--check", ...paths]: paths.format_files(ReportUnformatted)
 		_:
 			usage_error()
 
 
 private func usage_error() -> Int:
-	print_error("blorp: error: expected a library root, input and output paths\nhelp: run blorp --library-root DIRECTORY INPUT.brp OUTPUT.c, or --library-root DIRECTORY --test-suite SUITE.brp [SUITE.brp ...] OUTPUT.c")
+	print_error("blorp: error: expected a library root, input and output paths, or a formatting mode and source files\nhelp: run blorp --library-root DIRECTORY INPUT.brp OUTPUT.c, or --library-root DIRECTORY --test-suite SUITE.brp [SUITE.brp ...] OUTPUT.c; run blorp --format FILE.brp [FILE.brp ...] to rewrite files in the canonical layout, or --check FILE.brp [FILE.brp ...] to list the files it would change")
 	1
+
+
+-- What the formatter does with a file whose layout is not canonical.
+private union FormatMode:
+	FormatInPlace
+	ReportUnformatted
+
+
+-- Formats one source file: 0 when it needed nothing or was rewritten, 1 when it
+-- could not be read, parsed or written, or `--check` found it unformatted. An
+-- unparsable file prints the parser's diagnostic and is left untouched.
+private func format_file(path: String, mode: FormatMode) -> Int:
+	match path.read_text():
+		Err(error):
+			print_error("blorp: error: could not read ${error.describe()}\nhelp: pass each .brp source file to format by its path; directories are not searched")
+			1
+		Ok(original):
+			match original.format_source():
+				Err(diagnostic):
+					sources: SourceInputs = { modules = [{ path = path, contents = original }] }
+					sources.render_diagnostics(diagnostic.singleton_diagnostic()).print_error()
+					1
+				Ok(formatted):
+					if formatted == original:
+						0
+					else:
+						match mode:
+							-- write_text replaces the file atomically, as `publish` does.
+							FormatInPlace:
+								match path.write_text(formatted):
+									Err(error):
+										print_error("blorp: error: could not write ${error.describe()}\nhelp: make the source file writable, then format it again")
+										1
+									Ok(_):
+										0
+							ReportUnformatted:
+								print("${path}:${first_changed_line(original, formatted).to_string()}: would reformat")
+								1
+
+
+-- Every file is processed, whatever happens to the others.
+private func format_files(paths: List[String], mode: FormatMode) -> Int:
+	if paths.is_empty():
+		usage_error()
+	else:
+		var status: Int = 0
+		for path in paths:
+			if path.format_file(mode) != 0:
+				status = 1
+		status
 
 
 -- write_text replaces the output atomically, so a failed or interrupted

@@ -1,0 +1,1001 @@
+import:
+    ../utils/syntax:
+        ArithmeticOperator(AddOperator, SubtractOperator, MultiplyOperator, DivideOperator, RemainderOperator),
+        ElseBranch(ElseIf, ElseBlock),
+        ExpressionBase(
+            DirectApplication, QualifiedApplication, OpaqueWrap, OpaqueUnwrap, ListExpression, TupleExpression,
+            RangeExpression, ComparisonExpression, ArithmeticExpression, NegationExpression, IfExpression,
+            MatchExpression, LambdaExpression, RecordExpression, RecordUpdateExpression, DictExpression,
+            StringExpression, InterpolatedString,
+        ),
+        ForBinder(SingleForBinder, TupleForBinder),
+        Keyword(ElseKeyword),
+        LambdaBody(InlineBody, BlockBody),
+        LambdaParameter,
+        ParsedBinder(NamedBinder, DiscardBinder),
+        ParsedBlock,
+        ParsedDictEntry,
+        ParsedIf,
+        ParsedLambda,
+        ParsedMatch,
+        ParsedMatchArm,
+        ParsedRecordField,
+        ParsedStatement(BindingStatement, TupleBinding, PropagatingBinding, ExpressionStatement, WhileLoop, ForLoop, Break, Continue),
+        PostfixOperation(ReceiverInvocation, FieldAccess, TupleIndex),
+        ReceiverApplication,
+        Span,
+        Symbol(Colon),
+        pattern_span,
+        TokenKind(KeywordToken, SymbolToken),
+        TypeSyntax,
+        ValueExpression,
+        type_span,
+    ./flat:
+        NoFlatForm(HoldsBlock, HoldsComment, HoldsPipeString),
+        Placement(WholeValue, PartValue),
+        application_end, application_text, field_text, arithmetic_text, base_text, binder_text, closing_count, comparison_text,
+        is_pipe_string, joined, kept_parentheses, wraps_whole, lambda_header_text, lambda_parameter_text, name_text,
+        negation_prefix, pattern_text, purity_text, qualified_text, repeated, returned_text, type_text, value_text,
+    ./printer:
+        BODY_BLANK_LINES,
+        FormatFault(PipeStringAfterCode),
+        UnbreakableConstruct(PatternConstruct, TypeConstruct, HeaderConstruct),
+        INDENT_WIDTH,
+        Printer,
+        SourceView,
+        close_block, closer_after, column, faulted, fits, flush, flush_block_end, has_comment, line_open, newline, refusing_comments,
+        newline_without_blank, next_code_start, open_block, split_lines, text, token_before, written,
+    ./trivia: SPACE_BYTE, TAB_BYTE, first_on_line, source_level
+    bool: and, not, or
+    int: Int methods
+    list: List methods
+    option: Option methods
+    result: Result methods
+    string: String methods
+
+
+-- Where a value's line stands, which decides where a method chain may break.
+union LineContext:
+    -- A statement outside brackets: a broken chain continues one level deeper.
+    StatementLine
+    -- A block header outside brackets: the value must end on the header's
+    -- line, so a chain there does not break.
+    HeaderLine
+    -- Inside brackets, where a line break is trivia.
+    InBrackets
+
+
+-- One item of a bracketed, comma-separated list.
+union ListItem:
+    ValueItem(ValueExpression, Placement)
+    FieldItem(ParsedRecordField)
+    EntryItem(ParsedDictEntry)
+    -- An item with only a one-line form, such as a parameter or a type, and
+    -- its source: a comment inside it has no line to go to.
+    TextItem(String, Span)
+
+
+-- A bracketed list: its brackets, whether a space pads them on one line (as
+-- record braces are), where its comments may start, where its closing
+-- bracket starts, whether a final literal or block lambda may hug the
+-- opening line (decision 5), and whether its grammar admits a trailing comma:
+-- an opaque conversion's one value does not.
+record ListShape {
+    open: String,
+    close: String,
+    padded: Bool,
+    start: Int,
+    closer: Int,
+    hug: Bool,
+    trailing_comma: Bool
+}
+
+
+private pure func item_end(item: ListItem) -> Int:
+    match item:
+        ValueItem(value, _): value.span.end
+        FieldItem(field): field.value.span.end
+        EntryItem(entry): entry.value.span.end
+        TextItem(_, span): span.end
+
+
+private pure func item_start(item: ListItem) -> Int:
+    match item:
+        ValueItem(value, _): value.span.start
+        FieldItem(field): field.name.span.start
+        EntryItem(entry): entry.key.span.start
+        TextItem(_, span): span.start
+
+
+private pure func item_text(source: SourceView, item: ListItem) -> Result[String, NoFlatForm]:
+    match item:
+        ValueItem(value, placement): source.value_text(value, placement)
+        FieldItem(field): source.field_text(field)
+        EntryItem(entry): [source.value_text(entry.key, PartValue), source.value_text(entry.value, WholeValue)].joined(" => ")
+        TextItem(written_text, _): Ok(written_text)
+
+
+-- Whether an item's last line is a block's or a pipe String's, which nothing
+-- may follow on that line.
+private pure func item_ends_line(source: SourceView, item: ListItem) -> Bool:
+    match item:
+        ValueItem(value, placement): source.ends_line(value, placement)
+        FieldItem(field): source.ends_line(field.value, WholeValue)
+        EntryItem(entry): source.ends_line(entry.value, WholeValue)
+        TextItem(_, _): False
+
+
+-- Whether nothing may follow `value` on its last line: it ends with a block
+-- or a pipe String. Only a right operand can carry the ending further, so the
+-- walk is a loop down the right side.
+pure func ends_line(source: SourceView, value: ValueExpression, placement: Placement) -> Bool:
+    var current = value
+    var current_placement = placement
+    var answer: Option[Bool] = None
+    while answer.is_none():
+        if or(current.kept_parentheses(current_placement).is_empty().not(), current.applications.is_empty().not()):
+            answer = Some(False)
+        else:
+            match current.base:
+                IfExpression(_) | MatchExpression(_): answer = Some(True)
+                LambdaExpression(lambda):
+                    match lambda.body:
+                        BlockBody(_): answer = Some(True)
+                        InlineBody(body):
+                            current = body
+                            current_placement = WholeValue
+                StringExpression(_) | InterpolatedString(_): answer = Some(source.is_pipe_string(current.base_span))
+                -- A whole value's operator chain that ends a line cannot be
+                -- flat, so it breaks inside added parentheses, which end it.
+                ComparisonExpression(_, _, _, right) | ArithmeticExpression(_, _, _, right):
+                    match current_placement:
+                        WholeValue: answer = Some(False)
+                        PartValue:
+                            current = right
+                RangeExpression(_, right):
+                    current = right
+                    current_placement = PartValue
+                NegationExpression(_, operand):
+                    current = operand
+                    current_placement = PartValue
+                _: answer = Some(False)
+    answer.get_or(False)
+
+
+-- Whether `value` starts with a pipe String, which must begin its own line.
+-- Only a left operand carries the start, so the walk is a loop down the left
+-- side, as long as a sum's.
+pure func starts_with_pipe(source: SourceView, value: ValueExpression, placement: Placement) -> Bool:
+    var current = value
+    var current_placement = placement
+    var answer: Option[Bool] = None
+    while answer.is_none():
+        if current.kept_parentheses(current_placement).is_empty().not():
+            answer = Some(False)
+        else:
+            match current.base:
+                StringExpression(_) | InterpolatedString(_): answer = Some(source.is_pipe_string(current.base_span))
+                ComparisonExpression(_, _, left, _) | ArithmeticExpression(_, _, left, _) | RangeExpression(left, _):
+                    current = left
+                    current_placement = PartValue
+                _: answer = Some(False)
+    answer.get_or(False)
+
+
+private pure func emit_item(printer: Printer, item: ListItem, indent: Int, reserve: Int) -> Printer:
+    match item:
+        ValueItem(value, placement): printer.emit_value(value, placement, InBrackets, indent, reserve)
+        FieldItem(field):
+            named = printer.text("${printer.source.name_text(field.name)} =")
+            named.emit_bracketed_initializer(field.value, indent, reserve)
+        EntryItem(entry):
+            keyed = printer.emit_value(entry.key, PartValue, InBrackets, indent, 0).text(" =>")
+            keyed.emit_bracketed_initializer(entry.value, indent, reserve)
+        TextItem(written_text, span): printer.refusing_comments(TypeConstruct, span.start, span.end).text(written_text)
+
+
+-- A field's or entry's value after its `=` or `=>`. Inside brackets the value
+-- may start the next line, as a pipe String must, and as it does after a
+-- comment written between the operator and the value.
+private pure func emit_bracketed_initializer(printer: Printer, value: ValueExpression, indent: Int, reserve: Int) -> Printer:
+    flushed = printer.flush(value.span.start)
+    if or(printer.source.starts_with_pipe(value, WholeValue), flushed.line_open().not()):
+        flushed.newline(indent + 1).emit_value(value, WholeValue, InBrackets, indent + 1, reserve)
+    else:
+        flushed.text(" ").emit_value(value, WholeValue, InBrackets, indent, reserve)
+
+
+-- A final List or record literal, or a block lambda: the items that hug the
+-- line that opens their list.
+private pure func hugged_opening(source: SourceView, item: ListItem) -> Option[String]:
+    match item:
+        ValueItem(value, placement):
+            if and(value.applications.is_empty(), value.kept_parentheses(placement).is_empty()):
+                match value.base:
+                    ListExpression(elements):
+                        if elements.is_empty():
+                            None
+                        else:
+                            Some("[")
+                    RecordExpression(_): Some("{")
+                    LambdaExpression(lambda):
+                        match lambda.body:
+                            BlockBody(_): Some(source.lambda_header_text(lambda))
+                            InlineBody(_): None
+                    _: None
+            else:
+                None
+        _: None
+
+
+-- What hugging the last item writes on the opening line: the opening bracket
+-- and the other items, then the hugged item's own opening.
+private record HugLine {
+    before: String,
+    opening: String
+}
+
+
+-- The opening line of a list that hugs its last item, or None when it cannot
+-- hug: its last item is not a literal or block lambda, an earlier item has no
+-- one-line form, or a comment lies before the last item.
+private pure func hug_line(source: SourceView, shape: ListShape, items: List[ListItem]) -> Option[HugLine]:
+    match items.last():
+        None: None
+        Some(last):
+            match source.hugged_opening(last):
+                None: None
+                Some(opening):
+                    earlier = items.take(items.length() - 1).map(pure func(item: ListItem) -> Result[String, NoFlatForm]: source.item_text(item)).joined(", ")
+                    match earlier:
+                        Err(_): None
+                        Ok(listed):
+                            -- A comment before the last item, or between it and
+                            -- the closer, needs the broken form's lines.
+                            if or(source.has_comment(shape.start, last.item_start()), source.has_comment(last.item_end(), shape.closer)):
+                                None
+                            else if listed.length() == 0:
+                                Some({ before = shape.open, opening = opening })
+                            else:
+                                Some({ before = "${shape.open}${listed}, ", opening = opening })
+
+
+-- A list on one line when it fits and holds no comment; otherwise hugging its
+-- last item, when the shape allows it and the opening line fits; otherwise
+-- one item per line, each with a trailing comma (decision 4).
+pure func emit_list(printer: Printer, shape: ListShape, items: List[ListItem], indent: Int, reserve: Int) -> Printer:
+    source = printer.source
+    flat = items.map(pure func(item: ListItem) -> Result[String, NoFlatForm]: source.item_text(item)).joined(", ")
+    padding = if and(shape.padded, items.is_empty().not()):
+        " "
+    else:
+        ""
+    one_line: Option[String] = match flat:
+        Ok(listed):
+            if source.has_comment(shape.start, shape.closer):
+                None
+            else:
+                Some("${shape.open}${padding}${listed}${padding}${shape.close}")
+        Err(_): None
+    match one_line:
+        Some(line):
+            -- An empty pair has nothing to break onto lines of its own.
+            if or(printer.fits(line, reserve), items.is_empty()):
+                printer.text(line)
+            else:
+                printer.emit_hugged_or_broken(shape, items, indent, reserve)
+        None: printer.emit_hugged_or_broken(shape, items, indent, reserve)
+
+
+private pure func emit_hugged_or_broken(printer: Printer, shape: ListShape, items: List[ListItem], indent: Int, reserve: Int) -> Printer:
+    line: Option[HugLine] = if shape.hug:
+        printer.source.hug_line(shape, items)
+    else:
+        None
+    match (line, items.last()):
+        (Some(hugged), Some(last)):
+            if printer.fits("${hugged.before}${hugged.opening}", 0):
+                opened = printer.text(hugged.before).emit_item(last, indent, reserve + shape.close.length())
+                if printer.source.item_ends_line(last):
+                    opened.flush(shape.closer).newline_without_blank(indent).text(shape.close)
+                else:
+                    opened.text(shape.close)
+            else:
+                printer.emit_broken_list(shape, items, indent)
+        _: printer.emit_broken_list(shape, items, indent)
+
+
+-- One item per line, each with a trailing comma, then the closing bracket on
+-- its own line. An item whose last line ends a block or a pipe String cannot
+-- carry its comma there: a final one has none, and an earlier one has its
+-- comma on the next line.
+pure func emit_broken_list(printer: Printer, shape: ListShape, items: List[ListItem], indent: Int) -> Printer:
+    var written_items = printer.text(shape.open).open_block(0, indent + 1, BODY_BLANK_LINES)
+    var position = 0
+    for item in items:
+        flushed = written_items.flush(item.item_start())
+        started = if position == 0:
+            flushed.newline_without_blank(indent + 1)
+        else:
+            flushed.newline(indent + 1)
+        emitted = started.emit_item(item, indent + 1, 1)
+        last = position + 1 == items.length()
+        written_items = if and(last, shape.trailing_comma.not()):
+            emitted
+        else if printer.source.item_ends_line(item):
+            if last:
+                emitted
+            else:
+                emitted.newline_without_blank(indent + 1).text(",")
+        else:
+            emitted.text(",")
+        position = position + 1
+    written_items.flush(shape.closer).close_block().newline_without_blank(indent).text(shape.close)
+
+
+private pure func value_items(values: List[ValueExpression], placement: Placement) -> List[ListItem]:
+    values.map(pure func(value: ValueExpression) -> ListItem: ValueItem(value, placement))
+
+
+-- A call's arguments: the list ends at the call's closing parenthesis, the
+-- last byte of `span`.
+private pure func emit_arguments(printer: Printer, arguments: List[ListItem], span: Span, indent: Int, reserve: Int) -> Printer:
+    shape: ListShape = { open = "(", close = ")", padded = False, start = span.start, closer = span.end - 1, hug = True, trailing_comma = True }
+    printer.emit_list(shape, arguments, indent, reserve)
+
+
+-- `value` where it stands, flat when that fits and it holds no comment,
+-- otherwise broken by its own rule (FORMATTER_PLAN.md, "Layout engine").
+pure func emit_value(printer: Printer, value: ValueExpression, placement: Placement, context: LineContext, indent: Int, reserve: Int) -> Printer:
+    source = printer.source
+    flat: Result[String, NoFlatForm] = if source.has_comment(value.span.start, value.span.end):
+        Err(HoldsComment)
+    else:
+        source.value_text(value, placement)
+    match flat:
+        Ok(line):
+            if printer.fits(line, reserve):
+                printer.text(line)
+            else:
+                printer.emit_broken(value, placement, context, indent, reserve)
+        Err(_): printer.emit_broken(value, placement, context, indent, reserve)
+
+
+-- Whether a value is an operator chain the formatter may break: a sum,
+-- product or comparison with nothing applied to it.
+private pure func is_operator_chain(value: ValueExpression) -> Bool:
+    match value.base:
+        ArithmeticExpression(_, _, _, _) | ComparisonExpression(_, _, _, _): value.applications.is_empty()
+        _: False
+
+
+private pure func emit_broken(printer: Printer, value: ValueExpression, placement: Placement, context: LineContext, indent: Int, reserve: Int) -> Printer:
+    pairs = value.kept_parentheses(placement)
+    whole = pairs.filter(pure func(pair: Span) -> Bool: pair.wraps_whole(value))
+    inner: ValueExpression = { value | parentheses = pairs.filter(pure func(pair: Span) -> Bool: pair.wraps_whole(value).not()) }
+    match whole.last():
+        Some(innermost):
+            -- Written parentheses around the whole value, kept where it stands:
+            -- inside them a line break is trivia.
+            count = whole.length()
+            if and(inner.is_operator_chain(), inner.parentheses.is_empty()):
+                printer.text("(".repeated(count - 1))
+                    .emit_parenthesized_chain(inner, indent, Some(innermost.end - 1))
+                    .text(")".repeated(count - 1))
+            else:
+                opened = printer.text("(".repeated(count)).emit_value(inner, PartValue, InBrackets, indent, reserve + count)
+                closing = if printer.source.ends_line(inner, PartValue):
+                    opened.flush(innermost.end - 1).newline_without_blank(indent)
+                else:
+                    opened
+                closing.text(")".repeated(count))
+        None:
+            if value.is_operator_chain():
+                match placement:
+                    WholeValue: printer.emit_parenthesized_chain(value, indent, None)
+                    PartValue: printer.emit_unbroken_chain(value, context, indent, reserve)
+            else if value.applications.is_empty():
+                printer.emit_base(value, context, indent, reserve)
+            else:
+                printer.emit_postfix_chain(value, pairs, context, indent, reserve)
+
+
+-- One operand of a broken operator chain, with the operator before it.
+private record ChainOperand {
+    operator: Option[(String, Span)],
+    value: ValueExpression
+}
+
+
+private pure func additive(operator: ArithmeticOperator) -> Bool:
+    match operator:
+        AddOperator | SubtractOperator: True
+        MultiplyOperator | DivideOperator | RemainderOperator: False
+
+
+-- The operands of the outermost chain of `value`: the operators of one
+-- precedence level, left to right. Only that chain breaks; its operands stay
+-- whole. The left spine is walked in a loop, as long as a sum.
+private pure func chain_operands(value: ValueExpression) -> List[ChainOperand]:
+    match value.base:
+        ComparisonExpression(operator, token, left, right):
+            [{ operator = None, value = left }, { operator = Some((operator.comparison_text(), token)), value = right }]
+        ArithmeticExpression(top, _, _, _):
+            level = top.additive()
+            var rights: List[ChainOperand] = []
+            var current = value
+            var walking: Bool = True
+            while walking:
+                walking = False
+                match current.base:
+                    ArithmeticExpression(operator, token, left, right):
+                        if operator.additive() == level:
+                            rights = rights.append({ operator = Some((operator.arithmetic_text(), token)), value = right })
+                            same_level: Bool = match left.base:
+                                ArithmeticExpression(next, _, _, _): and(next.additive() == level, and(left.applications.is_empty(), left.parentheses.is_empty()))
+                                _: False
+                            if same_level:
+                                current = left
+                                walking = True
+                            else:
+                                rights = rights.append({ operator = None, value = left })
+                    _: void
+            rights.reverse()
+        _: [{ operator = None, value = value }]
+
+
+-- A chain broken inside parentheses, one operand per line with its operator
+-- first (FORMATTER_PLAN.md, "Layout engine"). `closer` is the written closing
+-- parenthesis, whose comments come before it; added parentheses have none.
+private pure func emit_parenthesized_chain(printer: Printer, chain: ValueExpression, indent: Int, closer: Option[Int]) -> Printer:
+    var written_operands = printer.text("(").open_block(0, indent + 1, BODY_BLANK_LINES)
+    var first: Bool = True
+    for operand in chain.chain_operands():
+        -- Comments before the operand, including any after its operator,
+        -- come before the operator's line.
+        flushed = written_operands.flush(operand.value.span.start)
+        started = if first:
+            flushed.newline_without_blank(indent + 1)
+        else:
+            flushed.newline(indent + 1)
+        -- A pipe String operand starts the line after its operator.
+        prefixed = match operand.operator:
+            Some((spelling, _)):
+                if printer.source.starts_with_pipe(operand.value, PartValue):
+                    started.text(spelling).newline(indent + 1)
+                else:
+                    started.text("${spelling} ")
+            None: started
+        written_operands = prefixed.emit_value(operand.value, PartValue, InBrackets, indent + 1, 0)
+        first = False
+    closed = match closer:
+        Some(offset): written_operands.flush(offset)
+        None: written_operands
+    closed.close_block().newline_without_blank(indent).text(")")
+
+
+-- A chain where it cannot break: its operands in a row, each laid out alone.
+private pure func emit_unbroken_chain(printer: Printer, chain: ValueExpression, context: LineContext, indent: Int, reserve: Int) -> Printer:
+    var written_operands = printer
+    for operand in chain.chain_operands():
+        prefixed = match operand.operator:
+            Some((spelling, _)): written_operands.text(" ${spelling} ")
+            None: written_operands
+        written_operands = prefixed.emit_value(operand.value, PartValue, context, indent, 0)
+    written_operands
+
+
+-- The dot before a postfix call or field, whose comments come before it.
+private pure func dot_position(source: SourceView, name_start: Int) -> Int:
+    match source.token_before(name_start):
+        Some(token): token.span.start
+        None: name_start
+
+
+-- One postfix operation, flat when it fits, otherwise with its arguments
+-- broken.
+private pure func emit_application(printer: Printer, application: PostfixOperation, indent: Int, reserve: Int) -> Printer:
+    source = printer.source
+    match application:
+        ReceiverInvocation(call):
+            flat: Result[String, NoFlatForm] = if source.has_comment(call.span.start, call.span.end):
+                Err(HoldsComment)
+            else:
+                source.application_text(application)
+            fitting: Option[String] = match flat:
+                Ok(line):
+                    if printer.fits(line, reserve):
+                        Some(line)
+                    else:
+                        None
+                Err(_): None
+            match fitting:
+                Some(line): printer.text(line)
+                None:
+                    printer.text(".${source.name_text(call.callee)}").emit_arguments(call.arguments.value_items(WholeValue), call.span, indent, reserve)
+        FieldAccess(field): printer.text(".${source.name_text(field)}")
+        TupleIndex(index, _): printer.text("[").emit_value(index, PartValue, InBrackets, indent, reserve + 1).text("]")
+
+
+-- A value's base and then its postfix operations, none on a line of its own,
+-- each laid out alone. Written pairs close after the last part they wrap.
+private pure func emit_pieces(printer: Printer, value: ValueExpression, pairs: List[Span], context: LineContext, indent: Int, reserve: Int) -> Printer:
+    var open = pairs.length()
+    var written_parts = printer.text("(".repeated(open)).emit_value({ value | applications = [], parentheses = [], span = value.base_span }, PartValue, context, indent, 0)
+    var position = 0
+    for application in value.applications:
+        last_reserve = if position + 1 == value.applications.length():
+            reserve
+        else:
+            0
+        closing = closing_count(pairs, open, application.application_end())
+        written_parts = written_parts.text(")".repeated(closing)).emit_application(application, indent, last_reserve)
+        open = open - closing
+        position = position + 1
+    written_parts.text(")".repeated(open))
+
+
+-- One link of a method chain: a call, and the field reads and indexes after it.
+private record ChainLink {
+    call: ReceiverApplication,
+    rest: List[PostfixOperation]
+}
+
+
+-- A method chain (FORMATTER_PLAN.md, "Layout engine"): hugging the last
+-- call's final literal or block lambda when the line before it fits;
+-- otherwise one link per line, one level deeper, when it has two or more
+-- calls or a comment between them and its line may break; otherwise its
+-- parts in a row, the last call's arguments broken. A link is a call with
+-- the field reads after it; field reads before the first call, and whatever
+-- written parentheses wrap, stay with the head.
+private pure func emit_postfix_chain(printer: Printer, value: ValueExpression, pairs: List[Span], context: LineContext, indent: Int, reserve: Int) -> Printer:
+    source = printer.source
+    covered_end = pairs.map(pure func(pair: Span) -> Int: pair.end).fold_max(value.base_span.end)
+    var head: List[PostfixOperation] = []
+    var links: List[ChainLink] = []
+    for application in value.applications:
+        in_head = and(links.is_empty(), application.application_end() <= covered_end)
+        match application:
+            ReceiverInvocation(call):
+                if in_head:
+                    head = head.append(application)
+                else:
+                    links = links.append({ call = call, rest = [] })
+            FieldAccess(_) | TupleIndex(_, _):
+                match links.last():
+                    Some(link): links = links.take(links.length() - 1).append({ link | rest = link.rest.append(application) })
+                    None: head = head.append(application)
+    head_value: ValueExpression = { value | applications = head, parentheses = pairs }
+    head_text = source.value_text(head_value, PartValue)
+    match links.last():
+        None: printer.emit_pieces(value, pairs, context, indent, reserve)
+        Some(last):
+            earlier_links = links.take(links.length() - 1)
+            earlier = earlier_links.map(pure func(link: ChainLink) -> Result[String, NoFlatForm]: source.link_text(link)).joined("")
+            arguments = last.call.arguments.value_items(WholeValue)
+            shape: ListShape = { open = "(", close = ")", padded = False, start = last.call.span.start, closer = last.call.span.end - 1, hug = True, trailing_comma = True }
+            -- Everything before the hugged item, flat, when the last call can hug.
+            before_hug: Option[String] = match ([head_text, earlier].joined(""), source.hug_line(shape, arguments)):
+                (Ok(before), Some(hugged)):
+                    if source.has_comment(value.span.start, last.call.span.start):
+                        None
+                    else if printer.fits("${before}.${source.name_text(last.call.callee)}${hugged.before}${hugged.opening}", 0):
+                        Some(before)
+                    else:
+                        None
+                _: None
+            match before_hug:
+                Some(before):
+                    called = printer.text("${before}.${source.name_text(last.call.callee)}").emit_list(shape, arguments, indent, reserve)
+                    last.rest.fold_applications(called, indent, reserve)
+                None: printer.emit_unhugged_chain(value, pairs, head_value, covered_end, links, context, indent, reserve)
+
+
+-- A chain that does not hug: one link per line when it may break and has two
+-- calls or a comment between them, otherwise its parts in a row.
+private pure func emit_unhugged_chain(
+    printer: Printer,
+    value: ValueExpression,
+    pairs: List[Span],
+    head_value: ValueExpression,
+    covered_end: Int,
+    links: List[ChainLink],
+    context: LineContext,
+    indent: Int,
+    reserve: Int,
+) -> Printer:
+    source = printer.source
+    last_start = match links.last():
+        Some(last): last.call.span.start
+        None: value.span.end
+    comment_between = source.has_comment(value.base_span.end, last_start)
+    may_break: Bool = match context:
+        HeaderLine: False
+        StatementLine | InBrackets: True
+    if and(may_break, or(links.length() >= 2, comment_between)):
+        -- The links are an open level, like a broken list's items, so a
+        -- comment between two of them sits at their indentation.
+        var written_links = printer.emit_pieces({ head_value | span = { value.span | end = covered_end } }, pairs, context, indent, 0)
+            .open_block(0, indent + 1, BODY_BLANK_LINES)
+        var position = 0
+        for link in links:
+            link_reserve = if position + 1 == links.length():
+                reserve
+            else:
+                0
+            started = written_links.flush(source.dot_position(link.call.callee.span.start)).newline(indent + 1)
+            called = started.emit_application(ReceiverInvocation(link.call), indent + 1, link_reserve)
+            written_links = link.rest.fold_applications(called, indent + 1, link_reserve)
+            position = position + 1
+        written_links.close_block()
+    else:
+        printer.emit_pieces(value, pairs, context, indent, reserve)
+
+
+private pure func fold_max(values: List[Int], floor: Int) -> Int:
+    var largest = floor
+    for value in values:
+        largest = largest.max(value)
+    largest
+
+
+private pure func fold_applications(applications: List[PostfixOperation], printer: Printer, indent: Int, reserve: Int) -> Printer:
+    var written_parts = printer
+    for application in applications:
+        written_parts = written_parts.emit_application(application, indent, reserve)
+    written_parts
+
+
+private pure func link_text(source: SourceView, link: ChainLink) -> Result[String, NoFlatForm]:
+    [ReceiverInvocation(link.call)].concat(link.rest).map(pure func(application: PostfixOperation) -> Result[String, NoFlatForm]: source.application_text(application)).joined("")
+
+
+private pure func field_items(fields: List[ParsedRecordField]) -> List[ListItem]:
+    fields.map(pure func(field: ParsedRecordField) -> ListItem: FieldItem(field))
+
+
+-- An opaque conversion's parenthesized value, which takes no trailing comma.
+private pure func conversion_shape(span: Span) -> ListShape:
+    { open = "(", close = ")", padded = False, start = span.start, closer = span.end - 1, hug = True, trailing_comma = False }
+
+
+-- A value's base with no postfix operation and no written parentheses,
+-- broken by its own rule.
+private pure func emit_base(printer: Printer, value: ValueExpression, context: LineContext, indent: Int, reserve: Int) -> Printer:
+    source = printer.source
+    span = value.base_span
+    match value.base:
+        DirectApplication(callee, arguments):
+            printer.text(source.name_text(callee)).emit_arguments(arguments.value_items(WholeValue), span, indent, reserve)
+        QualifiedApplication(qualified, arguments):
+            printer.text(source.qualified_text(qualified)).emit_arguments(arguments.value_items(WholeValue), span, indent, reserve)
+        OpaqueWrap(name, wrapped):
+            printer.text("into_opaque ${source.name_text(name)}").emit_list(conversion_shape(span), [ValueItem(wrapped, PartValue)], indent, reserve)
+        OpaqueUnwrap(name, wrapped):
+            printer.text("from_opaque ${source.name_text(name)}").emit_list(conversion_shape(span), [ValueItem(wrapped, PartValue)], indent, reserve)
+        ListExpression(elements):
+            shape: ListShape = { open = "[", close = "]", padded = False, start = span.start, closer = span.end - 1, hug = False, trailing_comma = True }
+            printer.emit_list(shape, elements.value_items(WholeValue), indent, reserve)
+        TupleExpression(elements):
+            shape: ListShape = { open = "(", close = ")", padded = False, start = span.start, closer = span.end - 1, hug = False, trailing_comma = True }
+            printer.emit_list(shape, elements.value_items(WholeValue), indent, reserve)
+        RecordExpression(fields):
+            shape: ListShape = { open = "{", close = "}", padded = True, start = span.start, closer = span.end - 1, hug = False, trailing_comma = True }
+            printer.emit_list(shape, fields.field_items(), indent, reserve)
+        RecordUpdateExpression(updated, fields):
+            -- The update's base stays on the opening line with its bar; the
+            -- bar may not start a line, where it would open a pipe String.
+            shape: ListShape = { open = " |", close = "}", padded = False, start = span.start, closer = span.end - 1, hug = False, trailing_comma = True }
+            printer.text("{ ").emit_value(updated, PartValue, InBrackets, indent, 2).emit_broken_list(shape, fields.field_items(), indent)
+        DictExpression(entries):
+            shape: ListShape = { open = "{", close = "}", padded = True, start = span.start, closer = span.end - 1, hug = False, trailing_comma = True }
+            printer.emit_list(shape, entries.map(pure func(entry: ParsedDictEntry) -> ListItem: EntryItem(entry)), indent, reserve)
+        IfExpression(form): printer.emit_if(form, indent)
+        MatchExpression(form): printer.emit_match(form, indent)
+        LambdaExpression(lambda): printer.emit_lambda(lambda, context, indent, reserve)
+        StringExpression(_) | InterpolatedString(_):
+            if source.is_pipe_string(span):
+                printer.emit_pipe_string(span, indent)
+            else:
+                printer.text(source.written(span))
+        RangeExpression(low, high):
+            printer.emit_value(low, PartValue, context, indent, 0).text("..").emit_value(high, PartValue, context, indent, reserve)
+        ComparisonExpression(_, _, _, _) | ArithmeticExpression(_, _, _, _):
+            printer.emit_unbroken_chain(value, context, indent, reserve)
+        -- `--` would start a comment, so a minus before a negative keeps a space.
+        NegationExpression(_, operand):
+            prefix = match source.value_text(operand, PartValue):
+                Ok(operand_text): operand_text.negation_prefix()
+                Err(_): "-"
+            printer.text(prefix).emit_value(operand, PartValue, context, indent, reserve)
+        -- Names, literals and void have only their one-line form.
+        _:
+            match source.base_text(value.base, span):
+                Ok(written_base): printer.text(written_base)
+                Err(_): printer.text(source.written(span))
+
+
+-- The word on its own line that opens a raw block (grammar `raw_string`).
+private RAW_WORD: String = "raw"
+
+
+-- A pipe String or raw block at the start of its own line, its marker lines
+-- re-indented: a pipe String's at its first line's indentation, a raw
+-- block's one level deeper than `raw`. Everything after each marker stays.
+private pure func emit_pipe_string(printer: Printer, span: Span, indent: Int) -> Printer:
+    lines = printer.source.written(span).split_lines()
+    raw = match lines.get(0):
+        Some(first): first.starts_with(RAW_WORD)
+        None: False
+    var written_lines: Printer = if printer.column() == indent * INDENT_WIDTH:
+        if raw:
+            printer.text(RAW_WORD)
+        else:
+            printer.text(lines.get(0).get_or(""))
+    else:
+        -- A pipe String after other code on its line would not lex as one.
+        printer.faulted(PipeStringAfterCode(span.start))
+    marker_indent = if raw:
+        indent + 1
+    else:
+        indent
+    for line in lines.drop(1):
+        written_lines = written_lines.newline(marker_indent).text(line.without_indentation())
+    written_lines
+
+
+private pure func without_indentation(line: String) -> String:
+    var start = 0
+    while or(line.byte_at(start) == Some(SPACE_BYTE), line.byte_at(start) == Some(TAB_BYTE)):
+        start = start + 1
+    line.slice(start, line.length()).get_or("")
+
+
+private pure func emit_lambda(printer: Printer, lambda: ParsedLambda, context: LineContext, indent: Int, reserve: Int) -> Printer:
+    source = printer.source
+    header = source.lambda_header_text(lambda)
+    returned = source.returned_text(lambda.return_type)
+    parameters_end = match lambda.parameters.last():
+        Some(parameter): parameter.lambda_parameter_end()
+        None: lambda.span.start
+    closer = source.closer_after(parameters_end)
+    -- Comments among the parameters break them one per line, as in any list.
+    headed = if and(or(printer.fits(header, 0), lambda.parameters.is_empty()), source.has_comment(lambda.span.start, closer).not()):
+        printer.text(header)
+    else:
+        parameters = lambda.parameters.map(pure func(parameter: LambdaParameter) -> ListItem: TextItem(source.lambda_parameter_text(parameter), { lambda.span | start = parameter.binder.binder_start(), end = parameter.lambda_parameter_end() }))
+        shape: ListShape = { open = "(", close = ")", padded = False, start = lambda.span.start, closer = closer, hug = False, trailing_comma = True }
+        printer.text("${lambda.purity.purity_text()}func").emit_list(shape, parameters, indent, returned.length() + 1).text("${returned}:")
+    -- The return type never breaks.
+    typed = match lambda.return_type:
+        Some(written_type): headed.refusing_comments(TypeConstruct, written_type.type_span().start, written_type.type_span().end)
+        None: headed
+    match lambda.body:
+        InlineBody(body): typed.text(" ").emit_value(body, WholeValue, context, indent, reserve)
+        BlockBody(block): typed.emit_block(block, indent + 1)
+
+
+pure func binder_start(binder: ParsedBinder) -> Int:
+    match binder:
+        NamedBinder(name): name.span.start
+        DiscardBinder(span): span.start
+
+
+pure func binder_end(binder: ParsedBinder) -> Int:
+    match binder:
+        NamedBinder(name): name.span.end
+        DiscardBinder(span): span.end
+
+
+private pure func lambda_parameter_end(parameter: LambdaParameter) -> Int:
+    match parameter.annotation:
+        Some(annotation): annotation.type_span().end
+        None: parameter.binder.binder_end()
+
+
+-- The `else` keyword before a branch starting at `branch_start`: just before
+-- a nested `if`, or before the `:` of an `else:` block.
+private pure func else_position(source: SourceView, branch_start: Int) -> Int:
+    match source.token_before(branch_start):
+        Some(token):
+            match token.kind:
+                KeywordToken(ElseKeyword): token.span.start
+                SymbolToken(Colon):
+                    match source.token_before(token.span.start):
+                        Some(keyword): keyword.span.start
+                        None: token.span.start
+                _: token.span.start
+        None: branch_start
+
+
+-- A block header's value and the `:` that ends the header. After a value
+-- whose last line ends a block, such as a `match` condition, the `:` takes a
+-- line of its own at the header's indentation.
+private pure func emit_header_value(printer: Printer, value: ValueExpression, placement: Placement, indent: Int) -> Printer:
+    written_value = printer.emit_value(value, placement, HeaderLine, indent, 1)
+    if printer.source.ends_line(value, placement):
+        written_value.newline_without_blank(indent).text(":")
+    else:
+        written_value.text(":")
+
+
+-- An `if` and its branches. Each `else:` block prints as written: the
+-- formatter changes layout, never structure, so it never turns an `else:`
+-- holding only an `if` into `else if` (Keith, 2026-11-06).
+pure func emit_if(printer: Printer, form: ParsedIf, indent: Int) -> Printer:
+    source = printer.source
+    headed = printer.text("if ").emit_header_value(form.condition, WholeValue, indent)
+    then_written = headed.emit_block(form.then_block, indent + 1)
+    match form.else_branch:
+        None: then_written
+        Some(ElseIf(nested)):
+            then_written.flush(source.else_position(nested.span.start)).newline(indent).text("else ").emit_if(nested, indent)
+        Some(ElseBlock(block)):
+            then_written.flush(source.else_position(block.span.start)).newline(indent).text("else:").emit_block(block, indent + 1)
+
+
+pure func emit_match(printer: Printer, form: ParsedMatch, indent: Int) -> Printer:
+    source = printer.source
+    headed = printer.text("match ").emit_header_value(form.scrutinee, PartValue, indent)
+    first_arm = match form.arms.get(0):
+        Some(arm): arm.span.start
+        None: form.span.end
+    var arms = headed.open_block(source.text.source_level(first_arm), indent + 1, BODY_BLANK_LINES)
+    for arm in form.arms:
+        arms = arms.flush(arm.span.start).newline(indent + 1).emit_arm(arm, indent + 1)
+    arms.flush_block_end(source.next_code_start(form.span.end)).close_block()
+
+
+-- An arm's one-line form: its value, or the one statement a match case may
+-- share its line with (grammar `match_arm`).
+private pure func arm_line(source: SourceView, arm: ParsedMatchArm) -> Result[String, NoFlatForm]:
+    if source.has_comment(arm.span.start, arm.span.end):
+        Err(HoldsComment)
+    else:
+        match (arm.block.statements, arm.block.value):
+            ([], Some(value)):
+                if or(source.ends_line(value, WholeValue), source.starts_with_pipe(value, WholeValue)):
+                    Err(HoldsBlock)
+                else:
+                    source.value_text(value, WholeValue)
+            ([statement], None): source.statement_text(statement)
+            _: Err(HoldsBlock)
+
+
+-- An arm on its pattern's line when that fits, otherwise its block below.
+private pure func emit_arm(printer: Printer, arm: ParsedMatchArm, indent: Int) -> Printer:
+    source = printer.source
+    pattern = source.pattern_text(arm.pattern)
+    inline: Option[String] = match source.arm_line(arm):
+        Ok(line):
+            if printer.fits("${pattern}: ${line}", 0):
+                Some("${pattern}: ${line}")
+            else:
+                None
+        Err(_): None
+    -- A pattern never breaks, so a comment inside it has no line to go to.
+    checked = printer.refusing_comments(PatternConstruct, arm.span.start, arm.pattern.pattern_span().end)
+    match inline:
+        Some(line): checked.text(line)
+        None: checked.text("${pattern}:").emit_block(arm.block, indent + 1)
+
+
+-- The source level of a block's lines. A block whose first line shares its
+-- header's, as an inline arm does, sits one level below that line.
+pure func block_level(source: SourceView, block_start: Int) -> Int:
+    level = source.text.source_level(block_start)
+    if source.text.first_on_line(block_start):
+        level
+    else:
+        level + 1
+
+
+pure func statement_start(statement: ParsedStatement) -> Int:
+    match statement:
+        BindingStatement(binding): binding.name.span.start
+        TupleBinding(_, _, span): span.start
+        PropagatingBinding(propagation): propagation.span.start
+        ExpressionStatement(value): value.span.start
+        WhileLoop(loop): loop.span.start
+        ForLoop(loop): loop.span.start
+        Break(span): span.start
+        Continue(span): span.start
+
+
+pure func emit_block(printer: Printer, block: ParsedBlock, indent: Int) -> Printer:
+    source = printer.source
+    var lines = printer.open_block(source.block_level(block.span.start), indent, BODY_BLANK_LINES)
+    for statement in block.statements:
+        lines = lines.flush(statement.statement_start()).newline(indent).emit_statement(statement, indent)
+    lines = match block.value:
+        Some(value): lines.flush(value.span.start).newline(indent).emit_value(value, WholeValue, StatementLine, indent, 0)
+        None: lines
+    lines.flush_block_end(source.next_code_start(block.span.end)).close_block()
+
+
+private pure func annotation_text(source: SourceView, annotation: Option[TypeSyntax]) -> String:
+    match annotation:
+        Some(written_type): ": ${source.type_text(written_type)}"
+        None: ""
+
+
+private pure func binders_text(source: SourceView, binders: List[ParsedBinder]) -> String:
+    "(${binders.map(pure func(binder: ParsedBinder) -> String: source.binder_text(binder)).join(", ")})"
+
+
+-- What a statement writes before its value: through its `=` or `?=`.
+private pure func binding_head(source: SourceView, statement: ParsedStatement) -> Option[(String, ValueExpression)]:
+    match statement:
+        BindingStatement(binding):
+            mutable = if binding.mutable:
+                "var "
+            else:
+                ""
+            Some(("${mutable}${source.name_text(binding.name)}${source.annotation_text(binding.annotation)} =", binding.initializer))
+        TupleBinding(binders, value, _): Some(("${source.binders_text(binders)} =", value))
+        PropagatingBinding(propagation):
+            Some(("${source.binder_text(propagation.binder)}${source.annotation_text(propagation.annotation)} ?=", propagation.value))
+        _: None
+
+
+-- A statement's one-line form, for a match case that shares its line.
+private pure func statement_text(source: SourceView, statement: ParsedStatement) -> Result[String, NoFlatForm]:
+    match source.binding_head(statement):
+        Some((head, value)):
+            if source.starts_with_pipe(value, WholeValue):
+                Err(HoldsPipeString)
+            else:
+                source.value_text(value, WholeValue).map(pure func(written_value: String) -> String: "${head} ${written_value}")
+        None:
+            match statement:
+                ExpressionStatement(value): source.value_text(value, PartValue)
+                Break(_): Ok("break")
+                Continue(_): Ok("continue")
+                _: Err(HoldsBlock)
+
+
+-- Where the `=` or `?=` before a binding's value starts.
+pure func operator_before(source: SourceView, value: ValueExpression) -> Int:
+    match source.token_before(value.span.start):
+        Some(token): token.span.start
+        None: value.span.start
+
+
+-- A binding's value after its operator: on the same line, or alone on the
+-- next line one level deeper, as the grammar's `initializer` allows, for a
+-- value that starts with a pipe String or after a comment that trails the
+-- operator.
+pure func emit_initializer(printer: Printer, value: ValueExpression, indent: Int) -> Printer:
+    flushed = printer.flush(value.span.start)
+    if or(printer.source.starts_with_pipe(value, WholeValue), flushed.line_open().not()):
+        flushed.newline(indent + 1).emit_value(value, WholeValue, StatementLine, indent + 1, 0)
+    else:
+        flushed.text(" ").emit_value(value, WholeValue, StatementLine, indent, 0)
+
+
+pure func emit_statement(printer: Printer, statement: ParsedStatement, indent: Int) -> Printer:
+    source = printer.source
+    match source.binding_head(statement):
+        -- The binder and its annotation share the operator's line, which a
+        -- comment would end; a comment after the operator stays on its line.
+        Some((head, value)):
+            printer.refusing_comments(HeaderConstruct, statement.statement_start(), source.operator_before(value))
+                .text(head)
+                .emit_initializer(value, indent)
+        None:
+            match statement:
+                ExpressionStatement(value): printer.emit_value(value, PartValue, StatementLine, indent, 0)
+                WhileLoop(loop):
+                    printer.text("while ").emit_header_value(loop.condition, WholeValue, indent).emit_block(loop.body, indent + 1)
+                ForLoop(loop):
+                    binder = match loop.binder:
+                        SingleForBinder(single): source.binder_text(single)
+                        TupleForBinder(binders, _): source.binders_text(binders)
+                    printer.refusing_comments(PatternConstruct, loop.span.start, loop.iterable.span.start)
+                        .text("for ${binder} in ")
+                        .emit_header_value(loop.iterable, PartValue, indent)
+                        .emit_block(loop.body, indent + 1)
+                Break(_): printer.text("break")
+                Continue(_): printer.text("continue")
+                _: printer

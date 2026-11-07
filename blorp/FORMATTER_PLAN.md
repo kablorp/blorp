@@ -86,10 +86,16 @@ What the formatter reuses (surveyed 2026-11-06):
 Settled without a choice: one space around binary operators, `=` and
 annotation `:`, and after commas; a space inside record braces and none inside
 `[]` or `()`; no column alignment; `if` is always a block, and an `else:`
-holding only an `if` prints as `else if`; continuation lines start with `.` or
-an operator; literals, escapes, pipe strings and documentation blocks print as
-written; interpolation holes never break; declarations, match arms and call
-spellings are never reordered or rewritten; LF endings and one final newline.
+block prints as written; the formatter never turns it into `else if`;
+continuation lines start with `.` or an operator; literals, escapes, pipe
+strings and documentation blocks print as written; interpolation holes never
+break; declarations, match arms and call spellings are never reordered or
+rewritten; LF endings and one final newline.
+
+The `else:` clause was decided by Keith on 2026-11-06, replacing "an `else:`
+holding only an `if` prints as `else if`": the two are different trees, and in
+statement position they compile to different C, so the rewrite would change
+structure, not layout, and break F3's byte-identical self-compiled C.
 
 ### D1: where the formatter may add parentheses (decided: a)
 
@@ -133,8 +139,10 @@ emits the trivia between the cursor and that position:
   the next code line opens, whose level does not exceed the comment's.
   Comment lines carry no layout meaning in the grammar, so this keeps a
   comment at the end of a block inside that block, and a comment just after
-  `if c:` inside the new block. A comment at column 0 inside a body stays at
-  column 0.
+  `if c:` inside the new block. A comment at column 0 between statements
+  stays at column 0. A broken bracketed list and a broken method chain count
+  as open levels too, so a comment inside one, or between two chain links,
+  takes its items' or links' indentation, whatever its own.
 - **Closing delimiters.** Before a `)`, `]` or `}`, the printer flushes
   trivia up to the delimiter's position, at item indentation. The position
   is the closing token itself, found in the lexed tokens as the first token
@@ -144,6 +152,14 @@ emits the trivia between the cursor and that position:
   after the last item and inside empty brackets.
 - **Forced breaks.** A construct with a comment anywhere inside it is laid
   out broken, never flat, so code is never joined onto a comment line.
+  Patterns, types and declaration header lines (a declaration's keyword,
+  name and type parameters, or a binding's name and annotation before its
+  `=`) never break, so a comment inside one stops formatting that file with
+  a diagnostic at the comment: "the formatter cannot keep a comment inside a
+  pattern" (or a type, or a declaration's header line), with the help "move
+  this comment above the line; the formatter keeps comments only between
+  items it can break". A comment after a binding's `=` or `?=` stays on that
+  line, and the value moves to the next one.
 - **Imports.** Sorting moves rows, so imports are the one place with
   attachment: a comment on a row's line, or directly above it with no blank
   line between, moves with that row. Other comments in the import block stay
@@ -301,15 +317,13 @@ Suites live under `test/unit/test_format/` and are listed in
 - **Idempotence:** formatting every expected output returns it unchanged.
 - **Meaning preserved:** for every `.brp` file in the repository that parses,
   `parse(format(file))` equals `parse(file)` under a test-only rendering that
-  prints name spellings rather than ids, omits spans and parentheses, prints
-  an `else:` holding only an `if` as `else if`, and sorts imports. It
-  therefore does not check which parentheses were kept; the layout pairs do.
-- **`else if` equivalence:** Check takes `ElseIf` and an `else:` block
-  holding only an `if` through different paths (`resolve_if` and
-  `resolve_value`), so a check test compiles a program written both ways and
-  requires identical C. A file that
-  does not parse (failure fixtures) is skipped and counted, and must be
-  left byte-identical by `--format`.
+  prints name spellings rather than ids, omits spans and the parentheses
+  that wrap a whole value at decision 8's positions, and sorts imports. It
+  also compares the declarations' written order across kinds, and each
+  comment's text, whether it is trailing or on its own line, and how many
+  names, literals and keywords precede it. A file that does not parse
+  (failure fixtures) is skipped and counted, and must be left byte-identical
+  by `--format`.
 - **Locality:** lengthen one argument's name in chosen files, format, and
   check that only the containing statement's lines differ.
 - **Red check:** break one rule in the printer (for example drop the

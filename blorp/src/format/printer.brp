@@ -1,0 +1,520 @@
+import:
+    ../utils/syntax: Span, Symbol(Comma, Newline, Indent, Dedent), Token, TokenKind(SymbolToken)
+    ./trivia: LINE_FEED_BYTE, Trivia(TrailingComment, OwnLineComment, BlankLine, DocumentationBlock), trivia_start
+    bool: and, not, or
+    int: Int methods
+    list: List methods, repeat
+    option: Option methods
+    string: String methods
+
+
+-- Decided by Keith (FORMATTER_PLAN.md, decisions 1 and 2).
+LINE_WIDTH: Int = 100
+-- Columns per indentation level (decision 1).
+INDENT_WIDTH: Int = 4
+private INDENT_SPACES: String = "    "
+-- At most this many blank lines in a row inside a body, and between items at
+-- the top level that no declaration rule spaces (decision 7).
+BODY_BLANK_LINES: Int = 1
+TOP_LEVEL_BLANK_LINES: Int = 2
+-- UTF-8 continuation bytes, 10xxxxxx, add no column.
+private CONTINUATION_FIRST: Int = 128
+private CONTINUATION_LAST: Int = 191
+
+
+-- The source the printer reads, from one lexing: its text, tokens and trivia.
+record SourceView {
+    text: String,
+    tokens: List[Token],
+    trivia: List[Trivia]
+}
+
+
+-- The line being written. A line that ends in a comment is closed: code
+-- written after it would become part of the comment, so the printer records a
+-- fault instead.
+union CurrentLine:
+    NoLine
+    CodeLine(String)
+    CommentedLine(String)
+
+
+-- A block the printer is inside, from the module down: its first line's
+-- source indentation level, the indentation the printer gives it, and how
+-- many blank lines in a row it keeps. An own-line comment goes to the deepest
+-- open block whose source level does not exceed its own (FORMATTER_PLAN.md,
+-- "Comments"). A broken bracketed list is a block of source level 0, so every
+-- comment inside it sits at its items' indentation.
+record OpenBlock {
+    level: Int,
+    indent: Int,
+    blank_limit: Int
+}
+
+
+-- Why the layout could not print a file faithfully, at an offset in it. The
+-- file is then left unchanged.
+union FormatFault:
+    -- Code would follow a comment on its line, or start a line the layout has
+    -- no place for: the comment written last could not stay where it is.
+    CodeAfterComment(Int)
+    -- A comment inside a construct that never breaks, at the comment's span.
+    CommentInUnbreakable(UnbreakableConstruct, Span)
+    -- A pipe String would start after other code on its line.
+    PipeStringAfterCode(Int)
+
+
+-- What never breaks across lines, so a comment inside it has no line of its
+-- own: the formatter stops rather than move the comment (FORMATTER_PLAN.md,
+-- "Forced breaks").
+union UnbreakableConstruct:
+    PatternConstruct
+    TypeConstruct
+    -- A declaration's header line: its keyword, name and type parameters, or
+    -- a binding's name and annotation before its `=`.
+    HeaderConstruct
+
+
+-- The output so far and the cursor into the source's trivia: every item
+-- before `next_trivia` has been written. `fault` is the first fault; once one
+-- is recorded the output is never used.
+record Printer {
+    source: SourceView,
+    next_trivia: Int,
+    lines: List[String],
+    line: CurrentLine,
+    owed_blank_lines: Int,
+    blocks: List[OpenBlock],
+    fault: Option[FormatFault]
+}
+
+
+pure func new_printer(source: SourceView) -> Printer:
+    {
+        source = source,
+        next_trivia = 0,
+        lines = [],
+        line = NoLine,
+        owed_blank_lines = 0,
+        blocks = [{ level = 0, indent = 0, blank_limit = TOP_LEVEL_BLANK_LINES }],
+        fault = None
+    }
+
+
+pure func indentation(indent: Int) -> String:
+    repeat(INDENT_SPACES, indent).join("")
+
+
+-- Columns, counting each UTF-8 scalar once.
+pure func display_width(written_text: String) -> Int:
+    var width = 0
+    var position = 0
+    while position < written_text.length():
+        match written_text.byte_at(position):
+            Some(byte):
+                if or(byte < CONTINUATION_FIRST, byte > CONTINUATION_LAST):
+                    width = width + 1
+            None: void
+        position = position + 1
+    width
+
+
+-- The source text of `span`. Every span the printer reads comes from lexing
+-- this text, so the slice is in bounds and the empty default is never used.
+pure func written(source: SourceView, span: Span) -> String:
+    source.text.slice(span.start, span.end).get_or("")
+
+
+pure func column(printer: Printer) -> Int:
+    match printer.line:
+        NoLine: 0
+        CodeLine(line): line.display_width()
+        CommentedLine(line): line.display_width()
+
+
+-- Whether `code`, then `reserve` more columns, fits on the current line.
+pure func fits(printer: Printer, code: String, reserve: Int) -> Bool:
+    printer.column() + code.display_width() + reserve <= LINE_WIDTH
+
+
+-- Records `fault` unless an earlier one is recorded: every fault goes here.
+pure func faulted(printer: Printer, fault: FormatFault) -> Printer:
+    match printer.fault:
+        Some(_): printer
+        None: { printer | fault = Some(fault) }
+
+
+-- A comment inside [start, end), where the caller cannot break, is a fault.
+pure func refusing_comments(printer: Printer, construct: UnbreakableConstruct, start: Int, end: Int) -> Printer:
+    match printer.source.first_comment(start, end):
+        Some(span): printer.faulted(CommentInUnbreakable(construct, span))
+        None: printer
+
+
+pure func text(printer: Printer, code: String) -> Printer:
+    match printer.line:
+        CodeLine(line): { printer | line = CodeLine(line + code) }
+        -- Only writing a comment closes or ends a line between `newline`
+        -- calls, so an item has been written and the cursor is past it.
+        NoLine | CommentedLine(_):
+            offset = match printer.source.trivia.get(printer.next_trivia - 1):
+                Some(item): item.trivia_start()
+                None: 0
+            printer.faulted(CodeAfterComment(offset))
+
+
+-- Whether code may still follow on the current line: a comment written
+-- there, or on a line of its own, closes it.
+pure func line_open(printer: Printer) -> Bool:
+    match printer.line:
+        CodeLine(_): True
+        NoLine | CommentedLine(_): False
+
+
+private pure func finished_line(printer: Printer) -> Printer:
+    match printer.line:
+        NoLine: printer
+        CodeLine(line): { printer | lines = printer.lines.append(line), line = NoLine }
+        CommentedLine(line): { printer | lines = printer.lines.append(line), line = NoLine }
+
+
+-- The module's block is opened with the printer and never closed, and every
+-- other `open_block` has its `close_block`, so the default is never used.
+private pure func innermost(printer: Printer) -> OpenBlock:
+    printer.blocks.last().get_or({ level = 0, indent = 0, blank_limit = TOP_LEVEL_BLANK_LINES })
+
+
+-- The blank lines owed before the next line, within the innermost block's
+-- limit, and never at the start of the output.
+private pure func paid_blank_lines(printer: Printer) -> Printer:
+    count = if printer.lines.is_empty():
+        0
+    else:
+        printer.owed_blank_lines.min(printer.innermost().blank_limit)
+    { printer | lines = printer.lines.concat(repeat("", count)), owed_blank_lines = 0 }
+
+
+-- Starts a new line at `indent`, after any owed blank lines.
+pure func newline(printer: Printer, indent: Int) -> Printer:
+    started = printer.finished_line().paid_blank_lines()
+    { started | line = CodeLine(indentation(indent)) }
+
+
+-- Starts a line that closes a bracket or opens the first item of a list,
+-- where a blank line would only pad.
+pure func newline_without_blank(printer: Printer, indent: Int) -> Printer:
+    { printer | owed_blank_lines = 0 }.newline(indent)
+
+
+-- Owes exactly `count` blank lines before the next line, whatever the source
+-- held; the top level spaces its declarations this way.
+pure func owing_blank_lines(printer: Printer, count: Int) -> Printer:
+    { printer | owed_blank_lines = count }
+
+
+pure func open_block(printer: Printer, level: Int, indent: Int, blank_limit: Int) -> Printer:
+    { printer | blocks = printer.blocks.append({ level = level, indent = indent, blank_limit = blank_limit }) }
+
+
+pure func close_block(printer: Printer) -> Printer:
+    { printer | blocks = printer.blocks.take(printer.blocks.length() - 1) }
+
+
+-- The indentation of an own-line comment written at source level `level`.
+private pure func placement(printer: Printer, level: Int) -> Int:
+    var indent = 0
+    for block in printer.blocks:
+        if block.level <= level:
+            indent = block.indent
+    indent
+
+
+private pure func written_line(printer: Printer, line: String) -> Printer:
+    { printer | lines = printer.lines.append(line) }
+
+
+-- Writes one trivia item at the printer's position.
+private pure func write_trivia(printer: Printer, item: Trivia) -> Printer:
+    match item:
+        BlankLine(_):
+            { printer | owed_blank_lines = printer.owed_blank_lines + 1 }
+        TrailingComment(span):
+            comment = printer.source.written(span)
+            match printer.line:
+                CodeLine(line): { printer | line = CommentedLine("${line} ${comment}") }
+                NoLine | CommentedLine(_): printer.faulted(CodeAfterComment(span.start))
+        OwnLineComment(span, level):
+            ready = printer.finished_line().paid_blank_lines()
+            ready.written_line(indentation(printer.placement(level)) + printer.source.written(span))
+        DocumentationBlock(span):
+            var ready = printer.finished_line().paid_blank_lines()
+            for line in printer.source.written(span).split_lines():
+                ready = ready.written_line(line)
+            ready
+
+
+-- The lines of `written_text`, split at each LF.
+pure func split_lines(written_text: String) -> List[String]:
+    var lines: List[String] = []
+    var start = 0
+    var position = 0
+    while position < written_text.length():
+        if written_text.byte_at(position) == Some(LINE_FEED_BYTE):
+            lines = lines.append(written_text.slice(start, position).get_or(""))
+            start = position + 1
+        position = position + 1
+    lines.append(written_text.slice(start, written_text.length()).get_or(""))
+
+
+-- Writes every trivia item before `position` that has not been written.
+pure func flush(printer: Printer, position: Int) -> Printer:
+    var flushed = printer
+    var writing: Bool = True
+    while writing:
+        writing = False
+        match flushed.source.trivia.get(flushed.next_trivia):
+            Some(item):
+                if item.trivia_start() < position:
+                    flushed = { flushed | next_trivia = flushed.next_trivia + 1 }.write_trivia(item)
+                    writing = True
+            None: void
+    flushed
+
+
+-- At the end of the innermost block, before the code at `position`: writes the
+-- trivia that still belongs to the block. A comment indented less than the
+-- block's first line belongs to an enclosing block, and so does everything
+-- after it; the enclosing block writes them.
+pure func flush_block_end(printer: Printer, position: Int) -> Printer:
+    level = printer.innermost().level
+    var flushed = printer
+    var writing: Bool = True
+    while writing:
+        writing = False
+        match flushed.source.trivia.get(flushed.next_trivia):
+            Some(item):
+                inside: Bool = match item:
+                    OwnLineComment(_, comment_level): comment_level >= level
+                    DocumentationBlock(_): False
+                    TrailingComment(_) | BlankLine(_): True
+                if and(item.trivia_start() < position, inside):
+                    flushed = { flushed | next_trivia = flushed.next_trivia + 1 }.write_trivia(item)
+                    writing = True
+            None: void
+    flushed
+
+
+-- The index of the first item of `trivia` at or after `offset`.
+pure func trivia_index_at(trivia: List[Trivia], offset: Int) -> Int:
+    var low = 0
+    var high = trivia.length()
+    while low < high:
+        middle = (low + high) / 2
+        match trivia.get(middle):
+            Some(item):
+                if item.trivia_start() < offset:
+                    low = middle + 1
+                else:
+                    high = middle
+            None: high = middle
+    low
+
+
+-- The first comment or documentation block in [start, end).
+pure func first_comment(source: SourceView, start: Int, end: Int) -> Option[Span]:
+    var position = source.trivia.trivia_index_at(start)
+    var found: Option[Span] = None
+    var scanning: Bool = True
+    while scanning:
+        scanning = False
+        match source.trivia.get(position):
+            Some(item):
+                offset = item.trivia_start()
+                if offset < end:
+                    match item:
+                        BlankLine(_): scanning = True
+                        TrailingComment(span) | OwnLineComment(span, _) | DocumentationBlock(span): found = Some(span)
+                    position = position + 1
+            None: void
+    found
+
+
+pure func has_comment(source: SourceView, start: Int, end: Int) -> Bool:
+    source.first_comment(start, end).is_some()
+
+
+-- The index of the first token at or after `offset`.
+private pure func token_index_at(tokens: List[Token], offset: Int) -> Int:
+    var low = 0
+    var high = tokens.length()
+    while low < high:
+        middle = (low + high) / 2
+        match tokens.get(middle):
+            Some(token):
+                if token.span.start < offset:
+                    low = middle + 1
+                else:
+                    high = middle
+            None: high = middle
+    low
+
+
+private pure func is_layout(token: Token) -> Bool:
+    match token.kind:
+        SymbolToken(Newline) | SymbolToken(Indent) | SymbolToken(Dedent): True
+        _: False
+
+
+private pure func is_comma(token: Token) -> Bool:
+    match token.kind:
+        SymbolToken(Comma): True
+        _: False
+
+
+-- The first token at or after `offset` that is neither layout nor, when
+-- `skip_commas`, a comma; None at the end of the source.
+private pure func next_token(source: SourceView, offset: Int, skip_commas: Bool) -> Option[Token]:
+    var position = source.tokens.token_index_at(offset)
+    var found: Option[Token] = None
+    var scanning: Bool = True
+    while scanning:
+        scanning = False
+        match source.tokens.get(position):
+            Some(token):
+                if or(token.is_layout(), and(skip_commas, token.is_comma())):
+                    position = position + 1
+                    scanning = True
+                else:
+                    found = Some(token)
+            None: void
+    found
+
+
+-- Where the next code after `offset` starts, or the end of the source.
+pure func next_code_start(source: SourceView, offset: Int) -> Int:
+    match source.next_token(offset, False):
+        Some(token): token.span.start
+        None: source.text.length()
+
+
+-- A list's closing bracket: the first token after its last item that is not
+-- a comma (FORMATTER_PLAN.md, "Closing delimiters"). `after` is where the last
+-- item, or the opening bracket, ends.
+pure func closer_after(source: SourceView, after: Int) -> Int:
+    match source.next_token(after, True):
+        Some(token): token.span.start
+        None: source.text.length()
+
+
+-- The code token that ends just before `offset`: a postfix operation's dot,
+-- or the `else` before a block.
+pure func token_before(source: SourceView, offset: Int) -> Option[Token]:
+    var position = source.tokens.token_index_at(offset) - 1
+    var found: Option[Token] = None
+    var scanning: Bool = True
+    while and(scanning, position >= 0):
+        scanning = False
+        match source.tokens.get(position):
+            Some(token):
+                if token.is_layout():
+                    position = position - 1
+                    scanning = True
+                else:
+                    found = Some(token)
+            None: void
+    found
+
+
+-- The token that starts at `offset`, ignoring the empty layout tokens a line
+-- at column 1 can share its start with.
+pure func token_at(source: SourceView, offset: Int) -> Option[Token]:
+    match source.next_token(offset, False):
+        Some(token):
+            if token.span.start == offset:
+                Some(token)
+            else:
+                None
+        None: None
+
+
+-- The whole output, or the fault that stopped it.
+pure func finished(printer: Printer) -> Result[String, FormatFault]:
+    done = printer.flush(printer.source.text.length() + 1).finished_line()
+    match done.fault:
+        Some(fault): Err(fault)
+        None:
+            if done.lines.is_empty():
+                Ok("")
+            else:
+                Ok(done.lines.join("\n") + "\n")
+
+
+-- How many blank lines the source holds before `position` and before any
+-- comment or documentation block on the way there.
+pure func blank_lines_before(printer: Printer, position: Int) -> Int:
+    var count = 0
+    var index = printer.next_trivia
+    var counting: Bool = True
+    while counting:
+        counting = False
+        match printer.source.trivia.get(index):
+            Some(item):
+                if item.trivia_start() < position:
+                    match item:
+                        BlankLine(_):
+                            count = count + 1
+                            counting = True
+                        TrailingComment(_): counting = True
+                        OwnLineComment(_, _) | DocumentationBlock(_): void
+                    index = index + 1
+            None: void
+    count
+
+
+-- Writes the trivia before a top-level item at `position`. The first comment
+-- or documentation block in the gap, or else the item, comes `separation`
+-- blank lines below what precedes it; the gap's other blank runs keep their
+-- written length, within `limit` (decision 7).
+pure func flush_top_level(printer: Printer, position: Int, separation: Int, limit: Int) -> Printer:
+    var flushed = printer
+    var written_blanks = 0
+    var first: Bool = True
+    var writing: Bool = True
+    while writing:
+        writing = False
+        match flushed.source.trivia.get(flushed.next_trivia):
+            Some(item):
+                if item.trivia_start() < position:
+                    writing = True
+                    advanced = { flushed | next_trivia = flushed.next_trivia + 1 }
+                    flushed = match item:
+                        BlankLine(_):
+                            written_blanks = written_blanks + 1
+                            advanced
+                        TrailingComment(_): advanced.write_trivia(item)
+                        OwnLineComment(_, _) | DocumentationBlock(_):
+                            owed = if first:
+                                separation
+                            else:
+                                written_blanks.min(limit)
+                            first = False
+                            written_blanks = 0
+                            advanced.owing_blank_lines(owed).write_trivia(item)
+            None: void
+    final_owed = if first:
+        separation
+    else:
+        written_blanks.min(limit)
+    flushed.owing_blank_lines(final_owed)
+
+
+-- Writes trivia that the source holds elsewhere as if it stood here, through
+-- the ordinary flush: the import block moves a row's comments with the row
+-- when it sorts the rows. The caller restores its own trivia afterwards.
+pure func with_trivia(printer: Printer, trivia: List[Trivia]) -> Printer:
+    { printer | source = { printer.source | trivia = trivia }, next_trivia = 0 }
+
+
+-- Back to `source`'s trivia, from item `next` on.
+pure func with_source(printer: Printer, source: SourceView, next: Int) -> Printer:
+    { printer | source = source, next_trivia = next }
